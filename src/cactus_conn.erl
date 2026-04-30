@@ -25,7 +25,8 @@ behaviour and routing arrive in slices 3–4.
     keep_alive_timeout := non_neg_integer(),
     max_keep_alive_request := pos_integer(),
     max_clients := pos_integer(),
-    client_counter := atomics:atomics_ref()
+    client_counter := atomics:atomics_ref(),
+    minimum_bytes_per_second := non_neg_integer()
 }.
 
 -doc """
@@ -118,13 +119,14 @@ process_one(
     Scheme,
     #{
         dispatch := Dispatch,
-        max_content_length := MaxCL
+        max_content_length := MaxCL,
+        minimum_bytes_per_second := MinRate
     },
     Timeout,
     Phase
 ) ->
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
-    Recv = make_recv(Socket, Deadline),
+    Recv = make_recv(Socket, Deadline, MinRate),
     case parse_loop(<<>>, Recv) of
         {ok, Req0, Buffered} ->
             Req = Req0#{peer => Peer, scheme => Scheme},
@@ -149,12 +151,16 @@ process_one(
                 {error, request_timeout} ->
                     _ = send_request_timeout(Socket),
                     close;
+                {error, slow_client} ->
+                    close;
                 {error, _} ->
                     _ = send_bad_request(Socket),
                     close
             end;
         {error, request_timeout} ->
             _ = maybe_send_request_timeout(Socket, Phase),
+            close;
+        {error, slow_client} ->
             close;
         {error, _} ->
             _ = send_bad_request(Socket),
@@ -166,22 +172,46 @@ process_one(
 maybe_send_request_timeout(Socket, first) -> send_request_timeout(Socket);
 maybe_send_request_timeout(_Socket, keep_alive) -> ok.
 
-%% Build a recv closure with a single overall deadline. `gen_tcp:recv`
-%% with a negative timeout is undefined, so we cap at 0 — which makes
-%% gen_tcp return `{error, timeout}` immediately when the deadline has
-%% passed. Any timeout here is, by construction, the request_timeout.
--spec make_recv(cactus_transport:socket(), integer()) ->
-    fun(() -> {ok, binary()} | {error, request_timeout | term()}).
-make_recv(Socket, Deadline) ->
+%% Build a recv closure with a single overall deadline plus a rolling
+%% rate check. `gen_tcp:recv` with a negative timeout is undefined, so
+%% we cap at 0 — which makes gen_tcp return `{error, timeout}`
+%% immediately when the deadline has passed. Any timeout here is, by
+%% construction, the request_timeout.
+%%
+%% Rate enforcement (anti-Slowloris): track total bytes received and
+%% time since the first recv. After a 1-second grace, require the
+%% running average to meet `MinRate` bytes/sec, otherwise return
+%% `{error, slow_client}`. The state is a per-conn atomics ref — no
+%% cross-process contention.
+-spec make_recv(cactus_transport:socket(), integer(), non_neg_integer()) ->
+    fun(() -> {ok, binary()} | {error, request_timeout | slow_client | term()}).
+make_recv(Socket, Deadline, MinRate) ->
+    Bytes = atomics:new(1, [{signed, false}]),
+    Start = erlang:monotonic_time(millisecond),
     fun() ->
         Now = erlang:monotonic_time(millisecond),
         Remaining = max(0, Deadline - Now),
         case cactus_transport:recv(Socket, 0, Remaining) of
-            {ok, _} = OK -> OK;
-            {error, timeout} -> {error, request_timeout};
-            {error, _} = E -> E
+            {ok, Data} ->
+                Total = atomics:add_get(Bytes, 1, byte_size(Data)),
+                case rate_ok(Now - Start, Total, MinRate) of
+                    true -> {ok, Data};
+                    false -> {error, slow_client}
+                end;
+            {error, timeout} ->
+                {error, request_timeout};
+            {error, _} = E ->
+                E
         end
     end.
+
+%% A 1-second grace lets a slow handshake / TLS session start without
+%% being misclassified. After that, the running average must meet the
+%% minimum or the client is dropped. `MinRate = 0` falls through and
+%% always passes — the inequality `Total * 1000 >= 0` is trivially true.
+-spec rate_ok(integer(), non_neg_integer(), non_neg_integer()) -> boolean().
+rate_ok(ElapsedMs, _Total, _MinRate) when ElapsedMs =< 1000 -> true;
+rate_ok(ElapsedMs, Total, MinRate) -> Total * 1000 >= MinRate * ElapsedMs.
 
 -doc false.
 -spec peer(cactus_transport:socket()) -> {inet:ip_address(), inet:port_number()} | undefined.

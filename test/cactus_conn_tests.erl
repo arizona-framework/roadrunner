@@ -730,6 +730,59 @@ conn_handler_crash_returns_500_test_() ->
             end}
         end}.
 
+conn_minimum_bytes_per_second_drops_slow_client_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_slow, #{
+                port => 0,
+                handler => cactus_keepalive_handler,
+                %% Require 1 MB/s — any trickle below that after grace closes.
+                minimum_bytes_per_second => 1000000,
+                request_timeout => 5000
+            }),
+            cactus_listener:port(conn_test_slow)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_slow) end, fun(Port) ->
+            [
+                {"trickle during request line / headers is dropped after grace", fun() ->
+                    {ok, Sock} = gen_tcp:connect(
+                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                    ),
+                    ok = gen_tcp:send(Sock, ~"GET"),
+                    trickle_bytes(Sock, ~" / HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+                    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 2000)),
+                    ok = gen_tcp:close(Sock)
+                end},
+                {"trickle during body (after headers parse) is dropped too", fun() ->
+                    {ok, Sock} = gen_tcp:connect(
+                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                    ),
+                    %% Headers complete instantly — Content-Length promises
+                    %% 50 bytes but we send them one-per-200ms, well under
+                    %% the 1 MB/s minimum.
+                    ok = gen_tcp:send(
+                        Sock,
+                        ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 50\r\n\r\n"
+                    ),
+                    Body = binary:copy(~"a", 50),
+                    trickle_bytes(Sock, Body, 200),
+                    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 2000)),
+                    ok = gen_tcp:close(Sock)
+                end}
+            ]
+        end}.
+
+trickle_bytes(_Sock, <<>>, _Delay) ->
+    ok;
+trickle_bytes(Sock, <<B, Rest/binary>>, Delay) ->
+    case gen_tcp:send(Sock, <<B>>) of
+        ok ->
+            timer:sleep(Delay),
+            trickle_bytes(Sock, Rest, Delay);
+        {error, _} ->
+            ok
+    end.
+
 conn_loop_handler_pushes_messages_as_chunks_test_() ->
     {setup,
         fun() ->
