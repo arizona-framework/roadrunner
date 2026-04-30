@@ -843,6 +843,78 @@ consume_state_chunked_length_after_done_returns_empty_test() ->
     {ok, ~"hel", State1} = cactus_conn:consume_body_state(State0, all),
     ?assertMatch({ok, <<>>, _}, cactus_conn:consume_body_state(State1, {length, 4})).
 
+consume_state_next_chunk_returns_one_chunk_test() ->
+    %% Two chunks "hel" and "lo"; next_chunk yields each one in turn.
+    State0 = chunked_state(~"3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n", fun() -> error(unused) end),
+    {more, B1, S1} = cactus_conn:consume_body_state(State0, next_chunk),
+    ?assertEqual(~"hel", B1),
+    {more, B2, S2} = cactus_conn:consume_body_state(S1, next_chunk),
+    ?assertEqual(~"lo", B2),
+    {ok, B3, _S3} = cactus_conn:consume_body_state(S2, next_chunk),
+    ?assertEqual(<<>>, B3).
+
+consume_state_next_chunk_drains_pending_first_test() ->
+    %% Pending non-empty (e.g. left over from a length-bounded read) is
+    %% returned as the next "chunk" before another wire chunk is parsed.
+    State = (chunked_state(~"3\r\nfoo\r\n0\r\n\r\n", fun() -> error(unused) end))#{
+        pending := ~"leftover"
+    },
+    {more, B, _S} = cactus_conn:consume_body_state(State, next_chunk),
+    ?assertEqual(~"leftover", B).
+
+consume_state_next_chunk_recvs_more_test() ->
+    Self = self(),
+    State = chunked_state(~"5\r\nhe", fun() ->
+        Self ! recv_called,
+        {ok, ~"llo\r\n0\r\n\r\n"}
+    end),
+    {more, B, _S} = cactus_conn:consume_body_state(State, next_chunk),
+    ?assertEqual(~"hello", B),
+    receive
+        recv_called -> ok
+    after 100 -> error(recv_was_not_called)
+    end.
+
+consume_state_next_chunk_recv_error_test() ->
+    State = chunked_state(~"5\r\nhe", fun() -> {error, closed} end),
+    ?assertEqual({error, closed}, cactus_conn:consume_body_state(State, next_chunk)).
+
+consume_state_next_chunk_exceeds_max_test() ->
+    State = (chunked_state(~"5\r\nhello\r\n0\r\n\r\n", fun() -> error(unused) end))#{
+        max := 2
+    },
+    ?assertEqual(
+        {error, content_length_too_large},
+        cactus_conn:consume_body_state(State, next_chunk)
+    ).
+
+consume_state_next_chunk_bad_chunk_test() ->
+    State = chunked_state(~"xyz\r\nhello\r\n", fun() -> error(unused) end),
+    ?assertEqual(
+        {error, bad_chunk_size},
+        cactus_conn:consume_body_state(State, next_chunk)
+    ).
+
+consume_state_next_chunk_for_content_length_drains_fully_test() ->
+    %% Non-chunked framing: `next_chunk` drains the full body in one
+    %% shot — there are no chunk boundaries to honor.
+    State = #{
+        framing => {content_length, 5},
+        buffered => ~"hello",
+        bytes_read => 0,
+        pending => <<>>,
+        done => false,
+        recv => fun() -> error(unused) end,
+        max => 1000
+    },
+    ?assertMatch({ok, ~"hello", _}, cactus_conn:consume_body_state(State, next_chunk)).
+
+consume_state_next_chunk_after_done_returns_empty_test() ->
+    %% Calling next_chunk on a state where the size-0 last chunk has
+    %% already been seen returns `{ok, <<>>, _}` without parsing more.
+    State = (chunked_state(<<>>, fun() -> error(unused) end))#{done := true},
+    ?assertMatch({ok, <<>>, _}, cactus_conn:consume_body_state(State, next_chunk)).
+
 consume_state_chunked_exceeds_max_test() ->
     %% Single chunk of 5 bytes, max=2 — must reject before pending swells.
     State = (chunked_state(~"5\r\nhello\r\n0\r\n\r\n", fun() -> error(unused) end))#{
@@ -1009,6 +1081,36 @@ conn_manual_body_buffering_drains_unread_body_test_() ->
                 {ok, R2} = gen_tcp:recv(Sock, 0, 1000),
                 ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, R2),
                 {match, _} = re:run(R2, ~"bye"),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_manual_body_buffering_per_chunk_read_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_per_chunk, #{
+                port => 0,
+                handler => cactus_stream_body_handler,
+                body_buffering => manual
+            }),
+            cactus_listener:port(conn_test_per_chunk)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_per_chunk) end, fun(Port) ->
+            {"manual mode + read_body_chunked/1 yields one chunk per call", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(
+                    Sock,
+                    <<
+                        "POST /per-chunk HTTP/1.1\r\nHost: x\r\n",
+                        "Transfer-Encoding: chunked\r\n\r\n",
+                        "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+                    >>
+                ),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"n=2 body=hello world"),
                 ok = gen_tcp:close(Sock)
             end}
         end}.

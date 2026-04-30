@@ -172,6 +172,39 @@ read_body_manual_state_error_propagates_test() ->
     Req = (sample_req())#{body_state => BS},
     ?assertEqual({error, closed}, cactus_req:read_body(Req)).
 
+%% --- read_body_chunked/1 ---
+
+read_body_chunked_auto_mode_returns_buffered_test() ->
+    Req = (sample_req())#{body => ~"already buffered"},
+    ?assertEqual({ok, ~"already buffered", Req}, cactus_req:read_body_chunked(Req)).
+
+read_body_chunked_manual_state_yields_one_chunk_test() ->
+    BS = #{
+        framing => chunked,
+        buffered => ~"3\r\nfoo\r\n0\r\n\r\n",
+        bytes_read => 0,
+        pending => <<>>,
+        done => false,
+        recv => fun() -> error(unused) end,
+        max => 1000
+    },
+    Req = (sample_req())#{body_state => BS},
+    {more, Bytes, _Req2} = cactus_req:read_body_chunked(Req),
+    ?assertEqual(~"foo", Bytes).
+
+read_body_chunked_manual_state_error_propagates_test() ->
+    BS = #{
+        framing => chunked,
+        buffered => ~"5\r\nhe",
+        bytes_read => 0,
+        pending => <<>>,
+        done => false,
+        recv => fun() -> {error, closed} end,
+        max => 1000
+    },
+    Req = (sample_req())#{body_state => BS},
+    ?assertEqual({error, closed}, cactus_req:read_body_chunked(Req)).
+
 has_body_absent_returns_false_test() ->
     ?assertEqual(false, cactus_req:has_body(sample_req())).
 

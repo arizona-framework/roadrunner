@@ -22,6 +22,7 @@ representation can evolve without breaking them.
     has_body/1,
     read_body/1,
     read_body/2,
+    read_body_chunked/1,
     bindings/1,
     peer/1,
     scheme/1,
@@ -175,14 +176,15 @@ read_body(Req) ->
 Read the request body, optionally bounded by `length`.
 
 `Opts` may contain `length => non_neg_integer()`. If absent, behaves
-like `read_body/1` (drain to end). When set on a content-length body,
-returns up to `Length` bytes per call:
+like `read_body/1` (drain to end). When set, returns up to `Length`
+bytes per call:
 
 - `{ok, Bytes, Req2}` — body is fully drained (no more bytes left).
 - `{more, Bytes, Req2}` — more bytes remain; call again with `Req2`.
 
-Chunked bodies fall through to a full read regardless of `length` —
-streaming-with-length over chunked framing is not yet implemented.
+Works for both content-length and chunked framing — chunked bodies
+are streamed transparently across chunk boundaries up to `Length`
+bytes per call.
 
 In `auto` mode the body is already buffered, so `length` has no
 effect — the buffered bytes are returned in one shot.
@@ -208,6 +210,39 @@ read_body(#{body_state := BS} = Req, Opts) ->
 read_body(Req, _Opts) ->
     %% Auto mode (or a manually-constructed req): the body is already
     %% sitting in the `body` field — return it.
+    {ok, body(Req), Req}.
+
+-doc """
+Read the next decoded HTTP chunk from a chunked-encoded request body.
+
+Mirrors cowboy's chunk-at-a-time read pattern: each call returns one
+chunk's payload. `{more, Bytes, Req2}` means more chunks remain;
+`{ok, <<>>, Req2}` signals end-of-body (the size-0 last chunk has
+been seen).
+
+For non-chunked framing (auto mode, content-length, or no body),
+`read_body_chunked/1` falls through to `read_body/1`'s behavior — the
+buffered body comes back in one shot. The "chunk boundary" concept
+only applies to wire-level chunked transfer encoding.
+
+Threading is the same as `read_body/1,2`: hand `Req2` back to the
+conn via the `{Response, Req2}` handler return shape so any unread
+chunks get drained for keep-alive.
+""".
+-spec read_body_chunked(cactus_http1:request()) ->
+    {ok, binary(), cactus_http1:request()}
+    | {more, binary(), cactus_http1:request()}
+    | {error, term()}.
+read_body_chunked(#{body_state := BS} = Req) ->
+    case cactus_conn:consume_body_state(BS, next_chunk) of
+        {ok, Bytes, BS2} ->
+            {ok, Bytes, Req#{body_state := BS2, body => Bytes}};
+        {more, Bytes, BS2} ->
+            {more, Bytes, Req#{body_state := BS2}};
+        {error, _} = E ->
+            E
+    end;
+read_body_chunked(Req) ->
     {ok, body(Req), Req}.
 
 -doc """

@@ -32,8 +32,25 @@ handle(#{method := ~"POST", target := ~"/echo-keepalive"} = Req) ->
     {reply_keepalive(200, Body), Req2};
 handle(#{method := ~"POST", target := ~"/skip-keepalive"} = Req) ->
     {reply_keepalive(200, ~"skipped"), Req};
+%% Reads body one HTTP chunk at a time via `read_body_chunked/1` and
+%% returns "n=COUNT body=CONCATENATION" so the test can verify both
+%% the count of chunks and their concatenated payload.
+handle(#{method := ~"POST", target := ~"/per-chunk"} = Req) ->
+    {Count, Body, Req2} = read_per_chunk(Req, 0, []),
+    Out = iolist_to_binary([
+        ~"n=", integer_to_binary(Count), ~" body=", Body
+    ]),
+    {reply(200, Out), Req2};
 handle(Req) ->
     {reply(200, ~"no body"), Req}.
+
+read_per_chunk(Req, Count, Acc) ->
+    case cactus_req:read_body_chunked(Req) of
+        {ok, _Bytes, Req2} ->
+            {Count, iolist_to_binary(lists:reverse(Acc)), Req2};
+        {more, Bytes, Req2} ->
+            read_per_chunk(Req2, Count + 1, [Bytes | Acc])
+    end.
 
 read_in_chunks(Req, Count, Acc) ->
     case cactus_req:read_body(Req, #{length => 4}) of

@@ -463,7 +463,7 @@ Used by `cactus_req:read_body/1,2`; not part of the public API.
 bytes — content-length framing only; chunked falls through to a
 full read).
 """.
--spec consume_body_state(body_state(), all | {length, non_neg_integer()}) ->
+-spec consume_body_state(body_state(), all | next_chunk | {length, non_neg_integer()}) ->
     {ok, binary(), body_state()}
     | {more, binary(), body_state()}
     | {error, term()}.
@@ -487,6 +487,7 @@ consume_body_state(
     Want =
         case Mode of
             all -> Remaining;
+            next_chunk -> Remaining;
             {length, L} -> min(Remaining, L)
         end,
     case Want > Max of
@@ -510,7 +511,12 @@ consume_body_state(#{framing := chunked} = BS, all) ->
     %% remaining chunks, accumulated in one return.
     chunked_collect(BS, infinity, []);
 consume_body_state(#{framing := chunked} = BS, {length, N}) ->
-    chunked_collect(BS, N, []).
+    chunked_collect(BS, N, []);
+consume_body_state(#{framing := chunked} = BS, next_chunk) ->
+    next_chunk(BS).
+%% Non-chunked framing (none, content_length) is handled by the
+%% earlier clauses above — `next_chunk` is treated as a full drain
+%% inside those, since there are no chunk boundaries to honor.
 
 %% Pull decoded chunked-body bytes out of `BS` until either `Want`
 %% bytes are collected or the body is fully drained. `Want` is either
@@ -559,6 +565,41 @@ chunked_collect(#{buffered := Buf, recv := Recv, max := Max, bytes_read := Read}
             case Recv() of
                 {ok, More} ->
                     chunked_collect(BS#{buffered := <<Buf/binary, More/binary>>}, Want, Acc);
+                {error, _} = E ->
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+%% Pull exactly one decoded chunk out of a chunked body_state. Pending
+%% bytes (left over from a length-bounded read) are returned first; if
+%% pending is empty, parse the next wire chunk. End-of-body returns
+%% `{ok, <<>>, BS}`.
+-spec next_chunk(body_state()) ->
+    {ok, binary(), body_state()}
+    | {more, binary(), body_state()}
+    | {error, term()}.
+next_chunk(#{pending := Pending} = BS) when byte_size(Pending) > 0 ->
+    {more, Pending, BS#{pending := <<>>}};
+next_chunk(#{done := true} = BS) ->
+    {ok, <<>>, BS};
+next_chunk(#{buffered := Buf, recv := Recv, max := Max, bytes_read := Read} = BS) ->
+    case cactus_http1:parse_chunk(Buf) of
+        {ok, Data, Rest} ->
+            NewRead = Read + byte_size(Data),
+            case NewRead > Max of
+                true ->
+                    {error, content_length_too_large};
+                false ->
+                    {more, Data, BS#{buffered := Rest, bytes_read := NewRead}}
+            end;
+        {ok, last, _Trailers, Rest} ->
+            {ok, <<>>, BS#{buffered := Rest, done := true}};
+        {more, _} ->
+            case Recv() of
+                {ok, More} ->
+                    next_chunk(BS#{buffered := <<Buf/binary, More/binary>>});
                 {error, _} = E ->
                     E
             end;
