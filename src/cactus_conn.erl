@@ -22,6 +22,7 @@ behaviour and routing arrive in slices 3–4.
     dispatch := dispatch(),
     max_content_length := non_neg_integer(),
     request_timeout := non_neg_integer(),
+    keep_alive_timeout := non_neg_integer(),
     max_keep_alive_request := pos_integer()
 }.
 
@@ -57,19 +58,40 @@ serve(Socket, ProtoOpts) ->
 serve_loop(_Socket, _Peer, _Scheme, #{max_keep_alive_request := Max}, Count) when Count >= Max ->
     ok;
 serve_loop(Socket, Peer, Scheme, ProtoOpts, Count) ->
-    case process_one(Socket, Peer, Scheme, ProtoOpts) of
+    %% First request on a fresh connection: bounded by request_timeout, and
+    %% a silent client gets a 408. Idle wait between keep-alive requests:
+    %% bounded by keep_alive_timeout, and an idle client just gets the
+    %% socket closed silently — no 408 to a peer that wasn't going to read it.
+    {Timeout, Phase} =
+        case Count of
+            0 -> {maps:get(request_timeout, ProtoOpts), first};
+            _ -> {maps:get(keep_alive_timeout, ProtoOpts), keep_alive}
+        end,
+    case process_one(Socket, Peer, Scheme, ProtoOpts, Timeout, Phase) of
         keep_alive -> serve_loop(Socket, Peer, Scheme, ProtoOpts, Count + 1);
         close -> ok
     end.
 
--spec process_one(cactus_transport:socket(), term(), http | https, proto_opts()) ->
-    keep_alive | close.
-process_one(Socket, Peer, Scheme, #{
-    dispatch := Dispatch,
-    max_content_length := MaxCL,
-    request_timeout := ReqTimeout
-}) ->
-    Deadline = erlang:monotonic_time(millisecond) + ReqTimeout,
+-spec process_one(
+    cactus_transport:socket(),
+    term(),
+    http | https,
+    proto_opts(),
+    non_neg_integer(),
+    first | keep_alive
+) -> keep_alive | close.
+process_one(
+    Socket,
+    Peer,
+    Scheme,
+    #{
+        dispatch := Dispatch,
+        max_content_length := MaxCL
+    },
+    Timeout,
+    Phase
+) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
     Recv = make_recv(Socket, Deadline),
     case parse_loop(<<>>, Recv) of
         {ok, Req0, Buffered} ->
@@ -100,12 +122,17 @@ process_one(Socket, Peer, Scheme, #{
                     close
             end;
         {error, request_timeout} ->
-            _ = send_request_timeout(Socket),
+            _ = maybe_send_request_timeout(Socket, Phase),
             close;
         {error, _} ->
             _ = send_bad_request(Socket),
             close
     end.
+
+-spec maybe_send_request_timeout(cactus_transport:socket(), first | keep_alive) ->
+    ok | {error, term()}.
+maybe_send_request_timeout(Socket, first) -> send_request_timeout(Socket);
+maybe_send_request_timeout(_Socket, keep_alive) -> ok.
 
 %% Build a recv closure with a single overall deadline. `gen_tcp:recv`
 %% with a negative timeout is undefined, so we cap at 0 — which makes

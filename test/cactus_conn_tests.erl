@@ -730,6 +730,30 @@ conn_handler_crash_returns_500_test_() ->
             end}
         end}.
 
+conn_keep_alive_timeout_closes_idle_connection_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_ka_idle, #{
+                port => 0,
+                handler => cactus_keepalive_handler,
+                keep_alive_timeout => 150
+            }),
+            cactus_listener:port(conn_test_ka_idle)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_ka_idle) end, fun(Port) ->
+            {"server closes a connection that sits idle past keep_alive_timeout", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                {ok, _Resp} = gen_tcp:recv(Sock, 0, 1000),
+                %% Sit idle past the configured keep_alive_timeout. Server
+                %% should close; recv on the closed half returns {error, closed}.
+                ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 1000)),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
 conn_sends_100_continue_before_reading_body_test_() ->
     {setup,
         fun() ->
