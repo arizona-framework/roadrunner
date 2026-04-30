@@ -9,7 +9,14 @@ tagged `{error, _}` results, leaving the caller in control of the
 response (`400`, `414`, `431`, etc.).
 """.
 
--export([parse_request_line/1, parse_header/1, parse_headers/1, parse_request/1, parse_chunk/1]).
+-export([
+    parse_request_line/1,
+    parse_header/1,
+    parse_headers/1,
+    parse_request/1,
+    parse_chunk/1,
+    response/3
+]).
 
 -export_type([version/0, headers/0, request/0]).
 
@@ -545,3 +552,50 @@ parse_hex_chars(<<C, R/binary>>, Acc) when C >= $A, C =< $F ->
     parse_hex_chars(R, Acc * 16 + (C - $A + 10));
 parse_hex_chars(_, _) ->
     error.
+
+-doc """
+Build a complete HTTP/1.1 response message.
+
+Returns iodata — caller is free to write directly to a socket without a
+flatten step. The caller is responsible for content framing: this
+function does **not** auto-inject `Content-Length` or `Transfer-Encoding`
+headers, nor a `Server` token (a higher-level builder will do that).
+
+Status reason phrases are looked up for the common HTTP codes; unknown
+codes get an empty reason (RFC 9112 §4.1 makes the phrase optional).
+""".
+-spec response(StatusCode :: 100..599, headers(), iodata()) -> iodata().
+response(Status, Headers, Body) when
+    is_integer(Status), Status >= 100, Status =< 599
+->
+    [
+        ~"HTTP/1.1 ",
+        integer_to_binary(Status),
+        $\s,
+        reason(Status),
+        ~"\r\n",
+        encode_headers(Headers),
+        ~"\r\n",
+        Body
+    ].
+
+-spec encode_headers(headers()) -> iodata().
+encode_headers([]) ->
+    [];
+encode_headers([{Name, Value} | Rest]) ->
+    [Name, ~": ", Value, ~"\r\n" | encode_headers(Rest)].
+
+-spec reason(100..599) -> binary().
+reason(200) -> ~"OK";
+reason(201) -> ~"Created";
+reason(204) -> ~"No Content";
+reason(301) -> ~"Moved Permanently";
+reason(302) -> ~"Found";
+reason(304) -> ~"Not Modified";
+reason(400) -> ~"Bad Request";
+reason(401) -> ~"Unauthorized";
+reason(403) -> ~"Forbidden";
+reason(404) -> ~"Not Found";
+reason(500) -> ~"Internal Server Error";
+reason(503) -> ~"Service Unavailable";
+reason(_) -> ~"".

@@ -635,3 +635,79 @@ chunk_last_bad_trailer_propagates_test() ->
         {error, bad_header},
         cactus_http1:parse_chunk(~"0\r\nbad trailer\r\n\r\n")
     ).
+
+%% =============================================================================
+%% response/3
+%% =============================================================================
+
+response_minimal_test() ->
+    ?assertEqual(
+        ~"HTTP/1.1 200 OK\r\n\r\n",
+        iolist_to_binary(cactus_http1:response(200, [], ~""))
+    ).
+
+response_with_body_test() ->
+    ?assertEqual(
+        ~"HTTP/1.1 200 OK\r\n\r\nhello",
+        iolist_to_binary(cactus_http1:response(200, [], ~"hello"))
+    ).
+
+response_with_single_header_test() ->
+    ?assertEqual(
+        ~"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\r\nhi",
+        iolist_to_binary(
+            cactus_http1:response(200, [{~"content-type", ~"text/plain"}], ~"hi")
+        )
+    ).
+
+response_preserves_header_order_test() ->
+    %% Headers must appear in the order the caller supplied them — important
+    %% for repeated headers like Set-Cookie.
+    ?assertEqual(
+        ~"HTTP/1.1 200 OK\r\nset-cookie: a=1\r\nset-cookie: b=2\r\nx-trace: 7\r\n\r\n",
+        iolist_to_binary(
+            cactus_http1:response(
+                200,
+                [{~"set-cookie", ~"a=1"}, {~"set-cookie", ~"b=2"}, {~"x-trace", ~"7"}],
+                ~""
+            )
+        )
+    ).
+
+response_accepts_iolist_body_test() ->
+    %% iodata input flows through without forcing a flatten.
+    Result = cactus_http1:response(200, [], [~"hello", ~" ", [~"wo", ~"rld"]]),
+    ?assertEqual(
+        ~"HTTP/1.1 200 OK\r\n\r\nhello world",
+        iolist_to_binary(Result)
+    ).
+
+response_status_reason_phrases_test_() ->
+    Cases = [
+        {200, ~"OK"},
+        {201, ~"Created"},
+        {204, ~"No Content"},
+        {301, ~"Moved Permanently"},
+        {302, ~"Found"},
+        {304, ~"Not Modified"},
+        {400, ~"Bad Request"},
+        {401, ~"Unauthorized"},
+        {403, ~"Forbidden"},
+        {404, ~"Not Found"},
+        {500, ~"Internal Server Error"},
+        {503, ~"Service Unavailable"}
+    ],
+    [
+        ?_assertEqual(
+            <<"HTTP/1.1 ", (integer_to_binary(S))/binary, " ", R/binary, "\r\n\r\n">>,
+            iolist_to_binary(cactus_http1:response(S, [], ~""))
+        )
+     || {S, R} <- Cases
+    ].
+
+response_unknown_status_has_empty_reason_test() ->
+    %% RFC 9112 §4.1 makes reason-phrase optional; we emit an empty one.
+    ?assertEqual(
+        ~"HTTP/1.1 599 \r\n\r\n",
+        iolist_to_binary(cactus_http1:response(599, [], ~""))
+    ).
