@@ -730,6 +730,35 @@ conn_handler_crash_returns_500_test_() ->
             end}
         end}.
 
+conn_max_clients_rejects_excess_connections_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_max_clients, #{
+                port => 0,
+                handler => cactus_keepalive_handler,
+                max_clients => 1
+            }),
+            cactus_listener:port(conn_test_max_clients)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_max_clients) end, fun(Port) ->
+            {"second connection past max_clients=1 is closed before any response", fun() ->
+                {ok, Sock1} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock1, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                {ok, Resp1} = gen_tcp:recv(Sock1, 0, 1000),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Resp1),
+                %% Sock1 is now in keep-alive — the cap is held.
+                {ok, Sock2} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                %% The acceptor closes Sock2 immediately — recv sees EOF.
+                ?assertEqual({error, closed}, gen_tcp:recv(Sock2, 0, 1000)),
+                ok = gen_tcp:close(Sock1),
+                ok = gen_tcp:close(Sock2)
+            end}
+        end}.
+
 conn_keep_alive_timeout_closes_idle_connection_test_() ->
     {setup,
         fun() ->

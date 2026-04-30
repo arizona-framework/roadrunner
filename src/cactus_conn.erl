@@ -10,7 +10,7 @@ This is the minimum end-to-end pipeline for slice 2; the handler
 behaviour and routing arrive in slices 3–4.
 """.
 
--export([start/2, parse_loop/2, read_body/4, peer/1]).
+-export([start/2, parse_loop/2, read_body/4, peer/1, try_acquire_slot/1, release_slot/1]).
 
 -export_type([proto_opts/0, dispatch/0]).
 
@@ -23,7 +23,9 @@ behaviour and routing arrive in slices 3–4.
     max_content_length := non_neg_integer(),
     request_timeout := non_neg_integer(),
     keep_alive_timeout := non_neg_integer(),
-    max_keep_alive_request := pos_integer()
+    max_keep_alive_request := pos_integer(),
+    max_clients := pos_integer(),
+    client_counter := atomics:atomics_ref()
 }.
 
 -doc """
@@ -38,11 +40,41 @@ send the process the atom `shoot` to release it.
 start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
     Pid = proc_lib:spawn(fun() ->
         proc_lib:set_label(cactus_conn),
-        receive
-            shoot -> serve(Socket, ProtoOpts)
+        try
+            receive
+                shoot -> serve(Socket, ProtoOpts)
+            end
+        after
+            release_slot(ProtoOpts)
         end
     end),
     {ok, Pid}.
+
+-doc """
+Try to bump the live-connection counter under `max_clients`. Returns
+`true` on success (caller may proceed to spawn a conn), `false` if
+the cap is already met (caller must close the accepted socket).
+
+The check is racy by a small amount: between increment and rollback
+multiple acceptors may briefly observe a count slightly above the
+cap, but the count is corrected immediately by the rollback. The
+overshoot is at most `num_acceptors - 1` — bounded and harmless.
+""".
+-spec try_acquire_slot(proto_opts()) -> boolean().
+try_acquire_slot(#{client_counter := Ref, max_clients := Max}) ->
+    case atomics:add_get(Ref, 1, 1) of
+        N when N =< Max ->
+            true;
+        _ ->
+            atomics:sub(Ref, 1, 1),
+            false
+    end.
+
+-doc "Decrement the live-connection counter — paired with `try_acquire_slot/1`.".
+-spec release_slot(proto_opts()) -> ok.
+release_slot(#{client_counter := Ref}) ->
+    _ = atomics:sub(Ref, 1, 1),
+    ok.
 
 -spec serve(cactus_transport:socket(), proto_opts()) -> ok.
 serve(Socket, ProtoOpts) ->

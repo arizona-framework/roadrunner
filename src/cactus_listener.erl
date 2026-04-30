@@ -22,6 +22,7 @@ connection workers will hang off it in subsequent features.
 -define(DEFAULT_KEEP_ALIVE_TIMEOUT, 60000).
 -define(DEFAULT_NUM_ACCEPTORS, 10).
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
+-define(DEFAULT_MAX_CLIENTS, 150).
 
 -type opts() :: #{
     port := inet:port_number(),
@@ -32,6 +33,7 @@ connection workers will hang off it in subsequent features.
     keep_alive_timeout => non_neg_integer(),
     num_acceptors => pos_integer(),
     max_keep_alive_request => pos_integer(),
+    max_clients => pos_integer(),
     tls => [ssl:tls_server_option()]
 }.
 
@@ -107,13 +109,19 @@ spawn_acceptors(LSocket, ProtoOpts, N) ->
 
 -spec build_proto_opts(opts()) -> cactus_conn:proto_opts().
 build_proto_opts(Opts) ->
+    %% A single shared atomics counter tracks live connections per listener.
+    %% Acceptors bump it before spawning a conn; conns decrement on exit.
+    %% Lock-free, ~1ns per op — cheap enough on the accept hot path.
+    Counter = atomics:new(1, [{signed, false}]),
     #{
         dispatch => build_dispatch(Opts),
         max_content_length => maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
         request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
         keep_alive_timeout => maps:get(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT),
         max_keep_alive_request =>
-            maps:get(max_keep_alive_request, Opts, ?DEFAULT_MAX_KEEP_ALIVE)
+            maps:get(max_keep_alive_request, Opts, ?DEFAULT_MAX_KEEP_ALIVE),
+        max_clients => maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
+        client_counter => Counter
     }.
 
 %% `routes` (router-based dispatch) takes precedence over `handler`. With

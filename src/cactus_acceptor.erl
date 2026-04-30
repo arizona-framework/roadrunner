@@ -30,12 +30,24 @@ start_link(LSocket, ProtoOpts) ->
 loop(LSocket, ProtoOpts) ->
     case cactus_transport:accept(LSocket) of
         {ok, Socket} ->
-            {ok, ConnPid} = cactus_conn:start(Socket, ProtoOpts),
-            ok = cactus_transport:controlling_process(Socket, ConnPid),
-            ConnPid ! shoot,
+            handle_accepted(Socket, ProtoOpts),
             loop(LSocket, ProtoOpts);
         {error, _} ->
             %% Listen socket was closed (or another transport error) —
             %% terminate cleanly; the linked listener will tear us down.
+            ok
+    end.
+
+-spec handle_accepted(cactus_transport:socket(), cactus_conn:proto_opts()) -> ok.
+handle_accepted(Socket, ProtoOpts) ->
+    case cactus_conn:try_acquire_slot(ProtoOpts) of
+        true ->
+            {ok, ConnPid} = cactus_conn:start(Socket, ProtoOpts),
+            ok = cactus_transport:controlling_process(Socket, ConnPid),
+            ConnPid ! shoot,
+            ok;
+        false ->
+            %% Over max_clients — drop the new connection on the floor.
+            _ = cactus_transport:close(Socket),
             ok
     end.
