@@ -2,16 +2,18 @@
 -moduledoc """
 Behaviour for handling parsed HTTP requests.
 
-Implementations receive the parsed request map and return one of:
+Implementations receive the parsed request map and return a
+`{Response, Req2}` pair — the `Response` selects what the conn does
+on the wire, and `Req2` is the (possibly mutated) request threaded
+back to the conn. Always returning `Req2` lets the conn drain
+unread bodies in `body_buffering => manual` mode, lets response
+middlewares observe and rewrite, and matches cowboy's idiom of
+threading `Req` through the entire request lifecycle.
+
+`Response` is one of:
 
 - `{StatusCode, Headers, Body}` — buffered response, encoded and sent
   in one shot.
-- `{StatusCode, Headers, Body, Req2}` — same as above but threads the
-  request back to the conn. Use this in `body_buffering => manual`
-  mode when you want keep-alive on the connection: the conn drains
-  whatever bytes you didn't read out of `Req2.body_state` before
-  serving the next request. `Req2` is whatever `cactus_req:read_body/1,2`
-  returned (or the original `Req` if you didn't read at all).
 - `{stream, StatusCode, Headers, StreamFun}` — chunked streaming. The
   connection emits status + headers (with `Transfer-Encoding: chunked`
   auto-prepended) and calls `StreamFun(Send)` where
@@ -25,26 +27,33 @@ Implementations receive the parsed request map and return one of:
   and closes. Useful for SSE/long-poll endpoints that subscribe to a
   pubsub topic in `handle/1` and forward messages to the wire.
 - `{websocket, Module, State}` — upgrade to a `cactus_ws_handler`.
+
+If the handler did not call `cactus_req:read_body/1,2`, just thread
+the original `Req` back. Idiomatic shape:
+
+```erlang
+handle(Req) ->
+    {{200, [], ~"hello"}, Req}.
+
+handle(Req) ->
+    {ok, Body, Req2} = cactus_req:read_body(Req),
+    {{200, [], Body}, Req2}.
+```
 """.
 
--export_type([send_fun/0, stream_fun/0, push_fun/0, response/0]).
+-export_type([send_fun/0, stream_fun/0, push_fun/0, response/0, result/0]).
 
 -type send_fun() :: fun((iodata(), nofin | fin) -> ok | {error, term()}).
 -type stream_fun() :: fun((send_fun()) -> any()).
 -type push_fun() :: fun((iodata()) -> ok | {error, term()}).
 -type response() ::
     {StatusCode :: cactus_http1:status(), cactus_http1:headers(), Body :: iodata()}
-    | {
-        StatusCode :: cactus_http1:status(),
-        cactus_http1:headers(),
-        Body :: iodata(),
-        Req2 :: cactus_http1:request()
-    }
     | {stream, StatusCode :: cactus_http1:status(), cactus_http1:headers(), stream_fun()}
     | {loop, StatusCode :: cactus_http1:status(), cactus_http1:headers(), State :: term()}
     | {websocket, Module :: module(), State :: term()}.
+-type result() :: {response(), cactus_http1:request()}.
 
--callback handle(Request :: cactus_http1:request()) -> response().
+-callback handle(Request :: cactus_http1:request()) -> result().
 -callback handle_info(Info :: term(), Push :: push_fun(), State :: term()) ->
     {ok, NewState :: term()} | {stop, NewState :: term()}.
 

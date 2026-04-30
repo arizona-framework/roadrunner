@@ -7,26 +7,29 @@
 %% =============================================================================
 
 compose_empty_returns_handler_test() ->
-    Handler = fun(_Req) -> {200, [], ~"ok"} end,
+    Handler = fun(R) -> {{200, [], ~"ok"}, R} end,
     Pipeline = cactus_middleware:compose([], Handler),
-    ?assertEqual({200, [], ~"ok"}, Pipeline(req())).
+    Req = req(),
+    ?assertEqual({{200, [], ~"ok"}, Req}, Pipeline(Req)).
 
 compose_single_fun_passes_through_test() ->
     Mw = fun(R, Next) -> Next(R) end,
-    Handler = fun(_Req) -> {201, [], ~"handler"} end,
+    Handler = fun(R) -> {{201, [], ~"handler"}, R} end,
     Pipeline = cactus_middleware:compose([Mw], Handler),
-    ?assertEqual({201, [], ~"handler"}, Pipeline(req())).
+    Req = req(),
+    ?assertEqual({{201, [], ~"handler"}, Req}, Pipeline(Req)).
 
 compose_halt_skips_handler_test() ->
     HandlerCalled = make_ref(),
     Self = self(),
-    Mw = fun(_R, _Next) -> {401, [], ~"nope"} end,
-    Handler = fun(_Req) ->
+    Mw = fun(R, _Next) -> {{401, [], ~"nope"}, R} end,
+    Handler = fun(R) ->
         Self ! HandlerCalled,
-        {200, [], ~"reached"}
+        {{200, [], ~"reached"}, R}
     end,
     Pipeline = cactus_middleware:compose([Mw], Handler),
-    ?assertEqual({401, [], ~"nope"}, Pipeline(req())),
+    Req = req(),
+    ?assertEqual({{401, [], ~"nope"}, Req}, Pipeline(Req)),
     %% Handler must NOT have been invoked.
     receive
         HandlerCalled -> error(handler_was_called)
@@ -40,42 +43,46 @@ compose_request_mutation_visible_to_handler_test() ->
         Next(R#{headers := [{~"x-from-mw", ~"yes"} | H]})
     end,
     Handler = fun(R) ->
-        {200, [], cactus_req:header(~"x-from-mw", R)}
+        {{200, [], cactus_req:header(~"x-from-mw", R)}, R}
     end,
     Pipeline = cactus_middleware:compose([Mw], Handler),
-    ?assertEqual({200, [], ~"yes"}, Pipeline(req())).
+    {{Status, Headers, Body}, _Req2} = Pipeline(req()),
+    ?assertEqual({200, [], ~"yes"}, {Status, Headers, Body}).
 
 compose_response_wrapping_works_test() ->
     %% Middleware calls Next then transforms the response.
     Mw = fun(R, Next) ->
-        {S, H, B} = Next(R),
-        {S, [{~"x-wrapped", ~"1"} | H], <<"[", B/binary, "]">>}
+        {{S, H, B}, R2} = Next(R),
+        {{S, [{~"x-wrapped", ~"1"} | H], <<"[", B/binary, "]">>}, R2}
     end,
-    Handler = fun(_Req) -> {200, [], ~"hi"} end,
+    Handler = fun(R) -> {{200, [], ~"hi"}, R} end,
     Pipeline = cactus_middleware:compose([Mw], Handler),
-    ?assertEqual({200, [{~"x-wrapped", ~"1"}], ~"[hi]"}, Pipeline(req())).
+    {{Status, Headers, Body}, _Req2} = Pipeline(req()),
+    ?assertEqual({200, [{~"x-wrapped", ~"1"}], ~"[hi]"}, {Status, Headers, Body}).
 
 compose_two_middlewares_outer_wraps_inner_test() ->
     %% First middleware in the list runs OUTERMOST. It sees the response
     %% the second middleware (and ultimately the handler) produced.
     Outer = fun(R, Next) ->
-        {S, H, B} = Next(R),
-        {S, H, <<"O(", B/binary, ")">>}
+        {{S, H, B}, R2} = Next(R),
+        {{S, H, <<"O(", B/binary, ")">>}, R2}
     end,
     Inner = fun(R, Next) ->
-        {S, H, B} = Next(R),
-        {S, H, <<"I(", B/binary, ")">>}
+        {{S, H, B}, R2} = Next(R),
+        {{S, H, <<"I(", B/binary, ")">>}, R2}
     end,
-    Handler = fun(_Req) -> {200, [], ~"x"} end,
+    Handler = fun(R) -> {{200, [], ~"x"}, R} end,
     Pipeline = cactus_middleware:compose([Outer, Inner], Handler),
-    ?assertEqual({200, [], ~"O(I(x))"}, Pipeline(req())).
+    {{Status, Headers, Body}, _Req2} = Pipeline(req()),
+    ?assertEqual({200, [], ~"O(I(x))"}, {Status, Headers, Body}).
 
 compose_module_form_dispatches_via_call2_test() ->
     Handler = fun(R) ->
-        {200, [], cactus_req:header(~"x-mw-mod", R)}
+        {{200, [], cactus_req:header(~"x-mw-mod", R)}, R}
     end,
     Pipeline = cactus_middleware:compose([cactus_test_middlewares], Handler),
-    ?assertEqual({200, [], ~"yes"}, Pipeline(req())).
+    {{Status, Headers, Body}, _Req2} = Pipeline(req()),
+    ?assertEqual({200, [], ~"yes"}, {Status, Headers, Body}).
 
 %% =============================================================================
 %% End-to-end through cactus_conn — exercises route_opts.middlewares plumbing.

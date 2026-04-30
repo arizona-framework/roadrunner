@@ -10,14 +10,15 @@ Replaces the hardcoded body cactus_conn carried before slice 3.
 
 -export([handle/1]).
 
--spec handle(cactus_http1:request()) ->
-    {200, cactus_http1:headers(), iodata()}.
-handle(_Req) ->
+-spec handle(cactus_http1:request()) -> cactus_handler:result().
+handle(Req) ->
     Body = ~"Hello, cactus!\r\n",
-    {200,
-        [
-            {~"content-type", ~"text/plain"},
-            {~"content-length", integer_to_binary(byte_size(Body))},
-            {~"connection", ~"close"}
-        ],
-        Body}.
+    Resp =
+        {200,
+            [
+                {~"content-type", ~"text/plain"},
+                {~"content-length", integer_to_binary(byte_size(Body))},
+                {~"connection", ~"close"}
+            ],
+            Body},
+    {Resp, Req}.

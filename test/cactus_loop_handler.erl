@@ -9,9 +9,9 @@ SSE-style chunk per incoming Erlang message. Registers itself under
 
 -export([handle/1, handle_info/3]).
 
-handle(_Req) ->
+handle(Req) ->
     true = register(cactus_loop_test_conn, self()),
-    {loop, 200, [{~"content-type", ~"text/event-stream"}], 0}.
+    {{loop, 200, [{~"content-type", ~"text/event-stream"}], 0}, Req}.
 
 handle_info({push, Data}, Push, N) ->
     _ = Push([~"data: ", Data, ~"\n\n"]),

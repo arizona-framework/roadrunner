@@ -888,30 +888,6 @@ conn_manual_body_buffering_keep_alive_after_full_read_test_() ->
             end}
         end}.
 
-conn_auto_mode_4tuple_handler_drains_noop_test_() ->
-    {setup,
-        fun() ->
-            {ok, _} = cactus_listener:start_link(conn_test_4tuple_auto, #{
-                port => 0,
-                handler => cactus_4tuple_auto_handler
-            }),
-            cactus_listener:port(conn_test_4tuple_auto)
-        end,
-        fun(_) -> ok = cactus_listener:stop(conn_test_4tuple_auto) end, fun(Port) ->
-            {"auto-mode 4-tuple handler: drain is a no-op, keep-alive engages", fun() ->
-                {ok, Sock} = gen_tcp:connect(
-                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
-                ),
-                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
-                {ok, R1} = gen_tcp:recv(Sock, 0, 1000),
-                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, R1),
-                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
-                {ok, R2} = gen_tcp:recv(Sock, 0, 1000),
-                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, R2),
-                ok = gen_tcp:close(Sock)
-            end}
-        end}.
-
 conn_manual_body_buffering_drain_error_forces_close_test_() ->
     {setup,
         fun() ->

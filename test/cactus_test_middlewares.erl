@@ -35,13 +35,13 @@ tag_request(Req, Next) ->
 %% middleware sees the handler's output, which simple cowboy-style
 %% middlewares could not.
 wrap_response(Req, Next) ->
-    {Status, Headers, Body} = Next(Req),
+    {{Status, Headers, Body}, Req2} = Next(Req),
     Wrapped = iolist_to_binary([~"[wrapped] ", Body]),
-    {Status, [{~"x-wrapped", ~"yes"} | Headers], Wrapped}.
+    {{Status, [{~"x-wrapped", ~"yes"} | Headers], Wrapped}, Req2}.
 
 %% Fun-form: short-circuit without calling Next.
-halt_401(_Req, _Next) ->
-    {401, [{~"content-length", ~"0"}], ~""}.
+halt_401(Req, _Next) ->
+    {{401, [{~"content-length", ~"0"}], ~""}, Req}.
 
 %% Fun-form: crash deliberately to exercise the 500 path.
 crash(_Req, _Next) ->

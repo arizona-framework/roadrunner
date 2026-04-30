@@ -31,17 +31,19 @@ returns 404 on a missing file or any path that contains `..`.
     ~".txt" => ~"text/plain; charset=utf-8"
 }).
 
--spec handle(cactus_http1:request()) -> cactus_resp:response().
+-spec handle(cactus_http1:request()) -> cactus_handler:result().
 handle(Req) ->
     #{dir := Dir} = cactus_req:route_opts(Req),
     Segments = maps:get(~"path", cactus_req:bindings(Req), []),
-    case validate_segments(Segments) of
-        ok ->
-            FilePath = filename:join([Dir | Segments]),
-            serve_file(FilePath);
-        traversal ->
-            cactus_resp:not_found()
-    end.
+    Resp =
+        case validate_segments(Segments) of
+            ok ->
+                FilePath = filename:join([Dir | Segments]),
+                serve_file(FilePath);
+            traversal ->
+                cactus_resp:not_found()
+        end,
+    {Resp, Req}.
 
 -spec serve_file(file:filename_all()) -> cactus_resp:response().
 serve_file(FilePath) ->

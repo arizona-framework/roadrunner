@@ -556,11 +556,15 @@ parse_loop(Buf, RecvFun) ->
 handle_and_send(Socket, Handler, Req, ListenerMws) ->
     %% Listener-level middlewares wrap route-level middlewares wrap handler.
     %% Both lists run "first = outermost"; an empty list is a no-op.
+    %% The pipeline returns `{Response, Req2}` — `Req2` is always
+    %% threaded back so the conn can drain (in manual mode) and so
+    %% response middlewares can rewrite. See `cactus_handler:result/0`.
     RouteMws = route_middlewares(Req),
     HandlerFun = fun(R) -> Handler:handle(R) end,
     Pipeline = cactus_middleware:compose(ListenerMws ++ RouteMws, HandlerFun),
     try Pipeline(Req) of
-        Response -> dispatch_response(Socket, Handler, Req, Response)
+        {Response, Req2} when is_map(Req2) ->
+            dispatch_response(Socket, Handler, Req2, Response)
     catch
         Class:Reason:Stack ->
             logger:error(#{
@@ -604,26 +608,12 @@ dispatch_response(Socket, _Handler, Req, {Status, Headers, Body}) when is_intege
     RespBody = response_body_for(Req, Body),
     Resp = cactus_http1:response(Status, Headers, RespBody),
     _ = cactus_transport:send(Socket, Resp),
-    %% Manual mode without a returned `Req2` means the handler did not
-    %% thread its read state back — we can't safely keep-alive because we
-    %% don't know what's left on the socket. Force close in that case;
-    %% otherwise honor the standard Connection-header decision.
-    case Req of
-        #{body_state := _} -> close;
-        _ -> keep_alive_decision(Req, Headers)
-    end;
-dispatch_response(Socket, _Handler, _Req, {Status, Headers, Body, Req2}) when
-    is_integer(Status), is_map(Req2)
-->
-    %% 4-tuple shape: handler threaded `Req2` back. Send the response,
-    %% then drain whatever the handler left on the socket so the next
-    %% request lands cleanly. Drain failure (closed peer, malformed
-    %% body, etc.) collapses to close.
-    RespBody = response_body_for(Req2, Body),
-    Resp = cactus_http1:response(Status, Headers, RespBody),
-    _ = cactus_transport:send(Socket, Resp),
-    case drain_body(Req2) of
-        ok -> keep_alive_decision(Req2, Headers);
+    %% Drain whatever the handler left on the socket so the next request
+    %% lands cleanly. In auto mode there's nothing to drain (no
+    %% body_state); in manual mode the conn consumes any unread body.
+    %% Drain failure (closed peer, malformed body, etc.) → close.
+    case drain_body(Req) of
+        ok -> keep_alive_decision(Req, Headers);
         {error, _} -> close
     end.
 

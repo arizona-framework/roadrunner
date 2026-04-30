@@ -9,10 +9,12 @@ size-0 terminator. Used to verify `cactus_conn` honors the
 
 -export([handle/1]).
 
--spec handle(cactus_http1:request()) -> cactus_handler:response().
-handle(_Req) ->
-    {stream, 200, [{~"content-type", ~"text/plain; charset=utf-8"}], fun(Send) ->
-        _ = Send(~"hello ", nofin),
-        _ = Send(~"world", fin),
-        ok
-    end}.
+-spec handle(cactus_http1:request()) -> cactus_handler:result().
+handle(Req) ->
+    Resp =
+        {stream, 200, [{~"content-type", ~"text/plain; charset=utf-8"}], fun(Send) ->
+            _ = Send(~"hello ", nofin),
+            _ = Send(~"world", fin),
+            ok
+        end},
+    {Resp, Req}.

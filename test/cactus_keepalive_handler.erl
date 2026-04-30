@@ -8,13 +8,14 @@ header, so the conn layer's keep-alive logic can engage.
 
 -export([handle/1]).
 
--spec handle(cactus_http1:request()) ->
-    {200, cactus_http1:headers(), iodata()}.
-handle(_Req) ->
+-spec handle(cactus_http1:request()) -> cactus_handler:result().
+handle(Req) ->
     Body = ~"alive\r\n",
-    {200,
-        [
-            {~"content-type", ~"text/plain"},
-            {~"content-length", integer_to_binary(byte_size(Body))}
-        ],
-        Body}.
+    Resp =
+        {200,
+            [
+                {~"content-type", ~"text/plain"},
+                {~"content-length", integer_to_binary(byte_size(Body))}
+            ],
+            Body},
+    {Resp, Req}.

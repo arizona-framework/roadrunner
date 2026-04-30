@@ -9,14 +9,15 @@ actually reaches the user-supplied handler module.
 
 -export([handle/1]).
 
--spec handle(cactus_http1:request()) ->
-    {201, cactus_http1:headers(), iodata()}.
-handle(_Req) ->
+-spec handle(cactus_http1:request()) -> cactus_handler:result().
+handle(Req) ->
     Body = ~"custom handler response",
-    {201,
-        [
-            {~"content-type", ~"text/plain"},
-            {~"content-length", integer_to_binary(byte_size(Body))},
-            {~"connection", ~"close"}
-        ],
-        Body}.
+    Resp =
+        {201,
+            [
+                {~"content-type", ~"text/plain"},
+                {~"content-length", integer_to_binary(byte_size(Body))},
+                {~"connection", ~"close"}
+            ],
+            Body},
+    {Resp, Req}.

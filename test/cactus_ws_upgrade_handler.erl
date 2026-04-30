@@ -8,6 +8,6 @@ to a WebSocket session driven by `cactus_ws_echo_handler`.
 
 -export([handle/1]).
 
--spec handle(cactus_http1:request()) -> cactus_handler:response().
-handle(_Req) ->
-    {websocket, cactus_ws_echo_handler, no_state}.
+-spec handle(cactus_http1:request()) -> cactus_handler:result().
+handle(Req) ->
+    {{websocket, cactus_ws_echo_handler, no_state}, Req}.
