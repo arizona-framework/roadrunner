@@ -66,17 +66,43 @@ serve(Socket, #{handler := Handler, max_content_length := MaxCL}) ->
     fun(() -> {ok, binary()} | {error, term()}),
     non_neg_integer()
 ) ->
-    {ok, binary()} | {error, content_length_too_large | bad_content_length | term()}.
+    {ok, binary()}
+    | {error,
+        content_length_too_large
+        | bad_content_length
+        | bad_transfer_encoding
+        | term()}.
 read_body(Req, Buffered, RecvFun, MaxCL) ->
-    case content_length(Req) of
+    case body_framing(Req) of
         none ->
             {ok, Buffered};
-        {ok, N} when N > MaxCL ->
+        chunked ->
+            read_chunked(Buffered, RecvFun, MaxCL, 0);
+        {content_length, N} when N > MaxCL ->
             {error, content_length_too_large};
-        {ok, N} ->
+        {content_length, N} ->
             read_body_until(N, Buffered, RecvFun);
         {error, _} = Err ->
             Err
+    end.
+
+-spec body_framing(cactus_http1:request()) ->
+    none
+    | chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding}.
+body_framing(Req) ->
+    case cactus_req:header(~"transfer-encoding", Req) of
+        undefined ->
+            case content_length(Req) of
+                none -> none;
+                {ok, N} -> {content_length, N};
+                {error, _} = Err -> Err
+            end;
+        ~"chunked" ->
+            chunked;
+        _ ->
+            {error, bad_transfer_encoding}
     end.
 
 -spec read_body_until(
@@ -92,6 +118,44 @@ read_body_until(N, Acc, RecvFun) ->
     case RecvFun() of
         {ok, Data} -> read_body_until(N, <<Acc/binary, Data/binary>>, RecvFun);
         {error, _} = E -> E
+    end.
+
+%% Read chunks until the size-0 last-chunk, concatenating decoded data
+%% into the result. Caps the accumulated body at MaxCL — a malicious
+%% client cannot stream unbounded chunked bytes past the configured
+%% limit. Body recursion: each call returns the body of the remaining
+%% chunks, the current call prepends its own data on the way out.
+-spec read_chunked(
+    binary(),
+    fun(() -> {ok, binary()} | {error, term()}),
+    non_neg_integer(),
+    non_neg_integer()
+) ->
+    {ok, binary()} | {error, content_length_too_large | term()}.
+read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
+    case cactus_http1:parse_chunk(Buf) of
+        {ok, last, _Trailers, _Rest} ->
+            {ok, <<>>};
+        {ok, Data, Rest} ->
+            NewDecoded = Decoded + byte_size(Data),
+            if
+                NewDecoded > MaxCL ->
+                    {error, content_length_too_large};
+                true ->
+                    case read_chunked(Rest, RecvFun, MaxCL, NewDecoded) of
+                        {ok, More} -> {ok, <<Data/binary, More/binary>>};
+                        {error, _} = E -> E
+                    end
+            end;
+        {more, _} ->
+            case RecvFun() of
+                {ok, More} ->
+                    read_chunked(<<Buf/binary, More/binary>>, RecvFun, MaxCL, Decoded);
+                {error, _} = E ->
+                    E
+            end;
+        {error, _} = E ->
+            E
     end.
 
 -spec content_length(cactus_http1:request()) ->

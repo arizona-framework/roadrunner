@@ -91,6 +91,76 @@ read_body_recv_error_test() ->
         cactus_conn:read_body(Req, ~"hi", Recv, 1000)
     ).
 
+%% --- chunked transfer-encoding ---
+
+read_body_chunked_single_in_buffer_test() ->
+    Req = req_with_headers([{~"transfer-encoding", ~"chunked"}]),
+    NoRecv = fun() -> error(should_not_be_called) end,
+    ?assertEqual(
+        {ok, ~"hello"},
+        cactus_conn:read_body(Req, ~"5\r\nhello\r\n0\r\n\r\n", NoRecv, 1000)
+    ).
+
+read_body_chunked_multiple_in_buffer_test() ->
+    Req = req_with_headers([{~"transfer-encoding", ~"chunked"}]),
+    NoRecv = fun() -> error(should_not_be_called) end,
+    ?assertEqual(
+        {ok, ~"hellofoo"},
+        cactus_conn:read_body(Req, ~"5\r\nhello\r\n3\r\nfoo\r\n0\r\n\r\n", NoRecv, 1000)
+    ).
+
+read_body_chunked_needs_more_recv_test() ->
+    Req = req_with_headers([{~"transfer-encoding", ~"chunked"}]),
+    %% First chunk in buffer, terminator chunk arrives via recv.
+    Recv = fun() -> {ok, ~"0\r\n\r\n"} end,
+    ?assertEqual(
+        {ok, ~"hi"},
+        cactus_conn:read_body(Req, ~"2\r\nhi\r\n", Recv, 1000)
+    ).
+
+read_body_chunked_exceeds_max_test() ->
+    Req = req_with_headers([{~"transfer-encoding", ~"chunked"}]),
+    NoRecv = fun() -> error(should_not_be_called) end,
+    %% MaxCL=3 but the single chunk is 5 bytes.
+    ?assertEqual(
+        {error, content_length_too_large},
+        cactus_conn:read_body(Req, ~"5\r\nhello\r\n0\r\n\r\n", NoRecv, 3)
+    ).
+
+read_body_chunked_second_chunk_exceeds_max_test() ->
+    Req = req_with_headers([{~"transfer-encoding", ~"chunked"}]),
+    NoRecv = fun() -> error(should_not_be_called) end,
+    %% First chunk fits (3 <= 4), second chunk pushes total to 6 > 4 —
+    %% the error must propagate out of the recursive read_chunked call.
+    ?assertEqual(
+        {error, content_length_too_large},
+        cactus_conn:read_body(Req, ~"3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n", NoRecv, 4)
+    ).
+
+read_body_chunked_bad_chunk_size_test() ->
+    Req = req_with_headers([{~"transfer-encoding", ~"chunked"}]),
+    NoRecv = fun() -> error(should_not_be_called) end,
+    ?assertEqual(
+        {error, bad_chunk_size},
+        cactus_conn:read_body(Req, ~"xyz\r\nhello\r\n", NoRecv, 1000)
+    ).
+
+read_body_chunked_recv_error_test() ->
+    Req = req_with_headers([{~"transfer-encoding", ~"chunked"}]),
+    Recv = fun() -> {error, closed} end,
+    ?assertEqual(
+        {error, closed},
+        cactus_conn:read_body(Req, ~"5\r\nhel", Recv, 1000)
+    ).
+
+read_body_unknown_transfer_encoding_rejected_test() ->
+    Req = req_with_headers([{~"transfer-encoding", ~"gzip"}]),
+    NoRecv = fun() -> error(should_not_be_called) end,
+    ?assertEqual(
+        {error, bad_transfer_encoding},
+        cactus_conn:read_body(Req, ~"", NoRecv, 1000)
+    ).
+
 req_with_headers(Headers) ->
     #{
         method => ~"POST",
@@ -228,6 +298,32 @@ conn_rejects_malformed_content_length_test_() ->
                 ),
                 Reply = recv_until_closed(Sock),
                 ?assertMatch(<<"HTTP/1.1 400 ", _/binary>>, Reply),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_decodes_chunked_body_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_chunked, #{
+                port => 0, handler => cactus_echo_body_handler
+            }),
+            cactus_listener:port(conn_test_chunked)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_chunked) end, fun(Port) ->
+            {"chunked body is decoded before reaching the handler", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ChunkedBody = ~"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+                ok = gen_tcp:send(
+                    Sock,
+                    <<"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
+                        ChunkedBody/binary>>
+                ),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"hello world"),
                 ok = gen_tcp:close(Sock)
             end}
         end}.
