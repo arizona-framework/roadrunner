@@ -25,6 +25,8 @@ helpers only fill in what the handler can know.
     status/1
 ]).
 
+-export_type([response/0]).
+
 -type response() :: {cactus_http1:status(), cactus_http1:headers(), iodata()}.
 
 -doc "Plain-text response with `text/plain; charset=utf-8`.".
