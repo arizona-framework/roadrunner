@@ -78,3 +78,12 @@ listener_ignores_unknown_cast_test() ->
     %% Process must still answer call/1 — proves it survived the cast.
     ?assert(cactus_listener:port(listener_test_cast) > 0),
     ok = cactus_listener:stop(listener_test_cast).
+
+listener_honors_num_acceptors_opt_test() ->
+    %% Explicit override exercises the opt path (default is exercised by
+    %% every other listener test).
+    {ok, _} = cactus_listener:start_link(listener_test_pool, #{
+        port => 0, num_acceptors => 3
+    }),
+    ?assert(cactus_listener:port(listener_test_pool) > 0),
+    ok = cactus_listener:stop(listener_test_pool).

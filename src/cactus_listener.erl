@@ -19,13 +19,15 @@ connection workers will hang off it in subsequent features.
 
 -define(DEFAULT_MAX_CONTENT_LENGTH, 10485760).
 -define(DEFAULT_REQUEST_TIMEOUT, 30000).
+-define(DEFAULT_NUM_ACCEPTORS, 10).
 
 -type opts() :: #{
     port := inet:port_number(),
     handler => module(),
     routes => cactus_router:routes(),
     max_content_length => non_neg_integer(),
-    request_timeout => non_neg_integer()
+    request_timeout => non_neg_integer(),
+    num_acceptors => pos_integer()
 }.
 
 -record(state, {
@@ -72,11 +74,25 @@ init(#{port := Port} = Opts) ->
     of
         {ok, LSocket} ->
             {ok, BoundPort} = inet:port(LSocket),
-            {ok, _AcceptorPid} = cactus_acceptor:start_link(LSocket, ProtoOpts),
+            NumAcceptors = maps:get(num_acceptors, Opts, ?DEFAULT_NUM_ACCEPTORS),
+            ok = spawn_acceptors(LSocket, ProtoOpts, NumAcceptors),
             {ok, #state{listen_socket = LSocket, port = BoundPort, proto_opts = ProtoOpts}};
         {error, Reason} ->
             {stop, {listen_failed, Reason}}
     end.
+
+%% Multiple acceptor processes all calling gen_tcp:accept on the same listen
+%% socket — Linux/BSD accept is thread-safe and avoids thundering-herd via
+%% kernel-side queueing.
+-spec spawn_acceptors(gen_tcp:socket(), cactus_conn:proto_opts(), pos_integer()) ->
+    ok.
+spawn_acceptors(LSocket, ProtoOpts, N) ->
+    lists:foreach(
+        fun(_) ->
+            {ok, _Pid} = cactus_acceptor:start_link(LSocket, ProtoOpts)
+        end,
+        lists:seq(1, N)
+    ).
 
 -spec build_proto_opts(opts()) -> cactus_conn:proto_opts().
 build_proto_opts(Opts) ->
