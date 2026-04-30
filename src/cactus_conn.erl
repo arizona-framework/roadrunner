@@ -51,10 +51,17 @@ read it anyway.
 %% Opaque body-read state attached to the request in manual buffering
 %% mode. `cactus_req:read_body/1,2` consumes from this state; the conn
 %% owns the recv closure and tracks how much remains.
+%%
+%% `pending` holds decoded body bytes that have been parsed off the
+%% wire but not yet handed to the caller — used for chunked framing
+%% to absorb a chunk's payload across multiple length-bounded calls.
+%% `done` flips true once the size-0 last chunk is parsed.
 -opaque body_state() :: #{
     framing := none | chunked | {content_length, non_neg_integer()},
     buffered := binary(),
     bytes_read := non_neg_integer(),
+    pending := binary(),
+    done := boolean(),
     recv := fun(() -> {ok, binary()} | {error, term()}),
     max := non_neg_integer()
 }.
@@ -224,6 +231,8 @@ handle_with_body(Socket, Req, Buffered, Recv, MaxCL, Dispatch, ListenerMws, manu
                 framing => Framing,
                 buffered => Buffered,
                 bytes_read => 0,
+                pending => <<>>,
+                done => false,
                 recv => Recv,
                 max => MaxCL
             },
@@ -496,13 +505,65 @@ consume_body_state(
                     E
             end
     end;
-consume_body_state(#{framing := chunked, buffered := Buf, recv := Recv, max := Max} = BS, _Mode) ->
-    %% Chunked: drain to end in one shot. Streaming-with-length over
-    %% chunked framing requires tracking partial chunks across calls;
-    %% defer until there's a use case.
-    case read_chunked(Buf, Recv, Max, 0) of
-        {ok, Body} -> {ok, Body, BS#{buffered := <<>>}};
-        {error, _} = E -> E
+consume_body_state(#{framing := chunked} = BS, all) ->
+    %% Drain everything left: any pending decoded bytes plus all
+    %% remaining chunks, accumulated in one return.
+    chunked_collect(BS, infinity, []);
+consume_body_state(#{framing := chunked} = BS, {length, N}) ->
+    chunked_collect(BS, N, []).
+
+%% Pull decoded chunked-body bytes out of `BS` until either `Want`
+%% bytes are collected or the body is fully drained. `Want` is either
+%% `infinity` (drain to end — caller asked for `all`) or a positive
+%% integer (caller asked for `{length, N}`). Returns `{ok, Bytes, BS2}`
+%% when no more body remains, `{more, Bytes, BS2}` when bytes were
+%% returned but the body is not yet exhausted, or `{error, Reason}`.
+-spec chunked_collect(body_state(), infinity | non_neg_integer(), [binary()]) ->
+    {ok, binary(), body_state()}
+    | {more, binary(), body_state()}
+    | {error, term()}.
+chunked_collect(#{pending := Pending} = BS, Want, Acc) when
+    Want =/= infinity, byte_size(Pending) >= Want
+->
+    %% Pending alone satisfies the request — no need to look at the
+    %% wire. The body may or may not have more bytes; we always tag
+    %% `more` here and let the next call detect end-of-body via the
+    %% `done` clause below.
+    <<Take:Want/binary, RestPending/binary>> = Pending,
+    Out = iolist_to_binary(lists:reverse([Take | Acc])),
+    {more, Out, BS#{pending := RestPending}};
+chunked_collect(#{pending := Pending} = BS, Want, Acc) when byte_size(Pending) > 0 ->
+    %% Take everything pending, then try to fill more from the wire.
+    NewWant =
+        case Want of
+            infinity -> infinity;
+            N -> N - byte_size(Pending)
+        end,
+    chunked_collect(BS#{pending := <<>>}, NewWant, [Pending | Acc]);
+chunked_collect(#{done := true} = BS, _Want, Acc) ->
+    {ok, iolist_to_binary(lists:reverse(Acc)), BS};
+chunked_collect(#{buffered := Buf, recv := Recv, max := Max, bytes_read := Read} = BS, Want, Acc) ->
+    case cactus_http1:parse_chunk(Buf) of
+        {ok, Data, Rest} ->
+            NewRead = Read + byte_size(Data),
+            case NewRead > Max of
+                true ->
+                    {error, content_length_too_large};
+                false ->
+                    BS2 = BS#{buffered := Rest, bytes_read := NewRead, pending := Data},
+                    chunked_collect(BS2, Want, Acc)
+            end;
+        {ok, last, _Trailers, Rest} ->
+            chunked_collect(BS#{buffered := Rest, done := true}, Want, Acc);
+        {more, _} ->
+            case Recv() of
+                {ok, More} ->
+                    chunked_collect(BS#{buffered := <<Buf/binary, More/binary>>}, Want, Acc);
+                {error, _} = E ->
+                    E
+            end;
+        {error, _} = E ->
+            E
     end.
 
 -spec fill_n(non_neg_integer(), binary(), fun(() -> {ok, binary()} | {error, term()})) ->

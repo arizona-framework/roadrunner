@@ -789,24 +789,80 @@ consume_state_request_too_large_test() ->
     ).
 
 consume_state_chunked_full_drain_test() ->
-    State = #{
-        framing => chunked,
-        buffered => ~"5\r\nhello\r\n0\r\n\r\n",
-        bytes_read => 0,
-        recv => fun() -> error(unused) end,
-        max => 1000
-    },
+    State = chunked_state(~"5\r\nhello\r\n0\r\n\r\n", fun() -> error(unused) end),
     ?assertMatch({ok, ~"hello", _}, cactus_conn:consume_body_state(State, all)).
 
 consume_state_chunked_error_propagates_test() ->
-    State = #{
-        framing => chunked,
-        buffered => ~"xyz\r\nhello\r\n",
-        bytes_read => 0,
-        recv => fun() -> error(unused) end,
-        max => 1000
-    },
+    State = chunked_state(~"xyz\r\nhello\r\n", fun() -> error(unused) end),
     ?assertEqual({error, bad_chunk_size}, cactus_conn:consume_body_state(State, all)).
+
+consume_state_chunked_length_streams_within_chunk_test() ->
+    %% Chunk decodes to "hello"; reading with length=2 yields he/ll/o.
+    State = chunked_state(~"5\r\nhello\r\n0\r\n\r\n", fun() -> error(unused) end),
+    {more, B1, S1} = cactus_conn:consume_body_state(State, {length, 2}),
+    ?assertEqual(~"he", B1),
+    {more, B2, S2} = cactus_conn:consume_body_state(S1, {length, 2}),
+    ?assertEqual(~"ll", B2),
+    {ok, B3, _S3} = cactus_conn:consume_body_state(S2, {length, 2}),
+    ?assertEqual(~"o", B3).
+
+consume_state_chunked_length_crosses_chunk_boundary_test() ->
+    %% Two chunks "hel" + "lo world"; read length=4 yields "hell", "o wo", "rld".
+    State = chunked_state(
+        ~"3\r\nhel\r\n8\r\nlo world\r\n0\r\n\r\n",
+        fun() -> error(unused) end
+    ),
+    {more, B1, S1} = cactus_conn:consume_body_state(State, {length, 4}),
+    ?assertEqual(~"hell", B1),
+    {more, B2, S2} = cactus_conn:consume_body_state(S1, {length, 4}),
+    ?assertEqual(~"o wo", B2),
+    {ok, B3, _S3} = cactus_conn:consume_body_state(S2, {length, 4}),
+    ?assertEqual(~"rld", B3).
+
+consume_state_chunked_length_recvs_more_test() ->
+    %% Buffer has the size line but the chunk body arrives via recv.
+    Self = self(),
+    State = chunked_state(~"5\r\nhe", fun() ->
+        Self ! recv_called,
+        {ok, ~"llo\r\n0\r\n\r\n"}
+    end),
+    {ok, Bytes, _S2} = cactus_conn:consume_body_state(State, {length, 100}),
+    ?assertEqual(~"hello", Bytes),
+    receive
+        recv_called -> ok
+    after 100 -> error(recv_was_not_called)
+    end.
+
+consume_state_chunked_length_recv_error_test() ->
+    State = chunked_state(~"5\r\nhe", fun() -> {error, closed} end),
+    ?assertEqual({error, closed}, cactus_conn:consume_body_state(State, {length, 4})).
+
+consume_state_chunked_length_after_done_returns_empty_test() ->
+    %% Drain the body fully via the all path, then try to read more.
+    State0 = chunked_state(~"3\r\nhel\r\n0\r\n\r\n", fun() -> error(unused) end),
+    {ok, ~"hel", State1} = cactus_conn:consume_body_state(State0, all),
+    ?assertMatch({ok, <<>>, _}, cactus_conn:consume_body_state(State1, {length, 4})).
+
+consume_state_chunked_exceeds_max_test() ->
+    %% Single chunk of 5 bytes, max=2 — must reject before pending swells.
+    State = (chunked_state(~"5\r\nhello\r\n0\r\n\r\n", fun() -> error(unused) end))#{
+        max := 2
+    },
+    ?assertEqual(
+        {error, content_length_too_large},
+        cactus_conn:consume_body_state(State, all)
+    ).
+
+chunked_state(Buf, Recv) ->
+    #{
+        framing => chunked,
+        buffered => Buf,
+        bytes_read => 0,
+        pending => <<>>,
+        done => false,
+        recv => Recv,
+        max => 1000
+    }.
 
 consume_state_recvs_more_when_buffer_short_test() ->
     %% Buffer has only 2 bytes, content-length is 5 — fill_n must recv
