@@ -1,12 +1,14 @@
 -module(cactus_acceptor).
 -moduledoc """
 Acceptor process — spins on `gen_tcp:accept/1` for a listen socket
-and (for this slice) immediately closes each accepted connection.
+and hands each accepted connection off to a `cactus_conn` worker.
 
 Spawn-linked to the owning `cactus_listener`: a listener stop closes
 the listen socket, the acceptor's `accept/1` returns `{error, _}`,
 and the acceptor exits cleanly. Unrelated acceptor crashes propagate
 back via the link, taking the listener down for supervisor restart.
+Connection workers are spawned **without** a link so that a crash
+in one connection does not bring down the acceptor.
 """.
 
 -export([start_link/1]).
@@ -29,7 +31,9 @@ start_link(LSocket) ->
 loop(LSocket) ->
     case gen_tcp:accept(LSocket) of
         {ok, Socket} ->
-            _ = gen_tcp:close(Socket),
+            {ok, ConnPid} = cactus_conn:start(Socket),
+            ok = gen_tcp:controlling_process(Socket, ConnPid),
+            ConnPid ! shoot,
             loop(LSocket);
         {error, _} ->
             %% Listen socket was closed (or another transport error) —
