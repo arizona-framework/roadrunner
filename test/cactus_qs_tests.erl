@@ -75,3 +75,67 @@ parse_value_with_equals_test() ->
         [{~"a", ~"b=c"}],
         cactus_qs:parse(~"a=b=c")
     ).
+
+%% =============================================================================
+%% encode/1
+%% =============================================================================
+
+encode_empty_test() ->
+    ?assertEqual(~"", cactus_qs:encode([])).
+
+encode_single_pair_test() ->
+    ?assertEqual(~"a=1", cactus_qs:encode([{~"a", ~"1"}])).
+
+encode_multiple_pairs_test() ->
+    ?assertEqual(
+        ~"a=1&b=2",
+        cactus_qs:encode([{~"a", ~"1"}, {~"b", ~"2"}])
+    ).
+
+encode_flag_test() ->
+    ?assertEqual(~"flag", cactus_qs:encode([{~"flag", true}])).
+
+encode_empty_value_test() ->
+    ?assertEqual(~"a=", cactus_qs:encode([{~"a", ~""}])).
+
+encode_space_as_plus_test() ->
+    ?assertEqual(
+        ~"q=hello+world",
+        cactus_qs:encode([{~"q", ~"hello world"}])
+    ).
+
+encode_reserved_chars_test() ->
+    %% '=' inside value gets percent-encoded so it isn't seen as a separator.
+    ?assertEqual(
+        ~"a=b%3Dc",
+        cactus_qs:encode([{~"a", ~"b=c"}])
+    ).
+
+encode_unreserved_marks_test() ->
+    %% RFC 3986 §2.3 unreserved set passes through.
+    ?assertEqual(~"a=-._~", cactus_qs:encode([{~"a", ~"-._~"}])).
+
+encode_literal_plus_test() ->
+    %% Literal '+' must round-trip — encode it as %2B, not '+'.
+    ?assertEqual(~"a=%2B", cactus_qs:encode([{~"a", ~"+"}])).
+
+encode_parse_roundtrip_test_() ->
+    Cases = [
+        [],
+        [{~"a", ~"1"}],
+        [{~"a", ~"1"}, {~"b", ~"2"}],
+        [{~"flag", true}],
+        [{~"a", ~""}],
+        [{~"q", ~"hello world"}],
+        [{~"a", ~"b=c"}],
+        [{~"key with space", ~"value with space"}],
+        [{~"a", ~"+"}],
+        [{~"unicode", ~"café"}]
+    ],
+    [
+        ?_assertEqual(
+            Pairs,
+            cactus_qs:parse(cactus_qs:encode(Pairs))
+        )
+     || Pairs <- Cases
+    ].

@@ -12,7 +12,7 @@ Lenient on malformed input (cowboy parity): empty pair entries
 that fail to decode pass through as raw bytes.
 """.
 
--export([parse/1]).
+-export([parse/1, encode/1]).
 
 -doc """
 Parse a query string into an ordered list of `{Key, Value}` pairs.
@@ -39,3 +39,29 @@ decode(Bin) ->
         {ok, Decoded} -> Decoded;
         {error, badarg} -> Spaced
     end.
+
+-doc """
+Encode a list of `{Key, Value}` pairs as a query string.
+
+`Value` may be `true` (bare flag, no `=`) or a binary. Spaces are
+encoded as `+` (form-encoding convention); other non-unreserved bytes
+become `%HH` triples — including a literal `+`, which becomes `%2B`
+so it round-trips through `parse/1`.
+""".
+-spec encode([{binary(), binary() | true}]) -> binary().
+encode(Pairs) when is_list(Pairs) ->
+    iolist_to_binary(lists:join(~"&", [encode_pair(P) || P <- Pairs])).
+
+-spec encode_pair({binary(), binary() | true}) -> iodata().
+encode_pair({Key, true}) ->
+    encode_component(Key);
+encode_pair({Key, Value}) when is_binary(Value) ->
+    [encode_component(Key), $=, encode_component(Value)].
+
+-spec encode_component(binary()) -> binary().
+encode_component(Bin) ->
+    %% Use the URI-style percent encoder, then collapse %20 to '+' so the
+    %% output is form-encoded. Other percent triples are unaffected because
+    %% only literal 0x20 ever produces "%20".
+    Encoded = cactus_uri:percent_encode(Bin),
+    binary:replace(Encoded, ~"%20", ~"+", [global]).
