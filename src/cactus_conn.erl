@@ -29,6 +29,7 @@ read it anyway.
 
 -type proto_opts() :: #{
     dispatch := dispatch(),
+    middlewares := cactus_middleware:middleware_list(),
     max_content_length := non_neg_integer(),
     request_timeout := non_neg_integer(),
     keep_alive_timeout := non_neg_integer(),
@@ -128,6 +129,7 @@ process_one(
     Scheme,
     #{
         dispatch := Dispatch,
+        middlewares := ListenerMws,
         max_content_length := MaxCL,
         minimum_bytes_per_second := MinRate
     },
@@ -149,7 +151,7 @@ process_one(
                                 bindings => Bindings,
                                 route_opts => RouteOpts
                             },
-                            handle_and_send(Socket, Handler, FullReq);
+                            handle_and_send(Socket, Handler, FullReq, ListenerMws);
                         not_found ->
                             _ = send_not_found(Socket),
                             close
@@ -395,24 +397,20 @@ parse_loop(Buf, RecvFun) ->
             E
     end.
 
--spec handle_and_send(cactus_transport:socket(), module(), cactus_http1:request()) ->
-    keep_alive | close.
-handle_and_send(Socket, Handler, Req) ->
-    try Handler:handle(Req) of
-        {websocket, Mod, State} when is_atom(Mod) ->
-            _ = upgrade_to_websocket(Socket, Req, Mod, State),
-            close;
-        {stream, Status, Headers, Fun} when is_function(Fun, 1) ->
-            _ = stream_response(Socket, Status, Headers, Fun),
-            close;
-        {loop, Status, Headers, LoopState} when is_integer(Status) ->
-            _ = loop_response(Socket, Status, Headers, Handler, LoopState),
-            close;
-        {Status, Headers, Body} when is_integer(Status) ->
-            RespBody = response_body_for(Req, Body),
-            Resp = cactus_http1:response(Status, Headers, RespBody),
-            _ = cactus_transport:send(Socket, Resp),
-            keep_alive_decision(Req, Headers)
+-spec handle_and_send(
+    cactus_transport:socket(),
+    module(),
+    cactus_http1:request(),
+    cactus_middleware:middleware_list()
+) -> keep_alive | close.
+handle_and_send(Socket, Handler, Req, ListenerMws) ->
+    %% Listener-level middlewares wrap route-level middlewares wrap handler.
+    %% Both lists run "first = outermost"; an empty list is a no-op.
+    RouteMws = route_middlewares(Req),
+    HandlerFun = fun(R) -> Handler:handle(R) end,
+    Pipeline = cactus_middleware:compose(ListenerMws ++ RouteMws, HandlerFun),
+    try Pipeline(Req) of
+        Response -> dispatch_response(Socket, Handler, Req, Response)
     catch
         Class:Reason:Stack ->
             logger:error(#{
@@ -425,6 +423,38 @@ handle_and_send(Socket, Handler, Req) ->
             _ = send_internal_error(Socket),
             close
     end.
+
+-spec route_middlewares(cactus_http1:request()) -> cactus_middleware:middleware_list().
+route_middlewares(Req) ->
+    case cactus_req:route_opts(Req) of
+        #{middlewares := Mws} -> Mws;
+        _ -> []
+    end.
+
+-spec dispatch_response(
+    cactus_transport:socket(),
+    module(),
+    cactus_http1:request(),
+    cactus_handler:response()
+) -> keep_alive | close.
+dispatch_response(Socket, _Handler, Req, {websocket, Mod, State}) when is_atom(Mod) ->
+    _ = upgrade_to_websocket(Socket, Req, Mod, State),
+    close;
+dispatch_response(Socket, _Handler, _Req, {stream, Status, Headers, Fun}) when
+    is_function(Fun, 1)
+->
+    _ = stream_response(Socket, Status, Headers, Fun),
+    close;
+dispatch_response(Socket, Handler, _Req, {loop, Status, Headers, LoopState}) when
+    is_integer(Status)
+->
+    _ = loop_response(Socket, Status, Headers, Handler, LoopState),
+    close;
+dispatch_response(Socket, _Handler, Req, {Status, Headers, Body}) when is_integer(Status) ->
+    RespBody = response_body_for(Req, Body),
+    Resp = cactus_http1:response(Status, Headers, RespBody),
+    _ = cactus_transport:send(Socket, Resp),
+    keep_alive_decision(Req, Headers).
 
 %% RFC 9110 §9.3.2: a response to HEAD must not include a message body.
 %% Headers (including Content-Length) stay as the handler set them, so

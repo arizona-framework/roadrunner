@@ -123,6 +123,7 @@ fake_conn_drives_handler_without_sockets_test() ->
 fake_proto_opts(Handler) ->
     #{
         dispatch => {handler, Handler},
+        middlewares => [],
         max_content_length => 10485760,
         request_timeout => 5000,
         keep_alive_timeout => 5000,

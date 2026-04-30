@@ -35,6 +35,7 @@ connection crash doesn't take the pool down.
     port := inet:port_number(),
     handler => module(),
     routes => cactus_router:routes(),
+    middlewares => cactus_middleware:middleware_list(),
     max_content_length => non_neg_integer(),
     request_timeout => non_neg_integer(),
     keep_alive_timeout => non_neg_integer(),
@@ -123,6 +124,7 @@ build_proto_opts(Opts) ->
     Counter = atomics:new(1, [{signed, false}]),
     #{
         dispatch => build_dispatch(Opts),
+        middlewares => maps:get(middlewares, Opts, []),
         max_content_length => maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
         request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
         keep_alive_timeout => maps:get(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT),
