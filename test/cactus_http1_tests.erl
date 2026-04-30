@@ -296,3 +296,130 @@ header_oversized_no_crlf_rejected_test() ->
 header_oversized_with_crlf_rejected_test() ->
     Big = <<(binary:copy(~"a", 8193))/binary, "\r\n">>,
     ?assertEqual({error, header_too_long}, cactus_http1:parse_header(Big)).
+
+%% =============================================================================
+%% parse_headers/1
+%% =============================================================================
+
+%% --- happy path ---
+
+block_empty_test() ->
+    ?assertEqual({ok, [], ~""}, cactus_http1:parse_headers(~"\r\n")).
+
+block_single_header_test() ->
+    ?assertEqual(
+        {ok, [{~"host", ~"x"}], ~""},
+        cactus_http1:parse_headers(~"Host: x\r\n\r\n")
+    ).
+
+block_preserves_order_test() ->
+    ?assertEqual(
+        {ok, [{~"host", ~"a"}, {~"accept", ~"b"}, {~"x-trace", ~"c"}], ~""},
+        cactus_http1:parse_headers(~"Host: a\r\nAccept: b\r\nX-Trace: c\r\n\r\n")
+    ).
+
+block_keeps_repeated_headers_test() ->
+    %% Two Set-Cookie entries must both appear, in order.
+    ?assertEqual(
+        {ok, [{~"set-cookie", ~"a=1"}, {~"set-cookie", ~"b=2"}], ~""},
+        cactus_http1:parse_headers(~"Set-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\n")
+    ).
+
+block_with_body_test() ->
+    ?assertEqual(
+        {ok, [{~"host", ~"x"}], ~"hello"},
+        cactus_http1:parse_headers(~"Host: x\r\n\r\nhello")
+    ).
+
+%% --- incremental ---
+
+block_empty_input_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_http1:parse_headers(~"")).
+
+block_partial_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_http1:parse_headers(~"Host: x\r\n")).
+
+%% --- limits ---
+
+block_too_long_rejected_test() ->
+    %% 50 headers × ~210 bytes = ~10500 bytes; trips the 10240 block cap
+    %% before the 100-header count cap.
+    ValuePad = binary:copy(~"a", 200),
+    HdrLine = fun(N) ->
+        I = integer_to_binary(N),
+        <<"X-H", I/binary, ": ", ValuePad/binary, "\r\n">>
+    end,
+    Lines = iolist_to_binary([HdrLine(N) || N <- lists:seq(1, 50)]),
+    ?assertEqual(
+        {error, header_block_too_long},
+        cactus_http1:parse_headers(<<Lines/binary, "\r\n">>)
+    ).
+
+block_too_many_headers_rejected_test() ->
+    %% 101 short headers stays well under the byte cap; trips the count cap.
+    HdrLine = fun(N) ->
+        I = integer_to_binary(N),
+        <<"X-H", I/binary, ": v\r\n">>
+    end,
+    Lines = iolist_to_binary([HdrLine(N) || N <- lists:seq(1, 101)]),
+    ?assertEqual(
+        {error, too_many_headers},
+        cactus_http1:parse_headers(<<Lines/binary, "\r\n">>)
+    ).
+
+block_at_count_limit_accepted_test() ->
+    %% Boundary: exactly 100 headers must be accepted (limit is "at most 100").
+    HdrLine = fun(N) ->
+        I = integer_to_binary(N),
+        <<"X-H", I/binary, ": v\r\n">>
+    end,
+    Lines = iolist_to_binary([HdrLine(N) || N <- lists:seq(1, 100)]),
+    {ok, Headers, ~""} = cactus_http1:parse_headers(<<Lines/binary, "\r\n">>),
+    ?assertEqual(100, length(Headers)).
+
+%% --- request smuggling defenses ---
+
+block_te_and_cl_rejected_test() ->
+    ?assertEqual(
+        {error, conflicting_framing},
+        cactus_http1:parse_headers(~"Transfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n")
+    ).
+
+block_differing_cls_rejected_test() ->
+    ?assertEqual(
+        {error, conflicting_framing},
+        cactus_http1:parse_headers(~"Content-Length: 5\r\nContent-Length: 7\r\n\r\n")
+    ).
+
+block_identical_cls_accepted_test() ->
+    ?assertEqual(
+        {ok, [{~"content-length", ~"5"}, {~"content-length", ~"5"}], ~""},
+        cactus_http1:parse_headers(~"Content-Length: 5\r\nContent-Length: 5\r\n\r\n")
+    ).
+
+block_only_te_accepted_test() ->
+    ?assertEqual(
+        {ok, [{~"transfer-encoding", ~"chunked"}], ~""},
+        cactus_http1:parse_headers(~"Transfer-Encoding: chunked\r\n\r\n")
+    ).
+
+block_only_cl_accepted_test() ->
+    ?assertEqual(
+        {ok, [{~"content-length", ~"42"}], ~""},
+        cactus_http1:parse_headers(~"Content-Length: 42\r\n\r\n")
+    ).
+
+%% --- error propagation ---
+
+block_propagates_bad_header_test() ->
+    ?assertEqual(
+        {error, bad_header},
+        cactus_http1:parse_headers(~"Host: x\r\nbad header\r\n\r\n")
+    ).
+
+block_propagates_header_too_long_test() ->
+    Big = <<(binary:copy(~"a", 8193))/binary, "\r\n">>,
+    ?assertEqual(
+        {error, header_too_long},
+        cactus_http1:parse_headers(<<"Host: x\r\n", Big/binary>>)
+    ).

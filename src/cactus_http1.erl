@@ -9,14 +9,17 @@ tagged `{error, _}` results, leaving the caller in control of the
 response (`400`, `414`, `431`, etc.).
 """.
 
--export([parse_request_line/1, parse_header/1]).
+-export([parse_request_line/1, parse_header/1, parse_headers/1]).
 
--export_type([version/0]).
+-export_type([version/0, headers/0]).
 
 -define(MAX_REQUEST_LINE, 8192).
 -define(MAX_HEADER_LINE, 8192).
+-define(MAX_HEADER_BLOCK, 10240).
+-define(MAX_HEADER_COUNT, 100).
 
 -type version() :: {1, 0} | {1, 1}.
+-type headers() :: [{Name :: binary(), Value :: binary()}].
 
 -doc """
 Parse the HTTP/1.1 request line.
@@ -289,3 +292,85 @@ validate_value(<<C, R/binary>>) when
     validate_value(R);
 validate_value(_) ->
     error.
+
+-doc """
+Parse the full HTTP/1.1 header block.
+
+Loops `parse_header/1` until the empty line that ends the block,
+returning the accumulated headers in wire order (repeated headers
+preserved as separate entries — important for `Set-Cookie`).
+
+Enforces three hardening limits per OTP PR #11073:
+- `max_header_count` = 100
+- `max_header_block` = 10240 bytes (cumulative)
+- HTTP request smuggling: rejects any block that mixes
+  `Transfer-Encoding` with `Content-Length`, or that contains
+  multiple `Content-Length` headers with differing values.
+""".
+-spec parse_headers(binary()) ->
+    {ok, headers(), Rest :: binary()}
+    | {more, undefined}
+    | {error,
+        bad_header
+        | header_too_long
+        | header_block_too_long
+        | too_many_headers
+        | conflicting_framing}.
+parse_headers(Bin) when is_binary(Bin) ->
+    case parse_headers_loop(Bin, 0, 0) of
+        {ok, Headers, Rest} ->
+            case check_framing(Headers) of
+                ok -> {ok, Headers, Rest};
+                error -> {error, conflicting_framing}
+            end;
+        Other ->
+            Other
+    end.
+
+-spec parse_headers_loop(binary(), non_neg_integer(), non_neg_integer()) ->
+    {ok, headers(), binary()}
+    | {more, undefined}
+    | {error,
+        bad_header
+        | header_too_long
+        | header_block_too_long
+        | too_many_headers}.
+parse_headers_loop(_Bin, Count, _Consumed) when Count > ?MAX_HEADER_COUNT ->
+    {error, too_many_headers};
+parse_headers_loop(_Bin, _Count, Consumed) when Consumed > ?MAX_HEADER_BLOCK ->
+    {error, header_block_too_long};
+parse_headers_loop(Bin, Count, Consumed) ->
+    case parse_header(Bin) of
+        {ok, Name, Value, Rest} ->
+            Used = byte_size(Bin) - byte_size(Rest),
+            case parse_headers_loop(Rest, Count + 1, Consumed + Used) of
+                {ok, Tail, FinalRest} -> {ok, [{Name, Value} | Tail], FinalRest};
+                Other -> Other
+            end;
+        {end_of_headers, Rest} ->
+            {ok, [], Rest};
+        {more, _} = More ->
+            More;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% Reject the two classic smuggling shapes:
+%% 1. Transfer-Encoding present alongside any Content-Length.
+%% 2. Multiple Content-Length headers with differing values.
+-spec check_framing(headers()) -> ok | error.
+check_framing(Headers) ->
+    HasTE = lists:keymember(~"transfer-encoding", 1, Headers),
+    Cls = [V || {N, V} <- Headers, N =:= ~"content-length"],
+    check_framing(HasTE, Cls).
+
+-spec check_framing(boolean(), [binary()]) -> ok | error.
+check_framing(true, []) -> ok;
+check_framing(false, []) -> ok;
+check_framing(false, [V | Rest]) -> check_cls_consistent(V, Rest);
+check_framing(true, [_ | _]) -> error.
+
+-spec check_cls_consistent(binary(), [binary()]) -> ok | error.
+check_cls_consistent(_, []) -> ok;
+check_cls_consistent(V, [V | Rest]) -> check_cls_consistent(V, Rest);
+check_cls_consistent(_, _) -> error.
