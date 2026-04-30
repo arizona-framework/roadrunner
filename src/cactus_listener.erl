@@ -18,12 +18,14 @@ connection workers will hang off it in subsequent features.
 -export_type([opts/0]).
 
 -define(DEFAULT_MAX_CONTENT_LENGTH, 10485760).
+-define(DEFAULT_REQUEST_TIMEOUT, 30000).
 
 -type opts() :: #{
     port := inet:port_number(),
     handler => module(),
     routes => cactus_router:routes(),
-    max_content_length => non_neg_integer()
+    max_content_length => non_neg_integer(),
+    request_timeout => non_neg_integer()
 }.
 
 -record(state, {
@@ -80,7 +82,8 @@ init(#{port := Port} = Opts) ->
 build_proto_opts(Opts) ->
     #{
         dispatch => build_dispatch(Opts),
-        max_content_length => maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH)
+        max_content_length => maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
+        request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT)
     }.
 
 %% `routes` (router-based dispatch) takes precedence over `handler`. With

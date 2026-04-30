@@ -388,6 +388,51 @@ conn_passes_bindings_to_handler_test_() ->
             end}
         end}.
 
+conn_request_timeout_returns_408_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_timeout, #{
+                port => 0, request_timeout => 100
+            }),
+            cactus_listener:port(conn_test_timeout)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_timeout) end, fun(Port) ->
+            {"silent client gets 408 after request_timeout", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                %% Send nothing; wait for the server's deadline.
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 408 ", _/binary>>, Reply),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_request_timeout_during_body_returns_408_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_timeout_body, #{
+                port => 0, request_timeout => 200
+            }),
+            cactus_listener:port(conn_test_timeout_body)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_timeout_body) end, fun(Port) ->
+            {"client that stops mid-body gets 408", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                %% Full headers, no body — server reads body up to
+                %% Content-Length and times out waiting.
+                ok = gen_tcp:send(
+                    Sock,
+                    ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n"
+                ),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 408 ", _/binary>>, Reply),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
 conn_populates_peer_in_request_test_() ->
     {setup,
         fun() ->

@@ -14,15 +14,14 @@ behaviour and routing arrive in slices 3–4.
 
 -export_type([proto_opts/0, dispatch/0]).
 
--define(RECV_TIMEOUT, 5000).
-
 -type dispatch() ::
     {handler, module()}
     | {router, cactus_router:compiled()}.
 
 -type proto_opts() :: #{
     dispatch := dispatch(),
-    max_content_length := non_neg_integer()
+    max_content_length := non_neg_integer(),
+    request_timeout := non_neg_integer()
 }.
 
 -doc """
@@ -44,9 +43,14 @@ start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
     {ok, Pid}.
 
 -spec serve(gen_tcp:socket(), proto_opts()) -> ok.
-serve(Socket, #{dispatch := Dispatch, max_content_length := MaxCL}) ->
+serve(Socket, #{
+    dispatch := Dispatch,
+    max_content_length := MaxCL,
+    request_timeout := ReqTimeout
+}) ->
     Peer = peer(Socket),
-    Recv = fun() -> gen_tcp:recv(Socket, 0, ?RECV_TIMEOUT) end,
+    Deadline = erlang:monotonic_time(millisecond) + ReqTimeout,
+    Recv = make_recv(Socket, Deadline),
     _ =
         case parse_loop(<<>>, Recv) of
             {ok, Req0, Buffered} ->
@@ -63,14 +67,35 @@ serve(Socket, #{dispatch := Dispatch, max_content_length := MaxCL}) ->
                         end;
                     {error, content_length_too_large} ->
                         send_payload_too_large(Socket);
+                    {error, request_timeout} ->
+                        send_request_timeout(Socket);
                     {error, _} ->
                         send_bad_request(Socket)
                 end;
+            {error, request_timeout} ->
+                send_request_timeout(Socket);
             {error, _} ->
                 send_bad_request(Socket)
         end,
     _ = gen_tcp:close(Socket),
     ok.
+
+%% Build a recv closure with a single overall deadline. `gen_tcp:recv`
+%% with a negative timeout is undefined, so we cap at 0 — which makes
+%% gen_tcp return `{error, timeout}` immediately when the deadline has
+%% passed. Any timeout here is, by construction, the request_timeout.
+-spec make_recv(gen_tcp:socket(), integer()) ->
+    fun(() -> {ok, binary()} | {error, request_timeout | term()}).
+make_recv(Socket, Deadline) ->
+    fun() ->
+        Now = erlang:monotonic_time(millisecond),
+        Remaining = max(0, Deadline - Now),
+        case gen_tcp:recv(Socket, 0, Remaining) of
+            {ok, _} = OK -> OK;
+            {error, timeout} -> {error, request_timeout};
+            {error, _} = E -> E
+        end
+    end.
 
 -doc false.
 -spec peer(gen_tcp:socket()) -> {inet:ip_address(), inet:port_number()} | undefined.
@@ -246,6 +271,15 @@ send_payload_too_large(Socket) ->
 send_not_found(Socket) ->
     Resp = cactus_http1:response(
         404,
+        [{~"content-length", ~"0"}, {~"connection", ~"close"}],
+        ~""
+    ),
+    gen_tcp:send(Socket, Resp).
+
+-spec send_request_timeout(gen_tcp:socket()) -> ok | {error, term()}.
+send_request_timeout(Socket) ->
+    Resp = cactus_http1:response(
+        408,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
         ~""
     ),
