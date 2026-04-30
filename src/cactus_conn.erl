@@ -228,12 +228,7 @@ handle_with_body(Socket, Req, Buffered, Recv, MaxCL, Dispatch, ListenerMws, manu
                 max => MaxCL
             },
             ReqWithState = Req#{body_state => BodyState},
-            Result = dispatch_resolved(Socket, ReqWithState, Dispatch, ListenerMws),
-            %% No drain implementation yet — manual mode always closes.
-            case Result of
-                keep_alive -> close;
-                close -> close
-            end
+            dispatch_resolved(Socket, ReqWithState, Dispatch, ListenerMws)
     end.
 
 -spec dispatch_resolved(
@@ -435,6 +430,20 @@ read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
             E
     end.
 
+%% Read and discard whatever the handler left in the manual-mode
+%% `body_state`. Called only on the 4-tuple response path; the conn
+%% uses the result to decide whether keep-alive can engage.
+-spec drain_body(cactus_http1:request()) -> ok | {error, term()}.
+drain_body(#{body_state := BS}) ->
+    case consume_body_state(BS, all) of
+        {ok, _Bytes, _BS2} -> ok;
+        {error, _} = E -> E
+    end;
+drain_body(_Req) ->
+    %% No body_state means the handler hand-built `Req2` without using
+    %% manual-mode plumbing. Nothing to drain.
+    ok.
+
 -doc """
 Consume bytes from a manual-mode `body_state()`. Returns either the
 final tail (`{ok, Bytes, NewState}` — the body has been fully drained)
@@ -595,7 +604,28 @@ dispatch_response(Socket, _Handler, Req, {Status, Headers, Body}) when is_intege
     RespBody = response_body_for(Req, Body),
     Resp = cactus_http1:response(Status, Headers, RespBody),
     _ = cactus_transport:send(Socket, Resp),
-    keep_alive_decision(Req, Headers).
+    %% Manual mode without a returned `Req2` means the handler did not
+    %% thread its read state back — we can't safely keep-alive because we
+    %% don't know what's left on the socket. Force close in that case;
+    %% otherwise honor the standard Connection-header decision.
+    case Req of
+        #{body_state := _} -> close;
+        _ -> keep_alive_decision(Req, Headers)
+    end;
+dispatch_response(Socket, _Handler, _Req, {Status, Headers, Body, Req2}) when
+    is_integer(Status), is_map(Req2)
+->
+    %% 4-tuple shape: handler threaded `Req2` back. Send the response,
+    %% then drain whatever the handler left on the socket so the next
+    %% request lands cleanly. Drain failure (closed peer, malformed
+    %% body, etc.) collapses to close.
+    RespBody = response_body_for(Req2, Body),
+    Resp = cactus_http1:response(Status, Headers, RespBody),
+    _ = cactus_transport:send(Socket, Resp),
+    case drain_body(Req2) of
+        ok -> keep_alive_decision(Req2, Headers);
+        {error, _} -> close
+    end.
 
 %% RFC 9110 §9.3.2: a response to HEAD must not include a message body.
 %% Headers (including Content-Length) stay as the handler set them, so

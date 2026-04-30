@@ -855,27 +855,128 @@ conn_manual_body_buffering_bad_transfer_encoding_test_() ->
             end}
         end}.
 
-conn_manual_body_buffering_keep_alive_handler_still_closes_test_() ->
+conn_manual_body_buffering_keep_alive_after_full_read_test_() ->
     {setup,
         fun() ->
-            %% cactus_keepalive_handler returns NO Connection: close — under
-            %% auto+HTTP/1.1 it would keep-alive. Under manual mode we still
-            %% close (handler may not have drained the body).
-            {ok, _} = cactus_listener:start_link(conn_test_manual_ka, #{
+            {ok, _} = cactus_listener:start_link(conn_test_manual_ka_full, #{
                 port => 0,
-                handler => cactus_keepalive_handler,
+                handler => cactus_stream_body_handler,
                 body_buffering => manual
             }),
-            cactus_listener:port(conn_test_manual_ka)
+            cactus_listener:port(conn_test_manual_ka_full)
         end,
-        fun(_) -> ok = cactus_listener:stop(conn_test_manual_ka) end, fun(Port) ->
-            {"manual mode forces close even when handler would keep-alive", fun() ->
+        fun(_) -> ok = cactus_listener:stop(conn_test_manual_ka_full) end, fun(Port) ->
+            {"manual mode keep-alive: two POSTs on the same conn after full read", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(
+                    Sock,
+                    ~"POST /echo-keepalive HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+                ),
+                {ok, R1} = gen_tcp:recv(Sock, 0, 1000),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, R1),
+                {match, _} = re:run(R1, ~"hello"),
+                ok = gen_tcp:send(
+                    Sock,
+                    ~"POST /echo-keepalive HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nworld"
+                ),
+                {ok, R2} = gen_tcp:recv(Sock, 0, 1000),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, R2),
+                {match, _} = re:run(R2, ~"world"),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_auto_mode_4tuple_handler_drains_noop_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_4tuple_auto, #{
+                port => 0,
+                handler => cactus_4tuple_auto_handler
+            }),
+            cactus_listener:port(conn_test_4tuple_auto)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_4tuple_auto) end, fun(Port) ->
+            {"auto-mode 4-tuple handler: drain is a no-op, keep-alive engages", fun() ->
                 {ok, Sock} = gen_tcp:connect(
                     {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
                 ),
                 ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                {ok, R1} = gen_tcp:recv(Sock, 0, 1000),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, R1),
+                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                {ok, R2} = gen_tcp:recv(Sock, 0, 1000),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, R2),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_manual_body_buffering_drain_error_forces_close_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_drain_err, #{
+                port => 0,
+                handler => cactus_stream_body_handler,
+                body_buffering => manual
+            }),
+            cactus_listener:port(conn_test_drain_err)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_drain_err) end, fun(Port) ->
+            {"manual-mode drain error on malformed chunked body forces close", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                %% Handler skips body, conn drains. The chunk size `xyz` is
+                %% non-hex — `consume_body_state` returns `{error, ...}`
+                %% and `drain_body` collapses the keep_alive into a close.
+                ok = gen_tcp:send(
+                    Sock,
+                    <<
+                        "POST /skip-keepalive HTTP/1.1\r\n",
+                        "Host: x\r\n",
+                        "Transfer-Encoding: chunked\r\n\r\n",
+                        "xyz\r\nbroken\r\n"
+                    >>
+                ),
                 Reply = recv_until_closed(Sock),
                 ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_manual_body_buffering_drains_unread_body_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_manual_drain, #{
+                port => 0,
+                handler => cactus_stream_body_handler,
+                body_buffering => manual
+            }),
+            cactus_listener:port(conn_test_manual_drain)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_manual_drain) end, fun(Port) ->
+            {"manual mode drains a body the handler ignored, then serves next request", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                %% Handler /skip-keepalive doesn't call read_body. The conn
+                %% has to drain the 5-byte body itself, otherwise the next
+                %% request would parse "hello" as a request line.
+                ok = gen_tcp:send(
+                    Sock,
+                    ~"POST /skip-keepalive HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+                ),
+                {ok, R1} = gen_tcp:recv(Sock, 0, 1000),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, R1),
+                {match, _} = re:run(R1, ~"skipped"),
+                ok = gen_tcp:send(
+                    Sock,
+                    ~"POST /echo-keepalive HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nbye"
+                ),
+                {ok, R2} = gen_tcp:recv(Sock, 0, 1000),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, R2),
+                {match, _} = re:run(R2, ~"bye"),
                 ok = gen_tcp:close(Sock)
             end}
         end}.

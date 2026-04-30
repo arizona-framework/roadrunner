@@ -160,9 +160,11 @@ body-buffering modes:
   invoking the handler — this returns the buffered bytes unchanged.
   `Req` is returned as-is.
 - **manual**: the conn parked the body on the socket. This drains it
-  and returns the bytes. The returned `Req2` has its embedded
-  `body_state` updated and `body` populated; subsequent
-  `cactus_req:body/1` and `read_body/1` calls return the same bytes.
+  and returns the bytes. The returned `Req2` carries the updated
+  body-read state — to enable keep-alive on the same connection in
+  manual mode, hand `Req2` back via the 4-tuple handler return shape
+  `{Status, Headers, Body, Req2}` so the conn can drain whatever the
+  handler skipped.
 """.
 -spec read_body(cactus_http1:request()) ->
     {ok, binary(), cactus_http1:request()} | {error, term()}.

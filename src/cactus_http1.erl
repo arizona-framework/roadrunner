@@ -54,7 +54,7 @@ response (`400`, `414`, `431`, etc.).
     %% single-handler dispatch (no router involved).
     route_opts => term(),
     %% Body-read state attached by `cactus_conn` in `body_buffering => manual`
-    %% mode. Consumed by `cactus_req:read_body/1,2`. Never present in
+    %% mode. Threaded through `cactus_req:read_body/1,2`. Never present in
     %% `auto` mode or in manually-constructed request maps.
     body_state => cactus_conn:body_state()
 }.

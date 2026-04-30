@@ -22,6 +22,15 @@ handle(#{method := ~"POST", target := ~"/chunks"} = Req) ->
         ~"chunks=", integer_to_binary(Count), ~" body=", Body
     ]),
     reply(200, Out);
+%% Reads body and threads `Req2` back via the 4-tuple shape so the
+%% conn drains anything left and keep-alive can engage.
+handle(#{method := ~"POST", target := ~"/echo-keepalive"} = Req) ->
+    {ok, Body, Req2} = cactus_req:read_body(Req),
+    reply_keepalive(200, Body, Req2);
+%% Does NOT read body. Threads the original `Req` back so the conn
+%% can drain on its behalf.
+handle(#{method := ~"POST", target := ~"/skip-keepalive"} = Req) ->
+    reply_keepalive(200, ~"skipped", Req);
 handle(_Req) ->
     reply(200, ~"no body").
 
@@ -39,3 +48,11 @@ reply(Status, Body) ->
             {~"connection", ~"close"}
         ],
         Body}.
+
+reply_keepalive(Status, Body, Req2) ->
+    {Status,
+        [
+            {~"content-type", ~"text/plain"},
+            {~"content-length", integer_to_binary(byte_size(Body))}
+        ],
+        Body, Req2}.
