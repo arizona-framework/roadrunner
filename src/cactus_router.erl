@@ -3,11 +3,18 @@
 Path → handler dispatch with parameterized segments.
 
 Routes are written as `/users/:id/posts/:post_id`. Segments starting
-with `:` capture into bindings keyed by the **binary** name that
-follows the colon — we deliberately avoid `binary_to_atom/1` on the
-parsed name to keep the "everything is binary on the wire" rule we
-already use for header names. Literal segments must match byte-exactly;
-comparison is case-sensitive per RFC 3986.
+with `:` capture a single segment into bindings keyed by the **binary**
+name that follows the colon — we deliberately avoid `binary_to_atom/1`
+on the parsed name to keep the "everything is binary on the wire" rule
+we already use for header names.
+
+Segments starting with `*` (e.g. `/static/*path`) are wildcard
+captures: they consume all remaining path segments and bind them as a
+list under the given name. A wildcard must be the last segment in a
+pattern; anything after it never matches.
+
+Literal segments must match byte-exactly; comparison is case-sensitive
+per RFC 3986.
 
 Routes are tried in declaration order — earlier entries win. The
 opaque `compiled()` shape is a list of pre-parsed segment patterns;
@@ -20,9 +27,9 @@ swapping to a trie/DAG later is a non-breaking change for callers.
 
 -type route() :: {Path :: binary(), Handler :: module()}.
 -type routes() :: [route()].
--type bindings() :: #{binary() => binary()}.
+-type bindings() :: #{binary() => binary() | [binary()]}.
 
--type segment() :: {literal, binary()} | {param, binary()}.
+-type segment() :: {literal, binary()} | {param, binary()} | {wildcard, binary()}.
 -opaque compiled() :: [{[segment()], module()}].
 
 -doc """
@@ -41,6 +48,7 @@ compile_path(Path) ->
 
 -spec compile_segment(binary()) -> segment().
 compile_segment(<<":", Name/binary>>) -> {param, Name};
+compile_segment(<<"*", Name/binary>>) -> {wildcard, Name};
 compile_segment(Lit) -> {literal, Lit}.
 
 -doc """
@@ -73,6 +81,8 @@ match_pattern([{literal, S} | P], [S | Segs], Bindings) ->
     match_pattern(P, Segs, Bindings);
 match_pattern([{param, Name} | P], [Value | Segs], Bindings) ->
     match_pattern(P, Segs, Bindings#{Name => Value});
+match_pattern([{wildcard, Name}], Segs, Bindings) ->
+    {ok, Bindings#{Name => Segs}};
 match_pattern(_, _, _) ->
     no_match.
 

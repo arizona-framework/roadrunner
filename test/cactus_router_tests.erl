@@ -78,3 +78,53 @@ match_first_route_wins_test() ->
         {ok, users_handler, #{~"id" => ~"42"}},
         cactus_router:match(~"/users/42", Compiled)
     ).
+
+%% =============================================================================
+%% Wildcard segments (*name)
+%% =============================================================================
+
+match_wildcard_captures_remainder_test() ->
+    Compiled = cactus_router:compile([{~"/static/*path", static_handler}]),
+    ?assertEqual(
+        {ok, static_handler, #{~"path" => [~"css", ~"main.css"]}},
+        cactus_router:match(~"/static/css/main.css", Compiled)
+    ).
+
+match_wildcard_captures_single_segment_test() ->
+    Compiled = cactus_router:compile([{~"/static/*path", static_handler}]),
+    ?assertEqual(
+        {ok, static_handler, #{~"path" => [~"file.txt"]}},
+        cactus_router:match(~"/static/file.txt", Compiled)
+    ).
+
+match_wildcard_captures_empty_remainder_test() ->
+    %% Pattern has prefix + wildcard; URL stops at the prefix — wildcard
+    %% binds to an empty list.
+    Compiled = cactus_router:compile([{~"/static/*path", static_handler}]),
+    ?assertEqual(
+        {ok, static_handler, #{~"path" => []}},
+        cactus_router:match(~"/static", Compiled)
+    ).
+
+match_root_wildcard_test() ->
+    Compiled = cactus_router:compile([{~"/*all", catchall_handler}]),
+    ?assertEqual(
+        {ok, catchall_handler, #{~"all" => [~"a", ~"b", ~"c"]}},
+        cactus_router:match(~"/a/b/c", Compiled)
+    ),
+    ?assertEqual(
+        {ok, catchall_handler, #{~"all" => []}},
+        cactus_router:match(~"/", Compiled)
+    ).
+
+match_wildcard_not_last_falls_through_test() ->
+    %% A wildcard mid-pattern doesn't match — extra literal after it never
+    %% reaches a matching clause, and a fallback route still works.
+    Compiled = cactus_router:compile([
+        {~"/foo/*rest/bar", weird_handler},
+        {~"/foo/*rest", normal_handler}
+    ]),
+    ?assertEqual(
+        {ok, normal_handler, #{~"rest" => [~"x", ~"y"]}},
+        cactus_router:match(~"/foo/x/y", Compiled)
+    ).
