@@ -27,7 +27,8 @@ connection workers will hang off it in subsequent features.
     routes => cactus_router:routes(),
     max_content_length => non_neg_integer(),
     request_timeout => non_neg_integer(),
-    num_acceptors => pos_integer()
+    num_acceptors => pos_integer(),
+    tls => [ssl:tls_server_option()]
 }.
 
 -record(state, {
@@ -62,16 +63,7 @@ port(Name) ->
 init(#{port := Port} = Opts) ->
     ProtoOpts = build_proto_opts(Opts),
     proc_lib:set_label({cactus_listener, Port}),
-    %% `inet_backend` must be the first option per gen_tcp docs.
-    case
-        cactus_transport:listen(Port, [
-            {inet_backend, socket},
-            binary,
-            {active, false},
-            {reuseaddr, true},
-            {packet, raw}
-        ])
-    of
+    case open_listen_socket(Port, Opts) of
         {ok, LSocket} ->
             {ok, BoundPort} = cactus_transport:port(LSocket),
             NumAcceptors = maps:get(num_acceptors, Opts, ?DEFAULT_NUM_ACCEPTORS),
@@ -80,6 +72,21 @@ init(#{port := Port} = Opts) ->
         {error, Reason} ->
             {stop, {listen_failed, Reason}}
     end.
+
+-spec open_listen_socket(inet:port_number(), opts()) ->
+    {ok, cactus_transport:socket()} | {error, term()}.
+open_listen_socket(Port, #{tls := TlsOpts}) ->
+    %% TLS path — caller is responsible for the cert/key options. We layer
+    %% the standard transport options on top so accepted sockets behave
+    %% like the plain-TCP variant.
+    cactus_transport:listen_tls(Port, TlsOpts ++ base_listen_opts());
+open_listen_socket(Port, _Opts) ->
+    %% Plain TCP. `inet_backend` must be the first option per gen_tcp docs.
+    cactus_transport:listen(Port, [{inet_backend, socket} | base_listen_opts()]).
+
+-spec base_listen_opts() -> [gen_tcp:listen_option()].
+base_listen_opts() ->
+    [binary, {active, false}, {reuseaddr, true}, {packet, raw}].
 
 %% Multiple acceptor processes all calling gen_tcp:accept on the same listen
 %% socket — Linux/BSD accept is thread-safe and avoids thundering-herd via
