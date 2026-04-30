@@ -585,9 +585,7 @@ Status reason phrases are looked up for the common HTTP codes; unknown
 codes get an empty reason (RFC 9112 §4.1 makes the phrase optional).
 """.
 -spec response(StatusCode :: status(), headers(), iodata()) -> iodata().
-response(Status, Headers, Body) when
-    is_integer(Status), Status >= 100, Status =< 599
-->
+response(Status, Headers, Body) when is_integer(Status, 100, 599) ->
     [
         ~"HTTP/1.1 ",
         integer_to_binary(Status),
