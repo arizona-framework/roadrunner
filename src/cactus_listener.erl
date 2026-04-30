@@ -50,7 +50,6 @@ port(Name) ->
 
 -spec init(opts()) -> {ok, #state{}} | {stop, term()}.
 init(#{port := Port}) ->
-    process_flag(trap_exit, true),
     proc_lib:set_label({cactus_listener, Port}),
     %% `inet_backend` must be the first option per gen_tcp docs.
     case
@@ -64,6 +63,7 @@ init(#{port := Port}) ->
     of
         {ok, LSocket} ->
             {ok, BoundPort} = inet:port(LSocket),
+            {ok, _AcceptorPid} = cactus_acceptor:start_link(LSocket),
             {ok, #state{listen_socket = LSocket, port = BoundPort}};
         {error, Reason} ->
             {stop, {listen_failed, Reason}}
