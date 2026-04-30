@@ -72,7 +72,12 @@ serve(Socket, #{dispatch := Dispatch, max_content_length := MaxCL}) ->
 resolve_handler({handler, Mod}, _Req) ->
     {ok, Mod};
 resolve_handler({router, Compiled}, Req) ->
-    cactus_router:match(cactus_req:path(Req), Compiled).
+    %% Bindings are discarded for now — they'll be threaded into the
+    %% request map in the next slice-4 feature.
+    case cactus_router:match(cactus_req:path(Req), Compiled) of
+        {ok, Mod, _Bindings} -> {ok, Mod};
+        not_found -> not_found
+    end.
 
 -doc false.
 -spec read_body(
