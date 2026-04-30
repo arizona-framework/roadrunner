@@ -612,6 +612,97 @@ conn_streams_chunked_response_test_() ->
             end}
         end}.
 
+conn_keep_alive_serves_two_requests_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_ka, #{
+                port => 0, handler => cactus_keepalive_handler
+            }),
+            cactus_listener:port(conn_test_ka)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_ka) end, fun(Port) ->
+            {"two HTTP/1.1 requests on the same connection both get served", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                Reply1 = send_and_recv(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply1),
+                Reply2 = send_and_recv(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply2),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_keep_alive_count_limit_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_ka_max, #{
+                port => 0,
+                handler => cactus_keepalive_handler,
+                max_keep_alive_request => 1
+            }),
+            cactus_listener:port(conn_test_ka_max)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_ka_max) end, fun(Port) ->
+            {"max_keep_alive_request=1 closes after first response", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_http10_default_close_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_ka_10, #{
+                port => 0, handler => cactus_keepalive_handler
+            }),
+            cactus_listener:port(conn_test_ka_10)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_ka_10) end, fun(Port) ->
+            {"HTTP/1.0 default-closes even when handler omits Connection: close", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.0\r\nHost: x\r\n\r\n"),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_http11_explicit_close_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_ka_close, #{
+                port => 0, handler => cactus_keepalive_handler
+            }),
+            cactus_listener:port(conn_test_ka_close)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_ka_close) end, fun(Port) ->
+            {"HTTP/1.1 with Connection: close in request closes after response", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(
+                    Sock,
+                    ~"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                ),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+send_and_recv(Sock, Request) ->
+    ok = gen_tcp:send(Sock, Request),
+    {ok, Data} = gen_tcp:recv(Sock, 0, 1000),
+    Data.
+
 conn_handler_crash_returns_500_test_() ->
     {setup,
         fun() ->

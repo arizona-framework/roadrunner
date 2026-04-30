@@ -21,7 +21,8 @@ behaviour and routing arrive in slices 3–4.
 -type proto_opts() :: #{
     dispatch := dispatch(),
     max_content_length := non_neg_integer(),
-    request_timeout := non_neg_integer()
+    request_timeout := non_neg_integer(),
+    max_keep_alive_request := pos_integer()
 }.
 
 -doc """
@@ -43,43 +44,64 @@ start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
     {ok, Pid}.
 
 -spec serve(cactus_transport:socket(), proto_opts()) -> ok.
-serve(Socket, #{
+serve(Socket, ProtoOpts) ->
+    Peer = peer(Socket),
+    Scheme = scheme(Socket),
+    serve_loop(Socket, Peer, Scheme, ProtoOpts, 0),
+    _ = cactus_transport:close(Socket),
+    ok.
+
+-spec serve_loop(
+    cactus_transport:socket(), term(), http | https, proto_opts(), non_neg_integer()
+) -> ok.
+serve_loop(_Socket, _Peer, _Scheme, #{max_keep_alive_request := Max}, Count) when Count >= Max ->
+    ok;
+serve_loop(Socket, Peer, Scheme, ProtoOpts, Count) ->
+    case process_one(Socket, Peer, Scheme, ProtoOpts) of
+        keep_alive -> serve_loop(Socket, Peer, Scheme, ProtoOpts, Count + 1);
+        close -> ok
+    end.
+
+-spec process_one(cactus_transport:socket(), term(), http | https, proto_opts()) ->
+    keep_alive | close.
+process_one(Socket, Peer, Scheme, #{
     dispatch := Dispatch,
     max_content_length := MaxCL,
     request_timeout := ReqTimeout
 }) ->
-    Peer = peer(Socket),
-    Scheme = scheme(Socket),
     Deadline = erlang:monotonic_time(millisecond) + ReqTimeout,
     Recv = make_recv(Socket, Deadline),
-    _ =
-        case parse_loop(<<>>, Recv) of
-            {ok, Req0, Buffered} ->
-                Req = Req0#{peer => Peer, scheme => Scheme},
-                case read_body(Req, Buffered, Recv, MaxCL) of
-                    {ok, Body} ->
-                        ReqWithBody = Req#{body => Body},
-                        case resolve_handler(Dispatch, ReqWithBody) of
-                            {ok, Handler, Bindings} ->
-                                FullReq = ReqWithBody#{bindings => Bindings},
-                                handle_and_send(Socket, Handler, FullReq);
-                            not_found ->
-                                send_not_found(Socket)
-                        end;
-                    {error, content_length_too_large} ->
-                        send_payload_too_large(Socket);
-                    {error, request_timeout} ->
-                        send_request_timeout(Socket);
-                    {error, _} ->
-                        send_bad_request(Socket)
-                end;
-            {error, request_timeout} ->
-                send_request_timeout(Socket);
-            {error, _} ->
-                send_bad_request(Socket)
-        end,
-    _ = cactus_transport:close(Socket),
-    ok.
+    case parse_loop(<<>>, Recv) of
+        {ok, Req0, Buffered} ->
+            Req = Req0#{peer => Peer, scheme => Scheme},
+            case read_body(Req, Buffered, Recv, MaxCL) of
+                {ok, Body} ->
+                    ReqWithBody = Req#{body => Body},
+                    case resolve_handler(Dispatch, ReqWithBody) of
+                        {ok, Handler, Bindings} ->
+                            FullReq = ReqWithBody#{bindings => Bindings},
+                            handle_and_send(Socket, Handler, FullReq);
+                        not_found ->
+                            _ = send_not_found(Socket),
+                            close
+                    end;
+                {error, content_length_too_large} ->
+                    _ = send_payload_too_large(Socket),
+                    close;
+                {error, request_timeout} ->
+                    _ = send_request_timeout(Socket),
+                    close;
+                {error, _} ->
+                    _ = send_bad_request(Socket),
+                    close
+            end;
+        {error, request_timeout} ->
+            _ = send_request_timeout(Socket),
+            close;
+        {error, _} ->
+            _ = send_bad_request(Socket),
+            close
+    end.
 
 %% Build a recv closure with a single overall deadline. `gen_tcp:recv`
 %% with a negative timeout is undefined, so we cap at 0 — which makes
@@ -248,16 +270,19 @@ parse_loop(Buf, RecvFun) ->
     end.
 
 -spec handle_and_send(cactus_transport:socket(), module(), cactus_http1:request()) ->
-    ok | {error, term()}.
+    keep_alive | close.
 handle_and_send(Socket, Handler, Req) ->
     try Handler:handle(Req) of
         {websocket, Mod, State} when is_atom(Mod) ->
-            upgrade_to_websocket(Socket, Req, Mod, State);
+            _ = upgrade_to_websocket(Socket, Req, Mod, State),
+            close;
         {stream, Status, Headers, Fun} when is_function(Fun, 1) ->
-            stream_response(Socket, Status, Headers, Fun);
+            _ = stream_response(Socket, Status, Headers, Fun),
+            close;
         {Status, Headers, Body} when is_integer(Status) ->
             Resp = cactus_http1:response(Status, Headers, Body),
-            cactus_transport:send(Socket, Resp)
+            _ = cactus_transport:send(Socket, Resp),
+            keep_alive_decision(Req, Headers)
     catch
         Class:Reason:Stack ->
             logger:error(#{
@@ -267,7 +292,38 @@ handle_and_send(Socket, Handler, Req) ->
                 reason => Reason,
                 stacktrace => Stack
             }),
-            send_internal_error(Socket)
+            _ = send_internal_error(Socket),
+            close
+    end.
+
+%% HTTP/1.0 default close. HTTP/1.1 keep-alive unless either side
+%% set Connection: close.
+-spec keep_alive_decision(cactus_http1:request(), cactus_http1:headers()) ->
+    keep_alive | close.
+keep_alive_decision(Req, RespHeaders) ->
+    case cactus_req:version(Req) of
+        {1, 0} ->
+            close;
+        {1, 1} ->
+            ReqClose = has_close_token(cactus_req:header(~"connection", Req)),
+            RespClose = has_close_token(header_value(~"connection", RespHeaders)),
+            case ReqClose orelse RespClose of
+                true -> close;
+                false -> keep_alive
+            end
+    end.
+
+-spec has_close_token(binary() | undefined) -> boolean().
+has_close_token(undefined) ->
+    false;
+has_close_token(Value) ->
+    binary:match(string:lowercase(Value), ~"close") =/= nomatch.
+
+-spec header_value(binary(), cactus_http1:headers()) -> binary() | undefined.
+header_value(Name, Headers) ->
+    case lists:keyfind(Name, 1, Headers) of
+        {_, V} -> V;
+        false -> undefined
     end.
 
 %% Emit the status line + headers (with `Transfer-Encoding: chunked`

@@ -20,6 +20,7 @@ connection workers will hang off it in subsequent features.
 -define(DEFAULT_MAX_CONTENT_LENGTH, 10485760).
 -define(DEFAULT_REQUEST_TIMEOUT, 30000).
 -define(DEFAULT_NUM_ACCEPTORS, 10).
+-define(DEFAULT_MAX_KEEP_ALIVE, 1000).
 
 -type opts() :: #{
     port := inet:port_number(),
@@ -28,6 +29,7 @@ connection workers will hang off it in subsequent features.
     max_content_length => non_neg_integer(),
     request_timeout => non_neg_integer(),
     num_acceptors => pos_integer(),
+    max_keep_alive_request => pos_integer(),
     tls => [ssl:tls_server_option()]
 }.
 
@@ -106,7 +108,9 @@ build_proto_opts(Opts) ->
     #{
         dispatch => build_dispatch(Opts),
         max_content_length => maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
-        request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT)
+        request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
+        max_keep_alive_request =>
+            maps:get(max_keep_alive_request, Opts, ?DEFAULT_MAX_KEEP_ALIVE)
     }.
 
 %% `routes` (router-based dispatch) takes precedence over `handler`. With
