@@ -48,6 +48,29 @@ header_case_insensitive_test() ->
     %% Caller passes mixed case; lookup finds the lowercased entry.
     ?assertEqual(~"example.com", cactus_req:header(~"Host", sample_req())).
 
+%% --- parse_qs/1 ---
+
+parse_qs_empty_test() ->
+    ?assertEqual([], cactus_req:parse_qs(sample_req_target(~"/foo"))).
+
+parse_qs_single_test() ->
+    ?assertEqual(
+        [{~"a", ~"1"}],
+        cactus_req:parse_qs(sample_req_target(~"/foo?a=1"))
+    ).
+
+parse_qs_multiple_test() ->
+    ?assertEqual(
+        [{~"a", ~"1"}, {~"b", ~"2"}],
+        cactus_req:parse_qs(sample_req_target(~"/foo?a=1&b=2"))
+    ).
+
+parse_qs_decodes_percent_test() ->
+    ?assertEqual(
+        [{~"q", ~"hello world"}],
+        cactus_req:parse_qs(sample_req_target(~"/foo?q=hello%20world"))
+    ).
+
 %% --- fixtures ---
 
 sample_req() ->

@@ -7,7 +7,7 @@ prefer these functions over direct `maps:get/2` so the request
 representation can evolve without breaking them.
 """.
 
--export([method/1, path/1, qs/1, version/1, headers/1, header/2]).
+-export([method/1, path/1, qs/1, version/1, headers/1, header/2, parse_qs/1]).
 
 -doc "Return the request method (uppercase ASCII binary).".
 -spec method(cactus_http1:request()) -> binary().
@@ -62,3 +62,14 @@ header(Name, #{headers := H}) when is_binary(Name) ->
         {_, Value} -> Value;
         false -> undefined
     end.
+
+-doc """
+Parse the query string portion of the request target into a list of
+`{Key, Value}` pairs (or `{Key, true}` for bare flags) via
+`cactus_qs:parse/1`.
+
+Returns `[]` when the target has no query component.
+""".
+-spec parse_qs(cactus_http1:request()) -> [{binary(), binary() | true}].
+parse_qs(Req) ->
+    cactus_qs:parse(qs(Req)).
