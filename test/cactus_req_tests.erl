@@ -87,6 +87,16 @@ parse_cookies_multiple_test() ->
         cactus_req:parse_cookies(Req)
     ).
 
+%% --- body/1 ---
+
+body_present_test() ->
+    Req = (sample_req())#{body => ~"hello world"},
+    ?assertEqual(~"hello world", cactus_req:body(Req)).
+
+body_absent_returns_empty_test() ->
+    %% A request map with no body field returns empty bytes.
+    ?assertEqual(~"", cactus_req:body(sample_req())).
+
 %% --- fixtures ---
 
 sample_req() ->

@@ -32,7 +32,11 @@ response (`400`, `414`, `431`, etc.).
     method := binary(),
     target := binary(),
     version := version(),
-    headers := headers()
+    headers := headers(),
+    %% Body is set by `cactus_conn` before the handler is invoked. The parser
+    %% itself never populates this field — it leaves the buffered body in the
+    %% `Rest` element of `parse_request/1` instead.
+    body => binary()
 }.
 
 -doc """

@@ -94,6 +94,30 @@ conn_dispatches_to_custom_handler_test_() ->
             end}
         end}.
 
+conn_handler_can_read_body_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_body, #{
+                port => 0, handler => cactus_echo_body_handler
+            }),
+            cactus_listener:port(conn_test_body)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_body) end, fun(Port) ->
+            {"handler reads request body via cactus_req:body/1", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(
+                    Sock,
+                    ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world"
+                ),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"hello world"),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
 %% --- helpers ---
 
 recv_until_closed(Sock) ->

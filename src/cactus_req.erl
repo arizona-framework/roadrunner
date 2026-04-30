@@ -15,7 +15,8 @@ representation can evolve without breaking them.
     headers/1,
     header/2,
     parse_qs/1,
-    parse_cookies/1
+    parse_cookies/1,
+    body/1
 ]).
 
 -doc "Return the request method (uppercase ASCII binary).".
@@ -95,3 +96,18 @@ parse_cookies(Req) ->
         undefined -> [];
         Value -> cactus_cookie:parse(Value)
     end.
+
+-doc """
+Return the buffered request body bytes as seen by the handler.
+
+The connection process embeds whatever bytes followed the header block
+under the `body` map key before invoking the handler. Body framing
+(Content-Length / chunked) is not yet applied — this exposes the raw
+buffer the parser carried over.
+
+Returns `<<>>` when the request has no body field (e.g. when a request
+map is constructed manually outside the connection pipeline).
+""".
+-spec body(cactus_http1:request()) -> binary().
+body(#{body := B}) -> B;
+body(_) -> <<>>.

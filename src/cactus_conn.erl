@@ -37,7 +37,7 @@ serve(Socket, Handler) ->
     Recv = fun() -> gen_tcp:recv(Socket, 0, ?RECV_TIMEOUT) end,
     _ =
         case parse_loop(<<>>, Recv) of
-            {ok, Req, _Rest} -> handle_and_send(Socket, Handler, Req);
+            {ok, Req, Body} -> handle_and_send(Socket, Handler, Req#{body => Body});
             {error, _} -> send_bad_request(Socket)
         end,
     _ = gen_tcp:close(Socket),
