@@ -730,6 +730,31 @@ conn_handler_crash_returns_500_test_() ->
             end}
         end}.
 
+conn_head_drops_response_body_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_head, #{
+                port => 0, handler => cactus_test_handler
+            }),
+            cactus_listener:port(conn_test_head)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_head) end, fun(Port) ->
+            {"HEAD response keeps headers (incl. Content-Length) but drops body", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 201 Created", _/binary>>, Reply),
+                %% Content-Length still reflects what GET would return.
+                {match, _} = re:run(Reply, ~"content-length: 23", [caseless]),
+                %% No body bytes after the header terminator.
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(~"", Body),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
 conn_populates_peer_in_request_test_() ->
     {setup,
         fun() ->

@@ -283,7 +283,8 @@ handle_and_send(Socket, Handler, Req) ->
             _ = stream_response(Socket, Status, Headers, Fun),
             close;
         {Status, Headers, Body} when is_integer(Status) ->
-            Resp = cactus_http1:response(Status, Headers, Body),
+            RespBody = response_body_for(Req, Body),
+            Resp = cactus_http1:response(Status, Headers, RespBody),
             _ = cactus_transport:send(Socket, Resp),
             keep_alive_decision(Req, Headers)
     catch
@@ -297,6 +298,16 @@ handle_and_send(Socket, Handler, Req) ->
             }),
             _ = send_internal_error(Socket),
             close
+    end.
+
+%% RFC 9110 §9.3.2: a response to HEAD must not include a message body.
+%% Headers (including Content-Length) stay as the handler set them, so
+%% the framing matches what GET would have returned.
+-spec response_body_for(cactus_http1:request(), iodata()) -> iodata().
+response_body_for(Req, Body) ->
+    case cactus_req:method(Req) of
+        ~"HEAD" -> ~"";
+        _ -> Body
     end.
 
 %% HTTP/1.0 default close. HTTP/1.1 keep-alive unless either side
