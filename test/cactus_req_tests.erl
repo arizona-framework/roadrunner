@@ -71,6 +71,22 @@ parse_qs_decodes_percent_test() ->
         cactus_req:parse_qs(sample_req_target(~"/foo?q=hello%20world"))
     ).
 
+%% --- parse_cookies/1 ---
+
+parse_cookies_no_header_test() ->
+    ?assertEqual([], cactus_req:parse_cookies(sample_req())).
+
+parse_cookies_single_test() ->
+    Req = with_cookie(~"sid=abc"),
+    ?assertEqual([{~"sid", ~"abc"}], cactus_req:parse_cookies(Req)).
+
+parse_cookies_multiple_test() ->
+    Req = with_cookie(~"sid=abc; theme=dark"),
+    ?assertEqual(
+        [{~"sid", ~"abc"}, {~"theme", ~"dark"}],
+        cactus_req:parse_cookies(Req)
+    ).
+
 %% --- fixtures ---
 
 sample_req() ->
@@ -83,3 +99,7 @@ sample_req() ->
 
 sample_req_target(Target) ->
     (sample_req())#{target := Target}.
+
+with_cookie(CookieValue) ->
+    Req = sample_req(),
+    Req#{headers := [{~"cookie", CookieValue} | maps:get(headers, Req)]}.

@@ -7,7 +7,16 @@ prefer these functions over direct `maps:get/2` so the request
 representation can evolve without breaking them.
 """.
 
--export([method/1, path/1, qs/1, version/1, headers/1, header/2, parse_qs/1]).
+-export([
+    method/1,
+    path/1,
+    qs/1,
+    version/1,
+    headers/1,
+    header/2,
+    parse_qs/1,
+    parse_cookies/1
+]).
 
 -doc "Return the request method (uppercase ASCII binary).".
 -spec method(cactus_http1:request()) -> binary().
@@ -73,3 +82,16 @@ Returns `[]` when the target has no query component.
 -spec parse_qs(cactus_http1:request()) -> [{binary(), binary() | true}].
 parse_qs(Req) ->
     cactus_qs:parse(qs(Req)).
+
+-doc """
+Parse the `Cookie` request header into a list of `{Name, Value}` pairs
+via `cactus_cookie:parse/1`.
+
+Returns `[]` when the request carries no `Cookie` header.
+""".
+-spec parse_cookies(cactus_http1:request()) -> [{binary(), binary()}].
+parse_cookies(Req) ->
+    case header(~"cookie", Req) of
+        undefined -> [];
+        Value -> cactus_cookie:parse(Value)
+    end.
