@@ -245,9 +245,21 @@ parse_loop(Buf, RecvFun) ->
 -spec handle_and_send(gen_tcp:socket(), module(), cactus_http1:request()) ->
     ok | {error, term()}.
 handle_and_send(Socket, Handler, Req) ->
-    {Status, Headers, Body} = Handler:handle(Req),
-    Resp = cactus_http1:response(Status, Headers, Body),
-    gen_tcp:send(Socket, Resp).
+    try Handler:handle(Req) of
+        {Status, Headers, Body} ->
+            Resp = cactus_http1:response(Status, Headers, Body),
+            gen_tcp:send(Socket, Resp)
+    catch
+        Class:Reason:Stack ->
+            logger:error(#{
+                msg => "cactus handler crashed",
+                handler => Handler,
+                class => Class,
+                reason => Reason,
+                stacktrace => Stack
+            }),
+            send_internal_error(Socket)
+    end.
 
 -spec send_bad_request(gen_tcp:socket()) -> ok | {error, term()}.
 send_bad_request(Socket) ->
@@ -280,6 +292,15 @@ send_not_found(Socket) ->
 send_request_timeout(Socket) ->
     Resp = cactus_http1:response(
         408,
+        [{~"content-length", ~"0"}, {~"connection", ~"close"}],
+        ~""
+    ),
+    gen_tcp:send(Socket, Resp).
+
+-spec send_internal_error(gen_tcp:socket()) -> ok | {error, term()}.
+send_internal_error(Socket) ->
+    Resp = cactus_http1:response(
+        500,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
         ~""
     ),

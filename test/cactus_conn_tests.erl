@@ -433,6 +433,33 @@ conn_request_timeout_during_body_returns_408_test_() ->
             end}
         end}.
 
+conn_handler_crash_returns_500_test_() ->
+    {setup,
+        fun() ->
+            %% Silence the expected logger:error/1 call so the test output
+            %% stays clean.
+            ok = logger:set_primary_config(level, none),
+            {ok, _} = cactus_listener:start_link(conn_test_crash, #{
+                port => 0, handler => cactus_crashing_handler
+            }),
+            cactus_listener:port(conn_test_crash)
+        end,
+        fun(_) ->
+            ok = cactus_listener:stop(conn_test_crash),
+            ok = logger:set_primary_config(level, notice)
+        end,
+        fun(Port) ->
+            {"crashing handler returns 500 instead of dropping the connection", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 500 ", _/binary>>, Reply),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
 conn_populates_peer_in_request_test_() ->
     {setup,
         fun() ->
