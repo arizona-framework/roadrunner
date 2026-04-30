@@ -39,6 +39,28 @@ static_test_() ->
             {"empty path returns 404 (read on directory fails)", fun() ->
                 Reply = http_get(Port, ~"/static/"),
                 ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
+            end},
+            {"sets an ETag header on successful responses", fun() ->
+                Reply = http_get(Port, ~"/static/hello.html"),
+                {match, [_, ETag]} = re:run(
+                    Reply, ~"etag: (\"[^\"]+\")", [caseless, {capture, all, binary}]
+                ),
+                ?assertMatch(<<$", _/binary>>, ETag),
+                %% Same request with the matching If-None-Match must 304.
+                Reply2 = http_get_with(
+                    Port,
+                    ~"/static/hello.html",
+                    [{~"If-None-Match", ETag}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 304 ", _/binary>>, Reply2)
+            end},
+            {"non-matching If-None-Match still returns 200", fun() ->
+                Reply = http_get_with(
+                    Port,
+                    ~"/static/hello.html",
+                    [{~"If-None-Match", ~"\"stale-etag\""}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
             end}
         ]
     end}.
@@ -65,17 +87,23 @@ cleanup({Dir, _}) ->
     ok.
 
 http_get(Port, Path) ->
+    http_get_with(Port, Path, []).
+
+http_get_with(Port, Path, ExtraHeaders) ->
     {ok, Sock} = gen_tcp:connect(
         {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
     ),
-    Req = <<
-        "GET ",
-        Path/binary,
-        " HTTP/1.1\r\n"
-        "Host: x\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-    >>,
+    Headers = [
+        [Name, ~": ", Value, ~"\r\n"]
+     || {Name, Value} <- ExtraHeaders
+    ],
+    Req = iolist_to_binary([
+        ~"GET ",
+        Path,
+        ~" HTTP/1.1\r\nHost: x\r\nConnection: close\r\n",
+        Headers,
+        ~"\r\n"
+    ]),
     ok = gen_tcp:send(Sock, Req),
     Reply = recv_until_closed(Sock, <<>>),
     ok = gen_tcp:close(Sock),
