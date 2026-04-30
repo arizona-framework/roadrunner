@@ -97,3 +97,8 @@ not_found_test() ->
 
 internal_error_test() ->
     ?assertEqual({500, [{~"content-length", ~"0"}], ~""}, cactus_resp:internal_error()).
+
+status_with_arbitrary_code_test() ->
+    %% 418 isn't in the named shortcuts.
+    ?assertEqual({418, [{~"content-length", ~"0"}], ~""}, cactus_resp:status(418)),
+    ?assertEqual({503, [{~"content-length", ~"0"}], ~""}, cactus_resp:status(503)).

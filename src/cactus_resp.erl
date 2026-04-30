@@ -21,7 +21,8 @@ helpers only fill in what the handler can know.
     unauthorized/0,
     forbidden/0,
     not_found/0,
-    internal_error/0
+    internal_error/0,
+    status/1
 ]).
 
 -type response() :: {cactus_http1:status(), cactus_http1:headers(), iodata()}.
@@ -111,6 +112,13 @@ not_found() -> empty_status(404).
 -doc "Empty 500 Internal Server Error response.".
 -spec internal_error() -> response().
 internal_error() -> empty_status(500).
+
+-doc """
+Empty-body response with an arbitrary status code — handy for
+statuses outside the named shortcut set (e.g., 418, 503).
+""".
+-spec status(cactus_http1:status()) -> response().
+status(Code) -> empty_status(Code).
 
 -spec empty_status(cactus_http1:status()) -> response().
 empty_status(Status) ->
