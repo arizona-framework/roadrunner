@@ -43,6 +43,7 @@ connection crash doesn't take the pool down.
     max_keep_alive_request => pos_integer(),
     max_clients => pos_integer(),
     minimum_bytes_per_second => non_neg_integer(),
+    body_buffering => auto | manual,
     tls => [ssl:tls_server_option()]
 }.
 
@@ -133,7 +134,8 @@ build_proto_opts(Opts) ->
         max_clients => maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
         client_counter => Counter,
         minimum_bytes_per_second =>
-            maps:get(minimum_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND)
+            maps:get(minimum_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
+        body_buffering => maps:get(body_buffering, Opts, auto)
     }.
 
 %% `routes` (router-based dispatch) takes precedence over `handler`. With

@@ -730,6 +730,239 @@ conn_handler_crash_returns_500_test_() ->
             end}
         end}.
 
+%% --- consume_body_state/2 — pure unit tests ---
+
+consume_state_no_framing_returns_buffered_test() ->
+    State = #{
+        framing => none,
+        buffered => ~"hi",
+        bytes_read => 0,
+        recv => fun() -> error(unused) end,
+        max => 1000
+    },
+    ?assertMatch({ok, ~"hi", #{buffered := <<>>}}, cactus_conn:consume_body_state(State, all)).
+
+consume_state_already_drained_returns_empty_test() ->
+    State = #{
+        framing => {content_length, 5},
+        buffered => <<>>,
+        bytes_read => 5,
+        recv => fun() -> error(unused) end,
+        max => 1000
+    },
+    ?assertMatch({ok, <<>>, _}, cactus_conn:consume_body_state(State, all)).
+
+consume_state_length_returns_more_then_ok_test() ->
+    State0 = #{
+        framing => {content_length, 6},
+        buffered => ~"abcdef",
+        bytes_read => 0,
+        recv => fun() -> error(unused) end,
+        max => 1000
+    },
+    {more, First, State1} = cactus_conn:consume_body_state(State0, {length, 4}),
+    ?assertEqual(~"abcd", First),
+    {ok, Last, _State2} = cactus_conn:consume_body_state(State1, {length, 4}),
+    ?assertEqual(~"ef", Last).
+
+consume_state_length_recv_error_propagates_test() ->
+    State = #{
+        framing => {content_length, 100},
+        buffered => <<>>,
+        bytes_read => 0,
+        recv => fun() -> {error, closed} end,
+        max => 1000
+    },
+    ?assertEqual({error, closed}, cactus_conn:consume_body_state(State, all)).
+
+consume_state_request_too_large_test() ->
+    State = #{
+        framing => {content_length, 100},
+        buffered => <<>>,
+        bytes_read => 0,
+        recv => fun() -> error(unused) end,
+        max => 10
+    },
+    ?assertEqual(
+        {error, content_length_too_large},
+        cactus_conn:consume_body_state(State, all)
+    ).
+
+consume_state_chunked_full_drain_test() ->
+    State = #{
+        framing => chunked,
+        buffered => ~"5\r\nhello\r\n0\r\n\r\n",
+        bytes_read => 0,
+        recv => fun() -> error(unused) end,
+        max => 1000
+    },
+    ?assertMatch({ok, ~"hello", _}, cactus_conn:consume_body_state(State, all)).
+
+consume_state_chunked_error_propagates_test() ->
+    State = #{
+        framing => chunked,
+        buffered => ~"xyz\r\nhello\r\n",
+        bytes_read => 0,
+        recv => fun() -> error(unused) end,
+        max => 1000
+    },
+    ?assertEqual({error, bad_chunk_size}, cactus_conn:consume_body_state(State, all)).
+
+consume_state_recvs_more_when_buffer_short_test() ->
+    %% Buffer has only 2 bytes, content-length is 5 — fill_n must recv
+    %% more. Exercises the success path of the recv loop.
+    Self = self(),
+    State = #{
+        framing => {content_length, 5},
+        buffered => ~"he",
+        bytes_read => 0,
+        recv => fun() ->
+            Self ! recv_called,
+            {ok, ~"llo"}
+        end,
+        max => 1000
+    },
+    ?assertMatch({ok, ~"hello", _}, cactus_conn:consume_body_state(State, all)),
+    receive
+        recv_called -> ok
+    after 100 -> error(recv_was_not_called)
+    end.
+
+%% --- end-to-end manual mode error cases ---
+
+conn_manual_body_buffering_bad_transfer_encoding_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_manual_te, #{
+                port => 0,
+                handler => cactus_stream_body_handler,
+                body_buffering => manual
+            }),
+            cactus_listener:port(conn_test_manual_te)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_manual_te) end, fun(Port) ->
+            {"manual mode rejects unknown Transfer-Encoding with 400", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(
+                    Sock,
+                    ~"POST /full HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n"
+                ),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 400 ", _/binary>>, Reply),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_manual_body_buffering_keep_alive_handler_still_closes_test_() ->
+    {setup,
+        fun() ->
+            %% cactus_keepalive_handler returns NO Connection: close — under
+            %% auto+HTTP/1.1 it would keep-alive. Under manual mode we still
+            %% close (handler may not have drained the body).
+            {ok, _} = cactus_listener:start_link(conn_test_manual_ka, #{
+                port => 0,
+                handler => cactus_keepalive_handler,
+                body_buffering => manual
+            }),
+            cactus_listener:port(conn_test_manual_ka)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_manual_ka) end, fun(Port) ->
+            {"manual mode forces close even when handler would keep-alive", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_manual_body_buffering_chunked_request_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_manual_chunked, #{
+                port => 0,
+                handler => cactus_stream_body_handler,
+                body_buffering => manual
+            }),
+            cactus_listener:port(conn_test_manual_chunked)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_manual_chunked) end, fun(Port) ->
+            {"manual mode decodes chunked request bodies on demand", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                Body = ~"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+                ok = gen_tcp:send(
+                    Sock,
+                    <<
+                        "POST /full HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
+                        Body/binary
+                    >>
+                ),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"hello world"),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_manual_body_buffering_full_read_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_manual_full, #{
+                port => 0,
+                handler => cactus_stream_body_handler,
+                body_buffering => manual
+            }),
+            cactus_listener:port(conn_test_manual_full)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_manual_full) end, fun(Port) ->
+            {"manual mode: read_body/1 returns the full body", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(
+                    Sock,
+                    ~"POST /full HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world"
+                ),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"hello world"),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_manual_body_buffering_chunked_reads_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_manual_chunks, #{
+                port => 0,
+                handler => cactus_stream_body_handler,
+                body_buffering => manual
+            }),
+            cactus_listener:port(conn_test_manual_chunks)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_manual_chunks) end, fun(Port) ->
+            {"manual mode: read_body/2 with length yields multiple chunks", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                %% 11-byte body, length=4 → 3 reads (4, 4, 3).
+                ok = gen_tcp:send(
+                    Sock,
+                    ~"POST /chunks HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world"
+                ),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"chunks=3 body=hello world"),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
 conn_minimum_bytes_per_second_drops_slow_client_test_() ->
     {setup,
         fun() ->

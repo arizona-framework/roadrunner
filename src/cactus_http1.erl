@@ -52,7 +52,11 @@ response (`400`, `414`, `431`, etc.).
     %% Per-route opts attached at compile time via the 3-tuple route shape
     %% `{Path, Handler, Opts}`. `undefined` for 2-tuple routes and for
     %% single-handler dispatch (no router involved).
-    route_opts => term()
+    route_opts => term(),
+    %% Body-read state attached by `cactus_conn` in `body_buffering => manual`
+    %% mode. Consumed by `cactus_req:read_body/1,2`. Never present in
+    %% `auto` mode or in manually-constructed request maps.
+    body_state => cactus_conn:body_state()
 }.
 
 -doc """

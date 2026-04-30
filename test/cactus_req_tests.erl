@@ -124,6 +124,54 @@ has_body_empty_returns_false_test() ->
     Req = (sample_req())#{body => ~""},
     ?assertEqual(false, cactus_req:has_body(Req)).
 
+%% --- read_body/1,2 ---
+
+read_body_auto_mode_returns_buffered_body_test() ->
+    Req = (sample_req())#{body => ~"already buffered"},
+    ?assertEqual({ok, ~"already buffered", Req}, cactus_req:read_body(Req)).
+
+read_body_no_body_field_returns_empty_test() ->
+    Req = sample_req(),
+    ?assertEqual({ok, ~"", Req}, cactus_req:read_body(Req)).
+
+read_body_manual_state_full_drain_test() ->
+    BS = #{
+        framing => {content_length, 5},
+        buffered => ~"hello",
+        bytes_read => 0,
+        recv => fun() -> error(unused) end,
+        max => 1000
+    },
+    Req = (sample_req())#{body_state => BS},
+    {ok, Bytes, Req2} = cactus_req:read_body(Req),
+    ?assertEqual(~"hello", Bytes),
+    ?assertEqual(~"hello", cactus_req:body(Req2)).
+
+read_body_manual_state_partial_returns_more_test() ->
+    BS = #{
+        framing => {content_length, 6},
+        buffered => ~"abcdef",
+        bytes_read => 0,
+        recv => fun() -> error(unused) end,
+        max => 1000
+    },
+    Req = (sample_req())#{body_state => BS},
+    {more, First, Req2} = cactus_req:read_body(Req, #{length => 4}),
+    ?assertEqual(~"abcd", First),
+    {ok, Last, _Req3} = cactus_req:read_body(Req2, #{length => 4}),
+    ?assertEqual(~"ef", Last).
+
+read_body_manual_state_error_propagates_test() ->
+    BS = #{
+        framing => {content_length, 100},
+        buffered => <<>>,
+        bytes_read => 0,
+        recv => fun() -> {error, closed} end,
+        max => 1000
+    },
+    Req = (sample_req())#{body_state => BS},
+    ?assertEqual({error, closed}, cactus_req:read_body(Req)).
+
 has_body_absent_returns_false_test() ->
     ?assertEqual(false, cactus_req:has_body(sample_req())).
 

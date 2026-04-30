@@ -20,6 +20,8 @@ representation can evolve without breaking them.
     parse_cookies/1,
     body/1,
     has_body/1,
+    read_body/1,
+    read_body/2,
     bindings/1,
     peer/1,
     scheme/1,
@@ -149,6 +151,62 @@ body-aware work.
 -spec has_body(cactus_http1:request()) -> boolean().
 has_body(#{body := B}) -> B =/= <<>>;
 has_body(_) -> false.
+
+-doc """
+Read the request body in one shot. Works in both `auto` and `manual`
+body-buffering modes:
+
+- **auto** (default): the conn already buffered the body before
+  invoking the handler — this returns the buffered bytes unchanged.
+  `Req` is returned as-is.
+- **manual**: the conn parked the body on the socket. This drains it
+  and returns the bytes. The returned `Req2` has its embedded
+  `body_state` updated and `body` populated; subsequent
+  `cactus_req:body/1` and `read_body/1` calls return the same bytes.
+""".
+-spec read_body(cactus_http1:request()) ->
+    {ok, binary(), cactus_http1:request()} | {error, term()}.
+read_body(Req) ->
+    read_body(Req, #{}).
+
+-doc """
+Read the request body, optionally bounded by `length`.
+
+`Opts` may contain `length => non_neg_integer()`. If absent, behaves
+like `read_body/1` (drain to end). When set on a content-length body,
+returns up to `Length` bytes per call:
+
+- `{ok, Bytes, Req2}` — body is fully drained (no more bytes left).
+- `{more, Bytes, Req2}` — more bytes remain; call again with `Req2`.
+
+Chunked bodies fall through to a full read regardless of `length` —
+streaming-with-length over chunked framing is not yet implemented.
+
+In `auto` mode the body is already buffered, so `length` has no
+effect — the buffered bytes are returned in one shot.
+""".
+-spec read_body(cactus_http1:request(), #{length => non_neg_integer()}) ->
+    {ok, binary(), cactus_http1:request()}
+    | {more, binary(), cactus_http1:request()}
+    | {error, term()}.
+read_body(#{body_state := BS} = Req, Opts) ->
+    Mode =
+        case Opts of
+            #{length := L} -> {length, L};
+            _ -> all
+        end,
+    case cactus_conn:consume_body_state(BS, Mode) of
+        {ok, Bytes, BS2} ->
+            {ok, Bytes, Req#{body_state := BS2, body => Bytes}};
+        {more, Bytes, BS2} ->
+            {more, Bytes, Req#{body_state := BS2}};
+        {error, _} = E ->
+            E
+    end;
+read_body(Req, _Opts) ->
+    %% Auto mode (or a manually-constructed req): the body is already
+    %% sitting in the `body` field — return it.
+    {ok, body(Req), Req}.
 
 -doc """
 Return the router-captured bindings for this request as a

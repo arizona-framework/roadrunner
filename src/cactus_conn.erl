@@ -19,9 +19,17 @@ connection silently — no response to a peer that wasn't going to
 read it anyway.
 """.
 
--export([start/2, parse_loop/2, read_body/4, peer/1, try_acquire_slot/1, release_slot/1]).
+-export([
+    start/2,
+    parse_loop/2,
+    read_body/4,
+    peer/1,
+    try_acquire_slot/1,
+    release_slot/1,
+    consume_body_state/2
+]).
 
--export_type([proto_opts/0, dispatch/0]).
+-export_type([proto_opts/0, dispatch/0, body_state/0]).
 
 -type dispatch() ::
     {handler, module()}
@@ -36,7 +44,19 @@ read it anyway.
     max_keep_alive_request := pos_integer(),
     max_clients := pos_integer(),
     client_counter := atomics:atomics_ref(),
-    minimum_bytes_per_second := non_neg_integer()
+    minimum_bytes_per_second := non_neg_integer(),
+    body_buffering := auto | manual
+}.
+
+%% Opaque body-read state attached to the request in manual buffering
+%% mode. `cactus_req:read_body/1,2` consumes from this state; the conn
+%% owns the recv closure and tracks how much remains.
+-opaque body_state() :: #{
+    framing := none | chunked | {content_length, non_neg_integer()},
+    buffered := binary(),
+    bytes_read := non_neg_integer(),
+    recv := fun(() -> {ok, binary()} | {error, term()}),
+    max := non_neg_integer()
 }.
 
 -doc """
@@ -131,7 +151,8 @@ process_one(
         dispatch := Dispatch,
         middlewares := ListenerMws,
         max_content_length := MaxCL,
-        minimum_bytes_per_second := MinRate
+        minimum_bytes_per_second := MinRate,
+        body_buffering := BodyBuffering
     },
     Timeout,
     Phase
@@ -142,32 +163,9 @@ process_one(
         {ok, Req0, Buffered} ->
             Req = Req0#{peer => Peer, scheme => Scheme},
             ok = maybe_send_continue(Socket, Req, Buffered),
-            case read_body(Req, Buffered, Recv, MaxCL) of
-                {ok, Body} ->
-                    ReqWithBody = Req#{body => Body},
-                    case resolve_handler(Dispatch, ReqWithBody) of
-                        {ok, Handler, Bindings, RouteOpts} ->
-                            FullReq = ReqWithBody#{
-                                bindings => Bindings,
-                                route_opts => RouteOpts
-                            },
-                            handle_and_send(Socket, Handler, FullReq, ListenerMws);
-                        not_found ->
-                            _ = send_not_found(Socket),
-                            close
-                    end;
-                {error, content_length_too_large} ->
-                    _ = send_payload_too_large(Socket),
-                    close;
-                {error, request_timeout} ->
-                    _ = send_request_timeout(Socket),
-                    close;
-                {error, slow_client} ->
-                    close;
-                {error, _} ->
-                    _ = send_bad_request(Socket),
-                    close
-            end;
+            handle_with_body(
+                Socket, Req, Buffered, Recv, MaxCL, Dispatch, ListenerMws, BodyBuffering
+            );
         {error, request_timeout} ->
             _ = maybe_send_request_timeout(Socket, Phase),
             close;
@@ -182,6 +180,77 @@ process_one(
     ok | {error, term()}.
 maybe_send_request_timeout(Socket, first) -> send_request_timeout(Socket);
 maybe_send_request_timeout(_Socket, keep_alive) -> ok.
+
+%% Auto mode: read the body upfront, hand the handler the buffered
+%% bytes via `req#{body}`. Manual mode: skip the upfront read, embed a
+%% `body_state` in the request so the handler can call
+%% `cactus_req:read_body/1,2`. Manual mode does not keep-alive — the
+%% conn would have to drain whatever the handler skipped, which we
+%% defer until arizona surfaces a need.
+-spec handle_with_body(
+    cactus_transport:socket(),
+    cactus_http1:request(),
+    binary(),
+    fun(() -> {ok, binary()} | {error, term()}),
+    non_neg_integer(),
+    dispatch(),
+    cactus_middleware:middleware_list(),
+    auto | manual
+) -> keep_alive | close.
+handle_with_body(Socket, Req, Buffered, Recv, MaxCL, Dispatch, ListenerMws, auto) ->
+    case read_body(Req, Buffered, Recv, MaxCL) of
+        {ok, Body} ->
+            ReqWithBody = Req#{body => Body},
+            dispatch_resolved(Socket, ReqWithBody, Dispatch, ListenerMws);
+        {error, content_length_too_large} ->
+            _ = send_payload_too_large(Socket),
+            close;
+        {error, request_timeout} ->
+            _ = send_request_timeout(Socket),
+            close;
+        {error, slow_client} ->
+            close;
+        {error, _} ->
+            _ = send_bad_request(Socket),
+            close
+    end;
+handle_with_body(Socket, Req, Buffered, Recv, MaxCL, Dispatch, ListenerMws, manual) ->
+    case body_framing(Req) of
+        {error, _} ->
+            _ = send_bad_request(Socket),
+            close;
+        Framing ->
+            BodyState = #{
+                framing => Framing,
+                buffered => Buffered,
+                bytes_read => 0,
+                recv => Recv,
+                max => MaxCL
+            },
+            ReqWithState = Req#{body_state => BodyState},
+            Result = dispatch_resolved(Socket, ReqWithState, Dispatch, ListenerMws),
+            %% No drain implementation yet — manual mode always closes.
+            case Result of
+                keep_alive -> close;
+                close -> close
+            end
+    end.
+
+-spec dispatch_resolved(
+    cactus_transport:socket(),
+    cactus_http1:request(),
+    dispatch(),
+    cactus_middleware:middleware_list()
+) -> keep_alive | close.
+dispatch_resolved(Socket, Req, Dispatch, ListenerMws) ->
+    case resolve_handler(Dispatch, Req) of
+        {ok, Handler, Bindings, RouteOpts} ->
+            FullReq = Req#{bindings => Bindings, route_opts => RouteOpts},
+            handle_and_send(Socket, Handler, FullReq, ListenerMws);
+        not_found ->
+            _ = send_not_found(Socket),
+            close
+    end.
 
 %% Build a recv closure with a single overall deadline plus a rolling
 %% rate check. `gen_tcp:recv` with a negative timeout is undefined, so
@@ -364,6 +433,78 @@ read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
             end;
         {error, _} = E ->
             E
+    end.
+
+-doc """
+Consume bytes from a manual-mode `body_state()`. Returns either the
+final tail (`{ok, Bytes, NewState}` — the body has been fully drained)
+or a partial chunk (`{more, Bytes, NewState}` — more is still pending).
+Used by `cactus_req:read_body/1,2`; not part of the public API.
+
+`Mode` is `all` (drain to end) or `{length, N}` (read up to `N`
+bytes — content-length framing only; chunked falls through to a
+full read).
+""".
+-spec consume_body_state(body_state(), all | {length, non_neg_integer()}) ->
+    {ok, binary(), body_state()}
+    | {more, binary(), body_state()}
+    | {error, term()}.
+consume_body_state(#{framing := none, buffered := Buf} = BS, _Mode) ->
+    {ok, Buf, BS#{buffered := <<>>}};
+consume_body_state(
+    #{framing := {content_length, N}, bytes_read := Read} = BS, _Mode
+) when Read >= N ->
+    {ok, <<>>, BS};
+consume_body_state(
+    #{
+        framing := {content_length, N},
+        bytes_read := Read,
+        buffered := Buf,
+        recv := Recv,
+        max := Max
+    } = BS,
+    Mode
+) ->
+    Remaining = N - Read,
+    Want =
+        case Mode of
+            all -> Remaining;
+            {length, L} -> min(Remaining, L)
+        end,
+    case Want > Max of
+        true ->
+            {error, content_length_too_large};
+        false ->
+            case fill_n(Want, Buf, Recv) of
+                {ok, Bytes, NewBuf} ->
+                    NewRead = Read + byte_size(Bytes),
+                    NewState = BS#{buffered := NewBuf, bytes_read := NewRead},
+                    case NewRead >= N of
+                        true -> {ok, Bytes, NewState};
+                        false -> {more, Bytes, NewState}
+                    end;
+                {error, _} = E ->
+                    E
+            end
+    end;
+consume_body_state(#{framing := chunked, buffered := Buf, recv := Recv, max := Max} = BS, _Mode) ->
+    %% Chunked: drain to end in one shot. Streaming-with-length over
+    %% chunked framing requires tracking partial chunks across calls;
+    %% defer until there's a use case.
+    case read_chunked(Buf, Recv, Max, 0) of
+        {ok, Body} -> {ok, Body, BS#{buffered := <<>>}};
+        {error, _} = E -> E
+    end.
+
+-spec fill_n(non_neg_integer(), binary(), fun(() -> {ok, binary()} | {error, term()})) ->
+    {ok, binary(), binary()} | {error, term()}.
+fill_n(N, Buf, _Recv) when byte_size(Buf) >= N ->
+    <<Bytes:N/binary, Rest/binary>> = Buf,
+    {ok, Bytes, Rest};
+fill_n(N, Buf, Recv) ->
+    case Recv() of
+        {ok, More} -> fill_n(N, <<Buf/binary, More/binary>>, Recv);
+        {error, _} = E -> E
     end.
 
 -spec content_length(cactus_http1:request()) ->
