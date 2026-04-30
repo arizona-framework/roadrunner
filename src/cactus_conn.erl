@@ -232,7 +232,8 @@ peer(Socket) ->
 
 -spec scheme(cactus_transport:socket()) -> http | https.
 scheme({gen_tcp, _}) -> http;
-scheme({ssl, _}) -> https.
+scheme({ssl, _}) -> https;
+scheme({fake, _}) -> http.
 
 -spec resolve_handler(dispatch(), cactus_http1:request()) ->
     {ok, module(), cactus_router:bindings(), term()} | not_found.

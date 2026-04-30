@@ -1,12 +1,16 @@
 -module(cactus_transport).
 -moduledoc """
-Tagged-socket transport abstraction over `gen_tcp` (and, in a follow-up
-feature, `ssl`).
+Tagged-socket transport abstraction over `gen_tcp`, `ssl`, and a
+`fake` test backend.
 
 A socket is `{Module, RawSocket}` so callers don't have to know whether
-they're talking to plain TCP or TLS. The first phase wires up only the
-`gen_tcp` backend; adding the `{ssl, _}` tag is a non-breaking change
-to this module.
+they're talking to plain TCP, TLS, or a test fixture.
+
+The `{fake, Pid}` variant is a per-connection test helper: every
+`send/2`, `recv/3`, and `close/1` call dispatches to `Pid` as an
+Erlang message, letting tests drive a `cactus_conn` byte-by-byte
+without spinning up a listener. See `cactus_transport_tests` for the
+message protocol.
 """.
 
 -export([
@@ -23,7 +27,10 @@ to this module.
 
 -export_type([socket/0]).
 
--type socket() :: {gen_tcp, gen_tcp:socket()} | {ssl, ssl:sslsocket()}.
+-type socket() ::
+    {gen_tcp, gen_tcp:socket()}
+    | {ssl, ssl:sslsocket()}
+    | {fake, pid()}.
 
 -doc "Open a plain TCP listening socket. Options pass verbatim to gen_tcp:listen/2.".
 -spec listen(inet:port_number(), [gen_tcp:listen_option()]) ->
@@ -73,39 +80,76 @@ accept({ssl, LSock}) ->
 controlling_process({gen_tcp, S}, Pid) ->
     gen_tcp:controlling_process(S, Pid);
 controlling_process({ssl, S}, Pid) ->
-    ssl:controlling_process(S, Pid).
+    ssl:controlling_process(S, Pid);
+controlling_process({fake, _Pid}, _NewPid) ->
+    ok.
 
--doc "Receive bytes from the socket.".
+-doc """
+Receive bytes from the socket.
+
+For `{fake, Pid}`: sends `{cactus_fake_recv, ConnPid, Length, Timeout}`
+to `Pid` and blocks waiting for a `{cactus_fake_recv_reply, Result}`
+message back. The test driver is expected to reply with `{ok, Bytes}`
+or `{error, Reason}` to drive the conn byte-by-byte.
+""".
 -spec recv(socket(), non_neg_integer(), timeout()) ->
     {ok, binary()} | {error, term()}.
 recv({gen_tcp, S}, Len, Timeout) ->
     gen_tcp:recv(S, Len, Timeout);
 recv({ssl, S}, Len, Timeout) ->
-    ssl:recv(S, Len, Timeout).
+    ssl:recv(S, Len, Timeout);
+recv({fake, Pid}, Len, Timeout) ->
+    Pid ! {cactus_fake_recv, self(), Len, Timeout},
+    receive
+        {cactus_fake_recv_reply, Result} -> Result
+    end.
 
--doc "Send bytes on the socket.".
+-doc """
+Send bytes on the socket.
+
+For `{fake, Pid}`: forwards `{cactus_fake_send, ConnPid, IoData}` to
+`Pid` and returns `ok`. `IoData` is left unflattened so tests can see
+what the caller actually constructed.
+""".
 -spec send(socket(), iodata()) -> ok | {error, term()}.
 send({gen_tcp, S}, Data) ->
     gen_tcp:send(S, Data);
 send({ssl, S}, Data) ->
-    ssl:send(S, Data).
+    ssl:send(S, Data);
+send({fake, Pid}, Data) ->
+    Pid ! {cactus_fake_send, self(), Data},
+    ok.
 
--doc "Close the socket.".
+-doc """
+Close the socket.
+
+For `{fake, Pid}`: forwards `{cactus_fake_close, ConnPid}` to `Pid`.
+""".
 -spec close(socket()) -> ok.
 close({gen_tcp, S}) ->
     _ = gen_tcp:close(S),
     ok;
 close({ssl, S}) ->
     _ = ssl:close(S),
+    ok;
+close({fake, Pid}) ->
+    Pid ! {cactus_fake_close, self()},
     ok.
 
--doc "Return the peer (`{IpAddress, Port}`) of an accepted connection.".
+-doc """
+Return the peer (`{IpAddress, Port}`) of an accepted connection.
+
+For `{fake, _}`: returns a stub `{127, 0, 0, 1}, 0` so handlers that
+read `cactus_req:peer/1` get a sensible value.
+""".
 -spec peername(socket()) ->
     {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 peername({gen_tcp, S}) ->
     inet:peername(S);
 peername({ssl, S}) ->
-    ssl:peername(S).
+    ssl:peername(S);
+peername({fake, _Pid}) ->
+    {ok, {{127, 0, 0, 1}, 0}}.
 
 -doc "Return the locally-bound port of a listening or connected socket.".
 -spec port(socket()) -> {ok, inet:port_number()} | {error, term()}.
