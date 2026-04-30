@@ -15,7 +15,8 @@ cactus_test_() ->
             {"stop_listener on unknown name returns {error, not_found}",
                 fun stop_unknown_listener/0},
             {"start_listener with a name already in use returns an error",
-                fun duplicate_listener_rejected/0}
+                fun duplicate_listener_rejected/0},
+            {"listeners/0 returns the registered names", fun lists_active_listeners/0}
         ]}.
 
 starts_listener_and_serves() ->
@@ -45,6 +46,16 @@ duplicate_listener_rejected() ->
     {ok, _} = cactus:start_listener(public_test_dup, #{port => 0}),
     ?assertMatch({error, _}, cactus:start_listener(public_test_dup, #{port => 0})),
     ok = cactus:stop_listener(public_test_dup).
+
+lists_active_listeners() ->
+    ?assertEqual([], cactus:listeners()),
+    {ok, _} = cactus:start_listener(public_test_l1, #{port => 0}),
+    {ok, _} = cactus:start_listener(public_test_l2, #{port => 0}),
+    Names = lists:sort(cactus:listeners()),
+    ?assertEqual([public_test_l1, public_test_l2], Names),
+    ok = cactus:stop_listener(public_test_l1),
+    ok = cactus:stop_listener(public_test_l2),
+    ?assertEqual([], cactus:listeners()).
 
 %% --- helpers ---
 

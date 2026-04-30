@@ -8,7 +8,7 @@ cactus application must be running (typically via
 `application:ensure_all_started(cactus)`).
 """.
 
--export([start_listener/2, stop_listener/1]).
+-export([start_listener/2, stop_listener/1, listeners/0]).
 
 -doc """
 Start a listener as a supervised child of the cactus application.
@@ -48,3 +48,13 @@ stop_listener(Name) when is_atom(Name) ->
         {error, not_found} ->
             {error, not_found}
     end.
+
+-doc """
+Return the list of currently registered listener names.
+
+Order matches `supervisor:which_children/1` — typically reverse
+start-order. The cactus application must be running.
+""".
+-spec listeners() -> [atom()].
+listeners() ->
+    [Name || {Name, _Pid, _Type, _Mods} <- supervisor:which_children(cactus_sup)].
