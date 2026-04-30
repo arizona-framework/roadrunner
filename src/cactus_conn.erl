@@ -49,12 +49,13 @@ serve(Socket, #{
     request_timeout := ReqTimeout
 }) ->
     Peer = peer(Socket),
+    Scheme = scheme(Socket),
     Deadline = erlang:monotonic_time(millisecond) + ReqTimeout,
     Recv = make_recv(Socket, Deadline),
     _ =
         case parse_loop(<<>>, Recv) of
             {ok, Req0, Buffered} ->
-                Req = Req0#{peer => Peer},
+                Req = Req0#{peer => Peer, scheme => Scheme},
                 case read_body(Req, Buffered, Recv, MaxCL) of
                     {ok, Body} ->
                         ReqWithBody = Req#{body => Body},
@@ -104,6 +105,10 @@ peer(Socket) ->
         {ok, Peer} -> Peer;
         {error, _} -> undefined
     end.
+
+-spec scheme(cactus_transport:socket()) -> http | https.
+scheme({gen_tcp, _}) -> http;
+scheme({ssl, _}) -> https.
 
 -spec resolve_handler(dispatch(), cactus_http1:request()) ->
     {ok, module(), cactus_router:bindings()} | not_found.

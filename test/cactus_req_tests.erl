@@ -139,6 +139,19 @@ peer_present_test() ->
 peer_absent_returns_undefined_test() ->
     ?assertEqual(undefined, cactus_req:peer(sample_req())).
 
+%% --- scheme/1 ---
+
+scheme_http_test() ->
+    Req = (sample_req())#{scheme => http},
+    ?assertEqual(http, cactus_req:scheme(Req)).
+
+scheme_https_test() ->
+    Req = (sample_req())#{scheme => https},
+    ?assertEqual(https, cactus_req:scheme(Req)).
+
+scheme_absent_defaults_to_http_test() ->
+    ?assertEqual(http, cactus_req:scheme(sample_req())).
+
 %% --- fixtures ---
 
 sample_req() ->

@@ -45,7 +45,10 @@ response (`400`, `414`, `431`, etc.).
     bindings => cactus_router:bindings(),
     %% Client TCP peer captured once per connection from `inet:peername/1`.
     %% `undefined` when the OS call fails (rare; usually socket teardown).
-    peer => {inet:ip_address(), inet:port_number()} | undefined
+    peer => {inet:ip_address(), inet:port_number()} | undefined,
+    %% Connection scheme — `http` for plain TCP, `https` for TLS. Set
+    %% once per connection by `cactus_conn` from the transport tag.
+    scheme => http | https
 }.
 
 -doc """

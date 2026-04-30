@@ -20,7 +20,8 @@ representation can evolve without breaking them.
     body/1,
     has_body/1,
     bindings/1,
-    peer/1
+    peer/1,
+    scheme/1
 ]).
 
 -doc "Return the request method (uppercase ASCII binary).".
@@ -161,3 +162,14 @@ when the OS call failed at accept time.
     {inet:ip_address(), inet:port_number()} | undefined.
 peer(#{peer := P}) -> P;
 peer(_) -> undefined.
+
+-doc """
+Return the connection scheme — `http` for plain TCP, `https` for TLS.
+
+`cactus_conn` sets this once per connection from the transport tag.
+Defaults to `http` for request maps constructed manually outside the
+connection pipeline.
+""".
+-spec scheme(cactus_http1:request()) -> http | https.
+scheme(#{scheme := S}) -> S;
+scheme(_) -> http.
