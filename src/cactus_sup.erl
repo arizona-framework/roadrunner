@@ -19,12 +19,13 @@ start_link() ->
 
 -spec init([]) -> {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
 init([]) ->
+    %% Listeners are added dynamically via cactus:start_listener/2 — start
+    %% with no static children. one_for_one isolates per-listener crashes.
     SupFlags = #{
-        strategy => one_for_all,
-        intensity => 0,
-        period => 1
+        strategy => one_for_one,
+        intensity => 5,
+        period => 10
     },
-    ChildSpecs = [],
-    {ok, {SupFlags, ChildSpecs}}.
+    {ok, {SupFlags, []}}.
 
 %% internal functions

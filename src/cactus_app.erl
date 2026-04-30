@@ -9,12 +9,9 @@
 
 -export([start/2, stop/1]).
 
--spec start(application:start_type(), term()) -> {ok, pid()} | {error, term()}.
+-spec start(application:start_type(), term()) -> supervisor:startlink_ret().
 start(_StartType, _StartArgs) ->
-    case cactus_sup:start_link() of
-        {ok, _} = Ok -> Ok;
-        {error, _} = Err -> Err
-    end.
+    cactus_sup:start_link().
 
 -spec stop(term()) -> ok.
 stop(_State) ->
