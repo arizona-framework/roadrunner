@@ -77,3 +77,23 @@ set_cookie_adds_set_cookie_header_test() ->
     Resp = cactus_resp:set_cookie(Resp0, ~"sid", ~"abc", #{path => ~"/", http_only => true}),
     {200, [{~"set-cookie", Cookie} | _], ~"hi"} = Resp,
     ?assertEqual(~"sid=abc; Path=/; HttpOnly", Cookie).
+
+%% --- empty-body status shortcuts ---
+
+no_content_test() ->
+    ?assertEqual({204, [{~"content-length", ~"0"}], ~""}, cactus_resp:no_content()).
+
+bad_request_test() ->
+    ?assertEqual({400, [{~"content-length", ~"0"}], ~""}, cactus_resp:bad_request()).
+
+unauthorized_test() ->
+    ?assertEqual({401, [{~"content-length", ~"0"}], ~""}, cactus_resp:unauthorized()).
+
+forbidden_test() ->
+    ?assertEqual({403, [{~"content-length", ~"0"}], ~""}, cactus_resp:forbidden()).
+
+not_found_test() ->
+    ?assertEqual({404, [{~"content-length", ~"0"}], ~""}, cactus_resp:not_found()).
+
+internal_error_test() ->
+    ?assertEqual({500, [{~"content-length", ~"0"}], ~""}, cactus_resp:internal_error()).

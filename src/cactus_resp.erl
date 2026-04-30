@@ -9,7 +9,20 @@ repeat the boilerplate. Body framing (`Connection: close`,
 helpers only fill in what the handler can know.
 """.
 
--export([text/2, html/2, json/2, redirect/2, add_header/3, set_cookie/4]).
+-export([
+    text/2,
+    html/2,
+    json/2,
+    redirect/2,
+    add_header/3,
+    set_cookie/4,
+    no_content/0,
+    bad_request/0,
+    unauthorized/0,
+    forbidden/0,
+    not_found/0,
+    internal_error/0
+]).
 
 -type response() :: {cactus_http1:status(), cactus_http1:headers(), iodata()}.
 
@@ -74,3 +87,31 @@ so handlers don't have to.
     response().
 set_cookie(Resp, Name, Value, Opts) ->
     add_header(Resp, ~"set-cookie", cactus_cookie:serialize(Name, Value, Opts)).
+
+-doc "Empty 204 No Content response.".
+-spec no_content() -> response().
+no_content() -> empty_status(204).
+
+-doc "Empty 400 Bad Request response.".
+-spec bad_request() -> response().
+bad_request() -> empty_status(400).
+
+-doc "Empty 401 Unauthorized response.".
+-spec unauthorized() -> response().
+unauthorized() -> empty_status(401).
+
+-doc "Empty 403 Forbidden response.".
+-spec forbidden() -> response().
+forbidden() -> empty_status(403).
+
+-doc "Empty 404 Not Found response.".
+-spec not_found() -> response().
+not_found() -> empty_status(404).
+
+-doc "Empty 500 Internal Server Error response.".
+-spec internal_error() -> response().
+internal_error() -> empty_status(500).
+
+-spec empty_status(cactus_http1:status()) -> response().
+empty_status(Status) ->
+    {Status, [{~"content-length", ~"0"}], ~""}.
