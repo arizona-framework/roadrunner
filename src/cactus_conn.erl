@@ -1,13 +1,22 @@
 -module(cactus_conn).
 -moduledoc """
-HTTP/1.1 connection process — one per accepted TCP connection.
+HTTP/1.1 connection process — one per accepted TCP/TLS connection.
 
-Reads bytes from the socket, drives `cactus_http1:parse_request/1`
-incrementally, sends a hardcoded `200 Hello, cactus!` response on
-success or `400 Bad Request` on parse failure, then closes.
+Reads bytes off the transport, drives `cactus_http1:parse_request/1`
+incrementally, dispatches to the configured `cactus_handler` (either
+directly or via `cactus_router`), and writes the response back.
 
-This is the minimum end-to-end pipeline for slice 2; the handler
-behaviour and routing arrive in slices 3–4.
+Supports HTTP/1.1 keep-alive (capped by `max_keep_alive_request`,
+idle-bound by `keep_alive_timeout`), the four handler return shapes
+(`{Status, Headers, Body}`, `{stream, ...}`, `{loop, ...}`,
+`{websocket, ...}`), `Expect: 100-continue`, HEAD body suppression,
+and a per-conn anti-Slowloris rate check (`minimum_bytes_per_second`).
+
+Sends `400 Bad Request` on parse failure, `408` on first-request
+silence, `413` on oversized bodies, and `500` on handler crashes.
+Idle keep-alive timeouts and slow-client rate violations close the
+connection silently — no response to a peer that wasn't going to
+read it anyway.
 """.
 
 -export([start/2, parse_loop/2, read_body/4, peer/1, try_acquire_slot/1, release_slot/1]).

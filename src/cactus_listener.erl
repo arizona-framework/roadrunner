@@ -1,13 +1,19 @@
 -module(cactus_listener).
 -moduledoc """
-TCP listener — owns the listening socket for a named cactus instance.
+Listener gen_server — owns the listening socket and the acceptor pool
+for one named cactus instance.
 
-Backed by `gen_tcp` with `{inet_backend, socket}` so we land on the
-NIF-based async I/O path that's been the production-ready default
-since OTP 27.
+Plain TCP is backed by `gen_tcp` with `{inet_backend, socket}` so we
+land on the NIF-based async I/O path that's been the production-ready
+default since OTP 27. TLS is backed by `ssl`, gated by the `tls` opt.
+Both paths share the same `cactus_transport` tagged-socket abstraction.
 
-This first slice opens and closes the listen socket. Acceptors and
-connection workers will hang off it in subsequent features.
+On `init/1` the listener opens the listen socket, builds the shared
+`cactus_conn:proto_opts()` (dispatch + body limits + timeouts +
+`max_clients` counter), and spawn-links `num_acceptors` (default 10)
+`cactus_acceptor` processes that pull from the same listen socket.
+Connection workers are unlinked from the acceptor so a single
+connection crash doesn't take the pool down.
 """.
 
 -behaviour(gen_server).
