@@ -730,6 +730,46 @@ conn_handler_crash_returns_500_test_() ->
             end}
         end}.
 
+conn_loop_handler_pushes_messages_as_chunks_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_loop, #{
+                port => 0, handler => cactus_loop_handler
+            }),
+            cactus_listener:port(conn_test_loop)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_loop) end, fun(Port) ->
+            {"loop handler streams chunks driven by Erlang messages", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                Headers = recv_until(Sock, ~"\r\n\r\n"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Headers),
+                {match, _} = re:run(Headers, ~"transfer-encoding: chunked", [caseless]),
+                wait_registered(cactus_loop_test_conn),
+                cactus_loop_test_conn ! {push, ~"hello"},
+                cactus_loop_test_conn ! {push, ~"world"},
+                cactus_loop_test_conn ! stop,
+                Body = recv_until_closed(Sock),
+                {match, _} = re:run(Body, ~"data: hello"),
+                {match, _} = re:run(Body, ~"data: world"),
+                {match, _} = re:run(Body, ~"data: bye\\(2\\)"),
+                %% Final size-0 terminator chunk.
+                {match, _} = re:run(Body, ~"\r\n0\r\n\r\n"),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+wait_registered(Name) ->
+    case whereis(Name) of
+        undefined ->
+            timer:sleep(10),
+            wait_registered(Name);
+        _ ->
+            ok
+    end.
+
 conn_max_clients_rejects_excess_connections_test_() ->
     {setup,
         fun() ->

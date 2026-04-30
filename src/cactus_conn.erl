@@ -365,6 +365,9 @@ handle_and_send(Socket, Handler, Req) ->
         {stream, Status, Headers, Fun} when is_function(Fun, 1) ->
             _ = stream_response(Socket, Status, Headers, Fun),
             close;
+        {loop, Status, Headers, LoopState} when is_integer(Status) ->
+            _ = loop_response(Socket, Status, Headers, Handler, LoopState),
+            close;
         {Status, Headers, Body} when is_integer(Status) ->
             RespBody = response_body_for(Req, Body),
             Resp = cactus_http1:response(Status, Headers, RespBody),
@@ -454,6 +457,44 @@ stream_response(Socket, Status, UserHeaders, Fun) ->
     end,
     _ = Fun(Send),
     ok.
+
+%% Emit status + chunked headers, then receive Erlang messages and
+%% dispatch each through `Handler:handle_info/3`. Each call gets a
+%% `Push(Data)` fun that frames `Data` as one chunk and writes it.
+%% On `{stop, _}` we emit the size-0 terminator and return.
+-spec loop_response(
+    cactus_transport:socket(),
+    cactus_http1:status(),
+    cactus_http1:headers(),
+    module(),
+    term()
+) -> ok.
+loop_response(Socket, Status, UserHeaders, Handler, State) ->
+    Headers = [{~"transfer-encoding", ~"chunked"} | UserHeaders],
+    Head = cactus_http1:response(Status, Headers, ~""),
+    _ = cactus_transport:send(Socket, Head),
+    Push = fun(Data) ->
+        cactus_transport:send(Socket, [
+            integer_to_binary(iolist_size(Data), 16),
+            ~"\r\n",
+            Data,
+            ~"\r\n"
+        ])
+    end,
+    info_loop(Socket, Handler, Push, State).
+
+-spec info_loop(cactus_transport:socket(), module(), cactus_handler:push_fun(), term()) -> ok.
+info_loop(Socket, Handler, Push, State) ->
+    receive
+        Info ->
+            case Handler:handle_info(Info, Push, State) of
+                {ok, NewState} ->
+                    info_loop(Socket, Handler, Push, NewState);
+                {stop, _NewState} ->
+                    _ = cactus_transport:send(Socket, ~"0\r\n\r\n"),
+                    ok
+            end
+    end.
 
 -spec send_bad_request(cactus_transport:socket()) -> ok | {error, term()}.
 send_bad_request(Socket) ->
