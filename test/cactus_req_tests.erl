@@ -108,6 +108,19 @@ body_absent_returns_empty_test() ->
     %% A request map with no body field returns empty bytes.
     ?assertEqual(~"", cactus_req:body(sample_req())).
 
+%% --- has_body/1 ---
+
+has_body_present_test() ->
+    Req = (sample_req())#{body => ~"hello"},
+    ?assertEqual(true, cactus_req:has_body(Req)).
+
+has_body_empty_returns_false_test() ->
+    Req = (sample_req())#{body => ~""},
+    ?assertEqual(false, cactus_req:has_body(Req)).
+
+has_body_absent_returns_false_test() ->
+    ?assertEqual(false, cactus_req:has_body(sample_req())).
+
 %% --- bindings/1 ---
 
 bindings_present_test() ->

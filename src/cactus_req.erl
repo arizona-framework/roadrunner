@@ -18,6 +18,7 @@ representation can evolve without breaking them.
     parse_qs/1,
     parse_cookies/1,
     body/1,
+    has_body/1,
     bindings/1,
     peer/1
 ]).
@@ -123,6 +124,17 @@ map is constructed manually outside the connection pipeline).
 -spec body(cactus_http1:request()) -> binary().
 body(#{body := B}) -> B;
 body(_) -> <<>>.
+
+-doc """
+Return whether the request carries a non-empty body.
+
+Returns `false` for both an absent `body` field and an empty body
+binary — handlers can use this as a short-circuit before doing any
+body-aware work.
+""".
+-spec has_body(cactus_http1:request()) -> boolean().
+has_body(#{body := B}) -> B =/= <<>>;
+has_body(_) -> false.
 
 -doc """
 Return the router-captured bindings for this request as a
