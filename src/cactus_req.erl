@@ -14,6 +14,7 @@ representation can evolve without breaking them.
     version/1,
     headers/1,
     header/2,
+    has_header/2,
     parse_qs/1,
     parse_cookies/1,
     body/1,
@@ -74,6 +75,15 @@ header(Name, #{headers := H}) when is_binary(Name) ->
         {_, Value} -> Value;
         false -> undefined
     end.
+
+-doc """
+Return whether `Name` is present in the request headers.
+
+Lookup is case-insensitive on `Name` — same convention as `header/2`.
+""".
+-spec has_header(binary(), cactus_http1:request()) -> boolean().
+has_header(Name, #{headers := H}) when is_binary(Name) ->
+    lists:keymember(string:lowercase(Name), 1, H).
 
 -doc """
 Parse the query string portion of the request target into a list of

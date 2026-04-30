@@ -48,6 +48,17 @@ header_case_insensitive_test() ->
     %% Caller passes mixed case; lookup finds the lowercased entry.
     ?assertEqual(~"example.com", cactus_req:header(~"Host", sample_req())).
 
+%% --- has_header/2 ---
+
+has_header_present_test() ->
+    ?assertEqual(true, cactus_req:has_header(~"host", sample_req())).
+
+has_header_present_mixed_case_test() ->
+    ?assertEqual(true, cactus_req:has_header(~"Host", sample_req())).
+
+has_header_absent_test() ->
+    ?assertEqual(false, cactus_req:has_header(~"x-missing", sample_req())).
+
 %% --- parse_qs/1 ---
 
 parse_qs_empty_test() ->
