@@ -22,6 +22,7 @@ connection workers will hang off it in subsequent features.
 -type opts() :: #{
     port := inet:port_number(),
     handler => module(),
+    routes => cactus_router:routes(),
     max_content_length => non_neg_integer()
 }.
 
@@ -78,9 +79,17 @@ init(#{port := Port} = Opts) ->
 -spec build_proto_opts(opts()) -> cactus_conn:proto_opts().
 build_proto_opts(Opts) ->
     #{
-        handler => maps:get(handler, Opts, cactus_hello_handler),
+        dispatch => build_dispatch(Opts),
         max_content_length => maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH)
     }.
+
+%% `routes` (router-based dispatch) takes precedence over `handler`. With
+%% neither, fall back to the default hello-world handler.
+-spec build_dispatch(opts()) -> cactus_conn:dispatch().
+build_dispatch(#{routes := Routes}) ->
+    {router, cactus_router:compile(Routes)};
+build_dispatch(Opts) ->
+    {handler, maps:get(handler, Opts, cactus_hello_handler)}.
 
 -spec handle_call(port, gen_server:from(), #state{}) ->
     {reply, inet:port_number(), #state{}}.

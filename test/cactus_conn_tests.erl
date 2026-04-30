@@ -328,7 +328,44 @@ conn_decodes_chunked_body_test_() ->
             end}
         end}.
 
+conn_dispatches_via_router_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_routes, #{
+                port => 0,
+                routes => [
+                    {~"/", cactus_hello_handler},
+                    {~"/created", cactus_test_handler}
+                ]
+            }),
+            cactus_listener:port(conn_test_routes)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_routes) end, fun(Port) ->
+            [
+                {"path / dispatches to cactus_hello_handler", fun() ->
+                    assert_status(Port, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n", 200)
+                end},
+                {"path /created dispatches to cactus_test_handler", fun() ->
+                    assert_status(Port, ~"GET /created HTTP/1.1\r\nHost: x\r\n\r\n", 201)
+                end},
+                {"unknown path returns 404", fun() ->
+                    assert_status(Port, ~"GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 404)
+                end}
+            ]
+        end}.
+
 %% --- helpers ---
+
+assert_status(Port, Request, ExpectedCode) ->
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Sock, Request),
+    Reply = recv_until_closed(Sock),
+    Prefix = iolist_to_binary([
+        ~"HTTP/1.1 ", integer_to_binary(ExpectedCode), ~" "
+    ]),
+    Size = byte_size(Prefix),
+    ?assertEqual(Prefix, binary:part(Reply, 0, Size)),
+    ok = gen_tcp:close(Sock).
 
 recv_until_closed(Sock) ->
     recv_until_closed(Sock, <<>>).

@@ -12,12 +12,16 @@ behaviour and routing arrive in slices 3–4.
 
 -export([start/2, parse_loop/2, read_body/4]).
 
--export_type([proto_opts/0]).
+-export_type([proto_opts/0, dispatch/0]).
 
 -define(RECV_TIMEOUT, 5000).
 
+-type dispatch() ::
+    {handler, module()}
+    | {router, cactus_router:compiled()}.
+
 -type proto_opts() :: #{
-    handler := module(),
+    dispatch := dispatch(),
     max_content_length := non_neg_integer()
 }.
 
@@ -40,14 +44,18 @@ start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
     {ok, Pid}.
 
 -spec serve(gen_tcp:socket(), proto_opts()) -> ok.
-serve(Socket, #{handler := Handler, max_content_length := MaxCL}) ->
+serve(Socket, #{dispatch := Dispatch, max_content_length := MaxCL}) ->
     Recv = fun() -> gen_tcp:recv(Socket, 0, ?RECV_TIMEOUT) end,
     _ =
         case parse_loop(<<>>, Recv) of
             {ok, Req, Buffered} ->
                 case read_body(Req, Buffered, Recv, MaxCL) of
                     {ok, Body} ->
-                        handle_and_send(Socket, Handler, Req#{body => Body});
+                        FullReq = Req#{body => Body},
+                        case resolve_handler(Dispatch, FullReq) of
+                            {ok, Handler} -> handle_and_send(Socket, Handler, FullReq);
+                            not_found -> send_not_found(Socket)
+                        end;
                     {error, content_length_too_large} ->
                         send_payload_too_large(Socket);
                     {error, _} ->
@@ -58,6 +66,13 @@ serve(Socket, #{handler := Handler, max_content_length := MaxCL}) ->
         end,
     _ = gen_tcp:close(Socket),
     ok.
+
+-spec resolve_handler(dispatch(), cactus_http1:request()) ->
+    {ok, module()} | not_found.
+resolve_handler({handler, Mod}, _Req) ->
+    {ok, Mod};
+resolve_handler({router, Compiled}, Req) ->
+    cactus_router:match(cactus_req:path(Req), Compiled).
 
 -doc false.
 -spec read_body(
@@ -209,6 +224,15 @@ send_bad_request(Socket) ->
 send_payload_too_large(Socket) ->
     Resp = cactus_http1:response(
         413,
+        [{~"content-length", ~"0"}, {~"connection", ~"close"}],
+        ~""
+    ),
+    gen_tcp:send(Socket, Resp).
+
+-spec send_not_found(gen_tcp:socket()) -> ok | {error, term()}.
+send_not_found(Socket) ->
+    Resp = cactus_http1:response(
+        404,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
         ~""
     ),
