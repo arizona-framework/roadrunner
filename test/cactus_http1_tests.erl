@@ -155,3 +155,144 @@ oversized_with_crlf_rejected_test() ->
         {error, request_line_too_long},
         cactus_http1:parse_request_line(<<Line/binary, "\r\n">>)
     ).
+
+%% =============================================================================
+%% parse_header/1
+%% =============================================================================
+
+%% --- happy path ---
+
+header_parses_simple_test() ->
+    ?assertEqual(
+        {ok, ~"host", ~"example.com", ~""},
+        cactus_http1:parse_header(~"Host: example.com\r\n")
+    ).
+
+header_lowercases_name_test() ->
+    ?assertEqual(
+        {ok, ~"content-type", ~"text/html", ~""},
+        cactus_http1:parse_header(~"Content-Type: text/html\r\n")
+    ).
+
+header_allows_digit_in_name_test() ->
+    ?assertEqual(
+        {ok, ~"x1-y2", ~"foo", ~""},
+        cactus_http1:parse_header(~"X1-Y2: foo\r\n")
+    ).
+
+header_trims_ows_test() ->
+    %% SP and HTAB on both sides are trimmed; internal whitespace preserved.
+    ?assertEqual(
+        {ok, ~"x-y", ~"a b", ~""},
+        cactus_http1:parse_header(~"X-Y: \t a b \t\r\n")
+    ).
+
+header_allows_htab_in_value_test() ->
+    ?assertEqual(
+        {ok, ~"x-foo", ~"a\tb", ~""},
+        cactus_http1:parse_header(~"X-Foo: a\tb\r\n")
+    ).
+
+header_accepts_non_ascii_value_test() ->
+    %% Bytes >= 0x80 are accepted in values (lenient — same as cowboy).
+    ?assertEqual(
+        {ok, ~"x-y", ~"café", ~""},
+        cactus_http1:parse_header(~"X-Y: café\r\n")
+    ).
+
+header_empty_value_accepted_test() ->
+    ?assertEqual(
+        {ok, ~"x-empty", ~"", ~""},
+        cactus_http1:parse_header(~"X-Empty:\r\n")
+    ).
+
+header_all_ows_value_trims_to_empty_test() ->
+    ?assertEqual(
+        {ok, ~"x-y", ~"", ~""},
+        cactus_http1:parse_header(~"X-Y:    \r\n")
+    ).
+
+header_passes_rest_test() ->
+    ?assertEqual(
+        {ok, ~"host", ~"x", ~"Accept: y\r\n"},
+        cactus_http1:parse_header(~"Host: x\r\nAccept: y\r\n")
+    ).
+
+%% --- end of headers ---
+
+header_end_of_headers_test() ->
+    ?assertEqual(
+        {end_of_headers, ~""},
+        cactus_http1:parse_header(~"\r\n")
+    ).
+
+header_end_of_headers_with_body_test() ->
+    ?assertEqual(
+        {end_of_headers, ~"hello body"},
+        cactus_http1:parse_header(~"\r\nhello body")
+    ).
+
+%% --- incremental ---
+
+header_empty_input_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_http1:parse_header(~"")).
+
+header_partial_name_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_http1:parse_header(~"Host")).
+
+header_partial_after_colon_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_http1:parse_header(~"Host:")).
+
+header_partial_value_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_http1:parse_header(~"Host: example.com")).
+
+header_partial_cr_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_http1:parse_header(~"Host: example.com\r")).
+
+%% --- bare LF ---
+
+header_bare_lf_at_start_rejected_test() ->
+    ?assertEqual({error, bad_header}, cactus_http1:parse_header(~"\n")).
+
+header_bare_lf_mid_buffer_rejected_test() ->
+    ?assertEqual({error, bad_header}, cactus_http1:parse_header(~"Host\nfoo")).
+
+%% --- bad header ---
+
+header_empty_name_rejected_test() ->
+    ?assertEqual({error, bad_header}, cactus_http1:parse_header(~": value\r\n")).
+
+header_name_with_space_rejected_test() ->
+    ?assertEqual({error, bad_header}, cactus_http1:parse_header(~"Ho st: x\r\n")).
+
+header_name_with_control_char_rejected_test() ->
+    ?assertEqual({error, bad_header}, cactus_http1:parse_header(~"Ho\x{01}st: x\r\n")).
+
+header_missing_colon_rejected_test() ->
+    ?assertEqual({error, bad_header}, cactus_http1:parse_header(~"Host example.com\r\n")).
+
+%% --- header injection ---
+
+header_cr_in_value_rejected_test() ->
+    ?assertEqual({error, bad_header}, cactus_http1:parse_header(~"X-Inj: foo\rbar\r\n")).
+
+header_nul_in_value_rejected_test() ->
+    ?assertEqual({error, bad_header}, cactus_http1:parse_header(~"X-Inj: foo\x{00}bar\r\n")).
+
+%% --- obs-fold ---
+
+header_obs_fold_space_rejected_test() ->
+    ?assertEqual({error, bad_header}, cactus_http1:parse_header(~"  continuation\r\n")).
+
+header_obs_fold_tab_rejected_test() ->
+    ?assertEqual({error, bad_header}, cactus_http1:parse_header(~"\tcontinuation\r\n")).
+
+%% --- limits ---
+
+header_oversized_no_crlf_rejected_test() ->
+    Big = <<"X: ", (binary:copy(~"a", 8200))/binary>>,
+    ?assertEqual({error, header_too_long}, cactus_http1:parse_header(Big)).
+
+header_oversized_with_crlf_rejected_test() ->
+    Big = <<(binary:copy(~"a", 8193))/binary, "\r\n">>,
+    ?assertEqual({error, header_too_long}, cactus_http1:parse_header(Big)).
