@@ -40,7 +40,10 @@ response (`400`, `414`, `431`, etc.).
     %% Bindings captured from `:param` segments by `cactus_router`, also set
     %% by `cactus_conn` before dispatch. Empty map when the dispatch is a
     %% single-handler one (no routing) or the route has no params.
-    bindings => cactus_router:bindings()
+    bindings => cactus_router:bindings(),
+    %% Client TCP peer captured once per connection from `inet:peername/1`.
+    %% `undefined` when the OS call fails (rare; usually socket teardown).
+    peer => {inet:ip_address(), inet:port_number()} | undefined
 }.
 
 -doc """

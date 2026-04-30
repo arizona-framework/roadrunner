@@ -161,6 +161,18 @@ read_body_unknown_transfer_encoding_rejected_test() ->
         cactus_conn:read_body(Req, ~"", NoRecv, 1000)
     ).
 
+%% --- peer/1 ---
+
+peer_on_closed_socket_returns_undefined_test() ->
+    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(Listen),
+    {ok, Client} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    {ok, Server} = gen_tcp:accept(Listen, 1000),
+    ok = gen_tcp:close(Server),
+    ?assertEqual(undefined, cactus_conn:peer(Server)),
+    ok = gen_tcp:close(Client),
+    ok = gen_tcp:close(Listen).
+
 req_with_headers(Headers) ->
     #{
         method => ~"POST",
@@ -372,6 +384,26 @@ conn_passes_bindings_to_handler_test_() ->
                 Reply = recv_until_closed(Sock),
                 ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
                 {match, _} = re:run(Reply, ~"id=42"),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_populates_peer_in_request_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_peer, #{
+                port => 0, handler => cactus_peer_handler
+            }),
+            cactus_listener:port(conn_test_peer)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_peer) end, fun(Port) ->
+            {"handler sees a peer tuple from inet:peername/1", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                Reply = recv_until_closed(Sock),
+                {match, _} = re:run(Reply, ~"peer=ok"),
                 ok = gen_tcp:close(Sock)
             end}
         end}.

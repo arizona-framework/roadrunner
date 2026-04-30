@@ -10,7 +10,7 @@ This is the minimum end-to-end pipeline for slice 2; the handler
 behaviour and routing arrive in slices 3–4.
 """.
 
--export([start/2, parse_loop/2, read_body/4]).
+-export([start/2, parse_loop/2, read_body/4, peer/1]).
 
 -export_type([proto_opts/0, dispatch/0]).
 
@@ -45,10 +45,12 @@ start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
 
 -spec serve(gen_tcp:socket(), proto_opts()) -> ok.
 serve(Socket, #{dispatch := Dispatch, max_content_length := MaxCL}) ->
+    Peer = peer(Socket),
     Recv = fun() -> gen_tcp:recv(Socket, 0, ?RECV_TIMEOUT) end,
     _ =
         case parse_loop(<<>>, Recv) of
-            {ok, Req, Buffered} ->
+            {ok, Req0, Buffered} ->
+                Req = Req0#{peer => Peer},
                 case read_body(Req, Buffered, Recv, MaxCL) of
                     {ok, Body} ->
                         ReqWithBody = Req#{body => Body},
@@ -69,6 +71,14 @@ serve(Socket, #{dispatch := Dispatch, max_content_length := MaxCL}) ->
         end,
     _ = gen_tcp:close(Socket),
     ok.
+
+-doc false.
+-spec peer(gen_tcp:socket()) -> {inet:ip_address(), inet:port_number()} | undefined.
+peer(Socket) ->
+    case inet:peername(Socket) of
+        {ok, Peer} -> Peer;
+        {error, _} -> undefined
+    end.
 
 -spec resolve_handler(dispatch(), cactus_http1:request()) ->
     {ok, module(), cactus_router:bindings()} | not_found.

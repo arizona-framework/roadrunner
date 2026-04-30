@@ -17,7 +17,8 @@ representation can evolve without breaking them.
     parse_qs/1,
     parse_cookies/1,
     body/1,
-    bindings/1
+    bindings/1,
+    peer/1
 ]).
 
 -doc "Return the request method (uppercase ASCII binary).".
@@ -124,3 +125,17 @@ mode (no router) or the matched route has no `:param` segments.
 -spec bindings(cactus_http1:request()) -> cactus_router:bindings().
 bindings(#{bindings := B}) -> B;
 bindings(_) -> #{}.
+
+-doc """
+Return the TCP peer (`{IpAddress, Port}`) for the connection that
+delivered this request.
+
+`cactus_conn` populates this from `inet:peername/1` once per
+connection. Returns `undefined` when the request map has no peer
+field (e.g. constructed manually outside the connection pipeline) or
+when the OS call failed at accept time.
+""".
+-spec peer(cactus_http1:request()) ->
+    {inet:ip_address(), inet:port_number()} | undefined.
+peer(#{peer := P}) -> P;
+peer(_) -> undefined.

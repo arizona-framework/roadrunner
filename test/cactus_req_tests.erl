@@ -106,6 +106,15 @@ bindings_present_test() ->
 bindings_absent_returns_empty_map_test() ->
     ?assertEqual(#{}, cactus_req:bindings(sample_req())).
 
+%% --- peer/1 ---
+
+peer_present_test() ->
+    Req = (sample_req())#{peer => {{127, 0, 0, 1}, 54321}},
+    ?assertEqual({{127, 0, 0, 1}, 54321}, cactus_req:peer(Req)).
+
+peer_absent_returns_undefined_test() ->
+    ?assertEqual(undefined, cactus_req:peer(sample_req())).
+
 %% --- fixtures ---
 
 sample_req() ->
