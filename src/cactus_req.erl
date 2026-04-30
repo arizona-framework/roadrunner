@@ -9,6 +9,7 @@ representation can evolve without breaking them.
 
 -export([
     method/1,
+    method_is/2,
     path/1,
     qs/1,
     version/1,
@@ -27,6 +28,17 @@ representation can evolve without breaking them.
 -doc "Return the request method (uppercase ASCII binary).".
 -spec method(cactus_http1:request()) -> binary().
 method(#{method := M}) -> M.
+
+-doc """
+Return whether the request method matches the given binary.
+
+Comparison is byte-exact and case-sensitive — the parser already
+enforces uppercase methods on the wire, so callers should pass
+uppercase too (`~"GET"`, `~"POST"`, etc.).
+""".
+-spec method_is(binary(), cactus_http1:request()) -> boolean().
+method_is(Method, #{method := M}) when is_binary(Method) ->
+    Method =:= M.
 
 -doc """
 Return the path component of the request-target.

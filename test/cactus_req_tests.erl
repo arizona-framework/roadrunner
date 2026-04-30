@@ -9,6 +9,12 @@
 method_test() ->
     ?assertEqual(~"GET", cactus_req:method(sample_req())).
 
+method_is_match_test() ->
+    ?assertEqual(true, cactus_req:method_is(~"GET", sample_req())).
+
+method_is_no_match_test() ->
+    ?assertEqual(false, cactus_req:method_is(~"POST", sample_req())).
+
 version_test() ->
     ?assertEqual({1, 1}, cactus_req:version(sample_req())).
 
