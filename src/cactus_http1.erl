@@ -9,7 +9,7 @@ tagged `{error, _}` results, leaving the caller in control of the
 response (`400`, `414`, `431`, etc.).
 """.
 
--export([parse_request_line/1, parse_header/1, parse_headers/1, parse_request/1]).
+-export([parse_request_line/1, parse_header/1, parse_headers/1, parse_request/1, parse_chunk/1]).
 
 -export_type([version/0, headers/0, request/0]).
 
@@ -17,6 +17,7 @@ response (`400`, `414`, `431`, etc.).
 -define(MAX_HEADER_LINE, 8192).
 -define(MAX_HEADER_BLOCK, 10240).
 -define(MAX_HEADER_COUNT, 100).
+-define(MAX_CHUNK_HEADER, 8192).
 
 -type version() :: {1, 0} | {1, 1}.
 -type headers() :: [{Name :: binary(), Value :: binary()}].
@@ -429,3 +430,118 @@ parse_request(Bin) when is_binary(Bin) ->
         {error, _} = Err ->
             Err
     end.
+
+-doc """
+Parse a single chunk from a chunked transfer-encoded body.
+
+Returns one of:
+- `{ok, Data, Rest}` for a regular chunk — `Data` is the chunk payload,
+  `Rest` is the buffer starting at the next chunk header.
+- `{ok, last, Trailers, Rest}` when the size-0 last chunk is reached —
+  `Trailers` is the (possibly empty) trailer header block, `Rest` is
+  whatever follows the empty line that closes it (typically the start
+  of the next pipelined message).
+- `{more, undefined}` when more bytes are needed.
+- `{error, bad_chunk_size}` when the size field cannot be parsed (bad
+  hex, empty, etc.).
+- `{error, bad_chunk}` for any other structural failure (oversized
+  chunk header, missing CRLF after data).
+
+Chunk extensions are parsed and discarded per RFC 9112 §7.1. The chunk
+header line is capped at 8192 bytes.
+""".
+-spec parse_chunk(binary()) ->
+    {ok, Data :: binary(), Rest :: binary()}
+    | {ok, last, Trailers :: headers(), Rest :: binary()}
+    | {more, undefined}
+    | {error,
+        bad_chunk_size
+        | bad_chunk
+        | bad_header
+        | header_too_long
+        | header_block_too_long
+        | too_many_headers
+        | conflicting_framing}.
+parse_chunk(Bin) when is_binary(Bin) ->
+    case parse_chunk_size_line(Bin) of
+        {ok, 0, AfterSize} ->
+            parse_last_chunk(AfterSize);
+        {ok, Size, AfterSize} ->
+            parse_chunk_data(Size, AfterSize);
+        Other ->
+            Other
+    end.
+
+-spec parse_last_chunk(binary()) ->
+    {ok, last, headers(), binary()}
+    | {more, undefined}
+    | {error,
+        bad_header
+        | header_too_long
+        | header_block_too_long
+        | too_many_headers
+        | conflicting_framing}.
+parse_last_chunk(AfterSize) ->
+    case parse_headers(AfterSize) of
+        {ok, Trailers, Rest} -> {ok, last, Trailers, Rest};
+        {more, _} = More -> More;
+        {error, _} = Err -> Err
+    end.
+
+-spec parse_chunk_data(pos_integer(), binary()) ->
+    {ok, binary(), binary()} | {more, undefined} | {error, bad_chunk}.
+parse_chunk_data(Size, AfterSize) ->
+    case AfterSize of
+        <<Data:Size/binary, "\r\n", Rest/binary>> ->
+            {ok, Data, Rest};
+        _ when byte_size(AfterSize) < Size + 2 ->
+            {more, undefined};
+        _ ->
+            {error, bad_chunk}
+    end.
+
+-spec parse_chunk_size_line(binary()) ->
+    {ok, non_neg_integer(), binary()}
+    | {more, undefined}
+    | {error, bad_chunk_size | bad_chunk}.
+parse_chunk_size_line(Bin) ->
+    case binary:match(Bin, ~"\r\n") of
+        nomatch when byte_size(Bin) > ?MAX_CHUNK_HEADER ->
+            {error, bad_chunk};
+        nomatch ->
+            {more, undefined};
+        {Pos, 2} when Pos > ?MAX_CHUNK_HEADER ->
+            {error, bad_chunk};
+        {Pos, 2} ->
+            <<Line:Pos/binary, "\r\n", Rest/binary>> = Bin,
+            parse_size_line(Line, Rest)
+    end.
+
+-spec parse_size_line(binary(), binary()) ->
+    {ok, non_neg_integer(), binary()} | {error, bad_chunk_size}.
+parse_size_line(Line, Rest) ->
+    SizePart =
+        case binary:split(Line, ~";") of
+            [S] -> S;
+            [S, _Ext] -> S
+        end,
+    case parse_hex(trim_ows(SizePart)) of
+        {ok, N} -> {ok, N, Rest};
+        error -> {error, bad_chunk_size}
+    end.
+
+-spec parse_hex(binary()) -> {ok, non_neg_integer()} | error.
+parse_hex(<<>>) -> error;
+parse_hex(B) -> parse_hex_chars(B, 0).
+
+-spec parse_hex_chars(binary(), non_neg_integer()) -> {ok, non_neg_integer()} | error.
+parse_hex_chars(<<>>, Acc) ->
+    {ok, Acc};
+parse_hex_chars(<<C, R/binary>>, Acc) when C >= $0, C =< $9 ->
+    parse_hex_chars(R, Acc * 16 + (C - $0));
+parse_hex_chars(<<C, R/binary>>, Acc) when C >= $a, C =< $f ->
+    parse_hex_chars(R, Acc * 16 + (C - $a + 10));
+parse_hex_chars(<<C, R/binary>>, Acc) when C >= $A, C =< $F ->
+    parse_hex_chars(R, Acc * 16 + (C - $A + 10));
+parse_hex_chars(_, _) ->
+    error.

@@ -497,3 +497,141 @@ request_smuggling_propagates_test() ->
             ~"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
         )
     ).
+
+%% =============================================================================
+%% parse_chunk/1
+%% =============================================================================
+
+%% --- happy path: regular chunks ---
+
+chunk_single_test() ->
+    ?assertEqual(
+        {ok, ~"hello", ~""},
+        cactus_http1:parse_chunk(~"5\r\nhello\r\n")
+    ).
+
+chunk_lowercase_hex_size_test() ->
+    %% 0xa = 10
+    ?assertEqual(
+        {ok, ~"helloworld", ~""},
+        cactus_http1:parse_chunk(~"a\r\nhelloworld\r\n")
+    ).
+
+chunk_uppercase_hex_size_test() ->
+    ?assertEqual(
+        {ok, ~"helloworld", ~""},
+        cactus_http1:parse_chunk(~"A\r\nhelloworld\r\n")
+    ).
+
+chunk_multi_digit_size_test() ->
+    %% 0x10 = 16
+    Data = binary:copy(~"x", 16),
+    ?assertEqual(
+        {ok, Data, ~""},
+        cactus_http1:parse_chunk(<<"10\r\n", Data/binary, "\r\n">>)
+    ).
+
+chunk_passes_rest_test() ->
+    %% Multi-chunk stream — first call returns the first chunk + rest of buffer.
+    ?assertEqual(
+        {ok, ~"hello", ~"3\r\nfoo\r\n0\r\n\r\n"},
+        cactus_http1:parse_chunk(~"5\r\nhello\r\n3\r\nfoo\r\n0\r\n\r\n")
+    ).
+
+chunk_extensions_ignored_test() ->
+    ?assertEqual(
+        {ok, ~"hello", ~""},
+        cactus_http1:parse_chunk(~"5;ext=value\r\nhello\r\n")
+    ).
+
+chunk_size_with_bws_before_ext_test() ->
+    %% BWS (bad whitespace) around `;` is RFC-permitted — strip it.
+    ?assertEqual(
+        {ok, ~"hello", ~""},
+        cactus_http1:parse_chunk(~"5 ;ext=value\r\nhello\r\n")
+    ).
+
+%% --- last chunk ---
+
+chunk_last_no_trailers_test() ->
+    ?assertEqual(
+        {ok, last, [], ~""},
+        cactus_http1:parse_chunk(~"0\r\n\r\n")
+    ).
+
+chunk_last_with_trailers_test() ->
+    ?assertEqual(
+        {ok, last, [{~"x-foo", ~"bar"}], ~""},
+        cactus_http1:parse_chunk(~"0\r\nX-Foo: bar\r\n\r\n")
+    ).
+
+chunk_last_passes_rest_after_trailers_test() ->
+    ?assertEqual(
+        {ok, last, [], ~"NEXT"},
+        cactus_http1:parse_chunk(~"0\r\n\r\nNEXT")
+    ).
+
+%% --- incremental ---
+
+chunk_empty_input_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_http1:parse_chunk(~"")).
+
+chunk_partial_size_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_http1:parse_chunk(~"5")).
+
+chunk_size_no_data_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_http1:parse_chunk(~"5\r\n")).
+
+chunk_partial_data_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_http1:parse_chunk(~"5\r\nhel")).
+
+chunk_data_no_trailing_crlf_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_http1:parse_chunk(~"5\r\nhello")).
+
+chunk_partial_trailing_crlf_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_http1:parse_chunk(~"5\r\nhello\r")).
+
+chunk_last_partial_trailers_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_http1:parse_chunk(~"0\r\nX-Foo: bar\r\n")).
+
+%% --- bad chunks ---
+
+chunk_bad_hex_rejected_test() ->
+    ?assertEqual(
+        {error, bad_chunk_size},
+        cactus_http1:parse_chunk(~"xyz\r\nhello\r\n")
+    ).
+
+chunk_empty_size_rejected_test() ->
+    ?assertEqual(
+        {error, bad_chunk_size},
+        cactus_http1:parse_chunk(~"\r\nhello\r\n")
+    ).
+
+chunk_size_with_only_ext_rejected_test() ->
+    %% Empty size before `;` is malformed.
+    ?assertEqual(
+        {error, bad_chunk_size},
+        cactus_http1:parse_chunk(~";ext=value\r\nhello\r\n")
+    ).
+
+chunk_oversized_header_no_crlf_rejected_test() ->
+    Big = binary:copy(~"a", 8200),
+    ?assertEqual({error, bad_chunk}, cactus_http1:parse_chunk(Big)).
+
+chunk_oversized_header_with_crlf_rejected_test() ->
+    Big = <<(binary:copy(~"a", 8193))/binary, "\r\n">>,
+    ?assertEqual({error, bad_chunk}, cactus_http1:parse_chunk(Big)).
+
+chunk_missing_crlf_after_data_rejected_test() ->
+    %% 5 bytes data + 2 bytes that aren't \r\n; full buffer present.
+    ?assertEqual(
+        {error, bad_chunk},
+        cactus_http1:parse_chunk(~"5\r\nhelloXX\r\n")
+    ).
+
+chunk_last_bad_trailer_propagates_test() ->
+    ?assertEqual(
+        {error, bad_header},
+        cactus_http1:parse_chunk(~"0\r\nbad trailer\r\n\r\n")
+    ).
