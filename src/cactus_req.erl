@@ -16,7 +16,8 @@ representation can evolve without breaking them.
     header/2,
     parse_qs/1,
     parse_cookies/1,
-    body/1
+    body/1,
+    bindings/1
 ]).
 
 -doc "Return the request method (uppercase ASCII binary).".
@@ -111,3 +112,15 @@ map is constructed manually outside the connection pipeline).
 -spec body(cactus_http1:request()) -> binary().
 body(#{body := B}) -> B;
 body(_) -> <<>>.
+
+-doc """
+Return the router-captured bindings for this request as a
+`#{Name => Value}` map of binaries.
+
+`cactus_conn` populates this from `cactus_router:match/2` before
+invoking the handler. Empty map when the listener is in single-handler
+mode (no router) or the matched route has no `:param` segments.
+""".
+-spec bindings(cactus_http1:request()) -> cactus_router:bindings().
+bindings(#{bindings := B}) -> B;
+bindings(_) -> #{}.

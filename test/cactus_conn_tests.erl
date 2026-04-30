@@ -354,6 +354,28 @@ conn_dispatches_via_router_test_() ->
             ]
         end}.
 
+conn_passes_bindings_to_handler_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_bindings, #{
+                port => 0,
+                routes => [{~"/users/:id", cactus_bindings_handler}]
+            }),
+            cactus_listener:port(conn_test_bindings)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_bindings) end, fun(Port) ->
+            {"handler reads :id from cactus_req:bindings/1", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"GET /users/42 HTTP/1.1\r\nHost: x\r\n\r\n"),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"id=42"),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
 %% --- helpers ---
 
 assert_status(Port, Request, ExpectedCode) ->

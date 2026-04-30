@@ -51,10 +51,13 @@ serve(Socket, #{dispatch := Dispatch, max_content_length := MaxCL}) ->
             {ok, Req, Buffered} ->
                 case read_body(Req, Buffered, Recv, MaxCL) of
                     {ok, Body} ->
-                        FullReq = Req#{body => Body},
-                        case resolve_handler(Dispatch, FullReq) of
-                            {ok, Handler} -> handle_and_send(Socket, Handler, FullReq);
-                            not_found -> send_not_found(Socket)
+                        ReqWithBody = Req#{body => Body},
+                        case resolve_handler(Dispatch, ReqWithBody) of
+                            {ok, Handler, Bindings} ->
+                                FullReq = ReqWithBody#{bindings => Bindings},
+                                handle_and_send(Socket, Handler, FullReq);
+                            not_found ->
+                                send_not_found(Socket)
                         end;
                     {error, content_length_too_large} ->
                         send_payload_too_large(Socket);
@@ -68,16 +71,11 @@ serve(Socket, #{dispatch := Dispatch, max_content_length := MaxCL}) ->
     ok.
 
 -spec resolve_handler(dispatch(), cactus_http1:request()) ->
-    {ok, module()} | not_found.
+    {ok, module(), cactus_router:bindings()} | not_found.
 resolve_handler({handler, Mod}, _Req) ->
-    {ok, Mod};
+    {ok, Mod, #{}};
 resolve_handler({router, Compiled}, Req) ->
-    %% Bindings are discarded for now — they'll be threaded into the
-    %% request map in the next slice-4 feature.
-    case cactus_router:match(cactus_req:path(Req), Compiled) of
-        {ok, Mod, _Bindings} -> {ok, Mod};
-        not_found -> not_found
-    end.
+    cactus_router:match(cactus_req:path(Req), Compiled).
 
 -doc false.
 -spec read_body(

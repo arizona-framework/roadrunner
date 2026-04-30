@@ -97,6 +97,15 @@ body_absent_returns_empty_test() ->
     %% A request map with no body field returns empty bytes.
     ?assertEqual(~"", cactus_req:body(sample_req())).
 
+%% --- bindings/1 ---
+
+bindings_present_test() ->
+    Req = (sample_req())#{bindings => #{~"id" => ~"42"}},
+    ?assertEqual(#{~"id" => ~"42"}, cactus_req:bindings(Req)).
+
+bindings_absent_returns_empty_map_test() ->
+    ?assertEqual(#{}, cactus_req:bindings(sample_req())).
+
 %% --- fixtures ---
 
 sample_req() ->

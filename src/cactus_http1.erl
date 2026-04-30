@@ -36,7 +36,11 @@ response (`400`, `414`, `431`, etc.).
     %% Body is set by `cactus_conn` before the handler is invoked. The parser
     %% itself never populates this field — it leaves the buffered body in the
     %% `Rest` element of `parse_request/1` instead.
-    body => binary()
+    body => binary(),
+    %% Bindings captured from `:param` segments by `cactus_router`, also set
+    %% by `cactus_conn` before dispatch. Empty map when the dispatch is a
+    %% single-handler one (no routing) or the route has no params.
+    bindings => cactus_router:bindings()
 }.
 
 -doc """
