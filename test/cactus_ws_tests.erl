@@ -189,6 +189,56 @@ parse_frame_bad_opcode_test() ->
     Frame = <<16#83, 16#80, 1, 2, 3, 4>>,
     ?assertEqual({error, bad_opcode}, cactus_ws:parse_frame(Frame)).
 
+%% =============================================================================
+%% encode_frame/3 — server→client direction (unmasked)
+%% =============================================================================
+
+encode_text_fin_test() ->
+    %% FIN=1, op=text → 0x81; MASK=0, len=5 → 0x05; payload Hello
+    Encoded = iolist_to_binary(cactus_ws:encode_frame(text, ~"Hello", true)),
+    ?assertEqual(<<16#81, 16#05, "Hello">>, Encoded).
+
+encode_binary_test() ->
+    Encoded = iolist_to_binary(cactus_ws:encode_frame(binary, <<1, 2, 3>>, true)),
+    ?assertEqual(<<16#82, 16#03, 1, 2, 3>>, Encoded).
+
+encode_continuation_no_fin_test() ->
+    %% FIN=0, op=0 → 0x00
+    Encoded = iolist_to_binary(cactus_ws:encode_frame(continuation, ~"part", false)),
+    ?assertEqual(<<16#00, 16#04, "part">>, Encoded).
+
+encode_close_test() ->
+    Encoded = iolist_to_binary(cactus_ws:encode_frame(close, ~"", true)),
+    ?assertEqual(<<16#88, 16#00>>, Encoded).
+
+encode_ping_test() ->
+    Encoded = iolist_to_binary(cactus_ws:encode_frame(ping, ~"hi", true)),
+    ?assertEqual(<<16#89, 16#02, "hi">>, Encoded).
+
+encode_pong_test() ->
+    Encoded = iolist_to_binary(cactus_ws:encode_frame(pong, ~"hi", true)),
+    ?assertEqual(<<16#8a, 16#02, "hi">>, Encoded).
+
+encode_16bit_length_test() ->
+    Payload = binary:copy(~"a", 200),
+    Encoded = iolist_to_binary(cactus_ws:encode_frame(binary, Payload, true)),
+    %% 0x82 + 0x7e (126) + 200:16 + payload
+    ?assertEqual(
+        <<16#82, 16#7e, 200:16, Payload/binary>>,
+        Encoded
+    ).
+
+encode_64bit_length_test() ->
+    Payload = binary:copy(~"x", 70000),
+    Encoded = iolist_to_binary(cactus_ws:encode_frame(binary, Payload, true)),
+    %% 0x82 + 0x7f (127) + 70000:64 + payload
+    Expected = <<16#82, 16#7f, 70000:64, Payload/binary>>,
+    ?assertEqual(Expected, Encoded).
+
+encode_accepts_iodata_payload_test() ->
+    Encoded = iolist_to_binary(cactus_ws:encode_frame(text, [~"hel", $l, ~"o"], true)),
+    ?assertEqual(<<16#81, 16#05, "hello">>, Encoded).
+
 %% --- helpers ---
 
 mask(Payload, MaskKey) ->

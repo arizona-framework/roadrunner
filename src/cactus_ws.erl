@@ -7,7 +7,7 @@ parsing, masking, and the conn-level protocol switch arrive in later
 features.
 """.
 
--export([accept_key/1, handshake_response/1, parse_frame/1]).
+-export([accept_key/1, handshake_response/1, parse_frame/1, encode_frame/3]).
 
 -export_type([opcode/0, frame/0]).
 
@@ -192,3 +192,43 @@ unmask_bytes(<<>>, _MaskKey, _I) ->
 unmask_bytes(<<B, Rest/binary>>, MaskKey, I) ->
     M = binary:at(MaskKey, I rem 4),
     [B bxor M | unmask_bytes(Rest, MaskKey, I + 1)].
+
+-doc """
+Encode a single WebSocket frame for the server→client direction.
+
+Server frames are sent **unmasked** per RFC 6455 §5.1. Picks the
+shortest valid length encoding: 7-bit literal for ≤125 bytes, 16-bit
+extended (126) for ≤65535, 64-bit extended (127) for larger.
+
+`Fin` controls the FIN bit — pass `true` for the only or last frame
+of a message and `false` for non-final fragments of a continuation
+sequence.
+""".
+-spec encode_frame(opcode(), iodata(), boolean()) -> iodata().
+encode_frame(Opcode, Payload, Fin) ->
+    Op = encode_opcode(Opcode),
+    FinBit = fin_bit(Fin),
+    PayloadBin = iolist_to_binary(Payload),
+    Len = byte_size(PayloadBin),
+    Header = encode_header(FinBit, Op, Len),
+    [Header, PayloadBin].
+
+-spec encode_header(0 | 1, 0..15, non_neg_integer()) -> binary().
+encode_header(FinBit, Op, Len) when Len =< 125 ->
+    <<FinBit:1, 0:3, Op:4, 0:1, Len:7>>;
+encode_header(FinBit, Op, Len) when Len =< 16#FFFF ->
+    <<FinBit:1, 0:3, Op:4, 0:1, 126:7, Len:16>>;
+encode_header(FinBit, Op, Len) ->
+    <<FinBit:1, 0:3, Op:4, 0:1, 127:7, Len:64>>.
+
+-spec encode_opcode(opcode()) -> 0..15.
+encode_opcode(continuation) -> ?OP_CONTINUATION;
+encode_opcode(text) -> ?OP_TEXT;
+encode_opcode(binary) -> ?OP_BINARY;
+encode_opcode(close) -> ?OP_CLOSE;
+encode_opcode(ping) -> ?OP_PING;
+encode_opcode(pong) -> ?OP_PONG.
+
+-spec fin_bit(boolean()) -> 0 | 1.
+fin_bit(true) -> 1;
+fin_bit(false) -> 0.
