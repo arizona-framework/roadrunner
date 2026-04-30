@@ -169,7 +169,7 @@ peer_on_closed_socket_returns_undefined_test() ->
     {ok, Client} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
     {ok, Server} = gen_tcp:accept(Listen, 1000),
     ok = gen_tcp:close(Server),
-    ?assertEqual(undefined, cactus_conn:peer(Server)),
+    ?assertEqual(undefined, cactus_conn:peer({gen_tcp, Server})),
     ok = gen_tcp:close(Client),
     ok = gen_tcp:close(Listen).
 

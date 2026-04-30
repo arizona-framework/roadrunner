@@ -18,7 +18,7 @@ Spawn-link an acceptor process bound to `LSocket` with the given
 `ProtoOpts` (handler + body limits). Each accepted socket is handed
 to a `cactus_conn` worker that consumes the same opts.
 """.
--spec start_link(gen_tcp:socket(), cactus_conn:proto_opts()) -> {ok, pid()}.
+-spec start_link(cactus_transport:socket(), cactus_conn:proto_opts()) -> {ok, pid()}.
 start_link(LSocket, ProtoOpts) ->
     Pid = proc_lib:spawn_link(fun() ->
         proc_lib:set_label(cactus_acceptor),
@@ -26,12 +26,12 @@ start_link(LSocket, ProtoOpts) ->
     end),
     {ok, Pid}.
 
--spec loop(gen_tcp:socket(), cactus_conn:proto_opts()) -> ok.
+-spec loop(cactus_transport:socket(), cactus_conn:proto_opts()) -> ok.
 loop(LSocket, ProtoOpts) ->
-    case gen_tcp:accept(LSocket) of
+    case cactus_transport:accept(LSocket) of
         {ok, Socket} ->
             {ok, ConnPid} = cactus_conn:start(Socket, ProtoOpts),
-            ok = gen_tcp:controlling_process(Socket, ConnPid),
+            ok = cactus_transport:controlling_process(Socket, ConnPid),
             ConnPid ! shoot,
             loop(LSocket, ProtoOpts);
         {error, _} ->

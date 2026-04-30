@@ -31,7 +31,7 @@ connection workers will hang off it in subsequent features.
 }.
 
 -record(state, {
-    listen_socket :: gen_tcp:socket(),
+    listen_socket :: cactus_transport:socket(),
     port :: inet:port_number(),
     proto_opts :: cactus_conn:proto_opts()
 }).
@@ -64,7 +64,7 @@ init(#{port := Port} = Opts) ->
     proc_lib:set_label({cactus_listener, Port}),
     %% `inet_backend` must be the first option per gen_tcp docs.
     case
-        gen_tcp:listen(Port, [
+        cactus_transport:listen(Port, [
             {inet_backend, socket},
             binary,
             {active, false},
@@ -73,7 +73,7 @@ init(#{port := Port} = Opts) ->
         ])
     of
         {ok, LSocket} ->
-            {ok, BoundPort} = inet:port(LSocket),
+            {ok, BoundPort} = cactus_transport:port(LSocket),
             NumAcceptors = maps:get(num_acceptors, Opts, ?DEFAULT_NUM_ACCEPTORS),
             ok = spawn_acceptors(LSocket, ProtoOpts, NumAcceptors),
             {ok, #state{listen_socket = LSocket, port = BoundPort, proto_opts = ProtoOpts}};
@@ -84,7 +84,7 @@ init(#{port := Port} = Opts) ->
 %% Multiple acceptor processes all calling gen_tcp:accept on the same listen
 %% socket — Linux/BSD accept is thread-safe and avoids thundering-herd via
 %% kernel-side queueing.
--spec spawn_acceptors(gen_tcp:socket(), cactus_conn:proto_opts(), pos_integer()) ->
+-spec spawn_acceptors(cactus_transport:socket(), cactus_conn:proto_opts(), pos_integer()) ->
     ok.
 spawn_acceptors(LSocket, ProtoOpts, N) ->
     lists:foreach(
@@ -121,5 +121,4 @@ handle_cast(_Msg, State) ->
 
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, #state{listen_socket = LSocket}) ->
-    _ = gen_tcp:close(LSocket),
-    ok.
+    cactus_transport:close(LSocket).

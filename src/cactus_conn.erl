@@ -29,10 +29,10 @@ Spawn an unlinked connection process for the accepted `Socket` and the
 shared `ProtoOpts` (handler module, body limits, ...).
 
 The caller (typically `cactus_acceptor`) must transfer socket
-ownership via `gen_tcp:controlling_process/2` and then send the
-process the atom `shoot` to release it.
+ownership via `cactus_transport:controlling_process/2` and then
+send the process the atom `shoot` to release it.
 """.
--spec start(gen_tcp:socket(), proto_opts()) -> {ok, pid()}.
+-spec start(cactus_transport:socket(), proto_opts()) -> {ok, pid()}.
 start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
     Pid = proc_lib:spawn(fun() ->
         proc_lib:set_label(cactus_conn),
@@ -42,7 +42,7 @@ start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
     end),
     {ok, Pid}.
 
--spec serve(gen_tcp:socket(), proto_opts()) -> ok.
+-spec serve(cactus_transport:socket(), proto_opts()) -> ok.
 serve(Socket, #{
     dispatch := Dispatch,
     max_content_length := MaxCL,
@@ -77,20 +77,20 @@ serve(Socket, #{
             {error, _} ->
                 send_bad_request(Socket)
         end,
-    _ = gen_tcp:close(Socket),
+    _ = cactus_transport:close(Socket),
     ok.
 
 %% Build a recv closure with a single overall deadline. `gen_tcp:recv`
 %% with a negative timeout is undefined, so we cap at 0 — which makes
 %% gen_tcp return `{error, timeout}` immediately when the deadline has
 %% passed. Any timeout here is, by construction, the request_timeout.
--spec make_recv(gen_tcp:socket(), integer()) ->
+-spec make_recv(cactus_transport:socket(), integer()) ->
     fun(() -> {ok, binary()} | {error, request_timeout | term()}).
 make_recv(Socket, Deadline) ->
     fun() ->
         Now = erlang:monotonic_time(millisecond),
         Remaining = max(0, Deadline - Now),
-        case gen_tcp:recv(Socket, 0, Remaining) of
+        case cactus_transport:recv(Socket, 0, Remaining) of
             {ok, _} = OK -> OK;
             {error, timeout} -> {error, request_timeout};
             {error, _} = E -> E
@@ -98,9 +98,9 @@ make_recv(Socket, Deadline) ->
     end.
 
 -doc false.
--spec peer(gen_tcp:socket()) -> {inet:ip_address(), inet:port_number()} | undefined.
+-spec peer(cactus_transport:socket()) -> {inet:ip_address(), inet:port_number()} | undefined.
 peer(Socket) ->
-    case inet:peername(Socket) of
+    case cactus_transport:peername(Socket) of
         {ok, Peer} -> Peer;
         {error, _} -> undefined
     end.
@@ -242,7 +242,7 @@ parse_loop(Buf, RecvFun) ->
             E
     end.
 
--spec handle_and_send(gen_tcp:socket(), module(), cactus_http1:request()) ->
+-spec handle_and_send(cactus_transport:socket(), module(), cactus_http1:request()) ->
     ok | {error, term()}.
 handle_and_send(Socket, Handler, Req) ->
     try Handler:handle(Req) of
@@ -252,7 +252,7 @@ handle_and_send(Socket, Handler, Req) ->
             stream_response(Socket, Status, Headers, Fun);
         {Status, Headers, Body} when is_integer(Status) ->
             Resp = cactus_http1:response(Status, Headers, Body),
-            gen_tcp:send(Socket, Resp)
+            cactus_transport:send(Socket, Resp)
     catch
         Class:Reason:Stack ->
             logger:error(#{
@@ -271,7 +271,7 @@ handle_and_send(Socket, Handler, Req) ->
 %% the size-0 terminator. Caller-supplied headers must NOT set
 %% Transfer-Encoding or Content-Length.
 -spec stream_response(
-    gen_tcp:socket(),
+    cactus_transport:socket(),
     cactus_http1:status(),
     cactus_http1:headers(),
     cactus_handler:stream_fun()
@@ -279,7 +279,7 @@ handle_and_send(Socket, Handler, Req) ->
 stream_response(Socket, Status, UserHeaders, Fun) ->
     Headers = [{~"transfer-encoding", ~"chunked"} | UserHeaders],
     Head = cactus_http1:response(Status, Headers, ~""),
-    _ = gen_tcp:send(Socket, Head),
+    _ = cactus_transport:send(Socket, Head),
     Send = fun(Data, FinFlag) ->
         Chunk = [
             integer_to_binary(iolist_size(Data), 16),
@@ -292,59 +292,59 @@ stream_response(Socket, Status, UserHeaders, Fun) ->
                 nofin -> Chunk;
                 fin -> [Chunk, ~"0\r\n\r\n"]
             end,
-        gen_tcp:send(Socket, Frame)
+        cactus_transport:send(Socket, Frame)
     end,
     _ = Fun(Send),
     ok.
 
--spec send_bad_request(gen_tcp:socket()) -> ok | {error, term()}.
+-spec send_bad_request(cactus_transport:socket()) -> ok | {error, term()}.
 send_bad_request(Socket) ->
     Resp = cactus_http1:response(
         400,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
         ~""
     ),
-    gen_tcp:send(Socket, Resp).
+    cactus_transport:send(Socket, Resp).
 
--spec send_payload_too_large(gen_tcp:socket()) -> ok | {error, term()}.
+-spec send_payload_too_large(cactus_transport:socket()) -> ok | {error, term()}.
 send_payload_too_large(Socket) ->
     Resp = cactus_http1:response(
         413,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
         ~""
     ),
-    gen_tcp:send(Socket, Resp).
+    cactus_transport:send(Socket, Resp).
 
--spec send_not_found(gen_tcp:socket()) -> ok | {error, term()}.
+-spec send_not_found(cactus_transport:socket()) -> ok | {error, term()}.
 send_not_found(Socket) ->
     Resp = cactus_http1:response(
         404,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
         ~""
     ),
-    gen_tcp:send(Socket, Resp).
+    cactus_transport:send(Socket, Resp).
 
--spec send_request_timeout(gen_tcp:socket()) -> ok | {error, term()}.
+-spec send_request_timeout(cactus_transport:socket()) -> ok | {error, term()}.
 send_request_timeout(Socket) ->
     Resp = cactus_http1:response(
         408,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
         ~""
     ),
-    gen_tcp:send(Socket, Resp).
+    cactus_transport:send(Socket, Resp).
 
--spec send_internal_error(gen_tcp:socket()) -> ok | {error, term()}.
+-spec send_internal_error(cactus_transport:socket()) -> ok | {error, term()}.
 send_internal_error(Socket) ->
     Resp = cactus_http1:response(
         500,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
         ~""
     ),
-    gen_tcp:send(Socket, Resp).
+    cactus_transport:send(Socket, Resp).
 
 %% --- WebSocket upgrade + frame loop ---
 
--spec upgrade_to_websocket(gen_tcp:socket(), cactus_http1:request(), module(), term()) ->
+-spec upgrade_to_websocket(cactus_transport:socket(), cactus_http1:request(), module(), term()) ->
     ok | {error, term()}.
 upgrade_to_websocket(Socket, Req, Mod, State) ->
     case cactus_ws:handshake_response(cactus_req:headers(Req)) of
@@ -352,19 +352,19 @@ upgrade_to_websocket(Socket, Req, Mod, State) ->
             Resp = cactus_http1:response(Status, RespHeaders, ~""),
             %% If this send fails, the next recv inside ws_loop will return
             %% {error, _} and the loop ends cleanly — no separate handling.
-            _ = gen_tcp:send(Socket, Resp),
+            _ = cactus_transport:send(Socket, Resp),
             ws_loop(Socket, <<>>, Mod, State);
         {error, _} ->
             send_bad_request(Socket)
     end.
 
--spec ws_loop(gen_tcp:socket(), binary(), module(), term()) -> ok.
+-spec ws_loop(cactus_transport:socket(), binary(), module(), term()) -> ok.
 ws_loop(Socket, Buffer, Mod, State) ->
     case cactus_ws:parse_frame(Buffer) of
         {ok, Frame, NewBuffer} ->
             handle_ws_frame(Socket, NewBuffer, Mod, State, Frame);
         {more, _} ->
-            case gen_tcp:recv(Socket, 0, infinity) of
+            case cactus_transport:recv(Socket, 0, infinity) of
                 {ok, Data} ->
                     ws_loop(Socket, <<Buffer/binary, Data/binary>>, Mod, State);
                 {error, _} ->
@@ -375,13 +375,13 @@ ws_loop(Socket, Buffer, Mod, State) ->
     end.
 
 -spec handle_ws_frame(
-    gen_tcp:socket(), binary(), module(), term(), cactus_ws:frame()
+    cactus_transport:socket(), binary(), module(), term(), cactus_ws:frame()
 ) -> ok.
 handle_ws_frame(Socket, _Buffer, _Mod, _State, #{opcode := close}) ->
-    _ = gen_tcp:send(Socket, cactus_ws:encode_frame(close, ~"", true)),
+    _ = cactus_transport:send(Socket, cactus_ws:encode_frame(close, ~"", true)),
     ok;
 handle_ws_frame(Socket, Buffer, Mod, State, #{opcode := ping, payload := P}) ->
-    _ = gen_tcp:send(Socket, cactus_ws:encode_frame(pong, P, true)),
+    _ = cactus_transport:send(Socket, cactus_ws:encode_frame(pong, P, true)),
     ws_loop(Socket, Buffer, Mod, State);
 handle_ws_frame(Socket, Buffer, Mod, State, #{opcode := pong}) ->
     %% Server is not pinging clients yet — pong from client is just dropped.
@@ -394,12 +394,12 @@ handle_ws_frame(Socket, Buffer, Mod, State, Frame) ->
         {ok, NewState} ->
             ws_loop(Socket, Buffer, Mod, NewState);
         {close, _NewState} ->
-            _ = gen_tcp:send(Socket, cactus_ws:encode_frame(close, ~"", true)),
+            _ = cactus_transport:send(Socket, cactus_ws:encode_frame(close, ~"", true)),
             ok
     end.
 
--spec send_ws_frames(gen_tcp:socket(), [{cactus_ws:opcode(), iodata()}]) ->
+-spec send_ws_frames(cactus_transport:socket(), [{cactus_ws:opcode(), iodata()}]) ->
     ok | {error, term()}.
 send_ws_frames(Socket, OutFrames) ->
     Iodata = [cactus_ws:encode_frame(Op, Payload, true) || {Op, Payload} <- OutFrames],
-    gen_tcp:send(Socket, Iodata).
+    cactus_transport:send(Socket, Iodata).
