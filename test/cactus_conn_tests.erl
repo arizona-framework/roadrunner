@@ -433,6 +433,159 @@ conn_request_timeout_during_body_returns_408_test_() ->
             end}
         end}.
 
+conn_websocket_echo_test_() ->
+    {setup, fun ws_setup/0, fun ws_cleanup/1, fun(Port) ->
+        {"WebSocket upgrade + text echo + clean close", fun() ->
+            Sock = ws_handshake(Port),
+            send_text_frame(Sock, ~"Hi"),
+            {ok, Echo} = gen_tcp:recv(Sock, 4, 1000),
+            ?assertEqual(<<16#81, 16#02, "Hi">>, Echo),
+            send_close_frame(Sock),
+            {ok, CloseEcho} = gen_tcp:recv(Sock, 2, 1000),
+            ?assertEqual(<<16#88, 16#00>>, CloseEcho),
+            ok = gen_tcp:close(Sock)
+        end}
+    end}.
+
+conn_websocket_ping_pong_test_() ->
+    {setup, fun ws_setup/0, fun ws_cleanup/1, fun(Port) ->
+        {"server replies pong with same payload as the client ping", fun() ->
+            Sock = ws_handshake(Port),
+            Mask = <<9, 8, 7, 6>>,
+            Masked = mask_test_payload(~"abc", Mask),
+            ok = gen_tcp:send(Sock, <<16#89, 16#83, Mask/binary, Masked/binary>>),
+            {ok, Pong} = gen_tcp:recv(Sock, 5, 1000),
+            ?assertEqual(<<16#8a, 16#03, "abc">>, Pong),
+            ok = gen_tcp:close(Sock)
+        end}
+    end}.
+
+conn_websocket_binary_no_reply_test_() ->
+    {setup, fun ws_setup/0, fun ws_cleanup/1, fun(Port) ->
+        {"binary frame yields no reply ({ok, _}); next text still echoes", fun() ->
+            Sock = ws_handshake(Port),
+            Mask = <<1, 2, 3, 4>>,
+            BinMasked = mask_test_payload(<<7, 8>>, Mask),
+            ok = gen_tcp:send(Sock, <<16#82, 16#82, Mask/binary, BinMasked/binary>>),
+            send_text_frame(Sock, ~"hi"),
+            {ok, Echo} = gen_tcp:recv(Sock, 4, 1000),
+            ?assertEqual(<<16#81, 16#02, "hi">>, Echo),
+            ok = gen_tcp:close(Sock)
+        end}
+    end}.
+
+conn_websocket_handler_close_test_() ->
+    {setup, fun ws_setup/0, fun ws_cleanup/1, fun(Port) ->
+        {"handler returning {close, _} closes the connection", fun() ->
+            Sock = ws_handshake(Port),
+            send_text_frame(Sock, ~"stop"),
+            {ok, CloseEcho} = gen_tcp:recv(Sock, 2, 1000),
+            ?assertEqual(<<16#88, 16#00>>, CloseEcho),
+            ok = gen_tcp:close(Sock)
+        end}
+    end}.
+
+conn_websocket_pong_silently_handled_test_() ->
+    {setup, fun ws_setup/0, fun ws_cleanup/1, fun(Port) ->
+        {"client pong is silently dropped; subsequent text still echoes", fun() ->
+            Sock = ws_handshake(Port),
+            Mask = <<5, 6, 7, 8>>,
+            PongMasked = mask_test_payload(~"x", Mask),
+            %% pong frame from client (opcode 0xA = 10)
+            ok = gen_tcp:send(Sock, <<16#8a, 16#81, Mask/binary, PongMasked/binary>>),
+            send_text_frame(Sock, ~"hi"),
+            {ok, Echo} = gen_tcp:recv(Sock, 4, 1000),
+            ?assertEqual(<<16#81, 16#02, "hi">>, Echo),
+            ok = gen_tcp:close(Sock)
+        end}
+    end}.
+
+conn_websocket_bad_frame_closes_test_() ->
+    {setup, fun ws_setup/0, fun ws_cleanup/1, fun(Port) ->
+        {"frame with RSV bit set causes the server to close silently", fun() ->
+            Sock = ws_handshake(Port),
+            %% byte1 = 0xc1: FIN=1, RSV1=1, opcode=text — RSV1 forbidden.
+            ok = gen_tcp:send(Sock, <<16#c1, 16#80, 1, 2, 3, 4>>),
+            ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 1000)),
+            ok = gen_tcp:close(Sock)
+        end}
+    end}.
+
+conn_websocket_client_disconnect_test_() ->
+    {setup, fun ws_setup/0, fun ws_cleanup/1, fun(Port) ->
+        {"client closing the TCP socket exits the ws loop cleanly", fun() ->
+            %% Connect, handshake, then disconnect without sending a frame —
+            %% the server's recv returns {error, closed} and ws_loop ends.
+            Sock = ws_handshake(Port),
+            ok = gen_tcp:close(Sock),
+            %% Give the server a beat to process the FIN.
+            timer:sleep(50)
+        end}
+    end}.
+
+conn_websocket_bad_handshake_returns_400_test_() ->
+    {setup, fun ws_setup/0, fun ws_cleanup/1, fun(Port) ->
+        {"upgrade missing Sec-WebSocket-Key falls back to 400", fun() ->
+            {ok, Sock} = gen_tcp:connect(
+                {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+            ),
+            ok = gen_tcp:send(
+                Sock,
+                ~"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            ),
+            Reply = recv_until_closed(Sock),
+            ?assertMatch(<<"HTTP/1.1 400 ", _/binary>>, Reply),
+            ok = gen_tcp:close(Sock)
+        end}
+    end}.
+
+%% --- WebSocket helpers ---
+
+ws_setup() ->
+    {ok, _} = cactus_listener:start_link(conn_test_ws, #{
+        port => 0, handler => cactus_ws_upgrade_handler
+    }),
+    cactus_listener:port(conn_test_ws).
+
+ws_cleanup(_) ->
+    ok = cactus_listener:stop(conn_test_ws).
+
+ws_handshake(Port) ->
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(
+        Sock,
+        ~"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    ),
+    _ = recv_until(Sock, ~"\r\n\r\n"),
+    Sock.
+
+send_text_frame(Sock, Payload) ->
+    Mask = <<1, 2, 3, 4>>,
+    Masked = mask_test_payload(Payload, Mask),
+    Len = byte_size(Payload),
+    ok = gen_tcp:send(Sock, <<16#81, 1:1, Len:7, Mask/binary, Masked/binary>>).
+
+send_close_frame(Sock) ->
+    ok = gen_tcp:send(Sock, <<16#88, 16#80, 1, 2, 3, 4>>).
+
+mask_test_payload(Payload, MaskKey) ->
+    list_to_binary([
+        B bxor binary:at(MaskKey, I rem 4)
+     || {I, B} <- lists:enumerate(0, binary_to_list(Payload))
+    ]).
+
+recv_until(Sock, Marker) ->
+    recv_until(Sock, Marker, <<>>).
+
+recv_until(Sock, Marker, Acc) ->
+    case binary:match(Acc, Marker) of
+        nomatch ->
+            {ok, Data} = gen_tcp:recv(Sock, 0, 1000),
+            recv_until(Sock, Marker, <<Acc/binary, Data/binary>>);
+        _ ->
+            Acc
+    end.
+
 conn_streams_chunked_response_test_() ->
     {setup,
         fun() ->

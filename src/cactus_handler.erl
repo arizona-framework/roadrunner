@@ -19,6 +19,7 @@ chunk; passing `fin` writes the size-0 terminator.
 -type stream_fun() :: fun((send_fun()) -> any()).
 -type response() ::
     {StatusCode :: cactus_http1:status(), cactus_http1:headers(), Body :: iodata()}
-    | {stream, StatusCode :: cactus_http1:status(), cactus_http1:headers(), stream_fun()}.
+    | {stream, StatusCode :: cactus_http1:status(), cactus_http1:headers(), stream_fun()}
+    | {websocket, Module :: module(), State :: term()}.
 
 -callback handle(Request :: cactus_http1:request()) -> response().

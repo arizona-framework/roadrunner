@@ -246,11 +246,13 @@ parse_loop(Buf, RecvFun) ->
     ok | {error, term()}.
 handle_and_send(Socket, Handler, Req) ->
     try Handler:handle(Req) of
-        {Status, Headers, Body} ->
-            Resp = cactus_http1:response(Status, Headers, Body),
-            gen_tcp:send(Socket, Resp);
+        {websocket, Mod, State} when is_atom(Mod) ->
+            upgrade_to_websocket(Socket, Req, Mod, State);
         {stream, Status, Headers, Fun} when is_function(Fun, 1) ->
-            stream_response(Socket, Status, Headers, Fun)
+            stream_response(Socket, Status, Headers, Fun);
+        {Status, Headers, Body} when is_integer(Status) ->
+            Resp = cactus_http1:response(Status, Headers, Body),
+            gen_tcp:send(Socket, Resp)
     catch
         Class:Reason:Stack ->
             logger:error(#{
@@ -339,3 +341,65 @@ send_internal_error(Socket) ->
         ~""
     ),
     gen_tcp:send(Socket, Resp).
+
+%% --- WebSocket upgrade + frame loop ---
+
+-spec upgrade_to_websocket(gen_tcp:socket(), cactus_http1:request(), module(), term()) ->
+    ok | {error, term()}.
+upgrade_to_websocket(Socket, Req, Mod, State) ->
+    case cactus_ws:handshake_response(cactus_req:headers(Req)) of
+        {ok, Status, RespHeaders, _} ->
+            Resp = cactus_http1:response(Status, RespHeaders, ~""),
+            %% If this send fails, the next recv inside ws_loop will return
+            %% {error, _} and the loop ends cleanly — no separate handling.
+            _ = gen_tcp:send(Socket, Resp),
+            ws_loop(Socket, <<>>, Mod, State);
+        {error, _} ->
+            send_bad_request(Socket)
+    end.
+
+-spec ws_loop(gen_tcp:socket(), binary(), module(), term()) -> ok.
+ws_loop(Socket, Buffer, Mod, State) ->
+    case cactus_ws:parse_frame(Buffer) of
+        {ok, Frame, NewBuffer} ->
+            handle_ws_frame(Socket, NewBuffer, Mod, State, Frame);
+        {more, _} ->
+            case gen_tcp:recv(Socket, 0, infinity) of
+                {ok, Data} ->
+                    ws_loop(Socket, <<Buffer/binary, Data/binary>>, Mod, State);
+                {error, _} ->
+                    ok
+            end;
+        {error, _} ->
+            ok
+    end.
+
+-spec handle_ws_frame(
+    gen_tcp:socket(), binary(), module(), term(), cactus_ws:frame()
+) -> ok.
+handle_ws_frame(Socket, _Buffer, _Mod, _State, #{opcode := close}) ->
+    _ = gen_tcp:send(Socket, cactus_ws:encode_frame(close, ~"", true)),
+    ok;
+handle_ws_frame(Socket, Buffer, Mod, State, #{opcode := ping, payload := P}) ->
+    _ = gen_tcp:send(Socket, cactus_ws:encode_frame(pong, P, true)),
+    ws_loop(Socket, Buffer, Mod, State);
+handle_ws_frame(Socket, Buffer, Mod, State, #{opcode := pong}) ->
+    %% Server is not pinging clients yet — pong from client is just dropped.
+    ws_loop(Socket, Buffer, Mod, State);
+handle_ws_frame(Socket, Buffer, Mod, State, Frame) ->
+    case Mod:handle_frame(Frame, State) of
+        {reply, OutFrames, NewState} ->
+            _ = send_ws_frames(Socket, OutFrames),
+            ws_loop(Socket, Buffer, Mod, NewState);
+        {ok, NewState} ->
+            ws_loop(Socket, Buffer, Mod, NewState);
+        {close, _NewState} ->
+            _ = gen_tcp:send(Socket, cactus_ws:encode_frame(close, ~"", true)),
+            ok
+    end.
+
+-spec send_ws_frames(gen_tcp:socket(), [{cactus_ws:opcode(), iodata()}]) ->
+    ok | {error, term()}.
+send_ws_frames(Socket, OutFrames) ->
+    Iodata = [cactus_ws:encode_frame(Op, Payload, true) || {Op, Payload} <- OutFrames],
+    gen_tcp:send(Socket, Iodata).
