@@ -9,9 +9,9 @@ tagged `{error, _}` results, leaving the caller in control of the
 response (`400`, `414`, `431`, etc.).
 """.
 
--export([parse_request_line/1, parse_header/1, parse_headers/1]).
+-export([parse_request_line/1, parse_header/1, parse_headers/1, parse_request/1]).
 
--export_type([version/0, headers/0]).
+-export_type([version/0, headers/0, request/0]).
 
 -define(MAX_REQUEST_LINE, 8192).
 -define(MAX_HEADER_LINE, 8192).
@@ -20,6 +20,12 @@ response (`400`, `414`, `431`, etc.).
 
 -type version() :: {1, 0} | {1, 1}.
 -type headers() :: [{Name :: binary(), Value :: binary()}].
+-type request() :: #{
+    method := binary(),
+    target := binary(),
+    version := version(),
+    headers := headers()
+}.
 
 -doc """
 Parse the HTTP/1.1 request line.
@@ -374,3 +380,52 @@ check_framing(true, [_ | _]) -> error.
 check_cls_consistent(_, []) -> ok;
 check_cls_consistent(V, [V | Rest]) -> check_cls_consistent(V, Rest);
 check_cls_consistent(_, _) -> error.
+
+-doc """
+Parse a complete HTTP/1.1 request (request line + header block).
+
+Returns `{ok, Request, Rest}` where `Request` is a map with `method`,
+`target`, `version`, and `headers` keys, and `Rest` is the remaining
+buffer (the start of the body, not yet framed).
+
+Body framing (Content-Length / chunked) is the next layer's job —
+this function stops cleanly at the empty line that terminates the
+header block.
+
+Spec deviates from the original plan: the result is a map rather than
+a record, so callers don't need to include a header file.
+""".
+-spec parse_request(binary()) ->
+    {ok, request(), Rest :: binary()}
+    | {more, undefined}
+    | {error,
+        bad_request_line
+        | bad_version
+        | request_line_too_long
+        | bad_header
+        | header_too_long
+        | header_block_too_long
+        | too_many_headers
+        | conflicting_framing}.
+parse_request(Bin) when is_binary(Bin) ->
+    case parse_request_line(Bin) of
+        {ok, Method, Target, Version, Rest} ->
+            case parse_headers(Rest) of
+                {ok, Headers, Rest2} ->
+                    Req = #{
+                        method => Method,
+                        target => Target,
+                        version => Version,
+                        headers => Headers
+                    },
+                    {ok, Req, Rest2};
+                {more, _} = More ->
+                    More;
+                {error, _} = Err ->
+                    Err
+            end;
+        {more, _} = More ->
+            More;
+        {error, _} = Err ->
+            Err
+    end.

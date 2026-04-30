@@ -423,3 +423,77 @@ block_propagates_header_too_long_test() ->
         {error, header_too_long},
         cactus_http1:parse_headers(<<"Host: x\r\n", Big/binary>>)
     ).
+
+%% =============================================================================
+%% parse_request/1
+%% =============================================================================
+
+%% --- happy path ---
+
+request_full_test() ->
+    ?assertEqual(
+        {ok,
+            #{
+                method => ~"GET",
+                target => ~"/foo",
+                version => {1, 1},
+                headers => [{~"host", ~"x"}]
+            },
+            ~"body"},
+        cactus_http1:parse_request(~"GET /foo HTTP/1.1\r\nHost: x\r\n\r\nbody")
+    ).
+
+request_no_headers_test() ->
+    ?assertEqual(
+        {ok,
+            #{
+                method => ~"GET",
+                target => ~"/",
+                version => {1, 1},
+                headers => []
+            },
+            ~""},
+        cactus_http1:parse_request(~"GET / HTTP/1.1\r\n\r\n")
+    ).
+
+%% --- incremental ---
+
+request_returns_more_until_complete_test_() ->
+    %% Every byte-prefix shorter than the full message must return {more, _}.
+    Full = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    Len = byte_size(Full),
+    [
+        ?_assertMatch(
+            {more, _},
+            cactus_http1:parse_request(binary:part(Full, 0, N))
+        )
+     || N <- lists:seq(0, Len - 1)
+    ].
+
+%% --- error propagation ---
+
+request_request_line_error_propagates_test() ->
+    ?assertEqual(
+        {error, bad_request_line},
+        cactus_http1:parse_request(~"BAD\r\n\r\n")
+    ).
+
+request_bad_version_propagates_test() ->
+    ?assertEqual(
+        {error, bad_version},
+        cactus_http1:parse_request(~"GET / HTTP/2.0\r\n\r\n")
+    ).
+
+request_bad_header_propagates_test() ->
+    ?assertEqual(
+        {error, bad_header},
+        cactus_http1:parse_request(~"GET / HTTP/1.1\r\nbad header\r\n\r\n")
+    ).
+
+request_smuggling_propagates_test() ->
+    ?assertEqual(
+        {error, conflicting_framing},
+        cactus_http1:parse_request(
+            ~"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
+        )
+    ).
