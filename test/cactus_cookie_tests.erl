@@ -73,3 +73,138 @@ parse_value_with_equals_test() ->
         [{~"sid", ~"a=b=c"}],
         cactus_cookie:parse(~"sid=a=b=c")
     ).
+
+%% =============================================================================
+%% serialize/3
+%% =============================================================================
+
+serialize_minimal_test() ->
+    ?assertEqual(
+        ~"sid=abc",
+        iolist_to_binary(cactus_cookie:serialize(~"sid", ~"abc", #{}))
+    ).
+
+serialize_with_domain_test() ->
+    ?assertEqual(
+        ~"sid=abc; Domain=example.com",
+        iolist_to_binary(
+            cactus_cookie:serialize(~"sid", ~"abc", #{domain => ~"example.com"})
+        )
+    ).
+
+serialize_with_path_test() ->
+    ?assertEqual(
+        ~"sid=abc; Path=/api",
+        iolist_to_binary(
+            cactus_cookie:serialize(~"sid", ~"abc", #{path => ~"/api"})
+        )
+    ).
+
+serialize_with_max_age_test() ->
+    ?assertEqual(
+        ~"sid=abc; Max-Age=3600",
+        iolist_to_binary(
+            cactus_cookie:serialize(~"sid", ~"abc", #{max_age => 3600})
+        )
+    ).
+
+serialize_with_max_age_zero_test() ->
+    ?assertEqual(
+        ~"sid=abc; Max-Age=0",
+        iolist_to_binary(
+            cactus_cookie:serialize(~"sid", ~"abc", #{max_age => 0})
+        )
+    ).
+
+serialize_with_expires_test() ->
+    %% Expires takes a pre-formatted IMF-fixdate / RFC 1123 string.
+    ?assertEqual(
+        ~"sid=abc; Expires=Wed, 09 Jun 2027 10:18:14 GMT",
+        iolist_to_binary(
+            cactus_cookie:serialize(~"sid", ~"abc", #{
+                expires => ~"Wed, 09 Jun 2027 10:18:14 GMT"
+            })
+        )
+    ).
+
+serialize_with_secure_test() ->
+    ?assertEqual(
+        ~"sid=abc; Secure",
+        iolist_to_binary(
+            cactus_cookie:serialize(~"sid", ~"abc", #{secure => true})
+        )
+    ).
+
+serialize_secure_false_omitted_test() ->
+    ?assertEqual(
+        ~"sid=abc",
+        iolist_to_binary(
+            cactus_cookie:serialize(~"sid", ~"abc", #{secure => false})
+        )
+    ).
+
+serialize_with_http_only_test() ->
+    ?assertEqual(
+        ~"sid=abc; HttpOnly",
+        iolist_to_binary(
+            cactus_cookie:serialize(~"sid", ~"abc", #{http_only => true})
+        )
+    ).
+
+serialize_http_only_false_omitted_test() ->
+    ?assertEqual(
+        ~"sid=abc",
+        iolist_to_binary(
+            cactus_cookie:serialize(~"sid", ~"abc", #{http_only => false})
+        )
+    ).
+
+serialize_with_same_site_strict_test() ->
+    ?assertEqual(
+        ~"sid=abc; SameSite=Strict",
+        iolist_to_binary(
+            cactus_cookie:serialize(~"sid", ~"abc", #{same_site => strict})
+        )
+    ).
+
+serialize_with_same_site_lax_test() ->
+    ?assertEqual(
+        ~"sid=abc; SameSite=Lax",
+        iolist_to_binary(
+            cactus_cookie:serialize(~"sid", ~"abc", #{same_site => lax})
+        )
+    ).
+
+serialize_with_same_site_none_test() ->
+    ?assertEqual(
+        ~"sid=abc; SameSite=None",
+        iolist_to_binary(
+            cactus_cookie:serialize(~"sid", ~"abc", #{same_site => none})
+        )
+    ).
+
+serialize_with_all_attrs_test() ->
+    %% All attributes appear in the documented order.
+    Opts = #{
+        domain => ~"example.com",
+        path => ~"/api",
+        max_age => 3600,
+        expires => ~"Wed, 09 Jun 2027 10:18:14 GMT",
+        secure => true,
+        http_only => true,
+        same_site => strict
+    },
+    Expected = iolist_to_binary([
+        ~"sid=abc",
+        ~"; Domain=example.com",
+        ~"; Path=/api",
+        ~"; Max-Age=3600",
+        ~"; Expires=Wed, 09 Jun 2027 10:18:14 GMT",
+        ~"; Secure",
+        ~"; HttpOnly",
+        ~"; SameSite=Strict"
+    ]),
+    ?assertEqual(
+        Expected,
+        iolist_to_binary(cactus_cookie:serialize(~"sid", ~"abc", Opts))
+    ).
