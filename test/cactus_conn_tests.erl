@@ -346,8 +346,8 @@ conn_dispatches_via_router_test_() ->
             {ok, _} = cactus_listener:start_link(conn_test_routes, #{
                 port => 0,
                 routes => [
-                    {~"/", cactus_hello_handler},
-                    {~"/created", cactus_test_handler}
+                    {~"/", cactus_hello_handler, undefined},
+                    {~"/created", cactus_test_handler, undefined}
                 ]
             }),
             cactus_listener:port(conn_test_routes)
@@ -371,7 +371,7 @@ conn_passes_bindings_to_handler_test_() ->
         fun() ->
             {ok, _} = cactus_listener:start_link(conn_test_bindings, #{
                 port => 0,
-                routes => [{~"/users/:id", cactus_bindings_handler}]
+                routes => [{~"/users/:id", cactus_bindings_handler, undefined}]
             }),
             cactus_listener:port(conn_test_bindings)
         end,

@@ -22,7 +22,8 @@ representation can evolve without breaking them.
     has_body/1,
     bindings/1,
     peer/1,
-    scheme/1
+    scheme/1,
+    route_opts/1
 ]).
 
 -doc "Return the request method (uppercase ASCII binary).".
@@ -185,3 +186,14 @@ connection pipeline.
 -spec scheme(cactus_http1:request()) -> http | https.
 scheme(#{scheme := S}) -> S;
 scheme(_) -> http.
+
+-doc """
+Return the opaque per-route opts attached at compile time via the
+3-tuple route shape `{Path, Handler, Opts}`.
+
+`undefined` for 2-tuple routes and for single-handler dispatch (no
+router involved).
+""".
+-spec route_opts(cactus_http1:request()) -> term().
+route_opts(#{route_opts := O}) -> O;
+route_opts(_) -> undefined.

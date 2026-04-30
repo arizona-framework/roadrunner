@@ -48,7 +48,11 @@ response (`400`, `414`, `431`, etc.).
     peer => {inet:ip_address(), inet:port_number()} | undefined,
     %% Connection scheme — `http` for plain TCP, `https` for TLS. Set
     %% once per connection by `cactus_conn` from the transport tag.
-    scheme => http | https
+    scheme => http | https,
+    %% Per-route opts attached at compile time via the 3-tuple route shape
+    %% `{Path, Handler, Opts}`. `undefined` for 2-tuple routes and for
+    %% single-handler dispatch (no router involved).
+    route_opts => term()
 }.
 
 -doc """

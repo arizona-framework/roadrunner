@@ -78,8 +78,11 @@ process_one(Socket, Peer, Scheme, #{
                 {ok, Body} ->
                     ReqWithBody = Req#{body => Body},
                     case resolve_handler(Dispatch, ReqWithBody) of
-                        {ok, Handler, Bindings} ->
-                            FullReq = ReqWithBody#{bindings => Bindings},
+                        {ok, Handler, Bindings, RouteOpts} ->
+                            FullReq = ReqWithBody#{
+                                bindings => Bindings,
+                                route_opts => RouteOpts
+                            },
                             handle_and_send(Socket, Handler, FullReq);
                         not_found ->
                             _ = send_not_found(Socket),
@@ -133,9 +136,9 @@ scheme({gen_tcp, _}) -> http;
 scheme({ssl, _}) -> https.
 
 -spec resolve_handler(dispatch(), cactus_http1:request()) ->
-    {ok, module(), cactus_router:bindings()} | not_found.
+    {ok, module(), cactus_router:bindings(), term()} | not_found.
 resolve_handler({handler, Mod}, _Req) ->
-    {ok, Mod, #{}};
+    {ok, Mod, #{}, undefined};
 resolve_handler({router, Compiled}, Req) ->
     cactus_router:match(cactus_req:path(Req), Compiled).
 

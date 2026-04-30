@@ -158,6 +158,15 @@ scheme_https_test() ->
 scheme_absent_defaults_to_http_test() ->
     ?assertEqual(http, cactus_req:scheme(sample_req())).
 
+%% --- route_opts/1 ---
+
+route_opts_present_test() ->
+    Req = (sample_req())#{route_opts => #{dir => ~"/var/www"}},
+    ?assertEqual(#{dir => ~"/var/www"}, cactus_req:route_opts(Req)).
+
+route_opts_absent_returns_undefined_test() ->
+    ?assertEqual(undefined, cactus_req:route_opts(sample_req())).
+
 %% --- fixtures ---
 
 sample_req() ->
