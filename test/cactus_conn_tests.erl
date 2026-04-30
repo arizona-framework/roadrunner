@@ -73,6 +73,27 @@ conn_serves_400_on_bad_request_test_() ->
             end}
         end}.
 
+conn_dispatches_to_custom_handler_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_custom, #{
+                port => 0, handler => cactus_test_handler
+            }),
+            cactus_listener:port(conn_test_custom)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_custom) end, fun(Port) ->
+            {"custom handler's response is sent on the wire", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 201 Created", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"custom handler response"),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
 %% --- helpers ---
 
 recv_until_closed(Sock) ->

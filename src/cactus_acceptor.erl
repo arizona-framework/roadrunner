@@ -11,30 +11,29 @@ Connection workers are spawned **without** a link so that a crash
 in one connection does not bring down the acceptor.
 """.
 
--export([start_link/1]).
+-export([start_link/2]).
 
 -doc """
-Spawn-link an acceptor process bound to `LSocket`.
-
-Returns the new process id. The acceptor inherits the caller's link
-graph — typically the calling `cactus_listener` gen_server.
+Spawn-link an acceptor process bound to `LSocket` with the given
+`Handler` module. Each accepted socket is handed to a `cactus_conn`
+worker that dispatches to `Handler:handle/1`.
 """.
--spec start_link(gen_tcp:socket()) -> {ok, pid()}.
-start_link(LSocket) ->
+-spec start_link(gen_tcp:socket(), module()) -> {ok, pid()}.
+start_link(LSocket, Handler) ->
     Pid = proc_lib:spawn_link(fun() ->
         proc_lib:set_label(cactus_acceptor),
-        loop(LSocket)
+        loop(LSocket, Handler)
     end),
     {ok, Pid}.
 
--spec loop(gen_tcp:socket()) -> ok.
-loop(LSocket) ->
+-spec loop(gen_tcp:socket(), module()) -> ok.
+loop(LSocket, Handler) ->
     case gen_tcp:accept(LSocket) of
         {ok, Socket} ->
-            {ok, ConnPid} = cactus_conn:start(Socket),
+            {ok, ConnPid} = cactus_conn:start(Socket, Handler),
             ok = gen_tcp:controlling_process(Socket, ConnPid),
             ConnPid ! shoot,
-            loop(LSocket);
+            loop(LSocket, Handler);
         {error, _} ->
             %% Listen socket was closed (or another transport error) —
             %% terminate cleanly; the linked listener will tear us down.

@@ -10,33 +10,34 @@ This is the minimum end-to-end pipeline for slice 2; the handler
 behaviour and routing arrive in slices 3–4.
 """.
 
--export([start/1, parse_loop/2]).
+-export([start/2, parse_loop/2]).
 
 -define(RECV_TIMEOUT, 5000).
 
 -doc """
-Spawn an unlinked connection process for the accepted `Socket`.
+Spawn an unlinked connection process for the accepted `Socket` and the
+chosen `Handler` module.
 
 The caller (typically `cactus_acceptor`) must transfer socket
 ownership via `gen_tcp:controlling_process/2` and then send the
 process the atom `shoot` to release it.
 """.
--spec start(gen_tcp:socket()) -> {ok, pid()}.
-start(Socket) ->
+-spec start(gen_tcp:socket(), module()) -> {ok, pid()}.
+start(Socket, Handler) ->
     Pid = proc_lib:spawn(fun() ->
         proc_lib:set_label(cactus_conn),
         receive
-            shoot -> serve(Socket)
+            shoot -> serve(Socket, Handler)
         end
     end),
     {ok, Pid}.
 
--spec serve(gen_tcp:socket()) -> ok.
-serve(Socket) ->
+-spec serve(gen_tcp:socket(), module()) -> ok.
+serve(Socket, Handler) ->
     Recv = fun() -> gen_tcp:recv(Socket, 0, ?RECV_TIMEOUT) end,
     _ =
         case parse_loop(<<>>, Recv) of
-            {ok, _Req, _Rest} -> send_hello(Socket);
+            {ok, Req, _Rest} -> handle_and_send(Socket, Handler, Req);
             {error, _} -> send_bad_request(Socket)
         end,
     _ = gen_tcp:close(Socket),
@@ -58,18 +59,11 @@ parse_loop(Buf, RecvFun) ->
             E
     end.
 
--spec send_hello(gen_tcp:socket()) -> ok | {error, term()}.
-send_hello(Socket) ->
-    Body = ~"Hello, cactus!\r\n",
-    Resp = cactus_http1:response(
-        200,
-        [
-            {~"content-type", ~"text/plain"},
-            {~"content-length", integer_to_binary(byte_size(Body))},
-            {~"connection", ~"close"}
-        ],
-        Body
-    ),
+-spec handle_and_send(gen_tcp:socket(), module(), cactus_http1:request()) ->
+    ok | {error, term()}.
+handle_and_send(Socket, Handler, Req) ->
+    {Status, Headers, Body} = Handler:handle(Req),
+    Resp = cactus_http1:response(Status, Headers, Body),
     gen_tcp:send(Socket, Resp).
 
 -spec send_bad_request(gen_tcp:socket()) -> ok | {error, term()}.

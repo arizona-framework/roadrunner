@@ -18,12 +18,14 @@ connection workers will hang off it in subsequent features.
 -export_type([opts/0]).
 
 -type opts() :: #{
-    port := inet:port_number()
+    port := inet:port_number(),
+    handler => module()
 }.
 
 -record(state, {
     listen_socket :: gen_tcp:socket(),
-    port :: inet:port_number()
+    port :: inet:port_number(),
+    handler :: module()
 }).
 
 -doc """
@@ -49,7 +51,8 @@ port(Name) ->
 %% --- gen_server callbacks ---
 
 -spec init(opts()) -> {ok, #state{}} | {stop, term()}.
-init(#{port := Port}) ->
+init(#{port := Port} = Opts) ->
+    Handler = maps:get(handler, Opts, cactus_hello_handler),
     proc_lib:set_label({cactus_listener, Port}),
     %% `inet_backend` must be the first option per gen_tcp docs.
     case
@@ -63,8 +66,8 @@ init(#{port := Port}) ->
     of
         {ok, LSocket} ->
             {ok, BoundPort} = inet:port(LSocket),
-            {ok, _AcceptorPid} = cactus_acceptor:start_link(LSocket),
-            {ok, #state{listen_socket = LSocket, port = BoundPort}};
+            {ok, _AcceptorPid} = cactus_acceptor:start_link(LSocket, Handler),
+            {ok, #state{listen_socket = LSocket, port = BoundPort, handler = Handler}};
         {error, Reason} ->
             {stop, {listen_failed, Reason}}
     end.
