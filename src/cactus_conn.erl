@@ -270,7 +270,7 @@ handle_and_send(Socket, Handler, Req) ->
 %% Transfer-Encoding or Content-Length.
 -spec stream_response(
     gen_tcp:socket(),
-    100..599,
+    cactus_http1:status(),
     cactus_http1:headers(),
     cactus_handler:stream_fun()
 ) -> ok | {error, term()}.

@@ -18,7 +18,7 @@ response (`400`, `414`, `431`, etc.).
     response/3
 ]).
 
--export_type([version/0, headers/0, request/0]).
+-export_type([version/0, headers/0, request/0, status/0, redirect_status/0]).
 
 -define(MAX_REQUEST_LINE, 8192).
 -define(MAX_HEADER_LINE, 8192).
@@ -28,6 +28,8 @@ response (`400`, `414`, `431`, etc.).
 
 -type version() :: {1, 0} | {1, 1}.
 -type headers() :: [{Name :: binary(), Value :: binary()}].
+-type status() :: 100..599.
+-type redirect_status() :: 300..399.
 -type request() :: #{
     method := binary(),
     target := binary(),
@@ -575,7 +577,7 @@ headers, nor a `Server` token (a higher-level builder will do that).
 Status reason phrases are looked up for the common HTTP codes; unknown
 codes get an empty reason (RFC 9112 §4.1 makes the phrase optional).
 """.
--spec response(StatusCode :: 100..599, headers(), iodata()) -> iodata().
+-spec response(StatusCode :: status(), headers(), iodata()) -> iodata().
 response(Status, Headers, Body) when
     is_integer(Status), Status >= 100, Status =< 599
 ->
@@ -596,7 +598,7 @@ encode_headers([]) ->
 encode_headers([{Name, Value} | Rest]) ->
     [Name, ~": ", Value, ~"\r\n" | encode_headers(Rest)].
 
--spec reason(100..599) -> binary().
+-spec reason(status()) -> binary().
 reason(200) -> ~"OK";
 reason(201) -> ~"Created";
 reason(204) -> ~"No Content";

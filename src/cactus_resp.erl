@@ -11,17 +11,15 @@ helpers only fill in what the handler can know.
 
 -export([text/2, html/2, json/2, redirect/2, add_header/3, set_cookie/4]).
 
--type response() :: {100..599, cactus_http1:headers(), iodata()}.
+-type response() :: {cactus_http1:status(), cactus_http1:headers(), iodata()}.
 
 -doc "Plain-text response with `text/plain; charset=utf-8`.".
--spec text(StatusCode :: 100..599, Body :: iodata()) ->
-    {100..599, cactus_http1:headers(), iodata()}.
+-spec text(StatusCode :: cactus_http1:status(), Body :: iodata()) -> response().
 text(Status, Body) ->
     with_length(Status, ~"text/plain; charset=utf-8", Body).
 
 -doc "HTML response with `text/html; charset=utf-8`.".
--spec html(StatusCode :: 100..599, Body :: iodata()) ->
-    {100..599, cactus_http1:headers(), iodata()}.
+-spec html(StatusCode :: cactus_http1:status(), Body :: iodata()) -> response().
 html(Status, Body) ->
     with_length(Status, ~"text/html; charset=utf-8", Body).
 
@@ -29,8 +27,7 @@ html(Status, Body) ->
 JSON response — the term is encoded via the stdlib `json` module
 (OTP 27+) and `Content-Type` is set to `application/json`.
 """.
--spec json(StatusCode :: 100..599, Term :: term()) ->
-    {100..599, cactus_http1:headers(), iodata()}.
+-spec json(StatusCode :: cactus_http1:status(), Term :: term()) -> response().
 json(Status, Term) ->
     Body = json:encode(Term),
     with_length(Status, ~"application/json", Body).
@@ -39,8 +36,8 @@ json(Status, Term) ->
 Redirect response — sets the `Location` header and an empty body.
 Use a 3xx status (typically 301, 302, 303, 307, or 308).
 """.
--spec redirect(StatusCode :: 300..399, Location :: binary()) ->
-    {300..399, cactus_http1:headers(), iodata()}.
+-spec redirect(StatusCode :: cactus_http1:redirect_status(), Location :: binary()) ->
+    response().
 redirect(Status, Location) when is_binary(Location) ->
     {Status,
         [
@@ -49,7 +46,7 @@ redirect(Status, Location) when is_binary(Location) ->
         ],
         ~""}.
 
--spec with_length(100..599, binary(), iodata()) -> response().
+-spec with_length(cactus_http1:status(), binary(), iodata()) -> response().
 with_length(Status, ContentType, Body) ->
     {Status,
         [
