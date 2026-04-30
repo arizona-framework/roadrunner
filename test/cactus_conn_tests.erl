@@ -730,6 +730,53 @@ conn_handler_crash_returns_500_test_() ->
             end}
         end}.
 
+conn_sends_100_continue_before_reading_body_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_100, #{
+                port => 0, handler => cactus_echo_body_handler
+            }),
+            cactus_listener:port(conn_test_100)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_100) end, fun(Port) ->
+            [
+                {"Expect: 100-continue gets a 100 line before the body is read", fun() ->
+                    {ok, Sock} = gen_tcp:connect(
+                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                    ),
+                    %% Send headers only, then wait for 100 before sending body.
+                    ok = gen_tcp:send(
+                        Sock,
+                        <<
+                            "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+                            "Expect: 100-continue\r\n\r\n"
+                        >>
+                    ),
+                    {ok, Continue} = gen_tcp:recv(Sock, 25, 1000),
+                    ?assertEqual(~"HTTP/1.1 100 Continue\r\n\r\n", Continue),
+                    %% Now ship the body and read the final response.
+                    ok = gen_tcp:send(Sock, ~"hello"),
+                    Reply = recv_until_closed(Sock),
+                    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                    {match, _} = re:run(Reply, ~"hello"),
+                    ok = gen_tcp:close(Sock)
+                end},
+                {"no Expect header → no 100 line precedes the response", fun() ->
+                    {ok, Sock} = gen_tcp:connect(
+                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                    ),
+                    ok = gen_tcp:send(
+                        Sock,
+                        ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+                    ),
+                    Reply = recv_until_closed(Sock),
+                    %% First bytes are the 200 line, not a 100 line.
+                    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                    ok = gen_tcp:close(Sock)
+                end}
+            ]
+        end}.
+
 conn_head_drops_response_body_test_() ->
     {setup,
         fun() ->

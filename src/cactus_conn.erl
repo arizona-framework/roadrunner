@@ -74,6 +74,7 @@ process_one(Socket, Peer, Scheme, #{
     case parse_loop(<<>>, Recv) of
         {ok, Req0, Buffered} ->
             Req = Req0#{peer => Peer, scheme => Scheme},
+            ok = maybe_send_continue(Socket, Req, Buffered),
             case read_body(Req, Buffered, Recv, MaxCL) of
                 {ok, Body} ->
                     ReqWithBody = Req#{body => Body},
@@ -167,6 +168,29 @@ read_body(Req, Buffered, RecvFun, MaxCL) ->
             read_body_until(N, Buffered, RecvFun);
         {error, _} = Err ->
             Err
+    end.
+
+%% RFC 9110 §10.1.1: when a request carries `Expect: 100-continue` and
+%% we're about to read a body, send `HTTP/1.1 100 Continue` so clients
+%% that gate body transmission on this signal don't stall. We only do
+%% this if no body bytes have already arrived in the buffer — once we
+%% see body data the client clearly didn't wait, and the 100 line is
+%% redundant.
+-spec maybe_send_continue(cactus_transport:socket(), cactus_http1:request(), binary()) -> ok.
+maybe_send_continue(Socket, Req, Buffered) ->
+    case Buffered =:= ~"" andalso has_continue_expectation(Req) of
+        true ->
+            _ = cactus_transport:send(Socket, ~"HTTP/1.1 100 Continue\r\n\r\n"),
+            ok;
+        false ->
+            ok
+    end.
+
+-spec has_continue_expectation(cactus_http1:request()) -> boolean().
+has_continue_expectation(Req) ->
+    case cactus_req:header(~"expect", Req) of
+        undefined -> false;
+        Value -> string:lowercase(Value) =:= ~"100-continue"
     end.
 
 -spec body_framing(cactus_http1:request()) ->
