@@ -248,7 +248,9 @@ handle_and_send(Socket, Handler, Req) ->
     try Handler:handle(Req) of
         {Status, Headers, Body} ->
             Resp = cactus_http1:response(Status, Headers, Body),
-            gen_tcp:send(Socket, Resp)
+            gen_tcp:send(Socket, Resp);
+        {stream, Status, Headers, Fun} when is_function(Fun, 1) ->
+            stream_response(Socket, Status, Headers, Fun)
     catch
         Class:Reason:Stack ->
             logger:error(#{
@@ -260,6 +262,38 @@ handle_and_send(Socket, Handler, Req) ->
             }),
             send_internal_error(Socket)
     end.
+
+%% Emit the status line + headers (with `Transfer-Encoding: chunked`
+%% prepended), then call the user's stream fun with a Send/2 callback.
+%% Each Send call frames its data as one chunk; passing `fin` appends
+%% the size-0 terminator. Caller-supplied headers must NOT set
+%% Transfer-Encoding or Content-Length.
+-spec stream_response(
+    gen_tcp:socket(),
+    100..599,
+    cactus_http1:headers(),
+    cactus_handler:stream_fun()
+) -> ok | {error, term()}.
+stream_response(Socket, Status, UserHeaders, Fun) ->
+    Headers = [{~"transfer-encoding", ~"chunked"} | UserHeaders],
+    Head = cactus_http1:response(Status, Headers, ~""),
+    _ = gen_tcp:send(Socket, Head),
+    Send = fun(Data, FinFlag) ->
+        Chunk = [
+            integer_to_binary(iolist_size(Data), 16),
+            ~"\r\n",
+            Data,
+            ~"\r\n"
+        ],
+        Frame =
+            case FinFlag of
+                nofin -> Chunk;
+                fin -> [Chunk, ~"0\r\n\r\n"]
+            end,
+        gen_tcp:send(Socket, Frame)
+    end,
+    _ = Fun(Send),
+    ok.
 
 -spec send_bad_request(gen_tcp:socket()) -> ok | {error, term()}.
 send_bad_request(Socket) ->

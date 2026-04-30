@@ -433,6 +433,32 @@ conn_request_timeout_during_body_returns_408_test_() ->
             end}
         end}.
 
+conn_streams_chunked_response_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_stream, #{
+                port => 0, handler => cactus_stream_handler
+            }),
+            cactus_listener:port(conn_test_stream)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_stream) end, fun(Port) ->
+            {"streaming handler delivers a chunked 200 response", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"transfer-encoding: chunked", [caseless]),
+                %% The chunk framing should land "hello world" in the body.
+                {match, _} = re:run(Reply, ~"hello"),
+                {match, _} = re:run(Reply, ~"world"),
+                %% Final size-0 terminator chunk.
+                {match, _} = re:run(Reply, ~"\r\n0\r\n\r\n"),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
 conn_handler_crash_returns_500_test_() ->
     {setup,
         fun() ->
