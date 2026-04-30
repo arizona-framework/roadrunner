@@ -90,3 +90,111 @@ handshake_missing_key_test() ->
         {error, missing_websocket_key},
         cactus_ws:handshake_response(Headers)
     ).
+
+%% =============================================================================
+%% parse_frame/1
+%% =============================================================================
+
+parse_frame_rfc_text_example_test() ->
+    %% RFC 6455 §5.7 single-frame masked text "Hello".
+    Frame = <<16#81, 16#85, 16#37, 16#fa, 16#21, 16#3d, 16#7f, 16#9f, 16#4d, 16#51, 16#58>>,
+    {ok, F, ~""} = cactus_ws:parse_frame(Frame),
+    ?assertEqual(text, maps:get(opcode, F)),
+    ?assertEqual(true, maps:get(fin, F)),
+    ?assertEqual(~"Hello", maps:get(payload, F)).
+
+parse_frame_binary_test() ->
+    Payload = <<1, 2, 3, 4, 5>>,
+    Mask = <<16#aa, 16#bb, 16#cc, 16#dd>>,
+    Frame = <<16#82, 16#85, Mask/binary, (mask(Payload, Mask))/binary>>,
+    {ok, F, ~""} = cactus_ws:parse_frame(Frame),
+    ?assertEqual(binary, maps:get(opcode, F)),
+    ?assertEqual(Payload, maps:get(payload, F)).
+
+parse_frame_continuation_test() ->
+    %% FIN=0, opcode=0
+    Frame = <<16#00, 16#80, 1, 2, 3, 4>>,
+    {ok, F, ~""} = cactus_ws:parse_frame(Frame),
+    ?assertEqual(continuation, maps:get(opcode, F)),
+    ?assertEqual(false, maps:get(fin, F)),
+    ?assertEqual(~"", maps:get(payload, F)).
+
+parse_frame_close_test() ->
+    Frame = <<16#88, 16#80, 1, 2, 3, 4>>,
+    {ok, F, ~""} = cactus_ws:parse_frame(Frame),
+    ?assertEqual(close, maps:get(opcode, F)).
+
+parse_frame_ping_test() ->
+    Frame = <<16#89, 16#80, 1, 2, 3, 4>>,
+    {ok, F, ~""} = cactus_ws:parse_frame(Frame),
+    ?assertEqual(ping, maps:get(opcode, F)).
+
+parse_frame_pong_test() ->
+    Frame = <<16#8a, 16#80, 1, 2, 3, 4>>,
+    {ok, F, ~""} = cactus_ws:parse_frame(Frame),
+    ?assertEqual(pong, maps:get(opcode, F)).
+
+parse_frame_extended_16bit_length_test() ->
+    Payload = binary:copy(~"a", 200),
+    Mask = <<1, 2, 3, 4>>,
+    Masked = mask(Payload, Mask),
+    Frame = <<16#82, 16#fe, 200:16, Mask/binary, Masked/binary>>,
+    {ok, F, ~""} = cactus_ws:parse_frame(Frame),
+    ?assertEqual(Payload, maps:get(payload, F)).
+
+parse_frame_extended_64bit_length_test() ->
+    %% Use 127 form for a small payload — parser doesn't enforce the
+    %% RFC's "shortest form" rule, only correct decoding.
+    Payload = ~"hi",
+    Mask = <<1, 2, 3, 4>>,
+    Masked = mask(Payload, Mask),
+    Frame = <<16#82, 16#ff, 2:64, Mask/binary, Masked/binary>>,
+    {ok, F, ~""} = cactus_ws:parse_frame(Frame),
+    ?assertEqual(Payload, maps:get(payload, F)).
+
+parse_frame_passes_rest_test() ->
+    Frame = <<16#81, 16#85, 16#37, 16#fa, 16#21, 16#3d, 16#7f, 16#9f, 16#4d, 16#51, 16#58>>,
+    Trailing = ~"NEXT_FRAME",
+    {ok, _F, Rest} = cactus_ws:parse_frame(<<Frame/binary, Trailing/binary>>),
+    ?assertEqual(Trailing, Rest).
+
+parse_frame_empty_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_ws:parse_frame(~"")).
+
+parse_frame_only_first_byte_returns_more_test() ->
+    ?assertMatch({more, _}, cactus_ws:parse_frame(<<16#81>>)).
+
+parse_frame_partial_payload_returns_more_test() ->
+    %% Header says payload length 5, only 3 bytes of masked payload.
+    Frame = <<16#81, 16#85, 1, 2, 3, 4, 99, 99, 99>>,
+    ?assertMatch({more, _}, cactus_ws:parse_frame(Frame)).
+
+parse_frame_partial_extended_length_returns_more_test() ->
+    %% Len7 = 126 means a 16-bit length follows, but only 1 byte is present.
+    Frame = <<16#81, 16#fe, 16#00>>,
+    ?assertMatch({more, _}, cactus_ws:parse_frame(Frame)).
+
+parse_frame_unmasked_rejected_test() ->
+    %% MASK bit clear — server must reject per RFC 6455 §5.1.
+    Frame = <<16#81, 16#05, "Hello">>,
+    ?assertEqual({error, not_masked}, cactus_ws:parse_frame(Frame)).
+
+parse_frame_bad_rsv_test() ->
+    %% RSV1 set — no extensions negotiated.
+    Frame = <<16#c1, 16#80, 1, 2, 3, 4>>,
+    ?assertEqual({error, bad_rsv}, cactus_ws:parse_frame(Frame)).
+
+parse_frame_bad_opcode_test() ->
+    %% Opcode 3 is reserved per RFC 6455.
+    Frame = <<16#83, 16#80, 1, 2, 3, 4>>,
+    ?assertEqual({error, bad_opcode}, cactus_ws:parse_frame(Frame)).
+
+%% --- helpers ---
+
+mask(Payload, MaskKey) ->
+    list_to_binary(do_mask(binary_to_list(Payload), MaskKey, 0)).
+
+do_mask([], _MaskKey, _I) ->
+    [];
+do_mask([B | Rest], MaskKey, I) ->
+    [B bxor binary:at(MaskKey, I rem 4) | do_mask(Rest, MaskKey, I + 1)].
