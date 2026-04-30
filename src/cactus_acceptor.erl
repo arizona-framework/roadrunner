@@ -15,25 +15,25 @@ in one connection does not bring down the acceptor.
 
 -doc """
 Spawn-link an acceptor process bound to `LSocket` with the given
-`Handler` module. Each accepted socket is handed to a `cactus_conn`
-worker that dispatches to `Handler:handle/1`.
+`ProtoOpts` (handler + body limits). Each accepted socket is handed
+to a `cactus_conn` worker that consumes the same opts.
 """.
--spec start_link(gen_tcp:socket(), module()) -> {ok, pid()}.
-start_link(LSocket, Handler) ->
+-spec start_link(gen_tcp:socket(), cactus_conn:proto_opts()) -> {ok, pid()}.
+start_link(LSocket, ProtoOpts) ->
     Pid = proc_lib:spawn_link(fun() ->
         proc_lib:set_label(cactus_acceptor),
-        loop(LSocket, Handler)
+        loop(LSocket, ProtoOpts)
     end),
     {ok, Pid}.
 
--spec loop(gen_tcp:socket(), module()) -> ok.
-loop(LSocket, Handler) ->
+-spec loop(gen_tcp:socket(), cactus_conn:proto_opts()) -> ok.
+loop(LSocket, ProtoOpts) ->
     case gen_tcp:accept(LSocket) of
         {ok, Socket} ->
-            {ok, ConnPid} = cactus_conn:start(Socket, Handler),
+            {ok, ConnPid} = cactus_conn:start(Socket, ProtoOpts),
             ok = gen_tcp:controlling_process(Socket, ConnPid),
             ConnPid ! shoot,
-            loop(LSocket, Handler);
+            loop(LSocket, ProtoOpts);
         {error, _} ->
             %% Listen socket was closed (or another transport error) —
             %% terminate cleanly; the linked listener will tear us down.

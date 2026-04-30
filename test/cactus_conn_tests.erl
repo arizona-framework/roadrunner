@@ -32,6 +32,74 @@ parse_loop_parse_error_test() ->
     ).
 
 %% =============================================================================
+%% read_body/4 — pure unit tests with a mock recv fun
+%% =============================================================================
+
+read_body_no_content_length_test() ->
+    Req = req_with_headers([]),
+    NoRecv = fun() -> error(should_not_be_called) end,
+    ?assertEqual(
+        {ok, ~"leftover bytes"},
+        cactus_conn:read_body(Req, ~"leftover bytes", NoRecv, 1000)
+    ).
+
+read_body_cl_within_buffer_test() ->
+    Req = req_with_headers([{~"content-length", ~"5"}]),
+    NoRecv = fun() -> error(should_not_be_called) end,
+    ?assertEqual(
+        {ok, ~"hello"},
+        cactus_conn:read_body(Req, ~"hello world", NoRecv, 1000)
+    ).
+
+read_body_cl_needs_more_recv_test() ->
+    Req = req_with_headers([{~"content-length", ~"11"}]),
+    Recv = fun() -> {ok, ~" world"} end,
+    ?assertEqual(
+        {ok, ~"hello world"},
+        cactus_conn:read_body(Req, ~"hello", Recv, 1000)
+    ).
+
+read_body_cl_too_large_test() ->
+    Req = req_with_headers([{~"content-length", ~"99999999"}]),
+    NoRecv = fun() -> error(should_not_be_called) end,
+    ?assertEqual(
+        {error, content_length_too_large},
+        cactus_conn:read_body(Req, ~"", NoRecv, 1000)
+    ).
+
+read_body_bad_cl_test() ->
+    Req = req_with_headers([{~"content-length", ~"abc"}]),
+    NoRecv = fun() -> error(should_not_be_called) end,
+    ?assertEqual(
+        {error, bad_content_length},
+        cactus_conn:read_body(Req, ~"", NoRecv, 1000)
+    ).
+
+read_body_negative_cl_test() ->
+    Req = req_with_headers([{~"content-length", ~"-5"}]),
+    NoRecv = fun() -> error(should_not_be_called) end,
+    ?assertEqual(
+        {error, bad_content_length},
+        cactus_conn:read_body(Req, ~"", NoRecv, 1000)
+    ).
+
+read_body_recv_error_test() ->
+    Req = req_with_headers([{~"content-length", ~"100"}]),
+    Recv = fun() -> {error, closed} end,
+    ?assertEqual(
+        {error, closed},
+        cactus_conn:read_body(Req, ~"hi", Recv, 1000)
+    ).
+
+req_with_headers(Headers) ->
+    #{
+        method => ~"POST",
+        target => ~"/",
+        version => {1, 1},
+        headers => Headers
+    }.
+
+%% =============================================================================
 %% End-to-end integration over a real TCP socket
 %% =============================================================================
 
@@ -114,6 +182,52 @@ conn_handler_can_read_body_test_() ->
                 Reply = recv_until_closed(Sock),
                 ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
                 {match, _} = re:run(Reply, ~"hello world"),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_rejects_excessive_content_length_test_() ->
+    {setup,
+        fun() ->
+            %% Configure a small max so the test is fast.
+            {ok, _} = cactus_listener:start_link(conn_test_413, #{
+                port => 0, max_content_length => 100
+            }),
+            cactus_listener:port(conn_test_413)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_413) end, fun(Port) ->
+            {"Content-Length above the configured max returns 413", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                %% Claim a body 10x the limit; we never have to actually send it.
+                ok = gen_tcp:send(
+                    Sock,
+                    ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n"
+                ),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 413 ", _/binary>>, Reply),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
+conn_rejects_malformed_content_length_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_bad_cl, #{port => 0}),
+            cactus_listener:port(conn_test_bad_cl)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_bad_cl) end, fun(Port) ->
+            {"non-integer Content-Length returns 400", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(
+                    Sock,
+                    ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n"
+                ),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 400 ", _/binary>>, Reply),
                 ok = gen_tcp:close(Sock)
             end}
         end}.

@@ -17,15 +17,18 @@ connection workers will hang off it in subsequent features.
 
 -export_type([opts/0]).
 
+-define(DEFAULT_MAX_CONTENT_LENGTH, 10485760).
+
 -type opts() :: #{
     port := inet:port_number(),
-    handler => module()
+    handler => module(),
+    max_content_length => non_neg_integer()
 }.
 
 -record(state, {
     listen_socket :: gen_tcp:socket(),
     port :: inet:port_number(),
-    handler :: module()
+    proto_opts :: cactus_conn:proto_opts()
 }).
 
 -doc """
@@ -52,7 +55,7 @@ port(Name) ->
 
 -spec init(opts()) -> {ok, #state{}} | {stop, term()}.
 init(#{port := Port} = Opts) ->
-    Handler = maps:get(handler, Opts, cactus_hello_handler),
+    ProtoOpts = build_proto_opts(Opts),
     proc_lib:set_label({cactus_listener, Port}),
     %% `inet_backend` must be the first option per gen_tcp docs.
     case
@@ -66,11 +69,18 @@ init(#{port := Port} = Opts) ->
     of
         {ok, LSocket} ->
             {ok, BoundPort} = inet:port(LSocket),
-            {ok, _AcceptorPid} = cactus_acceptor:start_link(LSocket, Handler),
-            {ok, #state{listen_socket = LSocket, port = BoundPort, handler = Handler}};
+            {ok, _AcceptorPid} = cactus_acceptor:start_link(LSocket, ProtoOpts),
+            {ok, #state{listen_socket = LSocket, port = BoundPort, proto_opts = ProtoOpts}};
         {error, Reason} ->
             {stop, {listen_failed, Reason}}
     end.
+
+-spec build_proto_opts(opts()) -> cactus_conn:proto_opts().
+build_proto_opts(Opts) ->
+    #{
+        handler => maps:get(handler, Opts, cactus_hello_handler),
+        max_content_length => maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH)
+    }.
 
 -spec handle_call(port, gen_server:from(), #state{}) ->
     {reply, inet:port_number(), #state{}}.
