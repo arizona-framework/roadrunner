@@ -104,6 +104,32 @@ response_send_failed_works_without_logger_metadata_test() ->
         detach(HandlerId)
     end.
 
+drain_acknowledged_event_fires_with_request_metadata_test() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    HandlerId = attach([[cactus, drain, acknowledged]]),
+    try
+        Req = #{
+            listener_name => probe_listener,
+            peer => {{127, 0, 0, 1}, 9999},
+            request_id => ~"abcd0123abcd0123",
+            method => ~"GET",
+            target => ~"/sse",
+            scheme => http,
+            headers => []
+        },
+        ok = cactus:acknowledge_drain(Req),
+        receive
+            {telemetry_event, [cactus, drain, acknowledged], M, Md} ->
+                ?assertMatch(#{system_time := _}, M),
+                ?assertEqual(probe_listener, maps:get(listener_name, Md)),
+                ?assertEqual({{127, 0, 0, 1}, 9999}, maps:get(peer, Md)),
+                ?assertEqual(~"abcd0123abcd0123", maps:get(request_id, Md))
+        after 1000 -> error(no_drain_acknowledged_event)
+        end
+    after
+        detach(HandlerId)
+    end.
+
 listener_accept_and_conn_close_fire_around_a_keep_alive_conn_test_() ->
     {setup, fun setup_listener/0, fun cleanup_listener/1, fun({Name, Port}) ->
         {"accept fires on connect; conn_close fires once the conn exits", fun() ->

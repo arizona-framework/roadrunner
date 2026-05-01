@@ -102,6 +102,7 @@ production or `telemetry_test:attach_event_handlers/2` in tests.
     response_send/2,
     listener_accept/1,
     listener_conn_close/2,
+    drain_acknowledged/1,
     ws_upgrade/1,
     ws_frame_in/2,
     ws_frame_out/2
@@ -213,6 +214,26 @@ listener_conn_close(StartMono, Metadata) ->
     telemetry:execute(
         [cactus, listener, conn_close],
         #{duration => erlang:monotonic_time() - StartMono},
+        Metadata
+    ),
+    ok.
+
+-doc """
+Emit `[cactus, drain, acknowledged]` when a long-running handler
+(`{loop, ...}` response or WebSocket session) participates in a
+graceful shutdown. SREs running a `cactus_listener:drain/2` use
+this signal to distinguish handlers that honored the deadline from
+those that needed to be force-killed once the timeout expired.
+
+`Metadata` should include `listener_name`, `request_id`, `peer`,
+and `module` so subscribers can correlate with `[cactus, request, _]`
+events.
+""".
+-spec drain_acknowledged(map()) -> ok.
+drain_acknowledged(Metadata) ->
+    telemetry:execute(
+        [cactus, drain, acknowledged],
+        #{system_time => erlang:system_time()},
         Metadata
     ),
     ok.

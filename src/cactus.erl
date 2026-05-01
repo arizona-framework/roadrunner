@@ -9,6 +9,7 @@ cactus application must be running (typically via
 """.
 
 -export([start_listener/2, stop_listener/1, listeners/0]).
+-export([acknowledge_drain/1]).
 
 -doc """
 Start a listener as a supervised child of the cactus application.
@@ -62,3 +63,23 @@ listeners() ->
      || {Name, _Pid, _Type, Mods} <- supervisor:which_children(cactus_sup),
         Mods =:= [cactus_listener]
     ].
+
+-doc """
+Emit `[cactus, drain, acknowledged]` for the current request, signalling
+to subscribers that a long-running handler (`{loop, ...}` or WebSocket)
+has observed and is honoring an in-flight `cactus_listener:drain/2`
+broadcast. Handlers should call this from their `handle_info/3` (loop)
+or `handle_frame/2` (websocket) when they pattern-match on
+`{cactus_drain, _}` and decide to wind down.
+
+`Req` is the request map the handler received. Returns `ok`. Calling
+this when no drain is in flight is harmless — subscribers see a stray
+event and ignore it — but the documented usage is post-drain-receipt.
+""".
+-spec acknowledge_drain(cactus_http1:request()) -> ok.
+acknowledge_drain(Req) when is_map(Req) ->
+    cactus_telemetry:drain_acknowledged(#{
+        listener_name => maps:get(listener_name, Req, undefined),
+        peer => maps:get(peer, Req, undefined),
+        request_id => maps:get(request_id, Req, undefined)
+    }).
