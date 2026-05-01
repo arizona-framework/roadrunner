@@ -11,6 +11,24 @@ Configure via a 3-tuple route with `#{dir => Path}` opts and a
 
 Reads the file from disk, sets `Content-Type` from the extension,
 returns 404 on a missing file or any path that contains `..`.
+
+## Symlink policy
+
+`#{symlink_policy => Policy}` (default `refuse_escapes`) controls
+how symlinks inside the docroot are handled. The policy applies to
+the **leaf** of the requested path — symlinks in intermediate
+directories are still followed by the kernel.
+
+- `refuse_escapes` (default) — symlinks whose target resolves
+  inside `dir` are followed; symlinks pointing outside (e.g. an
+  absolute target like `/etc/passwd`, or a relative target with
+  `..` segments) return 404. Stricter than nginx/Apache defaults
+  but matches what an operator typically wants for a public
+  docroot.
+- `follow` — every symlink is followed regardless of where it
+  points (nginx `disable_symlinks off` equivalent). Use only when
+  the docroot's filesystem permissions prevent untrusted writes.
+- `refuse` — every symlink returns 404, even safe in-docroot ones.
 """.
 
 -behaviour(cactus_handler).
@@ -49,24 +67,49 @@ handle(Req) ->
 
 -spec serve_file(file:filename_all(), cactus_http1:request()) -> cactus_handler:response().
 serve_file(FilePath, Req) ->
-    case file:read_file_info(FilePath, [{time, posix}]) of
-        {ok, #file_info{type = regular, size = Size, mtime = Mtime}} ->
-            ETag = etag(Size, Mtime),
-            LastMod = format_http_date(Mtime),
-            case is_cached(Req, ETag, Mtime) of
-                true ->
-                    {304,
-                        [
-                            {~"etag", ETag},
-                            {~"last-modified", LastMod},
-                            {~"content-length", ~"0"}
-                        ],
-                        ~""};
-                false ->
-                    serve_with_range(FilePath, Size, ETag, LastMod, Req)
+    %% `read_link_info/1` does not follow the leaf symlink — we need
+    %% the un-followed type so the symlink-policy gate can decide
+    %% whether the target is allowed to be served.
+    case file:read_link_info(FilePath, [{time, posix}]) of
+        {ok, #file_info{type = symlink}} ->
+            case symlink_allowed(FilePath, Req) of
+                true -> serve_followed_file(FilePath, Req);
+                false -> cactus_resp:not_found()
             end;
+        {ok, #file_info{type = regular, size = Size, mtime = Mtime}} ->
+            serve_regular_file(FilePath, Size, Mtime, Req);
         _ ->
             cactus_resp:not_found()
+    end.
+
+%% Read leaf-stat after the symlink-policy gate has approved follow.
+-spec serve_followed_file(file:filename_all(), cactus_http1:request()) ->
+    cactus_handler:response().
+serve_followed_file(FilePath, Req) ->
+    case file:read_file_info(FilePath, [{time, posix}]) of
+        {ok, #file_info{type = regular, size = Size, mtime = Mtime}} ->
+            serve_regular_file(FilePath, Size, Mtime, Req);
+        _ ->
+            cactus_resp:not_found()
+    end.
+
+-spec serve_regular_file(
+    file:filename_all(), non_neg_integer(), integer(), cactus_http1:request()
+) -> cactus_handler:response().
+serve_regular_file(FilePath, Size, Mtime, Req) ->
+    ETag = etag(Size, Mtime),
+    LastMod = format_http_date(Mtime),
+    case is_cached(Req, ETag, Mtime) of
+        true ->
+            {304,
+                [
+                    {~"etag", ETag},
+                    {~"last-modified", LastMod},
+                    {~"content-length", ~"0"}
+                ],
+                ~""};
+        false ->
+            serve_with_range(FilePath, Size, ETag, LastMod, Req)
     end.
 
 %% Cache hit when either:
@@ -259,6 +302,54 @@ validate_segments(Segments) ->
     case lists:any(fun(S) -> S =:= ~".." end, Segments) of
         true -> traversal;
         false -> ok
+    end.
+
+%% Decide whether a symlink leaf may be served under the route's policy.
+-spec symlink_allowed(file:filename_all(), cactus_http1:request()) -> boolean().
+symlink_allowed(FilePath, Req) ->
+    case symlink_policy(Req) of
+        follow -> true;
+        refuse -> false;
+        refuse_escapes -> target_inside_docroot(FilePath, Req)
+    end.
+
+-spec symlink_policy(cactus_http1:request()) -> follow | refuse | refuse_escapes.
+symlink_policy(Req) ->
+    case cactus_req:route_opts(Req) of
+        #{symlink_policy := follow} -> follow;
+        #{symlink_policy := refuse} -> refuse;
+        _ -> refuse_escapes
+    end.
+
+%% Resolve the symlink one level and check the result lives under
+%% `dir`. Symlinks in intermediate path components are not inspected —
+%% the kernel follows those when we eventually open the file. The
+%% threat model is "an attacker plants a leaf symlink to escape", which
+%% is the common case for upload-able directories.
+-spec target_inside_docroot(file:filename_all(), cactus_http1:request()) -> boolean().
+target_inside_docroot(FilePath, Req) ->
+    %% `serve_file/2` only calls us after `read_link_info` reported
+    %% `type = symlink`, so `read_link` is expected to succeed —
+    %% we let a TOCTOU race (symlink removed between the two stats)
+    %% crash and bubble up as a 500 instead of silently 404'ing.
+    {ok, Target} = file:read_link(FilePath),
+    #{dir := Dir} = cactus_req:route_opts(Req),
+    TargetBin = iolist_to_binary([Target]),
+    case filename:pathtype(TargetBin) of
+        relative ->
+            %% A relative target without any `..` segments must
+            %% land inside the directory containing the symlink,
+            %% which by construction is inside `dir`.
+            Segments = filename:split(TargetBin),
+            not lists:member(~"..", Segments);
+        _ ->
+            %% `filename:absname/1` strips trailing slashes (except for
+            %% the root `/` itself, which we don't reasonably support
+            %% as a docroot anyway), so a single appended `/` is enough
+            %% to make `string:prefix/2` an exact directory check
+            %% rather than a sibling-prefix false positive.
+            DirAbs = iolist_to_binary([filename:absname(Dir), $/]),
+            string:prefix(TargetBin, DirAbs) =/= nomatch
     end.
 
 %% Format a posix timestamp as IMF-fixdate (RFC 7231 §7.1.1.1) — the

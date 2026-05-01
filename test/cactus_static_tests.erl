@@ -297,20 +297,92 @@ static_test_() ->
                 Reply = http_get(Port, ~"/static/hello.html/"),
                 ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply)
             end},
-            {"symlink inside the docroot is followed (industry default)", fun() ->
-                %% Same default as nginx (`disable_symlinks off`) and
-                %% Apache (`FollowSymLinks` on). Operators relying on
-                %% this for chrooted content layouts shouldn't see
-                %% behavior change without a deliberate flag flip.
-                %% Caveat: a symlink pointing OUTSIDE Dir IS followed
-                %% — the only protection is filesystem permissions on
-                %% the docroot.
+            {"in-docroot symlink with relative target is followed by default", fun() ->
+                %% Default `symlink_policy => refuse_escapes`
+                %% allows relative-target symlinks that don't
+                %% contain `..`. The notes_link.txt → notes.txt
+                %% target lives in the same directory.
                 Reply = http_get(Port, ~"/static/notes_link.txt"),
                 ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
                 {match, _} = re:run(Reply, ~"hello via link")
+            end},
+            {"absolute symlink pointing outside the docroot is refused", fun() ->
+                %% This is the headline hardening: a symlink whose
+                %% absolute target leaves `dir` returns 404 by
+                %% default, even though the kernel would happily
+                %% follow it.
+                Reply = http_get(Port, ~"/static/escape_link.txt"),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
+            end},
+            {"relative symlink with .. segments in target is refused", fun() ->
+                Reply = http_get(Port, ~"/static/dotdot_link.txt"),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
+            end},
+            {"symlink whose target is a directory still returns 404", fun() ->
+                %% After the symlink-policy gate approves the follow,
+                %% `read_file_info` on the target reports
+                %% `type = directory` — non-regular → 404.
+                Reply = http_get(Port, ~"/static/subdir_link"),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
             end}
         ]
     end}.
+
+%% =============================================================================
+%% Symlink policy modes — exercised on dedicated listeners so the route
+%% opts differ from the default `refuse_escapes` setup above.
+%% =============================================================================
+
+symlink_policy_follow_test_() ->
+    {setup, fun() -> setup_with_policy(static_test_follow, follow) end,
+        fun({Name, _, _}) -> ok = cactus_listener:stop(Name) end, fun({_Name, _Dir, Port}) ->
+            {"policy=follow serves a symlink that escapes the docroot", fun() ->
+                Reply = http_get(Port, ~"/static/escape_link.txt"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"escaped content")
+            end}
+        end}.
+
+symlink_policy_refuse_test_() ->
+    {setup, fun() -> setup_with_policy(static_test_refuse, refuse) end,
+        fun({Name, _, _}) -> ok = cactus_listener:stop(Name) end, fun({_Name, _Dir, Port}) ->
+            [
+                {"policy=refuse rejects even an in-docroot relative symlink", fun() ->
+                    Reply = http_get(Port, ~"/static/notes_link.txt"),
+                    ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
+                end},
+                {"policy=refuse still serves regular files", fun() ->
+                    Reply = http_get(Port, ~"/static/notes.txt"),
+                    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply)
+                end}
+            ]
+        end}.
+
+setup_with_policy(Name, Policy) ->
+    Dir = filename:join(
+        "/tmp",
+        "cactus_static_pol_" ++ atom_to_list(Policy) ++ "_" ++
+            integer_to_list(rand:uniform(1000000))
+    ),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    ok = file:write_file(filename:join(Dir, "notes.txt"), ~"plain"),
+    _ = file:make_symlink("notes.txt", filename:join(Dir, "notes_link.txt")),
+    OutsideDir = filename:join("/tmp", "cactus_outside_" ++ integer_to_list(rand:uniform(1000000))),
+    ok = filelib:ensure_dir(filename:join(OutsideDir, "x")),
+    ok = file:write_file(filename:join(OutsideDir, "escape.txt"), ~"escaped content"),
+    _ = file:make_symlink(
+        filename:join(OutsideDir, "escape.txt"),
+        filename:join(Dir, "escape_link.txt")
+    ),
+    {ok, _} = cactus_listener:start_link(Name, #{
+        port => 0,
+        routes => [
+            {~"/static/*path", cactus_static, #{
+                dir => Dir, symlink_policy => Policy
+            }}
+        ]
+    }),
+    {Name, Dir, cactus_listener:port(Name)}.
 
 %% --- helpers ---
 
@@ -324,12 +396,26 @@ setup() ->
     ok = file:write_file(filename:join(Dir, "blob.bin"), <<1, 2, 3, 4>>),
     ok = file:write_file(filename:join(Dir, "empty.txt"), <<>>),
     ok = file:write_file(filename:join(Dir, "notes.txt"), ~"hello via link"),
-    %% In-docroot symlink — pins the "we follow symlinks" default.
+    %% Safe in-docroot symlink (relative target, no `..`).
     _ = file:make_symlink("notes.txt", filename:join(Dir, "notes_link.txt")),
+    %% Hostile symlinks — the default policy must refuse both.
+    OutsideDir = filename:join(
+        "/tmp", "cactus_outside_" ++ integer_to_list(rand:uniform(1000000))
+    ),
+    ok = filelib:ensure_dir(filename:join(OutsideDir, "x")),
+    ok = file:write_file(filename:join(OutsideDir, "escape.txt"), ~"escaped"),
+    _ = file:make_symlink(
+        filename:join(OutsideDir, "escape.txt"),
+        filename:join(Dir, "escape_link.txt")
+    ),
+    _ = file:make_symlink(~"../etc/passwd", filename:join(Dir, "dotdot_link.txt")),
     %% Empty subdirectory — `filename:join` can resolve a path to it,
     %% but `file:read_file_info` reports `type = directory` so the
     %% handler returns 404 instead of trying to send it.
     ok = filelib:ensure_dir(filename:join([Dir, "subdir", "x"])),
+    %% In-docroot symlink whose target is a directory — passes the
+    %% symlink-escape gate but fails the regular-file check.
+    _ = file:make_symlink("subdir", filename:join(Dir, "subdir_link")),
     {ok, _} = cactus_listener:start_link(static_test, #{
         port => 0,
         routes => [{~"/static/*path", cactus_static, #{dir => Dir}}]
