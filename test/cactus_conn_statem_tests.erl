@@ -197,6 +197,142 @@ drain_pending_before_shoot_stops_at_first_parse_test() ->
     end,
     stop_sink(Sink).
 
+%% =============================================================================
+%% Phase 6a — `dispatching` runs the handler and writes a buffered
+%% response. Driven through a real listener (TCP) because the handler
+%% invocation chain is too coupled to socket semantics for the fake
+%% transport to mock cleanly. Telemetry assertions still attach to the
+%% gen_statem-emitted events.
+%% =============================================================================
+
+dispatching_buffered_handler_writes_200_test() ->
+    ensure_pg(),
+    Self = self(),
+    Sink = spawn_recv_sink_with_send_log(Self, [
+        {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}
+    ]),
+    {ok, Pid} = cactus_conn_statem:start(
+        {fake, Sink}, fake_proto_opts(dispatch_test)
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Self, 100)),
+    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Sent),
+    stop_sink(Sink).
+
+dispatching_router_not_found_writes_404_test() ->
+    ensure_pg(),
+    Self = self(),
+    Sink = spawn_recv_sink_with_send_log(Self, [
+        {recv, ~"GET /nope HTTP/1.1\r\nHost: x\r\n\r\n"}
+    ]),
+    %% Router with no matching route → 404.
+    Routes = [{~"/known", cactus_hello_handler, undefined}],
+    persistent_term:put(
+        {cactus_routes, dispatch_router_test}, cactus_router:compile(Routes)
+    ),
+    Opts = (fake_proto_opts(dispatch_router_test))#{
+        dispatch := {router, dispatch_router_test}
+    },
+    try
+        {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+        Ref = monitor(process, Pid),
+        Pid ! shoot,
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 2000 -> error(no_normal_exit)
+        end,
+        Sent = iolist_to_binary(collect_sends(Self, 100)),
+        ?assertMatch(<<"HTTP/1.1 404", _/binary>>, Sent)
+    after
+        persistent_term:erase({cactus_routes, dispatch_router_test}),
+        stop_sink(Sink)
+    end.
+
+dispatching_handler_crash_writes_500_and_emits_exception_test() ->
+    ensure_pg(),
+    {ok, _} = application:ensure_all_started(telemetry),
+    Self = self(),
+    HandlerId = make_ref(),
+    ok = telemetry:attach(
+        HandlerId,
+        [cactus, request, exception],
+        fun(Event, M, Md, _) -> Self ! {ev, Event, M, Md} end,
+        undefined
+    ),
+    try
+        Sink = spawn_recv_sink_with_send_log(Self, [
+            {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}
+        ]),
+        Opts = (fake_proto_opts(dispatch_crash_test))#{
+            dispatch := {handler, cactus_crashing_handler}
+        },
+        {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+        Ref = monitor(process, Pid),
+        Pid ! shoot,
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 2000 -> error(no_normal_exit)
+        end,
+        Sent = iolist_to_binary(collect_sends(Self, 100)),
+        ?assertMatch(<<"HTTP/1.1 500", _/binary>>, Sent),
+        receive
+            {ev, [cactus, request, exception], _, ExcMd} ->
+                ?assertEqual(error, maps:get(kind, ExcMd)),
+                ?assertEqual(boom, maps:get(reason, ExcMd))
+        after 1000 -> error(no_exception_event)
+        end,
+        stop_sink(Sink)
+    after
+        telemetry:detach(HandlerId)
+    end.
+
+dispatching_request_start_and_stop_telemetry_fires_test() ->
+    ensure_pg(),
+    {ok, _} = application:ensure_all_started(telemetry),
+    Self = self(),
+    HandlerId = make_ref(),
+    ok = telemetry:attach_many(
+        HandlerId,
+        [[cactus, request, start], [cactus, request, stop]],
+        fun(Event, M, Md, _) -> Self ! {ev, Event, M, Md} end,
+        undefined
+    ),
+    try
+        Sink = spawn_recv_sink_with_send_log(Self, [
+            {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}
+        ]),
+        {ok, Pid} = cactus_conn_statem:start(
+            {fake, Sink}, fake_proto_opts(dispatch_telemetry_test)
+        ),
+        Ref = monitor(process, Pid),
+        Pid ! shoot,
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 2000 -> error(no_normal_exit)
+        end,
+        receive
+            {ev, [cactus, request, start], _, StartMd} ->
+                ?assertEqual(~"GET", maps:get(method, StartMd)),
+                ?assertEqual(~"/", maps:get(path, StartMd))
+        after 1000 -> error(no_start)
+        end,
+        receive
+            {ev, [cactus, request, stop], StopM, StopMd} ->
+                ?assert(is_integer(maps:get(duration, StopM))),
+                ?assertEqual(200, maps:get(status, StopMd)),
+                ?assertEqual(buffered, maps:get(response_kind, StopMd))
+        after 1000 -> error(no_stop)
+        end,
+        stop_sink(Sink)
+    after
+        telemetry:detach(HandlerId)
+    end.
+
 listener_accept_and_conn_close_fire_around_statem_test() ->
     {ok, _} = application:ensure_all_started(telemetry),
     Self = self(),

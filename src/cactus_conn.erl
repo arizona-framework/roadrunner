@@ -40,9 +40,17 @@ read it anyway.
     maybe_send_continue/3,
     refine_conn_label/2,
     scheme/1,
+    make_body_state/4,
     send_request_timeout/1,
     send_bad_request/1,
-    send_payload_too_large/1
+    send_payload_too_large/1,
+    send_internal_error/1,
+    send_not_found/1,
+    resolve_handler/2,
+    route_middlewares/1,
+    response_status/1,
+    response_kind/1,
+    response_body_for/2
 ]).
 
 -export_type([proto_opts/0, dispatch/0, body_state/0]).
@@ -460,6 +468,7 @@ scheme({gen_tcp, _}) -> http;
 scheme({ssl, _}) -> https;
 scheme({fake, _}) -> http.
 
+-doc false.
 -spec resolve_handler(dispatch(), cactus_http1:request()) ->
     {ok, module(), cactus_router:bindings(), term()} | not_found.
 resolve_handler({handler, Mod}, _Req) ->
@@ -527,6 +536,24 @@ has_continue_expectation(Req) ->
         undefined -> false;
         Value -> string:lowercase(Value) =:= ~"100-continue"
     end.
+
+-doc false.
+-spec make_body_state(
+    none | chunked | {content_length, non_neg_integer()},
+    binary(),
+    fun(() -> {ok, binary()} | {error, term()}),
+    non_neg_integer()
+) -> body_state().
+make_body_state(Framing, Buffered, Recv, Max) ->
+    #{
+        framing => Framing,
+        buffered => Buffered,
+        bytes_read => 0,
+        pending => <<>>,
+        done => false,
+        recv => Recv,
+        max => Max
+    }.
 
 -doc false.
 -spec body_framing(cactus_http1:request()) ->
@@ -866,6 +893,7 @@ telemetry_metadata(Req) ->
 
 %% Order matters — `{websocket, _, _}` is a 3-tuple too, so the
 %% atom-tagged variants must precede the buffered catch-all.
+-doc false.
 -spec response_status(cactus_handler:response()) -> cactus_http1:status().
 response_status({stream, Status, _, _}) -> Status;
 response_status({loop, Status, _, _}) -> Status;
@@ -873,6 +901,7 @@ response_status({sendfile, Status, _, _}) -> Status;
 response_status({websocket, _, _}) -> 101;
 response_status({Status, _, _}) when is_integer(Status) -> Status.
 
+-doc false.
 -spec response_kind(cactus_handler:response()) ->
     buffered | stream | loop | sendfile | websocket.
 response_kind({stream, _, _, _}) -> stream;
@@ -881,6 +910,7 @@ response_kind({sendfile, _, _, _}) -> sendfile;
 response_kind({websocket, _, _}) -> websocket;
 response_kind({_, _, _}) -> buffered.
 
+-doc false.
 -spec route_middlewares(cactus_http1:request()) -> cactus_middleware:middleware_list().
 route_middlewares(Req) ->
     case cactus_req:route_opts(Req) of
@@ -964,6 +994,7 @@ finish_response(Req, Headers) ->
 %% RFC 9110 §9.3.2: a response to HEAD must not include a message body.
 %% Headers (including Content-Length) stay as the handler set them, so
 %% the framing matches what GET would have returned.
+-doc false.
 -spec response_body_for(cactus_http1:request(), iodata()) -> iodata().
 response_body_for(Req, Body) ->
     case cactus_req:method(Req) of
@@ -1021,6 +1052,7 @@ send_payload_too_large(Socket) ->
     ),
     cactus_transport:send(Socket, Resp).
 
+-doc false.
 -spec send_not_found(cactus_transport:socket()) -> ok | {error, term()}.
 send_not_found(Socket) ->
     Resp = cactus_http1:response(
@@ -1040,6 +1072,7 @@ send_request_timeout(Socket) ->
     ),
     cactus_transport:send(Socket, Resp).
 
+-doc false.
 -spec send_internal_error(cactus_transport:socket()) -> ok | {error, term()}.
 send_internal_error(Socket) ->
     Resp = cactus_http1:response(

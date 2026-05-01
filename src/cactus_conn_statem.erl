@@ -34,7 +34,7 @@ with the connection's duration and the keep-alive request count.
 
 -export([start/2]).
 -export([init/1, callback_mode/0, terminate/3]).
--export([awaiting_shoot/3, reading_request/3, reading_body/3]).
+-export([awaiting_shoot/3, reading_request/3, reading_body/3, dispatching/3]).
 
 -record(data, {
     socket :: cactus_transport:socket(),
@@ -161,12 +161,7 @@ reading_body(
         auto ->
             case cactus_conn:read_body(Req, Buffered, Recv, MaxCL) of
                 {ok, Body} ->
-                    %% Phase 5 stops at `dispatching` — Phase 6 actually
-                    %% calls the handler. For now we bump the served
-                    %% counter (so conn_close telemetry reports a real
-                    %% number) and exit normally.
-                    _Req2 = Req#{body => Body},
-                    {stop, normal, Data#data{requests_served = Data#data.requests_served + 1}};
+                    {next_state, dispatching, Data#data{req = Req#{body => Body}}};
                 {error, content_length_too_large} ->
                     _ = cactus_conn:send_payload_too_large(Socket),
                     {stop, normal, Data};
@@ -185,20 +180,107 @@ reading_body(
                     _ = cactus_conn:send_bad_request(Socket),
                     {stop, normal, Data};
                 Framing ->
-                    _BodyState = #{
-                        framing => Framing,
-                        buffered => Buffered,
-                        bytes_read => 0,
-                        pending => <<>>,
-                        done => false,
-                        recv => Recv,
-                        max => MaxCL
-                    },
-                    %% Phase 5 stop point — Phase 6 wires the handler
-                    %% dispatch with the body_state.
-                    {stop, normal, Data#data{requests_served = Data#data.requests_served + 1}}
+                    BodyState = cactus_conn:make_body_state(Framing, Buffered, Recv, MaxCL),
+                    {next_state, dispatching, Data#data{
+                        req = Req#{body_state => BodyState}
+                    }}
             end
     end.
+
+-spec dispatching(gen_statem:event_type(), term(), #data{}) ->
+    gen_statem:event_handler_result(atom()).
+dispatching(enter, _Old, _Data) ->
+    {keep_state_and_data, [{state_timeout, 0, dispatch}]};
+dispatching(
+    state_timeout,
+    dispatch,
+    #data{
+        socket = Socket,
+        proto_opts = ProtoOpts,
+        req = Req
+    } = Data
+) ->
+    Dispatch = maps:get(dispatch, ProtoOpts),
+    ListenerMws = maps:get(middlewares, ProtoOpts),
+    case cactus_conn:resolve_handler(Dispatch, Req) of
+        {ok, Handler, Bindings, RouteOpts} ->
+            FullReq = Req#{bindings => Bindings, route_opts => RouteOpts},
+            run_pipeline(Socket, Handler, FullReq, ListenerMws, Data);
+        not_found ->
+            _ = cactus_conn:send_not_found(Socket),
+            {stop, normal, Data}
+    end.
+
+%% Mirror `cactus_conn:handle_and_send/4` exactly: bracket the
+%% middleware/handler pipeline with `[cactus, request, start | stop |
+%% exception]` telemetry, dispatch the response, count the request as
+%% served, then stop. Phase 6b adds keep-alive loop-back via the
+%% `finishing` state.
+-spec run_pipeline(
+    cactus_transport:socket(),
+    module(),
+    cactus_http1:request(),
+    cactus_middleware:middleware_list(),
+    #data{}
+) -> gen_statem:event_handler_result(atom()).
+run_pipeline(Socket, Handler, Req, ListenerMws, #data{} = Data) ->
+    RouteMws = cactus_conn:route_middlewares(Req),
+    HandlerFun = fun(R) -> Handler:handle(R) end,
+    Pipeline = cactus_middleware:compose(ListenerMws ++ RouteMws, HandlerFun),
+    Metadata = telemetry_metadata(Req),
+    StartMono = cactus_telemetry:request_start(Metadata),
+    try Pipeline(Req) of
+        {Response, Req2} when is_map(Req2) ->
+            _ = dispatch_response(Socket, Handler, Req2, Response),
+            ok = cactus_telemetry:request_stop(StartMono, Metadata, #{
+                status => cactus_conn:response_status(Response),
+                response_kind => cactus_conn:response_kind(Response)
+            }),
+            %% Phase 6a always stops after one request — Phase 6b
+            %% adds keep-alive transitions.
+            {stop, normal, Data#data{requests_served = Data#data.requests_served + 1}}
+    catch
+        Class:Reason:Stack ->
+            ok = cactus_telemetry:request_exception(StartMono, Metadata, Class, Reason),
+            logger:error(#{
+                msg => "cactus handler crashed",
+                handler => Handler,
+                class => Class,
+                reason => Reason,
+                stacktrace => Stack
+            }),
+            _ = cactus_conn:send_internal_error(Socket),
+            {stop, normal, Data}
+    end.
+
+-spec telemetry_metadata(cactus_http1:request()) -> cactus_telemetry:metadata().
+telemetry_metadata(Req) ->
+    #{
+        request_id => maps:get(request_id, Req),
+        peer => maps:get(peer, Req),
+        method => maps:get(method, Req),
+        path => maps:get(target, Req),
+        scheme => maps:get(scheme, Req),
+        listener_name => maps:get(listener_name, Req, undefined)
+    }.
+
+%% Phase 6a only handles the buffered response shape. Phase 6b/7 add
+%% `stream | loop | sendfile | websocket` once integration tests
+%% (real listener, real socket) drive the full dispatch and provide
+%% natural coverage for those clauses.
+-spec dispatch_response(
+    cactus_transport:socket(),
+    module(),
+    cactus_http1:request(),
+    cactus_handler:response()
+) -> ok.
+dispatch_response(Socket, _Handler, Req, {Status, Headers, Body}) when is_integer(Status) ->
+    RespBody = cactus_conn:response_body_for(Req, Body),
+    Resp = cactus_http1:response(Status, Headers, RespBody),
+    _ = cactus_telemetry:response_send(
+        cactus_transport:send(Socket, Resp), buffered_response
+    ),
+    ok.
 
 -spec do_read_request(non_neg_integer(), #data{}) ->
     gen_statem:event_handler_result(atom()).
