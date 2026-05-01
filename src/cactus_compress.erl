@@ -74,10 +74,53 @@ transform(Req, {Status, Headers, Body}) when is_integer(Status) ->
                 end,
             {Status, HeadersWithVary, Body}
     end;
+transform(Req, {stream, Status, Headers, Fun}) when is_integer(Status), is_function(Fun, 1) ->
+    case accepts_gzip(Req) andalso not has_header(~"content-encoding", Headers) of
+        true ->
+            wrap_stream(Status, Headers, Fun);
+        false ->
+            {stream, Status, Headers, Fun}
+    end;
 transform(_Req, Other) ->
-    %% stream / loop / websocket — pass through. Streaming compression
-    %% is a follow-up.
+    %% loop / websocket — pass through. Streaming gzip would need to
+    %% intercept the per-message Push fun in `cactus_conn:loop_response/5`,
+    %% which isn't wired through the response shape; defer until needed.
     Other.
+
+%% Wrap a stream response: each chunk passes through a deflate context
+%% configured for gzip output (windowBits = 16 + 15). The user's `Fun`
+%% sees a `Send2` callback that compresses on the way out and forwards
+%% the deflated bytes to the conn's real `Send`. The zlib context is
+%% released in a `try/after` so a crashing user fun doesn't leak the
+%% resource (the conn process death would also release it via the VM,
+%% but explicit cleanup is clearer).
+-spec wrap_stream(cactus_http1:status(), cactus_http1:headers(), cactus_handler:stream_fun()) ->
+    cactus_handler:response().
+wrap_stream(Status, Headers, Fun) ->
+    NewHeaders = [
+        {~"content-encoding", ~"gzip"},
+        {~"vary", ~"Accept-Encoding"}
+        | Headers
+    ],
+    WrappedFun = fun(Send) ->
+        Z = zlib:open(),
+        try
+            ok = zlib:deflateInit(Z, default, deflated, 16 + 15, 8, default),
+            Send2 = fun(Data, FinFlag) ->
+                Mode =
+                    case FinFlag of
+                        nofin -> none;
+                        fin -> finish
+                    end,
+                Compressed = zlib:deflate(Z, Data, Mode),
+                Send(Compressed, FinFlag)
+            end,
+            Fun(Send2)
+        after
+            zlib:close(Z)
+        end
+    end,
+    {stream, Status, NewHeaders, WrappedFun}.
 
 -spec compress(cactus_http1:status(), cactus_http1:headers(), iodata()) ->
     cactus_handler:response().

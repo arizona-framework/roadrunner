@@ -92,12 +92,47 @@ does_not_duplicate_vary_when_handler_already_set_it_test() ->
     Varys = [V || {N, V} <- Headers, N =:= ~"vary"],
     ?assertEqual([~"Cookie"], Varys).
 
-passes_stream_response_through_test() ->
-    Req = req([{~"accept-encoding", ~"gzip"}]),
+stream_response_passes_through_when_client_does_not_accept_gzip_test() ->
+    Req = req([]),
     Fun = fun(_Send) -> ok end,
     Next = fun(R) -> {{stream, 200, [], Fun}, R} end,
-    {Response, _Req2} = cactus_compress:call(Req, Next),
-    ?assertMatch({stream, 200, _, Fun}, Response).
+    {{stream, 200, Headers, OutFun}, _Req2} = cactus_compress:call(Req, Next),
+    %% Same fun, no Content-Encoding added.
+    ?assertEqual(Fun, OutFun),
+    ?assertEqual(undefined, header(~"content-encoding", Headers)).
+
+stream_response_passes_through_when_already_encoded_test() ->
+    Req = req([{~"accept-encoding", ~"gzip"}]),
+    Fun = fun(_Send) -> ok end,
+    Headers0 = [{~"content-encoding", ~"gzip"}],
+    Next = fun(R) -> {{stream, 200, Headers0, Fun}, R} end,
+    {{stream, 200, Headers, OutFun}, _Req2} = cactus_compress:call(Req, Next),
+    %% Already-encoded response is passed through verbatim.
+    ?assertEqual(Fun, OutFun),
+    ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
+
+stream_response_wrapped_with_gzip_test() ->
+    %% When the client accepts gzip and the response isn't already
+    %% encoded, the Send callback is wrapped with a deflate context.
+    %% We capture what the wrapped Send writes "to the wire" (here a
+    %% bag-of-bytes accumulator) and gunzip-verify it round-trips.
+    Req = req([{~"accept-encoding", ~"gzip"}]),
+    Self = self(),
+    Fun = fun(Send) ->
+        ok = Send(~"hello ", nofin),
+        ok = Send(~"world", fin)
+    end,
+    Next = fun(R) -> {{stream, 200, [], Fun}, R} end,
+    {{stream, 200, Headers, WrappedFun}, _Req2} = cactus_compress:call(Req, Next),
+    ?assertEqual(~"gzip", header(~"content-encoding", Headers)),
+    ?assertEqual(~"Accept-Encoding", header(~"vary", Headers)),
+    Capture = fun(Data, _Flag) ->
+        Self ! {chunk, iolist_to_binary(Data)},
+        ok
+    end,
+    WrappedFun(Capture),
+    Compressed = collect_chunks(),
+    ?assertEqual(~"hello world", zlib:gunzip(Compressed)).
 
 passes_loop_response_through_test() ->
     Req = req([{~"accept-encoding", ~"gzip"}]),
@@ -173,4 +208,10 @@ recv_all(Sock, Acc) ->
     case gen_tcp:recv(Sock, 0, 1000) of
         {ok, Data} -> recv_all(Sock, <<Acc/binary, Data/binary>>);
         {error, _} -> Acc
+    end.
+
+collect_chunks() ->
+    receive
+        {chunk, Bytes} -> <<Bytes/binary, (collect_chunks())/binary>>
+    after 50 -> <<>>
     end.
