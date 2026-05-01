@@ -1130,109 +1130,26 @@ send_internal_error(Socket) ->
     ),
     cactus_transport:send(Socket, Resp).
 
-%% --- WebSocket upgrade + frame loop ---
+%% --- WebSocket upgrade ---
 
+%% Send the 101 handshake response, then hand the socket off to a
+%% per-session `cactus_ws_session` gen_statem. The session monitors
+%% itself; we (the conn) wait synchronously for it to terminate via
+%% the launcher's monitor so the parent's `[cactus, listener,
+%% conn_close]` telemetry still fires after the WS session ends.
 -spec upgrade_to_websocket(cactus_transport:socket(), cactus_http1:request(), module(), term()) ->
     ok | {error, term()}.
 upgrade_to_websocket(Socket, Req, Mod, State) ->
     case cactus_ws:handshake_response(cactus_req:headers(Req)) of
         {ok, Status, RespHeaders, _} ->
             Resp = cactus_http1:response(Status, RespHeaders, ~""),
-            %% If this send fails, the next recv inside ws_loop will return
-            %% {error, _} and the loop ends cleanly — no separate handling.
+            %% If this send fails, the session's first recv will return
+            %% {error, _} and the session ends cleanly — no separate
+            %% handling.
             _ = cactus_telemetry:response_send(
                 cactus_transport:send(Socket, Resp), websocket_upgrade_response
             ),
-            Ctx = ws_context(Req, Mod),
-            ok = cactus_telemetry:ws_upgrade(Ctx),
-            ws_loop(Socket, <<>>, Mod, State, Ctx);
+            cactus_ws_session:run(Socket, Req, Mod, State);
         {error, _} ->
             send_bad_request(Socket)
     end.
-
--spec ws_context(cactus_http1:request(), module()) -> map().
-ws_context(Req, Mod) ->
-    #{
-        listener_name => maps:get(listener_name, Req, undefined),
-        peer => maps:get(peer, Req, undefined),
-        request_id => maps:get(request_id, Req, undefined),
-        module => Mod
-    }.
-
--spec ws_loop(cactus_transport:socket(), binary(), module(), term(), map()) -> ok.
-ws_loop(Socket, Buffer, Mod, State, Ctx) ->
-    case cactus_ws:parse_frame(Buffer) of
-        {ok, Frame, NewBuffer} ->
-            ok = cactus_telemetry:ws_frame_in(
-                Ctx#{opcode => maps:get(opcode, Frame)},
-                payload_size(Frame)
-            ),
-            handle_ws_frame(Socket, NewBuffer, Mod, State, Ctx, Frame);
-        {more, _} ->
-            case cactus_transport:recv(Socket, 0, infinity) of
-                {ok, Data} ->
-                    ws_loop(Socket, <<Buffer/binary, Data/binary>>, Mod, State, Ctx);
-                {error, _} ->
-                    ok
-            end;
-        {error, _} ->
-            ok
-    end.
-
--spec payload_size(cactus_ws:frame()) -> non_neg_integer().
-payload_size(#{payload := P}) -> byte_size(P).
-
--spec handle_ws_frame(
-    cactus_transport:socket(), binary(), module(), term(), map(), cactus_ws:frame()
-) -> ok.
-handle_ws_frame(Socket, _Buffer, _Mod, _State, Ctx, #{opcode := close}) ->
-    ok = send_ws_frame(Socket, Ctx, close, ~""),
-    ok;
-handle_ws_frame(Socket, Buffer, Mod, State, Ctx, #{opcode := ping, payload := P}) ->
-    ok = send_ws_frame(Socket, Ctx, pong, P),
-    ws_loop(Socket, Buffer, Mod, State, Ctx);
-handle_ws_frame(Socket, Buffer, Mod, State, Ctx, #{opcode := pong}) ->
-    %% Server is not pinging clients yet — pong from client is just dropped.
-    ws_loop(Socket, Buffer, Mod, State, Ctx);
-handle_ws_frame(Socket, Buffer, Mod, State, Ctx, Frame) ->
-    case Mod:handle_frame(Frame, State) of
-        {reply, OutFrames, NewState} ->
-            _ = send_ws_frames(Socket, Ctx, OutFrames),
-            ws_loop(Socket, Buffer, Mod, NewState, Ctx);
-        {ok, NewState} ->
-            ws_loop(Socket, Buffer, Mod, NewState, Ctx);
-        {close, _NewState} ->
-            ok = send_ws_frame(Socket, Ctx, close, ~""),
-            ok
-    end.
-
-%% Single outbound frame — wraps `cactus_transport:send/2` with a
-%% `[cactus, ws, frame_out]` event so subscribers see every frame the
-%% conn writes (auto-pong, close, and unary handler replies).
--spec send_ws_frame(
-    cactus_transport:socket(), map(), cactus_ws:opcode(), iodata()
-) -> ok.
-send_ws_frame(Socket, Ctx, Opcode, Payload) ->
-    ok = cactus_telemetry:ws_frame_out(
-        Ctx#{opcode => Opcode}, iolist_size(Payload)
-    ),
-    _ = cactus_transport:send(Socket, cactus_ws:encode_frame(Opcode, Payload, true)),
-    ok.
-
--spec send_ws_frames(
-    cactus_transport:socket(), map(), [{cactus_ws:opcode(), iodata()}]
-) -> ok | {error, term()}.
-send_ws_frames(Socket, Ctx, OutFrames) ->
-    %% Emit telemetry per frame so subscribers can count by opcode,
-    %% then write the batched frames in a single TCP send to avoid
-    %% partial-write fragmentation.
-    lists:foreach(
-        fun({Op, Payload}) ->
-            ok = cactus_telemetry:ws_frame_out(
-                Ctx#{opcode => Op}, iolist_size(Payload)
-            )
-        end,
-        OutFrames
-    ),
-    Iodata = [cactus_ws:encode_frame(Op, Payload, true) || {Op, Payload} <- OutFrames],
-    cactus_transport:send(Socket, Iodata).
