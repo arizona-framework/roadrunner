@@ -414,6 +414,11 @@ handle_info(
                 released => N,
                 counter_was => Counter0,
                 pg_count_bounded => PgCountBounded
+            }),
+            ok = cactus_telemetry:slots_reconciled(#{
+                listener_name => Name,
+                released => N,
+                counter_was => Counter0
             })
     end,
     erlang:send_after(Interval, self(), reconcile_slots),

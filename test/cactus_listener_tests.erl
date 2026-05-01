@@ -95,31 +95,52 @@ listener_honors_num_acceptors_opt_test() ->
 slot_reconciliation_releases_sustained_orphan_slots_test() ->
     %% With reconciliation enabled, an orphaned slot (counter > pg
     %% members for two consecutive ticks) is reaped — simulates
-    %% `kill`-bypasses-`terminate` recovery.
+    %% `kill`-bypasses-`terminate` recovery. Also asserts the
+    %% `[cactus, listener, slots_reconciled]` telemetry event fires
+    %% with the released count.
     case whereis(pg) of
         undefined -> {ok, _} = pg:start_link();
         _ -> ok
     end,
-    Name = listener_test_reap,
-    {ok, ListenerPid} = cactus_listener:start_link(Name, #{
-        port => 0,
-        max_clients => 100,
-        slot_reconciliation => #{interval_ms => 30}
-    }),
-    %% Reach into state to grab the counter ref. {state, LSocket, Port,
-    %% ProtoOpts, Phase, Reconciliation} — relies on field order.
-    State = sys:get_state(ListenerPid),
-    ProtoOpts = element(4, State),
-    Counter = maps:get(client_counter, ProtoOpts),
-    ?assertEqual(0, atomics:get(Counter, 1)),
-    %% Plant 3 orphan slots — bumped without a corresponding pg join.
-    ok = atomics:add(Counter, 1, 3),
-    ?assertEqual(3, atomics:get(Counter, 1)),
-    %% First tick at 30ms records prev_diff=3; second tick at 60ms
-    %% reaps. Wait long enough to be safe across CI jitter.
-    timer:sleep(200),
-    ?assertEqual(0, atomics:get(Counter, 1)),
-    ok = cactus_listener:stop(Name).
+    {ok, _} = application:ensure_all_started(telemetry),
+    Self = self(),
+    HandlerId = make_ref(),
+    ok = telemetry:attach(
+        HandlerId,
+        [cactus, listener, slots_reconciled],
+        fun(Event, M, Md, _) -> Self ! {ev, Event, M, Md} end,
+        undefined
+    ),
+    try
+        Name = listener_test_reap,
+        {ok, ListenerPid} = cactus_listener:start_link(Name, #{
+            port => 0,
+            max_clients => 100,
+            slot_reconciliation => #{interval_ms => 30}
+        }),
+        %% Reach into state to grab the counter ref. {state, LSocket, Port,
+        %% ProtoOpts, Phase, Reconciliation} — relies on field order.
+        State = sys:get_state(ListenerPid),
+        ProtoOpts = element(4, State),
+        Counter = maps:get(client_counter, ProtoOpts),
+        ?assertEqual(0, atomics:get(Counter, 1)),
+        %% Plant 3 orphan slots — bumped without a corresponding pg join.
+        ok = atomics:add(Counter, 1, 3),
+        ?assertEqual(3, atomics:get(Counter, 1)),
+        %% First tick at 30ms records prev_diff=3; second tick at 60ms
+        %% reaps. Wait long enough to be safe across CI jitter.
+        timer:sleep(200),
+        ?assertEqual(0, atomics:get(Counter, 1)),
+        receive
+            {ev, [cactus, listener, slots_reconciled], _, Md} ->
+                ?assertEqual(Name, maps:get(listener_name, Md)),
+                ?assertEqual(3, maps:get(released, Md))
+        after 500 -> error(no_slots_reconciled_event)
+        end,
+        ok = cactus_listener:stop(Name)
+    after
+        telemetry:detach(HandlerId)
+    end.
 
 slot_reconciliation_only_reaps_excess_over_pg_members_test() ->
     %% Counter > pg members → only the diff is orphan; pg members

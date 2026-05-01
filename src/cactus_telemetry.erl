@@ -102,6 +102,7 @@ production or `telemetry_test:attach_event_handlers/2` in tests.
     response_send/2,
     listener_accept/1,
     listener_conn_close/2,
+    slots_reconciled/1,
     drain_acknowledged/1,
     ws_upgrade/1,
     ws_frame_in/2,
@@ -214,6 +215,22 @@ listener_conn_close(StartMono, Metadata) ->
     telemetry:execute(
         [cactus, listener, conn_close],
         #{duration => erlang:monotonic_time() - StartMono},
+        Metadata
+    ),
+    ok.
+
+-doc """
+Emit `[cactus, listener, slots_reconciled]` when the optional
+`slot_reconciliation` reaper releases orphan slots that the
+`kill`-bypasses-`terminate` path left behind. `Metadata` should
+include `listener_name`, `released` (count), and `counter_was`
+(value before reconciliation).
+""".
+-spec slots_reconciled(map()) -> ok.
+slots_reconciled(Metadata) ->
+    telemetry:execute(
+        [cactus, listener, slots_reconciled],
+        #{system_time => erlang:system_time()},
         Metadata
     ),
     ok.
