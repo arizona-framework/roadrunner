@@ -74,6 +74,35 @@ parse_value_with_equals_test() ->
         cactus_cookie:parse(~"sid=a=b=c")
     ).
 
+parse_trims_ows_around_equals_test() ->
+    %% Per RFC 6265 §5.2 the name and value are each trimmed of OWS
+    %% separately — whitespace surrounding the `=` separator should not
+    %% leak into either side. Regression: previously the parser only
+    %% trimmed the whole pair, leaving `~"a  "` as the name.
+    ?assertEqual(
+        [{~"a", ~"b"}],
+        cactus_cookie:parse(~"  a  =  b  ")
+    ).
+
+parse_internal_whitespace_in_value_preserved_test() ->
+    %% Internal whitespace inside the value (between non-OWS bytes) is
+    %% preserved — only outer LWS is trimmed.
+    ?assertEqual(
+        [{~"a", ~"b   c"}],
+        cactus_cookie:parse(~"a=b   c")
+    ).
+
+parse_high_bytes_test() ->
+    %% Non-ASCII bytes pass through (browsers shouldn't send them but
+    %% we don't reject — `parse/1` is documented as lenient).
+    ?assertEqual(
+        [{~"k", <<255, 254>>}],
+        cactus_cookie:parse(<<"k=", 255, 254>>)
+    ).
+
+parse_only_semicolons_test() ->
+    ?assertEqual([], cactus_cookie:parse(~";;;;")).
+
 %% =============================================================================
 %% serialize/3
 %% =============================================================================

@@ -16,7 +16,20 @@ Add a new property:
 -include_lib("common_test/include/ct.hrl").
 
 -export([suite/0, all/0, init_per_suite/1, end_per_suite/1]).
--export([percent_roundtrip/1, encode_output_is_unreserved_or_percent/1]).
+-export([
+    percent_roundtrip/1,
+    encode_output_is_unreserved_or_percent/1,
+    qs_parse_encode_roundtrip/1,
+    cookie_parse_never_crashes/1,
+    cookie_parse_returns_well_formed_pairs/1,
+    http1_parse_request_line_never_crashes/1,
+    http1_parse_header_never_crashes/1,
+    http1_parse_headers_never_crashes/1,
+    http1_parse_request_never_crashes/1,
+    http1_parse_chunk_never_crashes/1,
+    http1_parse_request_line_incremental/1,
+    http1_parse_request_incremental/1
+]).
 
 suite() ->
     [{timetrap, {seconds, 60}}].
@@ -24,7 +37,17 @@ suite() ->
 all() ->
     [
         percent_roundtrip,
-        encode_output_is_unreserved_or_percent
+        encode_output_is_unreserved_or_percent,
+        qs_parse_encode_roundtrip,
+        cookie_parse_never_crashes,
+        cookie_parse_returns_well_formed_pairs,
+        http1_parse_request_line_never_crashes,
+        http1_parse_header_never_crashes,
+        http1_parse_headers_never_crashes,
+        http1_parse_request_never_crashes,
+        http1_parse_chunk_never_crashes,
+        http1_parse_request_line_incremental,
+        http1_parse_request_incremental
     ].
 
 init_per_suite(Config) ->
@@ -42,5 +65,65 @@ percent_roundtrip(Config) ->
 encode_output_is_unreserved_or_percent(Config) ->
     ct_property_test:quickcheck(
         cactus_uri_props:prop_encode_output_is_unreserved_or_percent(),
+        Config
+    ).
+
+qs_parse_encode_roundtrip(Config) ->
+    ct_property_test:quickcheck(
+        cactus_qs_props:prop_parse_encode_roundtrip(),
+        Config
+    ).
+
+cookie_parse_never_crashes(Config) ->
+    ct_property_test:quickcheck(
+        cactus_cookie_props:prop_parse_never_crashes(),
+        Config
+    ).
+
+cookie_parse_returns_well_formed_pairs(Config) ->
+    ct_property_test:quickcheck(
+        cactus_cookie_props:prop_parse_returns_well_formed_pairs(),
+        Config
+    ).
+
+http1_parse_request_line_never_crashes(Config) ->
+    ct_property_test:quickcheck(
+        cactus_http1_props:prop_parse_request_line_never_crashes(),
+        Config
+    ).
+
+http1_parse_header_never_crashes(Config) ->
+    ct_property_test:quickcheck(
+        cactus_http1_props:prop_parse_header_never_crashes(),
+        Config
+    ).
+
+http1_parse_headers_never_crashes(Config) ->
+    ct_property_test:quickcheck(
+        cactus_http1_props:prop_parse_headers_never_crashes(),
+        Config
+    ).
+
+http1_parse_request_never_crashes(Config) ->
+    ct_property_test:quickcheck(
+        cactus_http1_props:prop_parse_request_never_crashes(),
+        Config
+    ).
+
+http1_parse_chunk_never_crashes(Config) ->
+    ct_property_test:quickcheck(
+        cactus_http1_props:prop_parse_chunk_never_crashes(),
+        Config
+    ).
+
+http1_parse_request_line_incremental(Config) ->
+    ct_property_test:quickcheck(
+        cactus_http1_props:prop_parse_request_line_incremental(),
+        Config
+    ).
+
+http1_parse_request_incremental(Config) ->
+    ct_property_test:quickcheck(
+        cactus_http1_props:prop_parse_request_incremental(),
         Config
     ).

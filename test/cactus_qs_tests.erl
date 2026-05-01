@@ -119,6 +119,65 @@ encode_literal_plus_test() ->
     %% Literal '+' must round-trip — encode it as %2B, not '+'.
     ?assertEqual(~"a=%2B", cactus_qs:encode([{~"a", ~"+"}])).
 
+%% =============================================================================
+%% Adversarial / edge cases — surfaced by reading the implementation and
+%% by stressing inputs the property generators don't easily reach.
+%% =============================================================================
+
+parse_just_equals_test() ->
+    %% A bare `=` is parsed as empty key + empty value — both `=` halves
+    %% are present (one before, one after).
+    ?assertEqual([{~"", ~""}], cactus_qs:parse(~"=")).
+
+parse_just_amp_test() ->
+    ?assertEqual([], cactus_qs:parse(~"&")).
+
+parse_amp_amp_amp_test() ->
+    ?assertEqual([], cactus_qs:parse(~"&&&")).
+
+parse_equals_value_test() ->
+    %% Empty key with explicit value — preserved.
+    ?assertEqual([{~"", ~"v"}], cactus_qs:parse(~"=v")).
+
+parse_lone_percent_passes_through_test() ->
+    ?assertEqual(
+        [{~"a", ~"%"}, {~"b", ~"%2"}],
+        cactus_qs:parse(~"a=%&b=%2")
+    ).
+
+parse_high_bytes_test() ->
+    %% Non-ASCII bytes pass through percent_decode unchanged.
+    ?assertEqual(
+        [{~"k", <<255, 254, 253>>}],
+        cactus_qs:parse(<<"k=", 255, 254, 253>>)
+    ).
+
+%% Documented lossy round-trip: an empty-key bare flag encodes to <<>>,
+%% which parses back to []. Asserts the asymmetry so refactors notice
+%% it.
+encode_empty_flag_is_dropped_on_roundtrip_test() ->
+    Encoded = cactus_qs:encode([{~"", true}]),
+    ?assertEqual(~"", Encoded),
+    ?assertEqual([], cactus_qs:parse(Encoded)).
+
+encode_separator_chars_in_key_test() ->
+    %% `&` and `=` in a key would break parsing if not encoded.
+    Encoded = cactus_qs:encode([{~"a&b=c", ~"x"}]),
+    ?assertEqual(~"a%26b%3Dc=x", Encoded),
+    ?assertEqual([{~"a&b=c", ~"x"}], cactus_qs:parse(Encoded)).
+
+encode_all_unreserved_chars_passthrough_test() ->
+    %% Every byte in the RFC 3986 unreserved set encodes to itself.
+    Unreserved = <<
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789-._~"
+    >>,
+    ?assertEqual(
+        <<"k=", Unreserved/binary>>,
+        cactus_qs:encode([{~"k", Unreserved}])
+    ).
+
 encode_parse_roundtrip_test_() ->
     Cases = [
         [],

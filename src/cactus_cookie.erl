@@ -39,9 +39,18 @@ parse(Bin) when is_binary(Bin) ->
 parse_pairs([]) ->
     [];
 parse_pairs([Pair | Rest]) ->
-    case binary:split(trim_ows(Pair), ~"=") of
-        [Name, Value] when Name =/= <<>> ->
-            [{Name, Value} | parse_pairs(Rest)];
+    %% RFC 6265 §5.2: trim name and value of leading/trailing OWS
+    %% **separately** — `<<"  a  =b">>` should yield Name = `<<"a">>`,
+    %% not `<<"a  ">>`. Trimming the whole pair first would miss the
+    %% spaces around `=`.
+    case binary:split(Pair, ~"=") of
+        [RawName, RawValue] ->
+            case trim_ows(RawName) of
+                <<>> ->
+                    parse_pairs(Rest);
+                Name ->
+                    [{Name, trim_ows(RawValue)} | parse_pairs(Rest)]
+            end;
         _ ->
             parse_pairs(Rest)
     end.
