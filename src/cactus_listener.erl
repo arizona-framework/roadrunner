@@ -99,8 +99,9 @@ info(Name) ->
 
 -spec init(opts()) -> {ok, #state{}} | {stop, term()}.
 init(#{port := Port} = Opts) ->
-    ProtoOpts = build_proto_opts(Opts),
-    proc_lib:set_label({cactus_listener, Port}),
+    ListenerName = listener_name(),
+    ProtoOpts = build_proto_opts(Opts, ListenerName),
+    proc_lib:set_label({cactus_listener, ListenerName, Port}),
     case open_listen_socket(Port, Opts) of
         {ok, LSocket} ->
             {ok, BoundPort} = cactus_transport:port(LSocket),
@@ -110,6 +111,14 @@ init(#{port := Port} = Opts) ->
         {error, Reason} ->
             {stop, {listen_failed, Reason}}
     end.
+
+%% Recover the registered name we were started with. `start_link/2` always
+%% calls `gen_server:start_link({local, Name}, ...)` so the name is set
+%% before `init/1` runs.
+-spec listener_name() -> atom().
+listener_name() ->
+    {registered_name, Name} = process_info(self(), registered_name),
+    Name.
 
 -spec open_listen_socket(inet:port_number(), opts()) ->
     {ok, cactus_transport:socket()} | {error, term()}.
@@ -135,14 +144,14 @@ base_listen_opts() ->
     ok.
 spawn_acceptors(LSocket, ProtoOpts, N) ->
     lists:foreach(
-        fun(_) ->
-            {ok, _Pid} = cactus_acceptor:start_link(LSocket, ProtoOpts)
+        fun(I) ->
+            {ok, _Pid} = cactus_acceptor:start_link(LSocket, ProtoOpts, I)
         end,
         lists:seq(1, N)
     ).
 
--spec build_proto_opts(opts()) -> cactus_conn:proto_opts().
-build_proto_opts(Opts) ->
+-spec build_proto_opts(opts(), atom()) -> cactus_conn:proto_opts().
+build_proto_opts(Opts, ListenerName) ->
     %% Per-listener atomics: live-connection counter (acceptors bump on
     %% accept; conns decrement on exit) and a cumulative requests-served
     %% counter (conn bumps on each handler dispatch). Lock-free, ~1ns
@@ -162,7 +171,8 @@ build_proto_opts(Opts) ->
         requests_counter => RequestsCounter,
         minimum_bytes_per_second =>
             maps:get(minimum_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
-        body_buffering => maps:get(body_buffering, Opts, auto)
+        body_buffering => maps:get(body_buffering, Opts, auto),
+        listener_name => ListenerName
     }.
 
 %% `routes` (router-based dispatch) takes precedence over `handler`. With

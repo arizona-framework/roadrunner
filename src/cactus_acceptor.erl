@@ -11,17 +11,22 @@ Connection workers are spawned **without** a link so that a crash
 in one connection does not bring down the acceptor.
 """.
 
--export([start_link/2]).
+-export([start_link/3]).
 
 -doc """
 Spawn-link an acceptor process bound to `LSocket` with the given
-`ProtoOpts` (handler + body limits). Each accepted socket is handed
-to a `cactus_conn` worker that consumes the same opts.
+`ProtoOpts` (handler + body limits) and a 1-based pool index. Each
+accepted socket is handed to a `cactus_conn` worker that consumes
+the same opts. The index is used in the `proc_lib` label so
+`observer` distinguishes `{cactus_acceptor, ListenerName, 1}`,
+`{..., 2}`, etc., per listener.
 """.
--spec start_link(cactus_transport:socket(), cactus_conn:proto_opts()) -> {ok, pid()}.
-start_link(LSocket, ProtoOpts) ->
+-spec start_link(cactus_transport:socket(), cactus_conn:proto_opts(), pos_integer()) ->
+    {ok, pid()}.
+start_link(LSocket, ProtoOpts, Index) ->
+    ListenerName = maps:get(listener_name, ProtoOpts, undefined),
     Pid = proc_lib:spawn_link(fun() ->
-        proc_lib:set_label(cactus_acceptor),
+        proc_lib:set_label({cactus_acceptor, ListenerName, Index}),
         loop(LSocket, ProtoOpts)
     end),
     {ok, Pid}.

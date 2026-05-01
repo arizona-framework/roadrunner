@@ -46,7 +46,8 @@ read it anyway.
     client_counter := atomics:atomics_ref(),
     requests_counter := atomics:atomics_ref(),
     minimum_bytes_per_second := non_neg_integer(),
-    body_buffering := auto | manual
+    body_buffering := auto | manual,
+    listener_name => atom()
 }.
 
 %% Opaque body-read state attached to the request in manual buffering
@@ -77,8 +78,12 @@ send the process the atom `shoot` to release it.
 """.
 -spec start(cactus_transport:socket(), proto_opts()) -> {ok, pid()}.
 start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
+    ListenerName = maps:get(listener_name, ProtoOpts, undefined),
     Pid = proc_lib:spawn(fun() ->
-        proc_lib:set_label(cactus_conn),
+        %% Initial label — `Peer` isn't available yet because the socket
+        %% transfer hasn't happened. `serve/2` refines once peername is
+        %% known so `observer` shows `{cactus_conn, ListenerName, Peer}`.
+        proc_lib:set_label({cactus_conn, ListenerName}),
         try
             receive
                 shoot -> serve(Socket, ProtoOpts)
@@ -118,9 +123,18 @@ release_slot(#{client_counter := Ref}) ->
 -spec serve(cactus_transport:socket(), proto_opts()) -> ok.
 serve(Socket, ProtoOpts) ->
     Peer = peer(Socket),
+    refine_conn_label(ProtoOpts, Peer),
     Scheme = scheme(Socket),
     serve_loop(Socket, Peer, Scheme, ProtoOpts, 0),
     _ = cactus_transport:close(Socket),
+    ok.
+
+-spec refine_conn_label(
+    proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
+) -> ok.
+refine_conn_label(ProtoOpts, Peer) ->
+    ListenerName = maps:get(listener_name, ProtoOpts, undefined),
+    proc_lib:set_label({cactus_conn, ListenerName, Peer}),
     ok.
 
 -spec serve_loop(
