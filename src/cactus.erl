@@ -9,7 +9,7 @@ cactus application must be running (typically via
 """.
 
 -export([start_listener/2, stop_listener/1, listeners/0]).
--export([acknowledge_drain/1]).
+-export([acknowledge_drain/1, acknowledge_drain/2]).
 
 -doc """
 Start a listener as a supervised child of the cactus application.
@@ -75,11 +75,31 @@ or `handle_frame/2` (websocket) when they pattern-match on
 `Req` is the request map the handler received. Returns `ok`. Calling
 this when no drain is in flight is harmless — subscribers see a stray
 event and ignore it — but the documented usage is post-drain-receipt.
+
+For SREs computing "how much grace did the handler use," see
+`acknowledge_drain/2` which threads the `Deadline` from the
+`{cactus_drain, Deadline}` message into the event metadata.
 """.
 -spec acknowledge_drain(cactus_http1:request()) -> ok.
 acknowledge_drain(Req) when is_map(Req) ->
-    cactus_telemetry:drain_acknowledged(#{
+    cactus_telemetry:drain_acknowledged(drain_metadata(Req, undefined)).
+
+-doc """
+Same as `acknowledge_drain/1` but threads the drain `Deadline`
+(in milliseconds, the second element of the `{cactus_drain, Deadline}`
+message a handler received) into the telemetry metadata so subscribers
+can compute `Deadline - erlang:monotonic_time(millisecond)` for the
+remaining grace period.
+""".
+-spec acknowledge_drain(cactus_http1:request(), integer()) -> ok.
+acknowledge_drain(Req, Deadline) when is_map(Req), is_integer(Deadline) ->
+    cactus_telemetry:drain_acknowledged(drain_metadata(Req, Deadline)).
+
+-spec drain_metadata(cactus_http1:request(), integer() | undefined) -> map().
+drain_metadata(Req, Deadline) ->
+    #{
         listener_name => maps:get(listener_name, Req, undefined),
         peer => maps:get(peer, Req, undefined),
-        request_id => maps:get(request_id, Req, undefined)
-    }).
+        request_id => maps:get(request_id, Req, undefined),
+        deadline => Deadline
+    }.

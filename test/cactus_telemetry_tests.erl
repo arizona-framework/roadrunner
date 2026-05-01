@@ -123,7 +123,35 @@ drain_acknowledged_event_fires_with_request_metadata_test() ->
                 ?assertMatch(#{system_time := _}, M),
                 ?assertEqual(probe_listener, maps:get(listener_name, Md)),
                 ?assertEqual({{127, 0, 0, 1}, 9999}, maps:get(peer, Md)),
-                ?assertEqual(~"abcd0123abcd0123", maps:get(request_id, Md))
+                ?assertEqual(~"abcd0123abcd0123", maps:get(request_id, Md)),
+                ?assertEqual(undefined, maps:get(deadline, Md))
+        after 1000 -> error(no_drain_acknowledged_event)
+        end
+    after
+        detach(HandlerId)
+    end.
+
+drain_acknowledged_with_deadline_threads_metadata_test() ->
+    %% `acknowledge_drain/2` threads the `Deadline` from the
+    %% `{cactus_drain, Deadline}` message into the event metadata so
+    %% subscribers can compute remaining grace.
+    {ok, _} = application:ensure_all_started(telemetry),
+    HandlerId = attach([[cactus, drain, acknowledged]]),
+    try
+        Req = #{
+            listener_name => probe_listener_d,
+            peer => {{127, 0, 0, 1}, 9999},
+            request_id => ~"deadline00000000",
+            method => ~"GET",
+            target => ~"/sse",
+            scheme => http,
+            headers => []
+        },
+        Deadline = erlang:monotonic_time(millisecond) + 5_000,
+        ok = cactus:acknowledge_drain(Req, Deadline),
+        receive
+            {telemetry_event, [cactus, drain, acknowledged], _, Md} ->
+                ?assertEqual(Deadline, maps:get(deadline, Md))
         after 1000 -> error(no_drain_acknowledged_event)
         end
     after
