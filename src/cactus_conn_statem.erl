@@ -1,33 +1,51 @@
 -module(cactus_conn_statem).
 -moduledoc """
-HTTP/1.1 connection state machine — work-in-progress replacement
-for the hand-rolled `cactus_conn` recursion.
+HTTP/1.1 connection state machine — the per-connection process
+spawned by `cactus_conn:start/2`. Replaces the hand-rolled
+`proc_lib` recursion that lived in `cactus_conn` before Phase 7 of
+the migration.
 
-This module is **not yet wired in**. `cactus_conn:start/2` continues
-to spawn the legacy `proc_lib`-based loop. Phase 4 of the migration
-plan stops here; later phases (5–7) extend the state callbacks and
-finally swap `start/2` to spawn this gen_statem instead.
+`callback_mode/0` is `[handle_event_function, state_enter]` — every
+event funnels through `handle_event/4`, which lets the
+`{cactus_drain, _}` info event match a single wildcard-state clause
+without duplicating the handler in every named state.
 
-The plan keeps `cactus_conn`'s public pure-function surface intact —
-`parse_loop/2`, `read_body/4`, `peer/1`, `try_acquire_slot/1`,
-`release_slot/1`, `consume_body_state/2` — so the 44 closure-driven
-unit tests keep passing through the migration. The state machine
-just calls those from inside its state callbacks once the later
-phases land.
+## States
 
-States (only `awaiting_shoot` is implemented in Phase 4):
 - `awaiting_shoot` — gates the lifecycle until the acceptor's
-  `shoot` info message arrives. `cactus_acceptor:handle_accepted/2`
+  `shoot` message arrives. `cactus_acceptor:handle_accepted/2`
   spawns this gen_statem, transfers controlling-process, then sends
-  `ConnPid ! shoot` (raw bang, not a gen_statem call) — we receive
-  it as an info event.
-- `reading_request | reading_body | dispatching | finishing |
-  draining` — placeholders, implemented in later phases.
+  `ConnPid ! shoot` (raw bang) — we receive it as an info event.
+- `reading_request` — drives `cactus_conn:parse_loop/2` against a
+  `cactus_conn:make_recv/3` closure. The drain peek
+  (`drain_peek/1`) checks the gen_statem mailbox for an info-queued
+  drain message before parsing because state_timeout fires before
+  info events under gen_statem's event priority.
+- `reading_body` — calls `cactus_conn:read_body/4` (auto mode) or
+  installs a `cactus_conn:make_body_state/4` body state (manual
+  mode), then transitions to `dispatching`.
+- `dispatching` — runs the middleware/handler pipeline, dispatches
+  the response (buffered / stream / loop / sendfile / websocket),
+  fires `[cactus, request, start | stop | exception]` telemetry,
+  bumps `requests_served`, transitions to `finishing`.
+- `finishing` — drains any unread manual-mode body and decides
+  keep-alive vs close. Buffered responses can loop back to
+  `reading_request` (capped by `max_keep_alive_request`); stream /
+  loop / sendfile / websocket all force close.
 
-Telemetry: `[cactus, listener, accept]` fires at `init/1` (so the
-event captures the wall-clock start of the conn's life); the
-matching `[cactus, listener, conn_close]` fires from `terminate/3`
-with the connection's duration and the keep-alive request count.
+## Telemetry contract
+
+- `[cactus, listener, accept]` — fired in the `shoot` handler once
+  the peer is known.
+- `[cactus, listener, conn_close]` — fired from `terminate/3`
+  paired with the accept's `StartMono`. Skipped when termination
+  happens before `shoot` (no matching accept event was emitted).
+- `[cactus, request, start | stop | exception]` — fired from the
+  dispatching pipeline.
+- `[cactus, response, send_failed]` — bubbles up via
+  `cactus_telemetry:response_send/2` from each socket write.
+- `[cactus, ws, upgrade | frame_in | frame_out]` — fired by
+  `cactus_ws_session` once dispatching delegates to it.
 """.
 
 -behaviour(gen_statem).
@@ -43,8 +61,8 @@ with the connection's duration and the keep-alive request count.
     %% Captured by the `shoot` handler (once peer is known) and paired
     %% with the `[cactus, listener, conn_close]` event in `terminate/3`.
     start_mono :: integer() | undefined,
-    %% Peer is unknown until after the socket transfer; populated on
-    %% entry to `reading_request` (Phase 5).
+    %% Peer is unknown until after the socket transfer; populated by
+    %% the `shoot` handler (which also fires the `accept` telemetry).
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
     scheme = http :: http | https,
     %% First request on a fresh conn vs subsequent keep-alive requests

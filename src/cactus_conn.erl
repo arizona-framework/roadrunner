@@ -1,20 +1,31 @@
 -module(cactus_conn).
 -moduledoc """
-HTTP/1.1 connection process — one per accepted TCP/TLS connection.
+Public connection-process API and pure helpers.
 
-Reads bytes off the transport, drives `cactus_http1:parse_request/1`
-incrementally, dispatches to the configured `cactus_handler` (either
-directly or via `cactus_router`), and writes the response back.
+`start/2` spawns the per-connection process (`cactus_conn_statem` —
+a `gen_statem` whose named states `awaiting_shoot |
+reading_request | reading_body | dispatching | finishing` make the
+request lifecycle visible to `sys:get_state/1`, `sys:trace/2`, and
+observer's process inspector). The other public functions are
+pure-ish helpers that the gen_statem composes into its state
+callbacks; many are also called directly from `cactus_req` (manual
+body buffering) and from `cactus_conn_tests.erl`'s closure-driven
+unit tests.
 
-Supports HTTP/1.1 keep-alive (capped by `max_keep_alive_request`,
-idle-bound by `keep_alive_timeout`), the four handler return shapes
+Per-connection behavior — keep-alive (capped by
+`max_keep_alive_request`, idle-bound by `keep_alive_timeout`),
+`Expect: 100-continue`, HEAD body suppression, anti-Slowloris rate
+check (`minimum_bytes_per_second`), the five handler return shapes
 (`{Status, Headers, Body}`, `{stream, ...}`, `{loop, ...}`,
-`{websocket, ...}`), `Expect: 100-continue`, HEAD body suppression,
-and a per-conn anti-Slowloris rate check (`minimum_bytes_per_second`).
+`{sendfile, ...}`, `{websocket, ...}`) — lives in
+`cactus_conn_statem` and the response-shape-specific modules
+(`cactus_stream_response`, `cactus_loop_response`,
+`cactus_ws_session`).
 
-Sends `400 Bad Request` on parse failure, `408` on first-request
-silence, `413` on oversized bodies, and `500` on handler crashes.
-Idle keep-alive timeouts and slow-client rate violations close the
+The 4xx/5xx error responses (400 on parse failure, 408 on
+first-request silence, 413 on oversized bodies, 500 on handler
+crashes) are emitted via the `send_*/1` helpers exported here. Idle
+keep-alive timeouts and slow-client rate violations close the
 connection silently — no response to a peer that wasn't going to
 read it anyway.
 """.
@@ -29,9 +40,12 @@ read it anyway.
     consume_body_state/2,
     join_drain_group/1
 ]).
-%% Internal helpers that `cactus_conn_statem` calls during its phased
-%% migration. Marked `-doc false` so they don't appear in the public
-%% API surface; Phase 8 absorbs them once the statem owns the spine.
+%% Internal helpers shared with `cactus_conn_statem`. Marked `-doc false`
+%% individually so they stay invisible to the public API surface but
+%% are still reachable across the module boundary. They live here
+%% (rather than inside the statem module) because the closure-driven
+%% unit tests in `cactus_conn_tests.erl` exercise the body-state
+%% machinery directly through these functions.
 -export([
     make_recv/3,
     body_framing/1,
