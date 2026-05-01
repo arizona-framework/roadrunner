@@ -456,18 +456,24 @@ fake_controlling_process_is_noop_test() ->
     ?assertEqual(ok, cactus_transport:controlling_process({fake, self()}, self())).
 
 %% End-to-end: drive cactus_conn with a fake socket and assert the
-%% wire response, no listener / acceptor / port involved.
+%% wire response, no listener / acceptor / port involved. Uses
+%% active-mode reads (`reading_request` calls
+%% `cactus_transport:setopts/2` and waits for `cactus_fake_data`).
 fake_conn_drives_handler_without_sockets_test() ->
     Self = self(),
     {ok, ConnPid} = cactus_conn:start({fake, Self}, fake_proto_opts(cactus_test_handler)),
     ConnPid ! shoot,
-    %% Conn enters its parse loop and asks for bytes.
+    %% Conn arms active-once on the fake socket. Deliver the request
+    %% bytes as a fake-data info event.
     receive
-        {cactus_fake_recv, ConnPid, _Len, _Timeout} ->
-            ConnPid ! {cactus_fake_recv_reply, {ok, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}}
-    after 1000 -> error(no_recv_request)
+        {cactus_fake_setopts, ConnPid, _Opts} ->
+            ConnPid ! {cactus_fake_data, Self, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}
+    after 1000 -> error(no_setopts_request)
     end,
-    %% Handler runs and conn writes the response.
+    %% Body read still uses passive recv (auto-buffering reading_body).
+    %% No body to read here → recv returns `{ok, <<>>}` immediately
+    %% via Content-Length=0 path… actually GET has no body framing,
+    %% so the conn doesn't issue a recv. Move straight to handler.
     Reply =
         receive
             {cactus_fake_send, ConnPid, Data} -> iolist_to_binary(Data)

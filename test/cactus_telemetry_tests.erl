@@ -164,6 +164,17 @@ drain_recv_sink(Tag, Logger, Script) ->
                     ConnPid ! {cactus_fake_recv_reply, {ok, Bytes}},
                     drain_recv_sink(Tag, Logger, Rest)
             end;
+        {cactus_fake_setopts, ConnPid, _Opts} ->
+            %% Active-mode arming — deliver the next script item via
+            %% `cactus_fake_data` (or close on empty script).
+            case Script of
+                [] ->
+                    ConnPid ! {cactus_fake_closed, self()},
+                    drain_recv_sink(Tag, Logger, []);
+                [{recv, Bytes} | Rest] ->
+                    ConnPid ! {cactus_fake_data, self(), Bytes},
+                    drain_recv_sink(Tag, Logger, Rest)
+            end;
         {cactus_fake_send, _, Data} ->
             Logger ! {sent, Tag, Data},
             drain_recv_sink(Tag, Logger, Script);

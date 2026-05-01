@@ -191,6 +191,59 @@ reading_body_manual_mode_installs_body_state_test() ->
     end,
     stop_sink(Sink).
 
+reading_request_rate_check_fires_and_reschedules_test() ->
+    %% Configure a fast rate-check interval so the timer fires before
+    %% the request_timeout state_timeout, with `MinRate = 0` so the
+    %% check passes and re-schedules. Exercises both the
+    %% grace-period branch (first fire, Elapsed <= interval) and the
+    %% post-grace re-schedule branch.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    %% Empty script — sink doesn't deliver anything; conn waits.
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, []),
+    Opts = (fake_proto_opts(rate_check_test))#{
+        request_timeout := 1000,
+        rate_check_interval_ms => 30
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    %% Wait long enough for several rate-check fires (each 30ms) plus
+    %% the eventual request_timeout closure at 1000ms.
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
+    end,
+    stop_sink(Sink).
+
+reading_request_slow_rate_violates_minrate_test() ->
+    %% Fire the rate-check timer past the 1-second grace window with
+    %% zero bytes received and `minimum_bytes_per_second = 100`. The
+    %% running average (0 bytes / >1s) violates the minimum → silent
+    %% close, no 4xx on the wire.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, []),
+    Opts = (fake_proto_opts(rate_check_violation))#{
+        request_timeout := 5000,
+        rate_check_interval_ms => 20,
+        minimum_bytes_per_second := 100
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    %% After 1000ms grace + a 20ms tick, rate_ok = false → stop.
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    %% Silent close — no 4xx written.
+    ?assertEqual(<<>>, Sent),
+    stop_sink(Sink).
+
 drain_pending_before_shoot_stops_at_first_parse_test() ->
     ensure_pg(),
     Sink = spawn_recv_sink([]),
@@ -957,17 +1010,19 @@ recv_sink_loop(Script, Logger, Tag) ->
         stop ->
             ok;
         {cactus_fake_recv, ConnPid, _Len, _Timeout} ->
-            case Script of
-                [] ->
-                    ConnPid ! {cactus_fake_recv_reply, {error, closed}},
-                    recv_sink_loop([], Logger, Tag);
-                [{recv, {error, _} = Err} | Rest] ->
-                    ConnPid ! {cactus_fake_recv_reply, Err},
-                    recv_sink_loop(Rest, Logger, Tag);
-                [{recv, Bytes} | Rest] ->
-                    ConnPid ! {cactus_fake_recv_reply, {ok, Bytes}},
-                    recv_sink_loop(Rest, Logger, Tag)
-            end;
+            %% Legacy passive recv — used by `reading_body` (auto +
+            %% manual modes) and `cactus_conn:read_body/4`.
+            dispatch_passive(ConnPid, Script, Logger, Tag);
+        {cactus_fake_setopts, ConnPid, _Opts} ->
+            %% Active-once arming — used by `reading_request` after
+            %% the active-mode refactor. Map the script's `{recv,
+            %% Bytes}` to `cactus_fake_data`, `{recv, {error,
+            %% closed}}` to `cactus_fake_closed`, and skip
+            %% `{recv, {error, timeout | slow_client}}` items
+            %% (they're "kernel never delivered bytes" / "rate
+            %% violation" — the conn's state_timeout / rate-check
+            %% timer fires instead).
+            dispatch_active(ConnPid, Script, Logger, Tag);
         {cactus_fake_send, _Pid, Data} ->
             case Logger of
                 undefined -> ok;
@@ -977,6 +1032,44 @@ recv_sink_loop(Script, Logger, Tag) ->
         _ ->
             recv_sink_loop(Script, Logger, Tag)
     end.
+
+dispatch_passive(ConnPid, [], Logger, Tag) ->
+    ConnPid ! {cactus_fake_recv_reply, {error, closed}},
+    recv_sink_loop([], Logger, Tag);
+dispatch_passive(ConnPid, [{recv, {error, _} = Err} | Rest], Logger, Tag) ->
+    ConnPid ! {cactus_fake_recv_reply, Err},
+    recv_sink_loop(Rest, Logger, Tag);
+dispatch_passive(ConnPid, [{recv, Bytes} | Rest], Logger, Tag) ->
+    ConnPid ! {cactus_fake_recv_reply, {ok, Bytes}},
+    recv_sink_loop(Rest, Logger, Tag).
+
+dispatch_active(_ConnPid, [], Logger, Tag) ->
+    %% Empty script — leave conn armed; let its state_timeout fire if
+    %% there is one, or sit idle (test will eventually stop the conn).
+    recv_sink_loop([], Logger, Tag);
+dispatch_active(ConnPid, [{recv, {error, closed}} | Rest], Logger, Tag) ->
+    ConnPid ! {cactus_fake_closed, self()},
+    recv_sink_loop(Rest, Logger, Tag);
+dispatch_active(_ConnPid, [{recv, {error, timeout}} | Rest], Logger, Tag) ->
+    %% Active-mode equivalent of "kernel never delivers bytes" — drop
+    %% the script item so the next `cactus_fake_setopts` consumes the
+    %% next item instead. The conn's request_deadline state_timeout
+    %% will fire on its own.
+    recv_sink_loop(Rest, Logger, Tag);
+dispatch_active(ConnPid, [{recv, {error, slow_client}} | Rest], Logger, Tag) ->
+    %% In passive mode `slow_client` was the recv closure's rate-
+    %% violation signal. In active mode the rate check is a separate
+    %% timer; for test scoping, deliver the equivalent as a transport
+    %% error. Either path closes the conn silently — the observable
+    %% behavior matches.
+    ConnPid ! {cactus_fake_error, self(), slow_client},
+    recv_sink_loop(Rest, Logger, Tag);
+dispatch_active(ConnPid, [{recv, {error, Reason}} | Rest], Logger, Tag) ->
+    ConnPid ! {cactus_fake_error, self(), Reason},
+    recv_sink_loop(Rest, Logger, Tag);
+dispatch_active(ConnPid, [{recv, Bytes} | Rest], Logger, Tag) ->
+    ConnPid ! {cactus_fake_data, self(), Bytes},
+    recv_sink_loop(Rest, Logger, Tag).
 
 count_200(Bin) ->
     case re:run(Bin, ~"HTTP/1.1 200", [global]) of

@@ -16,14 +16,22 @@ without duplicating the handler in every named state.
   `shoot` message arrives. `cactus_acceptor:handle_accepted/2`
   spawns this gen_statem, transfers controlling-process, then sends
   `ConnPid ! shoot` (raw bang) — we receive it as an info event.
-- `reading_request` — drives `cactus_conn:parse_loop/2` against a
-  `cactus_conn:make_recv/3` closure. The drain peek
-  (`drain_peek/1`) checks the gen_statem mailbox for an info-queued
-  drain message before parsing because state_timeout fires before
-  info events under gen_statem's event priority.
+- `reading_request` — runs in **active-once** mode
+  (`cactus_transport:setopts(_, [{active, once}])`). Inbound bytes
+  arrive as `info` events; the gen_statem returns to its main loop
+  between events, which lets `{hibernate_after, _}` actually fire
+  during keep-alive idle waits between pipelined requests. The
+  request-timeout deadline is enforced via `state_timeout` and
+  the anti-Slowloris rate check via `{generic_timeout,
+  rate_check}`. Drain messages arriving in this state stop the
+  conn immediately (no need to finish parsing a request that won't
+  be served).
 - `reading_body` — calls `cactus_conn:read_body/4` (auto mode) or
   installs a `cactus_conn:make_body_state/4` body state (manual
-  mode), then transitions to `dispatching`.
+  mode), then transitions to `dispatching`. Body reads still use
+  the synchronous `cactus_conn:make_recv/3` closure; the deadline
+  passed to it is the same `read_deadline` set in `reading_request`
+  so the request-timeout covers both phases.
 - `dispatching` — runs the middleware/handler pipeline, dispatches
   the response (buffered / stream / loop / sendfile / websocket),
   fires `[cactus, request, start | stop | exception]` telemetry,
@@ -75,6 +83,15 @@ without duplicating the handler in every named state.
     req :: cactus_http1:request() | undefined,
     buffered = <<>> :: binary(),
     recv :: fun(() -> {ok, binary()} | {error, term()}) | undefined,
+    %% `reading_request` runs in active-mode (`setopts({active, once})`)
+    %% so the gen_statem returns to its main loop between events and
+    %% `{hibernate_after, _}` can fire during keep-alive idle waits.
+    %% These three fields track the request-timeout deadline + the
+    %% rate-check accumulator that used to live inside the synchronous
+    %% recv closure.
+    read_deadline :: integer() | undefined,
+    read_start_mono :: integer() | undefined,
+    read_bytes_total = 0 :: non_neg_integer(),
     %% Set by `dispatching`'s pipeline once the handler returns;
     %% consumed by `finishing` for the keep-alive / close decision.
     response :: cactus_handler:response() | undefined,
@@ -128,10 +145,15 @@ init({Socket, ProtoOpts}) ->
 -spec handle_event(gen_statem:event_type(), term(), atom(), #data{}) ->
     gen_statem:event_handler_result(atom()).
 
-%% Drain message handled identically in every state — flag is checked
-%% by `reading_request` before reading the next request. Using a
-%% wildcard state pattern avoids duplicating the clause across each
-%% specific state.
+%% Drain message handling.
+%%
+%% In `reading_request` we're idle waiting for the next request bytes
+%% — there's no in-flight work to preserve, so stop immediately when
+%% drain arrives. In every other state we stash the flag; the next
+%% reading_request iteration's state_enter sees it and stops there
+%% (after the current request finishes).
+handle_event(info, {cactus_drain, _Deadline}, reading_request, Data) ->
+    {stop, normal, Data};
 handle_event(info, {cactus_drain, _Deadline}, _State, Data) ->
     {keep_state, Data#data{drain_received = true}};
 %% --- awaiting_shoot ---
@@ -157,31 +179,73 @@ handle_event(
     {next_state, reading_request, Data#data{
         peer = Peer, scheme = Scheme, start_mono = StartMono
     }};
-%% --- reading_request ---
-handle_event(enter, _Old, reading_request, _Data) ->
-    %% `state_timeout` is the only action a `state_enter` callback can
-    %% use to schedule an internal-style follow-up. Zero delay fires
-    %% the parse immediately on the next event-loop turn.
-    {keep_state_and_data, [{state_timeout, 0, parse}]};
+%% --- reading_request (active-mode) ---
+handle_event(enter, _Old, reading_request, #data{drain_received = true} = Data) ->
+    %% Drain stashed during dispatching/finishing — bail before
+    %% serving another request.
+    {stop, normal, Data};
+handle_event(
+    enter,
+    _Old,
+    reading_request,
+    #data{
+        socket = Socket,
+        phase = Phase,
+        proto_opts = ProtoOpts
+    } = Data0
+) ->
+    %% Buffered is always `<<>>` on entry — `awaiting_shoot` and
+    %% `finishing` both transition with an empty buffer (the keep-
+    %% alive loop-back resets it). Bytes accumulate during the
+    %% active-mode read loop.
+    Timeout = request_timeout(Phase, ProtoOpts),
+    Now = erlang:monotonic_time(millisecond),
+    Data = Data0#data{
+        read_deadline = Now + Timeout,
+        read_start_mono = Now,
+        read_bytes_total = 0
+    },
+    ok = cactus_transport:setopts(Socket, [{active, once}]),
+    {keep_state, Data, reading_request_timeouts(Timeout, ProtoOpts)};
 handle_event(
     state_timeout,
-    parse,
+    request_deadline,
     reading_request,
-    #data{phase = Phase, proto_opts = ProtoOpts} = Data0
+    #data{
+        socket = Socket, phase = Phase
+    } = Data
 ) ->
-    %% Drain peek: a `{cactus_drain, _}` info event that arrived after
-    %% `state_enter` set the parse timeout would otherwise be queued
-    %% behind the state_timeout (which fires first under gen_statem's
-    %% event priority). Mirror the legacy spine's `drain_pending/0`
-    %% receive-with-after-0 by peeking the gen_statem process mailbox
-    %% directly here.
-    Data = drain_peek(Data0),
-    case Data#data.drain_received of
+    _ = maybe_send_request_timeout(Socket, Phase),
+    {stop, normal, Data};
+handle_event(
+    {timeout, rate_check},
+    rate_check,
+    reading_request,
+    #data{proto_opts = ProtoOpts} = Data
+) ->
+    MinRate = maps:get(minimum_bytes_per_second, ProtoOpts),
+    Elapsed = erlang:monotonic_time(millisecond) - Data#data.read_start_mono,
+    Interval = rate_check_interval(ProtoOpts),
+    case rate_ok(Elapsed, Data#data.read_bytes_total, MinRate) of
         true ->
-            {stop, normal, Data};
+            {keep_state, Data, [{{timeout, rate_check}, Interval, rate_check}]};
         false ->
-            Timeout = request_timeout(Phase, ProtoOpts),
-            do_read_request(Timeout, Data)
+            %% Slow client — silent close, no 4xx (peer wasn't reading
+            %% reliably anyway).
+            {stop, normal, Data}
+    end;
+handle_event(info, Msg, reading_request, #data{socket = Socket} = Data) ->
+    {DataTag, ClosedTag, ErrorTag} = cactus_transport:messages(Socket),
+    case Msg of
+        {DataTag, _Sock, Bytes} ->
+            handle_request_bytes(Bytes, Data);
+        {ClosedTag, _Sock} ->
+            {stop, normal, Data};
+        {ErrorTag, _Sock, _Reason} ->
+            {stop, normal, Data};
+        _Other ->
+            ok = cactus_transport:setopts(Socket, [{active, once}]),
+            {keep_state, Data}
     end;
 %% --- reading_body ---
 handle_event(enter, _Old, reading_body, _Data) ->
@@ -383,36 +447,92 @@ buffered_finish(Data, ProtoOpts, Req, {_Status, Headers, _Body}, Served) ->
 request_timeout(first, ProtoOpts) -> maps:get(request_timeout, ProtoOpts);
 request_timeout(keep_alive, ProtoOpts) -> maps:get(keep_alive_timeout, ProtoOpts).
 
-%% Non-blocking peek for a `{cactus_drain, _}` broadcast that may have
-%% landed in the gen_statem mailbox after state_enter set the parse
-%% timeout.
-%%
-%% **Why a raw receive instead of letting gen_statem dispatch?**
-%% Per OTP's gen_statem event-priority rules (see
-%% [the gen_statem User's Guide on event types](https://www.erlang.org/doc/system/statem.html#event-types)),
-%% `state_timeout` events take precedence over `info` events. So even
-%% if a `{cactus_drain, _}` info message is already in the mailbox
-%% when state_enter sets `{state_timeout, 0, parse}`, gen_statem
-%% will fire the parse timeout FIRST and only deliver the drain
-%% afterward — by which point the next request's parse has already
-%% begun. Tried alternatives: `postpone` (delays handling, not
-%% priority); `{generic_timeout, _, _}` (same priority class as
-%% state_timeout); reordering state_enter (can't, state_enter
-%% rejects `next_event`).
-%%
-%% The peek bypasses gen_statem's queue once per reading_request
-%% iteration to consume any pending drain message. The rest of the
-%% time drain_received is already true (caught by the first clause)
-%% or the mailbox has no drain (after-0 path). If a future OTP
-%% release adds a `peek_mailbox`-style primitive, revisit.
--spec drain_peek(#data{}) -> #data{}.
-drain_peek(#data{drain_received = true} = Data) ->
-    Data;
-drain_peek(Data) ->
-    receive
-        {cactus_drain, _Deadline} -> Data#data{drain_received = true}
-    after 0 ->
-        Data
+%% State timeouts that bound the request-line/header read phase. The
+%% `state_timeout` enforces the absolute deadline; the
+%% `{timeout, rate_check}` (a `{generic_timeout, _, _}`) checks the
+%% running rate so a peer that's connected but not sending bytes
+%% fast enough gets dropped silently before the full request_timeout
+%% elapses. The interval defaults to 1000ms in production but is
+%% read from `proto_opts` so tests can fire the rate check in
+%% sub-second time without slowing the suite.
+-spec reading_request_timeouts(non_neg_integer(), cactus_conn:proto_opts()) ->
+    [gen_statem:enter_action()].
+reading_request_timeouts(Timeout, ProtoOpts) ->
+    Interval = rate_check_interval(ProtoOpts),
+    [
+        {state_timeout, Timeout, request_deadline},
+        {{timeout, rate_check}, Interval, rate_check}
+    ].
+
+-spec rate_check_interval(cactus_conn:proto_opts()) -> pos_integer().
+rate_check_interval(ProtoOpts) ->
+    maps:get(rate_check_interval_ms, ProtoOpts, 1000).
+
+%% Anti-Slowloris rate check — same shape as the closure-era
+%% `cactus_conn:rate_ok/3`. After a 1-second grace, require the
+%% running average to meet `MinRate` bytes/sec.
+-spec rate_ok(integer(), non_neg_integer(), non_neg_integer()) -> boolean().
+rate_ok(ElapsedMs, _Total, _MinRate) when ElapsedMs =< 1000 -> true;
+rate_ok(ElapsedMs, Total, MinRate) -> Total * 1000 >= MinRate * ElapsedMs.
+
+-spec handle_request_bytes(binary(), #data{}) ->
+    gen_statem:event_handler_result(atom()).
+handle_request_bytes(Bytes, #data{buffered = Buf} = Data0) ->
+    Data = Data0#data{
+        buffered = <<Buf/binary, Bytes/binary>>,
+        read_bytes_total = Data0#data.read_bytes_total + byte_size(Bytes)
+    },
+    parse_buffered_request(Data).
+
+-spec parse_buffered_request(#data{}) ->
+    gen_statem:event_handler_result(atom()).
+parse_buffered_request(
+    #data{
+        socket = Socket,
+        proto_opts = ProtoOpts,
+        listener_name = ListenerName,
+        peer = Peer,
+        scheme = Scheme,
+        buffered = Buf,
+        read_deadline = Deadline
+    } = Data
+) ->
+    case cactus_http1:parse_request(Buf) of
+        {ok, Req0, Rest} ->
+            ReqCounter = maps:get(requests_counter, ProtoOpts),
+            _ = atomics:add(ReqCounter, 1, 1),
+            RequestId = cactus_conn:generate_request_id(),
+            Req = Req0#{
+                peer => Peer,
+                scheme => Scheme,
+                request_id => RequestId,
+                listener_name => ListenerName
+            },
+            ok = cactus_conn:set_request_logger_metadata(Req),
+            ok = cactus_conn:maybe_send_continue(Socket, Req, Rest),
+            %% Body read still uses the synchronous recv closure. The
+            %% deadline is the same one set at reading_request entry so
+            %% the request_timeout covers the whole request.
+            MinRate = maps:get(minimum_bytes_per_second, ProtoOpts),
+            Recv = cactus_conn:make_recv(Socket, Deadline, MinRate),
+            {next_state, reading_body, Data#data{
+                req = Req, buffered = Rest, recv = Recv
+            }};
+        {more, _} ->
+            ok = cactus_transport:setopts(Socket, [{active, once}]),
+            {keep_state, Data};
+        {error, Reason} ->
+            logger:debug(#{
+                msg => "cactus rejecting malformed request",
+                peer => Peer,
+                listener_name => ListenerName,
+                reason => Reason
+            }),
+            ok = cactus_telemetry:request_rejected(
+                rejection_metadata(Data, Reason)
+            ),
+            _ = cactus_conn:send_bad_request(Socket),
+            {stop, normal, Data}
     end.
 
 %% Mirrors `cactus_conn:maybe_send_request_timeout/2` — only the very
@@ -484,59 +604,6 @@ dispatch_response(Socket, _Handler, Req, {Status, Headers, Body}) when is_intege
 -spec rejection_metadata(#data{}, atom()) -> map().
 rejection_metadata(#data{listener_name = ListenerName, peer = Peer}, Reason) ->
     #{listener_name => ListenerName, peer => Peer, reason => Reason}.
-
--spec do_read_request(non_neg_integer(), #data{}) ->
-    gen_statem:event_handler_result(atom()).
-do_read_request(
-    Timeout,
-    #data{
-        socket = Socket,
-        proto_opts = ProtoOpts,
-        listener_name = ListenerName,
-        peer = Peer,
-        scheme = Scheme,
-        phase = Phase
-    } = Data
-) ->
-    Deadline = erlang:monotonic_time(millisecond) + Timeout,
-    MinRate = maps:get(minimum_bytes_per_second, ProtoOpts),
-    Recv = cactus_conn:make_recv(Socket, Deadline, MinRate),
-    case cactus_conn:parse_loop(<<>>, Recv) of
-        {ok, Req0, Buffered} ->
-            ReqCounter = maps:get(requests_counter, ProtoOpts),
-            _ = atomics:add(ReqCounter, 1, 1),
-            RequestId = cactus_conn:generate_request_id(),
-            Req = Req0#{
-                peer => Peer,
-                scheme => Scheme,
-                request_id => RequestId,
-                listener_name => ListenerName
-            },
-            ok = cactus_conn:set_request_logger_metadata(Req),
-            ok = cactus_conn:maybe_send_continue(Socket, Req, Buffered),
-            {next_state, reading_body, Data#data{
-                req = Req, buffered = Buffered, recv = Recv
-            }};
-        {error, request_timeout} ->
-            _ = maybe_send_request_timeout(Socket, Phase),
-            {stop, normal, Data};
-        {error, slow_client} ->
-            {stop, normal, Data};
-        {error, Reason} ->
-            logger:debug(#{
-                msg => "cactus rejecting malformed request",
-                peer => Peer,
-                listener_name => ListenerName,
-                reason => Reason
-            }),
-            ok = cactus_telemetry:request_rejected(#{
-                listener_name => ListenerName,
-                peer => Peer,
-                reason => Reason
-            }),
-            _ = cactus_conn:send_bad_request(Socket),
-            {stop, normal, Data}
-    end.
 
 %% --- Termination ---
 

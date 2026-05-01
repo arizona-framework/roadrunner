@@ -318,6 +318,27 @@ recv_sink_loop(Script) ->
                     ConnPid ! {cactus_fake_recv_reply, {ok, Bytes}},
                     recv_sink_loop(Rest)
             end;
+        {cactus_fake_setopts, ConnPid, _Opts} ->
+            %% Active-mode arming. `{recv, {error, timeout|slow_client}}`
+            %% items map to "no delivery" (let the conn's own
+            %% timeouts fire). Other errors become transport errors.
+            case Script of
+                [] ->
+                    recv_sink_loop([]);
+                [{recv, {error, closed}} | Rest] ->
+                    ConnPid ! {cactus_fake_closed, self()},
+                    recv_sink_loop(Rest);
+                [{recv, {error, timeout}} | Rest] ->
+                    recv_sink_loop(Rest);
+                [{recv, {error, slow_client}} | Rest] ->
+                    recv_sink_loop(Rest);
+                [{recv, {error, Reason}} | Rest] ->
+                    ConnPid ! {cactus_fake_error, self(), Reason},
+                    recv_sink_loop(Rest);
+                [{recv, Bytes} | Rest] ->
+                    ConnPid ! {cactus_fake_data, self(), Bytes},
+                    recv_sink_loop(Rest)
+            end;
         _ ->
             recv_sink_loop(Script)
     end.
