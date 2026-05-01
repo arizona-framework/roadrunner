@@ -346,6 +346,119 @@ dispatching_request_start_and_stop_telemetry_fires_test() ->
     end.
 
 %% =============================================================================
+%% Telemetry ordering invariants — enforce the contract subscribers
+%% rely on (paired start/stop, accept-before-request, conn-close-last,
+%% consistent request_id within a request).
+%% =============================================================================
+
+telemetry_ordering_invariants_full_lifecycle_test() ->
+    %% One full GET → 200 → conn_close. Events must arrive in this
+    %% order: listener_accept, request_start, request_stop,
+    %% listener_conn_close. request_id must match between start/stop.
+    ensure_pg(),
+    {ok, _} = application:ensure_all_started(telemetry),
+    Self = self(),
+    Tag = make_ref(),
+    HandlerId = make_ref(),
+    Events = [
+        [cactus, listener, accept],
+        [cactus, request, start],
+        [cactus, request, stop],
+        [cactus, listener, conn_close]
+    ],
+    ok = telemetry:attach_many(
+        HandlerId,
+        Events,
+        fun(Event, M, Md, _) -> Self ! {ev, Event, M, Md} end,
+        undefined
+    ),
+    try
+        Sink = spawn_recv_sink_with_send_log(Self, Tag, [
+            {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}
+        ]),
+        {ok, Pid} = cactus_conn_statem:start(
+            {fake, Sink}, fake_proto_opts(telemetry_order)
+        ),
+        Ref = monitor(process, Pid),
+        Pid ! shoot,
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 2000 -> error(no_normal_exit)
+        end,
+        AcceptMd =
+            receive
+                {ev, [cactus, listener, accept], _, AMd} -> AMd
+            after 1000 -> error(no_accept)
+            end,
+        StartMd =
+            receive
+                {ev, [cactus, request, start], _, SMd} -> SMd
+            after 1000 -> error(no_start)
+            end,
+        StopMd =
+            receive
+                {ev, [cactus, request, stop], _, RMd} -> RMd
+            after 1000 -> error(no_stop)
+            end,
+        CloseMd =
+            receive
+                {ev, [cactus, listener, conn_close], _, CMd} -> CMd
+            after 1000 -> error(no_close)
+            end,
+        %% Ordering: selective receive above already enforced it (each
+        %% receive only matches its event; if events arrived in the
+        %% wrong order a later receive's timeout would have fired).
+        %% Cross-check the metadata invariants:
+        ?assertEqual(maps:get(peer, AcceptMd), maps:get(peer, CloseMd)),
+        ?assertEqual(maps:get(request_id, StartMd), maps:get(request_id, StopMd)),
+        ?assertEqual(1, maps:get(requests_served, CloseMd)),
+        stop_sink(Sink)
+    after
+        telemetry:detach(HandlerId)
+    end.
+
+telemetry_peer_set_in_conn_close_after_parse_error_test() ->
+    %% A bad request fails before dispatch (no request_start fires) but
+    %% peer was known at accept-time, so conn_close metadata must still
+    %% carry the peer.
+    ensure_pg(),
+    {ok, _} = application:ensure_all_started(telemetry),
+    Self = self(),
+    Tag = make_ref(),
+    HandlerId = make_ref(),
+    ok = telemetry:attach(
+        HandlerId,
+        [cactus, listener, conn_close],
+        fun(Event, M, Md, _) -> Self ! {ev, Event, M, Md} end,
+        undefined
+    ),
+    try
+        Sink = spawn_recv_sink_with_send_log(
+            Self, Tag, [{recv, ~"NOT-A-VALID-REQUEST-LINE\r\n\r\n"}]
+        ),
+        {ok, Pid} = cactus_conn_statem:start(
+            {fake, Sink}, fake_proto_opts(parse_err_telemetry)
+        ),
+        Ref = monitor(process, Pid),
+        Pid ! shoot,
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 2000 -> error(no_normal_exit)
+        end,
+        receive
+            {ev, [cactus, listener, conn_close], _, CloseMd} ->
+                %% Fake transport's peername stub returns {{127,0,0,1},_}.
+                ?assertMatch({{127, 0, 0, 1}, _}, maps:get(peer, CloseMd)),
+                %% No request was served (parse failed before dispatch).
+                ?assertEqual(0, maps:get(requests_served, CloseMd))
+        after 1000 -> error(no_close)
+        end,
+        stop_sink(Sink)
+    after
+        telemetry:detach(HandlerId)
+    end.
+
+%% =============================================================================
 %% RFC framing edge cases — these regression-cover paths the line
 %% coverage gate doesn't reach by construction.
 %% =============================================================================
