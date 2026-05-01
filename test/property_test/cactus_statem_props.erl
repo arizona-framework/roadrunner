@@ -79,6 +79,117 @@ prop_conn_terminates_normal_on_random_inputs() ->
     ).
 
 %% =============================================================================
+%% State-transition graph — every observed `(FromState, ToState)`
+%% pair where the states differ must be in the documented transition
+%% set. Catches refactors that introduce undocumented edges (e.g. a
+%% `reading_request → finishing` shortcut that skips the body).
+%% =============================================================================
+
+prop_state_transitions_are_documented() ->
+    ?FORALL(
+        {Script, DrainBefore, DrainAfter},
+        {list(recv_step()), boolean(), boolean()},
+        begin
+            ensure_pg(),
+            Counter = atomics:new(1, [{signed, false}]),
+            Opts = proto_opts(prop_listener_trans, Counter),
+            true = cactus_conn:try_acquire_slot(Opts),
+            Sink = spawn_recv_sink(Script),
+            {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+            Tracer = start_tracer(),
+            erlang:trace(Pid, true, [call, return_to, {tracer, Tracer}]),
+            erlang:trace_pattern(
+                {cactus_conn_statem, handle_event, 4},
+                [{'_', [], [{return_trace}]}],
+                [local]
+            ),
+            Ref = monitor(process, Pid),
+            case DrainBefore of
+                true ->
+                    Pid ! {cactus_drain, erlang:monotonic_time(millisecond) + 1000};
+                false ->
+                    ok
+            end,
+            Pid ! shoot,
+            case DrainAfter of
+                true ->
+                    Pid ! {cactus_drain, erlang:monotonic_time(millisecond) + 1000};
+                false ->
+                    ok
+            end,
+            ExitOk =
+                receive
+                    {'DOWN', Ref, process, Pid, normal} -> true;
+                    {'DOWN', Ref, process, Pid, _} -> false
+                after 3000 ->
+                    erlang:demonitor(Ref, [flush]),
+                    exit(Pid, kill),
+                    false
+                end,
+            erlang:trace_pattern({cactus_conn_statem, handle_event, 4}, false, [local]),
+            Sink ! stop,
+            Transitions = stop_tracer(Tracer),
+            ExitOk andalso transitions_documented(Transitions)
+        end
+    ).
+
+documented_transitions() ->
+    [
+        {awaiting_shoot, reading_request},
+        {reading_request, reading_body},
+        {reading_body, dispatching},
+        {dispatching, finishing},
+        {finishing, reading_request}
+    ].
+
+transitions_documented(Transitions) ->
+    Documented = documented_transitions(),
+    lists:all(
+        fun
+            ({From, From}) -> true;
+            (Edge) -> lists:member(Edge, Documented)
+        end,
+        Transitions
+    ).
+
+start_tracer() ->
+    Self = self(),
+    spawn(fun() -> tracer_loop(Self, undefined, []) end).
+
+%% Pair `call` with the next `return_from`. Capture (FromState, NextState)
+%% from the call args and the return shape.
+tracer_loop(Reporter, CurrentCall, Edges) ->
+    receive
+        {trace, _Pid, call, {_Mod, handle_event, [_EvType, _Msg, FromState, _Data]}} ->
+            tracer_loop(Reporter, FromState, Edges);
+        {trace, _Pid, return_from, {_Mod, handle_event, 4}, Return} ->
+            NextState = next_state_of(Return, CurrentCall),
+            Edge = {CurrentCall, NextState},
+            tracer_loop(Reporter, undefined, [Edge | Edges]);
+        {report, From} ->
+            From ! {edges, lists:reverse(Edges)};
+        _ ->
+            tracer_loop(Reporter, CurrentCall, Edges)
+    end.
+
+next_state_of({next_state, NextState, _Data}, _) -> NextState;
+next_state_of({next_state, NextState, _Data, _Actions}, _) -> NextState;
+next_state_of({keep_state, _Data}, From) -> From;
+next_state_of({keep_state, _Data, _Actions}, From) -> From;
+next_state_of(keep_state_and_data, From) -> From;
+next_state_of({keep_state_and_data, _Actions}, From) -> From;
+next_state_of({stop, _, _}, From) -> From;
+next_state_of({stop_and_reply, _, _, _}, From) -> From;
+next_state_of(_, From) -> From.
+
+stop_tracer(Tracer) ->
+    Tracer ! {report, self()},
+    receive
+        {edges, Edges} -> Edges
+    after 1000 -> []
+    end.
+
+%% =============================================================================
 %% Telemetry pairing — when a full request reaches dispatch, the
 %% request_start and request_stop events share the same request_id.
 %% Restricted to the deterministic happy path because telemetry is a

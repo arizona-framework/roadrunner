@@ -32,6 +32,7 @@ Add a new property:
     http1_parse_chunk_incremental/1,
     statem_terminates_normal_on_random_inputs/1,
     statem_request_start_and_stop_share_request_id/1,
+    statem_state_transitions_are_documented/1,
     router_param_bindings_round_trip/1
 ]).
 
@@ -55,6 +56,7 @@ all() ->
         http1_parse_chunk_incremental,
         statem_terminates_normal_on_random_inputs,
         statem_request_start_and_stop_share_request_id,
+        statem_state_transitions_are_documented,
         router_param_bindings_round_trip
     ].
 
@@ -151,6 +153,12 @@ statem_terminates_normal_on_random_inputs(Config) ->
 statem_request_start_and_stop_share_request_id(Config) ->
     ct_property_test:quickcheck(
         cactus_statem_props:prop_request_start_and_stop_share_request_id(),
+        Config
+    ).
+
+statem_state_transitions_are_documented(Config) ->
+    ct_property_test:quickcheck(
+        cactus_statem_props:prop_state_transitions_are_documented(),
         Config
     ).
 
