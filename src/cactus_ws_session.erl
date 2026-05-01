@@ -39,24 +39,21 @@ every frame.
 }).
 
 -doc """
-Send the 101 handshake response and run the WebSocket session
-synchronously: spawn the gen_statem, transfer socket ownership,
-await termination. Returns `ok` once the session has ended (or
-the handshake check fails — in which case 400 has been sent and
+Run the WebSocket session synchronously: spawn the gen_statem,
+write the 101 upgrade response, transfer socket ownership, and
+await termination. The gen_statem is started **before** the 101
+hits the wire so a start failure can fall back to 500 without
+leaving the upgrade response sent with no process owning the
+socket. Returns `ok` once the session has ended (or the
+handshake check fails — in which case 400 has been sent and
 the gen_statem is never started).
 """.
 -spec run(cactus_transport:socket(), cactus_http1:request(), module(), term()) -> ok.
 run(Socket, Req, Mod, State) ->
     case cactus_ws:handshake_response(cactus_req:headers(Req)) of
         {ok, Status, RespHeaders, _} ->
-            Resp = cactus_http1:response(Status, RespHeaders, ~""),
-            %% If this send fails, the session's first recv will return
-            %% `{error, _}` and the loop ends cleanly — no separate
-            %% handling.
-            _ = cactus_telemetry:response_send(
-                cactus_transport:send(Socket, Resp), websocket_upgrade_response
-            ),
-            run_session(Socket, Req, Mod, State);
+            UpgradeResp = cactus_http1:response(Status, RespHeaders, ~""),
+            run_session(Socket, Req, Mod, State, UpgradeResp);
         {error, _} ->
             _ = cactus_transport:send(
                 Socket,
@@ -69,34 +66,68 @@ run(Socket, Req, Mod, State) ->
             ok
     end.
 
--spec run_session(cactus_transport:socket(), cactus_http1:request(), module(), term()) -> ok.
-run_session(Socket, Req, Mod, State) ->
+-spec run_session(
+    cactus_transport:socket(), cactus_http1:request(), module(), term(), iodata()
+) -> ok.
+run_session(Socket, Req, Mod, State, UpgradeResp) ->
     Ctx = ws_context(Req, Mod),
-    ok = cactus_telemetry:ws_upgrade(Ctx),
-    %% `start` (not `start_link`) — the conn is intentionally unlinked
-    %% from its children so a session crash never propagates to the
-    %% conn process. We synchronise via a monitor instead.
-    {ok, Pid} = gen_statem:start(?MODULE, {Socket, Mod, State, Ctx}, []),
-    Ref = monitor(process, Pid),
-    ok = cactus_transport:controlling_process(Socket, Pid),
-    Pid ! socket_ready,
-    receive
-        {'DOWN', Ref, process, Pid, _Reason} -> ok
+    %% Start the gen_statem **before** writing the 101 to the wire so a
+    %% start failure never leaves the upgrade response sent with no
+    %% process owning the socket. `start` (not `start_link`) — the
+    %% conn is intentionally unlinked from its children so a session
+    %% crash never propagates to the conn process. We synchronise via
+    %% a monitor instead.
+    case gen_statem:start(?MODULE, {Socket, Mod, State, Ctx}, []) of
+        {ok, Pid} ->
+            ok = cactus_telemetry:ws_upgrade(Ctx),
+            _ = cactus_telemetry:response_send(
+                cactus_transport:send(Socket, UpgradeResp), websocket_upgrade_response
+            ),
+            Ref = monitor(process, Pid),
+            ok = cactus_transport:controlling_process(Socket, Pid),
+            Pid ! socket_ready,
+            receive
+                {'DOWN', Ref, process, Pid, _Reason} -> ok
+            end;
+        {error, _Reason} ->
+            %% Couldn't start the session — the 101 was never on the
+            %% wire, so we can fall back to 500 without a protocol leak.
+            _ = cactus_transport:send(
+                Socket,
+                cactus_http1:response(
+                    500,
+                    [{~"content-length", ~"0"}, {~"connection", ~"close"}],
+                    ~""
+                )
+            ),
+            ok
     end.
 
 -spec callback_mode() -> gen_statem:callback_mode_result().
 callback_mode() -> [state_functions, state_enter].
 
 -spec init({cactus_transport:socket(), module(), term(), map()}) ->
-    {ok, awaiting_socket, #data{}}.
+    {ok, awaiting_socket, #data{}} | {stop, {bad_handler, module()}}.
 init({Socket, Mod, State, Ctx}) ->
-    {ok, awaiting_socket, #data{
-        socket = Socket,
-        buffer = <<>>,
-        mod = Mod,
-        mod_state = State,
-        ctx = Ctx
-    }}.
+    %% Reject unloadable handlers up front so `gen_statem:start/3`
+    %% returns `{error, _}` and the launcher's 500 fallback runs —
+    %% otherwise the session would crash later inside `handle_frame`
+    %% with the 101 already on the wire.
+    case
+        code:ensure_loaded(Mod) =:= {module, Mod} andalso
+            erlang:function_exported(Mod, handle_frame, 2)
+    of
+        true ->
+            {ok, awaiting_socket, #data{
+                socket = Socket,
+                buffer = <<>>,
+                mod = Mod,
+                mod_state = State,
+                ctx = Ctx
+            }};
+        false ->
+            {stop, {bad_handler, Mod}}
+    end.
 
 -spec awaiting_socket(gen_statem:event_type(), term(), #data{}) ->
     gen_statem:event_handler_result(atom()).
