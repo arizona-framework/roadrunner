@@ -59,6 +59,7 @@ event(Data) when is_binary(Data) ->
 -doc "Named event with a data payload.".
 -spec event(EventName :: binary(), Data :: binary()) -> iodata().
 event(Name, Data) when is_binary(Name), is_binary(Data) ->
+    ok = check_single_line(Name, event_name),
     [~"event: ", Name, $\n, data_lines(Data), $\n].
 
 -doc """
@@ -67,6 +68,8 @@ data payload.
 """.
 -spec event(EventName :: binary(), Data :: binary(), Id :: binary()) -> iodata().
 event(Name, Data, Id) when is_binary(Name), is_binary(Data), is_binary(Id) ->
+    ok = check_single_line(Name, event_name),
+    ok = check_single_line(Id, event_id),
     [~"event: ", Name, $\n, ~"id: ", Id, $\n, data_lines(Data), $\n].
 
 -doc """
@@ -75,7 +78,22 @@ for keep-alives over proxies.
 """.
 -spec comment(Text :: binary()) -> iodata().
 comment(Text) when is_binary(Text) ->
+    ok = check_single_line(Text, comment),
     [~": ", Text, ~"\n\n"].
+
+%% SSE field values (event name, id, comment text) MUST NOT contain
+%% line separators — `\r` or `\n` would split the value into a second
+%% line that's either silently dropped or interpreted as a new field
+%% by the client. Crash hard so a programmer bug — usually echoing
+%% user input into one of these fields without sanitization — turns
+%% into a 500, not a stream-corruption vulnerability. The `data` field
+%% is exempt; multi-line `data:` emission is handled by `data_lines/1`.
+-spec check_single_line(binary(), atom()) -> ok.
+check_single_line(Bin, Field) ->
+    case binary:match(Bin, [<<$\r>>, <<$\n>>]) of
+        nomatch -> ok;
+        _ -> error({sse_line_break, Field, Bin})
+    end.
 
 -doc """
 Tell the client how long (in milliseconds) to wait before retrying

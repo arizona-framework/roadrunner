@@ -62,3 +62,38 @@ retry_test() ->
         ~"retry: 5000\n\n",
         iolist_to_binary(cactus_sse:retry(5000))
     ).
+
+%% --- line-break injection defenses ---
+
+event_with_newline_in_name_rejected_test() ->
+    %% A `\n` in the event name would terminate the field early and
+    %% leak the rest of the input as a separate SSE line.
+    ?assertError(
+        {sse_line_break, event_name, _},
+        cactus_sse:event(~"my\nevent", ~"data")
+    ).
+
+event_with_cr_in_name_rejected_test() ->
+    ?assertError(
+        {sse_line_break, event_name, _},
+        cactus_sse:event(~"my\revent", ~"data")
+    ).
+
+event_with_newline_in_id_rejected_test() ->
+    ?assertError(
+        {sse_line_break, event_id, _},
+        cactus_sse:event(~"name", ~"data", ~"id\nbad")
+    ).
+
+comment_with_newline_rejected_test() ->
+    ?assertError(
+        {sse_line_break, comment, _},
+        cactus_sse:comment(~"line1\nline2")
+    ).
+
+%% Data is exempt: multi-line content splits into multiple `data:` lines.
+event_data_with_newline_splits_into_multiple_data_lines_test() ->
+    ?assertEqual(
+        ~"data: line one\ndata: line two\n\n",
+        iolist_to_binary(cactus_sse:event(~"line one\nline two"))
+    ).
