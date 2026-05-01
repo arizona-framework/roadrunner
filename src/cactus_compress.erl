@@ -1,0 +1,124 @@
+-module(cactus_compress).
+-moduledoc """
+Gzip response-compression middleware.
+
+Add to a listener's `middlewares` opt (or a route's `route_opts.middlewares`)
+to gzip eligible response bodies based on the request's `Accept-Encoding`
+header. Replaces cowboy's deprecated `cowboy_compress_h` stream handler
+for arizona's migration.
+
+```erlang
+cactus_listener:start_link(my_app, #{
+    port => 8080,
+    routes => Routes,
+    middlewares => [cactus_compress]
+}).
+```
+
+A response is compressed when **all** of these are true:
+
+- The client's `Accept-Encoding` header includes `gzip` (substring match).
+- The handler's response does not already carry a `Content-Encoding`
+  header (i.e. it isn't already compressed).
+- The body is at least `?THRESHOLD` bytes (default 860 — same as
+  cowboy's default; below this the compression overhead outweighs
+  the bandwidth saving).
+
+When compressed:
+
+- `Content-Encoding: gzip` is added.
+- `Content-Length` is rewritten to the compressed size.
+- `Vary: Accept-Encoding` is added.
+
+When not compressed (body too small, client doesn't accept gzip,
+or response already encoded), the response passes through unchanged
+**except** that `Vary: Accept-Encoding` is added if the client
+indicated `Accept-Encoding: gzip` — caches that key on this header
+will then handle the next variant correctly.
+
+## What this does NOT cover
+
+- **Streaming responses (`{stream, ...}`)** — passed through unchanged.
+  Wrapping the user's `Send` callback with a deflate context is a
+  follow-up; `zlib:deflateInit/2,6` + `zlib:deflate/3` + final
+  `zlib:deflate(_, finish)` is the recipe.
+- **`{loop, ...}` and `{websocket, ...}` returns** — passed through;
+  these aren't HTTP body responses.
+""".
+
+-behaviour(cactus_middleware).
+
+-export([call/2]).
+
+-define(THRESHOLD, 860).
+
+-spec call(cactus_http1:request(), cactus_middleware:next()) -> cactus_handler:result().
+call(Req, Next) ->
+    {Response, Req2} = Next(Req),
+    {transform(Req, Response), Req2}.
+
+-spec transform(cactus_http1:request(), cactus_handler:response()) ->
+    cactus_handler:response().
+transform(Req, {Status, Headers, Body}) when is_integer(Status) ->
+    AcceptsGzip = accepts_gzip(Req),
+    AlreadyEncoded = has_header(~"content-encoding", Headers),
+    Size = iolist_size(Body),
+    case AcceptsGzip andalso not AlreadyEncoded andalso Size >= ?THRESHOLD of
+        true ->
+            compress(Status, Headers, Body);
+        false ->
+            HeadersWithVary =
+                case AcceptsGzip andalso not AlreadyEncoded of
+                    true -> add_vary(Headers);
+                    false -> Headers
+                end,
+            {Status, HeadersWithVary, Body}
+    end;
+transform(_Req, Other) ->
+    %% stream / loop / websocket — pass through. Streaming compression
+    %% is a follow-up.
+    Other.
+
+-spec compress(cactus_http1:status(), cactus_http1:headers(), iodata()) ->
+    cactus_handler:response().
+compress(Status, Headers, Body) ->
+    Compressed = zlib:gzip(iolist_to_binary(Body)),
+    NewLength = integer_to_binary(byte_size(Compressed)),
+    %% Replace any existing Content-Length, drop the no-op (since gzip is
+    %% already absent at this point per the caller's check), then prepend
+    %% Content-Encoding + Vary.
+    Headers1 = lists:keystore(~"content-length", 1, Headers, {~"content-length", NewLength}),
+    Headers2 = [
+        {~"content-encoding", ~"gzip"},
+        {~"vary", ~"Accept-Encoding"}
+        | Headers1
+    ],
+    {Status, Headers2, Compressed}.
+
+-spec accepts_gzip(cactus_http1:request()) -> boolean().
+accepts_gzip(Req) ->
+    case cactus_req:header(~"accept-encoding", Req) of
+        undefined ->
+            false;
+        Value ->
+            Lower = string:lowercase(Value),
+            lists:any(
+                fun(Token) ->
+                    Trimmed = string:trim(Token),
+                    Trimmed =:= ~"gzip" orelse
+                        binary:match(Trimmed, ~"gzip") =/= nomatch
+                end,
+                binary:split(Lower, ~",", [global])
+            )
+    end.
+
+-spec has_header(binary(), cactus_http1:headers()) -> boolean().
+has_header(Name, Headers) ->
+    lists:keymember(Name, 1, Headers).
+
+-spec add_vary(cactus_http1:headers()) -> cactus_http1:headers().
+add_vary(Headers) ->
+    case has_header(~"vary", Headers) of
+        true -> Headers;
+        false -> [{~"vary", ~"Accept-Encoding"} | Headers]
+    end.
