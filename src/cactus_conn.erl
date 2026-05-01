@@ -789,15 +789,29 @@ stream_response(Socket, Status, UserHeaders, Fun) ->
             Data,
             ~"\r\n"
         ],
-        Frame =
-            case FinFlag of
-                nofin -> Chunk;
-                fin -> [Chunk, ~"0\r\n\r\n"]
-            end,
+        Frame = stream_frame(Chunk, FinFlag),
         cactus_transport:send(Socket, Frame)
     end,
     _ = Fun(Send),
     ok.
+
+%% Build the wire frame for one chunked-stream emission. `nofin` is just
+%% the chunk; `fin` adds the size-0 terminator + final CRLF; `{fin,
+%% Trailers}` adds the size-0 terminator + serialized trailer headers
+%% + final CRLF (RFC 7230 §4.1.2). Trailer names should also have been
+%% advertised in the response's `Trailer` header — that's the user's
+%% responsibility.
+-spec stream_frame(iodata(), nofin | fin | {fin, cactus_http1:headers()}) -> iodata().
+stream_frame(Chunk, nofin) ->
+    Chunk;
+stream_frame(Chunk, fin) ->
+    [Chunk, ~"0\r\n\r\n"];
+stream_frame(Chunk, {fin, Trailers}) ->
+    [Chunk, ~"0\r\n", encode_trailers(Trailers), ~"\r\n"].
+
+-spec encode_trailers(cactus_http1:headers()) -> iodata().
+encode_trailers(Trailers) ->
+    [[Name, ~": ", Value, ~"\r\n"] || {Name, Value} <- Trailers].
 
 %% Emit status + chunked headers, then receive Erlang messages and
 %% dispatch each through `Handler:handle_info/3`. Each call gets a

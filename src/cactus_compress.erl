@@ -107,10 +107,15 @@ wrap_stream(Status, Headers, Fun) ->
         try
             ok = zlib:deflateInit(Z, default, deflated, 16 + 15, 8, default),
             Send2 = fun(Data, FinFlag) ->
+                %% `{fin, Trailers}` is the same deflate-side action as
+                %% `fin` — finish flushing — but the trailers themselves
+                %% are chunked-encoding metadata and pass through to the
+                %% conn's Send unchanged.
                 Mode =
                     case FinFlag of
                         nofin -> none;
-                        fin -> finish
+                        fin -> finish;
+                        {fin, _Trailers} -> finish
                     end,
                 Compressed = zlib:deflate(Z, Data, Mode),
                 Send(Compressed, FinFlag)

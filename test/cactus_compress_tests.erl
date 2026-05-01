@@ -134,6 +134,29 @@ stream_response_wrapped_with_gzip_test() ->
     Compressed = collect_chunks(),
     ?assertEqual(~"hello world", zlib:gunzip(Compressed)).
 
+stream_response_wrapped_with_gzip_passes_trailers_test() ->
+    %% `{fin, Trailers}` finishes the deflate (just like `fin`) and
+    %% forwards the trailers to the conn's real Send unchanged.
+    Req = req([{~"accept-encoding", ~"gzip"}]),
+    Self = self(),
+    Trailers = [{~"x-md5", ~"deadbeef"}],
+    Fun = fun(Send) ->
+        ok = Send(~"hello", {fin, Trailers})
+    end,
+    Next = fun(R) -> {{stream, 200, [], Fun}, R} end,
+    {{stream, 200, _Headers, WrappedFun}, _Req2} = cactus_compress:call(Req, Next),
+    Capture = fun(Data, Flag) ->
+        Self ! {emit, iolist_to_binary(Data), Flag},
+        ok
+    end,
+    WrappedFun(Capture),
+    receive
+        {emit, Compressed, FinFlag} ->
+            ?assertEqual({fin, Trailers}, FinFlag),
+            ?assertEqual(~"hello", zlib:gunzip(Compressed))
+    after 50 -> error(no_emit)
+    end.
+
 passes_loop_response_through_test() ->
     Req = req([{~"accept-encoding", ~"gzip"}]),
     Next = fun(R) -> {{loop, 200, [], state}, R} end,

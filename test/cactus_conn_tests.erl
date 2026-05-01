@@ -586,6 +586,32 @@ recv_until(Sock, Marker, Acc) ->
             Acc
     end.
 
+conn_streams_chunked_with_trailers_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_trailers, #{
+                port => 0, handler => cactus_trailers_handler
+            }),
+            cactus_listener:port(conn_test_trailers)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_trailers) end, fun(Port) ->
+            {"chunked response emits trailer headers after the 0-chunk", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"transfer-encoding: chunked", [caseless]),
+                {match, _} = re:run(Reply, ~"trailer: x-trailer-one", [caseless]),
+                %% After the size-0 chunk we expect the trailer headers
+                %% before the final blank line.
+                {match, _} = re:run(Reply, ~"\r\n0\r\nx-trailer-one: alpha\r\n"),
+                {match, _} = re:run(Reply, ~"x-trailer-two: beta\r\n\r\n"),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
 conn_streams_chunked_response_test_() ->
     {setup,
         fun() ->

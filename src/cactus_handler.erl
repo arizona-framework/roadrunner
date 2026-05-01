@@ -17,8 +17,11 @@ threading `Req` through the entire request lifecycle.
 - `{stream, StatusCode, Headers, StreamFun}` — chunked streaming. The
   connection emits status + headers (with `Transfer-Encoding: chunked`
   auto-prepended) and calls `StreamFun(Send)` where
-  `Send(Data, nofin | fin)` writes one chunk; passing `fin` also
-  writes the size-0 terminator.
+  `Send(Data, nofin | fin | {fin, Trailers})` writes one chunk; `fin`
+  also writes the size-0 terminator and `{fin, Trailers}` writes the
+  terminator followed by the given trailer headers (RFC 7230 §4.1.2).
+  Trailer names should be advertised in the response's `Trailer`
+  header.
 - `{loop, StatusCode, Headers, State}` — message-driven streaming.
   The connection emits status + headers, then enters a receive loop
   in the conn process. Each Erlang message is dispatched through the
@@ -43,7 +46,8 @@ handle(Req) ->
 
 -export_type([send_fun/0, stream_fun/0, push_fun/0, response/0, result/0]).
 
--type send_fun() :: fun((iodata(), nofin | fin) -> ok | {error, term()}).
+-type send_fun() ::
+    fun((iodata(), nofin | fin | {fin, cactus_http1:headers()}) -> ok | {error, term()}).
 -type stream_fun() :: fun((send_fun()) -> any()).
 -type push_fun() :: fun((iodata()) -> ok | {error, term()}).
 -type response() ::
