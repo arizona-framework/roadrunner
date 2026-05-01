@@ -61,6 +61,108 @@ static_test_() ->
                     [{~"If-None-Match", ~"\"stale-etag\""}]
                 ),
                 ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
+            end},
+            {"Range: bytes=0-3 returns 206 with the first 4 bytes", fun() ->
+                %% hello.html is "<h1>Hello</h1>" (14 bytes); 0-3 → "<h1>".
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=0-3"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-range: bytes 0-3/14", [caseless]),
+                {match, _} = re:run(Reply, ~"content-length: 4", [caseless]),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(~"<h1>", Body)
+            end},
+            {"Range: bytes=4- returns suffix from byte 4 to end", fun() ->
+                %% bytes 4..13 → "Hello</h1>" (10 bytes).
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=4-"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-range: bytes 4-13/14", [caseless]),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(~"Hello</h1>", Body)
+            end},
+            {"Range: bytes=-5 returns the last 5 bytes", fun() ->
+                %% Last 5 bytes of "<h1>Hello</h1>" → "</h1>".
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=-5"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-range: bytes 9-13/14", [caseless]),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(~"</h1>", Body)
+            end},
+            {"unsatisfiable range returns 416", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=100-200"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 416 ", _/binary>>, Reply),
+                %% Per RFC 7233 §4.4 the response should carry
+                %% Content-Range: bytes */<size> so clients can detect
+                %% the resource size.
+                {match, _} = re:run(Reply, ~"content-range: bytes \\*/14", [caseless])
+            end},
+            {"malformed Range header falls through to 200", fun() ->
+                %% RFC 7233 §3.1: server MUST ignore Range it doesn't
+                %% understand. We'd rather serve the full file than 416.
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"items=0-3"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
+            end},
+            {"multi-range request falls through to 200", fun() ->
+                %% Multipart/byteranges responses aren't implemented; we
+                %% serve the full file rather than the first range only.
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=0-3,5-9"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
+            end},
+            {"suffix length of 0 is unsatisfiable", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=-0"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 416 ", _/binary>>, Reply)
+            end},
+            {"open-ended range with start beyond size is unsatisfiable", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=100-"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 416 ", _/binary>>, Reply)
+            end},
+            {"open-ended range with non-numeric start falls through to 200", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=abc-"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
+            end},
+            {"full range with non-numeric start falls through to 200", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=abc-5"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
+            end},
+            {"range with no dash falls through to 200", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=abc"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
+            end},
+            {"negative suffix length is malformed and falls through to 200", fun() ->
+                %% `bytes=--1` parses to suffix-spec "-1" which is a
+                %% negative integer — per RFC 7233 §3.1 the server MUST
+                %% ignore a Range it doesn't understand.
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=--1"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
+            end},
+            {"non-numeric suffix length falls through to 200", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=-abc"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
             end}
         ]
     end}.

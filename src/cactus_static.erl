@@ -56,10 +56,25 @@ serve_file(FilePath, Req) ->
                 true ->
                     {304, [{~"etag", ETag}, {~"content-length", ~"0"}], ~""};
                 false ->
-                    serve_full_file(FilePath, ETag)
+                    serve_with_range(FilePath, Size, ETag, Req)
             end;
         _ ->
             cactus_resp:not_found()
+    end.
+
+%% Branches on the Range header: satisfiable single range → 206,
+%% unsatisfiable → 416, anything else (no header, malformed, multi-range)
+%% → fall through to a normal 200 with the full body.
+-spec serve_with_range(file:filename_all(), non_neg_integer(), binary(), cactus_http1:request()) ->
+    cactus_resp:response().
+serve_with_range(FilePath, Size, ETag, Req) ->
+    case parse_range(cactus_req:header(~"range", Req), Size) of
+        {range, Start, End} ->
+            serve_range(FilePath, Size, ETag, Start, End);
+        unsatisfiable ->
+            range_not_satisfiable(Size, ETag);
+        none ->
+            serve_full_file(FilePath, ETag)
     end.
 
 %% read_file_info already established the file exists and is regular;
@@ -70,15 +85,18 @@ serve_file(FilePath, Req) ->
 -spec serve_full_file(file:filename_all(), binary()) -> cactus_resp:response().
 serve_full_file(FilePath, ETag) ->
     {ok, Bytes} = file:read_file(FilePath),
-    Ext = string:lowercase(iolist_to_binary(filename:extension(FilePath))),
-    ContentType = maps:get(Ext, ?MIME_TYPES, ~"application/octet-stream"),
     {200,
         [
-            {~"content-type", ContentType},
+            {~"content-type", content_type_for(FilePath)},
             {~"content-length", integer_to_binary(byte_size(Bytes))},
             {~"etag", ETag}
         ],
         Bytes}.
+
+-spec content_type_for(file:filename_all()) -> binary().
+content_type_for(FilePath) ->
+    Ext = string:lowercase(iolist_to_binary(filename:extension(FilePath))),
+    maps:get(Ext, ?MIME_TYPES, ~"application/octet-stream").
 
 %% Strong ETag derived from size + posix mtime — RFC 9110 §8.8.3
 %% format: opaque-tag wrapped in double quotes. Two files with the
@@ -91,6 +109,116 @@ etag(Size, Mtime) ->
 -spec if_none_match(cactus_http1:request()) -> binary() | undefined.
 if_none_match(Req) ->
     cactus_req:header(~"if-none-match", Req).
+
+%% Parse a `Range: bytes=N-M`, `bytes=N-`, or `bytes=-S` header against
+%% the file `Size`. `none` means "ignore Range and serve the full body"
+%% — used for missing, malformed, multi-range, and other shapes we
+%% don't honor (per RFC 7233 §3.1: servers MUST ignore unknown range
+%% units). `unsatisfiable` triggers a 416.
+-spec parse_range(binary() | undefined, non_neg_integer()) ->
+    {range, non_neg_integer(), non_neg_integer()} | unsatisfiable | none.
+parse_range(undefined, _Size) ->
+    none;
+parse_range(<<"bytes=", Spec/binary>>, Size) ->
+    case binary:match(Spec, ~",") of
+        nomatch -> parse_single_range(Spec, Size);
+        %% Multi-range — falls back to a 200 with the full body.
+        _ -> none
+    end;
+parse_range(_, _Size) ->
+    none.
+
+-spec parse_single_range(binary(), non_neg_integer()) ->
+    {range, non_neg_integer(), non_neg_integer()} | unsatisfiable | none.
+parse_single_range(Spec, Size) ->
+    case binary:split(Spec, ~"-") of
+        [<<>>, SuffixLen] ->
+            %% `bytes=-S` — last S bytes.
+            case bin_to_pos_int(SuffixLen) of
+                {ok, S} when S > 0, Size > 0 ->
+                    Start = max(0, Size - S),
+                    {range, Start, Size - 1};
+                {ok, _} ->
+                    %% Well-formed but unsatisfiable: zero-length suffix
+                    %% or empty file.
+                    unsatisfiable;
+                error ->
+                    %% Malformed (non-numeric, negative): per RFC 7233
+                    %% §3.1 the server MUST ignore Range.
+                    none
+            end;
+        [StartBin, <<>>] ->
+            %% `bytes=N-` — open-ended.
+            case bin_to_pos_int(StartBin) of
+                {ok, Start} when Start < Size ->
+                    {range, Start, Size - 1};
+                {ok, _} ->
+                    unsatisfiable;
+                error ->
+                    none
+            end;
+        [StartBin, EndBin] ->
+            case {bin_to_pos_int(StartBin), bin_to_pos_int(EndBin)} of
+                {{ok, Start}, {ok, End}} when Start =< End, Start < Size ->
+                    {range, Start, min(End, Size - 1)};
+                {{ok, _}, {ok, _}} ->
+                    unsatisfiable;
+                _ ->
+                    none
+            end;
+        _ ->
+            none
+    end.
+
+-spec bin_to_pos_int(binary()) -> {ok, non_neg_integer()} | error.
+bin_to_pos_int(Bin) ->
+    try binary_to_integer(Bin) of
+        N when N >= 0 -> {ok, N};
+        _ -> error
+    catch
+        _:_ -> error
+    end.
+
+-spec serve_range(
+    file:filename_all(), non_neg_integer(), binary(), non_neg_integer(), non_neg_integer()
+) -> cactus_resp:response().
+serve_range(FilePath, Size, ETag, Start, End) ->
+    Length = End - Start + 1,
+    {ok, IoDevice} = file:open(FilePath, [read, binary, raw]),
+    try
+        {ok, Bytes} = file:pread(IoDevice, Start, Length),
+        ContentRange = iolist_to_binary([
+            ~"bytes ",
+            integer_to_binary(Start),
+            $-,
+            integer_to_binary(End),
+            $/,
+            integer_to_binary(Size)
+        ]),
+        {206,
+            [
+                {~"content-type", content_type_for(FilePath)},
+                {~"content-length", integer_to_binary(byte_size(Bytes))},
+                {~"content-range", ContentRange},
+                {~"etag", ETag}
+            ],
+            Bytes}
+    after
+        ok = file:close(IoDevice)
+    end.
+
+-spec range_not_satisfiable(non_neg_integer(), binary()) -> cactus_resp:response().
+range_not_satisfiable(Size, ETag) ->
+    %% RFC 7233 §4.4: 416 SHOULD include Content-Range with the total
+    %% size so clients can recover.
+    ContentRange = iolist_to_binary([~"bytes */", integer_to_binary(Size)]),
+    {416,
+        [
+            {~"content-length", ~"0"},
+            {~"content-range", ContentRange},
+            {~"etag", ETag}
+        ],
+        ~""}.
 
 %% Reject any segment that's `..` — defense against path traversal.
 %% Empty segments are already stripped by `cactus_router:path_segments/1`.
