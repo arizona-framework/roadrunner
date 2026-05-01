@@ -60,6 +60,7 @@ read it anyway.
     send_request_timeout/1,
     send_bad_request/1,
     send_payload_too_large/1,
+    drain_oversized_body/3,
     send_internal_error/1,
     send_not_found/1,
     resolve_handler/2,
@@ -751,7 +752,31 @@ send_bad_request(Socket) ->
     ),
     cactus_transport:send(Socket, Resp).
 
+%% Drain up to `2 * MaxCL` bytes from the socket (counting the
+%% already-buffered bytes), discarding them. Used to flush an
+%% oversized in-flight body off the wire so the peer can read the
+%% 413 we're about to send before we close. Bounded by `2 * MaxCL`
+%% (memory) and a 1-second per-recv timeout (wall-clock) so a slow
+%% peer can't pin us indefinitely.
 -doc false.
+-spec drain_oversized_body(binary(), cactus_transport:socket(), non_neg_integer()) -> ok.
+drain_oversized_body(Buffered, Socket, MaxCL) ->
+    Cap = 2 * MaxCL,
+    drain_oversized_loop(Socket, byte_size(Buffered), Cap).
+
+-spec drain_oversized_loop(
+    cactus_transport:socket(), non_neg_integer(), non_neg_integer()
+) -> ok.
+drain_oversized_loop(_Socket, Read, Cap) when Read >= Cap ->
+    ok;
+drain_oversized_loop(Socket, Read, Cap) ->
+    case cactus_transport:recv(Socket, 0, 1000) of
+        {ok, Data} ->
+            drain_oversized_loop(Socket, Read + byte_size(Data), Cap);
+        {error, _} ->
+            ok
+    end.
+
 -spec send_payload_too_large(cactus_transport:socket()) -> ok | {error, term()}.
 send_payload_too_large(Socket) ->
     Resp = cactus_http1:response(

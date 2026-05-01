@@ -206,6 +206,13 @@ handle_event(
                 {ok, Body} ->
                     {next_state, dispatching, Data#data{req = Req#{body => Body}}};
                 {error, content_length_too_large} ->
+                    %% Drain a bounded prefix of the oversized body (up
+                    %% to 2 * MaxCL bytes, 1s per recv) so the peer
+                    %% finishes writing before we send 413 and close —
+                    %% without that, an in-flight write sees
+                    %% ECONNRESET instead of a clean 413. The byte +
+                    %% time caps prevent this becoming a DoS vector.
+                    _ = cactus_conn:drain_oversized_body(Buffered, Socket, MaxCL),
                     _ = cactus_conn:send_payload_too_large(Socket),
                     {stop, normal, Data};
                 {error, request_timeout} ->

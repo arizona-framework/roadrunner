@@ -71,6 +71,64 @@ read_body_cl_too_large_test() ->
         cactus_conn:read_body(Req, ~"", NoRecv, 1000)
     ).
 
+drain_oversized_body_caps_at_2x_max_test() ->
+    %% A `{fake, Pid}` socket whose recv replies a 30-byte chunk. Drain
+    %% must read AT MOST 2 * MaxCL bytes — bounded against memory
+    %% exhaustion.
+    Self = self(),
+    Sink = spawn(fun() -> drain_sink_loop(Self, [{recv, binary:copy(<<"a">>, 30)}]) end),
+    ok = cactus_conn:drain_oversized_body(<<>>, {fake, Sink}, 10),
+    %% MaxCL=10 → cap=20. First recv returns 30 bytes (Read=30 >= 20)
+    %% so the loop exits after exactly one call.
+    Sink ! stop,
+    ?assertEqual(1, drain_recv_calls(0)).
+
+drain_oversized_body_stops_on_recv_error_test() ->
+    %% Closed peer mid-drain → loop returns ok cleanly without
+    %% propagating the error.
+    Sink = spawn(fun() -> drain_sink_loop(undefined, [{error, closed}]) end),
+    ?assertEqual(ok, cactus_conn:drain_oversized_body(<<>>, {fake, Sink}, 10)),
+    Sink ! stop.
+
+drain_oversized_body_counts_buffered_bytes_test() ->
+    %% Already-buffered bytes count toward the cap — if the buffered
+    %% body alone exceeds 2 * MaxCL, no recv call is needed.
+    Self = self(),
+    Sink = spawn(fun() -> drain_sink_loop(Self, []) end),
+    ok = cactus_conn:drain_oversized_body(binary:copy(<<"a">>, 50), {fake, Sink}, 10),
+    Sink ! stop,
+    ?assertEqual(0, drain_recv_calls(0)).
+
+drain_sink_loop(Reporter, Script) ->
+    receive
+        stop ->
+            ok;
+        {cactus_fake_recv, ConnPid, _Len, _Timeout} ->
+            case Reporter of
+                undefined -> ok;
+                _ -> Reporter ! recv_called
+            end,
+            case Script of
+                [] ->
+                    ConnPid ! {cactus_fake_recv_reply, {error, closed}},
+                    drain_sink_loop(Reporter, []);
+                [{error, _} = Err | Rest] ->
+                    ConnPid ! {cactus_fake_recv_reply, Err},
+                    drain_sink_loop(Reporter, Rest);
+                [{recv, Bytes} | Rest] ->
+                    ConnPid ! {cactus_fake_recv_reply, {ok, Bytes}},
+                    drain_sink_loop(Reporter, Rest)
+            end;
+        _ ->
+            drain_sink_loop(Reporter, Script)
+    end.
+
+drain_recv_calls(Acc) ->
+    receive
+        recv_called -> drain_recv_calls(Acc + 1)
+    after 0 -> Acc
+    end.
+
 read_body_bad_cl_test() ->
     Req = req_with_headers([{~"content-length", ~"abc"}]),
     NoRecv = fun() -> error(should_not_be_called) end,
