@@ -341,7 +341,13 @@ resolve_handler({router, Compiled}, Req) ->
 read_body(Req, Buffered, RecvFun, MaxCL) ->
     case body_framing(Req) of
         none ->
-            {ok, Buffered};
+            %% Per RFC 7230 §3.3.3: a request without `Content-Length`
+            %% or `Transfer-Encoding` has a zero-length message body.
+            %% Any leftover bytes in `Buffered` are NOT body — they
+            %% belong to a pipelined next request (which we currently
+            %% drop on the floor; full pipelining support would feed
+            %% these into the next `parse_loop` iteration).
+            {ok, <<>>};
         chunked ->
             read_chunked(Buffered, RecvFun, MaxCL, 0);
         {content_length, N} when N > MaxCL ->
@@ -475,8 +481,11 @@ full read).
     {ok, binary(), body_state()}
     | {more, binary(), body_state()}
     | {error, term()}.
-consume_body_state(#{framing := none, buffered := Buf} = BS, _Mode) ->
-    {ok, Buf, BS#{buffered := <<>>}};
+consume_body_state(#{framing := none} = BS, _Mode) ->
+    %% Per RFC 7230 §3.3.3: no framing means the body is empty.
+    %% Any `buffered` bytes are pipelined-next-request leftovers, not
+    %% body bytes — discard rather than leak them to the handler.
+    {ok, <<>>, BS#{buffered := <<>>}};
 consume_body_state(
     #{framing := {content_length, N}, bytes_read := Read} = BS, _Mode
 ) when Read >= N ->

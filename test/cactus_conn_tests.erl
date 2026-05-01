@@ -36,10 +36,14 @@ parse_loop_parse_error_test() ->
 %% =============================================================================
 
 read_body_no_content_length_test() ->
+    %% Per RFC 7230 §3.3.3: a request without Content-Length or
+    %% Transfer-Encoding has zero body length. The bytes in `Buffered`
+    %% must NOT be returned as body — they could be a pipelined next
+    %% request's bytes leaking into the handler.
     Req = req_with_headers([]),
     NoRecv = fun() -> error(should_not_be_called) end,
     ?assertEqual(
-        {ok, ~"leftover bytes"},
+        {ok, <<>>},
         cactus_conn:read_body(Req, ~"leftover bytes", NoRecv, 1000)
     ).
 
@@ -626,6 +630,42 @@ conn_streams_empty_send_nofin_emits_nothing_test_() ->
             ]
         end}.
 
+conn_pipelined_get_does_not_leak_next_request_as_body_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_pipe, #{
+                port => 0, handler => cactus_echo_body_handler
+            }),
+            cactus_listener:port(conn_test_pipe)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_pipe) end, fun(Port) ->
+            {"GET with no framing must not see the next pipelined request as body", fun() ->
+                %% Two GETs back-to-back. The first has no Content-Length
+                %% / Transfer-Encoding so its body is zero per RFC 7230
+                %% §3.3.3. Previously the conn returned the buffered
+                %% bytes (which were the second request) as body, and
+                %% the echo handler would echo those bytes — leaking
+                %% one request's bytes into another's response.
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(
+                    Sock,
+                    <<
+                        "POST /echo HTTP/1.1\r\nHost: x\r\n\r\n",
+                        "GET /next HTTP/1.1\r\nHost: x\r\n\r\n"
+                    >>
+                ),
+                Reply = recv_until_closed(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                %% Body must be empty — the second request's bytes must
+                %% not leak into the response.
+                ?assertEqual(<<>>, Body),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
 conn_loop_empty_push_emits_nothing_test_() ->
     {setup,
         fun() ->
@@ -857,7 +897,9 @@ conn_handler_crash_returns_500_test_() ->
 
 %% --- consume_body_state/2 — pure unit tests ---
 
-consume_state_no_framing_returns_buffered_test() ->
+consume_state_no_framing_returns_empty_test() ->
+    %% No framing → zero-length body per RFC 7230 §3.3.3. The
+    %% `buffered` bytes are pipelined-leftover, not body — discard.
     State = #{
         framing => none,
         buffered => ~"hi",
@@ -865,7 +907,7 @@ consume_state_no_framing_returns_buffered_test() ->
         recv => fun() -> error(unused) end,
         max => 1000
     },
-    ?assertMatch({ok, ~"hi", #{buffered := <<>>}}, cactus_conn:consume_body_state(State, all)).
+    ?assertMatch({ok, <<>>, #{buffered := <<>>}}, cactus_conn:consume_body_state(State, all)).
 
 consume_state_already_drained_returns_empty_test() ->
     State = #{
