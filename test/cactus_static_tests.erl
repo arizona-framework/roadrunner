@@ -163,6 +163,58 @@ static_test_() ->
                     Port, ~"/static/hello.html", [{~"Range", ~"bytes=-abc"}]
                 ),
                 ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
+            end},
+            {"sets a Last-Modified header in IMF-fixdate format", fun() ->
+                Reply = http_get(Port, ~"/static/hello.html"),
+                {match, _} = re:run(
+                    Reply,
+                    %% Sun, 06 Nov 1994 08:49:37 GMT — three-letter
+                    %% day, two-digit day, three-letter month, four-digit
+                    %% year, HH:MM:SS, literal GMT.
+                    ~"last-modified: [A-Z][a-z][a-z], \\d{2} [A-Z][a-z][a-z] \\d{4} \\d{2}:\\d{2}:\\d{2} GMT",
+                    [caseless]
+                )
+            end},
+            {"If-Modified-Since matching the file's mtime returns 304", fun() ->
+                %% First fetch the actual Last-Modified to feed back.
+                Reply1 = http_get(Port, ~"/static/hello.html"),
+                {match, [_, LastMod]} = re:run(
+                    Reply1,
+                    ~"last-modified: ([^\r\n]+)",
+                    [caseless, {capture, all, binary}]
+                ),
+                Reply2 = http_get_with(
+                    Port,
+                    ~"/static/hello.html",
+                    [{~"If-Modified-Since", LastMod}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 304 ", _/binary>>, Reply2)
+            end},
+            {"If-Modified-Since older than mtime returns 200", fun() ->
+                Reply = http_get_with(
+                    Port,
+                    ~"/static/hello.html",
+                    [{~"If-Modified-Since", ~"Mon, 01 Jan 1990 00:00:00 GMT"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
+            end},
+            {"malformed If-Modified-Since is ignored", fun() ->
+                Reply = http_get_with(
+                    Port,
+                    ~"/static/hello.html",
+                    [{~"If-Modified-Since", ~"not a real date"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
+            end},
+            {"If-Modified-Since with valid format but bogus month is ignored", fun() ->
+                %% Pattern-matches the IMF-fixdate shape but `Xyz` isn't
+                %% a real month — exercises the try/catch error path.
+                Reply = http_get_with(
+                    Port,
+                    ~"/static/hello.html",
+                    [{~"If-Modified-Since", ~"Sun, 06 Xyz 1994 08:49:37 GMT"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
             end}
         ]
     end}.

@@ -52,29 +52,60 @@ serve_file(FilePath, Req) ->
     case file:read_file_info(FilePath, [{time, posix}]) of
         {ok, #file_info{type = regular, size = Size, mtime = Mtime}} ->
             ETag = etag(Size, Mtime),
-            case if_none_match(Req) =:= ETag of
+            LastMod = format_http_date(Mtime),
+            case is_cached(Req, ETag, Mtime) of
                 true ->
-                    {304, [{~"etag", ETag}, {~"content-length", ~"0"}], ~""};
+                    {304,
+                        [
+                            {~"etag", ETag},
+                            {~"last-modified", LastMod},
+                            {~"content-length", ~"0"}
+                        ],
+                        ~""};
                 false ->
-                    serve_with_range(FilePath, Size, ETag, Req)
+                    serve_with_range(FilePath, Size, ETag, LastMod, Req)
             end;
         _ ->
             cactus_resp:not_found()
     end.
 
+%% Cache hit when either:
+%% - `If-None-Match` matches the current ETag (strong validator), or
+%% - `If-Modified-Since` ≥ the file's mtime (weak validator).
+-spec is_cached(cactus_http1:request(), binary(), integer()) -> boolean().
+is_cached(Req, ETag, Mtime) ->
+    if_none_match(Req) =:= ETag orelse if_modified_since_satisfied(Req, Mtime).
+
+-spec if_modified_since_satisfied(cactus_http1:request(), integer()) -> boolean().
+if_modified_since_satisfied(Req, Mtime) ->
+    case cactus_req:header(~"if-modified-since", Req) of
+        undefined ->
+            false;
+        Value ->
+            case parse_http_date(Value) of
+                {ok, Posix} -> Posix >= Mtime;
+                error -> false
+            end
+    end.
+
 %% Branches on the Range header: satisfiable single range → 206,
 %% unsatisfiable → 416, anything else (no header, malformed, multi-range)
 %% → fall through to a normal 200 with the full body.
--spec serve_with_range(file:filename_all(), non_neg_integer(), binary(), cactus_http1:request()) ->
-    cactus_resp:response().
-serve_with_range(FilePath, Size, ETag, Req) ->
+-spec serve_with_range(
+    file:filename_all(),
+    non_neg_integer(),
+    binary(),
+    binary(),
+    cactus_http1:request()
+) -> cactus_resp:response().
+serve_with_range(FilePath, Size, ETag, LastMod, Req) ->
     case parse_range(cactus_req:header(~"range", Req), Size) of
         {range, Start, End} ->
-            serve_range(FilePath, Size, ETag, Start, End);
+            serve_range(FilePath, Size, ETag, LastMod, Start, End);
         unsatisfiable ->
-            range_not_satisfiable(Size, ETag);
+            range_not_satisfiable(Size, ETag, LastMod);
         none ->
-            serve_full_file(FilePath, ETag)
+            serve_full_file(FilePath, ETag, LastMod)
     end.
 
 %% read_file_info already established the file exists and is regular;
@@ -82,14 +113,15 @@ serve_with_range(FilePath, Size, ETag, Req) ->
 %% the exception bubbles up to the conn's standard handler-crash path
 %% and the client sees a 500. That's a strictly rarer case than
 %% 404-on-missing-file which is handled in `serve_file/2` above.
--spec serve_full_file(file:filename_all(), binary()) -> cactus_resp:response().
-serve_full_file(FilePath, ETag) ->
+-spec serve_full_file(file:filename_all(), binary(), binary()) -> cactus_resp:response().
+serve_full_file(FilePath, ETag, LastMod) ->
     {ok, Bytes} = file:read_file(FilePath),
     {200,
         [
             {~"content-type", content_type_for(FilePath)},
             {~"content-length", integer_to_binary(byte_size(Bytes))},
-            {~"etag", ETag}
+            {~"etag", ETag},
+            {~"last-modified", LastMod}
         ],
         Bytes}.
 
@@ -180,9 +212,14 @@ bin_to_pos_int(Bin) ->
     end.
 
 -spec serve_range(
-    file:filename_all(), non_neg_integer(), binary(), non_neg_integer(), non_neg_integer()
+    file:filename_all(),
+    non_neg_integer(),
+    binary(),
+    binary(),
+    non_neg_integer(),
+    non_neg_integer()
 ) -> cactus_resp:response().
-serve_range(FilePath, Size, ETag, Start, End) ->
+serve_range(FilePath, Size, ETag, LastMod, Start, End) ->
     Length = End - Start + 1,
     {ok, IoDevice} = file:open(FilePath, [read, binary, raw]),
     try
@@ -200,15 +237,16 @@ serve_range(FilePath, Size, ETag, Start, End) ->
                 {~"content-type", content_type_for(FilePath)},
                 {~"content-length", integer_to_binary(byte_size(Bytes))},
                 {~"content-range", ContentRange},
-                {~"etag", ETag}
+                {~"etag", ETag},
+                {~"last-modified", LastMod}
             ],
             Bytes}
     after
         ok = file:close(IoDevice)
     end.
 
--spec range_not_satisfiable(non_neg_integer(), binary()) -> cactus_resp:response().
-range_not_satisfiable(Size, ETag) ->
+-spec range_not_satisfiable(non_neg_integer(), binary(), binary()) -> cactus_resp:response().
+range_not_satisfiable(Size, ETag, LastMod) ->
     %% RFC 7233 §4.4: 416 SHOULD include Content-Range with the total
     %% size so clients can recover.
     ContentRange = iolist_to_binary([~"bytes */", integer_to_binary(Size)]),
@@ -216,7 +254,8 @@ range_not_satisfiable(Size, ETag) ->
         [
             {~"content-length", ~"0"},
             {~"content-range", ContentRange},
-            {~"etag", ETag}
+            {~"etag", ETag},
+            {~"last-modified", LastMod}
         ],
         ~""}.
 
@@ -228,3 +267,88 @@ validate_segments(Segments) ->
         true -> traversal;
         false -> ok
     end.
+
+%% Format a posix timestamp as IMF-fixdate (RFC 7231 §7.1.1.1) — the
+%% canonical HTTP date format. Example: `Sun, 06 Nov 1994 08:49:37 GMT`.
+-spec format_http_date(integer()) -> binary().
+format_http_date(Posix) ->
+    {{Y, M, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(Posix, second),
+    DayName = day_name(calendar:day_of_the_week(Y, M, D)),
+    MonthName = month_name(M),
+    iolist_to_binary(
+        io_lib:format(
+            "~s, ~2..0B ~s ~4..0B ~2..0B:~2..0B:~2..0B GMT",
+            [DayName, D, MonthName, Y, H, Mi, S]
+        )
+    ).
+
+%% Parse an IMF-fixdate header back into a posix timestamp. Returns
+%% `error` for any other format (we don't bother with the legacy RFC 850
+%% or asctime forms; modern clients all emit IMF-fixdate).
+-spec parse_http_date(binary()) -> {ok, integer()} | error.
+parse_http_date(<<
+    _DayName:3/binary,
+    ", ",
+    D1,
+    D2,
+    " ",
+    Mon:3/binary,
+    " ",
+    Y1,
+    Y2,
+    Y3,
+    Y4,
+    " ",
+    H1,
+    H2,
+    ":",
+    Mi1,
+    Mi2,
+    ":",
+    S1,
+    S2,
+    " GMT"
+>>) ->
+    try
+        Day = list_to_integer([D1, D2]),
+        Year = list_to_integer([Y1, Y2, Y3, Y4]),
+        Hour = list_to_integer([H1, H2]),
+        Minute = list_to_integer([Mi1, Mi2]),
+        Second = list_to_integer([S1, S2]),
+        Month = month_number(Mon),
+        DateTime = {{Year, Month, Day}, {Hour, Minute, Second}},
+        Epoch = calendar:datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}}),
+        {ok, calendar:datetime_to_gregorian_seconds(DateTime) - Epoch}
+    catch
+        _:_ -> error
+    end;
+parse_http_date(_) ->
+    error.
+
+day_name(N) ->
+    element(N, {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}).
+
+month_name(N) ->
+    element(
+        N,
+        {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+    ).
+
+%% `maps:get/2` raises `{badkey, _}` on an unknown month abbreviation;
+%% the surrounding try/catch in `parse_http_date/1` turns that into
+%% the `error` return, which is what we want for malformed input.
+month_number(Mon) ->
+    maps:get(Mon, #{
+        ~"Jan" => 1,
+        ~"Feb" => 2,
+        ~"Mar" => 3,
+        ~"Apr" => 4,
+        ~"May" => 5,
+        ~"Jun" => 6,
+        ~"Jul" => 7,
+        ~"Aug" => 8,
+        ~"Sep" => 9,
+        ~"Oct" => 10,
+        ~"Nov" => 11,
+        ~"Dec" => 12
+    }).
