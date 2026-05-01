@@ -186,6 +186,96 @@ request_exception_fires_on_handler_crash_test_() ->
         end}
     end}.
 
+ws_telemetry_fires_around_upgrade_and_each_frame_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = application:ensure_all_started(telemetry),
+            Name = telemetry_test_ws,
+            {ok, _} = cactus_listener:start_link(Name, #{
+                port => 0,
+                routes => [{~"/ws", cactus_ws_upgrade_handler, undefined}]
+            }),
+            {Name, cactus_listener:port(Name)}
+        end,
+        fun({Name, _Port}) -> ok = cactus_listener:stop(Name) end, fun({_Name, Port}) ->
+            {"upgrade + frame_in + frame_out events fire with the right metadata", fun() ->
+                HandlerId = attach([
+                    [cactus, ws, upgrade],
+                    [cactus, ws, frame_in],
+                    [cactus, ws, frame_out]
+                ]),
+                try
+                    Sock = ws_handshake(Port),
+                    %% One masked text frame "Hi" — handler echoes it.
+                    send_masked_text(Sock, ~"Hi"),
+                    {ok, Echo} = gen_tcp:recv(Sock, 4, 1000),
+                    ?assertEqual(<<16#81, 16#02, "Hi">>, Echo),
+                    ok = gen_tcp:close(Sock),
+                    Events = collect_events(3),
+                    {_, _, UpgradeMd} = lists:keyfind(
+                        [cactus, ws, upgrade], 1, Events
+                    ),
+                    ?assertEqual(
+                        cactus_ws_echo_handler, maps:get(module, UpgradeMd)
+                    ),
+                    ?assertMatch(<<_:16/binary>>, maps:get(request_id, UpgradeMd)),
+                    ?assertMatch({{127, 0, 0, 1}, _}, maps:get(peer, UpgradeMd)),
+                    {_, InM, InMd} = lists:keyfind(
+                        [cactus, ws, frame_in], 1, Events
+                    ),
+                    ?assertEqual(text, maps:get(opcode, InMd)),
+                    ?assertEqual(2, maps:get(payload_size, InM)),
+                    {_, OutM, OutMd} = lists:keyfind(
+                        [cactus, ws, frame_out], 1, Events
+                    ),
+                    ?assertEqual(text, maps:get(opcode, OutMd)),
+                    ?assertEqual(2, maps:get(payload_size, OutM))
+                after
+                    detach(HandlerId)
+                end
+            end}
+        end}.
+
+ws_handshake(Port) ->
+    {ok, Sock} = gen_tcp:connect(
+        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+    ),
+    Req = iolist_to_binary([
+        ~"GET /ws HTTP/1.1\r\n",
+        ~"Host: x\r\n",
+        ~"Upgrade: websocket\r\n",
+        ~"Connection: Upgrade\r\n",
+        ~"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+        ~"Sec-WebSocket-Version: 13\r\n",
+        ~"\r\n"
+    ]),
+    ok = gen_tcp:send(Sock, Req),
+    %% Drain the 101 handshake response so subsequent recv only sees frames.
+    recv_until_blank_line(Sock, <<>>),
+    Sock.
+
+recv_until_blank_line(Sock, Acc) ->
+    case binary:match(Acc, ~"\r\n\r\n") of
+        nomatch ->
+            {ok, More} = gen_tcp:recv(Sock, 0, 1000),
+            recv_until_blank_line(Sock, <<Acc/binary, More/binary>>);
+        _ ->
+            ok
+    end.
+
+send_masked_text(Sock, Payload) ->
+    Mask = <<1, 2, 3, 4>>,
+    Masked = mask(Payload, Mask, <<>>, 0),
+    Len = byte_size(Payload),
+    %% FIN=1, opcode=text(1), MASK=1, payload-len = Len.
+    ok = gen_tcp:send(Sock, <<16#81, (16#80 bor Len), Mask/binary, Masked/binary>>).
+
+mask(<<>>, _Mask, Acc, _I) ->
+    Acc;
+mask(<<B, Rest/binary>>, Mask, Acc, I) ->
+    M = binary:at(Mask, I rem 4),
+    mask(Rest, Mask, <<Acc/binary, (B bxor M)>>, I + 1).
+
 %% --- helpers ---
 
 setup_listener() ->

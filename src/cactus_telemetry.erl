@@ -63,6 +63,32 @@ have one module to grep for and tests have one place to attach.
   - **Measurements:** `duration` in `native` time units.
   - **Metadata:** `listener_name`, `peer`, `requests_served`.
 
+- `[cactus, ws, upgrade]` — fired in the conn process once the
+  WebSocket handshake response has been written. Marks the
+  transition from HTTP/1.1 keep-alive into the WS frame loop.
+
+  - **Measurements:** `system_time`.
+  - **Metadata:** `listener_name`, `peer`, `request_id`, `module`
+    (the `cactus_ws_handler` module driving the loop).
+
+- `[cactus, ws, frame_in]` — fired for every frame parsed from the
+  client, including control frames (`ping`, `pong`, `close`) that
+  the conn handles internally before delegating to the user
+  handler.
+
+  - **Measurements:** `system_time`, `payload_size` (bytes).
+  - **Metadata:** `listener_name`, `peer`, `request_id`, `module`,
+    `opcode` (`text | binary | continuation | close | ping | pong`).
+
+- `[cactus, ws, frame_out]` — fired for every frame written back to
+  the client: handler `{reply, ...}` outputs, automatic pong
+  responses, and the close frame on shutdown. Each frame in a
+  batched `{reply, [F1, F2, ...]}` produces one event.
+
+  - **Measurements:** `system_time`, `payload_size` (bytes).
+  - **Metadata:** `listener_name`, `peer`, `request_id`, `module`,
+    `opcode`.
+
 The `start_time` value returned by `request_start/1` must be passed
 back into `request_stop/3` / `request_exception/4` to compute
 `duration`. Subscribers can wire up via `telemetry:attach/4` in
@@ -75,7 +101,10 @@ production or `telemetry_test:attach_event_handlers/2` in tests.
     request_exception/4,
     response_send/2,
     listener_accept/1,
-    listener_conn_close/2
+    listener_conn_close/2,
+    ws_upgrade/1,
+    ws_frame_in/2,
+    ws_frame_out/2
 ]).
 
 -export_type([metadata/0]).
@@ -184,6 +213,36 @@ listener_conn_close(StartMono, Metadata) ->
     telemetry:execute(
         [cactus, listener, conn_close],
         #{duration => erlang:monotonic_time() - StartMono},
+        Metadata
+    ),
+    ok.
+
+-doc "Emit `[cactus, ws, upgrade]` as the conn enters the WebSocket loop.".
+-spec ws_upgrade(map()) -> ok.
+ws_upgrade(Metadata) ->
+    telemetry:execute(
+        [cactus, ws, upgrade],
+        #{system_time => erlang:system_time()},
+        Metadata
+    ),
+    ok.
+
+-doc "Emit `[cactus, ws, frame_in]` for one parsed inbound frame.".
+-spec ws_frame_in(map(), non_neg_integer()) -> ok.
+ws_frame_in(Metadata, PayloadSize) ->
+    telemetry:execute(
+        [cactus, ws, frame_in],
+        #{system_time => erlang:system_time(), payload_size => PayloadSize},
+        Metadata
+    ),
+    ok.
+
+-doc "Emit `[cactus, ws, frame_out]` for one outbound frame.".
+-spec ws_frame_out(map(), non_neg_integer()) -> ok.
+ws_frame_out(Metadata, PayloadSize) ->
+    telemetry:execute(
+        [cactus, ws, frame_out],
+        #{system_time => erlang:system_time(), payload_size => PayloadSize},
         Metadata
     ),
     ok.
