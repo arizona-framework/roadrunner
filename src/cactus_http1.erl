@@ -556,7 +556,11 @@ parse_size_line(Line, Rest) ->
             [S] -> S;
             [S, _Ext] -> S
         end,
-    case parse_hex(trim_ows(SizePart)) of
+    %% Per RFC 7230 §4.1: chunk-size = 1*HEXDIG. BWS is allowed before
+    %% `;` (chunk-ext separator) but NOT before the chunk-size itself —
+    %% so trim only trailing OWS, never leading. ` 5\r\n` is malformed;
+    %% `5 ;ext\r\n` is fine.
+    case parse_hex(trim_trailing_ows(SizePart)) of
         {ok, N} -> {ok, N, Rest};
         error -> {error, bad_chunk_size}
     end.

@@ -551,6 +551,21 @@ chunk_size_with_bws_before_ext_test() ->
         cactus_http1:parse_chunk(~"5 ;ext=value\r\nhello\r\n")
     ).
 
+chunk_size_with_leading_space_rejected_test() ->
+    %% chunk-size = 1*HEXDIG (RFC 7230 §4.1) — no whitespace permitted
+    %% before the size. Regression: previously `trim_ows` stripped both
+    %% sides and would have accepted ` 5\r\n...`.
+    ?assertEqual(
+        {error, bad_chunk_size},
+        cactus_http1:parse_chunk(~" 5\r\nhello\r\n")
+    ).
+
+chunk_size_with_leading_tab_rejected_test() ->
+    ?assertEqual(
+        {error, bad_chunk_size},
+        cactus_http1:parse_chunk(~"\t5\r\nhello\r\n")
+    ).
+
 %% --- last chunk ---
 
 chunk_last_no_trailers_test() ->
