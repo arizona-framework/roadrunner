@@ -2,18 +2,38 @@
 -moduledoc """
 Per-connection `{loop, ...}` response — message-driven streaming.
 
-Called by `cactus_conn:dispatch_response/4` after a handler returns
-`{loop, Status, Headers, State}`. Writes the status line + chunked
-headers, then runs a recursive selective-receive loop that
-dispatches every Erlang message through `Module:handle_info/3`.
-The handler's `Push(Data)` callback frames the data as one chunk
-and writes it. On `{stop, _NewState}` the loop emits the size-0
-chunked terminator and returns.
+Called by `cactus_conn_statem`'s dispatching state after a
+handler returns `{loop, Status, Headers, State}`. Writes the
+status line + chunked headers, then runs a recursive selective-
+receive loop that dispatches every Erlang message through
+`Module:handle_info/3`. The handler's `Push(Data)` callback frames
+the data as one chunk and writes it. On `{stop, _NewState}` the
+loop emits the size-0 chunked terminator and returns.
 
 **Runs in the conn process**, not a child — handlers commonly do
 `self() ! Msg` or `register(Name, self())` from `handle/1`,
 expecting the loop to share their mailbox. Splitting into a child
 process would break that contract; the loop stays inline.
+
+## Mailbox contract
+
+Because the loop runs synchronously in the conn's `gen_statem`
+process and uses `receive` directly, the conn's gen_statem is
+**not** processing events while the loop is active. The loop
+explicitly skips well-known OTP-internal message shapes
+(`{system, _, _}`, `{'$gen_call', _, _}`, `{'$gen_cast', _}`)
+so they remain in the mailbox and `gen_statem` resumes their
+normal handling once the loop returns. Concretely:
+
+- `sys:get_state/1`, `sys:trace/2`, `sys:replace_state/2` against
+  the conn process while it is in a loop response will appear to
+  hang — the caller should expect to time out.
+- `gen_statem:call/2,3` against the conn process is unsupported
+  and will hang the same way.
+- Any other Erlang message reaches the handler's
+  `handle_info/3` verbatim. Handlers should pattern-match
+  defensively (with a catch-all clause) rather than crash on
+  unexpected messages.
 """.
 
 -export([run/5]).
@@ -38,12 +58,21 @@ run(Socket, Status, UserHeaders, Handler, State) ->
     Push = make_push(Socket),
     info_loop(Socket, Handler, Push, State).
 
-%% Selective receive on every Erlang message → handler:handle_info/3.
-%% On `{stop, _}` we emit the size-0 chunked terminator and return.
+%% Selective receive on every Erlang message → handler:handle_info/3,
+%% **except** OTP-internal shapes (`{system, _, _}` for `sys` protocol,
+%% `{'$gen_call', _, _}` and `{'$gen_cast', _}` for `gen_statem`
+%% requests), which stay in the mailbox so the gen_statem resumes
+%% their normal handling after this loop returns. On `{stop, _}` we
+%% emit the size-0 chunked terminator and return.
 -spec info_loop(cactus_transport:socket(), module(), cactus_handler:push_fun(), term()) -> ok.
 info_loop(Socket, Handler, Push, State) ->
     receive
-        Info ->
+        Info when
+            not (is_tuple(Info) andalso
+                (element(1, Info) =:= system orelse
+                    element(1, Info) =:= '$gen_call' orelse
+                    element(1, Info) =:= '$gen_cast'))
+        ->
             case Handler:handle_info(Info, Push, State) of
                 {ok, NewState} ->
                     info_loop(Socket, Handler, Push, NewState);
