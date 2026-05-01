@@ -102,6 +102,7 @@ production or `telemetry_test:attach_event_handlers/2` in tests.
     response_send/2,
     listener_accept/1,
     listener_conn_close/2,
+    request_rejected/1,
     slots_reconciled/1,
     drain_acknowledged/1,
     ws_upgrade/1,
@@ -215,6 +216,24 @@ listener_conn_close(StartMono, Metadata) ->
     telemetry:execute(
         [cactus, listener, conn_close],
         #{duration => erlang:monotonic_time() - StartMono},
+        Metadata
+    ),
+    ok.
+
+-doc """
+Emit `[cactus, request, rejected]` when a request is dropped at the
+parser/limit layer before any handler runs (malformed request line,
+header CRLF injection, header count or block size limits exceeded,
+oversized Content-Length, transfer-encoding conflicts, etc.). Lets
+ops tooling track protocol-attack-shaped traffic without scraping
+debug logs. `Metadata` should include `listener_name`, `peer`, and
+`reason` (the parser's error atom).
+""".
+-spec request_rejected(map()) -> ok.
+request_rejected(Metadata) ->
+    telemetry:execute(
+        [cactus, request, rejected],
+        #{system_time => erlang:system_time()},
         Metadata
     ),
     ok.

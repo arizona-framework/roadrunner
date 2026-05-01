@@ -213,6 +213,9 @@ handle_event(
                     %% ECONNRESET instead of a clean 413. The byte +
                     %% time caps prevent this becoming a DoS vector.
                     _ = cactus_conn:drain_oversized_body(Buffered, Socket, MaxCL),
+                    ok = cactus_telemetry:request_rejected(
+                        rejection_metadata(Data, content_length_too_large)
+                    ),
                     _ = cactus_conn:send_payload_too_large(Socket),
                     {stop, normal, Data};
                 {error, request_timeout} ->
@@ -220,13 +223,19 @@ handle_event(
                     {stop, normal, Data};
                 {error, slow_client} ->
                     {stop, normal, Data};
-                {error, _} ->
+                {error, BodyReason} ->
+                    ok = cactus_telemetry:request_rejected(
+                        rejection_metadata(Data, BodyReason)
+                    ),
                     _ = cactus_conn:send_bad_request(Socket),
                     {stop, normal, Data}
             end;
         manual ->
             case cactus_conn:body_framing(Req) of
-                {error, _} ->
+                {error, FramingReason} ->
+                    ok = cactus_telemetry:request_rejected(
+                        rejection_metadata(Data, FramingReason)
+                    ),
                     _ = cactus_conn:send_bad_request(Socket),
                     {stop, normal, Data};
                 Framing ->
@@ -472,6 +481,10 @@ dispatch_response(Socket, _Handler, Req, {Status, Headers, Body}) when is_intege
     ),
     ok.
 
+-spec rejection_metadata(#data{}, atom()) -> map().
+rejection_metadata(#data{listener_name = ListenerName, peer = Peer}, Reason) ->
+    #{listener_name => ListenerName, peer => Peer, reason => Reason}.
+
 -spec do_read_request(non_neg_integer(), #data{}) ->
     gen_statem:event_handler_result(atom()).
 do_read_request(
@@ -514,6 +527,11 @@ do_read_request(
                 msg => "cactus rejecting malformed request",
                 peer => Peer,
                 listener_name => ListenerName,
+                reason => Reason
+            }),
+            ok = cactus_telemetry:request_rejected(#{
+                listener_name => ListenerName,
+                peer => Peer,
                 reason => Reason
             }),
             _ = cactus_conn:send_bad_request(Socket),

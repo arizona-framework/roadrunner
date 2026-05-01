@@ -104,6 +104,73 @@ response_send_failed_works_without_logger_metadata_test() ->
         detach(HandlerId)
     end.
 
+request_rejected_event_fires_on_bad_request_line_test() ->
+    %% Malformed request line is dropped at the parser layer; emit
+    %% `[cactus, request, rejected]` with the parser's reason atom so
+    %% ops tooling can track protocol-attack-shaped traffic.
+    {ok, _} = application:ensure_all_started(telemetry),
+    case whereis(pg) of
+        undefined -> {ok, _} = pg:start_link();
+        _ -> ok
+    end,
+    HandlerId = attach([[cactus, request, rejected]]),
+    try
+        Self = self(),
+        Tag = make_ref(),
+        Sink = spawn(fun() -> drain_recv_sink(Tag, Self, [{recv, ~"NOT-A-REQUEST\r\n\r\n"}]) end),
+        Opts = #{
+            dispatch => {handler, cactus_hello_handler},
+            middlewares => [],
+            max_content_length => 1_000_000,
+            request_timeout => 200,
+            keep_alive_timeout => 200,
+            max_keep_alive_request => 100,
+            max_clients => 10,
+            client_counter => atomics:new(1, [{signed, false}]),
+            requests_counter => atomics:new(1, [{signed, false}]),
+            minimum_bytes_per_second => 0,
+            body_buffering => auto,
+            listener_name => probe_listener_rej
+        },
+        true = cactus_conn:try_acquire_slot(Opts),
+        {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+        Ref = monitor(process, Pid),
+        Pid ! shoot,
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 2000 -> error(no_normal_exit)
+        end,
+        receive
+            {telemetry_event, [cactus, request, rejected], _, Md} ->
+                ?assertEqual(probe_listener_rej, maps:get(listener_name, Md)),
+                ?assertEqual(bad_request_line, maps:get(reason, Md))
+        after 1000 -> error(no_request_rejected_event)
+        end,
+        Sink ! stop
+    after
+        detach(HandlerId)
+    end.
+
+drain_recv_sink(Tag, Logger, Script) ->
+    receive
+        stop ->
+            ok;
+        {cactus_fake_recv, ConnPid, _Len, _Timeout} ->
+            case Script of
+                [] ->
+                    ConnPid ! {cactus_fake_recv_reply, {error, closed}},
+                    drain_recv_sink(Tag, Logger, []);
+                [{recv, Bytes} | Rest] ->
+                    ConnPid ! {cactus_fake_recv_reply, {ok, Bytes}},
+                    drain_recv_sink(Tag, Logger, Rest)
+            end;
+        {cactus_fake_send, _, Data} ->
+            Logger ! {sent, Tag, Data},
+            drain_recv_sink(Tag, Logger, Script);
+        _ ->
+            drain_recv_sink(Tag, Logger, Script)
+    end.
+
 drain_acknowledged_event_fires_with_request_metadata_test() ->
     {ok, _} = application:ensure_all_started(telemetry),
     HandlerId = attach([[cactus, drain, acknowledged]]),
