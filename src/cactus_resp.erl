@@ -34,7 +34,23 @@ helpers only fill in what the handler can know.
 text(Status, Body) ->
     with_length(Status, ~"text/plain; charset=utf-8", Body).
 
--doc "HTML response with `text/html; charset=utf-8`.".
+-doc """
+HTML response with `text/html; charset=utf-8`.
+
+The charset suffix is intentional — modern browsers default to
+ISO-8859-1 absent an explicit charset in the response header,
+which is wrong for ~all current content. To match a server that
+emits bare `text/html` (e.g. cowboy's default), override after the
+build:
+
+```erlang
+cactus_resp:add_header(
+    cactus_resp:html(200, Body), ~"content-type", ~"text/html"
+).
+```
+
+`add_header/3` prepends, so the bare value wins on header lookup.
+""".
 -spec html(StatusCode :: cactus_http1:status(), Body :: iodata()) -> response().
 html(Status, Body) ->
     with_length(Status, ~"text/html; charset=utf-8", Body).
