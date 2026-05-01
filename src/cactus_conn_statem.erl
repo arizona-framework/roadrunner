@@ -271,7 +271,19 @@ handle_event(
             buffered_finish(Data, ProtoOpts, Req, Response, Served);
         _ ->
             {stop, normal, Data}
-    end.
+    end;
+%% Catch-all for unexpected info events. Conns are unlinked from the
+%% acceptor and don't `trap_exit`, so stray `'EXIT'` signals never
+%% reach here — but a buggy library or trace tooling could deliver an
+%% out-of-band message. Drop it at debug level so observability is
+%% preserved without flooding production warning/notice logs.
+handle_event(info, Unexpected, State, Data) ->
+    logger:debug(#{
+        msg => "cactus_conn_statem dropping unexpected info",
+        state => State,
+        info => Unexpected
+    }),
+    {keep_state, Data}.
 
 %% Mirror `cactus_conn:handle_and_send/4` exactly: bracket the
 %% middleware/handler pipeline with `[cactus, request, start | stop |
@@ -357,10 +369,26 @@ request_timeout(keep_alive, ProtoOpts) -> maps:get(keep_alive_timeout, ProtoOpts
 
 %% Non-blocking peek for a `{cactus_drain, _}` broadcast that may have
 %% landed in the gen_statem mailbox after state_enter set the parse
-%% timeout. The state_timeout fires before info events under
-%% gen_statem's priority rules — without this peek, a drain that
-%% arrived during dispatching/finishing wouldn't be observed until
-%% AFTER the next request's parse begins.
+%% timeout.
+%%
+%% **Why a raw receive instead of letting gen_statem dispatch?**
+%% Per OTP's gen_statem event-priority rules (see
+%% [the gen_statem User's Guide on event types](https://www.erlang.org/doc/system/statem.html#event-types)),
+%% `state_timeout` events take precedence over `info` events. So even
+%% if a `{cactus_drain, _}` info message is already in the mailbox
+%% when state_enter sets `{state_timeout, 0, parse}`, gen_statem
+%% will fire the parse timeout FIRST and only deliver the drain
+%% afterward — by which point the next request's parse has already
+%% begun. Tried alternatives: `postpone` (delays handling, not
+%% priority); `{generic_timeout, _, _}` (same priority class as
+%% state_timeout); reordering state_enter (can't, state_enter
+%% rejects `next_event`).
+%%
+%% The peek bypasses gen_statem's queue once per reading_request
+%% iteration to consume any pending drain message. The rest of the
+%% time drain_pending is already true (caught by the first clause)
+%% or the mailbox has no drain (after-0 path). If a future OTP
+%% release adds a `peek_mailbox`-style primitive, revisit.
 -spec drain_peek(#data{}) -> #data{}.
 drain_peek(#data{drain_pending = true} = Data) ->
     Data;

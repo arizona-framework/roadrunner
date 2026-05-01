@@ -563,6 +563,19 @@ terminate_without_shoot_skips_conn_close_telemetry_test() ->
         telemetry:detach(HandlerId)
     end.
 
+unexpected_info_is_dropped_silently_test() ->
+    %% Catch-all info handler logs at debug and keeps state. Send a
+    %% stray message in `awaiting_shoot` and verify the gen_statem is
+    %% still alive afterwards (no function_clause crash).
+    ensure_pg(),
+    Sink = spawn_recv_sink([]),
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, fake_proto_opts(unexpected)),
+    Pid ! {stray_msg_from_buggy_lib, make_ref()},
+    %% Process must still be alive — assert via gen_statem:stop running
+    %% terminate cleanly.
+    ok = gen_statem:stop(Pid),
+    stop_sink(Sink).
+
 listener_accept_and_conn_close_fire_around_statem_test() ->
     {ok, _} = application:ensure_all_started(telemetry),
     Self = self(),
