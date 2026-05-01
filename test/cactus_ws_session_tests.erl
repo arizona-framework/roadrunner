@@ -272,17 +272,28 @@ mask(Bin, Key) ->
     crypto:exor(Bin, KeySlice).
 
 is_hibernating(Pid, TimeoutMs) ->
-    is_hibernating_loop(Pid, erlang:monotonic_time(millisecond) + TimeoutMs).
+    is_hibernating_loop(
+        Pid,
+        hibernation_heap_threshold(),
+        erlang:monotonic_time(millisecond) + TimeoutMs
+    ).
 
 %% A hibernated process is in `status =:= waiting` AND has had its
-%% heap shrunk to its minimum (typically 233 words on default OTP).
+%% heap shrunk to the OTP-configured minimum.
 %% `current_function` for a process resumed from hibernation is the
 %% M:F:A it'll re-enter when woken (so we can't rely on it being
-%% `{erlang, hibernate, _}`).
-is_hibernating_loop(Pid, Deadline) ->
+%% `{erlang, hibernate, _}`). Read the actual minimum from
+%% `erlang:system_info(min_heap_size)` so the threshold tracks the
+%% running OTP version (233 words on default 28+; +64 word slack
+%% for sys-debug / process-dict allocations that survive hibernation).
+hibernation_heap_threshold() ->
+    {min_heap_size, Min} = erlang:system_info(min_heap_size),
+    Min + 64.
+
+is_hibernating_loop(Pid, Threshold, Deadline) ->
     case process_info(Pid, [status, total_heap_size, message_queue_len]) of
         [{status, waiting}, {total_heap_size, H}, {message_queue_len, 0}] when
-            H =< 256
+            H =< Threshold
         ->
             true;
         _ ->
@@ -291,7 +302,7 @@ is_hibernating_loop(Pid, Deadline) ->
                     false;
                 false ->
                     timer:sleep(10),
-                    is_hibernating_loop(Pid, Deadline)
+                    is_hibernating_loop(Pid, Threshold, Deadline)
             end
     end.
 

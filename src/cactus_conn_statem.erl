@@ -260,6 +260,10 @@ handle_event(
     end;
 handle_event(info, Msg, reading_request, #data{socket = Socket} = Data) ->
     {DataTag, ClosedTag, ErrorTag} = cactus_transport:messages(Socket),
+    %% `_Sock` discarded — one socket per conn (captured in
+    %% `#data.socket` at init/shoot). The match on the dynamic tag
+    %% atoms is sufficient; if we ever multiplex sockets per conn,
+    %% bind `Sock = element(2, Socket)` and match it here.
     case Msg of
         {DataTag, _Sock, Bytes} ->
             handle_request_bytes(Bytes, Data);

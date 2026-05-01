@@ -169,6 +169,9 @@ frame_loop(enter, _Old, #data{socket = Socket} = Data) ->
     arm_or_stop(Socket, Data, []);
 frame_loop(info, Msg, #data{socket = Socket} = Data) ->
     {DataTag, ClosedTag, ErrorTag} = cactus_transport:messages(Socket),
+    %% `_Sock` discarded — one socket per gen_statem (captured in
+    %% `#data.socket` at init). If we ever support multi-socket
+    %% sessions, match `Sock = element(2, Socket)` here.
     case Msg of
         {DataTag, _Sock, Bytes} ->
             process_buffer(append_buffer(Data, Bytes), false);

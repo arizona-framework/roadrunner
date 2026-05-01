@@ -324,12 +324,25 @@ end_to_end_hibernate_across_keep_alive_iterations_test() ->
     stop_sink(Sink).
 
 is_hibernating(Pid, TimeoutMs) ->
-    is_hibernating_loop(Pid, erlang:monotonic_time(millisecond) + TimeoutMs).
+    is_hibernating_loop(
+        Pid,
+        hibernation_heap_threshold(),
+        erlang:monotonic_time(millisecond) + TimeoutMs
+    ).
 
-is_hibernating_loop(Pid, Deadline) ->
+%% A hibernated process's heap shrinks to the OTP-configured minimum.
+%% Reading `erlang:system_info(min_heap_size)` at test time tracks
+%% whatever the running OTP uses (233 words on default 28+; future
+%% versions may bump it). The +64 word slack absorbs any process
+%% dictionary / sys-debug allocations that survive hibernation.
+hibernation_heap_threshold() ->
+    {min_heap_size, Min} = erlang:system_info(min_heap_size),
+    Min + 64.
+
+is_hibernating_loop(Pid, Threshold, Deadline) ->
     case process_info(Pid, [status, total_heap_size, message_queue_len]) of
         [{status, waiting}, {total_heap_size, H}, {message_queue_len, 0}] when
-            H =< 256
+            H =< Threshold
         ->
             true;
         _ ->
@@ -338,7 +351,7 @@ is_hibernating_loop(Pid, Deadline) ->
                     false;
                 false ->
                     timer:sleep(10),
-                    is_hibernating_loop(Pid, Deadline)
+                    is_hibernating_loop(Pid, Threshold, Deadline)
             end
     end.
 
