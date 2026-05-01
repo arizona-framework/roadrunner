@@ -157,6 +157,20 @@ The check is racy by a small amount: between increment and rollback
 multiple acceptors may briefly observe a count slightly above the
 cap, but the count is corrected immediately by the rollback. The
 overshoot is at most `num_acceptors - 1` — bounded and harmless.
+
+## Slot leak under abnormal exits
+
+The slot is released by `cactus_conn_statem:terminate/3` on every
+normal exit path (handler crash, parse error, drain stop, peer
+close). Under `exit(Pid, kill)` — sent by a supervisor or by an
+operator using `recon:proc_count/2`-style cleanup — the runtime
+skips `terminate/3` per OTP semantics, so the slot is **leaked**
+for the lifetime of the listener process. This is bounded:
+`max_clients` accepted connections each leak at most one slot
+under killing, and the listener restart resets the counter. If
+leaks become a real concern under chaos-test conditions, add a
+periodic reaper that compares `pg:get_members({cactus_drain, _})`
+against the live counter and reconciles the difference.
 """.
 -spec try_acquire_slot(proto_opts()) -> boolean().
 try_acquire_slot(#{client_counter := Ref, max_clients := Max}) ->
