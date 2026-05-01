@@ -31,7 +31,8 @@ Add a new property:
     http1_parse_request_incremental/1,
     http1_parse_chunk_incremental/1,
     statem_terminates_normal_on_random_inputs/1,
-    statem_request_start_and_stop_share_request_id/1
+    statem_request_start_and_stop_share_request_id/1,
+    router_param_bindings_round_trip/1
 ]).
 
 suite() ->
@@ -53,7 +54,8 @@ all() ->
         http1_parse_request_incremental,
         http1_parse_chunk_incremental,
         statem_terminates_normal_on_random_inputs,
-        statem_request_start_and_stop_share_request_id
+        statem_request_start_and_stop_share_request_id,
+        router_param_bindings_round_trip
     ].
 
 init_per_suite(Config) ->
@@ -149,5 +151,11 @@ statem_terminates_normal_on_random_inputs(Config) ->
 statem_request_start_and_stop_share_request_id(Config) ->
     ct_property_test:quickcheck(
         cactus_statem_props:prop_request_start_and_stop_share_request_id(),
+        Config
+    ).
+
+router_param_bindings_round_trip(Config) ->
+    ct_property_test:quickcheck(
+        cactus_router_props:prop_param_bindings_round_trip(),
         Config
     ).
