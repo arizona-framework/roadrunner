@@ -586,6 +586,72 @@ recv_until(Sock, Marker, Acc) ->
             Acc
     end.
 
+%% --- chunked-stream empty-data special case ---
+
+conn_streams_empty_send_nofin_emits_nothing_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_empty_send, #{
+                port => 0, handler => cactus_empty_send_handler
+            }),
+            cactus_listener:port(conn_test_empty_send)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_empty_send) end, fun(Port) ->
+            [
+                {"empty Send(_, nofin) does not emit a stray 0-chunk terminator", fun() ->
+                    %% Handler does Send(<<>>, nofin) then Send(<<"hi">>, fin).
+                    {ok, Sock} = gen_tcp:connect(
+                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                    ),
+                    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                    Reply = recv_until_closed(Sock),
+                    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                    [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                    ?assertEqual(~"2\r\nhi\r\n0\r\n\r\n", Body),
+                    ok = gen_tcp:close(Sock)
+                end},
+                {"empty Send(_, fin) emits just the terminator (no leading chunk)", fun() ->
+                    {ok, Sock} = gen_tcp:connect(
+                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                    ),
+                    ok = gen_tcp:send(Sock, ~"GET /fin-empty HTTP/1.1\r\nHost: x\r\n\r\n"),
+                    Reply = recv_until_closed(Sock),
+                    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                    [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                    %% Body: "2\r\nhi\r\n0\r\n\r\n" — chunk for "hi"
+                    %% then terminator with no extra empty chunk.
+                    ?assertEqual(~"2\r\nhi\r\n0\r\n\r\n", Body),
+                    ok = gen_tcp:close(Sock)
+                end}
+            ]
+        end}.
+
+conn_loop_empty_push_emits_nothing_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = cactus_listener:start_link(conn_test_empty_push, #{
+                port => 0, handler => cactus_empty_push_handler
+            }),
+            cactus_listener:port(conn_test_empty_push)
+        end,
+        fun(_) -> ok = cactus_listener:stop(conn_test_empty_push) end, fun(Port) ->
+            {"empty Push(<<>>) is a no-op — does not emit the chunk terminator", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                wait_registered(cactus_empty_push_test_conn),
+                cactus_empty_push_test_conn ! empty_push,
+                cactus_empty_push_test_conn ! {push, ~"hello"},
+                cactus_empty_push_test_conn ! stop,
+                Reply = recv_until_closed(Sock),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                %% Empty push is no-op; only "hello" chunk + terminator.
+                ?assertEqual(~"5\r\nhello\r\n0\r\n\r\n", Body),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
 conn_trailer_with_crlf_in_value_crashes_test_() ->
     {setup,
         fun() ->

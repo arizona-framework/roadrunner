@@ -783,31 +783,37 @@ stream_response(Socket, Status, UserHeaders, Fun) ->
     Head = cactus_http1:response(Status, Headers, ~""),
     _ = cactus_transport:send(Socket, Head),
     Send = fun(Data, FinFlag) ->
-        Chunk = [
-            integer_to_binary(iolist_size(Data), 16),
-            ~"\r\n",
-            Data,
-            ~"\r\n"
-        ],
-        Frame = stream_frame(Chunk, FinFlag),
+        Frame = stream_frame(Data, FinFlag),
         cactus_transport:send(Socket, Frame)
     end,
     _ = Fun(Send),
     ok.
 
-%% Build the wire frame for one chunked-stream emission. `nofin` is just
-%% the chunk; `fin` adds the size-0 terminator + final CRLF; `{fin,
-%% Trailers}` adds the size-0 terminator + serialized trailer headers
-%% + final CRLF (RFC 7230 §4.1.2). Trailer names should also have been
-%% advertised in the response's `Trailer` header — that's the user's
-%% responsibility.
+%% Build the wire frame for one chunked-stream emission.
+%%
+%% **Empty data is special-cased**: a zero-length chunk would encode
+%% as `0\r\n\r\n`, which IS the chunked-body terminator — emitting it
+%% mid-stream prematurely ends the response. So `Send(<<>>, nofin)`
+%% emits nothing, `Send(<<>>, fin)` emits just the terminator (no
+%% leading chunk), and `Send(<<>>, {fin, Trailers})` emits just the
+%% terminator + trailers.
 -spec stream_frame(iodata(), nofin | fin | {fin, cactus_http1:headers()}) -> iodata().
-stream_frame(Chunk, nofin) ->
-    Chunk;
-stream_frame(Chunk, fin) ->
-    [Chunk, ~"0\r\n\r\n"];
-stream_frame(Chunk, {fin, Trailers}) ->
-    [Chunk, ~"0\r\n", encode_trailers(Trailers), ~"\r\n"].
+stream_frame(Data, nofin) ->
+    case iolist_size(Data) of
+        0 -> [];
+        N -> [integer_to_binary(N, 16), ~"\r\n", Data, ~"\r\n"]
+    end;
+stream_frame(Data, fin) ->
+    [chunk_or_empty(Data), ~"0\r\n\r\n"];
+stream_frame(Data, {fin, Trailers}) ->
+    [chunk_or_empty(Data), ~"0\r\n", encode_trailers(Trailers), ~"\r\n"].
+
+-spec chunk_or_empty(iodata()) -> iodata().
+chunk_or_empty(Data) ->
+    case iolist_size(Data) of
+        0 -> [];
+        N -> [integer_to_binary(N, 16), ~"\r\n", Data, ~"\r\n"]
+    end.
 
 -spec encode_trailers(cactus_http1:headers()) -> iodata().
 encode_trailers(Trailers) ->
@@ -840,12 +846,20 @@ loop_response(Socket, Status, UserHeaders, Handler, State) ->
     Head = cactus_http1:response(Status, Headers, ~""),
     _ = cactus_transport:send(Socket, Head),
     Push = fun(Data) ->
-        cactus_transport:send(Socket, [
-            integer_to_binary(iolist_size(Data), 16),
-            ~"\r\n",
-            Data,
-            ~"\r\n"
-        ])
+        %% Same special-case as `stream_frame/2`: zero-length data
+        %% would encode as `0\r\n\r\n` — the chunked terminator —
+        %% which would end the response mid-loop. Skip empty pushes.
+        case iolist_size(Data) of
+            0 ->
+                ok;
+            N ->
+                cactus_transport:send(Socket, [
+                    integer_to_binary(N, 16),
+                    ~"\r\n",
+                    Data,
+                    ~"\r\n"
+                ])
+        end
     end,
     info_loop(Socket, Handler, Push, State).
 
