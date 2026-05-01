@@ -106,10 +106,10 @@ hello, cactus!
 
 ### Observability
 
-- `telemetry` events: `[cactus, request, start | stop | exception]`,
-  `[cactus, response, send_failed]`, `[cactus, listener, accept |
-  conn_close]`, `[cactus, ws, upgrade | frame_in | frame_out]`,
-  `[cactus, drain, acknowledged]` (opt-in via
+- `telemetry` events: `[cactus, request, start | stop | exception |
+  rejected]`, `[cactus, response, send_failed]`, `[cactus, listener,
+  accept | conn_close | slots_reconciled]`, `[cactus, ws, upgrade |
+  frame_in | frame_out]`, `[cactus, drain, acknowledged]` (opt-in via
   `cactus:acknowledge_drain/1` from a `{loop, ...}` / WebSocket
   handler that pattern-matches `{cactus_drain, _}`).
 - Per-request `request_id` attached to `logger:set_process_metadata/1`
