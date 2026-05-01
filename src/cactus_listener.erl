@@ -18,7 +18,7 @@ connection crash doesn't take the pool down.
 
 -behaviour(gen_server).
 
--export([start_link/2, stop/1, drain/2, port/1, info/1, status/1]).
+-export([start_link/2, stop/1, drain/2, port/1, info/1, status/1, reload_routes/2]).
 -export([init/1, handle_call/3, handle_cast/2, terminate/2]).
 
 -export_type([opts/0]).
@@ -131,11 +131,28 @@ this call would fail with a `noproc`.
 status(Name) ->
     gen_server:call(Name, status).
 
+-doc """
+Atomically swap the listener's compiled route table without
+restarting it. The new `Routes` are compiled via
+`cactus_router:compile/1` and published to `persistent_term`;
+in-flight conns keep using whatever they read at request-resolve
+time, but every subsequent dispatch sees the new table.
+
+Returns `ok` on success or `{error, no_routes}` if the listener was
+started without a `routes` opt (single-handler dispatch — there's
+nothing to reload).
+""".
+-spec reload_routes(Name :: atom(), cactus_router:routes()) ->
+    ok | {error, no_routes}.
+reload_routes(Name, Routes) ->
+    gen_server:call(Name, {reload_routes, Routes}).
+
 %% --- gen_server callbacks ---
 
 -spec init(opts()) -> {ok, #state{}} | {stop, term()}.
 init(#{port := Port} = Opts) ->
     ListenerName = listener_name(),
+    publish_routes(ListenerName, Opts),
     ProtoOpts = build_proto_opts(Opts, ListenerName),
     proc_lib:set_label({cactus_listener, ListenerName, Port}),
     case open_listen_socket(Port, Opts) of
@@ -147,6 +164,16 @@ init(#{port := Port} = Opts) ->
         {error, Reason} ->
             {stop, {listen_failed, Reason}}
     end.
+
+%% Compile + publish to `persistent_term` once, at listener start. The
+%% conn reads via `persistent_term:get/1` on every request, so the
+%% lookup is O(1) and the table is shared across all conns of this
+%% listener without copying.
+-spec publish_routes(atom(), opts()) -> ok.
+publish_routes(ListenerName, #{routes := Routes}) ->
+    persistent_term:put({cactus_routes, ListenerName}, cactus_router:compile(Routes));
+publish_routes(_ListenerName, _Opts) ->
+    ok.
 
 %% Recover the registered name we were started with. `start_link/2` always
 %% calls `gen_server:start_link({local, Name}, ...)` so the name is set
@@ -195,7 +222,7 @@ build_proto_opts(Opts, ListenerName) ->
     ClientCounter = atomics:new(1, [{signed, false}]),
     RequestsCounter = atomics:new(1, [{signed, false}]),
     #{
-        dispatch => build_dispatch(Opts),
+        dispatch => build_dispatch(Opts, ListenerName),
         middlewares => maps:get(middlewares, Opts, []),
         max_content_length => maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
         request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
@@ -212,15 +239,24 @@ build_proto_opts(Opts, ListenerName) ->
     }.
 
 %% `routes` (router-based dispatch) takes precedence over `handler`. With
-%% neither, fall back to the default hello-world handler.
--spec build_dispatch(opts()) -> cactus_conn:dispatch().
-build_dispatch(#{routes := Routes}) ->
-    {router, cactus_router:compile(Routes)};
-build_dispatch(Opts) ->
+%% neither, fall back to the default hello-world handler. Routes are
+%% published to `persistent_term` by `publish_routes/2` — the dispatch
+%% tag carries the listener name so the conn can look the table up.
+-spec build_dispatch(opts(), atom()) -> cactus_conn:dispatch().
+build_dispatch(#{routes := _}, ListenerName) ->
+    {router, ListenerName};
+build_dispatch(Opts, _ListenerName) ->
     {handler, maps:get(handler, Opts, cactus_hello_handler)}.
 
--spec handle_call(port | info | status | {drain, non_neg_integer()}, gen_server:from(), #state{}) ->
-    {reply, term(), #state{}} | {stop, normal, term(), #state{}}.
+-spec handle_call(
+    port
+    | info
+    | status
+    | {drain, non_neg_integer()}
+    | {reload_routes, cactus_router:routes()},
+    gen_server:from(),
+    #state{}
+) -> {reply, term(), #state{}} | {stop, normal, term(), #state{}}.
 handle_call(port, _From, #state{port = Port} = State) ->
     {reply, Port, State};
 handle_call(status, _From, #state{phase = Phase} = State) ->
@@ -228,6 +264,9 @@ handle_call(status, _From, #state{phase = Phase} = State) ->
 handle_call({drain, Timeout}, _From, State) ->
     {Reply, NewState} = do_drain(State, Timeout),
     {stop, normal, Reply, NewState};
+handle_call({reload_routes, Routes}, _From, State) ->
+    Reply = do_reload_routes(State, Routes),
+    {reply, Reply, State};
 handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
     #{
         client_counter := ClientCounter,
@@ -240,6 +279,14 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
         requests_served => atomics:get(RequestsCounter, 1)
     },
     {reply, Reply, State}.
+
+-spec do_reload_routes(#state{}, cactus_router:routes()) ->
+    ok | {error, no_routes}.
+do_reload_routes(#state{proto_opts = #{dispatch := {router, Name}}}, Routes) ->
+    persistent_term:put({cactus_routes, Name}, cactus_router:compile(Routes)),
+    ok;
+do_reload_routes(#state{proto_opts = #{dispatch := {handler, _}}}, _Routes) ->
+    {error, no_routes}.
 
 -spec do_drain(#state{}, non_neg_integer()) ->
     {{ok, drained} | {timeout, non_neg_integer()}, #state{}}.
@@ -297,8 +344,17 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 -spec terminate(term(), #state{}) -> ok.
-terminate(_Reason, #state{listen_socket = closed}) ->
-    %% `drain/2` already closed the listen socket on its way out.
+terminate(_Reason, #state{listen_socket = LSocket, proto_opts = ProtoOpts}) ->
+    erase_routes(ProtoOpts),
+    case LSocket of
+        %% `drain/2` already closed the listen socket on its way out.
+        closed -> ok;
+        _ -> cactus_transport:close(LSocket)
+    end.
+
+-spec erase_routes(cactus_conn:proto_opts()) -> ok.
+erase_routes(#{dispatch := {router, Name}}) ->
+    _ = persistent_term:erase({cactus_routes, Name}),
     ok;
-terminate(_Reason, #state{listen_socket = LSocket}) ->
-    cactus_transport:close(LSocket).
+erase_routes(_) ->
+    ok.

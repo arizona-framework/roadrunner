@@ -33,7 +33,7 @@ read it anyway.
 
 -type dispatch() ::
     {handler, module()}
-    | {router, cactus_router:compiled()}.
+    | {router, ListenerName :: atom()}.
 
 -type proto_opts() :: #{
     dispatch := dispatch(),
@@ -407,7 +407,11 @@ scheme({fake, _}) -> http.
     {ok, module(), cactus_router:bindings(), term()} | not_found.
 resolve_handler({handler, Mod}, _Req) ->
     {ok, Mod, #{}, undefined};
-resolve_handler({router, Compiled}, Req) ->
+resolve_handler({router, ListenerName}, Req) ->
+    %% Routes are stored in `persistent_term` by `cactus_listener` so
+    %% the lookup is O(1) and `cactus_listener:reload_routes/2` can
+    %% atomically swap the table without bouncing the listener.
+    Compiled = persistent_term:get({cactus_routes, ListenerName}),
     cactus_router:match(cactus_req:path(Req), Compiled).
 
 -doc false.

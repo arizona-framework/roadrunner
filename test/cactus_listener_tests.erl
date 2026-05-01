@@ -149,7 +149,7 @@ drain_with_no_active_conns_returns_immediately_test_() ->
         fun(_) -> ok end, fun(Name) ->
             {"drain returns ok,drained immediately when no conns are alive", fun() ->
                 ?assertEqual({ok, drained}, cactus_listener:drain(Name, 1000)),
-                ?assertEqual(undefined, whereis(Name))
+                wait_until_unregistered(Name)
             end}
         end}.
 
@@ -176,7 +176,7 @@ drain_waits_for_in_flight_loop_to_close_test_() ->
                 ok = wait_for_chunk(Sock, ~"started"),
                 %% Drain — handler receives {cactus_drain, _} and stops.
                 ?assertEqual({ok, drained}, cactus_listener:drain(Name, 2000)),
-                ?assertEqual(undefined, whereis(Name)),
+                wait_until_unregistered(Name),
                 gen_tcp:close(Sock)
             end}
         end}.
@@ -203,7 +203,7 @@ drain_timeout_kills_unresponsive_conns_test_() ->
                 ok = wait_for_chunk(Sock, ~"started"),
                 %% Handler ignores cactus_drain — drain must time out.
                 ?assertMatch({timeout, N} when N > 0, cactus_listener:drain(Name, 100)),
-                ?assertEqual(undefined, whereis(Name)),
+                wait_until_unregistered(Name),
                 gen_tcp:close(Sock)
             end}
         end}.
@@ -230,6 +230,13 @@ drain_closes_keep_alive_conn_after_in_flight_request_test_() ->
                 %% message in its mailbox and closes without trying
                 %% to read a second keep-alive request.
                 ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                %% Brief warm-up so the conn has joined the `pg` drain
+                %% group before drain queries members. The acceptor
+                %% bumps the live-clients counter before spawning the
+                %% conn; without this sleep, drain can observe
+                %% counter=1 / pg=empty on a slow scheduler and time
+                %% out before the handler's 150ms sleep finishes.
+                timer:sleep(20),
                 Self = self(),
                 spawn_link(fun() ->
                     Self ! {drain_result, cactus_listener:drain(Name, 2000)}
@@ -279,6 +286,78 @@ parse_cl(Head) ->
     ),
     binary_to_integer(Cl).
 
+reload_routes_swaps_dispatch_table_test_() ->
+    {setup,
+        fun() ->
+            ensure_pg_started(),
+            Name = listener_test_reload,
+            {ok, _} = cactus_listener:start_link(Name, #{
+                port => 0,
+                routes => [{~"/old", cactus_hello_handler, #{}}]
+            }),
+            {Name, cactus_listener:port(Name)}
+        end,
+        fun({Name, _Port}) -> ok = cactus_listener:stop(Name) end, fun({Name, Port}) ->
+            {"reload_routes/2 makes new path resolvable, old one 404", fun() ->
+                %% Old path is live.
+                Reply1 = http_get_close(Port, ~"/old"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply1),
+                %% Swap routes — `/old` removed, `/new` added.
+                ok = cactus_listener:reload_routes(
+                    Name, [{~"/new", cactus_hello_handler, #{}}]
+                ),
+                Reply2 = http_get_close(Port, ~"/new"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply2),
+                Reply3 = http_get_close(Port, ~"/old"),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply3)
+            end}
+        end}.
+
+reload_routes_on_handler_listener_returns_no_routes_error_test() ->
+    Name = listener_test_reload_no_routes,
+    {ok, _} = cactus_listener:start_link(Name, #{
+        port => 0, handler => cactus_hello_handler
+    }),
+    try
+        ?assertEqual(
+            {error, no_routes},
+            cactus_listener:reload_routes(Name, [{~"/x", cactus_hello_handler, #{}}])
+        )
+    after
+        ok = cactus_listener:stop(Name)
+    end.
+
+routes_persistent_term_erased_on_listener_stop_test() ->
+    Name = listener_test_pt_erase,
+    Routes = [{~"/x", cactus_hello_handler, #{}}],
+    {ok, _} = cactus_listener:start_link(Name, #{port => 0, routes => Routes}),
+    %% Term is published.
+    Compiled = persistent_term:get({cactus_routes, Name}),
+    ?assertNotEqual(undefined, Compiled),
+    ok = cactus_listener:stop(Name),
+    %% Stopping the listener erases it.
+    ?assertException(error, badarg, persistent_term:get({cactus_routes, Name})).
+
+http_get_close(Port, Path) ->
+    {ok, Sock} = gen_tcp:connect(
+        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+    ),
+    Req = iolist_to_binary([
+        ~"GET ",
+        Path,
+        ~" HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    ]),
+    ok = gen_tcp:send(Sock, Req),
+    Reply = drain_close(Sock, <<>>),
+    ok = gen_tcp:close(Sock),
+    Reply.
+
+drain_close(Sock, Acc) ->
+    case gen_tcp:recv(Sock, 0, 1000) of
+        {ok, Data} -> drain_close(Sock, <<Acc/binary, Data/binary>>);
+        {error, _} -> Acc
+    end.
+
 status_returns_phase_test_() ->
     {setup,
         fun() ->
@@ -305,6 +384,23 @@ ensure_pg_started() ->
             {ok, _} = pg:start_link();
         _ ->
             ok
+    end.
+
+%% gen_server replies to `drain/2` *before* `terminate/2` finishes, so
+%% there's a brief window where `whereis/1` still returns the pid even
+%% though the listener is on its way out. Poll until the name unregisters.
+wait_until_unregistered(Name) ->
+    wait_until_unregistered(Name, 50).
+
+wait_until_unregistered(Name, 0) ->
+    ?assertEqual(undefined, whereis(Name));
+wait_until_unregistered(Name, N) ->
+    case whereis(Name) of
+        undefined ->
+            ok;
+        _ ->
+            timer:sleep(20),
+            wait_until_unregistered(Name, N - 1)
     end.
 
 wait_for_chunk(Sock, Needle) ->
