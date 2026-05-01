@@ -26,7 +26,8 @@ read it anyway.
     peer/1,
     try_acquire_slot/1,
     release_slot/1,
-    consume_body_state/2
+    consume_body_state/2,
+    join_drain_group/1
 ]).
 
 -export_type([proto_opts/0, dispatch/0, body_state/0]).
@@ -112,13 +113,19 @@ serve_lifecycle(Socket, ProtoOpts, ListenerName) ->
     }),
     ok.
 
-%% Join the per-listener `pg` group so `cactus_listener:drain/2` can
-%% broadcast a `{cactus_drain, Deadline}` notification to every active
-%% conn. `pg` removes us automatically when this process exits. The
-%% `pg` scope is started by `cactus_sup`; in tests that drive
-%% `cactus_listener:start_link/2` directly without starting the
-%% application, the scope is absent and we silently skip the join —
-%% drain will simply not see those conns.
+-doc """
+Join the per-listener `pg` group so `cactus_listener:drain/2` can
+broadcast a `{cactus_drain, Deadline}` notification to the calling
+process. `pg` removes the caller automatically when the process
+exits. The `pg` scope is started by `cactus_sup`; in tests that
+drive `cactus_listener:start_link/2` directly without starting the
+application, the scope is absent and the join is silently skipped
+— drain will simply not see those conns.
+
+Shared by `cactus_conn:start/2` and `cactus_conn_statem:init/1` so
+both implementations reach the drain group through a single
+covered code path.
+""".
 -spec join_drain_group(atom()) -> ok.
 join_drain_group(undefined) ->
     ok;
