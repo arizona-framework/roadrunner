@@ -29,6 +29,21 @@ read it anyway.
     consume_body_state/2,
     join_drain_group/1
 ]).
+%% Internal helpers that `cactus_conn_statem` calls during its phased
+%% migration. Marked `-doc false` so they don't appear in the public
+%% API surface; Phase 8 absorbs them once the statem owns the spine.
+-export([
+    make_recv/3,
+    body_framing/1,
+    generate_request_id/0,
+    set_request_logger_metadata/1,
+    maybe_send_continue/3,
+    refine_conn_label/2,
+    scheme/1,
+    send_request_timeout/1,
+    send_bad_request/1,
+    send_payload_too_large/1
+]).
 
 -export_type([proto_opts/0, dispatch/0, body_state/0]).
 
@@ -173,6 +188,7 @@ serve(Socket, ProtoOpts, Peer) ->
     _ = cactus_transport:close(Socket),
     Count.
 
+-doc false.
 -spec refine_conn_label(
     proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
 ) -> ok.
@@ -183,12 +199,14 @@ refine_conn_label(ProtoOpts, Peer) ->
 
 %% 64 random bits in lowercase hex — collision-resistant for billions of
 %% requests, short enough to embed in log lines.
+-doc false.
 -spec generate_request_id() -> binary().
 generate_request_id() ->
     binary:encode_hex(crypto:strong_rand_bytes(8), lowercase).
 
 %% Replaces (not merges) the conn process's logger metadata so a
 %% keep-alive request never inherits the previous request's correlation.
+-doc false.
 -spec set_request_logger_metadata(cactus_http1:request()) -> ok.
 set_request_logger_metadata(#{
     request_id := RequestId,
@@ -397,6 +415,7 @@ dispatch_resolved(Socket, Req, Dispatch, ListenerMws) ->
 %% running average to meet `MinRate` bytes/sec, otherwise return
 %% `{error, slow_client}`. The state is a per-conn atomics ref — no
 %% cross-process contention.
+-doc false.
 -spec make_recv(cactus_transport:socket(), integer(), non_neg_integer()) ->
     fun(() -> {ok, binary()} | {error, request_timeout | slow_client | term()}).
 make_recv(Socket, Deadline, MinRate) ->
@@ -435,6 +454,7 @@ peer(Socket) ->
         {error, _} -> undefined
     end.
 
+-doc false.
 -spec scheme(cactus_transport:socket()) -> http | https.
 scheme({gen_tcp, _}) -> http;
 scheme({ssl, _}) -> https;
@@ -490,6 +510,7 @@ read_body(Req, Buffered, RecvFun, MaxCL) ->
 %% this if no body bytes have already arrived in the buffer — once we
 %% see body data the client clearly didn't wait, and the 100 line is
 %% redundant.
+-doc false.
 -spec maybe_send_continue(cactus_transport:socket(), cactus_http1:request(), binary()) -> ok.
 maybe_send_continue(Socket, Req, Buffered) ->
     case Buffered =:= ~"" andalso has_continue_expectation(Req) of
@@ -507,6 +528,7 @@ has_continue_expectation(Req) ->
         Value -> string:lowercase(Value) =:= ~"100-continue"
     end.
 
+-doc false.
 -spec body_framing(cactus_http1:request()) ->
     none
     | chunked
@@ -979,6 +1001,7 @@ header_value(Name, Headers) ->
         false -> undefined
     end.
 
+-doc false.
 -spec send_bad_request(cactus_transport:socket()) -> ok | {error, term()}.
 send_bad_request(Socket) ->
     Resp = cactus_http1:response(
@@ -988,6 +1011,7 @@ send_bad_request(Socket) ->
     ),
     cactus_transport:send(Socket, Resp).
 
+-doc false.
 -spec send_payload_too_large(cactus_transport:socket()) -> ok | {error, term()}.
 send_payload_too_large(Socket) ->
     Resp = cactus_http1:response(
@@ -1006,6 +1030,7 @@ send_not_found(Socket) ->
     ),
     cactus_transport:send(Socket, Resp).
 
+-doc false.
 -spec send_request_timeout(cactus_transport:socket()) -> ok | {error, term()}.
 send_request_timeout(Socket) ->
     Resp = cactus_http1:response(
