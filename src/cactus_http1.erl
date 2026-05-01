@@ -89,7 +89,21 @@ Bare LF terminators are rejected as `bad_request_line` per RFC 9112 §2.2.
     {ok, Method :: binary(), Target :: binary(), version(), Rest :: binary()}
     | {more, undefined}
     | {error, bad_request_line | bad_version | request_line_too_long}.
+%% RFC 7230 §3.5 robustness allowance: a server SHOULD ignore at least
+%% one empty line received prior to the request-line. We strip one
+%% optional leading `\r\n` and then parse normally. Two consecutive
+%% leading CRLFs still fail (the second one becomes a malformed
+%% request-line) so this doesn't open a slowloris-style padding vector.
+parse_request_line(<<"\r\n", Rest/binary>>) ->
+    do_parse_request_line(Rest);
 parse_request_line(Bin) when is_binary(Bin) ->
+    do_parse_request_line(Bin).
+
+-spec do_parse_request_line(binary()) ->
+    {ok, Method :: binary(), Target :: binary(), version(), Rest :: binary()}
+    | {more, undefined}
+    | {error, bad_request_line | bad_version | request_line_too_long}.
+do_parse_request_line(Bin) ->
     case binary:match(Bin, ~"\n") of
         nomatch when byte_size(Bin) > ?MAX_REQUEST_LINE ->
             {error, request_line_too_long};

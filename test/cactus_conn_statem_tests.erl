@@ -489,6 +489,28 @@ content_length_zero_explicit_body_is_empty_test() ->
     ?assertNotEqual(nomatch, binary:match(Sent, ~"content-length: 0")),
     stop_sink(Sink).
 
+request_with_leading_crlf_still_serves_200_test() ->
+    %% RFC 7230 §3.5 robustness — a client may send one leading CRLF
+    %% before the request-line. The conn must accept it and serve 200.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
+        {recv, ~"\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n"}
+    ]),
+    {ok, Pid} = cactus_conn_statem:start(
+        {fake, Sink}, fake_proto_opts(leading_crlf)
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Sent),
+    stop_sink(Sink).
+
 chunked_body_with_only_terminator_test() ->
     %% Chunked body that's just the size-0 terminator — no data chunks.
     %% Handler must see an empty body.

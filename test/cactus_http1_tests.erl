@@ -24,6 +24,23 @@ stops_at_first_crlf_test() ->
         cactus_http1:parse_request_line(~"GET / HTTP/1.1\r\nHost: x\r\nAccept: */*\r\n\r\n")
     ).
 
+tolerates_one_leading_crlf_test() ->
+    %% RFC 7230 §3.5: server SHOULD ignore one empty line before the
+    %% request-line.
+    ?assertEqual(
+        {ok, ~"GET", ~"/", {1, 1}, ~""},
+        cactus_http1:parse_request_line(~"\r\nGET / HTTP/1.1\r\n")
+    ).
+
+rejects_two_leading_crlfs_test() ->
+    %% Tolerance is bounded — two consecutive CRLFs leave a malformed
+    %% request-line which still fails. Prevents a slowloris-style
+    %% padding vector.
+    ?assertEqual(
+        {error, bad_request_line},
+        cactus_http1:parse_request_line(~"\r\n\r\nGET / HTTP/1.1\r\n")
+    ).
+
 at_size_limit_accepted_test() ->
     %% Boundary: 8192-byte request line (target padded to fill it) must pass.
     Pad = binary:copy(~"a", 8192 - byte_size(~"GET / HTTP/1.1")),
