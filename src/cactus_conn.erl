@@ -87,13 +87,30 @@ start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
         join_drain_group(ListenerName),
         try
             receive
-                shoot -> serve(Socket, ProtoOpts)
+                shoot -> serve_lifecycle(Socket, ProtoOpts, ListenerName)
             end
         after
             release_slot(ProtoOpts)
         end
     end),
     {ok, Pid}.
+
+%% Bracket the per-conn lifetime with `[cactus, listener, accept]` /
+%% `[cactus, listener, conn_close]` telemetry. The accept event lets
+%% subscribers count incoming connections; the conn_close event reports
+%% the connection's wall-clock duration and how many keep-alive requests
+%% it served.
+-spec serve_lifecycle(cactus_transport:socket(), proto_opts(), atom()) -> ok.
+serve_lifecycle(Socket, ProtoOpts, ListenerName) ->
+    Peer = peer(Socket),
+    StartMono = cactus_telemetry:listener_accept(#{
+        listener_name => ListenerName, peer => Peer
+    }),
+    Count = serve(Socket, ProtoOpts, Peer),
+    cactus_telemetry:listener_conn_close(StartMono, #{
+        listener_name => ListenerName, peer => Peer, requests_served => Count
+    }),
+    ok.
 
 %% Join the per-listener `pg` group so `cactus_listener:drain/2` can
 %% broadcast a `{cactus_drain, Deadline}` notification to every active
@@ -137,14 +154,17 @@ release_slot(#{client_counter := Ref}) ->
     _ = atomics:sub(Ref, 1, 1),
     ok.
 
--spec serve(cactus_transport:socket(), proto_opts()) -> ok.
-serve(Socket, ProtoOpts) ->
-    Peer = peer(Socket),
+-spec serve(
+    cactus_transport:socket(),
+    proto_opts(),
+    {inet:ip_address(), inet:port_number()} | undefined
+) -> non_neg_integer().
+serve(Socket, ProtoOpts, Peer) ->
     refine_conn_label(ProtoOpts, Peer),
     Scheme = scheme(Socket),
-    serve_loop(Socket, Peer, Scheme, ProtoOpts, 0),
+    Count = serve_loop(Socket, Peer, Scheme, ProtoOpts, 0),
     _ = cactus_transport:close(Socket),
-    ok.
+    Count.
 
 -spec refine_conn_label(
     proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
@@ -178,22 +198,22 @@ set_request_logger_metadata(#{
 
 -spec serve_loop(
     cactus_transport:socket(), term(), http | https, proto_opts(), non_neg_integer()
-) -> ok.
+) -> non_neg_integer().
 serve_loop(_Socket, _Peer, _Scheme, #{max_keep_alive_request := Max}, Count) when Count >= Max ->
-    ok;
+    Count;
 serve_loop(Socket, Peer, Scheme, ProtoOpts, Count) ->
     case drain_pending() of
         true ->
             %% Listener is draining — finish the in-flight pipeline by
             %% closing instead of looking for the next keep-alive request.
-            ok;
+            Count;
         false ->
             do_serve_loop(Socket, Peer, Scheme, ProtoOpts, Count)
     end.
 
 -spec do_serve_loop(
     cactus_transport:socket(), term(), http | https, proto_opts(), non_neg_integer()
-) -> ok.
+) -> non_neg_integer().
 do_serve_loop(Socket, Peer, Scheme, ProtoOpts, Count) ->
     %% First request on a fresh connection: bounded by request_timeout, and
     %% a silent client gets a 408. Idle wait between keep-alive requests:
@@ -204,9 +224,18 @@ do_serve_loop(Socket, Peer, Scheme, ProtoOpts, Count) ->
             0 -> {maps:get(request_timeout, ProtoOpts), first};
             _ -> {maps:get(keep_alive_timeout, ProtoOpts), keep_alive}
         end,
+    %% `process_one` returns whether the response was the keep-alive
+    %% kind or the close kind, plus whether a request was actually
+    %% served (parse failure / silent-timeout / slow-client kicks
+    %% don't count as served — the listener's `requests_counter`
+    %% atomic skips them too, so the per-conn count stays consistent).
     case process_one(Socket, Peer, Scheme, ProtoOpts, Timeout, Phase) of
-        keep_alive -> serve_loop(Socket, Peer, Scheme, ProtoOpts, Count + 1);
-        close -> ok
+        {keep_alive, served} ->
+            serve_loop(Socket, Peer, Scheme, ProtoOpts, Count + 1);
+        {close, served} ->
+            Count + 1;
+        {close, unserved} ->
+            Count
     end.
 
 %% Non-blocking mailbox peek for a `{cactus_drain, _}` broadcast from
@@ -228,7 +257,7 @@ drain_pending() ->
     proto_opts(),
     non_neg_integer(),
     first | keep_alive
-) -> keep_alive | close.
+) -> {keep_alive | close, served | unserved}.
 process_one(
     Socket,
     Peer,
@@ -263,17 +292,18 @@ process_one(
             },
             ok = set_request_logger_metadata(Req),
             ok = maybe_send_continue(Socket, Req, Buffered),
-            handle_with_body(
+            Action = handle_with_body(
                 Socket, Req, Buffered, Recv, MaxCL, Dispatch, ListenerMws, BodyBuffering
-            );
+            ),
+            {Action, served};
         {error, request_timeout} ->
             _ = maybe_send_request_timeout(Socket, Phase),
-            close;
+            {close, unserved};
         {error, slow_client} ->
-            close;
+            {close, unserved};
         {error, _} ->
             _ = send_bad_request(Socket),
-            close
+            {close, unserved}
     end.
 
 -spec maybe_send_request_timeout(cactus_transport:socket(), first | keep_alive) ->

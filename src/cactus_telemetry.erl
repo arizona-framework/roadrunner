@@ -46,6 +46,23 @@ have one module to grep for and tests have one place to attach.
   - **Metadata:** `phase`, `reason`, plus the conn's logger
     process metadata (`request_id`, `peer`, `method`, `path`).
 
+- `[cactus, listener, accept]` — fired in the conn process once
+  the acceptor's `shoot` signal has been received and the peername
+  is known. Subscribers can use this to drive a "live connections"
+  gauge or correlate with `[cactus, listener, conn_close]`.
+
+  - **Measurements:** `system_time`.
+  - **Metadata:** `listener_name`, `peer`.
+
+- `[cactus, listener, conn_close]` — fired when the conn process is
+  about to exit (after the keep-alive loop ends, before the after-
+  clause releases the slot). `requests_served` is the count of
+  successfully-parsed requests on this conn; parse failures and
+  silent timeout/slow-client kicks are NOT counted.
+
+  - **Measurements:** `duration` in `native` time units.
+  - **Metadata:** `listener_name`, `peer`, `requests_served`.
+
 The `start_time` value returned by `request_start/1` must be passed
 back into `request_stop/3` / `request_exception/4` to compute
 `duration`. Subscribers can wire up via `telemetry:attach/4` in
@@ -56,7 +73,9 @@ production or `telemetry_test:attach_event_handlers/2` in tests.
     request_start/1,
     request_stop/3,
     request_exception/4,
-    response_send/2
+    response_send/2,
+    listener_accept/1,
+    listener_conn_close/2
 ]).
 
 -export_type([metadata/0]).
@@ -140,3 +159,31 @@ merge_logger_metadata(Extra) ->
         undefined -> Extra;
         Md when is_map(Md) -> maps:merge(Md, Extra)
     end.
+
+-doc """
+Emit `[cactus, listener, accept]` and return the start time so
+`listener_conn_close/2` can compute the connection's duration.
+""".
+-spec listener_accept(map()) -> integer().
+listener_accept(Metadata) ->
+    StartMono = erlang:monotonic_time(),
+    telemetry:execute(
+        [cactus, listener, accept],
+        #{system_time => erlang:system_time()},
+        Metadata
+    ),
+    StartMono.
+
+-doc """
+Emit `[cactus, listener, conn_close]` with the connection's wall-
+clock duration and the supplied metadata (which should include
+`requests_served`).
+""".
+-spec listener_conn_close(integer(), map()) -> ok.
+listener_conn_close(StartMono, Metadata) ->
+    telemetry:execute(
+        [cactus, listener, conn_close],
+        #{duration => erlang:monotonic_time() - StartMono},
+        Metadata
+    ),
+    ok.

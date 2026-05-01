@@ -104,6 +104,60 @@ response_send_failed_works_without_logger_metadata_test() ->
         detach(HandlerId)
     end.
 
+listener_accept_and_conn_close_fire_around_a_keep_alive_conn_test_() ->
+    {setup, fun setup_listener/0, fun cleanup_listener/1, fun({Name, Port}) ->
+        {"accept fires on connect; conn_close fires once the conn exits", fun() ->
+            HandlerId = attach([
+                [cactus, listener, accept],
+                [cactus, listener, conn_close]
+            ]),
+            try
+                ok = send_simple_get(Port),
+                Events = collect_events(2),
+                {_, AcceptM, AcceptMd} = lists:keyfind(
+                    [cactus, listener, accept], 1, Events
+                ),
+                {_, CloseM, CloseMd} = lists:keyfind(
+                    [cactus, listener, conn_close], 1, Events
+                ),
+                ?assert(is_integer(maps:get(system_time, AcceptM))),
+                ?assertEqual(Name, maps:get(listener_name, AcceptMd)),
+                ?assertMatch({{127, 0, 0, 1}, _}, maps:get(peer, AcceptMd)),
+                ?assert(is_integer(maps:get(duration, CloseM))),
+                ?assert(maps:get(duration, CloseM) > 0),
+                ?assertEqual(Name, maps:get(listener_name, CloseMd)),
+                ?assertMatch({{127, 0, 0, 1}, _}, maps:get(peer, CloseMd)),
+                ?assertEqual(1, maps:get(requests_served, CloseMd))
+            after
+                detach(HandlerId)
+            end
+        end}
+    end}.
+
+listener_conn_close_requests_served_does_not_count_parse_errors_test_() ->
+    {setup, fun setup_listener/0, fun cleanup_listener/1, fun({_Name, Port}) ->
+        {"a malformed first request keeps requests_served at 0", fun() ->
+            HandlerId = attach([[cactus, listener, conn_close]]),
+            try
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                %% Garbage that fails parse_request_line — conn replies
+                %% 400 then closes; no real request was served.
+                ok = gen_tcp:send(Sock, ~"NOT-A-VALID-REQUEST-LINE\r\n\r\n"),
+                drain(Sock),
+                ok = gen_tcp:close(Sock),
+                receive
+                    {telemetry_event, [cactus, listener, conn_close], _, Md} ->
+                        ?assertEqual(0, maps:get(requests_served, Md))
+                after 2000 -> error(no_conn_close_event)
+                end
+            after
+                detach(HandlerId)
+            end
+        end}
+    end}.
+
 request_exception_fires_on_handler_crash_test_() ->
     {setup, fun setup_crashing_listener/0, fun cleanup_listener/1, fun({_Name, Port}) ->
         {"crashing handler emits exception with kind + reason", fun() ->
