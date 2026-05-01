@@ -25,7 +25,8 @@ reading_request_parses_then_reading_body_full_request_test() ->
 reading_request_request_timeout_first_sends_408_test() ->
     ensure_pg(),
     Self = self(),
-    Sink = spawn_recv_sink_with_send_log(Self, [{recv, {error, timeout}}]),
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [{recv, {error, timeout}}]),
     {ok, Pid} = cactus_conn_statem:start(
         {fake, Sink}, fake_proto_opts_short_timeout(read_408)
     ),
@@ -35,14 +36,15 @@ reading_request_request_timeout_first_sends_408_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 2000 -> error(no_normal_exit)
     end,
-    Sent = collect_sends(Self, 100),
+    Sent = collect_sends(Tag, 100),
     ?assertMatch(<<"HTTP/1.1 408", _/binary>>, iolist_to_binary(Sent)),
     stop_sink(Sink).
 
 reading_request_slow_client_silent_test() ->
     ensure_pg(),
     Self = self(),
-    Sink = spawn_recv_sink_with_send_log(Self, [{recv, {error, slow_client}}]),
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [{recv, {error, slow_client}}]),
     {ok, Pid} = cactus_conn_statem:start(
         {fake, Sink}, fake_proto_opts(read_slow)
     ),
@@ -53,14 +55,15 @@ reading_request_slow_client_silent_test() ->
     after 2000 -> error(no_normal_exit)
     end,
     %% No 4xx written — slow_client closes silently.
-    ?assertEqual(<<>>, iolist_to_binary(collect_sends(Self, 50))),
+    ?assertEqual(<<>>, iolist_to_binary(collect_sends(Tag, 50))),
     stop_sink(Sink).
 
 reading_request_bad_request_sends_400_test() ->
     ensure_pg(),
     Self = self(),
+    Tag = make_ref(),
     Sink = spawn_recv_sink_with_send_log(
-        Self, [{recv, ~"NOT-A-VALID-REQUEST-LINE\r\n\r\n"}]
+        Self, Tag, [{recv, ~"NOT-A-VALID-REQUEST-LINE\r\n\r\n"}]
     ),
     {ok, Pid} = cactus_conn_statem:start({fake, Sink}, fake_proto_opts(read_400)),
     Ref = monitor(process, Pid),
@@ -69,15 +72,16 @@ reading_request_bad_request_sends_400_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 2000 -> error(no_normal_exit)
     end,
-    Sent = collect_sends(Self, 100),
+    Sent = collect_sends(Tag, 100),
     ?assertMatch(<<"HTTP/1.1 400", _/binary>>, iolist_to_binary(Sent)),
     stop_sink(Sink).
 
 reading_body_oversized_sends_413_test() ->
     ensure_pg(),
     Self = self(),
+    Tag = make_ref(),
     Req = ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 9999\r\n\r\n",
-    Sink = spawn_recv_sink_with_send_log(Self, [{recv, Req}]),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [{recv, Req}]),
     {ok, Pid} = cactus_conn_statem:start(
         {fake, Sink}, fake_proto_opts_small_max(read_413)
     ),
@@ -87,7 +91,7 @@ reading_body_oversized_sends_413_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 2000 -> error(no_normal_exit)
     end,
-    Sent = collect_sends(Self, 100),
+    Sent = collect_sends(Tag, 100),
     ?assertMatch(<<"HTTP/1.1 413", _/binary>>, iolist_to_binary(Sent)),
     stop_sink(Sink).
 
@@ -95,7 +99,8 @@ reading_body_request_timeout_sends_408_test() ->
     %% First chunk parses headers; the body recv times out → 408.
     ensure_pg(),
     Self = self(),
-    Sink = spawn_recv_sink_with_send_log(Self, [
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
         {recv, ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n"},
         {recv, {error, timeout}}
     ]),
@@ -108,13 +113,14 @@ reading_body_request_timeout_sends_408_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 2000 -> error(no_normal_exit)
     end,
-    ?assertMatch(<<"HTTP/1.1 408", _/binary>>, iolist_to_binary(collect_sends(Self, 100))),
+    ?assertMatch(<<"HTTP/1.1 408", _/binary>>, iolist_to_binary(collect_sends(Tag, 100))),
     stop_sink(Sink).
 
 reading_body_slow_client_silent_test() ->
     ensure_pg(),
     Self = self(),
-    Sink = spawn_recv_sink_with_send_log(Self, [
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
         {recv, ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n"},
         {recv, {error, slow_client}}
     ]),
@@ -127,14 +133,15 @@ reading_body_slow_client_silent_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 2000 -> error(no_normal_exit)
     end,
-    ?assertEqual(<<>>, iolist_to_binary(collect_sends(Self, 50))),
+    ?assertEqual(<<>>, iolist_to_binary(collect_sends(Tag, 50))),
     stop_sink(Sink).
 
 reading_body_recv_error_sends_400_test() ->
     %% Body recv returns a non-timeout/non-slow error mid-read → 400.
     ensure_pg(),
     Self = self(),
-    Sink = spawn_recv_sink_with_send_log(Self, [
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
         {recv, ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n"},
         {recv, {error, closed}}
     ]),
@@ -147,14 +154,15 @@ reading_body_recv_error_sends_400_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 2000 -> error(no_normal_exit)
     end,
-    ?assertMatch(<<"HTTP/1.1 400", _/binary>>, iolist_to_binary(collect_sends(Self, 100))),
+    ?assertMatch(<<"HTTP/1.1 400", _/binary>>, iolist_to_binary(collect_sends(Tag, 100))),
     stop_sink(Sink).
 
 reading_body_bad_transfer_encoding_in_manual_mode_test() ->
     ensure_pg(),
     Self = self(),
+    Tag = make_ref(),
     Req = ~"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: bogus\r\n\r\n",
-    Sink = spawn_recv_sink_with_send_log(Self, [{recv, Req}]),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [{recv, Req}]),
     {ok, Pid} = cactus_conn_statem:start(
         {fake, Sink}, fake_proto_opts_manual(read_te_bad)
     ),
@@ -164,7 +172,7 @@ reading_body_bad_transfer_encoding_in_manual_mode_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 2000 -> error(no_normal_exit)
     end,
-    Sent = collect_sends(Self, 100),
+    Sent = collect_sends(Tag, 100),
     ?assertMatch(<<"HTTP/1.1 400", _/binary>>, iolist_to_binary(Sent)),
     stop_sink(Sink).
 
@@ -208,7 +216,8 @@ drain_pending_before_shoot_stops_at_first_parse_test() ->
 dispatching_buffered_handler_writes_200_test() ->
     ensure_pg(),
     Self = self(),
-    Sink = spawn_recv_sink_with_send_log(Self, [
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
         {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}
     ]),
     {ok, Pid} = cactus_conn_statem:start(
@@ -220,14 +229,15 @@ dispatching_buffered_handler_writes_200_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 2000 -> error(no_normal_exit)
     end,
-    Sent = iolist_to_binary(collect_sends(Self, 100)),
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
     ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Sent),
     stop_sink(Sink).
 
 dispatching_router_not_found_writes_404_test() ->
     ensure_pg(),
     Self = self(),
-    Sink = spawn_recv_sink_with_send_log(Self, [
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
         {recv, ~"GET /nope HTTP/1.1\r\nHost: x\r\n\r\n"}
     ]),
     %% Router with no matching route → 404.
@@ -246,7 +256,7 @@ dispatching_router_not_found_writes_404_test() ->
             {'DOWN', Ref, process, Pid, normal} -> ok
         after 2000 -> error(no_normal_exit)
         end,
-        Sent = iolist_to_binary(collect_sends(Self, 100)),
+        Sent = iolist_to_binary(collect_sends(Tag, 100)),
         ?assertMatch(<<"HTTP/1.1 404", _/binary>>, Sent)
     after
         persistent_term:erase({cactus_routes, dispatch_router_test}),
@@ -257,6 +267,7 @@ dispatching_handler_crash_writes_500_and_emits_exception_test() ->
     ensure_pg(),
     {ok, _} = application:ensure_all_started(telemetry),
     Self = self(),
+    Tag = make_ref(),
     HandlerId = make_ref(),
     ok = telemetry:attach(
         HandlerId,
@@ -265,7 +276,7 @@ dispatching_handler_crash_writes_500_and_emits_exception_test() ->
         undefined
     ),
     try
-        Sink = spawn_recv_sink_with_send_log(Self, [
+        Sink = spawn_recv_sink_with_send_log(Self, Tag, [
             {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}
         ]),
         Opts = (fake_proto_opts(dispatch_crash_test))#{
@@ -278,7 +289,7 @@ dispatching_handler_crash_writes_500_and_emits_exception_test() ->
             {'DOWN', Ref, process, Pid, normal} -> ok
         after 2000 -> error(no_normal_exit)
         end,
-        Sent = iolist_to_binary(collect_sends(Self, 100)),
+        Sent = iolist_to_binary(collect_sends(Tag, 100)),
         ?assertMatch(<<"HTTP/1.1 500", _/binary>>, Sent),
         receive
             {ev, [cactus, request, exception], _, ExcMd} ->
@@ -295,6 +306,7 @@ dispatching_request_start_and_stop_telemetry_fires_test() ->
     ensure_pg(),
     {ok, _} = application:ensure_all_started(telemetry),
     Self = self(),
+    Tag = make_ref(),
     HandlerId = make_ref(),
     ok = telemetry:attach_many(
         HandlerId,
@@ -303,7 +315,7 @@ dispatching_request_start_and_stop_telemetry_fires_test() ->
         undefined
     ),
     try
-        Sink = spawn_recv_sink_with_send_log(Self, [
+        Sink = spawn_recv_sink_with_send_log(Self, Tag, [
             {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}
         ]),
         {ok, Pid} = cactus_conn_statem:start(
@@ -340,10 +352,11 @@ dispatching_request_start_and_stop_telemetry_fires_test() ->
 keep_alive_serves_two_requests_test() ->
     ensure_pg(),
     Self = self(),
+    Tag = make_ref(),
     %% `cactus_manual_keepalive_handler` doesn't emit `Connection: close`,
     %% so each response is keep-alive-friendly. The second request
     %% explicitly closes.
-    Sink = spawn_recv_sink_with_send_log(Self, [
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
         {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"},
         {recv, ~"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"}
     ]),
@@ -357,16 +370,17 @@ keep_alive_serves_two_requests_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 3000 -> error(no_normal_exit)
     end,
-    Sent = iolist_to_binary(collect_sends(Self, 100)),
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
     ?assert(count_200(Sent) >= 2),
     stop_sink(Sink).
 
 keep_alive_max_cap_stops_after_max_test() ->
     ensure_pg(),
     Self = self(),
+    Tag = make_ref(),
     %% Listener allows max_keep_alive_request = 1; the second request
     %% never reaches reading_request because finishing stops first.
-    Sink = spawn_recv_sink_with_send_log(Self, [
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
         {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"},
         {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}
     ]),
@@ -381,7 +395,7 @@ keep_alive_max_cap_stops_after_max_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 3000 -> error(no_normal_exit)
     end,
-    Sent = iolist_to_binary(collect_sends(Self, 100)),
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
     ?assertEqual(1, count_200(Sent)),
     stop_sink(Sink).
 
@@ -390,7 +404,8 @@ http10_default_close_test() ->
     %% Connection: close.
     ensure_pg(),
     Self = self(),
-    Sink = spawn_recv_sink_with_send_log(Self, [
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
         {recv, ~"GET / HTTP/1.0\r\nHost: x\r\n\r\n"},
         %% Second recv would be issued in keep-alive; with HTTP/1.0
         %% close we shouldn't see it. Make it slow so the first
@@ -404,7 +419,7 @@ http10_default_close_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 3000 -> error(no_normal_exit)
     end,
-    Sent = iolist_to_binary(collect_sends(Self, 100)),
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
     ?assertEqual(1, count_200(Sent)),
     stop_sink(Sink).
 
@@ -413,8 +428,10 @@ drain_mid_keep_alive_stops_test() ->
     %% reading_request iteration; conn stops without serving request 2.
     ensure_pg(),
     Self = self(),
+    Tag = make_ref(),
     Sink = spawn_recv_sink_with_send_log(
         Self,
+        Tag,
         [
             {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"},
             %% Slow second recv so we can race the drain in.
@@ -434,16 +451,17 @@ drain_mid_keep_alive_stops_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 3000 -> error(no_normal_exit)
     end,
-    Sent = iolist_to_binary(collect_sends(Self, 100)),
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
     ?assertEqual(1, count_200(Sent)),
     stop_sink(Sink).
 
 manual_body_full_read_keep_alive_test() ->
     ensure_pg(),
     Self = self(),
+    Tag = make_ref(),
     %% Manual body buffering — handler's body_state needs to drain.
     %% The handler echoes the body; second request closes.
-    Sink = spawn_recv_sink_with_send_log(Self, [
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
         {recv, ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"},
         {recv, ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"}
     ]),
@@ -458,7 +476,7 @@ manual_body_full_read_keep_alive_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 3000 -> error(no_normal_exit)
     end,
-    Sent = iolist_to_binary(collect_sends(Self, 100)),
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
     ?assert(count_200(Sent) >= 2),
     stop_sink(Sink).
 
@@ -467,7 +485,8 @@ keep_alive_request_timeout_silent_test() ->
     %% no 408 on the wire (peer wasn't reading anyway).
     ensure_pg(),
     Self = self(),
-    Sink = spawn_recv_sink_with_send_log(Self, [
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
         {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"},
         {recv, {error, timeout}}
     ]),
@@ -482,7 +501,7 @@ keep_alive_request_timeout_silent_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 3000 -> error(no_normal_exit)
     end,
-    Sent = iolist_to_binary(collect_sends(Self, 100)),
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
     %% First 200 went out; no 408 follows.
     ?assertEqual(nomatch, re:run(Sent, ~"HTTP/1.1 408")),
     stop_sink(Sink).
@@ -492,7 +511,8 @@ manual_body_drain_failure_closes_test() ->
     %% drain_body tries to consume but recv returns error → close.
     ensure_pg(),
     Self = self(),
-    Sink = spawn_recv_sink_with_send_log(Self, [
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
         {recv, ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 99\r\n\r\nshort"},
         {recv, {error, closed}}
     ]),
@@ -628,14 +648,17 @@ fake_proto_opts_manual(ListenerName) ->
 %% `cactus_fake_send` and `cactus_fake_close` so they don't pollute
 %% the test runner's mailbox.
 spawn_recv_sink(Script) ->
-    spawn(fun() -> recv_sink_loop(Script, undefined) end).
+    spawn(fun() -> recv_sink_loop(Script, undefined, undefined) end).
 
-%% Same, but forwards every `cactus_fake_send` to `Logger` so the test
-%% can assert on what the conn wrote (status lines, error responses).
-spawn_recv_sink_with_send_log(Logger, Script) ->
-    spawn(fun() -> recv_sink_loop(Script, Logger) end).
+%% Same, but forwards every `cactus_fake_send` to `Logger` tagged with
+%% `Tag` so the test can assert on what the conn wrote without picking
+%% up sends from sibling tests' sinks (eunit reuses the test runner
+%% process across some tests; an unscoped `{sent, _}` shape is
+%% cross-test-leak-prone).
+spawn_recv_sink_with_send_log(Logger, Tag, Script) ->
+    spawn(fun() -> recv_sink_loop(Script, Logger, Tag) end).
 
-recv_sink_loop(Script, Logger) ->
+recv_sink_loop(Script, Logger, Tag) ->
     receive
         stop ->
             ok;
@@ -643,22 +666,22 @@ recv_sink_loop(Script, Logger) ->
             case Script of
                 [] ->
                     ConnPid ! {cactus_fake_recv_reply, {error, closed}},
-                    recv_sink_loop([], Logger);
+                    recv_sink_loop([], Logger, Tag);
                 [{recv, {error, _} = Err} | Rest] ->
                     ConnPid ! {cactus_fake_recv_reply, Err},
-                    recv_sink_loop(Rest, Logger);
+                    recv_sink_loop(Rest, Logger, Tag);
                 [{recv, Bytes} | Rest] ->
                     ConnPid ! {cactus_fake_recv_reply, {ok, Bytes}},
-                    recv_sink_loop(Rest, Logger)
+                    recv_sink_loop(Rest, Logger, Tag)
             end;
         {cactus_fake_send, _Pid, Data} ->
             case Logger of
                 undefined -> ok;
-                _ -> Logger ! {sent, Data}
+                _ -> Logger ! {sent, Tag, Data}
             end,
-            recv_sink_loop(Script, Logger);
+            recv_sink_loop(Script, Logger, Tag);
         _ ->
-            recv_sink_loop(Script, Logger)
+            recv_sink_loop(Script, Logger, Tag)
     end.
 
 count_200(Bin) ->
@@ -667,12 +690,12 @@ count_200(Bin) ->
         {match, Matches} -> length(Matches)
     end.
 
-collect_sends(_Logger, Timeout) ->
-    collect_sends_loop([], Timeout).
+collect_sends(Tag, Timeout) ->
+    collect_sends_loop(Tag, [], Timeout).
 
-collect_sends_loop(Acc, Timeout) ->
+collect_sends_loop(Tag, Acc, Timeout) ->
     receive
-        {sent, Data} -> collect_sends_loop([Data | Acc], 0)
+        {sent, Tag, Data} -> collect_sends_loop(Tag, [Data | Acc], 0)
     after Timeout ->
         lists:reverse(Acc)
     end.

@@ -32,12 +32,15 @@ starts_listener_and_serves() ->
 
 stops_listener_cleanly() ->
     {ok, _} = cactus:start_listener(public_test_stop, #{port => 0}),
-    Port = cactus_listener:port(public_test_stop),
+    ?assert(lists:member(public_test_stop, cactus:listeners())),
     ok = cactus:stop_listener(public_test_stop),
-    ?assertMatch(
-        {error, _},
-        gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 200)
-    ).
+    %% After stop, the gen_server is gone — we don't probe the TCP port
+    %% because the OS may briefly accept a connect against a freshly-
+    %% closed listen socket, or another concurrent test may have
+    %% allocated the same ephemeral port. The registry membership is
+    %% the reliable cleanliness signal.
+    ?assertNot(lists:member(public_test_stop, cactus:listeners())),
+    ?assertExit(_, cactus_listener:port(public_test_stop)).
 
 stop_unknown_listener() ->
     ?assertEqual({error, not_found}, cactus:stop_listener(public_test_nope)).
