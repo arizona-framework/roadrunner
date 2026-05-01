@@ -195,3 +195,72 @@ match_route_path_with_only_slashes_test() ->
         not_found,
         cactus_router:match(~"/anything", Compiled)
     ).
+
+%% =============================================================================
+%% Adversarial / corner cases — document observable behavior so regressions
+%% are caught at the router boundary instead of leaking into handlers.
+%% =============================================================================
+
+match_empty_param_name_binds_under_empty_binary_test() ->
+    %% `/:` parses as `{param, <<>>}`. The capture goes under the empty
+    %% binary key — surprising but harmless; documenting the behavior so a
+    %% future "reject empty param name" change is a deliberate decision,
+    %% not a silent break.
+    Compiled = cactus_router:compile([{~"/:", h, undefined}]),
+    ?assertEqual(
+        {ok, h, #{<<>> => ~"foo"}, undefined},
+        cactus_router:match(~"/foo", Compiled)
+    ).
+
+match_empty_wildcard_name_binds_remainder_under_empty_binary_test() ->
+    %% Same shape for `/*` — captures the tail as a list under `<<>>`.
+    Compiled = cactus_router:compile([{~"/*", h, undefined}]),
+    ?assertEqual(
+        {ok, h, #{<<>> => [~"a", ~"b", ~"c"]}, undefined},
+        cactus_router:match(~"/a/b/c", Compiled)
+    ).
+
+match_duplicate_param_names_keep_last_binding_test() ->
+    %% A pattern repeats the same `:x` — bindings is a map, so the
+    %% second value silently overwrites the first. Footgun; locking
+    %% in the behavior so we don't accidentally start raising.
+    Compiled = cactus_router:compile([{~"/:x/:x", h, undefined}]),
+    ?assertEqual(
+        {ok, h, #{~"x" => ~"second"}, undefined},
+        cactus_router:match(~"/first/second", Compiled)
+    ).
+
+match_multiple_wildcards_pattern_does_not_match_test() ->
+    %% Wildcard match clause requires the wildcard segment to be last.
+    %% A pattern with two wildcards therefore can never match — the
+    %% second is treated as a literal. Document so a future change to
+    %% allow nested wildcards is intentional.
+    Compiled = cactus_router:compile([{~"/*a/*b", h, undefined}]),
+    ?assertEqual(not_found, cactus_router:match(~"/x/y/z", Compiled)).
+
+match_wildcard_followed_by_literal_does_not_match_test() ->
+    %% Same constraint: anything declared after a wildcard segment is
+    %% unreachable.
+    Compiled = cactus_router:compile([{~"/*tail/post", h, undefined}]),
+    ?assertEqual(not_found, cactus_router:match(~"/a/b/post", Compiled)).
+
+match_nul_byte_in_segment_is_captured_raw_test() ->
+    %% NUL is just a byte to the router — the request-line parser
+    %% rejects NUL upstream so a real wire request can't reach here
+    %% with a NUL, but a caller invoking `match/2` directly with a
+    %% poisoned binary gets it back verbatim. Documented as caller's
+    %% responsibility to validate.
+    Compiled = cactus_router:compile([{~"/admin/:p", h, undefined}]),
+    ?assertEqual(
+        {ok, h, #{~"p" => <<"sec", 0, "ret">>}, undefined},
+        cactus_router:match(<<"/admin/sec", 0, "ret">>, Compiled)
+    ).
+
+match_path_without_leading_slash_resolves_same_as_with_test() ->
+    %% `binary:split(_, ~"/", [global, trim_all])` strips empty leading
+    %% segments, so `~"users/joe"` and `~"/users/joe"` both produce
+    %% `[~"users", ~"joe"]` and match identically.
+    Compiled = cactus_router:compile([{~"/users/:id", h, undefined}]),
+    Expected = {ok, h, #{~"id" => ~"joe"}, undefined},
+    ?assertEqual(Expected, cactus_router:match(~"/users/joe", Compiled)),
+    ?assertEqual(Expected, cactus_router:match(~"users/joe", Compiled)).
