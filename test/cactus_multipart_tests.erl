@@ -275,3 +275,81 @@ parse_no_header_terminator_test() ->
         "\r\n--B--\r\n"
     >>,
     ?assertMatch({error, _}, cactus_multipart:parse(Body, ~"B")).
+
+%% =============================================================================
+%% Adversarial / corner cases.
+%% =============================================================================
+
+parse_part_with_empty_header_block_test() ->
+    %% Per RFC 5322 §2.2.3 (referenced by RFC 7578), the header field
+    %% list may be empty — the part is just `\r\nbody`. Browsers don't
+    %% emit this for form-data, but RFC-compliant clients can.
+    Body = <<"--B\r\n\r\nhello\r\n--B--\r\n">>,
+    ?assertEqual(
+        {ok, [#{headers => [], body => ~"hello"}]},
+        cactus_multipart:parse(Body, ~"B")
+    ).
+
+parse_part_body_can_contain_boundary_substring_test() ->
+    %% The split is on `\r\n--<boundary>`, not on the bare boundary —
+    %% so a body byte sequence that *contains* the boundary but isn't
+    %% preceded by CRLF stays in the body.
+    Body = <<
+        "--B\r\n",
+        "Content-Type: text/plain\r\n",
+        "\r\n",
+        "before--Bafter",
+        "\r\n--B--\r\n"
+    >>,
+    ?assertEqual(
+        {ok, [
+            #{
+                headers => [{~"content-type", ~"text/plain"}],
+                body => ~"before--Bafter"
+            }
+        ]},
+        cactus_multipart:parse(Body, ~"B")
+    ).
+
+parse_header_value_can_contain_colon_test() ->
+    %% `binary:split/2` defaults to first match — values like
+    %% `12:34:56` (timestamps), `Bearer abc:xyz` (creds) survive.
+    Body = <<
+        "--B\r\n",
+        "X-Time: 12:34:56\r\n",
+        "\r\n",
+        "v",
+        "\r\n--B--\r\n"
+    >>,
+    ?assertEqual(
+        {ok, [#{headers => [{~"x-time", ~"12:34:56"}], body => ~"v"}]},
+        cactus_multipart:parse(Body, ~"B")
+    ).
+
+parse_zero_parts_with_no_crlf_after_terminator_test() ->
+    %% RFC 7578 epilogue may be omitted entirely — `--B--` (no CRLF).
+    %% Already covered, but pin it next to the `--\r\n` shape.
+    ?assertEqual({ok, []}, cactus_multipart:parse(<<"--B--">>, ~"B")).
+
+parse_part_with_multiple_same_named_headers_preserves_order_test() ->
+    %% Repeated headers (e.g. multiple `X-Token` entries) must be kept
+    %% as separate `{Name, Value}` pairs in declaration order. The
+    %% conn-side wire path documents the same convention for response
+    %% headers, so multipart should match.
+    Body = <<
+        "--B\r\n",
+        "X-Token: a\r\n",
+        "X-Token: b\r\n",
+        "\r\n",
+        "v",
+        "\r\n--B--\r\n"
+    >>,
+    ?assertEqual(
+        {ok, [
+            #{
+                headers => [{~"x-token", ~"a"}, {~"x-token", ~"b"}],
+                body => ~"v"
+            }
+        ]},
+        cactus_multipart:parse(Body, ~"B")
+    ).

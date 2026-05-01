@@ -163,23 +163,31 @@ parse_parts(_, _) ->
 
 -spec parse_one_part(binary(), binary()) ->
     {ok, part(), binary()} | {error, term()}.
+%% Empty header block — the part starts with the empty-line terminator
+%% immediately. RFC 5322 §2.2.3 (referenced by RFC 7578) allows this:
+%% headers are followed by a blank line, and the header list itself
+%% may be empty. Without this clause we'd reject a perfectly valid
+%% file-upload that omits Content-Disposition / Content-Type.
+parse_one_part(<<"\r\n", BodyAndRest/binary>>, Sep) ->
+    extract_body(BodyAndRest, [], Sep);
 parse_one_part(Bytes, Sep) ->
     case binary:split(Bytes, ~"\r\n\r\n") of
         [HeaderBlock, BodyAndRest] ->
             case parse_header_lines(binary:split(HeaderBlock, ~"\r\n", [global])) of
-                {ok, Headers} ->
-                    BodyEnd = <<"\r\n", Sep/binary>>,
-                    case binary:split(BodyAndRest, BodyEnd) of
-                        [Body, Rest] ->
-                            {ok, #{headers => Headers, body => Body}, Rest};
-                        _ ->
-                            {error, no_part_terminator}
-                    end;
-                {error, _} = E ->
-                    E
+                {ok, Headers} -> extract_body(BodyAndRest, Headers, Sep);
+                {error, _} = E -> E
             end;
         _ ->
             {error, no_header_terminator}
+    end.
+
+-spec extract_body(binary(), [{binary(), binary()}], binary()) ->
+    {ok, part(), binary()} | {error, no_part_terminator}.
+extract_body(BodyAndRest, Headers, Sep) ->
+    BodyEnd = <<"\r\n", Sep/binary>>,
+    case binary:split(BodyAndRest, BodyEnd) of
+        [Body, Rest] -> {ok, #{headers => Headers, body => Body}, Rest};
+        _ -> {error, no_part_terminator}
     end.
 
 -spec parse_header_lines([binary()]) ->
