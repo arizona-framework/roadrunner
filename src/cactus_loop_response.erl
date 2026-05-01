@@ -64,6 +64,12 @@ run(Socket, Status, UserHeaders, Handler, State) ->
 %% requests), which stay in the mailbox so the gen_statem resumes
 %% their normal handling after this loop returns. On `{stop, _}` we
 %% emit the size-0 chunked terminator and return.
+%%
+%% **No `after` clause:** the loop blocks indefinitely until the
+%% handler returns `{stop, _}` from `handle_info/3`. A handler that
+%% never receives a stop-triggering message keeps the connection
+%% open forever; that's the contract for `{loop, ...}` responses
+%% (e.g. SSE feeds).
 -spec info_loop(cactus_transport:socket(), module(), cactus_handler:push_fun(), term()) -> ok.
 info_loop(Socket, Handler, Push, State) ->
     receive

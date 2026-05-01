@@ -136,6 +136,11 @@ awaiting_socket(enter, _Old, _Data) ->
 awaiting_socket(info, socket_ready, Data) ->
     {next_state, frame_loop, Data, [{next_event, internal, recv}]}.
 
+%% Each `recv` event blocks on `cactus_transport:recv/3` with `infinity`
+%% timeout when the buffer doesn't yet hold a full frame — the session
+%% sleeps until the peer sends bytes, the peer closes, or the framework
+%% detects a transport error. The session exits via `{stop, normal, _}`
+%% on close or parse error; idle sessions live indefinitely.
 -spec frame_loop(gen_statem:event_type(), term(), #data{}) ->
     gen_statem:event_handler_result(atom()).
 frame_loop(enter, _Old, _Data) ->
