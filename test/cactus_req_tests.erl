@@ -278,6 +278,97 @@ forwarded_for_rfc7239_empty_value_returns_undefined_test() ->
     Req = (sample_req())#{headers => [{~"forwarded", ~"for=;by=1.1.1.1"}]},
     ?assertEqual(undefined, cactus_req:forwarded_for(Req)).
 
+%% --- read_form/1 ---
+
+read_form_urlencoded_test() ->
+    Req = (sample_req())#{
+        headers => [{~"content-type", ~"application/x-www-form-urlencoded"}],
+        body => ~"a=1&b=hello+world&c"
+    },
+    {ok, urlencoded, Pairs, _Req2} = cactus_req:read_form(Req),
+    ?assertEqual([{~"a", ~"1"}, {~"b", ~"hello world"}, {~"c", true}], Pairs).
+
+read_form_urlencoded_with_charset_param_test() ->
+    %% `; charset=utf-8` after the type — type-prefix match must still
+    %% recognize it.
+    Req = (sample_req())#{
+        headers => [{~"content-type", ~"application/x-www-form-urlencoded; charset=utf-8"}],
+        body => ~"a=1"
+    },
+    {ok, urlencoded, [{~"a", ~"1"}], _Req2} = cactus_req:read_form(Req).
+
+read_form_multipart_test() ->
+    Body = <<
+        "--B\r\n",
+        "Content-Disposition: form-data; name=\"field1\"\r\n",
+        "\r\n",
+        "value1",
+        "\r\n--B--\r\n"
+    >>,
+    Req = (sample_req())#{
+        headers => [{~"content-type", ~"multipart/form-data; boundary=B"}],
+        body => Body
+    },
+    {ok, multipart, [Part], _Req2} = cactus_req:read_form(Req),
+    ?assertEqual(~"value1", maps:get(body, Part)).
+
+read_form_multipart_no_boundary_test() ->
+    Req = (sample_req())#{
+        headers => [{~"content-type", ~"multipart/form-data"}],
+        body => ~"anything"
+    },
+    ?assertEqual({error, no_boundary}, cactus_req:read_form(Req)).
+
+read_form_no_content_type_test() ->
+    Req = (sample_req())#{body => ~"a=1"},
+    ?assertEqual({error, no_content_type}, cactus_req:read_form(Req)).
+
+read_form_unsupported_content_type_test() ->
+    Req = (sample_req())#{
+        headers => [{~"content-type", ~"application/json"}],
+        body => ~"{}"
+    },
+    ?assertEqual({error, unsupported_content_type}, cactus_req:read_form(Req)).
+
+read_form_urlencoded_body_read_error_propagates_test() ->
+    BS = #{
+        framing => {content_length, 100},
+        buffered => <<>>,
+        bytes_read => 0,
+        pending => <<>>,
+        done => false,
+        recv => fun() -> {error, closed} end,
+        max => 1000
+    },
+    Req = (sample_req())#{
+        headers => [{~"content-type", ~"application/x-www-form-urlencoded"}],
+        body_state => BS
+    },
+    ?assertEqual({error, closed}, cactus_req:read_form(Req)).
+
+read_form_multipart_body_read_error_propagates_test() ->
+    BS = #{
+        framing => {content_length, 100},
+        buffered => <<>>,
+        bytes_read => 0,
+        pending => <<>>,
+        done => false,
+        recv => fun() -> {error, closed} end,
+        max => 1000
+    },
+    Req = (sample_req())#{
+        headers => [{~"content-type", ~"multipart/form-data; boundary=B"}],
+        body_state => BS
+    },
+    ?assertEqual({error, closed}, cactus_req:read_form(Req)).
+
+read_form_multipart_parse_error_propagates_test() ->
+    Req = (sample_req())#{
+        headers => [{~"content-type", ~"multipart/form-data; boundary=B"}],
+        body => ~"no boundary in body at all"
+    },
+    ?assertEqual({error, no_initial_boundary}, cactus_req:read_form(Req)).
+
 read_body_chunked_manual_state_error_propagates_test() ->
     BS = #{
         framing => chunked,

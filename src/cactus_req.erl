@@ -23,6 +23,7 @@ representation can evolve without breaking them.
     read_body/1,
     read_body/2,
     read_body_chunked/1,
+    read_form/1,
     bindings/1,
     peer/1,
     forwarded_for/1,
@@ -245,6 +246,73 @@ read_body_chunked(#{body_state := BS} = Req) ->
     end;
 read_body_chunked(Req) ->
     {ok, body(Req), Req}.
+
+-doc """
+Read and parse a form-encoded request body. Inspects the request's
+`Content-Type` and dispatches:
+
+- `application/x-www-form-urlencoded[; …]` →
+  `{ok, urlencoded, [{Name, Value | true}], Req2}`. Values are
+  percent-decoded (and `+` → space) per `cactus_qs:parse/1`. Bare
+  flags come back as `{Name, true}`.
+- `multipart/form-data; boundary=…` →
+  `{ok, multipart, [Part], Req2}` where each `Part` is the map
+  returned by `cactus_multipart:parse/2` (`#{headers, body}`).
+  `{error, no_boundary}` if the boundary parameter is missing.
+
+Other content types return `{error, unsupported_content_type}`;
+absent `Content-Type` returns `{error, no_content_type}`. Reads the
+body via `read_body/1` (so works in both `auto` and `manual`
+buffering modes), and threads `Req2` back so trailing body bytes
+get drained on keep-alive.
+""".
+-spec read_form(cactus_http1:request()) ->
+    {ok, urlencoded, [{binary(), binary() | true}], cactus_http1:request()}
+    | {ok, multipart, [cactus_multipart:part()], cactus_http1:request()}
+    | {error, no_content_type | unsupported_content_type | no_boundary | term()}.
+read_form(Req) ->
+    case header(~"content-type", Req) of
+        undefined ->
+            {error, no_content_type};
+        ContentType ->
+            dispatch_form(content_type_kind(ContentType), ContentType, Req)
+    end.
+
+-spec content_type_kind(binary()) -> urlencoded | multipart | unsupported.
+content_type_kind(ContentType) ->
+    [Type | _] = binary:split(ContentType, ~";"),
+    case string:lowercase(string:trim(Type)) of
+        ~"application/x-www-form-urlencoded" -> urlencoded;
+        ~"multipart/form-data" -> multipart;
+        _ -> unsupported
+    end.
+
+-spec dispatch_form(urlencoded | multipart | unsupported, binary(), cactus_http1:request()) ->
+    {ok, urlencoded, [{binary(), binary() | true}], cactus_http1:request()}
+    | {ok, multipart, [cactus_multipart:part()], cactus_http1:request()}
+    | {error, term()}.
+dispatch_form(urlencoded, _ContentType, Req) ->
+    case read_body(Req) of
+        {ok, Body, Req2} -> {ok, urlencoded, cactus_qs:parse(Body), Req2};
+        {error, _} = E -> E
+    end;
+dispatch_form(multipart, ContentType, Req) ->
+    case cactus_multipart:boundary(ContentType) of
+        {ok, Boundary} ->
+            case read_body(Req) of
+                {ok, Body, Req2} ->
+                    case cactus_multipart:parse(Body, Boundary) of
+                        {ok, Parts} -> {ok, multipart, Parts, Req2};
+                        {error, _} = E -> E
+                    end;
+                {error, _} = E ->
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end;
+dispatch_form(unsupported, _ContentType, _Req) ->
+    {error, unsupported_content_type}.
 
 -doc """
 Return the router-captured bindings for this request as a
