@@ -502,7 +502,13 @@ do_read_request(
             {stop, normal, Data};
         {error, slow_client} ->
             {stop, normal, Data};
-        {error, _} ->
+        {error, Reason} ->
+            logger:debug(#{
+                msg => "cactus rejecting malformed request",
+                peer => Peer,
+                listener_name => ListenerName,
+                reason => Reason
+            }),
             _ = cactus_conn:send_bad_request(Socket),
             {stop, normal, Data}
     end.
