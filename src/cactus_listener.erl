@@ -113,10 +113,12 @@ init(#{port := Port} = Opts) ->
 
 -spec open_listen_socket(inet:port_number(), opts()) ->
     {ok, cactus_transport:socket()} | {error, term()}.
-open_listen_socket(Port, #{tls := TlsOpts}) ->
-    %% TLS path — caller is responsible for the cert/key options. We layer
-    %% the standard transport options on top so accepted sockets behave
-    %% like the plain-TCP variant.
+open_listen_socket(Port, #{tls := UserTlsOpts}) ->
+    %% TLS path — caller supplies cert/key; we merge `cactus_transport`'s
+    %% hardened defaults underneath (user values win) and layer the
+    %% standard transport options on top so accepted sockets behave like
+    %% the plain-TCP variant.
+    TlsOpts = cactus_transport:apply_tls_defaults(UserTlsOpts),
     cactus_transport:listen_tls(Port, TlsOpts ++ base_listen_opts());
 open_listen_socket(Port, _Opts) ->
     %% Plain TCP. `inet_backend` must be the first option per gen_tcp docs.

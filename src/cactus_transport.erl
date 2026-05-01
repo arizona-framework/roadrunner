@@ -11,6 +11,19 @@ The `{fake, Pid}` variant is a per-connection test helper: every
 Erlang message, letting tests drive a `cactus_conn` byte-by-byte
 without spinning up a listener. See `cactus_transport_tests` for the
 message protocol.
+
+## TLS defaults
+
+`default_tls_opts/0` returns a hardened option list that
+`cactus_listener` merges underneath user-supplied `tls` opts (user
+values win for any key they specify). The defaults are aligned with
+the upstream OTP `ssl_hardening.md` guide: TLS 1.2/1.3 only,
+`honor_cipher_order`, `client_renegotiation` off, AEAD-only
+ECDHE-or-1.3 cipher list filtered through `ssl:filter_cipher_suites/2`,
+and the OTP-default signature algorithms / supported groups
+re-asserted so we don't drift if upstream lowers standards. OCSP
+stapling is intentionally absent — `ssl` does not support
+server-side stapling at the time of writing.
 """.
 
 -export([
@@ -22,7 +35,9 @@ message protocol.
     send/2,
     close/1,
     peername/1,
-    port/1
+    port/1,
+    default_tls_opts/0,
+    apply_tls_defaults/1
 ]).
 
 -export_type([socket/0]).
@@ -160,3 +175,67 @@ port({ssl, S}) ->
         {ok, {_Addr, Port}} -> {ok, Port};
         {error, _} = Err -> Err
     end.
+
+-doc """
+Hardened TLS server defaults — see the moduledoc.
+
+The list is computed at call time so it tracks the OTP version
+the listener is started under (`ssl:cipher_suites/2`,
+`ssl:signature_algs/2`, `ssl:groups/1`).
+""".
+-spec default_tls_opts() -> [ssl:tls_server_option()].
+default_tls_opts() ->
+    [
+        {versions, ['tlsv1.3', 'tlsv1.2']},
+        {honor_cipher_order, true},
+        {client_renegotiation, false},
+        {secure_renegotiate, true},
+        {early_data, disabled},
+        {reuse_sessions, true},
+        {ciphers, default_ciphers()},
+        {signature_algs, default_signature_algs()},
+        {supported_groups, ssl:groups(default)},
+        {alpn_preferred_protocols, [~"http/1.1"]}
+    ].
+
+-doc """
+Merge user-supplied `tls` opts with `default_tls_opts/0`.
+
+User values win: any 2-tuple option the caller already specified is
+kept verbatim and the corresponding default is dropped.
+""".
+-spec apply_tls_defaults([ssl:tls_server_option()]) -> [ssl:tls_server_option()].
+apply_tls_defaults(UserOpts) ->
+    UserKeys = [element(1, Opt) || Opt <- UserOpts, is_tuple(Opt), tuple_size(Opt) =:= 2],
+    Defaults = [
+        Opt
+     || {Key, _} = Opt <- default_tls_opts(),
+        not lists:member(Key, UserKeys)
+    ],
+    Defaults ++ UserOpts.
+
+%% --- internal ---
+
+%% AEAD-only and (for TLS 1.2) ECDHE-only — modern + forward secrecy.
+%% `key_exchange => any` is the TLS 1.3 marker (no separate key exchange).
+-spec default_ciphers() -> [ssl:erl_cipher_suite()].
+default_ciphers() ->
+    Suites = ssl:cipher_suites(default, 'tlsv1.3') ++ ssl:cipher_suites(default, 'tlsv1.2'),
+    Filters = [
+        {key_exchange, fun
+            (any) -> true;
+            (ecdhe_ecdsa) -> true;
+            (ecdhe_rsa) -> true;
+            (_) -> false
+        end},
+        {mac, fun(M) -> M =:= aead end}
+    ],
+    ssl:filter_cipher_suites(Suites, Filters).
+
+%% TLS 1.3 algs first (preferred), TLS 1.2 algs appended uniquely.
+%% OTP's `default` set already excludes SHA-1.
+-spec default_signature_algs() -> ssl:signature_algs().
+default_signature_algs() ->
+    Algs13 = ssl:signature_algs(default, 'tlsv1.3'),
+    Algs12 = ssl:signature_algs(default, 'tlsv1.2'),
+    Algs13 ++ [A || A <- Algs12, not lists:member(A, Algs13)].

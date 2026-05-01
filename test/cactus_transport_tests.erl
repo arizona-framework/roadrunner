@@ -3,6 +3,94 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %% =============================================================================
+%% TLS hardened defaults — see cactus_transport:default_tls_opts/0 and the
+%% OTP ssl_hardening guide.
+%% =============================================================================
+
+default_tls_opts_pins_security_keys_test() ->
+    {ok, _} = application:ensure_all_started(ssl),
+    Opts = cactus_transport:default_tls_opts(),
+    ?assertEqual(
+        {versions, ['tlsv1.3', 'tlsv1.2']}, lists:keyfind(versions, 1, Opts)
+    ),
+    ?assertEqual(
+        {honor_cipher_order, true}, lists:keyfind(honor_cipher_order, 1, Opts)
+    ),
+    ?assertEqual(
+        {client_renegotiation, false}, lists:keyfind(client_renegotiation, 1, Opts)
+    ),
+    ?assertEqual(
+        {secure_renegotiate, true}, lists:keyfind(secure_renegotiate, 1, Opts)
+    ),
+    ?assertEqual({early_data, disabled}, lists:keyfind(early_data, 1, Opts)),
+    ?assertEqual({reuse_sessions, true}, lists:keyfind(reuse_sessions, 1, Opts)),
+    ?assertEqual(
+        {alpn_preferred_protocols, [~"http/1.1"]},
+        lists:keyfind(alpn_preferred_protocols, 1, Opts)
+    ).
+
+default_tls_opts_ciphers_are_aead_pfs_only_test() ->
+    {ok, _} = application:ensure_all_started(ssl),
+    {ciphers, Ciphers} = lists:keyfind(ciphers, 1, cactus_transport:default_tls_opts()),
+    ?assertNotEqual([], Ciphers),
+    %% Every cipher uses AEAD MAC.
+    [?assertMatch(#{mac := aead}, C) || C <- Ciphers],
+    %% Key exchange is either TLS 1.3 ('any') or TLS 1.2 ECDHE — no
+    %% static-RSA, no DH-DSS, no ECDH (non-ephemeral).
+    [
+        ?assert(lists:member(KX, [any, ecdhe_ecdsa, ecdhe_rsa]))
+     || #{key_exchange := KX} <- Ciphers
+    ],
+    %% List passes ssl:filter_cipher_suites/2 round-trip — guards
+    %% against typos that silently drop suites at handshake time.
+    ?assertEqual(Ciphers, ssl:filter_cipher_suites(Ciphers, [])).
+
+default_tls_opts_signature_algs_excludes_sha1_test() ->
+    {ok, _} = application:ensure_all_started(ssl),
+    {signature_algs, Algs} = lists:keyfind(
+        signature_algs, 1, cactus_transport:default_tls_opts()
+    ),
+    ?assertNotEqual([], Algs),
+    %% No legacy {sha, _} entries. (OTP defaults already exclude
+    %% them; this test guards against future drift.)
+    [
+        ?assertNot(element(1, A) =:= sha)
+     || A <- Algs, is_tuple(A)
+    ].
+
+default_tls_opts_supported_groups_starts_with_pq_hybrid_test() ->
+    {ok, _} = application:ensure_all_started(ssl),
+    {supported_groups, [First | _] = Groups} =
+        lists:keyfind(supported_groups, 1, cactus_transport:default_tls_opts()),
+    %% PQ-hybrid first per OTP default.
+    ?assertEqual(x25519mlkem768, First),
+    ?assert(lists:member(x25519, Groups)).
+
+apply_tls_defaults_with_empty_user_opts_returns_all_defaults_test() ->
+    {ok, _} = application:ensure_all_started(ssl),
+    ?assertEqual(
+        cactus_transport:default_tls_opts(), cactus_transport:apply_tls_defaults([])
+    ).
+
+apply_tls_defaults_user_opt_overrides_default_test() ->
+    {ok, _} = application:ensure_all_started(ssl),
+    Result = cactus_transport:apply_tls_defaults([{versions, ['tlsv1.3']}]),
+    %% User's versions wins; no second {versions, _} entry.
+    ?assertEqual({versions, ['tlsv1.3']}, lists:keyfind(versions, 1, Result)),
+    OnlyOne = [Opt || {versions, _} = Opt <- Result],
+    ?assertEqual(1, length(OnlyOne)),
+    %% Other defaults still present.
+    ?assertMatch({honor_cipher_order, true}, lists:keyfind(honor_cipher_order, 1, Result)).
+
+apply_tls_defaults_preserves_user_cert_opts_test() ->
+    {ok, _} = application:ensure_all_started(ssl),
+    UserOpts = [{cert, ~"DER-bytes"}, {key, {rsa, ~"key-bytes"}}],
+    Result = cactus_transport:apply_tls_defaults(UserOpts),
+    ?assertEqual({cert, ~"DER-bytes"}, lists:keyfind(cert, 1, Result)),
+    ?assertEqual({key, {rsa, ~"key-bytes"}}, lists:keyfind(key, 1, Result)),
+    ?assertMatch({versions, _}, lists:keyfind(versions, 1, Result)).
+
+%% =============================================================================
 %% Negative ssl-side coverage. Happy paths are exercised by the gen_tcp
 %% conn tests and the cactus_tls_tests integration test.
 %% =============================================================================
