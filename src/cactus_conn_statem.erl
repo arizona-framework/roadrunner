@@ -40,8 +40,9 @@ with the connection's duration and the keep-alive request count.
     socket :: cactus_transport:socket(),
     proto_opts :: cactus_conn:proto_opts(),
     listener_name :: atom(),
-    %% Captured at init/1 for the conn_close telemetry's `duration`.
-    start_mono :: integer(),
+    %% Captured by the `shoot` handler (once peer is known) and paired
+    %% with the `[cactus, listener, conn_close]` event in `terminate/3`.
+    start_mono :: integer() | undefined,
     %% Peer is unknown until after the socket transfer; populated on
     %% entry to `reading_request` (Phase 5).
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
@@ -93,17 +94,15 @@ init({Socket, ProtoOpts}) ->
     ListenerName = maps:get(listener_name, ProtoOpts, undefined),
     proc_lib:set_label({cactus_conn, ListenerName}),
     ok = cactus_conn:join_drain_group(ListenerName),
-    %% Peer isn't known yet — `init/1` runs before the socket transfer.
-    %% Listener-accept telemetry fires here so subscribers can correlate
-    %% by listener regardless of when the peer becomes available.
-    StartMono = cactus_telemetry:listener_accept(#{
-        listener_name => ListenerName, peer => undefined
-    }),
+    %% Listener-accept telemetry fires from the `shoot` handler once
+    %% the peer is known (socket ownership has been transferred). The
+    %% StartMono captured there is paired with `listener_conn_close`
+    %% in `terminate/3` so the duration measures the conn's full
+    %% lifetime past the acceptor handoff.
     {ok, awaiting_shoot, #data{
         socket = Socket,
         proto_opts = ProtoOpts,
-        listener_name = ListenerName,
-        start_mono = StartMono
+        listener_name = ListenerName
     }}.
 
 %% --- Single event handler covering every state. ---
@@ -125,7 +124,7 @@ handle_event(
     shoot,
     awaiting_shoot,
     #data{
-        socket = Socket, proto_opts = ProtoOpts
+        socket = Socket, proto_opts = ProtoOpts, listener_name = ListenerName
     } = Data
 ) ->
     %% Socket ownership has just transferred from the acceptor — refine
@@ -134,7 +133,12 @@ handle_event(
     Peer = cactus_conn:peer(Socket),
     ok = cactus_conn:refine_conn_label(ProtoOpts, Peer),
     Scheme = cactus_conn:scheme(Socket),
-    {next_state, reading_request, Data#data{peer = Peer, scheme = Scheme}};
+    StartMono = cactus_telemetry:listener_accept(#{
+        listener_name => ListenerName, peer => Peer
+    }),
+    {next_state, reading_request, Data#data{
+        peer = Peer, scheme = Scheme, start_mono = StartMono
+    }};
 %% --- reading_request ---
 handle_event(enter, _Old, reading_request, _Data) ->
     %% `state_timeout` is the only action a `state_enter` callback can
@@ -145,22 +149,22 @@ handle_event(
     state_timeout,
     parse,
     reading_request,
-    #data{
-        drain_pending = true
-    } = Data
+    #data{phase = Phase, proto_opts = ProtoOpts} = Data0
 ) ->
-    %% Listener is draining — close before reading another request.
-    {stop, normal, Data};
-handle_event(
-    state_timeout,
-    parse,
-    reading_request,
-    #data{
-        phase = Phase, proto_opts = ProtoOpts
-    } = Data
-) ->
-    Timeout = request_timeout(Phase, ProtoOpts),
-    do_read_request(Timeout, Data);
+    %% Drain peek: a `{cactus_drain, _}` info event that arrived after
+    %% `state_enter` set the parse timeout would otherwise be queued
+    %% behind the state_timeout (which fires first under gen_statem's
+    %% event priority). Mirror the legacy spine's `drain_pending/0`
+    %% receive-with-after-0 by peeking the gen_statem process mailbox
+    %% directly here.
+    Data = drain_peek(Data0),
+    case Data#data.drain_pending of
+        true ->
+            {stop, normal, Data};
+        false ->
+            Timeout = request_timeout(Phase, ProtoOpts),
+            do_read_request(Timeout, Data)
+    end;
 %% --- reading_body ---
 handle_event(enter, _Old, reading_body, _Data) ->
     {keep_state_and_data, [{state_timeout, 0, read}]};
@@ -242,10 +246,14 @@ handle_event(
         requests_served = Served
     } = Data
 ) ->
-    %% Phase 6a/6b only handles buffered response keep-alive — the
-    %% other response kinds (stream, loop, sendfile, websocket) close
-    %% by construction in Phase 7's dispatch_response clauses.
-    buffered_finish(Data, ProtoOpts, Req, Response, Served).
+    %% Stream / loop / sendfile / websocket all force close by
+    %% construction — only buffered (3-tuple) considers keep-alive.
+    case cactus_conn:response_kind(Response) of
+        buffered ->
+            buffered_finish(Data, ProtoOpts, Req, Response, Served);
+        _ ->
+            {stop, normal, Data}
+    end.
 
 %% Mirror `cactus_conn:handle_and_send/4` exactly: bracket the
 %% middleware/handler pipeline with `[cactus, request, start | stop |
@@ -329,6 +337,22 @@ buffered_finish(Data, ProtoOpts, Req, {_Status, Headers, _Body}, Served) ->
 request_timeout(first, ProtoOpts) -> maps:get(request_timeout, ProtoOpts);
 request_timeout(keep_alive, ProtoOpts) -> maps:get(keep_alive_timeout, ProtoOpts).
 
+%% Non-blocking peek for a `{cactus_drain, _}` broadcast that may have
+%% landed in the gen_statem mailbox after state_enter set the parse
+%% timeout. The state_timeout fires before info events under
+%% gen_statem's priority rules — without this peek, a drain that
+%% arrived during dispatching/finishing wouldn't be observed until
+%% AFTER the next request's parse begins.
+-spec drain_peek(#data{}) -> #data{}.
+drain_peek(#data{drain_pending = true} = Data) ->
+    Data;
+drain_peek(Data) ->
+    receive
+        {cactus_drain, _Deadline} -> Data#data{drain_pending = true}
+    after 0 ->
+        Data
+    end.
+
 %% Mirrors `cactus_conn:maybe_send_request_timeout/2` — only the very
 %% first request gets a 408 on silence; idle keep-alive timeouts
 %% close silently to avoid blasting at peers that weren't reading.
@@ -348,16 +372,45 @@ telemetry_metadata(Req) ->
         listener_name => maps:get(listener_name, Req, undefined)
     }.
 
-%% Phase 6a only handles the buffered response shape. Phase 6b/7 add
-%% `stream | loop | sendfile | websocket` once integration tests
-%% (real listener, real socket) drive the full dispatch and provide
-%% natural coverage for those clauses.
 -spec dispatch_response(
     cactus_transport:socket(),
     module(),
     cactus_http1:request(),
     cactus_handler:response()
 ) -> ok.
+dispatch_response(Socket, _Handler, Req, {websocket, Mod, State}) when is_atom(Mod) ->
+    _ = cactus_ws_session:run(Socket, Req, Mod, State),
+    ok;
+dispatch_response(Socket, _Handler, _Req, {stream, Status, Headers, Fun}) when
+    is_function(Fun, 1)
+->
+    _ = cactus_stream_response:run(Socket, Status, Headers, Fun),
+    ok;
+dispatch_response(Socket, Handler, _Req, {loop, Status, Headers, LoopState}) when
+    is_integer(Status)
+->
+    _ = cactus_loop_response:run(Socket, Status, Headers, Handler, LoopState),
+    ok;
+dispatch_response(
+    Socket, _Handler, Req, {sendfile, Status, Headers, {Filename, Offset, Length}}
+) when
+    is_integer(Status)
+->
+    Head = cactus_http1:response(Status, Headers, ~""),
+    _ = cactus_telemetry:response_send(
+        cactus_transport:send(Socket, Head), sendfile_response_head
+    ),
+    _ =
+        case cactus_req:method(Req) of
+            ~"HEAD" ->
+                ok;
+            _ ->
+                cactus_telemetry:response_send(
+                    cactus_transport:sendfile(Socket, Filename, Offset, Length),
+                    sendfile_body
+                )
+        end,
+    ok;
 dispatch_response(Socket, _Handler, Req, {Status, Headers, Body}) when is_integer(Status) ->
     RespBody = cactus_conn:response_body_for(Req, Body),
     Resp = cactus_http1:response(Status, Headers, RespBody),
@@ -419,10 +472,19 @@ terminate(_Reason, _State, #data{
     peer = Peer,
     requests_served = Count
 }) ->
-    %% Mirror the legacy spine's `serve_lifecycle/3` telemetry exactly.
-    cactus_telemetry:listener_conn_close(StartMono, #{
-        listener_name => ListenerName, peer => Peer, requests_served => Count
-    }),
+    %% Skip the `conn_close` event if the process never reached the
+    %% `shoot` handler — `accept` never fired so a paired `conn_close`
+    %% would be misleading.
+    case StartMono of
+        undefined ->
+            ok;
+        _ ->
+            cactus_telemetry:listener_conn_close(StartMono, #{
+                listener_name => ListenerName,
+                peer => Peer,
+                requests_served => Count
+            })
+    end,
     _ = cactus_transport:close(Socket),
     cactus_conn:release_slot(ProtoOpts),
     ok.

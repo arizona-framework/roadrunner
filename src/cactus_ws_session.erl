@@ -39,12 +39,38 @@ every frame.
 }).
 
 -doc """
-Run the WebSocket session synchronously: spawn the gen_statem,
-transfer socket ownership, await termination. Returns `ok` once the
-session has ended.
+Send the 101 handshake response and run the WebSocket session
+synchronously: spawn the gen_statem, transfer socket ownership,
+await termination. Returns `ok` once the session has ended (or
+the handshake check fails — in which case 400 has been sent and
+the gen_statem is never started).
 """.
 -spec run(cactus_transport:socket(), cactus_http1:request(), module(), term()) -> ok.
 run(Socket, Req, Mod, State) ->
+    case cactus_ws:handshake_response(cactus_req:headers(Req)) of
+        {ok, Status, RespHeaders, _} ->
+            Resp = cactus_http1:response(Status, RespHeaders, ~""),
+            %% If this send fails, the session's first recv will return
+            %% `{error, _}` and the loop ends cleanly — no separate
+            %% handling.
+            _ = cactus_telemetry:response_send(
+                cactus_transport:send(Socket, Resp), websocket_upgrade_response
+            ),
+            run_session(Socket, Req, Mod, State);
+        {error, _} ->
+            _ = cactus_transport:send(
+                Socket,
+                cactus_http1:response(
+                    400,
+                    [{~"content-length", ~"0"}, {~"connection", ~"close"}],
+                    ~""
+                )
+            ),
+            ok
+    end.
+
+-spec run_session(cactus_transport:socket(), cactus_http1:request(), module(), term()) -> ok.
+run_session(Socket, Req, Mod, State) ->
     Ctx = ws_context(Req, Mod),
     ok = cactus_telemetry:ws_upgrade(Ctx),
     %% `start` (not `start_link`) — the conn is intentionally unlinked

@@ -509,6 +509,40 @@ manual_body_drain_failure_closes_test() ->
     end,
     stop_sink(Sink).
 
+terminate_without_shoot_skips_conn_close_telemetry_test() ->
+    %% If the gen_statem dies before `shoot` is processed (e.g., the
+    %% acceptor crashes between `start` and `controlling_process`),
+    %% no `accept` event was emitted. `terminate/3` skips `conn_close`
+    %% to keep the events paired.
+    ensure_pg(),
+    {ok, _} = application:ensure_all_started(telemetry),
+    Self = self(),
+    HandlerId = make_ref(),
+    ok = telemetry:attach(
+        HandlerId,
+        [cactus, listener, conn_close],
+        fun(Event, M, Md, _) -> Self ! {ev, Event, M, Md} end,
+        undefined
+    ),
+    try
+        Sink = spawn_recv_sink([]),
+        {ok, Pid} = cactus_conn_statem:start(
+            {fake, Sink}, fake_proto_opts(no_shoot)
+        ),
+        %% `gen_statem:stop` runs `terminate/3` cleanly with the
+        %% gen_statem still in `awaiting_shoot` — `start_mono` is
+        %% `undefined` so the conn_close branch is skipped.
+        ok = gen_statem:stop(Pid),
+        receive
+            {ev, [cactus, listener, conn_close], _, _} ->
+                error(unexpected_conn_close)
+        after 100 -> ok
+        end,
+        stop_sink(Sink)
+    after
+        telemetry:detach(HandlerId)
+    end.
+
 listener_accept_and_conn_close_fire_around_statem_test() ->
     {ok, _} = application:ensure_all_started(telemetry),
     Self = self(),
@@ -533,7 +567,10 @@ listener_accept_and_conn_close_fire_around_statem_test() ->
         end,
         receive
             {ev, [cactus, listener, accept], _, AcceptMd} ->
-                ?assertEqual(telemetry_test, maps:get(listener_name, AcceptMd))
+                ?assertEqual(telemetry_test, maps:get(listener_name, AcceptMd)),
+                %% Peer comes from `cactus_transport:peername/1` on the
+                %% fake socket — the stub returns `{{127, 0, 0, 1}, 0}`.
+                ?assertMatch({{127, 0, 0, 1}, _}, maps:get(peer, AcceptMd))
         after 1000 -> error(no_accept)
         end,
         receive

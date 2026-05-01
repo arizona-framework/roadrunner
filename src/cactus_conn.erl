@@ -98,45 +98,19 @@ read it anyway.
 Spawn an unlinked connection process for the accepted `Socket` and the
 shared `ProtoOpts` (handler module, body limits, ...).
 
+Backed by `cactus_conn_statem` — a `gen_statem` whose named states
+(`awaiting_shoot | reading_request | reading_body | dispatching |
+finishing`) make the request lifecycle visible to `sys:get_state/1`,
+`sys:trace/2`, and observer's process inspector. The legacy
+recursive spine is gone.
+
 The caller (typically `cactus_acceptor`) must transfer socket
 ownership via `cactus_transport:controlling_process/2` and then
 send the process the atom `shoot` to release it.
 """.
 -spec start(cactus_transport:socket(), proto_opts()) -> {ok, pid()}.
 start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
-    ListenerName = maps:get(listener_name, ProtoOpts, undefined),
-    Pid = proc_lib:spawn(fun() ->
-        %% Initial label — `Peer` isn't available yet because the socket
-        %% transfer hasn't happened. `serve/2` refines once peername is
-        %% known so `observer` shows `{cactus_conn, ListenerName, Peer}`.
-        proc_lib:set_label({cactus_conn, ListenerName}),
-        join_drain_group(ListenerName),
-        try
-            receive
-                shoot -> serve_lifecycle(Socket, ProtoOpts, ListenerName)
-            end
-        after
-            release_slot(ProtoOpts)
-        end
-    end),
-    {ok, Pid}.
-
-%% Bracket the per-conn lifetime with `[cactus, listener, accept]` /
-%% `[cactus, listener, conn_close]` telemetry. The accept event lets
-%% subscribers count incoming connections; the conn_close event reports
-%% the connection's wall-clock duration and how many keep-alive requests
-%% it served.
--spec serve_lifecycle(cactus_transport:socket(), proto_opts(), atom()) -> ok.
-serve_lifecycle(Socket, ProtoOpts, ListenerName) ->
-    Peer = peer(Socket),
-    StartMono = cactus_telemetry:listener_accept(#{
-        listener_name => ListenerName, peer => Peer
-    }),
-    Count = serve(Socket, ProtoOpts, Peer),
-    cactus_telemetry:listener_conn_close(StartMono, #{
-        listener_name => ListenerName, peer => Peer, requests_served => Count
-    }),
-    ok.
+    {ok, _Pid} = cactus_conn_statem:start(Socket, ProtoOpts).
 
 -doc """
 Join the per-listener `pg` group so `cactus_listener:drain/2` can
@@ -186,18 +160,6 @@ release_slot(#{client_counter := Ref}) ->
     _ = atomics:sub(Ref, 1, 1),
     ok.
 
--spec serve(
-    cactus_transport:socket(),
-    proto_opts(),
-    {inet:ip_address(), inet:port_number()} | undefined
-) -> non_neg_integer().
-serve(Socket, ProtoOpts, Peer) ->
-    refine_conn_label(ProtoOpts, Peer),
-    Scheme = scheme(Socket),
-    Count = serve_loop(Socket, Peer, Scheme, ProtoOpts, 0),
-    _ = cactus_transport:close(Socket),
-    Count.
-
 -doc false.
 -spec refine_conn_label(
     proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
@@ -230,189 +192,6 @@ set_request_logger_metadata(#{
         path => Target,
         peer => Peer
     }).
-
--spec serve_loop(
-    cactus_transport:socket(), term(), http | https, proto_opts(), non_neg_integer()
-) -> non_neg_integer().
-serve_loop(_Socket, _Peer, _Scheme, #{max_keep_alive_request := Max}, Count) when Count >= Max ->
-    Count;
-serve_loop(Socket, Peer, Scheme, ProtoOpts, Count) ->
-    case drain_pending() of
-        true ->
-            %% Listener is draining — finish the in-flight pipeline by
-            %% closing instead of looking for the next keep-alive request.
-            Count;
-        false ->
-            do_serve_loop(Socket, Peer, Scheme, ProtoOpts, Count)
-    end.
-
--spec do_serve_loop(
-    cactus_transport:socket(), term(), http | https, proto_opts(), non_neg_integer()
-) -> non_neg_integer().
-do_serve_loop(Socket, Peer, Scheme, ProtoOpts, Count) ->
-    %% First request on a fresh connection: bounded by request_timeout, and
-    %% a silent client gets a 408. Idle wait between keep-alive requests:
-    %% bounded by keep_alive_timeout, and an idle client just gets the
-    %% socket closed silently — no 408 to a peer that wasn't going to read it.
-    {Timeout, Phase} =
-        case Count of
-            0 -> {maps:get(request_timeout, ProtoOpts), first};
-            _ -> {maps:get(keep_alive_timeout, ProtoOpts), keep_alive}
-        end,
-    %% `process_one` returns whether the response was the keep-alive
-    %% kind or the close kind, plus whether a request was actually
-    %% served (parse failure / silent-timeout / slow-client kicks
-    %% don't count as served — the listener's `requests_counter`
-    %% atomic skips them too, so the per-conn count stays consistent).
-    case process_one(Socket, Peer, Scheme, ProtoOpts, Timeout, Phase) of
-        {keep_alive, served} ->
-            serve_loop(Socket, Peer, Scheme, ProtoOpts, Count + 1);
-        {close, served} ->
-            Count + 1;
-        {close, unserved} ->
-            Count
-    end.
-
-%% Non-blocking mailbox peek for a `{cactus_drain, _}` broadcast from
-%% `cactus_listener:drain/2`. Checked between requests on a keep-alive
-%% conn so an in-flight request always finishes, but the next one is
-%% never started.
--spec drain_pending() -> boolean().
-drain_pending() ->
-    receive
-        {cactus_drain, _Deadline} -> true
-    after 0 ->
-        false
-    end.
-
--spec process_one(
-    cactus_transport:socket(),
-    term(),
-    http | https,
-    proto_opts(),
-    non_neg_integer(),
-    first | keep_alive
-) -> {keep_alive | close, served | unserved}.
-process_one(
-    Socket,
-    Peer,
-    Scheme,
-    #{
-        dispatch := Dispatch,
-        middlewares := ListenerMws,
-        max_content_length := MaxCL,
-        minimum_bytes_per_second := MinRate,
-        body_buffering := BodyBuffering,
-        requests_counter := ReqCounter
-    } = ProtoOpts,
-    Timeout,
-    Phase
-) ->
-    Deadline = erlang:monotonic_time(millisecond) + Timeout,
-    Recv = make_recv(Socket, Deadline, MinRate),
-    case parse_loop(<<>>, Recv) of
-        {ok, Req0, Buffered} ->
-            %% Bump the listener's requests-served counter as soon as
-            %% headers parse — counts everything that reaches the
-            %% dispatch pipeline (including 404 from the router and
-            %% 413 from oversized bodies), excludes parse errors and
-            %% silent slow-client closes.
-            _ = atomics:add(ReqCounter, 1, 1),
-            RequestId = generate_request_id(),
-            Req = Req0#{
-                peer => Peer,
-                scheme => Scheme,
-                request_id => RequestId,
-                listener_name => maps:get(listener_name, ProtoOpts, undefined)
-            },
-            ok = set_request_logger_metadata(Req),
-            ok = maybe_send_continue(Socket, Req, Buffered),
-            Action = handle_with_body(
-                Socket, Req, Buffered, Recv, MaxCL, Dispatch, ListenerMws, BodyBuffering
-            ),
-            {Action, served};
-        {error, request_timeout} ->
-            _ = maybe_send_request_timeout(Socket, Phase),
-            {close, unserved};
-        {error, slow_client} ->
-            {close, unserved};
-        {error, _} ->
-            _ = send_bad_request(Socket),
-            {close, unserved}
-    end.
-
--spec maybe_send_request_timeout(cactus_transport:socket(), first | keep_alive) ->
-    ok | {error, term()}.
-maybe_send_request_timeout(Socket, first) -> send_request_timeout(Socket);
-maybe_send_request_timeout(_Socket, keep_alive) -> ok.
-
-%% Auto mode: read the body upfront, hand the handler the buffered
-%% bytes via `req#{body}`. Manual mode: skip the upfront read, embed a
-%% `body_state` in the request so the handler can call
-%% `cactus_req:read_body/1,2`. Manual mode does not keep-alive — the
-%% conn would have to drain whatever the handler skipped, which we
-%% defer until arizona surfaces a need.
--spec handle_with_body(
-    cactus_transport:socket(),
-    cactus_http1:request(),
-    binary(),
-    fun(() -> {ok, binary()} | {error, term()}),
-    non_neg_integer(),
-    dispatch(),
-    cactus_middleware:middleware_list(),
-    auto | manual
-) -> keep_alive | close.
-handle_with_body(Socket, Req, Buffered, Recv, MaxCL, Dispatch, ListenerMws, auto) ->
-    case read_body(Req, Buffered, Recv, MaxCL) of
-        {ok, Body} ->
-            ReqWithBody = Req#{body => Body},
-            dispatch_resolved(Socket, ReqWithBody, Dispatch, ListenerMws);
-        {error, content_length_too_large} ->
-            _ = send_payload_too_large(Socket),
-            close;
-        {error, request_timeout} ->
-            _ = send_request_timeout(Socket),
-            close;
-        {error, slow_client} ->
-            close;
-        {error, _} ->
-            _ = send_bad_request(Socket),
-            close
-    end;
-handle_with_body(Socket, Req, Buffered, Recv, MaxCL, Dispatch, ListenerMws, manual) ->
-    case body_framing(Req) of
-        {error, _} ->
-            _ = send_bad_request(Socket),
-            close;
-        Framing ->
-            BodyState = #{
-                framing => Framing,
-                buffered => Buffered,
-                bytes_read => 0,
-                pending => <<>>,
-                done => false,
-                recv => Recv,
-                max => MaxCL
-            },
-            ReqWithState = Req#{body_state => BodyState},
-            dispatch_resolved(Socket, ReqWithState, Dispatch, ListenerMws)
-    end.
-
--spec dispatch_resolved(
-    cactus_transport:socket(),
-    cactus_http1:request(),
-    dispatch(),
-    cactus_middleware:middleware_list()
-) -> keep_alive | close.
-dispatch_resolved(Socket, Req, Dispatch, ListenerMws) ->
-    case resolve_handler(Dispatch, Req) of
-        {ok, Handler, Bindings, RouteOpts} ->
-            FullReq = Req#{bindings => Bindings, route_opts => RouteOpts},
-            handle_and_send(Socket, Handler, FullReq, ListenerMws);
-        not_found ->
-            _ = send_not_found(Socket),
-            close
-    end.
 
 %% Build a recv closure with a single overall deadline plus a rolling
 %% rate check. `gen_tcp:recv` with a negative timeout is undefined, so
@@ -844,56 +623,6 @@ parse_loop(Buf, RecvFun) ->
             E
     end.
 
--spec handle_and_send(
-    cactus_transport:socket(),
-    module(),
-    cactus_http1:request(),
-    cactus_middleware:middleware_list()
-) -> keep_alive | close.
-handle_and_send(Socket, Handler, Req, ListenerMws) ->
-    %% Listener-level middlewares wrap route-level middlewares wrap handler.
-    %% Both lists run "first = outermost"; an empty list is a no-op.
-    %% The pipeline returns `{Response, Req2}` — `Req2` is always
-    %% threaded back so the conn can drain (in manual mode) and so
-    %% response middlewares can rewrite. See `cactus_handler:result/0`.
-    RouteMws = route_middlewares(Req),
-    HandlerFun = fun(R) -> Handler:handle(R) end,
-    Pipeline = cactus_middleware:compose(ListenerMws ++ RouteMws, HandlerFun),
-    Metadata = telemetry_metadata(Req),
-    StartMono = cactus_telemetry:request_start(Metadata),
-    try Pipeline(Req) of
-        {Response, Req2} when is_map(Req2) ->
-            Result = dispatch_response(Socket, Handler, Req2, Response),
-            ok = cactus_telemetry:request_stop(StartMono, Metadata, #{
-                status => response_status(Response),
-                response_kind => response_kind(Response)
-            }),
-            Result
-    catch
-        Class:Reason:Stack ->
-            ok = cactus_telemetry:request_exception(StartMono, Metadata, Class, Reason),
-            logger:error(#{
-                msg => "cactus handler crashed",
-                handler => Handler,
-                class => Class,
-                reason => Reason,
-                stacktrace => Stack
-            }),
-            _ = send_internal_error(Socket),
-            close
-    end.
-
--spec telemetry_metadata(cactus_http1:request()) -> cactus_telemetry:metadata().
-telemetry_metadata(Req) ->
-    #{
-        request_id => maps:get(request_id, Req),
-        peer => maps:get(peer, Req),
-        method => maps:get(method, Req),
-        path => maps:get(target, Req),
-        scheme => maps:get(scheme, Req),
-        listener_name => maps:get(listener_name, Req, undefined)
-    }.
-
 %% Order matters — `{websocket, _, _}` is a 3-tuple too, so the
 %% atom-tagged variants must precede the buffered catch-all.
 -doc false.
@@ -919,79 +648,6 @@ route_middlewares(Req) ->
     case cactus_req:route_opts(Req) of
         #{middlewares := Mws} -> Mws;
         _ -> []
-    end.
-
--spec dispatch_response(
-    cactus_transport:socket(),
-    module(),
-    cactus_http1:request(),
-    cactus_handler:response()
-) -> keep_alive | close.
-dispatch_response(Socket, _Handler, Req, {websocket, Mod, State}) when is_atom(Mod) ->
-    _ = upgrade_to_websocket(Socket, Req, Mod, State),
-    close;
-dispatch_response(Socket, _Handler, _Req, {stream, Status, Headers, Fun}) when
-    is_function(Fun, 1)
-->
-    _ = cactus_stream_response:run(Socket, Status, Headers, Fun),
-    close;
-dispatch_response(Socket, Handler, _Req, {loop, Status, Headers, LoopState}) when
-    is_integer(Status)
-->
-    _ = cactus_loop_response:run(Socket, Status, Headers, Handler, LoopState),
-    close;
-dispatch_response(
-    Socket, _Handler, Req, {sendfile, Status, Headers, {Filename, Offset, Length}}
-) when
-    is_integer(Status)
-->
-    sendfile_response(Socket, Req, Status, Headers, Filename, Offset, Length);
-dispatch_response(Socket, _Handler, Req, {Status, Headers, Body}) when is_integer(Status) ->
-    RespBody = response_body_for(Req, Body),
-    Resp = cactus_http1:response(Status, Headers, RespBody),
-    _ = cactus_telemetry:response_send(
-        cactus_transport:send(Socket, Resp), buffered_response
-    ),
-    finish_response(Req, Headers).
-
--spec sendfile_response(
-    cactus_transport:socket(),
-    cactus_http1:request(),
-    cactus_http1:status(),
-    cactus_http1:headers(),
-    file:filename_all(),
-    non_neg_integer(),
-    non_neg_integer()
-) -> keep_alive | close.
-sendfile_response(Socket, Req, Status, Headers, Filename, Offset, Length) ->
-    Head = cactus_http1:response(Status, Headers, ~""),
-    _ = cactus_telemetry:response_send(
-        cactus_transport:send(Socket, Head), sendfile_response_head
-    ),
-    %% RFC 9110 §9.3.2: HEAD must not include a message body. The
-    %% headers (including Content-Length) match what GET would have
-    %% sent, so framing is preserved.
-    _ =
-        case cactus_req:method(Req) of
-            ~"HEAD" ->
-                ok;
-            _ ->
-                cactus_telemetry:response_send(
-                    cactus_transport:sendfile(Socket, Filename, Offset, Length),
-                    sendfile_body
-                )
-        end,
-    finish_response(Req, Headers).
-
-%% Drain whatever the handler left on the socket so the next request
-%% lands cleanly. In auto mode there's nothing to drain (no
-%% body_state); in manual mode the conn consumes any unread body.
-%% Drain failure (closed peer, malformed body, etc.) → close.
--spec finish_response(cactus_http1:request(), cactus_http1:headers()) -> keep_alive | close.
-finish_response(Req, Headers) ->
-    case drain_body(Req) of
-        ok -> keep_alive_decision(Req, Headers);
-        {error, _} -> close
     end.
 
 %% RFC 9110 §9.3.2: a response to HEAD must not include a message body.
@@ -1085,27 +741,3 @@ send_internal_error(Socket) ->
         ~""
     ),
     cactus_transport:send(Socket, Resp).
-
-%% --- WebSocket upgrade ---
-
-%% Send the 101 handshake response, then hand the socket off to a
-%% per-session `cactus_ws_session` gen_statem. The session monitors
-%% itself; we (the conn) wait synchronously for it to terminate via
-%% the launcher's monitor so the parent's `[cactus, listener,
-%% conn_close]` telemetry still fires after the WS session ends.
--spec upgrade_to_websocket(cactus_transport:socket(), cactus_http1:request(), module(), term()) ->
-    ok | {error, term()}.
-upgrade_to_websocket(Socket, Req, Mod, State) ->
-    case cactus_ws:handshake_response(cactus_req:headers(Req)) of
-        {ok, Status, RespHeaders, _} ->
-            Resp = cactus_http1:response(Status, RespHeaders, ~""),
-            %% If this send fails, the session's first recv will return
-            %% {error, _} and the session ends cleanly — no separate
-            %% handling.
-            _ = cactus_telemetry:response_send(
-                cactus_transport:send(Socket, Resp), websocket_upgrade_response
-            ),
-            cactus_ws_session:run(Socket, Req, Mod, State);
-        {error, _} ->
-            send_bad_request(Socket)
-    end.
