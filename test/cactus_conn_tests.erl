@@ -586,6 +586,39 @@ recv_until(Sock, Marker, Acc) ->
             Acc
     end.
 
+conn_trailer_with_crlf_in_value_crashes_test_() ->
+    {setup,
+        fun() ->
+            ok = logger:set_primary_config(level, none),
+            {ok, _} = cactus_listener:start_link(conn_test_trailer_inject, #{
+                port => 0, handler => cactus_evil_trailers_handler
+            }),
+            cactus_listener:port(conn_test_trailer_inject)
+        end,
+        fun(_) ->
+            ok = cactus_listener:stop(conn_test_trailer_inject),
+            ok = logger:set_primary_config(level, notice)
+        end,
+        fun(Port) ->
+            {"trailer with CRLF in value triggers header_injection crash → 500", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                Reply = recv_until_closed(Sock),
+                %% The handler started streaming (so headers are already
+                %% on the wire as 200). The trailer crash happens during
+                %% the size-0 chunk write — the wire output gets cut off
+                %% before the malicious bytes reach the client.
+                Lower = string:lowercase(Reply),
+                ?assertEqual(
+                    nomatch,
+                    binary:match(Lower, ~"injected: yes")
+                ),
+                ok = gen_tcp:close(Sock)
+            end}
+        end}.
+
 conn_streams_chunked_with_trailers_test_() ->
     {setup,
         fun() ->

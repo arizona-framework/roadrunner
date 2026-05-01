@@ -811,7 +811,18 @@ stream_frame(Chunk, {fin, Trailers}) ->
 
 -spec encode_trailers(cactus_http1:headers()) -> iodata().
 encode_trailers(Trailers) ->
-    [[Name, ~": ", Value, ~"\r\n"] || {Name, Value} <- Trailers].
+    %% Trailers go on the wire after the size-0 chunk; the same
+    %% header-injection defense the response-line headers get applies
+    %% here — a CR/LF in a trailer value lets an attacker inject a
+    %% phantom trailer header.
+    [
+        begin
+            ok = cactus_http1:check_header_safe(Name, name),
+            ok = cactus_http1:check_header_safe(Value, value),
+            [Name, ~": ", Value, ~"\r\n"]
+        end
+     || {Name, Value} <- Trailers
+    ].
 
 %% Emit status + chunked headers, then receive Erlang messages and
 %% dispatch each through `Handler:handle_info/3`. Each call gets a

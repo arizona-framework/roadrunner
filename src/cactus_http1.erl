@@ -15,6 +15,7 @@ response (`400`, `414`, `431`, etc.).
     parse_headers/1,
     parse_request/1,
     parse_chunk/1,
+    check_header_safe/2,
     response/3
 ]).
 
@@ -619,6 +620,16 @@ encode_headers([{Name, Value} | Rest]) ->
     ok = check_header_safe(Value, value),
     [Name, ~": ", Value, ~"\r\n" | encode_headers(Rest)].
 
+-doc """
+Validate that a header name or value contains no CR, LF, or NUL —
+the bytes that would let an attacker who controls the value inject
+new headers (or terminate the header block early). Crashes with
+`{header_injection, Kind, Bin}` when an unsafe byte is present.
+
+Public so other modules emitting headers (e.g. `cactus_conn` for
+chunked-response trailers) can run the same check before writing
+to the wire.
+""".
 -spec check_header_safe(binary(), name | value) -> ok.
 check_header_safe(Bin, Kind) when is_binary(Bin) ->
     case binary:match(Bin, [<<$\r>>, <<$\n>>, <<0>>]) of
