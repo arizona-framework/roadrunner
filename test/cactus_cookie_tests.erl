@@ -103,6 +103,22 @@ parse_high_bytes_test() ->
 parse_only_semicolons_test() ->
     ?assertEqual([], cactus_cookie:parse(~";;;;")).
 
+parse_duplicate_names_preserve_order_test() ->
+    %% RFC 6265 doesn't say what to do with duplicate cookie names — we
+    %% keep all entries in declaration order so callers get a complete
+    %% audit of what the client sent. Pinned so a "dedupe last wins"
+    %% change is deliberate.
+    ?assertEqual(
+        [{~"a", ~"1"}, {~"b", ~"2"}, {~"a", ~"3"}],
+        cactus_cookie:parse(~"a=1; b=2; a=3")
+    ).
+
+parse_internal_whitespace_in_name_preserved_test() ->
+    %% RFC 6265 §4.1.1 forbids whitespace inside cookie names. We're
+    %% lenient: the byte sequence is returned verbatim. Locked in so
+    %% strict-mode parsing arrives via opt, not silent break.
+    ?assertEqual([{~"foo bar", ~"v"}], cactus_cookie:parse(~"foo bar=v")).
+
 %% =============================================================================
 %% serialize/3
 %% =============================================================================

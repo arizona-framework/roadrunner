@@ -273,6 +273,41 @@ static_test_() ->
                 {match, _} = re:run(Reply, ~"content-length: 14", [caseless]),
                 [_Head, Body] = binary:split(Reply, ~"\r\n\r\n"),
                 ?assertEqual(<<>>, Body)
+            end},
+            {"percent-encoded .. is not normalized — stays a literal segment", fun() ->
+                %% Defense-in-depth pin: the wildcard captures `%2E%2E`
+                %% byte-for-byte, the `..` validator therefore lets it
+                %% through, and `file:read_file_info/1` fails to locate
+                %% a real entry by that name → 404. If we ever start
+                %% percent-decoding wildcard segments, this test forces
+                %% us to re-derive the traversal defense.
+                Reply = http_get(Port, ~"/static/%2E%2E/hello.html"),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
+            end},
+            {"directory path resolves to a non-regular file → 404", fun() ->
+                Reply = http_get(Port, ~"/static/subdir"),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
+            end},
+            {"trailing slash on a file still serves the file", fun() ->
+                %% `filename:join([Dir, "hello.html", <<>>])` collapses
+                %% the empty trailing segment back to `Dir/hello.html`,
+                %% so `/static/hello.html/` and `/static/hello.html`
+                %% are equivalent. Locked in so a future "strip empty
+                %% segments differently" change is deliberate.
+                Reply = http_get(Port, ~"/static/hello.html/"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply)
+            end},
+            {"symlink inside the docroot is followed (industry default)", fun() ->
+                %% Same default as nginx (`disable_symlinks off`) and
+                %% Apache (`FollowSymLinks` on). Operators relying on
+                %% this for chrooted content layouts shouldn't see
+                %% behavior change without a deliberate flag flip.
+                %% Caveat: a symlink pointing OUTSIDE Dir IS followed
+                %% — the only protection is filesystem permissions on
+                %% the docroot.
+                Reply = http_get(Port, ~"/static/notes_link.txt"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"hello via link")
             end}
         ]
     end}.
@@ -288,6 +323,13 @@ setup() ->
     ok = file:write_file(filename:join(Dir, "main.css"), <<"body { color: red; }">>),
     ok = file:write_file(filename:join(Dir, "blob.bin"), <<1, 2, 3, 4>>),
     ok = file:write_file(filename:join(Dir, "empty.txt"), <<>>),
+    ok = file:write_file(filename:join(Dir, "notes.txt"), ~"hello via link"),
+    %% In-docroot symlink — pins the "we follow symlinks" default.
+    _ = file:make_symlink("notes.txt", filename:join(Dir, "notes_link.txt")),
+    %% Empty subdirectory — `filename:join` can resolve a path to it,
+    %% but `file:read_file_info` reports `type = directory` so the
+    %% handler returns 404 instead of trying to send it.
+    ok = filelib:ensure_dir(filename:join([Dir, "subdir", "x"])),
     {ok, _} = cactus_listener:start_link(static_test, #{
         port => 0,
         routes => [{~"/static/*path", cactus_static, #{dir => Dir}}]
