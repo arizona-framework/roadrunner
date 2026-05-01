@@ -279,6 +279,50 @@ hibernate_after_fires_during_keep_alive_idle_test() ->
     ok = gen_statem:stop(Pid),
     stop_sink(Sink).
 
+end_to_end_hibernate_across_keep_alive_iterations_test() ->
+    %% Full keep-alive lifecycle with hibernation: serve req1 → loop
+    %% back to reading_request → hibernate during idle → wake on
+    %% req2 → serve → hibernate again. Verifies that hibernation
+    %% works across the finishing → reading_request transition (not
+    %% just on the first read), and that woken-up conns process
+    %% subsequent requests correctly.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    %% Sink scripts only req1; we deliver req2 manually after the
+    %% hibernate window so we can observe the conn idle in
+    %% reading_request.
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
+        {recv, ~"GET /one HTTP/1.1\r\nHost: x\r\n\r\n"}
+    ]),
+    Opts = (fake_proto_opts(e2e_hibernate))#{
+        request_timeout := 5000,
+        keep_alive_timeout := 5000,
+        dispatch := {handler, cactus_manual_keepalive_handler},
+        hibernate_after => 30
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Pid ! shoot,
+    %% Phase 1: req1 served.
+    Sent1 = iolist_to_binary(collect_sends(Tag, 300)),
+    ?assertEqual(1, count_200(Sent1)),
+    %% Phase 2: conn looped back to reading_request, idle.
+    %% After hibernate_after=30ms, must be hibernated.
+    ?assert(is_hibernating(Pid, 300)),
+    %% Phase 3: deliver req2 directly. The conn wakes, parses,
+    %% dispatches, and serves a second response.
+    Pid ! {cactus_fake_data, Sink, ~"GET /two HTTP/1.1\r\nHost: x\r\n\r\nGET /three"},
+    %% (^ That last fragment is partial bytes for a third request —
+    %%   they should be ignored when the keep-alive loop-back resets
+    %%   `buffered = <<>>`. We're not testing that here, just making
+    %%   sure the partial doesn't break req2 parsing.)
+    Sent2 = iolist_to_binary(collect_sends(Tag, 300)),
+    ?assertEqual(1, count_200(Sent2)),
+    %% Phase 4: conn looped back again, hibernates again.
+    ?assert(is_hibernating(Pid, 300)),
+    ok = gen_statem:stop(Pid),
+    stop_sink(Sink).
+
 is_hibernating(Pid, TimeoutMs) ->
     is_hibernating_loop(Pid, erlang:monotonic_time(millisecond) + TimeoutMs).
 
