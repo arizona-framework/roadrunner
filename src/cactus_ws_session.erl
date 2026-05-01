@@ -15,8 +15,31 @@ parent's `[cactus, listener, conn_close]` telemetry fires after.
 States:
 - `awaiting_socket` — gates the frame loop until controlling-process
   has transferred and the launcher has sent `socket_ready`.
-- `frame_loop` — parse/dispatch one frame, emit telemetry, recv more
-  bytes if the buffer doesn't yet hold a full frame.
+- `frame_loop` — parse/dispatch frames as they arrive; the socket
+  is in active-once mode so bytes arrive as `info` events and the
+  gen_statem returns to its main loop between frames.
+
+## Active-mode reads
+
+`frame_loop` uses active-once reads (`cactus_transport:setopts(_,
+[{active, once}])`): after each event the state callback returns,
+gen_statem is idle in its main loop, and `hibernate` actions
+actually take effect. Without active mode we'd be blocked inside
+`cactus_transport:recv/3` and hibernation would be a no-op.
+
+## Handler hibernation opt-in
+
+The `cactus_ws_handler` callback supports an optional 4-tuple
+return shape: `{reply, OutFrames, NewState, Opts}` and
+`{ok, NewState, Opts}`, where `Opts` is a list that may contain
+`hibernate`. When present, the gen_statem hibernates after this
+event is fully processed — process heap drops to ~1KB until the
+next inbound frame wakes it up. For an idle WebSocket session
+this is the difference between holding ~5–8KB of process memory
+indefinitely vs. ~1KB.
+
+3-tuple returns (`{reply, OutFrames, NewState}`, `{ok, NewState}`,
+`{close, NewState}`) stay valid — the 4-tuple is purely additive.
 
 Telemetry: `[cactus, ws, upgrade]` fires from `run/4` once the
 launcher has decided to enter the session; `[cactus, ws, frame_in]`
@@ -134,36 +157,30 @@ init({Socket, Mod, State, Ctx}) ->
 awaiting_socket(enter, _Old, _Data) ->
     keep_state_and_data;
 awaiting_socket(info, socket_ready, Data) ->
-    {next_state, frame_loop, Data, [{next_event, internal, recv}]}.
+    {next_state, frame_loop, Data}.
 
-%% Each `recv` event blocks on `cactus_transport:recv/3` with `infinity`
-%% timeout when the buffer doesn't yet hold a full frame — the session
-%% sleeps until the peer sends bytes, the peer closes, or the framework
-%% detects a transport error. The session exits via `{stop, normal, _}`
-%% on close or parse error; idle sessions live indefinitely.
 -spec frame_loop(gen_statem:event_type(), term(), #data{}) ->
     gen_statem:event_handler_result(atom()).
-frame_loop(enter, _Old, _Data) ->
-    keep_state_and_data;
-frame_loop(internal, recv, #data{socket = Socket, buffer = Buf} = Data) ->
-    case cactus_ws:parse_frame(Buf) of
-        {ok, Frame, NewBuffer} ->
-            ok = cactus_telemetry:ws_frame_in(
-                (Data#data.ctx)#{opcode => maps:get(opcode, Frame)},
-                payload_size(Frame)
-            ),
-            handle_frame(Frame, Data#data{buffer = NewBuffer});
-        {more, _} ->
-            case cactus_transport:recv(Socket, 0, infinity) of
-                {ok, Bytes} ->
-                    {keep_state, Data#data{buffer = <<Buf/binary, Bytes/binary>>}, [
-                        {next_event, internal, recv}
-                    ]};
-                {error, _} ->
-                    {stop, normal, Data}
-            end;
-        {error, _} ->
-            {stop, normal, Data}
+frame_loop(enter, _Old, #data{socket = Socket} = Data) ->
+    %% Arm the socket for one chunk of inbound bytes. Each event below
+    %% re-arms after parsing whatever's in the buffer, so the
+    %% gen_statem is back in its main loop receive between events —
+    %% which is the only place `hibernate` actions can take effect.
+    ok = cactus_transport:setopts(Socket, [{active, once}]),
+    {keep_state, Data};
+frame_loop(info, Msg, #data{socket = Socket} = Data) ->
+    {DataTag, ClosedTag, ErrorTag} = cactus_transport:messages(Socket),
+    case Msg of
+        {DataTag, _Sock, Bytes} ->
+            process_buffer(append_buffer(Data, Bytes), false);
+        {ClosedTag, _Sock} ->
+            {stop, normal, Data};
+        {ErrorTag, _Sock, _Reason} ->
+            {stop, normal, Data};
+        _Other ->
+            %% Unexpected info — drop, re-arm, stay in frame_loop.
+            ok = cactus_transport:setopts(Socket, [{active, once}]),
+            {keep_state, Data}
     end.
 
 -spec terminate(term(), atom(), #data{}) -> ok.
@@ -172,24 +189,65 @@ terminate(_Reason, _State, _Data) ->
 
 %% --- frame dispatch ---
 
--spec handle_frame(cactus_ws:frame(), #data{}) ->
+%% Drain every complete frame out of the buffer in a single callback
+%% pass, accumulating any handler-requested `hibernate` opt. When the
+%% buffer doesn't hold a full frame, re-arm the socket and yield;
+%% gen_statem will then process its (currently empty) event queue and
+%% honor the hibernate flag if any handler set it.
+-spec process_buffer(#data{}, boolean()) ->
     gen_statem:event_handler_result(atom()).
-handle_frame(#{opcode := close}, Data) ->
+process_buffer(#data{socket = Socket, buffer = Buf} = Data, HibernateAcc) ->
+    case cactus_ws:parse_frame(Buf) of
+        {ok, Frame, NewBuffer} ->
+            ok = cactus_telemetry:ws_frame_in(
+                (Data#data.ctx)#{opcode => maps:get(opcode, Frame)},
+                payload_size(Frame)
+            ),
+            handle_frame(Frame, Data#data{buffer = NewBuffer}, HibernateAcc);
+        {more, _} ->
+            ok = cactus_transport:setopts(Socket, [{active, once}]),
+            {keep_state, Data, hibernate_actions(HibernateAcc)};
+        {error, _} ->
+            {stop, normal, Data}
+    end.
+
+-spec append_buffer(#data{}, binary()) -> #data{}.
+append_buffer(#data{buffer = Buf} = Data, Bytes) ->
+    Data#data{buffer = <<Buf/binary, Bytes/binary>>}.
+
+-spec hibernate_actions(boolean()) -> [hibernate].
+hibernate_actions(true) -> [hibernate];
+hibernate_actions(false) -> [].
+
+-spec handle_frame(cactus_ws:frame(), #data{}, boolean()) ->
+    gen_statem:event_handler_result(atom()).
+handle_frame(#{opcode := close}, Data, _Hibernate) ->
     ok = send_ws_frame(Data, close, ~""),
     {stop, normal, Data};
-handle_frame(#{opcode := ping, payload := P}, Data) ->
+handle_frame(#{opcode := ping, payload := P}, Data, Hibernate) ->
     ok = send_ws_frame(Data, pong, P),
-    {keep_state, Data, [{next_event, internal, recv}]};
-handle_frame(#{opcode := pong}, Data) ->
-    %% Server is not pinging clients yet — pong from client is just dropped.
-    {keep_state, Data, [{next_event, internal, recv}]};
-handle_frame(Frame, #data{mod = Mod, mod_state = State} = Data) ->
+    process_buffer(Data, Hibernate);
+handle_frame(#{opcode := pong}, Data, Hibernate) ->
+    %% Server is not pinging clients yet — pong from client is dropped.
+    process_buffer(Data, Hibernate);
+handle_frame(Frame, #data{mod = Mod, mod_state = State} = Data, Hibernate) ->
     case Mod:handle_frame(Frame, State) of
         {reply, OutFrames, NewState} ->
             _ = send_ws_frames(Data, OutFrames),
-            {keep_state, Data#data{mod_state = NewState}, [{next_event, internal, recv}]};
+            process_buffer(Data#data{mod_state = NewState}, Hibernate);
+        {reply, OutFrames, NewState, Opts} when is_list(Opts) ->
+            _ = send_ws_frames(Data, OutFrames),
+            process_buffer(
+                Data#data{mod_state = NewState},
+                Hibernate orelse lists:member(hibernate, Opts)
+            );
         {ok, NewState} ->
-            {keep_state, Data#data{mod_state = NewState}, [{next_event, internal, recv}]};
+            process_buffer(Data#data{mod_state = NewState}, Hibernate);
+        {ok, NewState, Opts} when is_list(Opts) ->
+            process_buffer(
+                Data#data{mod_state = NewState},
+                Hibernate orelse lists:member(hibernate, Opts)
+            );
         {close, _NewState} ->
             ok = send_ws_frame(Data, close, ~""),
             {stop, normal, Data}
