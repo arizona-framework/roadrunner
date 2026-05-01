@@ -215,6 +215,57 @@ static_test_() ->
                     [{~"If-Modified-Since", ~"Sun, 06 Xyz 1994 08:49:37 GMT"}]
                 ),
                 ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
+            end},
+            {"empty file with no Range serves 200 with empty body", fun() ->
+                Reply = http_get(Port, ~"/static/empty.txt"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-length: 0", [caseless]),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(~"", Body)
+            end},
+            {"suffix range on empty file is unsatisfiable", fun() ->
+                %% Suffix `bytes=-5` against a 0-byte file: the suffix
+                %% logic guard is `S > 0, Size > 0`; Size=0 fails → 416.
+                Reply = http_get_with(
+                    Port, ~"/static/empty.txt", [{~"Range", ~"bytes=-5"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 416 ", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-range: bytes \\*/0", [caseless])
+            end},
+            {"open-ended range on empty file is unsatisfiable", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/empty.txt", [{~"Range", ~"bytes=0-"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 416 ", _/binary>>, Reply)
+            end},
+            {"range past end clamps to last byte", fun() ->
+                %% hello.html is 14 bytes; bytes=10-100 → end clamps to 13.
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=10-100"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-range: bytes 10-13/14", [caseless]),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(~"/h1>", Body)
+            end},
+            {"range covering exactly the whole file returns 206", fun() ->
+                %% bytes=0-13 against 14-byte file = entire content as 206.
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=0-13"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-range: bytes 0-13/14", [caseless]),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(~"<h1>Hello</h1>", Body)
+            end},
+            {"suffix length larger than file size returns whole file", fun() ->
+                %% bytes=-100 on 14-byte file → suffix-spec 100, S > Size,
+                %% Start = max(0, Size - S) = max(0, -86) = 0; range 0-13.
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=-100"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-range: bytes 0-13/14", [caseless])
             end}
         ]
     end}.
@@ -229,6 +280,7 @@ setup() ->
     ok = file:write_file(filename:join(Dir, "hello.html"), <<"<h1>Hello</h1>">>),
     ok = file:write_file(filename:join(Dir, "main.css"), <<"body { color: red; }">>),
     ok = file:write_file(filename:join(Dir, "blob.bin"), <<1, 2, 3, 4>>),
+    ok = file:write_file(filename:join(Dir, "empty.txt"), <<>>),
     {ok, _} = cactus_listener:start_link(static_test, #{
         port => 0,
         routes => [{~"/static/*path", cactus_static, #{dir => Dir}}]

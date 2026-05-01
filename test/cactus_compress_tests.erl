@@ -80,6 +80,27 @@ updates_content_length_on_compress_test() ->
     %% And it differs from the original (i.e. compression actually shrunk it).
     ?assert(byte_size(NewLength) =< byte_size(OriginalLength)).
 
+body_just_below_threshold_not_compressed_test() ->
+    %% Threshold is 860 bytes. Anything strictly less skips
+    %% compression but still gets `Vary: Accept-Encoding` so caches
+    %% key correctly.
+    Req = req([{~"accept-encoding", ~"gzip"}]),
+    Body = binary:copy(~"a", 859),
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    {{200, Headers, OutBody}, _Req2} = cactus_compress:call(Req, Next),
+    ?assertEqual(undefined, header(~"content-encoding", Headers)),
+    ?assertEqual(~"Accept-Encoding", header(~"vary", Headers)),
+    ?assertEqual(Body, iolist_to_binary(OutBody)).
+
+body_at_threshold_compressed_test() ->
+    %% Exactly 860 bytes — at the threshold, compression engages.
+    Req = req([{~"accept-encoding", ~"gzip"}]),
+    Body = binary:copy(~"a", 860),
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    {{200, Headers, OutBody}, _Req2} = cactus_compress:call(Req, Next),
+    ?assertEqual(~"gzip", header(~"content-encoding", Headers)),
+    ?assertEqual(Body, zlib:gunzip(iolist_to_binary(OutBody))).
+
 does_not_duplicate_vary_when_handler_already_set_it_test() ->
     %% Body below threshold, but client accepts gzip — middleware would
     %% normally add Vary. Handler already set Vary, so we must not add a
