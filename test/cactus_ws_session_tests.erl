@@ -195,6 +195,33 @@ frame_loop_setopts_error_stops_cleanly_test() ->
     after 1000 -> error(no_normal_exit)
     end.
 
+frame_loop_processes_multiple_frames_in_one_chunk_test() ->
+    %% Real `inet:setopts({active, once})` can deliver several
+    %% complete frames in a single `{tcp, _, Bytes}` event when the
+    %% kernel buffered them before we re-armed. `process_buffer/2`
+    %% must drain ALL complete frames in one callback pass and
+    %% reply to each, not just the first one. Verifies the inline
+    %% recursive shape of process_buffer is correct under
+    %% multi-frame buffering.
+    Self = self(),
+    Tag = make_ref(),
+    %% One script item delivering two complete text frames
+    %% concatenated. The echo handler replies to each.
+    TwoFrames = <<(frame(text, ~"first"))/binary, (frame(text, ~"second"))/binary>>,
+    Sink = spawn_active_sink(Self, Tag, [{recv, TwoFrames}]),
+    {ok, Pid} = gen_statem:start(
+        cactus_ws_session,
+        {{fake, Sink}, cactus_ws_echo_handler, undefined, ws_ctx()},
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    %% Both frames echoed back — assert both payloads appear.
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"first")),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"second")),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
 frame_loop_drops_unexpected_info_event_test() ->
     %% A stray info message that doesn't match any of the transport
     %% tags gets dropped and the session re-arms the socket; verified
