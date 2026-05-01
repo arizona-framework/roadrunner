@@ -25,6 +25,7 @@ representation can evolve without breaking them.
     read_body_chunked/1,
     bindings/1,
     peer/1,
+    forwarded_for/1,
     scheme/1,
     route_opts/1
 ]).
@@ -270,6 +271,77 @@ when the OS call failed at accept time.
     {inet:ip_address(), inet:port_number()} | undefined.
 peer(#{peer := P}) -> P;
 peer(_) -> undefined.
+
+-doc """
+Return the leftmost client identifier from the `Forwarded` header
+(RFC 7239) or, if absent, from `X-Forwarded-For`. Returns `undefined`
+when neither header is set or the `Forwarded` header has no `for=`
+parameter.
+
+The returned binary is whatever the proxy chose to put there — for
+RFC 7239 that's typically an IP literal (`192.0.2.60`) or a quoted
+IPv6+port (`[2001:db8::1]:4711`); for `X-Forwarded-For` it's
+conventionally just the IP. The caller decides how to parse it.
+
+**No trust list is enforced.** Anyone who can speak to the listener
+directly can spoof these headers — only call this when the deploy
+sits behind a trusted reverse proxy that strips/overwrites them.
+""".
+-spec forwarded_for(cactus_http1:request()) -> binary() | undefined.
+forwarded_for(Req) ->
+    case header(~"forwarded", Req) of
+        undefined ->
+            x_forwarded_for(Req);
+        Value ->
+            %% First forwarded-element wins; multiple proxies append
+            %% comma-separated entries with the original client leftmost.
+            [First | _] = binary:split(Value, ~","),
+            empty_to_undefined(
+                find_for_param(binary:split(string:trim(First), ~";", [global]))
+            )
+    end.
+
+%% Normalize empty values to `undefined` so callers can pattern-match
+%% one shape regardless of which header path produced the result.
+-spec empty_to_undefined(binary() | undefined) -> binary() | undefined.
+empty_to_undefined(<<>>) -> undefined;
+empty_to_undefined(Other) -> Other.
+
+-spec x_forwarded_for(cactus_http1:request()) -> binary() | undefined.
+x_forwarded_for(Req) ->
+    case header(~"x-forwarded-for", Req) of
+        undefined ->
+            undefined;
+        Value ->
+            [First | _] = binary:split(Value, ~","),
+            case string:trim(First) of
+                <<>> -> undefined;
+                Trimmed -> Trimmed
+            end
+    end.
+
+-spec find_for_param([binary()]) -> binary() | undefined.
+find_for_param([]) ->
+    undefined;
+find_for_param([Pair | Rest]) ->
+    case binary:split(Pair, ~"=") of
+        [Key, Val] ->
+            case string:lowercase(string:trim(Key)) of
+                ~"for" -> unquote_param(string:trim(Val));
+                _ -> find_for_param(Rest)
+            end;
+        _ ->
+            find_for_param(Rest)
+    end.
+
+-spec unquote_param(binary()) -> binary().
+unquote_param(<<$", Rest/binary>>) ->
+    case binary:match(Rest, ~"\"") of
+        {End, _} -> binary:part(Rest, 0, End);
+        nomatch -> Rest
+    end;
+unquote_param(Bin) ->
+    Bin.
 
 -doc """
 Return the connection scheme — `http` for plain TCP, `https` for TLS.

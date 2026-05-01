@@ -192,6 +192,92 @@ read_body_chunked_manual_state_yields_one_chunk_test() ->
     {more, Bytes, _Req2} = cactus_req:read_body_chunked(Req),
     ?assertEqual(~"foo", Bytes).
 
+%% --- forwarded_for/1 ---
+
+forwarded_for_absent_returns_undefined_test() ->
+    ?assertEqual(undefined, cactus_req:forwarded_for(sample_req())).
+
+forwarded_for_x_forwarded_for_single_test() ->
+    Req = (sample_req())#{headers => [{~"x-forwarded-for", ~"1.2.3.4"}]},
+    ?assertEqual(~"1.2.3.4", cactus_req:forwarded_for(Req)).
+
+forwarded_for_x_forwarded_for_chain_test() ->
+    %% Leftmost is the original client; the rest are intermediate proxies.
+    Req = (sample_req())#{
+        headers => [{~"x-forwarded-for", ~"1.2.3.4, 5.6.7.8, 9.10.11.12"}]
+    },
+    ?assertEqual(~"1.2.3.4", cactus_req:forwarded_for(Req)).
+
+forwarded_for_x_forwarded_for_trims_whitespace_test() ->
+    Req = (sample_req())#{headers => [{~"x-forwarded-for", ~"   1.2.3.4   "}]},
+    ?assertEqual(~"1.2.3.4", cactus_req:forwarded_for(Req)).
+
+forwarded_for_rfc7239_simple_test() ->
+    Req = (sample_req())#{
+        headers => [{~"forwarded", ~"for=192.0.2.60;proto=http;by=203.0.113.43"}]
+    },
+    ?assertEqual(~"192.0.2.60", cactus_req:forwarded_for(Req)).
+
+forwarded_for_rfc7239_takes_leftmost_element_test() ->
+    %% Multiple proxies hop chain — the leftmost forwarded-element
+    %% identifies the original client.
+    Req = (sample_req())#{
+        headers => [{~"forwarded", ~"for=1.2.3.4, for=5.6.7.8;proto=https"}]
+    },
+    ?assertEqual(~"1.2.3.4", cactus_req:forwarded_for(Req)).
+
+forwarded_for_rfc7239_quoted_value_test() ->
+    %% IPv6 addresses with ports must be quoted per RFC 7239 §6.
+    Req = (sample_req())#{
+        headers => [{~"forwarded", ~"for=\"[2001:db8::1]:4711\""}]
+    },
+    ?assertEqual(~"[2001:db8::1]:4711", cactus_req:forwarded_for(Req)).
+
+forwarded_for_rfc7239_case_insensitive_param_test() ->
+    Req = (sample_req())#{headers => [{~"forwarded", ~"FOR=10.0.0.1"}]},
+    ?assertEqual(~"10.0.0.1", cactus_req:forwarded_for(Req)).
+
+forwarded_for_rfc7239_wins_over_x_forwarded_for_test() ->
+    %% When both are present, the modern Forwarded header wins.
+    Req = (sample_req())#{
+        headers => [
+            {~"forwarded", ~"for=1.1.1.1"},
+            {~"x-forwarded-for", ~"2.2.2.2"}
+        ]
+    },
+    ?assertEqual(~"1.1.1.1", cactus_req:forwarded_for(Req)).
+
+forwarded_for_rfc7239_no_for_param_returns_undefined_test() ->
+    Req = (sample_req())#{headers => [{~"forwarded", ~"proto=https;by=10.0.0.1"}]},
+    ?assertEqual(undefined, cactus_req:forwarded_for(Req)).
+
+forwarded_for_rfc7239_malformed_pair_skipped_test() ->
+    %% Pair with no `=` is just skipped — don't crash.
+    Req = (sample_req())#{
+        headers => [{~"forwarded", ~"junk;for=1.2.3.4"}]
+    },
+    ?assertEqual(~"1.2.3.4", cactus_req:forwarded_for(Req)).
+
+forwarded_for_x_forwarded_for_empty_returns_undefined_test() ->
+    %% Empty X-Forwarded-For (e.g. proxy stripped it without removing
+    %% the header) returns undefined rather than empty binary.
+    Req = (sample_req())#{headers => [{~"x-forwarded-for", ~"   "}]},
+    ?assertEqual(undefined, cactus_req:forwarded_for(Req)).
+
+forwarded_for_rfc7239_unclosed_quote_test() ->
+    %% Defensive: malformed quoted value with no closing quote — return
+    %% the rest of the string rather than crashing.
+    Req = (sample_req())#{
+        headers => [{~"forwarded", ~"for=\"unclosed"}]
+    },
+    ?assertEqual(~"unclosed", cactus_req:forwarded_for(Req)).
+
+forwarded_for_rfc7239_empty_value_returns_undefined_test() ->
+    %% `for=` with an empty value — normalize to undefined to match
+    %% the X-Forwarded-For empty-value behavior.
+    Req = (sample_req())#{headers => [{~"forwarded", ~"for=;by=1.1.1.1"}]},
+    ?assertEqual(undefined, cactus_req:forwarded_for(Req)).
+
 read_body_chunked_manual_state_error_propagates_test() ->
     BS = #{
         framing => chunked,
