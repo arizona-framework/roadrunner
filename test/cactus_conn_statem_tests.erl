@@ -641,6 +641,31 @@ http10_default_close_test() ->
     ?assertEqual(1, count_200(Sent)),
     stop_sink(Sink).
 
+http10_keep_alive_token_keeps_conn_alive_test() ->
+    %% RFC 7230 §6.1: HTTP/1.0 + `Connection: keep-alive` opts into
+    %% keep-alive even though HTTP/1.0's default is close. Two requests
+    %% must both reach the handler.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
+        {recv, ~"GET / HTTP/1.0\r\nHost: x\r\nConnection: keep-alive\r\n\r\n"},
+        {recv, ~"GET / HTTP/1.0\r\nHost: x\r\nConnection: close\r\n\r\n"}
+    ]),
+    Opts = (fake_proto_opts(http10_ka))#{
+        dispatch := {handler, cactus_manual_keepalive_handler}
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertEqual(2, count_200(Sent)),
+    stop_sink(Sink).
+
 drain_mid_dispatching_stops_after_response_test() ->
     %% Drain arrives **while the handler is running** in dispatching.
     %% gen_statem can't process the info event mid-callback, so the

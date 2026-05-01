@@ -695,23 +695,44 @@ response_body_for(Req, Body) ->
 -spec keep_alive_decision(cactus_http1:request(), cactus_http1:headers()) ->
     keep_alive | close.
 keep_alive_decision(Req, RespHeaders) ->
+    ReqConn = string:lowercase(req_connection_token(Req)),
+    RespConn = string:lowercase(resp_connection_token(RespHeaders)),
+    ReqClose = has_token(ReqConn, ~"close"),
+    RespClose = has_token(RespConn, ~"close"),
     case cactus_req:version(Req) of
         {1, 0} ->
-            close;
+            %% RFC 7230 §6.1: HTTP/1.0 default is close, but
+            %% `Connection: keep-alive` from client opts in (so long
+            %% as the response doesn't force close).
+            ReqKA = has_token(ReqConn, ~"keep-alive"),
+            case ReqKA andalso not RespClose of
+                true -> keep_alive;
+                false -> close
+            end;
         {1, 1} ->
-            ReqClose = has_close_token(cactus_req:header(~"connection", Req)),
-            RespClose = has_close_token(header_value(~"connection", RespHeaders)),
             case ReqClose orelse RespClose of
                 true -> close;
                 false -> keep_alive
             end
     end.
 
--spec has_close_token(binary() | undefined) -> boolean().
-has_close_token(undefined) ->
-    false;
-has_close_token(Value) ->
-    binary:match(string:lowercase(Value), ~"close") =/= nomatch.
+-spec req_connection_token(cactus_http1:request()) -> binary().
+req_connection_token(Req) ->
+    case cactus_req:header(~"connection", Req) of
+        undefined -> ~"";
+        V -> V
+    end.
+
+-spec resp_connection_token(cactus_http1:headers()) -> binary().
+resp_connection_token(Headers) ->
+    case header_value(~"connection", Headers) of
+        undefined -> ~"";
+        V -> V
+    end.
+
+-spec has_token(binary(), binary()) -> boolean().
+has_token(Value, Token) ->
+    binary:match(Value, Token) =/= nomatch.
 
 -spec header_value(binary(), cactus_http1:headers()) -> binary() | undefined.
 header_value(Name, Headers) ->
