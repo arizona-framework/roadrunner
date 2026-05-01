@@ -92,6 +92,71 @@ listener_honors_num_acceptors_opt_test() ->
 %% info/1
 %% =============================================================================
 
+slot_reconciliation_releases_sustained_orphan_slots_test() ->
+    %% With reconciliation enabled, an orphaned slot (counter > pg
+    %% members for two consecutive ticks) is reaped — simulates
+    %% `kill`-bypasses-`terminate` recovery.
+    case whereis(pg) of
+        undefined -> {ok, _} = pg:start_link();
+        _ -> ok
+    end,
+    Name = listener_test_reap,
+    {ok, ListenerPid} = cactus_listener:start_link(Name, #{
+        port => 0,
+        max_clients => 100,
+        slot_reconciliation => #{interval_ms => 30}
+    }),
+    %% Reach into state to grab the counter ref. {state, LSocket, Port,
+    %% ProtoOpts, Phase, Reconciliation} — relies on field order.
+    State = sys:get_state(ListenerPid),
+    ProtoOpts = element(4, State),
+    Counter = maps:get(client_counter, ProtoOpts),
+    ?assertEqual(0, atomics:get(Counter, 1)),
+    %% Plant 3 orphan slots — bumped without a corresponding pg join.
+    ok = atomics:add(Counter, 1, 3),
+    ?assertEqual(3, atomics:get(Counter, 1)),
+    %% First tick at 30ms records prev_diff=3; second tick at 60ms
+    %% reaps. Wait long enough to be safe across CI jitter.
+    timer:sleep(200),
+    ?assertEqual(0, atomics:get(Counter, 1)),
+    ok = cactus_listener:stop(Name).
+
+slot_reconciliation_disabled_drops_reconcile_slots_message_test() ->
+    %% A `reconcile_slots` arriving at a listener with reconciliation
+    %% disabled (race after a hypothetical config change) is just
+    %% dropped — gen_server stays alive.
+    Name = listener_test_disabled_reap,
+    {ok, ListenerPid} = cactus_listener:start_link(Name, #{port => 0}),
+    ListenerPid ! reconcile_slots,
+    %% Process must still answer port/1.
+    ?assert(cactus_listener:port(Name) > 0),
+    ok = cactus_listener:stop(Name).
+
+listener_drops_unknown_info_message_test() ->
+    %% Generic info catch-all: arbitrary stray messages don't crash
+    %% the listener.
+    Name = listener_test_stray_info,
+    {ok, ListenerPid} = cactus_listener:start_link(Name, #{port => 0}),
+    ListenerPid ! {stray, make_ref()},
+    ?assert(cactus_listener:port(Name) > 0),
+    ok = cactus_listener:stop(Name).
+
+slot_reconciliation_disabled_by_default_test() ->
+    case whereis(pg) of
+        undefined -> {ok, _} = pg:start_link();
+        _ -> ok
+    end,
+    Name = listener_test_no_reap,
+    {ok, ListenerPid} = cactus_listener:start_link(Name, #{port => 0}),
+    State = sys:get_state(ListenerPid),
+    ProtoOpts = element(4, State),
+    Counter = maps:get(client_counter, ProtoOpts),
+    %% Plant orphan slots; without reconciliation they stay forever.
+    ok = atomics:add(Counter, 1, 3),
+    timer:sleep(100),
+    ?assertEqual(3, atomics:get(Counter, 1)),
+    ok = cactus_listener:stop(Name).
+
 listener_info_initial_zero_test() ->
     Name = listener_test_info_init,
     {ok, _} = cactus_listener:start_link(Name, #{port => 0, max_clients => 42}),

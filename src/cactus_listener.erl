@@ -19,7 +19,7 @@ connection crash doesn't take the pool down.
 -behaviour(gen_server).
 
 -export([start_link/2, stop/1, drain/2, port/1, info/1, status/1, reload_routes/2]).
--export([init/1, handle_call/3, handle_cast/2, terminate/2]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([opts/0]).
 
@@ -44,6 +44,7 @@ connection crash doesn't take the pool down.
     max_clients => pos_integer(),
     minimum_bytes_per_second => non_neg_integer(),
     body_buffering => auto | manual,
+    slot_reconciliation => disabled | #{interval_ms := pos_integer()},
     tls => [ssl:tls_server_option()]
 }.
 
@@ -51,7 +52,20 @@ connection crash doesn't take the pool down.
     listen_socket :: cactus_transport:socket() | closed,
     port :: inet:port_number(),
     proto_opts :: cactus_conn:proto_opts(),
-    phase = accepting :: accepting | draining | stopped
+    phase = accepting :: accepting | draining | stopped,
+    %% Slot reconciliation (off by default). When enabled, a periodic
+    %% timer compares `client_counter` against pg group membership and
+    %% releases slots that have been orphaned by `kill`-style exits
+    %% (which bypass `terminate/3`). `prev_diff` tracks the previous
+    %% tick's diff to filter out spawn-time races (a freshly-started
+    %% conn has bumped the counter but not yet pg:join'd) — only
+    %% sustained diffs are reaped.
+    reconciliation = disabled ::
+        disabled
+        | #{
+            interval_ms := pos_integer(),
+            prev_diff := non_neg_integer()
+        }
 }).
 
 -doc """
@@ -160,10 +174,26 @@ init(#{port := Port} = Opts) ->
             {ok, BoundPort} = cactus_transport:port(LSocket),
             NumAcceptors = maps:get(num_acceptors, Opts, ?DEFAULT_NUM_ACCEPTORS),
             ok = spawn_acceptors(LSocket, ProtoOpts, NumAcceptors),
-            {ok, #state{listen_socket = LSocket, port = BoundPort, proto_opts = ProtoOpts}};
+            Reconciliation = setup_reconciliation(Opts),
+            {ok, #state{
+                listen_socket = LSocket,
+                port = BoundPort,
+                proto_opts = ProtoOpts,
+                reconciliation = Reconciliation
+            }};
         {error, Reason} ->
             {stop, {listen_failed, Reason}}
     end.
+
+-spec setup_reconciliation(opts()) ->
+    disabled | #{interval_ms := pos_integer(), prev_diff := non_neg_integer()}.
+setup_reconciliation(#{slot_reconciliation := #{interval_ms := IntervalMs}}) when
+    is_integer(IntervalMs), IntervalMs > 0
+->
+    erlang:send_after(IntervalMs, self(), reconcile_slots),
+    #{interval_ms => IntervalMs, prev_diff => 0};
+setup_reconciliation(_Opts) ->
+    disabled.
 
 %% Compile + publish to `persistent_term` once, at listener start. The
 %% conn reads via `persistent_term:get/1` on every request, so the
@@ -341,6 +371,48 @@ drain_group(#{listener_name := Name}) ->
 
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
 handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+-spec handle_info(term(), #state{}) -> {noreply, #state{}}.
+handle_info(reconcile_slots, #state{reconciliation = disabled} = State) ->
+    %% Race: a `slot_reconciliation` opt change between scheduling and
+    %% receipt would surface as the timer firing in disabled state.
+    %% Just drop it; the new config is the source of truth.
+    {noreply, State};
+handle_info(
+    reconcile_slots,
+    #state{
+        proto_opts = #{client_counter := Counter, listener_name := Name},
+        reconciliation = #{interval_ms := Interval, prev_diff := PrevDiff}
+    } = State
+) ->
+    %% pg is supervised by cactus_sup so it's always up when the
+    %% reconciler runs (which only fires when explicitly opted into).
+    PgCount = length(pg:get_members({cactus_drain, Name})),
+    Counter0 = atomics:get(Counter, 1),
+    NewDiff = max(0, Counter0 - PgCount),
+    %% Only release slots that have been orphaned for two consecutive
+    %% ticks — filters out the spawn-time race where a fresh conn has
+    %% incremented the counter but hasn't yet pg:join'd.
+    Release = min(PrevDiff, NewDiff),
+    case Release of
+        0 ->
+            ok;
+        N when N > 0 ->
+            _ = atomics:sub(Counter, 1, N),
+            logger:notice(#{
+                msg => "cactus_listener reconciled orphan slots",
+                listener_name => Name,
+                released => N,
+                counter_was => Counter0,
+                pg_count => PgCount
+            })
+    end,
+    erlang:send_after(Interval, self(), reconcile_slots),
+    {noreply, State#state{
+        reconciliation = #{interval_ms => Interval, prev_diff => NewDiff - Release}
+    }};
+handle_info(_Msg, State) ->
     {noreply, State}.
 
 -spec terminate(term(), #state{}) -> ok.
