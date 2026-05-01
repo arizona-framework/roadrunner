@@ -239,6 +239,74 @@ encode_accepts_iodata_payload_test() ->
     Encoded = iolist_to_binary(cactus_ws:encode_frame(text, [~"hel", $l, ~"o"], true)),
     ?assertEqual(<<16#81, 16#05, "hello">>, Encoded).
 
+%% =============================================================================
+%% RFC 6455 §5.5 — control-frame constraints.
+%% =============================================================================
+
+parse_frame_rejects_control_with_payload_over_125_test() ->
+    %% A close frame with a 200-byte payload uses the 16-bit extended
+    %% length encoding. Per §5.5 control frames MUST be ≤125 bytes —
+    %% reject regardless of the size encoding the client used.
+    Payload = binary:copy(~"a", 200),
+    MaskKey = <<1, 2, 3, 4>>,
+    Masked = mask(Payload, MaskKey),
+    %% byte 1: MASK=1, len7=126 → 0xFE; followed by 16-bit length 200.
+    Frame = <<16#88, 16#FE, 200:16, MaskKey/binary, Masked/binary>>,
+    ?assertEqual({error, control_frame_too_large}, cactus_ws:parse_frame(Frame)).
+
+parse_frame_rejects_control_with_64bit_length_test() ->
+    %% Same constraint applies regardless of which length encoding is
+    %% used — len7=127 (64-bit extended) on a control frame is a
+    %% protocol violation even before we see the actual length.
+    Frame = <<16#88, 16#FF, 0:64, 1, 2, 3, 4>>,
+    ?assertEqual({error, control_frame_too_large}, cactus_ws:parse_frame(Frame)).
+
+parse_frame_rejects_fragmented_control_test() ->
+    %% Per §5.5 control frames MUST NOT be fragmented. FIN=0 on a
+    %% control opcode is a protocol violation.
+    %% byte 0: FIN=0, RSV=0, opcode=close (8) → 0x08
+    %% byte 1: MASK=1, len=0 → 0x80; then 4-byte mask key.
+    Frame = <<16#08, 16#80, 1, 2, 3, 4>>,
+    ?assertEqual({error, fragmented_control}, cactus_ws:parse_frame(Frame)).
+
+parse_frame_rejects_fragmented_ping_test() ->
+    %% byte 0: FIN=0, opcode=ping (9) → 0x09
+    Frame = <<16#09, 16#80, 1, 2, 3, 4>>,
+    ?assertEqual({error, fragmented_control}, cactus_ws:parse_frame(Frame)).
+
+parse_frame_rejects_fragmented_pong_test() ->
+    %% byte 0: FIN=0, opcode=pong (10) → 0x0A
+    Frame = <<16#0A, 16#80, 1, 2, 3, 4>>,
+    ?assertEqual({error, fragmented_control}, cactus_ws:parse_frame(Frame)).
+
+%% Length 125 (max) on a control frame is still legal.
+parse_frame_accepts_control_at_max_length_test() ->
+    Payload = binary:copy(~"a", 125),
+    MaskKey = <<1, 2, 3, 4>>,
+    Masked = mask(Payload, MaskKey),
+    Frame = <<16#88, (16#80 bor 125), MaskKey/binary, Masked/binary>>,
+    ?assertMatch({ok, #{opcode := close, payload := Payload}, <<>>}, cactus_ws:parse_frame(Frame)).
+
+%% =============================================================================
+%% Handshake header value case-insensitivity (RFC 7230 §6.7).
+%% =============================================================================
+
+handshake_accepts_uppercase_websocket_test() ->
+    Headers = [
+        {~"upgrade", ~"WEBSOCKET"},
+        {~"connection", ~"Upgrade"},
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="}
+    ],
+    ?assertMatch({ok, 101, _, _}, cactus_ws:handshake_response(Headers)).
+
+handshake_accepts_mixed_case_websocket_test() ->
+    Headers = [
+        {~"upgrade", ~"WebSocket"},
+        {~"connection", ~"Upgrade"},
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="}
+    ],
+    ?assertMatch({ok, 101, _, _}, cactus_ws:handshake_response(Headers)).
+
 %% --- helpers ---
 
 mask(Payload, MaskKey) ->

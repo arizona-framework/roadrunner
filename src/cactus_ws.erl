@@ -75,8 +75,11 @@ handshake_response(Headers) when is_list(Headers) ->
         | missing_connection_upgrade
         | missing_websocket_key}.
 validate_upgrade(Headers) ->
-    case header_lookup(~"upgrade", Headers) of
-        ~"websocket" ->
+    %% RFC 7230 §6.7 — upgrade tokens are case-insensitive. Browsers
+    %% send `websocket` (lowercase) but other clients may send
+    %% `WebSocket` or `WEBSOCKET`; accept any case.
+    case is_websocket_upgrade(header_lookup(~"upgrade", Headers)) of
+        true ->
             case has_upgrade_token(header_lookup(~"connection", Headers)) of
                 true ->
                     case header_lookup(~"sec-websocket-key", Headers) of
@@ -86,9 +89,13 @@ validate_upgrade(Headers) ->
                 false ->
                     {error, missing_connection_upgrade}
             end;
-        _ ->
+        false ->
             {error, missing_websocket_upgrade}
     end.
+
+-spec is_websocket_upgrade(binary() | undefined) -> boolean().
+is_websocket_upgrade(undefined) -> false;
+is_websocket_upgrade(Value) -> string:lowercase(Value) =:= ~"websocket".
 
 -spec has_upgrade_token(binary() | undefined) -> boolean().
 has_upgrade_token(undefined) ->
@@ -118,20 +125,43 @@ frame, or `{error, _}` for protocol violations:
 - `bad_rsv` — any of RSV1/RSV2/RSV3 set (no extensions supported).
 - `bad_opcode` — opcode is reserved (3-7, 0xB-0xF).
 - `not_masked` — server-side requires the MASK bit on every client frame.
+- `fragmented_control` — control frame (close/ping/pong) with FIN=0,
+  forbidden by RFC 6455 §5.5.
+- `control_frame_too_large` — control frame with payload >125 bytes,
+  forbidden by RFC 6455 §5.5.
 """.
 -spec parse_frame(binary()) ->
     {ok, frame(), Rest :: binary()}
     | {more, undefined}
-    | {error, bad_opcode | bad_rsv | not_masked}.
+    | {error, bad_opcode | bad_rsv | not_masked | fragmented_control | control_frame_too_large}.
 parse_frame(<<_Fin:1, Rsv:3, _:4, _/bitstring>>) when Rsv =/= 0 ->
     {error, bad_rsv};
 parse_frame(<<Fin:1, 0:3, Op:4, Mask:1, Len7:7, Rest/binary>>) ->
     case decode_opcode(Op) of
-        {ok, Opcode} -> parse_length(Len7, Mask, Rest, fin_flag(Fin), Opcode);
-        error -> {error, bad_opcode}
+        {ok, Opcode} ->
+            case validate_control(Opcode, Fin, Len7) of
+                ok -> parse_length(Len7, Mask, Rest, fin_flag(Fin), Opcode);
+                {error, _} = E -> E
+            end;
+        error ->
+            {error, bad_opcode}
     end;
 parse_frame(_) ->
     {more, undefined}.
+
+%% RFC 6455 §5.5: control frames (close, ping, pong) MUST NOT be
+%% fragmented and MUST have payload ≤125 bytes (i.e. encoded with the
+%% 7-bit length, not the 16-bit or 64-bit extended forms).
+-spec validate_control(opcode(), 0 | 1, 0..127) ->
+    ok | {error, fragmented_control | control_frame_too_large}.
+validate_control(Op, _Fin, _Len7) when Op =/= close, Op =/= ping, Op =/= pong ->
+    ok;
+validate_control(_Op, 0, _Len7) ->
+    {error, fragmented_control};
+validate_control(_Op, 1, Len7) when Len7 > 125 ->
+    {error, control_frame_too_large};
+validate_control(_Op, 1, _Len7) ->
+    ok.
 
 -spec fin_flag(0 | 1) -> boolean().
 fin_flag(1) -> true;
