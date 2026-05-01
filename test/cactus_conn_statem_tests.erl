@@ -298,6 +298,53 @@ is_hibernating_loop(Pid, Deadline) ->
             end
     end.
 
+reading_request_closed_after_partial_data_stops_silently_test() ->
+    %% Client connects, sends a partial request line, then closes
+    %% (`{cactus_fake_closed, _}` info event arrives after a
+    %% `{cactus_fake_data, _, _}` event). The conn must terminate
+    %% cleanly without sending a 400 — peer has already closed and
+    %% won't see it. This locks in the post-active-mode-refactor
+    %% behavior; the pre-refactor passive code emitted a
+    %% `[cactus, request, rejected]` telemetry + 400, but the 400
+    %% never reached the peer (socket already closed).
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
+        {recv, ~"GET / HT"},
+        {recv, {error, closed}}
+    ]),
+    {ok, Pid} = cactus_conn_statem:start(
+        {fake, Sink}, fake_proto_opts(closed_partial)
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 50)),
+    ?assertEqual(<<>>, Sent),
+    stop_sink(Sink).
+
+reading_request_setopts_error_stops_cleanly_test() ->
+    %% When `setopts/2` returns `{error, _}` (kernel reports the
+    %% socket as closed between events), the conn must stop normally
+    %% rather than badmatch on a strict `ok = ...`. Drive: kill the
+    %% sink BEFORE sending shoot so reading_request's state_enter
+    %% setopts sees a dead-process socket → `{error, einval}` → stop.
+    ensure_pg(),
+    Sink = spawn_recv_sink([]),
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, fake_proto_opts(setopts_err)),
+    Ref = monitor(process, Pid),
+    exit(Sink, kill),
+    erlang:demonitor(monitor(process, Sink), [flush]),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end.
+
 drain_pending_before_shoot_stops_at_first_parse_test() ->
     ensure_pg(),
     Sink = spawn_recv_sink([]),

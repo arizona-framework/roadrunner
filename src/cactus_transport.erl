@@ -288,8 +288,17 @@ setopts({gen_tcp, S}, Opts) ->
 setopts({ssl, S}, Opts) ->
     ssl:setopts(S, Opts);
 setopts({fake, Pid}, Opts) ->
-    Pid ! {cactus_fake_setopts, self(), Opts},
-    ok.
+    %% Simulate "kernel reports socket closed" via a dead sink so
+    %% tests can drive the `{error, _}` branch of active-mode arming
+    %% without a real TCP RST. Real sockets return `{error, einval}`
+    %% in this scenario; we mirror that.
+    case is_process_alive(Pid) of
+        true ->
+            Pid ! {cactus_fake_setopts, self(), Opts},
+            ok;
+        false ->
+            {error, einval}
+    end.
 
 -doc """
 Return the `{Data, Closed, Error}` atom triple identifying the

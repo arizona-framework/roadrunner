@@ -166,8 +166,7 @@ frame_loop(enter, _Old, #data{socket = Socket} = Data) ->
     %% re-arms after parsing whatever's in the buffer, so the
     %% gen_statem is back in its main loop receive between events —
     %% which is the only place `hibernate` actions can take effect.
-    ok = cactus_transport:setopts(Socket, [{active, once}]),
-    {keep_state, Data};
+    arm_or_stop(Socket, Data, []);
 frame_loop(info, Msg, #data{socket = Socket} = Data) ->
     {DataTag, ClosedTag, ErrorTag} = cactus_transport:messages(Socket),
     case Msg of
@@ -179,8 +178,7 @@ frame_loop(info, Msg, #data{socket = Socket} = Data) ->
             {stop, normal, Data};
         _Other ->
             %% Unexpected info — drop, re-arm, stay in frame_loop.
-            ok = cactus_transport:setopts(Socket, [{active, once}]),
-            {keep_state, Data}
+            arm_or_stop(Socket, Data, [])
     end.
 
 -spec terminate(term(), atom(), #data{}) -> ok.
@@ -205,8 +203,7 @@ process_buffer(#data{socket = Socket, buffer = Buf} = Data, HibernateAcc) ->
             ),
             handle_frame(Frame, Data#data{buffer = NewBuffer}, HibernateAcc);
         {more, _} ->
-            ok = cactus_transport:setopts(Socket, [{active, once}]),
-            {keep_state, Data, hibernate_actions(HibernateAcc)};
+            arm_or_stop(Socket, Data, hibernate_actions(HibernateAcc));
         {error, _} ->
             {stop, normal, Data}
     end.
@@ -218,6 +215,21 @@ append_buffer(#data{buffer = Buf} = Data, Bytes) ->
 -spec hibernate_actions(boolean()) -> [hibernate].
 hibernate_actions(true) -> [hibernate];
 hibernate_actions(false) -> [].
+
+%% Re-arm the active-mode socket and yield with `Actions`. Stops the
+%% session cleanly if the socket is dead — matching `setopts/2`
+%% strictly with `ok = ...` would crash on a peer-closed socket
+%% before terminate/3 runs, polluting ops dashboards with badmatch
+%% noise for what's a normal end-of-session event.
+-spec arm_or_stop(
+    cactus_transport:socket(), #data{}, [gen_statem:enter_action()]
+) ->
+    gen_statem:event_handler_result(atom()).
+arm_or_stop(Socket, Data, Actions) ->
+    case cactus_transport:setopts(Socket, [{active, once}]) of
+        ok -> {keep_state, Data, Actions};
+        {error, _} -> {stop, normal, Data}
+    end.
 
 -spec handle_frame(cactus_ws:frame(), #data{}, boolean()) ->
     gen_statem:event_handler_result(atom()).

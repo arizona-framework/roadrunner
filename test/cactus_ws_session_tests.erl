@@ -140,6 +140,61 @@ frame_loop_stops_on_transport_error_event_test() ->
     end,
     Sink ! stop.
 
+frame_loop_closed_after_partial_frame_stops_cleanly_test() ->
+    %% A `cactus_fake_closed` arriving after a partial frame
+    %% (parser sees `{more, _}`, re-arms setopts, then close fires)
+    %% must terminate the session cleanly. Locks in the active-mode
+    %% partial-then-close path.
+    Self = self(),
+    Tag = make_ref(),
+    %% First chunk: 2 bytes of a frame header (parser returns {more, _}).
+    %% Then close.
+    Sink = spawn_active_sink(Self, Tag, [
+        {recv, <<16#81, 16#80>>},
+        {error, closed}
+    ]),
+    {ok, Pid} = gen_statem:start(
+        cactus_ws_session,
+        {{fake, Sink}, cactus_ws_echo_handler, undefined, ws_ctx()},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_normal_exit)
+    end,
+    Sink ! stop.
+
+frame_loop_setopts_error_stops_cleanly_test() ->
+    %% If the kernel reports the socket as closed when re-arming
+    %% (peer RST between events), `setopts/2` returns `{error, _}`.
+    %% Pre-fix this badmatched and crashed; post-fix the session
+    %% stops cleanly via `arm_or_stop/3` so terminate/3 still runs.
+    %%
+    %% Drive: spawn the gen_statem with a sink, kill the sink BEFORE
+    %% sending socket_ready so frame_loop's state_enter `setopts`
+    %% sees a dead-process socket and returns `{error, einval}`.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    {ok, Pid} = gen_statem:start(
+        cactus_ws_session,
+        {{fake, Sink}, cactus_ws_echo_handler, undefined, ws_ctx()},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    %% Kill the sink so the next `setopts` on `{fake, Sink}` returns
+    %% an error.
+    exit(Sink, kill),
+    %% Wait for the sink to actually be dead.
+    erlang:demonitor(monitor(process, Sink), [flush]),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_normal_exit)
+    end.
+
 frame_loop_drops_unexpected_info_event_test() ->
     %% A stray info message that doesn't match any of the transport
     %% tags gets dropped and the session re-arms the socket; verified

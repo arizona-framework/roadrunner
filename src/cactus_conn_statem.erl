@@ -32,6 +32,22 @@ without duplicating the handler in every named state.
   the synchronous `cactus_conn:make_recv/3` closure; the deadline
   passed to it is the same `read_deadline` set in `reading_request`
   so the request-timeout covers both phases.
+
+  **Why mixed (active for headers, sync for body)?** Hibernation
+  only fires when the gen_statem's main loop is idle. Between
+  pipelined requests on a keep-alive conn, the gen_statem sits
+  in `reading_request` waiting for bytes — that's the high-value
+  hibernation window (most idle WebSocket / HTTP/1.1 keep-alive
+  workloads). Once a request has been parsed, the conn proceeds
+  through `reading_body → dispatching` synchronously; the handler
+  blocks gen_statem anyway during dispatching, so making
+  `reading_body` event-driven would gain nothing for hibernation
+  and would significantly widen the refactor (manual-mode
+  handlers call `cactus_req:read_body/1,2` synchronously, which
+  would need a parallel async API). The mixed design is a
+  deliberate cost/benefit trade — keep the simple synchronous
+  body read; pay the active-mode complexity only where it
+  unlocks hibernation.
 - `dispatching` — runs the middleware/handler pipeline, dispatches
   the response (buffered / stream / loop / sendfile / websocket),
   fires `[cactus, request, start | stop | exception]` telemetry,
@@ -214,8 +230,7 @@ handle_event(
         read_start_mono = Now,
         read_bytes_total = 0
     },
-    ok = cactus_transport:setopts(Socket, [{active, once}]),
-    {keep_state, Data, reading_request_timeouts(Timeout, ProtoOpts)};
+    arm_or_stop(Socket, Data, reading_request_timeouts(Timeout, ProtoOpts));
 handle_event(
     state_timeout,
     request_deadline,
@@ -253,8 +268,7 @@ handle_event(info, Msg, reading_request, #data{socket = Socket} = Data) ->
         {ErrorTag, _Sock, _Reason} ->
             {stop, normal, Data};
         _Other ->
-            ok = cactus_transport:setopts(Socket, [{active, once}]),
-            {keep_state, Data}
+            arm_or_stop(Socket, Data, [])
     end;
 %% --- reading_body ---
 handle_event(enter, _Old, reading_body, _Data) ->
@@ -477,6 +491,23 @@ reading_request_timeouts(Timeout, ProtoOpts) ->
 rate_check_interval(ProtoOpts) ->
     maps:get(rate_check_interval_ms, ProtoOpts, 1000).
 
+%% Re-arm the active-mode socket and yield with `Actions`. If
+%% `setopts/2` reports the socket is dead (peer RST between events,
+%% kernel-side close), stop the conn cleanly instead of crashing on a
+%% strict `ok = ...` match. The next info event would normally have
+%% been `{tcp_closed, _}`, but with the socket already disposed the
+%% event won't fire — terminate now so terminate/3's slot release +
+%% conn_close telemetry still run.
+-spec arm_or_stop(
+    cactus_transport:socket(), #data{}, [gen_statem:enter_action()]
+) ->
+    gen_statem:event_handler_result(atom()).
+arm_or_stop(Socket, Data, Actions) ->
+    case cactus_transport:setopts(Socket, [{active, once}]) of
+        ok -> {keep_state, Data, Actions};
+        {error, _} -> {stop, normal, Data}
+    end.
+
 %% Anti-Slowloris rate check — same shape as the closure-era
 %% `cactus_conn:rate_ok/3`. After a 1-second grace, require the
 %% running average to meet `MinRate` bytes/sec.
@@ -528,8 +559,7 @@ parse_buffered_request(
                 req = Req, buffered = Rest, recv = Recv
             }};
         {more, _} ->
-            ok = cactus_transport:setopts(Socket, [{active, once}]),
-            {keep_state, Data};
+            arm_or_stop(Socket, Data, []);
         {error, Reason} ->
             logger:debug(#{
                 msg => "cactus rejecting malformed request",
