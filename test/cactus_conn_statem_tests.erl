@@ -333,6 +333,182 @@ dispatching_request_start_and_stop_telemetry_fires_test() ->
         telemetry:detach(HandlerId)
     end.
 
+%% =============================================================================
+%% Phase 6b — finishing + keep-alive + drain
+%% =============================================================================
+
+keep_alive_serves_two_requests_test() ->
+    ensure_pg(),
+    Self = self(),
+    %% `cactus_manual_keepalive_handler` doesn't emit `Connection: close`,
+    %% so each response is keep-alive-friendly. The second request
+    %% explicitly closes.
+    Sink = spawn_recv_sink_with_send_log(Self, [
+        {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"},
+        {recv, ~"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"}
+    ]),
+    Opts = (fake_proto_opts(ka_two))#{
+        dispatch := {handler, cactus_manual_keepalive_handler}
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Self, 100)),
+    ?assert(count_200(Sent) >= 2),
+    stop_sink(Sink).
+
+keep_alive_max_cap_stops_after_max_test() ->
+    ensure_pg(),
+    Self = self(),
+    %% Listener allows max_keep_alive_request = 1; the second request
+    %% never reaches reading_request because finishing stops first.
+    Sink = spawn_recv_sink_with_send_log(Self, [
+        {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"},
+        {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}
+    ]),
+    Opts = (fake_proto_opts(ka_cap))#{
+        max_keep_alive_request := 1,
+        dispatch := {handler, cactus_manual_keepalive_handler}
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Self, 100)),
+    ?assertEqual(1, count_200(Sent)),
+    stop_sink(Sink).
+
+http10_default_close_test() ->
+    %% HTTP/1.0 closes after one request even without an explicit
+    %% Connection: close.
+    ensure_pg(),
+    Self = self(),
+    Sink = spawn_recv_sink_with_send_log(Self, [
+        {recv, ~"GET / HTTP/1.0\r\nHost: x\r\n\r\n"},
+        %% Second recv would be issued in keep-alive; with HTTP/1.0
+        %% close we shouldn't see it. Make it slow so the first
+        %% request's response is logged before the conn closes.
+        {recv, {error, closed}}
+    ]),
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, fake_proto_opts(http10)),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Self, 100)),
+    ?assertEqual(1, count_200(Sent)),
+    stop_sink(Sink).
+
+drain_mid_keep_alive_stops_test() ->
+    %% Serve one request; drain message arrives before the next
+    %% reading_request iteration; conn stops without serving request 2.
+    ensure_pg(),
+    Self = self(),
+    Sink = spawn_recv_sink_with_send_log(
+        Self,
+        [
+            {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"},
+            %% Slow second recv so we can race the drain in.
+            {recv, {error, timeout}}
+        ]
+    ),
+    Opts = (fake_proto_opts(ka_drain))#{
+        dispatch := {handler, cactus_manual_keepalive_handler}
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    %% Brief delay to let request 1 land, then drain.
+    timer:sleep(50),
+    Pid ! {cactus_drain, erlang:monotonic_time(millisecond) + 1000},
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Self, 100)),
+    ?assertEqual(1, count_200(Sent)),
+    stop_sink(Sink).
+
+manual_body_full_read_keep_alive_test() ->
+    ensure_pg(),
+    Self = self(),
+    %% Manual body buffering — handler's body_state needs to drain.
+    %% The handler echoes the body; second request closes.
+    Sink = spawn_recv_sink_with_send_log(Self, [
+        {recv, ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"},
+        {recv, ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"}
+    ]),
+    Opts = (fake_proto_opts(ka_manual))#{
+        body_buffering := manual,
+        dispatch := {handler, cactus_manual_keepalive_handler}
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Self, 100)),
+    ?assert(count_200(Sent) >= 2),
+    stop_sink(Sink).
+
+keep_alive_request_timeout_silent_test() ->
+    %% A keep-alive iteration whose recv times out closes silently —
+    %% no 408 on the wire (peer wasn't reading anyway).
+    ensure_pg(),
+    Self = self(),
+    Sink = spawn_recv_sink_with_send_log(Self, [
+        {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"},
+        {recv, {error, timeout}}
+    ]),
+    Opts = (fake_proto_opts(ka_silent_timeout))#{
+        keep_alive_timeout := 50,
+        dispatch := {handler, cactus_manual_keepalive_handler}
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Self, 100)),
+    %% First 200 went out; no 408 follows.
+    ?assertEqual(nomatch, re:run(Sent, ~"HTTP/1.1 408")),
+    stop_sink(Sink).
+
+manual_body_drain_failure_closes_test() ->
+    %% Manual mode: handler completes without reading the body;
+    %% drain_body tries to consume but recv returns error → close.
+    ensure_pg(),
+    Self = self(),
+    Sink = spawn_recv_sink_with_send_log(Self, [
+        {recv, ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 99\r\n\r\nshort"},
+        {recv, {error, closed}}
+    ]),
+    Opts = (fake_proto_opts(ka_drain_fail))#{
+        body_buffering := manual,
+        max_content_length := 1000
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
+    end,
+    stop_sink(Sink).
+
 listener_accept_and_conn_close_fire_around_statem_test() ->
     {ok, _} = application:ensure_all_started(telemetry),
     Self = self(),
@@ -446,6 +622,12 @@ recv_sink_loop(Script, Logger) ->
             recv_sink_loop(Script, Logger);
         _ ->
             recv_sink_loop(Script, Logger)
+    end.
+
+count_200(Bin) ->
+    case re:run(Bin, ~"HTTP/1.1 200", [global]) of
+        nomatch -> 0;
+        {match, Matches} -> length(Matches)
     end.
 
 collect_sends(_Logger, Timeout) ->

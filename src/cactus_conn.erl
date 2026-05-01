@@ -41,6 +41,8 @@ read it anyway.
     refine_conn_label/2,
     scheme/1,
     make_body_state/4,
+    drain_body/1,
+    keep_alive_decision/2,
     send_request_timeout/1,
     send_bad_request/1,
     send_payload_too_large/1,
@@ -631,6 +633,7 @@ read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
 %% Read and discard whatever the handler left in the manual-mode
 %% `body_state`. Called only on the 4-tuple response path; the conn
 %% uses the result to decide whether keep-alive can engage.
+-doc false.
 -spec drain_body(cactus_http1:request()) -> ok | {error, term()}.
 drain_body(#{body_state := BS}) ->
     case consume_body_state(BS, all) of
@@ -1004,6 +1007,7 @@ response_body_for(Req, Body) ->
 
 %% HTTP/1.0 default close. HTTP/1.1 keep-alive unless either side
 %% set Connection: close.
+-doc false.
 -spec keep_alive_decision(cactus_http1:request(), cactus_http1:headers()) ->
     keep_alive | close.
 keep_alive_decision(Req, RespHeaders) ->

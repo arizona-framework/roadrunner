@@ -34,7 +34,7 @@ with the connection's duration and the keep-alive request count.
 
 -export([start/2]).
 -export([init/1, callback_mode/0, terminate/3]).
--export([awaiting_shoot/3, reading_request/3, reading_body/3, dispatching/3]).
+-export([handle_event/4]).
 
 -record(data, {
     socket :: cactus_transport:socket(),
@@ -46,12 +46,19 @@ with the connection's duration and the keep-alive request count.
     %% entry to `reading_request` (Phase 5).
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
     scheme = http :: http | https,
+    %% First request on a fresh conn vs subsequent keep-alive requests
+    %% — drives the timeout (request_timeout vs keep_alive_timeout) and
+    %% silent-vs-408 behavior in `reading_request`.
+    phase = first :: first | keep_alive,
     %% Per-request scratch carried from `reading_request` into
     %% `reading_body`: the parsed request map and any post-headers
     %% bytes already buffered on the wire.
     req :: cactus_http1:request() | undefined,
     buffered = <<>> :: binary(),
     recv :: fun(() -> {ok, binary()} | {error, term()}) | undefined,
+    %% Set by `dispatching`'s pipeline once the handler returns;
+    %% consumed by `finishing` for the keep-alive / close decision.
+    response :: cactus_handler:response() | undefined,
     %% Cumulative successfully-served requests on this conn —
     %% incremented as `dispatching` lands a response.
     requests_served = 0 :: non_neg_integer(),
@@ -78,7 +85,7 @@ start(Socket, ProtoOpts) ->
     gen_statem:start(?MODULE, {Socket, ProtoOpts}, []).
 
 -spec callback_mode() -> gen_statem:callback_mode_result().
-callback_mode() -> [state_functions, state_enter].
+callback_mode() -> [handle_event_function, state_enter].
 
 -spec init({cactus_transport:socket(), cactus_conn:proto_opts()}) ->
     {ok, awaiting_shoot, #data{}}.
@@ -99,13 +106,28 @@ init({Socket, ProtoOpts}) ->
         start_mono = StartMono
     }}.
 
-%% --- States ---
+%% --- Single event handler covering every state. ---
 
--spec awaiting_shoot(gen_statem:event_type(), term(), #data{}) ->
+-spec handle_event(gen_statem:event_type(), term(), atom(), #data{}) ->
     gen_statem:event_handler_result(atom()).
-awaiting_shoot(enter, _Old, _Data) ->
+
+%% Drain message handled identically in every state — flag is checked
+%% by `reading_request` before reading the next request. Using a
+%% wildcard state pattern avoids duplicating the clause across each
+%% specific state.
+handle_event(info, {cactus_drain, _Deadline}, _State, Data) ->
+    {keep_state, Data#data{drain_pending = true}};
+%% --- awaiting_shoot ---
+handle_event(enter, _Old, awaiting_shoot, _Data) ->
     keep_state_and_data;
-awaiting_shoot(info, shoot, #data{socket = Socket, proto_opts = ProtoOpts} = Data) ->
+handle_event(
+    info,
+    shoot,
+    awaiting_shoot,
+    #data{
+        socket = Socket, proto_opts = ProtoOpts
+    } = Data
+) ->
     %% Socket ownership has just transferred from the acceptor — refine
     %% the proc_lib label with the peer (which we couldn't know in
     %% init/1 because the OS-level socket wasn't ours yet).
@@ -113,40 +135,39 @@ awaiting_shoot(info, shoot, #data{socket = Socket, proto_opts = ProtoOpts} = Dat
     ok = cactus_conn:refine_conn_label(ProtoOpts, Peer),
     Scheme = cactus_conn:scheme(Socket),
     {next_state, reading_request, Data#data{peer = Peer, scheme = Scheme}};
-awaiting_shoot(info, {cactus_drain, _Deadline}, Data) ->
-    %% Drain may arrive before `shoot` if the listener drains during
-    %% the acceptor's hand-off window. Stash and check at parse time.
-    {keep_state, Data#data{drain_pending = true}}.
-
--spec reading_request(gen_statem:event_type(), term(), #data{}) ->
-    gen_statem:event_handler_result(atom()).
-reading_request(enter, _Old, _Data) ->
+%% --- reading_request ---
+handle_event(enter, _Old, reading_request, _Data) ->
     %% `state_timeout` is the only action a `state_enter` callback can
     %% use to schedule an internal-style follow-up. Zero delay fires
     %% the parse immediately on the next event-loop turn.
     {keep_state_and_data, [{state_timeout, 0, parse}]};
-reading_request(state_timeout, parse, #data{drain_pending = true} = Data) ->
+handle_event(
+    state_timeout,
+    parse,
+    reading_request,
+    #data{
+        drain_pending = true
+    } = Data
+) ->
     %% Listener is draining — close before reading another request.
-    %% (Phase 6 wires the `draining` state for the mid-keepalive case;
-    %% the first-request drain just stops.)
     {stop, normal, Data};
-reading_request(state_timeout, parse, #data{proto_opts = ProtoOpts} = Data) ->
-    %% Phase 5 only handles the first request — `phase` is always
-    %% `first`. Phase 6 introduces the keep-alive loop-back from
-    %% `finishing`, at which point `phase = keep_alive` reads the
-    %% `keep_alive_timeout` instead and `reading_request` grows an
-    %% `info, {cactus_drain, _}` clause for messages arriving
-    %% between requests.
-    Timeout = maps:get(request_timeout, ProtoOpts),
-    do_read_request(Timeout, Data).
-
--spec reading_body(gen_statem:event_type(), term(), #data{}) ->
-    gen_statem:event_handler_result(atom()).
-reading_body(enter, _Old, _Data) ->
+handle_event(
+    state_timeout,
+    parse,
+    reading_request,
+    #data{
+        phase = Phase, proto_opts = ProtoOpts
+    } = Data
+) ->
+    Timeout = request_timeout(Phase, ProtoOpts),
+    do_read_request(Timeout, Data);
+%% --- reading_body ---
+handle_event(enter, _Old, reading_body, _Data) ->
     {keep_state_and_data, [{state_timeout, 0, read}]};
-reading_body(
+handle_event(
     state_timeout,
     read,
+    reading_body,
     #data{
         socket = Socket,
         proto_opts = ProtoOpts,
@@ -185,19 +206,16 @@ reading_body(
                         req = Req#{body_state => BodyState}
                     }}
             end
-    end.
-
--spec dispatching(gen_statem:event_type(), term(), #data{}) ->
-    gen_statem:event_handler_result(atom()).
-dispatching(enter, _Old, _Data) ->
+    end;
+%% --- dispatching ---
+handle_event(enter, _Old, dispatching, _Data) ->
     {keep_state_and_data, [{state_timeout, 0, dispatch}]};
-dispatching(
+handle_event(
     state_timeout,
     dispatch,
+    dispatching,
     #data{
-        socket = Socket,
-        proto_opts = ProtoOpts,
-        req = Req
+        socket = Socket, proto_opts = ProtoOpts, req = Req
     } = Data
 ) ->
     Dispatch = maps:get(dispatch, ProtoOpts),
@@ -209,13 +227,30 @@ dispatching(
         not_found ->
             _ = cactus_conn:send_not_found(Socket),
             {stop, normal, Data}
-    end.
+    end;
+%% --- finishing ---
+handle_event(enter, _Old, finishing, _Data) ->
+    {keep_state_and_data, [{state_timeout, 0, finalize}]};
+handle_event(
+    state_timeout,
+    finalize,
+    finishing,
+    #data{
+        proto_opts = ProtoOpts,
+        req = Req,
+        response = Response,
+        requests_served = Served
+    } = Data
+) ->
+    %% Phase 6a/6b only handles buffered response keep-alive — the
+    %% other response kinds (stream, loop, sendfile, websocket) close
+    %% by construction in Phase 7's dispatch_response clauses.
+    buffered_finish(Data, ProtoOpts, Req, Response, Served).
 
 %% Mirror `cactus_conn:handle_and_send/4` exactly: bracket the
 %% middleware/handler pipeline with `[cactus, request, start | stop |
 %% exception]` telemetry, dispatch the response, count the request as
-%% served, then stop. Phase 6b adds keep-alive loop-back via the
-%% `finishing` state.
+%% served, transition to `finishing` for the keep-alive decision.
 -spec run_pipeline(
     cactus_transport:socket(),
     module(),
@@ -236,9 +271,12 @@ run_pipeline(Socket, Handler, Req, ListenerMws, #data{} = Data) ->
                 status => cactus_conn:response_status(Response),
                 response_kind => cactus_conn:response_kind(Response)
             }),
-            %% Phase 6a always stops after one request — Phase 6b
-            %% adds keep-alive transitions.
-            {stop, normal, Data#data{requests_served = Data#data.requests_served + 1}}
+            Served = Data#data.requests_served + 1,
+            %% Hand the response and Req2 to `finishing` for body drain
+            %% + keep-alive decision.
+            {next_state, finishing, Data#data{
+                req = Req2, requests_served = Served, response = Response
+            }}
     catch
         Class:Reason:Stack ->
             ok = cactus_telemetry:request_exception(StartMono, Metadata, Class, Reason),
@@ -252,6 +290,52 @@ run_pipeline(Socket, Handler, Req, ListenerMws, #data{} = Data) ->
             _ = cactus_conn:send_internal_error(Socket),
             {stop, normal, Data}
     end.
+
+-spec buffered_finish(
+    #data{},
+    cactus_conn:proto_opts(),
+    cactus_http1:request(),
+    cactus_handler:response(),
+    non_neg_integer()
+) -> gen_statem:event_handler_result(atom()).
+buffered_finish(Data, ProtoOpts, Req, {_Status, Headers, _Body}, Served) ->
+    case cactus_conn:drain_body(Req) of
+        ok ->
+            case cactus_conn:keep_alive_decision(Req, Headers) of
+                close ->
+                    {stop, normal, Data};
+                keep_alive ->
+                    Max = maps:get(max_keep_alive_request, ProtoOpts),
+                    case Served >= Max of
+                        true ->
+                            {stop, normal, Data};
+                        false ->
+                            %% Reset per-request scratch and loop back.
+                            {next_state, reading_request, Data#data{
+                                phase = keep_alive,
+                                req = undefined,
+                                buffered = <<>>,
+                                recv = undefined,
+                                response = undefined
+                            }}
+                    end
+            end;
+        {error, _} ->
+            %% Drain failure — close.
+            {stop, normal, Data}
+    end.
+
+-spec request_timeout(first | keep_alive, cactus_conn:proto_opts()) -> non_neg_integer().
+request_timeout(first, ProtoOpts) -> maps:get(request_timeout, ProtoOpts);
+request_timeout(keep_alive, ProtoOpts) -> maps:get(keep_alive_timeout, ProtoOpts).
+
+%% Mirrors `cactus_conn:maybe_send_request_timeout/2` — only the very
+%% first request gets a 408 on silence; idle keep-alive timeouts
+%% close silently to avoid blasting at peers that weren't reading.
+-spec maybe_send_request_timeout(cactus_transport:socket(), first | keep_alive) ->
+    ok | {error, term()}.
+maybe_send_request_timeout(Socket, first) -> cactus_conn:send_request_timeout(Socket);
+maybe_send_request_timeout(_Socket, keep_alive) -> ok.
 
 -spec telemetry_metadata(cactus_http1:request()) -> cactus_telemetry:metadata().
 telemetry_metadata(Req) ->
@@ -291,7 +375,8 @@ do_read_request(
         proto_opts = ProtoOpts,
         listener_name = ListenerName,
         peer = Peer,
-        scheme = Scheme
+        scheme = Scheme,
+        phase = Phase
     } = Data
 ) ->
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
@@ -314,10 +399,7 @@ do_read_request(
                 req = Req, buffered = Buffered, recv = Recv
             }};
         {error, request_timeout} ->
-            %% Phase 5 always sends 408 — only the first request can
-            %% time out here. Phase 6's keep-alive iteration calls a
-            %% silent variant via `phase = keep_alive`.
-            _ = cactus_conn:send_request_timeout(Socket),
+            _ = maybe_send_request_timeout(Socket, Phase),
             {stop, normal, Data};
         {error, slow_client} ->
             {stop, normal, Data};
