@@ -85,7 +85,7 @@ without duplicating the handler in every named state.
     %% via the `pg` group; the gen_statem handles it as an info event
     %% in any state and stashes a flag, which `reading_request` reads
     %% before parsing the next request.
-    drain_pending = false :: boolean()
+    drain_received = false :: boolean()
 }).
 
 -doc """
@@ -133,7 +133,7 @@ init({Socket, ProtoOpts}) ->
 %% wildcard state pattern avoids duplicating the clause across each
 %% specific state.
 handle_event(info, {cactus_drain, _Deadline}, _State, Data) ->
-    {keep_state, Data#data{drain_pending = true}};
+    {keep_state, Data#data{drain_received = true}};
 %% --- awaiting_shoot ---
 handle_event(enter, _Old, awaiting_shoot, _Data) ->
     keep_state_and_data;
@@ -176,7 +176,7 @@ handle_event(
     %% receive-with-after-0 by peeking the gen_statem process mailbox
     %% directly here.
     Data = drain_peek(Data0),
-    case Data#data.drain_pending of
+    case Data#data.drain_received of
         true ->
             {stop, normal, Data};
         false ->
@@ -386,15 +386,15 @@ request_timeout(keep_alive, ProtoOpts) -> maps:get(keep_alive_timeout, ProtoOpts
 %%
 %% The peek bypasses gen_statem's queue once per reading_request
 %% iteration to consume any pending drain message. The rest of the
-%% time drain_pending is already true (caught by the first clause)
+%% time drain_received is already true (caught by the first clause)
 %% or the mailbox has no drain (after-0 path). If a future OTP
 %% release adds a `peek_mailbox`-style primitive, revisit.
 -spec drain_peek(#data{}) -> #data{}.
-drain_peek(#data{drain_pending = true} = Data) ->
+drain_peek(#data{drain_received = true} = Data) ->
     Data;
 drain_peek(Data) ->
     receive
-        {cactus_drain, _Deadline} -> Data#data{drain_pending = true}
+        {cactus_drain, _Deadline} -> Data#data{drain_received = true}
     after 0 ->
         Data
     end.

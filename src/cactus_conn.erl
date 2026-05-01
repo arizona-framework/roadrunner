@@ -98,7 +98,7 @@ read it anyway.
 %% wire but not yet handed to the caller — used for chunked framing
 %% to absorb a chunk's payload across multiple length-bounded calls.
 %% `done` flips true once the size-0 last chunk is parsed.
--opaque body_state() :: #{
+-type body_state() :: #{
     framing := none | chunked | {content_length, non_neg_integer()},
     buffered := binary(),
     bytes_read := non_neg_integer(),
