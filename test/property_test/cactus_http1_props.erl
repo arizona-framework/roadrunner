@@ -65,6 +65,15 @@ prop_parse_request_incremental() ->
         cactus_http1:parse_request(Bytes) =:= feed(parse_request, Bytes)
     ).
 
+%% A single chunk plus the size-0 terminator, fed all at once vs.
+%% byte-by-byte, must reach the same `{ok, last, _, _}` result.
+prop_parse_chunk_incremental() ->
+    ?FORALL(
+        Bytes,
+        chunked_body_bytes(),
+        cactus_http1:parse_chunk(Bytes) =:= feed(parse_chunk, Bytes)
+    ).
+
 %% Drive the parser one byte at a time, accumulating into Buf, until
 %% it returns a non-`{more, _}` result.
 feed(Fn, Bytes) ->
@@ -137,4 +146,19 @@ header_value() ->
         L,
         list(oneof([$a, $b, $c, $d, $e, $\s])),
         iolist_to_binary(L)
+    ).
+
+%% A single complete chunk — no terminator. The incremental feed
+%% stops at the first `{ok, _, _}` return so we generate exactly the
+%% bytes for one chunk and compare against the full-buffer parse.
+chunked_body_bytes() ->
+    ?LET(
+        Payload,
+        binary(),
+        iolist_to_binary([
+            integer_to_binary(byte_size(Payload), 16),
+            ~"\r\n",
+            Payload,
+            ~"\r\n"
+        ])
     ).

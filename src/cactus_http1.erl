@@ -605,7 +605,22 @@ response(Status, Headers, Body) when is_integer(Status, 100, 599) ->
 encode_headers([]) ->
     [];
 encode_headers([{Name, Value} | Rest]) ->
+    %% Defend against HTTP response splitting / header injection: any
+    %% CR, LF, or NUL in a header name or value would let an attacker
+    %% who controls part of either inject an entirely new header (or
+    %% terminate the header block early). Crash hard so a programmer
+    %% bug — usually echoing user input into a header without
+    %% validation — turns into a 500, not a wire-level vulnerability.
+    ok = check_header_safe(Name, name),
+    ok = check_header_safe(Value, value),
     [Name, ~": ", Value, ~"\r\n" | encode_headers(Rest)].
+
+-spec check_header_safe(binary(), name | value) -> ok.
+check_header_safe(Bin, Kind) when is_binary(Bin) ->
+    case binary:match(Bin, [<<$\r>>, <<$\n>>, <<0>>]) of
+        nomatch -> ok;
+        _ -> error({header_injection, Kind, Bin})
+    end.
 
 -spec reason(status()) -> binary().
 reason(200) -> ~"OK";

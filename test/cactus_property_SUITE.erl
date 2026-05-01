@@ -28,7 +28,8 @@ Add a new property:
     http1_parse_request_never_crashes/1,
     http1_parse_chunk_never_crashes/1,
     http1_parse_request_line_incremental/1,
-    http1_parse_request_incremental/1
+    http1_parse_request_incremental/1,
+    http1_parse_chunk_incremental/1
 ]).
 
 suite() ->
@@ -47,7 +48,8 @@ all() ->
         http1_parse_request_never_crashes,
         http1_parse_chunk_never_crashes,
         http1_parse_request_line_incremental,
-        http1_parse_request_incremental
+        http1_parse_request_incremental,
+        http1_parse_chunk_incremental
     ].
 
 init_per_suite(Config) ->
@@ -125,5 +127,11 @@ http1_parse_request_line_incremental(Config) ->
 http1_parse_request_incremental(Config) ->
     ct_property_test:quickcheck(
         cactus_http1_props:prop_parse_request_incremental(),
+        Config
+    ).
+
+http1_parse_chunk_incremental(Config) ->
+    ct_property_test:quickcheck(
+        cactus_http1_props:prop_parse_chunk_incremental(),
         Config
     ).

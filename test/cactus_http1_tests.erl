@@ -711,3 +711,49 @@ response_unknown_status_has_empty_reason_test() ->
         ~"HTTP/1.1 599 \r\n\r\n",
         iolist_to_binary(cactus_http1:response(599, [], ~""))
     ).
+
+%% --- header injection / response splitting defenses ---
+
+response_rejects_cr_in_header_value_test() ->
+    %% Classic HTTP response splitting: CRLF in a header value would
+    %% let the attacker inject arbitrary headers (or a whole second
+    %% response) into the wire output. Must crash before it hits the
+    %% socket.
+    ?assertError(
+        {header_injection, value, _},
+        cactus_http1:response(
+            302, [{~"location", ~"http://x.com\r\nX-Inject: evil"}], ~""
+        )
+    ).
+
+response_rejects_lf_in_header_value_test() ->
+    ?assertError(
+        {header_injection, value, _},
+        cactus_http1:response(200, [{~"x-foo", ~"line1\nline2"}], ~"")
+    ).
+
+response_rejects_nul_in_header_value_test() ->
+    ?assertError(
+        {header_injection, value, _},
+        cactus_http1:response(200, [{~"x-foo", <<"a", 0, "b">>}], ~"")
+    ).
+
+response_rejects_cr_in_header_name_test() ->
+    %% A CR in the NAME would also enable injection (the second line
+    %% becomes a fresh header).
+    ?assertError(
+        {header_injection, name, _},
+        cactus_http1:response(200, [{~"x-name\r\nInjected", ~"v"}], ~"")
+    ).
+
+response_rejects_lf_in_header_name_test() ->
+    ?assertError(
+        {header_injection, name, _},
+        cactus_http1:response(200, [{~"x-name\nbad", ~"v"}], ~"")
+    ).
+
+response_rejects_nul_in_header_name_test() ->
+    ?assertError(
+        {header_injection, name, _},
+        cactus_http1:response(200, [{<<"x-name", 0, "bad">>, ~"v"}], ~"")
+    ).

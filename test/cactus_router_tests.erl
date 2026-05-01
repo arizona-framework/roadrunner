@@ -139,3 +139,59 @@ match_wildcard_not_last_falls_through_test() ->
         {ok, normal_handler, #{~"rest" => [~"x", ~"y"]}, undefined},
         cactus_router:match(~"/foo/x/y", Compiled)
     ).
+
+%% =============================================================================
+%% Adversarial path edge cases.
+%% =============================================================================
+
+match_double_slash_collapses_to_single_test() ->
+    %% Lenient: `path_segments/1` uses `trim_all` so `//` is the same as
+    %% `/`. Probably what most apps expect; document via assertion.
+    Compiled = cactus_router:compile([{~"/users/:id", users_handler, undefined}]),
+    ?assertEqual(
+        {ok, users_handler, #{~"id" => ~"42"}, undefined},
+        cactus_router:match(~"/users//42", Compiled)
+    ).
+
+match_trailing_slash_treated_as_no_slash_test() ->
+    Compiled = cactus_router:compile([{~"/about", about_handler, undefined}]),
+    ?assertEqual(
+        {ok, about_handler, #{}, undefined},
+        cactus_router:match(~"/about/", Compiled)
+    ).
+
+match_empty_path_matches_root_route_test() ->
+    %% `<<>>` and `<<"/">>` both produce zero segments — equivalent.
+    Compiled = cactus_router:compile([{~"/", home_handler, undefined}]),
+    ?assertEqual({ok, home_handler, #{}, undefined}, cactus_router:match(~"", Compiled)).
+
+match_param_captures_percent_encoded_segment_test() ->
+    %% Router does not percent-decode — handlers see the raw segment.
+    %% Documented as "literal segments must match byte-exactly".
+    Compiled = cactus_router:compile([{~"/users/:id", users_handler, undefined}]),
+    ?assertEqual(
+        {ok, users_handler, #{~"id" => ~"joe%20bob"}, undefined},
+        cactus_router:match(~"/users/joe%20bob", Compiled)
+    ).
+
+match_param_with_special_chars_in_segment_test() ->
+    %% A segment containing `:`, `*`, `.` etc. is just bytes — no special
+    %% meaning at match time (only the pattern's leading char matters).
+    Compiled = cactus_router:compile([{~"/users/:id", users_handler, undefined}]),
+    ?assertEqual(
+        {ok, users_handler, #{~"id" => ~":star*dot."}, undefined},
+        cactus_router:match(~"/users/:star*dot.", Compiled)
+    ).
+
+match_route_path_with_only_slashes_test() ->
+    %% Pattern of all slashes compiles to an empty segment list — only
+    %% empty paths match.
+    Compiled = cactus_router:compile([{~"////", root_handler, undefined}]),
+    ?assertEqual(
+        {ok, root_handler, #{}, undefined},
+        cactus_router:match(~"/", Compiled)
+    ),
+    ?assertEqual(
+        not_found,
+        cactus_router:match(~"/anything", Compiled)
+    ).
