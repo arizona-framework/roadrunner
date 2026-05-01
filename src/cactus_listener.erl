@@ -43,6 +43,13 @@ connection crash doesn't take the pool down.
     max_keep_alive_request => pos_integer(),
     max_clients => pos_integer(),
     minimum_bytes_per_second => non_neg_integer(),
+    %% How often (ms) `reading_request` re-checks the running
+    %% bytes-per-second average against `minimum_bytes_per_second`.
+    %% Default 1000ms — matches the 1-second grace period of the
+    %% rate check itself. Tests use shorter intervals (20–30ms) to
+    %% exercise rate-check fires deterministically without
+    %% second-scale waits; ops can tune for chattier observability.
+    rate_check_interval_ms => pos_integer(),
     body_buffering => auto | manual,
     slot_reconciliation => disabled | #{interval_ms := pos_integer()},
     %% When set, the per-connection gen_statem auto-hibernates after
@@ -275,15 +282,27 @@ build_proto_opts(Opts, ListenerName) ->
         body_buffering => maps:get(body_buffering, Opts, auto),
         listener_name => ListenerName
     },
-    %% Optional `hibernate_after` — `cactus_conn_statem:start/2`
-    %% reads it from proto_opts and threads it into
-    %% `gen_statem:start/3`'s start options. Omitted by default
-    %% because hibernation has a per-wake CPU cost (~tens of microseconds
-    %% for the GC); only worth enabling for workloads with mostly-idle
-    %% keep-alive conns where the heap-shrink win dominates.
-    case maps:find(hibernate_after, Opts) of
-        {ok, Ms} when is_integer(Ms), Ms > 0 -> Base#{hibernate_after => Ms};
-        error -> Base
+    WithHibernate =
+        %% Optional `hibernate_after` — `cactus_conn_statem:start/2`
+        %% reads it from proto_opts and threads it into
+        %% `gen_statem:start/3`'s start options. Omitted by default
+        %% because hibernation has a per-wake CPU cost (~tens of microseconds
+        %% for the GC); only worth enabling for workloads with mostly-idle
+        %% keep-alive conns where the heap-shrink win dominates.
+        case maps:find(hibernate_after, Opts) of
+            {ok, Ms} when is_integer(Ms), Ms > 0 ->
+                Base#{hibernate_after => Ms};
+            error ->
+                Base
+        end,
+    %% Optional `rate_check_interval_ms` — the rate-check timer
+    %% interval inside `reading_request`. Default 1000ms; ops can
+    %% override.
+    case maps:find(rate_check_interval_ms, Opts) of
+        {ok, IntervalMs} when is_integer(IntervalMs), IntervalMs > 0 ->
+            WithHibernate#{rate_check_interval_ms => IntervalMs};
+        error ->
+            WithHibernate
     end.
 
 %% `routes` (router-based dispatch) takes precedence over `handler`. With

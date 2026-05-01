@@ -182,6 +182,17 @@ slot_reconciliation_only_reaps_excess_over_pg_members_test() ->
     Stub2 ! stop,
     ok = cactus_listener:stop(Name).
 
+listener_threads_rate_check_interval_into_proto_opts_test() ->
+    Name = listener_test_rate_check_interval,
+    {ok, ListenerPid} = cactus_listener:start_link(Name, #{
+        port => 0,
+        rate_check_interval_ms => 500
+    }),
+    State = sys:get_state(ListenerPid),
+    ProtoOpts = element(4, State),
+    ?assertEqual(500, maps:get(rate_check_interval_ms, ProtoOpts)),
+    ok = cactus_listener:stop(Name).
+
 listener_threads_hibernate_after_into_proto_opts_test() ->
     %% `hibernate_after` listener opt must thread into proto_opts so
     %% `cactus_conn_statem:start/2` passes it as a `gen_statem:start/3`
