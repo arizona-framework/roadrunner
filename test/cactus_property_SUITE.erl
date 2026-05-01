@@ -29,7 +29,9 @@ Add a new property:
     http1_parse_chunk_never_crashes/1,
     http1_parse_request_line_incremental/1,
     http1_parse_request_incremental/1,
-    http1_parse_chunk_incremental/1
+    http1_parse_chunk_incremental/1,
+    statem_terminates_normal_on_random_inputs/1,
+    statem_request_start_and_stop_share_request_id/1
 ]).
 
 suite() ->
@@ -49,7 +51,9 @@ all() ->
         http1_parse_chunk_never_crashes,
         http1_parse_request_line_incremental,
         http1_parse_request_incremental,
-        http1_parse_chunk_incremental
+        http1_parse_chunk_incremental,
+        statem_terminates_normal_on_random_inputs,
+        statem_request_start_and_stop_share_request_id
     ].
 
 init_per_suite(Config) ->
@@ -133,5 +137,17 @@ http1_parse_request_incremental(Config) ->
 http1_parse_chunk_incremental(Config) ->
     ct_property_test:quickcheck(
         cactus_http1_props:prop_parse_chunk_incremental(),
+        Config
+    ).
+
+statem_terminates_normal_on_random_inputs(Config) ->
+    ct_property_test:quickcheck(
+        cactus_statem_props:prop_conn_terminates_normal_on_random_inputs(),
+        Config
+    ).
+
+statem_request_start_and_stop_share_request_id(Config) ->
+    ct_property_test:quickcheck(
+        cactus_statem_props:prop_request_start_and_stop_share_request_id(),
         Config
     ).
