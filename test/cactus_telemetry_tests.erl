@@ -43,6 +43,67 @@ request_start_and_stop_fire_with_metadata_test_() ->
         end}
     end}.
 
+response_send_failed_event_fires_on_error_test() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    HandlerId = attach([[cactus, response, send_failed]]),
+    try
+        ok = logger:set_process_metadata(#{
+            request_id => ~"deadbeefcafef00d",
+            method => ~"GET",
+            path => ~"/probe",
+            peer => {{127, 0, 0, 1}, 4242}
+        }),
+        Result = cactus_telemetry:response_send({error, closed}, buffered_response),
+        ?assertEqual({error, closed}, Result),
+        receive
+            {telemetry_event, [cactus, response, send_failed], M, Md} ->
+                ?assert(is_integer(maps:get(system_time, M))),
+                ?assertEqual(buffered_response, maps:get(phase, Md)),
+                ?assertEqual(closed, maps:get(reason, Md)),
+                ?assertEqual(~"deadbeefcafef00d", maps:get(request_id, Md)),
+                ?assertEqual(~"GET", maps:get(method, Md)),
+                ?assertEqual(~"/probe", maps:get(path, Md))
+        after 1000 -> error(no_send_failed_event)
+        end
+    after
+        logger:unset_process_metadata(),
+        detach(HandlerId)
+    end.
+
+response_send_ok_does_not_emit_event_test() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    HandlerId = attach([[cactus, response, send_failed]]),
+    try
+        ?assertEqual(ok, cactus_telemetry:response_send(ok, buffered_response)),
+        receive
+            {telemetry_event, [cactus, response, send_failed], _, _} ->
+                error(unexpected_event)
+        after 100 -> ok
+        end
+    after
+        detach(HandlerId)
+    end.
+
+response_send_failed_works_without_logger_metadata_test() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    %% Ensure no metadata is set on this process.
+    logger:unset_process_metadata(),
+    HandlerId = attach([[cactus, response, send_failed]]),
+    try
+        _ = cactus_telemetry:response_send({error, closed}, buffered_response),
+        receive
+            {telemetry_event, [cactus, response, send_failed], _, Md} ->
+                %% Only `phase` and `reason` populated when there's no
+                %% process metadata yet (rare pre-handshake error path).
+                ?assertEqual(buffered_response, maps:get(phase, Md)),
+                ?assertEqual(closed, maps:get(reason, Md)),
+                ?assertNot(maps:is_key(request_id, Md))
+        after 1000 -> error(no_send_failed_event)
+        end
+    after
+        detach(HandlerId)
+    end.
+
 request_exception_fires_on_handler_crash_test_() ->
     {setup, fun setup_crashing_listener/0, fun cleanup_listener/1, fun({_Name, Port}) ->
         {"crashing handler emits exception with kind + reason", fun() ->
@@ -93,7 +154,7 @@ cleanup_listener({Name, _Port}) ->
     ok = cactus_listener:stop(Name).
 
 %% Attach a single handler to a list of event paths. The handler forwards
-%% `{Event, Measurements, Metadata}` tuples to the test process.
+%% `{Event, Measurements, Metadata}` tuples to the calling process.
 attach(Events) ->
     Self = self(),
     HandlerId = make_ref(),

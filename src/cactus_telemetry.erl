@@ -34,6 +34,18 @@ have one module to grep for and tests have one place to attach.
   - **Metadata:** start metadata + `kind` (`error | exit | throw`)
     and `reason`.
 
+- `[cactus, response, send_failed]` — fired when a primary response
+  write (`buffered_response`, `stream_response_head`,
+  `loop_response_head`, or `websocket_upgrade_response`) returns
+  `{error, _}`. Status line was already going on the wire, so the
+  conn closes shortly after; this event lets operators correlate
+  the failure with the `request_id` from the conn's `logger`
+  process metadata.
+
+  - **Measurements:** `system_time`.
+  - **Metadata:** `phase`, `reason`, plus the conn's logger
+    process metadata (`request_id`, `peer`, `method`, `path`).
+
 The `start_time` value returned by `request_start/1` must be passed
 back into `request_stop/3` / `request_exception/4` to compute
 `duration`. Subscribers can wire up via `telemetry:attach/4` in
@@ -43,7 +55,8 @@ production or `telemetry_test:attach_event_handlers/2` in tests.
 -export([
     request_start/1,
     request_stop/3,
-    request_exception/4
+    request_exception/4,
+    response_send/2
 ]).
 
 -export_type([metadata/0]).
@@ -93,3 +106,37 @@ request_exception(StartMono, Metadata, Class, Reason) ->
         Metadata#{kind => Class, reason => Reason}
     ),
     ok.
+
+-doc """
+Inspect a primary-write `gen_tcp:send`/`ssl:send` result. On `ok`,
+this is a no-op. On `{error, _}`, it emits
+`[cactus, response, send_failed]` with the conn's logger process
+metadata merged in plus a `phase` tag, then logs `?LOG_NOTICE`. The
+original send result is returned so callers can chain.
+""".
+-spec response_send(ok | {error, term()}, atom()) -> ok | {error, term()}.
+response_send(ok, _Phase) ->
+    ok;
+response_send({error, Reason} = Err, Phase) ->
+    telemetry:execute(
+        [cactus, response, send_failed],
+        #{system_time => erlang:system_time()},
+        merge_logger_metadata(#{phase => Phase, reason => Reason})
+    ),
+    logger:notice(#{
+        msg => "cactus response send failed",
+        phase => Phase,
+        reason => Reason
+    }),
+    Err.
+
+%% Pull `request_id`/`peer`/`method`/`path` from the conn's logger
+%% process metadata if it has been set; otherwise the failure happened
+%% before `cactus_conn:set_request_logger_metadata/1` ran (rare —
+%% pre-handshake) and the event metadata is just `phase`/`reason`.
+-spec merge_logger_metadata(map()) -> map().
+merge_logger_metadata(Extra) ->
+    case logger:get_process_metadata() of
+        undefined -> Extra;
+        Md when is_map(Md) -> maps:merge(Md, Extra)
+    end.

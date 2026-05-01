@@ -803,7 +803,9 @@ dispatch_response(Socket, Handler, _Req, {loop, Status, Headers, LoopState}) whe
 dispatch_response(Socket, _Handler, Req, {Status, Headers, Body}) when is_integer(Status) ->
     RespBody = response_body_for(Req, Body),
     Resp = cactus_http1:response(Status, Headers, RespBody),
-    _ = cactus_transport:send(Socket, Resp),
+    _ = cactus_telemetry:response_send(
+        cactus_transport:send(Socket, Resp), buffered_response
+    ),
     %% Drain whatever the handler left on the socket so the next request
     %% lands cleanly. In auto mode there's nothing to drain (no
     %% body_state); in manual mode the conn consumes any unread body.
@@ -867,7 +869,9 @@ header_value(Name, Headers) ->
 stream_response(Socket, Status, UserHeaders, Fun) ->
     Headers = [{~"transfer-encoding", ~"chunked"} | UserHeaders],
     Head = cactus_http1:response(Status, Headers, ~""),
-    _ = cactus_transport:send(Socket, Head),
+    _ = cactus_telemetry:response_send(
+        cactus_transport:send(Socket, Head), stream_response_head
+    ),
     Send = fun(Data, FinFlag) ->
         Frame = stream_frame(Data, FinFlag),
         cactus_transport:send(Socket, Frame)
@@ -930,7 +934,9 @@ encode_trailers(Trailers) ->
 loop_response(Socket, Status, UserHeaders, Handler, State) ->
     Headers = [{~"transfer-encoding", ~"chunked"} | UserHeaders],
     Head = cactus_http1:response(Status, Headers, ~""),
-    _ = cactus_transport:send(Socket, Head),
+    _ = cactus_telemetry:response_send(
+        cactus_transport:send(Socket, Head), loop_response_head
+    ),
     Push = fun(Data) ->
         %% Same special-case as `stream_frame/2`: zero-length data
         %% would encode as `0\r\n\r\n` — the chunked terminator —
@@ -1017,7 +1023,9 @@ upgrade_to_websocket(Socket, Req, Mod, State) ->
             Resp = cactus_http1:response(Status, RespHeaders, ~""),
             %% If this send fails, the next recv inside ws_loop will return
             %% {error, _} and the loop ends cleanly — no separate handling.
-            _ = cactus_transport:send(Socket, Resp),
+            _ = cactus_telemetry:response_send(
+                cactus_transport:send(Socket, Resp), websocket_upgrade_response
+            ),
             ws_loop(Socket, <<>>, Mod, State);
         {error, _} ->
             send_bad_request(Socket)
