@@ -18,7 +18,7 @@ connection crash doesn't take the pool down.
 
 -behaviour(gen_server).
 
--export([start_link/2, stop/1, port/1]).
+-export([start_link/2, stop/1, port/1, info/1]).
 -export([init/1, handle_call/3, handle_cast/2, terminate/2]).
 
 -export_type([opts/0]).
@@ -73,6 +73,28 @@ stop(Name) ->
 port(Name) ->
     gen_server:call(Name, port).
 
+-doc """
+Return runtime introspection for a listener:
+
+- `active_clients` — current number of connections held open.
+- `max_clients` — the configured cap.
+- `requests_served` — cumulative count of requests whose headers
+  parsed successfully since the listener started. Includes 4xx
+  responses from the router (404) and the body-size pre-check (413);
+  excludes wire-level parse failures, idle keep-alive timeouts, and
+  silent slow-client closes.
+
+Useful for ops dashboards / health endpoints.
+""".
+-spec info(Name :: atom()) ->
+    #{
+        active_clients := non_neg_integer(),
+        max_clients := pos_integer(),
+        requests_served := non_neg_integer()
+    }.
+info(Name) ->
+    gen_server:call(Name, info).
+
 %% --- gen_server callbacks ---
 
 -spec init(opts()) -> {ok, #state{}} | {stop, term()}.
@@ -119,10 +141,12 @@ spawn_acceptors(LSocket, ProtoOpts, N) ->
 
 -spec build_proto_opts(opts()) -> cactus_conn:proto_opts().
 build_proto_opts(Opts) ->
-    %% A single shared atomics counter tracks live connections per listener.
-    %% Acceptors bump it before spawning a conn; conns decrement on exit.
-    %% Lock-free, ~1ns per op — cheap enough on the accept hot path.
-    Counter = atomics:new(1, [{signed, false}]),
+    %% Per-listener atomics: live-connection counter (acceptors bump on
+    %% accept; conns decrement on exit) and a cumulative requests-served
+    %% counter (conn bumps on each handler dispatch). Lock-free, ~1ns
+    %% per op — cheap enough on the hot path.
+    ClientCounter = atomics:new(1, [{signed, false}]),
+    RequestsCounter = atomics:new(1, [{signed, false}]),
     #{
         dispatch => build_dispatch(Opts),
         middlewares => maps:get(middlewares, Opts, []),
@@ -132,7 +156,8 @@ build_proto_opts(Opts) ->
         max_keep_alive_request =>
             maps:get(max_keep_alive_request, Opts, ?DEFAULT_MAX_KEEP_ALIVE),
         max_clients => maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
-        client_counter => Counter,
+        client_counter => ClientCounter,
+        requests_counter => RequestsCounter,
         minimum_bytes_per_second =>
             maps:get(minimum_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
         body_buffering => maps:get(body_buffering, Opts, auto)
@@ -146,10 +171,22 @@ build_dispatch(#{routes := Routes}) ->
 build_dispatch(Opts) ->
     {handler, maps:get(handler, Opts, cactus_hello_handler)}.
 
--spec handle_call(port, gen_server:from(), #state{}) ->
-    {reply, inet:port_number(), #state{}}.
+-spec handle_call(port | info, gen_server:from(), #state{}) ->
+    {reply, term(), #state{}}.
 handle_call(port, _From, #state{port = Port} = State) ->
-    {reply, Port, State}.
+    {reply, Port, State};
+handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
+    #{
+        client_counter := ClientCounter,
+        requests_counter := RequestsCounter,
+        max_clients := MaxClients
+    } = ProtoOpts,
+    Reply = #{
+        active_clients => atomics:get(ClientCounter, 1),
+        max_clients => MaxClients,
+        requests_served => atomics:get(RequestsCounter, 1)
+    },
+    {reply, Reply, State}.
 
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
 handle_cast(_Msg, State) ->

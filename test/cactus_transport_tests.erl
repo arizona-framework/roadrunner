@@ -130,6 +130,7 @@ fake_proto_opts(Handler) ->
         max_keep_alive_request => 100,
         max_clients => 10,
         client_counter => atomics:new(1, [{signed, false}]),
+        requests_counter => atomics:new(1, [{signed, false}]),
         minimum_bytes_per_second => 0,
         body_buffering => auto
     }.

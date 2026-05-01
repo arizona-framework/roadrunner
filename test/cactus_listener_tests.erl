@@ -87,3 +87,48 @@ listener_honors_num_acceptors_opt_test() ->
     }),
     ?assert(cactus_listener:port(listener_test_pool) > 0),
     ok = cactus_listener:stop(listener_test_pool).
+
+%% =============================================================================
+%% info/1
+%% =============================================================================
+
+listener_info_initial_zero_test() ->
+    Name = listener_test_info_init,
+    {ok, _} = cactus_listener:start_link(Name, #{port => 0, max_clients => 42}),
+    Info = cactus_listener:info(Name),
+    ?assertEqual(0, maps:get(active_clients, Info)),
+    ?assertEqual(42, maps:get(max_clients, Info)),
+    ?assertEqual(0, maps:get(requests_served, Info)),
+    ok = cactus_listener:stop(Name).
+
+listener_info_counts_served_requests_test_() ->
+    {setup,
+        fun() ->
+            Name = listener_test_info_count,
+            {ok, _} = cactus_listener:start_link(Name, #{
+                port => 0, handler => cactus_hello_handler
+            }),
+            {Name, cactus_listener:port(Name)}
+        end,
+        fun({Name, _Port}) -> ok = cactus_listener:stop(Name) end, fun({Name, Port}) ->
+            {"requests_served increments after each request", fun() ->
+                send_request(Port),
+                send_request(Port),
+                send_request(Port),
+                ?assertEqual(3, maps:get(requests_served, cactus_listener:info(Name)))
+            end}
+        end}.
+
+send_request(Port) ->
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+    %% Drain to EOF so the conn process completes (and bumps the counter)
+    %% before we read it.
+    drain(Sock),
+    ok = gen_tcp:close(Sock).
+
+drain(Sock) ->
+    case gen_tcp:recv(Sock, 0, 1000) of
+        {ok, _} -> drain(Sock);
+        {error, _} -> ok
+    end.

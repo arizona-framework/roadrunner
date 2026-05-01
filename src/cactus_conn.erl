@@ -44,6 +44,7 @@ read it anyway.
     max_keep_alive_request := pos_integer(),
     max_clients := pos_integer(),
     client_counter := atomics:atomics_ref(),
+    requests_counter := atomics:atomics_ref(),
     minimum_bytes_per_second := non_neg_integer(),
     body_buffering := auto | manual
 }.
@@ -159,7 +160,8 @@ process_one(
         middlewares := ListenerMws,
         max_content_length := MaxCL,
         minimum_bytes_per_second := MinRate,
-        body_buffering := BodyBuffering
+        body_buffering := BodyBuffering,
+        requests_counter := ReqCounter
     },
     Timeout,
     Phase
@@ -168,6 +170,12 @@ process_one(
     Recv = make_recv(Socket, Deadline, MinRate),
     case parse_loop(<<>>, Recv) of
         {ok, Req0, Buffered} ->
+            %% Bump the listener's requests-served counter as soon as
+            %% headers parse — counts everything that reaches the
+            %% dispatch pipeline (including 404 from the router and
+            %% 413 from oversized bodies), excludes parse errors and
+            %% silent slow-client closes.
+            _ = atomics:add(ReqCounter, 1, 1),
             Req = Req0#{peer => Peer, scheme => Scheme},
             ok = maybe_send_continue(Socket, Req, Buffered),
             handle_with_body(
