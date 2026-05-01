@@ -18,7 +18,7 @@ connection crash doesn't take the pool down.
 
 -behaviour(gen_server).
 
--export([start_link/2, stop/1, port/1, info/1]).
+-export([start_link/2, stop/1, drain/2, port/1, info/1, status/1]).
 -export([init/1, handle_call/3, handle_cast/2, terminate/2]).
 
 -export_type([opts/0]).
@@ -48,9 +48,10 @@ connection crash doesn't take the pool down.
 }.
 
 -record(state, {
-    listen_socket :: cactus_transport:socket(),
+    listen_socket :: cactus_transport:socket() | closed,
     port :: inet:port_number(),
-    proto_opts :: cactus_conn:proto_opts()
+    proto_opts :: cactus_conn:proto_opts(),
+    phase = accepting :: accepting | draining | stopped
 }).
 
 -doc """
@@ -63,10 +64,31 @@ with `port/1`.
 start_link(Name, Opts) when is_atom(Name), is_map(Opts) ->
     gen_server:start_link({local, Name}, ?MODULE, Opts, []).
 
--doc "Stop a listener and release its port.".
+-doc "Stop a listener and release its port. In-flight conns are not waited on.".
 -spec stop(Name :: atom()) -> ok.
 stop(Name) ->
     gen_server:stop(Name).
+
+-doc """
+Graceful shutdown. Closes the listen socket immediately so no new
+connections are accepted, broadcasts `{cactus_drain, Deadline}` to
+every active conn (so `{loop, ...}` handlers can opt to honor it),
+and then polls the live-connection counter until it hits zero or
+`Timeout` milliseconds elapse. Conns still alive at the deadline are
+hard-killed via `exit(Pid, shutdown)`.
+
+Returns `{ok, drained}` when the counter reached zero before the
+deadline, or `{timeout, Remaining}` with the count that was still
+alive when the timeout fired (those processes are torn down before
+returning).
+
+After `drain/2` returns the listener exits — call `start_link/2`
+again to bring it back up.
+""".
+-spec drain(Name :: atom(), Timeout :: non_neg_integer()) ->
+    {ok, drained} | {timeout, non_neg_integer()}.
+drain(Name, Timeout) ->
+    gen_server:call(Name, {drain, Timeout}, Timeout + 5000).
 
 -doc "Return the actual TCP port the listener is bound to.".
 -spec port(Name :: atom()) -> inet:port_number().
@@ -94,6 +116,20 @@ Useful for ops dashboards / health endpoints.
     }.
 info(Name) ->
     gen_server:call(Name, info).
+
+-doc """
+Return the listener's lifecycle phase:
+
+- `accepting` — normal serving; new connections are being accepted.
+- `draining` — `drain/2` is in progress; the listen socket is
+  closed and active conns are finishing.
+
+After `drain/2` (or `stop/1`) returns the listener has exited and
+this call would fail with a `noproc`.
+""".
+-spec status(Name :: atom()) -> accepting | draining.
+status(Name) ->
+    gen_server:call(Name, status).
 
 %% --- gen_server callbacks ---
 
@@ -183,10 +219,15 @@ build_dispatch(#{routes := Routes}) ->
 build_dispatch(Opts) ->
     {handler, maps:get(handler, Opts, cactus_hello_handler)}.
 
--spec handle_call(port | info, gen_server:from(), #state{}) ->
-    {reply, term(), #state{}}.
+-spec handle_call(port | info | status | {drain, non_neg_integer()}, gen_server:from(), #state{}) ->
+    {reply, term(), #state{}} | {stop, normal, term(), #state{}}.
 handle_call(port, _From, #state{port = Port} = State) ->
     {reply, Port, State};
+handle_call(status, _From, #state{phase = Phase} = State) ->
+    {reply, Phase, State};
+handle_call({drain, Timeout}, _From, State) ->
+    {Reply, NewState} = do_drain(State, Timeout),
+    {stop, normal, Reply, NewState};
 handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
     #{
         client_counter := ClientCounter,
@@ -200,10 +241,64 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
     },
     {reply, Reply, State}.
 
+-spec do_drain(#state{}, non_neg_integer()) ->
+    {{ok, drained} | {timeout, non_neg_integer()}, #state{}}.
+do_drain(#state{listen_socket = LSocket, proto_opts = ProtoOpts} = State, Timeout) ->
+    %% Close listen socket — accept fails, acceptors exit cleanly.
+    ok = cactus_transport:close(LSocket),
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    Group = drain_group(ProtoOpts),
+    notify_conns(Group, Deadline),
+    DrainingState = State#state{listen_socket = closed, phase = draining},
+    Counter = maps:get(client_counter, ProtoOpts),
+    Reply = wait_for_drain(Counter, Deadline, Group),
+    {Reply, DrainingState#state{phase = stopped}}.
+
+%% Best-effort broadcast to in-flight conns. Loop / SSE / WebSocket
+%% handlers can pattern-match on `{cactus_drain, Deadline}` in
+%% `handle_info/3`; non-loop conns ignore the message and fall through
+%% to the mailbox check at the next keep-alive boundary.
+-spec notify_conns(term(), integer()) -> ok.
+notify_conns(Group, Deadline) ->
+    lists:foreach(
+        fun(Pid) -> Pid ! {cactus_drain, Deadline} end,
+        pg:get_members(Group)
+    ).
+
+%% Poll the active-clients atomics counter every 50ms (or whatever
+%% remains, if smaller) until it hits zero or the deadline expires.
+-spec wait_for_drain(atomics:atomics_ref(), integer(), term()) ->
+    {ok, drained} | {timeout, non_neg_integer()}.
+wait_for_drain(Counter, Deadline, Group) ->
+    case atomics:get(Counter, 1) of
+        0 ->
+            {ok, drained};
+        N ->
+            Remaining = Deadline - erlang:monotonic_time(millisecond),
+            case Remaining =< 0 of
+                true ->
+                    lists:foreach(
+                        fun(Pid) -> exit(Pid, shutdown) end,
+                        pg:get_members(Group)
+                    ),
+                    {timeout, N};
+                false ->
+                    timer:sleep(min(50, Remaining)),
+                    wait_for_drain(Counter, Deadline, Group)
+            end
+    end.
+
+-spec drain_group(cactus_conn:proto_opts()) -> {cactus_drain, atom()}.
+drain_group(#{listener_name := Name}) ->
+    {cactus_drain, Name}.
+
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
 -spec terminate(term(), #state{}) -> ok.
+terminate(_Reason, #state{listen_socket = closed}) ->
+    %% `drain/2` already closed the listen socket on its way out.
+    ok;
 terminate(_Reason, #state{listen_socket = LSocket}) ->
     cactus_transport:close(LSocket).

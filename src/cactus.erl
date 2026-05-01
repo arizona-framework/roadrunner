@@ -57,4 +57,8 @@ start-order. The cactus application must be running.
 """.
 -spec listeners() -> [atom()].
 listeners() ->
-    [Name || {Name, _Pid, _Type, _Mods} <- supervisor:which_children(cactus_sup)].
+    [
+        Name
+     || {Name, _Pid, _Type, Mods} <- supervisor:which_children(cactus_sup),
+        Mods =:= [cactus_listener]
+    ].

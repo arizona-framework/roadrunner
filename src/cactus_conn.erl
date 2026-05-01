@@ -84,6 +84,7 @@ start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
         %% transfer hasn't happened. `serve/2` refines once peername is
         %% known so `observer` shows `{cactus_conn, ListenerName, Peer}`.
         proc_lib:set_label({cactus_conn, ListenerName}),
+        join_drain_group(ListenerName),
         try
             receive
                 shoot -> serve(Socket, ProtoOpts)
@@ -93,6 +94,22 @@ start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
         end
     end),
     {ok, Pid}.
+
+%% Join the per-listener `pg` group so `cactus_listener:drain/2` can
+%% broadcast a `{cactus_drain, Deadline}` notification to every active
+%% conn. `pg` removes us automatically when this process exits. The
+%% `pg` scope is started by `cactus_sup`; in tests that drive
+%% `cactus_listener:start_link/2` directly without starting the
+%% application, the scope is absent and we silently skip the join —
+%% drain will simply not see those conns.
+-spec join_drain_group(atom()) -> ok.
+join_drain_group(undefined) ->
+    ok;
+join_drain_group(Name) ->
+    case whereis(pg) of
+        undefined -> ok;
+        _ -> pg:join({cactus_drain, Name}, self())
+    end.
 
 -doc """
 Try to bump the live-connection counter under `max_clients`. Returns
@@ -165,6 +182,19 @@ set_request_logger_metadata(#{
 serve_loop(_Socket, _Peer, _Scheme, #{max_keep_alive_request := Max}, Count) when Count >= Max ->
     ok;
 serve_loop(Socket, Peer, Scheme, ProtoOpts, Count) ->
+    case drain_pending() of
+        true ->
+            %% Listener is draining — finish the in-flight pipeline by
+            %% closing instead of looking for the next keep-alive request.
+            ok;
+        false ->
+            do_serve_loop(Socket, Peer, Scheme, ProtoOpts, Count)
+    end.
+
+-spec do_serve_loop(
+    cactus_transport:socket(), term(), http | https, proto_opts(), non_neg_integer()
+) -> ok.
+do_serve_loop(Socket, Peer, Scheme, ProtoOpts, Count) ->
     %% First request on a fresh connection: bounded by request_timeout, and
     %% a silent client gets a 408. Idle wait between keep-alive requests:
     %% bounded by keep_alive_timeout, and an idle client just gets the
@@ -177,6 +207,18 @@ serve_loop(Socket, Peer, Scheme, ProtoOpts, Count) ->
     case process_one(Socket, Peer, Scheme, ProtoOpts, Timeout, Phase) of
         keep_alive -> serve_loop(Socket, Peer, Scheme, ProtoOpts, Count + 1);
         close -> ok
+    end.
+
+%% Non-blocking mailbox peek for a `{cactus_drain, _}` broadcast from
+%% `cactus_listener:drain/2`. Checked between requests on a keep-alive
+%% conn so an in-flight request always finishes, but the next one is
+%% never started.
+-spec drain_pending() -> boolean().
+drain_pending() ->
+    receive
+        {cactus_drain, _Deadline} -> true
+    after 0 ->
+        false
     end.
 
 -spec process_one(

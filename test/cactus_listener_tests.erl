@@ -134,6 +134,197 @@ drain(Sock) ->
     end.
 
 %% =============================================================================
+%% Graceful shutdown via drain/2.
+%% =============================================================================
+
+drain_with_no_active_conns_returns_immediately_test_() ->
+    {setup,
+        fun() ->
+            ensure_pg_started(),
+            Name = listener_test_drain_idle,
+            {ok, _} = cactus_listener:start_link(Name, #{port => 0}),
+            Name
+        end,
+        %% drain/2 stops the listener — cleanup is a no-op assertion.
+        fun(_) -> ok end, fun(Name) ->
+            {"drain returns ok,drained immediately when no conns are alive", fun() ->
+                ?assertEqual({ok, drained}, cactus_listener:drain(Name, 1000)),
+                ?assertEqual(undefined, whereis(Name))
+            end}
+        end}.
+
+drain_waits_for_in_flight_loop_to_close_test_() ->
+    {setup,
+        fun() ->
+            ensure_pg_started(),
+            Name = listener_test_drain_loop,
+            {ok, _} = cactus_listener:start_link(Name, #{
+                port => 0,
+                routes => [{~"/loop", cactus_drain_handler, #{}}]
+            }),
+            {Name, cactus_listener:port(Name)}
+        end,
+        fun(_) -> ok end, fun({Name, Port}) ->
+            {"drain delivers cactus_drain msg; loop handler stops cleanly", fun() ->
+                %% Open a long-lived loop conn: send the request, then
+                %% leave the socket open so the conn is still alive.
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(Sock, ~"GET /loop HTTP/1.1\r\nHost: x\r\n\r\n"),
+                %% Wait for the loop to start (it sends a `started` chunk).
+                ok = wait_for_chunk(Sock, ~"started"),
+                %% Drain — handler receives {cactus_drain, _} and stops.
+                ?assertEqual({ok, drained}, cactus_listener:drain(Name, 2000)),
+                ?assertEqual(undefined, whereis(Name)),
+                gen_tcp:close(Sock)
+            end}
+        end}.
+
+drain_timeout_kills_unresponsive_conns_test_() ->
+    {setup,
+        fun() ->
+            ensure_pg_started(),
+            Name = listener_test_drain_kill,
+            {ok, _} = cactus_listener:start_link(Name, #{
+                port => 0,
+                routes => [{~"/sleep", cactus_drain_ignore_handler, #{}}]
+            }),
+            {Name, cactus_listener:port(Name)}
+        end,
+        fun(_) -> ok end, fun({Name, Port}) ->
+            {"drain timeout returns {timeout, N} and hard-kills remainders", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:send(
+                    Sock, ~"GET /sleep HTTP/1.1\r\nHost: x\r\n\r\n"
+                ),
+                ok = wait_for_chunk(Sock, ~"started"),
+                %% Handler ignores cactus_drain — drain must time out.
+                ?assertMatch({timeout, N} when N > 0, cactus_listener:drain(Name, 100)),
+                ?assertEqual(undefined, whereis(Name)),
+                gen_tcp:close(Sock)
+            end}
+        end}.
+
+drain_closes_keep_alive_conn_after_in_flight_request_test_() ->
+    {setup,
+        fun() ->
+            ensure_pg_started(),
+            Name = listener_test_drain_ka,
+            {ok, _} = cactus_listener:start_link(Name, #{
+                port => 0, handler => cactus_drain_pause_handler
+            }),
+            {Name, cactus_listener:port(Name)}
+        end,
+        fun(_) -> ok end, fun({Name, Port}) ->
+            {"keep-alive conn closes at next loop iteration when drain msg arrives", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                %% Send request 1; the handler sleeps 150ms before
+                %% responding. While it sleeps we kick drain in another
+                %% process, which sends {cactus_drain, _} to this conn.
+                %% Once the handler finishes, serve_loop sees the drain
+                %% message in its mailbox and closes without trying
+                %% to read a second keep-alive request.
+                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                Self = self(),
+                spawn_link(fun() ->
+                    Self ! {drain_result, cactus_listener:drain(Name, 2000)}
+                end),
+                Resp1 = recv_one_full_response(Sock),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Resp1),
+                %% drain returns ok,drained because the conn closes
+                %% itself via the drain-pending check.
+                receive
+                    {drain_result, Got} ->
+                        ?assertEqual({ok, drained}, Got)
+                after 3000 -> error(no_drain_result)
+                end,
+                gen_tcp:close(Sock)
+            end}
+        end}.
+
+recv_one_full_response(Sock) ->
+    recv_one_full_response(Sock, <<>>).
+
+recv_one_full_response(Sock, Acc) ->
+    case binary:split(Acc, ~"\r\n\r\n") of
+        [Head, Rest] ->
+            CL = parse_cl(Head),
+            case Rest of
+                <<Body:CL/binary, _/binary>> ->
+                    <<Head/binary, "\r\n\r\n", Body/binary>>;
+                _ ->
+                    recv_more_or_done(Sock, Acc)
+            end;
+        [_] ->
+            recv_more_or_done(Sock, Acc)
+    end.
+
+recv_more_or_done(Sock, Acc) ->
+    case gen_tcp:recv(Sock, 0, 2000) of
+        {ok, More} -> recv_one_full_response(Sock, <<Acc/binary, More/binary>>);
+        %% Socket closed — return whatever's buffered so the parent
+        %% match against `<<"HTTP/1.1 200 OK", _/binary>>` succeeds on
+        %% the prefix bytes that did arrive before the close.
+        {error, closed} -> Acc
+    end.
+
+parse_cl(Head) ->
+    {match, [Cl]} = re:run(
+        Head, ~"(?i)content-length:\\s*(\\d+)", [{capture, [1], binary}]
+    ),
+    binary_to_integer(Cl).
+
+status_returns_phase_test_() ->
+    {setup,
+        fun() ->
+            ensure_pg_started(),
+            Name = listener_test_status,
+            {ok, _} = cactus_listener:start_link(Name, #{port => 0}),
+            Name
+        end,
+        fun(Name) ->
+            case whereis(Name) of
+                undefined -> ok;
+                _ -> ok = cactus_listener:stop(Name)
+            end
+        end,
+        fun(Name) ->
+            {"status/1 returns accepting before drain", fun() ->
+                ?assertEqual(accepting, cactus_listener:status(Name))
+            end}
+        end}.
+
+ensure_pg_started() ->
+    case whereis(pg) of
+        undefined ->
+            {ok, _} = pg:start_link();
+        _ ->
+            ok
+    end.
+
+wait_for_chunk(Sock, Needle) ->
+    wait_for_chunk(Sock, Needle, <<>>, 20).
+
+wait_for_chunk(_Sock, _Needle, _Acc, 0) ->
+    error(needle_not_found);
+wait_for_chunk(Sock, Needle, Acc, Attempts) ->
+    case gen_tcp:recv(Sock, 0, 200) of
+        {ok, Data} ->
+            New = <<Acc/binary, Data/binary>>,
+            case binary:match(New, Needle) of
+                nomatch -> wait_for_chunk(Sock, Needle, New, Attempts - 1);
+                _ -> ok
+            end;
+        {error, _} ->
+            wait_for_chunk(Sock, Needle, Acc, Attempts - 1)
+    end.
+
+%% =============================================================================
 %% Per-request `logger` metadata + `cactus_req:request_id/1` correlation.
 %% =============================================================================
 
