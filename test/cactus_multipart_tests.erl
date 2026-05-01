@@ -45,6 +45,46 @@ boundary_missing_test() ->
     ).
 
 %% =============================================================================
+%% params/1 — generic header-parameter parser.
+%% =============================================================================
+
+params_form_data_with_name_and_filename_test() ->
+    ?assertEqual(
+        #{~"name" => ~"a", ~"filename" => ~"f.txt"},
+        cactus_multipart:params(
+            ~"form-data; name=\"a\"; filename=\"f.txt\""
+        )
+    ).
+
+params_content_type_with_charset_test() ->
+    ?assertEqual(
+        #{~"charset" => ~"utf-8"},
+        cactus_multipart:params(~"text/html; charset=utf-8")
+    ).
+
+params_no_params_returns_empty_map_test() ->
+    ?assertEqual(#{}, cactus_multipart:params(~"text/html")).
+
+params_lowercases_param_names_test() ->
+    %% Param names are case-insensitive per RFC 7231 §3.1.1.1.
+    ?assertEqual(
+        #{~"charset" => ~"UTF-8"},
+        cactus_multipart:params(~"text/html; CHARSET=UTF-8")
+    ).
+
+params_skips_malformed_pairs_test() ->
+    ?assertEqual(
+        #{~"name" => ~"a"},
+        cactus_multipart:params(~"form-data; junk; name=\"a\"")
+    ).
+
+params_trims_unquoted_value_whitespace_test() ->
+    ?assertEqual(
+        #{~"a" => ~"x"},
+        cactus_multipart:params(~"type; a= x ")
+    ).
+
+%% =============================================================================
 %% parse/2 — happy paths.
 %% =============================================================================
 

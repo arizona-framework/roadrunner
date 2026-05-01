@@ -51,7 +51,7 @@ listener's `max_content_length` (default 10 MB).
   `multipart/form-data`, so this is rarely needed.
 """.
 
--export([parse/2, boundary/1]).
+-export([parse/2, boundary/1, params/1]).
 -export_type([part/0]).
 
 -type part() :: #{
@@ -68,29 +68,59 @@ Returns `{error, no_boundary}` when the parameter isn't present.
 """.
 -spec boundary(binary()) -> {ok, binary()} | {error, no_boundary}.
 boundary(ContentType) when is_binary(ContentType) ->
-    case binary:match(ContentType, ~"boundary=") of
-        nomatch ->
-            {error, no_boundary};
-        {Pos, Len} ->
-            Tail = binary:part(
-                ContentType,
-                Pos + Len,
-                byte_size(ContentType) - Pos - Len
-            ),
-            {ok, extract_boundary(Tail)}
+    case maps:find(~"boundary", params(ContentType)) of
+        {ok, Boundary} -> {ok, Boundary};
+        error -> {error, no_boundary}
     end.
 
--spec extract_boundary(binary()) -> binary().
-extract_boundary(<<$", Rest/binary>>) ->
+-doc """
+Parse the parameters of a structured header value (e.g. `Content-Type`,
+`Content-Disposition`) into a map. The "type" prefix before the first
+`;` is discarded — only the `key=value` pairs after it are returned.
+
+Param names are lowercased per RFC 7231 §3.1.1.1 (case-insensitive
+parameter names); values are returned as-is, with surrounding quotes
+stripped.
+
+Examples:
+- `~"text/html; charset=utf-8"` → `#{~"charset" => ~"utf-8"}`
+- `~"form-data; name=\"a\"; filename=\"f.txt\""` →
+  `#{~"name" => ~"a", ~"filename" => ~"f.txt"}`
+- `~"text/html"` → `#{}`
+
+Malformed pairs (no `=`) are silently skipped.
+""".
+-spec params(binary()) -> #{binary() => binary()}.
+params(Value) when is_binary(Value) ->
+    Tail =
+        case binary:split(Value, ~";") of
+            [_Type] -> <<>>;
+            [_Type, Rest] -> Rest
+        end,
+    parse_pairs(binary:split(Tail, ~";", [global]), #{}).
+
+-spec parse_pairs([binary()], #{binary() => binary()}) -> #{binary() => binary()}.
+parse_pairs([], Acc) ->
+    Acc;
+parse_pairs([Pair | Rest], Acc) ->
+    case binary:split(string:trim(Pair), ~"=") of
+        [Key, Val] ->
+            %% Unquote first so internal whitespace inside quoted strings
+            %% is preserved; trim afterwards catches trailing whitespace
+            %% on bare (unquoted) values.
+            parse_pairs(Rest, Acc#{string:lowercase(Key) => string:trim(unquote(Val))});
+        _ ->
+            parse_pairs(Rest, Acc)
+    end.
+
+-spec unquote(binary()) -> binary().
+unquote(<<$", Rest/binary>>) ->
     case binary:match(Rest, ~"\"") of
         {End, _} -> binary:part(Rest, 0, End);
         nomatch -> Rest
     end;
-extract_boundary(Bin) ->
-    case binary:match(Bin, ~";") of
-        {End, _} -> binary:part(Bin, 0, End);
-        nomatch -> Bin
-    end.
+unquote(Bin) ->
+    Bin.
 
 -doc """
 Split `Body` into a list of multipart parts using `Boundary` as the
