@@ -181,6 +181,97 @@ fake_peername_returns_stub_test() ->
     ?assertEqual({ok, {{127, 0, 0, 1}, 0}}, cactus_transport:peername({fake, self()})).
 
 %% =============================================================================
+%% setopts/2 + messages/1 — active-mode foundation. Real gen_tcp / ssl
+%% paths are exercised via the listener integration tests; the fake-
+%% transport coverage and the static atom triples are unit-tested here.
+%% =============================================================================
+
+fake_setopts_forwards_to_owner_test() ->
+    Sock = {fake, self()},
+    ok = cactus_transport:setopts(Sock, [{active, once}]),
+    receive
+        {cactus_fake_setopts, ConnPid, Opts} ->
+            ?assertEqual(self(), ConnPid),
+            ?assertEqual([{active, once}], Opts)
+    after 1000 -> error(no_setopts_message)
+    end.
+
+setopts_on_real_gen_tcp_socket_test() ->
+    %% Loopback listen + connect so we have a real gen_tcp socket pair
+    %% to exercise the inet:setopts path. Validates the wrapper actually
+    %% reaches inet, not just that it compiles.
+    {ok, LSock} = gen_tcp:listen(0, [binary, {active, false}]),
+    {ok, Port} = inet:port(LSock),
+    {ok, Client} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}]),
+    {ok, Accepted} = gen_tcp:accept(LSock),
+    Sock = {gen_tcp, Accepted},
+    ?assertEqual(ok, cactus_transport:setopts(Sock, [{active, once}])),
+    %% Round-trip: send from client, recv as info event because we just
+    %% armed once-mode.
+    ok = gen_tcp:send(Client, ~"x"),
+    receive
+        {tcp, Accepted, ~"x"} -> ok
+    after 1000 -> error(no_active_data_event)
+    end,
+    ok = gen_tcp:close(Client),
+    ok = gen_tcp:close(Accepted),
+    ok = gen_tcp:close(LSock).
+
+messages_returns_per_transport_atom_triples_test() ->
+    ?assertEqual({tcp, tcp_closed, tcp_error}, cactus_transport:messages({gen_tcp, dummy})),
+    ?assertEqual({ssl, ssl_closed, ssl_error}, cactus_transport:messages({ssl, dummy})),
+    ?assertEqual(
+        {cactus_fake_data, cactus_fake_closed, cactus_fake_error},
+        cactus_transport:messages({fake, self()})
+    ).
+
+setopts_on_real_ssl_socket_test() ->
+    %% Drive the `ssl:setopts` branch through a real handshake so the
+    %% wrapper is exercised end-to-end, not just typechecked.
+    {ok, _} = application:ensure_all_started(ssl),
+    ServerOpts =
+        cactus_test_certs:server_opts() ++
+            [binary, {active, false}, {reuseaddr, true}],
+    {ok, LSock} = ssl:listen(0, ServerOpts),
+    {ok, {_, Port}} = ssl:sockname(LSock),
+    Self = self(),
+    Acceptor = spawn_link(fun() ->
+        {ok, Pre} = ssl:transport_accept(LSock),
+        {ok, ServerSock} = ssl:handshake(Pre),
+        %% Hand the server socket's controller over to the test process
+        %% so active-mode messages land in our mailbox.
+        ok = ssl:controlling_process(ServerSock, Self),
+        Self ! {server_sock, ServerSock},
+        receive
+            stop -> ssl:close(ServerSock)
+        end
+    end),
+    ClientOpts =
+        [{verify, verify_none} | cactus_test_certs:client_opts()] ++
+            [binary, {active, false}],
+    {ok, ClientSock} = ssl:connect({127, 0, 0, 1}, Port, ClientOpts, 5000),
+    ServerSock =
+        receive
+            {server_sock, S} -> S
+        after 5000 -> error(no_handshake)
+        end,
+    try
+        ?assertEqual(
+            ok,
+            cactus_transport:setopts({ssl, ServerSock}, [{active, once}])
+        ),
+        ok = ssl:send(ClientSock, ~"y"),
+        receive
+            {ssl, ServerSock, ~"y"} -> ok
+        after 1000 -> error(no_active_data_event)
+        end
+    after
+        Acceptor ! stop,
+        ssl:close(ClientSock),
+        ssl:close(LSock)
+    end.
+
+%% =============================================================================
 %% sendfile/4 — gen_tcp covered via cactus_static integration tests; the
 %% remaining variants (fake, ssl) and error branches need direct coverage.
 %% =============================================================================

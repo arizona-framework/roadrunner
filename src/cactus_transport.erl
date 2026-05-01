@@ -7,10 +7,21 @@ A socket is `{Module, RawSocket}` so callers don't have to know whether
 they're talking to plain TCP, TLS, or a test fixture.
 
 The `{fake, Pid}` variant is a per-connection test helper: every
-`send/2`, `recv/3`, and `close/1` call dispatches to `Pid` as an
-Erlang message, letting tests drive a `cactus_conn` byte-by-byte
-without spinning up a listener. See `cactus_transport_tests` for the
-message protocol.
+`send/2`, `recv/3`, `setopts/2`, and `close/1` call dispatches to
+`Pid` as an Erlang message, letting tests drive a `cactus_conn`
+byte-by-byte without spinning up a listener. See
+`cactus_transport_tests` for the message protocol.
+
+## Active-mode reads
+
+`setopts/2` + `messages/1` switch the underlying socket to active
+mode (`[{active, once}]` / `[{active, N}]`) so the controlling
+process receives data as `info` events instead of blocking in
+`recv/3`. This is what lets `gen_statem`'s `hibernate` action fire
+between events — passive recv holds the process inside a state
+callback indefinitely, so hibernation has no window to run. Active
+mode is the prerequisite for WebSocket / long-keep-alive memory
+optimization. See `messages/1` for the per-transport tag triples.
 
 ## TLS defaults
 
@@ -37,6 +48,8 @@ server-side stapling at the time of writing.
     peername/1,
     port/1,
     sendfile/4,
+    setopts/2,
+    messages/1,
     default_tls_opts/0,
     apply_tls_defaults/1
 ]).
@@ -252,6 +265,59 @@ sendfile_chunked_loop(SendFun, File, Remaining) ->
                 {error, _} = Err -> Err
             end
     end.
+
+-doc """
+Set socket options on the underlying transport.
+
+Used primarily to switch a socket to active mode
+(`[{active, once}]` / `[{active, N}]`) so the controlling process
+receives data as `info` events instead of blocking in `recv/3`. With
+active mode the gen_statem driving the conn returns to its main loop
+between events, which lets `gen_statem`'s `hibernate` action and
+`{hibernate_after, _}` start option actually fire — passive recv
+holds the process inside a state callback indefinitely, so neither
+hibernation primitive has a window to run.
+
+For `{fake, Pid}`: forwards `{cactus_fake_setopts, ConnPid, Opts}`
+to the sink so test scripts can react to the conn arming itself for
+the next read (e.g. by delivering `{cactus_fake_data, _, Bytes}`).
+""".
+-spec setopts(socket(), [gen_tcp:option()]) -> ok | {error, term()}.
+setopts({gen_tcp, S}, Opts) ->
+    inet:setopts(S, Opts);
+setopts({ssl, S}, Opts) ->
+    ssl:setopts(S, Opts);
+setopts({fake, Pid}, Opts) ->
+    Pid ! {cactus_fake_setopts, self(), Opts},
+    ok.
+
+-doc """
+Return the `{Data, Closed, Error}` atom triple identifying the
+active-mode message tags for this transport. Use this to
+pattern-match incoming events in a state callback after switching
+the socket to `[{active, once}]`:
+
+```erlang
+{Data, Closed, Error} = cactus_transport:messages(Socket),
+%% in handle_event/4:
+handle_event(info, Msg, State, Data0) ->
+    case Msg of
+        {Data, _Sock, Bytes}    -> ... ;   %% bytes arrived
+        {Closed, _Sock}         -> ... ;   %% peer closed
+        {Error, _Sock, _Reason} -> ...     %% transport error
+    end.
+```
+
+Tag conventions:
+
+- `{gen_tcp, _}` → `{tcp, tcp_closed, tcp_error}` (per `inet:tcp_messages/1`)
+- `{ssl, _}`    → `{ssl, ssl_closed, ssl_error}` (per `ssl:tcp_messages/1`)
+- `{fake, _}`   → `{cactus_fake_data, cactus_fake_closed, cactus_fake_error}`
+""".
+-spec messages(socket()) -> {atom(), atom(), atom()}.
+messages({gen_tcp, _}) -> {tcp, tcp_closed, tcp_error};
+messages({ssl, _}) -> {ssl, ssl_closed, ssl_error};
+messages({fake, _}) -> {cactus_fake_data, cactus_fake_closed, cactus_fake_error}.
 
 -doc """
 Hardened TLS server defaults — see the moduledoc.
