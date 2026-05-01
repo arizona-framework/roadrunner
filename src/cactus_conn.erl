@@ -198,7 +198,7 @@ process_one(
         minimum_bytes_per_second := MinRate,
         body_buffering := BodyBuffering,
         requests_counter := ReqCounter
-    },
+    } = ProtoOpts,
     Timeout,
     Phase
 ) ->
@@ -213,7 +213,12 @@ process_one(
             %% silent slow-client closes.
             _ = atomics:add(ReqCounter, 1, 1),
             RequestId = generate_request_id(),
-            Req = Req0#{peer => Peer, scheme => Scheme, request_id => RequestId},
+            Req = Req0#{
+                peer => Peer,
+                scheme => Scheme,
+                request_id => RequestId,
+                listener_name => maps:get(listener_name, ProtoOpts, undefined)
+            },
             ok = set_request_logger_metadata(Req),
             ok = maybe_send_continue(Socket, Req, Buffered),
             handle_with_body(
@@ -719,11 +724,19 @@ handle_and_send(Socket, Handler, Req, ListenerMws) ->
     RouteMws = route_middlewares(Req),
     HandlerFun = fun(R) -> Handler:handle(R) end,
     Pipeline = cactus_middleware:compose(ListenerMws ++ RouteMws, HandlerFun),
+    Metadata = telemetry_metadata(Req),
+    StartMono = cactus_telemetry:request_start(Metadata),
     try Pipeline(Req) of
         {Response, Req2} when is_map(Req2) ->
-            dispatch_response(Socket, Handler, Req2, Response)
+            Result = dispatch_response(Socket, Handler, Req2, Response),
+            ok = cactus_telemetry:request_stop(StartMono, Metadata, #{
+                status => response_status(Response),
+                response_kind => response_kind(Response)
+            }),
+            Result
     catch
         Class:Reason:Stack ->
+            ok = cactus_telemetry:request_exception(StartMono, Metadata, Class, Reason),
             logger:error(#{
                 msg => "cactus handler crashed",
                 handler => Handler,
@@ -734,6 +747,32 @@ handle_and_send(Socket, Handler, Req, ListenerMws) ->
             _ = send_internal_error(Socket),
             close
     end.
+
+-spec telemetry_metadata(cactus_http1:request()) -> cactus_telemetry:metadata().
+telemetry_metadata(Req) ->
+    #{
+        request_id => maps:get(request_id, Req),
+        peer => maps:get(peer, Req),
+        method => maps:get(method, Req),
+        path => maps:get(target, Req),
+        scheme => maps:get(scheme, Req),
+        listener_name => maps:get(listener_name, Req, undefined)
+    }.
+
+%% Order matters — `{websocket, _, _}` is a 3-tuple too, so the
+%% atom-tagged variants must precede the buffered catch-all.
+-spec response_status(cactus_handler:response()) -> cactus_http1:status().
+response_status({stream, Status, _, _}) -> Status;
+response_status({loop, Status, _, _}) -> Status;
+response_status({websocket, _, _}) -> 101;
+response_status({Status, _, _}) when is_integer(Status) -> Status.
+
+-spec response_kind(cactus_handler:response()) ->
+    buffered | stream | loop | websocket.
+response_kind({stream, _, _, _}) -> stream;
+response_kind({loop, _, _, _}) -> loop;
+response_kind({websocket, _, _}) -> websocket;
+response_kind({_, _, _}) -> buffered.
 
 -spec route_middlewares(cactus_http1:request()) -> cactus_middleware:middleware_list().
 route_middlewares(Req) ->

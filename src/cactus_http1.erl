@@ -62,7 +62,12 @@ response (`400`, `414`, `431`, etc.).
     %% headers parse. 16 lowercase hex chars (8 bytes of CSPRNG output).
     %% Mirrored into `logger:set_process_metadata/1` so any `?LOG_*` call
     %% from middleware or the handler picks it up automatically.
-    request_id => binary()
+    request_id => binary(),
+    %% Registered name of the owning `cactus_listener`. Set once per
+    %% conn from `proto_opts.listener_name`. Surfaced in
+    %% `cactus_telemetry` event metadata so subscribers can filter by
+    %% listener in multi-listener deployments.
+    listener_name => atom()
 }.
 
 -doc """

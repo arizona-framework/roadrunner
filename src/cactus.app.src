@@ -5,7 +5,9 @@
     {mod, {cactus_app, []}},
     {applications, [
         kernel,
-        stdlib
+        stdlib,
+        crypto,
+        telemetry
     ]},
     {env, []},
     {modules, []},
