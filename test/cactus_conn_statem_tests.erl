@@ -346,6 +346,89 @@ dispatching_request_start_and_stop_telemetry_fires_test() ->
     end.
 
 %% =============================================================================
+%% RFC framing edge cases — these regression-cover paths the line
+%% coverage gate doesn't reach by construction.
+%% =============================================================================
+
+content_length_zero_explicit_body_is_empty_test() ->
+    %% Explicit `Content-Length: 0` differs from no CL at all (the
+    %% latter is `framing => none`; this one is `{content_length, 0}`).
+    %% Handler must see an empty body and respond cleanly.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
+        {recv, ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"}
+    ]),
+    Opts = (fake_proto_opts(cl_zero))#{
+        dispatch := {handler, cactus_echo_body_handler}
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Sent),
+    %% Echo handler sets Content-Length from the buffered body.
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"content-length: 0")),
+    stop_sink(Sink).
+
+chunked_body_with_only_terminator_test() ->
+    %% Chunked body that's just the size-0 terminator — no data chunks.
+    %% Handler must see an empty body.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
+        {recv, ~"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"}
+    ]),
+    Opts = (fake_proto_opts(chunked_zero))#{
+        dispatch := {handler, cactus_echo_body_handler}
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Sent),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"content-length: 0")),
+    stop_sink(Sink).
+
+chunked_body_with_request_trailers_test() ->
+    %% RFC 7230 §4.4: trailers on chunked request body. The framework
+    %% must parse the trailer block off the wire (so the conn doesn't
+    %% mistake them for the next pipelined request) but the handler
+    %% only sees the decoded body.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Req =
+        ~"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTrailer: X-Probe\r\n\r\n5\r\nhello\r\n0\r\nX-Probe: ok\r\n\r\n",
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [{recv, Req}]),
+    Opts = (fake_proto_opts(chunked_trailers))#{
+        dispatch := {handler, cactus_echo_body_handler}
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Sent),
+    %% Body echoed = "hello" (5 bytes).
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"content-length: 5")),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"hello")),
+    stop_sink(Sink).
+
+%% =============================================================================
 %% Phase 6b — finishing + keep-alive + drain
 %% =============================================================================
 
