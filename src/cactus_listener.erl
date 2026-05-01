@@ -388,9 +388,17 @@ handle_info(
 ) ->
     %% pg is supervised by cactus_sup so it's always up when the
     %% reconciler runs (which only fires when explicitly opted into).
-    PgCount = length(pg:get_members({cactus_drain, Name})),
+    %%
+    %% We avoid `length/1` on the member list because `max_clients`
+    %% can be configured into the tens of thousands and a full O(N)
+    %% length walk would dominate the tick. We only need to know
+    %% whether `length(members) >= counter` (no orphans) or
+    %% `length(members) < counter` (orphans = counter - length); a
+    %% bounded count short-circuits at the counter so the worst case
+    %% is `min(length(members), counter)` element visits.
     Counter0 = atomics:get(Counter, 1),
-    NewDiff = max(0, Counter0 - PgCount),
+    PgCountBounded = count_up_to(pg:get_members({cactus_drain, Name}), Counter0),
+    NewDiff = Counter0 - PgCountBounded,
     %% Only release slots that have been orphaned for two consecutive
     %% ticks — filters out the spawn-time race where a fresh conn has
     %% incremented the counter but hasn't yet pg:join'd.
@@ -405,7 +413,7 @@ handle_info(
                 listener_name => Name,
                 released => N,
                 counter_was => Counter0,
-                pg_count => PgCount
+                pg_count_bounded => PgCountBounded
             })
     end,
     erlang:send_after(Interval, self(), reconcile_slots),
@@ -414,6 +422,19 @@ handle_info(
     }};
 handle_info(_Msg, State) ->
     {noreply, State}.
+
+%% Count list elements, short-circuiting at `Cap`. Used by the slot
+%% reconciler so the worst-case walk per tick is bounded by the
+%% `client_counter` (i.e. `max_clients`) rather than the absolute
+%% size of the pg member list.
+-spec count_up_to([term()], non_neg_integer()) -> non_neg_integer().
+count_up_to(List, Cap) ->
+    count_up_to(List, Cap, 0).
+
+-spec count_up_to([term()], non_neg_integer(), non_neg_integer()) -> non_neg_integer().
+count_up_to(_, Cap, N) when N >= Cap -> Cap;
+count_up_to([], _Cap, N) -> N;
+count_up_to([_ | T], Cap, N) -> count_up_to(T, Cap, N + 1).
 
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, #state{listen_socket = LSocket, proto_opts = ProtoOpts}) ->

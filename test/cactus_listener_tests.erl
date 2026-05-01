@@ -121,6 +121,46 @@ slot_reconciliation_releases_sustained_orphan_slots_test() ->
     ?assertEqual(0, atomics:get(Counter, 1)),
     ok = cactus_listener:stop(Name).
 
+slot_reconciliation_only_reaps_excess_over_pg_members_test() ->
+    %% Counter > pg members → only the diff is orphan; pg members
+    %% themselves represent live conns and must NOT be touched.
+    case whereis(pg) of
+        undefined -> {ok, _} = pg:start_link();
+        _ -> ok
+    end,
+    Name = listener_test_reap_partial,
+    {ok, ListenerPid} = cactus_listener:start_link(Name, #{
+        port => 0,
+        max_clients => 100,
+        slot_reconciliation => #{interval_ms => 30}
+    }),
+    State = sys:get_state(ListenerPid),
+    ProtoOpts = element(4, State),
+    Counter = maps:get(client_counter, ProtoOpts),
+    %% Plant 2 fake "live conn" pids in the drain group + bump
+    %% counter to 5. Diff = 5 - 2 = 3 orphans. After two ticks the
+    %% reaper should release 3, leaving counter at 2 (the live ones).
+    Stub1 = spawn(fun() ->
+        pg:join({cactus_drain, Name}, self()),
+        receive
+            stop -> ok
+        end
+    end),
+    Stub2 = spawn(fun() ->
+        pg:join({cactus_drain, Name}, self()),
+        receive
+            stop -> ok
+        end
+    end),
+    %% Wait briefly for both joins to register.
+    timer:sleep(20),
+    ok = atomics:add(Counter, 1, 5),
+    timer:sleep(200),
+    ?assertEqual(2, atomics:get(Counter, 1)),
+    Stub1 ! stop,
+    Stub2 ! stop,
+    ok = cactus_listener:stop(Name).
+
 slot_reconciliation_disabled_drops_reconcile_slots_message_test() ->
     %% A `reconcile_slots` arriving at a listener with reconciliation
     %% disabled (race after a hypothetical config change) is just
