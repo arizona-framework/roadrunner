@@ -132,3 +132,94 @@ drain(Sock) ->
         {ok, _} -> drain(Sock);
         {error, _} -> ok
     end.
+
+%% =============================================================================
+%% Per-request `logger` metadata + `cactus_req:request_id/1` correlation.
+%% =============================================================================
+
+logger_metadata_set_for_each_request_test_() ->
+    {setup,
+        fun() ->
+            Name = listener_test_logger_md,
+            {ok, _} = cactus_listener:start_link(Name, #{
+                port => 0, handler => cactus_logger_probe_handler
+            }),
+            {Name, cactus_listener:port(Name)}
+        end,
+        fun({Name, _Port}) -> ok = cactus_listener:stop(Name) end, fun({_Name, Port}) ->
+            [
+                {"handler sees request_id + logger metadata populated", fun() ->
+                    {Md, Id} = probe_one(Port),
+                    ?assertMatch(<<_:16/binary>>, Id),
+                    ?assert(is_hex_lowercase(Id)),
+                    ?assertEqual(Id, maps:get(request_id, Md)),
+                    ?assertEqual(~"GET", maps:get(method, Md)),
+                    ?assertEqual(~"/", maps:get(path, Md)),
+                    ?assertMatch({{127, 0, 0, 1}, _}, maps:get(peer, Md))
+                end},
+                {"keep-alive requests get distinct request_ids", fun() ->
+                    {ok, Sock} = gen_tcp:connect(
+                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                    ),
+                    Id1 = probe_via_sock(Sock),
+                    Id2 = probe_via_sock(Sock),
+                    ok = gen_tcp:close(Sock),
+                    ?assertNotEqual(Id1, Id2)
+                end}
+            ]
+        end}.
+
+probe_one(Port) ->
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+    Reply = drain_to_binary(Sock),
+    ok = gen_tcp:close(Sock),
+    Body = http_body(Reply),
+    Probe = binary_to_term(Body, [safe]),
+    {maps:get(logger_metadata, Probe), maps:get(request_id, Probe)}.
+
+probe_via_sock(Sock) ->
+    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+    Reply = drain_one_response(Sock),
+    Probe = binary_to_term(http_body(Reply), [safe]),
+    maps:get(request_id, Probe).
+
+drain_to_binary(Sock) -> drain_to_binary(Sock, <<>>).
+drain_to_binary(Sock, Acc) ->
+    case gen_tcp:recv(Sock, 0, 1000) of
+        {ok, Data} -> drain_to_binary(Sock, <<Acc/binary, Data/binary>>);
+        {error, _} -> Acc
+    end.
+
+%% Read until the body of one fixed-content-length response is buffered.
+drain_one_response(Sock) ->
+    drain_one_response(Sock, <<>>).
+drain_one_response(Sock, Acc) ->
+    case binary:split(Acc, ~"\r\n\r\n") of
+        [Head, Rest] ->
+            CL = parse_content_length(Head),
+            case Rest of
+                <<Body:CL/binary, _/binary>> -> <<Head/binary, "\r\n\r\n", Body/binary>>;
+                _ -> drain_one_response(Sock, recv_more(Sock, Acc))
+            end;
+        [_] ->
+            drain_one_response(Sock, recv_more(Sock, Acc))
+    end.
+
+recv_more(Sock, Acc) ->
+    {ok, Data} = gen_tcp:recv(Sock, 0, 1000),
+    <<Acc/binary, Data/binary>>.
+
+http_body(Reply) ->
+    [_Head, Body] = binary:split(Reply, ~"\r\n\r\n"),
+    Body.
+
+parse_content_length(Head) ->
+    {match, [Cl]} = re:run(Head, ~"(?i)content-length:\\s*(\\d+)", [{capture, [1], binary}]),
+    binary_to_integer(Cl).
+
+is_hex_lowercase(Bin) ->
+    lists:all(
+        fun(C) -> (C >= $0 andalso C =< $9) orelse (C >= $a andalso C =< $f) end,
+        binary_to_list(Bin)
+    ).

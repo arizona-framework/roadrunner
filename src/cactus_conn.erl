@@ -137,6 +137,28 @@ refine_conn_label(ProtoOpts, Peer) ->
     proc_lib:set_label({cactus_conn, ListenerName, Peer}),
     ok.
 
+%% 64 random bits in lowercase hex — collision-resistant for billions of
+%% requests, short enough to embed in log lines.
+-spec generate_request_id() -> binary().
+generate_request_id() ->
+    binary:encode_hex(crypto:strong_rand_bytes(8), lowercase).
+
+%% Replaces (not merges) the conn process's logger metadata so a
+%% keep-alive request never inherits the previous request's correlation.
+-spec set_request_logger_metadata(cactus_http1:request()) -> ok.
+set_request_logger_metadata(#{
+    request_id := RequestId,
+    method := Method,
+    target := Target,
+    peer := Peer
+}) ->
+    logger:set_process_metadata(#{
+        request_id => RequestId,
+        method => Method,
+        path => Target,
+        peer => Peer
+    }).
+
 -spec serve_loop(
     cactus_transport:socket(), term(), http | https, proto_opts(), non_neg_integer()
 ) -> ok.
@@ -190,7 +212,9 @@ process_one(
             %% 413 from oversized bodies), excludes parse errors and
             %% silent slow-client closes.
             _ = atomics:add(ReqCounter, 1, 1),
-            Req = Req0#{peer => Peer, scheme => Scheme},
+            RequestId = generate_request_id(),
+            Req = Req0#{peer => Peer, scheme => Scheme, request_id => RequestId},
+            ok = set_request_logger_metadata(Req),
             ok = maybe_send_continue(Socket, Req, Buffered),
             handle_with_body(
                 Socket, Req, Buffered, Recv, MaxCL, Dispatch, ListenerMws, BodyBuffering

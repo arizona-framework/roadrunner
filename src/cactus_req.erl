@@ -28,7 +28,8 @@ representation can evolve without breaking them.
     peer/1,
     forwarded_for/1,
     scheme/1,
-    route_opts/1
+    route_opts/1,
+    request_id/1
 ]).
 
 -doc "Return the request method (uppercase ASCII binary).".
@@ -432,3 +433,17 @@ router involved).
 -spec route_opts(cactus_http1:request()) -> term().
 route_opts(#{route_opts := O}) -> O;
 route_opts(_) -> undefined.
+
+-doc """
+Return the per-request correlation token attached by `cactus_conn`.
+
+16 lowercase hex chars (8 bytes of CSPRNG output), unique per request
+even on the same keep-alive connection. Mirrored into the conn
+process's `logger` metadata, so any `?LOG_*` call in middleware or
+the handler is automatically annotated with the same id.
+
+`undefined` for manually-constructed request maps used in tests.
+""".
+-spec request_id(cactus_http1:request()) -> binary() | undefined.
+request_id(#{request_id := Id}) -> Id;
+request_id(_) -> undefined.

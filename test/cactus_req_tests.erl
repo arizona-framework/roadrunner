@@ -425,6 +425,15 @@ route_opts_present_test() ->
 route_opts_absent_returns_undefined_test() ->
     ?assertEqual(undefined, cactus_req:route_opts(sample_req())).
 
+%% --- request_id/1 ---
+
+request_id_present_test() ->
+    Req = (sample_req())#{request_id => ~"abcdef0123456789"},
+    ?assertEqual(~"abcdef0123456789", cactus_req:request_id(Req)).
+
+request_id_absent_returns_undefined_test() ->
+    ?assertEqual(undefined, cactus_req:request_id(sample_req())).
+
 %% --- fixtures ---
 
 sample_req() ->

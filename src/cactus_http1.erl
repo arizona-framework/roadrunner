@@ -57,7 +57,12 @@ response (`400`, `414`, `431`, etc.).
     %% Body-read state attached by `cactus_conn` in `body_buffering => manual`
     %% mode. Threaded through `cactus_req:read_body/1,2`. Never present in
     %% `auto` mode or in manually-constructed request maps.
-    body_state => cactus_conn:body_state()
+    body_state => cactus_conn:body_state(),
+    %% Per-request correlation token attached by `cactus_conn` once the
+    %% headers parse. 16 lowercase hex chars (8 bytes of CSPRNG output).
+    %% Mirrored into `logger:set_process_metadata/1` so any `?LOG_*` call
+    %% from middleware or the handler picks it up automatically.
+    request_id => binary()
 }.
 
 -doc """
