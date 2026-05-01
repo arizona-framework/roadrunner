@@ -619,6 +619,44 @@ http10_default_close_test() ->
     ?assertEqual(1, count_200(Sent)),
     stop_sink(Sink).
 
+drain_mid_dispatching_stops_after_response_test() ->
+    %% Drain arrives **while the handler is running** in dispatching.
+    %% gen_statem can't process the info event mid-callback, so the
+    %% drain queues. After the handler returns, the conn must (a) still
+    %% deliver request 1's response, (b) honor the drain on the next
+    %% reading_request iteration via drain_peek, (c) NOT serve a second
+    %% pipelined request. This is exactly the race the drain_peek
+    %% workaround exists for.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(
+        Self,
+        Tag,
+        [
+            {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"},
+            %% A second request is queued; the drain must prevent it.
+            {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}
+        ]
+    ),
+    Opts = (fake_proto_opts(drain_mid_dispatch))#{
+        dispatch := {handler, cactus_drain_pause_handler}
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    %% drain_pause_handler sleeps 150ms; deliver the drain mid-handler.
+    timer:sleep(50),
+    Pid ! {cactus_drain, erlang:monotonic_time(millisecond) + 1000},
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    %% Request 1's 200 was served; request 2 was NOT — exactly one 200.
+    ?assertEqual(1, count_200(Sent)),
+    stop_sink(Sink).
+
 drain_mid_keep_alive_stops_test() ->
     %% Serve one request; drain message arrives before the next
     %% reading_request iteration; conn stops without serving request 2.
