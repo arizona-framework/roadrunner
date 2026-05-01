@@ -244,6 +244,60 @@ reading_request_slow_rate_violates_minrate_test() ->
     ?assertEqual(<<>>, Sent),
     stop_sink(Sink).
 
+hibernate_after_fires_during_keep_alive_idle_test() ->
+    %% With `hibernate_after` set on the listener, the conn statem
+    %% auto-hibernates when its main loop is idle — between requests
+    %% on a keep-alive conn this means heap shrinks to ~1KB until
+    %% the next request arrives. We don't actually deliver a second
+    %% request: after the first response is sent, the conn is back
+    %% in `reading_request` waiting for bytes. After
+    %% `hibernate_after` ms idle, the gen_statem hibernates.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    %% Sink delivers one full request and then sits silent — gives
+    %% the conn time to serve the request, loop back to
+    %% reading_request, and then hibernate while waiting for a
+    %% second request that never comes.
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
+        {recv, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}
+    ]),
+    Opts = (fake_proto_opts(hibernate_test))#{
+        request_timeout := 2000,
+        keep_alive_timeout := 2000,
+        dispatch := {handler, cactus_manual_keepalive_handler},
+        hibernate_after => 30
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Pid ! shoot,
+    %% Wait for the response to come back (= request 1 served, conn
+    %% looped back to reading_request).
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    ?assertEqual(1, count_200(Sent)),
+    %% After ~30ms idle the conn must be hibernated.
+    ?assert(is_hibernating(Pid, 200)),
+    ok = gen_statem:stop(Pid),
+    stop_sink(Sink).
+
+is_hibernating(Pid, TimeoutMs) ->
+    is_hibernating_loop(Pid, erlang:monotonic_time(millisecond) + TimeoutMs).
+
+is_hibernating_loop(Pid, Deadline) ->
+    case process_info(Pid, [status, total_heap_size, message_queue_len]) of
+        [{status, waiting}, {total_heap_size, H}, {message_queue_len, 0}] when
+            H =< 256
+        ->
+            true;
+        _ ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true ->
+                    false;
+                false ->
+                    timer:sleep(10),
+                    is_hibernating_loop(Pid, Deadline)
+            end
+    end.
+
 drain_pending_before_shoot_stops_at_first_parse_test() ->
     ensure_pg(),
     Sink = spawn_recv_sink([]),

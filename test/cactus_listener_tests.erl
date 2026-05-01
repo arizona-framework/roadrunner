@@ -182,6 +182,21 @@ slot_reconciliation_only_reaps_excess_over_pg_members_test() ->
     Stub2 ! stop,
     ok = cactus_listener:stop(Name).
 
+listener_threads_hibernate_after_into_proto_opts_test() ->
+    %% `hibernate_after` listener opt must thread into proto_opts so
+    %% `cactus_conn_statem:start/2` passes it as a `gen_statem:start/3`
+    %% start option. Verified by reaching into the listener state and
+    %% checking the proto_opts map.
+    Name = listener_test_hibernate_after,
+    {ok, ListenerPid} = cactus_listener:start_link(Name, #{
+        port => 0,
+        hibernate_after => 5000
+    }),
+    State = sys:get_state(ListenerPid),
+    ProtoOpts = element(4, State),
+    ?assertEqual(5000, maps:get(hibernate_after, ProtoOpts)),
+    ok = cactus_listener:stop(Name).
+
 slot_reconciliation_disabled_drops_reconcile_slots_message_test() ->
     %% A `reconcile_slots` arriving at a listener with reconciliation
     %% disabled (race after a hypothetical config change) is just

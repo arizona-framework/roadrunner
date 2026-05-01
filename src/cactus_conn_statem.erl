@@ -118,7 +118,16 @@ never propagates to the acceptor pool.
 -spec start(cactus_transport:socket(), cactus_conn:proto_opts()) ->
     {ok, pid()} | {error, term()}.
 start(Socket, ProtoOpts) ->
-    gen_statem:start(?MODULE, {Socket, ProtoOpts}, []).
+    gen_statem:start(?MODULE, {Socket, ProtoOpts}, start_opts(ProtoOpts)).
+
+-spec start_opts(cactus_conn:proto_opts()) -> [gen_statem:start_opt()].
+start_opts(ProtoOpts) ->
+    case maps:find(hibernate_after, ProtoOpts) of
+        {ok, Ms} when is_integer(Ms), Ms > 0 ->
+            [{hibernate_after, Ms}];
+        _ ->
+            []
+    end.
 
 -spec callback_mode() -> gen_statem:callback_mode_result().
 callback_mode() -> [handle_event_function, state_enter].

@@ -45,6 +45,14 @@ connection crash doesn't take the pool down.
     minimum_bytes_per_second => non_neg_integer(),
     body_buffering => auto | manual,
     slot_reconciliation => disabled | #{interval_ms := pos_integer()},
+    %% When set, the per-connection gen_statem auto-hibernates after
+    %% `Ms` milliseconds of idle main-loop time. Most useful for
+    %% long-lived keep-alive HTTP/1.1 connections that mostly sit
+    %% idle between requests — drops process heap to ~1KB during
+    %% the wait. Active-mode reads (the conn statem returns to its
+    %% main loop between events) are the prerequisite that makes
+    %% this fire at all.
+    hibernate_after => pos_integer(),
     tls => [ssl:tls_server_option()]
 }.
 
@@ -251,7 +259,7 @@ build_proto_opts(Opts, ListenerName) ->
     %% per op — cheap enough on the hot path.
     ClientCounter = atomics:new(1, [{signed, false}]),
     RequestsCounter = atomics:new(1, [{signed, false}]),
-    #{
+    Base = #{
         dispatch => build_dispatch(Opts, ListenerName),
         middlewares => maps:get(middlewares, Opts, []),
         max_content_length => maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
@@ -266,7 +274,17 @@ build_proto_opts(Opts, ListenerName) ->
             maps:get(minimum_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
         body_buffering => maps:get(body_buffering, Opts, auto),
         listener_name => ListenerName
-    }.
+    },
+    %% Optional `hibernate_after` — `cactus_conn_statem:start/2`
+    %% reads it from proto_opts and threads it into
+    %% `gen_statem:start/3`'s start options. Omitted by default
+    %% because hibernation has a per-wake CPU cost (~tens of microseconds
+    %% for the GC); only worth enabling for workloads with mostly-idle
+    %% keep-alive conns where the heap-shrink win dominates.
+    case maps:find(hibernate_after, Opts) of
+        {ok, Ms} when is_integer(Ms), Ms > 0 -> Base#{hibernate_after => Ms};
+        error -> Base
+    end.
 
 %% `routes` (router-based dispatch) takes precedence over `handler`. With
 %% neither, fall back to the default hello-world handler. Routes are
