@@ -8,8 +8,13 @@ small public surface, RFC-correct parsing, and modern OTP idioms throughout.
 
 ## Status
 
-POC — not yet deployed in production. 700+ tests, 100% line coverage,
-dialyzer-clean. See [`/.claude/plans/sorted-discovering-thimble.md`](./.claude/plans/sorted-discovering-thimble.md)
+POC — not yet deployed in production. 738 eunit + 15 CT property
+tests, 100% line coverage across 28 source modules, dialyzer-clean.
+The per-connection request lifecycle is a `gen_statem` with named
+states (`awaiting_shoot | reading_request | reading_body |
+dispatching | finishing`) so it shows up in `sys:get_state/1`,
+`sys:trace/2`, and observer's process inspector. See
+[`/.claude/plans/sorted-discovering-thimble.md`](./.claude/plans/sorted-discovering-thimble.md)
 for the rolling roadmap.
 
 ## Quickstart
@@ -103,7 +108,10 @@ hello, cactus!
 
 - `telemetry` events: `[cactus, request, start | stop | exception]`,
   `[cactus, response, send_failed]`, `[cactus, listener, accept |
-  conn_close]`, `[cactus, ws, upgrade | frame_in | frame_out]`.
+  conn_close]`, `[cactus, ws, upgrade | frame_in | frame_out]`,
+  `[cactus, drain, acknowledged]` (opt-in via
+  `cactus:acknowledge_drain/1` from a `{loop, ...}` / WebSocket
+  handler that pattern-matches `{cactus_drain, _}`).
 - Per-request `request_id` attached to `logger:set_process_metadata/1`
   so any `?LOG_*` call from middleware/handlers is auto-correlated.
 - `cactus_listener:info/1` for pull-side `active_clients` /
@@ -118,13 +126,21 @@ hello, cactus!
   in-flight conns via `pg`, polls `active_clients` until zero or
   deadline, then `exit(Pid, shutdown)` for stragglers.
 - `cactus_listener:status/1` — `accepting | draining`.
+- Optional `slot_reconciliation => #{interval_ms => N}` listener
+  opt — periodic reaper compares `client_counter` vs the conn pg
+  group and releases slots orphaned by `kill`-style exits (which
+  bypass `terminate/3`). Off by default; enable for chaos-tested
+  deployments.
 
 ### Property tests
 
-13 PropEr properties via OTP `ct_property_test`: `cactus_uri`
-percent round-trip + encode shape, `cactus_qs` round-trip, `cactus_cookie`
-adversarial robustness, `cactus_http1` 5 parsers never-crash + 3
-incremental-feed equivalence.
+15 PropEr properties via OTP `ct_property_test`: `cactus_uri`
+percent round-trip + encode shape, `cactus_qs` round-trip,
+`cactus_cookie` adversarial robustness, `cactus_http1` 5 parsers
+never-crash + 3 incremental-feed equivalence, plus
+`cactus_conn_statem` robustness over random recv/drain/stray inputs
+(clean exit + slot release) and request_id consistency between
+`request_start` / `request_stop` telemetry.
 
 ## Design philosophy
 
