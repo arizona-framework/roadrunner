@@ -180,6 +180,187 @@ fake_close_forwards_to_owner_test() ->
 fake_peername_returns_stub_test() ->
     ?assertEqual({ok, {{127, 0, 0, 1}, 0}}, cactus_transport:peername({fake, self()})).
 
+%% =============================================================================
+%% sendfile/4 — gen_tcp covered via cactus_static integration tests; the
+%% remaining variants (fake, ssl) and error branches need direct coverage.
+%% =============================================================================
+
+sendfile_via_fake_forwards_slice_test() ->
+    Path = tmp_path(?FUNCTION_NAME),
+    ok = file:write_file(Path, ~"abcdefghij"),
+    try
+        ok = cactus_transport:sendfile({fake, self()}, Path, 2, 5),
+        receive
+            {cactus_fake_send, From, Data} ->
+                ?assertEqual(self(), From),
+                ?assertEqual(~"cdefg", iolist_to_binary(Data))
+        after 1000 -> error(no_send_message)
+        end
+    after
+        file:delete(Path)
+    end.
+
+sendfile_missing_file_returns_error_test() ->
+    ?assertMatch(
+        {error, _},
+        cactus_transport:sendfile({fake, self()}, "/no/such/path/cactus_xx", 0, 1)
+    ).
+
+sendfile_via_ssl_streams_through_chunked_fallback_test() ->
+    %% TLS hides the kernel sendfile path, so cactus_transport falls
+    %% back to a positioned read + ssl:send loop. Drive a >64 KiB file
+    %% so the loop iterates more than once.
+    {ok, _} = application:ensure_all_started(ssl),
+    Path = tmp_path(?FUNCTION_NAME),
+    Payload = binary:copy(<<"x">>, 96 * 1024),
+    ok = file:write_file(Path, Payload),
+    try
+        ServerOpts =
+            cactus_test_certs:server_opts() ++
+                [binary, {active, false}, {reuseaddr, true}],
+        {ok, LSock} = ssl:listen(0, ServerOpts),
+        {ok, {_, Port}} = ssl:sockname(LSock),
+        Self = self(),
+        spawn_link(fun() ->
+            {ok, Pre} = ssl:transport_accept(LSock),
+            {ok, ServerSock} = ssl:handshake(Pre),
+            Got = read_all_ssl(ServerSock, <<>>),
+            Self ! {got, Got},
+            ssl:close(ServerSock)
+        end),
+        ClientOpts =
+            [{verify, verify_none} | cactus_test_certs:client_opts()] ++
+                [binary, {active, false}],
+        {ok, ClientSock} = ssl:connect({127, 0, 0, 1}, Port, ClientOpts, 5000),
+        try
+            ok = cactus_transport:sendfile(
+                {ssl, ClientSock}, Path, 0, byte_size(Payload)
+            )
+        after
+            ssl:close(ClientSock),
+            ssl:close(LSock)
+        end,
+        receive
+            {got, Received} -> ?assertEqual(Payload, Received)
+        after 5000 -> error(no_payload)
+        end
+    after
+        file:delete(Path)
+    end.
+
+sendfile_via_closed_gen_tcp_returns_error_test() ->
+    %% Covers the `{error, _}` branch of `do_sendfile/4` for gen_tcp:
+    %% file:sendfile/5 against a closed socket returns `{error, _}`.
+    Path = tmp_path(?FUNCTION_NAME),
+    ok = file:write_file(Path, ~"hello"),
+    try
+        {ok, LSock} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
+        {ok, Port} = inet:port(LSock),
+        spawn(fun() -> _ = gen_tcp:accept(LSock) end),
+        timer:sleep(50),
+        {ok, Sock} = gen_tcp:connect(
+            {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+        ),
+        ok = gen_tcp:close(Sock),
+        ?assertMatch({error, _}, cactus_transport:sendfile({gen_tcp, Sock}, Path, 0, 5)),
+        gen_tcp:close(LSock)
+    after
+        file:delete(Path)
+    end.
+
+sendfile_via_ssl_send_error_returns_error_test() ->
+    %% Covers the SendFun-error branch in `sendfile_chunked_loop`: the
+    %% client closes the SSL socket before `cactus_transport:sendfile`
+    %% runs, so `ssl:send` inside the loop returns `{error, closed}`.
+    {ok, _} = application:ensure_all_started(ssl),
+    Path = tmp_path(?FUNCTION_NAME),
+    ok = file:write_file(Path, binary:copy(<<"x">>, 96 * 1024)),
+    try
+        ServerOpts =
+            cactus_test_certs:server_opts() ++
+                [binary, {active, false}, {reuseaddr, true}],
+        {ok, LSock} = ssl:listen(0, ServerOpts),
+        {ok, {_, Port}} = ssl:sockname(LSock),
+        spawn_link(fun() ->
+            case ssl:transport_accept(LSock) of
+                {ok, Pre} ->
+                    case ssl:handshake(Pre) of
+                        {ok, ServerSock} -> ssl:close(ServerSock);
+                        _ -> ok
+                    end;
+                _ ->
+                    ok
+            end
+        end),
+        ClientOpts =
+            [{verify, verify_none} | cactus_test_certs:client_opts()] ++
+                [binary, {active, false}],
+        {ok, ClientSock} = ssl:connect({127, 0, 0, 1}, Port, ClientOpts, 5000),
+        ok = ssl:close(ClientSock),
+        ?assertMatch(
+            {error, _},
+            cactus_transport:sendfile({ssl, ClientSock}, Path, 0, 96 * 1024)
+        ),
+        ssl:close(LSock)
+    after
+        file:delete(Path)
+    end.
+
+sendfile_via_ssl_with_length_past_eof_stops_at_eof_test() ->
+    %% Covers the `eof` branch in `sendfile_chunked_loop`: caller asks
+    %% for more bytes than the file holds, so the loop reads what's
+    %% available and stops.
+    {ok, _} = application:ensure_all_started(ssl),
+    Path = tmp_path(?FUNCTION_NAME),
+    Payload = ~"only-three-and-some-bytes",
+    ok = file:write_file(Path, Payload),
+    try
+        ServerOpts =
+            cactus_test_certs:server_opts() ++
+                [binary, {active, false}, {reuseaddr, true}],
+        {ok, LSock} = ssl:listen(0, ServerOpts),
+        {ok, {_, Port}} = ssl:sockname(LSock),
+        Self = self(),
+        spawn_link(fun() ->
+            {ok, Pre} = ssl:transport_accept(LSock),
+            {ok, ServerSock} = ssl:handshake(Pre),
+            Got = read_all_ssl(ServerSock, <<>>),
+            Self ! {got, Got},
+            ssl:close(ServerSock)
+        end),
+        ClientOpts =
+            [{verify, verify_none} | cactus_test_certs:client_opts()] ++
+                [binary, {active, false}],
+        {ok, ClientSock} = ssl:connect({127, 0, 0, 1}, Port, ClientOpts, 5000),
+        try
+            ok = cactus_transport:sendfile(
+                {ssl, ClientSock}, Path, 0, byte_size(Payload) + 1024
+            )
+        after
+            ssl:close(ClientSock),
+            ssl:close(LSock)
+        end,
+        receive
+            {got, Received} -> ?assertEqual(Payload, Received)
+        after 5000 -> error(no_payload)
+        end
+    after
+        file:delete(Path)
+    end.
+
+tmp_path(Suffix) ->
+    filename:join(
+        "/tmp",
+        "cactus_sendfile_test_" ++ atom_to_list(Suffix) ++ "_" ++
+            integer_to_list(erlang:unique_integer([positive]))
+    ).
+
+read_all_ssl(Sock, Acc) ->
+    case ssl:recv(Sock, 0, 2000) of
+        {ok, Data} -> read_all_ssl(Sock, <<Acc/binary, Data/binary>>);
+        {error, _} -> Acc
+    end.
+
 fake_controlling_process_is_noop_test() ->
     ?assertEqual(ok, cactus_transport:controlling_process({fake, self()}, self())).
 

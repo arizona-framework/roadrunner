@@ -764,13 +764,15 @@ telemetry_metadata(Req) ->
 -spec response_status(cactus_handler:response()) -> cactus_http1:status().
 response_status({stream, Status, _, _}) -> Status;
 response_status({loop, Status, _, _}) -> Status;
+response_status({sendfile, Status, _, _}) -> Status;
 response_status({websocket, _, _}) -> 101;
 response_status({Status, _, _}) when is_integer(Status) -> Status.
 
 -spec response_kind(cactus_handler:response()) ->
-    buffered | stream | loop | websocket.
+    buffered | stream | loop | sendfile | websocket.
 response_kind({stream, _, _, _}) -> stream;
 response_kind({loop, _, _, _}) -> loop;
+response_kind({sendfile, _, _, _}) -> sendfile;
 response_kind({websocket, _, _}) -> websocket;
 response_kind({_, _, _}) -> buffered.
 
@@ -800,16 +802,55 @@ dispatch_response(Socket, Handler, _Req, {loop, Status, Headers, LoopState}) whe
 ->
     _ = loop_response(Socket, Status, Headers, Handler, LoopState),
     close;
+dispatch_response(
+    Socket, _Handler, Req, {sendfile, Status, Headers, {Filename, Offset, Length}}
+) when
+    is_integer(Status)
+->
+    sendfile_response(Socket, Req, Status, Headers, Filename, Offset, Length);
 dispatch_response(Socket, _Handler, Req, {Status, Headers, Body}) when is_integer(Status) ->
     RespBody = response_body_for(Req, Body),
     Resp = cactus_http1:response(Status, Headers, RespBody),
     _ = cactus_telemetry:response_send(
         cactus_transport:send(Socket, Resp), buffered_response
     ),
-    %% Drain whatever the handler left on the socket so the next request
-    %% lands cleanly. In auto mode there's nothing to drain (no
-    %% body_state); in manual mode the conn consumes any unread body.
-    %% Drain failure (closed peer, malformed body, etc.) → close.
+    finish_response(Req, Headers).
+
+-spec sendfile_response(
+    cactus_transport:socket(),
+    cactus_http1:request(),
+    cactus_http1:status(),
+    cactus_http1:headers(),
+    file:filename_all(),
+    non_neg_integer(),
+    non_neg_integer()
+) -> keep_alive | close.
+sendfile_response(Socket, Req, Status, Headers, Filename, Offset, Length) ->
+    Head = cactus_http1:response(Status, Headers, ~""),
+    _ = cactus_telemetry:response_send(
+        cactus_transport:send(Socket, Head), sendfile_response_head
+    ),
+    %% RFC 9110 §9.3.2: HEAD must not include a message body. The
+    %% headers (including Content-Length) match what GET would have
+    %% sent, so framing is preserved.
+    _ =
+        case cactus_req:method(Req) of
+            ~"HEAD" ->
+                ok;
+            _ ->
+                cactus_telemetry:response_send(
+                    cactus_transport:sendfile(Socket, Filename, Offset, Length),
+                    sendfile_body
+                )
+        end,
+    finish_response(Req, Headers).
+
+%% Drain whatever the handler left on the socket so the next request
+%% lands cleanly. In auto mode there's nothing to drain (no
+%% body_state); in manual mode the conn consumes any unread body.
+%% Drain failure (closed peer, malformed body, etc.) → close.
+-spec finish_response(cactus_http1:request(), cactus_http1:headers()) -> keep_alive | close.
+finish_response(Req, Headers) ->
     case drain_body(Req) of
         ok -> keep_alive_decision(Req, Headers);
         {error, _} -> close

@@ -266,6 +266,13 @@ static_test_() ->
                 ),
                 ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply),
                 {match, _} = re:run(Reply, ~"content-range: bytes 0-13/14", [caseless])
+            end},
+            {"HEAD returns headers only — no body bytes follow", fun() ->
+                Reply = http_request(Port, ~"HEAD", ~"/static/hello.html", []),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-length: 14", [caseless]),
+                [_Head, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(<<>>, Body)
             end}
         ]
     end}.
@@ -296,6 +303,9 @@ http_get(Port, Path) ->
     http_get_with(Port, Path, []).
 
 http_get_with(Port, Path, ExtraHeaders) ->
+    http_request(Port, ~"GET", Path, ExtraHeaders).
+
+http_request(Port, Method, Path, ExtraHeaders) ->
     {ok, Sock} = gen_tcp:connect(
         {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
     ),
@@ -304,7 +314,8 @@ http_get_with(Port, Path, ExtraHeaders) ->
      || {Name, Value} <- ExtraHeaders
     ],
     Req = iolist_to_binary([
-        ~"GET ",
+        Method,
+        ~" ",
         Path,
         ~" HTTP/1.1\r\nHost: x\r\nConnection: close\r\n",
         Headers,

@@ -36,6 +36,7 @@ server-side stapling at the time of writing.
     close/1,
     peername/1,
     port/1,
+    sendfile/4,
     default_tls_opts/0,
     apply_tls_defaults/1
 ]).
@@ -174,6 +175,82 @@ port({ssl, S}) ->
     case ssl:sockname(S) of
         {ok, {_Addr, Port}} -> {ok, Port};
         {error, _} = Err -> Err
+    end.
+
+-doc """
+Send `Length` bytes of `Filename` starting at `Offset` over the
+socket.
+
+For `{gen_tcp, _}`: dispatches `file:sendfile/5` for kernel-space
+zero-copy on Linux/BSD/macOS. For `{ssl, _}`: TLS hides the
+plaintext from the kernel sendfile path, so we fall back to a
+chunked read+send loop (64 KiB per chunk). For `{fake, _}`:
+reads the slice and forwards it as a single `cactus_fake_send`
+message so unit tests see one bytes payload.
+""".
+-spec sendfile(socket(), file:filename_all(), non_neg_integer(), non_neg_integer()) ->
+    ok | {error, term()}.
+sendfile(Sock, Filename, Offset, Length) ->
+    case file:open(Filename, [read, raw, binary]) of
+        {ok, File} ->
+            try
+                do_sendfile(Sock, File, Offset, Length)
+            after
+                ok = file:close(File)
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+-spec do_sendfile(
+    socket(), file:io_device(), non_neg_integer(), non_neg_integer()
+) -> ok | {error, term()}.
+do_sendfile({gen_tcp, S}, File, Offset, Length) ->
+    case file:sendfile(File, S, Offset, Length, []) of
+        {ok, _} -> ok;
+        {error, _} = Err -> Err
+    end;
+do_sendfile({ssl, S}, File, Offset, Length) ->
+    sendfile_chunked(fun(Data) -> ssl:send(S, Data) end, File, Offset, Length);
+do_sendfile({fake, Pid}, File, Offset, Length) ->
+    {ok, Bytes} = file:pread(File, Offset, Length),
+    Pid ! {cactus_fake_send, self(), Bytes},
+    ok.
+
+%% TLS fallback: positioned read + ssl:send in 64 KiB chunks. The file
+%% is freshly opened with `[read, raw, binary]` so positioning and
+%% reading are infallible — read errors and position errors here would
+%% be programmer error, not a runtime case.
+-spec sendfile_chunked(
+    fun((iodata()) -> ok | {error, term()}),
+    file:io_device(),
+    non_neg_integer(),
+    non_neg_integer()
+) -> ok | {error, term()}.
+sendfile_chunked(SendFun, File, Offset, Length) ->
+    {ok, _} = file:position(File, {bof, Offset}),
+    sendfile_chunked_loop(SendFun, File, Length).
+
+-spec sendfile_chunked_loop(
+    fun((iodata()) -> ok | {error, term()}),
+    file:io_device(),
+    non_neg_integer()
+) -> ok | {error, term()}.
+sendfile_chunked_loop(_SendFun, _File, 0) ->
+    ok;
+sendfile_chunked_loop(SendFun, File, Remaining) ->
+    Chunk = min(Remaining, 65536),
+    case file:read(File, Chunk) of
+        eof ->
+            %% Length exceeds file size — caller asked for more bytes
+            %% than the file holds. Stop here; the truncated body is
+            %% on the wire already.
+            ok;
+        {ok, Data} ->
+            case SendFun(Data) of
+                ok -> sendfile_chunked_loop(SendFun, File, Remaining - byte_size(Data));
+                {error, _} = Err -> Err
+            end
     end.
 
 -doc """

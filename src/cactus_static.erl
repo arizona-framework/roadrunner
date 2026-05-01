@@ -47,7 +47,7 @@ handle(Req) ->
         end,
     {Resp, Req}.
 
--spec serve_file(file:filename_all(), cactus_http1:request()) -> cactus_resp:response().
+-spec serve_file(file:filename_all(), cactus_http1:request()) -> cactus_handler:response().
 serve_file(FilePath, Req) ->
     case file:read_file_info(FilePath, [{time, posix}]) of
         {ok, #file_info{type = regular, size = Size, mtime = Mtime}} ->
@@ -97,7 +97,7 @@ if_modified_since_satisfied(Req, Mtime) ->
     binary(),
     binary(),
     cactus_http1:request()
-) -> cactus_resp:response().
+) -> cactus_handler:response().
 serve_with_range(FilePath, Size, ETag, LastMod, Req) ->
     case parse_range(cactus_req:header(~"range", Req), Size) of
         {range, Start, End} ->
@@ -105,25 +105,24 @@ serve_with_range(FilePath, Size, ETag, LastMod, Req) ->
         unsatisfiable ->
             range_not_satisfiable(Size, ETag, LastMod);
         none ->
-            serve_full_file(FilePath, ETag, LastMod)
+            serve_full_file(FilePath, Size, ETag, LastMod)
     end.
 
-%% read_file_info already established the file exists and is regular;
-%% if read_file then fails (race with deletion, permission flip, etc.)
-%% the exception bubbles up to the conn's standard handler-crash path
-%% and the client sees a 500. That's a strictly rarer case than
-%% 404-on-missing-file which is handled in `serve_file/2` above.
--spec serve_full_file(file:filename_all(), binary(), binary()) -> cactus_resp:response().
-serve_full_file(FilePath, ETag, LastMod) ->
-    {ok, Bytes} = file:read_file(FilePath),
-    {200,
+%% Returns a `{sendfile, ...}` response so the conn dispatches
+%% `file:sendfile/5` (TCP) or a chunked read+send fallback (TLS) — the
+%% file body is never copied through the Erlang heap.
+-spec serve_full_file(
+    file:filename_all(), non_neg_integer(), binary(), binary()
+) -> cactus_handler:response().
+serve_full_file(FilePath, Size, ETag, LastMod) ->
+    {sendfile, 200,
         [
             {~"content-type", content_type_for(FilePath)},
-            {~"content-length", integer_to_binary(byte_size(Bytes))},
+            {~"content-length", integer_to_binary(Size)},
             {~"etag", ETag},
             {~"last-modified", LastMod}
         ],
-        Bytes}.
+        {FilePath, 0, Size}}.
 
 -spec content_type_for(file:filename_all()) -> binary().
 content_type_for(FilePath) ->
@@ -218,34 +217,28 @@ bin_to_pos_int(Bin) ->
     binary(),
     non_neg_integer(),
     non_neg_integer()
-) -> cactus_resp:response().
+) -> cactus_handler:response().
 serve_range(FilePath, Size, ETag, LastMod, Start, End) ->
     Length = End - Start + 1,
-    {ok, IoDevice} = file:open(FilePath, [read, binary, raw]),
-    try
-        {ok, Bytes} = file:pread(IoDevice, Start, Length),
-        ContentRange = iolist_to_binary([
-            ~"bytes ",
-            integer_to_binary(Start),
-            $-,
-            integer_to_binary(End),
-            $/,
-            integer_to_binary(Size)
-        ]),
-        {206,
-            [
-                {~"content-type", content_type_for(FilePath)},
-                {~"content-length", integer_to_binary(byte_size(Bytes))},
-                {~"content-range", ContentRange},
-                {~"etag", ETag},
-                {~"last-modified", LastMod}
-            ],
-            Bytes}
-    after
-        ok = file:close(IoDevice)
-    end.
+    ContentRange = iolist_to_binary([
+        ~"bytes ",
+        integer_to_binary(Start),
+        $-,
+        integer_to_binary(End),
+        $/,
+        integer_to_binary(Size)
+    ]),
+    {sendfile, 206,
+        [
+            {~"content-type", content_type_for(FilePath)},
+            {~"content-length", integer_to_binary(Length)},
+            {~"content-range", ContentRange},
+            {~"etag", ETag},
+            {~"last-modified", LastMod}
+        ],
+        {FilePath, Start, Length}}.
 
--spec range_not_satisfiable(non_neg_integer(), binary(), binary()) -> cactus_resp:response().
+-spec range_not_satisfiable(non_neg_integer(), binary(), binary()) -> cactus_handler:response().
 range_not_satisfiable(Size, ETag, LastMod) ->
     %% RFC 7233 §4.4: 416 SHOULD include Content-Range with the total
     %% size so clients can recover.

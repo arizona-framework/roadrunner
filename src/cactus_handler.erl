@@ -22,6 +22,14 @@ threading `Req` through the entire request lifecycle.
   terminator followed by the given trailer headers (RFC 7230 §4.1.2).
   Trailer names should be advertised in the response's `Trailer`
   header.
+- `{sendfile, StatusCode, Headers, {Filename, Offset, Length}}` —
+  zero-copy file body. The connection emits status + headers
+  verbatim (the handler is responsible for `Content-Length` and
+  `Content-Type`), then dispatches `file:sendfile/5` for plain TCP
+  (kernel-space copy) or a chunked read+send loop for TLS (where
+  the kernel sendfile path can't see plaintext). Used by
+  `cactus_static` so large assets don't get copied through the
+  Erlang heap.
 - `{loop, StatusCode, Headers, State}` — message-driven streaming.
   The connection emits status + headers, then enters a receive loop
   in the conn process. Each Erlang message is dispatched through the
@@ -44,16 +52,22 @@ handle(Req) ->
 ```
 """.
 
--export_type([send_fun/0, stream_fun/0, push_fun/0, response/0, result/0]).
+-export_type([send_fun/0, stream_fun/0, push_fun/0, sendfile_spec/0, response/0, result/0]).
 
 -type send_fun() ::
     fun((iodata(), nofin | fin | {fin, cactus_http1:headers()}) -> ok | {error, term()}).
 -type stream_fun() :: fun((send_fun()) -> any()).
 -type push_fun() :: fun((iodata()) -> ok | {error, term()}).
+-type sendfile_spec() :: {
+    Filename :: file:filename_all(),
+    Offset :: non_neg_integer(),
+    Length :: non_neg_integer()
+}.
 -type response() ::
     {StatusCode :: cactus_http1:status(), cactus_http1:headers(), Body :: iodata()}
     | {stream, StatusCode :: cactus_http1:status(), cactus_http1:headers(), stream_fun()}
     | {loop, StatusCode :: cactus_http1:status(), cactus_http1:headers(), State :: term()}
+    | {sendfile, StatusCode :: cactus_http1:status(), cactus_http1:headers(), sendfile_spec()}
     | {websocket, Module :: module(), State :: term()}.
 -type result() :: {response(), cactus_http1:request()}.
 
