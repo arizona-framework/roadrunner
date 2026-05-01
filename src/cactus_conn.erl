@@ -876,7 +876,7 @@ dispatch_response(Socket, _Handler, _Req, {stream, Status, Headers, Fun}) when
 dispatch_response(Socket, Handler, _Req, {loop, Status, Headers, LoopState}) when
     is_integer(Status)
 ->
-    _ = loop_response(Socket, Status, Headers, Handler, LoopState),
+    _ = cactus_loop_response:run(Socket, Status, Headers, Handler, LoopState),
     close;
 dispatch_response(
     Socket, _Handler, Req, {sendfile, Status, Headers, {Filename, Offset, Length}}
@@ -1036,54 +1036,6 @@ encode_trailers(Trailers) ->
         end
      || {Name, Value} <- Trailers
     ].
-
-%% Emit status + chunked headers, then receive Erlang messages and
-%% dispatch each through `Handler:handle_info/3`. Each call gets a
-%% `Push(Data)` fun that frames `Data` as one chunk and writes it.
-%% On `{stop, _}` we emit the size-0 terminator and return.
--spec loop_response(
-    cactus_transport:socket(),
-    cactus_http1:status(),
-    cactus_http1:headers(),
-    module(),
-    term()
-) -> ok.
-loop_response(Socket, Status, UserHeaders, Handler, State) ->
-    Headers = [{~"transfer-encoding", ~"chunked"} | UserHeaders],
-    Head = cactus_http1:response(Status, Headers, ~""),
-    _ = cactus_telemetry:response_send(
-        cactus_transport:send(Socket, Head), loop_response_head
-    ),
-    Push = fun(Data) ->
-        %% Same special-case as `stream_frame/2`: zero-length data
-        %% would encode as `0\r\n\r\n` — the chunked terminator —
-        %% which would end the response mid-loop. Skip empty pushes.
-        case iolist_size(Data) of
-            0 ->
-                ok;
-            N ->
-                cactus_transport:send(Socket, [
-                    integer_to_binary(N, 16),
-                    ~"\r\n",
-                    Data,
-                    ~"\r\n"
-                ])
-        end
-    end,
-    info_loop(Socket, Handler, Push, State).
-
--spec info_loop(cactus_transport:socket(), module(), cactus_handler:push_fun(), term()) -> ok.
-info_loop(Socket, Handler, Push, State) ->
-    receive
-        Info ->
-            case Handler:handle_info(Info, Push, State) of
-                {ok, NewState} ->
-                    info_loop(Socket, Handler, Push, NewState);
-                {stop, _NewState} ->
-                    _ = cactus_transport:send(Socket, ~"0\r\n\r\n"),
-                    ok
-            end
-    end.
 
 -spec send_bad_request(cactus_transport:socket()) -> ok | {error, term()}.
 send_bad_request(Socket) ->
