@@ -130,6 +130,28 @@ cli() ->
                 type => string,
                 default => ?DEFAULT_HOST,
                 help => "Loopback host the loadgen targets."
+            },
+            #{
+                name => profile,
+                long => "-profile",
+                type => boolean,
+                default => false,
+                help =>
+                    """
+                    Arm `eprof` inside each server's peer BEAM before driving
+                    load, then dump the hotspot table after the measured
+                    phase. Useful with `--servers <name>` to profile a
+                    single server in isolation. Throughput numbers under
+                    --profile are NOT comparable to a normal run; use it
+                    only to identify MFAs worth optimizing.
+                    """
+            },
+            #{
+                name => profile_min_ms,
+                long => "-profile-min-ms",
+                type => float,
+                default => 1.0,
+                help => "Minimum total ms for a row to appear in the hotspot table."
             }
         ]
     }.
@@ -189,13 +211,35 @@ run_side(Side, Opts) ->
     {Peer, Port} = start_server(Side, maps:get(scenario, Opts)),
     try
         run_warmup(Port, Opts),
+        ok = maybe_start_profile(Peer, Opts),
         Result = run_measured(Port, Opts),
+        ok = maybe_stop_profile(Peer, Side, Opts),
         Row = result_to_row(Side, Result),
         io:format("  ~s~n", [fmt_row(Row)]),
         {[Row], Result}
     after
         peer:stop(Peer)
     end.
+
+maybe_start_profile(_Peer, #{profile := false}) ->
+    ok;
+maybe_start_profile(Peer, #{profile := true}) ->
+    ok = peer:call(Peer, roadrunner_bench_profiler, start, []).
+
+maybe_stop_profile(_Peer, _Side, #{profile := false}) ->
+    ok;
+maybe_stop_profile(Peer, Side, #{profile := true, profile_min_ms := MinMs}) ->
+    Path = filename:join(["/tmp", "roadrunner_bench_eprof_" ++ atom_to_list(Side) ++ ".log"]),
+    ok = peer:call(Peer, roadrunner_bench_profiler, stop_and_dump, [Path, MinMs]),
+    %% Read the log written inside the peer's BEAM and print to the
+    %% bench's own stdout. Files are visible to both because they
+    %% share the host filesystem.
+    io:format("~nprofile (eprof, ~s, total time, rows >= ~.2f ms)~n", [Side, MinMs]),
+    case file:read_file(Path) of
+        {ok, Bin} -> io:put_chars(Bin), io:nl();
+        {error, Reason} -> io:format("  could not read ~s: ~p~n", [Path, Reason])
+    end,
+    ok.
 
 start_server(roadrunner, Scenario) ->
     {ok, Peer, _Node} = peer:start_link(#{
