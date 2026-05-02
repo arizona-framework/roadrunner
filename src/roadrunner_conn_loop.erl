@@ -22,20 +22,44 @@ slot tracking, telemetry pairing, hibernation, lifecycle
 introspection). See `.claude/plans/sorted-discovering-thimble.md`
 for the phased rollout.
 
-## Phase 1 — scaffolding only
+## Phases shipped so far
 
-This commit implements `awaiting_shoot` and a clean exit path. It
-does not yet handle requests; receiving `shoot` fires the
-listener_accept telemetry, then the conn exits cleanly (paired
-with listener_conn_close so telemetry stays balanced). Subsequent
-phases of the plan add reading_request → reading_body →
-dispatching → finishing.
+- **Phase 1** — `awaiting_shoot` + clean exit funnel (`exit_clean/6`).
+- **Phase 2** — `read_request_phase` with active-mode header read,
+  parse via `roadrunner_http1:parse_request/1`, 400 / 408 error
+  responses, drain handling, `request_timeout` via the receive's
+  `after` clause (no `start_timer` arms), stray-msg tolerance.
+  Successful parse currently exits cleanly (placeholder for body
+  + dispatch in Phase 3).
+
+Pending phases: Phase 3 (body read + dispatch + finishing),
+Phase 4 (hibernation), Phase 5 (top-level try/catch around
+`exit_clean`), Phase 6 (test parametrization), Phase 7 (A/B vs
+gen_statem), Phase 8 (cutover or park).
 """.
 
 -export([start/2]).
 
 %% Internal entry — invoked by `proc_lib:start/3` from `start/2`.
 -export([init_loop/3]).
+
+%% Loop-state record carried through every phase. Allocated once on
+%% the transition out of `awaiting_shoot` and pattern-matched (not
+%% reconstructed) thereafter, so the per-request hot path stays
+%% allocation-light.
+-record(loop_state, {
+    socket :: roadrunner_transport:socket(),
+    proto_opts :: roadrunner_conn:proto_opts(),
+    listener_name :: atom(),
+    %% Captured at `shoot` from `roadrunner_telemetry:listener_accept/1`.
+    %% Paired with `listener_conn_close` in `exit_clean/2`.
+    start_mono :: integer(),
+    peer :: {inet:ip_address(), inet:port_number()} | undefined,
+    %% Bytes received but not yet parsed. Empty on first iteration;
+    %% populated mid-recv when `parse_request/1` returns `{more, _}`.
+    %% Phase 3 will also use this for pipelined leftovers.
+    buffered = <<>> :: binary()
+}).
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
     {ok, pid()}.
@@ -70,10 +94,14 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
             StartMono = roadrunner_telemetry:listener_accept(#{
                 listener_name => ListenerName, peer => Peer
             }),
-            %% Phase 1 placeholder — request handling lands in Phase 2.
-            %% Exit cleanly so telemetry stays paired and the slot is
-            %% released even on this stripped-down lifecycle.
-            exit_clean(Socket, ProtoOpts, StartMono, Peer, ListenerName, normal);
+            S = #loop_state{
+                socket = Socket,
+                proto_opts = ProtoOpts,
+                listener_name = ListenerName,
+                start_mono = StartMono,
+                peer = Peer
+            },
+            read_request_phase(S);
         {roadrunner_drain, _Deadline} ->
             %% Drain before `shoot` — no telemetry was fired yet (accept
             %% pairs with `shoot`), so no listener_conn_close either. Just
@@ -85,6 +113,126 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
             %% conn with a typo'd message.
             awaiting_shoot(Socket, ProtoOpts, ListenerName)
     end.
+
+%% --- read_request phase ---
+%%
+%% Active-mode header read. Each iteration:
+%%
+%%   1. `setopts({active, once})` so the next inbound packet arrives
+%%      as a `{TcpTag, Sock, Bytes}` info event.
+%%   2. `receive` matches the data tag (accumulate + parse), the
+%%      closed/error tags (clean exit), `{roadrunner_drain, _}`
+%%      (clean exit), or stray messages (drop and re-loop).
+%%   3. The receive's `after RequestTimeout` clause handles
+%%      slowloris — no `start_timer` / `cancel_timer` per iteration,
+%%      unlike the gen_statem variant.
+%%
+%% Phase 2 only handles the "first request on a fresh conn" case;
+%% Phase 3 will add keep-alive loop-back and pipelined leftover.
+-spec read_request_phase(#loop_state{}) -> no_return().
+read_request_phase(#loop_state{listener_name = ListenerName} = S) ->
+    proc_lib:set_label({roadrunner_conn, reading_request, ListenerName}),
+    Timeout = maps:get(request_timeout, S#loop_state.proto_opts),
+    %% Compute an *absolute* deadline once. Each iteration's `after`
+    %% clause decays it — `recv_request_bytes/2` recomputes
+    %% `Deadline - now` so a slow client that drips bytes can NOT keep
+    %% extending the receive's timeout. Mirrors gen_statem's one-shot
+    %% `state_timeout` semantics in a hand-rolled receive.
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    arm_active_once(S),
+    recv_request_bytes(S, Deadline).
+
+-spec recv_request_bytes(#loop_state{}, integer()) -> no_return().
+recv_request_bytes(
+    #loop_state{
+        socket = Socket,
+        buffered = Buf
+    } = S,
+    Deadline
+) ->
+    {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {DataTag, _Sock, Bytes} ->
+            handle_request_bytes(S#loop_state{buffered = <<Buf/binary, Bytes/binary>>}, Deadline);
+        {ClosedTag, _Sock} ->
+            %% Peer closed mid-headers — silent exit, no 4xx (peer's
+            %% gone, no point writing).
+            exit_normal(S);
+        {ErrorTag, _Sock, _Reason} ->
+            exit_normal(S);
+        {roadrunner_drain, _Deadline} ->
+            exit_normal(S);
+        _Stray ->
+            %% Drop unmatched messages (gen_statem does the same via
+            %% the wildcard `info` clause) and re-arm.
+            arm_active_once(S),
+            recv_request_bytes(S, Deadline)
+    after Remaining ->
+        %% Slowloris / first-request silence. Phase 2 only sees `first`
+        %% requests (no keep-alive yet) so we always send a 408.
+        _ = roadrunner_conn:send_request_timeout(Socket),
+        exit_normal(S)
+    end.
+
+%% Try parsing the accumulated buffer. On `{more, _}` we re-arm and
+%% wait for more bytes; on `{ok, Req, Rest}` we've parsed a full
+%% request (Phase 2 placeholder: exit clean — Phase 3 will dispatch
+%% body + handler); on `{error, _}` we send 400 and exit.
+-spec handle_request_bytes(#loop_state{}, integer()) -> no_return().
+handle_request_bytes(
+    #loop_state{
+        socket = Socket,
+        listener_name = ListenerName,
+        peer = Peer,
+        buffered = Buf
+    } = S,
+    Deadline
+) ->
+    case roadrunner_http1:parse_request(Buf) of
+        {ok, _Req, _Rest} ->
+            %% Phase 2 placeholder — Phase 3 dispatches body + handler.
+            exit_normal(S);
+        {more, _} ->
+            arm_active_once(S),
+            recv_request_bytes(S, Deadline);
+        {error, Reason} ->
+            logger:debug(#{
+                msg => "roadrunner rejecting malformed request",
+                peer => Peer,
+                listener_name => ListenerName,
+                reason => Reason
+            }),
+            ok = roadrunner_telemetry:request_rejected(#{
+                listener_name => ListenerName,
+                peer => Peer,
+                reason => Reason
+            }),
+            _ = roadrunner_conn:send_bad_request(Socket),
+            exit_normal(S)
+    end.
+
+-spec arm_active_once(#loop_state{}) -> ok.
+arm_active_once(#loop_state{socket = Socket} = S) ->
+    %% On socket failure (peer RST during the gap, kernel-side close)
+    %% we can't `setopts` — exit cleanly instead of crashing.
+    case roadrunner_transport:setopts(Socket, [{active, once}]) of
+        ok -> ok;
+        {error, _} -> exit_normal(S)
+    end.
+
+%% Convenience wrapper around `exit_clean/6` that pulls fields off
+%% the loop state. Most exit paths in the read phases fire
+%% `listener_conn_close` (accept already fired during `shoot`).
+-spec exit_normal(#loop_state{}) -> no_return().
+exit_normal(#loop_state{
+    socket = Socket,
+    proto_opts = ProtoOpts,
+    listener_name = ListenerName,
+    start_mono = StartMono,
+    peer = Peer
+}) ->
+    exit_clean(Socket, ProtoOpts, StartMono, Peer, ListenerName, normal).
 
 %% Funnel for every clean exit path. Mirrors `roadrunner_conn_statem:terminate/3`
 %% — fires the paired listener_conn_close telemetry (only if accept already
