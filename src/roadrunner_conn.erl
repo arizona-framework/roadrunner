@@ -348,7 +348,7 @@ has_continue_expectation(Req) ->
     %% precompute — fall back to the lowercase-and-compare path.
     case roadrunner_req:header(~"expect", Req) of
         undefined -> false;
-        Value -> string:lowercase(Value) =:= ~"100-continue"
+        Value -> roadrunner_bin:ascii_lowercase(Value) =:= ~"100-continue"
     end.
 
 -doc false.
@@ -403,7 +403,7 @@ body_framing(Req) ->
             %% RFC 9110 §10.1.4: transfer-coding names are
             %% case-insensitive. Accept `chunked`, `Chunked`,
             %% `CHUNKED` etc. (clients in the wild send all variants).
-            case string:lowercase(Value) of
+            case roadrunner_bin:ascii_lowercase(Value) of
                 ~"chunked" -> chunked;
                 _ -> {error, bad_transfer_encoding}
             end
@@ -732,7 +732,7 @@ response_body_for(Req, Body) ->
     keep_alive | close.
 keep_alive_decision(Req, RespHeaders) ->
     ReqConn = req_connection_lower(Req),
-    RespConn = string:lowercase(resp_connection_token(RespHeaders)),
+    RespConn = roadrunner_bin:ascii_lowercase(resp_connection_token(RespHeaders)),
     ReqClose = has_token(ReqConn, ~"close"),
     RespClose = has_token(RespConn, ~"close"),
     case roadrunner_req:version(Req) of
@@ -761,7 +761,7 @@ req_connection_lower(#{cached_decisions := #{connection_lower := V}}) ->
 req_connection_lower(Req) ->
     case roadrunner_req:header(~"connection", Req) of
         undefined -> ~"";
-        V -> string:lowercase(V)
+        V -> roadrunner_bin:ascii_lowercase(V)
     end.
 
 -spec resp_connection_token(roadrunner_http1:headers()) -> binary().

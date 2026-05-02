@@ -320,7 +320,7 @@ classify_header(NameRaw, ValueRaw, Rest) ->
         ok ->
             Value = trim_ows(ValueRaw),
             case validate_value(Value) of
-                ok -> {ok, string:lowercase(NameRaw), Value, Rest};
+                ok -> {ok, roadrunner_bin:ascii_lowercase(NameRaw), Value, Rest};
                 error -> {error, bad_header}
             end;
         error ->
@@ -512,20 +512,22 @@ compute_cached_decisions_loop([], Acc) ->
     Acc;
 compute_cached_decisions_loop([{~"transfer-encoding", V} | Rest], Acc) ->
     Acc1 =
-        case string:lowercase(V) of
+        case roadrunner_bin:ascii_lowercase(V) of
             ~"chunked" -> Acc#{is_chunked := true};
             _ -> Acc
         end,
     compute_cached_decisions_loop(Rest, Acc1);
 compute_cached_decisions_loop([{~"expect", V} | Rest], Acc) ->
     Acc1 =
-        case string:lowercase(V) of
+        case roadrunner_bin:ascii_lowercase(V) of
             ~"100-continue" -> Acc#{expects_continue := true};
             _ -> Acc
         end,
     compute_cached_decisions_loop(Rest, Acc1);
 compute_cached_decisions_loop([{~"connection", V} | Rest], Acc) ->
-    compute_cached_decisions_loop(Rest, Acc#{connection_lower := string:lowercase(V)});
+    compute_cached_decisions_loop(
+        Rest, Acc#{connection_lower := roadrunner_bin:ascii_lowercase(V)}
+    );
 compute_cached_decisions_loop([_ | Rest], Acc) ->
     compute_cached_decisions_loop(Rest, Acc).
 
