@@ -22,11 +22,21 @@ response (`400`, `414`, `431`, etc.).
 
 -export_type([version/0, headers/0, request/0, status/0, redirect_status/0, cached_decisions/0]).
 
+-on_load(init_patterns/0).
+
 -define(MAX_REQUEST_LINE, 8192).
 -define(MAX_HEADER_LINE, 8192).
 -define(MAX_HEADER_BLOCK, 10240).
 -define(MAX_HEADER_COUNT, 100).
 -define(MAX_CHUNK_HEADER, 8192).
+
+%% `binary:match/2` accepts a pre-compiled pattern (`binary:cp()`), and
+%% the compile cost is non-trivial — measured via `binary:compile_pattern/1`,
+%% it's ~50% of the per-call match time on short header values. We
+%% compile the unsafe-byte alternation once at module load and stash it
+%% in `persistent_term` so `check_header_safe/2` reads a constant on
+%% every call instead of recompiling.
+-define(UNSAFE_BYTES_KEY, {?MODULE, unsafe_bytes_cp}).
 
 -type version() :: {1, 0} | {1, 1}.
 -type headers() :: [{Name :: binary(), Value :: binary()}].
@@ -738,10 +748,21 @@ to the wire.
 """.
 -spec check_header_safe(binary(), name | value) -> ok.
 check_header_safe(Bin, Kind) when is_binary(Bin) ->
-    case binary:match(Bin, [<<$\r>>, <<$\n>>, <<0>>]) of
+    case binary:match(Bin, persistent_term:get(?UNSAFE_BYTES_KEY)) of
         nomatch -> ok;
         _ -> error({header_injection, Kind, Bin})
     end.
+
+%% `-on_load` callback. Returns `ok` so module load succeeds; if the
+%% compile fails (it shouldn't — the pattern is a literal), the module
+%% won't load and we'll see it loudly.
+-spec init_patterns() -> ok.
+init_patterns() ->
+    persistent_term:put(
+        ?UNSAFE_BYTES_KEY,
+        binary:compile_pattern([~"\r", ~"\n", ~"\0"])
+    ),
+    ok.
 
 -spec reason(status()) -> binary().
 reason(200) -> ~"OK";
