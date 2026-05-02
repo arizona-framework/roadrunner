@@ -16,10 +16,11 @@ response (`400`, `414`, `431`, etc.).
     parse_request/1,
     parse_chunk/1,
     check_header_safe/2,
-    response/3
+    response/3,
+    compute_cached_decisions/1
 ]).
 
--export_type([version/0, headers/0, request/0, status/0, redirect_status/0]).
+-export_type([version/0, headers/0, request/0, status/0, redirect_status/0, cached_decisions/0]).
 
 -define(MAX_REQUEST_LINE, 8192).
 -define(MAX_HEADER_LINE, 8192).
@@ -31,11 +32,30 @@ response (`400`, `414`, `431`, etc.).
 -type headers() :: [{Name :: binary(), Value :: binary()}].
 -type status() :: 100..599.
 -type redirect_status() :: 300..399.
+-type cached_decisions() :: #{
+    %% True iff `Transfer-Encoding: chunked` (case-insensitive). Hot path
+    %% at body-framing time — saves a per-request `string:lowercase`.
+    is_chunked := boolean(),
+    %% True iff `Expect: 100-continue` (case-insensitive). Used by the
+    %% body-read path to decide whether to send a 100 before recv.
+    expects_continue := boolean(),
+    %% Lowercased value of the `Connection` header (`~""` if absent).
+    %% `cactus_conn:keep_alive_decision/2` and `has_token/2` operate on
+    %% this directly without re-lowercasing.
+    connection_lower := binary()
+}.
 -type request() :: #{
     method := binary(),
     target := binary(),
     version := version(),
     headers := headers(),
+    %% Pre-computed decisions for known case-insensitive headers, populated
+    %% by `parse_request/1`. Hot-path consumers (`cactus_conn:body_framing/1`,
+    %% `keep_alive_decision/2`, `has_continue_expectation/1`) read these
+    %% instead of re-lowercasing header values per request. Absent for
+    %% manually-built request maps — consumers fall back to the raw
+    %% `headers` list when missing.
+    cached_decisions => cached_decisions(),
     %% Body is set by `cactus_conn` before the handler is invoked. The parser
     %% itself never populates this field — it leaves the buffered body in the
     %% `Rest` element of `parse_request/1` instead.
@@ -439,6 +459,48 @@ check_cls_consistent(V, [V | Rest]) -> check_cls_consistent(V, Rest);
 check_cls_consistent(_, _) -> error.
 
 -doc """
+Walk a parsed header list once and return pre-computed decisions for the
+case-insensitive headers that the connection layer reads on every request.
+
+Header names are already lowercased by `parse_header/1`; this pass also
+lowercases the value of `Connection` (whose tokens are case-insensitive
+per RFC 9110) and computes booleans for `Transfer-Encoding: chunked` and
+`Expect: 100-continue`.
+
+Reusing the cached values avoids ~3 `string:lowercase` calls per request
+on the hot path measured via `scripts/stress.escript --profile`.
+""".
+-spec compute_cached_decisions(headers()) -> cached_decisions().
+compute_cached_decisions(Headers) ->
+    compute_cached_decisions_loop(Headers, #{
+        is_chunked => false,
+        expects_continue => false,
+        connection_lower => ~""
+    }).
+
+-spec compute_cached_decisions_loop(headers(), cached_decisions()) -> cached_decisions().
+compute_cached_decisions_loop([], Acc) ->
+    Acc;
+compute_cached_decisions_loop([{~"transfer-encoding", V} | Rest], Acc) ->
+    Acc1 =
+        case string:lowercase(V) of
+            ~"chunked" -> Acc#{is_chunked := true};
+            _ -> Acc
+        end,
+    compute_cached_decisions_loop(Rest, Acc1);
+compute_cached_decisions_loop([{~"expect", V} | Rest], Acc) ->
+    Acc1 =
+        case string:lowercase(V) of
+            ~"100-continue" -> Acc#{expects_continue := true};
+            _ -> Acc
+        end,
+    compute_cached_decisions_loop(Rest, Acc1);
+compute_cached_decisions_loop([{~"connection", V} | Rest], Acc) ->
+    compute_cached_decisions_loop(Rest, Acc#{connection_lower := string:lowercase(V)});
+compute_cached_decisions_loop([_ | Rest], Acc) ->
+    compute_cached_decisions_loop(Rest, Acc).
+
+-doc """
 Parse a complete HTTP/1.1 request (request line + header block).
 
 Returns `{ok, Request, Rest}` where `Request` is a map with `method`,
@@ -476,7 +538,8 @@ parse_request(Bin) when is_binary(Bin) ->
                                 method => Method,
                                 target => Target,
                                 version => Version,
-                                headers => Headers
+                                headers => Headers,
+                                cached_decisions => compute_cached_decisions(Headers)
                             },
                             {ok, Req, Rest2};
                         {error, _} = HostErr ->

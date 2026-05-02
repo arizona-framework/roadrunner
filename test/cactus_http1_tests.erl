@@ -454,7 +454,12 @@ request_full_test() ->
                 method => ~"GET",
                 target => ~"/foo",
                 version => {1, 1},
-                headers => [{~"host", ~"x"}]
+                headers => [{~"host", ~"x"}],
+                cached_decisions => #{
+                    is_chunked => false,
+                    expects_continue => false,
+                    connection_lower => ~""
+                }
             },
             ~"body"},
         cactus_http1:parse_request(~"GET /foo HTTP/1.1\r\nHost: x\r\n\r\nbody")
@@ -478,7 +483,12 @@ request_http10_no_host_accepted_test() ->
                 method => ~"GET",
                 target => ~"/",
                 version => {1, 0},
-                headers => []
+                headers => [],
+                cached_decisions => #{
+                    is_chunked => false,
+                    expects_continue => false,
+                    connection_lower => ~""
+                }
             },
             ~""},
         cactus_http1:parse_request(~"GET / HTTP/1.0\r\n\r\n")
@@ -491,6 +501,92 @@ request_http11_missing_host_returns_error_test() ->
     ?assertEqual(
         {error, missing_host},
         cactus_http1:parse_request(~"GET / HTTP/1.1\r\n\r\n")
+    ).
+
+cached_decisions_empty_for_empty_headers_test() ->
+    ?assertEqual(
+        #{
+            is_chunked => false,
+            expects_continue => false,
+            connection_lower => ~""
+        },
+        cactus_http1:compute_cached_decisions([])
+    ).
+
+cached_decisions_chunked_lowercased_match_test() ->
+    %% RFC 9110 §10.1.4: case-insensitive. Each casing must flip the flag.
+    [
+        ?assertMatch(
+            #{is_chunked := true},
+            cactus_http1:compute_cached_decisions([{~"transfer-encoding", V}])
+        )
+     || V <- [~"chunked", ~"Chunked", ~"CHUNKED", ~"ChUnKeD"]
+    ].
+
+cached_decisions_chunked_unknown_te_does_not_set_flag_test() ->
+    %% Non-chunked TE values leave is_chunked false; the connection layer
+    %% returns {error, bad_transfer_encoding} from there.
+    ?assertMatch(
+        #{is_chunked := false},
+        cactus_http1:compute_cached_decisions([{~"transfer-encoding", ~"gzip"}])
+    ).
+
+cached_decisions_expects_continue_lowercased_match_test() ->
+    [
+        ?assertMatch(
+            #{expects_continue := true},
+            cactus_http1:compute_cached_decisions([{~"expect", V}])
+        )
+     || V <- [~"100-continue", ~"100-Continue", ~"100-CONTINUE"]
+    ].
+
+cached_decisions_unknown_expect_does_not_set_flag_test() ->
+    %% Servers MAY return 417 for unknown expectations (RFC 9110 §10.1.1)
+    %% but at the parse layer we just leave the flag false. The connection
+    %% layer never sends a 100 for these.
+    ?assertMatch(
+        #{expects_continue := false},
+        cactus_http1:compute_cached_decisions([{~"expect", ~"the-spanish-inquisition"}])
+    ).
+
+cached_decisions_connection_lowercased_test() ->
+    ?assertMatch(
+        #{connection_lower := ~"keep-alive, upgrade"},
+        cactus_http1:compute_cached_decisions(
+            [{~"connection", ~"Keep-Alive, Upgrade"}]
+        )
+    ).
+
+cached_decisions_ignores_unrelated_headers_test() ->
+    %% Only the three known case-insensitive headers feed the cache;
+    %% unrelated headers (Host, Content-Type, etc.) leave defaults intact.
+    ?assertEqual(
+        #{
+            is_chunked => false,
+            expects_continue => false,
+            connection_lower => ~""
+        },
+        cactus_http1:compute_cached_decisions([
+            {~"host", ~"x"}, {~"content-type", ~"text/plain"}
+        ])
+    ).
+
+parse_request_attaches_cached_decisions_for_chunked_request_test() ->
+    Bin = ~"POST /u HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: Chunked\r\n\r\n",
+    ?assertMatch(
+        {ok,
+            #{
+                cached_decisions := #{is_chunked := true, expects_continue := false}
+            },
+            _},
+        cactus_http1:parse_request(Bin)
+    ).
+
+parse_request_attaches_cached_decisions_for_expect_continue_test() ->
+    Bin = ~"PUT /u HTTP/1.1\r\nHost: x\r\nExpect: 100-Continue\r\nContent-Length: 0\r\n\r\n",
+    ?assertMatch(
+        {ok, #{cached_decisions := #{expects_continue := true}}, _},
+        cactus_http1:parse_request(Bin)
     ).
 
 request_http11_with_host_accepted_test() ->

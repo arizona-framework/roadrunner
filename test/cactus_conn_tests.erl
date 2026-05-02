@@ -241,6 +241,64 @@ read_body_chunked_case_insensitive_test() ->
      || V <- [~"chunked", ~"Chunked", ~"CHUNKED", ~"ChUnKeD"]
     ].
 
+%% --- has_continue_expectation / keep_alive_decision fallbacks ---
+
+%% These two helpers have a fast path for parser-built request maps
+%% (which carry `cached_decisions`) and a fallback for manually-built
+%% maps (which don't). Cover the fallback explicitly.
+
+maybe_send_continue_without_cached_decisions_uses_header_test() ->
+    %% Manually-built Req, no `cached_decisions`. With Expect: 100-Continue
+    %% present, the helper must send the 100. Use a fake socket that
+    %% records send calls.
+    Self = self(),
+    Sink = spawn(fun() -> continue_sink_loop(Self) end),
+    Req = req_with_headers([{~"expect", ~"100-Continue"}]),
+    ok = cactus_conn:maybe_send_continue({fake, Sink}, Req, ~""),
+    Sink ! stop,
+    receive
+        {sent, Bytes} ->
+            ?assertMatch(<<"HTTP/1.1 100 Continue\r\n\r\n">>, iolist_to_binary(Bytes))
+    after 1000 ->
+        ?assert(false)
+    end.
+
+maybe_send_continue_without_cached_decisions_no_expect_skips_test() ->
+    %% Same path but no Expect header → no 100 sent.
+    Sink = spawn(fun() -> continue_sink_loop(undefined) end),
+    Req = req_with_headers([]),
+    ok = cactus_conn:maybe_send_continue({fake, Sink}, Req, ~""),
+    Sink ! stop,
+    receive
+        {sent, _} -> ?assert(false)
+    after 50 -> ok
+    end.
+
+continue_sink_loop(Reporter) ->
+    receive
+        stop ->
+            ok;
+        {cactus_fake_send, ConnPid, Data} ->
+            case Reporter of
+                undefined -> ok;
+                _ -> Reporter ! {sent, Data}
+            end,
+            ConnPid ! {cactus_fake_send_reply, ok},
+            continue_sink_loop(Reporter);
+        _ ->
+            continue_sink_loop(Reporter)
+    end.
+
+keep_alive_decision_without_cached_decisions_uses_header_test() ->
+    %% Manually-built Req with HTTP/1.1 + Connection: close → close.
+    Req = req_with_headers([{~"connection", ~"Close"}]),
+    ?assertEqual(close, cactus_conn:keep_alive_decision(Req, [])).
+
+keep_alive_decision_without_cached_decisions_no_connection_header_keeps_alive_test() ->
+    %% HTTP/1.1 default is keep-alive when neither side requests close.
+    Req = req_with_headers([]),
+    ?assertEqual(keep_alive, cactus_conn:keep_alive_decision(Req, [])).
+
 %% --- peer/1 ---
 
 peer_on_closed_socket_returns_undefined_test() ->

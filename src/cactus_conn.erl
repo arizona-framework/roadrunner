@@ -340,7 +340,11 @@ maybe_send_continue(Socket, Req, Buffered) ->
     end.
 
 -spec has_continue_expectation(cactus_http1:request()) -> boolean().
+has_continue_expectation(#{cached_decisions := #{expects_continue := EC}}) ->
+    EC;
 has_continue_expectation(Req) ->
+    %% Manually-built request maps (tests, middleware) skip the parse-time
+    %% precompute — fall back to the lowercase-and-compare path.
     case cactus_req:header(~"expect", Req) of
         undefined -> false;
         Value -> string:lowercase(Value) =:= ~"100-continue"
@@ -370,7 +374,23 @@ make_body_state(Framing, Buffered, Recv, Max) ->
     | chunked
     | {content_length, non_neg_integer()}
     | {error, bad_content_length | bad_transfer_encoding}.
+body_framing(#{cached_decisions := #{is_chunked := true}}) ->
+    chunked;
+body_framing(#{cached_decisions := #{is_chunked := false}} = Req) ->
+    %% Either no Transfer-Encoding header (fall through to Content-Length)
+    %% or a non-chunked TE (rare, but rejected per RFC 9112 §6.1).
+    case cactus_req:header(~"transfer-encoding", Req) of
+        undefined ->
+            case content_length(Req) of
+                none -> none;
+                {ok, N} -> {content_length, N};
+                {error, _} = Err -> Err
+            end;
+        _ ->
+            {error, bad_transfer_encoding}
+    end;
 body_framing(Req) ->
+    %% Manually-built request maps without cached_decisions — full path.
     case cactus_req:header(~"transfer-encoding", Req) of
         undefined ->
             case content_length(Req) of
@@ -710,7 +730,7 @@ response_body_for(Req, Body) ->
 -spec keep_alive_decision(cactus_http1:request(), cactus_http1:headers()) ->
     keep_alive | close.
 keep_alive_decision(Req, RespHeaders) ->
-    ReqConn = string:lowercase(req_connection_token(Req)),
+    ReqConn = req_connection_lower(Req),
     RespConn = string:lowercase(resp_connection_token(RespHeaders)),
     ReqClose = has_token(ReqConn, ~"close"),
     RespClose = has_token(RespConn, ~"close"),
@@ -731,11 +751,16 @@ keep_alive_decision(Req, RespHeaders) ->
             end
     end.
 
--spec req_connection_token(cactus_http1:request()) -> binary().
-req_connection_token(Req) ->
+%% Returns the request's `Connection` header value, lowercased. Reads from
+%% `cached_decisions` when present (parser populates it once per request)
+%% and falls back to a per-call lowercase for manually-built request maps.
+-spec req_connection_lower(cactus_http1:request()) -> binary().
+req_connection_lower(#{cached_decisions := #{connection_lower := V}}) ->
+    V;
+req_connection_lower(Req) ->
     case cactus_req:header(~"connection", Req) of
         undefined -> ~"";
-        V -> V
+        V -> string:lowercase(V)
     end.
 
 -spec resp_connection_token(cactus_http1:headers()) -> binary().
