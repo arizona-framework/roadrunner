@@ -22,6 +22,10 @@
 %%%   pipeline    Same as keep_alive but every send packs K requests into one
 %%%               gen_tcp:send and reads K responses back to back. Stresses the
 %%%               buffered-leftover path.
+%%%   sweep       Stepped load test — runs `keep_alive` at a sequence of
+%%%               client counts and prints a comparison table. Use to find
+%%%               the throughput knee and the connection ceiling in one
+%%%               run. See --sweep-clients / --sweep-step-duration.
 %%%
 %%% Output: total requests, errors, RPS, latency percentiles (p50 / p95 /
 %%% p99 / max), and bytes transferred. With `--profile`, an eprof hotspot
@@ -35,6 +39,9 @@
 -define(DEFAULT_PIPELINE, 16).
 -define(DEFAULT_WARMUP_S, 1).
 -define(DEFAULT_HOST, "127.0.0.1").
+-define(DEFAULT_SWEEP_START, 10).
+-define(DEFAULT_SWEEP_MAX, 100000).
+-define(DEFAULT_SWEEP_STEP_DURATION, 2).
 
 -define(LISTENER, cactus_stress_listener).
 
@@ -46,10 +53,15 @@ main(Args) ->
     Opts1 = Opts#{port => Port},
     print_header(Opts1),
     try
-        run_warmup(Opts1),
-        Result = with_optional_profile(Opts1, fun() -> run_measured(Opts1) end),
-        print_report(Opts1, Result),
-        maybe_print_profile(Opts1)
+        case maps:get(scenario, Opts1) of
+            sweep ->
+                run_sweep(Opts1);
+            _ ->
+                run_warmup(Opts1),
+                Result = with_optional_profile(Opts1, fun() -> run_measured(Opts1) end),
+                print_report(Opts1, Result),
+                maybe_print_profile(Opts1)
+        end
     after
         StopFn()
     end.
@@ -110,12 +122,14 @@ cli() ->
             #{
                 name => scenario,
                 long => "-scenario",
-                type => {atom, [concurrent, keep_alive, pipeline]},
+                type => {atom, [concurrent, keep_alive, pipeline, sweep]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
                     "concurrent: fresh TCP conn per request (stresses accept).\n"
                     "keep_alive: persistent conn, sequential GETs.\n"
-                    "pipeline:   K requests per send on one conn."
+                    "pipeline:   K requests per send on one conn.\n"
+                    "sweep:      stepped load — runs keep_alive at increasing client\n"
+                    "            counts (see --sweep-clients) and prints one table."
             },
             #{
                 name => clients,
@@ -176,6 +190,29 @@ cli() ->
                 type => float,
                 default => 1.0,
                 help => "Minimum total ms for a row to appear in the hotspot table."
+            },
+            #{
+                name => sweep_start,
+                long => "-sweep-start",
+                type => {integer, [{min, 1}]},
+                default => ?DEFAULT_SWEEP_START,
+                help => "Initial client count for the sweep scenario."
+            },
+            #{
+                name => sweep_max,
+                long => "-sweep-max",
+                type => {integer, [{min, 1}]},
+                default => ?DEFAULT_SWEEP_MAX,
+                help =>
+                    "Hard cap on sweep client count. The sweep stops early\n"
+                    "when throughput regresses or server-side errors appear."
+            },
+            #{
+                name => sweep_step_duration,
+                long => "-sweep-step-duration",
+                type => {integer, [{min, 1}]},
+                default => ?DEFAULT_SWEEP_STEP_DURATION,
+                help => "Seconds to run each sweep step."
             }
         ]
     }.
@@ -214,6 +251,15 @@ start_or_attach(_Opts) ->
 %% Header / report
 %% ===========================================================================
 
+print_header(#{scenario := sweep, host := H, port := P}) ->
+    io:format("~ncactus stress~n"),
+    io:format(
+        "  scenario   : sweep~n"
+        "  target     : ~s:~B~n",
+        [H, P]
+    ),
+    %% Per-step params are printed by run_sweep itself.
+    io:nl();
 print_header(#{
     scenario := S,
     clients := C,
@@ -317,6 +363,174 @@ run_warmup(Opts) ->
 run_measured(Opts) ->
     DurationMs = maps:get(duration_s, Opts) * 1000,
     run_phase(Opts, DurationMs).
+
+%% ===========================================================================
+%% Sweep — push the server until it breaks
+%% ===========================================================================
+%%
+%% Doubles the client count each step. Stops when either:
+%%   (a) the sweep cap is hit,
+%%   (b) throughput at step N+1 is < 95% of step N (saturation),
+%%   (c) any server-side error appears (bad_reply, empty_reply, recv:closed).
+%%
+%% Harness-side errors (connect:timeout, EMFILE on the loadgen) are tracked
+%% but NOT a stop condition — they tell us the loadgen ran out of sockets,
+%% not that cactus broke. Raise `ulimit -n` to push further.
+
+run_sweep(#{sweep_start := Start, sweep_max := Max, sweep_step_duration := StepS} = Opts) ->
+    StepMs = StepS * 1000,
+    BaseOpts = Opts#{scenario => keep_alive, warmup_s => 0},
+    io:format(
+        "running sweep: start=~B max=~B step=~Bs (doubling)~n~n",
+        [Start, Max, StepS]
+    ),
+    Rows = sweep_loop(BaseOpts, Start, Max, StepMs, undefined, []),
+    print_sweep_table(lists:reverse(Rows)).
+
+sweep_loop(_Opts, N, Max, _StepMs, _Prev, Rows) when N > Max ->
+    Rows;
+sweep_loop(Opts, N, Max, StepMs, PrevRps, Rows) ->
+    Result = run_phase(Opts#{clients => N}, StepMs),
+    Row = sweep_row(N, Result),
+    io:format("  ~s~n", [fmt_sweep_row(Row)]),
+    case stop_reason(Row, PrevRps) of
+        continue ->
+            sweep_loop(Opts, N * 2, Max, StepMs, maps:get(rps, Row), [Row | Rows]);
+        {stop, Reason} ->
+            io:format("~nstopping: ~ts~n", [Reason]),
+            [Row | Rows]
+    end.
+
+sweep_row(Clients, #{
+    total := Total,
+    err_buckets := Buckets,
+    elapsed_us := ElapsedUs,
+    latencies_ns := Latencies
+}) ->
+    Sorted = lists:sort(Latencies),
+    N = length(Sorted),
+    Rps =
+        case ElapsedUs of
+            0 -> 0.0;
+            _ -> Total * 1000000 / ElapsedUs
+        end,
+    #{
+        clients => Clients,
+        rps => Rps,
+        total => Total,
+        p50 => pct(Sorted, N, 0.50),
+        p99 => pct(Sorted, N, 0.99),
+        harness_errs => harness_errs(Buckets),
+        server_errs => server_errs(Buckets),
+        buckets => Buckets
+    }.
+
+%% Errors caused by the loadgen running out of resources (TIME_WAIT,
+%% EMFILE) — not a server failure. Raise ulimit to push further.
+harness_errs(Buckets) ->
+    maps:fold(
+        fun(K, V, Acc) ->
+            case K of
+                {connect, _} -> Acc + V;
+                {send, eaddrnotavail} -> Acc + V;
+                {send, eaddrinuse} -> Acc + V;
+                {send, emfile} -> Acc + V;
+                _ -> Acc
+            end
+        end,
+        0,
+        Buckets
+    ).
+
+%% Errors that mean cactus actually failed to serve the request — the
+%% server closed the connection mid-flight, returned bad bytes, or the
+%% recv timed out waiting for a response.
+server_errs(Buckets) ->
+    maps:fold(
+        fun(K, V, Acc) ->
+            case K of
+                bad_reply -> Acc + V;
+                empty_reply -> Acc + V;
+                {recv, _} -> Acc + V;
+                {send, closed} -> Acc + V;
+                _ -> Acc
+            end
+        end,
+        0,
+        Buckets
+    ).
+
+stop_reason(#{server_errs := S, buckets := Buckets}, _Prev) when S > 0 ->
+    {stop, format_server_err_stop(Buckets)};
+stop_reason(#{rps := Rps}, undefined) when Rps > 0 ->
+    continue;
+stop_reason(#{rps := _}, undefined) ->
+    {stop, "no successful requests in first step — abort"};
+stop_reason(#{rps := Rps}, Prev) when Rps >= Prev * 0.95 ->
+    continue;
+stop_reason(_, _) ->
+    {stop, "throughput regressed >5% from prior step — saturation"}.
+
+format_server_err_stop(Buckets) ->
+    %% Show the dominant server-side reason so the user knows whether the
+    %% ceiling is "conn closed mid-stream" vs "bad reply" etc.
+    Server = maps:filter(
+        fun(K, _) ->
+            case K of
+                bad_reply -> true;
+                empty_reply -> true;
+                {recv, _} -> true;
+                {send, closed} -> true;
+                _ -> false
+            end
+        end,
+        Buckets
+    ),
+    Sorted = lists:sort(fun({_, A}, {_, B}) -> A >= B end, maps:to_list(Server)),
+    Pretty = lists:join(
+        ", ",
+        [io_lib:format("~ts=~B", [fmt_reason(R), C]) || {R, C} <- Sorted]
+    ),
+    io_lib:format(
+        "server-side errors — cactus ceiling reached (~ts)",
+        [Pretty]
+    ).
+
+print_sweep_table(Rows) ->
+    io:format(
+        "~n~-8s  ~10s  ~10s  ~10s  ~10s  ~10s~n",
+        ["clients", "rps", "p50", "p99", "harness_e", "server_e"]
+    ),
+    io:format("~s~n", [string:copies("-", 64)]),
+    lists:foreach(
+        fun(R) -> io:format("  ~s~n", [fmt_sweep_row(R)]) end,
+        Rows
+    ),
+    io:nl(),
+    case Rows of
+        [] ->
+            ok;
+        _ ->
+            Best = lists:max([maps:get(rps, R) || R <- Rows]),
+            BestRow = hd([R || R <- Rows, maps:get(rps, R) =:= Best]),
+            io:format(
+                "peak: ~s req/s at ~B clients~n",
+                [fmt_int(round(Best)), maps:get(clients, BestRow)]
+            )
+    end.
+
+fmt_sweep_row(#{
+    clients := C,
+    rps := Rps,
+    p50 := P50,
+    p99 := P99,
+    harness_errs := HE,
+    server_errs := SE
+}) ->
+    io_lib:format(
+        "~-8B  ~10s  ~10s  ~10s  ~10B  ~10B",
+        [C, fmt_int(round(Rps)), fmt_ns(P50), fmt_ns(P99), HE, SE]
+    ).
 
 run_phase(#{clients := C} = Opts, DurationMs) ->
     Self = self(),
