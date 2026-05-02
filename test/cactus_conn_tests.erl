@@ -224,6 +224,23 @@ read_body_unknown_transfer_encoding_rejected_test() ->
         cactus_conn:read_body(Req, ~"", NoRecv, 1000)
     ).
 
+read_body_chunked_case_insensitive_test() ->
+    %% RFC 9110 §10.1.4: transfer-coding names are case-insensitive.
+    %% `Chunked`, `CHUNKED`, `chunked` all mean the same thing.
+    NoRecv = fun() -> error(should_not_be_called) end,
+    [
+        ?assertEqual(
+            {ok, ~"hi", <<>>},
+            cactus_conn:read_body(
+                req_with_headers([{~"transfer-encoding", V}]),
+                ~"2\r\nhi\r\n0\r\n\r\n",
+                NoRecv,
+                1000
+            )
+        )
+     || V <- [~"chunked", ~"Chunked", ~"CHUNKED", ~"ChUnKeD"]
+    ].
+
 %% --- peer/1 ---
 
 peer_on_closed_socket_returns_undefined_test() ->

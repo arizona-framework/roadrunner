@@ -378,10 +378,14 @@ body_framing(Req) ->
                 {ok, N} -> {content_length, N};
                 {error, _} = Err -> Err
             end;
-        ~"chunked" ->
-            chunked;
-        _ ->
-            {error, bad_transfer_encoding}
+        Value ->
+            %% RFC 9110 §10.1.4: transfer-coding names are
+            %% case-insensitive. Accept `chunked`, `Chunked`,
+            %% `CHUNKED` etc. (clients in the wild send all variants).
+            case string:lowercase(Value) of
+                ~"chunked" -> chunked;
+                _ -> {error, bad_transfer_encoding}
+            end
     end.
 
 -spec read_body_until(
