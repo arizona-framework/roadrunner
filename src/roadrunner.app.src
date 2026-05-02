@@ -1,0 +1,16 @@
+{application, roadrunner, [
+    {description, "An OTP application"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {roadrunner_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        crypto,
+        telemetry
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, []}
+]}.

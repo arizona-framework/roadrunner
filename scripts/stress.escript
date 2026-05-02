@@ -1,7 +1,7 @@
 #!/usr/bin/env escript
-%%% HTTP stress test for cactus.
+%%% HTTP stress test for roadrunner.
 %%%
-%%% Drives concurrent traffic at a cactus listener and reports
+%%% Drives concurrent traffic at a roadrunner listener and reports
 %%% throughput + latency. Designed for human comparison (run
 %%% before/after a change), not as a CI gate -- numbers vary with
 %%% machine load.
@@ -45,7 +45,7 @@
 -define(DEFAULT_SWEEP_TOLERANCE, 5).
 -define(DEFAULT_SWEEP_ERR_RATE_PCT, 0.5).
 
--define(LISTENER, cactus_stress_listener).
+-define(LISTENER, roadrunner_stress_listener).
 
 main(Args) ->
     Opts = parse_args(Args),
@@ -73,7 +73,7 @@ with_optional_profile(#{profile := false}, Fun) ->
 with_optional_profile(#{profile := true}, Fun) ->
     %% Trace every currently-alive process plus anything they spawn for
     %% the duration. set_on_spawn carries the trace flag through child
-    %% spawns -- without it, gen_statem:start/3 (used by cactus_acceptor
+    %% spawns -- without it, gen_statem:start/3 (used by roadrunner_acceptor
     %% to launch each conn) produces an untraced child and we'd miss the
     %% hot path entirely. The matchspec `'_'` traces all calls.
     {ok, _} = eprof:start(),
@@ -92,7 +92,7 @@ maybe_print_profile(#{profile := true, profile_min_ms := MinMs}) ->
     %% eprof's analyze prints to whatever was set via log/1; pipe to a
     %% temp file so we can trim out the chatty per-process headers and
     %% keep only the totals table.
-    LogFile = filename:join(["/tmp", "cactus_stress_eprof.log"]),
+    LogFile = filename:join(["/tmp", "roadrunner_stress_eprof.log"]),
     ok = eprof:log(LogFile),
     MinUs = trunc(MinMs * 1000),
     %% Filter rows below the threshold; rows print time-ascending, so
@@ -115,8 +115,8 @@ maybe_print_profile(#{profile := true, profile_min_ms := MinMs}) ->
 cli() ->
     #{
         help =>
-            "HTTP stress test for cactus.\n\n"
-            "Drives concurrent traffic at a cactus listener and reports "
+            "HTTP stress test for roadrunner.\n\n"
+            "Drives concurrent traffic at a roadrunner listener and reports "
             "throughput + latency.\nDesigned for human comparison "
             "(run before/after a change), not as a CI gate -- numbers vary "
             "with machine load.",
@@ -174,7 +174,7 @@ cli() ->
                 type => {integer, [{min, 1}, {max, 65535}]},
                 help =>
                     "Target an already-running listener on this port.\n"
-                    "Without --port, the script boots cactus in-process on a free port."
+                    "Without --port, the script boots roadrunner in-process on a free port."
             },
             #{
                 name => detach_server,
@@ -182,7 +182,7 @@ cli() ->
                 type => boolean,
                 default => false,
                 help =>
-                    "Spawn the cactus listener in a SEPARATE BEAM (via OTP\n"
+                    "Spawn the roadrunner listener in a SEPARATE BEAM (via OTP\n"
                     "peer module, stdio-connected) so the loadgen workers\n"
                     "don't compete with the server for schedulers in the\n"
                     "same VM. Removes the in-process scheduler-contention\n"
@@ -274,23 +274,23 @@ start_or_attach(#{detach_server := true}) ->
 start_or_attach(#{port := Port}) when is_integer(Port) ->
     {Port, fun() -> ok end};
 start_or_attach(_Opts) ->
-    {ok, _} = application:ensure_all_started(cactus),
-    {ok, _} = cactus:start_listener(?LISTENER, #{
+    {ok, _} = application:ensure_all_started(roadrunner),
+    {ok, _} = roadrunner:start_listener(?LISTENER, #{
         port => 0,
-        handler => cactus_keepalive_handler,
+        handler => roadrunner_keepalive_handler,
         keep_alive_timeout => 60000,
         max_clients => 10000,
         max_keep_alive_request => 1000000
     }),
-    Port = cactus_listener:port(?LISTENER),
-    {Port, fun() -> ok = cactus:stop_listener(?LISTENER) end}.
+    Port = roadrunner_listener:port(?LISTENER),
+    {Port, fun() -> ok = roadrunner:stop_listener(?LISTENER) end}.
 
 %% ===========================================================================
 %% Detached server BEAM (OTP `peer` module)
 %% ===========================================================================
 %%
 %% Spawns a child Erlang VM connected via stdio (no distribution / epmd).
-%% The child inherits the parent's code path, brings up cactus + a
+%% The child inherits the parent's code path, brings up roadrunner + a
 %% keep-alive listener on port 0 (kernel picks a free one), and reports
 %% the port back. The parent BEAM keeps running as the loadgen.
 %% `peer:stop/1` cleanly shuts the child down at end (also on parent
@@ -308,7 +308,7 @@ detach_server() ->
     of
         {ok, Peer, _Node} ->
             ok = bring_up_listener(Peer),
-            ListenerPort = peer:call(Peer, cactus_listener, port, [?LISTENER]),
+            ListenerPort = peer:call(Peer, roadrunner_listener, port, [?LISTENER]),
             io:format("detached server: listening on port ~B~n", [ListenerPort]),
             {ListenerPort, fun() -> peer:stop(Peer) end};
         {error, Reason} ->
@@ -317,12 +317,12 @@ detach_server() ->
     end.
 
 bring_up_listener(Peer) ->
-    {ok, _} = peer:call(Peer, application, ensure_all_started, [cactus]),
-    {ok, _} = peer:call(Peer, cactus, start_listener, [
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [roadrunner]),
+    {ok, _} = peer:call(Peer, roadrunner, start_listener, [
         ?LISTENER,
         #{
             port => 0,
-            handler => cactus_keepalive_handler,
+            handler => roadrunner_keepalive_handler,
             keep_alive_timeout => 60000,
             max_clients => 100000,
             max_keep_alive_request => 1000000
@@ -341,7 +341,7 @@ pa_args_for_peer() ->
 %% ===========================================================================
 
 print_header(#{scenario := sweep, host := H, port := P}) ->
-    io:format("~ncactus stress~n"),
+    io:format("~nroadrunner stress~n"),
     io:format(
         "  scenario   : sweep~n"
         "  target     : ~s:~B~n",
@@ -358,7 +358,7 @@ print_header(#{
     host := H,
     port := P
 }) ->
-    io:format("~ncactus stress~n"),
+    io:format("~nroadrunner stress~n"),
     io:format(
         "  scenario   : ~s~n"
         "  target     : ~s:~B~n"
@@ -467,7 +467,7 @@ run_measured(Opts) ->
 %%
 %% Harness-side errors (connect:timeout, EMFILE on the loadgen) are tracked
 %% but NOT a stop condition — they tell us the loadgen ran out of sockets,
-%% not that cactus broke. Raise `ulimit -n` to push further.
+%% not that roadrunner broke. Raise `ulimit -n` to push further.
 
 run_sweep(
     #{
@@ -582,7 +582,7 @@ harness_errs(Buckets) ->
         Buckets
     ).
 
-%% Errors that mean cactus actually failed to serve the request — the
+%% Errors that mean roadrunner actually failed to serve the request — the
 %% server closed the connection mid-flight, returned bad bytes, or the
 %% recv timed out waiting for a response.
 server_errs(Buckets) ->
@@ -939,7 +939,7 @@ recv_until_closed(Sock, TimeoutMs, Acc) ->
     end.
 
 %% Read one keepalive response (status + headers + 7-byte body from
-%% cactus_keepalive_handler). Returns {ok, BytesRead} or {error, _}.
+%% roadrunner_keepalive_handler). Returns {ok, BytesRead} or {error, _}.
 recv_keepalive_response(Sock, Buf, TimeoutMs) ->
     case binary:split(Buf, ~"\r\n\r\n") of
         [_Headers, Body] when byte_size(Body) >= 7 ->
@@ -989,7 +989,7 @@ consume_one(Buf) ->
         [_Headers, Tail] ->
             case Buf of
                 <<"HTTP/1.1 200 OK", _/binary>> ->
-                    %% cactus_keepalive_handler writes Content-Length: 7.
+                    %% roadrunner_keepalive_handler writes Content-Length: 7.
                     case Tail of
                         <<_:7/binary, Rest/binary>> -> {ok, Rest};
                         _ -> more
