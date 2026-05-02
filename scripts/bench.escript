@@ -64,9 +64,12 @@ main(Args) ->
 cli() ->
     #{
         help =>
-            "roadrunner vs cowboy vs elli throughput bench.\n\n"
-            "Spawns each server in its own peer BEAM, runs the same load "
-            "against\neach, and prints a side-by-side comparison.",
+            """
+            roadrunner vs cowboy vs elli throughput bench.
+
+            Spawns each server in its own peer BEAM, runs the same load against
+            each, and prints a side-by-side comparison.
+            """,
         arguments => [
             #{
                 name => scenario,
@@ -74,11 +77,13 @@ cli() ->
                 type => {atom, [hello, echo]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
-                    "hello: GET / with 1 header, 7-byte body. Bare-minimum HTTP cost.\n"
-                    "echo:  POST /echo with 256-byte body and 5 request headers.\n"
-                    "       Both servers are configured with a router so the\n"
-                    "       bench exercises body read + multi-header parsing +\n"
-                    "       dispatch."
+                    """
+                    hello: GET / with 1 header, 7-byte body. Bare-minimum HTTP cost.
+                    echo:  POST /echo with 256-byte body and 5 request headers.
+                           Both servers are configured with a router so the
+                           bench exercises body read + multi-header parsing +
+                           dispatch.
+                    """
             },
             #{
                 name => servers,
@@ -86,11 +91,13 @@ cli() ->
                 type => string,
                 default => "roadrunner,cowboy,elli",
                 help =>
-                    "Comma-separated list of servers to run (run order is\n"
-                    "preserved). Known: roadrunner, cowboy, elli. Use to\n"
-                    "compare a subset (e.g. `--servers roadrunner,elli`)\n"
-                    "or to drive load against a single server in\n"
-                    "isolation (`--servers roadrunner`)."
+                    """
+                    Comma-separated list of servers to run (run order is
+                    preserved). Known: roadrunner, cowboy, elli. Use to
+                    compare a subset (e.g. `--servers roadrunner,elli`)
+                    or to drive load against a single server in
+                    isolation (`--servers roadrunner`).
+                    """
             },
             #{
                 name => clients,
