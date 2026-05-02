@@ -8,45 +8,24 @@
 %%%
 %%% Usage:
 %%%   ./scripts/stress.escript [opts]
+%%%   ./scripts/stress.escript --help
 %%%
-%%% Options:
-%%%   --scenario NAME   one of: concurrent | keep_alive | pipeline
-%%%                     (default: concurrent)
-%%%   --clients N       number of worker processes (default: 50)
-%%%   --duration S      seconds to run the measured phase (default: 5)
-%%%   --pipeline K      requests per pipelined burst (pipeline scenario;
-%%%                     default: 16)
-%%%   --port N          target an already-running listener on this port.
-%%%                     Without --port, the script boots cactus in-process
-%%%                     with `cactus_keepalive_handler` on a free port.
-%%%   --host H          target host (default: 127.0.0.1)
-%%%   --warmup S        seconds of pre-measurement traffic discarded from
-%%%                     the report (default: 1)
-%%%   --profile         run the measured phase under `eprof` and print a
-%%%                     hotspot table after the report. Profiling adds
-%%%                     significant overhead -- throughput numbers under
-%%%                     `--profile` are NOT comparable to a normal run;
-%%%                     the report exists to point at MFAs worth optimizing.
-%%%                     Only useful with --port omitted (in-process listener)
-%%%                     so the listener's processes are traceable.
-%%%   --profile-min-ms F minimum total ms for a row to appear in the
-%%%                     hotspot table (default: 1.0). Lower to see more.
+%%% Run with `--help` for the full flag list. Three scenarios cover the
+%%% interesting connection patterns:
 %%%
-%%% Scenarios:
-%%%   concurrent  Each worker opens a fresh TCP conn, sends one GET
-%%%               with `Connection: close`, reads the response, closes.
-%%%               Repeats until the duration elapses. Stresses accept +
-%%%               connection setup/teardown.
+%%%   concurrent  Each worker opens a fresh TCP conn, sends one GET with
+%%%               `Connection: close`, reads the response, closes. Repeats
+%%%               until the duration elapses. Stresses accept + setup/teardown.
 %%%   keep_alive  Each worker opens one TCP conn at start, then loops
-%%%               GET/recv/GET/recv on the same conn until the duration
-%%%               elapses. Stresses the per-conn state machine and
-%%%               request->finishing->reading_request transition.
-%%%   pipeline    Same as keep_alive but every send packs K requests
-%%%               into one gen_tcp:send and reads K responses back to
-%%%               back. Stresses the buffered-leftover path.
+%%%               GET/recv/GET/recv on the same conn. Stresses the per-conn
+%%%               state machine and the finishing -> reading_request loop-back.
+%%%   pipeline    Same as keep_alive but every send packs K requests into one
+%%%               gen_tcp:send and reads K responses back to back. Stresses the
+%%%               buffered-leftover path.
 %%%
-%%% Output: a final report with total requests, errors, RPS, latency
-%%% percentiles (p50 / p95 / p99 / max), and bytes transferred.
+%%% Output: total requests, errors, RPS, latency percentiles (p50 / p95 /
+%%% p99 / max), and bytes transferred. With `--profile`, an eprof hotspot
+%%% table follows the report.
 
 -mode(compile).
 
@@ -60,7 +39,7 @@
 -define(LISTENER, cactus_stress_listener).
 
 main(Args) ->
-    Opts = parse_args(Args, default_opts()),
+    Opts = parse_args(Args),
     ProjectDir = project_dir(),
     ok = setup_code_paths(ProjectDir),
     {Port, StopFn} = start_or_attach(Opts),
@@ -106,7 +85,7 @@ maybe_print_profile(#{profile := true, profile_min_ms := MinMs}) ->
     %% the hottest MFAs land at the bottom of the table -- right above
     %% the next shell prompt where they're easiest to spot.
     _ = eprof:analyze(total, [{filter, [{time, MinUs}]}]),
-    ok = eprof:stop(),
+    stopped = eprof:stop(),
     case file:read_file(LogFile) of
         {ok, Bin} ->
             io:put_chars(Bin),
@@ -119,42 +98,99 @@ maybe_print_profile(#{profile := true, profile_min_ms := MinMs}) ->
 %% Args
 %% ===========================================================================
 
-default_opts() ->
+cli() ->
     #{
-        scenario => ?DEFAULT_SCENARIO,
-        clients => ?DEFAULT_CLIENTS,
-        duration_s => ?DEFAULT_DURATION_S,
-        pipeline => ?DEFAULT_PIPELINE,
-        warmup_s => ?DEFAULT_WARMUP_S,
-        host => ?DEFAULT_HOST,
-        port => undefined,
-        profile => false,
-        profile_min_ms => 1.0
+        help =>
+            "HTTP stress test for cactus.\n\n"
+            "Drives concurrent traffic at a cactus listener and reports "
+            "throughput + latency.\nDesigned for human comparison "
+            "(run before/after a change), not as a CI gate -- numbers vary "
+            "with machine load.",
+        arguments => [
+            #{
+                name => scenario,
+                long => "-scenario",
+                type => {atom, [concurrent, keep_alive, pipeline]},
+                default => ?DEFAULT_SCENARIO,
+                help =>
+                    "concurrent: fresh TCP conn per request (stresses accept).\n"
+                    "keep_alive: persistent conn, sequential GETs.\n"
+                    "pipeline:   K requests per send on one conn."
+            },
+            #{
+                name => clients,
+                long => "-clients",
+                type => {integer, [{min, 1}]},
+                default => ?DEFAULT_CLIENTS,
+                help => "Number of worker processes."
+            },
+            #{
+                name => duration_s,
+                long => "-duration",
+                type => {integer, [{min, 1}]},
+                default => ?DEFAULT_DURATION_S,
+                help => "Seconds to run the measured phase."
+            },
+            #{
+                name => pipeline,
+                long => "-pipeline",
+                type => {integer, [{min, 1}]},
+                default => ?DEFAULT_PIPELINE,
+                help => "Requests per pipelined burst (pipeline scenario)."
+            },
+            #{
+                name => warmup_s,
+                long => "-warmup",
+                type => {integer, [{min, 0}]},
+                default => ?DEFAULT_WARMUP_S,
+                help => "Seconds of pre-measurement traffic discarded from the report."
+            },
+            #{
+                name => host,
+                long => "-host",
+                type => string,
+                default => ?DEFAULT_HOST,
+                help => "Target host (used with --port)."
+            },
+            #{
+                name => port,
+                long => "-port",
+                type => {integer, [{min, 1}, {max, 65535}]},
+                help =>
+                    "Target an already-running listener on this port.\n"
+                    "Without --port, the script boots cactus in-process on a free port."
+            },
+            #{
+                name => profile,
+                long => "-profile",
+                type => boolean,
+                default => false,
+                help =>
+                    "Run the measured phase under eprof and print a hotspot table.\n"
+                    "Throughput numbers under --profile are NOT comparable to a normal run;\n"
+                    "the report exists to point at MFAs worth optimizing."
+            },
+            #{
+                name => profile_min_ms,
+                long => "-profile-min-ms",
+                type => float,
+                default => 1.0,
+                help => "Minimum total ms for a row to appear in the hotspot table."
+            }
+        ]
     }.
 
-parse_args([], Opts) ->
-    Opts;
-parse_args(["--scenario", V | Rest], Opts) ->
-    parse_args(Rest, Opts#{scenario => list_to_atom(V)});
-parse_args(["--clients", V | Rest], Opts) ->
-    parse_args(Rest, Opts#{clients => list_to_integer(V)});
-parse_args(["--duration", V | Rest], Opts) ->
-    parse_args(Rest, Opts#{duration_s => list_to_integer(V)});
-parse_args(["--pipeline", V | Rest], Opts) ->
-    parse_args(Rest, Opts#{pipeline => list_to_integer(V)});
-parse_args(["--warmup", V | Rest], Opts) ->
-    parse_args(Rest, Opts#{warmup_s => list_to_integer(V)});
-parse_args(["--port", V | Rest], Opts) ->
-    parse_args(Rest, Opts#{port => list_to_integer(V)});
-parse_args(["--host", V | Rest], Opts) ->
-    parse_args(Rest, Opts#{host => V});
-parse_args(["--profile" | Rest], Opts) ->
-    parse_args(Rest, Opts#{profile => true});
-parse_args(["--profile-min-ms", V | Rest], Opts) ->
-    parse_args(Rest, Opts#{profile_min_ms => list_to_float(V)});
-parse_args([Unknown | _], _Opts) ->
-    io:format("error: unknown option ~s~n", [Unknown]),
-    halt(1).
+parse_args(Argv) ->
+    Cli = cli(),
+    ProgOpts = #{progname => "stress.escript"},
+    case argparse:parse(Argv, Cli, ProgOpts) of
+        {ok, Parsed, _Path, _Cmd} ->
+            Parsed;
+        {error, Reason} ->
+            io:format(standard_error, "~s~n~n", [argparse:format_error(Reason)]),
+            io:format(standard_error, "~s~n", [argparse:help(Cli, ProgOpts)]),
+            halt(2)
+    end.
 
 %% ===========================================================================
 %% Listener lifecycle (in-process unless --port given)
