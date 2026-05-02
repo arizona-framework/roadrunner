@@ -1041,8 +1041,13 @@ manual_body_full_read_keep_alive_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 3000 -> error(no_normal_exit)
     end,
+    %% Sync the sink before reading sent data: the conn may exit (and
+    %% deliver DOWN) before the sink finishes forwarding the second
+    %% response to the test process. Without this the test flakes
+    %% under scheduler load.
+    ok = sync_sink(Sink),
     Sent = iolist_to_binary(collect_sends(Tag, 100)),
-    ?assert(count_200(Sent) >= 2),
+    ?assertEqual(2, count_200(Sent)),
     stop_sink(Sink).
 
 keep_alive_request_timeout_silent_test() ->
@@ -1240,6 +1245,13 @@ recv_sink_loop(Script, Logger, Tag) ->
     receive
         stop ->
             ok;
+        {sync, From, Ref} ->
+            %% Round-trip handshake — when this reply lands in the
+            %% caller's mailbox, all earlier `{sent, Tag, _}` messages
+            %% the sink forwarded for this Logger have already arrived.
+            %% Use after `receive DOWN` to deflake `collect_sends`.
+            From ! {synced, Ref},
+            recv_sink_loop(Script, Logger, Tag);
         {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
             %% Legacy passive recv — used by `reading_body` (auto +
             %% manual modes) and `roadrunner_conn:read_body/4`.
@@ -1262,6 +1274,24 @@ recv_sink_loop(Script, Logger, Tag) ->
             recv_sink_loop(Script, Logger, Tag);
         _ ->
             recv_sink_loop(Script, Logger, Tag)
+    end.
+
+%% Drain pending sends through the sink before reading them. The conn
+%% can exit (and trigger DOWN) before the sink finishes processing its
+%% inbox of `roadrunner_fake_send` messages and forwarding them to the
+%% test as `{sent, Tag, _}`. This sync round-trip guarantees the sink
+%% has handled every fake_send queued before the call returns; Erlang
+%% preserves message order from one sender to one receiver, so any
+%% `{sent, Tag, _}` already in the sink's mailbox lands in the test's
+%% mailbox before the `{synced, Ref}` reply.
+-spec sync_sink(pid()) -> ok.
+sync_sink(Sink) ->
+    Ref = make_ref(),
+    Sink ! {sync, self(), Ref},
+    receive
+        {synced, Ref} -> ok
+    after 1000 ->
+        error({sync_sink_timeout, Sink})
     end.
 
 dispatch_passive(ConnPid, [], Logger, Tag) ->
