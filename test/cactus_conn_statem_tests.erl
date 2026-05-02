@@ -279,6 +279,47 @@ hibernate_after_fires_during_keep_alive_idle_test() ->
     ok = gen_statem:stop(Pid),
     stop_sink(Sink).
 
+http11_missing_host_header_returns_400_test() ->
+    %% RFC 9112 §3.2: HTTP/1.1 request without Host MUST get 400.
+    %% Mitigates request-smuggling confusion in proxy chains where
+    %% the backend disagrees with the front about the target host.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(
+        Self, Tag, [{recv, ~"GET / HTTP/1.1\r\n\r\n"}]
+    ),
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, fake_proto_opts(no_host)),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 400", _/binary>>, Sent),
+    stop_sink(Sink).
+
+http10_missing_host_header_serves_200_test() ->
+    %% HTTP/1.0 doesn't require Host (RFC 7230 §5.4). A 1.0 request
+    %% without Host should reach the handler normally.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_recv_sink_with_send_log(
+        Self, Tag, [{recv, ~"GET / HTTP/1.0\r\n\r\n"}]
+    ),
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, fake_proto_opts(no_host_http10)),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Sent),
+    stop_sink(Sink).
+
 pipelined_two_requests_in_one_chunk_serves_both_test() ->
     %% RFC 7230 §6.3: an HTTP/1.1 server must handle pipelined
     %% requests — i.e. a client sending request N+1's bytes in the

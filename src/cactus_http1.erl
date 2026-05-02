@@ -463,19 +463,25 @@ a record, so callers don't need to include a header file.
         | header_too_long
         | header_block_too_long
         | too_many_headers
-        | conflicting_framing}.
+        | conflicting_framing
+        | missing_host}.
 parse_request(Bin) when is_binary(Bin) ->
     case parse_request_line(Bin) of
         {ok, Method, Target, Version, Rest} ->
             case parse_headers(Rest) of
                 {ok, Headers, Rest2} ->
-                    Req = #{
-                        method => Method,
-                        target => Target,
-                        version => Version,
-                        headers => Headers
-                    },
-                    {ok, Req, Rest2};
+                    case validate_host(Version, Headers) of
+                        ok ->
+                            Req = #{
+                                method => Method,
+                                target => Target,
+                                version => Version,
+                                headers => Headers
+                            },
+                            {ok, Req, Rest2};
+                        {error, _} = HostErr ->
+                            HostErr
+                    end;
                 {more, _} = More ->
                     More;
                 {error, _} = Err ->
@@ -486,6 +492,19 @@ parse_request(Bin) when is_binary(Bin) ->
         {error, _} = Err ->
             Err
     end.
+
+%% RFC 9112 §3.2 / 7230 §5.4: HTTP/1.1 requests MUST include a Host
+%% header. Absence is a 400 Bad Request, also a request-smuggling
+%% mitigation when proxies forward to backends that disagree on the
+%% target host. HTTP/1.0 didn't require it.
+-spec validate_host(version(), headers()) -> ok | {error, missing_host}.
+validate_host({1, 1}, Headers) ->
+    case lists:keymember(~"host", 1, Headers) of
+        true -> ok;
+        false -> {error, missing_host}
+    end;
+validate_host({1, 0}, _Headers) ->
+    ok.
 
 -doc """
 Parse a single chunk from a chunked transfer-encoded body.

@@ -574,6 +574,18 @@ conn_websocket_bad_frame_closes_test_() ->
         end}
     end}.
 
+conn_websocket_unmasked_frame_closes_test_() ->
+    {setup, fun ws_setup/0, fun ws_cleanup/1, fun(Port) ->
+        {"RFC 6455 §5.1: client MUST mask frames; server closes on unmasked", fun() ->
+            Sock = ws_handshake(Port),
+            %% byte1 = 0x81 (FIN+text), byte2 = 0x05 (mask=0, len=5), then
+            %% raw payload. Server must reject and close.
+            ok = gen_tcp:send(Sock, <<16#81, 16#05, "hello">>),
+            ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 1000)),
+            ok = gen_tcp:close(Sock)
+        end}
+    end}.
+
 conn_websocket_client_disconnect_test_() ->
     {setup, fun ws_setup/0, fun ws_cleanup/1, fun(Port) ->
         {"client closing the TCP socket exits the ws loop cleanly", fun() ->
@@ -617,7 +629,7 @@ ws_handshake(Port) ->
     {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
     ok = gen_tcp:send(
         Sock,
-        ~"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        ~"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
     ),
     _ = recv_until(Sock, ~"\r\n\r\n"),
     Sock.

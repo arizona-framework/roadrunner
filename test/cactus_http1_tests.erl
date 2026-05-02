@@ -460,17 +460,44 @@ request_full_test() ->
         cactus_http1:parse_request(~"GET /foo HTTP/1.1\r\nHost: x\r\n\r\nbody")
     ).
 
-request_no_headers_test() ->
+header_name_with_trailing_space_rejected_test() ->
+    %% RFC 9112 §5.1 / 7230 §3.2.4: no whitespace between header
+    %% name and colon. `Host : x` (space before colon) is malformed
+    %% and a known request-smuggling vector with proxies.
+    ?assertEqual(
+        {error, bad_header},
+        cactus_http1:parse_header(~"Host : example.com\r\n")
+    ).
+
+request_http10_no_host_accepted_test() ->
+    %% RFC 7230 §5.4: HTTP/1.0 doesn't require Host. A 1.0 request
+    %% with no headers is valid.
     ?assertEqual(
         {ok,
             #{
                 method => ~"GET",
                 target => ~"/",
-                version => {1, 1},
+                version => {1, 0},
                 headers => []
             },
             ~""},
+        cactus_http1:parse_request(~"GET / HTTP/1.0\r\n\r\n")
+    ).
+
+request_http11_missing_host_returns_error_test() ->
+    %% RFC 9112 §3.2 / 7230 §5.4: HTTP/1.1 requests MUST include a
+    %% Host header. Absent → 400 (request-smuggling mitigation +
+    %% spec compliance).
+    ?assertEqual(
+        {error, missing_host},
         cactus_http1:parse_request(~"GET / HTTP/1.1\r\n\r\n")
+    ).
+
+request_http11_with_host_accepted_test() ->
+    %% Sanity: Host present satisfies validation.
+    ?assertMatch(
+        {ok, #{headers := [{~"host", ~"x"}]}, ~""},
+        cactus_http1:parse_request(~"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
     ).
 
 %% --- incremental ---

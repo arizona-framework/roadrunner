@@ -23,7 +23,8 @@ handshake_valid_test() ->
         {~"host", ~"example.com"},
         {~"upgrade", ~"websocket"},
         {~"connection", ~"Upgrade"},
-        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="}
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
+        {~"sec-websocket-version", ~"13"}
     ],
     {ok, 101, RespHeaders, ~""} = cactus_ws:handshake_response(Headers),
     ?assertEqual(~"websocket", proplists:get_value(~"upgrade", RespHeaders)),
@@ -38,7 +39,8 @@ handshake_connection_with_keep_alive_test() ->
     Headers = [
         {~"upgrade", ~"websocket"},
         {~"connection", ~"keep-alive, Upgrade"},
-        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="}
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
+        {~"sec-websocket-version", ~"13"}
     ],
     ?assertMatch({ok, 101, _, _}, cactus_ws:handshake_response(Headers)).
 
@@ -84,10 +86,38 @@ handshake_connection_without_upgrade_test() ->
 handshake_missing_key_test() ->
     Headers = [
         {~"upgrade", ~"websocket"},
-        {~"connection", ~"Upgrade"}
+        {~"connection", ~"Upgrade"},
+        {~"sec-websocket-version", ~"13"}
     ],
     ?assertEqual(
         {error, missing_websocket_key},
+        cactus_ws:handshake_response(Headers)
+    ).
+
+handshake_missing_websocket_version_test() ->
+    %% RFC 6455 §4.2: server requires `Sec-WebSocket-Version: 13`.
+    %% Absent → reject (browsers always send it).
+    Headers = [
+        {~"upgrade", ~"websocket"},
+        {~"connection", ~"Upgrade"},
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="}
+    ],
+    ?assertEqual(
+        {error, unsupported_websocket_version},
+        cactus_ws:handshake_response(Headers)
+    ).
+
+handshake_wrong_websocket_version_test() ->
+    %% Older drafts (hybi-08, etc.) use different handshake formats
+    %% — reject anything that isn't `13`.
+    Headers = [
+        {~"upgrade", ~"websocket"},
+        {~"connection", ~"Upgrade"},
+        {~"sec-websocket-version", ~"8"},
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="}
+    ],
+    ?assertEqual(
+        {error, unsupported_websocket_version},
         cactus_ws:handshake_response(Headers)
     ).
 
@@ -295,7 +325,8 @@ handshake_accepts_uppercase_websocket_test() ->
     Headers = [
         {~"upgrade", ~"WEBSOCKET"},
         {~"connection", ~"Upgrade"},
-        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="}
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
+        {~"sec-websocket-version", ~"13"}
     ],
     ?assertMatch({ok, 101, _, _}, cactus_ws:handshake_response(Headers)).
 
@@ -303,7 +334,8 @@ handshake_accepts_mixed_case_websocket_test() ->
     Headers = [
         {~"upgrade", ~"WebSocket"},
         {~"connection", ~"Upgrade"},
-        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="}
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
+        {~"sec-websocket-version", ~"13"}
     ],
     ?assertMatch({ok, 101, _, _}, cactus_ws:handshake_response(Headers)).
 

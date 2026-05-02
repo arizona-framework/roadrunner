@@ -53,7 +53,8 @@ header containing the `upgrade` token, and a non-empty
     | {error,
         missing_websocket_upgrade
         | missing_connection_upgrade
-        | missing_websocket_key}.
+        | missing_websocket_key
+        | unsupported_websocket_version}.
 handshake_response(Headers) when is_list(Headers) ->
     case validate_upgrade(Headers) of
         {ok, Key} ->
@@ -73,7 +74,8 @@ handshake_response(Headers) when is_list(Headers) ->
     | {error,
         missing_websocket_upgrade
         | missing_connection_upgrade
-        | missing_websocket_key}.
+        | missing_websocket_key
+        | unsupported_websocket_version}.
 validate_upgrade(Headers) ->
     %% RFC 7230 §6.7 — upgrade tokens are case-insensitive. Browsers
     %% send `websocket` (lowercase) but other clients may send
@@ -82,9 +84,14 @@ validate_upgrade(Headers) ->
         true ->
             case has_upgrade_token(header_lookup(~"connection", Headers)) of
                 true ->
-                    case header_lookup(~"sec-websocket-key", Headers) of
-                        undefined -> {error, missing_websocket_key};
-                        Key -> {ok, Key}
+                    case validate_version(header_lookup(~"sec-websocket-version", Headers)) of
+                        ok ->
+                            case header_lookup(~"sec-websocket-key", Headers) of
+                                undefined -> {error, missing_websocket_key};
+                                Key -> {ok, Key}
+                            end;
+                        {error, _} = VErr ->
+                            VErr
                     end;
                 false ->
                     {error, missing_connection_upgrade}
@@ -92,6 +99,15 @@ validate_upgrade(Headers) ->
         false ->
             {error, missing_websocket_upgrade}
     end.
+
+%% RFC 6455 §4.1 / §4.2.2: server MUST accept only `Sec-WebSocket-
+%% Version: 13`. Other versions (or missing) → 400. Older drafts
+%% (e.g. version 8 / hybi-08) need a different handshake; we don't
+%% implement them.
+-spec validate_version(binary() | undefined) ->
+    ok | {error, unsupported_websocket_version}.
+validate_version(~"13") -> ok;
+validate_version(_) -> {error, unsupported_websocket_version}.
 
 -spec is_websocket_upgrade(binary() | undefined) -> boolean().
 is_websocket_upgrade(undefined) -> false;
