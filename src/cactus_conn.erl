@@ -198,12 +198,19 @@ refine_conn_label(ProtoOpts, Peer) ->
     proc_lib:set_label({cactus_conn, ListenerName, Peer}),
     ok.
 
-%% 64 random bits in lowercase hex — collision-resistant for billions of
-%% requests, short enough to embed in log lines.
+%% 64-bit unique integer in lowercase hex (16 chars). Used as a
+%% correlation token in `logger:set_process_metadata/1` and telemetry
+%% metadata — *not* a security primitive, so we don't pay for crypto-
+%% strength entropy. `erlang:unique_integer/1` is contention-free
+%% (per-scheduler) and avoids the per-request NIF call to
+%% `crypto:strong_rand_bytes/1` that the profile flagged as a hot spot.
+%% The `band` clamps the value to 64 bits so the hex output is
+%% exactly 16 chars regardless of how big the unique counter grows.
 -doc false.
 -spec generate_request_id() -> binary().
 generate_request_id() ->
-    binary:encode_hex(crypto:strong_rand_bytes(8), lowercase).
+    Id = erlang:unique_integer([positive]) band 16#FFFFFFFFFFFFFFFF,
+    binary:encode_hex(<<Id:64>>, lowercase).
 
 %% Replaces (not merges) the conn process's logger metadata so a
 %% keep-alive request never inherits the previous request's correlation.

@@ -79,7 +79,8 @@ response (`400`, `414`, `431`, etc.).
     %% `auto` mode or in manually-constructed request maps.
     body_state => cactus_conn:body_state(),
     %% Per-request correlation token attached by `cactus_conn` once the
-    %% headers parse. 16 lowercase hex chars (8 bytes of CSPRNG output).
+    %% headers parse. 16 lowercase hex chars from a 64-bit unique integer
+    %% — a correlation token, not a security primitive.
     %% Mirrored into `logger:set_process_metadata/1` so any `?LOG_*` call
     %% from middleware or the handler picks it up automatically.
     request_id => binary(),
