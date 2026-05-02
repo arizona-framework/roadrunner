@@ -31,12 +31,16 @@ response (`400`, `414`, `431`, etc.).
 -define(MAX_CHUNK_HEADER, 8192).
 
 %% `binary:match/2` accepts a pre-compiled pattern (`binary:cp()`), and
-%% the compile cost is non-trivial — measured via `binary:compile_pattern/1`,
-%% it's ~50% of the per-call match time on short header values. We
-%% compile the unsafe-byte alternation once at module load and stash it
-%% in `persistent_term` so `check_header_safe/2` reads a constant on
-%% every call instead of recompiling.
+%% the compile cost is non-trivial. Microbench (OTP 29-rc3, single-byte
+%% LF in a 56-byte header block, 200k iterations):
+%%   raw `<<$\n>>`         : 32 ms
+%%   compiled              : 16 ms  (50% faster)
+%%   re:run with compiled  : 57 ms  (78% slower than raw — don't switch)
+%% We compile the patterns the parser uses repeatedly and stash them in
+%% `persistent_term` so each call reads a constant — `persistent_term:get/1`
+%% measured at the same speed as a bound variable.
 -define(UNSAFE_BYTES_KEY, {?MODULE, unsafe_bytes_cp}).
+-define(LF_KEY, {?MODULE, lf_cp}).
 
 -type version() :: {1, 0} | {1, 1}.
 -type headers() :: [{Name :: binary(), Value :: binary()}].
@@ -134,7 +138,7 @@ parse_request_line(Bin) when is_binary(Bin) ->
     | {more, undefined}
     | {error, bad_request_line | bad_version | request_line_too_long}.
 do_parse_request_line(Bin) ->
-    case binary:match(Bin, ~"\n") of
+    case binary:match(Bin, persistent_term:get(?LF_KEY)) of
         nomatch when byte_size(Bin) > ?MAX_REQUEST_LINE ->
             {error, request_line_too_long};
         nomatch ->
@@ -256,7 +260,7 @@ lines exceeding 8192 bytes are rejected with `bad_header` /
     | {more, undefined}
     | {error, bad_header | header_too_long}.
 parse_header(Bin) when is_binary(Bin) ->
-    case binary:match(Bin, ~"\n") of
+    case binary:match(Bin, persistent_term:get(?LF_KEY)) of
         nomatch when byte_size(Bin) > ?MAX_HEADER_LINE ->
             {error, header_too_long};
         nomatch ->
@@ -762,6 +766,7 @@ init_patterns() ->
         ?UNSAFE_BYTES_KEY,
         binary:compile_pattern([~"\r", ~"\n", ~"\0"])
     ),
+    persistent_term:put(?LF_KEY, binary:compile_pattern(~"\n")),
     ok.
 
 -spec reason(status()) -> binary().
