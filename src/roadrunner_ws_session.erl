@@ -41,6 +41,19 @@ indefinitely vs. ~1KB.
 3-tuple returns (`{reply, OutFrames, NewState}`, `{ok, NewState}`,
 `{close, NewState}`) stay valid — the 4-tuple is purely additive.
 
+## Optional handler callbacks
+
+`init/1` runs once on the awaiting_socket → frame_loop transition,
+**before** the first inbound frame; the handler can push priming
+frames or refuse the session by returning `{close, _}`. `handle_info/2`
+receives any non-transport info message (a pubsub broadcast a handler
+subscribed to in `init/1`, an exit signal from a linked worker, etc.)
+and returns the same shape as `handle_frame/2`. Both are
+`-optional_callbacks` — handlers that don't export them get the
+old behavior (no init action, stray info dropped silently). Whether
+each is exported is cached in `#data` at session start so the BIF
+check doesn't run on every event.
+
 Telemetry: `[roadrunner, ws, upgrade]` fires from `run/4` once the
 launcher has decided to enter the session; `[roadrunner, ws, frame_in]`
 and `[roadrunner, ws, frame_out]` fire from the gen_statem itself for
@@ -58,7 +71,14 @@ every frame.
     buffer :: binary(),
     mod :: module(),
     mod_state :: term(),
-    ctx :: map()
+    ctx :: map(),
+    %% Cached results of `erlang:function_exported/3` for the optional
+    %% callbacks. Computed once in `init/1` and read on every event so
+    %% the BIF call doesn't run on the hot path (handle_info can fire
+    %% per pubsub message — caching turns a ~50ns BIF into a record
+    %% read).
+    has_init :: boolean(),
+    has_handle_info :: boolean()
 }).
 
 -doc """
@@ -146,7 +166,9 @@ init({Socket, Mod, State, Ctx}) ->
                 buffer = <<>>,
                 mod = Mod,
                 mod_state = State,
-                ctx = Ctx
+                ctx = Ctx,
+                has_init = erlang:function_exported(Mod, init, 1),
+                has_handle_info = erlang:function_exported(Mod, handle_info, 2)
             }};
         false ->
             {stop, {bad_handler, Mod}}
@@ -156,6 +178,13 @@ init({Socket, Mod, State, Ctx}) ->
     gen_statem:event_handler_result(atom()).
 awaiting_socket(enter, _Old, _Data) ->
     keep_state_and_data;
+awaiting_socket(info, socket_ready, #data{has_init = true, mod = Mod, mod_state = State} = Data) ->
+    %% Run the optional `init/1` callback once, here at the
+    %% awaiting_socket → frame_loop boundary. Placing it here (and not
+    %% in `frame_loop(enter, ...)`) means it fires **once** per session
+    %% by construction, regardless of any future state additions that
+    %% might re-enter `frame_loop`.
+    apply_handler_result(Mod:init(State), Data, false, fun continue_to_frame_loop/2);
 awaiting_socket(info, socket_ready, Data) ->
     {next_state, frame_loop, Data}.
 
@@ -180,8 +209,10 @@ frame_loop(info, Msg, #data{socket = Socket} = Data) ->
         {ErrorTag, _Sock, _Reason} ->
             {stop, normal, Data};
         _Other ->
-            %% Unexpected info — drop, re-arm, stay in frame_loop.
-            arm_or_stop(Socket, Data, [])
+            %% Forward to handler's optional handle_info/2 if exported,
+            %% otherwise drop. Mirrors handle_frame's reply / hibernate
+            %% / close return shapes.
+            handle_info_msg(Msg, Data, false)
     end.
 
 -spec terminate(term(), atom(), #data{}) -> ok.
@@ -246,20 +277,49 @@ handle_frame(#{opcode := pong}, Data, Hibernate) ->
     %% Server is not pinging clients yet — pong from client is dropped.
     process_buffer(Data, Hibernate);
 handle_frame(Frame, #data{mod = Mod, mod_state = State} = Data, Hibernate) ->
-    case Mod:handle_frame(Frame, State) of
+    apply_handler_result(Mod:handle_frame(Frame, State), Data, Hibernate, fun process_buffer/2).
+
+-spec handle_info_msg(term(), #data{}, boolean()) ->
+    gen_statem:event_handler_result(atom()).
+handle_info_msg(Msg, #data{has_handle_info = true, mod = Mod, mod_state = State} = Data, Hibernate) ->
+    apply_handler_result(Mod:handle_info(Msg, State), Data, Hibernate, fun continue_arm/2);
+handle_info_msg(_Msg, #data{has_handle_info = false, socket = Socket} = Data, _Hibernate) ->
+    arm_or_stop(Socket, Data, []).
+
+%% Named continue functions used by `apply_handler_result` — pass these
+%% by reference instead of allocating a closure per invocation.
+%% `process_buffer/2` (already named) is the continue for handle_frame.
+-spec continue_arm(#data{}, boolean()) -> gen_statem:event_handler_result(atom()).
+continue_arm(#data{socket = Socket} = Data, Hibernate) ->
+    arm_or_stop(Socket, Data, hibernate_actions(Hibernate)).
+
+-spec continue_to_frame_loop(#data{}, boolean()) -> gen_statem:event_handler_result(atom()).
+continue_to_frame_loop(Data, true) ->
+    {next_state, frame_loop, Data, [hibernate]};
+continue_to_frame_loop(Data, false) ->
+    {next_state, frame_loop, Data}.
+
+-spec apply_handler_result(
+    roadrunner_ws_handler:result(),
+    #data{},
+    boolean(),
+    fun((#data{}, boolean()) -> gen_statem:event_handler_result(atom()))
+) -> gen_statem:event_handler_result(atom()).
+apply_handler_result(Result, Data, Hibernate, Continue) ->
+    case Result of
         {reply, OutFrames, NewState} ->
             _ = send_ws_frames(Data, OutFrames),
-            process_buffer(Data#data{mod_state = NewState}, Hibernate);
+            Continue(Data#data{mod_state = NewState}, Hibernate);
         {reply, OutFrames, NewState, Opts} when is_list(Opts) ->
             _ = send_ws_frames(Data, OutFrames),
-            process_buffer(
+            Continue(
                 Data#data{mod_state = NewState},
                 Hibernate orelse lists:member(hibernate, Opts)
             );
         {ok, NewState} ->
-            process_buffer(Data#data{mod_state = NewState}, Hibernate);
+            Continue(Data#data{mod_state = NewState}, Hibernate);
         {ok, NewState, Opts} when is_list(Opts) ->
-            process_buffer(
+            Continue(
                 Data#data{mod_state = NewState},
                 Hibernate orelse lists:member(hibernate, Opts)
             );

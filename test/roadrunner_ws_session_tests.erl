@@ -243,6 +243,162 @@ frame_loop_drops_unexpected_info_event_test() ->
     Sink ! stop,
     ok = gen_statem:stop(Pid).
 
+%% =============================================================================
+%% Optional callbacks: init/1 and handle_info/2 (arizona-compat)
+%% =============================================================================
+
+init_callback_runs_once_at_session_start_test() ->
+    %% Handler exports `init/1`. It must run BEFORE the first frame
+    %% arrives; verified by an `event init` arriving at the sink before
+    %% any data is sent.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_init => ok},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx()},
+        []
+    ),
+    Pid ! socket_ready,
+    receive
+        {event, init} -> ok
+    after 200 -> ?assert(false)
+    end,
+    ?assert(is_process_alive(Pid)),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+init_callback_can_push_priming_frames_test() ->
+    %% Handler returns `{reply, Frames, _}` from init — frames must
+    %% reach the wire before the session reads any inbound bytes.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_init => {reply, [{text, ~"snapshot"}]}},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx()},
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"snapshot")),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+init_callback_can_request_hibernate_test() ->
+    %% Handler returns `{ok, _, [hibernate]}` from init — session must
+    %% hibernate immediately after the transition to frame_loop.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_init => ok_hibernate},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx()},
+        []
+    ),
+    Pid ! socket_ready,
+    receive
+        {event, init} -> ok
+    after 200 -> ?assert(false)
+    end,
+    ?assert(is_hibernating(Pid, 200)),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+init_callback_close_terminates_session_test() ->
+    %% Handler refuses the upgrade by returning `{close, _}` from init —
+    %% session must send a close frame and stop normally.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_init => close},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx()},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> ?assert(false)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 50)),
+    %% A close frame is opcode 0x88 — first byte of the encoded frame.
+    ?assertEqual(16#88, binary:first(Sent)),
+    Sink ! stop.
+
+handle_info_callback_forwards_stray_message_test() ->
+    %% Handler exports `handle_info/2` and replies — a stray info
+    %% message must reach the handler and produce wire output.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_info => {reply, [{text, ~"forwarded"}]}},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx()},
+        []
+    ),
+    Pid ! socket_ready,
+    timer:sleep(20),
+    Pid ! {pubsub, broadcast, payload},
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"forwarded")),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+handle_info_callback_can_request_hibernate_test() ->
+    %% Handler returns `{ok, _, [hibernate]}` from handle_info — session
+    %% hibernates after handling the stray message.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_info => ok_hibernate},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx()},
+        []
+    ),
+    Pid ! socket_ready,
+    timer:sleep(20),
+    Pid ! some_async_message,
+    receive
+        {event, info} -> ok
+    after 200 -> ?assert(false)
+    end,
+    ?assert(is_hibernating(Pid, 200)),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+handle_info_callback_close_terminates_session_test() ->
+    %% Handler returns `{close, _}` from handle_info — session sends a
+    %% close frame and stops normally.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_info => close},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx()},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    timer:sleep(20),
+    Pid ! shut_me_down,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> ?assert(false)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 50)),
+    %% The handler emits exactly one frame — the close. Opcode 0x88.
+    ?assertMatch(<<16#88, _/binary>>, Sent),
+    Sink ! stop.
+
 %% --- helpers ---
 
 ws_ctx() ->

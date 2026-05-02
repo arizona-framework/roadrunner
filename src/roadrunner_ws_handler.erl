@@ -25,18 +25,44 @@ recognized opt:
   Hibernation has a per-wake CPU cost (~tens of microseconds for
   the GC), so don't enable it for high-frequency frame patterns.
 
-Init and terminate callbacks are intentionally omitted at this stage
-— the initial `State` flows in via the upgrade tuple, and most
-handlers don't need bespoke teardown.
+The optional `init/1` callback runs once in the session process
+after the 101 has been written to the wire and before the first
+frame is read. It receives the state passed via the upgrade tuple
+and may emit zero or more frames or close immediately. Use it to
+register pubsub subscriptions, start linked workers, or push
+priming frames at connect-time (e.g. a snapshot the client
+expects before sending its first frame).
+
+The optional `handle_info/2` callback receives any Erlang message
+delivered to the session process that is not a transport
+`active`-mode tuple (data/closed/error). Use it for pubsub /
+asynchronous push patterns where the handler subscribes to topics
+in `init/1` or `handle_frame/2` and forwards inbound messages to
+the WebSocket peer. Handlers that don't export this callback have
+unknown messages dropped silently.
+
+A `terminate` callback is intentionally NOT provided — most handlers
+don't need bespoke teardown, and the conn process's drain plus
+listener slot reconciliation cover the lifecycle bookkeeping.
+
+All callbacks share the same return shape — `{reply, Frames,
+NewState}`, `{ok, NewState}`, or `{close, NewState}`, optionally
+with a 4-tuple `Opts` list for `hibernate`.
 """.
 
 -type opt() :: hibernate.
 
--callback handle_frame(Frame :: roadrunner_ws:frame(), State :: term()) ->
+-type result() ::
     {reply, Frames :: [{roadrunner_ws:opcode(), iodata()}], NewState :: term()}
     | {reply, Frames :: [{roadrunner_ws:opcode(), iodata()}], NewState :: term(), [opt()]}
     | {ok, NewState :: term()}
     | {ok, NewState :: term(), [opt()]}
     | {close, NewState :: term()}.
 
--export_type([opt/0]).
+-callback init(State :: term()) -> result().
+-callback handle_frame(Frame :: roadrunner_ws:frame(), State :: term()) -> result().
+-callback handle_info(Info :: term(), State :: term()) -> result().
+
+-optional_callbacks([init/1, handle_info/2]).
+
+-export_type([opt/0, result/0]).
