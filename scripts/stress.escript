@@ -241,6 +241,7 @@ print_header(#{
 print_report(_Opts, #{
     total := Total,
     errors := Errors,
+    err_buckets := Buckets,
     bytes_in := BytesIn,
     bytes_out := BytesOut,
     elapsed_us := ElapsedUs,
@@ -279,9 +280,24 @@ print_report(_Opts, #{
         ]
     ),
     io:format(
-        "  latency    : mean ~s | p50 ~s | p95 ~s | p99 ~s | max ~s~n~n",
+        "  latency    : mean ~s | p50 ~s | p95 ~s | p99 ~s | max ~s~n",
         [fmt_ns(Mean), fmt_ns(P50), fmt_ns(P95), fmt_ns(P99), fmt_ns(Max)]
-    ).
+    ),
+    print_err_buckets(Buckets),
+    io:nl().
+
+print_err_buckets(Buckets) when map_size(Buckets) =:= 0 ->
+    ok;
+print_err_buckets(Buckets) ->
+    %% Sort by descending count so the dominant cause shows first.
+    Sorted = lists:sort(
+        fun({_, A}, {_, B}) -> A >= B end, maps:to_list(Buckets)
+    ),
+    Lines = [io_lib:format("~s=~s", [fmt_reason(R), fmt_int(C)]) || {R, C} <- Sorted],
+    io:format("  err causes : ~s~n", [lists:join(", ", Lines)]).
+
+fmt_reason({Class, Sub}) -> io_lib:format("~p:~p", [Class, Sub]);
+fmt_reason(R) -> io_lib:format("~p", [R]).
 
 pct([], _N, _Q) -> 0;
 pct(Sorted, N, Q) ->
@@ -329,6 +345,7 @@ aggregate(PerWorker, ElapsedUs) ->
     Init = #{
         total => 0,
         errors => 0,
+        err_buckets => #{},
         bytes_in => 0,
         bytes_out => 0,
         latencies_ns => [],
@@ -336,10 +353,18 @@ aggregate(PerWorker, ElapsedUs) ->
     },
     lists:foldl(
         fun(W, Acc) ->
-            #{ok := Ok, err := Err, bytes_in := In, bytes_out := Out, latencies_ns := L} = W,
+            #{
+                ok := Ok,
+                err := Err,
+                err_buckets := WB,
+                bytes_in := In,
+                bytes_out := Out,
+                latencies_ns := L
+            } = W,
             #{
                 total := T,
                 errors := E,
+                err_buckets := AB,
                 bytes_in := In0,
                 bytes_out := Out0,
                 latencies_ns := L0
@@ -347,6 +372,7 @@ aggregate(PerWorker, ElapsedUs) ->
             Acc#{
                 total := T + Ok,
                 errors := E + Err,
+                err_buckets := merge_buckets(AB, WB),
                 bytes_in := In0 + In,
                 bytes_out := Out0 + Out,
                 latencies_ns := L ++ L0
@@ -355,6 +381,9 @@ aggregate(PerWorker, ElapsedUs) ->
         Init,
         PerWorker
     ).
+
+merge_buckets(A, B) ->
+    maps:fold(fun(K, V, Acc) -> maps:update_with(K, fun(X) -> X + V end, V, Acc) end, A, B).
 
 %% ===========================================================================
 %% Worker scenarios
@@ -371,7 +400,7 @@ worker_run(#{scenario := S}, _Deadline) ->
     halt(1).
 
 init_acc() ->
-    #{ok => 0, err => 0, bytes_in => 0, bytes_out => 0, latencies_ns => []}.
+    #{ok => 0, err => 0, err_buckets => #{}, bytes_in => 0, bytes_out => 0, latencies_ns => []}.
 
 %% --- concurrent: fresh conn per request -----------------------------------
 
@@ -384,7 +413,7 @@ worker_concurrent(Opts, Deadline, Acc) ->
 do_one_close(#{host := Host, port := Port}, Acc) ->
     Req = ~"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
     T0 = erlang:monotonic_time(nanosecond),
-    case gen_tcp:connect(Host, Port, [binary, {active, false}], 1000) of
+    case gen_tcp:connect(Host, Port, [binary, {active, false}], 5000) of
         {ok, Sock} ->
             case gen_tcp:send(Sock, Req) of
                 ok ->
@@ -394,27 +423,29 @@ do_one_close(#{host := Host, port := Port}, Acc) ->
                     case Reply of
                         <<"HTTP/1.1 200 OK", _/binary>> ->
                             bump_ok(Acc, T1 - T0, byte_size(Req), byte_size(Reply));
+                        <<>> ->
+                            bump_err(Acc, empty_reply);
                         _ ->
-                            bump_err(Acc)
+                            bump_err(Acc, bad_reply)
                     end;
-                {error, _} ->
+                {error, Reason} ->
                     _ = gen_tcp:close(Sock),
-                    bump_err(Acc)
+                    bump_err(Acc, {send, Reason})
             end;
-        {error, _} ->
-            bump_err(Acc)
+        {error, Reason} ->
+            bump_err(Acc, {connect, Reason})
     end.
 
 %% --- keep_alive: persistent conn, sequential requests ---------------------
 
 worker_keep_alive(#{host := Host, port := Port} = Opts, Deadline) ->
-    case gen_tcp:connect(Host, Port, [binary, {active, false}], 1000) of
+    case gen_tcp:connect(Host, Port, [binary, {active, false}], 5000) of
         {ok, Sock} ->
             Acc = keep_alive_loop(Opts, Sock, Deadline, init_acc()),
             ok = gen_tcp:close(Sock),
             Acc;
-        {error, _} ->
-            bump_err(init_acc())
+        {error, Reason} ->
+            bump_err(init_acc(), {connect, Reason})
     end.
 
 keep_alive_loop(Opts, Sock, Deadline, Acc) ->
@@ -433,18 +464,18 @@ keep_alive_loop(Opts, Sock, Deadline, Acc) ->
                                 Opts, Sock, Deadline,
                                 bump_ok(Acc, T1 - T0, byte_size(Req), Bytes)
                             );
-                        {error, _} ->
-                            bump_err(Acc)
+                        {error, Reason} ->
+                            bump_err(Acc, {recv, Reason})
                     end;
-                {error, _} ->
-                    bump_err(Acc)
+                {error, Reason} ->
+                    bump_err(Acc, {send, Reason})
             end
     end.
 
 %% --- pipeline: K requests per send, K responses per recv -------------------
 
 worker_pipeline(#{host := Host, port := Port, pipeline := K} = Opts, Deadline) ->
-    case gen_tcp:connect(Host, Port, [binary, {active, false}], 1000) of
+    case gen_tcp:connect(Host, Port, [binary, {active, false}], 5000) of
         {ok, Sock} ->
             Burst = iolist_to_binary(
                 lists:duplicate(K, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -452,8 +483,8 @@ worker_pipeline(#{host := Host, port := Port, pipeline := K} = Opts, Deadline) -
             Acc = pipeline_loop(Opts, Sock, Deadline, K, Burst, init_acc()),
             ok = gen_tcp:close(Sock),
             Acc;
-        {error, _} ->
-            bump_err(init_acc())
+        {error, Reason} ->
+            bump_err(init_acc(), {connect, Reason})
     end.
 
 pipeline_loop(Opts, Sock, Deadline, K, Burst, Acc) ->
@@ -484,11 +515,11 @@ pipeline_loop(Opts, Sock, Deadline, K, Burst, Acc) ->
                                 latencies_ns := lists:duplicate(K, PerReq) ++ L
                             },
                             pipeline_loop(Opts, Sock, Deadline, K, Burst, Acc1);
-                        {error, _} ->
-                            bump_err(Acc)
+                        {error, Reason} ->
+                            bump_err(Acc, {recv, Reason})
                     end;
-                {error, _} ->
-                    bump_err(Acc)
+                {error, Reason} ->
+                    bump_err(Acc, {send, Reason})
             end
     end.
 
@@ -578,7 +609,11 @@ bump_ok(#{ok := O, bytes_in := In, bytes_out := Out, latencies_ns := L} = Acc,
         latencies_ns := [Ns | L]
     }.
 
-bump_err(#{err := E} = Acc) -> Acc#{err := E + 1}.
+bump_err(#{err := E, err_buckets := B} = Acc, Reason) ->
+    Acc#{
+        err := E + 1,
+        err_buckets := maps:update_with(Reason, fun(N) -> N + 1 end, 1, B)
+    }.
 
 %% ===========================================================================
 %% Format helpers
