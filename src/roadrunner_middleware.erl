@@ -32,6 +32,37 @@ lifecycle into five callbacks). It matches the modern
 continuation/decorator pattern used by Plug.Builder, Express.js,
 Tower, and Servant.
 
+## No direct wire writes from middleware
+
+Middleware code never has access to the underlying socket — the
+`Request` map intentionally excludes any socket reference. To
+respond, a middleware **must** return a `Result` (either the one
+from `Next(Req)` or its own response triple); there is no
+`roadrunner_req:reply/4` equivalent to cowboy's mid-flight
+`cowboy_req:reply/4`.
+
+This is a feature, not a limitation. Bytes only hit the wire from
+one place — the conn process — which means:
+
+- `[roadrunner, request, stop]` telemetry fires for every request,
+  with consistent duration and status metadata.
+- gzip wrapping, response transforms, and `Content-Length` framing
+  are applied uniformly regardless of which middleware produced
+  the response.
+- Send errors are handled in one place (`[roadrunner, response,
+  send_failed]` telemetry, drain bookkeeping, slot release).
+- The "halt" pattern is structurally simple: don't call `Next`, just
+  return a response. There's no second halt protocol to maintain
+  (compare: an arizona cowboy adapter has to support BOTH stashed
+  redirects AND raw-write-from-middleware to stay backward-compatible
+  with cowboy's permissiveness; the roadrunner adapter only handles
+  the stashed-redirect path).
+
+If you're porting middleware from cowboy that called
+`cowboy_req:reply/4` directly, replace the call with returning a
+response triple — `{Status, Headers, Body}` — from the middleware,
+and the framework writes the bytes.
+
 ## Where middlewares live
 
 - **Listener-level**: `roadrunner_listener:start_link(_, #{middlewares => [...]})`.
