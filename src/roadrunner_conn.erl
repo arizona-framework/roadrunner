@@ -377,18 +377,18 @@ make_body_state(Framing, Buffered, Recv, Max) ->
     | {error, bad_content_length | bad_transfer_encoding}.
 body_framing(#{cached_decisions := #{is_chunked := true}}) ->
     chunked;
-body_framing(#{cached_decisions := #{is_chunked := false}} = Req) ->
-    %% Either no Transfer-Encoding header (fall through to Content-Length)
-    %% or a non-chunked TE (rare, but rejected per RFC 9112 §6.1).
-    case roadrunner_req:header(~"transfer-encoding", Req) of
-        undefined ->
-            case content_length(Req) of
-                none -> none;
-                {ok, N} -> {content_length, N};
-                {error, _} = Err -> Err
-            end;
-        _ ->
-            {error, bad_transfer_encoding}
+body_framing(#{cached_decisions := #{has_transfer_encoding := true}}) ->
+    %% Non-chunked Transfer-Encoding (e.g. `gzip`). Rejected per
+    %% RFC 9112 §6.1 — we only support identity and chunked.
+    {error, bad_transfer_encoding};
+body_framing(#{cached_decisions := #{content_length := CL}}) ->
+    %% No Transfer-Encoding header. `parse_request/1`'s `check_framing/1`
+    %% already rejected TE+CL combos and inconsistent multi-CL, so the
+    %% cached Content-Length is the body framing.
+    case CL of
+        none -> none;
+        {ok, N} -> {content_length, N};
+        {error, _} = Err -> Err
     end;
 body_framing(Req) ->
     %% Manually-built request maps without cached_decisions — full path.

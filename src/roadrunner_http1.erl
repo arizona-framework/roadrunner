@@ -50,13 +50,24 @@ response (`400`, `414`, `431`, etc.).
     %% True iff `Transfer-Encoding: chunked` (case-insensitive). Hot path
     %% at body-framing time — saves a per-request `string:lowercase`.
     is_chunked := boolean(),
+    %% True iff *any* `Transfer-Encoding` header is present (chunked or
+    %% otherwise). Distinguishes "no TE → use Content-Length" from
+    %% "non-chunked TE → bad_transfer_encoding" without a per-request
+    %% header re-lookup. Always implied by `is_chunked := true`.
+    has_transfer_encoding := boolean(),
     %% True iff `Expect: 100-continue` (case-insensitive). Used by the
     %% body-read path to decide whether to send a 100 before recv.
     expects_continue := boolean(),
     %% Lowercased value of the `Connection` header (`~""` if absent).
     %% `roadrunner_conn:keep_alive_decision/2` and `has_token/2` operate on
     %% this directly without re-lowercasing.
-    connection_lower := binary()
+    connection_lower := binary(),
+    %% Parsed `Content-Length`. `none` if absent; `{ok, N}` if a valid
+    %% non-negative integer; `{error, bad_content_length}` if present but
+    %% malformed. `roadrunner_conn:body_framing/1` consumes this directly
+    %% on the cached path, avoiding a `roadrunner_req:header/2` lookup
+    %% (which lowercases the lookup name) plus a `binary_to_integer/1`.
+    content_length := none | {ok, non_neg_integer()} | {error, bad_content_length}
 }.
 -type request() :: #{
     method := binary(),
@@ -503,20 +514,23 @@ on the hot path measured via `scripts/stress.escript --profile`.
 compute_cached_decisions(Headers) ->
     compute_cached_decisions_loop(Headers, #{
         is_chunked => false,
+        has_transfer_encoding => false,
         expects_continue => false,
-        connection_lower => ~""
+        connection_lower => ~"",
+        content_length => none
     }).
 
 -spec compute_cached_decisions_loop(headers(), cached_decisions()) -> cached_decisions().
 compute_cached_decisions_loop([], Acc) ->
     Acc;
 compute_cached_decisions_loop([{~"transfer-encoding", V} | Rest], Acc) ->
-    Acc1 =
+    Acc1 = Acc#{has_transfer_encoding := true},
+    Acc2 =
         case roadrunner_bin:ascii_lowercase(V) of
-            ~"chunked" -> Acc#{is_chunked := true};
-            _ -> Acc
+            ~"chunked" -> Acc1#{is_chunked := true};
+            _ -> Acc1
         end,
-    compute_cached_decisions_loop(Rest, Acc1);
+    compute_cached_decisions_loop(Rest, Acc2);
 compute_cached_decisions_loop([{~"expect", V} | Rest], Acc) ->
     Acc1 =
         case roadrunner_bin:ascii_lowercase(V) of
@@ -528,8 +542,20 @@ compute_cached_decisions_loop([{~"connection", V} | Rest], Acc) ->
     compute_cached_decisions_loop(
         Rest, Acc#{connection_lower := roadrunner_bin:ascii_lowercase(V)}
     );
+compute_cached_decisions_loop([{~"content-length", V} | Rest], Acc) ->
+    compute_cached_decisions_loop(Rest, Acc#{content_length := parse_content_length(V)});
 compute_cached_decisions_loop([_ | Rest], Acc) ->
     compute_cached_decisions_loop(Rest, Acc).
+
+-spec parse_content_length(binary()) ->
+    {ok, non_neg_integer()} | {error, bad_content_length}.
+parse_content_length(V) ->
+    try binary_to_integer(V) of
+        N when N >= 0 -> {ok, N};
+        _ -> {error, bad_content_length}
+    catch
+        _:_ -> {error, bad_content_length}
+    end.
 
 -doc """
 Parse a complete HTTP/1.1 request (request line + header block).

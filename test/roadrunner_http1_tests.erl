@@ -457,8 +457,10 @@ request_full_test() ->
                 headers => [{~"host", ~"x"}],
                 cached_decisions => #{
                     is_chunked => false,
+                    has_transfer_encoding => false,
                     expects_continue => false,
-                    connection_lower => ~""
+                    connection_lower => ~"",
+                    content_length => none
                 }
             },
             ~"body"},
@@ -486,8 +488,10 @@ request_http10_no_host_accepted_test() ->
                 headers => [],
                 cached_decisions => #{
                     is_chunked => false,
+                    has_transfer_encoding => false,
                     expects_continue => false,
-                    connection_lower => ~""
+                    connection_lower => ~"",
+                    content_length => none
                 }
             },
             ~""},
@@ -507,8 +511,10 @@ cached_decisions_empty_for_empty_headers_test() ->
     ?assertEqual(
         #{
             is_chunked => false,
+            has_transfer_encoding => false,
             expects_continue => false,
-            connection_lower => ~""
+            connection_lower => ~"",
+            content_length => none
         },
         roadrunner_http1:compute_cached_decisions([])
     ).
@@ -524,11 +530,49 @@ cached_decisions_chunked_lowercased_match_test() ->
     ].
 
 cached_decisions_chunked_unknown_te_does_not_set_flag_test() ->
-    %% Non-chunked TE values leave is_chunked false; the connection layer
-    %% returns {error, bad_transfer_encoding} from there.
+    %% Non-chunked TE values leave is_chunked false but flag the presence
+    %% of *some* Transfer-Encoding so `body_framing/1` can reject it
+    %% without re-reading the header.
     ?assertMatch(
-        #{is_chunked := false},
+        #{is_chunked := false, has_transfer_encoding := true},
         roadrunner_http1:compute_cached_decisions([{~"transfer-encoding", ~"gzip"}])
+    ).
+
+cached_decisions_chunked_te_sets_has_transfer_encoding_test() ->
+    %% `is_chunked := true` always implies `has_transfer_encoding := true`.
+    ?assertMatch(
+        #{is_chunked := true, has_transfer_encoding := true},
+        roadrunner_http1:compute_cached_decisions([{~"transfer-encoding", ~"chunked"}])
+    ).
+
+cached_decisions_caches_valid_content_length_test() ->
+    ?assertMatch(
+        #{content_length := {ok, 256}},
+        roadrunner_http1:compute_cached_decisions([{~"content-length", ~"256"}])
+    ).
+
+cached_decisions_caches_zero_content_length_test() ->
+    ?assertMatch(
+        #{content_length := {ok, 0}},
+        roadrunner_http1:compute_cached_decisions([{~"content-length", ~"0"}])
+    ).
+
+cached_decisions_caches_bad_content_length_non_integer_test() ->
+    ?assertMatch(
+        #{content_length := {error, bad_content_length}},
+        roadrunner_http1:compute_cached_decisions([{~"content-length", ~"abc"}])
+    ).
+
+cached_decisions_caches_bad_content_length_negative_test() ->
+    ?assertMatch(
+        #{content_length := {error, bad_content_length}},
+        roadrunner_http1:compute_cached_decisions([{~"content-length", ~"-1"}])
+    ).
+
+cached_decisions_content_length_default_none_test() ->
+    ?assertMatch(
+        #{content_length := none},
+        roadrunner_http1:compute_cached_decisions([])
     ).
 
 cached_decisions_expects_continue_lowercased_match_test() ->
@@ -558,13 +602,15 @@ cached_decisions_connection_lowercased_test() ->
     ).
 
 cached_decisions_ignores_unrelated_headers_test() ->
-    %% Only the three known case-insensitive headers feed the cache;
+    %% Only the cached case-insensitive headers feed the cache;
     %% unrelated headers (Host, Content-Type, etc.) leave defaults intact.
     ?assertEqual(
         #{
             is_chunked => false,
+            has_transfer_encoding => false,
             expects_continue => false,
-            connection_lower => ~""
+            connection_lower => ~"",
+            content_length => none
         },
         roadrunner_http1:compute_cached_decisions([
             {~"host", ~"x"}, {~"content-type", ~"text/plain"}
