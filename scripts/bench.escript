@@ -1,10 +1,12 @@
 #!/usr/bin/env escript
-%%% Side-by-side throughput bench: roadrunner vs cowboy.
+%%% Side-by-side throughput bench: roadrunner vs cowboy vs elli.
 %%%
 %%% Spawns each server in its OWN peer BEAM (stdio-connected, no
 %%% epmd) so the loadgen running in this escript's BEAM doesn't share
-%%% schedulers with the server. Both servers respond identically:
-%%% 200 OK / text/plain / "alive\r\n" / keep-alive engaged.
+%%% schedulers with the server. All three servers respond identically:
+%%% 200 OK / text/plain / "alive\r\n" / keep-alive engaged for the
+%%% `hello` scenario, or POST /echo with 256-byte body echoed for the
+%%% `echo` scenario.
 %%%
 %%% Honest comparison conditions:
 %%%   - Same handler shape (no per-server bonus telemetry, gzip, etc).
@@ -13,13 +15,14 @@
 %%%   - Servers run sequentially (one at a time) so they don't compete
 %%%     for cores during their measured phase.
 %%%
-%%% First-run: `mise exec -- rebar3 as test compile` once so cowboy and
-%%% the bench handler land in `_build/test/lib/`. After that the
-%%% escript inherits the parent's code path automatically.
+%%% First-run: `mise exec -- rebar3 as test compile` once so the
+%%% non-roadrunner deps (cowboy, elli) and the bench fixtures land in
+%%% `_build/test/lib/`. After that the escript inherits the parent's
+%%% code path automatically.
 %%%
 %%% Usage:
-%%%   ./scripts/bench_vs_cowboy.escript [opts]
-%%%   ./scripts/bench_vs_cowboy.escript --help
+%%%   ./scripts/bench.escript [opts]
+%%%   ./scripts/bench.escript --help
 %%%
 %%% Output: a side-by-side table with throughput, mean / p50 / p95 / p99
 %%% latency, errors per side, and a delta column showing roadrunner's
@@ -44,10 +47,14 @@ main(Args) ->
     print_header(Opts),
     %% Each side runs in isolation: bring the server up, drive load,
     %% bring it down, then do the next.
-    {RrRows, RrLast} = run_side(roadrunner, Opts),
-    {CowboyRows, CowboyLast} = run_side(cowboy, Opts),
-    print_table(RrRows, CowboyRows),
-    print_summary(RrLast, CowboyLast).
+    {_RrRows, RrLast} = run_side(roadrunner, Opts),
+    {_CowboyRows, CowboyLast} = run_side(cowboy, Opts),
+    {_ElliRows, ElliLast} = run_side(elli, Opts),
+    print_summary([
+        {roadrunner, RrLast},
+        {cowboy, CowboyLast},
+        {elli, ElliLast}
+    ]).
 
 %% ===========================================================================
 %% Args
@@ -56,7 +63,7 @@ main(Args) ->
 cli() ->
     #{
         help =>
-            "roadrunner vs cowboy throughput bench.\n\n"
+            "roadrunner vs cowboy vs elli throughput bench.\n\n"
             "Spawns each server in its own peer BEAM, runs the same load "
             "against\neach, and prints a side-by-side comparison.",
         arguments => [
@@ -171,10 +178,44 @@ start_server(cowboy, Scenario) ->
         #{env => #{dispatch => Dispatch}, max_keepalive => 1000000}
     ]),
     Port = peer:call(Peer, ranch, get_port, [bench_cb]),
-    {Peer, Port}.
+    {Peer, Port};
+start_server(elli, _Scenario) ->
+    {ok, Peer, _Node} = peer:start_link(#{
+        name => peer:random_name(),
+        connection => standard_io,
+        args => pa_args_for_peer(),
+        wait_boot => 10000
+    }),
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [elli]),
+    %% Elli routes via callback pattern-matching, so the same callback
+    %% module serves both scenarios. The handler chooses based on
+    %% method+path. `min_acceptors` matches cowboy/roadrunner's
+    %% 10-acceptor pool.
+    %% Elli doesn't expose `get_port/1` and inspecting the gen_server
+    %% state across the stdio-peer boundary is awkward (remote pid
+    %% representation isn't shared). Easiest robust approach: pick a
+    %% free port locally by binding+closing a probe socket, then
+    %% point elli at it. There's a tiny race (another process could
+    %% grab the port between probe and elli's listen), but for a
+    %% bench harness on a quiet machine that's fine.
+    %% Run elli's start AND port discovery inside the peer in one
+    %% `peer:call` so we never need to ship pids back across the
+    %% stdio boundary. The launcher (a regular .erl module under
+    %% test/) spawns the gen_server, reads its state, and returns
+    %% the bound port — all from inside the peer's BEAM.
+    case peer:call(Peer, roadrunner_bench_elli_launcher, start, [
+        roadrunner_bench_elli_handler
+    ]) of
+        {ok, Port} ->
+            {Peer, Port};
+        {error, Reason} ->
+            io:format("error: elli failed to launch: ~p~n", [Reason]),
+            peer:stop(Peer),
+            halt(1)
+    end.
 
 %% Per-scenario server config — same routes/handlers in shape across
-%% the two servers so the comparison stays apples-to-apples.
+%% all three servers so the comparison stays apples-to-apples.
 scenario_roadrunner_opts(hello, BaseOpts) ->
     BaseOpts#{handler => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(echo, BaseOpts) ->
@@ -342,7 +383,7 @@ aggregate(PerWorker, ElapsedUs) ->
 %% ===========================================================================
 
 print_header(#{scenario := S, clients := C, duration_s := D, warmup_s := W, host := H}) ->
-    io:format("~nroadrunner vs cowboy~n"),
+    io:format("~nroadrunner vs cowboy vs elli~n"),
     io:format(
         "  scenario : ~s~n"
         "  clients  : ~B~n"
@@ -416,46 +457,34 @@ fmt_row(#{
         ]
     ).
 
-print_table(_RrRows, _CowboyRows) ->
-    %% Reserved for future multi-step sweeps. Single-row case is already
-    %% printed as each side completes.
-    ok.
-
-print_summary(RrResult, CowboyResult) ->
-    RrRow = result_to_row(roadrunner, RrResult),
-    CbRow = result_to_row(cowboy, CowboyResult),
-    RrRps = maps:get(rps, RrRow),
-    CbRps = maps:get(rps, CbRow),
-    {Faster, FactorPct} =
-        case CbRps > 0 of
-            true ->
-                Delta = (RrRps - CbRps) / CbRps * 100,
-                Label =
-                    case RrRps > CbRps of
-                        true -> "roadrunner faster";
-                        false -> "cowboy faster"
-                    end,
-                {Label, abs(Delta)};
-            false ->
-                {"cowboy reported 0 rps", 0.0}
+print_summary(SidesAndResults) ->
+    Rows = [{Side, result_to_row(Side, R)} || {Side, R} <- SidesAndResults],
+    Sorted = lists:sort(
+        fun({_, A}, {_, B}) -> maps:get(rps, A) >= maps:get(rps, B) end,
+        Rows
+    ),
+    io:format("~nsummary (sorted by throughput, fastest first)~n"),
+    io:format("~-12s  ~10s req/s   ~10s p50   ~10s p99~n", ["server", "", "", ""]),
+    io:format("~s~n", [string:copies("-", 65)]),
+    lists:foreach(
+        fun({Side, Row}) ->
+            io:format(
+                "~-12s  ~10s req/s   ~10s p50   ~10s p99~n",
+                [
+                    atom_to_list(Side),
+                    fmt_int(round(maps:get(rps, Row))),
+                    fmt_ns(maps:get(p50, Row)),
+                    fmt_ns(maps:get(p99, Row))
+                ]
+            )
         end,
+        Sorted
+    ),
     io:format(
-        "~nsummary: ~s by ~.1f%~n"
-        "  roadrunner ~s req/s, p50 ~s, p99 ~s~n"
-        "  cowboy     ~s req/s, p50 ~s, p99 ~s~n"
-        "  NOTE: throughput deltas under ~~15% are inside run-to-run~n"
+        "~n  NOTE: throughput deltas under ~~15% are inside run-to-run~n"
         "        variance — re-run several times before drawing conclusions.~n"
         "        Latency deltas (p50/p99) tend to be more stable.~n",
-        [
-            Faster,
-            FactorPct,
-            fmt_int(round(RrRps)),
-            fmt_ns(maps:get(p50, RrRow)),
-            fmt_ns(maps:get(p99, RrRow)),
-            fmt_int(round(CbRps)),
-            fmt_ns(maps:get(p50, CbRow)),
-            fmt_ns(maps:get(p99, CbRow))
-        ]
+        []
     ).
 
 %% ===========================================================================
