@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_handler).
 -moduledoc """
-Cowboy hello handler used by `scripts/bench_vs_cowboy.escript`.
+Cowboy hello handler used by `scripts/bench.escript`.
 
 Mirrors the response shape of `roadrunner_keepalive_handler` so the
 two servers are comparable on the wire: 200 OK, `text/plain`, body

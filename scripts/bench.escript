@@ -39,6 +39,7 @@
 -define(DEFAULT_WARMUP_S, 1).
 -define(DEFAULT_HOST, "127.0.0.1").
 -define(ECHO_BODY_SIZE, 256).
+-define(LARGE_BODY_SIZE, 65536).
 
 %% Servers known to the bench, in default-run order. Adding a new
 %% server is two steps: append it here and add a clause for it in
@@ -74,15 +75,18 @@ cli() ->
             #{
                 name => scenario,
                 long => "-scenario",
-                type => {atom, [hello, echo]},
+                type => {atom, [hello, echo, large_response]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
                     """
-                    hello: GET / with 1 header, 7-byte body. Bare-minimum HTTP cost.
-                    echo:  POST /echo with 256-byte body and 5 request headers.
-                           Both servers are configured with a router so the
-                           bench exercises body read + multi-header parsing +
-                           dispatch.
+                    hello:          GET / with 1 header, 7-byte body. Bare-minimum
+                                    HTTP cost.
+                    echo:           POST /echo with 256-byte body and 5 request
+                                    headers. Exercises body read + multi-header
+                                    parsing + dispatch.
+                    large_response: GET /large with a 64 KB response body.
+                                    Exercises Content-Length encoding cost and
+                                    kernel-side send batching for big writes.
                     """
             },
             #{
@@ -273,12 +277,16 @@ start_server(elli, _Scenario) ->
 scenario_roadrunner_opts(hello, BaseOpts) ->
     BaseOpts#{handler => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(echo, BaseOpts) ->
-    BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]}.
+    BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
+scenario_roadrunner_opts(large_response, BaseOpts) ->
+    BaseOpts#{routes => [{~"/large", roadrunner_bench_large_handler, undefined}]}.
 
 scenario_cowboy_routes(hello) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
 scenario_cowboy_routes(echo) ->
-    [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}].
+    [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}];
+scenario_cowboy_routes(large_response) ->
+    [{'_', [{"/large", roadrunner_bench_cowboy_large_handler, []}]}].
 
 %% Inherit the parent's code path so the peer sees both default- and
 %% test-profile artifacts (cowboy lives under test).
@@ -331,12 +339,15 @@ build_request(echo) ->
         "Content-Length: ",
         BodyLenBin/binary,
         "\r\n\r\n",
-        Body/binary>>.
+        Body/binary>>;
+build_request(large_response) ->
+    ~"GET /large HTTP/1.1\r\nHost: x\r\n\r\n".
 
 %% Body byte count the recv loop should wait for before claiming the
 %% response is complete.
 expected_body_len(hello) -> 7;
-expected_body_len(echo) -> ?ECHO_BODY_SIZE.
+expected_body_len(echo) -> ?ECHO_BODY_SIZE;
+expected_body_len(large_response) -> ?LARGE_BODY_SIZE.
 
 collect(Pid, TimeoutMs) ->
     receive
@@ -459,7 +470,9 @@ print_header(#{
 scenario_request_summary(hello) ->
     "GET / HTTP/1.1, 1 header, 7-byte response body";
 scenario_request_summary(echo) ->
-    "POST /echo HTTP/1.1, 5 headers, 256-byte body, server echoes (router)".
+    "POST /echo HTTP/1.1, 5 headers, 256-byte body, server echoes (router)";
+scenario_request_summary(large_response) ->
+    "GET /large HTTP/1.1, 1 header, 64 KB response body (router)".
 
 result_to_row(Side, #{
     total := Total,
