@@ -22,6 +22,15 @@
 %%%   --host H          target host (default: 127.0.0.1)
 %%%   --warmup S        seconds of pre-measurement traffic discarded from
 %%%                     the report (default: 1)
+%%%   --profile         run the measured phase under `eprof` and print a
+%%%                     hotspot table after the report. Profiling adds
+%%%                     significant overhead -- throughput numbers under
+%%%                     `--profile` are NOT comparable to a normal run;
+%%%                     the report exists to point at MFAs worth optimizing.
+%%%                     Only useful with --port omitted (in-process listener)
+%%%                     so the listener's processes are traceable.
+%%%   --profile-min-ms F minimum total ms for a row to appear in the
+%%%                     hotspot table (default: 1.0). Lower to see more.
 %%%
 %%% Scenarios:
 %%%   concurrent  Each worker opens a fresh TCP conn, sends one GET
@@ -59,10 +68,51 @@ main(Args) ->
     print_header(Opts1),
     try
         run_warmup(Opts1),
-        Result = run_measured(Opts1),
-        print_report(Opts1, Result)
+        Result = with_optional_profile(Opts1, fun() -> run_measured(Opts1) end),
+        print_report(Opts1, Result),
+        maybe_print_profile(Opts1)
     after
         StopFn()
+    end.
+
+with_optional_profile(#{profile := false}, Fun) ->
+    Fun();
+with_optional_profile(#{profile := true}, Fun) ->
+    %% Trace every currently-alive process plus anything they spawn for
+    %% the duration. set_on_spawn carries the trace flag through child
+    %% spawns -- without it, gen_statem:start/3 (used by cactus_acceptor
+    %% to launch each conn) produces an untraced child and we'd miss the
+    %% hot path entirely. The matchspec `'_'` traces all calls.
+    {ok, _} = eprof:start(),
+    Roots = processes(),
+    profiling = eprof:start_profiling(Roots, {'_', '_', '_'}, [{set_on_spawn, true}]),
+    try
+        Fun()
+    after
+        profiling_stopped = eprof:stop_profiling()
+    end.
+
+maybe_print_profile(#{profile := false}) ->
+    ok;
+maybe_print_profile(#{profile := true, profile_min_ms := MinMs}) ->
+    io:format("profile (eprof, total time, rows >= ~.2f ms)~n", [MinMs]),
+    %% eprof's analyze prints to whatever was set via log/1; pipe to a
+    %% temp file so we can trim out the chatty per-process headers and
+    %% keep only the totals table.
+    LogFile = filename:join(["/tmp", "cactus_stress_eprof.log"]),
+    ok = eprof:log(LogFile),
+    MinUs = trunc(MinMs * 1000),
+    %% Filter rows below the threshold; rows print time-ascending, so
+    %% the hottest MFAs land at the bottom of the table -- right above
+    %% the next shell prompt where they're easiest to spot.
+    _ = eprof:analyze(total, [{filter, [{time, MinUs}]}]),
+    ok = eprof:stop(),
+    case file:read_file(LogFile) of
+        {ok, Bin} ->
+            io:put_chars(Bin),
+            io:nl();
+        {error, Reason} ->
+            io:format("error: could not read ~s: ~p~n", [LogFile, Reason])
     end.
 
 %% ===========================================================================
@@ -77,7 +127,9 @@ default_opts() ->
         pipeline => ?DEFAULT_PIPELINE,
         warmup_s => ?DEFAULT_WARMUP_S,
         host => ?DEFAULT_HOST,
-        port => undefined
+        port => undefined,
+        profile => false,
+        profile_min_ms => 1.0
     }.
 
 parse_args([], Opts) ->
@@ -96,6 +148,10 @@ parse_args(["--port", V | Rest], Opts) ->
     parse_args(Rest, Opts#{port => list_to_integer(V)});
 parse_args(["--host", V | Rest], Opts) ->
     parse_args(Rest, Opts#{host => V});
+parse_args(["--profile" | Rest], Opts) ->
+    parse_args(Rest, Opts#{profile => true});
+parse_args(["--profile-min-ms", V | Rest], Opts) ->
+    parse_args(Rest, Opts#{profile_min_ms => list_to_float(V)});
 parse_args([Unknown | _], _Opts) ->
     io:format("error: unknown option ~s~n", [Unknown]),
     halt(1).
