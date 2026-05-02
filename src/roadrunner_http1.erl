@@ -770,18 +770,26 @@ response(Status, Headers, Body) when is_integer(Status, 100, 599) ->
     ].
 
 -spec encode_headers(headers()) -> iodata().
-encode_headers([]) ->
+encode_headers(Headers) ->
+    %% Fetch the unsafe-bytes pattern ONCE here and thread it through
+    %% the per-header injection check. Saves a `persistent_term:get/1`
+    %% per header (was 2 per header for name + value).
+    UnsafeCp = persistent_term:get(?UNSAFE_BYTES_KEY),
+    encode_headers_loop(Headers, UnsafeCp).
+
+-spec encode_headers_loop(headers(), binary:cp()) -> iodata().
+encode_headers_loop([], _UnsafeCp) ->
     [];
-encode_headers([{Name, Value} | Rest]) ->
+encode_headers_loop([{Name, Value} | Rest], UnsafeCp) ->
     %% Defend against HTTP response splitting / header injection: any
     %% CR, LF, or NUL in a header name or value would let an attacker
     %% who controls part of either inject an entirely new header (or
     %% terminate the header block early). Crash hard so a programmer
     %% bug — usually echoing user input into a header without
     %% validation — turns into a 500, not a wire-level vulnerability.
-    ok = check_header_safe(Name, name),
-    ok = check_header_safe(Value, value),
-    [Name, ~": ", Value, ~"\r\n" | encode_headers(Rest)].
+    ok = check_header_safe(Name, name, UnsafeCp),
+    ok = check_header_safe(Value, value, UnsafeCp),
+    [Name, ~": ", Value, ~"\r\n" | encode_headers_loop(Rest, UnsafeCp)].
 
 -doc """
 Validate that a header name or value contains no CR, LF, or NUL —
@@ -795,7 +803,14 @@ to the wire.
 """.
 -spec check_header_safe(binary(), name | value) -> ok.
 check_header_safe(Bin, Kind) when is_binary(Bin) ->
-    case binary:match(Bin, persistent_term:get(?UNSAFE_BYTES_KEY)) of
+    check_header_safe(Bin, Kind, persistent_term:get(?UNSAFE_BYTES_KEY)).
+
+%% Internal entry that accepts a pre-fetched pattern. Used by
+%% `encode_headers/1` to avoid a `persistent_term:get/1` per
+%% (name, value) pair on the response hot path.
+-spec check_header_safe(binary(), name | value, binary:cp()) -> ok.
+check_header_safe(Bin, Kind, UnsafeCp) when is_binary(Bin) ->
+    case binary:match(Bin, UnsafeCp) of
         nomatch -> ok;
         _ -> error({header_injection, Kind, Bin})
     end.
