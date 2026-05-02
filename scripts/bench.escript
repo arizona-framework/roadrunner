@@ -40,21 +40,22 @@
 -define(DEFAULT_HOST, "127.0.0.1").
 -define(ECHO_BODY_SIZE, 256).
 
+%% Servers known to the bench, in default-run order. Adding a new
+%% server is two steps: append it here and add a clause for it in
+%% `start_server/2` (plus any `scenario_*` config helpers below).
+-define(KNOWN_SERVERS, [roadrunner, cowboy, elli]).
+
 main(Args) ->
     Opts = parse_args(Args),
     ProjectDir = project_dir(),
     ok = setup_code_paths(ProjectDir),
     print_header(Opts),
     %% Each side runs in isolation: bring the server up, drive load,
-    %% bring it down, then do the next.
-    {_RrRows, RrLast} = run_side(roadrunner, Opts),
-    {_CowboyRows, CowboyLast} = run_side(cowboy, Opts),
-    {_ElliRows, ElliLast} = run_side(elli, Opts),
-    print_summary([
-        {roadrunner, RrLast},
-        {cowboy, CowboyLast},
-        {elli, ElliLast}
-    ]).
+    %% bring it down, then do the next. Order matches the user's
+    %% --servers list (default: all known servers).
+    Servers = maps:get(servers, Opts),
+    Results = [{S, element(2, run_side(S, Opts))} || S <- Servers],
+    print_summary(Results).
 
 %% ===========================================================================
 %% Args
@@ -78,6 +79,18 @@ cli() ->
                     "       Both servers are configured with a router so the\n"
                     "       bench exercises body read + multi-header parsing +\n"
                     "       dispatch."
+            },
+            #{
+                name => servers,
+                long => "-servers",
+                type => string,
+                default => "roadrunner,cowboy,elli",
+                help =>
+                    "Comma-separated list of servers to run (run order is\n"
+                    "preserved). Known: roadrunner, cowboy, elli. Use to\n"
+                    "compare a subset (e.g. `--servers roadrunner,elli`)\n"
+                    "or to drive load against a single server in\n"
+                    "isolation (`--servers roadrunner`)."
             },
             #{
                 name => clients,
@@ -112,13 +125,47 @@ cli() ->
 
 parse_args(Argv) ->
     Cli = cli(),
-    ProgOpts = #{progname => "bench_vs_cowboy.escript"},
+    ProgOpts = #{progname => "bench.escript"},
     case argparse:parse(Argv, Cli, ProgOpts) of
         {ok, Parsed, _Path, _Cmd} ->
-            Parsed;
+            Parsed#{servers => parse_servers(maps:get(servers, Parsed))};
         {error, Reason} ->
             io:format(standard_error, "~s~n~n", [argparse:format_error(Reason)]),
             io:format(standard_error, "~s~n", [argparse:help(Cli, ProgOpts)]),
+            halt(2)
+    end.
+
+%% Parse `--servers` (comma-separated) into a list of atoms, validating
+%% each against `?KNOWN_SERVERS`. Preserves the user's order so the
+%% bench runs in the order they typed (e.g. `--servers elli,roadrunner`
+%% runs elli first).
+parse_servers(Str) ->
+    Names = [string:trim(P) || P <- string:split(Str, ",", all), P =/= ""],
+    %% `list_to_existing_atom` blows up on names that aren't already
+    %% atoms — convert via the safe membership check instead so a
+    %% typo produces a clean error message, not a crash.
+    Known = ?KNOWN_SERVERS,
+    KnownStrs = [atom_to_list(A) || A <- Known],
+    Lookup = lists:zip(KnownStrs, Known),
+    {Resolved, Unknown} = lists:foldr(
+        fun(N, {Ok, Bad}) ->
+            case lists:keyfind(N, 1, Lookup) of
+                {_, Atom} -> {[Atom | Ok], Bad};
+                false -> {Ok, [N | Bad]}
+            end
+        end,
+        {[], []},
+        Names
+    ),
+    case Unknown of
+        [] ->
+            Resolved;
+        _ ->
+            io:format(
+                standard_error,
+                "error: unknown servers: ~p (known: ~p)~n",
+                [Unknown, Known]
+            ),
             halt(2)
     end.
 
@@ -382,15 +429,23 @@ aggregate(PerWorker, ElapsedUs) ->
 %% Reporting
 %% ===========================================================================
 
-print_header(#{scenario := S, clients := C, duration_s := D, warmup_s := W, host := H}) ->
-    io:format("~nroadrunner vs cowboy vs elli~n"),
+print_header(#{
+    scenario := S,
+    servers := Servers,
+    clients := C,
+    duration_s := D,
+    warmup_s := W,
+    host := H
+}) ->
+    io:format("~nhttp server bench~n"),
     io:format(
+        "  servers  : ~s~n"
         "  scenario : ~s~n"
         "  clients  : ~B~n"
         "  warmup   : ~Bs~n"
         "  duration : ~Bs~n"
         "  host     : ~s~n",
-        [S, C, W, D, H]
+        [string:join([atom_to_list(A) || A <- Servers], ", "), S, C, W, D, H]
     ),
     io:format("  request  : ~s~n", [scenario_request_summary(S)]).
 
