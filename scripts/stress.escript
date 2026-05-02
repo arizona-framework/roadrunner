@@ -42,6 +42,7 @@
 -define(DEFAULT_SWEEP_START, 10).
 -define(DEFAULT_SWEEP_MAX, 100000).
 -define(DEFAULT_SWEEP_STEP_DURATION, 2).
+-define(DEFAULT_SWEEP_TOLERANCE, 5).
 
 -define(LISTENER, cactus_stress_listener).
 
@@ -213,6 +214,15 @@ cli() ->
                 type => {integer, [{min, 1}]},
                 default => ?DEFAULT_SWEEP_STEP_DURATION,
                 help => "Seconds to run each sweep step."
+            },
+            #{
+                name => sweep_tolerance,
+                long => "-sweep-tolerance",
+                type => {integer, [{min, 1}]},
+                default => ?DEFAULT_SWEEP_TOLERANCE,
+                help =>
+                    "Bisection precision — stop bisecting when the gap between\n"
+                    "last-good and first-fail is below this many clients."
             }
         ]
     }.
@@ -365,43 +375,80 @@ run_measured(Opts) ->
     run_phase(Opts, DurationMs).
 
 %% ===========================================================================
-%% Sweep — push the server until it breaks
+%% Sweep — push the server until it breaks, then bisect the boundary
 %% ===========================================================================
 %%
-%% Doubles the client count each step. Stops when either:
-%%   (a) the sweep cap is hit,
-%%   (b) throughput at step N+1 is < 95% of step N (saturation),
-%%   (c) any server-side error appears (bad_reply, empty_reply, recv:closed).
+%% Two phases:
+%%   1. **Doubling** — double the client count each step until throughput
+%%      regresses ≥5% (saturation) or server-side errors appear (ceiling).
+%%      Fast convergence to the ballpark.
+%%   2. **Bisection** — between the last-good and first-fail counts from
+%%      phase 1, halve the gap until it's smaller than --sweep-tolerance.
+%%      Pinpoints the ceiling precisely.
 %%
 %% Harness-side errors (connect:timeout, EMFILE on the loadgen) are tracked
 %% but NOT a stop condition — they tell us the loadgen ran out of sockets,
 %% not that cactus broke. Raise `ulimit -n` to push further.
 
-run_sweep(#{sweep_start := Start, sweep_max := Max, sweep_step_duration := StepS} = Opts) ->
+run_sweep(
+    #{
+        sweep_start := Start,
+        sweep_max := Max,
+        sweep_step_duration := StepS,
+        sweep_tolerance := Tol
+    } = Opts
+) ->
     StepMs = StepS * 1000,
     BaseOpts = Opts#{scenario => keep_alive, warmup_s => 0},
     io:format(
-        "running sweep: start=~B max=~B step=~Bs (doubling)~n~n",
-        [Start, Max, StepS]
+        "running sweep: start=~B max=~B step=~Bs tolerance=~B~n~n"
+        "phase 1 — doubling~n",
+        [Start, Max, StepS, Tol]
     ),
-    Rows = sweep_loop(BaseOpts, Start, Max, StepMs, undefined, []),
-    print_sweep_table(lists:reverse(Rows)).
+    {Rows1, GoodFail} = doubling_loop(BaseOpts, Start, Max, StepMs, undefined, []),
+    Rows2 =
+        case GoodFail of
+            {LastGood, FirstFail} when FirstFail - LastGood > Tol ->
+                io:format("~nphase 2 — bisecting between ~B and ~B~n", [LastGood, FirstFail]),
+                bisection_loop(BaseOpts, LastGood, FirstFail, StepMs, Tol, []);
+            _ ->
+                []
+        end,
+    print_sweep_table(lists:reverse(Rows1) ++ lists:reverse(Rows2), GoodFail).
 
-sweep_loop(_Opts, N, Max, _StepMs, _Prev, Rows) when N > Max ->
-    Rows;
-sweep_loop(Opts, N, Max, StepMs, PrevRps, Rows) ->
+doubling_loop(_Opts, N, Max, _StepMs, _Prev, Rows) when N > Max ->
+    {Rows, undefined};
+doubling_loop(Opts, N, Max, StepMs, PrevRps, Rows) ->
     Result = run_phase(Opts#{clients => N}, StepMs),
-    Row = sweep_row(N, Result),
+    Row = sweep_row(N, double, Result),
     io:format("  ~s~n", [fmt_sweep_row(Row)]),
     case stop_reason(Row, PrevRps) of
         continue ->
-            sweep_loop(Opts, N * 2, Max, StepMs, maps:get(rps, Row), [Row | Rows]);
+            doubling_loop(Opts, N * 2, Max, StepMs, maps:get(rps, Row), [Row | Rows]);
         {stop, Reason} ->
-            io:format("~nstopping: ~ts~n", [Reason]),
-            [Row | Rows]
+            io:format("~nphase 1 stop: ~ts~n", [Reason]),
+            LastGood = last_good_clients(Rows),
+            {[Row | Rows], {LastGood, N}}
     end.
 
-sweep_row(Clients, #{
+last_good_clients([]) -> 0;
+last_good_clients([#{clients := C} | _]) -> C.
+
+bisection_loop(_Opts, Good, Fail, _StepMs, Tol, Rows) when Fail - Good =< Tol ->
+    Rows;
+bisection_loop(Opts, Good, Fail, StepMs, Tol, Rows) ->
+    Mid = Good + (Fail - Good) div 2,
+    Result = run_phase(Opts#{clients => Mid}, StepMs),
+    Row = sweep_row(Mid, bisect, Result),
+    io:format("  ~s~n", [fmt_sweep_row(Row)]),
+    case maps:get(server_errs, Row) of
+        0 ->
+            bisection_loop(Opts, Mid, Fail, StepMs, Tol, [Row | Rows]);
+        _ ->
+            bisection_loop(Opts, Good, Mid, StepMs, Tol, [Row | Rows])
+    end.
+
+sweep_row(Clients, Phase, #{
     total := Total,
     err_buckets := Buckets,
     elapsed_us := ElapsedUs,
@@ -416,6 +463,7 @@ sweep_row(Clients, #{
         end,
     #{
         clients => Clients,
+        phase => Phase,
         rps => Rps,
         total => Total,
         p50 => pct(Sorted, N, 0.50),
@@ -496,12 +544,12 @@ format_server_err_stop(Buckets) ->
         [Pretty]
     ).
 
-print_sweep_table(Rows) ->
+print_sweep_table(Rows, GoodFail) ->
     io:format(
-        "~n~-8s  ~10s  ~10s  ~10s  ~10s  ~10s~n",
-        ["clients", "rps", "p50", "p99", "harness_e", "server_e"]
+        "~n~-7s  ~-8s  ~10s  ~10s  ~10s  ~10s  ~10s~n",
+        ["phase", "clients", "rps", "p50", "p99", "harness_e", "server_e"]
     ),
-    io:format("~s~n", [string:copies("-", 64)]),
+    io:format("~s~n", [string:copies("-", 75)]),
     lists:foreach(
         fun(R) -> io:format("  ~s~n", [fmt_sweep_row(R)]) end,
         Rows
@@ -516,11 +564,48 @@ print_sweep_table(Rows) ->
             io:format(
                 "peak: ~s req/s at ~B clients~n",
                 [fmt_int(round(Best)), maps:get(clients, BestRow)]
+            ),
+            print_ceiling(GoodFail, Rows)
+    end.
+
+print_ceiling(undefined, _Rows) ->
+    %% Doubling never failed — we hit the cap before the ceiling.
+    io:format("ceiling: not reached (raise --sweep-max to push further)~n");
+print_ceiling({_DGood, _DFail}, Rows) ->
+    %% Use the LOWEST client count with server errors as the first-fail
+    %% boundary, and the highest count STRICTLY BELOW that with no server
+    %% errors as the last-clean. Anything above the first-fail count may
+    %% pass or fail by chance — don't include it in the bracket.
+    Failing = [maps:get(clients, R) || R <- Rows, maps:get(server_errs, R) > 0],
+    case Failing of
+        [] ->
+            io:format(
+                "ceiling: no server errors observed — limit was throughput "
+                "saturation, not failure~n"
+            );
+        _ ->
+            LowestFail = lists:min(Failing),
+            CleanBelow = [
+                maps:get(clients, R)
+             || R <- Rows,
+                maps:get(server_errs, R) =:= 0,
+                maps:get(clients, R) < LowestFail
+            ],
+            HighestOk =
+                case CleanBelow of
+                    [] -> 0;
+                    _ -> lists:max(CleanBelow)
+                end,
+            io:format(
+                "ceiling: server errors first observed at ~B clients "
+                "(highest clean below: ~B)~n",
+                [LowestFail, HighestOk]
             )
     end.
 
 fmt_sweep_row(#{
     clients := C,
+    phase := Phase,
     rps := Rps,
     p50 := P50,
     p99 := P99,
@@ -528,9 +613,12 @@ fmt_sweep_row(#{
     server_errs := SE
 }) ->
     io_lib:format(
-        "~-8B  ~10s  ~10s  ~10s  ~10B  ~10B",
-        [C, fmt_int(round(Rps)), fmt_ns(P50), fmt_ns(P99), HE, SE]
+        "~-7s  ~-8B  ~10s  ~10s  ~10s  ~10B  ~10B",
+        [phase_label(Phase), C, fmt_int(round(Rps)), fmt_ns(P50), fmt_ns(P99), HE, SE]
     ).
+
+phase_label(double) -> "double";
+phase_label(bisect) -> "bisect".
 
 run_phase(#{clients := C} = Opts, DurationMs) ->
     Self = self(),
