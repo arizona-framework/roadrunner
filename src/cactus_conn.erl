@@ -297,7 +297,7 @@ resolve_handler({router, ListenerName}, Req) ->
     fun(() -> {ok, binary()} | {error, term()}),
     non_neg_integer()
 ) ->
-    {ok, binary()}
+    {ok, Body :: binary(), Leftover :: binary()}
     | {error,
         content_length_too_large
         | bad_content_length
@@ -308,11 +308,10 @@ read_body(Req, Buffered, RecvFun, MaxCL) ->
         none ->
             %% Per RFC 7230 §3.3.3: a request without `Content-Length`
             %% or `Transfer-Encoding` has a zero-length message body.
-            %% Any leftover bytes in `Buffered` are NOT body — they
-            %% belong to a pipelined next request (which we currently
-            %% drop on the floor; full pipelining support would feed
-            %% these into the next `parse_loop` iteration).
-            {ok, <<>>};
+            %% Any leftover bytes in `Buffered` belong to a pipelined
+            %% next request — preserve them as `Leftover` so the conn
+            %% can feed them into the next `reading_request` parse.
+            {ok, <<>>, Buffered};
         chunked ->
             read_chunked(Buffered, RecvFun, MaxCL, 0);
         {content_length, N} when N > MaxCL ->
@@ -390,10 +389,10 @@ body_framing(Req) ->
     binary(),
     fun(() -> {ok, binary()} | {error, term()})
 ) ->
-    {ok, binary()} | {error, term()}.
+    {ok, binary(), binary()} | {error, term()}.
 read_body_until(N, Acc, _RecvFun) when byte_size(Acc) >= N ->
-    <<Body:N/binary, _/binary>> = Acc,
-    {ok, Body};
+    <<Body:N/binary, Leftover/binary>> = Acc,
+    {ok, Body, Leftover};
 read_body_until(N, Acc, RecvFun) ->
     case RecvFun() of
         {ok, Data} -> read_body_until(N, <<Acc/binary, Data/binary>>, RecvFun);
@@ -411,11 +410,14 @@ read_body_until(N, Acc, RecvFun) ->
     non_neg_integer(),
     non_neg_integer()
 ) ->
-    {ok, binary()} | {error, content_length_too_large | term()}.
+    {ok, binary(), binary()} | {error, content_length_too_large | term()}.
 read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
     case cactus_http1:parse_chunk(Buf) of
-        {ok, last, _Trailers, _Rest} ->
-            {ok, <<>>};
+        {ok, last, _Trailers, Leftover} ->
+            %% Bytes after the size-0 last-chunk + trailer block are
+            %% pipelined-next-request leftover; thread them up so the
+            %% conn can feed them into the next parse.
+            {ok, <<>>, Leftover};
         {ok, Data, Rest} ->
             NewDecoded = Decoded + byte_size(Data),
             if
@@ -423,8 +425,10 @@ read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
                     {error, content_length_too_large};
                 true ->
                     case read_chunked(Rest, RecvFun, MaxCL, NewDecoded) of
-                        {ok, More} -> {ok, <<Data/binary, More/binary>>};
-                        {error, _} = E -> E
+                        {ok, More, Leftover} ->
+                            {ok, <<Data/binary, More/binary>>, Leftover};
+                        {error, _} = E ->
+                            E
                     end
             end;
         {more, _} ->
@@ -439,19 +443,23 @@ read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
     end.
 
 %% Read and discard whatever the handler left in the manual-mode
-%% `body_state`. Called only on the 4-tuple response path; the conn
-%% uses the result to decide whether keep-alive can engage.
+%% `body_state`, returning any post-body leftover bytes that belong
+%% to a pipelined next request. Called only on the 4-tuple response
+%% path; `cactus_conn_statem`'s finishing state threads `Leftover`
+%% forward into the next `reading_request` parse so pipelined
+%% clients get their N+1 request seen.
 -doc false.
--spec drain_body(cactus_http1:request()) -> ok | {error, term()}.
+-spec drain_body(cactus_http1:request()) -> {ok, binary()} | {error, term()}.
 drain_body(#{body_state := BS}) ->
     case consume_body_state(BS, all) of
-        {ok, _Bytes, _BS2} -> ok;
+        {ok, _Bytes, #{buffered := Leftover}} -> {ok, Leftover};
         {error, _} = E -> E
     end;
 drain_body(_Req) ->
     %% No body_state means the handler hand-built `Req2` without using
-    %% manual-mode plumbing. Nothing to drain.
-    ok.
+    %% manual-mode plumbing. Nothing to drain, no pipelined leftover
+    %% to surface.
+    {ok, <<>>}.
 
 -doc """
 Consume bytes from a manual-mode `body_state()`. Returns either the
@@ -469,9 +477,11 @@ full read).
     | {error, term()}.
 consume_body_state(#{framing := none} = BS, _Mode) ->
     %% Per RFC 7230 §3.3.3: no framing means the body is empty.
-    %% Any `buffered` bytes are pipelined-next-request leftovers, not
-    %% body bytes — discard rather than leak them to the handler.
-    {ok, <<>>, BS#{buffered := <<>>}};
+    %% Any `buffered` bytes are pipelined-next-request leftovers —
+    %% preserve them in the body_state's `buffered` field so
+    %% `cactus_conn_statem`'s finishing state can thread them into
+    %% the next `reading_request` parse for full pipelining support.
+    {ok, <<>>, BS};
 consume_body_state(
     #{framing := {content_length, N}, bytes_read := Read} = BS, _Mode
 ) when Read >= N ->

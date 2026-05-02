@@ -279,6 +279,39 @@ hibernate_after_fires_during_keep_alive_idle_test() ->
     ok = gen_statem:stop(Pid),
     stop_sink(Sink).
 
+pipelined_two_requests_in_one_chunk_serves_both_test() ->
+    %% RFC 7230 §6.3: an HTTP/1.1 server must handle pipelined
+    %% requests — i.e. a client sending request N+1's bytes in the
+    %% same TCP packet as request N's headers. The conn now preserves
+    %% post-body leftover bytes across the keep-alive loop-back so
+    %% the next reading_request iteration parses request N+1 from
+    %% the in-buffer bytes (no extra recv needed).
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    %% Two complete GET requests concatenated; both have CL-less /
+    %% no body so `read_body`'s `none` clause threads everything
+    %% past the first request into Leftover.
+    TwoRequests =
+        ~"GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    Sink = spawn_recv_sink_with_send_log(Self, Tag, [
+        {recv, TwoRequests}
+    ]),
+    Opts = (fake_proto_opts(pipelined))#{
+        dispatch := {handler, cactus_manual_keepalive_handler}
+    },
+    {ok, Pid} = cactus_conn_statem:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    %% Both requests were served — exactly two 200s on the wire.
+    ?assertEqual(2, count_200(Sent)),
+    stop_sink(Sink).
+
 end_to_end_hibernate_across_keep_alive_iterations_test() ->
     %% Full keep-alive lifecycle with hibernation: serve req1 → loop
     %% back to reading_request → hibernate during idle → wake on
@@ -310,12 +343,11 @@ end_to_end_hibernate_across_keep_alive_iterations_test() ->
     %% After hibernate_after=30ms, must be hibernated.
     ?assert(is_hibernating(Pid, 300)),
     %% Phase 3: deliver req2 directly. The conn wakes, parses,
-    %% dispatches, and serves a second response.
-    Pid ! {cactus_fake_data, Sink, ~"GET /two HTTP/1.1\r\nHost: x\r\n\r\nGET /three"},
-    %% (^ That last fragment is partial bytes for a third request —
-    %%   they should be ignored when the keep-alive loop-back resets
-    %%   `buffered = <<>>`. We're not testing that here, just making
-    %%   sure the partial doesn't break req2 parsing.)
+    %% dispatches, and serves a second response. (Note: pipelining
+    %% support means partial trailing bytes WOULD now be preserved
+    %% and parsed on the next iteration; we deliver a clean req2
+    %% so the test focuses on the hibernate-wake-rehibernate cycle.)
+    Pid ! {cactus_fake_data, Sink, ~"GET /two HTTP/1.1\r\nHost: x\r\n\r\n"},
     Sent2 = iolist_to_binary(collect_sends(Tag, 300)),
     ?assertEqual(1, count_200(Sent2)),
     %% Phase 4: conn looped back again, hibernates again.

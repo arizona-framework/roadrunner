@@ -38,12 +38,13 @@ parse_loop_parse_error_test() ->
 read_body_no_content_length_test() ->
     %% Per RFC 7230 §3.3.3: a request without Content-Length or
     %% Transfer-Encoding has zero body length. The bytes in `Buffered`
-    %% must NOT be returned as body — they could be a pipelined next
-    %% request's bytes leaking into the handler.
+    %% are returned as `Leftover` (not as body — they belong to the
+    %% pipelined next request) so the conn can thread them into the
+    %% next `reading_request` parse.
     Req = req_with_headers([]),
     NoRecv = fun() -> error(should_not_be_called) end,
     ?assertEqual(
-        {ok, <<>>},
+        {ok, <<>>, ~"leftover bytes"},
         cactus_conn:read_body(Req, ~"leftover bytes", NoRecv, 1000)
     ).
 
@@ -51,7 +52,7 @@ read_body_cl_within_buffer_test() ->
     Req = req_with_headers([{~"content-length", ~"5"}]),
     NoRecv = fun() -> error(should_not_be_called) end,
     ?assertEqual(
-        {ok, ~"hello"},
+        {ok, ~"hello", ~" world"},
         cactus_conn:read_body(Req, ~"hello world", NoRecv, 1000)
     ).
 
@@ -59,7 +60,7 @@ read_body_cl_needs_more_recv_test() ->
     Req = req_with_headers([{~"content-length", ~"11"}]),
     Recv = fun() -> {ok, ~" world"} end,
     ?assertEqual(
-        {ok, ~"hello world"},
+        {ok, ~"hello world", <<>>},
         cactus_conn:read_body(Req, ~"hello", Recv, 1000)
     ).
 
@@ -159,7 +160,7 @@ read_body_chunked_single_in_buffer_test() ->
     Req = req_with_headers([{~"transfer-encoding", ~"chunked"}]),
     NoRecv = fun() -> error(should_not_be_called) end,
     ?assertEqual(
-        {ok, ~"hello"},
+        {ok, ~"hello", <<>>},
         cactus_conn:read_body(Req, ~"5\r\nhello\r\n0\r\n\r\n", NoRecv, 1000)
     ).
 
@@ -167,7 +168,7 @@ read_body_chunked_multiple_in_buffer_test() ->
     Req = req_with_headers([{~"transfer-encoding", ~"chunked"}]),
     NoRecv = fun() -> error(should_not_be_called) end,
     ?assertEqual(
-        {ok, ~"hellofoo"},
+        {ok, ~"hellofoo", <<>>},
         cactus_conn:read_body(Req, ~"5\r\nhello\r\n3\r\nfoo\r\n0\r\n\r\n", NoRecv, 1000)
     ).
 
@@ -176,7 +177,7 @@ read_body_chunked_needs_more_recv_test() ->
     %% First chunk in buffer, terminator chunk arrives via recv.
     Recv = fun() -> {ok, ~"0\r\n\r\n"} end,
     ?assertEqual(
-        {ok, ~"hi"},
+        {ok, ~"hi", <<>>},
         cactus_conn:read_body(Req, ~"2\r\nhi\r\n", Recv, 1000)
     ).
 
@@ -957,7 +958,9 @@ conn_handler_crash_returns_500_test_() ->
 
 consume_state_no_framing_returns_empty_test() ->
     %% No framing → zero-length body per RFC 7230 §3.3.3. The
-    %% `buffered` bytes are pipelined-leftover, not body — discard.
+    %% `buffered` bytes are pipelined-leftover, not body — preserved
+    %% in the body_state so `cactus_conn_statem`'s finishing state can
+    %% thread them into the next reading_request parse.
     State = #{
         framing => none,
         buffered => ~"hi",
@@ -965,7 +968,7 @@ consume_state_no_framing_returns_empty_test() ->
         recv => fun() -> error(unused) end,
         max => 1000
     },
-    ?assertMatch({ok, <<>>, #{buffered := <<>>}}, cactus_conn:consume_body_state(State, all)).
+    ?assertMatch({ok, <<>>, #{buffered := ~"hi"}}, cactus_conn:consume_body_state(State, all)).
 
 consume_state_already_drained_returns_empty_test() ->
     State = #{

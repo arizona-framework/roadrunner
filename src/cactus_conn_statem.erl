@@ -216,21 +216,39 @@ handle_event(
     #data{
         socket = Socket,
         phase = Phase,
-        proto_opts = ProtoOpts
+        proto_opts = ProtoOpts,
+        buffered = Buf
     } = Data0
 ) ->
-    %% Buffered is always `<<>>` on entry — `awaiting_shoot` and
-    %% `finishing` both transition with an empty buffer (the keep-
-    %% alive loop-back resets it). Bytes accumulate during the
-    %% active-mode read loop.
+    %% Buffered is `<<>>` on the first entry from `awaiting_shoot`
+    %% and on keep-alive loop-backs that didn't pipeline. If a prior
+    %% request's `read_body` / `drain_body` left post-body bytes
+    %% (RFC 7230 §6.3 pipelining), `Buf` arrives non-empty and we
+    %% parse it immediately via a state_timeout 0 instead of waiting
+    %% on the next `{tcp, _, _}` info event.
     Timeout = request_timeout(Phase, ProtoOpts),
     Now = erlang:monotonic_time(millisecond),
     Data = Data0#data{
         read_deadline = Now + Timeout,
         read_start_mono = Now,
-        read_bytes_total = 0
+        read_bytes_total = byte_size(Buf)
     },
-    arm_or_stop(Socket, Data, reading_request_timeouts(Timeout, ProtoOpts));
+    case Buf of
+        <<>> ->
+            arm_or_stop(Socket, Data, reading_request_timeouts(Timeout, ProtoOpts));
+        _ ->
+            %% Use a generic_timeout (named) so it coexists with the
+            %% `state_timeout` for `request_deadline`. gen_statem
+            %% allows only one `state_timeout` per state — a second
+            %% one in the same actions list silently replaces the
+            %% first.
+            {keep_state, Data, [
+                {{timeout, parse_pipelined}, 0, parse_pipelined}
+                | reading_request_timeouts(Timeout, ProtoOpts)
+            ]}
+    end;
+handle_event({timeout, parse_pipelined}, parse_pipelined, reading_request, Data) ->
+    parse_buffered_request(Data);
 handle_event(
     state_timeout,
     request_deadline,
@@ -294,8 +312,15 @@ handle_event(
     case BodyBuffering of
         auto ->
             case cactus_conn:read_body(Req, Buffered, Recv, MaxCL) of
-                {ok, Body} ->
-                    {next_state, dispatching, Data#data{req = Req#{body => Body}}};
+                {ok, Body, Leftover} ->
+                    %% `Leftover` is bytes past the body — belongs to a
+                    %% pipelined next request. Stash in `buffered` so
+                    %% the keep-alive loop-back's `reading_request`
+                    %% state_enter can parse it.
+                    {next_state, dispatching, Data#data{
+                        req = Req#{body => Body},
+                        buffered = Leftover
+                    }};
                 {error, content_length_too_large} ->
                     %% Drain a bounded prefix of the oversized body (up
                     %% to 2 * MaxCL bytes, 1s per recv) so the peer
@@ -445,7 +470,7 @@ run_pipeline(Socket, Handler, Req, ListenerMws, #data{} = Data) ->
 ) -> gen_statem:event_handler_result(atom()).
 buffered_finish(Data, ProtoOpts, Req, {_Status, Headers, _Body}, Served) ->
     case cactus_conn:drain_body(Req) of
-        ok ->
+        {ok, ManualLeftover} ->
             case cactus_conn:keep_alive_decision(Req, Headers) of
                 close ->
                     {stop, normal, Data};
@@ -455,11 +480,19 @@ buffered_finish(Data, ProtoOpts, Req, {_Status, Headers, _Body}, Served) ->
                         true ->
                             {stop, normal, Data};
                         false ->
-                            %% Reset per-request scratch and loop back.
+                            %% RFC 7230 §6.3: preserve any post-body
+                            %% bytes for the pipelined next request.
+                            %% In manual mode `drain_body` returns the
+                            %% body_state's leftover; in auto mode the
+                            %% leftover was already stashed in
+                            %% `Data#data.buffered` by `reading_body`.
+                            Leftover = pipelined_leftover(
+                                Req, Data, ManualLeftover
+                            ),
                             {next_state, reading_request, Data#data{
                                 phase = keep_alive,
                                 req = undefined,
-                                buffered = <<>>,
+                                buffered = Leftover,
                                 recv = undefined,
                                 response = undefined
                             }}
@@ -473,6 +506,16 @@ buffered_finish(Data, ProtoOpts, Req, {_Status, Headers, _Body}, Served) ->
 -spec request_timeout(first | keep_alive, cactus_conn:proto_opts()) -> non_neg_integer().
 request_timeout(first, ProtoOpts) -> maps:get(request_timeout, ProtoOpts);
 request_timeout(keep_alive, ProtoOpts) -> maps:get(keep_alive_timeout, ProtoOpts).
+
+%% Pick the right leftover-bytes source for the keep-alive loop-back.
+%% Manual mode owns its leftover in the body_state (returned via
+%% `drain_body/1`); auto mode stashes the leftover in
+%% `Data#data.buffered` from `reading_body`'s `read_body/4` return.
+-spec pipelined_leftover(cactus_http1:request(), #data{}, binary()) -> binary().
+pipelined_leftover(Req, _Data, ManualLeftover) when is_map_key(body_state, Req) ->
+    ManualLeftover;
+pipelined_leftover(_Req, Data, _ManualLeftover) ->
+    Data#data.buffered.
 
 %% State timeouts that bound the request-line/header read phase. The
 %% `state_timeout` enforces the absolute deadline; the
