@@ -30,10 +30,12 @@
 
 -mode(compile).
 
+-define(DEFAULT_SCENARIO, hello).
 -define(DEFAULT_CLIENTS, 50).
 -define(DEFAULT_DURATION_S, 5).
 -define(DEFAULT_WARMUP_S, 1).
 -define(DEFAULT_HOST, "127.0.0.1").
+-define(ECHO_BODY_SIZE, 256).
 
 main(Args) ->
     Opts = parse_args(Args),
@@ -58,6 +60,18 @@ cli() ->
             "Spawns each server in its own peer BEAM, runs the same load "
             "against\neach, and prints a side-by-side comparison.",
         arguments => [
+            #{
+                name => scenario,
+                long => "-scenario",
+                type => {atom, [hello, echo]},
+                default => ?DEFAULT_SCENARIO,
+                help =>
+                    "hello: GET / with 1 header, 7-byte body. Bare-minimum HTTP cost.\n"
+                    "echo:  POST /echo with 256-byte body and 5 request headers.\n"
+                    "       Both servers are configured with a router so the\n"
+                    "       bench exercises body read + multi-header parsing +\n"
+                    "       dispatch."
+            },
             #{
                 name => clients,
                 long => "-clients",
@@ -107,7 +121,7 @@ parse_args(Argv) ->
 
 run_side(Side, Opts) ->
     io:format("~n~s~n", [Side]),
-    {Peer, Port} = start_server(Side),
+    {Peer, Port} = start_server(Side, maps:get(scenario, Opts)),
     try
         run_warmup(Port, Opts),
         Result = run_measured(Port, Opts),
@@ -118,7 +132,7 @@ run_side(Side, Opts) ->
         peer:stop(Peer)
     end.
 
-start_server(roadrunner) ->
+start_server(roadrunner, Scenario) ->
     {ok, Peer, _Node} = peer:start_link(#{
         name => peer:random_name(),
         connection => standard_io,
@@ -126,19 +140,17 @@ start_server(roadrunner) ->
         wait_boot => 10000
     }),
     {ok, _} = peer:call(Peer, application, ensure_all_started, [roadrunner]),
-    {ok, _} = peer:call(Peer, roadrunner, start_listener, [
-        bench_rr,
-        #{
-            port => 0,
-            handler => roadrunner_keepalive_handler,
-            keep_alive_timeout => 60000,
-            max_clients => 100000,
-            max_keep_alive_request => 1000000
-        }
-    ]),
+    BaseOpts = #{
+        port => 0,
+        keep_alive_timeout => 60000,
+        max_clients => 100000,
+        max_keep_alive_request => 1000000
+    },
+    ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
+    {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr, ListenerOpts]),
     Port = peer:call(Peer, roadrunner_listener, port, [bench_rr]),
     {Peer, Port};
-start_server(cowboy) ->
+start_server(cowboy, Scenario) ->
     {ok, Peer, _Node} = peer:start_link(#{
         name => peer:random_name(),
         connection => standard_io,
@@ -146,9 +158,7 @@ start_server(cowboy) ->
         wait_boot => 10000
     }),
     {ok, _} = peer:call(Peer, application, ensure_all_started, [cowboy]),
-    Dispatch = peer:call(Peer, cowboy_router, compile, [
-        [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}]
-    ]),
+    Dispatch = peer:call(Peer, cowboy_router, compile, [scenario_cowboy_routes(Scenario)]),
     %% `max_keepalive` capped to a million so cowboy's per-conn request
     %% counter doesn't trip during the bench (mirrors roadrunner's
     %% `max_keep_alive_request` setting). Cowboy 2.x's TransportOpts is
@@ -162,6 +172,18 @@ start_server(cowboy) ->
     ]),
     Port = peer:call(Peer, ranch, get_port, [bench_cb]),
     {Peer, Port}.
+
+%% Per-scenario server config — same routes/handlers in shape across
+%% the two servers so the comparison stays apples-to-apples.
+scenario_roadrunner_opts(hello, BaseOpts) ->
+    BaseOpts#{handler => roadrunner_keepalive_handler};
+scenario_roadrunner_opts(echo, BaseOpts) ->
+    BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]}.
+
+scenario_cowboy_routes(hello) ->
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
+scenario_cowboy_routes(echo) ->
+    [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}].
 
 %% Inherit the parent's code path so the peer sees both default- and
 %% test-profile artifacts (cowboy lives under test).
@@ -182,19 +204,44 @@ run_warmup(Port, #{warmup_s := W} = Opts) ->
 run_measured(Port, #{duration_s := D} = Opts) ->
     run_phase(Port, Opts, D * 1000).
 
-run_phase(Port, #{clients := C, host := Host}, DurationMs) ->
+run_phase(Port, #{clients := C, host := Host, scenario := Scenario}, DurationMs) ->
     Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    Req = build_request(Scenario),
+    BodyLen = expected_body_len(Scenario),
     Self = self(),
     StartUs = erlang:monotonic_time(microsecond),
     Workers = [
         spawn_link(fun() ->
-            Self ! {self(), worker_loop(Host, Port, Deadline, init_acc())}
+            Self ! {self(), worker_loop(Host, Port, Req, BodyLen, Deadline, init_acc())}
         end)
      || _ <- lists:seq(1, C)
     ],
     PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
     EndUs = erlang:monotonic_time(microsecond),
     aggregate(PerWorker, EndUs - StartUs).
+
+%% Pre-built per-iteration request bytes so the worker hot loop doesn't
+%% allocate. Both scenarios assume the same handler returns
+%% `Content-Length: <BodyLen>` so the recv side can stop deterministically.
+build_request(hello) ->
+    ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+build_request(echo) ->
+    Body = binary:copy(~"x", ?ECHO_BODY_SIZE),
+    BodyLenBin = integer_to_binary(?ECHO_BODY_SIZE),
+    <<"POST /echo HTTP/1.1\r\n",
+        "Host: x\r\n",
+        "User-Agent: roadrunner-bench/1.0\r\n",
+        "Accept: */*\r\n",
+        "Content-Type: application/octet-stream\r\n",
+        "Content-Length: ",
+        BodyLenBin/binary,
+        "\r\n\r\n",
+        Body/binary>>.
+
+%% Body byte count the recv loop should wait for before claiming the
+%% response is complete.
+expected_body_len(hello) -> 7;
+expected_body_len(echo) -> ?ECHO_BODY_SIZE.
 
 collect(Pid, TimeoutMs) ->
     receive
@@ -207,28 +254,30 @@ collect(Pid, TimeoutMs) ->
 init_acc() ->
     #{ok => 0, err => 0, bytes_in => 0, latencies_ns => []}.
 
-worker_loop(Host, Port, Deadline, Acc) ->
+worker_loop(Host, Port, Req, BodyLen, Deadline, Acc) ->
     case gen_tcp:connect(Host, Port, [binary, {active, false}], 5000) of
         {ok, Sock} ->
-            Final = keep_alive_loop(Sock, Deadline, Acc),
+            Final = keep_alive_loop(Sock, Req, BodyLen, Deadline, Acc),
             ok = gen_tcp:close(Sock),
             Final;
         {error, _} ->
             bump_err(Acc)
     end.
 
-keep_alive_loop(Sock, Deadline, Acc) ->
+keep_alive_loop(Sock, Req, BodyLen, Deadline, Acc) ->
     case erlang:monotonic_time(millisecond) >= Deadline of
         true ->
             Acc;
         false ->
             T0 = erlang:monotonic_time(nanosecond),
-            case gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n") of
+            case gen_tcp:send(Sock, Req) of
                 ok ->
-                    case recv_response(Sock, <<>>, 5000) of
+                    case recv_response(Sock, <<>>, BodyLen, 5000) of
                         {ok, Bytes} ->
                             T1 = erlang:monotonic_time(nanosecond),
-                            keep_alive_loop(Sock, Deadline, bump_ok(Acc, T1 - T0, Bytes));
+                            keep_alive_loop(
+                                Sock, Req, BodyLen, Deadline, bump_ok(Acc, T1 - T0, Bytes)
+                            );
                         {error, _} ->
                             bump_err(Acc)
                     end;
@@ -237,18 +286,19 @@ keep_alive_loop(Sock, Deadline, Acc) ->
             end
     end.
 
-%% Read until we have status line + headers + 7-byte body ("alive\r\n").
-%% Both servers respond with that exact body and Content-Length: 7.
-recv_response(Sock, Buf, Timeout) ->
+%% Read until we have status line + headers + the expected body-byte
+%% count. Both scenarios assume the response carries an accurate
+%% `Content-Length` so we know when the body's complete.
+recv_response(Sock, Buf, BodyLen, Timeout) ->
     case binary:split(Buf, ~"\r\n\r\n") of
-        [_Headers, Body] when byte_size(Body) >= 7 ->
+        [_Headers, Body] when byte_size(Body) >= BodyLen ->
             case Buf of
                 <<"HTTP/1.1 200", _/binary>> -> {ok, byte_size(Buf)};
                 _ -> {error, bad_status}
             end;
         _ ->
             case gen_tcp:recv(Sock, 0, Timeout) of
-                {ok, D} -> recv_response(Sock, <<Buf/binary, D/binary>>, Timeout);
+                {ok, D} -> recv_response(Sock, <<Buf/binary, D/binary>>, BodyLen, Timeout);
                 {error, _} = E -> E
             end
     end.
@@ -291,16 +341,22 @@ aggregate(PerWorker, ElapsedUs) ->
 %% Reporting
 %% ===========================================================================
 
-print_header(#{clients := C, duration_s := D, warmup_s := W, host := H}) ->
+print_header(#{scenario := S, clients := C, duration_s := D, warmup_s := W, host := H}) ->
     io:format("~nroadrunner vs cowboy~n"),
     io:format(
+        "  scenario : ~s~n"
         "  clients  : ~B~n"
         "  warmup   : ~Bs~n"
         "  duration : ~Bs~n"
-        "  host     : ~s~n"
-        "  handler  : 200 OK / text/plain / \"alive\\r\\n\" (keep-alive)~n",
-        [C, W, D, H]
-    ).
+        "  host     : ~s~n",
+        [S, C, W, D, H]
+    ),
+    io:format("  request  : ~s~n", [scenario_request_summary(S)]).
+
+scenario_request_summary(hello) ->
+    "GET / HTTP/1.1, 1 header, 7-byte response body";
+scenario_request_summary(echo) ->
+    "POST /echo HTTP/1.1, 5 headers, 256-byte body, server echoes (router)".
 
 result_to_row(Side, #{
     total := Total,
