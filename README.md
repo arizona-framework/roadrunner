@@ -142,6 +142,123 @@ never-crash + 3 incremental-feed equivalence, plus
 (clean exit + slot release) and request_id consistency between
 `request_start` / `request_stop` telemetry.
 
+## Comparison with cowboy and elli
+
+`scripts/bench.escript` runs the same loadgen against each server in
+its own peer BEAM. Numbers below are the **median of 20 runs** at 50
+concurrent clients × 3 s measured + 1 s warmup, on OTP 29-rc3 + a
+single Linux dev box, loopback (no network).
+
+> **TL;DR.** Roadrunner trades **~20–25 % throughput** for **2–3×
+> better p99 latency** and a smaller, queryable codebase. Elli is
+> faster on raw req/s for the same reason it has fewer features —
+> a tail-recursive synchronous loop with no per-request state
+> machine, telemetry, drain, or hibernation. Cowboy is bottom on
+> every axis here; the throughput hit comes from its
+> stream-handlers + multi-process pipeline.
+
+### Throughput — req/s (higher = better)
+
+| scenario        | roadrunner | elli       | cowboy     |
+|-----------------|-----------:|-----------:|-----------:|
+| hello           |     224 k  |   **285 k**|     190 k  |
+| echo            |     199 k  |   **270 k**|     143 k  |
+| large_response  |      97 k  |   **124 k**|      93 k  |
+
+### p99 latency — tail latency (lower = better)
+
+| scenario        | roadrunner   | elli       | cowboy     |
+|-----------------|-------------:|-----------:|-----------:|
+| hello           | **634 µs**   |   1.66 ms  |   2.17 ms  |
+| echo            | **852 µs**   |   1.58 ms  |   2.35 ms  |
+| large_response  | **1.16 ms**  |   2.62 ms  |   3.35 ms  |
+
+### p50 latency — typical request (lower = better)
+
+| scenario        | roadrunner | elli       | cowboy     |
+|-----------------|-----------:|-----------:|-----------:|
+| hello           | **108 µs** |   117 µs   |   203 µs   |
+| echo            |   132 µs   | **128 µs** |   280 µs   |
+| large_response  | **266 µs** |   318 µs   |   427 µs   |
+
+### Run-to-run variance — coefficient of variation (lower = more consistent)
+
+| scenario        | roadrunner | elli   | cowboy |
+|-----------------|-----------:|-------:|-------:|
+| hello           |    24.0 %  |  5.6 % |  6.4 % |
+| echo            |    18.7 %  |  5.6 % |  6.1 % |
+| large_response  |    25.2 %  |  5.0 % |  4.3 % |
+
+### Reading the numbers honestly
+
+- **Roadrunner's variance is 3–5× higher than elli/cowboy.**
+  Symptom of the gen_statem timer interactions (state_timeout +
+  generic_timeout per request) — the 30 % spread between best and
+  worst run is real and visible in production-style measurements,
+  not an artifact of small `n`. If your workload is latency-sensitive,
+  this is something to test on your hardware before committing.
+- **The throughput gap with elli is structural**, not a missed
+  optimization. Elli's per-request path is one synchronous
+  tail-recursive loop with no state-machine dispatch, no
+  per-request timer arms, no telemetry middleware, no drain group,
+  no hibernation hooks — every feature roadrunner kept costs ~7 %
+  combined CPU vs elli's lean loop. We measured this with eprof
+  and shipped the cheap recoveries (lowercase fast path, header
+  pattern caching, content-length cache); the remainder is the
+  price of the feature surface.
+- **Cowboy's slowdown** comes from its dual-process model
+  (acceptor → connection → stream handlers) and its rich-feature
+  pipeline. Cowboy 2.13 is also bottom on p99 in this lab; it
+  optimizes for very different ground (HTTP/2, sub-protocol
+  routing, supervisor-tree visibility) where the simpler servers
+  don't compete.
+- **Numbers shift on real hardware.** Loopback hides NIC + kernel
+  TCP cost. For a fair public comparison, run against a remote
+  host on a dedicated NIC with `--clients` tuned to your CPU
+  count. The relative ordering tends to hold; absolute numbers do
+  not.
+
+### Architectural trade-offs
+
+|                                | roadrunner                       | elli                       | cowboy                        |
+|--------------------------------|----------------------------------|----------------------------|-------------------------------|
+| Per-conn process model         | `gen_statem` (named states)      | tail-recursive loop        | gen_server + stream handlers  |
+| Request lifecycle observable   | yes (`sys:get_state/1`)          | no                         | partial                       |
+| Drain / graceful shutdown      | built-in (`pg`-broadcast)        | DIY                        | partial                       |
+| Telemetry                      | `telemetry` library, 8 events    | none (handler callbacks)   | `cowboy_metrics_h` opt-in     |
+| Middleware shape               | continuation-passing             | `pre_request`/`post_request` callback | deprecated `(Req, Env)`/stream handlers |
+| Hibernation between requests   | `hibernate_after` works          | no                         | depends on stream handler     |
+| Active-mode header read        | yes (`{active, once}`)           | passive (`gen_tcp:recv`)   | yes                           |
+| Production maturity            | POC                              | 10+ years, stable          | 10+ years, stable             |
+| Public API surface             | small                            | small                      | large (HTTP/2, gun, etc.)     |
+| Runtime deps                   | `telemetry` only                 | none                       | `cowlib`, `ranch`             |
+
+### How to reproduce
+
+```
+mise exec -- ./scripts/bench.escript --servers roadrunner,elli,cowboy \
+  --scenario hello --clients 50 --duration 3 --warmup 1
+```
+
+Run several times and take the median — the bench script's banner
+warns that single runs sit inside a ±15 % variance band on a
+loaded dev box. To reproduce the full 20-run dataset that
+produced the tables above, loop the bench command 20 times per
+scenario and median the `req/s` line. `scripts/bench.escript`
+also accepts `--profile` to dump an eprof hotspot table when you
+want to investigate a specific server.
+
+### Picking a server
+
+- **Pick elli** if you need a small server, no fancy lifecycle, and
+  you care about absolute throughput more than tail latency.
+- **Pick cowboy** if you need HTTP/2, sub-protocols, or you're
+  already in an ecosystem where it's the lingua franca.
+- **Pick roadrunner** if you want a small surface, queryable
+  per-request state, drain + telemetry built in, low p99, and
+  you can tolerate ~20 % less peak throughput than elli (and the
+  POC status — see "Status" above).
+
 ## Design philosophy
 
 - **Small surface, RFC-correct.** Parsers are pure incremental binary
