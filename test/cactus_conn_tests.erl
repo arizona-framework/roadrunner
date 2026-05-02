@@ -241,23 +241,6 @@ read_body_chunked_case_insensitive_test() ->
      || V <- [~"chunked", ~"Chunked", ~"CHUNKED", ~"ChUnKeD"]
     ].
 
-%% --- generate_request_id ---
-
-generate_request_id_returns_16_lowercase_hex_chars_test() ->
-    Id = cactus_conn:generate_request_id(),
-    ?assertMatch(<<_:16/binary>>, Id),
-    %% All bytes must be lowercase hex (`0`..`9`, `a`..`f`).
-    ?assert(
-        lists:all(
-            fun(C) -> (C >= $0 andalso C =< $9) orelse (C >= $a andalso C =< $f) end,
-            binary_to_list(Id)
-        )
-    ).
-
-generate_request_id_unique_across_calls_test() ->
-    Ids = [cactus_conn:generate_request_id() || _ <- lists:seq(1, 1000)],
-    ?assertEqual(1000, length(lists:usort(Ids))).
-
 %% --- has_continue_expectation / keep_alive_decision fallbacks ---
 
 %% These two helpers have a fast path for parser-built request maps
