@@ -88,7 +88,12 @@ read it anyway.
     requests_counter := atomics:atomics_ref(),
     minimum_bytes_per_second := non_neg_integer(),
     body_buffering := auto | manual,
-    listener_name => atom()
+    listener_name => atom(),
+    %% Conn-process implementation. Default `statem` dispatches to
+    %% `roadrunner_conn_statem` (gen_statem). Set to `loop` to route
+    %% through `roadrunner_conn_loop`'s tail-recursive variant —
+    %% wire-equivalent, lower variance, in-progress per the perf plan.
+    conn_impl => loop | statem
 }.
 
 %% Opaque body-read state attached to the request in manual buffering
@@ -125,7 +130,12 @@ send the process the atom `shoot` to release it.
 """.
 -spec start(roadrunner_transport:socket(), proto_opts()) -> {ok, pid()}.
 start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
-    {ok, _Pid} = roadrunner_conn_statem:start(Socket, ProtoOpts).
+    case maps:get(conn_impl, ProtoOpts, statem) of
+        statem ->
+            {ok, _Pid} = roadrunner_conn_statem:start(Socket, ProtoOpts);
+        loop ->
+            {ok, _Pid} = roadrunner_conn_loop:start(Socket, ProtoOpts)
+    end.
 
 -doc """
 Join the per-listener `pg` group so `roadrunner_listener:drain/2` can
