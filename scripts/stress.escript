@@ -43,6 +43,7 @@
 -define(DEFAULT_SWEEP_MAX, 100000).
 -define(DEFAULT_SWEEP_STEP_DURATION, 2).
 -define(DEFAULT_SWEEP_TOLERANCE, 5).
+-define(DEFAULT_SWEEP_ERR_RATE_PCT, 0.5).
 
 -define(LISTENER, cactus_stress_listener).
 
@@ -223,6 +224,17 @@ cli() ->
                 help =>
                     "Bisection precision — stop bisecting when the gap between\n"
                     "last-good and first-fail is below this many clients."
+            },
+            #{
+                name => sweep_err_rate_pct,
+                long => "-sweep-err-rate",
+                type => float,
+                default => ?DEFAULT_SWEEP_ERR_RATE_PCT,
+                help =>
+                    "Server-side error rate (%) above which a step is treated\n"
+                    "as a failure. A handful of recv:timeout errors out of\n"
+                    "100k+ requests is normal noise; this filter keeps the\n"
+                    "sweep going until errors actually become significant."
             }
         ]
     }.
@@ -395,36 +407,39 @@ run_sweep(
         sweep_start := Start,
         sweep_max := Max,
         sweep_step_duration := StepS,
-        sweep_tolerance := Tol
+        sweep_tolerance := Tol,
+        sweep_err_rate_pct := ErrRatePct
     } = Opts
 ) ->
     StepMs = StepS * 1000,
     BaseOpts = Opts#{scenario => keep_alive, warmup_s => 0},
     io:format(
-        "running sweep: start=~B max=~B step=~Bs tolerance=~B~n~n"
+        "running sweep: start=~B max=~B step=~Bs tolerance=~B err_rate=~.2f%~n~n"
         "phase 1 — doubling~n",
-        [Start, Max, StepS, Tol]
+        [Start, Max, StepS, Tol, ErrRatePct]
     ),
-    {Rows1, GoodFail} = doubling_loop(BaseOpts, Start, Max, StepMs, undefined, []),
+    {Rows1, GoodFail} = doubling_loop(BaseOpts, Start, Max, StepMs, ErrRatePct, undefined, []),
     Rows2 =
         case GoodFail of
             {LastGood, FirstFail} when FirstFail - LastGood > Tol ->
                 io:format("~nphase 2 — bisecting between ~B and ~B~n", [LastGood, FirstFail]),
-                bisection_loop(BaseOpts, LastGood, FirstFail, StepMs, Tol, []);
+                bisection_loop(BaseOpts, LastGood, FirstFail, StepMs, Tol, ErrRatePct, []);
             _ ->
                 []
         end,
-    print_sweep_table(lists:reverse(Rows1) ++ lists:reverse(Rows2), GoodFail).
+    print_sweep_table(lists:reverse(Rows1) ++ lists:reverse(Rows2), GoodFail, ErrRatePct).
 
-doubling_loop(_Opts, N, Max, _StepMs, _Prev, Rows) when N > Max ->
+doubling_loop(_Opts, N, Max, _StepMs, _ErrRatePct, _Prev, Rows) when N > Max ->
     {Rows, undefined};
-doubling_loop(Opts, N, Max, StepMs, PrevRps, Rows) ->
+doubling_loop(Opts, N, Max, StepMs, ErrRatePct, PrevRps, Rows) ->
     Result = run_phase(Opts#{clients => N}, StepMs),
     Row = sweep_row(N, double, Result),
     io:format("  ~s~n", [fmt_sweep_row(Row)]),
-    case stop_reason(Row, PrevRps) of
+    case stop_reason(Row, PrevRps, ErrRatePct) of
         continue ->
-            doubling_loop(Opts, N * 2, Max, StepMs, maps:get(rps, Row), [Row | Rows]);
+            doubling_loop(
+                Opts, N * 2, Max, StepMs, ErrRatePct, maps:get(rps, Row), [Row | Rows]
+            );
         {stop, Reason} ->
             io:format("~nphase 1 stop: ~ts~n", [Reason]),
             LastGood = last_good_clients(Rows),
@@ -434,18 +449,28 @@ doubling_loop(Opts, N, Max, StepMs, PrevRps, Rows) ->
 last_good_clients([]) -> 0;
 last_good_clients([#{clients := C} | _]) -> C.
 
-bisection_loop(_Opts, Good, Fail, _StepMs, Tol, Rows) when Fail - Good =< Tol ->
+bisection_loop(_Opts, Good, Fail, _StepMs, Tol, _ErrRatePct, Rows) when Fail - Good =< Tol ->
     Rows;
-bisection_loop(Opts, Good, Fail, StepMs, Tol, Rows) ->
+bisection_loop(Opts, Good, Fail, StepMs, Tol, ErrRatePct, Rows) ->
     Mid = Good + (Fail - Good) div 2,
     Result = run_phase(Opts#{clients => Mid}, StepMs),
     Row = sweep_row(Mid, bisect, Result),
     io:format("  ~s~n", [fmt_sweep_row(Row)]),
-    case maps:get(server_errs, Row) of
-        0 ->
-            bisection_loop(Opts, Mid, Fail, StepMs, Tol, [Row | Rows]);
-        _ ->
-            bisection_loop(Opts, Good, Mid, StepMs, Tol, [Row | Rows])
+    case server_errs_above_rate(Row, ErrRatePct) of
+        false ->
+            bisection_loop(Opts, Mid, Fail, StepMs, Tol, ErrRatePct, [Row | Rows]);
+        true ->
+            bisection_loop(Opts, Good, Mid, StepMs, Tol, ErrRatePct, [Row | Rows])
+    end.
+
+%% Server-side error rate as a percentage of attempted requests
+%% (`total + server_errs`). Used as a noise filter so a handful of
+%% recv:timeout flakes out of 100k+ requests don't trip the stop check.
+server_errs_above_rate(#{server_errs := S, total := T}, ErrRatePct) ->
+    Attempted = T + S,
+    case Attempted of
+        0 -> false;
+        _ -> S * 100 / Attempted > ErrRatePct
     end.
 
 sweep_row(Clients, Phase, #{
@@ -508,20 +533,27 @@ server_errs(Buckets) ->
         Buckets
     ).
 
-stop_reason(#{server_errs := S, buckets := Buckets}, _Prev) when S > 0 ->
-    {stop, format_server_err_stop(Buckets)};
-stop_reason(#{rps := Rps}, undefined) when Rps > 0 ->
+stop_reason(#{rps := _} = Row, _Prev, ErrRatePct) ->
+    case server_errs_above_rate(Row, ErrRatePct) of
+        true ->
+            #{buckets := Buckets, server_errs := S, total := T} = Row,
+            {stop, format_server_err_stop(Buckets, S, T)};
+        false ->
+            stop_reason_throughput(Row, _Prev)
+    end.
+
+stop_reason_throughput(#{rps := Rps}, undefined) when Rps > 0 ->
     continue;
-stop_reason(#{rps := _}, undefined) ->
+stop_reason_throughput(#{rps := _}, undefined) ->
     {stop, "no successful requests in first step — abort"};
-stop_reason(#{rps := Rps}, Prev) when Rps >= Prev * 0.95 ->
+stop_reason_throughput(#{rps := Rps}, Prev) when Rps >= Prev * 0.95 ->
     continue;
-stop_reason(_, _) ->
+stop_reason_throughput(_, _) ->
     {stop, "throughput regressed >5% from prior step — saturation"}.
 
-format_server_err_stop(Buckets) ->
-    %% Show the dominant server-side reason so the user knows whether the
-    %% ceiling is "conn closed mid-stream" vs "bad reply" etc.
+format_server_err_stop(Buckets, S, T) ->
+    %% Show the dominant server-side reason + the rate so the user knows
+    %% whether the ceiling is "conn closed mid-stream" vs "bad reply" etc.
     Server = maps:filter(
         fun(K, _) ->
             case K of
@@ -539,12 +571,13 @@ format_server_err_stop(Buckets) ->
         ", ",
         [io_lib:format("~ts=~B", [fmt_reason(R), C]) || {R, C} <- Sorted]
     ),
+    Rate = S * 100 / max(1, T + S),
     io_lib:format(
-        "server-side errors — cactus ceiling reached (~ts)",
-        [Pretty]
+        "server-side errors above noise (~.2f% rate, ~ts)",
+        [Rate, Pretty]
     ).
 
-print_sweep_table(Rows, GoodFail) ->
+print_sweep_table(Rows, GoodFail, ErrRatePct) ->
     io:format(
         "~n~-7s  ~-8s  ~10s  ~10s  ~10s  ~10s  ~10s~n",
         ["phase", "clients", "rps", "p50", "p99", "harness_e", "server_e"]
@@ -565,30 +598,33 @@ print_sweep_table(Rows, GoodFail) ->
                 "peak: ~s req/s at ~B clients~n",
                 [fmt_int(round(Best)), maps:get(clients, BestRow)]
             ),
-            print_ceiling(GoodFail, Rows)
+            print_ceiling(GoodFail, Rows, ErrRatePct)
     end.
 
-print_ceiling(undefined, _Rows) ->
+print_ceiling(undefined, _Rows, _ErrRatePct) ->
     %% Doubling never failed — we hit the cap before the ceiling.
     io:format("ceiling: not reached (raise --sweep-max to push further)~n");
-print_ceiling({_DGood, _DFail}, Rows) ->
-    %% Use the LOWEST client count with server errors as the first-fail
-    %% boundary, and the highest count STRICTLY BELOW that with no server
-    %% errors as the last-clean. Anything above the first-fail count may
-    %% pass or fail by chance — don't include it in the bracket.
-    Failing = [maps:get(clients, R) || R <- Rows, maps:get(server_errs, R) > 0],
+print_ceiling({_DGood, _DFail}, Rows, ErrRatePct) ->
+    %% A "failing" row is one where server-side error rate exceeded the
+    %% threshold. The ceiling sits between the lowest failing client
+    %% count and the highest clean count strictly below it.
+    Failing = [
+        maps:get(clients, R)
+     || R <- Rows, server_errs_above_rate(R, ErrRatePct)
+    ],
     case Failing of
         [] ->
             io:format(
-                "ceiling: no server errors observed — limit was throughput "
-                "saturation, not failure~n"
+                "ceiling: no server errors above ~.2f% rate — limit was "
+                "throughput saturation, not failure~n",
+                [ErrRatePct]
             );
         _ ->
             LowestFail = lists:min(Failing),
             CleanBelow = [
                 maps:get(clients, R)
              || R <- Rows,
-                maps:get(server_errs, R) =:= 0,
+                not server_errs_above_rate(R, ErrRatePct),
                 maps:get(clients, R) < LowestFail
             ],
             HighestOk =
@@ -597,9 +633,9 @@ print_ceiling({_DGood, _DFail}, Rows) ->
                     _ -> lists:max(CleanBelow)
                 end,
             io:format(
-                "ceiling: server errors first observed at ~B clients "
+                "ceiling: server-side errors first cross ~.2f% at ~B clients "
                 "(highest clean below: ~B)~n",
-                [LowestFail, HighestOk]
+                [ErrRatePct, LowestFail, HighestOk]
             )
     end.
 
