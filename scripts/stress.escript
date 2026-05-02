@@ -177,6 +177,20 @@ cli() ->
                     "Without --port, the script boots cactus in-process on a free port."
             },
             #{
+                name => detach_server,
+                long => "-detach-server",
+                type => boolean,
+                default => false,
+                help =>
+                    "Spawn the cactus listener in a SEPARATE BEAM (via OTP\n"
+                    "peer module, stdio-connected) so the loadgen workers\n"
+                    "don't compete with the server for schedulers in the\n"
+                    "same VM. Removes the in-process scheduler-contention\n"
+                    "artifact at the cost of one extra BEAM startup.\n"
+                    "Mutually exclusive with --port — when --detach-server\n"
+                    "is set, --port is ignored."
+            },
+            #{
                 name => profile,
                 long => "-profile",
                 type => boolean,
@@ -255,6 +269,8 @@ parse_args(Argv) ->
 %% Listener lifecycle (in-process unless --port given)
 %% ===========================================================================
 
+start_or_attach(#{detach_server := true}) ->
+    detach_server();
 start_or_attach(#{port := Port}) when is_integer(Port) ->
     {Port, fun() -> ok end};
 start_or_attach(_Opts) ->
@@ -268,6 +284,57 @@ start_or_attach(_Opts) ->
     }),
     Port = cactus_listener:port(?LISTENER),
     {Port, fun() -> ok = cactus:stop_listener(?LISTENER) end}.
+
+%% ===========================================================================
+%% Detached server BEAM (OTP `peer` module)
+%% ===========================================================================
+%%
+%% Spawns a child Erlang VM connected via stdio (no distribution / epmd).
+%% The child inherits the parent's code path, brings up cactus + a
+%% keep-alive listener on port 0 (kernel picks a free one), and reports
+%% the port back. The parent BEAM keeps running as the loadgen.
+%% `peer:stop/1` cleanly shuts the child down at end (also on parent
+%% exception via the `try ... after` wrapper in `main/1`).
+
+detach_server() ->
+    Args = pa_args_for_peer(),
+    case
+        peer:start_link(#{
+            name => peer:random_name(),
+            connection => standard_io,
+            args => Args,
+            wait_boot => 10000
+        })
+    of
+        {ok, Peer, _Node} ->
+            ok = bring_up_listener(Peer),
+            ListenerPort = peer:call(Peer, cactus_listener, port, [?LISTENER]),
+            io:format("detached server: listening on port ~B~n", [ListenerPort]),
+            {ListenerPort, fun() -> peer:stop(Peer) end};
+        {error, Reason} ->
+            io:format("error: failed to spawn detached server: ~p~n", [Reason]),
+            halt(1)
+    end.
+
+bring_up_listener(Peer) ->
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [cactus]),
+    {ok, _} = peer:call(Peer, cactus, start_listener, [
+        ?LISTENER,
+        #{
+            port => 0,
+            handler => cactus_keepalive_handler,
+            keep_alive_timeout => 60000,
+            max_clients => 100000,
+            max_keep_alive_request => 1000000
+        }
+    ]),
+    ok.
+
+%% Inherit the parent's code path so the child sees both default and
+%% test profiles (the keep-alive handler is a test fixture).
+pa_args_for_peer() ->
+    Paths = [P || P <- code:get_path(), filelib:is_dir(P)],
+    lists:foldr(fun(P, Acc) -> ["-pa", P | Acc] end, [], Paths).
 
 %% ===========================================================================
 %% Header / report
