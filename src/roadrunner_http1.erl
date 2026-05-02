@@ -260,7 +260,18 @@ lines exceeding 8192 bytes are rejected with `bad_header` /
     | {more, undefined}
     | {error, bad_header | header_too_long}.
 parse_header(Bin) when is_binary(Bin) ->
-    case binary:match(Bin, persistent_term:get(?LF_KEY)) of
+    parse_header(Bin, persistent_term:get(?LF_KEY)).
+
+%% Internal — accepts the compiled LF pattern so callers in a loop
+%% (e.g. `parse_headers_loop/4`) can fetch it once and pass it
+%% through, instead of paying a `persistent_term:get/1` per header.
+-spec parse_header(binary(), binary:cp()) ->
+    {ok, binary(), binary(), binary()}
+    | {end_of_headers, binary()}
+    | {more, undefined}
+    | {error, bad_header | header_too_long}.
+parse_header(Bin, LfCp) ->
+    case binary:match(Bin, LfCp) of
         nomatch when byte_size(Bin) > ?MAX_HEADER_LINE ->
             {error, header_too_long};
         nomatch ->
@@ -414,7 +425,11 @@ Enforces three hardening limits per OTP PR #11073:
         | too_many_headers
         | conflicting_framing}.
 parse_headers(Bin) when is_binary(Bin) ->
-    case parse_headers_loop(Bin, 0, 0) of
+    %% Fetch the compiled LF pattern ONCE here and thread it through
+    %% the per-header loop. Saves a `persistent_term:get/1` per header
+    %% (was ~6 per parse on a typical request; now 1).
+    LfCp = persistent_term:get(?LF_KEY),
+    case parse_headers_loop(Bin, 0, 0, LfCp) of
         {ok, Headers, Rest} ->
             case check_framing(Headers) of
                 ok -> {ok, Headers, Rest};
@@ -424,7 +439,7 @@ parse_headers(Bin) when is_binary(Bin) ->
             Other
     end.
 
--spec parse_headers_loop(binary(), non_neg_integer(), non_neg_integer()) ->
+-spec parse_headers_loop(binary(), non_neg_integer(), non_neg_integer(), binary:cp()) ->
     {ok, headers(), binary()}
     | {more, undefined}
     | {error,
@@ -432,15 +447,15 @@ parse_headers(Bin) when is_binary(Bin) ->
         | header_too_long
         | header_block_too_long
         | too_many_headers}.
-parse_headers_loop(_Bin, Count, _Consumed) when Count > ?MAX_HEADER_COUNT ->
+parse_headers_loop(_Bin, Count, _Consumed, _LfCp) when Count > ?MAX_HEADER_COUNT ->
     {error, too_many_headers};
-parse_headers_loop(_Bin, _Count, Consumed) when Consumed > ?MAX_HEADER_BLOCK ->
+parse_headers_loop(_Bin, _Count, Consumed, _LfCp) when Consumed > ?MAX_HEADER_BLOCK ->
     {error, header_block_too_long};
-parse_headers_loop(Bin, Count, Consumed) ->
-    case parse_header(Bin) of
+parse_headers_loop(Bin, Count, Consumed, LfCp) ->
+    case parse_header(Bin, LfCp) of
         {ok, Name, Value, Rest} ->
             Used = byte_size(Bin) - byte_size(Rest),
-            case parse_headers_loop(Rest, Count + 1, Consumed + Used) of
+            case parse_headers_loop(Rest, Count + 1, Consumed + Used, LfCp) of
                 {ok, Tail, FinalRest} -> {ok, [{Name, Value} | Tail], FinalRest};
                 Other -> Other
             end;
