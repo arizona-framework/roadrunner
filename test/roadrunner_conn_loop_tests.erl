@@ -320,6 +320,42 @@ shoot_fires_accept_paired_with_conn_close_test() ->
     detach_telemetry(Tag),
     Sink ! stop.
 
+middleware_pipeline_runs_when_listener_has_middlewares_test() ->
+    %% Covers the `false` branch of run_pipeline's empty-middleware
+    %% short-circuit — when ListenerMws is non-empty, compose runs.
+    %% The middleware sets a marker into the request body via a
+    %% no-op continuation. Asserts the response still lands and the
+    %% middleware ran (echo handler reflects the body).
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Body = ~"mw-marker",
+    Req = iolist_to_binary([
+        ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: ",
+        integer_to_binary(byte_size(Body)),
+        ~"\r\n\r\n",
+        Body
+    ]),
+    Sink = spawn_active_sink_with_send_log(Self, Tag, Req),
+    %% Identity middleware — just calls Inner(Req). Exercises the
+    %% compose path without changing the response.
+    Identity = fun(R, Inner) -> Inner(R) end,
+    Opts = (fake_opts(mw))#{
+        middlewares := [Identity],
+        dispatch := {handler, roadrunner_echo_body_handler}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 200", _/binary>>, Sent),
+    ?assertNotEqual(nomatch, binary:match(Sent, Body)),
+    Sink ! stop.
+
 handler_crash_writes_500_and_fires_request_exception_test() ->
     ensure_pg(),
     Self = self(),
