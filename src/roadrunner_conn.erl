@@ -312,7 +312,7 @@ resolve_handler({router, ListenerName}, Req) ->
 read_body(Req, Buffered, RecvFun, MaxCL) ->
     case body_framing(Req) of
         none ->
-            %% Per RFC 7230 §3.3.3: a request without `Content-Length`
+            %% Per RFC 9112 §6.3: a request without `Content-Length`
             %% or `Transfer-Encoding` has a zero-length message body.
             %% Any leftover bytes in `Buffered` belong to a pipelined
             %% next request — preserve them as `Leftover` so the conn
@@ -502,7 +502,7 @@ full read).
     | {more, binary(), body_state()}
     | {error, term()}.
 consume_body_state(#{framing := none} = BS, _Mode) ->
-    %% Per RFC 7230 §3.3.3: no framing means the body is empty.
+    %% Per RFC 9112 §6.3: no framing means the body is empty.
     %% Any `buffered` bytes are pipelined-next-request leftovers —
     %% preserve them in the body_state's `buffered` field so
     %% `roadrunner_conn_loop`'s finishing phase can thread them into
@@ -747,7 +747,7 @@ keep_alive_decision_full(Req, RespHeaders) ->
     RespClose = has_token(RespConn, ~"close"),
     case roadrunner_req:version(Req) of
         {1, 0} ->
-            %% RFC 7230 §6.1: HTTP/1.0 default is close, but
+            %% RFC 9112 §9.3 + RFC 9110 §7.6.1: HTTP/1.0 default is close, but
             %% `Connection: keep-alive` from client opts in (so long
             %% as the response doesn't force close).
             ReqKA = has_token(ReqConn, ~"keep-alive"),

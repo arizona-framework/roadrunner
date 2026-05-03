@@ -187,8 +187,8 @@ if_none_match(Req) ->
 %% Parse a `Range: bytes=N-M`, `bytes=N-`, or `bytes=-S` header against
 %% the file `Size`. `none` means "ignore Range and serve the full body"
 %% — used for missing, malformed, multi-range, and other shapes we
-%% don't honor (per RFC 7233 §3.1: servers MUST ignore unknown range
-%% units). `unsatisfiable` triggers a 416.
+%% don't honor (per RFC 9110 §14.1.1: servers MUST ignore unknown
+%% range units). `unsatisfiable` triggers a 416.
 -spec parse_range(binary() | undefined, non_neg_integer()) ->
     {range, non_neg_integer(), non_neg_integer()} | unsatisfiable | none.
 parse_range(undefined, _Size) ->
@@ -217,8 +217,8 @@ parse_single_range(Spec, Size) ->
                     %% or empty file.
                     unsatisfiable;
                 error ->
-                    %% Malformed (non-numeric, negative): per RFC 7233
-                    %% §3.1 the server MUST ignore Range.
+                    %% Malformed (non-numeric, negative): per RFC 9110
+                    %% §14.2 the server MUST ignore Range.
                     none
             end;
         [StartBin, <<>>] ->
@@ -283,8 +283,8 @@ serve_range(FilePath, Size, ETag, LastMod, Start, End) ->
 
 -spec range_not_satisfiable(non_neg_integer(), binary(), binary()) -> roadrunner_handler:response().
 range_not_satisfiable(Size, ETag, LastMod) ->
-    %% RFC 7233 §4.4: 416 SHOULD include Content-Range with the total
-    %% size so clients can recover.
+    %% RFC 9110 §15.5.17: 416 SHOULD include Content-Range with the
+    %% total size so clients can recover.
     ContentRange = iolist_to_binary([~"bytes */", integer_to_binary(Size)]),
     {416,
         [
@@ -352,7 +352,7 @@ target_inside_docroot(FilePath, Req) ->
             string:prefix(TargetBin, DirAbs) =/= nomatch
     end.
 
-%% Format a posix timestamp as IMF-fixdate (RFC 7231 §7.1.1.1) — the
+%% Format a posix timestamp as IMF-fixdate (RFC 9110 §5.6.7) — the
 %% canonical HTTP date format. Example: `Sun, 06 Nov 1994 08:49:37 GMT`.
 -spec format_http_date(integer()) -> binary().
 format_http_date(Posix) ->

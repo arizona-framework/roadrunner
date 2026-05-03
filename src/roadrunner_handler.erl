@@ -19,7 +19,7 @@ threading `Req` through the entire request lifecycle.
   auto-prepended) and calls `StreamFun(Send)` where
   `Send(Data, nofin | fin | {fin, Trailers})` writes one chunk; `fin`
   also writes the size-0 terminator and `{fin, Trailers}` writes the
-  terminator followed by the given trailer headers (RFC 7230 §4.1.2).
+  terminator followed by the given trailer headers (RFC 9112 §7.1.2).
   Trailer names should be advertised in the response's `Trailer`
   header.
 - `{sendfile, StatusCode, Headers, {Filename, Offset, Length}}` —

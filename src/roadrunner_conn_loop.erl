@@ -79,7 +79,7 @@ response shapes (buffered, `{stream, ...}`, `{loop, ...}`,
     %% Bytes received but not yet parsed. Empty on first iteration;
     %% populated mid-recv when `parse_request/1` returns `{more, _}`,
     %% AND on the keep-alive loop-back when a prior request's body
-    %% drain leaves post-body bytes (RFC 7230 §6.3 pipelining).
+    %% drain leaves post-body bytes (RFC 9112 §9.3.2 pipelining).
     buffered = <<>> :: binary(),
     %% Pre-generated CSPRNG bytes for `request_id`. Filled lazily
     %% (on first request) by `roadrunner_conn:generate_request_id/1`

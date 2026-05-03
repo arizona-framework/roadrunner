@@ -26,7 +26,7 @@ typical HTTP header names and RFC tokens.
 Non-ASCII letters are **left unchanged**. Use this only when the
 input domain is RFC-bounded to ASCII bytes:
 
-- HTTP header names (RFC 7230 `tchar` grammar — pure ASCII).
+- HTTP header names (RFC 9110 §5.6.2 `tchar` token grammar — pure ASCII).
 - Known case-insensitive HTTP tokens: `Connection` values
   (`close`, `keep-alive`, `upgrade`), `Transfer-Encoding` values
   (`chunked`), `Expect` values (`100-continue`).

@@ -11,7 +11,7 @@ that frames each emission as one chunk on the wire.
 - `nofin` — write `Data` as one chunk; expect more.
 - `fin` — write `Data` as one chunk, then the size-0 terminator.
 - `{fin, Trailers}` — same as `fin` but the terminator is followed
-  by serialized trailer headers (RFC 7230 §4.1.2).
+  by serialized trailer headers (RFC 9112 §7.1.2).
 
 Empty data is special-cased: `Send(<<>>, nofin)` is a no-op (a
 zero-length chunk encodes as `0\r\n\r\n`, the chunked terminator,

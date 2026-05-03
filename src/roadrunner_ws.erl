@@ -77,7 +77,7 @@ handshake_response(Headers) when is_list(Headers) ->
         | missing_websocket_key
         | unsupported_websocket_version}.
 validate_upgrade(Headers) ->
-    %% RFC 7230 §6.7 — upgrade tokens are case-insensitive. Browsers
+    %% RFC 9110 §7.8 — upgrade tokens are case-insensitive. Browsers
     %% send `websocket` (lowercase) but other clients may send
     %% `WebSocket` or `WEBSOCKET`; accept any case.
     case is_websocket_upgrade(header_lookup(~"upgrade", Headers)) of

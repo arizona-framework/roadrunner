@@ -78,9 +78,9 @@ Parse the parameters of a structured header value (e.g. `Content-Type`,
 `Content-Disposition`) into a map. The "type" prefix before the first
 `;` is discarded — only the `key=value` pairs after it are returned.
 
-Param names are lowercased per RFC 7231 §3.1.1.1 (case-insensitive
-parameter names); values are returned as-is, with surrounding quotes
-stripped.
+Param names are lowercased per RFC 9110 §8.3.1 (media-type parameter
+names are case-insensitive); values are returned as-is, with
+surrounding quotes stripped.
 
 Examples:
 - `~"text/html; charset=utf-8"` → `#{~"charset" => ~"utf-8"}`

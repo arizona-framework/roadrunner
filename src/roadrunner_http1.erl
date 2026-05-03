@@ -134,7 +134,7 @@ Bare LF terminators are rejected as `bad_request_line` per RFC 9112 §2.2.
     {ok, Method :: binary(), Target :: binary(), version(), Rest :: binary()}
     | {more, undefined}
     | {error, bad_request_line | bad_version | request_line_too_long}.
-%% RFC 7230 §3.5 robustness allowance: a server SHOULD ignore at least
+%% RFC 9112 §2.2 robustness allowance: a server SHOULD ignore at least
 %% one empty line received prior to the request-line. We strip one
 %% optional leading `\r\n` and then parse normally. Two consecutive
 %% leading CRLFs still fail (the second one becomes a malformed
@@ -206,7 +206,7 @@ classify(Method, Target, VersionBin, Rest) ->
 
 %% Fast path for standard methods — JIT pattern-table dispatch avoids the
 %% per-byte scan in validate_method_chars/1 on the hot path. Custom methods
-%% (uppercase ASCII letters only) still parse via the fallback; full RFC 7230
+%% (uppercase ASCII letters only) still parse via the fallback; full RFC 9110 §5.6.2
 %% token grammar (digits, lowercase, `-`, etc.) is intentionally not accepted
 %% — extension methods like WebDAV's MKCOL or UPnP's M-SEARCH would need it.
 -spec validate_method(binary()) -> ok | error.
@@ -258,9 +258,9 @@ block, returns `{end_of_headers, Rest}` so the caller can switch to
 body framing without re-scanning bytes.
 
 Header injection (CR or NUL inside a value), obsolete line folding
-(continuation lines starting with whitespace, RFC 7230 §3.2.4), and
-lines exceeding 8192 bytes are rejected with `bad_header` /
-`header_too_long`. Header names follow the RFC 7230 token grammar.
+(continuation lines starting with whitespace, RFC 9112 §5.2 obs-fold),
+and lines exceeding 8192 bytes are rejected with `bad_header` /
+`header_too_long`. Header names follow the RFC 9110 §5.6.2 token grammar.
 """.
 %% Spec deviates from the original plan: we return `{end_of_headers, Rest}`
 %% (a tuple) rather than the bare atom `end_of_headers`, so the caller does
@@ -314,7 +314,7 @@ extract_header_line(Bin, LfPos) ->
 -spec parse_header_line(binary(), binary()) ->
     {ok, binary(), binary(), binary()} | {error, bad_header}.
 parse_header_line(<<C, _/binary>>, _Rest) when C =:= $\s; C =:= $\t ->
-    %% Obs-fold continuation — RFC 7230 §3.2.4 says reject.
+    %% Obs-fold continuation — RFC 9112 §5.2 says servers MUST reject.
     {error, bad_header};
 parse_header_line(Line, Rest) ->
     case binary:split(Line, ~":") of
@@ -351,7 +351,7 @@ validate_name_chars(<<C, R/binary>>) ->
         false -> error
     end.
 
-%% RFC 7230 token character — ALPHA / DIGIT / one of the listed marks.
+%% RFC 9110 §5.6.2 tchar — ALPHA / DIGIT / one of the listed marks.
 -spec is_tchar(byte()) -> boolean().
 is_tchar(C) when C >= $A, C =< $Z -> true;
 is_tchar(C) when C >= $a, C =< $z -> true;
@@ -720,7 +720,7 @@ parse_size_line(Line, Rest) ->
             [S] -> S;
             [S, _Ext] -> S
         end,
-    %% Per RFC 7230 §4.1: chunk-size = 1*HEXDIG. BWS is allowed before
+    %% Per RFC 9112 §7.1: chunk-size = 1*HEXDIG. BWS is allowed before
     %% `;` (chunk-ext separator) but NOT before the chunk-size itself —
     %% so trim only trailing OWS, never leading. ` 5\r\n` is malformed;
     %% `5 ;ext\r\n` is fine.
