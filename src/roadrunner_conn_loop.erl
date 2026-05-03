@@ -123,10 +123,12 @@ Phase 8 (cutover or park).
     req_id_buffer = <<>> :: binary(),
     %% Conn-stable values pulled from `proto_opts` once at `shoot`
     %% time so the per-request hot path doesn't re-`maps:get` them.
-    %% Saves ~3 hash lookups per request.
+    %% Saves ~5 hash lookups per request.
     requests_counter :: atomics:atomics_ref() | undefined,
     dispatch :: roadrunner_conn:dispatch() | undefined,
-    middlewares = [] :: roadrunner_middleware:middleware_list()
+    middlewares = [] :: roadrunner_middleware:middleware_list(),
+    max_content_length = 0 :: non_neg_integer(),
+    max_keep_alive_request = 1 :: pos_integer()
 }).
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
@@ -172,7 +174,9 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
                 scheme = Scheme,
                 requests_counter = maps:get(requests_counter, ProtoOpts),
                 dispatch = maps:get(dispatch, ProtoOpts),
-                middlewares = maps:get(middlewares, ProtoOpts)
+                middlewares = maps:get(middlewares, ProtoOpts),
+                max_content_length = maps:get(max_content_length, ProtoOpts),
+                max_keep_alive_request = maps:get(max_keep_alive_request, ProtoOpts)
             },
             read_request_phase(S);
         {roadrunner_drain, _Deadline} ->
@@ -399,12 +403,12 @@ handle_request_bytes(
 read_body_phase(
     #loop_state{
         socket = Socket,
-        proto_opts = ProtoOpts
+        proto_opts = ProtoOpts,
+        max_content_length = MaxCL
     } = S,
     Req,
     Deadline
 ) ->
-    MaxCL = maps:get(max_content_length, ProtoOpts),
     MinRate = maps:get(minimum_bytes_per_second, ProtoOpts),
     Recv = roadrunner_conn:make_recv(Socket, Deadline, MinRate),
     Buffered = S#loop_state.buffered,
@@ -601,41 +605,36 @@ dispatch_response(Socket, _Handler, _Req, {Status, Headers, Body}) when is_integ
 %% reset to defaults, and any pipelined leftover bytes carried in
 %% `buffered` so the next iteration can parse them without waiting
 %% on more inbound packets.
+%% Pattern-matched on the response shape directly — saves the
+%% cross-module call to `roadrunner_conn:response_kind/1` and the
+%% subsequent `case` dispatch. Buffered (3-tuple) is the only shape
+%% eligible for keep-alive; stream/loop/sendfile/websocket writers
+%% own the wire from here and force close.
 -spec finishing_phase(#loop_state{}, roadrunner_http1:request(), roadrunner_handler:response()) ->
     no_return().
-finishing_phase(
-    #loop_state{
-        proto_opts = ProtoOpts
-    } = S,
-    Req,
-    Response
-) ->
-    case roadrunner_conn:response_kind(Response) of
-        buffered ->
-            buffered_finish(S, Req, Response, ProtoOpts);
-        _ ->
-            %% Stream / loop / sendfile / websocket: writer owns the
-            %% wire from here. Close the conn.
-            _ = roadrunner_conn:drain_body(Req),
-            exit_normal(S)
-    end.
+finishing_phase(S, Req, {Status, Headers, _Body}) when is_integer(Status) ->
+    buffered_finish(S, Req, Headers);
+finishing_phase(S, Req, _Response) ->
+    %% Stream / loop / sendfile / websocket: writer owns the wire.
+    %% In auto-mode the body is already fully read; manual-mode
+    %% may have leftover that needs draining.
+    _ = drain_body_if_manual(Req),
+    exit_normal(S).
 
 -spec buffered_finish(
     #loop_state{},
     roadrunner_http1:request(),
-    roadrunner_handler:response(),
-    roadrunner_conn:proto_opts()
+    roadrunner_http1:headers()
 ) -> no_return().
-buffered_finish(S, Req, {_Status, Headers, _Body} = _Response, ProtoOpts) ->
-    case roadrunner_conn:drain_body(Req) of
+buffered_finish(S, Req, Headers) ->
+    case drain_body_if_manual(Req) of
         {ok, ManualLeftover} ->
             case roadrunner_conn:keep_alive_decision(Req, Headers) of
                 close ->
                     exit_normal(S);
                 keep_alive ->
-                    Max = maps:get(max_keep_alive_request, ProtoOpts),
                     Served = S#loop_state.requests_served,
-                    case Served >= Max of
+                    case Served >= S#loop_state.max_keep_alive_request of
                         true ->
                             exit_normal(S);
                         false ->
@@ -660,6 +659,19 @@ pipelined_leftover(Req, _S, ManualLeftover) when is_map_key(body_state, Req) ->
     ManualLeftover;
 pipelined_leftover(_Req, #loop_state{buffered = Buf}, _ManualLeftover) ->
     Buf.
+
+%% In auto-mode the body has already been fully read by
+%% `read_body_phase` — the request map has no `body_state` key, and
+%% `roadrunner_conn:drain_body/1`'s second clause would just return
+%% `{ok, <<>>}`. Skip the call entirely on auto. Manual-mode (where
+%% the handler may have left bytes unread) goes through the real
+%% `drain_body/1` which consumes the body_state.
+-spec drain_body_if_manual(roadrunner_http1:request()) ->
+    {ok, binary()} | {error, term()}.
+drain_body_if_manual(#{body_state := _} = Req) ->
+    roadrunner_conn:drain_body(Req);
+drain_body_if_manual(_Req) ->
+    {ok, <<>>}.
 
 -spec telemetry_metadata(roadrunner_http1:request()) -> roadrunner_telemetry:metadata().
 telemetry_metadata(Req) ->
