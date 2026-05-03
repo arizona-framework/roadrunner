@@ -44,7 +44,7 @@
 %% Servers known to the bench, in default-run order. Adding a new
 %% server is two steps: append it here and add a clause for it in
 %% `start_server/2` (plus any `scenario_*` config helpers below).
--define(KNOWN_SERVERS, [roadrunner, cowboy, elli]).
+-define(KNOWN_SERVERS, [roadrunner, roadrunner_loop, cowboy, elli]).
 
 main(Args) ->
     Opts = parse_args(Args),
@@ -242,23 +242,13 @@ maybe_stop_profile(Peer, Side, #{profile := true, profile_min_ms := MinMs}) ->
     ok.
 
 start_server(roadrunner, Scenario) ->
-    {ok, Peer, _Node} = peer:start_link(#{
-        name => peer:random_name(),
-        connection => standard_io,
-        args => pa_args_for_peer(),
-        wait_boot => 10000
-    }),
-    {ok, _} = peer:call(Peer, application, ensure_all_started, [roadrunner]),
-    BaseOpts = #{
-        port => 0,
-        keep_alive_timeout => 60000,
-        max_clients => 100000,
-        max_keep_alive_request => 1000000
-    },
-    ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
-    {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr, ListenerOpts]),
-    Port = peer:call(Peer, roadrunner_listener, port, [bench_rr]),
-    {Peer, Port};
+    start_roadrunner(Scenario, statem);
+start_server(roadrunner_loop, Scenario) ->
+    %% Same listener setup as `roadrunner` but with the per-conn process
+    %% routed through `roadrunner_conn_loop` (tail-recursive variant)
+    %% instead of the default `roadrunner_conn_statem`. Run side-by-side
+    %% via `--servers roadrunner,roadrunner_loop` to A/B the two impls.
+    start_roadrunner(Scenario, loop);
 start_server(cowboy, Scenario) ->
     {ok, Peer, _Node} = peer:start_link(#{
         name => peer:random_name(),
@@ -315,6 +305,26 @@ start_server(elli, _Scenario) ->
             peer:stop(Peer),
             halt(1)
     end.
+
+start_roadrunner(Scenario, ConnImpl) ->
+    {ok, Peer, _Node} = peer:start_link(#{
+        name => peer:random_name(),
+        connection => standard_io,
+        args => pa_args_for_peer(),
+        wait_boot => 10000
+    }),
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [roadrunner]),
+    BaseOpts = #{
+        port => 0,
+        keep_alive_timeout => 60000,
+        max_clients => 100000,
+        max_keep_alive_request => 1000000,
+        conn_impl => ConnImpl
+    },
+    ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
+    {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr, ListenerOpts]),
+    Port = peer:call(Peer, roadrunner_listener, port, [bench_rr]),
+    {Peer, Port}.
 
 %% Per-scenario server config — same routes/handlers in shape across
 %% all three servers so the comparison stays apples-to-apples.
@@ -563,7 +573,7 @@ fmt_row(#{
     p99 := P99
 }) ->
     io_lib:format(
-        "~-12s  ~10s req/s  total=~s err=~B  mean=~s p50=~s p95=~s p99=~s",
+        "~-16s  ~10s req/s  total=~s err=~B  mean=~s p50=~s p95=~s p99=~s",
         [
             atom_to_list(Side),
             fmt_int(round(Rps)),
@@ -583,12 +593,12 @@ print_summary(SidesAndResults) ->
         Rows
     ),
     io:format("~nsummary (sorted by throughput, fastest first)~n"),
-    io:format("~-12s  ~10s req/s   ~10s p50   ~10s p99~n", ["server", "", "", ""]),
+    io:format("~-16s  ~10s req/s   ~10s p50   ~10s p99~n", ["server", "", "", ""]),
     io:format("~s~n", [string:copies("-", 65)]),
     lists:foreach(
         fun({Side, Row}) ->
             io:format(
-                "~-12s  ~10s req/s   ~10s p50   ~10s p99~n",
+                "~-16s  ~10s req/s   ~10s p50   ~10s p99~n",
                 [
                     atom_to_list(Side),
                     fmt_int(round(maps:get(rps, Row))),
