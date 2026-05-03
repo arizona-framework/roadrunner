@@ -2,23 +2,29 @@
 -moduledoc """
 Public connection-process API and pure helpers.
 
-`start/2` spawns the per-connection process (`roadrunner_conn_statem` —
-a `gen_statem` whose named states `awaiting_shoot |
-reading_request | reading_body | dispatching | finishing` make the
-request lifecycle visible to `sys:get_state/1`, `sys:trace/2`, and
-observer's process inspector). The other public functions are
-pure-ish helpers that the gen_statem composes into its state
-callbacks; many are also called directly from `roadrunner_req` (manual
-body buffering) and from `roadrunner_conn_tests.erl`'s closure-driven
-unit tests.
+`start/2` spawns the per-connection process. Two implementations:
+
+- `roadrunner_conn_loop` — tail-recursive loop (default). Lower
+  per-request overhead than the gen_statem variant; phase tracking
+  via `proc_lib:set_label/1` for observer / recon visibility.
+- `roadrunner_conn_statem` — `gen_statem` with named states
+  (`awaiting_shoot | reading_request | reading_body | dispatching |
+  finishing`) reachable via `sys:get_state/1` / `sys:trace/2`. Kept
+  as a rollback path while the loop variant bakes; opt back in via
+  `conn_impl => statem`.
+
+The other public functions are pure-ish helpers shared by both
+implementations; many are also called directly from `roadrunner_req`
+(manual body buffering) and from `roadrunner_conn_tests.erl`'s
+closure-driven unit tests.
 
 Per-connection behavior — keep-alive (capped by
 `max_keep_alive_request`, idle-bound by `keep_alive_timeout`),
 `Expect: 100-continue`, HEAD body suppression, anti-Slowloris rate
 check (`minimum_bytes_per_second`), the five handler return shapes
 (`{Status, Headers, Body}`, `{stream, ...}`, `{loop, ...}`,
-`{sendfile, ...}`, `{websocket, ...}`) — lives in
-`roadrunner_conn_statem` and the response-shape-specific modules
+`{sendfile, ...}`, `{websocket, ...}`) — lives in the conn
+implementation modules and the response-shape-specific modules
 (`roadrunner_stream_response`, `roadrunner_loop_response`,
 `roadrunner_ws_session`).
 
@@ -91,10 +97,12 @@ read it anyway.
     minimum_bytes_per_second := non_neg_integer(),
     body_buffering := auto | manual,
     listener_name => atom(),
-    %% Conn-process implementation. Default `statem` dispatches to
-    %% `roadrunner_conn_statem` (gen_statem). Set to `loop` to route
-    %% through `roadrunner_conn_loop`'s tail-recursive variant —
-    %% wire-equivalent, lower variance, in-progress per the perf plan.
+    %% Conn-process implementation. Default `loop` routes through
+    %% `roadrunner_conn_loop`'s tail-recursive variant — measured
+    %% faster than elli on hello throughput with 2-4× better p99.
+    %% Set to `statem` to opt back into the legacy `roadrunner_conn_statem`
+    %% (gen_statem) variant — kept available for one release as a
+    %% rollback path while the loop variant bakes.
     conn_impl => loop | statem
 }.
 
@@ -120,11 +128,9 @@ read it anyway.
 Spawn an unlinked connection process for the accepted `Socket` and the
 shared `ProtoOpts` (handler module, body limits, ...).
 
-Backed by `roadrunner_conn_statem` — a `gen_statem` whose named states
-(`awaiting_shoot | reading_request | reading_body | dispatching |
-finishing`) make the request lifecycle visible to `sys:get_state/1`,
-`sys:trace/2`, and observer's process inspector. The legacy
-recursive spine is gone.
+Routes to `roadrunner_conn_loop` (default) or `roadrunner_conn_statem`
+based on `proto_opts.conn_impl`. Both expose the same observable
+behavior — see the moduledoc for the trade-offs.
 
 The caller (typically `roadrunner_acceptor`) must transfer socket
 ownership via `roadrunner_transport:controlling_process/2` and then
@@ -132,11 +138,11 @@ send the process the atom `shoot` to release it.
 """.
 -spec start(roadrunner_transport:socket(), proto_opts()) -> {ok, pid()}.
 start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
-    case maps:get(conn_impl, ProtoOpts, statem) of
-        statem ->
-            {ok, _Pid} = roadrunner_conn_statem:start(Socket, ProtoOpts);
+    case maps:get(conn_impl, ProtoOpts, loop) of
         loop ->
-            {ok, _Pid} = roadrunner_conn_loop:start(Socket, ProtoOpts)
+            {ok, _Pid} = roadrunner_conn_loop:start(Socket, ProtoOpts);
+        statem ->
+            {ok, _Pid} = roadrunner_conn_statem:start(Socket, ProtoOpts)
     end.
 
 -doc """

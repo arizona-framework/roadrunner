@@ -459,9 +459,14 @@ fake_controlling_process_is_noop_test() ->
 %% wire response, no listener / acceptor / port involved. Uses
 %% active-mode reads (`reading_request` calls
 %% `roadrunner_transport:setopts/2` and waits for `roadrunner_fake_data`).
+%% Pinned to `conn_impl => statem` because this exercises the
+%% gen_statem variant's active-mode protocol; the `loop` default
+%% reads passively and has its own coverage in `roadrunner_conn_loop_tests`.
 fake_conn_drives_handler_without_sockets_test() ->
     Self = self(),
-    {ok, ConnPid} = roadrunner_conn:start({fake, Self}, fake_proto_opts(roadrunner_test_handler)),
+    {ok, ConnPid} = roadrunner_conn:start(
+        {fake, Self}, (fake_proto_opts(roadrunner_test_handler))#{conn_impl => statem}
+    ),
     ConnPid ! shoot,
     %% Conn arms active-once on the fake socket. Deliver the request
     %% bytes as a fake-data info event.

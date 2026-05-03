@@ -60,12 +60,13 @@ connection crash doesn't take the pool down.
     %% main loop between events) are the prerequisite that makes
     %% this fire at all.
     hibernate_after => pos_integer(),
-    %% Selects the per-connection process implementation. `statem`
-    %% (default) dispatches to the original `gen_statem` variant in
-    %% `roadrunner_conn_statem`; `loop` dispatches to the
-    %% tail-recursive variant in `roadrunner_conn_loop` — feature-
-    %% equivalent, lower run-to-run variance, see `.claude/plans/`
-    %% for the rationale and rollout.
+    %% Selects the per-connection process implementation. `loop`
+    %% (default) dispatches to the tail-recursive variant in
+    %% `roadrunner_conn_loop` — measured faster than elli on hello
+    %% throughput with 2-4× better p99. `statem` opts back into the
+    %% legacy `gen_statem` variant in `roadrunner_conn_statem`,
+    %% kept available as a rollback path while the loop variant
+    %% bakes; will be removed in a future release.
     conn_impl => loop | statem,
     tls => [ssl:tls_server_option()]
 }.
