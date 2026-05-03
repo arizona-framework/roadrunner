@@ -51,16 +51,28 @@ for the phased rollout.
   before re-arming the socket. `request_timeout` selection
   becomes phase-aware (first vs keep_alive_timeout) and the
   timeout response is silent on keep_alive (no peer waiting).
+- **Phase 4** — hibernation. When the listener was started with
+  `hibernate_after => Ms` (Ms > 0), the keep-alive idle window
+  in `recv_request_bytes/2` calls `erlang:hibernate/3` after Ms
+  of no message — the conn's heap GCs and shrinks, dramatically
+  reducing memory for long-lived idle keep-alive conns. A
+  `send_after` timer carries the request/keep-alive deadline as
+  a normal message so the hibernate `after` clause is dedicated
+  to the idle-trigger. Wakes naturally on the next inbound TCP
+  packet. Listeners without `hibernate_after` bypass this entirely
+  and use the Phase 2/3 receive shape (no timer per request).
 
-Pending: Phase 4 (hibernation), Phase 5 (top-level try/catch
-around `exit_clean`), Phase 6 (test parametrization), Phase 7
-(A/B vs gen_statem), Phase 8 (cutover or park).
+Pending: Phase 5 (top-level try/catch around `exit_clean`),
+Phase 6 (test parametrization), Phase 7 (A/B vs gen_statem),
+Phase 8 (cutover or park).
 """.
 
 -export([start/2]).
 
-%% Internal entry — invoked by `proc_lib:start/3` from `start/2`.
--export([init_loop/3]).
+%% Internal entries — invoked via `proc_lib:start/3` and via
+%% `erlang:hibernate/3`. Must stay exported so the runtime can
+%% re-enter them after wake-from-hibernate.
+-export([init_loop/3, recv_request_bytes_hib/2]).
 
 %% Loop-state record carried through every phase. Allocated once on
 %% the transition out of `awaiting_shoot` and pattern-matched (not
@@ -192,7 +204,19 @@ phase_timeout(#loop_state{phase = keep_alive, proto_opts = ProtoOpts}) ->
     maps:get(keep_alive_timeout, ProtoOpts).
 
 -spec recv_request_bytes(#loop_state{}, integer()) -> no_return().
-recv_request_bytes(
+recv_request_bytes(S, Deadline) ->
+    case maps:get(hibernate_after, S#loop_state.proto_opts, 0) of
+        Ms when is_integer(Ms), Ms > 0 ->
+            recv_with_hibernate(S, Deadline, Ms);
+        _ ->
+            recv_no_hibernate(S, Deadline)
+    end.
+
+%% Recv path with no hibernation — single `after Remaining` clause
+%% handles both request_timeout and keep_alive_timeout. Zero per-iter
+%% timer arms on the hot path.
+-spec recv_no_hibernate(#loop_state{}, integer()) -> no_return().
+recv_no_hibernate(
     #loop_state{
         socket = Socket,
         buffered = Buf
@@ -216,17 +240,74 @@ recv_request_bytes(
             %% Drop unmatched messages (gen_statem does the same via
             %% the wildcard `info` clause) and re-arm.
             arm_active_once(S),
-            recv_request_bytes(S, Deadline)
+            recv_no_hibernate(S, Deadline)
     after Remaining ->
-        %% Slowloris on first request → 408. Idle keep-alive timeout →
-        %% silent close (peer wasn't waiting on bytes).
-        _ =
-            case S#loop_state.phase of
-                first -> roadrunner_conn:send_request_timeout(Socket);
-                keep_alive -> ok
-            end,
+        timeout_response(S),
         exit_normal(S)
     end.
+
+%% Recv path with hibernation. Arms ONE `send_after` for the
+%% request/keep-alive deadline and uses the receive's `after` clause
+%% exclusively for the hibernate trigger. On wake (any inbound
+%% message) the function re-enters via `erlang:hibernate/3`'s
+%% `(?MODULE, recv_request_bytes_hib, [S, Deadline])` continuation.
+-spec recv_with_hibernate(#loop_state{}, integer(), pos_integer()) -> no_return().
+recv_with_hibernate(
+    #loop_state{
+        socket = Socket,
+        buffered = Buf
+    } = S,
+    Deadline,
+    HibernateAfter
+) ->
+    {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    DeadlineRef = erlang:send_after(Remaining, self(), {?MODULE, deadline_fired}),
+    receive
+        {DataTag, _Sock, Bytes} ->
+            _ = erlang:cancel_timer(DeadlineRef),
+            handle_request_bytes(S#loop_state{buffered = <<Buf/binary, Bytes/binary>>}, Deadline);
+        {ClosedTag, _Sock} ->
+            _ = erlang:cancel_timer(DeadlineRef),
+            exit_normal(S);
+        {ErrorTag, _Sock, _Reason} ->
+            _ = erlang:cancel_timer(DeadlineRef),
+            exit_normal(S);
+        {roadrunner_drain, _Deadline} ->
+            _ = erlang:cancel_timer(DeadlineRef),
+            exit_normal(S);
+        {?MODULE, deadline_fired} ->
+            timeout_response(S),
+            exit_normal(S);
+        _Stray ->
+            _ = erlang:cancel_timer(DeadlineRef),
+            arm_active_once(S),
+            recv_with_hibernate(S, Deadline, HibernateAfter)
+    after HibernateAfter ->
+        %% Idle window elapsed — drop the deadline timer (it'll
+        %% be re-armed when the conn wakes) and hibernate. The
+        %% process's heap GCs and shrinks; the next inbound
+        %% TCP packet wakes it.
+        _ = erlang:cancel_timer(DeadlineRef),
+        erlang:hibernate(?MODULE, recv_request_bytes_hib, [S, Deadline])
+    end.
+
+%% Hibernate continuation. Re-enters `recv_request_bytes/2` so
+%% the next iteration picks up wherever the recv shape demands
+%% (with or without hibernation, depending on `hibernate_after`).
+-doc false.
+-spec recv_request_bytes_hib(#loop_state{}, integer()) -> no_return().
+recv_request_bytes_hib(S, Deadline) ->
+    recv_request_bytes(S, Deadline).
+
+%% Slowloris on first request → 408. Idle keep-alive timeout →
+%% silent close (peer wasn't waiting on bytes).
+-spec timeout_response(#loop_state{}) -> ok.
+timeout_response(#loop_state{phase = first, socket = Socket}) ->
+    _ = roadrunner_conn:send_request_timeout(Socket),
+    ok;
+timeout_response(#loop_state{phase = keep_alive}) ->
+    ok.
 
 %% Try parsing the accumulated buffer. On `{more, _}` we re-arm and
 %% wait for more bytes; on `{ok, Req, Rest}` we've parsed a full

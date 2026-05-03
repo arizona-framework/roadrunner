@@ -715,6 +715,136 @@ keep_alive_idle_timeout_silently_closes_test() ->
     ?assertEqual(nomatch, binary:match(Sent, ~"HTTP/1.1 408")),
     Sink ! stop.
 
+hibernate_after_fires_during_keep_alive_idle_test() ->
+    %% With `hibernate_after` set, the conn idle in keep-alive should
+    %% enter `process_info(Pid, status) =:= waiting` AND show a
+    %% drastically reduced `total_heap_size` after hibernation. We
+    %% poll for status=waiting + heap < 5000 words.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(hib))#{
+        dispatch := {handler, roadrunner_keepalive_handler},
+        hibernate_after => 50,
+        keep_alive_timeout := 5000
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    %% Allow time for the request to dispatch and the conn to enter
+    %% the keep-alive idle hibernate window.
+    timer:sleep(150),
+    case process_info(Pid, [status, total_heap_size]) of
+        [{status, waiting}, {total_heap_size, Heap}] when Heap < 5000 ->
+            ok;
+        Other ->
+            error({not_hibernated, Other})
+    end,
+    %% Send drain to wake + clean exit so the test runner doesn't
+    %% leak a process.
+    Pid ! {roadrunner_drain, infinity},
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit_after_drain)
+    end,
+    Sink ! stop.
+
+hibernate_path_handles_close_test() ->
+    %% Coverage: the hibernate path's ClosedTag clause.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(hib_closed))#{
+        dispatch := {handler, roadrunner_keepalive_handler},
+        hibernate_after => 50
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    timer:sleep(20),
+    Pid ! {roadrunner_fake_closed, undefined},
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sink ! stop.
+
+hibernate_path_handles_tcp_error_test() ->
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(hib_err))#{
+        dispatch := {handler, roadrunner_keepalive_handler},
+        hibernate_after => 50
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    timer:sleep(20),
+    Pid ! {roadrunner_fake_error, undefined, econnreset},
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sink ! stop.
+
+hibernate_path_handles_deadline_fired_test() ->
+    %% With short keep_alive_timeout AND hibernate_after, the
+    %% deadline timer fires before hibernation does — covers the
+    %% `{?MODULE, deadline_fired}` clause.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(hib_dl))#{
+        dispatch := {handler, roadrunner_keepalive_handler},
+        hibernate_after => 5000,
+        keep_alive_timeout := 50
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sink ! stop.
+
+hibernate_path_drops_stray_messages_test() ->
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(hib_stray))#{
+        dispatch := {handler, roadrunner_keepalive_handler},
+        hibernate_after => 5000,
+        keep_alive_timeout := 200
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    timer:sleep(20),
+    Pid ! {junk, ref},
+    Pid ! 12345,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sink ! stop.
+
 request_start_and_stop_pair_with_shared_request_id_test() ->
     ensure_pg(),
     Self = self(),
