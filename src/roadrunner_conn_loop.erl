@@ -7,10 +7,24 @@ Same per-connection lifecycle the gen_statem encodes
 (`awaiting_shoot → reading_request → reading_body → dispatching →
 finishing → loop or close`) but expressed as direct function calls
 between phase functions instead of gen_statem dispatch + state-enter
-trampolines. The five phase names stay visible to operators via
-`proc_lib:set_label/1` updates at every boundary, so `observer`,
-`recon:proc_count/2`, and crash reports still show what the
-connection was doing.
+trampolines.
+
+## Phase introspection vs hot-path cost
+
+The label set on the conn process via `proc_lib:set_label/1` is
+intentionally written **at most twice per conn**: once at
+`init_loop` time (`{roadrunner_conn, awaiting_shoot, ListenerName}`)
+and once at the `shoot` handoff (`refine_conn_label/2` rewrites it
+to include the peer). The phases AFTER `awaiting_shoot` (read_request,
+read_body, dispatching, finishing) run in microseconds on the
+happy path — too fast for an operator's `observer` snapshot to
+catch a specific phase anyway. Profiling showed per-phase label
+updates cost ~1.2 % CPU on hello (4 writes/req, each touching the
+process dictionary), and contributed to the run-to-run variance.
+Stuck conns still surface via the conn-entry label + the
+`reading_request` idle window (where hibernation parks the
+process). Sub-microsecond phases that no one ever observes don't
+pay this cost.
 
 Selected per-listener via `proto_opts.conn_impl => loop`. Default is
 `statem`, which dispatches to `roadrunner_conn_statem`. The two
@@ -174,8 +188,7 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
 %% Phase 2 only handles the "first request on a fresh conn" case;
 %% Phase 3 will add keep-alive loop-back and pipelined leftover.
 -spec read_request_phase(#loop_state{}) -> no_return().
-read_request_phase(#loop_state{listener_name = ListenerName, buffered = Buf} = S) ->
-    proc_lib:set_label({roadrunner_conn, reading_request, ListenerName}),
+read_request_phase(#loop_state{buffered = Buf} = S) ->
     Timeout = phase_timeout(S),
     %% Compute an *absolute* deadline once. Each iteration's `after`
     %% clause decays it — `recv_request_bytes/2` recomputes
@@ -368,13 +381,11 @@ handle_request_bytes(
 read_body_phase(
     #loop_state{
         socket = Socket,
-        proto_opts = ProtoOpts,
-        listener_name = ListenerName
+        proto_opts = ProtoOpts
     } = S,
     Req,
     Deadline
 ) ->
-    proc_lib:set_label({roadrunner_conn, reading_body, ListenerName}),
     MaxCL = maps:get(max_content_length, ProtoOpts),
     MinRate = maps:get(minimum_bytes_per_second, ProtoOpts),
     Recv = roadrunner_conn:make_recv(Socket, Deadline, MinRate),
@@ -429,12 +440,10 @@ read_body_phase(
 dispatch_phase(
     #loop_state{
         socket = Socket,
-        proto_opts = ProtoOpts,
-        listener_name = ListenerName
+        proto_opts = ProtoOpts
     } = S,
     Req
 ) ->
-    proc_lib:set_label({roadrunner_conn, dispatching, ListenerName}),
     Dispatch = maps:get(dispatch, ProtoOpts),
     ListenerMws = maps:get(middlewares, ProtoOpts),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
@@ -553,13 +562,11 @@ dispatch_response(Socket, _Handler, Req, {Status, Headers, Body}) when is_intege
     no_return().
 finishing_phase(
     #loop_state{
-        listener_name = ListenerName,
         proto_opts = ProtoOpts
     } = S,
     Req,
     Response
 ) ->
-    proc_lib:set_label({roadrunner_conn, finishing, ListenerName}),
     case roadrunner_conn:response_kind(Response) of
         buffered ->
             buffered_finish(S, Req, Response, ProtoOpts);
