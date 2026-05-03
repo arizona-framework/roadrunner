@@ -26,6 +26,16 @@ share the same `request_id`.
 %% =============================================================================
 
 prop_conn_terminates_normal_on_random_inputs() ->
+    prop_terminates_normal(fun roadrunner_conn_statem:start/2).
+
+%% Parallel property targeting the tail-recursive `roadrunner_conn_loop`
+%% implementation. Same robustness guarantee — random recv responses,
+%% drain timing, and stray messages produce a clean `normal` exit and
+%% release the slot.
+prop_loop_terminates_normal_on_random_inputs() ->
+    prop_terminates_normal(fun roadrunner_conn_loop:start/2).
+
+prop_terminates_normal(Start) ->
     ?FORALL(
         {Script, DrainBefore, DrainAfter, Stray},
         {
@@ -39,11 +49,11 @@ prop_conn_terminates_normal_on_random_inputs() ->
             ensure_pg(),
             Counter = atomics:new(1, [{signed, false}]),
             Opts = proto_opts(prop_listener, Counter),
-            %% Mirror the acceptor's slot acquisition so terminate's
+            %% Mirror the acceptor's slot acquisition so the conn's
             %% release brings the counter back to 0 (not below).
             true = roadrunner_conn:try_acquire_slot(Opts),
             Sink = spawn_recv_sink(Script),
-            {ok, Pid} = roadrunner_conn_statem:start({fake, Sink}, Opts),
+            {ok, Pid} = Start({fake, Sink}, Opts),
             Ref = monitor(process, Pid),
             case DrainBefore of
                 true ->
@@ -69,10 +79,10 @@ prop_conn_terminates_normal_on_random_inputs() ->
                     false
                 end,
             Sink ! stop,
-            %% terminate/3 calls release_slot, decrementing the counter
-            %% from 1 (acquired above) back to 0. Anything else means
-            %% the conn either crashed before terminate or something
-            %% leaked the slot.
+            %% Clean exit calls release_slot, bringing the counter from 1
+            %% (acquired above) back to 0. Anything else means the conn
+            %% either crashed before exit_clean or something leaked the
+            %% slot.
             CounterOk = atomics:get(Counter, 1) =:= 0,
             ExitOk andalso CounterOk
         end

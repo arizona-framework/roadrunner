@@ -33,6 +33,7 @@ Add a new property:
     statem_terminates_normal_on_random_inputs/1,
     statem_request_start_and_stop_share_request_id/1,
     statem_state_transitions_are_documented/1,
+    loop_terminates_normal_on_random_inputs/1,
     router_param_bindings_round_trip/1
 ]).
 
@@ -57,6 +58,7 @@ all() ->
         statem_terminates_normal_on_random_inputs,
         statem_request_start_and_stop_share_request_id,
         statem_state_transitions_are_documented,
+        loop_terminates_normal_on_random_inputs,
         router_param_bindings_round_trip
     ].
 
@@ -159,6 +161,12 @@ statem_request_start_and_stop_share_request_id(Config) ->
 statem_state_transitions_are_documented(Config) ->
     ct_property_test:quickcheck(
         roadrunner_statem_props:prop_state_transitions_are_documented(),
+        Config
+    ).
+
+loop_terminates_normal_on_random_inputs(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_statem_props:prop_loop_terminates_normal_on_random_inputs(),
         Config
     ).
 
