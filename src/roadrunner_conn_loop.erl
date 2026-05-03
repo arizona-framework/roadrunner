@@ -142,7 +142,17 @@ Phase 8 (cutover or park).
     dispatch :: roadrunner_conn:dispatch() | undefined,
     middlewares = [] :: roadrunner_middleware:middleware_list(),
     max_content_length = 0 :: non_neg_integer(),
-    max_keep_alive_request = 1 :: pos_integer()
+    max_keep_alive_request = 1 :: pos_integer(),
+    %% Anti-slowloris on the request-read phase. `min_rate` is cached
+    %% from `proto_opts.minimum_bytes_per_second` at `shoot`. When > 0,
+    %% `recv_passive/2` tracks bytes received since `recv_phase_start`
+    %% and closes the conn if the running average drops below
+    %% `min_rate` after a 1 s grace (matches `roadrunner_conn:rate_ok/3`).
+    %% Reset at every `read_request_phase` entry (per-request window —
+    %% each request gets its own grace + budget).
+    min_rate = 0 :: non_neg_integer(),
+    recv_phase_start = 0 :: integer(),
+    recv_phase_bytes = 0 :: non_neg_integer()
 }).
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
@@ -190,7 +200,8 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
                 dispatch = maps:get(dispatch, ProtoOpts),
                 middlewares = maps:get(middlewares, ProtoOpts),
                 max_content_length = maps:get(max_content_length, ProtoOpts),
-                max_keep_alive_request = maps:get(max_keep_alive_request, ProtoOpts)
+                max_keep_alive_request = maps:get(max_keep_alive_request, ProtoOpts),
+                min_rate = maps:get(minimum_bytes_per_second, ProtoOpts)
             },
             read_request_phase(S);
         {roadrunner_drain, _Deadline} ->
@@ -228,15 +239,20 @@ read_request_phase(#loop_state{buffered = Buf} = S) ->
     %% `Deadline - now` so a slow client that drips bytes can NOT keep
     %% extending the receive's timeout. Mirrors gen_statem's one-shot
     %% `state_timeout` semantics in a hand-rolled receive.
-    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    Now = erlang:monotonic_time(millisecond),
+    Deadline = Now + Timeout,
+    %% Reset the slowloris window at every read_request_phase entry —
+    %% pipelined keep-alive iterations get their own grace + budget,
+    %% same shape as `roadrunner_conn:make_recv/3`.
+    S1 = S#loop_state{recv_phase_start = Now, recv_phase_bytes = 0},
     case Buf of
         <<>> ->
-            recv_request_bytes(S, Deadline);
+            recv_request_bytes(S1, Deadline);
         _ ->
             %% Pipelined leftover from a prior keep-alive iteration —
             %% try parsing it before reading more bytes. If the parse
             %% returns `{more, _}` we'll fall back to recv_request_bytes.
-            handle_request_bytes(S, Deadline)
+            handle_request_bytes(S1, Deadline)
     end.
 
 %% First requests use `request_timeout`; keep-alive loop-backs use
@@ -283,7 +299,10 @@ recv_request_bytes(S, Deadline) ->
 recv_passive(
     #loop_state{
         socket = Socket,
-        buffered = Buf
+        buffered = Buf,
+        min_rate = MinRate,
+        recv_phase_start = PhaseStart,
+        recv_phase_bytes = PhaseBytes
     } = S,
     Deadline
 ) ->
@@ -291,13 +310,31 @@ recv_passive(
         drain ->
             exit_normal(S);
         ok ->
-            Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+            Now = erlang:monotonic_time(millisecond),
+            Remaining = max(0, Deadline - Now),
             ChunkTimeout = min(Remaining, ?DRAIN_CHECK_INTERVAL_MS),
             case roadrunner_transport:recv(Socket, 0, ChunkTimeout) of
                 {ok, Bytes} ->
-                    handle_request_bytes(
-                        S#loop_state{buffered = <<Buf/binary, Bytes/binary>>}, Deadline
-                    );
+                    %% Anti-slowloris: track running bytes/sec and drop
+                    %% the conn if `min_rate` isn't met after the 1 s
+                    %% grace. Cheap when `min_rate = 0` because
+                    %% `roadrunner_conn:rate_ok/3` short-circuits at
+                    %% `MinRate * Elapsed = 0`.
+                    NewBytes = PhaseBytes + byte_size(Bytes),
+                    case roadrunner_conn:rate_ok(Now - PhaseStart, NewBytes, MinRate) of
+                        true ->
+                            handle_request_bytes(
+                                S#loop_state{
+                                    buffered = <<Buf/binary, Bytes/binary>>,
+                                    recv_phase_bytes = NewBytes
+                                },
+                                Deadline
+                            );
+                        false ->
+                            %% Slowloris — silent close, same as the
+                            %% gen_statem variant's `slow_client` branch.
+                            exit_normal(S)
+                    end;
                 {error, timeout} when Remaining =< ChunkTimeout ->
                     %% True request/keep-alive timeout — the deadline
                     %% has elapsed.
@@ -335,7 +372,10 @@ drain_mailbox_check() ->
 recv_with_hibernate(
     #loop_state{
         socket = Socket,
-        buffered = Buf
+        buffered = Buf,
+        min_rate = MinRate,
+        recv_phase_start = PhaseStart,
+        recv_phase_bytes = PhaseBytes
     } = S,
     Deadline,
     HibernateAfter
@@ -346,7 +386,20 @@ recv_with_hibernate(
     receive
         {DataTag, _Sock, Bytes} ->
             _ = erlang:cancel_timer(DeadlineRef),
-            handle_request_bytes(S#loop_state{buffered = <<Buf/binary, Bytes/binary>>}, Deadline);
+            NewBytes = PhaseBytes + byte_size(Bytes),
+            Now = erlang:monotonic_time(millisecond),
+            case roadrunner_conn:rate_ok(Now - PhaseStart, NewBytes, MinRate) of
+                true ->
+                    handle_request_bytes(
+                        S#loop_state{
+                            buffered = <<Buf/binary, Bytes/binary>>,
+                            recv_phase_bytes = NewBytes
+                        },
+                        Deadline
+                    );
+                false ->
+                    exit_normal(S)
+            end;
         {ClosedTag, _Sock} ->
             _ = erlang:cancel_timer(DeadlineRef),
             exit_normal(S);

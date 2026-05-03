@@ -274,6 +274,75 @@ setopts_on_dead_socket_exits_silently_test() ->
     detach_telemetry(Tag),
     _ = Self.
 
+slowloris_during_passive_recv_drops_client_test() ->
+    %% Passive recv path: deliver a tiny amount of bytes after the
+    %% 1 s grace, with `min_rate` set high enough that the running
+    %% average falls under it. The conn must close silently.
+    ensure_pg(),
+    Self = self(),
+    %% Sink that waits past the grace window, then delivers 3 bytes
+    %% in response to the conn's first recv.
+    Sink = spawn(fun() ->
+        receive
+            {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
+                timer:sleep(1100),
+                ConnPid ! {roadrunner_fake_recv_reply, {ok, ~"GET"}}
+        after 5000 -> ok
+        end,
+        receive
+            stop -> ok
+        after 5000 -> ok
+        end
+    end),
+    Opts = (fake_opts(slow_passive))#{
+        minimum_bytes_per_second => 1000000
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 4000 -> error(no_normal_exit_on_slowloris)
+    end,
+    Sink ! stop,
+    _ = Self.
+
+slowloris_during_active_mode_recv_drops_client_test() ->
+    %% Active-mode hibernate path: deliver a tiny amount of bytes
+    %% after the 1 s grace, with `min_rate` set high enough that the
+    %% running average falls under it. The conn must close silently
+    %% (no 408, same as the passive path's slowloris branch).
+    ensure_pg(),
+    Self = self(),
+    %% Sink that waits past the grace window, then delivers 3 bytes
+    %% — running average becomes `3 * 1000 / 1100 ≈ 2.7 B/s`, well
+    %% under 1 MB/s.
+    Sink = spawn(fun() ->
+        receive
+            {roadrunner_fake_setopts, ConnPid, _Opts} ->
+                timer:sleep(1100),
+                ConnPid ! {roadrunner_fake_data, undefined, ~"GET"}
+        after 5000 -> ok
+        end,
+        receive
+            stop -> ok
+        after 5000 -> ok
+        end
+    end),
+    Opts = (fake_opts(slow_active))#{
+        hibernate_after => 5000,
+        minimum_bytes_per_second => 1000000
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 4000 -> error(no_normal_exit_on_slowloris)
+    end,
+    Sink ! stop,
+    _ = Self.
+
 stray_msg_during_read_request_is_ignored_test() ->
     ensure_pg(),
     Self = self(),

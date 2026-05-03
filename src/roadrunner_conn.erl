@@ -48,6 +48,7 @@ read it anyway.
 %% machinery directly through these functions.
 -export([
     make_recv/3,
+    rate_ok/3,
     body_framing/1,
     generate_request_id/0,
     generate_request_id/1,
@@ -288,6 +289,7 @@ make_recv(Socket, Deadline, MinRate) ->
         end
     end.
 
+-doc false.
 %% A 1-second grace lets a slow handshake / TLS session start without
 %% being misclassified. After that, the running average must meet the
 %% minimum or the client is dropped. `MinRate = 0` falls through and
