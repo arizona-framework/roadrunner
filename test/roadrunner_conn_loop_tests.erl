@@ -181,16 +181,17 @@ drain_during_read_request_exits_silently_test() ->
     ?assertEqual(<<>>, iolist_to_binary(collect_sends(Tag, 50))),
     Sink ! stop.
 
-tcp_closed_during_read_request_exits_silently_test() ->
+tcp_closed_during_passive_recv_exits_silently_test() ->
+    %% Phase A' default path uses passive recv. TCP close is signaled
+    %% by `gen_tcp:recv` returning `{error, closed}` — script the sink
+    %% to reply with that.
     ensure_pg(),
     Self = self(),
     Tag = make_ref(),
-    Sink = spawn_silent_sink_with_send_log(Self, Tag),
+    Sink = spawn_scripted_sink(Self, Tag, [{passive, {error, closed}}]),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, fake_opts(closed)),
     Ref = monitor(process, Pid),
     Pid ! shoot,
-    timer:sleep(20),
-    Pid ! {roadrunner_fake_closed, undefined},
     receive
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 2000 -> error(no_normal_exit)
@@ -199,21 +200,20 @@ tcp_closed_during_read_request_exits_silently_test() ->
     ?assertEqual(<<>>, iolist_to_binary(collect_sends(Tag, 50))),
     Sink ! stop.
 
-tcp_error_during_read_request_exits_silently_test() ->
+tcp_error_during_passive_recv_exits_silently_test() ->
+    %% Phase A' passive path: any non-timeout, non-closed recv error
+    %% (e.g. econnreset) → silent exit.
     ensure_pg(),
     Self = self(),
     Tag = make_ref(),
-    Sink = spawn_silent_sink_with_send_log(Self, Tag),
+    Sink = spawn_scripted_sink(Self, Tag, [{passive, {error, econnreset}}]),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, fake_opts(tcp_err)),
     Ref = monitor(process, Pid),
     Pid ! shoot,
-    timer:sleep(20),
-    Pid ! {roadrunner_fake_error, undefined, econnreset},
     receive
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 2000 -> error(no_normal_exit)
     end,
-    %% No response — TCP-level error, peer's gone.
     ?assertEqual(<<>>, iolist_to_binary(collect_sends(Tag, 50))),
     Sink ! stop.
 
@@ -242,26 +242,25 @@ setopts_on_dead_socket_exits_silently_test() ->
     %% A dead sink causes `roadrunner_transport:setopts/2` to return
     %% `{error, einval}` (the fake transport mirrors real-socket
     %% behavior). The conn must exit cleanly without writing.
+    %%
+    %% Phase A' default path uses passive recv (no setopts call) —
+    %% so to exercise this code path the test opts into the
+    %% active-mode `recv_with_hibernate` branch via `hibernate_after`.
     ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     DeadSink = spawn(fun() -> ok end),
-    %% Wait for the sink to actually exit so its is_process_alive check
-    %% is false by the time the conn calls setopts.
     DeadRef = monitor(process, DeadSink),
     receive
         {'DOWN', DeadRef, process, DeadSink, _} -> ok
     after 1000 -> error(dead_sink_didnt_exit)
     end,
-    %% Use a separate live sink for the conn's send/close path so
-    %% `send_request_timeout`-style writes don't crash if Phase 2's
-    %% timeout `after` clause races. We pick the dead sink as the
-    %% socket peer, so setopts targets it and fails.
     attach_telemetry(Tag, [
         [roadrunner, listener, accept],
         [roadrunner, listener, conn_close]
     ]),
-    {ok, Pid} = roadrunner_conn_loop:start({fake, DeadSink}, fake_opts(deadsock)),
+    Opts = (fake_opts(deadsock))#{hibernate_after => 5000},
+    {ok, Pid} = roadrunner_conn_loop:start({fake, DeadSink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
     receive
@@ -455,8 +454,13 @@ body_recv_timeout_writes_408_test() ->
     Self = self(),
     Tag = make_ref(),
     Headers = ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n",
+    %% Phase A' default path uses passive recv for headers AND body,
+    %% so both script items are `{passive, _}` — no `{active, _}`
+    %% setopts dispatch in this conn_impl. Listeners that opt in to
+    %% `hibernate_after` use the active path (covered by the
+    %% hibernate_path_handles_* tests below).
     Sink = spawn_scripted_sink(Self, Tag, [
-        {active, Headers},
+        {passive, {ok, Headers}},
         {passive, {error, timeout}}
     ]),
     Opts = (fake_opts(body_to))#{
@@ -479,7 +483,7 @@ body_slow_client_exits_silently_test() ->
     Tag = make_ref(),
     Headers = ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n",
     Sink = spawn_scripted_sink(Self, Tag, [
-        {active, Headers},
+        {passive, {ok, Headers}},
         {passive, {error, slow_client}}
     ]),
     Opts = (fake_opts(body_slow))#{
@@ -504,7 +508,7 @@ body_recv_error_writes_400_test() ->
     Tag = make_ref(),
     Headers = ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n",
     Sink = spawn_scripted_sink(Self, Tag, [
-        {active, Headers},
+        {passive, {ok, Headers}},
         {passive, {error, closed}}
     ]),
     Opts = (fake_opts(body_err))#{
@@ -532,7 +536,7 @@ manual_mode_dispatches_with_body_state_test() ->
     Tag = make_ref(),
     Headers = ~"POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 5\r\n\r\n",
     Sink = spawn_scripted_sink(Self, Tag, [
-        {active, Headers},
+        {passive, {ok, Headers}},
         {passive, {ok, ~"hello"}}
     ]),
     Opts = (fake_opts(manual))#{
@@ -557,7 +561,7 @@ manual_mode_bad_framing_writes_400_test() ->
     Self = self(),
     Tag = make_ref(),
     Headers = ~"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n",
-    Sink = spawn_scripted_sink(Self, Tag, [{active, Headers}]),
+    Sink = spawn_scripted_sink(Self, Tag, [{passive, {ok, Headers}}]),
     Opts = (fake_opts(manual_bad))#{
         body_buffering := manual,
         dispatch := {handler, roadrunner_manual_keepalive_handler}
@@ -664,7 +668,7 @@ manual_mode_drain_failure_closes_cleanly_test() ->
     Tag = make_ref(),
     Headers = ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n",
     Sink = spawn_scripted_sink(Self, Tag, [
-        {active, Headers},
+        {passive, {ok, Headers}},
         %% No body bytes pre-buffered. The drain will recv → fail.
         {passive, {error, closed}}
     ]),
@@ -700,7 +704,7 @@ manual_mode_pipelined_leftover_uses_manual_drain_test() ->
     Req1 = ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
     Req2 = ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nbye",
     Both = <<Req1/binary, Req2/binary>>,
-    Sink = spawn_scripted_sink(Self, Tag, [{active, Both}]),
+    Sink = spawn_scripted_sink(Self, Tag, [{passive, {ok, Both}}]),
     Opts = (fake_opts(manual_pipe))#{
         body_buffering := manual,
         dispatch := {handler, roadrunner_manual_keepalive_handler},
@@ -1140,9 +1144,19 @@ active_sink_loop(Logger, Tag, Bytes, Delivered) ->
         stop ->
             ok;
         {roadrunner_fake_setopts, ConnPid, _Opts} when not Delivered ->
+            %% Active-mode delivery: simulate one inbound packet.
             ConnPid ! {roadrunner_fake_data, undefined, Bytes},
             active_sink_loop(Logger, Tag, Bytes, true);
         {roadrunner_fake_setopts, _ConnPid, _Opts} ->
+            active_sink_loop(Logger, Tag, Bytes, Delivered);
+        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} when not Delivered ->
+            %% Passive-mode delivery (Phase A'): reply with bytes once,
+            %% then subsequent recvs return `{error, closed}` so the
+            %% conn exits cleanly after parsing the request.
+            ConnPid ! {roadrunner_fake_recv_reply, {ok, Bytes}},
+            active_sink_loop(Logger, Tag, Bytes, true);
+        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
+            ConnPid ! {roadrunner_fake_recv_reply, {error, closed}},
             active_sink_loop(Logger, Tag, Bytes, Delivered);
         {roadrunner_fake_send, _Pid, Data} ->
             Logger ! {Tag, sent, Data},
@@ -1216,6 +1230,16 @@ two_chunk_sink_loop(Logger, Tag, Remaining) ->
                 [] ->
                     two_chunk_sink_loop(Logger, Tag, [])
             end;
+        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
+            %% Passive-mode delivery: reply one chunk per recv.
+            case Remaining of
+                [Bytes | Rest] ->
+                    ConnPid ! {roadrunner_fake_recv_reply, {ok, Bytes}},
+                    two_chunk_sink_loop(Logger, Tag, Rest);
+                [] ->
+                    ConnPid ! {roadrunner_fake_recv_reply, {error, closed}},
+                    two_chunk_sink_loop(Logger, Tag, [])
+            end;
         {roadrunner_fake_send, _Pid, Data} ->
             Logger ! {Tag, sent, Data},
             two_chunk_sink_loop(Logger, Tag, Remaining);
@@ -1232,6 +1256,11 @@ silent_sink_loop(Logger, Tag) ->
     receive
         stop ->
             ok;
+        {roadrunner_fake_recv, _ConnPid, _Len, _Timeout} ->
+            %% Passive-mode block: stay silent so request_timeout fires.
+            %% The conn's deadline check will see the recv chunk timeout
+            %% and exit on its own.
+            silent_sink_loop(Logger, Tag);
         {roadrunner_fake_send, _Pid, Data} ->
             Logger ! {Tag, sent, Data},
             silent_sink_loop(Logger, Tag);

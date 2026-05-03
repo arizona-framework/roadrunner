@@ -75,6 +75,20 @@ for the phased rollout.
   to the idle-trigger. Wakes naturally on the next inbound TCP
   packet. Listeners without `hibernate_after` bypass this entirely
   and use the Phase 2/3 receive shape (no timer per request).
+- **Phase A'** — passive-mode recv (default path). When
+  `hibernate_after` is unset or `0` (the production default),
+  switch from active-mode `{active, once}` + receive to passive
+  `gen_tcp:recv(Socket, 0, ChunkTimeout)`. Bypasses `gen_tcp_socket`'s
+  gen_statem dispatch entirely (eliminates ~7 % CPU from
+  `gen:do_call/4` + `recv_data_deliver/4` + `gen_statem:loop/3` +
+  `nif_getopt/3` on the hot path). Drain detection lag is bounded
+  by `?DRAIN_CHECK_INTERVAL_MS` (100 ms): each iteration drains
+  the mailbox for `{roadrunner_drain, _}` and stray messages
+  before blocking on recv with a chunk timeout. Listeners with
+  `hibernate_after => Ms > 0` continue to use the active-mode
+  Phase 4 path so hibernation works (passive recv blocks the
+  process inside a NIF — only `receive` shape supports
+  `erlang:hibernate/3`).
 
 Pending: Phase 5 (top-level try/catch around `exit_clean`),
 Phase 6 (test parametrization), Phase 7 (A/B vs gen_statem),
@@ -217,12 +231,11 @@ read_request_phase(#loop_state{buffered = Buf} = S) ->
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     case Buf of
         <<>> ->
-            arm_active_once(S),
             recv_request_bytes(S, Deadline);
         _ ->
             %% Pipelined leftover from a prior keep-alive iteration —
-            %% try parsing it before arming the socket. If the parse
-            %% returns `{more, _}` we'll arm and wait for more bytes.
+            %% try parsing it before reading more bytes. If the parse
+            %% returns `{more, _}` we'll fall back to recv_request_bytes.
             handle_request_bytes(S, Deadline)
     end.
 
@@ -235,47 +248,82 @@ phase_timeout(#loop_state{phase = first, proto_opts = ProtoOpts}) ->
 phase_timeout(#loop_state{phase = keep_alive, proto_opts = ProtoOpts}) ->
     maps:get(keep_alive_timeout, ProtoOpts).
 
+%% Drain-detection cap when in passive recv. Each `gen_tcp:recv` call
+%% is bounded to at most this many ms so the conn re-checks its
+%% mailbox for `{roadrunner_drain, _}` between blocks. Trade-off:
+%% shorter = lower drain latency, more recv NIF calls; longer =
+%% the opposite. 100 ms matches typical ops-tooling expectations
+%% for graceful-drain detection.
+-define(DRAIN_CHECK_INTERVAL_MS, 100).
+
 -spec recv_request_bytes(#loop_state{}, integer()) -> no_return().
 recv_request_bytes(S, Deadline) ->
     case maps:get(hibernate_after, S#loop_state.proto_opts, 0) of
         Ms when is_integer(Ms), Ms > 0 ->
+            arm_active_once(S),
             recv_with_hibernate(S, Deadline, Ms);
         _ ->
-            recv_no_hibernate(S, Deadline)
+            recv_passive(S, Deadline)
     end.
 
-%% Recv path with no hibernation — single `after Remaining` clause
-%% handles both request_timeout and keep_alive_timeout. Zero per-iter
-%% timer arms on the hot path.
--spec recv_no_hibernate(#loop_state{}, integer()) -> no_return().
-recv_no_hibernate(
+%% Passive-mode recv path (default — `hibernate_after` unset or 0).
+%% Bypasses `gen_tcp_socket`'s gen_statem dispatch entirely — direct
+%% `gen_tcp:recv` call into the kernel via the prim_socket NIF.
+%%
+%% Drain detection: zero-timeout receive before each blocking recv
+%% drains pending `{roadrunner_drain, _}` and stray messages from
+%% the mailbox. Each recv is capped at `?DRAIN_CHECK_INTERVAL_MS` so
+%% drain delivered while we're blocked surfaces within ~100 ms.
+%%
+%% Request-timeout: tracked via the absolute `Deadline`. `{error,
+%% timeout}` from recv with `Remaining =< chunk_timeout` means the
+%% request_timeout actually fired; otherwise it's a drain-check tick
+%% and we loop.
+-spec recv_passive(#loop_state{}, integer()) -> no_return().
+recv_passive(
     #loop_state{
         socket = Socket,
         buffered = Buf
     } = S,
     Deadline
 ) ->
-    {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
-    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    case drain_mailbox_check() of
+        drain ->
+            exit_normal(S);
+        ok ->
+            Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+            ChunkTimeout = min(Remaining, ?DRAIN_CHECK_INTERVAL_MS),
+            case roadrunner_transport:recv(Socket, 0, ChunkTimeout) of
+                {ok, Bytes} ->
+                    handle_request_bytes(
+                        S#loop_state{buffered = <<Buf/binary, Bytes/binary>>}, Deadline
+                    );
+                {error, timeout} when Remaining =< ChunkTimeout ->
+                    %% True request/keep-alive timeout — the deadline
+                    %% has elapsed.
+                    timeout_response(S),
+                    exit_normal(S);
+                {error, timeout} ->
+                    %% Drain-check tick. Loop back to the mailbox
+                    %% drain + recv.
+                    recv_passive(S, Deadline);
+                {error, _} ->
+                    %% Peer close, kernel error, etc. Silent exit.
+                    exit_normal(S)
+            end
+    end.
+
+%% Zero-timeout drain of the mailbox. Returns `drain` if a drain
+%% message was queued, otherwise drops every other message and
+%% returns `ok`. Stray messages don't queue forever — drained on
+%% every recv iteration.
+-spec drain_mailbox_check() -> drain | ok.
+drain_mailbox_check() ->
     receive
-        {DataTag, _Sock, Bytes} ->
-            handle_request_bytes(S#loop_state{buffered = <<Buf/binary, Bytes/binary>>}, Deadline);
-        {ClosedTag, _Sock} ->
-            %% Peer closed mid-headers — silent exit, no 4xx (peer's
-            %% gone, no point writing).
-            exit_normal(S);
-        {ErrorTag, _Sock, _Reason} ->
-            exit_normal(S);
-        {roadrunner_drain, _Deadline} ->
-            exit_normal(S);
-        _Stray ->
-            %% Drop unmatched messages (gen_statem does the same via
-            %% the wildcard `info` clause) and re-arm.
-            arm_active_once(S),
-            recv_no_hibernate(S, Deadline)
-    after Remaining ->
-        timeout_response(S),
-        exit_normal(S)
+        {roadrunner_drain, _Deadline} -> drain;
+        _Stray -> drain_mailbox_check()
+    after 0 ->
+        ok
     end.
 
 %% Recv path with hibernation. Arms ONE `send_after` for the
@@ -375,7 +423,12 @@ handle_request_bytes(
                 S#loop_state{buffered = Rest, req_id_buffer = NewBuffer}, Req, Deadline
             );
         {more, _} ->
-            arm_active_once(S),
+            %% Need more bytes to complete the request line/headers.
+            %% `recv_request_bytes/2` dispatches to passive (default)
+            %% or active+hibernate; either path arms whatever it
+            %% needs. Don't call `arm_active_once` here — passive
+            %% mode would silently leak the resulting `{tcp, _, _}`
+            %% delivery into the mailbox.
             recv_request_bytes(S, Deadline);
         {error, Reason} ->
             logger:debug(#{

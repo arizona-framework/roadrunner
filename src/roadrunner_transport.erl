@@ -129,8 +129,15 @@ recv({ssl, S}, Len, Timeout) ->
     ssl:recv(S, Len, Timeout);
 recv({fake, Pid}, Len, Timeout) ->
     Pid ! {roadrunner_fake_recv, self(), Len, Timeout},
+    %% Mirror real-transport behavior — honor the caller's timeout
+    %% so passive-recv test sinks don't have to track deadlines
+    %% themselves. A sink that just stays silent (e.g.,
+    %% `silent_sink_loop` for slowloris/timeout coverage) lets the
+    %% recv return `{error, timeout}` naturally.
     receive
         {roadrunner_fake_recv_reply, Result} -> Result
+    after Timeout ->
+        {error, timeout}
     end.
 
 -doc """
