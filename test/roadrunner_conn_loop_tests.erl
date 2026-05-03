@@ -588,6 +588,142 @@ request_start_and_stop_pair_with_shared_request_id_test() ->
     detach_telemetry(Tag),
     Sink ! stop.
 
+stream_response_writes_chunked_body_test() ->
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(stream))#{
+        dispatch := {handler, roadrunner_stream_handler}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    %% Stream writes a chunked-encoding response — assert at least the
+    %% 200 head landed on the wire.
+    ?assertMatch(<<"HTTP/1.1 200", _/binary>>, Sent),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"hello")),
+    Sink ! stop.
+
+loop_response_runs_until_stop_test() ->
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(looprsp))#{
+        dispatch := {handler, roadrunner_loop_handler}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    %% Loop handler registers itself under `roadrunner_loop_test_conn`
+    %% and pushes one chunk per inbound msg. Wait for it, then stop.
+    timer:sleep(50),
+    case whereis(roadrunner_loop_test_conn) of
+        undefined ->
+            error(loop_handler_not_registered);
+        LoopPid ->
+            LoopPid ! stop
+    end,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 200", _/binary>>, Sent),
+    Sink ! stop.
+
+sendfile_response_writes_head_then_body_test() ->
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Path = filename:join(["/tmp", "rr_conn_loop_sendfile.txt"]),
+    ok = file:write_file(Path, ~"sendfile-content"),
+    persistent_term:put({roadrunner_conn_loop_sendfile_handler, file}, Path),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(sendf))#{
+        dispatch := {handler, roadrunner_conn_loop_sendfile_handler}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 200", _/binary>>, Sent),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"sendfile-content")),
+    Sink ! stop,
+    persistent_term:erase({roadrunner_conn_loop_sendfile_handler, file}),
+    file:delete(Path).
+
+sendfile_response_skips_body_for_head_method_test() ->
+    %% RFC 9110 §9.3.2 — HEAD must not include a message body.
+    %% Covers the `~"HEAD"` branch of dispatch_response/4's sendfile clause.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Path = filename:join(["/tmp", "rr_conn_loop_sendfile_head.txt"]),
+    ok = file:write_file(Path, ~"never-sent"),
+    persistent_term:put({roadrunner_conn_loop_sendfile_handler, file}, Path),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(sendf_head))#{
+        dispatch := {handler, roadrunner_conn_loop_sendfile_handler}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 200", _/binary>>, Sent),
+    %% File body must NOT be on the wire — HEAD bypasses the sendfile call.
+    ?assertEqual(nomatch, binary:match(Sent, ~"never-sent")),
+    Sink ! stop,
+    persistent_term:erase({roadrunner_conn_loop_sendfile_handler, file}),
+    file:delete(Path).
+
+websocket_dispatch_invokes_session_run_test() ->
+    %% Without proper ws upgrade headers `ws_session:run/4` writes 400
+    %% and returns. We're covering the dispatch_response websocket
+    %% clause — a full handshake test lives in the WS suite.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET /ws HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(wsdisp))#{
+        dispatch := {handler, roadrunner_ws_upgrade_handler}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    %% Bad upgrade — ws_session writes a 400.
+    ?assertMatch(<<"HTTP/1.1 400", _/binary>>, Sent),
+    Sink ! stop.
+
 slot_released_after_parse_exit_test() ->
     ensure_pg(),
     Self = self(),

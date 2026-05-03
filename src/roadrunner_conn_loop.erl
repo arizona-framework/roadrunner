@@ -35,9 +35,14 @@ for the phased rollout.
   `[roadrunner, request, start | stop | exception]` with shared
   `StartMono`. 413 for oversized bodies, 500 for handler crashes,
   404 for not_found dispatch.
+- **Phase 3b** — full dispatch_response/4 with all 5 response
+  shapes: buffered (3-tuple), `{stream, ...}`, `{loop, ...}`,
+  `{sendfile, ...}`, `{websocket, ...}`. Stream / loop / sendfile /
+  websocket all force connection close (matching the gen_statem's
+  contract). The stream/loop/ws response writers
+  (`roadrunner_stream_response:run/4`, etc.) are reused as-is.
 
-Pending: Phase 3b (stream/loop/sendfile/websocket dispatch
-shapes), Phase 3c (keep-alive loop-back + pipelined leftover),
+Pending: Phase 3c (keep-alive loop-back + pipelined leftover),
 Phase 4 (hibernation), Phase 5 (top-level try/catch around
 `exit_clean`), Phase 6 (test parametrization), Phase 7 (A/B vs
 gen_statem), Phase 8 (cutover or park).
@@ -364,16 +369,49 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, ListenerMws) ->
             exit_normal(S)
     end.
 
-%% Phase 3a: buffered (3-tuple) only. Phase 3b adds stream/loop/
-%% sendfile/websocket. Anything else crashes loud — the handler
-%% behaviour spec rules out other shapes, so a crash is the right
-%% signal that someone's returning an undocumented response.
+%% Mirrors `roadrunner_conn_statem:dispatch_response/4` exactly. The 5
+%% shapes match the `roadrunner_handler:result/0` type. Stream / loop /
+%% sendfile / websocket force connection close (the underlying
+%% writers manage their own keep-alive semantics — generally none).
 -spec dispatch_response(
     roadrunner_transport:socket(),
     module(),
     roadrunner_http1:request(),
     roadrunner_handler:response()
 ) -> ok.
+dispatch_response(Socket, _Handler, Req, {websocket, Mod, State}) when is_atom(Mod) ->
+    _ = roadrunner_ws_session:run(Socket, Req, Mod, State),
+    ok;
+dispatch_response(Socket, _Handler, _Req, {stream, Status, Headers, Fun}) when
+    is_function(Fun, 1)
+->
+    _ = roadrunner_stream_response:run(Socket, Status, Headers, Fun),
+    ok;
+dispatch_response(Socket, Handler, _Req, {loop, Status, Headers, LoopState}) when
+    is_integer(Status)
+->
+    _ = roadrunner_loop_response:run(Socket, Status, Headers, Handler, LoopState),
+    ok;
+dispatch_response(
+    Socket, _Handler, Req, {sendfile, Status, Headers, {Filename, Offset, Length}}
+) when
+    is_integer(Status)
+->
+    Head = roadrunner_http1:response(Status, Headers, ~""),
+    _ = roadrunner_telemetry:response_send(
+        roadrunner_transport:send(Socket, Head), sendfile_response_head
+    ),
+    _ =
+        case roadrunner_req:method(Req) of
+            ~"HEAD" ->
+                ok;
+            _ ->
+                roadrunner_telemetry:response_send(
+                    roadrunner_transport:sendfile(Socket, Filename, Offset, Length),
+                    sendfile_body
+                )
+        end,
+    ok;
 dispatch_response(Socket, _Handler, Req, {Status, Headers, Body}) when is_integer(Status) ->
     RespBody = roadrunner_conn:response_body_for(Req, Body),
     Resp = roadrunner_http1:response(Status, Headers, RespBody),
