@@ -296,20 +296,20 @@ build_proto_opts(Opts, ListenerName) ->
         %% because hibernation has a per-wake CPU cost (~tens of microseconds
         %% for the GC); only worth enabling for workloads with mostly-idle
         %% keep-alive conns where the heap-shrink win dominates.
-        case maps:find(hibernate_after, Opts) of
-            {ok, Ms} when is_integer(Ms), Ms > 0 ->
+        case Opts of
+            #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 ->
                 Base#{hibernate_after => Ms};
-            error ->
+            #{} ->
                 Base
         end,
     %% Optional `rate_check_interval_ms` — the rate-check timer
     %% interval inside `reading_request`. Default 1000ms; ops can
     %% override.
     WithRate =
-        case maps:find(rate_check_interval_ms, Opts) of
-            {ok, IntervalMs} when is_integer(IntervalMs), IntervalMs > 0 ->
+        case Opts of
+            #{rate_check_interval_ms := IntervalMs} when is_integer(IntervalMs), IntervalMs > 0 ->
                 WithHibernate#{rate_check_interval_ms => IntervalMs};
-            error ->
+            #{} ->
                 WithHibernate
         end,
     %% Optional `conn_impl` — the conn-process implementation
@@ -317,10 +317,10 @@ build_proto_opts(Opts, ListenerName) ->
     %% `statem` (dispatches to `roadrunner_conn_statem`); set to
     %% `loop` to dispatch to `roadrunner_conn_loop`'s
     %% tail-recursive variant.
-    case maps:find(conn_impl, Opts) of
-        {ok, Impl} when Impl =:= loop; Impl =:= statem ->
+    case Opts of
+        #{conn_impl := Impl} when Impl =:= loop; Impl =:= statem ->
             WithRate#{conn_impl => Impl};
-        error ->
+        #{} ->
             WithRate
     end.
 

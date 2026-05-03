@@ -68,9 +68,9 @@ Returns `{error, no_boundary}` when the parameter isn't present.
 """.
 -spec boundary(binary()) -> {ok, binary()} | {error, no_boundary}.
 boundary(ContentType) when is_binary(ContentType) ->
-    case maps:find(~"boundary", params(ContentType)) of
-        {ok, Boundary} -> {ok, Boundary};
-        error -> {error, no_boundary}
+    case params(ContentType) of
+        #{~"boundary" := Boundary} -> {ok, Boundary};
+        #{} -> {error, no_boundary}
     end.
 
 -doc """

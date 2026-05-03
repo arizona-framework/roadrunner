@@ -138,10 +138,10 @@ start(Socket, ProtoOpts) ->
 
 -spec start_opts(roadrunner_conn:proto_opts()) -> [gen_statem:start_opt()].
 start_opts(ProtoOpts) ->
-    case maps:find(hibernate_after, ProtoOpts) of
-        {ok, Ms} when is_integer(Ms), Ms > 0 ->
+    case ProtoOpts of
+        #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 ->
             [{hibernate_after, Ms}];
-        _ ->
+        #{} ->
             []
     end.
 
