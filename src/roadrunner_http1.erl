@@ -758,16 +758,34 @@ codes get an empty reason (RFC 9112 §4.1 makes the phrase optional).
 """.
 -spec response(StatusCode :: status(), headers(), iodata()) -> iodata().
 response(Status, Headers, Body) when is_integer(Status, 100, 599) ->
-    [
-        ~"HTTP/1.1 ",
-        integer_to_binary(Status),
-        $\s,
-        reason(Status),
-        ~"\r\n",
-        encode_headers(Headers),
-        ~"\r\n",
-        Body
-    ].
+    [status_line(Status), encode_headers(Headers), ~"\r\n", Body].
+
+%% Common status codes get a precomputed `HTTP/1.1 NNN Reason\r\n`
+%% binary — one binary literal vs the five-element iolist build
+%% (`integer_to_binary(Status)` + `reason/1` + spacers) the slow
+%% path allocates per response. Wire bytes match the slow-path
+%% output exactly: only codes covered by `reason/1` appear here,
+%% with their reason phrase verbatim. Less common codes fall
+%% through to the original construction.
+-spec status_line(status()) -> binary() | iodata().
+status_line(200) -> ~"HTTP/1.1 200 OK\r\n";
+status_line(201) -> ~"HTTP/1.1 201 Created\r\n";
+status_line(204) -> ~"HTTP/1.1 204 No Content\r\n";
+status_line(301) -> ~"HTTP/1.1 301 Moved Permanently\r\n";
+status_line(302) -> ~"HTTP/1.1 302 Found\r\n";
+status_line(304) -> ~"HTTP/1.1 304 Not Modified\r\n";
+status_line(400) -> ~"HTTP/1.1 400 Bad Request\r\n";
+status_line(401) -> ~"HTTP/1.1 401 Unauthorized\r\n";
+status_line(403) -> ~"HTTP/1.1 403 Forbidden\r\n";
+status_line(404) -> ~"HTTP/1.1 404 Not Found\r\n";
+status_line(500) -> ~"HTTP/1.1 500 Internal Server Error\r\n";
+status_line(503) -> ~"HTTP/1.1 503 Service Unavailable\r\n";
+%% Uncommon status codes — emit `HTTP/1.1 NNN \r\n` with an empty
+%% reason phrase. RFC 9112 §4.1 explicitly allows the phrase to be
+%% absent. Listeners that want a custom reason for an uncommon code
+%% can return the response head themselves via the `{stream, ...}`
+%% or `{sendfile, ...}` shapes.
+status_line(Status) -> [~"HTTP/1.1 ", integer_to_binary(Status), ~" \r\n"].
 
 -spec encode_headers(headers()) -> iodata().
 encode_headers(Headers) ->
@@ -826,18 +844,3 @@ init_patterns() ->
     ),
     persistent_term:put(?LF_KEY, binary:compile_pattern(~"\n")),
     ok.
-
--spec reason(status()) -> binary().
-reason(200) -> ~"OK";
-reason(201) -> ~"Created";
-reason(204) -> ~"No Content";
-reason(301) -> ~"Moved Permanently";
-reason(302) -> ~"Found";
-reason(304) -> ~"Not Modified";
-reason(400) -> ~"Bad Request";
-reason(401) -> ~"Unauthorized";
-reason(403) -> ~"Forbidden";
-reason(404) -> ~"Not Found";
-reason(500) -> ~"Internal Server Error";
-reason(503) -> ~"Service Unavailable";
-reason(_) -> ~"".
