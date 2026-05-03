@@ -905,6 +905,32 @@ request_start_and_stop_pair_with_shared_request_id_test() ->
     detach_telemetry(Tag),
     Sink ! stop.
 
+head_method_buffered_response_omits_body_test() ->
+    %% RFC 9110 §9.3.2 — HEAD must NOT include a message body even
+    %% when the handler returns one. The dispatch_response/4 fast
+    %% path in conn_loop pattern-matches on `method := ~"HEAD"` and
+    %% forces the body to `~""`. Headers (including content-length)
+    %% stay as-is so the framing matches what GET would have returned.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, fake_opts(head)),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    %% Status line + headers, but the hello body bytes should NOT
+    %% be on the wire.
+    ?assertMatch(<<"HTTP/1.1 200", _/binary>>, Sent),
+    ?assertEqual(nomatch, binary:match(Sent, ~"Hello, roadrunner")),
+    Sink ! stop.
+
 stream_response_writes_chunked_body_test() ->
     ensure_pg(),
     Self = self(),

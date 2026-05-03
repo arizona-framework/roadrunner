@@ -120,7 +120,13 @@ Phase 8 (cutover or park).
     %% — 256 bytes batched, 8 bytes sliced per request. Empty
     %% buffer triggers a refill. Threaded via the loop_state to
     %% avoid process-dictionary writes.
-    req_id_buffer = <<>> :: binary()
+    req_id_buffer = <<>> :: binary(),
+    %% Conn-stable values pulled from `proto_opts` once at `shoot`
+    %% time so the per-request hot path doesn't re-`maps:get` them.
+    %% Saves ~3 hash lookups per request.
+    requests_counter :: atomics:atomics_ref() | undefined,
+    dispatch :: roadrunner_conn:dispatch() | undefined,
+    middlewares = [] :: roadrunner_middleware:middleware_list()
 }).
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
@@ -163,7 +169,10 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
                 listener_name = ListenerName,
                 start_mono = StartMono,
                 peer = Peer,
-                scheme = Scheme
+                scheme = Scheme,
+                requests_counter = maps:get(requests_counter, ProtoOpts),
+                dispatch = maps:get(dispatch, ProtoOpts),
+                middlewares = maps:get(middlewares, ProtoOpts)
             },
             read_request_phase(S);
         {roadrunner_drain, _Deadline} ->
@@ -339,14 +348,13 @@ handle_request_bytes(
         listener_name = ListenerName,
         peer = Peer,
         scheme = Scheme,
-        proto_opts = ProtoOpts
+        requests_counter = ReqCounter
     } = S,
     Deadline
 ) ->
     Buf = S#loop_state.buffered,
     case roadrunner_http1:parse_request(Buf) of
         {ok, Req0, Rest} ->
-            ReqCounter = maps:get(requests_counter, ProtoOpts),
             _ = atomics:add(ReqCounter, 1, 1),
             {RequestId, NewBuffer} = roadrunner_conn:generate_request_id(
                 S#loop_state.req_id_buffer
@@ -450,12 +458,11 @@ read_body_phase(
 dispatch_phase(
     #loop_state{
         socket = Socket,
-        proto_opts = ProtoOpts
+        dispatch = Dispatch,
+        middlewares = ListenerMws
     } = S,
     Req
 ) ->
-    Dispatch = maps:get(dispatch, ProtoOpts),
-    ListenerMws = maps:get(middlewares, ProtoOpts),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
         {ok, Handler, Bindings, RouteOpts} ->
             FullReq = Req#{bindings => Bindings, route_opts => RouteOpts},
@@ -561,9 +568,22 @@ dispatch_response(
                 )
         end,
     ok;
-dispatch_response(Socket, _Handler, Req, {Status, Headers, Body}) when is_integer(Status) ->
-    RespBody = roadrunner_conn:response_body_for(Req, Body),
-    Resp = roadrunner_http1:response(Status, Headers, RespBody),
+%% Buffered (3-tuple) response shape. RFC 9110 §9.3.2: HEAD must NOT
+%% include a message body — match on `method := ~"HEAD"` in the
+%% function head and emit the response with an empty body. Cheaper
+%% than the prior `roadrunner_conn:response_body_for/2` helper which
+%% did a `maps:get(method, _)` per response; here it's a free
+%% pattern-match dispatch.
+dispatch_response(Socket, _Handler, #{method := ~"HEAD"}, {Status, Headers, _Body}) when
+    is_integer(Status)
+->
+    Resp = roadrunner_http1:response(Status, Headers, ~""),
+    _ = roadrunner_telemetry:response_send(
+        roadrunner_transport:send(Socket, Resp), buffered_response
+    ),
+    ok;
+dispatch_response(Socket, _Handler, _Req, {Status, Headers, Body}) when is_integer(Status) ->
+    Resp = roadrunner_http1:response(Status, Headers, Body),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Resp), buffered_response
     ),
