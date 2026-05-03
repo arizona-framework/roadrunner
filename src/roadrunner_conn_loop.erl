@@ -41,11 +41,20 @@ for the phased rollout.
   websocket all force connection close (matching the gen_statem's
   contract). The stream/loop/ws response writers
   (`roadrunner_stream_response:run/4`, etc.) are reused as-is.
+- **Phase 3c** — keep-alive loop-back. `finishing_phase` decides
+  keep-alive vs close per `roadrunner_conn:keep_alive_decision/2`;
+  on keep-alive (and under `max_keep_alive_request`), recurses
+  into `read_request_phase` with `phase = keep_alive`, the
+  pipelined leftover bytes carried in `buffered`, and
+  `requests_served + 1`. Pipelined two-requests-in-one-packet
+  works because `handle_request_bytes/2` parses the buffer
+  before re-arming the socket. `request_timeout` selection
+  becomes phase-aware (first vs keep_alive_timeout) and the
+  timeout response is silent on keep_alive (no peer waiting).
 
-Pending: Phase 3c (keep-alive loop-back + pipelined leftover),
-Phase 4 (hibernation), Phase 5 (top-level try/catch around
-`exit_clean`), Phase 6 (test parametrization), Phase 7 (A/B vs
-gen_statem), Phase 8 (cutover or park).
+Pending: Phase 4 (hibernation), Phase 5 (top-level try/catch
+around `exit_clean`), Phase 6 (test parametrization), Phase 7
+(A/B vs gen_statem), Phase 8 (cutover or park).
 """.
 
 -export([start/2]).
@@ -66,13 +75,19 @@ gen_statem), Phase 8 (cutover or park).
     start_mono :: integer(),
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
     scheme = http :: http | https,
-    %% Cumulative successfully-served requests on this conn. Phase 3a
-    %% always exits after one request; 3c will loop here on keep-alive
-    %% and bump this counter to enforce `max_keep_alive_request`.
+    %% `first` for the first request on a fresh conn; `keep_alive` for
+    %% subsequent loop-back iterations. Drives the timeout selection
+    %% (request_timeout vs keep_alive_timeout) and the silent-vs-408
+    %% behavior in `recv_request_bytes/2`'s `after` clause.
+    phase = first :: first | keep_alive,
+    %% Cumulative successfully-served requests on this conn. Bumped
+    %% in `run_pipeline/4` after each successful dispatch; checked in
+    %% `finishing_phase/3` against `max_keep_alive_request`.
     requests_served = 0 :: non_neg_integer(),
     %% Bytes received but not yet parsed. Empty on first iteration;
-    %% populated mid-recv when `parse_request/1` returns `{more, _}`.
-    %% Phase 3c will also use this for pipelined leftovers.
+    %% populated mid-recv when `parse_request/1` returns `{more, _}`,
+    %% AND on the keep-alive loop-back when a prior request's body
+    %% drain leaves post-body bytes (RFC 7230 §6.3 pipelining).
     buffered = <<>> :: binary()
 }).
 
@@ -147,17 +162,34 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
 %% Phase 2 only handles the "first request on a fresh conn" case;
 %% Phase 3 will add keep-alive loop-back and pipelined leftover.
 -spec read_request_phase(#loop_state{}) -> no_return().
-read_request_phase(#loop_state{listener_name = ListenerName} = S) ->
+read_request_phase(#loop_state{listener_name = ListenerName, buffered = Buf} = S) ->
     proc_lib:set_label({roadrunner_conn, reading_request, ListenerName}),
-    Timeout = maps:get(request_timeout, S#loop_state.proto_opts),
+    Timeout = phase_timeout(S),
     %% Compute an *absolute* deadline once. Each iteration's `after`
     %% clause decays it — `recv_request_bytes/2` recomputes
     %% `Deadline - now` so a slow client that drips bytes can NOT keep
     %% extending the receive's timeout. Mirrors gen_statem's one-shot
     %% `state_timeout` semantics in a hand-rolled receive.
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
-    arm_active_once(S),
-    recv_request_bytes(S, Deadline).
+    case Buf of
+        <<>> ->
+            arm_active_once(S),
+            recv_request_bytes(S, Deadline);
+        _ ->
+            %% Pipelined leftover from a prior keep-alive iteration —
+            %% try parsing it before arming the socket. If the parse
+            %% returns `{more, _}` we'll arm and wait for more bytes.
+            handle_request_bytes(S, Deadline)
+    end.
+
+%% First requests use `request_timeout`; keep-alive loop-backs use
+%% `keep_alive_timeout` (typically shorter — connections that have
+%% nothing to do drop faster).
+-spec phase_timeout(#loop_state{}) -> non_neg_integer().
+phase_timeout(#loop_state{phase = first, proto_opts = ProtoOpts}) ->
+    maps:get(request_timeout, ProtoOpts);
+phase_timeout(#loop_state{phase = keep_alive, proto_opts = ProtoOpts}) ->
+    maps:get(keep_alive_timeout, ProtoOpts).
 
 -spec recv_request_bytes(#loop_state{}, integer()) -> no_return().
 recv_request_bytes(
@@ -186,9 +218,13 @@ recv_request_bytes(
             arm_active_once(S),
             recv_request_bytes(S, Deadline)
     after Remaining ->
-        %% Slowloris / first-request silence. Phase 2 only sees `first`
-        %% requests (no keep-alive yet) so we always send a 408.
-        _ = roadrunner_conn:send_request_timeout(Socket),
+        %% Slowloris on first request → 408. Idle keep-alive timeout →
+        %% silent close (peer wasn't waiting on bytes).
+        _ =
+            case S#loop_state.phase of
+                first -> roadrunner_conn:send_request_timeout(Socket);
+                keep_alive -> ok
+            end,
         exit_normal(S)
     end.
 
@@ -422,16 +458,77 @@ dispatch_response(Socket, _Handler, Req, {Status, Headers, Body}) when is_intege
 
 %% --- finishing phase ---
 %%
-%% Phase 3a: drain unread manual-mode body bytes (auto mode already
-%% read everything, so this is a no-op there) and exit. Phase 3c
-%% will use this point to decide keep-alive vs close and loop back
-%% into `read_request_phase`.
+%% Drain any unread manual-mode body bytes, then decide keep-alive
+%% vs close. Stream / loop / sendfile / websocket all force close
+%% (their writers manage their own lifecycle); only buffered
+%% (3-tuple) responses are eligible for keep-alive.
+%%
+%% On keep-alive, recurse into `read_request_phase` with phase
+%% flipped to `keep_alive`, the request-specific scratch fields
+%% reset to defaults, and any pipelined leftover bytes carried in
+%% `buffered` so the next iteration can parse them without waiting
+%% on more inbound packets.
 -spec finishing_phase(#loop_state{}, roadrunner_http1:request(), roadrunner_handler:response()) ->
     no_return().
-finishing_phase(#loop_state{listener_name = ListenerName} = S, Req, _Response) ->
+finishing_phase(
+    #loop_state{
+        listener_name = ListenerName,
+        proto_opts = ProtoOpts
+    } = S,
+    Req,
+    Response
+) ->
     proc_lib:set_label({roadrunner_conn, finishing, ListenerName}),
-    _ = roadrunner_conn:drain_body(Req),
-    exit_normal(S).
+    case roadrunner_conn:response_kind(Response) of
+        buffered ->
+            buffered_finish(S, Req, Response, ProtoOpts);
+        _ ->
+            %% Stream / loop / sendfile / websocket: writer owns the
+            %% wire from here. Close the conn.
+            _ = roadrunner_conn:drain_body(Req),
+            exit_normal(S)
+    end.
+
+-spec buffered_finish(
+    #loop_state{},
+    roadrunner_http1:request(),
+    roadrunner_handler:response(),
+    roadrunner_conn:proto_opts()
+) -> no_return().
+buffered_finish(S, Req, {_Status, Headers, _Body} = _Response, ProtoOpts) ->
+    case roadrunner_conn:drain_body(Req) of
+        {ok, ManualLeftover} ->
+            case roadrunner_conn:keep_alive_decision(Req, Headers) of
+                close ->
+                    exit_normal(S);
+                keep_alive ->
+                    Max = maps:get(max_keep_alive_request, ProtoOpts),
+                    Served = S#loop_state.requests_served,
+                    case Served >= Max of
+                        true ->
+                            exit_normal(S);
+                        false ->
+                            Leftover = pipelined_leftover(Req, S, ManualLeftover),
+                            read_request_phase(S#loop_state{
+                                phase = keep_alive,
+                                buffered = Leftover
+                            })
+                    end
+            end;
+        {error, _} ->
+            %% Drain failure — close. Manual-mode handlers can leave the
+            %% body_state in a broken state if they read past EOF.
+            exit_normal(S)
+    end.
+
+%% Manual-mode body_state owns its post-body leftover (returned by
+%% `drain_body/1`). Auto-mode stashes the leftover in the loop state's
+%% `buffered` field — set by `read_body_phase` on `read_body/4` return.
+-spec pipelined_leftover(roadrunner_http1:request(), #loop_state{}, binary()) -> binary().
+pipelined_leftover(Req, _S, ManualLeftover) when is_map_key(body_state, Req) ->
+    ManualLeftover;
+pipelined_leftover(_Req, #loop_state{buffered = Buf}, _ManualLeftover) ->
+    Buf.
 
 -spec telemetry_metadata(roadrunner_http1:request()) -> roadrunner_telemetry:metadata().
 telemetry_metadata(Req) ->

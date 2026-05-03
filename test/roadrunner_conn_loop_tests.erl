@@ -488,11 +488,13 @@ body_recv_error_writes_400_test() ->
 manual_mode_dispatches_with_body_state_test() ->
     %% Manual mode skips the auto-buffer read and hands a body_state to
     %% the handler. The manual handler reads the body explicitly,
-    %% returning 200 ok.
+    %% returning 200 ok. Use `Connection: close` so the conn closes
+    %% after the single request rather than looping back keep-alive
+    %% (which the manual handler doesn't disable on its own).
     ensure_pg(),
     Self = self(),
     Tag = make_ref(),
-    Headers = ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n",
+    Headers = ~"POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 5\r\n\r\n",
     Sink = spawn_scripted_sink(Self, Tag, [
         {active, Headers},
         {passive, {ok, ~"hello"}}
@@ -563,6 +565,155 @@ not_found_writes_404_test() ->
     ?assertMatch(<<"HTTP/1.1 404", _/binary>>, Sent),
     Sink ! stop,
     persistent_term:erase({roadrunner_routes, Listener}).
+
+two_pipelined_requests_in_one_packet_serve_both_test() ->
+    %% RFC 7230 §6.3 pipelining — two requests delivered as one TCP
+    %% packet should both be served. The keepalive handler (no
+    %% `Connection: close`) lets keep-alive engage. The second
+    %% request closes via the test's `max_keep_alive_request := 2`
+    %% cap so the conn exits cleanly without a third iteration.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Both =
+        ~"GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    Sink = spawn_active_sink_with_send_log(Self, Tag, Both),
+    Opts = (fake_opts(pipelined))#{
+        dispatch := {handler, roadrunner_keepalive_handler},
+        max_keep_alive_request := 2
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    %% Two 200 OK responses on the wire (split into 3 tokens by the
+    %% leading empty + one per response).
+    ?assertEqual(3, length(binary:split(Sent, ~"HTTP/1.1 ", [global]))),
+    Sink ! stop.
+
+keep_alive_max_cap_closes_after_max_test() ->
+    %% `max_keep_alive_request := 1` — the single served request hits
+    %% the cap and the conn closes (no second iteration even though
+    %% keep-alive is otherwise eligible).
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Both =
+        ~"GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    Sink = spawn_active_sink_with_send_log(Self, Tag, Both),
+    Opts = (fake_opts(max1))#{max_keep_alive_request := 1},
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    %% Exactly one 200 OK on the wire — second request never dispatched.
+    ?assertEqual(2, length(binary:split(Sent, ~"HTTP/1.1 ", [global]))),
+    Sink ! stop.
+
+manual_mode_drain_failure_closes_cleanly_test() ->
+    %% Manual handler returns 200 without reading the body. drain_body/1
+    %% then has to consume the body_state's unread bytes — when the
+    %% recv in that drain returns `{error, closed}`, drain_body returns
+    %% `{error, _}` and the conn must exit cleanly without crashing.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Headers = ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n",
+    Sink = spawn_scripted_sink(Self, Tag, [
+        {active, Headers},
+        %% No body bytes pre-buffered. The drain will recv → fail.
+        {passive, {error, closed}}
+    ]),
+    Opts = (fake_opts(drain_fail))#{
+        body_buffering := manual,
+        dispatch := {handler, roadrunner_conn_loop_lazy_manual_handler}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    %% Handler's 200 was written before drain failed.
+    ?assertMatch(<<"HTTP/1.1 200", _/binary>>, Sent),
+    Sink ! stop.
+
+manual_mode_pipelined_leftover_uses_manual_drain_test() ->
+    %% Manual handler reads its own body to completion, returns 200
+    %% keep-alive friendly. Two pipelined requests are delivered as one
+    %% packet — request 1's body is part of the packet, then request 2's
+    %% headers + body. After dispatch 1, drain_body returns
+    %% `{ok, ManualLeftover}` where ManualLeftover is request 2.
+    %% `pipelined_leftover/3` MUST take the manual-mode branch (the
+    %% req has `body_state` set) and feed ManualLeftover to the next
+    %% iteration's read_request_phase. Covers the manual-mode clause
+    %% of pipelined_leftover/3.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Req1 = ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+    Req2 = ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nbye",
+    Both = <<Req1/binary, Req2/binary>>,
+    Sink = spawn_scripted_sink(Self, Tag, [{active, Both}]),
+    Opts = (fake_opts(manual_pipe))#{
+        body_buffering := manual,
+        dispatch := {handler, roadrunner_manual_keepalive_handler},
+        max_keep_alive_request := 2
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    %% Two 200 responses on the wire — second one came from request 2
+    %% which lived in ManualLeftover after request 1's drain.
+    ?assertEqual(3, length(binary:split(Sent, ~"HTTP/1.1 ", [global]))),
+    Sink ! stop.
+
+keep_alive_idle_timeout_silently_closes_test() ->
+    %% After the first request, the conn waits in `read_request_phase`
+    %% (phase=keep_alive) for the next request bytes. With short
+    %% `keep_alive_timeout`, the receive's `after` fires and the conn
+    %% closes silently — NO 408 (the gen_statem does the same).
+    %% Uses the `roadrunner_keepalive_handler` (no `Connection: close`)
+    %% so keep-alive engages — otherwise the hello handler would
+    %% close after request 1 and we'd never enter `phase=keep_alive`.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(ka_to))#{
+        dispatch := {handler, roadrunner_keepalive_handler},
+        keep_alive_timeout := 50
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    %% Only the first request's 200 — no 408 written for the idle
+    %% keep-alive timeout.
+    ?assertEqual(2, length(binary:split(Sent, ~"HTTP/1.1 ", [global]))),
+    ?assertEqual(nomatch, binary:match(Sent, ~"HTTP/1.1 408")),
+    Sink ! stop.
 
 request_start_and_stop_pair_with_shared_request_id_test() ->
     ensure_pg(),
