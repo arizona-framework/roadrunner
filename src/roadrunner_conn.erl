@@ -50,6 +50,7 @@ read it anyway.
     make_recv/3,
     body_framing/1,
     generate_request_id/0,
+    generate_request_id/1,
     set_request_logger_metadata/1,
     maybe_send_continue/3,
     refine_conn_label/2,
@@ -210,10 +211,31 @@ refine_conn_label(ProtoOpts, Peer) ->
 
 %% 64 random bits in lowercase hex — collision-resistant for billions of
 %% requests, short enough to embed in log lines.
+%%
+%% Two arities. `/0` is stateless (each call goes through the CSPRNG NIF)
+%% — used by `roadrunner_conn_statem` and any caller that doesn't carry
+%% per-conn state. `/1` accepts a per-conn buffer of pre-generated random
+%% bytes and returns `{RequestId, NewBuffer}` — caller threads the
+%% buffer through its own state. The conn_loop variant uses `/1` to
+%% amortize the NIF call: one `crypto:strong_rand_bytes/1` per ~32
+%% requests instead of one per request. Each 8-byte slice still
+%% carries a full 64 bits of independent entropy — the batch boundary
+%% doesn't reduce randomness.
 -doc false.
 -spec generate_request_id() -> binary().
 generate_request_id() ->
     binary:encode_hex(crypto:strong_rand_bytes(8), lowercase).
+
+-define(REQ_ID_BATCH_BYTES, 256).
+
+-doc false.
+-spec generate_request_id(binary()) -> {binary(), binary()}.
+generate_request_id(<<Slice:8/binary, Rest/binary>>) ->
+    {binary:encode_hex(Slice, lowercase), Rest};
+generate_request_id(_Empty) ->
+    %% Buffer drained (or never initialized) — refill with one NIF call.
+    <<Slice:8/binary, Rest/binary>> = crypto:strong_rand_bytes(?REQ_ID_BATCH_BYTES),
+    {binary:encode_hex(Slice, lowercase), Rest}.
 
 %% Replaces (not merges) the conn process's logger metadata so a
 %% keep-alive request never inherits the previous request's correlation.

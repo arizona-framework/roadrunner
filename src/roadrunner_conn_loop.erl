@@ -114,7 +114,13 @@ Phase 8 (cutover or park).
     %% populated mid-recv when `parse_request/1` returns `{more, _}`,
     %% AND on the keep-alive loop-back when a prior request's body
     %% drain leaves post-body bytes (RFC 7230 §6.3 pipelining).
-    buffered = <<>> :: binary()
+    buffered = <<>> :: binary(),
+    %% Pre-generated CSPRNG bytes for `request_id`. Filled lazily
+    %% (on first request) by `roadrunner_conn:generate_request_id/1`
+    %% — 256 bytes batched, 8 bytes sliced per request. Empty
+    %% buffer triggers a refill. Threaded via the loop_state to
+    %% avoid process-dictionary writes.
+    req_id_buffer = <<>> :: binary()
 }).
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
@@ -342,7 +348,9 @@ handle_request_bytes(
         {ok, Req0, Rest} ->
             ReqCounter = maps:get(requests_counter, ProtoOpts),
             _ = atomics:add(ReqCounter, 1, 1),
-            RequestId = roadrunner_conn:generate_request_id(),
+            {RequestId, NewBuffer} = roadrunner_conn:generate_request_id(
+                S#loop_state.req_id_buffer
+            ),
             Req = Req0#{
                 peer => Peer,
                 scheme => Scheme,
@@ -351,7 +359,9 @@ handle_request_bytes(
             },
             ok = roadrunner_conn:set_request_logger_metadata(Req),
             ok = roadrunner_conn:maybe_send_continue(Socket, Req, Rest),
-            read_body_phase(S#loop_state{buffered = Rest}, Req, Deadline);
+            read_body_phase(
+                S#loop_state{buffered = Rest, req_id_buffer = NewBuffer}, Req, Deadline
+            );
         {more, _} ->
             arm_active_once(S),
             recv_request_bytes(S, Deadline);
