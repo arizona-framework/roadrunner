@@ -44,7 +44,7 @@
 %% Servers known to the bench, in default-run order. Adding a new
 %% server is two steps: append it here and add a clause for it in
 %% `start_server/2` (plus any `scenario_*` config helpers below).
--define(KNOWN_SERVERS, [roadrunner, roadrunner_loop, cowboy, elli]).
+-define(KNOWN_SERVERS, [roadrunner, cowboy, elli]).
 
 main(Args) ->
     Opts = parse_args(Args),
@@ -242,13 +242,7 @@ maybe_stop_profile(Peer, Side, #{profile := true, profile_min_ms := MinMs}) ->
     ok.
 
 start_server(roadrunner, Scenario) ->
-    start_roadrunner(Scenario, statem);
-start_server(roadrunner_loop, Scenario) ->
-    %% Same listener setup as `roadrunner` but with the per-conn process
-    %% routed through `roadrunner_conn_loop` (tail-recursive variant)
-    %% instead of the default `roadrunner_conn_statem`. Run side-by-side
-    %% via `--servers roadrunner,roadrunner_loop` to A/B the two impls.
-    start_roadrunner(Scenario, loop);
+    start_roadrunner(Scenario);
 start_server(cowboy, Scenario) ->
     {ok, Peer, _Node} = peer:start_link(#{
         name => peer:random_name(),
@@ -306,7 +300,7 @@ start_server(elli, _Scenario) ->
             halt(1)
     end.
 
-start_roadrunner(Scenario, ConnImpl) ->
+start_roadrunner(Scenario) ->
     {ok, Peer, _Node} = peer:start_link(#{
         name => peer:random_name(),
         connection => standard_io,
@@ -318,8 +312,7 @@ start_roadrunner(Scenario, ConnImpl) ->
         port => 0,
         keep_alive_timeout => 60000,
         max_clients => 100000,
-        max_keep_alive_request => 1000000,
-        conn_impl => ConnImpl
+        max_keep_alive_request => 1000000
     },
     ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
     {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr, ListenerOpts]),

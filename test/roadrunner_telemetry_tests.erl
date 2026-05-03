@@ -133,7 +133,7 @@ request_rejected_event_fires_on_bad_request_line_test() ->
             listener_name => probe_listener_rej
         },
         true = roadrunner_conn:try_acquire_slot(Opts),
-        {ok, Pid} = roadrunner_conn_statem:start({fake, Sink}, Opts),
+        {ok, Pid} = roadrunner_conn:start({fake, Sink}, Opts),
         Ref = monitor(process, Pid),
         Pid ! shoot,
         receive

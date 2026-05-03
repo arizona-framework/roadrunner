@@ -52,22 +52,15 @@ connection crash doesn't take the pool down.
     rate_check_interval_ms => pos_integer(),
     body_buffering => auto | manual,
     slot_reconciliation => disabled | #{interval_ms := pos_integer()},
-    %% When set, the per-connection gen_statem auto-hibernates after
+    %% When set, the per-connection process auto-hibernates after
     %% `Ms` milliseconds of idle main-loop time. Most useful for
     %% long-lived keep-alive HTTP/1.1 connections that mostly sit
     %% idle between requests — drops process heap to ~1KB during
-    %% the wait. Active-mode reads (the conn statem returns to its
-    %% main loop between events) are the prerequisite that makes
-    %% this fire at all.
+    %% the wait. Setting this routes `roadrunner_conn_loop`'s recv
+    %% through the active-mode `recv_with_hibernate/3` path so the
+    %% receive's `after` clause has a window to call
+    %% `erlang:hibernate/3`.
     hibernate_after => pos_integer(),
-    %% Selects the per-connection process implementation. `loop`
-    %% (default) dispatches to the tail-recursive variant in
-    %% `roadrunner_conn_loop` — measured faster than elli on hello
-    %% throughput with 2-4× better p99. `statem` opts back into the
-    %% legacy `gen_statem` variant in `roadrunner_conn_statem`,
-    %% kept available as a rollback path while the loop variant
-    %% bakes; will be removed in a future release.
-    conn_impl => loop | statem,
     tls => [ssl:tls_server_option()]
 }.
 
@@ -291,12 +284,13 @@ build_proto_opts(Opts, ListenerName) ->
         listener_name => ListenerName
     },
     WithHibernate =
-        %% Optional `hibernate_after` — `roadrunner_conn_statem:start/2`
-        %% reads it from proto_opts and threads it into
-        %% `gen_statem:start/3`'s start options. Omitted by default
-        %% because hibernation has a per-wake CPU cost (~tens of microseconds
-        %% for the GC); only worth enabling for workloads with mostly-idle
-        %% keep-alive conns where the heap-shrink win dominates.
+        %% Optional `hibernate_after` — `roadrunner_conn_loop` reads it
+        %% from proto_opts and routes the recv path through
+        %% `recv_with_hibernate/3` so the conn auto-hibernates after
+        %% Ms of idle time. Omitted by default because hibernation has
+        %% a per-wake CPU cost (~tens of microseconds for the GC); only
+        %% worth enabling for workloads with mostly-idle keep-alive
+        %% conns where the heap-shrink win dominates.
         case Opts of
             #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 ->
                 Base#{hibernate_after => Ms};
@@ -306,23 +300,11 @@ build_proto_opts(Opts, ListenerName) ->
     %% Optional `rate_check_interval_ms` — the rate-check timer
     %% interval inside `reading_request`. Default 1000ms; ops can
     %% override.
-    WithRate =
-        case Opts of
-            #{rate_check_interval_ms := IntervalMs} when is_integer(IntervalMs), IntervalMs > 0 ->
-                WithHibernate#{rate_check_interval_ms => IntervalMs};
-            #{} ->
-                WithHibernate
-        end,
-    %% Optional `conn_impl` — the conn-process implementation
-    %% selector consumed by `roadrunner_conn:start/2`. Default is
-    %% `statem` (dispatches to `roadrunner_conn_statem`); set to
-    %% `loop` to dispatch to `roadrunner_conn_loop`'s
-    %% tail-recursive variant.
     case Opts of
-        #{conn_impl := Impl} when Impl =:= loop; Impl =:= statem ->
-            WithRate#{conn_impl => Impl};
+        #{rate_check_interval_ms := IntervalMs} when is_integer(IntervalMs), IntervalMs > 0 ->
+            WithHibernate#{rate_check_interval_ms => IntervalMs};
         #{} ->
-            WithRate
+            WithHibernate
     end.
 
 %% `routes` (router-based dispatch) takes precedence over `handler`. With

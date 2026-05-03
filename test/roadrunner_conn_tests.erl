@@ -975,15 +975,38 @@ conn_http10_default_close_test_() ->
             roadrunner_listener:port(conn_test_ka_10)
         end,
         fun(_) -> ok = roadrunner_listener:stop(conn_test_ka_10) end, fun(Port) ->
-            {"HTTP/1.0 default-closes even when handler omits Connection: close", fun() ->
-                {ok, Sock} = gen_tcp:connect(
-                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
-                ),
-                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.0\r\nHost: x\r\n\r\n"),
-                Reply = recv_until_closed(Sock),
-                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
-                ok = gen_tcp:close(Sock)
-            end}
+            [
+                {"HTTP/1.0 default-closes even when handler omits Connection: close", fun() ->
+                    {ok, Sock} = gen_tcp:connect(
+                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                    ),
+                    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.0\r\nHost: x\r\n\r\n"),
+                    Reply = recv_until_closed(Sock),
+                    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                    ok = gen_tcp:close(Sock)
+                end},
+                {"HTTP/1.0 with Connection: keep-alive serves two requests on one conn", fun() ->
+                    %% RFC 7230 §6.1: HTTP/1.0 default is close, but
+                    %% `Connection: keep-alive` from the client opts in.
+                    {ok, Sock} = gen_tcp:connect(
+                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                    ),
+                    ok = gen_tcp:send(
+                        Sock,
+                        ~"GET / HTTP/1.0\r\nHost: x\r\nConnection: keep-alive\r\n\r\n"
+                    ),
+                    First = recv_response_with_body(Sock, 7),
+                    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, First),
+                    %% Conn must still be alive — send a second request.
+                    ok = gen_tcp:send(
+                        Sock,
+                        ~"GET / HTTP/1.0\r\nHost: x\r\nConnection: close\r\n\r\n"
+                    ),
+                    Second = recv_until_closed(Sock),
+                    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Second),
+                    ok = gen_tcp:close(Sock)
+                end}
+            ]
         end}.
 
 conn_http11_explicit_close_test_() ->
@@ -1046,7 +1069,7 @@ conn_handler_crash_returns_500_test_() ->
 consume_state_no_framing_returns_empty_test() ->
     %% No framing → zero-length body per RFC 7230 §3.3.3. The
     %% `buffered` bytes are pipelined-leftover, not body — preserved
-    %% in the body_state so `roadrunner_conn_statem`'s finishing state can
+    %% in the body_state so `roadrunner_conn_loop`'s finishing phase can
     %% thread them into the next reading_request parse.
     State = #{
         framing => none,
@@ -1751,134 +1774,6 @@ conn_populates_peer_in_request_test_() ->
             end}
         end}.
 
-%% =============================================================================
-%% Statem-impl coverage. With `conn_impl => loop` as the default, the
-%% statem variant's `dispatch_response/4` clauses for stream / loop /
-%% sendfile / websocket only see traffic when callers opt back into it.
-%% These tests pin one example of each shape to `conn_impl => statem`
-%% so the legacy variant stays covered until it's removed.
-%% =============================================================================
-
-statem_dispatches_websocket_upgrade_test_() ->
-    {setup,
-        fun() ->
-            {ok, _} = roadrunner_listener:start_link(conn_test_statem_ws, #{
-                port => 0,
-                handler => roadrunner_ws_upgrade_handler,
-                conn_impl => statem
-            }),
-            roadrunner_listener:port(conn_test_statem_ws)
-        end,
-        fun(_) -> ok = roadrunner_listener:stop(conn_test_statem_ws) end, fun(Port) ->
-            {"statem dispatches websocket upgrade", fun() ->
-                {ok, Sock} = gen_tcp:connect(
-                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
-                ),
-                ok = gen_tcp:send(
-                    Sock,
-                    ~"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
-                ),
-                Headers = recv_until(Sock, ~"\r\n\r\n"),
-                ?assertMatch(<<"HTTP/1.1 101", _/binary>>, Headers),
-                ok = gen_tcp:close(Sock)
-            end}
-        end}.
-
-statem_dispatches_stream_response_test_() ->
-    {setup,
-        fun() ->
-            {ok, _} = roadrunner_listener:start_link(conn_test_statem_stream, #{
-                port => 0,
-                handler => roadrunner_stream_handler,
-                conn_impl => statem
-            }),
-            roadrunner_listener:port(conn_test_statem_stream)
-        end,
-        fun(_) -> ok = roadrunner_listener:stop(conn_test_statem_stream) end, fun(Port) ->
-            {"statem dispatches stream response", fun() ->
-                {ok, Sock} = gen_tcp:connect(
-                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
-                ),
-                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
-                Reply = recv_until_closed(Sock),
-                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
-                {match, _} = re:run(Reply, ~"transfer-encoding: chunked", [caseless]),
-                ok = gen_tcp:close(Sock)
-            end}
-        end}.
-
-statem_dispatches_loop_response_test_() ->
-    {setup,
-        fun() ->
-            {ok, _} = roadrunner_listener:start_link(conn_test_statem_loop, #{
-                port => 0,
-                handler => roadrunner_loop_handler,
-                conn_impl => statem
-            }),
-            roadrunner_listener:port(conn_test_statem_loop)
-        end,
-        fun(_) -> ok = roadrunner_listener:stop(conn_test_statem_loop) end, fun(Port) ->
-            {"statem dispatches loop response", fun() ->
-                {ok, Sock} = gen_tcp:connect(
-                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
-                ),
-                ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
-                Headers = recv_until(Sock, ~"\r\n\r\n"),
-                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Headers),
-                wait_registered(roadrunner_loop_test_conn),
-                roadrunner_loop_test_conn ! stop,
-                _ = recv_until_closed(Sock),
-                ok = gen_tcp:close(Sock)
-            end}
-        end}.
-
-statem_dispatches_sendfile_response_test_() ->
-    {setup,
-        fun() ->
-            Path = filename:join(
-                "/tmp",
-                "roadrunner_statem_sendfile_" ++
-                    integer_to_list(erlang:unique_integer([positive]))
-            ),
-            ok = file:write_file(Path, ~"sendfile-via-statem"),
-            ok = persistent_term:put({roadrunner_conn_loop_sendfile_handler, file}, Path),
-            {ok, _} = roadrunner_listener:start_link(conn_test_statem_sendfile, #{
-                port => 0,
-                handler => roadrunner_conn_loop_sendfile_handler,
-                conn_impl => statem
-            }),
-            {Path, roadrunner_listener:port(conn_test_statem_sendfile)}
-        end,
-        fun({Path, _}) ->
-            ok = roadrunner_listener:stop(conn_test_statem_sendfile),
-            _ = persistent_term:erase({roadrunner_conn_loop_sendfile_handler, file}),
-            _ = file:delete(Path)
-        end,
-        fun({_Path, Port}) ->
-            [
-                {"statem dispatches sendfile response (GET emits body)", fun() ->
-                    {ok, Sock} = gen_tcp:connect(
-                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
-                    ),
-                    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
-                    Reply = recv_until_closed(Sock),
-                    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
-                    {match, _} = re:run(Reply, ~"sendfile-via-statem"),
-                    ok = gen_tcp:close(Sock)
-                end},
-                {"statem dispatches sendfile response (HEAD omits body)", fun() ->
-                    {ok, Sock} = gen_tcp:connect(
-                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
-                    ),
-                    ok = gen_tcp:send(Sock, ~"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n"),
-                    Reply = recv_until_closed(Sock),
-                    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
-                    nomatch = re:run(Reply, ~"sendfile-via-statem"),
-                    ok = gen_tcp:close(Sock)
-                end}
-            ]
-        end}.
-
 %% --- helpers ---
 
 assert_status(Port, Request, ExpectedCode) ->
@@ -1901,3 +1796,22 @@ recv_until_closed(Sock, Acc) ->
         {error, closed} -> Acc;
         {error, _} -> Acc
     end.
+
+%% Read response head + exactly `BodyLen` bytes from a keep-alive
+%% conn. recv_until_closed/1 would block waiting for the peer to
+%% close, which never happens on a keep-alive request. `recv_until`
+%% may already have buffered the body alongside the head — top up
+%% only what's missing.
+recv_response_with_body(Sock, BodyLen) ->
+    Buf = recv_until(Sock, ~"\r\n\r\n"),
+    [Head, BodySoFar] = binary:split(Buf, ~"\r\n\r\n"),
+    Need = BodyLen - byte_size(BodySoFar),
+    Body =
+        case Need of
+            0 ->
+                BodySoFar;
+            N when N > 0 ->
+                {ok, More} = gen_tcp:recv(Sock, N, 2000),
+                <<BodySoFar/binary, More/binary>>
+        end,
+    <<Head/binary, "\r\n\r\n", Body/binary>>.

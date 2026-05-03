@@ -2,31 +2,22 @@
 -moduledoc """
 Public connection-process API and pure helpers.
 
-`start/2` spawns the per-connection process. Two implementations:
+`start/2` spawns the per-connection process — `roadrunner_conn_loop`,
+a tail-recursive loop with phase tracking via `proc_lib:set_label/1`
+for observer / recon visibility.
 
-- `roadrunner_conn_loop` — tail-recursive loop (default). Lower
-  per-request overhead than the gen_statem variant; phase tracking
-  via `proc_lib:set_label/1` for observer / recon visibility.
-- `roadrunner_conn_statem` — `gen_statem` with named states
-  (`awaiting_shoot | reading_request | reading_body | dispatching |
-  finishing`) reachable via `sys:get_state/1` / `sys:trace/2`. Kept
-  as a rollback path while the loop variant bakes; opt back in via
-  `conn_impl => statem`.
-
-The other public functions are pure-ish helpers shared by both
-implementations; many are also called directly from `roadrunner_req`
-(manual body buffering) and from `roadrunner_conn_tests.erl`'s
-closure-driven unit tests.
+The other public functions are pure-ish helpers; many are also called
+directly from `roadrunner_req` (manual body buffering) and from
+`roadrunner_conn_tests.erl`'s closure-driven unit tests.
 
 Per-connection behavior — keep-alive (capped by
 `max_keep_alive_request`, idle-bound by `keep_alive_timeout`),
 `Expect: 100-continue`, HEAD body suppression, anti-Slowloris rate
 check (`minimum_bytes_per_second`), the five handler return shapes
 (`{Status, Headers, Body}`, `{stream, ...}`, `{loop, ...}`,
-`{sendfile, ...}`, `{websocket, ...}`) — lives in the conn
-implementation modules and the response-shape-specific modules
-(`roadrunner_stream_response`, `roadrunner_loop_response`,
-`roadrunner_ws_session`).
+`{sendfile, ...}`, `{websocket, ...}`) — lives in `roadrunner_conn_loop`
+and the response-shape-specific modules (`roadrunner_stream_response`,
+`roadrunner_loop_response`, `roadrunner_ws_session`).
 
 The 4xx/5xx error responses (400 on parse failure, 408 on
 first-request silence, 413 on oversized bodies, 500 on handler
@@ -46,17 +37,16 @@ read it anyway.
     consume_body_state/2,
     join_drain_group/1
 ]).
-%% Internal helpers shared with `roadrunner_conn_statem`. Marked `-doc false`
+%% Internal helpers shared with `roadrunner_conn_loop`. Marked `-doc false`
 %% individually so they stay invisible to the public API surface but
 %% are still reachable across the module boundary. They live here
-%% (rather than inside the statem module) because the closure-driven
+%% (rather than inside the conn-loop module) because the closure-driven
 %% unit tests in `roadrunner_conn_tests.erl` exercise the body-state
 %% machinery directly through these functions.
 -export([
     make_recv/3,
     rate_ok/3,
     body_framing/1,
-    generate_request_id/0,
     generate_request_id/1,
     set_request_logger_metadata/1,
     maybe_send_continue/3,
@@ -74,8 +64,7 @@ read it anyway.
     resolve_handler/2,
     route_middlewares/1,
     response_status/1,
-    response_kind/1,
-    response_body_for/2
+    response_kind/1
 ]).
 
 -export_type([proto_opts/0, dispatch/0, body_state/0]).
@@ -96,14 +85,7 @@ read it anyway.
     requests_counter := atomics:atomics_ref(),
     minimum_bytes_per_second := non_neg_integer(),
     body_buffering := auto | manual,
-    listener_name => atom(),
-    %% Conn-process implementation. Default `loop` routes through
-    %% `roadrunner_conn_loop`'s tail-recursive variant — measured
-    %% faster than elli on hello throughput with 2-4× better p99.
-    %% Set to `statem` to opt back into the legacy `roadrunner_conn_statem`
-    %% (gen_statem) variant — kept available for one release as a
-    %% rollback path while the loop variant bakes.
-    conn_impl => loop | statem
+    listener_name => atom()
 }.
 
 %% Opaque body-read state attached to the request in manual buffering
@@ -128,22 +110,13 @@ read it anyway.
 Spawn an unlinked connection process for the accepted `Socket` and the
 shared `ProtoOpts` (handler module, body limits, ...).
 
-Routes to `roadrunner_conn_loop` (default) or `roadrunner_conn_statem`
-based on `proto_opts.conn_impl`. Both expose the same observable
-behavior — see the moduledoc for the trade-offs.
-
 The caller (typically `roadrunner_acceptor`) must transfer socket
 ownership via `roadrunner_transport:controlling_process/2` and then
 send the process the atom `shoot` to release it.
 """.
 -spec start(roadrunner_transport:socket(), proto_opts()) -> {ok, pid()}.
 start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
-    case maps:get(conn_impl, ProtoOpts, loop) of
-        loop ->
-            {ok, _Pid} = roadrunner_conn_loop:start(Socket, ProtoOpts);
-        statem ->
-            {ok, _Pid} = roadrunner_conn_statem:start(Socket, ProtoOpts)
-    end.
+    {ok, _Pid} = roadrunner_conn_loop:start(Socket, ProtoOpts).
 
 -doc """
 Join the per-listener `pg` group so `roadrunner_listener:drain/2` can
@@ -154,9 +127,8 @@ drive `roadrunner_listener:start_link/2` directly without starting the
 application, the scope is absent and the join is silently skipped
 — drain will simply not see those conns.
 
-Shared by `roadrunner_conn:start/2` and `roadrunner_conn_statem:init/1` so
-both implementations reach the drain group through a single
-covered code path.
+Called by `roadrunner_conn_loop:init_loop/3` after the conn process
+starts but before it accepts any work.
 """.
 -spec join_drain_group(atom()) -> ok.
 join_drain_group(undefined) ->
@@ -179,12 +151,12 @@ overshoot is at most `num_acceptors - 1` — bounded and harmless.
 
 ## Slot leak under abnormal exits
 
-The slot is released by `roadrunner_conn_statem:terminate/3` on every
+The slot is released by `roadrunner_conn_loop:exit_clean/2` on every
 normal exit path (handler crash, parse error, drain stop, peer
 close). Under `exit(Pid, kill)` — sent by a supervisor or by an
 operator using `recon:proc_count/2`-style cleanup — the runtime
-skips `terminate/3` per OTP semantics, so the slot is **leaked**
-for the lifetime of the listener process. This is bounded:
+skips the cleanup funnel, so the slot is **leaked** for the lifetime
+of the listener process. This is bounded:
 `max_clients` accepted connections each leak at most one slot
 under killing, and the listener restart resets the counter. If
 leaks become a real concern under chaos-test conditions, add a
@@ -219,19 +191,13 @@ refine_conn_label(ProtoOpts, Peer) ->
 %% 64 random bits in lowercase hex — collision-resistant for billions of
 %% requests, short enough to embed in log lines.
 %%
-%% Two arities. `/0` is stateless (each call goes through the CSPRNG NIF)
-%% — used by `roadrunner_conn_statem` and any caller that doesn't carry
-%% per-conn state. `/1` accepts a per-conn buffer of pre-generated random
-%% bytes and returns `{RequestId, NewBuffer}` — caller threads the
-%% buffer through its own state. The conn_loop variant uses `/1` to
-%% amortize the NIF call: one `crypto:strong_rand_bytes/1` per ~32
+%% `/1` accepts a per-conn buffer of pre-generated random bytes and
+%% returns `{RequestId, NewBuffer}` — caller threads the buffer
+%% through its own state. The conn_loop variant uses this to amortize
+%% the CSPRNG NIF call: one `crypto:strong_rand_bytes/1` per ~32
 %% requests instead of one per request. Each 8-byte slice still
 %% carries a full 64 bits of independent entropy — the batch boundary
 %% doesn't reduce randomness.
--doc false.
--spec generate_request_id() -> binary().
-generate_request_id() ->
-    binary:encode_hex(crypto:strong_rand_bytes(8), lowercase).
 
 -define(REQ_ID_BATCH_BYTES, 256).
 
@@ -510,7 +476,7 @@ read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
 %% Read and discard whatever the handler left in the manual-mode
 %% `body_state`, returning any post-body leftover bytes that belong
 %% to a pipelined next request. Called only on the 4-tuple response
-%% path; `roadrunner_conn_statem`'s finishing state threads `Leftover`
+%% path; `roadrunner_conn_loop`'s finishing phase threads `Leftover`
 %% forward into the next `reading_request` parse so pipelined
 %% clients get their N+1 request seen.
 -doc false.
@@ -519,12 +485,7 @@ drain_body(#{body_state := BS}) ->
     case consume_body_state(BS, all) of
         {ok, _Bytes, #{buffered := Leftover}} -> {ok, Leftover};
         {error, _} = E -> E
-    end;
-drain_body(_Req) ->
-    %% No body_state means the handler hand-built `Req2` without using
-    %% manual-mode plumbing. Nothing to drain, no pipelined leftover
-    %% to surface.
-    {ok, <<>>}.
+    end.
 
 -doc """
 Consume bytes from a manual-mode `body_state()`. Returns either the
@@ -544,7 +505,7 @@ consume_body_state(#{framing := none} = BS, _Mode) ->
     %% Per RFC 7230 §3.3.3: no framing means the body is empty.
     %% Any `buffered` bytes are pipelined-next-request leftovers —
     %% preserve them in the body_state's `buffered` field so
-    %% `roadrunner_conn_statem`'s finishing state can thread them into
+    %% `roadrunner_conn_loop`'s finishing phase can thread them into
     %% the next `reading_request` parse for full pipelining support.
     {ok, <<>>, BS};
 consume_body_state(
@@ -752,17 +713,6 @@ route_middlewares(Req) ->
     case roadrunner_req:route_opts(Req) of
         #{middlewares := Mws} -> Mws;
         _ -> []
-    end.
-
-%% RFC 9110 §9.3.2: a response to HEAD must not include a message body.
-%% Headers (including Content-Length) stay as the handler set them, so
-%% the framing matches what GET would have returned.
--doc false.
--spec response_body_for(roadrunner_http1:request(), iodata()) -> iodata().
-response_body_for(Req, Body) ->
-    case roadrunner_req:method(Req) of
-        ~"HEAD" -> ~"";
-        _ -> Body
     end.
 
 %% HTTP/1.0 default close. HTTP/1.1 keep-alive unless either side

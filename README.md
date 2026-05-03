@@ -134,13 +134,13 @@ hello, roadrunner!
 
 ### Property tests
 
-15 PropEr properties via OTP `ct_property_test`: `roadrunner_uri`
+PropEr properties via OTP `ct_property_test`: `roadrunner_uri`
 percent round-trip + encode shape, `roadrunner_qs` round-trip,
 `roadrunner_cookie` adversarial robustness, `roadrunner_http1` 5 parsers
-never-crash + 3 incremental-feed equivalence, plus
-`roadrunner_conn_statem` robustness over random recv/drain/stray inputs
-(clean exit + slot release) and request_id consistency between
-`request_start` / `request_stop` telemetry.
+never-crash + 3 incremental-feed equivalence, plus `roadrunner_conn_loop`
+robustness over random recv/drain/stray inputs (clean exit + slot
+release) and request_id consistency between `request_start` /
+`request_stop` telemetry.
 
 ## Comparison with cowboy and elli
 

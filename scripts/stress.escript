@@ -191,18 +191,6 @@ cli() ->
                     "is set, --port is ignored."
             },
             #{
-                name => conn_impl,
-                long => "-conn-impl",
-                type => {atom, [loop, statem]},
-                default => loop,
-                help =>
-                    "Per-connection process implementation. `loop` (default) is\n"
-                    "the tail-recursive variant in `roadrunner_conn_loop`;\n"
-                    "`statem` is the legacy `gen_statem` in `roadrunner_conn_statem`.\n"
-                    "Use to A/B the two impls under stress without code changes.\n"
-                    "Ignored with --port (target listener was started elsewhere)."
-            },
-            #{
                 name => profile,
                 long => "-profile",
                 type => boolean,
@@ -281,19 +269,18 @@ parse_args(Argv) ->
 %% Listener lifecycle (in-process unless --port given)
 %% ===========================================================================
 
-start_or_attach(#{detach_server := true, conn_impl := ConnImpl}) ->
-    detach_server(ConnImpl);
+start_or_attach(#{detach_server := true}) ->
+    detach_server();
 start_or_attach(#{port := Port}) when is_integer(Port) ->
     {Port, fun() -> ok end};
-start_or_attach(#{conn_impl := ConnImpl}) ->
+start_or_attach(_Opts) ->
     {ok, _} = application:ensure_all_started(roadrunner),
     {ok, _} = roadrunner:start_listener(?LISTENER, #{
         port => 0,
         handler => roadrunner_keepalive_handler,
         keep_alive_timeout => 60000,
         max_clients => 10000,
-        max_keep_alive_request => 1000000,
-        conn_impl => ConnImpl
+        max_keep_alive_request => 1000000
     }),
     Port = roadrunner_listener:port(?LISTENER),
     {Port, fun() -> ok = roadrunner:stop_listener(?LISTENER) end}.
@@ -309,7 +296,7 @@ start_or_attach(#{conn_impl := ConnImpl}) ->
 %% `peer:stop/1` cleanly shuts the child down at end (also on parent
 %% exception via the `try ... after` wrapper in `main/1`).
 
-detach_server(ConnImpl) ->
+detach_server() ->
     Args = pa_args_for_peer(),
     case
         peer:start_link(#{
@@ -320,7 +307,7 @@ detach_server(ConnImpl) ->
         })
     of
         {ok, Peer, _Node} ->
-            ok = bring_up_listener(Peer, ConnImpl),
+            ok = bring_up_listener(Peer),
             ListenerPort = peer:call(Peer, roadrunner_listener, port, [?LISTENER]),
             io:format("detached server: listening on port ~B~n", [ListenerPort]),
             {ListenerPort, fun() -> peer:stop(Peer) end};
@@ -329,7 +316,7 @@ detach_server(ConnImpl) ->
             halt(1)
     end.
 
-bring_up_listener(Peer, ConnImpl) ->
+bring_up_listener(Peer) ->
     {ok, _} = peer:call(Peer, application, ensure_all_started, [roadrunner]),
     {ok, _} = peer:call(Peer, roadrunner, start_listener, [
         ?LISTENER,
@@ -338,8 +325,7 @@ bring_up_listener(Peer, ConnImpl) ->
             handler => roadrunner_keepalive_handler,
             keep_alive_timeout => 60000,
             max_clients => 100000,
-            max_keep_alive_request => 1000000,
-            conn_impl => ConnImpl
+            max_keep_alive_request => 1000000
         }
     ]),
     ok.

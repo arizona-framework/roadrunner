@@ -456,29 +456,20 @@ fake_controlling_process_is_noop_test() ->
     ?assertEqual(ok, roadrunner_transport:controlling_process({fake, self()}, self())).
 
 %% End-to-end: drive roadrunner_conn with a fake socket and assert the
-%% wire response, no listener / acceptor / port involved. Uses
-%% active-mode reads (`reading_request` calls
-%% `roadrunner_transport:setopts/2` and waits for `roadrunner_fake_data`).
-%% Pinned to `conn_impl => statem` because this exercises the
-%% gen_statem variant's active-mode protocol; the `loop` default
-%% reads passively and has its own coverage in `roadrunner_conn_loop_tests`.
+%% wire response, no listener / acceptor / port involved. Uses passive
+%% recv (the default loop path) — the sink replies to one
+%% `roadrunner_fake_recv` with the request bytes.
 fake_conn_drives_handler_without_sockets_test() ->
     Self = self(),
     {ok, ConnPid} = roadrunner_conn:start(
-        {fake, Self}, (fake_proto_opts(roadrunner_test_handler))#{conn_impl => statem}
+        {fake, Self}, fake_proto_opts(roadrunner_test_handler)
     ),
     ConnPid ! shoot,
-    %% Conn arms active-once on the fake socket. Deliver the request
-    %% bytes as a fake-data info event.
     receive
-        {roadrunner_fake_setopts, ConnPid, _Opts} ->
-            ConnPid ! {roadrunner_fake_data, Self, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}
-    after 1000 -> error(no_setopts_request)
+        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
+            ConnPid ! {roadrunner_fake_recv_reply, {ok, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}}
+    after 1000 -> error(no_recv_request)
     end,
-    %% Body read still uses passive recv (auto-buffering reading_body).
-    %% No body to read here → recv returns `{ok, <<>>}` immediately
-    %% via Content-Length=0 path… actually GET has no body framing,
-    %% so the conn doesn't issue a recv. Move straight to handler.
     Reply =
         receive
             {roadrunner_fake_send, ConnPid, Data} -> iolist_to_binary(Data)

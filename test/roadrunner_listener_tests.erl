@@ -195,9 +195,9 @@ listener_threads_rate_check_interval_into_proto_opts_test() ->
 
 listener_threads_hibernate_after_into_proto_opts_test() ->
     %% `hibernate_after` listener opt must thread into proto_opts so
-    %% `roadrunner_conn_statem:start/2` passes it as a `gen_statem:start/3`
-    %% start option. Verified by reaching into the listener state and
-    %% checking the proto_opts map.
+    %% `roadrunner_conn_loop` reads it and routes the recv path through
+    %% the active-mode hibernation branch. Verified by reaching into
+    %% the listener state and checking the proto_opts map.
     Name = listener_test_hibernate_after,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,

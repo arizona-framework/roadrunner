@@ -2,13 +2,13 @@
 -moduledoc """
 Per-connection `{loop, ...}` response — message-driven streaming.
 
-Called by `roadrunner_conn_statem`'s dispatching state after a
-handler returns `{loop, Status, Headers, State}`. Writes the
-status line + chunked headers, then runs a recursive selective-
-receive loop that dispatches every Erlang message through
-`Module:handle_info/3`. The handler's `Push(Data)` callback frames
-the data as one chunk and writes it. On `{stop, _NewState}` the
-loop emits the size-0 chunked terminator and returns.
+Called by `roadrunner_conn_loop:dispatch_response/4` after a handler
+returns `{loop, Status, Headers, State}`. Writes the status line +
+chunked headers, then runs a recursive selective-receive loop that
+dispatches every Erlang message through `Module:handle_info/3`. The
+handler's `Push(Data)` callback frames the data as one chunk and
+writes it. On `{stop, _NewState}` the loop emits the size-0 chunked
+terminator and returns.
 
 **Runs in the conn process**, not a child — handlers commonly do
 `self() ! Msg` or `register(Name, self())` from `handle/1`,
@@ -17,23 +17,19 @@ process would break that contract; the loop stays inline.
 
 ## Mailbox contract
 
-Because the loop runs synchronously in the conn's `gen_statem`
-process and uses `receive` directly, the conn's gen_statem is
-**not** processing events while the loop is active. The loop
-explicitly skips well-known OTP-internal message shapes
-(`{system, _, _}`, `{'$gen_call', _, _}`, `{'$gen_cast', _}`)
-so they remain in the mailbox and `gen_statem` resumes their
-normal handling once the loop returns. Concretely:
+The loop runs synchronously in the conn process and uses `receive`
+directly, so the conn is **not** processing OTP system events while
+the loop is active. The loop skips well-known OTP-internal message
+shapes (`{system, _, _}`, `{'$gen_call', _, _}`, `{'$gen_cast', _}`)
+so they remain in the mailbox for whatever picks them up after the
+loop returns. Concretely:
 
 - `sys:get_state/1`, `sys:trace/2`, `sys:replace_state/2` against
   the conn process while it is in a loop response will appear to
   hang — the caller should expect to time out.
-- `gen_statem:call/2,3` against the conn process is unsupported
-  and will hang the same way.
-- Any other Erlang message reaches the handler's
-  `handle_info/3` verbatim. Handlers should pattern-match
-  defensively (with a catch-all clause) rather than crash on
-  unexpected messages.
+- Any other Erlang message reaches the handler's `handle_info/3`
+  verbatim. Handlers should pattern-match defensively (with a
+  catch-all clause) rather than crash on unexpected messages.
 """.
 
 -export([run/5]).

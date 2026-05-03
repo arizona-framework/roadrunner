@@ -30,12 +30,9 @@ start_returns_ok_pid_test() ->
     ?assert(is_process_alive(Pid)),
     drain_then_wait(Pid).
 
-conn_start_dispatches_to_loop_when_conn_impl_loop_test() ->
+conn_start_routes_through_loop_test() ->
     ensure_pg(),
-    Opts = (fake_opts(dispatch))#{conn_impl => loop},
-    {ok, Pid} = roadrunner_conn:start({fake, spawn_sink()}, Opts),
-    %% Loop sets a label that includes the explicit `awaiting_shoot`
-    %% phase atom; use it to prove which branch was taken.
+    {ok, Pid} = roadrunner_conn:start({fake, spawn_sink()}, fake_opts(dispatch)),
     ?assertMatch({roadrunner_conn, awaiting_shoot, dispatch}, proc_lib:get_label(Pid)),
     drain_then_wait(Pid).
 
@@ -523,10 +520,9 @@ body_recv_timeout_writes_408_test() ->
     Self = self(),
     Tag = make_ref(),
     Headers = ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n",
-    %% Phase A' default path uses passive recv for headers AND body,
-    %% so both script items are `{passive, _}` — no `{active, _}`
-    %% setopts dispatch in this conn_impl. Listeners that opt in to
-    %% `hibernate_after` use the active path (covered by the
+    %% Default recv path is passive for headers AND body, so both
+    %% script items are `{passive, _}` — no `{active, _}` setopts
+    %% dispatch unless `hibernate_after` is set (covered by the
     %% hibernate_path_handles_* tests below).
     Sink = spawn_scripted_sink(Self, Tag, [
         {passive, {ok, Headers}},

@@ -1,98 +1,50 @@
 -module(roadrunner_conn_loop).
 -moduledoc """
-Tail-recursive synchronous connection loop — alternative to
-`roadrunner_conn_statem`'s `gen_statem` implementation.
+Tail-recursive per-connection process for HTTP/1.1.
 
-Same per-connection lifecycle the gen_statem encodes
-(`awaiting_shoot → reading_request → reading_body → dispatching →
-finishing → loop or close`) but expressed as direct function calls
-between phase functions instead of gen_statem dispatch + state-enter
-trampolines.
+The lifecycle (`awaiting_shoot → reading_request → reading_body →
+dispatching → finishing → loop or close`) is expressed as direct
+function calls between phase functions. No `gen_statem` dispatch,
+no per-request timer arms in the steady state.
+
+## Two recv paths
+
+Default is **passive recv** — `gen_tcp:recv(Socket, 0, ChunkTimeout)`
+in a loop with mailbox drain checks at `?DRAIN_CHECK_INTERVAL_MS`
+(100 ms) granularity. Bypasses `gen_tcp_socket`'s gen_statem dispatch
+on every recv (saves ~7 % CPU on the hot path: `gen:do_call/4`,
+`recv_data_deliver/4`, `gen_statem:loop/3`, `nif_getopt/3`).
+
+When the listener sets `hibernate_after => Ms > 0`, the recv path
+flips to **active-mode** (`{active, once}` + receive). The receive's
+`after Ms` clause has a window to call `erlang:hibernate/3` between
+keep-alive iterations so the conn's heap GCs and shrinks — only
+`receive` supports hibernation; passive recv blocks the process
+inside a NIF.
 
 ## Phase introspection vs hot-path cost
 
 The label set on the conn process via `proc_lib:set_label/1` is
-intentionally written **at most twice per conn**: once at
-`init_loop` time (`{roadrunner_conn, awaiting_shoot, ListenerName}`)
-and once at the `shoot` handoff (`refine_conn_label/2` rewrites it
-to include the peer). The phases AFTER `awaiting_shoot` (read_request,
-read_body, dispatching, finishing) run in microseconds on the
-happy path — too fast for an operator's `observer` snapshot to
-catch a specific phase anyway. Profiling showed per-phase label
-updates cost ~1.2 % CPU on hello (4 writes/req, each touching the
-process dictionary), and contributed to the run-to-run variance.
-Stuck conns still surface via the conn-entry label + the
-`reading_request` idle window (where hibernation parks the
-process). Sub-microsecond phases that no one ever observes don't
-pay this cost.
+written **at most twice per conn**: once at `init_loop` time
+(`{roadrunner_conn, awaiting_shoot, ListenerName}`) and once at the
+`shoot` handoff (`refine_conn_label/2` rewrites it to include the
+peer). The phases AFTER `awaiting_shoot` (read_request, read_body,
+dispatching, finishing) run in microseconds on the happy path — too
+fast for an operator's `observer` snapshot to catch a specific phase
+anyway. Per-phase label updates measured ~1.2 % CPU on hello (4
+writes/req, each touching the process dictionary) and contributed
+to run-to-run variance. Stuck conns still surface via the conn-entry
+label and the `reading_request` idle window (where hibernation
+parks the process).
 
-Selected per-listener via `proto_opts.conn_impl => loop`. Default is
-`statem`, which dispatches to `roadrunner_conn_statem`. The two
-implementations are wire-equivalent — same accept/drain/telemetry
-contract, same body-framing decisions, same keep-alive rules. The
-loop variant exists to recover the throughput + variance gap with
-elli without giving up roadrunner's stability features (drain,
-slot tracking, telemetry pairing, hibernation, lifecycle
-introspection). See `.claude/plans/sorted-discovering-thimble.md`
-for the phased rollout.
+## Stability features preserved
 
-## Phases shipped so far
-
-- **Phase 1** — `awaiting_shoot` + clean exit funnel (`exit_clean/6`).
-- **Phase 2** — `read_request_phase` with active-mode header read,
-  parse via `roadrunner_http1:parse_request/1`, 400 / 408 error
-  responses, drain handling, `request_timeout` via the receive's
-  `after` clause (no `start_timer` arms), stray-msg tolerance.
-- **Phase 3a** — `read_body_phase`, `dispatch_phase` (buffered
-  3-tuple response shape only), `finishing_phase` (close after
-  each request — keep-alive lands in 3c). Telemetry pairing for
-  `[roadrunner, request, start | stop | exception]` with shared
-  `StartMono`. 413 for oversized bodies, 500 for handler crashes,
-  404 for not_found dispatch.
-- **Phase 3b** — full dispatch_response/4 with all 5 response
-  shapes: buffered (3-tuple), `{stream, ...}`, `{loop, ...}`,
-  `{sendfile, ...}`, `{websocket, ...}`. Stream / loop / sendfile /
-  websocket all force connection close (matching the gen_statem's
-  contract). The stream/loop/ws response writers
-  (`roadrunner_stream_response:run/4`, etc.) are reused as-is.
-- **Phase 3c** — keep-alive loop-back. `finishing_phase` decides
-  keep-alive vs close per `roadrunner_conn:keep_alive_decision/2`;
-  on keep-alive (and under `max_keep_alive_request`), recurses
-  into `read_request_phase` with `phase = keep_alive`, the
-  pipelined leftover bytes carried in `buffered`, and
-  `requests_served + 1`. Pipelined two-requests-in-one-packet
-  works because `handle_request_bytes/2` parses the buffer
-  before re-arming the socket. `request_timeout` selection
-  becomes phase-aware (first vs keep_alive_timeout) and the
-  timeout response is silent on keep_alive (no peer waiting).
-- **Phase 4** — hibernation. When the listener was started with
-  `hibernate_after => Ms` (Ms > 0), the keep-alive idle window
-  in `recv_request_bytes/2` calls `erlang:hibernate/3` after Ms
-  of no message — the conn's heap GCs and shrinks, dramatically
-  reducing memory for long-lived idle keep-alive conns. A
-  `send_after` timer carries the request/keep-alive deadline as
-  a normal message so the hibernate `after` clause is dedicated
-  to the idle-trigger. Wakes naturally on the next inbound TCP
-  packet. Listeners without `hibernate_after` bypass this entirely
-  and use the Phase 2/3 receive shape (no timer per request).
-- **Phase A'** — passive-mode recv (default path). When
-  `hibernate_after` is unset or `0` (the production default),
-  switch from active-mode `{active, once}` + receive to passive
-  `gen_tcp:recv(Socket, 0, ChunkTimeout)`. Bypasses `gen_tcp_socket`'s
-  gen_statem dispatch entirely (eliminates ~7 % CPU from
-  `gen:do_call/4` + `recv_data_deliver/4` + `gen_statem:loop/3` +
-  `nif_getopt/3` on the hot path). Drain detection lag is bounded
-  by `?DRAIN_CHECK_INTERVAL_MS` (100 ms): each iteration drains
-  the mailbox for `{roadrunner_drain, _}` and stray messages
-  before blocking on recv with a chunk timeout. Listeners with
-  `hibernate_after => Ms > 0` continue to use the active-mode
-  Phase 4 path so hibernation works (passive recv blocks the
-  process inside a NIF — only `receive` shape supports
-  `erlang:hibernate/3`).
-
-Pending: Phase 5 (top-level try/catch around `exit_clean`),
-Phase 6 (test parametrization), Phase 7 (A/B vs gen_statem),
-Phase 8 (cutover or park).
+Drain via `pg`-broadcast, slot tracking via atomics, full telemetry
+pairing (`[roadrunner, request, start | stop | exception]` with
+shared `StartMono`), HEAD body suppression, `Expect: 100-continue`,
+anti-Slowloris rate-check on the request-read phase, all five
+response shapes (buffered, `{stream, ...}`, `{loop, ...}`,
+`{sendfile, ...}`, `{websocket, ...}`).
 """.
 
 -export([start/2]).
@@ -226,8 +178,7 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
 %%      closed/error tags (clean exit), `{roadrunner_drain, _}`
 %%      (clean exit), or stray messages (drop and re-loop).
 %%   3. The receive's `after RequestTimeout` clause handles
-%%      slowloris — no `start_timer` / `cancel_timer` per iteration,
-%%      unlike the gen_statem variant.
+%%      slowloris — no `start_timer` / `cancel_timer` per iteration.
 %%
 %% Phase 2 only handles the "first request on a fresh conn" case;
 %% Phase 3 will add keep-alive loop-back and pipelined leftover.
@@ -331,8 +282,8 @@ recv_passive(
                                 Deadline
                             );
                         false ->
-                            %% Slowloris — silent close, same as the
-                            %% gen_statem variant's `slow_client` branch.
+                            %% Slowloris — silent close. No 408; the peer
+                            %% wasn't going to read it anyway.
                             exit_normal(S)
                     end;
                 {error, timeout} when Remaining =< ChunkTimeout ->
@@ -635,8 +586,8 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, ListenerMws) ->
             exit_normal(S)
     end.
 
-%% Mirrors `roadrunner_conn_statem:dispatch_response/4` exactly. The 5
-%% shapes match the `roadrunner_handler:result/0` type. Stream / loop /
+%% Dispatches the 5 response shapes that match the
+%% `roadrunner_handler:result/0` type. Stream / loop /
 %% sendfile / websocket force connection close (the underlying
 %% writers manage their own keep-alive semantics — generally none).
 -spec dispatch_response(
@@ -680,10 +631,8 @@ dispatch_response(
     ok;
 %% Buffered (3-tuple) response shape. RFC 9110 §9.3.2: HEAD must NOT
 %% include a message body — match on `method := ~"HEAD"` in the
-%% function head and emit the response with an empty body. Cheaper
-%% than the prior `roadrunner_conn:response_body_for/2` helper which
-%% did a `maps:get(method, _)` per response; here it's a free
-%% pattern-match dispatch.
+%% function head and emit the response with an empty body. Free
+%% pattern-match dispatch (no `maps:get(method, _)` per response).
 dispatch_response(Socket, _Handler, #{method := ~"HEAD"}, {Status, Headers, _Body}) when
     is_integer(Status)
 ->
@@ -820,9 +769,9 @@ exit_normal(#loop_state{
 }) ->
     exit_clean(Socket, ProtoOpts, StartMono, Peer, ListenerName, Served, normal).
 
-%% Funnel for every clean exit path. Mirrors `roadrunner_conn_statem:terminate/3`
-%% — fires the paired listener_conn_close telemetry (only if accept already
-%% fired), releases the listener slot, closes the socket, and exits with the
+%% Funnel for every clean exit path. Fires the paired
+%% listener_conn_close telemetry (only if accept already fired),
+%% releases the listener slot, closes the socket, and exits with the
 %% supplied Reason.
 %%
 %% **Limitation**: under `exit(Pid, kill)` this funnel is skipped (same

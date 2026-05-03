@@ -1,18 +1,17 @@
--module(roadrunner_statem_props).
+-module(roadrunner_conn_loop_props).
 -moduledoc """
-PropEr properties for `roadrunner_conn_statem`.
+PropEr properties for `roadrunner_conn_loop`.
 
 The headline invariant: **for any combination of recv-script
-responses, drain timing, and stray info events, the gen_statem must
-terminate cleanly with `normal` reason and release its `client_counter`
-slot.** This is a robustness property — random inputs cannot crash
-the conn or leak the slot, regardless of how malformed the byte
-stream is.
+responses, drain timing, and stray info events, the conn must
+terminate cleanly with `normal` reason and release its
+`client_counter` slot.** Random inputs can not crash the conn or
+leak the slot, regardless of how malformed the byte stream is.
 
 A second property covers **telemetry-pairing**: when a full request
-makes it to dispatch (i.e. the conn actually serves a 200), the
-`[roadrunner, request, start]` and `[roadrunner, request, stop]` events
-share the same `request_id`.
+makes it to dispatch (the conn actually serves a 200), the
+`[roadrunner, request, start]` and `[roadrunner, request, stop]`
+events share the same `request_id`.
 """.
 
 -compile(export_all).
@@ -25,17 +24,7 @@ share the same `request_id`.
 %% cleanly. No crashes, no slot leaks.
 %% =============================================================================
 
-prop_conn_terminates_normal_on_random_inputs() ->
-    prop_terminates_normal(fun roadrunner_conn_statem:start/2).
-
-%% Parallel property targeting the tail-recursive `roadrunner_conn_loop`
-%% implementation. Same robustness guarantee — random recv responses,
-%% drain timing, and stray messages produce a clean `normal` exit and
-%% release the slot.
 prop_loop_terminates_normal_on_random_inputs() ->
-    prop_terminates_normal(fun roadrunner_conn_loop:start/2).
-
-prop_terminates_normal(Start) ->
     ?FORALL(
         {Script, DrainBefore, DrainAfter, Stray},
         {
@@ -53,7 +42,7 @@ prop_terminates_normal(Start) ->
             %% release brings the counter back to 0 (not below).
             true = roadrunner_conn:try_acquire_slot(Opts),
             Sink = spawn_recv_sink(Script),
-            {ok, Pid} = Start({fake, Sink}, Opts),
+            {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
             Ref = monitor(process, Pid),
             case DrainBefore of
                 true ->
@@ -89,117 +78,6 @@ prop_terminates_normal(Start) ->
     ).
 
 %% =============================================================================
-%% State-transition graph — every observed `(FromState, ToState)`
-%% pair where the states differ must be in the documented transition
-%% set. Catches refactors that introduce undocumented edges (e.g. a
-%% `reading_request → finishing` shortcut that skips the body).
-%% =============================================================================
-
-prop_state_transitions_are_documented() ->
-    ?FORALL(
-        {Script, DrainBefore, DrainAfter},
-        {list(recv_step()), boolean(), boolean()},
-        begin
-            ensure_pg(),
-            Counter = atomics:new(1, [{signed, false}]),
-            Opts = proto_opts(prop_listener_trans, Counter),
-            true = roadrunner_conn:try_acquire_slot(Opts),
-            Sink = spawn_recv_sink(Script),
-            {ok, Pid} = roadrunner_conn_statem:start({fake, Sink}, Opts),
-            Tracer = start_tracer(),
-            erlang:trace(Pid, true, [call, return_to, {tracer, Tracer}]),
-            erlang:trace_pattern(
-                {roadrunner_conn_statem, handle_event, 4},
-                [{'_', [], [{return_trace}]}],
-                [local]
-            ),
-            Ref = monitor(process, Pid),
-            case DrainBefore of
-                true ->
-                    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 1000};
-                false ->
-                    ok
-            end,
-            Pid ! shoot,
-            case DrainAfter of
-                true ->
-                    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 1000};
-                false ->
-                    ok
-            end,
-            ExitOk =
-                receive
-                    {'DOWN', Ref, process, Pid, normal} -> true;
-                    {'DOWN', Ref, process, Pid, _} -> false
-                after 3000 ->
-                    erlang:demonitor(Ref, [flush]),
-                    exit(Pid, kill),
-                    false
-                end,
-            erlang:trace_pattern({roadrunner_conn_statem, handle_event, 4}, false, [local]),
-            Sink ! stop,
-            Transitions = stop_tracer(Tracer),
-            ExitOk andalso transitions_documented(Transitions)
-        end
-    ).
-
-documented_transitions() ->
-    [
-        {awaiting_shoot, reading_request},
-        {reading_request, reading_body},
-        {reading_body, dispatching},
-        {dispatching, finishing},
-        {finishing, reading_request}
-    ].
-
-transitions_documented(Transitions) ->
-    Documented = documented_transitions(),
-    lists:all(
-        fun
-            ({From, From}) -> true;
-            (Edge) -> lists:member(Edge, Documented)
-        end,
-        Transitions
-    ).
-
-start_tracer() ->
-    Self = self(),
-    spawn(fun() -> tracer_loop(Self, undefined, []) end).
-
-%% Pair `call` with the next `return_from`. Capture (FromState, NextState)
-%% from the call args and the return shape.
-tracer_loop(Reporter, CurrentCall, Edges) ->
-    receive
-        {trace, _Pid, call, {_Mod, handle_event, [_EvType, _Msg, FromState, _Data]}} ->
-            tracer_loop(Reporter, FromState, Edges);
-        {trace, _Pid, return_from, {_Mod, handle_event, 4}, Return} ->
-            NextState = next_state_of(Return, CurrentCall),
-            Edge = {CurrentCall, NextState},
-            tracer_loop(Reporter, undefined, [Edge | Edges]);
-        {report, From} ->
-            From ! {edges, lists:reverse(Edges)};
-        _ ->
-            tracer_loop(Reporter, CurrentCall, Edges)
-    end.
-
-next_state_of({next_state, NextState, _Data}, _) -> NextState;
-next_state_of({next_state, NextState, _Data, _Actions}, _) -> NextState;
-next_state_of({keep_state, _Data}, From) -> From;
-next_state_of({keep_state, _Data, _Actions}, From) -> From;
-next_state_of(keep_state_and_data, From) -> From;
-next_state_of({keep_state_and_data, _Actions}, From) -> From;
-next_state_of({stop, _, _}, From) -> From;
-next_state_of({stop_and_reply, _, _, _}, From) -> From;
-next_state_of(_, From) -> From.
-
-stop_tracer(Tracer) ->
-    Tracer ! {report, self()},
-    receive
-        {edges, Edges} -> Edges
-    after 1000 -> []
-    end.
-
-%% =============================================================================
 %% Telemetry pairing — when a full request reaches dispatch, the
 %% request_start and request_stop events share the same request_id.
 %% Restricted to the deterministic happy path because telemetry is a
@@ -230,7 +108,7 @@ prop_request_start_and_stop_share_request_id() ->
                             "Connection: close\r\n\r\n">>}
                 ]),
                 Opts = proto_opts(prop_listener_tel, Counter),
-                {ok, Pid} = roadrunner_conn_statem:start({fake, Sink}, Opts),
+                {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
                 Ref = monitor(process, Pid),
                 Pid ! shoot,
                 receive
@@ -281,7 +159,7 @@ method() ->
     oneof([~"GET", ~"POST", ~"PUT", ~"DELETE", ~"HEAD", ~"OPTIONS"]).
 
 %% =============================================================================
-%% Helpers (mirror roadrunner_conn_statem_tests scaffold)
+%% Helpers
 %% =============================================================================
 
 ensure_pg() ->
@@ -329,9 +207,10 @@ recv_sink_loop(Script) ->
                     recv_sink_loop(Rest)
             end;
         {roadrunner_fake_setopts, ConnPid, _Opts} ->
-            %% Active-mode arming. `{recv, {error, timeout|slow_client}}`
-            %% items map to "no delivery" (let the conn's own
-            %% timeouts fire). Other errors become transport errors.
+            %% Active-mode arming (used when the listener has
+            %% `hibernate_after` set — `recv_with_hibernate/3`).
+            %% `{recv, {error, timeout|slow_client}}` items map to
+            %% "no delivery" (let the conn's own timeouts fire).
             case Script of
                 [] ->
                     recv_sink_loop([]);

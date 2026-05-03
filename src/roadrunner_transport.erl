@@ -279,11 +279,12 @@ Set socket options on the underlying transport.
 Used primarily to switch a socket to active mode
 (`[{active, once}]` / `[{active, N}]`) so the controlling process
 receives data as `info` events instead of blocking in `recv/3`. With
-active mode the gen_statem driving the conn returns to its main loop
-between events, which lets `gen_statem`'s `hibernate` action and
-`{hibernate_after, _}` start option actually fire — passive recv
-holds the process inside a state callback indefinitely, so neither
-hibernation primitive has a window to run.
+active mode the conn process returns to its `receive` between events,
+which lets `erlang:hibernate/3` actually fire from the `after` clause
+— passive recv holds the process inside a NIF indefinitely, so
+hibernation has no window to run. `roadrunner_ws_session` (gen_statem)
+relies on the same property for its `{hibernate_after, _}` start
+option.
 
 For `{fake, Pid}`: forwards `{roadrunner_fake_setopts, ConnPid, Opts}`
 to the sink so test scripts can react to the conn arming itself for
