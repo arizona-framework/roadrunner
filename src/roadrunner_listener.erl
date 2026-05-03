@@ -60,6 +60,13 @@ connection crash doesn't take the pool down.
     %% main loop between events) are the prerequisite that makes
     %% this fire at all.
     hibernate_after => pos_integer(),
+    %% Selects the per-connection process implementation. `statem`
+    %% (default) dispatches to the original `gen_statem` variant in
+    %% `roadrunner_conn_statem`; `loop` dispatches to the
+    %% tail-recursive variant in `roadrunner_conn_loop` — feature-
+    %% equivalent, lower run-to-run variance, see `.claude/plans/`
+    %% for the rationale and rollout.
+    conn_impl => loop | statem,
     tls => [ssl:tls_server_option()]
 }.
 
@@ -298,11 +305,23 @@ build_proto_opts(Opts, ListenerName) ->
     %% Optional `rate_check_interval_ms` — the rate-check timer
     %% interval inside `reading_request`. Default 1000ms; ops can
     %% override.
-    case maps:find(rate_check_interval_ms, Opts) of
-        {ok, IntervalMs} when is_integer(IntervalMs), IntervalMs > 0 ->
-            WithHibernate#{rate_check_interval_ms => IntervalMs};
+    WithRate =
+        case maps:find(rate_check_interval_ms, Opts) of
+            {ok, IntervalMs} when is_integer(IntervalMs), IntervalMs > 0 ->
+                WithHibernate#{rate_check_interval_ms => IntervalMs};
+            error ->
+                WithHibernate
+        end,
+    %% Optional `conn_impl` — the conn-process implementation
+    %% selector consumed by `roadrunner_conn:start/2`. Default is
+    %% `statem` (dispatches to `roadrunner_conn_statem`); set to
+    %% `loop` to dispatch to `roadrunner_conn_loop`'s
+    %% tail-recursive variant.
+    case maps:find(conn_impl, Opts) of
+        {ok, Impl} when Impl =:= loop; Impl =:= statem ->
+            WithRate#{conn_impl => Impl};
         error ->
-            WithHibernate
+            WithRate
     end.
 
 %% `routes` (router-based dispatch) takes precedence over `handler`. With

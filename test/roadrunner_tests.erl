@@ -16,7 +16,9 @@ roadrunner_test_() ->
                 fun stop_unknown_listener/0},
             {"start_listener with a name already in use returns an error",
                 fun duplicate_listener_rejected/0},
-            {"listeners/0 returns the registered names", fun lists_active_listeners/0}
+            {"listeners/0 returns the registered names", fun lists_active_listeners/0},
+            {"start_listener with conn_impl => loop serves a request end-to-end",
+                fun starts_listener_with_loop_impl_and_serves/0}
         ]}.
 
 starts_listener_and_serves() ->
@@ -59,6 +61,19 @@ lists_active_listeners() ->
     ok = roadrunner:stop_listener(public_test_l1),
     ok = roadrunner:stop_listener(public_test_l2),
     ?assertEqual([], roadrunner:listeners()).
+
+starts_listener_with_loop_impl_and_serves() ->
+    %% End-to-end: real listen socket + acceptor + conn_loop process
+    %% serves a real HTTP/1.1 request. Validates that listener opts
+    %% thread `conn_impl => loop` through to the conn spawn site.
+    {ok, _} = roadrunner:start_listener(public_test_loop, #{port => 0, conn_impl => loop}),
+    Port = roadrunner_listener:port(public_test_loop),
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+    Reply = recv_until_closed(Sock),
+    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+    ok = gen_tcp:close(Sock),
+    ok = roadrunner:stop_listener(public_test_loop).
 
 %% --- helpers ---
 
