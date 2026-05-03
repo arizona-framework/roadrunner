@@ -258,12 +258,15 @@ start_server(cowboy, Scenario) ->
     %% a `ranch:opts()` map — passing a flat list interprets every tuple
     %% as a `socket_opt` and `num_acceptors` ends up at `inet_tcp:listen`
     %% which crashes with `badarg`.
-    {ok, _} = peer:call(Peer, cowboy, start_clear, [
-        bench_cb,
-        #{num_acceptors => 10, socket_opts => [{port, 0}]},
-        #{env => #{dispatch => Dispatch}, max_keepalive => 1000000}
-    ]),
+    TransportOpts = #{num_acceptors => 10, socket_opts => [{port, 0}]},
+    ProtoOpts = #{env => #{dispatch => Dispatch}, max_keepalive => 1000000},
+    {ok, _} = peer:call(Peer, cowboy, start_clear, [bench_cb, TransportOpts, ProtoOpts]),
     Port = peer:call(Peer, ranch, get_port, [bench_cb]),
+    print_listener_config([
+        {"transport_opts", TransportOpts},
+        {"protocol_opts", ProtoOpts},
+        {"routes", scenario_cowboy_routes(Scenario)}
+    ]),
     {Peer, Port};
 start_server(elli, _Scenario) ->
     {ok, Peer, _Node} = peer:start_link(#{
@@ -293,6 +296,10 @@ start_server(elli, _Scenario) ->
         roadrunner_bench_elli_handler
     ]) of
         {ok, Port} ->
+            print_listener_config([
+                {"callback", roadrunner_bench_elli_handler},
+                {"min_acceptors", 10}
+            ]),
             {Peer, Port};
         {error, Reason} ->
             io:format("error: elli failed to launch: ~p~n", [Reason]),
@@ -317,7 +324,16 @@ start_roadrunner(Scenario) ->
     ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
     {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr, ListenerOpts]),
     Port = peer:call(Peer, roadrunner_listener, port, [bench_rr]),
+    print_listener_config([{"listener_opts", ListenerOpts}]),
     {Peer, Port}.
+
+%% Print the per-server listener configuration, indented under the
+%% side header. `~tp` prints with the printable-charlist heuristic
+%% on, so binaries-of-printable-bytes appear as text rather than
+%% byte lists. Wraps onto multiple lines for big maps.
+print_listener_config(Pairs) ->
+    [io:format("  ~-13s: ~tp~n", [Label, Value]) || {Label, Value} <- Pairs],
+    ok.
 
 %% Per-scenario server config — same routes/handlers in shape across
 %% all three servers so the comparison stays apples-to-apples.
@@ -502,6 +518,7 @@ print_header(#{
     warmup_s := W,
     host := H
 }) ->
+    print_environment(),
     io:format("~nhttp server bench~n"),
     io:format(
         "  servers  : ~s~n"
@@ -513,6 +530,66 @@ print_header(#{
         [string:join([atom_to_list(A) || A <- Servers], ", "), S, C, W, D, H]
     ),
     io:format("  request  : ~s~n", [scenario_request_summary(S)]).
+
+%% Environment block — printed once per run so the user can read the
+%% bench output later and know exactly what produced the numbers
+%% (OTP/ERTS version + emulator flavor, scheduler count, kernel/arch,
+%% rough CPU model + memory). Numbers are NOT comparable across
+%% machines; this block makes the per-machine context explicit.
+print_environment() ->
+    io:format("~nenvironment~n"),
+    io:format("  otp        : ~s (erts ~s)~n", [
+        erlang:system_info(otp_release), erlang:system_info(version)
+    ]),
+    io:format("  emulator   : ~s~n", [emulator_flavor()]),
+    io:format("  schedulers : ~B online / ~B total~n", [
+        erlang:system_info(schedulers_online), erlang:system_info(schedulers)
+    ]),
+    io:format("  os         : ~s~n", [os_release()]),
+    io:format("  cpu        : ~s~n", [cpu_model()]),
+    io:format("  memory     : ~s~n", [memory_total()]).
+
+emulator_flavor() ->
+    case erlang:system_info(emu_flavor) of
+        jit -> "JIT";
+        Other -> io_lib:format("~p", [Other])
+    end.
+
+os_release() ->
+    %% `uname -srm` is portable across Linux/macOS/BSD and gives kernel
+    %% name + release + machine in one line.
+    string:trim(os:cmd("uname -srm")).
+
+cpu_model() ->
+    %% Try `/proc/cpuinfo` first (Linux), then `sysctl` (macOS/BSD).
+    %% Falls back to the Erlang-reported architecture if neither
+    %% exposes a model name.
+    case file:read_file("/proc/cpuinfo") of
+        {ok, Cpuinfo} ->
+            case re:run(Cpuinfo, ~"model name\\s*:\\s*([^\n]+)", [{capture, [1], binary}]) of
+                {match, [Model]} -> binary_to_list(string:trim(Model));
+                _ -> erlang:system_info(system_architecture)
+            end;
+        _ ->
+            case string:trim(os:cmd("sysctl -n machdep.cpu.brand_string 2>/dev/null")) of
+                "" -> erlang:system_info(system_architecture);
+                Brand -> Brand
+            end
+    end.
+
+memory_total() ->
+    case file:read_file("/proc/meminfo") of
+        {ok, Meminfo} ->
+            case re:run(Meminfo, ~"MemTotal:\\s*(\\d+)\\s*kB", [{capture, [1], binary}]) of
+                {match, [KbBin]} ->
+                    Kb = binary_to_integer(KbBin),
+                    io_lib:format("~.1f GiB total", [Kb / 1024 / 1024]);
+                _ ->
+                    "unknown"
+            end;
+        _ ->
+            "unknown"
+    end.
 
 scenario_request_summary(hello) ->
     "GET / HTTP/1.1, 1 header, 7-byte response body";
