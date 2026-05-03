@@ -17,16 +17,16 @@ process would break that contract; the loop stays inline.
 
 ## Mailbox contract
 
-The loop runs synchronously in the conn process and uses `receive`
-directly, so the conn is **not** processing OTP system events while
-the loop is active. The loop skips well-known OTP-internal message
-shapes (`{system, _, _}`, `{'$gen_call', _, _}`, `{'$gen_cast', _}`)
-so they remain in the mailbox for whatever picks them up after the
-loop returns. Concretely:
+The conn is a plain `proc_lib`-spawned loop, not a `gen_*` behaviour,
+so it doesn't speak the OTP `sys` / `gen_call` / `gen_cast` protocols.
+The receive selectively skips those shapes (`{system, _, _}`,
+`{'$gen_call', _, _}`, `{'$gen_cast', _}`) so a misuse like
+`gen_server:call(ConnPid, _)` doesn't accidentally surface as an
+`handle_info/3` event to the user handler. Concretely:
 
-- `sys:get_state/1`, `sys:trace/2`, `sys:replace_state/2` against
-  the conn process while it is in a loop response will appear to
-  hang — the caller should expect to time out.
+- `sys:get_state/1`, `sys:trace/2`, `gen_server:call/2,3` and
+  friends against the conn process will appear to hang — the
+  caller should expect to time out.
 - Any other Erlang message reaches the handler's `handle_info/3`
   verbatim. Handlers should pattern-match defensively (with a
   catch-all clause) rather than crash on unexpected messages.
@@ -55,11 +55,14 @@ run(Socket, Status, UserHeaders, Handler, State) ->
     info_loop(Socket, Handler, Push, State).
 
 %% Selective receive on every Erlang message → handler:handle_info/3,
-%% **except** OTP-internal shapes (`{system, _, _}` for `sys` protocol,
-%% `{'$gen_call', _, _}` and `{'$gen_cast', _}` for `gen_statem`
-%% requests), which stay in the mailbox so the gen_statem resumes
-%% their normal handling after this loop returns. On `{stop, _}` we
-%% emit the size-0 chunked terminator and return.
+%% **except** OTP-internal shapes (`{system, _, _}` for the `sys`
+%% protocol, `{'$gen_call', _, _}` and `{'$gen_cast', _}` for
+%% gen_server/gen_statem requests). Those would only reach the conn
+%% via misuse (the conn is a plain proc_lib loop, not a gen_*) and
+%% delivering them to the user handler would surface a confusing
+%% shape it has no reason to pattern-match on. Skipping leaves them
+%% in the mailbox; they're dropped when the conn exits. On
+%% `{stop, _}` we emit the size-0 chunked terminator and return.
 %%
 %% **No `after` clause:** the loop blocks indefinitely until the
 %% handler returns `{stop, _}` from `handle_info/3`. A handler that

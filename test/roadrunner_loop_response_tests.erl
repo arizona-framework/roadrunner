@@ -17,9 +17,12 @@ handle_info(Msg, _Push, ProbePid) ->
     {ok, ProbePid}.
 
 %% `info_loop/4` must NOT deliver `{system, _, _}`,
-%% `{'$gen_call', _, _}`, or `{'$gen_cast', _}` to the handler. They
-%% stay in the conn process mailbox so the surrounding `gen_statem`
-%% resumes their normal handling once the loop ends.
+%% `{'$gen_call', _, _}`, or `{'$gen_cast', _}` to the handler.
+%% Those shapes only reach the conn via misuse (the conn doesn't
+%% speak the OTP gen_* protocols) and surfacing them at
+%% `handle_info/3` would force handlers to defensively match on
+%% bytes they have no reason to handle. Skipped messages remain
+%% queued and are dropped when the conn exits.
 loop_skips_otp_internal_messages_test() ->
     Tag = make_ref(),
     Self = self(),

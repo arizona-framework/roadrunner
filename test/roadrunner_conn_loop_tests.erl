@@ -792,7 +792,7 @@ keep_alive_idle_timeout_silently_closes_test() ->
     %% After the first request, the conn waits in `read_request_phase`
     %% (phase=keep_alive) for the next request bytes. With short
     %% `keep_alive_timeout`, the receive's `after` fires and the conn
-    %% closes silently — NO 408 (the gen_statem does the same).
+    %% closes silently — NO 408 (the peer wasn't waiting on a reply).
     %% Uses the `roadrunner_keepalive_handler` (no `Connection: close`)
     %% so keep-alive engages — otherwise the hello handler would
     %% close after request 1 and we'd never enter `phase=keep_alive`.

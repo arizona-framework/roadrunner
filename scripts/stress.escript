@@ -73,7 +73,7 @@ with_optional_profile(#{profile := false}, Fun) ->
 with_optional_profile(#{profile := true}, Fun) ->
     %% Trace every currently-alive process plus anything they spawn for
     %% the duration. set_on_spawn carries the trace flag through child
-    %% spawns -- without it, gen_statem:start/3 (used by roadrunner_acceptor
+    %% spawns -- without it, `proc_lib:start/3` (used by roadrunner_acceptor
     %% to launch each conn) produces an untraced child and we'd miss the
     %% hot path entirely. The matchspec `'_'` traces all calls.
     {ok, _} = eprof:start(),

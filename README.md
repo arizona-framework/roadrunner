@@ -8,14 +8,13 @@ small public surface, RFC-correct parsing, and modern OTP idioms throughout.
 
 ## Status
 
-POC — not yet deployed in production. 738 eunit + 15 CT property
-tests, 100% line coverage across 28 source modules, dialyzer-clean.
-The per-connection request lifecycle is a `gen_statem` with named
-states (`awaiting_shoot | reading_request | reading_body |
-dispatching | finishing`) so it shows up in `sys:get_state/1`,
-`sys:trace/2`, and observer's process inspector. See
-[`/.claude/plans/sorted-discovering-thimble.md`](./.claude/plans/sorted-discovering-thimble.md)
-for the rolling roadmap.
+POC — not yet deployed in production. Eunit + CT (incl. PropEr)
+tests with 100% line coverage, dialyzer-clean. The per-connection
+request lifecycle is a tail-recursive `proc_lib` loop
+(`roadrunner_conn_loop`) with named phases (`awaiting_shoot |
+reading_request | reading_body | dispatching | finishing`)
+reflected in `proc_lib:get_label/1` so the lifecycle shows up in
+observer's process inspector and `recon:proc_count/2`.
 
 ## Quickstart
 
@@ -145,17 +144,22 @@ release) and request_id consistency between `request_start` /
 ## Comparison with cowboy and elli
 
 `scripts/bench.escript` runs the same loadgen against each server in
-its own peer BEAM. Numbers below are the **median of 20 runs** at 50
-concurrent clients × 3 s measured + 1 s warmup, on OTP 29-rc3 + a
-single Linux dev box, loopback (no network).
+its own peer BEAM. Numbers below are the median of multiple runs at
+50 concurrent clients on a single Linux dev box, loopback (no
+network).
 
-> **TL;DR.** Roadrunner trades **~20–25 % throughput** for **2–3×
-> better p99 latency** and a smaller, queryable codebase. Elli is
-> faster on raw req/s for the same reason it has fewer features —
-> a tail-recursive synchronous loop with no per-request state
-> machine, telemetry, drain, or hibernation. Cowboy is bottom on
-> every axis here; the throughput hit comes from its
-> stream-handlers + multi-process pipeline.
+> **Stale numbers warning.** The tables below were captured under an
+> earlier per-connection implementation. Spot-checks against the
+> current `roadrunner_conn_loop` show meaningfully higher throughput
+> on `hello` and lower variance, but the full table hasn't been
+> rerun. Treat the tables as a lower bound for roadrunner; rerun
+> `scripts/bench.escript` for current numbers.
+
+> **TL;DR.** Roadrunner trades a small throughput delta for
+> **2–3× better p99 latency** and a smaller, queryable codebase.
+> Elli is competitive on raw req/s because it shares roadrunner's
+> tail-recursive loop shape; cowboy's lower numbers come from its
+> dual-process stream-handlers pipeline.
 
 ### Throughput — req/s (higher = better)
 
@@ -191,21 +195,18 @@ single Linux dev box, loopback (no network).
 
 ### Reading the numbers honestly
 
-- **Roadrunner's variance is 3–5× higher than elli/cowboy.**
-  Symptom of the gen_statem timer interactions (state_timeout +
-  generic_timeout per request) — the 30 % spread between best and
-  worst run is real and visible in production-style measurements,
-  not an artifact of small `n`. If your workload is latency-sensitive,
-  this is something to test on your hardware before committing.
-- **The throughput gap with elli is structural**, not a missed
-  optimization. Elli's per-request path is one synchronous
-  tail-recursive loop with no state-machine dispatch, no
-  per-request timer arms, no telemetry middleware, no drain group,
-  no hibernation hooks — every feature roadrunner kept costs ~7 %
-  combined CPU vs elli's lean loop. We measured this with eprof
-  and shipped the cheap recoveries (lowercase fast path, header
-  pattern caching, content-length cache); the remainder is the
-  price of the feature surface.
+- **Variance in this table is gen_statem-era.** The loop rewrite
+  removed the per-request `state_timeout` + `generic_timeout` arms
+  that drove the spread; spot-checks under the loop show single-digit
+  cv on the same scenarios. Re-bench before quoting these numbers.
+- **The throughput "gap" with elli closed under the loop rewrite.**
+  Elli's per-request path is one synchronous tail-recursive loop with
+  no state-machine dispatch — roadrunner's loop variant matches that
+  shape while keeping telemetry, drain, hibernation, and slot
+  tracking. Spot-checks show roadrunner now leads on `hello`
+  throughput. Where roadrunner pays a real cost over elli is the
+  feature surface itself: telemetry events fire on every request,
+  drain notifications check the mailbox between recv chunks, etc.
 - **Cowboy's slowdown** comes from its dual-process model
   (acceptor → connection → stream handlers) and its rich-feature
   pipeline. Cowboy 2.13 is also bottom on p99 in this lab; it
@@ -222,13 +223,13 @@ single Linux dev box, loopback (no network).
 
 |                                | roadrunner                       | elli                       | cowboy                        |
 |--------------------------------|----------------------------------|----------------------------|-------------------------------|
-| Per-conn process model         | `gen_statem` (named states)      | tail-recursive loop        | gen_server + stream handlers  |
-| Request lifecycle observable   | yes (`sys:get_state/1`)          | no                         | partial                       |
+| Per-conn process model         | tail-recursive `proc_lib` loop   | tail-recursive loop        | gen_server + stream handlers  |
+| Request lifecycle observable   | yes (`proc_lib:get_label/1`)     | no                         | partial                       |
 | Drain / graceful shutdown      | built-in (`pg`-broadcast)        | DIY                        | partial                       |
 | Telemetry                      | `telemetry` library, 8 events    | none (handler callbacks)   | `cowboy_metrics_h` opt-in     |
 | Middleware shape               | continuation-passing             | `pre_request`/`post_request` callback | deprecated `(Req, Env)`/stream handlers |
 | Hibernation between requests   | `hibernate_after` works          | no                         | depends on stream handler     |
-| Active-mode header read        | yes (`{active, once}`)           | passive (`gen_tcp:recv`)   | yes                           |
+| Default recv mode              | passive (`gen_tcp:recv`)         | passive (`gen_tcp:recv`)   | active (`{active, once}`)     |
 | Production maturity            | POC                              | 10+ years, stable          | 10+ years, stable             |
 | Public API surface             | small                            | small                      | large (HTTP/2, gun, etc.)     |
 | Runtime deps                   | `telemetry` only                 | none                       | `cowlib`, `ranch`             |

@@ -17,11 +17,13 @@ byte-by-byte without spinning up a listener. See
 `setopts/2` + `messages/1` switch the underlying socket to active
 mode (`[{active, once}]` / `[{active, N}]`) so the controlling
 process receives data as `info` events instead of blocking in
-`recv/3`. This is what lets `gen_statem`'s `hibernate` action fire
-between events — passive recv holds the process inside a state
-callback indefinitely, so hibernation has no window to run. Active
-mode is the prerequisite for WebSocket / long-keep-alive memory
-optimization. See `messages/1` for the per-transport tag triples.
+`recv/3`. This is what lets `erlang:hibernate/3` fire from a
+`receive ... after` clause — passive recv holds the process inside
+a NIF indefinitely, so hibernation has no window to run.
+`roadrunner_conn_loop`'s `recv_with_hibernate/3` and
+`roadrunner_ws_session` (gen_statem with `{hibernate_after, _}`)
+both rely on active mode for this reason. See `messages/1` for the
+per-transport tag triples.
 
 ## TLS defaults
 

@@ -774,9 +774,10 @@ exit_normal(#loop_state{
 %% releases the listener slot, closes the socket, and exits with the
 %% supplied Reason.
 %%
-%% **Limitation**: under `exit(Pid, kill)` this funnel is skipped (same
-%% gen_statem limitation today). Bounded by `max_clients` and reset on
-%% listener restart.
+%% **Limitation**: under `exit(Pid, kill)` this funnel is skipped — the
+%% runtime tears the process down without giving it a chance to run
+%% any cleanup. Same OTP semantics as `terminate/3` callbacks. Bounded
+%% by `max_clients` and reset on listener restart.
 -spec exit_clean(
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),
