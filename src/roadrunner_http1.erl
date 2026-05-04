@@ -17,8 +17,7 @@ response (`400`, `414`, `431`, etc.).
     parse_chunk/1,
     check_header_safe/2,
     response/3,
-    compute_cached_decisions/1,
-    http_date_now/0
+    compute_cached_decisions/1
 ]).
 
 -export_type([version/0, headers/0, request/0, status/0, redirect_status/0, cached_decisions/0]).
@@ -764,15 +763,6 @@ codes get an empty reason (RFC 9112 §4.1 makes the phrase optional).
 -spec response(StatusCode :: status(), headers(), iodata()) -> iodata().
 response(Status, Headers, Body) when is_integer(Status, 100, 599) ->
     [status_line(Status), encode_headers(Headers), ~"\r\n", Body].
-
--doc """
-Delegates to `roadrunner_http:http_date_now/0`. Kept here as a
-back-compat alias for callers using `roadrunner_http1:http_date_now/0`;
-new code should call the shared module directly.
-""".
--spec http_date_now() -> binary().
-http_date_now() ->
-    roadrunner_http:http_date_now().
 
 %% Common status codes get a precomputed `HTTP/1.1 NNN Reason\r\n`
 %% binary — one binary literal vs the five-element iolist build

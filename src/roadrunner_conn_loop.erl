@@ -664,7 +664,7 @@ dispatch_response(Socket, _Handler, _Req, {Status, Headers0, Body}) when is_inte
 with_date(_Status, Headers) ->
     case lists:keymember(~"date", 1, Headers) of
         true -> Headers;
-        false -> [{~"date", roadrunner_http1:http_date_now()} | Headers]
+        false -> [{~"date", roadrunner_http:http_date_now()} | Headers]
     end.
 
 %% --- finishing phase ---
