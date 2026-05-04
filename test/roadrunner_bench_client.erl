@@ -81,7 +81,23 @@ open(Host, Port, h2) ->
     HostArg = host_arg(Host),
     case ssl:connect(HostArg, Port, SslOpts, 5000) of
         {ok, Sock} ->
-            ok = ssl:send(Sock, [?PREFACE, h2_empty_settings_frame()]),
+            %% Preface + empty SETTINGS + a connection-level
+            %% WINDOW_UPDATE that bumps the server's `conn_send_window`
+            %% from the default 65 535 to (65 535 + (2^31-1 - 65 535)) =
+            %% 2^31-1. Without this, a long-running keep-alive bench
+            %% accumulates 65 535 bytes of response data and stalls the
+            %% server (which is correctly waiting on the peer to refill
+            %% the window). Real h2 clients (browsers, h2load, nghttp2)
+            %% all manage flow control like this.
+            BigBumpInc = 16#7FFFFFFF - 65535,
+            BumpFrame = roadrunner_http2_frame:encode(
+                {window_update, 0, BigBumpInc}
+            ),
+            ok = ssl:send(Sock, [
+                ?PREFACE,
+                h2_empty_settings_frame(),
+                BumpFrame
+            ]),
             case h2_handshake(Sock, <<>>, false, false) of
                 {ok, Buf} ->
                     {ok, #h2_conn{

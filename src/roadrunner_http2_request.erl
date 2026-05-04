@@ -40,17 +40,6 @@ served the request.
     | empty_path
     | connection_specific_header.
 
-%% Connection-specific headers banned in h2 per RFC 9113 §8.2.2.
-%% `te` is allowed only with the value `trailers` — we reject all
-%% other values. The other entries are unconditionally banned.
--define(BANNED_HEADERS, [
-    ~"connection",
-    ~"keep-alive",
-    ~"proxy-connection",
-    ~"transfer-encoding",
-    ~"upgrade"
-]).
-
 -doc """
 Build a request map from a decoded HPACK header list. `ConnInfo`
 carries the per-connection bits the HTTP/1 conn already has —
@@ -98,42 +87,52 @@ from_headers(Headers, Body, ConnInfo) ->
 %% starting with `:`) into a map keyed by name and regular headers
 %% into a list. Body recursion — regular headers cons in front on
 %% the way back out so the order matches the wire order.
+%% Walk pseudo-headers (names starting with `:`) into a map until
+%% the first regular header, then hand off to `partition_regular/1`
+%% which body-recurses the rest. Splitting the two phases avoids
+%% the prior shape's double recursion (cons-forward AND cons-back
+%% on every regular header).
 -spec partition(
     [roadrunner_http2_hpack:header()],
     map(),
     [roadrunner_http2_hpack:header()]
 ) ->
     {ok, map(), [roadrunner_http2_hpack:header()]} | {error, build_error()}.
-partition([], Pseudo, _Regular) ->
-    %% End of input — caller picks up `Pseudo` from the map and
-    %% the rest as regular headers (already in the accumulator).
+partition([], Pseudo, _) ->
     {ok, Pseudo, []};
-partition([{<<":", _/binary>>, _} | _], _Pseudo, [_ | _]) ->
-    %% Pseudo-header arrived after a regular header — RFC 9113
-    %% §8.1.2.1 protocol error.
-    {error, pseudo_after_regular};
-partition([{<<":", _/binary>> = Name, Value} | Rest], Pseudo, []) ->
-    case is_known_pseudo(Name) of
-        false ->
-            {error, unknown_pseudo_header};
-        true ->
-            case maps:is_key(Name, Pseudo) of
-                true -> {error, duplicate_pseudo_header};
-                false -> partition(Rest, Pseudo#{Name => Value}, [])
-            end
+partition([{<<":", _/binary>> = Name, Value} | Rest], Pseudo, _) ->
+    case Pseudo of
+        #{Name := _} ->
+            {error, duplicate_pseudo_header};
+        _ when
+            Name =:= ~":method";
+            Name =:= ~":scheme";
+            Name =:= ~":authority";
+            Name =:= ~":path"
+        ->
+            partition(Rest, Pseudo#{Name => Value}, []);
+        _ ->
+            {error, unknown_pseudo_header}
     end;
-partition([{Name, Value} | Rest], Pseudo, RegSeen) ->
-    case partition(Rest, Pseudo, [{Name, Value} | RegSeen]) of
-        {ok, Final, Tail} -> {ok, Final, [{Name, Value} | Tail]};
+partition([H | Rest], Pseudo, _) ->
+    case partition_regular(Rest) of
+        {ok, Tail} -> {ok, Pseudo, [H | Tail]};
         {error, _} = E -> E
     end.
 
--spec is_known_pseudo(binary()) -> boolean().
-is_known_pseudo(~":method") -> true;
-is_known_pseudo(~":scheme") -> true;
-is_known_pseudo(~":authority") -> true;
-is_known_pseudo(~":path") -> true;
-is_known_pseudo(_) -> false.
+%% Body-recurse the regular-header tail. A pseudo-header arriving
+%% here is RFC 9113 §8.1.2.1 PROTOCOL_ERROR.
+-spec partition_regular([roadrunner_http2_hpack:header()]) ->
+    {ok, [roadrunner_http2_hpack:header()]} | {error, build_error()}.
+partition_regular([]) ->
+    {ok, []};
+partition_regular([{<<":", _/binary>>, _} | _]) ->
+    {error, pseudo_after_regular};
+partition_regular([H | Rest]) ->
+    case partition_regular(Rest) of
+        {ok, Tail} -> {ok, [H | Tail]};
+        {error, _} = E -> E
+    end.
 
 -spec validate_pseudo(map()) ->
     {ok, binary(), binary(), binary(), binary() | undefined}
@@ -153,18 +152,21 @@ validate_pseudo(Pseudo) ->
             {error, missing_pseudo_header}
     end.
 
+%% Function-clause dispatch over the banned set (RFC 9113 §8.2.2)
+%% keeps the hot path branch-friendly: the BEAM compiles the
+%% literal-binary clauses to a hash/select, no `lists:member`
+%% function call per header.
 -spec check_banned([roadrunner_http2_hpack:header()]) ->
     ok | {error, connection_specific_header}.
-check_banned([]) ->
-    ok;
-check_banned([{~"te", Value} | _]) when Value =/= ~"trailers" ->
-    %% RFC 9113 §8.2.2: only `te: trailers` is allowed.
-    {error, connection_specific_header};
-check_banned([{Name, _} | Rest]) ->
-    case lists:member(Name, ?BANNED_HEADERS) of
-        true -> {error, connection_specific_header};
-        false -> check_banned(Rest)
-    end.
+check_banned([]) -> ok;
+check_banned([{~"connection", _} | _]) -> {error, connection_specific_header};
+check_banned([{~"keep-alive", _} | _]) -> {error, connection_specific_header};
+check_banned([{~"proxy-connection", _} | _]) -> {error, connection_specific_header};
+check_banned([{~"transfer-encoding", _} | _]) -> {error, connection_specific_header};
+check_banned([{~"upgrade", _} | _]) -> {error, connection_specific_header};
+check_banned([{~"te", ~"trailers"} | Rest]) -> check_banned(Rest);
+check_banned([{~"te", _} | _]) -> {error, connection_specific_header};
+check_banned([_ | Rest]) -> check_banned(Rest).
 
 -spec build(
     binary(),
@@ -185,16 +187,24 @@ build(Method, _Scheme, Path, Authority, Regular, Body, ConnInfo) ->
             undefined -> Regular;
             _ -> [{~"host", Authority} | Regular]
         end,
-    Base = #{
+    %% Caller (`roadrunner_conn_loop_http2:dispatch_stream`)
+    %% always builds `ConnInfo` with all four fields populated, so
+    %% pattern-matching wins vs. four `maps:get/3` calls.
+    #{
+        peer := Peer,
+        scheme := Scheme,
+        request_id := RequestId,
+        listener_name := ListenerName
+    } = ConnInfo,
+    #{
         method => Method,
         target => Path,
         version => {2, 0},
         headers => HeadersWithHost,
         body => Body,
         bindings => #{},
-        peer => maps:get(peer, ConnInfo, undefined),
-        scheme => maps:get(scheme, ConnInfo, http),
-        request_id => maps:get(request_id, ConnInfo, ~""),
-        listener_name => maps:get(listener_name, ConnInfo, undefined)
-    },
-    Base.
+        peer => Peer,
+        scheme => Scheme,
+        request_id => RequestId,
+        listener_name => ListenerName
+    }.

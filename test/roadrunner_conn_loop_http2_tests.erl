@@ -2261,9 +2261,12 @@ headers_for_closed_stream_protocol_error() ->
     end.
 
 settings_initial_window_size_shifts_stream_window() ->
-    %% Open a stream, then SETTINGS with a new INITIAL_WINDOW_SIZE.
-    %% No overflow → server applies the shift and ACKs. Sync via
-    %% PING-ACK to confirm processing order.
+    %% Open a stream, then SETTINGS with a new INITIAL_WINDOW_SIZE
+    %% mixed with an unrelated setting id (3, MAX_CONCURRENT_STREAMS)
+    %% so `last_setting/3` walks past a non-id-4 entry before
+    %% finding the value we care about. No overflow → server
+    %% applies the shift and ACKs. Sync via PING-ACK to confirm
+    %% processing order.
     {Pid, Ref, ConnPid} = post_handshake_conn(),
     HpackBin = encode_post_root_headers(),
     H = iolist_to_binary(
@@ -2271,7 +2274,7 @@ settings_initial_window_size_shifts_stream_window() ->
     ),
     serve_recv(ConnPid, H),
     Settings = iolist_to_binary(
-        roadrunner_http2_frame:encode({settings, 0, [{4, 32768}]})
+        roadrunner_http2_frame:encode({settings, 0, [{3, 100}, {4, 32768}]})
     ),
     serve_recv(ConnPid, Settings),
     SettingsAck = expect_send(),

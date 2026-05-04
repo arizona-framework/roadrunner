@@ -118,6 +118,282 @@ encode_uses_indexed_for_known_static_pairs_test() ->
     ?assertEqual(<<16#82>>, iolist_to_binary(Block)).
 
 %% =============================================================================
+%% Static table coverage — exercise every entry of RFC 7541 Appendix A.
+%% =============================================================================
+
+%% Each entry of the static table (61 entries) is exercised via a
+%% round-trip: encoder picks the indexed-name or indexed-pair shape,
+%% decoder reads the index back to the same `{Name, Value}`. This
+%% covers every clause of `static_full_match/2`, `static_name_match/1`
+%% and `lookup_static/1` — they're function-clause-dispatched per
+%% RFC 7541 Appendix A and the BEAM compiles them to a JIT'd jump
+%% table; without this test most clauses sit uncovered.
+static_table_round_trip_for_every_index_test_() ->
+    [
+        ?_assertEqual(
+            {Name, Value},
+            decode_via_index(Name, Value)
+        )
+     || {Name, Value} <- [
+            {~":authority", ~""},
+            {~":method", ~"GET"},
+            {~":method", ~"POST"},
+            {~":path", ~"/"},
+            {~":path", ~"/index.html"},
+            {~":scheme", ~"http"},
+            {~":scheme", ~"https"},
+            {~":status", ~"200"},
+            {~":status", ~"204"},
+            {~":status", ~"206"},
+            {~":status", ~"304"},
+            {~":status", ~"400"},
+            {~":status", ~"404"},
+            {~":status", ~"500"},
+            {~"accept-charset", ~""},
+            {~"accept-encoding", ~"gzip, deflate"},
+            {~"accept-language", ~""},
+            {~"accept-ranges", ~""},
+            {~"accept", ~""},
+            {~"access-control-allow-origin", ~""},
+            {~"age", ~""},
+            {~"allow", ~""},
+            {~"authorization", ~""},
+            {~"cache-control", ~""},
+            {~"content-disposition", ~""},
+            {~"content-encoding", ~""},
+            {~"content-language", ~""},
+            {~"content-length", ~""},
+            {~"content-location", ~""},
+            {~"content-range", ~""},
+            {~"content-type", ~""},
+            {~"cookie", ~""},
+            {~"date", ~""},
+            {~"etag", ~""},
+            {~"expect", ~""},
+            {~"expires", ~""},
+            {~"from", ~""},
+            {~"host", ~""},
+            {~"if-match", ~""},
+            {~"if-modified-since", ~""},
+            {~"if-none-match", ~""},
+            {~"if-range", ~""},
+            {~"if-unmodified-since", ~""},
+            {~"last-modified", ~""},
+            {~"link", ~""},
+            {~"location", ~""},
+            {~"max-forwards", ~""},
+            {~"proxy-authenticate", ~""},
+            {~"proxy-authorization", ~""},
+            {~"range", ~""},
+            {~"referer", ~""},
+            {~"refresh", ~""},
+            {~"retry-after", ~""},
+            {~"server", ~""},
+            {~"set-cookie", ~""},
+            {~"strict-transport-security", ~""},
+            {~"transfer-encoding", ~""},
+            {~"user-agent", ~""},
+            {~"vary", ~""},
+            {~"via", ~""},
+            {~"www-authenticate", ~""}
+        ]
+    ].
+
+%% Encode a header with the encoder (which picks the smallest static
+%% representation) and decode the resulting bytes, asserting the
+%% round-trip produced the same pair.
+decode_via_index(Name, Value) ->
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Block, _} = roadrunner_http2_hpack:encode([{Name, Value}], Enc),
+    BlockBin = iolist_to_binary(Block),
+    Dec = roadrunner_http2_hpack:new_decoder(4096),
+    {ok, [Pair], _Dec1} = roadrunner_http2_hpack:decode(BlockBin, Dec),
+    Pair.
+
+%% Decode an Indexed Header Field (one byte: 1xxxxxxx) for every
+%% static-table index 1..61. Exercises every clause of
+%% `lookup_static/1` directly via the decoder's indexed-header
+%% representation, which `encode/decode` round-trip in
+%% `static_table_round_trip_for_every_index_test_/0` only does for
+%% full-pair static entries (the empty-value rows go through
+%% indexed-name + literal value on encode and don't reach
+%% `lookup_static`).
+indexed_header_decode_for_every_static_index_test_() ->
+    StaticEntries =
+        [
+            {1, ~":authority", ~""},
+            {2, ~":method", ~"GET"},
+            {3, ~":method", ~"POST"},
+            {4, ~":path", ~"/"},
+            {5, ~":path", ~"/index.html"},
+            {6, ~":scheme", ~"http"},
+            {7, ~":scheme", ~"https"},
+            {8, ~":status", ~"200"},
+            {9, ~":status", ~"204"},
+            {10, ~":status", ~"206"},
+            {11, ~":status", ~"304"},
+            {12, ~":status", ~"400"},
+            {13, ~":status", ~"404"},
+            {14, ~":status", ~"500"},
+            {15, ~"accept-charset", ~""},
+            {16, ~"accept-encoding", ~"gzip, deflate"},
+            {17, ~"accept-language", ~""},
+            {18, ~"accept-ranges", ~""},
+            {19, ~"accept", ~""},
+            {20, ~"access-control-allow-origin", ~""},
+            {21, ~"age", ~""},
+            {22, ~"allow", ~""},
+            {23, ~"authorization", ~""},
+            {24, ~"cache-control", ~""},
+            {25, ~"content-disposition", ~""},
+            {26, ~"content-encoding", ~""},
+            {27, ~"content-language", ~""},
+            {28, ~"content-length", ~""},
+            {29, ~"content-location", ~""},
+            {30, ~"content-range", ~""},
+            {31, ~"content-type", ~""},
+            {32, ~"cookie", ~""},
+            {33, ~"date", ~""},
+            {34, ~"etag", ~""},
+            {35, ~"expect", ~""},
+            {36, ~"expires", ~""},
+            {37, ~"from", ~""},
+            {38, ~"host", ~""},
+            {39, ~"if-match", ~""},
+            {40, ~"if-modified-since", ~""},
+            {41, ~"if-none-match", ~""},
+            {42, ~"if-range", ~""},
+            {43, ~"if-unmodified-since", ~""},
+            {44, ~"last-modified", ~""},
+            {45, ~"link", ~""},
+            {46, ~"location", ~""},
+            {47, ~"max-forwards", ~""},
+            {48, ~"proxy-authenticate", ~""},
+            {49, ~"proxy-authorization", ~""},
+            {50, ~"range", ~""},
+            {51, ~"referer", ~""},
+            {52, ~"refresh", ~""},
+            {53, ~"retry-after", ~""},
+            {54, ~"server", ~""},
+            {55, ~"set-cookie", ~""},
+            {56, ~"strict-transport-security", ~""},
+            {57, ~"transfer-encoding", ~""},
+            {58, ~"user-agent", ~""},
+            {59, ~"vary", ~""},
+            {60, ~"via", ~""},
+            {61, ~"www-authenticate", ~""}
+        ],
+    [
+        ?_assertEqual(
+            {Name, Value},
+            decode_indexed(Idx)
+        )
+     || {Idx, Name, Value} <- StaticEntries
+    ].
+
+%% Indexed Header Field representation: 1xxxxxxx with the index in
+%% the low 7 bits (RFC 7541 §6.1). For Idx <= 127 this is a single
+%% byte; the static table tops out at 61 so we always fit.
+decode_indexed(Idx) ->
+    Byte = 16#80 bor Idx,
+    Dec = roadrunner_http2_hpack:new_decoder(4096),
+    {ok, [Pair], _} = roadrunner_http2_hpack:decode(<<Byte>>, Dec),
+    Pair.
+
+%% Encode each static-table NAME with a deliberately-non-static
+%% VALUE so the encoder takes the indexed-name + literal-value
+%% path (RFC 7541 §6.2.1). Exercises every clause of
+%% `static_name_match/1` directly. Round-trip via decode to
+%% confirm the chosen index resolves back to the right name.
+static_name_match_for_every_static_name_test_() ->
+    StaticNames = [
+        ~":authority",
+        ~":method",
+        ~":path",
+        ~":scheme",
+        ~":status",
+        ~"accept-charset",
+        ~"accept-encoding",
+        ~"accept-language",
+        ~"accept-ranges",
+        ~"accept",
+        ~"access-control-allow-origin",
+        ~"age",
+        ~"allow",
+        ~"authorization",
+        ~"cache-control",
+        ~"content-disposition",
+        ~"content-encoding",
+        ~"content-language",
+        ~"content-length",
+        ~"content-location",
+        ~"content-range",
+        ~"content-type",
+        ~"cookie",
+        ~"date",
+        ~"etag",
+        ~"expect",
+        ~"expires",
+        ~"from",
+        ~"host",
+        ~"if-match",
+        ~"if-modified-since",
+        ~"if-none-match",
+        ~"if-range",
+        ~"if-unmodified-since",
+        ~"last-modified",
+        ~"link",
+        ~"location",
+        ~"max-forwards",
+        ~"proxy-authenticate",
+        ~"proxy-authorization",
+        ~"range",
+        ~"referer",
+        ~"refresh",
+        ~"retry-after",
+        ~"server",
+        ~"set-cookie",
+        ~"strict-transport-security",
+        ~"transfer-encoding",
+        ~"user-agent",
+        ~"vary",
+        ~"via",
+        ~"www-authenticate"
+    ],
+    %% A value unlikely to collide with any RFC 7541 static-pair
+    %% entry — forces the encoder onto the indexed-name path.
+    Value = ~"x-roadrunner-not-static",
+    [
+        ?_assertEqual({Name, Value}, encode_then_decode(Name, Value))
+     || Name <- StaticNames
+    ].
+
+encode_then_decode(Name, Value) ->
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Block, _} = roadrunner_http2_hpack:encode([{Name, Value}], Enc),
+    BlockBin = iolist_to_binary(Block),
+    Dec = roadrunner_http2_hpack:new_decoder(4096),
+    {ok, [Pair], _} = roadrunner_http2_hpack:decode(BlockBin, Dec),
+    Pair.
+
+%% Names that don't resolve to a static-table entry must fall through
+%% to the catch-all `none` clause of `static_name_match/1`.
+static_name_match_unknown_falls_through_test() ->
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    %% A name that's not in the static table — encoder emits literal-
+    %% with-incremental-indexing using the new-name shape (header
+    %% field representation 0x40), which exercises both
+    %% `static_full_match/2` and `static_name_match/1` returning
+    %% `none`.
+    {Block, _} = roadrunner_http2_hpack:encode(
+        [{~"x-roadrunner-test", ~"1"}], Enc
+    ),
+    BlockBin = iolist_to_binary(Block),
+    Dec = roadrunner_http2_hpack:new_decoder(4096),
+    {ok, [Pair], _} = roadrunner_http2_hpack:decode(BlockBin, Dec),
+    ?assertEqual({~"x-roadrunner-test", ~"1"}, Pair).
+
+%% =============================================================================
 %% Dynamic table size update — RFC 7541 §6.3, §4.2.
 %% =============================================================================
 

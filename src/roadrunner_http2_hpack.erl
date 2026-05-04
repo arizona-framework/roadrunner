@@ -40,8 +40,6 @@ when emitting non-indexed pairs. Indexed-name + literal-value
 takes priority when the name appears in the static table.
 """.
 
--on_load(init_static_tables/0).
-
 -export([
     new_decoder/1,
     new_encoder/1,
@@ -447,7 +445,7 @@ validate_lower(<<_, Rest/binary>>) -> validate_lower(Rest).
 %% Idx > 61 + |dynamic table|.
 -spec lookup(pos_integer(), context()) -> {ok, header()} | {error, invalid_index}.
 lookup(Idx, _Ctx) when Idx =< ?STATIC_TABLE_LEN ->
-    {ok, element(Idx, static_table_tuple())};
+    {ok, lookup_static(Idx)};
 lookup(Idx, #hpack_ctx{table = Table}) ->
     DynIdx = Idx - ?STATIC_TABLE_LEN,
     case nth_or_undefined(DynIdx, Table) of
@@ -516,16 +514,20 @@ entry_size({Name, Value}) ->
 
 -spec full_match(binary(), binary(), context()) -> {ok, pos_integer()} | none.
 full_match(Name, Value, #hpack_ctx{table = Dyn}) ->
+    %% Static lookup is now a function-clause dispatch (BEAM JIT
+    %% turns the 60-clause `static_full_match/2` into a hash/select
+    %% jump table); we still indirect through the wrapper so a hit
+    %% returns directly without scanning the dynamic table.
     case static_full_match(Name, Value) of
-        {ok, _} = R -> R;
-        none -> dyn_full_match(Name, Value, Dyn, 1)
+        none -> dyn_full_match(Name, Value, Dyn, 1);
+        Found -> Found
     end.
 
 -spec name_match(binary(), context()) -> {ok, pos_integer()} | none.
 name_match(Name, #hpack_ctx{table = Dyn}) ->
     case static_name_match(Name) of
-        {ok, _} = R -> R;
-        none -> dyn_name_match(Name, Dyn, 1)
+        none -> dyn_name_match(Name, Dyn, 1);
+        Found -> Found
     end.
 
 dyn_full_match(_, _, [], _) -> none;
@@ -540,122 +542,202 @@ dyn_name_match(Name, [_ | T], I) -> dyn_name_match(Name, T, I + 1).
 %% RFC 7541 Appendix A — static table (61 entries)
 %% =============================================================================
 
--spec static_table_tuple() -> tuple().
-static_table_tuple() ->
-    persistent_term:get({?MODULE, static_table}).
+%% =============================================================================
+%% RFC 7541 Appendix A — static table as function-clause dispatch
+%% =============================================================================
+%%
+%% These three functions encode the 61-entry static table directly
+%% as Erlang clauses. The BEAM's pattern compiler turns each into a
+%% jump/select tree that lookups complete in a few instructions —
+%% no persistent_term, no map hash, no tuple element. Cowboy's
+%% `cow_hpack:table_find_field/_name` uses the same trick; the
+%% earlier persistent_term-backed maps measured at ~3 % of profile
+%% on the h2 hello bench, all of which goes away here.
+%%
+%% Match priority follows RFC 7541 Appendix A: when the same name
+%% appears with multiple values (`:method GET` / `:method POST`,
+%% `:path /` / `:path /index.html`, all eight `:status N` rows),
+%% earlier indices win for indexed-name lookups via
+%% `static_name_match/1`.
 
 -spec static_full_match(binary(), binary()) -> {ok, pos_integer()} | none.
-static_full_match(Name, Value) ->
-    pt_lookup({?MODULE, static_full}, {Name, Value}).
+static_full_match(~":authority", ~"") -> {ok, 1};
+static_full_match(~":method", ~"GET") -> {ok, 2};
+static_full_match(~":method", ~"POST") -> {ok, 3};
+static_full_match(~":path", ~"/") -> {ok, 4};
+static_full_match(~":path", ~"/index.html") -> {ok, 5};
+static_full_match(~":scheme", ~"http") -> {ok, 6};
+static_full_match(~":scheme", ~"https") -> {ok, 7};
+static_full_match(~":status", ~"200") -> {ok, 8};
+static_full_match(~":status", ~"204") -> {ok, 9};
+static_full_match(~":status", ~"206") -> {ok, 10};
+static_full_match(~":status", ~"304") -> {ok, 11};
+static_full_match(~":status", ~"400") -> {ok, 12};
+static_full_match(~":status", ~"404") -> {ok, 13};
+static_full_match(~":status", ~"500") -> {ok, 14};
+static_full_match(~"accept-charset", ~"") -> {ok, 15};
+static_full_match(~"accept-encoding", ~"gzip, deflate") -> {ok, 16};
+static_full_match(~"accept-language", ~"") -> {ok, 17};
+static_full_match(~"accept-ranges", ~"") -> {ok, 18};
+static_full_match(~"accept", ~"") -> {ok, 19};
+static_full_match(~"access-control-allow-origin", ~"") -> {ok, 20};
+static_full_match(~"age", ~"") -> {ok, 21};
+static_full_match(~"allow", ~"") -> {ok, 22};
+static_full_match(~"authorization", ~"") -> {ok, 23};
+static_full_match(~"cache-control", ~"") -> {ok, 24};
+static_full_match(~"content-disposition", ~"") -> {ok, 25};
+static_full_match(~"content-encoding", ~"") -> {ok, 26};
+static_full_match(~"content-language", ~"") -> {ok, 27};
+static_full_match(~"content-length", ~"") -> {ok, 28};
+static_full_match(~"content-location", ~"") -> {ok, 29};
+static_full_match(~"content-range", ~"") -> {ok, 30};
+static_full_match(~"content-type", ~"") -> {ok, 31};
+static_full_match(~"cookie", ~"") -> {ok, 32};
+static_full_match(~"date", ~"") -> {ok, 33};
+static_full_match(~"etag", ~"") -> {ok, 34};
+static_full_match(~"expect", ~"") -> {ok, 35};
+static_full_match(~"expires", ~"") -> {ok, 36};
+static_full_match(~"from", ~"") -> {ok, 37};
+static_full_match(~"host", ~"") -> {ok, 38};
+static_full_match(~"if-match", ~"") -> {ok, 39};
+static_full_match(~"if-modified-since", ~"") -> {ok, 40};
+static_full_match(~"if-none-match", ~"") -> {ok, 41};
+static_full_match(~"if-range", ~"") -> {ok, 42};
+static_full_match(~"if-unmodified-since", ~"") -> {ok, 43};
+static_full_match(~"last-modified", ~"") -> {ok, 44};
+static_full_match(~"link", ~"") -> {ok, 45};
+static_full_match(~"location", ~"") -> {ok, 46};
+static_full_match(~"max-forwards", ~"") -> {ok, 47};
+static_full_match(~"proxy-authenticate", ~"") -> {ok, 48};
+static_full_match(~"proxy-authorization", ~"") -> {ok, 49};
+static_full_match(~"range", ~"") -> {ok, 50};
+static_full_match(~"referer", ~"") -> {ok, 51};
+static_full_match(~"refresh", ~"") -> {ok, 52};
+static_full_match(~"retry-after", ~"") -> {ok, 53};
+static_full_match(~"server", ~"") -> {ok, 54};
+static_full_match(~"set-cookie", ~"") -> {ok, 55};
+static_full_match(~"strict-transport-security", ~"") -> {ok, 56};
+static_full_match(~"transfer-encoding", ~"") -> {ok, 57};
+static_full_match(~"user-agent", ~"") -> {ok, 58};
+static_full_match(~"vary", ~"") -> {ok, 59};
+static_full_match(~"via", ~"") -> {ok, 60};
+static_full_match(~"www-authenticate", ~"") -> {ok, 61};
+static_full_match(_, _) -> none.
 
 -spec static_name_match(binary()) -> {ok, pos_integer()} | none.
-static_name_match(Name) ->
-    pt_lookup({?MODULE, static_name}, Name).
+static_name_match(~":authority") -> {ok, 1};
+static_name_match(~":method") -> {ok, 2};
+static_name_match(~":path") -> {ok, 4};
+static_name_match(~":scheme") -> {ok, 6};
+static_name_match(~":status") -> {ok, 8};
+static_name_match(~"accept-charset") -> {ok, 15};
+static_name_match(~"accept-encoding") -> {ok, 16};
+static_name_match(~"accept-language") -> {ok, 17};
+static_name_match(~"accept-ranges") -> {ok, 18};
+static_name_match(~"accept") -> {ok, 19};
+static_name_match(~"access-control-allow-origin") -> {ok, 20};
+static_name_match(~"age") -> {ok, 21};
+static_name_match(~"allow") -> {ok, 22};
+static_name_match(~"authorization") -> {ok, 23};
+static_name_match(~"cache-control") -> {ok, 24};
+static_name_match(~"content-disposition") -> {ok, 25};
+static_name_match(~"content-encoding") -> {ok, 26};
+static_name_match(~"content-language") -> {ok, 27};
+static_name_match(~"content-length") -> {ok, 28};
+static_name_match(~"content-location") -> {ok, 29};
+static_name_match(~"content-range") -> {ok, 30};
+static_name_match(~"content-type") -> {ok, 31};
+static_name_match(~"cookie") -> {ok, 32};
+static_name_match(~"date") -> {ok, 33};
+static_name_match(~"etag") -> {ok, 34};
+static_name_match(~"expect") -> {ok, 35};
+static_name_match(~"expires") -> {ok, 36};
+static_name_match(~"from") -> {ok, 37};
+static_name_match(~"host") -> {ok, 38};
+static_name_match(~"if-match") -> {ok, 39};
+static_name_match(~"if-modified-since") -> {ok, 40};
+static_name_match(~"if-none-match") -> {ok, 41};
+static_name_match(~"if-range") -> {ok, 42};
+static_name_match(~"if-unmodified-since") -> {ok, 43};
+static_name_match(~"last-modified") -> {ok, 44};
+static_name_match(~"link") -> {ok, 45};
+static_name_match(~"location") -> {ok, 46};
+static_name_match(~"max-forwards") -> {ok, 47};
+static_name_match(~"proxy-authenticate") -> {ok, 48};
+static_name_match(~"proxy-authorization") -> {ok, 49};
+static_name_match(~"range") -> {ok, 50};
+static_name_match(~"referer") -> {ok, 51};
+static_name_match(~"refresh") -> {ok, 52};
+static_name_match(~"retry-after") -> {ok, 53};
+static_name_match(~"server") -> {ok, 54};
+static_name_match(~"set-cookie") -> {ok, 55};
+static_name_match(~"strict-transport-security") -> {ok, 56};
+static_name_match(~"transfer-encoding") -> {ok, 57};
+static_name_match(~"user-agent") -> {ok, 58};
+static_name_match(~"vary") -> {ok, 59};
+static_name_match(~"via") -> {ok, 60};
+static_name_match(~"www-authenticate") -> {ok, 61};
+static_name_match(_) -> none.
 
-%% Look up `Key` in a persistent_term-stored map. The map is
-%% populated by `init_static_tables/0` at module-load time, so the
-%% persistent_term entry always exists.
-pt_lookup(Slot, Key) ->
-    case maps:find(Key, persistent_term:get(Slot)) of
-        {ok, V} -> {ok, V};
-        error -> none
-    end.
-
-build_static_full() ->
-    maps:from_list([{KV, I} || {I, KV} <- enumerate(static_table_list())]).
-
-build_static_name() ->
-    %% Earlier indices win when names repeat (the static table has
-    %% several entries with the same name and different values —
-    %% RFC 7541 Appendix A — and the encoder should reference the
-    %% first match for the indexed-name + literal-value case).
-    lists:foldl(
-        fun
-            ({I, {Name, _}}, Acc) when not is_map_key(Name, Acc) ->
-                Acc#{Name => I};
-            (_, Acc) ->
-                Acc
-        end,
-        #{},
-        enumerate(static_table_list())
-    ).
-
-enumerate(L) ->
-    enumerate(L, 1).
-
-enumerate([], _) -> [];
-enumerate([H | T], I) -> [{I, H} | enumerate(T, I + 1)].
-
-%% RFC 7541 Appendix A — verbatim, in index order.
--spec static_table_list() -> [header()].
-static_table_list() ->
-    [
-        {~":authority", ~""},
-        {~":method", ~"GET"},
-        {~":method", ~"POST"},
-        {~":path", ~"/"},
-        {~":path", ~"/index.html"},
-        {~":scheme", ~"http"},
-        {~":scheme", ~"https"},
-        {~":status", ~"200"},
-        {~":status", ~"204"},
-        {~":status", ~"206"},
-        {~":status", ~"304"},
-        {~":status", ~"400"},
-        {~":status", ~"404"},
-        {~":status", ~"500"},
-        {~"accept-charset", ~""},
-        {~"accept-encoding", ~"gzip, deflate"},
-        {~"accept-language", ~""},
-        {~"accept-ranges", ~""},
-        {~"accept", ~""},
-        {~"access-control-allow-origin", ~""},
-        {~"age", ~""},
-        {~"allow", ~""},
-        {~"authorization", ~""},
-        {~"cache-control", ~""},
-        {~"content-disposition", ~""},
-        {~"content-encoding", ~""},
-        {~"content-language", ~""},
-        {~"content-length", ~""},
-        {~"content-location", ~""},
-        {~"content-range", ~""},
-        {~"content-type", ~""},
-        {~"cookie", ~""},
-        {~"date", ~""},
-        {~"etag", ~""},
-        {~"expect", ~""},
-        {~"expires", ~""},
-        {~"from", ~""},
-        {~"host", ~""},
-        {~"if-match", ~""},
-        {~"if-modified-since", ~""},
-        {~"if-none-match", ~""},
-        {~"if-range", ~""},
-        {~"if-unmodified-since", ~""},
-        {~"last-modified", ~""},
-        {~"link", ~""},
-        {~"location", ~""},
-        {~"max-forwards", ~""},
-        {~"proxy-authenticate", ~""},
-        {~"proxy-authorization", ~""},
-        {~"range", ~""},
-        {~"referer", ~""},
-        {~"refresh", ~""},
-        {~"retry-after", ~""},
-        {~"server", ~""},
-        {~"set-cookie", ~""},
-        {~"strict-transport-security", ~""},
-        {~"transfer-encoding", ~""},
-        {~"user-agent", ~""},
-        {~"vary", ~""},
-        {~"via", ~""},
-        {~"www-authenticate", ~""}
-    ].
-
-init_static_tables() ->
-    Tuple = list_to_tuple(static_table_list()),
-    persistent_term:put({?MODULE, static_table}, Tuple),
-    persistent_term:put({?MODULE, static_full}, build_static_full()),
-    persistent_term:put({?MODULE, static_name}, build_static_name()),
-    ok.
+-spec lookup_static(pos_integer()) -> header().
+lookup_static(1) -> {~":authority", ~""};
+lookup_static(2) -> {~":method", ~"GET"};
+lookup_static(3) -> {~":method", ~"POST"};
+lookup_static(4) -> {~":path", ~"/"};
+lookup_static(5) -> {~":path", ~"/index.html"};
+lookup_static(6) -> {~":scheme", ~"http"};
+lookup_static(7) -> {~":scheme", ~"https"};
+lookup_static(8) -> {~":status", ~"200"};
+lookup_static(9) -> {~":status", ~"204"};
+lookup_static(10) -> {~":status", ~"206"};
+lookup_static(11) -> {~":status", ~"304"};
+lookup_static(12) -> {~":status", ~"400"};
+lookup_static(13) -> {~":status", ~"404"};
+lookup_static(14) -> {~":status", ~"500"};
+lookup_static(15) -> {~"accept-charset", ~""};
+lookup_static(16) -> {~"accept-encoding", ~"gzip, deflate"};
+lookup_static(17) -> {~"accept-language", ~""};
+lookup_static(18) -> {~"accept-ranges", ~""};
+lookup_static(19) -> {~"accept", ~""};
+lookup_static(20) -> {~"access-control-allow-origin", ~""};
+lookup_static(21) -> {~"age", ~""};
+lookup_static(22) -> {~"allow", ~""};
+lookup_static(23) -> {~"authorization", ~""};
+lookup_static(24) -> {~"cache-control", ~""};
+lookup_static(25) -> {~"content-disposition", ~""};
+lookup_static(26) -> {~"content-encoding", ~""};
+lookup_static(27) -> {~"content-language", ~""};
+lookup_static(28) -> {~"content-length", ~""};
+lookup_static(29) -> {~"content-location", ~""};
+lookup_static(30) -> {~"content-range", ~""};
+lookup_static(31) -> {~"content-type", ~""};
+lookup_static(32) -> {~"cookie", ~""};
+lookup_static(33) -> {~"date", ~""};
+lookup_static(34) -> {~"etag", ~""};
+lookup_static(35) -> {~"expect", ~""};
+lookup_static(36) -> {~"expires", ~""};
+lookup_static(37) -> {~"from", ~""};
+lookup_static(38) -> {~"host", ~""};
+lookup_static(39) -> {~"if-match", ~""};
+lookup_static(40) -> {~"if-modified-since", ~""};
+lookup_static(41) -> {~"if-none-match", ~""};
+lookup_static(42) -> {~"if-range", ~""};
+lookup_static(43) -> {~"if-unmodified-since", ~""};
+lookup_static(44) -> {~"last-modified", ~""};
+lookup_static(45) -> {~"link", ~""};
+lookup_static(46) -> {~"location", ~""};
+lookup_static(47) -> {~"max-forwards", ~""};
+lookup_static(48) -> {~"proxy-authenticate", ~""};
+lookup_static(49) -> {~"proxy-authorization", ~""};
+lookup_static(50) -> {~"range", ~""};
+lookup_static(51) -> {~"referer", ~""};
+lookup_static(52) -> {~"refresh", ~""};
+lookup_static(53) -> {~"retry-after", ~""};
+lookup_static(54) -> {~"server", ~""};
+lookup_static(55) -> {~"set-cookie", ~""};
+lookup_static(56) -> {~"strict-transport-security", ~""};
+lookup_static(57) -> {~"transfer-encoding", ~""};
+lookup_static(58) -> {~"user-agent", ~""};
+lookup_static(59) -> {~"vary", ~""};
+lookup_static(60) -> {~"via", ~""};
+lookup_static(61) -> {~"www-authenticate", ~""}.

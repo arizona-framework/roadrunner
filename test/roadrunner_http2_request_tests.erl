@@ -118,6 +118,24 @@ pseudo_after_regular_is_error_test() ->
         roadrunner_http2_request:from_headers(Headers, <<>>, conn_info())
     ).
 
+pseudo_after_multiple_regulars_is_error_test() ->
+    %% Same error class as above, but the pseudo arrives DEEPER in
+    %% the regular tail so `partition_regular/1` recurses past
+    %% several non-pseudo entries before tripping. Exercises the
+    %% error-propagation arm of the regular-walk recursion.
+    Headers = [
+        {~":method", ~"GET"},
+        {~"x-a", ~"1"},
+        {~"x-b", ~"2"},
+        {~"x-c", ~"3"},
+        {~":scheme", ~"https"},
+        {~":path", ~"/"}
+    ],
+    ?assertEqual(
+        {error, pseudo_after_regular},
+        roadrunner_http2_request:from_headers(Headers, <<>>, conn_info())
+    ).
+
 connection_specific_header_is_error_test() ->
     %% RFC 9113 §8.2.2: `Connection` and friends MUST NOT appear.
     [
