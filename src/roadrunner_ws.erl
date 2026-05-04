@@ -7,10 +7,17 @@ parsing, masking, and the conn-level protocol switch arrive in later
 features.
 """.
 
+-on_load(init_patterns/0).
+
 -export([accept_key/1, handshake_response/1, parse_frame/1, encode_frame/3]).
 -export([parse_extensions/1]).
 
 -export_type([opcode/0, frame/0, extension/0]).
+
+-define(EXT_OFFER_CP_KEY, {?MODULE, ext_offer_cp}).
+-define(EXT_PARAM_CP_KEY, {?MODULE, ext_param_cp}).
+-define(EXT_KV_CP_KEY, {?MODULE, ext_kv_cp}).
+-define(EXT_QUOTE_CP_KEY, {?MODULE, ext_quote_cp}).
 
 -type opcode() :: continuation | text | binary | close | ping | pong.
 -type frame() :: #{
@@ -168,27 +175,33 @@ parse_extensions(<<>>) ->
     [];
 parse_extensions(Value) when is_binary(Value) ->
     Lower = roadrunner_bin:ascii_lowercase(Value),
-    [parse_extension_offer(Offer) || Offer <- split_offers(Lower)].
+    OfferCp = persistent_term:get(?EXT_OFFER_CP_KEY),
+    ParamCp = persistent_term:get(?EXT_PARAM_CP_KEY),
+    KvCp = persistent_term:get(?EXT_KV_CP_KEY),
+    [parse_extension_offer(Offer, ParamCp, KvCp) || Offer <- split_offers(Lower, OfferCp)].
 
 %% Comma is the offer separator and is not allowed inside parameter
 %% values (RFC 6455 §9.1 grammar uses token / quoted-string for
 %% values, both of which forbid `,`). Split-on-comma is safe.
--spec split_offers(binary()) -> [binary()].
-split_offers(Bin) ->
-    [string:trim(O) || O <- binary:split(Bin, ~",", [global]), string:trim(O) =/= <<>>].
+-spec split_offers(binary(), binary:cp()) -> [binary()].
+split_offers(Bin, OfferCp) ->
+    [
+        string:trim(O)
+     || O <- binary:split(Bin, OfferCp, [global]), string:trim(O) =/= <<>>
+    ].
 
--spec parse_extension_offer(binary()) -> extension().
-parse_extension_offer(Offer) ->
-    case binary:split(Offer, ~";", [global]) of
+-spec parse_extension_offer(binary(), binary:cp(), binary:cp()) -> extension().
+parse_extension_offer(Offer, ParamCp, KvCp) ->
+    case binary:split(Offer, ParamCp, [global]) of
         [Name] ->
             {string:trim(Name), []};
         [Name | Params] ->
-            {string:trim(Name), [parse_extension_param(P) || P <- Params]}
+            {string:trim(Name), [parse_extension_param(P, KvCp) || P <- Params]}
     end.
 
--spec parse_extension_param(binary()) -> {binary(), binary() | true}.
-parse_extension_param(Param) ->
-    case binary:split(string:trim(Param), ~"=") of
+-spec parse_extension_param(binary(), binary:cp()) -> {binary(), binary() | true}.
+parse_extension_param(Param, KvCp) ->
+    case binary:split(string:trim(Param), KvCp) of
         [Key] ->
             {Key, true};
         [Key, Value] ->
@@ -197,7 +210,7 @@ parse_extension_param(Param) ->
 
 -spec unquote(binary()) -> binary().
 unquote(<<$", Rest/binary>>) ->
-    case binary:match(Rest, ~"\"") of
+    case binary:match(Rest, persistent_term:get(?EXT_QUOTE_CP_KEY)) of
         {End, _} -> binary:part(Rest, 0, End);
         nomatch -> Rest
     end;
@@ -351,3 +364,14 @@ encode_opcode(pong) -> ?OP_PONG.
 -spec fin_bit(boolean()) -> 0 | 1.
 fin_bit(true) -> 1;
 fin_bit(false) -> 0.
+
+%% `-on_load` callback. Compiles the Sec-WebSocket-Extensions
+%% splitter patterns once and stashes them in `persistent_term` so
+%% the per-handshake parse has no setup cost.
+-spec init_patterns() -> ok.
+init_patterns() ->
+    persistent_term:put(?EXT_OFFER_CP_KEY, binary:compile_pattern(~",")),
+    persistent_term:put(?EXT_PARAM_CP_KEY, binary:compile_pattern(~";")),
+    persistent_term:put(?EXT_KV_CP_KEY, binary:compile_pattern(~"=")),
+    persistent_term:put(?EXT_QUOTE_CP_KEY, binary:compile_pattern(~"\"")),
+    ok.

@@ -61,9 +61,12 @@ gzip avoids the question.
 
 -behaviour(roadrunner_middleware).
 
+-on_load(init_patterns/0).
+
 -export([call/2]).
 
 -define(THRESHOLD, 860).
+-define(COMMA_CP_KEY, {?MODULE, comma_cp}).
 
 -type encoding() :: gzip | deflate | none.
 
@@ -204,12 +207,15 @@ negotiate_encoding(Req) ->
             none;
         Value ->
             Lower = roadrunner_bin:ascii_lowercase(Value),
+            CommaCp = persistent_term:get(?COMMA_CP_KEY),
             %% Walk tokens once, recording per-encoding qvalues.
             %% `Wildcard` covers any encoding name not seen; `Gzip`
             %% / `Deflate` override the wildcard. `undefined` means
             %% the encoding wasn't mentioned at all.
             {Gzip, Deflate, Wildcard} =
-                walk_tokens(binary:split(Lower, ~",", [global]), undefined, undefined, undefined),
+                walk_tokens(
+                    binary:split(Lower, CommaCp, [global]), undefined, undefined, undefined
+                ),
             choose(effective_q(Gzip, Wildcard), effective_q(Deflate, Wildcard))
     end.
 
@@ -290,3 +296,11 @@ add_vary(Headers) ->
         true -> Headers;
         false -> [{~"vary", ~"Accept-Encoding"} | Headers]
     end.
+
+%% `-on_load` callback. Compiles the Accept-Encoding token splitter
+%% pattern once and stashes it in `persistent_term` so the per-request
+%% `binary:split` call has no setup cost.
+-spec init_patterns() -> ok.
+init_patterns() ->
+    persistent_term:put(?COMMA_CP_KEY, binary:compile_pattern(~",")),
+    ok.
