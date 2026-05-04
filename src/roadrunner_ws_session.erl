@@ -427,33 +427,80 @@ accumulate_fragment(
     end;
 accumulate_fragment(
     #{fin := true, payload := P} = _Frame,
-    #data{msg_acc = Acc, msg_opcode = Op, msg_compressed = Compressed} = Data,
+    #data{
+        msg_acc = Acc,
+        msg_opcode = Op,
+        msg_compressed = Compressed,
+        utf8_pending = Pending
+    } = Data,
     Hibernate
 ) ->
-    AssembledIolist =
-        case Acc of
-            undefined -> [P];
-            _ -> [Acc, P]
-        end,
-    Reset = reset_msg(Data),
-    case finalize_message(Reset, AssembledIolist, Compressed) of
-        {ok, Payload, Data1} ->
-            %% Final validation: even with the per-fragment pre-checks,
-            %% the closing fragment may have introduced a hanging
-            %% incomplete sequence — that's invalid at FIN time. We
-            %% pass the FULL assembled message through
-            %% `unicode:characters_to_binary` to catch that case.
-            case validate_text_payload(Op, Payload) of
-                ok ->
-                    Synthesized =
-                        #{fin => true, rsv1 => false, opcode => Op, payload => Payload},
-                    dispatch_data_frame(Synthesized, Data1, Hibernate);
-                invalid_utf8 ->
-                    close_with(close_invalid_payload(), Data1)
+    case validate_fin_fragment(Op, Compressed, Pending, P) of
+        ok ->
+            AssembledIolist =
+                case Acc of
+                    undefined -> [P];
+                    _ -> [Acc, P]
+                end,
+            Reset = reset_msg(Data),
+            case finalize_message(Reset, AssembledIolist, Compressed) of
+                {ok, Payload, Data1} ->
+                    %% For compressed messages, finalize_message inflated
+                    %% the bytes — UTF-8 must be checked on the inflated
+                    %% binary (the wire bytes are deflate-compressed, not
+                    %% UTF-8). For uncompressed messages, validation has
+                    %% already run incrementally above; skip redundant
+                    %% full-message revalidation.
+                    case post_finalize_validate(Op, Compressed, Payload) of
+                        ok ->
+                            Synthesized = #{
+                                fin => true,
+                                rsv1 => false,
+                                opcode => Op,
+                                payload => Payload
+                            },
+                            dispatch_data_frame(Synthesized, Data1, Hibernate);
+                        invalid_utf8 ->
+                            close_with(close_invalid_payload(), Data1)
+                    end;
+                {error, _} ->
+                    close_with(close_protocol_error(), Reset)
             end;
-        {error, _} ->
-            close_with(close_protocol_error(), Reset)
+        invalid_utf8 ->
+            close_with(close_invalid_payload(), reset_msg(Data))
     end.
+
+%% Validate the FIN fragment's bytes against the carried pending
+%% prefix. For text messages, the fragment must complete any
+%% in-progress sequence — incomplete UTF-8 trailing the message is
+%% invalid. Compressed messages defer validation to post_finalize
+%% because the wire bytes are deflate, not UTF-8.
+-spec validate_fin_fragment(text | binary, boolean(), binary(), binary()) ->
+    ok | invalid_utf8.
+validate_fin_fragment(binary, _Compressed, _Pending, _Bytes) ->
+    ok;
+validate_fin_fragment(text, true, _Pending, _Bytes) ->
+    ok;
+validate_fin_fragment(text, false, Pending, Bytes) ->
+    Combined = <<Pending/binary, Bytes/binary>>,
+    case unicode:characters_to_binary(Combined, utf8, utf8) of
+        Bin when is_binary(Bin) -> ok;
+        %% Trailing bytes that didn't form a complete sequence are
+        %% invalid at FIN time per RFC 6455 §8.1.
+        {incomplete, _, _} -> invalid_utf8;
+        {error, _, _} -> invalid_utf8
+    end.
+
+%% Compressed messages need their inflated payload validated; their
+%% wire bytes are deflate, so per-fragment UTF-8 validation was
+%% skipped. Uncompressed messages were validated incrementally and
+%% don't need a redundant full-message check.
+-spec post_finalize_validate(text | binary, boolean(), binary()) ->
+    ok | invalid_utf8.
+post_finalize_validate(text, true, Payload) ->
+    validate_text_payload(text, Payload);
+post_finalize_validate(_Op, _Compressed, _Payload) ->
+    ok.
 
 -spec reset_msg(#data{}) -> #data{}.
 reset_msg(Data) ->
@@ -486,12 +533,30 @@ validate_incremental(text, false, Pending, Bytes) ->
             %% Fully-valid (no trailing incomplete sequence).
             {ok, <<>>};
         {incomplete, _Valid, Incomplete} ->
-            %% Valid up to a trailing incomplete sequence — carry it
-            %% forward for the next fragment to complete.
-            {ok, Incomplete};
+            %% Valid up to a trailing incomplete sequence. Most are
+            %% legitimately mid-codepoint, but some byte combos are
+            %% already provably-invalid before all continuation bytes
+            %% arrive — fail-fast on those per RFC 6455 §8.1.
+            case incomplete_is_provably_invalid(Incomplete) of
+                true -> invalid_utf8;
+                false -> {ok, Incomplete}
+            end;
         {error, _Valid, _Rest} ->
             invalid_utf8
     end.
+
+%% Detect UTF-8 byte prefixes that can't extend to any valid codepoint
+%% even with more continuation bytes. Catches Autobahn 6.4.x cases —
+%% out-of-range codepoints (F4 9X+...), overlongs (E0 0..9F, F0 0..8F),
+%% surrogates (ED A0..BF), and 5/6-byte legacy starts (F5..FF).
+-spec incomplete_is_provably_invalid(binary()) -> boolean().
+incomplete_is_provably_invalid(<<16#F4, B, _/binary>>) when B >= 16#90 -> true;
+incomplete_is_provably_invalid(<<16#E0, B, _/binary>>) when B < 16#A0 -> true;
+incomplete_is_provably_invalid(<<16#ED, B, _/binary>>) when B >= 16#A0 -> true;
+incomplete_is_provably_invalid(<<16#F0, B, _/binary>>) when B < 16#90 -> true;
+%% F5..FF as a leading byte is always invalid — no codepoint mapping.
+incomplete_is_provably_invalid(<<F, _/binary>>) when F >= 16#F5 -> true;
+incomplete_is_provably_invalid(_) -> false.
 
 %% Returns either a plain assembled binary (when the message was
 %% uncompressed) or the inflated bytes (when RSV1 was set on the
@@ -515,14 +580,14 @@ finalize_message(#data{inflate_z = Z, pmd_params = Params} = Data, Iolist, true)
 
 %% RFC 6455 §8.1: text-message payloads MUST be valid UTF-8. Binary
 %% payloads have no encoding constraint.
--spec validate_text_payload(text | binary, binary()) -> ok | invalid_utf8.
+%% Only called for `text` opcodes via `post_finalize_validate`. The
+%% `binary` case short-circuits earlier (no encoding constraint).
+-spec validate_text_payload(text, binary()) -> ok | invalid_utf8.
 validate_text_payload(text, Payload) ->
     case unicode:characters_to_binary(Payload, utf8, utf8) of
         Payload -> ok;
         _ -> invalid_utf8
-    end;
-validate_text_payload(binary, _Payload) ->
-    ok.
+    end.
 
 %% RFC 6455 §7.4: 1002 = protocol error.
 -spec close_protocol_error() -> binary().

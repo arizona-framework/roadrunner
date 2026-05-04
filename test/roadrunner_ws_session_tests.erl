@@ -686,6 +686,175 @@ invalid_utf8_in_text_message_closes_1007_test() ->
     ?assertEqual(<<16#88, 2, 1007:16>>, Sent),
     Sink ! stop.
 
+out_of_range_utf8_at_fragment_2_closes_immediately_test() ->
+    %% Autobahn 6.4.2 case: F4 prefix (legitimate start of a 4-byte
+    %% codepoint up to U+10FFFF) followed by 0x90 makes the codepoint
+    %% out of range (would be ≥ U+110000). Close 1007 must fire on
+    %% fragment 2, NOT wait for fragment 3 / FIN. Validates the
+    %% `incomplete_is_provably_invalid` fail-fast path.
+    Self = self(),
+    Tag = make_ref(),
+    F1 = uncompressed_fragment(text, <<16#CE, 16#BA, 16#F4>>, false),
+    F2 = uncompressed_fragment(continuation, <<16#90>>, false),
+    %% Fragment 3 should never be processed — close fires on fragment 2.
+    F3 = uncompressed_fragment(continuation, <<16#80, 16#80>>, true),
+    Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary, F3/binary>>}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    %% Close frame with status 1007.
+    ?assertEqual(<<16#88, 2, 1007:16>>, Sent),
+    Sink ! stop.
+
+overlong_3byte_e0_8x_closes_immediately_test() ->
+    %% E0 followed by 80..9F is overlong (encodes U+0000..U+07FF
+    %% which fit in 1- or 2-byte sequences). RFC 3629 §3 forbids
+    %% overlongs.
+    Self = self(),
+    Tag = make_ref(),
+    F1 = uncompressed_fragment(text, <<"x", 16#E0>>, false),
+    F2 = uncompressed_fragment(continuation, <<16#80>>, false),
+    Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    ?assertEqual(<<16#88, 2, 1007:16>>, iolist_to_binary(collect_sends(Tag, 100))),
+    Sink ! stop.
+
+overlong_4byte_f0_8x_closes_immediately_test() ->
+    %% F0 followed by 80..8F is overlong (encodes U+0000..U+FFFF).
+    Self = self(),
+    Tag = make_ref(),
+    F1 = uncompressed_fragment(text, <<"x", 16#F0>>, false),
+    F2 = uncompressed_fragment(continuation, <<16#80>>, false),
+    Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    ?assertEqual(<<16#88, 2, 1007:16>>, iolist_to_binary(collect_sends(Tag, 100))),
+    Sink ! stop.
+
+invalid_leader_f5_closes_immediately_test() ->
+    %% F5..FF as a leader byte is always invalid in modern UTF-8 —
+    %% the encoding scheme tops out at F4.
+    Self = self(),
+    Tag = make_ref(),
+    F1 = uncompressed_fragment(text, <<"x", 16#F5>>, false),
+    F2 = uncompressed_fragment(continuation, <<16#80>>, false),
+    Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    ?assertEqual(<<16#88, 2, 1007:16>>, iolist_to_binary(collect_sends(Tag, 100))),
+    Sink ! stop.
+
+incomplete_utf8_at_fin_closes_with_1007_test() ->
+    %% A text message that ends with a partial multi-byte sequence
+    %% (no continuation bytes following) is invalid at FIN per
+    %% RFC 6455 §8.1. Validates the validate_fin_fragment incomplete
+    %% branch.
+    Self = self(),
+    Tag = make_ref(),
+    %% Single-fragment, FIN=1, payload ends mid-codepoint.
+    F = uncompressed_fragment(text, <<"hello", 16#C3>>, true),
+    Sink = spawn_active_sink(Self, Tag, [{recv, F}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    ?assertEqual(<<16#88, 2, 1007:16>>, iolist_to_binary(collect_sends(Tag, 100))),
+    Sink ! stop.
+
+pmd_compressed_text_with_invalid_utf8_closes_1007_test() ->
+    %% Compressed text message whose INFLATED payload is not valid
+    %% UTF-8. PMD frames bypass per-fragment UTF-8 checks (wire bytes
+    %% are deflate-compressed); validation runs on the inflated
+    %% payload at FIN. Verifies the post_finalize_validate path.
+    Self = self(),
+    Tag = make_ref(),
+    %% Compress a payload containing an invalid UTF-8 byte (0xFF).
+    Compressed = pmd_compress(<<"hi", 16#FF>>),
+    F = pmd_frame(text, Compressed),
+    Sink = spawn_active_sink(Self, Tag, [{recv, F}]),
+    Negotiated = pmd_negotiated(),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    ?assertEqual(<<16#88, 2, 1007:16>>, iolist_to_binary(collect_sends(Tag, 100))),
+    Sink ! stop.
+
+surrogate_pair_in_utf8_closes_immediately_test() ->
+    %% ED A0 starts a sequence that would decode to U+D800 — a
+    %% surrogate, banned in UTF-8 (RFC 3629 §3). Validates the
+    %% surrogate-detection branch of incomplete_is_provably_invalid.
+    Self = self(),
+    Tag = make_ref(),
+    F1 = uncompressed_fragment(text, <<"hi", 16#ED>>, false),
+    F2 = uncompressed_fragment(continuation, <<16#A0>>, false),
+    Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertEqual(<<16#88, 2, 1007:16>>, Sent),
+    Sink ! stop.
+
 invalid_utf8_mid_fragment_closes_immediately_test() ->
     %% Multi-fragment text message; second fragment introduces an
     %% invalid UTF-8 byte. Close 1007 immediately on the second
