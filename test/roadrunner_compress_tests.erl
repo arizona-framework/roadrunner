@@ -35,11 +35,34 @@ compresses_when_gzip_listed_among_others_test() ->
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
 
 skips_when_only_other_encodings_offered_test() ->
-    Req = req([{~"accept-encoding", ~"br, deflate"}]),
+    %% `br` is not supported (would require a Brotli NIF dep). When it's
+    %% the only offer, no compression engages.
+    Req = req([{~"accept-encoding", ~"br"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
     {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
     ?assertEqual(undefined, header(~"content-encoding", Headers)).
+
+compresses_with_deflate_when_only_deflate_offered_test() ->
+    Req = req([{~"accept-encoding", ~"deflate"}]),
+    Body = big_body(),
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    ?assertEqual(~"deflate", header(~"content-encoding", Headers)),
+    ?assertEqual(~"Accept-Encoding", header(~"vary", Headers)),
+    %% RFC 9110 §8.4.1.3: deflate = zlib data format (RFC 1950) — round-
+    %% trip via `zlib:uncompress/1`, NOT `zlib:unzip/1` (which expects
+    %% raw deflate without the zlib header).
+    ?assertEqual(iolist_to_binary(Body), zlib:uncompress(iolist_to_binary(OutBody))).
+
+prefers_gzip_when_both_gzip_and_deflate_offered_test() ->
+    %% Tie-break: gzip wins. See moduledoc rationale.
+    Req = req([{~"accept-encoding", ~"deflate, gzip"}]),
+    Body = big_body(),
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    ?assertEqual(~"gzip", header(~"content-encoding", Headers)),
+    ?assertEqual(iolist_to_binary(Body), zlib:gunzip(iolist_to_binary(OutBody))).
 
 skips_when_response_already_encoded_test() ->
     %% Handler set Content-Encoding itself (e.g. served a pre-compressed asset).
@@ -154,6 +177,26 @@ stream_response_wrapped_with_gzip_test() ->
     WrappedFun(Capture),
     Compressed = collect_chunks(),
     ?assertEqual(~"hello world", zlib:gunzip(Compressed)).
+
+stream_response_wrapped_with_deflate_test() ->
+    %% Same as the gzip stream wrap test but for `Accept-Encoding: deflate`.
+    %% Round-trip via `zlib:uncompress/1` (zlib-wrapped, not raw).
+    Req = req([{~"accept-encoding", ~"deflate"}]),
+    Self = self(),
+    Fun = fun(Send) ->
+        ok = Send(~"hello ", nofin),
+        ok = Send(~"world", fin)
+    end,
+    Next = fun(R) -> {{stream, 200, [], Fun}, R} end,
+    {{stream, 200, Headers, WrappedFun}, _Req2} = roadrunner_compress:call(Req, Next),
+    ?assertEqual(~"deflate", header(~"content-encoding", Headers)),
+    Capture = fun(Data, _Flag) ->
+        Self ! {chunk, iolist_to_binary(Data)},
+        ok
+    end,
+    WrappedFun(Capture),
+    Compressed = collect_chunks(),
+    ?assertEqual(~"hello world", zlib:uncompress(Compressed)).
 
 stream_response_wrapped_with_gzip_passes_trailers_test() ->
     %% `{fin, Trailers}` finishes the deflate (just like `fin`) and
