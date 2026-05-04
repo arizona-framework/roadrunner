@@ -9,9 +9,6 @@
    ],
    "cases": ["*"],
    "exclude-cases": [
-      "9.*",
-      "12.1.*",
-      "12.2.*",
       "13.3.*"
    ],
    "exclude-agent-cases": {}

@@ -20,6 +20,12 @@
 -define(LISTENER, autobahn_listener).
 -define(DOCKER_IMAGE, "crossbario/autobahn-testsuite:latest").
 
+%% Most listeners ship a 10 MB content-length cap by default; the
+%% Autobahn 9.* category drives messages up to 16 MB. Bump for the
+%% conformance run so those cases aren't artificially failed by our
+%% own framework guard.
+-define(AUTOBAHN_MAX_CONTENT_LENGTH, 32 * 1024 * 1024).
+
 main(Args) ->
     Opts = parse_args(Args),
     ProjectDir = project_dir(),
@@ -28,7 +34,8 @@ main(Args) ->
     {ok, _} = application:ensure_all_started(roadrunner),
     {ok, _} = roadrunner:start_listener(?LISTENER, #{
         port => Port,
-        handler => roadrunner_autobahn_handler
+        handler => roadrunner_autobahn_handler,
+        max_content_length => ?AUTOBAHN_MAX_CONTENT_LENGTH
     }),
     BoundPort = roadrunner_listener:port(?LISTENER),
     io:format("autobahn|testsuite — roadrunner WS conformance~n"),
