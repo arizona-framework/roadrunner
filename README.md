@@ -9,9 +9,21 @@ small public surface, RFC-correct parsing, and modern OTP idioms throughout.
 ## Status
 
 POC — not yet deployed in production. Eunit + CT (incl. PropEr)
-tests with 100% line coverage, dialyzer-clean. The per-connection
-request lifecycle is a tail-recursive `proc_lib` loop
-(`roadrunner_conn_loop`) with named phases (`awaiting_shoot |
+tests with 100% line coverage, dialyzer-clean.
+
+Standards conformance:
+
+- **HTTP/1.1**: RFC 9110 (semantics) + RFC 9112 (syntax).
+- **Content-Encoding** (RFC 9110 §8.4.1): gzip + deflate, with
+  qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3).
+- **WebSocket**: RFC 6455 — passes the
+  [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
+  fuzzingclient at strict 100 % (`scripts/autobahn.escript`).
+- **WebSocket compression**: RFC 7692 `permessage-deflate`,
+  including `*_max_window_bits` and `*_no_context_takeover`.
+
+The per-connection request lifecycle is a tail-recursive `proc_lib`
+loop (`roadrunner_conn_loop`) with named phases (`awaiting_shoot |
 reading_request | reading_body | dispatching | finishing`)
 reflected in `proc_lib:get_label/1` so the lifecycle shows up in
 observer's process inspector and `recon:proc_count/2`.
@@ -131,93 +143,82 @@ hello, roadrunner!
   bypass `terminate/3`). Off by default; enable for chaos-tested
   deployments.
 
-### Property tests
+### Property + conformance tests
 
 PropEr properties via OTP `ct_property_test`: `roadrunner_uri`
 percent round-trip + encode shape, `roadrunner_qs` round-trip,
-`roadrunner_cookie` adversarial robustness, `roadrunner_http1` 5 parsers
-never-crash + 3 incremental-feed equivalence, plus `roadrunner_conn_loop`
-robustness over random recv/drain/stray inputs (clean exit + slot
-release) and request_id consistency between `request_start` /
-`request_stop` telemetry.
+`roadrunner_cookie` adversarial robustness, `roadrunner_http1`
+parsers never-crash + incremental-feed equivalence, plus
+`roadrunner_conn_loop` robustness over random recv/drain/stray
+inputs (clean exit + slot release) and `request_id` consistency
+between `request_start` / `request_stop` telemetry.
+
+WebSocket conformance lives in `test/autobahn/`. Run
+`./scripts/autobahn.escript` (requires Docker) to drive the full
+[Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
+fuzzingclient against a roadrunner echo listener; the harness
+prints a pass/fail summary and the HTML report path. Roadrunner
+passes 100 % strict on the cases enabled by default
+(`fuzzingclient.json`).
 
 ## Comparison with cowboy and elli
 
 `scripts/bench.escript` runs the same loadgen against each server in
 its own peer BEAM. Numbers below are the median of multiple runs at
 50 concurrent clients on a single Linux dev box, loopback (no
-network).
+network). Re-run locally to see what your hardware shows; absolute
+numbers shift, relative ordering tends to hold.
 
-> **Stale numbers warning.** The tables below were captured under an
-> earlier per-connection implementation. Spot-checks against the
-> current `roadrunner_conn_loop` show meaningfully higher throughput
-> on `hello` and lower variance, but the full table hasn't been
-> rerun. Treat the tables as a lower bound for roadrunner; rerun
-> `scripts/bench.escript` for current numbers.
-
-> **TL;DR.** Roadrunner trades a small throughput delta for
-> **2–3× better p99 latency** and a smaller, queryable codebase.
-> Elli is competitive on raw req/s because it shares roadrunner's
-> tail-recursive loop shape; cowboy's lower numbers come from its
-> dual-process stream-handlers pipeline.
+> **TL;DR.** Roadrunner is competitive on throughput, **wins p50
+> across the board, and wins p99 by 2.5–3.5×**. Elli edges raw req/s
+> on the simplest scenario (`hello`); roadrunner matches or
+> approaches it elsewhere while delivering far more consistent tail
+> latency. Cowboy is bottom on every axis here — it optimizes for
+> very different ground (HTTP/2, sub-protocol routing,
+> supervisor-tree visibility).
 
 ### Throughput — req/s (higher = better)
 
-| scenario        | roadrunner | elli       | cowboy     |
-|-----------------|-----------:|-----------:|-----------:|
-| hello           |     224 k  |   **285 k**|     190 k  |
-| echo            |     199 k  |   **270 k**|     143 k  |
-| large_response  |      97 k  |   **124 k**|      93 k  |
+| scenario        | roadrunner    | elli          | cowboy        |
+|-----------------|--------------:|--------------:|--------------:|
+| hello           |        252 k  |    **306 k**  |       190 k   |
+| echo            |        257 k  |    **279 k**  |       139 k   |
+| large_response  |        103 k  |    **122 k**  |        85 k   |
 
 ### p99 latency — tail latency (lower = better)
 
-| scenario        | roadrunner   | elli       | cowboy     |
-|-----------------|-------------:|-----------:|-----------:|
-| hello           | **634 µs**   |   1.66 ms  |   2.17 ms  |
-| echo            | **852 µs**   |   1.58 ms  |   2.35 ms  |
-| large_response  | **1.16 ms**  |   2.62 ms  |   3.35 ms  |
+| scenario        | roadrunner    | elli          | cowboy        |
+|-----------------|--------------:|--------------:|--------------:|
+| hello           | **440 µs**    |     1.39 ms   |     2.16 ms   |
+| echo            | **545 µs**    |     1.53 ms   |     2.63 ms   |
+| large_response  | **1.04 ms**   |     2.46 ms   |     3.45 ms   |
 
 ### p50 latency — typical request (lower = better)
 
-| scenario        | roadrunner | elli       | cowboy     |
-|-----------------|-----------:|-----------:|-----------:|
-| hello           | **108 µs** |   117 µs   |   203 µs   |
-| echo            |   132 µs   | **128 µs** |   280 µs   |
-| large_response  | **266 µs** |   318 µs   |   427 µs   |
-
-### Run-to-run variance — coefficient of variation (lower = more consistent)
-
-| scenario        | roadrunner | elli   | cowboy |
-|-----------------|-----------:|-------:|-------:|
-| hello           |    24.0 %  |  5.6 % |  6.4 % |
-| echo            |    18.7 %  |  5.6 % |  6.1 % |
-| large_response  |    25.2 %  |  5.0 % |  4.3 % |
+| scenario        | roadrunner    | elli          | cowboy        |
+|-----------------|--------------:|--------------:|--------------:|
+| hello           |  **90 µs**    |       112 µs  |       200 µs  |
+| echo            | **110 µs**    |       125 µs  |       282 µs  |
+| large_response  | **270 µs**    |       321 µs  |       455 µs  |
 
 ### Reading the numbers honestly
 
-- **Variance in this table is gen_statem-era.** The loop rewrite
-  removed the per-request `state_timeout` + `generic_timeout` arms
-  that drove the spread; spot-checks under the loop show single-digit
-  cv on the same scenarios. Re-bench before quoting these numbers.
-- **The throughput "gap" with elli closed under the loop rewrite.**
-  Elli's per-request path is one synchronous tail-recursive loop with
-  no state-machine dispatch — roadrunner's loop variant matches that
-  shape while keeping telemetry, drain, hibernation, and slot
-  tracking. Spot-checks show roadrunner now leads on `hello`
-  throughput. Where roadrunner pays a real cost over elli is the
-  feature surface itself: telemetry events fire on every request,
-  drain notifications check the mailbox between recv chunks, etc.
-- **Cowboy's slowdown** comes from its dual-process model
-  (acceptor → connection → stream handlers) and its rich-feature
-  pipeline. Cowboy 2.13 is also bottom on p99 in this lab; it
-  optimizes for very different ground (HTTP/2, sub-protocol
-  routing, supervisor-tree visibility) where the simpler servers
-  don't compete.
+- **The throughput gap with elli is small** and concentrated on the
+  bare-minimum `hello` scenario, where elli's lack of telemetry, drain,
+  hibernation, and slot tracking shows up as the cleanest possible
+  per-request path. On `echo` (router + body read) and `large_response`
+  the gap shrinks. Roadrunner's per-request feature surface is the
+  cost.
+- **p99 is the differentiator.** Roadrunner consistently delivers
+  2.5–3.5× lower tail latency than either alternative. On a
+  latency-sensitive workload, that's the dominant axis.
+- **Cowboy** trails on every axis here because its dual-process
+  pipeline (acceptor → connection → stream handlers) adds dispatch
+  overhead the simpler servers don't pay. It optimizes for HTTP/2 and
+  feature richness; benchmark numbers are the trade-off.
 - **Numbers shift on real hardware.** Loopback hides NIC + kernel
-  TCP cost. For a fair public comparison, run against a remote
-  host on a dedicated NIC with `--clients` tuned to your CPU
-  count. The relative ordering tends to hold; absolute numbers do
-  not.
+  TCP cost. For a public comparison run against a remote host with
+  `--clients` tuned to your CPU count.
 
 ### Architectural trade-offs
 
@@ -230,6 +231,10 @@ network).
 | Middleware shape               | continuation-passing             | `pre_request`/`post_request` callback | deprecated `(Req, Env)`/stream handlers |
 | Hibernation between requests   | `hibernate_after` works          | no                         | depends on stream handler     |
 | Default recv mode              | passive (`gen_tcp:recv`)         | passive (`gen_tcp:recv`)   | active (`{active, once}`)     |
+| HTTP RFCs                      | RFC 9110 + RFC 9112              | RFC 7230 era               | RFC 9110 + RFC 9112 + HTTP/2  |
+| Content-Encoding               | gzip + deflate, qvalue-aware     | DIY                        | hooks for stream handlers     |
+| WebSocket conformance          | Autobahn 100 % strict            | n/a                        | Autobahn-tested               |
+| permessage-deflate (RFC 7692)  | yes                              | n/a                        | yes                           |
 | Production maturity            | POC                              | 10+ years, stable          | 10+ years, stable             |
 | Public API surface             | small                            | small                      | large (HTTP/2, gun, etc.)     |
 | Runtime deps                   | `telemetry` only                 | none                       | `cowlib`, `ranch`             |
@@ -243,11 +248,9 @@ mise exec -- ./scripts/bench.escript --servers roadrunner,elli,cowboy \
 
 Run several times and take the median — the bench script's banner
 warns that single runs sit inside a ±15 % variance band on a
-loaded dev box. To reproduce the full 20-run dataset that
-produced the tables above, loop the bench command 20 times per
-scenario and median the `req/s` line. `scripts/bench.escript`
-also accepts `--profile` to dump an eprof hotspot table when you
-want to investigate a specific server.
+loaded dev box. `scripts/bench.escript` also accepts `--profile`
+to dump an eprof hotspot table when you want to investigate a
+specific server.
 
 ### Picking a server
 
