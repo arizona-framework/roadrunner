@@ -330,15 +330,15 @@ to dump an eprof hotspot table when you want to investigate a
 specific server.
 
 `scripts/bench.escript --protocol h2` drives the same scenarios
-over HTTP/2 via [h2load](https://nghttp2.org/documentation/h2load.1.html)
-(from `nghttp2-tools`, install via `pacman -S nghttp2` /
-`apt install nghttp2-client` / `brew install nghttp2`). h2load is
-a dev-only dep; roadrunner itself stays at zero non-`telemetry`
-runtime deps. h2 vs h1 numbers are workload-shape-sensitive:
-small responses at high concurrency typically favor h2
-(single-connection multiplexing); single-request latency may
-favor h1 (no frame demux). Run both directions on the same
-hardware before claiming a win.
+over HTTP/2. The h2 loadgen is the in-tree pure-Erlang
+`roadrunner_bench_client` (lives in `test/` because it's only used
+by dev tools); no external h2 client / loadgen needs to be
+installed. h2 vs h1 numbers are workload-shape-sensitive: small
+responses at high concurrency typically favor h2 (single-connection
+multiplexing — note that this bench uses one connection per worker
+so it measures protocol framing overhead, not multiplexing benefit);
+single-request latency may favor h1 (no frame demux). Run both
+directions on the same hardware before claiming a win.
 
 ### Picking a server
 

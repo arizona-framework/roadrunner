@@ -8,16 +8,14 @@
 %%% `hello` scenario, or POST /echo with 256-byte body echoed for the
 %%% `echo` scenario.
 %%%
-%%% Two protocols are supported:
-%%%   --protocol h1 (default): pure-Erlang loadgen over plain TCP
-%%%       with 50 keep-alive workers (one TCP connection per worker).
-%%%   --protocol h2: shells out to `h2load` (nghttp2-tools) against
-%%%       a TLS h2 listener. elli is filtered automatically — no h2
-%%%       support there. h2load is a dev-only dep (not a runtime
-%%%       roadrunner dep); we use it because it's the canonical h2
-%%%       benchmarking tool and its C-level event loop avoids the
-%%%       latency artifacts that an Erlang-side ssl recv loop runs
-%%%       into for h2's small per-frame TCP traffic patterns.
+%%% Two protocols are supported, both via the same pure-Erlang
+%%% `roadrunner_bench_client` worker pool:
+%%%   --protocol h1 (default): plain TCP, one keep-alive connection
+%%%       per worker.
+%%%   --protocol h2: TLS + ALPN h2, one keep-alive connection per
+%%%       worker, in-tree codec via `roadrunner_http2_frame` +
+%%%       `roadrunner_http2_hpack`. elli is filtered automatically
+%%%       — no h2 support there.
 %%%
 %%% Honest comparison conditions:
 %%%   - Same handler shape (no per-server bonus telemetry, gzip, etc).
@@ -70,49 +68,33 @@ main(Args) ->
     Results = [{S, element(2, run_side(S, Opts))} || S <- Servers],
     print_summary(Results).
 
-%% Validate environment for the chosen protocol, drop incompatible
-%% servers, and stash any per-protocol scratch (cert paths, h2load
-%% binary location). Halts with a clear message on tool gaps.
+%% Validate environment for the chosen protocol and drop
+%% incompatible servers. The h2 path needs a TLS cert (auto-
+%% generated) and elli filtered out (no h2 support).
 %%
-%% h2 path uses h2load (nghttp2-tools) as the loadgen. A
-%% pure-Erlang h2 client would avoid the dep but the version we
-%% prototyped surfaced a 40 ms-per-request artifact under
-%% peer-BEAM bench setups (kernel TCP delayed-ACK timer combined
-%% with our ssl recv pattern); h2load doesn't hit it because its
-%% C-level event loop drives reads/writes differently. h2load is
-%% the canonical h2 benchmarking tool — using it removes the
-%% measurement-fidelity question. Bench is a dev-time script, so
-%% an external dep here doesn't violate the runtime "telemetry
-%% only" policy.
+%% h2 loadgen is `roadrunner_bench_client` — the same in-tree
+%% client the eunit suite covers — so we don't take an external
+%% dep, and the latency model matches the h1 path (per-request
+%% nanosecond timing → real p50/p95/p99). The earlier 40 ms-per-
+%% request artifact that pushed us toward h2load was a server-side
+%% Nagle interaction; that's now fixed at the listener layer
+%% (`roadrunner_listener:base_listen_opts/0`).
 preflight_protocol(#{protocol := h1} = Opts) ->
     Opts;
 preflight_protocol(#{protocol := h2, servers := Servers} = Opts) ->
-    case os:find_executable("h2load") of
-        false ->
+    CertDir = generate_test_cert(),
+    Filtered = [S || S <- Servers, S =/= elli],
+    case Filtered =/= Servers of
+        true ->
             io:format(
-                standard_error,
-                "error: --protocol h2 requires `h2load` from nghttp2-tools.~n"
-                "       on Arch:    sudo pacman -S nghttp2~n"
-                "       on Debian:  sudo apt install nghttp2-client~n"
-                "       on macOS:   brew install nghttp2~n",
+                "note: --protocol h2 — elli filtered out (no HTTP/2 support)~n",
                 []
-            ),
-            halt(2);
-        H2load ->
-            CertDir = generate_test_cert(),
-            Filtered = [S || S <- Servers, S =/= elli],
-            case Filtered =/= Servers of
-                true ->
-                    io:format(
-                        "note: --protocol h2 — elli filtered out (no HTTP/2 support)~n",
-                        []
-                    );
-                false ->
-                    ok
-            end,
-            {ok, _} = application:ensure_all_started(ssl),
-            Opts#{servers => Filtered, cert_dir => CertDir, h2load => H2load}
-    end.
+            );
+        false ->
+            ok
+    end,
+    {ok, _} = application:ensure_all_started(ssl),
+    Opts#{servers => Filtered, cert_dir => CertDir}.
 
 generate_test_cert() ->
     Dir = string:trim(os:cmd("mktemp -d")),
@@ -236,12 +218,12 @@ cli() ->
                 default => h1,
                 help =>
                     """
-                    Wire protocol to drive the load over.
-                      h1: pure-Erlang loadgen over plain TCP (default).
-                      h2: shells out to h2load (from nghttp2-tools)
-                          against a TLS h2 listener. elli is filtered
-                          out automatically (no h2 support); only
-                          roadrunner + cowboy run.
+                    Wire protocol to drive the load over. Both paths
+                    use the in-tree pure-Erlang `roadrunner_bench_client`
+                    — no external loadgen tool required.
+                      h1: plain TCP, one keep-alive connection per worker.
+                      h2: TLS + ALPN h2. elli is filtered automatically
+                          (no h2 support); only roadrunner + cowboy run.
                     """
             }
         ]
@@ -529,7 +511,7 @@ run_measured(Port, #{duration_s := D} = Opts) ->
 run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
     run_phase_h1(Port, Opts, DurationMs);
 run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
-    run_phase_h2load(Port, Opts, DurationMs).
+    run_phase_h2(Port, Opts, DurationMs).
 
 run_phase_h1(Port, #{clients := C, host := Host, scenario := Scenario}, DurationMs) ->
     Deadline = erlang:monotonic_time(millisecond) + DurationMs,
@@ -640,101 +622,68 @@ bump_err(#{err := E} = Acc) ->
     Acc#{err := E + 1}.
 
 %% ===========================================================================
-%% h2 loadgen — shells out to h2load (nghttp2-tools) and parses its
-%% summary. Returns the same `aggregate/2`-shape result as the h1
-%% path so `result_to_row/2` doesn't care which loadgen produced
-%% the row.
-%%
-%% h2load doesn't print percentiles in the default summary — we
-%% map the reported `time for request` mean to all of
-%% mean/p50/p95/p99 so the row layout stays uniform. For real
-%% percentiles, run h2load with `--log-file=...` and post-process.
+%% h2 loadgen — pure-Erlang worker pool driving `roadrunner_bench_client`.
+%% Same shape as the h1 path: each worker holds one TLS+ALPN-h2
+%% connection, loops requests until the deadline, samples per-
+%% request nanoseconds. `clients` matches h1's parallel-request
+%% count for an apples-to-apples comparison; we don't multiplex
+%% N streams per connection so an h2 worker measures protocol
+%% framing overhead, not h2 multiplexing benefit.
 %% ===========================================================================
 
-run_phase_h2load(Port, #{clients := C, host := Host, scenario := Scenario, h2load := H2load}, DurationMs) ->
+run_phase_h2(Port, #{clients := C, host := Host, scenario := Scenario}, DurationMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    {Method, Path, ReqHeaders, ReqBody} = h2_request_shape(Scenario),
+    Self = self(),
     StartUs = erlang:monotonic_time(microsecond),
-    DurationS = max(1, DurationMs div 1000),
-    {Path, ExtraFlags} = h2load_request_shape(Scenario),
-    Url = io_lib:format("https://~s:~B~s", [Host, Port, Path]),
-    %% h2load -D <seconds>: duration mode (matches our --duration).
-    %% -c <conn>: total concurrent TLS connections.
-    %% -m 100: max concurrent streams per connection (h2 multiplexing).
-    %% -t <threads>: cap to half of online schedulers so the loadgen
-    %%   doesn't oversubscribe schedulers and starve the listener.
-    Threads = max(1, erlang:system_info(schedulers_online) div 2),
-    Cmd = lists:flatten(
-        io_lib:format(
-            "~s -D ~B -c ~B -m 100 -t ~B ~s~s 2>&1",
-            [H2load, DurationS, C, Threads, ExtraFlags, Url]
-        )
-    ),
-    Output = os:cmd(Cmd),
+    Workers = [
+        spawn_link(fun() ->
+            Self !
+                {self(),
+                    h2_worker_loop(
+                        Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, init_acc()
+                    )}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
     EndUs = erlang:monotonic_time(microsecond),
-    parse_h2load_output(Output, EndUs - StartUs).
+    aggregate(PerWorker, EndUs - StartUs).
 
-h2load_request_shape(hello) ->
-    {"/", ""};
-h2load_request_shape(echo) ->
-    %% h2load `-d FILE` sends FILE as the body of POST. /dev/zero
-    %% is a kernel-provided endless stream of NULs; h2load takes
-    %% only the first request-body's worth.
-    {"/echo", "-d /dev/zero -m 1 "};
-h2load_request_shape(large_response) ->
-    {"/large", ""}.
+h2_request_shape(hello) ->
+    {~"GET", ~"/", [], <<>>};
+h2_request_shape(echo) ->
+    {~"POST", ~"/echo", [{~"content-type", ~"application/octet-stream"}],
+        binary:copy(~"x", ?ECHO_BODY_SIZE)};
+h2_request_shape(large_response) ->
+    {~"GET", ~"/large", [], <<>>}.
 
-%% Parse h2load's text summary into the bench's standard result map.
-%% The mean `time for request` populates all of mean/p50/p95/p99 so
-%% the row formatter renders consistently.
-parse_h2load_output(Output, ElapsedUs) ->
-    Total = parse_h2load_int(Output, "\\s+(\\d+)\\s+done\\b"),
-    Errors =
-        parse_h2load_int(Output, "\\s+(\\d+)\\s+failed\\b") +
-            parse_h2load_int(Output, "\\s+(\\d+)\\s+errored\\b") +
-            parse_h2load_int(Output, "\\s+(\\d+)\\s+timeout\\b"),
-    MeanNs = parse_h2load_request_mean(Output),
-    Latencies =
-        case MeanNs of
-            undefined -> [];
-            _ -> [MeanNs]
-        end,
-    #{
-        total => max(Total, 0),
-        errors => max(Errors, 0),
-        bytes_in => 0,
-        latencies_ns => Latencies,
-        elapsed_us => ElapsedUs
-    }.
-
-parse_h2load_int(Output, Pattern) ->
-    case re:run(Output, Pattern, [{capture, [1], list}]) of
-        {match, [N]} -> list_to_integer(N);
-        _ -> 0
+h2_worker_loop(Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->
+    case roadrunner_bench_client:open(Host, Port, h2) of
+        {ok, Conn} ->
+            h2_keep_alive_loop(Conn, Method, Path, ReqHeaders, ReqBody, Deadline, Acc);
+        {error, _} ->
+            bump_err(Acc)
     end.
 
-%% h2load: `time for request:    Xus    Yus    Zus    sd  +/- sd`.
-%% Column 3 is the mean. Values may carry `us` / `ms` / `s` per
-%% h2load's autoscale.
-parse_h2load_request_mean(Output) ->
-    case
-        re:run(
-            Output,
-            "time for request:\\s+\\S+\\s+\\S+\\s+(\\d+(?:\\.\\d+)?)\\s*(us|ms|s)\\b",
-            [{capture, [1, 2], list}]
-        )
-    of
-        {match, [V, U]} -> h2load_to_ns(V, U);
-        _ -> undefined
-    end.
-
-h2load_to_ns(V, "us") -> round(list_to_float_or_int(V) * 1000);
-h2load_to_ns(V, "ms") -> round(list_to_float_or_int(V) * 1000000);
-h2load_to_ns(V, "s") -> round(list_to_float_or_int(V) * 1000000000).
-
-list_to_float_or_int(S) ->
-    try list_to_float(S) of
-        F -> F
-    catch
-        error:badarg -> list_to_integer(S) * 1.0
+h2_keep_alive_loop(Conn, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            _ = roadrunner_bench_client:close(Conn),
+            Acc;
+        false ->
+            T0 = erlang:monotonic_time(nanosecond),
+            case roadrunner_bench_client:request(Conn, Method, Path, ReqHeaders, ReqBody) of
+                {ok, 200, _RespHeaders, RespBody, Conn1} ->
+                    T1 = erlang:monotonic_time(nanosecond),
+                    h2_keep_alive_loop(
+                        Conn1, Method, Path, ReqHeaders, ReqBody, Deadline,
+                        bump_ok(Acc, T1 - T0, byte_size(RespBody))
+                    );
+                _Other ->
+                    _ = roadrunner_bench_client:close(Conn),
+                    bump_err(Acc)
+            end
     end.
 
 aggregate(PerWorker, ElapsedUs) ->
