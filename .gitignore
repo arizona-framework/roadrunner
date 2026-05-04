@@ -18,3 +18,4 @@ logs
 *.iml
 rebar3.crashdump
 *~
+test/autobahn/reports/
