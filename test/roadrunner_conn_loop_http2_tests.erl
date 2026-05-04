@@ -34,7 +34,12 @@ all_test_() ->
         fun malformed_hpack_block_triggers_goaway/0,
         fun missing_pseudo_header_rst_stream/0,
         fun empty_body_response_omits_data_frame/0,
-        fun stream_response_returns_501/0,
+        fun stream_response_emits_data/0,
+        fun stream_response_no_explicit_fin_auto_closes/0,
+        fun stream_response_empty_fin_emits_empty_data/0,
+        fun stream_response_with_trailers/0,
+        fun stream_response_trailers_only/0,
+        fun stream_response_skips_empty_nofin/0,
         fun loop_response_returns_501/0,
         fun sendfile_response_returns_501/0,
         fun websocket_response_returns_501/0,
@@ -478,8 +483,67 @@ empty_body_response_omits_data_frame() ->
     {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/empty"),
     cleanup(Pid, Ref).
 
-stream_response_returns_501() ->
-    {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/stream"),
+stream_response_emits_data() ->
+    %% Handler: `Send(~"hello ", nofin), Send(~"world", fin)`.
+    %% Expect HEADERS (no END_STREAM), DATA (no END_STREAM, "hello "),
+    %% DATA (END_STREAM, "world").
+    {Pid, Ref} = run_stream_request(~"/stream"),
+    Frames = collect_response_frames(),
+    ?assertMatch([{headers, 1, false} | _], Frames),
+    [_, F2, F3] = Frames,
+    ?assertEqual({data, 1, false, ~"hello "}, F2),
+    ?assertEqual({data, 1, true, ~"world"}, F3),
+    cleanup(Pid, Ref).
+
+stream_response_no_explicit_fin_auto_closes() ->
+    %% Handler returns without ever calling Send — server auto-emits
+    %% an empty DATA frame with END_STREAM.
+    {Pid, Ref} = run_stream_request(~"/stream/empty"),
+    Frames = collect_response_frames(),
+    ?assertEqual([{headers, 1, false}, {data, 1, true, ~""}], Frames),
+    cleanup(Pid, Ref).
+
+stream_response_empty_fin_emits_empty_data() ->
+    %% Handler: `Send(~"", fin)` — emits empty DATA with END_STREAM.
+    {Pid, Ref} = run_stream_request(~"/stream/empty-fin"),
+    Frames = collect_response_frames(),
+    ?assertEqual([{headers, 1, false}, {data, 1, true, ~""}], Frames),
+    cleanup(Pid, Ref).
+
+stream_response_with_trailers() ->
+    %% `Send(~"hi", {fin, [{x-checksum, deadbeef}]})` — emits a DATA
+    %% frame (no END_STREAM) followed by a HEADERS trailer frame
+    %% (END_STREAM).
+    {Pid, Ref} = run_stream_request(~"/stream/trailers"),
+    Frames = collect_response_frames(),
+    ?assertMatch(
+        [{headers, 1, false}, {data, 1, false, ~"hi"}, {headers, 1, true}],
+        Frames
+    ),
+    cleanup(Pid, Ref).
+
+stream_response_trailers_only() ->
+    %% `Send(~"", {fin, Trailers})` — only a trailer HEADERS frame.
+    {Pid, Ref} = run_stream_request(~"/stream/trailers-only"),
+    Frames = collect_response_frames(),
+    ?assertMatch([{headers, 1, false}, {headers, 1, true}], Frames),
+    cleanup(Pid, Ref).
+
+stream_response_skips_empty_nofin() ->
+    %% `Send(~"a", nofin), Send(~"", nofin), Send(~"b", nofin),
+    %%  Send(~"c", fin)` — the `~""` middle call must be silently
+    %% dropped. Three DATA frames in total.
+    {Pid, Ref} = run_stream_request(~"/stream/many"),
+    Frames = collect_response_frames(),
+    ?assertEqual(
+        [
+            {headers, 1, false},
+            {data, 1, false, ~"a"},
+            {data, 1, false, ~"b"},
+            {data, 1, true, ~"c"}
+        ],
+        Frames
+    ),
     cleanup(Pid, Ref).
 
 loop_response_returns_501() ->
@@ -853,6 +917,84 @@ run_h2_request_with_handler(Handler, Path) ->
     _ = expect_send(),
     _ = drain_send(50),
     {Pid, Ref}.
+
+%% Drive a GET against `Path` and return the conn pid + ref. Unlike
+%% `run_h2_request_with_handler`, leaves the response frames in our
+%% mailbox so the test can decode + assert on them via
+%% `collect_response_frames/0`.
+run_stream_request(Path) ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    Self = self(),
+    Counter = atomics:new(1, [{signed, false}]),
+    ok = atomics:add(Counter, 1, 1),
+    ProtoOpts = #{
+        client_counter => Counter,
+        listener_name => h2_stream_test,
+        dispatch => {handler, roadrunner_h2_test_handler},
+        middlewares => []
+    },
+    Sock = {fake, Self},
+    Pid = spawn(fun() ->
+        receive
+            ready -> ok
+        end,
+        roadrunner_conn_loop_http2:enter(
+            Sock, ProtoOpts, h2_stream_test, undefined, erlang:monotonic_time()
+        )
+    end),
+    Ref = monitor(process, Pid),
+    Pid ! ready,
+    _ = expect_send(),
+    serve_recv(Pid, ?PREFACE),
+    serve_recv(Pid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"localhost"},
+            {~":path", Path}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    Hf = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(Pid, Hf),
+    {Pid, Ref}.
+
+%% Pull every `roadrunner_fake_send` payload off the mailbox until
+%% there's a 50 ms quiet period, then parse the concatenated bytes
+%% into structural frame tags suitable for assertions:
+%%   {headers, StreamId, EndStream}
+%%   {data, StreamId, EndStream, Payload}
+collect_response_frames() ->
+    Bin = collect_send_bytes(<<>>),
+    parse_frames(Bin).
+
+collect_send_bytes(Acc) ->
+    receive
+        {roadrunner_fake_send, _Pid, Data} ->
+            collect_send_bytes(<<Acc/binary, (iolist_to_binary(Data))/binary>>)
+    after 100 ->
+        Acc
+    end.
+
+parse_frames(<<>>) ->
+    [];
+parse_frames(<<Len:24, Type, Flags, _R:1, StreamId:31, Body:Len/binary, Rest/binary>>) ->
+    EndStream = (Flags band 16#01) =/= 0,
+    case Type of
+        0 ->
+            [{data, StreamId, EndStream, Body} | parse_frames(Rest)];
+        1 ->
+            [{headers, StreamId, EndStream} | parse_frames(Rest)];
+        _ ->
+            [{other, Type, StreamId, EndStream} | parse_frames(Rest)]
+    end.
 
 drive_simple_get(Pid) ->
     _ = expect_send(),

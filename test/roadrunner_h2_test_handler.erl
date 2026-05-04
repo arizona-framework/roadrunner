@@ -14,7 +14,51 @@ shape.
 handle(#{target := ~"/empty"} = Req) ->
     {{200, [], ~""}, Req};
 handle(#{target := ~"/stream"} = Req) ->
+    {
+        {stream, 200, [{~"content-type", ~"text/plain"}], fun(Send) ->
+            Send(~"hello ", nofin),
+            Send(~"world", fin)
+        end},
+        Req
+    };
+handle(#{target := ~"/stream/empty"} = Req) ->
     {{stream, 200, [], fun(_Send) -> ok end}, Req};
+handle(#{target := ~"/stream/empty-fin"} = Req) ->
+    {{stream, 200, [], fun(Send) -> Send(~"", fin) end}, Req};
+handle(#{target := ~"/stream/trailers"} = Req) ->
+    {
+        {stream, 200, [{~"trailer", ~"x-checksum"}], fun(Send) ->
+            Send(~"hi", {fin, [{~"x-checksum", ~"deadbeef"}]})
+        end},
+        Req
+    };
+handle(#{target := ~"/stream/trailers-only"} = Req) ->
+    {
+        {stream, 200, [{~"trailer", ~"x-checksum"}], fun(Send) ->
+            Send(~"", {fin, [{~"x-checksum", ~"none"}]})
+        end},
+        Req
+    };
+handle(#{target := ~"/stream/many"} = Req) ->
+    {
+        {stream, 200, [], fun(Send) ->
+            Send(~"a", nofin),
+            Send(~"", nofin),
+            Send(~"b", nofin),
+            Send(~"c", fin)
+        end},
+        Req
+    };
+handle(#{target := ~"/stream/large"} = Req) ->
+    %% 100 KiB across two emissions — triggers flow-control
+    %% blocking when send window is artificially shrunk.
+    {
+        {stream, 200, [], fun(Send) ->
+            Send(binary:copy(<<"x">>, 60_000), nofin),
+            Send(binary:copy(<<"x">>, 40_000), fin)
+        end},
+        Req
+    };
 handle(#{target := ~"/loop"} = Req) ->
     {{loop, 200, [], state}, Req};
 handle(#{target := ~"/sendfile"} = Req) ->

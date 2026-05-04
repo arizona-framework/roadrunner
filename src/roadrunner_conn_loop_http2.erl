@@ -18,7 +18,7 @@ Response shapes supported here:
 | shape | h5 |
 |---|---|
 | `{Status, Headers, Body}` (buffered) | yes |
-| `{stream, _}` | 501 (Phase H7) |
+| `{stream, _}` | yes (Phase H7) |
 | `{loop, _}` | 501 (later) |
 | `{sendfile, _}` | 501 (later) |
 | `{websocket, _}` | 501 (Phase H13) |
@@ -27,6 +27,13 @@ The full frame demux + multiplexing arrives in Phase H8.
 """.
 
 -export([enter/5]).
+%% Helpers used by `roadrunner_http2_stream_response`. Not part of
+%% the public listener API.
+-export([
+    send_response_headers/4,
+    send_data_sync/3,
+    send_trailers/2
+]).
 
 %% RFC 9113 §3.4 client connection preface — fixed 24 bytes.
 -define(PREFACE, ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
@@ -491,8 +498,11 @@ emit_handler_response({Status, Headers, Body}, State) when
     is_integer(Status), Status >= 100, Status =< 599
 ->
     emit_response(Status, Headers, Body, State);
-emit_handler_response({stream, _, _, _}, State) ->
-    emit_501(State);
+emit_handler_response({stream, Status, Headers, Fun}, State) when
+    is_integer(Status), Status >= 100, Status =< 599, is_function(Fun, 1)
+->
+    State1 = roadrunner_http2_stream_response:run(State, Status, Headers, Fun),
+    frame_loop(State1#loop{stream = undefined});
 emit_handler_response({loop, _, _, _}, State) ->
     emit_501(State);
 emit_handler_response({sendfile, _, _, _}, State) ->
@@ -508,22 +518,43 @@ emit_501(State) ->
         State
     ).
 
-%% Encode + send a response: HEADERS (END_HEADERS) + DATA
-%% (END_STREAM). When body is empty, set END_STREAM on the
-%% HEADERS frame and skip DATA. Body bytes are chunked through
-%% the conn + stream send windows (RFC 9113 §6.9): if the body
-%% exceeds the available window, we wait for `WINDOW_UPDATE`
-%% before continuing.
-emit_response(
+%% Encode + send a buffered response: HEADERS (END_HEADERS) + one
+%% or more DATA frames terminated by END_STREAM. The body is
+%% delivered through the same flow-control machinery as `{stream,
+%% _}` responses — both call `send_data_sync/3`.
+emit_response(Status, Headers, Body0, State) ->
+    Body = iolist_to_binary(Body0),
+    EmptyBody = Body =:= <<>>,
+    State1 = send_response_headers(State, Status, Headers, EmptyBody),
+    State2 =
+        case EmptyBody of
+            true -> State1;
+            false -> send_data_sync(State1, Body, true)
+        end,
+    frame_loop(State2#loop{stream = undefined}).
+
+-doc """
+Encode the response HEADERS frame and write it on the wire.
+
+Sets `END_STREAM` when `EndStream` is `true` (zero-body responses
+or trailer-only responses where the entire payload fits in
+headers); otherwise the stream stays half-open for subsequent
+DATA / trailer frames.
+
+Returns the updated state with the new HPACK encoder context.
+""".
+-spec send_response_headers(
+    #loop{},
+    roadrunner_http:status(),
+    roadrunner_http:headers(),
+    boolean()
+) -> #loop{}.
+send_response_headers(
+    #loop{stream = #{id := StreamId}, hpack_enc = Enc} = State,
     Status,
     Headers,
-    Body0,
-    #loop{
-        stream = #{id := StreamId},
-        hpack_enc = Enc
-    } = State
+    EndStream
 ) ->
-    Body = iolist_to_binary(Body0),
     StatusBin = integer_to_binary(Status),
     %% Inject :status pseudo-header at the front; other pseudo-
     %% headers don't apply to responses (RFC 9113 §8.3.1).
@@ -532,52 +563,84 @@ emit_response(
     AllHeaders = [{~":status", StatusBin} | LowerHeaders],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     HpackBin = iolist_to_binary(HpackBlock),
-    State1 = State#loop{hpack_enc = Enc1},
-    case Body of
-        <<>> ->
-            %% No body — END_STREAM on HEADERS, no DATA frame
-            %% (and no flow-control consumption to track).
-            HeadersFrame = roadrunner_http2_frame:encode(
-                {headers, StreamId, 16#04 bor 16#01, undefined, HpackBin}
-            ),
-            _ = send(State1, HeadersFrame),
-            frame_loop(State1#loop{stream = undefined});
-        _ ->
-            HeadersFrame = roadrunner_http2_frame:encode(
-                {headers, StreamId, 16#04, undefined, HpackBin}
-            ),
-            _ = send(State1, HeadersFrame),
-            stream_data_chunks(Body, State1)
-    end.
+    Flags =
+        case EndStream of
+            true -> 16#04 bor 16#01;
+            false -> 16#04
+        end,
+    Frame = roadrunner_http2_frame:encode({headers, StreamId, Flags, undefined, HpackBin}),
+    _ = send(State, Frame),
+    State#loop{hpack_enc = Enc1}.
 
-%% Send `Body` as one or more DATA frames, blocking on
-%% WINDOW_UPDATE when either window won't fit the next chunk.
-%% The final chunk gets END_STREAM and the stream entry is
-%% cleared from the loop state.
--spec stream_data_chunks(binary(), #loop{}) -> no_return().
-stream_data_chunks(Body, #loop{stream = #{id := StreamId} = Stream} = State) ->
+-doc """
+Send `Body` as one or more DATA frames, blocking on WINDOW_UPDATE
+when either the conn or the stream send window can't fit the next
+chunk. The final chunk receives `END_STREAM` when `EndStream` is
+`true`; otherwise the stream remains half-open for further DATA
+or trailer frames.
+
+Returns the updated state with the consumed send-window quota.
+""".
+-spec send_data_sync(#loop{}, binary(), boolean()) -> #loop{}.
+send_data_sync(State, Body, EndStream) ->
+    stream_data_chunks(Body, EndStream, State).
+
+-doc """
+Send a trailer block as a HEADERS frame with both `END_HEADERS`
+and `END_STREAM` set (RFC 9113 §8.1). Header names are
+lowercased before HPACK encoding.
+
+Returns the updated state with the new HPACK encoder context.
+""".
+-spec send_trailers(#loop{}, roadrunner_http:headers()) -> #loop{}.
+send_trailers(
+    #loop{stream = #{id := StreamId}, hpack_enc = Enc} = State,
+    Trailers
+) ->
+    LowerTrailers = [{lowercase(N), V} || {N, V} <- Trailers],
+    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(LowerTrailers, Enc),
+    HpackBin = iolist_to_binary(HpackBlock),
+    Frame = roadrunner_http2_frame:encode(
+        {headers, StreamId, 16#04 bor 16#01, undefined, HpackBin}
+    ),
+    _ = send(State, Frame),
+    State#loop{hpack_enc = Enc1}.
+
+%% Send `Body` as DATA frames, returning State on completion.
+%% Blocks on WINDOW_UPDATE when stalled.
+-spec stream_data_chunks(binary(), boolean(), #loop{}) -> #loop{}.
+stream_data_chunks(<<>>, true, #loop{stream = #{id := StreamId}} = State) ->
+    %% Empty body but still need to close the stream — emit a
+    %% lone empty DATA frame with END_STREAM. Reached via
+    %% `Send(<<>>, fin)` from a stream-response handler.
+    Frame = roadrunner_http2_frame:encode({data, StreamId, 16#01, <<>>}),
+    _ = send(State, Frame),
+    State;
+stream_data_chunks(Body, EndStream, #loop{stream = #{id := StreamId} = Stream} = State) ->
     Available = window_budget(State, Stream),
     Take = min(min(byte_size(Body), Available), ?MAX_FRAME_SIZE),
     case Take of
         0 ->
             %% Both windows are zero (or one is) — wait for a
-            %% WINDOW_UPDATE that opens room. This blocks the
-            %% conn for Phase H6's serial mode; H8 will move
-            %% pending sends to per-stream workers.
-            wait_for_window(Body, State);
+            %% WINDOW_UPDATE that opens room.
+            wait_for_window(Body, EndStream, State);
         N when N =:= byte_size(Body) ->
-            %% This frame holds the rest of the body — END_STREAM
-            %% and close out.
-            Frame = roadrunner_http2_frame:encode({data, StreamId, 16#01, Body}),
+            %% This frame holds the rest of the body — set
+            %% END_STREAM only when the caller asked for it.
+            Flags =
+                case EndStream of
+                    true -> 16#01;
+                    false -> 0
+                end,
+            Frame = roadrunner_http2_frame:encode({data, StreamId, Flags, Body}),
             _ = send(State, Frame),
-            State1 = consume_send_window(State, Stream, N),
-            frame_loop(State1#loop{stream = undefined});
+            consume_send_window(State, Stream, N);
         N ->
             <<Chunk:N/binary, Rest/binary>> = Body,
             Frame = roadrunner_http2_frame:encode({data, StreamId, 0, Chunk}),
             _ = send(State, Frame),
             State1 = consume_send_window(State, Stream, N),
-            stream_data_chunks(Rest, State1)
+            stream_data_chunks(Rest, EndStream, State1)
     end.
 
 -spec window_budget(#loop{}, map()) -> non_neg_integer().
@@ -599,12 +662,13 @@ consume_send_window(#loop{conn_send_window = ConnW} = State, Stream, N) ->
 %% but only WINDOW_UPDATE / SETTINGS / PING make progress; the
 %% rest are sequenced in normally and resume here on the next
 %% receive (we re-call `stream_data_chunks` after applying the
-%% update).
--spec wait_for_window(binary(), #loop{}) -> no_return().
-wait_for_window(Body, State) ->
+%% update). Returns the updated state once the windows reopen and
+%% the body has been fully sent.
+-spec wait_for_window(binary(), boolean(), #loop{}) -> #loop{}.
+wait_for_window(Body, EndStream, State) ->
     case read_one_frame(State, ?IDLE_TIMEOUT) of
         {ok, Frame, State1} ->
-            handle_frame_during_send(Frame, Body, State1);
+            handle_frame_during_send(Frame, Body, EndStream, State1);
         {error, _} ->
             _ = send_goaway(State, protocol_error),
             exit_clean(State)
@@ -612,11 +676,20 @@ wait_for_window(Body, State) ->
 
 %% Same dispatch as `handle_frame/2` but for the subset of frame
 %% types that can legally arrive while we're stalled mid-response,
-%% with a return that resumes `stream_data_chunks/2` rather than
-%% the main frame loop.
+%% returning State (and resuming `stream_data_chunks/3`) rather
+%% than tail-calling the main frame loop.
+%%
+%% RST_STREAM for the active stream is the one case that doesn't
+%% return: the peer cancelled the in-flight response, so we exit
+%% the send loop entirely and re-enter the main `frame_loop` with
+%% the stream cleared.
+-spec handle_frame_during_send(
+    roadrunner_http2_frame:frame(), binary(), boolean(), #loop{}
+) -> #loop{}.
 handle_frame_during_send(
     {window_update, 0, Inc},
     Body,
+    EndStream,
     #loop{conn_send_window = W} = State
 ) ->
     case W + Inc of
@@ -624,11 +697,12 @@ handle_frame_during_send(
             _ = send_goaway(State, flow_control_error),
             exit_clean(State);
         N ->
-            stream_data_chunks(Body, State#loop{conn_send_window = N})
+            stream_data_chunks(Body, EndStream, State#loop{conn_send_window = N})
     end;
 handle_frame_during_send(
     {window_update, StreamId, Inc},
     Body,
+    EndStream,
     #loop{stream = #{id := StreamId} = Stream} = State
 ) ->
     case maps:get(send_window, Stream) + Inc of
@@ -636,26 +710,29 @@ handle_frame_during_send(
             _ = send_goaway(State, flow_control_error),
             exit_clean(State);
         N ->
-            stream_data_chunks(Body, State#loop{stream = Stream#{send_window := N}})
+            stream_data_chunks(
+                Body, EndStream, State#loop{stream = Stream#{send_window := N}}
+            )
     end;
-handle_frame_during_send({ping, 0, Opaque}, Body, State) ->
+handle_frame_during_send({ping, 0, Opaque}, Body, EndStream, State) ->
     _ = send(State, roadrunner_http2_frame:encode({ping, 1, Opaque})),
-    wait_for_window(Body, State);
-handle_frame_during_send({settings, 0, _}, Body, State) ->
+    wait_for_window(Body, EndStream, State);
+handle_frame_during_send({settings, 0, _}, Body, EndStream, State) ->
     _ = send(State, roadrunner_http2_frame:encode({settings, 1, []})),
-    wait_for_window(Body, State);
+    wait_for_window(Body, EndStream, State);
 handle_frame_during_send(
     {rst_stream, StreamId, _},
     _Body,
+    _EndStream,
     #loop{stream = #{id := StreamId}} = State
 ) ->
     %% Peer cancelled the stream we were streaming — drop the body
-    %% and resume the main loop.
+    %% and re-enter the main loop with the stream cleared.
     frame_loop(State#loop{stream = undefined});
-handle_frame_during_send(_Frame, Body, State) ->
+handle_frame_during_send(_Frame, Body, EndStream, State) ->
     %% Ping ACK / SETTINGS ACK / window updates for unknown
     %% streams / PRIORITY — ignore and keep waiting.
-    wait_for_window(Body, State).
+    wait_for_window(Body, EndStream, State).
 
 %% =============================================================================
 %% Helpers
