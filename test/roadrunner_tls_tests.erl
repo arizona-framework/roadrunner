@@ -61,15 +61,16 @@ cleanup(_) ->
 
 %% =============================================================================
 %% HTTP/2 ALPN dispatch — `http2_enabled => true` advertises `h2`,
-%% h2-capable clients reach `roadrunner_conn_loop_http2` (Phase H1 stub
-%% sends empty SETTINGS + GOAWAY and closes). h1 clients on the same
-%% listener still get the HTTP/1.1 path.
+%% h2-capable clients reach `roadrunner_conn_loop_http2`. Phase H2
+%% performs the connection-level handshake (preface + SETTINGS
+%% exchange + ACK) then GOAWAYs because streams aren't accepted yet.
+%% h1 clients on the same listener still get the HTTP/1.1 path.
 %% =============================================================================
 
 h2_alpn_dispatch_test_() ->
     {setup, fun setup_h2/0, fun cleanup_h2/1, fun({Port, ClientOpts}) ->
         [
-            {"h2 ALPN reaches the conn_loop_http2 stub (SETTINGS + GOAWAY)", fun() ->
+            {"h2 connection-level handshake completes then GOAWAYs", fun() ->
                 {ok, Sock} = ssl:connect(
                     {127, 0, 0, 1},
                     Port,
@@ -77,14 +78,20 @@ h2_alpn_dispatch_test_() ->
                     5000
                 ),
                 ?assertEqual({ok, ~"h2"}, ssl:negotiated_protocol(Sock)),
+                %% Drive the client side of the h2 handshake: send the
+                %% 24-byte preface plus an empty SETTINGS frame.
+                Preface = ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+                EmptySettings = <<0:24, 4, 0, 0:32>>,
+                ok = ssl:send(Sock, [Preface, EmptySettings]),
                 Reply = recv_until_closed(Sock),
-                %% Empty SETTINGS frame: 9-byte header (length=0, type=4,
-                %% flags=0, stream id=0).
-                ?assertMatch(<<0, 0, 0, 4, 0, 0, 0, 0, 0, _/binary>>, Reply),
-                %% GOAWAY follows: type 7, payload = last_stream_id 0 + error_code 0.
-                ?assertMatch(
-                    <<_:9/binary, 0, 0, 8, 7, 0, 0, 0, 0, 0, 0:32, 0:32>>,
-                    Reply
+                %% First frame from the server is its initial SETTINGS
+                %% (type=4, flags=0). Then SETTINGS ACK (flags=0x01,
+                %% length=0). Then GOAWAY (type=7, len=8).
+                ?assertMatch(<<_:24, 4, 0, 0:32, _/binary>>, Reply),
+                ?assertNotEqual(nomatch, binary:match(Reply, <<0:24, 4, 1, 0:32>>)),
+                ?assertNotEqual(
+                    nomatch,
+                    binary:match(Reply, <<0, 0, 8, 7, 0, 0:32, 0:32, 0:32>>)
                 ),
                 ok = ssl:close(Sock)
             end},
