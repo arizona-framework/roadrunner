@@ -400,6 +400,117 @@ handle_info_callback_close_terminates_session_test() ->
     Sink ! stop.
 
 %% =============================================================================
+%% Handler-driven close with status code + reason (RFC 6455 §5.5.1).
+%% =============================================================================
+
+close_with_code_emits_status_and_reason_test() ->
+    %% Handler returns `{close, 1000, ~"bye", State}` from init —
+    %% session must send a close frame whose payload is
+    %% <<1000:16, "bye">>.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_init => {close, 1000, ~"bye"}},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> ?assert(false)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 50)),
+    %% Frame: 0x88 (FIN+close), 5 (payload length), <<1000:16, "bye">>.
+    ?assertEqual(<<16#88, 5, 1000:16, "bye">>, Sent),
+    Sink ! stop.
+
+close_with_code_accepts_iodata_reason_test() ->
+    %% Reason is iodata per the type spec — pass an iolist that
+    %% iolist_to_binary flattens to <<"hello world">>.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_init => {close, 1001, [~"hello", ~" ", ~"world"]}},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> ?assert(false)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 50)),
+    ?assertEqual(<<16#88, 13, 1001:16, "hello world">>, Sent),
+    Sink ! stop.
+
+close_with_empty_reason_emits_only_code_test() ->
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_init => {close, 1000, ~""}},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> ?assert(false)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 50)),
+    ?assertEqual(<<16#88, 2, 1000:16>>, Sent),
+    Sink ! stop.
+
+close_with_invalid_code_crashes_session_test() ->
+    %% Code 5000 isn't in any RFC 6455 §7.4 / §7.4.1 valid range —
+    %% session refuses to emit the malformed close and crashes the
+    %% handler with `{invalid_close_payload, _, _}`.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_init => {close, 5000, ~"reason"}},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, {{invalid_close_payload, 5000, _}, _}} -> ok
+    after 500 -> ?assert(false)
+    end,
+    Sink ! stop.
+
+close_with_invalid_utf8_reason_crashes_session_test() ->
+    %% A bare 0xFF byte isn't valid UTF-8 — session refuses to emit
+    %% the malformed close and crashes.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_init => {close, 1000, <<16#FF>>}},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, {{invalid_close_payload, 1000, _}, _}} -> ok
+    after 500 -> ?assert(false)
+    end,
+    Sink ! stop.
+
+%% =============================================================================
 %% permessage-deflate (RFC 7692) — end-to-end through the session.
 %% =============================================================================
 

@@ -833,7 +833,24 @@ apply_handler_result(Result, Data, Hibernate, Continue) ->
             );
         {close, _NewState} ->
             ok = send_ws_frame(Data, close, ~""),
+            {stop, normal, Data};
+        {close, Code, Reason, _NewState} ->
+            ok = send_ws_frame(Data, close, close_payload(Code, Reason)),
             {stop, normal, Data}
+    end.
+
+%% Build the wire payload for a handler-driven close. RFC 6455 §5.5.1
+%% lays out the format: 2-byte big-endian status code followed by the
+%% UTF-8 reason. Validate both — emitting a malformed close would
+%% violate §7.4 / §8.1 and the peer would (correctly) close us with
+%% 1002. A handler that supplies bad inputs has a bug; let it crash
+%% with a tagged error rather than silently send garbage.
+-spec close_payload(non_neg_integer(), iodata()) -> binary().
+close_payload(Code, Reason) ->
+    ReasonBin = iolist_to_binary(Reason),
+    case is_valid_close_code(Code) andalso is_valid_utf8(ReasonBin) of
+        true -> <<Code:16, ReasonBin/binary>>;
+        false -> error({invalid_close_payload, Code, ReasonBin})
     end.
 
 %% --- helpers ---

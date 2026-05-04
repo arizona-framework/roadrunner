@@ -10,8 +10,18 @@ frame received from the client.
 Control frames (`ping`/`close`) are auto-handled by the connection
 layer and **never** reach the user callback. The handler may reply
 with zero or more frames (each `{Opcode, Payload}` — always
-`Fin = true`) or signal `{close, State}` to terminate the session
-gracefully. State is passed through unchanged by the framework.
+`Fin = true`) or signal close to terminate the session gracefully:
+
+- `{close, State}` sends an empty close frame (RFC 6455 §5.5.1
+  permits this).
+- `{close, Code, Reason, State}` sends a close frame carrying the
+  status code and reason text. `Code` must be a code the spec
+  permits the server to send (1000-1003, 1007-1011, 1014, or
+  3000-4999 per RFC 6455 §7.4). `Reason` is iodata that must be
+  valid UTF-8. The framework crashes the session on invalid
+  `Code` / `Reason` rather than emit a malformed close frame.
+
+State is passed through unchanged by the framework.
 
 The 4-tuple `{reply, Frames, NewState, Opts}` and 3-tuple
 `{ok, NewState, Opts}` variants accept an opt list. Currently
@@ -46,8 +56,9 @@ don't need bespoke teardown, and the conn process's drain plus
 listener slot reconciliation cover the lifecycle bookkeeping.
 
 All callbacks share the same return shape — `{reply, Frames,
-NewState}`, `{ok, NewState}`, or `{close, NewState}`, optionally
-with a 4-tuple `Opts` list for `hibernate`.
+NewState}`, `{ok, NewState}`, `{close, NewState}`, or
+`{close, Code, Reason, NewState}`, optionally with a 4-tuple
+`Opts` list for `hibernate` on the reply / ok shapes.
 """.
 
 -type opt() :: hibernate.
@@ -57,7 +68,8 @@ with a 4-tuple `Opts` list for `hibernate`.
     | {reply, Frames :: [{roadrunner_ws:opcode(), iodata()}], NewState :: term(), [opt()]}
     | {ok, NewState :: term()}
     | {ok, NewState :: term(), [opt()]}
-    | {close, NewState :: term()}.
+    | {close, NewState :: term()}
+    | {close, Code :: non_neg_integer(), Reason :: iodata(), NewState :: term()}.
 
 -callback init(State :: term()) -> result().
 -callback handle_frame(Frame :: roadrunner_ws:frame(), State :: term()) -> result().
