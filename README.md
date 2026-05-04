@@ -153,6 +153,13 @@ parsers never-crash + incremental-feed equivalence, plus
 inputs (clean exit + slot release) and `request_id` consistency
 between `request_start` / `request_stop` telemetry.
 
+`roadrunner_http1_corpus_tests` runs HTTP/1.1 malformed-input
+patterns lifted from the [llhttp](https://github.com/nodejs/llhttp)
+test corpus (the parser used by Node.js / undici) and the
+canonical request-smuggling vectors documented by Portswigger —
+the same coverage that goes into protecting other production
+HTTP/1.x servers in the wild.
+
 WebSocket conformance lives in `test/autobahn/`. Run
 `./scripts/autobahn.escript` (requires Docker) to drive the full
 [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
@@ -167,6 +174,15 @@ rather than `OK` — Autobahn's category for cases the spec leaves
 genuinely implementation-defined (close-during-write under
 async-only models; out-of-range close codes 5000 / 65535). Their
 own descriptions read *"Actual events are undefined by the spec."*
+
+HTTP/1.1 response hygiene is audited via
+[REDbot](https://redbot.org). Run `./scripts/redbot.escript`
+(requires Docker) to probe a representative set of routes
+(plain, JSON, cached, ETag, Last-Modified, conditional-GET,
+gzip-eligible) and capture per-route reports under
+`test/redbot/reports/`. See `test/redbot/README.md` for what's
+covered and what kinds of findings count as framework gaps vs
+handler-level choices.
 
 ## Comparison with cowboy and elli
 
