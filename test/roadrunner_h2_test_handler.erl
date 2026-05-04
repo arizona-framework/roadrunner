@@ -23,5 +23,9 @@ handle(#{target := ~"/websocket"} = Req) ->
     {{websocket, some_module, state}, Req};
 handle(#{target := ~"/crash"} = _Req) ->
     error(boom);
+handle(#{target := ~"/large50k"} = Req) ->
+    {{200, [], binary:copy(<<"x">>, 50_000)}, Req};
+handle(#{target := ~"/large100k"} = Req) ->
+    {{200, [], binary:copy(<<"x">>, 100_000)}, Req};
 handle(Req) ->
     {{200, [{~"content-type", ~"text/plain"}], ~"ok"}, Req}.

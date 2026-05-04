@@ -732,25 +732,17 @@ start_http2_conn() ->
     {Pid, Ref, Pid}.
 
 cleanup(Pid, Ref) ->
-    %% Force the conn process to exit without actually closing the
-    %% socket loop normally — for tests that don't drive the
-    %% handshake to its end-of-conn signal. Drain the mailbox
-    %% afterwards so leftover `roadrunner_fake_*` messages don't
-    %% bleed into later tests in this same eunit process.
+    %% Force the conn process to exit and **wait synchronously** for
+    %% its `'DOWN'` signal. Erlang's runtime reuses pids over time;
+    %% if the conn outlives the test process, eunit may spawn a
+    %% later test (in this or another module) at the same pid and
+    %% the still-alive conn will deliver `roadrunner_fake_*`
+    %% messages to it. The synchronous wait makes sure the conn is
+    %% truly gone before this test returns.
     exit(Pid, kill),
     receive
         {'DOWN', Ref, process, Pid, _} -> ok
-    after 500 -> ok
-    end,
-    %% Eunit shares the test process across tests in a module — and
-    %% across modules in a suite — so any in-flight message must be
-    %% caught before the next test runs. The fake-transport messages
-    %% only originate from `Pid`, which is dead after the kill; the
-    %% sleep gives the scheduler one tick to deliver any still-queued
-    %% sends. Drain twice to be safe.
-    timer:sleep(50),
-    drain_mailbox(),
-    drain_mailbox().
+    end.
 
 expect_send() ->
     receive
