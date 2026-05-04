@@ -93,6 +93,33 @@ The `start_time` value returned by `request_start/1` must be passed
 back into `request_stop/3` / `request_exception/4` to compute
 `duration`. Subscribers can wire up via `telemetry:attach/4` in
 production or `telemetry_test:attach_event_handlers/2` in tests.
+
+## Stability
+
+The following events have a **stable** contract — event name,
+measurement keys, and the listed metadata keys will not change
+without a major-version bump:
+
+- `[roadrunner, request, stop]` — measurements: `duration`
+  (native units). Metadata: `request_id`, `peer`, `method`,
+  `path`, `scheme`, `listener_name`, `status`, `response_kind`.
+- `[roadrunner, ws, upgrade]` — measurements: `system_time`.
+  Metadata: `listener_name`, `peer`, `request_id`, `module`.
+- `[roadrunner, ws, frame_out]` — measurements: `system_time`,
+  `payload_size`. Metadata: `listener_name`, `peer`,
+  `request_id`, `module`, `opcode`.
+
+All other events listed above (`request, start`,
+`request, exception`, `response, send_failed`,
+`listener, accept`, `listener, conn_close`,
+`request, rejected`, `listener, slots_reconciled`,
+`drain, acknowledged`, `ws, frame_in`) are **unstable**: their
+event name, measurement keys, or metadata schema may change in
+any minor release. Production subscribers depending on those
+events should pin a roadrunner version.
+
+Stable events may gain *additional* metadata keys in any release;
+they will not lose or rename listed keys without a major bump.
 """.
 
 -export([
