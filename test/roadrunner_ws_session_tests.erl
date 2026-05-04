@@ -597,38 +597,167 @@ pmd_no_context_takeover_resets_inflate_after_each_message_test() ->
     Sink ! stop,
     ok = gen_statem:stop(Pid).
 
-pmd_uncompressed_continuation_passes_through_test() ->
-    %% Uncompressed continuation frame outside any compressed message.
-    %% Tests `classify_data_frame` returning `regular` for that path
-    %% (compressed_acc=undefined). The echo handler's catch-all clause
-    %% handles it gracefully (no reply expected).
+fragmented_text_message_dispatches_complete_payload_test() ->
+    %% Two-fragment uncompressed text message: handler must see ONE
+    %% reassembled `text` frame with the concatenated payload, NOT two
+    %% individual fragments.
     Self = self(),
     Tag = make_ref(),
-    %% First send a non-FIN text frame to put the wire in continuation
-    %% state, then a FIN continuation frame. Both uncompressed.
     F1 = uncompressed_fragment(text, ~"part1", false),
     F2 = uncompressed_fragment(continuation, ~"part2", true),
     Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
-    Negotiated = pmd_negotiated(),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    %% Single text frame echoed back: opcode 0x81, length 10, "part1part2".
+    ?assertEqual(<<16#81, 10, "part1part2">>, Sent),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+continuation_outside_message_closes_with_protocol_error_test() ->
+    %% Per RFC 6455 §5.4 a continuation frame without a preceding
+    %% non-FIN text/binary frame is a protocol violation — close 1002.
+    Self = self(),
+    Tag = make_ref(),
+    Stray = uncompressed_fragment(continuation, ~"orphan", true),
+    Sink = spawn_active_sink(Self, Tag, [{recv, Stray}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
         []
     ),
     Ref = monitor(process, Pid),
     Pid ! socket_ready,
-    %% Echo handler replies to the non-FIN text frame with the same
-    %% partial; then sees the continuation and falls through. The
-    %% session stays alive until peer close. We just assert it
-    %% doesn't crash on the continuation.
-    timer:sleep(100),
-    ?assert(is_process_alive(Pid)),
-    Sink ! stop,
-    Pid ! {roadrunner_fake_closed, Sink},
     receive
         {'DOWN', Ref, process, Pid, normal} -> ok
-    after 1000 -> error(no_normal_exit)
-    end.
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    %% Close frame with status 1002 (protocol error).
+    ?assertEqual(<<16#88, 2, 1002:16>>, Sent),
+    Sink ! stop.
+
+new_data_frame_mid_message_closes_with_protocol_error_test() ->
+    %% A non-FIN text frame in progress, then ANOTHER text frame
+    %% (instead of a continuation) — protocol error.
+    Self = self(),
+    Tag = make_ref(),
+    F1 = uncompressed_fragment(text, ~"start", false),
+    F2 = uncompressed_fragment(text, ~"second", true),
+    Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertEqual(<<16#88, 2, 1002:16>>, Sent),
+    Sink ! stop.
+
+invalid_utf8_in_text_message_closes_1007_test() ->
+    %% Text message with invalid UTF-8 byte: close with 1007.
+    Self = self(),
+    Tag = make_ref(),
+    %% 0xC0 is invalid as a UTF-8 start byte (overlong-encoding form).
+    F = uncompressed_fragment(text, <<"hello", 16#C0, 16#C0>>, true),
+    Sink = spawn_active_sink(Self, Tag, [{recv, F}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertEqual(<<16#88, 2, 1007:16>>, Sent),
+    Sink ! stop.
+
+invalid_utf8_mid_fragment_closes_immediately_test() ->
+    %% Multi-fragment text message; second fragment introduces an
+    %% invalid UTF-8 byte. Close 1007 immediately on the second
+    %% fragment, BEFORE waiting for FIN.
+    Self = self(),
+    Tag = make_ref(),
+    F1 = uncompressed_fragment(text, ~"valid", false),
+    %% 0xFE is never a valid UTF-8 byte.
+    F2 = uncompressed_fragment(continuation, <<16#FE>>, false),
+    Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertEqual(<<16#88, 2, 1007:16>>, Sent),
+    Sink ! stop.
+
+incomplete_utf8_at_fragment_boundary_carries_forward_test() ->
+    %% Multi-byte UTF-8 codepoint split across fragments. First
+    %% fragment ends mid-sequence (incomplete but valid prefix);
+    %% second fragment completes it. Should reassemble cleanly and
+    %% echo the full message.
+    Self = self(),
+    Tag = make_ref(),
+    %% U+00E9 (é) = 0xC3 0xA9. Split it.
+    F1 = uncompressed_fragment(text, <<"caf", 16#C3>>, false),
+    F2 = uncompressed_fragment(continuation, <<16#A9, " latte">>, true),
+    Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    %% Echo: 1 text frame, length 10 (4 + 1 + 1 + 6 = "caf" + 0xC3 +
+    %% 0xA9 + " latte" actually byte_size of <<"café latte"/utf8>>
+    %% is 11). Just check the payload survives intact.
+    ?assertMatch(<<16#81, _, _Body/binary>>, Sent),
+    [_, _ | Body] = binary_to_list(Sent),
+    ?assertEqual(<<"café latte"/utf8>>, list_to_binary(Body)),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+binary_fragments_skip_utf8_validation_test() ->
+    %% Binary messages have NO encoding constraint. Even bytes that
+    %% would be invalid UTF-8 must round-trip cleanly. Uses
+    %% `roadrunner_autobahn_handler` which echoes both text and binary.
+    Self = self(),
+    Tag = make_ref(),
+    F1 = uncompressed_fragment(binary, <<16#FE, 16#FF>>, false),
+    F2 = uncompressed_fragment(continuation, <<16#C0, 16#C1>>, true),
+    Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_autobahn_handler, no_state, ws_ctx(), none},
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    %% opcode 0x82 (binary), length 4, payload = the 4 bytes verbatim.
+    ?assertEqual(<<16#82, 4, 16#FE, 16#FF, 16#C0, 16#C1>>, Sent),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
 
 pmd_control_frames_stay_uncompressed_test() ->
     %% RFC 7692 §6.1: control frames MUST NOT be compressed. Server's

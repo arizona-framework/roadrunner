@@ -85,14 +85,33 @@ every frame.
     pmd_params :: roadrunner_ws:permessage_deflate_params() | undefined,
     inflate_z :: zlib:zstream() | undefined,
     deflate_z :: zlib:zstream() | undefined,
-    %% When mid-fragmented-compressed-message, accumulates the raw
-    %% (still-compressed) fragment payloads. On FIN we concatenate,
-    %% append the per-message trailer (\x00\x00\xff\xff), and inflate.
-    %% `undefined` = not currently in a compressed message.
-    compressed_acc :: undefined | iodata(),
-    %% Opcode of the in-progress compressed message (text | binary) —
-    %% needed to rebuild the synthesized FIN frame for the handler.
-    compressed_opcode :: undefined | text | binary
+    %% In-progress message reassembly state. WebSocket data messages
+    %% (text / binary) MAY span multiple fragments at the wire level
+    %% (RFC 6455 §5.4). The session reassembles them before dispatch
+    %% so the user handler always sees a complete message. Control
+    %% frames may interleave between data fragments and don't disturb
+    %% this state.
+    %%
+    %% `msg_acc = undefined` means no fragmented message is in
+    %% progress. While in progress, the iodata accumulates fragment
+    %% payloads (still compressed when `msg_compressed` is true);
+    %% `msg_opcode` is the leading frame's opcode (text | binary)
+    %% used to dispatch the complete message.
+    msg_acc :: undefined | iodata(),
+    msg_opcode :: undefined | text | binary,
+    msg_compressed :: boolean(),
+    %% Trailing UTF-8 bytes carried over from a previous fragment that
+    %% form the start of a multi-byte sequence whose continuation
+    %% bytes haven't arrived yet. RFC 6455 §8.1 + §5.4 require that
+    %% text-message UTF-8 be validated **incrementally** (close 1007
+    %% as soon as an invalid sequence is detected, not just at
+    %% end-of-message). At most 3 bytes — the longest valid prefix of
+    %% an incomplete UTF-8 sequence is 3 bytes (4-byte sequences are
+    %% the maximum). Reset to `<<>>` between messages.
+    %% NOT used for compressed messages — the compressed wire bytes
+    %% aren't UTF-8 until inflated; validation runs on the inflated
+    %% binary at FIN time.
+    utf8_pending = <<>> :: binary()
 }).
 
 %% Per-message DEFLATE trailer (RFC 7692 §7.2.1). Sender strips it
@@ -199,8 +218,10 @@ init({Socket, Mod, State, Ctx, Negotiated}) ->
                 pmd_params = PmdParams,
                 inflate_z = InflateZ,
                 deflate_z = DeflateZ,
-                compressed_acc = undefined,
-                compressed_opcode = undefined
+                msg_acc = undefined,
+                msg_opcode = undefined,
+                msg_compressed = false,
+                utf8_pending = <<>>
             }};
         false ->
             {stop, {bad_handler, Mod}}
@@ -344,92 +365,180 @@ handle_frame(#{opcode := pong}, Data, Hibernate) ->
     %% Server is not pinging clients yet — pong from client is dropped.
     process_buffer(Data, Hibernate);
 handle_frame(Frame, Data, Hibernate) ->
-    %% Data frames (text / binary / continuation) — may be compressed
-    %% per RFC 7692 if permessage-deflate negotiated. The PMD path
-    %% buffers fragments then inflates on FIN; uncompressed frames
-    %% take the regular dispatch shape.
+    %% Data frames (text / binary / continuation). Per RFC 6455 §5.4 a
+    %% message MAY be fragmented across multiple frames at the wire
+    %% level; the session reassembles them and dispatches the COMPLETE
+    %% message to the user handler. Per RFC 7692, the first fragment
+    %% of a compressed message has RSV1=1 — we track that flag for the
+    %% whole message so the FIN handler knows to inflate.
     case classify_data_frame(Frame, Data) of
-        {compressed_first, NewData} ->
-            handle_compressed_fragment(Frame, NewData, Hibernate);
-        compressed_continuation ->
-            handle_compressed_fragment(Frame, Data, Hibernate);
-        regular ->
-            dispatch_data_frame(Frame, Data, Hibernate)
+        {message_start, NewData} ->
+            accumulate_fragment(Frame, NewData, Hibernate);
+        message_continuation ->
+            accumulate_fragment(Frame, Data, Hibernate);
+        protocol_error ->
+            %% Continuation arrived without a non-FIN start frame, OR
+            %% a new data frame arrived mid-message. RFC 6455 §5.4
+            %% says close with code 1002.
+            close_with(close_protocol_error(), Data)
     end.
 
-%% Determine whether this data frame is part of a PMD-compressed
-%% message. RFC 7692 §6.1: only the FIRST fragment of a compressed
-%% message has RSV1=1. Continuation frames within a compressed
-%% message have RSV1=0 but are still part of the compressed payload.
+%% RFC 6455 §5.4 fragmentation rules:
+%%   - Data message starts with text/binary, FIN=0 (multi-fragment) or
+%%     FIN=1 (single-fragment).
+%%   - Continuation frames carry on the message; FIN=1 closes it.
+%%   - Once a non-FIN message has started, NO new text/binary may
+%%     arrive until FIN; only continuations are valid mid-message.
 -spec classify_data_frame(roadrunner_ws:frame(), #data{}) ->
-    {compressed_first, #data{}} | compressed_continuation | regular.
-classify_data_frame(#{opcode := continuation}, #data{compressed_acc = undefined}) ->
-    %% Continuation outside a compressed message → not compressed.
-    regular;
+    {message_start, #data{}} | message_continuation | protocol_error.
+classify_data_frame(#{opcode := continuation}, #data{msg_acc = undefined}) ->
+    protocol_error;
 classify_data_frame(#{opcode := continuation}, _Data) ->
-    %% Continuation inside a compressed message → still compressed.
-    compressed_continuation;
-classify_data_frame(#{rsv1 := true, opcode := Op}, #data{pmd_params = Pmd} = Data) when
-    Pmd =/= undefined, (Op =:= text orelse Op =:= binary)
+    message_continuation;
+classify_data_frame(#{opcode := Op}, #data{msg_acc = Acc}) when
+    Acc =/= undefined, (Op =:= text orelse Op =:= binary)
 ->
-    %% First (or only) fragment of a compressed message.
-    {compressed_first, Data#data{compressed_opcode = Op}};
-classify_data_frame(_Frame, _Data) ->
-    regular.
+    protocol_error;
+classify_data_frame(#{rsv1 := Rsv1, opcode := Op}, Data) when Op =:= text orelse Op =:= binary ->
+    {message_start, Data#data{msg_opcode = Op, msg_compressed = Rsv1}}.
 
-%% Buffer this fragment's payload. On FIN, concatenate, append the
-%% per-message DEFLATE trailer, inflate, and dispatch the
-%% reconstituted message to the user handler as a single frame.
--spec handle_compressed_fragment(roadrunner_ws:frame(), #data{}, boolean()) ->
+-spec accumulate_fragment(roadrunner_ws:frame(), #data{}, boolean()) ->
     gen_statem:event_handler_result(atom()).
-handle_compressed_fragment(
-    #{fin := false, payload := P}, #data{compressed_acc = Acc} = Data, Hibernate
+accumulate_fragment(
+    #{fin := false, payload := P} = _Frame,
+    #data{msg_acc = Acc, msg_opcode = Op, msg_compressed = Compressed} = Data,
+    Hibernate
 ) ->
-    NewAcc =
+    case validate_incremental(Op, Compressed, Data#data.utf8_pending, P) of
+        {ok, NewPending} ->
+            NewAcc =
+                case Acc of
+                    undefined -> [P];
+                    _ -> [Acc, P]
+                end,
+            process_buffer(
+                Data#data{msg_acc = NewAcc, utf8_pending = NewPending},
+                Hibernate
+            );
+        invalid_utf8 ->
+            %% RFC 6455 §8.1: close 1007 on the first invalid UTF-8
+            %% byte sequence — don't wait for FIN.
+            close_with(close_invalid_payload(), reset_msg(Data))
+    end;
+accumulate_fragment(
+    #{fin := true, payload := P} = _Frame,
+    #data{msg_acc = Acc, msg_opcode = Op, msg_compressed = Compressed} = Data,
+    Hibernate
+) ->
+    AssembledIolist =
         case Acc of
             undefined -> [P];
             _ -> [Acc, P]
         end,
-    process_buffer(Data#data{compressed_acc = NewAcc}, Hibernate);
-handle_compressed_fragment(
-    #{fin := true, payload := P},
-    #data{compressed_acc = Acc, compressed_opcode = Op} = Data,
-    Hibernate
-) ->
-    Compressed = iolist_to_binary(
-        case Acc of
-            undefined -> [P, ?PMD_TAIL];
-            _ -> [Acc, P, ?PMD_TAIL]
-        end
-    ),
-    case inflate_message(Data, Compressed) of
-        {ok, Inflated, Data1} ->
-            Synthesized = #{fin => true, rsv1 => false, opcode => Op, payload => Inflated},
-            dispatch_data_frame(
-                Synthesized,
-                Data1#data{compressed_acc = undefined, compressed_opcode = undefined},
-                Hibernate
-            );
+    Reset = reset_msg(Data),
+    case finalize_message(Reset, AssembledIolist, Compressed) of
+        {ok, Payload, Data1} ->
+            %% Final validation: even with the per-fragment pre-checks,
+            %% the closing fragment may have introduced a hanging
+            %% incomplete sequence — that's invalid at FIN time. We
+            %% pass the FULL assembled message through
+            %% `unicode:characters_to_binary` to catch that case.
+            case validate_text_payload(Op, Payload) of
+                ok ->
+                    Synthesized =
+                        #{fin => true, rsv1 => false, opcode => Op, payload => Payload},
+                    dispatch_data_frame(Synthesized, Data1, Hibernate);
+                invalid_utf8 ->
+                    close_with(close_invalid_payload(), Data1)
+            end;
         {error, _} ->
-            {stop, normal, Data}
+            close_with(close_protocol_error(), Reset)
     end.
 
--spec inflate_message(#data{}, binary()) -> {ok, binary(), #data{}} | {error, term()}.
-inflate_message(#data{inflate_z = Z, pmd_params = Params} = Data, Compressed) ->
+-spec reset_msg(#data{}) -> #data{}.
+reset_msg(Data) ->
+    Data#data{
+        msg_acc = undefined,
+        msg_opcode = undefined,
+        msg_compressed = false,
+        utf8_pending = <<>>
+    }.
+
+%% RFC 6455 §8.1 strict UTF-8 validation: validate each text-fragment
+%% payload as it arrives rather than waiting for FIN. Carries forward
+%% any trailing **incomplete** multi-byte sequence (legitimate — its
+%% continuation bytes will arrive in the next fragment) but rejects
+%% any **invalid** sequence immediately.
+%%
+%% Skipped for binary messages (no encoding requirement) and for
+%% compressed messages (the wire bytes are deflate-compressed, not
+%% UTF-8; the inflated payload is validated at FIN time instead).
+-spec validate_incremental(text | binary, boolean(), binary(), binary()) ->
+    {ok, NewPending :: binary()} | invalid_utf8.
+validate_incremental(binary, _Compressed, _Pending, _Bytes) ->
+    {ok, <<>>};
+validate_incremental(text, true, _Pending, _Bytes) ->
+    {ok, <<>>};
+validate_incremental(text, false, Pending, Bytes) ->
+    Combined = <<Pending/binary, Bytes/binary>>,
+    case unicode:characters_to_binary(Combined, utf8, utf8) of
+        Bin when is_binary(Bin) ->
+            %% Fully-valid (no trailing incomplete sequence).
+            {ok, <<>>};
+        {incomplete, _Valid, Incomplete} ->
+            %% Valid up to a trailing incomplete sequence — carry it
+            %% forward for the next fragment to complete.
+            {ok, Incomplete};
+        {error, _Valid, _Rest} ->
+            invalid_utf8
+    end.
+
+%% Returns either a plain assembled binary (when the message was
+%% uncompressed) or the inflated bytes (when RSV1 was set on the
+%% start frame).
+-spec finalize_message(#data{}, iodata(), boolean()) ->
+    {ok, binary(), #data{}} | {error, term()}.
+finalize_message(Data, Iolist, false) ->
+    {ok, iolist_to_binary(Iolist), Data};
+finalize_message(#data{inflate_z = Z, pmd_params = Params} = Data, Iolist, true) ->
+    Compressed = iolist_to_binary([Iolist, ?PMD_TAIL]),
     try
-        Iolist = zlib:inflate(Z, Compressed),
-        Data1 =
-            case maps:get(client_no_context_takeover, Params, false) of
-                true ->
-                    ok = zlib:inflateReset(Z),
-                    Data;
-                false ->
-                    Data
-            end,
-        {ok, iolist_to_binary(Iolist), Data1}
+        Inflated = iolist_to_binary(zlib:inflate(Z, Compressed)),
+        case maps:get(client_no_context_takeover, Params, false) of
+            true -> ok = zlib:inflateReset(Z);
+            false -> ok
+        end,
+        {ok, Inflated, Data}
     catch
         _:Reason -> {error, Reason}
     end.
+
+%% RFC 6455 §8.1: text-message payloads MUST be valid UTF-8. Binary
+%% payloads have no encoding constraint.
+-spec validate_text_payload(text | binary, binary()) -> ok | invalid_utf8.
+validate_text_payload(text, Payload) ->
+    case unicode:characters_to_binary(Payload, utf8, utf8) of
+        Payload -> ok;
+        _ -> invalid_utf8
+    end;
+validate_text_payload(binary, _Payload) ->
+    ok.
+
+%% RFC 6455 §7.4: 1002 = protocol error.
+-spec close_protocol_error() -> binary().
+close_protocol_error() ->
+    <<1002:16>>.
+
+%% RFC 6455 §7.4: 1007 = invalid frame payload data (e.g. bad UTF-8 in
+%% a text frame).
+-spec close_invalid_payload() -> binary().
+close_invalid_payload() ->
+    <<1007:16>>.
+
+-spec close_with(binary(), #data{}) -> {stop, normal, #data{}}.
+close_with(StatusBin, Data) ->
+    ok = send_ws_frame(Data, close, StatusBin),
+    {stop, normal, Data}.
 
 -spec dispatch_data_frame(roadrunner_ws:frame(), #data{}, boolean()) ->
     gen_statem:event_handler_result(atom()).
