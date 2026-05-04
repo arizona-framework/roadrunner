@@ -169,7 +169,7 @@ serve_full_file(FilePath, Size, ETag, LastMod) ->
 
 -spec content_type_for(file:filename_all()) -> binary().
 content_type_for(FilePath) ->
-    Ext = string:lowercase(iolist_to_binary(filename:extension(FilePath))),
+    Ext = roadrunner_bin:ascii_lowercase(iolist_to_binary(filename:extension(FilePath))),
     maps:get(Ext, ?MIME_TYPES, ~"application/octet-stream").
 
 %% Strong ETag derived from size + posix mtime — RFC 9110 §8.8.3

@@ -91,7 +91,7 @@ before searching.
 """.
 -spec header(binary(), roadrunner_http1:request()) -> binary() | undefined.
 header(Name, #{headers := H}) when is_binary(Name) ->
-    Lower = string:lowercase(Name),
+    Lower = roadrunner_bin:ascii_lowercase(Name),
     case lists:keyfind(Lower, 1, H) of
         {_, Value} -> Value;
         false -> undefined
@@ -104,7 +104,7 @@ Lookup is case-insensitive on `Name` — same convention as `header/2`.
 """.
 -spec has_header(binary(), roadrunner_http1:request()) -> boolean().
 has_header(Name, #{headers := H}) when is_binary(Name) ->
-    lists:keymember(string:lowercase(Name), 1, H).
+    lists:keymember(roadrunner_bin:ascii_lowercase(Name), 1, H).
 
 -doc """
 Parse the query string portion of the request target into a list of
@@ -282,7 +282,7 @@ read_form(Req) ->
 -spec content_type_kind(binary()) -> urlencoded | multipart | unsupported.
 content_type_kind(ContentType) ->
     [Type | _] = binary:split(ContentType, ~";"),
-    case string:lowercase(string:trim(Type)) of
+    case roadrunner_bin:ascii_lowercase(string:trim(Type)) of
         ~"application/x-www-form-urlencoded" -> urlencoded;
         ~"multipart/form-data" -> multipart;
         _ -> unsupported
@@ -395,7 +395,7 @@ find_for_param([]) ->
 find_for_param([Pair | Rest]) ->
     case binary:split(Pair, ~"=") of
         [Key, Val] ->
-            case string:lowercase(string:trim(Key)) of
+            case roadrunner_bin:ascii_lowercase(string:trim(Key)) of
                 ~"for" -> unquote_param(string:trim(Val));
                 _ -> find_for_param(Rest)
             end;

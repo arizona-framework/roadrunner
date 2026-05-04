@@ -190,34 +190,31 @@ encoding_token(deflate) -> ~"deflate".
 
 %% Pick the strongest supported encoding from `Accept-Encoding`. Ties
 %% resolve to gzip (see moduledoc rationale). `none` means no
-%% supported encoding was offered.
+%% supported encoding was offered. Single-pass: short-circuits on
+%% gzip; remembers a deflate sighting and returns it only if no gzip
+%% was found.
 -spec negotiate_encoding(roadrunner_http1:request()) -> encoding().
 negotiate_encoding(Req) ->
     case roadrunner_req:header(~"accept-encoding", Req) of
         undefined ->
             none;
         Value ->
-            Tokens = parse_tokens(Value),
-            case {accepts(Tokens, ~"gzip"), accepts(Tokens, ~"deflate")} of
-                {true, _} -> gzip;
-                {false, true} -> deflate;
-                {false, false} -> none
-            end
+            Lower = roadrunner_bin:ascii_lowercase(Value),
+            select(binary:split(Lower, ~",", [global]), none)
     end.
 
--spec parse_tokens(binary()) -> [binary()].
-parse_tokens(Value) ->
-    Lower = roadrunner_bin:ascii_lowercase(Value),
-    [string:trim(T) || T <- binary:split(Lower, ~",", [global])].
-
--spec accepts([binary()], binary()) -> boolean().
-accepts(Tokens, Encoding) ->
-    lists:any(
-        fun(Token) ->
-            Token =:= Encoding orelse binary:match(Token, Encoding) =/= nomatch
-        end,
-        Tokens
-    ).
+%% `Best` is the best encoding seen so far (`none` initially, may
+%% become `deflate`). `gzip` returns immediately — nothing better is
+%% available.
+-spec select([binary()], deflate | none) -> encoding().
+select([], Best) ->
+    Best;
+select([Token | Rest], Best) ->
+    case string:trim(Token) of
+        ~"gzip" -> gzip;
+        ~"deflate" -> select(Rest, deflate);
+        _ -> select(Rest, Best)
+    end.
 
 -spec has_header(binary(), roadrunner_http1:headers()) -> boolean().
 has_header(Name, Headers) ->

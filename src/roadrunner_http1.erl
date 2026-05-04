@@ -48,7 +48,7 @@ response (`400`, `414`, `431`, etc.).
 -type redirect_status() :: 300..399.
 -type cached_decisions() :: #{
     %% True iff `Transfer-Encoding: chunked` (case-insensitive). Hot path
-    %% at body-framing time — saves a per-request `string:lowercase`.
+    %% at body-framing time — saves a per-request lowercase scan.
     is_chunked := boolean(),
     %% True iff *any* `Transfer-Encoding` header is present (chunked or
     %% otherwise). Distinguishes "no TE → use Content-Length" from
@@ -507,8 +507,8 @@ lowercases the value of `Connection` (whose tokens are case-insensitive
 per RFC 9110) and computes booleans for `Transfer-Encoding: chunked` and
 `Expect: 100-continue`.
 
-Reusing the cached values avoids ~3 `string:lowercase` calls per request
-on the hot path measured via `scripts/stress.escript --profile`.
+Reusing the cached values avoids ~3 lowercase scans per request on the
+hot path measured via `scripts/stress.escript --profile`.
 """.
 -spec compute_cached_decisions(headers()) -> cached_decisions().
 compute_cached_decisions(Headers) ->

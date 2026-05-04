@@ -111,7 +111,7 @@ validate_version(_) -> {error, unsupported_websocket_version}.
 
 -spec is_websocket_upgrade(binary() | undefined) -> boolean().
 is_websocket_upgrade(undefined) -> false;
-is_websocket_upgrade(Value) -> string:lowercase(Value) =:= ~"websocket".
+is_websocket_upgrade(Value) -> roadrunner_bin:ascii_lowercase(Value) =:= ~"websocket".
 
 -spec has_upgrade_token(binary() | undefined) -> boolean().
 has_upgrade_token(undefined) ->
@@ -119,7 +119,7 @@ has_upgrade_token(undefined) ->
 has_upgrade_token(Value) ->
     %% Connection may be a comma-separated token list — match
     %% case-insensitively against any token.
-    case binary:match(string:lowercase(Value), ~"upgrade") of
+    case binary:match(roadrunner_bin:ascii_lowercase(Value), ~"upgrade") of
         nomatch -> false;
         _ -> true
     end.

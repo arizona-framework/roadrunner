@@ -108,7 +108,10 @@ parse_pairs([Pair | Rest], Acc) ->
             %% Unquote first so internal whitespace inside quoted strings
             %% is preserved; trim afterwards catches trailing whitespace
             %% on bare (unquoted) values.
-            parse_pairs(Rest, Acc#{string:lowercase(Key) => string:trim(unquote(Val))});
+            parse_pairs(
+                Rest,
+                Acc#{roadrunner_bin:ascii_lowercase(Key) => string:trim(unquote(Val))}
+            );
         _ ->
             parse_pairs(Rest, Acc)
     end.
@@ -199,7 +202,7 @@ parse_header_lines([Line | Rest]) ->
         [Name, Value] ->
             case parse_header_lines(Rest) of
                 {ok, More} ->
-                    {ok, [{string:lowercase(Name), string:trim(Value)} | More]};
+                    {ok, [{roadrunner_bin:ascii_lowercase(Name), string:trim(Value)} | More]};
                 {error, _} = E ->
                     E
             end;
