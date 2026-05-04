@@ -8,6 +8,17 @@
 %%% `hello` scenario, or POST /echo with 256-byte body echoed for the
 %%% `echo` scenario.
 %%%
+%%% Two protocols are supported:
+%%%   --protocol h1 (default): pure-Erlang loadgen over plain TCP
+%%%       with 50 keep-alive workers (one TCP connection per worker).
+%%%   --protocol h2: shells out to `h2load` (nghttp2-tools) against
+%%%       a TLS h2 listener. elli is filtered automatically — no h2
+%%%       support there. h2load is a dev-only dep (not a runtime
+%%%       roadrunner dep); we use it because it's the canonical h2
+%%%       benchmarking tool and its C-level event loop avoids the
+%%%       latency artifacts that an Erlang-side ssl recv loop runs
+%%%       into for h2's small per-frame TCP traffic patterns.
+%%%
 %%% Honest comparison conditions:
 %%%   - Same handler shape (no per-server bonus telemetry, gzip, etc).
 %%%   - Same peer BEAM startup (inherited code path).
@@ -47,9 +58,10 @@
 -define(KNOWN_SERVERS, [roadrunner, cowboy, elli]).
 
 main(Args) ->
-    Opts = parse_args(Args),
+    Opts0 = parse_args(Args),
     ProjectDir = project_dir(),
     ok = setup_code_paths(ProjectDir),
+    Opts = preflight_protocol(Opts0),
     print_header(Opts),
     %% Each side runs in isolation: bring the server up, drive load,
     %% bring it down, then do the next. Order matches the user's
@@ -57,6 +69,70 @@ main(Args) ->
     Servers = maps:get(servers, Opts),
     Results = [{S, element(2, run_side(S, Opts))} || S <- Servers],
     print_summary(Results).
+
+%% Validate environment for the chosen protocol, drop incompatible
+%% servers, and stash any per-protocol scratch (cert paths, h2load
+%% binary location). Halts with a clear message on tool gaps.
+%%
+%% h2 path uses h2load (nghttp2-tools) as the loadgen. A
+%% pure-Erlang h2 client would avoid the dep but the version we
+%% prototyped surfaced a 40 ms-per-request artifact under
+%% peer-BEAM bench setups (kernel TCP delayed-ACK timer combined
+%% with our ssl recv pattern); h2load doesn't hit it because its
+%% C-level event loop drives reads/writes differently. h2load is
+%% the canonical h2 benchmarking tool — using it removes the
+%% measurement-fidelity question. Bench is a dev-time script, so
+%% an external dep here doesn't violate the runtime "telemetry
+%% only" policy.
+preflight_protocol(#{protocol := h1} = Opts) ->
+    Opts;
+preflight_protocol(#{protocol := h2, servers := Servers} = Opts) ->
+    case os:find_executable("h2load") of
+        false ->
+            io:format(
+                standard_error,
+                "error: --protocol h2 requires `h2load` from nghttp2-tools.~n"
+                "       on Arch:    sudo pacman -S nghttp2~n"
+                "       on Debian:  sudo apt install nghttp2-client~n"
+                "       on macOS:   brew install nghttp2~n",
+                []
+            ),
+            halt(2);
+        H2load ->
+            CertDir = generate_test_cert(),
+            Filtered = [S || S <- Servers, S =/= elli],
+            case Filtered =/= Servers of
+                true ->
+                    io:format(
+                        "note: --protocol h2 — elli filtered out (no HTTP/2 support)~n",
+                        []
+                    );
+                false ->
+                    ok
+            end,
+            {ok, _} = application:ensure_all_started(ssl),
+            Opts#{servers => Filtered, cert_dir => CertDir, h2load => H2load}
+    end.
+
+generate_test_cert() ->
+    Dir = string:trim(os:cmd("mktemp -d")),
+    Cmd = lists:flatten(io_lib:format(
+        "openssl req -x509 -newkey rsa:2048 -nodes -days 1 "
+        "-keyout ~s/key.pem -out ~s/cert.pem -subj /CN=localhost "
+        "2>/dev/null",
+        [Dir, Dir]
+    )),
+    [] = os:cmd(Cmd),
+    case
+        filelib:is_regular(Dir ++ "/cert.pem") andalso
+            filelib:is_regular(Dir ++ "/key.pem")
+    of
+        true ->
+            Dir;
+        false ->
+            io:format(standard_error, "error: openssl failed to generate test cert~n", []),
+            halt(2)
+    end.
 
 %% ===========================================================================
 %% Args
@@ -152,6 +228,21 @@ cli() ->
                 type => float,
                 default => 1.0,
                 help => "Minimum total ms for a row to appear in the hotspot table."
+            },
+            #{
+                name => protocol,
+                long => "-protocol",
+                type => {atom, [h1, h2]},
+                default => h1,
+                help =>
+                    """
+                    Wire protocol to drive the load over.
+                      h1: pure-Erlang loadgen over plain TCP (default).
+                      h2: shells out to h2load (from nghttp2-tools)
+                          against a TLS h2 listener. elli is filtered
+                          out automatically (no h2 support); only
+                          roadrunner + cowboy run.
+                    """
             }
         ]
     }.
@@ -208,7 +299,7 @@ parse_servers(Str) ->
 
 run_side(Side, Opts) ->
     io:format("~n~s~n", [Side]),
-    {Peer, Port} = start_server(Side, maps:get(scenario, Opts)),
+    {Peer, Port} = start_server(Side, Opts),
     try
         run_warmup(Port, Opts),
         ok = maybe_start_profile(Peer, Opts),
@@ -241,9 +332,18 @@ maybe_stop_profile(Peer, Side, #{profile := true, profile_min_ms := MinMs}) ->
     end,
     ok.
 
-start_server(roadrunner, Scenario) ->
+start_server(roadrunner, #{protocol := h1, scenario := Scenario}) ->
     start_roadrunner(Scenario);
-start_server(cowboy, Scenario) ->
+start_server(roadrunner, #{protocol := h2, scenario := Scenario, cert_dir := CertDir}) ->
+    start_roadrunner_h2(Scenario, CertDir);
+start_server(cowboy, #{protocol := h1, scenario := Scenario}) ->
+    start_cowboy_h1(Scenario);
+start_server(cowboy, #{protocol := h2, scenario := Scenario, cert_dir := CertDir}) ->
+    start_cowboy_h2(Scenario, CertDir);
+start_server(elli, #{scenario := Scenario}) ->
+    start_elli(Scenario).
+
+start_cowboy_h1(Scenario) ->
     {ok, Peer, _Node} = peer:start_link(#{
         name => peer:random_name(),
         connection => standard_io,
@@ -267,8 +367,9 @@ start_server(cowboy, Scenario) ->
         {"protocol_opts", ProtoOpts},
         {"routes", scenario_cowboy_routes(Scenario)}
     ]),
-    {Peer, Port};
-start_server(elli, _Scenario) ->
+    {Peer, Port}.
+
+start_elli(_Scenario) ->
     {ok, Peer, _Node} = peer:start_link(#{
         name => peer:random_name(),
         connection => standard_io,
@@ -327,6 +428,61 @@ start_roadrunner(Scenario) ->
     print_listener_config([{"listener_opts", ListenerOpts}]),
     {Peer, Port}.
 
+start_roadrunner_h2(Scenario, CertDir) ->
+    {ok, Peer, _Node} = peer:start_link(#{
+        name => peer:random_name(),
+        connection => standard_io,
+        args => pa_args_for_peer(),
+        wait_boot => 10000
+    }),
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [ssl]),
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [roadrunner]),
+    BaseOpts = #{
+        port => 0,
+        tls => [
+            {certfile, CertDir ++ "/cert.pem"},
+            {keyfile, CertDir ++ "/key.pem"}
+        ],
+        http2_enabled => true,
+        keep_alive_timeout => 60000,
+        max_clients => 100000,
+        max_keep_alive_request => 1000000
+    },
+    ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
+    {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr_h2, ListenerOpts]),
+    Port = peer:call(Peer, roadrunner_listener, port, [bench_rr_h2]),
+    print_listener_config([{"listener_opts", ListenerOpts}]),
+    {Peer, Port}.
+
+start_cowboy_h2(Scenario, CertDir) ->
+    {ok, Peer, _Node} = peer:start_link(#{
+        name => peer:random_name(),
+        connection => standard_io,
+        args => pa_args_for_peer(),
+        wait_boot => 10000
+    }),
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [ssl]),
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [cowboy]),
+    Dispatch = peer:call(Peer, cowboy_router, compile, [scenario_cowboy_routes(Scenario)]),
+    %% cowboy_tls advertises `h2` + `http/1.1` via ALPN by default.
+    TransportOpts = #{
+        num_acceptors => 10,
+        socket_opts => [
+            {port, 0},
+            {certfile, CertDir ++ "/cert.pem"},
+            {keyfile, CertDir ++ "/key.pem"}
+        ]
+    },
+    ProtoOpts = #{env => #{dispatch => Dispatch}, max_keepalive => 1000000},
+    {ok, _} = peer:call(Peer, cowboy, start_tls, [bench_cb_h2, TransportOpts, ProtoOpts]),
+    Port = peer:call(Peer, ranch, get_port, [bench_cb_h2]),
+    print_listener_config([
+        {"transport_opts", TransportOpts},
+        {"protocol_opts", ProtoOpts},
+        {"routes", scenario_cowboy_routes(Scenario)}
+    ]),
+    {Peer, Port}.
+
 %% Print the per-server listener configuration, indented under the
 %% side header. `~tp` prints with the printable-charlist heuristic
 %% on, so binaries-of-printable-bytes appear as text rather than
@@ -370,7 +526,12 @@ run_warmup(Port, #{warmup_s := W} = Opts) ->
 run_measured(Port, #{duration_s := D} = Opts) ->
     run_phase(Port, Opts, D * 1000).
 
-run_phase(Port, #{clients := C, host := Host, scenario := Scenario}, DurationMs) ->
+run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
+    run_phase_h1(Port, Opts, DurationMs);
+run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
+    run_phase_h2load(Port, Opts, DurationMs).
+
+run_phase_h1(Port, #{clients := C, host := Host, scenario := Scenario}, DurationMs) ->
     Deadline = erlang:monotonic_time(millisecond) + DurationMs,
     Req = build_request(Scenario),
     BodyLen = expected_body_len(Scenario),
@@ -478,6 +639,104 @@ bump_ok(#{ok := O, bytes_in := In, latencies_ns := L} = Acc, Ns, Bytes) ->
 bump_err(#{err := E} = Acc) ->
     Acc#{err := E + 1}.
 
+%% ===========================================================================
+%% h2 loadgen — shells out to h2load (nghttp2-tools) and parses its
+%% summary. Returns the same `aggregate/2`-shape result as the h1
+%% path so `result_to_row/2` doesn't care which loadgen produced
+%% the row.
+%%
+%% h2load doesn't print percentiles in the default summary — we
+%% map the reported `time for request` mean to all of
+%% mean/p50/p95/p99 so the row layout stays uniform. For real
+%% percentiles, run h2load with `--log-file=...` and post-process.
+%% ===========================================================================
+
+run_phase_h2load(Port, #{clients := C, host := Host, scenario := Scenario, h2load := H2load}, DurationMs) ->
+    StartUs = erlang:monotonic_time(microsecond),
+    DurationS = max(1, DurationMs div 1000),
+    {Path, ExtraFlags} = h2load_request_shape(Scenario),
+    Url = io_lib:format("https://~s:~B~s", [Host, Port, Path]),
+    %% h2load -D <seconds>: duration mode (matches our --duration).
+    %% -c <conn>: total concurrent TLS connections.
+    %% -m 100: max concurrent streams per connection (h2 multiplexing).
+    %% -t <threads>: cap to half of online schedulers so the loadgen
+    %%   doesn't oversubscribe schedulers and starve the listener.
+    Threads = max(1, erlang:system_info(schedulers_online) div 2),
+    Cmd = lists:flatten(
+        io_lib:format(
+            "~s -D ~B -c ~B -m 100 -t ~B ~s~s 2>&1",
+            [H2load, DurationS, C, Threads, ExtraFlags, Url]
+        )
+    ),
+    Output = os:cmd(Cmd),
+    EndUs = erlang:monotonic_time(microsecond),
+    parse_h2load_output(Output, EndUs - StartUs).
+
+h2load_request_shape(hello) ->
+    {"/", ""};
+h2load_request_shape(echo) ->
+    %% h2load `-d FILE` sends FILE as the body of POST. /dev/zero
+    %% is a kernel-provided endless stream of NULs; h2load takes
+    %% only the first request-body's worth.
+    {"/echo", "-d /dev/zero -m 1 "};
+h2load_request_shape(large_response) ->
+    {"/large", ""}.
+
+%% Parse h2load's text summary into the bench's standard result map.
+%% The mean `time for request` populates all of mean/p50/p95/p99 so
+%% the row formatter renders consistently.
+parse_h2load_output(Output, ElapsedUs) ->
+    Total = parse_h2load_int(Output, "\\s+(\\d+)\\s+done\\b"),
+    Errors =
+        parse_h2load_int(Output, "\\s+(\\d+)\\s+failed\\b") +
+            parse_h2load_int(Output, "\\s+(\\d+)\\s+errored\\b") +
+            parse_h2load_int(Output, "\\s+(\\d+)\\s+timeout\\b"),
+    MeanNs = parse_h2load_request_mean(Output),
+    Latencies =
+        case MeanNs of
+            undefined -> [];
+            _ -> [MeanNs]
+        end,
+    #{
+        total => max(Total, 0),
+        errors => max(Errors, 0),
+        bytes_in => 0,
+        latencies_ns => Latencies,
+        elapsed_us => ElapsedUs
+    }.
+
+parse_h2load_int(Output, Pattern) ->
+    case re:run(Output, Pattern, [{capture, [1], list}]) of
+        {match, [N]} -> list_to_integer(N);
+        _ -> 0
+    end.
+
+%% h2load: `time for request:    Xus    Yus    Zus    sd  +/- sd`.
+%% Column 3 is the mean. Values may carry `us` / `ms` / `s` per
+%% h2load's autoscale.
+parse_h2load_request_mean(Output) ->
+    case
+        re:run(
+            Output,
+            "time for request:\\s+\\S+\\s+\\S+\\s+(\\d+(?:\\.\\d+)?)\\s*(us|ms|s)\\b",
+            [{capture, [1, 2], list}]
+        )
+    of
+        {match, [V, U]} -> h2load_to_ns(V, U);
+        _ -> undefined
+    end.
+
+h2load_to_ns(V, "us") -> round(list_to_float_or_int(V) * 1000);
+h2load_to_ns(V, "ms") -> round(list_to_float_or_int(V) * 1000000);
+h2load_to_ns(V, "s") -> round(list_to_float_or_int(V) * 1000000000).
+
+list_to_float_or_int(S) ->
+    try list_to_float(S) of
+        F -> F
+    catch
+        error:badarg -> list_to_integer(S) * 1.0
+    end.
+
 aggregate(PerWorker, ElapsedUs) ->
     Init = #{
         total => 0,
@@ -516,18 +775,20 @@ print_header(#{
     clients := C,
     duration_s := D,
     warmup_s := W,
-    host := H
+    host := H,
+    protocol := P
 }) ->
     print_environment(),
     io:format("~nhttp server bench~n"),
     io:format(
+        "  protocol : ~s~n"
         "  servers  : ~s~n"
         "  scenario : ~s~n"
         "  clients  : ~B~n"
         "  warmup   : ~Bs~n"
         "  duration : ~Bs~n"
         "  host     : ~s~n",
-        [string:join([atom_to_list(A) || A <- Servers], ", "), S, C, W, D, H]
+        [P, string:join([atom_to_list(A) || A <- Servers], ", "), S, C, W, D, H]
     ),
     io:format("  request  : ~s~n", [scenario_request_summary(S)]).
 
