@@ -137,7 +137,13 @@ Response shapes supported:
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
-    worker_refs = #{} :: #{reference() => stream_id()}
+    worker_refs = #{} :: #{reference() => stream_id()},
+    %% Set to `true` once a `{roadrunner_drain, _}` message has
+    %% been observed (Phase H9). In drain mode we've already sent
+    %% GOAWAY(NO_ERROR), refuse fresh streams with
+    %% RST_STREAM(REFUSED_STREAM), and exit as soon as the streams
+    %% map empties.
+    draining = false :: boolean()
 }).
 
 -doc """
@@ -254,6 +260,10 @@ handshake_recv(
 %% =============================================================================
 
 -spec frame_loop(#loop{}) -> no_return().
+frame_loop(#loop{draining = true, streams = Streams} = State) when map_size(Streams) =:= 0 ->
+    %% Drain done — the last in-flight stream finished or peer
+    %% RST'd it, nothing more to do.
+    exit_clean(State);
 frame_loop(#loop{buffer = Buf} = State) ->
     case roadrunner_http2_frame:parse(Buf, ?MAX_FRAME_SIZE) of
         {ok, Frame, Rest} ->
@@ -298,11 +308,37 @@ recv_more(
         {h2_worker_done, StreamId} ->
             recv_more(handle_worker_done(State, StreamId));
         {'DOWN', MonRef, process, _Pid, Reason} ->
-            recv_more(handle_worker_down(State, MonRef, Reason))
+            recv_more(maybe_exit_when_drained(handle_worker_down(State, MonRef, Reason)));
+        {roadrunner_drain, _Deadline} ->
+            recv_more(maybe_exit_when_drained(start_drain(State)))
     after idle_timeout() ->
         _ = send_goaway(State, protocol_error),
         exit_clean(State)
     end.
+
+%% Begin a graceful drain: emit GOAWAY(NO_ERROR) once, refuse new
+%% streams henceforth. In-flight workers continue to completion.
+%% Idempotent — subsequent drain messages are no-ops.
+-spec start_drain(#loop{}) -> #loop{}.
+start_drain(#loop{draining = true} = State) ->
+    State;
+start_drain(#loop{} = State) ->
+    _ = send_goaway(State, no_error),
+    State#loop{draining = true}.
+
+%% Once we're draining and the streams map empties, exit cleanly.
+%% Called after every event that could remove a stream. Note that
+%% `exit_clean/1` is `no_return`, so on the drained branch this
+%% function never returns and the caller's tail-call to
+%% `recv_more/1` is dead — typed as `#loop{}` rather than
+%% `no_return()` so the type-checker sees the live path.
+-spec maybe_exit_when_drained(#loop{}) -> #loop{}.
+maybe_exit_when_drained(#loop{draining = true, streams = Streams} = State) when
+    map_size(Streams) =:= 0
+->
+    exit_clean(State);
+maybe_exit_when_drained(State) ->
+    State.
 
 %% =============================================================================
 %% Per-frame dispatch — peer → server frames
@@ -369,6 +405,12 @@ handle_frame({push_promise, _, _, _, _}, State) ->
 
 %% --- HEADERS / CONTINUATION ---
 
+on_headers(StreamId, _Flags, _Priority, _Fragment, #loop{draining = true} = State) ->
+    %% In drain mode — refuse all new streams. The peer already
+    %% saw GOAWAY(NO_ERROR); it knows new requests on this conn
+    %% won't be served.
+    _ = send_rst_stream(State, StreamId, refused_stream),
+    frame_loop(State);
 on_headers(StreamId, _Flags, _Priority, _Fragment, #loop{streams = Streams} = State) when
     map_size(Streams) >= ?MAX_CONCURRENT_STREAMS
 ->

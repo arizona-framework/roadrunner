@@ -68,7 +68,12 @@ all_test_() ->
         fun handler_returning_invalid_shape_resets_stream/0,
         fun unrelated_down_ignored/0,
         fun over_max_concurrent_streams_refused/0,
-        fun rst_during_stream_response_unwinds_worker/0
+        fun rst_during_stream_response_unwinds_worker/0,
+        fun drain_with_no_streams_exits_immediately/0,
+        fun drain_refuses_new_streams/0,
+        fun drain_with_in_flight_stream_waits/0,
+        fun drain_message_is_idempotent/0,
+        fun drain_then_peer_rst_exits_via_frame_loop/0
     ],
     [{spawn, F} || F <- Tests].
 
@@ -1249,6 +1254,229 @@ rst_during_stream_response_unwinds_worker() ->
     %% Wait for worker death + abort_stream to send RST_STREAM(internal_error).
     timer:sleep(300),
     cleanup(Pid, Ref).
+
+drain_with_no_streams_exits_immediately() ->
+    %% Drain message arrives on an idle conn. Server emits
+    %% GOAWAY(NO_ERROR) and exits cleanly.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    Goaway = expect_send(),
+    %% Frame type 7 = GOAWAY, error code 0 = NO_ERROR.
+    ?assertMatch(<<0, 0, 8, 7, 0, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(process_did_not_exit)
+    end.
+
+drain_refuses_new_streams() ->
+    %% After drain, HEADERS for a fresh stream gets
+    %% RST_STREAM(REFUSED_STREAM) — peer should already know to
+    %% retry on a different conn after the GOAWAY, but defensive.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    Self = self(),
+    Counter = atomics:new(1, [{signed, false}]),
+    ok = atomics:add(Counter, 1, 1),
+    ProtoOpts = #{
+        client_counter => Counter,
+        listener_name => h2_drain_test,
+        dispatch => {handler, roadrunner_h2_test_handler},
+        middlewares => []
+    },
+    Sock = {fake, Self},
+    Pid = spawn(fun() ->
+        receive
+            ready -> ok
+        end,
+        roadrunner_conn_loop_http2:enter(
+            Sock, ProtoOpts, h2_drain_test, undefined, erlang:monotonic_time()
+        )
+    end),
+    Ref = monitor(process, Pid),
+    Pid ! ready,
+    _ = expect_send(),
+    serve_recv(Pid, ?PREFACE),
+    serve_recv(Pid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    %% Open stream 1 (HEADERS without END_STREAM, no worker yet).
+    HpackBin = encode_post_root_headers(),
+    H1 = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(Pid, H1),
+    %% Drain — server emits GOAWAY(NO_ERROR) but stays alive
+    %% because stream 1 is still in-flight.
+    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, 0, _/binary>>, Goaway),
+    %% Now HEADERS for a new stream — refused.
+    H3 = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 3, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(Pid, H3),
+    Rst = expect_send(),
+    {ok, {rst_stream, 3, refused_stream}, _} =
+        roadrunner_http2_frame:parse(Rst, 16384),
+    cleanup(Pid, Ref).
+
+drain_with_in_flight_stream_waits() ->
+    %% Drain while a stream is in-flight: server sends GOAWAY but
+    %% keeps serving until the in-flight stream's worker finishes,
+    %% then exits cleanly.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    Self = self(),
+    Counter = atomics:new(1, [{signed, false}]),
+    ok = atomics:add(Counter, 1, 1),
+    ProtoOpts = #{
+        client_counter => Counter,
+        listener_name => h2_drain_inflight_test,
+        dispatch => {handler, roadrunner_h2_test_handler},
+        middlewares => []
+    },
+    Sock = {fake, Self},
+    Pid = spawn(fun() ->
+        receive
+            ready -> ok
+        end,
+        roadrunner_conn_loop_http2:enter(
+            Sock, ProtoOpts, h2_drain_inflight_test, undefined, erlang:monotonic_time()
+        )
+    end),
+    Ref = monitor(process, Pid),
+    Pid ! ready,
+    _ = expect_send(),
+    serve_recv(Pid, ?PREFACE),
+    serve_recv(Pid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    %% Open a slow-stream request. Worker pauses 200 ms mid-response.
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"localhost"},
+            {~":path", ~"/stream/slow"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    H1 = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(Pid, H1),
+    %% Worker emits HEADERS + first DATA, then sleeps. Drain mid-pause.
+    timer:sleep(50),
+    _ = drain_send(50),
+    _ = drain_send(50),
+    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    %% Conn alive while drain pending — eventually emits GOAWAY,
+    %% finishes the stream, then exits.
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(drain_did_not_complete)
+    end.
+
+drain_message_is_idempotent() ->
+    %% A second `{roadrunner_drain, _}` after the first is a no-op
+    %% — no extra GOAWAY emitted. PING-ACK proves the conn
+    %% processed the duplicate without misbehaving.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    Self = self(),
+    Counter = atomics:new(1, [{signed, false}]),
+    ok = atomics:add(Counter, 1, 1),
+    ProtoOpts = #{
+        client_counter => Counter,
+        listener_name => h2_drain_dup_test,
+        dispatch => {handler, roadrunner_h2_test_handler},
+        middlewares => []
+    },
+    Sock = {fake, Self},
+    Pid = spawn(fun() ->
+        receive
+            ready -> ok
+        end,
+        roadrunner_conn_loop_http2:enter(
+            Sock, ProtoOpts, h2_drain_dup_test, undefined, erlang:monotonic_time()
+        )
+    end),
+    Ref = monitor(process, Pid),
+    Pid ! ready,
+    _ = expect_send(),
+    serve_recv(Pid, ?PREFACE),
+    serve_recv(Pid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    %% Open a stream so the conn doesn't exit on first drain.
+    HpackBin = encode_post_root_headers(),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(Pid, H),
+    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, 0, _/binary>>, Goaway),
+    %% Second drain message — idempotent, no GOAWAY this time.
+    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    Ping = iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>})),
+    serve_recv(Pid, Ping),
+    PingAck = expect_send(),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, PingAck),
+    cleanup(Pid, Ref).
+
+drain_then_peer_rst_exits_via_frame_loop() ->
+    %% Drain while a stream is open. Peer RSTs the last
+    %% in-flight stream — `handle_frame({rst_stream, ...})` tail-calls
+    %% `frame_loop/1` which observes `draining = true` and an empty
+    %% streams map, and exits cleanly.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    Self = self(),
+    Counter = atomics:new(1, [{signed, false}]),
+    ok = atomics:add(Counter, 1, 1),
+    ProtoOpts = #{
+        client_counter => Counter,
+        listener_name => h2_drain_rst_test,
+        dispatch => {handler, roadrunner_h2_test_handler},
+        middlewares => []
+    },
+    Sock = {fake, Self},
+    Pid = spawn(fun() ->
+        receive
+            ready -> ok
+        end,
+        roadrunner_conn_loop_http2:enter(
+            Sock, ProtoOpts, h2_drain_rst_test, undefined, erlang:monotonic_time()
+        )
+    end),
+    Ref = monitor(process, Pid),
+    Pid ! ready,
+    _ = expect_send(),
+    serve_recv(Pid, ?PREFACE),
+    serve_recv(Pid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    HpackBin = encode_post_root_headers(),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(Pid, H),
+    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, 0, _/binary>>, Goaway),
+    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
+    serve_recv(Pid, Rst),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(drain_did_not_complete)
+    end.
 
 encode_post_root_headers() ->
     Enc = roadrunner_http2_hpack:new_encoder(4096),
