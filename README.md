@@ -162,6 +162,11 @@ passes 100 % strict on the **full suite** with zero exclusions —
 every category from basic framing through fragmentation, UTF-8,
 close handling, oversize control frames, large-payload performance
 (9.x), and the full `permessage-deflate` matrix (12.x + 13.x).
+Three cases (7.1.6, 7.13.1, 7.13.2) are reported as `INFORMATIONAL`
+rather than `OK` — Autobahn's category for cases the spec leaves
+genuinely implementation-defined (close-during-write under
+async-only models; out-of-range close codes 5000 / 65535). Their
+own descriptions read *"Actual events are undefined by the spec."*
 
 ## Comparison with cowboy and elli
 
