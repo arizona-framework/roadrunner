@@ -8,8 +8,9 @@ features.
 """.
 
 -export([accept_key/1, handshake_response/1, parse_frame/1, encode_frame/3]).
+-export([parse_extensions/1]).
 
--export_type([opcode/0, frame/0]).
+-export_type([opcode/0, frame/0, extension/0]).
 
 -type opcode() :: continuation | text | binary | close | ping | pong.
 -type frame() :: #{
@@ -17,6 +18,11 @@ features.
     opcode := opcode(),
     payload := binary()
 }.
+
+%% A single offer in the `Sec-WebSocket-Extensions` header. Parameter
+%% values are `binary()` for `key=value` pairs or `true` for bare flag
+%% parameters (e.g. `client_no_context_takeover`).
+-type extension() :: {binary(), [{binary(), binary() | true}]}.
 
 %% RFC 6455 §1.3 magic GUID concatenated with the client key before
 %% hashing — fixed by spec.
@@ -130,6 +136,73 @@ header_lookup(Name, Headers) ->
         {_, V} -> V;
         false -> undefined
     end.
+
+-doc """
+Parse a `Sec-WebSocket-Extensions` header value into a list of
+`{ExtensionName, Params}` tuples per RFC 6455 §9.1 grammar.
+
+Each offer in the header is comma-separated. Within an offer, the
+extension name comes first followed by optional `;`-separated
+parameters. Parameters may be bare (`client_no_context_takeover`,
+returned as `{<<"client_no_context_takeover">>, true}`) or
+key=value (`server_max_window_bits=10`, returned as
+`{<<"server_max_window_bits">>, <<"10">>}`).
+
+Names and parameter keys are lowercased; parameter values are
+returned verbatim (with surrounding quotes stripped). The order of
+offers AND of parameters within an offer is preserved — RFC 7692
+relies on offer order for negotiation precedence.
+
+Returns `[]` for an absent / empty header value.
+
+```erlang
+parse_extensions(<<"permessage-deflate; client_max_window_bits=15, x-foo">>).
+%% => [{<<"permessage-deflate">>, [{<<"client_max_window_bits">>, <<"15">>}]},
+%%     {<<"x-foo">>, []}]
+```
+""".
+-spec parse_extensions(binary() | undefined) -> [extension()].
+parse_extensions(undefined) ->
+    [];
+parse_extensions(<<>>) ->
+    [];
+parse_extensions(Value) when is_binary(Value) ->
+    Lower = roadrunner_bin:ascii_lowercase(Value),
+    [parse_extension_offer(Offer) || Offer <- split_offers(Lower)].
+
+%% Comma is the offer separator and is not allowed inside parameter
+%% values (RFC 6455 §9.1 grammar uses token / quoted-string for
+%% values, both of which forbid `,`). Split-on-comma is safe.
+-spec split_offers(binary()) -> [binary()].
+split_offers(Bin) ->
+    [string:trim(O) || O <- binary:split(Bin, ~",", [global]), string:trim(O) =/= <<>>].
+
+-spec parse_extension_offer(binary()) -> extension().
+parse_extension_offer(Offer) ->
+    case binary:split(Offer, ~";", [global]) of
+        [Name] ->
+            {string:trim(Name), []};
+        [Name | Params] ->
+            {string:trim(Name), [parse_extension_param(P) || P <- Params]}
+    end.
+
+-spec parse_extension_param(binary()) -> {binary(), binary() | true}.
+parse_extension_param(Param) ->
+    case binary:split(string:trim(Param), ~"=") of
+        [Key] ->
+            {Key, true};
+        [Key, Value] ->
+            {string:trim(Key), unquote(string:trim(Value))}
+    end.
+
+-spec unquote(binary()) -> binary().
+unquote(<<$", Rest/binary>>) ->
+    case binary:match(Rest, ~"\"") of
+        {End, _} -> binary:part(Rest, 0, End);
+        nomatch -> Rest
+    end;
+unquote(V) ->
+    V.
 
 -doc """
 Decode a single WebSocket frame from the buffer.

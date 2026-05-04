@@ -122,6 +122,88 @@ handshake_wrong_websocket_version_test() ->
     ).
 
 %% =============================================================================
+%% parse_extensions/1 — Sec-WebSocket-Extensions header (RFC 6455 §9.1).
+%% =============================================================================
+
+parse_extensions_undefined_returns_empty_test() ->
+    ?assertEqual([], roadrunner_ws:parse_extensions(undefined)).
+
+parse_extensions_empty_value_returns_empty_test() ->
+    ?assertEqual([], roadrunner_ws:parse_extensions(<<>>)).
+
+parse_extensions_single_offer_no_params_test() ->
+    ?assertEqual(
+        [{~"permessage-deflate", []}],
+        roadrunner_ws:parse_extensions(~"permessage-deflate")
+    ).
+
+parse_extensions_single_offer_with_bare_param_test() ->
+    %% Bare flag parameter (no `=`) — value is the atom `true`.
+    ?assertEqual(
+        [{~"permessage-deflate", [{~"client_no_context_takeover", true}]}],
+        roadrunner_ws:parse_extensions(~"permessage-deflate; client_no_context_takeover")
+    ).
+
+parse_extensions_single_offer_with_keyvalue_param_test() ->
+    ?assertEqual(
+        [{~"permessage-deflate", [{~"server_max_window_bits", ~"10"}]}],
+        roadrunner_ws:parse_extensions(~"permessage-deflate; server_max_window_bits=10")
+    ).
+
+parse_extensions_quoted_param_value_unquoted_test() ->
+    %% RFC 6455 §9.1 allows quoted-string parameter values; the parser
+    %% strips the surrounding quotes.
+    ?assertEqual(
+        [{~"permessage-deflate", [{~"server_max_window_bits", ~"10"}]}],
+        roadrunner_ws:parse_extensions(~"permessage-deflate; server_max_window_bits=\"10\"")
+    ).
+
+parse_extensions_multiple_offers_preserves_order_test() ->
+    ?assertEqual(
+        [
+            {~"permessage-deflate", [{~"client_max_window_bits", true}]},
+            {~"x-custom", []}
+        ],
+        roadrunner_ws:parse_extensions(
+            ~"permessage-deflate; client_max_window_bits, x-custom"
+        )
+    ).
+
+parse_extensions_lowercases_names_and_keys_test() ->
+    ?assertEqual(
+        [{~"permessage-deflate", [{~"client_max_window_bits", ~"15"}]}],
+        roadrunner_ws:parse_extensions(~"PerMessage-Deflate; Client_Max_Window_Bits=15")
+    ).
+
+parse_extensions_multiple_params_preserves_order_test() ->
+    ?assertEqual(
+        [
+            {~"permessage-deflate", [
+                {~"client_no_context_takeover", true},
+                {~"server_max_window_bits", ~"10"}
+            ]}
+        ],
+        roadrunner_ws:parse_extensions(
+            ~"permessage-deflate; client_no_context_takeover; server_max_window_bits=10"
+        )
+    ).
+
+parse_extensions_skips_empty_offers_from_double_commas_test() ->
+    ?assertEqual(
+        [{~"permessage-deflate", []}, {~"x-foo", []}],
+        roadrunner_ws:parse_extensions(~"permessage-deflate, , x-foo")
+    ).
+
+parse_extensions_unterminated_quote_yields_rest_as_value_test() ->
+    %% Malformed: opening `"` without a closing quote. The parser
+    %% lenient-handles by returning everything after the opening
+    %% quote as the value (better than crashing on a buggy client).
+    ?assertEqual(
+        [{~"permessage-deflate", [{~"server_max_window_bits", ~"10"}]}],
+        roadrunner_ws:parse_extensions(~"permessage-deflate; server_max_window_bits=\"10")
+    ).
+
+%% =============================================================================
 %% parse_frame/1
 %% =============================================================================
 
