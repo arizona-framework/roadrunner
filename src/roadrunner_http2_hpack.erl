@@ -305,22 +305,22 @@ take_pending_update(#hpack_ctx{pending_update = true, max_size = N} = Ctx) ->
 encode_each([], Ctx) ->
     {[], Ctx};
 encode_each([{Name, Value} = H | Rest], Ctx) ->
-    Bytes =
+    %% Single `full_match/3` lookup decides BOTH the wire emission
+    %% and whether to insert into the dynamic table — calling it
+    %% twice (as the prior shape did) was 2× the static-table
+    %% scan + persistent_term reads per response header on the
+    %% hot path.
+    {Bytes, Ctx1} =
         case full_match(Name, Value, Ctx) of
             {ok, Idx} ->
-                encode_indexed(Idx);
+                {encode_indexed(Idx), Ctx};
             none ->
-                case name_match(Name, Ctx) of
-                    {ok, Idx} ->
-                        encode_literal_indexed_name(Idx, Value);
-                    none ->
-                        encode_literal_new_name(Name, Value)
-                end
-        end,
-    Ctx1 =
-        case full_match(Name, Value, Ctx) of
-            {ok, _} -> Ctx;
-            none -> insert(H, Ctx)
+                Bs =
+                    case name_match(Name, Ctx) of
+                        {ok, Idx} -> encode_literal_indexed_name(Idx, Value);
+                        none -> encode_literal_new_name(Name, Value)
+                    end,
+                {Bs, insert(H, Ctx)}
         end,
     {Tail, Ctx2} = encode_each(Rest, Ctx1),
     {[Bytes | Tail], Ctx2}.
