@@ -8,8 +8,6 @@
       }
    ],
    "cases": ["*"],
-   "exclude-cases": [
-      "13.3.*"
-   ],
+   "exclude-cases": [],
    "exclude-agent-cases": {}
 }
