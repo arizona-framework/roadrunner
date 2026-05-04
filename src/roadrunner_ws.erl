@@ -22,7 +22,8 @@ features.
     parse_opts/0,
     encode_opts/0,
     permessage_deflate_params/0,
-    negotiated/0
+    negotiated/0,
+    close_code/0
 ]).
 
 -define(EXT_OFFER_CP_KEY, {?MODULE, ext_offer_cp}).
@@ -68,6 +69,13 @@ features.
 -type negotiated() ::
     none
     | {permessage_deflate, permessage_deflate_params(), ResponseHeaderValue :: binary()}.
+
+%% Close status codes a server is permitted to send per RFC 6455 §7.4.
+%% 1004/1005/1006 are reserved (MUST NOT appear on the wire);
+%% 1012/1013 are unassigned. 3000-3999 is the IANA-registered range,
+%% 4000-4999 is for application-private use.
+-type close_code() ::
+    1000..1003 | 1007..1011 | 1014 | 3000..4999.
 
 %% RFC 6455 §1.3 magic GUID concatenated with the client key before
 %% hashing — fixed by spec.

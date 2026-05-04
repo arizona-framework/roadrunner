@@ -69,7 +69,7 @@ NewState}`, `{ok, NewState}`, `{close, NewState}`, or
     | {ok, NewState :: term()}
     | {ok, NewState :: term(), [opt()]}
     | {close, NewState :: term()}
-    | {close, Code :: non_neg_integer(), Reason :: iodata(), NewState :: term()}.
+    | {close, Code :: roadrunner_ws:close_code(), Reason :: iodata(), NewState :: term()}.
 
 -callback init(State :: term()) -> result().
 -callback handle_frame(Frame :: roadrunner_ws:frame(), State :: term()) -> result().

@@ -845,7 +845,7 @@ apply_handler_result(Result, Data, Hibernate, Continue) ->
 %% violate §7.4 / §8.1 and the peer would (correctly) close us with
 %% 1002. A handler that supplies bad inputs has a bug; let it crash
 %% with a tagged error rather than silently send garbage.
--spec close_payload(non_neg_integer(), iodata()) -> binary().
+-spec close_payload(roadrunner_ws:close_code(), iodata()) -> binary().
 close_payload(Code, Reason) ->
     ReasonBin = iolist_to_binary(Reason),
     case is_valid_close_code(Code) andalso is_valid_utf8(ReasonBin) of
