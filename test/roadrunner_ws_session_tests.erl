@@ -715,6 +715,60 @@ out_of_range_utf8_at_fragment_2_closes_immediately_test() ->
     ?assertEqual(<<16#88, 2, 1007:16>>, Sent),
     Sink ! stop.
 
+close_with_status_code_echoes_code_back_test() ->
+    %% RFC 6455 §5.5.1: when the peer's close carries a status code,
+    %% the server's echoed close should carry the same code (so a
+    %% "bring me down with code 1000" handshake completes cleanly).
+    Sent = run_close_test(<<1000:16>>),
+    %% Echoed close: opcode 0x88, length 2, code 1000.
+    ?assertEqual(<<16#88, 2, 1000:16>>, Sent).
+
+close_with_status_and_reason_echoes_only_code_test() ->
+    %% Server echoes JUST the status code, dropping the peer's reason
+    %% text (RFC 6455 doesn't require propagating it back).
+    Sent = run_close_test(<<1000:16, "bye">>),
+    ?assertEqual(<<16#88, 2, 1000:16>>, Sent).
+
+close_without_status_code_echoes_empty_test() ->
+    %% Bare close (no payload) → bare close echo.
+    Sent = run_close_test(<<>>),
+    ?assertEqual(<<16#88, 0>>, Sent).
+
+close_with_malformed_one_byte_payload_replies_1002_test() ->
+    %% A 1-byte close payload is malformed (status code requires 2
+    %% bytes). Per RFC 6455 §7.4.1 reply with 1002 (protocol error).
+    Sent = run_close_test(<<16#FF>>),
+    ?assertEqual(<<16#88, 2, 1002:16>>, Sent).
+
+close_with_invalid_status_code_replies_1002_test() ->
+    %% Code 0 is reserved/never-used per RFC 6455 §7.4. Reply 1002.
+    Sent = run_close_test(<<0:16>>),
+    ?assertEqual(<<16#88, 2, 1002:16>>, Sent).
+
+close_with_reserved_status_code_replies_1002_test() ->
+    %% 1004/1005/1006 are reserved and MUST NOT appear on the wire.
+    Sent = run_close_test(<<1005:16>>),
+    ?assertEqual(<<16#88, 2, 1002:16>>, Sent).
+
+close_with_app_range_status_code_echoes_test() ->
+    %% 4000-4999 is the application-private range — valid on the wire.
+    Sent = run_close_test(<<4242:16>>),
+    ?assertEqual(<<16#88, 2, 4242:16>>, Sent).
+
+close_each_valid_assigned_code_echoes_test() ->
+    %% Run once per assigned valid close code (RFC 6455 §7.4.1) to
+    %% lock the per-code branches in `is_valid_close_code/1`.
+    [
+        ?assertEqual(<<16#88, 2, Code:16>>, run_close_test(<<Code:16>>))
+     || Code <- [1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1014]
+    ].
+
+close_with_invalid_utf8_reason_replies_1007_or_1002_test() ->
+    %% Reason text MUST be valid UTF-8. Invalid → 1002 (we pick that
+    %% over 1007 since the close handshake is itself the protocol layer).
+    Sent = run_close_test(<<1000:16, 16#FF>>),
+    ?assertEqual(<<16#88, 2, 1002:16>>, Sent).
+
 empty_text_frame_round_trips_test() ->
     %% Empty-payload text frame (FIN=1, payload length 0). Wire-level
     %% peek returns Available=0 → ToValidate=0 path. Echoes back
@@ -1136,6 +1190,39 @@ uncompressed_fragment(Opcode, Payload, Fin) ->
             {continuation, false} -> 16#00
         end,
     <<OpByte, (16#80 bor Len), Mask/binary, Masked/binary>>.
+
+%% Run a single masked close frame with the given payload and return
+%% whatever bytes the server emits before terminating. Encapsulates
+%% the "session terminates on close" cleanup — no need to call
+%% `gen_statem:stop` afterwards.
+run_close_test(ClosePayload) ->
+    Self = self(),
+    Tag = make_ref(),
+    Mask = <<1, 2, 3, 4>>,
+    Len = byte_size(ClosePayload),
+    Frame =
+        case Len of
+            0 ->
+                <<16#88, 16#80, Mask/binary>>;
+            _ ->
+                Masked = mask(ClosePayload, Mask),
+                <<16#88, (16#80 bor Len), Mask/binary, Masked/binary>>
+        end,
+    Sink = spawn_active_sink(Self, Tag, [{recv, Frame}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    Sink ! stop,
+    Sent.
 
 %% Default-shape negotiated permessage-deflate (context takeover ON,
 %% windowBits=15) — used by the majority of PMD tests.
