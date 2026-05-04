@@ -64,7 +64,7 @@ connection crash doesn't take the pool down.
     tls => [ssl:tls_server_option()],
     %% When `true` AND `tls` is set, the listener advertises `h2` ahead
     %% of `http/1.1` in `alpn_preferred_protocols`; clients that
-    %% negotiate `h2` are dispatched to `roadrunner_conn_loop_h2`
+    %% negotiate `h2` are dispatched to `roadrunner_conn_loop_http2`
     %% instead of the HTTP/1.1 path. Default `false`. User-supplied
     %% `alpn_preferred_protocols` in `tls` opts win — set this opt only
     %% if you want roadrunner to manage the ALPN list automatically.
@@ -243,7 +243,7 @@ open_listen_socket(Port, #{tls := UserTlsOpts0} = Opts) ->
     %% hardened defaults underneath (user values win) and layer the
     %% standard transport options on top so accepted sockets behave like
     %% the plain-TCP variant.
-    UserTlsOpts = inject_h2_alpn(UserTlsOpts0, Opts),
+    UserTlsOpts = inject_http2_alpn(UserTlsOpts0, Opts),
     TlsOpts = roadrunner_transport:apply_tls_defaults(UserTlsOpts),
     roadrunner_transport:listen_tls(Port, TlsOpts ++ base_listen_opts());
 open_listen_socket(Port, _Opts) ->
@@ -257,13 +257,13 @@ base_listen_opts() ->
 %% When `http2_enabled => true` and the user didn't supply their own
 %% `alpn_preferred_protocols`, advertise `h2` ahead of `http/1.1`.
 %% User-supplied ALPN list always wins.
--spec inject_h2_alpn([ssl:tls_server_option()], opts()) -> [ssl:tls_server_option()].
-inject_h2_alpn(UserTlsOpts, #{http2_enabled := true}) ->
+-spec inject_http2_alpn([ssl:tls_server_option()], opts()) -> [ssl:tls_server_option()].
+inject_http2_alpn(UserTlsOpts, #{http2_enabled := true}) ->
     case lists:keymember(alpn_preferred_protocols, 1, UserTlsOpts) of
         true -> UserTlsOpts;
         false -> [{alpn_preferred_protocols, [~"h2", ~"http/1.1"]} | UserTlsOpts]
     end;
-inject_h2_alpn(UserTlsOpts, _Opts) ->
+inject_http2_alpn(UserTlsOpts, _Opts) ->
     UserTlsOpts.
 
 %% Multiple acceptor processes all calling gen_tcp:accept on the same listen

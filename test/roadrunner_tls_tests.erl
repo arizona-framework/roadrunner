@@ -61,7 +61,7 @@ cleanup(_) ->
 
 %% =============================================================================
 %% HTTP/2 ALPN dispatch — `http2_enabled => true` advertises `h2`,
-%% h2-capable clients reach `roadrunner_conn_loop_h2` (Phase H1 stub
+%% h2-capable clients reach `roadrunner_conn_loop_http2` (Phase H1 stub
 %% sends empty SETTINGS + GOAWAY and closes). h1 clients on the same
 %% listener still get the HTTP/1.1 path.
 %% =============================================================================
@@ -69,7 +69,7 @@ cleanup(_) ->
 h2_alpn_dispatch_test_() ->
     {setup, fun setup_h2/0, fun cleanup_h2/1, fun({Port, ClientOpts}) ->
         [
-            {"h2 ALPN reaches the conn_loop_h2 stub (SETTINGS + GOAWAY)", fun() ->
+            {"h2 ALPN reaches the conn_loop_http2 stub (SETTINGS + GOAWAY)", fun() ->
                 {ok, Sock} = ssl:connect(
                     {127, 0, 0, 1},
                     Port,
@@ -123,16 +123,16 @@ h2_alpn_dispatch_test_() ->
 setup_h2() ->
     {ok, _} = application:ensure_all_started(ssl),
     ClientOpts = [{verify, verify_none} | roadrunner_test_certs:client_opts()],
-    {ok, _} = roadrunner_listener:start_link(tls_h2_test_listener, #{
+    {ok, _} = roadrunner_listener:start_link(tls_http2_test_listener, #{
         port => 0,
         tls => roadrunner_test_certs:server_opts(),
         http2_enabled => true
     }),
-    Port = roadrunner_listener:port(tls_h2_test_listener),
+    Port = roadrunner_listener:port(tls_http2_test_listener),
     {Port, ClientOpts}.
 
 cleanup_h2(_) ->
-    ok = roadrunner_listener:stop(tls_h2_test_listener).
+    ok = roadrunner_listener:stop(tls_http2_test_listener).
 
 %% User-supplied `alpn_preferred_protocols` always wins, even if
 %% `http2_enabled => true`. Verifies the listener doesn't blindly

@@ -141,12 +141,12 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
             StartMono = roadrunner_telemetry:listener_accept(#{
                 listener_name => ListenerName, peer => Peer
             }),
-            case h2_negotiated(Socket, ProtoOpts) of
+            case http2_negotiated(Socket, ProtoOpts) of
                 true ->
                     %% ALPN landed on `h2` and the listener allows it —
                     %% the HTTP/2 path takes over. Slot release and
                     %% `listener_conn_close` happen inside the h2 module.
-                    roadrunner_conn_loop_h2:enter(
+                    roadrunner_conn_loop_http2:enter(
                         Socket, ProtoOpts, ListenerName, Peer, StartMono
                     );
                 false ->
@@ -181,8 +181,8 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
 %% True iff the listener has h2 enabled AND the TLS handshake
 %% negotiated `h2`. Plain TCP and TLS sessions where the client
 %% picked `http/1.1` (or sent no ALPN) fall through to HTTP/1.1.
--spec h2_negotiated(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> boolean().
-h2_negotiated(Socket, ProtoOpts) ->
+-spec http2_negotiated(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> boolean().
+http2_negotiated(Socket, ProtoOpts) ->
     case maps:get(http2_enabled, ProtoOpts, false) of
         true ->
             case roadrunner_transport:negotiated_alpn(Socket) of

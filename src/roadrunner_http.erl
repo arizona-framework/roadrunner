@@ -1,7 +1,7 @@
 -module(roadrunner_http).
 -moduledoc """
 Protocol-version-agnostic HTTP semantics shared by HTTP/1.1
-(`roadrunner_http1`) and any future HTTP/2 (`roadrunner_h2_*`)
+(`roadrunner_http1`) and any future HTTP/2 (`roadrunner_http2_*`)
 modules.
 
 What lives here is RFC 9110 semantics — types and helpers whose

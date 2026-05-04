@@ -1,4 +1,4 @@
--module(roadrunner_conn_loop_h2).
+-module(roadrunner_conn_loop_http2).
 -moduledoc """
 HTTP/2 (RFC 9113) connection process.
 
@@ -52,7 +52,7 @@ slot and firing `[roadrunner, listener, conn_close]` telemetry.
     integer()
 ) -> no_return().
 enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
-    proc_lib:set_label({roadrunner_conn_loop_h2, ListenerName, Peer}),
+    proc_lib:set_label({roadrunner_conn_loop_http2, ListenerName, Peer}),
     %% Phase H1 stub: announce the connection, immediately tear it
     %% down. The peer sees a real h2 conn (preface SETTINGS) followed
     %% by an explicit GOAWAY rather than a TCP RST, so its error

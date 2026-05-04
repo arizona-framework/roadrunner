@@ -1,4 +1,4 @@
--module(roadrunner_conn_loop_h2_tests).
+-module(roadrunner_conn_loop_http2_tests).
 -include_lib("eunit/include/eunit.hrl").
 
 %% =============================================================================
@@ -26,7 +26,7 @@ enter_sends_settings_then_goaway_and_closes_test() ->
     ok = atomics:add(Counter, 1, 1),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
-        roadrunner_conn_loop_h2:enter(
+        roadrunner_conn_loop_http2:enter(
             Sock, ProtoOpts, h2_stub_test, undefined, erlang:monotonic_time()
         )
     end),
