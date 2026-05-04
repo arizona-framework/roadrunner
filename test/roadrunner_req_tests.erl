@@ -382,6 +382,28 @@ read_body_chunked_manual_state_error_propagates_test() ->
     Req = (sample_req())#{body_state => BS},
     ?assertEqual({error, closed}, roadrunner_req:read_body_chunked(Req)).
 
+%% Pending bytes don't satisfy the requested length, recursion needs
+%% more from recv, recv errors. The pending-clause must propagate the
+%% inner error up untransformed (otherwise we'd build garbage iodata
+%% with `[Pending | RestIo]` even though RestIo is an error tuple).
+read_body_chunked_manual_pending_then_recv_error_test() ->
+    BS = #{
+        framing => chunked,
+        %% Wire still has half a chunk header — parse_chunk returns
+        %% `{more, _}` and the session falls into recv.
+        buffered => ~"5\r\n",
+        bytes_read => 0,
+        pending => ~"hi",
+        done => false,
+        recv => fun() -> {error, closed} end,
+        max => 1000
+    },
+    Req = (sample_req())#{body_state => BS},
+    ?assertEqual(
+        {error, closed},
+        roadrunner_req:read_body(Req, #{length => 5})
+    ).
+
 has_body_absent_returns_false_test() ->
     ?assertEqual(false, roadrunner_req:has_body(sample_req())).
 

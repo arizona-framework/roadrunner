@@ -548,26 +548,38 @@ consume_body_state(
 consume_body_state(#{framing := chunked} = BS, all) ->
     %% Drain everything left: any pending decoded bytes plus all
     %% remaining chunks, accumulated in one return.
-    chunked_collect(BS, infinity, []);
+    finalize_chunked(chunked_collect(BS, infinity));
 consume_body_state(#{framing := chunked} = BS, {length, N}) ->
-    chunked_collect(BS, N, []);
+    finalize_chunked(chunked_collect(BS, N));
 consume_body_state(#{framing := chunked} = BS, next_chunk) ->
     next_chunk(BS).
 %% Non-chunked framing (none, content_length) is handled by the
 %% earlier clauses above — `next_chunk` is treated as a full drain
 %% inside those, since there are no chunk boundaries to honor.
 
-%% Pull decoded chunked-body bytes out of `BS` until either `Want`
-%% bytes are collected or the body is fully drained. `Want` is either
-%% `infinity` (drain to end — caller asked for `all`) or a positive
-%% integer (caller asked for `{length, N}`). Returns `{ok, Bytes, BS2}`
-%% when no more body remains, `{more, Bytes, BS2}` when bytes were
-%% returned but the body is not yet exhausted, or `{error, Reason}`.
--spec chunked_collect(body_state(), infinity | non_neg_integer(), [binary()]) ->
+-spec finalize_chunked(
+    {ok, iodata(), body_state()}
+    | {more, iodata(), body_state()}
+    | {error, term()}
+) ->
     {ok, binary(), body_state()}
     | {more, binary(), body_state()}
     | {error, term()}.
-chunked_collect(#{pending := Pending} = BS, Want, Acc) when
+finalize_chunked({ok, Iodata, BS}) -> {ok, iolist_to_binary(Iodata), BS};
+finalize_chunked({more, Iodata, BS}) -> {more, iolist_to_binary(Iodata), BS};
+finalize_chunked({error, _} = E) -> E.
+
+%% Pull decoded chunked-body bytes out of `BS` until either `Want`
+%% bytes are collected or the body is fully drained. `Want` is either
+%% `infinity` (drain to end — caller asked for `all`) or a positive
+%% integer (caller asked for `{length, N}`). Returns
+%% `{ok | more, Bytes, BS2}` (Bytes as iodata so each frame conses
+%% in front on the way out — caller flattens) or `{error, Reason}`.
+-spec chunked_collect(body_state(), infinity | non_neg_integer()) ->
+    {ok, iodata(), body_state()}
+    | {more, iodata(), body_state()}
+    | {error, term()}.
+chunked_collect(#{pending := Pending} = BS, Want) when
     Want =/= infinity, byte_size(Pending) >= Want
 ->
     %% Pending alone satisfies the request — no need to look at the
@@ -575,19 +587,24 @@ chunked_collect(#{pending := Pending} = BS, Want, Acc) when
     %% `more` here and let the next call detect end-of-body via the
     %% `done` clause below.
     <<Take:Want/binary, RestPending/binary>> = Pending,
-    Out = iolist_to_binary(lists:reverse([Take | Acc])),
-    {more, Out, BS#{pending := RestPending}};
-chunked_collect(#{pending := Pending} = BS, Want, Acc) when byte_size(Pending) > 0 ->
+    {more, [Take], BS#{pending := RestPending}};
+chunked_collect(#{pending := Pending} = BS, Want) when byte_size(Pending) > 0 ->
     %% Take everything pending, then try to fill more from the wire.
+    %% Cons `Pending` in front of the recursion's result on the way
+    %% out — body recursion replaces the old `[Pending | Acc]` /
+    %% `lists:reverse` shape.
     NewWant =
         case Want of
             infinity -> infinity;
             N -> N - byte_size(Pending)
         end,
-    chunked_collect(BS#{pending := <<>>}, NewWant, [Pending | Acc]);
-chunked_collect(#{done := true} = BS, _Want, Acc) ->
-    {ok, iolist_to_binary(lists:reverse(Acc)), BS};
-chunked_collect(#{buffered := Buf, recv := Recv, max := Max, bytes_read := Read} = BS, Want, Acc) ->
+    case chunked_collect(BS#{pending := <<>>}, NewWant) of
+        {Tag, RestIo, BS2} -> {Tag, [Pending | RestIo], BS2};
+        {error, _} = E -> E
+    end;
+chunked_collect(#{done := true} = BS, _Want) ->
+    {ok, [], BS};
+chunked_collect(#{buffered := Buf, recv := Recv, max := Max, bytes_read := Read} = BS, Want) ->
     case roadrunner_http1:parse_chunk(Buf) of
         {ok, Data, Rest} ->
             NewRead = Read + byte_size(Data),
@@ -596,14 +613,14 @@ chunked_collect(#{buffered := Buf, recv := Recv, max := Max, bytes_read := Read}
                     {error, content_length_too_large};
                 false ->
                     BS2 = BS#{buffered := Rest, bytes_read := NewRead, pending := Data},
-                    chunked_collect(BS2, Want, Acc)
+                    chunked_collect(BS2, Want)
             end;
         {ok, last, _Trailers, Rest} ->
-            chunked_collect(BS#{buffered := Rest, done := true}, Want, Acc);
+            chunked_collect(BS#{buffered := Rest, done := true}, Want);
         {more, _} ->
             case Recv() of
                 {ok, More} ->
-                    chunked_collect(BS#{buffered := <<Buf/binary, More/binary>>}, Want, Acc);
+                    chunked_collect(BS#{buffered := <<Buf/binary, More/binary>>}, Want);
                 {error, _} = E ->
                     E
             end;
