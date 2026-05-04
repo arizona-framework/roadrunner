@@ -85,7 +85,11 @@ read it anyway.
     requests_counter := atomics:atomics_ref(),
     minimum_bytes_per_second := non_neg_integer(),
     body_buffering := auto | manual,
-    listener_name => atom()
+    listener_name => atom(),
+    %% When `true`, the conn dispatch forks to `roadrunner_conn_loop_h2`
+    %% if the post-handshake ALPN selection landed on `h2`. Default
+    %% `false` (HTTP/1.1 only).
+    http2_enabled => boolean()
 }.
 
 %% Opaque body-read state attached to the request in manual buffering

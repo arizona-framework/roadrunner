@@ -181,6 +181,21 @@ fake_peername_returns_stub_test() ->
     ?assertEqual({ok, {{127, 0, 0, 1}, 0}}, roadrunner_transport:peername({fake, self()})).
 
 %% =============================================================================
+%% negotiated_alpn/1 — ALPN protocol probe used by the conn dispatch
+%% to fork between HTTP/1.1 and HTTP/2.
+%% =============================================================================
+
+negotiated_alpn_on_fake_returns_undefined_test() ->
+    %% Fake transport never has TLS — no ALPN to negotiate.
+    ?assertEqual(undefined, roadrunner_transport:negotiated_alpn({fake, self()})).
+
+negotiated_alpn_on_gen_tcp_returns_undefined_test() ->
+    %% Plain TCP transport — no ALPN concept.
+    {ok, LSock} = gen_tcp:listen(0, [binary, {active, false}]),
+    ?assertEqual(undefined, roadrunner_transport:negotiated_alpn({gen_tcp, LSock})),
+    ok = gen_tcp:close(LSock).
+
+%% =============================================================================
 %% setopts/2 + messages/1 — active-mode foundation. Real gen_tcp / ssl
 %% paths are exercised via the listener integration tests; the fake-
 %% transport coverage and the static atom triples are unit-tested here.

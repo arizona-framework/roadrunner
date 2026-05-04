@@ -53,7 +53,8 @@ server-side stapling at the time of writing.
     setopts/2,
     messages/1,
     default_tls_opts/0,
-    apply_tls_defaults/1
+    apply_tls_defaults/1,
+    negotiated_alpn/1
 ]).
 
 -export_type([socket/0]).
@@ -375,6 +376,26 @@ apply_tls_defaults(UserOpts) ->
         not lists:member(Key, UserKeys)
     ],
     Defaults ++ UserOpts.
+
+-doc """
+Return the ALPN protocol selected during the TLS handshake, or
+`undefined` if the transport is not TLS or no ALPN was negotiated.
+
+Used by the connection dispatch to fork between HTTP/1.1 and HTTP/2
+based on what the client picked from the listener's
+`alpn_preferred_protocols`.
+""".
+-spec negotiated_alpn(socket()) -> {ok, binary()} | undefined.
+negotiated_alpn({ssl, S}) ->
+    case ssl:negotiated_protocol(S) of
+        {ok, Proto} -> {ok, Proto};
+        %% `{error, protocol_not_negotiated}` and any other error
+        %% (closed socket, etc.) collapse to `undefined` so callers
+        %% just default to HTTP/1.1.
+        {error, _} -> undefined
+    end;
+negotiated_alpn(_) ->
+    undefined.
 
 %% --- internal ---
 

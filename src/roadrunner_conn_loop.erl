@@ -141,21 +141,31 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
             StartMono = roadrunner_telemetry:listener_accept(#{
                 listener_name => ListenerName, peer => Peer
             }),
-            S = #loop_state{
-                socket = Socket,
-                proto_opts = ProtoOpts,
-                listener_name = ListenerName,
-                start_mono = StartMono,
-                peer = Peer,
-                scheme = Scheme,
-                requests_counter = maps:get(requests_counter, ProtoOpts),
-                dispatch = maps:get(dispatch, ProtoOpts),
-                middlewares = maps:get(middlewares, ProtoOpts),
-                max_content_length = maps:get(max_content_length, ProtoOpts),
-                max_keep_alive_request = maps:get(max_keep_alive_request, ProtoOpts),
-                min_rate = maps:get(minimum_bytes_per_second, ProtoOpts)
-            },
-            read_request_phase(S);
+            case h2_negotiated(Socket, ProtoOpts) of
+                true ->
+                    %% ALPN landed on `h2` and the listener allows it —
+                    %% the HTTP/2 path takes over. Slot release and
+                    %% `listener_conn_close` happen inside the h2 module.
+                    roadrunner_conn_loop_h2:enter(
+                        Socket, ProtoOpts, ListenerName, Peer, StartMono
+                    );
+                false ->
+                    S = #loop_state{
+                        socket = Socket,
+                        proto_opts = ProtoOpts,
+                        listener_name = ListenerName,
+                        start_mono = StartMono,
+                        peer = Peer,
+                        scheme = Scheme,
+                        requests_counter = maps:get(requests_counter, ProtoOpts),
+                        dispatch = maps:get(dispatch, ProtoOpts),
+                        middlewares = maps:get(middlewares, ProtoOpts),
+                        max_content_length = maps:get(max_content_length, ProtoOpts),
+                        max_keep_alive_request = maps:get(max_keep_alive_request, ProtoOpts),
+                        min_rate = maps:get(minimum_bytes_per_second, ProtoOpts)
+                    },
+                    read_request_phase(S)
+            end;
         {roadrunner_drain, _Deadline} ->
             %% Drain before `shoot` — no telemetry was fired yet (accept
             %% pairs with `shoot`), so no listener_conn_close either. Just
@@ -166,6 +176,21 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
             %% silently; we do the same so a buggy library can't crash the
             %% conn with a typo'd message.
             awaiting_shoot(Socket, ProtoOpts, ListenerName)
+    end.
+
+%% True iff the listener has h2 enabled AND the TLS handshake
+%% negotiated `h2`. Plain TCP and TLS sessions where the client
+%% picked `http/1.1` (or sent no ALPN) fall through to HTTP/1.1.
+-spec h2_negotiated(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> boolean().
+h2_negotiated(Socket, ProtoOpts) ->
+    case maps:get(http2_enabled, ProtoOpts, false) of
+        true ->
+            case roadrunner_transport:negotiated_alpn(Socket) of
+                {ok, ~"h2"} -> true;
+                _ -> false
+            end;
+        false ->
+            false
     end.
 
 %% --- read_request phase ---

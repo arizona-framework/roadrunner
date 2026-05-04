@@ -61,7 +61,14 @@ connection crash doesn't take the pool down.
     %% receive's `after` clause has a window to call
     %% `erlang:hibernate/3`.
     hibernate_after => pos_integer(),
-    tls => [ssl:tls_server_option()]
+    tls => [ssl:tls_server_option()],
+    %% When `true` AND `tls` is set, the listener advertises `h2` ahead
+    %% of `http/1.1` in `alpn_preferred_protocols`; clients that
+    %% negotiate `h2` are dispatched to `roadrunner_conn_loop_h2`
+    %% instead of the HTTP/1.1 path. Default `false`. User-supplied
+    %% `alpn_preferred_protocols` in `tls` opts win — set this opt only
+    %% if you want roadrunner to manage the ALPN list automatically.
+    http2_enabled => boolean()
 }.
 
 -record(state, {
@@ -231,11 +238,12 @@ listener_name() ->
 
 -spec open_listen_socket(inet:port_number(), opts()) ->
     {ok, roadrunner_transport:socket()} | {error, term()}.
-open_listen_socket(Port, #{tls := UserTlsOpts}) ->
+open_listen_socket(Port, #{tls := UserTlsOpts0} = Opts) ->
     %% TLS path — caller supplies cert/key; we merge `roadrunner_transport`'s
     %% hardened defaults underneath (user values win) and layer the
     %% standard transport options on top so accepted sockets behave like
     %% the plain-TCP variant.
+    UserTlsOpts = inject_h2_alpn(UserTlsOpts0, Opts),
     TlsOpts = roadrunner_transport:apply_tls_defaults(UserTlsOpts),
     roadrunner_transport:listen_tls(Port, TlsOpts ++ base_listen_opts());
 open_listen_socket(Port, _Opts) ->
@@ -245,6 +253,18 @@ open_listen_socket(Port, _Opts) ->
 -spec base_listen_opts() -> [gen_tcp:listen_option()].
 base_listen_opts() ->
     [binary, {active, false}, {reuseaddr, true}, {packet, raw}].
+
+%% When `http2_enabled => true` and the user didn't supply their own
+%% `alpn_preferred_protocols`, advertise `h2` ahead of `http/1.1`.
+%% User-supplied ALPN list always wins.
+-spec inject_h2_alpn([ssl:tls_server_option()], opts()) -> [ssl:tls_server_option()].
+inject_h2_alpn(UserTlsOpts, #{http2_enabled := true}) ->
+    case lists:keymember(alpn_preferred_protocols, 1, UserTlsOpts) of
+        true -> UserTlsOpts;
+        false -> [{alpn_preferred_protocols, [~"h2", ~"http/1.1"]} | UserTlsOpts]
+    end;
+inject_h2_alpn(UserTlsOpts, _Opts) ->
+    UserTlsOpts.
 
 %% Multiple acceptor processes all calling gen_tcp:accept on the same listen
 %% socket — Linux/BSD accept is thread-safe and avoids thundering-herd via
@@ -281,7 +301,8 @@ build_proto_opts(Opts, ListenerName) ->
         minimum_bytes_per_second =>
             maps:get(minimum_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
         body_buffering => maps:get(body_buffering, Opts, auto),
-        listener_name => ListenerName
+        listener_name => ListenerName,
+        http2_enabled => maps:get(http2_enabled, Opts, false)
     },
     WithHibernate =
         %% Optional `hibernate_after` — `roadrunner_conn_loop` reads it
