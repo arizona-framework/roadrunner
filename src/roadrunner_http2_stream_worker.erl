@@ -161,26 +161,17 @@ emit_501(ConnPid, StreamId) ->
         ~"HTTP/2 does not yet support this response shape"
     ).
 
-%% Buffered response: HEADERS (END_STREAM if body empty) + DATA.
+%% Buffered response: a single conn-side message that emits
+%% HEADERS + (optional) DATA in one `ssl:send/2` for the common
+%% case where the body fits in a single DATA frame AND the
+%% stream's flow-control window. Conn-side handler falls back to
+%% the two-step (HEADERS, then queued DATA) path for large bodies
+%% or constrained windows; the worker still sees a single sync
+%% round-trip in either case.
 send_buffered(ConnPid, StreamId, Status, Headers, Body) ->
     Bin = iolist_to_binary(Body),
-    case Bin of
-        <<>> ->
-            send_headers_sync(ConnPid, StreamId, Status, Headers, true);
-        _ ->
-            send_headers_sync(ConnPid, StreamId, Status, Headers, false),
-            send_data_sync(ConnPid, StreamId, Bin, true)
-    end.
-
-send_headers_sync(ConnPid, StreamId, Status, Headers, EndStream) ->
     sync(ConnPid, fun(Ref) ->
-        _ = (ConnPid ! {h2_send_headers, self(), Ref, StreamId, Status, Headers, EndStream}),
-        ok
-    end).
-
-send_data_sync(ConnPid, StreamId, Bin, EndStream) ->
-    sync(ConnPid, fun(Ref) ->
-        _ = (ConnPid ! {h2_send_data, self(), Ref, StreamId, Bin, EndStream}),
+        _ = (ConnPid ! {h2_send_response, self(), Ref, StreamId, Status, Headers, Bin}),
         ok
     end).
 

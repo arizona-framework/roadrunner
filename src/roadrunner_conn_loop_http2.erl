@@ -324,6 +324,8 @@ recv_more(
             recv_more(handle_send_data(State, From, Ref, StreamId, Bin, EndStream));
         {h2_send_trailers, From, Ref, StreamId, Trailers} ->
             recv_more(handle_send_trailers(State, From, Ref, StreamId, Trailers));
+        {h2_send_response, From, Ref, StreamId, Status, Headers, Body} ->
+            recv_more(handle_send_response(State, From, Ref, StreamId, Status, Headers, Body));
         {h2_worker_done, StreamId} ->
             recv_more(handle_worker_done(State, StreamId));
         {'DOWN', MonRef, process, _Pid, Reason} ->
@@ -797,6 +799,53 @@ content_length_matches(Headers, BodyLen) ->
 %% Worker → conn message handlers
 %% =============================================================================
 
+%% Single-shot buffered-response path. Encodes HEADERS + (optional)
+%% DATA(END_STREAM) and writes them in ONE `ssl:send/2`, halving
+%% the per-response gen_call cost through `tls_sender`. Falls back
+%% to the two-frame two-message path when the body doesn't fit a
+%% single DATA frame AND the current window — the worker still
+%% sees one ack at the end of the data send.
+handle_send_response(State, From, Ref, StreamId, Status, Headers, <<>>) ->
+    %% Empty body — same wire shape as `handle_send_headers` with
+    %% `EndStream = true` (single HEADERS frame, END_STREAM bit set).
+    case stream_open(State, StreamId) of
+        {ok, _Stream} ->
+            State1 = encode_and_send_headers(State, StreamId, Status, Headers, true),
+            _ = (From ! {h2_send_ack, Ref}),
+            State1;
+        not_open ->
+            _ = (From ! {h2_stream_reset, StreamId}),
+            State
+    end;
+handle_send_response(State, From, Ref, StreamId, Status, Headers, Body) ->
+    case stream_open(State, StreamId) of
+        {ok, Stream} ->
+            BodyLen = byte_size(Body),
+            FitsFrame = BodyLen =< ?MAX_FRAME_SIZE,
+            FitsWindow = window_budget(State, Stream) >= BodyLen,
+            case FitsFrame andalso FitsWindow of
+                true ->
+                    State1 = encode_and_send_response_atomic(
+                        State, StreamId, Status, Headers, Body
+                    ),
+                    _ = (From ! {h2_send_ack, Ref}),
+                    State1;
+                false ->
+                    %% Body too big for one frame OR window too narrow —
+                    %% emit HEADERS now, hand the body to `try_send_data`
+                    %% which fragments / queues + acks the worker on
+                    %% completion.
+                    State1 = encode_and_send_headers(
+                        State, StreamId, Status, Headers, false
+                    ),
+                    Stream1 = maps:get(StreamId, State1#loop.streams),
+                    try_send_data(State1, Stream1, StreamId, From, Ref, Body, true)
+            end;
+        not_open ->
+            _ = (From ! {h2_stream_reset, StreamId}),
+            State
+    end.
+
 handle_send_headers(State, From, Ref, StreamId, Status, Headers, EndStream) ->
     case stream_open(State, StreamId) of
         {ok, _Stream} ->
@@ -879,6 +928,32 @@ encode_and_send_headers(
         true -> close_stream_send_side(State1, StreamId);
         false -> State1
     end.
+
+%% HEADERS + DATA (END_STREAM) packed into ONE `ssl:send/2`.
+%% Caller has already verified `byte_size(Body)` fits in a single
+%% DATA frame AND in the current send window. Consumes the window
+%% by `byte_size(Body)` and marks the stream's send side closed.
+encode_and_send_response_atomic(
+    #loop{hpack_enc = Enc, streams = Streams} = State,
+    StreamId,
+    Status,
+    Headers,
+    Body
+) ->
+    Stream = maps:get(StreamId, Streams),
+    StatusBin = integer_to_binary(Status),
+    LowerHeaders = [{lowercase(N), V} || {N, V} <- Headers],
+    AllHeaders = [{~":status", StatusBin} | LowerHeaders],
+    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
+    HpackBin = iolist_to_binary(HpackBlock),
+    HFrame = roadrunner_http2_frame:encode(
+        {headers, StreamId, 16#04, undefined, HpackBin}
+    ),
+    DFrame = roadrunner_http2_frame:encode({data, StreamId, 16#01, Body}),
+    _ = send(State, [HFrame, DFrame]),
+    State1 = State#loop{hpack_enc = Enc1},
+    State2 = consume_send_window(State1, StreamId, Stream, byte_size(Body)),
+    close_stream_send_side(State2, StreamId).
 
 encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
     LowerTrailers = [{lowercase(N), V} || {N, V} <- Trailers],

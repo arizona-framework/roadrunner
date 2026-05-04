@@ -63,6 +63,8 @@ all_test_() ->
         fun headers_for_already_open_stream_without_end_stream_protocol_error/0,
         fun synthetic_send_data_after_reset/0,
         fun synthetic_send_headers_after_reset/0,
+        fun synthetic_send_response_after_reset/0,
+        fun synthetic_send_response_empty_after_reset/0,
         fun synthetic_send_trailers_after_reset/0,
         fun synthetic_send_data_to_closed_stream/0,
         fun handler_returning_invalid_shape_resets_stream/0,
@@ -1110,6 +1112,58 @@ synthetic_send_headers_after_reset() ->
     serve_recv(ConnPid, Rst),
     DRef = make_ref(),
     ConnPid ! {h2_send_headers, self(), DRef, 1, 200, [], true},
+    receive
+        {h2_stream_reset, 1} -> ok
+    after 500 -> error(no_reset)
+    end,
+    cleanup(Pid, Ref).
+
+synthetic_send_response_after_reset() ->
+    %% New buffered-response message path: send a synthetic
+    %% `h2_send_response` for a stream that's been RST'd. Conn
+    %% replies `{h2_stream_reset, _}`. Body non-empty path.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    HpackBin = encode_post_root_headers(),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
+    serve_recv(ConnPid, Rst),
+    DRef = make_ref(),
+    ConnPid ! {h2_send_response, self(), DRef, 1, 200, [], ~"hi"},
+    receive
+        {h2_stream_reset, 1} -> ok
+    after 500 -> error(no_reset)
+    end,
+    cleanup(Pid, Ref).
+
+synthetic_send_response_empty_after_reset() ->
+    %% Same as above but empty body — exercises the
+    %% `handle_send_response/_, _, _, _, _, _, <<>>)` clause's
+    %% `not_open` arm.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    HpackBin = encode_post_root_headers(),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
+    serve_recv(ConnPid, Rst),
+    DRef = make_ref(),
+    ConnPid ! {h2_send_response, self(), DRef, 1, 200, [], <<>>},
     receive
         {h2_stream_reset, 1} -> ok
     after 500 -> error(no_reset)
