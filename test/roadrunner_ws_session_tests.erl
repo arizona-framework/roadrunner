@@ -68,7 +68,7 @@ frame_loop_hibernates_when_handler_returns_hibernate_opt_test() ->
     ]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_hibernate_handler, undefined, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_hibernate_handler, undefined, ws_ctx(), none},
         []
     ),
     Pid ! socket_ready,
@@ -89,7 +89,7 @@ frame_loop_hibernates_on_ok_opt_variant_test() ->
     ]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_hibernate_handler, undefined, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_hibernate_handler, undefined, ws_ctx(), none},
         []
     ),
     Pid ! socket_ready,
@@ -107,7 +107,7 @@ frame_loop_no_hibernate_for_3_tuple_returns_test() ->
     ]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
         []
     ),
     Pid ! socket_ready,
@@ -129,7 +129,7 @@ frame_loop_stops_on_transport_error_event_test() ->
     Sink = spawn_active_sink(Self, Tag, [{error, econnreset}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
         []
     ),
     Ref = monitor(process, Pid),
@@ -155,7 +155,7 @@ frame_loop_closed_after_partial_frame_stops_cleanly_test() ->
     ]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
         []
     ),
     Ref = monitor(process, Pid),
@@ -180,7 +180,7 @@ frame_loop_setopts_error_stops_cleanly_test() ->
     Sink = spawn_active_sink(Self, Tag, []),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
         []
     ),
     Ref = monitor(process, Pid),
@@ -211,7 +211,7 @@ frame_loop_processes_multiple_frames_in_one_chunk_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, TwoFrames}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
         []
     ),
     Pid ! socket_ready,
@@ -231,7 +231,7 @@ frame_loop_drops_unexpected_info_event_test() ->
     Sink = spawn_active_sink(Self, Tag, []),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
         []
     ),
     Pid ! socket_ready,
@@ -257,7 +257,7 @@ init_callback_runs_once_at_session_start_test() ->
     State = #{sink => Self, on_init => ok},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
         []
     ),
     Pid ! socket_ready,
@@ -278,7 +278,7 @@ init_callback_can_push_priming_frames_test() ->
     State = #{sink => Self, on_init => {reply, [{text, ~"snapshot"}]}},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
         []
     ),
     Pid ! socket_ready,
@@ -296,7 +296,7 @@ init_callback_can_request_hibernate_test() ->
     State = #{sink => Self, on_init => ok_hibernate},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
         []
     ),
     Pid ! socket_ready,
@@ -317,7 +317,7 @@ init_callback_close_terminates_session_test() ->
     State = #{sink => Self, on_init => close},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
         []
     ),
     Ref = monitor(process, Pid),
@@ -340,7 +340,7 @@ handle_info_callback_forwards_stray_message_test() ->
     State = #{sink => Self, on_info => {reply, [{text, ~"forwarded"}]}},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
         []
     ),
     Pid ! socket_ready,
@@ -360,7 +360,7 @@ handle_info_callback_can_request_hibernate_test() ->
     State = #{sink => Self, on_info => ok_hibernate},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
         []
     ),
     Pid ! socket_ready,
@@ -383,7 +383,7 @@ handle_info_callback_close_terminates_session_test() ->
     State = #{sink => Self, on_info => close},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx()},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
         []
     ),
     Ref = monitor(process, Pid),
@@ -398,6 +398,265 @@ handle_info_callback_close_terminates_session_test() ->
     %% The handler emits exactly one frame — the close. Opcode 0x88.
     ?assertMatch(<<16#88, _/binary>>, Sent),
     Sink ! stop.
+
+%% =============================================================================
+%% permessage-deflate (RFC 7692) — end-to-end through the session.
+%% =============================================================================
+
+pmd_inflates_compressed_inbound_text_message_test() ->
+    %% Client sends a single-fragment compressed text "hello"; server
+    %% inflates it and dispatches to the echo handler. Echo replies
+    %% with another compressed frame.
+    Self = self(),
+    Tag = make_ref(),
+    Compressed = pmd_compress(~"hello"),
+    %% RSV1=1, FIN=1, masked, opcode text.
+    InboundFrame = pmd_frame(text, Compressed),
+    Sink = spawn_active_sink(Self, Tag, [{recv, InboundFrame}]),
+    Negotiated =
+        {permessage_deflate,
+            #{
+                server_max_window_bits => 15,
+                client_max_window_bits => 15,
+                server_no_context_takeover => false,
+                client_no_context_takeover => false
+            },
+            ~"permessage-deflate"},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    %% The wire response is also compressed (RSV1=1) — first byte
+    %% has FIN(1) RSV1(1) opcode(0001) = 0xC1.
+    ?assertMatch(<<16#c1, _/binary>>, Sent),
+    %% Body bytes: strip the 2-byte header, append PMD trailer, inflate.
+    <<16#c1, Len, Body/binary>> = Sent,
+    ?assertEqual(Len, byte_size(Body)),
+    Decompressed = pmd_decompress(Body),
+    ?assertEqual(~"hello", Decompressed),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+pmd_concatenates_compressed_fragments_before_inflate_test() ->
+    %% Compressed message split across two fragments — first has
+    %% RSV1=1 FIN=0, continuation has RSV1=0 FIN=1. Server must
+    %% concatenate both fragment payloads, append the per-message
+    %% trailer, then inflate.
+    Self = self(),
+    Tag = make_ref(),
+    Compressed = pmd_compress(~"hello world"),
+    %% Split the compressed bytes roughly in half.
+    Mid = byte_size(Compressed) div 2,
+    <<First:Mid/binary, Second/binary>> = Compressed,
+    Frame1 = pmd_frame_fragment(text, First, false, true),
+    Frame2 = pmd_frame_fragment(continuation, Second, true, false),
+    TwoFrames = <<Frame1/binary, Frame2/binary>>,
+    Sink = spawn_active_sink(Self, Tag, [{recv, TwoFrames}]),
+    Negotiated =
+        {permessage_deflate,
+            #{
+                server_max_window_bits => 15,
+                client_max_window_bits => 15,
+                server_no_context_takeover => false,
+                client_no_context_takeover => false
+            },
+            ~"permessage-deflate"},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    <<16#c1, Len, Body/binary>> = Sent,
+    ?assertEqual(Len, byte_size(Body)),
+    Decompressed = pmd_decompress(Body),
+    ?assertEqual(~"hello world", Decompressed),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+pmd_uncompressed_frame_passes_through_when_pmd_negotiated_test() ->
+    %% Even with PMD negotiated, a frame with RSV1=0 is uncompressed.
+    %% Should reach the handler with payload as-sent.
+    Self = self(),
+    Tag = make_ref(),
+    InboundFrame = frame(text, ~"plain"),
+    Sink = spawn_active_sink(Self, Tag, [{recv, InboundFrame}]),
+    Negotiated =
+        {permessage_deflate,
+            #{
+                server_max_window_bits => 15,
+                client_max_window_bits => 15,
+                server_no_context_takeover => false,
+                client_no_context_takeover => false
+            },
+            ~"permessage-deflate"},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    %% Server's reply is still compressed (PMD active for outbound) —
+    %% RSV1=1 → 0xC1. Inflate to verify echo content.
+    <<16#c1, Len, Body/binary>> = Sent,
+    ?assertEqual(Len, byte_size(Body)),
+    ?assertEqual(~"plain", pmd_decompress(Body)),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+pmd_three_way_fragmented_compressed_message_test() ->
+    %% 3 fragments: first (RSV1=1, FIN=0) + middle continuation (FIN=0)
+    %% + last continuation (FIN=1). Exercises the per-fragment Acc
+    %% accumulation branch (Acc is non-undefined when middle arrives).
+    Self = self(),
+    Tag = make_ref(),
+    Compressed = pmd_compress(~"hello world!"),
+    %% Split into 3 roughly-equal pieces.
+    Sz = byte_size(Compressed),
+    A = Sz div 3,
+    B = (2 * Sz) div 3,
+    <<P1:A/binary, P2:(B - A)/binary, P3/binary>> = Compressed,
+    Frame1 = pmd_frame_fragment(text, P1, false, true),
+    Frame2 = pmd_frame_fragment(continuation, P2, false, false),
+    Frame3 = pmd_frame_fragment(continuation, P3, true, false),
+    Three = <<Frame1/binary, Frame2/binary, Frame3/binary>>,
+    Sink = spawn_active_sink(Self, Tag, [{recv, Three}]),
+    Negotiated = pmd_negotiated(),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    <<16#c1, Len, Body/binary>> = Sent,
+    ?assertEqual(Len, byte_size(Body)),
+    ?assertEqual(~"hello world!", pmd_decompress(Body)),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+pmd_corrupt_compressed_payload_stops_session_test() ->
+    %% Garbage bytes in a frame with RSV1=1 — inflate fails. Session
+    %% must terminate cleanly (no crash, no half-sent reply).
+    Self = self(),
+    Tag = make_ref(),
+    Garbage = <<255, 254, 253, 252, 251>>,
+    Frame = pmd_frame(text, Garbage),
+    Sink = spawn_active_sink(Self, Tag, [{recv, Frame}]),
+    Negotiated = pmd_negotiated(),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit_on_corrupt_payload)
+    end,
+    Sink ! stop.
+
+pmd_no_context_takeover_resets_inflate_after_each_message_test() ->
+    %% With client_no_context_takeover negotiated, the server's
+    %% inflate context resets after every message. Two compressed
+    %% messages each compressed with a fresh deflate context — both
+    %% must round-trip correctly even though the server's inflate
+    %% state was reset between them.
+    Self = self(),
+    Tag = make_ref(),
+    First = pmd_compress(~"hello"),
+    Second = pmd_compress(~"world"),
+    Two = <<(pmd_frame(text, First))/binary, (pmd_frame(text, Second))/binary>>,
+    Sink = spawn_active_sink(Self, Tag, [{recv, Two}]),
+    Negotiated =
+        {permessage_deflate,
+            #{
+                server_max_window_bits => 15,
+                client_max_window_bits => 15,
+                server_no_context_takeover => true,
+                client_no_context_takeover => true
+            },
+            ~"permessage-deflate; server_no_context_takeover; client_no_context_takeover"},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    %% Decompose into two RSV1=1 frames and verify each.
+    <<16#c1, L1, B1:L1/binary, 16#c1, L2, B2:L2/binary>> = Sent,
+    ?assertEqual(~"hello", pmd_decompress_fresh(B1)),
+    ?assertEqual(~"world", pmd_decompress_fresh(B2)),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+pmd_uncompressed_continuation_passes_through_test() ->
+    %% Uncompressed continuation frame outside any compressed message.
+    %% Tests `classify_data_frame` returning `regular` for that path
+    %% (compressed_acc=undefined). The echo handler's catch-all clause
+    %% handles it gracefully (no reply expected).
+    Self = self(),
+    Tag = make_ref(),
+    %% First send a non-FIN text frame to put the wire in continuation
+    %% state, then a FIN continuation frame. Both uncompressed.
+    F1 = uncompressed_fragment(text, ~"part1", false),
+    F2 = uncompressed_fragment(continuation, ~"part2", true),
+    Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
+    Negotiated = pmd_negotiated(),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    %% Echo handler replies to the non-FIN text frame with the same
+    %% partial; then sees the continuation and falls through. The
+    %% session stays alive until peer close. We just assert it
+    %% doesn't crash on the continuation.
+    timer:sleep(100),
+    ?assert(is_process_alive(Pid)),
+    Sink ! stop,
+    Pid ! {roadrunner_fake_closed, Sink},
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_normal_exit)
+    end.
+
+pmd_control_frames_stay_uncompressed_test() ->
+    %% RFC 7692 §6.1: control frames MUST NOT be compressed. Server's
+    %% auto-pong reply to an inbound ping must NOT have RSV1=1.
+    Self = self(),
+    Tag = make_ref(),
+    Ping = ping_frame(~"hi"),
+    Sink = spawn_active_sink(Self, Tag, [{recv, Ping}]),
+    Negotiated =
+        {permessage_deflate,
+            #{
+                server_max_window_bits => 15,
+                client_max_window_bits => 15,
+                server_no_context_takeover => false,
+                client_no_context_takeover => false
+            },
+            ~"permessage-deflate"},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    %% Auto-pong: opcode 0xA, FIN=1, RSV1=0 → 0x8A.
+    ?assertMatch(<<16#8a, _/binary>>, Sent),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
 
 %% --- helpers ---
 
@@ -426,6 +685,109 @@ mask(Bin, Key) ->
     KeyBin = binary:copy(Key, (byte_size(Bin) div 4) + 1),
     <<KeySlice:(byte_size(Bin))/binary, _/binary>> = KeyBin,
     crypto:exor(Bin, KeySlice).
+
+%% Build a single-fragment compressed text/binary frame: FIN=1, RSV1=1,
+%% masked, with the given (already-deflated) compressed payload.
+pmd_frame(Opcode, Compressed) ->
+    pmd_frame_fragment(Opcode, Compressed, true, true).
+
+%% Build a compressed-message fragment with explicit FIN/RSV1 control.
+pmd_frame_fragment(Opcode, CompressedPayload, Fin, Rsv1) ->
+    OpcodeByte = pmd_opcode_byte(Opcode, Fin, Rsv1),
+    Mask = <<5, 6, 7, 8>>,
+    Masked = mask(CompressedPayload, Mask),
+    Len = byte_size(CompressedPayload),
+    <<OpcodeByte, (16#80 bor Len), Mask/binary, Masked/binary>>.
+
+pmd_opcode_byte(text, Fin, Rsv1) ->
+    pmd_byte_with_flags(16#01, Fin, Rsv1);
+pmd_opcode_byte(binary, Fin, Rsv1) ->
+    pmd_byte_with_flags(16#02, Fin, Rsv1);
+pmd_opcode_byte(continuation, Fin, Rsv1) ->
+    pmd_byte_with_flags(16#00, Fin, Rsv1).
+
+pmd_byte_with_flags(OpNibble, Fin, Rsv1) ->
+    FinBit =
+        case Fin of
+            true -> 16#80;
+            false -> 0
+        end,
+    Rsv1Bit =
+        case Rsv1 of
+            true -> 16#40;
+            false -> 0
+        end,
+    FinBit bor Rsv1Bit bor OpNibble.
+
+%% Compress a payload through a fresh deflate context with windowBits=15
+%% (raw deflate, matches the session's negotiated default), then strip
+%% the trailing per-message DEFLATE tail (\x00\x00\xff\xff) per
+%% RFC 7692 §7.2.1.
+pmd_compress(Payload) ->
+    Z = zlib:open(),
+    try
+        ok = zlib:deflateInit(Z, default, deflated, -15, 8, default),
+        Bin = iolist_to_binary(zlib:deflate(Z, Payload, sync)),
+        Size = byte_size(Bin),
+        binary:part(Bin, 0, Size - 4)
+    after
+        zlib:close(Z)
+    end.
+
+%% Decompress a payload that the server emitted (RSV1=1 frame body) by
+%% appending the per-message DEFLATE tail and inflating with
+%% windowBits=15 (raw inflate).
+pmd_decompress(CompressedBody) ->
+    Z = zlib:open(),
+    try
+        ok = zlib:inflateInit(Z, -15),
+        iolist_to_binary(zlib:inflate(Z, <<CompressedBody/binary, 0, 0, 16#FF, 16#FF>>))
+    after
+        zlib:close(Z)
+    end.
+
+%% Masked client ping frame with arbitrary payload (≤125 bytes).
+ping_frame(Payload) ->
+    Mask = <<9, 10, 11, 12>>,
+    Masked = mask(Payload, Mask),
+    Len = byte_size(Payload),
+    %% Opcode 0x9 = ping, FIN=1, RSV*=0, MASK=1.
+    <<16#89, (16#80 bor Len), Mask/binary, Masked/binary>>.
+
+%% Uncompressed text/binary/continuation fragment with explicit FIN.
+uncompressed_fragment(Opcode, Payload, Fin) ->
+    Mask = <<13, 14, 15, 16>>,
+    Masked = mask(Payload, Mask),
+    Len = byte_size(Payload),
+    OpByte =
+        case {Opcode, Fin} of
+            {text, true} -> 16#81;
+            {text, false} -> 16#01;
+            {binary, true} -> 16#82;
+            {binary, false} -> 16#02;
+            {continuation, true} -> 16#80;
+            {continuation, false} -> 16#00
+        end,
+    <<OpByte, (16#80 bor Len), Mask/binary, Masked/binary>>.
+
+%% Default-shape negotiated permessage-deflate (context takeover ON,
+%% windowBits=15) — used by the majority of PMD tests.
+pmd_negotiated() ->
+    {permessage_deflate,
+        #{
+            server_max_window_bits => 15,
+            client_max_window_bits => 15,
+            server_no_context_takeover => false,
+            client_no_context_takeover => false
+        },
+        ~"permessage-deflate"}.
+
+%% Decompress with a FRESH inflate context — for asserting messages
+%% emitted under server_no_context_takeover (server resets its deflate
+%% context after each message, so each message is independently
+%% decompressible from a fresh inflate state).
+pmd_decompress_fresh(CompressedBody) ->
+    pmd_decompress(CompressedBody).
 
 is_hibernating(Pid, TimeoutMs) ->
     is_hibernating_loop(

@@ -78,8 +78,27 @@ every frame.
     %% per pubsub message — caching turns a ~50ns BIF into a record
     %% read).
     has_init :: boolean(),
-    has_handle_info :: boolean()
+    has_handle_info :: boolean(),
+    %% permessage-deflate (RFC 7692) state. `pmd_params = undefined`
+    %% means the extension was NOT negotiated; the session bypasses
+    %% all compression machinery on the hot path.
+    pmd_params :: roadrunner_ws:permessage_deflate_params() | undefined,
+    inflate_z :: zlib:zstream() | undefined,
+    deflate_z :: zlib:zstream() | undefined,
+    %% When mid-fragmented-compressed-message, accumulates the raw
+    %% (still-compressed) fragment payloads. On FIN we concatenate,
+    %% append the per-message trailer (\x00\x00\xff\xff), and inflate.
+    %% `undefined` = not currently in a compressed message.
+    compressed_acc :: undefined | iodata(),
+    %% Opcode of the in-progress compressed message (text | binary) —
+    %% needed to rebuild the synthesized FIN frame for the handler.
+    compressed_opcode :: undefined | text | binary
 }).
+
+%% Per-message DEFLATE trailer (RFC 7692 §7.2.1). Sender strips it
+%% from the deflate output; receiver appends it before inflating to
+%% terminate the deflate block.
+-define(PMD_TAIL, <<0, 0, 16#FF, 16#FF>>).
 
 -doc """
 Run the WebSocket session synchronously: spawn the gen_statem,
@@ -94,13 +113,9 @@ the gen_statem is never started).
 -spec run(roadrunner_transport:socket(), roadrunner_http1:request(), module(), term()) -> ok.
 run(Socket, Req, Mod, State) ->
     case roadrunner_ws:handshake_response(roadrunner_req:headers(Req)) of
-        {ok, Status, RespHeaders, _, _Negotiated} ->
-            %% R5.3a: extension negotiation result is parsed and the
-            %% header echoed in `RespHeaders`, but the session does not
-            %% yet act on `_Negotiated` — that lands in R5.3b alongside
-            %% per-message compression.
+        {ok, Status, RespHeaders, _, Negotiated} ->
             UpgradeResp = roadrunner_http1:response(Status, RespHeaders, ~""),
-            run_session(Socket, Req, Mod, State, UpgradeResp);
+            run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated);
         {error, _} ->
             _ = roadrunner_transport:send(
                 Socket,
@@ -114,9 +129,14 @@ run(Socket, Req, Mod, State) ->
     end.
 
 -spec run_session(
-    roadrunner_transport:socket(), roadrunner_http1:request(), module(), term(), iodata()
+    roadrunner_transport:socket(),
+    roadrunner_http1:request(),
+    module(),
+    term(),
+    iodata(),
+    roadrunner_ws:negotiated()
 ) -> ok.
-run_session(Socket, Req, Mod, State, UpgradeResp) ->
+run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated) ->
     Ctx = ws_context(Req, Mod),
     %% Start the gen_statem **before** writing the 101 to the wire so a
     %% start failure never leaves the upgrade response sent with no
@@ -124,7 +144,7 @@ run_session(Socket, Req, Mod, State, UpgradeResp) ->
     %% conn is intentionally unlinked from its children so a session
     %% crash never propagates to the conn process. We synchronise via
     %% a monitor instead.
-    case gen_statem:start(?MODULE, {Socket, Mod, State, Ctx}, []) of
+    case gen_statem:start(?MODULE, {Socket, Mod, State, Ctx, Negotiated}, []) of
         {ok, Pid} ->
             ok = roadrunner_telemetry:ws_upgrade(Ctx),
             _ = roadrunner_telemetry:response_send(
@@ -153,9 +173,11 @@ run_session(Socket, Req, Mod, State, UpgradeResp) ->
 -spec callback_mode() -> gen_statem:callback_mode_result().
 callback_mode() -> [state_functions, state_enter].
 
--spec init({roadrunner_transport:socket(), module(), term(), map()}) ->
+-spec init({
+    roadrunner_transport:socket(), module(), term(), map(), roadrunner_ws:negotiated()
+}) ->
     {ok, awaiting_socket, #data{}} | {stop, {bad_handler, module()}}.
-init({Socket, Mod, State, Ctx}) ->
+init({Socket, Mod, State, Ctx, Negotiated}) ->
     %% Reject unloadable handlers up front so `gen_statem:start/3`
     %% returns `{error, _}` and the launcher's 500 fallback runs —
     %% otherwise the session would crash later inside `handle_frame`
@@ -165,6 +187,7 @@ init({Socket, Mod, State, Ctx}) ->
             erlang:function_exported(Mod, handle_frame, 2)
     of
         true ->
+            {PmdParams, InflateZ, DeflateZ} = init_pmd(Negotiated),
             {ok, awaiting_socket, #data{
                 socket = Socket,
                 buffer = <<>>,
@@ -172,11 +195,37 @@ init({Socket, Mod, State, Ctx}) ->
                 mod_state = State,
                 ctx = Ctx,
                 has_init = erlang:function_exported(Mod, init, 1),
-                has_handle_info = erlang:function_exported(Mod, handle_info, 2)
+                has_handle_info = erlang:function_exported(Mod, handle_info, 2),
+                pmd_params = PmdParams,
+                inflate_z = InflateZ,
+                deflate_z = DeflateZ,
+                compressed_acc = undefined,
+                compressed_opcode = undefined
             }};
         false ->
             {stop, {bad_handler, Mod}}
     end.
+
+%% Set up the inflate / deflate contexts when permessage-deflate was
+%% negotiated. Inflate uses the client's max-window-bits (server's
+%% inflate decompresses what the client deflated). Deflate uses the
+%% server's max-window-bits. RFC 7692 §7.2.1 specifies raw DEFLATE
+%% (no zlib header), so windowBits is negative in zlib's convention.
+-spec init_pmd(roadrunner_ws:negotiated()) ->
+    {undefined, undefined, undefined}
+    | {roadrunner_ws:permessage_deflate_params(), zlib:zstream(), zlib:zstream()}.
+init_pmd(none) ->
+    {undefined, undefined, undefined};
+init_pmd({permessage_deflate, Params, _ResponseValue}) ->
+    #{
+        client_max_window_bits := ClientWB,
+        server_max_window_bits := ServerWB
+    } = Params,
+    InflateZ = zlib:open(),
+    ok = zlib:inflateInit(InflateZ, -ClientWB),
+    DeflateZ = zlib:open(),
+    ok = zlib:deflateInit(DeflateZ, default, deflated, -ServerWB, 8, default),
+    {Params, InflateZ, DeflateZ}.
 
 -spec awaiting_socket(gen_statem:event_type(), term(), #data{}) ->
     gen_statem:event_handler_result(atom()).
@@ -220,8 +269,17 @@ frame_loop(info, Msg, #data{socket = Socket} = Data) ->
     end.
 
 -spec terminate(term(), atom(), #data{}) -> ok.
-terminate(_Reason, _State, _Data) ->
+terminate(_Reason, _State, #data{inflate_z = InflateZ, deflate_z = DeflateZ}) ->
+    %% The runtime would clean these up on process exit anyway, but
+    %% explicit release means the zlib NIF reclaims its working
+    %% buffers immediately rather than waiting on GC.
+    close_zlib(InflateZ),
+    close_zlib(DeflateZ),
     ok.
+
+-spec close_zlib(zlib:zstream() | undefined) -> ok.
+close_zlib(undefined) -> ok;
+close_zlib(Z) -> zlib:close(Z).
 
 %% --- frame dispatch ---
 
@@ -232,8 +290,13 @@ terminate(_Reason, _State, _Data) ->
 %% honor the hibernate flag if any handler set it.
 -spec process_buffer(#data{}, boolean()) ->
     gen_statem:event_handler_result(atom()).
-process_buffer(#data{socket = Socket, buffer = Buf} = Data, HibernateAcc) ->
-    case roadrunner_ws:parse_frame(Buf) of
+process_buffer(#data{socket = Socket, buffer = Buf, pmd_params = Pmd} = Data, HibernateAcc) ->
+    Opts =
+        case Pmd of
+            undefined -> #{};
+            _ -> #{allow_rsv1 => true}
+        end,
+    case roadrunner_ws:parse_frame(Buf, Opts) of
         {ok, Frame, NewBuffer} ->
             ok = roadrunner_telemetry:ws_frame_in(
                 (Data#data.ctx)#{opcode => maps:get(opcode, Frame)},
@@ -280,7 +343,97 @@ handle_frame(#{opcode := ping, payload := P}, Data, Hibernate) ->
 handle_frame(#{opcode := pong}, Data, Hibernate) ->
     %% Server is not pinging clients yet — pong from client is dropped.
     process_buffer(Data, Hibernate);
-handle_frame(Frame, #data{mod = Mod, mod_state = State} = Data, Hibernate) ->
+handle_frame(Frame, Data, Hibernate) ->
+    %% Data frames (text / binary / continuation) — may be compressed
+    %% per RFC 7692 if permessage-deflate negotiated. The PMD path
+    %% buffers fragments then inflates on FIN; uncompressed frames
+    %% take the regular dispatch shape.
+    case classify_data_frame(Frame, Data) of
+        {compressed_first, NewData} ->
+            handle_compressed_fragment(Frame, NewData, Hibernate);
+        compressed_continuation ->
+            handle_compressed_fragment(Frame, Data, Hibernate);
+        regular ->
+            dispatch_data_frame(Frame, Data, Hibernate)
+    end.
+
+%% Determine whether this data frame is part of a PMD-compressed
+%% message. RFC 7692 §6.1: only the FIRST fragment of a compressed
+%% message has RSV1=1. Continuation frames within a compressed
+%% message have RSV1=0 but are still part of the compressed payload.
+-spec classify_data_frame(roadrunner_ws:frame(), #data{}) ->
+    {compressed_first, #data{}} | compressed_continuation | regular.
+classify_data_frame(#{opcode := continuation}, #data{compressed_acc = undefined}) ->
+    %% Continuation outside a compressed message → not compressed.
+    regular;
+classify_data_frame(#{opcode := continuation}, _Data) ->
+    %% Continuation inside a compressed message → still compressed.
+    compressed_continuation;
+classify_data_frame(#{rsv1 := true, opcode := Op}, #data{pmd_params = Pmd} = Data) when
+    Pmd =/= undefined, (Op =:= text orelse Op =:= binary)
+->
+    %% First (or only) fragment of a compressed message.
+    {compressed_first, Data#data{compressed_opcode = Op}};
+classify_data_frame(_Frame, _Data) ->
+    regular.
+
+%% Buffer this fragment's payload. On FIN, concatenate, append the
+%% per-message DEFLATE trailer, inflate, and dispatch the
+%% reconstituted message to the user handler as a single frame.
+-spec handle_compressed_fragment(roadrunner_ws:frame(), #data{}, boolean()) ->
+    gen_statem:event_handler_result(atom()).
+handle_compressed_fragment(
+    #{fin := false, payload := P}, #data{compressed_acc = Acc} = Data, Hibernate
+) ->
+    NewAcc =
+        case Acc of
+            undefined -> [P];
+            _ -> [Acc, P]
+        end,
+    process_buffer(Data#data{compressed_acc = NewAcc}, Hibernate);
+handle_compressed_fragment(
+    #{fin := true, payload := P},
+    #data{compressed_acc = Acc, compressed_opcode = Op} = Data,
+    Hibernate
+) ->
+    Compressed = iolist_to_binary(
+        case Acc of
+            undefined -> [P, ?PMD_TAIL];
+            _ -> [Acc, P, ?PMD_TAIL]
+        end
+    ),
+    case inflate_message(Data, Compressed) of
+        {ok, Inflated, Data1} ->
+            Synthesized = #{fin => true, rsv1 => false, opcode => Op, payload => Inflated},
+            dispatch_data_frame(
+                Synthesized,
+                Data1#data{compressed_acc = undefined, compressed_opcode = undefined},
+                Hibernate
+            );
+        {error, _} ->
+            {stop, normal, Data}
+    end.
+
+-spec inflate_message(#data{}, binary()) -> {ok, binary(), #data{}} | {error, term()}.
+inflate_message(#data{inflate_z = Z, pmd_params = Params} = Data, Compressed) ->
+    try
+        Iolist = zlib:inflate(Z, Compressed),
+        Data1 =
+            case maps:get(client_no_context_takeover, Params, false) of
+                true ->
+                    ok = zlib:inflateReset(Z),
+                    Data;
+                false ->
+                    Data
+            end,
+        {ok, iolist_to_binary(Iolist), Data1}
+    catch
+        _:Reason -> {error, Reason}
+    end.
+
+-spec dispatch_data_frame(roadrunner_ws:frame(), #data{}, boolean()) ->
+    gen_statem:event_handler_result(atom()).
+dispatch_data_frame(Frame, #data{mod = Mod, mod_state = State} = Data, Hibernate) ->
     apply_handler_result(Mod:handle_frame(Frame, State), Data, Hibernate, fun process_buffer/2).
 
 -spec handle_info_msg(term(), #data{}, boolean()) ->
@@ -349,12 +502,20 @@ payload_size(#{payload := P}) -> byte_size(P).
 %% Single outbound frame — wraps `roadrunner_transport:send/2` with a
 %% `[roadrunner, ws, frame_out]` event so subscribers see every frame the
 %% session writes (auto-pong, close, and unary handler replies).
+%%
+%% When permessage-deflate is active and the opcode is text/binary the
+%% payload is deflated and emitted with RSV1=1. Control frames (close
+%% / ping / pong) and continuations are NEVER compressed — RFC 7692
+%% §6.1 forbids compressing control frames; continuations carry no
+%% RSV1 even inside a compressed message (we never emit a
+%% multi-fragment outbound message anyway, so the question is moot).
 -spec send_ws_frame(#data{}, roadrunner_ws:opcode(), iodata()) -> ok.
-send_ws_frame(#data{socket = Socket, ctx = Ctx}, Opcode, Payload) ->
+send_ws_frame(#data{socket = Socket, ctx = Ctx} = Data, Opcode, Payload) ->
     ok = roadrunner_telemetry:ws_frame_out(
         Ctx#{opcode => Opcode}, iolist_size(Payload)
     ),
-    _ = roadrunner_transport:send(Socket, roadrunner_ws:encode_frame(Opcode, Payload, true)),
+    Encoded = encode_outbound(Data, Opcode, Payload),
+    _ = roadrunner_transport:send(Socket, Encoded),
     ok.
 
 %% Batched outbound frames from a handler `{reply, [...]}` return —
@@ -363,7 +524,7 @@ send_ws_frame(#data{socket = Socket, ctx = Ctx}, Opcode, Payload) ->
 %% fragmentation.
 -spec send_ws_frames(#data{}, [{roadrunner_ws:opcode(), iodata()}]) ->
     ok | {error, term()}.
-send_ws_frames(#data{socket = Socket, ctx = Ctx}, OutFrames) ->
+send_ws_frames(#data{socket = Socket, ctx = Ctx} = Data, OutFrames) ->
     lists:foreach(
         fun({Op, Payload}) ->
             ok = roadrunner_telemetry:ws_frame_out(
@@ -372,5 +533,40 @@ send_ws_frames(#data{socket = Socket, ctx = Ctx}, OutFrames) ->
         end,
         OutFrames
     ),
-    Iodata = [roadrunner_ws:encode_frame(Op, Payload, true) || {Op, Payload} <- OutFrames],
+    Iodata = [encode_outbound(Data, Op, Payload) || {Op, Payload} <- OutFrames],
     roadrunner_transport:send(Socket, Iodata).
+
+-spec encode_outbound(#data{}, roadrunner_ws:opcode(), iodata()) -> iodata().
+encode_outbound(#data{pmd_params = undefined}, Opcode, Payload) ->
+    %% No PMD negotiated — straight encode.
+    roadrunner_ws:encode_frame(Opcode, Payload, true);
+encode_outbound(_Data, Opcode, Payload) when
+    Opcode =:= close; Opcode =:= ping; Opcode =:= pong; Opcode =:= continuation
+->
+    %% Control frames must not be compressed (RFC 7692 §6.1). We
+    %% never emit continuation outbound either, but treat it the
+    %% same as a control for safety.
+    roadrunner_ws:encode_frame(Opcode, Payload, true);
+encode_outbound(Data, Opcode, Payload) ->
+    %% text / binary with PMD — deflate, strip per-message tail,
+    %% emit single frame with RSV1=1.
+    Compressed = deflate_message(Data, Payload),
+    roadrunner_ws:encode_frame(Opcode, Compressed, true, #{rsv1 => true}).
+
+%% Deflate a full message payload. Reads inside `try` so a zlib
+%% failure (e.g. context corruption) gives a clean session exit
+%% rather than a bare badmatch in the calling shape. Strips the
+%% trailing 4-byte deflate tail per RFC 7692 §7.2.1 — receivers
+%% append it back before inflating.
+-spec deflate_message(#data{}, iodata()) -> binary().
+deflate_message(#data{deflate_z = Z, pmd_params = Params}, Payload) ->
+    Iolist = zlib:deflate(Z, Payload, sync),
+    case maps:get(server_no_context_takeover, Params, false) of
+        true -> ok = zlib:deflateReset(Z);
+        false -> ok
+    end,
+    Bin = iolist_to_binary(Iolist),
+    %% Strip the per-message tail (last 4 bytes of `0x00 0x00 0xff 0xff`).
+    %% `sync` flush always emits these, so it's safe to chop.
+    Size = byte_size(Bin),
+    binary:part(Bin, 0, Size - 4).

@@ -15,7 +15,13 @@ features.
 -export([parse_extensions/1, negotiate_extensions/1]).
 
 -export_type([
-    opcode/0, frame/0, extension/0, parse_opts/0, encode_opts/0, negotiated/0
+    opcode/0,
+    frame/0,
+    extension/0,
+    parse_opts/0,
+    encode_opts/0,
+    permessage_deflate_params/0,
+    negotiated/0
 ]).
 
 -define(EXT_OFFER_CP_KEY, {?MODULE, ext_offer_cp}).
