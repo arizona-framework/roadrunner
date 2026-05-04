@@ -252,7 +252,16 @@ open_listen_socket(Port, _Opts) ->
 
 -spec base_listen_opts() -> [gen_tcp:listen_option()].
 base_listen_opts() ->
-    [binary, {active, false}, {reuseaddr, true}, {packet, raw}].
+    %% `nodelay` disables Nagle's algorithm on accepted sockets.
+    %% RFC 9113 §5.2 doesn't mandate it, but every production h2
+    %% server (nginx, h2o, cowboy, …) sets it because h2 responses
+    %% emit multiple small frames per request (HEADERS + DATA),
+    %% and Nagle holds the second write until the client ACKs the
+    %% first — hitting Linux's 40 ms delayed-ACK timer and
+    %% capping per-request latency at ~50 ms. h1 isn't affected
+    %% (one `ssl:send/2` per response) but `nodelay` is the right
+    %% default for any HTTP server.
+    [binary, {active, false}, {reuseaddr, true}, {packet, raw}, {nodelay, true}].
 
 %% When `http2_enabled => true` and the user didn't supply their own
 %% `alpn_preferred_protocols`, advertise `h2` ahead of `http/1.1`.
