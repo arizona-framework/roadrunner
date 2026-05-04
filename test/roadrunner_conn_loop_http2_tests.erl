@@ -73,7 +73,10 @@ all_test_() ->
         fun drain_refuses_new_streams/0,
         fun drain_with_in_flight_stream_waits/0,
         fun drain_message_is_idempotent/0,
-        fun drain_then_peer_rst_exits_via_frame_loop/0
+        fun drain_then_peer_rst_exits_via_frame_loop/0,
+        fun telemetry_request_start_stop_fires_for_h2/0,
+        fun telemetry_request_exception_fires_on_h2_handler_crash/0,
+        fun telemetry_request_stop_fires_for_router_404/0
     ],
     [{spawn, F} || F <- Tests].
 
@@ -1477,6 +1480,142 @@ drain_then_peer_rst_exits_via_frame_loop() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 1000 -> error(drain_did_not_complete)
     end.
+
+telemetry_request_start_stop_fires_for_h2() ->
+    %% A successful h2 request fires `[roadrunner, request, start]`
+    %% and `[roadrunner, request, stop]` from the worker. Same
+    %% metadata schema as h1 — request_id, peer, method, path,
+    %% scheme, listener_name; stop adds status + response_kind.
+    HandlerId = attach_telemetry([
+        [roadrunner, request, start],
+        [roadrunner, request, stop]
+    ]),
+    try
+        {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/empty"),
+        Events = collect_telemetry(2),
+        [{StartEv, _, StartMd}, {StopEv, StopM, StopMd}] = sort_events(Events),
+        ?assertEqual([roadrunner, request, start], StartEv),
+        ?assertEqual([roadrunner, request, stop], StopEv),
+        ?assertEqual(~"GET", maps:get(method, StartMd)),
+        ?assertEqual(~"/empty", maps:get(path, StartMd)),
+        ?assertEqual(http, maps:get(scheme, StartMd)),
+        ?assert(is_integer(maps:get(duration, StopM))),
+        ?assertEqual(200, maps:get(status, StopMd)),
+        ?assertEqual(buffered, maps:get(response_kind, StopMd)),
+        cleanup(Pid, Ref)
+    after
+        detach_telemetry(HandlerId)
+    end.
+
+telemetry_request_exception_fires_on_h2_handler_crash() ->
+    HandlerId = attach_telemetry([[roadrunner, request, exception]]),
+    try
+        {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/crash"),
+        receive
+            {telemetry_event, [roadrunner, request, exception], M, Md} ->
+                ?assert(is_integer(maps:get(duration, M))),
+                ?assertEqual(error, maps:get(kind, Md)),
+                ?assertEqual(boom, maps:get(reason, Md))
+        after 500 -> error(no_exception_event)
+        end,
+        cleanup(Pid, Ref)
+    after
+        detach_telemetry(HandlerId)
+    end.
+
+telemetry_request_stop_fires_for_router_404() ->
+    %% Router-based dispatch where no route matches → 404 path
+    %% in `run_handler/4` short-circuits past `invoke/7` and still
+    %% fires request_stop with status=404.
+    HandlerId = attach_telemetry([[roadrunner, request, stop]]),
+    try
+        {ok, _} = application:ensure_all_started(telemetry),
+        drain_mailbox(),
+        persistent_term:put({roadrunner_routes, h2_telem_404}, roadrunner_router:compile([])),
+        Self = self(),
+        Counter = atomics:new(1, [{signed, false}]),
+        ok = atomics:add(Counter, 1, 1),
+        ProtoOpts = #{
+            client_counter => Counter,
+            listener_name => h2_telem_404,
+            dispatch => {router, h2_telem_404},
+            middlewares => []
+        },
+        Sock = {fake, Self},
+        Pid = spawn(fun() ->
+            receive
+                ready -> ok
+            end,
+            roadrunner_conn_loop_http2:enter(
+                Sock, ProtoOpts, h2_telem_404, undefined, erlang:monotonic_time()
+            )
+        end),
+        Ref = monitor(process, Pid),
+        Pid ! ready,
+        _ = expect_send(),
+        serve_recv(Pid, ?PREFACE),
+        serve_recv(Pid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        Enc = roadrunner_http2_hpack:new_encoder(4096),
+        {Hpack, _} = roadrunner_http2_hpack:encode(
+            [
+                {~":method", ~"GET"},
+                {~":scheme", ~"https"},
+                {~":authority", ~"x"},
+                {~":path", ~"/missing"}
+            ],
+            Enc
+        ),
+        HpackBin = iolist_to_binary(Hpack),
+        H = iolist_to_binary(
+            roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+        ),
+        serve_recv(Pid, H),
+        receive
+            {telemetry_event, [roadrunner, request, stop], _M, Md} ->
+                ?assertEqual(404, maps:get(status, Md)),
+                ?assertEqual(buffered, maps:get(response_kind, Md))
+        after 500 -> error(no_stop_event)
+        end,
+        cleanup(Pid, Ref)
+    after
+        detach_telemetry(HandlerId)
+    end.
+
+attach_telemetry(Events) ->
+    Self = self(),
+    HandlerId = make_ref(),
+    ok = telemetry:attach_many(
+        HandlerId,
+        Events,
+        fun(Ev, M, Md, _) -> Self ! {telemetry_event, Ev, M, Md} end,
+        []
+    ),
+    HandlerId.
+
+detach_telemetry(HandlerId) ->
+    ok = telemetry:detach(HandlerId).
+
+collect_telemetry(N) ->
+    collect_telemetry(N, []).
+
+collect_telemetry(0, Acc) ->
+    lists:reverse(Acc);
+collect_telemetry(N, Acc) ->
+    receive
+        {telemetry_event, Ev, M, Md} ->
+            collect_telemetry(N - 1, [{Ev, M, Md} | Acc])
+    after 500 ->
+        error({missing_events, N})
+    end.
+
+sort_events(Events) ->
+    Order = fun
+        ([roadrunner, request, start]) -> 1;
+        ([roadrunner, request, stop]) -> 2;
+        (_) -> 3
+    end,
+    lists:sort(fun({A, _, _}, {B, _, _}) -> Order(A) =< Order(B) end, Events).
 
 encode_post_root_headers() ->
     Enc = roadrunner_http2_hpack:new_encoder(4096),

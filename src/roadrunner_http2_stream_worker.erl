@@ -71,15 +71,22 @@ init(ConnPid, StreamId, Req, ProtoOpts) ->
 run_handler(ConnPid, StreamId, Req, ProtoOpts) ->
     Dispatch = maps:get(dispatch, ProtoOpts),
     Mws = maps:get(middlewares, ProtoOpts, []),
+    Metadata = telemetry_metadata(Req),
+    ReqStart = roadrunner_telemetry:request_start(Metadata),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
         {ok, Handler, Bindings, RouteOpts} ->
             FullReq = Req#{bindings => Bindings, route_opts => RouteOpts},
-            invoke(ConnPid, StreamId, Handler, Mws, FullReq);
+            invoke(ConnPid, StreamId, Handler, Mws, FullReq, Metadata, ReqStart);
         not_found ->
-            send_buffered(ConnPid, StreamId, 404, [{~"content-type", ~"text/plain"}], ~"Not Found")
+            send_buffered(
+                ConnPid, StreamId, 404, [{~"content-type", ~"text/plain"}], ~"Not Found"
+            ),
+            ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, #{
+                status => 404, response_kind => buffered
+            })
     end.
 
-invoke(ConnPid, StreamId, Handler, ListenerMws, Req) ->
+invoke(ConnPid, StreamId, Handler, ListenerMws, Req, Metadata, ReqStart) ->
     RouteMws = roadrunner_conn:route_middlewares(Req),
     Pipeline =
         case ListenerMws =:= [] andalso RouteMws =:= [] of
@@ -93,9 +100,16 @@ invoke(ConnPid, StreamId, Handler, ListenerMws, Req) ->
         end,
     try Pipeline(Req) of
         {Response, _Req2} ->
-            emit_handler_response(ConnPid, StreamId, Response)
+            emit_handler_response(ConnPid, StreamId, Response),
+            ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, #{
+                status => roadrunner_conn:response_status(Response),
+                response_kind => roadrunner_conn:response_kind(Response)
+            })
     catch
         Class:Reason:Stack ->
+            ok = roadrunner_telemetry:request_exception(
+                ReqStart, Metadata, Class, Reason
+            ),
             logger:error(#{
                 msg => "roadrunner h2 handler crashed",
                 handler => Handler,
@@ -111,6 +125,17 @@ invoke(ConnPid, StreamId, Handler, ListenerMws, Req) ->
                 ~"Internal Server Error"
             )
     end.
+
+-spec telemetry_metadata(roadrunner_http1:request()) -> roadrunner_telemetry:metadata().
+telemetry_metadata(Req) ->
+    #{
+        request_id => maps:get(request_id, Req),
+        peer => maps:get(peer, Req),
+        method => maps:get(method, Req),
+        path => maps:get(target, Req),
+        scheme => maps:get(scheme, Req),
+        listener_name => maps:get(listener_name, Req, undefined)
+    }.
 
 emit_handler_response(ConnPid, StreamId, {Status, Headers, Body}) when
     is_integer(Status), Status >= 100, Status =< 599
