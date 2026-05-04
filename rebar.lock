@@ -1,8 +1,4 @@
-{"1.2.0",
-[{<<"telemetry">>,{pkg,<<"telemetry">>,<<"1.4.1">>},0}]}.
-[
-{pkg_hash,[
- {<<"telemetry">>, <<"AB6DE178E2B29B58E8256B92B382EA3F590A47152CA3651EA857A6CAE05AC423">>}]},
-{pkg_hash_ext,[
- {<<"telemetry">>, <<"2172E05A27531D3D31DD9782841065C50DD5C3C7699D95266B2EDD54C2DAFA1C">>}]}
-].
+[{<<"telemetry">>,
+  {git,"https://github.com/beam-telemetry/telemetry.git",
+       {ref,"11462db509623be85c7acf3f15d0579d0d3f4a79"}},
+  0}].
