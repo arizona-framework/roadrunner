@@ -135,6 +135,11 @@ Response shapes supported:
     %% Highest stream id we've processed — for the LAST_STREAM_ID
     %% in GOAWAY.
     last_stream_id = 0 :: non_neg_integer(),
+    %% Pre-generated CSPRNG bytes for `request_id`, sliced 8 bytes
+    %% at a time. Refilled by `roadrunner_conn:generate_request_id/1`
+    %% in 256-byte batches so h2 conns amortize the crypto cost
+    %% across ~32 requests instead of paying it per dispatch.
+    req_id_buffer = <<>> :: binary(),
     %% Connection-level flow-control windows (RFC 9113 §5.2).
     conn_send_window = 65535 :: integer(),
     conn_recv_window = 65535 :: non_neg_integer(),
@@ -729,7 +734,9 @@ dispatch_stream(
     case content_length_matches(Headers, BodyLen) of
         true ->
             Body = iolist_to_binary(maps:get(body, Stream)),
-            {RequestId, _} = roadrunner_conn:generate_request_id(<<>>),
+            {RequestId, NewBuf} = roadrunner_conn:generate_request_id(
+                State#loop.req_id_buffer
+            ),
             ConnInfo = #{
                 peer => Peer,
                 scheme => Scheme,
@@ -751,12 +758,13 @@ dispatch_stream(
                         streams = maps:put(StreamId, Stream1, Streams),
                         worker_refs = maps:put(
                             MonRef, StreamId, State#loop.worker_refs
-                        )
+                        ),
+                        req_id_buffer = NewBuf
                     },
                     frame_loop(State1);
                 {error, _Reason} ->
                     _ = send_rst_stream(State, StreamId, protocol_error),
-                    frame_loop(remove_stream(State, StreamId))
+                    frame_loop(remove_stream(State#loop{req_id_buffer = NewBuf}, StreamId))
             end;
         false ->
             %% RFC 9113 §8.1.2.6: content-length / DATA-payload
