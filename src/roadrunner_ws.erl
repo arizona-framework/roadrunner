@@ -12,9 +12,11 @@ features.
 -export([accept_key/1, handshake_response/1]).
 -export([parse_frame/1, parse_frame/2]).
 -export([encode_frame/3, encode_frame/4]).
--export([parse_extensions/1]).
+-export([parse_extensions/1, negotiate_extensions/1]).
 
--export_type([opcode/0, frame/0, extension/0, parse_opts/0, encode_opts/0]).
+-export_type([
+    opcode/0, frame/0, extension/0, parse_opts/0, encode_opts/0, negotiated/0
+]).
 
 -define(EXT_OFFER_CP_KEY, {?MODULE, ext_offer_cp}).
 -define(EXT_PARAM_CP_KEY, {?MODULE, ext_param_cp}).
@@ -45,6 +47,21 @@ features.
 %% extension that uses the bit is in effect.
 -type encode_opts() :: #{rsv1 => boolean()}.
 
+%% Negotiated permessage-deflate parameters per RFC 7692 §7.1.
+%% Window-bits values are zlib's (8..15). The `*_no_context_takeover`
+%% flags mirror the request; when `true`, the corresponding zlib
+%% context is reset after every message.
+-type permessage_deflate_params() :: #{
+    server_max_window_bits := 8..15,
+    client_max_window_bits := 8..15,
+    server_no_context_takeover := boolean(),
+    client_no_context_takeover := boolean()
+}.
+
+-type negotiated() ::
+    none
+    | {permessage_deflate, permessage_deflate_params(), ResponseHeaderValue :: binary()}.
+
 %% RFC 6455 §1.3 magic GUID concatenated with the client key before
 %% hashing — fixed by spec.
 -define(WS_GUID, ~"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").
@@ -67,16 +84,21 @@ accept_key(Key) when is_binary(Key) ->
 
 -doc """
 Validate the request headers for a WebSocket upgrade and build the
-`101 Switching Protocols` response triple.
+`101 Switching Protocols` response.
 
-Returns `{ok, 101, Headers, <<>>}` on success, or `{error, Reason}`
-when the request is missing or has wrong values for any of the
-required handshake headers (`Upgrade: websocket`, a `Connection`
-header containing the `upgrade` token, and a non-empty
+Returns `{ok, 101, Headers, <<>>, Negotiated}` on success, or
+`{error, Reason}` when the request is missing or has wrong values
+for any of the required handshake headers (`Upgrade: websocket`, a
+`Connection` header containing the `upgrade` token, and a non-empty
 `Sec-WebSocket-Key`).
+
+`Negotiated` is `none` if no extension was offered or accepted, or
+`{permessage_deflate, Params, _}` when RFC 7692 was negotiated.
+The session uses this to set up zlib state. The agreed extension's
+response header is already in `Headers`.
 """.
 -spec handshake_response(roadrunner_http1:headers()) ->
-    {ok, roadrunner_http1:status(), roadrunner_http1:headers(), iodata()}
+    {ok, roadrunner_http1:status(), roadrunner_http1:headers(), iodata(), negotiated()}
     | {error,
         missing_websocket_upgrade
         | missing_connection_upgrade
@@ -86,15 +108,29 @@ handshake_response(Headers) when is_list(Headers) ->
     case validate_upgrade(Headers) of
         {ok, Key} ->
             Accept = accept_key(Key),
-            RespHeaders = [
-                {~"upgrade", ~"websocket"},
-                {~"connection", ~"upgrade"},
-                {~"sec-websocket-accept", Accept}
-            ],
-            {ok, 101, RespHeaders, ~""};
+            Negotiated = negotiate_extensions(
+                parse_extensions(header_lookup(~"sec-websocket-extensions", Headers))
+            ),
+            RespHeaders = build_handshake_headers(Accept, Negotiated),
+            {ok, 101, RespHeaders, ~"", Negotiated};
         {error, _} = Err ->
             Err
     end.
+
+-spec build_handshake_headers(binary(), negotiated()) -> roadrunner_http1:headers().
+build_handshake_headers(Accept, none) ->
+    [
+        {~"upgrade", ~"websocket"},
+        {~"connection", ~"upgrade"},
+        {~"sec-websocket-accept", Accept}
+    ];
+build_handshake_headers(Accept, {permessage_deflate, _, ResponseValue}) ->
+    [
+        {~"upgrade", ~"websocket"},
+        {~"connection", ~"upgrade"},
+        {~"sec-websocket-accept", Accept},
+        {~"sec-websocket-extensions", ResponseValue}
+    ].
 
 -spec validate_upgrade(roadrunner_http1:headers()) ->
     {ok, binary()}
@@ -230,6 +266,129 @@ unquote(<<$", Rest/binary>>) ->
     end;
 unquote(V) ->
     V.
+
+-doc """
+Pick the first acceptable offer from a parsed `Sec-WebSocket-Extensions`
+list. Today only `permessage-deflate` (RFC 7692) is supported; all
+other extension names are skipped.
+
+Returns `none` if no acceptable offer is found, or
+`{permessage_deflate, NegotiatedParams, ResponseHeaderValue}` where:
+
+- `NegotiatedParams` is a map suitable for setting up the inflate /
+  deflate zlib contexts and for honoring the `*_no_context_takeover`
+  reset semantics.
+- `ResponseHeaderValue` is the value to put in the response's
+  `Sec-WebSocket-Extensions` header per RFC 7692 §5.1 (echoes the
+  negotiated parameters with their agreed values).
+
+Per RFC 6455 §9.1, when multiple extensions are offered the server
+processes them in order and picks the first one it can accept;
+unrecognised offers are silently skipped.
+""".
+-spec negotiate_extensions([extension()]) -> negotiated().
+negotiate_extensions([]) ->
+    none;
+negotiate_extensions([{~"permessage-deflate", Params} | _Rest]) ->
+    case negotiate_permessage_deflate(Params) of
+        {ok, Negotiated, ResponseValue} ->
+            {permessage_deflate, Negotiated, ResponseValue};
+        invalid ->
+            %% Malformed offer (e.g. out-of-range window bits) — skip
+            %% per RFC 7692 §7. Don't try a second permessage-deflate
+            %% offer; clients aren't supposed to send more than one.
+            none
+    end;
+negotiate_extensions([_Other | Rest]) ->
+    negotiate_extensions(Rest).
+
+%% Walk the offer's parameter list and either return a fully-resolved
+%% set of negotiated values + the response header echo, or `invalid`
+%% if any parameter is out of spec. Defaults: window bits 15
+%% (max history), context takeover ON (most efficient).
+-spec negotiate_permessage_deflate([{binary(), binary() | true}]) ->
+    {ok, permessage_deflate_params(), binary()} | invalid.
+negotiate_permessage_deflate(Params) ->
+    case parse_pmd_params(Params, default_pmd()) of
+        {ok, Negotiated} ->
+            {ok, Negotiated, format_pmd_response(Negotiated)};
+        invalid ->
+            invalid
+    end.
+
+-spec default_pmd() -> permessage_deflate_params().
+default_pmd() ->
+    #{
+        server_max_window_bits => 15,
+        client_max_window_bits => 15,
+        server_no_context_takeover => false,
+        client_no_context_takeover => false
+    }.
+
+-spec parse_pmd_params([{binary(), binary() | true}], permessage_deflate_params()) ->
+    {ok, permessage_deflate_params()} | invalid.
+parse_pmd_params([], Acc) ->
+    {ok, Acc};
+parse_pmd_params([{~"server_no_context_takeover", true} | Rest], Acc) ->
+    parse_pmd_params(Rest, Acc#{server_no_context_takeover => true});
+parse_pmd_params([{~"client_no_context_takeover", true} | Rest], Acc) ->
+    parse_pmd_params(Rest, Acc#{client_no_context_takeover => true});
+parse_pmd_params([{~"server_max_window_bits", Value} | Rest], Acc) ->
+    case window_bits(Value) of
+        {ok, N} -> parse_pmd_params(Rest, Acc#{server_max_window_bits => N});
+        invalid -> invalid
+    end;
+parse_pmd_params([{~"client_max_window_bits", true} | Rest], Acc) ->
+    %% Bare `client_max_window_bits` (no value) means the client
+    %% accepts any value the server picks. Default to 15 (max).
+    parse_pmd_params(Rest, Acc);
+parse_pmd_params([{~"client_max_window_bits", Value} | Rest], Acc) ->
+    case window_bits(Value) of
+        {ok, N} -> parse_pmd_params(Rest, Acc#{client_max_window_bits => N});
+        invalid -> invalid
+    end;
+parse_pmd_params([{_Other, _} | Rest], Acc) ->
+    %% Unknown parameter — skip. RFC 7692 §7 allows future extension
+    %% parameters; ignoring keeps us compatible.
+    parse_pmd_params(Rest, Acc).
+
+%% Erlang's zlib accepts windowBits 8..15 for inflate (`-N` for raw
+%% inflate, same range). Spec-allowed range is also 8..15.
+-spec window_bits(binary() | true) -> {ok, 8..15} | invalid.
+window_bits(true) ->
+    invalid;
+window_bits(Bin) when is_binary(Bin) ->
+    case string:to_integer(Bin) of
+        {N, <<>>} when N >= 8, N =< 15 -> {ok, N};
+        _ -> invalid
+    end.
+
+%% Build the response header value echoing the agreed parameters.
+%% Defaults that the client did NOT request can be omitted from the
+%% response — the format below echoes only the non-default settings
+%% so clients with strict parsers see a clean response.
+-spec format_pmd_response(permessage_deflate_params()) -> binary().
+format_pmd_response(#{
+    server_max_window_bits := SMW,
+    client_max_window_bits := CMW,
+    server_no_context_takeover := SNCT,
+    client_no_context_takeover := CNCT
+}) ->
+    Tail = [
+        format_pmd_flag(~"server_no_context_takeover", SNCT),
+        format_pmd_flag(~"client_no_context_takeover", CNCT),
+        format_pmd_kv(~"server_max_window_bits", SMW, 15),
+        format_pmd_kv(~"client_max_window_bits", CMW, 15)
+    ],
+    iolist_to_binary([~"permessage-deflate" | [P || P <- Tail, P =/= []]]).
+
+-spec format_pmd_flag(binary(), boolean()) -> iodata().
+format_pmd_flag(_Name, false) -> [];
+format_pmd_flag(Name, true) -> [~"; ", Name].
+
+-spec format_pmd_kv(binary(), 8..15, 8..15) -> iodata().
+format_pmd_kv(_Name, Default, Default) -> [];
+format_pmd_kv(Name, Value, _Default) -> [~"; ", Name, ~"=", integer_to_binary(Value)].
 
 -doc """
 Decode a single WebSocket frame from the buffer.

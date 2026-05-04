@@ -26,13 +26,16 @@ handshake_valid_test() ->
         {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
         {~"sec-websocket-version", ~"13"}
     ],
-    {ok, 101, RespHeaders, ~""} = roadrunner_ws:handshake_response(Headers),
+    {ok, 101, RespHeaders, ~"", none} = roadrunner_ws:handshake_response(Headers),
     ?assertEqual(~"websocket", proplists:get_value(~"upgrade", RespHeaders)),
     ?assertEqual(~"upgrade", proplists:get_value(~"connection", RespHeaders)),
     ?assertEqual(
         ~"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
         proplists:get_value(~"sec-websocket-accept", RespHeaders)
-    ).
+    ),
+    %% No `Sec-WebSocket-Extensions` request header → no extension
+    %% header in the response either.
+    ?assertEqual(undefined, proplists:get_value(~"sec-websocket-extensions", RespHeaders)).
 
 handshake_connection_with_keep_alive_test() ->
     %% Connection header may carry multiple tokens, e.g. `keep-alive, Upgrade`.
@@ -42,7 +45,7 @@ handshake_connection_with_keep_alive_test() ->
         {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
         {~"sec-websocket-version", ~"13"}
     ],
-    ?assertMatch({ok, 101, _, _}, roadrunner_ws:handshake_response(Headers)).
+    ?assertMatch({ok, 101, _, _, _}, roadrunner_ws:handshake_response(Headers)).
 
 handshake_missing_upgrade_header_test() ->
     Headers = [{~"host", ~"x"}],
@@ -202,6 +205,163 @@ parse_extensions_unterminated_quote_yields_rest_as_value_test() ->
         [{~"permessage-deflate", [{~"server_max_window_bits", ~"10"}]}],
         roadrunner_ws:parse_extensions(~"permessage-deflate; server_max_window_bits=\"10")
     ).
+
+%% =============================================================================
+%% negotiate_extensions/1 — pick acceptable offer (RFC 7692 permessage-deflate).
+%% =============================================================================
+
+negotiate_extensions_empty_offers_returns_none_test() ->
+    ?assertEqual(none, roadrunner_ws:negotiate_extensions([])).
+
+negotiate_extensions_unsupported_extension_returns_none_test() ->
+    ?assertEqual(
+        none,
+        roadrunner_ws:negotiate_extensions([{~"x-some-extension", []}])
+    ).
+
+negotiate_extensions_bare_permessage_deflate_accepts_with_defaults_test() ->
+    %% Offer with no parameters → defaults: window bits 15, context
+    %% takeover ON. Response header echoes only the extension name
+    %% (no params since all values match defaults).
+    ?assertEqual(
+        {permessage_deflate,
+            #{
+                server_max_window_bits => 15,
+                client_max_window_bits => 15,
+                server_no_context_takeover => false,
+                client_no_context_takeover => false
+            },
+            ~"permessage-deflate"},
+        roadrunner_ws:negotiate_extensions([{~"permessage-deflate", []}])
+    ).
+
+negotiate_extensions_with_no_context_takeover_echoes_in_response_test() ->
+    {permessage_deflate, Params, ResponseValue} =
+        roadrunner_ws:negotiate_extensions([
+            {~"permessage-deflate", [
+                {~"client_no_context_takeover", true},
+                {~"server_no_context_takeover", true}
+            ]}
+        ]),
+    ?assertEqual(true, maps:get(client_no_context_takeover, Params)),
+    ?assertEqual(true, maps:get(server_no_context_takeover, Params)),
+    %% Response echoes the agreed flags (order: server first per
+    %% format_pmd_response).
+    ?assertEqual(
+        ~"permessage-deflate; server_no_context_takeover; client_no_context_takeover",
+        ResponseValue
+    ).
+
+negotiate_extensions_with_explicit_window_bits_test() ->
+    {permessage_deflate, Params, ResponseValue} =
+        roadrunner_ws:negotiate_extensions([
+            {~"permessage-deflate", [
+                {~"server_max_window_bits", ~"10"},
+                {~"client_max_window_bits", ~"12"}
+            ]}
+        ]),
+    ?assertEqual(10, maps:get(server_max_window_bits, Params)),
+    ?assertEqual(12, maps:get(client_max_window_bits, Params)),
+    ?assertEqual(
+        ~"permessage-deflate; server_max_window_bits=10; client_max_window_bits=12",
+        ResponseValue
+    ).
+
+negotiate_extensions_bare_client_max_window_bits_uses_default_test() ->
+    %% `client_max_window_bits` (no value) means client accepts any
+    %% choice — server picks the default (15).
+    {permessage_deflate, Params, _ResponseValue} =
+        roadrunner_ws:negotiate_extensions([
+            {~"permessage-deflate", [{~"client_max_window_bits", true}]}
+        ]),
+    ?assertEqual(15, maps:get(client_max_window_bits, Params)).
+
+negotiate_extensions_invalid_client_max_window_bits_value_skips_offer_test() ->
+    %% `client_max_window_bits` with an unparseable value is invalid;
+    %% the offer must be skipped (consistent with server_max_window_bits).
+    ?assertEqual(
+        none,
+        roadrunner_ws:negotiate_extensions([
+            {~"permessage-deflate", [{~"client_max_window_bits", ~"42"}]}
+        ])
+    ).
+
+negotiate_extensions_bare_server_max_window_bits_skips_offer_test() ->
+    %% `server_max_window_bits` (no value) is invalid per RFC 7692
+    %% §7.1.2.2 — the parameter MUST carry a value when present in
+    %% an offer. Skip the offer rather than guess.
+    ?assertEqual(
+        none,
+        roadrunner_ws:negotiate_extensions([
+            {~"permessage-deflate", [{~"server_max_window_bits", true}]}
+        ])
+    ).
+
+negotiate_extensions_window_bits_out_of_range_skips_offer_test() ->
+    %% RFC 7692 allows 8..15 only; 7 is invalid → skip the offer
+    %% (return none rather than fall back to defaults — matches
+    %% RFC 7692's intent of strict negotiation).
+    ?assertEqual(
+        none,
+        roadrunner_ws:negotiate_extensions([
+            {~"permessage-deflate", [{~"server_max_window_bits", ~"7"}]}
+        ])
+    ),
+    ?assertEqual(
+        none,
+        roadrunner_ws:negotiate_extensions([
+            {~"permessage-deflate", [{~"server_max_window_bits", ~"16"}]}
+        ])
+    ).
+
+negotiate_extensions_unknown_pmd_param_is_ignored_test() ->
+    %% Future PMD parameters we don't recognize should be skipped, not
+    %% rejected — RFC 7692 §7 allows future param additions.
+    ?assertMatch(
+        {permessage_deflate, _, _},
+        roadrunner_ws:negotiate_extensions([
+            {~"permessage-deflate", [{~"x-future-param", ~"value"}]}
+        ])
+    ).
+
+negotiate_extensions_picks_first_acceptable_in_order_test() ->
+    %% Per RFC 6455 §9.1, server processes offers in order and picks
+    %% the first acceptable one. With unsupported first, supported
+    %% second → pick the second.
+    ?assertMatch(
+        {permessage_deflate, _, _},
+        roadrunner_ws:negotiate_extensions([
+            {~"x-unknown", []},
+            {~"permessage-deflate", []}
+        ])
+    ).
+
+%% Integration: full handshake_response/1 with extension negotiation.
+
+handshake_with_permessage_deflate_offer_includes_response_header_test() ->
+    Headers = [
+        {~"upgrade", ~"websocket"},
+        {~"connection", ~"Upgrade"},
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
+        {~"sec-websocket-version", ~"13"},
+        {~"sec-websocket-extensions", ~"permessage-deflate"}
+    ],
+    {ok, 101, RespHeaders, ~"", Negotiated} = roadrunner_ws:handshake_response(Headers),
+    ?assertMatch({permessage_deflate, _, _}, Negotiated),
+    ?assertEqual(
+        ~"permessage-deflate",
+        proplists:get_value(~"sec-websocket-extensions", RespHeaders)
+    ).
+
+handshake_without_extensions_returns_none_negotiated_test() ->
+    Headers = [
+        {~"upgrade", ~"websocket"},
+        {~"connection", ~"Upgrade"},
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
+        {~"sec-websocket-version", ~"13"}
+    ],
+    {ok, 101, _RespHeaders, ~"", Negotiated} = roadrunner_ws:handshake_response(Headers),
+    ?assertEqual(none, Negotiated).
 
 %% =============================================================================
 %% parse_frame/1
@@ -460,7 +620,7 @@ handshake_accepts_uppercase_websocket_test() ->
         {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
         {~"sec-websocket-version", ~"13"}
     ],
-    ?assertMatch({ok, 101, _, _}, roadrunner_ws:handshake_response(Headers)).
+    ?assertMatch({ok, 101, _, _, _}, roadrunner_ws:handshake_response(Headers)).
 
 handshake_accepts_mixed_case_websocket_test() ->
     Headers = [
@@ -469,7 +629,7 @@ handshake_accepts_mixed_case_websocket_test() ->
         {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
         {~"sec-websocket-version", ~"13"}
     ],
-    ?assertMatch({ok, 101, _, _}, roadrunner_ws:handshake_response(Headers)).
+    ?assertMatch({ok, 101, _, _, _}, roadrunner_ws:handshake_response(Headers)).
 
 %% --- helpers ---
 

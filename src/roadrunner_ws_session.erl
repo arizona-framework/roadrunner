@@ -94,7 +94,11 @@ the gen_statem is never started).
 -spec run(roadrunner_transport:socket(), roadrunner_http1:request(), module(), term()) -> ok.
 run(Socket, Req, Mod, State) ->
     case roadrunner_ws:handshake_response(roadrunner_req:headers(Req)) of
-        {ok, Status, RespHeaders, _} ->
+        {ok, Status, RespHeaders, _, _Negotiated} ->
+            %% R5.3a: extension negotiation result is parsed and the
+            %% header echoed in `RespHeaders`, but the session does not
+            %% yet act on `_Negotiated` — that lands in R5.3b alongside
+            %% per-message compression.
             UpgradeResp = roadrunner_http1:response(Status, RespHeaders, ~""),
             run_session(Socket, Req, Mod, State, UpgradeResp);
         {error, _} ->
