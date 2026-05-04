@@ -17,7 +17,8 @@ response (`400`, `414`, `431`, etc.).
     parse_chunk/1,
     check_header_safe/2,
     response/3,
-    compute_cached_decisions/1
+    compute_cached_decisions/1,
+    http_date_now/0
 ]).
 
 -export_type([version/0, headers/0, request/0, status/0, redirect_status/0, cached_decisions/0]).
@@ -759,6 +760,31 @@ codes get an empty reason (RFC 9112 §4.1 makes the phrase optional).
 -spec response(StatusCode :: status(), headers(), iodata()) -> iodata().
 response(Status, Headers, Body) when is_integer(Status, 100, 599) ->
     [status_line(Status), encode_headers(Headers), ~"\r\n", Body].
+
+-doc """
+Format the current UTC time as an IMF-fixdate per RFC 9110 §5.6.7
+— the canonical HTTP `Date` header format, e.g.
+`Sun, 06 Nov 1994 08:49:37 GMT`. Used by the dispatch layer to
+auto-inject the `Date` response header per RFC 9110 §6.6.1.
+""".
+-define(DAY_NAMES, {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}).
+-define(MONTH_NAMES,
+    {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+).
+
+-spec http_date_now() -> binary().
+http_date_now() ->
+    {{Y, M, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(
+        erlang:system_time(second), second
+    ),
+    DayName = element(calendar:day_of_the_week(Y, M, D), ?DAY_NAMES),
+    MonthName = element(M, ?MONTH_NAMES),
+    iolist_to_binary(
+        io_lib:format(
+            "~s, ~2..0B ~s ~4..0B ~2..0B:~2..0B:~2..0B GMT",
+            [DayName, D, MonthName, Y, H, Mi, S]
+        )
+    ).
 
 %% Common status codes get a precomputed `HTTP/1.1 NNN Reason\r\n`
 %% binary — one binary literal vs the five-element iolist build

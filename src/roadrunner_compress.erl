@@ -77,36 +77,67 @@ call(Req, Next) ->
 
 -spec transform(roadrunner_http1:request(), roadrunner_handler:response()) ->
     roadrunner_handler:response().
-transform(Req, {Status, Headers, Body}) when is_integer(Status) ->
-    Encoding = negotiate_encoding(Req),
-    AlreadyEncoded = has_header(~"content-encoding", Headers),
-    Size = iolist_size(Body),
-    case Encoding =/= none andalso not AlreadyEncoded andalso Size >= ?THRESHOLD of
-        true ->
-            compress(Status, Headers, Body, Encoding);
-        false ->
-            HeadersWithVary =
-                case Encoding =/= none andalso not AlreadyEncoded of
-                    true -> add_vary(Headers);
-                    false -> Headers
-                end,
-            {Status, HeadersWithVary, Body}
-    end;
-transform(Req, {stream, Status, Headers, Fun}) when is_integer(Status), is_function(Fun, 1) ->
-    case negotiate_encoding(Req) of
-        none ->
-            {stream, Status, Headers, Fun};
-        Encoding ->
-            case has_header(~"content-encoding", Headers) of
-                true -> {stream, Status, Headers, Fun};
-                false -> wrap_stream(Status, Headers, Fun, Encoding)
-            end
-    end;
+transform(_Req, {Status, Headers, Body} = _Response) when is_integer(Status) ->
+    transform_buffered(_Req, Status, Headers, Body);
+transform(_Req, {stream, Status, Headers, Fun} = _Response) when
+    is_integer(Status), is_function(Fun, 1)
+->
+    transform_stream(_Req, Status, Headers, Fun);
 transform(_Req, Other) ->
     %% loop / websocket — pass through. Streaming gzip would need to
     %% intercept the per-message Push fun in `roadrunner_loop_response`,
     %% which isn't wired through the response shape; defer until needed.
     Other.
+
+%% Buffered (3-tuple) responses. RFC 9110 §12.5.5 — a resource that
+%% varies its representation based on a request header MUST emit a
+%% `Vary` listing that header on EVERY response, even when the
+%% variation didn't engage on this particular request. The compress
+%% middleware always varies by `Accept-Encoding` (the result of
+%% running the middleware depends on the request's value), so Vary
+%% goes on every response that isn't already content-encoded.
+-spec transform_buffered(
+    roadrunner_http1:request(),
+    roadrunner_http1:status(),
+    roadrunner_http1:headers(),
+    iodata()
+) -> roadrunner_handler:response().
+transform_buffered(Req, Status, Headers, Body) ->
+    case has_header(~"content-encoding", Headers) of
+        true ->
+            %% Already encoded by the handler — pass through verbatim;
+            %% don't add Vary on top of whatever the handler chose.
+            {Status, Headers, Body};
+        false ->
+            HeadersWithVary = add_vary(Headers),
+            Encoding = negotiate_encoding(Req),
+            Size = iolist_size(Body),
+            case Encoding =/= none andalso Size >= ?THRESHOLD of
+                true -> compress(Status, HeadersWithVary, Body, Encoding);
+                false -> {Status, HeadersWithVary, Body}
+            end
+    end.
+
+-spec transform_stream(
+    roadrunner_http1:request(),
+    roadrunner_http1:status(),
+    roadrunner_http1:headers(),
+    roadrunner_handler:stream_fun()
+) -> roadrunner_handler:response().
+transform_stream(Req, Status, Headers, Fun) ->
+    case has_header(~"content-encoding", Headers) of
+        true ->
+            %% Handler set its own Content-Encoding — don't double-wrap.
+            {stream, Status, Headers, Fun};
+        false ->
+            HeadersWithVary = add_vary(Headers),
+            case negotiate_encoding(Req) of
+                none ->
+                    {stream, Status, HeadersWithVary, Fun};
+                Encoding ->
+                    wrap_stream(Status, HeadersWithVary, Fun, Encoding)
+            end
+    end.
 
 %% Wrap a stream response: each chunk passes through a deflate context
 %% configured for the negotiated encoding. The user's `Fun` sees a
@@ -121,11 +152,9 @@ transform(_Req, Other) ->
 ) ->
     roadrunner_handler:response().
 wrap_stream(Status, Headers, Fun, Encoding) ->
-    NewHeaders = [
-        {~"content-encoding", encoding_token(Encoding)},
-        {~"vary", ~"Accept-Encoding"}
-        | Headers
-    ],
+    %% Vary is already on `Headers` — added by the caller
+    %% (`transform_stream/4`) before this wrap fires.
+    NewHeaders = [{~"content-encoding", encoding_token(Encoding)} | Headers],
     WrappedFun = fun(Send) ->
         Z = zlib:open(),
         try
@@ -161,13 +190,10 @@ compress(Status, Headers, Body, Encoding) ->
     Compressed = compress_body(Body, Encoding),
     NewLength = integer_to_binary(byte_size(Compressed)),
     %% Replace any existing Content-Length, then prepend
-    %% Content-Encoding + Vary.
+    %% Content-Encoding. Vary is already on `Headers` — added by
+    %% the caller (`transform_buffered/4`) before this fires.
     Headers1 = lists:keystore(~"content-length", 1, Headers, {~"content-length", NewLength}),
-    Headers2 = [
-        {~"content-encoding", encoding_token(Encoding)},
-        {~"vary", ~"Accept-Encoding"}
-        | Headers1
-    ],
+    Headers2 = [{~"content-encoding", encoding_token(Encoding)} | Headers1],
     {Status, Headers2, Compressed}.
 
 %% RFC 9110 §8.4.1.3: "deflate" = zlib data format (RFC 1950) — i.e.

@@ -599,21 +599,24 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, ListenerMws) ->
 dispatch_response(Socket, _Handler, Req, {websocket, Mod, State}) when is_atom(Mod) ->
     _ = roadrunner_ws_session:run(Socket, Req, Mod, State),
     ok;
-dispatch_response(Socket, _Handler, _Req, {stream, Status, Headers, Fun}) when
+dispatch_response(Socket, _Handler, _Req, {stream, Status, Headers0, Fun}) when
     is_function(Fun, 1)
 ->
+    Headers = with_date(Status, Headers0),
     _ = roadrunner_stream_response:run(Socket, Status, Headers, Fun),
     ok;
-dispatch_response(Socket, Handler, _Req, {loop, Status, Headers, LoopState}) when
+dispatch_response(Socket, Handler, _Req, {loop, Status, Headers0, LoopState}) when
     is_integer(Status)
 ->
+    Headers = with_date(Status, Headers0),
     _ = roadrunner_loop_response:run(Socket, Status, Headers, Handler, LoopState),
     ok;
 dispatch_response(
-    Socket, _Handler, Req, {sendfile, Status, Headers, {Filename, Offset, Length}}
+    Socket, _Handler, Req, {sendfile, Status, Headers0, {Filename, Offset, Length}}
 ) when
     is_integer(Status)
 ->
+    Headers = with_date(Status, Headers0),
     Head = roadrunner_http1:response(Status, Headers, ~""),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Head), sendfile_response_head
@@ -633,20 +636,36 @@ dispatch_response(
 %% include a message body — match on `method := ~"HEAD"` in the
 %% function head and emit the response with an empty body. Free
 %% pattern-match dispatch (no `maps:get(method, _)` per response).
-dispatch_response(Socket, _Handler, #{method := ~"HEAD"}, {Status, Headers, _Body}) when
+dispatch_response(Socket, _Handler, #{method := ~"HEAD"}, {Status, Headers0, _Body}) when
     is_integer(Status)
 ->
+    Headers = with_date(Status, Headers0),
     Resp = roadrunner_http1:response(Status, Headers, ~""),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Resp), buffered_response
     ),
     ok;
-dispatch_response(Socket, _Handler, _Req, {Status, Headers, Body}) when is_integer(Status) ->
+dispatch_response(Socket, _Handler, _Req, {Status, Headers0, Body}) when is_integer(Status) ->
+    Headers = with_date(Status, Headers0),
     Resp = roadrunner_http1:response(Status, Headers, Body),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Resp), buffered_response
     ),
     ok.
+
+%% RFC 9110 §6.6.1: an origin server MUST emit `Date` on every
+%% response. We always have a clock (BEAM `erlang:system_time/0`),
+%% so inject Date unless the handler already set it. dispatch_response
+%% only fires for handler-emitted responses (status ≥ 200); 1xx
+%% interim responses are emitted by the framework directly without
+%% routing through this path, so we don't need a 1xx skip here.
+-spec with_date(roadrunner_http1:status(), roadrunner_http1:headers()) ->
+    roadrunner_http1:headers().
+with_date(_Status, Headers) ->
+    case lists:keymember(~"date", 1, Headers) of
+        true -> Headers;
+        false -> [{~"date", roadrunner_http1:http_date_now()} | Headers]
+    end.
 
 %% --- finishing phase ---
 %%

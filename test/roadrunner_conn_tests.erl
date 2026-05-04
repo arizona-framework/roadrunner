@@ -330,14 +330,69 @@ conn_serves_200_on_get_test_() ->
             roadrunner_listener:port(conn_test_get)
         end,
         fun(_) -> ok = roadrunner_listener:stop(conn_test_get) end, fun(Port) ->
-            {"GET request gets a 200 with the hello body", fun() ->
+            [
+                {"GET request gets a 200 with the hello body", fun() ->
+                    {ok, Sock} = gen_tcp:connect(
+                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                    ),
+                    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                    Reply = recv_until_closed(Sock),
+                    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                    {match, _} = re:run(Reply, ~"Hello, roadrunner!"),
+                    ok = gen_tcp:close(Sock)
+                end},
+                {"response auto-injects Date header per RFC 9110 §6.6.1", fun() ->
+                    {ok, Sock} = gen_tcp:connect(
+                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                    ),
+                    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                    Reply = recv_until_closed(Sock),
+                    {match, _} = re:run(
+                        Reply,
+                        %% IMF-fixdate: e.g. "date: Sun, 06 Nov 1994 08:49:37 GMT"
+                        "date: [A-Z][a-z]{2}, \\d{2} [A-Z][a-z]{2} \\d{4} "
+                        "\\d{2}:\\d{2}:\\d{2} GMT",
+                        []
+                    ),
+                    ok = gen_tcp:close(Sock)
+                end}
+            ]
+        end}.
+
+conn_handler_emitted_date_is_preserved_test_() ->
+    %% When a handler explicitly sets `Date` (e.g. for replay or
+    %% pre-recorded fixtures), the framework's auto-injection MUST
+    %% NOT override it.
+    {setup,
+        fun() ->
+            {ok, _} = roadrunner_listener:start_link(conn_test_date, #{
+                port => 0,
+                handler => roadrunner_explicit_date_handler
+            }),
+            roadrunner_listener:port(conn_test_date)
+        end,
+        fun(_) -> ok = roadrunner_listener:stop(conn_test_date) end, fun(Port) ->
+            {"handler's explicit Date wins over auto-injection", fun() ->
                 {ok, Sock} = gen_tcp:connect(
                     {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
                 ),
                 ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
                 Reply = recv_until_closed(Sock),
-                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
-                {match, _} = re:run(Reply, ~"Hello, roadrunner!"),
+                {match, _} = re:run(
+                    Reply,
+                    "date: Sun, 06 Nov 1994 08:49:37 GMT",
+                    []
+                ),
+                %% No second Date header — the auto-inject should have
+                %% deferred to the handler's value.
+                Lines = binary:split(Reply, ~"\r\n", [global]),
+                DateCount = length([
+                    L
+                 || L <- Lines,
+                    binary:match(L, ~"date:") =:= {0, 5} orelse
+                        binary:match(L, ~"Date:") =:= {0, 5}
+                ]),
+                ?assertEqual(1, DateCount),
                 ok = gen_tcp:close(Sock)
             end}
         end}.
