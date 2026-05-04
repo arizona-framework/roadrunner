@@ -11,6 +11,7 @@ features.
 
 -export([accept_key/1, handshake_response/1]).
 -export([parse_frame/1, parse_frame/2]).
+-export([peek_frame_header/2]).
 -export([encode_frame/3, encode_frame/4]).
 -export([parse_extensions/1, negotiate_extensions/1]).
 
@@ -456,6 +457,75 @@ do_parse_frame(<<Fin:1, Rsv1:1, 0:2, Op:4, Mask:1, Len7:7, Rest/binary>>, _Allow
     end;
 do_parse_frame(_, _AllowRsv1) ->
     {more, undefined}.
+
+-doc """
+Sneak-peek a partially-buffered frame: parse just enough of the
+header to expose the payload region. Returns:
+
+- `{ok, #{opcode => _, fin => _, rsv1 => _, total_payload_len => _,
+         mask_key => _, payload_offset => _}, BytesAvailable}` when
+  the header is fully buffered; `BytesAvailable` is the number of
+  payload bytes already in `Buf` (may be 0..total_payload_len).
+- `{more, undefined}` if even the header isn't complete.
+- `{error, _}` for the same protocol violations `parse_frame/2`
+  rejects.
+
+Used by `roadrunner_ws_session` to validate text-frame UTF-8
+payload bytes incrementally as TCP chunks arrive — well before
+the frame as a whole completes. Honors `allow_rsv1` the same way
+`parse_frame/2` does.
+""".
+-spec peek_frame_header(binary(), parse_opts()) ->
+    {ok, map(), non_neg_integer()}
+    | {more, undefined}
+    | {error, bad_opcode | bad_rsv | not_masked | fragmented_control | control_frame_too_large}.
+peek_frame_header(Bin, Opts) ->
+    do_peek(Bin, maps:get(allow_rsv1, Opts, false)).
+
+-spec do_peek(binary(), boolean()) ->
+    {ok, map(), non_neg_integer()}
+    | {more, undefined}
+    | {error, bad_opcode | bad_rsv | not_masked | fragmented_control | control_frame_too_large}.
+do_peek(<<_Fin:1, _Rsv1:1, Rsv23:2, _:4, _/bitstring>>, _AllowRsv1) when Rsv23 =/= 0 ->
+    {error, bad_rsv};
+do_peek(<<_Fin:1, 1:1, 0:2, _:4, _/bitstring>>, false) ->
+    {error, bad_rsv};
+do_peek(<<Fin:1, Rsv1:1, 0:2, Op:4, Mask:1, Len7:7, Rest/binary>>, _AllowRsv1) ->
+    case decode_opcode(Op) of
+        {ok, Opcode} ->
+            case validate_control(Opcode, Fin, Len7) of
+                ok -> peek_extract(Opcode, Fin, Rsv1, Mask, Len7, Rest);
+                {error, _} = E -> E
+            end;
+        error ->
+            {error, bad_opcode}
+    end;
+do_peek(_, _AllowRsv1) ->
+    {more, undefined}.
+
+-spec peek_extract(opcode(), 0 | 1, 0 | 1, 0 | 1, 0..127, binary()) ->
+    {ok, map(), non_neg_integer()} | {more, undefined} | {error, not_masked}.
+peek_extract(_Opcode, _Fin, _Rsv1, 0, _Len7, _Rest) ->
+    {error, not_masked};
+peek_extract(Opcode, Fin, Rsv1, 1, 126, <<Len:16, MaskKey:4/binary, Body/binary>>) ->
+    {ok, peek_header(Opcode, Fin, Rsv1, Len, MaskKey, 8), byte_size(Body)};
+peek_extract(Opcode, Fin, Rsv1, 1, 127, <<Len:64, MaskKey:4/binary, Body/binary>>) ->
+    {ok, peek_header(Opcode, Fin, Rsv1, Len, MaskKey, 14), byte_size(Body)};
+peek_extract(Opcode, Fin, Rsv1, 1, Len7, <<MaskKey:4/binary, Body/binary>>) when Len7 < 126 ->
+    {ok, peek_header(Opcode, Fin, Rsv1, Len7, MaskKey, 6), byte_size(Body)};
+peek_extract(_Opcode, _Fin, _Rsv1, 1, _Len7, _Rest) ->
+    {more, undefined}.
+
+-spec peek_header(opcode(), 0 | 1, 0 | 1, non_neg_integer(), binary(), non_neg_integer()) -> map().
+peek_header(Opcode, Fin, Rsv1, Len, MaskKey, PayloadOffset) ->
+    #{
+        opcode => Opcode,
+        fin => fin_flag(Fin),
+        rsv1 => rsv_flag(Rsv1),
+        total_payload_len => Len,
+        mask_key => MaskKey,
+        payload_offset => PayloadOffset
+    }.
 
 %% RFC 6455 §5.5: control frames (close, ping, pong) MUST NOT be
 %% fragmented and MUST have payload ≤125 bytes (i.e. encoded with the

@@ -715,6 +715,75 @@ out_of_range_utf8_at_fragment_2_closes_immediately_test() ->
     ?assertEqual(<<16#88, 2, 1007:16>>, Sent),
     Sink ! stop.
 
+empty_text_frame_round_trips_test() ->
+    %% Empty-payload text frame (FIN=1, payload length 0). Wire-level
+    %% peek returns Available=0 → ToValidate=0 path. Echoes back
+    %% empty payload.
+    Self = self(),
+    Tag = make_ref(),
+    %% FIN+text=0x81, MASK+0=0x80, mask key, no payload.
+    Empty = <<16#81, 16#80, 1, 2, 3, 4>>,
+    Sink = spawn_active_sink(Self, Tag, [{recv, Empty}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    %% Echoed empty text frame: 0x81, length 0.
+    ?assertEqual(<<16#81, 0>>, Sent),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+continuation_with_invalid_utf8_at_fin_closes_1007_test() ->
+    %% Multi-fragment text message; final continuation fragment
+    %% contains an invalid UTF-8 byte. Wire-level skips continuation
+    %% frames (peek matches opcode=text only), so fragment-level
+    %% validate_fin_fragment runs and catches the error.
+    Self = self(),
+    Tag = make_ref(),
+    F1 = uncompressed_fragment(text, ~"hello", false),
+    %% 0x80 is a stray continuation byte without a leader — invalid.
+    F2 = uncompressed_fragment(continuation, <<16#80>>, true),
+    Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    ?assertEqual(<<16#88, 2, 1007:16>>, iolist_to_binary(collect_sends(Tag, 100))),
+    Sink ! stop.
+
+continuation_with_incomplete_utf8_at_fin_closes_1007_test() ->
+    %% Multi-fragment text message; final continuation ends with a
+    %% partial multi-byte sequence (no continuation bytes follow).
+    Self = self(),
+    Tag = make_ref(),
+    F1 = uncompressed_fragment(text, ~"hi", false),
+    %% 0xC3 starts a 2-byte sequence; nothing follows.
+    F2 = uncompressed_fragment(continuation, <<16#C3>>, true),
+    Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    ?assertEqual(<<16#88, 2, 1007:16>>, iolist_to_binary(collect_sends(Tag, 100))),
+    Sink ! stop.
+
 overlong_3byte_e0_8x_closes_immediately_test() ->
     %% E0 followed by 80..9F is overlong (encodes U+0000..U+07FF
     %% which fit in 1- or 2-byte sequences). RFC 3629 §3 forbids

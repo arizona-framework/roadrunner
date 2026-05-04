@@ -456,6 +456,85 @@ parse_frame_bad_rsv_test() ->
     Frame = <<16#c1, 16#80, 1, 2, 3, 4>>,
     ?assertEqual({error, bad_rsv}, roadrunner_ws:parse_frame(Frame)).
 
+%% peek_frame_header/2 — sneak-peek for the wire-level UTF-8
+%% validation path in roadrunner_ws_session.
+peek_frame_header_text_short_payload_test() ->
+    %% 7-bit length encoding (Len7 < 126). 5-byte payload "Hello".
+    Frame = <<16#81, 16#85, 16#37, 16#fa, 16#21, 16#3d, 16#7f, 16#9f, 16#4d, 16#51, 16#58>>,
+    {ok,
+        #{
+            opcode := text,
+            fin := true,
+            rsv1 := false,
+            total_payload_len := 5,
+            mask_key := <<16#37, 16#fa, 16#21, 16#3d>>,
+            payload_offset := 6
+        },
+        5} = roadrunner_ws:peek_frame_header(Frame, #{}),
+    ok.
+
+peek_frame_header_16bit_length_test() ->
+    %% Len7=126 → 16-bit extended length follows. Build a 130-byte
+    %% payload to force the extended encoding.
+    Payload = binary:copy(<<"x">>, 130),
+    Mask = <<1, 2, 3, 4>>,
+    Masked = mask(Payload, Mask),
+    Frame =
+        <<16#81, 16#FE, 130:16, Mask/binary, Masked/binary>>,
+    {ok, #{total_payload_len := 130, payload_offset := 8}, 130} =
+        roadrunner_ws:peek_frame_header(Frame, #{}),
+    ok.
+
+peek_frame_header_64bit_length_test() ->
+    %% Len7=127 → 64-bit extended length follows.
+    Payload = binary:copy(<<"y">>, 100),
+    Mask = <<5, 6, 7, 8>>,
+    Masked = mask(Payload, Mask),
+    Frame =
+        <<16#81, 16#FF, 100:64, Mask/binary, Masked/binary>>,
+    {ok, #{total_payload_len := 100, payload_offset := 14}, 100} =
+        roadrunner_ws:peek_frame_header(Frame, #{}),
+    ok.
+
+peek_frame_header_partial_returns_more_test() ->
+    %% Just the first byte — header isn't peekable yet.
+    ?assertEqual({more, undefined}, roadrunner_ws:peek_frame_header(<<16#81>>, #{})).
+
+peek_frame_header_rsv2_rejected_test() ->
+    %% RSV2 set — `bad_rsv` regardless of allow_rsv1.
+    %% First byte: FIN(1) RSV1(0) RSV2(1) RSV3(0) opcode(0001) = 0xA1.
+    Frame = <<16#A1, 16#80, 1, 2, 3, 4>>,
+    ?assertEqual({error, bad_rsv}, roadrunner_ws:peek_frame_header(Frame, #{})),
+    ?assertEqual(
+        {error, bad_rsv},
+        roadrunner_ws:peek_frame_header(Frame, #{allow_rsv1 => true})
+    ).
+
+peek_frame_header_rsv1_rejected_without_allow_test() ->
+    Frame = <<16#C1, 16#80, 1, 2, 3, 4>>,
+    ?assertEqual({error, bad_rsv}, roadrunner_ws:peek_frame_header(Frame, #{})).
+
+peek_frame_header_bad_opcode_test() ->
+    Frame = <<16#83, 16#80, 1, 2, 3, 4>>,
+    ?assertEqual({error, bad_opcode}, roadrunner_ws:peek_frame_header(Frame, #{})).
+
+peek_frame_header_unmasked_rejected_test() ->
+    Frame = <<16#81, 16#05, "Hello">>,
+    ?assertEqual({error, not_masked}, roadrunner_ws:peek_frame_header(Frame, #{})).
+
+peek_frame_header_oversized_control_rejected_test() ->
+    %% 200-byte close frame — invalid per RFC 6455 §5.5.
+    Frame = <<16#88, 16#FE, 200:16, 1, 2, 3, 4>>,
+    ?assertEqual(
+        {error, control_frame_too_large}, roadrunner_ws:peek_frame_header(Frame, #{})
+    ).
+
+peek_frame_header_partial_after_header_returns_more_test() ->
+    %% Header complete (1 byte + 16-bit len indicator) but length
+    %% bytes haven't arrived yet.
+    Frame = <<16#81, 16#FE, 0>>,
+    ?assertEqual({more, undefined}, roadrunner_ws:peek_frame_header(Frame, #{})).
+
 parse_frame_rsv1_allowed_when_extension_active_test() ->
     %% RSV1=1 + allow_rsv1 => true (e.g. permessage-deflate negotiated)
     %% — accept and surface rsv1=true in the frame map.

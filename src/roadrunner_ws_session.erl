@@ -111,7 +111,14 @@ every frame.
     %% NOT used for compressed messages — the compressed wire bytes
     %% aren't UTF-8 until inflated; validation runs on the inflated
     %% binary at FIN time.
-    utf8_pending = <<>> :: binary()
+    utf8_pending = <<>> :: binary(),
+    %% Count of payload bytes already validated for the in-progress
+    %% frame at the wire level. Lets the session sneak-peek the
+    %% buffer between TCP chunks of a text frame and validate ONLY
+    %% the new bytes — Autobahn 6.4.3/6.4.4 fail-fast cases where the
+    %% invalid UTF-8 sequence arrives mid-frame across multiple TCP
+    %% packets. Reset on every complete frame parse.
+    frame_validated = 0 :: non_neg_integer()
 }).
 
 %% Per-message DEFLATE trailer (RFC 7692 §7.2.1). Sender strips it
@@ -221,7 +228,8 @@ init({Socket, Mod, State, Ctx, Negotiated}) ->
                 msg_acc = undefined,
                 msg_opcode = undefined,
                 msg_compressed = false,
-                utf8_pending = <<>>
+                utf8_pending = <<>>,
+                frame_validated = 0
             }};
         false ->
             {stop, {bad_handler, Mod}}
@@ -317,18 +325,95 @@ process_buffer(#data{socket = Socket, buffer = Buf, pmd_params = Pmd} = Data, Hi
             undefined -> #{};
             _ -> #{allow_rsv1 => true}
         end,
-    case roadrunner_ws:parse_frame(Buf, Opts) of
-        {ok, Frame, NewBuffer} ->
-            ok = roadrunner_telemetry:ws_frame_in(
-                (Data#data.ctx)#{opcode => maps:get(opcode, Frame)},
-                payload_size(Frame)
-            ),
-            handle_frame(Frame, Data#data{buffer = NewBuffer}, HibernateAcc);
-        {more, _} ->
-            arm_or_stop(Socket, Data, hibernate_actions(HibernateAcc));
-        {error, _} ->
-            {stop, normal, Data}
+    case early_validate_text(Data, Buf, Opts) of
+        {ok, Data1} ->
+            case roadrunner_ws:parse_frame(Buf, Opts) of
+                {ok, Frame, NewBuffer} ->
+                    ok = roadrunner_telemetry:ws_frame_in(
+                        (Data1#data.ctx)#{opcode => maps:get(opcode, Frame)},
+                        payload_size(Frame)
+                    ),
+                    %% Frame parsed. Carry `frame_validated` into
+                    %% handle_frame so accumulate_fragment can skip
+                    %% redundant per-fragment UTF-8 validation. The
+                    %% reset happens AFTER fragment-level dispatch
+                    %% (in `reset_msg/1`), so the next frame's
+                    %% wire-level cursor starts from zero.
+                    handle_frame(
+                        Frame,
+                        Data1#data{buffer = NewBuffer},
+                        HibernateAcc
+                    );
+                {more, _} ->
+                    arm_or_stop(Socket, Data1, hibernate_actions(HibernateAcc));
+                {error, _} ->
+                    {stop, normal, Data1}
+            end;
+        invalid_utf8 ->
+            close_with(close_invalid_payload(), reset_msg(Data))
     end.
+
+%% Sneak-peek a partially-buffered frame and validate any NEW
+%% text-payload bytes that have arrived since the last process_buffer
+%% pass. This is the fail-fast path for Autobahn 6.4.3/6.4.4 cases —
+%% invalid UTF-8 spread across multiple TCP chunks of a SINGLE frame
+%% gets caught before the frame even completes.
+%%
+%% Skipped when the in-progress frame isn't a fresh text data frame
+%% (binary, control, continuation, or compressed all bypass — they
+%% have their own validation paths or no encoding constraint).
+-spec early_validate_text(#data{}, binary(), roadrunner_ws:parse_opts()) ->
+    {ok, #data{}} | invalid_utf8.
+early_validate_text(Data, Buf, Opts) ->
+    case roadrunner_ws:peek_frame_header(Buf, Opts) of
+        {ok,
+            #{
+                opcode := text,
+                rsv1 := false,
+                mask_key := MaskKey,
+                payload_offset := Off,
+                total_payload_len := TotalLen
+            },
+            Available} ->
+            #data{frame_validated = AlreadyValidated, utf8_pending = Pending} = Data,
+            ToValidate = min(Available, TotalLen) - AlreadyValidated,
+            case ToValidate > 0 of
+                false ->
+                    {ok, Data};
+                true ->
+                    Slice = binary:part(Buf, Off + AlreadyValidated, ToValidate),
+                    Unmasked = unmask_slice(Slice, MaskKey, AlreadyValidated),
+                    case validate_incremental(text, false, Pending, Unmasked) of
+                        {ok, NewPending} ->
+                            {ok, Data#data{
+                                utf8_pending = NewPending,
+                                frame_validated = AlreadyValidated + ToValidate
+                            }};
+                        invalid_utf8 ->
+                            invalid_utf8
+                    end
+            end;
+        _ ->
+            %% Header isn't peekable yet, OR the in-progress frame
+            %% isn't a fresh uncompressed text frame — skip early
+            %% validation. parse_frame will catch protocol errors;
+            %% UTF-8 validation happens at fragment / FIN time.
+            {ok, Data}
+    end.
+
+%% Unmask `Slice` where its first byte sits at `Offset` into the
+%% logical payload (so the mask-key cycle is right). RFC 6455 §5.3
+%% mask: payload[i] = masked[i] XOR maskKey[i mod 4].
+-spec unmask_slice(binary(), binary(), non_neg_integer()) -> binary().
+unmask_slice(Slice, MaskKey, Offset) ->
+    iolist_to_binary(unmask_slice_loop(Slice, MaskKey, Offset)).
+
+-spec unmask_slice_loop(binary(), binary(), non_neg_integer()) -> [byte()].
+unmask_slice_loop(<<>>, _MaskKey, _I) ->
+    [];
+unmask_slice_loop(<<B, Rest/binary>>, MaskKey, I) ->
+    M = binary:at(MaskKey, I rem 4),
+    [B bxor M | unmask_slice_loop(Rest, MaskKey, I + 1)].
 
 -spec append_buffer(#data{}, binary()) -> #data{}.
 append_buffer(#data{buffer = Buf} = Data, Bytes) ->
@@ -409,7 +494,7 @@ accumulate_fragment(
     #data{msg_acc = Acc, msg_opcode = Op, msg_compressed = Compressed} = Data,
     Hibernate
 ) ->
-    case validate_incremental(Op, Compressed, Data#data.utf8_pending, P) of
+    case fragment_validate(Op, Compressed, Data#data.utf8_pending, P, Data) of
         {ok, NewPending} ->
             NewAcc =
                 case Acc of
@@ -417,7 +502,14 @@ accumulate_fragment(
                     _ -> [Acc, P]
                 end,
             process_buffer(
-                Data#data{msg_acc = NewAcc, utf8_pending = NewPending},
+                Data#data{
+                    msg_acc = NewAcc,
+                    utf8_pending = NewPending,
+                    %% Reset wire-level cursor so the NEXT frame's
+                    %% bytes are validated from scratch when they
+                    %% arrive.
+                    frame_validated = 0
+                },
                 Hibernate
             );
         invalid_utf8 ->
@@ -435,7 +527,7 @@ accumulate_fragment(
     } = Data,
     Hibernate
 ) ->
-    case validate_fin_fragment(Op, Compressed, Pending, P) of
+    case fragment_validate_fin(Op, Compressed, Pending, P, Data) of
         ok ->
             AssembledIolist =
                 case Acc of
@@ -491,6 +583,34 @@ validate_fin_fragment(text, false, Pending, Bytes) ->
         {error, _, _} -> invalid_utf8
     end.
 
+%% Skip fragment-level UTF-8 validation when the wire-level
+%% `early_validate_text` already processed every byte of this
+%% fragment (or the fragment is empty / non-text where validation is
+%% a no-op anyway).
+-spec fragment_validate(text | binary, boolean(), binary(), binary(), #data{}) ->
+    {ok, binary()} | invalid_utf8.
+fragment_validate(_Op, _Compressed, Pending, P, #data{frame_validated = Cursor}) when
+    Cursor >= byte_size(P)
+->
+    {ok, Pending};
+fragment_validate(Op, Compressed, Pending, P, _Data) ->
+    validate_incremental(Op, Compressed, Pending, P).
+
+%% Same idea for FIN: wire-level already validated, but FIN brings
+%% the additional constraint that no incomplete sequence may trail
+%% the message.
+-spec fragment_validate_fin(text | binary, boolean(), binary(), binary(), #data{}) ->
+    ok | invalid_utf8.
+fragment_validate_fin(Op, Compressed, Pending, P, #data{frame_validated = Cursor}) when
+    Cursor >= byte_size(P)
+->
+    case {Op, Compressed} of
+        {text, false} when Pending =/= <<>> -> invalid_utf8;
+        _ -> ok
+    end;
+fragment_validate_fin(Op, Compressed, Pending, P, _Data) ->
+    validate_fin_fragment(Op, Compressed, Pending, P).
+
 %% Compressed messages need their inflated payload validated; their
 %% wire bytes are deflate, so per-fragment UTF-8 validation was
 %% skipped. Uncompressed messages were validated incrementally and
@@ -508,7 +628,8 @@ reset_msg(Data) ->
         msg_acc = undefined,
         msg_opcode = undefined,
         msg_compressed = false,
-        utf8_pending = <<>>
+        utf8_pending = <<>>,
+        frame_validated = 0
     }.
 
 %% RFC 6455 §8.1 strict UTF-8 validation: validate each text-fragment
