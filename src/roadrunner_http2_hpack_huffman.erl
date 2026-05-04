@@ -117,11 +117,11 @@ decode(Bin) ->
 -spec decode_loop(binary(), tuple(), non_neg_integer(), binary()) ->
     {ok, binary()} | {error, decode_error()}.
 decode_loop(<<>>, Table, State, Out) ->
-    %% End of input: state must be accepting (pad bits along the EOS
-    %% path are allowed; landing on a non-EOS branch is a malformed
-    %% pad).
-    {_Trans, Accept} = element(State + 1, Table),
-    case Accept of
+    %% End of input. RFC 7541 §5.2:
+    %%   - state must be accepting (pad bits along the EOS path);
+    %%   - the depth-since-last-emit (= state depth) must be < 8.
+    {_Trans, Accept, Depth} = element(State + 1, Table),
+    case Accept andalso Depth < 8 of
         true -> {ok, Out};
         false -> {error, invalid_padding}
     end;
@@ -147,7 +147,7 @@ decode_loop(<<Byte, Rest/binary>>, Table, State, Out) ->
 -spec nibble_step(tuple(), non_neg_integer(), 0..15, binary()) ->
     {ok, non_neg_integer(), binary()} | {error, decode_error()}.
 nibble_step(Table, State, Nibble, Out) ->
-    {Trans, _Accept} = element(State + 1, Table),
+    {Trans, _Accept, _Depth} = element(State + 1, Table),
     case element(Nibble + 1, Trans) of
         eos -> {error, eos_in_string};
         {Next, none} -> {ok, Next, Out};
@@ -254,13 +254,34 @@ is_branch_node(_) -> false.
 
 %% --- per-state transitions ---
 
--spec build_state_entry(term(), term(), map()) -> {tuple(), boolean()}.
+-spec build_state_entry(term(), term(), map()) -> {tuple(), boolean(), non_neg_integer()}.
 build_state_entry(BranchNode, Tree, IdMap) ->
     Trans = list_to_tuple([
         nibble_transition(N, BranchNode, Tree, IdMap)
      || N <- lists:seq(0, 15)
     ]),
-    {Trans, accept_flag(BranchNode)}.
+    {Trans, accept_flag(BranchNode), node_depth(BranchNode, Tree)}.
+
+%% Depth of a branch node from the tree root, in bits. Used by
+%% `decode_loop/4` to enforce RFC 7541 §5.2: padding MUST be < 8
+%% bits, which means at end-of-input the current state's depth
+%% (= bits consumed since last symbol emit) must be < 8.
+%% Branch nodes assigned via BFS are guaranteed reachable from the
+%% root, so the walk always terminates at the target.
+-spec node_depth(term(), term()) -> non_neg_integer().
+node_depth(Node, Tree) ->
+    {ok, D} = node_depth_walk(Tree, Node, 0),
+    D.
+
+node_depth_walk(Node, Node, D) ->
+    {ok, D};
+node_depth_walk({branch, L, R}, Target, D) ->
+    case node_depth_walk(L, Target, D + 1) of
+        {ok, _} = R0 -> R0;
+        not_found -> node_depth_walk(R, Target, D + 1)
+    end;
+node_depth_walk(_Leaf, _Target, _D) ->
+    not_found.
 
 %% Walk 4 bits (high-order first) from `StartNode` through `Tree`,
 %% emitting symbols on each leaf and resetting to root when so.

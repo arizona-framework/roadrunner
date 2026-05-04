@@ -21,7 +21,7 @@ reuse / scheduling races.
 -export([suite/0, all/0, init_per_testcase/2, end_per_testcase/2]).
 -export([
     conn_window_update_overflow_triggers_goaway/1,
-    stream_window_update_overflow_triggers_goaway/1,
+    stream_window_update_overflow_triggers_rst_stream/1,
     window_update_for_unknown_stream_ignored/1,
     stream_window_update_grows_send_window/1,
     large_response_chunks_through_send_window/1,
@@ -48,7 +48,7 @@ suite() ->
 all() ->
     [
         conn_window_update_overflow_triggers_goaway,
-        stream_window_update_overflow_triggers_goaway,
+        stream_window_update_overflow_triggers_rst_stream,
         window_update_for_unknown_stream_ignored,
         stream_window_update_grows_send_window,
         large_response_chunks_through_send_window,
@@ -89,7 +89,9 @@ conn_window_update_overflow_triggers_goaway(_Config) ->
     expect_close(),
     wait_down(Pid, Ref).
 
-stream_window_update_overflow_triggers_goaway(_Config) ->
+stream_window_update_overflow_triggers_rst_stream(_Config) ->
+    %% RFC 9113 §6.9.1: stream-level WINDOW_UPDATE overflow is a
+    %% stream error, not a connection error — RST_STREAM(FLOW_CONTROL_ERROR).
     {Pid, Ref, ConnPid} = start_conn(roadrunner_hello_handler),
     handshake(ConnPid),
     HpackBin = encode_request_headers(~"POST", ~"/"),
@@ -98,9 +100,10 @@ stream_window_update_overflow_triggers_goaway(_Config) ->
     Inc = 16#7FFFFFFF - 65535 + 1,
     Wu = encode_frame({window_update, 1, Inc}),
     serve_recv(ConnPid, Wu),
-    expect_send_type(7),
-    expect_close(),
-    wait_down(Pid, Ref).
+    expect_send_type(3),
+    %% Conn stays alive — only the stream was reset.
+    true = is_process_alive(Pid),
+    cleanup(Pid, Ref).
 
 window_update_for_unknown_stream_ignored(_Config) ->
     %% WINDOW_UPDATE for a stream that's not currently open is
@@ -247,17 +250,18 @@ conn_window_update_overflow_during_blocked_send(_Config) ->
     wait_down(Pid, Ref).
 
 stream_window_update_overflow_during_blocked_send(_Config) ->
-    %% Mirror of the conn-level case — grow the stream window first
-    %% (with the conn window staying at 0), then overflow the stream.
+    %% Stream-level overflow during a blocked send is a stream
+    %% error (RST_STREAM), not a connection error — the conn
+    %% stays alive after the offending stream is dropped.
     {Pid, Ref, ConnPid} = setup_blocked_send(),
     drain_all_sends(),
     Wu1 = encode_frame({window_update, 1, 1}),
     serve_recv(ConnPid, Wu1),
     Wu2 = encode_frame({window_update, 1, 16#7FFFFFFF}),
     serve_recv(ConnPid, Wu2),
-    expect_send_type(7),
-    expect_close(),
-    wait_down(Pid, Ref).
+    expect_send_type(3),
+    true = is_process_alive(Pid),
+    cleanup(Pid, Ref).
 
 blocked_send_recv_error_exits_clean(_Config) ->
     %% While stalled mid-response, the transport raises an error.
@@ -269,12 +273,12 @@ blocked_send_recv_error_exits_clean(_Config) ->
     wait_down(Pid, Ref).
 
 blocked_send_garbage_frame_triggers_goaway(_Config) ->
-    %% Garbage frame bytes during a stalled send — the
-    %% `wait_for_window/3` parse falls to the `{error, _}` arm.
+    %% Malformed RST_STREAM (5-byte payload, must be 4) during a
+    %% blocked send — frame parse rejects with a real error and
+    %% the conn GOAWAYs.
     {Pid, Ref, ConnPid} = setup_blocked_send(),
     drain_all_sends(),
-    %% Length 0, type 99 (unknown), flags 0, R=0, stream 0.
-    serve_recv(ConnPid, <<0:24, 99, 0, 0:32>>),
+    serve_recv(ConnPid, <<0, 0, 5, 3, 0, 0:32, 0:32, 0>>),
     expect_send_type(7),
     expect_close(),
     wait_down(Pid, Ref).

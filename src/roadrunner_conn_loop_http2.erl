@@ -105,6 +105,10 @@ Response shapes supported:
     end_stream_seen := boolean(),
     headers := undefined | [roadrunner_http2_hpack:header()],
     body := iolist(),
+    %% Cumulative byte count of received DATA payload, used to
+    %% validate against the request's `content-length` header at
+    %% END_STREAM (RFC 9113 §8.1.2.6).
+    body_len := non_neg_integer(),
     send_window := integer(),
     recv_window := non_neg_integer(),
     worker_pid := undefined | pid(),
@@ -138,6 +142,16 @@ Response shapes supported:
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
     worker_refs = #{} :: #{reference() => stream_id()},
+    %% Set to a stream id while a HEADERS / PUSH_PROMISE block is
+    %% still being assembled (no END_HEADERS yet). The next inbound
+    %% frame MUST be a CONTINUATION on the same stream — anything
+    %% else is a connection error per RFC 9113 §6.10.
+    awaiting_continuation = undefined :: undefined | stream_id(),
+    %% Peer-advertised SETTINGS_INITIAL_WINDOW_SIZE for stream send
+    %% windows. Default per §6.9.2 is 65535. New streams use this
+    %% value; existing stream send-windows shift by the delta when
+    %% the peer changes the setting (§6.9.2).
+    peer_initial_window = 65535 :: integer(),
     %% Set to `true` once a `{roadrunner_drain, _}` message has
     %% been observed (Phase H9). In drain mode we've already sent
     %% GOAWAY(NO_ERROR), refuse fresh streams with
@@ -345,11 +359,39 @@ maybe_exit_when_drained(State) ->
 %% =============================================================================
 
 -spec handle_frame(roadrunner_http2_frame:frame(), #loop{}) -> no_return().
+%% RFC 9113 §6.10: while a HEADERS / PUSH_PROMISE block is in
+%% mid-flight (no END_HEADERS yet), the next frame MUST be a
+%% CONTINUATION on the same stream. Anything else is PROTOCOL_ERROR.
+handle_frame(Frame, #loop{awaiting_continuation = Awaiting} = State) when
+    Awaiting =/= undefined
+->
+    case Frame of
+        {continuation, Awaiting, Flags, Fragment} ->
+            on_continuation(Awaiting, Flags, Fragment, State);
+        _ ->
+            _ = send_goaway(State, protocol_error),
+            exit_clean(State)
+    end;
 handle_frame({settings, 1, _}, State) ->
     frame_loop(State);
-handle_frame({settings, 0, _Params}, State) ->
-    _ = send(State, roadrunner_http2_frame:encode({settings, 1, []})),
-    frame_loop(State);
+handle_frame({settings, 0, Params}, State) ->
+    case validate_settings(Params) of
+        ok ->
+            case apply_initial_window_size(Params, State) of
+                {ok, State1} ->
+                    _ = send(State1, roadrunner_http2_frame:encode({settings, 1, []})),
+                    frame_loop(State1);
+                {error, flow_control_error} ->
+                    _ = send_goaway(State, flow_control_error),
+                    exit_clean(State)
+            end;
+        {error, {protocol_error, _}} ->
+            _ = send_goaway(State, protocol_error),
+            exit_clean(State);
+        {error, {flow_control_error, _}} ->
+            _ = send_goaway(State, flow_control_error),
+            exit_clean(State)
+    end;
 handle_frame({ping, 1, _Data}, State) ->
     frame_loop(State);
 handle_frame({ping, 0, Opaque}, State) ->
@@ -369,17 +411,32 @@ handle_frame({window_update, StreamId, Inc}, #loop{streams = Streams} = State) -
         {ok, Stream} ->
             case maps:get(send_window, Stream) + Inc of
                 New when New > ?MAX_WINDOW ->
-                    _ = send_goaway(State, flow_control_error),
-                    exit_clean(State);
+                    %% RFC 9113 §6.9.1: stream-level overflow is a
+                    %% stream error, not a connection error.
+                    _ = send_rst_stream(State, StreamId, flow_control_error),
+                    frame_loop(remove_stream(State, StreamId));
                 New ->
                     Stream1 = Stream#{send_window := New},
                     State1 = update_stream(State, StreamId, Stream1),
                     frame_loop(flush_pending_data(State1, StreamId))
             end;
         error ->
-            %% Closed stream — silently ignore per RFC 9113 §6.9.
-            frame_loop(State)
+            %% RFC 9113 §5.1: WINDOW_UPDATE on an idle stream is
+            %% PROTOCOL_ERROR. A closed-stream WU (id <=
+            %% last_stream_id) is silently ignored per §6.9.
+            case StreamId > State#loop.last_stream_id of
+                true ->
+                    _ = send_goaway(State, protocol_error),
+                    exit_clean(State);
+                false ->
+                    frame_loop(State)
+            end
     end;
+handle_frame({priority, StreamId, #{stream_dependency := StreamId}}, State) ->
+    %% RFC 9113 §5.3.1: a stream cannot depend on itself —
+    %% stream-error PROTOCOL_ERROR.
+    _ = send_rst_stream(State, StreamId, protocol_error),
+    frame_loop(State);
 handle_frame({priority, _, _}, State) ->
     frame_loop(State);
 handle_frame({rst_stream, StreamId, _}, #loop{streams = Streams} = State) ->
@@ -387,7 +444,18 @@ handle_frame({rst_stream, StreamId, _}, #loop{streams = Streams} = State) ->
         true ->
             frame_loop(reset_stream(State, StreamId));
         false ->
-            frame_loop(State)
+            %% RFC 9113 §5.1: RST_STREAM on an idle stream is
+            %% PROTOCOL_ERROR (we never opened it). On a closed
+            %% stream (id <= last_stream_id) the receipt is a no-op
+            %% per §5.4 — it's the peer telling us about the
+            %% already-closed lifecycle.
+            case StreamId > State#loop.last_stream_id of
+                true ->
+                    _ = send_goaway(State, protocol_error),
+                    exit_clean(State);
+                false ->
+                    frame_loop(State)
+            end
     end;
 handle_frame({goaway, _, _, _}, State) ->
     %% Client is shutting down.
@@ -401,10 +469,68 @@ handle_frame({data, StreamId, Flags, Payload}, State) ->
 handle_frame({push_promise, _, _, _, _}, State) ->
     %% Servers MUST NOT receive PUSH_PROMISE — RFC 9113 §6.6.
     _ = send_goaway(State, protocol_error),
-    exit_clean(State).
+    exit_clean(State);
+handle_frame({unknown, _Type, _StreamId}, State) ->
+    %% RFC 9113 §4.1: unknown frame types MUST be ignored. The
+    %% awaiting_continuation guard above already rejected the
+    %% mid-header-block case (§6.10), so reaching here is benign.
+    frame_loop(State).
 
 %% --- HEADERS / CONTINUATION ---
 
+on_headers(StreamId, _Flags, #{stream_dependency := StreamId}, _Fragment, State) ->
+    %% RFC 9113 §5.3.1: a stream cannot depend on itself —
+    %% stream-error PROTOCOL_ERROR. We never enter the stream into
+    %% the streams map since we're rejecting it.
+    _ = send_rst_stream(State, StreamId, protocol_error),
+    frame_loop(State);
+on_headers(StreamId, _Flags, _Priority, _Fragment, State) when StreamId rem 2 =:= 0 ->
+    %% RFC 9113 §5.1.1: client-initiated stream IDs are odd.
+    _ = send_goaway(State, protocol_error),
+    exit_clean(State);
+on_headers(StreamId, Flags, _Priority, Fragment, #loop{streams = Streams} = State) when
+    is_map_key(StreamId, Streams)
+->
+    %% HEADERS for an already-open stream — only valid as a
+    %% trailer block per RFC 9113 §8.1: peer's first HEADERS
+    %% must have been finalized (end_headers + decoded), the
+    %% stream's body must be open (no END_STREAM yet), and the
+    %% trailer HEADERS frame MUST set END_STREAM.
+    Stream = maps:get(StreamId, Streams),
+    case is_trailer_block(Stream, Flags) of
+        true ->
+            EndHeaders = (Flags band 16#04) =/= 0,
+            Stream1 = Stream#{
+                header_fragment := Fragment,
+                end_headers := EndHeaders,
+                end_stream_seen := true
+            },
+            State1 = update_stream(State, StreamId, Stream1),
+            State2 =
+                case EndHeaders of
+                    true -> State1;
+                    false -> State1#loop{awaiting_continuation = StreamId}
+                end,
+            case EndHeaders of
+                true -> finalize_trailers(StreamId, State2);
+                false -> frame_loop(State2)
+            end;
+        false ->
+            _ = send_goaway(State, protocol_error),
+            exit_clean(State)
+    end;
+on_headers(StreamId, _Flags, _Priority, _Fragment, State) when
+    StreamId =< State#loop.last_stream_id
+->
+    %% RFC 9113 §5.1.1: stream IDs MUST monotonically increase.
+    %% Receiving a HEADERS for a stream id we've already advanced
+    %% past (without it being currently open) means the peer is
+    %% trying to (re)open a closed stream — STREAM_CLOSED is the
+    %% nominal stream error, but with an unknown stream we have
+    %% no per-stream context to RST against, so treat as a
+    %% connection error.
+    _ = send_goaway(State, protocol_error),
+    exit_clean(State);
 on_headers(StreamId, _Flags, _Priority, _Fragment, #loop{draining = true} = State) ->
     %% In drain mode — refuse all new streams. The peer already
     %% saw GOAWAY(NO_ERROR); it knows new requests on this conn
@@ -417,32 +543,25 @@ on_headers(StreamId, _Flags, _Priority, _Fragment, #loop{streams = Streams} = St
     %% Over the advertised concurrency limit — refuse the stream.
     _ = send_rst_stream(State, StreamId, refused_stream),
     frame_loop(State);
-on_headers(StreamId, _Flags, _Priority, _Fragment, #loop{streams = Streams} = State) when
-    is_map_key(StreamId, Streams)
-->
-    %% HEADERS for an already-open stream is a protocol error
-    %% (RFC 9113 §5.1.1; trailers come via END_STREAM on the same
-    %% stream, not a fresh HEADERS).
-    _ = send_goaway(State, protocol_error),
-    exit_clean(State);
-on_headers(StreamId, Flags, _Priority, Fragment, State) when StreamId rem 2 =:= 1 ->
+on_headers(StreamId, Flags, _Priority, Fragment, State) ->
     EndHeaders = (Flags band 16#04) =/= 0,
     EndStream = (Flags band 16#01) =/= 0,
-    Stream = new_stream(Fragment, EndHeaders, EndStream),
+    Stream = new_stream(Fragment, EndHeaders, EndStream, State#loop.peer_initial_window),
     State1 = State#loop{
         streams = maps:put(StreamId, Stream, State#loop.streams),
-        last_stream_id = max(StreamId, State#loop.last_stream_id)
+        last_stream_id = StreamId,
+        awaiting_continuation =
+            case EndHeaders of
+                true -> undefined;
+                false -> StreamId
+            end
     },
     case EndHeaders of
         true -> finalize_headers(StreamId, State1);
         false -> frame_loop(State1)
-    end;
-on_headers(_StreamId, _Flags, _Priority, _Fragment, State) ->
-    %% Even stream id from client — protocol error.
-    _ = send_goaway(State, protocol_error),
-    exit_clean(State).
+    end.
 
-new_stream(Fragment, EndHeaders, EndStream) ->
+new_stream(Fragment, EndHeaders, EndStream, SendWindow) ->
     #{
         state => open,
         header_fragment => Fragment,
@@ -450,7 +569,8 @@ new_stream(Fragment, EndHeaders, EndStream) ->
         end_stream_seen => EndStream,
         headers => undefined,
         body => [],
-        send_window => ?INITIAL_WINDOW,
+        body_len => 0,
+        send_window => SendWindow,
         recv_window => ?INITIAL_WINDOW,
         worker_pid => undefined,
         worker_ref => undefined,
@@ -464,11 +584,38 @@ on_continuation(StreamId, Flags, Fragment, #loop{streams = Streams} = State) ->
             EndHeaders = (Flags band 16#04) =/= 0,
             Stream1 = Stream#{header_fragment := Combined, end_headers := EndHeaders},
             State1 = update_stream(State, StreamId, Stream1),
-            case EndHeaders of
-                true -> finalize_headers(StreamId, State1);
-                false -> frame_loop(State1)
+            State2 =
+                case EndHeaders of
+                    true -> State1#loop{awaiting_continuation = undefined};
+                    false -> State1
+                end,
+            case {EndHeaders, maps:get(headers, Stream) =:= undefined} of
+                {true, true} -> finalize_headers(StreamId, State2);
+                {true, false} -> finalize_trailers(StreamId, State2);
+                {false, _} -> frame_loop(State2)
             end;
         _ ->
+            _ = send_goaway(State, protocol_error),
+            exit_clean(State)
+    end.
+
+%% Decode an inbound trailer HPACK block. We currently drop the
+%% decoded fields (handlers don't see request trailers yet) but
+%% MUST advance the HPACK decoder context so subsequent header
+%% blocks decode correctly. After consuming, dispatch the
+%% pending request (END_STREAM was already set by `on_headers/5`).
+finalize_trailers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) ->
+    Stream = maps:get(StreamId, Streams),
+    Fragment = maps:get(header_fragment, Stream),
+    case roadrunner_http2_hpack:decode(Fragment, Dec) of
+        {ok, _Trailers, Dec1} ->
+            Stream1 = Stream#{header_fragment := <<>>},
+            State1 = State#loop{
+                hpack_dec = Dec1,
+                streams = maps:put(StreamId, Stream1, Streams)
+            },
+            dispatch_stream(StreamId, State1);
+        {error, _} ->
             _ = send_goaway(State, protocol_error),
             exit_clean(State)
     end.
@@ -497,31 +644,41 @@ finalize_headers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) ->
 
 %% --- DATA ---
 
+on_data(StreamId, _Flags, _Payload, State) when StreamId > State#loop.last_stream_id ->
+    %% RFC 9113 §5.1: DATA on an idle stream is PROTOCOL_ERROR.
+    _ = send_goaway(State, protocol_error),
+    exit_clean(State);
+on_data(StreamId, _Flags, _Payload, #loop{streams = Streams} = State) when
+    not is_map_key(StreamId, Streams)
+->
+    %% RFC 9113 §6.1: DATA on a closed stream is STREAM_CLOSED.
+    %% In our setup the conn-level recv window has already been
+    %% partially consumed by the peer's send so we still emit a
+    %% RST_STREAM rather than ignoring.
+    _ = send_rst_stream(State, StreamId, stream_closed),
+    frame_loop(State);
 on_data(StreamId, Flags, Payload, #loop{streams = Streams} = State) ->
-    case maps:find(StreamId, Streams) of
-        {ok, Stream} ->
-            EndStream = (Flags band 16#01) =/= 0,
-            PayloadLen = byte_size(Payload),
-            NewBody = [maps:get(body, Stream), Payload],
-            NewConnRecv = State#loop.conn_recv_window - PayloadLen,
-            NewStreamRecv = maps:get(recv_window, Stream) - PayloadLen,
-            Stream1 = Stream#{
-                body := NewBody,
-                end_stream_seen := EndStream,
-                recv_window := NewStreamRecv
-            },
-            State1 = State#loop{
-                streams = maps:put(StreamId, Stream1, Streams),
-                conn_recv_window = NewConnRecv
-            },
-            State2 = maybe_refill_recv_windows(State1, StreamId),
-            case EndStream of
-                true -> dispatch_stream(StreamId, State2);
-                false -> frame_loop(State2)
-            end;
-        error ->
-            _ = send_goaway(State, protocol_error),
-            exit_clean(State)
+    Stream = maps:get(StreamId, Streams),
+    EndStream = (Flags band 16#01) =/= 0,
+    PayloadLen = byte_size(Payload),
+    NewBody = [maps:get(body, Stream), Payload],
+    NewBodyLen = maps:get(body_len, Stream) + PayloadLen,
+    NewConnRecv = State#loop.conn_recv_window - PayloadLen,
+    NewStreamRecv = maps:get(recv_window, Stream) - PayloadLen,
+    Stream1 = Stream#{
+        body := NewBody,
+        body_len := NewBodyLen,
+        end_stream_seen := EndStream,
+        recv_window := NewStreamRecv
+    },
+    State1 = State#loop{
+        streams = maps:put(StreamId, Stream1, Streams),
+        conn_recv_window = NewConnRecv
+    },
+    State2 = maybe_refill_recv_windows(State1, StreamId),
+    case EndStream of
+        true -> dispatch_stream(StreamId, State2);
+        false -> frame_loop(State2)
     end.
 
 %% Refill the conn-level + stream-level recv windows whenever they
@@ -568,33 +725,64 @@ dispatch_stream(
 ) ->
     Stream = maps:get(StreamId, Streams),
     Headers = maps:get(headers, Stream),
-    Body = iolist_to_binary(maps:get(body, Stream)),
-    {RequestId, _} = roadrunner_conn:generate_request_id(<<>>),
-    ConnInfo = #{
-        peer => Peer,
-        scheme => Scheme,
-        listener_name => ListenerName,
-        request_id => RequestId
-    },
-    case roadrunner_http2_request:from_headers(Headers, Body, ConnInfo) of
-        {ok, Req} ->
-            {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
-                self(), StreamId, Req, ProtoOpts
-            ),
-            Stream1 = Stream#{
-                worker_pid := WorkerPid,
-                worker_ref := MonRef,
-                state := half_closed_remote,
-                body := []
+    BodyLen = maps:get(body_len, Stream),
+    case content_length_matches(Headers, BodyLen) of
+        true ->
+            Body = iolist_to_binary(maps:get(body, Stream)),
+            {RequestId, _} = roadrunner_conn:generate_request_id(<<>>),
+            ConnInfo = #{
+                peer => Peer,
+                scheme => Scheme,
+                listener_name => ListenerName,
+                request_id => RequestId
             },
-            State1 = State#loop{
-                streams = maps:put(StreamId, Stream1, Streams),
-                worker_refs = maps:put(MonRef, StreamId, State#loop.worker_refs)
-            },
-            frame_loop(State1);
-        {error, _Reason} ->
+            case roadrunner_http2_request:from_headers(Headers, Body, ConnInfo) of
+                {ok, Req} ->
+                    {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
+                        self(), StreamId, Req, ProtoOpts
+                    ),
+                    Stream1 = Stream#{
+                        worker_pid := WorkerPid,
+                        worker_ref := MonRef,
+                        state := half_closed_remote,
+                        body := []
+                    },
+                    State1 = State#loop{
+                        streams = maps:put(StreamId, Stream1, Streams),
+                        worker_refs = maps:put(
+                            MonRef, StreamId, State#loop.worker_refs
+                        )
+                    },
+                    frame_loop(State1);
+                {error, _Reason} ->
+                    _ = send_rst_stream(State, StreamId, protocol_error),
+                    frame_loop(remove_stream(State, StreamId))
+            end;
+        false ->
+            %% RFC 9113 §8.1.2.6: content-length / DATA-payload
+            %% mismatch is a stream-error PROTOCOL_ERROR.
             _ = send_rst_stream(State, StreamId, protocol_error),
             frame_loop(remove_stream(State, StreamId))
+    end.
+
+%% Verify that any client-supplied `content-length` header matches
+%% the cumulative bytes received in DATA frames. Absent header is
+%% always acceptable; multi-valued or non-integer values are
+%% rejected as mismatches.
+-spec content_length_matches([{binary(), binary()}], non_neg_integer()) -> boolean().
+content_length_matches(Headers, BodyLen) ->
+    case [V || {N, V} <- Headers, N =:= ~"content-length"] of
+        [] ->
+            true;
+        [V] ->
+            try binary_to_integer(V) of
+                BodyLen -> true;
+                _ -> false
+            catch
+                error:badarg -> false
+            end;
+        _ ->
+            false
     end.
 
 %% =============================================================================
@@ -864,9 +1052,76 @@ notify_pending_reset(StreamId, [{data, _Ref, From, _Bin, _Es} | Rest]) ->
 %% Generic helpers
 %% =============================================================================
 
+%% A second HEADERS frame on an already-open stream is only valid
+%% as a trailer block (RFC 9113 §8.1): the body must still be
+%% open (no END_STREAM seen yet) and the trailer HEADERS frame
+%% MUST set END_STREAM. We don't need to check `headers =/=
+%% undefined` because the only path into here is a duplicate
+%% HEADERS for a stream where the first HEADERS had END_HEADERS=true
+%% (otherwise the awaiting_continuation guard fires upstream),
+%% which guarantees `finalize_headers/2` has already run.
+-spec is_trailer_block(map(), non_neg_integer()) -> boolean().
+is_trailer_block(#{end_stream_seen := true}, _Flags) ->
+    false;
+is_trailer_block(_Stream, Flags) ->
+    (Flags band 16#01) =/= 0.
+
 -spec lowercase(binary()) -> binary().
 lowercase(B) ->
     roadrunner_bin:ascii_lowercase(B).
+
+%% RFC 9113 §6.9.2: when peer changes INITIAL_WINDOW_SIZE we shift
+%% every open stream's send window by the delta. Overflow on any
+%% stream is FLOW_CONTROL_ERROR (connection error). New streams
+%% use the latest value via `peer_initial_window`.
+-spec apply_initial_window_size(
+    [{non_neg_integer(), non_neg_integer()}], #loop{}
+) -> {ok, #loop{}} | {error, flow_control_error}.
+apply_initial_window_size(Params, #loop{peer_initial_window = Old} = State) ->
+    case lists:reverse([V || {4, V} <- Params]) of
+        [] ->
+            {ok, State};
+        [New | _] ->
+            Delta = New - Old,
+            case shift_stream_send_windows(maps:to_list(State#loop.streams), Delta, []) of
+                {ok, Streams1} ->
+                    {ok, State#loop{
+                        peer_initial_window = New,
+                        streams = maps:from_list(Streams1)
+                    }};
+                {error, _} = E ->
+                    E
+            end
+    end.
+
+shift_stream_send_windows([], _Delta, Acc) ->
+    {ok, Acc};
+shift_stream_send_windows([{Id, Stream} | Rest], Delta, Acc) ->
+    NewWindow = maps:get(send_window, Stream) + Delta,
+    case NewWindow > ?MAX_WINDOW of
+        true ->
+            {error, flow_control_error};
+        false ->
+            Stream1 = Stream#{send_window := NewWindow},
+            shift_stream_send_windows(Rest, Delta, [{Id, Stream1} | Acc])
+    end.
+
+%% Validate the per-id constraints on incoming SETTINGS values per
+%% RFC 9113 §6.5.2: ENABLE_PUSH ∈ {0,1}, INITIAL_WINDOW_SIZE
+%% ≤ 2^31-1, MAX_FRAME_SIZE ∈ [2^14, 2^24-1]. Other ids carry no
+%% range constraints (or are forward-compat unknowns we ignore).
+-spec validate_settings([{non_neg_integer(), non_neg_integer()}]) ->
+    ok | {error, {protocol_error | flow_control_error, atom()}}.
+validate_settings([]) ->
+    ok;
+validate_settings([{2, V} | _]) when V =/= 0, V =/= 1 ->
+    {error, {protocol_error, enable_push_value}};
+validate_settings([{4, V} | _]) when V > 16#7FFFFFFF ->
+    {error, {flow_control_error, initial_window_size}};
+validate_settings([{5, V} | _]) when V < 16384; V > 16#FFFFFF ->
+    {error, {protocol_error, max_frame_size}};
+validate_settings([_ | Rest]) ->
+    validate_settings(Rest).
 
 -spec send(#loop{}, iodata()) -> ok | {error, term()}.
 send(#loop{socket = Socket}, Data) ->

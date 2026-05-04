@@ -276,13 +276,17 @@ continuation_on_stream_zero_is_protocol_error_test() ->
     Bin = <<0:24, 9, 0, 0:32>>,
     ?assertEqual({error, stream_id_violation}, roadrunner_http2_frame:parse(Bin, ?MAX)).
 
-unknown_frame_type_is_protocol_error_test() ->
-    %% Type 0xFF doesn't exist — RFC 9113 §4.1 says receivers MAY
-    %% ignore unknown types; our parser surfaces an error so callers
-    %% can decide. (Spec compliance for "ignore" lives at the
-    %% conn-loop layer.)
-    Bin = <<0:24, 16#FF, 0, 0:32>>,
-    ?assertEqual({error, protocol_error}, roadrunner_http2_frame:parse(Bin, ?MAX)).
+unknown_frame_type_surfaces_unknown_tag_test() ->
+    %% RFC 9113 §4.1 + §5.5: unknown frame types MUST be ignored.
+    %% `parse/2` returns a `{unknown, Type, StreamId}` tag so the
+    %% conn-loop can ignore them (default) BUT still enforce the
+    %% §6.10 "no non-CONTINUATION between HEADERS and CONTINUATION"
+    %% rule, which requires *seeing* the unknown frame.
+    Unknown = <<0:24, 16#FF, 0, 0:32>>,
+    ?assertMatch(
+        {ok, {unknown, 16#FF, 0}, <<>>},
+        roadrunner_http2_frame:parse(Unknown, ?MAX)
+    ).
 
 %% =============================================================================
 %% Error code mapping (RFC 9113 §7).

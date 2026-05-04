@@ -127,7 +127,12 @@ higher value. Frames whose `length` exceeds the limit fail with
     | {ping, flags(), OpaqueData :: <<_:64>>}
     | {goaway, LastStreamId :: stream_id(), error_code(), DebugData :: binary()}
     | {window_update, stream_id(), Increment :: 1..16#7FFFFFFF}
-    | {continuation, stream_id(), flags(), HeaderBlock :: binary()}.
+    | {continuation, stream_id(), flags(), HeaderBlock :: binary()}
+    %% Unknown frame types — RFC 9113 §4.1: receivers MUST ignore.
+    %% Surfaced (rather than dropped at parse time) so the conn can
+    %% enforce the §6.10 "no non-CONTINUATION between HEADERS and
+    %% CONTINUATION" rule even for unknown frame types.
+    | {unknown, Type :: non_neg_integer(), stream_id()}.
 
 -type parse_error() ::
     frame_size_error
@@ -195,6 +200,7 @@ parse(<<Length:24, Type:8, Flags:8, _R:1, StreamId:31, Body/binary>>, _MaxFrameS
     <<Payload:Length/binary, Rest/binary>> = Body,
     case decode(Type, Flags, StreamId, Payload) of
         {ok, Frame} -> {ok, Frame, Rest};
+        ignore -> {ok, {unknown, Type, StreamId}, Rest};
         {error, _} = E -> E
     end;
 parse(Bin, _MaxFrameSize) when byte_size(Bin) < 9 ->
@@ -205,7 +211,7 @@ parse(Bin, _MaxFrameSize) when byte_size(Bin) < 9 ->
 %% =============================================================================
 
 -spec decode(non_neg_integer(), flags(), stream_id(), binary()) ->
-    {ok, frame()} | {error, parse_error()}.
+    {ok, frame()} | ignore | {error, parse_error()}.
 decode(?TYPE_DATA, _Flags, 0, _Payload) ->
     %% RFC 9113 §6.1: DATA on stream 0 is a connection error.
     {error, stream_id_violation};
@@ -252,13 +258,19 @@ decode(?TYPE_SETTINGS, _Flags, NonZero, _Payload) when NonZero =/= 0 ->
     %% §6.5: SETTINGS MUST be on stream 0.
     {error, stream_id_violation};
 decode(?TYPE_SETTINGS, Flags, 0, Payload) ->
+    %% §4.1: undefined flags MUST be ignored — mask Flags down to
+    %% the only defined SETTINGS flag (ACK) so handle_frame/2's
+    %% literal `0` / `1` patterns match cleanly even when the peer
+    %% sets stray bits.
     case has_flag(Flags, ?FLAG_ACK) of
         true when byte_size(Payload) =/= 0 ->
             %% ACK SETTINGS MUST be empty (§6.5).
             {error, bad_settings_payload};
-        _ ->
+        true ->
+            {ok, {settings, ?FLAG_ACK, []}};
+        false ->
             case decode_settings_params(Payload) of
-                {ok, Params} -> {ok, {settings, Flags, Params}};
+                {ok, Params} -> {ok, {settings, 0, Params}};
                 {error, _} = E -> E
             end
     end;
@@ -278,7 +290,10 @@ decode(?TYPE_PING, _Flags, NonZero, _Payload) when NonZero =/= 0 ->
     %% §6.7: PING MUST be on stream 0.
     {error, stream_id_violation};
 decode(?TYPE_PING, Flags, 0, <<OpaqueData:8/binary>>) ->
-    {ok, {ping, Flags, OpaqueData}};
+    %% Mask Flags to the only defined PING flag (ACK) so undefined
+    %% bits don't bypass `handle_frame/2`'s literal `0` / `1`
+    %% patterns (RFC 9113 §4.1).
+    {ok, {ping, Flags band ?FLAG_ACK, OpaqueData}};
 decode(?TYPE_PING, _Flags, 0, _Payload) ->
     {error, bad_ping_payload};
 decode(?TYPE_GOAWAY, _Flags, NonZero, _Payload) when NonZero =/= 0 ->
@@ -303,11 +318,10 @@ decode(?TYPE_CONTINUATION, _Flags, 0, _Payload) ->
 decode(?TYPE_CONTINUATION, Flags, StreamId, Payload) ->
     {ok, {continuation, StreamId, Flags, Payload}};
 decode(_UnknownType, _Flags, _StreamId, _Payload) ->
-    %% RFC 9113 §4.1 last paragraph: unknown frame types MUST be
-    %% ignored (the connection stays alive). We don't lose data for
-    %% them — caller can choose to treat the parse as a no-op and
-    %% advance to the next frame.
-    {error, protocol_error}.
+    %% RFC 9113 §4.1 last paragraph + §5.5: unknown frame types
+    %% MUST be ignored. `parse/2` recurses on `ignore` to advance
+    %% past the silently-discarded frame.
+    ignore.
 
 %% Strip the optional pad-length byte + trailing pad bytes per
 %% §6.1 / §6.2 / §6.6. When PADDED is not set, the payload is

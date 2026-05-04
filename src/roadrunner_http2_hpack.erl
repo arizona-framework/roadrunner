@@ -154,13 +154,18 @@ fragment before passing here).
 -spec decode(binary(), context()) ->
     {ok, [header()], context()} | {error, decode_error()}.
 decode(Bin, Ctx) ->
-    decode_loop(Bin, Ctx).
+    %% Third arg is the "updates still permitted" flag (RFC 7541
+    %% §4.2): a Dynamic Table Size Update MUST appear at the very
+    %% start of a header block. Once any header representation
+    %% has been decoded, the flag flips to `false` and any
+    %% subsequent update is COMPRESSION_ERROR.
+    decode_loop(Bin, Ctx, true).
 
--spec decode_loop(binary(), context()) ->
+-spec decode_loop(bitstring(), context(), boolean()) ->
     {ok, [header()], context()} | {error, decode_error()}.
-decode_loop(<<>>, Ctx) ->
+decode_loop(<<>>, Ctx, _) ->
     {ok, [], Ctx};
-decode_loop(<<1:1, Rest/bitstring>>, Ctx) ->
+decode_loop(<<1:1, Rest/bitstring>>, Ctx, _UpdatesAllowed) ->
     %% 1xxxxxxx — Indexed Header Field. 7-bit integer prefix.
     case decode_integer(7, Rest) of
         {ok, 0, _} ->
@@ -168,7 +173,7 @@ decode_loop(<<1:1, Rest/bitstring>>, Ctx) ->
         {ok, Index, Rest1} ->
             case lookup(Index, Ctx) of
                 {ok, Header} ->
-                    case decode_loop(Rest1, Ctx) of
+                    case decode_loop(Rest1, Ctx, false) of
                         {ok, Tail, Ctx2} -> {ok, [Header | Tail], Ctx2};
                         {error, _} = E -> E
                     end;
@@ -178,52 +183,53 @@ decode_loop(<<1:1, Rest/bitstring>>, Ctx) ->
         {error, _} = E ->
             E
     end;
-decode_loop(<<0:1, 1:1, Rest/bitstring>>, Ctx) ->
+decode_loop(<<0:1, 1:1, Rest/bitstring>>, Ctx, _UpdatesAllowed) ->
     %% 01xxxxxx — Literal w/ Incremental Indexing.
     case decode_literal(6, Rest, Ctx) of
         {ok, Header, Rest1} ->
             Ctx2 = insert(Header, Ctx),
-            case decode_loop(Rest1, Ctx2) of
+            case decode_loop(Rest1, Ctx2, false) of
                 {ok, Tail, Ctx3} -> {ok, [Header | Tail], Ctx3};
                 {error, _} = E -> E
             end;
         {error, _} = E ->
             E
     end;
-decode_loop(<<0:1, 0:1, 1:1, Rest/bitstring>>, Ctx) ->
-    %% 001xxxxx — Dynamic Table Size Update. MUST be the FIRST
-    %% representation in a header block when a SETTINGS update has
-    %% reduced the limit; later occurrences are also legal between
-    %% header reps as long as they don't exceed the SETTINGS cap.
+decode_loop(<<0:1, 0:1, 1:1, _/bitstring>>, _Ctx, false) ->
+    %% RFC 7541 §4.2: a Dynamic Table Size Update is only legal
+    %% at the start of a header block.
+    {error, table_size_update_after_block};
+decode_loop(<<0:1, 0:1, 1:1, Rest/bitstring>>, Ctx, true) ->
+    %% 001xxxxx — Dynamic Table Size Update.
     case decode_integer(5, Rest) of
         {ok, NewSize, Rest1} when NewSize =< Ctx#hpack_ctx.limit ->
             Ctx1 = evict_to(NewSize, Ctx),
             Ctx2 = Ctx1#hpack_ctx{max_size = NewSize},
-            decode_loop(Rest1, Ctx2);
+            decode_loop(Rest1, Ctx2, true);
         {ok, _, _} ->
             {error, invalid_table_size};
         {error, _} = E ->
             E
     end;
-decode_loop(<<0:1, 0:1, 0:1, 1:1, Rest/bitstring>>, Ctx) ->
+decode_loop(<<0:1, 0:1, 0:1, 1:1, Rest/bitstring>>, Ctx, _UpdatesAllowed) ->
     %% 0001xxxx — Literal Never Indexed. Treated identically to
     %% Literal w/o Indexing on the decode side; the difference
     %% only matters to intermediaries that re-encode (RFC 7541
     %% §6.2.3 sensitive header field).
     case decode_literal(4, Rest, Ctx) of
         {ok, Header, Rest1} ->
-            case decode_loop(Rest1, Ctx) of
+            case decode_loop(Rest1, Ctx, false) of
                 {ok, Tail, Ctx2} -> {ok, [Header | Tail], Ctx2};
                 {error, _} = E -> E
             end;
         {error, _} = E ->
             E
     end;
-decode_loop(<<0:1, 0:1, 0:1, 0:1, Rest/bitstring>>, Ctx) ->
+decode_loop(<<0:1, 0:1, 0:1, 0:1, Rest/bitstring>>, Ctx, _UpdatesAllowed) ->
     %% 0000xxxx — Literal w/o Indexing.
     case decode_literal(4, Rest, Ctx) of
         {ok, Header, Rest1} ->
-            case decode_loop(Rest1, Ctx) of
+            case decode_loop(Rest1, Ctx, false) of
                 {ok, Tail, Ctx2} -> {ok, [Header | Tail], Ctx2};
                 {error, _} = E -> E
             end;

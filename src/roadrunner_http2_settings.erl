@@ -78,6 +78,9 @@ apply_records(<<Id:16, Value:32, Rest/binary>>, Acc) ->
     apply_records(Rest, apply_one(Id, Value, Acc)).
 
 %% RFC 9113 §6.5.2 last paragraph: unknown identifiers MUST be ignored.
+%% Per-id range validation lives in `roadrunner_conn_loop_http2`'s
+%% `validate_settings/1` which runs against the parsed parameter
+%% list before this module is consulted; here we trust the input.
 apply_one(1, V, S) -> S#settings{header_table_size = V};
 apply_one(2, V, S) -> S#settings{enable_push = V};
 apply_one(3, V, S) -> S#settings{max_concurrent_streams = V};

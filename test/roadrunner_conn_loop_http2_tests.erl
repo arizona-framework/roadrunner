@@ -60,7 +60,7 @@ all_test_() ->
         fun rst_stream_active_stream_synced/0,
         fun stream_window_update_grows_window_synced/0,
         fun rst_stream_unknown_stream_ignored/0,
-        fun headers_for_already_open_stream_protocol_error/0,
+        fun headers_for_already_open_stream_without_end_stream_protocol_error/0,
         fun synthetic_send_data_after_reset/0,
         fun synthetic_send_headers_after_reset/0,
         fun synthetic_send_trailers_after_reset/0,
@@ -78,7 +78,34 @@ all_test_() ->
         fun telemetry_request_exception_fires_on_h2_handler_crash/0,
         fun telemetry_request_stop_fires_for_router_404/0,
         fun compress_middleware_gzips_buffered_h2_response/0,
-        fun compress_middleware_passthrough_when_no_accept_encoding/0
+        fun compress_middleware_passthrough_when_no_accept_encoding/0,
+        fun data_on_stream_zero_protocol_error/0,
+        fun data_on_idle_stream_protocol_error/0,
+        fun data_on_closed_stream_rst/0,
+        fun headers_self_dependency_rst_stream/0,
+        fun priority_self_dependency_rst_stream/0,
+        fun enable_push_invalid_value_protocol_error/0,
+        fun initial_window_size_too_large_flow_control_error/0,
+        fun max_frame_size_too_small_protocol_error/0,
+        fun max_frame_size_too_large_protocol_error/0,
+        fun initial_window_size_change_overflows_flow_control_error/0,
+        fun content_length_mismatch_rst_stream/0,
+        fun request_trailers_dispatched/0,
+        fun request_trailers_via_continuation/0,
+        fun awaiting_continuation_blocks_other_frames/0,
+        fun unknown_frame_silently_ignored/0,
+        fun rst_stream_on_idle_stream_protocol_error/0,
+        fun window_update_on_idle_stream_protocol_error/0,
+        fun window_update_on_closed_stream_ignored/0,
+        fun unsolicited_continuation_protocol_error/0,
+        fun trailers_with_malformed_hpack_goaway/0,
+        fun content_length_match_dispatches/0,
+        fun content_length_non_integer_rst_stream/0,
+        fun hpack_table_size_update_after_block_goaway/0,
+        fun headers_for_closed_stream_protocol_error/0,
+        fun settings_initial_window_size_shifts_stream_window/0,
+        fun content_length_multi_valued_rst_stream/0,
+        fun trailers_after_first_end_stream_protocol_error/0
     ],
     [{spawn, F} || F <- Tests].
 
@@ -238,9 +265,6 @@ all_frame_types_handled() ->
     %% SETTINGS ACK from peer — silent.
     SetAckIn = iolist_to_binary(roadrunner_http2_frame:encode({settings, 1, []})),
     serve_recv(ConnPid, SetAckIn),
-    %% RST_STREAM for an unknown stream — silently dropped.
-    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 99, cancel})),
-    serve_recv(ConnPid, Rst),
     %% Sync via PING-ACK so coverage records the prior no-op
     %% frames before `cleanup/2` races the conn process.
     SyncPing = iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<3:64>>})),
@@ -877,9 +901,9 @@ frame_loop_parse_error_triggers_goaway() ->
     serve_recv(ConnPid, ?PREFACE),
     serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
     _ = expect_send(),
-    %% Length 0, type 99 (unknown), flags 0, R=0, stream 0 — the
-    %% parser rejects the unknown frame type with an error tuple.
-    Bad = <<0:24, 99, 0, 0:32>>,
+    %% RST_STREAM with a 5-byte payload (must be exactly 4 bytes
+    %% per RFC 9113 §6.4) — parser returns `{error, _}`.
+    Bad = <<0, 0, 5, 3, 0, 0:32, 0:32, 0>>,
     serve_recv(ConnPid, Bad),
     Goaway = expect_send(),
     ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
@@ -984,10 +1008,11 @@ stream_window_update_grows_window_synced() ->
     cleanup(Pid, Ref).
 
 rst_stream_unknown_stream_ignored() ->
-    %% RST_STREAM for a stream that's not currently open is silently
-    %% dropped (closed-stream legality per RFC 9113 §5.4 / §6.4).
-    %% Sync via PING-ACK to ensure the conn processed the RST
-    %% before the cleanup race.
+    %% RST_STREAM for a stream we previously opened then RST'd
+    %% (id <= last_stream_id, no longer in map) is silently
+    %% dropped per RFC 9113 §5.4 / §6.4. Idle (id > last_stream_id)
+    %% is a different case — covered by
+    %% `rst_stream_on_idle_stream_protocol_error/0`.
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
@@ -995,19 +1020,28 @@ rst_stream_unknown_stream_ignored() ->
     serve_recv(ConnPid, ?PREFACE),
     serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
     _ = expect_send(),
-    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 99, cancel})),
-    serve_recv(ConnPid, Rst),
+    %% Open + RST stream 1 so it's a closed (not idle) id.
+    HpackBin = encode_post_root_headers(),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    Rst1 = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
+    serve_recv(ConnPid, Rst1),
+    %% Second RST for the same now-closed stream — silently ignored.
+    Rst2 = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
+    serve_recv(ConnPid, Rst2),
     Ping = iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>})),
     serve_recv(ConnPid, Ping),
     PingAck = expect_send(),
     ?assertMatch(<<_:24, 6, 1, _/binary>>, PingAck),
     cleanup(Pid, Ref).
 
-headers_for_already_open_stream_protocol_error() ->
-    %% Stream id 1 is opened (HEADERS without END_STREAM) and then
-    %% HEADERS for stream 1 arrives again — RFC 9113 §5.1.1: a
-    %% server treats receipt of a duplicate stream-id HEADERS as
-    %% PROTOCOL_ERROR (after the original opened the stream).
+headers_for_already_open_stream_without_end_stream_protocol_error() ->
+    %% Two HEADERS frames on the same stream without END_STREAM on
+    %% either: the first opens the stream, the second is invalid
+    %% (only a trailer HEADERS with END_STREAM is allowed after
+    %% the body). Per RFC 9113 §8.1 → PROTOCOL_ERROR.
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
@@ -1021,7 +1055,7 @@ headers_for_already_open_stream_protocol_error() ->
     ),
     serve_recv(ConnPid, H1),
     H1Again = iolist_to_binary(
-        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
     ),
     serve_recv(ConnPid, H1Again),
     Goaway = expect_send(),
@@ -1687,6 +1721,625 @@ decode_response_loop([{headers, _, _, Block} | Rest], Dec, _Status, _RespHeaders
     decode_response_loop(Rest, Dec1, Status1, Regular, Body);
 decode_response_loop([{data, _, _, Payload} | Rest], Dec, Status, RespHeaders, Body) ->
     decode_response_loop(Rest, Dec, Status, RespHeaders, <<Body/binary, Payload/binary>>).
+
+data_on_stream_zero_protocol_error() ->
+    %% RFC 9113 §6.1: DATA on stream 0 is a connection error.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    serve_recv(ConnPid, <<1:24, 0, 0, 0:32, 0>>),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+data_on_idle_stream_protocol_error() ->
+    %% RFC 9113 §5.1: DATA on a stream id > last_stream_id is a
+    %% connection error PROTOCOL_ERROR.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    serve_recv(ConnPid, <<1:24, 0, 0, 0:1, 99:31, 0>>),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+data_on_closed_stream_rst() ->
+    %% DATA on a stream id we previously closed (<= last_stream_id,
+    %% not in map) is a stream error STREAM_CLOSED.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    HpackBin = encode_post_root_headers(),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    %% RST stream 1 — removes from map.
+    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
+    serve_recv(ConnPid, Rst),
+    %% Now send DATA on closed stream 1.
+    serve_recv(ConnPid, <<1:24, 0, 0, 0:1, 1:31, 0>>),
+    Out = expect_send(),
+    ?assertMatch(<<_:24, 3, _/binary>>, Out),
+    cleanup(Pid, Ref).
+
+headers_self_dependency_rst_stream() ->
+    %% RFC 9113 §5.3.1: HEADERS with PRIORITY flag where stream
+    %% depends on itself — stream-error PROTOCOL_ERROR.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    HpackBin = encode_post_root_headers(),
+    %% PRIORITY-payload prefix: E:1, Dep:31, Weight:8 — Dep = stream id 1.
+    PriPayload = <<0:1, 1:31, 0>>,
+    Body = <<PriPayload/binary, HpackBin/binary>>,
+    %% Flags: END_HEADERS (0x04) | PRIORITY (0x20) = 0x24.
+    Frame = <<(byte_size(Body)):24, 1, 16#24, 0:1, 1:31, Body/binary>>,
+    serve_recv(ConnPid, Frame),
+    Out = expect_send(),
+    ?assertMatch(<<_:24, 3, _/binary>>, Out),
+    cleanup(Pid, Ref).
+
+priority_self_dependency_rst_stream() ->
+    %% RFC 9113 §5.3.1: PRIORITY frame depending on its own
+    %% stream — stream-error PROTOCOL_ERROR.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    Pri = iolist_to_binary(
+        roadrunner_http2_frame:encode(
+            {priority, 1, #{exclusive => false, stream_dependency => 1, weight => 0}}
+        )
+    ),
+    serve_recv(ConnPid, Pri),
+    Out = expect_send(),
+    ?assertMatch(<<_:24, 3, _/binary>>, Out),
+    cleanup(Pid, Ref).
+
+enable_push_invalid_value_protocol_error() ->
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    Settings = iolist_to_binary(
+        roadrunner_http2_frame:encode({settings, 0, [{2, 2}]})
+    ),
+    serve_recv(ConnPid, Settings),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+initial_window_size_too_large_flow_control_error() ->
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    Settings = iolist_to_binary(
+        roadrunner_http2_frame:encode({settings, 0, [{4, 16#80000000}]})
+    ),
+    serve_recv(ConnPid, Settings),
+    Goaway = expect_send(),
+    %% Frame type 7 (GOAWAY); error code 3 (FLOW_CONTROL_ERROR).
+    ?assertMatch(<<0, 0, 8, 7, 0, 0:32, _:32, 3:32>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+max_frame_size_too_small_protocol_error() ->
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    Settings = iolist_to_binary(
+        roadrunner_http2_frame:encode({settings, 0, [{5, 1024}]})
+    ),
+    serve_recv(ConnPid, Settings),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+max_frame_size_too_large_protocol_error() ->
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    Settings = iolist_to_binary(
+        roadrunner_http2_frame:encode({settings, 0, [{5, 16#1000000}]})
+    ),
+    serve_recv(ConnPid, Settings),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+initial_window_size_change_overflows_flow_control_error() ->
+    %% Open a stream (default send_window=65535), then a SETTINGS
+    %% with INITIAL_WINDOW_SIZE = 2^31-1. Delta = (2^31-1) - 65535,
+    %% pushes existing stream window to 2^31-1 + 65535 - 65535 ... no
+    %% wait: stream's send_window = 65535 + delta = 2^31-1. Doesn't
+    %% overflow. To force overflow, first WINDOW_UPDATE the stream
+    %% to a high value, then change INITIAL_WINDOW_SIZE.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    HpackBin = encode_post_root_headers(),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    %% Grow stream 1's send_window to near the cap.
+    Wu = iolist_to_binary(
+        roadrunner_http2_frame:encode({window_update, 1, 16#7FFFFFFF - 65535})
+    ),
+    serve_recv(ConnPid, Wu),
+    %% Now: stream 1 send_window = 2^31-1. Default initial = 65535.
+    %% A SETTINGS with INITIAL_WINDOW_SIZE = 65535 + 1 → delta = 1
+    %% → existing stream window = 2^31-1 + 1 = 2^31 > MAX → overflow.
+    Settings = iolist_to_binary(
+        roadrunner_http2_frame:encode({settings, 0, [{4, 65536}]})
+    ),
+    serve_recv(ConnPid, Settings),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, 0, 0:32, _:32, 3:32>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+content_length_mismatch_rst_stream() ->
+    %% Request declares content-length: 5 but body is 3 bytes.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"POST"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"},
+            {~"content-length", ~"5"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    %% Send 3-byte body with END_STREAM.
+    Data = <<3:24, 0, 1, 0:1, 1:31, "abc">>,
+    serve_recv(ConnPid, Data),
+    Out = expect_send(),
+    ?assertMatch(<<_:24, 3, _/binary>>, Out),
+    cleanup(Pid, Ref).
+
+request_trailers_dispatched() ->
+    %% HEADERS (no END_STREAM) → DATA (no END_STREAM) → HEADERS
+    %% (END_STREAM). Server treats the second HEADERS as trailers
+    %% and dispatches the request.
+    {Pid, Ref, ConnPid} = post_handshake_handler(roadrunner_h2_test_handler),
+    HpackBin = encode_post_root_headers(),
+    H1 = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H1),
+    D = <<5:24, 0, 0, 0:1, 1:31, "hello">>,
+    serve_recv(ConnPid, D),
+    %% Encode a trailer header block separately.
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Trailer, _} = roadrunner_http2_hpack:encode([{~"x-trace", ~"abc"}], Enc),
+    TrailerBin = iolist_to_binary(Trailer),
+    H2 = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, TrailerBin})
+    ),
+    serve_recv(ConnPid, H2),
+    %% Drain whatever the response was; just confirm the conn
+    %% didn't GOAWAY.
+    _ = expect_send(),
+    cleanup(Pid, Ref).
+
+request_trailers_via_continuation() ->
+    %% Trailer block split across HEADERS + CONTINUATION (both
+    %% within the trailer-fragment phase).
+    {Pid, Ref, ConnPid} = post_handshake_handler(roadrunner_h2_test_handler),
+    HpackBin = encode_post_root_headers(),
+    H1 = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H1),
+    D = <<5:24, 0, 0, 0:1, 1:31, "hello">>,
+    serve_recv(ConnPid, D),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Trailer, _} = roadrunner_http2_hpack:encode([{~"x-trace", ~"abc"}], Enc),
+    TrailerBin = iolist_to_binary(Trailer),
+    %% Split trailer block in two halves.
+    HalfLen = byte_size(TrailerBin) div 2,
+    <<TrFirst:HalfLen/binary, TrRest/binary>> = TrailerBin,
+    %% First HEADERS: END_STREAM, no END_HEADERS.
+    H2 = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#01, undefined, TrFirst})
+    ),
+    serve_recv(ConnPid, H2),
+    %% CONTINUATION with END_HEADERS.
+    C = iolist_to_binary(
+        roadrunner_http2_frame:encode({continuation, 1, 16#04, TrRest})
+    ),
+    serve_recv(ConnPid, C),
+    _ = expect_send(),
+    cleanup(Pid, Ref).
+
+awaiting_continuation_blocks_other_frames() ->
+    %% HEADERS without END_HEADERS — server expects CONTINUATION
+    %% next. Sending PRIORITY instead is PROTOCOL_ERROR (RFC §6.10).
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    HpackBin = encode_post_root_headers(),
+    %% HEADERS no END_HEADERS, no END_STREAM.
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 0, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    Pri = iolist_to_binary(
+        roadrunner_http2_frame:encode(
+            {priority, 1, #{exclusive => false, stream_dependency => 0, weight => 0}}
+        )
+    ),
+    serve_recv(ConnPid, Pri),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+unknown_frame_silently_ignored() ->
+    %% Unknown frame type 99 mid-conn — silently ignored (RFC §4.1).
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    serve_recv(ConnPid, <<0:24, 99, 0, 0:32>>),
+    %% Sync via PING-ACK to confirm conn still alive + processed.
+    Ping = iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>})),
+    serve_recv(ConnPid, Ping),
+    PingAck = expect_send(),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, PingAck),
+    cleanup(Pid, Ref).
+
+rst_stream_on_idle_stream_protocol_error() ->
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 99, cancel})),
+    serve_recv(ConnPid, Rst),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+window_update_on_idle_stream_protocol_error() ->
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    Wu = iolist_to_binary(roadrunner_http2_frame:encode({window_update, 99, 1024})),
+    serve_recv(ConnPid, Wu),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+window_update_on_closed_stream_ignored() ->
+    %% WU on a stream id we previously closed (id <= last_stream_id,
+    %% not in map) is silently ignored per RFC 9113 §6.9.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    HpackBin = encode_post_root_headers(),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
+    serve_recv(ConnPid, Rst),
+    Wu = iolist_to_binary(roadrunner_http2_frame:encode({window_update, 1, 1024})),
+    serve_recv(ConnPid, Wu),
+    %% Sync via PING-ACK to confirm processing order.
+    Ping = iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>})),
+    serve_recv(ConnPid, Ping),
+    PingAck = expect_send(),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, PingAck),
+    cleanup(Pid, Ref).
+
+unsolicited_continuation_protocol_error() ->
+    %% CONTINUATION arriving with no in-flight HEADERS block is a
+    %% PROTOCOL_ERROR per RFC 9113 §6.10.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    Cont = iolist_to_binary(
+        roadrunner_http2_frame:encode({continuation, 1, 16#04, <<>>})
+    ),
+    serve_recv(ConnPid, Cont),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+trailers_with_malformed_hpack_goaway() ->
+    %% Trailer block fails to decode → connection error
+    %% (PROTOCOL_ERROR via finalize_trailers).
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    HpackBin = encode_post_root_headers(),
+    H1 = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H1),
+    %% Garbage HPACK block as the trailer payload.
+    H2 = iolist_to_binary(
+        roadrunner_http2_frame:encode(
+            {headers, 1, 16#04 bor 16#01, undefined, <<16#FF, 16#FF, 16#FF>>}
+        )
+    ),
+    serve_recv(ConnPid, H2),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+content_length_match_dispatches() ->
+    %% content-length matches body bytes — request dispatches normally.
+    {Pid, Ref, ConnPid} = post_handshake_handler(roadrunner_h2_test_handler),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"POST"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"},
+            {~"content-length", ~"5"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    %% 5-byte body with END_STREAM.
+    Data = <<5:24, 0, 1, 0:1, 1:31, "abcde">>,
+    serve_recv(ConnPid, Data),
+    %% Server replies — confirms dispatch happened.
+    _ = expect_send(),
+    cleanup(Pid, Ref).
+
+content_length_non_integer_rst_stream() ->
+    %% Non-integer content-length → RST_STREAM(PROTOCOL_ERROR).
+    {Pid, Ref, ConnPid} = post_handshake_handler(roadrunner_h2_test_handler),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"POST"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"},
+            {~"content-length", ~"banana"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    Out = expect_send(),
+    ?assertMatch(<<_:24, 3, _/binary>>, Out),
+    cleanup(Pid, Ref).
+
+hpack_table_size_update_after_block_goaway() ->
+    %% RFC 7541 §4.2: a Dynamic Table Size Update only at the
+    %% beginning of a header block. A block that decodes a literal
+    %% then attempts a table-size update is a COMPRESSION_ERROR.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    %% Build manually: 1 indexed-pseudo (`:method GET` = idx 2) =
+    %% 0x82, then a 0x20 (Dynamic Table Size Update of 0).
+    %% That gets us a header reps then an update — should error.
+    %% But indexed alone isn't enough to dispatch; we need a valid
+    %% pseudo set. Easier: encode a valid request, then append
+    %% a table-size-update byte. Decoder rejects on the trailing
+    %% update.
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    Bad = <<HpackBin/binary, 16#20>>,
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, Bad})
+    ),
+    serve_recv(ConnPid, H),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+headers_for_closed_stream_protocol_error() ->
+    %% Open + complete stream 1 (handler runs, worker exits, stream
+    %% removed from map). Then HEADERS for stream 1 — id <=
+    %% last_stream_id, not in map → connection error PROTOCOL_ERROR.
+    {Pid, Ref, ConnPid} = post_handshake_handler(roadrunner_h2_test_handler),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/empty"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    H1 = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H1),
+    %% Drain the response so the worker finishes + cleans up.
+    _ = expect_send(),
+    timer:sleep(50),
+    drain_send(50),
+    %% Now send HEADERS for stream id 1 again — closed.
+    H1Again = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H1Again),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+settings_initial_window_size_shifts_stream_window() ->
+    %% Open a stream, then SETTINGS with a new INITIAL_WINDOW_SIZE.
+    %% No overflow → server applies the shift and ACKs. Sync via
+    %% PING-ACK to confirm processing order.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    HpackBin = encode_post_root_headers(),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    Settings = iolist_to_binary(
+        roadrunner_http2_frame:encode({settings, 0, [{4, 32768}]})
+    ),
+    serve_recv(ConnPid, Settings),
+    SettingsAck = expect_send(),
+    ?assertMatch(<<_:24, 4, 1, _/binary>>, SettingsAck),
+    Ping = iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>})),
+    serve_recv(ConnPid, Ping),
+    PingAck = expect_send(),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, PingAck),
+    cleanup(Pid, Ref).
+
+content_length_multi_valued_rst_stream() ->
+    %% Two `content-length` headers on the request — content_length_matches
+    %% rejects with the multi-valued branch.
+    {Pid, Ref, ConnPid} = post_handshake_handler(roadrunner_h2_test_handler),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"POST"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"},
+            {~"content-length", ~"5"},
+            {~"content-length", ~"7"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    Out = expect_send(),
+    ?assertMatch(<<_:24, 3, _/binary>>, Out),
+    cleanup(Pid, Ref).
+
+trailers_after_first_end_stream_protocol_error() ->
+    %% Stream's `end_stream_seen` is set on the first HEADERS+END_STREAM,
+    %% the worker is dispatched but might still be running. A second
+    %% HEADERS arriving in that window hits `is_trailer_block` and
+    %% sees end_stream_seen=true → not a valid trailer → goaway.
+    %% Use the slow handler so the worker is guaranteed alive when
+    %% the second HEADERS arrives.
+    {Pid, Ref, ConnPid} = post_handshake_handler(roadrunner_h2_test_handler),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/stream/slow"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    H1 = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H1),
+    %% Worker spawned, sleeping. Drain the initial HEADERS+DATA it emits.
+    timer:sleep(50),
+    drain_send(50),
+    drain_send(50),
+    %% Second HEADERS for the same in-flight stream — invalid.
+    H2 = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H2),
+    %% Eventually GOAWAY after pending sends drain.
+    drain_until_goaway(),
+    cleanup(Pid, Ref).
+
+drain_until_goaway() ->
+    receive
+        {roadrunner_fake_send, _, Data} ->
+            case iolist_to_binary(Data) of
+                <<_:24, 7, _/binary>> -> ok;
+                _ -> drain_until_goaway()
+            end
+    after 500 -> error(no_goaway)
+    end.
+
+%% Common pre-test scaffolding: spawn a conn, run the handshake,
+%% return the handles so the test can drive whatever frame it
+%% wants next.
+post_handshake_conn() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    {Pid, Ref, ConnPid}.
+
+post_handshake_handler(Handler) ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    Self = self(),
+    Counter = atomics:new(1, [{signed, false}]),
+    ok = atomics:add(Counter, 1, 1),
+    ProtoOpts = #{
+        client_counter => Counter,
+        listener_name => h2_strict_test,
+        dispatch => {handler, Handler},
+        middlewares => []
+    },
+    Sock = {fake, Self},
+    Pid = spawn(fun() ->
+        receive
+            ready -> ok
+        end,
+        roadrunner_conn_loop_http2:enter(
+            Sock, ProtoOpts, h2_strict_test, undefined, erlang:monotonic_time()
+        )
+    end),
+    Ref = monitor(process, Pid),
+    Pid ! ready,
+    _ = expect_send(),
+    serve_recv(Pid, ?PREFACE),
+    serve_recv(Pid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    {Pid, Ref, Pid}.
 
 attach_telemetry(Events) ->
     Self = self(),
