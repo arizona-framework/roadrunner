@@ -1,6 +1,6 @@
 # roadrunner
 
-A modern, pure-Erlang HTTP/1.1 + WebSocket server for OTP 28+.
+A modern, pure-Erlang HTTP/1.1 + HTTP/2 + WebSocket server for OTP 28+.
 
 Built ground-up via TDD as a Cowboy alternative for the
 [arizona-framework](https://github.com/arizona-framework/arizona). Targets a
@@ -14,8 +14,14 @@ tests with 100% line coverage, dialyzer-clean.
 Standards conformance:
 
 - **HTTP/1.1**: RFC 9110 (semantics) + RFC 9112 (syntax).
+- **HTTP/2**: RFC 9113 (frames + multiplexing) + RFC 7541 (HPACK)
+  — opt-in per listener via `http2_enabled => true` in TLS opts;
+  passes [h2spec](https://github.com/summerwind/h2spec) at 100 %
+  in both default (146/146) and strict (`-S`, 147/147) modes
+  (`scripts/h2spec.sh`).
 - **Content-Encoding** (RFC 9110 §8.4.1): gzip + deflate, with
   qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3).
+  Works unchanged over HTTP/2.
 - **WebSocket**: RFC 6455 — passes the
   [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
   fuzzingclient at strict 100 % (`scripts/autobahn.escript`).
@@ -27,6 +33,18 @@ loop (`roadrunner_conn_loop`) with named phases (`awaiting_shoot |
 reading_request | reading_body | dispatching | finishing`)
 reflected in `proc_lib:get_label/1` so the lifecycle shows up in
 observer's process inspector and `recon:proc_count/2`.
+
+The HTTP/2 path takes over after the TLS ALPN handshake settles
+on `h2`; it shares the same handler / middleware / router / drain
+/ telemetry surface as the HTTP/1.1 path. Each request stream
+runs in its own `spawn_monitor`-spawned worker so a handler crash
+resets only the affected stream (`RST_STREAM(INTERNAL_ERROR)`)
+and leaves the other streams on the connection running.
+`SETTINGS_MAX_CONCURRENT_STREAMS = 100` is advertised; flow
+control honors `WINDOW_UPDATE` and `SETTINGS_INITIAL_WINDOW_SIZE`
+shifts. See `src/roadrunner_conn_loop_http2.erl` for the conn
+state machine and `src/roadrunner_http2_stream_worker.erl` for
+the worker dispatch contract.
 
 ## Quickstart
 
@@ -64,6 +82,30 @@ content-length: 14
 
 hello, roadrunner!
 ```
+
+To enable HTTP/2 over TLS:
+
+```erlang
+3> roadrunner:start_listener(https, #{
+       port => 8443,
+       tls => [{certfile, "cert.pem"}, {keyfile, "key.pem"}],
+       http2_enabled => true,
+       routes => [{~"/", hello_handler, undefined}]
+   }).
+```
+
+```
+$ curl -i --http2 https://localhost:8443/
+HTTP/2 200
+content-type: text/plain; charset=utf-8
+content-length: 14
+
+hello, roadrunner!
+```
+
+ALPN negotiation routes `h2` clients to the HTTP/2 path and
+`http/1.1` clients (or no-ALPN) to the HTTP/1.1 path on the same
+listener.
 
 ## Features
 
@@ -184,6 +226,17 @@ gzip-eligible) and capture per-route reports under
 covered and what kinds of findings count as framework gaps vs
 handler-level choices.
 
+HTTP/2 conformance lives in `scripts/h2spec.sh`. The script
+boots a roadrunner h2 listener with a throwaway TLS cert and
+drives [h2spec](https://github.com/summerwind/h2spec) (Docker
+image `summerwind/h2spec`) against it. Roadrunner passes
+**146/146 in default mode and 147/147 in strict (`-S`) mode**
+across the generic HTTP/2 conformance, RFC 9113 frame
+definitions, and HPACK (RFC 7541) test categories — including
+stream-state transitions, flow control, settings validation,
+content-length consistency, request trailers, padding rules,
+and the full HPACK decoding-error matrix.
+
 ## Comparison with cowboy and elli
 
 `scripts/bench.escript` runs the same loadgen against each server in
@@ -254,7 +307,8 @@ numbers shift, relative ordering tends to hold.
 | Middleware shape               | continuation-passing             | `pre_request`/`post_request` callback | deprecated `(Req, Env)`/stream handlers |
 | Hibernation between requests   | `hibernate_after` works          | no                         | depends on stream handler     |
 | Default recv mode              | passive (`gen_tcp:recv`)         | passive (`gen_tcp:recv`)   | active (`{active, once}`)     |
-| HTTP RFCs                      | RFC 9110 + RFC 9112              | RFC 7230 era               | RFC 9110 + RFC 9112 + HTTP/2  |
+| HTTP RFCs                      | RFC 9110 + RFC 9112 + RFC 9113   | RFC 7230 era               | RFC 9110 + RFC 9112 + HTTP/2  |
+| HTTP/2 (RFC 9113 + 7541)       | yes — h2spec 100 % strict        | no                         | yes                           |
 | Content-Encoding               | gzip + deflate, qvalue-aware     | DIY                        | hooks for stream handlers     |
 | WebSocket conformance          | Autobahn 100 % strict            | n/a                        | Autobahn-tested               |
 | permessage-deflate (RFC 7692)  | yes                              | n/a                        | yes                           |
@@ -275,16 +329,25 @@ loaded dev box. `scripts/bench.escript` also accepts `--profile`
 to dump an eprof hotspot table when you want to investigate a
 specific server.
 
+For HTTP/2 throughput, `scripts/bench_h2.sh` drives
+[h2load](https://nghttp2.org/documentation/h2load.1.html) (from
+`nghttp2-tools`) against a TLS h2 listener. h2 vs h1 numbers are
+workload-shape-sensitive: small responses at high concurrency
+typically favor h2 (single-connection multiplexing); single-request
+latency may favor h1 (no frame demux). Run both directions on the
+same hardware before claiming a win.
+
 ### Picking a server
 
 - **Pick elli** if you need a small server, no fancy lifecycle, and
   you care about absolute throughput more than tail latency.
-- **Pick cowboy** if you need HTTP/2, sub-protocols, or you're
-  already in an ecosystem where it's the lingua franca.
+- **Pick cowboy** if you need sub-protocols beyond what roadrunner
+  ships, or you're already in an ecosystem where it's the lingua
+  franca.
 - **Pick roadrunner** if you want a small surface, queryable
-  per-request state, drain + telemetry built in, low p99, and
-  you can tolerate ~20 % less peak throughput than elli (and the
-  POC status — see "Status" above).
+  per-request state, drain + telemetry built in, low p99, h2spec-
+  compliant HTTP/2, and you can tolerate ~20 % less peak HTTP/1.1
+  throughput than elli (and the POC status — see "Status" above).
 
 ## Design philosophy
 
