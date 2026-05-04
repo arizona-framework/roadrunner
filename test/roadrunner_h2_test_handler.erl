@@ -86,6 +86,12 @@ handle(#{target := ~"/badshape"} = Req) ->
     %% function_clause error and the conn aborts the stream with
     %% RST_STREAM(INTERNAL_ERROR).
     {{stream, 200, [], not_a_function}, Req};
+handle(#{target := ~"/compressible"} = Req) ->
+    %% A response large enough to clear the compress threshold and
+    %% with an obvious repeating pattern so a gzip-compressed body
+    %% is significantly smaller than the original.
+    Body = binary:copy(<<"hello world! ">>, 1000),
+    {{200, [{~"content-type", ~"text/plain"}], Body}, Req};
 handle(#{target := ~"/large50k"} = Req) ->
     {{200, [], binary:copy(<<"x">>, 50_000)}, Req};
 handle(#{target := ~"/large100k"} = Req) ->

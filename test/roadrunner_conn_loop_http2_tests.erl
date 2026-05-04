@@ -76,7 +76,9 @@ all_test_() ->
         fun drain_then_peer_rst_exits_via_frame_loop/0,
         fun telemetry_request_start_stop_fires_for_h2/0,
         fun telemetry_request_exception_fires_on_h2_handler_crash/0,
-        fun telemetry_request_stop_fires_for_router_404/0
+        fun telemetry_request_stop_fires_for_router_404/0,
+        fun compress_middleware_gzips_buffered_h2_response/0,
+        fun compress_middleware_passthrough_when_no_accept_encoding/0
     ],
     [{spawn, F} || F <- Tests].
 
@@ -1581,6 +1583,110 @@ telemetry_request_stop_fires_for_router_404() ->
     after
         detach_telemetry(HandlerId)
     end.
+
+compress_middleware_gzips_buffered_h2_response() ->
+    %% Verify Phase H11's hypothesis: `roadrunner_compress` works
+    %% unchanged over h2 because it operates on the abstract
+    %% request/response shape, not on h1 wire syntax. Send a GET
+    %% with `accept-encoding: gzip` over h2 → response carries
+    %% `content-encoding: gzip` and the decoded body matches the
+    %% original.
+    Body = binary:copy(<<"hello world! ">>, 1000),
+    {Pid, Ref, Frames} = run_h2_with_compress_middleware(
+        ~"/compressible", [{~"accept-encoding", ~"gzip"}]
+    ),
+    {200, RespHeaders, GzipPayload} = decode_response(Frames),
+    ?assertEqual(~"gzip", proplists:get_value(~"content-encoding", RespHeaders)),
+    ?assertEqual(Body, zlib:gunzip(GzipPayload)),
+    %% Compressed body should be smaller than original (sanity).
+    ?assert(byte_size(GzipPayload) < byte_size(Body)),
+    cleanup(Pid, Ref).
+
+compress_middleware_passthrough_when_no_accept_encoding() ->
+    %% No `accept-encoding` header → middleware passes through
+    %% uncompressed. Body matches handler output verbatim.
+    Body = binary:copy(<<"hello world! ">>, 1000),
+    {Pid, Ref, Frames} = run_h2_with_compress_middleware(~"/compressible", []),
+    {200, RespHeaders, Payload} = decode_response(Frames),
+    ?assertEqual(undefined, proplists:get_value(~"content-encoding", RespHeaders)),
+    ?assertEqual(Body, Payload),
+    cleanup(Pid, Ref).
+
+run_h2_with_compress_middleware(Path, ExtraHeaders) ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    Self = self(),
+    Counter = atomics:new(1, [{signed, false}]),
+    ok = atomics:add(Counter, 1, 1),
+    ProtoOpts = #{
+        client_counter => Counter,
+        listener_name => h2_compress_test,
+        dispatch => {handler, roadrunner_h2_test_handler},
+        middlewares => [roadrunner_compress]
+    },
+    Sock = {fake, Self},
+    Pid = spawn(fun() ->
+        receive
+            ready -> ok
+        end,
+        roadrunner_conn_loop_http2:enter(
+            Sock, ProtoOpts, h2_compress_test, undefined, erlang:monotonic_time()
+        )
+    end),
+    Ref = monitor(process, Pid),
+    Pid ! ready,
+    _ = expect_send(),
+    serve_recv(Pid, ?PREFACE),
+    serve_recv(Pid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    BaseHeaders = [
+        {~":method", ~"GET"},
+        {~":scheme", ~"https"},
+        {~":authority", ~"localhost"},
+        {~":path", Path}
+    ],
+    {Hpack, _} = roadrunner_http2_hpack:encode(BaseHeaders ++ ExtraHeaders, Enc),
+    HpackBin = iolist_to_binary(Hpack),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(Pid, H),
+    Bytes = collect_send_bytes(<<>>),
+    {Pid, Ref, parse_full_frames(Bytes)}.
+
+%% Parse raw response bytes into structured frames preserving
+%% HPACK blocks + DATA payloads. Different from
+%% `parse_frames/1` (which discards bodies) — needed for
+%% compression tests where we have to decode HPACK headers and
+%% concatenate DATA payloads.
+parse_full_frames(<<>>) ->
+    [];
+parse_full_frames(<<Len:24, Type, Flags, _R:1, StreamId:31, Body:Len/binary, Rest/binary>>) ->
+    EndStream = (Flags band 16#01) =/= 0,
+    case Type of
+        0 ->
+            [{data, StreamId, EndStream, Body} | parse_full_frames(Rest)];
+        1 ->
+            [{headers, StreamId, EndStream, Body} | parse_full_frames(Rest)];
+        _ ->
+            parse_full_frames(Rest)
+    end.
+
+decode_response(Frames) ->
+    Dec = roadrunner_http2_hpack:new_decoder(4096),
+    decode_response_loop(Frames, Dec, undefined, [], <<>>).
+
+decode_response_loop([], _Dec, Status, RespHeaders, Body) ->
+    {Status, RespHeaders, Body};
+decode_response_loop([{headers, _, _, Block} | Rest], Dec, _Status, _RespHeaders, Body) ->
+    {ok, Decoded, Dec1} = roadrunner_http2_hpack:decode(Block, Dec),
+    StatusBin = proplists:get_value(~":status", Decoded),
+    Status1 = binary_to_integer(StatusBin),
+    Regular = [{N, V} || {N, V} <- Decoded, binary:first(N) =/= $:],
+    decode_response_loop(Rest, Dec1, Status1, Regular, Body);
+decode_response_loop([{data, _, _, Payload} | Rest], Dec, Status, RespHeaders, Body) ->
+    decode_response_loop(Rest, Dec, Status, RespHeaders, <<Body/binary, Payload/binary>>).
 
 attach_telemetry(Events) ->
     Self = self(),
