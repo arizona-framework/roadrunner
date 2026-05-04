@@ -2,41 +2,51 @@
 -moduledoc """
 HTTP/2 (RFC 9113) connection process.
 
-Serial single-stream mode: handshake completes, then the conn
-loops on inbound frames, dispatching one stream at a time
-through the existing `roadrunner_conn:resolve_handler/2` +
-`roadrunner_middleware` pipeline, emitting the response, and
-returning to the loop for the next stream. Frames are read in
-active-mode (`[{active, once}]`) so worker messages from
-Phase H8b's per-stream dispatch will share the same mailbox
-without deadlocking the conn against `recv/3`.
+Phase H8b — true multiplexing with per-stream workers. The conn
+process owns:
 
-`SETTINGS_MAX_CONCURRENT_STREAMS = 1` is advertised to
-discourage clients from opening overlapping streams; if a second
-HEADERS arrives before the first stream is closed, the
-new stream gets `RST_STREAM(REFUSED_STREAM)`.
+- the active-mode socket (sole reader / writer of bytes),
+- the HPACK encoder / decoder (single context per direction
+  shared across all streams),
+- the connection-level flow-control windows and per-stream
+  windows / pending-send queues,
+- a `streams` map keyed by stream id, and `worker_refs` mapping
+  monitor refs back to stream ids for `'DOWN'` correlation.
 
-Response shapes supported here:
+Once a request stream finishes receiving (HEADERS + body +
+END_STREAM), the conn spawns a `roadrunner_http2_stream_worker`
+process. The worker resolves the route, runs middleware + handler,
+and translates the response into messages back to the conn:
 
-| shape | h5 |
+```
+{h2_send_headers, Worker, Ref, StreamId, Status, Headers, EndStream}
+{h2_send_data,    Worker, Ref, StreamId, Bin,    EndStream}
+{h2_send_trailers, Worker, Ref, StreamId, Trailers}
+{h2_worker_done,  StreamId}
+```
+
+The conn replies `{h2_send_ack, Ref}` once the corresponding
+frame(s) are on the wire — so workers are synchronously
+back-pressured against flow control without buffering.
+
+Workers are spawn_monitored (NOT linked) so a handler crash
+resets only the affected stream — `'DOWN'` triggers
+`RST_STREAM(INTERNAL_ERROR)` and the other in-flight streams
+keep running. `MAX_CONCURRENT_STREAMS=100` is advertised; HEADERS
+beyond that limit get `RST_STREAM(REFUSED_STREAM)`.
+
+Response shapes supported:
+
+| shape | h2 |
 |---|---|
 | `{Status, Headers, Body}` (buffered) | yes |
-| `{stream, _}` | yes (Phase H7) |
-| `{loop, _}` | 501 (later) |
-| `{sendfile, _}` | 501 (later) |
-| `{websocket, _}` | 501 (Phase H13) |
-
-The full frame demux + multiplexing arrives in Phase H8.
+| `{stream, _, _, Fun}` | yes |
+| `{loop, _}` | 501 |
+| `{sendfile, _}` | 501 |
+| `{websocket, _, _}` | 501 (Phase H13) |
 """.
 
 -export([enter/5]).
-%% Helpers used by `roadrunner_http2_stream_response`. Not part of
-%% the public listener API.
--export([
-    send_response_headers/4,
-    send_data_sync/3,
-    send_trailers/2
-]).
 
 %% RFC 9113 §3.4 client connection preface — fixed 24 bytes.
 -define(PREFACE, ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
@@ -49,19 +59,15 @@ The full frame demux + multiplexing arrives in Phase H8.
 -define(HANDSHAKE_TIMEOUT_DEFAULT, 10_000).
 -define(IDLE_TIMEOUT_DEFAULT, 30_000).
 
-%% RFC 9113 §6.5.2 default `MAX_FRAME_SIZE`. Clients can advertise
-%% larger values; we honor the smaller of theirs and our cap. For
-%% phase 5 the default is fine.
+%% RFC 9113 §6.5.2 default `MAX_FRAME_SIZE`.
 -define(MAX_FRAME_SIZE, 16_384).
 
 %% RFC 9113 §6.9.2 initial window size for both the connection and
-%% each stream. Peer-advertised SETTINGS_INITIAL_WINDOW_SIZE adjusts
-%% per-stream windows but Phase H6 doesn't honor that update yet.
+%% each stream.
 -define(INITIAL_WINDOW, 65535).
 
 %% Send a WINDOW_UPDATE refill once the local recv window falls
-%% below this threshold. 32 KiB strikes a balance between flooding
-%% the peer with updates and stalling them on flow control.
+%% below this threshold.
 -define(WINDOW_REFILL_THRESHOLD, 32_768).
 
 %% Hard upper bound on a flow-control window per RFC 9113 §6.9.1
@@ -69,9 +75,42 @@ The full frame demux + multiplexing arrives in Phase H8.
 %% FLOW_CONTROL_ERROR.
 -define(MAX_WINDOW, 16#7FFFFFFF).
 
+%% Phase H8b: lift from 1 (serial) to 100 concurrent streams.
+%% Clients exceeding this on this connection get
+%% RST_STREAM(REFUSED_STREAM) on the over-limit HEADERS.
+-define(MAX_CONCURRENT_STREAMS, 100).
+
 -define(GOAWAY(LastStreamId, ErrorCode),
     roadrunner_http2_frame:encode({goaway, (LastStreamId), (ErrorCode), <<>>})
 ).
+
+-type stream_id() :: pos_integer().
+
+-type stream_state() ::
+    open | half_closed_remote | half_closed_local | closed.
+
+%% Pending-send entry. Only DATA frames are ever queued —
+%% HEADERS / trailer HEADERS write straight to the wire (HPACK
+%% encoding is window-independent). Workers are synchronous so at
+%% most one entry can be pending per stream at a time; we still
+%% type it as a list to leave room for future enrichment without
+%% reshaping callers.
+-type pending_send() ::
+    {data, reference(), pid(), binary(), boolean()}.
+
+-type stream_entry() :: #{
+    state := stream_state(),
+    header_fragment := binary(),
+    end_headers := boolean(),
+    end_stream_seen := boolean(),
+    headers := undefined | [roadrunner_http2_hpack:header()],
+    body := iolist(),
+    send_window := integer(),
+    recv_window := non_neg_integer(),
+    worker_pid := undefined | pid(),
+    worker_ref := undefined | reference(),
+    pending_sends := [pending_send()]
+}.
 
 -record(loop, {
     socket :: roadrunner_transport:socket(),
@@ -80,51 +119,25 @@ The full frame demux + multiplexing arrives in Phase H8.
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
     start_mono :: integer(),
     scheme :: http | https,
-    %% Active-mode message tags for this transport (cached at
-    %% `enter/5` time so the receive loop doesn't have to look them
-    %% up per iteration). For real TCP this is `{tcp, tcp_closed,
-    %% tcp_error}`; for the fake test backend it's
-    %% `{roadrunner_fake_data, _closed, _error}`.
+    %% Active-mode message tags for this transport.
     msg_data :: atom(),
     msg_closed :: atom(),
     msg_error :: atom(),
     %% Inbound bytes still to parse.
     buffer = <<>> :: binary(),
-    %% HPACK contexts. Decoder mutates per inbound HEADERS;
-    %% encoder mutates per outbound HEADERS.
+    %% HPACK contexts.
     hpack_dec :: roadrunner_http2_hpack:context(),
     hpack_enc :: roadrunner_http2_hpack:context(),
     %% Highest stream id we've processed — for the LAST_STREAM_ID
     %% in GOAWAY.
     last_stream_id = 0 :: non_neg_integer(),
-    %% Connection-level flow-control windows (RFC 9113 §5.2):
-    %%   - `conn_send_window` — bytes the peer permits us to send
-    %%     across all streams. Starts at 65535.
-    %%   - `conn_recv_window` — bytes we've advertised to the peer
-    %%     for inbound DATA. Replenished by emitting WINDOW_UPDATE
-    %%     when it falls below `?WINDOW_REFILL_THRESHOLD`.
-    %% Each stream has the same pair on its own scale; the smaller
-    %% of the two governs every DATA frame.
+    %% Connection-level flow-control windows (RFC 9113 §5.2).
     conn_send_window = 65535 :: integer(),
     conn_recv_window = 65535 :: non_neg_integer(),
-    %% Open stream state, or `undefined` when idle.
-    stream = undefined ::
-        undefined
-        | #{
-            id := pos_integer(),
-            %% Pending HPACK fragment when END_HEADERS hasn't been
-            %% seen yet; complete decoded headers go into `headers`.
-            header_fragment := binary(),
-            end_headers := boolean(),
-            end_stream := boolean(),
-            headers := undefined | [roadrunner_http2_hpack:header()],
-            body := iodata(),
-            %% Stream-level flow-control windows. Same defaults as
-            %% the connection — peer advertises both via SETTINGS
-            %% (we don't honor INITIAL_WINDOW_SIZE updates yet).
-            send_window := integer(),
-            recv_window := non_neg_integer()
-        }
+    %% Stream table, keyed by stream id.
+    streams = #{} :: #{stream_id() => stream_entry()},
+    %% Worker monitor ref → stream id, for DOWN correlation.
+    worker_refs = #{} :: #{reference() => stream_id()}
 }).
 
 -doc """
@@ -164,21 +177,16 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
 
 -spec handshake(#loop{}) -> no_return().
 handshake(State) ->
-    %% Send failures are silently ignored throughout — if the wire
-    %% has gone away, the next mailbox event surfaces the error and
-    %% we fall to `exit_clean` cleanly. Keeping per-call error
-    %% branches added a forest of unreachable paths.
     _ = send(State, server_settings_frame()),
     handshake_phase_preface(State).
 
 -spec server_settings_frame() -> iodata().
 server_settings_frame() ->
-    %% Advertise MAX_CONCURRENT_STREAMS=1 (serial mode) plus our
-    %% MAX_FRAME_SIZE (16384, the default — included for clarity).
+    %% Advertise MAX_CONCURRENT_STREAMS=100 and MAX_FRAME_SIZE.
     %% IDs from RFC 9113 §6.5.2: 3 = MAX_CONCURRENT_STREAMS,
     %% 5 = MAX_FRAME_SIZE.
     roadrunner_http2_frame:encode(
-        {settings, 0, [{3, 1}, {5, ?MAX_FRAME_SIZE}]}
+        {settings, 0, [{3, ?MAX_CONCURRENT_STREAMS}, {5, ?MAX_FRAME_SIZE}]}
     ).
 
 -spec handshake_timeout() -> non_neg_integer().
@@ -189,10 +197,6 @@ handshake_timeout() ->
 idle_timeout() ->
     persistent_term:get({?MODULE, idle_timeout}, ?IDLE_TIMEOUT_DEFAULT).
 
-%% RFC 9113 §3.4 — the first 24 bytes from the client must match
-%% the preface. We accumulate bytes through active-once events
-%% until at least 24 are buffered, then either advance to the
-%% SETTINGS phase or exit on mismatch.
 -spec handshake_phase_preface(#loop{}) -> no_return().
 handshake_phase_preface(#loop{buffer = Buf} = State) when byte_size(Buf) >= ?PREFACE_LEN ->
     <<Head:?PREFACE_LEN/binary, Rest/binary>> = Buf,
@@ -205,8 +209,6 @@ handshake_phase_preface(#loop{buffer = Buf} = State) when byte_size(Buf) >= ?PRE
 handshake_phase_preface(State) ->
     handshake_recv(State, fun handshake_phase_preface/1).
 
-%% RFC 9113 §3.4 — the first frame after the preface must be a
-%% non-ACK SETTINGS. Anything else is a connection error.
 -spec handshake_phase_settings(#loop{}) -> no_return().
 handshake_phase_settings(#loop{buffer = Buf} = State) ->
     case roadrunner_http2_frame:parse(Buf, ?MAX_FRAME_SIZE) of
@@ -224,10 +226,6 @@ handshake_phase_settings(#loop{buffer = Buf} = State) ->
             exit_clean(State)
     end.
 
-%% Block on the next active-once event during the handshake;
-%% timeout is the tighter handshake deadline rather than the idle
-%% deadline since slow handshake clients are usually misuse /
-%% probes rather than legitimate.
 -spec handshake_recv(#loop{}, fun((#loop{}) -> no_return())) -> no_return().
 handshake_recv(
     #loop{
@@ -239,11 +237,6 @@ handshake_recv(
     } = State,
     Cont
 ) ->
-    %% Setopts can fail if the transport went away between events
-    %% — ignore the return value and let the next receive surface
-    %% the closure as `{MClosed, _}` / `{MError, _, _}` or time
-    %% out cleanly. The defensive `{error, _}` arm was unreachable
-    %% in tests and only delayed exit_clean by one mailbox poll.
     _ = roadrunner_transport:setopts(Sock, [{active, once}]),
     receive
         {MData, _, Bytes} ->
@@ -257,30 +250,9 @@ handshake_recv(
     end.
 
 %% =============================================================================
-%% Frame loop — active-mode socket receive
+%% Frame loop — active-mode socket receive + worker message dispatch
 %% =============================================================================
-%%
-%% After the handshake the conn switches to active-once mode and
-%% drives every iteration off the process mailbox. This is the
-%% groundwork Phase H8b's per-stream workers will build on —
-%% without it the conn would block in `recv/3` while workers piled
-%% up pending-send messages it couldn't process, deadlocking the
-%% connection.
-%%
-%% Mailbox events handled:
-%% - `{Data, _, Bytes}` — frame bytes from the peer (parse + dispatch)
-%% - `{Closed, _}` — peer half-closed
-%% - `{Error, _, _}` — transport error
-%% - timeout — idle conn, GOAWAY + close
-%%
-%% After consuming bytes we drain `process_frames/1` until the
-%% buffer no longer contains a complete frame; only then do we
-%% re-arm `[{active, once}]`.
 
-%% Continuation point after every frame dispatch (and the entry
-%% point from the handshake): drains the buffer through
-%% `handle_frame/2` until a partial frame remains, at which point
-%% we re-arm `[{active, once}]` and block in `recv_more/1`.
 -spec frame_loop(#loop{}) -> no_return().
 frame_loop(#loop{buffer = Buf} = State) ->
     case roadrunner_http2_frame:parse(Buf, ?MAX_FRAME_SIZE) of
@@ -298,6 +270,8 @@ arm_and_recv(#loop{socket = Sock} = State) ->
     _ = roadrunner_transport:setopts(Sock, [{active, once}]),
     recv_more(State).
 
+%% Unified mailbox dispatch: socket events, worker send requests,
+%% worker DOWN signals, and the idle-timeout `after` clause.
 -spec recv_more(#loop{}) -> no_return().
 recv_more(
     #loop{
@@ -314,73 +288,73 @@ recv_more(
             exit_clean(State);
         {MError, _, _} ->
             _ = send_goaway(State, protocol_error),
-            exit_clean(State)
+            exit_clean(State);
+        {h2_send_headers, From, Ref, StreamId, Status, Headers, EndStream} ->
+            recv_more(handle_send_headers(State, From, Ref, StreamId, Status, Headers, EndStream));
+        {h2_send_data, From, Ref, StreamId, Bin, EndStream} ->
+            recv_more(handle_send_data(State, From, Ref, StreamId, Bin, EndStream));
+        {h2_send_trailers, From, Ref, StreamId, Trailers} ->
+            recv_more(handle_send_trailers(State, From, Ref, StreamId, Trailers));
+        {h2_worker_done, StreamId} ->
+            recv_more(handle_worker_done(State, StreamId));
+        {'DOWN', MonRef, process, _Pid, Reason} ->
+            recv_more(handle_worker_down(State, MonRef, Reason))
     after idle_timeout() ->
         _ = send_goaway(State, protocol_error),
         exit_clean(State)
     end.
 
 %% =============================================================================
-%% Per-frame dispatch
+%% Per-frame dispatch — peer → server frames
 %% =============================================================================
 
 -spec handle_frame(roadrunner_http2_frame:frame(), #loop{}) -> no_return().
 handle_frame({settings, 1, _}, State) ->
-    %% Client ACK to our SETTINGS — nothing to do.
     frame_loop(State);
 handle_frame({settings, 0, _Params}, State) ->
-    %% Client SETTINGS update — ACK.
     _ = send(State, roadrunner_http2_frame:encode({settings, 1, []})),
     frame_loop(State);
 handle_frame({ping, 1, _Data}, State) ->
-    %% PING ACK — drop.
     frame_loop(State);
 handle_frame({ping, 0, Opaque}, State) ->
-    %% PING — echo with ACK flag.
     _ = send(State, roadrunner_http2_frame:encode({ping, 1, Opaque})),
     frame_loop(State);
 handle_frame({window_update, 0, Inc}, State) ->
-    %% Connection-level — grow the conn send window. RFC 9113 §6.9.1:
-    %% the resulting window MUST stay <= 2^31 - 1 or we close with
-    %% FLOW_CONTROL_ERROR.
     case State#loop.conn_send_window + Inc of
         New when New > ?MAX_WINDOW ->
             _ = send_goaway(State, flow_control_error),
             exit_clean(State);
         New ->
-            frame_loop(State#loop{conn_send_window = New})
+            State1 = State#loop{conn_send_window = New},
+            frame_loop(flush_all_pending_data(State1))
     end;
-handle_frame({window_update, StreamId, Inc}, #loop{stream = #{id := StreamId} = Stream} = State) ->
-    %% Stream-level update for the open stream — grow its send
-    %% window. Same overflow rule (treated here as a stream error;
-    %% Phase H8's full multiplexing distinguishes RST_STREAM vs
-    %% GOAWAY semantics, but H6 with a single live stream upgrades
-    %% to GOAWAY for simplicity).
-    case maps:get(send_window, Stream) + Inc of
-        New when New > ?MAX_WINDOW ->
-            _ = send_goaway(State, flow_control_error),
-            exit_clean(State);
-        New ->
-            frame_loop(State#loop{stream = Stream#{send_window := New}})
+handle_frame({window_update, StreamId, Inc}, #loop{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            case maps:get(send_window, Stream) + Inc of
+                New when New > ?MAX_WINDOW ->
+                    _ = send_goaway(State, flow_control_error),
+                    exit_clean(State);
+                New ->
+                    Stream1 = Stream#{send_window := New},
+                    State1 = update_stream(State, StreamId, Stream1),
+                    frame_loop(flush_pending_data(State1, StreamId))
+            end;
+        error ->
+            %% Closed stream — silently ignore per RFC 9113 §6.9.
+            frame_loop(State)
     end;
-handle_frame({window_update, _StreamId, _Inc}, State) ->
-    %% Update for a stream we don't have open — silently ignore
-    %% (RFC 9113 §6.9 allows it for streams in `closed` state).
-    frame_loop(State);
 handle_frame({priority, _, _}, State) ->
-    %% PRIORITY is deprecated in RFC 9113 — accept and ignore.
     frame_loop(State);
-handle_frame({rst_stream, StreamId, _}, #loop{stream = #{id := StreamId}} = State) ->
-    %% Client cancelled our active stream — drop the in-progress
-    %% state and continue.
-    frame_loop(State#loop{stream = undefined});
-handle_frame({rst_stream, _, _}, State) ->
-    %% RST_STREAM for a stream we don't recognize — ignore.
-    frame_loop(State);
+handle_frame({rst_stream, StreamId, _}, #loop{streams = Streams} = State) ->
+    case maps:is_key(StreamId, Streams) of
+        true ->
+            frame_loop(reset_stream(State, StreamId));
+        false ->
+            frame_loop(State)
+    end;
 handle_frame({goaway, _, _, _}, State) ->
-    %% Client is shutting down — finish any in-flight stream
-    %% (we have at most one) and exit. For phase 5 the simpler
-    %% "exit immediately" is acceptable.
+    %% Client is shutting down.
     exit_clean(State);
 handle_frame({headers, StreamId, Flags, Priority, Fragment}, State) ->
     on_headers(StreamId, Flags, Priority, Fragment, State);
@@ -395,28 +369,30 @@ handle_frame({push_promise, _, _, _, _}, State) ->
 
 %% --- HEADERS / CONTINUATION ---
 
-on_headers(NewStreamId, _Flags, _Priority, _Fragment, #loop{stream = #{id := _}} = State) ->
-    %% Stream already in flight — Phase H5 is single-stream
-    %% serial. Refuse the new stream.
-    _ = send_rst_stream(State, NewStreamId, refused_stream),
+on_headers(StreamId, _Flags, _Priority, _Fragment, #loop{streams = Streams} = State) when
+    map_size(Streams) >= ?MAX_CONCURRENT_STREAMS
+->
+    %% Over the advertised concurrency limit — refuse the stream.
+    _ = send_rst_stream(State, StreamId, refused_stream),
     frame_loop(State);
+on_headers(StreamId, _Flags, _Priority, _Fragment, #loop{streams = Streams} = State) when
+    is_map_key(StreamId, Streams)
+->
+    %% HEADERS for an already-open stream is a protocol error
+    %% (RFC 9113 §5.1.1; trailers come via END_STREAM on the same
+    %% stream, not a fresh HEADERS).
+    _ = send_goaway(State, protocol_error),
+    exit_clean(State);
 on_headers(StreamId, Flags, _Priority, Fragment, State) when StreamId rem 2 =:= 1 ->
-    %% Client-initiated stream ids are odd (RFC 9113 §5.1.1).
     EndHeaders = (Flags band 16#04) =/= 0,
     EndStream = (Flags band 16#01) =/= 0,
-    Stream = #{
-        id => StreamId,
-        header_fragment => Fragment,
-        end_headers => EndHeaders,
-        end_stream => EndStream,
-        headers => undefined,
-        body => [],
-        send_window => ?INITIAL_WINDOW,
-        recv_window => ?INITIAL_WINDOW
+    Stream = new_stream(Fragment, EndHeaders, EndStream),
+    State1 = State#loop{
+        streams = maps:put(StreamId, Stream, State#loop.streams),
+        last_stream_id = max(StreamId, State#loop.last_stream_id)
     },
-    State1 = State#loop{stream = Stream, last_stream_id = StreamId},
     case EndHeaders of
-        true -> finalize_headers(State1);
+        true -> finalize_headers(StreamId, State1);
         false -> frame_loop(State1)
     end;
 on_headers(_StreamId, _Flags, _Priority, _Fragment, State) ->
@@ -424,80 +400,94 @@ on_headers(_StreamId, _Flags, _Priority, _Fragment, State) ->
     _ = send_goaway(State, protocol_error),
     exit_clean(State).
 
-on_continuation(StreamId, Flags, Fragment, #loop{stream = #{id := StreamId} = Stream} = State) when
-    map_get(end_headers, Stream) =:= false
-->
-    Combined = <<(maps:get(header_fragment, Stream))/binary, Fragment/binary>>,
-    EndHeaders = (Flags band 16#04) =/= 0,
-    NewStream = Stream#{header_fragment := Combined, end_headers := EndHeaders},
-    State1 = State#loop{stream = NewStream},
-    case EndHeaders of
-        true -> finalize_headers(State1);
-        false -> frame_loop(State1)
-    end;
-on_continuation(_, _, _, State) ->
-    %% Unexpected CONTINUATION (no pending HEADERS, or wrong
-    %% stream id, or already saw END_HEADERS). Connection error.
-    _ = send_goaway(State, protocol_error),
-    exit_clean(State).
+new_stream(Fragment, EndHeaders, EndStream) ->
+    #{
+        state => open,
+        header_fragment => Fragment,
+        end_headers => EndHeaders,
+        end_stream_seen => EndStream,
+        headers => undefined,
+        body => [],
+        send_window => ?INITIAL_WINDOW,
+        recv_window => ?INITIAL_WINDOW,
+        worker_pid => undefined,
+        worker_ref => undefined,
+        pending_sends => []
+    }.
 
-%% Decode the accumulated HPACK fragment, build the request map.
-%% If END_STREAM was set on the HEADERS frame, dispatch
-%% immediately (no body). Otherwise wait for DATA frames.
-finalize_headers(#loop{stream = Stream, hpack_dec = Dec} = State) ->
+on_continuation(StreamId, Flags, Fragment, #loop{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #{end_headers := false} = Stream} ->
+            Combined = <<(maps:get(header_fragment, Stream))/binary, Fragment/binary>>,
+            EndHeaders = (Flags band 16#04) =/= 0,
+            Stream1 = Stream#{header_fragment := Combined, end_headers := EndHeaders},
+            State1 = update_stream(State, StreamId, Stream1),
+            case EndHeaders of
+                true -> finalize_headers(StreamId, State1);
+                false -> frame_loop(State1)
+            end;
+        _ ->
+            _ = send_goaway(State, protocol_error),
+            exit_clean(State)
+    end.
+
+%% Decode the accumulated HPACK fragment, store decoded headers on
+%% the stream entry. If END_STREAM was set on the HEADERS frame,
+%% dispatch the worker now (no body); otherwise wait for DATA.
+finalize_headers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) ->
+    Stream = maps:get(StreamId, Streams),
     Fragment = maps:get(header_fragment, Stream),
     case roadrunner_http2_hpack:decode(Fragment, Dec) of
         {ok, Headers, Dec1} ->
+            Stream1 = Stream#{headers := Headers, header_fragment := <<>>},
             State1 = State#loop{
                 hpack_dec = Dec1,
-                stream = Stream#{headers := Headers, header_fragment := <<>>}
+                streams = maps:put(StreamId, Stream1, Streams)
             },
-            case maps:get(end_stream, Stream) of
-                true -> dispatch_stream(State1);
+            case maps:get(end_stream_seen, Stream1) of
+                true -> dispatch_stream(StreamId, State1);
                 false -> frame_loop(State1)
             end;
-        {error, _Reason} ->
+        {error, _} ->
             _ = send_goaway(State, protocol_error),
             exit_clean(State)
     end.
 
 %% --- DATA ---
 
-on_data(StreamId, Flags, Payload, #loop{stream = #{id := StreamId} = Stream} = State) ->
-    EndStream = (Flags band 16#01) =/= 0,
-    NewBody = [maps:get(body, Stream), Payload],
-    PayloadLen = byte_size(Payload),
-    %% Consume recv windows by `PayloadLen`. Going below 0 is a
-    %% FLOW_CONTROL_ERROR (peer ignored a closed window); but a
-    %% non-blocking peer that respects our advertised window
-    %% never trips this in practice.
-    NewConnRecv = State#loop.conn_recv_window - PayloadLen,
-    NewStreamRecv = maps:get(recv_window, Stream) - PayloadLen,
-    NewStream = Stream#{
-        body := NewBody,
-        end_stream := EndStream,
-        recv_window := NewStreamRecv
-    },
-    State1 = State#loop{stream = NewStream, conn_recv_window = NewConnRecv},
-    State2 = maybe_refill_recv_windows(State1),
-    case EndStream of
-        true -> dispatch_stream(State2);
-        false -> frame_loop(State2)
-    end;
-on_data(_StreamId, _, _, State) ->
-    %% DATA on an unknown / closed stream — protocol error.
-    _ = send_goaway(State, protocol_error),
-    exit_clean(State).
+on_data(StreamId, Flags, Payload, #loop{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            EndStream = (Flags band 16#01) =/= 0,
+            PayloadLen = byte_size(Payload),
+            NewBody = [maps:get(body, Stream), Payload],
+            NewConnRecv = State#loop.conn_recv_window - PayloadLen,
+            NewStreamRecv = maps:get(recv_window, Stream) - PayloadLen,
+            Stream1 = Stream#{
+                body := NewBody,
+                end_stream_seen := EndStream,
+                recv_window := NewStreamRecv
+            },
+            State1 = State#loop{
+                streams = maps:put(StreamId, Stream1, Streams),
+                conn_recv_window = NewConnRecv
+            },
+            State2 = maybe_refill_recv_windows(State1, StreamId),
+            case EndStream of
+                true -> dispatch_stream(StreamId, State2);
+                false -> frame_loop(State2)
+            end;
+        error ->
+            _ = send_goaway(State, protocol_error),
+            exit_clean(State)
+    end.
 
 %% Refill the conn-level + stream-level recv windows whenever they
-%% drop below `?WINDOW_REFILL_THRESHOLD`, by emitting a
-%% WINDOW_UPDATE that brings the window back to `?INITIAL_WINDOW`.
-%% Cheaper than per-DATA acks, but timely enough that streaming
-%% uploads never stall on flow control.
--spec maybe_refill_recv_windows(#loop{}) -> #loop{}.
-maybe_refill_recv_windows(State) ->
+%% drop below `?WINDOW_REFILL_THRESHOLD`.
+-spec maybe_refill_recv_windows(#loop{}, stream_id()) -> #loop{}.
+maybe_refill_recv_windows(State, StreamId) ->
     State1 = maybe_refill_conn(State),
-    maybe_refill_stream(State1).
+    maybe_refill_stream(State1, StreamId).
 
 maybe_refill_conn(#loop{conn_recv_window = W} = State) when W < ?WINDOW_REFILL_THRESHOLD ->
     Inc = ?INITIAL_WINDOW - W,
@@ -506,27 +496,35 @@ maybe_refill_conn(#loop{conn_recv_window = W} = State) when W < ?WINDOW_REFILL_T
 maybe_refill_conn(State) ->
     State.
 
-maybe_refill_stream(#loop{stream = #{recv_window := W, id := Id} = S} = State) when
-    W < ?WINDOW_REFILL_THRESHOLD
-->
-    Inc = ?INITIAL_WINDOW - W,
-    _ = send(State, roadrunner_http2_frame:encode({window_update, Id, Inc})),
-    State#loop{stream = S#{recv_window := W + Inc}};
-maybe_refill_stream(State) ->
-    State.
+maybe_refill_stream(#loop{streams = Streams} = State, StreamId) ->
+    Stream = maps:get(StreamId, Streams),
+    case maps:get(recv_window, Stream) of
+        W when W < ?WINDOW_REFILL_THRESHOLD ->
+            Inc = ?INITIAL_WINDOW - W,
+            _ = send(
+                State,
+                roadrunner_http2_frame:encode({window_update, StreamId, Inc})
+            ),
+            update_stream(State, StreamId, Stream#{recv_window := W + Inc});
+        _ ->
+            State
+    end.
 
 %% =============================================================================
-%% Stream dispatch — build request, run handler, emit response.
+%% Stream dispatch — spawn a worker
 %% =============================================================================
 
 dispatch_stream(
+    StreamId,
     #loop{
-        stream = Stream,
+        streams = Streams,
+        proto_opts = ProtoOpts,
         peer = Peer,
         scheme = Scheme,
         listener_name = ListenerName
     } = State
 ) ->
+    Stream = maps:get(StreamId, Streams),
     Headers = maps:get(headers, Stream),
     Body = iolist_to_binary(maps:get(body, Stream)),
     {RequestId, _} = roadrunner_conn:generate_request_id(<<>>),
@@ -538,119 +536,95 @@ dispatch_stream(
     },
     case roadrunner_http2_request:from_headers(Headers, Body, ConnInfo) of
         {ok, Req} ->
-            run_handler(Req, State);
+            {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
+                self(), StreamId, Req, ProtoOpts
+            ),
+            Stream1 = Stream#{
+                worker_pid := WorkerPid,
+                worker_ref := MonRef,
+                state := half_closed_remote,
+                body := []
+            },
+            State1 = State#loop{
+                streams = maps:put(StreamId, Stream1, Streams),
+                worker_refs = maps:put(MonRef, StreamId, State#loop.worker_refs)
+            },
+            frame_loop(State1);
         {error, _Reason} ->
-            _ = send_rst_stream(State, maps:get(id, Stream), protocol_error),
-            frame_loop(State#loop{stream = undefined})
-    end.
-
-run_handler(Req, #loop{proto_opts = Proto} = State) ->
-    Dispatch = maps:get(dispatch, Proto),
-    Mws = maps:get(middlewares, Proto, []),
-    case roadrunner_conn:resolve_handler(Dispatch, Req) of
-        {ok, Handler, Bindings, RouteOpts} ->
-            FullReq = Req#{bindings => Bindings, route_opts => RouteOpts},
-            invoke(Handler, Mws, FullReq, State);
-        not_found ->
-            emit_response(404, [{~"content-type", ~"text/plain"}], ~"Not Found", State)
-    end.
-
-invoke(Handler, ListenerMws, Req, State) ->
-    RouteMws = roadrunner_conn:route_middlewares(Req),
-    Pipeline =
-        case ListenerMws =:= [] andalso RouteMws =:= [] of
-            true ->
-                fun Handler:handle/1;
-            false ->
-                roadrunner_middleware:compose(
-                    ListenerMws ++ RouteMws,
-                    fun(R) -> Handler:handle(R) end
-                )
-        end,
-    try Pipeline(Req) of
-        {Response, _Req2} ->
-            emit_handler_response(Response, State)
-    catch
-        Class:Reason:Stack ->
-            logger:error(#{
-                msg => "roadrunner h2 handler crashed",
-                handler => Handler,
-                class => Class,
-                reason => Reason,
-                stacktrace => Stack
-            }),
-            emit_response(500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error", State)
+            _ = send_rst_stream(State, StreamId, protocol_error),
+            frame_loop(remove_stream(State, StreamId))
     end.
 
 %% =============================================================================
-%% Response shapes — buffered now; others 501 until later phases.
+%% Worker → conn message handlers
 %% =============================================================================
 
-emit_handler_response({Status, Headers, Body}, State) when
-    is_integer(Status), Status >= 100, Status =< 599
-->
-    emit_response(Status, Headers, Body, State);
-emit_handler_response({stream, Status, Headers, Fun}, State) when
-    is_integer(Status), Status >= 100, Status =< 599, is_function(Fun, 1)
-->
-    State1 = roadrunner_http2_stream_response:run(State, Status, Headers, Fun),
-    frame_loop(State1#loop{stream = undefined});
-emit_handler_response({loop, _, _, _}, State) ->
-    emit_501(State);
-emit_handler_response({sendfile, _, _, _}, State) ->
-    emit_501(State);
-emit_handler_response({websocket, _, _}, State) ->
-    emit_501(State).
+handle_send_headers(State, From, Ref, StreamId, Status, Headers, EndStream) ->
+    case stream_open(State, StreamId) of
+        {ok, _Stream} ->
+            State1 = encode_and_send_headers(State, StreamId, Status, Headers, EndStream),
+            _ = (From ! {h2_send_ack, Ref}),
+            State1;
+        not_open ->
+            _ = (From ! {h2_stream_reset, StreamId}),
+            State
+    end.
 
-emit_501(State) ->
-    emit_response(
-        501,
-        [{~"content-type", ~"text/plain"}],
-        ~"HTTP/2 does not yet support this response shape",
-        State
-    ).
+handle_send_data(State, From, Ref, StreamId, Bin, EndStream) ->
+    case stream_open(State, StreamId) of
+        {ok, Stream} ->
+            try_send_data(State, Stream, StreamId, From, Ref, Bin, EndStream);
+        not_open ->
+            _ = (From ! {h2_stream_reset, StreamId}),
+            State
+    end.
 
-%% Encode + send a buffered response: HEADERS (END_HEADERS) + one
-%% or more DATA frames terminated by END_STREAM. The body is
-%% delivered through the same flow-control machinery as `{stream,
-%% _}` responses — both call `send_data_sync/3`.
-emit_response(Status, Headers, Body0, State) ->
-    Body = iolist_to_binary(Body0),
-    EmptyBody = Body =:= <<>>,
-    State1 = send_response_headers(State, Status, Headers, EmptyBody),
-    State2 =
-        case EmptyBody of
-            true -> State1;
-            false -> send_data_sync(State1, Body, true)
-        end,
-    frame_loop(State2#loop{stream = undefined}).
+handle_send_trailers(State, From, Ref, StreamId, Trailers) ->
+    case stream_open(State, StreamId) of
+        {ok, _Stream} ->
+            State1 = encode_and_send_trailers(State, StreamId, Trailers),
+            _ = (From ! {h2_send_ack, Ref}),
+            State1;
+        not_open ->
+            _ = (From ! {h2_stream_reset, StreamId}),
+            State
+    end.
 
--doc """
-Encode the response HEADERS frame and write it on the wire.
+handle_worker_done(State, StreamId) ->
+    %% The worker exits after this message; the DOWN cleanup will
+    %% remove the stream. Nothing to do here.
+    _ = StreamId,
+    State.
 
-Sets `END_STREAM` when `EndStream` is `true` (zero-body responses
-or trailer-only responses where the entire payload fits in
-headers); otherwise the stream stays half-open for subsequent
-DATA / trailer frames.
+handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
+    case maps:find(MonRef, Refs) of
+        {ok, StreamId} ->
+            State1 = State#loop{worker_refs = maps:remove(MonRef, Refs)},
+            case Reason of
+                normal -> remove_stream(State1, StreamId);
+                _ -> abort_stream(State1, StreamId, internal_error)
+            end;
+        error ->
+            State
+    end.
 
-Returns the updated state with the new HPACK encoder context.
-""".
--spec send_response_headers(
-    #loop{},
-    roadrunner_http:status(),
-    roadrunner_http:headers(),
-    boolean()
-) -> #loop{}.
-send_response_headers(
-    #loop{stream = #{id := StreamId}, hpack_enc = Enc} = State,
-    Status,
-    Headers,
-    EndStream
+%% Look up a stream that has not yet been reset / closed. Returns
+%% `not_open` for streams the conn has already torn down (peer
+%% RST_STREAM, write of END_STREAM completed, etc.) — workers
+%% asking to write to those should be told to abort.
+stream_open(#loop{streams = Streams}, StreamId) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #{state := closed}} -> not_open;
+        {ok, Stream} -> {ok, Stream};
+        error -> not_open
+    end.
+
+%% Encode + write a HEADERS frame (always fits without flow control;
+%% the wire just takes it).
+encode_and_send_headers(
+    #loop{hpack_enc = Enc} = State, StreamId, Status, Headers, EndStream
 ) ->
     StatusBin = integer_to_binary(Status),
-    %% Inject :status pseudo-header at the front; other pseudo-
-    %% headers don't apply to responses (RFC 9113 §8.3.1).
-    %% Lowercase regular header names per §8.2.
     LowerHeaders = [{lowercase(N), V} || {N, V} <- Headers],
     AllHeaders = [{~":status", StatusBin} | LowerHeaders],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
@@ -662,33 +636,13 @@ send_response_headers(
         end,
     Frame = roadrunner_http2_frame:encode({headers, StreamId, Flags, undefined, HpackBin}),
     _ = send(State, Frame),
-    State#loop{hpack_enc = Enc1}.
+    State1 = State#loop{hpack_enc = Enc1},
+    case EndStream of
+        true -> close_stream_send_side(State1, StreamId);
+        false -> State1
+    end.
 
--doc """
-Send `Body` as one or more DATA frames, blocking on WINDOW_UPDATE
-when either the conn or the stream send window can't fit the next
-chunk. The final chunk receives `END_STREAM` when `EndStream` is
-`true`; otherwise the stream remains half-open for further DATA
-or trailer frames.
-
-Returns the updated state with the consumed send-window quota.
-""".
--spec send_data_sync(#loop{}, binary(), boolean()) -> #loop{}.
-send_data_sync(State, Body, EndStream) ->
-    stream_data_chunks(Body, EndStream, State).
-
--doc """
-Send a trailer block as a HEADERS frame with both `END_HEADERS`
-and `END_STREAM` set (RFC 9113 §8.1). Header names are
-lowercased before HPACK encoding.
-
-Returns the updated state with the new HPACK encoder context.
-""".
--spec send_trailers(#loop{}, roadrunner_http:headers()) -> #loop{}.
-send_trailers(
-    #loop{stream = #{id := StreamId}, hpack_enc = Enc} = State,
-    Trailers
-) ->
+encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
     LowerTrailers = [{lowercase(N), V} || {N, V} <- Trailers],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(LowerTrailers, Enc),
     HpackBin = iolist_to_binary(HpackBlock),
@@ -696,172 +650,176 @@ send_trailers(
         {headers, StreamId, 16#04 bor 16#01, undefined, HpackBin}
     ),
     _ = send(State, Frame),
-    State#loop{hpack_enc = Enc1}.
+    State1 = State#loop{hpack_enc = Enc1},
+    close_stream_send_side(State1, StreamId).
 
-%% Send `Body` as DATA frames, returning State on completion.
-%% Blocks on WINDOW_UPDATE when stalled.
--spec stream_data_chunks(binary(), boolean(), #loop{}) -> #loop{}.
-stream_data_chunks(<<>>, true, #loop{stream = #{id := StreamId}} = State) ->
-    %% Empty body but still need to close the stream — emit a
-    %% lone empty DATA frame with END_STREAM. Reached via
-    %% `Send(<<>>, fin)` from a stream-response handler.
+%% Mark the send side closed. Future worker writes on this stream
+%% get `{h2_stream_reset, _}` so they unwind cleanly.
+close_stream_send_side(#loop{streams = Streams} = State, StreamId) ->
+    Stream = maps:get(StreamId, Streams),
+    update_stream(State, StreamId, Stream#{state := closed}).
+
+%% =============================================================================
+%% DATA send + flow control
+%% =============================================================================
+
+%% Try to send `Bin` as DATA frame(s). If both windows allow, send
+%% everything and ack. If a partial chunk fits, send what we can
+%% and queue the rest. If nothing fits, queue the whole thing.
+%%
+%% Empty `Bin` always means `EndStream = true` because
+%% `roadrunner_http2_stream_response` short-circuits empty `nofin`
+%% sends — the empty-body case here doesn't consume any window
+%% bytes, so it bypasses the window check entirely.
+try_send_data(State, _Stream, StreamId, From, Ref, <<>>, true) ->
     Frame = roadrunner_http2_frame:encode({data, StreamId, 16#01, <<>>}),
     _ = send(State, Frame),
-    State;
-stream_data_chunks(Body, EndStream, #loop{stream = #{id := StreamId} = Stream} = State) ->
+    _ = (From ! {h2_send_ack, Ref}),
+    close_stream_send_side(State, StreamId);
+try_send_data(State, Stream, StreamId, From, Ref, Bin, EndStream) ->
+    case window_budget(State, Stream) of
+        0 ->
+            %% Window closed — queue the whole send.
+            Stream1 = enqueue_pending(Stream, {data, Ref, From, Bin, EndStream}),
+            update_stream(State, StreamId, Stream1);
+        _ ->
+            send_data_chunks(State, Stream, StreamId, From, Ref, Bin, EndStream)
+    end.
+
+send_data_chunks(State, Stream, StreamId, From, Ref, Bin, EndStream) ->
     Available = window_budget(State, Stream),
-    Take = min(min(byte_size(Body), Available), ?MAX_FRAME_SIZE),
+    Take = min(min(byte_size(Bin), Available), ?MAX_FRAME_SIZE),
     case Take of
         0 ->
-            %% Both windows are zero (or one is) — wait for a
-            %% WINDOW_UPDATE that opens room.
-            wait_for_window(Body, EndStream, State);
-        N when N =:= byte_size(Body) ->
-            %% This frame holds the rest of the body — set
-            %% END_STREAM only when the caller asked for it.
+            %% Window closed mid-body — queue the remainder.
+            Stream1 = enqueue_pending(Stream, {data, Ref, From, Bin, EndStream}),
+            update_stream(State, StreamId, Stream1);
+        N when N =:= byte_size(Bin) ->
+            %% Last chunk — END_STREAM if the caller asked.
             Flags =
                 case EndStream of
                     true -> 16#01;
                     false -> 0
                 end,
-            Frame = roadrunner_http2_frame:encode({data, StreamId, Flags, Body}),
+            Frame = roadrunner_http2_frame:encode({data, StreamId, Flags, Bin}),
             _ = send(State, Frame),
-            consume_send_window(State, Stream, N);
+            State1 = consume_send_window(State, StreamId, Stream, N),
+            _ = (From ! {h2_send_ack, Ref}),
+            case EndStream of
+                true -> close_stream_send_side(State1, StreamId);
+                false -> State1
+            end;
         N ->
-            <<Chunk:N/binary, Rest/binary>> = Body,
+            <<Chunk:N/binary, Rest/binary>> = Bin,
             Frame = roadrunner_http2_frame:encode({data, StreamId, 0, Chunk}),
             _ = send(State, Frame),
-            State1 = consume_send_window(State, Stream, N),
-            stream_data_chunks(Rest, EndStream, State1)
+            State1 = consume_send_window(State, StreamId, Stream, N),
+            Stream1 = maps:get(StreamId, State1#loop.streams),
+            send_data_chunks(State1, Stream1, StreamId, From, Ref, Rest, EndStream)
     end.
 
--spec window_budget(#loop{}, map()) -> non_neg_integer().
 window_budget(#loop{conn_send_window = ConnW}, #{send_window := StreamW}) ->
-    %% A window can legitimately go negative in a future phase
-    %% when SETTINGS_INITIAL_WINDOW_SIZE shrinks; H6 doesn't
-    %% honor that yet, so we still clamp non-negative.
     max(0, min(ConnW, StreamW)).
 
--spec consume_send_window(#loop{}, map(), non_neg_integer()) -> #loop{}.
-consume_send_window(#loop{conn_send_window = ConnW} = State, Stream, N) ->
+consume_send_window(
+    #loop{conn_send_window = ConnW, streams = Streams} = State, StreamId, Stream, N
+) ->
+    Stream1 = Stream#{send_window := maps:get(send_window, Stream) - N},
     State#loop{
         conn_send_window = ConnW - N,
-        stream = Stream#{send_window := maps:get(send_window, Stream) - N}
+        streams = maps:put(StreamId, Stream1, Streams)
     }.
 
-%% Read frames until a WINDOW_UPDATE that grows our usable window
-%% arrives. Same dispatch shape as `frame_loop/1` (drain buffer,
-%% otherwise arm + receive) but routes the parsed frame through
-%% `handle_frame_during_send/4` instead of the main `handle_frame/2`
-%% — the subset of frames that may legally arrive while a stream
-%% is stalled mid-response is narrower than the full set, and the
-%% return shape is "resume `stream_data_chunks/3`" rather than
-%% "loop back".
--spec wait_for_window(binary(), boolean(), #loop{}) -> #loop{}.
-wait_for_window(Body, EndStream, #loop{buffer = Buf} = State) ->
-    case roadrunner_http2_frame:parse(Buf, ?MAX_FRAME_SIZE) of
-        {ok, Frame, Rest} ->
-            handle_frame_during_send(Frame, Body, EndStream, State#loop{buffer = Rest});
-        {more, _Need} ->
-            arm_and_recv_during_send(Body, EndStream, State);
-        {error, _} ->
-            _ = send_goaway(State, protocol_error),
-            exit_clean(State)
+enqueue_pending(Stream, Entry) ->
+    Stream#{pending_sends := maps:get(pending_sends, Stream) ++ [Entry]}.
+
+%% After a stream's send window grew, drain its pending DATA queue
+%% as far as windows allow.
+flush_pending_data(#loop{streams = Streams} = State, StreamId) ->
+    case maps:get(StreamId, Streams) of
+        #{pending_sends := []} -> State;
+        Stream -> drain_pending(State, StreamId, Stream)
     end.
 
--spec arm_and_recv_during_send(binary(), boolean(), #loop{}) -> #loop{}.
-arm_and_recv_during_send(Body, EndStream, #loop{socket = Sock} = State) ->
-    _ = roadrunner_transport:setopts(Sock, [{active, once}]),
-    recv_more_during_send(Body, EndStream, State).
+%% After the conn-level send window grew, drain every stream's
+%% pending queue.
+flush_all_pending_data(#loop{streams = Streams} = State) ->
+    maps:fold(
+        fun(StreamId, _Stream, AccState) ->
+            flush_pending_data(AccState, StreamId)
+        end,
+        State,
+        Streams
+    ).
 
--spec recv_more_during_send(binary(), boolean(), #loop{}) -> #loop{}.
-recv_more_during_send(
-    Body,
-    EndStream,
-    #loop{
-        msg_data = MData,
-        msg_closed = MClosed,
-        msg_error = MError,
-        buffer = Buf
-    } = State
-) ->
-    receive
-        {MData, _, Bytes} ->
-            wait_for_window(Body, EndStream, State#loop{
-                buffer = <<Buf/binary, Bytes/binary>>
-            });
-        {MClosed, _} ->
-            exit_clean(State);
-        {MError, _, _} ->
-            _ = send_goaway(State, protocol_error),
-            exit_clean(State)
-    after idle_timeout() ->
-        _ = send_goaway(State, protocol_error),
-        exit_clean(State)
+%% Drain queued sends on a single stream until either the queue is
+%% empty or the window forces us to stop again.
+drain_pending(State, _StreamId, #{pending_sends := []}) ->
+    State;
+drain_pending(State, StreamId, #{pending_sends := [Entry | Rest]} = Stream) ->
+    {data, Ref, From, Bin, EndStream} = Entry,
+    Stream1 = Stream#{pending_sends := Rest},
+    State1 = update_stream(State, StreamId, Stream1),
+    State2 = try_send_data(State1, Stream1, StreamId, From, Ref, Bin, EndStream),
+    Stream2 = maps:get(StreamId, State2#loop.streams),
+    case maps:get(pending_sends, Stream2) of
+        [Entry | _] ->
+            %% Same entry re-queued: window still closed.
+            State2;
+        _ ->
+            drain_pending(State2, StreamId, Stream2)
     end.
-
-%% Same dispatch as `handle_frame/2` but for the subset of frame
-%% types that can legally arrive while we're stalled mid-response,
-%% returning State (and resuming `stream_data_chunks/3`) rather
-%% than tail-calling the main frame loop.
-%%
-%% RST_STREAM for the active stream is the one case that doesn't
-%% return: the peer cancelled the in-flight response, so we exit
-%% the send loop entirely and re-enter the main `frame_loop` with
-%% the stream cleared.
--spec handle_frame_during_send(
-    roadrunner_http2_frame:frame(), binary(), boolean(), #loop{}
-) -> #loop{}.
-handle_frame_during_send(
-    {window_update, 0, Inc},
-    Body,
-    EndStream,
-    #loop{conn_send_window = W} = State
-) ->
-    case W + Inc of
-        N when N > ?MAX_WINDOW ->
-            _ = send_goaway(State, flow_control_error),
-            exit_clean(State);
-        N ->
-            stream_data_chunks(Body, EndStream, State#loop{conn_send_window = N})
-    end;
-handle_frame_during_send(
-    {window_update, StreamId, Inc},
-    Body,
-    EndStream,
-    #loop{stream = #{id := StreamId} = Stream} = State
-) ->
-    case maps:get(send_window, Stream) + Inc of
-        N when N > ?MAX_WINDOW ->
-            _ = send_goaway(State, flow_control_error),
-            exit_clean(State);
-        N ->
-            stream_data_chunks(
-                Body, EndStream, State#loop{stream = Stream#{send_window := N}}
-            )
-    end;
-handle_frame_during_send({ping, 0, Opaque}, Body, EndStream, State) ->
-    _ = send(State, roadrunner_http2_frame:encode({ping, 1, Opaque})),
-    wait_for_window(Body, EndStream, State);
-handle_frame_during_send({settings, 0, _}, Body, EndStream, State) ->
-    _ = send(State, roadrunner_http2_frame:encode({settings, 1, []})),
-    wait_for_window(Body, EndStream, State);
-handle_frame_during_send(
-    {rst_stream, StreamId, _},
-    _Body,
-    _EndStream,
-    #loop{stream = #{id := StreamId}} = State
-) ->
-    %% Peer cancelled the stream we were streaming — drop the body
-    %% and re-enter the main loop with the stream cleared.
-    frame_loop(State#loop{stream = undefined});
-handle_frame_during_send(_Frame, Body, EndStream, State) ->
-    %% Ping ACK / SETTINGS ACK / window updates for unknown
-    %% streams / PRIORITY — ignore and keep waiting.
-    wait_for_window(Body, EndStream, State).
 
 %% =============================================================================
-%% Helpers
+%% Stream lifecycle helpers
+%% =============================================================================
+
+update_stream(#loop{streams = Streams} = State, StreamId, Stream) ->
+    State#loop{streams = maps:put(StreamId, Stream, Streams)}.
+
+%% Peer sent RST_STREAM for a stream we have alive. Tell the worker
+%% (if any) to bail, then drop our stream entry. Pending sends get
+%% reset notifications so workers waiting on `h2_send_ack` unwind.
+reset_stream(#loop{streams = Streams, worker_refs = Refs} = State, StreamId) ->
+    Stream = maps:get(StreamId, Streams),
+    notify_pending_reset(StreamId, maps:get(pending_sends, Stream)),
+    Refs1 =
+        case maps:get(worker_ref, Stream) of
+            undefined ->
+                %% RST landed before END_STREAM dispatched a worker.
+                Refs;
+            MonRef ->
+                Pid = maps:get(worker_pid, Stream),
+                _ = (Pid ! {h2_stream_reset, StreamId}),
+                true = demonitor(MonRef, [flush]),
+                maps:remove(MonRef, Refs)
+        end,
+    State#loop{
+        streams = maps:remove(StreamId, Streams),
+        worker_refs = Refs1
+    }.
+
+%% Called by `handle_worker_down/3` when a worker dies abnormally.
+%% Send RST_STREAM(error_code) to the peer and drop our state.
+abort_stream(#loop{streams = Streams} = State, StreamId, ErrorCode) ->
+    Stream = maps:get(StreamId, Streams),
+    notify_pending_reset(StreamId, maps:get(pending_sends, Stream)),
+    _ = send_rst_stream(State, StreamId, ErrorCode),
+    State#loop{streams = maps:remove(StreamId, Streams)}.
+
+%% Worker exited normally (handler done, all frames already on the
+%% wire). Just drop state.
+remove_stream(#loop{streams = Streams} = State, StreamId) ->
+    State#loop{streams = maps:remove(StreamId, Streams)}.
+
+notify_pending_reset(_StreamId, []) ->
+    ok;
+notify_pending_reset(StreamId, [{data, _Ref, From, _Bin, _Es} | Rest]) ->
+    _ = (From ! {h2_stream_reset, StreamId}),
+    notify_pending_reset(StreamId, Rest).
+
+%% =============================================================================
+%% Generic helpers
 %% =============================================================================
 
 -spec lowercase(binary()) -> binary().

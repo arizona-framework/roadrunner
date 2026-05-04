@@ -24,7 +24,7 @@ all_test_() ->
         fun full_get_request_returns_response/0,
         fun all_frame_types_handled/0,
         fun goaway_received_closes_connection/0,
-        fun second_stream_gets_refused/0,
+        fun concurrent_streams_both_dispatch/0,
         fun post_with_body_via_data_frame/0,
         fun continuation_assembles_header_block/0,
         fun push_promise_from_client_triggers_goaway/0,
@@ -59,7 +59,16 @@ all_test_() ->
         fun runtime_idle_timeout_emits_goaway/0,
         fun rst_stream_active_stream_synced/0,
         fun stream_window_update_grows_window_synced/0,
-        fun rst_stream_unknown_stream_ignored/0
+        fun rst_stream_unknown_stream_ignored/0,
+        fun headers_for_already_open_stream_protocol_error/0,
+        fun synthetic_send_data_after_reset/0,
+        fun synthetic_send_headers_after_reset/0,
+        fun synthetic_send_trailers_after_reset/0,
+        fun synthetic_send_data_to_closed_stream/0,
+        fun handler_returning_invalid_shape_resets_stream/0,
+        fun unrelated_down_ignored/0,
+        fun over_max_concurrent_streams_refused/0,
+        fun rst_during_stream_response_unwinds_worker/0
     ],
     [{spawn, F} || F <- Tests].
 
@@ -222,8 +231,12 @@ all_frame_types_handled() ->
     %% RST_STREAM for an unknown stream — silently dropped.
     Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 99, cancel})),
     serve_recv(ConnPid, Rst),
-    %% Sanity: conn still alive.
-    ?assert(is_process_alive(Pid)),
+    %% Sync via PING-ACK so coverage records the prior no-op
+    %% frames before `cleanup/2` races the conn process.
+    SyncPing = iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<3:64>>})),
+    serve_recv(ConnPid, SyncPing),
+    PingAck2 = expect_send(),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, PingAck2),
     cleanup(Pid, Ref).
 
 goaway_received_closes_connection() ->
@@ -242,41 +255,62 @@ goaway_received_closes_connection() ->
     after 500 -> error(no_exit)
     end.
 
-second_stream_gets_refused() ->
-    %% Open stream 1 without END_STREAM (DATA pending), then send
-    %% HEADERS for stream 3 — server RST_STREAMs the new one.
+concurrent_streams_both_dispatch() ->
+    %% Phase H8b lifts MAX_CONCURRENT_STREAMS from 1 to 100; two
+    %% in-flight streams now dispatch independently in their own
+    %% worker processes. Open stream 1 and stream 3 with a full
+    %% request each (END_HEADERS + END_STREAM) and confirm both
+    %% workers reply by parsing the HEADERS frames they emit.
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
-    {Pid, Ref, ConnPid} = start_http2_conn(),
+    Self = self(),
+    Counter = atomics:new(1, [{signed, false}]),
+    ok = atomics:add(Counter, 1, 1),
+    ProtoOpts = #{
+        client_counter => Counter,
+        listener_name => h2_concurrent_test,
+        dispatch => {handler, roadrunner_h2_test_handler},
+        middlewares => []
+    },
+    Sock = {fake, Self},
+    Pid = spawn(fun() ->
+        receive
+            ready -> ok
+        end,
+        roadrunner_conn_loop_http2:enter(
+            Sock, ProtoOpts, h2_concurrent_test, undefined, erlang:monotonic_time()
+        )
+    end),
+    Ref = monitor(process, Pid),
+    Pid ! ready,
     _ = expect_send(),
-    serve_recv(ConnPid, ?PREFACE),
-    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    serve_recv(Pid, ?PREFACE),
+    serve_recv(Pid, ?EMPTY_SETTINGS_FRAME),
     _ = expect_send(),
     Enc = roadrunner_http2_hpack:new_encoder(4096),
     {Hpack, _} = roadrunner_http2_hpack:encode(
         [
-            {~":method", ~"POST"},
+            {~":method", ~"GET"},
             {~":scheme", ~"https"},
-            {~":authority", ~"x"},
-            {~":path", ~"/"}
+            {~":authority", ~"localhost"},
+            {~":path", ~"/empty"}
         ],
         Enc
     ),
     HpackBin = iolist_to_binary(Hpack),
-    %% Stream 1: HEADERS without END_STREAM (END_HEADERS only).
-    Stream1Headers = iolist_to_binary(
-        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    H1 = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
     ),
-    serve_recv(ConnPid, Stream1Headers),
-    %% Stream 3: HEADERS while stream 1 is still active.
-    Stream3Headers = iolist_to_binary(
+    H3 = iolist_to_binary(
         roadrunner_http2_frame:encode({headers, 3, 16#04 bor 16#01, undefined, HpackBin})
     ),
-    serve_recv(ConnPid, Stream3Headers),
-    %% Server RST_STREAMs stream 3 with REFUSED_STREAM.
-    Out = expect_send(),
-    {ok, {rst_stream, 3, refused_stream}, _} =
-        roadrunner_http2_frame:parse(Out, 16384),
+    serve_recv(Pid, H1),
+    serve_recv(Pid, H3),
+    %% Drain all sends, parse to find HEADERS frames per stream.
+    Frames = collect_response_frames(),
+    StreamIds = lists:usort([SId || {headers, SId, _} <- Frames]),
+    ?assert(lists:member(1, StreamIds)),
+    ?assert(lists:member(3, StreamIds)),
     cleanup(Pid, Ref).
 
 post_with_body_via_data_frame() ->
@@ -958,6 +992,276 @@ rst_stream_unknown_stream_ignored() ->
     PingAck = expect_send(),
     ?assertMatch(<<_:24, 6, 1, _/binary>>, PingAck),
     cleanup(Pid, Ref).
+
+headers_for_already_open_stream_protocol_error() ->
+    %% Stream id 1 is opened (HEADERS without END_STREAM) and then
+    %% HEADERS for stream 1 arrives again — RFC 9113 §5.1.1: a
+    %% server treats receipt of a duplicate stream-id HEADERS as
+    %% PROTOCOL_ERROR (after the original opened the stream).
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    HpackBin = encode_post_root_headers(),
+    H1 = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H1),
+    H1Again = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H1Again),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(process_did_not_exit)
+    end.
+
+synthetic_send_data_after_reset() ->
+    %% Open a stream, then RST it. Stream is removed from the
+    %% map. Sending a synthetic `h2_send_data` for that stream id
+    %% takes the not_open branch in `handle_send_data/6` and
+    %% returns `{h2_stream_reset, _}` to the would-be worker.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    HpackBin = encode_post_root_headers(),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
+    serve_recv(ConnPid, Rst),
+    DRef = make_ref(),
+    ConnPid ! {h2_send_data, self(), DRef, 1, ~"x", false},
+    receive
+        {h2_stream_reset, 1} -> ok
+    after 500 -> error(no_reset)
+    end,
+    cleanup(Pid, Ref).
+
+synthetic_send_headers_after_reset() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    HpackBin = encode_post_root_headers(),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
+    serve_recv(ConnPid, Rst),
+    DRef = make_ref(),
+    ConnPid ! {h2_send_headers, self(), DRef, 1, 200, [], true},
+    receive
+        {h2_stream_reset, 1} -> ok
+    after 500 -> error(no_reset)
+    end,
+    cleanup(Pid, Ref).
+
+synthetic_send_trailers_after_reset() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    HpackBin = encode_post_root_headers(),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
+    serve_recv(ConnPid, Rst),
+    DRef = make_ref(),
+    ConnPid ! {h2_send_trailers, self(), DRef, 1, []},
+    receive
+        {h2_stream_reset, 1} -> ok
+    after 500 -> error(no_reset)
+    end,
+    cleanup(Pid, Ref).
+
+synthetic_send_data_to_closed_stream() ->
+    %% Open a stream protocol-side (HEADERS no END_STREAM, no
+    %% worker yet), inject a synthetic empty-fin DATA send (closes
+    %% the send side, state := closed), then inject another DATA
+    %% send. The second one hits `stream_open/2`'s closed clause.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    HpackBin = encode_post_root_headers(),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    %% Empty fin closes the send side; ack confirms it.
+    DRef1 = make_ref(),
+    ConnPid ! {h2_send_data, self(), DRef1, 1, <<>>, true},
+    receive
+        {h2_send_ack, DRef1} -> ok
+    after 500 -> error(no_ack)
+    end,
+    %% Stream is in state := closed. Send another DATA → reset.
+    DRef2 = make_ref(),
+    ConnPid ! {h2_send_data, self(), DRef2, 1, ~"x", false},
+    receive
+        {h2_stream_reset, 1} -> ok
+    after 500 -> error(no_reset)
+    end,
+    cleanup(Pid, Ref).
+
+handler_returning_invalid_shape_resets_stream() ->
+    %% Handler returns a `{stream, _, _, not_a_function}` shape
+    %% that no `emit_handler_response/3` clause matches — worker
+    %% dies with function_clause; conn observes DOWN with a
+    %% non-normal reason and emits RST_STREAM(internal_error).
+    {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/badshape"),
+    cleanup(Pid, Ref).
+
+unrelated_down_ignored() ->
+    %% A `'DOWN'` message with a ref the conn doesn't know about
+    %% (some stray monitor) is silently dropped — the conn keeps
+    %% serving. PING-ACK sync proves it.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    ConnPid ! {'DOWN', make_ref(), process, self(), normal},
+    Ping = iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>})),
+    serve_recv(ConnPid, Ping),
+    PingAck = expect_send(),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, PingAck),
+    cleanup(Pid, Ref).
+
+over_max_concurrent_streams_refused() ->
+    %% Open 100 streams without END_STREAM (no body, just keep
+    %% them alive in the map), then HEADERS for the 101st gets
+    %% RST_STREAM(REFUSED_STREAM).
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    HpackBin = encode_post_root_headers(),
+    %% Send 100 HEADERS frames (stream ids 1, 3, ..., 199).
+    lists:foreach(
+        fun(I) ->
+            StreamId = 1 + 2 * I,
+            HF = iolist_to_binary(
+                roadrunner_http2_frame:encode(
+                    {headers, StreamId, 16#04, undefined, HpackBin}
+                )
+            ),
+            serve_recv(ConnPid, HF)
+        end,
+        lists:seq(0, 99)
+    ),
+    %% 101st stream → over the limit. Expect RST_STREAM(refused_stream).
+    Over = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 201, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, Over),
+    Rst = expect_send(),
+    {ok, {rst_stream, 201, refused_stream}, _} =
+        roadrunner_http2_frame:parse(Rst, 16384),
+    cleanup(Pid, Ref).
+
+rst_during_stream_response_unwinds_worker() ->
+    %% A `{stream, _}` handler pauses mid-response. Peer sends
+    %% RST_STREAM during the pause. Conn's `reset_stream/2` tells
+    %% the worker; the worker is parked in `sync/2` waiting for
+    %% the next ack — the `{h2_stream_reset, _}` arm fires and the
+    %% worker exits with reason `stream_reset`. Conn's
+    %% `handle_worker_down/3` observes the non-normal exit and
+    %% emits `RST_STREAM(internal_error)` (no-op for the peer
+    %% since they already cancelled, but exercises that branch).
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    Self = self(),
+    Counter = atomics:new(1, [{signed, false}]),
+    ok = atomics:add(Counter, 1, 1),
+    ProtoOpts = #{
+        client_counter => Counter,
+        listener_name => h2_rst_during_stream,
+        dispatch => {handler, roadrunner_h2_test_handler},
+        middlewares => []
+    },
+    Sock = {fake, Self},
+    Pid = spawn(fun() ->
+        receive
+            ready -> ok
+        end,
+        roadrunner_conn_loop_http2:enter(
+            Sock, ProtoOpts, h2_rst_during_stream, undefined, erlang:monotonic_time()
+        )
+    end),
+    Ref = monitor(process, Pid),
+    Pid ! ready,
+    _ = expect_send(),
+    serve_recv(Pid, ?PREFACE),
+    serve_recv(Pid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"localhost"},
+            {~":path", ~"/stream/slow"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(Pid, H),
+    %% Worker emits HEADERS + first DATA (~"a"), then sleeps 200 ms.
+    %% Drain those, then RST during the sleep.
+    timer:sleep(50),
+    _ = drain_send(50),
+    _ = drain_send(50),
+    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
+    serve_recv(Pid, Rst),
+    %% Wait for worker death + abort_stream to send RST_STREAM(internal_error).
+    timer:sleep(300),
+    cleanup(Pid, Ref).
+
+encode_post_root_headers() ->
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"POST"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"}
+        ],
+        Enc
+    ),
+    iolist_to_binary(Hpack).
 
 runtime_transport_error_triggers_goaway() ->
     %% Transport error AFTER handshake — exercises the `{MError, _, _}`

@@ -18,76 +18,93 @@ Empty data is special-cased to match the h1 behavior:
 - `Send(<<>>, {fin, Trailers})` emits the trailer HEADERS frame
   (with END_STREAM) and no DATA.
 
-The `Send` callback runs synchronously in the conn process and
-blocks on `WINDOW_UPDATE` whenever the conn or stream send
-window can't fit the next chunk (RFC 9113 §6.9). Conn-loop
-state is threaded through Send via the process dictionary —
-the h1-parity Send shape can't return state, and there is at
-most one in-flight stream (Phase H7 keeps `MAX_CONCURRENT_STREAMS
-= 1`).
+The `Send` callback runs in the worker process and synchronously
+round-trips with the conn process for each emission — `Send`
+returns only after the conn has written the corresponding frame
+on the wire (or queued it pending a `WINDOW_UPDATE`). This
+threads natural backpressure: a slow consumer stalls the worker
+without us having to explicitly buffer.
 
 If the handler returns without calling `Send(_, fin)` /
-`{fin, _}` we auto-close the stream with an empty DATA frame so
-the peer doesn't see a half-open stream.
+`{fin, _}` we auto-close the stream with an empty `END_STREAM`
+DATA frame so the peer doesn't see a half-open stream.
 """.
 
--export([run/4]).
+-export([run/5]).
 
-%% Process-dict key for the conn `#loop{}` threaded through Send.
--define(STATE_KEY, '$roadrunner_http2_stream_state').
-%% Process-dict flag set once Send observed a fin variant.
+%% Process-dict flag: set once Send observed a fin variant. Lives
+%% in the WORKER's process dict (not the conn's), so isolation
+%% across streams is automatic.
 -define(FIN_KEY, '$roadrunner_http2_stream_fin').
 
 -doc """
-Send the response HEADERS (no `END_STREAM`), invoke the user's
-stream fun with a `Send/2` callback, then return the updated
-conn state. If the handler never finished the stream explicitly,
-we close it with an empty `END_STREAM` DATA frame.
+Send the response HEADERS (no `END_STREAM`) to the conn process,
+invoke the user's stream fun with a `Send/2` callback, and ensure
+the stream is closed by the time we return. Runs in the worker
+process; every frame is synchronously round-tripped through the
+conn (which owns HPACK encoder state and serialises wire writes).
 """.
 -spec run(
-    State :: term(),
+    pid(),
+    pos_integer(),
     roadrunner_http:status(),
     roadrunner_http:headers(),
     roadrunner_handler:stream_fun()
-) -> term().
-run(State0, Status, Headers, Fun) ->
-    State1 = roadrunner_conn_loop_http2:send_response_headers(
-        State0, Status, Headers, false
-    ),
-    put(?STATE_KEY, State1),
+) -> ok.
+run(ConnPid, StreamId, Status, Headers, Fun) ->
+    sync_send_headers(ConnPid, StreamId, Status, Headers, false),
     erase(?FIN_KEY),
-    Send = fun do_send/2,
+    Send = fun(Data, FinFlag) -> do_send(ConnPid, StreamId, Data, FinFlag) end,
     _ = Fun(Send),
     case erase(?FIN_KEY) of
         true -> ok;
-        _ -> do_send(<<>>, fin)
+        _ -> do_send(ConnPid, StreamId, <<>>, fin)
     end,
-    erase(?STATE_KEY).
+    ok.
 
-do_send(Data, nofin) ->
+do_send(ConnPid, StreamId, Data, nofin) ->
     case iolist_size(Data) of
         0 ->
             ok;
         _ ->
-            send_body(iolist_to_binary(Data), false),
+            sync_send_data(ConnPid, StreamId, iolist_to_binary(Data), false),
             ok
     end;
-do_send(Data, fin) ->
-    send_body(iolist_to_binary(Data), true),
+do_send(ConnPid, StreamId, Data, fin) ->
+    sync_send_data(ConnPid, StreamId, iolist_to_binary(Data), true),
     put(?FIN_KEY, true),
     ok;
-do_send(Data, {fin, Trailers}) ->
+do_send(ConnPid, StreamId, Data, {fin, Trailers}) ->
     case iolist_size(Data) of
         0 -> ok;
-        _ -> send_body(iolist_to_binary(Data), false)
+        _ -> sync_send_data(ConnPid, StreamId, iolist_to_binary(Data), false)
     end,
-    State0 = get(?STATE_KEY),
-    State1 = roadrunner_conn_loop_http2:send_trailers(State0, Trailers),
-    put(?STATE_KEY, State1),
+    sync_send_trailers(ConnPid, StreamId, Trailers),
     put(?FIN_KEY, true),
     ok.
 
-send_body(Bin, EndStream) ->
-    State0 = get(?STATE_KEY),
-    State1 = roadrunner_conn_loop_http2:send_data_sync(State0, Bin, EndStream),
-    put(?STATE_KEY, State1).
+sync_send_headers(ConnPid, StreamId, Status, Headers, EndStream) ->
+    sync(ConnPid, fun(Ref) ->
+        _ = (ConnPid ! {h2_send_headers, self(), Ref, StreamId, Status, Headers, EndStream}),
+        ok
+    end).
+
+sync_send_data(ConnPid, StreamId, Bin, EndStream) ->
+    sync(ConnPid, fun(Ref) ->
+        _ = (ConnPid ! {h2_send_data, self(), Ref, StreamId, Bin, EndStream}),
+        ok
+    end).
+
+sync_send_trailers(ConnPid, StreamId, Trailers) ->
+    sync(ConnPid, fun(Ref) ->
+        _ = (ConnPid ! {h2_send_trailers, self(), Ref, StreamId, Trailers}),
+        ok
+    end).
+
+sync(_ConnPid, SendFun) ->
+    Ref = make_ref(),
+    ok = SendFun(Ref),
+    receive
+        {h2_send_ack, Ref} -> ok;
+        {h2_stream_reset, _StreamId} -> exit(stream_reset)
+    end.

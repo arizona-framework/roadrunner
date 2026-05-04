@@ -49,6 +49,18 @@ handle(#{target := ~"/stream/many"} = Req) ->
         end},
         Req
     };
+handle(#{target := ~"/stream/slow"} = Req) ->
+    %% Pauses between emissions so a test can race a peer RST in.
+    %% The Send call after the sleep should return via
+    %% `{h2_stream_reset, _}` (worker's `sync/2` exit branch).
+    {
+        {stream, 200, [], fun(Send) ->
+            Send(~"a", nofin),
+            timer:sleep(200),
+            Send(~"b", fin)
+        end},
+        Req
+    };
 handle(#{target := ~"/stream/large"} = Req) ->
     %% 100 KiB across two emissions — triggers flow-control
     %% blocking when send window is artificially shrunk.
@@ -67,6 +79,13 @@ handle(#{target := ~"/websocket"} = Req) ->
     {{websocket, some_module, state}, Req};
 handle(#{target := ~"/crash"} = _Req) ->
     error(boom);
+handle(#{target := ~"/badshape"} = Req) ->
+    %% Returns a malformed `{stream, ...}` response — the worker's
+    %% `emit_handler_response/3` clauses won't match (the trailing
+    %% element isn't a function), so the worker exits with a
+    %% function_clause error and the conn aborts the stream with
+    %% RST_STREAM(INTERNAL_ERROR).
+    {{stream, 200, [], not_a_function}, Req};
 handle(#{target := ~"/large50k"} = Req) ->
     {{200, [], binary:copy(<<"x">>, 50_000)}, Req};
 handle(#{target := ~"/large100k"} = Req) ->
