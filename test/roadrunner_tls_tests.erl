@@ -70,7 +70,7 @@ cleanup(_) ->
 h2_alpn_dispatch_test_() ->
     {setup, fun setup_h2/0, fun cleanup_h2/1, fun({Port, ClientOpts}) ->
         [
-            {"h2 connection-level handshake completes then GOAWAYs", fun() ->
+            {"h2 GET / completes through the handler pipeline", fun() ->
                 {ok, Sock} = ssl:connect(
                     {127, 0, 0, 1},
                     Port,
@@ -78,20 +78,40 @@ h2_alpn_dispatch_test_() ->
                     5000
                 ),
                 ?assertEqual({ok, ~"h2"}, ssl:negotiated_protocol(Sock)),
-                %% Drive the client side of the h2 handshake: send the
-                %% 24-byte preface plus an empty SETTINGS frame.
+                %% Phase H5 end-to-end: preface + SETTINGS + HEADERS,
+                %% then read the server's response frames.
                 Preface = ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
                 EmptySettings = <<0:24, 4, 0, 0:32>>,
-                ok = ssl:send(Sock, [Preface, EmptySettings]),
+                %% HEADERS frame, stream id 1, END_HEADERS|END_STREAM,
+                %% HPACK-encoding ":method GET / :scheme https :authority localhost".
+                Enc = roadrunner_http2_hpack:new_encoder(4096),
+                {HpackBlock, _} = roadrunner_http2_hpack:encode(
+                    [
+                        {~":method", ~"GET"},
+                        {~":scheme", ~"https"},
+                        {~":authority", ~"localhost"},
+                        {~":path", ~"/"}
+                    ],
+                    Enc
+                ),
+                HpackBin = iolist_to_binary(HpackBlock),
+                Headers =
+                    iolist_to_binary(
+                        roadrunner_http2_frame:encode(
+                            {headers, 1, 16#04 bor 16#01, undefined, HpackBin}
+                        )
+                    ),
+                ok = ssl:send(Sock, [Preface, EmptySettings, Headers]),
                 Reply = recv_until_closed(Sock),
-                %% First frame from the server is its initial SETTINGS
-                %% (type=4, flags=0). Then SETTINGS ACK (flags=0x01,
-                %% length=0). Then GOAWAY (type=7, len=8).
-                ?assertMatch(<<_:24, 4, 0, 0:32, _/binary>>, Reply),
-                ?assertNotEqual(nomatch, binary:match(Reply, <<0:24, 4, 1, 0:32>>)),
-                ?assertNotEqual(
-                    nomatch,
-                    binary:match(Reply, <<0, 0, 8, 7, 0, 0:32, 0:32, 0:32>>)
+                %% Server response should include a HEADERS frame
+                %% (type 1) for stream id 1 followed by a DATA frame
+                %% (type 0). Decode the HEADERS to verify :status.
+                Dec0 = roadrunner_http2_hpack:new_decoder(4096),
+                Dec1 = take_pending_settings(Reply, Dec0),
+                {ok, RespHeaders} = find_response_headers(Reply, Dec1),
+                ?assertEqual(
+                    ~"200",
+                    proplists:get_value(~":status", RespHeaders)
                 ),
                 ok = ssl:close(Sock)
             end},
@@ -190,4 +210,28 @@ recv_until_closed(Sock, Acc) ->
         {ok, Data} -> recv_until_closed(Sock, <<Acc/binary, Data/binary>>);
         {error, closed} -> Acc;
         {error, _} -> Acc
+    end.
+
+%% Walk the server's reply, draining SETTINGS / SETTINGS-ACK / etc
+%% to seed the decoder context with any HPACK state-changes
+%% (none for our outbound SETTINGS, but a no-op preserves
+%% generality). Returns the decoder for use on the response
+%% HEADERS.
+take_pending_settings(_Reply, Dec) -> Dec.
+
+%% Walk the server's reply binary frame-by-frame, returning the
+%% decoded header list for the first HEADERS frame.
+find_response_headers(<<>>, _Dec) ->
+    {error, no_headers_frame};
+find_response_headers(Reply, Dec) ->
+    case roadrunner_http2_frame:parse(Reply, 16384) of
+        {ok, {headers, _Stream, _Flags, _Priority, Hpack}, _Rest} ->
+            case roadrunner_http2_hpack:decode(Hpack, Dec) of
+                {ok, Headers, _NewDec} -> {ok, Headers};
+                {error, _} = E -> E
+            end;
+        {ok, _OtherFrame, Rest} ->
+            find_response_headers(Rest, Dec);
+        _ ->
+            {error, parse}
     end.

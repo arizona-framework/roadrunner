@@ -31,7 +31,7 @@ keep compiling unchanged.
 -type headers() :: [{Name :: binary(), Value :: binary()}].
 -type status() :: 100..599.
 -type redirect_status() :: 300..399.
--type version() :: {1, 0} | {1, 1}.
+-type version() :: {1, 0} | {1, 1} | {2, 0}.
 
 -define(DAY_NAMES, {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}).
 -define(MONTH_NAMES,
