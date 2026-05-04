@@ -43,10 +43,14 @@ response (`400`, `414`, `431`, etc.).
 -define(UNSAFE_BYTES_KEY, {?MODULE, unsafe_bytes_cp}).
 -define(LF_KEY, {?MODULE, lf_cp}).
 
--type version() :: {1, 0} | {1, 1}.
--type headers() :: [{Name :: binary(), Value :: binary()}].
--type status() :: 100..599.
--type redirect_status() :: 300..399.
+%% Re-exported as type aliases from `roadrunner_http` so existing
+%% callers using `roadrunner_http1:request()` / `:headers()` /
+%% `:status()` / `:redirect_status()` / `:version()` keep compiling.
+%% New code calls the shared module directly.
+-type version() :: roadrunner_http:version().
+-type headers() :: roadrunner_http:headers().
+-type status() :: roadrunner_http:status().
+-type redirect_status() :: roadrunner_http:redirect_status().
 -type cached_decisions() :: #{
     %% True iff `Transfer-Encoding: chunked` (case-insensitive). Hot path
     %% at body-framing time — saves a per-request lowercase scan.
@@ -762,29 +766,13 @@ response(Status, Headers, Body) when is_integer(Status, 100, 599) ->
     [status_line(Status), encode_headers(Headers), ~"\r\n", Body].
 
 -doc """
-Format the current UTC time as an IMF-fixdate per RFC 9110 §5.6.7
-— the canonical HTTP `Date` header format, e.g.
-`Sun, 06 Nov 1994 08:49:37 GMT`. Used by the dispatch layer to
-auto-inject the `Date` response header per RFC 9110 §6.6.1.
+Delegates to `roadrunner_http:http_date_now/0`. Kept here as a
+back-compat alias for callers using `roadrunner_http1:http_date_now/0`;
+new code should call the shared module directly.
 """.
--define(DAY_NAMES, {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}).
--define(MONTH_NAMES,
-    {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
-).
-
 -spec http_date_now() -> binary().
 http_date_now() ->
-    {{Y, M, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(
-        erlang:system_time(second), second
-    ),
-    DayName = element(calendar:day_of_the_week(Y, M, D), ?DAY_NAMES),
-    MonthName = element(M, ?MONTH_NAMES),
-    iolist_to_binary(
-        io_lib:format(
-            "~s, ~2..0B ~s ~4..0B ~2..0B:~2..0B:~2..0B GMT",
-            [DayName, D, MonthName, Y, H, Mi, S]
-        )
-    ).
+    roadrunner_http:http_date_now().
 
 %% Common status codes get a precomputed `HTTP/1.1 NNN Reason\r\n`
 %% binary — one binary literal vs the five-element iolist build
