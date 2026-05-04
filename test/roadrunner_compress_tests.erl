@@ -64,6 +64,85 @@ prefers_gzip_when_both_gzip_and_deflate_offered_test() ->
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)),
     ?assertEqual(iolist_to_binary(Body), zlib:gunzip(iolist_to_binary(OutBody))).
 
+%% ---- qvalue (RFC 9110 §12.5.3) tests ----
+
+qvalue_zero_excludes_encoding_test() ->
+    %% `gzip;q=0` is explicit refusal — must not engage gzip.
+    Req = req([{~"accept-encoding", ~"gzip;q=0"}]),
+    Body = big_body(),
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    ?assertEqual(undefined, header(~"content-encoding", Headers)).
+
+higher_qvalue_wins_when_gzip_lower_test() ->
+    %% deflate;q=0.8 beats gzip;q=0.5 — deflate engages despite the
+    %% gzip-preferred tie-break (tie-break only applies to equal q).
+    Req = req([{~"accept-encoding", ~"gzip;q=0.5, deflate;q=0.8"}]),
+    Body = big_body(),
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    ?assertEqual(~"deflate", header(~"content-encoding", Headers)),
+    ?assertEqual(iolist_to_binary(Body), zlib:uncompress(iolist_to_binary(OutBody))).
+
+equal_qvalues_tie_break_to_gzip_test() ->
+    Req = req([{~"accept-encoding", ~"gzip;q=0.5, deflate;q=0.5"}]),
+    Body = big_body(),
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
+
+wildcard_with_positive_qvalue_accepts_supported_test() ->
+    %% `*;q=1` covers any encoding the server supports — gzip wins
+    %% the tie-break.
+    Req = req([{~"accept-encoding", ~"*;q=1"}]),
+    Body = big_body(),
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
+
+wildcard_zero_excludes_unlisted_encodings_test() ->
+    %% `*;q=0` says "any encoding I didn't explicitly list is forbidden".
+    %% Without a positive gzip/deflate token, no compression engages.
+    Req = req([{~"accept-encoding", ~"*;q=0"}]),
+    Body = big_body(),
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    ?assertEqual(undefined, header(~"content-encoding", Headers)).
+
+explicit_token_overrides_wildcard_test() ->
+    %% `*;q=0, gzip;q=1` — the explicit gzip beats the wildcard refusal.
+    Req = req([{~"accept-encoding", ~"*;q=0, gzip;q=1"}]),
+    Body = big_body(),
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
+
+absent_qvalue_defaults_to_one_test() ->
+    %% `gzip` (no q) defaults to q=1 per RFC 9110 §12.5.3 — beats
+    %% `deflate;q=0.5`.
+    Req = req([{~"accept-encoding", ~"deflate;q=0.5, gzip"}]),
+    Body = big_body(),
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
+
+non_q_parameters_are_ignored_test() ->
+    %% `gzip;something=value` (not q=) — q defaults to 1, gzip wins.
+    Req = req([{~"accept-encoding", ~"gzip;level=fast"}]),
+    Body = big_body(),
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
+
+malformed_qvalue_falls_back_to_default_test() ->
+    %% `q=garbage` is unparseable — fall back to default 1.0 so the
+    %% encoding still engages (lenient handling of broken clients).
+    Req = req([{~"accept-encoding", ~"gzip;q=garbage"}]),
+    Body = big_body(),
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
+
 skips_when_response_already_encoded_test() ->
     %% Handler set Content-Encoding itself (e.g. served a pre-compressed asset).
     Req = req([{~"accept-encoding", ~"gzip"}]),

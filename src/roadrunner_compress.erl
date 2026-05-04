@@ -188,11 +188,15 @@ window_bits(deflate) -> 15.
 encoding_token(gzip) -> ~"gzip";
 encoding_token(deflate) -> ~"deflate".
 
-%% Pick the strongest supported encoding from `Accept-Encoding`. Ties
-%% resolve to gzip (see moduledoc rationale). `none` means no
-%% supported encoding was offered. Single-pass: short-circuits on
-%% gzip; remembers a deflate sighting and returns it only if no gzip
-%% was found.
+%% Pick the strongest supported encoding from `Accept-Encoding` per
+%% RFC 9110 §12.5.3. Each token may carry `;q=N` (0.0–1.0); `q=0`
+%% means explicit refusal. The wildcard `*` covers any encoding the
+%% server supports but we don't otherwise see listed. Default qvalue
+%% (no `;q=`) is 1.0. When two encodings tie on qvalue, gzip wins
+%% (see moduledoc rationale).
+%%
+%% Returned: `gzip | deflate | none`. `none` if neither has an
+%% effective q > 0.
 -spec negotiate_encoding(roadrunner_http1:request()) -> encoding().
 negotiate_encoding(Req) ->
     case roadrunner_req:header(~"accept-encoding", Req) of
@@ -200,20 +204,80 @@ negotiate_encoding(Req) ->
             none;
         Value ->
             Lower = roadrunner_bin:ascii_lowercase(Value),
-            select(binary:split(Lower, ~",", [global]), none)
+            %% Walk tokens once, recording per-encoding qvalues.
+            %% `Wildcard` covers any encoding name not seen; `Gzip`
+            %% / `Deflate` override the wildcard. `undefined` means
+            %% the encoding wasn't mentioned at all.
+            {Gzip, Deflate, Wildcard} =
+                walk_tokens(binary:split(Lower, ~",", [global]), undefined, undefined, undefined),
+            choose(effective_q(Gzip, Wildcard), effective_q(Deflate, Wildcard))
     end.
 
-%% `Best` is the best encoding seen so far (`none` initially, may
-%% become `deflate`). `gzip` returns immediately — nothing better is
-%% available.
--spec select([binary()], deflate | none) -> encoding().
-select([], Best) ->
-    Best;
-select([Token | Rest], Best) ->
-    case string:trim(Token) of
-        ~"gzip" -> gzip;
-        ~"deflate" -> select(Rest, deflate);
-        _ -> select(Rest, Best)
+-type qvalue() :: float() | undefined.
+
+%% `effective_q` resolves "what qvalue applies to this encoding" given
+%% the explicit value (if any) and the wildcard's value (if any).
+%% Explicit overrides wildcard (RFC 9110: a more specific entry wins).
+-spec effective_q(qvalue(), qvalue()) -> float().
+effective_q(undefined, undefined) -> 0.0;
+effective_q(undefined, Wildcard) -> Wildcard;
+effective_q(Q, _) -> Q.
+
+-spec choose(float(), float()) -> encoding().
+choose(GzipQ, DeflateQ) when GzipQ > 0.0, GzipQ >= DeflateQ -> gzip;
+choose(_GzipQ, DeflateQ) when DeflateQ > 0.0 -> deflate;
+choose(_, _) -> none.
+
+%% Walk the comma-split token list once, accumulating per-encoding
+%% qvalues. Unrecognized encoding names (br, identity, etc.) are
+%% ignored — they don't affect the gzip/deflate pick.
+-spec walk_tokens([binary()], qvalue(), qvalue(), qvalue()) ->
+    {qvalue(), qvalue(), qvalue()}.
+walk_tokens([], Gzip, Deflate, Wildcard) ->
+    {Gzip, Deflate, Wildcard};
+walk_tokens([Token | Rest], Gzip, Deflate, Wildcard) ->
+    {Name, Q} = parse_token(Token),
+    case Name of
+        ~"gzip" -> walk_tokens(Rest, Q, Deflate, Wildcard);
+        ~"deflate" -> walk_tokens(Rest, Gzip, Q, Wildcard);
+        ~"*" -> walk_tokens(Rest, Gzip, Deflate, Q);
+        _ -> walk_tokens(Rest, Gzip, Deflate, Wildcard)
+    end.
+
+%% Parse one `name[;q=value]` token. Other parameters (`;level=fast`
+%% and similar — RFC allows them though they're rarely used for
+%% Accept-Encoding) are ignored; only `q=` is recognized.
+-spec parse_token(binary()) -> {binary(), float()}.
+parse_token(Token) ->
+    case binary:split(Token, ~";", [global]) of
+        [Name] ->
+            {string:trim(Name), 1.0};
+        [Name | Params] ->
+            {string:trim(Name), find_q(Params, 1.0)}
+    end.
+
+-spec find_q([binary()], float()) -> float().
+find_q([], Default) ->
+    Default;
+find_q([Param | Rest], Default) ->
+    case string:trim(Param) of
+        <<"q=", QBin/binary>> -> parse_q(QBin, Default);
+        _ -> find_q(Rest, Default)
+    end.
+
+%% Parse the qvalue itself. RFC 9110 §12.4.2 allows 0, 0.NNN, 1, or
+%% 1.000 (max 3 decimals). Anything malformed falls back to the
+%% default.
+-spec parse_q(binary(), float()) -> float().
+parse_q(QBin, Default) ->
+    case string:to_float(QBin) of
+        {Float, _} when Float >= 0.0, Float =< 1.0 -> Float;
+        _ ->
+            case string:to_integer(QBin) of
+                {0, _} -> 0.0;
+                {1, _} -> 1.0;
+                _ -> Default
+            end
     end.
 
 -spec has_header(binary(), roadrunner_http1:headers()) -> boolean().
