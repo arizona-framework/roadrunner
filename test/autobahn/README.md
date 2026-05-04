@@ -11,17 +11,15 @@ fuzzingclient. Coverage:
 - **5.x — Fragmentation**: continuation handling, control-in-the-middle, fragment ordering.
 - **6.x — UTF-8**: invalid byte sequences in text frames trigger 1007.
 - **7.x — Close codes**: protocol-level close handshake.
+- **9.x — Performance**: large payloads up to 16 MB.
 - **10.x — Misc limits**: invalid masking, oversize control frames.
-- **12.x — `permessage-deflate` compression**: round-trip various payload sizes.
-- **13.x — `permessage-deflate` parameters**: `*_max_window_bits`, `*_no_context_takeover`.
+- **12.x — `permessage-deflate` compression**: round-trip various
+  payload sizes and compression ratios.
+- **13.x — `permessage-deflate` parameters**: `*_max_window_bits`,
+  `*_no_context_takeover`, auto-fragment cases.
 
-Excluded by default:
-
-- **9.x** — performance / very-large payloads. Slow; not a correctness concern.
-- **12.1.x / 12.2.x** — mid-fragment compression scenarios where the
-  client compresses every fragment rather than the whole message;
-  Roadrunner follows the more common interpretation (compress the
-  whole message, RSV1=1 only on the first fragment) per RFC 7692 §6.1.
+The full suite (~500 cases) is enabled. Roadrunner passes 100 %
+strict with zero exclusions.
 
 ## Run
 

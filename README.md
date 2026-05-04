@@ -158,8 +158,10 @@ WebSocket conformance lives in `test/autobahn/`. Run
 [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
 fuzzingclient against a roadrunner echo listener; the harness
 prints a pass/fail summary and the HTML report path. Roadrunner
-passes 100 % strict on the cases enabled by default
-(`fuzzingclient.json`).
+passes 100 % strict on the **full suite** with zero exclusions —
+every category from basic framing through fragmentation, UTF-8,
+close handling, oversize control frames, large-payload performance
+(9.x), and the full `permessage-deflate` matrix (12.x + 13.x).
 
 ## Comparison with cowboy and elli
 
