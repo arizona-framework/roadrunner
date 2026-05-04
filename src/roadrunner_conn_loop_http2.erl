@@ -1,12 +1,15 @@
 -module(roadrunner_conn_loop_http2).
 -moduledoc """
-HTTP/2 (RFC 9113) connection process — Phase H5.
+HTTP/2 (RFC 9113) connection process.
 
 Serial single-stream mode: handshake completes, then the conn
 loops on inbound frames, dispatching one stream at a time
 through the existing `roadrunner_conn:resolve_handler/2` +
 `roadrunner_middleware` pipeline, emitting the response, and
-returning to the loop for the next stream.
+returning to the loop for the next stream. Frames are read in
+active-mode (`[{active, once}]`) so worker messages from
+Phase H8b's per-stream dispatch will share the same mailbox
+without deadlocking the conn against `recv/3`.
 
 `SETTINGS_MAX_CONCURRENT_STREAMS = 1` is advertised to
 discourage clients from opening overlapping streams; if a second
@@ -39,12 +42,12 @@ The full frame demux + multiplexing arrives in Phase H8.
 -define(PREFACE, ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
 -define(PREFACE_LEN, 24).
 
-%% Read-deadline cap for the handshake. The frame loop uses
-%% per-recv timeouts that are recomputed against an absolute
-%% deadline — slow clients can't tarpit us.
--define(HANDSHAKE_TIMEOUT, 10_000).
--define(IDLE_TIMEOUT, 30_000).
--define(RECV_CHUNK, 16_384).
+%% Read-deadline caps for the handshake and idle states. Tests
+%% override via `persistent_term:put/2` on `{?MODULE, handshake_timeout}`
+%% / `{?MODULE, idle_timeout}` so the timeout branches are exercisable
+%% without forcing 10–30 s waits per case.
+-define(HANDSHAKE_TIMEOUT_DEFAULT, 10_000).
+-define(IDLE_TIMEOUT_DEFAULT, 30_000).
 
 %% RFC 9113 §6.5.2 default `MAX_FRAME_SIZE`. Clients can advertise
 %% larger values; we honor the smaller of theirs and our cap. For
@@ -77,6 +80,14 @@ The full frame demux + multiplexing arrives in Phase H8.
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
     start_mono :: integer(),
     scheme :: http | https,
+    %% Active-mode message tags for this transport (cached at
+    %% `enter/5` time so the receive loop doesn't have to look them
+    %% up per iteration). For real TCP this is `{tcp, tcp_closed,
+    %% tcp_error}`; for the fake test backend it's
+    %% `{roadrunner_fake_data, _closed, _error}`.
+    msg_data :: atom(),
+    msg_closed :: atom(),
+    msg_error :: atom(),
     %% Inbound bytes still to parse.
     buffer = <<>> :: binary(),
     %% HPACK contexts. Decoder mutates per inbound HEADERS;
@@ -131,6 +142,7 @@ slot and firing `[roadrunner, listener, conn_close]` telemetry.
 enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
     proc_lib:set_label({roadrunner_conn_loop_http2, ListenerName, Peer}),
     Scheme = roadrunner_conn:scheme(Socket),
+    {Data, Closed, Error} = roadrunner_transport:messages(Socket),
     State = #loop{
         socket = Socket,
         proto_opts = ProtoOpts,
@@ -138,6 +150,9 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
         peer = Peer,
         start_mono = StartMono,
         scheme = Scheme,
+        msg_data = Data,
+        msg_closed = Closed,
+        msg_error = Error,
         hpack_dec = roadrunner_http2_hpack:new_decoder(4096),
         hpack_enc = roadrunner_http2_hpack:new_encoder(4096)
     },
@@ -150,11 +165,11 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
 -spec handshake(#loop{}) -> no_return().
 handshake(State) ->
     %% Send failures are silently ignored throughout — if the wire
-    %% has gone away, the next `recv` will surface the error and
-    %% we'll fall to `exit_clean` cleanly. Keeping per-call error
+    %% has gone away, the next mailbox event surfaces the error and
+    %% we fall to `exit_clean` cleanly. Keeping per-call error
     %% branches added a forest of unreachable paths.
     _ = send(State, server_settings_frame()),
-    read_preface(State).
+    handshake_phase_preface(State).
 
 -spec server_settings_frame() -> iodata().
 server_settings_frame() ->
@@ -166,66 +181,143 @@ server_settings_frame() ->
         {settings, 0, [{3, 1}, {5, ?MAX_FRAME_SIZE}]}
     ).
 
--spec read_preface(#loop{}) -> no_return().
-read_preface(#loop{socket = Socket} = State) ->
-    case roadrunner_transport:recv(Socket, ?PREFACE_LEN, ?HANDSHAKE_TIMEOUT) of
-        {ok, ?PREFACE} -> read_client_settings(State);
-        _ -> exit_clean(State)
-    end.
+-spec handshake_timeout() -> non_neg_integer().
+handshake_timeout() ->
+    persistent_term:get({?MODULE, handshake_timeout}, ?HANDSHAKE_TIMEOUT_DEFAULT).
 
--spec read_client_settings(#loop{}) -> no_return().
-read_client_settings(State) ->
-    case read_one_frame(State, ?HANDSHAKE_TIMEOUT) of
-        {ok, {settings, Flags, _Params}, State1} when (Flags band 1) =:= 0 ->
-            %% Non-ACK SETTINGS — apply (we don't enforce values
-            %% beyond what the codec already validated) and ACK.
+-spec idle_timeout() -> non_neg_integer().
+idle_timeout() ->
+    persistent_term:get({?MODULE, idle_timeout}, ?IDLE_TIMEOUT_DEFAULT).
+
+%% RFC 9113 §3.4 — the first 24 bytes from the client must match
+%% the preface. We accumulate bytes through active-once events
+%% until at least 24 are buffered, then either advance to the
+%% SETTINGS phase or exit on mismatch.
+-spec handshake_phase_preface(#loop{}) -> no_return().
+handshake_phase_preface(#loop{buffer = Buf} = State) when byte_size(Buf) >= ?PREFACE_LEN ->
+    <<Head:?PREFACE_LEN/binary, Rest/binary>> = Buf,
+    case Head of
+        ?PREFACE ->
+            handshake_phase_settings(State#loop{buffer = Rest});
+        _ ->
+            exit_clean(State)
+    end;
+handshake_phase_preface(State) ->
+    handshake_recv(State, fun handshake_phase_preface/1).
+
+%% RFC 9113 §3.4 — the first frame after the preface must be a
+%% non-ACK SETTINGS. Anything else is a connection error.
+-spec handshake_phase_settings(#loop{}) -> no_return().
+handshake_phase_settings(#loop{buffer = Buf} = State) ->
+    case roadrunner_http2_frame:parse(Buf, ?MAX_FRAME_SIZE) of
+        {ok, {settings, Flags, _Params}, Rest} when (Flags band 1) =:= 0 ->
+            State1 = State#loop{buffer = Rest},
             _ = send(State1, roadrunner_http2_frame:encode({settings, 1, []})),
             frame_loop(State1);
-        _ ->
-            %% RFC 9113 §3.4: the client preface MUST be followed
-            %% by a SETTINGS frame. Anything else is a connection
-            %% error.
+        {ok, _, _} ->
+            _ = send_goaway(State, protocol_error),
+            exit_clean(State);
+        {more, _Need} ->
+            handshake_recv(State, fun handshake_phase_settings/1);
+        {error, _} ->
             _ = send_goaway(State, protocol_error),
             exit_clean(State)
     end.
 
-%% =============================================================================
-%% Frame loop
-%% =============================================================================
+%% Block on the next active-once event during the handshake;
+%% timeout is the tighter handshake deadline rather than the idle
+%% deadline since slow handshake clients are usually misuse /
+%% probes rather than legitimate.
+-spec handshake_recv(#loop{}, fun((#loop{}) -> no_return())) -> no_return().
+handshake_recv(
+    #loop{
+        socket = Sock,
+        msg_data = MData,
+        msg_closed = MClosed,
+        msg_error = MError,
+        buffer = Buf
+    } = State,
+    Cont
+) ->
+    %% Setopts can fail if the transport went away between events
+    %% — ignore the return value and let the next receive surface
+    %% the closure as `{MClosed, _}` / `{MError, _, _}` or time
+    %% out cleanly. The defensive `{error, _}` arm was unreachable
+    %% in tests and only delayed exit_clean by one mailbox poll.
+    _ = roadrunner_transport:setopts(Sock, [{active, once}]),
+    receive
+        {MData, _, Bytes} ->
+            Cont(State#loop{buffer = <<Buf/binary, Bytes/binary>>});
+        {MClosed, _} ->
+            exit_clean(State);
+        {MError, _, _} ->
+            exit_clean(State)
+    after handshake_timeout() ->
+        exit_clean(State)
+    end.
 
+%% =============================================================================
+%% Frame loop — active-mode socket receive
+%% =============================================================================
+%%
+%% After the handshake the conn switches to active-once mode and
+%% drives every iteration off the process mailbox. This is the
+%% groundwork Phase H8b's per-stream workers will build on —
+%% without it the conn would block in `recv/3` while workers piled
+%% up pending-send messages it couldn't process, deadlocking the
+%% connection.
+%%
+%% Mailbox events handled:
+%% - `{Data, _, Bytes}` — frame bytes from the peer (parse + dispatch)
+%% - `{Closed, _}` — peer half-closed
+%% - `{Error, _, _}` — transport error
+%% - timeout — idle conn, GOAWAY + close
+%%
+%% After consuming bytes we drain `process_frames/1` until the
+%% buffer no longer contains a complete frame; only then do we
+%% re-arm `[{active, once}]`.
+
+%% Continuation point after every frame dispatch (and the entry
+%% point from the handshake): drains the buffer through
+%% `handle_frame/2` until a partial frame remains, at which point
+%% we re-arm `[{active, once}]` and block in `recv_more/1`.
 -spec frame_loop(#loop{}) -> no_return().
-frame_loop(State) ->
-    case read_one_frame(State, ?IDLE_TIMEOUT) of
-        {ok, Frame, State1} ->
-            handle_frame(Frame, State1);
-        %% Any failure — parse error, recv timeout, or peer close —
-        %% gets a best-effort GOAWAY (the peer may already be gone)
-        %% and a clean process exit. We don't try to distinguish
-        %% "they hung up" vs "they sent garbage": both end the
-        %% connection.
-        {error, _Reason} ->
-            _ = send_goaway(State, protocol_error),
-            exit_clean(State)
-    end.
-
--spec read_one_frame(#loop{}, non_neg_integer()) ->
-    {ok, roadrunner_http2_frame:frame(), #loop{}} | {error, term()}.
-read_one_frame(#loop{socket = Socket, buffer = Buf} = State, Timeout) ->
+frame_loop(#loop{buffer = Buf} = State) ->
     case roadrunner_http2_frame:parse(Buf, ?MAX_FRAME_SIZE) of
         {ok, Frame, Rest} ->
-            {ok, Frame, State#loop{buffer = Rest}};
+            handle_frame(Frame, State#loop{buffer = Rest});
         {more, _Need} ->
-            case roadrunner_transport:recv(Socket, 0, Timeout) of
-                {ok, More} ->
-                    read_one_frame(
-                        State#loop{buffer = <<Buf/binary, More/binary>>},
-                        Timeout
-                    );
-                {error, _} = E ->
-                    E
-            end;
-        {error, _} = E ->
-            E
+            arm_and_recv(State);
+        {error, _} ->
+            _ = send_goaway(State, protocol_error),
+            exit_clean(State)
+    end.
+
+-spec arm_and_recv(#loop{}) -> no_return().
+arm_and_recv(#loop{socket = Sock} = State) ->
+    _ = roadrunner_transport:setopts(Sock, [{active, once}]),
+    recv_more(State).
+
+-spec recv_more(#loop{}) -> no_return().
+recv_more(
+    #loop{
+        msg_data = MData,
+        msg_closed = MClosed,
+        msg_error = MError,
+        buffer = Buf
+    } = State
+) ->
+    receive
+        {MData, _, Bytes} ->
+            frame_loop(State#loop{buffer = <<Buf/binary, Bytes/binary>>});
+        {MClosed, _} ->
+            exit_clean(State);
+        {MError, _, _} ->
+            _ = send_goaway(State, protocol_error),
+            exit_clean(State)
+    after idle_timeout() ->
+        _ = send_goaway(State, protocol_error),
+        exit_clean(State)
     end.
 
 %% =============================================================================
@@ -658,20 +750,54 @@ consume_send_window(#loop{conn_send_window = ConnW} = State, Stream, N) ->
     }.
 
 %% Read frames until a WINDOW_UPDATE that grows our usable window
-%% arrives. The handler set is the same as the main `frame_loop`
-%% but only WINDOW_UPDATE / SETTINGS / PING make progress; the
-%% rest are sequenced in normally and resume here on the next
-%% receive (we re-call `stream_data_chunks` after applying the
-%% update). Returns the updated state once the windows reopen and
-%% the body has been fully sent.
+%% arrives. Same dispatch shape as `frame_loop/1` (drain buffer,
+%% otherwise arm + receive) but routes the parsed frame through
+%% `handle_frame_during_send/4` instead of the main `handle_frame/2`
+%% — the subset of frames that may legally arrive while a stream
+%% is stalled mid-response is narrower than the full set, and the
+%% return shape is "resume `stream_data_chunks/3`" rather than
+%% "loop back".
 -spec wait_for_window(binary(), boolean(), #loop{}) -> #loop{}.
-wait_for_window(Body, EndStream, State) ->
-    case read_one_frame(State, ?IDLE_TIMEOUT) of
-        {ok, Frame, State1} ->
-            handle_frame_during_send(Frame, Body, EndStream, State1);
+wait_for_window(Body, EndStream, #loop{buffer = Buf} = State) ->
+    case roadrunner_http2_frame:parse(Buf, ?MAX_FRAME_SIZE) of
+        {ok, Frame, Rest} ->
+            handle_frame_during_send(Frame, Body, EndStream, State#loop{buffer = Rest});
+        {more, _Need} ->
+            arm_and_recv_during_send(Body, EndStream, State);
         {error, _} ->
             _ = send_goaway(State, protocol_error),
             exit_clean(State)
+    end.
+
+-spec arm_and_recv_during_send(binary(), boolean(), #loop{}) -> #loop{}.
+arm_and_recv_during_send(Body, EndStream, #loop{socket = Sock} = State) ->
+    _ = roadrunner_transport:setopts(Sock, [{active, once}]),
+    recv_more_during_send(Body, EndStream, State).
+
+-spec recv_more_during_send(binary(), boolean(), #loop{}) -> #loop{}.
+recv_more_during_send(
+    Body,
+    EndStream,
+    #loop{
+        msg_data = MData,
+        msg_closed = MClosed,
+        msg_error = MError,
+        buffer = Buf
+    } = State
+) ->
+    receive
+        {MData, _, Bytes} ->
+            wait_for_window(Body, EndStream, State#loop{
+                buffer = <<Buf/binary, Bytes/binary>>
+            });
+        {MClosed, _} ->
+            exit_clean(State);
+        {MError, _, _} ->
+            _ = send_goaway(State, protocol_error),
+            exit_clean(State)
+    after idle_timeout() ->
+        _ = send_goaway(State, protocol_error),
+        exit_clean(State)
     end.
 
 %% Same dispatch as `handle_frame/2` but for the subset of frame

@@ -33,7 +33,10 @@ reuse / scheduling races.
     priority_during_blocked_send_is_ignored/1,
     conn_window_update_overflow_during_blocked_send/1,
     stream_window_update_overflow_during_blocked_send/1,
-    blocked_send_recv_error_exits_clean/1
+    blocked_send_recv_error_exits_clean/1,
+    blocked_send_garbage_frame_triggers_goaway/1,
+    blocked_send_peer_closes_exits_clean/1,
+    blocked_send_idle_timeout_emits_goaway/1
 ]).
 
 -define(PREFACE, ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
@@ -57,7 +60,10 @@ all() ->
         priority_during_blocked_send_is_ignored,
         conn_window_update_overflow_during_blocked_send,
         stream_window_update_overflow_during_blocked_send,
-        blocked_send_recv_error_exits_clean
+        blocked_send_recv_error_exits_clean,
+        blocked_send_garbage_frame_triggers_goaway,
+        blocked_send_peer_closes_exits_clean,
+        blocked_send_idle_timeout_emits_goaway
     ].
 
 init_per_testcase(_Case, Config) ->
@@ -254,17 +260,53 @@ stream_window_update_overflow_during_blocked_send(_Config) ->
     wait_down(Pid, Ref).
 
 blocked_send_recv_error_exits_clean(_Config) ->
-    %% While stalled mid-response, the peer drops the connection.
+    %% While stalled mid-response, the transport raises an error.
     %% The server should send GOAWAY and exit cleanly.
     {Pid, Ref, ConnPid} = setup_blocked_send(),
-    receive
-        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
-            ConnPid ! {roadrunner_fake_recv_reply, {error, closed}}
-    after 500 -> ct:fail(no_recv_request)
-    end,
+    ConnPid ! {roadrunner_fake_error, {fake, self()}, closed},
     expect_send_type(7),
     expect_close(),
     wait_down(Pid, Ref).
+
+blocked_send_garbage_frame_triggers_goaway(_Config) ->
+    %% Garbage frame bytes during a stalled send — the
+    %% `wait_for_window/3` parse falls to the `{error, _}` arm.
+    {Pid, Ref, ConnPid} = setup_blocked_send(),
+    drain_all_sends(),
+    %% Length 0, type 99 (unknown), flags 0, R=0, stream 0.
+    serve_recv(ConnPid, <<0:24, 99, 0, 0:32>>),
+    expect_send_type(7),
+    expect_close(),
+    wait_down(Pid, Ref).
+
+blocked_send_peer_closes_exits_clean(_Config) ->
+    %% Peer half-closes during a stalled send — `recv_more_during_send`
+    %% takes the `{MClosed, _}` arm and exits without GOAWAY.
+    {Pid, Ref, ConnPid} = setup_blocked_send(),
+    ConnPid ! {roadrunner_fake_closed, {fake, self()}},
+    expect_close(),
+    wait_down(Pid, Ref).
+
+blocked_send_idle_timeout_emits_goaway(_Config) ->
+    %% Stalled-send waits past the idle deadline. `idle_timeout()`
+    %% is evaluated at receive entry, so we lower the deadline
+    %% AFTER the body drain finishes and then poke the conn with
+    %% an unknown-stream WINDOW_UPDATE — that's silently ignored
+    %% by `handle_frame_during_send/4` and forces a re-entry into
+    %% `recv_more_during_send/3`, which reads the new 100-ms
+    %% timeout and fires shortly after.
+    {Pid, Ref, ConnPid} = setup_blocked_send(),
+    drain_all_sends(),
+    persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 100),
+    try
+        Wu = encode_frame({window_update, 99, 1024}),
+        serve_recv(ConnPid, Wu),
+        expect_send_type(7),
+        expect_close(),
+        wait_down(Pid, Ref)
+    after
+        persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
+    end.
 
 %% =============================================================================
 %% Helpers
@@ -395,21 +437,18 @@ drain_until_n_bytes_loop(Got, Target) ->
     after 500 -> ok
     end.
 
+%% After Phase H8a's switch to active-mode receive, the conn
+%% process arms `[{active, once}]` between iterations and reads
+%% bytes off its mailbox. We deliver wire bytes by sending a
+%% `roadrunner_fake_data` message directly to the conn pid. The
+%% old recv-request/reply pattern no longer fires.
 serve_recv(ConnPid, Data) ->
-    serve_recv_loop(ConnPid, iolist_to_binary([Data])).
+    drain_setopts(),
+    ConnPid ! {roadrunner_fake_data, {fake, self()}, iolist_to_binary([Data])},
+    ok.
 
-serve_recv_loop(_ConnPid, <<>>) ->
-    ok;
-serve_recv_loop(ConnPid, Buf) ->
+drain_setopts() ->
     receive
-        {roadrunner_fake_recv, ConnPid, Len, _Timeout} ->
-            Take =
-                case Len of
-                    0 -> byte_size(Buf);
-                    _ -> min(Len, byte_size(Buf))
-                end,
-            <<Chunk:Take/binary, Rest/binary>> = Buf,
-            ConnPid ! {roadrunner_fake_recv_reply, {ok, Chunk}},
-            serve_recv_loop(ConnPid, Rest)
-    after 500 -> ct:fail(no_recv_request)
+        {roadrunner_fake_setopts, _, _} -> drain_setopts()
+    after 0 -> ok
     end.

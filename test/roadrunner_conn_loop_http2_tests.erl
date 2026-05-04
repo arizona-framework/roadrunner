@@ -49,7 +49,17 @@ all_test_() ->
         fun router_404_returns_not_found/0,
         fun data_without_end_stream_continues_loop/0,
         fun continuation_without_end_headers_continues_loop/0,
-        fun idle_timeout_emits_goaway/0
+        fun idle_timeout_emits_goaway/0,
+        fun settings_ack_first_frame_triggers_goaway/0,
+        fun handshake_closed_during_partial_preface/0,
+        fun handshake_error_during_partial_preface/0,
+        fun handshake_timeout_during_partial_preface/0,
+        fun frame_loop_parse_error_triggers_goaway/0,
+        fun runtime_transport_error_triggers_goaway/0,
+        fun runtime_idle_timeout_emits_goaway/0,
+        fun rst_stream_active_stream_synced/0,
+        fun stream_window_update_grows_window_synced/0,
+        fun rst_stream_unknown_stream_ignored/0
     ],
     [{spawn, F} || F <- Tests].
 
@@ -743,10 +753,79 @@ continuation_without_end_headers_continues_loop() ->
     _ = expect_send(),
     cleanup(Pid, Ref).
 
-idle_timeout_emits_goaway() ->
-    %% After the handshake the conn is idle waiting for frames.
-    %% Closing the fake socket simulates the client going away —
-    %% the conn should exit cleanly.
+settings_ack_first_frame_triggers_goaway() ->
+    %% RFC 9113 §3.4: the first frame after the preface MUST be a
+    %% non-ACK SETTINGS. A SETTINGS-ACK (the right type but wrong
+    %% flags) parses cleanly — exercises the `{ok, _, _}` branch
+    %% in `handshake_phase_settings/1`.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    %% SETTINGS-ACK: type 4, flags 1, empty body.
+    serve_recv(ConnPid, <<0:24, 4, 1, 0:32>>),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(process_did_not_exit)
+    end.
+
+handshake_closed_during_partial_preface() ->
+    %% Peer half-closes mid-preface (only 12 bytes delivered).
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    Half = binary:part(?PREFACE, 0, 12),
+    serve_recv(ConnPid, Half),
+    ConnPid ! {roadrunner_fake_closed, {fake, self()}},
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(process_did_not_exit)
+    end.
+
+handshake_error_during_partial_preface() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    Half = binary:part(?PREFACE, 0, 12),
+    serve_recv(ConnPid, Half),
+    ConnPid ! {roadrunner_fake_error, {fake, self()}, eaddrnotavail},
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(process_did_not_exit)
+    end.
+
+handshake_timeout_during_partial_preface() ->
+    %% Slowloris: 12 preface bytes then nothing. Override the
+    %% 10s default with a 100 ms test deadline so the `after`
+    %% branch in `handshake_recv/2` fires fast.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    persistent_term:put({roadrunner_conn_loop_http2, handshake_timeout}, 100),
+    try
+        {Pid, Ref, ConnPid} = start_http2_conn(),
+        _ = expect_send(),
+        Half = binary:part(?PREFACE, 0, 12),
+        serve_recv(ConnPid, Half),
+        expect_close(),
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 1000 -> error(process_did_not_exit)
+        end
+    after
+        persistent_term:erase({roadrunner_conn_loop_http2, handshake_timeout})
+    end.
+
+frame_loop_parse_error_triggers_goaway() ->
+    %% Garbage frame bytes after a clean handshake — the buffer
+    %% parses to `{error, _}`, server emits GOAWAY and exits.
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
@@ -754,12 +833,167 @@ idle_timeout_emits_goaway() ->
     serve_recv(ConnPid, ?PREFACE),
     serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
     _ = expect_send(),
-    %% Reply to the next recv with an error — simulates closed peer.
+    %% Length 0, type 99 (unknown), flags 0, R=0, stream 0 — the
+    %% parser rejects the unknown frame type with an error tuple.
+    Bad = <<0:24, 99, 0, 0:32>>,
+    serve_recv(ConnPid, Bad),
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
     receive
-        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
-            ConnPid ! {roadrunner_fake_recv_reply, {error, closed}}
-    after 500 -> error(no_recv_request)
-    end,
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(process_did_not_exit)
+    end.
+
+runtime_idle_timeout_emits_goaway() ->
+    %% Override the 30-s idle timeout with a 100-ms test deadline
+    %% so the `after` branch in `recv_more/1` fires fast.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 100),
+    try
+        {Pid, Ref, ConnPid} = start_http2_conn(),
+        _ = expect_send(),
+        serve_recv(ConnPid, ?PREFACE),
+        serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        Goaway = expect_send(),
+        ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+        expect_close(),
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 1000 -> error(process_did_not_exit)
+        end
+    after
+        persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
+    end.
+
+rst_stream_active_stream_synced() ->
+    %% Open stream 1, RST_STREAM it, then sync via PING-ACK to
+    %% prove the RST was processed before cleanup races the kill.
+    %% Active-mode receive added enough async slack between
+    %% `serve_recv/2` and conn dispatch that `is_process_alive/1`
+    %% alone wasn't a sufficient barrier for cover instrumentation.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"POST"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    Hf = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, Hf),
+    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
+    serve_recv(ConnPid, Rst),
+    Ping = iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>})),
+    serve_recv(ConnPid, Ping),
+    PingAck = expect_send(),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, PingAck),
+    cleanup(Pid, Ref).
+
+stream_window_update_grows_window_synced() ->
+    %% Open a stream, deliver a non-overflowing WINDOW_UPDATE on
+    %% it, sync via PING-ACK. Covers the success path of
+    %% `handle_frame({window_update, StreamId, Inc}, _)` for the
+    %% active stream.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"POST"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    Hf = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, Hf),
+    Wu = iolist_to_binary(roadrunner_http2_frame:encode({window_update, 1, 1024})),
+    serve_recv(ConnPid, Wu),
+    Ping = iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>})),
+    serve_recv(ConnPid, Ping),
+    PingAck = expect_send(),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, PingAck),
+    cleanup(Pid, Ref).
+
+rst_stream_unknown_stream_ignored() ->
+    %% RST_STREAM for a stream that's not currently open is silently
+    %% dropped (closed-stream legality per RFC 9113 §5.4 / §6.4).
+    %% Sync via PING-ACK to ensure the conn processed the RST
+    %% before the cleanup race.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 99, cancel})),
+    serve_recv(ConnPid, Rst),
+    Ping = iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>})),
+    serve_recv(ConnPid, Ping),
+    PingAck = expect_send(),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, PingAck),
+    cleanup(Pid, Ref).
+
+runtime_transport_error_triggers_goaway() ->
+    %% Transport error AFTER handshake — exercises the `{MError, _, _}`
+    %% arm of `recv_more/1`.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    %% Drain the setopts (active-once arm) before delivering the
+    %% error so the conn is parked in `recv_more/1`.
+    timer:sleep(20),
+    ConnPid ! {roadrunner_fake_error, {fake, self()}, etimedout},
+    Goaway = expect_send(),
+    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(process_did_not_exit)
+    end.
+
+idle_timeout_emits_goaway() ->
+    %% After the handshake the conn is idle in active-once receive
+    %% waiting for frames. Delivering a `roadrunner_fake_closed`
+    %% message simulates the peer going away — the conn should exit
+    %% cleanly.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    ConnPid ! {roadrunner_fake_closed, {fake, self()}},
     expect_close(),
     receive
         {'DOWN', Ref, process, Pid, normal} -> ok
@@ -826,23 +1060,25 @@ expect_close() ->
     after 500 -> error(no_close)
     end.
 
+%% After Phase H8a's switch to active-mode receive, the conn
+%% process arms `[{active, once}]` between iterations and reads
+%% bytes off its mailbox. Tests deliver wire bytes by sending the
+%% `roadrunner_fake_data` message directly to the conn pid. The
+%% `recv` request/reply pattern that used to drive this no longer
+%% fires.
 serve_recv(ConnPid, Data) ->
-    serve_recv_loop(ConnPid, iolist_to_binary([Data])).
+    %% The conn arms active-once and the fake transport forwards
+    %% `{roadrunner_fake_setopts, ConnPid, Opts}` to us each time;
+    %% we don't care about it here but draining keeps the mailbox
+    %% from filling up across long tests.
+    drain_setopts(),
+    ConnPid ! {roadrunner_fake_data, {fake, self()}, iolist_to_binary([Data])},
+    ok.
 
-serve_recv_loop(_ConnPid, <<>>) ->
-    ok;
-serve_recv_loop(ConnPid, Buf) ->
+drain_setopts() ->
     receive
-        {roadrunner_fake_recv, ConnPid, Len, _Timeout} ->
-            Take =
-                case Len of
-                    0 -> byte_size(Buf);
-                    _ -> min(Len, byte_size(Buf))
-                end,
-            <<Chunk:Take/binary, Rest/binary>> = Buf,
-            ConnPid ! {roadrunner_fake_recv_reply, {ok, Chunk}},
-            serve_recv_loop(ConnPid, Rest)
-    after 500 -> error(no_recv_request)
+        {roadrunner_fake_setopts, _, _} -> drain_setopts()
+    after 0 -> ok
     end.
 
 drain_mailbox() ->
