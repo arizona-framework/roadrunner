@@ -9,10 +9,12 @@ features.
 
 -on_load(init_patterns/0).
 
--export([accept_key/1, handshake_response/1, parse_frame/1, encode_frame/3]).
+-export([accept_key/1, handshake_response/1]).
+-export([parse_frame/1, parse_frame/2]).
+-export([encode_frame/3, encode_frame/4]).
 -export([parse_extensions/1]).
 
--export_type([opcode/0, frame/0, extension/0]).
+-export_type([opcode/0, frame/0, extension/0, parse_opts/0, encode_opts/0]).
 
 -define(EXT_OFFER_CP_KEY, {?MODULE, ext_offer_cp}).
 -define(EXT_PARAM_CP_KEY, {?MODULE, ext_param_cp}).
@@ -22,6 +24,7 @@ features.
 -type opcode() :: continuation | text | binary | close | ping | pong.
 -type frame() :: #{
     fin := boolean(),
+    rsv1 := boolean(),
     opcode := opcode(),
     payload := binary()
 }.
@@ -30,6 +33,17 @@ features.
 %% values are `binary()` for `key=value` pairs or `true` for bare flag
 %% parameters (e.g. `client_no_context_takeover`).
 -type extension() :: {binary(), [{binary(), binary() | true}]}.
+
+%% Parse-side options. `allow_rsv1 => true` surfaces the RSV1 bit in
+%% the returned frame map (per RFC 7692 the bit signals a compressed
+%% message). RSV2 and RSV3 are always rejected — no IETF extension
+%% uses them.
+-type parse_opts() :: #{allow_rsv1 => boolean()}.
+
+%% Encode-side options. `rsv1 => true` sets the RSV1 bit on the
+%% emitted frame; the caller is responsible for ensuring an
+%% extension that uses the bit is in effect.
+-type encode_opts() :: #{rsv1 => boolean()}.
 
 %% RFC 6455 §1.3 magic GUID concatenated with the client key before
 %% hashing — fixed by spec.
@@ -221,34 +235,61 @@ unquote(V) ->
 Decode a single WebSocket frame from the buffer.
 
 Returns `{ok, Frame, Rest}` on success — `Frame` is a map with
-`fin`, `opcode`, and (already-unmasked) `payload`. Returns
+`fin`, `rsv1`, `opcode`, and (already-unmasked) `payload`. Returns
 `{more, undefined}` when more bytes are needed to complete the
 frame, or `{error, _}` for protocol violations:
-- `bad_rsv` — any of RSV1/RSV2/RSV3 set (no extensions supported).
+- `bad_rsv` — RSV2 or RSV3 set, or RSV1 set without an extension
+  permitting it (default: not permitted).
 - `bad_opcode` — opcode is reserved (3-7, 0xB-0xF).
 - `not_masked` — server-side requires the MASK bit on every client frame.
 - `fragmented_control` — control frame (close/ping/pong) with FIN=0,
   forbidden by RFC 6455 §5.5.
 - `control_frame_too_large` — control frame with payload >125 bytes,
   forbidden by RFC 6455 §5.5.
+
+Use `parse_frame/2` with `#{allow_rsv1 => true}` once a permessage
+extension (RFC 7692) has been negotiated.
 """.
 -spec parse_frame(binary()) ->
     {ok, frame(), Rest :: binary()}
     | {more, undefined}
     | {error, bad_opcode | bad_rsv | not_masked | fragmented_control | control_frame_too_large}.
-parse_frame(<<_Fin:1, Rsv:3, _:4, _/bitstring>>) when Rsv =/= 0 ->
+parse_frame(Bin) ->
+    parse_frame(Bin, #{}).
+
+-doc """
+Decode a single WebSocket frame, with extension awareness.
+
+`Opts` may include `allow_rsv1 => true` to permit the RSV1 bit
+(needed once `permessage-deflate` is negotiated per RFC 7692).
+RSV2 and RSV3 remain unconditionally rejected.
+""".
+-spec parse_frame(binary(), parse_opts()) ->
+    {ok, frame(), Rest :: binary()}
+    | {more, undefined}
+    | {error, bad_opcode | bad_rsv | not_masked | fragmented_control | control_frame_too_large}.
+parse_frame(Bin, Opts) ->
+    do_parse_frame(Bin, maps:get(allow_rsv1, Opts, false)).
+
+-spec do_parse_frame(binary(), boolean()) ->
+    {ok, frame(), Rest :: binary()}
+    | {more, undefined}
+    | {error, bad_opcode | bad_rsv | not_masked | fragmented_control | control_frame_too_large}.
+do_parse_frame(<<_Fin:1, _Rsv1:1, Rsv23:2, _:4, _/bitstring>>, _AllowRsv1) when Rsv23 =/= 0 ->
     {error, bad_rsv};
-parse_frame(<<Fin:1, 0:3, Op:4, Mask:1, Len7:7, Rest/binary>>) ->
+do_parse_frame(<<_Fin:1, 1:1, 0:2, _:4, _/bitstring>>, false) ->
+    {error, bad_rsv};
+do_parse_frame(<<Fin:1, Rsv1:1, 0:2, Op:4, Mask:1, Len7:7, Rest/binary>>, _AllowRsv1) ->
     case decode_opcode(Op) of
         {ok, Opcode} ->
             case validate_control(Opcode, Fin, Len7) of
-                ok -> parse_length(Len7, Mask, Rest, fin_flag(Fin), Opcode);
+                ok -> parse_length(Len7, Mask, Rest, fin_flag(Fin), rsv_flag(Rsv1), Opcode);
                 {error, _} = E -> E
             end;
         error ->
             {error, bad_opcode}
     end;
-parse_frame(_) ->
+do_parse_frame(_, _AllowRsv1) ->
     {more, undefined}.
 
 %% RFC 6455 §5.5: control frames (close, ping, pong) MUST NOT be
@@ -269,6 +310,10 @@ validate_control(_Op, 1, _Len7) ->
 fin_flag(1) -> true;
 fin_flag(0) -> false.
 
+-spec rsv_flag(0 | 1) -> boolean().
+rsv_flag(1) -> true;
+rsv_flag(0) -> false.
+
 -spec decode_opcode(0..15) -> {ok, opcode()} | error.
 decode_opcode(?OP_CONTINUATION) -> {ok, continuation};
 decode_opcode(?OP_TEXT) -> {ok, text};
@@ -278,32 +323,33 @@ decode_opcode(?OP_PING) -> {ok, ping};
 decode_opcode(?OP_PONG) -> {ok, pong};
 decode_opcode(_) -> error.
 
--spec parse_length(0..127, 0 | 1, binary(), boolean(), opcode()) ->
+-spec parse_length(0..127, 0 | 1, binary(), boolean(), boolean(), opcode()) ->
     {ok, frame(), binary()}
     | {more, undefined}
     | {error, not_masked}.
-parse_length(126, Mask, <<Len:16, Rest/binary>>, Fin, Op) ->
-    parse_payload(Len, Mask, Rest, Fin, Op);
-parse_length(127, Mask, <<Len:64, Rest/binary>>, Fin, Op) ->
-    parse_payload(Len, Mask, Rest, Fin, Op);
-parse_length(Len7, Mask, Rest, Fin, Op) when Len7 < 126 ->
-    parse_payload(Len7, Mask, Rest, Fin, Op);
-parse_length(_, _, _, _, _) ->
+parse_length(126, Mask, <<Len:16, Rest/binary>>, Fin, Rsv1, Op) ->
+    parse_payload(Len, Mask, Rest, Fin, Rsv1, Op);
+parse_length(127, Mask, <<Len:64, Rest/binary>>, Fin, Rsv1, Op) ->
+    parse_payload(Len, Mask, Rest, Fin, Rsv1, Op);
+parse_length(Len7, Mask, Rest, Fin, Rsv1, Op) when Len7 < 126 ->
+    parse_payload(Len7, Mask, Rest, Fin, Rsv1, Op);
+parse_length(_, _, _, _, _, _) ->
     {more, undefined}.
 
--spec parse_payload(non_neg_integer(), 0 | 1, binary(), boolean(), opcode()) ->
+-spec parse_payload(non_neg_integer(), 0 | 1, binary(), boolean(), boolean(), opcode()) ->
     {ok, frame(), binary()}
     | {more, undefined}
     | {error, not_masked}.
-parse_payload(_Len, 0, _Bin, _Fin, _Op) ->
+parse_payload(_Len, 0, _Bin, _Fin, _Rsv1, _Op) ->
     %% Server-side: per RFC 6455 §5.1 every client frame must be masked.
     {error, not_masked};
-parse_payload(Len, 1, Bin, Fin, Op) ->
+parse_payload(Len, 1, Bin, Fin, Rsv1, Op) ->
     case Bin of
         <<MaskKey:4/binary, Payload:Len/binary, Rest/binary>> ->
             {ok,
                 #{
                     fin => Fin,
+                    rsv1 => Rsv1,
                     opcode => Op,
                     payload => unmask(Payload, MaskKey)
                 },
@@ -335,23 +381,31 @@ extended (126) for ≤65535, 64-bit extended (127) for larger.
 `Fin` controls the FIN bit — pass `true` for the only or last frame
 of a message and `false` for non-final fragments of a continuation
 sequence.
+
+Use `encode_frame/4` with `#{rsv1 => true}` once `permessage-deflate`
+is negotiated and you're emitting a compressed first-fragment.
 """.
 -spec encode_frame(opcode(), iodata(), boolean()) -> iodata().
 encode_frame(Opcode, Payload, Fin) ->
+    encode_frame(Opcode, Payload, Fin, #{}).
+
+-spec encode_frame(opcode(), iodata(), boolean(), encode_opts()) -> iodata().
+encode_frame(Opcode, Payload, Fin, Opts) ->
     Op = encode_opcode(Opcode),
     FinBit = fin_bit(Fin),
+    Rsv1Bit = rsv_bit(maps:get(rsv1, Opts, false)),
     PayloadBin = iolist_to_binary(Payload),
     Len = byte_size(PayloadBin),
-    Header = encode_header(FinBit, Op, Len),
+    Header = encode_header(FinBit, Rsv1Bit, Op, Len),
     [Header, PayloadBin].
 
--spec encode_header(0 | 1, 0..15, non_neg_integer()) -> binary().
-encode_header(FinBit, Op, Len) when Len =< 125 ->
-    <<FinBit:1, 0:3, Op:4, 0:1, Len:7>>;
-encode_header(FinBit, Op, Len) when Len =< 16#FFFF ->
-    <<FinBit:1, 0:3, Op:4, 0:1, 126:7, Len:16>>;
-encode_header(FinBit, Op, Len) ->
-    <<FinBit:1, 0:3, Op:4, 0:1, 127:7, Len:64>>.
+-spec encode_header(0 | 1, 0 | 1, 0..15, non_neg_integer()) -> binary().
+encode_header(FinBit, Rsv1Bit, Op, Len) when Len =< 125 ->
+    <<FinBit:1, Rsv1Bit:1, 0:2, Op:4, 0:1, Len:7>>;
+encode_header(FinBit, Rsv1Bit, Op, Len) when Len =< 16#FFFF ->
+    <<FinBit:1, Rsv1Bit:1, 0:2, Op:4, 0:1, 126:7, Len:16>>;
+encode_header(FinBit, Rsv1Bit, Op, Len) ->
+    <<FinBit:1, Rsv1Bit:1, 0:2, Op:4, 0:1, 127:7, Len:64>>.
 
 -spec encode_opcode(opcode()) -> 0..15.
 encode_opcode(continuation) -> ?OP_CONTINUATION;
@@ -364,6 +418,10 @@ encode_opcode(pong) -> ?OP_PONG.
 -spec fin_bit(boolean()) -> 0 | 1.
 fin_bit(true) -> 1;
 fin_bit(false) -> 0.
+
+-spec rsv_bit(boolean()) -> 0 | 1.
+rsv_bit(true) -> 1;
+rsv_bit(false) -> 0.
 
 %% `-on_load` callback. Compiles the Sec-WebSocket-Extensions
 %% splitter patterns once and stashes them in `persistent_term` so

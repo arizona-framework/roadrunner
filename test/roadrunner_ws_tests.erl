@@ -292,9 +292,39 @@ parse_frame_unmasked_rejected_test() ->
     ?assertEqual({error, not_masked}, roadrunner_ws:parse_frame(Frame)).
 
 parse_frame_bad_rsv_test() ->
-    %% RSV1 set — no extensions negotiated.
+    %% RSV1 set — no extensions negotiated → reject.
     Frame = <<16#c1, 16#80, 1, 2, 3, 4>>,
     ?assertEqual({error, bad_rsv}, roadrunner_ws:parse_frame(Frame)).
+
+parse_frame_rsv1_allowed_when_extension_active_test() ->
+    %% RSV1=1 + allow_rsv1 => true (e.g. permessage-deflate negotiated)
+    %% — accept and surface rsv1=true in the frame map.
+    Frame = <<16#c1, 16#85, 16#37, 16#fa, 16#21, 16#3d, 16#7f, 16#9f, 16#4d, 16#51, 16#58>>,
+    {ok, F, ~""} = roadrunner_ws:parse_frame(Frame, #{allow_rsv1 => true}),
+    ?assertMatch(#{rsv1 := true, opcode := text, payload := ~"Hello"}, F).
+
+parse_frame_rsv1_default_rejected_test() ->
+    %% allow_rsv1 default is false — same shape as parse_frame/1.
+    Frame = <<16#c1, 16#80, 1, 2, 3, 4>>,
+    ?assertEqual({error, bad_rsv}, roadrunner_ws:parse_frame(Frame, #{})),
+    ?assertEqual({error, bad_rsv}, roadrunner_ws:parse_frame(Frame, #{allow_rsv1 => false})).
+
+parse_frame_rsv2_always_rejected_test() ->
+    %% RSV2 set — no IETF extension uses it; reject even with
+    %% allow_rsv1 => true.
+    Frame = <<16#a1, 16#80, 1, 2, 3, 4>>,
+    ?assertEqual({error, bad_rsv}, roadrunner_ws:parse_frame(Frame, #{allow_rsv1 => true})).
+
+parse_frame_rsv3_always_rejected_test() ->
+    Frame = <<16#91, 16#80, 1, 2, 3, 4>>,
+    ?assertEqual({error, bad_rsv}, roadrunner_ws:parse_frame(Frame, #{allow_rsv1 => true})).
+
+parse_frame_surfaces_rsv1_false_for_normal_frame_test() ->
+    %% Even on the back-compat parse_frame/1 path, the new frame map
+    %% includes `rsv1 => false` so consumers can rely on the field.
+    Frame = <<16#81, 16#85, 16#37, 16#fa, 16#21, 16#3d, 16#7f, 16#9f, 16#4d, 16#51, 16#58>>,
+    {ok, F, ~""} = roadrunner_ws:parse_frame(Frame),
+    ?assertMatch(#{rsv1 := false}, F).
 
 parse_frame_bad_opcode_test() ->
     %% Opcode 3 is reserved per RFC 6455.
@@ -350,6 +380,24 @@ encode_64bit_length_test() ->
 encode_accepts_iodata_payload_test() ->
     Encoded = iolist_to_binary(roadrunner_ws:encode_frame(text, [~"hel", $l, ~"o"], true)),
     ?assertEqual(<<16#81, 16#05, "hello">>, Encoded).
+
+encode_frame_4_with_rsv1_sets_the_bit_test() ->
+    %% encode_frame/4 with #{rsv1 => true} sets RSV1=1 in the first byte
+    %% — used by the permessage-deflate sender path on the first frame
+    %% of a compressed message.
+    Encoded = iolist_to_binary(
+        roadrunner_ws:encode_frame(text, ~"Hello", true, #{rsv1 => true})
+    ),
+    %% First byte: FIN(1) RSV1(1) RSV2(0) RSV3(0) opcode(0001) = 0xC1.
+    ?assertEqual(<<16#c1, 16#05, "Hello">>, Encoded).
+
+encode_frame_4_default_omits_rsv1_test() ->
+    %% encode_frame/4 with empty opts behaves identically to
+    %% encode_frame/3.
+    A = iolist_to_binary(roadrunner_ws:encode_frame(text, ~"Hello", true, #{})),
+    B = iolist_to_binary(roadrunner_ws:encode_frame(text, ~"Hello", true)),
+    ?assertEqual(A, B),
+    ?assertEqual(<<16#81, 16#05, "Hello">>, A).
 
 %% =============================================================================
 %% RFC 6455 §5.5 — control-frame constraints.
