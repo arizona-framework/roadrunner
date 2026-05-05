@@ -108,6 +108,9 @@ preflight_scenario(#{scenario := websocket_msg_throughput, servers := Servers} =
 preflight_scenario(#{scenario := url_with_qs, servers := Servers} = Opts) ->
     filter_servers(url_with_qs, [elli], Servers, Opts,
         ~"no native query-string parser in elli test fixture");
+preflight_scenario(#{scenario := head_method, servers := Servers} = Opts) ->
+    filter_servers(head_method, [elli], Servers, Opts,
+        ~"elli test fixture's handle/3 only matches 'GET' for /large; HEAD falls through to 404");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -203,7 +206,8 @@ cli() ->
                         websocket_msg_throughput,
                         url_with_qs,
                         small_chunked_response,
-                        accept_storm_burst
+                        accept_storm_burst,
+                        head_method
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -401,6 +405,15 @@ cli() ->
                                     load. Run with --duration 1
                                     or short; throughput =
                                     clients / time-to-drain.
+                    head_method:    HEAD /large — same handler as
+                                    `large_response`; the conn-loop
+                                    detects HEAD and emits the
+                                    headers (incl. Content-Length:
+                                    65536) but suppresses the
+                                    64 KB body per RFC 9110 §9.3.2.
+                                    Tests the body-suppression
+                                    short-circuit. Distinct from
+                                    GET on the wire.
                     """
             },
             #{
@@ -845,6 +858,8 @@ scenario_roadrunner_opts(small_chunked_response, BaseOpts) ->
     BaseOpts#{routes => [{~"/small", roadrunner_bench_small_chunks_handler, undefined}]};
 scenario_roadrunner_opts(accept_storm_burst, BaseOpts) ->
     BaseOpts#{handler => roadrunner_keepalive_handler};
+scenario_roadrunner_opts(head_method, BaseOpts) ->
+    BaseOpts#{routes => [{~"/large", roadrunner_bench_large_handler, undefined}]};
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -918,7 +933,9 @@ scenario_cowboy_routes(url_with_qs) ->
 scenario_cowboy_routes(small_chunked_response) ->
     [{'_', [{"/small", roadrunner_bench_cowboy_small_chunks_handler, []}]}];
 scenario_cowboy_routes(accept_storm_burst) ->
-    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}].
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
+scenario_cowboy_routes(head_method) ->
+    [{'_', [{"/large", roadrunner_bench_cowboy_large_handler, []}]}].
 
 %% Per-scenario cowboy TransportOpts. The default keeps the bench's
 %% prior shape (`num_acceptors => 10`); `backpressure_sustained`
@@ -2037,6 +2054,8 @@ build_request(small_chunked_response) ->
         "error: --scenario small_chunked_response is h2-only "
         "(use --protocol h2)~n", []),
     halt(2);
+build_request(head_method) ->
+    ~"HEAD /large HTTP/1.1\r\nHost: x\r\n\r\n";
 build_request(post_4kb_form) ->
     %% 4 KB urlencoded body — see `post_4kb_form_body/0` for shape.
     %% Predictable parse cost (ASCII letters/digits only, no
@@ -2107,7 +2126,8 @@ expected_body_len(gzip_response) ->
 expected_body_len(backpressure_sustained) -> 7;
 expected_body_len(large_keepalive_session) -> 7;
 expected_body_len(url_with_qs) -> 1;
-expected_body_len(small_chunked_response) -> 6400.
+expected_body_len(small_chunked_response) -> 6400;
+expected_body_len(head_method) -> 0.
 
 %% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
 %% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
@@ -2426,6 +2446,8 @@ h2_request_shape(accept_storm_burst) ->
         "error: --scenario accept_storm_burst is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(head_method) ->
+    {~"HEAD", ~"/large", [], <<>>};
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -2627,7 +2649,9 @@ scenario_request_summary(url_with_qs) ->
 scenario_request_summary(small_chunked_response) ->
     "GET /small over h2, 100 × 64-byte streamed chunks (router)";
 scenario_request_summary(accept_storm_burst) ->
-    "GET / HTTP/1.1 + Connection: close, --clients all connect at once, 1 req each (handler)".
+    "GET / HTTP/1.1 + Connection: close, --clients all connect at once, 1 req each (handler)";
+scenario_request_summary(head_method) ->
+    "HEAD /large HTTP/1.1, headers including Content-Length: 65536 but no body (router)".
 
 result_to_row(Side, #{
     total := Total,
