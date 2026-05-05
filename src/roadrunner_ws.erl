@@ -120,8 +120,8 @@ for any of the required handshake headers (`Upgrade: websocket`, a
 The session uses this to set up zlib state. The agreed extension's
 response header is already in `Headers`.
 """.
--spec handshake_response(roadrunner_http1:headers()) ->
-    {ok, roadrunner_http1:status(), roadrunner_http1:headers(), iodata(), negotiated()}
+-spec handshake_response(roadrunner_req:headers()) ->
+    {ok, roadrunner_req:status(), roadrunner_req:headers(), iodata(), negotiated()}
     | {error,
         missing_websocket_upgrade
         | missing_connection_upgrade
@@ -140,7 +140,7 @@ handshake_response(Headers) when is_list(Headers) ->
             Err
     end.
 
--spec build_handshake_headers(binary(), negotiated()) -> roadrunner_http1:headers().
+-spec build_handshake_headers(binary(), negotiated()) -> roadrunner_req:headers().
 build_handshake_headers(Accept, none) ->
     [
         {~"upgrade", ~"websocket"},
@@ -155,7 +155,7 @@ build_handshake_headers(Accept, {permessage_deflate, _, ResponseValue}) ->
         {~"sec-websocket-extensions", ResponseValue}
     ].
 
--spec validate_upgrade(roadrunner_http1:headers()) ->
+-spec validate_upgrade(roadrunner_req:headers()) ->
     {ok, binary()}
     | {error,
         missing_websocket_upgrade
@@ -210,7 +210,7 @@ has_upgrade_token(Value) ->
         _ -> true
     end.
 
--spec header_lookup(binary(), roadrunner_http1:headers()) -> binary() | undefined.
+-spec header_lookup(binary(), roadrunner_req:headers()) -> binary() | undefined.
 header_lookup(Name, Headers) ->
     case lists:keyfind(Name, 1, Headers) of
         {_, V} -> V;

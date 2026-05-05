@@ -1,11 +1,28 @@
 -module(roadrunner_req).
 -moduledoc """
-Pure accessors over a `roadrunner_http1:request()` map.
+Pure accessors over a `request()` map, plus the public type
+aliases for the request-side surface.
 
 Decouples handler code from the underlying map shape — handlers should
 prefer these functions over direct `maps:get/2` so the request
 representation can evolve without breaking them.
+
+The exported types (`request/0`, `headers/0`, `version/0`,
+`status/0`, `redirect_status/0`) are the **public** request-side
+surface. Internal modules may use the underlying
+`roadrunner_http1:*` types directly; user code (handlers,
+middleware, custom response builders) should reach in through
+this module so the internal h1 module can be renamed or
+restructured without breaking the public contract.
 """.
+
+-export_type([request/0, headers/0, version/0, status/0, redirect_status/0]).
+
+-type request() :: roadrunner_http1:request().
+-type headers() :: roadrunner_http1:headers().
+-type version() :: roadrunner_http1:version().
+-type status() :: roadrunner_http1:status().
+-type redirect_status() :: roadrunner_http1:redirect_status().
 
 -export([
     method/1,
@@ -33,7 +50,7 @@ representation can evolve without breaking them.
 ]).
 
 -doc "Return the request method (uppercase ASCII binary).".
--spec method(roadrunner_http1:request()) -> binary().
+-spec method(request()) -> binary().
 method(#{method := M}) -> M.
 
 -doc """
@@ -43,7 +60,7 @@ Comparison is byte-exact and case-sensitive — the parser already
 enforces uppercase methods on the wire, so callers should pass
 uppercase too (`~"GET"`, `~"POST"`, etc.).
 """.
--spec method_is(binary(), roadrunner_http1:request()) -> boolean().
+-spec method_is(binary(), request()) -> boolean().
 method_is(Method, #{method := M}) when is_binary(Method) ->
     Method =:= M.
 
@@ -54,7 +71,7 @@ If the target contains a `?` query separator, only the bytes before it
 are returned. The path is **not** percent-decoded — that's the
 router's job.
 """.
--spec path(roadrunner_http1:request()) -> binary().
+-spec path(request()) -> binary().
 path(#{target := T}) ->
     case binary:split(T, ~"?") of
         [P, _Q] -> P;
@@ -67,7 +84,7 @@ leading `?`. Empty binary when no `?` is present (or nothing follows it).
 
 For decoded `{Key, Value}` pairs, pipe through `roadrunner_qs:parse/1`.
 """.
--spec qs(roadrunner_http1:request()) -> binary().
+-spec qs(request()) -> binary().
 qs(#{target := T}) ->
     case binary:split(T, ~"?") of
         [_P, Q] -> Q;
@@ -75,11 +92,11 @@ qs(#{target := T}) ->
     end.
 
 -doc "Return the HTTP version tuple ({1,0} or {1,1}).".
--spec version(roadrunner_http1:request()) -> roadrunner_http1:version().
+-spec version(request()) -> version().
 version(#{version := V}) -> V.
 
 -doc "Return the full ordered list of `{Name, Value}` header pairs.".
--spec headers(roadrunner_http1:request()) -> roadrunner_http1:headers().
+-spec headers(request()) -> headers().
 headers(#{headers := H}) -> H.
 
 -doc """
@@ -89,7 +106,7 @@ The lookup is case-insensitive on `Name` — the parser already
 lowercases header names on the wire, so any-case input is normalized
 before searching.
 """.
--spec header(binary(), roadrunner_http1:request()) -> binary() | undefined.
+-spec header(binary(), request()) -> binary() | undefined.
 header(Name, #{headers := H}) when is_binary(Name) ->
     Lower = roadrunner_bin:ascii_lowercase(Name),
     case lists:keyfind(Lower, 1, H) of
@@ -102,7 +119,7 @@ Return whether `Name` is present in the request headers.
 
 Lookup is case-insensitive on `Name` — same convention as `header/2`.
 """.
--spec has_header(binary(), roadrunner_http1:request()) -> boolean().
+-spec has_header(binary(), request()) -> boolean().
 has_header(Name, #{headers := H}) when is_binary(Name) ->
     lists:keymember(roadrunner_bin:ascii_lowercase(Name), 1, H).
 
@@ -113,7 +130,7 @@ Parse the query string portion of the request target into a list of
 
 Returns `[]` when the target has no query component.
 """.
--spec parse_qs(roadrunner_http1:request()) -> [{binary(), binary() | true}].
+-spec parse_qs(request()) -> [{binary(), binary() | true}].
 parse_qs(Req) ->
     roadrunner_qs:parse(qs(Req)).
 
@@ -123,7 +140,7 @@ via `roadrunner_cookie:parse/1`.
 
 Returns `[]` when the request carries no `Cookie` header.
 """.
--spec parse_cookies(roadrunner_http1:request()) -> [{binary(), binary()}].
+-spec parse_cookies(request()) -> [{binary(), binary()}].
 parse_cookies(Req) ->
     case header(~"cookie", Req) of
         undefined -> [];
@@ -141,7 +158,7 @@ buffer the parser carried over.
 Returns `<<>>` when the request has no body field (e.g. when a request
 map is constructed manually outside the connection pipeline).
 """.
--spec body(roadrunner_http1:request()) -> binary().
+-spec body(request()) -> binary().
 body(#{body := B}) -> B;
 body(_) -> <<>>.
 
@@ -152,7 +169,7 @@ Returns `false` for both an absent `body` field and an empty body
 binary — handlers can use this as a short-circuit before doing any
 body-aware work.
 """.
--spec has_body(roadrunner_http1:request()) -> boolean().
+-spec has_body(request()) -> boolean().
 has_body(#{body := B}) -> B =/= <<>>;
 has_body(_) -> false.
 
@@ -170,8 +187,8 @@ body-buffering modes:
   `{Status, Headers, Body, Req2}` so the conn can drain whatever the
   handler skipped.
 """.
--spec read_body(roadrunner_http1:request()) ->
-    {ok, binary(), roadrunner_http1:request()} | {error, term()}.
+-spec read_body(request()) ->
+    {ok, binary(), request()} | {error, term()}.
 read_body(Req) ->
     read_body(Req, #{}).
 
@@ -192,9 +209,9 @@ bytes per call.
 In `auto` mode the body is already buffered, so `length` has no
 effect — the buffered bytes are returned in one shot.
 """.
--spec read_body(roadrunner_http1:request(), #{length => non_neg_integer()}) ->
-    {ok, binary(), roadrunner_http1:request()}
-    | {more, binary(), roadrunner_http1:request()}
+-spec read_body(request(), #{length => non_neg_integer()}) ->
+    {ok, binary(), request()}
+    | {more, binary(), request()}
     | {error, term()}.
 read_body(#{body_state := BS} = Req, Opts) ->
     Mode =
@@ -232,9 +249,9 @@ Threading is the same as `read_body/1,2`: hand `Req2` back to the
 conn via the `{Response, Req2}` handler return shape so any unread
 chunks get drained for keep-alive.
 """.
--spec read_body_chunked(roadrunner_http1:request()) ->
-    {ok, binary(), roadrunner_http1:request()}
-    | {more, binary(), roadrunner_http1:request()}
+-spec read_body_chunked(request()) ->
+    {ok, binary(), request()}
+    | {more, binary(), request()}
     | {error, term()}.
 read_body_chunked(#{body_state := BS} = Req) ->
     case roadrunner_conn:consume_body_state(BS, next_chunk) of
@@ -267,9 +284,9 @@ body via `read_body/1` (so works in both `auto` and `manual`
 buffering modes), and threads `Req2` back so trailing body bytes
 get drained on keep-alive.
 """.
--spec read_form(roadrunner_http1:request()) ->
-    {ok, urlencoded, [{binary(), binary() | true}], roadrunner_http1:request()}
-    | {ok, multipart, [roadrunner_multipart:part()], roadrunner_http1:request()}
+-spec read_form(request()) ->
+    {ok, urlencoded, [{binary(), binary() | true}], request()}
+    | {ok, multipart, [roadrunner_multipart:part()], request()}
     | {error, no_content_type | unsupported_content_type | no_boundary | term()}.
 read_form(Req) ->
     case header(~"content-type", Req) of
@@ -288,9 +305,9 @@ content_type_kind(ContentType) ->
         _ -> unsupported
     end.
 
--spec dispatch_form(urlencoded | multipart | unsupported, binary(), roadrunner_http1:request()) ->
-    {ok, urlencoded, [{binary(), binary() | true}], roadrunner_http1:request()}
-    | {ok, multipart, [roadrunner_multipart:part()], roadrunner_http1:request()}
+-spec dispatch_form(urlencoded | multipart | unsupported, binary(), request()) ->
+    {ok, urlencoded, [{binary(), binary() | true}], request()}
+    | {ok, multipart, [roadrunner_multipart:part()], request()}
     | {error, term()}.
 dispatch_form(urlencoded, _ContentType, Req) ->
     case read_body(Req) of
@@ -323,7 +340,7 @@ Return the router-captured bindings for this request as a
 invoking the handler. Empty map when the listener is in single-handler
 mode (no router) or the matched route has no `:param` segments.
 """.
--spec bindings(roadrunner_http1:request()) -> roadrunner_router:bindings().
+-spec bindings(request()) -> roadrunner_router:bindings().
 bindings(#{bindings := B}) -> B;
 bindings(_) -> #{}.
 
@@ -336,7 +353,7 @@ connection. Returns `undefined` when the request map has no peer
 field (e.g. constructed manually outside the connection pipeline) or
 when the OS call failed at accept time.
 """.
--spec peer(roadrunner_http1:request()) ->
+-spec peer(request()) ->
     {inet:ip_address(), inet:port_number()} | undefined.
 peer(#{peer := P}) -> P;
 peer(_) -> undefined.
@@ -356,7 +373,7 @@ conventionally just the IP. The caller decides how to parse it.
 directly can spoof these headers — only call this when the deploy
 sits behind a trusted reverse proxy that strips/overwrites them.
 """.
--spec forwarded_for(roadrunner_http1:request()) -> binary() | undefined.
+-spec forwarded_for(request()) -> binary() | undefined.
 forwarded_for(Req) ->
     case header(~"forwarded", Req) of
         undefined ->
@@ -376,7 +393,7 @@ forwarded_for(Req) ->
 empty_to_undefined(<<>>) -> undefined;
 empty_to_undefined(Other) -> Other.
 
--spec x_forwarded_for(roadrunner_http1:request()) -> binary() | undefined.
+-spec x_forwarded_for(request()) -> binary() | undefined.
 x_forwarded_for(Req) ->
     case header(~"x-forwarded-for", Req) of
         undefined ->
@@ -419,7 +436,7 @@ Return the connection scheme — `http` for plain TCP, `https` for TLS.
 Defaults to `http` for request maps constructed manually outside the
 connection pipeline.
 """.
--spec scheme(roadrunner_http1:request()) -> http | https.
+-spec scheme(request()) -> http | https.
 scheme(#{scheme := S}) -> S;
 scheme(_) -> http.
 
@@ -430,7 +447,7 @@ Return the opaque per-route opts attached at compile time via the
 `undefined` for 2-tuple routes and for single-handler dispatch (no
 router involved).
 """.
--spec route_opts(roadrunner_http1:request()) -> term().
+-spec route_opts(request()) -> term().
 route_opts(#{route_opts := O}) -> O;
 route_opts(_) -> undefined.
 
@@ -444,6 +461,6 @@ the handler is automatically annotated with the same id.
 
 `undefined` for manually-constructed request maps used in tests.
 """.
--spec request_id(roadrunner_http1:request()) -> binary() | undefined.
+-spec request_id(request()) -> binary() | undefined.
 request_id(#{request_id := Id}) -> Id;
 request_id(_) -> undefined.

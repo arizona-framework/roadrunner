@@ -51,7 +51,7 @@ directories are still followed by the kernel.
     ~".txt" => ~"text/plain; charset=utf-8"
 }).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     #{dir := Dir} = roadrunner_req:route_opts(Req),
     Segments = maps:get(~"path", roadrunner_req:bindings(Req), []),
@@ -65,7 +65,7 @@ handle(Req) ->
         end,
     {Resp, Req}.
 
--spec serve_file(file:filename_all(), roadrunner_http1:request()) -> roadrunner_handler:response().
+-spec serve_file(file:filename_all(), roadrunner_req:request()) -> roadrunner_handler:response().
 serve_file(FilePath, Req) ->
     %% `read_link_info/1` does not follow the leaf symlink — we need
     %% the un-followed type so the symlink-policy gate can decide
@@ -83,7 +83,7 @@ serve_file(FilePath, Req) ->
     end.
 
 %% Read leaf-stat after the symlink-policy gate has approved follow.
--spec serve_followed_file(file:filename_all(), roadrunner_http1:request()) ->
+-spec serve_followed_file(file:filename_all(), roadrunner_req:request()) ->
     roadrunner_handler:response().
 serve_followed_file(FilePath, Req) ->
     case file:read_file_info(FilePath, [{time, posix}]) of
@@ -94,7 +94,7 @@ serve_followed_file(FilePath, Req) ->
     end.
 
 -spec serve_regular_file(
-    file:filename_all(), non_neg_integer(), integer(), roadrunner_http1:request()
+    file:filename_all(), non_neg_integer(), integer(), roadrunner_req:request()
 ) -> roadrunner_handler:response().
 serve_regular_file(FilePath, Size, Mtime, Req) ->
     ETag = etag(Size, Mtime),
@@ -115,11 +115,11 @@ serve_regular_file(FilePath, Size, Mtime, Req) ->
 %% Cache hit when either:
 %% - `If-None-Match` matches the current ETag (strong validator), or
 %% - `If-Modified-Since` ≥ the file's mtime (weak validator).
--spec is_cached(roadrunner_http1:request(), binary(), integer()) -> boolean().
+-spec is_cached(roadrunner_req:request(), binary(), integer()) -> boolean().
 is_cached(Req, ETag, Mtime) ->
     if_none_match(Req) =:= ETag orelse if_modified_since_satisfied(Req, Mtime).
 
--spec if_modified_since_satisfied(roadrunner_http1:request(), integer()) -> boolean().
+-spec if_modified_since_satisfied(roadrunner_req:request(), integer()) -> boolean().
 if_modified_since_satisfied(Req, Mtime) ->
     case roadrunner_req:header(~"if-modified-since", Req) of
         undefined ->
@@ -139,7 +139,7 @@ if_modified_since_satisfied(Req, Mtime) ->
     non_neg_integer(),
     binary(),
     binary(),
-    roadrunner_http1:request()
+    roadrunner_req:request()
 ) -> roadrunner_handler:response().
 serve_with_range(FilePath, Size, ETag, LastMod, Req) ->
     case parse_range(roadrunner_req:header(~"range", Req), Size) of
@@ -180,7 +180,7 @@ content_type_for(FilePath) ->
 etag(Size, Mtime) ->
     <<$", (integer_to_binary(Size))/binary, $-, (integer_to_binary(Mtime))/binary, $">>.
 
--spec if_none_match(roadrunner_http1:request()) -> binary() | undefined.
+-spec if_none_match(roadrunner_req:request()) -> binary() | undefined.
 if_none_match(Req) ->
     roadrunner_req:header(~"if-none-match", Req).
 
@@ -305,7 +305,7 @@ validate_segments(Segments) ->
     end.
 
 %% Decide whether a symlink leaf may be served under the route's policy.
--spec symlink_allowed(file:filename_all(), roadrunner_http1:request()) -> boolean().
+-spec symlink_allowed(file:filename_all(), roadrunner_req:request()) -> boolean().
 symlink_allowed(FilePath, Req) ->
     case symlink_policy(Req) of
         follow -> true;
@@ -313,7 +313,7 @@ symlink_allowed(FilePath, Req) ->
         refuse_escapes -> target_inside_docroot(FilePath, Req)
     end.
 
--spec symlink_policy(roadrunner_http1:request()) -> follow | refuse | refuse_escapes.
+-spec symlink_policy(roadrunner_req:request()) -> follow | refuse | refuse_escapes.
 symlink_policy(Req) ->
     case roadrunner_req:route_opts(Req) of
         #{symlink_policy := follow} -> follow;
@@ -326,7 +326,7 @@ symlink_policy(Req) ->
 %% the kernel follows those when we eventually open the file. The
 %% threat model is "an attacker plants a leaf symlink to escape", which
 %% is the common case for upload-able directories.
--spec target_inside_docroot(file:filename_all(), roadrunner_http1:request()) -> boolean().
+-spec target_inside_docroot(file:filename_all(), roadrunner_req:request()) -> boolean().
 target_inside_docroot(FilePath, Req) ->
     %% `serve_file/2` only calls us after `read_link_info` reported
     %% `type = symlink`, so `read_link` is expected to succeed —

@@ -70,12 +70,12 @@ gzip avoids the question.
 
 -type encoding() :: gzip | deflate | none.
 
--spec call(roadrunner_http1:request(), roadrunner_middleware:next()) -> roadrunner_handler:result().
+-spec call(roadrunner_req:request(), roadrunner_middleware:next()) -> roadrunner_handler:result().
 call(Req, Next) ->
     {Response, Req2} = Next(Req),
     {transform(Req, Response), Req2}.
 
--spec transform(roadrunner_http1:request(), roadrunner_handler:response()) ->
+-spec transform(roadrunner_req:request(), roadrunner_handler:response()) ->
     roadrunner_handler:response().
 transform(_Req, {Status, Headers, Body} = _Response) when is_integer(Status) ->
     transform_buffered(_Req, Status, Headers, Body);
@@ -97,9 +97,9 @@ transform(_Req, Other) ->
 %% running the middleware depends on the request's value), so Vary
 %% goes on every response that isn't already content-encoded.
 -spec transform_buffered(
-    roadrunner_http1:request(),
-    roadrunner_http1:status(),
-    roadrunner_http1:headers(),
+    roadrunner_req:request(),
+    roadrunner_req:status(),
+    roadrunner_req:headers(),
     iodata()
 ) -> roadrunner_handler:response().
 transform_buffered(Req, Status, Headers, Body) ->
@@ -119,9 +119,9 @@ transform_buffered(Req, Status, Headers, Body) ->
     end.
 
 -spec transform_stream(
-    roadrunner_http1:request(),
-    roadrunner_http1:status(),
-    roadrunner_http1:headers(),
+    roadrunner_req:request(),
+    roadrunner_req:status(),
+    roadrunner_req:headers(),
     roadrunner_handler:stream_fun()
 ) -> roadrunner_handler:response().
 transform_stream(Req, Status, Headers, Fun) ->
@@ -145,8 +145,8 @@ transform_stream(Req, Status, Headers, Fun) ->
 %% bytes to the conn's real `Send`. The zlib context is released in
 %% a `try/after` so a crashing user fun doesn't leak the resource.
 -spec wrap_stream(
-    roadrunner_http1:status(),
-    roadrunner_http1:headers(),
+    roadrunner_req:status(),
+    roadrunner_req:headers(),
     roadrunner_handler:stream_fun(),
     gzip | deflate
 ) ->
@@ -181,8 +181,8 @@ wrap_stream(Status, Headers, Fun, Encoding) ->
     {stream, Status, NewHeaders, WrappedFun}.
 
 -spec compress(
-    roadrunner_http1:status(),
-    roadrunner_http1:headers(),
+    roadrunner_req:status(),
+    roadrunner_req:headers(),
     iodata(),
     gzip | deflate
 ) -> roadrunner_handler:response().
@@ -226,7 +226,7 @@ encoding_token(deflate) -> ~"deflate".
 %%
 %% Returned: `gzip | deflate | none`. `none` if neither has an
 %% effective q > 0.
--spec negotiate_encoding(roadrunner_http1:request()) -> encoding().
+-spec negotiate_encoding(roadrunner_req:request()) -> encoding().
 negotiate_encoding(Req) ->
     case roadrunner_req:header(~"accept-encoding", Req) of
         undefined ->
@@ -312,11 +312,11 @@ parse_q(QBin, Default) ->
             end
     end.
 
--spec has_header(binary(), roadrunner_http1:headers()) -> boolean().
+-spec has_header(binary(), roadrunner_req:headers()) -> boolean().
 has_header(Name, Headers) ->
     lists:keymember(Name, 1, Headers).
 
--spec add_vary(roadrunner_http1:headers()) -> roadrunner_http1:headers().
+-spec add_vary(roadrunner_req:headers()) -> roadrunner_req:headers().
 add_vary(Headers) ->
     case has_header(~"vary", Headers) of
         true -> Headers;

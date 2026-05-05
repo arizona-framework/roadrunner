@@ -55,7 +55,7 @@ handle(Req) ->
 -export_type([send_fun/0, stream_fun/0, push_fun/0, sendfile_spec/0, response/0, result/0]).
 
 -type send_fun() ::
-    fun((iodata(), nofin | fin | {fin, roadrunner_http1:headers()}) -> ok | {error, term()}).
+    fun((iodata(), nofin | fin | {fin, roadrunner_req:headers()}) -> ok | {error, term()}).
 -type stream_fun() :: fun((send_fun()) -> any()).
 -type push_fun() :: fun((iodata()) -> ok | {error, term()}).
 -type sendfile_spec() :: {
@@ -64,15 +64,14 @@ handle(Req) ->
     Length :: non_neg_integer()
 }.
 -type response() ::
-    {StatusCode :: roadrunner_http1:status(), roadrunner_http1:headers(), Body :: iodata()}
-    | {stream, StatusCode :: roadrunner_http1:status(), roadrunner_http1:headers(), stream_fun()}
-    | {loop, StatusCode :: roadrunner_http1:status(), roadrunner_http1:headers(), State :: term()}
-    | {sendfile, StatusCode :: roadrunner_http1:status(), roadrunner_http1:headers(),
-        sendfile_spec()}
+    {StatusCode :: roadrunner_req:status(), roadrunner_req:headers(), Body :: iodata()}
+    | {stream, StatusCode :: roadrunner_req:status(), roadrunner_req:headers(), stream_fun()}
+    | {loop, StatusCode :: roadrunner_req:status(), roadrunner_req:headers(), State :: term()}
+    | {sendfile, StatusCode :: roadrunner_req:status(), roadrunner_req:headers(), sendfile_spec()}
     | {websocket, Module :: module(), State :: term()}.
--type result() :: {response(), roadrunner_http1:request()}.
+-type result() :: {response(), roadrunner_req:request()}.
 
--callback handle(Request :: roadrunner_http1:request()) -> result().
+-callback handle(Request :: roadrunner_req:request()) -> result().
 -callback handle_info(Info :: term(), Push :: push_fun(), State :: term()) ->
     {ok, NewState :: term()} | {stop, NewState :: term()}.
 

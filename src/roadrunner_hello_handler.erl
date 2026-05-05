@@ -10,7 +10,7 @@ Replaces the hardcoded body roadrunner_conn carried before slice 3.
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Body = ~"Hello, roadrunner!\r\n",
     Resp =

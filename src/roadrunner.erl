@@ -80,7 +80,7 @@ For SREs computing "how much grace did the handler use," see
 `acknowledge_drain/2` which threads the `Deadline` from the
 `{roadrunner_drain, Deadline}` message into the event metadata.
 """.
--spec acknowledge_drain(roadrunner_http1:request()) -> ok.
+-spec acknowledge_drain(roadrunner_req:request()) -> ok.
 acknowledge_drain(Req) when is_map(Req) ->
     roadrunner_telemetry:drain_acknowledged(drain_metadata(Req, undefined)).
 
@@ -91,11 +91,11 @@ message a handler received) into the telemetry metadata so subscribers
 can compute `Deadline - erlang:monotonic_time(millisecond)` for the
 remaining grace period.
 """.
--spec acknowledge_drain(roadrunner_http1:request(), integer()) -> ok.
+-spec acknowledge_drain(roadrunner_req:request(), integer()) -> ok.
 acknowledge_drain(Req, Deadline) when is_map(Req), is_integer(Deadline) ->
     roadrunner_telemetry:drain_acknowledged(drain_metadata(Req, Deadline)).
 
--spec drain_metadata(roadrunner_http1:request(), integer() | undefined) -> map().
+-spec drain_metadata(roadrunner_req:request(), integer() | undefined) -> map().
 drain_metadata(Req, Deadline) ->
     #{
         listener_name => maps:get(listener_name, Req, undefined),

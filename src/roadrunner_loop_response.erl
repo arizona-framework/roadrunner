@@ -40,8 +40,8 @@ loop. Returns when the handler's `handle_info/3` returns `{stop, _}`.
 """.
 -spec run(
     roadrunner_transport:socket(),
-    roadrunner_http1:status(),
-    roadrunner_http1:headers(),
+    roadrunner_req:status(),
+    roadrunner_req:headers(),
     module(),
     term()
 ) -> ok.

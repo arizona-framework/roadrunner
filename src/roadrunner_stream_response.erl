@@ -31,8 +31,8 @@ decision).
 """.
 -spec run(
     roadrunner_transport:socket(),
-    roadrunner_http1:status(),
-    roadrunner_http1:headers(),
+    roadrunner_req:status(),
+    roadrunner_req:headers(),
     roadrunner_handler:stream_fun()
 ) -> ok | {error, term()}.
 run(Socket, Status, UserHeaders, Fun) ->
@@ -56,7 +56,7 @@ run(Socket, Status, UserHeaders, Fun) ->
 %% emits nothing, `Send(<<>>, fin)` emits just the terminator (no
 %% leading chunk), and `Send(<<>>, {fin, Trailers})` emits just the
 %% terminator + trailers.
--spec stream_frame(iodata(), nofin | fin | {fin, roadrunner_http1:headers()}) -> iodata().
+-spec stream_frame(iodata(), nofin | fin | {fin, roadrunner_req:headers()}) -> iodata().
 stream_frame(Data, nofin) ->
     case iolist_size(Data) of
         0 -> [];
@@ -74,7 +74,7 @@ chunk_or_empty(Data) ->
         N -> [integer_to_binary(N, 16), ~"\r\n", Data, ~"\r\n"]
     end.
 
--spec encode_trailers(roadrunner_http1:headers()) -> iodata().
+-spec encode_trailers(roadrunner_req:headers()) -> iodata().
 encode_trailers(Trailers) ->
     %% Trailers go on the wire after the size-0 chunk; the same
     %% header-injection defense the response-line headers get applies

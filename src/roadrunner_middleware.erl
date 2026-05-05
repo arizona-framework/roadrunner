@@ -6,7 +6,7 @@ A middleware wraps the rest of the request pipeline:
 
 ```erlang
 -callback call(Request, Next) -> Result when
-    Request :: roadrunner_http1:request(),
+    Request :: roadrunner_req:request(),
     Next :: fun((Request) -> Result),
     Result :: roadrunner_handler:result().
 ```
@@ -107,13 +107,13 @@ server_header(Req, Next) ->
 -export([compose/2]).
 -export_type([middleware/0, middleware_list/0, next/0]).
 
--type next() :: fun((roadrunner_http1:request()) -> roadrunner_handler:result()).
+-type next() :: fun((roadrunner_req:request()) -> roadrunner_handler:result()).
 -type middleware() ::
     module()
-    | fun((roadrunner_http1:request(), next()) -> roadrunner_handler:result()).
+    | fun((roadrunner_req:request(), next()) -> roadrunner_handler:result()).
 -type middleware_list() :: [middleware()].
 
--callback call(Request :: roadrunner_http1:request(), Next :: next()) ->
+-callback call(Request :: roadrunner_req:request(), Next :: next()) ->
     roadrunner_handler:result().
 
 -doc """
@@ -132,7 +132,7 @@ compose([Mw | Rest], Handler) ->
     Inner = compose(Rest, Handler),
     fun(Req) -> apply_one(Mw, Req, Inner) end.
 
--spec apply_one(middleware(), roadrunner_http1:request(), next()) ->
+-spec apply_one(middleware(), roadrunner_req:request(), next()) ->
     roadrunner_handler:result().
 apply_one(Mod, Req, Next) when is_atom(Mod) ->
     Mod:call(Req, Next);

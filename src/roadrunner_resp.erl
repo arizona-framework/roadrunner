@@ -27,10 +27,10 @@ helpers only fill in what the handler can know.
 
 -export_type([response/0]).
 
--type response() :: {roadrunner_http1:status(), roadrunner_http1:headers(), iodata()}.
+-type response() :: {roadrunner_req:status(), roadrunner_req:headers(), iodata()}.
 
 -doc "Plain-text response with `text/plain; charset=utf-8`.".
--spec text(StatusCode :: roadrunner_http1:status(), Body :: iodata()) -> response().
+-spec text(StatusCode :: roadrunner_req:status(), Body :: iodata()) -> response().
 text(Status, Body) ->
     with_length(Status, ~"text/plain; charset=utf-8", Body).
 
@@ -51,7 +51,7 @@ roadrunner_resp:add_header(
 
 `add_header/3` prepends, so the bare value wins on header lookup.
 """.
--spec html(StatusCode :: roadrunner_http1:status(), Body :: iodata()) -> response().
+-spec html(StatusCode :: roadrunner_req:status(), Body :: iodata()) -> response().
 html(Status, Body) ->
     with_length(Status, ~"text/html; charset=utf-8", Body).
 
@@ -59,7 +59,7 @@ html(Status, Body) ->
 JSON response — the term is encoded via the stdlib `json` module
 (OTP 27+) and `Content-Type` is set to `application/json`.
 """.
--spec json(StatusCode :: roadrunner_http1:status(), Term :: term()) -> response().
+-spec json(StatusCode :: roadrunner_req:status(), Term :: term()) -> response().
 json(Status, Term) ->
     Body = json:encode(Term),
     with_length(Status, ~"application/json", Body).
@@ -68,7 +68,7 @@ json(Status, Term) ->
 Redirect response — sets the `Location` header and an empty body.
 Use a 3xx status (typically 301, 302, 303, 307, or 308).
 """.
--spec redirect(StatusCode :: roadrunner_http1:redirect_status(), Location :: binary()) ->
+-spec redirect(StatusCode :: roadrunner_req:redirect_status(), Location :: binary()) ->
     response().
 redirect(Status, Location) when is_binary(Location) ->
     {Status,
@@ -78,7 +78,7 @@ redirect(Status, Location) when is_binary(Location) ->
         ],
         ~""}.
 
--spec with_length(roadrunner_http1:status(), binary(), iodata()) -> response().
+-spec with_length(roadrunner_req:status(), binary(), iodata()) -> response().
 with_length(Status, ContentType, Body) ->
     {Status,
         [
@@ -137,9 +137,9 @@ internal_error() -> empty_status(500).
 Empty-body response with an arbitrary status code — handy for
 statuses outside the named shortcut set (e.g., 418, 503).
 """.
--spec status(roadrunner_http1:status()) -> response().
+-spec status(roadrunner_req:status()) -> response().
 status(Code) -> empty_status(Code).
 
--spec empty_status(roadrunner_http1:status()) -> response().
+-spec empty_status(roadrunner_req:status()) -> response().
 empty_status(Status) ->
     {Status, [{~"content-length", ~"0"}], ~""}.
