@@ -93,6 +93,9 @@ preflight_scenario(#{scenario := varied_paths_router, servers := Servers} = Opts
 preflight_scenario(#{scenario := gzip_response, servers := Servers} = Opts) ->
     filter_servers(gzip_response, [elli], Servers, Opts,
         ~"no built-in gzip middleware");
+preflight_scenario(#{scenario := backpressure_sustained, servers := Servers} = Opts) ->
+    filter_servers(backpressure_sustained, [elli], Servers, Opts,
+        ~"no max_connections cap; comparison would not be apples-to-apples");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -180,7 +183,8 @@ cli() ->
                         large_post_streaming,
                         router_404_storm,
                         varied_paths_router,
-                        gzip_response
+                        gzip_response,
+                        backpressure_sustained
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -290,6 +294,17 @@ cli() ->
                                     middleware (cowboy: cowboy_compress_h
                                     stream handler). elli filtered
                                     out (no built-in compression).
+                    backpressure_sustained:
+                                    h1-only. Listener capped at 50
+                                    concurrent slots; bench drives
+                                    --clients > cap (default 200)
+                                    so 150 conn-attempts fail at
+                                    slot-acquire and the surviving
+                                    50 do sustained keep-alive
+                                    throughput. Cowboy uses ranch
+                                    max_connections; elli has no
+                                    cap so filtered out for
+                                    apples-to-apples.
                     """
             },
             #{
@@ -485,7 +500,7 @@ start_cowboy_h1(Scenario) ->
     %% a `ranch:opts()` map — passing a flat list interprets every tuple
     %% as a `socket_opt` and `num_acceptors` ends up at `inet_tcp:listen`
     %% which crashes with `badarg`.
-    TransportOpts = #{num_acceptors => 10, socket_opts => [{port, 0}]},
+    TransportOpts = scenario_cowboy_transport_opts(Scenario),
     ProtoOpts = scenario_cowboy_proto_opts(Scenario, Dispatch),
     {ok, _} = peer:call(Peer, cowboy, start_clear, [bench_cb, TransportOpts, ProtoOpts]),
     Port = peer:call(Peer, ranch, get_port, [bench_cb]),
@@ -675,6 +690,13 @@ scenario_roadrunner_opts(gzip_response, BaseOpts) ->
         middlewares => [roadrunner_compress],
         routes => [{~"/gzip", roadrunner_bench_gzip_handler, undefined}]
     };
+scenario_roadrunner_opts(backpressure_sustained, BaseOpts) ->
+    %% Override the bench's default max_clients => 100K to a tight
+    %% cap so the bench's 200-client wave saturates the listener.
+    BaseOpts#{
+        handler => roadrunner_keepalive_handler,
+        max_clients => 50
+    };
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -732,7 +754,22 @@ scenario_cowboy_routes(router_404_storm) ->
 scenario_cowboy_routes(varied_paths_router) ->
     [{'_', varied_paths_cowboy_routes()}];
 scenario_cowboy_routes(gzip_response) ->
-    [{'_', [{"/gzip", roadrunner_bench_cowboy_gzip_handler, []}]}].
+    [{'_', [{"/gzip", roadrunner_bench_cowboy_gzip_handler, []}]}];
+scenario_cowboy_routes(backpressure_sustained) ->
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}].
+
+%% Per-scenario cowboy TransportOpts. The default keeps the bench's
+%% prior shape (`num_acceptors => 10`); `backpressure_sustained`
+%% layers a 50-conn `max_connections` cap to mirror roadrunner's
+%% `max_clients => 50` for that scenario.
+scenario_cowboy_transport_opts(backpressure_sustained) ->
+    #{
+        num_acceptors => 10,
+        socket_opts => [{port, 0}],
+        max_connections => 50
+    };
+scenario_cowboy_transport_opts(_Scenario) ->
+    #{num_acceptors => 10, socket_opts => [{port, 0}]}.
 
 %% Per-scenario cowboy ProtoOpts. Default returns the base map; the
 %% gzip_response scenario layers in `cowboy_compress_h` ahead of
@@ -1317,6 +1354,8 @@ build_request(large_post_streaming) ->
         Body/binary>>;
 build_request(gzip_response) ->
     ~"GET /gzip HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n";
+build_request(backpressure_sustained) ->
+    ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 build_request(post_4kb_form) ->
     %% 4 KB urlencoded body — see `post_4kb_form_body/0` for shape.
     %% Predictable parse cost (ASCII letters/digits only, no
@@ -1383,7 +1422,8 @@ expected_body_len(gzip_response) ->
     %% buffer and would be picked up by the next iteration's recv —
     %% but each iteration's response fits in one TCP segment on
     %% loopback so this is moot in practice.
-    50.
+    50;
+expected_body_len(backpressure_sustained) -> 7.
 
 %% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
 %% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
@@ -1647,6 +1687,14 @@ h2_request_shape(gzip_response) ->
         "error: --scenario gzip_response is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(backpressure_sustained) ->
+    %% Connection limits over h2 are per-stream not per-conn; the
+    %% h2 equivalent (multi_stream_h2 + low MAX_CONCURRENT_STREAMS)
+    %% is a different scenario worth its own design. h1-only here.
+    io:format(standard_error,
+        "error: --scenario backpressure_sustained is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -1832,7 +1880,9 @@ scenario_request_summary(router_404_storm) ->
 scenario_request_summary(varied_paths_router) ->
     "GET /api/v1/items/<NNNN> HTTP/1.1, round-robin across 100 routed paths (router)";
 scenario_request_summary(gzip_response) ->
-    "GET /gzip HTTP/1.1 + Accept-Encoding: gzip, 16 KB JSON in / ~200 B out (router + compress)".
+    "GET /gzip HTTP/1.1 + Accept-Encoding: gzip, 16 KB JSON in / ~200 B out (router + compress)";
+scenario_request_summary(backpressure_sustained) ->
+    "GET / HTTP/1.1, server capped at 50 concurrent slots, --clients exceeds cap (handler)".
 
 result_to_row(Side, #{
     total := Total,
