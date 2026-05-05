@@ -321,13 +321,27 @@ base_listen_opts() ->
     %% defaults to 1024; matching that. Linux clamps at
     %% `net.core.somaxconn` (typically 4096), so this is safely
     %% non-truncated everywhere.
+    %%
+    %% `buffer` is the emulator's user-space buffer that bounds how
+    %% many bytes each `{tcp, _, Data}` message carries in
+    %% `{active, ...}` mode. The OTP default is `min(sndbuf,
+    %% recbuf)` and on plain TCP with MTU-bounded delivery
+    %% (1460-byte chunks) this can result in many small messages
+    %% per request body, each paying the message-passing tax. 64 KB
+    %% is enough to carry 4 default-sized HTTP/2 DATA frames or a
+    %% typical request, comfortably above the per-MTU floor without
+    %% wasting memory at scale (`max_clients × 64KB` ≈ 10 MB at the
+    %% default `max_clients = 150`). See `erlang/otp#9423` and
+    %% `ninenines/cowlib#143` for the upstream context that prompted
+    %% this tuning.
     [
         binary,
         {active, false},
         {reuseaddr, true},
         {packet, raw},
         {nodelay, true},
-        {backlog, 1024}
+        {backlog, 1024},
+        {buffer, 65536}
     ].
 
 %% When `http2_enabled => true` and the user didn't supply their own
