@@ -370,7 +370,7 @@ file. Spot-checks from the same run:
 | Per-conn process model         | tail-recursive `proc_lib` loop   | tail-recursive loop        | gen_server + stream handlers  |
 | Request lifecycle observable   | yes (`proc_lib:get_label/1`)     | no                         | partial                       |
 | Drain / graceful shutdown      | built-in (`pg`-broadcast)        | DIY                        | partial                       |
-| Telemetry                      | `telemetry` library, 8 events    | none (handler callbacks)   | `cowboy_metrics_h` opt-in     |
+| Telemetry                      | `telemetry` library, 12 events   | none (handler callbacks)   | `cowboy_metrics_h` opt-in     |
 | Middleware shape               | continuation-passing             | `pre_request`/`post_request` callback | deprecated `(Req, Env)`/stream handlers |
 | Hibernation between requests   | `hibernate_after` works          | no                         | depends on stream handler     |
 | Default recv mode              | passive (`gen_tcp:recv`)         | passive (`gen_tcp:recv`)   | active (`{active, once}`)     |
