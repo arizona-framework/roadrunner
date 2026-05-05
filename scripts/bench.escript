@@ -140,7 +140,8 @@ cli() ->
                         large_response,
                         json,
                         headers_heavy,
-                        streaming_response
+                        streaming_response,
+                        multi_stream_h2
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -165,6 +166,14 @@ cli() ->
                                     chunks via the framework's stream-
                                     body API. Exercises the streaming
                                     worker path + per-chunk fragmentation.
+                    multi_stream_h2:
+                                    h2-only. Bench client opens ONE TLS
+                                    conn and drives 16 multiplexed
+                                    streams in flight before reading
+                                    any responses. The actual h2
+                                    workload — exercises per-stream
+                                    workers, conn-level flow control,
+                                    and MAX_CONCURRENT_STREAMS dispatch.
                     """
             },
             #{
@@ -508,7 +517,11 @@ scenario_roadrunner_opts(large_response, BaseOpts) ->
 scenario_roadrunner_opts(json, BaseOpts) ->
     BaseOpts#{routes => [{~"/json", roadrunner_bench_json_handler, undefined}]};
 scenario_roadrunner_opts(streaming_response, BaseOpts) ->
-    BaseOpts#{routes => [{~"/streaming", roadrunner_bench_streaming_handler, undefined}]}.
+    BaseOpts#{routes => [{~"/streaming", roadrunner_bench_streaming_handler, undefined}]};
+scenario_roadrunner_opts(multi_stream_h2, BaseOpts) ->
+    %% Same handler as `hello` — the differentiator is the bench
+    %% client driving N streams in flight per conn.
+    BaseOpts#{handler => roadrunner_keepalive_handler}.
 
 scenario_cowboy_routes(hello) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
@@ -521,7 +534,9 @@ scenario_cowboy_routes(large_response) ->
 scenario_cowboy_routes(json) ->
     [{'_', [{"/json", roadrunner_bench_cowboy_json_handler, []}]}];
 scenario_cowboy_routes(streaming_response) ->
-    [{'_', [{"/streaming", roadrunner_bench_cowboy_streaming_handler, []}]}].
+    [{'_', [{"/streaming", roadrunner_bench_cowboy_streaming_handler, []}]}];
+scenario_cowboy_routes(multi_stream_h2) ->
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}].
 
 %% Inherit the parent's code path so the peer sees both default- and
 %% test-profile artifacts (cowboy lives under test).
@@ -591,6 +606,11 @@ build_request(streaming_response) ->
     %% can't reuse — limit this scenario to h2.
     io:format(standard_error,
         "error: --scenario streaming_response is h2-only "
+        "(use --protocol h2)~n", []),
+    halt(2);
+build_request(multi_stream_h2) ->
+    io:format(standard_error,
+        "error: --scenario multi_stream_h2 is h2-only "
         "(use --protocol h2)~n", []),
     halt(2);
 build_request(headers_heavy) ->
@@ -705,6 +725,21 @@ bump_err(#{err := E} = Acc) ->
 %% framing overhead, not h2 multiplexing benefit.
 %% ===========================================================================
 
+run_phase_h2(
+    Port, #{clients := C, host := Host, scenario := multi_stream_h2}, DurationMs
+) ->
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    Self = self(),
+    StartUs = erlang:monotonic_time(microsecond),
+    Workers = [
+        spawn_link(fun() ->
+            Self ! {self(), h2_multi_stream_worker(Host, Port, Deadline, init_acc())}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
+    EndUs = erlang:monotonic_time(microsecond),
+    aggregate(PerWorker, EndUs - StartUs);
 run_phase_h2(Port, #{clients := C, host := Host, scenario := Scenario}, DurationMs) ->
     Deadline = erlang:monotonic_time(millisecond) + DurationMs,
     {Method, Path, ReqHeaders, ReqBody} = h2_request_shape(Scenario),
@@ -723,6 +758,50 @@ run_phase_h2(Port, #{clients := C, host := Host, scenario := Scenario}, Duration
     PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
     EndUs = erlang:monotonic_time(microsecond),
     aggregate(PerWorker, EndUs - StartUs).
+
+%% Number of concurrent streams in flight per `request_many/2`
+%% batch. Roadrunner advertises MAX_CONCURRENT_STREAMS=100; cowboy
+%% defaults to 100 too; pick a value comfortably below both that
+%% still meaningfully exercises multiplexing.
+-define(MULTI_STREAM_BATCH, 16).
+
+h2_multi_stream_worker(Host, Port, Deadline, Acc) ->
+    case roadrunner_bench_client:open(Host, Port, h2) of
+        {ok, Conn} ->
+            Final = h2_multi_stream_loop(Conn, Deadline, Acc),
+            _ = roadrunner_bench_client:close(Conn),
+            Final;
+        {error, _} ->
+            bump_err(Acc)
+    end.
+
+h2_multi_stream_loop(Conn, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Acc;
+        false ->
+            T0 = erlang:monotonic_time(nanosecond),
+            case roadrunner_bench_client:request_many(Conn, ?MULTI_STREAM_BATCH) of
+                {ok, Conn1} ->
+                    T1 = erlang:monotonic_time(nanosecond),
+                    %% Per-batch latency is divided across the
+                    %% N streams so the bench's per-request mean /
+                    %% percentiles are comparable to the
+                    %% single-stream scenarios. Each stream gets
+                    %% the same sample point — the batch's wall
+                    %% time / N — which is fine for percentile
+                    %% calculations on bursty workloads.
+                    PerStream = (T1 - T0) div ?MULTI_STREAM_BATCH,
+                    Acc1 = lists:foldl(
+                        fun(_, A) -> bump_ok(A, PerStream, 0) end,
+                        Acc,
+                        lists:seq(1, ?MULTI_STREAM_BATCH)
+                    ),
+                    h2_multi_stream_loop(Conn1, Deadline, Acc1);
+                {error, _} ->
+                    bump_err(Acc)
+            end
+    end.
 
 h2_request_shape(hello) ->
     {~"GET", ~"/", [], <<>>};
@@ -900,7 +979,9 @@ scenario_request_summary(json) ->
 scenario_request_summary(headers_heavy) ->
     "GET / HTTP/1.1, 17 headers, 7-byte response body (handler)";
 scenario_request_summary(streaming_response) ->
-    "GET /streaming HTTP/1.1, 1 header, 4 × 4 KB chunks (router)".
+    "GET /streaming HTTP/1.1, 1 header, 4 × 4 KB chunks (router)";
+scenario_request_summary(multi_stream_h2) ->
+    "GET / over h2 with 16 multiplexed streams in flight per conn (handler)".
 
 result_to_row(Side, #{
     total := Total,

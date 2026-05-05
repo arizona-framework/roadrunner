@@ -30,7 +30,7 @@ ms. That's now fixed at the listener layer
 `docs/h2_loadgen_artifact.md`.
 """.
 
--export([open/3, request/5, close/1]).
+-export([open/3, request/5, request_many/2, close/1]).
 -export_type([conn/0, protocol/0]).
 
 %% RFC 9113 §3.4 client connection preface.
@@ -203,6 +203,123 @@ close(#h1_conn{sock = Sock}) ->
 close(#h2_conn{sock = Sock}) ->
     _ = ssl:close(Sock),
     ok.
+
+-doc """
+h2 multi-stream request: send `N` GET requests on `N` fresh stream
+ids in one `ssl:send/2`, then drain until all `N` END_STREAM
+responses arrive. Exercises h2 multiplexing — the workload h2 was
+designed for.
+
+Returns `{ok, Conn}` once all N responses have been collected (any
+response with status =/= 200 short-circuits to `{error, bad_status}`)
+or `{error, Reason}` on transport failure.
+""".
+-spec request_many(#h2_conn{}, pos_integer()) ->
+    {ok, #h2_conn{}} | {error, term()}.
+request_many(
+    #h2_conn{
+        sock = Sock,
+        buf = Buf,
+        enc = Enc,
+        dec = Dec,
+        next_stream_id = Sid0,
+        authority = Auth
+    } = Conn,
+    N
+) when N >= 1 ->
+    Pseudo = [
+        {~":method", ~"GET"},
+        {~":scheme", ~"https"},
+        {~":authority", Auth},
+        {~":path", ~"/"}
+    ],
+    %% Encode N HEADERS frames in a row; the encoder's dyn table
+    %% mutates across the batch, so we thread Enc through.
+    {Frames, Enc1, LastSid} = build_h2_batch(Pseudo, Enc, Sid0, N),
+    case ssl:send(Sock, Frames) of
+        ok ->
+            %% Track outstanding stream ids in a map sid → undefined.
+            %% Each END_STREAM response removes its key; we're done
+            %% when the map is empty.
+            Pending = lists:foldl(
+                fun(I, Acc) -> Acc#{Sid0 + I * 2 => true} end,
+                #{},
+                lists:seq(0, N - 1)
+            ),
+            case recv_h2_streams(Sock, Buf, Pending, Dec) of
+                {ok, Buf1, Dec1} ->
+                    {ok, Conn#h2_conn{
+                        buf = Buf1,
+                        enc = Enc1,
+                        dec = Dec1,
+                        next_stream_id = LastSid + 2
+                    }};
+                {error, _} = E ->
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+build_h2_batch(_Pseudo, Enc, Sid, 0) ->
+    {[], Enc, Sid - 2};
+build_h2_batch(Pseudo, Enc, Sid, N) ->
+    {Block, Enc1} = roadrunner_http2_hpack:encode(Pseudo, Enc),
+    Frame = roadrunner_http2_frame:encode(
+        {headers, Sid, 16#04 bor 16#01, undefined, Block}
+    ),
+    {Rest, Enc2, LastSid} = build_h2_batch(Pseudo, Enc1, Sid + 2, N - 1),
+    {[Frame | Rest], Enc2, LastSid}.
+
+%% Drain frames until every stream id in `Pending` has emitted an
+%% END_STREAM bit. Per-stream HEADERS are fully decoded so the
+%% encoder/decoder dyn tables stay in lockstep across the batch.
+recv_h2_streams(_Sock, Buf, Pending, Dec) when map_size(Pending) =:= 0 ->
+    {ok, Buf, Dec};
+recv_h2_streams(Sock, Buf, Pending, Dec) ->
+    case roadrunner_http2_frame:parse(Buf, ?MAX_FRAME_SIZE) of
+        {ok, {headers, Sid, F, _Priority, Block}, Rest} ->
+            {ok, Decoded, Dec1} = roadrunner_http2_hpack:decode(Block, Dec),
+            case lists:keyfind(~":status", 1, Decoded) of
+                {_, ~"200"} ->
+                    Pending1 =
+                        case (F band 16#01) =/= 0 of
+                            true -> maps:remove(Sid, Pending);
+                            false -> Pending
+                        end,
+                    recv_h2_streams(Sock, Rest, Pending1, Dec1);
+                {_, S} ->
+                    {error, {bad_status, S}};
+                false ->
+                    {error, no_status}
+            end;
+        {ok, {data, Sid, F, _Payload}, Rest} ->
+            Pending1 =
+                case (F band 16#01) =/= 0 of
+                    true -> maps:remove(Sid, Pending);
+                    false -> Pending
+                end,
+            recv_h2_streams(Sock, Rest, Pending1, Dec);
+        {ok, {settings, 0, _}, Rest} ->
+            ok = ssl:send(Sock, h2_settings_ack_frame()),
+            recv_h2_streams(Sock, Rest, Pending, Dec);
+        {ok, {ping, 0, Opaque}, Rest} ->
+            ok = ssl:send(Sock, roadrunner_http2_frame:encode({ping, 1, Opaque})),
+            recv_h2_streams(Sock, Rest, Pending, Dec);
+        {ok, _Other, Rest} ->
+            recv_h2_streams(Sock, Rest, Pending, Dec);
+        {more, _Need} ->
+            case ssl:recv(Sock, 0, 5000) of
+                {ok, More} ->
+                    recv_h2_streams(
+                        Sock, <<Buf/binary, More/binary>>, Pending, Dec
+                    );
+                {error, _} = E ->
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
 
 %% =============================================================================
 %% h1 helpers
