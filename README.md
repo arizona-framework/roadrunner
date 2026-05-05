@@ -29,10 +29,15 @@ Standards conformance:
   including `*_max_window_bits` and `*_no_context_takeover`.
 
 The per-connection request lifecycle is a tail-recursive `proc_lib`
-loop (`roadrunner_conn_loop`) with named phases (`awaiting_shoot |
-reading_request | reading_body | dispatching | finishing`)
-reflected in `proc_lib:get_label/1` so the lifecycle shows up in
-observer's process inspector and `recon:proc_count/2`.
+loop (`roadrunner_conn_loop`). The conn process carries a
+`proc_lib:set_label/1` label — `{roadrunner_conn, awaiting_shoot,
+ListenerName}` while idle / between requests, refined to include
+the peer once the request starts. Mid-request phases (read body,
+dispatch, finish) run in microseconds and aren't labeled — too
+fast for an `observer` snapshot to land on a specific phase anyway.
+Stuck conns still surface via the entry label and the
+`reading_request` idle window (where hibernation parks the
+process).
 
 The HTTP/2 path takes over after the TLS ALPN handshake settles
 on `h2`; it shares the same handler / middleware / router / drain
