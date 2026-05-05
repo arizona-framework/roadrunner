@@ -1,5 +1,5 @@
 {application, roadrunner, [
-    {description, "An OTP application"},
+    {description, "Pure-Erlang HTTP and WebSocket server. Beep beep."},
     {vsn, "0.1.0"},
     {registered, []},
     {mod, {roadrunner_app, []}},
@@ -12,5 +12,7 @@
     {env, []},
     {modules, []},
     {licenses, ["Apache-2.0"]},
-    {links, []}
+    {links, [
+        {"GitHub", "https://github.com/arizona-framework/roadrunner"}
+    ]}
 ]}.
