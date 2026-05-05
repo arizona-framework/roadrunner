@@ -432,6 +432,21 @@ cli() ->
                 help => "Minimum total ms for a row to appear in the hotspot table."
             },
             #{
+                name => profile_tool,
+                long => "-profile-tool",
+                type => {atom, [eprof, fprof]},
+                default => eprof,
+                help =>
+                    """
+                    Profiler tool. `eprof` is fast but times out under high
+                    request volume (connection_storm, multi_stream_h2,
+                    websocket_msg_throughput); `fprof` handles those without
+                    blocking but writes a richer call-tree analysis to
+                    `/tmp/roadrunner_bench_fprof_<server>.log` which the
+                    user reads directly. `--profile` must also be set.
+                    """
+            },
+            #{
                 name => protocol,
                 long => "-protocol",
                 type => {atom, [h1, h2]},
@@ -516,11 +531,25 @@ run_side(Side, Opts) ->
 
 maybe_start_profile(_Peer, #{profile := false}) ->
     ok;
+maybe_start_profile(Peer, #{profile := true, profile_tool := fprof}) ->
+    Trace = "/tmp/roadrunner_bench_fprof.trace",
+    ok = peer:call(Peer, roadrunner_bench_profiler, start_fprof, [Trace]);
 maybe_start_profile(Peer, #{profile := true}) ->
     ok = peer:call(Peer, roadrunner_bench_profiler, start, []).
 
 maybe_stop_profile(_Peer, _Side, #{profile := false}) ->
     ok;
+maybe_stop_profile(Peer, Side, #{profile := true, profile_tool := fprof}) ->
+    Trace = "/tmp/roadrunner_bench_fprof.trace",
+    Analysis =
+        filename:join(["/tmp", "roadrunner_bench_fprof_" ++ atom_to_list(Side) ++ ".log"]),
+    %% fprof's profile + analyse steps walk the trace file twice and
+    %% can take 30+ seconds on a 100k-event trace; bump peer:call's
+    %% default 5 s timeout.
+    ok = peer:call(
+        Peer, roadrunner_bench_profiler, stop_fprof_and_dump, [Trace, Analysis], 120000
+    ),
+    io:format("~nprofile (fprof, ~s) written to ~s~n", [Side, Analysis]);
 maybe_stop_profile(Peer, Side, #{profile := true, profile_min_ms := MinMs}) ->
     Path = filename:join(["/tmp", "roadrunner_bench_eprof_" ++ atom_to_list(Side) ++ ".log"]),
     ok = peer:call(Peer, roadrunner_bench_profiler, stop_and_dump, [Path, MinMs]),
