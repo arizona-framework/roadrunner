@@ -219,7 +219,8 @@ cli() ->
                         accept_storm_burst,
                         head_method,
                         etag_304,
-                        partial_body_drop
+                        partial_body_drop,
+                        cookies_heavy
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -447,6 +448,14 @@ cli() ->
                                     count as OK — measures the
                                     error-path's resilience and
                                     rejection rate.
+                    cookies_heavy:  GET /cookies with 8 cookies in
+                                    a single Cookie: header
+                                    (~200 bytes total). Server
+                                    parses via roadrunner_cookie
+                                    (cowboy: cow_cookie). Tests the
+                                    cookie-header parser hot path
+                                    distinct from the raw header
+                                    pipeline.
                     """
             },
             #{
@@ -901,6 +910,8 @@ scenario_roadrunner_opts(partial_body_drop, BaseOpts) ->
     %% server should detect truncation BEFORE dispatch, so the
     %% handler is a placeholder.
     BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
+scenario_roadrunner_opts(cookies_heavy, BaseOpts) ->
+    BaseOpts#{routes => [{~"/cookies", roadrunner_bench_cookies_handler, undefined}]};
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -980,7 +991,9 @@ scenario_cowboy_routes(head_method) ->
 scenario_cowboy_routes(etag_304) ->
     [{'_', [{"/etag", roadrunner_bench_cowboy_etag_handler, []}]}];
 scenario_cowboy_routes(partial_body_drop) ->
-    [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}].
+    [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}];
+scenario_cowboy_routes(cookies_heavy) ->
+    [{'_', [{"/cookies", roadrunner_bench_cowboy_cookies_handler, []}]}].
 
 %% Per-scenario cowboy TransportOpts. The default keeps the bench's
 %% prior shape (`num_acceptors => 10`); `backpressure_sustained`
@@ -2173,6 +2186,8 @@ build_request(head_method) ->
     ~"HEAD /large HTTP/1.1\r\nHost: x\r\n\r\n";
 build_request(etag_304) ->
     ~"GET /etag HTTP/1.1\r\nHost: x\r\nIf-None-Match: \"v1\"\r\n\r\n";
+build_request(cookies_heavy) ->
+    ~"GET /cookies HTTP/1.1\r\nHost: x\r\nCookie: session=abc123def456ghi789; user_id=42; theme=dark; lang=en-US; tz=America/Los_Angeles; tracker=prod-789xyz; campaign=spring-2026; ab_test=variant_b\r\n\r\n";
 build_request(post_4kb_form) ->
     %% 4 KB urlencoded body — see `post_4kb_form_body/0` for shape.
     %% Predictable parse cost (ASCII letters/digits only, no
@@ -2245,7 +2260,8 @@ expected_body_len(large_keepalive_session) -> 7;
 expected_body_len(url_with_qs) -> 1;
 expected_body_len(small_chunked_response) -> 6400;
 expected_body_len(head_method) -> 0;
-expected_body_len(etag_304) -> 0.
+expected_body_len(etag_304) -> 0;
+expected_body_len(cookies_heavy) -> 1.
 
 %% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
 %% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
@@ -2590,6 +2606,13 @@ h2_request_shape(partial_body_drop) ->
         "error: --scenario partial_body_drop is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(cookies_heavy) ->
+    {~"GET", ~"/cookies",
+        [
+            {~"cookie",
+                ~"session=abc123def456ghi789; user_id=42; theme=dark; lang=en-US; tz=America/Los_Angeles; tracker=prod-789xyz; campaign=spring-2026; ab_test=variant_b"}
+        ],
+        <<>>};
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -2797,7 +2820,9 @@ scenario_request_summary(head_method) ->
 scenario_request_summary(etag_304) ->
     "GET /etag HTTP/1.1 + If-None-Match: \"v1\", server returns 304 with no body (router)";
 scenario_request_summary(partial_body_drop) ->
-    "POST /echo HTTP/1.1, Content-Length: 256 but only 128 sent then close, server rejects (router)".
+    "POST /echo HTTP/1.1, Content-Length: 256 but only 128 sent then close, server rejects (router)";
+scenario_request_summary(cookies_heavy) ->
+    "GET /cookies HTTP/1.1, single Cookie header with 8 pairs, server parses all (router)".
 
 result_to_row(Side, #{
     total := Total,
