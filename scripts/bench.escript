@@ -201,7 +201,8 @@ cli() ->
                         expect_100_continue,
                         large_keepalive_session,
                         websocket_msg_throughput,
-                        url_with_qs
+                        url_with_qs,
+                        small_chunked_response
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -377,6 +378,16 @@ cli() ->
                                     which exercises the body-side
                                     qs path. elli filtered out
                                     (no native qs parser).
+                    small_chunked_response:
+                                    h2-only. GET /small returns
+                                    100 × 64-byte chunks via
+                                    {stream, _, _, Fun}. Tests
+                                    fragmentation overhead
+                                    (per-chunk DATA frame headers)
+                                    on small chunks — distinct
+                                    cost shape from
+                                    `streaming_response`'s
+                                    4 × 4 KB.
                     """
             },
             #{
@@ -817,6 +828,8 @@ scenario_roadrunner_opts(websocket_msg_throughput, BaseOpts) ->
     BaseOpts#{routes => [{~"/ws", roadrunner_ws_upgrade_handler, undefined}]};
 scenario_roadrunner_opts(url_with_qs, BaseOpts) ->
     BaseOpts#{routes => [{~"/qs", roadrunner_bench_url_qs_handler, undefined}]};
+scenario_roadrunner_opts(small_chunked_response, BaseOpts) ->
+    BaseOpts#{routes => [{~"/small", roadrunner_bench_small_chunks_handler, undefined}]};
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -886,7 +899,9 @@ scenario_cowboy_routes(large_keepalive_session) ->
 scenario_cowboy_routes(websocket_msg_throughput) ->
     [{'_', [{"/ws", roadrunner_bench_cowboy_ws_handler, []}]}];
 scenario_cowboy_routes(url_with_qs) ->
-    [{'_', [{"/qs", roadrunner_bench_cowboy_url_qs_handler, []}]}].
+    [{'_', [{"/qs", roadrunner_bench_cowboy_url_qs_handler, []}]}];
+scenario_cowboy_routes(small_chunked_response) ->
+    [{'_', [{"/small", roadrunner_bench_cowboy_small_chunks_handler, []}]}].
 
 %% Per-scenario cowboy TransportOpts. The default keeps the bench's
 %% prior shape (`num_acceptors => 10`); `backpressure_sustained`
@@ -1924,6 +1939,14 @@ build_request(url_with_qs) ->
     %% qs:parse fast-path takes the no-op branch (matches typical
     %% REST API filter URLs).
     ~"GET /qs?filter=active&sort=name&limit=100&offset=200&fields=id,name,email&include=role HTTP/1.1\r\nHost: x\r\n\r\n";
+build_request(small_chunked_response) ->
+    %% Same h1 limitation as `streaming_response`: stream responses
+    %% close the conn per-request, breaking the bench's keep-alive
+    %% loop. h2-only.
+    io:format(standard_error,
+        "error: --scenario small_chunked_response is h2-only "
+        "(use --protocol h2)~n", []),
+    halt(2);
 build_request(post_4kb_form) ->
     %% 4 KB urlencoded body — see `post_4kb_form_body/0` for shape.
     %% Predictable parse cost (ASCII letters/digits only, no
@@ -1993,7 +2016,8 @@ expected_body_len(gzip_response) ->
     50;
 expected_body_len(backpressure_sustained) -> 7;
 expected_body_len(large_keepalive_session) -> 7;
-expected_body_len(url_with_qs) -> 1.
+expected_body_len(url_with_qs) -> 1;
+expected_body_len(small_chunked_response) -> 6400.
 
 %% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
 %% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
@@ -2303,6 +2327,8 @@ h2_request_shape(url_with_qs) ->
         "error: --scenario url_with_qs is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(small_chunked_response) ->
+    {~"GET", ~"/small", [], <<>>};
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -2500,7 +2526,9 @@ scenario_request_summary(large_keepalive_session) ->
 scenario_request_summary(websocket_msg_throughput) ->
     "WS upgrade then 1 KB masked text frame echoes in a tight loop (handler/router)";
 scenario_request_summary(url_with_qs) ->
-    "GET /qs?<6 pairs> HTTP/1.1, server parses URL query string, 1-byte response (router)".
+    "GET /qs?<6 pairs> HTTP/1.1, server parses URL query string, 1-byte response (router)";
+scenario_request_summary(small_chunked_response) ->
+    "GET /small over h2, 100 × 64-byte streamed chunks (router)".
 
 result_to_row(Side, #{
     total := Total,
