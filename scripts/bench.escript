@@ -134,7 +134,14 @@ cli() ->
                 name => scenario,
                 long => "-scenario",
                 type =>
-                    {atom, [hello, echo, large_response, json, headers_heavy]},
+                    {atom, [
+                        hello,
+                        echo,
+                        large_response,
+                        json,
+                        headers_heavy,
+                        streaming_response
+                    ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
                     """
@@ -153,6 +160,11 @@ cli() ->
                                     Stresses the request-header parser
                                     (h1) / HPACK encoder + literal-with-
                                     incremental-indexing path (h2).
+                    streaming_response:
+                                    GET /streaming returns 4 × 4 KB
+                                    chunks via the framework's stream-
+                                    body API. Exercises the streaming
+                                    worker path + per-chunk fragmentation.
                     """
             },
             #{
@@ -494,7 +506,9 @@ scenario_roadrunner_opts(echo, BaseOpts) ->
 scenario_roadrunner_opts(large_response, BaseOpts) ->
     BaseOpts#{routes => [{~"/large", roadrunner_bench_large_handler, undefined}]};
 scenario_roadrunner_opts(json, BaseOpts) ->
-    BaseOpts#{routes => [{~"/json", roadrunner_bench_json_handler, undefined}]}.
+    BaseOpts#{routes => [{~"/json", roadrunner_bench_json_handler, undefined}]};
+scenario_roadrunner_opts(streaming_response, BaseOpts) ->
+    BaseOpts#{routes => [{~"/streaming", roadrunner_bench_streaming_handler, undefined}]}.
 
 scenario_cowboy_routes(hello) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
@@ -505,7 +519,9 @@ scenario_cowboy_routes(echo) ->
 scenario_cowboy_routes(large_response) ->
     [{'_', [{"/large", roadrunner_bench_cowboy_large_handler, []}]}];
 scenario_cowboy_routes(json) ->
-    [{'_', [{"/json", roadrunner_bench_cowboy_json_handler, []}]}].
+    [{'_', [{"/json", roadrunner_bench_cowboy_json_handler, []}]}];
+scenario_cowboy_routes(streaming_response) ->
+    [{'_', [{"/streaming", roadrunner_bench_cowboy_streaming_handler, []}]}].
 
 %% Inherit the parent's code path so the peer sees both default- and
 %% test-profile artifacts (cowboy lives under test).
@@ -568,6 +584,15 @@ build_request(large_response) ->
     ~"GET /large HTTP/1.1\r\nHost: x\r\n\r\n";
 build_request(json) ->
     ~"GET /json HTTP/1.1\r\nHost: x\r\nAccept: application/json\r\n\r\n";
+build_request(streaming_response) ->
+    %% h1 streaming responses close the connection per request (the
+    %% server's chunked-stream emitter returns `close` from the
+    %% keep-alive decision), which the bench's keep-alive loop
+    %% can't reuse — limit this scenario to h2.
+    io:format(standard_error,
+        "error: --scenario streaming_response is h2-only "
+        "(use --protocol h2)~n", []),
+    halt(2);
 build_request(headers_heavy) ->
     %% 16 small request headers + the Host. Names are valid h1
     %% tokens (lowercase ASCII); values are short. Same path as
@@ -601,7 +626,8 @@ expected_body_len(hello) -> 7;
 expected_body_len(echo) -> ?ECHO_BODY_SIZE;
 expected_body_len(large_response) -> ?LARGE_BODY_SIZE;
 expected_body_len(json) -> 115;
-expected_body_len(headers_heavy) -> 7.
+expected_body_len(headers_heavy) -> 7;
+expected_body_len(streaming_response) -> 16384.
 
 collect(Pid, TimeoutMs) ->
     receive
@@ -658,7 +684,7 @@ recv_response(Sock, Buf, BodyLen, Timeout) ->
             end;
         _ ->
             case gen_tcp:recv(Sock, 0, Timeout) of
-                {ok, D} -> recv_response(Sock, <<Buf/binary, D/binary>>, BodyLen, Timeout);
+                {ok, Data} -> recv_response(Sock, <<Buf/binary, Data/binary>>, BodyLen, Timeout);
                 {error, _} = E -> E
             end
     end.
@@ -707,6 +733,8 @@ h2_request_shape(large_response) ->
     {~"GET", ~"/large", [], <<>>};
 h2_request_shape(json) ->
     {~"GET", ~"/json", [{~"accept", ~"application/json"}], <<>>};
+h2_request_shape(streaming_response) ->
+    {~"GET", ~"/streaming", [], <<>>};
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -870,7 +898,9 @@ scenario_request_summary(large_response) ->
 scenario_request_summary(json) ->
     "GET /json HTTP/1.1, 2 headers, ~115-byte JSON response body (router)";
 scenario_request_summary(headers_heavy) ->
-    "GET / HTTP/1.1, 17 headers, 7-byte response body (handler)".
+    "GET / HTTP/1.1, 17 headers, 7-byte response body (handler)";
+scenario_request_summary(streaming_response) ->
+    "GET /streaming HTTP/1.1, 1 header, 4 × 4 KB chunks (router)".
 
 result_to_row(Side, #{
     total := Total,
