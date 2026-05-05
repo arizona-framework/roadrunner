@@ -102,6 +102,9 @@ preflight_scenario(#{scenario := server_sent_events, servers := Servers} = Opts)
 preflight_scenario(#{scenario := expect_100_continue, servers := Servers} = Opts) ->
     filter_servers(expect_100_continue, [elli], Servers, Opts,
         ~"no automatic 100-continue handling in our elli fixture");
+preflight_scenario(#{scenario := websocket_msg_throughput, servers := Servers} = Opts) ->
+    filter_servers(websocket_msg_throughput, [elli], Servers, Opts,
+        ~"no WebSocket support in elli test fixture");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -193,7 +196,8 @@ cli() ->
                         backpressure_sustained,
                         server_sent_events,
                         expect_100_continue,
-                        large_keepalive_session
+                        large_keepalive_session,
+                        websocket_msg_throughput
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -350,6 +354,17 @@ cli() ->
                                     completion path that single-
                                     request `connection_storm`
                                     can't reach.
+                    websocket_msg_throughput:
+                                    h1-only (upgrade to WS). Bench
+                                    completes WS handshake then
+                                    sends 1 KB masked text frames
+                                    in a tight loop, reading the
+                                    echoed reply each iteration.
+                                    Tests the WebSocket frame-
+                                    encode / parse hot path —
+                                    distinct from any other
+                                    scenario. elli filtered out
+                                    (no WS in test fixture).
                     """
             },
             #{
@@ -757,6 +772,8 @@ scenario_roadrunner_opts(large_keepalive_session, BaseOpts) ->
         handler => roadrunner_keepalive_handler,
         max_keep_alive_request => 1000
     };
+scenario_roadrunner_opts(websocket_msg_throughput, BaseOpts) ->
+    BaseOpts#{routes => [{~"/ws", roadrunner_ws_upgrade_handler, undefined}]};
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -822,7 +839,9 @@ scenario_cowboy_routes(server_sent_events) ->
 scenario_cowboy_routes(expect_100_continue) ->
     [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}];
 scenario_cowboy_routes(large_keepalive_session) ->
-    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}].
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
+scenario_cowboy_routes(websocket_msg_throughput) ->
+    [{'_', [{"/ws", roadrunner_bench_cowboy_ws_handler, []}]}].
 
 %% Per-scenario cowboy TransportOpts. The default keeps the bench's
 %% prior shape (`num_acceptors => 10`); `backpressure_sustained`
@@ -877,6 +896,21 @@ run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
 run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
     run_phase_h2(Port, Opts, DurationMs).
 
+run_phase_h1(
+    Port, #{clients := C, host := Host, scenario := websocket_msg_throughput}, DurationMs
+) ->
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    Self = self(),
+    StartUs = erlang:monotonic_time(microsecond),
+    Workers = [
+        spawn_link(fun() ->
+            Self ! {self(), ws_throughput_worker(Host, Port, Deadline, init_acc())}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
+    EndUs = erlang:monotonic_time(microsecond),
+    aggregate(PerWorker, EndUs - StartUs);
 run_phase_h1(
     Port, #{clients := C, host := Host, scenario := large_keepalive_session}, DurationMs
 ) ->
@@ -1243,6 +1277,156 @@ router_404_storm_one(Host, Port) ->
         {error, _} = E ->
             E
     end.
+
+%% websocket_msg_throughput: WS handshake then a tight echo loop
+%% (1 KB masked text frame → 1 KB unmasked text frame back). Each
+%% successful echo counts as one bench-OK; latency is per-echo.
+-define(WS_PAYLOAD_SIZE, 1024).
+
+ws_handshake_request() ->
+    %% 16-byte random key, base64-encoded — RFC 6455 §4.2.1. The
+    %% server's `Sec-WebSocket-Accept` is computed from this; we
+    %% don't validate it here, just check for the 101 status.
+    Key = base64:encode(crypto:strong_rand_bytes(16)),
+    <<"GET /ws HTTP/1.1\r\n",
+        "Host: x\r\n",
+        "Upgrade: websocket\r\n",
+        "Connection: Upgrade\r\n",
+        "Sec-WebSocket-Key: ", Key/binary, "\r\n",
+        "Sec-WebSocket-Version: 13\r\n",
+        "\r\n">>.
+
+ws_throughput_worker(Host, Port, Deadline, Acc) ->
+    case gen_tcp:connect(Host, Port, [binary, {active, false}, {nodelay, true}], 5000) of
+        {ok, Sock} ->
+            case ws_complete_handshake(Sock) of
+                {ok, Buf0} ->
+                    Payload = binary:copy(~"x", ?WS_PAYLOAD_SIZE),
+                    Final = ws_loop(Sock, Payload, Buf0, Deadline, Acc),
+                    _ = gen_tcp:close(Sock),
+                    Final;
+                {error, _} ->
+                    _ = gen_tcp:close(Sock),
+                    bump_err(Acc)
+            end;
+        {error, _} ->
+            bump_err(Acc)
+    end.
+
+%% Send the upgrade request, drain the 101 response headers,
+%% return any leftover bytes (which are the start of the first
+%% server-side WS frame, if the server already wrote one).
+ws_complete_handshake(Sock) ->
+    Req = ws_handshake_request(),
+    case gen_tcp:send(Sock, Req) of
+        ok -> ws_recv_handshake(Sock, <<>>);
+        {error, _} = E -> E
+    end.
+
+ws_recv_handshake(Sock, Buf) ->
+    case binary:split(Buf, ~"\r\n\r\n") of
+        [_Head, Rest] ->
+            case Buf of
+                <<"HTTP/1.1 101", _/binary>> -> {ok, Rest};
+                _ -> {error, bad_status}
+            end;
+        _ ->
+            case gen_tcp:recv(Sock, 0, 5000) of
+                {ok, Data} ->
+                    ws_recv_handshake(Sock, <<Buf/binary, Data/binary>>);
+                {error, _} = E ->
+                    E
+            end
+    end.
+
+ws_loop(Sock, Payload, Buf, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Acc;
+        false ->
+            T0 = erlang:monotonic_time(nanosecond),
+            Frame = ws_encode_masked_text(Payload),
+            case gen_tcp:send(Sock, Frame) of
+                ok ->
+                    case ws_recv_frame(Sock, Buf) of
+                        {ok, _Bytes, Buf1} ->
+                            T1 = erlang:monotonic_time(nanosecond),
+                            ws_loop(
+                                Sock, Payload, Buf1, Deadline,
+                                bump_ok(Acc, T1 - T0, ?WS_PAYLOAD_SIZE)
+                            );
+                        {error, _} ->
+                            bump_err(Acc)
+                    end;
+                {error, _} ->
+                    bump_err(Acc)
+            end
+    end.
+
+%% Encode a single FIN+text WS frame with a fresh 4-byte mask.
+%% RFC 6455 §5.3 mandates client→server frames be masked.
+ws_encode_masked_text(Payload) ->
+    Len = byte_size(Payload),
+    Mask = crypto:strong_rand_bytes(4),
+    Masked = ws_apply_mask(Payload, Mask),
+    Header =
+        case Len of
+            L when L =< 125 ->
+                <<1:1, 0:3, 1:4, 1:1, L:7, Mask/binary>>;
+            L when L =< 16#FFFF ->
+                <<1:1, 0:3, 1:4, 1:1, 126:7, L:16, Mask/binary>>;
+            L ->
+                <<1:1, 0:3, 1:4, 1:1, 127:7, L:64, Mask/binary>>
+        end,
+    [Header, Masked].
+
+ws_apply_mask(Payload, <<M0, M1, M2, M3>>) ->
+    ws_apply_mask_bytes(Payload, M0, M1, M2, M3, 0, <<>>).
+
+ws_apply_mask_bytes(<<>>, _, _, _, _, _, Acc) ->
+    Acc;
+ws_apply_mask_bytes(<<B, R/binary>>, M0, M1, M2, M3, I, Acc) ->
+    M =
+        case I rem 4 of
+            0 -> M0;
+            1 -> M1;
+            2 -> M2;
+            _ -> M3
+        end,
+    ws_apply_mask_bytes(R, M0, M1, M2, M3, I + 1, <<Acc/binary, (B bxor M)>>).
+
+%% Read one server-side (unmasked) frame from the wire. Returns
+%% the unconsumed buf so the next iteration's read picks up where
+%% this left off. Only handles unfragmented text frames — that's
+%% all the bench's echo handler ever emits.
+ws_recv_frame(Sock, Buf) ->
+    case ws_parse_frame(Buf) of
+        {ok, Bytes, Rest} ->
+            {ok, Bytes, Rest};
+        more ->
+            case gen_tcp:recv(Sock, 0, 5000) of
+                {ok, Data} -> ws_recv_frame(Sock, <<Buf/binary, Data/binary>>);
+                {error, _} = E -> E
+            end
+    end.
+
+ws_parse_frame(<<_:1, _:3, _:4, 0:1, Len:7, Rest/binary>>) when
+    Len =< 125, byte_size(Rest) >= Len
+->
+    <<Payload:Len/binary, Tail/binary>> = Rest,
+    {ok, byte_size(Payload), Tail};
+ws_parse_frame(<<_:1, _:3, _:4, 0:1, 126:7, Len:16, Rest/binary>>) when
+    byte_size(Rest) >= Len
+->
+    <<Payload:Len/binary, Tail/binary>> = Rest,
+    {ok, byte_size(Payload), Tail};
+ws_parse_frame(<<_:1, _:3, _:4, 0:1, 127:7, Len:64, Rest/binary>>) when
+    byte_size(Rest) >= Len
+->
+    <<Payload:Len/binary, Tail/binary>> = Rest,
+    {ok, byte_size(Payload), Tail};
+ws_parse_frame(_) ->
+    more.
 
 %% large_keepalive_session: like the default keep_alive_loop, but
 %% on conn-close (the server hit its `max_keep_alive_request` cap)
@@ -2052,6 +2236,13 @@ h2_request_shape(large_keepalive_session) ->
         "error: --scenario large_keepalive_session is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(websocket_msg_throughput) ->
+    %% RFC 8441 (h2 + WS) is out of scope for this scenario;
+    %% bench-client side hasn't been wired for h2 WS frames.
+    io:format(standard_error,
+        "error: --scenario websocket_msg_throughput is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -2245,7 +2436,9 @@ scenario_request_summary(server_sent_events) ->
 scenario_request_summary(expect_100_continue) ->
     "POST /echo HTTP/1.1 + Expect: 100-continue, headers/100/body/200 cycle, 256-byte body (router)";
 scenario_request_summary(large_keepalive_session) ->
-    "GET / HTTP/1.1, server caps at 1000 reqs/conn, worker reconnects on close (handler)".
+    "GET / HTTP/1.1, server caps at 1000 reqs/conn, worker reconnects on close (handler)";
+scenario_request_summary(websocket_msg_throughput) ->
+    "WS upgrade then 1 KB masked text frame echoes in a tight loop (handler/router)".
 
 result_to_row(Side, #{
     total := Total,
