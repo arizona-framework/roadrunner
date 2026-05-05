@@ -161,6 +161,54 @@ without the fprof survey.
 The 5 µs/conn cost guess from the prior session was off by an order
 of magnitude — the actual cost was 60+ µs/conn, all in one place.
 
+## Round 3 — `tls_handshake_throughput` (h2): null result
+
+`tls_handshake_throughput` (open fresh TLS conn per request, GET /,
+close — full handshake every time) showed roadrunner ~2.4K vs
+cowboy ~2.9K, a consistent **20% loss** across 3 runs (well outside
+variance). fprof'd the path looking for a fixable hotspot.
+
+**Top own-time MFAs (5 clients × 2 s, fprof):**
+
+| MFA | % own | Calls/conn |
+|---|---|---|
+| `gen:do_call/4` (gen_statem dispatch inside ssl) | 6.2% | ~4 |
+| `prim_inet:enc_opts/2` | 3.9% | ~3.4 |
+| `prim_inet:enc_opt_val/4` | 3.0% | ~3.1 |
+| `roadrunner_bin:ascii_lowercase_walk/1` | 2.8% | ~8 |
+| `prim_inet:dec_opt_val/1` | 2.1% | ~4 |
+| `prim_inet:type_opt/2` | 2.0% | ~10 |
+| `prim_inet:dec_opt_val/3` | 1.9% | ~3.4 |
+| `prim_inet:type_opt_1/1` | 1.8% | ~10 |
+
+**Caller analysis:** the `prim_inet:*` cluster (~15% combined own
+time) is reached via `prim_inet:accept0/3 → accept_opts/3 → getopts
++ setopts`. This is OTP's standard `gen_tcp:accept` machinery — when
+the inet driver hands a new socket up, it inherits the listener's
+options via this getopts/setopts dance. Same path cowboy hits.
+
+**No fixable hotspot.** The gap is spread across many small
+contributors:
+- `prim_inet` accept-opts inheritance is OTP-internal and identical
+  for any `inet_drv`-backed listener (which both servers are).
+- `gen_statem:call` overhead is from the `ssl` app's internal state
+  machine — also identical.
+- `ascii_lowercase_walk` at 2.8% is plausibly fprof overhead on a
+  short-string walk that JIT-compiles to ~50 ns per call (fprof's
+  per-call instrumentation cost is ~1 µs).
+
+**What WOULD close the gap (out of scope for this branch):**
+- Switching to the OTP-27 `socket` NIF backend for the TLS listener
+  *might* reduce the inheritance cost, but we deliberately reverted
+  to `inet_drv` for h1 (40% gain at recv time). Different trade per
+  scenario; no single-default that wins both.
+- Multi-acceptor SSL or handshake-pre-staging — architectural.
+- Reducing per-conn `setopts({active, once})` calls by switching
+  to `{active, N}` — structural change to the recv loop.
+
+This is documented as a known gap. Pursuing more without an
+architectural lever returns null results inside variance.
+
 ## Round 2 — WebSocket throughput
 
 `websocket_msg_throughput` (1 KB masked text frames, 50 conns) was
