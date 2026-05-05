@@ -141,7 +141,8 @@ cli() ->
                         json,
                         headers_heavy,
                         streaming_response,
-                        multi_stream_h2
+                        multi_stream_h2,
+                        pipelined_h1
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -174,6 +175,12 @@ cli() ->
                                     workload — exercises per-stream
                                     workers, conn-level flow control,
                                     and MAX_CONCURRENT_STREAMS dispatch.
+                    pipelined_h1:   h1-only. 4 GET / requests sent in
+                                    one TCP segment, then 4 responses
+                                    drained. Exercises the parser's
+                                    "more bytes left in buffer after
+                                    one request completes" path
+                                    (RFC 7230 §6.3.2 pipelining).
                     """
             },
             #{
@@ -521,6 +528,10 @@ scenario_roadrunner_opts(streaming_response, BaseOpts) ->
 scenario_roadrunner_opts(multi_stream_h2, BaseOpts) ->
     %% Same handler as `hello` — the differentiator is the bench
     %% client driving N streams in flight per conn.
+    BaseOpts#{handler => roadrunner_keepalive_handler};
+scenario_roadrunner_opts(pipelined_h1, BaseOpts) ->
+    %% Same handler as `hello` — pipelining is a wire-level
+    %% client behavior; the server sees N requests in one buffer.
     BaseOpts#{handler => roadrunner_keepalive_handler}.
 
 scenario_cowboy_routes(hello) ->
@@ -536,6 +547,8 @@ scenario_cowboy_routes(json) ->
 scenario_cowboy_routes(streaming_response) ->
     [{'_', [{"/streaming", roadrunner_bench_cowboy_streaming_handler, []}]}];
 scenario_cowboy_routes(multi_stream_h2) ->
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
+scenario_cowboy_routes(pipelined_h1) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}].
 
 %% Inherit the parent's code path so the peer sees both default- and
@@ -562,6 +575,21 @@ run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
 run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
     run_phase_h2(Port, Opts, DurationMs).
 
+run_phase_h1(
+    Port, #{clients := C, host := Host, scenario := pipelined_h1}, DurationMs
+) ->
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    Self = self(),
+    StartUs = erlang:monotonic_time(microsecond),
+    Workers = [
+        spawn_link(fun() ->
+            Self ! {self(), pipelined_h1_worker(Host, Port, Deadline, init_acc())}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
+    EndUs = erlang:monotonic_time(microsecond),
+    aggregate(PerWorker, EndUs - StartUs);
 run_phase_h1(Port, #{clients := C, host := Host, scenario := Scenario}, DurationMs) ->
     Deadline = erlang:monotonic_time(millisecond) + DurationMs,
     Req = build_request(Scenario),
@@ -577,6 +605,92 @@ run_phase_h1(Port, #{clients := C, host := Host, scenario := Scenario}, Duration
     PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
     EndUs = erlang:monotonic_time(microsecond),
     aggregate(PerWorker, EndUs - StartUs).
+
+%% RFC 7230 §6.3.2 pipelining: client sends N requests back-to-back
+%% and reads N responses in the same order. Real workloads are
+%% browser-side dead but proxies (HAProxy, nginx) and health-check
+%% probes still pipeline. The wire-distinct test target is the
+%% server's parser handling "more bytes left in buffer after one
+%% complete request" — a path single-request keep-alive doesn't
+%% exercise.
+-define(PIPELINE_DEPTH, 4).
+-define(PIPELINED_H1_BODY_LEN, 7).
+
+pipelined_h1_batch() ->
+    %% 4 GET / requests joined into one binary so the server sees
+    %% them in a single TCP segment (loopback MTU is 64 KB, well
+    %% above 4 × ~24 bytes).
+    binary:copy(~"GET / HTTP/1.1\r\nHost: x\r\n\r\n", ?PIPELINE_DEPTH).
+
+pipelined_h1_worker(Host, Port, Deadline, Acc) ->
+    Batch = pipelined_h1_batch(),
+    case gen_tcp:connect(Host, Port, [binary, {active, false}], 5000) of
+        {ok, Sock} ->
+            Final = pipelined_h1_loop(Sock, Batch, Deadline, Acc),
+            ok = gen_tcp:close(Sock),
+            Final;
+        {error, _} ->
+            bump_err(Acc)
+    end.
+
+pipelined_h1_loop(Sock, Batch, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Acc;
+        false ->
+            T0 = erlang:monotonic_time(nanosecond),
+            case gen_tcp:send(Sock, Batch) of
+                ok ->
+                    case recv_n_responses(
+                        Sock, <<>>, ?PIPELINE_DEPTH, ?PIPELINED_H1_BODY_LEN, 5000, 0
+                    ) of
+                        {ok, Bytes} ->
+                            T1 = erlang:monotonic_time(nanosecond),
+                            PerReq = (T1 - T0) div ?PIPELINE_DEPTH,
+                            PerBytes = Bytes div ?PIPELINE_DEPTH,
+                            Acc1 = lists:foldl(
+                                fun(_, A) -> bump_ok(A, PerReq, PerBytes) end,
+                                Acc,
+                                lists:seq(1, ?PIPELINE_DEPTH)
+                            ),
+                            pipelined_h1_loop(Sock, Batch, Deadline, Acc1);
+                        {error, _} ->
+                            bump_err(Acc)
+                    end;
+                {error, _} ->
+                    bump_err(Acc)
+            end
+    end.
+
+%% Drain N back-to-back HTTP/1.1 responses from `Buf`. Each response
+%% has the same fixed Content-Length (`BodyLen`). After consuming a
+%% complete response, the leftover bytes in `Buf` are the start of
+%% the next response — no extra recv until the buffer is empty.
+recv_n_responses(_Sock, _Buf, 0, _BodyLen, _Timeout, BytesAcc) ->
+    {ok, BytesAcc};
+recv_n_responses(Sock, Buf, N, BodyLen, Timeout, BytesAcc) ->
+    case binary:split(Buf, ~"\r\n\r\n") of
+        [Headers, Body] when byte_size(Body) >= BodyLen ->
+            case Buf of
+                <<"HTTP/1.1 200", _/binary>> ->
+                    Consumed = byte_size(Headers) + 4 + BodyLen,
+                    <<_:Consumed/binary, Rest/binary>> = Buf,
+                    recv_n_responses(
+                        Sock, Rest, N - 1, BodyLen, Timeout, BytesAcc + Consumed
+                    );
+                _ ->
+                    {error, bad_status}
+            end;
+        _ ->
+            case gen_tcp:recv(Sock, 0, Timeout) of
+                {ok, Data} ->
+                    recv_n_responses(
+                        Sock, <<Buf/binary, Data/binary>>, N, BodyLen, Timeout, BytesAcc
+                    );
+                {error, _} = E ->
+                    E
+            end
+    end.
 
 %% Pre-built per-iteration request bytes so the worker hot loop doesn't
 %% allocate. Both scenarios assume the same handler returns
@@ -814,6 +928,13 @@ h2_request_shape(json) ->
     {~"GET", ~"/json", [{~"accept", ~"application/json"}], <<>>};
 h2_request_shape(streaming_response) ->
     {~"GET", ~"/streaming", [], <<>>};
+h2_request_shape(pipelined_h1) ->
+    %% h2 already multiplexes — pipelining is an h1 wire concept
+    %% with no analogue in h2 (use `multi_stream_h2` instead).
+    io:format(standard_error,
+        "error: --scenario pipelined_h1 is h1-only "
+        "(use --protocol h1; for h2 multiplexing see multi_stream_h2)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -981,7 +1102,9 @@ scenario_request_summary(headers_heavy) ->
 scenario_request_summary(streaming_response) ->
     "GET /streaming HTTP/1.1, 1 header, 4 × 4 KB chunks (router)";
 scenario_request_summary(multi_stream_h2) ->
-    "GET / over h2 with 16 multiplexed streams in flight per conn (handler)".
+    "GET / over h2 with 16 multiplexed streams in flight per conn (handler)";
+scenario_request_summary(pipelined_h1) ->
+    "GET / HTTP/1.1, 4 requests pipelined per send, 7-byte response body (handler)".
 
 result_to_row(Side, #{
     total := Total,
