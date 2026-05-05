@@ -35,7 +35,7 @@ diagnosing startup failures.
    protocol, not free for arbitrary writes.
 """.
 
--export([start/0, stop_and_dump/2]).
+-export([start/0, stop_and_dump/2, start_fprof/1, stop_fprof_and_dump/2]).
 
 -spec start() -> ok.
 start() ->
@@ -63,6 +63,53 @@ stop_and_dump(Path, MinMs) ->
     MinUs = trunc(MinMs * 1000),
     _ = eprof:analyze(total, [{filter, [{time, MinUs}]}]),
     stopped = eprof:stop(),
+    ok.
+
+-doc """
+Start an `fprof` trace seeded with the same roadrunner-pid set as
+`start/0`. fprof produces a richer call-tree (per-MFA OWN and ACC
+time, callers/callees) than eprof and tolerates higher trace volumes
+without blocking. Use it for the connection-lifecycle survey where
+eprof times out (see `docs/conn_lifecycle_investigation.md`).
+
+`TraceFile` is the binary trace output; pass it to
+`stop_fprof_and_dump/2` along with the desired analysis output path.
+""".
+-spec start_fprof(file:filename()) -> ok.
+start_fprof(TraceFile) ->
+    Pids = [P || P <- roadrunner_pids(), is_process_alive(P)],
+    ok = fprof:trace([
+        start,
+        {procs, Pids},
+        {file, TraceFile},
+        verbose
+    ]),
+    ok.
+
+-doc """
+Stop the fprof trace, profile, and write the totals analysis to
+`AnalysisPath`. Filters out MFAs with own-time below `MinMs`
+milliseconds — same shape as `stop_and_dump/2`.
+
+The analysis file groups results in two sections:
+- `totals` — top-level summary
+- per-MFA blocks with `OWN` (exclusive) and `ACC` (inclusive) time
+
+`stop` is idempotent — safe to call after any fprof:trace error.
+""".
+-spec stop_fprof_and_dump(file:filename(), file:filename()) -> ok.
+stop_fprof_and_dump(TraceFile, AnalysisPath) ->
+    fprof:trace(stop),
+    ok = fprof:profile([{file, TraceFile}]),
+    ok = fprof:analyse([
+        {dest, AnalysisPath},
+        {cols, 120},
+        {totals, true},
+        {sort, own},
+        no_callers,
+        no_details
+    ]),
+    ok = fprof:stop(),
     ok.
 
 %% Seed: every alive process whose `proc_lib:initial_call/1` is in a

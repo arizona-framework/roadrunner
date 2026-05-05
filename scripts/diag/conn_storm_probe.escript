@@ -37,11 +37,46 @@ main(Args) ->
     {Peer, Port} = start_server(Opts),
     %% Warmup: warm the JIT, fill any caches, before measuring.
     _ = run_n(Port, ?WARMUP_REQS),
+    ProfileHandle = maybe_start_profile(Opts),
     Latencies = run_n(Port, maps:get(reqs, Opts)),
+    maybe_stop_profile(Opts, ProfileHandle),
     teardown(Opts, Peer),
     print_summary(Opts, Latencies).
 
-parse_args(Args) -> parse_args(Args, #{mode => local, reqs => ?DEFAULT_REQS}).
+%% Profiling — `--profile fprof` only meaningful in `--mode local`
+%% (fprof traces this BEAM's processes; in peer mode the server
+%% lives in a different BEAM and would need a peer:call boundary).
+%% Survey-grade output written to /tmp; analysis path is printed at
+%% the end so the user can grep it.
+maybe_start_profile(#{profile := none}) ->
+    none;
+maybe_start_profile(#{profile := fprof, mode := local, server := roadrunner}) ->
+    TraceFile = "/tmp/roadrunner_conn_storm_fprof.trace",
+    ok = roadrunner_bench_profiler:start_fprof(TraceFile),
+    TraceFile;
+maybe_start_profile(#{profile := fprof, mode := local, server := Server}) ->
+    %% Profiling cowboy/elli is interesting for cross-server comparison
+    %% but their per-pid seed isn't trivially available — punt for now.
+    %% Survey is roadrunner-focused.
+    io:format(
+        "note: --profile fprof only supported for --server roadrunner "
+        "(asked for ~p)~n",
+        [Server]
+    ),
+    none;
+maybe_start_profile(#{profile := fprof, mode := peer}) ->
+    io:format("note: --profile fprof requires --mode local~n"),
+    none.
+
+maybe_stop_profile(_, none) ->
+    ok;
+maybe_stop_profile(_, TraceFile) ->
+    AnalysisPath = "/tmp/roadrunner_conn_storm_fprof.analysis",
+    ok = roadrunner_bench_profiler:stop_fprof_and_dump(TraceFile, AnalysisPath),
+    io:format("~nfprof analysis written to ~s~n", [AnalysisPath]),
+    io:format("  trace: ~s~n", [TraceFile]).
+
+parse_args(Args) -> parse_args(Args, #{mode => local, reqs => ?DEFAULT_REQS, profile => none}).
 
 parse_args([], #{server := _} = Opts) ->
     Opts;
@@ -53,13 +88,15 @@ parse_args(["--mode", M | T], Opts) ->
     parse_args(T, Opts#{mode => list_to_atom(M)});
 parse_args(["--reqs", N | T], Opts) ->
     parse_args(T, Opts#{reqs => list_to_integer(N)});
+parse_args(["--profile", "fprof" | T], Opts) ->
+    parse_args(T, Opts#{profile => fprof});
 parse_args(_, _) ->
     usage().
 
 usage() ->
     io:format(
         "usage: conn_storm_probe.escript --server roadrunner|cowboy|elli "
-        "[--mode local|peer] [--reqs N]~n"
+        "[--mode local|peer] [--reqs N] [--profile fprof]~n"
     ),
     halt(2).
 
@@ -163,18 +200,15 @@ pa_args_for_peer() ->
     lists:foldr(fun(P, Acc) -> ["-pa", P | Acc] end, [], Paths).
 
 teardown(#{server := roadrunner, mode := local}, _) ->
-    catch roadrunner:stop_listener(probe_rr),
-    ok;
+    try roadrunner:stop_listener(probe_rr) of _ -> ok catch _:_ -> ok end;
 teardown(#{server := cowboy, mode := local}, _) ->
-    catch cowboy:stop_listener(probe_cb),
-    ok;
+    try cowboy:stop_listener(probe_cb) of _ -> ok catch _:_ -> ok end;
 teardown(#{server := elli, mode := local}, _) ->
     %% Elli has no graceful stop in this fixture — application:stop
     %% would suffice but is heavy; rely on script exit to clean up.
     ok;
 teardown(#{mode := peer}, Peer) ->
-    catch peer:stop(Peer),
-    ok.
+    try peer:stop(Peer) of _ -> ok catch _:_ -> ok end.
 
 rr_listener_opts() ->
     #{
