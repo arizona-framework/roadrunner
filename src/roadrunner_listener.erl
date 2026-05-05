@@ -79,7 +79,37 @@ connection crash doesn't take the pool down.
     %% instead of the HTTP/1.1 path. Default `false`. User-supplied
     %% `alpn_preferred_protocols` in `tls` opts win — set this opt only
     %% if you want roadrunner to manage the ALPN list automatically.
-    http2_enabled => boolean()
+    http2_enabled => boolean(),
+    %% h2 connection-level recv window peak (bytes). The RFC default is
+    %% 65535 — the only window reachable without explicit
+    %% `WINDOW_UPDATE` per RFC 9113 §6.5.2 (SETTINGS doesn't carry the
+    %% conn-level initial). When set above 65535, the listener emits an
+    %% early `WINDOW_UPDATE(0, peak - 65535)` right after the server
+    %% SETTINGS in the handshake. Useful for upload-heavy workloads on
+    %% non-LAN RTTs where window/RTT bounds per-conn throughput.
+    %% Reference points: gun 8 MB, Go net/http2 1 GB, h2o 16 MB+, Mint
+    %% 16 MB. Default `65535` (RFC). See `docs/roadmap.md` "h2 receive-
+    %% window defaults" for the trade-off behind keeping the default
+    %% conservative (worst-case memory is `max_clients × peak`).
+    h2_initial_conn_window => 1..16#7FFFFFFF,
+    %% h2 stream-level recv window peak (bytes). Advertised via
+    %% `SETTINGS_INITIAL_WINDOW_SIZE` in the server SETTINGS frame
+    %% (RFC 9113 §6.5.2). Same throughput-vs-RTT consideration as the
+    %% conn-level peak, applied per stream. Reference points: Mint
+    %% 4 MB, gun 8 MB. Default `65535` (RFC). Setting this higher than
+    %% `h2_initial_conn_window` is allowed but not useful — the
+    %% conn-level peak is the binding constraint when streams aggregate
+    %% past it. See `docs/roadmap.md` for the default-bump trade-off.
+    h2_initial_stream_window => 1..16#7FFFFFFF,
+    %% h2 receive-window refill threshold (bytes). The conn refills the
+    %% conn-level / stream-level recv window back to its peak once the
+    %% remaining drops below this value. Lower threshold = fewer
+    %% `WINDOW_UPDATE` frames per byte consumed but a smaller live
+    %% window between refills. Default `32768` matches the prior
+    %% half-of-RFC-default heuristic. Setting this larger than the
+    %% configured peak refills on every DATA frame (always under
+    %% threshold).
+    h2_window_refill_threshold => pos_integer()
 }.
 
 -record(state, {
@@ -327,6 +357,12 @@ spawn_acceptors(LSocket, ProtoOpts, N) ->
 
 -spec build_proto_opts(opts(), atom()) -> roadrunner_conn:proto_opts().
 build_proto_opts(Opts, ListenerName) ->
+    %% Validate the h2 receive-window opts up-front so a bad value
+    %% surfaces at listener `init/1` rather than mid-handshake. RFC
+    %% 9113 §6.9.1 caps a flow-control window at 2^31-1.
+    ok = validate_h2_window_opt(h2_initial_conn_window, Opts, 16#7FFFFFFF),
+    ok = validate_h2_window_opt(h2_initial_stream_window, Opts, 16#7FFFFFFF),
+    ok = validate_h2_window_opt(h2_window_refill_threshold, Opts, 16#7FFFFFFF),
     %% Per-listener atomics: live-connection counter (acceptors bump on
     %% accept; conns decrement on exit) and a cumulative requests-served
     %% counter (conn bumps on each handler dispatch). Lock-free, ~1ns
@@ -349,7 +385,10 @@ build_proto_opts(Opts, ListenerName) ->
         body_buffering => maps:get(body_buffering, Opts, auto),
         listener_name => ListenerName,
         drain_group => maps:get(drain_group, Opts, enabled),
-        http2_enabled => maps:get(http2_enabled, Opts, false)
+        http2_enabled => maps:get(http2_enabled, Opts, false),
+        h2_initial_conn_window => maps:get(h2_initial_conn_window, Opts, 65535),
+        h2_initial_stream_window => maps:get(h2_initial_stream_window, Opts, 65535),
+        h2_window_refill_threshold => maps:get(h2_window_refill_threshold, Opts, 32768)
     },
     WithHibernate =
         %% Optional `hibernate_after` — `roadrunner_conn_loop` reads it
@@ -380,6 +419,17 @@ build_proto_opts(Opts, ListenerName) ->
 %% published to `persistent_term` by `publish_routes/2` — the dispatch
 %% tag carries the listener name so the conn can look the table up.
 -spec build_dispatch(opts(), atom()) -> roadrunner_conn:dispatch().
+-spec validate_h2_window_opt(atom(), opts(), pos_integer()) -> ok.
+validate_h2_window_opt(Key, Opts, Max) ->
+    case maps:find(Key, Opts) of
+        error ->
+            ok;
+        {ok, V} when is_integer(V), V >= 1, V =< Max ->
+            ok;
+        {ok, V} ->
+            error({invalid_listener_opt, Key, V})
+    end.
+
 build_dispatch(#{routes := _}, ListenerName) ->
     {router, ListenerName};
 build_dispatch(Opts, _ListenerName) ->

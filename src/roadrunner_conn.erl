@@ -96,7 +96,12 @@ read it anyway.
     %% When `true`, the conn dispatch forks to `roadrunner_conn_loop_http2`
     %% if the post-handshake ALPN selection landed on `h2`. Default
     %% `false` (HTTP/1.1 only).
-    http2_enabled => boolean()
+    http2_enabled => boolean(),
+    %% h2 receive-window tuning. See `roadrunner_listener:opts()` for
+    %% prose. Defaults match the RFC 9113 baseline.
+    h2_initial_conn_window => 1..16#7FFFFFFF,
+    h2_initial_stream_window => 1..16#7FFFFFFF,
+    h2_window_refill_threshold => pos_integer()
 }.
 
 %% Opaque body-read state attached to the request in manual buffering

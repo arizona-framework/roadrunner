@@ -110,6 +110,33 @@ by the dep.
 
 ## Other
 
+### h2 receive-window defaults
+
+**What:** Bump the listener's default receive-window peaks above the
+RFC 9113 §6.9.2 baseline of 65535. Override knobs already exist
+(`h2_initial_conn_window`, `h2_initial_stream_window`,
+`h2_window_refill_threshold` on `roadrunner_listener:opts()`); the
+question is what values to ship as the default.
+
+**Why deferred:** `window / RTT` caps per-stream throughput, and at
+65535 with a 100 ms RTT the ceiling is ~0.6 MB/s. Reference points
+for the bumped defaults: gun 8 MB / 8 MB, Mint (post-PR) 16 MB /
+4 MB, Go net/http2 1 GB / 4 MB, h2o 16 MB+. The trade-off for a
+**server**: a larger conn-level peak means each peer can hold up
+to that many in-flight bytes before back-pressure, multiplied by
+`max_clients`. Worst-case memory pressure at `max_clients = 100k`
+× `16 MB conn peak` is ~1.6 TB — small VPS deployments would
+notice. Mint's bench was a CLIENT (one app's connection pool),
+where the multiplier is smaller.
+
+For now the listener opts let users opt in per-deployment. A
+default change wants its own benchmarking against roadrunner-shape
+workloads (server-side, large-POST upload patterns) before shipping.
+
+**Scope:** small (one-line default change + ~50 test sites that
+have to drain the new SETTINGS entry + early WINDOW_UPDATE in
+their handshake fixture).
+
 ### h2 manual-mode body reading
 
 **What:** Parity with the h1 manual-mode body reader for h2 streams

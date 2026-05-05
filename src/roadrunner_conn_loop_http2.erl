@@ -66,9 +66,18 @@ Response shapes supported:
 %% each stream.
 -define(INITIAL_WINDOW, 65535).
 
-%% Send a WINDOW_UPDATE refill once the local recv window falls
-%% below this threshold.
--define(WINDOW_REFILL_THRESHOLD, 32_768).
+%% Default refill threshold + recv-window peaks when proto_opts
+%% don't override. RFC 9113 doesn't mandate any of these — they're
+%% policy. The defaults match the RFC 9113 §6.9.2 baseline (65535
+%% for both windows; the threshold is half of that, the original
+%% heuristic). `roadrunner_listener:opts()` carries the override
+%% knobs (`h2_initial_conn_window`, `h2_initial_stream_window`,
+%% `h2_window_refill_threshold`) — bumping the windows is the
+%% standard tuning for non-LAN RTTs (window/RTT bounds per-stream
+%% throughput).
+-define(DEFAULT_CONN_RECV_WINDOW, 65535).
+-define(DEFAULT_STREAM_RECV_WINDOW, 65535).
+-define(DEFAULT_WINDOW_REFILL_THRESHOLD, 32_768).
 
 %% Hard upper bound on a flow-control window per RFC 9113 §6.9.1
 %% (signed 31-bit). Increments that would push past this are a
@@ -140,9 +149,20 @@ Response shapes supported:
     %% in 256-byte batches so h2 conns amortize the crypto cost
     %% across ~32 requests instead of paying it per dispatch.
     req_id_buffer = <<>> :: binary(),
-    %% Connection-level flow-control windows (RFC 9113 §5.2).
+    %% Connection-level flow-control windows (RFC 9113 §5.2). Send
+    %% window is set by peer SETTINGS / WINDOW_UPDATE. Recv window
+    %% starts at 65535 (RFC default) and is bumped to
+    %% `recv_window_peak` via an early `WINDOW_UPDATE(0, _)` in
+    %% `handshake/1` when the peak is greater. Refilled to the peak
+    %% whenever it drops below `recv_window_threshold`.
     conn_send_window = 65535 :: integer(),
     conn_recv_window = 65535 :: non_neg_integer(),
+    %% Configured peaks + refill threshold. Read from proto_opts at
+    %% `enter/5`. See the `?DEFAULT_*` macros above for the policy
+    %% baseline + the listener moduledoc for the override knobs.
+    recv_window_peak = ?DEFAULT_CONN_RECV_WINDOW :: pos_integer(),
+    stream_recv_window_peak = ?DEFAULT_STREAM_RECV_WINDOW :: pos_integer(),
+    recv_window_threshold = ?DEFAULT_WINDOW_REFILL_THRESHOLD :: pos_integer(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -181,6 +201,11 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
     proc_lib:set_label({roadrunner_conn_loop_http2, ListenerName, Peer}),
     Scheme = roadrunner_conn:scheme(Socket),
     {Data, Closed, Error} = roadrunner_transport:messages(Socket),
+    ConnPeak = maps:get(h2_initial_conn_window, ProtoOpts, ?DEFAULT_CONN_RECV_WINDOW),
+    StreamPeak = maps:get(h2_initial_stream_window, ProtoOpts, ?DEFAULT_STREAM_RECV_WINDOW),
+    Threshold = maps:get(
+        h2_window_refill_threshold, ProtoOpts, ?DEFAULT_WINDOW_REFILL_THRESHOLD
+    ),
     State = #loop{
         socket = Socket,
         proto_opts = ProtoOpts,
@@ -192,7 +217,10 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
         msg_closed = Closed,
         msg_error = Error,
         hpack_dec = roadrunner_http2_hpack:new_decoder(4096),
-        hpack_enc = roadrunner_http2_hpack:new_encoder(4096)
+        hpack_enc = roadrunner_http2_hpack:new_encoder(4096),
+        recv_window_peak = ConnPeak,
+        stream_recv_window_peak = StreamPeak,
+        recv_window_threshold = Threshold
     },
     handshake(State).
 
@@ -201,18 +229,40 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
 %% =============================================================================
 
 -spec handshake(#loop{}) -> no_return().
-handshake(State) ->
-    _ = send(State, server_settings_frame()),
-    handshake_phase_preface(State).
+handshake(
+    #loop{recv_window_peak = ConnPeak, stream_recv_window_peak = StreamPeak} = State
+) ->
+    _ = send(State, server_settings_frame(StreamPeak)),
+    %% RFC 9113 §6.9.2: SETTINGS_INITIAL_WINDOW_SIZE only affects
+    %% stream-level recv windows. The conn-level recv window stays
+    %% at the 65535 default until an explicit `WINDOW_UPDATE(0, _)`,
+    %% so emit one now if the configured peak is bigger.
+    State1 =
+        case ConnPeak > ?INITIAL_WINDOW of
+            true ->
+                Inc = ConnPeak - ?INITIAL_WINDOW,
+                _ = send(State, roadrunner_http2_frame:encode({window_update, 0, Inc})),
+                State#loop{conn_recv_window = ConnPeak};
+            false ->
+                State
+        end,
+    handshake_phase_preface(State1).
 
--spec server_settings_frame() -> iodata().
-server_settings_frame() ->
+-spec server_settings_frame(pos_integer()) -> iodata().
+server_settings_frame(StreamPeak) ->
     %% Advertise MAX_CONCURRENT_STREAMS=100 and MAX_FRAME_SIZE.
     %% IDs from RFC 9113 §6.5.2: 3 = MAX_CONCURRENT_STREAMS,
-    %% 5 = MAX_FRAME_SIZE.
-    roadrunner_http2_frame:encode(
-        {settings, 0, [{3, ?MAX_CONCURRENT_STREAMS}, {5, ?MAX_FRAME_SIZE}]}
-    ).
+    %% 5 = MAX_FRAME_SIZE.  When the stream-level recv peak is bigger
+    %% than the RFC 65535 default, also advertise
+    %% SETTINGS_INITIAL_WINDOW_SIZE (id 4) so streams the peer opens
+    %% start with the larger receive allowance.
+    Base = [{3, ?MAX_CONCURRENT_STREAMS}, {5, ?MAX_FRAME_SIZE}],
+    Settings =
+        case StreamPeak > ?INITIAL_WINDOW of
+            true -> [{4, StreamPeak} | Base];
+            false -> Base
+        end,
+    roadrunner_http2_frame:encode({settings, 0, Settings}).
 
 -spec handshake_timeout() -> non_neg_integer().
 handshake_timeout() ->
@@ -553,7 +603,13 @@ on_headers(StreamId, _Flags, _Priority, _Fragment, #loop{streams = Streams} = St
 on_headers(StreamId, Flags, _Priority, Fragment, State) ->
     EndHeaders = (Flags band 16#04) =/= 0,
     EndStream = (Flags band 16#01) =/= 0,
-    Stream = new_stream(Fragment, EndHeaders, EndStream, State#loop.peer_initial_window),
+    Stream = new_stream(
+        Fragment,
+        EndHeaders,
+        EndStream,
+        State#loop.peer_initial_window,
+        State#loop.stream_recv_window_peak
+    ),
     State1 = State#loop{
         streams = (State#loop.streams)#{StreamId => Stream},
         last_stream_id = StreamId,
@@ -568,7 +624,7 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
         true -> frame_loop(State1)
     end.
 
-new_stream(Fragment, EndHeaders, EndStream, SendWindow) ->
+new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow) ->
     #{
         state => open,
         header_fragment => Fragment,
@@ -578,7 +634,7 @@ new_stream(Fragment, EndHeaders, EndStream, SendWindow) ->
         body => [],
         body_len => 0,
         send_window => SendWindow,
-        recv_window => ?INITIAL_WINDOW,
+        recv_window => RecvWindow,
         worker_pid => undefined,
         worker_ref => undefined,
         pending_sends => []
@@ -704,18 +760,31 @@ maybe_refill_recv_windows(State, StreamId) ->
     State1 = maybe_refill_conn(State),
     maybe_refill_stream(State1, StreamId).
 
-maybe_refill_conn(#loop{conn_recv_window = W} = State) when W < ?WINDOW_REFILL_THRESHOLD ->
-    Inc = ?INITIAL_WINDOW - W,
+maybe_refill_conn(
+    #loop{
+        conn_recv_window = W,
+        recv_window_peak = Peak,
+        recv_window_threshold = Threshold
+    } = State
+) when W < Threshold ->
+    Inc = Peak - W,
     _ = send(State, roadrunner_http2_frame:encode({window_update, 0, Inc})),
     State#loop{conn_recv_window = W + Inc};
 maybe_refill_conn(State) ->
     State.
 
-maybe_refill_stream(#loop{streams = Streams} = State, StreamId) ->
+maybe_refill_stream(
+    #loop{
+        streams = Streams,
+        stream_recv_window_peak = Peak,
+        recv_window_threshold = Threshold
+    } = State,
+    StreamId
+) ->
     #{StreamId := #{recv_window := W} = Stream} = Streams,
     if
-        W < ?WINDOW_REFILL_THRESHOLD ->
-            Inc = ?INITIAL_WINDOW - W,
+        W < Threshold ->
+            Inc = Peak - W,
             _ = send(
                 State,
                 roadrunner_http2_frame:encode({window_update, StreamId, Inc})
