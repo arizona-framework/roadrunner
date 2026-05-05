@@ -682,9 +682,44 @@ fill_n(N, Buf, _Recv) when byte_size(Buf) >= N ->
     <<Bytes:N/binary, Rest/binary>> = Buf,
     {ok, Bytes, Rest};
 fill_n(N, Buf, Recv) ->
+    %% Body recursion that conses each recv chunk onto the iolist on
+    %% the way OUT. Avoids the original `<<Buf/binary, More/binary>>`
+    %% per-step concat (O(N²) total copy across all chunks); the
+    %% single `iolist_to_binary` at the bottom is O(N).
+    Need = N - byte_size(Buf),
+    case fill_iolist(Need, Recv) of
+        {ok, Iolist, Leftover} ->
+            %% Iolist has Need bytes, Buf has byte_size(Buf), so
+            %% [Buf | Iolist] flattens to exactly N bytes.
+            Bytes = iolist_to_binary([Buf | Iolist]),
+            {ok, Bytes, Leftover};
+        {error, _} = E ->
+            E
+    end.
+
+%% Always called with `Need >= 1` from `fill_n/3` (the
+%% `byte_size(Buf) >= N` clause handles the Need = 0 case before
+%% we get here). When `MoreSize == Need` exactly, the
+%% `MoreSize >= Need` branch returns directly — we never recurse
+%% with Need = 0, so no base clause is needed.
+-spec fill_iolist(pos_integer(), fun(() -> {ok, binary()} | {error, term()})) ->
+    {ok, iolist(), binary()} | {error, term()}.
+fill_iolist(Need, Recv) ->
     case Recv() of
-        {ok, More} -> fill_n(N, <<Buf/binary, More/binary>>, Recv);
-        {error, _} = E -> E
+        {ok, More} ->
+            MoreSize = byte_size(More),
+            if
+                MoreSize >= Need ->
+                    <<Take:Need/binary, Leftover/binary>> = More,
+                    {ok, [Take], Leftover};
+                true ->
+                    case fill_iolist(Need - MoreSize, Recv) of
+                        {ok, Rest, Leftover} -> {ok, [More | Rest], Leftover};
+                        {error, _} = E -> E
+                    end
+            end;
+        {error, _} = E ->
+            E
     end.
 
 -spec content_length(roadrunner_http1:request()) ->

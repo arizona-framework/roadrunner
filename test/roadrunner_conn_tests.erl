@@ -1168,6 +1168,61 @@ consume_state_length_recv_error_propagates_test() ->
     },
     ?assertEqual({error, closed}, roadrunner_conn:consume_body_state(State, all)).
 
+%% Exercise `fill_n` / `fill_iolist`'s recursive branch where one
+%% recv returns less than `Need` and a SECOND recv has to land
+%% before the request is satisfied. Ensures the iolist accumulator
+%% / leftover threading work correctly across multiple chunks.
+consume_state_length_multi_recv_test() ->
+    %% First recv returns 4 bytes ("abcd"); second returns 6 bytes
+    %% ("efghij"). The handler asks for 8 — should consume the
+    %% first chunk plus 4 bytes of the second, leave "ij" buffered.
+    Counter = counters:new(1, []),
+    Recv = fun() ->
+        N = counters:get(Counter, 1),
+        counters:add(Counter, 1, 1),
+        case N of
+            0 -> {ok, ~"abcd"};
+            1 -> {ok, ~"efghij"};
+            _ -> error(unused)
+        end
+    end,
+    State0 = #{
+        framing => {content_length, 100},
+        buffered => <<>>,
+        bytes_read => 0,
+        recv => Recv,
+        max => 1000
+    },
+    {more, Bytes, State1} = roadrunner_conn:consume_body_state(State0, {length, 8}),
+    ?assertEqual(~"abcdefgh", Bytes),
+    %% State1's buffered should now hold the leftover "ij".
+    ?assertMatch(#{buffered := ~"ij"}, State1).
+
+%% Exercise `fill_iolist`'s recursive error branch — first recv
+%% delivers SOME bytes, the second recv fails. The error should
+%% propagate back up the recursion to the caller.
+consume_state_length_multi_recv_error_test() ->
+    Counter = counters:new(1, []),
+    Recv = fun() ->
+        N = counters:get(Counter, 1),
+        counters:add(Counter, 1, 1),
+        case N of
+            0 -> {ok, ~"abcd"};
+            _ -> {error, closed}
+        end
+    end,
+    State = #{
+        framing => {content_length, 100},
+        buffered => <<>>,
+        bytes_read => 0,
+        recv => Recv,
+        max => 1000
+    },
+    ?assertEqual(
+        {error, closed},
+        roadrunner_conn:consume_body_state(State, {length, 8})
+    ).
+
 consume_state_request_too_large_test() ->
     State = #{
         framing => {content_length, 100},
