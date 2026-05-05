@@ -51,10 +51,42 @@ iolist build is 3× faster.
 ascii_lowercase(Bin) when is_binary(Bin) ->
     iolist_to_binary(ascii_lowercase_walk(Bin)).
 
+%% 26 explicit head clauses + literal lowercase byte instead of
+%% `when C >= $A, C =< $Z -> [C + 32 | ...]`. The compiler converts
+%% the explicit form into a single `select_val` jump table (BEAM
+%% switch/case) with each target putting the literal lowercase byte
+%% — no runtime guard comparisons, no runtime `+ 32` arithmetic.
+%% `erlc -S` confirms: guard form emits 2× `is_ge` + `gc_bif '+'`
+%% per byte; explicit form emits one `select_val` over 26 entries
+%% per byte. Faster on ASCII-heavy inputs and indistinguishable on
+%% the (already lowercase) common case where the catch-all clause
+%% runs.
 -spec ascii_lowercase_walk(binary()) -> iolist().
-ascii_lowercase_walk(<<>>) ->
-    [];
-ascii_lowercase_walk(<<C, R/binary>>) when C >= $A, C =< $Z ->
-    [C + 32 | ascii_lowercase_walk(R)];
-ascii_lowercase_walk(<<C, R/binary>>) ->
-    [C | ascii_lowercase_walk(R)].
+ascii_lowercase_walk(<<>>) -> [];
+ascii_lowercase_walk(<<$A, R/binary>>) -> [$a | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$B, R/binary>>) -> [$b | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$C, R/binary>>) -> [$c | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$D, R/binary>>) -> [$d | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$E, R/binary>>) -> [$e | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$F, R/binary>>) -> [$f | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$G, R/binary>>) -> [$g | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$H, R/binary>>) -> [$h | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$I, R/binary>>) -> [$i | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$J, R/binary>>) -> [$j | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$K, R/binary>>) -> [$k | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$L, R/binary>>) -> [$l | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$M, R/binary>>) -> [$m | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$N, R/binary>>) -> [$n | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$O, R/binary>>) -> [$o | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$P, R/binary>>) -> [$p | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$Q, R/binary>>) -> [$q | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$R, R/binary>>) -> [$r | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$S, R/binary>>) -> [$s | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$T, R/binary>>) -> [$t | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$U, R/binary>>) -> [$u | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$V, R/binary>>) -> [$v | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$W, R/binary>>) -> [$w | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$X, R/binary>>) -> [$x | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$Y, R/binary>>) -> [$y | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<$Z, R/binary>>) -> [$z | ascii_lowercase_walk(R)];
+ascii_lowercase_walk(<<C, R/binary>>) -> [C | ascii_lowercase_walk(R)].

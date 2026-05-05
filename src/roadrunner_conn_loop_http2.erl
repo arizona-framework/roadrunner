@@ -940,7 +940,7 @@ encode_and_send_headers(
     #loop{hpack_enc = Enc} = State, StreamId, Status, Headers, EndStream
 ) ->
     StatusBin = integer_to_binary(Status),
-    LowerHeaders = [{lowercase(N), V} || {N, V} <- Headers],
+    LowerHeaders = [{roadrunner_bin:ascii_lowercase(N), V} || {N, V} <- Headers],
     AllHeaders = [{~":status", StatusBin} | LowerHeaders],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     %% `frame:encode` accepts iodata for the header block — skip
@@ -971,7 +971,7 @@ encode_and_send_response_atomic(
 ) ->
     #{StreamId := Stream} = Streams,
     StatusBin = integer_to_binary(Status),
-    LowerHeaders = [{lowercase(N), V} || {N, V} <- Headers],
+    LowerHeaders = [{roadrunner_bin:ascii_lowercase(N), V} || {N, V} <- Headers],
     AllHeaders = [{~":status", StatusBin} | LowerHeaders],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     HFrame = roadrunner_http2_frame:encode(
@@ -984,7 +984,7 @@ encode_and_send_response_atomic(
     close_stream_send_side(State2, StreamId).
 
 encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
-    LowerTrailers = [{lowercase(N), V} || {N, V} <- Trailers],
+    LowerTrailers = [{roadrunner_bin:ascii_lowercase(N), V} || {N, V} <- Trailers],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(LowerTrailers, Enc),
     Frame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04 bor 16#01, undefined, HpackBlock}
@@ -1181,10 +1181,6 @@ is_trailer_block(#{end_stream_seen := true}, _Flags) ->
     false;
 is_trailer_block(_Stream, Flags) ->
     (Flags band 16#01) =/= 0.
-
--spec lowercase(binary()) -> binary().
-lowercase(B) ->
-    roadrunner_bin:ascii_lowercase(B).
 
 %% RFC 9113 §6.9.2: when peer changes INITIAL_WINDOW_SIZE we shift
 %% every open stream's send window by the delta. Overflow on any
