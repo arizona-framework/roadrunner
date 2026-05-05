@@ -575,6 +575,24 @@ cli() ->
                 help => "Loopback host the loadgen targets."
             },
             #{
+                name => with_resources,
+                long => "-with-resources",
+                type => boolean,
+                default => false,
+                help =>
+                    """
+                    Sample memory + CPU during the measured phase and emit
+                    them alongside throughput. Linux only (reads
+                    /proc/<peer-pid>). Adds these columns to the per-side
+                    row + summary table:
+                      rss(MB) — peak OS-level resident set
+                      beam(MB) — peak `erlang:memory(total)` in the peer BEAM
+                      cpu%     — (utime+stime delta)/wall-clock; >100% = >1 core
+                    Sampling poll interval is 100 ms during the measure
+                    window; warmup is excluded.
+                    """
+            },
+            #{
                 name => profile,
                 long => "-profile",
                 type => boolean,
@@ -685,14 +703,109 @@ run_side(Side, Opts) ->
     try
         run_warmup(Port, Opts),
         ok = maybe_start_profile(Peer, Opts),
-        Result = run_measured(Port, Opts),
+        Sampler = maybe_start_sampler(Peer, Opts),
+        Result0 = run_measured(Port, Opts),
+        Resources = maybe_stop_sampler(Sampler),
         ok = maybe_stop_profile(Peer, Side, Opts),
+        Result =
+            case Resources of
+                undefined -> Result0;
+                _ -> Result0#{resources => Resources}
+            end,
         Row = result_to_row(Side, Result),
         io:format("  ~s~n", [fmt_row(Row)]),
         {[Row], Result}
     after
         peer:stop(Peer)
     end.
+
+%% Resource sampling (Linux). Polls `/proc/<peer-pid>/{status,stat}`
+%% and `peer:call(erlang, memory, [])` every 100 ms for the duration
+%% of the measure phase, tracking the peak RSS / BEAM memory and the
+%% utime+stime delta. `--with-resources` opt-in.
+maybe_start_sampler(_Peer, #{with_resources := false}) ->
+    undefined;
+maybe_start_sampler(Peer, #{with_resources := true}) ->
+    OsPid = peer:call(Peer, os, getpid, []),
+    Self = self(),
+    spawn(fun() ->
+        StartMs = erlang:monotonic_time(millisecond),
+        CpuStart = read_proc_cpu_ticks(OsPid),
+        InitAcc = #{peak_rss_kb => 0, peak_beam_total => 0},
+        Acc = sampler_loop(Peer, OsPid, InitAcc),
+        CpuEnd = read_proc_cpu_ticks(OsPid),
+        EndMs = erlang:monotonic_time(millisecond),
+        Result = Acc#{cpu_pct => cpu_pct(CpuStart, CpuEnd, EndMs - StartMs)},
+        Self ! {self(), {sampler_result, Result}}
+    end).
+
+maybe_stop_sampler(undefined) ->
+    undefined;
+maybe_stop_sampler(SamplerPid) ->
+    SamplerPid ! {self(), stop},
+    receive
+        {SamplerPid, {sampler_result, R}} -> R
+    after 5000 ->
+        undefined
+    end.
+
+sampler_loop(Peer, OsPid, Acc) ->
+    receive
+        {_, stop} -> Acc
+    after 100 ->
+        Rss = read_proc_rss_kb(OsPid),
+        BeamTotal =
+            try proplists:get_value(total, peer:call(Peer, erlang, memory, [], 1000), 0)
+            catch _:_ -> 0
+            end,
+        sampler_loop(Peer, OsPid, Acc#{
+            peak_rss_kb => max(maps:get(peak_rss_kb, Acc), Rss),
+            peak_beam_total => max(maps:get(peak_beam_total, Acc), BeamTotal)
+        })
+    end.
+
+read_proc_rss_kb(OsPid) ->
+    case file:read_file("/proc/" ++ OsPid ++ "/status") of
+        {ok, Bin} ->
+            case re:run(Bin, ~"VmRSS:\\s+([0-9]+)\\s+kB", [{capture, [1], list}]) of
+                {match, [Kb]} -> list_to_integer(Kb);
+                _ -> 0
+            end;
+        _ ->
+            0
+    end.
+
+read_proc_cpu_ticks(OsPid) ->
+    %% /proc/<pid>/stat fields (1-indexed): 14 = utime, 15 = stime.
+    %% The `comm` field (2) can contain whitespace inside `(...)`,
+    %% which would break a naïve space-split — strip up to the
+    %% trailing `)` first, then split. After that, the original
+    %% indices 14/15 are the 12th/13th tokens.
+    case file:read_file("/proc/" ++ OsPid ++ "/stat") of
+        {ok, Bin} ->
+            case binary:split(Bin, ~")", [trim_all]) of
+                [_Pre, Rest] ->
+                    Tokens = binary:split(Rest, ~" ", [global, trim_all]),
+                    safe_int(lists:nth(12, Tokens)) + safe_int(lists:nth(13, Tokens));
+                _ ->
+                    0
+            end;
+        _ ->
+            0
+    end.
+
+safe_int(B) ->
+    try binary_to_integer(B)
+    catch _:_ -> 0
+    end.
+
+cpu_pct(Start, End, ElapsedMs) when ElapsedMs > 0 ->
+    %% _SC_CLK_TCK is conventionally 100 on Linux.
+    Ticks = End - Start,
+    CpuMs = (Ticks * 1000) / 100,
+    (CpuMs / ElapsedMs) * 100;
+cpu_pct(_, _, _) ->
+    0.
 
 maybe_start_profile(_Peer, #{profile := false}) ->
     ok;
@@ -3095,7 +3208,7 @@ result_to_row(Side, #{
     errors := Errors,
     elapsed_us := ElapsedUs,
     latencies_ns := Latencies
-}) ->
+} = Result) ->
     Sorted = lists:sort(Latencies),
     N = length(Sorted),
     Rps =
@@ -3108,7 +3221,7 @@ result_to_row(Side, #{
             0 -> 0;
             _ -> lists:sum(Sorted) div N
         end,
-    #{
+    Base = #{
         side => Side,
         rps => Rps,
         total => Total,
@@ -3117,24 +3230,30 @@ result_to_row(Side, #{
         p50 => pct(Sorted, N, 0.50),
         p95 => pct(Sorted, N, 0.95),
         p99 => pct(Sorted, N, 0.99)
-    }.
+    },
+    case Result of
+        #{resources := Res} -> maps:merge(Base, Res);
+        _ -> Base
+    end.
 
 pct([], _N, _Q) -> 0;
 pct(Sorted, N, Q) ->
     Idx = max(1, min(N, round(Q * N))),
     lists:nth(Idx, Sorted).
 
-fmt_row(#{
-    side := Side,
-    rps := Rps,
-    total := Total,
-    errors := Err,
-    mean := Mean,
-    p50 := P50,
-    p95 := P95,
-    p99 := P99
-}) ->
-    io_lib:format(
+fmt_row(
+    #{
+        side := Side,
+        rps := Rps,
+        total := Total,
+        errors := Err,
+        mean := Mean,
+        p50 := P50,
+        p95 := P95,
+        p99 := P99
+    } = Row
+) ->
+    Base = io_lib:format(
         "~-16s  ~10s req/s  total=~s err=~B  mean=~s p50=~s p95=~s p99=~s",
         [
             atom_to_list(Side),
@@ -3146,7 +3265,19 @@ fmt_row(#{
             fmt_ns(P95),
             fmt_ns(P99)
         ]
-    ).
+    ),
+    case Row of
+        #{peak_rss_kb := Rss, peak_beam_total := Beam, cpu_pct := Cpu} ->
+            [
+                Base,
+                io_lib:format(
+                    "  rss=~BMB beam=~BMB cpu=~B%",
+                    [Rss div 1024, Beam div (1024 * 1024), round(Cpu)]
+                )
+            ];
+        _ ->
+            Base
+    end.
 
 print_summary(SidesAndResults) ->
     Rows = [{Side, result_to_row(Side, R)} || {Side, R} <- SidesAndResults],
@@ -3154,20 +3285,48 @@ print_summary(SidesAndResults) ->
         fun({_, A}, {_, B}) -> maps:get(rps, A) >= maps:get(rps, B) end,
         Rows
     ),
+    HasResources = lists:any(
+        fun({_, R}) -> maps:is_key(peak_rss_kb, R) end, Sorted
+    ),
     io:format("~nsummary (sorted by throughput, fastest first)~n"),
-    io:format("~-16s  ~10s req/s   ~10s p50   ~10s p99~n", ["server", "", "", ""]),
-    io:format("~s~n", [string:copies("-", 65)]),
+    case HasResources of
+        true ->
+            io:format(
+                "~-16s  ~10s req/s   ~10s p50   ~10s p99   ~6s   ~7s   ~5s~n",
+                ["server", "", "", "", "rss", "beam", "cpu%"]
+            ),
+            io:format("~s~n", [string:copies("-", 92)]);
+        false ->
+            io:format("~-16s  ~10s req/s   ~10s p50   ~10s p99~n", ["server", "", "", ""]),
+            io:format("~s~n", [string:copies("-", 65)])
+    end,
     lists:foreach(
         fun({Side, Row}) ->
-            io:format(
-                "~-16s  ~10s req/s   ~10s p50   ~10s p99~n",
-                [
-                    atom_to_list(Side),
-                    fmt_int(round(maps:get(rps, Row))),
-                    fmt_ns(maps:get(p50, Row)),
-                    fmt_ns(maps:get(p99, Row))
-                ]
-            )
+            case HasResources of
+                true ->
+                    io:format(
+                        "~-16s  ~10s req/s   ~10s p50   ~10s p99   ~3BMB   ~4BMB   ~4B%~n",
+                        [
+                            atom_to_list(Side),
+                            fmt_int(round(maps:get(rps, Row))),
+                            fmt_ns(maps:get(p50, Row)),
+                            fmt_ns(maps:get(p99, Row)),
+                            maps:get(peak_rss_kb, Row, 0) div 1024,
+                            maps:get(peak_beam_total, Row, 0) div (1024 * 1024),
+                            round(maps:get(cpu_pct, Row, 0))
+                        ]
+                    );
+                false ->
+                    io:format(
+                        "~-16s  ~10s req/s   ~10s p50   ~10s p99~n",
+                        [
+                            atom_to_list(Side),
+                            fmt_int(round(maps:get(rps, Row))),
+                            fmt_ns(maps:get(p50, Row)),
+                            fmt_ns(maps:get(p99, Row))
+                        ]
+                    )
+            end
         end,
         Sorted
     ),
