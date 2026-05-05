@@ -1456,3 +1456,80 @@ collect_sends_loop(Tag, Acc, Timeout) ->
     after Timeout ->
         lists:reverse(Acc)
     end.
+
+%% =============================================================================
+%% unmask_slice/3 — direct unit tests on the chunked unmask path. The
+%% function is exercised end-to-end by the WS conformance tests with
+%% small payloads, but the 16-byte fast path (4 × 32-bit words at a
+%% time) and trailing 24/16/8-bit residuals only land when the slice
+%% size lines up. Test those explicitly so coverage is honest.
+%% =============================================================================
+
+unmask_slice_empty_test() ->
+    ?assertEqual(<<>>, roadrunner_ws_session:unmask_slice(<<>>, <<1, 2, 3, 4>>, 0)).
+
+unmask_slice_1_byte_test() ->
+    ?assertEqual(
+        <<(1 bxor 1)>>,
+        roadrunner_ws_session:unmask_slice(<<1>>, <<1, 2, 3, 4>>, 0)
+    ).
+
+unmask_slice_2_bytes_test() ->
+    Mask = <<1, 2, 3, 4>>,
+    Bytes = <<10, 20>>,
+    Expected = <<(10 bxor 1), (20 bxor 2)>>,
+    ?assertEqual(Expected, roadrunner_ws_session:unmask_slice(Bytes, Mask, 0)).
+
+unmask_slice_3_bytes_test() ->
+    Mask = <<1, 2, 3, 4>>,
+    Bytes = <<10, 20, 30>>,
+    Expected = <<(10 bxor 1), (20 bxor 2), (30 bxor 3)>>,
+    ?assertEqual(Expected, roadrunner_ws_session:unmask_slice(Bytes, Mask, 0)).
+
+unmask_slice_one_word_test() ->
+    Mask = <<1, 2, 3, 4>>,
+    Bytes = <<10, 20, 30, 40, 50, 60, 70, 80>>,
+    Expected = <<
+        (10 bxor 1),
+        (20 bxor 2),
+        (30 bxor 3),
+        (40 bxor 4),
+        (50 bxor 1),
+        (60 bxor 2),
+        (70 bxor 3),
+        (80 bxor 4)
+    >>,
+    ?assertEqual(Expected, roadrunner_ws_session:unmask_slice(Bytes, Mask, 0)).
+
+unmask_slice_16_byte_chunk_test() ->
+    %% Exercises the 4-word fast path.
+    Mask = <<1, 2, 3, 4>>,
+    Bytes = <<
+        10,
+        20,
+        30,
+        40,
+        50,
+        60,
+        70,
+        80,
+        90,
+        100,
+        110,
+        120,
+        130,
+        140,
+        150,
+        160
+    >>,
+    Cycle = [1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4],
+    Plain = binary_to_list(Bytes),
+    Expected = list_to_binary([B bxor M || {B, M} <- lists:zip(Plain, Cycle)]),
+    ?assertEqual(Expected, roadrunner_ws_session:unmask_slice(Bytes, Mask, 0)).
+
+unmask_slice_offset_test() ->
+    %% Non-zero offset: slice[0] aligns to MaskKey[Offset rem 4].
+    Mask = <<1, 2, 3, 4>>,
+    Bytes = <<10, 20, 30, 40>>,
+    Expected = <<(10 bxor 2), (20 bxor 3), (30 bxor 4), (40 bxor 1)>>,
+    ?assertEqual(Expected, roadrunner_ws_session:unmask_slice(Bytes, Mask, 1)).
