@@ -221,7 +221,8 @@ cli() ->
                         etag_304,
                         partial_body_drop,
                         cookies_heavy,
-                        tls_handshake_throughput
+                        tls_handshake_throughput,
+                        multi_request_body
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -467,6 +468,14 @@ cli() ->
                                     of `ssl`-app behavior across
                                     servers (same cert; same
                                     cipher suites; same OTP version).
+                    multi_request_body:
+                                    h1-only. POST /echo with a
+                                    4 KB body, keep-alive. Distinct
+                                    from `echo` (256 B body) — tests
+                                    body-read at a more realistic
+                                    size where the read loop and
+                                    the kernel send buffer (default
+                                    ~85 KB) interact differently.
                     """
             },
             #{
@@ -925,6 +934,8 @@ scenario_roadrunner_opts(cookies_heavy, BaseOpts) ->
     BaseOpts#{routes => [{~"/cookies", roadrunner_bench_cookies_handler, undefined}]};
 scenario_roadrunner_opts(tls_handshake_throughput, BaseOpts) ->
     BaseOpts#{handler => roadrunner_keepalive_handler};
+scenario_roadrunner_opts(multi_request_body, BaseOpts) ->
+    BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -1008,7 +1019,9 @@ scenario_cowboy_routes(partial_body_drop) ->
 scenario_cowboy_routes(cookies_heavy) ->
     [{'_', [{"/cookies", roadrunner_bench_cowboy_cookies_handler, []}]}];
 scenario_cowboy_routes(tls_handshake_throughput) ->
-    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}].
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
+scenario_cowboy_routes(multi_request_body) ->
+    [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}].
 
 %% Per-scenario cowboy TransportOpts. The default keeps the bench's
 %% prior shape (`num_acceptors => 10`); `backpressure_sustained`
@@ -2209,6 +2222,15 @@ build_request(tls_handshake_throughput) ->
         "error: --scenario tls_handshake_throughput is h2-only "
         "(use --protocol h2)~n", []),
     halt(2);
+build_request(multi_request_body) ->
+    Body = binary:copy(~"x", 4096),
+    BodyLenBin = integer_to_binary(4096),
+    <<"POST /echo HTTP/1.1\r\n",
+        "Host: x\r\n",
+        "Content-Type: application/octet-stream\r\n",
+        "Content-Length: ", BodyLenBin/binary, "\r\n",
+        "\r\n",
+        Body/binary>>;
 build_request(post_4kb_form) ->
     %% 4 KB urlencoded body — see `post_4kb_form_body/0` for shape.
     %% Predictable parse cost (ASCII letters/digits only, no
@@ -2282,7 +2304,8 @@ expected_body_len(url_with_qs) -> 1;
 expected_body_len(small_chunked_response) -> 6400;
 expected_body_len(head_method) -> 0;
 expected_body_len(etag_304) -> 0;
-expected_body_len(cookies_heavy) -> 1.
+expected_body_len(cookies_heavy) -> 1;
+expected_body_len(multi_request_body) -> 4096.
 
 %% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
 %% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
@@ -2680,6 +2703,9 @@ h2_request_shape(cookies_heavy) ->
                 ~"session=abc123def456ghi789; user_id=42; theme=dark; lang=en-US; tz=America/Los_Angeles; tracker=prod-789xyz; campaign=spring-2026; ab_test=variant_b"}
         ],
         <<>>};
+h2_request_shape(multi_request_body) ->
+    {~"POST", ~"/echo", [{~"content-type", ~"application/octet-stream"}],
+        binary:copy(~"x", 4096)};
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -2891,7 +2917,9 @@ scenario_request_summary(partial_body_drop) ->
 scenario_request_summary(cookies_heavy) ->
     "GET /cookies HTTP/1.1, single Cookie header with 8 pairs, server parses all (router)";
 scenario_request_summary(tls_handshake_throughput) ->
-    "GET / over h2, fresh TLS conn per request, TLS handshake dominates (handler)".
+    "GET / over h2, fresh TLS conn per request, TLS handshake dominates (handler)";
+scenario_request_summary(multi_request_body) ->
+    "POST /echo HTTP/1.1, 4 KB body, keep-alive (router)".
 
 result_to_row(Side, #{
     total := Total,
