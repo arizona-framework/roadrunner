@@ -99,6 +99,9 @@ preflight_scenario(#{scenario := backpressure_sustained, servers := Servers} = O
 preflight_scenario(#{scenario := server_sent_events, servers := Servers} = Opts) ->
     filter_servers(server_sent_events, [elli], Servers, Opts,
         ~"no equivalent loop handler in our test fixture");
+preflight_scenario(#{scenario := expect_100_continue, servers := Servers} = Opts) ->
+    filter_servers(expect_100_continue, [elli], Servers, Opts,
+        ~"no automatic 100-continue handling in our elli fixture");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -188,7 +191,8 @@ cli() ->
                         varied_paths_router,
                         gzip_response,
                         backpressure_sustained,
-                        server_sent_events
+                        server_sent_events,
+                        expect_100_continue
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -322,6 +326,18 @@ cli() ->
                                     the one feature pg:join enables).
                                     elli filtered out (different
                                     handler shape).
+                    expect_100_continue:
+                                    h1-only. POST /echo with
+                                    `Expect: 100-continue`. Bench
+                                    sends headers only, awaits a
+                                    `HTTP/1.1 100 Continue` interim
+                                    response, sends the body, then
+                                    awaits the final 200. Tests
+                                    `roadrunner_conn:maybe_send_continue/3`
+                                    + the conn-state machine that
+                                    ferries the interim response.
+                                    elli filtered out (no
+                                    100-continue support in fixture).
                     """
             },
             #{
@@ -716,6 +732,11 @@ scenario_roadrunner_opts(backpressure_sustained, BaseOpts) ->
     };
 scenario_roadrunner_opts(server_sent_events, BaseOpts) ->
     BaseOpts#{routes => [{~"/sse", roadrunner_bench_sse_handler, undefined}]};
+scenario_roadrunner_opts(expect_100_continue, BaseOpts) ->
+    %% Reuse the existing echo handler — same body shape, the
+    %% protocol-level interim 100 is handled automatically by
+    %% `roadrunner_conn:maybe_send_continue/3`.
+    BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -777,7 +798,9 @@ scenario_cowboy_routes(gzip_response) ->
 scenario_cowboy_routes(backpressure_sustained) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
 scenario_cowboy_routes(server_sent_events) ->
-    [{'_', [{"/sse", roadrunner_bench_cowboy_sse_handler, []}]}].
+    [{'_', [{"/sse", roadrunner_bench_cowboy_sse_handler, []}]}];
+scenario_cowboy_routes(expect_100_continue) ->
+    [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}].
 
 %% Per-scenario cowboy TransportOpts. The default keeps the bench's
 %% prior shape (`num_acceptors => 10`); `backpressure_sustained`
@@ -830,6 +853,21 @@ run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
 run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
     run_phase_h2(Port, Opts, DurationMs).
 
+run_phase_h1(
+    Port, #{clients := C, host := Host, scenario := expect_100_continue}, DurationMs
+) ->
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    Self = self(),
+    StartUs = erlang:monotonic_time(microsecond),
+    Workers = [
+        spawn_link(fun() ->
+            Self ! {self(), expect_100_worker(Host, Port, Deadline, init_acc())}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
+    EndUs = erlang:monotonic_time(microsecond),
+    aggregate(PerWorker, EndUs - StartUs);
 run_phase_h1(
     Port, #{clients := C, host := Host, scenario := server_sent_events}, DurationMs
 ) ->
@@ -1161,6 +1199,108 @@ router_404_storm_one(Host, Port) ->
             end;
         {error, _} = E ->
             E
+    end.
+
+%% expect_100_continue: keep-alive worker. Per iteration: send
+%% request HEADERS WITH `Expect: 100-continue` (no body); read the
+%% interim `HTTP/1.1 100 Continue` response; then send the body;
+%% then read the final `HTTP/1.1 200 OK` response. Two recv-then-
+%% send phases per request — distinct from any other scenario,
+%% exercises `roadrunner_conn:maybe_send_continue/3`.
+-define(EXPECT_100_BODY_SIZE, 256).
+
+expect_100_headers() ->
+    Body = binary:copy(~"x", ?EXPECT_100_BODY_SIZE),
+    BodyLen = integer_to_binary(?EXPECT_100_BODY_SIZE),
+    Headers = <<"POST /echo HTTP/1.1\r\n",
+        "Host: x\r\n",
+        "Content-Type: application/octet-stream\r\n",
+        "Expect: 100-continue\r\n",
+        "Content-Length: ", BodyLen/binary, "\r\n",
+        "\r\n">>,
+    {Headers, Body}.
+
+expect_100_worker(Host, Port, Deadline, Acc) ->
+    case gen_tcp:connect(Host, Port, [binary, {active, false}, {nodelay, true}], 5000) of
+        {ok, Sock} ->
+            {Headers, Body} = expect_100_headers(),
+            Final = expect_100_loop(Sock, Headers, Body, Deadline, Acc),
+            ok = gen_tcp:close(Sock),
+            Final;
+        {error, _} ->
+            bump_err(Acc)
+    end.
+
+expect_100_loop(Sock, Headers, Body, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Acc;
+        false ->
+            T0 = erlang:monotonic_time(nanosecond),
+            case expect_100_one(Sock, Headers, Body) of
+                {ok, Bytes} ->
+                    T1 = erlang:monotonic_time(nanosecond),
+                    expect_100_loop(
+                        Sock, Headers, Body, Deadline,
+                        bump_ok(Acc, T1 - T0, Bytes)
+                    );
+                {error, _} ->
+                    bump_err(Acc)
+            end
+    end.
+
+%% One full 100-continue cycle on `Sock`: headers → 100 → body → 200.
+%% Returns the leftover buf-size on success so the bench accumulator
+%% has something concrete; `Buf` itself is discarded between
+%% iterations (kernel buffer drained by the read).
+expect_100_one(Sock, Headers, Body) ->
+    case gen_tcp:send(Sock, Headers) of
+        ok ->
+            case recv_status_line(Sock, <<>>, ~"HTTP/1.1 100", 5000) of
+                {ok, Buf1} ->
+                    %% Buf1 contains the 100 status line + its
+                    %% terminating CRLFs. Consume those, then send
+                    %% the body and wait for 200.
+                    case skip_status_line(Buf1) of
+                        {ok, _Rest} ->
+                            case gen_tcp:send(Sock, Body) of
+                                ok -> recv_response(Sock, <<>>, ?EXPECT_100_BODY_SIZE, 5000);
+                                {error, _} = E -> E
+                            end;
+                        {error, _} = E ->
+                            E
+                    end;
+                {error, _} = E ->
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+%% Read until `Buf` contains the expected status-line prefix at offset 0.
+recv_status_line(Sock, Buf, Prefix, Timeout) ->
+    case Buf of
+        <<Prefix:(byte_size(Prefix))/binary, _/binary>> ->
+            {ok, Buf};
+        _ when byte_size(Buf) >= byte_size(Prefix) ->
+            {error, bad_status};
+        _ ->
+            case gen_tcp:recv(Sock, 0, Timeout) of
+                {ok, Data} ->
+                    recv_status_line(Sock, <<Buf/binary, Data/binary>>, Prefix, Timeout);
+                {error, _} = E ->
+                    E
+            end
+    end.
+
+%% Drop the first status-line + terminating `\r\n\r\n` from `Buf`.
+%% The interim 100-continue response carries no body — the headers
+%% block end is followed immediately by the final response's status
+%% line on the wire, possibly already buffered.
+skip_status_line(Buf) ->
+    case binary:split(Buf, ~"\r\n\r\n") of
+        [_Status, Rest] -> {ok, Rest};
+        _ -> {error, bad_status}
     end.
 
 %% server_sent_events: per iteration, open a fresh conn, send a
@@ -1799,6 +1939,13 @@ h2_request_shape(server_sent_events) ->
         "error: --scenario server_sent_events is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(expect_100_continue) ->
+    %% h2 has no Expect: 100-continue equivalent (see RFC 9113 §8.5).
+    %% h1-only scenario.
+    io:format(standard_error,
+        "error: --scenario expect_100_continue is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -1988,7 +2135,9 @@ scenario_request_summary(gzip_response) ->
 scenario_request_summary(backpressure_sustained) ->
     "GET / HTTP/1.1, server capped at 50 concurrent slots, --clients exceeds cap (handler)";
 scenario_request_summary(server_sent_events) ->
-    "GET /sse HTTP/1.1, 100 SSE events per session then close (router; counts session, not events)".
+    "GET /sse HTTP/1.1, 100 SSE events per session then close (router; counts session, not events)";
+scenario_request_summary(expect_100_continue) ->
+    "POST /echo HTTP/1.1 + Expect: 100-continue, headers/100/body/200 cycle, 256-byte body (router)".
 
 result_to_row(Side, #{
     total := Total,
