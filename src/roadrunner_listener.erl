@@ -3,9 +3,11 @@
 Listener gen_server — owns the listening socket and the acceptor pool
 for one named roadrunner instance.
 
-Plain TCP is backed by `gen_tcp` with `{inet_backend, socket}` so we
-land on the NIF-based async I/O path that's been the production-ready
-default since OTP 27. TLS is backed by `ssl`, gated by the `tls` opt.
+Plain TCP is backed by `gen_tcp` with the legacy `inet_drv` backend.
+The OTP-27 `{inet_backend, socket}` NIF path was tried but adds ~46%
+own-time overhead on short-lived connections via per-socket-option
+lookups (see `docs/conn_lifecycle_investigation.md`). TLS is backed
+by `ssl`, gated by the `tls` opt.
 Both paths share the same `roadrunner_transport` tagged-socket abstraction.
 
 On `init/1` the listener opens the listen socket, builds the shared
@@ -256,8 +258,16 @@ open_listen_socket(Port, #{tls := UserTlsOpts0} = Opts) ->
     TlsOpts = roadrunner_transport:apply_tls_defaults(UserTlsOpts),
     roadrunner_transport:listen_tls(Port, TlsOpts ++ base_listen_opts());
 open_listen_socket(Port, _Opts) ->
-    %% Plain TCP. `inet_backend` must be the first option per gen_tcp docs.
-    roadrunner_transport:listen(Port, [{inet_backend, socket} | base_listen_opts()]).
+    %% Plain TCP. The legacy `inet_drv` backend (gen_tcp default) has
+    %% lower per-call overhead than the OTP-27 `socket` backend on
+    %% short-lived connections. fprof on `connection_storm` shows the
+    %% `socket` backend's `prim_socket:is_supported_option` + the
+    %% `maps:fold_1` walking it costs ~46% of per-conn own time
+    %% (~106 lookups per connection). See
+    %% `docs/conn_lifecycle_investigation.md`. The new backend's
+    %% async I/O wins are real for long-lived connections; revisit
+    %% if/when the workload mix shifts there.
+    roadrunner_transport:listen(Port, base_listen_opts()).
 
 -spec base_listen_opts() -> [gen_tcp:listen_option()].
 base_listen_opts() ->

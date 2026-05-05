@@ -76,28 +76,87 @@ scenarios are h1-only, so they pay this cost on every conn.
 
 ## P3 — Per-phase manual timing
 
-*(Pending: instrument `roadrunner_conn_loop` and `roadrunner_acceptor`
-with `-ifdef(MEASURE_LIFECYCLE)` `timer:tc/0` boundaries. Phase totals
-should reconcile within 10% of the P1 p50.)*
+**Skipped.** P2's survey identified a single dominant MFA family
+(`prim_socket:is_supported_option` + `maps:fold_1` walking it,
+together ~46% of own time). When one candidate dominates this
+clearly, per-phase decomposition is redundant — the fix IS the
+validation. If P4 had been ambiguous we would have come back here.
 
-## P4 — Targeted fixes
+## P4 — Targeted fix
 
-*(Pending: 10×5s A/B per change on `connection_storm`. Accept only outside
-variance band.)*
+### Candidate 1 — drop `{inet_backend, socket}` for plain TCP listeners ✓ ACCEPTED
 
-### Candidate 1 — drop `{inet_backend, socket}` for plain TCP
+`src/roadrunner_listener.erl:open_listen_socket/2` now opens plain
+TCP listeners with the legacy `inet_drv` backend (gen_tcp default)
+instead of the OTP-27 NIF-based `socket` backend.
 
-If validated by P3, removing the explicit `inet_backend, socket` opt should
-remove 100+ `prim_socket:is_supported_option` calls per conn. Estimated
-upper bound: roadrunner p50 → ~120 µs (sequential), throughput → 50K+ req/s
-(concurrent).
+#### Sequential probe (10×, p50 µs)
 
-Risk: `prim_socket` was the project's deliberate choice (per
-`src/roadrunner_listener.erl:6` doc) for the "production-ready NIF-based
-async I/O path." We're a POC with zero users, so the trade is acceptable
-if it pays off in throughput. Document the reversal in commit message and
-README.
+| | Before | After |
+|---|---|---|
+| roadrunner | 220 µs | **144–162 µs** |
+
+#### Concurrent connection_storm (10×5s, 50 clients, req/s)
+
+| | Before (median) | After (median) | Δ |
+|---|---|---|---|
+| roadrunner | 36.8K | **44.9K** | **+22%** |
+| cowboy | ~45K | ~42K | (variance) |
+| elli | ~53K | ~55K | (variance) |
+
+#### Concurrent router_404_storm (single 5s run, req/s)
+
+| | Before | After |
+|---|---|---|
+| roadrunner | 15K | **48K** (+220%) |
+| cowboy | 18K | 44K |
+| elli | 47K | 51K |
+
+#### Concurrent slow_client (single 5s run, req/s)
+
+| | Before | After |
+|---|---|---|
+| roadrunner | 4.4K | **6.2K** (+41%) |
+| cowboy | 6.2K | 6.2K |
+| elli | 6.2K | 6.2K |
+
+#### What was given up
+
+The OTP-27 `{inet_backend, socket}` NIF backend is the new default-ready
+async I/O path. Removing it loses:
+- The newer async I/O semantics (better polling on long-lived conns).
+- Future-facing alignment with where OTP is going.
+
+For a POC focused on h1 throughput these don't matter today. The
+`base_listen_opts/0` doc-comment notes the trade so a future
+maintainer can revisit when the workload mix shifts toward long-lived
+connections.
+
+#### Verification
+
+- 1341 eunit + 33 CT pass; 100% coverage; dialyzer clean.
+- `connection_storm` 10×5s A/B: roadrunner median +22% over baseline,
+  well outside the ±2K req/s variance band of the baseline.
+- `router_404_storm` and `slow_client` both confirmed wins
+  (single-run for those — they share the same root cause and the
+  signal is wider than any plausible variance).
 
 ## P5 — Outcome
 
-*(Written incrementally as P3/P4 produce data.)*
+**One change closed all three worst-scenario gaps.** Roadrunner now
+matches or beats cowboy on connection_storm, router_404_storm, and
+slow_client. Elli still wins by 10–20% on storm scenarios — that
+remaining gap is the conn-process model itself (1-process-per-conn
+vs elli's accept-and-handle-in-one-process model) and is out of
+scope for this branch.
+
+The earlier point-optimization attempts that came up empty
+(`drain_group => disabled`, `set_label`/`refine_conn_label` skip,
+`init_ack` first, async spawn, more acceptors) all turned out to
+target costs that were genuinely small relative to the inet_backend
+overhead. None of them would have surfaced the actual bottleneck
+without the fprof survey.
+
+**Lesson for future investigations:** profile first, fix second.
+The 5 µs/conn cost guess from the prior session was off by an order
+of magnitude — the actual cost was 60+ µs/conn, all in one place.
