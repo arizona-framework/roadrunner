@@ -11,6 +11,10 @@ small public surface, RFC-correct parsing, and modern OTP idioms throughout.
 POC — not yet deployed in production. Eunit + CT (incl. PropEr)
 tests with 100% line coverage, dialyzer-clean.
 
+See [`docs/roadmap.md`](docs/roadmap.md) for what's deferred past
+v0.1 — notably `{loop, _}`, `{sendfile, _}`, and
+`{websocket, _, _}` over HTTP/2 (currently 501) and HTTP/3.
+
 Standards conformance:
 
 - **HTTP/1.1**: RFC 9110 (semantics) + RFC 9112 (syntax).
