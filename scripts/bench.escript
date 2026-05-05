@@ -202,7 +202,8 @@ cli() ->
                         large_keepalive_session,
                         websocket_msg_throughput,
                         url_with_qs,
-                        small_chunked_response
+                        small_chunked_response,
+                        accept_storm_burst
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -388,6 +389,18 @@ cli() ->
                                     cost shape from
                                     `streaming_response`'s
                                     4 × 4 KB.
+                    accept_storm_burst:
+                                    h1-only. ALL --clients connect
+                                    simultaneously (a single peak
+                                    burst), each does 1 GET / +
+                                    Connection: close, then exits.
+                                    Different from `connection_storm`
+                                    which is sustained — this tests
+                                    listener backlog + acceptor
+                                    pool under peak instantaneous
+                                    load. Run with --duration 1
+                                    or short; throughput =
+                                    clients / time-to-drain.
                     """
             },
             #{
@@ -830,6 +843,8 @@ scenario_roadrunner_opts(url_with_qs, BaseOpts) ->
     BaseOpts#{routes => [{~"/qs", roadrunner_bench_url_qs_handler, undefined}]};
 scenario_roadrunner_opts(small_chunked_response, BaseOpts) ->
     BaseOpts#{routes => [{~"/small", roadrunner_bench_small_chunks_handler, undefined}]};
+scenario_roadrunner_opts(accept_storm_burst, BaseOpts) ->
+    BaseOpts#{handler => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -901,7 +916,9 @@ scenario_cowboy_routes(websocket_msg_throughput) ->
 scenario_cowboy_routes(url_with_qs) ->
     [{'_', [{"/qs", roadrunner_bench_cowboy_url_qs_handler, []}]}];
 scenario_cowboy_routes(small_chunked_response) ->
-    [{'_', [{"/small", roadrunner_bench_cowboy_small_chunks_handler, []}]}].
+    [{'_', [{"/small", roadrunner_bench_cowboy_small_chunks_handler, []}]}];
+scenario_cowboy_routes(accept_storm_burst) ->
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}].
 
 %% Per-scenario cowboy TransportOpts. The default keeps the bench's
 %% prior shape (`num_acceptors => 10`); `backpressure_sustained`
@@ -956,6 +973,23 @@ run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
 run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
     run_phase_h2(Port, Opts, DurationMs).
 
+run_phase_h1(
+    Port, #{clients := C, host := Host, scenario := accept_storm_burst}, _DurationMs
+) ->
+    %% Burst — all clients connect at once, each does 1 conn, then
+    %% exits. `--duration` is ignored; throughput is
+    %% (successful conns) / (wall time to drain).
+    Self = self(),
+    StartUs = erlang:monotonic_time(microsecond),
+    Workers = [
+        spawn_link(fun() ->
+            Self ! {self(), accept_storm_burst_one(Host, Port)}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    Results = [collect_burst_one(W, 30000) || W <- Workers],
+    EndUs = erlang:monotonic_time(microsecond),
+    aggregate_burst(Results, EndUs - StartUs);
 run_phase_h1(
     Port, #{clients := C, host := Host, scenario := websocket_msg_throughput}, DurationMs
 ) ->
@@ -1643,6 +1677,62 @@ skip_status_line(Buf) ->
         _ -> {error, bad_status}
     end.
 
+%% accept_storm_burst: each worker does ONE conn (open, send, recv,
+%% close) then exits. All workers spawn simultaneously so the
+%% kernel's listen queue and the acceptor pool see a single peak
+%% burst. Different bookkeeping from the loop-driven scenarios:
+%% the worker reports a single result, not a deadline-bounded acc.
+accept_storm_burst_one(Host, Port) ->
+    T0 = erlang:monotonic_time(nanosecond),
+    case
+        gen_tcp:connect(
+            Host, Port, [binary, {active, false}, {nodelay, true}], 5000
+        )
+    of
+        {ok, Sock} ->
+            Result =
+                case
+                    gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                of
+                    ok ->
+                        case recv_response(Sock, <<>>, 7, 5000) of
+                            {ok, Bytes} ->
+                                T1 = erlang:monotonic_time(nanosecond),
+                                {ok, T1 - T0, Bytes};
+                            {error, Reason} ->
+                                {error, Reason}
+                        end;
+                    {error, Reason} ->
+                        {error, Reason}
+                end,
+            _ = gen_tcp:close(Sock),
+            Result;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+collect_burst_one(Pid, TimeoutMs) ->
+    receive
+        {Pid, R} -> R
+    after TimeoutMs ->
+        io:format("error: burst worker ~p timed out~n", [Pid]),
+        {error, worker_timeout}
+    end.
+
+%% Build a single accumulator from a list of per-worker burst
+%% results. Same shape as the deadline-driven scenarios so the
+%% existing `aggregate/2` and reporting paths work unchanged.
+aggregate_burst(Results, ElapsedUs) ->
+    OkLatencies = [Ns || {ok, Ns, _Bytes} <- Results],
+    OkBytes = lists:sum([B || {ok, _, B} <- Results]),
+    Acc = #{
+        ok => length(OkLatencies),
+        err => length(Results) - length(OkLatencies),
+        bytes_in => OkBytes,
+        latencies_ns => OkLatencies
+    },
+    aggregate([Acc], ElapsedUs).
+
 %% server_sent_events: per iteration, open a fresh conn, send a
 %% GET /sse, drain the chunked-encoded SSE stream until the server
 %% closes (after 100 events), then loop. Each iteration counts as
@@ -2329,6 +2419,13 @@ h2_request_shape(url_with_qs) ->
     halt(2);
 h2_request_shape(small_chunked_response) ->
     {~"GET", ~"/small", [], <<>>};
+h2_request_shape(accept_storm_burst) ->
+    %% h2 conns require TLS handshake which dominates burst cost;
+    %% backlog under burst is an h1-flavored question.
+    io:format(standard_error,
+        "error: --scenario accept_storm_burst is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -2528,7 +2625,9 @@ scenario_request_summary(websocket_msg_throughput) ->
 scenario_request_summary(url_with_qs) ->
     "GET /qs?<6 pairs> HTTP/1.1, server parses URL query string, 1-byte response (router)";
 scenario_request_summary(small_chunked_response) ->
-    "GET /small over h2, 100 × 64-byte streamed chunks (router)".
+    "GET /small over h2, 100 × 64-byte streamed chunks (router)";
+scenario_request_summary(accept_storm_burst) ->
+    "GET / HTTP/1.1 + Connection: close, --clients all connect at once, 1 req each (handler)".
 
 result_to_row(Side, #{
     total := Total,
