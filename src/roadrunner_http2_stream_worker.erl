@@ -69,8 +69,10 @@ init(ConnPid, StreamId, Req, ProtoOpts) ->
     ok.
 
 run_handler(ConnPid, StreamId, Req, ProtoOpts) ->
-    Dispatch = maps:get(dispatch, ProtoOpts),
-    Mws = maps:get(middlewares, ProtoOpts, []),
+    %% Destructure once — `proto_opts` always carries `dispatch`
+    %% (set by listener init); `middlewares` is also always set,
+    %% defaulting to `[]`, so a strict map-pattern is correct here.
+    #{dispatch := Dispatch, middlewares := Mws} = ProtoOpts,
     Metadata = telemetry_metadata(Req),
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
@@ -127,14 +129,24 @@ invoke(ConnPid, StreamId, Handler, ListenerMws, Req, Metadata, ReqStart) ->
     end.
 
 -spec telemetry_metadata(roadrunner_http1:request()) -> roadrunner_telemetry:metadata().
-telemetry_metadata(Req) ->
+telemetry_metadata(#{
+    request_id := RequestId,
+    peer := Peer,
+    method := Method,
+    target := Target,
+    scheme := Scheme,
+    listener_name := ListenerName
+}) ->
+    %% All five required keys are populated by
+    %% `roadrunner_http2_request:build/7`; pattern-match destructure
+    %% replaces the prior 6 `maps:get/2,3` calls per request.
     #{
-        request_id => maps:get(request_id, Req),
-        peer => maps:get(peer, Req),
-        method => maps:get(method, Req),
-        path => maps:get(target, Req),
-        scheme => maps:get(scheme, Req),
-        listener_name => maps:get(listener_name, Req, undefined)
+        request_id => RequestId,
+        peer => Peer,
+        method => Method,
+        path => Target,
+        scheme => Scheme,
+        listener_name => ListenerName
     }.
 
 emit_handler_response(ConnPid, StreamId, {Status, Headers, Body}) when
