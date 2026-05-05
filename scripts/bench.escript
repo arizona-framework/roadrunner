@@ -121,6 +121,20 @@ preflight_scenario(#{scenario := partial_body_drop, servers := Servers} = Opts) 
     %% apples on the rejection path.
     filter_servers(partial_body_drop, [elli], Servers, Opts,
         ~"elli's body-read failure path differs; comparison would not be apples-to-apples");
+preflight_scenario(#{scenario := path_with_unicode, servers := Servers} = Opts) ->
+    filter_servers(path_with_unicode, [elli], Servers, Opts,
+        ~"no native qs parser in elli test fixture");
+preflight_scenario(#{scenario := cors_preflight, servers := Servers} = Opts) ->
+    filter_servers(cors_preflight, [elli], Servers, Opts,
+        ~"no /api OPTIONS handler in elli test fixture");
+preflight_scenario(#{scenario := redirect_response, servers := Servers} = Opts) ->
+    filter_servers(redirect_response, [elli], Servers, Opts,
+        ~"no /redirect handler in elli test fixture");
+preflight_scenario(#{scenario := chunked_request_body, servers := Servers} = Opts) ->
+    %% elli's body parser doesn't handle Transfer-Encoding: chunked
+    %% in the same shape; skip for apples-to-apples.
+    filter_servers(chunked_request_body, [elli], Servers, Opts,
+        ~"elli test fixture's body-read does not handle Transfer-Encoding: chunked here");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -222,7 +236,12 @@ cli() ->
                         partial_body_drop,
                         cookies_heavy,
                         tls_handshake_throughput,
-                        multi_request_body
+                        multi_request_body,
+                        path_with_unicode,
+                        cors_preflight,
+                        chunked_request_body,
+                        redirect_response,
+                        compressed_request_body
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -476,6 +495,41 @@ cli() ->
                                     size where the read loop and
                                     the kernel send buffer (default
                                     ~85 KB) interact differently.
+                    path_with_unicode:
+                                    h1-only. GET /qs?<5 pairs,
+                                    several percent-encoded UTF-8
+                                    bytes>; exercises the qs/uri
+                                    decode SLOW path (real
+                                    percent-decode work, no
+                                    fast-path skip).
+                    cors_preflight: h1-only. OPTIONS /api with
+                                    Origin / Access-Control-*
+                                    headers. Server returns 204
+                                    + CORS headers. Real path for
+                                    SPA browsers before each
+                                    cross-origin request.
+                    chunked_request_body:
+                                    h1-only. POST /echo with
+                                    Transfer-Encoding: chunked
+                                    body (4 chunks × 256 B).
+                                    Distinct from Content-Length-
+                                    framed POSTs — tests the
+                                    chunked-decode path.
+                    redirect_response:
+                                    h1-only. GET /redirect returns
+                                    302 with Location: header. Tests
+                                    the small-response write path
+                                    distinct from etag_304 (different
+                                    status, includes Location header).
+                    compressed_request_body:
+                                    h1-only. POST /echo with
+                                    Content-Encoding: gzip and a
+                                    pre-compressed body. Server
+                                    reads the body bytes without
+                                    decompressing (transparent to
+                                    the framework). Distinct on
+                                    the wire from echo via the
+                                    Content-Encoding header.
                     """
             },
             #{
@@ -936,6 +990,23 @@ scenario_roadrunner_opts(tls_handshake_throughput, BaseOpts) ->
     BaseOpts#{handler => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(multi_request_body, BaseOpts) ->
     BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
+scenario_roadrunner_opts(path_with_unicode, BaseOpts) ->
+    %% Same handler as `url_with_qs` — different request shape with
+    %% percent-encoded bytes exercises the qs/uri decode slow path.
+    BaseOpts#{routes => [{~"/qs", roadrunner_bench_url_qs_handler, undefined}]};
+scenario_roadrunner_opts(cors_preflight, BaseOpts) ->
+    BaseOpts#{routes => [{~"/api", roadrunner_bench_cors_handler, undefined}]};
+scenario_roadrunner_opts(chunked_request_body, BaseOpts) ->
+    %% Echo handler reads the body — server transparently decodes
+    %% Transfer-Encoding: chunked into the body bytes.
+    BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
+scenario_roadrunner_opts(redirect_response, BaseOpts) ->
+    BaseOpts#{routes => [{~"/redirect", roadrunner_bench_redirect_handler, undefined}]};
+scenario_roadrunner_opts(compressed_request_body, BaseOpts) ->
+    %% Echo handler — server is unaware of Content-Encoding; just
+    %% reads the bytes and echoes them. Tests body transfer with
+    %% the encoding header set.
+    BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -1021,6 +1092,16 @@ scenario_cowboy_routes(cookies_heavy) ->
 scenario_cowboy_routes(tls_handshake_throughput) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
 scenario_cowboy_routes(multi_request_body) ->
+    [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}];
+scenario_cowboy_routes(path_with_unicode) ->
+    [{'_', [{"/qs", roadrunner_bench_cowboy_url_qs_handler, []}]}];
+scenario_cowboy_routes(cors_preflight) ->
+    [{'_', [{"/api", roadrunner_bench_cowboy_cors_handler, []}]}];
+scenario_cowboy_routes(chunked_request_body) ->
+    [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}];
+scenario_cowboy_routes(redirect_response) ->
+    [{'_', [{"/redirect", roadrunner_bench_cowboy_redirect_handler, []}]}];
+scenario_cowboy_routes(compressed_request_body) ->
     [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}].
 
 %% Per-scenario cowboy TransportOpts. The default keeps the bench's
@@ -2231,6 +2312,43 @@ build_request(multi_request_body) ->
         "Content-Length: ", BodyLenBin/binary, "\r\n",
         "\r\n",
         Body/binary>>;
+build_request(path_with_unicode) ->
+    %% 5 pairs, percent-encoded UTF-8 in `name` (中文) and `city`
+    %% (Москва), `+`-encoded space in `query`, plus an emoji.
+    %% Forces the qs/uri decode slow path on every value.
+    ~"GET /qs?name=%E4%B8%AD%E6%96%87&city=%D0%9C%D0%BE%D1%81%D0%BA%D0%B2%D0%B0&emoji=%F0%9F%8E%89&query=hello+world&filter=active HTTP/1.1\r\nHost: x\r\n\r\n";
+build_request(cors_preflight) ->
+    ~"OPTIONS /api HTTP/1.1\r\nHost: x\r\nOrigin: https://example.com\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: Content-Type, Authorization\r\n\r\n";
+build_request(chunked_request_body) ->
+    %% 4 chunks × 256 B + the 0-length terminator. Each chunk is
+    %% "100\r\n<256 bytes>\r\n" (256 = 0x100). Wire byte count =
+    %% 4 × (3+2+256+2) + (1+2+2) = 4×263 + 5 = 1057.
+    Chunk = binary:copy(~"x", 256),
+    ChunkFrame = <<"100\r\n", Chunk/binary, "\r\n">>,
+    Body = <<ChunkFrame/binary, ChunkFrame/binary, ChunkFrame/binary, ChunkFrame/binary, "0\r\n\r\n">>,
+    <<"POST /echo HTTP/1.1\r\n",
+        "Host: x\r\n",
+        "Content-Type: application/octet-stream\r\n",
+        "Transfer-Encoding: chunked\r\n",
+        "\r\n",
+        Body/binary>>;
+build_request(redirect_response) ->
+    ~"GET /redirect HTTP/1.1\r\nHost: x\r\n\r\n";
+build_request(compressed_request_body) ->
+    %% Pre-gzipped 1 KB body. Server doesn't decompress — it just
+    %% reads the byte count declared by Content-Length. Tests the
+    %% effect of the Content-Encoding header on the request path
+    %% (some servers branch on it; most just pass through).
+    Plain = binary:copy(~"abc", 350),
+    Gz = zlib:gzip(Plain),
+    BodyLenBin = integer_to_binary(byte_size(Gz)),
+    <<"POST /echo HTTP/1.1\r\n",
+        "Host: x\r\n",
+        "Content-Type: application/octet-stream\r\n",
+        "Content-Encoding: gzip\r\n",
+        "Content-Length: ", BodyLenBin/binary, "\r\n",
+        "\r\n",
+        Gz/binary>>;
 build_request(post_4kb_form) ->
     %% 4 KB urlencoded body — see `post_4kb_form_body/0` for shape.
     %% Predictable parse cost (ASCII letters/digits only, no
@@ -2305,7 +2423,16 @@ expected_body_len(small_chunked_response) -> 6400;
 expected_body_len(head_method) -> 0;
 expected_body_len(etag_304) -> 0;
 expected_body_len(cookies_heavy) -> 1;
-expected_body_len(multi_request_body) -> 4096.
+expected_body_len(multi_request_body) -> 4096;
+expected_body_len(path_with_unicode) -> 1;
+expected_body_len(cors_preflight) -> 0;
+expected_body_len(chunked_request_body) -> 1024;
+expected_body_len(redirect_response) -> 0;
+expected_body_len(compressed_request_body) ->
+    %% Server echoes the gzipped bytes back unchanged. zlib:gzip
+    %% of `abc`*350 produces 32 B; pin recv to a lower bound (20)
+    %% so it stops as soon as the body shows up.
+    20.
 
 %% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
 %% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
@@ -2394,6 +2521,8 @@ recv_response(Sock, Buf, BodyLen, Timeout) ->
     end.
 
 ok_status_prefix(<<"HTTP/1.1 200", _/binary>>) -> true;
+ok_status_prefix(<<"HTTP/1.1 204", _/binary>>) -> true;
+ok_status_prefix(<<"HTTP/1.1 302", _/binary>>) -> true;
 ok_status_prefix(<<"HTTP/1.1 304", _/binary>>) -> true;
 ok_status_prefix(_) -> false.
 
@@ -2706,6 +2835,36 @@ h2_request_shape(cookies_heavy) ->
 h2_request_shape(multi_request_body) ->
     {~"POST", ~"/echo", [{~"content-type", ~"application/octet-stream"}],
         binary:copy(~"x", 4096)};
+h2_request_shape(path_with_unicode) ->
+    io:format(standard_error,
+        "error: --scenario path_with_unicode is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
+h2_request_shape(cors_preflight) ->
+    %% h2 client doesn't support OPTIONS preflight (it bypasses
+    %% CORS via origin negotiation); h1-only.
+    io:format(standard_error,
+        "error: --scenario cors_preflight is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
+h2_request_shape(chunked_request_body) ->
+    %% h2 has its own framing (DATA frames); chunked is h1-specific.
+    io:format(standard_error,
+        "error: --scenario chunked_request_body is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
+h2_request_shape(redirect_response) ->
+    %% Bench h2 client only accepts :status = 200; 302 would
+    %% short-circuit to bad_status. h2 follow-up.
+    io:format(standard_error,
+        "error: --scenario redirect_response is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
+h2_request_shape(compressed_request_body) ->
+    io:format(standard_error,
+        "error: --scenario compressed_request_body is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -2919,7 +3078,17 @@ scenario_request_summary(cookies_heavy) ->
 scenario_request_summary(tls_handshake_throughput) ->
     "GET / over h2, fresh TLS conn per request, TLS handshake dominates (handler)";
 scenario_request_summary(multi_request_body) ->
-    "POST /echo HTTP/1.1, 4 KB body, keep-alive (router)".
+    "POST /echo HTTP/1.1, 4 KB body, keep-alive (router)";
+scenario_request_summary(path_with_unicode) ->
+    "GET /qs?<5 pairs, percent-encoded UTF-8> HTTP/1.1, qs/uri slow path (router)";
+scenario_request_summary(cors_preflight) ->
+    "OPTIONS /api HTTP/1.1, CORS preflight, server returns 204 + allow headers (router)";
+scenario_request_summary(chunked_request_body) ->
+    "POST /echo HTTP/1.1, Transfer-Encoding: chunked, 4 chunks x 256 B (router)";
+scenario_request_summary(redirect_response) ->
+    "GET /redirect HTTP/1.1, server returns 302 + Location (router)";
+scenario_request_summary(compressed_request_body) ->
+    "POST /echo HTTP/1.1 + Content-Encoding: gzip, ~50 B compressed body (router)".
 
 result_to_row(Side, #{
     total := Total,
