@@ -49,6 +49,7 @@
 -define(DEFAULT_HOST, "127.0.0.1").
 -define(ECHO_BODY_SIZE, 256).
 -define(LARGE_BODY_SIZE, 65536).
+-define(LARGE_POST_BODY_SIZE, 1048576).
 
 %% Servers known to the bench, in default-run order. Adding a new
 %% server is two steps: append it here and add a clause for it in
@@ -81,23 +82,26 @@ main(Args) ->
 %% Nagle interaction; that's now fixed at the listener layer
 %% (`roadrunner_listener:base_listen_opts/0`).
 preflight_scenario(#{scenario := post_4kb_form, servers := Servers} = Opts) ->
-    %% elli has no native urlencoded parser; calling
-    %% `roadrunner_qs:parse/1` from the elli handler would bias the
-    %% comparison toward roadrunner. Filter elli out instead.
-    Filtered = [S || S <- Servers, S =/= elli],
+    filter_servers(post_4kb_form, [elli], Servers, Opts,
+        ~"no native urlencoded body parser");
+preflight_scenario(#{scenario := large_post_streaming, servers := Servers} = Opts) ->
+    filter_servers(large_post_streaming, [elli], Servers, Opts,
+        ~"auto-buffers full body, no manual-mode read API");
+preflight_scenario(Opts) ->
+    Opts.
+
+filter_servers(Scenario, Drop, Servers, Opts, Reason) ->
+    Filtered = [S || S <- Servers, not lists:member(S, Drop)],
     case Filtered =/= Servers of
         true ->
             io:format(
-                "note: --scenario post_4kb_form — elli filtered out "
-                "(no native urlencoded body parser)~n",
-                []
+                "note: --scenario ~p — ~p filtered out (~s)~n",
+                [Scenario, Drop, Reason]
             );
         false ->
             ok
     end,
-    Opts#{servers => Filtered};
-preflight_scenario(Opts) ->
-    Opts.
+    Opts#{servers => Filtered}.
 
 preflight_protocol(#{protocol := h1} = Opts) ->
     Opts;
@@ -166,7 +170,8 @@ cli() ->
                         slow_client,
                         connection_storm,
                         mixed_workload,
-                        post_4kb_form
+                        post_4kb_form,
+                        large_post_streaming
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -238,6 +243,16 @@ cli() ->
                                     cowboy's `read_urlencoded_body`)
                                     + body-read. elli filtered out
                                     (no native urlencoded parser).
+                    large_post_streaming:
+                                    h1-only. POST /drain with a 1 MB
+                                    body, server reads via the
+                                    manual-mode read_body API in
+                                    64 KB chunks and discards.
+                                    Exercises body_state machine +
+                                    chunked-recv path + recv-rate
+                                    bookkeeping under sustained
+                                    inbound load. elli filtered
+                                    out (auto-buffers full body).
                     """
             },
             #{
@@ -607,7 +622,15 @@ scenario_roadrunner_opts(mixed_workload, BaseOpts) ->
         {~"/large", roadrunner_bench_large_handler, undefined}
     ]};
 scenario_roadrunner_opts(post_4kb_form, BaseOpts) ->
-    BaseOpts#{routes => [{~"/form", roadrunner_bench_form_handler, undefined}]}.
+    BaseOpts#{routes => [{~"/form", roadrunner_bench_form_handler, undefined}]};
+scenario_roadrunner_opts(large_post_streaming, BaseOpts) ->
+    %% `body_buffering => manual` so the handler drains via
+    %% `roadrunner_req:read_body/2` chunk-by-chunk rather than
+    %% the conn pre-buffering 1 MB into the request map.
+    BaseOpts#{
+        body_buffering => manual,
+        routes => [{~"/drain", roadrunner_bench_drain_handler, undefined}]
+    }.
 
 scenario_cowboy_routes(hello) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
@@ -638,7 +661,9 @@ scenario_cowboy_routes(mixed_workload) ->
         ]}
     ];
 scenario_cowboy_routes(post_4kb_form) ->
-    [{'_', [{"/form", roadrunner_bench_cowboy_form_handler, []}]}].
+    [{'_', [{"/form", roadrunner_bench_cowboy_form_handler, []}]}];
+scenario_cowboy_routes(large_post_streaming) ->
+    [{'_', [{"/drain", roadrunner_bench_cowboy_drain_handler, []}]}].
 
 %% Inherit the parent's code path so the peer sees both default- and
 %% test-profile artifacts (cowboy lives under test).
@@ -1025,6 +1050,20 @@ build_request(multi_stream_h2) ->
         "error: --scenario multi_stream_h2 is h2-only "
         "(use --protocol h2)~n", []),
     halt(2);
+build_request(large_post_streaming) ->
+    %% 1 MB body — `x` repeated. Cached at module load via
+    %% `persistent_term` would be ideal but escripts don't
+    %% have on_load; pay one allocation per worker spawn (which
+    %% also caches the request once per worker).
+    Body = binary:copy(~"x", ?LARGE_POST_BODY_SIZE),
+    BodyLenBin = integer_to_binary(?LARGE_POST_BODY_SIZE),
+    <<"POST /drain HTTP/1.1\r\n",
+        "Host: x\r\n",
+        "Content-Type: application/octet-stream\r\n",
+        "Content-Length: ",
+        BodyLenBin/binary,
+        "\r\n\r\n",
+        Body/binary>>;
 build_request(post_4kb_form) ->
     %% 4 KB urlencoded body — see `post_4kb_form_body/0` for shape.
     %% Predictable parse cost (ASCII letters/digits only, no
@@ -1080,7 +1119,8 @@ expected_body_len(post_4kb_form) ->
     %% computed from the body so the bench stays in sync if the
     %% body shape changes.
     Pairs = post_4kb_form_pair_count(),
-    byte_size(integer_to_binary(Pairs)).
+    byte_size(integer_to_binary(Pairs));
+expected_body_len(large_post_streaming) -> 2.
 
 %% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
 %% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
@@ -1310,6 +1350,15 @@ h2_request_shape(post_4kb_form) ->
         "error: --scenario post_4kb_form is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(large_post_streaming) ->
+    %% h2 has a different body-delivery model (DATA frames with
+    %% per-stream WINDOW_UPDATE flow control); a 1 MB POST over
+    %% h2 is a separate scenario worth adding later but the
+    %% current focus is the h1 body-state machine.
+    io:format(standard_error,
+        "error: --scenario large_post_streaming is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -1487,7 +1536,9 @@ scenario_request_summary(connection_storm) ->
 scenario_request_summary(mixed_workload) ->
     "Random pick per request from {GET /, GET /json, GET /large} on keep-alive (router)";
 scenario_request_summary(post_4kb_form) ->
-    "POST /form HTTP/1.1, 4 KB application/x-www-form-urlencoded body (router)".
+    "POST /form HTTP/1.1, 4 KB application/x-www-form-urlencoded body (router)";
+scenario_request_summary(large_post_streaming) ->
+    "POST /drain HTTP/1.1, 1 MB body, manual-mode 64 KB chunks (router)".
 
 result_to_row(Side, #{
     total := Total,
