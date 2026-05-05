@@ -414,9 +414,9 @@ handle_frame({window_update, 0, Inc}, State) ->
             frame_loop(flush_all_pending_data(State1))
     end;
 handle_frame({window_update, StreamId, Inc}, #loop{streams = Streams} = State) ->
-    case maps:find(StreamId, Streams) of
-        {ok, Stream} ->
-            case maps:get(send_window, Stream) + Inc of
+    case Streams of
+        #{StreamId := #{send_window := SW} = Stream} ->
+            case SW + Inc of
                 New when New > ?MAX_WINDOW ->
                     %% RFC 9113 §6.9.1: stream-level overflow is a
                     %% stream error, not a connection error.
@@ -424,10 +424,10 @@ handle_frame({window_update, StreamId, Inc}, #loop{streams = Streams} = State) -
                     frame_loop(remove_stream(State, StreamId));
                 New ->
                     Stream1 = Stream#{send_window := New},
-                    State1 = update_stream(State, StreamId, Stream1),
+                    State1 = State#loop{streams = Streams#{StreamId := Stream1}},
                     frame_loop(flush_pending_data(State1, StreamId))
             end;
-        error ->
+        #{} ->
             %% RFC 9113 §5.1: WINDOW_UPDATE on an idle stream is
             %% PROTOCOL_ERROR. A closed-stream WU (id <=
             %% last_stream_id) is silently ignored per §6.9.
@@ -447,10 +447,10 @@ handle_frame({priority, StreamId, #{stream_dependency := StreamId}}, State) ->
 handle_frame({priority, _, _}, State) ->
     frame_loop(State);
 handle_frame({rst_stream, StreamId, _}, #loop{streams = Streams} = State) ->
-    case maps:is_key(StreamId, Streams) of
-        true ->
+    case Streams of
+        #{StreamId := _} ->
             frame_loop(reset_stream(State, StreamId));
-        false ->
+        #{} ->
             %% RFC 9113 §5.1: RST_STREAM on an idle stream is
             %% PROTOCOL_ERROR (we never opened it). On a closed
             %% stream (id <= last_stream_id) the receipt is a no-op
@@ -503,7 +503,7 @@ on_headers(StreamId, Flags, _Priority, Fragment, #loop{streams = Streams} = Stat
     %% must have been finalized (end_headers + decoded), the
     %% stream's body must be open (no END_STREAM yet), and the
     %% trailer HEADERS frame MUST set END_STREAM.
-    Stream = maps:get(StreamId, Streams),
+    #{StreamId := Stream} = Streams,
     case is_trailer_block(Stream, Flags) of
         true ->
             EndHeaders = (Flags band 16#04) =/= 0,
@@ -555,17 +555,17 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
     EndStream = (Flags band 16#01) =/= 0,
     Stream = new_stream(Fragment, EndHeaders, EndStream, State#loop.peer_initial_window),
     State1 = State#loop{
-        streams = maps:put(StreamId, Stream, State#loop.streams),
+        streams = (State#loop.streams)#{StreamId => Stream},
         last_stream_id = StreamId,
         awaiting_continuation =
-            case EndHeaders of
-                true -> undefined;
-                false -> StreamId
+            if
+                EndHeaders -> undefined;
+                true -> StreamId
             end
     },
-    case EndHeaders of
-        true -> finalize_headers(StreamId, State1);
-        false -> frame_loop(State1)
+    if
+        EndHeaders -> finalize_headers(StreamId, State1);
+        true -> frame_loop(State1)
     end.
 
 new_stream(Fragment, EndHeaders, EndStream, SendWindow) ->
@@ -585,18 +585,25 @@ new_stream(Fragment, EndHeaders, EndStream, SendWindow) ->
     }.
 
 on_continuation(StreamId, Flags, Fragment, #loop{streams = Streams} = State) ->
-    case maps:find(StreamId, Streams) of
-        {ok, #{end_headers := false} = Stream} ->
-            Combined = <<(maps:get(header_fragment, Stream))/binary, Fragment/binary>>,
+    case Streams of
+        #{
+            StreamId :=
+                #{
+                    end_headers := false,
+                    header_fragment := Existing,
+                    headers := PriorHeaders
+                } = Stream
+        } ->
+            Combined = <<Existing/binary, Fragment/binary>>,
             EndHeaders = (Flags band 16#04) =/= 0,
             Stream1 = Stream#{header_fragment := Combined, end_headers := EndHeaders},
-            State1 = update_stream(State, StreamId, Stream1),
+            State1 = State#loop{streams = Streams#{StreamId := Stream1}},
             State2 =
                 case EndHeaders of
                     true -> State1#loop{awaiting_continuation = undefined};
                     false -> State1
                 end,
-            case {EndHeaders, maps:get(headers, Stream) =:= undefined} of
+            case {EndHeaders, PriorHeaders =:= undefined} of
                 {true, true} -> finalize_headers(StreamId, State2);
                 {true, false} -> finalize_trailers(StreamId, State2);
                 {false, _} -> frame_loop(State2)
@@ -612,14 +619,13 @@ on_continuation(StreamId, Flags, Fragment, #loop{streams = Streams} = State) ->
 %% blocks decode correctly. After consuming, dispatch the
 %% pending request (END_STREAM was already set by `on_headers/5`).
 finalize_trailers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) ->
-    Stream = maps:get(StreamId, Streams),
-    Fragment = maps:get(header_fragment, Stream),
+    #{StreamId := #{header_fragment := Fragment} = Stream} = Streams,
     case roadrunner_http2_hpack:decode(Fragment, Dec) of
         {ok, _Trailers, Dec1} ->
             Stream1 = Stream#{header_fragment := <<>>},
             State1 = State#loop{
                 hpack_dec = Dec1,
-                streams = maps:put(StreamId, Stream1, Streams)
+                streams = Streams#{StreamId := Stream1}
             },
             dispatch_stream(StreamId, State1);
         {error, _} ->
@@ -631,16 +637,20 @@ finalize_trailers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) -
 %% the stream entry. If END_STREAM was set on the HEADERS frame,
 %% dispatch the worker now (no body); otherwise wait for DATA.
 finalize_headers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) ->
-    Stream = maps:get(StreamId, Streams),
-    Fragment = maps:get(header_fragment, Stream),
+    #{
+        StreamId := #{
+            header_fragment := Fragment,
+            end_stream_seen := EndStreamSeen
+        } = Stream
+    } = Streams,
     case roadrunner_http2_hpack:decode(Fragment, Dec) of
         {ok, Headers, Dec1} ->
             Stream1 = Stream#{headers := Headers, header_fragment := <<>>},
             State1 = State#loop{
                 hpack_dec = Dec1,
-                streams = maps:put(StreamId, Stream1, Streams)
+                streams = Streams#{StreamId := Stream1}
             },
-            case maps:get(end_stream_seen, Stream1) of
+            case EndStreamSeen of
                 true -> dispatch_stream(StreamId, State1);
                 false -> frame_loop(State1)
             end;
@@ -665,22 +675,21 @@ on_data(StreamId, _Flags, _Payload, #loop{streams = Streams} = State) when
     _ = send_rst_stream(State, StreamId, stream_closed),
     frame_loop(State);
 on_data(StreamId, Flags, Payload, #loop{streams = Streams} = State) ->
-    Stream = maps:get(StreamId, Streams),
+    #{
+        StreamId :=
+            #{body := Body, body_len := Len, recv_window := RW} = Stream
+    } = Streams,
     EndStream = (Flags band 16#01) =/= 0,
     PayloadLen = byte_size(Payload),
-    NewBody = [maps:get(body, Stream), Payload],
-    NewBodyLen = maps:get(body_len, Stream) + PayloadLen,
-    NewConnRecv = State#loop.conn_recv_window - PayloadLen,
-    NewStreamRecv = maps:get(recv_window, Stream) - PayloadLen,
     Stream1 = Stream#{
-        body := NewBody,
-        body_len := NewBodyLen,
+        body := [Body, Payload],
+        body_len := Len + PayloadLen,
         end_stream_seen := EndStream,
-        recv_window := NewStreamRecv
+        recv_window := RW - PayloadLen
     },
     State1 = State#loop{
-        streams = maps:put(StreamId, Stream1, Streams),
-        conn_recv_window = NewConnRecv
+        streams = Streams#{StreamId := Stream1},
+        conn_recv_window = State#loop.conn_recv_window - PayloadLen
     },
     State2 = maybe_refill_recv_windows(State1, StreamId),
     case EndStream of
@@ -703,16 +712,16 @@ maybe_refill_conn(State) ->
     State.
 
 maybe_refill_stream(#loop{streams = Streams} = State, StreamId) ->
-    Stream = maps:get(StreamId, Streams),
-    case maps:get(recv_window, Stream) of
-        W when W < ?WINDOW_REFILL_THRESHOLD ->
+    #{StreamId := #{recv_window := W} = Stream} = Streams,
+    if
+        W < ?WINDOW_REFILL_THRESHOLD ->
             Inc = ?INITIAL_WINDOW - W,
             _ = send(
                 State,
                 roadrunner_http2_frame:encode({window_update, StreamId, Inc})
             ),
-            update_stream(State, StreamId, Stream#{recv_window := W + Inc});
-        _ ->
+            State#loop{streams = Streams#{StreamId := Stream#{recv_window := W + Inc}}};
+        true ->
             State
     end.
 
@@ -730,12 +739,19 @@ dispatch_stream(
         listener_name = ListenerName
     } = State
 ) ->
-    Stream = maps:get(StreamId, Streams),
-    Headers = maps:get(headers, Stream),
-    BodyLen = maps:get(body_len, Stream),
+    #{
+        StreamId := #{
+            headers := Headers,
+            body_len := BodyLen,
+            body := BodyIolist
+        } = Stream
+    } = Streams,
     case content_length_matches(Headers, BodyLen) of
         true ->
-            Body = iolist_to_binary(maps:get(body, Stream)),
+            %% iolist → binary once here; downstream code (worker
+            %% Req map, content-length comparator, etc.) all want
+            %% a flat binary.
+            Body = iolist_to_binary(BodyIolist),
             {RequestId, NewBuf} = roadrunner_conn:generate_request_id(
                 State#loop.req_id_buffer
             ),
@@ -757,10 +773,8 @@ dispatch_stream(
                         body := []
                     },
                     State1 = State#loop{
-                        streams = maps:put(StreamId, Stream1, Streams),
-                        worker_refs = maps:put(
-                            MonRef, StreamId, State#loop.worker_refs
-                        ),
+                        streams = Streams#{StreamId := Stream1},
+                        worker_refs = (State#loop.worker_refs)#{MonRef => StreamId},
                         req_id_buffer = NewBuf
                     },
                     frame_loop(State1);
@@ -779,21 +793,31 @@ dispatch_stream(
 %% the cumulative bytes received in DATA frames. Absent header is
 %% always acceptable; multi-valued or non-integer values are
 %% rejected as mismatches.
+%% Single-pass walk: find the first (and check there isn't a
+%% second) `content-length` header value, then compare against
+%% `BodyLen`. Avoids the per-request list-comprehension allocation
+%% the prior shape paid even when no `content-length` was present.
 -spec content_length_matches([{binary(), binary()}], non_neg_integer()) -> boolean().
 content_length_matches(Headers, BodyLen) ->
-    case [V || {N, V} <- Headers, N =:= ~"content-length"] of
-        [] ->
+    case find_content_length(Headers, undefined) of
+        none ->
             true;
-        [V] ->
+        multiple ->
+            false;
+        V ->
             try binary_to_integer(V) of
                 BodyLen -> true;
                 _ -> false
             catch
                 error:badarg -> false
-            end;
-        _ ->
-            false
+            end
     end.
+
+find_content_length([], undefined) -> none;
+find_content_length([], V) -> V;
+find_content_length([{~"content-length", _} | _], V) when V =/= undefined -> multiple;
+find_content_length([{~"content-length", V} | Rest], undefined) -> find_content_length(Rest, V);
+find_content_length([_ | Rest], V) -> find_content_length(Rest, V).
 
 %% =============================================================================
 %% Worker → conn message handlers
@@ -809,17 +833,20 @@ handle_send_response(State, From, Ref, StreamId, Status, Headers, <<>>) ->
     %% Empty body — same wire shape as `handle_send_headers` with
     %% `EndStream = true` (single HEADERS frame, END_STREAM bit set).
     case stream_open(State, StreamId) of
-        {ok, _Stream} ->
-            State1 = encode_and_send_headers(State, StreamId, Status, Headers, true),
-            _ = (From ! {h2_send_ack, Ref}),
-            State1;
         not_open ->
             _ = (From ! {h2_stream_reset, StreamId}),
-            State
+            State;
+        _Stream ->
+            State1 = encode_and_send_headers(State, StreamId, Status, Headers, true),
+            _ = (From ! {h2_send_ack, Ref}),
+            State1
     end;
 handle_send_response(State, From, Ref, StreamId, Status, Headers, Body) ->
     case stream_open(State, StreamId) of
-        {ok, Stream} ->
+        not_open ->
+            _ = (From ! {h2_stream_reset, StreamId}),
+            State;
+        Stream ->
             BodyLen = byte_size(Body),
             FitsFrame = BodyLen =< ?MAX_FRAME_SIZE,
             FitsWindow = window_budget(State, Stream) >= BodyLen,
@@ -838,43 +865,40 @@ handle_send_response(State, From, Ref, StreamId, Status, Headers, Body) ->
                     State1 = encode_and_send_headers(
                         State, StreamId, Status, Headers, false
                     ),
-                    Stream1 = maps:get(StreamId, State1#loop.streams),
+                    #{StreamId := Stream1} = State1#loop.streams,
                     try_send_data(State1, Stream1, StreamId, From, Ref, Body, true)
-            end;
-        not_open ->
-            _ = (From ! {h2_stream_reset, StreamId}),
-            State
+            end
     end.
 
 handle_send_headers(State, From, Ref, StreamId, Status, Headers, EndStream) ->
     case stream_open(State, StreamId) of
-        {ok, _Stream} ->
-            State1 = encode_and_send_headers(State, StreamId, Status, Headers, EndStream),
-            _ = (From ! {h2_send_ack, Ref}),
-            State1;
         not_open ->
             _ = (From ! {h2_stream_reset, StreamId}),
-            State
+            State;
+        _Stream ->
+            State1 = encode_and_send_headers(State, StreamId, Status, Headers, EndStream),
+            _ = (From ! {h2_send_ack, Ref}),
+            State1
     end.
 
 handle_send_data(State, From, Ref, StreamId, Bin, EndStream) ->
     case stream_open(State, StreamId) of
-        {ok, Stream} ->
-            try_send_data(State, Stream, StreamId, From, Ref, Bin, EndStream);
         not_open ->
             _ = (From ! {h2_stream_reset, StreamId}),
-            State
+            State;
+        Stream ->
+            try_send_data(State, Stream, StreamId, From, Ref, Bin, EndStream)
     end.
 
 handle_send_trailers(State, From, Ref, StreamId, Trailers) ->
     case stream_open(State, StreamId) of
-        {ok, _Stream} ->
-            State1 = encode_and_send_trailers(State, StreamId, Trailers),
-            _ = (From ! {h2_send_ack, Ref}),
-            State1;
         not_open ->
             _ = (From ! {h2_stream_reset, StreamId}),
-            State
+            State;
+        _Stream ->
+            State1 = encode_and_send_trailers(State, StreamId, Trailers),
+            _ = (From ! {h2_send_ack, Ref}),
+            State1
     end.
 
 handle_worker_done(State, StreamId) ->
@@ -884,14 +908,14 @@ handle_worker_done(State, StreamId) ->
     State.
 
 handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
-    case maps:find(MonRef, Refs) of
-        {ok, StreamId} ->
+    case Refs of
+        #{MonRef := StreamId} ->
             State1 = State#loop{worker_refs = maps:remove(MonRef, Refs)},
             case Reason of
                 normal -> remove_stream(State1, StreamId);
                 _ -> abort_stream(State1, StreamId, internal_error)
             end;
-        error ->
+        #{} ->
             State
     end.
 
@@ -899,11 +923,15 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
 %% `not_open` for streams the conn has already torn down (peer
 %% RST_STREAM, write of END_STREAM completed, etc.) — workers
 %% asking to write to those should be told to abort.
+%% Returns the stream entry map directly on hit, or the atom
+%% `not_open` if the stream is gone or its send side is already
+%% closed. The two return shapes are disjoint (map vs. atom) so
+%% callers can pattern-match without an `{ok, _}` wrapper.
 stream_open(#loop{streams = Streams}, StreamId) ->
-    case maps:find(StreamId, Streams) of
-        {ok, #{state := closed}} -> not_open;
-        {ok, Stream} -> {ok, Stream};
-        error -> not_open
+    case Streams of
+        #{StreamId := #{state := closed}} -> not_open;
+        #{StreamId := Stream} -> Stream;
+        #{} -> not_open
     end.
 
 %% Encode + write a HEADERS frame (always fits without flow control;
@@ -915,18 +943,19 @@ encode_and_send_headers(
     LowerHeaders = [{lowercase(N), V} || {N, V} <- Headers],
     AllHeaders = [{~":status", StatusBin} | LowerHeaders],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
-    HpackBin = iolist_to_binary(HpackBlock),
+    %% `frame:encode` accepts iodata for the header block — skip
+    %% the upfront flatten; ssl:send walks the iolist anyway.
     Flags =
-        case EndStream of
-            true -> 16#04 bor 16#01;
-            false -> 16#04
+        if
+            EndStream -> 16#04 bor 16#01;
+            true -> 16#04
         end,
-    Frame = roadrunner_http2_frame:encode({headers, StreamId, Flags, undefined, HpackBin}),
+    Frame = roadrunner_http2_frame:encode({headers, StreamId, Flags, undefined, HpackBlock}),
     _ = send(State, Frame),
     State1 = State#loop{hpack_enc = Enc1},
-    case EndStream of
-        true -> close_stream_send_side(State1, StreamId);
-        false -> State1
+    if
+        EndStream -> close_stream_send_side(State1, StreamId);
+        true -> State1
     end.
 
 %% HEADERS + DATA (END_STREAM) packed into ONE `ssl:send/2`.
@@ -940,14 +969,13 @@ encode_and_send_response_atomic(
     Headers,
     Body
 ) ->
-    Stream = maps:get(StreamId, Streams),
+    #{StreamId := Stream} = Streams,
     StatusBin = integer_to_binary(Status),
     LowerHeaders = [{lowercase(N), V} || {N, V} <- Headers],
     AllHeaders = [{~":status", StatusBin} | LowerHeaders],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
-    HpackBin = iolist_to_binary(HpackBlock),
     HFrame = roadrunner_http2_frame:encode(
-        {headers, StreamId, 16#04, undefined, HpackBin}
+        {headers, StreamId, 16#04, undefined, HpackBlock}
     ),
     DFrame = roadrunner_http2_frame:encode({data, StreamId, 16#01, Body}),
     _ = send(State, [HFrame, DFrame]),
@@ -958,9 +986,8 @@ encode_and_send_response_atomic(
 encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
     LowerTrailers = [{lowercase(N), V} || {N, V} <- Trailers],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(LowerTrailers, Enc),
-    HpackBin = iolist_to_binary(HpackBlock),
     Frame = roadrunner_http2_frame:encode(
-        {headers, StreamId, 16#04 bor 16#01, undefined, HpackBin}
+        {headers, StreamId, 16#04 bor 16#01, undefined, HpackBlock}
     ),
     _ = send(State, Frame),
     State1 = State#loop{hpack_enc = Enc1},
@@ -969,8 +996,8 @@ encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
 %% Mark the send side closed. Future worker writes on this stream
 %% get `{h2_stream_reset, _}` so they unwind cleanly.
 close_stream_send_side(#loop{streams = Streams} = State, StreamId) ->
-    Stream = maps:get(StreamId, Streams),
-    update_stream(State, StreamId, Stream#{state := closed}).
+    #{StreamId := Stream} = Streams,
+    State#loop{streams = Streams#{StreamId := Stream#{state := closed}}}.
 
 %% =============================================================================
 %% DATA send + flow control
@@ -1010,24 +1037,24 @@ send_data_chunks(State, Stream, StreamId, From, Ref, Bin, EndStream) ->
         N when N =:= byte_size(Bin) ->
             %% Last chunk — END_STREAM if the caller asked.
             Flags =
-                case EndStream of
-                    true -> 16#01;
-                    false -> 0
+                if
+                    EndStream -> 16#01;
+                    true -> 0
                 end,
             Frame = roadrunner_http2_frame:encode({data, StreamId, Flags, Bin}),
             _ = send(State, Frame),
             State1 = consume_send_window(State, StreamId, Stream, N),
             _ = (From ! {h2_send_ack, Ref}),
-            case EndStream of
-                true -> close_stream_send_side(State1, StreamId);
-                false -> State1
+            if
+                EndStream -> close_stream_send_side(State1, StreamId);
+                true -> State1
             end;
         N ->
             <<Chunk:N/binary, Rest/binary>> = Bin,
             Frame = roadrunner_http2_frame:encode({data, StreamId, 0, Chunk}),
             _ = send(State, Frame),
             State1 = consume_send_window(State, StreamId, Stream, N),
-            Stream1 = maps:get(StreamId, State1#loop.streams),
+            #{StreamId := Stream1} = State1#loop.streams,
             send_data_chunks(State1, Stream1, StreamId, From, Ref, Rest, EndStream)
     end.
 
@@ -1037,32 +1064,33 @@ window_budget(#loop{conn_send_window = ConnW}, #{send_window := StreamW}) ->
 consume_send_window(
     #loop{conn_send_window = ConnW, streams = Streams} = State, StreamId, Stream, N
 ) ->
-    Stream1 = Stream#{send_window := maps:get(send_window, Stream) - N},
+    #{send_window := SW} = Stream,
+    Stream1 = Stream#{send_window := SW - N},
     State#loop{
         conn_send_window = ConnW - N,
-        streams = maps:put(StreamId, Stream1, Streams)
+        streams = Streams#{StreamId := Stream1}
     }.
 
-enqueue_pending(Stream, Entry) ->
-    Stream#{pending_sends := maps:get(pending_sends, Stream) ++ [Entry]}.
+enqueue_pending(#{pending_sends := Pending} = Stream, Entry) ->
+    Stream#{pending_sends := Pending ++ [Entry]}.
 
 %% After a stream's send window grew, drain its pending DATA queue
 %% as far as windows allow.
 flush_pending_data(#loop{streams = Streams} = State, StreamId) ->
-    case maps:get(StreamId, Streams) of
-        #{pending_sends := []} -> State;
-        Stream -> drain_pending(State, StreamId, Stream)
+    case Streams of
+        #{StreamId := #{pending_sends := []}} -> State;
+        #{StreamId := Stream} -> drain_pending(State, StreamId, Stream)
     end.
 
 %% After the conn-level send window grew, drain every stream's
-%% pending queue.
+%% pending queue. We iterate keys (not values) — `flush_pending_data`
+%% re-fetches the stream from the post-iteration state which may
+%% already be mutated by a prior drain.
 flush_all_pending_data(#loop{streams = Streams} = State) ->
-    maps:fold(
-        fun(StreamId, _Stream, AccState) ->
-            flush_pending_data(AccState, StreamId)
-        end,
+    lists:foldl(
+        fun(StreamId, AccState) -> flush_pending_data(AccState, StreamId) end,
         State,
-        Streams
+        maps:keys(Streams)
     ).
 
 %% Drain queued sends on a single stream until either the queue is
@@ -1074,8 +1102,8 @@ drain_pending(State, StreamId, #{pending_sends := [Entry | Rest]} = Stream) ->
     Stream1 = Stream#{pending_sends := Rest},
     State1 = update_stream(State, StreamId, Stream1),
     State2 = try_send_data(State1, Stream1, StreamId, From, Ref, Bin, EndStream),
-    Stream2 = maps:get(StreamId, State2#loop.streams),
-    case maps:get(pending_sends, Stream2) of
+    #{StreamId := #{pending_sends := Pending2} = Stream2} = State2#loop.streams,
+    case Pending2 of
         [Entry | _] ->
             %% Same entry re-queued: window still closed.
             State2;
@@ -1088,22 +1116,27 @@ drain_pending(State, StreamId, #{pending_sends := [Entry | Rest]} = Stream) ->
 %% =============================================================================
 
 update_stream(#loop{streams = Streams} = State, StreamId, Stream) ->
-    State#loop{streams = maps:put(StreamId, Stream, Streams)}.
+    State#loop{streams = Streams#{StreamId := Stream}}.
 
 %% Peer sent RST_STREAM for a stream we have alive. Tell the worker
 %% (if any) to bail, then drop our stream entry. Pending sends get
 %% reset notifications so workers waiting on `h2_send_ack` unwind.
 reset_stream(#loop{streams = Streams, worker_refs = Refs} = State, StreamId) ->
-    Stream = maps:get(StreamId, Streams),
-    notify_pending_reset(StreamId, maps:get(pending_sends, Stream)),
+    #{
+        StreamId := #{
+            pending_sends := Pending,
+            worker_pid := WorkerPid,
+            worker_ref := WorkerRef
+        }
+    } = Streams,
+    notify_pending_reset(StreamId, Pending),
     Refs1 =
-        case maps:get(worker_ref, Stream) of
+        case WorkerRef of
             undefined ->
                 %% RST landed before END_STREAM dispatched a worker.
                 Refs;
             MonRef ->
-                Pid = maps:get(worker_pid, Stream),
-                _ = (Pid ! {h2_stream_reset, StreamId}),
+                _ = (WorkerPid ! {h2_stream_reset, StreamId}),
                 true = demonitor(MonRef, [flush]),
                 maps:remove(MonRef, Refs)
         end,
@@ -1115,8 +1148,8 @@ reset_stream(#loop{streams = Streams, worker_refs = Refs} = State, StreamId) ->
 %% Called by `handle_worker_down/3` when a worker dies abnormally.
 %% Send RST_STREAM(error_code) to the peer and drop our state.
 abort_stream(#loop{streams = Streams} = State, StreamId, ErrorCode) ->
-    Stream = maps:get(StreamId, Streams),
-    notify_pending_reset(StreamId, maps:get(pending_sends, Stream)),
+    #{StreamId := #{pending_sends := Pending}} = Streams,
+    notify_pending_reset(StreamId, Pending),
     _ = send_rst_stream(State, StreamId, ErrorCode),
     State#loop{streams = maps:remove(StreamId, Streams)}.
 
@@ -1161,33 +1194,47 @@ lowercase(B) ->
     [{non_neg_integer(), non_neg_integer()}], #loop{}
 ) -> {ok, #loop{}} | {error, flow_control_error}.
 apply_initial_window_size(Params, #loop{peer_initial_window = Old} = State) ->
-    case lists:reverse([V || {4, V} <- Params]) of
-        [] ->
+    %% RFC 9113 §6.5.3: when SETTINGS contains the same id more
+    %% than once, the LAST value wins. Walk in order and keep the
+    %% last `{4, V}` we see — single pass, no list-comp + reverse.
+    case last_setting(Params, 4, undefined) of
+        undefined ->
             {ok, State};
-        [New | _] ->
+        New ->
             Delta = New - Old,
-            case shift_stream_send_windows(maps:to_list(State#loop.streams), Delta, []) of
+            case shift_stream_send_windows(State#loop.streams, Delta) of
                 {ok, Streams1} ->
                     {ok, State#loop{
                         peer_initial_window = New,
-                        streams = maps:from_list(Streams1)
+                        streams = Streams1
                     }};
                 {error, _} = E ->
                     E
             end
     end.
 
-shift_stream_send_windows([], _Delta, Acc) ->
-    {ok, Acc};
-shift_stream_send_windows([{Id, Stream} | Rest], Delta, Acc) ->
-    NewWindow = maps:get(send_window, Stream) + Delta,
-    case NewWindow > ?MAX_WINDOW of
-        true ->
-            {error, flow_control_error};
-        false ->
-            Stream1 = Stream#{send_window := NewWindow},
-            shift_stream_send_windows(Rest, Delta, [{Id, Stream1} | Acc])
+last_setting([], _Id, V) -> V;
+last_setting([{Id, V} | Rest], Id, _) -> last_setting(Rest, Id, V);
+last_setting([_ | Rest], Id, V) -> last_setting(Rest, Id, V).
+
+%% Map-comprehension shift across the streams map (OTP 28+). A
+%% single overflow short-circuits via `throw/1` — cleaner than
+%% threading a Result tuple through the comprehension.
+shift_stream_send_windows(Streams, Delta) ->
+    try
+        Streams1 =
+            #{
+                Id => Stream#{send_window := check_window(SW + Delta)}
+             || Id := #{send_window := SW} = Stream <- Streams
+            },
+        {ok, Streams1}
+    catch
+        throw:flow_control_error ->
+            {error, flow_control_error}
     end.
+
+check_window(W) when W > ?MAX_WINDOW -> throw(flow_control_error);
+check_window(W) -> W.
 
 %% Validate the per-id constraints on incoming SETTINGS values per
 %% RFC 9113 §6.5.2: ENABLE_PUSH ∈ {0,1}, INITIAL_WINDOW_SIZE

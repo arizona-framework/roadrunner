@@ -56,29 +56,22 @@ run(ConnPid, StreamId, Status, Headers, Fun) ->
     erase(?FIN_KEY),
     Send = fun(Data, FinFlag) -> do_send(ConnPid, StreamId, Data, FinFlag) end,
     _ = Fun(Send),
-    case erase(?FIN_KEY) of
-        true -> ok;
-        _ -> do_send(ConnPid, StreamId, <<>>, fin)
-    end,
+    erase(?FIN_KEY) =:= true orelse do_send(ConnPid, StreamId, <<>>, fin),
     ok.
 
 do_send(ConnPid, StreamId, Data, nofin) ->
-    case iolist_size(Data) of
-        0 ->
-            ok;
-        _ ->
-            sync_send_data(ConnPid, StreamId, iolist_to_binary(Data), false),
-            ok
-    end;
+    %% Flatten to a binary once — `byte_size/1` after is O(1) and
+    %% the conn-side flow-control arithmetic needs a binary anyway.
+    Bin = iolist_to_binary(Data),
+    byte_size(Bin) > 0 andalso sync_send_data(ConnPid, StreamId, Bin, false),
+    ok;
 do_send(ConnPid, StreamId, Data, fin) ->
     sync_send_data(ConnPid, StreamId, iolist_to_binary(Data), true),
     put(?FIN_KEY, true),
     ok;
 do_send(ConnPid, StreamId, Data, {fin, Trailers}) ->
-    case iolist_size(Data) of
-        0 -> ok;
-        _ -> sync_send_data(ConnPid, StreamId, iolist_to_binary(Data), false)
-    end,
+    Bin = iolist_to_binary(Data),
+    byte_size(Bin) > 0 andalso sync_send_data(ConnPid, StreamId, Bin, false),
     sync_send_trailers(ConnPid, StreamId, Trailers),
     put(?FIN_KEY, true),
     ok.

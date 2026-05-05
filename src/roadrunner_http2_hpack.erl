@@ -303,22 +303,22 @@ take_pending_update(#hpack_ctx{pending_update = true, max_size = N} = Ctx) ->
 encode_each([], Ctx) ->
     {[], Ctx};
 encode_each([{Name, Value} = H | Rest], Ctx) ->
-    %% Single `full_match/3` lookup decides BOTH the wire emission
-    %% and whether to insert into the dynamic table — calling it
-    %% twice (as the prior shape did) was 2× the static-table
-    %% scan + persistent_term reads per response header on the
-    %% hot path.
+    %% `full_match/3` and `name_match/2` return a bare
+    %% `pos_integer() | none` — skipping the prior `{ok, _}` tuple
+    %% wrapper avoids a per-lookup heap alloc on the dyn-table hit
+    %% path (static-table hits are literal constants in the BEAM
+    %% pool, so the saving is on dynamic lookups specifically).
     {Bytes, Ctx1} =
         case full_match(Name, Value, Ctx) of
-            {ok, Idx} ->
-                {encode_indexed(Idx), Ctx};
             none ->
                 Bs =
                     case name_match(Name, Ctx) of
-                        {ok, Idx} -> encode_literal_indexed_name(Idx, Value);
-                        none -> encode_literal_new_name(Name, Value)
+                        none -> encode_literal_new_name(Name, Value);
+                        NameIdx -> encode_literal_indexed_name(NameIdx, Value)
                     end,
-                {Bs, insert(H, Ctx)}
+                {Bs, insert(H, Ctx)};
+            Idx ->
+                {encode_indexed(Idx), Ctx}
         end,
     {Tail, Ctx2} = encode_each(Rest, Ctx1),
     {[Bytes | Tail], Ctx2}.
@@ -512,30 +512,30 @@ entry_size({Name, Value}) ->
 %% Lookup helpers — name + name+value match against static then dynamic table
 %% =============================================================================
 
--spec full_match(binary(), binary(), context()) -> {ok, pos_integer()} | none.
+-spec full_match(binary(), binary(), context()) -> pos_integer() | none.
 full_match(Name, Value, #hpack_ctx{table = Dyn}) ->
-    %% Static lookup is now a function-clause dispatch (BEAM JIT
-    %% turns the 60-clause `static_full_match/2` into a hash/select
-    %% jump table); we still indirect through the wrapper so a hit
+    %% Static lookup is a function-clause dispatch (BEAM JIT turns
+    %% the 60-clause `static_full_match/2` into a hash/select jump
+    %% table); we still indirect through the wrapper so a hit
     %% returns directly without scanning the dynamic table.
     case static_full_match(Name, Value) of
         none -> dyn_full_match(Name, Value, Dyn, 1);
-        Found -> Found
+        Idx -> Idx
     end.
 
--spec name_match(binary(), context()) -> {ok, pos_integer()} | none.
+-spec name_match(binary(), context()) -> pos_integer() | none.
 name_match(Name, #hpack_ctx{table = Dyn}) ->
     case static_name_match(Name) of
         none -> dyn_name_match(Name, Dyn, 1);
-        Found -> Found
+        Idx -> Idx
     end.
 
 dyn_full_match(_, _, [], _) -> none;
-dyn_full_match(Name, Value, [{Name, Value} | _], I) -> {ok, ?STATIC_TABLE_LEN + I};
+dyn_full_match(Name, Value, [{Name, Value} | _], I) -> ?STATIC_TABLE_LEN + I;
 dyn_full_match(Name, Value, [_ | T], I) -> dyn_full_match(Name, Value, T, I + 1).
 
 dyn_name_match(_, [], _) -> none;
-dyn_name_match(Name, [{Name, _} | _], I) -> {ok, ?STATIC_TABLE_LEN + I};
+dyn_name_match(Name, [{Name, _} | _], I) -> ?STATIC_TABLE_LEN + I;
 dyn_name_match(Name, [_ | T], I) -> dyn_name_match(Name, T, I + 1).
 
 %% =============================================================================
@@ -560,123 +560,123 @@ dyn_name_match(Name, [_ | T], I) -> dyn_name_match(Name, T, I + 1).
 %% earlier indices win for indexed-name lookups via
 %% `static_name_match/1`.
 
--spec static_full_match(binary(), binary()) -> {ok, pos_integer()} | none.
-static_full_match(~":authority", ~"") -> {ok, 1};
-static_full_match(~":method", ~"GET") -> {ok, 2};
-static_full_match(~":method", ~"POST") -> {ok, 3};
-static_full_match(~":path", ~"/") -> {ok, 4};
-static_full_match(~":path", ~"/index.html") -> {ok, 5};
-static_full_match(~":scheme", ~"http") -> {ok, 6};
-static_full_match(~":scheme", ~"https") -> {ok, 7};
-static_full_match(~":status", ~"200") -> {ok, 8};
-static_full_match(~":status", ~"204") -> {ok, 9};
-static_full_match(~":status", ~"206") -> {ok, 10};
-static_full_match(~":status", ~"304") -> {ok, 11};
-static_full_match(~":status", ~"400") -> {ok, 12};
-static_full_match(~":status", ~"404") -> {ok, 13};
-static_full_match(~":status", ~"500") -> {ok, 14};
-static_full_match(~"accept-charset", ~"") -> {ok, 15};
-static_full_match(~"accept-encoding", ~"gzip, deflate") -> {ok, 16};
-static_full_match(~"accept-language", ~"") -> {ok, 17};
-static_full_match(~"accept-ranges", ~"") -> {ok, 18};
-static_full_match(~"accept", ~"") -> {ok, 19};
-static_full_match(~"access-control-allow-origin", ~"") -> {ok, 20};
-static_full_match(~"age", ~"") -> {ok, 21};
-static_full_match(~"allow", ~"") -> {ok, 22};
-static_full_match(~"authorization", ~"") -> {ok, 23};
-static_full_match(~"cache-control", ~"") -> {ok, 24};
-static_full_match(~"content-disposition", ~"") -> {ok, 25};
-static_full_match(~"content-encoding", ~"") -> {ok, 26};
-static_full_match(~"content-language", ~"") -> {ok, 27};
-static_full_match(~"content-length", ~"") -> {ok, 28};
-static_full_match(~"content-location", ~"") -> {ok, 29};
-static_full_match(~"content-range", ~"") -> {ok, 30};
-static_full_match(~"content-type", ~"") -> {ok, 31};
-static_full_match(~"cookie", ~"") -> {ok, 32};
-static_full_match(~"date", ~"") -> {ok, 33};
-static_full_match(~"etag", ~"") -> {ok, 34};
-static_full_match(~"expect", ~"") -> {ok, 35};
-static_full_match(~"expires", ~"") -> {ok, 36};
-static_full_match(~"from", ~"") -> {ok, 37};
-static_full_match(~"host", ~"") -> {ok, 38};
-static_full_match(~"if-match", ~"") -> {ok, 39};
-static_full_match(~"if-modified-since", ~"") -> {ok, 40};
-static_full_match(~"if-none-match", ~"") -> {ok, 41};
-static_full_match(~"if-range", ~"") -> {ok, 42};
-static_full_match(~"if-unmodified-since", ~"") -> {ok, 43};
-static_full_match(~"last-modified", ~"") -> {ok, 44};
-static_full_match(~"link", ~"") -> {ok, 45};
-static_full_match(~"location", ~"") -> {ok, 46};
-static_full_match(~"max-forwards", ~"") -> {ok, 47};
-static_full_match(~"proxy-authenticate", ~"") -> {ok, 48};
-static_full_match(~"proxy-authorization", ~"") -> {ok, 49};
-static_full_match(~"range", ~"") -> {ok, 50};
-static_full_match(~"referer", ~"") -> {ok, 51};
-static_full_match(~"refresh", ~"") -> {ok, 52};
-static_full_match(~"retry-after", ~"") -> {ok, 53};
-static_full_match(~"server", ~"") -> {ok, 54};
-static_full_match(~"set-cookie", ~"") -> {ok, 55};
-static_full_match(~"strict-transport-security", ~"") -> {ok, 56};
-static_full_match(~"transfer-encoding", ~"") -> {ok, 57};
-static_full_match(~"user-agent", ~"") -> {ok, 58};
-static_full_match(~"vary", ~"") -> {ok, 59};
-static_full_match(~"via", ~"") -> {ok, 60};
-static_full_match(~"www-authenticate", ~"") -> {ok, 61};
+-spec static_full_match(binary(), binary()) -> pos_integer() | none.
+static_full_match(~":authority", ~"") -> 1;
+static_full_match(~":method", ~"GET") -> 2;
+static_full_match(~":method", ~"POST") -> 3;
+static_full_match(~":path", ~"/") -> 4;
+static_full_match(~":path", ~"/index.html") -> 5;
+static_full_match(~":scheme", ~"http") -> 6;
+static_full_match(~":scheme", ~"https") -> 7;
+static_full_match(~":status", ~"200") -> 8;
+static_full_match(~":status", ~"204") -> 9;
+static_full_match(~":status", ~"206") -> 10;
+static_full_match(~":status", ~"304") -> 11;
+static_full_match(~":status", ~"400") -> 12;
+static_full_match(~":status", ~"404") -> 13;
+static_full_match(~":status", ~"500") -> 14;
+static_full_match(~"accept-charset", ~"") -> 15;
+static_full_match(~"accept-encoding", ~"gzip, deflate") -> 16;
+static_full_match(~"accept-language", ~"") -> 17;
+static_full_match(~"accept-ranges", ~"") -> 18;
+static_full_match(~"accept", ~"") -> 19;
+static_full_match(~"access-control-allow-origin", ~"") -> 20;
+static_full_match(~"age", ~"") -> 21;
+static_full_match(~"allow", ~"") -> 22;
+static_full_match(~"authorization", ~"") -> 23;
+static_full_match(~"cache-control", ~"") -> 24;
+static_full_match(~"content-disposition", ~"") -> 25;
+static_full_match(~"content-encoding", ~"") -> 26;
+static_full_match(~"content-language", ~"") -> 27;
+static_full_match(~"content-length", ~"") -> 28;
+static_full_match(~"content-location", ~"") -> 29;
+static_full_match(~"content-range", ~"") -> 30;
+static_full_match(~"content-type", ~"") -> 31;
+static_full_match(~"cookie", ~"") -> 32;
+static_full_match(~"date", ~"") -> 33;
+static_full_match(~"etag", ~"") -> 34;
+static_full_match(~"expect", ~"") -> 35;
+static_full_match(~"expires", ~"") -> 36;
+static_full_match(~"from", ~"") -> 37;
+static_full_match(~"host", ~"") -> 38;
+static_full_match(~"if-match", ~"") -> 39;
+static_full_match(~"if-modified-since", ~"") -> 40;
+static_full_match(~"if-none-match", ~"") -> 41;
+static_full_match(~"if-range", ~"") -> 42;
+static_full_match(~"if-unmodified-since", ~"") -> 43;
+static_full_match(~"last-modified", ~"") -> 44;
+static_full_match(~"link", ~"") -> 45;
+static_full_match(~"location", ~"") -> 46;
+static_full_match(~"max-forwards", ~"") -> 47;
+static_full_match(~"proxy-authenticate", ~"") -> 48;
+static_full_match(~"proxy-authorization", ~"") -> 49;
+static_full_match(~"range", ~"") -> 50;
+static_full_match(~"referer", ~"") -> 51;
+static_full_match(~"refresh", ~"") -> 52;
+static_full_match(~"retry-after", ~"") -> 53;
+static_full_match(~"server", ~"") -> 54;
+static_full_match(~"set-cookie", ~"") -> 55;
+static_full_match(~"strict-transport-security", ~"") -> 56;
+static_full_match(~"transfer-encoding", ~"") -> 57;
+static_full_match(~"user-agent", ~"") -> 58;
+static_full_match(~"vary", ~"") -> 59;
+static_full_match(~"via", ~"") -> 60;
+static_full_match(~"www-authenticate", ~"") -> 61;
 static_full_match(_, _) -> none.
 
--spec static_name_match(binary()) -> {ok, pos_integer()} | none.
-static_name_match(~":authority") -> {ok, 1};
-static_name_match(~":method") -> {ok, 2};
-static_name_match(~":path") -> {ok, 4};
-static_name_match(~":scheme") -> {ok, 6};
-static_name_match(~":status") -> {ok, 8};
-static_name_match(~"accept-charset") -> {ok, 15};
-static_name_match(~"accept-encoding") -> {ok, 16};
-static_name_match(~"accept-language") -> {ok, 17};
-static_name_match(~"accept-ranges") -> {ok, 18};
-static_name_match(~"accept") -> {ok, 19};
-static_name_match(~"access-control-allow-origin") -> {ok, 20};
-static_name_match(~"age") -> {ok, 21};
-static_name_match(~"allow") -> {ok, 22};
-static_name_match(~"authorization") -> {ok, 23};
-static_name_match(~"cache-control") -> {ok, 24};
-static_name_match(~"content-disposition") -> {ok, 25};
-static_name_match(~"content-encoding") -> {ok, 26};
-static_name_match(~"content-language") -> {ok, 27};
-static_name_match(~"content-length") -> {ok, 28};
-static_name_match(~"content-location") -> {ok, 29};
-static_name_match(~"content-range") -> {ok, 30};
-static_name_match(~"content-type") -> {ok, 31};
-static_name_match(~"cookie") -> {ok, 32};
-static_name_match(~"date") -> {ok, 33};
-static_name_match(~"etag") -> {ok, 34};
-static_name_match(~"expect") -> {ok, 35};
-static_name_match(~"expires") -> {ok, 36};
-static_name_match(~"from") -> {ok, 37};
-static_name_match(~"host") -> {ok, 38};
-static_name_match(~"if-match") -> {ok, 39};
-static_name_match(~"if-modified-since") -> {ok, 40};
-static_name_match(~"if-none-match") -> {ok, 41};
-static_name_match(~"if-range") -> {ok, 42};
-static_name_match(~"if-unmodified-since") -> {ok, 43};
-static_name_match(~"last-modified") -> {ok, 44};
-static_name_match(~"link") -> {ok, 45};
-static_name_match(~"location") -> {ok, 46};
-static_name_match(~"max-forwards") -> {ok, 47};
-static_name_match(~"proxy-authenticate") -> {ok, 48};
-static_name_match(~"proxy-authorization") -> {ok, 49};
-static_name_match(~"range") -> {ok, 50};
-static_name_match(~"referer") -> {ok, 51};
-static_name_match(~"refresh") -> {ok, 52};
-static_name_match(~"retry-after") -> {ok, 53};
-static_name_match(~"server") -> {ok, 54};
-static_name_match(~"set-cookie") -> {ok, 55};
-static_name_match(~"strict-transport-security") -> {ok, 56};
-static_name_match(~"transfer-encoding") -> {ok, 57};
-static_name_match(~"user-agent") -> {ok, 58};
-static_name_match(~"vary") -> {ok, 59};
-static_name_match(~"via") -> {ok, 60};
-static_name_match(~"www-authenticate") -> {ok, 61};
+-spec static_name_match(binary()) -> pos_integer() | none.
+static_name_match(~":authority") -> 1;
+static_name_match(~":method") -> 2;
+static_name_match(~":path") -> 4;
+static_name_match(~":scheme") -> 6;
+static_name_match(~":status") -> 8;
+static_name_match(~"accept-charset") -> 15;
+static_name_match(~"accept-encoding") -> 16;
+static_name_match(~"accept-language") -> 17;
+static_name_match(~"accept-ranges") -> 18;
+static_name_match(~"accept") -> 19;
+static_name_match(~"access-control-allow-origin") -> 20;
+static_name_match(~"age") -> 21;
+static_name_match(~"allow") -> 22;
+static_name_match(~"authorization") -> 23;
+static_name_match(~"cache-control") -> 24;
+static_name_match(~"content-disposition") -> 25;
+static_name_match(~"content-encoding") -> 26;
+static_name_match(~"content-language") -> 27;
+static_name_match(~"content-length") -> 28;
+static_name_match(~"content-location") -> 29;
+static_name_match(~"content-range") -> 30;
+static_name_match(~"content-type") -> 31;
+static_name_match(~"cookie") -> 32;
+static_name_match(~"date") -> 33;
+static_name_match(~"etag") -> 34;
+static_name_match(~"expect") -> 35;
+static_name_match(~"expires") -> 36;
+static_name_match(~"from") -> 37;
+static_name_match(~"host") -> 38;
+static_name_match(~"if-match") -> 39;
+static_name_match(~"if-modified-since") -> 40;
+static_name_match(~"if-none-match") -> 41;
+static_name_match(~"if-range") -> 42;
+static_name_match(~"if-unmodified-since") -> 43;
+static_name_match(~"last-modified") -> 44;
+static_name_match(~"link") -> 45;
+static_name_match(~"location") -> 46;
+static_name_match(~"max-forwards") -> 47;
+static_name_match(~"proxy-authenticate") -> 48;
+static_name_match(~"proxy-authorization") -> 49;
+static_name_match(~"range") -> 50;
+static_name_match(~"referer") -> 51;
+static_name_match(~"refresh") -> 52;
+static_name_match(~"retry-after") -> 53;
+static_name_match(~"server") -> 54;
+static_name_match(~"set-cookie") -> 55;
+static_name_match(~"strict-transport-security") -> 56;
+static_name_match(~"transfer-encoding") -> 57;
+static_name_match(~"user-agent") -> 58;
+static_name_match(~"vary") -> 59;
+static_name_match(~"via") -> 60;
+static_name_match(~"www-authenticate") -> 61;
 static_name_match(_) -> none.
 
 -spec lookup_static(pos_integer()) -> header().

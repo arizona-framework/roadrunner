@@ -118,16 +118,16 @@ higher value. Frames whose `length` exceeds the limit fail with
 -type settings_param() :: {ParamId :: non_neg_integer(), Value :: non_neg_integer()}.
 
 -type frame() ::
-    {data, stream_id(), flags(), Payload :: binary()}
-    | {headers, stream_id(), flags(), Priority :: priority() | undefined, HeaderBlock :: binary()}
+    {data, stream_id(), flags(), Payload :: iodata()}
+    | {headers, stream_id(), flags(), Priority :: priority() | undefined, HeaderBlock :: iodata()}
     | {priority, stream_id(), priority()}
     | {rst_stream, stream_id(), error_code()}
     | {settings, flags(), [settings_param()]}
-    | {push_promise, stream_id(), flags(), PromisedStreamId :: stream_id(), HeaderBlock :: binary()}
+    | {push_promise, stream_id(), flags(), PromisedStreamId :: stream_id(), HeaderBlock :: iodata()}
     | {ping, flags(), OpaqueData :: <<_:64>>}
-    | {goaway, LastStreamId :: stream_id(), error_code(), DebugData :: binary()}
+    | {goaway, LastStreamId :: stream_id(), error_code(), DebugData :: iodata()}
     | {window_update, stream_id(), Increment :: 1..16#7FFFFFFF}
-    | {continuation, stream_id(), flags(), HeaderBlock :: binary()}
+    | {continuation, stream_id(), flags(), HeaderBlock :: iodata()}
     %% Unknown frame types — RFC 9113 §4.1: receivers MUST ignore.
     %% Surfaced (rather than dropped at parse time) so the conn can
     %% enforce the §6.10 "no non-CONTINUATION between HEADERS and
