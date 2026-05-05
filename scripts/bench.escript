@@ -90,6 +90,9 @@ preflight_scenario(#{scenario := large_post_streaming, servers := Servers} = Opt
 preflight_scenario(#{scenario := varied_paths_router, servers := Servers} = Opts) ->
     filter_servers(varied_paths_router, [elli], Servers, Opts,
         ~"no router; the test fixture only handles /, /echo, /large, /json");
+preflight_scenario(#{scenario := gzip_response, servers := Servers} = Opts) ->
+    filter_servers(gzip_response, [elli], Servers, Opts,
+        ~"no built-in gzip middleware");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -176,7 +179,8 @@ cli() ->
                         post_4kb_form,
                         large_post_streaming,
                         router_404_storm,
-                        varied_paths_router
+                        varied_paths_router,
+                        gzip_response
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -279,6 +283,13 @@ cli() ->
                                     table, more representative of
                                     a real REST API. elli filtered
                                     out (no router).
+                    gzip_response:  h1-only. GET /gzip with
+                                    Accept-Encoding: gzip; server
+                                    returns 16 KB JSON-shaped body
+                                    compressed via roadrunner_compress
+                                    middleware (cowboy: cowboy_compress_h
+                                    stream handler). elli filtered
+                                    out (no built-in compression).
                     """
             },
             #{
@@ -475,7 +486,7 @@ start_cowboy_h1(Scenario) ->
     %% as a `socket_opt` and `num_acceptors` ends up at `inet_tcp:listen`
     %% which crashes with `badarg`.
     TransportOpts = #{num_acceptors => 10, socket_opts => [{port, 0}]},
-    ProtoOpts = #{env => #{dispatch => Dispatch}, max_keepalive => 1000000},
+    ProtoOpts = scenario_cowboy_proto_opts(Scenario, Dispatch),
     {ok, _} = peer:call(Peer, cowboy, start_clear, [bench_cb, TransportOpts, ProtoOpts]),
     Port = peer:call(Peer, ranch, get_port, [bench_cb]),
     print_listener_config([
@@ -657,6 +668,13 @@ scenario_roadrunner_opts(large_post_streaming, BaseOpts) ->
         body_buffering => manual,
         routes => [{~"/drain", roadrunner_bench_drain_handler, undefined}]
     };
+scenario_roadrunner_opts(gzip_response, BaseOpts) ->
+    %% Enable roadrunner_compress middleware at the listener level so
+    %% all routes get gzip when the client asks for it.
+    BaseOpts#{
+        middlewares => [roadrunner_compress],
+        routes => [{~"/gzip", roadrunner_bench_gzip_handler, undefined}]
+    };
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -712,7 +730,23 @@ scenario_cowboy_routes(router_404_storm) ->
         ]}
     ];
 scenario_cowboy_routes(varied_paths_router) ->
-    [{'_', varied_paths_cowboy_routes()}].
+    [{'_', varied_paths_cowboy_routes()}];
+scenario_cowboy_routes(gzip_response) ->
+    [{'_', [{"/gzip", roadrunner_bench_cowboy_gzip_handler, []}]}].
+
+%% Per-scenario cowboy ProtoOpts. Default returns the base map; the
+%% gzip_response scenario layers in `cowboy_compress_h` ahead of
+%% the default stream handler so cowboy applies gzip per the
+%% request's Accept-Encoding header (mirrors roadrunner_compress
+%% middleware on the roadrunner side).
+scenario_cowboy_proto_opts(gzip_response, Dispatch) ->
+    #{
+        env => #{dispatch => Dispatch},
+        max_keepalive => 1000000,
+        stream_handlers => [cowboy_compress_h, cowboy_stream_h]
+    };
+scenario_cowboy_proto_opts(_Scenario, Dispatch) ->
+    #{env => #{dispatch => Dispatch}, max_keepalive => 1000000}.
 
 %% Inherit the parent's code path so the peer sees both default- and
 %% test-profile artifacts (cowboy lives under test).
@@ -1281,6 +1315,8 @@ build_request(large_post_streaming) ->
         BodyLenBin/binary,
         "\r\n\r\n",
         Body/binary>>;
+build_request(gzip_response) ->
+    ~"GET /gzip HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n";
 build_request(post_4kb_form) ->
     %% 4 KB urlencoded body — see `post_4kb_form_body/0` for shape.
     %% Predictable parse cost (ASCII letters/digits only, no
@@ -1337,7 +1373,17 @@ expected_body_len(post_4kb_form) ->
     %% body shape changes.
     Pairs = post_4kb_form_pair_count(),
     byte_size(integer_to_binary(Pairs));
-expected_body_len(large_post_streaming) -> 2.
+expected_body_len(large_post_streaming) -> 2;
+expected_body_len(gzip_response) ->
+    %% 16 KB JSON body of repeating records compresses to ~180-200
+    %% bytes via gzip (almost all dictionary references). Cowboy and
+    %% roadrunner pick slightly different compression params; pin
+    %% to the lower bound so recv returns as soon as either server's
+    %% body bytes have arrived. Extra bytes stay in the kernel
+    %% buffer and would be picked up by the next iteration's recv —
+    %% but each iteration's response fits in one TCP segment on
+    %% loopback so this is moot in practice.
+    50.
 
 %% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
 %% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
@@ -1592,6 +1638,15 @@ h2_request_shape(varied_paths_router) ->
         "error: --scenario varied_paths_router is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(gzip_response) ->
+    %% h2 has its own header compression (HPACK) and per-stream
+    %% body compression is rarely combined with it. Out of scope
+    %% for this scenario, which targets the h1 compress-middleware
+    %% path specifically.
+    io:format(standard_error,
+        "error: --scenario gzip_response is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -1775,7 +1830,9 @@ scenario_request_summary(large_post_streaming) ->
 scenario_request_summary(router_404_storm) ->
     "GET /nope HTTP/1.1 + Connection: close, fresh conn per request, 404 expected (router)";
 scenario_request_summary(varied_paths_router) ->
-    "GET /api/v1/items/<NNNN> HTTP/1.1, round-robin across 100 routed paths (router)".
+    "GET /api/v1/items/<NNNN> HTTP/1.1, round-robin across 100 routed paths (router)";
+scenario_request_summary(gzip_response) ->
+    "GET /gzip HTTP/1.1 + Accept-Encoding: gzip, 16 KB JSON in / ~200 B out (router + compress)".
 
 result_to_row(Side, #{
     total := Total,
