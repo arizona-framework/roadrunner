@@ -279,7 +279,8 @@ base_listen_opts() ->
     %% first — hitting Linux's 40 ms delayed-ACK timer and
     %% capping per-request latency at ~50 ms. h1 isn't affected
     %% (one `ssl:send/2` per response) but `nodelay` is the right
-    %% default for any HTTP server.
+    %% default for any HTTP server. See
+    %% `docs/h2_loadgen_artifact.md` for the original investigation.
     %%
     %% `backlog` overrides OTP's default of 5. With 5, a burst of
     %% concurrent connects (real apps, load tests, health-check
