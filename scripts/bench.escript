@@ -171,7 +171,8 @@ cli() ->
                         connection_storm,
                         mixed_workload,
                         post_4kb_form,
-                        large_post_streaming
+                        large_post_streaming,
+                        router_404_storm
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -253,6 +254,16 @@ cli() ->
                                     bookkeeping under sustained
                                     inbound load. elli filtered
                                     out (auto-buffers full body).
+                    router_404_storm:
+                                    h1-only. Fresh conn per request
+                                    (Connection: close), GET on a
+                                    path no route matches. Tests
+                                    the router's NEGATIVE match
+                                    path — the trie/list walk that
+                                    fails to match — plus 404
+                                    response framing. Realistic
+                                    for APIs hit by scanners,
+                                    broken links, deprecated paths.
                     """
             },
             #{
@@ -630,7 +641,18 @@ scenario_roadrunner_opts(large_post_streaming, BaseOpts) ->
     BaseOpts#{
         body_buffering => manual,
         routes => [{~"/drain", roadrunner_bench_drain_handler, undefined}]
-    }.
+    };
+scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
+    %% A real route table — even though the bench targets a
+    %% non-matching path, populate /, /json, /large so the router
+    %% has actual routes to walk past. Three is realistic for the
+    %% smallest production router; bigger tables would amplify the
+    %% router cost more.
+    BaseOpts#{routes => [
+        {~"/", roadrunner_keepalive_handler, undefined},
+        {~"/json", roadrunner_bench_json_handler, undefined},
+        {~"/large", roadrunner_bench_large_handler, undefined}
+    ]}.
 
 scenario_cowboy_routes(hello) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
@@ -663,7 +685,15 @@ scenario_cowboy_routes(mixed_workload) ->
 scenario_cowboy_routes(post_4kb_form) ->
     [{'_', [{"/form", roadrunner_bench_cowboy_form_handler, []}]}];
 scenario_cowboy_routes(large_post_streaming) ->
-    [{'_', [{"/drain", roadrunner_bench_cowboy_drain_handler, []}]}].
+    [{'_', [{"/drain", roadrunner_bench_cowboy_drain_handler, []}]}];
+scenario_cowboy_routes(router_404_storm) ->
+    [
+        {'_', [
+            {"/", roadrunner_bench_cowboy_handler, []},
+            {"/json", roadrunner_bench_cowboy_json_handler, []},
+            {"/large", roadrunner_bench_cowboy_large_handler, []}
+        ]}
+    ].
 
 %% Inherit the parent's code path so the peer sees both default- and
 %% test-profile artifacts (cowboy lives under test).
@@ -689,6 +719,21 @@ run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
 run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
     run_phase_h2(Port, Opts, DurationMs).
 
+run_phase_h1(
+    Port, #{clients := C, host := Host, scenario := router_404_storm}, DurationMs
+) ->
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    Self = self(),
+    StartUs = erlang:monotonic_time(microsecond),
+    Workers = [
+        spawn_link(fun() ->
+            Self ! {self(), router_404_storm_worker(Host, Port, Deadline, init_acc())}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
+    EndUs = erlang:monotonic_time(microsecond),
+    aggregate(PerWorker, EndUs - StartUs);
 run_phase_h1(
     Port, #{clients := C, host := Host, scenario := mixed_workload}, DurationMs
 ) ->
@@ -932,6 +977,66 @@ connection_storm_one(Host, Port) ->
             end;
         {error, _} = E ->
             E
+    end.
+
+%% router_404_storm: roadrunner's 404 path returns
+%% `Connection: close` (defensive — the conn might be in an
+%% unexpected state after a router miss), so a keep-alive loop
+%% can't reuse the conn. Use a fresh-conn-per-request shape and
+%% send `Connection: close` from the client too — both servers
+%% see identical conn lifecycle, the bench measures router-miss
+%% throughput including the conn close cost.
+router_404_storm_request() ->
+    ~"GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".
+
+router_404_storm_worker(Host, Port, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Acc;
+        false ->
+            T0 = erlang:monotonic_time(nanosecond),
+            case router_404_storm_one(Host, Port) of
+                {ok, Bytes} ->
+                    T1 = erlang:monotonic_time(nanosecond),
+                    router_404_storm_worker(
+                        Host, Port, Deadline, bump_ok(Acc, T1 - T0, Bytes)
+                    );
+                {error, _} ->
+                    router_404_storm_worker(Host, Port, Deadline, bump_err(Acc))
+            end
+    end.
+
+router_404_storm_one(Host, Port) ->
+    case gen_tcp:connect(Host, Port, [binary, {active, false}, {nodelay, true}], 5000) of
+        {ok, Sock} ->
+            case gen_tcp:send(Sock, router_404_storm_request()) of
+                ok ->
+                    Result = recv_404_response(Sock, <<>>, 5000),
+                    _ = gen_tcp:close(Sock),
+                    Result;
+                {error, _} = E ->
+                    _ = gen_tcp:close(Sock),
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+%% Drain a 404 response. Body is zero bytes (server sets
+%% Content-Length: 0); we just need to see the headers terminator
+%% with the 404 status line.
+recv_404_response(Sock, Buf, Timeout) ->
+    case binary:split(Buf, ~"\r\n\r\n") of
+        [_Headers, _Body] ->
+            case Buf of
+                <<"HTTP/1.1 404", _/binary>> -> {ok, byte_size(Buf)};
+                _ -> {error, bad_status}
+            end;
+        _ ->
+            case gen_tcp:recv(Sock, 0, Timeout) of
+                {ok, Data} -> recv_404_response(Sock, <<Buf/binary, Data/binary>>, Timeout);
+                {error, _} = E -> E
+            end
     end.
 
 %% mixed_workload: per request, randomly pick a path from
@@ -1359,6 +1464,14 @@ h2_request_shape(large_post_streaming) ->
         "error: --scenario large_post_streaming is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(router_404_storm) ->
+    %% Connection lifecycle is the dominant cost on this scenario;
+    %% h2 conns + per-conn TLS handshake would obscure the
+    %% router-miss cost we're trying to surface. h1-only.
+    io:format(standard_error,
+        "error: --scenario router_404_storm is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -1538,7 +1651,9 @@ scenario_request_summary(mixed_workload) ->
 scenario_request_summary(post_4kb_form) ->
     "POST /form HTTP/1.1, 4 KB application/x-www-form-urlencoded body (router)";
 scenario_request_summary(large_post_streaming) ->
-    "POST /drain HTTP/1.1, 1 MB body, manual-mode 64 KB chunks (router)".
+    "POST /drain HTTP/1.1, 1 MB body, manual-mode 64 KB chunks (router)";
+scenario_request_summary(router_404_storm) ->
+    "GET /nope HTTP/1.1 + Connection: close, fresh conn per request, 404 expected (router)".
 
 result_to_row(Side, #{
     total := Total,
