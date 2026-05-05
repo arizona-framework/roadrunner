@@ -144,7 +144,8 @@ cli() ->
                         multi_stream_h2,
                         pipelined_h1,
                         slow_client,
-                        connection_storm
+                        connection_storm,
+                        mixed_workload
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -200,6 +201,14 @@ cli() ->
                                     health-check probes (k8s, ELB),
                                     short-lived CLI clients, HTTP-
                                     as-RPC patterns.
+                    mixed_workload: Per-request random pick from
+                                    {hello, json, large_response}
+                                    on the same keep-alive conn.
+                                    Closer to production traffic
+                                    than uniform-path benches —
+                                    surfaces router-cache effects
+                                    and gives an honest "average
+                                    request" number.
                     """
             },
             #{
@@ -560,7 +569,14 @@ scenario_roadrunner_opts(slow_client, BaseOpts) ->
 scenario_roadrunner_opts(connection_storm, BaseOpts) ->
     %% Same handler as `hello` — connection_storm is a connection-
     %% lifecycle test; per-request work is identical to `hello`.
-    BaseOpts#{handler => roadrunner_keepalive_handler}.
+    BaseOpts#{handler => roadrunner_keepalive_handler};
+scenario_roadrunner_opts(mixed_workload, BaseOpts) ->
+    %% Three routes — bench client picks one uniformly per request.
+    BaseOpts#{routes => [
+        {~"/", roadrunner_keepalive_handler, undefined},
+        {~"/json", roadrunner_bench_json_handler, undefined},
+        {~"/large", roadrunner_bench_large_handler, undefined}
+    ]}.
 
 scenario_cowboy_routes(hello) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
@@ -581,7 +597,15 @@ scenario_cowboy_routes(pipelined_h1) ->
 scenario_cowboy_routes(slow_client) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
 scenario_cowboy_routes(connection_storm) ->
-    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}].
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
+scenario_cowboy_routes(mixed_workload) ->
+    [
+        {'_', [
+            {"/", roadrunner_bench_cowboy_handler, []},
+            {"/json", roadrunner_bench_cowboy_json_handler, []},
+            {"/large", roadrunner_bench_cowboy_large_handler, []}
+        ]}
+    ].
 
 %% Inherit the parent's code path so the peer sees both default- and
 %% test-profile artifacts (cowboy lives under test).
@@ -607,6 +631,21 @@ run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
 run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
     run_phase_h2(Port, Opts, DurationMs).
 
+run_phase_h1(
+    Port, #{clients := C, host := Host, scenario := mixed_workload}, DurationMs
+) ->
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    Self = self(),
+    StartUs = erlang:monotonic_time(microsecond),
+    Workers = [
+        spawn_link(fun() ->
+            Self ! {self(), mixed_workload_worker(Host, Port, Deadline, init_acc())}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
+    EndUs = erlang:monotonic_time(microsecond),
+    aggregate(PerWorker, EndUs - StartUs);
 run_phase_h1(
     Port, #{clients := C, host := Host, scenario := connection_storm}, DurationMs
 ) ->
@@ -835,6 +874,57 @@ connection_storm_one(Host, Port) ->
             end;
         {error, _} = E ->
             E
+    end.
+
+%% mixed_workload: per request, randomly pick a path from
+%% {hello, json, large_response} on the same keep-alive conn.
+%% Closer-to-production traffic shape — surfaces router-cache
+%% effects (a stable single path warms one router slot; a varied
+%% path mix exercises real dispatch). Equal weights so each path
+%% gets pressure; latency reported is the per-request mean across
+%% the mix, not a per-path breakdown.
+mixed_workload_requests() ->
+    %% Triple of {RequestBytes, ExpectedBodyLen} so the recv loop
+    %% can stop on Content-Length without re-parsing the request.
+    {
+        {build_request(hello), expected_body_len(hello)},
+        {build_request(json), expected_body_len(json)},
+        {build_request(large_response), expected_body_len(large_response)}
+    }.
+
+mixed_workload_worker(Host, Port, Deadline, Acc) ->
+    case gen_tcp:connect(Host, Port, [binary, {active, false}, {nodelay, true}], 5000) of
+        {ok, Sock} ->
+            Reqs = mixed_workload_requests(),
+            Final = mixed_workload_loop(Sock, Reqs, Deadline, Acc),
+            ok = gen_tcp:close(Sock),
+            Final;
+        {error, _} ->
+            bump_err(Acc)
+    end.
+
+mixed_workload_loop(Sock, Reqs, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Acc;
+        false ->
+            {Req, BodyLen} = element(rand:uniform(3), Reqs),
+            T0 = erlang:monotonic_time(nanosecond),
+            case gen_tcp:send(Sock, Req) of
+                ok ->
+                    case recv_response(Sock, <<>>, BodyLen, 5000) of
+                        {ok, Bytes} ->
+                            T1 = erlang:monotonic_time(nanosecond),
+                            mixed_workload_loop(
+                                Sock, Reqs, Deadline,
+                                bump_ok(Acc, T1 - T0, Bytes)
+                            );
+                        {error, _} ->
+                            bump_err(Acc)
+                    end;
+                {error, _} ->
+                    bump_err(Acc)
+            end
     end.
 
 %% Drain N back-to-back HTTP/1.1 responses from `Buf`. Each response
@@ -1127,6 +1217,15 @@ h2_request_shape(connection_storm) ->
         "error: --scenario connection_storm is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(mixed_workload) ->
+    %% h2 mixed-path workload is a separate (and meaningful) test
+    %% but needs varying per-request shapes through the bench
+    %% client — out of scope for this scenario, which targets the
+    %% h1 router under varied dispatch.
+    io:format(standard_error,
+        "error: --scenario mixed_workload is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -1300,7 +1399,9 @@ scenario_request_summary(pipelined_h1) ->
 scenario_request_summary(slow_client) ->
     "GET / HTTP/1.1, request drip-fed in 5 chunks @ 1 ms each, 7-byte response (handler)";
 scenario_request_summary(connection_storm) ->
-    "GET / HTTP/1.1 + Connection: close, fresh conn per request (handler)".
+    "GET / HTTP/1.1 + Connection: close, fresh conn per request (handler)";
+scenario_request_summary(mixed_workload) ->
+    "Random pick per request from {GET /, GET /json, GET /large} on keep-alive (router)".
 
 result_to_row(Side, #{
     total := Total,
