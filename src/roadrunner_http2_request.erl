@@ -30,7 +30,7 @@ served the request.
 
 -export([from_headers/3]).
 
--export_type([build_error/0]).
+-export_type([build_error/0, conn_info/0]).
 
 -type build_error() ::
     missing_pseudo_header
@@ -39,6 +39,13 @@ served the request.
     | pseudo_after_regular
     | empty_path
     | connection_specific_header.
+
+-type conn_info() :: #{
+    peer := {inet:ip_address(), inet:port_number()} | undefined,
+    scheme := http | https,
+    request_id := binary(),
+    listener_name := atom()
+}.
 
 -doc """
 Build a request map from a decoded HPACK header list. `ConnInfo`
@@ -54,7 +61,7 @@ read it via `roadrunner_req:header/2` still work.
 `Body` is the concatenated DATA-frame payload bytes (or `<<>>`
 for header-only requests).
 """.
--spec from_headers([roadrunner_http2_hpack:header()], binary(), map()) ->
+-spec from_headers([roadrunner_http2_hpack:header()], binary(), conn_info()) ->
     {ok, roadrunner_http1:request()} | {error, build_error()}.
 from_headers(Headers, Body, ConnInfo) ->
     case partition(Headers, #{}, []) of
