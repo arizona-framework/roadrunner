@@ -48,7 +48,15 @@ features.
 %% the returned frame map (per RFC 7692 the bit signals a compressed
 %% message). RSV2 and RSV3 are always rejected — no IETF extension
 %% uses them.
--type parse_opts() :: #{allow_rsv1 => boolean()}.
+-type parse_opts() :: #{
+    allow_rsv1 => boolean(),
+    %% Caller-supplied unmasked payload. When this matches the frame's
+    %% length, `parse_frame/2` skips its own `unmask/2` call and uses
+    %% the supplied bytes directly. `roadrunner_ws_session` populates
+    %% this from its incremental UTF-8 validation pass — same bytes
+    %% would otherwise be unmasked twice.
+    pre_unmasked => binary()
+}.
 
 %% Encode-side options. `rsv1 => true` sets the RSV1 bit on the
 %% emitted frame; the caller is responsible for ensuring an
@@ -443,27 +451,35 @@ RSV2 and RSV3 remain unconditionally rejected.
     | {more, undefined}
     | {error, bad_opcode | bad_rsv | not_masked | fragmented_control | control_frame_too_large}.
 parse_frame(Bin, Opts) ->
-    do_parse_frame(Bin, maps:get(allow_rsv1, Opts, false)).
+    do_parse_frame(
+        Bin,
+        maps:get(allow_rsv1, Opts, false),
+        maps:get(pre_unmasked, Opts, undefined)
+    ).
 
--spec do_parse_frame(binary(), boolean()) ->
+-spec do_parse_frame(binary(), boolean(), binary() | undefined) ->
     {ok, frame(), Rest :: binary()}
     | {more, undefined}
     | {error, bad_opcode | bad_rsv | not_masked | fragmented_control | control_frame_too_large}.
-do_parse_frame(<<_Fin:1, _Rsv1:1, Rsv23:2, _:4, _/bitstring>>, _AllowRsv1) when Rsv23 =/= 0 ->
+do_parse_frame(<<_Fin:1, _Rsv1:1, Rsv23:2, _:4, _/bitstring>>, _AllowRsv1, _Pre) when
+    Rsv23 =/= 0
+->
     {error, bad_rsv};
-do_parse_frame(<<_Fin:1, 1:1, 0:2, _:4, _/bitstring>>, false) ->
+do_parse_frame(<<_Fin:1, 1:1, 0:2, _:4, _/bitstring>>, false, _Pre) ->
     {error, bad_rsv};
-do_parse_frame(<<Fin:1, Rsv1:1, 0:2, Op:4, Mask:1, Len7:7, Rest/binary>>, _AllowRsv1) ->
+do_parse_frame(<<Fin:1, Rsv1:1, 0:2, Op:4, Mask:1, Len7:7, Rest/binary>>, _AllowRsv1, Pre) ->
     case decode_opcode(Op) of
         {ok, Opcode} ->
             case validate_control(Opcode, Fin, Len7) of
-                ok -> parse_length(Len7, Mask, Rest, fin_flag(Fin), rsv_flag(Rsv1), Opcode);
-                {error, _} = E -> E
+                ok ->
+                    parse_length(Len7, Mask, Rest, fin_flag(Fin), rsv_flag(Rsv1), Opcode, Pre);
+                {error, _} = E ->
+                    E
             end;
         error ->
             {error, bad_opcode}
     end;
-do_parse_frame(_, _AllowRsv1) ->
+do_parse_frame(_, _AllowRsv1, _Pre) ->
     {more, undefined}.
 
 -doc """
@@ -566,28 +582,46 @@ decode_opcode(?OP_PING) -> {ok, ping};
 decode_opcode(?OP_PONG) -> {ok, pong};
 decode_opcode(_) -> error.
 
--spec parse_length(0..127, 0 | 1, binary(), boolean(), boolean(), opcode()) ->
+-spec parse_length(
+    0..127, 0 | 1, binary(), boolean(), boolean(), opcode(), binary() | undefined
+) ->
     {ok, frame(), binary()}
     | {more, undefined}
     | {error, not_masked}.
-parse_length(126, Mask, <<Len:16, Rest/binary>>, Fin, Rsv1, Op) ->
-    parse_payload(Len, Mask, Rest, Fin, Rsv1, Op);
-parse_length(127, Mask, <<Len:64, Rest/binary>>, Fin, Rsv1, Op) ->
-    parse_payload(Len, Mask, Rest, Fin, Rsv1, Op);
-parse_length(Len7, Mask, Rest, Fin, Rsv1, Op) when Len7 < 126 ->
-    parse_payload(Len7, Mask, Rest, Fin, Rsv1, Op);
-parse_length(_, _, _, _, _, _) ->
+parse_length(126, Mask, <<Len:16, Rest/binary>>, Fin, Rsv1, Op, Pre) ->
+    parse_payload(Len, Mask, Rest, Fin, Rsv1, Op, Pre);
+parse_length(127, Mask, <<Len:64, Rest/binary>>, Fin, Rsv1, Op, Pre) ->
+    parse_payload(Len, Mask, Rest, Fin, Rsv1, Op, Pre);
+parse_length(Len7, Mask, Rest, Fin, Rsv1, Op, Pre) when Len7 < 126 ->
+    parse_payload(Len7, Mask, Rest, Fin, Rsv1, Op, Pre);
+parse_length(_, _, _, _, _, _, _) ->
     {more, undefined}.
 
--spec parse_payload(non_neg_integer(), 0 | 1, binary(), boolean(), boolean(), opcode()) ->
+-spec parse_payload(
+    non_neg_integer(), 0 | 1, binary(), boolean(), boolean(), opcode(), binary() | undefined
+) ->
     {ok, frame(), binary()}
     | {more, undefined}
     | {error, not_masked}.
-parse_payload(_Len, 0, _Bin, _Fin, _Rsv1, _Op) ->
+parse_payload(_Len, 0, _Bin, _Fin, _Rsv1, _Op, _Pre) ->
     %% Server-side: per RFC 6455 §5.1 every client frame must be masked.
     {error, not_masked};
-parse_payload(Len, 1, Bin, Fin, Rsv1, Op) ->
+parse_payload(Len, 1, Bin, Fin, Rsv1, Op, Pre) ->
     case Bin of
+        <<_MaskKey:4/binary, _Payload:Len/binary, Rest/binary>> when
+            is_binary(Pre), byte_size(Pre) =:= Len
+        ->
+            %% Caller already unmasked these bytes (typically via
+            %% `roadrunner_ws_session:early_validate_text/3`'s
+            %% incremental UTF-8 pass) — skip the redundant unmask.
+            {ok,
+                #{
+                    fin => Fin,
+                    rsv1 => Rsv1,
+                    opcode => Op,
+                    payload => Pre
+                },
+                Rest};
         <<MaskKey:4/binary, Payload:Len/binary, Rest/binary>> ->
             {ok,
                 #{
