@@ -105,6 +105,9 @@ preflight_scenario(#{scenario := expect_100_continue, servers := Servers} = Opts
 preflight_scenario(#{scenario := websocket_msg_throughput, servers := Servers} = Opts) ->
     filter_servers(websocket_msg_throughput, [elli], Servers, Opts,
         ~"no WebSocket support in elli test fixture");
+preflight_scenario(#{scenario := url_with_qs, servers := Servers} = Opts) ->
+    filter_servers(url_with_qs, [elli], Servers, Opts,
+        ~"no native query-string parser in elli test fixture");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -197,7 +200,8 @@ cli() ->
                         server_sent_events,
                         expect_100_continue,
                         large_keepalive_session,
-                        websocket_msg_throughput
+                        websocket_msg_throughput,
+                        url_with_qs
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -365,6 +369,14 @@ cli() ->
                                     distinct from any other
                                     scenario. elli filtered out
                                     (no WS in test fixture).
+                    url_with_qs:    h1-only. GET /qs?<6 pairs>;
+                                    server parses the URL query
+                                    string via roadrunner_qs:parse
+                                    (cowboy: cowboy_req:parse_qs).
+                                    Distinct from `post_4kb_form`
+                                    which exercises the body-side
+                                    qs path. elli filtered out
+                                    (no native qs parser).
                     """
             },
             #{
@@ -803,6 +815,8 @@ scenario_roadrunner_opts(large_keepalive_session, BaseOpts) ->
     };
 scenario_roadrunner_opts(websocket_msg_throughput, BaseOpts) ->
     BaseOpts#{routes => [{~"/ws", roadrunner_ws_upgrade_handler, undefined}]};
+scenario_roadrunner_opts(url_with_qs, BaseOpts) ->
+    BaseOpts#{routes => [{~"/qs", roadrunner_bench_url_qs_handler, undefined}]};
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -870,7 +884,9 @@ scenario_cowboy_routes(expect_100_continue) ->
 scenario_cowboy_routes(large_keepalive_session) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
 scenario_cowboy_routes(websocket_msg_throughput) ->
-    [{'_', [{"/ws", roadrunner_bench_cowboy_ws_handler, []}]}].
+    [{'_', [{"/ws", roadrunner_bench_cowboy_ws_handler, []}]}];
+scenario_cowboy_routes(url_with_qs) ->
+    [{'_', [{"/qs", roadrunner_bench_cowboy_url_qs_handler, []}]}].
 
 %% Per-scenario cowboy TransportOpts. The default keeps the bench's
 %% prior shape (`num_acceptors => 10`); `backpressure_sustained`
@@ -1903,6 +1919,11 @@ build_request(backpressure_sustained) ->
     ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 build_request(large_keepalive_session) ->
     ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+build_request(url_with_qs) ->
+    %% 6 simple key=value pairs in the URL — no `+` or `%`, so the
+    %% qs:parse fast-path takes the no-op branch (matches typical
+    %% REST API filter URLs).
+    ~"GET /qs?filter=active&sort=name&limit=100&offset=200&fields=id,name,email&include=role HTTP/1.1\r\nHost: x\r\n\r\n";
 build_request(post_4kb_form) ->
     %% 4 KB urlencoded body — see `post_4kb_form_body/0` for shape.
     %% Predictable parse cost (ASCII letters/digits only, no
@@ -1971,7 +1992,8 @@ expected_body_len(gzip_response) ->
     %% loopback so this is moot in practice.
     50;
 expected_body_len(backpressure_sustained) -> 7;
-expected_body_len(large_keepalive_session) -> 7.
+expected_body_len(large_keepalive_session) -> 7;
+expected_body_len(url_with_qs) -> 1.
 
 %% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
 %% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
@@ -2272,6 +2294,15 @@ h2_request_shape(websocket_msg_throughput) ->
         "error: --scenario websocket_msg_throughput is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(url_with_qs) ->
+    %% h2 path encodes the query string in the `:path` pseudo-
+    %% header — same code-path on the server side. Worth a
+    %% follow-up scenario but out of scope here, which targets
+    %% the h1 URL-side qs:parse path specifically.
+    io:format(standard_error,
+        "error: --scenario url_with_qs is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -2467,7 +2498,9 @@ scenario_request_summary(expect_100_continue) ->
 scenario_request_summary(large_keepalive_session) ->
     "GET / HTTP/1.1, server caps at 1000 reqs/conn, worker reconnects on close (handler)";
 scenario_request_summary(websocket_msg_throughput) ->
-    "WS upgrade then 1 KB masked text frame echoes in a tight loop (handler/router)".
+    "WS upgrade then 1 KB masked text frame echoes in a tight loop (handler/router)";
+scenario_request_summary(url_with_qs) ->
+    "GET /qs?<6 pairs> HTTP/1.1, server parses URL query string, 1-byte response (router)".
 
 result_to_row(Side, #{
     total := Total,
