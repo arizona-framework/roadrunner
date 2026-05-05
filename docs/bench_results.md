@@ -1,6 +1,6 @@
 # Benchmark results
 
-Captured by `scripts/bench_matrix.sh` on 2026-05-05 at `9e15ccd`.
+Captured by `scripts/bench_matrix.sh` on 2026-05-05 at `020b440`.
 
 **Hardware / runtime**
 
@@ -11,9 +11,9 @@ Captured by `scripts/bench_matrix.sh` on 2026-05-05 at `9e15ccd`.
 - Bench client: in-tree `roadrunner_bench_client` (h1 + h2)
 
 Numbers are the **median** req/s across 3 runs. `p50 / p99`
-shown is **roadrunner's** for that cell — see the raw
-`bench_results.csv` (next to this file) for the full
-rr / cowboy / elli breakdown including each server's p50 / p99.
+shown is **roadrunner's** for that cell. Per-server p50 / p99
+for cowboy and elli land in `/tmp/bench_results.csv` after a
+matrix run if you need to diff alternative servers.
 
 Re-run locally with:
 

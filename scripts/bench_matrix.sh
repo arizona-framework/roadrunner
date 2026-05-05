@@ -2,13 +2,14 @@
 #
 # bench_matrix.sh — run scripts/bench.escript across every
 # (scenario, protocol) pair, take the median of N runs per cell,
-# and emit:
-#   docs/bench_results.csv  — machine-readable medians
-#   docs/bench_results.md   — human-readable per-protocol tables
+# and emit docs/bench_results.md (per-protocol tables).
 #
 # bench.escript runs ONE scenario at a time (single peer BEAM,
 # isolated per side). This wrapper drives the full matrix and
-# writes the consolidated tables that ship under docs/.
+# writes the consolidated table that ships under docs/.
+#
+# Intermediate medians land in /tmp/bench_results.csv — useful for
+# diffing across runs but not committed (the MD is the deliverable).
 #
 # Requires bash 4+ (associative arrays + BASH_REMATCH `match[]`).
 # macOS ships /bin/bash 3.2 — install bash via brew and run
@@ -43,7 +44,7 @@ SKIP_BENCH=${SKIP_BENCH:-0}
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOG=/tmp/bench_matrix.log
-CSV="$REPO_ROOT/docs/bench_results.csv"
+CSV=/tmp/bench_results.csv
 MD="$REPO_ROOT/docs/bench_results.md"
 PER_RUN_TSV=/tmp/bench_per_run.tsv
 
@@ -255,9 +256,9 @@ OTP=$(mise exec -- erl -noshell -eval 'io:format("~s",[erlang:system_info(otp_re
   echo "- Bench client: in-tree \`roadrunner_bench_client\` (h1 + h2)"
   echo
   echo "Numbers are the **median** req/s across $RUNS runs. \`p50 / p99\`"
-  echo "shown is **roadrunner's** for that cell — see the raw"
-  echo "\`bench_results.csv\` (next to this file) for the full"
-  echo "rr / cowboy / elli breakdown including each server's p50 / p99."
+  echo "shown is **roadrunner's** for that cell. Per-server p50 / p99"
+  echo "for cowboy and elli land in \`/tmp/bench_results.csv\` after a"
+  echo "matrix run if you need to diff alternative servers."
   echo
   echo "Re-run locally with:"
   echo

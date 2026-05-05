@@ -242,8 +242,7 @@ and the full HPACK decoding-error matrix.
 `scripts/bench.escript` runs the same loadgen against each server in
 its own peer BEAM. `scripts/bench_matrix.sh` drives all 35 scenarios
 across both protocols and writes the consolidated tables that ship
-in [`docs/bench_results.md`](docs/bench_results.md) (raw CSV at
-[`docs/bench_results.csv`](docs/bench_results.csv)). Numbers below
+in [`docs/bench_results.md`](docs/bench_results.md). Numbers below
 are the median of 3 runs at 50 concurrent clients on a single Linux
 dev box, loopback. Re-run locally to see what your hardware shows;
 absolute numbers shift, relative ordering tends to hold.
