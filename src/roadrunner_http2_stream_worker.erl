@@ -64,6 +64,11 @@ start(ConnPid, StreamId, Req, ProtoOpts) ->
 -spec init(pid(), pos_integer(), roadrunner_http1:request(), map()) -> ok.
 init(ConnPid, StreamId, Req, ProtoOpts) ->
     proc_lib:set_label({roadrunner_http2_stream_worker, StreamId}),
+    %% Mirror the h1 path: attach request-scoped metadata so any
+    %% `?LOG_*` from middleware/handlers is auto-correlated by
+    %% `request_id`. The conn process can't do this for us — the
+    %% handler runs in this worker, not on the conn.
+    ok = roadrunner_conn:set_request_logger_metadata(Req),
     run_handler(ConnPid, StreamId, Req, ProtoOpts),
     ConnPid ! {h2_worker_done, StreamId},
     ok.
