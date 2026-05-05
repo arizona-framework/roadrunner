@@ -133,7 +133,8 @@ cli() ->
             #{
                 name => scenario,
                 long => "-scenario",
-                type => {atom, [hello, echo, large_response]},
+                type =>
+                    {atom, [hello, echo, large_response, json, headers_heavy]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
                     """
@@ -145,6 +146,13 @@ cli() ->
                     large_response: GET /large with a 64 KB response body.
                                     Exercises Content-Length encoding cost and
                                     kernel-side send batching for big writes.
+                    json:           GET /json returning a ~120-byte
+                                    application/json body. Realistic single-
+                                    item REST shape.
+                    headers_heavy:  GET / with 16 extra request headers.
+                                    Stresses the request-header parser
+                                    (h1) / HPACK encoder + literal-with-
+                                    incremental-indexing path (h2).
                     """
             },
             #{
@@ -477,17 +485,27 @@ print_listener_config(Pairs) ->
 %% all three servers so the comparison stays apples-to-apples.
 scenario_roadrunner_opts(hello, BaseOpts) ->
     BaseOpts#{handler => roadrunner_keepalive_handler};
+scenario_roadrunner_opts(headers_heavy, BaseOpts) ->
+    %% Same handler as `hello` — the difference is request-side
+    %% headers, server work is identical.
+    BaseOpts#{handler => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(echo, BaseOpts) ->
     BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
 scenario_roadrunner_opts(large_response, BaseOpts) ->
-    BaseOpts#{routes => [{~"/large", roadrunner_bench_large_handler, undefined}]}.
+    BaseOpts#{routes => [{~"/large", roadrunner_bench_large_handler, undefined}]};
+scenario_roadrunner_opts(json, BaseOpts) ->
+    BaseOpts#{routes => [{~"/json", roadrunner_bench_json_handler, undefined}]}.
 
 scenario_cowboy_routes(hello) ->
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
+scenario_cowboy_routes(headers_heavy) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
 scenario_cowboy_routes(echo) ->
     [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}];
 scenario_cowboy_routes(large_response) ->
-    [{'_', [{"/large", roadrunner_bench_cowboy_large_handler, []}]}].
+    [{'_', [{"/large", roadrunner_bench_cowboy_large_handler, []}]}];
+scenario_cowboy_routes(json) ->
+    [{'_', [{"/json", roadrunner_bench_cowboy_json_handler, []}]}].
 
 %% Inherit the parent's code path so the peer sees both default- and
 %% test-profile artifacts (cowboy lives under test).
@@ -547,13 +565,43 @@ build_request(echo) ->
         "\r\n\r\n",
         Body/binary>>;
 build_request(large_response) ->
-    ~"GET /large HTTP/1.1\r\nHost: x\r\n\r\n".
+    ~"GET /large HTTP/1.1\r\nHost: x\r\n\r\n";
+build_request(json) ->
+    ~"GET /json HTTP/1.1\r\nHost: x\r\nAccept: application/json\r\n\r\n";
+build_request(headers_heavy) ->
+    %% 16 small request headers + the Host. Names are valid h1
+    %% tokens (lowercase ASCII); values are short. Same path as
+    %% `hello` so the server-side handler cost is identical and the
+    %% bench surfaces request-header parsing overhead.
+    <<
+        "GET / HTTP/1.1\r\n"
+        "Host: x\r\n"
+        "x-bench-1: 1\r\n"
+        "x-bench-2: 22\r\n"
+        "x-bench-3: 333\r\n"
+        "x-bench-4: 4444\r\n"
+        "x-bench-5: 55555\r\n"
+        "x-bench-6: 666666\r\n"
+        "x-bench-7: 7777777\r\n"
+        "x-bench-8: 88888888\r\n"
+        "x-bench-9: 999999999\r\n"
+        "x-bench-10: aaaaaaaaaa\r\n"
+        "x-bench-11: bbbbbbbbbbb\r\n"
+        "x-bench-12: cccccccccccc\r\n"
+        "x-bench-13: ddddddddddddd\r\n"
+        "x-bench-14: eeeeeeeeeeeeee\r\n"
+        "x-bench-15: fffffffffffffff\r\n"
+        "x-bench-16: gggggggggggggggg\r\n"
+        "\r\n"
+    >>.
 
 %% Body byte count the recv loop should wait for before claiming the
 %% response is complete.
 expected_body_len(hello) -> 7;
 expected_body_len(echo) -> ?ECHO_BODY_SIZE;
-expected_body_len(large_response) -> ?LARGE_BODY_SIZE.
+expected_body_len(large_response) -> ?LARGE_BODY_SIZE;
+expected_body_len(json) -> 115;
+expected_body_len(headers_heavy) -> 7.
 
 collect(Pid, TimeoutMs) ->
     receive
@@ -656,7 +704,19 @@ h2_request_shape(echo) ->
     {~"POST", ~"/echo", [{~"content-type", ~"application/octet-stream"}],
         binary:copy(~"x", ?ECHO_BODY_SIZE)};
 h2_request_shape(large_response) ->
-    {~"GET", ~"/large", [], <<>>}.
+    {~"GET", ~"/large", [], <<>>};
+h2_request_shape(json) ->
+    {~"GET", ~"/json", [{~"accept", ~"application/json"}], <<>>};
+h2_request_shape(headers_heavy) ->
+    %% 16 small custom headers — exercises HPACK encode's
+    %% literal-with-incremental-indexing path. After warmup these
+    %% land in the dynamic table and subsequent requests reference
+    %% them by index, mirroring real-world h2 client behaviour.
+    Hdrs = [
+        {<<"x-bench-", (integer_to_binary(N))/binary>>, binary:copy(~"a", N)}
+     || N <- lists:seq(1, 16)
+    ],
+    {~"GET", ~"/", Hdrs, <<>>}.
 
 h2_worker_loop(Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->
     case roadrunner_bench_client:open(Host, Port, h2) of
@@ -806,7 +866,11 @@ scenario_request_summary(hello) ->
 scenario_request_summary(echo) ->
     "POST /echo HTTP/1.1, 5 headers, 256-byte body, server echoes (router)";
 scenario_request_summary(large_response) ->
-    "GET /large HTTP/1.1, 1 header, 64 KB response body (router)".
+    "GET /large HTTP/1.1, 1 header, 64 KB response body (router)";
+scenario_request_summary(json) ->
+    "GET /json HTTP/1.1, 2 headers, ~115-byte JSON response body (router)";
+scenario_request_summary(headers_heavy) ->
+    "GET / HTTP/1.1, 17 headers, 7-byte response body (handler)".
 
 result_to_row(Side, #{
     total := Total,
