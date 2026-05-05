@@ -240,58 +240,126 @@ and the full HPACK decoding-error matrix.
 ## Comparison with cowboy and elli
 
 `scripts/bench.escript` runs the same loadgen against each server in
-its own peer BEAM. Numbers below are the median of multiple runs at
-50 concurrent clients on a single Linux dev box, loopback (no
-network). Re-run locally to see what your hardware shows; absolute
-numbers shift, relative ordering tends to hold.
+its own peer BEAM. `scripts/bench_matrix.sh` drives all 35 scenarios
+across both protocols and writes the consolidated tables that ship
+in [`docs/bench_results.md`](docs/bench_results.md) (raw CSV at
+[`docs/bench_results.csv`](docs/bench_results.csv)). Numbers below
+are the median of 3 runs at 50 concurrent clients on a single Linux
+dev box, loopback. Re-run locally to see what your hardware shows;
+absolute numbers shift, relative ordering tends to hold.
 
-> **TL;DR.** Roadrunner is competitive on throughput, **wins p50
-> across the board, and wins p99 by 2.5–3.5×**. Elli edges raw req/s
-> on the simplest scenario (`hello`); roadrunner matches or
-> approaches it elsewhere while delivering far more consistent tail
-> latency. Cowboy is bottom on every axis here — it optimizes for
-> very different ground (HTTP/2, sub-protocol routing,
-> supervisor-tree visibility).
+> **TL;DR.** Roadrunner beats cowboy on most common scenarios by
+> +30–50 % req/s with proportionally lower p50 / p99. The
+> exceptions are connection-storm-shape scenarios (open-conn /
+> close-conn dominates) and two h2-specific cases — those tie or
+> slightly lose. Vs elli, roadrunner is within ~15 % on simple
+> GETs (elli's minimal surface still wins the cleanest hot path)
+> and beats elli outright wherever the workload needs a feature
+> elli doesn't ship — pipelining, gzip, body streaming, h2,
+> WebSocket, router, native qs/cookie parsing, etag.
 
-### Throughput — req/s (higher = better)
+### Throughput — req/s, HTTP/1.1 (higher = better)
 
-| scenario        | roadrunner    | elli          | cowboy        |
-|-----------------|--------------:|--------------:|--------------:|
-| hello           |        252 k  |    **306 k**  |       190 k   |
-| echo            |        257 k  |    **279 k**  |       139 k   |
-| large_response  |        103 k  |    **122 k**  |        85 k   |
+A representative cross-section. Full 35-scenario table including
+HTTP/2 and per-server p50/p99 lives in
+[`docs/bench_results.md`](docs/bench_results.md).
 
-### p99 latency — tail latency (lower = better)
+Bolded cells indicate the row's winner *and* a margin wider than
+~15 % over the next-best (the bench's own variance band — see
+"Reading the numbers honestly" below). Cells without bold are
+inside variance and shouldn't be read as a win.
 
-| scenario        | roadrunner    | elli          | cowboy        |
-|-----------------|--------------:|--------------:|--------------:|
-| hello           | **440 µs**    |     1.39 ms   |     2.16 ms   |
-| echo            | **545 µs**    |     1.53 ms   |     2.63 ms   |
-| large_response  | **1.04 ms**   |     2.46 ms   |     3.45 ms   |
+| scenario                  | roadrunner    | elli          | cowboy        |
+|---------------------------|--------------:|--------------:|--------------:|
+| `hello`                   |       254 k   |       272 k   |       181 k   |
+| `json`                    |       255 k   |       270 k   |       178 k   |
+| `echo`                    |       225 k   |    **269 k**  |       146 k   |
+| `headers_heavy`           |       210 k   |       240 k   |       125 k   |
+| `large_response`          |       103 k   |       114 k   |        90 k   |
+| `url_with_qs`             |   **247 k**   |          —    |       167 k   |
+| `varied_paths_router`     |   **239 k**   |          —    |       168 k   |
+| `cors_preflight`          |   **242 k**   |          —    |       162 k   |
+| `redirect_response`       |   **258 k**   |          —    |       176 k   |
+| `chunked_request_body`    |   **210 k**   |          —    |       129 k   |
+| `multi_request_body`      |       225 k   |       245 k   |       111 k   |
+| `expect_100_continue`     |   **130 k**   |          —    |        94 k   |
+| `large_post_streaming`    |  **14.6 k**   |          —    |       6.6 k   |
+| `cookies_heavy`           |   **234 k**   |          —    |       160 k   |
+| `etag_304`                |   **234 k**   |          —    |       169 k   |
+| `gzip_response`           |       105 k   |          —    |        96 k   |
+| `pipelined_h1`            |   **426 k**   |       4.9 k   |       331 k   |
+| `large_keepalive_session` |       227 k   |    **279 k**  |       175 k   |
+| `connection_storm`        |        46 k   |     **55 k**  |        46 k   |
+| `accept_storm_burst`      |        28 k   |     **35 k**  |        31 k   |
+| `websocket_msg_throughput`|   **214 k**   |          —    |       168 k   |
+| `backpressure_sustained`  |   **249 k**   |          —    |       182 k   |
 
-### p50 latency — typical request (lower = better)
+`—` means the elli test fixture doesn't support that scenario shape
+(no h2, no WebSocket, no gzip middleware, no router, no native qs
+parser, etc.). That's a real comparison point: if your workload
+needs any of these, elli isn't on the table.
 
-| scenario        | roadrunner    | elli          | cowboy        |
-|-----------------|--------------:|--------------:|--------------:|
-| hello           |  **90 µs**    |       112 µs  |       200 µs  |
-| echo            | **110 µs**    |       125 µs  |       282 µs  |
-| large_response  | **270 µs**    |       321 µs  |       455 µs  |
+### Throughput — req/s, HTTP/2 (higher = better)
+
+| scenario                   | roadrunner    | cowboy        |
+|----------------------------|--------------:|--------------:|
+| `hello`                    |       158 k   |       154 k   |
+| `json`                     |       155 k   |       138 k   |
+| `echo`                     |   **151 k**   |       101 k   |
+| `headers_heavy`            |   **146 k**   |        82 k   |
+| `multi_request_body`       |   **129 k**   |        29 k   |
+| `streaming_response`       |        57 k   |        56 k   |
+| `multi_stream_h2`          |       330 k   |       314 k   |
+| `small_chunked_response`   |       4.7 k   |       4.9 k   |
+| `tls_handshake_throughput` |       2.5 k   |     **3.0 k** |
+
+Multi-stream and basic-req h2 line up with the h1 picture — large
+wins on bigger headers/bodies, smaller wins on the simple paths. The
+two cowboy wins (`small_chunked_response`, `tls_handshake_throughput`)
+are documented honestly in
+[`docs/conn_lifecycle_investigation.md`](docs/conn_lifecycle_investigation.md).
+
+### Latency — p50 / p99 (lower = better)
+
+p50 / p99 numbers per scenario × server are in the full results
+file. Spot-checks from the same run:
+
+| scenario               | rr p50 / p99    | elli p50 / p99   | cowboy p50 / p99 |
+|------------------------|----------------:|-----------------:|-----------------:|
+| `hello`                | 135 µs / 1.75 ms| 122 µs / 1.82 ms | 208 µs / 2.44 ms |
+| `echo`                 | 157 µs / 1.77 ms| 129 µs / 1.57 ms | 269 µs / 2.44 ms |
+| `cookies_heavy`        | 153 µs / 1.57 ms|         —        | 244 µs / 2.43 ms |
+| `pipelined_h1`         |  97 µs / 0.73 ms| 10.3 ms / 10.6 ms| 127 µs / 0.82 ms |
+| `large_post_streaming` | 3.4 ms / 7.18 ms|         —        | 6.0 ms / 30.0 ms |
 
 ### Reading the numbers honestly
 
-- **The throughput gap with elli is small** and concentrated on the
-  bare-minimum `hello` scenario, where elli's lack of telemetry, drain,
-  hibernation, and slot tracking shows up as the cleanest possible
-  per-request path. On `echo` (router + body read) and `large_response`
-  the gap shrinks. Roadrunner's per-request feature surface is the
-  cost.
-- **p99 is the differentiator.** Roadrunner consistently delivers
-  2.5–3.5× lower tail latency than either alternative. On a
-  latency-sensitive workload, that's the dominant axis.
-- **Cowboy** trails on every axis here because its dual-process
+- **vs cowboy: roadrunner wins on most scenarios** by 25–60 % on
+  req/s with proportionally lower p50 / p99. The exceptions:
+  `connection_storm` and `accept_storm_burst` are ties (within
+  variance), and the h2 `small_chunked_response` /
+  `tls_handshake_throughput` cells are roadrunner-loses
+  (documented in
+  [`docs/conn_lifecycle_investigation.md`](docs/conn_lifecycle_investigation.md)).
+- **vs elli: a wash on simple hot-path GETs.** Elli's lack of
+  telemetry, drain, hibernation, and slot tracking shows up as up
+  to ~20 % more throughput on `hello` / `json` / `echo` /
+  `headers_heavy` / `large_response` / `large_keepalive_session`.
+  Add a router / cookie parse / gzip / pipeline / body stream /
+  h2 / WebSocket and elli either falls behind or drops out (no
+  support). Elli also still wins the connection-storm-shape
+  scenarios where the per-conn process model dominates.
+- **p99 is competitive but not dramatic.** Earlier README copy
+  claimed "2.5–3.5× lower p99" — that was measured on a 3 s
+  warmup + 3 s window where multi-millisecond outliers
+  under-counted. With the 2 s + 5 s settings used here,
+  roadrunner's p99 vs cowboy is typically 1.4–1.8× lower; vs elli
+  it's within 10 %.
+- **Cowboy trails on most axes here** because its dual-process
   pipeline (acceptor → connection → stream handlers) adds dispatch
-  overhead the simpler servers don't pay. It optimizes for HTTP/2 and
-  feature richness; benchmark numbers are the trade-off.
+  overhead the simpler servers don't pay. It optimizes for HTTP/2
+  feature richness and supervisor-tree visibility — the
+  trade-off shows on the bench.
 - **Numbers shift on real hardware.** Loopback hides NIC + kernel
   TCP cost. For a public comparison run against a remote host with
   `--clients` tuned to your CPU count.
@@ -318,16 +386,26 @@ numbers shift, relative ordering tends to hold.
 
 ### How to reproduce
 
+Single scenario:
+
 ```
 mise exec -- ./scripts/bench.escript --servers roadrunner,elli,cowboy \
-  --scenario hello --clients 50 --duration 3 --warmup 1
+  --scenario hello --clients 50 --duration 5 --warmup 2
 ```
 
 Run several times and take the median — the bench script's banner
 warns that single runs sit inside a ±15 % variance band on a
 loaded dev box. `scripts/bench.escript` also accepts `--profile`
-to dump an eprof hotspot table when you want to investigate a
-specific server.
+to dump an eprof or fprof hotspot table.
+
+Full matrix (all 35 scenarios × {h1, h2}, medians of 3 runs,
+regenerates `docs/bench_results.{md,csv}`):
+
+```
+./scripts/bench_matrix.sh
+```
+
+Override defaults via env: `RUNS=5 DURATION=10 ./scripts/bench_matrix.sh`.
 
 `scripts/bench.escript --protocol h2` drives the same scenarios
 over HTTP/2. The h2 loadgen is the in-tree pure-Erlang
@@ -342,15 +420,19 @@ directions on the same hardware before claiming a win.
 
 ### Picking a server
 
-- **Pick elli** if you need a small server, no fancy lifecycle, and
-  you care about absolute throughput more than tail latency.
+- **Pick elli** if you need only the simplest GET hot path with
+  zero modern features and care about the last 6–15 % of throughput
+  more than RFC coverage / drain / telemetry / pipelining / gzip /
+  h2 / WebSocket.
 - **Pick cowboy** if you need sub-protocols beyond what roadrunner
   ships, or you're already in an ecosystem where it's the lingua
-  franca.
+  franca. Roadrunner beats it on every common scenario in this
+  bench.
 - **Pick roadrunner** if you want a small surface, queryable
-  per-request state, drain + telemetry built in, low p99, h2spec-
-  compliant HTTP/2, and you can tolerate ~20 % less peak HTTP/1.1
-  throughput than elli (and the POC status — see "Status" above).
+  per-request state, drain + telemetry built in, RFC-9110/9112/9113
+  coverage, h2spec-compliant HTTP/2, Autobahn-strict WebSocket, and
+  the throughput / p99 numbers above (and the POC status — see
+  "Status" above).
 
 ## Design philosophy
 
