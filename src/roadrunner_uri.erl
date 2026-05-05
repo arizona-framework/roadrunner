@@ -5,7 +5,11 @@ URI percent-encoding helpers (RFC 3986 §2.1).
 Pure binary in / binary out. Used by `roadrunner_qs` and the eventual router.
 """.
 
+-on_load(init_patterns/0).
+
 -export([percent_decode/1, percent_encode/1]).
+
+-define(PERCENT_CP_KEY, {?MODULE, percent_cp}).
 
 -doc """
 Decode a percent-encoded binary.
@@ -16,7 +20,16 @@ exactly two hex digits — including a lone `%` at end of input.
 """.
 -spec percent_decode(binary()) -> {ok, binary()} | {error, badarg}.
 percent_decode(Bin) when is_binary(Bin) ->
-    decode(Bin, <<>>).
+    %% Fast path: no `%` means no decoding needed — return the
+    %% original binary untouched. The compiled-pattern `match/2`
+    %% scans once; the original `decode/2` walks AND copies every
+    %% byte even when the binary is `%`-free, so this avoids the
+    %% byte-by-byte reconstruction cost on the typical input
+    %% (form fields with safe ASCII keys/values, paths, etc.).
+    case binary:match(Bin, persistent_term:get(?PERCENT_CP_KEY)) of
+        nomatch -> {ok, Bin};
+        _ -> decode(Bin, <<>>)
+    end.
 
 -spec decode(binary(), binary()) -> {ok, binary()} | {error, badarg}.
 decode(<<>>, Acc) ->
@@ -80,3 +93,14 @@ is_unreserved(_) -> false.
 -spec hex_digit(0..15) -> byte().
 hex_digit(N) when N < 10 -> $0 + N;
 hex_digit(N) -> $A + N - 10.
+
+%% `-on_load` callback. Compiles the percent trigger pattern once
+%% at module load and stashes it in `persistent_term`, so the
+%% `percent_decode/1` fast-path scans with a precompiled binary
+%% pattern instead of building one per call. Conventional shape
+%% across the codebase (see `roadrunner_compress`,
+%% `roadrunner_http1`, `roadrunner_ws`).
+-spec init_patterns() -> ok.
+init_patterns() ->
+    persistent_term:put(?PERCENT_CP_KEY, binary:compile_pattern(~"%")),
+    ok.
