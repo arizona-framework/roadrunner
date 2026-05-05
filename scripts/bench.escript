@@ -59,7 +59,8 @@ main(Args) ->
     Opts0 = parse_args(Args),
     ProjectDir = project_dir(),
     ok = setup_code_paths(ProjectDir),
-    Opts = preflight_protocol(Opts0),
+    Opts1 = preflight_protocol(Opts0),
+    Opts = preflight_scenario(Opts1),
     print_header(Opts),
     %% Each side runs in isolation: bring the server up, drive load,
     %% bring it down, then do the next. Order matches the user's
@@ -79,6 +80,25 @@ main(Args) ->
 %% request artifact that pushed us toward h2load was a server-side
 %% Nagle interaction; that's now fixed at the listener layer
 %% (`roadrunner_listener:base_listen_opts/0`).
+preflight_scenario(#{scenario := post_4kb_form, servers := Servers} = Opts) ->
+    %% elli has no native urlencoded parser; calling
+    %% `roadrunner_qs:parse/1` from the elli handler would bias the
+    %% comparison toward roadrunner. Filter elli out instead.
+    Filtered = [S || S <- Servers, S =/= elli],
+    case Filtered =/= Servers of
+        true ->
+            io:format(
+                "note: --scenario post_4kb_form — elli filtered out "
+                "(no native urlencoded body parser)~n",
+                []
+            );
+        false ->
+            ok
+    end,
+    Opts#{servers => Filtered};
+preflight_scenario(Opts) ->
+    Opts.
+
 preflight_protocol(#{protocol := h1} = Opts) ->
     Opts;
 preflight_protocol(#{protocol := h2, servers := Servers} = Opts) ->
@@ -145,7 +165,8 @@ cli() ->
                         pipelined_h1,
                         slow_client,
                         connection_storm,
-                        mixed_workload
+                        mixed_workload,
+                        post_4kb_form
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -209,6 +230,14 @@ cli() ->
                                     surfaces router-cache effects
                                     and gives an honest "average
                                     request" number.
+                    post_4kb_form:  POST /form with a 4 KB
+                                    `application/x-www-form-urlen-
+                                    coded` body. Exercises the
+                                    form-decode path
+                                    (`roadrunner_qs:parse/1` /
+                                    cowboy's `read_urlencoded_body`)
+                                    + body-read. elli filtered out
+                                    (no native urlencoded parser).
                     """
             },
             #{
@@ -576,7 +605,9 @@ scenario_roadrunner_opts(mixed_workload, BaseOpts) ->
         {~"/", roadrunner_keepalive_handler, undefined},
         {~"/json", roadrunner_bench_json_handler, undefined},
         {~"/large", roadrunner_bench_large_handler, undefined}
-    ]}.
+    ]};
+scenario_roadrunner_opts(post_4kb_form, BaseOpts) ->
+    BaseOpts#{routes => [{~"/form", roadrunner_bench_form_handler, undefined}]}.
 
 scenario_cowboy_routes(hello) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
@@ -605,7 +636,9 @@ scenario_cowboy_routes(mixed_workload) ->
             {"/json", roadrunner_bench_cowboy_json_handler, []},
             {"/large", roadrunner_bench_cowboy_large_handler, []}
         ]}
-    ].
+    ];
+scenario_cowboy_routes(post_4kb_form) ->
+    [{'_', [{"/form", roadrunner_bench_cowboy_form_handler, []}]}].
 
 %% Inherit the parent's code path so the peer sees both default- and
 %% test-profile artifacts (cowboy lives under test).
@@ -992,6 +1025,21 @@ build_request(multi_stream_h2) ->
         "error: --scenario multi_stream_h2 is h2-only "
         "(use --protocol h2)~n", []),
     halt(2);
+build_request(post_4kb_form) ->
+    %% 4 KB urlencoded body — see `post_4kb_form_body/0` for shape.
+    %% Predictable parse cost (ASCII letters/digits only, no
+    %% percent-decoding) so the bench measures qs-tokenization and
+    %% pair-split, not URL decoding.
+    Body = post_4kb_form_body(),
+    BodyLen = byte_size(Body),
+    BodyLenBin = integer_to_binary(BodyLen),
+    <<"POST /form HTTP/1.1\r\n",
+        "Host: x\r\n",
+        "Content-Type: application/x-www-form-urlencoded\r\n",
+        "Content-Length: ",
+        BodyLenBin/binary,
+        "\r\n\r\n",
+        Body/binary>>;
 build_request(headers_heavy) ->
     %% 16 small request headers + the Host. Names are valid h1
     %% tokens (lowercase ASCII); values are short. Same path as
@@ -1026,7 +1074,35 @@ expected_body_len(echo) -> ?ECHO_BODY_SIZE;
 expected_body_len(large_response) -> ?LARGE_BODY_SIZE;
 expected_body_len(json) -> 115;
 expected_body_len(headers_heavy) -> 7;
-expected_body_len(streaming_response) -> 16384.
+expected_body_len(streaming_response) -> 16384;
+expected_body_len(post_4kb_form) ->
+    %% Response is the integer pair-count rendered as decimal —
+    %% computed from the body so the bench stays in sync if the
+    %% body shape changes.
+    Pairs = post_4kb_form_pair_count(),
+    byte_size(integer_to_binary(Pairs)).
+
+%% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
+%% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
+%% bytes. ASCII-only so qs:parse never enters percent-decode.
+-define(POST_FORM_PAIRS, 128).
+-define(POST_FORM_VALUE,
+    ~"abcdefghijklmnopqrstuvwxyz0"
+).
+
+post_4kb_form_pair_count() -> ?POST_FORM_PAIRS.
+
+post_4kb_form_body() ->
+    Pairs = [
+        <<"k", (pad3(N))/binary, "=", ?POST_FORM_VALUE/binary>>
+     || N <- lists:seq(1, ?POST_FORM_PAIRS)
+    ],
+    iolist_to_binary(lists:join(~"&", Pairs)).
+
+%% 3-digit zero-padded decimal: 1 → ~"001", 128 → ~"128".
+pad3(N) when N < 10 -> <<"00", (integer_to_binary(N))/binary>>;
+pad3(N) when N < 100 -> <<"0", (integer_to_binary(N))/binary>>;
+pad3(N) -> integer_to_binary(N).
 
 collect(Pid, TimeoutMs) ->
     receive
@@ -1226,6 +1302,14 @@ h2_request_shape(mixed_workload) ->
         "error: --scenario mixed_workload is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(post_4kb_form) ->
+    %% h2 form-decode is a meaningful follow-up but out of scope
+    %% for this scenario, which targets the h1 body-read +
+    %% qs:parse path under realistic body sizes.
+    io:format(standard_error,
+        "error: --scenario post_4kb_form is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -1401,7 +1485,9 @@ scenario_request_summary(slow_client) ->
 scenario_request_summary(connection_storm) ->
     "GET / HTTP/1.1 + Connection: close, fresh conn per request (handler)";
 scenario_request_summary(mixed_workload) ->
-    "Random pick per request from {GET /, GET /json, GET /large} on keep-alive (router)".
+    "Random pick per request from {GET /, GET /json, GET /large} on keep-alive (router)";
+scenario_request_summary(post_4kb_form) ->
+    "POST /form HTTP/1.1, 4 KB application/x-www-form-urlencoded body (router)".
 
 result_to_row(Side, #{
     total := Total,
