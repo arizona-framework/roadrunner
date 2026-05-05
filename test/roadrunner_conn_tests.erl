@@ -1288,6 +1288,17 @@ consume_state_next_chunk_bad_chunk_test() ->
         roadrunner_conn:consume_body_state(State, next_chunk)
     ).
 
+join_drain_group_undefined_listener_test() ->
+    ?assertEqual(ok, roadrunner_conn:join_drain_group(undefined, enabled)),
+    ?assertEqual(ok, roadrunner_conn:join_drain_group(undefined, disabled)).
+
+join_drain_group_disabled_skips_pg_test() ->
+    %% `disabled` short-circuits without touching pg, even when a
+    %% real listener name is supplied. Verifies the opt-out path
+    %% callers use to skip per-conn pg overhead on short-lived
+    %% workloads.
+    ?assertEqual(ok, roadrunner_conn:join_drain_group(some_listener, disabled)).
+
 consume_state_next_chunk_for_content_length_drains_fully_test() ->
     %% Non-chunked framing: `next_chunk` drains the full body in one
     %% shot — there are no chunk boundaries to honor.

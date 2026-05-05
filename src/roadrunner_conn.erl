@@ -35,7 +35,7 @@ read it anyway.
     try_acquire_slot/1,
     release_slot/1,
     consume_body_state/2,
-    join_drain_group/1
+    join_drain_group/2
 ]).
 %% Internal helpers shared with `roadrunner_conn_loop`. Marked `-doc false`
 %% individually so they stay invisible to the public API surface but
@@ -86,6 +86,13 @@ read it anyway.
     minimum_bytes_per_second := non_neg_integer(),
     body_buffering := auto | manual,
     listener_name => atom(),
+    %% When `disabled`, conns skip the per-process `pg:join` into
+    %% `{roadrunner_drain, ListenerName}`. The drain group is the
+    %% mechanism `roadrunner_listener:drain/2` uses to broadcast
+    %% `{roadrunner_drain, Deadline}` to in-flight conns; loop /
+    %% SSE / WebSocket handlers depend on it. Short-lived h1
+    %% workloads can opt out for ~10% lower per-conn overhead.
+    drain_group => enabled | disabled,
     %% When `true`, the conn dispatch forks to `roadrunner_conn_loop_http2`
     %% if the post-handshake ALPN selection landed on `h2`. Default
     %% `false` (HTTP/1.1 only).
@@ -134,10 +141,12 @@ application, the scope is absent and the join is silently skipped
 Called by `roadrunner_conn_loop:init_loop/3` after the conn process
 starts but before it accepts any work.
 """.
--spec join_drain_group(atom()) -> ok.
-join_drain_group(undefined) ->
+-spec join_drain_group(atom(), enabled | disabled) -> ok.
+join_drain_group(_Name, disabled) ->
     ok;
-join_drain_group(Name) ->
+join_drain_group(undefined, _) ->
+    ok;
+join_drain_group(Name, enabled) ->
     case whereis(pg) of
         undefined -> ok;
         _ -> pg:join({roadrunner_drain, Name}, self())
