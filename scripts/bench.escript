@@ -96,6 +96,9 @@ preflight_scenario(#{scenario := gzip_response, servers := Servers} = Opts) ->
 preflight_scenario(#{scenario := backpressure_sustained, servers := Servers} = Opts) ->
     filter_servers(backpressure_sustained, [elli], Servers, Opts,
         ~"no max_connections cap; comparison would not be apples-to-apples");
+preflight_scenario(#{scenario := server_sent_events, servers := Servers} = Opts) ->
+    filter_servers(server_sent_events, [elli], Servers, Opts,
+        ~"no equivalent loop handler in our test fixture");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -184,7 +187,8 @@ cli() ->
                         router_404_storm,
                         varied_paths_router,
                         gzip_response,
-                        backpressure_sustained
+                        backpressure_sustained,
+                        server_sent_events
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -305,6 +309,19 @@ cli() ->
                                     max_connections; elli has no
                                     cap so filtered out for
                                     apples-to-apples.
+                    server_sent_events:
+                                    h1-only. GET /sse opens a
+                                    text/event-stream session; the
+                                    server emits 100 small `tick`
+                                    events as fast as possible then
+                                    closes. One bench iteration =
+                                    one SSE session. Tests the
+                                    {loop, ...} response path,
+                                    handle_info dispatch, and the
+                                    drain group (loop handlers are
+                                    the one feature pg:join enables).
+                                    elli filtered out (different
+                                    handler shape).
                     """
             },
             #{
@@ -697,6 +714,8 @@ scenario_roadrunner_opts(backpressure_sustained, BaseOpts) ->
         handler => roadrunner_keepalive_handler,
         max_clients => 50
     };
+scenario_roadrunner_opts(server_sent_events, BaseOpts) ->
+    BaseOpts#{routes => [{~"/sse", roadrunner_bench_sse_handler, undefined}]};
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -756,7 +775,9 @@ scenario_cowboy_routes(varied_paths_router) ->
 scenario_cowboy_routes(gzip_response) ->
     [{'_', [{"/gzip", roadrunner_bench_cowboy_gzip_handler, []}]}];
 scenario_cowboy_routes(backpressure_sustained) ->
-    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}].
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
+scenario_cowboy_routes(server_sent_events) ->
+    [{'_', [{"/sse", roadrunner_bench_cowboy_sse_handler, []}]}].
 
 %% Per-scenario cowboy TransportOpts. The default keeps the bench's
 %% prior shape (`num_acceptors => 10`); `backpressure_sustained`
@@ -809,6 +830,21 @@ run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
 run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
     run_phase_h2(Port, Opts, DurationMs).
 
+run_phase_h1(
+    Port, #{clients := C, host := Host, scenario := server_sent_events}, DurationMs
+) ->
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    Self = self(),
+    StartUs = erlang:monotonic_time(microsecond),
+    Workers = [
+        spawn_link(fun() ->
+            Self ! {self(), sse_worker(Host, Port, Deadline, init_acc())}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
+    EndUs = erlang:monotonic_time(microsecond),
+    aggregate(PerWorker, EndUs - StartUs);
 run_phase_h1(
     Port, #{clients := C, host := Host, scenario := varied_paths_router}, DurationMs
 ) ->
@@ -1122,6 +1158,66 @@ router_404_storm_one(Host, Port) ->
                 {error, _} = E ->
                     _ = gen_tcp:close(Sock),
                     E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+%% server_sent_events: per iteration, open a fresh conn, send a
+%% GET /sse, drain the chunked-encoded SSE stream until the server
+%% closes (after 100 events), then loop. Each iteration counts as
+%% one OK; the bench's "req/s" is therefore "SSE-sessions/s" — each
+%% session encompasses 100 events, so total event throughput is
+%% req/s × 100.
+sse_request() ->
+    ~"GET /sse HTTP/1.1\r\nHost: x\r\n\r\n".
+
+sse_worker(Host, Port, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Acc;
+        false ->
+            T0 = erlang:monotonic_time(nanosecond),
+            case sse_one(Host, Port) of
+                {ok, Bytes} ->
+                    T1 = erlang:monotonic_time(nanosecond),
+                    sse_worker(
+                        Host, Port, Deadline, bump_ok(Acc, T1 - T0, Bytes)
+                    );
+                {error, _} ->
+                    sse_worker(Host, Port, Deadline, bump_err(Acc))
+            end
+    end.
+
+sse_one(Host, Port) ->
+    case gen_tcp:connect(Host, Port, [binary, {active, false}, {nodelay, true}], 5000) of
+        {ok, Sock} ->
+            case gen_tcp:send(Sock, sse_request()) of
+                ok ->
+                    Result = sse_drain(Sock, <<>>, 0),
+                    _ = gen_tcp:close(Sock),
+                    Result;
+                {error, _} = E ->
+                    _ = gen_tcp:close(Sock),
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+%% Drain until the peer closes — that's the terminating signal for
+%% an SSE session in this fixture (server emits 100 events then
+%% closes). Validate status 200 once headers are seen; total bytes
+%% read is reported back to the bench's accumulator.
+sse_drain(Sock, Buf, Bytes) ->
+    case gen_tcp:recv(Sock, 0, 5000) of
+        {ok, Data} ->
+            NewBuf = <<Buf/binary, Data/binary>>,
+            sse_drain(Sock, NewBuf, Bytes + byte_size(Data));
+        {error, closed} ->
+            case Buf of
+                <<"HTTP/1.1 200", _/binary>> -> {ok, Bytes};
+                _ -> {error, bad_status}
             end;
         {error, _} = E ->
             E
@@ -1695,6 +1791,14 @@ h2_request_shape(backpressure_sustained) ->
         "error: --scenario backpressure_sustained is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(server_sent_events) ->
+    %% h2 SSE works (RFC 8441 + chunked-frame DATA) but the
+    %% bench-client side hasn't been wired for streaming response
+    %% reads. Out of scope for now.
+    io:format(standard_error,
+        "error: --scenario server_sent_events is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -1882,7 +1986,9 @@ scenario_request_summary(varied_paths_router) ->
 scenario_request_summary(gzip_response) ->
     "GET /gzip HTTP/1.1 + Accept-Encoding: gzip, 16 KB JSON in / ~200 B out (router + compress)";
 scenario_request_summary(backpressure_sustained) ->
-    "GET / HTTP/1.1, server capped at 50 concurrent slots, --clients exceeds cap (handler)".
+    "GET / HTTP/1.1, server capped at 50 concurrent slots, --clients exceeds cap (handler)";
+scenario_request_summary(server_sent_events) ->
+    "GET /sse HTTP/1.1, 100 SSE events per session then close (router; counts session, not events)".
 
 result_to_row(Side, #{
     total := Total,
