@@ -160,3 +160,69 @@ without the fprof survey.
 **Lesson for future investigations:** profile first, fix second.
 The 5 µs/conn cost guess from the prior session was off by an order
 of magnitude — the actual cost was 60+ µs/conn, all in one place.
+
+## Round 2 — WebSocket throughput
+
+`websocket_msg_throughput` (1 KB masked text frames, 50 conns) was
+added in this round. Initial result: roadrunner 110K msgs/s vs
+cowboy 153K — a clear gap.
+
+### Findings (fprof, `--profile-tool fprof` on bench.escript)
+
+Two byte-at-a-time unmask paths in roadrunner, each ~30% of own
+time on the WS hot path:
+
+1. `roadrunner_ws:unmask/2` — unmasks the full frame payload in
+   `parse_payload`, server-side. Original implementation built an
+   iolist via cons-on-the-way-out then `iolist_to_binary`. Each
+   byte: `binary:at(MaskKey, I rem 4)` + `bxor` + cons + recursion
+   bookkeeping.
+2. `roadrunner_ws_session:unmask_slice/3` — unmasks an incremental
+   slice for early UTF-8 validation, called from
+   `early_validate_text/3` per frame fragment. Same byte-at-a-time
+   pattern.
+
+cowlib's `cow_ws:mask/3` processes 16 bytes per recursion (4 ×
+32-bit words) with a single `bxor` against a precomputed rotated
+32-bit mask. ~10× faster on 1 KB payloads.
+
+### Fix
+
+Both functions rewritten to mirror cowlib's pattern — 16 bytes per
+recursion, 32-bit XOR, bit-rotated mask key for non-zero offsets.
+Two commits:
+
+- `Unmask WS frames in 32-bit chunks instead of byte-at-a-time`
+  (`roadrunner_ws:unmask/2`)
+- `Unmask WS frame slices in 32-bit chunks instead of
+  byte-at-a-time` (`roadrunner_ws_session:unmask_slice/3` — adds a
+  test export + chunk-path unit tests for honest coverage).
+
+### Measured impact
+
+10×5s `websocket_msg_throughput` A/B at 50 clients:
+
+| Stage | Median (msgs/s) | Δ |
+|---|---|---|
+| Baseline | 110K | — |
+| After `roadrunner_ws:unmask` fix | 149K | +35% |
+| After `unmask_slice` fix (final) | **193K** | **+75%** total |
+
+Now beats cowboy (153K) by ~26% on the same scenario.
+
+### What's left
+
+Re-profile after the fixes shows ~40% of own time still in the two
+chunked unmask paths combined. The remaining cost is partly
+fundamental (1024 bytes XOR'd at 16 bytes/recursion is 64
+iterations + 64 binary appends) and partly the fact that
+**we unmask twice** for text frames: once for incremental UTF-8
+validation in `early_validate_text/3`, then again for the final
+payload in `roadrunner_ws:parse_payload/6`. Caching the
+already-unmasked bytes from the early-validation path so
+`parse_payload` doesn't re-unmask is a real optimization but
+crosses the `roadrunner_ws_session` ↔ `roadrunner_ws` module
+boundary — needs its own design pass. Deferred.
+
+Roadrunner currently leads cowboy on this scenario; pursuing more
+WS optimization without a fresh signal is gilding the lily.
