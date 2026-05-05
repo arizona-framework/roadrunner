@@ -192,7 +192,8 @@ cli() ->
                         gzip_response,
                         backpressure_sustained,
                         server_sent_events,
-                        expect_100_continue
+                        expect_100_continue,
+                        large_keepalive_session
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -338,6 +339,17 @@ cli() ->
                                     ferries the interim response.
                                     elli filtered out (no
                                     100-continue support in fixture).
+                    large_keepalive_session:
+                                    h1-only. Listener capped at
+                                    max_keep_alive_request => 1000;
+                                    bench worker reconnects on conn
+                                    close. Measures keep-alive
+                                    throughput including the
+                                    periodic reconnect tax. Tests
+                                    the per-conn-life cycle
+                                    completion path that single-
+                                    request `connection_storm`
+                                    can't reach.
                     """
             },
             #{
@@ -737,6 +749,14 @@ scenario_roadrunner_opts(expect_100_continue, BaseOpts) ->
     %% protocol-level interim 100 is handled automatically by
     %% `roadrunner_conn:maybe_send_continue/3`.
     BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
+scenario_roadrunner_opts(large_keepalive_session, BaseOpts) ->
+    %% Override the bench's default max_keep_alive_request => 1M
+    %% with a tight cap so each conn closes after ~1000 requests,
+    %% triggering reconnects within the bench duration.
+    BaseOpts#{
+        handler => roadrunner_keepalive_handler,
+        max_keep_alive_request => 1000
+    };
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -800,7 +820,9 @@ scenario_cowboy_routes(backpressure_sustained) ->
 scenario_cowboy_routes(server_sent_events) ->
     [{'_', [{"/sse", roadrunner_bench_cowboy_sse_handler, []}]}];
 scenario_cowboy_routes(expect_100_continue) ->
-    [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}].
+    [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}];
+scenario_cowboy_routes(large_keepalive_session) ->
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}].
 
 %% Per-scenario cowboy TransportOpts. The default keeps the bench's
 %% prior shape (`num_acceptors => 10`); `backpressure_sustained`
@@ -826,6 +848,8 @@ scenario_cowboy_proto_opts(gzip_response, Dispatch) ->
         max_keepalive => 1000000,
         stream_handlers => [cowboy_compress_h, cowboy_stream_h]
     };
+scenario_cowboy_proto_opts(large_keepalive_session, Dispatch) ->
+    #{env => #{dispatch => Dispatch}, max_keepalive => 1000};
 scenario_cowboy_proto_opts(_Scenario, Dispatch) ->
     #{env => #{dispatch => Dispatch}, max_keepalive => 1000000}.
 
@@ -853,6 +877,25 @@ run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
 run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
     run_phase_h2(Port, Opts, DurationMs).
 
+run_phase_h1(
+    Port, #{clients := C, host := Host, scenario := large_keepalive_session}, DurationMs
+) ->
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    Req = build_request(large_keepalive_session),
+    BodyLen = expected_body_len(large_keepalive_session),
+    Self = self(),
+    StartUs = erlang:monotonic_time(microsecond),
+    Workers = [
+        spawn_link(fun() ->
+            Self !
+                {self(),
+                    large_keepalive_worker(Host, Port, Req, BodyLen, Deadline, init_acc())}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
+    EndUs = erlang:monotonic_time(microsecond),
+    aggregate(PerWorker, EndUs - StartUs);
 run_phase_h1(
     Port, #{clients := C, host := Host, scenario := expect_100_continue}, DurationMs
 ) ->
@@ -1199,6 +1242,59 @@ router_404_storm_one(Host, Port) ->
             end;
         {error, _} = E ->
             E
+    end.
+
+%% large_keepalive_session: like the default keep_alive_loop, but
+%% on conn-close (the server hit its `max_keep_alive_request` cap)
+%% the worker reconnects and continues. Measures sustained
+%% throughput INCLUDING the periodic per-1000-req reconnect tax
+%% — a path single-request `connection_storm` and the default
+%% per-conn-fixed `keep_alive_loop` can't reach.
+large_keepalive_worker(Host, Port, Req, BodyLen, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Acc;
+        false ->
+            case gen_tcp:connect(Host, Port, [binary, {active, false}], 5000) of
+                {ok, Sock} ->
+                    Acc1 = large_keepalive_inner(Sock, Req, BodyLen, Deadline, Acc),
+                    ok = gen_tcp:close(Sock),
+                    %% Loop: open a fresh conn and keep going until
+                    %% the bench deadline. The ok-counter carries
+                    %% across reconnects.
+                    large_keepalive_worker(Host, Port, Req, BodyLen, Deadline, Acc1);
+                {error, _} ->
+                    bump_err(Acc)
+            end
+    end.
+
+%% Run requests on `Sock` until either the deadline elapses or the
+%% server closes (max_keep_alive_request). Conn-close mid-loop is
+%% NOT an error here — it's the expected end-of-conn signal.
+large_keepalive_inner(Sock, Req, BodyLen, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Acc;
+        false ->
+            T0 = erlang:monotonic_time(nanosecond),
+            case gen_tcp:send(Sock, Req) of
+                ok ->
+                    case recv_response(Sock, <<>>, BodyLen, 5000) of
+                        {ok, Bytes} ->
+                            T1 = erlang:monotonic_time(nanosecond),
+                            large_keepalive_inner(
+                                Sock, Req, BodyLen, Deadline,
+                                bump_ok(Acc, T1 - T0, Bytes)
+                            );
+                        {error, _} ->
+                            %% Conn closed by the server (max
+                            %% reached) — return to the outer
+                            %% loop which reconnects.
+                            Acc
+                    end;
+                {error, _} ->
+                    Acc
+            end
     end.
 
 %% expect_100_continue: keep-alive worker. Per iteration: send
@@ -1592,6 +1688,8 @@ build_request(gzip_response) ->
     ~"GET /gzip HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n";
 build_request(backpressure_sustained) ->
     ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+build_request(large_keepalive_session) ->
+    ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 build_request(post_4kb_form) ->
     %% 4 KB urlencoded body — see `post_4kb_form_body/0` for shape.
     %% Predictable parse cost (ASCII letters/digits only, no
@@ -1659,7 +1757,8 @@ expected_body_len(gzip_response) ->
     %% but each iteration's response fits in one TCP segment on
     %% loopback so this is moot in practice.
     50;
-expected_body_len(backpressure_sustained) -> 7.
+expected_body_len(backpressure_sustained) -> 7;
+expected_body_len(large_keepalive_session) -> 7.
 
 %% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
 %% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
@@ -1946,6 +2045,13 @@ h2_request_shape(expect_100_continue) ->
         "error: --scenario expect_100_continue is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(large_keepalive_session) ->
+    %% h2 has no per-conn-request count limit at the protocol layer
+    %% (per-stream limits are different); h1-only scenario.
+    io:format(standard_error,
+        "error: --scenario large_keepalive_session is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -2137,7 +2243,9 @@ scenario_request_summary(backpressure_sustained) ->
 scenario_request_summary(server_sent_events) ->
     "GET /sse HTTP/1.1, 100 SSE events per session then close (router; counts session, not events)";
 scenario_request_summary(expect_100_continue) ->
-    "POST /echo HTTP/1.1 + Expect: 100-continue, headers/100/body/200 cycle, 256-byte body (router)".
+    "POST /echo HTTP/1.1 + Expect: 100-continue, headers/100/body/200 cycle, 256-byte body (router)";
+scenario_request_summary(large_keepalive_session) ->
+    "GET / HTTP/1.1, server caps at 1000 reqs/conn, worker reconnects on close (handler)".
 
 result_to_row(Side, #{
     total := Total,
