@@ -137,6 +137,38 @@ workloads (server-side, large-POST upload patterns) before shipping.
 have to drain the new SETTINGS entry + early WINDOW_UPDATE in
 their handshake fixture).
 
+### Investigate small-body POST RSS gap
+
+**What:** A `--with-resources` survey (see `docs/resource_results.md`)
+shows roadrunner using **+51 % RSS** vs cowboy on `post_4kb_form` and
+**+17 %** on `echo` (256-byte body). The hot-path GETs and large-body
+streaming scenarios don't show this gap — only small-body POST.
+
+**Why deferred:** the likely cause is the per-request `body_state`
+machinery + manual-mode reader being allocated even for auto-mode
+small-body workloads. Investigation needs fprof under load to
+confirm the allocation site, then a targeted fix (e.g. lazy
+allocation of the body-state map / reader closures only when the
+handler opts into manual mode). Single most actionable resource
+finding from the survey.
+
+**Scope:** medium — fprof + targeted refactor + A/B precommit
+verification.
+
+### Automate `docs/resource_results.md` regeneration
+
+**What:** Extend `scripts/bench_matrix.sh` so it can pass
+`--with-resources` to every cell and emit a refreshed
+`docs/resource_results.md` alongside `bench_results.md`. Today the
+resource doc is hand-curated from a one-off survey.
+
+**Why deferred:** doable but ~80–120 LOC of awk/bash for the
+parser + emitter; the doc is checked-in snapshot-style and rarely
+needs full regeneration. Automating earns its keep once we're
+chasing a regression that needs frequent refresh.
+
+**Scope:** small.
+
 ### h2 manual-mode body reading
 
 **What:** Parity with the h1 manual-mode body reader for h2 streams

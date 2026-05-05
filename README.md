@@ -279,7 +279,9 @@ tends to hold.
 
 A representative cross-section. The full per-protocol tables
 (including per-server p50 / p99) live in
-[`docs/bench_results.md`](docs/bench_results.md).
+[`docs/bench_results.md`](docs/bench_results.md). Memory + CPU
+shape per scenario lives in
+[`docs/resource_results.md`](docs/resource_results.md).
 
 Bolded cells indicate the row's winner *and* a margin wider than
 ~15 % over the next-best (the bench's own variance band — see
