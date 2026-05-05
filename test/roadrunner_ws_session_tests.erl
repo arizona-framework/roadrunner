@@ -1448,13 +1448,26 @@ active_sink_loop(Logger, Tag, Script) ->
     end.
 
 collect_sends(Tag, Timeout) ->
-    collect_sends_loop(Tag, [], Timeout).
+    collect_sends_loop(Tag, [], Timeout, Timeout).
 
-collect_sends_loop(Tag, Acc, Timeout) ->
+%% Wait up to `InitialTimeout` for the FIRST message; after each
+%% received message wait up to `SettleMs` for the next one. Dropping
+%% the post-message wait to 0 (the prior shape) raced with the gen_statem's
+%% scheduling — when two echoes were emitted from a single `process_buffer`
+%% pass, the second `receive` could return `nothing queued yet` even
+%% though the second echo was milliseconds away. 50 ms is comfortably
+%% above the BEAM's reduction-budget gap on idle scheduling.
+collect_sends_loop(Tag, Acc, _InitialTimeout, SettleMs) when Acc =/= [] ->
     receive
-        {sent, Tag, Data} -> collect_sends_loop(Tag, [Data | Acc], 0)
-    after Timeout ->
+        {sent, Tag, Data} -> collect_sends_loop(Tag, [Data | Acc], SettleMs, SettleMs)
+    after SettleMs ->
         lists:reverse(Acc)
+    end;
+collect_sends_loop(Tag, [], InitialTimeout, SettleMs) ->
+    receive
+        {sent, Tag, Data} -> collect_sends_loop(Tag, [Data], InitialTimeout, SettleMs)
+    after InitialTimeout ->
+        []
     end.
 
 %% =============================================================================
