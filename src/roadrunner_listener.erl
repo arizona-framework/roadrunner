@@ -261,7 +261,24 @@ base_listen_opts() ->
     %% capping per-request latency at ~50 ms. h1 isn't affected
     %% (one `ssl:send/2` per response) but `nodelay` is the right
     %% default for any HTTP server.
-    [binary, {active, false}, {reuseaddr, true}, {packet, raw}, {nodelay, true}].
+    %%
+    %% `backlog` overrides OTP's default of 5. With 5, a burst of
+    %% concurrent connects (real apps, load tests, health-check
+    %% storms) overflows the kernel listen queue and the new SYNs
+    %% get dropped — `gen_tcp:connect` succeeds (kernel SYN-cookie
+    %% path), then the first `send` returns `{error, closed}`
+    %% because the conn was never queued for `accept`. Cowboy
+    %% defaults to 1024; matching that. Linux clamps at
+    %% `net.core.somaxconn` (typically 4096), so this is safely
+    %% non-truncated everywhere.
+    [
+        binary,
+        {active, false},
+        {reuseaddr, true},
+        {packet, raw},
+        {nodelay, true},
+        {backlog, 1024}
+    ].
 
 %% When `http2_enabled => true` and the user didn't supply their own
 %% `alpn_preferred_protocols`, advertise `h2` ahead of `http/1.1`.
