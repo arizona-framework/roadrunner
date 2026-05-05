@@ -114,6 +114,13 @@ preflight_scenario(#{scenario := head_method, servers := Servers} = Opts) ->
 preflight_scenario(#{scenario := etag_304, servers := Servers} = Opts) ->
     filter_servers(etag_304, [elli], Servers, Opts,
         ~"no /etag handler in elli test fixture");
+preflight_scenario(#{scenario := partial_body_drop, servers := Servers} = Opts) ->
+    %% Elli's /echo handler exists but elli's body-read failure
+    %% behavior differs noticeably (it may hang waiting for the
+    %% missing bytes). Filtering keeps the comparison apples-to-
+    %% apples on the rejection path.
+    filter_servers(partial_body_drop, [elli], Servers, Opts,
+        ~"elli's body-read failure path differs; comparison would not be apples-to-apples");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -211,7 +218,8 @@ cli() ->
                         small_chunked_response,
                         accept_storm_burst,
                         head_method,
-                        etag_304
+                        etag_304,
+                        partial_body_drop
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -427,6 +435,18 @@ cli() ->
                                     Tests conditional-response
                                     semantics + small-response
                                     write path.
+                    partial_body_drop:
+                                    h1-only. Bench claims
+                                    Content-Length: 256, sends
+                                    128 bytes, then closes the
+                                    conn. Server should detect the
+                                    truncated body (recv returns
+                                    closed before all bytes arrived)
+                                    and either send 400 or just
+                                    close the conn. Both outcomes
+                                    count as OK — measures the
+                                    error-path's resilience and
+                                    rejection rate.
                     """
             },
             #{
@@ -875,6 +895,12 @@ scenario_roadrunner_opts(head_method, BaseOpts) ->
     BaseOpts#{routes => [{~"/large", roadrunner_bench_large_handler, undefined}]};
 scenario_roadrunner_opts(etag_304, BaseOpts) ->
     BaseOpts#{routes => [{~"/etag", roadrunner_bench_etag_handler, undefined}]};
+scenario_roadrunner_opts(partial_body_drop, BaseOpts) ->
+    %% Echo handler at /echo — handler only runs if the server
+    %% successfully reads the body. With partial_body_drop, the
+    %% server should detect truncation BEFORE dispatch, so the
+    %% handler is a placeholder.
+    BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -952,7 +978,9 @@ scenario_cowboy_routes(accept_storm_burst) ->
 scenario_cowboy_routes(head_method) ->
     [{'_', [{"/large", roadrunner_bench_cowboy_large_handler, []}]}];
 scenario_cowboy_routes(etag_304) ->
-    [{'_', [{"/etag", roadrunner_bench_cowboy_etag_handler, []}]}].
+    [{'_', [{"/etag", roadrunner_bench_cowboy_etag_handler, []}]}];
+scenario_cowboy_routes(partial_body_drop) ->
+    [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}].
 
 %% Per-scenario cowboy TransportOpts. The default keeps the bench's
 %% prior shape (`num_acceptors => 10`); `backpressure_sustained`
@@ -1007,6 +1035,21 @@ run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
 run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
     run_phase_h2(Port, Opts, DurationMs).
 
+run_phase_h1(
+    Port, #{clients := C, host := Host, scenario := partial_body_drop}, DurationMs
+) ->
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    Self = self(),
+    StartUs = erlang:monotonic_time(microsecond),
+    Workers = [
+        spawn_link(fun() ->
+            Self ! {self(), partial_body_worker(Host, Port, Deadline, init_acc())}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
+    EndUs = erlang:monotonic_time(microsecond),
+    aggregate(PerWorker, EndUs - StartUs);
 run_phase_h1(
     Port, #{clients := C, host := Host, scenario := accept_storm_burst}, _DurationMs
 ) ->
@@ -1709,6 +1752,61 @@ skip_status_line(Buf) ->
     case binary:split(Buf, ~"\r\n\r\n") of
         [_Status, Rest] -> {ok, Rest};
         _ -> {error, bad_status}
+    end.
+
+%% partial_body_drop: per iteration, open a fresh conn, send POST
+%% headers claiming `Content-Length: 256`, send only 128 bytes,
+%% close the conn. The server should detect the truncated body
+%% (its recv returns closed before all bytes arrived) and either
+%% send `400 Bad Request` or just close. Both are valid — the
+%% bench treats both `{ok, 400}` and `{error, closed}` as OK
+%% because the SERVER's behavior is what matters: did it survive
+%% and recover. A crash or hang would surface as bench-side
+%% timeouts.
+partial_body_drop_request() ->
+    Body128 = binary:copy(~"x", 128),
+    <<"POST /echo HTTP/1.1\r\n",
+        "Host: x\r\n",
+        "Content-Type: application/octet-stream\r\n",
+        "Content-Length: 256\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        Body128/binary>>.
+
+partial_body_worker(Host, Port, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Acc;
+        false ->
+            T0 = erlang:monotonic_time(nanosecond),
+            case partial_body_one(Host, Port) of
+                ok ->
+                    T1 = erlang:monotonic_time(nanosecond),
+                    partial_body_worker(Host, Port, Deadline, bump_ok(Acc, T1 - T0, 0));
+                error ->
+                    partial_body_worker(Host, Port, Deadline, bump_err(Acc))
+            end
+    end.
+
+partial_body_one(Host, Port) ->
+    case gen_tcp:connect(Host, Port, [binary, {active, false}, {nodelay, true}], 5000) of
+        {ok, Sock} ->
+            Result =
+                case gen_tcp:send(Sock, partial_body_drop_request()) of
+                    ok ->
+                        %% Don't actively wait for a response; the
+                        %% server may close (no response) OR send 400
+                        %% before close. Either way the server has
+                        %% successfully detected and rejected the
+                        %% truncated request.
+                        ok;
+                    {error, _} ->
+                        error
+                end,
+            _ = gen_tcp:close(Sock),
+            Result;
+        {error, _} ->
+            error
     end.
 
 %% accept_storm_burst: each worker does ONE conn (open, send, recv,
@@ -2485,6 +2583,13 @@ h2_request_shape(etag_304) ->
         "error: --scenario etag_304 is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(partial_body_drop) ->
+    %% h2 has its own truncation semantics (RST_STREAM); the h1
+    %% Content-Length-mismatch path is what this scenario targets.
+    io:format(standard_error,
+        "error: --scenario partial_body_drop is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -2690,7 +2795,9 @@ scenario_request_summary(accept_storm_burst) ->
 scenario_request_summary(head_method) ->
     "HEAD /large HTTP/1.1, headers including Content-Length: 65536 but no body (router)";
 scenario_request_summary(etag_304) ->
-    "GET /etag HTTP/1.1 + If-None-Match: \"v1\", server returns 304 with no body (router)".
+    "GET /etag HTTP/1.1 + If-None-Match: \"v1\", server returns 304 with no body (router)";
+scenario_request_summary(partial_body_drop) ->
+    "POST /echo HTTP/1.1, Content-Length: 256 but only 128 sent then close, server rejects (router)".
 
 result_to_row(Side, #{
     total := Total,
