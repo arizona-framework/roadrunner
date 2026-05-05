@@ -142,7 +142,8 @@ cli() ->
                         headers_heavy,
                         streaming_response,
                         multi_stream_h2,
-                        pipelined_h1
+                        pipelined_h1,
+                        slow_client
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -181,6 +182,14 @@ cli() ->
                                     "more bytes left in buffer after
                                     one request completes" path
                                     (RFC 7230 §6.3.2 pipelining).
+                    slow_client:    h1-only. Request is split into 5
+                                    lines and drip-fed one line per
+                                    millisecond. Exercises the
+                                    parser's incremental-receive
+                                    path (multiple `gen_tcp:recv` /
+                                    `{tcp, _, Bytes}` cycles per
+                                    request) and recv-deadline
+                                    accounting.
                     """
             },
             #{
@@ -532,6 +541,11 @@ scenario_roadrunner_opts(multi_stream_h2, BaseOpts) ->
 scenario_roadrunner_opts(pipelined_h1, BaseOpts) ->
     %% Same handler as `hello` — pipelining is a wire-level
     %% client behavior; the server sees N requests in one buffer.
+    BaseOpts#{handler => roadrunner_keepalive_handler};
+scenario_roadrunner_opts(slow_client, BaseOpts) ->
+    %% Same handler as `hello` — slow_client is a wire-level
+    %% client behavior; the server sees a request arrive in
+    %% multiple chunks with delays between them.
     BaseOpts#{handler => roadrunner_keepalive_handler}.
 
 scenario_cowboy_routes(hello) ->
@@ -549,6 +563,8 @@ scenario_cowboy_routes(streaming_response) ->
 scenario_cowboy_routes(multi_stream_h2) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
 scenario_cowboy_routes(pipelined_h1) ->
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
+scenario_cowboy_routes(slow_client) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}].
 
 %% Inherit the parent's code path so the peer sees both default- and
@@ -575,6 +591,21 @@ run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
 run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
     run_phase_h2(Port, Opts, DurationMs).
 
+run_phase_h1(
+    Port, #{clients := C, host := Host, scenario := slow_client}, DurationMs
+) ->
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    Self = self(),
+    StartUs = erlang:monotonic_time(microsecond),
+    Workers = [
+        spawn_link(fun() ->
+            Self ! {self(), slow_client_worker(Host, Port, Deadline, init_acc())}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
+    EndUs = erlang:monotonic_time(microsecond),
+    aggregate(PerWorker, EndUs - StartUs);
 run_phase_h1(
     Port, #{clients := C, host := Host, scenario := pipelined_h1}, DurationMs
 ) ->
@@ -660,6 +691,77 @@ pipelined_h1_loop(Sock, Batch, Deadline, Acc) ->
                 {error, _} ->
                     bump_err(Acc)
             end
+    end.
+
+%% slow_client: a single h1 request is split into 5 lines and
+%% drip-fed one line per millisecond. Each `gen_tcp:send/2` lands
+%% in a separate TCP segment (loopback + small payload + `nodelay`
+%% on both sides) so the server's parser sees the request arrive
+%% incrementally — multiple recv cycles before the request is
+%% complete. That's a code path uniform-fast-keep-alive doesn't
+%% reach: most h1 servers buffer the whole request inside one recv
+%% on a fast LAN.
+-define(SLOW_CHUNK_DELAY_MS, 1).
+
+slow_client_chunks() ->
+    %% 5 chunks → 4 inter-chunk sleeps = 4 ms minimum send-time
+    %% per request. Body is identical to `hello` so the wire
+    %% comparison stays apples-to-apples.
+    [
+        ~"GET / HTTP/1.1\r\n",
+        ~"Host: x\r\n",
+        ~"User-Agent: roadrunner-bench-slow/1.0\r\n",
+        ~"Accept: */*\r\n",
+        ~"\r\n"
+    ].
+
+slow_client_worker(Host, Port, Deadline, Acc) ->
+    Chunks = slow_client_chunks(),
+    case gen_tcp:connect(Host, Port, [binary, {active, false}, {nodelay, true}], 5000) of
+        {ok, Sock} ->
+            Final = slow_client_loop(Sock, Chunks, Deadline, Acc),
+            ok = gen_tcp:close(Sock),
+            Final;
+        {error, _} ->
+            bump_err(Acc)
+    end.
+
+slow_client_loop(Sock, Chunks, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Acc;
+        false ->
+            T0 = erlang:monotonic_time(nanosecond),
+            case slow_send(Sock, Chunks) of
+                ok ->
+                    case recv_response(Sock, <<>>, 7, 5000) of
+                        {ok, Bytes} ->
+                            T1 = erlang:monotonic_time(nanosecond),
+                            slow_client_loop(
+                                Sock, Chunks, Deadline,
+                                bump_ok(Acc, T1 - T0, Bytes)
+                            );
+                        {error, _} ->
+                            bump_err(Acc)
+                    end;
+                {error, _} ->
+                    bump_err(Acc)
+            end
+    end.
+
+slow_send(_Sock, []) ->
+    ok;
+slow_send(Sock, [Last]) ->
+    %% No sleep after the last chunk — the request is complete and
+    %% the server should respond immediately.
+    gen_tcp:send(Sock, Last);
+slow_send(Sock, [Chunk | Rest]) ->
+    case gen_tcp:send(Sock, Chunk) of
+        ok ->
+            timer:sleep(?SLOW_CHUNK_DELAY_MS),
+            slow_send(Sock, Rest);
+        {error, _} = E ->
+            E
     end.
 
 %% Drain N back-to-back HTTP/1.1 responses from `Buf`. Each response
@@ -935,6 +1037,14 @@ h2_request_shape(pipelined_h1) ->
         "error: --scenario pipelined_h1 is h1-only "
         "(use --protocol h1; for h2 multiplexing see multi_stream_h2)~n", []),
     halt(2);
+h2_request_shape(slow_client) ->
+    %% Drip-feed semantics target the h1 byte-stream parser; h2's
+    %% framed wire format makes incremental delivery a different
+    %% (and less interesting) test.
+    io:format(standard_error,
+        "error: --scenario slow_client is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -1104,7 +1214,9 @@ scenario_request_summary(streaming_response) ->
 scenario_request_summary(multi_stream_h2) ->
     "GET / over h2 with 16 multiplexed streams in flight per conn (handler)";
 scenario_request_summary(pipelined_h1) ->
-    "GET / HTTP/1.1, 4 requests pipelined per send, 7-byte response body (handler)".
+    "GET / HTTP/1.1, 4 requests pipelined per send, 7-byte response body (handler)";
+scenario_request_summary(slow_client) ->
+    "GET / HTTP/1.1, request drip-fed in 5 chunks @ 1 ms each, 7-byte response (handler)".
 
 result_to_row(Side, #{
     total := Total,
