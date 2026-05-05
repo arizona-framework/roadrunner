@@ -47,10 +47,13 @@
 
 -define(LISTENER, roadrunner_stress_listener).
 
+-define(DEFAULT_PROTOCOL, h1).
+
 main(Args) ->
-    Opts = parse_args(Args),
+    Opts0 = parse_args(Args),
     ProjectDir = project_dir(),
     ok = setup_code_paths(ProjectDir),
+    Opts = preflight_protocol(Opts0),
     {Port, StopFn} = start_or_attach(Opts),
     Opts1 = Opts#{port => Port},
     print_header(Opts1),
@@ -132,6 +135,20 @@ cli() ->
                     "pipeline:   K requests per send on one conn.\n"
                     "sweep:      stepped load — runs keep_alive at increasing client\n"
                     "            counts (see --sweep-clients) and prints one table."
+            },
+            #{
+                name => protocol,
+                long => "-protocol",
+                type => {atom, [h1, h2]},
+                default => ?DEFAULT_PROTOCOL,
+                help =>
+                    "h1: HTTP/1.1 over plain TCP (default).\n"
+                    "h2: HTTP/2 over TLS with ALPN. Drives the listener via\n"
+                    "    `roadrunner_bench_client` (same h2 client the\n"
+                    "    bench script uses) — `pipeline` scenario is\n"
+                    "    rejected (h2 multiplexes streams over one conn);\n"
+                    "    `concurrent` opens a fresh TLS+h2 conn per\n"
+                    "    request, `keep_alive` and `sweep` reuse one."
             },
             #{
                 name => clients,
@@ -253,6 +270,41 @@ cli() ->
         ]
     }.
 
+%% Reject scenario combinations that don't make sense for the picked
+%% protocol; for h2, generate a one-shot test cert and stash its
+%% directory on Opts so the listener can find it.
+preflight_protocol(#{protocol := h1} = Opts) ->
+    Opts;
+preflight_protocol(#{protocol := h2, scenario := pipeline}) ->
+    io:format(standard_error,
+        "error: --scenario pipeline does not apply to --protocol h2 "
+        "(h2 multiplexes streams over a single connection — pipeline "
+        "is an h1-specific concept).~n", []),
+    halt(2);
+preflight_protocol(#{protocol := h2} = Opts) ->
+    {ok, _} = application:ensure_all_started(ssl),
+    Opts#{cert_dir => generate_test_cert()}.
+
+generate_test_cert() ->
+    Dir = string:trim(os:cmd("mktemp -d")),
+    Cmd = lists:flatten(io_lib:format(
+        "openssl req -x509 -newkey rsa:2048 -nodes -days 1 "
+        "-keyout ~s/key.pem -out ~s/cert.pem -subj /CN=localhost "
+        "2>/dev/null",
+        [Dir, Dir]
+    )),
+    [] = os:cmd(Cmd),
+    case
+        filelib:is_regular(Dir ++ "/cert.pem") andalso
+            filelib:is_regular(Dir ++ "/key.pem")
+    of
+        true ->
+            Dir;
+        false ->
+            io:format(standard_error, "error: openssl failed to generate test cert~n", []),
+            halt(2)
+    end.
+
 parse_args(Argv) ->
     Cli = cli(),
     ProgOpts = #{progname => "stress.escript"},
@@ -269,21 +321,38 @@ parse_args(Argv) ->
 %% Listener lifecycle (in-process unless --port given)
 %% ===========================================================================
 
-start_or_attach(#{detach_server := true}) ->
-    detach_server();
+start_or_attach(#{detach_server := true} = Opts) ->
+    detach_server(Opts);
 start_or_attach(#{port := Port}) when is_integer(Port) ->
     {Port, fun() -> ok end};
-start_or_attach(_Opts) ->
+start_or_attach(Opts) ->
     {ok, _} = application:ensure_all_started(roadrunner),
-    {ok, _} = roadrunner:start_listener(?LISTENER, #{
+    {ok, _} = roadrunner:start_listener(?LISTENER, listener_opts(Opts)),
+    Port = roadrunner_listener:port(?LISTENER),
+    {Port, fun() -> ok = roadrunner:stop_listener(?LISTENER) end}.
+
+%% Listener config — h1 (default) or h2 over TLS + ALPN.
+listener_opts(#{protocol := h2, cert_dir := CertDir}) ->
+    #{
+        port => 0,
+        tls => [
+            {certfile, CertDir ++ "/cert.pem"},
+            {keyfile, CertDir ++ "/key.pem"}
+        ],
+        http2_enabled => true,
+        handler => roadrunner_keepalive_handler,
+        keep_alive_timeout => 60000,
+        max_clients => 100000,
+        max_keep_alive_request => 1000000
+    };
+listener_opts(_) ->
+    #{
         port => 0,
         handler => roadrunner_keepalive_handler,
         keep_alive_timeout => 60000,
         max_clients => 10000,
         max_keep_alive_request => 1000000
-    }),
-    Port = roadrunner_listener:port(?LISTENER),
-    {Port, fun() -> ok = roadrunner:stop_listener(?LISTENER) end}.
+    }.
 
 %% ===========================================================================
 %% Detached server BEAM (OTP `peer` module)
@@ -296,7 +365,7 @@ start_or_attach(_Opts) ->
 %% `peer:stop/1` cleanly shuts the child down at end (also on parent
 %% exception via the `try ... after` wrapper in `main/1`).
 
-detach_server() ->
+detach_server(Opts) ->
     Args = pa_args_for_peer(),
     case
         peer:start_link(#{
@@ -307,7 +376,7 @@ detach_server() ->
         })
     of
         {ok, Peer, _Node} ->
-            ok = bring_up_listener(Peer),
+            ok = bring_up_listener(Peer, Opts),
             ListenerPort = peer:call(Peer, roadrunner_listener, port, [?LISTENER]),
             io:format("detached server: listening on port ~B~n", [ListenerPort]),
             {ListenerPort, fun() -> peer:stop(Peer) end};
@@ -316,17 +385,11 @@ detach_server() ->
             halt(1)
     end.
 
-bring_up_listener(Peer) ->
+bring_up_listener(Peer, Opts) ->
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [ssl]),
     {ok, _} = peer:call(Peer, application, ensure_all_started, [roadrunner]),
     {ok, _} = peer:call(Peer, roadrunner, start_listener, [
-        ?LISTENER,
-        #{
-            port => 0,
-            handler => roadrunner_keepalive_handler,
-            keep_alive_timeout => 60000,
-            max_clients => 100000,
-            max_keep_alive_request => 1000000
-        }
+        ?LISTENER, listener_opts(Opts)
     ]),
     ok.
 
@@ -340,17 +403,19 @@ pa_args_for_peer() ->
 %% Header / report
 %% ===========================================================================
 
-print_header(#{scenario := sweep, host := H, port := P}) ->
+print_header(#{scenario := sweep, protocol := Proto, host := H, port := P}) ->
     io:format("~nroadrunner stress~n"),
     io:format(
         "  scenario   : sweep~n"
+        "  protocol   : ~s~n"
         "  target     : ~s:~B~n",
-        [H, P]
+        [Proto, H, P]
     ),
     %% Per-step params are printed by run_sweep itself.
     io:nl();
 print_header(#{
     scenario := S,
+    protocol := Proto,
     clients := C,
     duration_s := D,
     warmup_s := W,
@@ -361,11 +426,12 @@ print_header(#{
     io:format("~nroadrunner stress~n"),
     io:format(
         "  scenario   : ~s~n"
+        "  protocol   : ~s~n"
         "  target     : ~s:~B~n"
         "  clients    : ~B~n"
         "  warmup     : ~Bs~n"
         "  duration   : ~Bs~n",
-        [S, H, P, C, W, D]
+        [S, Proto, H, P, C, W, D]
     ),
     case S of
         pipeline -> io:format("  pipeline K : ~B~n", [K]);
@@ -794,6 +860,10 @@ merge_buckets(A, B) ->
 %% Worker scenarios
 %% ===========================================================================
 
+worker_run(#{protocol := h2, scenario := concurrent} = Opts, Deadline) ->
+    worker_h2_concurrent(Opts, Deadline, init_acc());
+worker_run(#{protocol := h2, scenario := keep_alive} = Opts, Deadline) ->
+    worker_h2_keep_alive(Opts, Deadline);
 worker_run(#{scenario := concurrent} = Opts, Deadline) ->
     worker_concurrent(Opts, Deadline, init_acc());
 worker_run(#{scenario := keep_alive} = Opts, Deadline) ->
@@ -874,6 +944,71 @@ keep_alive_loop(Opts, Sock, Deadline, Acc) ->
                     end;
                 {error, Reason} ->
                     bump_err(Acc, {send, Reason})
+            end
+    end.
+
+%% --- h2 concurrent: fresh TLS+ALPN-h2 conn per request --------------------
+%%
+%% `roadrunner_bench_client` already handles preface + SETTINGS exchange +
+%% conn-level WINDOW_UPDATE bump. The wall-clock T0/T1 covers handshake +
+%% one HEADERS+DATA round-trip, so the latency reflects the full setup
+%% cost — exactly what `concurrent` measures for h1.
+
+worker_h2_concurrent(Opts, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true -> Acc;
+        false -> worker_h2_concurrent(Opts, Deadline, do_one_h2_close(Opts, Acc))
+    end.
+
+do_one_h2_close(#{host := Host, port := Port}, Acc) ->
+    T0 = erlang:monotonic_time(nanosecond),
+    case roadrunner_bench_client:open(Host, Port, h2) of
+        {ok, Conn} ->
+            case roadrunner_bench_client:request(Conn, ~"GET", ~"/", [], <<>>) of
+                {ok, 200, _RespHdrs, RespBody, _Conn1} ->
+                    _ = roadrunner_bench_client:close(Conn),
+                    T1 = erlang:monotonic_time(nanosecond),
+                    bump_ok(Acc, T1 - T0, 0, byte_size(RespBody));
+                {ok, Status, _, _, _} ->
+                    _ = roadrunner_bench_client:close(Conn),
+                    bump_err(Acc, {bad_status, Status});
+                {error, Reason} ->
+                    _ = roadrunner_bench_client:close(Conn),
+                    bump_err(Acc, {request, Reason})
+            end;
+        {error, Reason} ->
+            bump_err(Acc, {connect, Reason})
+    end.
+
+%% --- h2 keep_alive: persistent TLS+ALPN-h2 conn, sequential streams -------
+
+worker_h2_keep_alive(#{host := Host, port := Port}, Deadline) ->
+    case roadrunner_bench_client:open(Host, Port, h2) of
+        {ok, Conn} ->
+            Acc = h2_keep_alive_loop(Conn, Deadline, init_acc()),
+            _ = roadrunner_bench_client:close(Conn),
+            Acc;
+        {error, Reason} ->
+            bump_err(init_acc(), {connect, Reason})
+    end.
+
+h2_keep_alive_loop(Conn, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Acc;
+        false ->
+            T0 = erlang:monotonic_time(nanosecond),
+            case roadrunner_bench_client:request(Conn, ~"GET", ~"/", [], <<>>) of
+                {ok, 200, _RespHdrs, RespBody, Conn1} ->
+                    T1 = erlang:monotonic_time(nanosecond),
+                    h2_keep_alive_loop(
+                        Conn1, Deadline,
+                        bump_ok(Acc, T1 - T0, 0, byte_size(RespBody))
+                    );
+                {ok, Status, _, _, _} ->
+                    bump_err(Acc, {bad_status, Status});
+                {error, Reason} ->
+                    bump_err(Acc, {recv, Reason})
             end
     end.
 
