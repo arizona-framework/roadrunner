@@ -220,7 +220,8 @@ cli() ->
                         head_method,
                         etag_304,
                         partial_body_drop,
-                        cookies_heavy
+                        cookies_heavy,
+                        tls_handshake_throughput
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -456,6 +457,16 @@ cli() ->
                                     cookie-header parser hot path
                                     distinct from the raw header
                                     pipeline.
+                    tls_handshake_throughput:
+                                    h2-only. Per request, the
+                                    bench opens a fresh TLS+ALPN-h2
+                                    conn (full handshake), sends 1
+                                    GET, closes. Throughput is
+                                    dominated by the TLS handshake
+                                    cost — primarily a comparison
+                                    of `ssl`-app behavior across
+                                    servers (same cert; same
+                                    cipher suites; same OTP version).
                     """
             },
             #{
@@ -912,6 +923,8 @@ scenario_roadrunner_opts(partial_body_drop, BaseOpts) ->
     BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
 scenario_roadrunner_opts(cookies_heavy, BaseOpts) ->
     BaseOpts#{routes => [{~"/cookies", roadrunner_bench_cookies_handler, undefined}]};
+scenario_roadrunner_opts(tls_handshake_throughput, BaseOpts) ->
+    BaseOpts#{handler => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
     %% A real route table — even though the bench targets a
     %% non-matching path, populate /, /json, /large so the router
@@ -993,7 +1006,9 @@ scenario_cowboy_routes(etag_304) ->
 scenario_cowboy_routes(partial_body_drop) ->
     [{'_', [{"/echo", roadrunner_bench_cowboy_echo_handler, []}]}];
 scenario_cowboy_routes(cookies_heavy) ->
-    [{'_', [{"/cookies", roadrunner_bench_cowboy_cookies_handler, []}]}].
+    [{'_', [{"/cookies", roadrunner_bench_cowboy_cookies_handler, []}]}];
+scenario_cowboy_routes(tls_handshake_throughput) ->
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}].
 
 %% Per-scenario cowboy TransportOpts. The default keeps the bench's
 %% prior shape (`num_acceptors => 10`); `backpressure_sustained`
@@ -2188,6 +2203,12 @@ build_request(etag_304) ->
     ~"GET /etag HTTP/1.1\r\nHost: x\r\nIf-None-Match: \"v1\"\r\n\r\n";
 build_request(cookies_heavy) ->
     ~"GET /cookies HTTP/1.1\r\nHost: x\r\nCookie: session=abc123def456ghi789; user_id=42; theme=dark; lang=en-US; tz=America/Los_Angeles; tracker=prod-789xyz; campaign=spring-2026; ab_test=variant_b\r\n\r\n";
+build_request(tls_handshake_throughput) ->
+    %% h2-only scenario — handshake dominates, only meaningful over TLS.
+    io:format(standard_error,
+        "error: --scenario tls_handshake_throughput is h2-only "
+        "(use --protocol h2)~n", []),
+    halt(2);
 build_request(post_4kb_form) ->
     %% 4 KB urlencoded body — see `post_4kb_form_body/0` for shape.
     %% Predictable parse cost (ASCII letters/digits only, no
@@ -2370,6 +2391,21 @@ bump_err(#{err := E} = Acc) ->
 %% ===========================================================================
 
 run_phase_h2(
+    Port, #{clients := C, host := Host, scenario := tls_handshake_throughput}, DurationMs
+) ->
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    Self = self(),
+    StartUs = erlang:monotonic_time(microsecond),
+    Workers = [
+        spawn_link(fun() ->
+            Self ! {self(), tls_handshake_worker(Host, Port, Deadline, init_acc())}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
+    EndUs = erlang:monotonic_time(microsecond),
+    aggregate(PerWorker, EndUs - StartUs);
+run_phase_h2(
     Port, #{clients := C, host := Host, scenario := multi_stream_h2}, DurationMs
 ) ->
     Deadline = erlang:monotonic_time(millisecond) + DurationMs,
@@ -2402,6 +2438,37 @@ run_phase_h2(Port, #{clients := C, host := Host, scenario := Scenario}, Duration
     PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
     EndUs = erlang:monotonic_time(microsecond),
     aggregate(PerWorker, EndUs - StartUs).
+
+%% tls_handshake_throughput: open a fresh TLS+ALPN-h2 conn per
+%% iteration, do 1 GET, close. Throughput is dominated by the
+%% TLS handshake cost. Useful as a comparison baseline across
+%% servers that all use OTP `ssl` with the same cert + cipher
+%% suites.
+tls_handshake_worker(Host, Port, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Acc;
+        false ->
+            T0 = erlang:monotonic_time(nanosecond),
+            case roadrunner_bench_client:open(Host, Port, h2) of
+                {ok, Conn} ->
+                    case
+                        roadrunner_bench_client:request(Conn, ~"GET", ~"/", [], <<>>)
+                    of
+                        {ok, _Status, _Hdrs, _Body, Conn1} ->
+                            _ = roadrunner_bench_client:close(Conn1),
+                            T1 = erlang:monotonic_time(nanosecond),
+                            tls_handshake_worker(
+                                Host, Port, Deadline, bump_ok(Acc, T1 - T0, 0)
+                            );
+                        {error, _} ->
+                            _ = roadrunner_bench_client:close(Conn),
+                            tls_handshake_worker(Host, Port, Deadline, bump_err(Acc))
+                    end;
+                {error, _} ->
+                    tls_handshake_worker(Host, Port, Deadline, bump_err(Acc))
+            end
+    end.
 
 %% Number of concurrent streams in flight per `request_many/2`
 %% batch. Roadrunner advertises MAX_CONCURRENT_STREAMS=100; cowboy
@@ -2822,7 +2889,9 @@ scenario_request_summary(etag_304) ->
 scenario_request_summary(partial_body_drop) ->
     "POST /echo HTTP/1.1, Content-Length: 256 but only 128 sent then close, server rejects (router)";
 scenario_request_summary(cookies_heavy) ->
-    "GET /cookies HTTP/1.1, single Cookie header with 8 pairs, server parses all (router)".
+    "GET /cookies HTTP/1.1, single Cookie header with 8 pairs, server parses all (router)";
+scenario_request_summary(tls_handshake_throughput) ->
+    "GET / over h2, fresh TLS conn per request, TLS handshake dominates (handler)".
 
 result_to_row(Side, #{
     total := Total,
