@@ -10,6 +10,10 @@
 # isolated per side). This wrapper drives the full matrix and
 # writes the consolidated tables that ship under docs/.
 #
+# Requires bash 4+ (associative arrays + BASH_REMATCH `match[]`).
+# macOS ships /bin/bash 3.2 — install bash via brew and run
+# explicitly: `bash ./scripts/bench_matrix.sh`.
+#
 # Usage (from repo root):
 #
 #   ./scripts/bench_matrix.sh
@@ -22,6 +26,12 @@
 #   CLIENTS=50            # bench.escript --clients
 #   SKIP_BENCH=1          # reuse existing /tmp/bench_matrix.log
 #                         #   (regenerate the CSV + MD only)
+#
+# Drift note: the PROTOS / SCENARIOS arrays below MUST be kept in
+# sync with the `scenario_roadrunner_opts/2` clauses in
+# scripts/bench.escript and that script's `preflight_scenario/1`
+# h1-only / h2-only filters. Adding a scenario without updating
+# this list silently drops it from the rendered tables.
 #
 set -u
 
