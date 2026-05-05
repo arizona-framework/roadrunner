@@ -209,6 +209,65 @@ contributors:
 This is documented as a known gap. Pursuing more without an
 architectural lever returns null results inside variance.
 
+## Round 4 — `streaming_response` / `large_post_streaming` / `small_chunked_response` near-tie
+
+All three were within variance vs cowboy (51K/53K, 6.1K/6.4K, 5.0K/5.1K).
+fprof'd each looking for shared MFA hotspots.
+
+### Win: `roadrunner_conn:fill_n/3` — O(N²) → O(N)
+
+`large_post_streaming` fprof showed `fill_n/3` at 15.6 % of own time.
+The implementation accumulated recv chunks via `<<Buf/binary,
+More/binary>>` per recursion — each step reallocates the running
+buffer (cumulative O(N²) copy bytes for many small chunks).
+
+Rewrote with body recursion that conses each recv chunk onto an
+iolist on the way OUT, flattening once via `iolist_to_binary` at the
+end (O(N) total). No `lists:reverse` per `feedback_body_recursion`.
+
+A/B (3×5 s):
+
+| | Before (median) | After (median) | Δ |
+|---|---|---|---|
+| roadrunner | 11.7K req/s | **13.5K** | **+15 %** |
+| cowboy | ~6.1K | ~6.1K | unchanged |
+| Δ vs cowboy | +96 % | **+130 %** | — |
+
+Variance band on baseline was <1 % (11.67–11.77K), so the +15 % is
+unambiguously real.
+
+Same fix shape applies to `roadrunner_conn:read_body_until/3` (auto-
+mode body read) — same `<<Acc/binary, Data/binary>>` pattern.
+Tested but reverted: at the 4 KB body sizes our scenarios use, only
+~3 recv chunks per request, not enough to surface the O(N²) at
+bench scale. Kept as a known follow-up if a future scenario stresses
+larger auto-mode bodies.
+
+### Null results (reverted)
+
+- **`roadrunner_conn_loop_http2:try_send_data`/`send_data_chunks`**:
+  redundant `window_budget/2` call between the two functions.
+  Threading the value through saved one call per chunk; A/B on
+  `small_chunked_response` (100 chunks per response) was within
+  variance. Function is too cheap to register.
+- **`roadrunner_uri:percent_decode/1` slow-path run-based decoder**:
+  `binary:match` to the next `%`, slice the unchanged run as a
+  sub-binary, only individually process `%HH` triples. Structurally
+  better worst-case (O(L) vs O(L²) on long runs). A/B on
+  `path_with_unicode` was within variance because the URLs have
+  only 4-5 percent-encoded values — the slow path is too small a
+  slice of total request cost. Kept the fast-path (skip when no
+  `%`) but reverted the slow-path rewrite.
+
+### Outcome
+
+`streaming_response` h2: roadrunner now leads cowboy 54.9K vs
+52.8K (was tied). `large_post_streaming` h1: roadrunner doubles
+cowboy. `small_chunked_response` h2: still tied (no fixable
+hotspot found beyond the inevitable per-chunk message round-trip
+between stream worker and conn process — a structural property
+of the design).
+
 ## Round 2 — WebSocket throughput
 
 `websocket_msg_throughput` (1 KB masked text frames, 50 conns) was
