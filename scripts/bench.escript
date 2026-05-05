@@ -143,7 +143,8 @@ cli() ->
                         streaming_response,
                         multi_stream_h2,
                         pipelined_h1,
-                        slow_client
+                        slow_client,
+                        connection_storm
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -190,6 +191,15 @@ cli() ->
                                     `{tcp, _, Bytes}` cycles per
                                     request) and recv-deadline
                                     accounting.
+                    connection_storm:
+                                    h1-only. Open conn, do 1 GET /,
+                                    close, repeat. Exercises accept
+                                    / acceptor-pool dispatch / slot
+                                    acquire-release / TCP handshake
+                                    + teardown. Real-world target:
+                                    health-check probes (k8s, ELB),
+                                    short-lived CLI clients, HTTP-
+                                    as-RPC patterns.
                     """
             },
             #{
@@ -546,6 +556,10 @@ scenario_roadrunner_opts(slow_client, BaseOpts) ->
     %% Same handler as `hello` — slow_client is a wire-level
     %% client behavior; the server sees a request arrive in
     %% multiple chunks with delays between them.
+    BaseOpts#{handler => roadrunner_keepalive_handler};
+scenario_roadrunner_opts(connection_storm, BaseOpts) ->
+    %% Same handler as `hello` — connection_storm is a connection-
+    %% lifecycle test; per-request work is identical to `hello`.
     BaseOpts#{handler => roadrunner_keepalive_handler}.
 
 scenario_cowboy_routes(hello) ->
@@ -565,6 +579,8 @@ scenario_cowboy_routes(multi_stream_h2) ->
 scenario_cowboy_routes(pipelined_h1) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
 scenario_cowboy_routes(slow_client) ->
+    [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
+scenario_cowboy_routes(connection_storm) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}].
 
 %% Inherit the parent's code path so the peer sees both default- and
@@ -591,6 +607,21 @@ run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
 run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
     run_phase_h2(Port, Opts, DurationMs).
 
+run_phase_h1(
+    Port, #{clients := C, host := Host, scenario := connection_storm}, DurationMs
+) ->
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    Self = self(),
+    StartUs = erlang:monotonic_time(microsecond),
+    Workers = [
+        spawn_link(fun() ->
+            Self ! {self(), connection_storm_worker(Host, Port, Deadline, init_acc())}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
+    EndUs = erlang:monotonic_time(microsecond),
+    aggregate(PerWorker, EndUs - StartUs);
 run_phase_h1(
     Port, #{clients := C, host := Host, scenario := slow_client}, DurationMs
 ) ->
@@ -760,6 +791,48 @@ slow_send(Sock, [Chunk | Rest]) ->
         ok ->
             timer:sleep(?SLOW_CHUNK_DELAY_MS),
             slow_send(Sock, Rest);
+        {error, _} = E ->
+            E
+    end.
+
+%% connection_storm: per request, open a fresh TCP conn, send one
+%% GET /, recv the 7-byte response, close. Tests the accept /
+%% acceptor-pool dispatch / slot acquire-release / TCP teardown
+%% path — the metric ops care about for health-check probes (k8s
+%% readiness / ELB target-group), short-lived CLI clients, and
+%% HTTP-as-RPC patterns where keep-alive isn't in use.
+connection_storm_request() ->
+    ~"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".
+
+connection_storm_worker(Host, Port, Deadline, Acc) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Acc;
+        false ->
+            T0 = erlang:monotonic_time(nanosecond),
+            case connection_storm_one(Host, Port) of
+                {ok, Bytes} ->
+                    T1 = erlang:monotonic_time(nanosecond),
+                    connection_storm_worker(
+                        Host, Port, Deadline, bump_ok(Acc, T1 - T0, Bytes)
+                    );
+                {error, _} ->
+                    connection_storm_worker(Host, Port, Deadline, bump_err(Acc))
+            end
+    end.
+
+connection_storm_one(Host, Port) ->
+    case gen_tcp:connect(Host, Port, [binary, {active, false}, {nodelay, true}], 5000) of
+        {ok, Sock} ->
+            case gen_tcp:send(Sock, connection_storm_request()) of
+                ok ->
+                    Result = recv_response(Sock, <<>>, 7, 5000),
+                    _ = gen_tcp:close(Sock),
+                    Result;
+                {error, _} = E ->
+                    _ = gen_tcp:close(Sock),
+                    E
+            end;
         {error, _} = E ->
             E
     end.
@@ -1045,6 +1118,15 @@ h2_request_shape(slow_client) ->
         "error: --scenario slow_client is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
+h2_request_shape(connection_storm) ->
+    %% Per-request TLS handshake would dominate the measurement
+    %% and obscure the connection-lifecycle question. h2's design
+    %% point is keep-alive multiplexing — a "storm" of fresh h2
+    %% conns is anti-h2 and not a real-world workload.
+    io:format(standard_error,
+        "error: --scenario connection_storm is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
     %% literal-with-incremental-indexing path. After warmup these
@@ -1216,7 +1298,9 @@ scenario_request_summary(multi_stream_h2) ->
 scenario_request_summary(pipelined_h1) ->
     "GET / HTTP/1.1, 4 requests pipelined per send, 7-byte response body (handler)";
 scenario_request_summary(slow_client) ->
-    "GET / HTTP/1.1, request drip-fed in 5 chunks @ 1 ms each, 7-byte response (handler)".
+    "GET / HTTP/1.1, request drip-fed in 5 chunks @ 1 ms each, 7-byte response (handler)";
+scenario_request_summary(connection_storm) ->
+    "GET / HTTP/1.1 + Connection: close, fresh conn per request (handler)".
 
 result_to_row(Side, #{
     total := Total,
