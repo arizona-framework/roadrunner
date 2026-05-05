@@ -240,7 +240,7 @@ and the full HPACK decoding-error matrix.
 ## Comparison with cowboy and elli
 
 `scripts/bench.escript` runs the same loadgen against each server in
-its own peer BEAM. `scripts/bench_matrix.sh` drives all 35 scenarios
+its own peer BEAM. `scripts/bench_matrix.sh` drives 30+ scenarios
 across both protocols and writes the consolidated tables that ship
 in [`docs/bench_results.md`](docs/bench_results.md). Numbers below
 are the median of 3 runs at 50 concurrent clients on a single Linux
@@ -259,8 +259,8 @@ absolute numbers shift, relative ordering tends to hold.
 
 ### Throughput — req/s, HTTP/1.1 (higher = better)
 
-A representative cross-section. Full 35-scenario table including
-HTTP/2 and per-server p50/p99 lives in
+A representative cross-section. The full per-protocol tables
+(including per-server p50 / p99) live in
 [`docs/bench_results.md`](docs/bench_results.md).
 
 Bolded cells indicate the row's winner *and* a margin wider than
@@ -370,7 +370,7 @@ file. Spot-checks from the same run:
 | Per-conn process model         | tail-recursive `proc_lib` loop   | tail-recursive loop        | gen_server + stream handlers  |
 | Request lifecycle observable   | yes (`proc_lib:get_label/1`)     | no                         | partial                       |
 | Drain / graceful shutdown      | built-in (`pg`-broadcast)        | DIY                        | partial                       |
-| Telemetry                      | `telemetry` library, 12 events   | none (handler callbacks)   | `cowboy_metrics_h` opt-in     |
+| Telemetry                      | `telemetry` library, 10+ events  | none (handler callbacks)   | `cowboy_metrics_h` opt-in     |
 | Middleware shape               | continuation-passing             | `pre_request`/`post_request` callback | deprecated `(Req, Env)`/stream handlers |
 | Hibernation between requests   | `hibernate_after` works          | no                         | depends on stream handler     |
 | Default recv mode              | passive (`gen_tcp:recv`)         | passive (`gen_tcp:recv`)   | active (`{active, once}`)     |
@@ -397,8 +397,7 @@ warns that single runs sit inside a ±15 % variance band on a
 loaded dev box. `scripts/bench.escript` also accepts `--profile`
 to dump an eprof or fprof hotspot table.
 
-Full matrix (all 35 scenarios × {h1, h2}, medians of 3 runs,
-regenerates `docs/bench_results.{md,csv}`):
+Full matrix (regenerates `docs/bench_results.md`):
 
 ```
 ./scripts/bench_matrix.sh
