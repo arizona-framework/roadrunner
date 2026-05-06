@@ -64,30 +64,11 @@ for header-only requests).
 -spec from_headers([roadrunner_http2_hpack:header()], binary(), conn_info()) ->
     {ok, roadrunner_http1:request()} | {error, build_error()}.
 from_headers(Headers, Body, ConnInfo) ->
-    case partition(Headers, #{}, []) of
-        {error, _} = E ->
-            E;
-        {ok, Pseudo, Regular} ->
-            case validate_pseudo(Pseudo) of
-                {ok, Method, Scheme, Path, Authority} ->
-                    case check_banned(Regular) of
-                        ok ->
-                            {ok,
-                                build(
-                                    Method,
-                                    Scheme,
-                                    Path,
-                                    Authority,
-                                    Regular,
-                                    Body,
-                                    ConnInfo
-                                )};
-                        {error, _} = E ->
-                            E
-                    end;
-                {error, _} = E ->
-                    E
-            end
+    maybe
+        {ok, Pseudo, Regular} ?= partition(Headers, #{}, []),
+        {ok, Method, Scheme, Path, Authority} ?= validate_pseudo(Pseudo),
+        ok ?= check_banned(Regular),
+        {ok, build(Method, Scheme, Path, Authority, Regular, Body, ConnInfo)}
     end.
 
 %% Walk the decoded header list, collecting pseudo-headers (names
