@@ -7,7 +7,7 @@
 
 ![roadrunner logo](https://raw.githubusercontent.com/arizona-framework/roadrunner/main/assets/logo.jpg)
 
-Pure-Erlang HTTP/1.1 + HTTP/2 + WebSocket server for OTP 28+. **Beep beep.**
+Pure-Erlang HTTP/1.1 + HTTP/2 + WebSocket server for OTP 29+. **Beep beep.**
 
 Built ground-up via TDD as the HTTP backbone for the
 [arizona-framework](https://github.com/arizona-framework/arizona). The
@@ -15,6 +15,12 @@ user-facing API is a handler behaviour, request/response accessors,
 listener controls, and a handful of opt-in helpers (cookies, qs,
 multipart, SSE, WebSocket). RFC-correct parsing, modern OTP idioms
 throughout, and predictable per-connection lifecycle observability.
+
+## ⚠️ Requirements
+
+Roadrunner requires **OTP 29** (currently RC at the time of writing).
+Older OTPs won't compile, and the throughput numbers in the
+[performance section](#performance-at-a-glance) assume 29.
 
 ## Status
 
