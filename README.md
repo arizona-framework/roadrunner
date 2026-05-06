@@ -145,7 +145,8 @@ roadrunner:start_listener(my_listener, #{port => 8080, handler => hello_handler}
   symlink escape defenses.
 - TLS hardened defaults — TLS 1.2/1.3 only, `honor_cipher_order`,
   `client_renegotiation` off, AEAD-only ECDHE-or-1.3 ciphers filtered
-  through `ssl:filter_cipher_suites/2`, `x25519mlkem768` PQ hybrid first,
+  through `ssl:filter_cipher_suites/2`, OTP default `supported_groups`
+  (PQ-hybrid `x25519mlkem768` first when the OpenSSL build supports it),
   `early_data` disabled.
 - DoS bounds — `max_clients`, `max_content_length`,
   `minimum_bytes_per_second`, `request_timeout`, `keep_alive_timeout`,

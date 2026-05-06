@@ -58,13 +58,18 @@ default_tls_opts_signature_algs_excludes_sha1_test() ->
      || A <- Algs, is_tuple(A)
     ].
 
-default_tls_opts_supported_groups_starts_with_pq_hybrid_test() ->
+default_tls_opts_supported_groups_match_otp_default_test() ->
     {ok, _} = application:ensure_all_started(ssl),
-    {supported_groups, [First | _] = Groups} =
+    {supported_groups, Groups} =
         lists:keyfind(supported_groups, 1, roadrunner_transport:default_tls_opts()),
-    %% PQ-hybrid first per OTP default.
-    ?assertEqual(x25519mlkem768, First),
-    ?assert(lists:member(x25519, Groups)).
+    %% We pass `ssl:groups(default)` through verbatim, so the leading
+    %% group depends on the underlying OpenSSL build. Modern builds
+    %% (OpenSSL 3.5+) put `x25519mlkem768` (PQ hybrid) first; older
+    %% builds fall back to classical `x25519`. Either is acceptable —
+    %% asserting just `x25519` is present catches the only invariant
+    %% we rely on (a sane default of classical X25519 always available).
+    ?assert(lists:member(x25519, Groups)),
+    ?assertEqual(ssl:groups(default), Groups).
 
 apply_tls_defaults_with_empty_user_opts_returns_all_defaults_test() ->
     {ok, _} = application:ensure_all_started(ssl),
