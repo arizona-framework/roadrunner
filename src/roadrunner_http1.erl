@@ -589,32 +589,18 @@ a record, so callers don't need to include a header file.
         | conflicting_framing
         | missing_host}.
 parse_request(Bin) when is_binary(Bin) ->
-    case parse_request_line(Bin) of
-        {ok, Method, Target, Version, Rest} ->
-            case parse_headers(Rest) of
-                {ok, Headers, Rest2} ->
-                    case validate_host(Version, Headers) of
-                        ok ->
-                            Req = #{
-                                method => Method,
-                                target => Target,
-                                version => Version,
-                                headers => Headers,
-                                cached_decisions => compute_cached_decisions(Headers)
-                            },
-                            {ok, Req, Rest2};
-                        {error, _} = HostErr ->
-                            HostErr
-                    end;
-                {more, _} = More ->
-                    More;
-                {error, _} = Err ->
-                    Err
-            end;
-        {more, _} = More ->
-            More;
-        {error, _} = Err ->
-            Err
+    maybe
+        {ok, Method, Target, Version, Rest} ?= parse_request_line(Bin),
+        {ok, Headers, Rest2} ?= parse_headers(Rest),
+        ok ?= validate_host(Version, Headers),
+        Req = #{
+            method => Method,
+            target => Target,
+            version => Version,
+            headers => Headers,
+            cached_decisions => compute_cached_decisions(Headers)
+        },
+        {ok, Req, Rest2}
     end.
 
 %% RFC 9112 §3.2 / 7230 §5.4: HTTP/1.1 requests MUST include a Host
