@@ -579,7 +579,7 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, ListenerMws) ->
             false ->
                 roadrunner_middleware:compose(
                     ListenerMws ++ RouteMws,
-                    fun(R) -> Handler:handle(R) end
+                    fun Handler:handle/1
                 )
         end,
     Metadata = telemetry_metadata(Req),
