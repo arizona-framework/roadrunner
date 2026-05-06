@@ -512,10 +512,8 @@ do_drain(#state{listen_socket = LSocket, proto_opts = ProtoOpts} = State, Timeou
 %% to the mailbox check at the next keep-alive boundary.
 -spec notify_conns(term(), integer()) -> ok.
 notify_conns(Group, Deadline) ->
-    lists:foreach(
-        fun(Pid) -> Pid ! {roadrunner_drain, Deadline} end,
-        pg:get_members(Group)
-    ).
+    _ = [Pid ! {roadrunner_drain, Deadline} || Pid <- pg:get_members(Group)],
+    ok.
 
 %% Poll the active-clients atomics counter every 50ms (or whatever
 %% remains, if smaller) until it hits zero or the deadline expires.
@@ -529,10 +527,7 @@ wait_for_drain(Counter, Deadline, Group) ->
             Remaining = Deadline - erlang:monotonic_time(millisecond),
             case Remaining =< 0 of
                 true ->
-                    lists:foreach(
-                        fun(Pid) -> exit(Pid, shutdown) end,
-                        pg:get_members(Group)
-                    ),
+                    _ = [exit(Pid, shutdown) || Pid <- pg:get_members(Group)],
                     {timeout, N};
                 false ->
                     timer:sleep(min(50, Remaining)),
