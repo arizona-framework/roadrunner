@@ -165,33 +165,19 @@ decode_loop(<<>>, Ctx, _) ->
     {ok, [], Ctx};
 decode_loop(<<1:1, Rest/bitstring>>, Ctx, _UpdatesAllowed) ->
     %% 1xxxxxxx — Indexed Header Field. 7-bit integer prefix.
-    case decode_integer(7, Rest) of
-        {ok, 0, _} ->
-            {error, invalid_index};
-        {ok, Index, Rest1} ->
-            case lookup(Index, Ctx) of
-                {ok, Header} ->
-                    case decode_loop(Rest1, Ctx, false) of
-                        {ok, Tail, Ctx2} -> {ok, [Header | Tail], Ctx2};
-                        {error, _} = E -> E
-                    end;
-                {error, _} = E ->
-                    E
-            end;
-        {error, _} = E ->
-            E
+    maybe
+        {ok, Index, Rest1} ?= decode_integer(7, Rest),
+        {ok, Header} ?= lookup_indexed(Index, Ctx),
+        {ok, Tail, Ctx2} ?= decode_loop(Rest1, Ctx, false),
+        {ok, [Header | Tail], Ctx2}
     end;
 decode_loop(<<0:1, 1:1, Rest/bitstring>>, Ctx, _UpdatesAllowed) ->
     %% 01xxxxxx — Literal w/ Incremental Indexing.
-    case decode_literal(6, Rest, Ctx) of
-        {ok, Header, Rest1} ->
-            Ctx2 = insert(Header, Ctx),
-            case decode_loop(Rest1, Ctx2, false) of
-                {ok, Tail, Ctx3} -> {ok, [Header | Tail], Ctx3};
-                {error, _} = E -> E
-            end;
-        {error, _} = E ->
-            E
+    maybe
+        {ok, Header, Rest1} ?= decode_literal(6, Rest, Ctx),
+        Ctx2 = insert(Header, Ctx),
+        {ok, Tail, Ctx3} ?= decode_loop(Rest1, Ctx2, false),
+        {ok, [Header | Tail], Ctx3}
     end;
 decode_loop(<<0:1, 0:1, 1:1, _/bitstring>>, _Ctx, false) ->
     %% RFC 7541 §4.2: a Dynamic Table Size Update is only legal
@@ -214,59 +200,43 @@ decode_loop(<<0:1, 0:1, 0:1, 1:1, Rest/bitstring>>, Ctx, _UpdatesAllowed) ->
     %% Literal w/o Indexing on the decode side; the difference
     %% only matters to intermediaries that re-encode (RFC 7541
     %% §6.2.3 sensitive header field).
-    case decode_literal(4, Rest, Ctx) of
-        {ok, Header, Rest1} ->
-            case decode_loop(Rest1, Ctx, false) of
-                {ok, Tail, Ctx2} -> {ok, [Header | Tail], Ctx2};
-                {error, _} = E -> E
-            end;
-        {error, _} = E ->
-            E
+    maybe
+        {ok, Header, Rest1} ?= decode_literal(4, Rest, Ctx),
+        {ok, Tail, Ctx2} ?= decode_loop(Rest1, Ctx, false),
+        {ok, [Header | Tail], Ctx2}
     end;
 decode_loop(<<0:1, 0:1, 0:1, 0:1, Rest/bitstring>>, Ctx, _UpdatesAllowed) ->
     %% 0000xxxx — Literal w/o Indexing.
-    case decode_literal(4, Rest, Ctx) of
-        {ok, Header, Rest1} ->
-            case decode_loop(Rest1, Ctx, false) of
-                {ok, Tail, Ctx2} -> {ok, [Header | Tail], Ctx2};
-                {error, _} = E -> E
-            end;
-        {error, _} = E ->
-            E
+    maybe
+        {ok, Header, Rest1} ?= decode_literal(4, Rest, Ctx),
+        {ok, Tail, Ctx2} ?= decode_loop(Rest1, Ctx, false),
+        {ok, [Header | Tail], Ctx2}
     end.
 
 -spec decode_literal(pos_integer(), bitstring(), context()) ->
     {ok, header(), bitstring()} | {error, decode_error()}.
 decode_literal(PrefixBits, Bits, Ctx) ->
-    case decode_integer(PrefixBits, Bits) of
-        {ok, 0, AfterIdx} ->
-            %% New name.
-            case decode_string(AfterIdx) of
-                {ok, Name, AfterName} ->
-                    case validate_lower(Name) of
-                        ok ->
-                            case decode_string(AfterName) of
-                                {ok, Value, Rest} -> {ok, {Name, Value}, Rest};
-                                {error, _} = E -> E
-                            end;
-                        {error, _} = E ->
-                            E
-                    end;
-                {error, _} = E ->
-                    E
-            end;
-        {ok, NameIdx, AfterIdx} ->
-            case lookup(NameIdx, Ctx) of
-                {ok, {Name, _}} ->
-                    case decode_string(AfterIdx) of
-                        {ok, Value, Rest} -> {ok, {Name, Value}, Rest};
-                        {error, _} = E -> E
-                    end;
-                {error, _} = E ->
-                    E
-            end;
-        {error, _} = E ->
-            E
+    maybe
+        {ok, NameIdx, AfterIdx} ?= decode_integer(PrefixBits, Bits),
+        decode_literal_with_name(NameIdx, AfterIdx, Ctx)
+    end.
+
+-spec decode_literal_with_name(non_neg_integer(), bitstring(), context()) ->
+    {ok, header(), bitstring()} | {error, decode_error()}.
+decode_literal_with_name(0, AfterIdx, _Ctx) ->
+    %% New name — name + value both follow inline.
+    maybe
+        {ok, Name, AfterName} ?= decode_string(AfterIdx),
+        ok ?= validate_lower(Name),
+        {ok, Value, Rest} ?= decode_string(AfterName),
+        {ok, {Name, Value}, Rest}
+    end;
+decode_literal_with_name(NameIdx, AfterIdx, Ctx) ->
+    %% Indexed name — value follows inline.
+    maybe
+        {ok, {Name, _}} ?= lookup(NameIdx, Ctx),
+        {ok, Value, Rest} ?= decode_string(AfterIdx),
+        {ok, {Name, Value}, Rest}
     end.
 
 %% =============================================================================
@@ -393,27 +363,27 @@ encode_integer_continuation(I) ->
 -spec decode_string(bitstring()) ->
     {ok, binary(), bitstring()} | {error, decode_error()}.
 decode_string(<<H:1, Rest/bitstring>>) ->
-    case decode_integer(7, Rest) of
-        {ok, Len, AfterLen} ->
-            case AfterLen of
-                <<Body:Len/binary, Tail/binary>> ->
-                    case H of
-                        0 ->
-                            {ok, Body, Tail};
-                        1 ->
-                            case roadrunner_http2_hpack_huffman:decode(Body) of
-                                {ok, Decoded} -> {ok, Decoded, Tail};
-                                {error, _} -> {error, huffman_decode_error}
-                            end
-                    end;
-                _ ->
-                    {error, premature_end_of_block}
-            end;
-        {error, _} = E ->
-            E
+    maybe
+        {ok, Len, AfterLen} ?= decode_integer(7, Rest),
+        case AfterLen of
+            <<Body:Len/binary, Tail/binary>> ->
+                decode_string_body(H, Body, Tail);
+            _ ->
+                {error, premature_end_of_block}
+        end
     end;
 decode_string(_) ->
     {error, bad_string}.
+
+-spec decode_string_body(0..1, binary(), bitstring()) ->
+    {ok, binary(), bitstring()} | {error, huffman_decode_error}.
+decode_string_body(0, Body, Tail) ->
+    {ok, Body, Tail};
+decode_string_body(1, Body, Tail) ->
+    case roadrunner_http2_hpack_huffman:decode(Body) of
+        {ok, Decoded} -> {ok, Decoded, Tail};
+        {error, _} -> {error, huffman_decode_error}
+    end.
 
 %% Plain (non-Huffman) string emission. The encoder picks Huffman
 %% only when it shortens the output; for now we emit raw to keep
@@ -452,6 +422,15 @@ lookup(Idx, #hpack_ctx{table = Table}) ->
         undefined -> {error, invalid_index};
         H -> {ok, H}
     end.
+
+%% Like `lookup/2` but rejects index 0 — RFC 7541 §6.1 disallows
+%% Indexed Header Field with index 0. Used from the `decode_loop`
+%% Indexed Header Field clause where `maybe`'s `?=` can't easily
+%% guard the `Index =:= 0` early-exit.
+-spec lookup_indexed(non_neg_integer(), context()) ->
+    {ok, header()} | {error, invalid_index}.
+lookup_indexed(0, _Ctx) -> {error, invalid_index};
+lookup_indexed(Idx, Ctx) -> lookup(Idx, Ctx).
 
 -spec nth_or_undefined(pos_integer(), [term()]) -> term() | undefined.
 nth_or_undefined(_, []) -> undefined;
