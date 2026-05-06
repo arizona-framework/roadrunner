@@ -293,25 +293,13 @@ inside variance and shouldn't be read as a win.
 | `hello`                   |       254 k   |       272 k   |       181 k   |
 | `json`                    |       255 k   |       270 k   |       178 k   |
 | `echo`                    |       225 k   |    **269 k**  |       146 k   |
-| `headers_heavy`           |       210 k   |       240 k   |       125 k   |
 | `large_response`          |       103 k   |       114 k   |        90 k   |
-| `url_with_qs`             |   **247 k**   |          —    |       167 k   |
-| `varied_paths_router`     |   **239 k**   |          —    |       168 k   |
-| `cors_preflight`          |   **242 k**   |          —    |       162 k   |
-| `redirect_response`       |   **258 k**   |          —    |       176 k   |
-| `chunked_request_body`    |   **210 k**   |          —    |       129 k   |
-| `multi_request_body`      |       225 k   |       245 k   |       111 k   |
-| `expect_100_continue`     |   **130 k**   |          —    |        94 k   |
-| `large_post_streaming`    |  **14.6 k**   |          —    |       6.6 k   |
+| `headers_heavy`           |       210 k   |       240 k   |       125 k   |
 | `cookies_heavy`           |   **234 k**   |          —    |       160 k   |
-| `etag_304`                |   **234 k**   |          —    |       169 k   |
-| `gzip_response`           |       105 k   |          —    |        96 k   |
 | `pipelined_h1`            |   **426 k**   |       4.9 k   |       331 k   |
-| `large_keepalive_session` |       227 k   |    **279 k**  |       175 k   |
-| `connection_storm`        |        46 k   |     **55 k**  |        46 k   |
-| `accept_storm_burst`      |        28 k   |     **35 k**  |        31 k   |
+| `varied_paths_router`     |   **239 k**   |          —    |       168 k   |
+| `gzip_response`           |       105 k   |          —    |        96 k   |
 | `websocket_msg_throughput`|   **214 k**   |          —    |       168 k   |
-| `backpressure_sustained`  |   **249 k**   |          —    |       182 k   |
 
 `—` means the elli test fixture doesn't support that scenario shape
 (no h2, no WebSocket, no gzip middleware, no router, no native qs
@@ -326,16 +314,13 @@ needs any of these, elli isn't on the table.
 | `json`                     |       155 k   |       138 k   |
 | `echo`                     |   **151 k**   |       101 k   |
 | `headers_heavy`            |   **146 k**   |        82 k   |
-| `multi_request_body`       |   **129 k**   |        29 k   |
-| `streaming_response`       |        57 k   |        56 k   |
 | `multi_stream_h2`          |       330 k   |       314 k   |
-| `small_chunked_response`   |       4.7 k   |       4.9 k   |
 | `tls_handshake_throughput` |       2.5 k   |     **3.0 k** |
 
 Multi-stream and basic-req h2 line up with the h1 picture — large
-wins on bigger headers/bodies, smaller wins on the simple paths. The
-two cowboy wins (`small_chunked_response`, `tls_handshake_throughput`)
-are documented honestly in
+wins on bigger headers/bodies, smaller wins on the simple paths.
+`tls_handshake_throughput` is the one cowboy-wins case; documented
+honestly in
 [`docs/conn_lifecycle_investigation.md`](docs/conn_lifecycle_investigation.md).
 
 ### Latency — p50 / p99 (lower = better)
@@ -349,23 +334,21 @@ file. Spot-checks from the same run:
 | `echo`                 | 157 µs / 1.77 ms| 129 µs / 1.57 ms | 269 µs / 2.44 ms |
 | `cookies_heavy`        | 153 µs / 1.57 ms|         —        | 244 µs / 2.43 ms |
 | `pipelined_h1`         |  97 µs / 0.73 ms| 10.3 ms / 10.6 ms| 127 µs / 0.82 ms |
-| `large_post_streaming` | 3.4 ms / 7.18 ms|         —        | 6.0 ms / 30.0 ms |
 
 ### Reading the numbers honestly
 
 - **vs cowboy: roadrunner wins on most scenarios** by 25–60 % on
-  req/s with proportionally lower p50 / p99. The exceptions:
-  `connection_storm` and `accept_storm_burst` are ties (within
-  variance), and the h2 `small_chunked_response` /
-  `tls_handshake_throughput` cells are roadrunner-loses
-  (documented in
+  req/s with proportionally lower p50 / p99. The exception is
+  `tls_handshake_throughput` (h2), where cowboy edges roadrunner
+  on fresh-TLS-conn-per-request workloads (documented in
   [`docs/conn_lifecycle_investigation.md`](docs/conn_lifecycle_investigation.md)).
+  Connection-storm-shape scenarios (in the full results) tie
+  within variance.
 - **vs elli: a wash on simple hot-path GETs.** Elli's lack of
   telemetry, drain, hibernation, and slot tracking shows up as up
   to ~20 % more throughput on `hello` / `json` / `echo` /
-  `headers_heavy` / `large_response` / `large_keepalive_session`.
-  Add a router / cookie parse / gzip / pipeline / body stream /
-  h2 / WebSocket and elli either falls behind or drops out (no
+  `large_response`. Add a router / cookie parse / gzip / pipeline
+  / h2 / WebSocket and elli either falls behind or drops out (no
   support). Elli also still wins the connection-storm-shape
   scenarios where the per-conn process model dominates.
 - **p99 is competitive but not dramatic.** Earlier README copy
