@@ -1,85 +1,67 @@
 # roadrunner
 
-A modern, pure-Erlang HTTP/1.1 + HTTP/2 + WebSocket server for OTP 28+.
+Pure-Erlang HTTP/1.1 + HTTP/2 + WebSocket server for OTP 28+. **Beep beep.**
 
-Built ground-up via TDD as a Cowboy alternative for the
-[arizona-framework](https://github.com/arizona-framework/arizona). Targets a
-small public surface, RFC-correct parsing, and modern OTP idioms throughout.
+Built ground-up via TDD as the HTTP backbone for the
+[arizona-framework](https://github.com/arizona-framework/arizona). The
+user-facing API is a handler behaviour, request/response accessors,
+listener controls, and a handful of opt-in helpers (cookies, qs,
+multipart, SSE, WebSocket). RFC-correct parsing, modern OTP idioms
+throughout, and predictable per-connection lifecycle observability.
 
 ## Status
 
-POC — not yet deployed in production. Eunit + CT (incl. PropEr)
-tests with 100% line coverage, dialyzer-clean.
-
-See [`docs/roadmap.md`](docs/roadmap.md) for what's deferred past
-v0.1 — notably `{loop, _}`, `{sendfile, _}`, and
-`{websocket, _, _}` over HTTP/2 (currently 501) and HTTP/3.
+Eunit + Common Test (incl. PropEr) suites with **100 % line coverage**,
+dialyzer-clean, h2spec strict 100 %, Autobahn fuzzingclient strict
+100 % across the full WebSocket matrix (no exclusions). Continuous
+performance work is tracked in [`docs/roadmap.md`](docs/roadmap.md).
 
 Standards conformance:
 
 - **HTTP/1.1**: RFC 9110 (semantics) + RFC 9112 (syntax).
-- **HTTP/2**: RFC 9113 (frames + multiplexing) + RFC 7541 (HPACK)
-  — opt-in per listener via `http2_enabled => true` in TLS opts;
-  passes [h2spec](https://github.com/summerwind/h2spec) at 100 %
-  in both default (146/146) and strict (`-S`, 147/147) modes
-  (`scripts/h2spec.sh`).
-- **Content-Encoding** (RFC 9110 §8.4.1): gzip + deflate, with
-  qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3).
-  Works unchanged over HTTP/2.
+- **HTTP/2**: RFC 9113 (frames + multiplexing) + RFC 7541 (HPACK).
+  Opt-in per listener via `http2_enabled => true` in TLS opts.
+  [h2spec](https://github.com/summerwind/h2spec) passes at 100 % in
+  strict (`-S`) mode (`scripts/h2spec.sh`).
+- **Content-Encoding** (RFC 9110 §8.4.1): gzip + deflate with
+  qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3),
+  works unchanged over HTTP/2.
 - **WebSocket**: RFC 6455 — passes the
   [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
   fuzzingclient at strict 100 % (`scripts/autobahn.escript`).
 - **WebSocket compression**: RFC 7692 `permessage-deflate`,
   including `*_max_window_bits` and `*_no_context_takeover`.
 
-The per-connection request lifecycle is a tail-recursive `proc_lib`
-loop (`roadrunner_conn_loop`). The conn process carries a
-`proc_lib:set_label/1` label — `{roadrunner_conn, awaiting_shoot,
-ListenerName}` while idle / between requests, refined to include
-the peer once the request starts. Mid-request phases (read body,
-dispatch, finish) run in microseconds and aren't labeled — too
-fast for an `observer` snapshot to land on a specific phase anyway.
-Stuck conns still surface via the entry label and the
-`reading_request` idle window (where hibernation parks the
-process).
-
-The HTTP/2 path takes over after the TLS ALPN handshake settles
-on `h2`; it shares the same handler / middleware / router / drain
-/ telemetry surface as the HTTP/1.1 path. Each request stream
-runs in its own `spawn_monitor`-spawned worker so a handler crash
-resets only the affected stream (`RST_STREAM(INTERNAL_ERROR)`)
-and leaves the other streams on the connection running.
-`SETTINGS_MAX_CONCURRENT_STREAMS = 100` is advertised; flow
-control honors `WINDOW_UPDATE` and `SETTINGS_INITIAL_WINDOW_SIZE`
-shifts. See `src/roadrunner_conn_loop_http2.erl` for the conn
-state machine and `src/roadrunner_http2_stream_worker.erl` for
-the worker dispatch contract.
-
 ## Quickstart
 
+Add to `rebar.config`:
+
 ```erlang
-%% rebar.config
 {deps, [
     {roadrunner, {git, "https://github.com/arizona-framework/roadrunner.git", {branch, "main"}}}
 ]}.
 ```
 
+Write a handler — the third route element is per-route opts, threaded
+to the handler via `roadrunner_req:route_opts/1`:
+
 ```erlang
-%% A handler
 -module(hello_handler).
 -behaviour(roadrunner_handler).
 -export([handle/1]).
 
 handle(Req) ->
-    {roadrunner_resp:text(200, ~"hello, roadrunner!"), Req}.
+    #{greeting := Greeting} = roadrunner_req:route_opts(Req),
+    {roadrunner_resp:text(200, <<Greeting/binary, ", roadrunner!">>), Req}.
 ```
 
+Boot a listener:
+
 ```erlang
-%% Boot a listener
 1> application:ensure_all_started(roadrunner).
 2> roadrunner:start_listener(http, #{
        port => 8080,
-       routes => [{~"/", hello_handler, undefined}]
+       routes => [{~"/", hello_handler, #{greeting => ~"hello"}}]
    }).
 ```
 
@@ -87,34 +69,24 @@ handle(Req) ->
 $ curl -i localhost:8080
 HTTP/1.1 200 OK
 content-type: text/plain; charset=utf-8
-content-length: 14
+content-length: 18
 
 hello, roadrunner!
 ```
 
-To enable HTTP/2 over TLS:
+For HTTP/2 over TLS, add a cert and flip `http2_enabled => true`:
 
 ```erlang
 3> roadrunner:start_listener(https, #{
        port => 8443,
        tls => [{certfile, "cert.pem"}, {keyfile, "key.pem"}],
        http2_enabled => true,
-       routes => [{~"/", hello_handler, undefined}]
+       routes => [{~"/", hello_handler, #{greeting => ~"hello"}}]
    }).
 ```
 
-```
-$ curl -i --http2 https://localhost:8443/
-HTTP/2 200
-content-type: text/plain; charset=utf-8
-content-length: 14
-
-hello, roadrunner!
-```
-
-ALPN negotiation routes `h2` clients to the HTTP/2 path and
-`http/1.1` clients (or no-ALPN) to the HTTP/1.1 path on the same
-listener.
+ALPN routes `h2` clients to the HTTP/2 path and `http/1.1` clients (or
+no-ALPN) to the HTTP/1.1 path on the same listener.
 
 ## Features
 
@@ -125,7 +97,7 @@ listener.
 - **Streaming:** `{stream, Status, Headers, Fun}` — chunked transfer with a
   `Send/2` callback; supports trailer headers per RFC 7230 §4.1.2.
 - **Loop / SSE:** `{loop, Status, Headers, State}` + optional
-  `handle_info/3` callback for message-driven push (cowboy_loop equivalent).
+  `handle_info/3` callback for message-driven push.
 - **WebSocket:** `{websocket, Module, State}` upgrade with
   `roadrunner_ws_handler` callback.
 - **Sendfile:** `{sendfile, Status, Headers, {Filename, Offset, Length}}` —
@@ -152,7 +124,7 @@ listener.
 
 ### Hardening
 
-- RFC 7230 / RFC 9112 strict parsing — request smuggling defenses
+- Strict RFC 9110 / RFC 9112 parsing — request smuggling defenses
   (CL+TE conflict, multiple-CL), header CRLF/NUL injection rejection,
   chunk-size leading-whitespace rejection, RFC 6265 cookie OWS handling,
   RFC 6455 §5.5 control-frame limits, SSE event-line CRLF rejection,
@@ -168,14 +140,12 @@ listener.
 
 ### Observability
 
-- `telemetry` events: `[roadrunner, request, start | stop | exception |
-  rejected]`, `[roadrunner, response, send_failed]`, `[roadrunner, listener,
-  accept | conn_close | slots_reconciled]`, `[roadrunner, ws, upgrade |
-  frame_in | frame_out]`, `[roadrunner, drain, acknowledged]` (opt-in via
-  `roadrunner:acknowledge_drain/1` from a `{loop, ...}` / WebSocket
-  handler that pattern-matches `{roadrunner_drain, _}`).
+- `telemetry` events: request `start | stop | exception | rejected`,
+  `response, send_failed`, listener `accept | conn_close |
+  slots_reconciled`, ws `upgrade | frame_in | frame_out`, `drain,
+  acknowledged` (opt-in via `roadrunner:acknowledge_drain/1`).
 - Per-request `request_id` attached to `logger:set_process_metadata/1`
-  so any `?LOG_*` call from middleware/handlers is auto-correlated.
+  so any `?LOG_*` from middleware/handlers is auto-correlated.
 - `roadrunner_listener:info/1` for pull-side `active_clients` /
   `requests_served` metrics.
 - `proc_lib:set_label/1` per-listener / per-acceptor / per-conn for
@@ -183,278 +153,65 @@ listener.
 
 ### Lifecycle
 
-- `roadrunner_listener:drain/2` — graceful shutdown with timeout. Closes the
-  listen socket immediately, broadcasts `{roadrunner_drain, Deadline}` to
-  in-flight conns via `pg`, polls `active_clients` until zero or
-  deadline, then `exit(Pid, shutdown)` for stragglers.
+- `roadrunner_listener:drain/2` — graceful shutdown with timeout. Closes
+  the listen socket, broadcasts `{roadrunner_drain, Deadline}` to in-flight
+  conns via `pg`, polls until idle or deadline, then `exit(Pid, shutdown)`
+  for stragglers.
 - `roadrunner_listener:status/1` — `accepting | draining`.
-- Optional `slot_reconciliation => #{interval_ms => N}` listener
-  opt — periodic reaper compares `client_counter` vs the conn pg
-  group and releases slots orphaned by `kill`-style exits (which
-  bypass `terminate/3`). Off by default; enable for chaos-tested
-  deployments.
+- Optional `slot_reconciliation => #{interval_ms => N}` listener opt — a
+  periodic reaper that compares `client_counter` against the conn `pg`
+  group and releases slots orphaned by `kill`-style exits. Off by default;
+  enable for chaos-tested deployments.
 
-### Property + conformance tests
+### Test surface
 
-PropEr properties via OTP `ct_property_test`: `roadrunner_uri`
-percent round-trip + encode shape, `roadrunner_qs` round-trip,
-`roadrunner_cookie` adversarial robustness, `roadrunner_http1`
-parsers never-crash + incremental-feed equivalence, plus
-`roadrunner_conn_loop` robustness over random recv/drain/stray
-inputs (clean exit + slot release) and `request_id` consistency
-between `request_start` / `request_stop` telemetry.
+- **PropEr properties** via `ct_property_test`: `roadrunner_uri`
+  percent round-trip + encode shape, `roadrunner_qs` round-trip,
+  `roadrunner_cookie` adversarial robustness, `roadrunner_http1`
+  parsers never-crash + incremental-feed equivalence, plus
+  `roadrunner_conn_loop` robustness over random recv/drain/stray
+  inputs (clean exit + slot release) and `request_id` consistency
+  between `request_start` / `request_stop` telemetry.
+- **Malformed-input corpus**: `roadrunner_http1_corpus_tests`
+  exercises HTTP/1.1 patterns lifted from the
+  [llhttp](https://github.com/nodejs/llhttp) test corpus and the
+  canonical request-smuggling vectors documented by Portswigger.
+- **Conformance harnesses**: `scripts/h2spec.sh` (HTTP/2),
+  `scripts/autobahn.escript` (WebSocket),
+  `scripts/redbot.escript` (HTTP/1.1 response hygiene).
 
-`roadrunner_http1_corpus_tests` runs HTTP/1.1 malformed-input
-patterns lifted from the [llhttp](https://github.com/nodejs/llhttp)
-test corpus (the parser used by Node.js / undici) and the
-canonical request-smuggling vectors documented by Portswigger —
-the same coverage that goes into protecting other production
-HTTP/1.x servers in the wild.
+## Documentation
 
-WebSocket conformance lives in `test/autobahn/`. Run
-`./scripts/autobahn.escript` (requires Docker) to drive the full
-[Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
-fuzzingclient against a roadrunner echo listener; the harness
-prints a pass/fail summary and the HTML report path. Roadrunner
-passes 100 % strict on the **full suite** with zero exclusions —
-every category from basic framing through fragmentation, UTF-8,
-close handling, oversize control frames, large-payload performance
-(9.x), and the full `permessage-deflate` matrix (12.x + 13.x).
-Three cases (7.1.6, 7.13.1, 7.13.2) are reported as `INFORMATIONAL`
-rather than `OK` — Autobahn's category for cases the spec leaves
-genuinely implementation-defined (close-during-write under
-async-only models; out-of-range close codes 5000 / 65535). Their
-own descriptions read *"Actual events are undefined by the spec."*
-
-HTTP/1.1 response hygiene is audited via
-[REDbot](https://redbot.org). Run `./scripts/redbot.escript`
-(requires Docker) to probe a representative set of routes
-(plain, JSON, cached, ETag, Last-Modified, conditional-GET,
-gzip-eligible) and capture per-route reports under
-`test/redbot/reports/`. See `test/redbot/README.md` for what's
-covered and what kinds of findings count as framework gaps vs
-handler-level choices.
-
-HTTP/2 conformance lives in `scripts/h2spec.sh`. The script
-boots a roadrunner h2 listener with a throwaway TLS cert and
-drives [h2spec](https://github.com/summerwind/h2spec) (Docker
-image `summerwind/h2spec`) against it. Roadrunner passes
-**146/146 in default mode and 147/147 in strict (`-S`) mode**
-across the generic HTTP/2 conformance, RFC 9113 frame
-definitions, and HPACK (RFC 7541) test categories — including
-stream-state transitions, flow control, settings validation,
-content-length consistency, request trailers, padding rules,
-and the full HPACK decoding-error matrix.
-
-## Comparison with cowboy and elli
-
-`scripts/bench.escript` runs the same loadgen against each server in
-its own peer BEAM. `scripts/bench_matrix.sh` drives 30+ scenarios
-across both protocols and writes the consolidated tables that ship
-in [`docs/bench_results.md`](docs/bench_results.md). Numbers below
-are the median of 3 runs at 50 concurrent clients on the system
-described below, loopback only (no NIC). Re-run locally to see what
-your hardware shows; absolute numbers shift, relative ordering
-tends to hold.
-
-| | |
-|---|---|
-| CPU | 12th Gen Intel Core i9-12900HX (24 threads) |
-| Kernel | Linux 6.19.6 (Arch) |
-| OTP | 29 (erts 17.0, JIT) |
-| Loadgen | 50 clients, 5s warmup + 5s measure, loopback |
-| Bench client | in-tree `roadrunner_bench_client` (h1 + h2) |
-
-> **TL;DR.** Roadrunner beats cowboy on most common scenarios by
-> +30–80 % req/s with proportionally lower p50 / p99. The
-> exceptions are connection-storm-shape scenarios (open-conn /
-> close-conn dominates) and the h2 `tls_handshake_throughput`
-> case — those tie or slightly lose. Vs elli, roadrunner ties or
-> wins on simple GETs (`hello`, `echo`, `json`) within a few
-> percent, with elli still slightly ahead on bandwidth-bound
-> `large_response`. Roadrunner beats elli outright wherever the
-> workload needs a feature elli doesn't ship — pipelining,
-> gzip, body streaming, h2, WebSocket, router, native
-> qs/cookie parsing, etag.
-
-### Throughput — req/s, HTTP/1.1 (higher = better)
-
-A representative cross-section. The full per-protocol tables
-(including per-server p50 / p99) live in
-[`docs/bench_results.md`](docs/bench_results.md). Memory + CPU
-shape per scenario lives in
-[`docs/resource_results.md`](docs/resource_results.md).
-
-Bolded cells indicate the row's winner *and* a margin wider than
-~15 % over the next-best (the bench's own variance band — see
-"Reading the numbers honestly" below). Cells without bold are
-inside variance and shouldn't be read as a win.
-
-| scenario                  | roadrunner    | elli          | cowboy        |
-|---------------------------|--------------:|--------------:|--------------:|
-| `hello`                   |       298 k   |       278 k   |       179 k   |
-| `json`                    |       264 k   |       269 k   |       163 k   |
-| `echo`                    |       256 k   |       251 k   |       133 k   |
-| `large_response`          |       104 k   |       111 k   |        85 k   |
-| `headers_heavy`           |       235 k   |       211 k   |       118 k   |
-| `cookies_heavy`           |   **247 k**   |          —    |       154 k   |
-| `pipelined_h1`            |   **501 k**   |       4.9 k   |       329 k   |
-| `varied_paths_router`     |   **257 k**   |          —    |       149 k   |
-| `gzip_response`           |   **127 k**   |          —    |       100 k   |
-| `websocket_msg_throughput`|   **199 k**   |          —    |       155 k   |
-
-`—` means the elli test fixture doesn't support that scenario shape
-(no h2, no WebSocket, no gzip middleware, no router, no native qs
-parser, etc.). That's a real comparison point: if your workload
-needs any of these, elli isn't on the table.
-
-### Throughput — req/s, HTTP/2 (higher = better)
-
-| scenario                   | roadrunner    | cowboy        |
-|----------------------------|--------------:|--------------:|
-| `hello`                    |       162 k   |       157 k   |
-| `json`                     |       159 k   |       141 k   |
-| `echo`                     |   **151 k**   |       104 k   |
-| `headers_heavy`            |   **148 k**   |        84 k   |
-| `multi_stream_h2`          |       334 k   |       307 k   |
-| `tls_handshake_throughput` |       2.5 k   |     **3.0 k** |
-
-Multi-stream and basic-req h2 line up with the h1 picture — large
-wins on bigger headers/bodies, smaller wins on the simple paths.
-`tls_handshake_throughput` is the one cowboy-wins case; documented
-honestly in
-[`docs/conn_lifecycle_investigation.md`](docs/conn_lifecycle_investigation.md).
-
-### Latency — p50 / p99 (lower = better)
-
-p50 / p99 numbers per scenario × server are in the full results
-file. Spot-checks from the same run:
-
-| scenario               | rr p50 / p99    | elli p50 / p99   | cowboy p50 / p99 |
-|------------------------|----------------:|-----------------:|-----------------:|
-| `hello`                | 117 µs / 1.45 ms| 124 µs / 1.69 ms | 211 µs / 2.36 ms |
-| `echo`                 | 139 µs / 1.51 ms| 138 µs / 1.77 ms | 301 µs / 2.65 ms |
-| `cookies_heavy`        | 142 µs / 1.67 ms|         —        | 251 µs / 2.52 ms |
-| `pipelined_h1`         |  83 µs / 0.57 ms| 10.3 ms / 10.6 ms| 129 µs / 0.84 ms |
-
-### Reading the numbers honestly
-
-- **vs cowboy: roadrunner wins on most scenarios** by 25–60 % on
-  req/s with proportionally lower p50 / p99. The exception is
-  `tls_handshake_throughput` (h2), where cowboy edges roadrunner
-  on fresh-TLS-conn-per-request workloads (documented in
-  [`docs/conn_lifecycle_investigation.md`](docs/conn_lifecycle_investigation.md)).
-  Connection-storm-shape scenarios (in the full results) tie
-  within variance.
-- **vs elli: tied or just ahead on simple hot-path GETs.**
-  Roadrunner now matches or slightly leads elli on `hello` /
-  `echo` (within ~7 %), and trails by ~2–7 % on `json` /
-  `large_response`. The gap (either way) is inside the bench's
-  variance band — elli's minimal surface still wins the cleanest
-  hot path some runs. Add a router / cookie parse / gzip /
-  pipeline / h2 / WebSocket and elli either falls behind or
-  drops out (no support). Elli also still wins the
-  connection-storm-shape scenarios where the per-conn process
-  model dominates.
-- **p99 is competitive but not dramatic.** Earlier README copy
-  claimed "2.5–3.5× lower p99" — that was measured on a 3 s
-  warmup + 3 s window where multi-millisecond outliers
-  under-counted. With the 2 s + 5 s settings used here,
-  roadrunner's p99 vs cowboy is typically 1.4–1.8× lower; vs elli
-  it's within 10 %.
-- **Cowboy trails on most axes here** because its dual-process
-  pipeline (acceptor → connection → stream handlers) adds dispatch
-  overhead the simpler servers don't pay. It optimizes for HTTP/2
-  feature richness and supervisor-tree visibility — the
-  trade-off shows on the bench.
-- **Numbers shift on real hardware.** Loopback hides NIC + kernel
-  TCP cost. For a public comparison run against a remote host with
-  `--clients` tuned to your CPU count.
-
-### Architectural trade-offs
-
-|                                | roadrunner                       | elli                       | cowboy                        |
-|--------------------------------|----------------------------------|----------------------------|-------------------------------|
-| Per-conn process model         | tail-recursive `proc_lib` loop   | tail-recursive loop        | gen_server + stream handlers  |
-| Request lifecycle observable   | yes (`proc_lib:get_label/1`)     | no                         | partial                       |
-| Drain / graceful shutdown      | built-in (`pg`-broadcast)        | DIY                        | partial                       |
-| Telemetry                      | `telemetry` library, 10+ events  | none (handler callbacks)   | `cowboy_metrics_h` opt-in     |
-| Middleware shape               | continuation-passing             | `pre_request`/`post_request` callback | deprecated `(Req, Env)`/stream handlers |
-| Hibernation between requests   | `hibernate_after` works          | no                         | depends on stream handler     |
-| Default recv mode              | passive (`gen_tcp:recv`)         | passive (`gen_tcp:recv`)   | active (`{active, once}`)     |
-| HTTP RFCs                      | RFC 9110 + RFC 9112 + RFC 9113   | RFC 7230 era               | RFC 9110 + RFC 9112 + HTTP/2  |
-| HTTP/2 (RFC 9113 + 7541)       | yes — h2spec 100 % strict        | no                         | yes                           |
-| Content-Encoding               | gzip + deflate, qvalue-aware     | DIY                        | hooks for stream handlers     |
-| WebSocket conformance          | Autobahn 100 % strict            | n/a                        | Autobahn-tested               |
-| permessage-deflate (RFC 7692)  | yes                              | n/a                        | yes                           |
-| Production maturity            | POC                              | 10+ years, stable          | 10+ years, stable             |
-| Public API surface             | small                            | small                      | large (HTTP/2, gun, etc.)     |
-| Runtime deps                   | `telemetry` only                 | none                       | `cowlib`, `ranch`             |
-
-### How to reproduce
-
-Single scenario:
-
-```
-mise exec -- ./scripts/bench.escript --servers roadrunner,elli,cowboy \
-  --scenario hello --clients 50 --duration 5 --warmup 2
-```
-
-Run several times and take the median — the bench script's banner
-warns that single runs sit inside a ±15 % variance band on a
-loaded dev box. `scripts/bench.escript` also accepts `--profile`
-to dump an eprof or fprof hotspot table.
-
-Full matrix (regenerates `docs/bench_results.md`):
-
-```
-./scripts/bench_matrix.sh
-```
-
-Override defaults via env: `RUNS=5 DURATION=10 ./scripts/bench_matrix.sh`.
-
-`scripts/bench.escript --protocol h2` drives the same scenarios
-over HTTP/2. The h2 loadgen is the in-tree pure-Erlang
-`roadrunner_bench_client` (lives in `test/` because it's only used
-by dev tools); no external h2 client / loadgen needs to be
-installed. h2 vs h1 numbers are workload-shape-sensitive: small
-responses at high concurrency typically favor h2 (single-connection
-multiplexing — note that this bench uses one connection per worker
-so it measures protocol framing overhead, not multiplexing benefit);
-single-request latency may favor h1 (no frame demux). Run both
-directions on the same hardware before claiming a win.
-
-### Picking a server
-
-- **Pick elli** if you need only the simplest GET hot path with
-  zero modern features and care about the last 6–15 % of throughput
-  more than RFC coverage / drain / telemetry / pipelining / gzip /
-  h2 / WebSocket.
-- **Pick cowboy** if you need sub-protocols beyond what roadrunner
-  ships, or you're already in an ecosystem where it's the lingua
-  franca. Roadrunner beats it on every common scenario in this
-  bench.
-- **Pick roadrunner** if you want a small surface, queryable
-  per-request state, drain + telemetry built in, RFC-9110/9112/9113
-  coverage, h2spec-compliant HTTP/2, Autobahn-strict WebSocket, and
-  the throughput / p99 numbers above (and the POC status — see
-  "Status" above).
+- [`docs/comparison.md`](docs/comparison.md) — side-by-side benchmarks
+  vs cowboy and elli (throughput, latency, architectural trade-offs,
+  reproduction commands).
+- [`docs/bench_results.md`](docs/bench_results.md) — full per-protocol
+  matrix with p50 / p99 across every scenario.
+- [`docs/resource_results.md`](docs/resource_results.md) — memory + CPU
+  shape per scenario.
+- [`docs/conn_lifecycle_investigation.md`](docs/conn_lifecycle_investigation.md)
+  — the connection-process model trade-offs and the one h2 case
+  cowboy still wins.
+- [`docs/roadmap.md`](docs/roadmap.md) — deferred items past v0.1
+  (notably `{loop, _}`, `{sendfile, _}`, `{websocket, _, _}` over
+  HTTP/2 — currently 501 — and HTTP/3).
 
 ## Design philosophy
 
 - **Small surface, RFC-correct.** Parsers are pure incremental binary
   matchers; only programmer errors raise, wire input becomes
-  `{error, _}`. Hostile input is bounded before reaching application code.
+  `{error, _}`. Hostile input is bounded before reaching application
+  code.
 - **Modern OTP idioms.** Sigils for binary literals, body recursion (cons
-  on the way out), binary keys for wire-derived data, `-doc`/`-moduledoc`
-  markdown, dialyzer-clean specs. No `binary_to_atom` on parsed names.
+  on the way out), binary keys for wire-derived data, `-doc` /
+  `-moduledoc` markdown, dialyzer-clean specs. No `binary_to_atom` on
+  parsed names.
 - **Continuation-style middleware** over Plug.Conn-style transformation
   — strictly more expressive than cowboy 2.13's deprecated `(Req, Env)`
   shape and dramatically simpler than cowboy's stream handlers.
 - **Telemetry over custom callbacks.** `telemetry` is the de facto
-  standard (Phoenix, Ecto, gleam_otp), zero-overhead when no
-  subscribers, integrates with prometheus/opentelemetry/datadog out of
-  the box.
+  standard (Phoenix, Ecto, gleam_otp); zero-overhead when no subscribers,
+  integrates with prometheus / opentelemetry / datadog out of the box.
 - **No external deps unless stdlib genuinely can't.** Only runtime dep
   is `telemetry` (tiny, no transitive deps); only dev-time dep is the
   `erlfmt` plugin.
@@ -466,7 +223,7 @@ mise exec -- rebar3 precommit
 ```
 
 Runs fmt-check, compile, xref, dialyzer, eunit + ct with cover, and
-fails if line coverage drops below 100%.
+fails if line coverage drops below 100 %.
 
 ## License
 
