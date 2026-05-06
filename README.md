@@ -58,7 +58,7 @@ in [`docs/comparison.md`](docs/comparison.md).
 Bold = row winner. `—` means the elli fixture doesn't support that
 workload shape (no router, no gzip middleware, no native cookie
 parser, no WebSocket). On simple GETs (`hello`, `json`, `echo`)
-roadrunner's lead over elli is within the bench's ~15 % variance
+Roadrunner's lead over elli is within the bench's ~15 % variance
 band — see [`docs/comparison.md`](docs/comparison.md) for the full
 honest framing.
 
@@ -204,7 +204,8 @@ roadrunner:start_listener(my_listener, #{port => 8080, handler => hello_handler}
 - Optional `slot_reconciliation => #{interval_ms => N}` listener opt — a
   periodic reaper that compares `client_counter` against the conn `pg`
   group and releases slots orphaned by `kill`-style exits. Off by default;
-  enable for chaos-tested deployments.
+  enable in production where you can't trust every exit path to run
+  `terminate/3` (`kill` signals, OOM kills, supervisor brutal-kill).
 
 ### Test surface
 
@@ -235,22 +236,21 @@ roadrunner:start_listener(my_listener, #{port => 8080, handler => hello_handler}
 - [`docs/conn_lifecycle_investigation.md`](docs/conn_lifecycle_investigation.md)
   — the connection-process model trade-offs and the one h2 case
   cowboy still wins.
-- [`docs/roadmap.md`](docs/roadmap.md) — deferred items past v0.1
-  (notably `{loop, _}`, `{sendfile, _}`, `{websocket, _, _}` over
-  HTTP/2 — currently 501 — and HTTP/3).
+- [`docs/roadmap.md`](docs/roadmap.md) — deferred items, with rough
+  effort estimates for each.
 
 ## Design philosophy
 
-- **Small surface, RFC-correct.** Parsers are pure incremental binary
-  matchers; only programmer errors raise, wire input becomes
-  `{error, _}`. Hostile input is bounded before reaching application
-  code.
+- **RFC-correct, hostile-input-safe.** Parsers are pure incremental
+  binary matchers; only programmer errors raise, wire input always
+  becomes `{error, _}`. Malformed bytes are bounded by length and
+  rejected before reaching application code.
 - **Modern OTP idioms.** Sigils for binary literals, body recursion (cons
   on the way out), binary keys for wire-derived data, `-doc` /
   `-moduledoc` markdown, dialyzer-clean specs. No `binary_to_atom` on
   parsed names.
 - **Continuation-style middleware** over Plug.Conn-style transformation
-  — strictly more expressive than cowboy 2.13's deprecated `(Req, Env)`
+  — strictly more expressive than cowboy's deprecated `(Req, Env)`
   shape and dramatically simpler than cowboy's stream handlers.
 - **Telemetry over custom callbacks.** `telemetry` is the de facto
   standard (Phoenix, Ecto, gleam_otp); zero-overhead when no subscribers,
