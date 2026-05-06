@@ -251,11 +251,11 @@ phase_timeout(#loop_state{phase = keep_alive, proto_opts = ProtoOpts}) ->
 
 -spec recv_request_bytes(#loop_state{}, integer()) -> no_return().
 recv_request_bytes(S, Deadline) ->
-    case maps:get(hibernate_after, S#loop_state.proto_opts, 0) of
-        Ms when is_integer(Ms), Ms > 0 ->
+    case S#loop_state.proto_opts of
+        #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 ->
             arm_active_once(S),
             recv_with_hibernate(S, Deadline, Ms);
-        _ ->
+        #{} ->
             recv_passive(S, Deadline)
     end.
 

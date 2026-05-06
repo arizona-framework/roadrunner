@@ -101,7 +101,13 @@ read it anyway.
     %% prose. Defaults match the RFC 9113 baseline.
     h2_initial_conn_window => 1..16#7FFFFFFF,
     h2_initial_stream_window => 1..16#7FFFFFFF,
-    h2_window_refill_threshold => pos_integer()
+    h2_window_refill_threshold => pos_integer(),
+    %% Optional fields the listener injects only when the user
+    %% supplies them — see `roadrunner_listener:build_proto_opts/2`.
+    %% Declared here so dialyzer accepts pattern matches like
+    %% `#{hibernate_after := Ms}` against `proto_opts()`.
+    hibernate_after => pos_integer(),
+    rate_check_interval_ms => pos_integer()
 }.
 
 %% Opaque body-read state attached to the request in manual buffering
