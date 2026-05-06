@@ -266,14 +266,16 @@ tends to hold.
 | Bench client | in-tree `roadrunner_bench_client` (h1 + h2) |
 
 > **TL;DR.** Roadrunner beats cowboy on most common scenarios by
-> +30–50 % req/s with proportionally lower p50 / p99. The
+> +30–80 % req/s with proportionally lower p50 / p99. The
 > exceptions are connection-storm-shape scenarios (open-conn /
-> close-conn dominates) and two h2-specific cases — those tie or
-> slightly lose. Vs elli, roadrunner is within ~15 % on simple
-> GETs (elli's minimal surface still wins the cleanest hot path)
-> and beats elli outright wherever the workload needs a feature
-> elli doesn't ship — pipelining, gzip, body streaming, h2,
-> WebSocket, router, native qs/cookie parsing, etag.
+> close-conn dominates) and the h2 `tls_handshake_throughput`
+> case — those tie or slightly lose. Vs elli, roadrunner ties or
+> wins on simple GETs (`hello`, `echo`, `json`) within a few
+> percent, with elli still slightly ahead on bandwidth-bound
+> `large_response`. Roadrunner beats elli outright wherever the
+> workload needs a feature elli doesn't ship — pipelining,
+> gzip, body streaming, h2, WebSocket, router, native
+> qs/cookie parsing, etag.
 
 ### Throughput — req/s, HTTP/1.1 (higher = better)
 
@@ -290,16 +292,16 @@ inside variance and shouldn't be read as a win.
 
 | scenario                  | roadrunner    | elli          | cowboy        |
 |---------------------------|--------------:|--------------:|--------------:|
-| `hello`                   |       254 k   |       272 k   |       181 k   |
-| `json`                    |       255 k   |       270 k   |       178 k   |
-| `echo`                    |       225 k   |    **269 k**  |       146 k   |
-| `large_response`          |       103 k   |       114 k   |        90 k   |
-| `headers_heavy`           |       210 k   |       240 k   |       125 k   |
-| `cookies_heavy`           |   **234 k**   |          —    |       160 k   |
-| `pipelined_h1`            |   **426 k**   |       4.9 k   |       331 k   |
-| `varied_paths_router`     |   **239 k**   |          —    |       168 k   |
-| `gzip_response`           |       105 k   |          —    |        96 k   |
-| `websocket_msg_throughput`|   **214 k**   |          —    |       168 k   |
+| `hello`                   |       298 k   |       278 k   |       179 k   |
+| `json`                    |       264 k   |       269 k   |       163 k   |
+| `echo`                    |       256 k   |       251 k   |       133 k   |
+| `large_response`          |       104 k   |       111 k   |        85 k   |
+| `headers_heavy`           |       235 k   |       211 k   |       118 k   |
+| `cookies_heavy`           |   **247 k**   |          —    |       154 k   |
+| `pipelined_h1`            |   **501 k**   |       4.9 k   |       329 k   |
+| `varied_paths_router`     |   **257 k**   |          —    |       149 k   |
+| `gzip_response`           |   **127 k**   |          —    |       100 k   |
+| `websocket_msg_throughput`|   **199 k**   |          —    |       155 k   |
 
 `—` means the elli test fixture doesn't support that scenario shape
 (no h2, no WebSocket, no gzip middleware, no router, no native qs
@@ -310,11 +312,11 @@ needs any of these, elli isn't on the table.
 
 | scenario                   | roadrunner    | cowboy        |
 |----------------------------|--------------:|--------------:|
-| `hello`                    |       158 k   |       154 k   |
-| `json`                     |       155 k   |       138 k   |
-| `echo`                     |   **151 k**   |       101 k   |
-| `headers_heavy`            |   **146 k**   |        82 k   |
-| `multi_stream_h2`          |       330 k   |       314 k   |
+| `hello`                    |       162 k   |       157 k   |
+| `json`                     |       159 k   |       141 k   |
+| `echo`                     |   **151 k**   |       104 k   |
+| `headers_heavy`            |   **148 k**   |        84 k   |
+| `multi_stream_h2`          |       334 k   |       307 k   |
 | `tls_handshake_throughput` |       2.5 k   |     **3.0 k** |
 
 Multi-stream and basic-req h2 line up with the h1 picture — large
@@ -330,10 +332,10 @@ file. Spot-checks from the same run:
 
 | scenario               | rr p50 / p99    | elli p50 / p99   | cowboy p50 / p99 |
 |------------------------|----------------:|-----------------:|-----------------:|
-| `hello`                | 135 µs / 1.75 ms| 122 µs / 1.82 ms | 208 µs / 2.44 ms |
-| `echo`                 | 157 µs / 1.77 ms| 129 µs / 1.57 ms | 269 µs / 2.44 ms |
-| `cookies_heavy`        | 153 µs / 1.57 ms|         —        | 244 µs / 2.43 ms |
-| `pipelined_h1`         |  97 µs / 0.73 ms| 10.3 ms / 10.6 ms| 127 µs / 0.82 ms |
+| `hello`                | 117 µs / 1.45 ms| 124 µs / 1.69 ms | 211 µs / 2.36 ms |
+| `echo`                 | 139 µs / 1.51 ms| 138 µs / 1.77 ms | 301 µs / 2.65 ms |
+| `cookies_heavy`        | 142 µs / 1.67 ms|         —        | 251 µs / 2.52 ms |
+| `pipelined_h1`         |  83 µs / 0.57 ms| 10.3 ms / 10.6 ms| 129 µs / 0.84 ms |
 
 ### Reading the numbers honestly
 
@@ -344,13 +346,16 @@ file. Spot-checks from the same run:
   [`docs/conn_lifecycle_investigation.md`](docs/conn_lifecycle_investigation.md)).
   Connection-storm-shape scenarios (in the full results) tie
   within variance.
-- **vs elli: a wash on simple hot-path GETs.** Elli's lack of
-  telemetry, drain, hibernation, and slot tracking shows up as up
-  to ~20 % more throughput on `hello` / `json` / `echo` /
-  `large_response`. Add a router / cookie parse / gzip / pipeline
-  / h2 / WebSocket and elli either falls behind or drops out (no
-  support). Elli also still wins the connection-storm-shape
-  scenarios where the per-conn process model dominates.
+- **vs elli: tied or just ahead on simple hot-path GETs.**
+  Roadrunner now matches or slightly leads elli on `hello` /
+  `echo` (within ~7 %), and trails by ~2–7 % on `json` /
+  `large_response`. The gap (either way) is inside the bench's
+  variance band — elli's minimal surface still wins the cleanest
+  hot path some runs. Add a router / cookie parse / gzip /
+  pipeline / h2 / WebSocket and elli either falls behind or
+  drops out (no support). Elli also still wins the
+  connection-storm-shape scenarios where the per-conn process
+  model dominates.
 - **p99 is competitive but not dramatic.** Earlier README copy
   claimed "2.5–3.5× lower p99" — that was measured on a 3 s
   warmup + 3 s window where multi-millisecond outliers
