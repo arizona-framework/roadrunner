@@ -78,7 +78,7 @@ Add to `rebar.config`:
 
 ```erlang
 {deps, [
-    {roadrunner, {git, "https://github.com/arizona-framework/roadrunner.git", {branch, "main"}}}
+    {roadrunner, "0.1.0"}
 ]}.
 ```
 
