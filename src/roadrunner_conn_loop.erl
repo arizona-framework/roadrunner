@@ -566,19 +566,28 @@ dispatch_phase(
     roadrunner_middleware:middleware_list()
 ) -> no_return().
 run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, ListenerMws) ->
-    RouteMws = roadrunner_conn:route_middlewares(Req),
     %% Common production case: handler dispatch with no middlewares
     %% (listener empty AND route empty). Skip the compose helper —
     %% it would just wrap `Handler:handle/1` in another fun and fall
     %% through. Direct call avoids one closure allocation + one
     %% indirection per request.
+    %%
+    %% When the listener has middlewares, always compose (so the
+    %% route call is needed to merge them in). When it doesn't, do
+    %% the route lookup lazily and skip compose if the route is also
+    %% empty — the no-mws fast path most production handlers hit.
     Pipeline =
-        case ListenerMws =:= [] andalso RouteMws =:= [] of
-            true ->
-                fun Handler:handle/1;
-            false ->
+        case ListenerMws of
+            [] ->
+                case roadrunner_conn:route_middlewares(Req) of
+                    [] ->
+                        fun Handler:handle/1;
+                    RouteMws ->
+                        roadrunner_middleware:compose(RouteMws, fun Handler:handle/1)
+                end;
+            _ ->
                 roadrunner_middleware:compose(
-                    ListenerMws ++ RouteMws,
+                    ListenerMws ++ roadrunner_conn:route_middlewares(Req),
                     fun Handler:handle/1
                 )
         end,
