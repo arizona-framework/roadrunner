@@ -20,23 +20,23 @@ throughout, and predictable per-connection lifecycle observability.
 
 Eunit + Common Test (incl. PropEr) suites with **100 % line coverage**,
 dialyzer-clean, h2spec strict 100 %, Autobahn fuzzingclient strict
-100 % across the full WebSocket matrix (no exclusions). Continuous
-performance work is tracked in [`docs/roadmap.md`](docs/roadmap.md).
+100 % across the full WebSocket matrix (no exclusions).
 
 Standards conformance:
 
 - **HTTP/1.1**: RFC 9110 (semantics) + RFC 9112 (syntax).
 - **HTTP/2**: RFC 9113 (frames + multiplexing) + RFC 7541 (HPACK).
   Opt-in per listener by listing `~"h2"` in the TLS
-  `alpn_preferred_protocols` option.
-  [h2spec](https://github.com/summerwind/h2spec) passes at 100 % in
-  strict (`-S`) mode (`scripts/h2spec.sh`).
+  `alpn_preferred_protocols` option. Conformance harness:
+  [`scripts/h2spec.sh`](scripts/h2spec.sh) (drives
+  [h2spec](https://github.com/summerwind/h2spec)).
 - **Content-Encoding** (RFC 9110 §8.4.1): gzip + deflate with
   qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3),
   works unchanged over HTTP/2.
-- **WebSocket**: RFC 6455 — passes the
+- **WebSocket**: RFC 6455. Conformance harness:
+  [`scripts/autobahn.escript`](scripts/autobahn.escript) (drives the
   [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
-  fuzzingclient at strict 100 % (`scripts/autobahn.escript`).
+  fuzzingclient).
 - **WebSocket compression**: RFC 7692 `permessage-deflate`,
   including `*_max_window_bits` and `*_no_context_takeover`.
 
@@ -59,8 +59,7 @@ Bold = row winner. `—` means the elli fixture doesn't support that
 workload shape (no router, no gzip middleware, no native cookie
 parser, no WebSocket). On simple GETs (`hello`, `json`, `echo`)
 Roadrunner's lead over elli is within the bench's ~15 % variance
-band — see [`docs/comparison.md`](docs/comparison.md) for the full
-honest framing.
+band — the comparison doc has the full honest framing.
 
 ## Quickstart
 
