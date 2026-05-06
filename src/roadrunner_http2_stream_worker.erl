@@ -94,17 +94,7 @@ run_handler(ConnPid, StreamId, Req, ProtoOpts) ->
     end.
 
 invoke(ConnPid, StreamId, Handler, ListenerMws, Req, Metadata, ReqStart) ->
-    RouteMws = roadrunner_conn:route_middlewares(Req),
-    Pipeline =
-        case ListenerMws =:= [] andalso RouteMws =:= [] of
-            true ->
-                fun Handler:handle/1;
-            false ->
-                roadrunner_middleware:compose(
-                    ListenerMws ++ RouteMws,
-                    fun(R) -> Handler:handle(R) end
-                )
-        end,
+    Pipeline = roadrunner_middleware:build_pipeline(ListenerMws, Req, Handler),
     try Pipeline(Req) of
         {Response, _Req2} ->
             emit_handler_response(ConnPid, StreamId, Response),

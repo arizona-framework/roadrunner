@@ -62,7 +62,6 @@ read it anyway.
     send_internal_error/1,
     send_not_found/1,
     resolve_handler/2,
-    route_middlewares/1,
     response_status/1,
     response_kind/1
 ]).
@@ -782,14 +781,6 @@ response_kind({loop, _, _, _}) -> loop;
 response_kind({sendfile, _, _, _}) -> sendfile;
 response_kind({websocket, _, _}) -> websocket;
 response_kind({_, _, _}) -> buffered.
-
--doc false.
--spec route_middlewares(roadrunner_http1:request()) -> roadrunner_middleware:middleware_list().
-route_middlewares(Req) ->
-    case roadrunner_req:route_opts(Req) of
-        #{middlewares := Mws} -> Mws;
-        _ -> []
-    end.
 
 %% HTTP/1.0 default close. HTTP/1.1 keep-alive unless either side
 %% set Connection: close.
