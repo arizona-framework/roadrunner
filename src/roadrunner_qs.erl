@@ -19,6 +19,8 @@ that fail to decode pass through as raw bytes.
 %% Trigger bytes that mean `decode/1` actually has to do work.
 %% Pre-compiled at module load (see `init_patterns/0`).
 -define(QS_TRIGGERS_KEY, {?MODULE, qs_triggers_cp}).
+-define(AMP_KEY, {?MODULE, amp_cp}).
+-define(EQ_KEY, {?MODULE, eq_cp}).
 
 -doc """
 Parse a query string into an ordered list of `{Key, Value}` pairs.
@@ -29,11 +31,15 @@ Parse a query string into an ordered list of `{Key, Value}` pairs.
 parse(<<>>) ->
     [];
 parse(Bin) when is_binary(Bin) ->
-    [parse_pair(P) || P <- binary:split(Bin, ~"&", [global]), P =/= <<>>].
+    EqCp = persistent_term:get(?EQ_KEY),
+    [
+        parse_pair(P, EqCp)
+     || P <- binary:split(Bin, persistent_term:get(?AMP_KEY), [global]), P =/= <<>>
+    ].
 
--spec parse_pair(binary()) -> {binary(), binary() | true}.
-parse_pair(Pair) ->
-    case binary:split(Pair, ~"=") of
+-spec parse_pair(binary(), binary:cp()) -> {binary(), binary() | true}.
+parse_pair(Pair, EqCp) ->
+    case binary:split(Pair, EqCp) of
         [Key] -> {decode(Key), true};
         [Key, Value] -> {decode(Key), decode(Value)}
     end.
@@ -92,4 +98,6 @@ encode_component(Bin) ->
 -spec init_patterns() -> ok.
 init_patterns() ->
     persistent_term:put(?QS_TRIGGERS_KEY, binary:compile_pattern([~"+", ~"%"])),
+    persistent_term:put(?AMP_KEY, binary:compile_pattern(~"&")),
+    persistent_term:put(?EQ_KEY, binary:compile_pattern(~"=")),
     ok.

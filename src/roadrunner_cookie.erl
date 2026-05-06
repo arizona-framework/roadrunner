@@ -6,6 +6,11 @@ Currently provides `parse/1` for the request-side `Cookie` header.
 The response-side `Set-Cookie` builder will arrive in a later feature.
 """.
 
+-on_load(init_patterns/0).
+
+-define(SEMI_CP_KEY, {?MODULE, semi_cp}).
+-define(EQ_CP_KEY, {?MODULE, eq_cp}).
+
 -export([parse/1, serialize/3]).
 
 -export_type([serialize_opts/0]).
@@ -33,26 +38,27 @@ so a cookie like `sid=a=b=c` parses as a single pair with value `a=b=c`.
 parse(<<>>) ->
     [];
 parse(Bin) when is_binary(Bin) ->
-    parse_pairs(binary:split(Bin, ~";", [global])).
+    EqCp = persistent_term:get(?EQ_CP_KEY),
+    parse_pairs(binary:split(Bin, persistent_term:get(?SEMI_CP_KEY), [global]), EqCp).
 
--spec parse_pairs([binary()]) -> [{binary(), binary()}].
-parse_pairs([]) ->
+-spec parse_pairs([binary()], binary:cp()) -> [{binary(), binary()}].
+parse_pairs([], _EqCp) ->
     [];
-parse_pairs([Pair | Rest]) ->
+parse_pairs([Pair | Rest], EqCp) ->
     %% RFC 6265 §5.2: trim name and value of leading/trailing OWS
     %% **separately** — `<<"  a  =b">>` should yield Name = `<<"a">>`,
     %% not `<<"a  ">>`. Trimming the whole pair first would miss the
     %% spaces around `=`.
-    case binary:split(Pair, ~"=") of
+    case binary:split(Pair, EqCp) of
         [RawName, RawValue] ->
             case trim_ows(RawName) of
                 <<>> ->
-                    parse_pairs(Rest);
+                    parse_pairs(Rest, EqCp);
                 Name ->
-                    [{Name, trim_ows(RawValue)} | parse_pairs(Rest)]
+                    [{Name, trim_ows(RawValue)} | parse_pairs(Rest, EqCp)]
             end;
         _ ->
-            parse_pairs(Rest)
+            parse_pairs(Rest, EqCp)
     end.
 
 -doc """
@@ -134,3 +140,12 @@ trim_trailing_ows(B) ->
         _ ->
             B
     end.
+
+%% `-on_load` callback. See `feedback_compile_pattern_convention` —
+%% binary:match/split patterns belong in `persistent_term` so the
+%% per-cookie hot path doesn't recompile on every call.
+-spec init_patterns() -> ok.
+init_patterns() ->
+    persistent_term:put(?SEMI_CP_KEY, binary:compile_pattern(~";")),
+    persistent_term:put(?EQ_CP_KEY, binary:compile_pattern(~"=")),
+    ok.

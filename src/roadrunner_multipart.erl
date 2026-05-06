@@ -51,6 +51,15 @@ listener's `max_content_length` (default 10 MB).
   `multipart/form-data`, so this is rarely needed.
 """.
 
+-on_load(init_patterns/0).
+
+-define(SEMI_CP_KEY, {?MODULE, semi_cp}).
+-define(EQ_CP_KEY, {?MODULE, eq_cp}).
+-define(QUOTE_CP_KEY, {?MODULE, quote_cp}).
+-define(CRLF_CP_KEY, {?MODULE, crlf_cp}).
+-define(DBL_CRLF_CP_KEY, {?MODULE, dbl_crlf_cp}).
+-define(COLON_CP_KEY, {?MODULE, colon_cp}).
+
 -export([parse/2, boundary/1, params/1]).
 -export_type([part/0]).
 
@@ -92,33 +101,36 @@ Malformed pairs (no `=`) are silently skipped.
 """.
 -spec params(binary()) -> #{binary() => binary()}.
 params(Value) when is_binary(Value) ->
+    SemiCp = persistent_term:get(?SEMI_CP_KEY),
     Tail =
-        case binary:split(Value, ~";") of
+        case binary:split(Value, SemiCp) of
             [_Type] -> <<>>;
             [_Type, Rest] -> Rest
         end,
-    parse_pairs(binary:split(Tail, ~";", [global]), #{}).
+    parse_pairs(binary:split(Tail, SemiCp, [global]), persistent_term:get(?EQ_CP_KEY), #{}).
 
--spec parse_pairs([binary()], #{binary() => binary()}) -> #{binary() => binary()}.
-parse_pairs([], Acc) ->
+-spec parse_pairs([binary()], binary:cp(), #{binary() => binary()}) ->
+    #{binary() => binary()}.
+parse_pairs([], _EqCp, Acc) ->
     Acc;
-parse_pairs([Pair | Rest], Acc) ->
-    case binary:split(string:trim(Pair), ~"=") of
+parse_pairs([Pair | Rest], EqCp, Acc) ->
+    case binary:split(string:trim(Pair), EqCp) of
         [Key, Val] ->
             %% Unquote first so internal whitespace inside quoted strings
             %% is preserved; trim afterwards catches trailing whitespace
             %% on bare (unquoted) values.
             parse_pairs(
                 Rest,
+                EqCp,
                 Acc#{roadrunner_bin:ascii_lowercase(Key) => string:trim(unquote(Val))}
             );
         _ ->
-            parse_pairs(Rest, Acc)
+            parse_pairs(Rest, EqCp, Acc)
     end.
 
 -spec unquote(binary()) -> binary().
 unquote(<<$", Rest/binary>>) ->
-    case binary:match(Rest, ~"\"") of
+    case binary:match(Rest, persistent_term:get(?QUOTE_CP_KEY)) of
         {End, _} -> binary:part(Rest, 0, End);
         nomatch -> Rest
     end;
@@ -174,9 +186,10 @@ parse_parts(_, _) ->
 parse_one_part(<<"\r\n", BodyAndRest/binary>>, Sep) ->
     extract_body(BodyAndRest, [], Sep);
 parse_one_part(Bytes, Sep) ->
-    case binary:split(Bytes, ~"\r\n\r\n") of
+    case binary:split(Bytes, persistent_term:get(?DBL_CRLF_CP_KEY)) of
         [HeaderBlock, BodyAndRest] ->
-            case parse_header_lines(binary:split(HeaderBlock, ~"\r\n", [global])) of
+            CrlfCp = persistent_term:get(?CRLF_CP_KEY),
+            case parse_header_lines(binary:split(HeaderBlock, CrlfCp, [global])) of
                 {ok, Headers} -> extract_body(BodyAndRest, Headers, Sep);
                 {error, _} = E -> E
             end;
@@ -195,12 +208,17 @@ extract_body(BodyAndRest, Headers, Sep) ->
 
 -spec parse_header_lines([binary()]) ->
     {ok, [{binary(), binary()}]} | {error, bad_header}.
-parse_header_lines([]) ->
+parse_header_lines(Lines) ->
+    parse_header_lines_loop(Lines, persistent_term:get(?COLON_CP_KEY)).
+
+-spec parse_header_lines_loop([binary()], binary:cp()) ->
+    {ok, [{binary(), binary()}]} | {error, bad_header}.
+parse_header_lines_loop([], _ColonCp) ->
     {ok, []};
-parse_header_lines([Line | Rest]) ->
-    case binary:split(Line, ~":") of
+parse_header_lines_loop([Line | Rest], ColonCp) ->
+    case binary:split(Line, ColonCp) of
         [Name, Value] ->
-            case parse_header_lines(Rest) of
+            case parse_header_lines_loop(Rest, ColonCp) of
                 {ok, More} ->
                     {ok, [{roadrunner_bin:ascii_lowercase(Name), string:trim(Value)} | More]};
                 {error, _} = E ->
@@ -209,3 +227,14 @@ parse_header_lines([Line | Rest]) ->
         _ ->
             {error, bad_header}
     end.
+
+%% `-on_load` callback. See `feedback_compile_pattern_convention`.
+-spec init_patterns() -> ok.
+init_patterns() ->
+    persistent_term:put(?SEMI_CP_KEY, binary:compile_pattern(~";")),
+    persistent_term:put(?EQ_CP_KEY, binary:compile_pattern(~"=")),
+    persistent_term:put(?QUOTE_CP_KEY, binary:compile_pattern(~"\"")),
+    persistent_term:put(?CRLF_CP_KEY, binary:compile_pattern(~"\r\n")),
+    persistent_term:put(?DBL_CRLF_CP_KEY, binary:compile_pattern(~"\r\n\r\n")),
+    persistent_term:put(?COLON_CP_KEY, binary:compile_pattern(~":")),
+    ok.

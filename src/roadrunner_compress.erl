@@ -67,6 +67,7 @@ gzip avoids the question.
 
 -define(THRESHOLD, 860).
 -define(COMMA_CP_KEY, {?MODULE, comma_cp}).
+-define(SEMI_CP_KEY, {?MODULE, semi_cp}).
 
 -type encoding() :: gzip | deflate | none.
 
@@ -234,13 +235,18 @@ negotiate_encoding(Req) ->
         Value ->
             Lower = roadrunner_bin:ascii_lowercase(Value),
             CommaCp = persistent_term:get(?COMMA_CP_KEY),
+            SemiCp = persistent_term:get(?SEMI_CP_KEY),
             %% Walk tokens once, recording per-encoding qvalues.
             %% `Wildcard` covers any encoding name not seen; `Gzip`
             %% / `Deflate` override the wildcard. `undefined` means
             %% the encoding wasn't mentioned at all.
             {Gzip, Deflate, Wildcard} =
                 walk_tokens(
-                    binary:split(Lower, CommaCp, [global]), undefined, undefined, undefined
+                    binary:split(Lower, CommaCp, [global]),
+                    SemiCp,
+                    undefined,
+                    undefined,
+                    undefined
                 ),
             choose(effective_q(Gzip, Wildcard), effective_q(Deflate, Wildcard))
     end.
@@ -263,25 +269,25 @@ choose(_, _) -> none.
 %% Walk the comma-split token list once, accumulating per-encoding
 %% qvalues. Unrecognized encoding names (br, identity, etc.) are
 %% ignored — they don't affect the gzip/deflate pick.
--spec walk_tokens([binary()], qvalue(), qvalue(), qvalue()) ->
+-spec walk_tokens([binary()], binary:cp(), qvalue(), qvalue(), qvalue()) ->
     {qvalue(), qvalue(), qvalue()}.
-walk_tokens([], Gzip, Deflate, Wildcard) ->
+walk_tokens([], _SemiCp, Gzip, Deflate, Wildcard) ->
     {Gzip, Deflate, Wildcard};
-walk_tokens([Token | Rest], Gzip, Deflate, Wildcard) ->
-    {Name, Q} = parse_token(Token),
+walk_tokens([Token | Rest], SemiCp, Gzip, Deflate, Wildcard) ->
+    {Name, Q} = parse_token(Token, SemiCp),
     case Name of
-        ~"gzip" -> walk_tokens(Rest, Q, Deflate, Wildcard);
-        ~"deflate" -> walk_tokens(Rest, Gzip, Q, Wildcard);
-        ~"*" -> walk_tokens(Rest, Gzip, Deflate, Q);
-        _ -> walk_tokens(Rest, Gzip, Deflate, Wildcard)
+        ~"gzip" -> walk_tokens(Rest, SemiCp, Q, Deflate, Wildcard);
+        ~"deflate" -> walk_tokens(Rest, SemiCp, Gzip, Q, Wildcard);
+        ~"*" -> walk_tokens(Rest, SemiCp, Gzip, Deflate, Q);
+        _ -> walk_tokens(Rest, SemiCp, Gzip, Deflate, Wildcard)
     end.
 
 %% Parse one `name[;q=value]` token. Other parameters (`;level=fast`
 %% and similar — RFC allows them though they're rarely used for
 %% Accept-Encoding) are ignored; only `q=` is recognized.
--spec parse_token(binary()) -> {binary(), float()}.
-parse_token(Token) ->
-    case binary:split(Token, ~";", [global]) of
+-spec parse_token(binary(), binary:cp()) -> {binary(), float()}.
+parse_token(Token, SemiCp) ->
+    case binary:split(Token, SemiCp, [global]) of
         [Name] ->
             {string:trim(Name), 1.0};
         [Name | Params] ->
@@ -329,4 +335,5 @@ add_vary(Headers) ->
 -spec init_patterns() -> ok.
 init_patterns() ->
     persistent_term:put(?COMMA_CP_KEY, binary:compile_pattern(~",")),
+    persistent_term:put(?SEMI_CP_KEY, binary:compile_pattern(~";")),
     ok.

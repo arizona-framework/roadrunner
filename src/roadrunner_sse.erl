@@ -43,6 +43,10 @@ Per the SSE spec ([WHATWG HTML §9.2](https://html.spec.whatwg.org/multipage/ser
   proxies that close idle connections.
 """.
 
+-on_load(init_patterns/0).
+
+-define(LF_CP_KEY, {?MODULE, lf_cp}).
+
 -export([
     event/1,
     event/2,
@@ -108,4 +112,13 @@ retry(Ms) when is_integer(Ms), Ms >= 0 ->
 %% trailing blank line that ends the event.
 -spec data_lines(binary()) -> iodata().
 data_lines(Data) ->
-    [[~"data: ", Line, $\n] || Line <- binary:split(Data, ~"\n", [global])].
+    [
+        [~"data: ", Line, $\n]
+     || Line <- binary:split(Data, persistent_term:get(?LF_CP_KEY), [global])
+    ].
+
+%% `-on_load` callback. See `feedback_compile_pattern_convention`.
+-spec init_patterns() -> ok.
+init_patterns() ->
+    persistent_term:put(?LF_CP_KEY, binary:compile_pattern(~"\n")),
+    ok.

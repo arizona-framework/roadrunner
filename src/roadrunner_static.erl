@@ -35,6 +35,11 @@ directories are still followed by the kernel.
 
 -include_lib("kernel/include/file.hrl").
 
+-on_load(init_patterns/0).
+
+-define(COMMA_CP_KEY, {?MODULE, comma_cp}).
+-define(DASH_CP_KEY, {?MODULE, dash_cp}).
+
 -export([handle/1]).
 
 -define(MIME_TYPES, #{
@@ -194,7 +199,7 @@ if_none_match(Req) ->
 parse_range(undefined, _Size) ->
     none;
 parse_range(<<"bytes=", Spec/binary>>, Size) ->
-    case binary:match(Spec, ~",") of
+    case binary:match(Spec, persistent_term:get(?COMMA_CP_KEY)) of
         nomatch -> parse_single_range(Spec, Size);
         %% Multi-range — falls back to a 200 with the full body.
         _ -> none
@@ -205,7 +210,7 @@ parse_range(_, _Size) ->
 -spec parse_single_range(binary(), non_neg_integer()) ->
     {range, non_neg_integer(), non_neg_integer()} | unsatisfiable | none.
 parse_single_range(Spec, Size) ->
-    case binary:split(Spec, ~"-") of
+    case binary:split(Spec, persistent_term:get(?DASH_CP_KEY)) of
         [<<>>, SuffixLen] ->
             %% `bytes=-S` — last S bytes.
             case bin_to_pos_int(SuffixLen) of
@@ -436,3 +441,10 @@ month_number(Mon) ->
         ~"Nov" => 11,
         ~"Dec" => 12
     }).
+
+%% `-on_load` callback. See `feedback_compile_pattern_convention`.
+-spec init_patterns() -> ok.
+init_patterns() ->
+    persistent_term:put(?COMMA_CP_KEY, binary:compile_pattern(~",")),
+    persistent_term:put(?DASH_CP_KEY, binary:compile_pattern(~"-")),
+    ok.

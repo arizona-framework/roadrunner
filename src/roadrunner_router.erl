@@ -1,4 +1,7 @@
 -module(roadrunner_router).
+-on_load(init_patterns/0).
+
+-define(SLASH_CP_KEY, {?MODULE, slash_cp}).
 -moduledoc """
 Path → handler dispatch with parameterized segments.
 
@@ -99,4 +102,12 @@ match_pattern(_, _, _) ->
 
 -spec path_segments(binary()) -> [binary()].
 path_segments(Path) ->
-    binary:split(Path, ~"/", [global, trim_all]).
+    binary:split(Path, persistent_term:get(?SLASH_CP_KEY), [global, trim_all]).
+
+%% `-on_load` callback. Compiles the path-segment separator once at
+%% module load — see the `feedback_compile_pattern_convention`
+%% project rule.
+-spec init_patterns() -> ok.
+init_patterns() ->
+    persistent_term:put(?SLASH_CP_KEY, binary:compile_pattern(~"/")),
+    ok.

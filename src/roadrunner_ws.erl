@@ -30,6 +30,7 @@ features.
 -define(EXT_PARAM_CP_KEY, {?MODULE, ext_param_cp}).
 -define(EXT_KV_CP_KEY, {?MODULE, ext_kv_cp}).
 -define(EXT_QUOTE_CP_KEY, {?MODULE, ext_quote_cp}).
+-define(UPGRADE_CP_KEY, {?MODULE, upgrade_cp}).
 
 -type opcode() :: continuation | text | binary | close | ping | pong.
 -type frame() :: #{
@@ -205,7 +206,9 @@ has_upgrade_token(undefined) ->
 has_upgrade_token(Value) ->
     %% Connection may be a comma-separated token list — match
     %% case-insensitively against any token.
-    case binary:match(roadrunner_bin:ascii_lowercase(Value), ~"upgrade") of
+    case
+        binary:match(roadrunner_bin:ascii_lowercase(Value), persistent_term:get(?UPGRADE_CP_KEY))
+    of
         nomatch -> false;
         _ -> true
     end.
@@ -731,4 +734,5 @@ init_patterns() ->
     persistent_term:put(?EXT_PARAM_CP_KEY, binary:compile_pattern(~";")),
     persistent_term:put(?EXT_KV_CP_KEY, binary:compile_pattern(~"=")),
     persistent_term:put(?EXT_QUOTE_CP_KEY, binary:compile_pattern(~"\"")),
+    persistent_term:put(?UPGRADE_CP_KEY, binary:compile_pattern(~"upgrade")),
     ok.

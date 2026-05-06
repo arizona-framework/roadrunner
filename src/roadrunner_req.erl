@@ -16,6 +16,14 @@ this module so the internal h1 module can be renamed or
 restructured without breaking the public contract.
 """.
 
+-on_load(init_patterns/0).
+
+-define(QMARK_CP_KEY, {?MODULE, qmark_cp}).
+-define(SEMI_CP_KEY, {?MODULE, semi_cp}).
+-define(COMMA_CP_KEY, {?MODULE, comma_cp}).
+-define(EQ_CP_KEY, {?MODULE, eq_cp}).
+-define(QUOTE_CP_KEY, {?MODULE, quote_cp}).
+
 -export_type([request/0, headers/0, version/0, status/0, redirect_status/0]).
 
 -type request() :: roadrunner_http1:request().
@@ -73,7 +81,7 @@ router's job.
 """.
 -spec path(request()) -> binary().
 path(#{target := T}) ->
-    case binary:split(T, ~"?") of
+    case binary:split(T, persistent_term:get(?QMARK_CP_KEY)) of
         [P, _Q] -> P;
         [P] -> P
     end.
@@ -86,7 +94,7 @@ For decoded `{Key, Value}` pairs, pipe through `roadrunner_qs:parse/1`.
 """.
 -spec qs(request()) -> binary().
 qs(#{target := T}) ->
-    case binary:split(T, ~"?") of
+    case binary:split(T, persistent_term:get(?QMARK_CP_KEY)) of
         [_P, Q] -> Q;
         [_P] -> <<>>
     end.
@@ -298,7 +306,7 @@ read_form(Req) ->
 
 -spec content_type_kind(binary()) -> urlencoded | multipart | unsupported.
 content_type_kind(ContentType) ->
-    [Type | _] = binary:split(ContentType, ~";"),
+    [Type | _] = binary:split(ContentType, persistent_term:get(?SEMI_CP_KEY)),
     case roadrunner_bin:ascii_lowercase(string:trim(Type)) of
         ~"application/x-www-form-urlencoded" -> urlencoded;
         ~"multipart/form-data" -> multipart;
@@ -381,9 +389,12 @@ forwarded_for(Req) ->
         Value ->
             %% First forwarded-element wins; multiple proxies append
             %% comma-separated entries with the original client leftmost.
-            [First | _] = binary:split(Value, ~","),
+            [First | _] = binary:split(Value, persistent_term:get(?COMMA_CP_KEY)),
             empty_to_undefined(
-                find_for_param(binary:split(string:trim(First), ~";", [global]))
+                find_for_param(
+                    binary:split(string:trim(First), persistent_term:get(?SEMI_CP_KEY), [global]),
+                    persistent_term:get(?EQ_CP_KEY)
+                )
             )
     end.
 
@@ -399,30 +410,30 @@ x_forwarded_for(Req) ->
         undefined ->
             undefined;
         Value ->
-            [First | _] = binary:split(Value, ~","),
+            [First | _] = binary:split(Value, persistent_term:get(?COMMA_CP_KEY)),
             case string:trim(First) of
                 <<>> -> undefined;
                 Trimmed -> Trimmed
             end
     end.
 
--spec find_for_param([binary()]) -> binary() | undefined.
-find_for_param([]) ->
+-spec find_for_param([binary()], binary:cp()) -> binary() | undefined.
+find_for_param([], _EqCp) ->
     undefined;
-find_for_param([Pair | Rest]) ->
-    case binary:split(Pair, ~"=") of
+find_for_param([Pair | Rest], EqCp) ->
+    case binary:split(Pair, EqCp) of
         [Key, Val] ->
             case roadrunner_bin:ascii_lowercase(string:trim(Key)) of
                 ~"for" -> unquote_param(string:trim(Val));
-                _ -> find_for_param(Rest)
+                _ -> find_for_param(Rest, EqCp)
             end;
         _ ->
-            find_for_param(Rest)
+            find_for_param(Rest, EqCp)
     end.
 
 -spec unquote_param(binary()) -> binary().
 unquote_param(<<$", Rest/binary>>) ->
-    case binary:match(Rest, ~"\"") of
+    case binary:match(Rest, persistent_term:get(?QUOTE_CP_KEY)) of
         {End, _} -> binary:part(Rest, 0, End);
         nomatch -> Rest
     end;
@@ -464,3 +475,13 @@ the handler is automatically annotated with the same id.
 -spec request_id(request()) -> binary() | undefined.
 request_id(#{request_id := Id}) -> Id;
 request_id(_) -> undefined.
+
+%% `-on_load` callback. See `feedback_compile_pattern_convention`.
+-spec init_patterns() -> ok.
+init_patterns() ->
+    persistent_term:put(?QMARK_CP_KEY, binary:compile_pattern(~"?")),
+    persistent_term:put(?SEMI_CP_KEY, binary:compile_pattern(~";")),
+    persistent_term:put(?COMMA_CP_KEY, binary:compile_pattern(~",")),
+    persistent_term:put(?EQ_CP_KEY, binary:compile_pattern(~"=")),
+    persistent_term:put(?QUOTE_CP_KEY, binary:compile_pattern(~"\"")),
+    ok.
