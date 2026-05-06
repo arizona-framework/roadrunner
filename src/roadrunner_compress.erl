@@ -111,11 +111,16 @@ transform_buffered(Req, Status, Headers, Body) ->
             {Status, Headers, Body};
         false ->
             HeadersWithVary = add_vary(Headers),
-            Encoding = negotiate_encoding(Req),
-            Size = iolist_size(Body),
-            case Encoding =/= none andalso Size >= ?THRESHOLD of
-                true -> compress(Status, HeadersWithVary, Body, Encoding);
-                false -> {Status, HeadersWithVary, Body}
+            case negotiate_encoding(Req) of
+                none ->
+                    %% No encoding negotiated → skip the `iolist_size`
+                    %% walk over the body entirely.
+                    {Status, HeadersWithVary, Body};
+                Encoding ->
+                    case iolist_size(Body) >= ?THRESHOLD of
+                        true -> compress(Status, HeadersWithVary, Body, Encoding);
+                        false -> {Status, HeadersWithVary, Body}
+                    end
             end
     end.
 

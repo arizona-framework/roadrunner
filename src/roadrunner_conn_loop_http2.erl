@@ -917,9 +917,9 @@ handle_send_response(State, From, Ref, StreamId, Status, Headers, Body) ->
             State;
         Stream ->
             BodyLen = byte_size(Body),
-            FitsFrame = BodyLen =< ?MAX_FRAME_SIZE,
-            FitsWindow = window_budget(State, Stream) >= BodyLen,
-            case FitsFrame andalso FitsWindow of
+            %% Short-circuit: skip the `window_budget/2` lookup when the
+            %% body already won't fit in one frame.
+            case BodyLen =< ?MAX_FRAME_SIZE andalso window_budget(State, Stream) >= BodyLen of
                 true ->
                     State1 = encode_and_send_response_atomic(
                         State, StreamId, Status, Headers, Body

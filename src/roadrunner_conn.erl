@@ -812,20 +812,25 @@ keep_alive_decision_full(Req, RespHeaders) ->
     ReqConn = req_connection_lower(Req),
     RespConn = roadrunner_bin:ascii_lowercase(resp_connection_token(RespHeaders)),
     CloseCp = persistent_term:get(?CLOSE_CP_KEY),
-    ReqClose = has_token(ReqConn, CloseCp),
-    RespClose = has_token(RespConn, CloseCp),
     case roadrunner_req:version(Req) of
         {1, 0} ->
             %% RFC 9112 §9.3 + RFC 9110 §7.6.1: HTTP/1.0 default is close, but
             %% `Connection: keep-alive` from client opts in (so long
-            %% as the response doesn't force close).
-            ReqKA = has_token(ReqConn, persistent_term:get(?KEEP_ALIVE_CP_KEY)),
-            case ReqKA andalso not RespClose of
+            %% as the response doesn't force close). `andalso` short-
+            %% circuits on the keep-alive check so the response-side
+            %% `has_token` only fires when the client opted in.
+            case
+                has_token(ReqConn, persistent_term:get(?KEEP_ALIVE_CP_KEY)) andalso
+                    not has_token(RespConn, CloseCp)
+            of
                 true -> keep_alive;
                 false -> close
             end;
         {1, 1} ->
-            case ReqClose orelse RespClose of
+            %% `orelse` short-circuits on ReqClose = true so the
+            %% response-side `has_token` only fires when the client
+            %% didn't already say `close`.
+            case has_token(ReqConn, CloseCp) orelse has_token(RespConn, CloseCp) of
                 true -> close;
                 false -> keep_alive
             end
