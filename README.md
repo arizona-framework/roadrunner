@@ -33,6 +33,28 @@ Standards conformance:
 - **WebSocket compression**: RFC 7692 `permessage-deflate`,
   including `*_max_window_bits` and `*_no_context_takeover`.
 
+## Performance at a glance
+
+Median req/s on a 12th-gen i9-12900HX, 50 clients, 5 s warmup + 5 s
+measure, loopback. Full per-protocol grid + p50/p99 + memory shape
+in [`docs/comparison.md`](docs/comparison.md).
+
+| scenario                  | roadrunner    | cowboy        | elli          |
+|---------------------------|--------------:|--------------:|--------------:|
+| `hello`                   |   **298 k**   |       179 k   |       278 k   |
+| `headers_heavy`           |   **235 k**   |       118 k   |       211 k   |
+| `cookies_heavy`           |   **247 k**   |       154 k   |          —    |
+| `pipelined_h1`            |   **501 k**   |       329 k   |       4.9 k   |
+| `gzip_response`           |   **127 k**   |       100 k   |          —    |
+| `websocket_msg_throughput`|   **199 k**   |       155 k   |          —    |
+
+Bold = row winner. `—` means the elli fixture doesn't support that
+workload shape (no router, no gzip middleware, no native cookie
+parser, no WebSocket). On simple GETs (`hello`, `json`, `echo`)
+roadrunner's lead over elli is within the bench's ~15 % variance
+band — see [`docs/comparison.md`](docs/comparison.md) for the full
+honest framing.
+
 ## Quickstart
 
 Add to `rebar.config`:
@@ -196,9 +218,9 @@ roadrunner:start_listener(my_listener, #{port => 8080, handler => hello_handler}
 
 ## Documentation
 
-- [`docs/comparison.md`](docs/comparison.md) — side-by-side benchmarks
-  vs cowboy and elli (throughput, latency, architectural trade-offs,
-  reproduction commands).
+- [`docs/comparison.md`](docs/comparison.md) — full side-by-side
+  benchmarks vs cowboy and elli (throughput, latency, architectural
+  trade-offs, reproduction commands).
 - [`docs/bench_results.md`](docs/bench_results.md) — full per-protocol
   matrix with p50 / p99 across every scenario.
 - [`docs/resource_results.md`](docs/resource_results.md) — memory + CPU
