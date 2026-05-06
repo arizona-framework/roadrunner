@@ -90,6 +90,14 @@ jobs:
             rebar3-${{ runner.os }}-
 
       - name: Compile test profile
+        env:
+          # OTP 29 RC3 + Fastly TLS workaround so rebar3 can fetch
+          # the rebar3_hex / rebar3_ex_doc plugins from hex.pm.
+          # Pins the rebar3 BEAM to TLS 1.2 + middlebox_comp_mode
+          # off. Scoped to this step only — precommit's eunit/CT
+          # run with normal TLS settings so the TLS 1.2/1.3 tests
+          # keep their coverage. Drop after OTP 29 RC4 lands.
+          ERL_FLAGS: "-config ${{ github.workspace }}/config/rebar3_ssl"
         run: rebar3 as test compile
 
   precommit:
