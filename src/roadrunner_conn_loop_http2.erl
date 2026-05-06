@@ -122,7 +122,7 @@ Response shapes supported:
     recv_window := non_neg_integer(),
     worker_pid := undefined | pid(),
     worker_ref := undefined | reference(),
-    pending_sends := [pending_send()]
+    pending_sends := queue:queue(pending_send())
 }.
 
 -record(loop, {
@@ -637,7 +637,7 @@ new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow) ->
         recv_window => RecvWindow,
         worker_pid => undefined,
         worker_ref => undefined,
-        pending_sends => []
+        pending_sends => queue:new()
     }.
 
 on_continuation(StreamId, Flags, Fragment, #loop{streams = Streams} = State) ->
@@ -1141,14 +1141,19 @@ consume_send_window(
     }.
 
 enqueue_pending(#{pending_sends := Pending} = Stream, Entry) ->
-    Stream#{pending_sends := Pending ++ [Entry]}.
+    Stream#{pending_sends := queue:in(Entry, Pending)}.
 
 %% After a stream's send window grew, drain its pending DATA queue
 %% as far as windows allow.
 flush_pending_data(#loop{streams = Streams} = State, StreamId) ->
     case Streams of
-        #{StreamId := #{pending_sends := []}} -> State;
-        #{StreamId := Stream} -> drain_pending(State, StreamId, Stream)
+        #{StreamId := #{pending_sends := Pending} = Stream} ->
+            case queue:is_empty(Pending) of
+                true -> State;
+                false -> drain_pending(State, StreamId, Stream)
+            end;
+        _ ->
+            State
     end.
 
 %% After the conn-level send window grew, drain every stream's
@@ -1164,20 +1169,23 @@ flush_all_pending_data(#loop{streams = Streams} = State) ->
 
 %% Drain queued sends on a single stream until either the queue is
 %% empty or the window forces us to stop again.
-drain_pending(State, _StreamId, #{pending_sends := []}) ->
-    State;
-drain_pending(State, StreamId, #{pending_sends := [Entry | Rest]} = Stream) ->
-    {data, Ref, From, Bin, EndStream} = Entry,
-    Stream1 = Stream#{pending_sends := Rest},
-    State1 = update_stream(State, StreamId, Stream1),
-    State2 = try_send_data(State1, Stream1, StreamId, From, Ref, Bin, EndStream),
-    #{StreamId := #{pending_sends := Pending2} = Stream2} = State2#loop.streams,
-    case Pending2 of
-        [Entry | _] ->
-            %% Same entry re-queued: window still closed.
-            State2;
-        _ ->
-            drain_pending(State2, StreamId, Stream2)
+drain_pending(State, StreamId, #{pending_sends := Pending} = Stream) ->
+    case queue:out(Pending) of
+        {empty, _} ->
+            State;
+        {{value, Entry}, Rest} ->
+            {data, Ref, From, Bin, EndStream} = Entry,
+            Stream1 = Stream#{pending_sends := Rest},
+            State1 = update_stream(State, StreamId, Stream1),
+            State2 = try_send_data(State1, Stream1, StreamId, From, Ref, Bin, EndStream),
+            #{StreamId := #{pending_sends := Pending2} = Stream2} = State2#loop.streams,
+            case queue:peek(Pending2) of
+                {value, Entry} ->
+                    %% Same entry re-queued: window still closed.
+                    State2;
+                _ ->
+                    drain_pending(State2, StreamId, Stream2)
+            end
     end.
 
 %% =============================================================================
@@ -1227,11 +1235,14 @@ abort_stream(#loop{streams = Streams} = State, StreamId, ErrorCode) ->
 remove_stream(#loop{streams = Streams} = State, StreamId) ->
     State#loop{streams = maps:remove(StreamId, Streams)}.
 
-notify_pending_reset(_StreamId, []) ->
-    ok;
-notify_pending_reset(StreamId, [{data, _Ref, From, _Bin, _Es} | Rest]) ->
-    _ = (From ! {h2_stream_reset, StreamId}),
-    notify_pending_reset(StreamId, Rest).
+notify_pending_reset(StreamId, Pending) ->
+    case queue:out(Pending) of
+        {empty, _} ->
+            ok;
+        {{value, {data, _Ref, From, _Bin, _Es}}, Rest} ->
+            _ = (From ! {h2_stream_reset, StreamId}),
+            notify_pending_reset(StreamId, Rest)
+    end.
 
 %% =============================================================================
 %% Generic helpers
