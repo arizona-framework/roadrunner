@@ -46,6 +46,7 @@ Per the SSE spec ([WHATWG HTML §9.2](https://html.spec.whatwg.org/multipage/ser
 -on_load(init_patterns/0).
 
 -define(LF_CP_KEY, {?MODULE, lf_cp}).
+-define(LINE_BREAK_CP_KEY, {?MODULE, line_break_cp}).
 
 -export([
     event/1,
@@ -94,7 +95,7 @@ comment(Text) when is_binary(Text) ->
 %% is exempt; multi-line `data:` emission is handled by `data_lines/1`.
 -spec check_single_line(binary(), atom()) -> ok.
 check_single_line(Bin, Field) ->
-    case binary:match(Bin, [<<$\r>>, <<$\n>>]) of
+    case binary:match(Bin, persistent_term:get(?LINE_BREAK_CP_KEY)) of
         nomatch -> ok;
         _ -> error({sse_line_break, Field, Bin})
     end.
@@ -121,4 +122,5 @@ data_lines(Data) ->
 -spec init_patterns() -> ok.
 init_patterns() ->
     persistent_term:put(?LF_CP_KEY, binary:compile_pattern(~"\n")),
+    persistent_term:put(?LINE_BREAK_CP_KEY, binary:compile_pattern([~"\r", ~"\n"])),
     ok.
