@@ -1,5 +1,12 @@
 # roadrunner
 
+[![Erlang CI](https://github.com/arizona-framework/roadrunner/actions/workflows/erlang.yml/badge.svg?branch=main)](https://github.com/arizona-framework/roadrunner/actions/workflows/erlang.yml)
+[![Hex.pm](https://img.shields.io/hexpm/v/roadrunner.svg)](https://hex.pm/packages/roadrunner)
+[![Hex Docs](https://img.shields.io/badge/hex-docs-lightgreen.svg)](https://hexdocs.pm/roadrunner/)
+[![License](https://img.shields.io/hexpm/l/roadrunner.svg)](https://github.com/arizona-framework/roadrunner/blob/main/LICENSE.md)
+
+![roadrunner logo](https://raw.githubusercontent.com/arizona-framework/roadrunner/main/assets/logo.jpg)
+
 Pure-Erlang HTTP/1.1 + HTTP/2 + WebSocket server for OTP 28+. **Beep beep.**
 
 Built ground-up via TDD as the HTTP backbone for the
