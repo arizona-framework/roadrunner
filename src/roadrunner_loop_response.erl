@@ -89,9 +89,9 @@ info_loop(Socket, Handler, Push, State) ->
     end.
 
 %% Push fun handed to the user handler. Same special-case as
-%% `roadrunner_stream_response:stream_frame/2` (Phase 3): zero-length
-%% data would encode as `0\r\n\r\n` — the chunked terminator —
-%% which would end the response mid-loop. Skip empty pushes.
+%% `roadrunner_stream_response:stream_frame/2`: zero-length data
+%% would encode as `0\r\n\r\n` — the chunked terminator — which
+%% would end the response mid-loop. Skip empty pushes.
 -spec make_push(roadrunner_transport:socket()) -> roadrunner_handler:push_fun().
 make_push(Socket) ->
     fun(Data) ->

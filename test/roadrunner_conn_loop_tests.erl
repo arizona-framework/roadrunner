@@ -3,7 +3,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %% =============================================================================
-%% Phase 1 + Phase 2 — awaiting_shoot + read_request phase.
+%% Connection-loop tests — awaiting_shoot + read_request + dispatch.
 %%
 %% Asserts:
 %%   - `start/2` returns `{ok, Pid}` shape.
@@ -13,12 +13,11 @@
 %%   - `Pid ! {roadrunner_drain, _}` exits cleanly in awaiting_shoot
 %%     (no telemetry — accept hadn't fired yet).
 %%   - Stray info messages don't crash the conn.
-%%   - **Phase 2** — after `shoot`, the conn enters reading_request,
-%%     parses bytes via `roadrunner_http1:parse_request/1`, sends 400 on
-%%     malformed input, sends 408 when the request_timeout fires
-%%     before any bytes arrive, exits cleanly on drain mid-recv,
-%%     stays alive across stray messages, exits silently on TCP close
-%%     mid-headers.
+%%   - After `shoot`, the conn enters reading_request, parses bytes
+%%     via `roadrunner_http1:parse_request/1`, sends 400 on malformed
+%%     input, sends 408 when the request_timeout fires before any
+%%     bytes arrive, exits cleanly on drain mid-recv, stays alive
+%%     across stray messages, exits silently on TCP close mid-headers.
 %%   - Slot release on every clean exit path.
 %%   - Telemetry pairing: every `accept` is paired with a `conn_close`.
 %% =============================================================================
@@ -93,13 +92,12 @@ slot_released_on_drain_in_awaiting_shoot_test() ->
     end,
     ?assertEqual(0, atomics:get(Counter, 1)).
 
-%% --- Phase 2 — read_request phase ---
+%% --- read_request + dispatch ---
 
 shoot_then_valid_request_dispatches_hello_handler_test() ->
-    %% Phase 3a — the conn parses the request, dispatches the
-    %% configured handler (default `roadrunner_hello_handler`), writes
-    %% the 200 response, and exits cleanly. (No keep-alive yet —
-    %% lands in Phase 3c.)
+    %% The conn parses the request, dispatches the configured handler
+    %% (default `roadrunner_hello_handler`), writes the 200 response,
+    %% and exits cleanly.
     ensure_pg(),
     Self = self(),
     Tag = make_ref(),
@@ -137,9 +135,7 @@ bad_request_writes_400_then_exits_test() ->
 
 request_timeout_writes_408_then_exits_test() ->
     %% No bytes — the request_timeout `after` clause should fire and
-    %% the conn should write 408 before exiting (this is "first request
-    %% on fresh conn" — Phase 2 only sees first; keep_alive lands in
-    %% Phase 3).
+    %% the conn should write 408 before exiting.
     ensure_pg(),
     Self = self(),
     Tag = make_ref(),

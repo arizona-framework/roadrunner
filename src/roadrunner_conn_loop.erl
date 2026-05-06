@@ -203,8 +203,9 @@ http2_negotiated(Socket) ->
 %%   3. The receive's `after RequestTimeout` clause handles
 %%      slowloris — no `start_timer` / `cancel_timer` per iteration.
 %%
-%% Phase 2 only handles the "first request on a fresh conn" case;
-%% Phase 3 will add keep-alive loop-back and pipelined leftover.
+%% Re-entered for every keep-alive iteration; pipelined leftover from
+%% the previous request is already in `buffered` and parsed first
+%% before any new recv.
 -spec read_request_phase(#loop_state{}) -> no_return().
 read_request_phase(#loop_state{buffered = Buf} = S) ->
     Timeout = phase_timeout(S),
@@ -418,8 +419,8 @@ timeout_response(#loop_state{phase = keep_alive}) ->
 
 %% Try parsing the accumulated buffer. On `{more, _}` we re-arm and
 %% wait for more bytes; on `{ok, Req, Rest}` we've parsed a full
-%% request (Phase 2 placeholder: exit clean — Phase 3 will dispatch
-%% body + handler); on `{error, _}` we send 400 and exit.
+%% request and dispatch into the body/handler phase; on `{error, _}`
+%% we send 400 and exit.
 -spec handle_request_bytes(#loop_state{}, integer()) -> no_return().
 handle_request_bytes(
     #loop_state{
@@ -496,10 +497,9 @@ read_body_phase(
         auto ->
             case roadrunner_conn:read_body(Req, Buffered, Recv, MaxCL) of
                 {ok, Body, Leftover} ->
-                    %% Leftover is bytes past the body — Phase 3c will
-                    %% feed it back to the next reading_request iteration
-                    %% as pipelined leftover. Phase 3a closes after one
-                    %% request, so it's discarded here.
+                    %% Leftover is bytes past the body — feed it
+                    %% back to the next read_request_phase iteration
+                    %% as pipelined leftover.
                     dispatch_phase(S#loop_state{buffered = Leftover}, Req#{body => Body});
                 {error, content_length_too_large} ->
                     _ = roadrunner_conn:drain_oversized_body(Buffered, Socket, MaxCL),
@@ -536,8 +536,7 @@ read_body_phase(
 %% pipeline, run it bracketed by request_start / request_stop |
 %% request_exception telemetry. The 5 response shapes (buffered,
 %% stream, loop, sendfile, websocket) dispatch to their respective
-%% writers — Phase 3a wires the buffered (3-tuple) shape only;
-%% the remaining four land in Phase 3b.
+%% writers via `dispatch_response/4`.
 -spec dispatch_phase(#loop_state{}, roadrunner_http1:request()) -> no_return().
 dispatch_phase(
     #loop_state{
