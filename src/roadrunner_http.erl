@@ -16,15 +16,17 @@ Items here:
 - Header list shape: `[{binary(), binary()}]`.
 - HTTP status codes: `100..599` and the redirect subset.
 - Protocol version tuple: `{Major, Minor}`.
-- IMF-fixdate formatter (`http_date_now/0`) for the `Date`
-  response header per RFC 9110 §5.6.7.
+- IMF-fixdate formatter (`http_date_now/0` for the current
+  time, `format_http_date/1` for an arbitrary posix timestamp)
+  for the `Date` response header per RFC 9110 §5.6.7 and the
+  `Last-Modified` response header used by the static handler.
 
 `roadrunner_http1` re-exports these as type aliases so existing
 callers using `roadrunner_http1:request()` / `:headers()` etc.
 keep compiling unchanged.
 """.
 
--export([http_date_now/0]).
+-export([http_date_now/0, format_http_date/1]).
 
 -export_type([headers/0, status/0, redirect_status/0, version/0]).
 
@@ -54,9 +56,17 @@ request.
 """.
 -spec http_date_now() -> binary().
 http_date_now() ->
-    {{Y, M, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(
-        erlang:system_time(second), second
-    ),
+    format_http_date(erlang:system_time(second)).
+
+-doc """
+Format a posix timestamp (seconds since epoch) as an IMF-fixdate
+per RFC 9110 §5.6.7. Same shape as `http_date_now/0` but for an
+explicit timestamp — used by the static file handler to emit the
+`Last-Modified` header for a file's mtime.
+""".
+-spec format_http_date(integer()) -> binary().
+format_http_date(Posix) ->
+    {{Y, M, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(Posix, second),
     DayName = element(calendar:day_of_the_week(Y, M, D), ?DAY_NAMES),
     MonthName = element(M, ?MONTH_NAMES),
     <<DayName/binary, ", ", (pad2(D))/binary, " ", MonthName/binary, " ",

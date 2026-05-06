@@ -103,7 +103,7 @@ serve_followed_file(FilePath, Req) ->
 ) -> roadrunner_handler:response().
 serve_regular_file(FilePath, Size, Mtime, Req) ->
     ETag = etag(Size, Mtime),
-    LastMod = format_http_date(Mtime),
+    LastMod = roadrunner_http:format_http_date(Mtime),
     case is_cached(Req, ETag, Mtime) of
         true ->
             {304,
@@ -357,20 +357,6 @@ target_inside_docroot(FilePath, Req) ->
             string:prefix(TargetBin, DirAbs) =/= nomatch
     end.
 
-%% Format a posix timestamp as IMF-fixdate (RFC 9110 §5.6.7) — the
-%% canonical HTTP date format. Example: `Sun, 06 Nov 1994 08:49:37 GMT`.
--spec format_http_date(integer()) -> binary().
-format_http_date(Posix) ->
-    {{Y, M, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(Posix, second),
-    DayName = day_name(calendar:day_of_the_week(Y, M, D)),
-    MonthName = month_name(M),
-    iolist_to_binary(
-        io_lib:format(
-            "~s, ~2..0B ~s ~4..0B ~2..0B:~2..0B:~2..0B GMT",
-            [DayName, D, MonthName, Y, H, Mi, S]
-        )
-    ).
-
 %% Parse an IMF-fixdate header back into a posix timestamp. Returns
 %% `error` for any other format (we don't bother with the legacy RFC 850
 %% or asctime forms; modern clients all emit IMF-fixdate).
@@ -413,15 +399,6 @@ parse_http_date(<<
     end;
 parse_http_date(_) ->
     error.
-
-day_name(N) ->
-    element(N, {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}).
-
-month_name(N) ->
-    element(
-        N,
-        {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
-    ).
 
 %% `maps:get/2` raises `{badkey, _}` on an unknown month abbreviation;
 %% the surrounding try/catch in `parse_http_date/1` turns that into
