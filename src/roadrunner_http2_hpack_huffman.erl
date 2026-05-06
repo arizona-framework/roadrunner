@@ -128,14 +128,10 @@ decode_loop(<<>>, Table, State, Out) ->
 decode_loop(<<Byte, Rest/binary>>, Table, State, Out) ->
     Hi = Byte bsr 4,
     Lo = Byte band 16#0F,
-    case nibble_step(Table, State, Hi, Out) of
-        {error, _} = E ->
-            E;
-        {ok, S1, Out1} ->
-            case nibble_step(Table, S1, Lo, Out1) of
-                {error, _} = E -> E;
-                {ok, S2, Out2} -> decode_loop(Rest, Table, S2, Out2)
-            end
+    maybe
+        {ok, S1, Out1} ?= nibble_step(Table, State, Hi, Out),
+        {ok, S2, Out2} ?= nibble_step(Table, S1, Lo, Out1),
+        decode_loop(Rest, Table, S2, Out2)
     end.
 
 %% RFC 7541's Huffman codes are Kraft-equal (sum of 2^-len = 1) so
