@@ -25,8 +25,8 @@ Older OTPs won't compile, and the throughput numbers in the
 ## 🚧 Status
 
 Roadrunner is in `0.x`. The core is functional and covered by tests,
-but the API may change between minor versions. Pin an exact version
-in your deps (e.g. `{roadrunner, "0.1.0"}`) if you need stability
+but the API may change between minor versions. Pin an exact commit
+ref in your deps (e.g. `{ref, "<sha>"}`) if you need stability
 across upgrades.
 
 Eunit + Common Test (incl. PropEr) suites with **100 % line coverage**,
@@ -78,7 +78,7 @@ Add to `rebar.config`:
 
 ```erlang
 {deps, [
-    {roadrunner, "0.1.0"}
+    {roadrunner, {git, "https://github.com/arizona-framework/roadrunner.git", {branch, "main"}}}
 ]}.
 ```
 
