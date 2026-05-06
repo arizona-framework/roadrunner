@@ -145,11 +145,11 @@ telemetry_metadata(#{
     }.
 
 emit_handler_response(ConnPid, StreamId, {Status, Headers, Body}) when
-    is_integer(Status), Status >= 100, Status =< 599
+    is_integer(Status, 100, 599)
 ->
     send_buffered(ConnPid, StreamId, Status, Headers, Body);
 emit_handler_response(ConnPid, StreamId, {stream, Status, Headers, Fun}) when
-    is_integer(Status), Status >= 100, Status =< 599, is_function(Fun, 1)
+    is_integer(Status, 100, 599), is_function(Fun, 1)
 ->
     roadrunner_http2_stream_response:run(ConnPid, StreamId, Status, Headers, Fun);
 emit_handler_response(ConnPid, StreamId, {loop, _, _, _}) ->

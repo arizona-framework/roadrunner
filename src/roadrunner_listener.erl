@@ -438,7 +438,7 @@ validate_h2_window_opt(Key, Opts, Max) ->
     case maps:find(Key, Opts) of
         error ->
             ok;
-        {ok, V} when is_integer(V), V >= 1, V =< Max ->
+        {ok, V} when is_integer(V, 1, Max) ->
             ok;
         {ok, V} ->
             error({invalid_listener_opt, Key, V})
