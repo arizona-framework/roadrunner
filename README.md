@@ -1,4 +1,4 @@
-# roadrunner
+# Roadrunner
 
 [![Erlang CI](https://github.com/arizona-framework/roadrunner/actions/workflows/erlang.yml/badge.svg?branch=main)](https://github.com/arizona-framework/roadrunner/actions/workflows/erlang.yml)
 [![Hex.pm](https://img.shields.io/hexpm/v/roadrunner.svg)](https://hex.pm/packages/roadrunner)
