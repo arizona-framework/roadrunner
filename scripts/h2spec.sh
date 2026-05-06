@@ -41,8 +41,22 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
 # TLS h2-enabled listener and writes its bound port to a known file
 # so we can inject it into the h2spec invocation.
 PORT_FILE="$CERT_DIR/port"
-ERL_FLAGS="-config $HOME/.config/rebar3/ssl" \
-mise exec -- rebar3 as test shell --eval "
+
+# `mise exec --` is the local-dev tool-version shim; on CI runners
+# `rebar3` is on PATH directly via `erlef/setup-beam` so we drop the
+# shim. Same for `~/.config/rebar3/ssl` — that's a per-user fix for
+# the OTP-29 + Fastly TLS handshake (see feedback_rebar3_hex_tls);
+# CI's network doesn't need it.
+if command -v mise >/dev/null 2>&1; then
+    rebar3_cmd=(mise exec -- rebar3)
+else
+    rebar3_cmd=(rebar3)
+fi
+if [ -f "$HOME/.config/rebar3/ssl.config" ]; then
+    export ERL_FLAGS="-config $HOME/.config/rebar3/ssl"
+fi
+
+"${rebar3_cmd[@]}" as test shell --eval "
     application:ensure_all_started(roadrunner),
     {ok, _} = roadrunner:start_listener(h2spec_listener, #{
         port => $PORT,

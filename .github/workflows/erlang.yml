@@ -1,7 +1,17 @@
 ---
 # Erlang CI — runs the same `rebar3 precommit` gate contributors run
-# locally (fmt-check, compile, xref, dialyzer, eunit + ct with cover,
-# 100 % line-coverage gate).
+# locally (fmt-check, compile, xref, hank, dialyzer, eunit + ct with
+# cover, 100 % line-coverage gate) plus external conformance harnesses
+# (h2spec for HTTP/2, Autobahn for WebSocket) that back the README's
+# Status claims.
+#
+# Job dependency structure:
+# - cache-erlang: Standalone, sets up Erlang and caches build artifacts.
+#                 Exposes cache keys as outputs.
+# - precommit / h2spec / autobahn: Depend on cache-erlang only, restore
+#                 the same cache, run in parallel. Failure of one
+#                 doesn't block the others — the dashboard shows each
+#                 Status claim as its own check.
 name: Erlang
 
 "on":
@@ -22,8 +32,70 @@ permissions:
   contents: read
 
 jobs:
+  cache-erlang:
+    name: Cache Erlang
+
+    runs-on: ubuntu-24.04
+
+    outputs:
+      build-cache-key: ${{ steps.set-build-key.outputs.key }}
+      build-cache-prefix: ${{ steps.set-build-key.outputs.prefix }}
+      rebar-cache-key: ${{ steps.set-rebar-key.outputs.key }}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24
+        id: setup-beam
+        with:
+          version-type: strict
+          version-file: .tool-versions
+
+      - name: Set build cache key
+        id: set-build-key
+        run: |
+          os="${{ runner.os }}"
+          otp="${{ steps.setup-beam.outputs.otp-version }}"
+          cfg_hash="${{ hashFiles('rebar.config') }}"
+          lock_hash="${{ hashFiles('rebar.lock') }}"
+          prefix="_build-${os}-otp-${otp}-cfg-${cfg_hash}-"
+          echo "prefix=${prefix}" >> "${GITHUB_OUTPUT}"
+          echo "key=${prefix}lock-${lock_hash}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set rebar cache key
+        id: set-rebar-key
+        run: |
+          echo "key=\
+          rebar3-\
+          ${{ runner.os }}-\
+          otp-${{ steps.setup-beam.outputs.otp-version }}-\
+          rebar3-${{ steps.setup-beam.outputs.rebar3-version }}-\
+          config-${{ hashFiles('rebar.config') }}" \
+          >> "${GITHUB_OUTPUT}"
+
+      - name: Cache _build
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: _build
+          key: ${{ steps.set-build-key.outputs.key }}
+          restore-keys: ${{ steps.set-build-key.outputs.prefix }}
+
+      - name: Cache rebar3
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/rebar3
+          key: ${{ steps.set-rebar-key.outputs.key }}
+          restore-keys: |
+            rebar3-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-
+            rebar3-${{ runner.os }}-
+
+      - name: Compile test profile
+        run: rebar3 as test compile
+
   precommit:
     name: precommit
+
+    needs: cache-erlang
 
     runs-on: ubuntu-24.04
 
@@ -36,26 +108,101 @@ jobs:
           version-type: strict
           version-file: .tool-versions
 
-      - name: Cache _build
+      - name: Restore _build cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: _build
-          key: >-
-            _build-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-cfg-${{
-              hashFiles('rebar.config') }}-lock-${{ hashFiles('rebar.lock') }}
-          restore-keys: |
-            _build-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-cfg-${{ hashFiles('rebar.config') }}-
+          key: ${{ needs.cache-erlang.outputs.build-cache-key }}
+          restore-keys: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
 
-      - name: Cache rebar3
+      - name: Restore rebar3 cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/rebar3
-          key: >-
-            rebar3-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-rebar3-${{
-              steps.setup-beam.outputs.rebar3-version }}-cfg-${{ hashFiles('rebar.config') }}
+          key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
           restore-keys: |
             rebar3-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-
             rebar3-${{ runner.os }}-
 
       - name: Run precommit
         run: rebar3 precommit
+
+  # HTTP/2 conformance — backs the README "h2spec strict 100 %" claim.
+  # Runs in parallel with precommit so a lint/fmt issue doesn't block
+  # the conformance signal.
+  h2spec:
+    name: h2spec (HTTP/2 conformance)
+
+    needs: cache-erlang
+
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24
+        id: setup-beam
+        with:
+          version-type: strict
+          version-file: .tool-versions
+
+      - name: Restore _build cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: _build
+          key: ${{ needs.cache-erlang.outputs.build-cache-key }}
+          restore-keys: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
+
+      - name: Restore rebar3 cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/rebar3
+          key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
+          restore-keys: |
+            rebar3-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-
+            rebar3-${{ runner.os }}-
+
+      - name: Run h2spec strict
+        run: ./scripts/h2spec.sh
+
+  # WebSocket conformance — backs the README "Autobahn fuzzingclient
+  # strict 100 %" claim. Slow (~5 min) — runs only on push to main,
+  # merge_group, and manual dispatch, not every PR. Use
+  # `workflow_dispatch` to trigger on a feature branch when WS code
+  # is touched.
+  autobahn:
+    name: autobahn (WebSocket conformance)
+
+    needs: cache-erlang
+
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24
+        id: setup-beam
+        with:
+          version-type: strict
+          version-file: .tool-versions
+
+      - name: Restore _build cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: _build
+          key: ${{ needs.cache-erlang.outputs.build-cache-key }}
+          restore-keys: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
+
+      - name: Restore rebar3 cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/rebar3
+          key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
+          restore-keys: |
+            rebar3-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-
+            rebar3-${{ runner.os }}-
+
+      - name: Run Autobahn fuzzingclient
+        run: ./scripts/autobahn.escript
