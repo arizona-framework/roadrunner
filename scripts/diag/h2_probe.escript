@@ -99,9 +99,9 @@ listener_opts(CertDir) ->
         port => 0,
         tls => [
             {certfile, CertDir ++ "/cert.pem"},
-            {keyfile, CertDir ++ "/key.pem"}
+            {keyfile, CertDir ++ "/key.pem"},
+            {alpn_preferred_protocols, [~"h2", ~"http/1.1"]}
         ],
-        http2_enabled => true,
         handler => roadrunner_hello_handler,
         keep_alive_timeout => 60000,
         max_clients => 100000,

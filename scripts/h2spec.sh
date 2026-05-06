@@ -45,16 +45,13 @@ ERL_FLAGS="-config $HOME/.config/rebar3/ssl" \
 mise exec -- rebar3 as test shell --eval "
     application:ensure_all_started(roadrunner),
     {ok, _} = roadrunner:start_listener(h2spec_listener, #{
-        transport => ssl,
         port => $PORT,
-        tls_opts => [
+        tls => [
             {certfile, \"$CERT_DIR/cert.pem\"},
             {keyfile, \"$CERT_DIR/key.pem\"},
             {alpn_preferred_protocols, [<<\"h2\">>]}
         ],
-        http2_enabled => true,
-        dispatch => {handler, roadrunner_hello_handler},
-        middlewares => []
+        handler => roadrunner_hello_handler
     }),
     Port = roadrunner_listener:port(h2spec_listener),
     file:write_file(\"$PORT_FILE\", integer_to_binary(Port)).

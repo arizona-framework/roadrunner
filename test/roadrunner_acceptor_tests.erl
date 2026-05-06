@@ -9,7 +9,9 @@
 acceptor_serves_request_test_() ->
     {setup,
         fun() ->
-            {ok, _} = roadrunner_listener:start_link(acceptor_test_serves, #{port => 0}),
+            {ok, _} = roadrunner_listener:start_link(acceptor_test_serves, #{
+                port => 0, handler => roadrunner_hello_handler
+            }),
             roadrunner_listener:port(acceptor_test_serves)
         end,
         fun(_) -> ok = roadrunner_listener:stop(acceptor_test_serves) end, fun(Port) ->
@@ -27,7 +29,9 @@ acceptor_serves_request_test_() ->
 acceptor_serves_multiple_connections_test_() ->
     {setup,
         fun() ->
-            {ok, _} = roadrunner_listener:start_link(acceptor_test_loop, #{port => 0}),
+            {ok, _} = roadrunner_listener:start_link(acceptor_test_loop, #{
+                port => 0, handler => roadrunner_hello_handler
+            }),
             roadrunner_listener:port(acceptor_test_loop)
         end,
         fun(_) -> ok = roadrunner_listener:stop(acceptor_test_loop) end, fun(Port) ->
@@ -51,7 +55,9 @@ acceptor_processes_carry_listener_name_and_index_label_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(
-                acceptor_test_labels, #{port => 0, num_acceptors => 3}
+                acceptor_test_labels, #{
+                    port => 0, num_acceptors => 3, handler => roadrunner_hello_handler
+                }
             ),
             acceptor_test_labels
         end,
@@ -78,7 +84,9 @@ acceptor_processes_carry_listener_name_and_index_label_test_() ->
 conn_process_carries_listener_name_and_peer_label_test_() ->
     {setup,
         fun() ->
-            {ok, _} = roadrunner_listener:start_link(conn_test_labels, #{port => 0}),
+            {ok, _} = roadrunner_listener:start_link(conn_test_labels, #{
+                port => 0, handler => roadrunner_hello_handler
+            }),
             {conn_test_labels, roadrunner_listener:port(conn_test_labels)}
         end,
         fun({Name, _}) -> ok = roadrunner_listener:stop(Name) end, fun({Name, Port}) ->

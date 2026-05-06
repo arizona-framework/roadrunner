@@ -51,7 +51,9 @@ setup() ->
     %% Loosen client verification — the test cert isn't in any system root.
     ClientOpts = [{verify, verify_none} | roadrunner_test_certs:client_opts()],
     {ok, _} = roadrunner_listener:start_link(tls_test_listener, #{
-        port => 0, tls => roadrunner_test_certs:server_opts()
+        port => 0,
+        tls => roadrunner_test_certs:server_opts(),
+        handler => roadrunner_hello_handler
     }),
     Port = roadrunner_listener:port(tls_test_listener),
     {Port, ClientOpts}.
@@ -154,7 +156,8 @@ setup_h2() ->
     AlpnH2 = {alpn_preferred_protocols, [~"h2", ~"http/1.1"]},
     {ok, _} = roadrunner_listener:start_link(tls_http2_test_listener, #{
         port => 0,
-        tls => [AlpnH2 | roadrunner_test_certs:server_opts()]
+        tls => [AlpnH2 | roadrunner_test_certs:server_opts()],
+        handler => roadrunner_hello_handler
     }),
     Port = roadrunner_listener:port(tls_http2_test_listener),
     {Port, ClientOpts}.
@@ -173,7 +176,8 @@ h2_user_alpn_overrides_test_() ->
             UserTls = [UserAlpn | roadrunner_test_certs:server_opts()],
             {ok, _} = roadrunner_listener:start_link(tls_h2_user_alpn_listener, #{
                 port => 0,
-                tls => UserTls
+                tls => UserTls,
+                handler => roadrunner_hello_handler
             }),
             Port = roadrunner_listener:port(tls_h2_user_alpn_listener),
             {Port, ClientOpts}

@@ -326,7 +326,9 @@ req_with_headers(Headers) ->
 conn_serves_200_on_get_test_() ->
     {setup,
         fun() ->
-            {ok, _} = roadrunner_listener:start_link(conn_test_get, #{port => 0}),
+            {ok, _} = roadrunner_listener:start_link(conn_test_get, #{
+                port => 0, handler => roadrunner_hello_handler
+            }),
             roadrunner_listener:port(conn_test_get)
         end,
         fun(_) -> ok = roadrunner_listener:stop(conn_test_get) end, fun(Port) ->
@@ -400,7 +402,9 @@ conn_handler_emitted_date_is_preserved_test_() ->
 conn_serves_400_on_bad_request_test_() ->
     {setup,
         fun() ->
-            {ok, _} = roadrunner_listener:start_link(conn_test_bad, #{port => 0}),
+            {ok, _} = roadrunner_listener:start_link(conn_test_bad, #{
+                port => 0, handler => roadrunner_hello_handler
+            }),
             roadrunner_listener:port(conn_test_bad)
         end,
         fun(_) -> ok = roadrunner_listener:stop(conn_test_bad) end, fun(Port) ->
@@ -466,7 +470,9 @@ conn_rejects_excessive_content_length_test_() ->
         fun() ->
             %% Configure a small max so the test is fast.
             {ok, _} = roadrunner_listener:start_link(conn_test_413, #{
-                port => 0, max_content_length => 100
+                port => 0,
+                max_content_length => 100,
+                handler => roadrunner_hello_handler
             }),
             roadrunner_listener:port(conn_test_413)
         end,
@@ -489,7 +495,9 @@ conn_rejects_excessive_content_length_test_() ->
 conn_rejects_malformed_content_length_test_() ->
     {setup,
         fun() ->
-            {ok, _} = roadrunner_listener:start_link(conn_test_bad_cl, #{port => 0}),
+            {ok, _} = roadrunner_listener:start_link(conn_test_bad_cl, #{
+                port => 0, handler => roadrunner_hello_handler
+            }),
             roadrunner_listener:port(conn_test_bad_cl)
         end,
         fun(_) -> ok = roadrunner_listener:stop(conn_test_bad_cl) end, fun(Port) ->
@@ -585,7 +593,9 @@ conn_request_timeout_returns_408_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_timeout, #{
-                port => 0, request_timeout => 100
+                port => 0,
+                request_timeout => 100,
+                handler => roadrunner_hello_handler
             }),
             roadrunner_listener:port(conn_test_timeout)
         end,
@@ -605,7 +615,9 @@ conn_request_timeout_during_body_returns_408_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_timeout_body, #{
-                port => 0, request_timeout => 200
+                port => 0,
+                request_timeout => 200,
+                handler => roadrunner_hello_handler
             }),
             roadrunner_listener:port(conn_test_timeout_body)
         end,

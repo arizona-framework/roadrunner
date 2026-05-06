@@ -94,6 +94,13 @@ ALPN routes `h2` clients to the HTTP/2 path and `http/1.1` clients (or
 no-ALPN) to the HTTP/1.1 path on the same listener. Omit `~"h2"` from
 the list to disable HTTP/2.
 
+For listeners that don't need routing, `handler => Mod` skips the router
+entirely and dispatches every request to `Mod:handle/1`:
+
+```erlang
+roadrunner:start_listener(http, #{port => 8080, handler => hello_handler}).
+```
+
 ## Features
 
 ### Handlers

@@ -285,6 +285,29 @@ header_name_with_space_rejected_test() ->
 header_name_with_control_char_rejected_test() ->
     ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"Ho\x{01}st: x\r\n")).
 
+%% Hits the lowercase-only scan path's digit + mark + invalid clauses.
+header_lowercase_name_with_digit_test() ->
+    ?assertEqual(
+        {ok, ~"x-rate-1", ~"y", ~""},
+        roadrunner_http1:parse_header(~"x-rate-1: y\r\n")
+    ).
+
+header_lowercase_name_with_mark_test() ->
+    ?assertEqual(
+        {ok, ~"x.foo!", ~"y", ~""},
+        roadrunner_http1:parse_header(~"x.foo!: y\r\n")
+    ).
+
+header_lowercase_name_with_invalid_byte_rejected_test() ->
+    ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"x bad: y\r\n")).
+
+%% Hits the mixed-case scan path's digit + mark clauses.
+header_mixed_case_name_with_mark_test() ->
+    ?assertEqual(
+        {ok, ~"x.foo!", ~"y", ~""},
+        roadrunner_http1:parse_header(~"X.foo!: y\r\n")
+    ).
+
 header_missing_colon_rejected_test() ->
     ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"Host example.com\r\n")).
 

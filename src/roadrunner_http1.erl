@@ -395,11 +395,11 @@ scan_name_upper(<<C, R/binary>>) ->
         false -> error
     end.
 
-%% RFC 9110 §5.6.2 tchar — ALPHA / DIGIT / one of the listed marks.
+%% RFC 9110 §5.6.2 tchar mark fallback. The scan-name walkers above
+%% handle ALPHA / DIGIT / `-` inline; this only sees the remaining
+%% punctuation marks plus invalid bytes, so the alpha/digit/dash
+%% branches are pruned vs the spec's full tchar grammar.
 -spec is_tchar(byte()) -> boolean().
-is_tchar(C) when C >= $A, C =< $Z -> true;
-is_tchar(C) when C >= $a, C =< $z -> true;
-is_tchar(C) when C >= $0, C =< $9 -> true;
 is_tchar(C) when
     C =:= $!;
     C =:= $#;

@@ -201,7 +201,8 @@ valid_window_opts_let_listener_boot() ->
         port => 0,
         h2_initial_conn_window => 1_048_576,
         h2_initial_stream_window => 524_288,
-        h2_window_refill_threshold => 65_536
+        h2_window_refill_threshold => 65_536,
+        handler => roadrunner_hello_handler
     }),
     ok = roadrunner_listener:stop(Name).
 

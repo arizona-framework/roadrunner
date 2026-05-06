@@ -1,9 +1,11 @@
 -module(roadrunner_hello_handler).
 -moduledoc """
-Default `roadrunner_handler` — answers every request with `200 Hello, roadrunner!`.
-
-Used when no `handler` opt is passed to `roadrunner:start_listener/2`.
-Replaces the hardcoded body roadrunner_conn carried before slice 3.
+Test-fixture `roadrunner_handler` — answers every request with
+`200 Hello, roadrunner!`. Used by the test suite, the diagnostic
+scripts (`scripts/h2spec.sh`, `scripts/diag/h2_probe.escript`), and
+the bench client tests as a minimal default-shape handler. Lives
+in `test/` because no production listener should ship with this
+as a default.
 """.
 
 -behaviour(roadrunner_handler).

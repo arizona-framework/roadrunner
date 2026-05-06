@@ -20,7 +20,7 @@ roadrunner_test_() ->
         ]}.
 
 starts_listener_and_serves() ->
-    {ok, Pid} = roadrunner:start_listener(public_test_serve, #{port => 0}),
+    {ok, Pid} = start(public_test_serve),
     ?assert(is_pid(Pid)),
     Port = roadrunner_listener:port(public_test_serve),
     {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
@@ -31,7 +31,7 @@ starts_listener_and_serves() ->
     ok = roadrunner:stop_listener(public_test_serve).
 
 stops_listener_cleanly() ->
-    {ok, _} = roadrunner:start_listener(public_test_stop, #{port => 0}),
+    {ok, _} = start(public_test_stop),
     ?assert(lists:member(public_test_stop, roadrunner:listeners())),
     ok = roadrunner:stop_listener(public_test_stop),
     %% After stop, the gen_server is gone — we don't probe the TCP port
@@ -46,14 +46,14 @@ stop_unknown_listener() ->
     ?assertEqual({error, not_found}, roadrunner:stop_listener(public_test_nope)).
 
 duplicate_listener_rejected() ->
-    {ok, _} = roadrunner:start_listener(public_test_dup, #{port => 0}),
-    ?assertMatch({error, _}, roadrunner:start_listener(public_test_dup, #{port => 0})),
+    {ok, _} = start(public_test_dup),
+    ?assertMatch({error, _}, start(public_test_dup)),
     ok = roadrunner:stop_listener(public_test_dup).
 
 lists_active_listeners() ->
     ?assertEqual([], roadrunner:listeners()),
-    {ok, _} = roadrunner:start_listener(public_test_l1, #{port => 0}),
-    {ok, _} = roadrunner:start_listener(public_test_l2, #{port => 0}),
+    {ok, _} = start(public_test_l1),
+    {ok, _} = start(public_test_l2),
     Names = lists:sort(roadrunner:listeners()),
     ?assertEqual([public_test_l1, public_test_l2], Names),
     ok = roadrunner:stop_listener(public_test_l1),
@@ -61,6 +61,9 @@ lists_active_listeners() ->
     ?assertEqual([], roadrunner:listeners()).
 
 %% --- helpers ---
+
+start(Name) ->
+    roadrunner:start_listener(Name, #{port => 0, handler => roadrunner_hello_handler}).
 
 recv_until_closed(Sock) -> recv_until_closed(Sock, <<>>).
 

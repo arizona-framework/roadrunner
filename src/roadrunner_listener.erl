@@ -436,7 +436,7 @@ validate_h2_window_opt(Key, Opts, Max) ->
 build_dispatch(#{routes := _}, ListenerName) ->
     {router, ListenerName};
 build_dispatch(Opts, _ListenerName) ->
-    {handler, maps:get(handler, Opts, roadrunner_hello_handler)}.
+    {handler, maps:get(handler, Opts, roadrunner_default_handler)}.
 
 -spec handle_call(
     port

@@ -10,7 +10,9 @@ listener_lifecycle_test_() ->
     {setup,
         fun() ->
             Name = listener_test_one,
-            {ok, Pid} = roadrunner_listener:start_link(Name, #{port => 0}),
+            {ok, Pid} = roadrunner_listener:start_link(Name, #{
+                port => 0, handler => roadrunner_hello_handler
+            }),
             {Name, Pid}
         end,
         fun({Name, _Pid}) ->
@@ -31,7 +33,9 @@ listener_accepts_tcp_handshake_test_() ->
     {setup,
         fun() ->
             Name = listener_test_handshake,
-            {ok, _} = roadrunner_listener:start_link(Name, #{port => 0}),
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0, handler => roadrunner_hello_handler
+            }),
             roadrunner_listener:port(Name)
         end,
         fun(_Port) ->
@@ -48,7 +52,9 @@ listener_stops_releases_port_test_() ->
     {setup,
         fun() ->
             Name = listener_test_release,
-            {ok, _} = roadrunner_listener:start_link(Name, #{port => 0}),
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0, handler => roadrunner_hello_handler
+            }),
             Port = roadrunner_listener:port(Name),
             ok = roadrunner_listener:stop(Name),
             Port
@@ -65,15 +71,21 @@ listener_stops_releases_port_test_() ->
 listener_listen_failure_returns_error_test() ->
     %% Bind listener A to an ephemeral port, then try to bind B to the
     %% same port — second listen() must fail with eaddrinuse.
-    {ok, _} = roadrunner_listener:start_link(listener_test_busy_a, #{port => 0}),
+    {ok, _} = roadrunner_listener:start_link(listener_test_busy_a, #{
+        port => 0, handler => roadrunner_hello_handler
+    }),
     Port = roadrunner_listener:port(listener_test_busy_a),
     process_flag(trap_exit, true),
-    Result = roadrunner_listener:start_link(listener_test_busy_b, #{port => Port}),
+    Result = roadrunner_listener:start_link(listener_test_busy_b, #{
+        port => Port, handler => roadrunner_hello_handler
+    }),
     ?assertMatch({error, _}, Result),
     ok = roadrunner_listener:stop(listener_test_busy_a).
 
 listener_ignores_unknown_cast_test() ->
-    {ok, _} = roadrunner_listener:start_link(listener_test_cast, #{port => 0}),
+    {ok, _} = roadrunner_listener:start_link(listener_test_cast, #{
+        port => 0, handler => roadrunner_hello_handler
+    }),
     gen_server:cast(listener_test_cast, surprise),
     %% Process must still answer call/1 — proves it survived the cast.
     ?assert(roadrunner_listener:port(listener_test_cast) > 0),
@@ -83,7 +95,9 @@ listener_honors_num_acceptors_opt_test() ->
     %% Explicit override exercises the opt path (default is exercised by
     %% every other listener test).
     {ok, _} = roadrunner_listener:start_link(listener_test_pool, #{
-        port => 0, num_acceptors => 3
+        port => 0,
+        num_acceptors => 3,
+        handler => roadrunner_hello_handler
     }),
     ?assert(roadrunner_listener:port(listener_test_pool) > 0),
     ok = roadrunner_listener:stop(listener_test_pool).
@@ -116,7 +130,8 @@ slot_reconciliation_releases_sustained_orphan_slots_test() ->
         {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
             port => 0,
             max_clients => 100,
-            slot_reconciliation => #{interval_ms => 30}
+            slot_reconciliation => #{interval_ms => 30},
+            handler => roadrunner_hello_handler
         }),
         %% Reach into state to grab the counter ref. {state, LSocket, Port,
         %% ProtoOpts, Phase, Reconciliation} — relies on field order.
@@ -153,7 +168,8 @@ slot_reconciliation_only_reaps_excess_over_pg_members_test() ->
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
         max_clients => 100,
-        slot_reconciliation => #{interval_ms => 30}
+        slot_reconciliation => #{interval_ms => 30},
+        handler => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
@@ -186,7 +202,8 @@ listener_threads_rate_check_interval_into_proto_opts_test() ->
     Name = listener_test_rate_check_interval,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
-        rate_check_interval_ms => 500
+        rate_check_interval_ms => 500,
+        handler => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
@@ -201,7 +218,8 @@ listener_threads_hibernate_after_into_proto_opts_test() ->
     Name = listener_test_hibernate_after,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
-        hibernate_after => 5000
+        hibernate_after => 5000,
+        handler => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
@@ -213,7 +231,9 @@ slot_reconciliation_disabled_drops_reconcile_slots_message_test() ->
     %% disabled (race after a hypothetical config change) is just
     %% dropped — gen_server stays alive.
     Name = listener_test_disabled_reap,
-    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{port => 0}),
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0, handler => roadrunner_hello_handler
+    }),
     ListenerPid ! reconcile_slots,
     %% Process must still answer port/1.
     ?assert(roadrunner_listener:port(Name) > 0),
@@ -223,7 +243,9 @@ listener_drops_unknown_info_message_test() ->
     %% Generic info catch-all: arbitrary stray messages don't crash
     %% the listener.
     Name = listener_test_stray_info,
-    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{port => 0}),
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0, handler => roadrunner_hello_handler
+    }),
     ListenerPid ! {stray, make_ref()},
     ?assert(roadrunner_listener:port(Name) > 0),
     ok = roadrunner_listener:stop(Name).
@@ -234,7 +256,9 @@ slot_reconciliation_disabled_by_default_test() ->
         _ -> ok
     end,
     Name = listener_test_no_reap,
-    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{port => 0}),
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0, handler => roadrunner_hello_handler
+    }),
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
     Counter = maps:get(client_counter, ProtoOpts),
@@ -246,7 +270,9 @@ slot_reconciliation_disabled_by_default_test() ->
 
 listener_info_initial_zero_test() ->
     Name = listener_test_info_init,
-    {ok, _} = roadrunner_listener:start_link(Name, #{port => 0, max_clients => 42}),
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0, max_clients => 42, handler => roadrunner_hello_handler
+    }),
     Info = roadrunner_listener:info(Name),
     ?assertEqual(0, maps:get(active_clients, Info)),
     ?assertEqual(42, maps:get(max_clients, Info)),
@@ -294,7 +320,9 @@ drain_with_no_active_conns_returns_immediately_test_() ->
         fun() ->
             ensure_pg_started(),
             Name = listener_test_drain_idle,
-            {ok, _} = roadrunner_listener:start_link(Name, #{port => 0}),
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0, handler => roadrunner_hello_handler
+            }),
             Name
         end,
         %% drain/2 stops the listener — cleanup is a no-op assertion.
@@ -515,7 +543,9 @@ status_returns_phase_test_() ->
         fun() ->
             ensure_pg_started(),
             Name = listener_test_status,
-            {ok, _} = roadrunner_listener:start_link(Name, #{port => 0}),
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0, handler => roadrunner_hello_handler
+            }),
             Name
         end,
         fun(Name) ->

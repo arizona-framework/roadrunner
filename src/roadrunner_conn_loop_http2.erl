@@ -1146,14 +1146,10 @@ enqueue_pending(#{pending_sends := Pending} = Stream, Entry) ->
 %% After a stream's send window grew, drain its pending DATA queue
 %% as far as windows allow.
 flush_pending_data(#loop{streams = Streams} = State, StreamId) ->
-    case Streams of
-        #{StreamId := #{pending_sends := Pending} = Stream} ->
-            case queue:is_empty(Pending) of
-                true -> State;
-                false -> drain_pending(State, StreamId, Stream)
-            end;
-        _ ->
-            State
+    #{StreamId := #{pending_sends := Pending} = Stream} = Streams,
+    case queue:is_empty(Pending) of
+        true -> State;
+        false -> drain_pending(State, StreamId, Stream)
     end.
 
 %% After the conn-level send window grew, drain every stream's
