@@ -164,14 +164,10 @@ parse_parts(<<"--\r\n", _Epilogue/binary>>, _Sep) ->
 parse_parts(<<"--">>, _Sep) ->
     {ok, []};
 parse_parts(<<"\r\n", PartAndRest/binary>>, Sep) ->
-    case parse_one_part(PartAndRest, Sep) of
-        {ok, Part, Rest} ->
-            case parse_parts(Rest, Sep) of
-                {ok, More} -> {ok, [Part | More]};
-                {error, _} = E -> E
-            end;
-        {error, _} = E ->
-            E
+    maybe
+        {ok, Part, Rest} ?= parse_one_part(PartAndRest, Sep),
+        {ok, More} ?= parse_parts(Rest, Sep),
+        {ok, [Part | More]}
     end;
 parse_parts(_, _) ->
     {error, malformed}.
@@ -186,15 +182,14 @@ parse_parts(_, _) ->
 parse_one_part(<<"\r\n", BodyAndRest/binary>>, Sep) ->
     extract_body(BodyAndRest, [], Sep);
 parse_one_part(Bytes, Sep) ->
-    case binary:split(Bytes, persistent_term:get(?DBL_CRLF_CP_KEY)) of
-        [HeaderBlock, BodyAndRest] ->
-            CrlfCp = persistent_term:get(?CRLF_CP_KEY),
-            case parse_header_lines(binary:split(HeaderBlock, CrlfCp, [global])) of
-                {ok, Headers} -> extract_body(BodyAndRest, Headers, Sep);
-                {error, _} = E -> E
-            end;
-        _ ->
-            {error, no_header_terminator}
+    maybe
+        [HeaderBlock, BodyAndRest] ?= binary:split(Bytes, persistent_term:get(?DBL_CRLF_CP_KEY)),
+        CrlfCp = persistent_term:get(?CRLF_CP_KEY),
+        {ok, Headers} ?= parse_header_lines(binary:split(HeaderBlock, CrlfCp, [global])),
+        extract_body(BodyAndRest, Headers, Sep)
+    else
+        [_] -> {error, no_header_terminator};
+        Other -> Other
     end.
 
 -spec extract_body(binary(), [{binary(), binary()}], binary()) ->
@@ -216,16 +211,13 @@ parse_header_lines(Lines) ->
 parse_header_lines_loop([], _ColonCp) ->
     {ok, []};
 parse_header_lines_loop([Line | Rest], ColonCp) ->
-    case binary:split(Line, ColonCp) of
-        [Name, Value] ->
-            case parse_header_lines_loop(Rest, ColonCp) of
-                {ok, More} ->
-                    {ok, [{roadrunner_bin:ascii_lowercase(Name), string:trim(Value)} | More]};
-                {error, _} = E ->
-                    E
-            end;
-        _ ->
-            {error, bad_header}
+    maybe
+        [Name, Value] ?= binary:split(Line, ColonCp),
+        {ok, More} ?= parse_header_lines_loop(Rest, ColonCp),
+        {ok, [{roadrunner_bin:ascii_lowercase(Name), string:trim(Value)} | More]}
+    else
+        [_] -> {error, bad_header};
+        Other -> Other
     end.
 
 %% `-on_load` callback. See `feedback_compile_pattern_convention`.
