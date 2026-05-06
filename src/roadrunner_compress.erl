@@ -203,8 +203,8 @@ compress(Status, Headers, Body, Encoding) ->
 %% emits a header-less raw deflate stream (RFC 1951) — non-conformant
 %% to RFC 9110 even though some servers historically shipped it.
 -spec compress_body(iodata(), gzip | deflate) -> binary().
-compress_body(Body, gzip) -> zlib:gzip(iolist_to_binary(Body));
-compress_body(Body, deflate) -> zlib:compress(iolist_to_binary(Body)).
+compress_body(Body, gzip) -> zlib:gzip(Body);
+compress_body(Body, deflate) -> zlib:compress(Body).
 
 %% `windowBits` selects the zlib stream wrapper:
 %%   16 + 15 → gzip (RFC 1952 header)
