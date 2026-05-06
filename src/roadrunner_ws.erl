@@ -206,12 +206,8 @@ has_upgrade_token(undefined) ->
 has_upgrade_token(Value) ->
     %% Connection may be a comma-separated token list — match
     %% case-insensitively against any token.
-    case
-        binary:match(roadrunner_bin:ascii_lowercase(Value), persistent_term:get(?UPGRADE_CP_KEY))
-    of
-        nomatch -> false;
-        _ -> true
-    end.
+    binary:match(roadrunner_bin:ascii_lowercase(Value), persistent_term:get(?UPGRADE_CP_KEY)) =/=
+        nomatch.
 
 -spec header_lookup(binary(), roadrunner_req:headers()) -> binary() | undefined.
 header_lookup(Name, Headers) ->
