@@ -336,27 +336,62 @@ parse_header_line(Line, Rest, ColonCp) ->
 -spec classify_header(binary(), binary(), binary()) ->
     {ok, binary(), binary(), binary()} | {error, bad_header}.
 classify_header(NameRaw, ValueRaw, Rest) ->
-    case validate_name(NameRaw) of
-        ok ->
+    case validate_and_lowercase_name(NameRaw) of
+        {ok, Name} ->
             Value = roadrunner_bin:trim_ows(ValueRaw),
             case validate_value(Value) of
-                ok -> {ok, roadrunner_bin:ascii_lowercase(NameRaw), Value, Rest};
+                ok -> {ok, Name, Value, Rest};
                 error -> {error, bad_header}
             end;
         error ->
             {error, bad_header}
     end.
 
--spec validate_name(binary()) -> ok | error.
-validate_name(<<>>) -> error;
-validate_name(N) -> validate_name_chars(N).
+%% Combined RFC 9110 §5.6.2 tchar validation + lowercase, in a single
+%% walk. Returns the original `Bin` unchanged when every byte is a
+%% lowercase tchar (the typical case for already-lowercased wire
+%% data); falls through to `roadrunner_bin:ascii_lowercase/1` only
+%% when an uppercase byte is seen. Halves the per-name work for the
+%% wire format most clients send (Title-Case names).
+-spec validate_and_lowercase_name(binary()) -> {ok, binary()} | error.
+validate_and_lowercase_name(<<>>) ->
+    error;
+validate_and_lowercase_name(Bin) ->
+    case scan_name_lower(Bin) of
+        lower -> {ok, Bin};
+        upper -> {ok, roadrunner_bin:ascii_lowercase(Bin)};
+        error -> error
+    end.
 
--spec validate_name_chars(binary()) -> ok | error.
-validate_name_chars(<<>>) ->
-    ok;
-validate_name_chars(<<C, R/binary>>) ->
+%% Walk while every byte is a lowercase tchar; on uppercase, switch
+%% to `scan_name_upper/1`; on invalid, return `error`. The hot-path
+%% clauses (a-z, $-, 0-9) are listed before the catch-all guard so
+%% the BEAM jump table dispatches typical header bytes in one step.
+-spec scan_name_lower(binary()) -> lower | upper | error.
+scan_name_lower(<<>>) ->
+    lower;
+scan_name_lower(<<C, R/binary>>) when C >= $a, C =< $z -> scan_name_lower(R);
+scan_name_lower(<<$-, R/binary>>) ->
+    scan_name_lower(R);
+scan_name_lower(<<C, R/binary>>) when C >= $0, C =< $9 -> scan_name_lower(R);
+scan_name_lower(<<C, R/binary>>) when C >= $A, C =< $Z -> scan_name_upper(R);
+scan_name_lower(<<C, R/binary>>) ->
     case is_tchar(C) of
-        true -> validate_name_chars(R);
+        true -> scan_name_lower(R);
+        false -> error
+    end.
+
+-spec scan_name_upper(binary()) -> upper | error.
+scan_name_upper(<<>>) ->
+    upper;
+scan_name_upper(<<C, R/binary>>) when C >= $a, C =< $z -> scan_name_upper(R);
+scan_name_upper(<<$-, R/binary>>) ->
+    scan_name_upper(R);
+scan_name_upper(<<C, R/binary>>) when C >= $0, C =< $9 -> scan_name_upper(R);
+scan_name_upper(<<C, R/binary>>) when C >= $A, C =< $Z -> scan_name_upper(R);
+scan_name_upper(<<C, R/binary>>) ->
+    case is_tchar(C) of
+        true -> scan_name_upper(R);
         false -> error
     end.
 
