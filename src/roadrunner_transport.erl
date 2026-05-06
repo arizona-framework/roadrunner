@@ -97,14 +97,10 @@ accept({gen_tcp, LSock}) ->
         {error, _} = Err -> Err
     end;
 accept({ssl, LSock}) ->
-    case ssl:transport_accept(LSock) of
-        {ok, Pre} ->
-            case ssl:handshake(Pre) of
-                {ok, S} -> {ok, {ssl, S}};
-                {error, _} = Err -> Err
-            end;
-        {error, _} = Err ->
-            Err
+    maybe
+        {ok, Pre} ?= ssl:transport_accept(LSock),
+        {ok, S} ?= ssl:handshake(Pre),
+        {ok, {ssl, S}}
     end.
 
 -doc "Hand the controlling process for the underlying socket.".
@@ -214,15 +210,13 @@ message so unit tests see one bytes payload.
 -spec sendfile(socket(), file:filename_all(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
 sendfile(Sock, Filename, Offset, Length) ->
-    case file:open(Filename, [read, raw, binary]) of
-        {ok, File} ->
-            try
-                do_sendfile(Sock, File, Offset, Length)
-            after
-                ok = file:close(File)
-            end;
-        {error, _} = Err ->
-            Err
+    maybe
+        {ok, File} ?= file:open(Filename, [read, raw, binary]),
+        try
+            do_sendfile(Sock, File, Offset, Length)
+        after
+            ok = file:close(File)
+        end
     end.
 
 -spec do_sendfile(
@@ -263,17 +257,15 @@ sendfile_chunked_loop(_SendFun, _File, 0) ->
     ok;
 sendfile_chunked_loop(SendFun, File, Remaining) ->
     Chunk = min(Remaining, 65536),
-    case file:read(File, Chunk) of
-        eof ->
-            %% Length exceeds file size — caller asked for more bytes
-            %% than the file holds. Stop here; the truncated body is
-            %% on the wire already.
-            ok;
-        {ok, Data} ->
-            case SendFun(Data) of
-                ok -> sendfile_chunked_loop(SendFun, File, Remaining - byte_size(Data));
-                {error, _} = Err -> Err
-            end
+    maybe
+        {ok, Data} ?= file:read(File, Chunk),
+        ok ?= SendFun(Data),
+        sendfile_chunked_loop(SendFun, File, Remaining - byte_size(Data))
+    else
+        %% Length exceeds file size — caller asked for more bytes than the
+        %% file holds. Stop here; the truncated body is on the wire already.
+        eof -> ok;
+        {error, _} = Err -> Err
     end.
 
 -doc """
