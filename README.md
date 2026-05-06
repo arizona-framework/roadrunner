@@ -20,7 +20,8 @@ Standards conformance:
 
 - **HTTP/1.1**: RFC 9110 (semantics) + RFC 9112 (syntax).
 - **HTTP/2**: RFC 9113 (frames + multiplexing) + RFC 7541 (HPACK).
-  Opt-in per listener via `http2_enabled => true` in TLS opts.
+  Opt-in per listener by listing `~"h2"` in the TLS
+  `alpn_preferred_protocols` option.
   [h2spec](https://github.com/summerwind/h2spec) passes at 100 % in
   strict (`-S`) mode (`scripts/h2spec.sh`).
 - **Content-Encoding** (RFC 9110 §8.4.1): gzip + deflate with
@@ -74,19 +75,24 @@ content-length: 18
 hello, roadrunner!
 ```
 
-For HTTP/2 over TLS, add a cert and flip `http2_enabled => true`:
+For HTTP/2 over TLS, add a cert and put `~"h2"` in the listener's
+`alpn_preferred_protocols`:
 
 ```erlang
 3> roadrunner:start_listener(https, #{
        port => 8443,
-       tls => [{certfile, "cert.pem"}, {keyfile, "key.pem"}],
-       http2_enabled => true,
+       tls => [
+           {certfile, "cert.pem"},
+           {keyfile, "key.pem"},
+           {alpn_preferred_protocols, [~"h2", ~"http/1.1"]}
+       ],
        routes => [{~"/", hello_handler, #{greeting => ~"hello"}}]
    }).
 ```
 
 ALPN routes `h2` clients to the HTTP/2 path and `http/1.1` clients (or
-no-ALPN) to the HTTP/1.1 path on the same listener.
+no-ALPN) to the HTTP/1.1 path on the same listener. Omit `~"h2"` from
+the list to disable HTTP/2.
 
 ## Features
 

@@ -97,10 +97,6 @@ read it anyway.
     %% SSE / WebSocket handlers depend on it. Short-lived h1
     %% workloads can opt out for ~10% lower per-conn overhead.
     drain_group => enabled | disabled,
-    %% When `true`, the conn dispatch forks to `roadrunner_conn_loop_http2`
-    %% if the post-handshake ALPN selection landed on `h2`. Default
-    %% `false` (HTTP/1.1 only).
-    http2_enabled => boolean(),
     %% h2 receive-window tuning. See `roadrunner_listener:opts()` for
     %% prose. Defaults match the RFC 9113 baseline.
     h2_initial_conn_window => 1..16#7FFFFFFF,

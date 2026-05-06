@@ -60,11 +60,12 @@ cleanup(_) ->
     ok = roadrunner_listener:stop(tls_test_listener).
 
 %% =============================================================================
-%% HTTP/2 ALPN dispatch — `http2_enabled => true` advertises `h2`,
-%% h2-capable clients reach `roadrunner_conn_loop_http2`. Phase H2
-%% performs the connection-level handshake (preface + SETTINGS
-%% exchange + ACK) then GOAWAYs because streams aren't accepted yet.
-%% h1 clients on the same listener still get the HTTP/1.1 path.
+%% HTTP/2 ALPN dispatch — listing `~"h2"` in `alpn_preferred_protocols`
+%% advertises h2 to clients; h2-capable clients reach
+%% `roadrunner_conn_loop_http2`. Phase H2 performs the connection-level
+%% handshake (preface + SETTINGS exchange + ACK) then GOAWAYs because
+%% streams aren't accepted yet. h1 clients on the same listener still
+%% get the HTTP/1.1 path.
 %% =============================================================================
 
 h2_alpn_dispatch_test_() ->
@@ -150,10 +151,10 @@ h2_alpn_dispatch_test_() ->
 setup_h2() ->
     {ok, _} = application:ensure_all_started(ssl),
     ClientOpts = [{verify, verify_none} | roadrunner_test_certs:client_opts()],
+    AlpnH2 = {alpn_preferred_protocols, [~"h2", ~"http/1.1"]},
     {ok, _} = roadrunner_listener:start_link(tls_http2_test_listener, #{
         port => 0,
-        tls => roadrunner_test_certs:server_opts(),
-        http2_enabled => true
+        tls => [AlpnH2 | roadrunner_test_certs:server_opts()]
     }),
     Port = roadrunner_listener:port(tls_http2_test_listener),
     {Port, ClientOpts}.
@@ -161,9 +162,8 @@ setup_h2() ->
 cleanup_h2(_) ->
     ok = roadrunner_listener:stop(tls_http2_test_listener).
 
-%% User-supplied `alpn_preferred_protocols` always wins, even if
-%% `http2_enabled => true`. Verifies the listener doesn't blindly
-%% prepend `h2` when the user has explicit ALPN intent.
+%% Listener's `alpn_preferred_protocols` is the source of truth: an
+%% h1-only ALPN list forces h1 even when the client offers h2.
 h2_user_alpn_overrides_test_() ->
     {setup,
         fun() ->
@@ -173,8 +173,7 @@ h2_user_alpn_overrides_test_() ->
             UserTls = [UserAlpn | roadrunner_test_certs:server_opts()],
             {ok, _} = roadrunner_listener:start_link(tls_h2_user_alpn_listener, #{
                 port => 0,
-                tls => UserTls,
-                http2_enabled => true
+                tls => UserTls
             }),
             Port = roadrunner_listener:port(tls_h2_user_alpn_listener),
             {Port, ClientOpts}
@@ -184,7 +183,7 @@ h2_user_alpn_overrides_test_() ->
         end,
         fun({Port, ClientOpts}) ->
             [
-                {"client offering h2 still gets http/1.1 because user opts pinned ALPN", fun() ->
+                {"client offering h2 still gets http/1.1 because listener ALPN is h1-only", fun() ->
                     {ok, Sock} = ssl:connect(
                         {127, 0, 0, 1},
                         Port,

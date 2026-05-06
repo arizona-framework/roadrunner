@@ -157,10 +157,10 @@ start_h1_listener(Name, Handler) ->
 start_h2_listener(Name, Handler) ->
     {ok, _} = application:ensure_all_started(ssl),
     ensure_pg(),
+    AlpnH2 = {alpn_preferred_protocols, [~"h2", ~"http/1.1"]},
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0,
-        tls => roadrunner_test_certs:server_opts(),
-        http2_enabled => true,
+        tls => [AlpnH2 | roadrunner_test_certs:server_opts()],
         handler => Handler
     }),
     roadrunner_listener:port(Name).

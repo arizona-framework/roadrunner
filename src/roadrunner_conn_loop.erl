@@ -179,19 +179,16 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
             awaiting_shoot(Socket, ProtoOpts, ListenerName)
     end.
 
-%% True iff the listener has h2 enabled AND the TLS handshake
-%% negotiated `h2`. Plain TCP and TLS sessions where the client
-%% picked `http/1.1` (or sent no ALPN) fall through to HTTP/1.1.
+%% True iff the TLS handshake negotiated `h2`. Plain TCP and TLS
+%% sessions where the client picked `http/1.1` (or sent no ALPN)
+%% fall through to HTTP/1.1. h2 is enabled by listing `~"h2"` in the
+%% listener's `alpn_preferred_protocols`; without it the server
+%% never advertises h2 so this branch is unreachable.
 -spec http2_negotiated(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> boolean().
-http2_negotiated(Socket, ProtoOpts) ->
-    case maps:get(http2_enabled, ProtoOpts, false) of
-        true ->
-            case roadrunner_transport:negotiated_alpn(Socket) of
-                {ok, ~"h2"} -> true;
-                _ -> false
-            end;
-        false ->
-            false
+http2_negotiated(Socket, _ProtoOpts) ->
+    case roadrunner_transport:negotiated_alpn(Socket) of
+        {ok, ~"h2"} -> true;
+        _ -> false
     end.
 
 %% --- read_request phase ---

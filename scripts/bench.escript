@@ -950,9 +950,9 @@ start_roadrunner_h2(Scenario, CertDir) ->
         port => 0,
         tls => [
             {certfile, CertDir ++ "/cert.pem"},
-            {keyfile, CertDir ++ "/key.pem"}
+            {keyfile, CertDir ++ "/key.pem"},
+            {alpn_preferred_protocols, [~"h2", ~"http/1.1"]}
         ],
-        http2_enabled => true,
         keep_alive_timeout => 60000,
         max_clients => 100000,
         max_keep_alive_request => 1000000
