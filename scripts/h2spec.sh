@@ -42,22 +42,29 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
 # so we can inject it into the h2spec invocation.
 PORT_FILE="$CERT_DIR/port"
 
-# `mise exec --` is the local-dev tool-version shim; on CI runners
-# `rebar3` is on PATH directly via `erlef/setup-beam` so we drop the
-# shim. Same for `~/.config/rebar3/ssl` — that's a per-user fix for
-# the OTP-29 + Fastly TLS handshake (see feedback_rebar3_hex_tls);
-# CI's network doesn't need it.
-if command -v mise >/dev/null 2>&1; then
-    rebar3_cmd=(mise exec -- rebar3)
-else
-    rebar3_cmd=(rebar3)
-fi
-if [ -f "$HOME/.config/rebar3/ssl.config" ]; then
-    export ERL_FLAGS="-config $HOME/.config/rebar3/ssl"
+# Expect `_build/test/lib/*` populated (CI restores it from the
+# `cache-erlang` job; locally, run `rebar3 as test compile` once).
+if [ ! -d "_build/test/lib/roadrunner/ebin" ]; then
+    echo "missing _build/test/lib/roadrunner/ebin — run 'rebar3 as test compile' first" >&2
+    exit 2
 fi
 
-"${rebar3_cmd[@]}" as test shell --eval "
-    application:ensure_all_started(roadrunner),
+# Capture stdout+stderr to a log file so a failed listener-start shows
+# its real error message; surface the log on failure below.
+#
+# Arizona-style (see arizona/scripts/start_test_server.sh): invoke
+# `erl` directly with explicit `-pa`. `-noshell` skips the
+# interactive prompt entirely (so stdin EOF doesn't tear down BEAM
+# in CI); the eval's trailing `receive` blocks BEAM until we kill it.
+# Redirect stdin from /dev/null for belt-and-braces.
+SHELL_LOG="$CERT_DIR/shell.log"
+PA_DIRS=()
+for d in _build/test/lib/*/ebin _build/test/lib/roadrunner/test; do
+    PA_DIRS+=(-pa "$d")
+done
+
+erl -noshell "${PA_DIRS[@]}" -eval "
+    {ok, _} = application:ensure_all_started([roadrunner, ssl]),
     {ok, _} = roadrunner:start_listener(h2spec_listener, #{
         port => $PORT,
         tls => [
@@ -68,18 +75,23 @@ fi
         handler => roadrunner_hello_handler
     }),
     Port = roadrunner_listener:port(h2spec_listener),
-    file:write_file(\"$PORT_FILE\", integer_to_binary(Port)).
-" --no-shell >/dev/null 2>&1 &
+    file:write_file(\"$PORT_FILE\", integer_to_binary(Port)),
+    receive _ -> ok end.
+" </dev/null >"$SHELL_LOG" 2>&1 &
 SHELL_PID=$!
 
-# Wait for the port file to appear.
-for _ in $(seq 1 30); do
+# Wait for the port file to appear. Up to 60 s — cold-BEAM start
+# on a CI runner can take a few seconds.
+for _ in $(seq 1 120); do
     [ -s "$PORT_FILE" ] && break
     sleep 0.5
 done
 
 if [ ! -s "$PORT_FILE" ]; then
-    echo "roadrunner listener didn't come up — check the shell stdout" >&2
+    echo "roadrunner listener didn't come up — shell stdout follows:" >&2
+    echo "----" >&2
+    cat "$SHELL_LOG" >&2
+    echo "----" >&2
     kill $SHELL_PID 2>/dev/null || true
     exit 2
 fi
