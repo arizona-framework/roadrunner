@@ -154,6 +154,6 @@ the roadmap (`docs/roadmap.md`) but not yet implemented.
 - Throughput-only comparison with full p50 / p99 across all
   scenarios: [`docs/bench_results.md`](bench_results.md).
 - Connection-process model trade-offs:
-  [`docs/conn_lifecycle_investigation.md`](conn_lifecycle_investigation.md).
+  [`docs/conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md).
 - Tracked deferred work (including the small-body-POST
   resource investigation): [`docs/roadmap.md`](roadmap.md).

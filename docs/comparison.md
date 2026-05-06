@@ -80,7 +80,7 @@ Multi-stream and basic-req h2 line up with the h1 picture — large
 wins on bigger headers/bodies, smaller wins on the simple paths.
 `tls_handshake_throughput` is the one cowboy-wins case; documented
 honestly in
-[`conn_lifecycle_investigation.md`](conn_lifecycle_investigation.md).
+[`conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md).
 
 ## Latency — p50 / p99 (lower = better)
 
@@ -100,7 +100,7 @@ file. Spot-checks from the same run:
   req/s with proportionally lower p50 / p99. The exception is
   `tls_handshake_throughput` (h2), where cowboy edges roadrunner
   on fresh-TLS-conn-per-request workloads (documented in
-  [`conn_lifecycle_investigation.md`](conn_lifecycle_investigation.md)).
+  [`conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md)).
   Connection-storm-shape scenarios (in the full results) tie
   within variance.
 - **vs elli: tied or just ahead on simple hot-path GETs.**

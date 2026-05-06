@@ -8,7 +8,7 @@ silently 200-ing.
 
 Operators wire their own handler via the listener's `handler` opt
 (single-handler shape) or `routes` opt (routed shape) — see
-`roadrunner_listener:opts/0` and the project README.
+`t:roadrunner_listener:opts/0` and the project README.
 """.
 
 -behaviour(roadrunner_handler).

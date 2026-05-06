@@ -243,7 +243,7 @@ roadrunner:start_listener(my_listener, #{port => 8080, handler => hello_handler}
   matrix with p50 / p99 across every scenario.
 - [`docs/resource_results.md`](docs/resource_results.md) — memory + CPU
   shape per scenario.
-- [`docs/conn_lifecycle_investigation.md`](docs/conn_lifecycle_investigation.md)
+- [`docs/conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md)
   — the connection-process model trade-offs and the one h2 case
   cowboy still wins.
 - [`docs/roadmap.md`](docs/roadmap.md) — deferred items, with rough

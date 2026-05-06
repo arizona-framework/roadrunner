@@ -87,7 +87,7 @@ Set `SKIP_BENCH=1` to regenerate the CSV / MD from the existing
   not pipelining.
 - `tls_handshake_throughput` h2: cowboy edges roadrunner
   here. See
-  [`docs/conn_lifecycle_investigation.md`](conn_lifecycle_investigation.md)
+  [`docs/conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md)
   Round 3 for the prior null-result investigation.
 
 ## Reading the numbers honestly
