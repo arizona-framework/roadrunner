@@ -229,14 +229,15 @@ roadrunner:start_listener(my_listener, #{port => 8080, handler => hello_handler}
   is `telemetry` (tiny, no transitive deps); only dev-time dep is the
   `erlfmt` plugin.
 
-## Build
+## Contributing
 
 ```
-mise exec -- rebar3 precommit
+rebar3 precommit
 ```
 
-Runs fmt-check, compile, xref, dialyzer, eunit + ct with cover, and
-fails if line coverage drops below 100 %.
+Local gate for contributors — runs fmt-check, compile, xref,
+dialyzer, eunit + ct with cover, and fails if line coverage drops
+below 100 %. CI runs the same command.
 
 ## License
 
