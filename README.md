@@ -22,7 +22,12 @@ Roadrunner requires **OTP 29** (currently RC at the time of writing).
 Older OTPs won't compile, and the throughput numbers in the
 [performance section](#performance-at-a-glance) assume 29.
 
-## Status
+## 🚧 Status
+
+Roadrunner is in `0.x`. The core is functional and covered by tests,
+but the API may change between minor versions. Pin an exact version
+in your deps (e.g. `{roadrunner, "0.1.0"}`) if you need stability
+across upgrades.
 
 Eunit + Common Test (incl. PropEr) suites with **100 % line coverage**,
 dialyzer-clean, h2spec strict 100 %, Autobahn fuzzingclient strict
