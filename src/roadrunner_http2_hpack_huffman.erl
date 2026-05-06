@@ -167,7 +167,7 @@ init_tables() ->
 -spec build_encode_table([{non_neg_integer(), pos_integer(), non_neg_integer()}]) ->
     tuple().
 build_encode_table(Codes) ->
-    Map = maps:from_list([{S, {W, C}} || {S, W, C} <- Codes, S =< 255]),
+    Map = #{S => {W, C} || {S, W, C} <- Codes, S =< 255},
     list_to_tuple([maps:get(I, Map) || I <- lists:seq(0, 255)]).
 
 %% Decode table: each state is a branch node in the prefix tree.
