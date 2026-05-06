@@ -102,18 +102,20 @@ Malformed pairs (no `=`) are silently skipped.
 -spec params(binary()) -> #{binary() => binary()}.
 params(Value) when is_binary(Value) ->
     SemiCp = persistent_term:get(?SEMI_CP_KEY),
+    EqCp = persistent_term:get(?EQ_CP_KEY),
+    QuoteCp = persistent_term:get(?QUOTE_CP_KEY),
     Tail =
         case binary:split(Value, SemiCp) of
             [_Type] -> <<>>;
             [_Type, Rest] -> Rest
         end,
-    parse_pairs(binary:split(Tail, SemiCp, [global]), persistent_term:get(?EQ_CP_KEY), #{}).
+    parse_pairs(binary:split(Tail, SemiCp, [global]), EqCp, QuoteCp, #{}).
 
--spec parse_pairs([binary()], binary:cp(), #{binary() => binary()}) ->
+-spec parse_pairs([binary()], binary:cp(), binary:cp(), #{binary() => binary()}) ->
     #{binary() => binary()}.
-parse_pairs([], _EqCp, Acc) ->
+parse_pairs([], _EqCp, _QuoteCp, Acc) ->
     Acc;
-parse_pairs([Pair | Rest], EqCp, Acc) ->
+parse_pairs([Pair | Rest], EqCp, QuoteCp, Acc) ->
     case binary:split(string:trim(Pair), EqCp) of
         [Key, Val] ->
             %% Unquote first so internal whitespace inside quoted strings
@@ -122,19 +124,20 @@ parse_pairs([Pair | Rest], EqCp, Acc) ->
             parse_pairs(
                 Rest,
                 EqCp,
-                Acc#{roadrunner_bin:ascii_lowercase(Key) => string:trim(unquote(Val))}
+                QuoteCp,
+                Acc#{roadrunner_bin:ascii_lowercase(Key) => string:trim(unquote(Val, QuoteCp))}
             );
         _ ->
-            parse_pairs(Rest, EqCp, Acc)
+            parse_pairs(Rest, EqCp, QuoteCp, Acc)
     end.
 
--spec unquote(binary()) -> binary().
-unquote(<<$", Rest/binary>>) ->
-    case binary:match(Rest, persistent_term:get(?QUOTE_CP_KEY)) of
+-spec unquote(binary(), binary:cp()) -> binary().
+unquote(<<$", Rest/binary>>, QuoteCp) ->
+    case binary:match(Rest, QuoteCp) of
         {End, _} -> binary:part(Rest, 0, End);
         nomatch -> Rest
     end;
-unquote(Bin) ->
+unquote(Bin, _QuoteCp) ->
     Bin.
 
 -doc """
@@ -151,41 +154,53 @@ multipart structure is otherwise broken.
 parse(Body, Boundary) when is_binary(Body), is_binary(Boundary) ->
     Sep = <<"--", Boundary/binary>>,
     case binary:split(Body, Sep) of
-        [_Preamble, Rest] -> parse_parts(Rest, Sep);
-        _ -> {error, no_initial_boundary}
+        [_Preamble, Rest] ->
+            %% Fetch the compiled patterns ONCE on the success branch
+            %% and thread them through `parse_parts/5` → `parse_one_part/5`
+            %% → header-line parsing. Avoids three
+            %% `persistent_term:get/1` calls per part on a multi-part
+            %% body, and avoids fetching them at all when the body
+            %% lacks the opening boundary.
+            DblCrlfCp = persistent_term:get(?DBL_CRLF_CP_KEY),
+            CrlfCp = persistent_term:get(?CRLF_CP_KEY),
+            ColonCp = persistent_term:get(?COLON_CP_KEY),
+            parse_parts(Rest, Sep, DblCrlfCp, CrlfCp, ColonCp);
+        _ ->
+            {error, no_initial_boundary}
     end.
 
 %% After the first boundary marker, what follows is either:
 %% - "--\r\n" or "--" → terminating boundary, end of multipart.
 %% - "\r\n" + part bytes → another part to parse.
--spec parse_parts(binary(), binary()) -> {ok, [part()]} | {error, term()}.
-parse_parts(<<"--\r\n", _Epilogue/binary>>, _Sep) ->
+-spec parse_parts(binary(), binary(), binary:cp(), binary:cp(), binary:cp()) ->
+    {ok, [part()]} | {error, term()}.
+parse_parts(<<"--\r\n", _Epilogue/binary>>, _Sep, _DblCrlfCp, _CrlfCp, _ColonCp) ->
     {ok, []};
-parse_parts(<<"--">>, _Sep) ->
+parse_parts(<<"--">>, _Sep, _DblCrlfCp, _CrlfCp, _ColonCp) ->
     {ok, []};
-parse_parts(<<"\r\n", PartAndRest/binary>>, Sep) ->
+parse_parts(<<"\r\n", PartAndRest/binary>>, Sep, DblCrlfCp, CrlfCp, ColonCp) ->
     maybe
-        {ok, Part, Rest} ?= parse_one_part(PartAndRest, Sep),
-        {ok, More} ?= parse_parts(Rest, Sep),
+        {ok, Part, Rest} ?= parse_one_part(PartAndRest, Sep, DblCrlfCp, CrlfCp, ColonCp),
+        {ok, More} ?= parse_parts(Rest, Sep, DblCrlfCp, CrlfCp, ColonCp),
         {ok, [Part | More]}
     end;
-parse_parts(_, _) ->
+parse_parts(_, _, _, _, _) ->
     {error, malformed}.
 
--spec parse_one_part(binary(), binary()) ->
+-spec parse_one_part(binary(), binary(), binary:cp(), binary:cp(), binary:cp()) ->
     {ok, part(), binary()} | {error, term()}.
 %% Empty header block — the part starts with the empty-line terminator
 %% immediately. RFC 5322 §2.2.3 (referenced by RFC 7578) allows this:
 %% headers are followed by a blank line, and the header list itself
 %% may be empty. Without this clause we'd reject a perfectly valid
 %% file-upload that omits Content-Disposition / Content-Type.
-parse_one_part(<<"\r\n", BodyAndRest/binary>>, Sep) ->
+parse_one_part(<<"\r\n", BodyAndRest/binary>>, Sep, _DblCrlfCp, _CrlfCp, _ColonCp) ->
     extract_body(BodyAndRest, [], Sep);
-parse_one_part(Bytes, Sep) ->
+parse_one_part(Bytes, Sep, DblCrlfCp, CrlfCp, ColonCp) ->
     maybe
-        [HeaderBlock, BodyAndRest] ?= binary:split(Bytes, persistent_term:get(?DBL_CRLF_CP_KEY)),
-        CrlfCp = persistent_term:get(?CRLF_CP_KEY),
-        {ok, Headers} ?= parse_header_lines(binary:split(HeaderBlock, CrlfCp, [global])),
+        [HeaderBlock, BodyAndRest] ?= binary:split(Bytes, DblCrlfCp),
+        {ok, Headers} ?=
+            parse_header_lines(binary:split(HeaderBlock, CrlfCp, [global]), ColonCp),
         extract_body(BodyAndRest, Headers, Sep)
     else
         [_] -> {error, no_header_terminator};
@@ -201,10 +216,10 @@ extract_body(BodyAndRest, Headers, Sep) ->
         _ -> {error, no_part_terminator}
     end.
 
--spec parse_header_lines([binary()]) ->
+-spec parse_header_lines([binary()], binary:cp()) ->
     {ok, [{binary(), binary()}]} | {error, bad_header}.
-parse_header_lines(Lines) ->
-    parse_header_lines_loop(Lines, persistent_term:get(?COLON_CP_KEY)).
+parse_header_lines(Lines, ColonCp) ->
+    parse_header_lines_loop(Lines, ColonCp).
 
 -spec parse_header_lines_loop([binary()], binary:cp()) ->
     {ok, [{binary(), binary()}]} | {error, bad_header}.
