@@ -41,6 +41,10 @@ response (`400`, `414`, `431`, etc.).
 %% measured at the same speed as a bound variable.
 -define(UNSAFE_BYTES_KEY, {?MODULE, unsafe_bytes_cp}).
 -define(LF_KEY, {?MODULE, lf_cp}).
+-define(CRLF_KEY, {?MODULE, crlf_cp}).
+-define(COLON_KEY, {?MODULE, colon_cp}).
+-define(SPACE_KEY, {?MODULE, space_cp}).
+-define(SEMICOLON_KEY, {?MODULE, semicolon_cp}).
 
 %% Re-exported as type aliases from `roadrunner_http` so existing
 %% callers using `roadrunner_http1:request()` / `:headers()` /
@@ -144,16 +148,16 @@ Bare LF terminators are rejected as `bad_request_line` per RFC 9112 §2.2.
 %% leading CRLFs still fail (the second one becomes a malformed
 %% request-line) so this doesn't open a slowloris-style padding vector.
 parse_request_line(<<"\r\n", Rest/binary>>) ->
-    do_parse_request_line(Rest);
+    do_parse_request_line(Rest, persistent_term:get(?LF_KEY), persistent_term:get(?SPACE_KEY));
 parse_request_line(Bin) when is_binary(Bin) ->
-    do_parse_request_line(Bin).
+    do_parse_request_line(Bin, persistent_term:get(?LF_KEY), persistent_term:get(?SPACE_KEY)).
 
--spec do_parse_request_line(binary()) ->
+-spec do_parse_request_line(binary(), binary:cp(), binary:cp()) ->
     {ok, Method :: binary(), Target :: binary(), version(), Rest :: binary()}
     | {more, undefined}
     | {error, bad_request_line | bad_version | request_line_too_long}.
-do_parse_request_line(Bin) ->
-    case binary:match(Bin, persistent_term:get(?LF_KEY)) of
+do_parse_request_line(Bin, LfCp, SpaceCp) ->
+    case binary:match(Bin, LfCp) of
         nomatch when byte_size(Bin) > ?MAX_REQUEST_LINE ->
             {error, request_line_too_long};
         nomatch ->
@@ -161,28 +165,28 @@ do_parse_request_line(Bin) ->
         {0, 1} ->
             {error, bad_request_line};
         {LfPos, 1} ->
-            extract_line(Bin, LfPos)
+            extract_line(Bin, LfPos, SpaceCp)
     end.
 
--spec extract_line(binary(), pos_integer()) ->
+-spec extract_line(binary(), pos_integer(), binary:cp()) ->
     {ok, binary(), binary(), version(), binary()}
     | {error, bad_request_line | bad_version | request_line_too_long}.
-extract_line(Bin, LfPos) ->
+extract_line(Bin, LfPos, SpaceCp) ->
     LineLen = LfPos - 1,
     case Bin of
         <<Line:LineLen/binary, "\r\n", Rest/binary>> when LineLen =< ?MAX_REQUEST_LINE ->
-            parse_line(Line, Rest);
+            parse_line(Line, Rest, SpaceCp);
         <<_:LineLen/binary, "\r\n", _/binary>> ->
             {error, request_line_too_long};
         _ ->
             {error, bad_request_line}
     end.
 
--spec parse_line(binary(), binary()) ->
+-spec parse_line(binary(), binary(), binary:cp()) ->
     {ok, binary(), binary(), version(), binary()}
     | {error, bad_request_line | bad_version}.
-parse_line(Line, Rest) ->
-    case binary:split(Line, ~" ", [global]) of
+parse_line(Line, Rest, SpaceCp) ->
+    case binary:split(Line, SpaceCp, [global]) of
         [Method, Target, VersionBin] ->
             classify(Method, Target, VersionBin, Rest);
         _ ->
@@ -275,17 +279,18 @@ and lines exceeding 8192 bytes are rejected with `bad_header` /
     | {more, undefined}
     | {error, bad_header | header_too_long}.
 parse_header(Bin) when is_binary(Bin) ->
-    parse_header(Bin, persistent_term:get(?LF_KEY)).
+    parse_header(Bin, persistent_term:get(?LF_KEY), persistent_term:get(?COLON_KEY)).
 
-%% Internal — accepts the compiled LF pattern so callers in a loop
-%% (e.g. `parse_headers_loop/4`) can fetch it once and pass it
-%% through, instead of paying a `persistent_term:get/1` per header.
--spec parse_header(binary(), binary:cp()) ->
+%% Internal — accepts the compiled LF + colon patterns so callers in
+%% a loop (e.g. `parse_headers_loop/5`) can fetch them once and pass
+%% them through, instead of paying two `persistent_term:get/1` per
+%% header.
+-spec parse_header(binary(), binary:cp(), binary:cp()) ->
     {ok, binary(), binary(), binary()}
     | {end_of_headers, binary()}
     | {more, undefined}
     | {error, bad_header | header_too_long}.
-parse_header(Bin, LfCp) ->
+parse_header(Bin, LfCp, ColonCp) ->
     case binary:match(Bin, LfCp) of
         nomatch when byte_size(Bin) > ?MAX_HEADER_LINE ->
             {error, header_too_long};
@@ -294,20 +299,20 @@ parse_header(Bin, LfCp) ->
         {0, 1} ->
             {error, bad_header};
         {LfPos, 1} ->
-            extract_header_line(Bin, LfPos)
+            extract_header_line(Bin, LfPos, ColonCp)
     end.
 
--spec extract_header_line(binary(), pos_integer()) ->
+-spec extract_header_line(binary(), pos_integer(), binary:cp()) ->
     {ok, binary(), binary(), binary()}
     | {end_of_headers, binary()}
     | {error, bad_header | header_too_long}.
-extract_header_line(Bin, LfPos) ->
+extract_header_line(Bin, LfPos, ColonCp) ->
     LineLen = LfPos - 1,
     case Bin of
         <<Line:LineLen/binary, "\r\n", Rest/binary>> when LineLen =< ?MAX_HEADER_LINE ->
             case Line of
                 <<>> -> {end_of_headers, Rest};
-                _ -> parse_header_line(Line, Rest)
+                _ -> parse_header_line(Line, Rest, ColonCp)
             end;
         <<_:LineLen/binary, "\r\n", _/binary>> ->
             {error, header_too_long};
@@ -315,13 +320,13 @@ extract_header_line(Bin, LfPos) ->
             {error, bad_header}
     end.
 
--spec parse_header_line(binary(), binary()) ->
+-spec parse_header_line(binary(), binary(), binary:cp()) ->
     {ok, binary(), binary(), binary()} | {error, bad_header}.
-parse_header_line(<<C, _/binary>>, _Rest) when C =:= $\s; C =:= $\t ->
+parse_header_line(<<C, _/binary>>, _Rest, _ColonCp) when C =:= $\s; C =:= $\t ->
     %% Obs-fold continuation — RFC 9112 §5.2 says servers MUST reject.
     {error, bad_header};
-parse_header_line(Line, Rest) ->
-    case binary:split(Line, ~":") of
+parse_header_line(Line, Rest, ColonCp) ->
+    case binary:split(Line, ColonCp) of
         [NameRaw, ValueRaw] ->
             classify_header(NameRaw, ValueRaw, Rest);
         [_] ->
@@ -440,11 +445,13 @@ Enforces three hardening limits per OTP PR #11073:
         | too_many_headers
         | conflicting_framing}.
 parse_headers(Bin) when is_binary(Bin) ->
-    %% Fetch the compiled LF pattern ONCE here and thread it through
-    %% the per-header loop. Saves a `persistent_term:get/1` per header
-    %% (was ~6 per parse on a typical request; now 1).
+    %% Fetch the compiled LF + colon patterns ONCE here and thread
+    %% them through the per-header loop. Saves two
+    %% `persistent_term:get/1` calls per header (was ~12 per parse on
+    %% a typical request; now 2).
     LfCp = persistent_term:get(?LF_KEY),
-    case parse_headers_loop(Bin, 0, 0, LfCp) of
+    ColonCp = persistent_term:get(?COLON_KEY),
+    case parse_headers_loop(Bin, 0, 0, LfCp, ColonCp) of
         {ok, Headers, Rest} ->
             case check_framing(Headers) of
                 ok -> {ok, Headers, Rest};
@@ -454,7 +461,9 @@ parse_headers(Bin) when is_binary(Bin) ->
             Other
     end.
 
--spec parse_headers_loop(binary(), non_neg_integer(), non_neg_integer(), binary:cp()) ->
+-spec parse_headers_loop(
+    binary(), non_neg_integer(), non_neg_integer(), binary:cp(), binary:cp()
+) ->
     {ok, headers(), binary()}
     | {more, undefined}
     | {error,
@@ -462,15 +471,15 @@ parse_headers(Bin) when is_binary(Bin) ->
         | header_too_long
         | header_block_too_long
         | too_many_headers}.
-parse_headers_loop(_Bin, Count, _Consumed, _LfCp) when Count > ?MAX_HEADER_COUNT ->
+parse_headers_loop(_Bin, Count, _Consumed, _LfCp, _ColonCp) when Count > ?MAX_HEADER_COUNT ->
     {error, too_many_headers};
-parse_headers_loop(_Bin, _Count, Consumed, _LfCp) when Consumed > ?MAX_HEADER_BLOCK ->
+parse_headers_loop(_Bin, _Count, Consumed, _LfCp, _ColonCp) when Consumed > ?MAX_HEADER_BLOCK ->
     {error, header_block_too_long};
-parse_headers_loop(Bin, Count, Consumed, LfCp) ->
-    case parse_header(Bin, LfCp) of
+parse_headers_loop(Bin, Count, Consumed, LfCp, ColonCp) ->
+    case parse_header(Bin, LfCp, ColonCp) of
         {ok, Name, Value, Rest} ->
             Used = byte_size(Bin) - byte_size(Rest),
-            case parse_headers_loop(Rest, Count + 1, Consumed + Used, LfCp) of
+            case parse_headers_loop(Rest, Count + 1, Consumed + Used, LfCp, ColonCp) of
                 {ok, Tail, FinalRest} -> {ok, [{Name, Value} | Tail], FinalRest};
                 Other -> Other
             end;
@@ -648,7 +657,14 @@ header line is capped at 8192 bytes.
         | too_many_headers
         | conflicting_framing}.
 parse_chunk(Bin) when is_binary(Bin) ->
-    case parse_chunk_size_line(Bin) of
+    %% Fetch the compiled CRLF + semicolon patterns ONCE here and
+    %% thread them into `parse_chunk_size_line/3` (and onward to
+    %% `parse_size_line/3`) so the chunked-decode loop in
+    %% `roadrunner_conn:read_chunked/4` doesn't pay two
+    %% `persistent_term:get/1` per chunk through this entry.
+    CrlfCp = persistent_term:get(?CRLF_KEY),
+    SemiCp = persistent_term:get(?SEMICOLON_KEY),
+    case parse_chunk_size_line(Bin, CrlfCp, SemiCp) of
         {ok, 0, AfterSize} ->
             parse_last_chunk(AfterSize);
         {ok, Size, AfterSize} ->
@@ -685,12 +701,12 @@ parse_chunk_data(Size, AfterSize) ->
             {error, bad_chunk}
     end.
 
--spec parse_chunk_size_line(binary()) ->
+-spec parse_chunk_size_line(binary(), binary:cp(), binary:cp()) ->
     {ok, non_neg_integer(), binary()}
     | {more, undefined}
     | {error, bad_chunk_size | bad_chunk}.
-parse_chunk_size_line(Bin) ->
-    case binary:match(Bin, ~"\r\n") of
+parse_chunk_size_line(Bin, CrlfCp, SemiCp) ->
+    case binary:match(Bin, CrlfCp) of
         nomatch when byte_size(Bin) > ?MAX_CHUNK_HEADER ->
             {error, bad_chunk};
         nomatch ->
@@ -699,14 +715,14 @@ parse_chunk_size_line(Bin) ->
             {error, bad_chunk};
         {Pos, 2} ->
             <<Line:Pos/binary, "\r\n", Rest/binary>> = Bin,
-            parse_size_line(Line, Rest)
+            parse_size_line(Line, Rest, SemiCp)
     end.
 
--spec parse_size_line(binary(), binary()) ->
+-spec parse_size_line(binary(), binary(), binary:cp()) ->
     {ok, non_neg_integer(), binary()} | {error, bad_chunk_size}.
-parse_size_line(Line, Rest) ->
+parse_size_line(Line, Rest, SemiCp) ->
     SizePart =
-        case binary:split(Line, ~";") of
+        case binary:split(Line, SemiCp) of
             [S] -> S;
             [S, _Ext] -> S
         end,
@@ -833,4 +849,8 @@ init_patterns() ->
         binary:compile_pattern([~"\r", ~"\n", ~"\0"])
     ),
     persistent_term:put(?LF_KEY, binary:compile_pattern(~"\n")),
+    persistent_term:put(?CRLF_KEY, binary:compile_pattern(~"\r\n")),
+    persistent_term:put(?COLON_KEY, binary:compile_pattern(~":")),
+    persistent_term:put(?SPACE_KEY, binary:compile_pattern(~" ")),
+    persistent_term:put(?SEMICOLON_KEY, binary:compile_pattern(~";")),
     ok.
