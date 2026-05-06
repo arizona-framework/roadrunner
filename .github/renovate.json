@@ -1,0 +1,43 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    ":pinDevDependencies",
+    ":pinDigestsDisabled"
+  ],
+  "packageRules": [
+    {
+      "matchFileNames": [".github/**/*.yml", ".tool-versions"],
+      "groupName": "dev tools"
+    },
+    {
+      "matchFileNames": ["rebar.config"],
+      "groupName": "rebar.config deps"
+    },
+    {
+      "enabled": false,
+      "matchPackageNames": ["minimum_otp_vsn{/,}**"]
+    }
+  ],
+  "customManagers": [
+    {
+      "description": "Match versions (per datasource and depName) in .github/**/*.yml",
+      "customType": "regex",
+      "managerFilePatterns": ["/.github/.*/.*\\.yml/"],
+      "matchStrings": [
+        "# renovate datasource: (?<datasource>[^,]+), depName: (?<depName>[^\\n]+)\\n.+?(?<currentValue>v?\\d+(\\.\\d+(\\.\\d+)?)?(-[^\\n]+)?)\\n"
+      ]
+    },
+    {
+      "description": "Match versions in rebar.config",
+      "customType": "regex",
+      "managerFilePatterns": ["/rebar.config/"],
+      "datasourceTemplate": "hex",
+      "matchStrings": [
+        "{(?<depName>[^,]+), \"(?<currentValue>\\d+\\.\\d+(\\.\\d+)?)\""
+      ],
+      "versioningTemplate": "semver"
+    }
+  ]
+}

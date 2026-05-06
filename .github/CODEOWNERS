@@ -1,0 +1,26 @@
+# Code ownership for Roadrunner
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Global ownership - all files require review from maintainers
+* @williamthome
+
+# Core Erlang modules - require maintainer review
+/src/ @williamthome
+/test/ @williamthome
+
+# Build and configuration files
+/rebar.config @williamthome
+/rebar.lock @williamthome
+/.tool-versions @williamthome
+
+# CI/CD and GitHub configuration
+/.github/ @williamthome
+
+# Documentation
+/README.md @williamthome
+/CONTRIBUTING.md @williamthome
+/CHANGELOG.md @williamthome
+/docs/ @williamthome
+
+# Scripts
+/scripts/ @williamthome
