@@ -64,7 +64,7 @@ for d in _build/test/lib/*/ebin _build/test/lib/roadrunner/test; do
 done
 
 erl -noshell "${PA_DIRS[@]}" -eval "
-    {ok, _} = application:ensure_all_started([roadrunner, ssl]),
+    {ok, _} = application:ensure_all_started(roadrunner),
     {ok, _} = roadrunner:start_listener(h2spec_listener, #{
         port => $PORT,
         tls => [
