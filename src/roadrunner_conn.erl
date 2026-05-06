@@ -68,6 +68,11 @@ read it anyway.
 
 -export_type([proto_opts/0, dispatch/0, body_state/0]).
 
+-on_load(init_patterns/0).
+
+-define(CLOSE_CP_KEY, {?MODULE, close_cp}).
+-define(KEEP_ALIVE_CP_KEY, {?MODULE, keep_alive_cp}).
+
 -type dispatch() ::
     {handler, module()}
     | {router, ListenerName :: atom()}.
@@ -810,14 +815,15 @@ keep_alive_decision(Req, RespHeaders) ->
 keep_alive_decision_full(Req, RespHeaders) ->
     ReqConn = req_connection_lower(Req),
     RespConn = roadrunner_bin:ascii_lowercase(resp_connection_token(RespHeaders)),
-    ReqClose = has_token(ReqConn, ~"close"),
-    RespClose = has_token(RespConn, ~"close"),
+    CloseCp = persistent_term:get(?CLOSE_CP_KEY),
+    ReqClose = has_token(ReqConn, CloseCp),
+    RespClose = has_token(RespConn, CloseCp),
     case roadrunner_req:version(Req) of
         {1, 0} ->
             %% RFC 9112 §9.3 + RFC 9110 §7.6.1: HTTP/1.0 default is close, but
             %% `Connection: keep-alive` from client opts in (so long
             %% as the response doesn't force close).
-            ReqKA = has_token(ReqConn, ~"keep-alive"),
+            ReqKA = has_token(ReqConn, persistent_term:get(?KEEP_ALIVE_CP_KEY)),
             case ReqKA andalso not RespClose of
                 true -> keep_alive;
                 false -> close
@@ -848,9 +854,15 @@ resp_connection_token(Headers) ->
         V -> V
     end.
 
--spec has_token(binary(), binary()) -> boolean().
-has_token(Value, Token) ->
-    binary:match(Value, Token) =/= nomatch.
+-spec has_token(binary(), binary:cp()) -> boolean().
+has_token(Value, TokenCp) ->
+    binary:match(Value, TokenCp) =/= nomatch.
+
+-spec init_patterns() -> ok.
+init_patterns() ->
+    persistent_term:put(?CLOSE_CP_KEY, binary:compile_pattern(~"close")),
+    persistent_term:put(?KEEP_ALIVE_CP_KEY, binary:compile_pattern(~"keep-alive")),
+    ok.
 
 -spec header_value(binary(), roadrunner_http1:headers()) -> binary() | undefined.
 header_value(Name, Headers) ->
