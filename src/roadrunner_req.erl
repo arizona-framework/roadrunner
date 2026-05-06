@@ -323,19 +323,11 @@ dispatch_form(urlencoded, _ContentType, Req) ->
         {error, _} = E -> E
     end;
 dispatch_form(multipart, ContentType, Req) ->
-    case roadrunner_multipart:boundary(ContentType) of
-        {ok, Boundary} ->
-            case read_body(Req) of
-                {ok, Body, Req2} ->
-                    case roadrunner_multipart:parse(Body, Boundary) of
-                        {ok, Parts} -> {ok, multipart, Parts, Req2};
-                        {error, _} = E -> E
-                    end;
-                {error, _} = E ->
-                    E
-            end;
-        {error, _} = E ->
-            E
+    maybe
+        {ok, Boundary} ?= roadrunner_multipart:boundary(ContentType),
+        {ok, Body, Req2} ?= read_body(Req),
+        {ok, Parts} ?= roadrunner_multipart:parse(Body, Boundary),
+        {ok, multipart, Parts, Req2}
     end;
 dispatch_form(unsupported, _ContentType, _Req) ->
     {error, unsupported_content_type}.
