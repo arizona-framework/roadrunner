@@ -338,7 +338,7 @@ parse_header_line(Line, Rest, ColonCp) ->
 classify_header(NameRaw, ValueRaw, Rest) ->
     case validate_name(NameRaw) of
         ok ->
-            Value = trim_ows(ValueRaw),
+            Value = roadrunner_bin:trim_ows(ValueRaw),
             case validate_value(Value) of
                 ok -> {ok, roadrunner_bin:ascii_lowercase(NameRaw), Value, Rest};
                 error -> {error, bad_header}
@@ -385,27 +385,6 @@ is_tchar(C) when
     true;
 is_tchar(_) ->
     false.
-
--spec trim_ows(binary()) -> binary().
-trim_ows(B) -> trim_trailing_ows(trim_leading_ows(B)).
-
--spec trim_leading_ows(binary()) -> binary().
-trim_leading_ows(<<C, R/binary>>) when C =:= $\s; C =:= $\t ->
-    trim_leading_ows(R);
-trim_leading_ows(B) ->
-    B.
-
--spec trim_trailing_ows(binary()) -> binary().
-trim_trailing_ows(<<>>) ->
-    <<>>;
-trim_trailing_ows(B) ->
-    Size = byte_size(B),
-    case binary:at(B, Size - 1) of
-        C when C =:= $\s; C =:= $\t ->
-            trim_trailing_ows(binary:part(B, 0, Size - 1));
-        _ ->
-            B
-    end.
 
 %% Reject CR, LF, NUL, and other CTL bytes inside header values; HTAB allowed.
 %% Bytes >= 0x80 (non-ASCII) are accepted leniently — same as cowboy.
@@ -730,7 +709,7 @@ parse_size_line(Line, Rest, SemiCp) ->
     %% `;` (chunk-ext separator) but NOT before the chunk-size itself —
     %% so trim only trailing OWS, never leading. ` 5\r\n` is malformed;
     %% `5 ;ext\r\n` is fine.
-    case parse_hex(trim_trailing_ows(SizePart)) of
+    case parse_hex(roadrunner_bin:trim_trailing_ows(SizePart)) of
         {ok, N} -> {ok, N, Rest};
         error -> {error, bad_chunk_size}
     end.

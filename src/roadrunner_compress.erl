@@ -289,16 +289,16 @@ walk_tokens([Token | Rest], SemiCp, Gzip, Deflate, Wildcard) ->
 parse_token(Token, SemiCp) ->
     case binary:split(Token, SemiCp, [global]) of
         [Name] ->
-            {string:trim(Name), 1.0};
+            {roadrunner_bin:trim_ows(Name), 1.0};
         [Name | Params] ->
-            {string:trim(Name), find_q(Params, 1.0)}
+            {roadrunner_bin:trim_ows(Name), find_q(Params, 1.0)}
     end.
 
 -spec find_q([binary()], float()) -> float().
 find_q([], Default) ->
     Default;
 find_q([Param | Rest], Default) ->
-    case string:trim(Param) of
+    case roadrunner_bin:trim_ows(Param) of
         <<"q=", QBin/binary>> -> parse_q(QBin, Default);
         _ -> find_q(Rest, Default)
     end.

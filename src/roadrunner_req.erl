@@ -307,7 +307,7 @@ read_form(Req) ->
 -spec content_type_kind(binary()) -> urlencoded | multipart | unsupported.
 content_type_kind(ContentType) ->
     [Type | _] = binary:split(ContentType, persistent_term:get(?SEMI_CP_KEY)),
-    case roadrunner_bin:ascii_lowercase(string:trim(Type)) of
+    case roadrunner_bin:ascii_lowercase(roadrunner_bin:trim_ows(Type)) of
         ~"application/x-www-form-urlencoded" -> urlencoded;
         ~"multipart/form-data" -> multipart;
         _ -> unsupported
@@ -384,7 +384,9 @@ forwarded_for(Req) ->
             [First | _] = binary:split(Value, persistent_term:get(?COMMA_CP_KEY)),
             empty_to_undefined(
                 find_for_param(
-                    binary:split(string:trim(First), persistent_term:get(?SEMI_CP_KEY), [global]),
+                    binary:split(
+                        roadrunner_bin:trim_ows(First), persistent_term:get(?SEMI_CP_KEY), [global]
+                    ),
                     persistent_term:get(?EQ_CP_KEY)
                 )
             )
@@ -403,7 +405,7 @@ x_forwarded_for(Req) ->
             undefined;
         Value ->
             [First | _] = binary:split(Value, persistent_term:get(?COMMA_CP_KEY)),
-            case string:trim(First) of
+            case roadrunner_bin:trim_ows(First) of
                 <<>> -> undefined;
                 Trimmed -> Trimmed
             end
@@ -415,8 +417,8 @@ find_for_param([], _EqCp) ->
 find_for_param([Pair | Rest], EqCp) ->
     case binary:split(Pair, EqCp) of
         [Key, Val] ->
-            case roadrunner_bin:ascii_lowercase(string:trim(Key)) of
-                ~"for" -> unquote_param(string:trim(Val));
+            case roadrunner_bin:ascii_lowercase(roadrunner_bin:trim_ows(Key)) of
+                ~"for" -> unquote_param(roadrunner_bin:trim_ows(Val));
                 _ -> find_for_param(Rest, EqCp)
             end;
         _ ->

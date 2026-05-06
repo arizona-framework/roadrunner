@@ -116,7 +116,7 @@ params(Value) when is_binary(Value) ->
 parse_pairs([], _EqCp, _QuoteCp, Acc) ->
     Acc;
 parse_pairs([Pair | Rest], EqCp, QuoteCp, Acc) ->
-    case binary:split(string:trim(Pair), EqCp) of
+    case binary:split(roadrunner_bin:trim_ows(Pair), EqCp) of
         [Key, Val] ->
             %% Unquote first so internal whitespace inside quoted strings
             %% is preserved; trim afterwards catches trailing whitespace
@@ -125,7 +125,11 @@ parse_pairs([Pair | Rest], EqCp, QuoteCp, Acc) ->
                 Rest,
                 EqCp,
                 QuoteCp,
-                Acc#{roadrunner_bin:ascii_lowercase(Key) => string:trim(unquote(Val, QuoteCp))}
+                Acc#{
+                    roadrunner_bin:ascii_lowercase(Key) => roadrunner_bin:trim_ows(
+                        unquote(Val, QuoteCp)
+                    )
+                }
             );
         _ ->
             parse_pairs(Rest, EqCp, QuoteCp, Acc)
@@ -232,7 +236,7 @@ parse_header_lines_loop([Line | Rest], ColonCp) ->
     maybe
         [Name, Value] ?= binary:split(Line, ColonCp),
         {ok, More} ?= parse_header_lines_loop(Rest, ColonCp),
-        {ok, [{roadrunner_bin:ascii_lowercase(Name), string:trim(Value)} | More]}
+        {ok, [{roadrunner_bin:ascii_lowercase(Name), roadrunner_bin:trim_ows(Value)} | More]}
     else
         [_] -> {error, bad_header};
         Other -> Other

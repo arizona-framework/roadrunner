@@ -258,26 +258,26 @@ parse_extensions(Value) when is_binary(Value) ->
 -spec split_offers(binary(), binary:cp()) -> [binary()].
 split_offers(Bin, OfferCp) ->
     [
-        string:trim(O)
-     || O <- binary:split(Bin, OfferCp, [global]), string:trim(O) =/= <<>>
+        roadrunner_bin:trim_ows(O)
+     || O <- binary:split(Bin, OfferCp, [global]), roadrunner_bin:trim_ows(O) =/= <<>>
     ].
 
 -spec parse_extension_offer(binary(), binary:cp(), binary:cp()) -> extension().
 parse_extension_offer(Offer, ParamCp, KvCp) ->
     case binary:split(Offer, ParamCp, [global]) of
         [Name] ->
-            {string:trim(Name), []};
+            {roadrunner_bin:trim_ows(Name), []};
         [Name | Params] ->
-            {string:trim(Name), [parse_extension_param(P, KvCp) || P <- Params]}
+            {roadrunner_bin:trim_ows(Name), [parse_extension_param(P, KvCp) || P <- Params]}
     end.
 
 -spec parse_extension_param(binary(), binary:cp()) -> {binary(), binary() | true}.
 parse_extension_param(Param, KvCp) ->
-    case binary:split(string:trim(Param), KvCp) of
+    case binary:split(roadrunner_bin:trim_ows(Param), KvCp) of
         [Key] ->
             {Key, true};
         [Key, Value] ->
-            {string:trim(Key), unquote(string:trim(Value))}
+            {roadrunner_bin:trim_ows(Key), unquote(roadrunner_bin:trim_ows(Value))}
     end.
 
 -spec unquote(binary()) -> binary().

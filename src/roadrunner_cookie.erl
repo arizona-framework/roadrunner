@@ -51,11 +51,11 @@ parse_pairs([Pair | Rest], EqCp) ->
     %% spaces around `=`.
     case binary:split(Pair, EqCp) of
         [RawName, RawValue] ->
-            case trim_ows(RawName) of
+            case roadrunner_bin:trim_ows(RawName) of
                 <<>> ->
                     parse_pairs(Rest, EqCp);
                 Name ->
-                    [{Name, trim_ows(RawValue)} | parse_pairs(Rest, EqCp)]
+                    [{Name, roadrunner_bin:trim_ows(RawValue)} | parse_pairs(Rest, EqCp)]
             end;
         _ ->
             parse_pairs(Rest, EqCp)
@@ -117,29 +117,6 @@ attr_same_site(#{same_site := strict}) -> ~"; SameSite=Strict";
 attr_same_site(#{same_site := lax}) -> ~"; SameSite=Lax";
 attr_same_site(#{same_site := none}) -> ~"; SameSite=None";
 attr_same_site(_) -> [].
-
-%% Duplicated from roadrunner_http1 — both modules need OWS trimming. Extract
-%% to a util module if a third caller appears.
--spec trim_ows(binary()) -> binary().
-trim_ows(B) -> trim_trailing_ows(trim_leading_ows(B)).
-
--spec trim_leading_ows(binary()) -> binary().
-trim_leading_ows(<<C, R/binary>>) when C =:= $\s; C =:= $\t ->
-    trim_leading_ows(R);
-trim_leading_ows(B) ->
-    B.
-
--spec trim_trailing_ows(binary()) -> binary().
-trim_trailing_ows(<<>>) ->
-    <<>>;
-trim_trailing_ows(B) ->
-    Size = byte_size(B),
-    case binary:at(B, Size - 1) of
-        C when C =:= $\s; C =:= $\t ->
-            trim_trailing_ows(binary:part(B, 0, Size - 1));
-        _ ->
-            B
-    end.
 
 %% `-on_load` callback. See `feedback_compile_pattern_convention` —
 %% binary:match/split patterns belong in `persistent_term` so the
