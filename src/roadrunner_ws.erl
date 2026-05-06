@@ -257,10 +257,10 @@ parse_extensions(Value) when is_binary(Value) ->
 %% values, both of which forbid `,`). Split-on-comma is safe.
 -spec split_offers(binary(), binary:cp()) -> [binary()].
 split_offers(Bin, OfferCp) ->
-    [
-        roadrunner_bin:trim_ows(O)
-     || O <- binary:split(Bin, OfferCp, [global]), roadrunner_bin:trim_ows(O) =/= <<>>
-    ].
+    %% Compute the trim once via a 1-element nested generator so it
+    %% can be both filtered and used as the result, instead of calling
+    %% `trim_ows` twice per offer.
+    [X || O <- binary:split(Bin, OfferCp, [global]), X <- [roadrunner_bin:trim_ows(O)], X =/= <<>>].
 
 -spec parse_extension_offer(binary(), binary:cp(), binary:cp()) -> extension().
 parse_extension_offer(Offer, ParamCp, KvCp) ->
