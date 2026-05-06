@@ -33,16 +33,24 @@ keep compiling unchanged.
 -type redirect_status() :: 300..399.
 -type version() :: {1, 0} | {1, 1} | {2, 0}.
 
--define(DAY_NAMES, {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}).
--define(MONTH_NAMES,
-    {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
-).
+-define(DAY_NAMES, {~"Mon", ~"Tue", ~"Wed", ~"Thu", ~"Fri", ~"Sat", ~"Sun"}).
+-define(MONTH_NAMES, {
+    ~"Jan", ~"Feb", ~"Mar", ~"Apr", ~"May", ~"Jun", ~"Jul", ~"Aug", ~"Sep", ~"Oct", ~"Nov", ~"Dec"
+}).
 
 -doc """
 Format the current UTC time as an IMF-fixdate per RFC 9110 §5.6.7
 — the canonical HTTP `Date` header format, e.g.
 `Sun, 06 Nov 1994 08:49:37 GMT`. Used by the dispatch layer to
 auto-inject the `Date` response header per RFC 9110 §6.6.1.
+
+Built via direct bit-syntax binary construction rather than
+`io_lib:format/2` because the shape is fixed (RFC 9110 mandates
+exact widths and the day/month abbreviations) and this function
+runs once per response on the hot path — a 250 k req/s listener
+calls it 250 k times per second. Skipping the formatter's
+state-machine walk and iolist tree saves real cycles on every
+request.
 """.
 -spec http_date_now() -> binary().
 http_date_now() ->
@@ -51,9 +59,14 @@ http_date_now() ->
     ),
     DayName = element(calendar:day_of_the_week(Y, M, D), ?DAY_NAMES),
     MonthName = element(M, ?MONTH_NAMES),
-    iolist_to_binary(
-        io_lib:format(
-            "~s, ~2..0B ~s ~4..0B ~2..0B:~2..0B:~2..0B GMT",
-            [DayName, D, MonthName, Y, H, Mi, S]
-        )
-    ).
+    <<DayName/binary, ", ", (pad2(D))/binary, " ", MonthName/binary, " ",
+        (integer_to_binary(Y))/binary, " ", (pad2(H))/binary, ":", (pad2(Mi))/binary, ":",
+        (pad2(S))/binary, " GMT">>.
+
+%% Two-digit zero-padded integer for the IMF-fixdate fields. Year is
+%% 4-digit (always — calendar guarantees positive 4-digit years for
+%% modern timestamps), so `integer_to_binary/1` suffices there; only
+%% the day/hour/minute/second need the leading-zero pad when < 10.
+-spec pad2(0..99) -> binary().
+pad2(N) when N < 10 -> <<$0, ($0 + N)>>;
+pad2(N) -> integer_to_binary(N).
