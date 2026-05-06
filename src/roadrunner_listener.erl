@@ -361,13 +361,17 @@ inject_http2_alpn(UserTlsOpts, _Opts) ->
 %% kernel-side queueing.
 -spec spawn_acceptors(roadrunner_transport:socket(), roadrunner_conn:proto_opts(), pos_integer()) ->
     ok.
-spawn_acceptors(LSocket, ProtoOpts, N) ->
-    lists:foreach(
-        fun(I) ->
-            {ok, _Pid} = roadrunner_acceptor:start_link(LSocket, ProtoOpts, I)
-        end,
-        lists:seq(1, N)
-    ).
+spawn_acceptors(LSocket, ProtoOpts, N) when is_integer(N), N >= 0 ->
+    spawn_acceptors_loop(LSocket, ProtoOpts, 1, N).
+
+-spec spawn_acceptors_loop(
+    roadrunner_transport:socket(), roadrunner_conn:proto_opts(), pos_integer(), non_neg_integer()
+) -> ok.
+spawn_acceptors_loop(_LSocket, _ProtoOpts, I, N) when I > N ->
+    ok;
+spawn_acceptors_loop(LSocket, ProtoOpts, I, N) ->
+    {ok, _Pid} = roadrunner_acceptor:start_link(LSocket, ProtoOpts, I),
+    spawn_acceptors_loop(LSocket, ProtoOpts, I + 1, N).
 
 -spec build_proto_opts(opts(), atom()) -> roadrunner_conn:proto_opts().
 build_proto_opts(Opts, ListenerName) ->
