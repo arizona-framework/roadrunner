@@ -60,7 +60,7 @@ Boot a listener:
 
 ```erlang
 1> application:ensure_all_started(roadrunner).
-2> roadrunner:start_listener(http, #{
+2> roadrunner:start_listener(my_listener, #{
        port => 8080,
        routes => [{~"/", hello_handler, #{greeting => ~"hello"}}]
    }).
@@ -79,7 +79,7 @@ For HTTP/2 over TLS, add a cert and put `~"h2"` in the listener's
 `alpn_preferred_protocols`:
 
 ```erlang
-3> roadrunner:start_listener(https, #{
+3> roadrunner:start_listener(my_tls_listener, #{
        port => 8443,
        tls => [
            {certfile, "cert.pem"},
@@ -98,7 +98,7 @@ For listeners that don't need routing, `handler => Mod` skips the router
 entirely and dispatches every request to `Mod:handle/1`:
 
 ```erlang
-roadrunner:start_listener(http, #{port => 8080, handler => hello_handler}).
+roadrunner:start_listener(my_listener, #{port => 8080, handler => hello_handler}).
 ```
 
 ## Features
