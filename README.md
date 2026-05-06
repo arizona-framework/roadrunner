@@ -229,16 +229,55 @@ roadrunner:start_listener(my_listener, #{port => 8080, handler => hello_handler}
   is `telemetry` (tiny, no transitive deps); only dev-time dep is the
   `erlfmt` plugin.
 
+## Sponsors
+
+If you like Roadrunner, please consider [sponsoring me](https://github.com/sponsors/williamthome).
+I'm thankful for your never-ending support ❤️
+
+I also accept coffees ☕
+
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/williamthome)
+
 ## Contributing
 
-```
-rebar3 precommit
-```
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for development setup,
+testing guidelines, and contribution workflow.
 
-Local gate for contributors — runs fmt-check, compile, xref,
-dialyzer, eunit + ct with cover, and fails if line coverage drops
-below 100 %. CI runs the same command.
+### Contributors
+
+<a href="https://github.com/arizona-framework/roadrunner/graphs/contributors">
+  <img
+    src="https://contrib.rocks/image?repo=arizona-framework/roadrunner&max=100&columns=10"
+    width="15%"
+    alt="Contributors"
+  />
+</a>
+
+## Star History
+
+<a href="https://star-history.com/#arizona-framework/roadrunner">
+  <picture>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="https://api.star-history.com/svg?repos=arizona-framework/roadrunner&type=Date&theme=dark"
+    />
+    <source
+      media="(prefers-color-scheme: light)"
+      srcset="https://api.star-history.com/svg?repos=arizona-framework/roadrunner&type=Date"
+    />
+    <img
+      src="https://api.star-history.com/svg?repos=arizona-framework/roadrunner&type=Date"
+      alt="Star History Chart"
+      width="100%"
+    />
+  </picture>
+</a>
 
 ## License
 
-Apache-2.0.
+Copyright (c) 2026 [William Fank Thomé](https://github.com/williamthome)
+
+Roadrunner is open-source under the Apache 2.0 License on
+[GitHub](https://github.com/arizona-framework/roadrunner).
+
+See [LICENSE.md](LICENSE.md) for more information.
