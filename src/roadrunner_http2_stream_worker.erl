@@ -133,7 +133,7 @@ telemetry_metadata(#{
     listener_name := ListenerName
 }) ->
     %% All five required keys are populated by
-    %% `roadrunner_http2_request:build/7`; pattern-match destructure
+    %% `roadrunner_http2_request:build/6`; pattern-match destructure
     %% replaces the prior 6 `maps:get/2,3` calls per request.
     #{
         request_id => RequestId,
@@ -177,12 +177,12 @@ emit_501(ConnPid, StreamId) ->
 %% round-trip in either case.
 send_buffered(ConnPid, StreamId, Status, Headers, Body) ->
     Bin = iolist_to_binary(Body),
-    sync(ConnPid, fun(Ref) ->
+    sync(fun(Ref) ->
         _ = (ConnPid ! {h2_send_response, self(), Ref, StreamId, Status, Headers, Bin}),
         ok
     end).
 
-sync(_ConnPid, SendFun) ->
+sync(SendFun) ->
     Ref = make_ref(),
     ok = SendFun(Ref),
     receive

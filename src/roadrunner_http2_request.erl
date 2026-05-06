@@ -65,10 +65,14 @@ for header-only requests).
     {ok, roadrunner_http1:request()} | {error, build_error()}.
 from_headers(Headers, Body, ConnInfo) ->
     maybe
-        {ok, Pseudo, Regular} ?= partition(Headers, #{}, []),
-        {ok, Method, Scheme, Path, Authority} ?= validate_pseudo(Pseudo),
+        {ok, Pseudo, Regular} ?= partition(Headers),
+        %% `validate_pseudo` returns the parsed `:scheme` value but we
+        %% deliberately discard it — the authoritative scheme comes
+        %% from the conn (`ConnInfo.scheme`) since clients can lie
+        %% about the pseudo-header value.
+        {ok, Method, _Scheme, Path, Authority} ?= validate_pseudo(Pseudo),
         ok ?= check_banned(Regular),
-        {ok, build(Method, Scheme, Path, Authority, Regular, Body, ConnInfo)}
+        {ok, build(Method, Path, Authority, Regular, Body, ConnInfo)}
     end.
 
 %% Walk the decoded header list, collecting pseudo-headers (names
@@ -80,15 +84,16 @@ from_headers(Headers, Body, ConnInfo) ->
 %% which body-recurses the rest. Splitting the two phases avoids
 %% the prior shape's double recursion (cons-forward AND cons-back
 %% on every regular header).
--spec partition(
-    [roadrunner_http2_hpack:header()],
-    map(),
-    [roadrunner_http2_hpack:header()]
-) ->
+-spec partition([roadrunner_http2_hpack:header()]) ->
     {ok, map(), [roadrunner_http2_hpack:header()]} | {error, build_error()}.
-partition([], Pseudo, _) ->
+partition(Headers) ->
+    partition(Headers, #{}).
+
+-spec partition([roadrunner_http2_hpack:header()], map()) ->
+    {ok, map(), [roadrunner_http2_hpack:header()]} | {error, build_error()}.
+partition([], Pseudo) ->
     {ok, Pseudo, []};
-partition([{<<":", _/binary>> = Name, Value} | Rest], Pseudo, _) ->
+partition([{<<":", _/binary>> = Name, Value} | Rest], Pseudo) ->
     case Pseudo of
         #{Name := _} ->
             {error, duplicate_pseudo_header};
@@ -98,11 +103,11 @@ partition([{<<":", _/binary>> = Name, Value} | Rest], Pseudo, _) ->
             Name =:= ~":authority";
             Name =:= ~":path"
         ->
-            partition(Rest, Pseudo#{Name => Value}, []);
+            partition(Rest, Pseudo#{Name => Value});
         _ ->
             {error, unknown_pseudo_header}
     end;
-partition([H | Rest], Pseudo, _) ->
+partition([H | Rest], Pseudo) ->
     case partition_regular(Rest) of
         {ok, Tail} -> {ok, Pseudo, [H | Tail]};
         {error, _} = E -> E
@@ -159,13 +164,12 @@ check_banned([_ | Rest]) -> check_banned(Rest).
 -spec build(
     binary(),
     binary(),
-    binary(),
     binary() | undefined,
     [roadrunner_http2_hpack:header()],
     binary(),
     map()
 ) -> roadrunner_http1:request().
-build(Method, _Scheme, Path, Authority, Regular, Body, ConnInfo) ->
+build(Method, Path, Authority, Regular, Body, ConnInfo) ->
     %% Forward `:authority` as a `host` header so existing h1
     %% handler code that reads `Host` still works. (RFC 9113
     %% §8.3.1 says an h2 server MUST treat `:authority` like

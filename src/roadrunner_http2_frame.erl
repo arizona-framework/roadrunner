@@ -166,9 +166,7 @@ higher value. Frames whose `length` exceeds the limit fail with
 -define(TYPE_CONTINUATION, 9).
 
 %% Common flag bits used across multiple frame types.
--define(FLAG_END_STREAM, 16#01).
 -define(FLAG_ACK, 16#01).
--define(FLAG_END_HEADERS, 16#04).
 -define(FLAG_PADDED, 16#08).
 -define(FLAG_PRIORITY, 16#20).
 

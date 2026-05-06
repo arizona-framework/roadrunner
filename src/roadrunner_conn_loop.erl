@@ -142,7 +142,7 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
             StartMono = roadrunner_telemetry:listener_accept(#{
                 listener_name => ListenerName, peer => Peer
             }),
-            case http2_negotiated(Socket, ProtoOpts) of
+            case http2_negotiated(Socket) of
                 true ->
                     %% ALPN landed on `h2` and the listener allows it —
                     %% the HTTP/2 path takes over. Slot release and
@@ -184,8 +184,8 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
 %% fall through to HTTP/1.1. h2 is enabled by listing `~"h2"` in the
 %% listener's `alpn_preferred_protocols`; without it the server
 %% never advertises h2 so this branch is unreachable.
--spec http2_negotiated(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> boolean().
-http2_negotiated(Socket, _ProtoOpts) ->
+-spec http2_negotiated(roadrunner_transport:socket()) -> boolean().
+http2_negotiated(Socket) ->
     case roadrunner_transport:negotiated_alpn(Socket) of
         {ok, ~"h2"} -> true;
         _ -> false
@@ -610,13 +610,13 @@ dispatch_response(Socket, _Handler, Req, {websocket, Mod, State}) when is_atom(M
 dispatch_response(Socket, _Handler, _Req, {stream, Status, Headers0, Fun}) when
     is_function(Fun, 1)
 ->
-    Headers = with_date(Status, Headers0),
+    Headers = with_date(Headers0),
     _ = roadrunner_stream_response:run(Socket, Status, Headers, Fun),
     ok;
 dispatch_response(Socket, Handler, _Req, {loop, Status, Headers0, LoopState}) when
     is_integer(Status)
 ->
-    Headers = with_date(Status, Headers0),
+    Headers = with_date(Headers0),
     _ = roadrunner_loop_response:run(Socket, Status, Headers, Handler, LoopState),
     ok;
 dispatch_response(
@@ -624,7 +624,7 @@ dispatch_response(
 ) when
     is_integer(Status)
 ->
-    Headers = with_date(Status, Headers0),
+    Headers = with_date(Headers0),
     Head = roadrunner_http1:response(Status, Headers, ~""),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Head), sendfile_response_head
@@ -647,14 +647,14 @@ dispatch_response(
 dispatch_response(Socket, _Handler, #{method := ~"HEAD"}, {Status, Headers0, _Body}) when
     is_integer(Status)
 ->
-    Headers = with_date(Status, Headers0),
+    Headers = with_date(Headers0),
     Resp = roadrunner_http1:response(Status, Headers, ~""),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Resp), buffered_response
     ),
     ok;
 dispatch_response(Socket, _Handler, _Req, {Status, Headers0, Body}) when is_integer(Status) ->
-    Headers = with_date(Status, Headers0),
+    Headers = with_date(Headers0),
     Resp = roadrunner_http1:response(Status, Headers, Body),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Resp), buffered_response
@@ -667,9 +667,8 @@ dispatch_response(Socket, _Handler, _Req, {Status, Headers0, Body}) when is_inte
 %% only fires for handler-emitted responses (status ≥ 200); 1xx
 %% interim responses are emitted by the framework directly without
 %% routing through this path, so we don't need a 1xx skip here.
--spec with_date(roadrunner_http1:status(), roadrunner_http1:headers()) ->
-    roadrunner_http1:headers().
-with_date(_Status, Headers) ->
+-spec with_date(roadrunner_http1:headers()) -> roadrunner_http1:headers().
+with_date(Headers) ->
     case lists:keymember(~"date", 1, Headers) of
         true -> Headers;
         false -> [{~"date", roadrunner_http:http_date_now()} | Headers]

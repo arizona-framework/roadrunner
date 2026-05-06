@@ -77,24 +77,24 @@ do_send(ConnPid, StreamId, Data, {fin, Trailers}) ->
     ok.
 
 sync_send_headers(ConnPid, StreamId, Status, Headers, EndStream) ->
-    sync(ConnPid, fun(Ref) ->
+    sync(fun(Ref) ->
         _ = (ConnPid ! {h2_send_headers, self(), Ref, StreamId, Status, Headers, EndStream}),
         ok
     end).
 
 sync_send_data(ConnPid, StreamId, Bin, EndStream) ->
-    sync(ConnPid, fun(Ref) ->
+    sync(fun(Ref) ->
         _ = (ConnPid ! {h2_send_data, self(), Ref, StreamId, Bin, EndStream}),
         ok
     end).
 
 sync_send_trailers(ConnPid, StreamId, Trailers) ->
-    sync(ConnPid, fun(Ref) ->
+    sync(fun(Ref) ->
         _ = (ConnPid ! {h2_send_trailers, self(), Ref, StreamId, Trailers}),
         ok
     end).
 
-sync(_ConnPid, SendFun) ->
+sync(SendFun) ->
     Ref = make_ref(),
     ok = SendFun(Ref),
     receive

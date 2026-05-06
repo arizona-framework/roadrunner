@@ -78,12 +78,12 @@ call(Req, Next) ->
 
 -spec transform(roadrunner_req:request(), roadrunner_handler:response()) ->
     roadrunner_handler:response().
-transform(_Req, {Status, Headers, Body} = _Response) when is_integer(Status, 100, 599) ->
-    transform_buffered(_Req, Status, Headers, Body);
-transform(_Req, {stream, Status, Headers, Fun} = _Response) when
+transform(Req, {Status, Headers, Body}) when is_integer(Status, 100, 599) ->
+    transform_buffered(Req, Status, Headers, Body);
+transform(Req, {stream, Status, Headers, Fun}) when
     is_integer(Status, 100, 599), is_function(Fun, 1)
 ->
-    transform_stream(_Req, Status, Headers, Fun);
+    transform_stream(Req, Status, Headers, Fun);
 transform(_Req, Other) ->
     %% loop / websocket — pass through. Streaming gzip would need to
     %% intercept the per-message Push fun in `roadrunner_loop_response`,
