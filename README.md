@@ -72,6 +72,12 @@ parser, no WebSocket). On simple GETs (`hello`, `json`, `echo`)
 Roadrunner's lead over elli is within the bench's ~15 % variance
 band — the comparison doc has the full honest framing.
 
+The numbers above are throughput from `scripts/bench.escript`
+(closed-loop). For Coordinated-Omission-corrected tail latency at
+sustained rates (open-loop, via wrk2), see
+[`docs/wrk2_results.md`](docs/wrk2_results.md) and the
+methodology section in [`docs/comparison.md`](docs/comparison.md).
+
 ## Quickstart
 
 Add to `rebar.config`:
