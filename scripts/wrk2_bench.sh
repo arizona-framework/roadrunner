@@ -172,13 +172,16 @@ command -v docker >/dev/null 2>&1 || {
     exit 2
 }
 
-# Optional filters.
+# Optional filters. `--scenario` accepts a comma-separated list so a
+# small subset can be targeted, e.g. `--scenario hello,echo`.
 if [ -n "$SCENARIO" ]; then
-    contains "$SCENARIO" "${SCENARIOS_ALL[@]}" || {
-        echo "error: unknown scenario '$SCENARIO'" >&2
-        exit 2
-    }
-    SCENARIOS=("$SCENARIO")
+    IFS=',' read -ra SCENARIOS <<< "$SCENARIO"
+    for s in "${SCENARIOS[@]}"; do
+        contains "$s" "${SCENARIOS_ALL[@]}" || {
+            echo "error: unknown scenario '$s'" >&2
+            exit 2
+        }
+    done
 else
     SCENARIOS=("${SCENARIOS_ALL[@]}")
 fi
@@ -538,7 +541,11 @@ Time"). Two tables per scenario:
   server is keeping up; if they diverge, that's a saturation
   signal even if achieved is at target.
 
-Each row is the median of **${RUNS} runs at ${DURATION_S}s each**,
+$(if [ "$RUNS" -eq 1 ]; then
+    echo "Each row is a **single run at ${DURATION_S}s** (no medianing — this is a preliminary capture; re-run with \`--runs 3\` on a quiet machine for the canonical artifact),"
+else
+    echo "Each row is the median of **${RUNS} runs at ${DURATION_S}s each**,"
+fi)
 \`-t${THREADS} -c${CONNS}\`. Per-run logs live under
 \`/tmp/wrk2/<scenario>/<server>/<rate-pct>/run-N.log\`.
 
