@@ -214,3 +214,67 @@ jobs:
 
       - name: Run Autobahn fuzzingclient
         run: ./scripts/autobahn.escript
+
+  # wrk2 smoke — verifies the open-loop bench pipeline (Docker
+  # cylab/wrk2 + bench.escript --standalone + HdrHistogram parsing
+  # + Lua POST scripts) still works end-to-end. Catches breakage,
+  # NOT regression: CI runner numbers are too noisy for tail-latency
+  # claims, so the canonical `docs/wrk2_results.md` always comes
+  # from a quiet local box. Two scenarios: `hello` (GET path) and
+  # `echo` (POST path via Lua) so a broken Lua script also fails
+  # the smoke. Runs on every push + PR; ~2 min total.
+  wrk2-smoke:
+    name: wrk2 smoke
+
+    needs: cache-erlang
+
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24
+        id: setup-beam
+        with:
+          version-type: strict
+          version-file: .tool-versions
+
+      - name: Restore _build cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: _build
+          key: ${{ needs.cache-erlang.outputs.build-cache-key }}
+          restore-keys: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
+
+      - name: Restore rebar3 cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/rebar3
+          key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
+          restore-keys: |
+            rebar3-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-
+            rebar3-${{ runner.os }}-
+
+      - name: Run wrk2 smoke (hello + echo, --quick, 10s)
+        run: |
+          ./scripts/wrk2_bench.sh --quick --scenario hello,echo \
+              --duration 10 --server roadrunner \
+              --out /tmp/wrk2_smoke.md
+
+      - name: Verify smoke output structure
+        run: |
+          set -euo pipefail
+          out=/tmp/wrk2_smoke.md
+          [ -s "$out" ] || { echo "smoke output empty"; exit 1; }
+          # Both scenarios must render their tables.
+          grep -q '^## `hello`'  "$out" || { echo "missing hello section"; exit 1; }
+          grep -q '^## `echo`'   "$out" || { echo "missing echo section"; exit 1; }
+          # Both views (corrected + uncorrected) must be present.
+          grep -q 'CO-corrected' "$out" || { echo "missing CO-corrected table"; exit 1; }
+          grep -q 'Uncorrected'  "$out" || { echo "missing Uncorrected table"; exit 1; }
+          # Roadrunner must have at least one populated row in the
+          # corrected table — proves the standalone listener came up
+          # and the HdrHistogram parser pulled a value.
+          grep -E '^\| roadrunner \| .* \| .*ms \| .*ms \|' "$out" \
+              || { echo "no parsed roadrunner row"; exit 1; }
+          echo "smoke ok"
