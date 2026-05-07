@@ -20,26 +20,77 @@ See `.tool-versions` for the required Erlang/OTP and rebar3 versions
 ```bash
 git clone https://github.com/arizona-framework/roadrunner.git
 cd roadrunner
-rebar3 compile
+make compile
 ```
+
+> **OTP 29 RC3 note.** rebar3 on OTP 29 RC3 fails the TLS handshake
+> to hex.pm on `/packages/<name>` paths (Fastly's edge rejects OTP
+> 29's TLS 1.3 client fingerprint). The repo ships a workaround
+> config (`config/rebar3_ssl.config`) that pins TLS 1.2; the
+> `Makefile` loads it via `ERL_FLAGS` automatically. If you're
+> invoking `rebar3` directly, prepend
+> `ERL_FLAGS="-config config/rebar3_ssl"`. The fix is in OTP 29
+> RC4 — once that lands, the Makefile's `ERL_FLAGS` and this note
+> can be dropped.
 
 ## Workflow
 
 One command covers day-to-day development:
 
-- **`rebar3 precommit`** -- run before every commit and before pushing.
-  Formats Erlang via `erlfmt`, compiles, runs xref + dialyzer, runs
-  the eunit + Common Test (incl. PropEr) suites with cover, and
-  fails if line coverage drops below 100 %. CI runs the same command.
+- **`make test`** (or `make precommit`, or `rebar3 precommit`) — run
+  before every commit and before pushing. Formats-check Erlang via
+  `erlfmt`, compiles, runs xref + hank + dialyzer, runs the eunit +
+  Common Test (incl. PropEr) suites with cover, fails if line
+  coverage drops below 100 %, and builds the docs. CI runs the same
+  command.
 
-For everything else (single-suite runs, coverage reports, individual
-check stages) invoke `rebar3 <task>` directly: `rebar3 eunit`,
-`rebar3 ct`, `rebar3 dialyzer`, `rebar3 cover`, `rebar3 fmt`, etc.
-See `rebar.config` for the full alias list.
+`make help` lists every target. Common ones:
+
+- `make compile` / `make doc` / `make fmt`
+- `make eunit` / `make ct` / `make dialyzer` / `make xref` / `make hank` (individual stages)
+- `make bench-quick` / `make wrk2-quick` / `make h2spec` / `make autobahn`
+- `make clean` / `make distclean`
+
+You can also invoke `rebar3 <task>` directly (the Makefile is just a
+thin wrapper that pre-sets the OTP 29 TLS workaround). See
+`rebar.config` for the full alias list.
 
 Diagnostic / conformance scripts under `scripts/` (`bench.escript`,
-`h2spec.sh`, `autobahn.escript`, `redbot.escript`) are run directly;
-each script's header documents its requirements.
+`h2spec.sh`, `autobahn.escript`, `redbot.escript`, `wrk2_bench.sh`)
+are run directly; each script's header documents its requirements.
+
+### Benchmarking notes
+
+Two complementary load drivers ship in this repo:
+
+- **`scripts/bench.escript`** — closed-loop. Each worker sends a
+  request, waits for the response, sends the next. Reports
+  throughput + p50/p99 from per-request timing. Easy to set up,
+  no external dependency, but tail latency under load is
+  deflated by Coordinated Omission. Used for the per-scenario
+  matrix in [`docs/bench_results.md`](docs/bench_results.md).
+- **`scripts/wrk2_bench.sh`** — open-loop, via
+  [wrk2](https://github.com/giltene/wrk2) running in Docker
+  (`cylab/wrk2:latest`). Issues requests at a fixed rate
+  regardless of server response and reports
+  Coordinated-Omission-corrected HdrHistogram percentiles.
+  Output: [`docs/wrk2_results.md`](docs/wrk2_results.md). Needs
+  `docker` on PATH and `rebar3 as test compile` already done;
+  the script pulls the image automatically.
+
+Run a quick wrk2 sanity check:
+
+```bash
+./scripts/wrk2_bench.sh --quick --scenario hello
+```
+
+The full matrix takes ~2 hours at `--runs 1 --duration 30s` and
+~10 hours at the canonical `--runs 3 --duration 60s`. Run on a
+quiet machine — system noise inflates tail percentiles.
+
+Both drivers' internals (worker model, latency aggregation,
+loader-as-bottleneck conditions) are documented in
+[`docs/bench_internals.md`](docs/bench_internals.md).
 
 ## License
 

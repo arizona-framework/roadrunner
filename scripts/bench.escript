@@ -60,15 +60,26 @@ main(Args) ->
     Opts0 = parse_args(Args),
     ProjectDir = project_dir(),
     ok = setup_code_paths(ProjectDir),
+    %% preflight runs for both `--standalone` and the regular bench
+    %% flow: it filters incompatible servers (e.g. elli for scenarios
+    %% the elli fixture can't serve) and produces clear console
+    %% notes. `run_standalone/1`'s "exactly one server" check then
+    %% catches the case where the user-requested server got filtered
+    %% out, instead of starting a listener that 404s every request.
     Opts1 = preflight_protocol(Opts0),
     Opts = preflight_scenario(Opts1),
-    print_header(Opts),
-    %% Each side runs in isolation: bring the server up, drive load,
-    %% bring it down, then do the next. Order matches the user's
-    %% --servers list (default: all known servers).
-    Servers = maps:get(servers, Opts),
-    Results = [{S, element(2, run_side(S, Opts))} || S <- Servers],
-    print_summary(Results).
+    case maps:get(standalone, Opts, false) of
+        true ->
+            run_standalone(Opts);
+        false ->
+            print_header(Opts),
+            %% Each side runs in isolation: bring the server up, drive load,
+            %% bring it down, then do the next. Order matches the user's
+            %% --servers list (default: all known servers).
+            Servers = maps:get(servers, Opts),
+            Results = [{S, element(2, run_side(S, Opts))} || S <- Servers],
+            print_summary(Results)
+    end.
 
 %% Validate environment for the chosen protocol and drop
 %% incompatible servers. The h2 path needs a TLS cert (auto-
@@ -135,6 +146,9 @@ preflight_scenario(#{scenario := chunked_request_body, servers := Servers} = Opt
     %% in the same shape; skip for apples-to-apples.
     filter_servers(chunked_request_body, [elli], Servers, Opts,
         ~"elli test fixture's body-read does not handle Transfer-Encoding: chunked here");
+preflight_scenario(#{scenario := cookies_heavy, servers := Servers} = Opts) ->
+    filter_servers(cookies_heavy, [elli], Servers, Opts,
+        ~"no /cookies handler in elli test fixture");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -643,6 +657,36 @@ cli() ->
                       h2: TLS + ALPN h2. elli is filtered automatically
                           (no h2 support); only roadrunner + cowboy run.
                     """
+            },
+            #{
+                name => standalone,
+                long => "-standalone",
+                type => boolean,
+                default => false,
+                help =>
+                    """
+                    Bring ONE server up with the scenario's listener
+                    config, write the bound port + URL + method to
+                    `--port-file`, and block until SIGTERM. Lets
+                    out-of-process load drivers (e.g. wrk2) target
+                    the listener without re-implementing the per-
+                    server launcher logic. Requires `--port-file`,
+                    `--servers <one>`, `--protocol h1` (h1-only).
+                    """
+            },
+            #{
+                name => port_file,
+                long => "-port-file",
+                type => string,
+                default => "",
+                help =>
+                    """
+                    Path the `--standalone` mode writes the listener
+                    metadata to. Three-line ini:
+                      PORT=<integer>
+                      PATH=<scenario path, may include query string>
+                      METHOD=<GET|POST|HEAD|OPTIONS>
+                    """
             }
         ]
     }.
@@ -692,6 +736,81 @@ parse_servers(Str) ->
             ),
             halt(2)
     end.
+
+%% ===========================================================================
+%% --standalone mode: bring ONE server up, write the bound port + URL +
+%% method to a port file, and block until SIGTERM. Out-of-process load
+%% drivers (wrk2) read the port file and target the listener directly.
+%% h1-only — wrk2's primary consumer doesn't speak h2; h2 needs TLS +
+%% cert generation which the bench's existing flow handles but is
+%% pointless without an h2 client.
+%% ===========================================================================
+
+run_standalone(Opts) ->
+    PortFile = maps:get(port_file, Opts, ""),
+    PortFile =/= "" orelse standalone_error(
+        "--standalone requires --port-file PATH", []
+    ),
+    Servers = maps:get(servers, Opts),
+    [Server] =
+        case Servers of
+            [_] -> Servers;
+            _ ->
+                standalone_error(
+                    "--standalone requires exactly one --servers entry "
+                    "(got: ~p)", [Servers]
+                )
+        end,
+    Protocol = maps:get(protocol, Opts),
+    Protocol =:= h1 orelse standalone_error(
+        "--standalone is h1-only (received --protocol ~s)", [Protocol]
+    ),
+    Scenario = maps:get(scenario, Opts),
+    ok = validate_standalone_scenario(Scenario),
+    {Peer, Port} = start_server(Server, Opts),
+    ok = write_port_file(PortFile, Port, Scenario),
+    ok = os:set_signal(sigterm, handle),
+    io:format(
+        "standalone listener: ~s scenario=~s port=~b "
+        "(SIGTERM to stop)~n",
+        [Server, Scenario, Port]
+    ),
+    receive
+        {signal, sigterm} ->
+            peer:stop(Peer),
+            halt(0)
+    end.
+
+validate_standalone_scenario(Scenario) ->
+    %% `scenario_path/1` covers exactly the scenarios that translate to
+    %% a single-URL, single-method open-loop request. h2-only and
+    %% connection-shape scenarios have no clause and raise
+    %% `function_clause` here, which we surface as a clean error.
+    try
+        _ = scenario_path(Scenario),
+        ok
+    catch
+        error:function_clause ->
+            standalone_error(
+                "scenario '~s' is not supported in --standalone mode "
+                "(no path mapping; h2-only or connection-shape)",
+                [Scenario]
+            )
+    end.
+
+write_port_file(Path, Port, Scenario) ->
+    Method = scenario_method(Scenario),
+    UrlPath = scenario_path(Scenario),
+    Content = iolist_to_binary([
+        "PORT=", integer_to_binary(Port), $\n,
+        "PATH=", UrlPath, $\n,
+        "METHOD=", Method, $\n
+    ]),
+    file:write_file(Path, Content).
+
+standalone_error(Fmt, Args) ->
+    io:format(standard_error, "error: " ++ Fmt ++ "~n", Args),
+    halt(2).
 
 %% ===========================================================================
 %% Per-side runner — spawn peer, bring server up, run loadgen, tear down.
@@ -2335,6 +2454,70 @@ recv_n_responses(Sock, Buf, N, BodyLen, Timeout, BytesAcc) ->
                     E
             end
     end.
+
+%% Method + path lookups for each scenario. Used by `--standalone` mode
+%% (which writes them to the port file so an out-of-process load driver
+%% — e.g. wrk2 — can target the right URL) and by anything else that
+%% needs the URL without constructing the full request bytes.
+%%
+%% INVARIANT: keep these in sync with the `build_request/1` clause for
+%% the same scenario. Adding a new scenario means adding to all three
+%% (build_request, scenario_method, scenario_path).
+%%
+%% h2-only scenarios (streaming_response, multi_stream_h2,
+%% small_chunked_response, tls_handshake_throughput) are intentionally
+%% absent — `build_request/1` halts on those, and `--standalone` is
+%% h1-only.
+%%
+%% Connection-shape scenarios (pipelined_h1, slow_client,
+%% connection_storm, mixed_workload, accept_storm_burst,
+%% server_sent_events) don't have a single representative URL — the
+%% bench worker drives them with custom wire patterns. Open-loop
+%% drivers like wrk2 can't reproduce those shapes, so they're absent
+%% here too.
+scenario_method(hello) -> ~"GET";
+scenario_method(echo) -> ~"POST";
+scenario_method(large_response) -> ~"GET";
+scenario_method(json) -> ~"GET";
+scenario_method(large_post_streaming) -> ~"POST";
+scenario_method(gzip_response) -> ~"GET";
+scenario_method(backpressure_sustained) -> ~"GET";
+scenario_method(large_keepalive_session) -> ~"GET";
+scenario_method(url_with_qs) -> ~"GET";
+scenario_method(head_method) -> ~"HEAD";
+scenario_method(etag_304) -> ~"GET";
+scenario_method(cookies_heavy) -> ~"GET";
+scenario_method(multi_request_body) -> ~"POST";
+scenario_method(path_with_unicode) -> ~"GET";
+scenario_method(cors_preflight) -> ~"OPTIONS";
+scenario_method(chunked_request_body) -> ~"POST";
+scenario_method(redirect_response) -> ~"GET";
+scenario_method(compressed_request_body) -> ~"POST";
+scenario_method(post_4kb_form) -> ~"POST";
+scenario_method(headers_heavy) -> ~"GET".
+
+scenario_path(hello) -> ~"/";
+scenario_path(echo) -> ~"/echo";
+scenario_path(large_response) -> ~"/large";
+scenario_path(json) -> ~"/json";
+scenario_path(large_post_streaming) -> ~"/drain";
+scenario_path(gzip_response) -> ~"/gzip";
+scenario_path(backpressure_sustained) -> ~"/";
+scenario_path(large_keepalive_session) -> ~"/";
+scenario_path(url_with_qs) ->
+    ~"/qs?filter=active&sort=name&limit=100&offset=200&fields=id,name,email&include=role";
+scenario_path(head_method) -> ~"/large";
+scenario_path(etag_304) -> ~"/etag";
+scenario_path(cookies_heavy) -> ~"/cookies";
+scenario_path(multi_request_body) -> ~"/echo";
+scenario_path(path_with_unicode) ->
+    ~"/qs?name=%E4%B8%AD%E6%96%87&city=%D0%9C%D0%BE%D1%81%D0%BA%D0%B2%D0%B0&emoji=%F0%9F%8E%89&query=hello+world&filter=active";
+scenario_path(cors_preflight) -> ~"/api";
+scenario_path(chunked_request_body) -> ~"/echo";
+scenario_path(redirect_response) -> ~"/redirect";
+scenario_path(compressed_request_body) -> ~"/echo";
+scenario_path(post_4kb_form) -> ~"/form";
+scenario_path(headers_heavy) -> ~"/".
 
 %% Pre-built per-iteration request bytes so the worker hot loop doesn't
 %% allocate. Both scenarios assume the same handler returns
