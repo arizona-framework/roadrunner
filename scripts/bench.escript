@@ -60,12 +60,18 @@ main(Args) ->
     Opts0 = parse_args(Args),
     ProjectDir = project_dir(),
     ok = setup_code_paths(ProjectDir),
-    case maps:get(standalone, Opts0, false) of
+    %% preflight runs for both `--standalone` and the regular bench
+    %% flow: it filters incompatible servers (e.g. elli for scenarios
+    %% the elli fixture can't serve) and produces clear console
+    %% notes. `run_standalone/1`'s "exactly one server" check then
+    %% catches the case where the user-requested server got filtered
+    %% out, instead of starting a listener that 404s every request.
+    Opts1 = preflight_protocol(Opts0),
+    Opts = preflight_scenario(Opts1),
+    case maps:get(standalone, Opts, false) of
         true ->
-            run_standalone(Opts0);
+            run_standalone(Opts);
         false ->
-            Opts1 = preflight_protocol(Opts0),
-            Opts = preflight_scenario(Opts1),
             print_header(Opts),
             %% Each side runs in isolation: bring the server up, drive load,
             %% bring it down, then do the next. Order matches the user's
@@ -140,6 +146,9 @@ preflight_scenario(#{scenario := chunked_request_body, servers := Servers} = Opt
     %% in the same shape; skip for apples-to-apples.
     filter_servers(chunked_request_body, [elli], Servers, Opts,
         ~"elli test fixture's body-read does not handle Transfer-Encoding: chunked here");
+preflight_scenario(#{scenario := cookies_heavy, servers := Servers} = Opts) ->
+    filter_servers(cookies_heavy, [elli], Servers, Opts,
+        ~"no /cookies handler in elli test fixture");
 preflight_scenario(Opts) ->
     Opts.
 

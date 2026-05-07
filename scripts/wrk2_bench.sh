@@ -39,8 +39,10 @@
 #   ./scripts/wrk2_bench.sh                     # full matrix
 #   ./scripts/wrk2_bench.sh --quick             # --runs 1, dev iteration
 #   ./scripts/wrk2_bench.sh --scenario hello    # one scenario only
+#   ./scripts/wrk2_bench.sh --scenario hello,echo
 #   ./scripts/wrk2_bench.sh --server roadrunner # one server only
 #   ./scripts/wrk2_bench.sh --runs 5 --duration 90
+#   ./scripts/wrk2_bench.sh --threads 16 --conns 100
 #   ./scripts/wrk2_bench.sh --out /tmp/wrk2.md
 
 set -euo pipefail
@@ -66,6 +68,8 @@ while [ $# -gt 0 ]; do
         --servers)    SERVER_FILTER="$2"; shift 2 ;;
         --runs)       RUNS="$2"; shift 2 ;;
         --duration)   DURATION_S="$2"; shift 2 ;;
+        --threads)    THREADS="$2"; shift 2 ;;
+        --conns)      CONNS="$2"; shift 2 ;;
         --out)        OUT="$2"; shift 2 ;;
         --quick)      RUNS=1; shift ;;
         -h|--help)
@@ -281,7 +285,9 @@ parse_wrk2_log() {
 
     pick() {
         # args: block percentile_label (e.g. "50.000%")
-        echo "$1" | awk -v p="$2" '$1==p{print $2}'
+        # printf instead of echo so a `$1` that ever begins with `-e`
+        # or `-n` (which echo misinterprets) is passed through verbatim.
+        printf '%s\n' "$1" | awk -v p="$2" '$1==p{print $2}'
     }
 
     local c_block u_block
