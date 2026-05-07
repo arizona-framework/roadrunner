@@ -2336,6 +2336,70 @@ recv_n_responses(Sock, Buf, N, BodyLen, Timeout, BytesAcc) ->
             end
     end.
 
+%% Method + path lookups for each scenario. Used by `--standalone` mode
+%% (which writes them to the port file so an out-of-process load driver
+%% — e.g. wrk2 — can target the right URL) and by anything else that
+%% needs the URL without constructing the full request bytes.
+%%
+%% INVARIANT: keep these in sync with the `build_request/1` clause for
+%% the same scenario. Adding a new scenario means adding to all three
+%% (build_request, scenario_method, scenario_path).
+%%
+%% h2-only scenarios (streaming_response, multi_stream_h2,
+%% small_chunked_response, tls_handshake_throughput) are intentionally
+%% absent — `build_request/1` halts on those, and `--standalone` is
+%% h1-only.
+%%
+%% Connection-shape scenarios (pipelined_h1, slow_client,
+%% connection_storm, mixed_workload, accept_storm_burst,
+%% server_sent_events) don't have a single representative URL — the
+%% bench worker drives them with custom wire patterns. Open-loop
+%% drivers like wrk2 can't reproduce those shapes, so they're absent
+%% here too.
+scenario_method(hello) -> ~"GET";
+scenario_method(echo) -> ~"POST";
+scenario_method(large_response) -> ~"GET";
+scenario_method(json) -> ~"GET";
+scenario_method(large_post_streaming) -> ~"POST";
+scenario_method(gzip_response) -> ~"GET";
+scenario_method(backpressure_sustained) -> ~"GET";
+scenario_method(large_keepalive_session) -> ~"GET";
+scenario_method(url_with_qs) -> ~"GET";
+scenario_method(head_method) -> ~"HEAD";
+scenario_method(etag_304) -> ~"GET";
+scenario_method(cookies_heavy) -> ~"GET";
+scenario_method(multi_request_body) -> ~"POST";
+scenario_method(path_with_unicode) -> ~"GET";
+scenario_method(cors_preflight) -> ~"OPTIONS";
+scenario_method(chunked_request_body) -> ~"POST";
+scenario_method(redirect_response) -> ~"GET";
+scenario_method(compressed_request_body) -> ~"POST";
+scenario_method(post_4kb_form) -> ~"POST";
+scenario_method(headers_heavy) -> ~"GET".
+
+scenario_path(hello) -> ~"/";
+scenario_path(echo) -> ~"/echo";
+scenario_path(large_response) -> ~"/large";
+scenario_path(json) -> ~"/json";
+scenario_path(large_post_streaming) -> ~"/drain";
+scenario_path(gzip_response) -> ~"/gzip";
+scenario_path(backpressure_sustained) -> ~"/";
+scenario_path(large_keepalive_session) -> ~"/";
+scenario_path(url_with_qs) ->
+    ~"/qs?filter=active&sort=name&limit=100&offset=200&fields=id,name,email&include=role";
+scenario_path(head_method) -> ~"/large";
+scenario_path(etag_304) -> ~"/etag";
+scenario_path(cookies_heavy) -> ~"/cookies";
+scenario_path(multi_request_body) -> ~"/echo";
+scenario_path(path_with_unicode) ->
+    ~"/qs?name=%E4%B8%AD%E6%96%87&city=%D0%9C%D0%BE%D1%81%D0%BA%D0%B2%D0%B0&emoji=%F0%9F%8E%89&query=hello+world&filter=active";
+scenario_path(cors_preflight) -> ~"/api";
+scenario_path(chunked_request_body) -> ~"/echo";
+scenario_path(redirect_response) -> ~"/redirect";
+scenario_path(compressed_request_body) -> ~"/echo";
+scenario_path(post_4kb_form) -> ~"/form";
+scenario_path(headers_heavy) -> ~"/".
+
 %% Pre-built per-iteration request bytes so the worker hot loop doesn't
 %% allocate. Both scenarios assume the same handler returns
 %% `Content-Length: <BodyLen>` so the recv side can stop deterministically.
