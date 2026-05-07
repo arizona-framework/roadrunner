@@ -60,15 +60,20 @@ main(Args) ->
     Opts0 = parse_args(Args),
     ProjectDir = project_dir(),
     ok = setup_code_paths(ProjectDir),
-    Opts1 = preflight_protocol(Opts0),
-    Opts = preflight_scenario(Opts1),
-    print_header(Opts),
-    %% Each side runs in isolation: bring the server up, drive load,
-    %% bring it down, then do the next. Order matches the user's
-    %% --servers list (default: all known servers).
-    Servers = maps:get(servers, Opts),
-    Results = [{S, element(2, run_side(S, Opts))} || S <- Servers],
-    print_summary(Results).
+    case maps:get(standalone, Opts0, false) of
+        true ->
+            run_standalone(Opts0);
+        false ->
+            Opts1 = preflight_protocol(Opts0),
+            Opts = preflight_scenario(Opts1),
+            print_header(Opts),
+            %% Each side runs in isolation: bring the server up, drive load,
+            %% bring it down, then do the next. Order matches the user's
+            %% --servers list (default: all known servers).
+            Servers = maps:get(servers, Opts),
+            Results = [{S, element(2, run_side(S, Opts))} || S <- Servers],
+            print_summary(Results)
+    end.
 
 %% Validate environment for the chosen protocol and drop
 %% incompatible servers. The h2 path needs a TLS cert (auto-
@@ -643,6 +648,36 @@ cli() ->
                       h2: TLS + ALPN h2. elli is filtered automatically
                           (no h2 support); only roadrunner + cowboy run.
                     """
+            },
+            #{
+                name => standalone,
+                long => "-standalone",
+                type => boolean,
+                default => false,
+                help =>
+                    """
+                    Bring ONE server up with the scenario's listener
+                    config, write the bound port + URL + method to
+                    `--port-file`, and block until SIGTERM. Lets
+                    out-of-process load drivers (e.g. wrk2) target
+                    the listener without re-implementing the per-
+                    server launcher logic. Requires `--port-file`,
+                    `--servers <one>`, `--protocol h1` (h1-only).
+                    """
+            },
+            #{
+                name => port_file,
+                long => "-port-file",
+                type => string,
+                default => "",
+                help =>
+                    """
+                    Path the `--standalone` mode writes the listener
+                    metadata to. Three-line ini:
+                      PORT=<integer>
+                      PATH=<scenario path, may include query string>
+                      METHOD=<GET|POST|HEAD|OPTIONS>
+                    """
             }
         ]
     }.
@@ -692,6 +727,81 @@ parse_servers(Str) ->
             ),
             halt(2)
     end.
+
+%% ===========================================================================
+%% --standalone mode: bring ONE server up, write the bound port + URL +
+%% method to a port file, and block until SIGTERM. Out-of-process load
+%% drivers (wrk2) read the port file and target the listener directly.
+%% h1-only — wrk2's primary consumer doesn't speak h2; h2 needs TLS +
+%% cert generation which the bench's existing flow handles but is
+%% pointless without an h2 client.
+%% ===========================================================================
+
+run_standalone(Opts) ->
+    PortFile = maps:get(port_file, Opts, ""),
+    PortFile =/= "" orelse standalone_error(
+        "--standalone requires --port-file PATH", []
+    ),
+    Servers = maps:get(servers, Opts),
+    [Server] =
+        case Servers of
+            [_] -> Servers;
+            _ ->
+                standalone_error(
+                    "--standalone requires exactly one --servers entry "
+                    "(got: ~p)", [Servers]
+                )
+        end,
+    Protocol = maps:get(protocol, Opts),
+    Protocol =:= h1 orelse standalone_error(
+        "--standalone is h1-only (received --protocol ~s)", [Protocol]
+    ),
+    Scenario = maps:get(scenario, Opts),
+    ok = validate_standalone_scenario(Scenario),
+    {Peer, Port} = start_server(Server, Opts),
+    ok = write_port_file(PortFile, Port, Scenario),
+    ok = os:set_signal(sigterm, handle),
+    io:format(
+        "standalone listener: ~s scenario=~s port=~b "
+        "(SIGTERM to stop)~n",
+        [Server, Scenario, Port]
+    ),
+    receive
+        {signal, sigterm} ->
+            peer:stop(Peer),
+            halt(0)
+    end.
+
+validate_standalone_scenario(Scenario) ->
+    %% `scenario_path/1` covers exactly the scenarios that translate to
+    %% a single-URL, single-method open-loop request. h2-only and
+    %% connection-shape scenarios have no clause and raise
+    %% `function_clause` here, which we surface as a clean error.
+    try
+        _ = scenario_path(Scenario),
+        ok
+    catch
+        error:function_clause ->
+            standalone_error(
+                "scenario '~s' is not supported in --standalone mode "
+                "(no path mapping; h2-only or connection-shape)",
+                [Scenario]
+            )
+    end.
+
+write_port_file(Path, Port, Scenario) ->
+    Method = scenario_method(Scenario),
+    UrlPath = scenario_path(Scenario),
+    Content = iolist_to_binary([
+        "PORT=", integer_to_binary(Port), $\n,
+        "PATH=", UrlPath, $\n,
+        "METHOD=", Method, $\n
+    ]),
+    file:write_file(Path, Content).
+
+standalone_error(Fmt, Args) ->
+    io:format(standard_error, "error: " ++ Fmt ++ "~n", Args),
+    halt(2).
 
 %% ===========================================================================
 %% Per-side runner — spawn peer, bring server up, run loadgen, tear down.
