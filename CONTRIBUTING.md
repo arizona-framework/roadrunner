@@ -20,22 +20,40 @@ See `.tool-versions` for the required Erlang/OTP and rebar3 versions
 ```bash
 git clone https://github.com/arizona-framework/roadrunner.git
 cd roadrunner
-rebar3 compile
+make compile
 ```
+
+> **OTP 29 RC3 note.** rebar3 on OTP 29 RC3 fails the TLS handshake
+> to hex.pm on `/packages/<name>` paths (Fastly's edge rejects OTP
+> 29's TLS 1.3 client fingerprint). The repo ships a workaround
+> config (`config/rebar3_ssl.config`) that pins TLS 1.2; the
+> `Makefile` loads it via `ERL_FLAGS` automatically. If you're
+> invoking `rebar3` directly, prepend
+> `ERL_FLAGS="-config config/rebar3_ssl"`. The fix is in OTP 29
+> RC4 — once that lands, the Makefile's `ERL_FLAGS` and this note
+> can be dropped.
 
 ## Workflow
 
 One command covers day-to-day development:
 
-- **`rebar3 precommit`** -- run before every commit and before pushing.
-  Formats Erlang via `erlfmt`, compiles, runs xref + dialyzer, runs
-  the eunit + Common Test (incl. PropEr) suites with cover, and
-  fails if line coverage drops below 100 %. CI runs the same command.
+- **`make test`** (or `make precommit`, or `rebar3 precommit`) — run
+  before every commit and before pushing. Formats-check Erlang via
+  `erlfmt`, compiles, runs xref + hank + dialyzer, runs the eunit +
+  Common Test (incl. PropEr) suites with cover, fails if line
+  coverage drops below 100 %, and builds the docs. CI runs the same
+  command.
 
-For everything else (single-suite runs, coverage reports, individual
-check stages) invoke `rebar3 <task>` directly: `rebar3 eunit`,
-`rebar3 ct`, `rebar3 dialyzer`, `rebar3 cover`, `rebar3 fmt`, etc.
-See `rebar.config` for the full alias list.
+`make help` lists every target. Common ones:
+
+- `make compile` / `make doc` / `make fmt`
+- `make eunit` / `make ct` / `make dialyzer` / `make xref` / `make hank` (individual stages)
+- `make bench-quick` / `make wrk2-quick` / `make h2spec` / `make autobahn`
+- `make clean` / `make distclean`
+
+You can also invoke `rebar3 <task>` directly (the Makefile is just a
+thin wrapper that pre-sets the OTP 29 TLS workaround). See
+`rebar.config` for the full alias list.
 
 Diagnostic / conformance scripts under `scripts/` (`bench.escript`,
 `h2spec.sh`, `autobahn.escript`, `redbot.escript`, `wrk2_bench.sh`)
