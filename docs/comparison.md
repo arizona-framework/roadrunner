@@ -94,6 +94,37 @@ file. Spot-checks from the same run:
 | `cookies_heavy`        | 142 µs / 1.67 ms|         —        | 251 µs / 2.52 ms |
 | `pipelined_h1`         |  83 µs / 0.57 ms| 10.3 ms / 10.6 ms| 129 µs / 0.84 ms |
 
+## Open-loop tail latency (wrk2)
+
+The numbers above come from `bench.escript`, a closed-loop loadgen.
+Closed loop deflates tail latency under load
+([Coordinated Omission](https://www.scylladb.com/2021/04/22/on-coordinated-omission/));
+[`bench_internals.md`](bench_internals.md) explains how and when it
+matters.
+
+[wrk2](https://github.com/giltene/wrk2) is the open-loop counterpart.
+For the same `hello` scenario at the same rate, the corrected p99 is
+roughly 13× the uncorrected:
+
+|                          | corrected p99 | uncorrected p99 |
+|--------------------------|--------------:|----------------:|
+| roadrunner @ 127 k req/s |        2.0 ms |          165 µs |
+| roadrunner @ 191 k req/s |        2.2 ms |           89 µs |
+
+Full per-scenario tables and the rate-vs-tail curve are in
+[`wrk2_results.md`](wrk2_results.md).
+
+Run it locally:
+
+```
+./scripts/wrk2_bench.sh                       # full matrix
+./scripts/wrk2_bench.sh --quick                # --runs 1, dev iteration
+./scripts/wrk2_bench.sh --scenario hello,echo  # subset
+```
+
+Requires Docker and a compiled test profile. See
+[`CONTRIBUTING.md`](../CONTRIBUTING.md) for setup.
+
 ## Reading the numbers honestly
 
 - **vs cowboy: roadrunner wins on most scenarios** by 25–60 % on

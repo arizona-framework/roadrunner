@@ -38,8 +38,41 @@ check stages) invoke `rebar3 <task>` directly: `rebar3 eunit`,
 See `rebar.config` for the full alias list.
 
 Diagnostic / conformance scripts under `scripts/` (`bench.escript`,
-`h2spec.sh`, `autobahn.escript`, `redbot.escript`) are run directly;
-each script's header documents its requirements.
+`h2spec.sh`, `autobahn.escript`, `redbot.escript`, `wrk2_bench.sh`)
+are run directly; each script's header documents its requirements.
+
+### Benchmarking notes
+
+Two complementary load drivers ship in this repo:
+
+- **`scripts/bench.escript`** — closed-loop. Each worker sends a
+  request, waits for the response, sends the next. Reports
+  throughput + p50/p99 from per-request timing. Easy to set up,
+  no external dependency, but tail latency under load is
+  deflated by Coordinated Omission. Used for the per-scenario
+  matrix in [`docs/bench_results.md`](docs/bench_results.md).
+- **`scripts/wrk2_bench.sh`** — open-loop, via
+  [wrk2](https://github.com/giltene/wrk2) running in Docker
+  (`cylab/wrk2:latest`). Issues requests at a fixed rate
+  regardless of server response and reports
+  Coordinated-Omission-corrected HdrHistogram percentiles.
+  Output: [`docs/wrk2_results.md`](docs/wrk2_results.md). Needs
+  `docker` on PATH and `rebar3 as test compile` already done;
+  the script pulls the image automatically.
+
+Run a quick wrk2 sanity check:
+
+```bash
+./scripts/wrk2_bench.sh --quick --scenario hello
+```
+
+The full matrix takes ~2 hours at `--runs 1 --duration 30s` and
+~10 hours at the canonical `--runs 3 --duration 60s`. Run on a
+quiet machine — system noise inflates tail percentiles.
+
+Both drivers' internals (worker model, latency aggregation,
+loader-as-bottleneck conditions) are documented in
+[`docs/bench_internals.md`](docs/bench_internals.md).
 
 ## License
 
