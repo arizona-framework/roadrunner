@@ -100,25 +100,33 @@ The HttpArena Erlang submission (`frameworks/roadrunner/` in
 pipelined, limited-conn, json, json-comp, json-tls, upload,
 async-db, api-4, api-16, static, fortunes, crud, baseline-h2,
 echo-ws, echo-ws-pipeline. Validator passes 57/57 on those. The
-remaining 12 profiles need roadrunner-side features; listed in
-roughly the order a follow-up PR would tackle them.
+remaining 10 profiles need roadrunner-side features; listed in
+roughly the order a follow-up PR would tackle them. (`baseline-h2c`
+and `json-h2c` are reachable once the HttpArena SHA pin bumps and
+the bench app subscribes; the underlying h2c prior-knowledge
+support shipped in `roadrunner_listener`'s `h2c => enabled` opt.)
 
-### h2c (HTTP/2 cleartext) — small/medium (roadrunner-side)
+### h2c Upgrade-mode on a shared port — medium (roadrunner-side)
 
-**What:** Accept HTTP/2 on a plaintext listener, either via
-prior-knowledge (client opens with the h2 connection preface
-directly on a dedicated port) or RFC 7540 §3.2 `Upgrade: h2c`.
+**What:** RFC 7540 §3.2 `Upgrade: h2c` negotiation: an HTTP/1.1
+request with `Upgrade: h2c, HTTP2-Settings: <base64>` headers,
+answered with `101 Switching Protocols`, after which the
+connection upstreams h2 frames. The same listener accepts h1 and
+h2c on the same port.
 
-**Why deferred:** The current h2 path is gated by TLS ALPN
-negotiation in `roadrunner_listener`. h2c needs either a listener
-opt that forces every accepted connection through the h2 state
-machine without TLS, or first-byte sniffing for the HTTP/2 preface
-(`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) on a shared port.
+**Why deferred:** The prior-knowledge variant (`h2c => enabled` on
+a dedicated plaintext listener) ships and covers the common case
+(benchmarks, internal clients with prior knowledge). Upgrade-mode
+adds preface sniffing or h1-parse-then-switch logic to the conn
+loop — a real expansion of the connection state machine that
+isn't on the critical path.
 
-**HttpArena impact:** `baseline-h2c` and `json-h2c`.
+**HttpArena impact:** none (its `baseline-h2c` / `json-h2c` profiles
+use prior-knowledge).
 
-**Scope:** small for prior-knowledge on a dedicated listener,
-medium with preface sniffing.
+**Scope:** medium. Decide on shared-port sniff vs h1-parse-Upgrade;
+implement the chosen path; tests for both successful upgrade and
+`Upgrade: h2c` rejection on TLS sockets (the spec forbids it).
 
 ### HTTP/3 — see above
 

@@ -76,8 +76,15 @@ connection crash doesn't take the pool down.
     %% `~"h2"`, clients that ALPN-negotiate `h2` are dispatched to
     %% `roadrunner_conn_loop_http2`; everything else (including no-ALPN
     %% and `~"http/1.1"`) goes to the HTTP/1.1 path. Default ALPN is
-    %% `[~"http/1.1"]` only. Plain TCP listeners are h1-only.
+    %% `[~"http/1.1"]` only. For HTTP/2 on plain TCP set `h2c => enabled`.
     tls => [ssl:tls_server_option()],
+    %% Force every accepted connection on a plaintext listener through
+    %% the HTTP/2 state machine via the RFC 7540 §3.4 prior-knowledge
+    %% variant. Client opens TCP and sends the h2 connection preface
+    %% (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) directly, no Upgrade
+    %% negotiation. Plain TCP only: combining `h2c => enabled` with
+    %% `tls` is rejected at `init/1`. Default `disabled`.
+    h2c => enabled | disabled,
     %% h2 connection-level recv window peak (bytes). The RFC default is
     %% 65535 — the only window reachable without explicit
     %% `WINDOW_UPDATE` per RFC 9113 §6.5.2 (SETTINGS doesn't carry the
@@ -367,6 +374,7 @@ build_proto_opts(Opts, ListenerName) ->
     ok = validate_h2_window_opt(h2_initial_conn_window, Opts, 16#7FFFFFFF),
     ok = validate_h2_window_opt(h2_initial_stream_window, Opts, 16#7FFFFFFF),
     ok = validate_h2_window_opt(h2_window_refill_threshold, Opts, 16#7FFFFFFF),
+    ok = validate_h2c_opt(Opts),
     %% Per-listener atomics: live-connection counter (acceptors bump on
     %% accept; conns decrement on exit) and a cumulative requests-served
     %% counter (conn bumps on each handler dispatch). Lock-free, ~1ns
@@ -389,6 +397,7 @@ build_proto_opts(Opts, ListenerName) ->
         body_buffering => maps:get(body_buffering, Opts, auto),
         listener_name => ListenerName,
         drain_group => maps:get(drain_group, Opts, enabled),
+        h2c => maps:get(h2c, Opts, disabled),
         h2_initial_conn_window => maps:get(h2_initial_conn_window, Opts, 65535),
         h2_initial_stream_window => maps:get(h2_initial_stream_window, Opts, 65535),
         h2_window_refill_threshold => maps:get(h2_window_refill_threshold, Opts, 32768)
@@ -431,6 +440,28 @@ validate_h2_window_opt(Key, Opts, Max) ->
             ok;
         {ok, V} ->
             error({invalid_listener_opt, Key, V})
+    end.
+
+%% `h2c => enabled` is a plaintext-only mode: TLS listeners use ALPN
+%% to negotiate h2 instead. Reject the combo at `init/1` so the
+%% misconfiguration surfaces immediately rather than as a silent
+%% no-op (the dispatch wouldn't honour h2c on a TLS socket anyway).
+%%
+%% Two error shapes:
+%%
+%% - `{invalid_listener_opt, h2c, V}` for a bad value (anything other
+%%   than `enabled` / `disabled`). Matches `validate_h2_window_opt/3`.
+%% - `{listener_opt_conflict, h2c, tls}` when both opts are present
+%%   together. The value `enabled` is valid in isolation; the
+%%   misconfiguration is the combination, so a distinct class makes
+%%   the error message say what's actually wrong.
+-spec validate_h2c_opt(opts()) -> ok.
+validate_h2c_opt(Opts) ->
+    case {maps:get(h2c, Opts, disabled), maps:is_key(tls, Opts)} of
+        {disabled, _} -> ok;
+        {enabled, false} -> ok;
+        {enabled, true} -> error({listener_opt_conflict, h2c, tls});
+        {Other, _} -> error({invalid_listener_opt, h2c, Other})
     end.
 
 build_dispatch(#{routes := _}, ListenerName) ->

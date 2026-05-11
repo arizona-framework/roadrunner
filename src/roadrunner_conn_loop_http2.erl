@@ -2,6 +2,12 @@
 -moduledoc """
 HTTP/2 (RFC 9113) connection process.
 
+Driven by either TLS ALPN-negotiated `h2` or a plaintext listener
+configured with `h2c => enabled` (RFC 7540 §3.4 prior-knowledge).
+The dispatch decision lives in `roadrunner_conn_loop:awaiting_shoot/3`;
+this module is transport-agnostic and reads frames via
+`roadrunner_transport:recv/3` either way.
+
 Phase H8b — true multiplexing with per-stream workers. The conn
 process owns:
 

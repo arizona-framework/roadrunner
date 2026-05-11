@@ -97,6 +97,12 @@ read it anyway.
     %% SSE / WebSocket handlers depend on it. Short-lived h1
     %% workloads can opt out for ~10% lower per-conn overhead.
     drain_group => enabled | disabled,
+    %% RFC 7540 §3.4 prior-knowledge HTTP/2 cleartext. When `enabled`,
+    %% `roadrunner_conn_loop:awaiting_shoot/3` routes the connection
+    %% straight to the h2 conn loop without consulting TLS ALPN.
+    %% Plain TCP only: `roadrunner_listener` rejects the combo with
+    %% `tls` at `init/1`. Default `disabled`.
+    h2c => enabled | disabled,
     %% h2 receive-window tuning. See `roadrunner_listener:opts()` for
     %% prose. Defaults match the RFC 9113 baseline.
     h2_initial_conn_window => 1..16#7FFFFFFF,

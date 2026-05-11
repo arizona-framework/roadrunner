@@ -142,11 +142,13 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
             StartMono = roadrunner_telemetry:listener_accept(#{
                 listener_name => ListenerName, peer => Peer
             }),
-            case http2_negotiated(Socket) of
+            case http2_negotiated(Socket) orelse h2c_enabled(ProtoOpts) of
                 true ->
-                    %% ALPN landed on `h2` and the listener allows it —
-                    %% the HTTP/2 path takes over. Slot release and
-                    %% `listener_conn_close` happen inside the h2 module.
+                    %% Either ALPN landed on `h2` (TLS listener) or the
+                    %% listener is in prior-knowledge h2c mode (plain TCP
+                    %% with `h2c => enabled`). The HTTP/2 path takes over;
+                    %% slot release and `listener_conn_close` happen
+                    %% inside the h2 module.
                     roadrunner_conn_loop_http2:enter(
                         Socket, ProtoOpts, ListenerName, Peer, StartMono
                     );
@@ -190,6 +192,15 @@ http2_negotiated(Socket) ->
         {ok, ~"h2"} -> true;
         _ -> false
     end.
+
+%% True iff this listener is configured for HTTP/2 cleartext
+%% (RFC 7540 §3.4 prior-knowledge). Plain TCP only: listener init
+%% rejects `h2c => enabled` combined with `tls`, so by the time this
+%% function runs the socket is `{gen_tcp, _}` (or `{fake, _}` in
+%% tests).
+-spec h2c_enabled(roadrunner_conn:proto_opts()) -> boolean().
+h2c_enabled(#{h2c := enabled}) -> true;
+h2c_enabled(_) -> false.
 
 %% --- read_request phase ---
 %%

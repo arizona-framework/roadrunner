@@ -25,6 +25,8 @@ all_test_() ->
         fun all_frame_types_handled/0,
         fun goaway_received_closes_connection/0,
         fun concurrent_streams_both_dispatch/0,
+        fun h2c_dispatch_routes_plaintext_to_http2_loop/0,
+        fun plaintext_listener_without_h2c_stays_h1/0,
         fun post_with_body_via_data_frame/0,
         fun continuation_assembles_header_block/0,
         fun push_promise_from_client_triggers_goaway/0,
@@ -351,6 +353,104 @@ concurrent_streams_both_dispatch() ->
     StreamIds = lists:usort([SId || {headers, SId, _} <- Frames]),
     ?assert(lists:member(1, StreamIds)),
     ?assert(lists:member(3, StreamIds)),
+    cleanup(Pid, Ref).
+
+h2c_dispatch_routes_plaintext_to_http2_loop() ->
+    %% Drive the dispatch decision through `roadrunner_conn_loop:start/2`
+    %% with a `{fake, _}` socket and `h2c => enabled`. Without the h2c
+    %% opt the plain TCP path stays h1 and the conn waits for a request
+    %% line; the h2 path proactively emits SETTINGS right after `shoot`.
+    %% Receiving an h2 SETTINGS frame here proves the new dispatch
+    %% (`http2_negotiated/1 orelse h2c_enabled/1`) routed to the h2 loop.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    Self = self(),
+    Counter = atomics:new(1, [{signed, false}]),
+    ok = atomics:add(Counter, 1, 1),
+    RequestsCounter = atomics:new(1, [{signed, false}]),
+    ProtoOpts = #{
+        client_counter => Counter,
+        requests_counter => RequestsCounter,
+        listener_name => h2c_dispatch_test,
+        dispatch => {handler, roadrunner_hello_handler},
+        middlewares => [],
+        max_content_length => 1_048_576,
+        request_timeout => 30000,
+        keep_alive_timeout => 60000,
+        max_keep_alive_request => 1000,
+        max_clients => 100,
+        minimum_bytes_per_second => 0,
+        body_buffering => auto,
+        drain_group => disabled,
+        h2c => enabled,
+        h2_initial_conn_window => 65535,
+        h2_initial_stream_window => 65535,
+        h2_window_refill_threshold => 32768
+    },
+    Sock = {fake, Self},
+    {ok, Pid} = roadrunner_conn_loop:start(Sock, ProtoOpts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    %% h2 SETTINGS frame: 24-bit length, type=4, 8-bit flags, 31-bit
+    %% reserved+stream-id (zero for conn-level). Length is non-negative
+    %% (server SETTINGS is at least zero bytes). The exact value
+    %% depends on which SETTINGS entries roadrunner advertises; we
+    %% match the frame shape rather than pin the bytes.
+    Out = expect_send(),
+    ?assertMatch(<<_Len:24, 4, _Flags, _Reserved:1, _StreamId:31, _/binary>>, Out),
+    cleanup(Pid, Ref).
+
+plaintext_listener_without_h2c_stays_h1() ->
+    %% Regression guard for the dispatch's false branch. Without
+    %% `h2c => enabled` and without TLS ALPN, `awaiting_shoot/3`
+    %% must fall through to the HTTP/1.1 path. Discriminator:
+    %%
+    %% - The h2 path proactively sends a SETTINGS frame on the wire
+    %%   right after `shoot` (`{roadrunner_fake_send, _, _}`).
+    %% - The h1 path enters passive recv and asks the fake transport
+    %%   for bytes (`{roadrunner_fake_recv, _, _, _}`).
+    %%
+    %% Receiving the recv message (and no send) proves we routed to h1.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    Self = self(),
+    Counter = atomics:new(1, [{signed, false}]),
+    ok = atomics:add(Counter, 1, 1),
+    RequestsCounter = atomics:new(1, [{signed, false}]),
+    ProtoOpts = #{
+        client_counter => Counter,
+        requests_counter => RequestsCounter,
+        listener_name => h1_dispatch_test,
+        dispatch => {handler, roadrunner_hello_handler},
+        middlewares => [],
+        max_content_length => 1_048_576,
+        request_timeout => 30000,
+        keep_alive_timeout => 60000,
+        max_keep_alive_request => 1000,
+        max_clients => 100,
+        minimum_bytes_per_second => 0,
+        body_buffering => auto,
+        drain_group => disabled,
+        h2c => disabled,
+        h2_initial_conn_window => 65535,
+        h2_initial_stream_window => 65535,
+        h2_window_refill_threshold => 32768
+    },
+    Sock = {fake, Self},
+    {ok, Pid} = roadrunner_conn_loop:start(Sock, ProtoOpts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    %% h1 issues a passive recv on the socket; on a fake socket that
+    %% surfaces as a `{roadrunner_fake_recv, ConnPid, Len, Timeout}`
+    %% message to our process. h2 would never do this — it goes
+    %% active-once via setopts and proactively writes SETTINGS first.
+    receive
+        {roadrunner_fake_recv, _, _, _} -> ok;
+        {roadrunner_fake_send, _, _} -> error(unexpected_h2_send)
+    after 500 ->
+        error(no_recv_call)
+    end,
+    ?assert(is_process_alive(Pid)),
     cleanup(Pid, Ref).
 
 post_with_body_via_data_frame() ->
