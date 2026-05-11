@@ -243,3 +243,42 @@ SLA sizing and exposing tail-hiding effects.
 substitutes. The peak in `bench_results.md` feeds the rate sweep in
 `wrk2_results.md`; the tail in `wrk2_results.md` tells you how
 close to that peak you can actually run in production.
+
+## HttpArena-shape workloads
+
+For profile-driven optimization against the
+[HttpArena](https://github.com/MDA2AV/HttpArena) leaderboard, the
+bench includes scenarios that mirror HttpArena profiles directly,
+so improvements can be measured reproducibly inside this repo
+rather than only via the external harness:
+
+- `httparena_baseline`: `GET /baseline11?a=I&b=I` returns plaintext
+  `A + B`. Mirrors HttpArena's `baseline` profile.
+- `httparena_json`: `GET /httparena_json/50?m=1` returns a 50-item
+  JSON list with `total = price * quantity * m`. The dataset is
+  cached in `persistent_term` at module load. Mirrors HttpArena's
+  `json` profile.
+- `httparena_upload_20mb_auto` and `httparena_upload_20mb_manual`:
+  `POST /upload` with a 20 MB body, under `body_buffering => auto`
+  vs `body_buffering => manual` respectively. The handler returns
+  the plaintext byte count. Mirrors HttpArena's `upload` profile;
+  the pair is the in-tree reproduction of HttpArena's auto-mode
+  memory peak on the 20 MB validator.
+
+All four are roadrunner-only fixtures (no cowboy / elli parity
+handler); the bench filters the other servers out at preflight.
+
+Run with `--with-resources` to capture peak RSS / BEAM memory
+alongside throughput:
+
+```bash
+./scripts/bench.escript --scenario httparena_upload_20mb_auto \
+    --with-resources --clients 8 --duration 5
+./scripts/bench.escript --scenario httparena_upload_20mb_manual \
+    --with-resources --clients 8 --duration 5
+```
+
+For hot-path analysis, add `--profile --profile-tool eprof` (or
+`fprof`); the workflow established in
+[`conn_lifecycle_investigation.md`](conn_lifecycle_investigation.md)
+applies directly.

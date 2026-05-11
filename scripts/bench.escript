@@ -50,6 +50,7 @@
 -define(ECHO_BODY_SIZE, 256).
 -define(LARGE_BODY_SIZE, 65536).
 -define(LARGE_POST_BODY_SIZE, 1048576).
+-define(HTTPARENA_UPLOAD_BODY_SIZE, 20 * 1024 * 1024).
 
 %% Servers known to the bench, in default-run order. Adding a new
 %% server is two steps: append it here and add a clause for it in
@@ -149,6 +150,18 @@ preflight_scenario(#{scenario := chunked_request_body, servers := Servers} = Opt
 preflight_scenario(#{scenario := cookies_heavy, servers := Servers} = Opts) ->
     filter_servers(cookies_heavy, [elli], Servers, Opts,
         ~"no /cookies handler in elli test fixture");
+preflight_scenario(#{scenario := httparena_baseline, servers := Servers} = Opts) ->
+    filter_servers(httparena_baseline, [cowboy, elli], Servers, Opts,
+        ~"roadrunner-only fixture; mirrors HttpArena's `baseline` profile");
+preflight_scenario(#{scenario := httparena_json, servers := Servers} = Opts) ->
+    filter_servers(httparena_json, [cowboy, elli], Servers, Opts,
+        ~"roadrunner-only fixture; mirrors HttpArena's `json` profile");
+preflight_scenario(#{scenario := httparena_upload_20mb_auto, servers := Servers} = Opts) ->
+    filter_servers(httparena_upload_20mb_auto, [cowboy, elli], Servers, Opts,
+        ~"roadrunner-only fixture; mirrors HttpArena's `upload` profile (auto-buffering)");
+preflight_scenario(#{scenario := httparena_upload_20mb_manual, servers := Servers} = Opts) ->
+    filter_servers(httparena_upload_20mb_manual, [cowboy, elli], Servers, Opts,
+        ~"roadrunner-only fixture; mirrors HttpArena's `upload` profile (manual streaming)");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -255,7 +268,11 @@ cli() ->
                         cors_preflight,
                         chunked_request_body,
                         redirect_response,
-                        compressed_request_body
+                        compressed_request_body,
+                        httparena_baseline,
+                        httparena_json,
+                        httparena_upload_20mb_auto,
+                        httparena_upload_20mb_manual
                     ]},
                 default => ?DEFAULT_SCENARIO,
                 help =>
@@ -544,6 +561,49 @@ cli() ->
                                     the framework). Distinct on
                                     the wire from echo via the
                                     Content-Encoding header.
+                    httparena_baseline:
+                                    h1-only, roadrunner-only.
+                                    GET /baseline11?a=123&b=456
+                                    returns plaintext A+B. Mirrors
+                                    HttpArena's `baseline` profile:
+                                    query-string parse + integer
+                                    arithmetic + small plaintext
+                                    response. cowboy / elli
+                                    filtered out (no parity
+                                    fixture).
+                    httparena_json: h1-only, roadrunner-only.
+                                    GET /httparena_json/50?m=1
+                                    returns a JSON list of 50
+                                    items projected with
+                                    total=price*qty*m. Mirrors
+                                    HttpArena's `json` profile:
+                                    path-binding + qs parse +
+                                    dataset projection + JSON
+                                    encode. Dataset cached in
+                                    persistent_term.
+                    httparena_upload_20mb_auto:
+                                    h1-only, roadrunner-only.
+                                    POST /upload with a 20 MB body
+                                    under default
+                                    `body_buffering => auto`.
+                                    Handler reads from
+                                    #{body := Body} and returns
+                                    plaintext byte count. Mirrors
+                                    HttpArena's `upload` profile
+                                    on the buffered path; pair
+                                    with `_manual` to expose the
+                                    body_buffering memory delta.
+                    httparena_upload_20mb_manual:
+                                    h1-only, roadrunner-only.
+                                    POST /upload with a 20 MB body
+                                    under `body_buffering =>
+                                    manual`. Handler drains via
+                                    `roadrunner_req:read_body/2`
+                                    in 64 KB chunks. Expected
+                                    peak memory bounded by the
+                                    chunk size; auto-mode peer
+                                    pays the full-body buffering
+                                    cost.
                     """
             },
             #{
@@ -1251,7 +1311,36 @@ scenario_roadrunner_opts(router_404_storm, BaseOpts) ->
         {~"/large", roadrunner_bench_large_handler, undefined}
     ]};
 scenario_roadrunner_opts(varied_paths_router, BaseOpts) ->
-    BaseOpts#{routes => varied_paths_roadrunner_routes()}.
+    BaseOpts#{routes => varied_paths_roadrunner_routes()};
+scenario_roadrunner_opts(httparena_baseline, BaseOpts) ->
+    BaseOpts#{routes => [
+        {~"/baseline11", roadrunner_bench_httparena_baseline_handler, undefined}
+    ]};
+scenario_roadrunner_opts(httparena_json, BaseOpts) ->
+    BaseOpts#{routes => [
+        {~"/httparena_json/:count", roadrunner_bench_httparena_json_handler, undefined}
+    ]};
+scenario_roadrunner_opts(httparena_upload_20mb_auto, BaseOpts) ->
+    %% Default `body_buffering => auto`: the conn pre-buffers the
+    %% 20 MB body into the request map before dispatch. Pair with
+    %% `_manual` to surface the body_buffering memory delta.
+    BaseOpts#{
+        max_content_length => ?HTTPARENA_UPLOAD_BODY_SIZE + 1024,
+        routes => [
+            {~"/upload", roadrunner_bench_httparena_upload_handler, undefined}
+        ]
+    };
+scenario_roadrunner_opts(httparena_upload_20mb_manual, BaseOpts) ->
+    %% Manual buffering: the handler drains the body in 64 KB chunks
+    %% via `roadrunner_req:read_body/2`. Peak memory bounded by chunk
+    %% size, not full body size.
+    BaseOpts#{
+        body_buffering => manual,
+        max_content_length => ?HTTPARENA_UPLOAD_BODY_SIZE + 1024,
+        routes => [
+            {~"/upload", roadrunner_bench_httparena_upload_handler, undefined}
+        ]
+    }.
 
 scenario_cowboy_routes(hello) ->
     [{'_', [{"/", roadrunner_bench_cowboy_handler, []}]}];
@@ -2494,7 +2583,11 @@ scenario_method(chunked_request_body) -> ~"POST";
 scenario_method(redirect_response) -> ~"GET";
 scenario_method(compressed_request_body) -> ~"POST";
 scenario_method(post_4kb_form) -> ~"POST";
-scenario_method(headers_heavy) -> ~"GET".
+scenario_method(headers_heavy) -> ~"GET";
+scenario_method(httparena_baseline) -> ~"GET";
+scenario_method(httparena_json) -> ~"GET";
+scenario_method(httparena_upload_20mb_auto) -> ~"POST";
+scenario_method(httparena_upload_20mb_manual) -> ~"POST".
 
 scenario_path(hello) -> ~"/";
 scenario_path(echo) -> ~"/echo";
@@ -2517,7 +2610,11 @@ scenario_path(chunked_request_body) -> ~"/echo";
 scenario_path(redirect_response) -> ~"/redirect";
 scenario_path(compressed_request_body) -> ~"/echo";
 scenario_path(post_4kb_form) -> ~"/form";
-scenario_path(headers_heavy) -> ~"/".
+scenario_path(headers_heavy) -> ~"/";
+scenario_path(httparena_baseline) -> ~"/baseline11?a=123&b=456";
+scenario_path(httparena_json) -> ~"/httparena_json/50?m=1";
+scenario_path(httparena_upload_20mb_auto) -> ~"/upload";
+scenario_path(httparena_upload_20mb_manual) -> ~"/upload".
 
 %% Pre-built per-iteration request bytes so the worker hot loop doesn't
 %% allocate. Both scenarios assume the same handler returns
@@ -2685,7 +2782,26 @@ build_request(headers_heavy) ->
         "x-bench-15: fffffffffffffff\r\n"
         "x-bench-16: gggggggggggggggg\r\n"
         "\r\n"
-    >>.
+    >>;
+build_request(httparena_baseline) ->
+    ~"GET /baseline11?a=123&b=456 HTTP/1.1\r\nHost: x\r\n\r\n";
+build_request(httparena_json) ->
+    ~"GET /httparena_json/50?m=1 HTTP/1.1\r\nHost: x\r\nAccept: application/json\r\n\r\n";
+build_request(httparena_upload_20mb_auto) ->
+    httparena_upload_request();
+build_request(httparena_upload_20mb_manual) ->
+    httparena_upload_request().
+
+httparena_upload_request() ->
+    Body = binary:copy(~"x", ?HTTPARENA_UPLOAD_BODY_SIZE),
+    BodyLenBin = integer_to_binary(?HTTPARENA_UPLOAD_BODY_SIZE),
+    <<"POST /upload HTTP/1.1\r\n",
+        "Host: x\r\n",
+        "Content-Type: application/octet-stream\r\n",
+        "Content-Length: ",
+        BodyLenBin/binary,
+        "\r\n\r\n",
+        Body/binary>>.
 
 %% Body byte count the recv loop should wait for before claiming the
 %% response is complete.
@@ -2728,7 +2844,19 @@ expected_body_len(compressed_request_body) ->
     %% Server echoes the gzipped bytes back unchanged. zlib:gzip
     %% of `abc`*350 produces 32 B; pin recv to a lower bound (20)
     %% so it stops as soon as the body shows up.
-    20.
+    20;
+expected_body_len(httparena_baseline) ->
+    %% Response is `integer_to_binary(123 + 456)` = "579" (3 bytes).
+    byte_size(integer_to_binary(123 + 456));
+expected_body_len(httparena_json) ->
+    %% Variable JSON body for count=50, m=1; the handler module
+    %% precomputes it at -on_load via `bench_body/0`.
+    byte_size(roadrunner_bench_httparena_json_handler:bench_body());
+expected_body_len(httparena_upload_20mb_auto) ->
+    %% Response is `integer_to_binary(20*1024*1024)` = "20971520" (8 B).
+    byte_size(integer_to_binary(?HTTPARENA_UPLOAD_BODY_SIZE));
+expected_body_len(httparena_upload_20mb_manual) ->
+    byte_size(integer_to_binary(?HTTPARENA_UPLOAD_BODY_SIZE)).
 
 %% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
 %% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
@@ -3170,7 +3298,34 @@ h2_request_shape(headers_heavy) ->
         {<<"x-bench-", (integer_to_binary(N))/binary>>, binary:copy(~"a", N)}
      || N <- lists:seq(1, 16)
     ],
-    {~"GET", ~"/", Hdrs, <<>>}.
+    {~"GET", ~"/", Hdrs, <<>>};
+h2_request_shape(httparena_baseline) ->
+    %% h2 variant is meaningful but out of scope for the first round;
+    %% this scenario mirrors HttpArena's h1 baseline profile.
+    io:format(standard_error,
+        "error: --scenario httparena_baseline is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
+h2_request_shape(httparena_json) ->
+    %% h2 variant is meaningful but out of scope for the first round;
+    %% this scenario mirrors HttpArena's h1 json profile.
+    io:format(standard_error,
+        "error: --scenario httparena_json is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
+h2_request_shape(httparena_upload_20mb_auto) ->
+    %% h2 has its own body-delivery model (DATA frames with per-stream
+    %% flow control); a 20 MB POST over h2 is a separate scenario worth
+    %% adding later. h1-only here.
+    io:format(standard_error,
+        "error: --scenario httparena_upload_20mb_auto is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2);
+h2_request_shape(httparena_upload_20mb_manual) ->
+    io:format(standard_error,
+        "error: --scenario httparena_upload_20mb_manual is h1-only "
+        "(use --protocol h1)~n", []),
+    halt(2).
 
 h2_worker_loop(Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->
     case roadrunner_bench_client:open(Host, Port, h2) of
@@ -3384,7 +3539,15 @@ scenario_request_summary(chunked_request_body) ->
 scenario_request_summary(redirect_response) ->
     "GET /redirect HTTP/1.1, server returns 302 + Location (router)";
 scenario_request_summary(compressed_request_body) ->
-    "POST /echo HTTP/1.1 + Content-Encoding: gzip, ~50 B compressed body (router)".
+    "POST /echo HTTP/1.1 + Content-Encoding: gzip, ~50 B compressed body (router)";
+scenario_request_summary(httparena_baseline) ->
+    "GET /baseline11?a=123&b=456 HTTP/1.1, plaintext A+B response (router, roadrunner-only)";
+scenario_request_summary(httparena_json) ->
+    "GET /httparena_json/50?m=1 HTTP/1.1, 50-item projected JSON response (router, roadrunner-only)";
+scenario_request_summary(httparena_upload_20mb_auto) ->
+    "POST /upload HTTP/1.1, 20 MB body, body_buffering=auto (router, roadrunner-only)";
+scenario_request_summary(httparena_upload_20mb_manual) ->
+    "POST /upload HTTP/1.1, 20 MB body, body_buffering=manual 64 KB chunks (router, roadrunner-only)".
 
 result_to_row(Side, #{
     total := Total,

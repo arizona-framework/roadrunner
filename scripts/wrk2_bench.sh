@@ -90,6 +90,8 @@ SCENARIOS_ALL=(
     compressed_request_body multi_request_body large_post_streaming
     cookies_heavy etag_304 large_keepalive_session
     gzip_response backpressure_sustained
+    httparena_baseline httparena_json
+    httparena_upload_20mb_auto httparena_upload_20mb_manual
 )
 
 # Scenarios elli doesn't support (mirrors `preflight_scenario/1` in
@@ -100,6 +102,16 @@ ELLI_UNSUPPORTED=(
     head_method post_4kb_form chunked_request_body
     large_post_streaming cookies_heavy etag_304
     gzip_response backpressure_sustained
+    httparena_baseline httparena_json
+    httparena_upload_20mb_auto httparena_upload_20mb_manual
+)
+
+# Scenarios cowboy doesn't run here either (roadrunner-only fixtures).
+# The matrix only emits roadrunner rows; cowboy is skipped via missing
+# PEAK entries below, but listing here makes the intent explicit.
+COWBOY_UNSUPPORTED=(
+    httparena_baseline httparena_json
+    httparena_upload_20mb_auto httparena_upload_20mb_manual
 )
 
 # Lua scripts for non-GET scenarios. Run via Docker volume mount.
@@ -112,6 +124,8 @@ declare -A LUA_FILE=(
     [cors_preflight]=cors_preflight.lua
     [chunked_request_body]=chunked_request_body.lua
     [head_method]=head_method.lua
+    [httparena_upload_20mb_auto]=httparena_upload.lua
+    [httparena_upload_20mb_manual]=httparena_upload.lua
 )
 
 # Custom request headers for GET-with-headers scenarios. Multiple
@@ -121,6 +135,7 @@ declare -A EXTRA_HEADERS=(
     [gzip_response]="Accept-Encoding: gzip"
     [etag_304]='If-None-Match: "v1"'
     [headers_heavy]="x-bench-1: 1|x-bench-2: 22|x-bench-3: 333|x-bench-4: 4444|x-bench-5: 55555|x-bench-6: 666666|x-bench-7: 7777777|x-bench-8: 88888888|x-bench-9: 999999999|x-bench-10: aaaaaaaaaa|x-bench-11: bbbbbbbbbbb|x-bench-12: cccccccccccc|x-bench-13: ddddddddddddd|x-bench-14: eeeeeeeeeeeeee|x-bench-15: fffffffffffffff|x-bench-16: gggggggggggggggg"
+    [httparena_json]="Accept: application/json"
 )
 
 # Per-(server, scenario) PEAK ESTIMATE in req/s. Pulled from
@@ -148,6 +163,14 @@ declare -A PEAK=(
     [roadrunner.large_keepalive_session]=227000 [cowboy.large_keepalive_session]=175000 [elli.large_keepalive_session]=279000
     [roadrunner.gzip_response]=105000   [cowboy.gzip_response]=96000
     [roadrunner.backpressure_sustained]=249000 [cowboy.backpressure_sustained]=182000
+    # roadrunner-only HttpArena-shape scenarios. Placeholders captured
+    # on the first standalone smoke run; refresh from
+    # `docs/bench_results.md` once measured under the same harness as
+    # the other scenarios.
+    [roadrunner.httparena_baseline]=200000
+    [roadrunner.httparena_json]=80000
+    [roadrunner.httparena_upload_20mb_auto]=500
+    [roadrunner.httparena_upload_20mb_manual]=2000
 )
 
 # ---------------------------------------------------------------------------
