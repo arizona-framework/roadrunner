@@ -64,6 +64,26 @@ read_body_cl_needs_more_recv_test() ->
         roadrunner_conn:read_body(Req, ~"hello", Recv, 1000)
     ).
 
+read_body_cl_multi_chunk_recv_test() ->
+    %% Body arrives in three separate recv chunks, none individually
+    %% enough to satisfy Content-Length. Exercises the body-recursive
+    %% iolist accumulator in `read_body_until_io/2`.
+    Req = req_with_headers([{~"content-length", ~"15"}]),
+    Recv = chunked_recv([~"abc", ~"defgh", ~"ijklmnop"]),
+    ?assertEqual(
+        {ok, ~"abcdefghijklmno", ~"p"},
+        roadrunner_conn:read_body(Req, <<>>, Recv, 1000)
+    ).
+
+read_body_cl_recv_error_test() ->
+    %% First recv returns an error before any body bytes arrive.
+    Req = req_with_headers([{~"content-length", ~"5"}]),
+    Recv = fun() -> {error, closed} end,
+    ?assertEqual(
+        {error, closed},
+        roadrunner_conn:read_body(Req, <<>>, Recv, 1000)
+    ).
+
 read_body_cl_too_large_test() ->
     Req = req_with_headers([{~"content-length", ~"99999999"}]),
     NoRecv = fun() -> error(should_not_be_called) end,
@@ -318,6 +338,22 @@ req_with_headers(Headers) ->
         version => {1, 1},
         headers => Headers
     }.
+
+%% Recv closure that yields the given chunks one per call, then
+%% `{error, closed}` once exhausted. Backed by the process dictionary
+%% so the same fun can drive multiple recv invocations.
+chunked_recv(Chunks) ->
+    Key = {?MODULE, chunked_recv, make_ref()},
+    erlang:put(Key, Chunks),
+    fun() ->
+        case erlang:get(Key) of
+            [Chunk | Rest] ->
+                erlang:put(Key, Rest),
+                {ok, Chunk};
+            _ ->
+                {error, closed}
+        end
+    end.
 
 %% =============================================================================
 %% End-to-end integration over a real TCP socket

@@ -451,13 +451,46 @@ body_framing(Req) ->
     fun(() -> {ok, binary()} | {error, term()})
 ) ->
     {ok, binary(), binary()} | {error, term()}.
-read_body_until(N, Acc, _RecvFun) when byte_size(Acc) >= N ->
-    <<Body:N/binary, Leftover/binary>> = Acc,
+read_body_until(N, Buffered, _RecvFun) when byte_size(Buffered) >= N ->
+    <<Body:N/binary, Leftover/binary>> = Buffered,
     {ok, Body, Leftover};
-read_body_until(N, Acc, RecvFun) ->
+read_body_until(N, Buffered, RecvFun) ->
+    %% Body recursion: each level reads one recv-chunk and prepends it
+    %% to the iolist returned from below on the way out, then a single
+    %% `iolist_to_binary` flattens at the public boundary. The previous
+    %% shape (`<<Acc/binary, Data/binary>>` per iteration) was O(N²) on
+    %% the body size: the parser's leftover seed is a sub-binary view
+    %% (non-writable), so the binary-builder slack-allocation
+    %% optimisation never engaged and every iteration copied the full
+    %% accumulator.
+    case read_body_until_io(N - byte_size(Buffered), RecvFun) of
+        {ok, MoreIo, Leftover} ->
+            {ok, iolist_to_binary([Buffered | MoreIo]), Leftover};
+        {error, _} = E ->
+            E
+    end.
+
+-spec read_body_until_io(
+    non_neg_integer(),
+    fun(() -> {ok, binary()} | {error, term()})
+) ->
+    {ok, iolist(), binary()} | {error, term()}.
+read_body_until_io(N, RecvFun) ->
     case RecvFun() of
-        {ok, Data} -> read_body_until(N, <<Acc/binary, Data/binary>>, RecvFun);
-        {error, _} = E -> E
+        {ok, Data} ->
+            DataSz = byte_size(Data),
+            if
+                DataSz >= N ->
+                    <<Chunk:N/binary, Leftover/binary>> = Data,
+                    {ok, [Chunk], Leftover};
+                true ->
+                    case read_body_until_io(N - DataSz, RecvFun) of
+                        {ok, More, Leftover} -> {ok, [Data | More], Leftover};
+                        {error, _} = E -> E
+                    end
+            end;
+        {error, _} = E ->
+            E
     end.
 
 %% Read chunks until the size-0 last-chunk, concatenating decoded data
