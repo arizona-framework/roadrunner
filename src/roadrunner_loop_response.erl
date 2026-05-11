@@ -60,9 +60,10 @@ run(Socket, Status, UserHeaders, Handler, State) ->
 %% gen_server/gen_statem requests). Those would only reach the conn
 %% via misuse (the conn is a plain proc_lib loop, not a gen_*) and
 %% delivering them to the user handler would surface a confusing
-%% shape it has no reason to pattern-match on. Skipping leaves them
-%% in the mailbox; they're dropped when the conn exits. On
-%% `{stop, _}` we emit the size-0 chunked terminator and return.
+%% shape it has no reason to pattern-match on. Each OTP shape gets
+%% its own no-op clause that re-enters the loop; non-OTP messages
+%% fall through to the catch-all `Info` clause. On `{stop, _}` we
+%% emit the size-0 chunked terminator and return.
 %%
 %% **No `after` clause:** the loop blocks indefinitely until the
 %% handler returns `{stop, _}` from `handle_info/3`. A handler that
@@ -73,12 +74,13 @@ run(Socket, Status, UserHeaders, Handler, State) ->
     ok.
 info_loop(Socket, Handler, Push, State) ->
     receive
-        Info when
-            not (is_tuple(Info) andalso
-                (element(1, Info) =:= system orelse
-                    element(1, Info) =:= '$gen_call' orelse
-                    element(1, Info) =:= '$gen_cast'))
-        ->
+        {system, _, _} ->
+            info_loop(Socket, Handler, Push, State);
+        {'$gen_call', _, _} ->
+            info_loop(Socket, Handler, Push, State);
+        {'$gen_cast', _} ->
+            info_loop(Socket, Handler, Push, State);
+        Info ->
             case Handler:handle_info(Info, Push, State) of
                 {ok, NewState} ->
                     info_loop(Socket, Handler, Push, NewState);
