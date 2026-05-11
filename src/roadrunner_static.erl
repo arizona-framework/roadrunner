@@ -150,8 +150,10 @@ serve_regular_file(FilePath, Size, Mtime, Req) ->
 -spec maybe_serve_gzip(file:filename_all(), binary(), binary(), roadrunner_req:request()) ->
     {ok, roadrunner_handler:response()} | none.
 maybe_serve_gzip(FilePath, ETag, LastMod, Req) ->
-    case (roadrunner_req:header(~"range", Req) =:= undefined)
-         andalso accepts_gzip(Req) of
+    case
+        (roadrunner_req:header(~"range", Req) =:= undefined) andalso
+            accepts_gzip(Req)
+    of
         true ->
             GzPath = iolist_to_binary([FilePath, ~".gz"]),
             case file:read_file_info(GzPath, [{time, posix}]) of

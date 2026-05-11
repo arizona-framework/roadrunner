@@ -78,7 +78,11 @@ handle(#{target := ~"/loop"} = Req) ->
     %% Unregister first in case a prior test's worker leaked the name
     %% (eunit `_test/0` crashes skip the test's cleanup; the conn is
     %% spawned not spawn_linked, so it can outlive a failed test).
-    try unregister(roadrunner_h2_loop_test) catch _:_ -> ok end,
+    try
+        unregister(roadrunner_h2_loop_test)
+    catch
+        _:_ -> ok
+    end,
     true = register(roadrunner_h2_loop_test, self()),
     {{loop, 200, [{~"content-type", ~"text/event-stream"}], 0}, Req};
 handle(#{target := ~"/sendfile"} = Req) ->

@@ -81,21 +81,26 @@ make_push(ConnPid, StreamId) ->
 %% factoring them out into `roadrunner_http2_worker_sync`.
 
 -spec sync_send_headers(
-    pid(), pos_integer(), roadrunner_req:status(),
-    roadrunner_req:headers(), boolean()
+    pid(),
+    pos_integer(),
+    roadrunner_req:status(),
+    roadrunner_req:headers(),
+    boolean()
 ) -> ok.
 sync_send_headers(ConnPid, StreamId, Status, Headers, EndStream) ->
     sync(fun(Ref) ->
-        _ = (ConnPid !
-            {h2_send_headers, self(), Ref, StreamId, Status, Headers, EndStream}),
+        _ =
+            (ConnPid !
+                {h2_send_headers, self(), Ref, StreamId, Status, Headers, EndStream}),
         ok
     end).
 
 -spec sync_send_data(pid(), pos_integer(), binary(), boolean()) -> ok.
 sync_send_data(ConnPid, StreamId, Bin, EndStream) ->
     sync(fun(Ref) ->
-        _ = (ConnPid !
-            {h2_send_data, self(), Ref, StreamId, Bin, EndStream}),
+        _ =
+            (ConnPid !
+                {h2_send_data, self(), Ref, StreamId, Bin, EndStream}),
         ok
     end).
 
