@@ -97,7 +97,7 @@ invoke(ConnPid, StreamId, Handler, ListenerMws, Req, Metadata, ReqStart) ->
     Pipeline = roadrunner_middleware:build_pipeline(ListenerMws, Req, Handler),
     try Pipeline(Req) of
         {Response, _Req2} ->
-            emit_handler_response(ConnPid, StreamId, Response),
+            emit_handler_response(ConnPid, StreamId, Handler, Response),
             ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, #{
                 status => roadrunner_conn:response_status(Response),
                 response_kind => roadrunner_conn:response_kind(Response)
@@ -144,18 +144,27 @@ telemetry_metadata(#{
         listener_name => ListenerName
     }.
 
-emit_handler_response(ConnPid, StreamId, {Status, Headers, Body}) when
+emit_handler_response(ConnPid, StreamId, _Handler, {Status, Headers, Body}) when
     is_integer(Status, 100, 599)
 ->
     send_buffered(ConnPid, StreamId, Status, Headers, Body);
-emit_handler_response(ConnPid, StreamId, {stream, Status, Headers, Fun}) when
+emit_handler_response(ConnPid, StreamId, _Handler, {stream, Status, Headers, Fun}) when
     is_integer(Status, 100, 599), is_function(Fun, 1)
 ->
     roadrunner_http2_stream_response:run(ConnPid, StreamId, Status, Headers, Fun);
-emit_handler_response(ConnPid, StreamId, {loop, _, _, _}) ->
-    emit_501(ConnPid, StreamId);
+emit_handler_response(ConnPid, StreamId, Handler, {loop, Status, Headers, State}) when
+    is_integer(Status, 100, 599)
+->
+    %% Mirrors h1's `{loop, _}` path: enter a selective-receive loop
+    %% in the worker (sharing the handler's mailbox), dispatch each
+    %% non-OTP message through `Handler:handle_info/3`, emit DATA
+    %% frames via Push. On `{stop, _}` the worker emits an empty
+    %% DATA + END_STREAM and exits.
+    roadrunner_http2_loop_response:run(
+        ConnPid, StreamId, Status, Headers, {Handler, State}
+    );
 emit_handler_response(
-    ConnPid, StreamId, {sendfile, Status, Headers, {File, Offset, Length}}
+    ConnPid, StreamId, _Handler, {sendfile, Status, Headers, {File, Offset, Length}}
 ) when is_integer(Status, 100, 599) ->
     %% h2 has no kernel sendfile path. Wrap the file-read loop in a
     %% stream_fun so the existing streaming machinery handles
@@ -172,7 +181,7 @@ emit_handler_response(
         end
     end,
     roadrunner_http2_stream_response:run(ConnPid, StreamId, Status, Headers, Fun);
-emit_handler_response(ConnPid, StreamId, {websocket, _, _}) ->
+emit_handler_response(ConnPid, StreamId, _Handler, {websocket, _, _}) ->
     emit_501(ConnPid, StreamId).
 
 %% h2 DATA frame payload cap. The default SETTINGS_MAX_FRAME_SIZE is

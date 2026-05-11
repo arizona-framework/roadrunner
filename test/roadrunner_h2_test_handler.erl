@@ -9,6 +9,8 @@ shape.
 
 -export([handle/1]).
 
+-export([handle_info/3]).
+
 -spec handle(roadrunner_http1:request()) ->
     {roadrunner_handler:response(), roadrunner_http1:request()}.
 handle(#{target := ~"/empty"} = Req) ->
@@ -72,7 +74,13 @@ handle(#{target := ~"/stream/large"} = Req) ->
         Req
     };
 handle(#{target := ~"/loop"} = Req) ->
-    {{loop, 200, [], state}, Req};
+    %% Register the worker so the test can address it from outside.
+    %% Unregister first in case a prior test's worker leaked the name
+    %% (eunit `_test/0` crashes skip the test's cleanup; the conn is
+    %% spawned not spawn_linked, so it can outlive a failed test).
+    try unregister(roadrunner_h2_loop_test) catch _:_ -> ok end,
+    true = register(roadrunner_h2_loop_test, self()),
+    {{loop, 200, [{~"content-type", ~"text/event-stream"}], 0}, Req};
 handle(#{target := ~"/sendfile"} = Req) ->
     %% Empty-length: file is opened but never read. Exercises the
     %% sendfile_loop/3 base case (`Send(<<>>, fin)`).
@@ -118,3 +126,13 @@ handle(#{target := ~"/large100k"} = Req) ->
     {{200, [], binary:copy(<<"x">>, 100_000)}, Req};
 handle(Req) ->
     {{200, [{~"content-type", ~"text/plain"}], ~"ok"}, Req}.
+
+%% `handle_info/3` is consulted only by `{loop, _}` responses. The
+%% `/loop` clause above registers the worker; the test then sends
+%% `{push, _}` to add an SSE-style chunk and `stop` to terminate.
+handle_info({push, Data}, Push, N) ->
+    _ = Push([~"data: ", Data, ~"\n\n"]),
+    {ok, N + 1};
+handle_info(stop, Push, N) ->
+    _ = Push([~"data: bye(", integer_to_binary(N), ~")\n\n"]),
+    {stop, N}.

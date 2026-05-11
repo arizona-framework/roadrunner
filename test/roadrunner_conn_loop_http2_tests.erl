@@ -42,7 +42,8 @@ all_test_() ->
         fun stream_response_with_trailers/0,
         fun stream_response_trailers_only/0,
         fun stream_response_skips_empty_nofin/0,
-        fun loop_response_returns_501/0,
+        fun loop_response_emits_data_then_closes_on_stop/0,
+        fun loop_response_filters_otp_messages/0,
         fun sendfile_empty_emits_empty_data/0,
         fun sendfile_small_file_emits_single_data_frame/0,
         fun sendfile_multi_frame_chunks_at_max_frame_size/0,
@@ -730,8 +731,50 @@ stream_response_skips_empty_nofin() ->
     ),
     cleanup(Pid, Ref).
 
-loop_response_returns_501() ->
-    {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/loop"),
+loop_response_emits_data_then_closes_on_stop() ->
+    %% Drive the worker into the info_loop, push two messages, then
+    %% stop. The handler registers `roadrunner_h2_loop_test` so we
+    %% can address it from outside the worker. Expected wire frame
+    %% sequence: HEADERS (no END_STREAM), DATA(`data: hi\n\n`),
+    %% DATA(`data: bye(1)\n\n`), DATA(<<>>, END_STREAM).
+    {Pid, Ref} = run_stream_request(~"/loop"),
+    wait_for_register(roadrunner_h2_loop_test, 1000),
+    roadrunner_h2_loop_test ! {push, ~"hi"},
+    roadrunner_h2_loop_test ! stop,
+    Frames = collect_response_frames(),
+    ?assertMatch(
+        [
+            {headers, 1, false},
+            {data, 1, false, ~"data: hi\n\n"},
+            {data, 1, false, ~"data: bye(1)\n\n"},
+            {data, 1, true, ~""}
+        ],
+        Frames
+    ),
+    cleanup(Pid, Ref).
+
+loop_response_filters_otp_messages() ->
+    %% sys / gen_call / gen_cast shapes must NOT reach `handle_info/3`.
+    %% The handler increments `N` only on `{push, _}`; if any OTP
+    %% message slipped through to handle_info the `bye(N)` chunk
+    %% would show a larger counter.
+    {Pid, Ref} = run_stream_request(~"/loop"),
+    wait_for_register(roadrunner_h2_loop_test, 1000),
+    roadrunner_h2_loop_test ! {system, make_ref(), get_state},
+    roadrunner_h2_loop_test ! {'$gen_call', {self(), make_ref()}, ping},
+    roadrunner_h2_loop_test ! {'$gen_cast', whatever},
+    roadrunner_h2_loop_test ! {push, ~"real"},
+    roadrunner_h2_loop_test ! stop,
+    Frames = collect_response_frames(),
+    ?assertMatch(
+        [
+            {headers, 1, false},
+            {data, 1, false, ~"data: real\n\n"},
+            {data, 1, false, ~"data: bye(1)\n\n"},
+            {data, 1, true, ~""}
+        ],
+        Frames
+    ),
     cleanup(Pid, Ref).
 
 sendfile_empty_emits_empty_data() ->
@@ -2756,6 +2799,22 @@ drain_setopts() ->
     receive
         {roadrunner_fake_setopts, _, _} -> drain_setopts()
     after 0 -> ok
+    end.
+
+%% Spin-wait for a registered name to appear. Used by tests where
+%% the handler registers itself inside `handle/1`; without the wait,
+%% the test races with the worker's spawn and `Name ! Msg` crashes
+%% with `badarg`.
+wait_for_register(_Name, RemainingMs) when RemainingMs =< 0 ->
+    error({wait_for_register_timeout, _Name});
+wait_for_register(Name, RemainingMs) ->
+    case whereis(Name) of
+        undefined ->
+            Step = 10,
+            timer:sleep(Step),
+            wait_for_register(Name, RemainingMs - Step);
+        Pid ->
+            Pid
     end.
 
 drain_mailbox() ->

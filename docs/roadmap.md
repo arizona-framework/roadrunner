@@ -6,32 +6,9 @@ rough effort estimate so you know what's on deck and what's
 
 ## HTTP/2 response-shape coverage
 
-Today, two of the five handler return shapes return `501 Not
+Today, one of the five handler return shapes still returns `501 Not
 Implemented` when served over HTTP/2 (`src/roadrunner_conn_loop_http2.erl`
-moduledoc has the matrix). Both are tracked here.
-
-### `{loop, _}` over h2 — medium effort
-
-**What:** Allow a handler to return `{loop, Status, Headers,
-State}` and run a long-lived handler with `handle_info/3` callbacks
-(SSE-style push) over h2.
-
-**Why deferred:** the h2 stream worker today does request → response
-→ exit. Implementing `{loop, _}` means teaching the worker to enter
-a selective-receive loop, dispatch process messages to
-`Handler:handle_info/3`, and emit DATA frames per push (with the
-conn process mediating socket writes for ordering + flow control).
-It also has to cooperate with peer `RST_STREAM` cancellation and h2
-flow-control windows. Not protocol-hard — just code we haven't
-written.
-
-**Workaround today:** `{stream, _}` works on both h1 and h2 and is
-a better cross-protocol primitive for most push workloads.
-
-**Scope:** medium. Tests cover happy path, server-initiated close,
-peer-initiated `RST_STREAM`, mid-loop flow-control bursts,
-`handle_info/3` returning `{ok, NewState}` / `{stop, _}` /
-`{reply, NewState}`.
+moduledoc has the matrix). It's tracked here.
 
 ### `{websocket, _, _}` over h2 — RFC 8441 Extended CONNECT — large effort
 
@@ -240,6 +217,29 @@ needs full regeneration. Automating earns its keep once we're
 chasing a regression that needs frequent refresh.
 
 **Scope:** small.
+
+### Proper OTP citizenship in loop responses
+
+**What:** Both `roadrunner_loop_response:info_loop/4` (h1) and
+`roadrunner_http2_loop_response:info_loop/5` (h2) silently drop
+`{system, _, _}`, `{'$gen_call', _, _}`, and `{'$gen_cast', _}`
+messages. A more polite implementation would call
+`sys:handle_system_msg/6` on the system message, reply to gen-calls
+with `gen:reply(From, {error, not_supported})`, and so on.
+
+**Why deferred:** the conn (h1) and worker (h2) are plain
+`proc_lib`-spawned loops, not `gen_*` behaviours, so the only path
+for these shapes to reach them is misuse (`gen_server:call(ConnPid, _)`
+or `sys:get_state(ConnPid)`). The current contract is "those calls
+appear to hang; the caller should expect to time out", documented
+in the `roadrunner_loop_response` moduledoc. Proper handling would
+make these calls observable (e.g. `sys:get_state/1` would return the
+loop state), which has debugging value but no functional fix.
+
+**Scope:** small. New helper `roadrunner_loop_sys` exporting a
+single `handle/3` (sys message, From, ProcessState) used from both
+h1 and h2 info_loops. Tests covering sys/get_state, sys/replace_state,
+gen_call rejection, gen_cast no-op.
 
 ### h2 manual-mode body reading
 
