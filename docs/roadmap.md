@@ -118,23 +118,6 @@ echo-ws, echo-ws-pipeline. Validator passes 57/57 on those. The
 remaining 12 profiles need roadrunner-side features; listed in
 roughly the order a follow-up PR would tackle them.
 
-### `static` gzip-sibling serving — small (roadrunner-side)
-
-**What:** When `Accept-Encoding: gzip` is present and `<file>.gz`
-exists, serve the pre-compressed sibling with
-`Content-Encoding: gzip`. nginx's `gzip_static on`.
-
-**Why:** The HttpArena `static` fixture ships `.gz` siblings.
-Without sibling-serving, every static response either passes the
-raw bytes (uncompressed wire) or runs through the on-the-fly
-compress middleware (CPU per request). Sibling-serving sends the
-pre-encoded bytes verbatim. The validator marks this as SKIP today
-(compression is optional for correctness); the benchmark numbers
-would improve with it.
-
-**Scope:** small. One file existence check on the request path,
-swap the file plus add headers.
-
 ### `static-h2` — covered by `{sendfile, _}` over h2 above
 
 ### h2c (HTTP/2 cleartext) — small/medium (roadrunner-side)

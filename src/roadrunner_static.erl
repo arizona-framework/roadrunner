@@ -12,6 +12,28 @@ Configure via a 3-tuple route with `#{dir => Path}` opts and a
 Reads the file from disk, sets `Content-Type` from the extension,
 returns 404 on a missing file or any path that contains `..`.
 
+## Gzip-sibling serving
+
+When a request carries `Accept-Encoding: gzip` and the requested
+file has a `<file>.gz` sibling on disk, the sibling is served
+verbatim with `Content-Encoding: gzip` plus `Vary: Accept-Encoding`.
+This matches nginx's `gzip_static on` behaviour and lets operators
+pre-compress build assets once instead of paying the deflate cost
+per request.
+
+`Accept-Encoding` is matched via plain substring (`gzip`) rather
+than full RFC 9110 §12.5.3 qvalue ranking. The static path is
+typically hit by browsers and benchmark clients that always
+include `gzip` plainly. Brotli (`.br`) siblings are not served —
+gzip is the universally supported encoding.
+
+The original file's ETag is reused for the gzip variant, so a
+follow-up `If-None-Match` returns 304 regardless of which variant
+was first served. A `Range` request disables the gzip path on that
+request — byte offsets over a compressed representation have
+subtle semantics and the simple "Range wins" rule matches what
+nginx does.
+
 ## Symlink policy
 
 `#{symlink_policy => Policy}` (default `refuse_escapes`) controls
@@ -114,8 +136,55 @@ serve_regular_file(FilePath, Size, Mtime, Req) ->
                 ],
                 ~""};
         false ->
-            serve_with_range(FilePath, Size, ETag, LastMod, Req)
+            case maybe_serve_gzip(FilePath, ETag, LastMod, Req) of
+                {ok, Resp} -> Resp;
+                none -> serve_with_range(FilePath, Size, ETag, LastMod, Req)
+            end
     end.
+
+%% When the client opted into gzip and a `<file>.gz` sibling is on
+%% disk, serve the sibling with `Content-Encoding: gzip`. `Range`
+%% requests skip this path — byte offsets over a compressed
+%% representation have subtle semantics, so we let Range win and
+%% serve the raw file.
+-spec maybe_serve_gzip(file:filename_all(), binary(), binary(), roadrunner_req:request()) ->
+    {ok, roadrunner_handler:response()} | none.
+maybe_serve_gzip(FilePath, ETag, LastMod, Req) ->
+    case (roadrunner_req:header(~"range", Req) =:= undefined)
+         andalso accepts_gzip(Req) of
+        true ->
+            GzPath = iolist_to_binary([FilePath, ~".gz"]),
+            case file:read_file_info(GzPath, [{time, posix}]) of
+                {ok, #file_info{type = regular, size = GzSize}} ->
+                    {ok, gzip_response(FilePath, GzPath, GzSize, ETag, LastMod)};
+                _ ->
+                    none
+            end;
+        false ->
+            none
+    end.
+
+-spec accepts_gzip(roadrunner_req:request()) -> boolean().
+accepts_gzip(Req) ->
+    case roadrunner_req:header(~"accept-encoding", Req) of
+        undefined -> false;
+        Bin -> binary:match(Bin, ~"gzip") =/= nomatch
+    end.
+
+-spec gzip_response(
+    file:filename_all(), file:filename_all(), non_neg_integer(), binary(), binary()
+) -> roadrunner_handler:response().
+gzip_response(OrigPath, GzPath, GzSize, ETag, LastMod) ->
+    {sendfile, 200,
+        [
+            {~"content-type", content_type_for(OrigPath)},
+            {~"content-encoding", ~"gzip"},
+            {~"content-length", integer_to_binary(GzSize)},
+            {~"etag", ETag},
+            {~"last-modified", LastMod},
+            {~"vary", ~"Accept-Encoding"}
+        ],
+        {GzPath, 0, GzSize}}.
 
 %% Cache hit when either:
 %% - `If-None-Match` matches the current ETag (strong validator), or
