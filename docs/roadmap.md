@@ -180,6 +180,35 @@ workloads (server-side, large-POST upload patterns) before shipping.
 have to drain the new SETTINGS entry + early WINDOW_UPDATE in
 their handshake fixture).
 
+### Sendfile chunk size tracks the peer's negotiated MAX_FRAME_SIZE
+
+**What:** Today `?SENDFILE_CHUNK_SIZE` in
+`src/roadrunner_http2_stream_worker.erl` is pinned at 16384, the
+RFC 9113 §6.5.2 default for `SETTINGS_MAX_FRAME_SIZE`. Peers can
+advertise up to `16777215` in their SETTINGS frame; gun, h2o, and
+other clients routinely raise it. Reading the peer's actual
+negotiated value (already tracked at
+`roadrunner_http2_settings:settings.max_frame_size`,
+`src/roadrunner_http2_settings.erl:47`) and using it as the cap in
+`sendfile_loop/3` would let large sendfile responses ship fewer,
+larger DATA frames.
+
+**Why deferred:** Per-DATA-frame overhead is 9 bytes of header vs
+payloads typically thousands of bytes long, so the bandwidth win is
+sub-1%. Plumbing the peer's settings into the stream worker also
+isn't trivial: the worker is handed `(ConnPid, StreamId, ...)` at
+spawn time, not the conn's per-stream peer-settings view, so the
+handoff path needs a new field. No measured case yet where the
+framing overhead matters.
+
+**Scope:** small once measured. Add the peer `max_frame_size` to
+the stream worker's spawn args (or a fetch-on-demand call into the
+conn); replace `min(Remaining, ?SENDFILE_CHUNK_SIZE)` with
+`min(Remaining, PeerMaxFrameSize)` in `sendfile_loop/3`. One new
+test in `roadrunner_conn_loop_http2_tests` that advertises a higher
+`MAX_FRAME_SIZE` in the client SETTINGS and asserts the resulting
+DATA frames scale up accordingly.
+
 ### Investigate small-body POST RSS gap
 
 **What:** A `--with-resources` survey (see `docs/resource_results.md`)
