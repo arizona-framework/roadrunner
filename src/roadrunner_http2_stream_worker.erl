@@ -154,10 +154,44 @@ emit_handler_response(ConnPid, StreamId, {stream, Status, Headers, Fun}) when
     roadrunner_http2_stream_response:run(ConnPid, StreamId, Status, Headers, Fun);
 emit_handler_response(ConnPid, StreamId, {loop, _, _, _}) ->
     emit_501(ConnPid, StreamId);
-emit_handler_response(ConnPid, StreamId, {sendfile, _, _, _}) ->
-    emit_501(ConnPid, StreamId);
+emit_handler_response(
+    ConnPid, StreamId, {sendfile, Status, Headers, {File, Offset, Length}}
+) when is_integer(Status, 100, 599) ->
+    %% h2 has no kernel sendfile path. Wrap the file-read loop in a
+    %% stream_fun so the existing streaming machinery handles
+    %% HEADERS, DATA framing, MAX_FRAME_SIZE chunking, and per-stream
+    %% / conn-level flow control. File-open failures crash the worker;
+    %% the conn process RST_STREAM-s the stream, matching h1.
+    Fun = fun(Send) ->
+        {ok, IoDev} = file:open(File, [read, raw, binary]),
+        try
+            {ok, _} = file:position(IoDev, Offset),
+            sendfile_loop(IoDev, Length, Send)
+        after
+            _ = file:close(IoDev)
+        end
+    end,
+    roadrunner_http2_stream_response:run(ConnPid, StreamId, Status, Headers, Fun);
 emit_handler_response(ConnPid, StreamId, {websocket, _, _}) ->
     emit_501(ConnPid, StreamId).
+
+%% h2 DATA frame payload cap. The default SETTINGS_MAX_FRAME_SIZE is
+%% 16384 (RFC 9113 §6.5.2); larger reads just force the framer to
+%% split, so cap at the floor.
+-define(SENDFILE_CHUNK_SIZE, 16384).
+
+sendfile_loop(_IoDev, 0, Send) ->
+    Send(<<>>, fin);
+sendfile_loop(IoDev, Remaining, Send) ->
+    Want = min(Remaining, ?SENDFILE_CHUNK_SIZE),
+    {ok, Bin} = file:read(IoDev, Want),
+    case Remaining - byte_size(Bin) of
+        0 ->
+            Send(Bin, fin);
+        NextRemaining ->
+            Send(Bin, nofin),
+            sendfile_loop(IoDev, NextRemaining, Send)
+    end.
 
 emit_501(ConnPid, StreamId) ->
     send_buffered(

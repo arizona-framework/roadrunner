@@ -41,7 +41,11 @@ all_test_() ->
         fun stream_response_trailers_only/0,
         fun stream_response_skips_empty_nofin/0,
         fun loop_response_returns_501/0,
-        fun sendfile_response_returns_501/0,
+        fun sendfile_empty_emits_empty_data/0,
+        fun sendfile_small_file_emits_single_data_frame/0,
+        fun sendfile_multi_frame_chunks_at_max_frame_size/0,
+        fun sendfile_offset_and_length_window/0,
+        fun sendfile_missing_file_resets_stream/0,
         fun websocket_response_returns_501/0,
         fun handler_crash_returns_500/0,
         fun middleware_chain_runs/0,
@@ -630,8 +634,94 @@ loop_response_returns_501() ->
     {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/loop"),
     cleanup(Pid, Ref).
 
-sendfile_response_returns_501() ->
-    {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/sendfile"),
+sendfile_empty_emits_empty_data() ->
+    %% Length=0: file is opened but never read. The base clause of
+    %% sendfile_loop emits Send(<<>>, fin) → empty DATA with END_STREAM.
+    {Pid, Ref} = run_stream_request(~"/sendfile"),
+    Frames = collect_response_frames(),
+    ?assertEqual([{headers, 1, false}, {data, 1, true, ~""}], Frames),
+    cleanup(Pid, Ref).
+
+sendfile_small_file_emits_single_data_frame() ->
+    %% 100-byte file fits in a single DATA frame.
+    Path = "/tmp/rr_h2_sf_small.bin",
+    Body = binary:copy(<<"x">>, 100),
+    ok = file:write_file(Path, Body),
+    try
+        {Pid, Ref} = run_stream_request(~"/sendfile/small"),
+        Frames = collect_response_frames(),
+        ?assertEqual(
+            [{headers, 1, false}, {data, 1, true, Body}],
+            Frames
+        ),
+        cleanup(Pid, Ref)
+    after
+        _ = file:delete(Path)
+    end.
+
+sendfile_multi_frame_chunks_at_max_frame_size() ->
+    %% 40000-byte file splits into 3 DATA frames: 16384, 16384, 7232.
+    %% Only the last carries END_STREAM. The wire body re-assembled
+    %% from all three DATA payloads must equal the original file.
+    Path = "/tmp/rr_h2_sf_multi.bin",
+    Body = iolist_to_binary([
+        binary:copy(<<"a">>, 16384),
+        binary:copy(<<"b">>, 16384),
+        binary:copy(<<"c">>, 7232)
+    ]),
+    ok = file:write_file(Path, Body),
+    try
+        {Pid, Ref} = run_stream_request(~"/sendfile/multi"),
+        Frames = collect_response_frames(),
+        ?assertMatch(
+            [
+                {headers, 1, false},
+                {data, 1, false, _},
+                {data, 1, false, _},
+                {data, 1, true, _}
+            ],
+            Frames
+        ),
+        [_H, {data, 1, false, D1}, {data, 1, false, D2}, {data, 1, true, D3}] =
+            Frames,
+        ?assertEqual(16384, byte_size(D1)),
+        ?assertEqual(16384, byte_size(D2)),
+        ?assertEqual(7232, byte_size(D3)),
+        ?assertEqual(Body, <<D1/binary, D2/binary, D3/binary>>),
+        cleanup(Pid, Ref)
+    after
+        _ = file:delete(Path)
+    end.
+
+sendfile_offset_and_length_window() ->
+    %% 1000-byte file, sendfile (Offset=200, Length=500). Wire body
+    %% must equal bytes [200, 700) of the file.
+    Path = "/tmp/rr_h2_sf_window.bin",
+    Body = list_to_binary([X rem 256 || X <- lists:seq(0, 999)]),
+    ok = file:write_file(Path, Body),
+    try
+        {Pid, Ref} = run_stream_request(~"/sendfile/window"),
+        Frames = collect_response_frames(),
+        ?assertMatch(
+            [{headers, 1, false}, {data, 1, true, _}],
+            Frames
+        ),
+        [_H, {data, 1, true, Slice}] = Frames,
+        ?assertEqual(binary:part(Body, 200, 500), Slice),
+        cleanup(Pid, Ref)
+    after
+        _ = file:delete(Path)
+    end.
+
+sendfile_missing_file_resets_stream() ->
+    %% File open fails inside the StreamFun before any HEADERS are
+    %% sent. The worker crashes; the conn RST_STREAMs the stream and
+    %% the loop continues. The conn process must still be alive
+    %% afterwards.
+    _ = file:delete("/tmp/rr_h2_sf_does_not_exist.bin"),
+    {Pid, Ref} = run_h2_request_with_handler(
+        roadrunner_h2_test_handler, ~"/sendfile/missing"
+    ),
     cleanup(Pid, Ref).
 
 websocket_response_returns_501() ->

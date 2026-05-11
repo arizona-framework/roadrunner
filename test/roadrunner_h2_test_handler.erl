@@ -74,7 +74,27 @@ handle(#{target := ~"/stream/large"} = Req) ->
 handle(#{target := ~"/loop"} = Req) ->
     {{loop, 200, [], state}, Req};
 handle(#{target := ~"/sendfile"} = Req) ->
+    %% Empty-length: file is opened but never read. Exercises the
+    %% sendfile_loop/3 base case (`Send(<<>>, fin)`).
     {{sendfile, 200, [], {"/dev/null", 0, 0}}, Req};
+handle(#{target := ~"/sendfile/small"} = Req) ->
+    %% 100-byte body, single DATA frame with END_STREAM.
+    {{sendfile, 200, [], {"/tmp/rr_h2_sf_small.bin", 0, 100}}, Req};
+handle(#{target := ~"/sendfile/multi"} = Req) ->
+    %% 40000-byte body, splits into 3 DATA frames (16384 + 16384 + 7232).
+    {{sendfile, 200, [], {"/tmp/rr_h2_sf_multi.bin", 0, 40000}}, Req};
+handle(#{target := ~"/sendfile/window"} = Req) ->
+    %% Offset + Length: serve bytes [200, 700) from a 1000-byte file.
+    {{sendfile, 200, [], {"/tmp/rr_h2_sf_window.bin", 200, 500}}, Req};
+handle(#{target := ~"/sendfile/missing"} = Req) ->
+    %% File-open failure: worker crashes, conn RST_STREAMs.
+    {{sendfile, 200, [], {"/tmp/rr_h2_sf_does_not_exist.bin", 0, 100}}, Req};
+handle(#{target := ~"/sendfile/large"} = Req) ->
+    %% 100 KB body via sendfile — exceeds the default 65535-byte
+    %% conn-level window, so the server stalls and resumes after
+    %% WINDOW_UPDATE. Used by the flow-control SUITE to verify
+    %% sendfile-over-h2 reuses the streaming backpressure path.
+    {{sendfile, 200, [], {"/tmp/rr_h2_sf_large.bin", 0, 100_000}}, Req};
 handle(#{target := ~"/websocket"} = Req) ->
     {{websocket, some_module, state}, Req};
 handle(#{target := ~"/crash"} = _Req) ->

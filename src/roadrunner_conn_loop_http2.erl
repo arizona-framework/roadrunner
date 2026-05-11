@@ -42,7 +42,7 @@ Response shapes supported:
 | `{Status, Headers, Body}` (buffered) | yes |
 | `{stream, _, _, Fun}` | yes |
 | `{loop, _}` | 501 |
-| `{sendfile, _}` | 501 |
+| `{sendfile, _}` | yes (chunked DATA via the stream-response engine) |
 | `{websocket, _, _}` | 501 (Phase H13) |
 """.
 

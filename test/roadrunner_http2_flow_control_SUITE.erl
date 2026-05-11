@@ -26,6 +26,7 @@ reuse / scheduling races.
     stream_window_update_grows_send_window/1,
     large_response_chunks_through_send_window/1,
     large_response_blocked_resumes_on_window_update/1,
+    sendfile_large_response_blocked_resumes_on_window_update/1,
     large_inbound_body_refills_recv_windows/1,
     rst_stream_during_blocked_send_drops_body/1,
     ping_during_blocked_send_is_acked/1,
@@ -53,6 +54,7 @@ all() ->
         stream_window_update_grows_send_window,
         large_response_chunks_through_send_window,
         large_response_blocked_resumes_on_window_update,
+        sendfile_large_response_blocked_resumes_on_window_update,
         large_inbound_body_refills_recv_windows,
         rst_stream_during_blocked_send_drops_body,
         ping_during_blocked_send_is_acked,
@@ -157,6 +159,31 @@ large_response_blocked_resumes_on_window_update(_Config) ->
     serve_recv(ConnPid, Wu2),
     drain_until_n_bytes(40_000),
     cleanup(Pid, Ref).
+
+sendfile_large_response_blocked_resumes_on_window_update(_Config) ->
+    %% Sendfile-over-h2 delegates to the same stream_response runner
+    %% as `{stream, _}`, so window-blocking behaviour must match the
+    %% streaming variant above. 100 KB file exceeds the default
+    %% conn-level window; the server stalls until WINDOW_UPDATE
+    %% refills both windows.
+    Path = "/tmp/rr_h2_sf_large.bin",
+    ok = file:write_file(Path, binary:copy(<<"x">>, 100_000)),
+    try
+        {Pid, Ref, ConnPid} = start_conn(roadrunner_h2_test_handler),
+        handshake(ConnPid),
+        HpackBin = encode_request_headers(~"GET", ~"/sendfile/large"),
+        Hf = encode_frame({headers, 1, 16#04 bor 16#01, undefined, HpackBin}),
+        serve_recv(ConnPid, Hf),
+        drain_until_n_bytes(60_000),
+        Wu = encode_frame({window_update, 0, 200_000}),
+        serve_recv(ConnPid, Wu),
+        Wu2 = encode_frame({window_update, 1, 200_000}),
+        serve_recv(ConnPid, Wu2),
+        drain_until_n_bytes(40_000),
+        cleanup(Pid, Ref)
+    after
+        _ = file:delete(Path)
+    end.
 
 large_inbound_body_refills_recv_windows(_Config) ->
     %% Sending 4 × 10 KB DATA frames drops both recv windows below

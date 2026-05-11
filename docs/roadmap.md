@@ -6,24 +6,9 @@ rough effort estimate so you know what's on deck and what's
 
 ## HTTP/2 response-shape coverage
 
-Today, three of the five handler return shapes return `501 Not
+Today, two of the five handler return shapes return `501 Not
 Implemented` when served over HTTP/2 (`src/roadrunner_conn_loop_http2.erl`
-moduledoc has the matrix). All three are tracked here.
-
-### `{sendfile, _}` over h2 — small effort
-
-**What:** Allow a handler to return `{sendfile, Status, Headers,
-{File, Offset, Length}}` and have it work over h2.
-
-**Why deferred:** h2 has no kernel sendfile path — every byte must
-go through HPACK (for headers) and DATA framing. The implementation
-is a chunked-read-and-frame loop honoring per-stream and conn-level
-flow control. Doable; just lower priority than other items because
-the perf upside vs. a buffered response is smaller on h2 than on h1.
-
-**Scope:** small. Tests cover happy path, large file (>64 KB so
-multiple DATA frames), small initial window (flow-control split),
-file-open errors.
+moduledoc has the matrix). Both are tracked here.
 
 ### `{loop, _}` over h2 — medium effort
 
@@ -117,8 +102,6 @@ async-db, api-4, api-16, static, fortunes, crud, baseline-h2,
 echo-ws, echo-ws-pipeline. Validator passes 57/57 on those. The
 remaining 12 profiles need roadrunner-side features; listed in
 roughly the order a follow-up PR would tackle them.
-
-### `static-h2` — covered by `{sendfile, _}` over h2 above
 
 ### h2c (HTTP/2 cleartext) — small/medium (roadrunner-side)
 
