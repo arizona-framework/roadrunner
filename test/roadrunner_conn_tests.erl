@@ -59,10 +59,9 @@ read_body_cl_within_buffer_test() ->
 read_body_cl_needs_more_recv_test() ->
     Req = req_with_headers([{~"content-length", ~"11"}]),
     Recv = fun() -> {ok, ~" world"} end,
-    ?assertEqual(
-        {ok, ~"hello world", <<>>},
-        roadrunner_conn:read_body(Req, ~"hello", Recv, 1000)
-    ).
+    {ok, Body, Leftover} = roadrunner_conn:read_body(Req, ~"hello", Recv, 1000),
+    ?assertEqual(~"hello world", iolist_to_binary(Body)),
+    ?assertEqual(<<>>, Leftover).
 
 read_body_cl_multi_chunk_recv_test() ->
     %% Body arrives in three separate recv chunks, none individually
@@ -70,10 +69,9 @@ read_body_cl_multi_chunk_recv_test() ->
     %% iolist accumulator in `read_body_until_io/2`.
     Req = req_with_headers([{~"content-length", ~"15"}]),
     Recv = chunked_recv([~"abc", ~"defgh", ~"ijklmnop"]),
-    ?assertEqual(
-        {ok, ~"abcdefghijklmno", ~"p"},
-        roadrunner_conn:read_body(Req, <<>>, Recv, 1000)
-    ).
+    {ok, Body, Leftover} = roadrunner_conn:read_body(Req, <<>>, Recv, 1000),
+    ?assertEqual(~"abcdefghijklmno", iolist_to_binary(Body)),
+    ?assertEqual(~"p", Leftover).
 
 read_body_cl_recv_error_test() ->
     %% First recv returns an error before any body bytes arrive.
@@ -1242,7 +1240,7 @@ consume_state_length_multi_recv_test() ->
         max => 1000
     },
     {more, Bytes, State1} = roadrunner_conn:consume_body_state(State0, {length, 8}),
-    ?assertEqual(~"abcdefgh", Bytes),
+    ?assertEqual(~"abcdefgh", iolist_to_binary(Bytes)),
     %% State1's buffered should now hold the leftover "ij".
     ?assertMatch(#{buffered := ~"ij"}, State1).
 
@@ -1286,7 +1284,8 @@ consume_state_request_too_large_test() ->
 
 consume_state_chunked_full_drain_test() ->
     State = chunked_state(~"5\r\nhello\r\n0\r\n\r\n", fun() -> error(unused) end),
-    ?assertMatch({ok, ~"hello", _}, roadrunner_conn:consume_body_state(State, all)).
+    {ok, Bytes, _} = roadrunner_conn:consume_body_state(State, all),
+    ?assertEqual(~"hello", iolist_to_binary(Bytes)).
 
 consume_state_chunked_error_propagates_test() ->
     State = chunked_state(~"xyz\r\nhello\r\n", fun() -> error(unused) end),
@@ -1296,11 +1295,11 @@ consume_state_chunked_length_streams_within_chunk_test() ->
     %% Chunk decodes to "hello"; reading with length=2 yields he/ll/o.
     State = chunked_state(~"5\r\nhello\r\n0\r\n\r\n", fun() -> error(unused) end),
     {more, B1, S1} = roadrunner_conn:consume_body_state(State, {length, 2}),
-    ?assertEqual(~"he", B1),
+    ?assertEqual(~"he", iolist_to_binary(B1)),
     {more, B2, S2} = roadrunner_conn:consume_body_state(S1, {length, 2}),
-    ?assertEqual(~"ll", B2),
+    ?assertEqual(~"ll", iolist_to_binary(B2)),
     {ok, B3, _S3} = roadrunner_conn:consume_body_state(S2, {length, 2}),
-    ?assertEqual(~"o", B3).
+    ?assertEqual(~"o", iolist_to_binary(B3)).
 
 consume_state_chunked_length_crosses_chunk_boundary_test() ->
     %% Two chunks "hel" + "lo world"; read length=4 yields "hell", "o wo", "rld".
@@ -1309,11 +1308,11 @@ consume_state_chunked_length_crosses_chunk_boundary_test() ->
         fun() -> error(unused) end
     ),
     {more, B1, S1} = roadrunner_conn:consume_body_state(State, {length, 4}),
-    ?assertEqual(~"hell", B1),
+    ?assertEqual(~"hell", iolist_to_binary(B1)),
     {more, B2, S2} = roadrunner_conn:consume_body_state(S1, {length, 4}),
-    ?assertEqual(~"o wo", B2),
+    ?assertEqual(~"o wo", iolist_to_binary(B2)),
     {ok, B3, _S3} = roadrunner_conn:consume_body_state(S2, {length, 4}),
-    ?assertEqual(~"rld", B3).
+    ?assertEqual(~"rld", iolist_to_binary(B3)).
 
 consume_state_chunked_length_recvs_more_test() ->
     %% Buffer has the size line but the chunk body arrives via recv.
@@ -1323,7 +1322,7 @@ consume_state_chunked_length_recvs_more_test() ->
         {ok, ~"llo\r\n0\r\n\r\n"}
     end),
     {ok, Bytes, _S2} = roadrunner_conn:consume_body_state(State, {length, 100}),
-    ?assertEqual(~"hello", Bytes),
+    ?assertEqual(~"hello", iolist_to_binary(Bytes)),
     receive
         recv_called -> ok
     after 100 -> error(recv_was_not_called)
@@ -1336,8 +1335,10 @@ consume_state_chunked_length_recv_error_test() ->
 consume_state_chunked_length_after_done_returns_empty_test() ->
     %% Drain the body fully via the all path, then try to read more.
     State0 = chunked_state(~"3\r\nhel\r\n0\r\n\r\n", fun() -> error(unused) end),
-    {ok, ~"hel", State1} = roadrunner_conn:consume_body_state(State0, all),
-    ?assertMatch({ok, <<>>, _}, roadrunner_conn:consume_body_state(State1, {length, 4})).
+    {ok, Drained, State1} = roadrunner_conn:consume_body_state(State0, all),
+    ?assertEqual(~"hel", iolist_to_binary(Drained)),
+    {ok, MoreBytes, _} = roadrunner_conn:consume_body_state(State1, {length, 4}),
+    ?assertEqual(<<>>, iolist_to_binary(MoreBytes)).
 
 consume_state_next_chunk_returns_one_chunk_test() ->
     %% Two chunks "hel" and "lo"; next_chunk yields each one in turn.
@@ -1457,7 +1458,8 @@ consume_state_recvs_more_when_buffer_short_test() ->
         end,
         max => 1000
     },
-    ?assertMatch({ok, ~"hello", _}, roadrunner_conn:consume_body_state(State, all)),
+    {ok, Bytes, _} = roadrunner_conn:consume_body_state(State, all),
+    ?assertEqual(~"hello", iolist_to_binary(Bytes)),
     receive
         recv_called -> ok
     after 100 -> error(recv_was_not_called)

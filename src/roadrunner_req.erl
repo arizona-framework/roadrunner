@@ -159,26 +159,29 @@ parse_cookies(Req) ->
 Return the buffered request body bytes as seen by the handler.
 
 The connection process embeds whatever bytes followed the header block
-under the `body` map key before invoking the handler. Body framing
-(Content-Length / chunked) is not yet applied — this exposes the raw
-buffer the parser carried over.
+under the `body` map key before invoking the handler. Auto-mode delivers
+the full body as `iodata()` (an iolist of recv chunks for multi-chunk
+bodies, a single binary otherwise) so handlers that only need
+`iolist_size/1` or `gen_tcp:send/2` skip a flatten. Handlers requiring
+a flat binary call `iolist_to_binary/1` themselves.
 
 Returns `<<>>` when the request has no body field (e.g. when a request
 map is constructed manually outside the connection pipeline).
 """.
--spec body(request()) -> binary().
+-spec body(request()) -> iodata().
 body(#{body := B}) -> B;
 body(_) -> <<>>.
 
 -doc """
 Return whether the request carries a non-empty body.
 
-Returns `false` for both an absent `body` field and an empty body
-binary — handlers can use this as a short-circuit before doing any
-body-aware work.
+Returns `false` for both an absent `body` field and an empty body.
+Handlers can use this as a short-circuit before doing any body-aware
+work. Uses `iolist_size/1` so the check is O(length of iolist), not
+O(total bytes).
 """.
 -spec has_body(request()) -> boolean().
-has_body(#{body := B}) -> B =/= <<>>;
+has_body(#{body := B}) -> iolist_size(B) > 0;
 has_body(_) -> false.
 
 -doc """
@@ -196,7 +199,7 @@ body-buffering modes:
   handler skipped.
 """.
 -spec read_body(request()) ->
-    {ok, binary(), request()} | {error, term()}.
+    {ok, iodata(), request()} | {error, term()}.
 read_body(Req) ->
     read_body(Req, #{}).
 
@@ -218,8 +221,8 @@ In `auto` mode the body is already buffered, so `length` has no
 effect — the buffered bytes are returned in one shot.
 """.
 -spec read_body(request(), #{length => non_neg_integer()}) ->
-    {ok, binary(), request()}
-    | {more, binary(), request()}
+    {ok, iodata(), request()}
+    | {more, iodata(), request()}
     | {error, term()}.
 read_body(#{body_state := BS} = Req, Opts) ->
     Mode =
@@ -258,8 +261,8 @@ conn via the `{Response, Req2}` handler return shape so any unread
 chunks get drained for keep-alive.
 """.
 -spec read_body_chunked(request()) ->
-    {ok, binary(), request()}
-    | {more, binary(), request()}
+    {ok, iodata(), request()}
+    | {more, iodata(), request()}
     | {error, term()}.
 read_body_chunked(#{body_state := BS} = Req) ->
     case roadrunner_conn:consume_body_state(BS, next_chunk) of
@@ -319,14 +322,18 @@ content_type_kind(ContentType) ->
     | {error, term()}.
 dispatch_form(urlencoded, _ContentType, Req) ->
     case read_body(Req) of
-        {ok, Body, Req2} -> {ok, urlencoded, roadrunner_qs:parse(Body), Req2};
-        {error, _} = E -> E
+        {ok, Body, Req2} ->
+            %% Parser requires a flat binary; flatten only here, not at
+            %% every body read.
+            {ok, urlencoded, roadrunner_qs:parse(iolist_to_binary(Body)), Req2};
+        {error, _} = E ->
+            E
     end;
 dispatch_form(multipart, ContentType, Req) ->
     maybe
         {ok, Boundary} ?= roadrunner_multipart:boundary(ContentType),
         {ok, Body, Req2} ?= read_body(Req),
-        {ok, Parts} ?= roadrunner_multipart:parse(Body, Boundary),
+        {ok, Parts} ?= roadrunner_multipart:parse(iolist_to_binary(Body), Boundary),
         {ok, multipart, Parts, Req2}
     end;
 dispatch_form(unsupported, _ContentType, _Req) ->

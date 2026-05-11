@@ -89,10 +89,14 @@ response (`400`, `414`, `431`, etc.).
     %% manually-built request maps — consumers fall back to the raw
     %% `headers` list when missing.
     cached_decisions => cached_decisions(),
-    %% Body is set by `roadrunner_conn` before the handler is invoked. The parser
-    %% itself never populates this field — it leaves the buffered body in the
+    %% Body is set by `roadrunner_conn` before the handler is invoked. Auto
+    %% mode delivers the full body here as `iodata()` (an iolist of recv
+    %% chunks for multi-chunk bodies, a single binary otherwise) so the conn
+    %% can skip a flatten that many handlers do not need. Handlers that
+    %% require a flat binary call `iolist_to_binary/1` themselves. The parser
+    %% never populates this field; it leaves the buffered body in the
     %% `Rest` element of `parse_request/1` instead.
-    body => binary(),
+    body => iodata(),
     %% Bindings captured from `:param` segments by `roadrunner_router`, also set
     %% by `roadrunner_conn` before dispatch. Empty map when the dispatch is a
     %% single-handler one (no routing) or the route has no params.

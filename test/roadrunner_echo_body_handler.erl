@@ -16,7 +16,7 @@ handle(Req) ->
         {200,
             [
                 {~"content-type", ~"text/plain"},
-                {~"content-length", integer_to_binary(byte_size(Body))},
+                {~"content-length", integer_to_binary(iolist_size(Body))},
                 {~"connection", ~"close"}
             ],
             Body},

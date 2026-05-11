@@ -9,7 +9,8 @@ plaintext byte count of the request body. Two pattern-match
 clauses cover both buffering modes:
 
 - `body_buffering => auto` (default): the conn pre-buffers the body
-  into `#{body := Body}`; handler just reads the field.
+  into `#{body := Body}` as `iodata()`; handler reads the field and
+  uses `iolist_size/1` to count bytes without flattening.
 - `body_buffering => manual`: handler drains the body in 64 KB
   chunks via `roadrunner_req:read_body/2`, counting bytes per
   chunk without retaining them. Peak memory stays bounded even on
@@ -28,15 +29,15 @@ peak on the 20 MB upload validator.
 
 -spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
 handle(#{body := Body} = Req) ->
-    ack(byte_size(Body), Req);
+    ack(iolist_size(Body), Req);
 handle(Req) ->
     {Count, Req2} = drain(Req, 0),
     ack(Count, Req2).
 
 drain(Req, Acc) ->
     case roadrunner_req:read_body(Req, #{length => ?CHUNK_LIMIT}) of
-        {ok, Bytes, Req2} -> {Acc + byte_size(Bytes), Req2};
-        {more, Bytes, Req2} -> drain(Req2, Acc + byte_size(Bytes))
+        {ok, Bytes, Req2} -> {Acc + iolist_size(Bytes), Req2};
+        {more, Bytes, Req2} -> drain(Req2, Acc + iolist_size(Bytes))
     end.
 
 ack(Count, Req) ->

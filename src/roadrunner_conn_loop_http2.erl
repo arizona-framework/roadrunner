@@ -823,10 +823,9 @@ dispatch_stream(
     } = Streams,
     case content_length_matches(Headers, BodyLen) of
         true ->
-            %% iolist → binary once here; downstream code (worker
-            %% Req map, content-length comparator, etc.) all want
-            %% a flat binary.
-            Body = iolist_to_binary(BodyIolist),
+            %% Pass the iolist body straight through to the worker's
+            %% Req map. The body field is typed `iodata()`; handlers
+            %% that need a flat binary call `iolist_to_binary/1`.
             {RequestId, NewBuf} = roadrunner_conn:generate_request_id(
                 State#loop.req_id_buffer
             ),
@@ -836,7 +835,7 @@ dispatch_stream(
                 listener_name => ListenerName,
                 request_id => RequestId
             },
-            case roadrunner_http2_request:from_headers(Headers, Body, ConnInfo) of
+            case roadrunner_http2_request:from_headers(Headers, BodyIolist, ConnInfo) of
                 {ok, Req} ->
                     {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
                         self(), StreamId, Req, ProtoOpts
