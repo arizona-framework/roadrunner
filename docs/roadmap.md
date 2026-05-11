@@ -108,6 +108,75 @@ route h3 traffic to a new `roadrunner_conn_loop_http3` that adapts
 telemetry surface. Most of the protocol-heavy work is already done
 by the dep.
 
+## HttpArena coverage gaps
+
+The HttpArena Erlang submission (`frameworks/roadrunner/` in
+`MDA2AV/HttpArena`) covers 16 of HttpArena's 28 profiles: baseline,
+pipelined, limited-conn, json, json-comp, json-tls, upload,
+async-db, api-4, api-16, static, fortunes, crud, baseline-h2,
+echo-ws, echo-ws-pipeline. Validator passes 57/57 on those. The
+remaining 12 profiles need roadrunner-side features; listed in
+roughly the order a follow-up PR would tackle them.
+
+### `static` gzip-sibling serving — small (roadrunner-side)
+
+**What:** When `Accept-Encoding: gzip` is present and `<file>.gz`
+exists, serve the pre-compressed sibling with
+`Content-Encoding: gzip`. nginx's `gzip_static on`.
+
+**Why:** The HttpArena `static` fixture ships `.gz` siblings.
+Without sibling-serving, every static response either passes the
+raw bytes (uncompressed wire) or runs through the on-the-fly
+compress middleware (CPU per request). Sibling-serving sends the
+pre-encoded bytes verbatim. The validator marks this as SKIP today
+(compression is optional for correctness); the benchmark numbers
+would improve with it.
+
+**Scope:** small. One file existence check on the request path,
+swap the file plus add headers.
+
+### `static-h2` — covered by `{sendfile, _}` over h2 above
+
+### h2c (HTTP/2 cleartext) — small/medium (roadrunner-side)
+
+**What:** Accept HTTP/2 on a plaintext listener, either via
+prior-knowledge (client opens with the h2 connection preface
+directly on a dedicated port) or RFC 7540 §3.2 `Upgrade: h2c`.
+
+**Why deferred:** The current h2 path is gated by TLS ALPN
+negotiation in `roadrunner_listener`. h2c needs either a listener
+opt that forces every accepted connection through the h2 state
+machine without TLS, or first-byte sniffing for the HTTP/2 preface
+(`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) on a shared port.
+
+**HttpArena impact:** `baseline-h2c` and `json-h2c`.
+
+**Scope:** small for prior-knowledge on a dedicated listener,
+medium with preface sniffing.
+
+### HTTP/3 — see above
+
+Unlocks `baseline-h3` and `static-h3`.
+
+### gRPC — large (roadrunner-side)
+
+**What:** A gRPC layer on top of the h2 stack: `application/grpc`
+content-type dispatch, length-prefixed framing inside h2 DATA,
+`grpc-status` trailers, server-streaming generators, plus a
+codegen story (rebar3 plugin or grpcbox-style runtime descriptors).
+
+**HttpArena impact:** `unary-grpc`, `stream-grpc`, and their TLS
+variants.
+
+**Scope:** large. None of the bits are exotic, but there are a
+lot of them.
+
+### `gateway-64`, `gateway-h3`, `production-stack` — out of scope
+
+Reverse-proxy multi-container setups (nginx, caddy, or envoy in
+front of the framework). Bench-app docker-compose work, not a
+roadrunner gap.
+
 ## Other
 
 ### h2 receive-window defaults
