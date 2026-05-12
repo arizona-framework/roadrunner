@@ -75,7 +75,11 @@ response (`400`, `414`, `431`, etc.).
     %% malformed. `roadrunner_conn:body_framing/1` consumes this directly
     %% on the cached path, avoiding a `roadrunner_req:header/2` lookup
     %% (which lowercases the lookup name) plus a `binary_to_integer/1`.
-    content_length := none | {ok, non_neg_integer()} | {error, bad_content_length}
+    content_length := none | {ok, non_neg_integer()} | {error, bad_content_length},
+    %% True iff a `Host` header is present. Drives the RFC 7230 §5.4
+    %% missing-host rejection for HTTP/1.1 without a per-request
+    %% keymember walk.
+    has_host := boolean()
 }.
 -type request() :: #{
     method := binary(),
@@ -561,7 +565,8 @@ compute_cached_decisions(Headers) ->
         has_transfer_encoding => false,
         expects_continue => false,
         connection_lower => ~"",
-        content_length => none
+        content_length => none,
+        has_host => false
     }).
 
 -spec compute_cached_decisions_loop(headers(), cached_decisions()) -> cached_decisions().
@@ -588,6 +593,8 @@ compute_cached_decisions_loop([{~"connection", V} | Rest], Acc) ->
     );
 compute_cached_decisions_loop([{~"content-length", V} | Rest], Acc) ->
     compute_cached_decisions_loop(Rest, Acc#{content_length := parse_content_length(V)});
+compute_cached_decisions_loop([{~"host", _} | Rest], Acc) ->
+    compute_cached_decisions_loop(Rest, Acc#{has_host := true});
 compute_cached_decisions_loop([_ | Rest], Acc) ->
     compute_cached_decisions_loop(Rest, Acc).
 
@@ -632,13 +639,14 @@ parse_request(Bin) when is_binary(Bin) ->
     maybe
         {ok, Method, Target, Version, Rest} ?= parse_request_line(Bin),
         {ok, Headers, Rest2} ?= parse_headers(Rest),
-        ok ?= validate_host(Version, Headers),
+        Decisions = compute_cached_decisions(Headers),
+        ok ?= validate_host(Version, Decisions),
         Req = #{
             method => Method,
             target => Target,
             version => Version,
             headers => Headers,
-            cached_decisions => compute_cached_decisions(Headers)
+            cached_decisions => Decisions
         },
         {ok, Req, Rest2}
     end.
@@ -647,14 +655,10 @@ parse_request(Bin) when is_binary(Bin) ->
 %% header. Absence is a 400 Bad Request, also a request-smuggling
 %% mitigation when proxies forward to backends that disagree on the
 %% target host. HTTP/1.0 didn't require it.
--spec validate_host(version(), headers()) -> ok | {error, missing_host}.
-validate_host({1, 1}, Headers) ->
-    case lists:keymember(~"host", 1, Headers) of
-        true -> ok;
-        false -> {error, missing_host}
-    end;
-validate_host({1, 0}, _Headers) ->
-    ok.
+-spec validate_host(version(), cached_decisions()) -> ok | {error, missing_host}.
+validate_host({1, 1}, #{has_host := true}) -> ok;
+validate_host({1, 1}, #{has_host := false}) -> {error, missing_host};
+validate_host({1, 0}, _Decisions) -> ok.
 
 -doc """
 Parse a single chunk from a chunked transfer-encoded body.
