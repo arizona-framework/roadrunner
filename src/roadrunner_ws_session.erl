@@ -959,22 +959,21 @@ send_ws_frame(#data{socket = Socket, ctx = Ctx} = Data, Opcode, Payload) ->
     ok.
 
 %% Batched outbound frames from a handler `{reply, [...]}` return —
-%% emit telemetry per frame (so subscribers can count by opcode), then
-%% write all frames in a single TCP send to avoid partial-write
-%% fragmentation.
+%% emit telemetry per frame (so subscribers can count by opcode) and
+%% encode them in one walk, then write the whole batch in a single
+%% TCP send to avoid partial-write fragmentation.
 -spec send_ws_frames(#data{}, [{roadrunner_ws:opcode(), iodata()}]) ->
     ok | {error, term()}.
 send_ws_frames(#data{socket = Socket, ctx = Ctx} = Data, OutFrames) ->
-    lists:foreach(
-        fun({Op, Payload}) ->
-            ok = roadrunner_telemetry:ws_frame_out(
-                Ctx#{opcode => Op}, iolist_size(Payload)
-            )
-        end,
-        OutFrames
-    ),
-    Iodata = [encode_outbound(Data, Op, Payload) || {Op, Payload} <- OutFrames],
+    Iodata = encode_frames(Data, Ctx, OutFrames),
     roadrunner_transport:send(Socket, Iodata).
+
+-spec encode_frames(#data{}, map(), [{roadrunner_ws:opcode(), iodata()}]) -> iodata().
+encode_frames(_Data, _Ctx, []) ->
+    [];
+encode_frames(Data, Ctx, [{Op, Payload} | Rest]) ->
+    ok = roadrunner_telemetry:ws_frame_out(Ctx#{opcode => Op}, iolist_size(Payload)),
+    [encode_outbound(Data, Op, Payload) | encode_frames(Data, Ctx, Rest)].
 
 -spec encode_outbound(#data{}, roadrunner_ws:opcode(), iodata()) -> iodata().
 encode_outbound(#data{pmd_params = undefined}, Opcode, Payload) ->
