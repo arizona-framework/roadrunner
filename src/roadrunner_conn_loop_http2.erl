@@ -1015,8 +1015,10 @@ encode_and_send_headers(
 ) ->
     StatusBin = integer_to_binary(Status),
     %% Handler-supplied header names MUST already be lowercase per RFC 9113
-    %% §8.1.2 (see `roadrunner_handler:response/0`). h1 emits names verbatim;
-    %% h2 follows the same contract here, skipping a redundant pass.
+    %% §8.1.2 (see `roadrunner_handler:response/0`). Bytes outside the
+    %% RFC 9110 §5.5 field-value charset (CR/LF/NUL) crash here so the
+    %% h2 path matches h1's `encode_headers/1` discipline.
+    ok = validate_headers(Headers),
     AllHeaders = [{~":status", StatusBin} | Headers],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     %% `frame:encode` accepts iodata for the header block — skip
@@ -1047,7 +1049,10 @@ encode_and_send_response_atomic(
 ) ->
     #{StreamId := Stream} = Streams,
     StatusBin = integer_to_binary(Status),
-    %% Names already lowercase per `roadrunner_handler:response/0` contract.
+    %% Names already lowercase per `roadrunner_handler:response/0` contract;
+    %% reject CR/LF/NUL anywhere in the pair so they cannot reach the peer
+    %% or split at an h2->h1 reverse proxy.
+    ok = validate_headers(Headers),
     AllHeaders = [{~":status", StatusBin} | Headers],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     HFrame = roadrunner_http2_frame:encode(
@@ -1060,7 +1065,9 @@ encode_and_send_response_atomic(
     close_stream_send_side(State2, StreamId).
 
 encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
-    %% Trailer names already lowercase per `roadrunner_handler:response/0`.
+    %% Trailer names already lowercase per `roadrunner_handler:response/0`;
+    %% h1 trailers run the same check in `roadrunner_stream_response`.
+    ok = validate_headers(Trailers),
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(Trailers, Enc),
     Frame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04 bor 16#01, undefined, HpackBlock}
@@ -1068,6 +1075,20 @@ encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
     _ = send(State, Frame),
     State1 = State#loop{hpack_enc = Enc1},
     close_stream_send_side(State1, StreamId).
+
+%% RFC 9110 §5.5 / RFC 9113 §8.2.1: field values are VCHAR / SP /
+%% HTAB only; no CTLs. HPACK is length-framed so CR/LF cannot smuggle
+%% a new h2 frame, but malformed bytes still reach the peer (and any
+%% downstream h2->h1 reverse proxy where they would split). Crash
+%% hard so a handler echoing user input into a header turns into a
+%% 500, matching `roadrunner_http1:encode_headers/1`.
+-spec validate_headers([{binary(), binary()}]) -> ok.
+validate_headers([]) ->
+    ok;
+validate_headers([{Name, Value} | Rest]) ->
+    ok = roadrunner_http1:check_header_safe(Name, name),
+    ok = roadrunner_http1:check_header_safe(Value, value),
+    validate_headers(Rest).
 
 %% Mark the send side closed. Future worker writes on this stream
 %% get `{h2_stream_reset, _}` so they unwind cleanly.
