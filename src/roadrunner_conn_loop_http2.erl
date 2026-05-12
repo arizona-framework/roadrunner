@@ -1014,8 +1014,10 @@ encode_and_send_headers(
     #loop{hpack_enc = Enc} = State, StreamId, Status, Headers, EndStream
 ) ->
     StatusBin = integer_to_binary(Status),
-    LowerHeaders = [{roadrunner_bin:ascii_lowercase(N), V} || {N, V} <- Headers],
-    AllHeaders = [{~":status", StatusBin} | LowerHeaders],
+    %% Handler-supplied header names MUST already be lowercase per RFC 9113
+    %% §8.1.2 (see `roadrunner_handler:response/0`). h1 emits names verbatim;
+    %% h2 follows the same contract here, skipping a redundant pass.
+    AllHeaders = [{~":status", StatusBin} | Headers],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     %% `frame:encode` accepts iodata for the header block — skip
     %% the upfront flatten; ssl:send walks the iolist anyway.
@@ -1045,8 +1047,8 @@ encode_and_send_response_atomic(
 ) ->
     #{StreamId := Stream} = Streams,
     StatusBin = integer_to_binary(Status),
-    LowerHeaders = [{roadrunner_bin:ascii_lowercase(N), V} || {N, V} <- Headers],
-    AllHeaders = [{~":status", StatusBin} | LowerHeaders],
+    %% Names already lowercase per `roadrunner_handler:response/0` contract.
+    AllHeaders = [{~":status", StatusBin} | Headers],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     HFrame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04, undefined, HpackBlock}
@@ -1058,8 +1060,8 @@ encode_and_send_response_atomic(
     close_stream_send_side(State2, StreamId).
 
 encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
-    LowerTrailers = [{roadrunner_bin:ascii_lowercase(N), V} || {N, V} <- Trailers],
-    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(LowerTrailers, Enc),
+    %% Trailer names already lowercase per `roadrunner_handler:response/0`.
+    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(Trailers, Enc),
     Frame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04 bor 16#01, undefined, HpackBlock}
     ),

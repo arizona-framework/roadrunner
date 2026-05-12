@@ -63,6 +63,17 @@ handle(Req) ->
     Offset :: non_neg_integer(),
     Length :: non_neg_integer()
 }.
+
+-doc """
+Handler response shape returned alongside the (mutated) request map.
+
+Response header names MUST be ASCII lowercase. HTTP/2 requires this on the
+wire per RFC 9113 §8.1.2 (clients reject responses with uppercase names);
+the HTTP/1.1 path emits names verbatim, so the requirement is uniform
+across protocols. Framework helpers (`roadrunner_resp:*`,
+`roadrunner_compress`, the auto-injected `~"date"` header) all emit
+lowercase names; handler-supplied tuples must follow suit.
+""".
 -type response() ::
     {StatusCode :: roadrunner_req:status(), roadrunner_req:headers(), Body :: iodata()}
     | {stream, StatusCode :: roadrunner_req:status(), roadrunner_req:headers(), stream_fun()}
