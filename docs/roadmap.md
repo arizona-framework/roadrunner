@@ -6,47 +6,9 @@ rough effort estimate so you know what's on deck and what's
 
 ## HTTP/2 response-shape coverage
 
-Today, three of the five handler return shapes return `501 Not
+Today, one of the five handler return shapes still returns `501 Not
 Implemented` when served over HTTP/2 (`src/roadrunner_conn_loop_http2.erl`
-moduledoc has the matrix). All three are tracked here.
-
-### `{sendfile, _}` over h2 — small effort
-
-**What:** Allow a handler to return `{sendfile, Status, Headers,
-{File, Offset, Length}}` and have it work over h2.
-
-**Why deferred:** h2 has no kernel sendfile path — every byte must
-go through HPACK (for headers) and DATA framing. The implementation
-is a chunked-read-and-frame loop honoring per-stream and conn-level
-flow control. Doable; just lower priority than other items because
-the perf upside vs. a buffered response is smaller on h2 than on h1.
-
-**Scope:** small. Tests cover happy path, large file (>64 KB so
-multiple DATA frames), small initial window (flow-control split),
-file-open errors.
-
-### `{loop, _}` over h2 — medium effort
-
-**What:** Allow a handler to return `{loop, Status, Headers,
-State}` and run a long-lived handler with `handle_info/3` callbacks
-(SSE-style push) over h2.
-
-**Why deferred:** the h2 stream worker today does request → response
-→ exit. Implementing `{loop, _}` means teaching the worker to enter
-a selective-receive loop, dispatch process messages to
-`Handler:handle_info/3`, and emit DATA frames per push (with the
-conn process mediating socket writes for ordering + flow control).
-It also has to cooperate with peer `RST_STREAM` cancellation and h2
-flow-control windows. Not protocol-hard — just code we haven't
-written.
-
-**Workaround today:** `{stream, _}` works on both h1 and h2 and is
-a better cross-protocol primitive for most push workloads.
-
-**Scope:** medium. Tests cover happy path, server-initiated close,
-peer-initiated `RST_STREAM`, mid-loop flow-control bursts,
-`handle_info/3` returning `{ok, NewState}` / `{stop, _}` /
-`{reply, NewState}`.
+moduledoc has the matrix). It's tracked here.
 
 ### `{websocket, _, _}` over h2 — RFC 8441 Extended CONNECT — large effort
 
@@ -108,6 +70,64 @@ route h3 traffic to a new `roadrunner_conn_loop_http3` that adapts
 telemetry surface. Most of the protocol-heavy work is already done
 by the dep.
 
+## HttpArena coverage gaps
+
+The HttpArena Erlang submission (`frameworks/roadrunner/` in
+`MDA2AV/HttpArena`) covers 16 of HttpArena's 28 profiles: baseline,
+pipelined, limited-conn, json, json-comp, json-tls, upload,
+async-db, api-4, api-16, static, fortunes, crud, baseline-h2,
+echo-ws, echo-ws-pipeline. Validator passes 57/57 on those. The
+remaining 10 profiles need roadrunner-side features; listed in
+roughly the order a follow-up PR would tackle them. (`baseline-h2c`
+and `json-h2c` are reachable once the HttpArena SHA pin bumps and
+the bench app subscribes; the underlying h2c prior-knowledge
+support shipped in `roadrunner_listener`'s `h2c => enabled` opt.)
+
+### h2c Upgrade-mode on a shared port — medium (roadrunner-side)
+
+**What:** RFC 7540 §3.2 `Upgrade: h2c` negotiation: an HTTP/1.1
+request with `Upgrade: h2c, HTTP2-Settings: <base64>` headers,
+answered with `101 Switching Protocols`, after which the
+connection upstreams h2 frames. The same listener accepts h1 and
+h2c on the same port.
+
+**Why deferred:** The prior-knowledge variant (`h2c => enabled` on
+a dedicated plaintext listener) ships and covers the common case
+(benchmarks, internal clients with prior knowledge). Upgrade-mode
+adds preface sniffing or h1-parse-then-switch logic to the conn
+loop — a real expansion of the connection state machine that
+isn't on the critical path.
+
+**HttpArena impact:** none (its `baseline-h2c` / `json-h2c` profiles
+use prior-knowledge).
+
+**Scope:** medium. Decide on shared-port sniff vs h1-parse-Upgrade;
+implement the chosen path; tests for both successful upgrade and
+`Upgrade: h2c` rejection on TLS sockets (the spec forbids it).
+
+### HTTP/3 — see above
+
+Unlocks `baseline-h3` and `static-h3`.
+
+### gRPC — large (roadrunner-side)
+
+**What:** A gRPC layer on top of the h2 stack: `application/grpc`
+content-type dispatch, length-prefixed framing inside h2 DATA,
+`grpc-status` trailers, server-streaming generators, plus a
+codegen story (rebar3 plugin or grpcbox-style runtime descriptors).
+
+**HttpArena impact:** `unary-grpc`, `stream-grpc`, and their TLS
+variants.
+
+**Scope:** large. None of the bits are exotic, but there are a
+lot of them.
+
+### `gateway-64`, `gateway-h3`, `production-stack` — out of scope
+
+Reverse-proxy multi-container setups (nginx, caddy, or envoy in
+front of the framework). Bench-app docker-compose work, not a
+roadrunner gap.
+
 ## Other
 
 ### h2 receive-window defaults
@@ -136,6 +156,35 @@ workloads (server-side, large-POST upload patterns) before shipping.
 **Scope:** small (one-line default change + ~50 test sites that
 have to drain the new SETTINGS entry + early WINDOW_UPDATE in
 their handshake fixture).
+
+### Sendfile chunk size tracks the peer's negotiated MAX_FRAME_SIZE
+
+**What:** Today `?SENDFILE_CHUNK_SIZE` in
+`src/roadrunner_http2_stream_worker.erl` is pinned at 16384, the
+RFC 9113 §6.5.2 default for `SETTINGS_MAX_FRAME_SIZE`. Peers can
+advertise up to `16777215` in their SETTINGS frame; gun, h2o, and
+other clients routinely raise it. Reading the peer's actual
+negotiated value (already tracked at
+`roadrunner_http2_settings:settings.max_frame_size`,
+`src/roadrunner_http2_settings.erl:47`) and using it as the cap in
+`sendfile_loop/3` would let large sendfile responses ship fewer,
+larger DATA frames.
+
+**Why deferred:** Per-DATA-frame overhead is 9 bytes of header vs
+payloads typically thousands of bytes long, so the bandwidth win is
+sub-1%. Plumbing the peer's settings into the stream worker also
+isn't trivial: the worker is handed `(ConnPid, StreamId, ...)` at
+spawn time, not the conn's per-stream peer-settings view, so the
+handoff path needs a new field. No measured case yet where the
+framing overhead matters.
+
+**Scope:** small once measured. Add the peer `max_frame_size` to
+the stream worker's spawn args (or a fetch-on-demand call into the
+conn); replace `min(Remaining, ?SENDFILE_CHUNK_SIZE)` with
+`min(Remaining, PeerMaxFrameSize)` in `sendfile_loop/3`. One new
+test in `roadrunner_conn_loop_http2_tests` that advertises a higher
+`MAX_FRAME_SIZE` in the client SETTINGS and asserts the resulting
+DATA frames scale up accordingly.
 
 ### Investigate small-body POST RSS gap
 
@@ -168,6 +217,29 @@ needs full regeneration. Automating earns its keep once we're
 chasing a regression that needs frequent refresh.
 
 **Scope:** small.
+
+### Proper OTP citizenship in loop responses
+
+**What:** Both `roadrunner_loop_response:info_loop/4` (h1) and
+`roadrunner_http2_loop_response:info_loop/5` (h2) silently drop
+`{system, _, _}`, `{'$gen_call', _, _}`, and `{'$gen_cast', _}`
+messages. A more polite implementation would call
+`sys:handle_system_msg/6` on the system message, reply to gen-calls
+with `gen:reply(From, {error, not_supported})`, and so on.
+
+**Why deferred:** the conn (h1) and worker (h2) are plain
+`proc_lib`-spawned loops, not `gen_*` behaviours, so the only path
+for these shapes to reach them is misuse (`gen_server:call(ConnPid, _)`
+or `sys:get_state(ConnPid)`). The current contract is "those calls
+appear to hang; the caller should expect to time out", documented
+in the `roadrunner_loop_response` moduledoc. Proper handling would
+make these calls observable (e.g. `sys:get_state/1` would return the
+loop state), which has debugging value but no functional fix.
+
+**Scope:** small. New helper `roadrunner_loop_sys` exporting a
+single `handle/3` (sys message, From, ProcessState) used from both
+h1 and h2 info_loops. Tests covering sys/get_state, sys/replace_state,
+gen_call rejection, gen_cast no-op.
 
 ### h2 manual-mode body reading
 

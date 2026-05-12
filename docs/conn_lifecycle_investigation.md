@@ -236,12 +236,15 @@ A/B (3×5 s):
 Variance band on baseline was <1 % (11.67–11.77K), so the +15 % is
 unambiguously real.
 
-Same fix shape applies to `roadrunner_conn:read_body_until/3` (auto-
-mode body read) — same `<<Acc/binary, Data/binary>>` pattern.
-Tested but reverted: at the 4 KB body sizes our scenarios use, only
-~3 recv chunks per request, not enough to surface the O(N²) at
-bench scale. Kept as a known follow-up if a future scenario stresses
-larger auto-mode bodies.
+Same fix shape later applied to `roadrunner_conn:read_body_until/3`
+(auto-mode body read), same `<<Acc/binary, Data/binary>>` pattern.
+At 4 KB body sizes (~3 recv chunks per request) the O(N²) was
+invisible. The `httparena_upload_20mb_auto` scenario (20 MB body,
+~320 recv chunks per request) surfaced it unambiguously: eprof
+showed `read_body_until/3` at 49 % of CPU. Shipped the body-
+recursive iolist fix in `b507415` "Avoid quadratic binary concat
+in conn body buffer"; pre→post on that scenario: 381 → 430 r/s,
+peak RSS 3.4 GB → 1.95 GB, p99 44 → 31 ms.
 
 ### Null results (reverted)
 

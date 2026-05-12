@@ -86,6 +86,8 @@ declare -A PROTOS=(
   [compressed_request_body]="h1"
   [router_404_storm]="h1"
   [varied_paths_router]="h1"
+  [httparena_baseline]="h1"
+  [httparena_json]="h1"
 )
 
 # Stable iteration order — groups roughly by category for the
@@ -102,6 +104,7 @@ SCENARIOS=(
   slow_client accept_storm_burst partial_body_drop
   server_sent_events gzip_response backpressure_sustained
   websocket_msg_throughput
+  httparena_baseline httparena_json
   streaming_response multi_stream_h2 small_chunked_response
   tls_handshake_throughput
 )

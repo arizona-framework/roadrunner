@@ -58,10 +58,11 @@ value, and `method` set to `:method`. The `:authority`
 pseudo-header is forwarded as a `host` header so handlers that
 read it via `roadrunner_req:header/2` still work.
 
-`Body` is the concatenated DATA-frame payload bytes (or `<<>>`
-for header-only requests).
+`Body` is the iolist of accumulated DATA-frame payload chunks (or `<<>>`
+for header-only requests). Stored on the request map as `iodata()`;
+handlers requiring a flat binary call `iolist_to_binary/1` themselves.
 """.
--spec from_headers([roadrunner_http2_hpack:header()], binary(), conn_info()) ->
+-spec from_headers([roadrunner_http2_hpack:header()], iodata(), conn_info()) ->
     {ok, roadrunner_http1:request()} | {error, build_error()}.
 from_headers(Headers, Body, ConnInfo) ->
     maybe

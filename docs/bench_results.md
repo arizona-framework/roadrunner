@@ -1,5 +1,16 @@
 # Benchmark results
 
+> ⚠️ **Out of date.** The full matrix below is from 2026-05-05
+> (SHA `020b440`) and has NOT been re-run after the
+> `feat/http-arena` branch's perf rounds (concat fix, iodata body,
+> h2 lowercase contract). Several scenarios moved by 5-20 % on
+> roadrunner since this matrix was captured.
+>
+> For up-to-date side-by-side numbers on the representative
+> scenarios, see [`comparison.md`](comparison.md). Re-run the full
+> matrix locally with `./scripts/bench_matrix.sh` (~25-40 min) to
+> refresh this file end-to-end.
+
 Captured by `scripts/bench_matrix.sh` on 2026-05-05 at `020b440`.
 
 **Hardware / runtime**

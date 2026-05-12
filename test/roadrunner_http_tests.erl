@@ -33,3 +33,10 @@ http_date_now_format_matches_imf_fixdate_test() ->
             ~"Dec"
         ])
     ).
+
+format_http_date_pads_single_digits_test() ->
+    %% Pick a timestamp whose calendar fields all need two-digit padding
+    %% (1970-01-01 00:00:00 UTC = Posix 0) so the `pad2/1` single-digit
+    %% clause is exercised regardless of wall-clock at test run time.
+    Date = roadrunner_http:format_http_date(0),
+    ?assertEqual(~"Thu, 01 Jan 1970 00:00:00 GMT", Date).

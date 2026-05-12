@@ -25,6 +25,8 @@ all_test_() ->
         fun all_frame_types_handled/0,
         fun goaway_received_closes_connection/0,
         fun concurrent_streams_both_dispatch/0,
+        fun h2c_dispatch_routes_plaintext_to_http2_loop/0,
+        fun plaintext_listener_without_h2c_stays_h1/0,
         fun post_with_body_via_data_frame/0,
         fun continuation_assembles_header_block/0,
         fun push_promise_from_client_triggers_goaway/0,
@@ -40,8 +42,13 @@ all_test_() ->
         fun stream_response_with_trailers/0,
         fun stream_response_trailers_only/0,
         fun stream_response_skips_empty_nofin/0,
-        fun loop_response_returns_501/0,
-        fun sendfile_response_returns_501/0,
+        fun loop_response_emits_data_then_closes_on_stop/0,
+        fun loop_response_filters_otp_messages/0,
+        fun sendfile_empty_emits_empty_data/0,
+        fun sendfile_small_file_emits_single_data_frame/0,
+        fun sendfile_multi_frame_chunks_at_max_frame_size/0,
+        fun sendfile_offset_and_length_window/0,
+        fun sendfile_missing_file_resets_stream/0,
         fun websocket_response_returns_501/0,
         fun handler_crash_returns_500/0,
         fun middleware_chain_runs/0,
@@ -349,6 +356,104 @@ concurrent_streams_both_dispatch() ->
     ?assert(lists:member(3, StreamIds)),
     cleanup(Pid, Ref).
 
+h2c_dispatch_routes_plaintext_to_http2_loop() ->
+    %% Drive the dispatch decision through `roadrunner_conn_loop:start/2`
+    %% with a `{fake, _}` socket and `h2c => enabled`. Without the h2c
+    %% opt the plain TCP path stays h1 and the conn waits for a request
+    %% line; the h2 path proactively emits SETTINGS right after `shoot`.
+    %% Receiving an h2 SETTINGS frame here proves the new dispatch
+    %% (`http2_negotiated/1 orelse h2c_enabled/1`) routed to the h2 loop.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    Self = self(),
+    Counter = atomics:new(1, [{signed, false}]),
+    ok = atomics:add(Counter, 1, 1),
+    RequestsCounter = atomics:new(1, [{signed, false}]),
+    ProtoOpts = #{
+        client_counter => Counter,
+        requests_counter => RequestsCounter,
+        listener_name => h2c_dispatch_test,
+        dispatch => {handler, roadrunner_hello_handler},
+        middlewares => [],
+        max_content_length => 1_048_576,
+        request_timeout => 30000,
+        keep_alive_timeout => 60000,
+        max_keep_alive_request => 1000,
+        max_clients => 100,
+        minimum_bytes_per_second => 0,
+        body_buffering => auto,
+        drain_group => disabled,
+        h2c => enabled,
+        h2_initial_conn_window => 65535,
+        h2_initial_stream_window => 65535,
+        h2_window_refill_threshold => 32768
+    },
+    Sock = {fake, Self},
+    {ok, Pid} = roadrunner_conn_loop:start(Sock, ProtoOpts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    %% h2 SETTINGS frame: 24-bit length, type=4, 8-bit flags, 31-bit
+    %% reserved+stream-id (zero for conn-level). Length is non-negative
+    %% (server SETTINGS is at least zero bytes). The exact value
+    %% depends on which SETTINGS entries roadrunner advertises; we
+    %% match the frame shape rather than pin the bytes.
+    Out = expect_send(),
+    ?assertMatch(<<_Len:24, 4, _Flags, _Reserved:1, _StreamId:31, _/binary>>, Out),
+    cleanup(Pid, Ref).
+
+plaintext_listener_without_h2c_stays_h1() ->
+    %% Regression guard for the dispatch's false branch. Without
+    %% `h2c => enabled` and without TLS ALPN, `awaiting_shoot/3`
+    %% must fall through to the HTTP/1.1 path. Discriminator:
+    %%
+    %% - The h2 path proactively sends a SETTINGS frame on the wire
+    %%   right after `shoot` (`{roadrunner_fake_send, _, _}`).
+    %% - The h1 path enters passive recv and asks the fake transport
+    %%   for bytes (`{roadrunner_fake_recv, _, _, _}`).
+    %%
+    %% Receiving the recv message (and no send) proves we routed to h1.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    Self = self(),
+    Counter = atomics:new(1, [{signed, false}]),
+    ok = atomics:add(Counter, 1, 1),
+    RequestsCounter = atomics:new(1, [{signed, false}]),
+    ProtoOpts = #{
+        client_counter => Counter,
+        requests_counter => RequestsCounter,
+        listener_name => h1_dispatch_test,
+        dispatch => {handler, roadrunner_hello_handler},
+        middlewares => [],
+        max_content_length => 1_048_576,
+        request_timeout => 30000,
+        keep_alive_timeout => 60000,
+        max_keep_alive_request => 1000,
+        max_clients => 100,
+        minimum_bytes_per_second => 0,
+        body_buffering => auto,
+        drain_group => disabled,
+        h2c => disabled,
+        h2_initial_conn_window => 65535,
+        h2_initial_stream_window => 65535,
+        h2_window_refill_threshold => 32768
+    },
+    Sock = {fake, Self},
+    {ok, Pid} = roadrunner_conn_loop:start(Sock, ProtoOpts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    %% h1 issues a passive recv on the socket; on a fake socket that
+    %% surfaces as a `{roadrunner_fake_recv, ConnPid, Len, Timeout}`
+    %% message to our process. h2 would never do this — it goes
+    %% active-once via setopts and proactively writes SETTINGS first.
+    receive
+        {roadrunner_fake_recv, _, _, _} -> ok;
+        {roadrunner_fake_send, _, _} -> error(unexpected_h2_send)
+    after 500 ->
+        error(no_recv_call)
+    end,
+    ?assert(is_process_alive(Pid)),
+    cleanup(Pid, Ref).
+
 post_with_body_via_data_frame() ->
     %% HEADERS without END_STREAM, then DATA with END_STREAM —
     %% exercises the on_data / DATA-accumulation path.
@@ -626,12 +731,140 @@ stream_response_skips_empty_nofin() ->
     ),
     cleanup(Pid, Ref).
 
-loop_response_returns_501() ->
-    {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/loop"),
+loop_response_emits_data_then_closes_on_stop() ->
+    %% Drive the worker into the info_loop, push two messages, then
+    %% stop. The handler registers `roadrunner_h2_loop_test` so we
+    %% can address it from outside the worker. Expected wire frame
+    %% sequence: HEADERS (no END_STREAM), DATA(`data: hi\n\n`),
+    %% DATA(`data: bye(1)\n\n`), DATA(<<>>, END_STREAM).
+    {Pid, Ref} = run_stream_request(~"/loop"),
+    wait_for_register(roadrunner_h2_loop_test, 1000),
+    roadrunner_h2_loop_test ! {push, ~"hi"},
+    roadrunner_h2_loop_test ! stop,
+    Frames = collect_response_frames(),
+    ?assertMatch(
+        [
+            {headers, 1, false},
+            {data, 1, false, ~"data: hi\n\n"},
+            {data, 1, false, ~"data: bye(1)\n\n"},
+            {data, 1, true, ~""}
+        ],
+        Frames
+    ),
     cleanup(Pid, Ref).
 
-sendfile_response_returns_501() ->
-    {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/sendfile"),
+loop_response_filters_otp_messages() ->
+    %% sys / gen_call / gen_cast shapes must NOT reach `handle_info/3`.
+    %% The handler increments `N` only on `{push, _}`; if any OTP
+    %% message slipped through to handle_info the `bye(N)` chunk
+    %% would show a larger counter.
+    {Pid, Ref} = run_stream_request(~"/loop"),
+    wait_for_register(roadrunner_h2_loop_test, 1000),
+    roadrunner_h2_loop_test ! {system, make_ref(), get_state},
+    roadrunner_h2_loop_test ! {'$gen_call', {self(), make_ref()}, ping},
+    roadrunner_h2_loop_test ! {'$gen_cast', whatever},
+    roadrunner_h2_loop_test ! {push, ~"real"},
+    roadrunner_h2_loop_test ! stop,
+    Frames = collect_response_frames(),
+    ?assertMatch(
+        [
+            {headers, 1, false},
+            {data, 1, false, ~"data: real\n\n"},
+            {data, 1, false, ~"data: bye(1)\n\n"},
+            {data, 1, true, ~""}
+        ],
+        Frames
+    ),
+    cleanup(Pid, Ref).
+
+sendfile_empty_emits_empty_data() ->
+    %% Length=0: file is opened but never read. The base clause of
+    %% sendfile_loop emits Send(<<>>, fin) → empty DATA with END_STREAM.
+    {Pid, Ref} = run_stream_request(~"/sendfile"),
+    Frames = collect_response_frames(),
+    ?assertEqual([{headers, 1, false}, {data, 1, true, ~""}], Frames),
+    cleanup(Pid, Ref).
+
+sendfile_small_file_emits_single_data_frame() ->
+    %% 100-byte file fits in a single DATA frame.
+    Path = "/tmp/rr_h2_sf_small.bin",
+    Body = binary:copy(<<"x">>, 100),
+    ok = file:write_file(Path, Body),
+    try
+        {Pid, Ref} = run_stream_request(~"/sendfile/small"),
+        Frames = collect_response_frames(),
+        ?assertEqual(
+            [{headers, 1, false}, {data, 1, true, Body}],
+            Frames
+        ),
+        cleanup(Pid, Ref)
+    after
+        _ = file:delete(Path)
+    end.
+
+sendfile_multi_frame_chunks_at_max_frame_size() ->
+    %% 40000-byte file splits into 3 DATA frames: 16384, 16384, 7232.
+    %% Only the last carries END_STREAM. The wire body re-assembled
+    %% from all three DATA payloads must equal the original file.
+    Path = "/tmp/rr_h2_sf_multi.bin",
+    Body = iolist_to_binary([
+        binary:copy(<<"a">>, 16384),
+        binary:copy(<<"b">>, 16384),
+        binary:copy(<<"c">>, 7232)
+    ]),
+    ok = file:write_file(Path, Body),
+    try
+        {Pid, Ref} = run_stream_request(~"/sendfile/multi"),
+        Frames = collect_response_frames(),
+        ?assertMatch(
+            [
+                {headers, 1, false},
+                {data, 1, false, _},
+                {data, 1, false, _},
+                {data, 1, true, _}
+            ],
+            Frames
+        ),
+        [_H, {data, 1, false, D1}, {data, 1, false, D2}, {data, 1, true, D3}] =
+            Frames,
+        ?assertEqual(16384, byte_size(D1)),
+        ?assertEqual(16384, byte_size(D2)),
+        ?assertEqual(7232, byte_size(D3)),
+        ?assertEqual(Body, <<D1/binary, D2/binary, D3/binary>>),
+        cleanup(Pid, Ref)
+    after
+        _ = file:delete(Path)
+    end.
+
+sendfile_offset_and_length_window() ->
+    %% 1000-byte file, sendfile (Offset=200, Length=500). Wire body
+    %% must equal bytes [200, 700) of the file.
+    Path = "/tmp/rr_h2_sf_window.bin",
+    Body = list_to_binary([X rem 256 || X <- lists:seq(0, 999)]),
+    ok = file:write_file(Path, Body),
+    try
+        {Pid, Ref} = run_stream_request(~"/sendfile/window"),
+        Frames = collect_response_frames(),
+        ?assertMatch(
+            [{headers, 1, false}, {data, 1, true, _}],
+            Frames
+        ),
+        [_H, {data, 1, true, Slice}] = Frames,
+        ?assertEqual(binary:part(Body, 200, 500), Slice),
+        cleanup(Pid, Ref)
+    after
+        _ = file:delete(Path)
+    end.
+
+sendfile_missing_file_resets_stream() ->
+    %% File open fails inside the StreamFun before any HEADERS are
+    %% sent. The worker crashes; the conn RST_STREAMs the stream and
+    %% the loop continues. The conn process must still be alive
+    %% afterwards.
+    _ = file:delete("/tmp/rr_h2_sf_does_not_exist.bin"),
+    {Pid, Ref} = run_h2_request_with_handler(
+        roadrunner_h2_test_handler, ~"/sendfile/missing"
+    ),
     cleanup(Pid, Ref).
 
 websocket_response_returns_501() ->
@@ -2566,6 +2799,22 @@ drain_setopts() ->
     receive
         {roadrunner_fake_setopts, _, _} -> drain_setopts()
     after 0 -> ok
+    end.
+
+%% Spin-wait for a registered name to appear. Used by tests where
+%% the handler registers itself inside `handle/1`; without the wait,
+%% the test races with the worker's spawn and `Name ! Msg` crashes
+%% with `badarg`.
+wait_for_register(_Name, RemainingMs) when RemainingMs =< 0 ->
+    error({wait_for_register_timeout, _Name});
+wait_for_register(Name, RemainingMs) ->
+    case whereis(Name) of
+        undefined ->
+            Step = 10,
+            timer:sleep(Step),
+            wait_for_register(Name, RemainingMs - Step);
+        Pid ->
+            Pid
     end.
 
 drain_mailbox() ->

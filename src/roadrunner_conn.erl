@@ -97,6 +97,12 @@ read it anyway.
     %% SSE / WebSocket handlers depend on it. Short-lived h1
     %% workloads can opt out for ~10% lower per-conn overhead.
     drain_group => enabled | disabled,
+    %% RFC 7540 §3.4 prior-knowledge HTTP/2 cleartext. When `enabled`,
+    %% `roadrunner_conn_loop:awaiting_shoot/3` routes the connection
+    %% straight to the h2 conn loop without consulting TLS ALPN.
+    %% Plain TCP only: `roadrunner_listener` rejects the combo with
+    %% `tls` at `init/1`. Default `disabled`.
+    h2c => enabled | disabled,
     %% h2 receive-window tuning. See `roadrunner_listener:opts()` for
     %% prose. Defaults match the RFC 9113 baseline.
     h2_initial_conn_window => 1..16#7FFFFFFF,
@@ -327,7 +333,7 @@ resolve_handler({router, ListenerName}, Req) ->
     fun(() -> {ok, binary()} | {error, term()}),
     non_neg_integer()
 ) ->
-    {ok, Body :: binary(), Leftover :: binary()}
+    {ok, Body :: iodata(), Leftover :: binary()}
     | {error,
         content_length_too_large
         | bad_content_length
@@ -444,14 +450,46 @@ body_framing(Req) ->
     binary(),
     fun(() -> {ok, binary()} | {error, term()})
 ) ->
-    {ok, binary(), binary()} | {error, term()}.
-read_body_until(N, Acc, _RecvFun) when byte_size(Acc) >= N ->
-    <<Body:N/binary, Leftover/binary>> = Acc,
+    {ok, iodata(), binary()} | {error, term()}.
+read_body_until(N, Buffered, _RecvFun) when byte_size(Buffered) >= N ->
+    <<Body:N/binary, Leftover/binary>> = Buffered,
     {ok, Body, Leftover};
-read_body_until(N, Acc, RecvFun) ->
+read_body_until(N, Buffered, RecvFun) ->
+    %% Body recursion: each level reads one recv-chunk and prepends it
+    %% to the iolist returned from below on the way out. The auto-path
+    %% body field is `iodata()` so handlers that only need
+    %% `iolist_size/1` or want to forward the body via `gen_tcp:send/2`
+    %% never pay the flatten cost. Handlers requiring a flat binary
+    %% (e.g. pattern matching, `roadrunner_qs:parse/1`) call
+    %% `iolist_to_binary/1` themselves.
+    case read_body_until_io(N - byte_size(Buffered), RecvFun) of
+        {ok, MoreIo, Leftover} ->
+            {ok, [Buffered | MoreIo], Leftover};
+        {error, _} = E ->
+            E
+    end.
+
+-spec read_body_until_io(
+    non_neg_integer(),
+    fun(() -> {ok, binary()} | {error, term()})
+) ->
+    {ok, iolist(), binary()} | {error, term()}.
+read_body_until_io(N, RecvFun) ->
     case RecvFun() of
-        {ok, Data} -> read_body_until(N, <<Acc/binary, Data/binary>>, RecvFun);
-        {error, _} = E -> E
+        {ok, Data} ->
+            DataSz = byte_size(Data),
+            if
+                DataSz >= N ->
+                    <<Chunk:N/binary, Leftover/binary>> = Data,
+                    {ok, [Chunk], Leftover};
+                true ->
+                    case read_body_until_io(N - DataSz, RecvFun) of
+                        {ok, More, Leftover} -> {ok, [Data | More], Leftover};
+                        {error, _} = E -> E
+                    end
+            end;
+        {error, _} = E ->
+            E
     end.
 
 %% Read chunks until the size-0 last-chunk, concatenating decoded data
@@ -522,8 +560,8 @@ bytes — content-length framing only; chunked falls through to a
 full read).
 """.
 -spec consume_body_state(body_state(), all | next_chunk | {length, non_neg_integer()}) ->
-    {ok, binary(), body_state()}
-    | {more, binary(), body_state()}
+    {ok, iodata(), body_state()}
+    | {more, iodata(), body_state()}
     | {error, term()}.
 consume_body_state(#{framing := none} = BS, _Mode) ->
     %% Per RFC 9112 §6.3: no framing means the body is empty.
@@ -559,7 +597,7 @@ consume_body_state(
         false ->
             case fill_n(Want, Buf, Recv) of
                 {ok, Bytes, NewBuf} ->
-                    NewRead = Read + byte_size(Bytes),
+                    NewRead = Read + iolist_size(Bytes),
                     NewState = BS#{buffered := NewBuf, bytes_read := NewRead},
                     case NewRead >= N of
                         true -> {ok, Bytes, NewState};
@@ -571,34 +609,24 @@ consume_body_state(
     end;
 consume_body_state(#{framing := chunked} = BS, all) ->
     %% Drain everything left: any pending decoded bytes plus all
-    %% remaining chunks, accumulated in one return.
-    finalize_chunked(chunked_collect(BS, infinity));
+    %% remaining chunks, accumulated in one return. Iodata stays unflattened
+    %% so callers that only need `iolist_size/1` or want to forward via
+    %% `gen_tcp:send/2` skip a flatten.
+    chunked_collect(BS, infinity);
 consume_body_state(#{framing := chunked} = BS, {length, N}) ->
-    finalize_chunked(chunked_collect(BS, N));
+    chunked_collect(BS, N);
 consume_body_state(#{framing := chunked} = BS, next_chunk) ->
     next_chunk(BS).
 %% Non-chunked framing (none, content_length) is handled by the
 %% earlier clauses above — `next_chunk` is treated as a full drain
 %% inside those, since there are no chunk boundaries to honor.
 
--spec finalize_chunked(
-    {ok, iodata(), body_state()}
-    | {more, iodata(), body_state()}
-    | {error, term()}
-) ->
-    {ok, binary(), body_state()}
-    | {more, binary(), body_state()}
-    | {error, term()}.
-finalize_chunked({ok, Iodata, BS}) -> {ok, iolist_to_binary(Iodata), BS};
-finalize_chunked({more, Iodata, BS}) -> {more, iolist_to_binary(Iodata), BS};
-finalize_chunked({error, _} = E) -> E.
-
 %% Pull decoded chunked-body bytes out of `BS` until either `Want`
 %% bytes are collected or the body is fully drained. `Want` is either
 %% `infinity` (drain to end — caller asked for `all`) or a positive
 %% integer (caller asked for `{length, N}`). Returns
-%% `{ok | more, Bytes, BS2}` (Bytes as iodata so each frame conses
-%% in front on the way out — caller flattens) or `{error, Reason}`.
+%% `{ok | more, Bytes, BS2}` with Bytes as iodata (propagated through
+%% `consume_body_state` to the public API unflattened).
 -spec chunked_collect(body_state(), infinity | non_neg_integer()) ->
     {ok, iodata(), body_state()}
     | {more, iodata(), body_state()}
@@ -688,22 +716,20 @@ next_chunk(#{buffered := Buf, recv := Recv, max := Max, bytes_read := Read} = BS
     end.
 
 -spec fill_n(non_neg_integer(), binary(), fun(() -> {ok, binary()} | {error, term()})) ->
-    {ok, binary(), binary()} | {error, term()}.
+    {ok, iodata(), binary()} | {error, term()}.
 fill_n(N, Buf, _Recv) when byte_size(Buf) >= N ->
     <<Bytes:N/binary, Rest/binary>> = Buf,
     {ok, Bytes, Rest};
 fill_n(N, Buf, Recv) ->
     %% Body recursion that conses each recv chunk onto the iolist on
-    %% the way OUT. Avoids the original `<<Buf/binary, More/binary>>`
-    %% per-step concat (O(N²) total copy across all chunks); the
-    %% single `iolist_to_binary` at the bottom is O(N).
+    %% the way OUT. The iolist propagates through `consume_body_state`
+    %% to the caller unflattened so callers that only need
+    %% `iolist_size/1` (or want to forward via `gen_tcp:send/2`) avoid
+    %% an O(total-body) copy.
     Need = N - byte_size(Buf),
     case fill_iolist(Need, Recv) of
         {ok, Iolist, Leftover} ->
-            %% Iolist has Need bytes, Buf has byte_size(Buf), so
-            %% [Buf | Iolist] flattens to exactly N bytes.
-            Bytes = iolist_to_binary([Buf | Iolist]),
-            {ok, Bytes, Leftover};
+            {ok, [Buf | Iolist], Leftover};
         {error, _} = E ->
             E
     end.

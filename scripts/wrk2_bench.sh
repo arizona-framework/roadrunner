@@ -90,6 +90,7 @@ SCENARIOS_ALL=(
     compressed_request_body multi_request_body large_post_streaming
     cookies_heavy etag_304 large_keepalive_session
     gzip_response backpressure_sustained
+    httparena_baseline httparena_json
 )
 
 # Scenarios elli doesn't support (mirrors `preflight_scenario/1` in
@@ -100,6 +101,14 @@ ELLI_UNSUPPORTED=(
     head_method post_4kb_form chunked_request_body
     large_post_streaming cookies_heavy etag_304
     gzip_response backpressure_sustained
+    httparena_baseline httparena_json
+)
+
+# Scenarios cowboy doesn't run here either (roadrunner-only fixtures).
+# The matrix only emits roadrunner rows; cowboy is skipped via missing
+# PEAK entries below, but listing here makes the intent explicit.
+COWBOY_UNSUPPORTED=(
+    httparena_baseline httparena_json
 )
 
 # Lua scripts for non-GET scenarios. Run via Docker volume mount.
@@ -121,6 +130,7 @@ declare -A EXTRA_HEADERS=(
     [gzip_response]="Accept-Encoding: gzip"
     [etag_304]='If-None-Match: "v1"'
     [headers_heavy]="x-bench-1: 1|x-bench-2: 22|x-bench-3: 333|x-bench-4: 4444|x-bench-5: 55555|x-bench-6: 666666|x-bench-7: 7777777|x-bench-8: 88888888|x-bench-9: 999999999|x-bench-10: aaaaaaaaaa|x-bench-11: bbbbbbbbbbb|x-bench-12: cccccccccccc|x-bench-13: ddddddddddddd|x-bench-14: eeeeeeeeeeeeee|x-bench-15: fffffffffffffff|x-bench-16: gggggggggggggggg"
+    [httparena_json]="Accept: application/json"
 )
 
 # Per-(server, scenario) PEAK ESTIMATE in req/s. Pulled from
@@ -128,26 +138,32 @@ declare -A EXTRA_HEADERS=(
 # 75%, 95% of these. Estimates can drift with code changes; the
 # achieved-rate column makes the gap visible.
 declare -A PEAK=(
-    [roadrunner.hello]=254000           [cowboy.hello]=181000           [elli.hello]=272000
-    [roadrunner.json]=255000            [cowboy.json]=178000            [elli.json]=270000
-    [roadrunner.echo]=225000            [cowboy.echo]=146000            [elli.echo]=269000
-    [roadrunner.headers_heavy]=210000   [cowboy.headers_heavy]=125000   [elli.headers_heavy]=240000
-    [roadrunner.large_response]=103000  [cowboy.large_response]=90000   [elli.large_response]=114000
+    [roadrunner.hello]=285000           [cowboy.hello]=196000           [elli.hello]=289000
+    [roadrunner.json]=292000            [cowboy.json]=182000            [elli.json]=301000
+    [roadrunner.echo]=270000            [cowboy.echo]=148000            [elli.echo]=281000
+    [roadrunner.headers_heavy]=267000   [cowboy.headers_heavy]=134000   [elli.headers_heavy]=241000
+    [roadrunner.large_response]=124000  [cowboy.large_response]=94000   [elli.large_response]=125000
     [roadrunner.url_with_qs]=247000     [cowboy.url_with_qs]=167000
     [roadrunner.path_with_unicode]=235000 [cowboy.path_with_unicode]=167000
     [roadrunner.cors_preflight]=242000  [cowboy.cors_preflight]=162000
     [roadrunner.redirect_response]=258000 [cowboy.redirect_response]=176000
     [roadrunner.head_method]=251000     [cowboy.head_method]=176000
-    [roadrunner.post_4kb_form]=122000   [cowboy.post_4kb_form]=92000
-    [roadrunner.chunked_request_body]=210000 [cowboy.chunked_request_body]=129000
-    [roadrunner.compressed_request_body]=233000 [cowboy.compressed_request_body]=149000 [elli.compressed_request_body]=278000
-    [roadrunner.multi_request_body]=225000 [cowboy.multi_request_body]=111000 [elli.multi_request_body]=245000
-    [roadrunner.large_post_streaming]=15000 [cowboy.large_post_streaming]=6600
-    [roadrunner.cookies_heavy]=234000   [cowboy.cookies_heavy]=160000
+    [roadrunner.post_4kb_form]=193000   [cowboy.post_4kb_form]=92500
+    [roadrunner.chunked_request_body]=266000 [cowboy.chunked_request_body]=137000
+    [roadrunner.compressed_request_body]=289000 [cowboy.compressed_request_body]=154000 [elli.compressed_request_body]=298000
+    [roadrunner.multi_request_body]=257000 [cowboy.multi_request_body]=121000 [elli.multi_request_body]=272000
+    [roadrunner.large_post_streaming]=18900 [cowboy.large_post_streaming]=6800
+    [roadrunner.cookies_heavy]=287000   [cowboy.cookies_heavy]=163000
     [roadrunner.etag_304]=234000        [cowboy.etag_304]=169000
     [roadrunner.large_keepalive_session]=227000 [cowboy.large_keepalive_session]=175000 [elli.large_keepalive_session]=279000
-    [roadrunner.gzip_response]=105000   [cowboy.gzip_response]=96000
+    [roadrunner.gzip_response]=136000   [cowboy.gzip_response]=108000
     [roadrunner.backpressure_sustained]=249000 [cowboy.backpressure_sustained]=182000
+    # roadrunner-only HttpArena-shape scenarios. The upload scenarios
+    # are intentionally absent: at 50 concurrent 20 MB POSTs they
+    # don't fit the matrix's memory budget; profile them via
+    # bench.escript at 8 clients (see `docs/bench_internals.md`).
+    [roadrunner.httparena_baseline]=275000
+    [roadrunner.httparena_json]=81000
 )
 
 # ---------------------------------------------------------------------------

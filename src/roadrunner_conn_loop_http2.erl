@@ -2,6 +2,12 @@
 -moduledoc """
 HTTP/2 (RFC 9113) connection process.
 
+Driven by either TLS ALPN-negotiated `h2` or a plaintext listener
+configured with `h2c => enabled` (RFC 7540 §3.4 prior-knowledge).
+The dispatch decision lives in `roadrunner_conn_loop:awaiting_shoot/3`;
+this module is transport-agnostic and reads frames via
+`roadrunner_transport:recv/3` either way.
+
 Phase H8b — true multiplexing with per-stream workers. The conn
 process owns:
 
@@ -41,8 +47,8 @@ Response shapes supported:
 |---|---|
 | `{Status, Headers, Body}` (buffered) | yes |
 | `{stream, _, _, Fun}` | yes |
-| `{loop, _}` | 501 |
-| `{sendfile, _}` | 501 |
+| `{loop, _}` | yes (worker enters handle_info loop) |
+| `{sendfile, _}` | yes (chunked DATA via the stream-response engine) |
 | `{websocket, _, _}` | 501 (Phase H13) |
 """.
 
@@ -817,10 +823,9 @@ dispatch_stream(
     } = Streams,
     case content_length_matches(Headers, BodyLen) of
         true ->
-            %% iolist → binary once here; downstream code (worker
-            %% Req map, content-length comparator, etc.) all want
-            %% a flat binary.
-            Body = iolist_to_binary(BodyIolist),
+            %% Pass the iolist body straight through to the worker's
+            %% Req map. The body field is typed `iodata()`; handlers
+            %% that need a flat binary call `iolist_to_binary/1`.
             {RequestId, NewBuf} = roadrunner_conn:generate_request_id(
                 State#loop.req_id_buffer
             ),
@@ -830,7 +835,7 @@ dispatch_stream(
                 listener_name => ListenerName,
                 request_id => RequestId
             },
-            case roadrunner_http2_request:from_headers(Headers, Body, ConnInfo) of
+            case roadrunner_http2_request:from_headers(Headers, BodyIolist, ConnInfo) of
                 {ok, Req} ->
                     {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
                         self(), StreamId, Req, ProtoOpts
@@ -1009,8 +1014,10 @@ encode_and_send_headers(
     #loop{hpack_enc = Enc} = State, StreamId, Status, Headers, EndStream
 ) ->
     StatusBin = integer_to_binary(Status),
-    LowerHeaders = [{roadrunner_bin:ascii_lowercase(N), V} || {N, V} <- Headers],
-    AllHeaders = [{~":status", StatusBin} | LowerHeaders],
+    %% Handler-supplied header names MUST already be lowercase per RFC 9113
+    %% §8.1.2 (see `roadrunner_handler:response/0`). h1 emits names verbatim;
+    %% h2 follows the same contract here, skipping a redundant pass.
+    AllHeaders = [{~":status", StatusBin} | Headers],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     %% `frame:encode` accepts iodata for the header block — skip
     %% the upfront flatten; ssl:send walks the iolist anyway.
@@ -1040,8 +1047,8 @@ encode_and_send_response_atomic(
 ) ->
     #{StreamId := Stream} = Streams,
     StatusBin = integer_to_binary(Status),
-    LowerHeaders = [{roadrunner_bin:ascii_lowercase(N), V} || {N, V} <- Headers],
-    AllHeaders = [{~":status", StatusBin} | LowerHeaders],
+    %% Names already lowercase per `roadrunner_handler:response/0` contract.
+    AllHeaders = [{~":status", StatusBin} | Headers],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     HFrame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04, undefined, HpackBlock}
@@ -1053,8 +1060,8 @@ encode_and_send_response_atomic(
     close_stream_send_side(State2, StreamId).
 
 encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
-    LowerTrailers = [{roadrunner_bin:ascii_lowercase(N), V} || {N, V} <- Trailers],
-    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(LowerTrailers, Enc),
+    %% Trailer names already lowercase per `roadrunner_handler:response/0`.
+    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(Trailers, Enc),
     Frame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04 bor 16#01, undefined, HpackBlock}
     ),

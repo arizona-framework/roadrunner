@@ -49,16 +49,16 @@ inside variance and shouldn't be read as a win.
 
 | scenario                  | roadrunner    | elli          | cowboy        |
 |---------------------------|--------------:|--------------:|--------------:|
-| `hello`                   |       298 k   |       278 k   |       179 k   |
-| `json`                    |       264 k   |       269 k   |       163 k   |
-| `echo`                    |       256 k   |       251 k   |       133 k   |
-| `large_response`          |       104 k   |       111 k   |        85 k   |
-| `headers_heavy`           |       235 k   |       211 k   |       118 k   |
-| `cookies_heavy`           |   **247 k**   |          —    |       154 k   |
-| `pipelined_h1`            |   **501 k**   |       4.9 k   |       329 k   |
-| `varied_paths_router`     |   **257 k**   |          —    |       149 k   |
-| `gzip_response`           |   **127 k**   |          —    |       100 k   |
-| `websocket_msg_throughput`|   **199 k**   |          —    |       155 k   |
+| `hello`                   |       285 k   |       289 k   |       196 k   |
+| `json`                    |       292 k   |       301 k   |       182 k   |
+| `echo`                    |       270 k   |       281 k   |       148 k   |
+| `large_response`          |       124 k   |       125 k   |        94 k   |
+| `headers_heavy`           |       267 k   |       241 k   |       134 k   |
+| `cookies_heavy`           |   **287 k**   |          —    |       163 k   |
+| `pipelined_h1`            |   **526 k**   |       4.9 k   |       357 k   |
+| `varied_paths_router`     |   **294 k**   |          —    |       170 k   |
+| `gzip_response`           |   **136 k**   |          —    |       108 k   |
+| `websocket_msg_throughput`|   **230 k**   |          —    |       167 k   |
 
 `—` means the elli test fixture doesn't support that scenario shape
 (no h2, no WebSocket, no gzip middleware, no router, no native qs
@@ -69,12 +69,12 @@ needs any of these, elli isn't on the table.
 
 | scenario                   | roadrunner    | cowboy        |
 |----------------------------|--------------:|--------------:|
-| `hello`                    |       162 k   |       157 k   |
-| `json`                     |       159 k   |       141 k   |
-| `echo`                     |   **151 k**   |       104 k   |
-| `headers_heavy`            |   **148 k**   |        84 k   |
-| `multi_stream_h2`          |       334 k   |       307 k   |
-| `tls_handshake_throughput` |       2.5 k   |     **3.0 k** |
+| `hello`                    |       178 k   |       169 k   |
+| `json`                     |       170 k   |       151 k   |
+| `echo`                     |   **163 k**   |       118 k   |
+| `headers_heavy`            |   **162 k**   |        89 k   |
+| `multi_stream_h2`          |       351 k   |       331 k   |
+| `tls_handshake_throughput` |       2.7 k   |     **3.2 k** |
 
 Multi-stream and basic-req h2 line up with the h1 picture — large
 wins on bigger headers/bodies, smaller wins on the simple paths.
@@ -87,12 +87,12 @@ honestly in
 p50 / p99 numbers per scenario × server are in the full results
 file. Spot-checks from the same run:
 
-| scenario               | rr p50 / p99    | elli p50 / p99   | cowboy p50 / p99 |
-|------------------------|----------------:|-----------------:|-----------------:|
-| `hello`                | 117 µs / 1.45 ms| 124 µs / 1.69 ms | 211 µs / 2.36 ms |
-| `echo`                 | 139 µs / 1.51 ms| 138 µs / 1.77 ms | 301 µs / 2.65 ms |
-| `cookies_heavy`        | 142 µs / 1.67 ms|         —        | 251 µs / 2.52 ms |
-| `pipelined_h1`         |  83 µs / 0.57 ms| 10.3 ms / 10.6 ms| 129 µs / 0.84 ms |
+| scenario               |     rr p50 / p99 |        elli p50 / p99 | cowboy p50 / p99 |
+|------------------------|-----------------:|----------------------:|-----------------:|
+| `hello`                | 119 µs / 1.65 ms |      117 µs / 1.53 ms | 196 µs / 1.87 ms |
+| `echo`                 | 126 µs / 1.77 ms |      119 µs / 1.70 ms | 261 µs / 2.75 ms |
+| `cookies_heavy`        | 120 µs / 1.56 ms |           —           | 235 µs / 2.62 ms |
+| `pipelined_h1`         |  74 µs / 0.71 ms |   10.35 ms / 10.67 ms | 117 µs / 0.82 ms |
 
 ## Open-loop tail latency (wrk2)
 

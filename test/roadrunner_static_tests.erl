@@ -324,6 +324,77 @@ static_test_() ->
                 %% `type = directory` — non-regular → 404.
                 Reply = http_get(Port, ~"/static/subdir_link"),
                 ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
+            end},
+            {"Accept-Encoding gzip serves .gz sibling with Content-Encoding", fun() ->
+                Reply = http_get_with(
+                    Port,
+                    ~"/static/compressible.css",
+                    [{~"Accept-Encoding", ~"gzip"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-encoding: gzip", [caseless]),
+                {match, _} = re:run(Reply, ~"vary: Accept-Encoding", [caseless]),
+                %% Content-Type still reflects the original file's extension.
+                {match, _} = re:run(Reply, ~"content-type: text/css", [caseless]),
+                %% Body is the exact bytes of `<file>.gz` on disk.
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                Expected = zlib:gzip(
+                    <<"body { background: white; padding: 1em; }">>
+                ),
+                ?assertEqual(Expected, Body)
+            end},
+            {"Accept-Encoding gzip with no .gz sibling falls back to plain", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/main.css", [{~"Accept-Encoding", ~"gzip"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                nomatch = re:run(Reply, ~"content-encoding:", [caseless]),
+                {match, _} = re:run(Reply, ~"color: red")
+            end},
+            {"no Accept-Encoding serves plain file even when .gz exists", fun() ->
+                Reply = http_get(Port, ~"/static/compressible.css"),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                nomatch = re:run(Reply, ~"content-encoding:", [caseless]),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(
+                    <<"body { background: white; padding: 1em; }">>, Body
+                )
+            end},
+            {"Range header disables gzip-sibling and serves raw bytes", fun() ->
+                Reply = http_get_with(
+                    Port,
+                    ~"/static/compressible.css",
+                    [
+                        {~"Accept-Encoding", ~"gzip"},
+                        {~"Range", ~"bytes=0-3"}
+                    ]
+                ),
+                ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply),
+                nomatch = re:run(Reply, ~"content-encoding:", [caseless]),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(~"body", Body)
+            end},
+            {"If-None-Match from a gzip-served response still 304s", fun() ->
+                %% ETag is the original file's, so cache validation
+                %% works regardless of which variant the client first
+                %% received.
+                Reply = http_get_with(
+                    Port,
+                    ~"/static/compressible.css",
+                    [{~"Accept-Encoding", ~"gzip"}]
+                ),
+                {match, [_, ETag]} = re:run(
+                    Reply, ~"etag: (\"[^\"]+\")", [caseless, {capture, all, binary}]
+                ),
+                Reply2 = http_get_with(
+                    Port,
+                    ~"/static/compressible.css",
+                    [
+                        {~"Accept-Encoding", ~"gzip"},
+                        {~"If-None-Match", ETag}
+                    ]
+                ),
+                ?assertMatch(<<"HTTP/1.1 304 ", _/binary>>, Reply2)
             end}
         ]
     end}.
@@ -396,6 +467,13 @@ setup() ->
     ok = file:write_file(filename:join(Dir, "hello.html"), <<"<h1>Hello</h1>">>),
     ok = file:write_file(filename:join(Dir, "main.css"), <<"body { color: red; }">>),
     ok = file:write_file(filename:join(Dir, "blob.bin"), <<1, 2, 3, 4>>),
+    %% Gzip-sibling fixtures: a CSS file alongside its pre-compressed
+    %% sibling. The .gz body intentionally differs from a fresh
+    %% `zlib:gzip/1` of the original (different mtime/level) so tests
+    %% that read the served bytes verify which file was opened.
+    GzOriginal = <<"body { background: white; padding: 1em; }">>,
+    ok = file:write_file(filename:join(Dir, "compressible.css"), GzOriginal),
+    ok = file:write_file(filename:join(Dir, "compressible.css.gz"), zlib:gzip(GzOriginal)),
     ok = file:write_file(filename:join(Dir, "empty.txt"), <<>>),
     ok = file:write_file(filename:join(Dir, "notes.txt"), ~"hello via link"),
     %% Safe in-docroot symlink (relative target, no `..`).
