@@ -253,3 +253,142 @@ serialize_with_all_attrs_test() ->
         Expected,
         iolist_to_binary(roadrunner_cookie:serialize(~"sid", ~"abc", Opts))
     ).
+
+%% --- serialize/3 input validation ---
+
+serialize_rejects_empty_name_test() ->
+    ?assertError(
+        {invalid_cookie_name, ~""},
+        roadrunner_cookie:serialize(~"", ~"abc", #{})
+    ).
+
+serialize_rejects_separator_in_name_test() ->
+    %% `;` is a token separator per RFC 7230 §3.2.6 — must not appear in
+    %% a cookie-name or it would smuggle a new pair on the wire.
+    ?assertError(
+        {invalid_cookie_name, ~"foo;bar"},
+        roadrunner_cookie:serialize(~"foo;bar", ~"abc", #{})
+    ).
+
+serialize_rejects_equals_in_name_test() ->
+    ?assertError(
+        {invalid_cookie_name, ~"foo=bar"},
+        roadrunner_cookie:serialize(~"foo=bar", ~"abc", #{})
+    ).
+
+serialize_rejects_space_in_name_test() ->
+    ?assertError(
+        {invalid_cookie_name, ~"foo bar"},
+        roadrunner_cookie:serialize(~"foo bar", ~"abc", #{})
+    ).
+
+serialize_rejects_crlf_in_name_test() ->
+    ?assertError(
+        {invalid_cookie_name, ~"foo\r\nbar"},
+        roadrunner_cookie:serialize(~"foo\r\nbar", ~"abc", #{})
+    ).
+
+serialize_rejects_semicolon_in_value_test() ->
+    %% Cookie-smuggling: `abc; admin=1` would surface as a phantom
+    %% attribute on the client. Reject at the encoder.
+    ?assertError(
+        {invalid_cookie_value, ~"abc; admin=1"},
+        roadrunner_cookie:serialize(~"sid", ~"abc; admin=1", #{})
+    ).
+
+serialize_rejects_comma_in_value_test() ->
+    ?assertError(
+        {invalid_cookie_value, ~"a,b"},
+        roadrunner_cookie:serialize(~"sid", ~"a,b", #{})
+    ).
+
+serialize_rejects_dquote_in_value_test() ->
+    ?assertError(
+        {invalid_cookie_value, ~"a\"b"},
+        roadrunner_cookie:serialize(~"sid", ~"a\"b", #{})
+    ).
+
+serialize_rejects_backslash_in_value_test() ->
+    ?assertError(
+        {invalid_cookie_value, ~"a\\b"},
+        roadrunner_cookie:serialize(~"sid", ~"a\\b", #{})
+    ).
+
+serialize_rejects_crlf_in_value_test() ->
+    ?assertError(
+        {invalid_cookie_value, ~"a\r\nb"},
+        roadrunner_cookie:serialize(~"sid", ~"a\r\nb", #{})
+    ).
+
+serialize_rejects_nul_in_value_test() ->
+    ?assertError(
+        {invalid_cookie_value, <<"a", 0, "b">>},
+        roadrunner_cookie:serialize(~"sid", <<"a", 0, "b">>, #{})
+    ).
+
+serialize_accepts_empty_value_test() ->
+    %% RFC 6265 §4.1.1: cookie-value = *cookie-octet, so empty is legal.
+    ?assertEqual(
+        ~"sid=",
+        iolist_to_binary(roadrunner_cookie:serialize(~"sid", ~"", #{}))
+    ).
+
+serialize_rejects_semicolon_in_domain_test() ->
+    ?assertError(
+        {invalid_cookie_attr, domain, ~"ex;ample.com"},
+        roadrunner_cookie:serialize(~"sid", ~"abc", #{domain => ~"ex;ample.com"})
+    ).
+
+serialize_rejects_space_in_domain_test() ->
+    ?assertError(
+        {invalid_cookie_attr, domain, ~"example .com"},
+        roadrunner_cookie:serialize(~"sid", ~"abc", #{domain => ~"example .com"})
+    ).
+
+serialize_rejects_crlf_in_domain_test() ->
+    ?assertError(
+        {invalid_cookie_attr, domain, ~"example.com\r\nX-Evil: 1"},
+        roadrunner_cookie:serialize(~"sid", ~"abc", #{
+            domain => ~"example.com\r\nX-Evil: 1"
+        })
+    ).
+
+serialize_rejects_semicolon_in_path_test() ->
+    ?assertError(
+        {invalid_cookie_attr, path, ~"/a;b"},
+        roadrunner_cookie:serialize(~"sid", ~"abc", #{path => ~"/a;b"})
+    ).
+
+serialize_rejects_crlf_in_path_test() ->
+    ?assertError(
+        {invalid_cookie_attr, path, ~"/a\r\nb"},
+        roadrunner_cookie:serialize(~"sid", ~"abc", #{path => ~"/a\r\nb"})
+    ).
+
+serialize_rejects_crlf_in_expires_test() ->
+    ?assertError(
+        {invalid_cookie_attr, expires, ~"Wed\r\nX-Evil: 1"},
+        roadrunner_cookie:serialize(~"sid", ~"abc", #{expires => ~"Wed\r\nX-Evil: 1"})
+    ).
+
+serialize_rejects_semicolon_in_expires_test() ->
+    ?assertError(
+        {invalid_cookie_attr, expires, ~"Wed; admin=1"},
+        roadrunner_cookie:serialize(~"sid", ~"abc", #{expires => ~"Wed; admin=1"})
+    ).
+
+serialize_accepts_token_punctuation_in_name_test() ->
+    %% Token punctuation (RFC 7230 §3.2.6): `!#$%&'*+-.^_`|~`. Pin so an
+    %% over-eager validator doesn't reject legal cookie names.
+    ?assertEqual(
+        ~"_a.b-c=v",
+        iolist_to_binary(roadrunner_cookie:serialize(~"_a.b-c", ~"v", #{}))
+    ).
+
+serialize_accepts_alnum_in_name_test() ->
+    %% RFC 7230 §3.2.6 token covers ALPHA and DIGIT; exercise both
+    %% uppercase and digit branches of the validator.
+    ?assertEqual(
+        ~"Foo42=v",
+        iolist_to_binary(roadrunner_cookie:serialize(~"Foo42", ~"v", #{}))
+    ).
