@@ -87,12 +87,12 @@ honestly in
 p50 / p99 numbers per scenario × server are in the full results
 file. Spot-checks from the same run:
 
-| scenario               | rr p50 / p99    | elli p50 / p99   | cowboy p50 / p99 |
-|------------------------|----------------:|-----------------:|-----------------:|
-| `hello`                | 119 µs / 1.65 ms| 117 µs / 1.53 ms | 196 µs / 1.87 ms |
-| `echo`                 | 126 µs / 1.77 ms| 119 µs / 1.70 ms | 261 µs / 2.75 ms |
-| `cookies_heavy`        | 120 µs / 1.56 ms|         —        | 235 µs / 2.62 ms |
-| `pipelined_h1`         |  74 µs / 0.71 ms| 10.35 ms / 10.67 ms| 117 µs / 0.82 ms |
+| scenario               |     rr p50 / p99 |        elli p50 / p99 | cowboy p50 / p99 |
+|------------------------|-----------------:|----------------------:|-----------------:|
+| `hello`                | 119 µs / 1.65 ms |      117 µs / 1.53 ms | 196 µs / 1.87 ms |
+| `echo`                 | 126 µs / 1.77 ms |      119 µs / 1.70 ms | 261 µs / 2.75 ms |
+| `cookies_heavy`        | 120 µs / 1.56 ms |           —           | 235 µs / 2.62 ms |
+| `pipelined_h1`         |  74 µs / 0.71 ms |   10.35 ms / 10.67 ms | 117 µs / 0.82 ms |
 
 ## Open-loop tail latency (wrk2)
 
