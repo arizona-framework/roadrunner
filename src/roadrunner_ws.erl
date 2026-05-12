@@ -166,17 +166,19 @@ build_handshake_headers(Accept, {permessage_deflate, _, ResponseValue}) ->
 validate_upgrade(Headers) ->
     %% RFC 9110 §7.8 — upgrade tokens are case-insensitive. Browsers
     %% send `websocket` (lowercase) but other clients may send
-    %% `WebSocket` or `WEBSOCKET`; accept any case.
-    case is_websocket_upgrade(header_lookup(~"upgrade", Headers)) of
+    %% `WebSocket` or `WEBSOCKET`; accept any case. One pass over
+    %% Headers extracts all four handshake-relevant values; the
+    %% dispatch below is map lookups, not list walks.
+    {Upgrade, Connection, Version, Key} = collect_upgrade_headers(Headers),
+    case is_websocket_upgrade(Upgrade) of
         true ->
-            case has_upgrade_token(header_lookup(~"connection", Headers)) of
+            case has_upgrade_token(Connection) of
                 true ->
-                    case validate_version(header_lookup(~"sec-websocket-version", Headers)) of
+                    case validate_version(Version) of
+                        ok when Key =:= undefined ->
+                            {error, missing_websocket_key};
                         ok ->
-                            case header_lookup(~"sec-websocket-key", Headers) of
-                                undefined -> {error, missing_websocket_key};
-                                Key -> {ok, Key}
-                            end;
+                            {ok, Key};
                         {error, _} = VErr ->
                             VErr
                     end;
@@ -186,6 +188,28 @@ validate_upgrade(Headers) ->
         false ->
             {error, missing_websocket_upgrade}
     end.
+
+%% Single-pass extraction. Missing headers come back as `undefined`,
+%% matching `header_lookup/2`'s contract so the validators above stay
+%% untouched.
+-spec collect_upgrade_headers(roadrunner_req:headers()) ->
+    {binary() | undefined, binary() | undefined, binary() | undefined, binary() | undefined}.
+collect_upgrade_headers([]) ->
+    {undefined, undefined, undefined, undefined};
+collect_upgrade_headers([{~"upgrade", V} | Rest]) ->
+    {_, C, Ver, K} = collect_upgrade_headers(Rest),
+    {V, C, Ver, K};
+collect_upgrade_headers([{~"connection", V} | Rest]) ->
+    {U, _, Ver, K} = collect_upgrade_headers(Rest),
+    {U, V, Ver, K};
+collect_upgrade_headers([{~"sec-websocket-version", V} | Rest]) ->
+    {U, C, _, K} = collect_upgrade_headers(Rest),
+    {U, C, V, K};
+collect_upgrade_headers([{~"sec-websocket-key", V} | Rest]) ->
+    {U, C, Ver, _} = collect_upgrade_headers(Rest),
+    {U, C, Ver, V};
+collect_upgrade_headers([_ | Rest]) ->
+    collect_upgrade_headers(Rest).
 
 %% RFC 6455 §4.1 / §4.2.2: server MUST accept only `Sec-WebSocket-
 %% Version: 13`. Other versions (or missing) → 400. Older drafts

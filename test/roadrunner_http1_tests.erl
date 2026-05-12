@@ -483,7 +483,8 @@ request_full_test() ->
                     has_transfer_encoding => false,
                     expects_continue => false,
                     connection_lower => ~"",
-                    content_length => none
+                    content_length => none,
+                    has_host => true
                 }
             },
             ~"body"},
@@ -514,7 +515,8 @@ request_http10_no_host_accepted_test() ->
                     has_transfer_encoding => false,
                     expects_continue => false,
                     connection_lower => ~"",
-                    content_length => none
+                    content_length => none,
+                    has_host => false
                 }
             },
             ~""},
@@ -537,7 +539,8 @@ cached_decisions_empty_for_empty_headers_test() ->
             has_transfer_encoding => false,
             expects_continue => false,
             connection_lower => ~"",
-            content_length => none
+            content_length => none,
+            has_host => false
         },
         roadrunner_http1:compute_cached_decisions([])
     ).
@@ -625,15 +628,18 @@ cached_decisions_connection_lowercased_test() ->
     ).
 
 cached_decisions_ignores_unrelated_headers_test() ->
-    %% Only the cached case-insensitive headers feed the cache;
-    %% unrelated headers (Host, Content-Type, etc.) leave defaults intact.
+    %% Only cached headers feed the cache; everything else
+    %% (Content-Type, X-*, etc.) leaves defaults intact. `Host` is
+    %% cached too — flips `has_host` — so it stays in the input here
+    %% and the assertion expects `has_host => true`.
     ?assertEqual(
         #{
             is_chunked => false,
             has_transfer_encoding => false,
             expects_continue => false,
             connection_lower => ~"",
-            content_length => none
+            content_length => none,
+            has_host => true
         },
         roadrunner_http1:compute_cached_decisions([
             {~"host", ~"x"}, {~"content-type", ~"text/plain"}

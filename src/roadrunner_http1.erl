@@ -75,7 +75,11 @@ response (`400`, `414`, `431`, etc.).
     %% malformed. `roadrunner_conn:body_framing/1` consumes this directly
     %% on the cached path, avoiding a `roadrunner_req:header/2` lookup
     %% (which lowercases the lookup name) plus a `binary_to_integer/1`.
-    content_length := none | {ok, non_neg_integer()} | {error, bad_content_length}
+    content_length := none | {ok, non_neg_integer()} | {error, bad_content_length},
+    %% True iff a `Host` header is present. Drives the RFC 7230 §5.4
+    %% missing-host rejection for HTTP/1.1 without a per-request
+    %% keymember walk.
+    has_host := boolean()
 }.
 -type request() :: #{
     method := binary(),
@@ -512,17 +516,30 @@ parse_headers_loop(Bin, Count, Consumed, LfCp, ColonCp) ->
 %% Reject the two classic smuggling shapes:
 %% 1. Transfer-Encoding present alongside any Content-Length.
 %% 2. Multiple Content-Length headers with differing values.
+%% One pass over the header list collects the TE-present flag and every
+%% Content-Length value; `decide_framing/2` then drives the verdict from
+%% those two summaries.
 -spec check_framing(headers()) -> ok | error.
 check_framing(Headers) ->
-    HasTE = lists:keymember(~"transfer-encoding", 1, Headers),
-    Cls = [V || {N, V} <- Headers, N =:= ~"content-length"],
-    check_framing(HasTE, Cls).
+    scan_framing(Headers, false, []).
 
--spec check_framing(boolean(), [binary()]) -> ok | error.
-check_framing(true, []) -> ok;
-check_framing(false, []) -> ok;
-check_framing(false, [V | Rest]) -> check_cls_consistent(V, Rest);
-check_framing(true, [_ | _]) -> error.
+-spec scan_framing(headers(), boolean(), [binary()]) -> ok | error.
+scan_framing([], HasTE, Cls) ->
+    decide_framing(HasTE, Cls);
+scan_framing([{~"transfer-encoding", _} | Rest], _HasTE, Cls) ->
+    scan_framing(Rest, true, Cls);
+scan_framing([{~"content-length", V} | Rest], HasTE, Cls) ->
+    scan_framing(Rest, HasTE, [V | Cls]);
+scan_framing([_ | Rest], HasTE, Cls) ->
+    scan_framing(Rest, HasTE, Cls).
+
+%% `Cls` order is irrelevant — `check_cls_consistent/2` does a pairwise
+%% pivot-vs-rest compare, so the reversed-by-cons accumulator is fine.
+-spec decide_framing(boolean(), [binary()]) -> ok | error.
+decide_framing(true, []) -> ok;
+decide_framing(false, []) -> ok;
+decide_framing(false, [V | Rest]) -> check_cls_consistent(V, Rest);
+decide_framing(true, [_ | _]) -> error.
 
 -spec check_cls_consistent(binary(), [binary()]) -> ok | error.
 check_cls_consistent(_, []) -> ok;
@@ -548,7 +565,8 @@ compute_cached_decisions(Headers) ->
         has_transfer_encoding => false,
         expects_continue => false,
         connection_lower => ~"",
-        content_length => none
+        content_length => none,
+        has_host => false
     }).
 
 -spec compute_cached_decisions_loop(headers(), cached_decisions()) -> cached_decisions().
@@ -575,6 +593,8 @@ compute_cached_decisions_loop([{~"connection", V} | Rest], Acc) ->
     );
 compute_cached_decisions_loop([{~"content-length", V} | Rest], Acc) ->
     compute_cached_decisions_loop(Rest, Acc#{content_length := parse_content_length(V)});
+compute_cached_decisions_loop([{~"host", _} | Rest], Acc) ->
+    compute_cached_decisions_loop(Rest, Acc#{has_host := true});
 compute_cached_decisions_loop([_ | Rest], Acc) ->
     compute_cached_decisions_loop(Rest, Acc).
 
@@ -619,13 +639,14 @@ parse_request(Bin) when is_binary(Bin) ->
     maybe
         {ok, Method, Target, Version, Rest} ?= parse_request_line(Bin),
         {ok, Headers, Rest2} ?= parse_headers(Rest),
-        ok ?= validate_host(Version, Headers),
+        Decisions = compute_cached_decisions(Headers),
+        ok ?= validate_host(Version, Decisions),
         Req = #{
             method => Method,
             target => Target,
             version => Version,
             headers => Headers,
-            cached_decisions => compute_cached_decisions(Headers)
+            cached_decisions => Decisions
         },
         {ok, Req, Rest2}
     end.
@@ -634,14 +655,10 @@ parse_request(Bin) when is_binary(Bin) ->
 %% header. Absence is a 400 Bad Request, also a request-smuggling
 %% mitigation when proxies forward to backends that disagree on the
 %% target host. HTTP/1.0 didn't require it.
--spec validate_host(version(), headers()) -> ok | {error, missing_host}.
-validate_host({1, 1}, Headers) ->
-    case lists:keymember(~"host", 1, Headers) of
-        true -> ok;
-        false -> {error, missing_host}
-    end;
-validate_host({1, 0}, _Headers) ->
-    ok.
+-spec validate_host(version(), cached_decisions()) -> ok | {error, missing_host}.
+validate_host({1, 1}, #{has_host := true}) -> ok;
+validate_host({1, 1}, #{has_host := false}) -> {error, missing_host};
+validate_host({1, 0}, _Decisions) -> ok.
 
 -doc """
 Parse a single chunk from a chunked transfer-encoded body.

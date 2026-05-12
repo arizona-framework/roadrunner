@@ -254,6 +254,22 @@ the only mode on h2.
 
 **Scope:** small-medium when needed. No present caller is blocked.
 
+### Strict grammars for Set-Cookie attributes
+
+**What:** `roadrunner_cookie:serialize/3` validates the cookie
+`Name` and `Value` against RFC 6265 §4.1.1 (and rejects header-injection
+bytes in `Domain`, `Path`, `Expires`), but it does not enforce the full
+attribute grammars — e.g. `Domain` is not checked against RFC 1035 §3.5
+hostname rules, `Expires` is not parsed as IMF-fixdate, `Path` accepts
+any non-CTL non-`;` byte (RFC 6265 §4.1.1 allows that, but stricter
+checks could catch caller bugs earlier).
+
+**Why deferred:** the present check covers the header-injection /
+attribute-smuggling surface (the cowlib CVE-2026-43969 class). Strict
+grammar enforcement is callers-write-bugs ergonomics, not security.
+
+**Scope:** small per attribute. Add when a real caller hits the gap.
+
 ## Out of scope
 
 These are deliberately out of scope, not "deferred":
