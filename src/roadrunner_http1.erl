@@ -512,17 +512,30 @@ parse_headers_loop(Bin, Count, Consumed, LfCp, ColonCp) ->
 %% Reject the two classic smuggling shapes:
 %% 1. Transfer-Encoding present alongside any Content-Length.
 %% 2. Multiple Content-Length headers with differing values.
+%% One pass over the header list collects the TE-present flag and every
+%% Content-Length value; `decide_framing/2` then drives the verdict from
+%% those two summaries.
 -spec check_framing(headers()) -> ok | error.
 check_framing(Headers) ->
-    HasTE = lists:keymember(~"transfer-encoding", 1, Headers),
-    Cls = [V || {N, V} <- Headers, N =:= ~"content-length"],
-    check_framing(HasTE, Cls).
+    scan_framing(Headers, false, []).
 
--spec check_framing(boolean(), [binary()]) -> ok | error.
-check_framing(true, []) -> ok;
-check_framing(false, []) -> ok;
-check_framing(false, [V | Rest]) -> check_cls_consistent(V, Rest);
-check_framing(true, [_ | _]) -> error.
+-spec scan_framing(headers(), boolean(), [binary()]) -> ok | error.
+scan_framing([], HasTE, Cls) ->
+    decide_framing(HasTE, Cls);
+scan_framing([{~"transfer-encoding", _} | Rest], _HasTE, Cls) ->
+    scan_framing(Rest, true, Cls);
+scan_framing([{~"content-length", V} | Rest], HasTE, Cls) ->
+    scan_framing(Rest, HasTE, [V | Cls]);
+scan_framing([_ | Rest], HasTE, Cls) ->
+    scan_framing(Rest, HasTE, Cls).
+
+%% `Cls` order is irrelevant — `check_cls_consistent/2` does a pairwise
+%% pivot-vs-rest compare, so the reversed-by-cons accumulator is fine.
+-spec decide_framing(boolean(), [binary()]) -> ok | error.
+decide_framing(true, []) -> ok;
+decide_framing(false, []) -> ok;
+decide_framing(false, [V | Rest]) -> check_cls_consistent(V, Rest);
+decide_framing(true, [_ | _]) -> error.
 
 -spec check_cls_consistent(binary(), [binary()]) -> ok | error.
 check_cls_consistent(_, []) -> ok;
