@@ -1,26 +1,6 @@
-# Roadrunner Makefile
-#
-# The whole reason this Makefile exists: rebar3 on OTP 29 RC3 fails
-# the TLS handshake to hex.pm on `/packages/<name>` paths because
-# Fastly's edge rejects OTP 29's TLS 1.3 client fingerprint there.
-# Without a workaround, every `rebar3 compile` / `rebar3 precommit`
-# /  `rebar3 ex_doc` that needs to refresh the hex registry fails to
-# load `rebar3_hank`, `rebar3_hex`, and `rebar3_ex_doc` plugins.
-#
-# The fix is an `ssl.config` (under `config/rebar3_ssl.config`) that
-# pins TLS 1.2 + disables `middlebox_comp_mode`, loaded into the
-# rebar3 BEAM via `ERL_FLAGS`. Setting it as a Makefile variable
-# means contributors don't have to remember it on every invocation.
-#
-# **Drop this file (or at least the ERL_FLAGS bit) once OTP 29 RC4
-# lands** — the Fastly-side fix is in that release.
+# Roadrunner Makefile — thin wrapper over the common rebar3 targets.
 
 SHELL := /bin/bash
-
-# Loaded into the rebar3 BEAM only — the project's own ssl listeners
-# pass their opts verbatim and aren't affected.
-ERL_FLAGS := -config $(CURDIR)/config/rebar3_ssl
-export ERL_FLAGS
 
 .PHONY: all help compile test precommit doc fmt fmt-check \
 	xref hank dialyzer eunit ct cover \

@@ -31,7 +31,7 @@ response (`400`, `414`, `431`, etc.).
 -define(MAX_CHUNK_HEADER, 8192).
 
 %% `binary:match/2` accepts a pre-compiled pattern (`binary:cp()`), and
-%% the compile cost is non-trivial. Microbench (OTP 29-rc3, single-byte
+%% the compile cost is non-trivial. Microbench (OTP 29.0, single-byte
 %% LF in a 56-byte header block, 200k iterations):
 %%   raw `<<$\n>>`         : 32 ms
 %%   compiled              : 16 ms  (50% faster)

@@ -18,9 +18,9 @@ throughout, and predictable per-connection lifecycle observability.
 
 ## ⚠️ Requirements
 
-Roadrunner requires **OTP 29** (currently RC at the time of writing).
-Older OTPs won't compile, and the throughput numbers in the
-[performance section](#performance-at-a-glance) assume 29.
+Roadrunner requires **OTP 29**. Older OTPs won't compile, and the
+throughput numbers in the [performance section](#performance-at-a-glance)
+assume 29.
 
 ## 🚧 Status
 

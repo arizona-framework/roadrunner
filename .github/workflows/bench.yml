@@ -92,11 +92,6 @@ jobs:
       # bench fixtures live under `_build/test/lib/`). On a cache hit
       # this is a fast no-op.
       - name: Compile test profile
-        env:
-          # OTP 29 RC3 + Fastly TLS workaround. Same rationale as in
-          # erlang.yml — pin TLS 1.2 + middlebox_comp_mode off for the
-          # rebar3 BEAM only. Drop after OTP 29 RC4.
-          ERL_FLAGS: "-config ${{ github.workspace }}/config/rebar3_ssl"
         run: rebar3 as test compile
 
       # Inputs threaded through env, not direct template substitution,
