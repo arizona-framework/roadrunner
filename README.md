@@ -196,7 +196,7 @@ roadrunner:start_listener(my_listener, #{port => 8080, routes => hello_handler})
   (PQ-hybrid `x25519mlkem768` first when the OpenSSL build supports it),
   `early_data` disabled.
 - DoS bounds — `max_clients`, `max_content_length`,
-  `minimum_bytes_per_second`, `request_timeout`, `keep_alive_timeout`,
+  `min_bytes_per_second`, `request_timeout`, `keep_alive_timeout`,
   `max_keep_alive_requests`.
 
 ### Observability

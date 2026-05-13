@@ -128,7 +128,7 @@ request_rejected_event_fires_on_bad_request_line_test() ->
             max_clients => 10,
             client_counter => atomics:new(1, [{signed, false}]),
             requests_counter => atomics:new(1, [{signed, false}]),
-            minimum_bytes_per_second => 0,
+            min_bytes_per_second => 0,
             body_buffering => auto,
             listener_name => probe_listener_rej
         },

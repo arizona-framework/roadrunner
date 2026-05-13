@@ -381,7 +381,7 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
         keep_alive_timeout => 60000,
         max_keep_alive_requests => 1000,
         max_clients => 100,
-        minimum_bytes_per_second => 0,
+        min_bytes_per_second => 0,
         body_buffering => auto,
         graceful_drain => false,
         protocols => [http2],
@@ -430,7 +430,7 @@ plaintext_listener_without_h2c_stays_h1() ->
         keep_alive_timeout => 60000,
         max_keep_alive_requests => 1000,
         max_clients => 100,
-        minimum_bytes_per_second => 0,
+        min_bytes_per_second => 0,
         body_buffering => auto,
         graceful_drain => false,
         protocols => [http1]

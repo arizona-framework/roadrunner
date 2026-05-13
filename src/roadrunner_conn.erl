@@ -13,7 +13,7 @@ directly from `roadrunner_req` (manual body buffering) and from
 Per-connection behavior — keep-alive (capped by
 `max_keep_alive_requests`, idle-bound by `keep_alive_timeout`),
 `Expect: 100-continue`, HEAD body suppression, anti-Slowloris rate
-check (`minimum_bytes_per_second`), the five handler return shapes
+check (`min_bytes_per_second`), the five handler return shapes
 (`{Status, Headers, Body}`, `{stream, ...}`, `{loop, ...}`,
 `{sendfile, ...}`, `{websocket, ...}`) — lives in `roadrunner_conn_loop`
 and the response-shape-specific modules (`roadrunner_stream_response`,
@@ -87,7 +87,7 @@ read it anyway.
     max_clients := pos_integer(),
     client_counter := atomics:atomics_ref(),
     requests_counter := atomics:atomics_ref(),
-    minimum_bytes_per_second := non_neg_integer(),
+    min_bytes_per_second := non_neg_integer(),
     body_buffering := auto | manual,
     listener_name => atom(),
     %% When `false`, conns skip the per-process `pg:join` into

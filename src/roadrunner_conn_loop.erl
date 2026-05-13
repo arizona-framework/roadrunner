@@ -96,7 +96,7 @@ response shapes (buffered, `{stream, ...}`, `{loop, ...}`,
     max_content_length = 0 :: non_neg_integer(),
     max_keep_alive_requests = 1 :: pos_integer(),
     %% Anti-slowloris on the request-read phase. `min_rate` is cached
-    %% from `proto_opts.minimum_bytes_per_second` at `shoot`. When > 0,
+    %% from `proto_opts.min_bytes_per_second` at `shoot`. When > 0,
     %% `recv_passive/2` tracks bytes received since `recv_phase_start`
     %% and closes the conn if the running average drops below
     %% `min_rate` after a 1 s grace (matches `roadrunner_conn:rate_ok/3`).
@@ -165,7 +165,7 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
                         middlewares = maps:get(middlewares, ProtoOpts),
                         max_content_length = maps:get(max_content_length, ProtoOpts),
                         max_keep_alive_requests = maps:get(max_keep_alive_requests, ProtoOpts),
-                        min_rate = maps:get(minimum_bytes_per_second, ProtoOpts)
+                        min_rate = maps:get(min_bytes_per_second, ProtoOpts)
                     },
                     read_request_phase(S)
             end;
@@ -501,7 +501,7 @@ read_body_phase(
     Req,
     Deadline
 ) ->
-    MinRate = maps:get(minimum_bytes_per_second, ProtoOpts),
+    MinRate = maps:get(min_bytes_per_second, ProtoOpts),
     Recv = roadrunner_conn:make_recv(Socket, Deadline, MinRate),
     Buffered = S#loop_state.buffered,
     case maps:get(body_buffering, ProtoOpts) of

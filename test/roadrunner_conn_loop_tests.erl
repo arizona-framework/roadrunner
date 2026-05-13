@@ -288,7 +288,7 @@ slowloris_during_passive_recv_drops_client_test() ->
         end
     end),
     Opts = (fake_opts(slow_passive))#{
-        minimum_bytes_per_second => 1000000
+        min_bytes_per_second => 1000000
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -324,7 +324,7 @@ slowloris_during_active_mode_recv_drops_client_test() ->
     end),
     Opts = (fake_opts(slow_active))#{
         hibernate_after => 5000,
-        minimum_bytes_per_second => 1000000
+        min_bytes_per_second => 1000000
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -1174,7 +1174,7 @@ fake_opts(ListenerName) ->
         max_clients => 10,
         client_counter => atomics:new(1, [{signed, false}]),
         requests_counter => atomics:new(1, [{signed, false}]),
-        minimum_bytes_per_second => 0,
+        min_bytes_per_second => 0,
         body_buffering => auto,
         listener_name => ListenerName
     }.

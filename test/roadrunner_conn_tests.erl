@@ -1706,14 +1706,14 @@ conn_manual_body_buffering_chunked_reads_test_() ->
             end}
         end}.
 
-conn_minimum_bytes_per_second_drops_slow_client_test_() ->
+conn_min_bytes_per_second_drops_slow_client_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_slow, #{
                 port => 0,
                 routes => roadrunner_keepalive_handler,
                 %% Require 1 MB/s — any trickle below that after grace closes.
-                minimum_bytes_per_second => 1000000,
+                min_bytes_per_second => 1000000,
                 request_timeout => 5000
             }),
             roadrunner_listener:port(conn_test_slow)

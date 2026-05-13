@@ -47,11 +47,11 @@ All duration and interval values in `opts()` are in milliseconds —
     num_acceptors => pos_integer(),
     max_keep_alive_requests => pos_integer(),
     max_clients => pos_integer(),
-    minimum_bytes_per_second => non_neg_integer(),
-    %% How often (ms) `reading_request` re-checks the running
-    %% bytes-per-second average against `minimum_bytes_per_second`.
-    %% Default 1000ms — matches the 1-second grace period of the
-    %% rate check itself. Tests use shorter intervals (20–30ms) to
+    min_bytes_per_second => non_neg_integer(),
+    %% How often `reading_request` re-checks the running
+    %% bytes-per-second average against `min_bytes_per_second`.
+    %% Default `1000` — matches the 1-second grace period of the
+    %% rate check itself. Tests use shorter intervals (20–30) to
     %% exercise rate-check fires deterministically without
     %% second-scale waits; ops can tune for chattier observability.
     rate_check_interval => pos_integer(),
@@ -412,8 +412,8 @@ build_proto_opts(Opts, ListenerName) ->
             max_clients => maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
             client_counter => ClientCounter,
             requests_counter => RequestsCounter,
-            minimum_bytes_per_second =>
-                maps:get(minimum_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
+            min_bytes_per_second =>
+                maps:get(min_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
             body_buffering => maps:get(body_buffering, Opts, auto),
             listener_name => ListenerName,
             graceful_drain => maps:get(graceful_drain, Opts, true),

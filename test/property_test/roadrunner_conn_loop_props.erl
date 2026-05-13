@@ -182,7 +182,7 @@ proto_opts(ListenerName, Counter) ->
         max_clients => 1000,
         client_counter => Counter,
         requests_counter => atomics:new(1, [{signed, false}]),
-        minimum_bytes_per_second => 0,
+        min_bytes_per_second => 0,
         body_buffering => auto,
         listener_name => ListenerName
     }.
