@@ -102,7 +102,7 @@ listener_opts(CertDir) ->
             {keyfile, CertDir ++ "/key.pem"},
             {alpn_preferred_protocols, [~"h2", ~"http/1.1"]}
         ],
-        handler => roadrunner_hello_handler,
+        routes => roadrunner_hello_handler,
         keep_alive_timeout => 60000,
         max_clients => 100000,
         max_keep_alive_requests => 1000000

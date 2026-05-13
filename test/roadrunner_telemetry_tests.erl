@@ -414,7 +414,7 @@ setup_listener() ->
     {ok, _} = application:ensure_all_started(telemetry),
     Name = telemetry_test_listener,
     {ok, _} = roadrunner_listener:start_link(Name, #{
-        port => 0, handler => roadrunner_hello_handler
+        port => 0, routes => roadrunner_hello_handler
     }),
     {Name, roadrunner_listener:port(Name)}.
 
@@ -422,7 +422,7 @@ setup_crashing_listener() ->
     {ok, _} = application:ensure_all_started(telemetry),
     Name = telemetry_test_crashing,
     {ok, _} = roadrunner_listener:start_link(Name, #{
-        port => 0, handler => roadrunner_crashing_handler
+        port => 0, routes => roadrunner_crashing_handler
     }),
     {Name, roadrunner_listener:port(Name)}.
 

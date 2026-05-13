@@ -1391,11 +1391,11 @@ print_listener_config(Pairs) ->
 %% Per-scenario server config — same routes/handlers in shape across
 %% all three servers so the comparison stays apples-to-apples.
 scenario_roadrunner_opts(hello, BaseOpts) ->
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(headers_heavy, BaseOpts) ->
     %% Same handler as `hello` — the difference is request-side
     %% headers, server work is identical.
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(echo, BaseOpts) ->
     BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
 scenario_roadrunner_opts(large_response, BaseOpts) ->
@@ -1407,20 +1407,20 @@ scenario_roadrunner_opts(streaming_response, BaseOpts) ->
 scenario_roadrunner_opts(multi_stream_h2, BaseOpts) ->
     %% Same handler as `hello` — the differentiator is the bench
     %% client driving N streams in flight per conn.
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(pipelined_h1, BaseOpts) ->
     %% Same handler as `hello` — pipelining is a wire-level
     %% client behavior; the server sees N requests in one buffer.
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(slow_client, BaseOpts) ->
     %% Same handler as `hello` — slow_client is a wire-level
     %% client behavior; the server sees a request arrive in
     %% multiple chunks with delays between them.
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(connection_storm, BaseOpts) ->
     %% Same handler as `hello` — connection_storm is a connection-
     %% lifecycle test; per-request work is identical to `hello`.
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(mixed_workload, BaseOpts) ->
     %% Three routes — bench client picks one uniformly per request.
     BaseOpts#{routes => [
@@ -1449,7 +1449,7 @@ scenario_roadrunner_opts(backpressure_sustained, BaseOpts) ->
     %% Override the bench's default max_clients => 100K to a tight
     %% cap so the bench's 200-client wave saturates the listener.
     BaseOpts#{
-        handler => roadrunner_keepalive_handler,
+        routes => roadrunner_keepalive_handler,
         max_clients => 50
     };
 scenario_roadrunner_opts(server_sent_events, BaseOpts) ->
@@ -1464,7 +1464,7 @@ scenario_roadrunner_opts(large_keepalive_session, BaseOpts) ->
     %% with a tight cap so each conn closes after ~1000 requests,
     %% triggering reconnects within the bench duration.
     BaseOpts#{
-        handler => roadrunner_keepalive_handler,
+        routes => roadrunner_keepalive_handler,
         max_keep_alive_requests => 1000
     };
 scenario_roadrunner_opts(websocket_msg_throughput, BaseOpts) ->
@@ -1474,7 +1474,7 @@ scenario_roadrunner_opts(url_with_qs, BaseOpts) ->
 scenario_roadrunner_opts(small_chunked_response, BaseOpts) ->
     BaseOpts#{routes => [{~"/small", roadrunner_bench_small_chunks_handler, undefined}]};
 scenario_roadrunner_opts(accept_storm_burst, BaseOpts) ->
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(head_method, BaseOpts) ->
     BaseOpts#{routes => [{~"/large", roadrunner_bench_large_handler, undefined}]};
 scenario_roadrunner_opts(etag_304, BaseOpts) ->
@@ -1488,7 +1488,7 @@ scenario_roadrunner_opts(partial_body_drop, BaseOpts) ->
 scenario_roadrunner_opts(cookies_heavy, BaseOpts) ->
     BaseOpts#{routes => [{~"/cookies", roadrunner_bench_cookies_handler, undefined}]};
 scenario_roadrunner_opts(tls_handshake_throughput, BaseOpts) ->
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(multi_request_body, BaseOpts) ->
     BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
 scenario_roadrunner_opts(path_with_unicode, BaseOpts) ->

@@ -34,7 +34,7 @@ main(Args) ->
     {ok, _} = application:ensure_all_started(roadrunner),
     {ok, _} = roadrunner:start_listener(?LISTENER, #{
         port => Port,
-        handler => roadrunner_autobahn_handler,
+        routes => roadrunner_autobahn_handler,
         max_content_length => ?AUTOBAHN_MAX_CONTENT_LENGTH
     }),
     BoundPort = roadrunner_listener:port(?LISTENER),

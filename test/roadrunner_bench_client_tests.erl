@@ -151,7 +151,7 @@ stop_listener(Name) ->
 
 start_h1_listener(Name, Handler) ->
     ensure_pg(),
-    {ok, _} = roadrunner_listener:start_link(Name, #{port => 0, handler => Handler}),
+    {ok, _} = roadrunner_listener:start_link(Name, #{port => 0, routes => Handler}),
     roadrunner_listener:port(Name).
 
 start_h2_listener(Name, Handler) ->
@@ -161,6 +161,6 @@ start_h2_listener(Name, Handler) ->
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0,
         tls => [AlpnH2 | roadrunner_test_certs:server_opts()],
-        handler => Handler
+        routes => Handler
     }),
     roadrunner_listener:port(Name).

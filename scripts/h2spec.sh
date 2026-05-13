@@ -72,7 +72,7 @@ erl -noshell "${PA_DIRS[@]}" -eval "
             {keyfile, \"$CERT_DIR/key.pem\"},
             {alpn_preferred_protocols, [<<\"h2\">>]}
         ],
-        handler => roadrunner_hello_handler
+        routes => roadrunner_hello_handler
     }),
     Port = roadrunner_listener:port(h2spec_listener),
     file:write_file(\"$PORT_FILE\", integer_to_binary(Port)),

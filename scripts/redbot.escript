@@ -42,7 +42,7 @@ main(Args) ->
     {ok, _} = application:ensure_all_started(roadrunner),
     {ok, _} = roadrunner:start_listener(?LISTENER, #{
         port => Port,
-        handler => roadrunner_redbot_handler,
+        routes => roadrunner_redbot_handler,
         middlewares => [roadrunner_compress]
     }),
     BoundPort = roadrunner_listener:port(?LISTENER),

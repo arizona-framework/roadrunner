@@ -321,7 +321,7 @@ end_to_end_compresses_html_response_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(compress_e2e, #{
                 port => 0,
-                handler => roadrunner_compress_test_handler,
+                routes => roadrunner_compress_test_handler,
                 middlewares => [roadrunner_compress]
             }),
             roadrunner_listener:port(compress_e2e)

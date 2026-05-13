@@ -189,7 +189,7 @@ listener_middleware_runs_without_router_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(mw_test_listener, #{
                 port => 0,
-                handler => roadrunner_echo_headers_handler,
+                routes => roadrunner_echo_headers_handler,
                 middlewares => [fun roadrunner_test_middlewares:tag_request/2]
             }),
             roadrunner_listener:port(mw_test_listener)

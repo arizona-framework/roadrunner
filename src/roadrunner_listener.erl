@@ -39,8 +39,7 @@ All duration and interval values in `opts()` are in milliseconds —
 
 -type opts() :: #{
     port := inet:port_number(),
-    handler => module(),
-    routes => roadrunner_router:routes(),
+    routes => module() | roadrunner_router:routes(),
     middlewares => roadrunner_middleware:middleware_list(),
     max_content_length => non_neg_integer(),
     request_timeout => non_neg_integer(),
@@ -226,8 +225,8 @@ in-flight conns keep using whatever they read at request-resolve
 time, but every subsequent dispatch sees the new table.
 
 Returns `ok` on success or `{error, no_routes}` if the listener was
-started without a `routes` opt (single-handler dispatch — there's
-nothing to reload).
+started in single-handler mode (`routes => Module` or no `routes`
+opt) — there's no router table to reload.
 """.
 -spec reload_routes(Name :: atom(), roadrunner_router:routes()) ->
     ok | {error, no_routes}.
@@ -273,7 +272,7 @@ setup_reconciliation(_Opts) ->
 %% lookup is O(1) and the table is shared across all conns of this
 %% listener without copying.
 -spec publish_routes(atom(), opts()) -> ok.
-publish_routes(ListenerName, #{routes := Routes}) ->
+publish_routes(ListenerName, #{routes := Routes}) when is_list(Routes) ->
     persistent_term:put({roadrunner_routes, ListenerName}, roadrunner_router:compile(Routes));
 publish_routes(_ListenerName, _Opts) ->
     ok.
@@ -430,10 +429,12 @@ build_proto_opts(Opts, ListenerName) ->
             WithHibernate
     end.
 
-%% `routes` (router-based dispatch) takes precedence over `handler`. With
-%% neither, fall back to the default hello-world handler. Routes are
-%% published to `persistent_term` by `publish_routes/2` — the dispatch
-%% tag carries the listener name so the conn can look the table up.
+%% `routes` is the unified dispatch option. A bare module atom sends
+%% every request to that handler; a list of `{Path, Module, Opts}`
+%% tuples uses the router. When `routes` is omitted, fall back to the
+%% default hello-world handler. List-form routes are published to
+%% `persistent_term` by `publish_routes/2` — the dispatch tag carries
+%% the listener name so the conn can look the table up.
 -spec build_dispatch(opts(), atom()) -> roadrunner_conn:dispatch().
 -spec validate_h2_window_opt(atom(), opts(), pos_integer()) -> ok.
 validate_h2_window_opt(Key, Opts, Max) ->
@@ -468,10 +469,12 @@ validate_h2c_opt(Opts) ->
         {Other, _} -> error({invalid_listener_opt, h2c, Other})
     end.
 
-build_dispatch(#{routes := _}, ListenerName) ->
+build_dispatch(#{routes := Module}, _ListenerName) when is_atom(Module) ->
+    {handler, Module};
+build_dispatch(#{routes := Routes}, ListenerName) when is_list(Routes) ->
     {router, ListenerName};
-build_dispatch(Opts, _ListenerName) ->
-    {handler, maps:get(handler, Opts, roadrunner_default_handler)}.
+build_dispatch(_Opts, _ListenerName) ->
+    {handler, roadrunner_default_handler}.
 
 -spec handle_call(
     port

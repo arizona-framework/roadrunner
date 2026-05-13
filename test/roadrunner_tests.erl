@@ -63,7 +63,7 @@ lists_active_listeners() ->
 %% --- helpers ---
 
 start(Name) ->
-    roadrunner:start_listener(Name, #{port => 0, handler => roadrunner_hello_handler}).
+    roadrunner:start_listener(Name, #{port => 0, routes => roadrunner_hello_handler}).
 
 recv_until_closed(Sock) -> recv_until_closed(Sock, <<>>).
 

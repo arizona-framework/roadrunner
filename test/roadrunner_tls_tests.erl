@@ -53,7 +53,7 @@ setup() ->
     {ok, _} = roadrunner_listener:start_link(tls_test_listener, #{
         port => 0,
         tls => roadrunner_test_certs:server_opts(),
-        handler => roadrunner_hello_handler
+        routes => roadrunner_hello_handler
     }),
     Port = roadrunner_listener:port(tls_test_listener),
     {Port, ClientOpts}.
@@ -157,7 +157,7 @@ setup_h2() ->
     {ok, _} = roadrunner_listener:start_link(tls_http2_test_listener, #{
         port => 0,
         tls => [AlpnH2 | roadrunner_test_certs:server_opts()],
-        handler => roadrunner_hello_handler
+        routes => roadrunner_hello_handler
     }),
     Port = roadrunner_listener:port(tls_http2_test_listener),
     {Port, ClientOpts}.
@@ -177,7 +177,7 @@ h2_user_alpn_overrides_test_() ->
             {ok, _} = roadrunner_listener:start_link(tls_h2_user_alpn_listener, #{
                 port => 0,
                 tls => UserTls,
-                handler => roadrunner_hello_handler
+                routes => roadrunner_hello_handler
             }),
             Port = roadrunner_listener:port(tls_h2_user_alpn_listener),
             {Port, ClientOpts}
