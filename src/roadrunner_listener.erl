@@ -42,7 +42,7 @@ connection crash doesn't take the pool down.
     request_timeout => non_neg_integer(),
     keep_alive_timeout => non_neg_integer(),
     num_acceptors => pos_integer(),
-    max_keep_alive_request => pos_integer(),
+    max_keep_alive_requests => pos_integer(),
     max_clients => pos_integer(),
     minimum_bytes_per_second => non_neg_integer(),
     %% How often (ms) `reading_request` re-checks the running
@@ -387,8 +387,8 @@ build_proto_opts(Opts, ListenerName) ->
         max_content_length => maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
         request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
         keep_alive_timeout => maps:get(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT),
-        max_keep_alive_request =>
-            maps:get(max_keep_alive_request, Opts, ?DEFAULT_MAX_KEEP_ALIVE),
+        max_keep_alive_requests =>
+            maps:get(max_keep_alive_requests, Opts, ?DEFAULT_MAX_KEEP_ALIVE),
         max_clients => maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
         client_counter => ClientCounter,
         requests_counter => RequestsCounter,

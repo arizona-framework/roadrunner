@@ -124,7 +124,7 @@ request_rejected_event_fires_on_bad_request_line_test() ->
             max_content_length => 1_000_000,
             request_timeout => 200,
             keep_alive_timeout => 200,
-            max_keep_alive_request => 100,
+            max_keep_alive_requests => 100,
             max_clients => 10,
             client_counter => atomics:new(1, [{signed, false}]),
             requests_counter => atomics:new(1, [{signed, false}]),

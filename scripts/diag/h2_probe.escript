@@ -105,7 +105,7 @@ listener_opts(CertDir) ->
         handler => roadrunner_hello_handler,
         keep_alive_timeout => 60000,
         max_clients => 100000,
-        max_keep_alive_request => 1000000
+        max_keep_alive_requests => 1000000
     }.
 
 make_cert() ->

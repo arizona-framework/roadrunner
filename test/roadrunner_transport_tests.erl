@@ -509,7 +509,7 @@ fake_proto_opts(Handler) ->
         max_content_length => 10485760,
         request_timeout => 5000,
         keep_alive_timeout => 5000,
-        max_keep_alive_request => 100,
+        max_keep_alive_requests => 100,
         max_clients => 10,
         client_counter => atomics:new(1, [{signed, false}]),
         requests_counter => atomics:new(1, [{signed, false}]),

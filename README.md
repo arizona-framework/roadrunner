@@ -195,7 +195,7 @@ roadrunner:start_listener(my_listener, #{port => 8080, handler => hello_handler}
   `early_data` disabled.
 - DoS bounds — `max_clients`, `max_content_length`,
   `minimum_bytes_per_second`, `request_timeout`, `keep_alive_timeout`,
-  `max_keep_alive_request`.
+  `max_keep_alive_requests`.
 
 ### Observability
 

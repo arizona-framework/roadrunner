@@ -74,7 +74,7 @@ response shapes (buffered, `{stream, ...}`, `{loop, ...}`,
     phase = first :: first | keep_alive,
     %% Cumulative successfully-served requests on this conn. Bumped
     %% in `run_pipeline/4` after each successful dispatch; checked in
-    %% `finishing_phase/3` against `max_keep_alive_request`.
+    %% `finishing_phase/3` against `max_keep_alive_requests`.
     requests_served = 0 :: non_neg_integer(),
     %% Bytes received but not yet parsed. Empty on first iteration;
     %% populated mid-recv when `parse_request/1` returns `{more, _}`,
@@ -94,7 +94,7 @@ response shapes (buffered, `{stream, ...}`, `{loop, ...}`,
     dispatch :: roadrunner_conn:dispatch() | undefined,
     middlewares = [] :: roadrunner_middleware:middleware_list(),
     max_content_length = 0 :: non_neg_integer(),
-    max_keep_alive_request = 1 :: pos_integer(),
+    max_keep_alive_requests = 1 :: pos_integer(),
     %% Anti-slowloris on the request-read phase. `min_rate` is cached
     %% from `proto_opts.minimum_bytes_per_second` at `shoot`. When > 0,
     %% `recv_passive/2` tracks bytes received since `recv_phase_start`
@@ -164,7 +164,7 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
                         dispatch = maps:get(dispatch, ProtoOpts),
                         middlewares = maps:get(middlewares, ProtoOpts),
                         max_content_length = maps:get(max_content_length, ProtoOpts),
-                        max_keep_alive_request = maps:get(max_keep_alive_request, ProtoOpts),
+                        max_keep_alive_requests = maps:get(max_keep_alive_requests, ProtoOpts),
                         min_rate = maps:get(minimum_bytes_per_second, ProtoOpts)
                     },
                     read_request_phase(S)
@@ -725,7 +725,7 @@ buffered_finish(S, Req, Headers) ->
                     exit_normal(S);
                 keep_alive ->
                     Served = S#loop_state.requests_served,
-                    case Served >= S#loop_state.max_keep_alive_request of
+                    case Served >= S#loop_state.max_keep_alive_requests of
                         true ->
                             exit_normal(S);
                         false ->

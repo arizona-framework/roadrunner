@@ -589,7 +589,7 @@ cli() ->
                                     100-continue support in fixture).
                     large_keepalive_session:
                                     h1-only. Listener capped at
-                                    max_keep_alive_request => 1000;
+                                    max_keep_alive_requests => 1000;
                                     bench worker reconnects on conn
                                     close. Measures keep-alive
                                     throughput including the
@@ -1251,7 +1251,7 @@ start_cowboy_h1(Scenario) ->
     Dispatch = peer:call(Peer, cowboy_router, compile, [scenario_cowboy_routes(Scenario)]),
     %% `max_keepalive` capped to a million so cowboy's per-conn request
     %% counter doesn't trip during the bench (mirrors roadrunner's
-    %% `max_keep_alive_request` setting). Cowboy 2.x's TransportOpts is
+    %% `max_keep_alive_requests` setting). Cowboy 2.x's TransportOpts is
     %% a `ranch:opts()` map — passing a flat list interprets every tuple
     %% as a `socket_opt` and `num_acceptors` ends up at `inet_tcp:listen`
     %% which crashes with `badarg`.
@@ -1317,7 +1317,7 @@ start_roadrunner(Scenario) ->
         port => 0,
         keep_alive_timeout => 60000,
         max_clients => 100000,
-        max_keep_alive_request => 1000000
+        max_keep_alive_requests => 1000000
     },
     ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
     {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr, ListenerOpts]),
@@ -1343,7 +1343,7 @@ start_roadrunner_h2(Scenario, CertDir) ->
         ],
         keep_alive_timeout => 60000,
         max_clients => 100000,
-        max_keep_alive_request => 1000000
+        max_keep_alive_requests => 1000000
     },
     ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
     {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr_h2, ListenerOpts]),
@@ -1460,12 +1460,12 @@ scenario_roadrunner_opts(expect_100_continue, BaseOpts) ->
     %% `roadrunner_conn:maybe_send_continue/3`.
     BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
 scenario_roadrunner_opts(large_keepalive_session, BaseOpts) ->
-    %% Override the bench's default max_keep_alive_request => 1M
+    %% Override the bench's default max_keep_alive_requests => 1M
     %% with a tight cap so each conn closes after ~1000 requests,
     %% triggering reconnects within the bench duration.
     BaseOpts#{
         handler => roadrunner_keepalive_handler,
-        max_keep_alive_request => 1000
+        max_keep_alive_requests => 1000
     };
 scenario_roadrunner_opts(websocket_msg_throughput, BaseOpts) ->
     BaseOpts#{routes => [{~"/ws", roadrunner_ws_upgrade_handler, undefined}]};
@@ -2252,7 +2252,7 @@ ws_parse_frame(_) ->
     more.
 
 %% large_keepalive_session: like the default keep_alive_loop, but
-%% on conn-close (the server hit its `max_keep_alive_request` cap)
+%% on conn-close (the server hit its `max_keep_alive_requests` cap)
 %% the worker reconnects and continues. Measures sustained
 %% throughput INCLUDING the periodic per-1000-req reconnect tax
 %% — a path single-request `connection_storm` and the default
@@ -2276,7 +2276,7 @@ large_keepalive_worker(Host, Port, Req, BodyLen, Deadline, Acc) ->
     end.
 
 %% Run requests on `Sock` until either the deadline elapses or the
-%% server closes (max_keep_alive_request). Conn-close mid-loop is
+%% server closes (max_keep_alive_requests). Conn-close mid-loop is
 %% NOT an error here — it's the expected end-of-conn signal.
 large_keepalive_inner(Sock, Req, BodyLen, Deadline, Acc) ->
     case erlang:monotonic_time(millisecond) >= Deadline of

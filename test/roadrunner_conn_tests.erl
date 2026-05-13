@@ -1051,12 +1051,12 @@ conn_keep_alive_count_limit_test_() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_ka_max, #{
                 port => 0,
                 handler => roadrunner_keepalive_handler,
-                max_keep_alive_request => 1
+                max_keep_alive_requests => 1
             }),
             roadrunner_listener:port(conn_test_ka_max)
         end,
         fun(_) -> ok = roadrunner_listener:stop(conn_test_ka_max) end, fun(Port) ->
-            {"max_keep_alive_request=1 closes after first response", fun() ->
+            {"max_keep_alive_requests=1 closes after first response", fun() ->
                 {ok, Sock} = gen_tcp:connect(
                     {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
                 ),

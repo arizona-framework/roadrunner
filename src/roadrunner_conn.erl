@@ -11,7 +11,7 @@ directly from `roadrunner_req` (manual body buffering) and from
 `roadrunner_conn_tests.erl`'s closure-driven unit tests.
 
 Per-connection behavior — keep-alive (capped by
-`max_keep_alive_request`, idle-bound by `keep_alive_timeout`),
+`max_keep_alive_requests`, idle-bound by `keep_alive_timeout`),
 `Expect: 100-continue`, HEAD body suppression, anti-Slowloris rate
 check (`minimum_bytes_per_second`), the five handler return shapes
 (`{Status, Headers, Body}`, `{stream, ...}`, `{loop, ...}`,
@@ -83,7 +83,7 @@ read it anyway.
     max_content_length := non_neg_integer(),
     request_timeout := non_neg_integer(),
     keep_alive_timeout := non_neg_integer(),
-    max_keep_alive_request := pos_integer(),
+    max_keep_alive_requests := pos_integer(),
     max_clients := pos_integer(),
     client_counter := atomics:atomics_ref(),
     requests_counter := atomics:atomics_ref(),
