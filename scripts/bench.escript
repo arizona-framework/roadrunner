@@ -874,7 +874,7 @@ cli() ->
             },
             #{
                 name => protocols,
-                long => "-protocol",
+                long => "-protocols",
                 type => {custom, fun parse_protocols/1},
                 %% Omitting `--protocols` defaults to the `all` sentinel,
                 %% which `main/1` expands to `?KNOWN_PROTOCOLS`. Explicit
@@ -937,8 +937,14 @@ parse_args(Argv) ->
             %% pre-parsed (list of atoms). No post-process needed.
             Parsed;
         {error, Reason} ->
-            io:format(standard_error, "~s~n~n", [argparse:format_error(Reason)]),
-            io:format(standard_error, "~s~n", [argparse:help(Cli, ProgOpts)]),
+            %% Skip `argparse:help/2` on error: it renders every option's
+            %% default with `~ts`, and our `--servers` / `--scenarios` /
+            %% `--protocols` defaults are atom values (sentinel `all` or
+            %% atom lists like `?KNOWN_SERVERS`) that crash io_lib's
+            %% Unicode-chardata pass. The error message is still
+            %% actionable; users who want the full usage can pass no
+            %% arguments or read `cli/0`.
+            io:format(standard_error, "~s~n", [argparse:format_error(Reason)]),
             halt(2)
     end.
 
