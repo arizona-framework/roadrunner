@@ -1,0 +1,130 @@
+---
+# Manual perf check — runs `scripts/bench.escript` on demand and pins
+# the output to the workflow step summary so a reviewer sees the
+# table without opening logs. Lives in its own workflow file so a
+# manual dispatch doesn't also fire precommit / h2spec / wrk2-smoke /
+# autobahn from `erlang.yml` (manual dispatch wall time stays ~45 s
+# instead of ~5 min dominated by autobahn).
+#
+# NOT a gate: GH free runners share CPU and variance is well above any
+# change we'd plausibly make in one PR. The variance caveat is printed
+# alongside the table so a reader doesn't mistake a 5 % bump for a real
+# win. Closed-loop (not wrk2) so the job stays in the ~1 min budget;
+# wrk2-smoke in erlang.yml already proves the open-loop pipeline.
+name: Bench
+
+"on":
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "bench.escript scenario (e.g. hello, echo, large_post_streaming)"
+        required: false
+        default: hello
+        type: string
+      duration:
+        description: "bench duration in seconds (warmup is +2s on top)"
+        required: false
+        default: "10"
+        type: string
+
+concurrency:
+  group: ${{github.workflow}}-${{github.ref}}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bench-on-demand:
+    name: bench on-demand
+
+    runs-on: ubuntu-24.04
+
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24
+        id: setup-beam
+        with:
+          version-type: strict
+          version-file: .tool-versions
+
+      # Mirror the cache key shape used by erlang.yml so this workflow
+      # rides any cache that the regular suite seeded recently.
+      - name: Set build cache key
+        id: set-build-key
+        run: |
+          os="${{ runner.os }}"
+          otp="${{ steps.setup-beam.outputs.otp-version }}"
+          cfg_hash="${{ hashFiles('rebar.config') }}"
+          lock_hash="${{ hashFiles('rebar.lock') }}"
+          prefix="_build-${os}-otp-${otp}-cfg-${cfg_hash}-"
+          echo "prefix=${prefix}" >> "${GITHUB_OUTPUT}"
+          echo "key=${prefix}lock-${lock_hash}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore _build cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: _build
+          key: ${{ steps.set-build-key.outputs.key }}
+          restore-keys: ${{ steps.set-build-key.outputs.prefix }}
+
+      - name: Restore rebar3 cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/rebar3
+          key: rebar3-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-config-${{ hashFiles('rebar.config') }}
+          restore-keys: |
+            rebar3-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-
+            rebar3-${{ runner.os }}-
+
+      # bench.escript needs the test profile compiled (cowboy / elli /
+      # bench fixtures live under `_build/test/lib/`). On a cache hit
+      # this is a fast no-op.
+      - name: Compile test profile
+        env:
+          # OTP 29 RC3 + Fastly TLS workaround. Same rationale as in
+          # erlang.yml — pin TLS 1.2 + middlebox_comp_mode off for the
+          # rebar3 BEAM only. Drop after OTP 29 RC4.
+          ERL_FLAGS: "-config ${{ github.workspace }}/config/rebar3_ssl"
+        run: rebar3 as test compile
+
+      # Inputs threaded through env, not direct template substitution,
+      # so a caller can't slip shell metacharacters into the run script.
+      - name: Run bench.escript
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+          DURATION: ${{ inputs.duration }}
+        run: |
+          ./scripts/bench.escript \
+            --scenario "$SCENARIO" \
+            --duration "$DURATION" \
+            --warmup 2 \
+            2>&1 | tee /tmp/bench.log
+
+      - name: Publish to step summary
+        if: always()
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+          DURATION: ${{ inputs.duration }}
+          BRANCH: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          {
+            echo "## bench on-demand"
+            echo ""
+            echo "scenario \`$SCENARIO\`, duration \`${DURATION}s\`, warmup \`2s\`"
+            echo ""
+            echo "branch \`$BRANCH\`, sha \`$SHA\`"
+            echo ""
+            echo "> GH runners share CPU; deltas under ~15 % sit inside variance"
+            echo "> (see \`scripts/bench.escript\`'s own NOTE). Re-run a few times"
+            echo "> on the same ref before drawing conclusions, and never put"
+            echo "> CI-runner numbers in README or docs."
+            echo ""
+            echo "\`\`\`"
+            cat /tmp/bench.log
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -218,6 +218,24 @@ chasing a regression that needs frequent refresh.
 
 **Scope:** small.
 
+### CI bench-vs-baseline comparison
+
+**What:** The `Bench` workflow (`.github/workflows/bench.yml`) writes
+its result to the workflow step summary only. A follow-up would upload
+the bench output as an artifact and add a comparison step (or
+dashboard) that diffs a PR run against a baseline (e.g. `main` HEAD)
+and surfaces the delta.
+
+**Why deferred:** GH free runners are too noisy for automated
+regression gating (deltas under ~15 % are inside variance per
+`scripts/bench.escript`'s own NOTE). A useful comparison needs a
+baseline-collection strategy that filters noise (multi-sample on
+both sides, distribution stats, alerting only on shifts well outside
+variance). Eyeball-from-summary covers the v1 use case.
+
+**Scope:** medium. The artifact upload is a few lines; the parser,
+distribution stats, baseline storage, and presentation are the bulk.
+
 ### Proper OTP citizenship in loop responses
 
 **What:** Both `roadrunner_loop_response:info_loop/4` (h1) and
