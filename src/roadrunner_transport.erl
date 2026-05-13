@@ -371,15 +371,15 @@ apply_tls_defaults(UserOpts) ->
     Defaults ++ UserOpts.
 
 -doc """
-Build the final `tls` opts list from the listener's `protocols` list
-and the user-supplied TLS options.
+Build the final `tls` opts list from the listener's `protocols` atom
+list and the user-supplied TLS options.
 
 Derives `alpn_preferred_protocols` from `Protocols` (`http2` →
-`~"h2"`, `http1` → `~"http/1.1"`) and prepends it to `UserOpts`,
-unless the user already supplied `alpn_preferred_protocols`
-explicitly — in which case the explicit value wins and derivation
-is skipped. Then layers hardened defaults underneath via
-`apply_tls_defaults/1`.
+`~"h2"`, `http1` → `~"http/1.1"`) in user-supplied order and
+prepends it to `UserOpts`, unless the user already supplied
+`alpn_preferred_protocols` explicitly — in which case the explicit
+value wins and derivation is skipped. Then layers hardened defaults
+underneath via `apply_tls_defaults/1`.
 
 Final precedence: explicit user value > derived ALPN > hardened
 defaults.

@@ -385,9 +385,9 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
         body_buffering => auto,
         graceful_drain => disabled,
         protocols => [http2],
-        h2_initial_conn_window => 65535,
-        h2_initial_stream_window => 65535,
-        h2_window_refill_threshold => 32768
+        http2_conn_window => 65535,
+        http2_stream_window => 65535,
+        http2_window_refill_threshold => 32768
     },
     Sock = {fake, Self},
     {ok, Pid} = roadrunner_conn_loop:start(Sock, ProtoOpts),
@@ -433,10 +433,7 @@ plaintext_listener_without_h2c_stays_h1() ->
         minimum_bytes_per_second => 0,
         body_buffering => auto,
         graceful_drain => disabled,
-        protocols => [http1],
-        h2_initial_conn_window => 65535,
-        h2_initial_stream_window => 65535,
-        h2_window_refill_threshold => 32768
+        protocols => [http1]
     },
     Sock = {fake, Self},
     {ok, Pid} = roadrunner_conn_loop:start(Sock, ProtoOpts),
@@ -2735,7 +2732,11 @@ start_http2_conn() ->
         client_counter => Counter,
         listener_name => http2_test,
         dispatch => {handler, roadrunner_hello_handler},
-        middlewares => []
+        middlewares => [],
+        protocols => [http2],
+        http2_conn_window => 65535,
+        http2_stream_window => 65535,
+        http2_window_refill_threshold => 32768
     },
     Sock = {fake, Self},
     Pid = spawn(fun() ->

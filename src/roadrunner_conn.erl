@@ -97,17 +97,27 @@ read it anyway.
     %% SSE / WebSocket handlers depend on it. Short-lived h1
     %% workloads can opt out for ~10% lower per-conn overhead.
     graceful_drain => enabled | disabled,
-    %% Protocols this listener accepts. `[http1]` is HTTP/1.1 only,
-    %% `[http2]` is HTTP/2 (h2 via ALPN on TLS, h2c prior-knowledge on
-    %% plain TCP), `[http1, http2]` is both (TLS only). On plain TCP
-    %% with `[http2]`, `roadrunner_conn_loop:awaiting_shoot/3` routes
-    %% straight to the h2 conn loop. Default `[http1]`.
+    %% Enabled protocols as a flat atom list in user-supplied (ALPN
+    %% preference) order. On plain TCP with `[http2]`,
+    %% `roadrunner_conn_loop:awaiting_shoot/3` routes straight to the
+    %% h2 conn loop. HTTP/2 sub-opts are flattened onto proto_opts
+    %% top-level as `http2_conn_window`, `http2_stream_window`,
+    %% `http2_window_refill_threshold` — see those keys below. The
+    %% user-facing nested shape (`{http2, #{conn_window => N, ...}}`)
+    %% is documented in `t:roadrunner_listener:opts/0`.
     protocols => [http1 | http2, ...],
-    %% h2 receive-window tuning. See `roadrunner_listener:opts()` for
-    %% prose. Defaults match the RFC 9113 baseline.
-    h2_initial_conn_window => 1..16#7FFFFFFF,
-    h2_initial_stream_window => 1..16#7FFFFFFF,
-    h2_window_refill_threshold => pos_integer(),
+    %% HTTP/2 receive-window tuning, populated by the listener only
+    %% when `http2` is in the protocols list. Pattern-match these
+    %% keys directly in code paths that already know http2 is
+    %% enabled (e.g. `roadrunner_conn_loop_http2:enter/5`) — they're
+    %% guaranteed present, defaults filled at normalization time.
+    %% See `t:roadrunner_listener:opts/0` for the user-facing shape
+    %% (`{http2, #{conn_window => N, stream_window => N,
+    %% window_refill_threshold => N}}`) and RFC 9113 §6.5.2 / §6.9.2
+    %% for the wire semantics.
+    http2_conn_window => 1..16#7FFFFFFF,
+    http2_stream_window => 1..16#7FFFFFFF,
+    http2_window_refill_threshold => 1..16#7FFFFFFF,
     %% Optional fields the listener injects only when the user
     %% supplies them — see `roadrunner_listener:build_proto_opts/2`.
     %% Declared here so dialyzer accepts pattern matches like

@@ -255,6 +255,22 @@ listener_protocols_default_is_http1_only_test() ->
     ?assertEqual([http1], maps:get(protocols, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
+listener_accepts_http1_tuple_form_test() ->
+    %% `{http1, #{}}` is the explicit tuple shape — accepted but
+    %% currently must be empty (no http1 tunables yet; reserved for
+    %% future additions). Normalizes to the same internal `[http1]`
+    %% atom list as the bare-atom form.
+    Name = listener_test_protocols_http1_tuple,
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        protocols => [{http1, #{}}],
+        routes => roadrunner_hello_handler
+    }),
+    State = sys:get_state(ListenerPid),
+    ProtoOpts = element(4, State),
+    ?assertEqual([http1], maps:get(protocols, ProtoOpts)),
+    ok = roadrunner_listener:stop(Name).
+
 listener_rejects_h1_and_h2_on_plain_tcp_test() ->
     %% `[http1, http2]` (and the reverse order) on plain TCP needs
     %% `Upgrade: h2c` to share the port — roadrunner doesn't implement

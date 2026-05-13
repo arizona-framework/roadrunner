@@ -136,10 +136,10 @@ roadrunner gap.
 ### h2 receive-window defaults
 
 **What:** Bump the listener's default receive-window peaks above the
-RFC 9113 §6.9.2 baseline of 65535. Override knobs already exist
-(`h2_initial_conn_window`, `h2_initial_stream_window`,
-`h2_window_refill_threshold` on `roadrunner_listener:opts()`); the
-question is what values to ship as the default.
+RFC 9113 §6.9.2 baseline of 65535. Override knobs already exist as
+nested `http2` sub-opts (`conn_window`, `stream_window`,
+`window_refill_threshold` under `protocols => [{http2, #{...}}]`);
+the question is what values to ship as the default.
 
 **Why deferred:** `window / RTT` caps per-stream throughput, and at
 65535 with a 100 ms RTT the ceiling is ~0.6 MB/s. Reference points
