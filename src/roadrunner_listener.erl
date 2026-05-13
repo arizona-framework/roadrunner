@@ -66,7 +66,7 @@ All duration and interval values in `opts()` are in milliseconds —
     %% notification for ~10% lower per-conn overhead. Long-lived
     %% conns (loop handlers, SSE, WebSocket) still rely on this
     %% — keep `enabled` if your handlers have those.
-    drain_group => enabled | disabled,
+    graceful_drain => enabled | disabled,
     %% When set, the per-connection process auto-hibernates after
     %% `Ms` milliseconds of idle main-loop time. Most useful for
     %% long-lived keep-alive HTTP/1.1 connections that mostly sit
@@ -400,7 +400,7 @@ build_proto_opts(Opts, ListenerName) ->
             maps:get(minimum_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
         body_buffering => maps:get(body_buffering, Opts, auto),
         listener_name => ListenerName,
-        drain_group => maps:get(drain_group, Opts, enabled),
+        graceful_drain => maps:get(graceful_drain, Opts, enabled),
         h2c => maps:get(h2c, Opts, disabled),
         h2_initial_conn_window => maps:get(h2_initial_conn_window, Opts, 65535),
         h2_initial_stream_window => maps:get(h2_initial_stream_window, Opts, 65535),

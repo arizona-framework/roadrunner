@@ -122,7 +122,7 @@ start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
     no_return().
 init_loop(Parent, Socket, ProtoOpts) ->
     ListenerName = maps:get(listener_name, ProtoOpts, undefined),
-    DrainGroup = maps:get(drain_group, ProtoOpts, enabled),
+    DrainGroup = maps:get(graceful_drain, ProtoOpts, enabled),
     proc_lib:set_label({roadrunner_conn, awaiting_shoot, ListenerName}),
     ok = roadrunner_conn:join_drain_group(ListenerName, DrainGroup),
     proc_lib:init_ack(Parent, {ok, self()}),

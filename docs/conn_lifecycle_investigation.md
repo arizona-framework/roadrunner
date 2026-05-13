@@ -14,7 +14,7 @@ hot-path work:
 | `router_404_storm` | 15K | 18K | 47K |
 | `slow_client` | 4.4K | 6.2K | 6.2K |
 
-Five point optimizations were tried first (drain_group skip, set_label
+Five point optimizations were tried first (graceful_drain skip, set_label
 removal, init_ack-first, async spawn, more acceptors) — all within
 variance or regressing. None of them addressed the actual blocker
 because the actual blocker had not yet been measured.
@@ -151,7 +151,7 @@ vs elli's accept-and-handle-in-one-process model) and is out of
 scope for this branch.
 
 The earlier point-optimization attempts that came up empty
-(`drain_group => disabled`, `set_label`/`refine_conn_label` skip,
+(`graceful_drain => disabled`, `set_label`/`refine_conn_label` skip,
 `init_ack` first, async spawn, more acceptors) all turned out to
 target costs that were genuinely small relative to the inet_backend
 overhead. None of them would have surfaced the actual bottleneck

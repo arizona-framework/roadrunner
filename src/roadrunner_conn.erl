@@ -96,7 +96,7 @@ read it anyway.
     %% `{roadrunner_drain, Deadline}` to in-flight conns; loop /
     %% SSE / WebSocket handlers depend on it. Short-lived h1
     %% workloads can opt out for ~10% lower per-conn overhead.
-    drain_group => enabled | disabled,
+    graceful_drain => enabled | disabled,
     %% RFC 7540 §3.4 prior-knowledge HTTP/2 cleartext. When `enabled`,
     %% `roadrunner_conn_loop:awaiting_shoot/3` routes the connection
     %% straight to the h2 conn loop without consulting TLS ALPN.
