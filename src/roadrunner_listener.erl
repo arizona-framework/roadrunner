@@ -57,15 +57,15 @@ All duration and interval values in `opts()` are in milliseconds —
     rate_check_interval => pos_integer(),
     body_buffering => auto | manual,
     slot_reconciliation => disabled | #{interval := pos_integer()},
-    %% Opt out of the per-conn `pg` drain group. Default `enabled`
-    %% (current behavior). Set to `disabled` for short-lived
-    %% h1-only workloads (REST APIs, health-check probes, CLI
-    %% clients) where conns finish on their own faster than any
-    %% drain notification could fire. Trades graceful drain
-    %% notification for ~10% lower per-conn overhead. Long-lived
-    %% conns (loop handlers, SSE, WebSocket) still rely on this
-    %% — keep `enabled` if your handlers have those.
-    graceful_drain => enabled | disabled,
+    %% Opt out of the per-conn `pg` drain group. Default `true`
+    %% (current behavior). Set to `false` for short-lived h1-only
+    %% workloads (REST APIs, health-check probes, CLI clients) where
+    %% conns finish on their own faster than any drain notification
+    %% could fire. Trades graceful drain notification for ~10% lower
+    %% per-conn overhead. Long-lived conns (loop handlers, SSE,
+    %% WebSocket) still rely on this — keep `true` if your handlers
+    %% have those.
+    graceful_drain => boolean(),
     %% When set, the per-connection process auto-hibernates after
     %% `Ms` milliseconds of idle main-loop time. Most useful for
     %% long-lived keep-alive HTTP/1.1 connections that mostly sit
@@ -416,7 +416,7 @@ build_proto_opts(Opts, ListenerName) ->
                 maps:get(minimum_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
             body_buffering => maps:get(body_buffering, Opts, auto),
             listener_name => ListenerName,
-            graceful_drain => maps:get(graceful_drain, Opts, enabled),
+            graceful_drain => maps:get(graceful_drain, Opts, true),
             protocols => Protocols
         },
         ProtoFlats

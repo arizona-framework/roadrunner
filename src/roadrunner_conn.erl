@@ -90,13 +90,13 @@ read it anyway.
     minimum_bytes_per_second := non_neg_integer(),
     body_buffering := auto | manual,
     listener_name => atom(),
-    %% When `disabled`, conns skip the per-process `pg:join` into
+    %% When `false`, conns skip the per-process `pg:join` into
     %% `{roadrunner_drain, ListenerName}`. The drain group is the
     %% mechanism `roadrunner_listener:drain/2` uses to broadcast
     %% `{roadrunner_drain, Deadline}` to in-flight conns; loop /
     %% SSE / WebSocket handlers depend on it. Short-lived h1
     %% workloads can opt out for ~10% lower per-conn overhead.
-    graceful_drain => enabled | disabled,
+    graceful_drain => boolean(),
     %% Enabled protocols as a flat atom list in user-supplied (ALPN
     %% preference) order. On plain TCP with `[http2]`,
     %% `roadrunner_conn_loop:awaiting_shoot/3` routes straight to the
@@ -168,12 +168,12 @@ application, the scope is absent and the join is silently skipped
 Called by `roadrunner_conn_loop:init_loop/3` after the conn process
 starts but before it accepts any work.
 """.
--spec join_drain_group(atom(), enabled | disabled) -> ok.
-join_drain_group(_Name, disabled) ->
+-spec join_drain_group(atom(), boolean()) -> ok.
+join_drain_group(_Name, false) ->
     ok;
 join_drain_group(undefined, _) ->
     ok;
-join_drain_group(Name, enabled) ->
+join_drain_group(Name, true) ->
     case whereis(pg) of
         undefined -> ok;
         _ -> pg:join({roadrunner_drain, Name}, self())

@@ -383,7 +383,7 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
         max_clients => 100,
         minimum_bytes_per_second => 0,
         body_buffering => auto,
-        graceful_drain => disabled,
+        graceful_drain => false,
         protocols => [http2],
         http2_conn_window => 65535,
         http2_stream_window => 65535,
@@ -432,7 +432,7 @@ plaintext_listener_without_h2c_stays_h1() ->
         max_clients => 100,
         minimum_bytes_per_second => 0,
         body_buffering => auto,
-        graceful_drain => disabled,
+        graceful_drain => false,
         protocols => [http1]
     },
     Sock = {fake, Self},

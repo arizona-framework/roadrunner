@@ -151,7 +151,7 @@ vs elli's accept-and-handle-in-one-process model) and is out of
 scope for this branch.
 
 The earlier point-optimization attempts that came up empty
-(`graceful_drain => disabled`, `set_label`/`refine_conn_label` skip,
+(`graceful_drain => false`, `set_label`/`refine_conn_label` skip,
 `init_ack` first, async spawn, more acceptors) all turned out to
 target costs that were genuinely small relative to the inet_backend
 overhead. None of them would have surfaced the actual bottleneck
