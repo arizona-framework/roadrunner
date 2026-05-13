@@ -42,7 +42,6 @@
 
 -mode(compile).
 
--define(DEFAULT_SCENARIO, hello).
 -define(DEFAULT_CLIENTS, 50).
 -define(DEFAULT_DURATION_S, 5).
 -define(DEFAULT_WARMUP_S, 1).
@@ -369,7 +368,12 @@ cli() ->
                 name => scenarios,
                 long => "-scenarios",
                 type => {custom, fun parse_scenarios/1},
-                default => [?DEFAULT_SCENARIO],
+                %% Omitting `--scenarios` defaults to the `all` sentinel,
+                %% which `main/1` expands to the protocol-compatible
+                %% subset of `?KNOWN_SCENARIOS`. Explicit picks
+                %% (`--scenarios X,Y`) are passed through as a list and
+                %% still halt loudly on protocol mismatch.
+                default => all,
                 help =>
                     """
                     Comma-separated list of scenarios to run sequentially
@@ -377,14 +381,13 @@ cli() ->
                     is run in its own server-up / load / server-down
                     cycle, in the order given. Single-scenario
                     invocations (e.g. `--scenarios hello`) keep the
-                    existing one-shot output shape. The sentinel
-                    `--scenarios all` expands to every known scenario
-                    compatible with `--protocol`, dropping
-                    h1-only entries under `--protocol h2` and vice
-                    versa with a one-line note. Explicit
-                    comma-separated picks (`--scenarios X,Y`) still
-                    halt loudly on protocol mismatch — only the
-                    `all` sentinel auto-filters.
+                    existing one-shot output shape. Omitting the flag
+                    runs every known scenario compatible with
+                    `--protocol`, dropping h1-only entries under
+                    `--protocol h2` and vice versa with a one-line
+                    note. Explicit comma-separated picks
+                    (`--scenarios X,Y`) still halt loudly on protocol
+                    mismatch — only the omitted-default auto-filters.
 
                     hello:          GET / with 1 header, 7-byte body. Bare-minimum
                                     HTTP cost.
@@ -886,14 +889,11 @@ parse_servers(Str) ->
 %% Same shape for `--scenarios` — comma-separated list validated
 %% against `?KNOWN_SCENARIOS`. Single-value input (e.g.
 %% `--scenarios hello`) returns a 1-element list and runs the existing
-%% single-scenario flow unchanged. The literal `all` returns the atom
-%% sentinel `all` which `main/1` expands to the protocol-compatible
-%% subset of `?KNOWN_SCENARIOS` (so `--scenarios all --protocol h1`
-%% drops h2-only scenarios and vice versa, with a one-line note). The
-%% sentinel must appear alone — mixing it into a comma list (`all,X`)
-%% fails the known-atom check, which is the intended UX.
-parse_scenarios("all") ->
-    all;
+%% single-scenario flow unchanged. There is no user-facing `all`
+%% literal — when the user omits `--scenarios` entirely, argparse
+%% uses the atom default `all` (set in `cli/0`) and `main/1`'s
+%% `expand_scenarios/2` widens it to the protocol-compatible subset
+%% of `?KNOWN_SCENARIOS`.
 parse_scenarios(Str) ->
     parse_known_atoms(Str, ?KNOWN_SCENARIOS, "scenarios").
 
