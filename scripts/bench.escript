@@ -57,22 +57,87 @@
 %% `start_server/2` (plus any `scenario_*` config helpers below).
 -define(KNOWN_SERVERS, [roadrunner, cowboy, elli]).
 
+%% Scenarios known to the bench. `--scenario` accepts a comma-separated
+%% list (mirroring `--servers`), so each value in the user's input
+%% must validate against this set. Adding a new scenario requires
+%% appending it here, adding a `preflight_scenario/1` clause if any
+%% servers should be filtered, and wiring `scenario_path/1` /
+%% `build_request/N` / `start_server/2` for it.
+-define(KNOWN_SCENARIOS, [
+    hello,
+    echo,
+    large_response,
+    json,
+    headers_heavy,
+    streaming_response,
+    multi_stream_h2,
+    pipelined_h1,
+    slow_client,
+    connection_storm,
+    mixed_workload,
+    post_4kb_form,
+    large_post_streaming,
+    router_404_storm,
+    varied_paths_router,
+    gzip_response,
+    backpressure_sustained,
+    server_sent_events,
+    expect_100_continue,
+    large_keepalive_session,
+    websocket_msg_throughput,
+    url_with_qs,
+    small_chunked_response,
+    accept_storm_burst,
+    head_method,
+    etag_304,
+    partial_body_drop,
+    cookies_heavy,
+    tls_handshake_throughput,
+    multi_request_body,
+    path_with_unicode,
+    cors_preflight,
+    chunked_request_body,
+    redirect_response,
+    compressed_request_body,
+    httparena_baseline,
+    httparena_json,
+    httparena_upload_20mb_auto,
+    httparena_upload_20mb_manual
+]).
+
 main(Args) ->
     Opts0 = parse_args(Args),
     ProjectDir = project_dir(),
     ok = setup_code_paths(ProjectDir),
+    Scenarios = maps:get(scenarios, Opts0),
+    case maps:get(standalone, Opts0, false) of
+        true when length(Scenarios) > 1 ->
+            io:format(
+                standard_error,
+                "error: --standalone takes exactly one scenario (got: ~p)~n",
+                [Scenarios]
+            ),
+            halt(2);
+        _ ->
+            run_each_scenario(Opts0, Scenarios)
+    end.
+
+run_each_scenario(_Opts, []) ->
+    ok;
+run_each_scenario(Opts0, [Scenario | Rest]) ->
     %% preflight runs for both `--standalone` and the regular bench
     %% flow: it filters incompatible servers (e.g. elli for scenarios
     %% the elli fixture can't serve) and produces clear console
     %% notes. `run_standalone/1`'s "exactly one server" check then
     %% catches the case where the user-requested server got filtered
     %% out, instead of starting a listener that 404s every request.
-    Opts1 = preflight_protocol(Opts0),
+    Opts1 = preflight_protocol(Opts0#{scenario := Scenario}),
     Opts = preflight_scenario(Opts1),
     case maps:get(standalone, Opts, false) of
         true ->
             run_standalone(Opts);
         false ->
+            maybe_print_scenario_divider(Opts0, Scenario),
             print_header(Opts),
             %% Each side runs in isolation: bring the server up, drive load,
             %% bring it down, then do the next. Order matches the user's
@@ -80,7 +145,16 @@ main(Args) ->
             Servers = maps:get(servers, Opts),
             Results = [{S, element(2, run_side(S, Opts))} || S <- Servers],
             print_summary(Results)
-    end.
+    end,
+    run_each_scenario(Opts0, Rest).
+
+%% Single-scenario invocations keep the existing one-shot output
+%% verbatim. Multi-scenario runs prefix each iteration with a divider so
+%% the stacked tables are scannable.
+maybe_print_scenario_divider(#{scenarios := [_]}, _Scenario) ->
+    ok;
+maybe_print_scenario_divider(_Opts, Scenario) ->
+    io:format("~n==== scenario: ~s ====~n", [Scenario]).
 
 %% Validate environment for the chosen protocol and drop
 %% incompatible servers. The h2 path needs a TLS cert (auto-
@@ -232,51 +306,17 @@ cli() ->
             #{
                 name => scenario,
                 long => "-scenario",
-                type =>
-                    {atom, [
-                        hello,
-                        echo,
-                        large_response,
-                        json,
-                        headers_heavy,
-                        streaming_response,
-                        multi_stream_h2,
-                        pipelined_h1,
-                        slow_client,
-                        connection_storm,
-                        mixed_workload,
-                        post_4kb_form,
-                        large_post_streaming,
-                        router_404_storm,
-                        varied_paths_router,
-                        gzip_response,
-                        backpressure_sustained,
-                        server_sent_events,
-                        expect_100_continue,
-                        large_keepalive_session,
-                        websocket_msg_throughput,
-                        url_with_qs,
-                        small_chunked_response,
-                        accept_storm_burst,
-                        head_method,
-                        etag_304,
-                        partial_body_drop,
-                        cookies_heavy,
-                        tls_handshake_throughput,
-                        multi_request_body,
-                        path_with_unicode,
-                        cors_preflight,
-                        chunked_request_body,
-                        redirect_response,
-                        compressed_request_body,
-                        httparena_baseline,
-                        httparena_json,
-                        httparena_upload_20mb_auto,
-                        httparena_upload_20mb_manual
-                    ]},
-                default => ?DEFAULT_SCENARIO,
+                type => string,
+                default => atom_to_list(?DEFAULT_SCENARIO),
                 help =>
                     """
+                    Comma-separated list of scenarios to run sequentially
+                    (e.g. `--scenario hello,echo,large_response`). Each is
+                    run in its own server-up / load / server-down cycle, in
+                    the order given. Single-scenario invocations (e.g.
+                    `--scenario hello`) keep the existing one-shot output
+                    shape.
+
                     hello:          GET / with 1 header, 7-byte body. Bare-minimum
                                     HTTP cost.
                     echo:           POST /echo with 256-byte body and 5 request
@@ -756,7 +796,10 @@ parse_args(Argv) ->
     ProgOpts = #{progname => "bench.escript"},
     case argparse:parse(Argv, Cli, ProgOpts) of
         {ok, Parsed, _Path, _Cmd} ->
-            Parsed#{servers => parse_servers(maps:get(servers, Parsed))};
+            Parsed#{
+                servers => parse_servers(maps:get(servers, Parsed)),
+                scenarios => parse_scenarios(maps:get(scenario, Parsed))
+            };
         {error, Reason} ->
             io:format(standard_error, "~s~n~n", [argparse:format_error(Reason)]),
             io:format(standard_error, "~s~n", [argparse:help(Cli, ProgOpts)]),
@@ -768,11 +811,24 @@ parse_args(Argv) ->
 %% bench runs in the order they typed (e.g. `--servers elli,roadrunner`
 %% runs elli first).
 parse_servers(Str) ->
+    parse_known_atoms(Str, ?KNOWN_SERVERS, "servers").
+
+%% Same shape for `--scenario` — comma-separated list validated against
+%% `?KNOWN_SCENARIOS`. Single-value input (e.g. `--scenario hello`)
+%% returns a 1-element list and runs the existing single-scenario flow
+%% unchanged.
+parse_scenarios(Str) ->
+    parse_known_atoms(Str, ?KNOWN_SCENARIOS, "scenarios").
+
+%% Shared comma-list parser for the two enum-valued options. Splits on
+%% comma, trims OWS, validates each token against `Known`, and either
+%% returns the resolved atoms in user-typed order or halts with a clean
+%% error listing the unknown names.
+parse_known_atoms(Str, Known, Label) ->
     Names = [string:trim(P) || P <- string:split(Str, ",", all), P =/= ""],
     %% `list_to_existing_atom` blows up on names that aren't already
     %% atoms — convert via the safe membership check instead so a
     %% typo produces a clean error message, not a crash.
-    Known = ?KNOWN_SERVERS,
     KnownStrs = [atom_to_list(A) || A <- Known],
     Lookup = lists:zip(KnownStrs, Known),
     {Resolved, Unknown} = lists:foldr(
@@ -791,8 +847,8 @@ parse_servers(Str) ->
         _ ->
             io:format(
                 standard_error,
-                "error: unknown servers: ~p (known: ~p)~n",
-                [Unknown, Known]
+                "error: unknown ~s: ~p (known: ~p)~n",
+                [Label, Unknown, Known]
             ),
             halt(2)
     end.
