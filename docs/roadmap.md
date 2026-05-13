@@ -81,7 +81,8 @@ remaining 10 profiles need roadrunner-side features; listed in
 roughly the order a follow-up PR would tackle them. (`baseline-h2c`
 and `json-h2c` are reachable once the HttpArena SHA pin bumps and
 the bench app subscribes; the underlying h2c prior-knowledge
-support shipped in `roadrunner_listener`'s `h2c => enabled` opt.)
+support shipped in `roadrunner_listener`'s `protocols => [http2]`
+opt on plaintext listeners.)
 
 ### h2c Upgrade-mode on a shared port — medium (roadrunner-side)
 
@@ -89,10 +90,12 @@ support shipped in `roadrunner_listener`'s `h2c => enabled` opt.)
 request with `Upgrade: h2c, HTTP2-Settings: <base64>` headers,
 answered with `101 Switching Protocols`, after which the
 connection upstreams h2 frames. The same listener accepts h1 and
-h2c on the same port.
+h2c on the same port, unlocking `protocols => [http1, http2]` on
+plain TCP (today that combo is rejected at `init/1` with
+`{listener_opt_conflict, protocols, _, no_h2c_upgrade}`).
 
-**Why deferred:** The prior-knowledge variant (`h2c => enabled` on
-a dedicated plaintext listener) ships and covers the common case
+**Why deferred:** The prior-knowledge variant (`protocols => [http2]`
+on a dedicated plaintext listener) ships and covers the common case
 (benchmarks, internal clients with prior knowledge). Upgrade-mode
 adds preface sniffing or h1-parse-then-switch logic to the conn
 loop — a real expansion of the connection state machine that

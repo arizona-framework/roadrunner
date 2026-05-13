@@ -37,9 +37,9 @@ Standards conformance:
 
 - **HTTP/1.1**: RFC 9110 (semantics) + RFC 9112 (syntax).
 - **HTTP/2**: RFC 9113 (frames + multiplexing) + RFC 7541 (HPACK).
-  Opt-in per listener by listing `~"h2"` in the TLS
-  `alpn_preferred_protocols` option. Conformance harness:
-  [`scripts/h2spec.sh`](scripts/h2spec.sh) (drives
+  Opt-in per listener via `protocols => [http1, http2]` (or
+  `[http2]` for h2c prior-knowledge on plain TCP). Conformance
+  harness: [`scripts/h2spec.sh`](scripts/h2spec.sh) (drives
   [h2spec](https://github.com/summerwind/h2spec)).
 - **Content-Encoding** (RFC 9110 §8.4.1): gzip + deflate with
   qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3),
@@ -120,24 +120,26 @@ content-length: 18
 hello, roadrunner!
 ```
 
-For HTTP/2 over TLS, add a cert and put `~"h2"` in the listener's
-`alpn_preferred_protocols`:
+For HTTP/2 over TLS, add a cert and list both protocols. ALPN is
+derived from `protocols` automatically:
 
 ```erlang
 3> roadrunner:start_listener(my_tls_listener, #{
        port => 8443,
+       protocols => [http1, http2],
        tls => [
            {certfile, "cert.pem"},
-           {keyfile, "key.pem"},
-           {alpn_preferred_protocols, [~"h2", ~"http/1.1"]}
+           {keyfile, "key.pem"}
        ],
        routes => [{~"/", hello_handler, #{greeting => ~"hello"}}]
    }).
 ```
 
 ALPN routes `h2` clients to the HTTP/2 path and `http/1.1` clients (or
-no-ALPN) to the HTTP/1.1 path on the same listener. Omit `~"h2"` from
-the list to disable HTTP/2.
+no-ALPN) to the HTTP/1.1 path on the same listener. Drop `http2` from
+the list to disable HTTP/2. For HTTP/2 on plain TCP (h2c
+prior-knowledge per RFC 7540 §3.4), use `protocols => [http2]` without
+the `tls` opt.
 
 For listeners that don't need routing, `routes => Mod` skips the router
 entirely and dispatches every request to `Mod:handle/1`:

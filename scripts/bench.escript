@@ -1336,10 +1336,10 @@ start_roadrunner_h2(Scenario, CertDir) ->
     {ok, _} = peer:call(Peer, application, ensure_all_started, [roadrunner]),
     BaseOpts = #{
         port => 0,
+        protocols => [http1, http2],
         tls => [
             {certfile, CertDir ++ "/cert.pem"},
-            {keyfile, CertDir ++ "/key.pem"},
-            {alpn_preferred_protocols, [~"h2", ~"http/1.1"]}
+            {keyfile, CertDir ++ "/key.pem"}
         ],
         keep_alive_timeout => 60000,
         max_clients => 100000,

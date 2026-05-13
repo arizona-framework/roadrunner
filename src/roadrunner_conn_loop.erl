@@ -142,12 +142,12 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
             StartMono = roadrunner_telemetry:listener_accept(#{
                 listener_name => ListenerName, peer => Peer
             }),
-            case http2_negotiated(Socket) orelse h2c_enabled(ProtoOpts) of
+            case http2_negotiated(Socket) orelse h2c_only(ProtoOpts) of
                 true ->
                     %% Either ALPN landed on `h2` (TLS listener) or the
                     %% listener is in prior-knowledge h2c mode (plain TCP
-                    %% with `h2c => enabled`). The HTTP/2 path takes over;
-                    %% slot release and `listener_conn_close` happen
+                    %% with `protocols => [http2]`). The HTTP/2 path takes
+                    %% over; slot release and `listener_conn_close` happen
                     %% inside the h2 module.
                     roadrunner_conn_loop_http2:enter(
                         Socket, ProtoOpts, ListenerName, Peer, StartMono
@@ -183,9 +183,10 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
 
 %% True iff the TLS handshake negotiated `h2`. Plain TCP and TLS
 %% sessions where the client picked `http/1.1` (or sent no ALPN)
-%% fall through to HTTP/1.1. h2 is enabled by listing `~"h2"` in the
-%% listener's `alpn_preferred_protocols`; without it the server
-%% never advertises h2 so this branch is unreachable.
+%% fall through to HTTP/1.1. h2 ALPN is advertised when the listener
+%% lists `http2` in its `protocols` opt — that derivation runs in
+%% `roadrunner_transport:build_tls_opts/2` (or the user can override
+%% `alpn_preferred_protocols` explicitly inside `tls`).
 -spec http2_negotiated(roadrunner_transport:socket()) -> boolean().
 http2_negotiated(Socket) ->
     case roadrunner_transport:negotiated_alpn(Socket) of
@@ -193,14 +194,13 @@ http2_negotiated(Socket) ->
         _ -> false
     end.
 
-%% True iff this listener is configured for HTTP/2 cleartext
-%% (RFC 7540 §3.4 prior-knowledge). Plain TCP only: listener init
-%% rejects `h2c => enabled` combined with `tls`, so by the time this
-%% function runs the socket is `{gen_tcp, _}` (or `{fake, _}` in
-%% tests).
--spec h2c_enabled(roadrunner_conn:proto_opts()) -> boolean().
-h2c_enabled(#{h2c := enabled}) -> true;
-h2c_enabled(_) -> false.
+%% True iff this listener accepts HTTP/2 only (`protocols => [http2]`).
+%% On plain TCP this forces h2c prior-knowledge dispatch (RFC 7540
+%% §3.4). On TLS the ALPN handshake already drove the dispatch via
+%% `http2_negotiated/1`; this short-circuit is a no-op there.
+-spec h2c_only(roadrunner_conn:proto_opts()) -> boolean().
+h2c_only(#{protocols := [http2]}) -> true;
+h2c_only(_) -> false.
 
 %% --- read_request phase ---
 %%

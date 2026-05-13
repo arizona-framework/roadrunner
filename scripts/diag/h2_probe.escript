@@ -97,10 +97,10 @@ teardown(peer, Peer) ->
 listener_opts(CertDir) ->
     #{
         port => 0,
+        protocols => [http1, http2],
         tls => [
             {certfile, CertDir ++ "/cert.pem"},
-            {keyfile, CertDir ++ "/key.pem"},
-            {alpn_preferred_protocols, [~"h2", ~"http/1.1"]}
+            {keyfile, CertDir ++ "/key.pem"}
         ],
         routes => roadrunner_hello_handler,
         keep_alive_timeout => 60000,

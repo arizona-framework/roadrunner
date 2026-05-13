@@ -54,6 +54,7 @@ server-side stapling at the time of writing.
     messages/1,
     default_tls_opts/0,
     apply_tls_defaults/1,
+    build_tls_opts/2,
     negotiated_alpn/1
 ]).
 
@@ -368,6 +369,40 @@ apply_tls_defaults(UserOpts) ->
         not lists:member(Key, UserKeys)
     ],
     Defaults ++ UserOpts.
+
+-doc """
+Build the final `tls` opts list from the listener's `protocols` list
+and the user-supplied TLS options.
+
+Derives `alpn_preferred_protocols` from `Protocols` (`http2` →
+`~"h2"`, `http1` → `~"http/1.1"`) and prepends it to `UserOpts`,
+unless the user already supplied `alpn_preferred_protocols`
+explicitly — in which case the explicit value wins and derivation
+is skipped. Then layers hardened defaults underneath via
+`apply_tls_defaults/1`.
+
+Final precedence: explicit user value > derived ALPN > hardened
+defaults.
+""".
+-spec build_tls_opts([http1 | http2, ...], [ssl:tls_server_option()]) ->
+    [ssl:tls_server_option()].
+build_tls_opts(Protocols, UserOpts) ->
+    WithAlpn =
+        case lists:keymember(alpn_preferred_protocols, 1, UserOpts) of
+            true -> UserOpts;
+            false -> [{alpn_preferred_protocols, alpn_from_protocols(Protocols)} | UserOpts]
+        end,
+    apply_tls_defaults(WithAlpn).
+
+-spec alpn_from_protocols([http1 | http2, ...]) -> [binary(), ...].
+alpn_from_protocols(Protocols) ->
+    [
+        case P of
+            http2 -> ~"h2";
+            http1 -> ~"http/1.1"
+        end
+     || P <- Protocols
+    ].
 
 -doc """
 Return the ALPN protocol selected during the TLS handshake, or

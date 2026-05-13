@@ -75,19 +75,26 @@ All duration and interval values in `opts()` are in milliseconds —
     %% receive's `after` clause has a window to call
     %% `erlang:hibernate/3`.
     hibernate_after => pos_integer(),
-    %% When the `tls` opts include `alpn_preferred_protocols` containing
-    %% `~"h2"`, clients that ALPN-negotiate `h2` are dispatched to
-    %% `roadrunner_conn_loop_http2`; everything else (including no-ALPN
-    %% and `~"http/1.1"`) goes to the HTTP/1.1 path. Default ALPN is
-    %% `[~"http/1.1"]` only. For HTTP/2 on plain TCP set `h2c => enabled`.
+    %% Protocols this listener accepts. `http1` is HTTP/1.1, `http2`
+    %% is HTTP/2 (h2 over TLS via ALPN, or h2c prior-knowledge on
+    %% plain TCP per RFC 7540 §3.4). Default `[http1]`.
+    %%
+    %% On TLS listeners the list drives `alpn_preferred_protocols`
+    %% automatically (`http1` → `~"http/1.1"`, `http2` → `~"h2"`).
+    %% An explicit `alpn_preferred_protocols` inside `tls` overrides
+    %% the derivation.
+    %%
+    %% On plain TCP, `[http1]` serves HTTP/1.1 only; `[http2]` serves
+    %% h2c prior-knowledge (client sends the h2 connection preface
+    %% `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` directly, no Upgrade
+    %% negotiation). `[http1, http2]` on plain TCP is rejected at
+    %% `init/1` — roadrunner has no `Upgrade: h2c` implementation,
+    %% so the two cannot share a plaintext port.
+    %%
+    %% Empty list, unknown atoms, or duplicate entries are rejected
+    %% at `init/1`.
+    protocols => [http1 | http2, ...],
     tls => [ssl:tls_server_option()],
-    %% Force every accepted connection on a plaintext listener through
-    %% the HTTP/2 state machine via the RFC 7540 §3.4 prior-knowledge
-    %% variant. Client opens TCP and sends the h2 connection preface
-    %% (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) directly, no Upgrade
-    %% negotiation. Plain TCP only: combining `h2c => enabled` with
-    %% `tls` is rejected at `init/1`. Default `disabled`.
-    h2c => enabled | disabled,
     %% h2 connection-level recv window peak (bytes). The RFC default is
     %% 65535 — the only window reachable without explicit
     %% `WINDOW_UPDATE` per RFC 9113 §6.5.2 (SETTINGS doesn't carry the
@@ -287,13 +294,16 @@ listener_name() ->
 
 -spec open_listen_socket(inet:port_number(), opts()) ->
     {ok, roadrunner_transport:socket()} | {error, term()}.
-open_listen_socket(Port, #{tls := UserTlsOpts}) ->
-    %% TLS path — caller supplies cert/key (and optionally
-    %% `alpn_preferred_protocols`). We merge `roadrunner_transport`'s
-    %% hardened defaults underneath (user values win) and layer the
-    %% standard transport options on top so accepted sockets behave like
+open_listen_socket(Port, #{tls := UserTlsOpts} = Opts) ->
+    %% TLS path — caller supplies cert/key. ALPN is derived from the
+    %% `protocols` list (`http2` → `~"h2"`, `http1` → `~"http/1.1"`)
+    %% unless the user supplied `alpn_preferred_protocols` explicitly,
+    %% in which case the explicit value wins. Hardened defaults are
+    %% layered underneath (user values win), and the standard
+    %% transport options sit on top so accepted sockets behave like
     %% the plain-TCP variant.
-    TlsOpts = roadrunner_transport:apply_tls_defaults(UserTlsOpts),
+    Protocols = maps:get(protocols, Opts, [http1]),
+    TlsOpts = roadrunner_transport:build_tls_opts(Protocols, UserTlsOpts),
     roadrunner_transport:listen_tls(Port, TlsOpts ++ base_listen_opts());
 open_listen_socket(Port, _Opts) ->
     %% Plain TCP. The legacy `inet_drv` backend (gen_tcp default) has
@@ -377,7 +387,7 @@ build_proto_opts(Opts, ListenerName) ->
     ok = validate_h2_window_opt(h2_initial_conn_window, Opts, 16#7FFFFFFF),
     ok = validate_h2_window_opt(h2_initial_stream_window, Opts, 16#7FFFFFFF),
     ok = validate_h2_window_opt(h2_window_refill_threshold, Opts, 16#7FFFFFFF),
-    ok = validate_h2c_opt(Opts),
+    ok = validate_protocols(Opts),
     %% Per-listener atomics: live-connection counter (acceptors bump on
     %% accept; conns decrement on exit) and a cumulative requests-served
     %% counter (conn bumps on each handler dispatch). Lock-free, ~1ns
@@ -400,7 +410,7 @@ build_proto_opts(Opts, ListenerName) ->
         body_buffering => maps:get(body_buffering, Opts, auto),
         listener_name => ListenerName,
         graceful_drain => maps:get(graceful_drain, Opts, enabled),
-        h2c => maps:get(h2c, Opts, disabled),
+        protocols => maps:get(protocols, Opts, [http1]),
         h2_initial_conn_window => maps:get(h2_initial_conn_window, Opts, 65535),
         h2_initial_stream_window => maps:get(h2_initial_stream_window, Opts, 65535),
         h2_window_refill_threshold => maps:get(h2_window_refill_threshold, Opts, 32768)
@@ -447,27 +457,34 @@ validate_h2_window_opt(Key, Opts, Max) ->
             error({invalid_listener_opt, Key, V})
     end.
 
-%% `h2c => enabled` is a plaintext-only mode: TLS listeners use ALPN
-%% to negotiate h2 instead. Reject the combo at `init/1` so the
-%% misconfiguration surfaces immediately rather than as a silent
-%% no-op (the dispatch wouldn't honour h2c on a TLS socket anyway).
+%% Validate the `protocols` opt. Two error shapes follow the existing
+%% convention from `validate_h2_window_opt/3`:
 %%
-%% Two error shapes:
-%%
-%% - `{invalid_listener_opt, h2c, V}` for a bad value (anything other
-%%   than `enabled` / `disabled`). Matches `validate_h2_window_opt/3`.
-%% - `{listener_opt_conflict, h2c, tls}` when both opts are present
-%%   together. The value `enabled` is valid in isolation; the
-%%   misconfiguration is the combination, so a distinct class makes
-%%   the error message say what's actually wrong.
--spec validate_h2c_opt(opts()) -> ok.
-validate_h2c_opt(Opts) ->
-    case {maps:get(h2c, Opts, disabled), maps:is_key(tls, Opts)} of
-        {disabled, _} -> ok;
-        {enabled, false} -> ok;
-        {enabled, true} -> error({listener_opt_conflict, h2c, tls});
-        {Other, _} -> error({invalid_listener_opt, h2c, Other})
+%% - `{invalid_listener_opt, protocols, V}` for a bad list shape:
+%%   empty list, non-list, unknown atom, or duplicate entries.
+%% - `{listener_opt_conflict, protocols, V, no_h2c_upgrade}` for the
+%%   one combo we have to reject at config time: `[http1, http2]` on
+%%   a plain-TCP listener. Roadrunner has no `Upgrade: h2c`
+%%   implementation, so the two cannot share a plaintext port; the
+%%   reason token spells that out so the error message is honest.
+-spec validate_protocols(opts()) -> ok.
+validate_protocols(Opts) ->
+    Protos = maps:get(protocols, Opts, [http1]),
+    HasTls = maps:is_key(tls, Opts),
+    case classify_protocols(Protos) of
+        h1_only -> ok;
+        h2_only -> ok;
+        h1_and_h2 when HasTls -> ok;
+        h1_and_h2 -> error({listener_opt_conflict, protocols, Protos, no_h2c_upgrade});
+        invalid -> error({invalid_listener_opt, protocols, Protos})
     end.
+
+-spec classify_protocols(term()) -> h1_only | h2_only | h1_and_h2 | invalid.
+classify_protocols([http1]) -> h1_only;
+classify_protocols([http2]) -> h2_only;
+classify_protocols([http1, http2]) -> h1_and_h2;
+classify_protocols([http2, http1]) -> h1_and_h2;
+classify_protocols(_) -> invalid.
 
 build_dispatch(#{routes := Module}, _ListenerName) when is_atom(Module) ->
     {handler, Module};

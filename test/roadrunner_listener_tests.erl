@@ -226,62 +226,70 @@ listener_threads_hibernate_after_into_proto_opts_test() ->
     ?assertEqual(5000, maps:get(hibernate_after, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
-listener_threads_h2c_into_proto_opts_test() ->
-    %% `h2c => enabled` listener opt threads into proto_opts so the
-    %% dispatch helper `roadrunner_conn_loop:h2c_enabled/1` can read
+listener_threads_protocols_into_proto_opts_test() ->
+    %% `protocols => [http2]` listener opt threads into proto_opts so
+    %% the dispatch helper `roadrunner_conn_loop:h2c_only/1` can read
     %% it and route plaintext connections to the h2 conn loop without
     %% an ALPN check.
-    Name = listener_test_h2c_enabled,
+    Name = listener_test_protocols_h2,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
-        h2c => enabled,
+        protocols => [http2],
         routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
-    ?assertEqual(enabled, maps:get(h2c, ProtoOpts)),
+    ?assertEqual([http2], maps:get(protocols, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
-listener_h2c_default_disabled_test() ->
-    %% Default for `h2c` is `disabled`; plaintext listeners stay
+listener_protocols_default_is_http1_only_test() ->
+    %% Default for `protocols` is `[http1]`; plaintext listeners stay
     %% h1-only unless explicitly opted in.
-    Name = listener_test_h2c_default,
+    Name = listener_test_protocols_default,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
         routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
-    ?assertEqual(disabled, maps:get(h2c, ProtoOpts)),
+    ?assertEqual([http1], maps:get(protocols, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
-listener_rejects_h2c_with_tls_test() ->
-    %% `h2c => enabled` is plaintext-only. Combining it with `tls`
-    %% must crash `init/1` so the misconfiguration surfaces at
-    %% startup, not as a silent no-op on the dispatch path.
-    Name = listener_test_h2c_with_tls,
+listener_rejects_h1_and_h2_on_plain_tcp_test() ->
+    %% `[http1, http2]` (and the reverse order) on plain TCP needs
+    %% `Upgrade: h2c` to share the port — roadrunner doesn't implement
+    %% that, so either ordering must surface as an error at `init/1`.
     process_flag(trap_exit, true),
-    Result = roadrunner_listener:start_link(Name, #{
-        port => 0,
-        tls => [
-            {certfile, "/nonexistent/cert.pem"},
-            {keyfile, "/nonexistent/key.pem"}
-        ],
-        h2c => enabled,
-        routes => roadrunner_hello_handler
-    }),
-    ?assertMatch({error, {{listener_opt_conflict, h2c, tls}, _Stack}}, Result).
+    lists:foreach(
+        fun(Protos) ->
+            R = roadrunner_listener:start_link(listener_test_protocols_no_h2c_upgrade, #{
+                port => 0,
+                protocols => Protos,
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch(
+                {error, {{listener_opt_conflict, protocols, Protos, no_h2c_upgrade}, _Stack}}, R
+            )
+        end,
+        [[http1, http2], [http2, http1]]
+    ).
 
-listener_rejects_invalid_h2c_value_test() ->
-    %% Any atom other than `enabled` / `disabled` is rejected at init.
-    Name = listener_test_h2c_bad_atom,
+listener_rejects_invalid_protocols_value_test() ->
+    %% Empty list, unknown atom, duplicates, and non-list shapes all
+    %% reject with `{invalid_listener_opt, protocols, _}`.
+    Name = listener_test_protocols_invalid,
     process_flag(trap_exit, true),
-    Result = roadrunner_listener:start_link(Name, #{
-        port => 0,
-        h2c => yes,
-        routes => roadrunner_hello_handler
-    }),
-    ?assertMatch({error, {{invalid_listener_opt, h2c, yes}, _Stack}}, Result).
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                protocols => Bad,
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, protocols, _}, _Stack}}, R)
+        end,
+        [[], [http3], [http1, http1], not_a_list]
+    ).
 
 slot_reconciliation_disabled_drops_reconcile_slots_message_test() ->
     %% A `reconcile_slots` arriving at a listener with reconciliation

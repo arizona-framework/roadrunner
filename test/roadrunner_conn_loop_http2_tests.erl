@@ -358,11 +358,12 @@ concurrent_streams_both_dispatch() ->
 
 h2c_dispatch_routes_plaintext_to_http2_loop() ->
     %% Drive the dispatch decision through `roadrunner_conn_loop:start/2`
-    %% with a `{fake, _}` socket and `h2c => enabled`. Without the h2c
-    %% opt the plain TCP path stays h1 and the conn waits for a request
-    %% line; the h2 path proactively emits SETTINGS right after `shoot`.
-    %% Receiving an h2 SETTINGS frame here proves the new dispatch
-    %% (`http2_negotiated/1 orelse h2c_enabled/1`) routed to the h2 loop.
+    %% with a `{fake, _}` socket and `protocols => [http2]`. Without
+    %% http2 in the protocols list the plain TCP path stays h1 and the
+    %% conn waits for a request line; the h2 path proactively emits
+    %% SETTINGS right after `shoot`. Receiving an h2 SETTINGS frame
+    %% here proves the new dispatch (`http2_negotiated/1 orelse
+    %% h2c_only/1`) routed to the h2 loop.
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
@@ -383,7 +384,7 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
         minimum_bytes_per_second => 0,
         body_buffering => auto,
         graceful_drain => disabled,
-        h2c => enabled,
+        protocols => [http2],
         h2_initial_conn_window => 65535,
         h2_initial_stream_window => 65535,
         h2_window_refill_threshold => 32768
@@ -403,7 +404,7 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
 
 plaintext_listener_without_h2c_stays_h1() ->
     %% Regression guard for the dispatch's false branch. Without
-    %% `h2c => enabled` and without TLS ALPN, `awaiting_shoot/3`
+    %% `http2` in `protocols` and without TLS ALPN, `awaiting_shoot/3`
     %% must fall through to the HTTP/1.1 path. Discriminator:
     %%
     %% - The h2 path proactively sends a SETTINGS frame on the wire
@@ -432,7 +433,7 @@ plaintext_listener_without_h2c_stays_h1() ->
         minimum_bytes_per_second => 0,
         body_buffering => auto,
         graceful_drain => disabled,
-        h2c => disabled,
+        protocols => [http1],
         h2_initial_conn_window => 65535,
         h2_initial_stream_window => 65535,
         h2_window_refill_threshold => 32768
