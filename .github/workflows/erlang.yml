@@ -54,13 +54,22 @@ jobs:
       - name: Set build cache key
         id: set-build-key
         run: |
+          # Key is per-commit so each push gets its own _build cache.
+          # actions/cache is immutable per key: a key-based cache hit
+          # skips the post-step upload, so without the SHA component
+          # branches that don't touch rebar.config / rebar.lock would
+          # all share main's cache and downstream jobs (h2spec,
+          # wrk2-smoke) would run against main's stale .beam files
+          # even after cache-erlang recompiled this branch's source.
+          # restore-keys (the prefix) gives a fresh SHA a warm start
+          # from the most recent matching cache.
           os="${{ runner.os }}"
           otp="${{ steps.setup-beam.outputs.otp-version }}"
           cfg_hash="${{ hashFiles('rebar.config') }}"
           lock_hash="${{ hashFiles('rebar.lock') }}"
-          prefix="_build-${os}-otp-${otp}-cfg-${cfg_hash}-"
+          prefix="_build-${os}-otp-${otp}-cfg-${cfg_hash}-lock-${lock_hash}-"
           echo "prefix=${prefix}" >> "${GITHUB_OUTPUT}"
-          echo "key=${prefix}lock-${lock_hash}" >> "${GITHUB_OUTPUT}"
+          echo "key=${prefix}sha-${{ github.sha }}" >> "${GITHUB_OUTPUT}"
 
       - name: Set rebar cache key
         id: set-rebar-key
