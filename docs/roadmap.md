@@ -61,7 +61,7 @@ production options are imperfect:
   GitHub's license API pick it up automatically; the README
   declaration is unambiguous but unconventional.
 
-`--protocol h3` in `scripts/bench.escript` is currently a stub;
+`--protocols h3` in `scripts/bench.escript` is currently a stub;
 ALPN advertisement does not include `h3`.
 
 **Scope:** medium-large. Wiring is mostly: ALPN advertise `h3`,

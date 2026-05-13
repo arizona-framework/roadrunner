@@ -10,9 +10,9 @@
 %%%
 %%% Two protocols are supported, both via the same pure-Erlang
 %%% `roadrunner_bench_client` worker pool:
-%%%   --protocol h1 (default): plain TCP, one keep-alive connection
+%%%   --protocols h1 (default): plain TCP, one keep-alive connection
 %%%       per worker.
-%%%   --protocol h2: TLS + ALPN h2, one keep-alive connection per
+%%%   --protocols h2: TLS + ALPN h2, one keep-alive connection per
 %%%       worker, in-tree codec via `roadrunner_http2_frame` +
 %%%       `roadrunner_http2_hpack`. elli is filtered automatically
 %%%       — no h2 support there.
@@ -55,6 +55,13 @@
 %% server is two steps: append it here and add a clause for it in
 %% `start_server/2` (plus any `scenario_*` config helpers below).
 -define(KNOWN_SERVERS, [roadrunner, cowboy, elli]).
+
+%% Wire protocols the bench can drive. `--protocols` accepts a
+%% comma-separated subset; omitting the flag iterates every protocol.
+%% Adding a new protocol (e.g. h3) requires appending it here, wiring
+%% `preflight_protocol/1`, and tagging incompatible scenarios in the
+%% `?H?_ONLY_SCENARIOS` macros below.
+-define(KNOWN_PROTOCOLS, [h1, h2]).
 
 %% Scenarios are partitioned by protocol compatibility. Each scenario
 %% name lives in exactly one of these three macros; adding a new
@@ -132,21 +139,71 @@ main(Args) ->
     Opts0 = parse_args(Args),
     ProjectDir = project_dir(),
     ok = setup_code_paths(ProjectDir),
-    Scenarios = expand_scenarios(
-        maps:get(scenarios, Opts0), maps:get(protocol, Opts0)
+    Protocols = expand_protocols(maps:get(protocols, Opts0)),
+    Scenarios0 = maps:get(scenarios, Opts0),
+    case maps:get(standalone, Opts0, false) of
+        true ->
+            run_standalone_one(Opts0, Protocols, Scenarios0);
+        false ->
+            run_each_protocol(Opts0, Protocols, Scenarios0)
+    end.
+
+%% Standalone mode brings up ONE listener for an out-of-process wrk2
+%% driver, so exactly one protocol AND exactly one scenario must be
+%% selected. Each failure mode gets its own clear error.
+run_standalone_one(_Opts, Protocols, _Scenarios0) when length(Protocols) =/= 1 ->
+    io:format(
+        standard_error,
+        "error: --standalone takes exactly one protocol (got: ~p)~n",
+        [Protocols]
     ),
-    Opts1 = Opts0#{scenarios := Scenarios},
-    case maps:get(standalone, Opts1, false) of
-        true when length(Scenarios) > 1 ->
+    halt(2);
+run_standalone_one(Opts0, [Protocol], Scenarios0) ->
+    Scenarios = expand_scenarios(Scenarios0, Protocol),
+    case Scenarios of
+        [Scenario] ->
+            Opts1 = Opts0#{
+                protocols := [Protocol],
+                protocol => Protocol,
+                scenarios := Scenarios,
+                scenario => Scenario
+            },
+            run_standalone(Opts1);
+        _ ->
             io:format(
                 standard_error,
                 "error: --standalone takes exactly one scenario (got: ~p)~n",
                 [Scenarios]
             ),
-            halt(2);
-        _ ->
-            run_each_scenario(Opts1, Scenarios)
+            halt(2)
     end.
+
+run_each_protocol(_Opts, [], _Scenarios0) ->
+    ok;
+run_each_protocol(Opts0, [Protocol | Rest], Scenarios0) ->
+    Scenarios = expand_scenarios(Scenarios0, Protocol),
+    Opts1 = Opts0#{
+        protocol => Protocol,
+        scenarios := Scenarios
+    },
+    maybe_print_protocol_divider(Opts0, Protocol),
+    run_each_scenario(Opts1, Scenarios),
+    run_each_protocol(Opts0, Rest, Scenarios0).
+
+%% Single-protocol invocations keep the original output verbatim.
+%% Multi-protocol runs prefix each protocol block with a heavier
+%% divider so the nested scenario blocks underneath stay scannable.
+maybe_print_protocol_divider(#{protocols := [_]}, _Protocol) ->
+    ok;
+maybe_print_protocol_divider(_Opts, Protocol) ->
+    io:format("~n======== protocol: ~s ========~n", [Protocol]).
+
+%% Resolve the `--protocol` sentinel `all` (default when the flag is
+%% omitted) to `?KNOWN_PROTOCOLS`. Explicit picks pass through.
+expand_protocols(all) ->
+    ?KNOWN_PROTOCOLS;
+expand_protocols(Protocols) when is_list(Protocols) ->
+    Protocols.
 
 %% Resolve the `--scenarios all` sentinel to the protocol-compatible
 %% subset of `?KNOWN_SCENARIOS`. Other shapes (already a list of
@@ -166,7 +223,7 @@ expand_scenarios(all, Protocol) ->
             ok;
         _ ->
             io:format(
-                "note: --scenarios all + --protocol ~s, dropped: ~p~n",
+                "note: --protocols ~s, dropped ~p as incompatible~n",
                 [Protocol, Dropped]
             )
     end,
@@ -321,7 +378,7 @@ preflight_protocol(#{protocol := h2, servers := Servers} = Opts) ->
     case Filtered =/= Servers of
         true ->
             io:format(
-                "note: --protocol h2 — elli filtered out (no HTTP/2 support)~n",
+                "note: --protocols h2 — elli filtered out (no HTTP/2 support)~n",
                 []
             );
         false ->
@@ -383,8 +440,8 @@ cli() ->
                     invocations (e.g. `--scenarios hello`) keep the
                     existing one-shot output shape. Omitting the flag
                     runs every known scenario compatible with
-                    `--protocol`, dropping h1-only entries under
-                    `--protocol h2` and vice versa with a one-line
+                    `--protocols`, dropping h1-only entries under
+                    `--protocols h2` and vice versa with a one-line
                     note. Explicit comma-separated picks
                     (`--scenarios X,Y`) still halt loudly on protocol
                     mismatch — only the omitted-default auto-filters.
@@ -816,10 +873,16 @@ cli() ->
                     """
             },
             #{
-                name => protocol,
+                name => protocols,
                 long => "-protocol",
-                type => {atom, [h1, h2]},
-                default => h1,
+                type => {custom, fun parse_protocols/1},
+                %% Omitting `--protocols` defaults to the `all` sentinel,
+                %% which `main/1` expands to `?KNOWN_PROTOCOLS`. Explicit
+                %% picks (`--protocols h1` or `--protocols h1,h2`) are
+                %% passed through as a list. Both forms iterate in
+                %% sequence with per-protocol output dividers when
+                %% length > 1.
+                default => all,
                 help =>
                     """
                     Wire protocol to drive the load over. Both paths
@@ -843,7 +906,7 @@ cli() ->
                     out-of-process load drivers (e.g. wrk2) target
                     the listener without re-implementing the per-
                     server launcher logic. Requires `--port-file`,
-                    `--servers <one>`, `--protocol h1` (h1-only).
+                    `--servers <one>`, `--protocols h1` (h1-only).
                     """
             },
             #{
@@ -896,6 +959,13 @@ parse_servers(Str) ->
 %% of `?KNOWN_SCENARIOS`.
 parse_scenarios(Str) ->
     parse_known_atoms(Str, ?KNOWN_SCENARIOS, "scenarios").
+
+%% Same shape for `--protocols` — comma-separated list validated
+%% against `?KNOWN_PROTOCOLS`. Omitting the flag entirely uses the
+%% atom default `all` (set in `cli/0`) which `main/1`'s
+%% `expand_protocols/1` widens to `?KNOWN_PROTOCOLS`.
+parse_protocols(Str) ->
+    parse_known_atoms(Str, ?KNOWN_PROTOCOLS, "protocols").
 
 %% Shared comma-list parser for the two enum-valued options. Splits on
 %% comma, trims OWS, validates each token against `Known`, and either
@@ -956,7 +1026,7 @@ run_standalone(Opts) ->
         end,
     Protocol = maps:get(protocol, Opts),
     Protocol =:= h1 orelse standalone_error(
-        "--standalone is h1-only (received --protocol ~s)", [Protocol]
+        "--standalone is h1-only (received --protocols ~s)", [Protocol]
     ),
     Scenario = maps:get(scenario, Opts),
     ok = validate_standalone_scenario(Scenario),
@@ -2777,12 +2847,12 @@ build_request(streaming_response) ->
     %% can't reuse — limit this scenario to h2.
     io:format(standard_error,
         "error: --scenarios streaming_response is h2-only "
-        "(use --protocol h2)~n", []),
+        "(use --protocols h2)~n", []),
     halt(2);
 build_request(multi_stream_h2) ->
     io:format(standard_error,
         "error: --scenarios multi_stream_h2 is h2-only "
-        "(use --protocol h2)~n", []),
+        "(use --protocols h2)~n", []),
     halt(2);
 build_request(large_post_streaming) ->
     %% 1 MB body — `x` repeated. Cached at module load via
@@ -2815,7 +2885,7 @@ build_request(small_chunked_response) ->
     %% loop. h2-only.
     io:format(standard_error,
         "error: --scenarios small_chunked_response is h2-only "
-        "(use --protocol h2)~n", []),
+        "(use --protocols h2)~n", []),
     halt(2);
 build_request(head_method) ->
     ~"HEAD /large HTTP/1.1\r\nHost: x\r\n\r\n";
@@ -2827,7 +2897,7 @@ build_request(tls_handshake_throughput) ->
     %% h2-only scenario — handshake dominates, only meaningful over TLS.
     io:format(standard_error,
         "error: --scenarios tls_handshake_throughput is h2-only "
-        "(use --protocol h2)~n", []),
+        "(use --protocols h2)~n", []),
     halt(2);
 build_request(multi_request_body) ->
     Body = binary:copy(~"x", 4096),
@@ -3239,7 +3309,7 @@ h2_request_shape(pipelined_h1) ->
     %% with no analogue in h2 (use `multi_stream_h2` instead).
     io:format(standard_error,
         "error: --scenarios pipelined_h1 is h1-only "
-        "(use --protocol h1; for h2 multiplexing see multi_stream_h2)~n", []),
+        "(use --protocols h1; for h2 multiplexing see multi_stream_h2)~n", []),
     halt(2);
 h2_request_shape(slow_client) ->
     %% Drip-feed semantics target the h1 byte-stream parser; h2's
@@ -3247,7 +3317,7 @@ h2_request_shape(slow_client) ->
     %% (and less interesting) test.
     io:format(standard_error,
         "error: --scenarios slow_client is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(connection_storm) ->
     %% Per-request TLS handshake would dominate the measurement
@@ -3256,7 +3326,7 @@ h2_request_shape(connection_storm) ->
     %% conns is anti-h2 and not a real-world workload.
     io:format(standard_error,
         "error: --scenarios connection_storm is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(mixed_workload) ->
     %% h2 mixed-path workload is a separate (and meaningful) test
@@ -3265,7 +3335,7 @@ h2_request_shape(mixed_workload) ->
     %% h1 router under varied dispatch.
     io:format(standard_error,
         "error: --scenarios mixed_workload is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(post_4kb_form) ->
     %% h2 form-decode is a meaningful follow-up but out of scope
@@ -3273,7 +3343,7 @@ h2_request_shape(post_4kb_form) ->
     %% qs:parse path under realistic body sizes.
     io:format(standard_error,
         "error: --scenarios post_4kb_form is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(large_post_streaming) ->
     %% h2 has a different body-delivery model (DATA frames with
@@ -3282,7 +3352,7 @@ h2_request_shape(large_post_streaming) ->
     %% current focus is the h1 body-state machine.
     io:format(standard_error,
         "error: --scenarios large_post_streaming is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(router_404_storm) ->
     %% Connection lifecycle is the dominant cost on this scenario;
@@ -3290,7 +3360,7 @@ h2_request_shape(router_404_storm) ->
     %% router-miss cost we're trying to surface. h1-only.
     io:format(standard_error,
         "error: --scenarios router_404_storm is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(varied_paths_router) ->
     %% h2 varied paths is meaningful but needs varying per-request
@@ -3298,7 +3368,7 @@ h2_request_shape(varied_paths_router) ->
     %% scenario.
     io:format(standard_error,
         "error: --scenarios varied_paths_router is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(gzip_response) ->
     %% h2 has its own header compression (HPACK) and per-stream
@@ -3307,7 +3377,7 @@ h2_request_shape(gzip_response) ->
     %% path specifically.
     io:format(standard_error,
         "error: --scenarios gzip_response is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(backpressure_sustained) ->
     %% Connection limits over h2 are per-stream not per-conn; the
@@ -3315,7 +3385,7 @@ h2_request_shape(backpressure_sustained) ->
     %% is a different scenario worth its own design. h1-only here.
     io:format(standard_error,
         "error: --scenarios backpressure_sustained is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(server_sent_events) ->
     %% h2 SSE works (RFC 8441 + chunked-frame DATA) but the
@@ -3323,28 +3393,28 @@ h2_request_shape(server_sent_events) ->
     %% reads. Out of scope for now.
     io:format(standard_error,
         "error: --scenarios server_sent_events is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(expect_100_continue) ->
     %% h2 has no Expect: 100-continue equivalent (see RFC 9113 §8.5).
     %% h1-only scenario.
     io:format(standard_error,
         "error: --scenarios expect_100_continue is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(large_keepalive_session) ->
     %% h2 has no per-conn-request count limit at the protocol layer
     %% (per-stream limits are different); h1-only scenario.
     io:format(standard_error,
         "error: --scenarios large_keepalive_session is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(websocket_msg_throughput) ->
     %% RFC 8441 (h2 + WS) is out of scope for this scenario;
     %% bench-client side hasn't been wired for h2 WS frames.
     io:format(standard_error,
         "error: --scenarios websocket_msg_throughput is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(url_with_qs) ->
     %% h2 path encodes the query string in the `:path` pseudo-
@@ -3353,7 +3423,7 @@ h2_request_shape(url_with_qs) ->
     %% the h1 URL-side qs:parse path specifically.
     io:format(standard_error,
         "error: --scenarios url_with_qs is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(small_chunked_response) ->
     {~"GET", ~"/small", [], <<>>};
@@ -3362,7 +3432,7 @@ h2_request_shape(accept_storm_burst) ->
     %% backlog under burst is an h1-flavored question.
     io:format(standard_error,
         "error: --scenarios accept_storm_burst is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(head_method) ->
     {~"HEAD", ~"/large", [], <<>>};
@@ -3373,14 +3443,14 @@ h2_request_shape(etag_304) ->
     %% scope here.
     io:format(standard_error,
         "error: --scenarios etag_304 is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(partial_body_drop) ->
     %% h2 has its own truncation semantics (RST_STREAM); the h1
     %% Content-Length-mismatch path is what this scenario targets.
     io:format(standard_error,
         "error: --scenarios partial_body_drop is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(cookies_heavy) ->
     {~"GET", ~"/cookies",
@@ -3395,32 +3465,32 @@ h2_request_shape(multi_request_body) ->
 h2_request_shape(path_with_unicode) ->
     io:format(standard_error,
         "error: --scenarios path_with_unicode is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(cors_preflight) ->
     %% h2 client doesn't support OPTIONS preflight (it bypasses
     %% CORS via origin negotiation); h1-only.
     io:format(standard_error,
         "error: --scenarios cors_preflight is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(chunked_request_body) ->
     %% h2 has its own framing (DATA frames); chunked is h1-specific.
     io:format(standard_error,
         "error: --scenarios chunked_request_body is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(redirect_response) ->
     %% Bench h2 client only accepts :status = 200; 302 would
     %% short-circuit to bad_status. h2 follow-up.
     io:format(standard_error,
         "error: --scenarios redirect_response is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(compressed_request_body) ->
     io:format(standard_error,
         "error: --scenarios compressed_request_body is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(headers_heavy) ->
     %% 16 small custom headers — exercises HPACK encode's
@@ -3437,14 +3507,14 @@ h2_request_shape(httparena_baseline) ->
     %% this scenario mirrors HttpArena's h1 baseline profile.
     io:format(standard_error,
         "error: --scenarios httparena_baseline is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(httparena_json) ->
     %% h2 variant is meaningful but out of scope for the first round;
     %% this scenario mirrors HttpArena's h1 json profile.
     io:format(standard_error,
         "error: --scenarios httparena_json is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(httparena_upload_20mb_auto) ->
     %% h2 has its own body-delivery model (DATA frames with per-stream
@@ -3452,12 +3522,12 @@ h2_request_shape(httparena_upload_20mb_auto) ->
     %% adding later. h1-only here.
     io:format(standard_error,
         "error: --scenarios httparena_upload_20mb_auto is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(httparena_upload_20mb_manual) ->
     io:format(standard_error,
         "error: --scenarios httparena_upload_20mb_manual is h1-only "
-        "(use --protocol h1)~n", []),
+        "(use --protocols h1)~n", []),
     halt(2).
 
 h2_worker_loop(Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->

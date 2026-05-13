@@ -196,7 +196,7 @@ Full matrix (regenerates `bench_results.md`):
 
 Override defaults via env: `RUNS=5 DURATION=10 ./scripts/bench_matrix.sh`.
 
-`scripts/bench.escript --protocol h2` drives the same scenarios
+`scripts/bench.escript --protocols h2` drives the same scenarios
 over HTTP/2. The h2 loadgen is the in-tree pure-Erlang
 `roadrunner_bench_client` (lives in `test/` because it's only used
 by dev tools); no external h2 client / loadgen needs to be
