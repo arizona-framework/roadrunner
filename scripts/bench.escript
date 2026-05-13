@@ -109,7 +109,7 @@ main(Args) ->
     Opts0 = parse_args(Args),
     ProjectDir = project_dir(),
     ok = setup_code_paths(ProjectDir),
-    Scenarios = maps:get(scenarios, Opts0),
+    Scenarios = maps:get(scenario, Opts0),
     case maps:get(standalone, Opts0, false) of
         true when length(Scenarios) > 1 ->
             io:format(
@@ -150,8 +150,9 @@ run_each_scenario(Opts0, [Scenario | Rest]) ->
 
 %% Single-scenario invocations keep the existing one-shot output
 %% verbatim. Multi-scenario runs prefix each iteration with a divider so
-%% the stacked tables are scannable.
-maybe_print_scenario_divider(#{scenarios := [_]}, _Scenario) ->
+%% the stacked tables are scannable. The match looks at the original
+%% parsed `scenario` list (pre-iteration override) to decide.
+maybe_print_scenario_divider(#{scenario := [_]}, _Scenario) ->
     ok;
 maybe_print_scenario_divider(_Opts, Scenario) ->
     io:format("~n==== scenario: ~s ====~n", [Scenario]).
@@ -306,8 +307,8 @@ cli() ->
             #{
                 name => scenario,
                 long => "-scenario",
-                type => string,
-                default => atom_to_list(?DEFAULT_SCENARIO),
+                type => {custom, fun parse_scenarios/1},
+                default => [?DEFAULT_SCENARIO],
                 help =>
                     """
                     Comma-separated list of scenarios to run sequentially
@@ -649,8 +650,8 @@ cli() ->
             #{
                 name => servers,
                 long => "-servers",
-                type => string,
-                default => "roadrunner,cowboy,elli",
+                type => {custom, fun parse_servers/1},
+                default => ?KNOWN_SERVERS,
                 help =>
                     """
                     Comma-separated list of servers to run (run order is
@@ -796,10 +797,11 @@ parse_args(Argv) ->
     ProgOpts = #{progname => "bench.escript"},
     case argparse:parse(Argv, Cli, ProgOpts) of
         {ok, Parsed, _Path, _Cmd} ->
-            Parsed#{
-                servers => parse_servers(maps:get(servers, Parsed)),
-                scenarios => parse_scenarios(maps:get(scenario, Parsed))
-            };
+            %% `--scenario` and `--servers` use `{custom, fun}` types so
+            %% argparse has already run `parse_scenarios/1` /
+            %% `parse_servers/1` on user input; defaults are likewise
+            %% pre-parsed (list of atoms). No post-process needed here.
+            Parsed;
         {error, Reason} ->
             io:format(standard_error, "~s~n~n", [argparse:format_error(Reason)]),
             io:format(standard_error, "~s~n", [argparse:help(Cli, ProgOpts)]),
