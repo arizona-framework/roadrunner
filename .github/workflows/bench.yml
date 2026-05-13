@@ -16,8 +16,8 @@ name: Bench
 "on":
   workflow_dispatch:
     inputs:
-      scenario:
-        description: "bench.escript scenario, comma-separated for multi-run (e.g. hello | hello,echo | hello,echo,large_response)"
+      scenarios:
+        description: "bench.escript scenarios, comma-separated (e.g. hello | hello,echo | hello,echo,large_response)"
         required: false
         default: hello
         type: string
@@ -95,11 +95,11 @@ jobs:
       # so a caller can't slip shell metacharacters into the run script.
       - name: Run bench.escript
         env:
-          SCENARIO: ${{ inputs.scenario }}
+          SCENARIOS: ${{ inputs.scenarios }}
           DURATION: ${{ inputs.duration }}
         run: |
           ./scripts/bench.escript \
-            --scenario "$SCENARIO" \
+            --scenarios "$SCENARIOS" \
             --duration "$DURATION" \
             --warmup 2 \
             2>&1 | tee /tmp/bench.log
@@ -107,7 +107,7 @@ jobs:
       - name: Publish to step summary
         if: always()
         env:
-          SCENARIO: ${{ inputs.scenario }}
+          SCENARIOS: ${{ inputs.scenarios }}
           DURATION: ${{ inputs.duration }}
           BRANCH: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
@@ -115,7 +115,7 @@ jobs:
           {
             echo "## bench on-demand"
             echo ""
-            echo "scenario \`$SCENARIO\`, duration \`${DURATION}s\`, warmup \`2s\`"
+            echo "scenarios \`$SCENARIOS\`, duration \`${DURATION}s\`, warmup \`2s\`"
             echo ""
             echo "branch \`$BRANCH\`, sha \`$SHA\`"
             echo ""

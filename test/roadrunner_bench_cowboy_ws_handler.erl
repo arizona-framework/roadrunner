@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_ws_handler).
 -moduledoc """
-Cowboy WebSocket echo handler for `scripts/bench.escript --scenario
+Cowboy WebSocket echo handler for `scripts/bench.escript --scenarios
 websocket_msg_throughput`.
 
 Mirror of `roadrunner_ws_echo_handler`'s behavior: echoes any text

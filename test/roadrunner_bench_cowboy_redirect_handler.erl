@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_redirect_handler).
 -moduledoc """
-Cowboy redirect handler for `scripts/bench.escript --scenario redirect_response`.
+Cowboy redirect handler for `scripts/bench.escript --scenarios redirect_response`.
 
 Mirror of `roadrunner_bench_redirect_handler`: 302 + Location.
 """.

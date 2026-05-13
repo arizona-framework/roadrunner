@@ -1,6 +1,6 @@
 -module(roadrunner_bench_echo_handler).
 -moduledoc """
-Roadrunner handler for `scripts/bench.escript --scenario echo`.
+Roadrunner handler for `scripts/bench.escript --scenarios echo`.
 
 Reads the request body (delivered via auto buffering) and echoes it
 back in the response with `Content-Type: application/octet-stream`.

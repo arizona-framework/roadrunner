@@ -1,6 +1,6 @@
 -module(roadrunner_bench_gzip_handler).
 -moduledoc """
-Roadrunner handler for `scripts/bench.escript --scenario gzip_response`.
+Roadrunner handler for `scripts/bench.escript --scenarios gzip_response`.
 
 Returns a 16 KB JSON-shaped body. Above the 860-byte threshold of
 `roadrunner_compress`, well-compressible (repeating record shape)

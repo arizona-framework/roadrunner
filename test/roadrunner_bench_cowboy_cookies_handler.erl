@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_cookies_handler).
 -moduledoc """
-Cowboy handler for `scripts/bench.escript --scenario cookies_heavy`.
+Cowboy handler for `scripts/bench.escript --scenarios cookies_heavy`.
 
 Mirror of `roadrunner_bench_cookies_handler` — parses the request's
 cookies via `cowboy_req:parse_cookies/1` and returns the cookie

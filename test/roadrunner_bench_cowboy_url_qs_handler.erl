@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_url_qs_handler).
 -moduledoc """
-Cowboy handler for `scripts/bench.escript --scenario url_with_qs`.
+Cowboy handler for `scripts/bench.escript --scenarios url_with_qs`.
 
 Mirror of `roadrunner_bench_url_qs_handler`: parses the URL's
 query string via `cowboy_req:parse_qs/1` and returns the pair

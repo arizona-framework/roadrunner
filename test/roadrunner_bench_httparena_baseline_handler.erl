@@ -1,6 +1,6 @@
 -module(roadrunner_bench_httparena_baseline_handler).
 -moduledoc """
-Roadrunner handler for `scripts/bench.escript --scenario httparena_baseline`.
+Roadrunner handler for `scripts/bench.escript --scenarios httparena_baseline`.
 
 Mirrors HttpArena's `baseline` profile: `GET /baseline11?a=I&b=I`
 returns plaintext `integer_to_binary(A + B)`. Exercises query-string

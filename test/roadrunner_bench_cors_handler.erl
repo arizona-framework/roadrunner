@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cors_handler).
 -moduledoc """
-Roadrunner CORS preflight handler for `scripts/bench.escript --scenario cors_preflight`.
+Roadrunner CORS preflight handler for `scripts/bench.escript --scenarios cors_preflight`.
 
 Responds to OPTIONS /api with `204 No Content` + CORS allow-headers.
 The browser sends this preflight before any actual cross-origin

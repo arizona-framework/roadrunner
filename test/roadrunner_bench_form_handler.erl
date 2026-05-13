@@ -1,6 +1,6 @@
 -module(roadrunner_bench_form_handler).
 -moduledoc """
-Roadrunner handler for `scripts/bench.escript --scenario post_4kb_form`.
+Roadrunner handler for `scripts/bench.escript --scenarios post_4kb_form`.
 
 Reads a `application/x-www-form-urlencoded` body, parses it via
 `roadrunner_qs:parse/1`, and returns a small `200 ok` ack with the

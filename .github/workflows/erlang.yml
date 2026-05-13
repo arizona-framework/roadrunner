@@ -257,7 +257,7 @@ jobs:
 
       - name: Run wrk2 smoke (hello + echo, --quick, 10s)
         run: |
-          ./scripts/wrk2_bench.sh --quick --scenario hello,echo \
+          ./scripts/wrk2_bench.sh --quick --scenarios hello,echo \
               --duration 10 --server roadrunner \
               --out /tmp/wrk2_smoke.md
 

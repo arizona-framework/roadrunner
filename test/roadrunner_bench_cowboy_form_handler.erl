@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_form_handler).
 -moduledoc """
-Cowboy handler for `scripts/bench.escript --scenario post_4kb_form`.
+Cowboy handler for `scripts/bench.escript --scenarios post_4kb_form`.
 
 Mirror of `roadrunner_bench_form_handler` for cowboy: reads the
 form body via `cowboy_req:read_urlencoded_body/1` (which both reads

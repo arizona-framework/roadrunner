@@ -1,6 +1,6 @@
 -module(roadrunner_bench_streaming_handler).
 -moduledoc """
-Roadrunner handler for `scripts/bench.escript --scenario streaming_response`.
+Roadrunner handler for `scripts/bench.escript --scenarios streaming_response`.
 
 Returns a `{stream, _, _, Fun}` shape that emits the response body
 in 4 × 4 KB chunks via the `Send/2` callback. Exercises the

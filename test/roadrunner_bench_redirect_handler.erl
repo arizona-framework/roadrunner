@@ -1,6 +1,6 @@
 -module(roadrunner_bench_redirect_handler).
 -moduledoc """
-Roadrunner redirect handler for `scripts/bench.escript --scenario redirect_response`.
+Roadrunner redirect handler for `scripts/bench.escript --scenarios redirect_response`.
 
 Returns 302 with `Location: /target`. Common pattern for login
 flows, deprecated-URL forwarding, etc.

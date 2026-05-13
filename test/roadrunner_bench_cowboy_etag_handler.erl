@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_etag_handler).
 -moduledoc """
-Cowboy handler for `scripts/bench.escript --scenario etag_304`.
+Cowboy handler for `scripts/bench.escript --scenarios etag_304`.
 
 Mirror of `roadrunner_bench_etag_handler`: returns 304 when the
 request's If-None-Match matches `\"v1\"`, else 200 with body.

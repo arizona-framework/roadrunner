@@ -1,6 +1,6 @@
 -module(roadrunner_bench_large_handler).
 -moduledoc """
-Roadrunner handler for `scripts/bench.escript --scenario large_response`.
+Roadrunner handler for `scripts/bench.escript --scenarios large_response`.
 
 Returns a 64 KB `application/octet-stream` body for `GET /large`.
 The body is computed once via `persistent_term` so the per-request

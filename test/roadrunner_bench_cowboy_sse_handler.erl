@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_sse_handler).
 -moduledoc """
-Cowboy loop handler for `scripts/bench.escript --scenario server_sent_events`.
+Cowboy loop handler for `scripts/bench.escript --scenarios server_sent_events`.
 
 Mirror of `roadrunner_bench_sse_handler` for cowboy. Uses the
 `cowboy_loop` behaviour: `init/2` opens a streaming reply and

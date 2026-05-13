@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_gzip_handler).
 -moduledoc """
-Cowboy handler for `scripts/bench.escript --scenario gzip_response`.
+Cowboy handler for `scripts/bench.escript --scenarios gzip_response`.
 
 Mirror of `roadrunner_bench_gzip_handler` for cowboy. Compression
 is applied by `cowboy_compress_h` configured in the listener's

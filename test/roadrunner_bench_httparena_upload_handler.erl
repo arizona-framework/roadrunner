@@ -1,7 +1,7 @@
 -module(roadrunner_bench_httparena_upload_handler).
 -moduledoc """
-Roadrunner handler for `scripts/bench.escript --scenario
-httparena_upload_20mb_auto` and `--scenario
+Roadrunner handler for `scripts/bench.escript --scenarios
+httparena_upload_20mb_auto` and `--scenarios
 httparena_upload_20mb_manual`.
 
 Mirrors HttpArena's `upload` profile: `POST /upload` returns the

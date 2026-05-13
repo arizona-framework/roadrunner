@@ -81,7 +81,7 @@ Two complementary load drivers ship in this repo:
 Run a quick wrk2 sanity check:
 
 ```bash
-./scripts/wrk2_bench.sh --quick --scenario hello
+./scripts/wrk2_bench.sh --quick --scenarios hello
 ```
 
 The full matrix takes ~2 hours at `--runs 1 --duration 30s` and

@@ -57,11 +57,11 @@
 %% `start_server/2` (plus any `scenario_*` config helpers below).
 -define(KNOWN_SERVERS, [roadrunner, cowboy, elli]).
 
-%% Scenarios known to the bench. `--scenario` accepts a comma-separated
-%% list (mirroring `--servers`), so each value in the user's input
-%% must validate against this set. Adding a new scenario requires
-%% appending it here, adding a `preflight_scenario/1` clause if any
-%% servers should be filtered, and wiring `scenario_path/1` /
+%% Scenarios known to the bench. `--scenarios` accepts a
+%% comma-separated list (mirroring `--servers`), so each value in the
+%% user's input must validate against this set. Adding a new scenario
+%% requires appending it here, adding a `preflight_scenario/1` clause
+%% if any servers should be filtered, and wiring `scenario_path/1` /
 %% `build_request/N` / `start_server/2` for it.
 -define(KNOWN_SCENARIOS, [
     hello,
@@ -109,7 +109,7 @@ main(Args) ->
     Opts0 = parse_args(Args),
     ProjectDir = project_dir(),
     ok = setup_code_paths(ProjectDir),
-    Scenarios = maps:get(scenario, Opts0),
+    Scenarios = maps:get(scenarios, Opts0),
     case maps:get(standalone, Opts0, false) of
         true when length(Scenarios) > 1 ->
             io:format(
@@ -131,7 +131,15 @@ run_each_scenario(Opts0, [Scenario | Rest]) ->
     %% notes. `run_standalone/1`'s "exactly one server" check then
     %% catches the case where the user-requested server got filtered
     %% out, instead of starting a listener that 404s every request.
-    Opts1 = preflight_protocol(Opts0#{scenario := Scenario}),
+    %%
+    %% `Opts0` keeps the parsed `scenarios :: [atom()]` input list
+    %% unchanged across iterations. Each iteration adds the singular
+    %% `scenario :: atom()` key — the current value — so downstream
+    %% pattern-matches (`preflight_scenario`, `start_server`,
+    %% `scenario_path`, `build_request`, etc.) keep reading a single
+    %% atom from `scenario` exactly as they did before multi-scenario
+    %% support landed.
+    Opts1 = preflight_protocol(Opts0#{scenario => Scenario}),
     Opts = preflight_scenario(Opts1),
     case maps:get(standalone, Opts, false) of
         true ->
@@ -150,9 +158,9 @@ run_each_scenario(Opts0, [Scenario | Rest]) ->
 
 %% Single-scenario invocations keep the existing one-shot output
 %% verbatim. Multi-scenario runs prefix each iteration with a divider so
-%% the stacked tables are scannable. The match looks at the original
-%% parsed `scenario` list (pre-iteration override) to decide.
-maybe_print_scenario_divider(#{scenario := [_]}, _Scenario) ->
+%% the stacked tables are scannable. The match looks at the parsed
+%% `scenarios` list, not the per-iteration `scenario` atom.
+maybe_print_scenario_divider(#{scenarios := [_]}, _Scenario) ->
     ok;
 maybe_print_scenario_divider(_Opts, Scenario) ->
     io:format("~n==== scenario: ~s ====~n", [Scenario]).
@@ -245,7 +253,7 @@ filter_servers(Scenario, Drop, Servers, Opts, Reason) ->
     case Filtered =/= Servers of
         true ->
             io:format(
-                "note: --scenario ~p — ~p filtered out (~s)~n",
+                "note: --scenarios ~p — ~p filtered out (~s)~n",
                 [Scenario, Drop, Reason]
             );
         false ->
@@ -305,18 +313,18 @@ cli() ->
             """,
         arguments => [
             #{
-                name => scenario,
-                long => "-scenario",
+                name => scenarios,
+                long => "-scenarios",
                 type => {custom, fun parse_scenarios/1},
                 default => [?DEFAULT_SCENARIO],
                 help =>
                     """
                     Comma-separated list of scenarios to run sequentially
-                    (e.g. `--scenario hello,echo,large_response`). Each is
-                    run in its own server-up / load / server-down cycle, in
-                    the order given. Single-scenario invocations (e.g.
-                    `--scenario hello`) keep the existing one-shot output
-                    shape.
+                    (e.g. `--scenarios hello,echo,large_response`). Each
+                    is run in its own server-up / load / server-down
+                    cycle, in the order given. Single-scenario
+                    invocations (e.g. `--scenarios hello`) keep the
+                    existing one-shot output shape.
 
                     hello:          GET / with 1 header, 7-byte body. Bare-minimum
                                     HTTP cost.
@@ -797,10 +805,10 @@ parse_args(Argv) ->
     ProgOpts = #{progname => "bench.escript"},
     case argparse:parse(Argv, Cli, ProgOpts) of
         {ok, Parsed, _Path, _Cmd} ->
-            %% `--scenario` and `--servers` use `{custom, fun}` types so
-            %% argparse has already run `parse_scenarios/1` /
+            %% `--scenarios` and `--servers` use `{custom, fun}` types
+            %% so argparse has already run `parse_scenarios/1` /
             %% `parse_servers/1` on user input; defaults are likewise
-            %% pre-parsed (list of atoms). No post-process needed here.
+            %% pre-parsed (list of atoms). No post-process needed.
             Parsed;
         {error, Reason} ->
             io:format(standard_error, "~s~n~n", [argparse:format_error(Reason)]),
@@ -815,10 +823,10 @@ parse_args(Argv) ->
 parse_servers(Str) ->
     parse_known_atoms(Str, ?KNOWN_SERVERS, "servers").
 
-%% Same shape for `--scenario` — comma-separated list validated against
-%% `?KNOWN_SCENARIOS`. Single-value input (e.g. `--scenario hello`)
-%% returns a 1-element list and runs the existing single-scenario flow
-%% unchanged.
+%% Same shape for `--scenarios` — comma-separated list validated
+%% against `?KNOWN_SCENARIOS`. Single-value input (e.g.
+%% `--scenarios hello`) returns a 1-element list and runs the existing
+%% single-scenario flow unchanged.
 parse_scenarios(Str) ->
     parse_known_atoms(Str, ?KNOWN_SCENARIOS, "scenarios").
 
@@ -2701,12 +2709,12 @@ build_request(streaming_response) ->
     %% keep-alive decision), which the bench's keep-alive loop
     %% can't reuse — limit this scenario to h2.
     io:format(standard_error,
-        "error: --scenario streaming_response is h2-only "
+        "error: --scenarios streaming_response is h2-only "
         "(use --protocol h2)~n", []),
     halt(2);
 build_request(multi_stream_h2) ->
     io:format(standard_error,
-        "error: --scenario multi_stream_h2 is h2-only "
+        "error: --scenarios multi_stream_h2 is h2-only "
         "(use --protocol h2)~n", []),
     halt(2);
 build_request(large_post_streaming) ->
@@ -2739,7 +2747,7 @@ build_request(small_chunked_response) ->
     %% close the conn per-request, breaking the bench's keep-alive
     %% loop. h2-only.
     io:format(standard_error,
-        "error: --scenario small_chunked_response is h2-only "
+        "error: --scenarios small_chunked_response is h2-only "
         "(use --protocol h2)~n", []),
     halt(2);
 build_request(head_method) ->
@@ -2751,7 +2759,7 @@ build_request(cookies_heavy) ->
 build_request(tls_handshake_throughput) ->
     %% h2-only scenario — handshake dominates, only meaningful over TLS.
     io:format(standard_error,
-        "error: --scenario tls_handshake_throughput is h2-only "
+        "error: --scenarios tls_handshake_throughput is h2-only "
         "(use --protocol h2)~n", []),
     halt(2);
 build_request(multi_request_body) ->
@@ -3163,7 +3171,7 @@ h2_request_shape(pipelined_h1) ->
     %% h2 already multiplexes — pipelining is an h1 wire concept
     %% with no analogue in h2 (use `multi_stream_h2` instead).
     io:format(standard_error,
-        "error: --scenario pipelined_h1 is h1-only "
+        "error: --scenarios pipelined_h1 is h1-only "
         "(use --protocol h1; for h2 multiplexing see multi_stream_h2)~n", []),
     halt(2);
 h2_request_shape(slow_client) ->
@@ -3171,7 +3179,7 @@ h2_request_shape(slow_client) ->
     %% framed wire format makes incremental delivery a different
     %% (and less interesting) test.
     io:format(standard_error,
-        "error: --scenario slow_client is h1-only "
+        "error: --scenarios slow_client is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(connection_storm) ->
@@ -3180,7 +3188,7 @@ h2_request_shape(connection_storm) ->
     %% point is keep-alive multiplexing — a "storm" of fresh h2
     %% conns is anti-h2 and not a real-world workload.
     io:format(standard_error,
-        "error: --scenario connection_storm is h1-only "
+        "error: --scenarios connection_storm is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(mixed_workload) ->
@@ -3189,7 +3197,7 @@ h2_request_shape(mixed_workload) ->
     %% client — out of scope for this scenario, which targets the
     %% h1 router under varied dispatch.
     io:format(standard_error,
-        "error: --scenario mixed_workload is h1-only "
+        "error: --scenarios mixed_workload is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(post_4kb_form) ->
@@ -3197,7 +3205,7 @@ h2_request_shape(post_4kb_form) ->
     %% for this scenario, which targets the h1 body-read +
     %% qs:parse path under realistic body sizes.
     io:format(standard_error,
-        "error: --scenario post_4kb_form is h1-only "
+        "error: --scenarios post_4kb_form is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(large_post_streaming) ->
@@ -3206,7 +3214,7 @@ h2_request_shape(large_post_streaming) ->
     %% h2 is a separate scenario worth adding later but the
     %% current focus is the h1 body-state machine.
     io:format(standard_error,
-        "error: --scenario large_post_streaming is h1-only "
+        "error: --scenarios large_post_streaming is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(router_404_storm) ->
@@ -3214,7 +3222,7 @@ h2_request_shape(router_404_storm) ->
     %% h2 conns + per-conn TLS handshake would obscure the
     %% router-miss cost we're trying to surface. h1-only.
     io:format(standard_error,
-        "error: --scenario router_404_storm is h1-only "
+        "error: --scenarios router_404_storm is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(varied_paths_router) ->
@@ -3222,7 +3230,7 @@ h2_request_shape(varied_paths_router) ->
     %% shapes through the bench client — out of scope for this
     %% scenario.
     io:format(standard_error,
-        "error: --scenario varied_paths_router is h1-only "
+        "error: --scenarios varied_paths_router is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(gzip_response) ->
@@ -3231,7 +3239,7 @@ h2_request_shape(gzip_response) ->
     %% for this scenario, which targets the h1 compress-middleware
     %% path specifically.
     io:format(standard_error,
-        "error: --scenario gzip_response is h1-only "
+        "error: --scenarios gzip_response is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(backpressure_sustained) ->
@@ -3239,7 +3247,7 @@ h2_request_shape(backpressure_sustained) ->
     %% h2 equivalent (multi_stream_h2 + low MAX_CONCURRENT_STREAMS)
     %% is a different scenario worth its own design. h1-only here.
     io:format(standard_error,
-        "error: --scenario backpressure_sustained is h1-only "
+        "error: --scenarios backpressure_sustained is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(server_sent_events) ->
@@ -3247,28 +3255,28 @@ h2_request_shape(server_sent_events) ->
     %% bench-client side hasn't been wired for streaming response
     %% reads. Out of scope for now.
     io:format(standard_error,
-        "error: --scenario server_sent_events is h1-only "
+        "error: --scenarios server_sent_events is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(expect_100_continue) ->
     %% h2 has no Expect: 100-continue equivalent (see RFC 9113 §8.5).
     %% h1-only scenario.
     io:format(standard_error,
-        "error: --scenario expect_100_continue is h1-only "
+        "error: --scenarios expect_100_continue is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(large_keepalive_session) ->
     %% h2 has no per-conn-request count limit at the protocol layer
     %% (per-stream limits are different); h1-only scenario.
     io:format(standard_error,
-        "error: --scenario large_keepalive_session is h1-only "
+        "error: --scenarios large_keepalive_session is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(websocket_msg_throughput) ->
     %% RFC 8441 (h2 + WS) is out of scope for this scenario;
     %% bench-client side hasn't been wired for h2 WS frames.
     io:format(standard_error,
-        "error: --scenario websocket_msg_throughput is h1-only "
+        "error: --scenarios websocket_msg_throughput is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(url_with_qs) ->
@@ -3277,7 +3285,7 @@ h2_request_shape(url_with_qs) ->
     %% follow-up scenario but out of scope here, which targets
     %% the h1 URL-side qs:parse path specifically.
     io:format(standard_error,
-        "error: --scenario url_with_qs is h1-only "
+        "error: --scenarios url_with_qs is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(small_chunked_response) ->
@@ -3286,7 +3294,7 @@ h2_request_shape(accept_storm_burst) ->
     %% h2 conns require TLS handshake which dominates burst cost;
     %% backlog under burst is an h1-flavored question.
     io:format(standard_error,
-        "error: --scenario accept_storm_burst is h1-only "
+        "error: --scenarios accept_storm_burst is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(head_method) ->
@@ -3297,14 +3305,14 @@ h2_request_shape(etag_304) ->
     %% intentionally. h2 support is a small follow-up but out of
     %% scope here.
     io:format(standard_error,
-        "error: --scenario etag_304 is h1-only "
+        "error: --scenarios etag_304 is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(partial_body_drop) ->
     %% h2 has its own truncation semantics (RST_STREAM); the h1
     %% Content-Length-mismatch path is what this scenario targets.
     io:format(standard_error,
-        "error: --scenario partial_body_drop is h1-only "
+        "error: --scenarios partial_body_drop is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(cookies_heavy) ->
@@ -3319,32 +3327,32 @@ h2_request_shape(multi_request_body) ->
         binary:copy(~"x", 4096)};
 h2_request_shape(path_with_unicode) ->
     io:format(standard_error,
-        "error: --scenario path_with_unicode is h1-only "
+        "error: --scenarios path_with_unicode is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(cors_preflight) ->
     %% h2 client doesn't support OPTIONS preflight (it bypasses
     %% CORS via origin negotiation); h1-only.
     io:format(standard_error,
-        "error: --scenario cors_preflight is h1-only "
+        "error: --scenarios cors_preflight is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(chunked_request_body) ->
     %% h2 has its own framing (DATA frames); chunked is h1-specific.
     io:format(standard_error,
-        "error: --scenario chunked_request_body is h1-only "
+        "error: --scenarios chunked_request_body is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(redirect_response) ->
     %% Bench h2 client only accepts :status = 200; 302 would
     %% short-circuit to bad_status. h2 follow-up.
     io:format(standard_error,
-        "error: --scenario redirect_response is h1-only "
+        "error: --scenarios redirect_response is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(compressed_request_body) ->
     io:format(standard_error,
-        "error: --scenario compressed_request_body is h1-only "
+        "error: --scenarios compressed_request_body is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(headers_heavy) ->
@@ -3361,14 +3369,14 @@ h2_request_shape(httparena_baseline) ->
     %% h2 variant is meaningful but out of scope for the first round;
     %% this scenario mirrors HttpArena's h1 baseline profile.
     io:format(standard_error,
-        "error: --scenario httparena_baseline is h1-only "
+        "error: --scenarios httparena_baseline is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(httparena_json) ->
     %% h2 variant is meaningful but out of scope for the first round;
     %% this scenario mirrors HttpArena's h1 json profile.
     io:format(standard_error,
-        "error: --scenario httparena_json is h1-only "
+        "error: --scenarios httparena_json is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(httparena_upload_20mb_auto) ->
@@ -3376,12 +3384,12 @@ h2_request_shape(httparena_upload_20mb_auto) ->
     %% flow control); a 20 MB POST over h2 is a separate scenario worth
     %% adding later. h1-only here.
     io:format(standard_error,
-        "error: --scenario httparena_upload_20mb_auto is h1-only "
+        "error: --scenarios httparena_upload_20mb_auto is h1-only "
         "(use --protocol h1)~n", []),
     halt(2);
 h2_request_shape(httparena_upload_20mb_manual) ->
     io:format(standard_error,
-        "error: --scenario httparena_upload_20mb_manual is h1-only "
+        "error: --scenarios httparena_upload_20mb_manual is h1-only "
         "(use --protocol h1)~n", []),
     halt(2).
 

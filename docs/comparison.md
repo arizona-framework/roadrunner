@@ -119,7 +119,7 @@ Run it locally:
 ```
 ./scripts/wrk2_bench.sh                       # full matrix
 ./scripts/wrk2_bench.sh --quick                # --runs 1, dev iteration
-./scripts/wrk2_bench.sh --scenario hello,echo  # subset
+./scripts/wrk2_bench.sh --scenarios hello,echo  # subset
 ```
 
 Requires Docker and a compiled test profile. See
@@ -180,7 +180,7 @@ Single scenario:
 
 ```
 mise exec -- ./scripts/bench.escript --servers roadrunner,elli,cowboy \
-  --scenario hello --clients 50 --duration 5 --warmup 2
+  --scenarios hello --clients 50 --duration 5 --warmup 2
 ```
 
 Run several times and take the median — the bench script's banner

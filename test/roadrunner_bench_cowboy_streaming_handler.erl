@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_streaming_handler).
 -moduledoc """
-Cowboy streaming handler for `scripts/bench.escript --scenario streaming_response`.
+Cowboy streaming handler for `scripts/bench.escript --scenarios streaming_response`.
 
 Mirrors `roadrunner_bench_streaming_handler` so the wire bytes match
 across servers: 4 × 4 KB chunks, the last with `fin`.

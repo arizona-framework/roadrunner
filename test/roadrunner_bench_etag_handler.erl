@@ -1,6 +1,6 @@
 -module(roadrunner_bench_etag_handler).
 -moduledoc """
-Roadrunner handler for `scripts/bench.escript --scenario etag_304`.
+Roadrunner handler for `scripts/bench.escript --scenarios etag_304`.
 
 Conditional GET: when `If-None-Match: "v1"` matches the server's
 fixed ETag, returns `304 Not Modified` with no body. Otherwise

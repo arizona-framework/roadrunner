@@ -1,6 +1,6 @@
 -module(roadrunner_bench_drain_handler).
 -moduledoc """
-Roadrunner handler for `scripts/bench.escript --scenario large_post_streaming`.
+Roadrunner handler for `scripts/bench.escript --scenarios large_post_streaming`.
 
 Manual-mode body read: loops `roadrunner_req:read_body/2` with
 `length => 64 KB` until the body is fully drained, then returns a
