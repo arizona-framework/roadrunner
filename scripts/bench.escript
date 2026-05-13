@@ -105,12 +105,62 @@
     httparena_upload_20mb_manual
 ]).
 
+%% Scenarios that only make sense over HTTP/1.1 — the listener fixture
+%% or the workload itself depends on h1-specific shape (pipelining,
+%% Connection: close storms, etc.). When `--scenarios all` is paired
+%% with `--protocol h2`, these get filtered out. Mirrors the
+%% `"error: --scenarios X is h1-only ..."` preflight checks at the
+%% per-scenario h2-workload sites — keep in sync when adding a new
+%% h1-only scenario.
+-define(H1_ONLY_SCENARIOS, [
+    pipelined_h1,
+    slow_client,
+    connection_storm,
+    mixed_workload,
+    post_4kb_form,
+    large_post_streaming,
+    router_404_storm,
+    varied_paths_router,
+    gzip_response,
+    backpressure_sustained,
+    server_sent_events,
+    expect_100_continue,
+    large_keepalive_session,
+    websocket_msg_throughput,
+    url_with_qs,
+    accept_storm_burst,
+    etag_304,
+    partial_body_drop,
+    path_with_unicode,
+    cors_preflight,
+    chunked_request_body,
+    redirect_response,
+    compressed_request_body,
+    httparena_baseline,
+    httparena_json,
+    httparena_upload_20mb_auto,
+    httparena_upload_20mb_manual
+]).
+
+%% Scenarios that only make sense over HTTP/2. Mirrors the
+%% `"error: --scenarios X is h2-only ..."` preflight checks at the
+%% per-scenario h1-workload sites.
+-define(H2_ONLY_SCENARIOS, [
+    streaming_response,
+    multi_stream_h2,
+    small_chunked_response,
+    tls_handshake_throughput
+]).
+
 main(Args) ->
     Opts0 = parse_args(Args),
     ProjectDir = project_dir(),
     ok = setup_code_paths(ProjectDir),
-    Scenarios = maps:get(scenarios, Opts0),
-    case maps:get(standalone, Opts0, false) of
+    Scenarios = expand_scenarios(
+        maps:get(scenarios, Opts0), maps:get(protocol, Opts0)
+    ),
+    Opts1 = Opts0#{scenarios := Scenarios},
+    case maps:get(standalone, Opts1, false) of
         true when length(Scenarios) > 1 ->
             io:format(
                 standard_error,
@@ -119,8 +169,34 @@ main(Args) ->
             ),
             halt(2);
         _ ->
-            run_each_scenario(Opts0, Scenarios)
+            run_each_scenario(Opts1, Scenarios)
     end.
+
+%% Resolve the `--scenarios all` sentinel to the protocol-compatible
+%% subset of `?KNOWN_SCENARIOS`. Other shapes (already a list of
+%% atoms) pass through unchanged so an explicit `--scenarios X,Y`
+%% picks still hit the existing loud preflight errors when the user
+%% asks for an incompatible combo.
+expand_scenarios(all, Protocol) ->
+    Drop =
+        case Protocol of
+            h1 -> ?H2_ONLY_SCENARIOS;
+            h2 -> ?H1_ONLY_SCENARIOS
+        end,
+    Kept = [S || S <- ?KNOWN_SCENARIOS, not lists:member(S, Drop)],
+    Dropped = [S || S <- ?KNOWN_SCENARIOS, lists:member(S, Drop)],
+    case Dropped of
+        [] ->
+            ok;
+        _ ->
+            io:format(
+                "note: --scenarios all + --protocol ~s, dropped: ~p~n",
+                [Protocol, Dropped]
+            )
+    end,
+    Kept;
+expand_scenarios(Scenarios, _Protocol) when is_list(Scenarios) ->
+    Scenarios.
 
 run_each_scenario(_Opts, []) ->
     ok;
@@ -324,7 +400,14 @@ cli() ->
                     is run in its own server-up / load / server-down
                     cycle, in the order given. Single-scenario
                     invocations (e.g. `--scenarios hello`) keep the
-                    existing one-shot output shape.
+                    existing one-shot output shape. The sentinel
+                    `--scenarios all` expands to every known scenario
+                    compatible with `--protocol`, dropping
+                    h1-only entries under `--protocol h2` and vice
+                    versa with a one-line note. Explicit
+                    comma-separated picks (`--scenarios X,Y`) still
+                    halt loudly on protocol mismatch — only the
+                    `all` sentinel auto-filters.
 
                     hello:          GET / with 1 header, 7-byte body. Bare-minimum
                                     HTTP cost.
@@ -826,7 +909,14 @@ parse_servers(Str) ->
 %% Same shape for `--scenarios` — comma-separated list validated
 %% against `?KNOWN_SCENARIOS`. Single-value input (e.g.
 %% `--scenarios hello`) returns a 1-element list and runs the existing
-%% single-scenario flow unchanged.
+%% single-scenario flow unchanged. The literal `all` returns the atom
+%% sentinel `all` which `main/1` expands to the protocol-compatible
+%% subset of `?KNOWN_SCENARIOS` (so `--scenarios all --protocol h1`
+%% drops h2-only scenarios and vice versa, with a one-line note). The
+%% sentinel must appear alone — mixing it into a comma list (`all,X`)
+%% fails the known-atom check, which is the intended UX.
+parse_scenarios("all") ->
+    all;
 parse_scenarios(Str) ->
     parse_known_atoms(Str, ?KNOWN_SCENARIOS, "scenarios").
 
