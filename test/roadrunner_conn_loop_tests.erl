@@ -288,7 +288,7 @@ slowloris_during_passive_recv_drops_client_test() ->
         end
     end),
     Opts = (fake_opts(slow_passive))#{
-        minimum_bytes_per_second => 1000000
+        min_bytes_per_second => 1000000
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -324,7 +324,7 @@ slowloris_during_active_mode_recv_drops_client_test() ->
     end),
     Opts = (fake_opts(slow_active))#{
         hibernate_after => 5000,
-        minimum_bytes_per_second => 1000000
+        min_bytes_per_second => 1000000
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -671,7 +671,7 @@ two_pipelined_requests_in_one_packet_serve_both_test() ->
     %% RFC 7230 §6.3 pipelining — two requests delivered as one TCP
     %% packet should both be served. The keepalive handler (no
     %% `Connection: close`) lets keep-alive engage. The second
-    %% request closes via the test's `max_keep_alive_request := 2`
+    %% request closes via the test's `max_keep_alive_requests := 2`
     %% cap so the conn exits cleanly without a third iteration.
     ensure_pg(),
     Self = self(),
@@ -681,7 +681,7 @@ two_pipelined_requests_in_one_packet_serve_both_test() ->
     Sink = spawn_active_sink_with_send_log(Self, Tag, Both),
     Opts = (fake_opts(pipelined))#{
         dispatch := {handler, roadrunner_keepalive_handler},
-        max_keep_alive_request := 2
+        max_keep_alive_requests := 2
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -697,7 +697,7 @@ two_pipelined_requests_in_one_packet_serve_both_test() ->
     Sink ! stop.
 
 keep_alive_max_cap_closes_after_max_test() ->
-    %% `max_keep_alive_request := 1` — the single served request hits
+    %% `max_keep_alive_requests := 1` — the single served request hits
     %% the cap and the conn closes (no second iteration even though
     %% keep-alive is otherwise eligible).
     ensure_pg(),
@@ -706,7 +706,7 @@ keep_alive_max_cap_closes_after_max_test() ->
     Both =
         ~"GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n",
     Sink = spawn_active_sink_with_send_log(Self, Tag, Both),
-    Opts = (fake_opts(max1))#{max_keep_alive_request := 1},
+    Opts = (fake_opts(max1))#{max_keep_alive_requests := 1},
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -769,7 +769,7 @@ manual_mode_pipelined_leftover_uses_manual_drain_test() ->
     Opts = (fake_opts(manual_pipe))#{
         body_buffering := manual,
         dispatch := {handler, roadrunner_manual_keepalive_handler},
-        max_keep_alive_request := 2
+        max_keep_alive_requests := 2
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -1170,11 +1170,11 @@ fake_opts(ListenerName) ->
         max_content_length => 10485760,
         request_timeout => 5000,
         keep_alive_timeout => 5000,
-        max_keep_alive_request => 100,
+        max_keep_alive_requests => 100,
         max_clients => 10,
         client_counter => atomics:new(1, [{signed, false}]),
         requests_counter => atomics:new(1, [{signed, false}]),
-        minimum_bytes_per_second => 0,
+        min_bytes_per_second => 0,
         body_buffering => auto,
         listener_name => ListenerName
     }.

@@ -589,7 +589,7 @@ cli() ->
                                     100-continue support in fixture).
                     large_keepalive_session:
                                     h1-only. Listener capped at
-                                    max_keep_alive_request => 1000;
+                                    max_keep_alive_requests => 1000;
                                     bench worker reconnects on conn
                                     close. Measures keep-alive
                                     throughput including the
@@ -1251,7 +1251,7 @@ start_cowboy_h1(Scenario) ->
     Dispatch = peer:call(Peer, cowboy_router, compile, [scenario_cowboy_routes(Scenario)]),
     %% `max_keepalive` capped to a million so cowboy's per-conn request
     %% counter doesn't trip during the bench (mirrors roadrunner's
-    %% `max_keep_alive_request` setting). Cowboy 2.x's TransportOpts is
+    %% `max_keep_alive_requests` setting). Cowboy 2.x's TransportOpts is
     %% a `ranch:opts()` map — passing a flat list interprets every tuple
     %% as a `socket_opt` and `num_acceptors` ends up at `inet_tcp:listen`
     %% which crashes with `badarg`.
@@ -1317,7 +1317,7 @@ start_roadrunner(Scenario) ->
         port => 0,
         keep_alive_timeout => 60000,
         max_clients => 100000,
-        max_keep_alive_request => 1000000
+        max_keep_alive_requests => 1000000
     },
     ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
     {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr, ListenerOpts]),
@@ -1336,14 +1336,14 @@ start_roadrunner_h2(Scenario, CertDir) ->
     {ok, _} = peer:call(Peer, application, ensure_all_started, [roadrunner]),
     BaseOpts = #{
         port => 0,
+        protocols => [http1, http2],
         tls => [
             {certfile, CertDir ++ "/cert.pem"},
-            {keyfile, CertDir ++ "/key.pem"},
-            {alpn_preferred_protocols, [~"h2", ~"http/1.1"]}
+            {keyfile, CertDir ++ "/key.pem"}
         ],
         keep_alive_timeout => 60000,
         max_clients => 100000,
-        max_keep_alive_request => 1000000
+        max_keep_alive_requests => 1000000
     },
     ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
     {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr_h2, ListenerOpts]),
@@ -1391,11 +1391,11 @@ print_listener_config(Pairs) ->
 %% Per-scenario server config — same routes/handlers in shape across
 %% all three servers so the comparison stays apples-to-apples.
 scenario_roadrunner_opts(hello, BaseOpts) ->
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(headers_heavy, BaseOpts) ->
     %% Same handler as `hello` — the difference is request-side
     %% headers, server work is identical.
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(echo, BaseOpts) ->
     BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
 scenario_roadrunner_opts(large_response, BaseOpts) ->
@@ -1407,20 +1407,20 @@ scenario_roadrunner_opts(streaming_response, BaseOpts) ->
 scenario_roadrunner_opts(multi_stream_h2, BaseOpts) ->
     %% Same handler as `hello` — the differentiator is the bench
     %% client driving N streams in flight per conn.
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(pipelined_h1, BaseOpts) ->
     %% Same handler as `hello` — pipelining is a wire-level
     %% client behavior; the server sees N requests in one buffer.
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(slow_client, BaseOpts) ->
     %% Same handler as `hello` — slow_client is a wire-level
     %% client behavior; the server sees a request arrive in
     %% multiple chunks with delays between them.
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(connection_storm, BaseOpts) ->
     %% Same handler as `hello` — connection_storm is a connection-
     %% lifecycle test; per-request work is identical to `hello`.
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(mixed_workload, BaseOpts) ->
     %% Three routes — bench client picks one uniformly per request.
     BaseOpts#{routes => [
@@ -1449,7 +1449,7 @@ scenario_roadrunner_opts(backpressure_sustained, BaseOpts) ->
     %% Override the bench's default max_clients => 100K to a tight
     %% cap so the bench's 200-client wave saturates the listener.
     BaseOpts#{
-        handler => roadrunner_keepalive_handler,
+        routes => roadrunner_keepalive_handler,
         max_clients => 50
     };
 scenario_roadrunner_opts(server_sent_events, BaseOpts) ->
@@ -1460,12 +1460,12 @@ scenario_roadrunner_opts(expect_100_continue, BaseOpts) ->
     %% `roadrunner_conn:maybe_send_continue/3`.
     BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
 scenario_roadrunner_opts(large_keepalive_session, BaseOpts) ->
-    %% Override the bench's default max_keep_alive_request => 1M
+    %% Override the bench's default max_keep_alive_requests => 1M
     %% with a tight cap so each conn closes after ~1000 requests,
     %% triggering reconnects within the bench duration.
     BaseOpts#{
-        handler => roadrunner_keepalive_handler,
-        max_keep_alive_request => 1000
+        routes => roadrunner_keepalive_handler,
+        max_keep_alive_requests => 1000
     };
 scenario_roadrunner_opts(websocket_msg_throughput, BaseOpts) ->
     BaseOpts#{routes => [{~"/ws", roadrunner_ws_upgrade_handler, undefined}]};
@@ -1474,7 +1474,7 @@ scenario_roadrunner_opts(url_with_qs, BaseOpts) ->
 scenario_roadrunner_opts(small_chunked_response, BaseOpts) ->
     BaseOpts#{routes => [{~"/small", roadrunner_bench_small_chunks_handler, undefined}]};
 scenario_roadrunner_opts(accept_storm_burst, BaseOpts) ->
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(head_method, BaseOpts) ->
     BaseOpts#{routes => [{~"/large", roadrunner_bench_large_handler, undefined}]};
 scenario_roadrunner_opts(etag_304, BaseOpts) ->
@@ -1488,7 +1488,7 @@ scenario_roadrunner_opts(partial_body_drop, BaseOpts) ->
 scenario_roadrunner_opts(cookies_heavy, BaseOpts) ->
     BaseOpts#{routes => [{~"/cookies", roadrunner_bench_cookies_handler, undefined}]};
 scenario_roadrunner_opts(tls_handshake_throughput, BaseOpts) ->
-    BaseOpts#{handler => roadrunner_keepalive_handler};
+    BaseOpts#{routes => roadrunner_keepalive_handler};
 scenario_roadrunner_opts(multi_request_body, BaseOpts) ->
     BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
 scenario_roadrunner_opts(path_with_unicode, BaseOpts) ->
@@ -2252,7 +2252,7 @@ ws_parse_frame(_) ->
     more.
 
 %% large_keepalive_session: like the default keep_alive_loop, but
-%% on conn-close (the server hit its `max_keep_alive_request` cap)
+%% on conn-close (the server hit its `max_keep_alive_requests` cap)
 %% the worker reconnects and continues. Measures sustained
 %% throughput INCLUDING the periodic per-1000-req reconnect tax
 %% — a path single-request `connection_storm` and the default
@@ -2276,7 +2276,7 @@ large_keepalive_worker(Host, Port, Req, BodyLen, Deadline, Acc) ->
     end.
 
 %% Run requests on `Sock` until either the deadline elapses or the
-%% server closes (max_keep_alive_request). Conn-close mid-loop is
+%% server closes (max_keep_alive_requests). Conn-close mid-loop is
 %% NOT an error here — it's the expected end-of-conn signal.
 large_keepalive_inner(Sock, Req, BodyLen, Deadline, Acc) ->
     case erlang:monotonic_time(millisecond) >= Deadline of

@@ -340,18 +340,18 @@ listener_opts(#{protocol := h2, cert_dir := CertDir}) ->
             {keyfile, CertDir ++ "/key.pem"}
         ],
         http2_enabled => true,
-        handler => roadrunner_keepalive_handler,
+        routes => roadrunner_keepalive_handler,
         keep_alive_timeout => 60000,
         max_clients => 100000,
-        max_keep_alive_request => 1000000
+        max_keep_alive_requests => 1000000
     };
 listener_opts(_) ->
     #{
         port => 0,
-        handler => roadrunner_keepalive_handler,
+        routes => roadrunner_keepalive_handler,
         keep_alive_timeout => 60000,
         max_clients => 10000,
-        max_keep_alive_request => 1000000
+        max_keep_alive_requests => 1000000
     }.
 
 %% ===========================================================================

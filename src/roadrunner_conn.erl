@@ -11,9 +11,9 @@ directly from `roadrunner_req` (manual body buffering) and from
 `roadrunner_conn_tests.erl`'s closure-driven unit tests.
 
 Per-connection behavior — keep-alive (capped by
-`max_keep_alive_request`, idle-bound by `keep_alive_timeout`),
+`max_keep_alive_requests`, idle-bound by `keep_alive_timeout`),
 `Expect: 100-continue`, HEAD body suppression, anti-Slowloris rate
-check (`minimum_bytes_per_second`), the five handler return shapes
+check (`min_bytes_per_second`), the five handler return shapes
 (`{Status, Headers, Body}`, `{stream, ...}`, `{loop, ...}`,
 `{sendfile, ...}`, `{websocket, ...}`) — lives in `roadrunner_conn_loop`
 and the response-shape-specific modules (`roadrunner_stream_response`,
@@ -83,37 +83,47 @@ read it anyway.
     max_content_length := non_neg_integer(),
     request_timeout := non_neg_integer(),
     keep_alive_timeout := non_neg_integer(),
-    max_keep_alive_request := pos_integer(),
+    max_keep_alive_requests := pos_integer(),
     max_clients := pos_integer(),
     client_counter := atomics:atomics_ref(),
     requests_counter := atomics:atomics_ref(),
-    minimum_bytes_per_second := non_neg_integer(),
+    min_bytes_per_second := non_neg_integer(),
     body_buffering := auto | manual,
     listener_name => atom(),
-    %% When `disabled`, conns skip the per-process `pg:join` into
+    %% When `false`, conns skip the per-process `pg:join` into
     %% `{roadrunner_drain, ListenerName}`. The drain group is the
     %% mechanism `roadrunner_listener:drain/2` uses to broadcast
     %% `{roadrunner_drain, Deadline}` to in-flight conns; loop /
     %% SSE / WebSocket handlers depend on it. Short-lived h1
     %% workloads can opt out for ~10% lower per-conn overhead.
-    drain_group => enabled | disabled,
-    %% RFC 7540 §3.4 prior-knowledge HTTP/2 cleartext. When `enabled`,
-    %% `roadrunner_conn_loop:awaiting_shoot/3` routes the connection
-    %% straight to the h2 conn loop without consulting TLS ALPN.
-    %% Plain TCP only: `roadrunner_listener` rejects the combo with
-    %% `tls` at `init/1`. Default `disabled`.
-    h2c => enabled | disabled,
-    %% h2 receive-window tuning. See `roadrunner_listener:opts()` for
-    %% prose. Defaults match the RFC 9113 baseline.
-    h2_initial_conn_window => 1..16#7FFFFFFF,
-    h2_initial_stream_window => 1..16#7FFFFFFF,
-    h2_window_refill_threshold => pos_integer(),
+    graceful_drain => boolean(),
+    %% Enabled protocols as a flat atom list in user-supplied (ALPN
+    %% preference) order. On plain TCP with `[http2]`,
+    %% `roadrunner_conn_loop:awaiting_shoot/3` routes straight to the
+    %% h2 conn loop. HTTP/2 sub-opts are flattened onto proto_opts
+    %% top-level as `http2_conn_window`, `http2_stream_window`,
+    %% `http2_window_refill_threshold` — see those keys below. The
+    %% user-facing nested shape (`{http2, #{conn_window => N, ...}}`)
+    %% is documented in `t:roadrunner_listener:opts/0`.
+    protocols => [http1 | http2, ...],
+    %% HTTP/2 receive-window tuning, populated by the listener only
+    %% when `http2` is in the protocols list. Pattern-match these
+    %% keys directly in code paths that already know http2 is
+    %% enabled (e.g. `roadrunner_conn_loop_http2:enter/5`) — they're
+    %% guaranteed present, defaults filled at normalization time.
+    %% See `t:roadrunner_listener:opts/0` for the user-facing shape
+    %% (`{http2, #{conn_window => N, stream_window => N,
+    %% window_refill_threshold => N}}`) and RFC 9113 §6.5.2 / §6.9.2
+    %% for the wire semantics.
+    http2_conn_window => 1..16#7FFFFFFF,
+    http2_stream_window => 1..16#7FFFFFFF,
+    http2_window_refill_threshold => 1..16#7FFFFFFF,
     %% Optional fields the listener injects only when the user
     %% supplies them — see `roadrunner_listener:build_proto_opts/2`.
     %% Declared here so dialyzer accepts pattern matches like
     %% `#{hibernate_after := Ms}` against `proto_opts()`.
     hibernate_after => pos_integer(),
-    rate_check_interval_ms => pos_integer()
+    rate_check_interval => pos_integer()
 }.
 
 %% Opaque body-read state attached to the request in manual buffering
@@ -158,12 +168,12 @@ application, the scope is absent and the join is silently skipped
 Called by `roadrunner_conn_loop:init_loop/3` after the conn process
 starts but before it accepts any work.
 """.
--spec join_drain_group(atom(), enabled | disabled) -> ok.
-join_drain_group(_Name, disabled) ->
+-spec join_drain_group(atom(), boolean()) -> ok.
+join_drain_group(_Name, false) ->
     ok;
 join_drain_group(undefined, _) ->
     ok;
-join_drain_group(Name, enabled) ->
+join_drain_group(Name, true) ->
     case whereis(pg) of
         undefined -> ok;
         _ -> pg:join({roadrunner_drain, Name}, self())

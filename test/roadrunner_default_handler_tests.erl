@@ -19,5 +19,5 @@ handle_returns_404_with_quickstart_body_test() ->
     %% Body is the quickstart blurb — verify a couple of stable
     %% landmark phrases instead of the whole text so the test
     %% survives wording polish.
-    {match, _} = re:run(Body, ~"no handler or routes configured"),
+    {match, _} = re:run(Body, ~"no routes configured"),
     {match, _} = re:run(Body, ~"start_listener").

@@ -361,7 +361,7 @@ conn_serves_200_on_get_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_get, #{
-                port => 0, handler => roadrunner_hello_handler
+                port => 0, routes => roadrunner_hello_handler
             }),
             roadrunner_listener:port(conn_test_get)
         end,
@@ -403,7 +403,7 @@ conn_handler_emitted_date_is_preserved_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_date, #{
                 port => 0,
-                handler => roadrunner_explicit_date_handler
+                routes => roadrunner_explicit_date_handler
             }),
             roadrunner_listener:port(conn_test_date)
         end,
@@ -437,7 +437,7 @@ conn_serves_400_on_bad_request_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_bad, #{
-                port => 0, handler => roadrunner_hello_handler
+                port => 0, routes => roadrunner_hello_handler
             }),
             roadrunner_listener:port(conn_test_bad)
         end,
@@ -458,7 +458,7 @@ conn_dispatches_to_custom_handler_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_custom, #{
-                port => 0, handler => roadrunner_test_handler
+                port => 0, routes => roadrunner_test_handler
             }),
             roadrunner_listener:port(conn_test_custom)
         end,
@@ -479,7 +479,7 @@ conn_handler_can_read_body_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_body, #{
-                port => 0, handler => roadrunner_echo_body_handler
+                port => 0, routes => roadrunner_echo_body_handler
             }),
             roadrunner_listener:port(conn_test_body)
         end,
@@ -506,7 +506,7 @@ conn_rejects_excessive_content_length_test_() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_413, #{
                 port => 0,
                 max_content_length => 100,
-                handler => roadrunner_hello_handler
+                routes => roadrunner_hello_handler
             }),
             roadrunner_listener:port(conn_test_413)
         end,
@@ -530,7 +530,7 @@ conn_rejects_malformed_content_length_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_bad_cl, #{
-                port => 0, handler => roadrunner_hello_handler
+                port => 0, routes => roadrunner_hello_handler
             }),
             roadrunner_listener:port(conn_test_bad_cl)
         end,
@@ -553,7 +553,7 @@ conn_decodes_chunked_body_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_chunked, #{
-                port => 0, handler => roadrunner_echo_body_handler
+                port => 0, routes => roadrunner_echo_body_handler
             }),
             roadrunner_listener:port(conn_test_chunked)
         end,
@@ -629,7 +629,7 @@ conn_request_timeout_returns_408_test_() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_timeout, #{
                 port => 0,
                 request_timeout => 100,
-                handler => roadrunner_hello_handler
+                routes => roadrunner_hello_handler
             }),
             roadrunner_listener:port(conn_test_timeout)
         end,
@@ -651,7 +651,7 @@ conn_request_timeout_during_body_returns_408_test_() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_timeout_body, #{
                 port => 0,
                 request_timeout => 200,
-                handler => roadrunner_hello_handler
+                routes => roadrunner_hello_handler
             }),
             roadrunner_listener:port(conn_test_timeout_body)
         end,
@@ -794,7 +794,7 @@ conn_websocket_bad_handshake_returns_400_test_() ->
 
 ws_setup() ->
     {ok, _} = roadrunner_listener:start_link(conn_test_ws, #{
-        port => 0, handler => roadrunner_ws_upgrade_handler
+        port => 0, routes => roadrunner_ws_upgrade_handler
     }),
     roadrunner_listener:port(conn_test_ws).
 
@@ -843,7 +843,7 @@ conn_streams_empty_send_nofin_emits_nothing_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_empty_send, #{
-                port => 0, handler => roadrunner_empty_send_handler
+                port => 0, routes => roadrunner_empty_send_handler
             }),
             roadrunner_listener:port(conn_test_empty_send)
         end,
@@ -881,7 +881,7 @@ conn_pipelined_get_does_not_leak_next_request_as_body_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_pipe, #{
-                port => 0, handler => roadrunner_echo_body_handler
+                port => 0, routes => roadrunner_echo_body_handler
             }),
             roadrunner_listener:port(conn_test_pipe)
         end,
@@ -917,7 +917,7 @@ conn_loop_empty_push_emits_nothing_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_empty_push, #{
-                port => 0, handler => roadrunner_empty_push_handler
+                port => 0, routes => roadrunner_empty_push_handler
             }),
             roadrunner_listener:port(conn_test_empty_push)
         end,
@@ -944,7 +944,7 @@ conn_trailer_with_crlf_in_value_crashes_test_() ->
         fun() ->
             ok = logger:set_primary_config(level, none),
             {ok, _} = roadrunner_listener:start_link(conn_test_trailer_inject, #{
-                port => 0, handler => roadrunner_evil_trailers_handler
+                port => 0, routes => roadrunner_evil_trailers_handler
             }),
             roadrunner_listener:port(conn_test_trailer_inject)
         end,
@@ -976,7 +976,7 @@ conn_streams_chunked_with_trailers_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_trailers, #{
-                port => 0, handler => roadrunner_trailers_handler
+                port => 0, routes => roadrunner_trailers_handler
             }),
             roadrunner_listener:port(conn_test_trailers)
         end,
@@ -1002,7 +1002,7 @@ conn_streams_chunked_response_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_stream, #{
-                port => 0, handler => roadrunner_stream_handler
+                port => 0, routes => roadrunner_stream_handler
             }),
             roadrunner_listener:port(conn_test_stream)
         end,
@@ -1028,7 +1028,7 @@ conn_keep_alive_serves_two_requests_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_ka, #{
-                port => 0, handler => roadrunner_keepalive_handler
+                port => 0, routes => roadrunner_keepalive_handler
             }),
             roadrunner_listener:port(conn_test_ka)
         end,
@@ -1050,13 +1050,13 @@ conn_keep_alive_count_limit_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_ka_max, #{
                 port => 0,
-                handler => roadrunner_keepalive_handler,
-                max_keep_alive_request => 1
+                routes => roadrunner_keepalive_handler,
+                max_keep_alive_requests => 1
             }),
             roadrunner_listener:port(conn_test_ka_max)
         end,
         fun(_) -> ok = roadrunner_listener:stop(conn_test_ka_max) end, fun(Port) ->
-            {"max_keep_alive_request=1 closes after first response", fun() ->
+            {"max_keep_alive_requests=1 closes after first response", fun() ->
                 {ok, Sock} = gen_tcp:connect(
                     {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
                 ),
@@ -1071,7 +1071,7 @@ conn_http10_default_close_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_ka_10, #{
-                port => 0, handler => roadrunner_keepalive_handler
+                port => 0, routes => roadrunner_keepalive_handler
             }),
             roadrunner_listener:port(conn_test_ka_10)
         end,
@@ -1114,7 +1114,7 @@ conn_http11_explicit_close_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_ka_close, #{
-                port => 0, handler => roadrunner_keepalive_handler
+                port => 0, routes => roadrunner_keepalive_handler
             }),
             roadrunner_listener:port(conn_test_ka_close)
         end,
@@ -1145,7 +1145,7 @@ conn_handler_crash_returns_500_test_() ->
             %% stays clean.
             ok = logger:set_primary_config(level, none),
             {ok, _} = roadrunner_listener:start_link(conn_test_crash, #{
-                port => 0, handler => roadrunner_crashing_handler
+                port => 0, routes => roadrunner_crashing_handler
             }),
             roadrunner_listener:port(conn_test_crash)
         end,
@@ -1393,15 +1393,14 @@ consume_state_next_chunk_bad_chunk_test() ->
     ).
 
 join_drain_group_undefined_listener_test() ->
-    ?assertEqual(ok, roadrunner_conn:join_drain_group(undefined, enabled)),
-    ?assertEqual(ok, roadrunner_conn:join_drain_group(undefined, disabled)).
+    ?assertEqual(ok, roadrunner_conn:join_drain_group(undefined, true)),
+    ?assertEqual(ok, roadrunner_conn:join_drain_group(undefined, false)).
 
 join_drain_group_disabled_skips_pg_test() ->
-    %% `disabled` short-circuits without touching pg, even when a
-    %% real listener name is supplied. Verifies the opt-out path
-    %% callers use to skip per-conn pg overhead on short-lived
-    %% workloads.
-    ?assertEqual(ok, roadrunner_conn:join_drain_group(some_listener, disabled)).
+    %% `false` short-circuits without touching pg, even when a real
+    %% listener name is supplied. Verifies the opt-out path callers
+    %% use to skip per-conn pg overhead on short-lived workloads.
+    ?assertEqual(ok, roadrunner_conn:join_drain_group(some_listener, false)).
 
 consume_state_next_chunk_for_content_length_drains_fully_test() ->
     %% Non-chunked framing: `next_chunk` drains the full body in one
@@ -1472,7 +1471,7 @@ conn_manual_body_buffering_bad_transfer_encoding_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_manual_te, #{
                 port => 0,
-                handler => roadrunner_stream_body_handler,
+                routes => roadrunner_stream_body_handler,
                 body_buffering => manual
             }),
             roadrunner_listener:port(conn_test_manual_te)
@@ -1497,7 +1496,7 @@ conn_manual_body_buffering_keep_alive_after_full_read_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_manual_ka_full, #{
                 port => 0,
-                handler => roadrunner_stream_body_handler,
+                routes => roadrunner_stream_body_handler,
                 body_buffering => manual
             }),
             roadrunner_listener:port(conn_test_manual_ka_full)
@@ -1530,7 +1529,7 @@ conn_manual_body_buffering_drain_error_forces_close_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_drain_err, #{
                 port => 0,
-                handler => roadrunner_stream_body_handler,
+                routes => roadrunner_stream_body_handler,
                 body_buffering => manual
             }),
             roadrunner_listener:port(conn_test_drain_err)
@@ -1563,7 +1562,7 @@ conn_manual_body_buffering_drains_unread_body_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_manual_drain, #{
                 port => 0,
-                handler => roadrunner_stream_body_handler,
+                routes => roadrunner_stream_body_handler,
                 body_buffering => manual
             }),
             roadrunner_listener:port(conn_test_manual_drain)
@@ -1599,7 +1598,7 @@ conn_manual_body_buffering_per_chunk_read_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_per_chunk, #{
                 port => 0,
-                handler => roadrunner_stream_body_handler,
+                routes => roadrunner_stream_body_handler,
                 body_buffering => manual
             }),
             roadrunner_listener:port(conn_test_per_chunk)
@@ -1629,7 +1628,7 @@ conn_manual_body_buffering_chunked_request_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_manual_chunked, #{
                 port => 0,
-                handler => roadrunner_stream_body_handler,
+                routes => roadrunner_stream_body_handler,
                 body_buffering => manual
             }),
             roadrunner_listener:port(conn_test_manual_chunked)
@@ -1659,7 +1658,7 @@ conn_manual_body_buffering_full_read_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_manual_full, #{
                 port => 0,
-                handler => roadrunner_stream_body_handler,
+                routes => roadrunner_stream_body_handler,
                 body_buffering => manual
             }),
             roadrunner_listener:port(conn_test_manual_full)
@@ -1685,7 +1684,7 @@ conn_manual_body_buffering_chunked_reads_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_manual_chunks, #{
                 port => 0,
-                handler => roadrunner_stream_body_handler,
+                routes => roadrunner_stream_body_handler,
                 body_buffering => manual
             }),
             roadrunner_listener:port(conn_test_manual_chunks)
@@ -1707,14 +1706,14 @@ conn_manual_body_buffering_chunked_reads_test_() ->
             end}
         end}.
 
-conn_minimum_bytes_per_second_drops_slow_client_test_() ->
+conn_min_bytes_per_second_drops_slow_client_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_slow, #{
                 port => 0,
-                handler => roadrunner_keepalive_handler,
+                routes => roadrunner_keepalive_handler,
                 %% Require 1 MB/s — any trickle below that after grace closes.
-                minimum_bytes_per_second => 1000000,
+                min_bytes_per_second => 1000000,
                 request_timeout => 5000
             }),
             roadrunner_listener:port(conn_test_slow)
@@ -1764,7 +1763,7 @@ conn_loop_handler_pushes_messages_as_chunks_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_loop, #{
-                port => 0, handler => roadrunner_loop_handler
+                port => 0, routes => roadrunner_loop_handler
             }),
             roadrunner_listener:port(conn_test_loop)
         end,
@@ -1805,7 +1804,7 @@ conn_max_clients_rejects_excess_connections_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_max_clients, #{
                 port => 0,
-                handler => roadrunner_keepalive_handler,
+                routes => roadrunner_keepalive_handler,
                 max_clients => 1
             }),
             roadrunner_listener:port(conn_test_max_clients)
@@ -1834,7 +1833,7 @@ conn_keep_alive_timeout_closes_idle_connection_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_ka_idle, #{
                 port => 0,
-                handler => roadrunner_keepalive_handler,
+                routes => roadrunner_keepalive_handler,
                 keep_alive_timeout => 150
             }),
             roadrunner_listener:port(conn_test_ka_idle)
@@ -1857,7 +1856,7 @@ conn_sends_100_continue_before_reading_body_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_100, #{
-                port => 0, handler => roadrunner_echo_body_handler
+                port => 0, routes => roadrunner_echo_body_handler
             }),
             roadrunner_listener:port(conn_test_100)
         end,
@@ -1904,7 +1903,7 @@ conn_head_drops_response_body_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_head, #{
-                port => 0, handler => roadrunner_test_handler
+                port => 0, routes => roadrunner_test_handler
             }),
             roadrunner_listener:port(conn_test_head)
         end,
@@ -1929,7 +1928,7 @@ conn_populates_peer_in_request_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_peer, #{
-                port => 0, handler => roadrunner_peer_handler
+                port => 0, routes => roadrunner_peer_handler
             }),
             roadrunner_listener:port(conn_test_peer)
         end,

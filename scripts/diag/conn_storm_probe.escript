@@ -213,10 +213,10 @@ teardown(#{mode := peer}, Peer) ->
 rr_listener_opts() ->
     #{
         port => 0,
-        handler => roadrunner_keepalive_handler,
+        routes => roadrunner_keepalive_handler,
         keep_alive_timeout => 60000,
         max_clients => 100000,
-        max_keep_alive_request => 1000000
+        max_keep_alive_requests => 1000000
     }.
 
 %% N sequential connections, each: connect → send → recv → close.

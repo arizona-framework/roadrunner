@@ -67,12 +67,12 @@ erl -noshell "${PA_DIRS[@]}" -eval "
     {ok, _} = application:ensure_all_started(roadrunner),
     {ok, _} = roadrunner:start_listener(h2spec_listener, #{
         port => $PORT,
+        protocols => [http2],
         tls => [
             {certfile, \"$CERT_DIR/cert.pem\"},
-            {keyfile, \"$CERT_DIR/key.pem\"},
-            {alpn_preferred_protocols, [<<\"h2\">>]}
+            {keyfile, \"$CERT_DIR/key.pem\"}
         ],
-        handler => roadrunner_hello_handler
+        routes => roadrunner_hello_handler
     }),
     Port = roadrunner_listener:port(h2spec_listener),
     file:write_file(\"$PORT_FILE\", integer_to_binary(Port)),

@@ -1,22 +1,23 @@
 -module(roadrunner_h2_window_tuning_tests).
 -include_lib("eunit/include/eunit.hrl").
 
-%% Tests the listener-level h2 receive-window knobs:
-%%   - `h2_initial_conn_window`     — connection-level recv peak
-%%   - `h2_initial_stream_window`   — stream-level recv peak
-%%   - `h2_window_refill_threshold` — refill trigger (not directly
-%%                                    asserted here; covered by the
-%%                                    conn loop's own flow-control
-%%                                    tests)
+%% Tests the listener-level h2 receive-window knobs (nested under
+%% `protocols => [{http2, #{...}}]`):
+%%   - `conn_window`               — connection-level recv peak
+%%   - `stream_window`             — stream-level recv peak
+%%   - `window_refill_threshold`   — refill trigger (not directly
+%%                                   asserted here; covered by the
+%%                                   conn loop's own flow-control
+%%                                   tests)
 %%
-%% When `h2_initial_conn_window > 65535`, the conn emits an early
+%% When `conn_window > 65535`, the conn emits an early
 %% `WINDOW_UPDATE(0, peak - 65535)` right after the server SETTINGS
 %% in the handshake (RFC 9113 §6.5.2: the conn-level recv window is
 %% only tunable via `WINDOW_UPDATE`, not SETTINGS).
 %%
-%% When `h2_initial_stream_window > 65535`, the server SETTINGS frame
-%% includes a `SETTINGS_INITIAL_WINDOW_SIZE` (id 4) entry advertising
-%% the configured peak.
+%% When `stream_window > 65535`, the server SETTINGS frame includes
+%% a `SETTINGS_INITIAL_WINDOW_SIZE` (id 4) entry advertising the
+%% configured peak.
 %%
 %% Defaults match the RFC baseline (65535 / 65535) — neither extra
 %% frame is emitted unless the user explicitly bumps the values.
@@ -54,10 +55,10 @@ default_opts_emit_only_basic_settings() ->
     cleanup(Pid, Ref).
 
 bumped_conn_window_emits_window_update() ->
-    %% h2_initial_conn_window = 16M, stream stays default. Expect
-    %% SETTINGS without id 4, then WINDOW_UPDATE(0, 16M - 65535).
+    %% conn_window = 16M, stream stays default. Expect SETTINGS
+    %% without id 4, then WINDOW_UPDATE(0, 16M - 65535).
     Peak = 16 * 1024 * 1024,
-    {Pid, Ref} = start_conn(#{h2_initial_conn_window => Peak}),
+    {Pid, Ref} = start_conn(#{conn_window => Peak}),
     Settings = expect_send(),
     {ok, {settings, 0, Entries}, _} = roadrunner_http2_frame:parse(Settings, 16384),
     ?assertEqual(false, lists:keymember(4, 1, Entries)),
@@ -67,10 +68,10 @@ bumped_conn_window_emits_window_update() ->
     cleanup(Pid, Ref).
 
 bumped_stream_window_advertises_initial_window_size() ->
-    %% h2_initial_stream_window = 4M, conn stays default. Expect
-    %% SETTINGS WITH id 4 = 4M, NO follow-up WINDOW_UPDATE.
+    %% stream_window = 4M, conn stays default. Expect SETTINGS WITH
+    %% id 4 = 4M, NO follow-up WINDOW_UPDATE.
     StreamPeak = 4 * 1024 * 1024,
-    {Pid, Ref} = start_conn(#{h2_initial_stream_window => StreamPeak}),
+    {Pid, Ref} = start_conn(#{stream_window => StreamPeak}),
     Settings = expect_send(),
     {ok, {settings, 0, Entries}, _} = roadrunner_http2_frame:parse(Settings, 16384),
     ?assertEqual(StreamPeak, proplists:get_value(4, Entries)),
@@ -83,8 +84,8 @@ bumped_both_emits_settings_with_size_then_window_update() ->
     ConnPeak = 16 * 1024 * 1024,
     StreamPeak = 4 * 1024 * 1024,
     {Pid, Ref} = start_conn(#{
-        h2_initial_conn_window => ConnPeak,
-        h2_initial_stream_window => StreamPeak
+        conn_window => ConnPeak,
+        stream_window => StreamPeak
     }),
     Settings = expect_send(),
     {ok, {settings, 0, Entries}, _} = roadrunner_http2_frame:parse(Settings, 16384),
@@ -105,9 +106,9 @@ custom_threshold_changes_refill_trigger() ->
     Peak = 100_000,
     Threshold = 50_000,
     {Pid, Ref} = start_conn(#{
-        h2_initial_conn_window => Peak,
-        h2_initial_stream_window => Peak,
-        h2_window_refill_threshold => Threshold
+        conn_window => Peak,
+        stream_window => Peak,
+        window_refill_threshold => Threshold
     }),
     %% Drain handshake init (SETTINGS + early WINDOW_UPDATE for the
     %% bumped conn peak).
@@ -162,64 +163,73 @@ custom_threshold_changes_refill_trigger() ->
 invalid_window_opt_fails_listener_start() ->
     %% A non-positive integer (or anything outside 1..2^31-1) should
     %% surface at listener init/1 rather than mid-handshake. Each
-    %% bad-opt case fails fast with `{invalid_listener_opt, Key, V}`.
+    %% bad-opt case fails fast with
+    %% `{invalid_listener_opt, protocols, _}`.
     process_flag(trap_exit, true),
     BadCases = [
-        {h2_initial_conn_window, 0},
-        {h2_initial_conn_window, -1},
-        {h2_initial_stream_window, 16#80000000},
-        {h2_window_refill_threshold, not_an_integer}
+        #{conn_window => 0},
+        #{conn_window => -1},
+        #{stream_window => 16#80000000},
+        #{window_refill_threshold => not_an_integer},
+        #{unknown_h2_opt => 1}
     ],
     [
         ?assertMatch(
-            {error, {{invalid_listener_opt, Key, V}, _}},
+            {error, {{invalid_listener_opt, protocols, _}, _}},
             roadrunner_listener:start_link(
                 list_to_atom(
                     "h2_window_test_invalid_" ++
-                        atom_to_list(Key) ++
-                        "_" ++
                         integer_to_list(erlang:unique_integer([positive]))
                 ),
-                #{port => 0, Key => V}
+                #{port => 0, protocols => [{http2, H2}]}
             )
         )
-     || {Key, V} <- BadCases
+     || H2 <- BadCases
     ],
     ok.
 
 valid_window_opts_let_listener_boot() ->
     %% Companion to `invalid_window_opt_fails_listener_start/0`:
-    %% the validator's success path (`{ok, V} when integer in
-    %% range`) is exercised by booting a listener with all three
-    %% h2 window opts set to valid bumped values. The listener
-    %% comes up clean.
+    %% the validator's success path (in-range integers under all
+    %% three nested keys) is exercised by booting a listener with a
+    %% tuned `{http2, _}` entry. The listener comes up clean.
     Name = list_to_atom(
         "h2_window_test_valid_" ++
             integer_to_list(erlang:unique_integer([positive]))
     ),
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0,
-        h2_initial_conn_window => 1_048_576,
-        h2_initial_stream_window => 524_288,
-        h2_window_refill_threshold => 65_536,
-        handler => roadrunner_hello_handler
+        protocols => [
+            {http2, #{
+                conn_window => 1_048_576,
+                stream_window => 524_288,
+                window_refill_threshold => 65_536
+            }}
+        ],
+        routes => roadrunner_hello_handler
     }),
     ok = roadrunner_listener:stop(Name).
 
 %% --- helpers ---------------------------------------------------
 
-start_conn(ExtraOpts) ->
+start_conn(H2Opts) ->
+    %% `H2Opts` is the user-facing sub-opts map (keys: `conn_window`,
+    %% `stream_window`, `window_refill_threshold`). Translate to the
+    %% flat `http2_` prefix the conn loop reads via single `maps:get/2`.
     {ok, _} = application:ensure_all_started(telemetry),
     Self = self(),
     Counter = atomics:new(1, [{signed, false}]),
     ok = atomics:add(Counter, 1, 1),
-    Base = #{
+    ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_window_test,
         dispatch => {handler, roadrunner_hello_handler},
-        middlewares => []
+        middlewares => [],
+        protocols => [http2],
+        http2_conn_window => maps:get(conn_window, H2Opts, 65535),
+        http2_stream_window => maps:get(stream_window, H2Opts, 65535),
+        http2_window_refill_threshold => maps:get(window_refill_threshold, H2Opts, 32768)
     },
-    ProtoOpts = maps:merge(Base, ExtraOpts),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive

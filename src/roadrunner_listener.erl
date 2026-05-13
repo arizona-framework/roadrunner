@@ -16,6 +16,10 @@ On `init/1` the listener opens the listen socket, builds the shared
 `roadrunner_acceptor` processes that pull from the same listen socket.
 Connection workers are unlinked from the acceptor so a single
 connection crash doesn't take the pool down.
+
+All duration and interval values in `opts()` are in milliseconds —
+`request_timeout`, `keep_alive_timeout`, `rate_check_interval`,
+`hibernate_after`, and `slot_reconciliation.interval`.
 """.
 
 -behaviour(gen_server).
@@ -35,34 +39,33 @@ connection crash doesn't take the pool down.
 
 -type opts() :: #{
     port := inet:port_number(),
-    handler => module(),
-    routes => roadrunner_router:routes(),
+    routes => module() | roadrunner_router:routes(),
     middlewares => roadrunner_middleware:middleware_list(),
     max_content_length => non_neg_integer(),
     request_timeout => non_neg_integer(),
     keep_alive_timeout => non_neg_integer(),
     num_acceptors => pos_integer(),
-    max_keep_alive_request => pos_integer(),
+    max_keep_alive_requests => pos_integer(),
     max_clients => pos_integer(),
-    minimum_bytes_per_second => non_neg_integer(),
-    %% How often (ms) `reading_request` re-checks the running
-    %% bytes-per-second average against `minimum_bytes_per_second`.
-    %% Default 1000ms — matches the 1-second grace period of the
-    %% rate check itself. Tests use shorter intervals (20–30ms) to
+    min_bytes_per_second => non_neg_integer(),
+    %% How often `reading_request` re-checks the running
+    %% bytes-per-second average against `min_bytes_per_second`.
+    %% Default `1000` — matches the 1-second grace period of the
+    %% rate check itself. Tests use shorter intervals (20–30) to
     %% exercise rate-check fires deterministically without
     %% second-scale waits; ops can tune for chattier observability.
-    rate_check_interval_ms => pos_integer(),
+    rate_check_interval => pos_integer(),
     body_buffering => auto | manual,
-    slot_reconciliation => disabled | #{interval_ms := pos_integer()},
-    %% Opt out of the per-conn `pg` drain group. Default `enabled`
-    %% (current behavior). Set to `disabled` for short-lived
-    %% h1-only workloads (REST APIs, health-check probes, CLI
-    %% clients) where conns finish on their own faster than any
-    %% drain notification could fire. Trades graceful drain
-    %% notification for ~10% lower per-conn overhead. Long-lived
-    %% conns (loop handlers, SSE, WebSocket) still rely on this
-    %% — keep `enabled` if your handlers have those.
-    drain_group => enabled | disabled,
+    slot_reconciliation => disabled | #{interval := pos_integer()},
+    %% Opt out of the per-conn `pg` drain group. Default `true`
+    %% (current behavior). Set to `false` for short-lived h1-only
+    %% workloads (REST APIs, health-check probes, CLI clients) where
+    %% conns finish on their own faster than any drain notification
+    %% could fire. Trades graceful drain notification for ~10% lower
+    %% per-conn overhead. Long-lived conns (loop handlers, SSE,
+    %% WebSocket) still rely on this — keep `true` if your handlers
+    %% have those.
+    graceful_drain => boolean(),
     %% When set, the per-connection process auto-hibernates after
     %% `Ms` milliseconds of idle main-loop time. Most useful for
     %% long-lived keep-alive HTTP/1.1 connections that mostly sit
@@ -72,49 +75,60 @@ connection crash doesn't take the pool down.
     %% receive's `after` clause has a window to call
     %% `erlang:hibernate/3`.
     hibernate_after => pos_integer(),
-    %% When the `tls` opts include `alpn_preferred_protocols` containing
-    %% `~"h2"`, clients that ALPN-negotiate `h2` are dispatched to
-    %% `roadrunner_conn_loop_http2`; everything else (including no-ALPN
-    %% and `~"http/1.1"`) goes to the HTTP/1.1 path. Default ALPN is
-    %% `[~"http/1.1"]` only. For HTTP/2 on plain TCP set `h2c => enabled`.
-    tls => [ssl:tls_server_option()],
-    %% Force every accepted connection on a plaintext listener through
-    %% the HTTP/2 state machine via the RFC 7540 §3.4 prior-knowledge
-    %% variant. Client opens TCP and sends the h2 connection preface
-    %% (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) directly, no Upgrade
-    %% negotiation. Plain TCP only: combining `h2c => enabled` with
-    %% `tls` is rejected at `init/1`. Default `disabled`.
-    h2c => enabled | disabled,
-    %% h2 connection-level recv window peak (bytes). The RFC default is
-    %% 65535 — the only window reachable without explicit
-    %% `WINDOW_UPDATE` per RFC 9113 §6.5.2 (SETTINGS doesn't carry the
-    %% conn-level initial). When set above 65535, the listener emits an
-    %% early `WINDOW_UPDATE(0, peak - 65535)` right after the server
-    %% SETTINGS in the handshake. Useful for upload-heavy workloads on
-    %% non-LAN RTTs where window/RTT bounds per-conn throughput.
-    %% Reference points: gun 8 MB, Go net/http2 1 GB, h2o 16 MB+, Mint
-    %% 16 MB. Default `65535` (RFC). See `docs/roadmap.md` "h2 receive-
-    %% window defaults" for the trade-off behind keeping the default
-    %% conservative (worst-case memory is `max_clients × peak`).
-    h2_initial_conn_window => 1..16#7FFFFFFF,
-    %% h2 stream-level recv window peak (bytes). Advertised via
-    %% `SETTINGS_INITIAL_WINDOW_SIZE` in the server SETTINGS frame
-    %% (RFC 9113 §6.5.2). Same throughput-vs-RTT consideration as the
-    %% conn-level peak, applied per stream. Reference points: Mint
-    %% 4 MB, gun 8 MB. Default `65535` (RFC). Setting this higher than
-    %% `h2_initial_conn_window` is allowed but not useful — the
-    %% conn-level peak is the binding constraint when streams aggregate
-    %% past it. See `docs/roadmap.md` for the default-bump trade-off.
-    h2_initial_stream_window => 1..16#7FFFFFFF,
-    %% h2 receive-window refill threshold (bytes). The conn refills the
-    %% conn-level / stream-level recv window back to its peak once the
-    %% remaining drops below this value. Lower threshold = fewer
-    %% `WINDOW_UPDATE` frames per byte consumed but a smaller live
-    %% window between refills. Default `32768` matches the prior
-    %% half-of-RFC-default heuristic. Setting this larger than the
-    %% configured peak refills on every DATA frame (always under
-    %% threshold).
-    h2_window_refill_threshold => pos_integer()
+    %% Protocols this listener accepts. Each entry is either a bare
+    %% atom (`http1` / `http2`) or a `{Proto, Opts}` tuple carrying
+    %% protocol-specific tuning. Bare atom means "default opts".
+    %% Default `[http1]`.
+    %%
+    %% On TLS listeners the list drives `alpn_preferred_protocols`
+    %% automatically (`http1` → `~"http/1.1"`, `http2` → `~"h2"`).
+    %% An explicit `alpn_preferred_protocols` inside `tls` overrides
+    %% the derivation.
+    %%
+    %% On plain TCP, `[http1]` serves HTTP/1.1 only; `[http2]` serves
+    %% h2c prior-knowledge (client sends the h2 connection preface
+    %% `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` directly, no Upgrade
+    %% negotiation). `[http1, http2]` on plain TCP is rejected at
+    %% `init/1` — roadrunner has no `Upgrade: h2c` implementation,
+    %% so the two cannot share a plaintext port.
+    %%
+    %% HTTP/1 currently has no tunables; its opts map must be empty
+    %% (room reserved for future additions without an API break).
+    %%
+    %% HTTP/2 tunables live under the `http2` tuple's opts map:
+    %%
+    %% - `conn_window` — connection-level receive window peak (bytes,
+    %%   `1..2^31-1`). RFC 9113 default `65535`; values above the RFC
+    %%   default emit an early `WINDOW_UPDATE(0, peak - 65535)` after
+    %%   the server SETTINGS. Useful for upload-heavy workloads on
+    %%   non-LAN RTTs. Reference points: gun 8 MB, Go net/http2 1 GB,
+    %%   h2o 16 MB+, Mint 16 MB. Worst-case memory is
+    %%   `max_clients × peak`.
+    %% - `stream_window` — stream-level receive window peak (bytes,
+    %%   `1..2^31-1`). Advertised via `SETTINGS_INITIAL_WINDOW_SIZE`.
+    %%   Default `65535`. Setting above `conn_window` is allowed but
+    %%   not useful — the conn-level peak is the binding constraint.
+    %% - `window_refill_threshold` — refill trigger (bytes,
+    %%   `pos_integer`). When the remaining window drops below this,
+    %%   the conn refills back to the peak. Lower threshold = fewer
+    %%   `WINDOW_UPDATE` frames per byte consumed but a smaller live
+    %%   window between refills. Default `32768`.
+    %%
+    %% Empty list, unknown protocol atoms, duplicate entries, bad
+    %% tuple shape, unknown sub-option keys, or out-of-range sub-
+    %% option values are rejected at `init/1`. See
+    %% `docs/roadmap.md` "h2 receive-window defaults" for the
+    %% trade-off behind keeping the conservative RFC defaults.
+    protocols => [protocol_entry(), ...],
+    tls => [ssl:tls_server_option()]
+}.
+
+-type protocol_entry() :: http1 | http2 | {http1, #{}} | {http2, http2_opts()}.
+
+-type http2_opts() :: #{
+    conn_window => 1..16#7FFFFFFF,
+    stream_window => 1..16#7FFFFFFF,
+    window_refill_threshold => 1..16#7FFFFFFF
 }.
 
 -record(state, {
@@ -132,7 +146,7 @@ connection crash doesn't take the pool down.
     reconciliation = disabled ::
         disabled
         | #{
-            interval_ms := pos_integer(),
+            interval := pos_integer(),
             prev_diff := non_neg_integer()
         }
 }).
@@ -222,8 +236,8 @@ in-flight conns keep using whatever they read at request-resolve
 time, but every subsequent dispatch sees the new table.
 
 Returns `ok` on success or `{error, no_routes}` if the listener was
-started without a `routes` opt (single-handler dispatch — there's
-nothing to reload).
+started in single-handler mode (`routes => Module` or no `routes`
+opt) — there's no router table to reload.
 """.
 -spec reload_routes(Name :: atom(), roadrunner_router:routes()) ->
     ok | {error, no_routes}.
@@ -238,7 +252,8 @@ init(#{port := Port} = Opts) ->
     publish_routes(ListenerName, Opts),
     ProtoOpts = build_proto_opts(Opts, ListenerName),
     proc_lib:set_label({roadrunner_listener, ListenerName, Port}),
-    case open_listen_socket(Port, Opts) of
+    Protocols = maps:get(protocols, ProtoOpts),
+    case open_listen_socket(Port, Opts, Protocols) of
         {ok, LSocket} ->
             {ok, BoundPort} = roadrunner_transport:port(LSocket),
             NumAcceptors = maps:get(num_acceptors, Opts, ?DEFAULT_NUM_ACCEPTORS),
@@ -255,12 +270,12 @@ init(#{port := Port} = Opts) ->
     end.
 
 -spec setup_reconciliation(opts()) ->
-    disabled | #{interval_ms := pos_integer(), prev_diff := non_neg_integer()}.
-setup_reconciliation(#{slot_reconciliation := #{interval_ms := IntervalMs}}) when
+    disabled | #{interval := pos_integer(), prev_diff := non_neg_integer()}.
+setup_reconciliation(#{slot_reconciliation := #{interval := IntervalMs}}) when
     is_integer(IntervalMs), IntervalMs > 0
 ->
     erlang:send_after(IntervalMs, self(), reconcile_slots),
-    #{interval_ms => IntervalMs, prev_diff => 0};
+    #{interval => IntervalMs, prev_diff => 0};
 setup_reconciliation(_Opts) ->
     disabled.
 
@@ -269,7 +284,7 @@ setup_reconciliation(_Opts) ->
 %% lookup is O(1) and the table is shared across all conns of this
 %% listener without copying.
 -spec publish_routes(atom(), opts()) -> ok.
-publish_routes(ListenerName, #{routes := Routes}) ->
+publish_routes(ListenerName, #{routes := Routes}) when is_list(Routes) ->
     persistent_term:put({roadrunner_routes, ListenerName}, roadrunner_router:compile(Routes));
 publish_routes(_ListenerName, _Opts) ->
     ok.
@@ -282,17 +297,20 @@ listener_name() ->
     {registered_name, Name} = process_info(self(), registered_name),
     Name.
 
--spec open_listen_socket(inet:port_number(), opts()) ->
-    {ok, roadrunner_transport:socket()} | {error, term()}.
-open_listen_socket(Port, #{tls := UserTlsOpts}) ->
-    %% TLS path — caller supplies cert/key (and optionally
-    %% `alpn_preferred_protocols`). We merge `roadrunner_transport`'s
-    %% hardened defaults underneath (user values win) and layer the
-    %% standard transport options on top so accepted sockets behave like
-    %% the plain-TCP variant.
-    TlsOpts = roadrunner_transport:apply_tls_defaults(UserTlsOpts),
+-spec open_listen_socket(
+    inet:port_number(), opts(), [http1 | http2, ...]
+) -> {ok, roadrunner_transport:socket()} | {error, term()}.
+open_listen_socket(Port, #{tls := UserTlsOpts}, Protocols) ->
+    %% TLS path — caller supplies cert/key. ALPN is derived from the
+    %% normalized `protocols` list (`http2` → `~"h2"`, `http1` →
+    %% `~"http/1.1"`) unless the user supplied
+    %% `alpn_preferred_protocols` explicitly, in which case the
+    %% explicit value wins. Hardened defaults are layered underneath
+    %% (user values win), and the standard transport options sit on
+    %% top so accepted sockets behave like the plain-TCP variant.
+    TlsOpts = roadrunner_transport:build_tls_opts(Protocols, UserTlsOpts),
     roadrunner_transport:listen_tls(Port, TlsOpts ++ base_listen_opts());
-open_listen_socket(Port, _Opts) ->
+open_listen_socket(Port, _Opts, _Protocols) ->
     %% Plain TCP. The legacy `inet_drv` backend (gen_tcp default) has
     %% lower per-call overhead than the OTP-27 `socket` backend on
     %% short-lived connections. fprof on `connection_storm` shows the
@@ -368,40 +386,41 @@ spawn_acceptors_loop(LSocket, ProtoOpts, I, N) ->
 
 -spec build_proto_opts(opts(), atom()) -> roadrunner_conn:proto_opts().
 build_proto_opts(Opts, ListenerName) ->
-    %% Validate the h2 receive-window opts up-front so a bad value
-    %% surfaces at listener `init/1` rather than mid-handshake. RFC
-    %% 9113 §6.9.1 caps a flow-control window at 2^31-1.
-    ok = validate_h2_window_opt(h2_initial_conn_window, Opts, 16#7FFFFFFF),
-    ok = validate_h2_window_opt(h2_initial_stream_window, Opts, 16#7FFFFFFF),
-    ok = validate_h2_window_opt(h2_window_refill_threshold, Opts, 16#7FFFFFFF),
-    ok = validate_h2c_opt(Opts),
+    %% Validate + normalize the `protocols` list. Public input may
+    %% nest `{http2, #{...}}` for protocol-specific tuning; the
+    %% normalizer flattens HTTP/2 sub-opts onto proto_opts top-level
+    %% with an `http2_` prefix so the hot path reads each knob via
+    %% a single `maps:get/2` instead of a nested map dive.
+    {Protocols, ProtoFlats} = normalize_protocols(Opts),
     %% Per-listener atomics: live-connection counter (acceptors bump on
     %% accept; conns decrement on exit) and a cumulative requests-served
     %% counter (conn bumps on each handler dispatch). Lock-free, ~1ns
     %% per op — cheap enough on the hot path.
     ClientCounter = atomics:new(1, [{signed, false}]),
     RequestsCounter = atomics:new(1, [{signed, false}]),
-    Base = #{
-        dispatch => build_dispatch(Opts, ListenerName),
-        middlewares => maps:get(middlewares, Opts, []),
-        max_content_length => maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
-        request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
-        keep_alive_timeout => maps:get(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT),
-        max_keep_alive_request =>
-            maps:get(max_keep_alive_request, Opts, ?DEFAULT_MAX_KEEP_ALIVE),
-        max_clients => maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
-        client_counter => ClientCounter,
-        requests_counter => RequestsCounter,
-        minimum_bytes_per_second =>
-            maps:get(minimum_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
-        body_buffering => maps:get(body_buffering, Opts, auto),
-        listener_name => ListenerName,
-        drain_group => maps:get(drain_group, Opts, enabled),
-        h2c => maps:get(h2c, Opts, disabled),
-        h2_initial_conn_window => maps:get(h2_initial_conn_window, Opts, 65535),
-        h2_initial_stream_window => maps:get(h2_initial_stream_window, Opts, 65535),
-        h2_window_refill_threshold => maps:get(h2_window_refill_threshold, Opts, 32768)
-    },
+    Base = maps:merge(
+        #{
+            dispatch => build_dispatch(Opts, ListenerName),
+            middlewares => maps:get(middlewares, Opts, []),
+            max_content_length =>
+                maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
+            request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
+            keep_alive_timeout =>
+                maps:get(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT),
+            max_keep_alive_requests =>
+                maps:get(max_keep_alive_requests, Opts, ?DEFAULT_MAX_KEEP_ALIVE),
+            max_clients => maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
+            client_counter => ClientCounter,
+            requests_counter => RequestsCounter,
+            min_bytes_per_second =>
+                maps:get(min_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
+            body_buffering => maps:get(body_buffering, Opts, auto),
+            listener_name => ListenerName,
+            graceful_drain => maps:get(graceful_drain, Opts, true),
+            protocols => Protocols
+        },
+        ProtoFlats
+    ),
     WithHibernate =
         %% Optional `hibernate_after` — `roadrunner_conn_loop` reads it
         %% from proto_opts and routes the recv path through
@@ -416,58 +435,131 @@ build_proto_opts(Opts, ListenerName) ->
             #{} ->
                 Base
         end,
-    %% Optional `rate_check_interval_ms` — the rate-check timer
+    %% Optional `rate_check_interval` — the rate-check timer
     %% interval inside `reading_request`. Default 1000ms; ops can
     %% override.
     case Opts of
-        #{rate_check_interval_ms := IntervalMs} when is_integer(IntervalMs), IntervalMs > 0 ->
-            WithHibernate#{rate_check_interval_ms => IntervalMs};
+        #{rate_check_interval := IntervalMs} when is_integer(IntervalMs), IntervalMs > 0 ->
+            WithHibernate#{rate_check_interval => IntervalMs};
         #{} ->
             WithHibernate
     end.
 
-%% `routes` (router-based dispatch) takes precedence over `handler`. With
-%% neither, fall back to the default hello-world handler. Routes are
-%% published to `persistent_term` by `publish_routes/2` — the dispatch
-%% tag carries the listener name so the conn can look the table up.
+%% `routes` is the unified dispatch option. A bare module atom sends
+%% every request to that handler; a list of `{Path, Module, Opts}`
+%% tuples uses the router. When `routes` is omitted, fall back to the
+%% default hello-world handler. List-form routes are published to
+%% `persistent_term` by `publish_routes/2` — the dispatch tag carries
+%% the listener name so the conn can look the table up.
 -spec build_dispatch(opts(), atom()) -> roadrunner_conn:dispatch().
--spec validate_h2_window_opt(atom(), opts(), pos_integer()) -> ok.
-validate_h2_window_opt(Key, Opts, Max) ->
-    case maps:find(Key, Opts) of
-        error ->
-            ok;
-        {ok, V} when is_integer(V, 1, Max) ->
-            ok;
-        {ok, V} ->
-            error({invalid_listener_opt, Key, V})
+%% Validate + normalize the `protocols` opt. Returns a 2-tuple:
+%%
+%% - `Protocols :: [http1 | http2, ...]` — the enabled protocols as a
+%%   flat atom list in user-supplied order (ALPN preference).
+%% - `ProtoFlats :: #{atom() => term()}` — HTTP/2 sub-opts flattened
+%%   with `http2_` prefix (`http2_conn_window`, `http2_stream_window`,
+%%   `http2_window_refill_threshold`), defaults filled. Empty map
+%%   when http2 is not in the list. Flat keys keep the hot path to
+%%   one `maps:get/2` per knob; no nested map dives.
+%%
+%% Error shapes follow the existing `{invalid_listener_opt, K, V}` /
+%% `{listener_opt_conflict, ...}` convention:
+%%
+%% - `{invalid_listener_opt, protocols, V}` for a bad list shape:
+%%   empty list, non-list, unknown atom, malformed tuple, unknown
+%%   sub-option key, out-of-range sub-option value, or duplicate
+%%   entries.
+%% - `{listener_opt_conflict, protocols, V, no_h2c_upgrade}` for the
+%%   one combo we have to reject at config time: both `http1` and
+%%   `http2` on a plain-TCP listener. Roadrunner has no
+%%   `Upgrade: h2c` implementation, so the two cannot share a
+%%   plaintext port; the reason token spells that out so the error
+%%   message is honest.
+-spec normalize_protocols(opts()) -> {[http1 | http2, ...], #{atom() => term()}}.
+normalize_protocols(Opts) ->
+    Raw = maps:get(protocols, Opts, [http1]),
+    HasTls = maps:is_key(tls, Opts),
+    Entries = normalize_protocols_list(Raw),
+    Names = [N || {N, _} <- Entries],
+    case Names of
+        [http1, http2] when not HasTls ->
+            error({listener_opt_conflict, protocols, Raw, no_h2c_upgrade});
+        [http2, http1] when not HasTls ->
+            error({listener_opt_conflict, protocols, Raw, no_h2c_upgrade});
+        _ ->
+            {Names, flatten_http2_opts(Entries)}
     end.
 
-%% `h2c => enabled` is a plaintext-only mode: TLS listeners use ALPN
-%% to negotiate h2 instead. Reject the combo at `init/1` so the
-%% misconfiguration surfaces immediately rather than as a silent
-%% no-op (the dispatch wouldn't honour h2c on a TLS socket anyway).
-%%
-%% Two error shapes:
-%%
-%% - `{invalid_listener_opt, h2c, V}` for a bad value (anything other
-%%   than `enabled` / `disabled`). Matches `validate_h2_window_opt/3`.
-%% - `{listener_opt_conflict, h2c, tls}` when both opts are present
-%%   together. The value `enabled` is valid in isolation; the
-%%   misconfiguration is the combination, so a distinct class makes
-%%   the error message say what's actually wrong.
--spec validate_h2c_opt(opts()) -> ok.
-validate_h2c_opt(Opts) ->
-    case {maps:get(h2c, Opts, disabled), maps:is_key(tls, Opts)} of
-        {disabled, _} -> ok;
-        {enabled, false} -> ok;
-        {enabled, true} -> error({listener_opt_conflict, h2c, tls});
-        {Other, _} -> error({invalid_listener_opt, h2c, Other})
+-type protocol_entry_norm() :: {http1, #{}} | {http2, http2_opts()}.
+
+-spec normalize_protocols_list(term()) -> [protocol_entry_norm(), ...].
+normalize_protocols_list(L) when is_list(L), L =/= [] ->
+    Entries = [normalize_protocol_entry(E, L) || E <- L],
+    Names = [N || {N, _} <- Entries],
+    case length(lists:usort(Names)) =:= length(Names) of
+        true -> Entries;
+        false -> error({invalid_listener_opt, protocols, L})
+    end;
+normalize_protocols_list(L) ->
+    error({invalid_listener_opt, protocols, L}).
+
+-spec normalize_protocol_entry(term(), term()) -> protocol_entry_norm().
+normalize_protocol_entry(http1, _Raw) ->
+    {http1, #{}};
+normalize_protocol_entry(http2, _Raw) ->
+    {http2, http2_defaults()};
+normalize_protocol_entry({http1, Opts}, _Raw) when is_map(Opts), map_size(Opts) =:= 0 ->
+    {http1, #{}};
+normalize_protocol_entry({http2, Opts}, Raw) when is_map(Opts) ->
+    {http2, validate_http2_opts(Opts, Raw)};
+normalize_protocol_entry(_, Raw) ->
+    error({invalid_listener_opt, protocols, Raw}).
+
+-spec http2_defaults() -> http2_opts().
+http2_defaults() ->
+    #{conn_window => 65535, stream_window => 65535, window_refill_threshold => 32768}.
+
+-spec validate_http2_opts(map(), term()) -> http2_opts().
+validate_http2_opts(Opts, Raw) ->
+    Defaults = http2_defaults(),
+    maps:fold(
+        fun(K, V, Acc) ->
+            case is_map_key(K, Defaults) of
+                false -> error({invalid_listener_opt, protocols, Raw});
+                true when is_integer(V, 1, 16#7FFFFFFF) -> Acc#{K => V};
+                true -> error({invalid_listener_opt, protocols, Raw})
+            end
+        end,
+        Defaults,
+        Opts
+    ).
+
+%% Flatten the http2 sub-opts onto proto_opts top-level with an
+%% `http2_` prefix so the hot path reads each knob with a single
+%% `maps:get/2`. Returns an empty map when http2 isn't in the list.
+-spec flatten_http2_opts([protocol_entry_norm(), ...]) -> #{atom() => term()}.
+flatten_http2_opts(Entries) ->
+    case lists:keyfind(http2, 1, Entries) of
+        false ->
+            #{};
+        {http2, #{
+            conn_window := Conn,
+            stream_window := Stream,
+            window_refill_threshold := Threshold
+        }} ->
+            #{
+                http2_conn_window => Conn,
+                http2_stream_window => Stream,
+                http2_window_refill_threshold => Threshold
+            }
     end.
 
-build_dispatch(#{routes := _}, ListenerName) ->
+build_dispatch(#{routes := Module}, _ListenerName) when is_atom(Module) ->
+    {handler, Module};
+build_dispatch(#{routes := Routes}, ListenerName) when is_list(Routes) ->
     {router, ListenerName};
-build_dispatch(Opts, _ListenerName) ->
-    {handler, maps:get(handler, Opts, roadrunner_default_handler)}.
+build_dispatch(_Opts, _ListenerName) ->
+    {handler, roadrunner_default_handler}.
 
 -spec handle_call(
     port
@@ -569,7 +661,7 @@ handle_info(
     reconcile_slots,
     #state{
         proto_opts = #{client_counter := Counter, listener_name := Name},
-        reconciliation = #{interval_ms := Interval, prev_diff := PrevDiff}
+        reconciliation = #{interval := Interval, prev_diff := PrevDiff}
     } = State
 ) ->
     %% pg is supervised by roadrunner_sup so it's always up when the
@@ -609,7 +701,7 @@ handle_info(
     end,
     erlang:send_after(Interval, self(), reconcile_slots),
     {noreply, State#state{
-        reconciliation = #{interval_ms => Interval, prev_diff => NewDiff - Release}
+        reconciliation = #{interval => Interval, prev_diff => NewDiff - Release}
     }};
 handle_info(_Msg, State) ->
     {noreply, State}.

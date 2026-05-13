@@ -74,7 +74,7 @@ response shapes (buffered, `{stream, ...}`, `{loop, ...}`,
     phase = first :: first | keep_alive,
     %% Cumulative successfully-served requests on this conn. Bumped
     %% in `run_pipeline/4` after each successful dispatch; checked in
-    %% `finishing_phase/3` against `max_keep_alive_request`.
+    %% `finishing_phase/3` against `max_keep_alive_requests`.
     requests_served = 0 :: non_neg_integer(),
     %% Bytes received but not yet parsed. Empty on first iteration;
     %% populated mid-recv when `parse_request/1` returns `{more, _}`,
@@ -94,9 +94,9 @@ response shapes (buffered, `{stream, ...}`, `{loop, ...}`,
     dispatch :: roadrunner_conn:dispatch() | undefined,
     middlewares = [] :: roadrunner_middleware:middleware_list(),
     max_content_length = 0 :: non_neg_integer(),
-    max_keep_alive_request = 1 :: pos_integer(),
+    max_keep_alive_requests = 1 :: pos_integer(),
     %% Anti-slowloris on the request-read phase. `min_rate` is cached
-    %% from `proto_opts.minimum_bytes_per_second` at `shoot`. When > 0,
+    %% from `proto_opts.min_bytes_per_second` at `shoot`. When > 0,
     %% `recv_passive/2` tracks bytes received since `recv_phase_start`
     %% and closes the conn if the running average drops below
     %% `min_rate` after a 1 s grace (matches `roadrunner_conn:rate_ok/3`).
@@ -122,7 +122,7 @@ start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
     no_return().
 init_loop(Parent, Socket, ProtoOpts) ->
     ListenerName = maps:get(listener_name, ProtoOpts, undefined),
-    DrainGroup = maps:get(drain_group, ProtoOpts, enabled),
+    DrainGroup = maps:get(graceful_drain, ProtoOpts, true),
     proc_lib:set_label({roadrunner_conn, awaiting_shoot, ListenerName}),
     ok = roadrunner_conn:join_drain_group(ListenerName, DrainGroup),
     proc_lib:init_ack(Parent, {ok, self()}),
@@ -142,12 +142,12 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
             StartMono = roadrunner_telemetry:listener_accept(#{
                 listener_name => ListenerName, peer => Peer
             }),
-            case http2_negotiated(Socket) orelse h2c_enabled(ProtoOpts) of
+            case http2_negotiated(Socket) orelse h2c_only(ProtoOpts) of
                 true ->
                     %% Either ALPN landed on `h2` (TLS listener) or the
                     %% listener is in prior-knowledge h2c mode (plain TCP
-                    %% with `h2c => enabled`). The HTTP/2 path takes over;
-                    %% slot release and `listener_conn_close` happen
+                    %% with `protocols => [http2]`). The HTTP/2 path takes
+                    %% over; slot release and `listener_conn_close` happen
                     %% inside the h2 module.
                     roadrunner_conn_loop_http2:enter(
                         Socket, ProtoOpts, ListenerName, Peer, StartMono
@@ -164,8 +164,8 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
                         dispatch = maps:get(dispatch, ProtoOpts),
                         middlewares = maps:get(middlewares, ProtoOpts),
                         max_content_length = maps:get(max_content_length, ProtoOpts),
-                        max_keep_alive_request = maps:get(max_keep_alive_request, ProtoOpts),
-                        min_rate = maps:get(minimum_bytes_per_second, ProtoOpts)
+                        max_keep_alive_requests = maps:get(max_keep_alive_requests, ProtoOpts),
+                        min_rate = maps:get(min_bytes_per_second, ProtoOpts)
                     },
                     read_request_phase(S)
             end;
@@ -183,9 +183,10 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
 
 %% True iff the TLS handshake negotiated `h2`. Plain TCP and TLS
 %% sessions where the client picked `http/1.1` (or sent no ALPN)
-%% fall through to HTTP/1.1. h2 is enabled by listing `~"h2"` in the
-%% listener's `alpn_preferred_protocols`; without it the server
-%% never advertises h2 so this branch is unreachable.
+%% fall through to HTTP/1.1. h2 ALPN is advertised when the listener
+%% lists `http2` in its `protocols` opt — that derivation runs in
+%% `roadrunner_transport:build_tls_opts/2` (or the user can override
+%% `alpn_preferred_protocols` explicitly inside `tls`).
 -spec http2_negotiated(roadrunner_transport:socket()) -> boolean().
 http2_negotiated(Socket) ->
     case roadrunner_transport:negotiated_alpn(Socket) of
@@ -193,14 +194,13 @@ http2_negotiated(Socket) ->
         _ -> false
     end.
 
-%% True iff this listener is configured for HTTP/2 cleartext
-%% (RFC 7540 §3.4 prior-knowledge). Plain TCP only: listener init
-%% rejects `h2c => enabled` combined with `tls`, so by the time this
-%% function runs the socket is `{gen_tcp, _}` (or `{fake, _}` in
-%% tests).
--spec h2c_enabled(roadrunner_conn:proto_opts()) -> boolean().
-h2c_enabled(#{h2c := enabled}) -> true;
-h2c_enabled(_) -> false.
+%% True iff this listener accepts HTTP/2 only (`protocols => [http2]`).
+%% On plain TCP this forces h2c prior-knowledge dispatch (RFC 7540
+%% §3.4). On TLS the ALPN handshake already drove the dispatch via
+%% `http2_negotiated/1`; this short-circuit is a no-op there.
+-spec h2c_only(roadrunner_conn:proto_opts()) -> boolean().
+h2c_only(#{protocols := [http2]}) -> true;
+h2c_only(_) -> false.
 
 %% --- read_request phase ---
 %%
@@ -501,7 +501,7 @@ read_body_phase(
     Req,
     Deadline
 ) ->
-    MinRate = maps:get(minimum_bytes_per_second, ProtoOpts),
+    MinRate = maps:get(min_bytes_per_second, ProtoOpts),
     Recv = roadrunner_conn:make_recv(Socket, Deadline, MinRate),
     Buffered = S#loop_state.buffered,
     case maps:get(body_buffering, ProtoOpts) of
@@ -725,7 +725,7 @@ buffered_finish(S, Req, Headers) ->
                     exit_normal(S);
                 keep_alive ->
                     Served = S#loop_state.requests_served,
-                    case Served >= S#loop_state.max_keep_alive_request of
+                    case Served >= S#loop_state.max_keep_alive_requests of
                         true ->
                             exit_normal(S);
                         false ->

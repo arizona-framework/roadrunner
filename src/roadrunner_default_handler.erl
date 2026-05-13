@@ -1,13 +1,13 @@
 -module(roadrunner_default_handler).
 -moduledoc """
-Default `roadrunner_handler` — used when a listener starts with
-neither `routes` nor `handler` configured. Returns 404 with a body
-pointing the operator at the quickstart, so a smoke `curl` against
-an otherwise-blank listener tells you what to do next instead of
-silently 200-ing.
+Default `roadrunner_handler` — used when a listener starts with no
+`routes` opt configured. Returns 404 with a body pointing the
+operator at the quickstart, so a smoke `curl` against an otherwise-
+blank listener tells you what to do next instead of silently 200-ing.
 
-Operators wire their own handler via the listener's `handler` opt
-(single-handler shape) or `routes` opt (routed shape) — see
+Operators wire their own handler via the listener's `routes` opt:
+either a bare module atom (every request goes to that handler) or
+a list of `{Path, Module, Opts}` tuples (routed dispatch). See
 `t:roadrunner_listener:opts/0` and the project README.
 """.
 
@@ -16,12 +16,12 @@ Operators wire their own handler via the listener's `handler` opt
 -export([handle/1]).
 
 -define(BODY, ~"""
-roadrunner: no handler or routes configured for this listener.
+roadrunner: no routes configured for this listener.
 
 Quickstart:
   roadrunner:start_listener(my_listener, #{
       port => 8080,
-      handler => my_handler
+      routes => my_handler
   }).
 
   roadrunner:start_listener(my_listener, #{

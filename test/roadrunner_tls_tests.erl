@@ -53,7 +53,7 @@ setup() ->
     {ok, _} = roadrunner_listener:start_link(tls_test_listener, #{
         port => 0,
         tls => roadrunner_test_certs:server_opts(),
-        handler => roadrunner_hello_handler
+        routes => roadrunner_hello_handler
     }),
     Port = roadrunner_listener:port(tls_test_listener),
     {Port, ClientOpts}.
@@ -153,11 +153,11 @@ h2_alpn_dispatch_test_() ->
 setup_h2() ->
     {ok, _} = application:ensure_all_started(ssl),
     ClientOpts = [{verify, verify_none} | roadrunner_test_certs:client_opts()],
-    AlpnH2 = {alpn_preferred_protocols, [~"h2", ~"http/1.1"]},
     {ok, _} = roadrunner_listener:start_link(tls_http2_test_listener, #{
         port => 0,
-        tls => [AlpnH2 | roadrunner_test_certs:server_opts()],
-        handler => roadrunner_hello_handler
+        protocols => [http1, http2],
+        tls => roadrunner_test_certs:server_opts(),
+        routes => roadrunner_hello_handler
     }),
     Port = roadrunner_listener:port(tls_http2_test_listener),
     {Port, ClientOpts}.
@@ -165,8 +165,9 @@ setup_h2() ->
 cleanup_h2(_) ->
     ok = roadrunner_listener:stop(tls_http2_test_listener).
 
-%% Listener's `alpn_preferred_protocols` is the source of truth: an
-%% h1-only ALPN list forces h1 even when the client offers h2.
+%% User-supplied `alpn_preferred_protocols` overrides what `protocols`
+%% would derive: an h1-only ALPN list forces h1 even when the listener
+%% lists `http2` in its `protocols` opt.
 h2_user_alpn_overrides_test_() ->
     {setup,
         fun() ->
@@ -176,8 +177,9 @@ h2_user_alpn_overrides_test_() ->
             UserTls = [UserAlpn | roadrunner_test_certs:server_opts()],
             {ok, _} = roadrunner_listener:start_link(tls_h2_user_alpn_listener, #{
                 port => 0,
+                protocols => [http1, http2],
                 tls => UserTls,
-                handler => roadrunner_hello_handler
+                routes => roadrunner_hello_handler
             }),
             Port = roadrunner_listener:port(tls_h2_user_alpn_listener),
             {Port, ClientOpts}

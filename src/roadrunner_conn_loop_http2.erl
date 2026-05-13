@@ -3,7 +3,7 @@
 HTTP/2 (RFC 9113) connection process.
 
 Driven by either TLS ALPN-negotiated `h2` or a plaintext listener
-configured with `h2c => enabled` (RFC 7540 §3.4 prior-knowledge).
+configured with `protocols => [http2]` (RFC 7540 §3.4 prior-knowledge).
 The dispatch decision lives in `roadrunner_conn_loop:awaiting_shoot/3`;
 this module is transport-agnostic and reads frames via
 `roadrunner_transport:recv/3` either way.
@@ -72,15 +72,17 @@ Response shapes supported:
 %% each stream.
 -define(INITIAL_WINDOW, 65535).
 
-%% Default refill threshold + recv-window peaks when proto_opts
-%% don't override. RFC 9113 doesn't mandate any of these — they're
-%% policy. The defaults match the RFC 9113 §6.9.2 baseline (65535
-%% for both windows; the threshold is half of that, the original
-%% heuristic). `roadrunner_listener:opts()` carries the override
-%% knobs (`h2_initial_conn_window`, `h2_initial_stream_window`,
-%% `h2_window_refill_threshold`) — bumping the windows is the
-%% standard tuning for non-LAN RTTs (window/RTT bounds per-stream
-%% throughput).
+%% Default refill threshold + recv-window peaks. RFC 9113 doesn't
+%% mandate any of these — they're policy. The defaults match the
+%% RFC 9113 §6.9.2 baseline (65535 for both windows; the threshold
+%% is half of that, the original heuristic).
+%% `roadrunner_listener:opts()` carries the override knobs as nested
+%% `http2` sub-opts (`conn_window`, `stream_window`,
+%% `window_refill_threshold`) — bumping the windows is the standard
+%% tuning for non-LAN RTTs (window/RTT bounds per-stream
+%% throughput). Defaults here mirror those baselines for static
+%% record initialization; runtime values come from the proto_opts
+%% map populated by `roadrunner_listener:normalize_protocols/1`.
 -define(DEFAULT_CONN_RECV_WINDOW, 65535).
 -define(DEFAULT_STREAM_RECV_WINDOW, 65535).
 -define(DEFAULT_WINDOW_REFILL_THRESHOLD, 32_768).
@@ -207,10 +209,15 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
     proc_lib:set_label({roadrunner_conn_loop_http2, ListenerName, Peer}),
     Scheme = roadrunner_conn:scheme(Socket),
     {Data, Closed, Error} = roadrunner_transport:messages(Socket),
-    ConnPeak = maps:get(h2_initial_conn_window, ProtoOpts, ?DEFAULT_CONN_RECV_WINDOW),
-    StreamPeak = maps:get(h2_initial_stream_window, ProtoOpts, ?DEFAULT_STREAM_RECV_WINDOW),
+    %% h2 window knobs are flattened onto proto_opts top-level with
+    %% an `http2_` prefix by `roadrunner_listener:normalize_protocols/1`
+    %% — one `maps:get/2` per knob, no nested map dives. Fallback
+    %% defaults match the listener's so tests that build proto_opts
+    %% directly stay short.
+    ConnPeak = maps:get(http2_conn_window, ProtoOpts, ?DEFAULT_CONN_RECV_WINDOW),
+    StreamPeak = maps:get(http2_stream_window, ProtoOpts, ?DEFAULT_STREAM_RECV_WINDOW),
     Threshold = maps:get(
-        h2_window_refill_threshold, ProtoOpts, ?DEFAULT_WINDOW_REFILL_THRESHOLD
+        http2_window_refill_threshold, ProtoOpts, ?DEFAULT_WINDOW_REFILL_THRESHOLD
     ),
     State = #loop{
         socket = Socket,

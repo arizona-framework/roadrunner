@@ -11,7 +11,7 @@ listener_lifecycle_test_() ->
         fun() ->
             Name = listener_test_one,
             {ok, Pid} = roadrunner_listener:start_link(Name, #{
-                port => 0, handler => roadrunner_hello_handler
+                port => 0, routes => roadrunner_hello_handler
             }),
             {Name, Pid}
         end,
@@ -34,7 +34,7 @@ listener_accepts_tcp_handshake_test_() ->
         fun() ->
             Name = listener_test_handshake,
             {ok, _} = roadrunner_listener:start_link(Name, #{
-                port => 0, handler => roadrunner_hello_handler
+                port => 0, routes => roadrunner_hello_handler
             }),
             roadrunner_listener:port(Name)
         end,
@@ -53,7 +53,7 @@ listener_stops_releases_port_test_() ->
         fun() ->
             Name = listener_test_release,
             {ok, _} = roadrunner_listener:start_link(Name, #{
-                port => 0, handler => roadrunner_hello_handler
+                port => 0, routes => roadrunner_hello_handler
             }),
             Port = roadrunner_listener:port(Name),
             ok = roadrunner_listener:stop(Name),
@@ -72,19 +72,19 @@ listener_listen_failure_returns_error_test() ->
     %% Bind listener A to an ephemeral port, then try to bind B to the
     %% same port — second listen() must fail with eaddrinuse.
     {ok, _} = roadrunner_listener:start_link(listener_test_busy_a, #{
-        port => 0, handler => roadrunner_hello_handler
+        port => 0, routes => roadrunner_hello_handler
     }),
     Port = roadrunner_listener:port(listener_test_busy_a),
     process_flag(trap_exit, true),
     Result = roadrunner_listener:start_link(listener_test_busy_b, #{
-        port => Port, handler => roadrunner_hello_handler
+        port => Port, routes => roadrunner_hello_handler
     }),
     ?assertMatch({error, _}, Result),
     ok = roadrunner_listener:stop(listener_test_busy_a).
 
 listener_ignores_unknown_cast_test() ->
     {ok, _} = roadrunner_listener:start_link(listener_test_cast, #{
-        port => 0, handler => roadrunner_hello_handler
+        port => 0, routes => roadrunner_hello_handler
     }),
     gen_server:cast(listener_test_cast, surprise),
     %% Process must still answer call/1 — proves it survived the cast.
@@ -97,7 +97,7 @@ listener_honors_num_acceptors_opt_test() ->
     {ok, _} = roadrunner_listener:start_link(listener_test_pool, #{
         port => 0,
         num_acceptors => 3,
-        handler => roadrunner_hello_handler
+        routes => roadrunner_hello_handler
     }),
     ?assert(roadrunner_listener:port(listener_test_pool) > 0),
     ok = roadrunner_listener:stop(listener_test_pool).
@@ -130,8 +130,8 @@ slot_reconciliation_releases_sustained_orphan_slots_test() ->
         {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
             port => 0,
             max_clients => 100,
-            slot_reconciliation => #{interval_ms => 30},
-            handler => roadrunner_hello_handler
+            slot_reconciliation => #{interval => 30},
+            routes => roadrunner_hello_handler
         }),
         %% Reach into state to grab the counter ref. {state, LSocket, Port,
         %% ProtoOpts, Phase, Reconciliation} — relies on field order.
@@ -168,8 +168,8 @@ slot_reconciliation_only_reaps_excess_over_pg_members_test() ->
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
         max_clients => 100,
-        slot_reconciliation => #{interval_ms => 30},
-        handler => roadrunner_hello_handler
+        slot_reconciliation => #{interval => 30},
+        routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
@@ -202,12 +202,12 @@ listener_threads_rate_check_interval_into_proto_opts_test() ->
     Name = listener_test_rate_check_interval,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
-        rate_check_interval_ms => 500,
-        handler => roadrunner_hello_handler
+        rate_check_interval => 500,
+        routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
-    ?assertEqual(500, maps:get(rate_check_interval_ms, ProtoOpts)),
+    ?assertEqual(500, maps:get(rate_check_interval, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
 listener_threads_hibernate_after_into_proto_opts_test() ->
@@ -219,69 +219,93 @@ listener_threads_hibernate_after_into_proto_opts_test() ->
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
         hibernate_after => 5000,
-        handler => roadrunner_hello_handler
+        routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
     ?assertEqual(5000, maps:get(hibernate_after, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
-listener_threads_h2c_into_proto_opts_test() ->
-    %% `h2c => enabled` listener opt threads into proto_opts so the
-    %% dispatch helper `roadrunner_conn_loop:h2c_enabled/1` can read
+listener_threads_protocols_into_proto_opts_test() ->
+    %% `protocols => [http2]` listener opt threads into proto_opts so
+    %% the dispatch helper `roadrunner_conn_loop:h2c_only/1` can read
     %% it and route plaintext connections to the h2 conn loop without
     %% an ALPN check.
-    Name = listener_test_h2c_enabled,
+    Name = listener_test_protocols_h2,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
-        h2c => enabled,
-        handler => roadrunner_hello_handler
+        protocols => [http2],
+        routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
-    ?assertEqual(enabled, maps:get(h2c, ProtoOpts)),
+    ?assertEqual([http2], maps:get(protocols, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
-listener_h2c_default_disabled_test() ->
-    %% Default for `h2c` is `disabled`; plaintext listeners stay
+listener_protocols_default_is_http1_only_test() ->
+    %% Default for `protocols` is `[http1]`; plaintext listeners stay
     %% h1-only unless explicitly opted in.
-    Name = listener_test_h2c_default,
+    Name = listener_test_protocols_default,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
-        handler => roadrunner_hello_handler
+        routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
-    ?assertEqual(disabled, maps:get(h2c, ProtoOpts)),
+    ?assertEqual([http1], maps:get(protocols, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
-listener_rejects_h2c_with_tls_test() ->
-    %% `h2c => enabled` is plaintext-only. Combining it with `tls`
-    %% must crash `init/1` so the misconfiguration surfaces at
-    %% startup, not as a silent no-op on the dispatch path.
-    Name = listener_test_h2c_with_tls,
-    process_flag(trap_exit, true),
-    Result = roadrunner_listener:start_link(Name, #{
+listener_accepts_http1_tuple_form_test() ->
+    %% `{http1, #{}}` is the explicit tuple shape — accepted but
+    %% currently must be empty (no http1 tunables yet; reserved for
+    %% future additions). Normalizes to the same internal `[http1]`
+    %% atom list as the bare-atom form.
+    Name = listener_test_protocols_http1_tuple,
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
-        tls => [
-            {certfile, "/nonexistent/cert.pem"},
-            {keyfile, "/nonexistent/key.pem"}
-        ],
-        h2c => enabled,
-        handler => roadrunner_hello_handler
+        protocols => [{http1, #{}}],
+        routes => roadrunner_hello_handler
     }),
-    ?assertMatch({error, {{listener_opt_conflict, h2c, tls}, _Stack}}, Result).
+    State = sys:get_state(ListenerPid),
+    ProtoOpts = element(4, State),
+    ?assertEqual([http1], maps:get(protocols, ProtoOpts)),
+    ok = roadrunner_listener:stop(Name).
 
-listener_rejects_invalid_h2c_value_test() ->
-    %% Any atom other than `enabled` / `disabled` is rejected at init.
-    Name = listener_test_h2c_bad_atom,
+listener_rejects_h1_and_h2_on_plain_tcp_test() ->
+    %% `[http1, http2]` (and the reverse order) on plain TCP needs
+    %% `Upgrade: h2c` to share the port — roadrunner doesn't implement
+    %% that, so either ordering must surface as an error at `init/1`.
     process_flag(trap_exit, true),
-    Result = roadrunner_listener:start_link(Name, #{
-        port => 0,
-        h2c => yes,
-        handler => roadrunner_hello_handler
-    }),
-    ?assertMatch({error, {{invalid_listener_opt, h2c, yes}, _Stack}}, Result).
+    lists:foreach(
+        fun(Protos) ->
+            R = roadrunner_listener:start_link(listener_test_protocols_no_h2c_upgrade, #{
+                port => 0,
+                protocols => Protos,
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch(
+                {error, {{listener_opt_conflict, protocols, Protos, no_h2c_upgrade}, _Stack}}, R
+            )
+        end,
+        [[http1, http2], [http2, http1]]
+    ).
+
+listener_rejects_invalid_protocols_value_test() ->
+    %% Empty list, unknown atom, duplicates, and non-list shapes all
+    %% reject with `{invalid_listener_opt, protocols, _}`.
+    Name = listener_test_protocols_invalid,
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                protocols => Bad,
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, protocols, _}, _Stack}}, R)
+        end,
+        [[], [http3], [http1, http1], not_a_list]
+    ).
 
 slot_reconciliation_disabled_drops_reconcile_slots_message_test() ->
     %% A `reconcile_slots` arriving at a listener with reconciliation
@@ -289,7 +313,7 @@ slot_reconciliation_disabled_drops_reconcile_slots_message_test() ->
     %% dropped — gen_server stays alive.
     Name = listener_test_disabled_reap,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
-        port => 0, handler => roadrunner_hello_handler
+        port => 0, routes => roadrunner_hello_handler
     }),
     ListenerPid ! reconcile_slots,
     %% Process must still answer port/1.
@@ -301,7 +325,7 @@ listener_drops_unknown_info_message_test() ->
     %% the listener.
     Name = listener_test_stray_info,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
-        port => 0, handler => roadrunner_hello_handler
+        port => 0, routes => roadrunner_hello_handler
     }),
     ListenerPid ! {stray, make_ref()},
     ?assert(roadrunner_listener:port(Name) > 0),
@@ -314,7 +338,7 @@ slot_reconciliation_disabled_by_default_test() ->
     end,
     Name = listener_test_no_reap,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
-        port => 0, handler => roadrunner_hello_handler
+        port => 0, routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
@@ -328,7 +352,7 @@ slot_reconciliation_disabled_by_default_test() ->
 listener_info_initial_zero_test() ->
     Name = listener_test_info_init,
     {ok, _} = roadrunner_listener:start_link(Name, #{
-        port => 0, max_clients => 42, handler => roadrunner_hello_handler
+        port => 0, max_clients => 42, routes => roadrunner_hello_handler
     }),
     Info = roadrunner_listener:info(Name),
     ?assertEqual(0, maps:get(active_clients, Info)),
@@ -341,7 +365,7 @@ listener_info_counts_served_requests_test_() ->
         fun() ->
             Name = listener_test_info_count,
             {ok, _} = roadrunner_listener:start_link(Name, #{
-                port => 0, handler => roadrunner_hello_handler
+                port => 0, routes => roadrunner_hello_handler
             }),
             {Name, roadrunner_listener:port(Name)}
         end,
@@ -378,7 +402,7 @@ drain_with_no_active_conns_returns_immediately_test_() ->
             ensure_pg_started(),
             Name = listener_test_drain_idle,
             {ok, _} = roadrunner_listener:start_link(Name, #{
-                port => 0, handler => roadrunner_hello_handler
+                port => 0, routes => roadrunner_hello_handler
             }),
             Name
         end,
@@ -451,7 +475,7 @@ drain_closes_keep_alive_conn_after_in_flight_request_test_() ->
             ensure_pg_started(),
             Name = listener_test_drain_ka,
             {ok, _} = roadrunner_listener:start_link(Name, #{
-                port => 0, handler => roadrunner_drain_pause_handler
+                port => 0, routes => roadrunner_drain_pause_handler
             }),
             {Name, roadrunner_listener:port(Name)}
         end,
@@ -553,7 +577,7 @@ reload_routes_swaps_dispatch_table_test_() ->
 reload_routes_on_handler_listener_returns_no_routes_error_test() ->
     Name = listener_test_reload_no_routes,
     {ok, _} = roadrunner_listener:start_link(Name, #{
-        port => 0, handler => roadrunner_hello_handler
+        port => 0, routes => roadrunner_hello_handler
     }),
     try
         ?assertEqual(
@@ -574,6 +598,18 @@ routes_persistent_term_erased_on_listener_stop_test() ->
     ok = roadrunner_listener:stop(Name),
     %% Stopping the listener erases it.
     ?assertException(error, badarg, persistent_term:get({roadrunner_routes, Name})).
+
+listener_without_routes_opt_falls_back_to_default_handler_test() ->
+    Name = listener_test_default_handler_fallback,
+    {ok, _} = roadrunner_listener:start_link(Name, #{port => 0}),
+    try
+        Port = roadrunner_listener:port(Name),
+        Reply = http_get_close(Port, ~"/"),
+        ?assertMatch({match, _}, re:run(Reply, ~"^HTTP/1\\.1 404")),
+        ?assertMatch({match, _}, re:run(Reply, ~"no routes configured"))
+    after
+        ok = roadrunner_listener:stop(Name)
+    end.
 
 http_get_close(Port, Path) ->
     {ok, Sock} = gen_tcp:connect(
@@ -601,7 +637,7 @@ status_returns_phase_test_() ->
             ensure_pg_started(),
             Name = listener_test_status,
             {ok, _} = roadrunner_listener:start_link(Name, #{
-                port => 0, handler => roadrunner_hello_handler
+                port => 0, routes => roadrunner_hello_handler
             }),
             Name
         end,
@@ -668,7 +704,7 @@ logger_metadata_set_for_each_request_test_() ->
         fun() ->
             Name = listener_test_logger_md,
             {ok, _} = roadrunner_listener:start_link(Name, #{
-                port => 0, handler => roadrunner_logger_probe_handler
+                port => 0, routes => roadrunner_logger_probe_handler
             }),
             {Name, roadrunner_listener:port(Name)}
         end,

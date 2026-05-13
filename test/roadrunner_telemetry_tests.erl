@@ -124,11 +124,11 @@ request_rejected_event_fires_on_bad_request_line_test() ->
             max_content_length => 1_000_000,
             request_timeout => 200,
             keep_alive_timeout => 200,
-            max_keep_alive_request => 100,
+            max_keep_alive_requests => 100,
             max_clients => 10,
             client_counter => atomics:new(1, [{signed, false}]),
             requests_counter => atomics:new(1, [{signed, false}]),
-            minimum_bytes_per_second => 0,
+            min_bytes_per_second => 0,
             body_buffering => auto,
             listener_name => probe_listener_rej
         },
@@ -414,7 +414,7 @@ setup_listener() ->
     {ok, _} = application:ensure_all_started(telemetry),
     Name = telemetry_test_listener,
     {ok, _} = roadrunner_listener:start_link(Name, #{
-        port => 0, handler => roadrunner_hello_handler
+        port => 0, routes => roadrunner_hello_handler
     }),
     {Name, roadrunner_listener:port(Name)}.
 
@@ -422,7 +422,7 @@ setup_crashing_listener() ->
     {ok, _} = application:ensure_all_started(telemetry),
     Name = telemetry_test_crashing,
     {ok, _} = roadrunner_listener:start_link(Name, #{
-        port => 0, handler => roadrunner_crashing_handler
+        port => 0, routes => roadrunner_crashing_handler
     }),
     {Name, roadrunner_listener:port(Name)}.
 

@@ -95,6 +95,39 @@ apply_tls_defaults_preserves_user_cert_opts_test() ->
     ?assertEqual({key, {rsa, ~"key-bytes"}}, lists:keyfind(key, 1, Result)),
     ?assertMatch({versions, _}, lists:keyfind(versions, 1, Result)).
 
+build_tls_opts_derives_alpn_from_protocols_h1_only_test() ->
+    {ok, _} = application:ensure_all_started(ssl),
+    Result = roadrunner_transport:build_tls_opts([http1], []),
+    ?assertEqual(
+        {alpn_preferred_protocols, [~"http/1.1"]},
+        lists:keyfind(alpn_preferred_protocols, 1, Result)
+    ).
+
+build_tls_opts_derives_alpn_from_protocols_h2_only_test() ->
+    {ok, _} = application:ensure_all_started(ssl),
+    Result = roadrunner_transport:build_tls_opts([http2], []),
+    ?assertEqual(
+        {alpn_preferred_protocols, [~"h2"]},
+        lists:keyfind(alpn_preferred_protocols, 1, Result)
+    ).
+
+build_tls_opts_derives_alpn_from_protocols_h1_and_h2_test() ->
+    {ok, _} = application:ensure_all_started(ssl),
+    Result = roadrunner_transport:build_tls_opts([http1, http2], []),
+    ?assertEqual(
+        {alpn_preferred_protocols, [~"http/1.1", ~"h2"]},
+        lists:keyfind(alpn_preferred_protocols, 1, Result)
+    ).
+
+build_tls_opts_user_alpn_overrides_derivation_test() ->
+    {ok, _} = application:ensure_all_started(ssl),
+    UserOpts = [{alpn_preferred_protocols, [~"http/1.1"]}],
+    Result = roadrunner_transport:build_tls_opts([http1, http2], UserOpts),
+    ?assertEqual(
+        {alpn_preferred_protocols, [~"http/1.1"]},
+        lists:keyfind(alpn_preferred_protocols, 1, Result)
+    ).
+
 %% =============================================================================
 %% Negative ssl-side coverage. Happy paths are exercised by the gen_tcp
 %% conn tests and the roadrunner_tls_tests integration test.
@@ -509,10 +542,10 @@ fake_proto_opts(Handler) ->
         max_content_length => 10485760,
         request_timeout => 5000,
         keep_alive_timeout => 5000,
-        max_keep_alive_request => 100,
+        max_keep_alive_requests => 100,
         max_clients => 10,
         client_counter => atomics:new(1, [{signed, false}]),
         requests_counter => atomics:new(1, [{signed, false}]),
-        minimum_bytes_per_second => 0,
+        min_bytes_per_second => 0,
         body_buffering => auto
     }.

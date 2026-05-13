@@ -10,7 +10,7 @@ acceptor_serves_request_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(acceptor_test_serves, #{
-                port => 0, handler => roadrunner_hello_handler
+                port => 0, routes => roadrunner_hello_handler
             }),
             roadrunner_listener:port(acceptor_test_serves)
         end,
@@ -30,7 +30,7 @@ acceptor_serves_multiple_connections_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(acceptor_test_loop, #{
-                port => 0, handler => roadrunner_hello_handler
+                port => 0, routes => roadrunner_hello_handler
             }),
             roadrunner_listener:port(acceptor_test_loop)
         end,
@@ -56,7 +56,7 @@ acceptor_processes_carry_listener_name_and_index_label_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(
                 acceptor_test_labels, #{
-                    port => 0, num_acceptors => 3, handler => roadrunner_hello_handler
+                    port => 0, num_acceptors => 3, routes => roadrunner_hello_handler
                 }
             ),
             acceptor_test_labels
@@ -85,7 +85,7 @@ conn_process_carries_listener_name_and_peer_label_test_() ->
     {setup,
         fun() ->
             {ok, _} = roadrunner_listener:start_link(conn_test_labels, #{
-                port => 0, handler => roadrunner_hello_handler
+                port => 0, routes => roadrunner_hello_handler
             }),
             {conn_test_labels, roadrunner_listener:port(conn_test_labels)}
         end,
