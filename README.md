@@ -217,7 +217,7 @@ roadrunner:start_listener(my_listener, #{port => 8080, handler => hello_handler}
   conns via `pg`, polls until idle or deadline, then `exit(Pid, shutdown)`
   for stragglers.
 - `roadrunner_listener:status/1` — `accepting | draining`.
-- Optional `slot_reconciliation => #{interval_ms => N}` listener opt — a
+- Optional `slot_reconciliation => #{interval => N}` listener opt — a
   periodic reaper that compares `client_counter` against the conn `pg`
   group and releases slots orphaned by `kill`-style exits. Off by default;
   enable in production where you can't trust every exit path to run

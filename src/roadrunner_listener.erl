@@ -16,6 +16,10 @@ On `init/1` the listener opens the listen socket, builds the shared
 `roadrunner_acceptor` processes that pull from the same listen socket.
 Connection workers are unlinked from the acceptor so a single
 connection crash doesn't take the pool down.
+
+All duration and interval values in `opts()` are in milliseconds —
+`request_timeout`, `keep_alive_timeout`, `rate_check_interval`,
+`hibernate_after`, and `slot_reconciliation.interval`.
 """.
 
 -behaviour(gen_server).
@@ -51,9 +55,9 @@ connection crash doesn't take the pool down.
     %% rate check itself. Tests use shorter intervals (20–30ms) to
     %% exercise rate-check fires deterministically without
     %% second-scale waits; ops can tune for chattier observability.
-    rate_check_interval_ms => pos_integer(),
+    rate_check_interval => pos_integer(),
     body_buffering => auto | manual,
-    slot_reconciliation => disabled | #{interval_ms := pos_integer()},
+    slot_reconciliation => disabled | #{interval := pos_integer()},
     %% Opt out of the per-conn `pg` drain group. Default `enabled`
     %% (current behavior). Set to `disabled` for short-lived
     %% h1-only workloads (REST APIs, health-check probes, CLI
@@ -132,7 +136,7 @@ connection crash doesn't take the pool down.
     reconciliation = disabled ::
         disabled
         | #{
-            interval_ms := pos_integer(),
+            interval := pos_integer(),
             prev_diff := non_neg_integer()
         }
 }).
@@ -255,12 +259,12 @@ init(#{port := Port} = Opts) ->
     end.
 
 -spec setup_reconciliation(opts()) ->
-    disabled | #{interval_ms := pos_integer(), prev_diff := non_neg_integer()}.
-setup_reconciliation(#{slot_reconciliation := #{interval_ms := IntervalMs}}) when
+    disabled | #{interval := pos_integer(), prev_diff := non_neg_integer()}.
+setup_reconciliation(#{slot_reconciliation := #{interval := IntervalMs}}) when
     is_integer(IntervalMs), IntervalMs > 0
 ->
     erlang:send_after(IntervalMs, self(), reconcile_slots),
-    #{interval_ms => IntervalMs, prev_diff => 0};
+    #{interval => IntervalMs, prev_diff => 0};
 setup_reconciliation(_Opts) ->
     disabled.
 
@@ -416,12 +420,12 @@ build_proto_opts(Opts, ListenerName) ->
             #{} ->
                 Base
         end,
-    %% Optional `rate_check_interval_ms` — the rate-check timer
+    %% Optional `rate_check_interval` — the rate-check timer
     %% interval inside `reading_request`. Default 1000ms; ops can
     %% override.
     case Opts of
-        #{rate_check_interval_ms := IntervalMs} when is_integer(IntervalMs), IntervalMs > 0 ->
-            WithHibernate#{rate_check_interval_ms => IntervalMs};
+        #{rate_check_interval := IntervalMs} when is_integer(IntervalMs), IntervalMs > 0 ->
+            WithHibernate#{rate_check_interval => IntervalMs};
         #{} ->
             WithHibernate
     end.
@@ -569,7 +573,7 @@ handle_info(
     reconcile_slots,
     #state{
         proto_opts = #{client_counter := Counter, listener_name := Name},
-        reconciliation = #{interval_ms := Interval, prev_diff := PrevDiff}
+        reconciliation = #{interval := Interval, prev_diff := PrevDiff}
     } = State
 ) ->
     %% pg is supervised by roadrunner_sup so it's always up when the
@@ -609,7 +613,7 @@ handle_info(
     end,
     erlang:send_after(Interval, self(), reconcile_slots),
     {noreply, State#state{
-        reconciliation = #{interval_ms => Interval, prev_diff => NewDiff - Release}
+        reconciliation = #{interval => Interval, prev_diff => NewDiff - Release}
     }};
 handle_info(_Msg, State) ->
     {noreply, State}.

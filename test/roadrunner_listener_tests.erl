@@ -130,7 +130,7 @@ slot_reconciliation_releases_sustained_orphan_slots_test() ->
         {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
             port => 0,
             max_clients => 100,
-            slot_reconciliation => #{interval_ms => 30},
+            slot_reconciliation => #{interval => 30},
             handler => roadrunner_hello_handler
         }),
         %% Reach into state to grab the counter ref. {state, LSocket, Port,
@@ -168,7 +168,7 @@ slot_reconciliation_only_reaps_excess_over_pg_members_test() ->
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
         max_clients => 100,
-        slot_reconciliation => #{interval_ms => 30},
+        slot_reconciliation => #{interval => 30},
         handler => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
@@ -202,12 +202,12 @@ listener_threads_rate_check_interval_into_proto_opts_test() ->
     Name = listener_test_rate_check_interval,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
-        rate_check_interval_ms => 500,
+        rate_check_interval => 500,
         handler => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
-    ?assertEqual(500, maps:get(rate_check_interval_ms, ProtoOpts)),
+    ?assertEqual(500, maps:get(rate_check_interval, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
 listener_threads_hibernate_after_into_proto_opts_test() ->

@@ -113,7 +113,7 @@ read it anyway.
     %% Declared here so dialyzer accepts pattern matches like
     %% `#{hibernate_after := Ms}` against `proto_opts()`.
     hibernate_after => pos_integer(),
-    rate_check_interval_ms => pos_integer()
+    rate_check_interval => pos_integer()
 }.
 
 %% Opaque body-read state attached to the request in manual buffering
