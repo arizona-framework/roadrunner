@@ -1,6 +1,6 @@
 -module(roadrunner_bench_small_chunks_handler).
 -moduledoc """
-Roadrunner handler for `scripts/bench.escript --scenario small_chunked_response`.
+Roadrunner handler for `scripts/bench.escript --scenarios small_chunked_response`.
 
 Streams 100 × 64-byte chunks via `{stream, _, _, Fun}` — distinct
 from `streaming_response`'s 4 × 4 KB. Tests fragmentation overhead

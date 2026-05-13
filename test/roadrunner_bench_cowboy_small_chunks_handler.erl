@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_small_chunks_handler).
 -moduledoc """
-Cowboy streaming handler for `scripts/bench.escript --scenario small_chunked_response`.
+Cowboy streaming handler for `scripts/bench.escript --scenarios small_chunked_response`.
 
 Mirrors `roadrunner_bench_small_chunks_handler`: streams 100 × 64-byte
 chunks via `cowboy_req:stream_body/3`.

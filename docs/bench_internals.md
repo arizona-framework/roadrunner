@@ -272,9 +272,9 @@ Run with `--with-resources` to capture peak RSS / BEAM memory
 alongside throughput:
 
 ```bash
-./scripts/bench.escript --scenario httparena_upload_20mb_auto \
+./scripts/bench.escript --scenarios httparena_upload_20mb_auto \
     --with-resources --clients 8 --duration 5
-./scripts/bench.escript --scenario httparena_upload_20mb_manual \
+./scripts/bench.escript --scenarios httparena_upload_20mb_manual \
     --with-resources --clients 8 --duration 5
 ```
 

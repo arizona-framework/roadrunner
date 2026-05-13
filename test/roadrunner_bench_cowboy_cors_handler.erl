@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_cors_handler).
 -moduledoc """
-Cowboy CORS preflight handler for `scripts/bench.escript --scenario cors_preflight`.
+Cowboy CORS preflight handler for `scripts/bench.escript --scenarios cors_preflight`.
 
 Mirror of `roadrunner_bench_cors_handler`: returns 204 + CORS
 allow-headers.

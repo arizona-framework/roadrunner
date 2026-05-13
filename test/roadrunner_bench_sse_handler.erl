@@ -1,6 +1,6 @@
 -module(roadrunner_bench_sse_handler).
 -moduledoc """
-Roadrunner SSE handler for `scripts/bench.escript --scenario server_sent_events`.
+Roadrunner SSE handler for `scripts/bench.escript --scenarios server_sent_events`.
 
 Emits 100 small `tick` events as fast as possible, then a comment
 and closes the stream. One bench iteration = one SSE session of

@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_echo_handler).
 -moduledoc """
-Cowboy handler for `scripts/bench.escript --scenario echo`.
+Cowboy handler for `scripts/bench.escript --scenarios echo`.
 
 Mirror of `roadrunner_bench_echo_handler` for cowboy: reads the
 request body and echoes it back. Body is read via

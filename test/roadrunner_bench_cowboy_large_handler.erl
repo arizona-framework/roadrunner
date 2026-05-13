@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_large_handler).
 -moduledoc """
-Cowboy handler for `scripts/bench.escript --scenario large_response`.
+Cowboy handler for `scripts/bench.escript --scenarios large_response`.
 
 Mirror of `roadrunner_bench_large_handler` for cowboy: returns a
 64 KB `application/octet-stream` body. Body is cached in

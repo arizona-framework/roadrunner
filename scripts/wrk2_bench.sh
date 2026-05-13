@@ -38,8 +38,8 @@
 # Usage:
 #   ./scripts/wrk2_bench.sh                     # full matrix
 #   ./scripts/wrk2_bench.sh --quick             # --runs 1, dev iteration
-#   ./scripts/wrk2_bench.sh --scenario hello    # one scenario only
-#   ./scripts/wrk2_bench.sh --scenario hello,echo
+#   ./scripts/wrk2_bench.sh --scenarios hello    # one scenario only
+#   ./scripts/wrk2_bench.sh --scenarios hello,echo
 #   ./scripts/wrk2_bench.sh --server roadrunner # one server only
 #   ./scripts/wrk2_bench.sh --runs 5 --duration 90
 #   ./scripts/wrk2_bench.sh --threads 16 --conns 100
@@ -63,7 +63,7 @@ WRK2_IMAGE="${WRK2_IMAGE:-cylab/wrk2:latest}"
 # Parse args.
 while [ $# -gt 0 ]; do
     case "$1" in
-        --scenario)   SCENARIO="$2"; shift 2 ;;
+        --scenarios)  SCENARIO="$2"; shift 2 ;;
         --server)     SERVER_FILTER="$2"; shift 2 ;;
         --servers)    SERVER_FILTER="$2"; shift 2 ;;
         --runs)       RUNS="$2"; shift 2 ;;
@@ -192,8 +192,8 @@ command -v docker >/dev/null 2>&1 || {
     exit 2
 }
 
-# Optional filters. `--scenario` accepts a comma-separated list so a
-# small subset can be targeted, e.g. `--scenario hello,echo`.
+# Optional filters. `--scenarios` accepts a comma-separated list so a
+# small subset can be targeted, e.g. `--scenarios hello,echo`.
 if [ -n "$SCENARIO" ]; then
     IFS=',' read -ra SCENARIOS <<< "$SCENARIO"
     for s in "${SCENARIOS[@]}"; do
@@ -231,8 +231,11 @@ ROWS_FILE="$WORK_DIR/rows.tsv"
 start_standalone() {
     # args: server scenario port_file_path
     local server="$1" scenario="$2" port_file="$3"
+    # `--protocols h1` is required since bench.escript defaults
+    # `--protocols` to all known and `--standalone` rejects
+    # multi-protocol input. wrk2 is h1-only anyway (see top of file).
     "$PROJECT_DIR/scripts/bench.escript" --standalone \
-        --scenario "$scenario" --servers "$server" \
+        --scenarios "$scenario" --protocols h1 --servers "$server" \
         --port-file "$port_file" >"$WORK_DIR/$server.$scenario.standalone.log" 2>&1 &
     STANDALONE_PID=$!
     local i

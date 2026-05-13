@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cookies_handler).
 -moduledoc """
-Roadrunner handler for `scripts/bench.escript --scenario cookies_heavy`.
+Roadrunner handler for `scripts/bench.escript --scenarios cookies_heavy`.
 
 Calls `roadrunner_req:parse_cookies/1` and returns the cookie
 count. Tests the cookie-header parser hot path (single `Cookie:`

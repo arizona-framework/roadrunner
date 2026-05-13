@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_json_handler).
 -moduledoc """
-Cowboy JSON handler for `scripts/bench.escript --scenario json`.
+Cowboy JSON handler for `scripts/bench.escript --scenarios json`.
 
 Mirrors `roadrunner_bench_json_handler` so cowboy and roadrunner
 return the same wire bytes for the `json` scenario.

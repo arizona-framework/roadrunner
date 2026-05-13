@@ -1,6 +1,6 @@
 -module(roadrunner_bench_httparena_json_handler).
 -moduledoc """
-Roadrunner handler for `scripts/bench.escript --scenario httparena_json`.
+Roadrunner handler for `scripts/bench.escript --scenarios httparena_json`.
 
 Mirrors HttpArena's `json` profile: `GET /httparena_json/:count?m=M`
 returns a JSON list of `count` items, each projected with

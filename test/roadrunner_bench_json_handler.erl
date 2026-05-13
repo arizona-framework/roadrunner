@@ -1,6 +1,6 @@
 -module(roadrunner_bench_json_handler).
 -moduledoc """
-Roadrunner handler for `scripts/bench.escript --scenario json`.
+Roadrunner handler for `scripts/bench.escript --scenarios json`.
 
 Returns a fixed JSON body (~120 bytes) with `Content-Type:
 application/json`. The body and `Content-Length` are precomputed at

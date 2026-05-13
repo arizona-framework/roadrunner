@@ -1,6 +1,6 @@
 -module(roadrunner_bench_cowboy_drain_handler).
 -moduledoc """
-Cowboy handler for `scripts/bench.escript --scenario large_post_streaming`.
+Cowboy handler for `scripts/bench.escript --scenarios large_post_streaming`.
 
 Mirror of `roadrunner_bench_drain_handler`: loops
 `cowboy_req:read_body/1` until the body is fully drained, then

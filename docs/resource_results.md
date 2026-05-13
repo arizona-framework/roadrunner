@@ -141,7 +141,7 @@ Single scenario:
 
 ```
 mise exec -- ./scripts/bench.escript --servers roadrunner,elli,cowboy \
-  --scenario hello --clients 50 --duration 5 --warmup 2 --with-resources
+  --scenarios hello --clients 50 --duration 5 --warmup 2 --with-resources
 ```
 
 To regenerate this whole doc with fresh numbers, loop the kept

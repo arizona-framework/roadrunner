@@ -124,7 +124,7 @@ if [[ "$SKIP_BENCH" != "1" ]]; then
       echo "[$idx/$total] $s ($p)"
       for run in $(seq 1 "$RUNS"); do
         out=$(mise exec -- "$REPO_ROOT/scripts/bench.escript" \
-          --scenario "$s" --protocol "$p" \
+          --scenarios "$s" --protocols "$p" \
           --duration "$DURATION" --warmup "$WARMUP" --clients "$CLIENTS" \
           --servers roadrunner,cowboy,elli 2>&1)
         printf '===== %s | %s | run %s =====\n%s\n' "$s" "$p" "$run" "$out" >> "$LOG"

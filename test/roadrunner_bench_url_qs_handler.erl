@@ -1,6 +1,6 @@
 -module(roadrunner_bench_url_qs_handler).
 -moduledoc """
-Roadrunner handler for `scripts/bench.escript --scenario url_with_qs`.
+Roadrunner handler for `scripts/bench.escript --scenarios url_with_qs`.
 
 Calls `roadrunner_req:parse_qs/1` on the URL's query string,
 returns the pair count. Mirrors `roadrunner_bench_form_handler`'s

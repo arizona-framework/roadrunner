@@ -119,7 +119,7 @@ Run it locally:
 ```
 ./scripts/wrk2_bench.sh                       # full matrix
 ./scripts/wrk2_bench.sh --quick                # --runs 1, dev iteration
-./scripts/wrk2_bench.sh --scenario hello,echo  # subset
+./scripts/wrk2_bench.sh --scenarios hello,echo  # subset
 ```
 
 Requires Docker and a compiled test profile. See
@@ -180,7 +180,7 @@ Single scenario:
 
 ```
 mise exec -- ./scripts/bench.escript --servers roadrunner,elli,cowboy \
-  --scenario hello --clients 50 --duration 5 --warmup 2
+  --scenarios hello --clients 50 --duration 5 --warmup 2
 ```
 
 Run several times and take the median — the bench script's banner
@@ -196,7 +196,7 @@ Full matrix (regenerates `bench_results.md`):
 
 Override defaults via env: `RUNS=5 DURATION=10 ./scripts/bench_matrix.sh`.
 
-`scripts/bench.escript --protocol h2` drives the same scenarios
+`scripts/bench.escript --protocols h2` drives the same scenarios
 over HTTP/2. The h2 loadgen is the in-tree pure-Erlang
 `roadrunner_bench_client` (lives in `test/` because it's only used
 by dev tools); no external h2 client / loadgen needs to be
