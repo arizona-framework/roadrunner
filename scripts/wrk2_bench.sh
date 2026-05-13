@@ -231,8 +231,11 @@ ROWS_FILE="$WORK_DIR/rows.tsv"
 start_standalone() {
     # args: server scenario port_file_path
     local server="$1" scenario="$2" port_file="$3"
+    # `--protocols h1` is required since bench.escript defaults
+    # `--protocols` to all known and `--standalone` rejects
+    # multi-protocol input. wrk2 is h1-only anyway (see top of file).
     "$PROJECT_DIR/scripts/bench.escript" --standalone \
-        --scenarios "$scenario" --servers "$server" \
+        --scenarios "$scenario" --protocols h1 --servers "$server" \
         --port-file "$port_file" >"$WORK_DIR/$server.$scenario.standalone.log" 2>&1 &
     STANDALONE_PID=$!
     local i

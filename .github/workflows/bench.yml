@@ -17,9 +17,14 @@ name: Bench
   workflow_dispatch:
     inputs:
       scenarios:
-        description: "bench.escript scenarios, comma-separated (e.g. hello | hello,echo | hello,echo,large_response)"
+        description: "comma-separated scenarios (e.g. hello,echo); leave empty to run all known"
         required: false
-        default: hello
+        default: ""
+        type: string
+      protocols:
+        description: "comma-separated protocols (h1 | h2 | h1,h2); leave empty to run all known"
+        required: false
+        default: ""
         type: string
       duration:
         description: "bench duration in seconds (warmup is +2s on top)"
@@ -40,7 +45,10 @@ jobs:
 
     runs-on: ubuntu-24.04
 
-    timeout-minutes: 5
+    # Empty inputs run every scenario on every protocol (~30 cells
+    # × ~25 s × 3 servers ≈ tens of minutes). Bump if you trip the
+    # cap; default values fit in <2 min.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -93,13 +101,20 @@ jobs:
 
       # Inputs threaded through env, not direct template substitution,
       # so a caller can't slip shell metacharacters into the run script.
+      # An empty input omits the flag so bench.escript's own default
+      # (`all`) kicks in — the workflow surface mirrors the CLI's
+      # "omitted = all" convention exactly.
       - name: Run bench.escript
         env:
           SCENARIOS: ${{ inputs.scenarios }}
+          PROTOCOLS: ${{ inputs.protocols }}
           DURATION: ${{ inputs.duration }}
         run: |
+          args=()
+          [[ -n "$SCENARIOS" ]] && args+=(--scenarios "$SCENARIOS")
+          [[ -n "$PROTOCOLS" ]] && args+=(--protocols "$PROTOCOLS")
           ./scripts/bench.escript \
-            --scenarios "$SCENARIOS" \
+            "${args[@]}" \
             --duration "$DURATION" \
             --warmup 2 \
             2>&1 | tee /tmp/bench.log
@@ -108,14 +123,18 @@ jobs:
         if: always()
         env:
           SCENARIOS: ${{ inputs.scenarios }}
+          PROTOCOLS: ${{ inputs.protocols }}
           DURATION: ${{ inputs.duration }}
           BRANCH: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
         run: |
+          scenarios_label="${SCENARIOS:-all}"
+          protocols_label="${PROTOCOLS:-all}"
           {
             echo "## bench on-demand"
             echo ""
-            echo "scenarios \`$SCENARIOS\`, duration \`${DURATION}s\`, warmup \`2s\`"
+            echo "scenarios \`$scenarios_label\`, protocols \`$protocols_label\`,"
+            echo "duration \`${DURATION}s\`, warmup \`2s\`"
             echo ""
             echo "branch \`$BRANCH\`, sha \`$SHA\`"
             echo ""

@@ -198,7 +198,7 @@ maybe_print_protocol_divider(#{protocols := [_]}, _Protocol) ->
 maybe_print_protocol_divider(_Opts, Protocol) ->
     io:format("~n======== protocol: ~s ========~n", [Protocol]).
 
-%% Resolve the `--protocol` sentinel `all` (default when the flag is
+%% Resolve the `--protocols` sentinel `all` (default when the flag is
 %% omitted) to `?KNOWN_PROTOCOLS`. Explicit picks pass through.
 expand_protocols(all) ->
     ?KNOWN_PROTOCOLS;
