@@ -57,61 +57,34 @@
 %% `start_server/2` (plus any `scenario_*` config helpers below).
 -define(KNOWN_SERVERS, [roadrunner, cowboy, elli]).
 
-%% Scenarios known to the bench. `--scenarios` accepts a
-%% comma-separated list (mirroring `--servers`), so each value in the
-%% user's input must validate against this set. Adding a new scenario
-%% requires appending it here, adding a `preflight_scenario/1` clause
-%% if any servers should be filtered, and wiring `scenario_path/1` /
-%% `build_request/N` / `start_server/2` for it.
--define(KNOWN_SCENARIOS, [
+%% Scenarios are partitioned by protocol compatibility. Each scenario
+%% name lives in exactly one of these three macros; adding a new
+%% scenario means picking the right one and wiring the matching
+%% `preflight_scenario/1` clause, `scenario_path/1`, `build_request/N`,
+%% and `start_server/2` bits below. `?KNOWN_SCENARIOS` is the
+%% concatenation, used by `parse_known_atoms/3` for input validation —
+%% the compiler folds the constant-list concatenation, so there's no
+%% runtime cost.
+
+%% Scenarios that run on any wire protocol — their workload doesn't
+%% touch protocol-specific shape, so they survive any future
+%% `?KNOWN_PROTOCOLS` addition without code changes.
+-define(PROTOCOL_AGNOSTIC_SCENARIOS, [
     hello,
     echo,
     large_response,
     json,
     headers_heavy,
-    streaming_response,
-    multi_stream_h2,
-    pipelined_h1,
-    slow_client,
-    connection_storm,
-    mixed_workload,
-    post_4kb_form,
-    large_post_streaming,
-    router_404_storm,
-    varied_paths_router,
-    gzip_response,
-    backpressure_sustained,
-    server_sent_events,
-    expect_100_continue,
-    large_keepalive_session,
-    websocket_msg_throughput,
-    url_with_qs,
-    small_chunked_response,
-    accept_storm_burst,
     head_method,
-    etag_304,
-    partial_body_drop,
     cookies_heavy,
-    tls_handshake_throughput,
-    multi_request_body,
-    path_with_unicode,
-    cors_preflight,
-    chunked_request_body,
-    redirect_response,
-    compressed_request_body,
-    httparena_baseline,
-    httparena_json,
-    httparena_upload_20mb_auto,
-    httparena_upload_20mb_manual
+    multi_request_body
 ]).
 
 %% Scenarios that only make sense over HTTP/1.1 — the listener fixture
 %% or the workload itself depends on h1-specific shape (pipelining,
-%% Connection: close storms, etc.). When `--scenarios all` is paired
-%% with `--protocol h2`, these get filtered out. Mirrors the
+%% Connection: close storms, etc.). Mirrors the
 %% `"error: --scenarios X is h1-only ..."` preflight checks at the
-%% per-scenario h2-workload sites — keep in sync when adding a new
-%% h1-only scenario.
+%% per-scenario h2-workload sites.
 -define(H1_ONLY_SCENARIOS, [
     pipelined_h1,
     slow_client,
@@ -151,6 +124,10 @@
     small_chunked_response,
     tls_handshake_throughput
 ]).
+
+-define(KNOWN_SCENARIOS,
+    ?PROTOCOL_AGNOSTIC_SCENARIOS ++ ?H1_ONLY_SCENARIOS ++ ?H2_ONLY_SCENARIOS
+).
 
 main(Args) ->
     Opts0 = parse_args(Args),
