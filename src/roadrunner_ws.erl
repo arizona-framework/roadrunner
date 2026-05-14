@@ -38,7 +38,23 @@ frames.
 -define(EXT_QUOTE_CP_KEY, {?MODULE, ext_quote_cp}).
 -define(UPGRADE_CP_KEY, {?MODULE, upgrade_cp}).
 
+-doc """
+WebSocket frame opcodes (RFC 6455 §11.8). `continuation` only
+appears on the wire — the session reassembles fragmented messages
+before dispatching to `c:roadrunner_ws_handler:handle_frame/2`, so
+handlers see `text` or `binary` for data and `ping`/`pong`/`close`
+for control. Outbound replies use `text`, `binary`, `ping`, `pong`,
+or `close`.
+""".
 -type opcode() :: continuation | text | binary | close | ping | pong.
+
+-doc """
+A parsed WebSocket frame. `payload` is the post-unmask (and
+post-reassembly + post-inflate, when delivered to a handler) bytes
+the application should treat as the message body. `rsv1` carries
+the RFC 7692 compression flag when permessage-deflate was
+negotiated; otherwise always `false`.
+""".
 -type frame() :: #{
     fin := boolean(),
     rsv1 := boolean(),
@@ -51,29 +67,36 @@ frames.
 %% parameters (e.g. `client_no_context_takeover`).
 -type extension() :: {binary(), [{binary(), binary() | true}]}.
 
-%% Parse-side options. `allow_rsv1 => true` surfaces the RSV1 bit in
-%% the returned frame map (per RFC 7692 the bit signals a compressed
-%% message). RSV2 and RSV3 are always rejected — no IETF extension
-%% uses them.
+-doc """
+Parse-side options for `parse_frame/2`.
+
+- `allow_rsv1` — surface the RSV1 bit in the returned frame map.
+  Set once permessage-deflate (RFC 7692) is negotiated. RSV2 and
+  RSV3 are always rejected; no IETF extension uses them.
+- `pre_unmasked` — caller-supplied already-unmasked payload. When
+  this matches the frame's length, `parse_frame/2` skips its own
+  unmask pass and uses the supplied bytes directly.
+""".
 -type parse_opts() :: #{
     allow_rsv1 => boolean(),
-    %% Caller-supplied unmasked payload. When this matches the frame's
-    %% length, `parse_frame/2` skips its own `unmask/2` call and uses
-    %% the supplied bytes directly. `roadrunner_ws_session` populates
-    %% this from its incremental UTF-8 validation pass — same bytes
-    %% would otherwise be unmasked twice.
     pre_unmasked => binary()
 }.
 
-%% Encode-side options. `rsv1 => true` sets the RSV1 bit on the
-%% emitted frame; the caller is responsible for ensuring an
-%% extension that uses the bit is in effect.
+-doc """
+Encode-side options for `encode_frame/4`.
+
+- `rsv1` — set the RSV1 bit on the emitted frame. The caller is
+  responsible for ensuring an extension that uses the bit is in
+  effect (RFC 7692 permessage-deflate).
+""".
 -type encode_opts() :: #{rsv1 => boolean()}.
 
-%% Negotiated permessage-deflate parameters per RFC 7692 §7.1.
-%% Window-bits values are zlib's (8..15). The `*_no_context_takeover`
-%% flags mirror the request; when `true`, the corresponding zlib
-%% context is reset after every message.
+-doc """
+Negotiated permessage-deflate parameters per RFC 7692 §7.1.
+Window-bits values are zlib's (8..15). The `*_no_context_takeover`
+flags mirror the request; when `true`, the corresponding zlib
+context is reset after every message.
+""".
 -type permessage_deflate_params() :: #{
     server_max_window_bits := 8..15,
     client_max_window_bits := 8..15,
@@ -81,14 +104,24 @@ frames.
     client_no_context_takeover := boolean()
 }.
 
+-doc """
+The outcome of extension negotiation during the upgrade handshake.
+`none` means no extension was offered or accepted;
+`{permessage_deflate, Params, ResponseHeaderValue}` means RFC 7692
+was negotiated with the given parameters, and `ResponseHeaderValue`
+is the value placed in the response's `Sec-WebSocket-Extensions`
+header.
+""".
 -type negotiated() ::
     none
     | {permessage_deflate, permessage_deflate_params(), ResponseHeaderValue :: binary()}.
 
-%% Close status codes a server is permitted to send per RFC 6455 §7.4.
-%% 1004/1005/1006 are reserved (MUST NOT appear on the wire);
-%% 1012/1013 are unassigned. 3000-3999 is the IANA-registered range,
-%% 4000-4999 is for application-private use.
+-doc """
+Close status codes a server is permitted to send per RFC 6455 §7.4.
+1004/1005/1006 are reserved (MUST NOT appear on the wire);
+1012/1013 are unassigned. 3000-3999 is the IANA-registered range,
+4000-4999 is for application-private use.
+""".
 -type close_code() ::
     1000..1003 | 1007..1011 | 1014 | 3000..4999.
 
@@ -106,6 +139,7 @@ frames.
 %% Compute the `Sec-WebSocket-Accept` value from a client-provided
 %% `Sec-WebSocket-Key` per RFC 6455 §4.2.2 step 5: SHA-1 of the key
 %% concatenated with the WebSocket GUID, base64-encoded.
+
 -doc false.
 -spec accept_key(Key :: binary()) -> binary().
 accept_key(Key) when is_binary(Key) ->
@@ -124,6 +158,7 @@ accept_key(Key) when is_binary(Key) ->
 %% `{permessage_deflate, Params, _}` when RFC 7692 was negotiated.
 %% The session uses this to set up zlib state. The agreed extension's
 %% response header is already in `Headers`.
+
 -doc false.
 -spec handshake_response(roadrunner_req:headers()) ->
     {ok, roadrunner_req:status(), roadrunner_req:headers(), iodata(), negotiated()}
@@ -260,6 +295,7 @@ header_lookup(Name, Headers) ->
 %% relies on offer order for negotiation precedence.
 %%
 %% Returns `[]` for an absent / empty header value.
+
 -doc false.
 -spec parse_extensions(binary() | undefined) -> [extension()].
 parse_extensions(undefined) ->
@@ -327,6 +363,7 @@ unquote(V) ->
 %% Per RFC 6455 §9.1, when multiple extensions are offered the server
 %% processes them in order and picks the first one it can accept;
 %% unrecognised offers are silently skipped.
+
 -doc false.
 -spec negotiate_extensions([extension()]) -> negotiated().
 negotiate_extensions([]) ->
@@ -449,6 +486,7 @@ format_pmd_kv(Name, Value, _Default) -> [~"; ", Name, ~"=", integer_to_binary(Va
 %%
 %% Use `parse_frame/2` with `#{allow_rsv1 => true}` once a permessage
 %% extension (RFC 7692) has been negotiated.
+
 -doc false.
 -spec parse_frame(binary()) ->
     {ok, frame(), Rest :: binary()}
@@ -462,6 +500,7 @@ parse_frame(Bin) ->
 %% `Opts` may include `allow_rsv1 => true` to permit the RSV1 bit
 %% (needed once `permessage-deflate` is negotiated per RFC 7692).
 %% RSV2 and RSV3 remain unconditionally rejected.
+
 -doc false.
 -spec parse_frame(binary(), parse_opts()) ->
     {ok, frame(), Rest :: binary()}
@@ -514,6 +553,7 @@ do_parse_frame(_, _AllowRsv1, _Pre) ->
 %% payload bytes incrementally as TCP chunks arrive — well before
 %% the frame as a whole completes. Honors `allow_rsv1` the same way
 %% `parse_frame/2` does.
+
 -doc false.
 -spec peek_frame_header(binary(), parse_opts()) ->
     {ok, map(), non_neg_integer()}
@@ -698,6 +738,7 @@ unmask_chunks(<<>>, _MK, Acc) ->
 %%
 %% Use `encode_frame/4` with `#{rsv1 => true}` once `permessage-deflate`
 %% is negotiated and you're emitting a compressed first-fragment.
+
 -doc false.
 -spec encode_frame(opcode(), iodata(), boolean()) -> iodata().
 encode_frame(Opcode, Payload, Fin) ->

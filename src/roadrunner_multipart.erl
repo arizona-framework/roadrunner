@@ -66,6 +66,12 @@ listener's `max_content_length` (default 10 MB).
 -export([parse/2, boundary/1, params/1]).
 -export_type([part/0]).
 
+-doc """
+One section of a parsed `multipart/form-data` body. `headers` is
+the part's headers (names lowercased, values OWS-trimmed) as a list
+of `{Name, Value}` binaries; `body` is the raw bytes between
+end-of-headers and the next boundary.
+""".
 -type part() :: #{
     headers := [{binary(), binary()}],
     body := binary()

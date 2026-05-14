@@ -54,10 +54,40 @@ handle(Req) ->
 
 -export_type([send_fun/0, stream_fun/0, push_fun/0, sendfile_spec/0, response/0, result/0]).
 
+-doc """
+The chunk-writing callback handed to a `t:stream_fun/0`. Each call
+emits one chunk on the wire:
+
+- `Send(Data, nofin)` — write `Data` and expect more.
+- `Send(Data, fin)` — write `Data` then the size-0 terminator.
+- `Send(Data, {fin, Trailers})` — write `Data`, the terminator, and
+  serialized trailer headers (RFC 9112 §7.1.2).
+
+Returns `ok` on success or `{error, Reason}` if the wire write
+failed (peer close, kernel error, etc.).
+""".
 -type send_fun() ::
     fun((iodata(), nofin | fin | {fin, roadrunner_req:headers()}) -> ok | {error, term()}).
+
+-doc """
+The stream callback for `{stream, _, _, Fun}` responses. The
+framework calls `Fun(Send)` with a `t:send_fun/0`; the fun emits
+chunks via `Send` and returns when the stream is complete.
+""".
 -type stream_fun() :: fun((send_fun()) -> any()).
+
+-doc """
+The push callback handed to a `{loop, _, _, State}` handler via
+`handle_info/3`. Each call writes one chunk to the wire.
+""".
 -type push_fun() :: fun((iodata()) -> ok | {error, term()}).
+
+-doc """
+The `{Filename, Offset, Length}` triple for a `{sendfile, _, _, _}`
+response. Bytes `[Offset, Offset+Length)` of the file are emitted
+verbatim — the handler is responsible for setting `Content-Length`
+and `Content-Type` headers on the response.
+""".
 -type sendfile_spec() :: {
     Filename :: file:filename_all(),
     Offset :: non_neg_integer(),
@@ -80,6 +110,13 @@ lowercase names; handler-supplied tuples must follow suit.
     | {loop, StatusCode :: roadrunner_req:status(), roadrunner_req:headers(), State :: term()}
     | {sendfile, StatusCode :: roadrunner_req:status(), roadrunner_req:headers(), sendfile_spec()}
     | {websocket, Module :: module(), State :: term()}.
+
+-doc """
+What `handle/1` returns: a pair of the handler's `t:response/0` and
+the (possibly mutated) request map. Threading `Req2` back lets the
+conn drain unread bodies in manual-buffering mode and response
+middlewares observe / rewrite.
+""".
 -type result() :: {response(), roadrunner_req:request()}.
 
 -doc """

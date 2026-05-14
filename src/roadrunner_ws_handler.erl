@@ -61,8 +61,28 @@ NewState}`, `{ok, NewState}`, `{close, NewState}`, or
 `Opts` list for `hibernate` on the reply / ok shapes.
 """.
 
+-doc """
+Per-event option flags. Currently only `hibernate` is recognized;
+when included in a 4-tuple callback return, the framework hibernates
+the session process after the event finishes processing.
+""".
 -type opt() :: hibernate.
 
+-doc """
+Unified return shape for all `roadrunner_ws_handler` callbacks.
+
+- `{reply, Frames, NewState}` — emit each `{Opcode, Payload}` frame
+  (always with FIN=true) and keep the session open.
+- `{reply, Frames, NewState, Opts}` — same, with an opt list (e.g.
+  `[hibernate]`).
+- `{ok, NewState}` — no outbound frames, keep the session open.
+- `{ok, NewState, Opts}` — same, with an opt list.
+- `{close, NewState}` — send an empty close frame and terminate.
+- `{close, Code, Reason, NewState}` — send a close frame carrying
+  `Code` (RFC 6455 §7.4 server-permitted code) and UTF-8 `Reason`.
+  The framework crashes the session if `Code` / `Reason` is invalid
+  rather than emit a malformed close.
+""".
 -type result() ::
     {reply, Frames :: [{roadrunner_ws:opcode(), iodata()}], NewState :: term()}
     | {reply, Frames :: [{roadrunner_ws:opcode(), iodata()}], NewState :: term(), [opt()]}

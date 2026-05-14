@@ -106,10 +106,24 @@ server_header(Req, Next) ->
 -export([compose/2, build_pipeline/3]).
 -export_type([middleware/0, middleware_list/0, next/0]).
 
+-doc """
+The continuation passed to a middleware's `call/2`: a fun that runs
+the rest of the pipeline (other middlewares + the inner handler)
+and returns the same `t:roadrunner_handler:result/0` shape every
+middleware returns.
+""".
 -type next() :: fun((roadrunner_req:request()) -> roadrunner_handler:result()).
+
+-doc """
+A single entry in a `middlewares` list. Either a module that
+implements `-behaviour(roadrunner_middleware)` (its `call/2` is
+invoked) or a `fun((Request, Next) -> Result)` invoked directly.
+""".
 -type middleware() ::
     module()
     | fun((roadrunner_req:request(), next()) -> roadrunner_handler:result()).
+
+-doc "An ordered list of `t:middleware/0` entries.".
 -type middleware_list() :: [middleware()].
 
 -doc """
@@ -159,6 +173,7 @@ compose([Mw | Rest], Handler) ->
 %% Used by both the h1 conn loop (`roadrunner_conn_loop:run_pipeline`)
 %% and the h2 stream worker (`roadrunner_http2_stream_worker:invoke`)
 %% so the dispatch shape stays identical across protocols.
+
 -doc false.
 -spec build_pipeline(middleware_list(), roadrunner_req:request(), module()) -> next().
 build_pipeline([], Req, Handler) ->

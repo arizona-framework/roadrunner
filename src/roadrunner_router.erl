@@ -33,11 +33,34 @@ swapping to a trie/DAG later is a non-breaking change for callers.
 
 -export_type([route/0, routes/0, compiled/0, bindings/0]).
 
+-doc """
+A single route entry: `{Path, Handler, Opts}` where `Path` is a
+binary pattern (literal segments, `:param` captures, or `*wildcard`
+catch-all), `Handler` is the module implementing
+`roadrunner_handler`, and `Opts` is opaque per-route data threaded
+back to the handler via `roadrunner_req:route_opts/1`.
+""".
 -type route() :: {Path :: binary(), Handler :: module(), Opts :: term()}.
+
+-doc "An ordered list of routes; matched first-to-last.".
 -type routes() :: [route()].
+
+-doc """
+Captured route parameters, populated by `match/2`.
+
+`:param` segments produce a single binary value
+(`#{~"id" => ~"42"}`). `*wildcard` segments produce the list of
+remaining path segments
+(`#{~"rest" => [~"a", ~"b"]}`). Empty for routes with no captures.
+""".
 -type bindings() :: #{binary() => binary() | [binary()]}.
 
 -type segment() :: {literal, binary()} | {param, binary()} | {wildcard, binary()}.
+
+-doc """
+The compiled-routes representation `match/2` consumes. Treat as
+opaque: the shape is an implementation detail and may change.
+""".
 -opaque compiled() :: [{[segment()], module(), term()}].
 
 -doc """
