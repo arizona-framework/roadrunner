@@ -40,7 +40,7 @@ All duration and interval values in `opts()` are in milliseconds —
 -type opts() :: #{
     port := inet:port_number(),
     routes => module() | roadrunner_router:routes(),
-    middlewares => roadrunner_handler:middleware_list(),
+    middlewares => roadrunner_middleware:middleware_list(),
     max_content_length => non_neg_integer(),
     request_timeout => non_neg_integer(),
     keep_alive_timeout => non_neg_integer(),
