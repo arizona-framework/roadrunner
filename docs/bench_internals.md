@@ -279,4 +279,6 @@ alongside throughput:
 ```
 
 For hot-path analysis, add `--profile --profile-tool eprof` (or
-`fprof`).
+`fprof`); the workflow established in
+[`conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md)
+applies directly.
