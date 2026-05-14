@@ -39,13 +39,13 @@ Standards conformance:
 - **HTTP/2**: RFC 9113 (frames + multiplexing) + RFC 7541 (HPACK).
   Opt-in per listener via `protocols => [http1, http2]` (or
   `[http2]` for h2c prior-knowledge on plain TCP). Conformance
-  harness: [`scripts/h2spec.sh`](scripts/h2spec.sh) (drives
+  harness: [`scripts/h2spec.sh`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/h2spec.sh) (drives
   [h2spec](https://github.com/summerwind/h2spec)).
 - **Content-Encoding** (RFC 9110 §8.4.1): gzip + deflate with
   qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3),
   works unchanged over HTTP/2.
 - **WebSocket**: RFC 6455. Conformance harness:
-  [`scripts/autobahn.escript`](scripts/autobahn.escript) (drives the
+  [`scripts/autobahn.escript`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/autobahn.escript) (drives the
   [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
   fuzzingclient).
 - **WebSocket compression**: RFC 7692 `permessage-deflate`,
@@ -55,7 +55,7 @@ Standards conformance:
 
 Median req/s on a 12th-gen i9-12900HX, 50 clients, 5 s warmup + 5 s
 measure, loopback. Full per-protocol grid + p50/p99 + memory shape
-in [`docs/comparison.md`](docs/comparison.md).
+in [`docs/comparison.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/comparison.md).
 
 | scenario                  | roadrunner    | cowboy        | elli          |
 |---------------------------|--------------:|--------------:|--------------:|
@@ -75,8 +75,8 @@ band — the comparison doc has the full honest framing.
 The numbers above are throughput from `scripts/bench.escript`
 (closed-loop). For Coordinated-Omission-corrected tail latency at
 sustained rates (open-loop, via wrk2), see
-[`docs/wrk2_results.md`](docs/wrk2_results.md) and the
-methodology section in [`docs/comparison.md`](docs/comparison.md).
+[`docs/wrk2_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/wrk2_results.md);
+the comparison doc has the methodology breakdown.
 
 ## Quickstart
 
@@ -244,17 +244,17 @@ roadrunner:start_listener(my_listener, #{port => 8080, routes => hello_handler})
 
 ## Documentation
 
-- [`docs/comparison.md`](docs/comparison.md) — full side-by-side
+- [`docs/comparison.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/comparison.md) — full side-by-side
   benchmarks vs cowboy and elli (throughput, latency, architectural
   trade-offs, reproduction commands).
-- [`docs/bench_results.md`](docs/bench_results.md) — full per-protocol
+- [`docs/bench_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/bench_results.md) — full per-protocol
   matrix with p50 / p99 across every scenario.
-- [`docs/resource_results.md`](docs/resource_results.md) — memory + CPU
+- [`docs/resource_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/resource_results.md) — memory + CPU
   shape per scenario.
 - [`docs/conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md)
   — the connection-process model trade-offs and the one h2 case
   cowboy still wins.
-- [`docs/roadmap.md`](docs/roadmap.md) — deferred items, with rough
+- [`docs/roadmap.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/roadmap.md) — deferred items, with rough
   effort estimates for each.
 
 ## Design philosophy
@@ -288,7 +288,7 @@ I also accept coffees ☕
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for development setup,
+Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/arizona-framework/roadrunner/blob/main/CONTRIBUTING.md) for development setup,
 testing guidelines, and contribution workflow.
 
 ### Contributors
@@ -328,4 +328,4 @@ Copyright (c) 2026 [William Fank Thomé](https://github.com/williamthome)
 Roadrunner is open-source under the Apache 2.0 License on
 [GitHub](https://github.com/arizona-framework/roadrunner).
 
-See [LICENSE.md](LICENSE.md) for more information.
+See [LICENSE.md](https://github.com/arizona-framework/roadrunner/blob/main/LICENSE.md) for more information.
