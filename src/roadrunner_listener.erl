@@ -323,7 +323,6 @@ reload_routes(Name, Routes) ->
     gen_server:call(Name, {reload_routes, Routes}).
 
 %% --- gen_server callbacks ---
-
 -doc false.
 -spec init(opts()) -> {ok, #state{}} | {stop, term()}.
 init(#{port := Port} = Opts) ->

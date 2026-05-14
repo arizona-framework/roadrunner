@@ -443,7 +443,6 @@ early_validate_text(Data, Buf, Opts) ->
 %% Unmask `Slice` where its first byte sits at `Offset` into the
 %% logical payload (so the mask-key cycle is right). RFC 6455 §5.3
 %% mask: payload[i] = masked[i] XOR maskKey[i mod 4].
-
 -doc false.
 -spec unmask_slice(binary(), binary(), non_neg_integer()) -> binary().
 unmask_slice(Slice, <<MaskKey:32>>, Offset) ->

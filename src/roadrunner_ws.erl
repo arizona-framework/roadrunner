@@ -139,7 +139,6 @@ Close status codes a server is permitted to send per RFC 6455 §7.4.
 %% Compute the `Sec-WebSocket-Accept` value from a client-provided
 %% `Sec-WebSocket-Key` per RFC 6455 §4.2.2 step 5: SHA-1 of the key
 %% concatenated with the WebSocket GUID, base64-encoded.
-
 -doc false.
 -spec accept_key(Key :: binary()) -> binary().
 accept_key(Key) when is_binary(Key) ->
@@ -158,7 +157,6 @@ accept_key(Key) when is_binary(Key) ->
 %% `{permessage_deflate, Params, _}` when RFC 7692 was negotiated.
 %% The session uses this to set up zlib state. The agreed extension's
 %% response header is already in `Headers`.
-
 -doc false.
 -spec handshake_response(roadrunner_req:headers()) ->
     {ok, roadrunner_req:status(), roadrunner_req:headers(), iodata(), negotiated()}
@@ -295,7 +293,6 @@ header_lookup(Name, Headers) ->
 %% relies on offer order for negotiation precedence.
 %%
 %% Returns `[]` for an absent / empty header value.
-
 -doc false.
 -spec parse_extensions(binary() | undefined) -> [extension()].
 parse_extensions(undefined) ->
@@ -363,7 +360,6 @@ unquote(V) ->
 %% Per RFC 6455 §9.1, when multiple extensions are offered the server
 %% processes them in order and picks the first one it can accept;
 %% unrecognised offers are silently skipped.
-
 -doc false.
 -spec negotiate_extensions([extension()]) -> negotiated().
 negotiate_extensions([]) ->
@@ -486,7 +482,6 @@ format_pmd_kv(Name, Value, _Default) -> [~"; ", Name, ~"=", integer_to_binary(Va
 %%
 %% Use `parse_frame/2` with `#{allow_rsv1 => true}` once a permessage
 %% extension (RFC 7692) has been negotiated.
-
 -doc false.
 -spec parse_frame(binary()) ->
     {ok, frame(), Rest :: binary()}
@@ -500,7 +495,6 @@ parse_frame(Bin) ->
 %% `Opts` may include `allow_rsv1 => true` to permit the RSV1 bit
 %% (needed once `permessage-deflate` is negotiated per RFC 7692).
 %% RSV2 and RSV3 remain unconditionally rejected.
-
 -doc false.
 -spec parse_frame(binary(), parse_opts()) ->
     {ok, frame(), Rest :: binary()}
@@ -553,7 +547,6 @@ do_parse_frame(_, _AllowRsv1, _Pre) ->
 %% payload bytes incrementally as TCP chunks arrive — well before
 %% the frame as a whole completes. Honors `allow_rsv1` the same way
 %% `parse_frame/2` does.
-
 -doc false.
 -spec peek_frame_header(binary(), parse_opts()) ->
     {ok, map(), non_neg_integer()}
@@ -738,7 +731,6 @@ unmask_chunks(<<>>, _MK, Acc) ->
 %%
 %% Use `encode_frame/4` with `#{rsv1 => true}` once `permessage-deflate`
 %% is negotiated and you're emitting a compressed first-fragment.
-
 -doc false.
 -spec encode_frame(opcode(), iodata(), boolean()) -> iodata().
 encode_frame(Opcode, Payload, Fin) ->

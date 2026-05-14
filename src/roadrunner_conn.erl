@@ -252,7 +252,6 @@ generate_request_id(_Empty) ->
 
 %% Replaces (not merges) the conn process's logger metadata so a
 %% keep-alive request never inherits the previous request's correlation.
-
 -doc false.
 -spec set_request_logger_metadata(roadrunner_http1:request()) -> ok.
 set_request_logger_metadata(#{
@@ -279,7 +278,6 @@ set_request_logger_metadata(#{
 %% running average to meet `MinRate` bytes/sec, otherwise return
 %% `{error, slow_client}`. The state is a per-conn atomics ref — no
 %% cross-process contention.
-
 -doc false.
 -spec make_recv(roadrunner_transport:socket(), integer(), non_neg_integer()) ->
     fun(() -> {ok, binary()} | {error, request_timeout | slow_client | term()}).
@@ -376,7 +374,6 @@ read_body(Req, Buffered, RecvFun, MaxCL) ->
 %% this if no body bytes have already arrived in the buffer — once we
 %% see body data the client clearly didn't wait, and the 100 line is
 %% redundant.
-
 -doc false.
 -spec maybe_send_continue(roadrunner_transport:socket(), roadrunner_http1:request(), binary()) ->
     ok.
@@ -554,7 +551,6 @@ read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
 %% path; `roadrunner_conn_loop`'s finishing phase threads `Leftover`
 %% forward into the next `reading_request` parse so pipelined
 %% clients get their N+1 request seen.
-
 -doc false.
 -spec drain_body(roadrunner_http1:request()) -> {ok, binary()} | {error, term()}.
 drain_body(#{body_state := BS}) ->
@@ -806,7 +802,6 @@ parse_loop(Buf, RecvFun) ->
 
 %% Order matters — `{websocket, _, _}` is a 3-tuple too, so the
 %% atom-tagged variants must precede the buffered catch-all.
-
 -doc false.
 -spec response_status(roadrunner_handler:response()) -> roadrunner_http1:status().
 response_status({stream, Status, _, _}) -> Status;
@@ -826,7 +821,6 @@ response_kind({_, _, _}) -> buffered.
 
 %% HTTP/1.0 default close. HTTP/1.1 keep-alive unless either side
 %% set Connection: close.
-
 -doc false.
 -spec keep_alive_decision(roadrunner_http1:request(), roadrunner_http1:headers()) ->
     keep_alive | close.
@@ -930,7 +924,6 @@ send_bad_request(Socket) ->
 %% 413 we're about to send before we close. Bounded by `2 * MaxCL`
 %% (memory) and a 1-second per-recv timeout (wall-clock) so a slow
 %% peer can't pin us indefinitely.
-
 -doc false.
 -spec drain_oversized_body(binary(), roadrunner_transport:socket(), non_neg_integer()) -> ok.
 drain_oversized_body(Buffered, Socket, MaxCL) ->

@@ -173,7 +173,6 @@ compose([Mw | Rest], Handler) ->
 %% Used by both the h1 conn loop (`roadrunner_conn_loop:run_pipeline`)
 %% and the h2 stream worker (`roadrunner_http2_stream_worker:invoke`)
 %% so the dispatch shape stays identical across protocols.
-
 -doc false.
 -spec build_pipeline(middleware_list(), roadrunner_req:request(), module()) -> next().
 build_pipeline([], Req, Handler) ->

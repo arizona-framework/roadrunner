@@ -414,7 +414,6 @@ recv_with_hibernate(
 %% Hibernate continuation. Re-enters `recv_request_bytes/2` so
 %% the next iteration picks up wherever the recv shape demands
 %% (with or without hibernation, depending on `hibernate_after`).
-
 -doc false.
 -spec recv_request_bytes_hib(#loop_state{}, integer()) -> no_return().
 recv_request_bytes_hib(S, Deadline) ->
