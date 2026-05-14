@@ -246,6 +246,7 @@ reload_routes(Name, Routes) ->
 
 %% --- gen_server callbacks ---
 
+-doc false.
 -spec init(opts()) -> {ok, #state{}} | {stop, term()}.
 init(#{port := Port} = Opts) ->
     ListenerName = listener_name(),
@@ -561,6 +562,7 @@ build_dispatch(#{routes := Routes}, ListenerName) when is_list(Routes) ->
 build_dispatch(_Opts, _ListenerName) ->
     {handler, roadrunner_default_handler}.
 
+-doc false.
 -spec handle_call(
     port
     | info
@@ -647,10 +649,12 @@ wait_for_drain(Counter, Deadline, Group) ->
 drain_group(#{listener_name := Name}) ->
     {roadrunner_drain, Name}.
 
+-doc false.
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+-doc false.
 -spec handle_info(term(), #state{}) -> {noreply, #state{}}.
 handle_info(reconcile_slots, #state{reconciliation = disabled} = State) ->
     %% Race: a `slot_reconciliation` opt change between scheduling and
@@ -719,6 +723,7 @@ count_up_to(_, Cap, N) when N >= Cap -> Cap;
 count_up_to([], _Cap, N) -> N;
 count_up_to([_ | T], Cap, N) -> count_up_to(T, Cap, N + 1).
 
+-doc false.
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, #state{listen_socket = LSocket, proto_opts = ProtoOpts}) ->
     erase_routes(ProtoOpts),
