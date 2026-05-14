@@ -1,44 +1,44 @@
 -module(roadrunner_http2_stream_worker).
--moduledoc """
-Per-stream worker process for HTTP/2 dispatch (Phase H8b).
+-moduledoc false.
 
-Spawned by `roadrunner_conn_loop_http2` once a request stream
-finishes receiving (HEADERS + body + END_STREAM). The worker:
-
-1. Resolves the route + middleware stack.
-2. Calls the handler.
-3. Translates the response shape (`{Status, Headers, Body}` or
-   `{stream, _, _, Fun}`) into messages back to the conn process,
-   which is the single owner of HPACK encoder state and frame I/O.
-
-Worker → conn protocol (synchronous round-trip per write so the
-worker doesn't outpace flow control or the wire):
-
-```
-Worker → Conn: {h2_send_headers, Worker, Ref, StreamId, Status, Headers, EndStream}
-Conn   → Worker: {h2_send_ack, Ref}                       %% frame written
-
-Worker → Conn: {h2_send_data, Worker, Ref, StreamId, Data, EndStream}
-Conn   → Worker: {h2_send_ack, Ref}                       %% frame written
-                  %% (delayed if the conn or stream send window was
-                  %% closed — drained on the next WINDOW_UPDATE)
-
-Worker → Conn: {h2_send_trailers, Worker, Ref, StreamId, Trailers}
-Conn   → Worker: {h2_send_ack, Ref}
-
-Worker → Conn: {h2_worker_done, StreamId}                 %% normal exit
-```
-
-If the peer cancels the stream (`RST_STREAM` or worker-level error
-on the conn side), the conn sends `{h2_stream_reset, StreamId}` —
-the worker observes this on its next sync round and exits without
-emitting further frames.
-
-Crash isolation: workers are spawn_monitored (NOT linked) so a
-handler crash resets only the affected stream — the conn
-observes the `'DOWN'` and emits
-`RST_STREAM(INTERNAL_ERROR)`, leaving in-flight peers untouched.
-""".
+%% Per-stream worker process for HTTP/2 dispatch (Phase H8b).
+%%
+%% Spawned by `roadrunner_conn_loop_http2` once a request stream
+%% finishes receiving (HEADERS + body + END_STREAM). The worker:
+%%
+%% 1. Resolves the route + middleware stack.
+%% 2. Calls the handler.
+%% 3. Translates the response shape (`{Status, Headers, Body}` or
+%%    `{stream, _, _, Fun}`) into messages back to the conn process,
+%%    which is the single owner of HPACK encoder state and frame I/O.
+%%
+%% Worker → conn protocol (synchronous round-trip per write so the
+%% worker doesn't outpace flow control or the wire):
+%%
+%% ```
+%% Worker → Conn: {h2_send_headers, Worker, Ref, StreamId, Status, Headers, EndStream}
+%% Conn   → Worker: {h2_send_ack, Ref}                       %% frame written
+%%
+%% Worker → Conn: {h2_send_data, Worker, Ref, StreamId, Data, EndStream}
+%% Conn   → Worker: {h2_send_ack, Ref}                       %% frame written
+%%                   %% (delayed if the conn or stream send window was
+%%                   %% closed — drained on the next WINDOW_UPDATE)
+%%
+%% Worker → Conn: {h2_send_trailers, Worker, Ref, StreamId, Trailers}
+%% Conn   → Worker: {h2_send_ack, Ref}
+%%
+%% Worker → Conn: {h2_worker_done, StreamId}                 %% normal exit
+%% ```
+%%
+%% If the peer cancels the stream (`RST_STREAM` or worker-level error
+%% on the conn side), the conn sends `{h2_stream_reset, StreamId}` —
+%% the worker observes this on its next sync round and exits without
+%% emitting further frames.
+%%
+%% Crash isolation: workers are spawn_monitored (NOT linked) so a
+%% handler crash resets only the affected stream — the conn
+%% observes the `'DOWN'` and emits
+%% `RST_STREAM(INTERNAL_ERROR)`, leaving in-flight peers untouched.
 
 -export([start/4]).
 -export([init/4]).

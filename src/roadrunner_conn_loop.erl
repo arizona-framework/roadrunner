@@ -1,51 +1,51 @@
 -module(roadrunner_conn_loop).
--moduledoc """
-Tail-recursive per-connection process for HTTP/1.1.
+-moduledoc false.
 
-The lifecycle (`awaiting_shoot → reading_request → reading_body →
-dispatching → finishing → loop or close`) is expressed as direct
-function calls between phase functions. No `gen_statem` dispatch,
-no per-request timer arms in the steady state.
-
-## Two recv paths
-
-Default is **passive recv** — `gen_tcp:recv(Socket, 0, ChunkTimeout)`
-in a loop with mailbox drain checks at `?DRAIN_CHECK_INTERVAL_MS`
-(100 ms) granularity. Bypasses `gen_tcp_socket`'s gen_statem dispatch
-on every recv (saves ~7 % CPU on the hot path: `gen:do_call/4`,
-`recv_data_deliver/4`, `gen_statem:loop/3`, `nif_getopt/3`).
-
-When the listener sets `hibernate_after => Ms > 0`, the recv path
-flips to **active-mode** (`{active, once}` + receive). The receive's
-`after Ms` clause has a window to call `erlang:hibernate/3` between
-keep-alive iterations so the conn's heap GCs and shrinks — only
-`receive` supports hibernation; passive recv blocks the process
-inside a NIF.
-
-## Phase introspection vs hot-path cost
-
-The label set on the conn process via `proc_lib:set_label/1` is
-written **at most twice per conn**: once at `init_loop` time
-(`{roadrunner_conn, awaiting_shoot, ListenerName}`) and once at the
-`shoot` handoff (`refine_conn_label/2` rewrites it to include the
-peer). The phases AFTER `awaiting_shoot` (read_request, read_body,
-dispatching, finishing) run in microseconds on the happy path — too
-fast for an operator's `observer` snapshot to catch a specific phase
-anyway. Per-phase label updates measured ~1.2 % CPU on hello (4
-writes/req, each touching the process dictionary) and contributed
-to run-to-run variance. Stuck conns still surface via the conn-entry
-label and the `reading_request` idle window (where hibernation
-parks the process).
-
-## Stability features preserved
-
-Drain via `pg`-broadcast, slot tracking via atomics, full telemetry
-pairing (`[roadrunner, request, start | stop | exception]` with
-shared `StartMono`), HEAD body suppression, `Expect: 100-continue`,
-anti-Slowloris rate-check on the request-read phase, all five
-response shapes (buffered, `{stream, ...}`, `{loop, ...}`,
-`{sendfile, ...}`, `{websocket, ...}`).
-""".
+%% Tail-recursive per-connection process for HTTP/1.1.
+%%
+%% The lifecycle (`awaiting_shoot → reading_request → reading_body →
+%% dispatching → finishing → loop or close`) is expressed as direct
+%% function calls between phase functions. No `gen_statem` dispatch,
+%% no per-request timer arms in the steady state.
+%%
+%% ## Two recv paths
+%%
+%% Default is **passive recv** — `gen_tcp:recv(Socket, 0, ChunkTimeout)`
+%% in a loop with mailbox drain checks at `?DRAIN_CHECK_INTERVAL_MS`
+%% (100 ms) granularity. Bypasses `gen_tcp_socket`'s gen_statem dispatch
+%% on every recv (saves ~7 % CPU on the hot path: `gen:do_call/4`,
+%% `recv_data_deliver/4`, `gen_statem:loop/3`, `nif_getopt/3`).
+%%
+%% When the listener sets `hibernate_after => Ms > 0`, the recv path
+%% flips to **active-mode** (`{active, once}` + receive). The receive's
+%% `after Ms` clause has a window to call `erlang:hibernate/3` between
+%% keep-alive iterations so the conn's heap GCs and shrinks — only
+%% `receive` supports hibernation; passive recv blocks the process
+%% inside a NIF.
+%%
+%% ## Phase introspection vs hot-path cost
+%%
+%% The label set on the conn process via `proc_lib:set_label/1` is
+%% written **at most twice per conn**: once at `init_loop` time
+%% (`{roadrunner_conn, awaiting_shoot, ListenerName}`) and once at the
+%% `shoot` handoff (`refine_conn_label/2` rewrites it to include the
+%% peer). The phases AFTER `awaiting_shoot` (read_request, read_body,
+%% dispatching, finishing) run in microseconds on the happy path — too
+%% fast for an operator's `observer` snapshot to catch a specific phase
+%% anyway. Per-phase label updates measured ~1.2 % CPU on hello (4
+%% writes/req, each touching the process dictionary) and contributed
+%% to run-to-run variance. Stuck conns still surface via the conn-entry
+%% label and the `reading_request` idle window (where hibernation
+%% parks the process).
+%%
+%% ## Stability features preserved
+%%
+%% Drain via `pg`-broadcast, slot tracking via atomics, full telemetry
+%% pairing (`[roadrunner, request, start | stop | exception]` with
+%% shared `StartMono`), HEAD body suppression, `Expect: 100-continue`,
+%% anti-Slowloris rate-check on the request-read phase, all five
+%% response shapes (buffered, `{stream, ...}`, `{loop, ...}`,
+%% `{sendfile, ...}`, `{websocket, ...}`).
 
 -export([start/2]).
 

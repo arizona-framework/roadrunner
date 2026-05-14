@@ -1,24 +1,24 @@
 -module(roadrunner_stream_response).
--moduledoc """
-Per-connection `{stream, ...}` response — chunked Transfer-Encoding.
+-moduledoc false.
 
-Called by `roadrunner_conn:dispatch_response/4` after a handler returns
-`{stream, Status, Headers, Fun}`. Writes the status line + chunked
-headers, then calls the user's `Fun(Send)` with a `Send/2` callback
-that frames each emission as one chunk on the wire.
-
-`Send(Data, FinFlag)` — `FinFlag` is one of:
-- `nofin` — write `Data` as one chunk; expect more.
-- `fin` — write `Data` as one chunk, then the size-0 terminator.
-- `{fin, Trailers}` — same as `fin` but the terminator is followed
-  by serialized trailer headers (RFC 9112 §7.1.2).
-
-Empty data is special-cased: `Send(<<>>, nofin)` is a no-op (a
-zero-length chunk encodes as `0\r\n\r\n`, the chunked terminator,
-which would prematurely end the response).
-
-Pure functions, no process spawn — runs in the conn process.
-""".
+%% Per-connection `{stream, ...}` response — chunked Transfer-Encoding.
+%%
+%% Called by `roadrunner_conn:dispatch_response/4` after a handler returns
+%% `{stream, Status, Headers, Fun}`. Writes the status line + chunked
+%% headers, then calls the user's `Fun(Send)` with a `Send/2` callback
+%% that frames each emission as one chunk on the wire.
+%%
+%% `Send(Data, FinFlag)` — `FinFlag` is one of:
+%% - `nofin` — write `Data` as one chunk; expect more.
+%% - `fin` — write `Data` as one chunk, then the size-0 terminator.
+%% - `{fin, Trailers}` — same as `fin` but the terminator is followed
+%%   by serialized trailer headers (RFC 9112 §7.1.2).
+%%
+%% Empty data is special-cased: `Send(<<>>, nofin)` is a no-op (a
+%% zero-length chunk encodes as `0\r\n\r\n`, the chunked terminator,
+%% which would prematurely end the response).
+%%
+%% Pure functions, no process spawn — runs in the conn process.
 
 -export([run/4]).
 

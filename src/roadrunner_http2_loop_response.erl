@@ -1,21 +1,21 @@
 -module(roadrunner_http2_loop_response).
--moduledoc """
-HTTP/2 `{loop, _}` response: message-driven streaming over h2 DATA frames.
+-moduledoc false.
 
-Mirrors `roadrunner_loop_response` (the h1 path) but runs in the
-per-stream worker process and emits DATA frames via the conn's
-`{h2_send_data, ...}` message protocol. Same mailbox contract as
-h1: a handler's `self() ! Msg` and `register/2` calls from
-`handle/1` work because the worker IS the dispatch process. OTP
-shapes (`{system, _, _}`, `{'$gen_call', _, _}`, `{'$gen_cast', _}`)
-are silently dropped via dedicated receive clauses; we're a plain
-spawn, not a `gen_*`, so `gen_server:call/2,3` against the worker
-will time out instead of surfacing in `handle_info/3`.
-
-On `{stop, _NewState}` the worker emits an empty DATA frame with
-END_STREAM and returns; the conn cleans up the stream slot via the
-worker's `'DOWN'` signal.
-""".
+%% HTTP/2 `{loop, _}` response: message-driven streaming over h2 DATA frames.
+%%
+%% Mirrors `roadrunner_loop_response` (the h1 path) but runs in the
+%% per-stream worker process and emits DATA frames via the conn's
+%% `{h2_send_data, ...}` message protocol. Same mailbox contract as
+%% h1: a handler's `self() ! Msg` and `register/2` calls from
+%% `handle/1` work because the worker IS the dispatch process. OTP
+%% shapes (`{system, _, _}`, `{'$gen_call', _, _}`, `{'$gen_cast', _}`)
+%% are silently dropped via dedicated receive clauses; we're a plain
+%% spawn, not a `gen_*`, so `gen_server:call/2,3` against the worker
+%% will time out instead of surfacing in `handle_info/3`.
+%%
+%% On `{stop, _NewState}` the worker emits an empty DATA frame with
+%% END_STREAM and returns; the conn cleans up the stream slot via the
+%% worker's `'DOWN'` signal.
 
 -export([run/5]).
 

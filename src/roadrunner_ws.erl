@@ -1,11 +1,11 @@
 -module(roadrunner_ws).
--moduledoc """
-WebSocket support — RFC 6455.
+-moduledoc false.
 
-This first slice provides the **handshake** helpers only. Frame
-parsing, masking, and the conn-level protocol switch arrive in later
-features.
-""".
+%% WebSocket support — RFC 6455.
+%%
+%% This first slice provides the **handshake** helpers only. Frame
+%% parsing, masking, and the conn-level protocol switch arrive in later
+%% features.
 
 -on_load(init_patterns/0).
 

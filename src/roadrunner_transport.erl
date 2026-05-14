@@ -1,43 +1,43 @@
 -module(roadrunner_transport).
--moduledoc """
-Tagged-socket transport abstraction over `gen_tcp`, `ssl`, and a
-`fake` test backend.
+-moduledoc false.
 
-A socket is `{Module, RawSocket}` so callers don't have to know whether
-they're talking to plain TCP, TLS, or a test fixture.
-
-The `{fake, Pid}` variant is a per-connection test helper: every
-`send/2`, `recv/3`, `setopts/2`, and `close/1` call dispatches to
-`Pid` as an Erlang message, letting tests drive a `roadrunner_conn`
-byte-by-byte without spinning up a listener. See
-`roadrunner_transport_tests` for the message protocol.
-
-## Active-mode reads
-
-`setopts/2` + `messages/1` switch the underlying socket to active
-mode (`[{active, once}]` / `[{active, N}]`) so the controlling
-process receives data as `info` events instead of blocking in
-`recv/3`. This is what lets `erlang:hibernate/3` fire from a
-`receive ... after` clause — passive recv holds the process inside
-a NIF indefinitely, so hibernation has no window to run.
-`roadrunner_conn_loop`'s `recv_with_hibernate/3` and
-`roadrunner_ws_session` (gen_statem with `{hibernate_after, _}`)
-both rely on active mode for this reason. See `messages/1` for the
-per-transport tag triples.
-
-## TLS defaults
-
-`default_tls_opts/0` returns a hardened option list that
-`roadrunner_listener` merges underneath user-supplied `tls` opts (user
-values win for any key they specify). The defaults are aligned with
-the upstream OTP `ssl_hardening.md` guide: TLS 1.2/1.3 only,
-`honor_cipher_order`, `client_renegotiation` off, AEAD-only
-ECDHE-or-1.3 cipher list filtered through `ssl:filter_cipher_suites/2`,
-and the OTP-default signature algorithms / supported groups
-re-asserted so we don't drift if upstream lowers standards. OCSP
-stapling is intentionally absent — `ssl` does not support
-server-side stapling at the time of writing.
-""".
+%% Tagged-socket transport abstraction over `gen_tcp`, `ssl`, and a
+%% `fake` test backend.
+%%
+%% A socket is `{Module, RawSocket}` so callers don't have to know whether
+%% they're talking to plain TCP, TLS, or a test fixture.
+%%
+%% The `{fake, Pid}` variant is a per-connection test helper: every
+%% `send/2`, `recv/3`, `setopts/2`, and `close/1` call dispatches to
+%% `Pid` as an Erlang message, letting tests drive a `roadrunner_conn`
+%% byte-by-byte without spinning up a listener. See
+%% `roadrunner_transport_tests` for the message protocol.
+%%
+%% ## Active-mode reads
+%%
+%% `setopts/2` + `messages/1` switch the underlying socket to active
+%% mode (`[{active, once}]` / `[{active, N}]`) so the controlling
+%% process receives data as `info` events instead of blocking in
+%% `recv/3`. This is what lets `erlang:hibernate/3` fire from a
+%% `receive ... after` clause — passive recv holds the process inside
+%% a NIF indefinitely, so hibernation has no window to run.
+%% `roadrunner_conn_loop`'s `recv_with_hibernate/3` and
+%% `roadrunner_ws_session` (gen_statem with `{hibernate_after, _}`)
+%% both rely on active mode for this reason. See `messages/1` for the
+%% per-transport tag triples.
+%%
+%% ## TLS defaults
+%%
+%% `default_tls_opts/0` returns a hardened option list that
+%% `roadrunner_listener` merges underneath user-supplied `tls` opts (user
+%% values win for any key they specify). The defaults are aligned with
+%% the upstream OTP `ssl_hardening.md` guide: TLS 1.2/1.3 only,
+%% `honor_cipher_order`, `client_renegotiation` off, AEAD-only
+%% ECDHE-or-1.3 cipher list filtered through `ssl:filter_cipher_suites/2`,
+%% and the OTP-default signature algorithms / supported groups
+%% re-asserted so we don't drift if upstream lowers standards. OCSP
+%% stapling is intentionally absent — `ssl` does not support
+%% server-side stapling at the time of writing.
 
 -export([
     listen/2,

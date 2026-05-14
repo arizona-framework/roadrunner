@@ -1,33 +1,33 @@
 -module(roadrunner_http2_settings).
--moduledoc """
-HTTP/2 SETTINGS state and frame helpers (RFC 9113 §6.5).
+-moduledoc false.
 
-A SETTINGS frame carries zero or more 6-byte parameter records:
-2-byte identifier + 4-byte value. The frame applies to the connection
-as a whole (stream id MUST be 0). The receiver records the new
-values and replies with a SETTINGS frame whose ACK flag is set
-(payload empty).
-
-This module is Phase H2 of the HTTP/2 plan — enough to negotiate the
-preamble and answer ACK requirements. Validation of obvious value
-ranges (negative `INITIAL_WINDOW_SIZE`, zero `MAX_FRAME_SIZE`, etc.)
-arrives with the full frame codec in Phase H3 and the stream state
-machine in Phase H5.
-
-The known parameter identifiers per RFC 9113 §6.5.2:
-
-| id | name                             | default     |
-|----|----------------------------------|-------------|
-| 1  | `SETTINGS_HEADER_TABLE_SIZE`     | 4096        |
-| 2  | `SETTINGS_ENABLE_PUSH`           | 1           |
-| 3  | `SETTINGS_MAX_CONCURRENT_STREAMS`| (no limit)  |
-| 4  | `SETTINGS_INITIAL_WINDOW_SIZE`   | 65535       |
-| 5  | `SETTINGS_MAX_FRAME_SIZE`        | 16384       |
-| 6  | `SETTINGS_MAX_HEADER_LIST_SIZE`  | (no limit)  |
-
-Unknown identifiers MUST be ignored (RFC 9113 §6.5.2 last paragraph)
-— preserves forward compatibility with future SETTINGS extensions.
-""".
+%% HTTP/2 SETTINGS state and frame helpers (RFC 9113 §6.5).
+%%
+%% A SETTINGS frame carries zero or more 6-byte parameter records:
+%% 2-byte identifier + 4-byte value. The frame applies to the connection
+%% as a whole (stream id MUST be 0). The receiver records the new
+%% values and replies with a SETTINGS frame whose ACK flag is set
+%% (payload empty).
+%%
+%% This module is Phase H2 of the HTTP/2 plan — enough to negotiate the
+%% preamble and answer ACK requirements. Validation of obvious value
+%% ranges (negative `INITIAL_WINDOW_SIZE`, zero `MAX_FRAME_SIZE`, etc.)
+%% arrives with the full frame codec in Phase H3 and the stream state
+%% machine in Phase H5.
+%%
+%% The known parameter identifiers per RFC 9113 §6.5.2:
+%%
+%% | id | name                             | default     |
+%% |----|----------------------------------|-------------|
+%% | 1  | `SETTINGS_HEADER_TABLE_SIZE`     | 4096        |
+%% | 2  | `SETTINGS_ENABLE_PUSH`           | 1           |
+%% | 3  | `SETTINGS_MAX_CONCURRENT_STREAMS`| (no limit)  |
+%% | 4  | `SETTINGS_INITIAL_WINDOW_SIZE`   | 65535       |
+%% | 5  | `SETTINGS_MAX_FRAME_SIZE`        | 16384       |
+%% | 6  | `SETTINGS_MAX_HEADER_LIST_SIZE`  | (no limit)  |
+%%
+%% Unknown identifiers MUST be ignored (RFC 9113 §6.5.2 last paragraph)
+%% — preserves forward compatibility with future SETTINGS extensions.
 
 -export([
     new/0,

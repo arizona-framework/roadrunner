@@ -1,13 +1,13 @@
 -module(roadrunner_bin).
--moduledoc """
-Binary-level helpers — operations on `binary()` that several
-modules need but don't belong to any specific protocol module
-(`roadrunner_http1`, `roadrunner_ws`, `roadrunner_uri`, etc.).
+-moduledoc false.
 
-Mirrors OTP's stdlib `binary` module in spirit: things that work
-on bytes, with no protocol semantics. Don't put non-binary helpers
-here — give them their own module.
-""".
+%% Binary-level helpers — operations on `binary()` that several
+%% modules need but don't belong to any specific protocol module
+%% (`roadrunner_http1`, `roadrunner_ws`, `roadrunner_uri`, etc.).
+%%
+%% Mirrors OTP's stdlib `binary` module in spirit: things that work
+%% on bytes, with no protocol semantics. Don't put non-binary helpers
+%% here — give them their own module.
 
 -export([ascii_lowercase/1, trim_ows/1, trim_trailing_ows/1]).
 

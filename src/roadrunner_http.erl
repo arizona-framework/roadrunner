@@ -1,30 +1,30 @@
 -module(roadrunner_http).
--moduledoc """
-Protocol-version-agnostic HTTP semantics shared by HTTP/1.1
-(`roadrunner_http1`) and any future HTTP/2 (`roadrunner_http2_*`)
-modules.
+-moduledoc false.
 
-What lives here is RFC 9110 semantics — types and helpers whose
-meaning doesn't depend on wire framing — not RFC 9112 syntax.
-The HTTP/1.1 wire codec (request-line / header / chunked
-parsers, status-line + CRLF response encoder) stays in
-`roadrunner_http1`. HTTP/2 frame codec + HPACK live in their
-own modules.
-
-Items here:
-
-- Header list shape: `[{binary(), binary()}]`.
-- HTTP status codes: `100..599` and the redirect subset.
-- Protocol version tuple: `{Major, Minor}`.
-- IMF-fixdate formatter (`http_date_now/0` for the current
-  time, `format_http_date/1` for an arbitrary posix timestamp)
-  for the `Date` response header per RFC 9110 §5.6.7 and the
-  `Last-Modified` response header used by the static handler.
-
-`roadrunner_http1` re-exports these as type aliases so existing
-callers using `roadrunner_http1:request()` / `:headers()` etc.
-keep compiling unchanged.
-""".
+%% Protocol-version-agnostic HTTP semantics shared by HTTP/1.1
+%% (`roadrunner_http1`) and any future HTTP/2 (`roadrunner_http2_*`)
+%% modules.
+%%
+%% What lives here is RFC 9110 semantics — types and helpers whose
+%% meaning doesn't depend on wire framing — not RFC 9112 syntax.
+%% The HTTP/1.1 wire codec (request-line / header / chunked
+%% parsers, status-line + CRLF response encoder) stays in
+%% `roadrunner_http1`. HTTP/2 frame codec + HPACK live in their
+%% own modules.
+%%
+%% Items here:
+%%
+%% - Header list shape: `[{binary(), binary()}]`.
+%% - HTTP status codes: `100..599` and the redirect subset.
+%% - Protocol version tuple: `{Major, Minor}`.
+%% - IMF-fixdate formatter (`http_date_now/0` for the current
+%%   time, `format_http_date/1` for an arbitrary posix timestamp)
+%%   for the `Date` response header per RFC 9110 §5.6.7 and the
+%%   `Last-Modified` response header used by the static handler.
+%%
+%% `roadrunner_http1` re-exports these as type aliases so existing
+%% callers using `roadrunner_http1:request()` / `:headers()` etc.
+%% keep compiling unchanged.
 
 -on_load(init_cache/0).
 

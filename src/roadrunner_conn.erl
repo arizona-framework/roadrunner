@@ -1,31 +1,31 @@
 -module(roadrunner_conn).
--moduledoc """
-Public connection-process API and pure helpers.
+-moduledoc false.
 
-`start/2` spawns the per-connection process — `roadrunner_conn_loop`,
-a tail-recursive loop with phase tracking via `proc_lib:set_label/1`
-for observer / recon visibility.
-
-The other public functions are pure-ish helpers; many are also called
-directly from `roadrunner_req` (manual body buffering) and from
-`roadrunner_conn_tests.erl`'s closure-driven unit tests.
-
-Per-connection behavior — keep-alive (capped by
-`max_keep_alive_requests`, idle-bound by `keep_alive_timeout`),
-`Expect: 100-continue`, HEAD body suppression, anti-Slowloris rate
-check (`min_bytes_per_second`), the five handler return shapes
-(`{Status, Headers, Body}`, `{stream, ...}`, `{loop, ...}`,
-`{sendfile, ...}`, `{websocket, ...}`) — lives in `roadrunner_conn_loop`
-and the response-shape-specific modules (`roadrunner_stream_response`,
-`roadrunner_loop_response`, `roadrunner_ws_session`).
-
-The 4xx/5xx error responses (400 on parse failure, 408 on
-first-request silence, 413 on oversized bodies, 500 on handler
-crashes) are emitted via the `send_*/1` helpers exported here. Idle
-keep-alive timeouts and slow-client rate violations close the
-connection silently — no response to a peer that wasn't going to
-read it anyway.
-""".
+%% Public connection-process API and pure helpers.
+%%
+%% `start/2` spawns the per-connection process — `roadrunner_conn_loop`,
+%% a tail-recursive loop with phase tracking via `proc_lib:set_label/1`
+%% for observer / recon visibility.
+%%
+%% The other public functions are pure-ish helpers; many are also called
+%% directly from `roadrunner_req` (manual body buffering) and from
+%% `roadrunner_conn_tests.erl`'s closure-driven unit tests.
+%%
+%% Per-connection behavior — keep-alive (capped by
+%% `max_keep_alive_requests`, idle-bound by `keep_alive_timeout`),
+%% `Expect: 100-continue`, HEAD body suppression, anti-Slowloris rate
+%% check (`min_bytes_per_second`), the five handler return shapes
+%% (`{Status, Headers, Body}`, `{stream, ...}`, `{loop, ...}`,
+%% `{sendfile, ...}`, `{websocket, ...}`) — lives in `roadrunner_conn_loop`
+%% and the response-shape-specific modules (`roadrunner_stream_response`,
+%% `roadrunner_loop_response`, `roadrunner_ws_session`).
+%%
+%% The 4xx/5xx error responses (400 on parse failure, 408 on
+%% first-request silence, 413 on oversized bodies, 500 on handler
+%% crashes) are emitted via the `send_*/1` helpers exported here. Idle
+%% keep-alive timeouts and slow-client rate violations close the
+%% connection silently — no response to a peer that wasn't going to
+%% read it anyway.
 
 -export([
     start/2,

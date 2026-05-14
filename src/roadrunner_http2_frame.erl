@@ -1,67 +1,67 @@
 -module(roadrunner_http2_frame).
--moduledoc """
-HTTP/2 (RFC 9113 §4 + §6) frame codec — pure binary parsers and
-encoders for all 10 frame types.
+-moduledoc false.
 
-This module is purely about wire-format syntax: it parses bytes into
-typed terms and encodes typed terms back to bytes. It does **not**
-enforce stream-state validity (RFC 9113 §5.1), connection-level
-validity (e.g. SETTINGS arriving before the preface), or flow-control
-arithmetic (§5.2). Those constraints are enforced by callers in
-later phases.
-
-## Frame types
-
-| Type | Hex | Module spec |
-|------|-----|-------------|
-| DATA          | 0x0 | RFC 9113 §6.1 |
-| HEADERS       | 0x1 | RFC 9113 §6.2 |
-| PRIORITY      | 0x2 | RFC 9113 §6.3 (deprecated, MUST accept) |
-| RST_STREAM    | 0x3 | RFC 9113 §6.4 |
-| SETTINGS      | 0x4 | RFC 9113 §6.5 |
-| PUSH_PROMISE  | 0x5 | RFC 9113 §6.6 |
-| PING          | 0x6 | RFC 9113 §6.7 |
-| GOAWAY        | 0x7 | RFC 9113 §6.8 |
-| WINDOW_UPDATE | 0x8 | RFC 9113 §6.9 |
-| CONTINUATION  | 0x9 | RFC 9113 §6.10 |
-
-## API
-
-`parse(Bin, MaxFrameSize)` is incremental: it returns
-`{ok, frame(), Rest}` when a complete frame has been decoded,
-`{more, Need}` when more bytes are required, or `{error, Reason}`
-on syntactic failure. `encode(frame())` returns iodata.
-
-Frame flags are kept as the raw 8-bit byte in the parsed shape —
-higher layers interpret them per-type. Reserved bits in flag bytes
-MUST be ignored on receive (§4.1) and MUST be sent as 0; the
-encoder zeros any unknown bits.
-
-## Padding
-
-DATA, HEADERS, and PUSH_PROMISE frames support optional padding
-(PADDED flag, 0x8 — RFC 9113 §6.1 / §6.2 / §6.6). When present the
-first byte of the payload is the pad length, followed by the
-fragment, followed by `pad-length` bytes of padding. Pad length
-larger than the available frame payload is `PROTOCOL_ERROR`.
-
-## Stream id 0 / non-zero rules
-
-Per RFC 9113 §6, certain frame types MUST be on stream 0
-(SETTINGS, PING, GOAWAY) and others MUST be on a non-zero stream
-(DATA, HEADERS, PRIORITY, RST_STREAM, PUSH_PROMISE,
-WINDOW_UPDATE-on-stream, CONTINUATION). The parser enforces this
-at parse time with a `stream_id_violation` error so callers don't
-have to re-validate.
-
-## MAX_FRAME_SIZE
-
-Per RFC 9113 §6.5.2 SETTINGS_MAX_FRAME_SIZE governs the largest
-frame payload the receiver will accept. The codec takes the limit
-as an explicit argument so it can grow as the client advertises a
-higher value. Frames whose `length` exceeds the limit fail with
-`frame_size_error`.
-""".
+%% HTTP/2 (RFC 9113 §4 + §6) frame codec — pure binary parsers and
+%% encoders for all 10 frame types.
+%%
+%% This module is purely about wire-format syntax: it parses bytes into
+%% typed terms and encodes typed terms back to bytes. It does **not**
+%% enforce stream-state validity (RFC 9113 §5.1), connection-level
+%% validity (e.g. SETTINGS arriving before the preface), or flow-control
+%% arithmetic (§5.2). Those constraints are enforced by callers in
+%% later phases.
+%%
+%% ## Frame types
+%%
+%% | Type | Hex | Module spec |
+%% |------|-----|-------------|
+%% | DATA          | 0x0 | RFC 9113 §6.1 |
+%% | HEADERS       | 0x1 | RFC 9113 §6.2 |
+%% | PRIORITY      | 0x2 | RFC 9113 §6.3 (deprecated, MUST accept) |
+%% | RST_STREAM    | 0x3 | RFC 9113 §6.4 |
+%% | SETTINGS      | 0x4 | RFC 9113 §6.5 |
+%% | PUSH_PROMISE  | 0x5 | RFC 9113 §6.6 |
+%% | PING          | 0x6 | RFC 9113 §6.7 |
+%% | GOAWAY        | 0x7 | RFC 9113 §6.8 |
+%% | WINDOW_UPDATE | 0x8 | RFC 9113 §6.9 |
+%% | CONTINUATION  | 0x9 | RFC 9113 §6.10 |
+%%
+%% ## API
+%%
+%% `parse(Bin, MaxFrameSize)` is incremental: it returns
+%% `{ok, frame(), Rest}` when a complete frame has been decoded,
+%% `{more, Need}` when more bytes are required, or `{error, Reason}`
+%% on syntactic failure. `encode(frame())` returns iodata.
+%%
+%% Frame flags are kept as the raw 8-bit byte in the parsed shape —
+%% higher layers interpret them per-type. Reserved bits in flag bytes
+%% MUST be ignored on receive (§4.1) and MUST be sent as 0; the
+%% encoder zeros any unknown bits.
+%%
+%% ## Padding
+%%
+%% DATA, HEADERS, and PUSH_PROMISE frames support optional padding
+%% (PADDED flag, 0x8 — RFC 9113 §6.1 / §6.2 / §6.6). When present the
+%% first byte of the payload is the pad length, followed by the
+%% fragment, followed by `pad-length` bytes of padding. Pad length
+%% larger than the available frame payload is `PROTOCOL_ERROR`.
+%%
+%% ## Stream id 0 / non-zero rules
+%%
+%% Per RFC 9113 §6, certain frame types MUST be on stream 0
+%% (SETTINGS, PING, GOAWAY) and others MUST be on a non-zero stream
+%% (DATA, HEADERS, PRIORITY, RST_STREAM, PUSH_PROMISE,
+%% WINDOW_UPDATE-on-stream, CONTINUATION). The parser enforces this
+%% at parse time with a `stream_id_violation` error so callers don't
+%% have to re-validate.
+%%
+%% ## MAX_FRAME_SIZE
+%%
+%% Per RFC 9113 §6.5.2 SETTINGS_MAX_FRAME_SIZE governs the largest
+%% frame payload the receiver will accept. The codec takes the limit
+%% as an explicit argument so it can grow as the client advertises a
+%% higher value. Frames whose `length` exceeds the limit fail with
+%% `frame_size_error`.
 
 -export([parse/2, encode/1]).
 

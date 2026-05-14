@@ -1,63 +1,63 @@
 -module(roadrunner_compress).
--moduledoc """
-Response-compression middleware. Supports `gzip` and `deflate`
-Content-Encoding per RFC 9110 §8.4.1.
+-moduledoc false.
 
-Add to a listener's `middlewares` opt (or a route's `route_opts.middlewares`)
-to compress eligible response bodies based on the request's `Accept-Encoding`
-header. Replaces cowboy's deprecated `cowboy_compress_h` stream handler
-for arizona's migration.
-
-```erlang
-roadrunner_listener:start_link(my_app, #{
-    port => 8080,
-    routes => Routes,
-    middlewares => [roadrunner_compress]
-}).
-```
-
-A response is compressed when **all** of these are true:
-
-- The client's `Accept-Encoding` header includes `gzip` or `deflate`
-  (substring match per token; qvalue ranking is a follow-up).
-- The handler's response does not already carry a `Content-Encoding`
-  header (i.e. it isn't already compressed).
-- The body is at least `?THRESHOLD` bytes (default 860 — same as
-  cowboy's default; below this the compression overhead outweighs
-  the bandwidth saving).
-
-When compressed:
-
-- `Content-Encoding: gzip` (or `deflate`) is added.
-- `Content-Length` is rewritten to the compressed size.
-- `Vary: Accept-Encoding` is added.
-
-When not compressed (body too small, client doesn't accept any
-supported encoding, or response already encoded), the response
-passes through unchanged **except** that `Vary: Accept-Encoding` is
-added if the client indicated a supported encoding — caches that
-key on this header will then handle the next variant correctly.
-
-## Encoding selection
-
-When the client accepts both gzip and deflate, **gzip wins**. gzip has
-a more deterministic on-the-wire format (RFC 1952) and broader
-client tolerance than `Content-Encoding: deflate` — historically
-some servers shipped raw deflate (RFC 1951) instead of the
-zlib-wrapped form RFC 9110 §8.4.1.3 mandates (RFC 1950), and a
-handful of older clients still ship workarounds for both shapes.
-gzip avoids the question.
-
-## What this does NOT cover
-
-- **`{loop, ...}` and `{websocket, ...}` returns** — passed through;
-  these aren't HTTP body responses.
-- **Brotli (`br`) Content-Encoding** — would require a NIF dep
-  (`brotli`); deferred until there's user pull.
-- **Qvalue-aware Accept-Encoding parsing** — current implementation
-  is substring-match per token; treats `gzip;q=0` as "accepts gzip"
-  (a real conformance bug). Tracked separately.
-""".
+%% Response-compression middleware. Supports `gzip` and `deflate`
+%% Content-Encoding per RFC 9110 §8.4.1.
+%%
+%% Add to a listener's `middlewares` opt (or a route's `route_opts.middlewares`)
+%% to compress eligible response bodies based on the request's `Accept-Encoding`
+%% header. Replaces cowboy's deprecated `cowboy_compress_h` stream handler
+%% for arizona's migration.
+%%
+%% ```erlang
+%% roadrunner_listener:start_link(my_app, #{
+%%     port => 8080,
+%%     routes => Routes,
+%%     middlewares => [roadrunner_compress]
+%% }).
+%% ```
+%%
+%% A response is compressed when **all** of these are true:
+%%
+%% - The client's `Accept-Encoding` header includes `gzip` or `deflate`
+%%   (substring match per token; qvalue ranking is a follow-up).
+%% - The handler's response does not already carry a `Content-Encoding`
+%%   header (i.e. it isn't already compressed).
+%% - The body is at least `?THRESHOLD` bytes (default 860 — same as
+%%   cowboy's default; below this the compression overhead outweighs
+%%   the bandwidth saving).
+%%
+%% When compressed:
+%%
+%% - `Content-Encoding: gzip` (or `deflate`) is added.
+%% - `Content-Length` is rewritten to the compressed size.
+%% - `Vary: Accept-Encoding` is added.
+%%
+%% When not compressed (body too small, client doesn't accept any
+%% supported encoding, or response already encoded), the response
+%% passes through unchanged **except** that `Vary: Accept-Encoding` is
+%% added if the client indicated a supported encoding — caches that
+%% key on this header will then handle the next variant correctly.
+%%
+%% ## Encoding selection
+%%
+%% When the client accepts both gzip and deflate, **gzip wins**. gzip has
+%% a more deterministic on-the-wire format (RFC 1952) and broader
+%% client tolerance than `Content-Encoding: deflate` — historically
+%% some servers shipped raw deflate (RFC 1951) instead of the
+%% zlib-wrapped form RFC 9110 §8.4.1.3 mandates (RFC 1950), and a
+%% handful of older clients still ship workarounds for both shapes.
+%% gzip avoids the question.
+%%
+%% ## What this does NOT cover
+%%
+%% - **`{loop, ...}` and `{websocket, ...}` returns** — passed through;
+%%   these aren't HTTP body responses.
+%% - **Brotli (`br`) Content-Encoding** — would require a NIF dep
+%%   (`brotli`); deferred until there's user pull.
+%% - **Qvalue-aware Accept-Encoding parsing** — current implementation
+%%   is substring-match per token; treats `gzip;q=0` as "accepts gzip"
+%%   (a real conformance bug). Tracked separately.
 
 -behaviour(roadrunner_middleware).
 

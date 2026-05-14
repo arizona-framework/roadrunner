@@ -1,9 +1,5 @@
-%%%-------------------------------------------------------------------
-%% @doc roadrunner public API
-%% @end
-%%%-------------------------------------------------------------------
-
 -module(roadrunner_app).
+-moduledoc false.
 
 -behaviour(application).
 
@@ -16,5 +12,3 @@ start(_StartType, _StartArgs) ->
 -spec stop(term()) -> ok.
 stop(_State) ->
     ok.
-
-%% internal functions

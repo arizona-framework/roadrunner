@@ -1,9 +1,7 @@
-%%%-------------------------------------------------------------------
-%% @doc roadrunner top level supervisor.
-%% @end
-%%%-------------------------------------------------------------------
-
 -module(roadrunner_sup).
+-moduledoc false.
+
+%% roadrunner top level supervisor.
 
 -behaviour(supervisor).
 
