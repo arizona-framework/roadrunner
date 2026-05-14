@@ -279,6 +279,4 @@ alongside throughput:
 ```
 
 For hot-path analysis, add `--profile --profile-tool eprof` (or
-`fprof`); the workflow established in
-[`conn_lifecycle_investigation.md`](conn_lifecycle_investigation.md)
-applies directly.
+`fprof`).
