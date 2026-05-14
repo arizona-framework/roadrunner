@@ -1,19 +1,15 @@
 -module(roadrunner_req).
 -moduledoc """
-Pure accessors over a `request()` map, plus the public type
-aliases for the request-side surface.
+Pure accessors over the `request()` map.
 
 Decouples handler code from the underlying map shape — handlers should
 prefer these functions over direct `maps:get/2` so the request
 representation can evolve without breaking them.
 
-The exported types (`request/0`, `headers/0`, `version/0`,
-`status/0`, `redirect_status/0`) are the **public** request-side
-surface. Internal modules may use the underlying
-`roadrunner_http1:*` types directly; user code (handlers,
-middleware, custom response builders) should reach in through
-this module so the internal h1 module can be renamed or
-restructured without breaking the public contract.
+The `request/0` type is canonical here. The shared HTTP primitives
+re-exported alongside it (`headers/0`, `version/0`, `status/0`,
+`redirect_status/0`) are aliases of the definitions in
+`roadrunner_http`.
 """.
 
 -on_load(init_patterns/0).
@@ -26,11 +22,38 @@ restructured without breaking the public contract.
 
 -export_type([request/0, headers/0, version/0, status/0, redirect_status/0]).
 
--type request() :: roadrunner_http1:request().
--type headers() :: roadrunner_http1:headers().
--type version() :: roadrunner_http1:version().
--type status() :: roadrunner_http1:status().
--type redirect_status() :: roadrunner_http1:redirect_status().
+-doc """
+The parsed request map handlers receive.
+
+Required fields are present on every request the framework
+delivers; optional fields are populated by the framework when
+applicable (e.g. `body` in `body_buffering => auto` mode,
+`bindings` for routed dispatch, `request_id` for telemetry).
+
+The `cached_decisions` and `body_state` fields are framework
+internals — typed as `term()` here because their precise shapes
+are not part of the public contract and can change between releases.
+""".
+-type request() :: #{
+    method := binary(),
+    target := binary(),
+    version := version(),
+    headers := headers(),
+    cached_decisions => term(),
+    body => iodata(),
+    bindings => roadrunner_router:bindings(),
+    peer => {inet:ip_address(), inet:port_number()} | undefined,
+    scheme => http | https,
+    route_opts => term(),
+    body_state => term(),
+    request_id => binary(),
+    listener_name => atom()
+}.
+
+-type headers() :: roadrunner_http:headers().
+-type version() :: roadrunner_http:version().
+-type status() :: roadrunner_http:status().
+-type redirect_status() :: roadrunner_http:redirect_status().
 
 -export([
     method/1,
