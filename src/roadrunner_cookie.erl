@@ -82,7 +82,7 @@ with one of:
   `Expires` contains a CTL or `;` (the bytes that would let a
   malicious caller smuggle attributes or split the header line)
 
-Crashing matches the discipline of `roadrunner_http1:check_header_safe/2`:
+Crashing matches the discipline applied elsewhere in the framework:
 a programmer bug echoing user input into a cookie turns into a 500, not
 a wire-level vulnerability.
 """.
