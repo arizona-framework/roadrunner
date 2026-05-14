@@ -71,8 +71,35 @@ NewState}`, `{ok, NewState}`, `{close, NewState}`, or
     | {close, NewState :: term()}
     | {close, Code :: roadrunner_ws:close_code(), Reason :: iodata(), NewState :: term()}.
 
+-doc """
+Optional. Runs once in the session process after the 101 has been
+written to the wire and before the first frame is read, with the
+state from the upgrade tuple `{websocket, Module, State}`. Use it
+to register pubsub subscriptions, start linked workers, or push
+priming frames at connect-time. Returns the same shape as
+`handle_frame/2`. Handlers that don't export this callback skip
+the init step.
+""".
 -callback init(State :: term()) -> result().
+
+-doc """
+Invoked for each non-control frame received from the client, after
+the framework has reassembled fragmented messages (so the handler
+always sees a complete `text` or `binary` payload). Returns one of
+the `result/0` shapes: reply with frames, stay open, close
+gracefully, or close with a code + reason. Control frames
+(`ping`/`pong`/`close`) are auto-handled by the framework and
+never reach this callback.
+""".
 -callback handle_frame(Frame :: roadrunner_ws:frame(), State :: term()) -> result().
+
+-doc """
+Optional. Receives any Erlang message delivered to the session
+process that isn't a transport `active`-mode event. Use for
+pubsub / asynchronous push patterns. Returns the same shape as
+`handle_frame/2`. Handlers that don't export this callback have
+unknown messages dropped silently.
+""".
 -callback handle_info(Info :: term(), State :: term()) -> result().
 
 -optional_callbacks([init/1, handle_info/2]).

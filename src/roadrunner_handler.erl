@@ -82,7 +82,26 @@ lowercase names; handler-supplied tuples must follow suit.
     | {websocket, Module :: module(), State :: term()}.
 -type result() :: {response(), roadrunner_req:request()}.
 
+-doc """
+Invoked once per parsed request. Receives the request map and
+returns a `{Response, Req2}` pair where `Response` is one of the
+shapes listed in the moduledoc (buffered, stream, sendfile, loop,
+websocket) and `Req2` is the (possibly mutated) request map threaded
+back to the framework. Always return `Req2` so the conn can drain
+unread bodies in manual-buffering mode and response middlewares can
+observe / rewrite.
+""".
 -callback handle(Request :: roadrunner_req:request()) -> result().
+
+-doc """
+Optional, only fired for `{loop, _, _, State}` responses. The
+framework dispatches every non-OTP Erlang message delivered to the
+conn (or h2 worker) process through this callback. `Push(Data)`
+writes one chunk to the wire. Return `{ok, NewState}` to keep
+looping or `{stop, NewState}` to emit the size-0 terminator and
+close. Handlers that don't export this callback can't use
+`{loop, ...}` responses.
+""".
 -callback handle_info(Info :: term(), Push :: push_fun(), State :: term()) ->
     {ok, NewState :: term()} | {stop, NewState :: term()}.
 

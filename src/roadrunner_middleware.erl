@@ -112,6 +112,20 @@ server_header(Req, Next) ->
     | fun((roadrunner_req:request(), next()) -> roadrunner_handler:result()).
 -type middleware_list() :: [middleware()].
 
+-doc """
+The middleware contract. `Request` is the current request map;
+`Next` is a continuation that runs the rest of the pipeline (other
+middlewares + the inner handler) and returns the same
+`t:roadrunner_handler:result/0` shape every middleware returns.
+
+The middleware decides whether to:
+- pass through unchanged (`Next(Req)`),
+- transform the request (`Next(Req#{...})`),
+- short-circuit (return `{Response, Req}` without calling `Next`),
+- wrap the response (let `Next(Req)` run, then transform what it
+  returned),
+- run side effects around the call (log, time, instrument).
+""".
 -callback call(Request :: roadrunner_req:request(), Next :: next()) ->
     roadrunner_handler:result().
 
