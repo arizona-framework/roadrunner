@@ -63,18 +63,49 @@ NewState}`, `{ok, NewState}`, `{close, NewState}`, or
 
 -type opt() :: hibernate.
 
+-doc """
+The four data/control opcodes a handler sees. `continuation` only
+appears at the wire level — the session reassembles fragmented
+messages before dispatching to `handle_frame/2`, so handlers
+receive `text` or `binary` for data and `ping` / `pong` / `close`
+for control. Outbound replies may use `text`, `binary`, `ping`,
+`pong`, or `close`.
+""".
+-type opcode() :: continuation | text | binary | close | ping | pong.
+
+-doc """
+The frame map handed to `handle_frame/2`. `payload` is the
+post-unmask, post-reassembly (and post-inflate, for compressed
+messages) bytes — exactly what the handler should treat as the
+message body.
+""".
+-type frame() :: #{
+    fin := boolean(),
+    rsv1 := boolean(),
+    opcode := opcode(),
+    payload := binary()
+}.
+
+-doc """
+Close status codes a server is permitted to send per RFC 6455 §7.4.
+1004/1005/1006 are reserved (MUST NOT appear on the wire);
+1012/1013 are unassigned. 3000-3999 is the IANA-registered range,
+4000-4999 is for application-private use.
+""".
+-type close_code() :: 1000..1003 | 1007..1011 | 1014 | 3000..4999.
+
 -type result() ::
-    {reply, Frames :: [{roadrunner_ws:opcode(), iodata()}], NewState :: term()}
-    | {reply, Frames :: [{roadrunner_ws:opcode(), iodata()}], NewState :: term(), [opt()]}
+    {reply, Frames :: [{opcode(), iodata()}], NewState :: term()}
+    | {reply, Frames :: [{opcode(), iodata()}], NewState :: term(), [opt()]}
     | {ok, NewState :: term()}
     | {ok, NewState :: term(), [opt()]}
     | {close, NewState :: term()}
-    | {close, Code :: roadrunner_ws:close_code(), Reason :: iodata(), NewState :: term()}.
+    | {close, Code :: close_code(), Reason :: iodata(), NewState :: term()}.
 
 -callback init(State :: term()) -> result().
--callback handle_frame(Frame :: roadrunner_ws:frame(), State :: term()) -> result().
+-callback handle_frame(Frame :: frame(), State :: term()) -> result().
 -callback handle_info(Info :: term(), State :: term()) -> result().
 
 -optional_callbacks([init/1, handle_info/2]).
 
--export_type([opt/0, result/0]).
+-export_type([opt/0, result/0, opcode/0, frame/0, close_code/0]).

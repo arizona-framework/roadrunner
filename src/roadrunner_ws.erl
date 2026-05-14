@@ -32,13 +32,8 @@
 -define(EXT_QUOTE_CP_KEY, {?MODULE, ext_quote_cp}).
 -define(UPGRADE_CP_KEY, {?MODULE, upgrade_cp}).
 
--type opcode() :: continuation | text | binary | close | ping | pong.
--type frame() :: #{
-    fin := boolean(),
-    rsv1 := boolean(),
-    opcode := opcode(),
-    payload := binary()
-}.
+-type opcode() :: roadrunner_ws_handler:opcode().
+-type frame() :: roadrunner_ws_handler:frame().
 
 %% A single offer in the `Sec-WebSocket-Extensions` header. Parameter
 %% values are `binary()` for `key=value` pairs or `true` for bare flag
@@ -79,12 +74,7 @@
     none
     | {permessage_deflate, permessage_deflate_params(), ResponseHeaderValue :: binary()}.
 
-%% Close status codes a server is permitted to send per RFC 6455 §7.4.
-%% 1004/1005/1006 are reserved (MUST NOT appear on the wire);
-%% 1012/1013 are unassigned. 3000-3999 is the IANA-registered range,
-%% 4000-4999 is for application-private use.
--type close_code() ::
-    1000..1003 | 1007..1011 | 1014 | 3000..4999.
+-type close_code() :: roadrunner_ws_handler:close_code().
 
 %% RFC 6455 §1.3 magic GUID concatenated with the client key before
 %% hashing — fixed by spec.
