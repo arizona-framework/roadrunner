@@ -53,16 +53,14 @@ auto-inject the `Date` response header per RFC 9110 §6.6.1.
 Built via direct bit-syntax binary construction rather than
 `io_lib:format/2` because the shape is fixed (RFC 9110 mandates
 exact widths and the day/month abbreviations) and this function
-runs once per response on the hot path — a 250 k req/s listener
-calls it 250 k times per second.
+runs on the response hot path.
 
 Cached via `persistent_term` keyed by the current Posix second:
 the formatted binary is identical for every request that lands in
 the same second, so we recompute it only when the second ticks
-over. Microbench: full build ~292 ns/call, cache hit ~38 ns/call
-(−87 %). Updates are racy on the second-boundary (multiple
-processes may put the same value), but each put writes the same
-binary so the race is benign.
+over. Updates are racy on the second boundary (multiple processes
+may put the same value), but each put writes the same binary so
+the race is benign.
 """.
 -spec http_date_now() -> binary().
 http_date_now() ->

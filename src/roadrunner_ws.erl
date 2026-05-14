@@ -7,11 +7,11 @@ referenced by `roadrunner_ws_handler` callback signatures, plus the
 permessage-deflate extension shape negotiated during the handshake.
 
 The exported wire-level functions (frame parse/encode, handshake
-response builder, extension negotiation) are framework plumbing used
-by `roadrunner_ws_session`. Most applications implement the
-`roadrunner_ws_handler` behaviour and receive already-parsed frames;
-the protocol functions are exposed for advanced use cases (custom
-session transports, low-level testing).
+response builder, extension negotiation) are framework plumbing
+called from `roadrunner_ws_session`. They're not part of the
+documented public API — implement `roadrunner_ws_handler` to write
+WebSocket endpoints and let the framework deliver already-parsed
+frames.
 """.
 
 -on_load(init_patterns/0).

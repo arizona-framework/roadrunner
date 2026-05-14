@@ -2,13 +2,16 @@
 -moduledoc """
 Parser for `multipart/form-data` request bodies (RFC 7578).
 
-Two entry points:
+Three entry points:
 
 - `boundary/1` — pull the `boundary=…` parameter out of a
   `Content-Type` header value, handling unquoted, quoted, and
   parameter-mixed forms.
 - `parse/2` — split a buffered body into a list of `part()` maps,
   each with its own `headers` and decoded `body`.
+- `params/1` — parse the `key=value` parameters of any structured
+  header value (e.g. `Content-Type`, `Content-Disposition`) into
+  a lowercase-keyed map.
 
 Typical handler shape:
 

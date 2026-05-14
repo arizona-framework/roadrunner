@@ -4,10 +4,10 @@ Listener gen_server — owns the listening socket and the acceptor pool
 for one named roadrunner instance.
 
 Plain TCP is backed by `gen_tcp` with the legacy `inet_drv` backend.
-The OTP-27 `{inet_backend, socket}` NIF path was tried but adds ~46%
-own-time overhead on short-lived connections via per-socket-option
-lookups (see `docs/conn_lifecycle_investigation.md`). TLS is backed
-by `ssl`, gated by the `tls` opt.
+The OTP-27 `{inet_backend, socket}` NIF path was tried but adds
+significant own-time overhead on short-lived connections via
+per-socket-option lookups. TLS is backed by `ssl`, gated by the
+`tls` opt.
 Both paths share the same `roadrunner_transport` tagged-socket abstraction.
 
 On `init/1` the listener opens the listen socket, builds the shared
