@@ -107,11 +107,9 @@
 -export([compose/2, build_pipeline/3]).
 -export_type([middleware/0, middleware_list/0, next/0]).
 
--type next() :: fun((roadrunner_req:request()) -> roadrunner_handler:result()).
--type middleware() ::
-    module()
-    | fun((roadrunner_req:request(), next()) -> roadrunner_handler:result()).
--type middleware_list() :: [middleware()].
+-type next() :: roadrunner_handler:next().
+-type middleware() :: roadrunner_handler:middleware().
+-type middleware_list() :: roadrunner_handler:middleware_list().
 
 -callback call(Request :: roadrunner_req:request(), Next :: next()) ->
     roadrunner_handler:result().

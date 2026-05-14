@@ -52,7 +52,17 @@ handle(Req) ->
 ```
 """.
 
--export_type([send_fun/0, stream_fun/0, push_fun/0, sendfile_spec/0, response/0, result/0]).
+-export_type([
+    send_fun/0,
+    stream_fun/0,
+    push_fun/0,
+    sendfile_spec/0,
+    response/0,
+    result/0,
+    next/0,
+    middleware/0,
+    middleware_list/0
+]).
 
 -type send_fun() ::
     fun((iodata(), nofin | fin | {fin, roadrunner_req:headers()}) -> ok | {error, term()}).
@@ -81,6 +91,26 @@ lowercase names; handler-supplied tuples must follow suit.
     | {sendfile, StatusCode :: roadrunner_req:status(), roadrunner_req:headers(), sendfile_spec()}
     | {websocket, Module :: module(), State :: term()}.
 -type result() :: {response(), roadrunner_req:request()}.
+
+-doc """
+The continuation passed to a middleware's `call/2`: a fun that runs
+the rest of the pipeline (other middlewares + the inner handler) on
+the request and returns the same `result/0` shape every middleware
+returns.
+""".
+-type next() :: fun((roadrunner_req:request()) -> result()).
+
+-doc """
+A single entry in a listener's or route's `middlewares` list. Either:
+- A module that implements `-behaviour(roadrunner_middleware)` (its
+  `call/2` is invoked).
+- A `fun((Request, Next) -> Result)` invoked directly.
+""".
+-type middleware() ::
+    module()
+    | fun((roadrunner_req:request(), next()) -> result()).
+
+-type middleware_list() :: [middleware()].
 
 -callback handle(Request :: roadrunner_req:request()) -> result().
 -callback handle_info(Info :: term(), Push :: push_fun(), State :: term()) ->
