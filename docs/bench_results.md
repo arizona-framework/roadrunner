@@ -1,17 +1,6 @@
 # Benchmark results
 
-> ⚠️ **Out of date.** The full matrix below is from 2026-05-05
-> (SHA `020b440`) and has NOT been re-run after the
-> `feat/http-arena` branch's perf rounds (concat fix, iodata body,
-> h2 lowercase contract). Several scenarios moved by 5-20 % on
-> roadrunner since this matrix was captured.
->
-> For up-to-date side-by-side numbers on the representative
-> scenarios, see [`comparison.md`](comparison.md). Re-run the full
-> matrix locally with `./scripts/bench_matrix.sh` (~25-40 min) to
-> refresh this file end-to-end.
-
-Captured by `scripts/bench_matrix.sh` on 2026-05-05 at `020b440`.
+Captured by `scripts/bench_matrix.sh` on 2026-05-15 at `90fba12`.
 
 **Hardware / runtime**
 
@@ -40,66 +29,47 @@ Set `SKIP_BENCH=1` to regenerate the CSV / MD from the existing
 
 | scenario | roadrunner | cowboy | elli | rr p50 / p99 |
 |---|---:|---:|---:|---:|
-| `hello` | 254 k | 181 k | 272 k | 135 µs / 1.8 ms |
-| `json` | 255 k | 178 k | 270 k | 135 µs / 1.6 ms |
-| `echo` | 225 k | 146 k | 269 k | 157 µs / 1.8 ms |
-| `headers_heavy` | 210 k | 125 k | 240 k | 180 µs / 1.6 ms |
-| `large_response` | 103 k | 90 k | 114 k | 373 µs / 3.1 ms |
-| `url_with_qs` | 247 k | 167 k | — | 148 µs / 1.4 ms |
-| `varied_paths_router` | 239 k | 168 k | — | 151 µs / 1.5 ms |
-| `path_with_unicode` | 235 k | 167 k | — | 159 µs / 1.3 ms |
-| `router_404_storm` | 51 k | 43 k | 50 k | 890 µs / 2.5 ms |
-| `cors_preflight` | 242 k | 162 k | — | 153 µs / 1.3 ms |
-| `redirect_response` | 258 k | 176 k | — | 133 µs / 1.7 ms |
-| `head_method` | 251 k | 176 k | — | 139 µs / 1.7 ms |
-| `post_4kb_form` | 122 k | 92 k | — | 344 µs / 2.2 ms |
-| `chunked_request_body` | 210 k | 129 k | — | 177 µs / 1.5 ms |
-| `compressed_request_body` | 233 k | 149 k | 278 k | 154 µs / 1.6 ms |
-| `multi_request_body` | 225 k | 111 k | 245 k | 160 µs / 1.6 ms |
-| `expect_100_continue` | 130 k | 94 k | — | 294 µs / 2.8 ms |
-| `large_post_streaming` | 15 k | 6.6 k | — | 3.4 ms / 7.2 ms |
-| `cookies_heavy` | 234 k | 160 k | — | 153 µs / 1.6 ms |
-| `etag_304` | 234 k | 169 k | — | 149 µs / 1.8 ms |
-| `mixed_workload` | 169 k | 133 k | 177 k | 223 µs / 2.1 ms |
-| `pipelined_h1` | 426 k | 331 k | 4.9 k | 97 µs / 730 µs |
-| `large_keepalive_session` | 227 k | 175 k | 279 k | 152 µs / 2.0 ms |
-| `connection_storm` | 46 k | 46 k | 55 k | 956 µs / 3.2 ms |
-| `slow_client` | 6.2 k | 6.2 k | 6.2 k | 8.0 ms / 8.3 ms |
-| `accept_storm_burst` | 28 k | 31 k | 35 k | 1.3 ms / 1.6 ms |
-| `partial_body_drop` | 17 k | 16 k | — | 1.9 ms / 11.9 ms |
-| `server_sent_events` | 11 k | 10.0 k | — | 4.2 ms / 9.5 ms |
-| `gzip_response` | 105 k | 96 k | — | 387 µs / 2.5 ms |
-| `backpressure_sustained` | 249 k | 182 k | — | 139 µs / 1.8 ms |
-| `websocket_msg_throughput` | 214 k | 168 k | — | 167 µs / 2.0 ms |
+| `hello` | 287 k | 189 k | 281 k | 115 µs / 1.7 ms |
+| `json` | 290 k | 194 k | 316 k | 115 µs / 1.7 ms |
+| `echo` | 284 k | 153 k | 294 k | 123 µs / 1.5 ms |
+| `headers_heavy` | 254 k | 143 k | 249 k | 135 µs / 1.8 ms |
+| `large_response` | 121 k | 95 k | 129 k | 315 µs / 3.0 ms |
+| `multi_request_body` | 271 k | 120 k | 275 k | 129 µs / 1.5 ms |
+| `varied_paths_router` | 292 k | 168 k | — | 119 µs / 1.4 ms |
+| `post_4kb_form` | 174 k | 95 k | — | 220 µs / 1.8 ms |
+| `large_post_streaming` | 19 k | 7.0 k | — | 2.5 ms / 5.9 ms |
+| `pipelined_h1` | 572 k | 362 k | 4.8 k | 69 µs / 609 µs |
+| `websocket_msg_throughput` | 231 k | 171 k | — | 153 µs / 1.9 ms |
+| `gzip_response` | 137 k | 108 k | — | 287 µs / 2.2 ms |
 
 ## HTTP/2
 
 | scenario | roadrunner | cowboy | elli | rr p50 / p99 |
 |---|---:|---:|---:|---:|
-| `hello` | 158 k | 154 k | — | 233 µs / 2.6 ms |
-| `json` | 155 k | 138 k | — | 247 µs / 2.5 ms |
-| `echo` | 151 k | 101 k | — | 257 µs / 2.3 ms |
-| `headers_heavy` | 146 k | 82 k | — | 260 µs / 2.6 ms |
-| `multi_request_body` | 129 k | 29 k | — | 305 µs / 2.5 ms |
-| `cookies_heavy` | 153 k | 136 k | — | 253 µs / 2.3 ms |
-| `streaming_response` | 57 k | 56 k | — | 694 µs / 4.1 ms |
-| `multi_stream_h2` | 330 k | 314 k | — | 133 µs / 397 µs |
-| `small_chunked_response` | 4.7 k | 4.9 k | — | 10.0 ms / 20.4 ms |
-| `tls_handshake_throughput` | 2.5 k | 3.0 k | — | 20.2 ms / 24.9 ms |
+| `hello` | 172 k | 166 k | — | 215 µs / 2.5 ms |
+| `json` | 167 k | 151 k | — | 224 µs / 2.4 ms |
+| `echo` | 163 k | 118 k | — | 237 µs / 2.1 ms |
+| `headers_heavy` | 163 k | 89 k | — | 240 µs / 2.1 ms |
+| `multi_request_body` | 138 k | 33 k | — | 285 µs / 2.5 ms |
+| `multi_stream_h2` | 350 k | 339 k | — | 126 µs / 379 µs |
+| `streaming_response` | 61 k | 60 k | — | 644 µs / 4.1 ms |
 
 ## Notes / known gaps
 
-- `large_response` / `head_method` are listed h1-only here.
-  Their h2 cells errored on 64 KB single-stream responses
-  against both servers — a flow-control interaction in the
-  test client, not a server-side bug.
+- `large_response` is listed h1-only here. The h2 cell
+  errored on 64 KB single-stream responses against both
+  servers, which is a flow-control interaction in the test
+  client and not a server-side bug.
 - `pipelined_h1` elli: elli's keep-alive path doesn't
-  pipeline; the 4.9 k req/s reflects per-request RTT,
+  pipeline; the elli column reflects per-request RTT,
   not pipelining.
-- `tls_handshake_throughput` h2: cowboy edges roadrunner
-  here. See
-  [`docs/conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md)
-  Round 3 for the prior null-result investigation.
+- `websocket_msg_throughput` is roadrunner + cowboy only;
+  the elli fixture has no WebSocket support.
+- The wider set of scenarios (connection-shape storms,
+  TLS handshake throughput, the HttpArena fixtures, etc.)
+  is runnable ad-hoc via `./scripts/bench.escript
+  --scenarios <name>`. The headline matrix here mirrors
+  `?MAIN_SCENARIOS` in scripts/bench.escript.
 
 ## Reading the numbers honestly
 

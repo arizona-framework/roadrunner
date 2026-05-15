@@ -53,24 +53,32 @@ Standards conformance:
 
 ## Performance at a glance
 
-Median req/s on a 12th-gen i9-12900HX, 50 clients, 5 s warmup + 5 s
-measure, loopback. Full per-protocol grid + p50/p99 + memory shape
-in [`docs/comparison.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/comparison.md).
+Median req/s over HTTP/1.1 on a 12th-gen i9-12900HX, 50 clients,
+5 s warmup + 5 s measure, loopback. HTTP/2 numbers, p50 / p99
+percentiles, and memory shape sit in
+[`docs/bench_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/bench_results.md)
+and [`docs/comparison.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/comparison.md).
 
 | scenario                  | roadrunner    | cowboy        | elli          |
 |---------------------------|--------------:|--------------:|--------------:|
-| `hello`                   |   **298 k**   |       179 k   |       278 k   |
-| `headers_heavy`           |   **235 k**   |       118 k   |       211 k   |
-| `cookies_heavy`           |   **247 k**   |       154 k   |          —    |
-| `pipelined_h1`            |   **501 k**   |       329 k   |       4.9 k   |
-| `gzip_response`           |   **127 k**   |       100 k   |          —    |
-| `websocket_msg_throughput`|   **199 k**   |       155 k   |          —    |
+| `hello`                   |   **287 k**   |       189 k   |       281 k   |
+| `json`                    |       290 k   |       194 k   |   **316 k**   |
+| `echo`                    |       284 k   |       153 k   |   **294 k**   |
+| `headers_heavy`           |   **254 k**   |       143 k   |       249 k   |
+| `large_response`          |       121 k   |        95 k   |   **129 k**   |
+| `multi_request_body`      |       271 k   |       120 k   |   **275 k**   |
+| `varied_paths_router`     |   **292 k**   |       168 k   |          —    |
+| `post_4kb_form`           |   **174 k**   |        95 k   |          —    |
+| `large_post_streaming`    |    **19 k**   |       7.0 k   |          —    |
+| `pipelined_h1`            |   **572 k**   |       362 k   |       4.8 k   |
+| `websocket_msg_throughput`|   **231 k**   |       171 k   |          —    |
+| `gzip_response`           |   **137 k**   |       108 k   |          —    |
 
-Bold = row winner. `—` means the elli fixture doesn't support that
-workload shape (no router, no gzip middleware, no native cookie
-parser, no WebSocket). On simple GETs (`hello`, `json`, `echo`)
-Roadrunner's lead over elli is within the bench's ~15 % variance
-band — the comparison doc has the full honest framing.
+Bold = fastest in row. `—` means the elli fixture doesn't expose
+that workload (no router, no gzip middleware, no WebSocket, no
+streaming-POST endpoint). On simple GETs and small POSTs
+Roadrunner and elli are within the bench's ~15 % variance band on
+those rows; the comparison doc has the full honest framing.
 
 The numbers above are throughput from `scripts/bench.escript`
 (closed-loop). For Coordinated-Omission-corrected tail latency at
