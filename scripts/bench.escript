@@ -135,6 +135,38 @@
     ?PROTOCOL_AGNOSTIC_SCENARIOS ++ ?H1_ONLY_SCENARIOS ++ ?H2_ONLY_SCENARIOS
 ).
 
+%% Curated headline set rendered in `docs/bench_results.md` and
+%% `docs/wrk2_results.md`. Every member is also in
+%% `?KNOWN_SCENARIOS`; the macro is orthogonal to the
+%% protocol-compat partition above, so a main scenario carries
+%% whatever protocols its `?PROTOCOL_AGNOSTIC_*` / `?H?_ONLY_*`
+%% slot already declares.
+%%
+%% Canonical source for `scripts/bench_matrix.sh`'s `SCENARIOS`
+%% array and `scripts/wrk2_bench.sh`'s `SCENARIOS_ALL` (those are
+%% the iteration / render lists; the data tables next to them —
+%% `PROTOS`, `PEAK`, `LUA_FILE`, `EXTRA_HEADERS`,
+%% `ELLI_UNSUPPORTED` — stay full and outlive any reshuffle). Shell
+%% scripts can't read Erlang macros, so each iteration list mirrors
+%% this macro behind a "drift note" comment — keep all three in
+%% sync when this changes.
+-define(MAIN_SCENARIOS, [
+    hello,
+    json,
+    echo,
+    headers_heavy,
+    large_response,
+    multi_request_body,
+    varied_paths_router,
+    post_4kb_form,
+    large_post_streaming,
+    pipelined_h1,
+    websocket_msg_throughput,
+    gzip_response,
+    multi_stream_h2,
+    streaming_response
+]).
+
 main(Args) ->
     Opts0 = parse_args(Args),
     ProjectDir = project_dir(),

@@ -28,11 +28,14 @@
 #   SKIP_BENCH=1          # reuse existing /tmp/bench_matrix.log
 #                         #   (regenerate the CSV + MD only)
 #
-# Drift note: the PROTOS / SCENARIOS arrays below MUST be kept in
-# sync with the `scenario_roadrunner_opts/2` clauses in
-# scripts/bench.escript and that script's `preflight_scenario/1`
-# h1-only / h2-only filters. Adding a scenario without updating
-# this list silently drops it from the rendered tables.
+# Drift note: the PROTOS / SCENARIOS arrays below mirror
+# `?MAIN_SCENARIOS` in scripts/bench.escript (the curated headline
+# set rendered in docs/bench_results.md). The PROTOS map for each
+# scenario reflects the `?PROTOCOL_AGNOSTIC_*` / `?H?_ONLY_*` slot
+# the scenario already lives in. Adding to / removing from
+# `?MAIN_SCENARIOS` requires updating both arrays here and
+# `SCENARIOS_ALL` in scripts/wrk2_bench.sh; otherwise the rendered
+# tables drift from the canonical macro silently.
 #
 set -u
 
@@ -50,6 +53,11 @@ PER_RUN_TSV=/tmp/bench_per_run.tsv
 
 # ---- Scenario × protocol matrix ---------------------------------
 
+# Full protocol map for every scenario in `?KNOWN_SCENARIOS`.
+# `SCENARIOS` below picks a subset to render; the unused entries
+# stay so reshuffling the headline set is a one-line edit, not a
+# re-derivation. Mirror new `?KNOWN_SCENARIOS` members here too —
+# any miss is a silent KeyError at lookup time.
 declare -A PROTOS=(
   [hello]="h1 h2"
   [headers_heavy]="h1 h2"
@@ -90,23 +98,15 @@ declare -A PROTOS=(
   [httparena_json]="h1"
 )
 
-# Stable iteration order — groups roughly by category for the
-# rendered tables (simple, parsing/routing, body, connection,
-# streaming/push, websocket, then h2-only at the bottom).
+# Iteration order — the curated headline set rendered in
+# docs/bench_results.md. Mirrors `?MAIN_SCENARIOS` in
+# scripts/bench.escript; reshuffle there first, then here.
 SCENARIOS=(
   hello json echo headers_heavy large_response
-  url_with_qs varied_paths_router path_with_unicode
-  router_404_storm cors_preflight redirect_response head_method
-  post_4kb_form chunked_request_body compressed_request_body
-  multi_request_body expect_100_continue large_post_streaming
-  cookies_heavy etag_304 mixed_workload
-  pipelined_h1 large_keepalive_session connection_storm
-  slow_client accept_storm_burst partial_body_drop
-  server_sent_events gzip_response backpressure_sustained
-  websocket_msg_throughput
-  httparena_baseline httparena_json
-  streaming_response multi_stream_h2 small_chunked_response
-  tls_handshake_throughput
+  multi_request_body varied_paths_router post_4kb_form
+  large_post_streaming pipelined_h1 websocket_msg_throughput
+  gzip_response
+  multi_stream_h2 streaming_response
 )
 
 # ---- Drive the matrix -------------------------------------------
@@ -283,17 +283,20 @@ OTP=$(mise exec -- erl -noshell -eval 'io:format("~s",[erlang:system_info(otp_re
   echo
   echo "## Notes / known gaps"
   echo
-  echo "- \`large_response\` / \`head_method\` are listed h1-only here."
-  echo "  Their h2 cells errored on 64 KB single-stream responses"
-  echo "  against both servers — a flow-control interaction in the"
-  echo "  test client, not a server-side bug."
+  echo "- \`large_response\` is listed h1-only here. The h2 cell"
+  echo "  errored on 64 KB single-stream responses against both"
+  echo "  servers, which is a flow-control interaction in the test"
+  echo "  client and not a server-side bug."
   echo "- \`pipelined_h1\` elli: elli's keep-alive path doesn't"
-  echo "  pipeline; the 4.9 k req/s reflects per-request RTT,"
+  echo "  pipeline; the elli column reflects per-request RTT,"
   echo "  not pipelining."
-  echo "- \`tls_handshake_throughput\` h2: cowboy edges roadrunner"
-  echo "  here. See"
-  echo "  [\`docs/conn_lifecycle_investigation.md\`](conn_lifecycle_investigation.md)"
-  echo "  Round 3 for the prior null-result investigation."
+  echo "- \`websocket_msg_throughput\` is roadrunner + cowboy only;"
+  echo "  the elli fixture has no WebSocket support."
+  echo "- The wider set of scenarios (connection-shape storms,"
+  echo "  TLS handshake throughput, the HttpArena fixtures, etc.)"
+  echo "  is runnable ad-hoc via \`./scripts/bench.escript"
+  echo "  --scenarios <name>\`. The headline matrix here mirrors"
+  echo "  \`?MAIN_SCENARIOS\` in scripts/bench.escript."
   echo
   echo "## Reading the numbers honestly"
   echo

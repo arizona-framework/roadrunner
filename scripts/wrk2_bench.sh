@@ -21,11 +21,14 @@
 # coordinated-omission gap directly instead of taking our word for
 # it.
 #
-# Connection-shape scenarios (pipelined_h1, slow_client,
-# connection_storm, mixed_workload, accept_storm_burst,
-# server_sent_events) are intentionally absent — wrk2's `-c50`
-# keep-alive shape can't reproduce their wire patterns. h2-only
-# scenarios are absent too (wrk2 is HTTP/1.1).
+# The wrk2 set is the h1-runnable subset of `?MAIN_SCENARIOS` in
+# scripts/bench.escript. `pipelined_h1` is excluded because wrk2's
+# `-c50` keep-alive shape can't reproduce pipelining;
+# `websocket_msg_throughput` is excluded because wrk2 doesn't speak
+# WS frames; the h2-only main scenarios are excluded because wrk2
+# is HTTP/1.1. Any other scenario from `?KNOWN_SCENARIOS` can be
+# driven ad-hoc via `./scripts/bench.escript --standalone` + a
+# direct wrk2 invocation.
 #
 # Requirements:
 #   - docker (for cylab/wrk2 image — same pattern as h2spec.sh)
@@ -81,16 +84,21 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Scenarios in the matrix. Order matches docs/bench_results.md so the
-# wrk2 report skims left-to-right alongside the closed-loop one.
+# Scenarios in the matrix. Curated headline subset that mirrors
+# the h1-runnable portion of `?MAIN_SCENARIOS` in
+# scripts/bench.escript. The data tables below (PEAK, LUA_FILE,
+# EXTRA_HEADERS, ELLI_UNSUPPORTED) keep entries for every
+# h1-runnable scenario in `?KNOWN_SCENARIOS` so reshuffling the
+# headline set is a one-line edit here, not a re-derivation.
+#
+# `varied_paths_router` is in `?MAIN_SCENARIOS` for the closed-loop
+# matrix but is intentionally absent here: bench.escript's
+# `--standalone` mode rejects it (multi-path workload, no stable
+# single path to expose to an external wrk2 driver).
 SCENARIOS_ALL=(
     hello json echo headers_heavy large_response
-    url_with_qs path_with_unicode cors_preflight redirect_response
-    head_method post_4kb_form chunked_request_body
-    compressed_request_body multi_request_body large_post_streaming
-    cookies_heavy etag_304 large_keepalive_session
-    gzip_response backpressure_sustained
-    httparena_baseline httparena_json
+    multi_request_body post_4kb_form
+    large_post_streaming gzip_response
 )
 
 # Scenarios elli doesn't support (mirrors `preflight_scenario/1` in
@@ -100,7 +108,8 @@ ELLI_UNSUPPORTED=(
     url_with_qs path_with_unicode cors_preflight redirect_response
     head_method post_4kb_form chunked_request_body
     large_post_streaming cookies_heavy etag_304
-    gzip_response backpressure_sustained
+    gzip_response backpressure_sustained varied_paths_router
+    router_404_storm
     httparena_baseline httparena_json
 )
 
@@ -158,6 +167,7 @@ declare -A PEAK=(
     [roadrunner.large_keepalive_session]=227000 [cowboy.large_keepalive_session]=175000 [elli.large_keepalive_session]=279000
     [roadrunner.gzip_response]=136000   [cowboy.gzip_response]=108000
     [roadrunner.backpressure_sustained]=249000 [cowboy.backpressure_sustained]=182000
+    [roadrunner.varied_paths_router]=239000 [cowboy.varied_paths_router]=168000
     # roadrunner-only HttpArena-shape scenarios. The upload scenarios
     # are intentionally absent: at 50 concurrent 20 MB POSTs they
     # don't fit the matrix's memory budget; profile them via
@@ -574,11 +584,14 @@ fi)
 \`-t${THREADS} -c${CONNS}\`. Per-run logs live under
 \`/tmp/wrk2/<scenario>/<server>/<rate-pct>/run-N.log\`.
 
-Connection-shape scenarios (\`pipelined_h1\`, \`slow_client\`,
-\`connection_storm\`, \`mixed_workload\`, \`accept_storm_burst\`,
-\`server_sent_events\`) are intentionally absent — wrk2's
-\`-c${CONNS}\` keep-alive shape can't reproduce their wire patterns.
-HTTP/2-only scenarios are absent too; wrk2 is HTTP/1.1.
+Scenario set is the h1-runnable subset of \`?MAIN_SCENARIOS\` in
+\`scripts/bench.escript\`. \`pipelined_h1\` and
+\`websocket_msg_throughput\` are excluded because wrk2's
+\`-c${CONNS}\` keep-alive shape can't reproduce pipelining or
+WebSocket frames; \`varied_paths_router\` is excluded because
+bench.escript's \`--standalone\` mode rejects multi-path workloads
+(no stable single path to expose to an external wrk2 driver); the
+h2-only scenarios are excluded because wrk2 is HTTP/1.1.
 
 EOF
 

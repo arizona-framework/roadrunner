@@ -207,6 +207,24 @@ finding from the survey.
 **Scope:** medium — fprof + targeted refactor + A/B precommit
 verification.
 
+### Sync headline scenarios in comparison.md + resource_results.md
+
+**What:** `docs/comparison.md` and `docs/resource_results.md` still
+carry their own scenario picks predating the curated
+`?MAIN_SCENARIOS` in `scripts/bench.escript`. The README's
+quick-look table and the two bench-script-driven docs
+(`docs/bench_results.md`, `docs/wrk2_results.md`) have already
+been resynced.
+
+**Why deferred:** both docs cross-reference broader investigations
+(memory shape, architectural trade-offs) — a mechanical sync isn't
+the right move, but a deliberate re-pick against `?MAIN_SCENARIOS`
+is.
+
+**Scope:** small. Re-render the comparison-doc throughput tables
+and refresh the resource doc's per-scenario notes against the new
+headline.
+
 ### Automate `docs/resource_results.md` regeneration
 
 **What:** Extend `scripts/bench_matrix.sh` so it can pass
