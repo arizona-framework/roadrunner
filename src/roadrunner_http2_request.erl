@@ -1,32 +1,32 @@
 -module(roadrunner_http2_request).
--moduledoc """
-Build a roadrunner request map from an HTTP/2 HEADERS block
-(decoded HPACK header list) per RFC 9113 §8.3.
+-moduledoc false.
 
-The request shape is the same `roadrunner_http1:request()` map
-that HTTP/1.1 produces — pseudo-headers (`:method`, `:scheme`,
-`:authority`, `:path`) get normalized into the existing `method`
-/ `scheme` / `target` / regular-header fields so handler code
-(and `roadrunner_req` accessors) doesn't care which protocol
-served the request.
-
-## Validation (RFC 9113 §8.1.2)
-
-- Exactly one each of `:method`, `:scheme`, `:path` is required;
-  CONNECT requests omit `:scheme`/`:path` and require
-  `:authority` (we accept the simpler "GET-style" request shape
-  here; CONNECT and Extended CONNECT for WebSocket-over-h2
-  support arrive later).
-- Pseudo-headers MUST appear before regular headers; mixing is
-  a `protocol_error`.
-- Pseudo-headers other than the four defined are rejected.
-- `:path` MUST NOT be empty (an h2 client should send `/` for
-  the origin form).
-- Header field names MUST be lowercase — already enforced by
-  `roadrunner_http2_hpack:decode/2`.
-- `Connection`-specific headers MUST NOT appear (RFC 9113
-  §8.2.2). Rejected.
-""".
+%% Build a roadrunner request map from an HTTP/2 HEADERS block
+%% (decoded HPACK header list) per RFC 9113 §8.3.
+%%
+%% The request shape is the same `roadrunner_http1:request()` map
+%% that HTTP/1.1 produces — pseudo-headers (`:method`, `:scheme`,
+%% `:authority`, `:path`) get normalized into the existing `method`
+%% / `scheme` / `target` / regular-header fields so handler code
+%% (and `roadrunner_req` accessors) doesn't care which protocol
+%% served the request.
+%%
+%% ## Validation (RFC 9113 §8.1.2)
+%%
+%% - Exactly one each of `:method`, `:scheme`, `:path` is required;
+%%   CONNECT requests omit `:scheme`/`:path` and require
+%%   `:authority` (we accept the simpler "GET-style" request shape
+%%   here; CONNECT and Extended CONNECT for WebSocket-over-h2
+%%   support arrive later).
+%% - Pseudo-headers MUST appear before regular headers; mixing is
+%%   a `protocol_error`.
+%% - Pseudo-headers other than the four defined are rejected.
+%% - `:path` MUST NOT be empty (an h2 client should send `/` for
+%%   the origin form).
+%% - Header field names MUST be lowercase — already enforced by
+%%   `roadrunner_http2_hpack:decode/2`.
+%% - `Connection`-specific headers MUST NOT appear (RFC 9113
+%%   §8.2.2). Rejected.
 
 -export([from_headers/3]).
 

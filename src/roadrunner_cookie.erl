@@ -15,6 +15,23 @@ Provides `parse/1` for the request-side `Cookie` header and
 
 -export_type([serialize_opts/0]).
 
+-doc """
+Optional attributes for the `Set-Cookie` header per RFC 6265 §4.1.
+
+- `domain` — explicit `Domain` attribute. Default is the response
+  host (no `Domain` attribute emitted), which limits the cookie
+  to that exact host.
+- `path` — explicit `Path` attribute. Default is `/`.
+- `max_age` — seconds until the cookie expires. `0` deletes the
+  cookie. Browsers prefer `Max-Age` over `Expires` when both are
+  present (RFC 6265 §5.3 step 3).
+- `expires` — IMF-fixdate string for clients that ignore
+  `Max-Age` (use `roadrunner_http:format_http_date/1`).
+- `secure` — restrict transmission to HTTPS.
+- `http_only` — hide from JavaScript (`document.cookie`).
+- `same_site` — cross-site request policy: `strict`, `lax`, or
+  `none`. `none` requires `secure => true`.
+""".
 -type serialize_opts() :: #{
     domain => binary(),
     path => binary(),
@@ -82,7 +99,7 @@ with one of:
   `Expires` contains a CTL or `;` (the bytes that would let a
   malicious caller smuggle attributes or split the header line)
 
-Crashing matches the discipline of `roadrunner_http1:check_header_safe/2`:
+Crashing matches the discipline applied elsewhere in the framework:
 a programmer bug echoing user input into a cookie turns into a 500, not
 a wire-level vulnerability.
 """.

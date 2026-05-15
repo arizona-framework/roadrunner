@@ -1,56 +1,56 @@
 -module(roadrunner_conn_loop_http2).
--moduledoc """
-HTTP/2 (RFC 9113) connection process.
+-moduledoc false.
 
-Driven by either TLS ALPN-negotiated `h2` or a plaintext listener
-configured with `protocols => [http2]` (RFC 7540 §3.4 prior-knowledge).
-The dispatch decision lives in `roadrunner_conn_loop:awaiting_shoot/3`;
-this module is transport-agnostic and reads frames via
-`roadrunner_transport:recv/3` either way.
-
-Phase H8b — true multiplexing with per-stream workers. The conn
-process owns:
-
-- the active-mode socket (sole reader / writer of bytes),
-- the HPACK encoder / decoder (single context per direction
-  shared across all streams),
-- the connection-level flow-control windows and per-stream
-  windows / pending-send queues,
-- a `streams` map keyed by stream id, and `worker_refs` mapping
-  monitor refs back to stream ids for `'DOWN'` correlation.
-
-Once a request stream finishes receiving (HEADERS + body +
-END_STREAM), the conn spawns a `roadrunner_http2_stream_worker`
-process. The worker resolves the route, runs middleware + handler,
-and translates the response into messages back to the conn:
-
-```
-{h2_send_headers, Worker, Ref, StreamId, Status, Headers, EndStream}
-{h2_send_data,    Worker, Ref, StreamId, Bin,    EndStream}
-{h2_send_trailers, Worker, Ref, StreamId, Trailers}
-{h2_worker_done,  StreamId}
-```
-
-The conn replies `{h2_send_ack, Ref}` once the corresponding
-frame(s) are on the wire — so workers are synchronously
-back-pressured against flow control without buffering.
-
-Workers are spawn_monitored (NOT linked) so a handler crash
-resets only the affected stream — `'DOWN'` triggers
-`RST_STREAM(INTERNAL_ERROR)` and the other in-flight streams
-keep running. `MAX_CONCURRENT_STREAMS=100` is advertised; HEADERS
-beyond that limit get `RST_STREAM(REFUSED_STREAM)`.
-
-Response shapes supported:
-
-| shape | h2 |
-|---|---|
-| `{Status, Headers, Body}` (buffered) | yes |
-| `{stream, _, _, Fun}` | yes |
-| `{loop, _}` | yes (worker enters handle_info loop) |
-| `{sendfile, _}` | yes (chunked DATA via the stream-response engine) |
-| `{websocket, _, _}` | 501 (Phase H13) |
-""".
+%% HTTP/2 (RFC 9113) connection process.
+%%
+%% Driven by either TLS ALPN-negotiated `h2` or a plaintext listener
+%% configured with `protocols => [http2]` (RFC 7540 §3.4 prior-knowledge).
+%% The dispatch decision lives in `roadrunner_conn_loop:awaiting_shoot/3`;
+%% this module is transport-agnostic and reads frames via
+%% `roadrunner_transport:recv/3` either way.
+%%
+%% Phase H8b — true multiplexing with per-stream workers. The conn
+%% process owns:
+%%
+%% - the active-mode socket (sole reader / writer of bytes),
+%% - the HPACK encoder / decoder (single context per direction
+%%   shared across all streams),
+%% - the connection-level flow-control windows and per-stream
+%%   windows / pending-send queues,
+%% - a `streams` map keyed by stream id, and `worker_refs` mapping
+%%   monitor refs back to stream ids for `'DOWN'` correlation.
+%%
+%% Once a request stream finishes receiving (HEADERS + body +
+%% END_STREAM), the conn spawns a `roadrunner_http2_stream_worker`
+%% process. The worker resolves the route, runs middleware + handler,
+%% and translates the response into messages back to the conn:
+%%
+%% ```
+%% {h2_send_headers, Worker, Ref, StreamId, Status, Headers, EndStream}
+%% {h2_send_data,    Worker, Ref, StreamId, Bin,    EndStream}
+%% {h2_send_trailers, Worker, Ref, StreamId, Trailers}
+%% {h2_worker_done,  StreamId}
+%% ```
+%%
+%% The conn replies `{h2_send_ack, Ref}` once the corresponding
+%% frame(s) are on the wire — so workers are synchronously
+%% back-pressured against flow control without buffering.
+%%
+%% Workers are spawn_monitored (NOT linked) so a handler crash
+%% resets only the affected stream — `'DOWN'` triggers
+%% `RST_STREAM(INTERNAL_ERROR)` and the other in-flight streams
+%% keep running. `MAX_CONCURRENT_STREAMS=100` is advertised; HEADERS
+%% beyond that limit get `RST_STREAM(REFUSED_STREAM)`.
+%%
+%% Response shapes supported:
+%%
+%% | shape | h2 |
+%% |---|---|
+%% | `{Status, Headers, Body}` (buffered) | yes |
+%% | `{stream, _, _, Fun}` | yes |
+%% | `{loop, _}` | yes (worker enters handle_info loop) |
+%% | `{sendfile, _}` | yes (chunked DATA via the stream-response engine) |
+%% | `{websocket, _, _}` | 501 (Phase H13) |
 
 -export([enter/5]).
 

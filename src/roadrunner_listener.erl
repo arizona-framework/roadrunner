@@ -4,10 +4,10 @@ Listener gen_server — owns the listening socket and the acceptor pool
 for one named roadrunner instance.
 
 Plain TCP is backed by `gen_tcp` with the legacy `inet_drv` backend.
-The OTP-27 `{inet_backend, socket}` NIF path was tried but adds ~46%
-own-time overhead on short-lived connections via per-socket-option
-lookups (see `docs/conn_lifecycle_investigation.md`). TLS is backed
-by `ssl`, gated by the `tls` opt.
+The OTP-27 `{inet_backend, socket}` NIF path was tried but adds
+significant own-time overhead on short-lived connections via
+per-socket-option lookups. TLS is backed by `ssl`, gated by the
+`tls` opt.
 Both paths share the same `roadrunner_transport` tagged-socket abstraction.
 
 On `init/1` the listener opens the listen socket, builds the shared
@@ -37,6 +37,54 @@ All duration and interval values in `opts()` are in milliseconds —
 -define(DEFAULT_MAX_CLIENTS, 150).
 -define(DEFAULT_MIN_BYTES_PER_SECOND, 100).
 
+-doc """
+Listener configuration map.
+
+Required:
+- `port` — TCP port to bind. `0` lets the kernel pick an ephemeral
+  port; query it back with `port/1`.
+
+Routing (pick one):
+- `routes => module()` — single-handler dispatch. Every request
+  goes to `Module:handle/1`.
+- `routes => roadrunner_router:routes()` — list of
+  `{Path, Handler, Opts}` tuples; first match wins.
+
+Optional middleware and timing knobs (durations in milliseconds):
+- `middlewares` — listener-wide pipeline applied to every request.
+- `max_content_length` — request-body cap; over-cap reads return
+  `payload_too_large`. Default 10 MB.
+- `request_timeout` — header-read timeout on a fresh conn.
+  Default 30 s.
+- `keep_alive_timeout` — idle timeout between requests on a
+  keep-alive conn. Default 60 s.
+- `num_acceptors` — size of the acceptor pool. Default 10.
+- `max_keep_alive_requests` — requests served per conn before
+  forced close. Default 1000.
+- `max_clients` — concurrent connection cap. Default 150.
+- `min_bytes_per_second` — slow-loris guard on the request-read
+  phase (0 disables). Default 100.
+- `rate_check_interval` — how often the rate guard re-checks
+  (ms). Default 1000.
+- `body_buffering` — `auto` (default; framework reads the full
+  body before invoking the handler) or `manual` (handler calls
+  `roadrunner_req:read_body/1,2`).
+- `slot_reconciliation` — `disabled` (default) or
+  `#{interval := Ms}` to periodically reap slots orphaned by
+  brutal-kill exits.
+- `graceful_drain` — opt out of the per-conn pg drain group
+  (`true` default; `false` trades drain notification for ~10 %
+  lower per-conn overhead on short-lived workloads).
+- `hibernate_after` — when set, idle conns hibernate after this
+  many milliseconds of main-loop idle time.
+- `protocols` — list of `t:protocol_entry/0`. Default `[http1]`.
+  On TLS this drives `alpn_preferred_protocols` automatically.
+- `tls` — `[ssl:tls_server_option()]` for HTTPS. Empty / absent
+  for plain HTTP.
+
+The inline source comments next to each field carry the deeper
+ops-tuning rationale.
+""".
 -type opts() :: #{
     port := inet:port_number(),
     routes => module() | roadrunner_router:routes(),
@@ -123,8 +171,38 @@ All duration and interval values in `opts()` are in milliseconds —
     tls => [ssl:tls_server_option()]
 }.
 
+-doc """
+One protocol entry in the listener's `protocols` list. Either a
+bare atom (`http1` / `http2`) for default opts, or a tuple
+`{Proto, ProtoOpts}` carrying protocol-specific tuning. HTTP/1
+currently has no tunables (its opts map must be empty); HTTP/2
+tunables live under `t:http2_opts/0`.
+
+On TLS the list drives `alpn_preferred_protocols`. On plain TCP,
+`[http2]` means prior-knowledge h2c (client sends the h2 preface
+directly); `[http1, http2]` on plain TCP is rejected at `init/1`
+since there's no `Upgrade: h2c` implementation.
+""".
 -type protocol_entry() :: http1 | http2 | {http1, #{}} | {http2, http2_opts()}.
 
+-doc """
+HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
+
+- `conn_window` — connection-level receive window peak in bytes
+  (`1..2^31-1`). RFC 9113 default `65535`; values above the
+  default emit an early `WINDOW_UPDATE(0, peak - 65535)` after
+  the server SETTINGS. Worst-case memory is
+  `max_clients × peak`.
+- `stream_window` — stream-level receive window peak in bytes
+  (`1..2^31-1`). Advertised via `SETTINGS_INITIAL_WINDOW_SIZE`.
+  Default `65535`. Setting above `conn_window` is allowed but
+  not useful — the conn-level peak is the binding constraint.
+- `window_refill_threshold` — refill trigger in bytes. When the
+  remaining window drops below this, the conn refills back to
+  the peak. Lower threshold = fewer `WINDOW_UPDATE` frames per
+  byte consumed but a smaller live window between refills.
+  Default `32768`.
+""".
 -type http2_opts() :: #{
     conn_window => 1..16#7FFFFFFF,
     stream_window => 1..16#7FFFFFFF,
@@ -245,7 +323,7 @@ reload_routes(Name, Routes) ->
     gen_server:call(Name, {reload_routes, Routes}).
 
 %% --- gen_server callbacks ---
-
+-doc false.
 -spec init(opts()) -> {ok, #state{}} | {stop, term()}.
 init(#{port := Port} = Opts) ->
     ListenerName = listener_name(),
@@ -561,6 +639,7 @@ build_dispatch(#{routes := Routes}, ListenerName) when is_list(Routes) ->
 build_dispatch(_Opts, _ListenerName) ->
     {handler, roadrunner_default_handler}.
 
+-doc false.
 -spec handle_call(
     port
     | info
@@ -647,10 +726,12 @@ wait_for_drain(Counter, Deadline, Group) ->
 drain_group(#{listener_name := Name}) ->
     {roadrunner_drain, Name}.
 
+-doc false.
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+-doc false.
 -spec handle_info(term(), #state{}) -> {noreply, #state{}}.
 handle_info(reconcile_slots, #state{reconciliation = disabled} = State) ->
     %% Race: a `slot_reconciliation` opt change between scheduling and
@@ -719,6 +800,7 @@ count_up_to(_, Cap, N) when N >= Cap -> Cap;
 count_up_to([], _Cap, N) -> N;
 count_up_to([_ | T], Cap, N) -> count_up_to(T, Cap, N + 1).
 
+-doc false.
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, #state{listen_socket = LSocket, proto_opts = ProtoOpts}) ->
     erase_routes(ProtoOpts),

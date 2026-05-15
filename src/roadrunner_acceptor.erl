@@ -1,15 +1,15 @@
 -module(roadrunner_acceptor).
--moduledoc """
-Acceptor process — spins on `gen_tcp:accept/1` for a listen socket
-and hands each accepted connection off to a `roadrunner_conn` worker.
+-moduledoc false.
 
-Spawn-linked to the owning `roadrunner_listener`: a listener stop closes
-the listen socket, the acceptor's `accept/1` returns `{error, _}`,
-and the acceptor exits cleanly. Unrelated acceptor crashes propagate
-back via the link, taking the listener down for supervisor restart.
-Connection workers are spawned **without** a link so that a crash
-in one connection does not bring down the acceptor.
-""".
+%% Acceptor process — spins on `gen_tcp:accept/1` for a listen socket
+%% and hands each accepted connection off to a `roadrunner_conn` worker.
+%%
+%% Spawn-linked to the owning `roadrunner_listener`: a listener stop closes
+%% the listen socket, the acceptor's `accept/1` returns `{error, _}`,
+%% and the acceptor exits cleanly. Unrelated acceptor crashes propagate
+%% back via the link, taking the listener down for supervisor restart.
+%% Connection workers are spawned **without** a link so that a crash
+%% in one connection does not bring down the acceptor.
 
 -export([start_link/3]).
 

@@ -1,13 +1,13 @@
 -module(roadrunner_http1).
--moduledoc """
-HTTP/1.1 wire codec — pure binary parsers and encoders.
+-moduledoc false.
 
-All functions are pure and incremental: parsers accept partial inputs
-and return `{more, _}` until a complete unit can be decoded. They never
-raise on hostile input — malformed bytes from the wire become
-tagged `{error, _}` results, leaving the caller in control of the
-response (`400`, `414`, `431`, etc.).
-""".
+%% HTTP/1.1 wire codec — pure binary parsers and encoders.
+%%
+%% All functions are pure and incremental: parsers accept partial inputs
+%% and return `{more, _}` until a complete unit can be decoded. They never
+%% raise on hostile input — malformed bytes from the wire become
+%% tagged `{error, _}` results, leaving the caller in control of the
+%% response (`400`, `414`, `431`, etc.).
 
 -export([
     parse_request_line/1,

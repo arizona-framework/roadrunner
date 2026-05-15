@@ -1,34 +1,34 @@
 -module(roadrunner_http2_stream_response).
--moduledoc """
-HTTP/2 `{stream, ...}` response — body delivered as one or more
-DATA frames, with optional trailers as a closing HEADERS frame.
+-moduledoc false.
 
-Mirrors `roadrunner_stream_response` so the handler-facing
-`Send/2` API stays protocol-agnostic. Translation table:
-
-| `Send(Data, FinFlag)` | h1 wire | h2 wire |
-|---|---|---|
-| `Send(Data, nofin)` | one chunk | DATA, no END_STREAM |
-| `Send(Data, fin)` | chunk + `0\\r\\n\\r\\n` | DATA + END_STREAM |
-| `Send(Data, {fin, Trailers})` | chunk + `0` + trailers | DATA + HEADERS + END_STREAM |
-
-Empty data is special-cased to match the h1 behavior:
-- `Send(<<>>, nofin)` is a no-op (no zero-length DATA frame).
-- `Send(<<>>, fin)` emits an empty DATA frame with END_STREAM.
-- `Send(<<>>, {fin, Trailers})` emits the trailer HEADERS frame
-  (with END_STREAM) and no DATA.
-
-The `Send` callback runs in the worker process and synchronously
-round-trips with the conn process for each emission — `Send`
-returns only after the conn has written the corresponding frame
-on the wire (or queued it pending a `WINDOW_UPDATE`). This
-threads natural backpressure: a slow consumer stalls the worker
-without us having to explicitly buffer.
-
-If the handler returns without calling `Send(_, fin)` /
-`{fin, _}` we auto-close the stream with an empty `END_STREAM`
-DATA frame so the peer doesn't see a half-open stream.
-""".
+%% HTTP/2 `{stream, ...}` response — body delivered as one or more
+%% DATA frames, with optional trailers as a closing HEADERS frame.
+%%
+%% Mirrors `roadrunner_stream_response` so the handler-facing
+%% `Send/2` API stays protocol-agnostic. Translation table:
+%%
+%% | `Send(Data, FinFlag)` | h1 wire | h2 wire |
+%% |---|---|---|
+%% | `Send(Data, nofin)` | one chunk | DATA, no END_STREAM |
+%% | `Send(Data, fin)` | chunk + `0\\r\\n\\r\\n` | DATA + END_STREAM |
+%% | `Send(Data, {fin, Trailers})` | chunk + `0` + trailers | DATA + HEADERS + END_STREAM |
+%%
+%% Empty data is special-cased to match the h1 behavior:
+%% - `Send(<<>>, nofin)` is a no-op (no zero-length DATA frame).
+%% - `Send(<<>>, fin)` emits an empty DATA frame with END_STREAM.
+%% - `Send(<<>>, {fin, Trailers})` emits the trailer HEADERS frame
+%%   (with END_STREAM) and no DATA.
+%%
+%% The `Send` callback runs in the worker process and synchronously
+%% round-trips with the conn process for each emission — `Send`
+%% returns only after the conn has written the corresponding frame
+%% on the wire (or queued it pending a `WINDOW_UPDATE`). This
+%% threads natural backpressure: a slow consumer stalls the worker
+%% without us having to explicitly buffer.
+%%
+%% If the handler returns without calling `Send(_, fin)` /
+%% `{fin, _}` we auto-close the stream with an empty `END_STREAM`
+%% DATA frame so the peer doesn't see a half-open stream.
 
 -export([run/5]).
 

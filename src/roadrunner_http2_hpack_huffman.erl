@@ -1,37 +1,37 @@
 -module(roadrunner_http2_hpack_huffman).
--moduledoc """
-HPACK Huffman codec (RFC 7541 §5.2 + Appendix B).
+-moduledoc false.
 
-The static Huffman code table maps each of the 256 byte values plus
-an end-of-string symbol (id 256) to a variable-length bit string of
-5 to 30 bits. Encoded strings are zero-padded with `1`-bits at the
-end of the final byte to reach a byte boundary; the EOS symbol
-(`11111111 11111111 11111111 111111`) is **never** emitted as part
-of a string and MUST trigger a decode error if it appears.
-
-## Encoding
-
-`encode(Bin)` walks the input byte-by-byte, looking up each byte's
-code in the encode table (a 256-element tuple of `{NumBits, Code}`)
-and packing the bits into the output via a small accumulator.
-EOS-padding is applied at the end.
-
-## Decoding
-
-`decode(Bin)` uses a 4-bit-nibble state machine. Each state has
-16 transitions; a transition either emits 0/1/2 bytes and lands
-in a new state, or rejects with `eos_in_string` (EOS symbol seen
-mid-string) or `invalid_huffman` (no path through the tree).
-
-The state table is a tuple keyed by state id (state 0 is the root
-of the prefix tree); each entry is `{TransitionsTuple, AcceptFlag}`.
-A state is accepting if pad bits (all `1`s) from this point lie on
-the EOS path of the tree — i.e. terminating the input here is
-valid.
-
-Both tables are constructed at module-load time and stashed in
-`persistent_term` so the hot path does no allocation.
-""".
+%% HPACK Huffman codec (RFC 7541 §5.2 + Appendix B).
+%%
+%% The static Huffman code table maps each of the 256 byte values plus
+%% an end-of-string symbol (id 256) to a variable-length bit string of
+%% 5 to 30 bits. Encoded strings are zero-padded with `1`-bits at the
+%% end of the final byte to reach a byte boundary; the EOS symbol
+%% (`11111111 11111111 11111111 111111`) is **never** emitted as part
+%% of a string and MUST trigger a decode error if it appears.
+%%
+%% ## Encoding
+%%
+%% `encode(Bin)` walks the input byte-by-byte, looking up each byte's
+%% code in the encode table (a 256-element tuple of `{NumBits, Code}`)
+%% and packing the bits into the output via a small accumulator.
+%% EOS-padding is applied at the end.
+%%
+%% ## Decoding
+%%
+%% `decode(Bin)` uses a 4-bit-nibble state machine. Each state has
+%% 16 transitions; a transition either emits 0/1/2 bytes and lands
+%% in a new state, or rejects with `eos_in_string` (EOS symbol seen
+%% mid-string) or `invalid_huffman` (no path through the tree).
+%%
+%% The state table is a tuple keyed by state id (state 0 is the root
+%% of the prefix tree); each entry is `{TransitionsTuple, AcceptFlag}`.
+%% A state is accepting if pad bits (all `1`s) from this point lie on
+%% the EOS path of the tree — i.e. terminating the input here is
+%% valid.
+%%
+%% Both tables are constructed at module-load time and stashed in
+%% `persistent_term` so the hot path does no allocation.
 
 -on_load(init_tables/0).
 

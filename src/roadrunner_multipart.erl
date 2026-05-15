@@ -2,13 +2,16 @@
 -moduledoc """
 Parser for `multipart/form-data` request bodies (RFC 7578).
 
-Two entry points:
+Three entry points:
 
 - `boundary/1` — pull the `boundary=…` parameter out of a
   `Content-Type` header value, handling unquoted, quoted, and
   parameter-mixed forms.
 - `parse/2` — split a buffered body into a list of `part()` maps,
   each with its own `headers` and decoded `body`.
+- `params/1` — parse the `key=value` parameters of any structured
+  header value (e.g. `Content-Type`, `Content-Disposition`) into
+  a lowercase-keyed map.
 
 Typical handler shape:
 
@@ -63,6 +66,12 @@ listener's `max_content_length` (default 10 MB).
 -export([parse/2, boundary/1, params/1]).
 -export_type([part/0]).
 
+-doc """
+One section of a parsed `multipart/form-data` body. `headers` is
+the part's headers (names lowercased, values OWS-trimmed) as a list
+of `{Name, Value}` binaries; `body` is the raw bytes between
+end-of-headers and the next boundary.
+""".
 -type part() :: #{
     headers := [{binary(), binary()}],
     body := binary()

@@ -1,64 +1,64 @@
 -module(roadrunner_ws_session).
--moduledoc """
-Per-connection WebSocket session — runs the frame loop in its own
-`gen_statem` process after `roadrunner_conn:upgrade_to_websocket/4`
-hands the socket off.
+-moduledoc false.
 
-The session owns the socket for its lifetime: the parent `roadrunner_conn`
-launcher (`run/4`) starts the session, transfers controlling-process,
-sends the `socket_ready` startup signal (mirroring the conn's `shoot`
-pattern), and waits via a monitor for the session to terminate.
-When the session exits — peer close frame, recv error, frame parse
-error, or handler-driven `{close, _}` — the launcher returns and the
-parent's `[roadrunner, listener, conn_close]` telemetry fires after.
-
-States:
-- `awaiting_socket` — gates the frame loop until controlling-process
-  has transferred and the launcher has sent `socket_ready`.
-- `frame_loop` — parse/dispatch frames as they arrive; the socket
-  is in active-once mode so bytes arrive as `info` events and the
-  gen_statem returns to its main loop between frames.
-
-## Active-mode reads
-
-`frame_loop` uses active-once reads (`roadrunner_transport:setopts(_,
-[{active, once}])`): after each event the state callback returns,
-gen_statem is idle in its main loop, and `hibernate` actions
-actually take effect. Without active mode we'd be blocked inside
-`roadrunner_transport:recv/3` and hibernation would be a no-op.
-
-## Handler hibernation opt-in
-
-The `roadrunner_ws_handler` callback supports an optional 4-tuple
-return shape: `{reply, OutFrames, NewState, Opts}` and
-`{ok, NewState, Opts}`, where `Opts` is a list that may contain
-`hibernate`. When present, the gen_statem hibernates after this
-event is fully processed — process heap drops to ~1KB until the
-next inbound frame wakes it up. For an idle WebSocket session
-this is the difference between holding ~5–8KB of process memory
-indefinitely vs. ~1KB.
-
-3-tuple returns (`{reply, OutFrames, NewState}`, `{ok, NewState}`,
-`{close, NewState}`) stay valid — the 4-tuple is purely additive.
-
-## Optional handler callbacks
-
-`init/1` runs once on the awaiting_socket → frame_loop transition,
-**before** the first inbound frame; the handler can push priming
-frames or refuse the session by returning `{close, _}`. `handle_info/2`
-receives any non-transport info message (a pubsub broadcast a handler
-subscribed to in `init/1`, an exit signal from a linked worker, etc.)
-and returns the same shape as `handle_frame/2`. Both are
-`-optional_callbacks` — handlers that don't export them get the
-old behavior (no init action, stray info dropped silently). Whether
-each is exported is cached in `#data` at session start so the BIF
-check doesn't run on every event.
-
-Telemetry: `[roadrunner, ws, upgrade]` fires from `run/4` once the
-launcher has decided to enter the session; `[roadrunner, ws, frame_in]`
-and `[roadrunner, ws, frame_out]` fire from the gen_statem itself for
-every frame.
-""".
+%% Per-connection WebSocket session — runs the frame loop in its own
+%% `gen_statem` process after `roadrunner_conn:upgrade_to_websocket/4`
+%% hands the socket off.
+%%
+%% The session owns the socket for its lifetime: the parent `roadrunner_conn`
+%% launcher (`run/4`) starts the session, transfers controlling-process,
+%% sends the `socket_ready` startup signal (mirroring the conn's `shoot`
+%% pattern), and waits via a monitor for the session to terminate.
+%% When the session exits — peer close frame, recv error, frame parse
+%% error, or handler-driven `{close, _}` — the launcher returns and the
+%% parent's `[roadrunner, listener, conn_close]` telemetry fires after.
+%%
+%% States:
+%% - `awaiting_socket` — gates the frame loop until controlling-process
+%%   has transferred and the launcher has sent `socket_ready`.
+%% - `frame_loop` — parse/dispatch frames as they arrive; the socket
+%%   is in active-once mode so bytes arrive as `info` events and the
+%%   gen_statem returns to its main loop between frames.
+%%
+%% ## Active-mode reads
+%%
+%% `frame_loop` uses active-once reads (`roadrunner_transport:setopts(_,
+%% [{active, once}])`): after each event the state callback returns,
+%% gen_statem is idle in its main loop, and `hibernate` actions
+%% actually take effect. Without active mode we'd be blocked inside
+%% `roadrunner_transport:recv/3` and hibernation would be a no-op.
+%%
+%% ## Handler hibernation opt-in
+%%
+%% The `roadrunner_ws_handler` callback supports an optional 4-tuple
+%% return shape: `{reply, OutFrames, NewState, Opts}` and
+%% `{ok, NewState, Opts}`, where `Opts` is a list that may contain
+%% `hibernate`. When present, the gen_statem hibernates after this
+%% event is fully processed — process heap drops to ~1KB until the
+%% next inbound frame wakes it up. For an idle WebSocket session
+%% this is the difference between holding ~5–8KB of process memory
+%% indefinitely vs. ~1KB.
+%%
+%% 3-tuple returns (`{reply, OutFrames, NewState}`, `{ok, NewState}`,
+%% `{close, NewState}`) stay valid — the 4-tuple is purely additive.
+%%
+%% ## Optional handler callbacks
+%%
+%% `init/1` runs once on the awaiting_socket → frame_loop transition,
+%% **before** the first inbound frame; the handler can push priming
+%% frames or refuse the session by returning `{close, _}`. `handle_info/2`
+%% receives any non-transport info message (a pubsub broadcast a handler
+%% subscribed to in `init/1`, an exit signal from a linked worker, etc.)
+%% and returns the same shape as `handle_frame/2`. Both are
+%% `-optional_callbacks` — handlers that don't export them get the
+%% old behavior (no init action, stray info dropped silently). Whether
+%% each is exported is cached in `#data` at session start so the BIF
+%% check doesn't run on every event.
+%%
+%% Telemetry: `[roadrunner, ws, upgrade]` fires from `run/4` once the
+%% launcher has decided to enter the session; `[roadrunner, ws, frame_in]`
+%% and `[roadrunner, ws, frame_out]` fire from the gen_statem itself for
+%% every frame.
 
 -behaviour(gen_statem).
 

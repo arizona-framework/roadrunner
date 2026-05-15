@@ -37,9 +37,8 @@ Tower, and Servant.
 Middleware code never has access to the underlying socket — the
 `Request` map intentionally excludes any socket reference. To
 respond, a middleware **must** return a `Result` (either the one
-from `Next(Req)` or its own response triple); there is no
-`roadrunner_req:reply/4` equivalent to cowboy's mid-flight
-`cowboy_req:reply/4`.
+from `Next(Req)` or its own response triple); there is no `reply`
+escape hatch equivalent to cowboy's mid-flight `cowboy_req:reply/4`.
 
 This is a feature, not a limitation. Bytes only hit the wire from
 one place — the conn process — which means:
@@ -107,12 +106,40 @@ server_header(Req, Next) ->
 -export([compose/2, build_pipeline/3]).
 -export_type([middleware/0, middleware_list/0, next/0]).
 
+-doc """
+The continuation passed to a middleware's `call/2`: a fun that runs
+the rest of the pipeline (other middlewares + the inner handler)
+and returns the same `t:roadrunner_handler:result/0` shape every
+middleware returns.
+""".
 -type next() :: fun((roadrunner_req:request()) -> roadrunner_handler:result()).
+
+-doc """
+A single entry in a `middlewares` list. Either a module that
+implements `-behaviour(roadrunner_middleware)` (its `call/2` is
+invoked) or a `fun((Request, Next) -> Result)` invoked directly.
+""".
 -type middleware() ::
     module()
     | fun((roadrunner_req:request(), next()) -> roadrunner_handler:result()).
+
+-doc "An ordered list of `t:middleware/0` entries.".
 -type middleware_list() :: [middleware()].
 
+-doc """
+The middleware contract. `Request` is the current request map;
+`Next` is a continuation that runs the rest of the pipeline (other
+middlewares + the inner handler) and returns the same
+`t:roadrunner_handler:result/0` shape every middleware returns.
+
+The middleware decides whether to:
+- pass through unchanged (`Next(Req)`),
+- transform the request (`Next(Req#{...})`),
+- short-circuit (return `{Response, Req}` without calling `Next`),
+- wrap the response (let `Next(Req)` run, then transform what it
+  returned),
+- run side effects around the call (log, time, instrument).
+""".
 -callback call(Request :: roadrunner_req:request(), Next :: next()) ->
     roadrunner_handler:result().
 
@@ -132,26 +159,21 @@ compose([Mw | Rest], Handler) ->
     Inner = compose(Rest, Handler),
     fun(Req) -> apply_one(Mw, Req, Inner) end.
 
--doc """
-Build the per-request handler pipeline from listener-level
-middlewares + the request's route-level middlewares (read from
-`Req#{route_opts}`) + a target handler module.
-
-Listener middlewares wrap the route middlewares wrap the handler.
-When BOTH lists are empty, returns `fun Handler:handle/1` directly
-— skipping `compose/2` saves one closure allocation + one
-indirection on the no-mws fast path most production handlers hit.
-Otherwise composes the concatenated list with the handler at the
-center.
-
-Takes the request directly (rather than a pre-computed RouteMws)
-so the route-mws pattern-match is folded into this function — one
-fewer function-call frame than the older `route_middlewares/1`
-chain. Used by both the h1 conn loop
-(`roadrunner_conn_loop:run_pipeline`) and the h2 stream worker
-(`roadrunner_http2_stream_worker:invoke`) so the dispatch shape
-stays identical across protocols.
-""".
+%% Build the per-request handler pipeline from listener-level
+%% middlewares + the request's route-level middlewares (read from
+%% `Req#{route_opts}`) + a target handler module.
+%%
+%% Listener middlewares wrap the route middlewares wrap the handler.
+%% When BOTH lists are empty, returns `fun Handler:handle/1` directly
+%% — skipping `compose/2` saves one closure allocation + one
+%% indirection on the no-mws fast path most production handlers hit.
+%% Otherwise composes the concatenated list with the handler at the
+%% center.
+%%
+%% Used by both the h1 conn loop (`roadrunner_conn_loop:run_pipeline`)
+%% and the h2 stream worker (`roadrunner_http2_stream_worker:invoke`)
+%% so the dispatch shape stays identical across protocols.
+-doc false.
 -spec build_pipeline(middleware_list(), roadrunner_req:request(), module()) -> next().
 build_pipeline([], Req, Handler) ->
     case route_mws(Req) of

@@ -61,8 +61,28 @@ NewState}`, `{ok, NewState}`, `{close, NewState}`, or
 `Opts` list for `hibernate` on the reply / ok shapes.
 """.
 
+-doc """
+Per-event option flags. Currently only `hibernate` is recognized;
+when included in a 4-tuple callback return, the framework hibernates
+the session process after the event finishes processing.
+""".
 -type opt() :: hibernate.
 
+-doc """
+Unified return shape for all `roadrunner_ws_handler` callbacks.
+
+- `{reply, Frames, NewState}` — emit each `{Opcode, Payload}` frame
+  (always with FIN=true) and keep the session open.
+- `{reply, Frames, NewState, Opts}` — same, with an opt list (e.g.
+  `[hibernate]`).
+- `{ok, NewState}` — no outbound frames, keep the session open.
+- `{ok, NewState, Opts}` — same, with an opt list.
+- `{close, NewState}` — send an empty close frame and terminate.
+- `{close, Code, Reason, NewState}` — send a close frame carrying
+  `Code` (RFC 6455 §7.4 server-permitted code) and UTF-8 `Reason`.
+  The framework crashes the session if `Code` / `Reason` is invalid
+  rather than emit a malformed close.
+""".
 -type result() ::
     {reply, Frames :: [{roadrunner_ws:opcode(), iodata()}], NewState :: term()}
     | {reply, Frames :: [{roadrunner_ws:opcode(), iodata()}], NewState :: term(), [opt()]}
@@ -71,8 +91,35 @@ NewState}`, `{ok, NewState}`, `{close, NewState}`, or
     | {close, NewState :: term()}
     | {close, Code :: roadrunner_ws:close_code(), Reason :: iodata(), NewState :: term()}.
 
+-doc """
+Optional. Runs once in the session process after the 101 has been
+written to the wire and before the first frame is read, with the
+state from the upgrade tuple `{websocket, Module, State}`. Use it
+to register pubsub subscriptions, start linked workers, or push
+priming frames at connect-time. Returns the same shape as
+`handle_frame/2`. Handlers that don't export this callback skip
+the init step.
+""".
 -callback init(State :: term()) -> result().
+
+-doc """
+Invoked for each non-control frame received from the client, after
+the framework has reassembled fragmented messages (so the handler
+always sees a complete `text` or `binary` payload). Returns one of
+the `result/0` shapes: reply with frames, stay open, close
+gracefully, or close with a code + reason. Control frames
+(`ping`/`pong`/`close`) are auto-handled by the framework and
+never reach this callback.
+""".
 -callback handle_frame(Frame :: roadrunner_ws:frame(), State :: term()) -> result().
+
+-doc """
+Optional. Receives any Erlang message delivered to the session
+process that isn't a transport `active`-mode event. Use for
+pubsub / asynchronous push patterns. Returns the same shape as
+`handle_frame/2`. Handlers that don't export this callback have
+unknown messages dropped silently.
+""".
 -callback handle_info(Info :: term(), State :: term()) -> result().
 
 -optional_callbacks([init/1, handle_info/2]).

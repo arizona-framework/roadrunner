@@ -1,126 +1,126 @@
 -module(roadrunner_telemetry).
--moduledoc """
-Telemetry event emitters for roadrunner.
+-moduledoc false.
 
-Centralizes the event names and the metadata shape so subscribers
-have one module to grep for and tests have one place to attach.
-
-## Events
-
-- `[roadrunner, request, start]` — fired by `roadrunner_conn` once a request's
-  headers parse and `request_id` is assigned, before the
-  middleware/handler pipeline is invoked.
-
-  - **Measurements:** `system_time` (`erlang:system_time/0`).
-  - **Metadata:** `request_id`, `peer`, `method`, `path`, `scheme`,
-    `listener_name`.
-
-- `[roadrunner, request, stop]` — fired after the handler's response is
-  written to the wire (or, for `stream`/`loop`/`websocket`, after the
-  initial dispatch returns).
-
-  - **Measurements:** `duration` in `native` time units. Convert
-    with `erlang:convert_time_unit(Duration, native, microsecond)`.
-  - **Metadata:** start metadata + `status` (response code, `101`
-    for websocket upgrades) and `response_kind`
-    (`buffered | stream | loop | websocket`).
-
-- `[roadrunner, request, exception]` — fired when the
-  middleware/handler pipeline raises. The exception is rethrown
-  after the event is emitted so the conn's existing 500-on-crash
-  path is preserved.
-
-  - **Measurements:** `duration`.
-  - **Metadata:** start metadata + `kind` (`error | exit | throw`)
-    and `reason`.
-
-- `[roadrunner, response, send_failed]` — fired when a primary response
-  write (`buffered_response`, `stream_response_head`,
-  `loop_response_head`, or `websocket_upgrade_response`) returns
-  `{error, _}`. Status line was already going on the wire, so the
-  conn closes shortly after; this event lets operators correlate
-  the failure with the `request_id` from the conn's `logger`
-  process metadata.
-
-  - **Measurements:** `system_time`.
-  - **Metadata:** `phase`, `reason`, plus the conn's logger
-    process metadata (`request_id`, `peer`, `method`, `path`).
-
-- `[roadrunner, listener, accept]` — fired in the conn process once
-  the acceptor's `shoot` signal has been received and the peername
-  is known. Subscribers can use this to drive a "live connections"
-  gauge or correlate with `[roadrunner, listener, conn_close]`.
-
-  - **Measurements:** `system_time`.
-  - **Metadata:** `listener_name`, `peer`.
-
-- `[roadrunner, listener, conn_close]` — fired when the conn process is
-  about to exit (after the keep-alive loop ends, before the after-
-  clause releases the slot). `requests_served` is the count of
-  successfully-parsed requests on this conn; parse failures and
-  silent timeout/slow-client kicks are NOT counted.
-
-  - **Measurements:** `duration` in `native` time units.
-  - **Metadata:** `listener_name`, `peer`, `requests_served`.
-
-- `[roadrunner, ws, upgrade]` — fired in the conn process once the
-  WebSocket handshake response has been written. Marks the
-  transition from HTTP/1.1 keep-alive into the WS frame loop.
-
-  - **Measurements:** `system_time`.
-  - **Metadata:** `listener_name`, `peer`, `request_id`, `module`
-    (the `roadrunner_ws_handler` module driving the loop).
-
-- `[roadrunner, ws, frame_in]` — fired for every frame parsed from the
-  client, including control frames (`ping`, `pong`, `close`) that
-  the conn handles internally before delegating to the user
-  handler.
-
-  - **Measurements:** `system_time`, `payload_size` (bytes).
-  - **Metadata:** `listener_name`, `peer`, `request_id`, `module`,
-    `opcode` (`text | binary | continuation | close | ping | pong`).
-
-- `[roadrunner, ws, frame_out]` — fired for every frame written back to
-  the client: handler `{reply, ...}` outputs, automatic pong
-  responses, and the close frame on shutdown. Each frame in a
-  batched `{reply, [F1, F2, ...]}` produces one event.
-
-  - **Measurements:** `system_time`, `payload_size` (bytes).
-  - **Metadata:** `listener_name`, `peer`, `request_id`, `module`,
-    `opcode`.
-
-The `start_time` value returned by `request_start/1` must be passed
-back into `request_stop/3` / `request_exception/4` to compute
-`duration`. Subscribers can wire up via `telemetry:attach/4` in
-production or `telemetry_test:attach_event_handlers/2` in tests.
-
-## Stability
-
-The following events have a **stable** contract — event name,
-measurement keys, and the listed metadata keys will not change
-without a major-version bump:
-
-- `[roadrunner, request, stop]` — measurements: `duration`
-  (native units). Metadata: `request_id`, `peer`, `method`,
-  `path`, `scheme`, `listener_name`, `status`, `response_kind`.
-- `[roadrunner, ws, upgrade]` — measurements: `system_time`.
-  Metadata: `listener_name`, `peer`, `request_id`, `module`.
-- `[roadrunner, ws, frame_out]` — measurements: `system_time`,
-  `payload_size`. Metadata: `listener_name`, `peer`,
-  `request_id`, `module`, `opcode`.
-
-All other events listed above (`request, start`,
-`request, exception`, `response, send_failed`,
-`listener, accept`, `listener, conn_close`,
-`request, rejected`, `listener, slots_reconciled`,
-`drain, acknowledged`, `ws, frame_in`) are **unstable**: their
-event name, measurement keys, or metadata schema may change in
-any minor release. Production subscribers depending on those
-events should pin a roadrunner version.
-
-Stable events may gain *additional* metadata keys in any release;
-they will not lose or rename listed keys without a major bump.
-""".
+%% Telemetry event emitters for roadrunner.
+%%
+%% Centralizes the event names and the metadata shape so subscribers
+%% have one module to grep for and tests have one place to attach.
+%%
+%% ## Events
+%%
+%% - `[roadrunner, request, start]` — fired by `roadrunner_conn` once a request's
+%%   headers parse and `request_id` is assigned, before the
+%%   middleware/handler pipeline is invoked.
+%%
+%%   - **Measurements:** `system_time` (`erlang:system_time/0`).
+%%   - **Metadata:** `request_id`, `peer`, `method`, `path`, `scheme`,
+%%     `listener_name`.
+%%
+%% - `[roadrunner, request, stop]` — fired after the handler's response is
+%%   written to the wire (or, for `stream`/`loop`/`websocket`, after the
+%%   initial dispatch returns).
+%%
+%%   - **Measurements:** `duration` in `native` time units. Convert
+%%     with `erlang:convert_time_unit(Duration, native, microsecond)`.
+%%   - **Metadata:** start metadata + `status` (response code, `101`
+%%     for websocket upgrades) and `response_kind`
+%%     (`buffered | stream | loop | websocket`).
+%%
+%% - `[roadrunner, request, exception]` — fired when the
+%%   middleware/handler pipeline raises. The exception is rethrown
+%%   after the event is emitted so the conn's existing 500-on-crash
+%%   path is preserved.
+%%
+%%   - **Measurements:** `duration`.
+%%   - **Metadata:** start metadata + `kind` (`error | exit | throw`)
+%%     and `reason`.
+%%
+%% - `[roadrunner, response, send_failed]` — fired when a primary response
+%%   write (`buffered_response`, `stream_response_head`,
+%%   `loop_response_head`, or `websocket_upgrade_response`) returns
+%%   `{error, _}`. Status line was already going on the wire, so the
+%%   conn closes shortly after; this event lets operators correlate
+%%   the failure with the `request_id` from the conn's `logger`
+%%   process metadata.
+%%
+%%   - **Measurements:** `system_time`.
+%%   - **Metadata:** `phase`, `reason`, plus the conn's logger
+%%     process metadata (`request_id`, `peer`, `method`, `path`).
+%%
+%% - `[roadrunner, listener, accept]` — fired in the conn process once
+%%   the acceptor's `shoot` signal has been received and the peername
+%%   is known. Subscribers can use this to drive a "live connections"
+%%   gauge or correlate with `[roadrunner, listener, conn_close]`.
+%%
+%%   - **Measurements:** `system_time`.
+%%   - **Metadata:** `listener_name`, `peer`.
+%%
+%% - `[roadrunner, listener, conn_close]` — fired when the conn process is
+%%   about to exit (after the keep-alive loop ends, before the after-
+%%   clause releases the slot). `requests_served` is the count of
+%%   successfully-parsed requests on this conn; parse failures and
+%%   silent timeout/slow-client kicks are NOT counted.
+%%
+%%   - **Measurements:** `duration` in `native` time units.
+%%   - **Metadata:** `listener_name`, `peer`, `requests_served`.
+%%
+%% - `[roadrunner, ws, upgrade]` — fired in the conn process once the
+%%   WebSocket handshake response has been written. Marks the
+%%   transition from HTTP/1.1 keep-alive into the WS frame loop.
+%%
+%%   - **Measurements:** `system_time`.
+%%   - **Metadata:** `listener_name`, `peer`, `request_id`, `module`
+%%     (the `roadrunner_ws_handler` module driving the loop).
+%%
+%% - `[roadrunner, ws, frame_in]` — fired for every frame parsed from the
+%%   client, including control frames (`ping`, `pong`, `close`) that
+%%   the conn handles internally before delegating to the user
+%%   handler.
+%%
+%%   - **Measurements:** `system_time`, `payload_size` (bytes).
+%%   - **Metadata:** `listener_name`, `peer`, `request_id`, `module`,
+%%     `opcode` (`text | binary | continuation | close | ping | pong`).
+%%
+%% - `[roadrunner, ws, frame_out]` — fired for every frame written back to
+%%   the client: handler `{reply, ...}` outputs, automatic pong
+%%   responses, and the close frame on shutdown. Each frame in a
+%%   batched `{reply, [F1, F2, ...]}` produces one event.
+%%
+%%   - **Measurements:** `system_time`, `payload_size` (bytes).
+%%   - **Metadata:** `listener_name`, `peer`, `request_id`, `module`,
+%%     `opcode`.
+%%
+%% The `start_time` value returned by `request_start/1` must be passed
+%% back into `request_stop/3` / `request_exception/4` to compute
+%% `duration`. Subscribers can wire up via `telemetry:attach/4` in
+%% production or `telemetry_test:attach_event_handlers/2` in tests.
+%%
+%% ## Stability
+%%
+%% The following events have a **stable** contract — event name,
+%% measurement keys, and the listed metadata keys will not change
+%% without a major-version bump:
+%%
+%% - `[roadrunner, request, stop]` — measurements: `duration`
+%%   (native units). Metadata: `request_id`, `peer`, `method`,
+%%   `path`, `scheme`, `listener_name`, `status`, `response_kind`.
+%% - `[roadrunner, ws, upgrade]` — measurements: `system_time`.
+%%   Metadata: `listener_name`, `peer`, `request_id`, `module`.
+%% - `[roadrunner, ws, frame_out]` — measurements: `system_time`,
+%%   `payload_size`. Metadata: `listener_name`, `peer`,
+%%   `request_id`, `module`, `opcode`.
+%%
+%% All other events listed above (`request, start`,
+%% `request, exception`, `response, send_failed`,
+%% `listener, accept`, `listener, conn_close`,
+%% `request, rejected`, `listener, slots_reconciled`,
+%% `drain, acknowledged`, `ws, frame_in`) are **unstable**: their
+%% event name, measurement keys, or metadata schema may change in
+%% any minor release. Production subscribers depending on those
+%% events should pin a roadrunner version.
+%%
+%% Stable events may gain *additional* metadata keys in any release;
+%% they will not lose or rename listed keys without a major bump.
 
 -export([
     request_start/1,

@@ -1,44 +1,44 @@
 -module(roadrunner_http2_hpack).
--moduledoc """
-HPACK header compression for HTTP/2 (RFC 7541).
+-moduledoc false.
 
-HPACK encodes header lists as a sequence of representations,
-each referring to a static (61-entry, RFC-defined) or dynamic
-(per-connection, FIFO) header table. Names and values are
-length-prefixed strings, optionally Huffman-encoded
-(`roadrunner_http2_hpack_huffman`).
-
-This module exposes:
-
-- `new_decoder/1` / `new_encoder/1` — fresh per-connection
-  contexts pinned at a max table size.
-- `decode/2` — parse a header block fragment, mutating the
-  decoder's dynamic table per the spec.
-- `encode/2` — emit a header block, mutating the encoder's
-  dynamic table.
-- `set_max_table_size/2` — drop the configured maximum;
-  decoders apply the change to inbound updates, encoders MUST
-  emit a Dynamic Table Size Update on the next `encode/2`
-  call.
-
-Header names are returned as **lowercase binaries** per RFC 9113
-§8.2 case-folding requirement; the decoder rejects any uppercase
-character in a literal name field with `bad_header_name`.
-
-## Representations (RFC 7541 §6)
-
-| Prefix bits | Meaning |
-|----|---|
-| `1xxxxxxx` | Indexed Header Field |
-| `01xxxxxx` | Literal w/ Incremental Indexing — indexed/new name |
-| `001xxxxx` | Dynamic Table Size Update |
-| `0001xxxx` | Literal Never Indexed |
-| `0000xxxx` | Literal w/o Indexing |
-
-The encoder here always uses Literal w/ Incremental Indexing
-when emitting non-indexed pairs. Indexed-name + literal-value
-takes priority when the name appears in the static table.
-""".
+%% HPACK header compression for HTTP/2 (RFC 7541).
+%%
+%% HPACK encodes header lists as a sequence of representations,
+%% each referring to a static (61-entry, RFC-defined) or dynamic
+%% (per-connection, FIFO) header table. Names and values are
+%% length-prefixed strings, optionally Huffman-encoded
+%% (`roadrunner_http2_hpack_huffman`).
+%%
+%% This module exposes:
+%%
+%% - `new_decoder/1` / `new_encoder/1` — fresh per-connection
+%%   contexts pinned at a max table size.
+%% - `decode/2` — parse a header block fragment, mutating the
+%%   decoder's dynamic table per the spec.
+%% - `encode/2` — emit a header block, mutating the encoder's
+%%   dynamic table.
+%% - `set_max_table_size/2` — drop the configured maximum;
+%%   decoders apply the change to inbound updates, encoders MUST
+%%   emit a Dynamic Table Size Update on the next `encode/2`
+%%   call.
+%%
+%% Header names are returned as **lowercase binaries** per RFC 9113
+%% §8.2 case-folding requirement; the decoder rejects any uppercase
+%% character in a literal name field with `bad_header_name`.
+%%
+%% ## Representations (RFC 7541 §6)
+%%
+%% | Prefix bits | Meaning |
+%% |----|---|
+%% | `1xxxxxxx` | Indexed Header Field |
+%% | `01xxxxxx` | Literal w/ Incremental Indexing — indexed/new name |
+%% | `001xxxxx` | Dynamic Table Size Update |
+%% | `0001xxxx` | Literal Never Indexed |
+%% | `0000xxxx` | Literal w/o Indexing |
+%%
+%% The encoder here always uses Literal w/ Incremental Indexing
+%% when emitting non-indexed pairs. Indexed-name + literal-value
+%% takes priority when the name appears in the static table.
 
 -export([
     new_decoder/1,
