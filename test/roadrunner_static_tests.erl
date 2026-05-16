@@ -314,6 +314,23 @@ static_test_() ->
                 Reply = http_get(Port, ~"/static/escape_link.txt"),
                 ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
             end},
+            {"absolute symlink whose target lives inside the docroot is followed", fun() ->
+                %% Covers the acceptance side of the absolute-pathtype
+                %% branch; the prefix check on `[absname(Dir), $/]`
+                %% must say `=/= nomatch`.
+                Reply = http_get(Port, ~"/static/inside_abs_link.txt"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"hello via link")
+            end},
+            {"absolute symlink to a sibling-prefixed dir is refused", fun() ->
+                %% `<Dir>_evil/leak.txt` shares a prefix with `<Dir>`
+                %% but is NOT inside it. The trailing `/` on the
+                %% prefix check is what saves us here — without it,
+                %% `string:prefix` would match and the leak would
+                %% pass.
+                Reply = http_get(Port, ~"/static/sibling_attack.txt"),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
+            end},
             {"relative symlink with .. segments in target is refused", fun() ->
                 Reply = http_get(Port, ~"/static/dotdot_link.txt"),
                 ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
@@ -489,6 +506,24 @@ setup() ->
         filename:join(Dir, "escape_link.txt")
     ),
     _ = file:make_symlink(~"../etc/passwd", filename:join(Dir, "dotdot_link.txt")),
+    %% Absolute symlink that DOES land inside the docroot — the
+    %% pathtype/2 absolute branch must accept this. (The other
+    %% absolute test only covers rejection.)
+    _ = file:make_symlink(
+        filename:join(Dir, "notes.txt"),
+        filename:join(Dir, "inside_abs_link.txt")
+    ),
+    %% Sibling-prefix attack: a directory whose name shares a prefix
+    %% with `Dir`. Without the trailing `/` in the prefix check,
+    %% `string:prefix("<Dir>_evil/leak.txt", "<Dir>")` would match
+    %% and let the symlink through. With the `/`, it must be refused.
+    SiblingDir = Dir ++ "_evil",
+    ok = filelib:ensure_dir(filename:join(SiblingDir, "x")),
+    ok = file:write_file(filename:join(SiblingDir, "leak.txt"), ~"sibling leak"),
+    _ = file:make_symlink(
+        filename:join(SiblingDir, "leak.txt"),
+        filename:join(Dir, "sibling_attack.txt")
+    ),
     %% Empty subdirectory — `filename:join` can resolve a path to it,
     %% but `file:read_file_info` reports `type = directory` so the
     %% handler returns 404 instead of trying to send it.

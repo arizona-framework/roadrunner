@@ -60,18 +60,17 @@ run(ConnPid, StreamId, Status, Headers, Fun) ->
     ok.
 
 do_send(ConnPid, StreamId, Data, nofin) ->
-    %% Flatten to a binary once — `byte_size/1` after is O(1) and
-    %% the conn-side flow-control arithmetic needs a binary anyway.
-    Bin = iolist_to_binary(Data),
-    byte_size(Bin) > 0 andalso sync_send_data(ConnPid, StreamId, Bin, false),
+    %% Ship as iodata. The conn fast-paths single-frame sends
+    %% without materialising and only flattens when chunking
+    %% across window/MAX_FRAME_SIZE boundaries.
+    iolist_size(Data) > 0 andalso sync_send_data(ConnPid, StreamId, Data, false),
     ok;
 do_send(ConnPid, StreamId, Data, fin) ->
-    sync_send_data(ConnPid, StreamId, iolist_to_binary(Data), true),
+    sync_send_data(ConnPid, StreamId, Data, true),
     put(?FIN_KEY, true),
     ok;
 do_send(ConnPid, StreamId, Data, {fin, Trailers}) ->
-    Bin = iolist_to_binary(Data),
-    byte_size(Bin) > 0 andalso sync_send_data(ConnPid, StreamId, Bin, false),
+    iolist_size(Data) > 0 andalso sync_send_data(ConnPid, StreamId, Data, false),
     sync_send_trailers(ConnPid, StreamId, Trailers),
     put(?FIN_KEY, true),
     ok.
@@ -82,9 +81,9 @@ sync_send_headers(ConnPid, StreamId, Status, Headers, EndStream) ->
         ok
     end).
 
-sync_send_data(ConnPid, StreamId, Bin, EndStream) ->
+sync_send_data(ConnPid, StreamId, Data, EndStream) ->
     sync(fun(Ref) ->
-        _ = (ConnPid ! {h2_send_data, self(), Ref, StreamId, Bin, EndStream}),
+        _ = (ConnPid ! {h2_send_data, self(), Ref, StreamId, Data, EndStream}),
         ok
     end).
 
