@@ -60,16 +60,17 @@ info_loop(ConnPid, StreamId, Handler, Push, State) ->
 %% empty DATA frame would be legal on the wire but doesn't advance
 %% the response, and matching h1's behaviour (which skips empty
 %% chunks to avoid emitting the chunked terminator prematurely)
-%% keeps the two paths symmetric.
+%% keeps the two paths symmetric. Non-empty pushes ship as iodata;
+%% the conn fast-paths single-frame sends without materialising and
+%% only flattens when chunking across window/MAX_FRAME_SIZE.
 -spec make_push(pid(), pos_integer()) -> roadrunner_handler:push_fun().
 make_push(ConnPid, StreamId) ->
     fun(Data) ->
-        Bin = iolist_to_binary(Data),
-        case byte_size(Bin) of
+        case iolist_size(Data) of
             0 ->
                 ok;
             _ ->
-                sync_send_data(ConnPid, StreamId, Bin, false),
+                sync_send_data(ConnPid, StreamId, Data, false),
                 ok
         end
     end.
@@ -95,12 +96,12 @@ sync_send_headers(ConnPid, StreamId, Status, Headers, EndStream) ->
         ok
     end).
 
--spec sync_send_data(pid(), pos_integer(), binary(), boolean()) -> ok.
-sync_send_data(ConnPid, StreamId, Bin, EndStream) ->
+-spec sync_send_data(pid(), pos_integer(), iodata(), boolean()) -> ok.
+sync_send_data(ConnPid, StreamId, Data, EndStream) ->
     sync(fun(Ref) ->
         _ =
             (ConnPid !
-                {h2_send_data, self(), Ref, StreamId, Bin, EndStream}),
+                {h2_send_data, self(), Ref, StreamId, Data, EndStream}),
         ok
     end).
 

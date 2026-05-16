@@ -27,7 +27,7 @@
 %%
 %% ```
 %% {h2_send_headers, Worker, Ref, StreamId, Status, Headers, EndStream}
-%% {h2_send_data,    Worker, Ref, StreamId, Bin,    EndStream}
+%% {h2_send_data,    Worker, Ref, StreamId, Data,   EndStream}
 %% {h2_send_trailers, Worker, Ref, StreamId, Trailers}
 %% {h2_worker_done,  StreamId}
 %% ```
@@ -113,7 +113,7 @@
 %% type it as a list to leave room for future enrichment without
 %% reshaping callers.
 -type pending_send() ::
-    {data, reference(), pid(), binary(), boolean()}.
+    {data, reference(), pid(), iodata(), boolean()}.
 
 -type stream_entry() :: #{
     state := stream_state(),
@@ -383,8 +383,8 @@ recv_more(
             exit_clean(State);
         {h2_send_headers, From, Ref, StreamId, Status, Headers, EndStream} ->
             recv_more(handle_send_headers(State, From, Ref, StreamId, Status, Headers, EndStream));
-        {h2_send_data, From, Ref, StreamId, Bin, EndStream} ->
-            recv_more(handle_send_data(State, From, Ref, StreamId, Bin, EndStream));
+        {h2_send_data, From, Ref, StreamId, Data, EndStream} ->
+            recv_more(handle_send_data(State, From, Ref, StreamId, Data, EndStream));
         {h2_send_trailers, From, Ref, StreamId, Trailers} ->
             recv_more(handle_send_trailers(State, From, Ref, StreamId, Trailers));
         {h2_send_response, From, Ref, StreamId, Status, Headers, Body} ->
@@ -962,13 +962,13 @@ handle_send_headers(State, From, Ref, StreamId, Status, Headers, EndStream) ->
             State1
     end.
 
-handle_send_data(State, From, Ref, StreamId, Bin, EndStream) ->
+handle_send_data(State, From, Ref, StreamId, Data, EndStream) ->
     case stream_open(State, StreamId) of
         not_open ->
             _ = (From ! {h2_stream_reset, StreamId}),
             State;
         Stream ->
-            try_send_data(State, Stream, StreamId, From, Ref, Bin, EndStream)
+            try_send_data(State, Stream, StreamId, From, Ref, Data, EndStream)
     end.
 
 handle_send_trailers(State, From, Ref, StreamId, Trailers) ->
@@ -1107,45 +1107,57 @@ close_stream_send_side(#loop{streams = Streams} = State, StreamId) ->
 %% DATA send + flow control
 %% =============================================================================
 
-%% Try to send `Bin` as DATA frame(s). If both windows allow, send
+%% Try to send `Data` as DATA frame(s). If both windows allow, send
 %% everything and ack. If a partial chunk fits, send what we can
 %% and queue the rest. If nothing fits, queue the whole thing.
 %%
-%% Empty `Bin` always means `EndStream = true` because
-%% `roadrunner_http2_stream_response` short-circuits empty `nofin`
-%% sends — the empty-body case here doesn't consume any window
-%% bytes, so it bypasses the window check entirely.
-try_send_data(State, _Stream, StreamId, From, Ref, <<>>, true) ->
-    Frame = roadrunner_http2_frame:encode({data, StreamId, 16#01, <<>>}),
-    _ = send(State, Frame),
-    _ = (From ! {h2_send_ack, Ref}),
-    close_stream_send_side(State, StreamId);
-try_send_data(State, Stream, StreamId, From, Ref, Bin, EndStream) ->
-    case window_budget(State, Stream) of
-        0 ->
-            %% Window closed — queue the whole send.
-            Stream1 = enqueue_pending(Stream, {data, Ref, From, Bin, EndStream}),
-            update_stream(State, StreamId, Stream1);
+%% `Data` is iodata. The single-frame branch in `send_data_chunks`
+%% passes it straight to the frame encoder (which accepts iodata)
+%% and the transport `writev()`s it, so the common streaming case
+%% never materialises to a flat binary.
+%%
+%% Empty `Data` always means `EndStream = true` because workers
+%% short-circuit empty `nofin` sends — the empty-body case here
+%% doesn't consume any window bytes, so it bypasses the window
+%% check entirely.
+try_send_data(State, Stream, StreamId, From, Ref, Data, EndStream) ->
+    case iolist_size(Data) of
+        0 when EndStream ->
+            %% Final empty DATA frame closes the stream.
+            Frame = roadrunner_http2_frame:encode({data, StreamId, 16#01, <<>>}),
+            _ = send(State, Frame),
+            _ = (From ! {h2_send_ack, Ref}),
+            close_stream_send_side(State, StreamId);
         _ ->
-            send_data_chunks(State, Stream, StreamId, From, Ref, Bin, EndStream)
+            case window_budget(State, Stream) of
+                0 ->
+                    %% Window closed — queue the whole send.
+                    Stream1 = enqueue_pending(Stream, {data, Ref, From, Data, EndStream}),
+                    update_stream(State, StreamId, Stream1);
+                _ ->
+                    send_data_chunks(State, Stream, StreamId, From, Ref, Data, EndStream)
+            end
     end.
 
-send_data_chunks(State, Stream, StreamId, From, Ref, Bin, EndStream) ->
+send_data_chunks(State, Stream, StreamId, From, Ref, Data, EndStream) ->
     Available = window_budget(State, Stream),
-    Take = min(min(byte_size(Bin), Available), ?MAX_FRAME_SIZE),
+    Total = iolist_size(Data),
+    Take = min(min(Total, Available), ?MAX_FRAME_SIZE),
     case Take of
         0 ->
             %% Window closed mid-body — queue the remainder.
-            Stream1 = enqueue_pending(Stream, {data, Ref, From, Bin, EndStream}),
+            Stream1 = enqueue_pending(Stream, {data, Ref, From, Data, EndStream}),
             update_stream(State, StreamId, Stream1);
-        N when N =:= byte_size(Bin) ->
-            %% Last chunk — END_STREAM if the caller asked.
+        N when N =:= Total ->
+            %% Fits in one DATA frame and within the window: ship
+            %% iodata straight through. Frame encoder accepts iodata
+            %% and the transport's writev() avoids the flatten.
             Flags =
                 if
                     EndStream -> 16#01;
                     true -> 0
                 end,
-            Frame = roadrunner_http2_frame:encode({data, StreamId, Flags, Bin}),
+            Frame = roadrunner_http2_frame:encode({data, StreamId, Flags, Data}),
             _ = send(State, Frame),
             State1 = consume_send_window(State, StreamId, Stream, N),
             _ = (From ! {h2_send_ack, Ref}),
@@ -1154,6 +1166,12 @@ send_data_chunks(State, Stream, StreamId, From, Ref, Bin, EndStream) ->
                 true -> State1
             end;
         N ->
+            %% Chunking across window/MAX_FRAME_SIZE boundaries:
+            %% materialise once so we can slice with binary patterns
+            %% (sub-binaries, no per-chunk copy). On recursion `Rest`
+            %% is a binary, so `iolist_size/1` becomes O(1) and
+            %% `iolist_to_binary/1` is a no-op BIF.
+            Bin = iolist_to_binary(Data),
             <<Chunk:N/binary, Rest/binary>> = Bin,
             Frame = roadrunner_http2_frame:encode({data, StreamId, 0, Chunk}),
             _ = send(State, Frame),
