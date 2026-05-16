@@ -410,22 +410,23 @@ target_inside_docroot(FilePath, Req) ->
     %% crash and bubble up as a 500 instead of silently 404'ing.
     {ok, Target} = file:read_link(FilePath),
     #{dir := Dir} = roadrunner_req:route_opts(Req),
-    TargetBin = iolist_to_binary([Target]),
-    case filename:pathtype(TargetBin) of
+    case filename:pathtype(Target) of
         relative ->
-            %% A relative target without any `..` segments must
-            %% land inside the directory containing the symlink,
-            %% which by construction is inside `dir`.
-            Segments = filename:split(TargetBin),
-            not lists:member(~"..", Segments);
+            %% A relative target without any `..` segments must land
+            %% inside the directory containing the symlink, which by
+            %% construction is inside `dir`. The framework runs with
+            %% binary file names (default UTF-8 native encoding), so
+            %% `filename:split/1` yields binaries and the `~".."`
+            %% literal matches directly.
+            not lists:member(~"..", filename:split(Target));
         _ ->
             %% `filename:absname/1` strips trailing slashes (except for
             %% the root `/` itself, which we don't reasonably support
             %% as a docroot anyway), so a single appended `/` is enough
             %% to make `string:prefix/2` an exact directory check
-            %% rather than a sibling-prefix false positive.
-            DirAbs = iolist_to_binary([filename:absname(Dir), $/]),
-            string:prefix(TargetBin, DirAbs) =/= nomatch
+            %% rather than a sibling-prefix false positive. `string:prefix/2`
+            %% accepts chardata, so neither argument needs flattening.
+            string:prefix(Target, [filename:absname(Dir), $/]) =/= nomatch
     end.
 
 %% Parse an IMF-fixdate header back into a posix timestamp. Returns
