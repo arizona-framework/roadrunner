@@ -1128,20 +1128,19 @@ try_send_data(State, Stream, StreamId, From, Ref, Data, EndStream) ->
             _ = send(State, Frame),
             _ = (From ! {h2_send_ack, Ref}),
             close_stream_send_side(State, StreamId);
-        _ ->
+        Total ->
             case window_budget(State, Stream) of
                 0 ->
                     %% Window closed — queue the whole send.
                     Stream1 = enqueue_pending(Stream, {data, Ref, From, Data, EndStream}),
                     update_stream(State, StreamId, Stream1);
                 _ ->
-                    send_data_chunks(State, Stream, StreamId, From, Ref, Data, EndStream)
+                    send_data_chunks(State, Stream, StreamId, From, Ref, Data, Total, EndStream)
             end
     end.
 
-send_data_chunks(State, Stream, StreamId, From, Ref, Data, EndStream) ->
+send_data_chunks(State, Stream, StreamId, From, Ref, Data, Total, EndStream) ->
     Available = window_budget(State, Stream),
-    Total = iolist_size(Data),
     Take = min(min(Total, Available), ?MAX_FRAME_SIZE),
     case Take of
         0 ->
@@ -1169,15 +1168,15 @@ send_data_chunks(State, Stream, StreamId, From, Ref, Data, EndStream) ->
             %% Chunking across window/MAX_FRAME_SIZE boundaries:
             %% materialise once so we can slice with binary patterns
             %% (sub-binaries, no per-chunk copy). On recursion `Rest`
-            %% is a binary, so `iolist_size/1` becomes O(1) and
-            %% `iolist_to_binary/1` is a no-op BIF.
+            %% is a binary and we thread the running size as `Total -
+            %% N`, so no further `iolist_size/1` walk is needed.
             Bin = iolist_to_binary(Data),
             <<Chunk:N/binary, Rest/binary>> = Bin,
             Frame = roadrunner_http2_frame:encode({data, StreamId, 0, Chunk}),
             _ = send(State, Frame),
             State1 = consume_send_window(State, StreamId, Stream, N),
             #{StreamId := Stream1} = State1#loop.streams,
-            send_data_chunks(State1, Stream1, StreamId, From, Ref, Rest, EndStream)
+            send_data_chunks(State1, Stream1, StreamId, From, Ref, Rest, Total - N, EndStream)
     end.
 
 window_budget(#loop{conn_send_window = ConnW}, #{send_window := StreamW}) ->
