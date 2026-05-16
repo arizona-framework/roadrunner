@@ -910,44 +910,45 @@ find_content_length([_ | Rest], V) -> find_content_length(Rest, V).
 %% to the two-frame two-message path when the body doesn't fit a
 %% single DATA frame AND the current window — the worker still
 %% sees one ack at the end of the data send.
-handle_send_response(State, From, Ref, StreamId, Status, Headers, <<>>) ->
-    %% Empty body — same wire shape as `handle_send_headers` with
-    %% `EndStream = true` (single HEADERS frame, END_STREAM bit set).
-    case stream_open(State, StreamId) of
-        not_open ->
-            _ = (From ! {h2_stream_reset, StreamId}),
-            State;
-        _Stream ->
-            State1 = encode_and_send_headers(State, StreamId, Status, Headers, true),
-            _ = (From ! {h2_send_ack, Ref}),
-            State1
-    end;
 handle_send_response(State, From, Ref, StreamId, Status, Headers, Body) ->
     case stream_open(State, StreamId) of
         not_open ->
             _ = (From ! {h2_stream_reset, StreamId}),
             State;
         Stream ->
-            BodyLen = byte_size(Body),
-            %% Short-circuit: skip the `window_budget/2` lookup when the
-            %% body already won't fit in one frame.
-            case BodyLen =< ?MAX_FRAME_SIZE andalso window_budget(State, Stream) >= BodyLen of
-                true ->
-                    State1 = encode_and_send_response_atomic(
-                        State, StreamId, Status, Headers, Body
-                    ),
+            case iolist_size(Body) of
+                0 ->
+                    %% Empty body — single HEADERS frame with END_STREAM,
+                    %% same wire shape as `handle_send_headers/_, true)`.
+                    State1 = encode_and_send_headers(State, StreamId, Status, Headers, true),
                     _ = (From ! {h2_send_ack, Ref}),
                     State1;
-                false ->
-                    %% Body too big for one frame OR window too narrow —
-                    %% emit HEADERS now, hand the body to `try_send_data`
-                    %% which fragments / queues + acks the worker on
-                    %% completion.
-                    State1 = encode_and_send_headers(
-                        State, StreamId, Status, Headers, false
-                    ),
-                    #{StreamId := Stream1} = State1#loop.streams,
-                    try_send_data(State1, Stream1, StreamId, From, Ref, Body, true)
+                BodyLen ->
+                    %% Short-circuit: skip the `window_budget/2` lookup
+                    %% when the body already won't fit in one frame.
+                    case
+                        BodyLen =< ?MAX_FRAME_SIZE andalso
+                            window_budget(State, Stream) >= BodyLen
+                    of
+                        true ->
+                            State1 = encode_and_send_response_atomic(
+                                State, StreamId, Status, Headers, Body, BodyLen
+                            ),
+                            _ = (From ! {h2_send_ack, Ref}),
+                            State1;
+                        false ->
+                            %% Body too big for one frame OR window too
+                            %% narrow — emit HEADERS now, hand the body to
+                            %% `try_send_data` which fragments / queues +
+                            %% acks the worker on completion.
+                            State1 = encode_and_send_headers(
+                                State, StreamId, Status, Headers, false
+                            ),
+                            #{StreamId := Stream1} = State1#loop.streams,
+                            try_send_data(
+                                State1, Stream1, StreamId, From, Ref, Body, true
+                            )
+                    end
             end
     end.
 
@@ -1043,16 +1044,19 @@ encode_and_send_headers(
         true -> State1
     end.
 
-%% HEADERS + DATA (END_STREAM) packed into ONE `ssl:send/2`.
-%% Caller has already verified `byte_size(Body)` fits in a single
-%% DATA frame AND in the current send window. Consumes the window
-%% by `byte_size(Body)` and marks the stream's send side closed.
+%% HEADERS + DATA (END_STREAM) packed into ONE `ssl:send/2`. Body
+%% is iodata; the frame encoder accepts it and the transport
+%% `writev()`s the assembled iolist so no flatten happens here.
+%% Caller has already verified `BodyLen` fits in a single DATA
+%% frame AND in the current send window. Consumes the window by
+%% `BodyLen` and marks the stream's send side closed.
 encode_and_send_response_atomic(
     #loop{hpack_enc = Enc, streams = Streams} = State,
     StreamId,
     Status,
     Headers,
-    Body
+    Body,
+    BodyLen
 ) ->
     #{StreamId := Stream} = Streams,
     StatusBin = integer_to_binary(Status),
@@ -1068,7 +1072,7 @@ encode_and_send_response_atomic(
     DFrame = roadrunner_http2_frame:encode({data, StreamId, 16#01, Body}),
     _ = send(State, [HFrame, DFrame]),
     State1 = State#loop{hpack_enc = Enc1},
-    State2 = consume_send_window(State1, StreamId, Stream, byte_size(Body)),
+    State2 = consume_send_window(State1, StreamId, Stream, BodyLen),
     close_stream_send_side(State2, StreamId).
 
 encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->

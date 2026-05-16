@@ -219,9 +219,8 @@ emit_501(ConnPid, StreamId) ->
 %% or constrained windows; the worker still sees a single sync
 %% round-trip in either case.
 send_buffered(ConnPid, StreamId, Status, Headers, Body) ->
-    Bin = iolist_to_binary(Body),
     sync(fun(Ref) ->
-        _ = (ConnPid ! {h2_send_response, self(), Ref, StreamId, Status, Headers, Bin}),
+        _ = (ConnPid ! {h2_send_response, self(), Ref, StreamId, Status, Headers, Body}),
         ok
     end).
 
