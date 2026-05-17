@@ -172,8 +172,9 @@ compose([Mw | Rest], Handler) ->
 %% Called once per route at listener init / `reload_routes/2` time,
 %% from the router compile path (router-form routes) and the
 %% listener's dispatch builder (single-handler dispatch tag). The
-%% result is stashed under the `pipeline` key on the route cfg; the
-%% conn loops read it straight out and call it with the request.
+%% resulting `next()` fun lands directly in the compiled route entry
+%% (and the `{handler, Mod, Pipeline, State}` dispatch tag) — no
+%% wrapper map. The conn loops just call it with the request.
 %%
 %% Empty list → returns `fun Handler:handle/1` directly, skipping
 %% `compose/2` to save one closure allocation + one indirection on the
