@@ -40,15 +40,14 @@ care which protocol delivered the bytes.
     target := binary(),
     version := version(),
     headers := headers(),
-    %% H1-parser internal optimization (no public contract).
-    %% Pre-computed decisions for known case-insensitive headers,
-    %% populated by `roadrunner_http1:parse_request/1`. Hot-path
-    %% framework code (`roadrunner_conn:body_framing/1`,
+    %% H1-parser internal optimization — handlers should ignore.
+    %% See `t:roadrunner_http1:cached_decisions/0` for the shape.
+    %% Hot-path framework code (`roadrunner_conn:body_framing/1`,
     %% `keep_alive_decision/2`, `has_continue_expectation/1`) reads
-    %% it directly to avoid re-lowercasing header values per request.
-    %% Handlers should ignore this field — it's absent on h2 requests
-    %% and on manually-built request maps.
-    cached_decisions => term(),
+    %% it directly to avoid re-lowercasing header values per
+    %% request. Absent on h2 requests and on manually-built request
+    %% maps.
+    cached_decisions => roadrunner_http1:cached_decisions(),
     %% Body is set by `roadrunner_conn` before the handler is
     %% invoked. Auto mode delivers the full body as `iodata()` (an
     %% iolist of recv chunks for multi-chunk bodies, a single binary
@@ -79,7 +78,7 @@ care which protocol delivered the bytes.
     %% `body_buffering => manual` mode. Threaded through
     %% `roadrunner_req:read_body/1,2`. Never present in `auto` mode
     %% or in manually-constructed request maps.
-    body_reader => term(),
+    body_reader => roadrunner_conn:body_reader(),
     %% Per-request correlation token attached by `roadrunner_conn`
     %% once the headers parse. 16 lowercase hex chars (8 bytes of
     %% CSPRNG output). Mirrored into `logger:set_process_metadata/1`

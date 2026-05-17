@@ -54,11 +54,15 @@
 -type headers() :: roadrunner_http:headers().
 -type status() :: roadrunner_http:status().
 
-%% H1-parser internal hot-path optimization (no public contract).
-%% Surfaces on the request map as the `cached_decisions` field; both
-%% the field and this type are framework internals — handlers should
-%% ignore them. Exported only so cross-module specs (e.g. the field's
-%% type annotation in `roadrunner_req:request/0`) can reference it.
+-doc """
+Framework internal — handlers should ignore both this type and the
+`cached_decisions` field on `t:roadrunner_req:request/0` that
+carries it. H1-parser hot-path optimization: pre-computed answers
+for case-insensitive headers the connection layer reads on every
+request (chunked / transfer-encoding / expect-continue /
+connection / content-length / host). Exported so cross-module
+specs can reference it; not part of the user-facing handler API.
+""".
 -type cached_decisions() :: #{
     %% True iff `Transfer-Encoding: chunked` (case-insensitive). Hot path
     %% at body-framing time — saves a per-request lowercase scan.

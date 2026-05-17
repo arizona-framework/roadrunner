@@ -126,14 +126,16 @@
     rate_check_interval => pos_integer()
 }.
 
-%% Opaque body-read state attached to the request in manual buffering
-%% mode. `roadrunner_req:read_body/1,2` consumes from this state; the conn
-%% owns the recv closure and tracks how much remains.
-%%
-%% `pending` holds decoded body bytes that have been parsed off the
-%% wire but not yet handed to the caller — used for chunked framing
-%% to absorb a chunk's payload across multiple length-bounded calls.
-%% `done` flips true once the size-0 last chunk is parsed.
+-doc """
+Body-read envelope attached to the request in `body_buffering =>
+manual` mode. `roadrunner_req:read_body/1,2` consumes from it; the
+conn owns the recv closure and tracks how much remains.
+
+`pending` holds decoded body bytes that have been parsed off the
+wire but not yet handed to the caller — used for chunked framing
+to absorb a chunk's payload across multiple length-bounded calls.
+`done` flips true once the size-0 last chunk is parsed.
+""".
 -type body_reader() :: #{
     framing := none | chunked | {content_length, non_neg_integer()},
     buffered := binary(),
