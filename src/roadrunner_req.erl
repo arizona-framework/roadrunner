@@ -44,7 +44,7 @@ are not part of the public contract and can change between releases.
     bindings => roadrunner_router:bindings(),
     peer => {inet:ip_address(), inet:port_number()} | undefined,
     scheme => http | https,
-    route_opts => term(),
+    state => term(),
     body_state => term(),
     request_id => binary(),
     listener_name => atom()
@@ -76,7 +76,7 @@ are not part of the public contract and can change between releases.
     peer/1,
     forwarded_for/1,
     scheme/1,
-    route_opts/1,
+    state/1,
     request_id/1
 ]).
 
@@ -476,15 +476,16 @@ scheme(#{scheme := S}) -> S;
 scheme(_) -> http.
 
 -doc """
-Return the opaque per-route opts attached at compile time via the
-3-tuple route shape `{Path, Handler, Opts}`.
+Return the opaque per-route handler state attached at compile time
+via the 3-tuple route shape `{Path, Handler, State}` (or the
+listener's `{Module, State}` single-handler shape).
 
-`undefined` for 2-tuple routes and for single-handler dispatch (no
-router involved).
+`undefined` for 2-tuple routes and for the bare-atom single-handler
+form, where no state was supplied.
 """.
--spec route_opts(request()) -> term().
-route_opts(#{route_opts := O}) -> O;
-route_opts(_) -> undefined.
+-spec state(request()) -> term().
+state(#{state := S}) -> S;
+state(_) -> undefined.
 
 -doc """
 Return the per-request correlation token attached by `roadrunner_conn`.

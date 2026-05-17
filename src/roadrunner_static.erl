@@ -80,7 +80,7 @@ directories are still followed by the kernel.
 
 -spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
-    #{dir := Dir} = roadrunner_req:route_opts(Req),
+    #{dir := Dir} = roadrunner_req:state(Req),
     Segments = maps:get(~"path", roadrunner_req:bindings(Req), []),
     Resp =
         case validate_segments(Segments) of
@@ -391,7 +391,7 @@ symlink_allowed(FilePath, Req) ->
 
 -spec symlink_policy(roadrunner_req:request()) -> follow | refuse | refuse_escapes.
 symlink_policy(Req) ->
-    case roadrunner_req:route_opts(Req) of
+    case roadrunner_req:state(Req) of
         #{symlink_policy := follow} -> follow;
         #{symlink_policy := refuse} -> refuse;
         _ -> refuse_escapes
@@ -409,7 +409,7 @@ target_inside_docroot(FilePath, Req) ->
     %% we let a TOCTOU race (symlink removed between the two stats)
     %% crash and bubble up as a 500 instead of silently 404'ing.
     {ok, Target} = file:read_link(FilePath),
-    #{dir := Dir} = roadrunner_req:route_opts(Req),
+    #{dir := Dir} = roadrunner_req:state(Req),
     case filename:pathtype(Target) of
         relative ->
             %% A relative target without any `..` segments must land

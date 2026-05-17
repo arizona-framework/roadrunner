@@ -46,14 +46,14 @@ Required:
 
 Routing (pick one):
 - `routes => module()` — single-handler dispatch. Every request
-  goes to `Module:handle/1` and `roadrunner_req:route_opts/1`
+  goes to `Module:handle/1` and `roadrunner_req:state/1`
   returns `undefined`.
 - `routes => {module(), term()}` — single-handler dispatch with
-  per-handler opts. The opaque second element is reachable from
-  the handler via `roadrunner_req:route_opts/1`.
+  per-handler state. The opaque second element is reachable from
+  the handler via `roadrunner_req:state/1`.
 - `routes => roadrunner_router:routes()` — list of
-  `{Path, Handler}` or `{Path, Handler, Opts}` tuples; first
-  match wins. The 2-tuple form is shorthand for `Opts = undefined`.
+  `{Path, Handler}` or `{Path, Handler, State}` tuples; first
+  match wins. The 2-tuple form is shorthand for `State = undefined`.
 
 Optional middleware and timing knobs (durations in milliseconds):
 - `middlewares` — listener-wide pipeline applied to every request.
@@ -529,9 +529,9 @@ build_proto_opts(Opts, ListenerName) ->
     end.
 
 %% `routes` is the unified dispatch option. A bare module atom sends
-%% every request to that handler; `{Module, Opts}` is the same plus
-%% per-handler opts surfaced via `roadrunner_req:route_opts/1`; a list
-%% of `{Path, Module, Opts}` tuples uses the router. When `routes` is
+%% every request to that handler; `{Module, State}` is the same plus
+%% per-handler state surfaced via `roadrunner_req:state/1`; a list
+%% of `{Path, Module, State}` tuples uses the router. When `routes` is
 %% omitted, fall back to the default hello-world handler. List-form
 %% routes are published to `persistent_term` by `publish_routes/2` —
 %% the dispatch tag carries the listener name so the conn can look

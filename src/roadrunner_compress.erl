@@ -4,7 +4,7 @@
 %% Response-compression middleware. Supports `gzip` and `deflate`
 %% Content-Encoding per RFC 9110 §8.4.1.
 %%
-%% Add to a listener's `middlewares` opt (or a route's `route_opts.middlewares`)
+%% Add to a listener's `middlewares` opt (or a route's `state.middlewares`)
 %% to compress eligible response bodies based on the request's `Accept-Encoding`
 %% header. Replaces cowboy's deprecated `cowboy_compress_h` stream handler
 %% for arizona's migration.

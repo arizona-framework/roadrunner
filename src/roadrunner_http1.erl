@@ -114,7 +114,7 @@
     %% Per-route opts attached at compile time via the 3-tuple route shape
     %% `{Path, Handler, Opts}`. `undefined` for 2-tuple routes and for
     %% single-handler dispatch (no router involved).
-    route_opts => term(),
+    state => term(),
     %% Body-read state attached by `roadrunner_conn` in `body_buffering => manual`
     %% mode. Threaded through `roadrunner_req:read_body/1,2`. Never present in
     %% `auto` mode or in manually-constructed request maps.

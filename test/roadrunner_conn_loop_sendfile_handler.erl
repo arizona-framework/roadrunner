@@ -2,8 +2,8 @@
 -moduledoc """
 Test fixture — emits a `{sendfile, ...}` response covering
 `roadrunner_conn_loop:dispatch_response/4`'s sendfile clause. The
-file path is read from the request's `route_opts` (set by the
-single-handler dispatch helper that stashes opts there) or from
+file path is read from the request's `state` (set by the
+single-handler dispatch helper that stashes state there) or from
 `persistent_term` under `{?MODULE, file}`.
 """.
 

@@ -96,8 +96,8 @@ Add to `rebar.config`:
 ]}.
 ```
 
-Write a handler — the third route element is per-route opts, threaded
-to the handler via `roadrunner_req:route_opts/1`:
+Write a handler — the third route element is per-route state, threaded
+to the handler via `roadrunner_req:state/1`:
 
 ```erlang
 -module(hello_handler).
@@ -105,7 +105,7 @@ to the handler via `roadrunner_req:route_opts/1`:
 -export([handle/1]).
 
 handle(Req) ->
-    #{greeting := Greeting} = roadrunner_req:route_opts(Req),
+    #{greeting := Greeting} = roadrunner_req:state(Req),
     {roadrunner_resp:text(200, <<Greeting/binary, ", roadrunner!">>), Req}.
 ```
 
@@ -175,7 +175,6 @@ roadrunner:start_listener(my_listener, #{port => 8080, routes => hello_handler})
 ### Routing
 
 - `roadrunner_router` with literal / `:param` / `*wildcard` segments.
-- 3-tuple route shape `{Path, Handler, Opts}` — opts thread to the handler.
 - Routes published to `persistent_term` for O(1) lookup;
   `roadrunner_listener:reload_routes/2` swaps the table without restart.
 

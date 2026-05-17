@@ -21,9 +21,9 @@ pattern; anything after it never matches.
 Literal segments must match byte-exactly; comparison is case-sensitive
 per RFC 3986.
 
-`Opts` is an opaque per-route term threaded through to the handler via
-`roadrunner_req:route_opts/1`. Omit it (use the 2-tuple form) when a
-route has no opts; `roadrunner_req:route_opts/1` then returns
+`State` is an opaque per-route term threaded through to the handler
+via `roadrunner_req:state/1`. Omit it (use the 2-tuple form) when a
+route has no state; `roadrunner_req:state/1` then returns
 `undefined`.
 
 Routes are tried in declaration order — earlier entries win. The
@@ -38,11 +38,10 @@ swapping to a trie/DAG later is a non-breaking change for callers.
 -doc """
 A single route entry. Two shapes are accepted:
 
-- `{Path, Handler}` — shorthand for routes without per-route opts;
-  `roadrunner_req:route_opts/1` returns `undefined`.
-- `{Path, Handler, Opts}` — full shape; `Opts` is opaque per-route
-  data threaded back to the handler via
-  `roadrunner_req:route_opts/1`.
+- `{Path, Handler}` — shorthand for routes without per-route state;
+  `roadrunner_req:state/1` returns `undefined`.
+- `{Path, Handler, State}` — full shape; `State` is opaque per-route
+  data threaded back to the handler via `roadrunner_req:state/1`.
 
 `Path` is a binary pattern (literal segments, `:param` captures, or
 `*wildcard` catch-all) and `Handler` is the module implementing
@@ -50,7 +49,7 @@ A single route entry. Two shapes are accepted:
 """.
 -type route() ::
     {Path :: binary(), Handler :: module()}
-    | {Path :: binary(), Handler :: module(), Opts :: term()}.
+    | {Path :: binary(), Handler :: module(), State :: term()}.
 
 -doc "An ordered list of routes; matched first-to-last.".
 -type routes() :: [route()].
@@ -85,7 +84,7 @@ compile(Routes) when is_list(Routes) ->
 
 -spec compile_route(route()) -> {[segment()], module(), term()}.
 compile_route({Path, Handler}) -> {compile_path(Path), Handler, undefined};
-compile_route({Path, Handler, Opts}) -> {compile_path(Path), Handler, Opts}.
+compile_route({Path, Handler, State}) -> {compile_path(Path), Handler, State}.
 
 -spec compile_path(binary()) -> [segment()].
 compile_path(Path) ->
@@ -99,9 +98,9 @@ compile_segment(Lit) -> {literal, Lit}.
 -doc """
 Look up the handler for a given request path.
 
-Returns `{ok, Handler, Bindings, Opts}` on a match — `Bindings` is a
+Returns `{ok, Handler, Bindings, State}` on a match — `Bindings` is a
 map populated with captures from `:param` segments (empty for purely
-literal routes); `Opts` is the per-route opaque attached at compile
+literal routes); `State` is the per-route opaque attached at compile
 time (or `undefined` for a 2-tuple route). Returns `not_found` when
 no compiled route matches.
 """.
@@ -115,9 +114,9 @@ match(Path, Compiled) when is_binary(Path), is_list(Compiled) ->
     {ok, module(), bindings(), term()} | not_found.
 match_first(_Segments, []) ->
     not_found;
-match_first(Segments, [{Pattern, Handler, Opts} | Rest]) ->
+match_first(Segments, [{Pattern, Handler, State} | Rest]) ->
     case match_pattern(Pattern, Segments, #{}) of
-        {ok, Bindings} -> {ok, Handler, Bindings, Opts};
+        {ok, Bindings} -> {ok, Handler, Bindings, State};
         no_match -> match_first(Segments, Rest)
     end.
 

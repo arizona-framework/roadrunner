@@ -85,7 +85,7 @@ compose_module_form_dispatches_via_call2_test() ->
     ?assertEqual({200, [], ~"yes"}, {Status, Headers, Body}).
 
 %% =============================================================================
-%% End-to-end through roadrunner_conn — exercises route_opts.middlewares plumbing.
+%% End-to-end through roadrunner_conn — exercises state.middlewares plumbing.
 %% =============================================================================
 
 route_middlewares_run_before_handler_test_() ->

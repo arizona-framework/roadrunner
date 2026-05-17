@@ -354,7 +354,7 @@ chunked_recv(Chunks) ->
     end.
 
 %% =============================================================================
-%% resolve_handler/2 — dispatch tag → {ok, Mod, Bindings, RouteOpts}
+%% resolve_handler/2 — dispatch tag → {ok, Mod, Bindings, State}
 %% =============================================================================
 
 resolve_handler_bare_atom_form_returns_undefined_opts_test() ->
