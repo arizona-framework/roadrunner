@@ -128,6 +128,35 @@ match_route_with_opts_test() ->
         roadrunner_router:match(~"/static/a.css", Compiled)
     ).
 
+match_two_tuple_route_returns_undefined_opts_test() ->
+    %% 2-tuple shorthand: Opts defaults to `undefined`.
+    Compiled = roadrunner_router:compile([{~"/", home_handler}]),
+    ?assertEqual(
+        {ok, home_handler, #{}, undefined},
+        roadrunner_router:match(~"/", Compiled)
+    ).
+
+match_two_tuple_with_params_test() ->
+    Compiled = roadrunner_router:compile([{~"/users/:id", users_handler}]),
+    ?assertEqual(
+        {ok, users_handler, #{~"id" => ~"42"}, undefined},
+        roadrunner_router:match(~"/users/42", Compiled)
+    ).
+
+match_mixed_two_and_three_tuple_routes_test() ->
+    Compiled = roadrunner_router:compile([
+        {~"/", home_handler},
+        {~"/static/*path", static_handler, #{dir => ~"/var/www"}}
+    ]),
+    ?assertEqual(
+        {ok, home_handler, #{}, undefined},
+        roadrunner_router:match(~"/", Compiled)
+    ),
+    ?assertEqual(
+        {ok, static_handler, #{~"path" => [~"a.css"]}, #{dir => ~"/var/www"}},
+        roadrunner_router:match(~"/static/a.css", Compiled)
+    ).
+
 match_wildcard_not_last_falls_through_test() ->
     %% A wildcard mid-pattern doesn't match — extra literal after it never
     %% reaches a matching clause, and a fallback route still works.

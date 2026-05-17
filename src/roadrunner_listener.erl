@@ -52,7 +52,8 @@ Routing (pick one):
   per-handler opts. The opaque second element is reachable from
   the handler via `roadrunner_req:route_opts/1`.
 - `routes => roadrunner_router:routes()` — list of
-  `{Path, Handler, Opts}` tuples; first match wins.
+  `{Path, Handler}` or `{Path, Handler, Opts}` tuples; first
+  match wins. The 2-tuple form is shorthand for `Opts = undefined`.
 
 Optional middleware and timing knobs (durations in milliseconds):
 - `middlewares` — listener-wide pipeline applied to every request.

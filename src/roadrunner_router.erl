@@ -5,12 +5,13 @@
 -moduledoc """
 Path → handler dispatch with parameterized segments.
 
-Routes are written as `{Path, Handler, Opts}` where `Path` is a
-binary like `/users/:id/posts/:post_id`. Segments starting with `:`
-capture a single segment into bindings keyed by the **binary** name
-that follows the colon — we deliberately avoid `binary_to_atom/1`
-on the parsed name to keep the "everything is binary on the wire"
-rule we already use for header names.
+Routes are written as `{Path, Handler}` or `{Path, Handler, Opts}`
+where `Path` is a binary like `/users/:id/posts/:post_id`. The
+2-tuple form is shorthand for `Opts = undefined`. Segments starting
+with `:` capture a single segment into bindings keyed by the
+**binary** name that follows the colon — we deliberately avoid
+`binary_to_atom/1` on the parsed name to keep the "everything is
+binary on the wire" rule we already use for header names.
 
 Segments starting with `*` (e.g. `/static/*path`) are wildcard
 captures: they consume all remaining path segments and bind them as a
@@ -21,8 +22,9 @@ Literal segments must match byte-exactly; comparison is case-sensitive
 per RFC 3986.
 
 `Opts` is an opaque per-route term threaded through to the handler via
-`roadrunner_req:route_opts/1`. Use `undefined` (or any sentinel of your
-choice) when a route has no opts.
+`roadrunner_req:route_opts/1`. Omit it (use the 2-tuple form) when a
+route has no opts; `roadrunner_req:route_opts/1` then returns
+`undefined`.
 
 Routes are tried in declaration order — earlier entries win. The
 opaque `compiled()` shape is a list of pre-parsed segment patterns;
@@ -34,13 +36,21 @@ swapping to a trie/DAG later is a non-breaking change for callers.
 -export_type([route/0, routes/0, compiled/0, bindings/0]).
 
 -doc """
-A single route entry: `{Path, Handler, Opts}` where `Path` is a
-binary pattern (literal segments, `:param` captures, or `*wildcard`
-catch-all), `Handler` is the module implementing
-`roadrunner_handler`, and `Opts` is opaque per-route data threaded
-back to the handler via `roadrunner_req:route_opts/1`.
+A single route entry. Two shapes are accepted:
+
+- `{Path, Handler}` — shorthand for routes without per-route opts;
+  `roadrunner_req:route_opts/1` returns `undefined`.
+- `{Path, Handler, Opts}` — full shape; `Opts` is opaque per-route
+  data threaded back to the handler via
+  `roadrunner_req:route_opts/1`.
+
+`Path` is a binary pattern (literal segments, `:param` captures, or
+`*wildcard` catch-all) and `Handler` is the module implementing
+`roadrunner_handler`.
 """.
--type route() :: {Path :: binary(), Handler :: module(), Opts :: term()}.
+-type route() ::
+    {Path :: binary(), Handler :: module()}
+    | {Path :: binary(), Handler :: module(), Opts :: term()}.
 
 -doc "An ordered list of routes; matched first-to-last.".
 -type routes() :: [route()].
@@ -74,6 +84,7 @@ compile(Routes) when is_list(Routes) ->
     [compile_route(R) || R <- Routes].
 
 -spec compile_route(route()) -> {[segment()], module(), term()}.
+compile_route({Path, Handler}) -> {compile_path(Path), Handler, undefined};
 compile_route({Path, Handler, Opts}) -> {compile_path(Path), Handler, Opts}.
 
 -spec compile_path(binary()) -> [segment()].
