@@ -187,11 +187,15 @@ the list to disable HTTP/2. For HTTP/2 on plain TCP (h2c
 prior-knowledge per RFC 7540 §3.4), use `protocols => [http2]` without
 the `tls` opt.
 
-For listeners that don't need routing, `routes => Mod` skips the router
-entirely and dispatches every request to `Mod:handle/1`:
+For listeners that don't need routing, `routes => Mod` (or
+`{Mod, State}` to seed handler state) skips the router entirely and
+dispatches every request to `Mod:handle/1`:
 
 ```erlang
-roadrunner:start_listener(my_listener, #{port => 8080, routes => hello_handler}).
+roadrunner:start_listener(my_listener, #{
+    port => 8080,
+    routes => {hello_handler, #{greeting => ~"hello"}}
+}).
 ```
 
 ## Features
