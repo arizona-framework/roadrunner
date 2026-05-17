@@ -152,7 +152,8 @@ to absorb a chunk's payload across multiple length-bounded calls.
     forwarded_for/1,
     scheme/1,
     state/1,
-    request_id/1
+    request_id/1,
+    listener_name/1
 ]).
 
 -doc "Return the request method (uppercase ASCII binary).".
@@ -579,6 +580,20 @@ the handler is automatically annotated with the same id.
 -spec request_id(request()) -> binary() | undefined.
 request_id(#{request_id := Id}) -> Id;
 request_id(_) -> undefined.
+
+-doc """
+Return the atom name of the listener that accepted this request.
+
+Set by `roadrunner_conn` from `proto_opts.listener_name` and stable
+for the lifetime of the connection. Useful for adapter code that
+needs to address the listener (e.g. `pg`-based broadcasts keyed by
+listener name).
+
+`undefined` for manually-constructed request maps used in tests.
+""".
+-spec listener_name(request()) -> atom() | undefined.
+listener_name(#{listener_name := Name}) -> Name;
+listener_name(_) -> undefined.
 
 %% `-on_load` callback. See `feedback_compile_pattern_convention`.
 -spec init_patterns() -> ok.

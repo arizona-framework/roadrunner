@@ -456,6 +456,15 @@ request_id_present_test() ->
 request_id_absent_returns_undefined_test() ->
     ?assertEqual(undefined, roadrunner_req:request_id(sample_req())).
 
+%% --- listener_name/1 ---
+
+listener_name_present_test() ->
+    Req = (sample_req())#{listener_name => my_listener},
+    ?assertEqual(my_listener, roadrunner_req:listener_name(Req)).
+
+listener_name_absent_returns_undefined_test() ->
+    ?assertEqual(undefined, roadrunner_req:listener_name(sample_req())).
+
 %% --- fixtures ---
 
 sample_req() ->
