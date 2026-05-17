@@ -380,8 +380,12 @@ setup_reconciliation(_Opts) ->
 %% lookup is O(1) and the table is shared across all conns of this
 %% listener without copying.
 -spec publish_routes(atom(), opts()) -> ok.
-publish_routes(ListenerName, #{routes := Routes}) when is_list(Routes) ->
-    persistent_term:put({roadrunner_routes, ListenerName}, roadrunner_router:compile(Routes));
+publish_routes(ListenerName, #{routes := Routes} = Opts) when is_list(Routes) ->
+    ListenerMws = maps:get(middlewares, Opts, []),
+    persistent_term:put(
+        {roadrunner_routes, ListenerName},
+        roadrunner_router:compile(Routes, ListenerMws)
+    );
 publish_routes(_ListenerName, _Opts) ->
     ok.
 
@@ -653,16 +657,31 @@ flatten_http2_opts(Entries) ->
             }
     end.
 
-build_dispatch(#{routes := Module}, _ListenerName) when is_atom(Module) ->
-    {handler, Module, #{}};
-build_dispatch(#{routes := {Module, State}}, _ListenerName) when is_atom(Module) ->
-    {handler, Module, #{state => State}};
-build_dispatch(#{routes := #{handler := Module} = Route}, _ListenerName) when is_atom(Module) ->
-    {handler, Module, maps:without([handler], Route)};
+build_dispatch(#{routes := Module} = Opts, _ListenerName) when is_atom(Module) ->
+    {handler, Module, bake_listener_mws(#{}, Opts)};
+build_dispatch(#{routes := {Module, State}} = Opts, _ListenerName) when is_atom(Module) ->
+    {handler, Module, bake_listener_mws(#{state => State}, Opts)};
+build_dispatch(#{routes := #{handler := Module} = Route} = Opts, _ListenerName) when
+    is_atom(Module)
+->
+    {handler, Module, bake_listener_mws(maps:without([handler], Route), Opts)};
 build_dispatch(#{routes := Routes}, ListenerName) when is_list(Routes) ->
     {router, ListenerName};
-build_dispatch(_Opts, _ListenerName) ->
-    {handler, roadrunner_default_handler, #{}}.
+build_dispatch(Opts, _ListenerName) ->
+    {handler, roadrunner_default_handler, bake_listener_mws(#{}, Opts)}.
+
+%% Prepend the listener's `middlewares` opt onto the single-handler
+%% dispatch tag's Cfg `middlewares` key, mirroring
+%% `roadrunner_router:compile/2`'s per-route bake. Cfg keeps no
+%% `middlewares` key when both lists are empty — preserves the no-mws
+%% fast path through `build_pipeline/2`.
+-spec bake_listener_mws(roadrunner_router:route_cfg(), opts()) ->
+    roadrunner_router:route_cfg().
+bake_listener_mws(Cfg, Opts) ->
+    case {maps:get(middlewares, Opts, []), maps:get(middlewares, Cfg, [])} of
+        {[], []} -> Cfg;
+        {ListenerMws, HandlerMws} -> Cfg#{middlewares => ListenerMws ++ HandlerMws}
+    end.
 
 -doc false.
 -spec handle_call(
@@ -699,8 +718,14 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
 
 -spec do_reload_routes(#state{}, roadrunner_router:routes()) ->
     ok | {error, no_routes}.
-do_reload_routes(#state{proto_opts = #{dispatch := {router, Name}}}, Routes) ->
-    persistent_term:put({roadrunner_routes, Name}, roadrunner_router:compile(Routes)),
+do_reload_routes(
+    #state{proto_opts = #{dispatch := {router, Name}, middlewares := ListenerMws}},
+    Routes
+) ->
+    persistent_term:put(
+        {roadrunner_routes, Name},
+        roadrunner_router:compile(Routes, ListenerMws)
+    ),
     ok;
 do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _}}}, _Routes) ->
     {error, no_routes}.

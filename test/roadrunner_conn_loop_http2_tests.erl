@@ -938,7 +938,7 @@ router_404_returns_not_found() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     %% Publish empty routes for a fake listener.
-    persistent_term:put({roadrunner_routes, h2_404_listener}, roadrunner_router:compile([])),
+    persistent_term:put({roadrunner_routes, h2_404_listener}, roadrunner_router:compile([], [])),
     Self = self(),
     Counter = atomics:new(1, [{signed, false}]),
     ok = atomics:add(Counter, 1, 1),
@@ -1852,7 +1852,7 @@ telemetry_request_stop_fires_for_router_404() ->
     try
         {ok, _} = application:ensure_all_started(telemetry),
         drain_mailbox(),
-        persistent_term:put({roadrunner_routes, h2_telem_404}, roadrunner_router:compile([])),
+        persistent_term:put({roadrunner_routes, h2_telem_404}, roadrunner_router:compile([], [])),
         Self = self(),
         Counter = atomics:new(1, [{signed, false}]),
         ok = atomics:add(Counter, 1, 1),
@@ -1940,7 +1940,8 @@ run_h2_with_compress_middleware(Path, ExtraHeaders) ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_compress_test,
-        dispatch => {handler, roadrunner_h2_test_handler, #{}},
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, #{middlewares => [roadrunner_compress]}},
         middlewares => [roadrunner_compress]
     },
     Sock = {fake, Self},

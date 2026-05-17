@@ -381,7 +381,7 @@ resolve_handler_router_no_match_returns_not_found_test() ->
     Name = resolve_handler_router_no_match,
     persistent_term:put(
         {roadrunner_routes, Name},
-        roadrunner_router:compile([{~"/known", some_mod}])
+        roadrunner_router:compile([{~"/known", some_mod}], [])
     ),
     try
         Req = #{target => ~"/missing"},

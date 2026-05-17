@@ -552,15 +552,15 @@ read_body_phase(
 dispatch_phase(
     #loop_state{
         socket = Socket,
-        dispatch = Dispatch,
-        middlewares = ListenerMws
+        dispatch = Dispatch
     } = S,
     Req
 ) ->
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
         {ok, Handler, Bindings, Cfg} ->
             FullReq = roadrunner_conn:thread_route_cfg(Req#{bindings => Bindings}, Cfg),
-            run_pipeline(S, Handler, FullReq, ListenerMws);
+            Mws = maps:get(middlewares, Cfg, []),
+            run_pipeline(S, Handler, FullReq, Mws);
         not_found ->
             _ = roadrunner_conn:send_not_found(Socket),
             exit_normal(S)
@@ -572,8 +572,8 @@ dispatch_phase(
     roadrunner_http1:request(),
     roadrunner_middleware:middleware_list()
 ) -> no_return().
-run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, ListenerMws) ->
-    Pipeline = roadrunner_middleware:build_pipeline(ListenerMws, Req, Handler),
+run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Mws) ->
+    Pipeline = roadrunner_middleware:build_pipeline(Mws, Handler),
     Metadata = telemetry_metadata(Req),
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     try Pipeline(Req) of

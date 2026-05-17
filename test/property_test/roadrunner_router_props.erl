@@ -26,7 +26,7 @@ prop_param_bindings_round_trip() ->
         begin
             PathBin = build_path(Pattern, Values),
             RouteBin = build_route(Pattern),
-            Compiled = roadrunner_router:compile([{RouteBin, my_handler}]),
+            Compiled = roadrunner_router:compile([{RouteBin, my_handler}], []),
             case roadrunner_router:match(PathBin, Compiled) of
                 {ok, my_handler, Bindings, #{}} ->
                     %% Every `:Name` in the pattern must show up in

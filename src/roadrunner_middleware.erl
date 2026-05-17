@@ -106,7 +106,7 @@ server_header(Req, Next) ->
 ```
 """.
 
--export([compose/2, build_pipeline/3]).
+-export([compose/2, build_pipeline/2]).
 -export_type([middleware/0, middleware_list/0, next/0]).
 
 -doc """
@@ -162,34 +162,25 @@ compose([Mw | Rest], Handler) ->
     Inner = compose(Rest, Handler),
     fun(Req) -> apply_one(Mw, Req, Inner) end.
 
-%% Build the per-request handler pipeline from listener-level
-%% middlewares + the request's route-level middlewares (read from
-%% `Req#{middlewares}`, populated by the conn loops from the matched
-%% route's `middlewares` key) + a target handler module.
+%% Build the per-request handler pipeline from a combined middleware
+%% list (listener-level ++ per-route) and a target handler module.
+%% Callers concat the two lists at the dispatch site; the order is
+%% listener-first so listener middlewares wrap route middlewares wrap
+%% the handler — first in each list runs outermost.
 %%
-%% Listener middlewares wrap the route middlewares wrap the handler.
-%% When BOTH lists are empty, returns `fun Handler:handle/1` directly
-%% — skipping `compose/2` saves one closure allocation + one
-%% indirection on the no-mws fast path most production handlers hit.
-%% Otherwise composes the concatenated list with the handler at the
-%% center.
+%% Empty list → returns `fun Handler:handle/1` directly, skipping
+%% `compose/2` to save one closure allocation + one indirection on the
+%% no-mws fast path most production handlers hit.
 %%
 %% Used by both the h1 conn loop (`roadrunner_conn_loop:run_pipeline`)
 %% and the h2 stream worker (`roadrunner_http2_stream_worker:invoke`)
 %% so the dispatch shape stays identical across protocols.
 -doc false.
--spec build_pipeline(middleware_list(), roadrunner_req:request(), module()) -> next().
-build_pipeline([], Req, Handler) ->
-    case route_mws(Req) of
-        [] -> fun Handler:handle/1;
-        Mws -> compose(Mws, fun Handler:handle/1)
-    end;
-build_pipeline(ListenerMws, Req, Handler) ->
-    compose(ListenerMws ++ route_mws(Req), fun Handler:handle/1).
-
--spec route_mws(roadrunner_req:request()) -> middleware_list().
-route_mws(#{middlewares := Mws}) -> Mws;
-route_mws(_) -> [].
+-spec build_pipeline(middleware_list(), module()) -> next().
+build_pipeline([], Handler) ->
+    fun Handler:handle/1;
+build_pipeline(Mws, Handler) ->
+    compose(Mws, fun Handler:handle/1).
 
 -spec apply_one(middleware(), roadrunner_req:request(), next()) ->
     roadrunner_handler:result().

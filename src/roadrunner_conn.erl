@@ -337,25 +337,17 @@ resolve_handler({router, ListenerName}, Req) ->
     Compiled = persistent_term:get({roadrunner_routes, ListenerName}),
     roadrunner_router:match(roadrunner_req:path(Req), Compiled).
 
-%% Splat the matched route's `route_cfg()` onto the request: each cfg
-%% key lands under the same name on the req. `state` is read by
-%% `roadrunner_req:state/1`; `middlewares` by
-%% `roadrunner_middleware:route_mws/1`. Only sets a field when the cfg
-%% map carries it — keeps the no-state / no-mws fast path off both
-%% map writes.
+%% Thread the matched route's per-handler `state` onto the request so
+%% `roadrunner_req:state/1` can read it. Only sets the field when the
+%% cfg carries it — `state/1` falls back to `undefined` when absent,
+%% which saves one map slot per request on the no-state fast path.
+%% Middlewares are NOT threaded here: they're consumed once by the
+%% conn loops to build the pipeline, then thrown away.
 -doc false.
 -spec thread_route_cfg(roadrunner_http1:request(), roadrunner_router:route_cfg()) ->
     roadrunner_http1:request().
-thread_route_cfg(Req, Cfg) ->
-    Req1 =
-        case Cfg of
-            #{state := S} -> Req#{state => S};
-            _ -> Req
-        end,
-    case Cfg of
-        #{middlewares := Mws} -> Req1#{middlewares => Mws};
-        _ -> Req1
-    end.
+thread_route_cfg(Req, #{state := S}) -> Req#{state => S};
+thread_route_cfg(Req, _) -> Req.
 
 -doc false.
 -spec read_body(

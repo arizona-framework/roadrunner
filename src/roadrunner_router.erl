@@ -40,7 +40,7 @@ opaque `compiled()` shape is a list of pre-parsed segment patterns;
 swapping to a trie/DAG later is a non-breaking change for callers.
 """.
 
--export([compile/1, match/2]).
+-export([compile/2, match/2]).
 
 -export_type([route/0, routes/0, route_cfg/0, compiled/0, bindings/0]).
 
@@ -104,20 +104,39 @@ Compile a list of routes into the lookup form `match/2` expects.
 
 Each path is split on `/` (empty leading/trailing segments dropped),
 and segments starting with `:` are recorded as named captures.
-""".
--spec compile(routes()) -> compiled().
-compile(Routes) when is_list(Routes) ->
-    [compile_route(R) || R <- Routes].
 
--spec compile_route(route()) -> {[segment()], module(), route_cfg()}.
-compile_route({Path, Handler}) when is_binary(Path), is_atom(Handler) ->
-    {compile_path(Path), Handler, #{}};
-compile_route({Path, Handler, State}) when is_binary(Path), is_atom(Handler) ->
-    {compile_path(Path), Handler, #{state => State}};
-compile_route(#{path := Path, handler := Handler} = Route) when
+`ListenerMws` is the listener-wide middleware list; it is prepended
+to each route's own `middlewares` so the conn loop reads the full
+pipeline straight from the matched route's cfg — no per-request
+concatenation. Pass `[]` when compiling routes outside a listener
+(typically only in tests).
+""".
+-spec compile(routes(), roadrunner_middleware:middleware_list()) -> compiled().
+compile(Routes, ListenerMws) when is_list(Routes), is_list(ListenerMws) ->
+    [compile_route(R, ListenerMws) || R <- Routes].
+
+-spec compile_route(route(), roadrunner_middleware:middleware_list()) ->
+    {[segment()], module(), route_cfg()}.
+compile_route({Path, Handler}, ListenerMws) when is_binary(Path), is_atom(Handler) ->
+    {compile_path(Path), Handler, with_listener_mws(#{}, ListenerMws)};
+compile_route({Path, Handler, State}, ListenerMws) when is_binary(Path), is_atom(Handler) ->
+    {compile_path(Path), Handler, with_listener_mws(#{state => State}, ListenerMws)};
+compile_route(#{path := Path, handler := Handler} = Route, ListenerMws) when
     is_binary(Path), is_atom(Handler)
 ->
-    {compile_path(Path), Handler, maps:without([path, handler], Route)}.
+    Cfg = maps:without([path, handler], Route),
+    {compile_path(Path), Handler, with_listener_mws(Cfg, ListenerMws)}.
+
+%% Bake listener-level mws onto the per-route cfg's `middlewares` key
+%% so the conn loop reads the full pipeline directly. Omit the key
+%% entirely when the combined list is empty to preserve the no-mws
+%% fast path (`build_pipeline([], Handler)` returns the bare
+%% `fun Handler:handle/1`).
+-spec with_listener_mws(route_cfg(), roadrunner_middleware:middleware_list()) -> route_cfg().
+with_listener_mws(Cfg, []) ->
+    Cfg;
+with_listener_mws(Cfg, ListenerMws) ->
+    Cfg#{middlewares => ListenerMws ++ maps:get(middlewares, Cfg, [])}.
 
 -spec compile_path(binary()) -> [segment()].
 compile_path(Path) ->

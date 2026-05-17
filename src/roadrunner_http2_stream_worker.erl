@@ -74,15 +74,17 @@ init(ConnPid, StreamId, Req, ProtoOpts) ->
     ok.
 
 run_handler(ConnPid, StreamId, Req, ProtoOpts) ->
-    %% Destructure once — `proto_opts` always carries `dispatch`
-    %% (set by listener init); `middlewares` is also always set,
-    %% defaulting to `[]`, so a strict map-pattern is correct here.
-    #{dispatch := Dispatch, middlewares := Mws} = ProtoOpts,
+    %% `dispatch` is set by listener init and always present. The
+    %% per-route middleware list (listener-wide ++ per-route) is baked
+    %% into the matched route's `Cfg.middlewares` at compile time, so
+    %% we just read it out — no per-request concat.
+    #{dispatch := Dispatch} = ProtoOpts,
     Metadata = telemetry_metadata(Req),
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
         {ok, Handler, Bindings, Cfg} ->
             FullReq = roadrunner_conn:thread_route_cfg(Req#{bindings => Bindings}, Cfg),
+            Mws = maps:get(middlewares, Cfg, []),
             invoke(ConnPid, StreamId, Handler, Mws, FullReq, Metadata, ReqStart);
         not_found ->
             send_buffered(
@@ -93,8 +95,8 @@ run_handler(ConnPid, StreamId, Req, ProtoOpts) ->
             })
     end.
 
-invoke(ConnPid, StreamId, Handler, ListenerMws, Req, Metadata, ReqStart) ->
-    Pipeline = roadrunner_middleware:build_pipeline(ListenerMws, Req, Handler),
+invoke(ConnPid, StreamId, Handler, Mws, Req, Metadata, ReqStart) ->
+    Pipeline = roadrunner_middleware:build_pipeline(Mws, Handler),
     try Pipeline(Req) of
         {Response, _Req2} ->
             emit_handler_response(ConnPid, StreamId, Handler, Response),

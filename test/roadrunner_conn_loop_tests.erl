@@ -647,7 +647,7 @@ not_found_writes_404_test() ->
     %% `resolve_handler/2` finds the routes ets entry but returns
     %% `not_found` for any path.
     Listener = nf404,
-    Compiled = roadrunner_router:compile([]),
+    Compiled = roadrunner_router:compile([], []),
     persistent_term:put({roadrunner_routes, Listener}, Compiled),
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET /missing HTTP/1.1\r\nHost: x\r\n\r\n"
