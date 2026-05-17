@@ -40,13 +40,14 @@ care which protocol delivered the bytes.
     target := binary(),
     version := version(),
     headers := headers(),
+    %% H1-parser internal optimization (no public contract).
     %% Pre-computed decisions for known case-insensitive headers,
     %% populated by `roadrunner_http1:parse_request/1`. Hot-path
-    %% consumers (`roadrunner_conn:body_framing/1`,
-    %% `keep_alive_decision/2`, `has_continue_expectation/1`) read
-    %% these instead of re-lowercasing header values per request.
-    %% Absent for manually-built request maps — consumers fall back
-    %% to the raw `headers` list when missing.
+    %% framework code (`roadrunner_conn:body_framing/1`,
+    %% `keep_alive_decision/2`, `has_continue_expectation/1`) reads
+    %% it directly to avoid re-lowercasing header values per request.
+    %% Handlers should ignore this field — it's absent on h2 requests
+    %% and on manually-built request maps.
     cached_decisions => roadrunner_http1:cached_decisions(),
     %% Body is set by `roadrunner_conn` before the handler is
     %% invoked. Auto mode delivers the full body as `iodata()` (an
