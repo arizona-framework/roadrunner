@@ -19,12 +19,12 @@ and **strict 100 %
 (WebSocket, no exclusions). The user-facing API is a handler
 behaviour, request/response accessors, listener controls, and a
 handful of opt-in helpers (cookies, qs, multipart, SSE, WebSocket).
-Modern OTP idioms throughout, predictable per-connection lifecycle
-observability.
+Modern OTP idioms throughout, with predictable per-connection
+lifecycle observability.
 
 ## ⚠️ Requirements
 
-Requires **OTP 29**.
+Requires **OTP 29 or newer**.
 
 ## 🚧 Status
 
@@ -90,7 +90,19 @@ streaming-POST endpoint). On simple GETs and small POSTs
 Roadrunner and elli are within the bench's ~15 % variance band on
 those rows; the comparison doc has the full honest framing.
 
-### Feature matrix
+### Tail latency at sustained load
+
+Open-loop, Coordinated-Omission-corrected (wrk2, `hello`, 8 threads,
+50 connections, 3-run median): Roadrunner sustains **270 k req/s**
+at p50 1.06 ms, p99 2.26 ms, p99.99 3.34 ms. Full per-scenario
+matrix with all four rate-points per server in
+[`docs/wrk2_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/wrk2_results.md).
+
+The throughput numbers above are from `scripts/bench.escript`
+(closed-loop); the comparison doc has the full methodology
+breakdown.
+
+## Comparison
 
 If your workload needs a feature, the server has to ship it. `—`
 means achievable in user code but no helper / option built in; `✗`
@@ -98,6 +110,7 @@ means out of scope for that server.
 
 | feature                                   | roadrunner | cowboy | elli |
 |-------------------------------------------|:----------:|:------:|:----:|
+| HTTP/1.1                                  |     ✓      |   ✓    |  ✓   |
 | HTTP/2 + HPACK                            |     ✓      |   ✓    |  ✗   |
 | WebSocket (RFC 6455)                      |     ✓      |   ✓    |  —   |
 | permessage-deflate (RFC 7692)             |     ✓      |   ✓    |  ✗   |
@@ -110,18 +123,6 @@ means out of scope for that server.
 | Static handler (ETag / Range / IMS)       |     ✓      |   ✓    |  —   |
 | Graceful drain with deadline + broadcast  |     ✓      |   —    |  ✗   |
 | Per-request `request_id` in logger meta   |     ✓      |   —    |  ✗   |
-
-### Tail latency at sustained load
-
-Open-loop, Coordinated-Omission-corrected (wrk2, `hello`, 8 threads,
-50 connections, 3-run median): Roadrunner sustains **270 k req/s**
-at p50 1.06 ms, p99 2.26 ms, p99.99 3.34 ms. Full per-scenario
-matrix with all four rate-points per server in
-[`docs/wrk2_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/wrk2_results.md).
-
-The throughput numbers above are from `scripts/bench.escript`
-(closed-loop); the comparison doc has the full methodology
-breakdown.
 
 ## Quickstart
 
@@ -228,27 +229,28 @@ roadrunner:start_listener(my_listener, #{port => 8080, routes => hello_handler})
 
 ### Hardening
 
-- Strict RFC 9110 / RFC 9112 parsing — request smuggling defenses
-  (CL+TE conflict, multiple-CL), header CRLF/NUL injection rejection,
-  chunk-size leading-whitespace rejection, RFC 6265 cookie OWS handling,
-  RFC 6455 §5.5 control-frame limits, SSE event-line CRLF rejection,
-  trailer header CRLF injection rejection, sendfile path traversal +
-  symlink escape defenses.
-- TLS hardened defaults — TLS 1.2/1.3 only, `honor_cipher_order`,
-  `client_renegotiation` off, AEAD-only ECDHE-or-1.3 ciphers filtered
-  through `ssl:filter_cipher_suites/2`, OTP default `supported_groups`
-  (PQ-hybrid `x25519mlkem768` first when the OpenSSL build supports it),
-  `early_data` disabled.
+- Strict RFC 9110 / 9112 parsing, with defenses grouped by subsystem:
+    - **Request smuggling / framing:** CL+TE conflict, multiple-CL,
+      chunk-size leading-whitespace rejection.
+    - **Header / control-frame injection:** header CRLF / NUL rejection,
+      SSE event-line CRLF rejection, trailer-header CRLF rejection,
+      RFC 6455 §5.5 control-frame limits, RFC 6265 cookie OWS handling.
+    - **Sendfile path safety:** path traversal + symlink escape defenses.
+- TLS hardened defaults — TLS 1.2 / 1.3 only, AEAD-only cipher filter,
+  client renegotiation off, post-quantum hybrid `x25519mlkem768` first
+  when the OpenSSL build supports it. Full settings list in the
+  `roadrunner_listener` module docs.
 - DoS bounds — `max_clients`, `max_content_length`,
   `min_bytes_per_second`, `request_timeout`, `keep_alive_timeout`,
   `max_keep_alive_requests`.
 
 ### Observability
 
-- `telemetry` events: request `start | stop | exception | rejected`,
-  `response, send_failed`, listener `accept | conn_close |
-  slots_reconciled`, ws `upgrade | frame_in | frame_out`, `drain,
-  acknowledged` (opt-in via `roadrunner:acknowledge_drain/1`).
+- `telemetry` events covering request, response, listener
+  accept / close, slot reconciliation, ws upgrade and frames, and
+  drain ack (opt-in via `roadrunner:acknowledge_drain/1`). Full event
+  list with measurements / metadata in the `roadrunner_telemetry`
+  module docs.
 - Per-request `request_id` attached to `logger:set_process_metadata/1`
   so any `?LOG_*` from middleware/handlers is auto-correlated.
 - `roadrunner_listener:info/1` for pull-side `active_clients` /
@@ -276,6 +278,11 @@ roadrunner:start_listener(my_listener, #{port => 8080, routes => hello_handler})
   trade-offs, reproduction commands).
 - [`docs/bench_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/bench_results.md) — full per-protocol
   matrix with p50 / p99 across every scenario.
+- [`docs/bench_internals.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/bench_internals.md) — loadgen worker
+  model, latency aggregation, when the loader becomes the bottleneck.
+- [`docs/wrk2_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/wrk2_results.md) — open-loop,
+  Coordinated-Omission-corrected tail-latency tables (full per-scenario,
+  all rate-points per server).
 - [`docs/resource_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/resource_results.md) — memory + CPU
   shape per scenario.
 - [`docs/conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md)
