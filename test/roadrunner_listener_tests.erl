@@ -574,6 +574,37 @@ reload_routes_swaps_dispatch_table_test_() ->
             end}
         end}.
 
+reload_routes_rebakes_listener_middlewares_test_() ->
+    %% reload_routes/2 must re-bake the listener's `middlewares` opt
+    %% onto the new route cfg. Regression guard for `do_reload_routes/2`
+    %% accidentally passing `[]` instead of the real `ListenerMws` from
+    %% proto_opts — that would silently strip listener-level
+    %% middlewares on reloaded routes.
+    {setup,
+        fun() ->
+            ensure_pg_started(),
+            Name = listener_test_reload_listener_mws,
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                middlewares => [fun roadrunner_test_middlewares:wrap_response/2],
+                routes => [{~"/old", roadrunner_hello_handler, undefined}]
+            }),
+            {Name, roadrunner_listener:port(Name)}
+        end,
+        fun({Name, _Port}) -> ok = roadrunner_listener:stop(Name) end, fun({Name, Port}) ->
+            {"listener middleware survives reload_routes/2 onto the new routes", fun() ->
+                Reply1 = http_get_close(Port, ~"/old"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply1),
+                {match, _} = re:run(Reply1, ~"x-wrapped: yes", [caseless]),
+                ok = roadrunner_listener:reload_routes(
+                    Name, [{~"/new", roadrunner_hello_handler, undefined}]
+                ),
+                Reply2 = http_get_close(Port, ~"/new"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply2),
+                {match, _} = re:run(Reply2, ~"x-wrapped: yes", [caseless])
+            end}
+        end}.
+
 reload_routes_on_handler_listener_returns_no_routes_error_test() ->
     Name = listener_test_reload_no_routes,
     {ok, _} = roadrunner_listener:start_link(Name, #{
