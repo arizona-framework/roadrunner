@@ -103,6 +103,38 @@ listener_honors_num_acceptors_opt_test() ->
     ok = roadrunner_listener:stop(listener_test_pool).
 
 %% =============================================================================
+%% notify_drain/2 (soft drain — broadcast without stopping the listener)
+%% =============================================================================
+
+notify_drain_reaches_pg_members_test() ->
+    %% Self-join the drain group so the broadcast reaches this process,
+    %% then call notify_drain and assert the message lands.
+    Name = listener_test_notify_drain,
+    Group = {roadrunner_drain, Name},
+    ok = pg:join(Group, self()),
+    try
+        Deadline = erlang:monotonic_time(millisecond) + 30000,
+        ok = roadrunner_listener:notify_drain(Name, Deadline),
+        receive
+            {roadrunner_drain, Deadline} -> ok
+        after 200 ->
+            ?assert(false)
+        end
+    after
+        ok = pg:leave(Group, self())
+    end.
+
+notify_drain_with_no_members_is_noop_test() ->
+    %% Empty group — just confirms the call returns ok and doesn't crash.
+    ?assertEqual(
+        ok,
+        roadrunner_listener:notify_drain(
+            listener_test_notify_drain_empty,
+            erlang:monotonic_time(millisecond) + 30000
+        )
+    ).
+
+%% =============================================================================
 %% info/1
 %% =============================================================================
 
