@@ -2,7 +2,7 @@
 -moduledoc """
 Test fixture for the manual-mode keep-alive finishing path:
 explicitly reads the body via `roadrunner_req:read_body/1` so the
-`body_state` is fully drained, and emits a keep-alive-friendly
+`body_reader` is fully drained, and emits a keep-alive-friendly
 response (no `Connection: close`).
 """.
 

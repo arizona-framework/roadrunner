@@ -142,7 +142,7 @@ read_body_manual_state_full_drain_test() ->
         recv => fun() -> error(unused) end,
         max => 1000
     },
-    Req = (sample_req())#{body_state => BS},
+    Req = (sample_req())#{body_reader => BS},
     {ok, Bytes, Req2} = roadrunner_req:read_body(Req),
     ?assertEqual(~"hello", Bytes),
     ?assertEqual(~"hello", roadrunner_req:body(Req2)).
@@ -155,7 +155,7 @@ read_body_manual_state_partial_returns_more_test() ->
         recv => fun() -> error(unused) end,
         max => 1000
     },
-    Req = (sample_req())#{body_state => BS},
+    Req = (sample_req())#{body_reader => BS},
     {more, First, Req2} = roadrunner_req:read_body(Req, #{length => 4}),
     ?assertEqual(~"abcd", First),
     {ok, Last, _Req3} = roadrunner_req:read_body(Req2, #{length => 4}),
@@ -169,7 +169,7 @@ read_body_manual_state_error_propagates_test() ->
         recv => fun() -> {error, closed} end,
         max => 1000
     },
-    Req = (sample_req())#{body_state => BS},
+    Req = (sample_req())#{body_reader => BS},
     ?assertEqual({error, closed}, roadrunner_req:read_body(Req)).
 
 %% --- read_body_chunked/1 ---
@@ -188,7 +188,7 @@ read_body_chunked_manual_state_yields_one_chunk_test() ->
         recv => fun() -> error(unused) end,
         max => 1000
     },
-    Req = (sample_req())#{body_state => BS},
+    Req = (sample_req())#{body_reader => BS},
     {more, Bytes, _Req2} = roadrunner_req:read_body_chunked(Req),
     ?assertEqual(~"foo", Bytes).
 
@@ -342,7 +342,7 @@ read_form_urlencoded_body_read_error_propagates_test() ->
     },
     Req = (sample_req())#{
         headers => [{~"content-type", ~"application/x-www-form-urlencoded"}],
-        body_state => BS
+        body_reader => BS
     },
     ?assertEqual({error, closed}, roadrunner_req:read_form(Req)).
 
@@ -358,7 +358,7 @@ read_form_multipart_body_read_error_propagates_test() ->
     },
     Req = (sample_req())#{
         headers => [{~"content-type", ~"multipart/form-data; boundary=B"}],
-        body_state => BS
+        body_reader => BS
     },
     ?assertEqual({error, closed}, roadrunner_req:read_form(Req)).
 
@@ -379,7 +379,7 @@ read_body_chunked_manual_state_error_propagates_test() ->
         recv => fun() -> {error, closed} end,
         max => 1000
     },
-    Req = (sample_req())#{body_state => BS},
+    Req = (sample_req())#{body_reader => BS},
     ?assertEqual({error, closed}, roadrunner_req:read_body_chunked(Req)).
 
 %% Pending bytes don't satisfy the requested length, recursion needs
@@ -398,7 +398,7 @@ read_body_chunked_manual_pending_then_recv_error_test() ->
         recv => fun() -> {error, closed} end,
         max => 1000
     },
-    Req = (sample_req())#{body_state => BS},
+    Req = (sample_req())#{body_reader => BS},
     ?assertEqual(
         {error, closed},
         roadrunner_req:read_body(Req, #{length => 5})

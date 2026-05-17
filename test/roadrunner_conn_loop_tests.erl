@@ -600,8 +600,8 @@ body_recv_error_writes_400_test() ->
     ?assertMatch(<<"HTTP/1.1 400", _/binary>>, Sent),
     Sink ! stop.
 
-manual_mode_dispatches_with_body_state_test() ->
-    %% Manual mode skips the auto-buffer read and hands a body_state to
+manual_mode_dispatches_with_body_reader_test() ->
+    %% Manual mode skips the auto-buffer read and hands a body_reader to
     %% the handler. The manual handler reads the body explicitly,
     %% returning 200 ok. Use `Connection: close` so the conn closes
     %% after the single request rather than looping back keep-alive
@@ -741,7 +741,7 @@ keep_alive_max_cap_closes_after_max_test() ->
 
 manual_mode_drain_failure_closes_cleanly_test() ->
     %% Manual handler returns 200 without reading the body. drain_body/1
-    %% then has to consume the body_state's unread bytes — when the
+    %% then has to consume the body_reader's unread bytes — when the
     %% recv in that drain returns `{error, closed}`, drain_body returns
     %% `{error, _}` and the conn must exit cleanly without crashing.
     ensure_pg(),
@@ -778,7 +778,7 @@ manual_mode_pipelined_leftover_uses_manual_drain_test() ->
     %% headers + body. After dispatch 1, drain_body returns
     %% `{ok, ManualLeftover}` where ManualLeftover is request 2.
     %% `pipelined_leftover/3` MUST take the manual-mode branch (the
-    %% req has `body_state` set) and feed ManualLeftover to the next
+    %% req has `body_reader` set) and feed ManualLeftover to the next
     %% iteration's read_request_phase. Covers the manual-mode clause
     %% of pipelined_leftover/3.
     ensure_pg(),

@@ -34,7 +34,7 @@
     peer/1,
     try_acquire_slot/1,
     release_slot/1,
-    consume_body_state/2,
+    consume_body_reader/2,
     join_drain_group/2
 ]).
 %% Internal helpers shared with `roadrunner_conn_loop`. Marked `-doc false`
@@ -52,7 +52,7 @@
     maybe_send_continue/3,
     refine_conn_label/2,
     scheme/1,
-    make_body_state/4,
+    make_body_reader/4,
     drain_body/1,
     keep_alive_decision/2,
     send_request_timeout/1,
@@ -66,7 +66,7 @@
     response_kind/1
 ]).
 
--export_type([proto_opts/0, dispatch/0, body_state/0]).
+-export_type([proto_opts/0, dispatch/0, body_reader/0]).
 
 -on_load(init_patterns/0).
 
@@ -134,7 +134,7 @@
 %% wire but not yet handed to the caller — used for chunked framing
 %% to absorb a chunk's payload across multiple length-bounded calls.
 %% `done` flips true once the size-0 last chunk is parsed.
--type body_state() :: #{
+-type body_reader() :: #{
     framing := none | chunked | {content_length, non_neg_integer()},
     buffered := binary(),
     bytes_read := non_neg_integer(),
@@ -399,13 +399,13 @@ has_continue_expectation(Req) ->
     end.
 
 -doc false.
--spec make_body_state(
+-spec make_body_reader(
     none | chunked | {content_length, non_neg_integer()},
     binary(),
     fun(() -> {ok, binary()} | {error, term()}),
     non_neg_integer()
-) -> body_state().
-make_body_state(Framing, Buffered, Recv, Max) ->
+) -> body_reader().
+make_body_reader(Framing, Buffered, Recv, Max) ->
     #{
         framing => Framing,
         buffered => Buffered,
@@ -547,21 +547,21 @@ read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
     end.
 
 %% Read and discard whatever the handler left in the manual-mode
-%% `body_state`, returning any post-body leftover bytes that belong
+%% `body_reader`, returning any post-body leftover bytes that belong
 %% to a pipelined next request. Called only on the 4-tuple response
 %% path; `roadrunner_conn_loop`'s finishing phase threads `Leftover`
 %% forward into the next `reading_request` parse so pipelined
 %% clients get their N+1 request seen.
 -doc false.
 -spec drain_body(roadrunner_req:request()) -> {ok, binary()} | {error, term()}.
-drain_body(#{body_state := BS}) ->
-    case consume_body_state(BS, all) of
+drain_body(#{body_reader := BS}) ->
+    case consume_body_reader(BS, all) of
         {ok, _Bytes, #{buffered := Leftover}} -> {ok, Leftover};
         {error, _} = E -> E
     end.
 
 -doc """
-Consume bytes from a manual-mode `body_state()`. Returns either the
+Consume bytes from a manual-mode `body_reader()`. Returns either the
 final tail (`{ok, Bytes, NewState}` — the body has been fully drained)
 or a partial chunk (`{more, Bytes, NewState}` — more is still pending).
 Used by `roadrunner_req:read_body/1,2`; not part of the public API.
@@ -570,22 +570,22 @@ Used by `roadrunner_req:read_body/1,2`; not part of the public API.
 bytes — content-length framing only; chunked falls through to a
 full read).
 """.
--spec consume_body_state(body_state(), all | next_chunk | {length, non_neg_integer()}) ->
-    {ok, iodata(), body_state()}
-    | {more, iodata(), body_state()}
+-spec consume_body_reader(body_reader(), all | next_chunk | {length, non_neg_integer()}) ->
+    {ok, iodata(), body_reader()}
+    | {more, iodata(), body_reader()}
     | {error, term()}.
-consume_body_state(#{framing := none} = BS, _Mode) ->
+consume_body_reader(#{framing := none} = BS, _Mode) ->
     %% Per RFC 9112 §6.3: no framing means the body is empty.
     %% Any `buffered` bytes are pipelined-next-request leftovers —
-    %% preserve them in the body_state's `buffered` field so
+    %% preserve them in the body_reader's `buffered` field so
     %% `roadrunner_conn_loop`'s finishing phase can thread them into
     %% the next `reading_request` parse for full pipelining support.
     {ok, <<>>, BS};
-consume_body_state(
+consume_body_reader(
     #{framing := {content_length, N}, bytes_read := Read} = BS, _Mode
 ) when Read >= N ->
     {ok, <<>>, BS};
-consume_body_state(
+consume_body_reader(
     #{
         framing := {content_length, N},
         bytes_read := Read,
@@ -618,15 +618,15 @@ consume_body_state(
                     E
             end
     end;
-consume_body_state(#{framing := chunked} = BS, all) ->
+consume_body_reader(#{framing := chunked} = BS, all) ->
     %% Drain everything left: any pending decoded bytes plus all
     %% remaining chunks, accumulated in one return. Iodata stays unflattened
     %% so callers that only need `iolist_size/1` or want to forward via
     %% `gen_tcp:send/2` skip a flatten.
     chunked_collect(BS, infinity);
-consume_body_state(#{framing := chunked} = BS, {length, N}) ->
+consume_body_reader(#{framing := chunked} = BS, {length, N}) ->
     chunked_collect(BS, N);
-consume_body_state(#{framing := chunked} = BS, next_chunk) ->
+consume_body_reader(#{framing := chunked} = BS, next_chunk) ->
     next_chunk(BS).
 %% Non-chunked framing (none, content_length) is handled by the
 %% earlier clauses above — `next_chunk` is treated as a full drain
@@ -637,10 +637,10 @@ consume_body_state(#{framing := chunked} = BS, next_chunk) ->
 %% `infinity` (drain to end — caller asked for `all`) or a positive
 %% integer (caller asked for `{length, N}`). Returns
 %% `{ok | more, Bytes, BS2}` with Bytes as iodata (propagated through
-%% `consume_body_state` to the public API unflattened).
--spec chunked_collect(body_state(), infinity | non_neg_integer()) ->
-    {ok, iodata(), body_state()}
-    | {more, iodata(), body_state()}
+%% `consume_body_reader` to the public API unflattened).
+-spec chunked_collect(body_reader(), infinity | non_neg_integer()) ->
+    {ok, iodata(), body_reader()}
+    | {more, iodata(), body_reader()}
     | {error, term()}.
 chunked_collect(#{pending := Pending} = BS, Want) when
     Want =/= infinity, byte_size(Pending) >= Want
@@ -691,13 +691,13 @@ chunked_collect(#{buffered := Buf, recv := Recv, max := Max, bytes_read := Read}
             E
     end.
 
-%% Pull exactly one decoded chunk out of a chunked body_state. Pending
+%% Pull exactly one decoded chunk out of a chunked body_reader. Pending
 %% bytes (left over from a length-bounded read) are returned first; if
 %% pending is empty, parse the next wire chunk. End-of-body returns
 %% `{ok, <<>>, BS}`.
--spec next_chunk(body_state()) ->
-    {ok, binary(), body_state()}
-    | {more, binary(), body_state()}
+-spec next_chunk(body_reader()) ->
+    {ok, binary(), body_reader()}
+    | {more, binary(), body_reader()}
     | {error, term()}.
 next_chunk(#{pending := Pending} = BS) when byte_size(Pending) > 0 ->
     {more, Pending, BS#{pending := <<>>}};
@@ -733,7 +733,7 @@ fill_n(N, Buf, _Recv) when byte_size(Buf) >= N ->
     {ok, Bytes, Rest};
 fill_n(N, Buf, Recv) ->
     %% Body recursion that conses each recv chunk onto the iolist on
-    %% the way OUT. The iolist propagates through `consume_body_state`
+    %% the way OUT. The iolist propagates through `consume_body_reader`
     %% to the caller unflattened so callers that only need
     %% `iolist_size/1` (or want to forward via `gen_tcp:send/2`) avoid
     %% an O(total-body) copy.

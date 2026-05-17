@@ -4,7 +4,7 @@ Roadrunner handler for `scripts/bench.escript --scenarios large_post_streaming`.
 
 Manual-mode body read: loops `roadrunner_req:read_body/2` with
 `length => 64 KB` until the body is fully drained, then returns a
-2-byte ack. Exercises the manual body_state machine + `recv_phase_bytes`
+2-byte ack. Exercises the manual body_reader machine + `recv_phase_bytes`
 rate-limit interaction — paths with unit coverage but no bench coverage.
 """.
 

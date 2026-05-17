@@ -79,7 +79,7 @@ care which protocol delivered the bytes.
     %% `body_buffering => manual` mode. Threaded through
     %% `roadrunner_req:read_body/1,2`. Never present in `auto` mode
     %% or in manually-constructed request maps.
-    body_state => roadrunner_conn:body_state(),
+    body_reader => roadrunner_conn:body_reader(),
     %% Per-request correlation token attached by `roadrunner_conn`
     %% once the headers parse. 16 lowercase hex chars (8 bytes of
     %% CSPRNG output). Mirrored into `logger:set_process_metadata/1`
@@ -288,17 +288,17 @@ effect — the buffered bytes are returned in one shot.
     {ok, iodata(), request()}
     | {more, iodata(), request()}
     | {error, term()}.
-read_body(#{body_state := BS} = Req, Opts) ->
+read_body(#{body_reader := BS} = Req, Opts) ->
     Mode =
         case Opts of
             #{length := L} -> {length, L};
             _ -> all
         end,
-    case roadrunner_conn:consume_body_state(BS, Mode) of
+    case roadrunner_conn:consume_body_reader(BS, Mode) of
         {ok, Bytes, BS2} ->
-            {ok, Bytes, Req#{body_state := BS2, body => Bytes}};
+            {ok, Bytes, Req#{body_reader := BS2, body => Bytes}};
         {more, Bytes, BS2} ->
-            {more, Bytes, Req#{body_state := BS2}};
+            {more, Bytes, Req#{body_reader := BS2}};
         {error, _} = E ->
             E
     end;
@@ -328,12 +328,12 @@ chunks get drained for keep-alive.
     {ok, iodata(), request()}
     | {more, iodata(), request()}
     | {error, term()}.
-read_body_chunked(#{body_state := BS} = Req) ->
-    case roadrunner_conn:consume_body_state(BS, next_chunk) of
+read_body_chunked(#{body_reader := BS} = Req) ->
+    case roadrunner_conn:consume_body_reader(BS, next_chunk) of
         {ok, Bytes, BS2} ->
-            {ok, Bytes, Req#{body_state := BS2, body => Bytes}};
+            {ok, Bytes, Req#{body_reader := BS2, body => Bytes}};
         {more, Bytes, BS2} ->
-            {more, Bytes, Req#{body_state := BS2}};
+            {more, Bytes, Req#{body_reader := BS2}};
         {error, _} = E ->
             E
     end;
