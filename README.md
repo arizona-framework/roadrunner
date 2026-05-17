@@ -198,6 +198,24 @@ roadrunner:start_listener(my_listener, #{
 }).
 ```
 
+## Configuration
+
+All listener options live in the
+[`roadrunner_listener:opts/0`](https://hexdocs.pm/roadrunner/roadrunner_listener.html#t:opts/0)
+type, with per-key defaults and tuning rationale. Beyond `port`,
+`protocols`, `tls`, and `routes` from the Quickstart, the type covers:
+
+- **DoS bounds** — `max_clients`, `max_content_length`,
+  `request_timeout`, `keep_alive_timeout`,
+  `min_bytes_per_second`, `max_keep_alive_requests`
+- **Middleware** — `middlewares`
+- **Body buffering** — `body_buffering`
+- **Graceful drain** — `graceful_drain`, `slot_reconciliation`
+- **Per-conn hibernation** — `hibernate_after`
+- **HTTP/2 tunables** (under the `{http2, Opts}` entry in
+  `protocols`) — `conn_window`, `stream_window`,
+  `window_refill_threshold`
+
 ## Features
 
 ### Handlers

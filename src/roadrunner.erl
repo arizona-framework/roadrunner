@@ -6,6 +6,10 @@ Listeners are supervised by `roadrunner_sup`: starting a listener adds a
 `roadrunner_listener` child, stopping one terminates and forgets it. The
 roadrunner application must be running (typically via
 `application:ensure_all_started(roadrunner)`).
+
+Configure listeners via the `t:roadrunner_listener:opts/0` map; see
+that type for the full set of available keys, defaults, and tuning
+rationale.
 """.
 
 -export([start_listener/2, stop_listener/1, listeners/0]).
@@ -18,6 +22,9 @@ Start a listener as a supervised child of the roadrunner application.
 `stop_listener/1` later. Returns `{ok, Pid}` on success or `{error, _}`
 if a child with the same name already exists or the listen socket
 cannot be opened.
+
+`Opts` is a `t:roadrunner_listener:opts/0` map — see that type for
+the full set of keys, per-key defaults, and tuning rationale.
 """.
 -spec start_listener(Name :: atom(), roadrunner_listener:opts()) ->
     {ok, pid()} | {error, term()}.
