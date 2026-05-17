@@ -30,7 +30,7 @@
 
 -export([from_headers/3]).
 
--export_type([build_error/0, conn_info/0]).
+-export_type([build_error/0, request_context/0]).
 
 -type build_error() ::
     missing_pseudo_header
@@ -40,7 +40,7 @@
     | empty_path
     | connection_specific_header.
 
--type conn_info() :: #{
+-type request_context() :: #{
     peer := {inet:ip_address(), inet:port_number()} | undefined,
     scheme := http | https,
     request_id := binary(),
@@ -48,7 +48,7 @@
 }.
 
 -doc """
-Build a request map from a decoded HPACK header list. `ConnInfo`
+Build a request map from a decoded HPACK header list. `RequestContext`
 carries the per-connection bits the HTTP/1 conn already has —
 peer, scheme (from the TLS tag), listener_name, request_id.
 
@@ -62,18 +62,18 @@ read it via `roadrunner_req:header/2` still work.
 for header-only requests). Stored on the request map as `iodata()`;
 handlers requiring a flat binary call `iolist_to_binary/1` themselves.
 """.
--spec from_headers(roadrunner_http:headers(), iodata(), conn_info()) ->
+-spec from_headers(roadrunner_http:headers(), iodata(), request_context()) ->
     {ok, roadrunner_req:request()} | {error, build_error()}.
-from_headers(Headers, Body, ConnInfo) ->
+from_headers(Headers, Body, RequestContext) ->
     maybe
         {ok, Pseudo, Regular} ?= partition(Headers),
         %% `validate_pseudo` returns the parsed `:scheme` value but we
         %% deliberately discard it — the authoritative scheme comes
-        %% from the conn (`ConnInfo.scheme`) since clients can lie
+        %% from the conn (`RequestContext.scheme`) since clients can lie
         %% about the pseudo-header value.
         {ok, Method, _Scheme, Path, Authority} ?= validate_pseudo(Pseudo),
         ok ?= check_banned(Regular),
-        {ok, build(Method, Path, Authority, Regular, Body, ConnInfo)}
+        {ok, build(Method, Path, Authority, Regular, Body, RequestContext)}
     end.
 
 %% Walk the decoded header list, collecting pseudo-headers (names
@@ -170,7 +170,7 @@ check_banned([_ | Rest]) -> check_banned(Rest).
     binary(),
     map()
 ) -> roadrunner_req:request().
-build(Method, Path, Authority, Regular, Body, ConnInfo) ->
+build(Method, Path, Authority, Regular, Body, RequestContext) ->
     %% Forward `:authority` as a `host` header so existing h1
     %% handler code that reads `Host` still works. (RFC 9113
     %% §8.3.1 says an h2 server MUST treat `:authority` like
@@ -181,14 +181,14 @@ build(Method, Path, Authority, Regular, Body, ConnInfo) ->
             _ -> [{~"host", Authority} | Regular]
         end,
     %% Caller (`roadrunner_conn_loop_http2:dispatch_stream`)
-    %% always builds `ConnInfo` with all four fields populated, so
+    %% always builds `RequestContext` with all four fields populated, so
     %% pattern-matching wins vs. four `maps:get/3` calls.
     #{
         peer := Peer,
         scheme := Scheme,
         request_id := RequestId,
         listener_name := ListenerName
-    } = ConnInfo,
+    } = RequestContext,
     #{
         method => Method,
         target => Path,

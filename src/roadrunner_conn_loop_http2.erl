@@ -836,13 +836,13 @@ dispatch_stream(
             {RequestId, NewBuf} = roadrunner_conn:generate_request_id(
                 State#loop.req_id_buffer
             ),
-            ConnInfo = #{
+            RequestContext = #{
                 peer => Peer,
                 scheme => Scheme,
                 listener_name => ListenerName,
                 request_id => RequestId
             },
-            case roadrunner_http2_request:from_headers(Headers, BodyIolist, ConnInfo) of
+            case roadrunner_http2_request:from_headers(Headers, BodyIolist, RequestContext) of
                 {ok, Req} ->
                     {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
                         self(), StreamId, Req, ProtoOpts
