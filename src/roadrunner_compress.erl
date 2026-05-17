@@ -99,8 +99,8 @@ transform(_Req, Other) ->
 %% goes on every response that isn't already content-encoded.
 -spec transform_buffered(
     roadrunner_req:request(),
-    roadrunner_req:status(),
-    roadrunner_req:headers(),
+    roadrunner_http:status(),
+    roadrunner_http:headers(),
     iodata()
 ) -> roadrunner_handler:response().
 transform_buffered(Req, Status, Headers, Body) ->
@@ -126,8 +126,8 @@ transform_buffered(Req, Status, Headers, Body) ->
 
 -spec transform_stream(
     roadrunner_req:request(),
-    roadrunner_req:status(),
-    roadrunner_req:headers(),
+    roadrunner_http:status(),
+    roadrunner_http:headers(),
     roadrunner_handler:stream_fun()
 ) -> roadrunner_handler:response().
 transform_stream(Req, Status, Headers, Fun) ->
@@ -151,8 +151,8 @@ transform_stream(Req, Status, Headers, Fun) ->
 %% bytes to the conn's real `Send`. The zlib context is released in
 %% a `try/after` so a crashing user fun doesn't leak the resource.
 -spec wrap_stream(
-    roadrunner_req:status(),
-    roadrunner_req:headers(),
+    roadrunner_http:status(),
+    roadrunner_http:headers(),
     roadrunner_handler:stream_fun(),
     gzip | deflate
 ) ->
@@ -187,8 +187,8 @@ wrap_stream(Status, Headers, Fun, Encoding) ->
     {stream, Status, NewHeaders, WrappedFun}.
 
 -spec compress(
-    roadrunner_req:status(),
-    roadrunner_req:headers(),
+    roadrunner_http:status(),
+    roadrunner_http:headers(),
     iodata(),
     gzip | deflate
 ) -> roadrunner_handler:response().
@@ -323,11 +323,11 @@ parse_q(QBin, Default) ->
             end
     end.
 
--spec has_header(binary(), roadrunner_req:headers()) -> boolean().
+-spec has_header(binary(), roadrunner_http:headers()) -> boolean().
 has_header(Name, Headers) ->
     lists:keymember(Name, 1, Headers).
 
--spec add_vary(roadrunner_req:headers()) -> roadrunner_req:headers().
+-spec add_vary(roadrunner_http:headers()) -> roadrunner_http:headers().
 add_vary(Headers) ->
     case has_header(~"vary", Headers) of
         true -> Headers;

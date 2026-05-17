@@ -674,7 +674,7 @@ dispatch_response(Socket, _Handler, _Req, {Status, Headers0, Body}) when is_inte
 %% only fires for handler-emitted responses (status ≥ 200); 1xx
 %% interim responses are emitted by the framework directly without
 %% routing through this path, so we don't need a 1xx skip here.
--spec with_date(roadrunner_http1:headers()) -> roadrunner_http1:headers().
+-spec with_date(roadrunner_http:headers()) -> roadrunner_http:headers().
 with_date(Headers) ->
     case lists:keymember(~"date", 1, Headers) of
         true -> Headers;
@@ -712,7 +712,7 @@ finishing_phase(S, Req, _Response) ->
 -spec buffered_finish(
     #loop_state{},
     roadrunner_req:request(),
-    roadrunner_http1:headers()
+    roadrunner_http:headers()
 ) -> no_return().
 buffered_finish(S, Req, Headers) ->
     case drain_body_if_manual(Req) of

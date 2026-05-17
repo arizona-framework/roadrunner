@@ -804,7 +804,7 @@ parse_loop(Buf, RecvFun) ->
 %% Order matters — `{websocket, _, _}` is a 3-tuple too, so the
 %% atom-tagged variants must precede the buffered catch-all.
 -doc false.
--spec response_status(roadrunner_handler:response()) -> roadrunner_http1:status().
+-spec response_status(roadrunner_handler:response()) -> roadrunner_http:status().
 response_status({stream, Status, _, _}) -> Status;
 response_status({loop, Status, _, _}) -> Status;
 response_status({sendfile, Status, _, _}) -> Status;
@@ -823,7 +823,7 @@ response_kind({_, _, _}) -> buffered.
 %% HTTP/1.0 default close. HTTP/1.1 keep-alive unless either side
 %% set Connection: close.
 -doc false.
--spec keep_alive_decision(roadrunner_req:request(), roadrunner_http1:headers()) ->
+-spec keep_alive_decision(roadrunner_req:request(), roadrunner_http:headers()) ->
     keep_alive | close.
 %% Common-case fast path: HTTP/1.1, parser-cached request `Connection`
 %% empty, response has no `connection` header → `keep_alive` directly.
@@ -843,7 +843,7 @@ keep_alive_decision(
 keep_alive_decision(Req, RespHeaders) ->
     keep_alive_decision_full(Req, RespHeaders).
 
--spec keep_alive_decision_full(roadrunner_req:request(), roadrunner_http1:headers()) ->
+-spec keep_alive_decision_full(roadrunner_req:request(), roadrunner_http:headers()) ->
     keep_alive | close.
 keep_alive_decision_full(Req, RespHeaders) ->
     ReqConn = req_connection_lower(Req),
@@ -885,7 +885,7 @@ req_connection_lower(Req) ->
         V -> roadrunner_bin:ascii_lowercase(V)
     end.
 
--spec resp_connection_token(roadrunner_http1:headers()) -> binary().
+-spec resp_connection_token(roadrunner_http:headers()) -> binary().
 resp_connection_token(Headers) ->
     case header_value(~"connection", Headers) of
         undefined -> ~"";
@@ -902,7 +902,7 @@ init_patterns() ->
     persistent_term:put(?KEEP_ALIVE_CP_KEY, binary:compile_pattern(~"keep-alive")),
     ok.
 
--spec header_value(binary(), roadrunner_http1:headers()) -> binary() | undefined.
+-spec header_value(binary(), roadrunner_http:headers()) -> binary() | undefined.
 header_value(Name, Headers) ->
     case lists:keyfind(Name, 1, Headers) of
         {_, V} -> V;

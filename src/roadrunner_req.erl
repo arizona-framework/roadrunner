@@ -20,7 +20,7 @@ re-exported alongside it (`headers/0`, `version/0`, `status/0`,
 -define(EQ_CP_KEY, {?MODULE, eq_cp}).
 -define(QUOTE_CP_KEY, {?MODULE, quote_cp}).
 
--export_type([request/0, headers/0, version/0, status/0, redirect_status/0]).
+-export_type([request/0]).
 
 -doc """
 The parsed request map handlers receive.
@@ -94,8 +94,6 @@ care which protocol delivered the bytes.
 
 -type headers() :: roadrunner_http:headers().
 -type version() :: roadrunner_http:version().
--type status() :: roadrunner_http:status().
--type redirect_status() :: roadrunner_http:redirect_status().
 
 -export([
     method/1,

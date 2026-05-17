@@ -67,7 +67,7 @@ Returns `ok` on success or `{error, Reason}` if the wire write
 failed (peer close, kernel error, etc.).
 """.
 -type send_fun() ::
-    fun((iodata(), nofin | fin | {fin, roadrunner_req:headers()}) -> ok | {error, term()}).
+    fun((iodata(), nofin | fin | {fin, roadrunner_http:headers()}) -> ok | {error, term()}).
 
 -doc """
 The stream callback for `{stream, _, _, Fun}` responses. The
@@ -105,10 +105,10 @@ across protocols. Framework helpers (`roadrunner_resp:*`,
 lowercase names; handler-supplied tuples must follow suit.
 """.
 -type response() ::
-    {StatusCode :: roadrunner_req:status(), roadrunner_req:headers(), Body :: iodata()}
-    | {stream, StatusCode :: roadrunner_req:status(), roadrunner_req:headers(), stream_fun()}
-    | {loop, StatusCode :: roadrunner_req:status(), roadrunner_req:headers(), State :: term()}
-    | {sendfile, StatusCode :: roadrunner_req:status(), roadrunner_req:headers(), sendfile_spec()}
+    {StatusCode :: roadrunner_http:status(), roadrunner_http:headers(), Body :: iodata()}
+    | {stream, StatusCode :: roadrunner_http:status(), roadrunner_http:headers(), stream_fun()}
+    | {loop, StatusCode :: roadrunner_http:status(), roadrunner_http:headers(), State :: term()}
+    | {sendfile, StatusCode :: roadrunner_http:status(), roadrunner_http:headers(), sendfile_spec()}
     | {websocket, Module :: module(), State :: term()}.
 
 -doc """

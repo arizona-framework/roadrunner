@@ -158,8 +158,8 @@ accept_key(Key) when is_binary(Key) ->
 %% The session uses this to set up zlib state. The agreed extension's
 %% response header is already in `Headers`.
 -doc false.
--spec handshake_response(roadrunner_req:headers()) ->
-    {ok, roadrunner_req:status(), roadrunner_req:headers(), iodata(), negotiated()}
+-spec handshake_response(roadrunner_http:headers()) ->
+    {ok, roadrunner_http:status(), roadrunner_http:headers(), iodata(), negotiated()}
     | {error,
         missing_websocket_upgrade
         | missing_connection_upgrade
@@ -178,7 +178,7 @@ handshake_response(Headers) when is_list(Headers) ->
             Err
     end.
 
--spec build_handshake_headers(binary(), negotiated()) -> roadrunner_req:headers().
+-spec build_handshake_headers(binary(), negotiated()) -> roadrunner_http:headers().
 build_handshake_headers(Accept, none) ->
     [
         {~"upgrade", ~"websocket"},
@@ -193,7 +193,7 @@ build_handshake_headers(Accept, {permessage_deflate, _, ResponseValue}) ->
         {~"sec-websocket-extensions", ResponseValue}
     ].
 
--spec validate_upgrade(roadrunner_req:headers()) ->
+-spec validate_upgrade(roadrunner_http:headers()) ->
     {ok, binary()}
     | {error,
         missing_websocket_upgrade
@@ -229,7 +229,7 @@ validate_upgrade(Headers) ->
 %% Single-pass extraction. Missing headers come back as `undefined`,
 %% matching `header_lookup/2`'s contract so the validators above stay
 %% untouched.
--spec collect_upgrade_headers(roadrunner_req:headers()) ->
+-spec collect_upgrade_headers(roadrunner_http:headers()) ->
     {binary() | undefined, binary() | undefined, binary() | undefined, binary() | undefined}.
 collect_upgrade_headers([]) ->
     {undefined, undefined, undefined, undefined};
@@ -270,7 +270,7 @@ has_upgrade_token(Value) ->
     binary:match(roadrunner_bin:ascii_lowercase(Value), persistent_term:get(?UPGRADE_CP_KEY)) =/=
         nomatch.
 
--spec header_lookup(binary(), roadrunner_req:headers()) -> binary() | undefined.
+-spec header_lookup(binary(), roadrunner_http:headers()) -> binary() | undefined.
 header_lookup(Name, Headers) ->
     case lists:keyfind(Name, 1, Headers) of
         {_, V} -> V;

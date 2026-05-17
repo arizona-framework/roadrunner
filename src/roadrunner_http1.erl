@@ -20,7 +20,7 @@
     compute_cached_decisions/1
 ]).
 
--export_type([version/0, headers/0, status/0, redirect_status/0, cached_decisions/0]).
+-export_type([cached_decisions/0]).
 
 -on_load(init_patterns/0).
 
@@ -46,14 +46,13 @@
 -define(SPACE_KEY, {?MODULE, space_cp}).
 -define(SEMICOLON_KEY, {?MODULE, semicolon_cp}).
 
-%% Re-exported as type aliases from `roadrunner_http` so existing
-%% callers using `roadrunner_req:request()` / `:headers()` /
-%% `:status()` / `:redirect_status()` / `:version()` keep compiling.
-%% New code calls the shared module directly.
+%% Module-local aliases for the shared HTTP primitives so this
+%% module's specs stay readable. The canonical, exported type lives
+%% at `roadrunner_http:<name>/0` — that's where cross-module callers
+%% should reference it from.
 -type version() :: roadrunner_http:version().
 -type headers() :: roadrunner_http:headers().
 -type status() :: roadrunner_http:status().
--type redirect_status() :: roadrunner_http:redirect_status().
 -type cached_decisions() :: #{
     %% True iff `Transfer-Encoding: chunked` (case-insensitive). Hot path
     %% at body-framing time — saves a per-request lowercase scan.
