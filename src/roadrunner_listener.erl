@@ -327,7 +327,8 @@ status(Name) ->
 -doc """
 Atomically swap the listener's compiled route table without
 restarting it. The new `Routes` are compiled via
-`roadrunner_router:compile/1` and published to `persistent_term`;
+`roadrunner_router:compile/2` (with the listener's `middlewares`
+re-baked) and published to `persistent_term`;
 in-flight conns keep using whatever they read at request-resolve
 time, but every subsequent dispatch sees the new table.
 

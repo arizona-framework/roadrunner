@@ -70,8 +70,13 @@ to the handler via `roadrunner_req:state/1`; unset → `undefined`.
 
 -doc """
 Per-route configuration map carried alongside the matched handler.
-The 4th element of `match/2`'s `{ok, ...}` return. Keys present
-reflect what the route entry attached; missing keys mean "not set".
+The 4th element of `match/2`'s `{ok, ...}` return.
+
+- `state` mirrors what the route entry attached (`undefined` when
+  the route used the 2-tuple shorthand).
+- `middlewares`, when present, is the **pre-baked** combined list:
+  `compile/2`'s `ListenerMws` argument prepended onto the route's
+  own list. Absent when both are empty.
 """.
 -type route_cfg() :: #{
     state => term(),
@@ -153,10 +158,8 @@ Look up the handler for a given request path.
 Returns `{ok, Handler, Bindings, RouteCfg}` on a match — `Bindings`
 is a map populated with captures from `:param` segments (empty for
 purely literal routes); `RouteCfg` is the per-route configuration
-map attached at compile time (`#{}` for bare 2-tuple routes,
-`#{state => S}` for 3-tuple routes, the user's map (minus `path`
-and `handler`) for map-form routes). Returns `not_found` when no
-compiled route matches.
+map produced at compile time. See `t:route_cfg/0` for its shape.
+Returns `not_found` when no compiled route matches.
 """.
 -spec match(Path :: binary(), compiled()) ->
     {ok, module(), bindings(), route_cfg()} | not_found.

@@ -476,12 +476,16 @@ scheme(#{scheme := S}) -> S;
 scheme(_) -> http.
 
 -doc """
-Return the opaque per-route handler state attached at compile time
-via the 3-tuple route shape `{Path, Handler, State}` (or the
-listener's `{Module, State}` single-handler shape).
+Return the opaque per-route handler state attached at compile time.
 
-`undefined` for 2-tuple routes and for the bare-atom single-handler
-form, where no state was supplied.
+Sources, listed by route shape:
+- 3-tuple `{Path, Handler, State}` or map `#{path, handler, state}`
+  list entry.
+- Listener single-handler `{Module, State}` tuple or
+  `#{handler, state, ...}` map.
+
+Returns `undefined` for shapes that don't carry state (2-tuple route,
+bare-atom single-handler, map without a `state` key).
 """.
 -spec state(request()) -> term().
 state(#{state := S}) -> S;
