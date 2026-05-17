@@ -671,6 +671,25 @@ single_handler_map_form_threads_state_test_() ->
             end}
         end}.
 
+single_handler_map_form_without_state_yields_undefined_state_test_() ->
+    {setup,
+        fun() ->
+            Name = listener_test_single_handler_map_no_state,
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                routes => #{handler => roadrunner_state_echo_handler}
+            }),
+            {Name, roadrunner_listener:port(Name)}
+        end,
+        fun({Name, _Port}) -> ok = roadrunner_listener:stop(Name) end, fun({_Name, Port}) ->
+            {"routes => #{handler} (no state key) leaves state/1 as undefined", fun() ->
+                Reply = http_get_close(Port, ~"/"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                [_Head, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(undefined, binary_to_term(Body))
+            end}
+        end}.
+
 single_handler_bare_atom_form_yields_undefined_state_test_() ->
     {setup,
         fun() ->

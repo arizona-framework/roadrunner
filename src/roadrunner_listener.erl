@@ -548,13 +548,14 @@ build_proto_opts(Opts, ListenerName) ->
 
 %% `routes` is the unified dispatch option. Single-handler forms
 %% (bare atom, `{Mod, State}` tuple, or `#{handler := Mod, ...}` map)
-%% all compile to a `{handler, Mod, RouteCfg}` dispatch tag where
-%% `RouteCfg` carries `pipeline` (the pre-composed middleware chain
-%% ending in `fun Mod:handle/1`) and optionally `state`. A list of
-%% route entries uses the router. When `routes` is omitted, fall back
-%% to the default hello-world handler. List-form routes are published
-%% to `persistent_term` by `publish_routes/2` — the dispatch tag
-%% carries the listener name so the conn can look the table up.
+%% all compile to a `{handler, Mod, Pipeline}` dispatch tag where
+%% `Pipeline` is the pre-composed `next()` fun: listener mws ++
+%% per-handler mws, optionally wrapped in a state-injecting closure,
+%% ending in `fun Mod:handle/1`. A list of route entries uses the
+%% router. When `routes` is omitted, fall back to the default
+%% hello-world handler. List-form routes are published to
+%% `persistent_term` by `publish_routes/2` — the dispatch tag carries
+%% the listener name so the conn can look the table up.
 -spec build_dispatch(opts(), atom()) -> roadrunner_conn:dispatch().
 %% Validate + normalize the `protocols` opt. Returns a 2-tuple:
 %%
@@ -659,34 +660,37 @@ flatten_http2_opts(Entries) ->
     end.
 
 build_dispatch(#{routes := Module} = Opts, _ListenerName) when is_atom(Module) ->
-    {handler, Module, bake_cfg(Module, Opts, #{}, [])};
+    {handler, Module, bake_pipeline(Module, Opts, [], no_state)};
 build_dispatch(#{routes := {Module, State}} = Opts, _ListenerName) when is_atom(Module) ->
-    {handler, Module, bake_cfg(Module, Opts, #{state => State}, [])};
+    {handler, Module, bake_pipeline(Module, Opts, [], {state, State})};
 build_dispatch(#{routes := #{handler := Module} = Route} = Opts, _ListenerName) when
     is_atom(Module)
 ->
     HandlerMws = maps:get(middlewares, Route, []),
-    Cfg = maps:without([handler, middlewares], Route),
-    {handler, Module, bake_cfg(Module, Opts, Cfg, HandlerMws)};
+    StateArg =
+        case Route of
+            #{state := S} -> {state, S};
+            _ -> no_state
+        end,
+    {handler, Module, bake_pipeline(Module, Opts, HandlerMws, StateArg)};
 build_dispatch(#{routes := Routes}, ListenerName) when is_list(Routes) ->
     {router, ListenerName};
 build_dispatch(Opts, _ListenerName) ->
-    {handler, roadrunner_default_handler, bake_cfg(roadrunner_default_handler, Opts, #{}, [])}.
+    {handler, roadrunner_default_handler,
+        bake_pipeline(roadrunner_default_handler, Opts, [], no_state)}.
 
-%% Single-handler dispatch counterpart of `roadrunner_router:base_cfg/3`.
-%% Builds the combined listener-mws ++ per-handler-mws pipeline (ending
-%% in `fun Handler:handle/1`) once and stashes it on the dispatch tag's
-%% cfg under `pipeline`. The conn loop reads the fun straight out of
-%% the cfg with no per-request closure allocation.
--spec bake_cfg(
+%% Single-handler dispatch counterpart of the router's compile path.
+%% Defers to `roadrunner_middleware:compile_pipeline/3` after combining
+%% the listener-wide and per-handler mws lists.
+-spec bake_pipeline(
     module(),
     opts(),
-    roadrunner_router:route_cfg(),
-    roadrunner_middleware:middleware_list()
-) -> roadrunner_router:route_cfg().
-bake_cfg(Handler, Opts, Cfg, HandlerMws) ->
+    roadrunner_middleware:middleware_list(),
+    no_state | {state, term()}
+) -> roadrunner_middleware:next().
+bake_pipeline(Handler, Opts, HandlerMws, StateArg) ->
     ListenerMws = maps:get(middlewares, Opts, []),
-    Cfg#{pipeline => roadrunner_middleware:build_pipeline(ListenerMws ++ HandlerMws, Handler)}.
+    roadrunner_middleware:compile_pipeline(ListenerMws ++ HandlerMws, Handler, StateArg).
 
 -doc false.
 -spec handle_call(

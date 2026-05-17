@@ -28,9 +28,8 @@ logger_metadata_set_in_h2_worker_test_() ->
         },
         ProtoOpts = #{
             dispatch =>
-                {handler, roadrunner_logger_probe_handler, #{
-                    pipeline => fun roadrunner_logger_probe_handler:handle/1
-                }},
+                {handler, roadrunner_logger_probe_handler,
+                    fun roadrunner_logger_probe_handler:handle/1},
             middlewares => []
         },
         {_WorkerPid, _MonRef} = roadrunner_http2_stream_worker:start(

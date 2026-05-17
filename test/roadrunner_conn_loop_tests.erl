@@ -404,9 +404,7 @@ middleware_pipeline_runs_when_listener_has_middlewares_test() ->
     Opts = (fake_opts(mw))#{
         middlewares := [Identity],
         dispatch :=
-            {handler, roadrunner_echo_body_handler, #{
-                pipeline => fun roadrunner_echo_body_handler:handle/1
-            }}
+            {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -434,9 +432,7 @@ handler_crash_writes_500_and_fires_request_exception_test() ->
     ),
     Opts = (fake_opts(crash))#{
         dispatch :=
-            {handler, roadrunner_crashing_handler, #{
-                pipeline => fun roadrunner_crashing_handler:handle/1
-            }}
+            {handler, roadrunner_crashing_handler, fun roadrunner_crashing_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -470,9 +466,7 @@ post_body_echoes_via_auto_mode_test() ->
     Sink = spawn_active_sink_with_send_log(Self, Tag, Req),
     Opts = (fake_opts(echo))#{
         dispatch :=
-            {handler, roadrunner_echo_body_handler, #{
-                pipeline => fun roadrunner_echo_body_handler:handle/1
-            }}
+            {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -504,9 +498,7 @@ oversized_body_writes_413_and_fires_request_rejected_test() ->
     Opts = (fake_opts(big))#{
         max_content_length := 5,
         dispatch :=
-            {handler, roadrunner_echo_body_handler, #{
-                pipeline => fun roadrunner_echo_body_handler:handle/1
-            }}
+            {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -538,9 +530,7 @@ body_recv_timeout_writes_408_test() ->
     ]),
     Opts = (fake_opts(body_to))#{
         dispatch :=
-            {handler, roadrunner_echo_body_handler, #{
-                pipeline => fun roadrunner_echo_body_handler:handle/1
-            }}
+            {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -564,9 +554,7 @@ body_slow_client_exits_silently_test() ->
     ]),
     Opts = (fake_opts(body_slow))#{
         dispatch :=
-            {handler, roadrunner_echo_body_handler, #{
-                pipeline => fun roadrunner_echo_body_handler:handle/1
-            }}
+            {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -592,9 +580,7 @@ body_recv_error_writes_400_test() ->
     ]),
     Opts = (fake_opts(body_err))#{
         dispatch :=
-            {handler, roadrunner_echo_body_handler, #{
-                pipeline => fun roadrunner_echo_body_handler:handle/1
-            }}
+            {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -624,9 +610,8 @@ manual_mode_dispatches_with_body_state_test() ->
     Opts = (fake_opts(manual))#{
         body_buffering := manual,
         dispatch :=
-            {handler, roadrunner_manual_keepalive_handler, #{
-                pipeline => fun roadrunner_manual_keepalive_handler:handle/1
-            }}
+            {handler, roadrunner_manual_keepalive_handler,
+                fun roadrunner_manual_keepalive_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -650,9 +635,8 @@ manual_mode_bad_framing_writes_400_test() ->
     Opts = (fake_opts(manual_bad))#{
         body_buffering := manual,
         dispatch :=
-            {handler, roadrunner_manual_keepalive_handler, #{
-                pipeline => fun roadrunner_manual_keepalive_handler:handle/1
-            }}
+            {handler, roadrunner_manual_keepalive_handler,
+                fun roadrunner_manual_keepalive_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -708,9 +692,7 @@ two_pipelined_requests_in_one_packet_serve_both_test() ->
     Sink = spawn_active_sink_with_send_log(Self, Tag, Both),
     Opts = (fake_opts(pipelined))#{
         dispatch :=
-            {handler, roadrunner_keepalive_handler, #{
-                pipeline => fun roadrunner_keepalive_handler:handle/1
-            }},
+            {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1},
         max_keep_alive_requests := 2
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
@@ -766,9 +748,8 @@ manual_mode_drain_failure_closes_cleanly_test() ->
     Opts = (fake_opts(drain_fail))#{
         body_buffering := manual,
         dispatch :=
-            {handler, roadrunner_conn_loop_lazy_manual_handler, #{
-                pipeline => fun roadrunner_conn_loop_lazy_manual_handler:handle/1
-            }}
+            {handler, roadrunner_conn_loop_lazy_manual_handler,
+                fun roadrunner_conn_loop_lazy_manual_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -802,9 +783,8 @@ manual_mode_pipelined_leftover_uses_manual_drain_test() ->
     Opts = (fake_opts(manual_pipe))#{
         body_buffering := manual,
         dispatch :=
-            {handler, roadrunner_manual_keepalive_handler, #{
-                pipeline => fun roadrunner_manual_keepalive_handler:handle/1
-            }},
+            {handler, roadrunner_manual_keepalive_handler,
+                fun roadrunner_manual_keepalive_handler:handle/1},
         max_keep_alive_requests := 2
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
@@ -836,9 +816,7 @@ keep_alive_idle_timeout_silently_closes_test() ->
     ),
     Opts = (fake_opts(ka_to))#{
         dispatch :=
-            {handler, roadrunner_keepalive_handler, #{
-                pipeline => fun roadrunner_keepalive_handler:handle/1
-            }},
+            {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1},
         keep_alive_timeout := 50
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
@@ -868,9 +846,7 @@ hibernate_after_fires_during_keep_alive_idle_test() ->
     ),
     Opts = (fake_opts(hib))#{
         dispatch :=
-            {handler, roadrunner_keepalive_handler, #{
-                pipeline => fun roadrunner_keepalive_handler:handle/1
-            }},
+            {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1},
         hibernate_after => 50,
         keep_alive_timeout := 5000
     },
@@ -905,9 +881,7 @@ hibernate_path_handles_close_test() ->
     ),
     Opts = (fake_opts(hib_closed))#{
         dispatch :=
-            {handler, roadrunner_keepalive_handler, #{
-                pipeline => fun roadrunner_keepalive_handler:handle/1
-            }},
+            {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1},
         hibernate_after => 50
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
@@ -930,9 +904,7 @@ hibernate_path_handles_tcp_error_test() ->
     ),
     Opts = (fake_opts(hib_err))#{
         dispatch :=
-            {handler, roadrunner_keepalive_handler, #{
-                pipeline => fun roadrunner_keepalive_handler:handle/1
-            }},
+            {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1},
         hibernate_after => 50
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
@@ -958,9 +930,7 @@ hibernate_path_handles_deadline_fired_test() ->
     ),
     Opts = (fake_opts(hib_dl))#{
         dispatch :=
-            {handler, roadrunner_keepalive_handler, #{
-                pipeline => fun roadrunner_keepalive_handler:handle/1
-            }},
+            {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1},
         hibernate_after => 5000,
         keep_alive_timeout := 50
     },
@@ -982,9 +952,7 @@ hibernate_path_drops_stray_messages_test() ->
     ),
     Opts = (fake_opts(hib_stray))#{
         dispatch :=
-            {handler, roadrunner_keepalive_handler, #{
-                pipeline => fun roadrunner_keepalive_handler:handle/1
-            }},
+            {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1},
         hibernate_after => 5000,
         keep_alive_timeout := 200
     },
@@ -1059,9 +1027,7 @@ stream_response_writes_chunked_body_test() ->
     ),
     Opts = (fake_opts(stream))#{
         dispatch :=
-            {handler, roadrunner_stream_handler, #{
-                pipeline => fun roadrunner_stream_handler:handle/1
-            }}
+            {handler, roadrunner_stream_handler, fun roadrunner_stream_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -1086,7 +1052,7 @@ loop_response_runs_until_stop_test() ->
     ),
     Opts = (fake_opts(looprsp))#{
         dispatch :=
-            {handler, roadrunner_loop_handler, #{pipeline => fun roadrunner_loop_handler:handle/1}}
+            {handler, roadrunner_loop_handler, fun roadrunner_loop_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -1120,9 +1086,8 @@ sendfile_response_writes_head_then_body_test() ->
     ),
     Opts = (fake_opts(sendf))#{
         dispatch :=
-            {handler, roadrunner_conn_loop_sendfile_handler, #{
-                pipeline => fun roadrunner_conn_loop_sendfile_handler:handle/1
-            }}
+            {handler, roadrunner_conn_loop_sendfile_handler,
+                fun roadrunner_conn_loop_sendfile_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -1152,9 +1117,8 @@ sendfile_response_skips_body_for_head_method_test() ->
     ),
     Opts = (fake_opts(sendf_head))#{
         dispatch :=
-            {handler, roadrunner_conn_loop_sendfile_handler, #{
-                pipeline => fun roadrunner_conn_loop_sendfile_handler:handle/1
-            }}
+            {handler, roadrunner_conn_loop_sendfile_handler,
+                fun roadrunner_conn_loop_sendfile_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -1183,9 +1147,7 @@ websocket_dispatch_invokes_session_run_test() ->
     ),
     Opts = (fake_opts(wsdisp))#{
         dispatch :=
-            {handler, roadrunner_ws_upgrade_handler, #{
-                pipeline => fun roadrunner_ws_upgrade_handler:handle/1
-            }}
+            {handler, roadrunner_ws_upgrade_handler, fun roadrunner_ws_upgrade_handler:handle/1}
     },
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -1232,10 +1194,7 @@ ensure_pg() ->
 
 fake_opts(ListenerName) ->
     #{
-        dispatch =>
-            {handler, roadrunner_hello_handler, #{
-                pipeline => fun roadrunner_hello_handler:handle/1
-            }},
+        dispatch => {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1},
         middlewares => [],
         max_content_length => 10485760,
         request_timeout => 5000,

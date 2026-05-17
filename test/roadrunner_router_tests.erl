@@ -124,8 +124,11 @@ match_root_wildcard_test() ->
     ).
 
 match_route_with_state_test() ->
-    %% 3-tuple route attaches per-handler state; match/2 surfaces it as
-    %% `#{state => ...}` in the route cfg map.
+    %% 3-tuple route attaches per-handler state. State is baked into
+    %% the pipeline closure (verified behaviorally by
+    %% `compile_bakes_state_into_pipeline_test`); the structural test
+    %% here just confirms the route resolves to the right handler +
+    %% bindings.
     Compiled = roadrunner_router:compile(
         [
             {~"/static/*path", static_handler, #{dir => ~"/var/www"}}
@@ -133,7 +136,7 @@ match_route_with_state_test() ->
         []
     ),
     ?assertEqual(
-        {ok, static_handler, #{~"path" => [~"a.css"]}, #{state => #{dir => ~"/var/www"}}},
+        {ok, static_handler, #{~"path" => [~"a.css"]}, #{}},
         match_no_pipeline(~"/static/a.css", Compiled)
     ).
 
@@ -165,7 +168,7 @@ match_mixed_two_and_three_tuple_routes_test() ->
         match_no_pipeline(~"/", Compiled)
     ),
     ?assertEqual(
-        {ok, static_handler, #{~"path" => [~"a.css"]}, #{state => #{dir => ~"/var/www"}}},
+        {ok, static_handler, #{~"path" => [~"a.css"]}, #{}},
         match_no_pipeline(~"/static/a.css", Compiled)
     ).
 
@@ -194,7 +197,7 @@ match_map_route_with_state_test() ->
         []
     ),
     ?assertEqual(
-        {ok, users_handler, #{~"id" => ~"42"}, #{state => #{role => admin}}},
+        {ok, users_handler, #{~"id" => ~"42"}, #{}},
         match_no_pipeline(~"/users/42", Compiled)
     ).
 
@@ -226,7 +229,7 @@ match_map_route_with_state_and_middlewares_test() ->
         []
     ),
     ?assertEqual(
-        {ok, api_handler, #{~"resource" => ~"users"}, #{state => #{db => primary}}},
+        {ok, api_handler, #{~"resource" => ~"users"}, #{}},
         match_no_pipeline(~"/api/users", Compiled)
     ).
 
@@ -245,7 +248,7 @@ match_mixed_tuple_and_map_routes_test() ->
         match_no_pipeline(~"/", Compiled)
     ),
     ?assertEqual(
-        {ok, about_handler, #{}, #{state => ~"hello"}},
+        {ok, about_handler, #{}, #{}},
         match_no_pipeline(~"/about", Compiled)
     ),
     ?assertEqual(
@@ -394,13 +397,15 @@ match_path_without_leading_slash_resolves_same_as_with_test() ->
     ?assertEqual(Expected, match_no_pipeline(~"users/joe", Compiled)).
 
 %% =============================================================================
-%% Pipeline shape (the post-compile `pipeline` key)
+%% Pipeline shape + state injection (the post-compile 4th element is the
+%% pre-composed `next()` fun; state on 3-tuple / map-with-state routes is
+%% injected onto the req before the chain runs)
 %% =============================================================================
 
-compile_sets_pipeline_on_every_cfg_test() ->
-    %% Every compiled route, regardless of shape, carries a callable
-    %% `pipeline` fun. Shape only — behavior is covered by
-    %% `roadrunner_middleware_tests`.
+compile_returns_callable_pipeline_test() ->
+    %% Every compiled route, regardless of shape, ends with a 1-arity
+    %% fun in the 4th element of `match/2`'s return. Behavior is
+    %% covered by `roadrunner_middleware_tests`.
     Compiled = roadrunner_router:compile(
         [
             {~"/", h},
@@ -412,17 +417,32 @@ compile_sets_pipeline_on_every_cfg_test() ->
     [
         ?assert(is_function(P, 1))
      || Path <- [~"/", ~"/x", ~"/y"],
-        {ok, _, _, #{pipeline := P}} <- [roadrunner_router:match(Path, Compiled)]
+        {ok, _, _, P} <- [roadrunner_router:match(Path, Compiled)]
     ].
+
+compile_bakes_state_into_pipeline_test() ->
+    %% State attached at compile time is injected onto the req by the
+    %% pipeline's outermost closure, so middlewares + handler see it.
+    %% The fixture handler echoes `roadrunner_req:state(Req)` as the
+    %% response body.
+    Compiled = roadrunner_router:compile(
+        [{~"/", roadrunner_state_echo_handler, #{my => state}}], []
+    ),
+    {ok, _, _, Pipeline} = roadrunner_router:match(~"/", Compiled),
+    {{200, _, Body}, _} = Pipeline(empty_req()),
+    ?assertEqual(#{my => state}, binary_to_term(Body)).
 
 %% --- helpers ---
 
-%% Strip the always-present `pipeline` fun from a match result so the
-%% remaining cfg keys can be asserted with `?assertEqual`. The
-%% pipeline itself is funs-are-not-comparable; its behavior is
-%% covered by `roadrunner_middleware_tests`.
+%% Drop the 4th element (the pipeline fun, funs-are-not-comparable) so
+%% the handler module + bindings can be asserted with `?assertEqual`.
+%% State injection is covered separately by
+%% `compile_bakes_state_into_pipeline_test`.
 match_no_pipeline(Path, Compiled) ->
     case roadrunner_router:match(Path, Compiled) of
-        {ok, Mod, Bindings, Cfg} -> {ok, Mod, Bindings, maps:without([pipeline], Cfg)};
+        {ok, Mod, Bindings, _Pipeline} -> {ok, Mod, Bindings, #{}};
         Other -> Other
     end.
+
+empty_req() ->
+    #{method => ~"GET", target => ~"/", version => {1, 1}, headers => []}.

@@ -62,7 +62,6 @@
     send_internal_error/1,
     send_not_found/1,
     resolve_handler/2,
-    thread_route_cfg/2,
     response_status/1,
     response_kind/1
 ]).
@@ -75,7 +74,7 @@
 -define(KEEP_ALIVE_CP_KEY, {?MODULE, keep_alive_cp}).
 
 -type dispatch() ::
-    {handler, module(), roadrunner_router:route_cfg()}
+    {handler, module(), roadrunner_middleware:next()}
     | {router, ListenerName :: atom()}.
 
 -type proto_opts() :: #{
@@ -327,27 +326,15 @@ scheme({fake, _}) -> http.
 
 -doc false.
 -spec resolve_handler(dispatch(), roadrunner_http1:request()) ->
-    {ok, module(), roadrunner_router:bindings(), roadrunner_router:route_cfg()} | not_found.
-resolve_handler({handler, Mod, Cfg}, _Req) ->
-    {ok, Mod, #{}, Cfg};
+    {ok, module(), roadrunner_router:bindings(), roadrunner_middleware:next()} | not_found.
+resolve_handler({handler, Mod, Pipeline}, _Req) ->
+    {ok, Mod, #{}, Pipeline};
 resolve_handler({router, ListenerName}, Req) ->
     %% Routes are stored in `persistent_term` by `roadrunner_listener` so
     %% the lookup is O(1) and `roadrunner_listener:reload_routes/2` can
     %% atomically swap the table without bouncing the listener.
     Compiled = persistent_term:get({roadrunner_routes, ListenerName}),
     roadrunner_router:match(roadrunner_req:path(Req), Compiled).
-
-%% Thread the matched route's per-handler `state` onto the request so
-%% `roadrunner_req:state/1` can read it. Only sets the field when the
-%% cfg carries it — `state/1` falls back to `undefined` when absent,
-%% which saves one map slot per request on the no-state fast path.
-%% Middlewares are NOT threaded here: they're consumed once by the
-%% conn loops to build the pipeline, then thrown away.
--doc false.
--spec thread_route_cfg(roadrunner_http1:request(), roadrunner_router:route_cfg()) ->
-    roadrunner_http1:request().
-thread_route_cfg(Req, #{state := S}) -> Req#{state => S};
-thread_route_cfg(Req, _) -> Req.
 
 -doc false.
 -spec read_body(

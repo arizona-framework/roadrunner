@@ -354,23 +354,17 @@ chunked_recv(Chunks) ->
     end.
 
 %% =============================================================================
-%% resolve_handler/2 — dispatch tag → {ok, Mod, Bindings, RouteCfg}
+%% resolve_handler/2 — dispatch tag → {ok, Mod, Bindings, Pipeline}
 %% =============================================================================
 
-resolve_handler_passes_cfg_through_test() ->
-    %% The handler-form dispatch tag just unpacks: same cfg comes back
-    %% as the 4th element. Bindings is empty (no router involved).
-    Cfg = #{pipeline => fun some_mod:handle/1},
+resolve_handler_passes_pipeline_through_test() ->
+    %% The handler-form dispatch tag just unpacks: the pre-baked
+    %% pipeline fun comes back as the 4th element. Bindings is empty
+    %% (no router involved).
+    Pipeline = fun some_mod:handle/1,
     ?assertEqual(
-        {ok, some_mod, #{}, Cfg},
-        roadrunner_conn:resolve_handler({handler, some_mod, Cfg}, dummy_req())
-    ).
-
-resolve_handler_cfg_with_state_test() ->
-    Cfg = #{pipeline => fun some_mod:handle/1, state => #{greeting => ~"hi"}},
-    ?assertEqual(
-        {ok, some_mod, #{}, Cfg},
-        roadrunner_conn:resolve_handler({handler, some_mod, Cfg}, dummy_req())
+        {ok, some_mod, #{}, Pipeline},
+        roadrunner_conn:resolve_handler({handler, some_mod, Pipeline}, dummy_req())
     ).
 
 resolve_handler_router_no_match_returns_not_found_test() ->

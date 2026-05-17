@@ -106,7 +106,7 @@ server_header(Req, Next) ->
 ```
 """.
 
--export([compose/2, build_pipeline/2]).
+-export([compose/2, build_pipeline/2, compile_pipeline/3]).
 -export_type([middleware/0, middleware_list/0, next/0]).
 
 -doc """
@@ -184,6 +184,21 @@ build_pipeline([], Handler) ->
     fun Handler:handle/1;
 build_pipeline(Mws, Handler) ->
     compose(Mws, fun Handler:handle/1).
+
+%% Compile a per-request pipeline `next()` fun: composes the mws
+%% ending in `fun Handler:handle/1`, optionally wrapped in an
+%% outermost closure that injects `state` onto the request before
+%% middlewares run. Used by `roadrunner_router:compile/2` and
+%% `roadrunner_listener:build_dispatch/2` to pre-bake the full
+%% pipeline at compile / `reload_routes/2` time so the conn loops
+%% don't allocate closures per request.
+-doc false.
+-spec compile_pipeline(middleware_list(), module(), no_state | {state, term()}) -> next().
+compile_pipeline(Mws, Handler, no_state) ->
+    build_pipeline(Mws, Handler);
+compile_pipeline(Mws, Handler, {state, State}) ->
+    Inner = build_pipeline(Mws, Handler),
+    fun(Req) -> Inner(Req#{state => State}) end.
 
 -spec apply_one(middleware(), roadrunner_req:request(), next()) ->
     roadrunner_handler:result().
