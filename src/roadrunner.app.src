@@ -1,5 +1,5 @@
 {application, roadrunner, [
-    {description, "Pure-Erlang HTTP and WebSocket server. Beep beep."},
+    {description, "Pure-Erlang HTTP/1.1, HTTP/2, and WebSocket server. Beep beep."},
     {vsn, "0.1.0"},
     {registered, []},
     {mod, {roadrunner_app, []}},
