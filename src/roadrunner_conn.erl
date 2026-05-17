@@ -35,7 +35,8 @@
     try_acquire_slot/1,
     release_slot/1,
     consume_body_reader/2,
-    join_drain_group/2
+    join_drain_group/2,
+    join_drain_group_for/2
 ]).
 %% Internal helpers shared with `roadrunner_conn_loop`. Marked `-doc false`
 %% individually so they stay invisible to the public API surface but
@@ -159,6 +160,31 @@ join_drain_group(Name, true) ->
     case whereis(pg) of
         undefined -> ok;
         _ -> pg:join({roadrunner_drain, Name}, self())
+    end.
+
+-doc """
+Join `Pid` into the per-listener `pg` drain group on behalf of another
+process. Used by `roadrunner_ws_session:run/4` so each WS session
+pid (spawned via `gen_statem:start` and thus NOT inheriting the
+conn's `pg` membership) still receives `{roadrunner_drain, Deadline}`
+broadcasts.
+
+WS sessions always join, regardless of the conn's `graceful_drain`
+setting: that flag is documented as a perf opt-out for short-lived
+HTTP/1 conns, and WS sessions are never short-lived. Skipping the
+join here would silently strand long-lived sessions during deploys.
+
+Silently no-ops when `Name` is `undefined` (manually constructed
+requests in tests) or when the `pg` scope is absent (listener
+started without the supervision tree).
+""".
+-spec join_drain_group_for(pid(), atom()) -> ok.
+join_drain_group_for(_Pid, undefined) ->
+    ok;
+join_drain_group_for(Pid, Name) when is_pid(Pid), is_atom(Name) ->
+    case whereis(pg) of
+        undefined -> ok;
+        _ -> pg:join({roadrunner_drain, Name}, Pid)
     end.
 
 -doc """

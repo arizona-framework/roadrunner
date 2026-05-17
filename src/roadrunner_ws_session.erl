@@ -80,6 +80,7 @@
     %% read).
     has_init :: boolean(),
     has_handle_info :: boolean(),
+    has_handle_drain :: boolean(),
     %% permessage-deflate (RFC 7692) state. `pmd_params = undefined`
     %% means the extension was NOT negotiated; the session bypasses
     %% all compression machinery on the hot path.
@@ -182,6 +183,11 @@ run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated) ->
     %% a monitor instead.
     case gen_statem:start(?MODULE, {Socket, Mod, State, Ctx, Negotiated}, []) of
         {ok, Pid} ->
+            %% Auto-join the session into the listener's drain `pg` group
+            %% so `roadrunner_listener:drain/2` broadcasts reach long-lived
+            %% sessions directly — the conn's membership does not carry
+            %% across the unlinked `gen_statem:start` boundary above.
+            ok = roadrunner_conn:join_drain_group_for(Pid, roadrunner_req:listener_name(Req)),
             ok = roadrunner_telemetry:ws_upgrade(Ctx),
             _ = roadrunner_telemetry:response_send(
                 roadrunner_transport:send(Socket, UpgradeResp), websocket_upgrade_response
@@ -232,6 +238,7 @@ init({Socket, Mod, State, Ctx, Negotiated}) ->
                 ctx = Ctx,
                 has_init = erlang:function_exported(Mod, init, 1),
                 has_handle_info = erlang:function_exported(Mod, handle_info, 2),
+                has_handle_drain = erlang:function_exported(Mod, handle_drain, 2),
                 pmd_params = PmdParams,
                 inflate_z = InflateZ,
                 deflate_z = DeflateZ,
@@ -301,6 +308,11 @@ frame_loop(info, Msg, #data{socket = Socket} = Data) ->
             {stop, normal, Data};
         {ErrorTag, _Sock, _Reason} ->
             {stop, normal, Data};
+        {roadrunner_drain, Deadline} ->
+            %% Drain broadcast — dispatch to optional handle_drain/2 and
+            %% drop. Drain messages never reach handle_info/2 so handlers
+            %% don't have to pattern-match on a framework-internal shape.
+            handle_drain_msg(Deadline, Data, false);
         _Other ->
             %% Forward to handler's optional handle_info/2 if exported,
             %% otherwise drop. Mirrors handle_frame's reply / hibernate
@@ -864,6 +876,17 @@ dispatch_data_frame(Frame, #data{mod = Mod, mod_state = State} = Data, Hibernate
 handle_info_msg(Msg, #data{has_handle_info = true, mod = Mod, mod_state = State} = Data, Hibernate) ->
     apply_handler_result(Mod:handle_info(Msg, State), Data, Hibernate, fun continue_arm/2);
 handle_info_msg(_Msg, #data{has_handle_info = false, socket = Socket} = Data, _Hibernate) ->
+    arm_or_stop(Socket, Data, []).
+
+-spec handle_drain_msg(integer(), #data{}, boolean()) ->
+    gen_statem:event_handler_result(atom()).
+handle_drain_msg(
+    Deadline,
+    #data{has_handle_drain = true, mod = Mod, mod_state = State} = Data,
+    Hibernate
+) ->
+    apply_handler_result(Mod:handle_drain(Deadline, State), Data, Hibernate, fun continue_arm/2);
+handle_drain_msg(_Deadline, #data{has_handle_drain = false, socket = Socket} = Data, _Hibernate) ->
     arm_or_stop(Socket, Data, []).
 
 %% Named continue functions used by `apply_handler_result` — pass these

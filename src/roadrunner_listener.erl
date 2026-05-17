@@ -24,7 +24,16 @@ All duration and interval values in `opts()` are in milliseconds —
 
 -behaviour(gen_server).
 
--export([start_link/2, stop/1, drain/2, port/1, info/1, status/1, reload_routes/2]).
+-export([
+    start_link/2,
+    stop/1,
+    drain/2,
+    notify_drain/2,
+    port/1,
+    info/1,
+    status/1,
+    reload_routes/2
+]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([opts/0]).
@@ -282,6 +291,25 @@ again to bring it back up.
     {ok, drained} | {timeout, non_neg_integer()}.
 drain(Name, Timeout) ->
     gen_server:call(Name, {drain, Timeout}, Timeout + 5000).
+
+-doc """
+Broadcast a `{roadrunner_drain, Deadline}` notification to every conn /
+WS session in the listener's `pg` drain group **without** stopping the
+listener or waiting on the counter.
+
+Use for soft-drain workflows — telling long-lived sessions to wind down
+ahead of a deploy, or in test suites that want to observe drain
+behavior without losing the listener for subsequent cases. Unlike
+`drain/2`, the listener keeps accepting new connections.
+
+Requires the `pg` scope to be running (started by `roadrunner_sup`).
+""".
+-spec notify_drain(Name :: atom(), Deadline :: integer()) -> ok.
+notify_drain(Name, Deadline) when is_atom(Name), is_integer(Deadline) ->
+    lists:foreach(
+        fun(Pid) -> Pid ! {roadrunner_drain, Deadline} end,
+        pg:get_members({roadrunner_drain, Name})
+    ).
 
 -doc "Return the actual TCP port the listener is bound to.".
 -spec port(Name :: atom()) -> inet:port_number().
