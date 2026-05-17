@@ -49,6 +49,32 @@ Diagnostic / conformance scripts under `scripts/` (`bench.escript`,
 `h2spec.sh`, `autobahn.escript`, `redbot.escript`, `wrk2_bench.sh`)
 are run directly; each script's header documents its requirements.
 
+### Test surface
+
+**PropEr properties** via `ct_property_test` cover the surfaces where
+input-shape coverage matters: `roadrunner_uri` (percent round-trip +
+encode shape), `roadrunner_qs` (round-trip), `roadrunner_cookie`
+(adversarial robustness), `roadrunner_http1` (parsers never-crash +
+incremental-feed equivalence), `roadrunner_conn_loop` (random recv /
+drain / stray inputs, clean exit + slot release), and `request_id`
+consistency between `request_start` / `request_stop` telemetry.
+
+**Malformed-input corpus:** `roadrunner_http1_corpus_tests` exercises
+HTTP/1.1 patterns lifted from the
+[llhttp](https://github.com/nodejs/llhttp) test corpus and the
+canonical request-smuggling vectors documented by
+[PortSwigger](https://portswigger.net/web-security/request-smuggling).
+
+**Conformance harnesses** (run on-demand, not part of `make precommit`):
+
+- `scripts/h2spec.sh` — HTTP/2 (RFC 9113 + RFC 7541). Strict 100 % pass.
+- `scripts/autobahn.escript` — WebSocket (RFC 6455 + RFC 7692). Strict
+  100 % across the full
+  [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
+  fuzzingclient matrix, no exclusions.
+- `scripts/redbot.escript` — HTTP/1.1 response hygiene via
+  [REDbot](https://redbot.org).
+
 ### Benchmarking notes
 
 Two complementary load drivers ship in this repo:

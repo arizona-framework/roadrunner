@@ -7,31 +7,41 @@
 
 ![roadrunner logo](https://raw.githubusercontent.com/arizona-framework/roadrunner/main/assets/logo.jpg)
 
-Pure-Erlang HTTP/1.1 + HTTP/2 + WebSocket server for OTP 29+. **Beep beep.**
+Pure-Erlang HTTP/1.1 + HTTP/2 + WebSocket server for OTP 29+.
+**Built for low tail latency at sustained load.** Beep beep.
 
-Built ground-up via TDD as the HTTP backbone for the
-[arizona-framework](https://github.com/arizona-framework/arizona). The
-user-facing API is a handler behaviour, request/response accessors,
-listener controls, and a handful of opt-in helpers (cookies, qs,
-multipart, SSE, WebSocket). RFC-correct parsing, modern OTP idioms
-throughout, and predictable per-connection lifecycle observability.
+Roadrunner is the HTTP backbone of the
+[arizona-framework](https://github.com/arizona-framework/arizona).
+Strict RFC 9110 / 9112 / 9113 parsing, with **strict 100 %
+[h2spec](https://github.com/summerwind/h2spec)** (HTTP/2 conformance)
+and **strict 100 %
+[Autobahn fuzzingclient](https://github.com/crossbario/autobahn-testsuite)**
+(WebSocket, no exclusions). The user-facing API is a handler
+behaviour, request/response accessors, listener controls, and a
+handful of opt-in helpers (cookies, qs, multipart, SSE, WebSocket).
+Modern OTP idioms throughout, with predictable per-connection
+lifecycle observability.
 
 ## ⚠️ Requirements
 
-Roadrunner requires **OTP 29**. Older OTPs won't compile, and the
-throughput numbers in the [performance section](#performance-at-a-glance)
-assume 29.
+Requires **OTP 29 or newer**.
 
 ## 🚧 Status
 
 Roadrunner is in `0.x`. The core is functional and covered by tests,
-but the API may change between minor versions. Pin an exact commit
-ref in your deps (e.g. `{ref, "<sha>"}`) if you need stability
+but the API may change between minor versions. Pin an exact version
+in your deps (e.g. `{roadrunner, "0.1.0"}`) if you need stability
 across upgrades.
+
+## ✅ Conformance
 
 Eunit + Common Test (incl. PropEr) suites with **100 % line coverage**,
 dialyzer-clean, h2spec strict 100 %, Autobahn fuzzingclient strict
-100 % across the full WebSocket matrix (no exclusions).
+100 % across the full WebSocket matrix (no exclusions). HTTP/1.1
+parsers stress-tested against the
+[llhttp](https://github.com/nodejs/llhttp) test corpus and the
+canonical [PortSwigger](https://portswigger.net/web-security/request-smuggling)
+request-smuggling vectors.
 
 Standards conformance:
 
@@ -80,11 +90,39 @@ streaming-POST endpoint). On simple GETs and small POSTs
 Roadrunner and elli are within the bench's ~15 % variance band on
 those rows; the comparison doc has the full honest framing.
 
-The numbers above are throughput from `scripts/bench.escript`
-(closed-loop). For Coordinated-Omission-corrected tail latency at
-sustained rates (open-loop, via wrk2), see
-[`docs/wrk2_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/wrk2_results.md);
-the comparison doc has the methodology breakdown.
+### Tail latency at sustained load
+
+Open-loop, Coordinated-Omission-corrected (wrk2, `hello`, 8 threads,
+50 connections, 3-run median): Roadrunner sustains **270 k req/s**
+at p50 1.06 ms, p99 2.26 ms, p99.99 3.34 ms. Full per-scenario
+matrix with all four rate-points per server in
+[`docs/wrk2_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/wrk2_results.md).
+
+The throughput numbers above are from `scripts/bench.escript`
+(closed-loop); the comparison doc has the full methodology
+breakdown.
+
+## Comparison
+
+If your workload needs a feature, the server has to ship it. `—`
+means achievable in user code but no helper / option built in; `✗`
+means out of scope for that server.
+
+| feature                                   | roadrunner | cowboy | elli |
+|-------------------------------------------|:----------:|:------:|:----:|
+| HTTP/1.1                                  |     ✓      |   ✓    |  ✓   |
+| HTTP/2 + HPACK                            |     ✓      |   ✓    |  ✗   |
+| WebSocket (RFC 6455)                      |     ✓      |   ✓    |  —   |
+| permessage-deflate (RFC 7692)             |     ✓      |   ✓    |  ✗   |
+| Native router                             |     ✓      |   ✓    |  ✗   |
+| gzip / deflate response negotiation       |     ✓      |   ✓    |  —   |
+| Streaming request bodies                  |     ✓      |   ✓    |  —   |
+| Native qs / cookie / multipart            |     ✓      |   ✓    |  —   |
+| Server-Sent Events helper                 |     ✓      |   —    |  —   |
+| Sendfile                                  |     ✓      |   ✓    |  ✓   |
+| Static handler (ETag / Range / IMS)       |     ✓      |   ✓    |  —   |
+| Graceful drain with deadline + broadcast  |     ✓      |   —    |  ✗   |
+| Per-request `request_id` in logger meta   |     ✓      |   —    |  ✗   |
 
 ## Quickstart
 
@@ -92,7 +130,7 @@ Add to `rebar.config`:
 
 ```erlang
 {deps, [
-    {roadrunner, {git, "https://github.com/arizona-framework/roadrunner.git", {branch, "main"}}}
+    {roadrunner, "0.1.0"}
 ]}.
 ```
 
@@ -149,12 +187,34 @@ the list to disable HTTP/2. For HTTP/2 on plain TCP (h2c
 prior-knowledge per RFC 7540 §3.4), use `protocols => [http2]` without
 the `tls` opt.
 
-For listeners that don't need routing, `routes => Mod` skips the router
-entirely and dispatches every request to `Mod:handle/1`:
+For listeners that don't need routing, `routes => Mod` (or
+`{Mod, State}` to seed handler state) skips the router entirely and
+dispatches every request to `Mod:handle/1`:
 
 ```erlang
-roadrunner:start_listener(my_listener, #{port => 8080, routes => hello_handler}).
+roadrunner:start_listener(my_listener, #{
+    port => 8080,
+    routes => {hello_handler, #{greeting => ~"hello"}}
+}).
 ```
+
+## Configuration
+
+All listener options live in the
+[`roadrunner_listener:opts/0`](https://hexdocs.pm/roadrunner/roadrunner_listener.html#t:opts/0)
+type, with per-key defaults and tuning rationale. Beyond `port`,
+`protocols`, `tls`, and `routes` from the Quickstart, the type covers:
+
+- **DoS bounds** — `max_clients`, `max_content_length`,
+  `request_timeout`, `keep_alive_timeout`,
+  `min_bytes_per_second`, `max_keep_alive_requests`
+- **Middleware** — `middlewares`
+- **Body buffering** — `body_buffering`
+- **Graceful drain** — `graceful_drain`, `slot_reconciliation`
+- **Per-conn hibernation** — `hibernate_after`
+- **HTTP/2 tunables** (under the `{http2, Opts}` entry in
+  `protocols`) — `conn_window`, `stream_window`,
+  `window_refill_threshold`
 
 ## Features
 
@@ -191,27 +251,28 @@ roadrunner:start_listener(my_listener, #{port => 8080, routes => hello_handler})
 
 ### Hardening
 
-- Strict RFC 9110 / RFC 9112 parsing — request smuggling defenses
-  (CL+TE conflict, multiple-CL), header CRLF/NUL injection rejection,
-  chunk-size leading-whitespace rejection, RFC 6265 cookie OWS handling,
-  RFC 6455 §5.5 control-frame limits, SSE event-line CRLF rejection,
-  trailer header CRLF injection rejection, sendfile path traversal +
-  symlink escape defenses.
-- TLS hardened defaults — TLS 1.2/1.3 only, `honor_cipher_order`,
-  `client_renegotiation` off, AEAD-only ECDHE-or-1.3 ciphers filtered
-  through `ssl:filter_cipher_suites/2`, OTP default `supported_groups`
-  (PQ-hybrid `x25519mlkem768` first when the OpenSSL build supports it),
-  `early_data` disabled.
+- Strict RFC 9110 / 9112 parsing, with defenses grouped by subsystem:
+    - **Request smuggling / framing:** CL+TE conflict, multiple-CL,
+      chunk-size leading-whitespace rejection.
+    - **Header / control-frame injection:** header CRLF / NUL rejection,
+      SSE event-line CRLF rejection, trailer-header CRLF rejection,
+      RFC 6455 §5.5 control-frame limits, RFC 6265 cookie OWS handling.
+    - **Sendfile path safety:** path traversal + symlink escape defenses.
+- TLS hardened defaults — TLS 1.2 / 1.3 only, AEAD-only cipher filter,
+  client renegotiation off, post-quantum hybrid `x25519mlkem768` first
+  when the OpenSSL build supports it. Full settings list in the
+  `roadrunner_listener` module docs.
 - DoS bounds — `max_clients`, `max_content_length`,
   `min_bytes_per_second`, `request_timeout`, `keep_alive_timeout`,
   `max_keep_alive_requests`.
 
 ### Observability
 
-- `telemetry` events: request `start | stop | exception | rejected`,
-  `response, send_failed`, listener `accept | conn_close |
-  slots_reconciled`, ws `upgrade | frame_in | frame_out`, `drain,
-  acknowledged` (opt-in via `roadrunner:acknowledge_drain/1`).
+- `telemetry` events covering request, response, listener
+  accept / close, slot reconciliation, ws upgrade and frames, and
+  drain ack (opt-in via `roadrunner:acknowledge_drain/1`). Full event
+  list with measurements / metadata in the `roadrunner_telemetry`
+  module docs.
 - Per-request `request_id` attached to `logger:set_process_metadata/1`
   so any `?LOG_*` from middleware/handlers is auto-correlated.
 - `roadrunner_listener:info/1` for pull-side `active_clients` /
@@ -232,23 +293,6 @@ roadrunner:start_listener(my_listener, #{port => 8080, routes => hello_handler})
   enable in production where you can't trust every exit path to run
   `terminate/3` (`kill` signals, OOM kills, supervisor brutal-kill).
 
-### Test surface
-
-- **PropEr properties** via `ct_property_test`: `roadrunner_uri`
-  percent round-trip + encode shape, `roadrunner_qs` round-trip,
-  `roadrunner_cookie` adversarial robustness, `roadrunner_http1`
-  parsers never-crash + incremental-feed equivalence, plus
-  `roadrunner_conn_loop` robustness over random recv/drain/stray
-  inputs (clean exit + slot release) and `request_id` consistency
-  between `request_start` / `request_stop` telemetry.
-- **Malformed-input corpus**: `roadrunner_http1_corpus_tests`
-  exercises HTTP/1.1 patterns lifted from the
-  [llhttp](https://github.com/nodejs/llhttp) test corpus and the
-  canonical request-smuggling vectors documented by Portswigger.
-- **Conformance harnesses**: `scripts/h2spec.sh` (HTTP/2),
-  `scripts/autobahn.escript` (WebSocket),
-  `scripts/redbot.escript` (HTTP/1.1 response hygiene).
-
 ## Documentation
 
 - [`docs/comparison.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/comparison.md) — full side-by-side
@@ -256,6 +300,11 @@ roadrunner:start_listener(my_listener, #{port => 8080, routes => hello_handler})
   trade-offs, reproduction commands).
 - [`docs/bench_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/bench_results.md) — full per-protocol
   matrix with p50 / p99 across every scenario.
+- [`docs/bench_internals.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/bench_internals.md) — loadgen worker
+  model, latency aggregation, when the loader becomes the bottleneck.
+- [`docs/wrk2_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/wrk2_results.md) — open-loop,
+  Coordinated-Omission-corrected tail-latency tables (full per-scenario,
+  all rate-points per server).
 - [`docs/resource_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/resource_results.md) — memory + CPU
   shape per scenario.
 - [`docs/conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md)
@@ -274,9 +323,8 @@ roadrunner:start_listener(my_listener, #{port => 8080, routes => hello_handler})
   on the way out), binary keys for wire-derived data, `-doc` /
   `-moduledoc` markdown, dialyzer-clean specs. No `binary_to_atom` on
   parsed names.
-- **Continuation-style middleware** over Plug.Conn-style transformation
-  — strictly more expressive than cowboy's deprecated `(Req, Env)`
-  shape and dramatically simpler than cowboy's stream handlers.
+- **Continuation-style middleware.** `(Req, Next) -> {Response, Req2}`,
+  composable at listener and per-route level. Outermost first.
 - **Telemetry over custom callbacks.** `telemetry` is the de facto
   standard (Phoenix, Ecto, gleam_otp); zero-overhead when no subscribers,
   integrates with prometheus / opentelemetry / datadog out of the box.

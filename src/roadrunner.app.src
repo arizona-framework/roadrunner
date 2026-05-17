@@ -1,6 +1,6 @@
 {application, roadrunner, [
-    {description, "Pure-Erlang HTTP and WebSocket server. Beep beep."},
-    {vsn, "0.1.0"},
+    {description, "Pure-Erlang HTTP/1.1, HTTP/2, and WebSocket server. Beep beep."},
+    {vsn, semver},
     {registered, []},
     {mod, {roadrunner_app, []}},
     {applications, [
@@ -14,6 +14,9 @@
     {modules, []},
     {licenses, ["Apache-2.0"]},
     {links, [
-        {"GitHub", "https://github.com/arizona-framework/roadrunner"}
+        {"GitHub", "https://github.com/arizona-framework/roadrunner"},
+        {"Docs", "https://hexdocs.pm/roadrunner"},
+        {"Issues", "https://github.com/arizona-framework/roadrunner/issues"},
+        {"Changelog", "https://github.com/arizona-framework/roadrunner/blob/main/CHANGELOG.md"}
     ]}
 ]}.
