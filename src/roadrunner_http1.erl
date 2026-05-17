@@ -117,9 +117,12 @@
     %% `undefined` when no state was attached.
     state => term(),
     %% Per-route middleware list attached via the map-shape `middlewares`
-    %% key. Read by `roadrunner_middleware:route_mws/1`. `[]` when no
-    %% per-route middlewares were attached.
-    route_middlewares => roadrunner_middleware:middleware_list(),
+    %% key. Read by `roadrunner_middleware:route_mws/1`. Absent when no
+    %% per-route middlewares were attached. Distinct from
+    %% `roadrunner_conn:proto_opts()`'s `middlewares` (the listener-wide
+    %% list) — proto_opts and the req are different maps; they don't
+    %% collide.
+    middlewares => roadrunner_middleware:middleware_list(),
     %% Body-read state attached by `roadrunner_conn` in `body_buffering => manual`
     %% mode. Threaded through `roadrunner_req:read_body/1,2`. Never present in
     %% `auto` mode or in manually-constructed request maps.

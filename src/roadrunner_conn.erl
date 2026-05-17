@@ -337,10 +337,10 @@ resolve_handler({router, ListenerName}, Req) ->
     Compiled = persistent_term:get({roadrunner_routes, ListenerName}),
     roadrunner_router:match(roadrunner_req:path(Req), Compiled).
 
-%% Splat the matched route's `route_cfg()` onto the request: `state` goes
-%% into the req's `state` field (read by `roadrunner_req:state/1`),
-%% `middlewares` into `route_middlewares` (read by
-%% `roadrunner_middleware:route_mws/1`). Only sets a field when the cfg
+%% Splat the matched route's `route_cfg()` onto the request: each cfg
+%% key lands under the same name on the req. `state` is read by
+%% `roadrunner_req:state/1`; `middlewares` by
+%% `roadrunner_middleware:route_mws/1`. Only sets a field when the cfg
 %% map carries it — keeps the no-state / no-mws fast path off both
 %% map writes.
 -doc false.
@@ -353,7 +353,7 @@ thread_route_cfg(Req, Cfg) ->
             _ -> Req
         end,
     case Cfg of
-        #{middlewares := Mws} -> Req1#{route_middlewares => Mws};
+        #{middlewares := Mws} -> Req1#{middlewares => Mws};
         _ -> Req1
     end.
 

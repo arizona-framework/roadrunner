@@ -164,8 +164,8 @@ compose([Mw | Rest], Handler) ->
 
 %% Build the per-request handler pipeline from listener-level
 %% middlewares + the request's route-level middlewares (read from
-%% `Req#{route_middlewares}`, populated by the conn loops from the
-%% matched route's `middlewares` key) + a target handler module.
+%% `Req#{middlewares}`, populated by the conn loops from the matched
+%% route's `middlewares` key) + a target handler module.
 %%
 %% Listener middlewares wrap the route middlewares wrap the handler.
 %% When BOTH lists are empty, returns `fun Handler:handle/1` directly
@@ -188,7 +188,7 @@ build_pipeline(ListenerMws, Req, Handler) ->
     compose(ListenerMws ++ route_mws(Req), fun Handler:handle/1).
 
 -spec route_mws(roadrunner_req:request()) -> middleware_list().
-route_mws(#{route_middlewares := Mws}) -> Mws;
+route_mws(#{middlewares := Mws}) -> Mws;
 route_mws(_) -> [].
 
 -spec apply_one(middleware(), roadrunner_req:request(), next()) ->
