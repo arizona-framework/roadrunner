@@ -11,7 +11,7 @@ parsing, integer parsing, and small plaintext response framing.
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     A = qs_int(~"a", Req, 0),
     B = qs_int(~"b", Req, 0),

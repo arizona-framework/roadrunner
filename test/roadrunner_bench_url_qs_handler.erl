@@ -12,7 +12,7 @@ form-decode path the form handler measures).
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Pairs = roadrunner_req:parse_qs(Req),
     AckBody = integer_to_binary(length(Pairs)),

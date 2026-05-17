@@ -19,7 +19,7 @@ behaviour — only loaded under the test profile.
 
 -export([handle/1, handle_frame/2]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     {{websocket, ?MODULE, no_state}, Req}.
 

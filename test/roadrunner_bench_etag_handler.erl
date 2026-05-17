@@ -20,7 +20,7 @@ browsers, varnish) hit constantly.
     """
 ).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     case roadrunner_req:header(~"if-none-match", Req) of
         ?ETAG ->

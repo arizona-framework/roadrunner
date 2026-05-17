@@ -20,8 +20,6 @@
     compute_cached_decisions/1
 ]).
 
--export_type([version/0, headers/0, request/0, status/0, redirect_status/0, cached_decisions/0]).
-
 -on_load(init_patterns/0).
 
 -define(MAX_REQUEST_LINE, 8192).
@@ -46,91 +44,13 @@
 -define(SPACE_KEY, {?MODULE, space_cp}).
 -define(SEMICOLON_KEY, {?MODULE, semicolon_cp}).
 
-%% Re-exported as type aliases from `roadrunner_http` so existing
-%% callers using `roadrunner_http1:request()` / `:headers()` /
-%% `:status()` / `:redirect_status()` / `:version()` keep compiling.
-%% New code calls the shared module directly.
+%% Module-local aliases for the shared HTTP primitives so this
+%% module's specs stay readable. The canonical, exported type lives
+%% at `roadrunner_http:<name>/0` — that's where cross-module callers
+%% should reference it from.
 -type version() :: roadrunner_http:version().
 -type headers() :: roadrunner_http:headers().
 -type status() :: roadrunner_http:status().
--type redirect_status() :: roadrunner_http:redirect_status().
--type cached_decisions() :: #{
-    %% True iff `Transfer-Encoding: chunked` (case-insensitive). Hot path
-    %% at body-framing time — saves a per-request lowercase scan.
-    is_chunked := boolean(),
-    %% True iff *any* `Transfer-Encoding` header is present (chunked or
-    %% otherwise). Distinguishes "no TE → use Content-Length" from
-    %% "non-chunked TE → bad_transfer_encoding" without a per-request
-    %% header re-lookup. Always implied by `is_chunked := true`.
-    has_transfer_encoding := boolean(),
-    %% True iff `Expect: 100-continue` (case-insensitive). Used by the
-    %% body-read path to decide whether to send a 100 before recv.
-    expects_continue := boolean(),
-    %% Lowercased value of the `Connection` header (`~""` if absent).
-    %% `roadrunner_conn:keep_alive_decision/2` and `has_token/2` operate on
-    %% this directly without re-lowercasing.
-    connection_lower := binary(),
-    %% Parsed `Content-Length`. `none` if absent; `{ok, N}` if a valid
-    %% non-negative integer; `{error, bad_content_length}` if present but
-    %% malformed. `roadrunner_conn:body_framing/1` consumes this directly
-    %% on the cached path, avoiding a `roadrunner_req:header/2` lookup
-    %% (which lowercases the lookup name) plus a `binary_to_integer/1`.
-    content_length := none | {ok, non_neg_integer()} | {error, bad_content_length},
-    %% True iff a `Host` header is present. Drives the RFC 7230 §5.4
-    %% missing-host rejection for HTTP/1.1 without a per-request
-    %% keymember walk.
-    has_host := boolean()
-}.
--type request() :: #{
-    method := binary(),
-    target := binary(),
-    version := version(),
-    headers := headers(),
-    %% Pre-computed decisions for known case-insensitive headers, populated
-    %% by `parse_request/1`. Hot-path consumers (`roadrunner_conn:body_framing/1`,
-    %% `keep_alive_decision/2`, `has_continue_expectation/1`) read these
-    %% instead of re-lowercasing header values per request. Absent for
-    %% manually-built request maps — consumers fall back to the raw
-    %% `headers` list when missing.
-    cached_decisions => cached_decisions(),
-    %% Body is set by `roadrunner_conn` before the handler is invoked. Auto
-    %% mode delivers the full body here as `iodata()` (an iolist of recv
-    %% chunks for multi-chunk bodies, a single binary otherwise) so the conn
-    %% can skip a flatten that many handlers do not need. Handlers that
-    %% require a flat binary call `iolist_to_binary/1` themselves. The parser
-    %% never populates this field; it leaves the buffered body in the
-    %% `Rest` element of `parse_request/1` instead.
-    body => iodata(),
-    %% Bindings captured from `:param` segments by `roadrunner_router`, also set
-    %% by `roadrunner_conn` before dispatch. Empty map when the dispatch is a
-    %% single-handler one (no routing) or the route has no params.
-    bindings => roadrunner_router:bindings(),
-    %% Client TCP peer captured once per connection from `inet:peername/1`.
-    %% `undefined` when the OS call fails (rare; usually socket teardown).
-    peer => {inet:ip_address(), inet:port_number()} | undefined,
-    %% Connection scheme — `http` for plain TCP, `https` for TLS. Set
-    %% once per connection by `roadrunner_conn` from the transport tag.
-    scheme => http | https,
-    %% Per-route handler state attached at compile time via the 3-tuple
-    %% route shape `{Path, Handler, State}` or the map shape's `state` key
-    %% (and the listener's `{Module, State}` single-handler form).
-    %% `undefined` when no state was attached.
-    state => term(),
-    %% Body-read state attached by `roadrunner_conn` in `body_buffering => manual`
-    %% mode. Threaded through `roadrunner_req:read_body/1,2`. Never present in
-    %% `auto` mode or in manually-constructed request maps.
-    body_state => roadrunner_conn:body_state(),
-    %% Per-request correlation token attached by `roadrunner_conn` once the
-    %% headers parse. 16 lowercase hex chars (8 bytes of CSPRNG output).
-    %% Mirrored into `logger:set_process_metadata/1` so any `?LOG_*` call
-    %% from middleware or the handler picks it up automatically.
-    request_id => binary(),
-    %% Registered name of the owning `roadrunner_listener`. Set once per
-    %% conn from `proto_opts.listener_name`. Surfaced in
-    %% `roadrunner_telemetry` event metadata so subscribers can filter by
-    %% listener in multi-listener deployments.
-    listener_name => atom()
-}.
 
 -doc """
 Parse the HTTP/1.1 request line.
@@ -547,19 +467,23 @@ check_cls_consistent(_, []) -> ok;
 check_cls_consistent(V, [V | Rest]) -> check_cls_consistent(V, Rest);
 check_cls_consistent(_, _) -> error.
 
--doc """
-Walk a parsed header list once and return pre-computed decisions for the
-case-insensitive headers that the connection layer reads on every request.
-
-Header names are already lowercased by `parse_header/1`; this pass also
-lowercases the value of `Connection` (whose tokens are case-insensitive
-per RFC 9110) and computes booleans for `Transfer-Encoding: chunked` and
-`Expect: 100-continue`.
-
-Reusing the cached values avoids ~3 lowercase scans per request on the
-hot path measured via `scripts/stress.escript --profile`.
-""".
--spec compute_cached_decisions(headers()) -> cached_decisions().
+%% Walk a parsed header list once and return pre-computed decisions
+%% for the case-insensitive headers that the connection layer reads
+%% on every request.
+%%
+%% Internal hot-path helper — not part of the public handler API. The
+%% result is stashed on the request map's `cached_decisions` field
+%% for `roadrunner_conn` to read; handlers should ignore it.
+%%
+%% Header names are already lowercased by `parse_header/1`; this pass
+%% also lowercases the value of `Connection` (whose tokens are
+%% case-insensitive per RFC 9110) and computes booleans for
+%% `Transfer-Encoding: chunked` and `Expect: 100-continue`.
+%%
+%% Reusing the cached values avoids ~3 lowercase scans per request on
+%% the hot path measured via `scripts/stress.escript --profile`.
+-doc false.
+-spec compute_cached_decisions(headers()) -> roadrunner_req:cached_decisions().
 compute_cached_decisions(Headers) ->
     compute_cached_decisions_loop(Headers, #{
         is_chunked => false,
@@ -570,7 +494,8 @@ compute_cached_decisions(Headers) ->
         has_host => false
     }).
 
--spec compute_cached_decisions_loop(headers(), cached_decisions()) -> cached_decisions().
+-spec compute_cached_decisions_loop(headers(), roadrunner_req:cached_decisions()) ->
+    roadrunner_req:cached_decisions().
 compute_cached_decisions_loop([], Acc) ->
     Acc;
 compute_cached_decisions_loop([{~"transfer-encoding", V} | Rest], Acc) ->
@@ -624,7 +549,7 @@ Spec deviates from the original plan: the result is a map rather than
 a record, so callers don't need to include a header file.
 """.
 -spec parse_request(binary()) ->
-    {ok, request(), Rest :: binary()}
+    {ok, roadrunner_req:request(), Rest :: binary()}
     | {more, undefined}
     | {error,
         bad_request_line
@@ -656,7 +581,7 @@ parse_request(Bin) when is_binary(Bin) ->
 %% header. Absence is a 400 Bad Request, also a request-smuggling
 %% mitigation when proxies forward to backends that disagree on the
 %% target host. HTTP/1.0 didn't require it.
--spec validate_host(version(), cached_decisions()) -> ok | {error, missing_host}.
+-spec validate_host(version(), roadrunner_req:cached_decisions()) -> ok | {error, missing_host}.
 validate_host({1, 1}, #{has_host := true}) -> ok;
 validate_host({1, 1}, #{has_host := false}) -> {error, missing_host};
 validate_host({1, 0}, _Decisions) -> ok.

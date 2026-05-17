@@ -12,7 +12,7 @@ coverage but no bench coverage.
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(#{body := Body} = Req) ->
     %% The auto-buffered body is `iodata()`; qs:parse requires a binary.
     Pairs = roadrunner_qs:parse(iolist_to_binary(Body)),

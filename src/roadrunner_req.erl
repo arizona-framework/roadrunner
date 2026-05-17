@@ -20,7 +20,7 @@ re-exported alongside it (`headers/0`, `version/0`, `status/0`,
 -define(EQ_CP_KEY, {?MODULE, eq_cp}).
 -define(QUOTE_CP_KEY, {?MODULE, quote_cp}).
 
--export_type([request/0, headers/0, version/0, status/0, redirect_status/0]).
+-export_type([request/0, body_reader/0, cached_decisions/0]).
 
 -doc """
 The parsed request map handlers receive.
@@ -30,30 +30,105 @@ delivers; optional fields are populated by the framework when
 applicable (e.g. `body` in `body_buffering => auto` mode,
 `bindings` for routed dispatch, `request_id` for telemetry).
 
-The `cached_decisions` and `body_state` fields are framework
-internals — typed as `term()` here because their precise shapes
-are not part of the public contract and can change between releases.
+The same shape flows through both the h1 and h2 paths — h2's
+`roadrunner_http2_request` synthesizes a request matching this
+type from frames + pseudo-headers, so handlers don't have to
+care which protocol delivered the bytes.
 """.
 -type request() :: #{
     method := binary(),
     target := binary(),
     version := version(),
     headers := headers(),
-    cached_decisions => term(),
+    %% H1-parser internal optimization — handlers should ignore.
+    %% Hot-path conn helpers (`body_framing/1`,
+    %% `keep_alive_decision/2`, `has_continue_expectation/1`) read
+    %% this directly to skip per-request header re-lowercasing.
+    %% Absent on h2 requests and on manually-built request maps.
+    cached_decisions => cached_decisions(),
+    %% Body is set by `roadrunner_conn` before the handler is
+    %% invoked. Auto mode delivers the full body as `iodata()` (an
+    %% iolist of recv chunks for multi-chunk bodies, a single binary
+    %% otherwise) so the conn can skip a flatten that many handlers
+    %% do not need. Handlers that require a flat binary call
+    %% `iolist_to_binary/1` themselves. The parser never populates
+    %% this field; it leaves the buffered body in the `Rest` element
+    %% of `roadrunner_http1:parse_request/1` instead.
     body => iodata(),
+    %% Bindings captured from `:param` segments by
+    %% `roadrunner_router`, set by `roadrunner_conn` before dispatch.
+    %% Empty map for single-handler dispatch or routes with no params.
     bindings => roadrunner_router:bindings(),
+    %% Client TCP peer captured once per connection from
+    %% `inet:peername/1`. `undefined` when the OS call fails (rare;
+    %% usually socket teardown).
     peer => {inet:ip_address(), inet:port_number()} | undefined,
+    %% Connection scheme — `http` for plain TCP, `https` for TLS.
+    %% Set once per connection by `roadrunner_conn` from the
+    %% transport tag.
     scheme => http | https,
+    %% Per-route handler state attached at compile time via the
+    %% 3-tuple route shape `{Path, Handler, State}` or the map
+    %% shape's `state` key (and the listener's `{Module, State}`
+    %% single-handler form). `undefined` when no state was attached.
     state => term(),
-    body_state => term(),
+    %% Body-read state attached by `roadrunner_conn` in
+    %% `body_buffering => manual` mode. Threaded through
+    %% `roadrunner_req:read_body/1,2`. Never present in `auto` mode
+    %% or in manually-constructed request maps.
+    body_reader => body_reader(),
+    %% Per-request correlation token attached by `roadrunner_conn`
+    %% once the headers parse. 16 lowercase hex chars (8 bytes of
+    %% CSPRNG output). Mirrored into `logger:set_process_metadata/1`
+    %% so any `?LOG_*` call from middleware or the handler picks it
+    %% up automatically.
     request_id => binary(),
+    %% Registered name of the owning `roadrunner_listener`. Set
+    %% once per conn from `proto_opts.listener_name`. Surfaced in
+    %% `roadrunner_telemetry` event metadata so subscribers can
+    %% filter by listener in multi-listener deployments.
     listener_name => atom()
 }.
 
 -type headers() :: roadrunner_http:headers().
 -type version() :: roadrunner_http:version().
--type status() :: roadrunner_http:status().
--type redirect_status() :: roadrunner_http:redirect_status().
+
+-doc """
+Framework-internal h1-parser hot-path optimization carried on the
+request map's `cached_decisions` field. Handlers should ignore both
+the field and this type — they're absent on h2 requests and on
+manually-built request maps. Populated by the h1 parser at
+request-read time and consumed by framework code to skip
+per-request header re-lowercasing on the dispatch hot path.
+""".
+-type cached_decisions() :: #{
+    is_chunked := boolean(),
+    has_transfer_encoding := boolean(),
+    expects_continue := boolean(),
+    connection_lower := binary(),
+    content_length := none | {ok, non_neg_integer()} | {error, bad_content_length},
+    has_host := boolean()
+}.
+
+-doc """
+Body-read envelope attached to the request in `body_buffering =>
+manual` mode. `read_body/1,2` consumes from it; the conn owns the
+recv closure and tracks how much remains.
+
+`pending` holds decoded body bytes that have been parsed off the
+wire but not yet handed to the caller — used for chunked framing
+to absorb a chunk's payload across multiple length-bounded calls.
+`done` flips true once the size-0 last chunk is parsed.
+""".
+-type body_reader() :: #{
+    framing := none | chunked | {content_length, non_neg_integer()},
+    buffered := binary(),
+    bytes_read := non_neg_integer(),
+    pending := binary(),
+    done := boolean(),
+    recv := fun(() -> {ok, binary()} | {error, term()}),
+    max := non_neg_integer()
+}.
 
 -export([
     method/1,
@@ -247,17 +322,17 @@ effect — the buffered bytes are returned in one shot.
     {ok, iodata(), request()}
     | {more, iodata(), request()}
     | {error, term()}.
-read_body(#{body_state := BS} = Req, Opts) ->
+read_body(#{body_reader := BS} = Req, Opts) ->
     Mode =
         case Opts of
             #{length := L} -> {length, L};
             _ -> all
         end,
-    case roadrunner_conn:consume_body_state(BS, Mode) of
+    case roadrunner_conn:consume_body_reader(BS, Mode) of
         {ok, Bytes, BS2} ->
-            {ok, Bytes, Req#{body_state := BS2, body => Bytes}};
+            {ok, Bytes, Req#{body_reader := BS2, body => Bytes}};
         {more, Bytes, BS2} ->
-            {more, Bytes, Req#{body_state := BS2}};
+            {more, Bytes, Req#{body_reader := BS2}};
         {error, _} = E ->
             E
     end;
@@ -287,12 +362,12 @@ chunks get drained for keep-alive.
     {ok, iodata(), request()}
     | {more, iodata(), request()}
     | {error, term()}.
-read_body_chunked(#{body_state := BS} = Req) ->
-    case roadrunner_conn:consume_body_state(BS, next_chunk) of
+read_body_chunked(#{body_reader := BS} = Req) ->
+    case roadrunner_conn:consume_body_reader(BS, next_chunk) of
         {ok, Bytes, BS2} ->
-            {ok, Bytes, Req#{body_state := BS2, body => Bytes}};
+            {ok, Bytes, Req#{body_reader := BS2, body => Bytes}};
         {more, Bytes, BS2} ->
-            {more, Bytes, Req#{body_state := BS2}};
+            {more, Bytes, Req#{body_reader := BS2}};
         {error, _} = E ->
             E
     end;

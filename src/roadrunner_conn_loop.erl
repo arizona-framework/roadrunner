@@ -489,9 +489,9 @@ handle_request_bytes(
 %%
 %% Auto-buffering reads the full body synchronously via the recv
 %% closure (passive `gen_tcp:recv` with the request_timeout deadline).
-%% Manual buffering builds a body_state the handler will pull from
+%% Manual buffering builds a body_reader the handler will pull from
 %% via `roadrunner_req:read_body/1,2`.
--spec read_body_phase(#loop_state{}, roadrunner_http1:request(), integer()) -> no_return().
+-spec read_body_phase(#loop_state{}, roadrunner_req:request(), integer()) -> no_return().
 read_body_phase(
     #loop_state{
         socket = Socket,
@@ -534,10 +534,10 @@ read_body_phase(
                     _ = roadrunner_conn:send_bad_request(Socket),
                     exit_normal(S);
                 Framing ->
-                    BodyState = roadrunner_conn:make_body_state(
+                    BodyState = roadrunner_conn:make_body_reader(
                         Framing, Buffered, Recv, MaxCL
                     ),
-                    dispatch_phase(S, Req#{body_state => BodyState})
+                    dispatch_phase(S, Req#{body_reader => BodyState})
             end
     end.
 
@@ -548,7 +548,7 @@ read_body_phase(
 %% request_exception telemetry. The 5 response shapes (buffered,
 %% stream, loop, sendfile, websocket) dispatch to their respective
 %% writers via `dispatch_response/4`.
--spec dispatch_phase(#loop_state{}, roadrunner_http1:request()) -> no_return().
+-spec dispatch_phase(#loop_state{}, roadrunner_req:request()) -> no_return().
 dispatch_phase(
     #loop_state{
         socket = Socket,
@@ -567,7 +567,7 @@ dispatch_phase(
 -spec run_pipeline(
     #loop_state{},
     module(),
-    roadrunner_http1:request(),
+    roadrunner_req:request(),
     roadrunner_middleware:next()
 ) -> no_return().
 run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
@@ -608,7 +608,7 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
 -spec dispatch_response(
     roadrunner_transport:socket(),
     module(),
-    roadrunner_http1:request(),
+    roadrunner_req:request(),
     roadrunner_handler:response()
 ) -> ok.
 dispatch_response(Socket, _Handler, Req, {websocket, Mod, State}) when is_atom(Mod) ->
@@ -674,7 +674,7 @@ dispatch_response(Socket, _Handler, _Req, {Status, Headers0, Body}) when is_inte
 %% only fires for handler-emitted responses (status ≥ 200); 1xx
 %% interim responses are emitted by the framework directly without
 %% routing through this path, so we don't need a 1xx skip here.
--spec with_date(roadrunner_http1:headers()) -> roadrunner_http1:headers().
+-spec with_date(roadrunner_http:headers()) -> roadrunner_http:headers().
 with_date(Headers) ->
     case lists:keymember(~"date", 1, Headers) of
         true -> Headers;
@@ -698,7 +698,7 @@ with_date(Headers) ->
 %% subsequent `case` dispatch. Buffered (3-tuple) is the only shape
 %% eligible for keep-alive; stream/loop/sendfile/websocket writers
 %% own the wire from here and force close.
--spec finishing_phase(#loop_state{}, roadrunner_http1:request(), roadrunner_handler:response()) ->
+-spec finishing_phase(#loop_state{}, roadrunner_req:request(), roadrunner_handler:response()) ->
     no_return().
 finishing_phase(S, Req, {Status, Headers, _Body}) when is_integer(Status) ->
     buffered_finish(S, Req, Headers);
@@ -711,8 +711,8 @@ finishing_phase(S, Req, _Response) ->
 
 -spec buffered_finish(
     #loop_state{},
-    roadrunner_http1:request(),
-    roadrunner_http1:headers()
+    roadrunner_req:request(),
+    roadrunner_http:headers()
 ) -> no_return().
 buffered_finish(S, Req, Headers) ->
     case drain_body_if_manual(Req) of
@@ -735,33 +735,33 @@ buffered_finish(S, Req, Headers) ->
             end;
         {error, _} ->
             %% Drain failure — close. Manual-mode handlers can leave the
-            %% body_state in a broken state if they read past EOF.
+            %% body_reader in a broken state if they read past EOF.
             exit_normal(S)
     end.
 
-%% Manual-mode body_state owns its post-body leftover (returned by
+%% Manual-mode body_reader owns its post-body leftover (returned by
 %% `drain_body/1`). Auto-mode stashes the leftover in the loop state's
 %% `buffered` field — set by `read_body_phase` on `read_body/4` return.
--spec pipelined_leftover(roadrunner_http1:request(), #loop_state{}, binary()) -> binary().
-pipelined_leftover(Req, _S, ManualLeftover) when is_map_key(body_state, Req) ->
+-spec pipelined_leftover(roadrunner_req:request(), #loop_state{}, binary()) -> binary().
+pipelined_leftover(Req, _S, ManualLeftover) when is_map_key(body_reader, Req) ->
     ManualLeftover;
 pipelined_leftover(_Req, #loop_state{buffered = Buf}, _ManualLeftover) ->
     Buf.
 
 %% In auto-mode the body has already been fully read by
-%% `read_body_phase` — the request map has no `body_state` key, and
+%% `read_body_phase` — the request map has no `body_reader` key, and
 %% `roadrunner_conn:drain_body/1`'s second clause would just return
 %% `{ok, <<>>}`. Skip the call entirely on auto. Manual-mode (where
 %% the handler may have left bytes unread) goes through the real
-%% `drain_body/1` which consumes the body_state.
--spec drain_body_if_manual(roadrunner_http1:request()) ->
+%% `drain_body/1` which consumes the body_reader.
+-spec drain_body_if_manual(roadrunner_req:request()) ->
     {ok, binary()} | {error, term()}.
-drain_body_if_manual(#{body_state := _} = Req) ->
+drain_body_if_manual(#{body_reader := _} = Req) ->
     roadrunner_conn:drain_body(Req);
 drain_body_if_manual(_Req) ->
     {ok, <<>>}.
 
--spec telemetry_metadata(roadrunner_http1:request()) -> roadrunner_telemetry:metadata().
+-spec telemetry_metadata(roadrunner_req:request()) -> roadrunner_telemetry:metadata().
 telemetry_metadata(Req) ->
     #{
         request_id => maps:get(request_id, Req),

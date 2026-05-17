@@ -28,7 +28,7 @@ wire framing + dispatch, not body construction.
     """
 ).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Resp =
         {200,

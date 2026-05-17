@@ -12,7 +12,7 @@ minimal_get_test() ->
         {~":authority", ~"example.com"},
         {~":path", ~"/"}
     ],
-    {ok, Req} = roadrunner_http2_request:from_headers(Headers, <<>>, conn_info()),
+    {ok, Req} = roadrunner_http2_request:from_headers(Headers, <<>>, request_context()),
     ?assertEqual(~"GET", maps:get(method, Req)),
     ?assertEqual(~"/", maps:get(target, Req)),
     ?assertEqual({2, 0}, maps:get(version, Req)),
@@ -27,7 +27,7 @@ post_with_body_test() ->
         {~"content-type", ~"application/json"}
     ],
     Body = ~"{\"hello\":\"world\"}",
-    {ok, Req} = roadrunner_http2_request:from_headers(Headers, Body, conn_info()),
+    {ok, Req} = roadrunner_http2_request:from_headers(Headers, Body, request_context()),
     ?assertEqual(~"POST", maps:get(method, Req)),
     ?assertEqual(Body, maps:get(body, Req)),
     ?assertEqual(
@@ -44,7 +44,7 @@ regular_headers_preserved_in_order_test() ->
         {~"x-2", ~"b"},
         {~"x-3", ~"c"}
     ],
-    {ok, Req} = roadrunner_http2_request:from_headers(Headers, <<>>, conn_info()),
+    {ok, Req} = roadrunner_http2_request:from_headers(Headers, <<>>, request_context()),
     %% No `:authority` so no synthesised `host` header is prepended.
     ?assertEqual(
         [{~"x-1", ~"a"}, {~"x-2", ~"b"}, {~"x-3", ~"c"}],
@@ -58,7 +58,7 @@ missing_method_is_error_test() ->
     ],
     ?assertEqual(
         {error, missing_pseudo_header},
-        roadrunner_http2_request:from_headers(Headers, <<>>, conn_info())
+        roadrunner_http2_request:from_headers(Headers, <<>>, request_context())
     ).
 
 missing_path_is_error_test() ->
@@ -68,7 +68,7 @@ missing_path_is_error_test() ->
     ],
     ?assertEqual(
         {error, missing_pseudo_header},
-        roadrunner_http2_request:from_headers(Headers, <<>>, conn_info())
+        roadrunner_http2_request:from_headers(Headers, <<>>, request_context())
     ).
 
 empty_path_is_error_test() ->
@@ -79,7 +79,7 @@ empty_path_is_error_test() ->
     ],
     ?assertEqual(
         {error, empty_path},
-        roadrunner_http2_request:from_headers(Headers, <<>>, conn_info())
+        roadrunner_http2_request:from_headers(Headers, <<>>, request_context())
     ).
 
 duplicate_pseudo_is_error_test() ->
@@ -91,7 +91,7 @@ duplicate_pseudo_is_error_test() ->
     ],
     ?assertEqual(
         {error, duplicate_pseudo_header},
-        roadrunner_http2_request:from_headers(Headers, <<>>, conn_info())
+        roadrunner_http2_request:from_headers(Headers, <<>>, request_context())
     ).
 
 unknown_pseudo_is_error_test() ->
@@ -103,7 +103,7 @@ unknown_pseudo_is_error_test() ->
     ],
     ?assertEqual(
         {error, unknown_pseudo_header},
-        roadrunner_http2_request:from_headers(Headers, <<>>, conn_info())
+        roadrunner_http2_request:from_headers(Headers, <<>>, request_context())
     ).
 
 pseudo_after_regular_is_error_test() ->
@@ -115,7 +115,7 @@ pseudo_after_regular_is_error_test() ->
     ],
     ?assertEqual(
         {error, pseudo_after_regular},
-        roadrunner_http2_request:from_headers(Headers, <<>>, conn_info())
+        roadrunner_http2_request:from_headers(Headers, <<>>, request_context())
     ).
 
 pseudo_after_multiple_regulars_is_error_test() ->
@@ -133,7 +133,7 @@ pseudo_after_multiple_regulars_is_error_test() ->
     ],
     ?assertEqual(
         {error, pseudo_after_regular},
-        roadrunner_http2_request:from_headers(Headers, <<>>, conn_info())
+        roadrunner_http2_request:from_headers(Headers, <<>>, request_context())
     ).
 
 connection_specific_header_is_error_test() ->
@@ -149,7 +149,7 @@ connection_specific_header_is_error_test() ->
                     {Banned, ~"x"}
                 ],
                 <<>>,
-                conn_info()
+                request_context()
             )
         )
      || Banned <- [
@@ -168,7 +168,9 @@ te_only_trailers_allowed_test() ->
         {~":path", ~"/"},
         {~"te", ~"trailers"}
     ],
-    ?assertMatch({ok, _}, roadrunner_http2_request:from_headers(GoodHeaders, <<>>, conn_info())),
+    ?assertMatch(
+        {ok, _}, roadrunner_http2_request:from_headers(GoodHeaders, <<>>, request_context())
+    ),
     BadHeaders = [
         {~":method", ~"GET"},
         {~":scheme", ~"https"},
@@ -177,12 +179,12 @@ te_only_trailers_allowed_test() ->
     ],
     ?assertEqual(
         {error, connection_specific_header},
-        roadrunner_http2_request:from_headers(BadHeaders, <<>>, conn_info())
+        roadrunner_http2_request:from_headers(BadHeaders, <<>>, request_context())
     ).
 
 %% --- helpers ---
 
-conn_info() ->
+request_context() ->
     #{
         peer => {{127, 0, 0, 1}, 12345},
         scheme => https,

@@ -16,7 +16,7 @@ callback drives event emission via the `Push` fun.
 
 -define(NUM_EVENTS, 100).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     self() ! {emit, ?NUM_EVENTS},
     Resp =

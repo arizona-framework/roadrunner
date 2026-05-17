@@ -48,7 +48,7 @@
     set_max_table_size/2
 ]).
 
--export_type([context/0, header/0, decode_error/0]).
+-export_type([context/0, decode_error/0]).
 
 %% RFC 7541 Appendix A — 61 static-table entries. Defined up here
 %% so it expands in every later guard / arithmetic site below.

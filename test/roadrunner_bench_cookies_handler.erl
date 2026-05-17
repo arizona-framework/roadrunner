@@ -11,7 +11,7 @@ header with N pairs separated by `; `).
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Cookies = roadrunner_req:parse_cookies(Req),
     AckBody = integer_to_binary(length(Cookies)),

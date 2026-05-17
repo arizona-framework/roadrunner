@@ -34,7 +34,7 @@
     peer/1,
     try_acquire_slot/1,
     release_slot/1,
-    consume_body_state/2,
+    consume_body_reader/2,
     join_drain_group/2
 ]).
 %% Internal helpers shared with `roadrunner_conn_loop`. Marked `-doc false`
@@ -52,7 +52,7 @@
     maybe_send_continue/3,
     refine_conn_label/2,
     scheme/1,
-    make_body_state/4,
+    make_body_reader/4,
     drain_body/1,
     keep_alive_decision/2,
     send_request_timeout/1,
@@ -66,7 +66,7 @@
     response_kind/1
 ]).
 
--export_type([proto_opts/0, dispatch/0, body_state/0]).
+-export_type([proto_opts/0, dispatch/0]).
 
 -on_load(init_patterns/0).
 
@@ -124,24 +124,6 @@
     %% `#{hibernate_after := Ms}` against `proto_opts()`.
     hibernate_after => pos_integer(),
     rate_check_interval => pos_integer()
-}.
-
-%% Opaque body-read state attached to the request in manual buffering
-%% mode. `roadrunner_req:read_body/1,2` consumes from this state; the conn
-%% owns the recv closure and tracks how much remains.
-%%
-%% `pending` holds decoded body bytes that have been parsed off the
-%% wire but not yet handed to the caller — used for chunked framing
-%% to absorb a chunk's payload across multiple length-bounded calls.
-%% `done` flips true once the size-0 last chunk is parsed.
--type body_state() :: #{
-    framing := none | chunked | {content_length, non_neg_integer()},
-    buffered := binary(),
-    bytes_read := non_neg_integer(),
-    pending := binary(),
-    done := boolean(),
-    recv := fun(() -> {ok, binary()} | {error, term()}),
-    max := non_neg_integer()
 }.
 
 -doc """
@@ -253,7 +235,7 @@ generate_request_id(_Empty) ->
 %% Replaces (not merges) the conn process's logger metadata so a
 %% keep-alive request never inherits the previous request's correlation.
 -doc false.
--spec set_request_logger_metadata(roadrunner_http1:request()) -> ok.
+-spec set_request_logger_metadata(roadrunner_req:request()) -> ok.
 set_request_logger_metadata(#{
     request_id := RequestId,
     method := Method,
@@ -325,7 +307,7 @@ scheme({ssl, _}) -> https;
 scheme({fake, _}) -> http.
 
 -doc false.
--spec resolve_handler(dispatch(), roadrunner_http1:request()) ->
+-spec resolve_handler(dispatch(), roadrunner_req:request()) ->
     {ok, module(), roadrunner_router:bindings(), roadrunner_middleware:next(), term()}
     | not_found.
 resolve_handler({handler, Mod, Pipeline, State}, _Req) ->
@@ -339,7 +321,7 @@ resolve_handler({router, ListenerName}, Req) ->
 
 -doc false.
 -spec read_body(
-    roadrunner_http1:request(),
+    roadrunner_req:request(),
     binary(),
     fun(() -> {ok, binary()} | {error, term()}),
     non_neg_integer()
@@ -376,7 +358,7 @@ read_body(Req, Buffered, RecvFun, MaxCL) ->
 %% see body data the client clearly didn't wait, and the 100 line is
 %% redundant.
 -doc false.
--spec maybe_send_continue(roadrunner_transport:socket(), roadrunner_http1:request(), binary()) ->
+-spec maybe_send_continue(roadrunner_transport:socket(), roadrunner_req:request(), binary()) ->
     ok.
 maybe_send_continue(Socket, Req, Buffered) ->
     case Buffered =:= ~"" andalso has_continue_expectation(Req) of
@@ -387,7 +369,7 @@ maybe_send_continue(Socket, Req, Buffered) ->
             ok
     end.
 
--spec has_continue_expectation(roadrunner_http1:request()) -> boolean().
+-spec has_continue_expectation(roadrunner_req:request()) -> boolean().
 has_continue_expectation(#{cached_decisions := #{expects_continue := EC}}) ->
     EC;
 has_continue_expectation(Req) ->
@@ -399,13 +381,13 @@ has_continue_expectation(Req) ->
     end.
 
 -doc false.
--spec make_body_state(
+-spec make_body_reader(
     none | chunked | {content_length, non_neg_integer()},
     binary(),
     fun(() -> {ok, binary()} | {error, term()}),
     non_neg_integer()
-) -> body_state().
-make_body_state(Framing, Buffered, Recv, Max) ->
+) -> roadrunner_req:body_reader().
+make_body_reader(Framing, Buffered, Recv, Max) ->
     #{
         framing => Framing,
         buffered => Buffered,
@@ -417,7 +399,7 @@ make_body_state(Framing, Buffered, Recv, Max) ->
     }.
 
 -doc false.
--spec body_framing(roadrunner_http1:request()) ->
+-spec body_framing(roadrunner_req:request()) ->
     none
     | chunked
     | {content_length, non_neg_integer()}
@@ -547,21 +529,21 @@ read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
     end.
 
 %% Read and discard whatever the handler left in the manual-mode
-%% `body_state`, returning any post-body leftover bytes that belong
+%% `body_reader`, returning any post-body leftover bytes that belong
 %% to a pipelined next request. Called only on the 4-tuple response
 %% path; `roadrunner_conn_loop`'s finishing phase threads `Leftover`
 %% forward into the next `reading_request` parse so pipelined
 %% clients get their N+1 request seen.
 -doc false.
--spec drain_body(roadrunner_http1:request()) -> {ok, binary()} | {error, term()}.
-drain_body(#{body_state := BS}) ->
-    case consume_body_state(BS, all) of
+-spec drain_body(roadrunner_req:request()) -> {ok, binary()} | {error, term()}.
+drain_body(#{body_reader := BS}) ->
+    case consume_body_reader(BS, all) of
         {ok, _Bytes, #{buffered := Leftover}} -> {ok, Leftover};
         {error, _} = E -> E
     end.
 
 -doc """
-Consume bytes from a manual-mode `body_state()`. Returns either the
+Consume bytes from a manual-mode `roadrunner_req:body_reader()`. Returns either the
 final tail (`{ok, Bytes, NewState}` — the body has been fully drained)
 or a partial chunk (`{more, Bytes, NewState}` — more is still pending).
 Used by `roadrunner_req:read_body/1,2`; not part of the public API.
@@ -570,22 +552,24 @@ Used by `roadrunner_req:read_body/1,2`; not part of the public API.
 bytes — content-length framing only; chunked falls through to a
 full read).
 """.
--spec consume_body_state(body_state(), all | next_chunk | {length, non_neg_integer()}) ->
-    {ok, iodata(), body_state()}
-    | {more, iodata(), body_state()}
+-spec consume_body_reader(
+    roadrunner_req:body_reader(), all | next_chunk | {length, non_neg_integer()}
+) ->
+    {ok, iodata(), roadrunner_req:body_reader()}
+    | {more, iodata(), roadrunner_req:body_reader()}
     | {error, term()}.
-consume_body_state(#{framing := none} = BS, _Mode) ->
+consume_body_reader(#{framing := none} = BS, _Mode) ->
     %% Per RFC 9112 §6.3: no framing means the body is empty.
     %% Any `buffered` bytes are pipelined-next-request leftovers —
-    %% preserve them in the body_state's `buffered` field so
+    %% preserve them in the body_reader's `buffered` field so
     %% `roadrunner_conn_loop`'s finishing phase can thread them into
     %% the next `reading_request` parse for full pipelining support.
     {ok, <<>>, BS};
-consume_body_state(
+consume_body_reader(
     #{framing := {content_length, N}, bytes_read := Read} = BS, _Mode
 ) when Read >= N ->
     {ok, <<>>, BS};
-consume_body_state(
+consume_body_reader(
     #{
         framing := {content_length, N},
         bytes_read := Read,
@@ -618,15 +602,15 @@ consume_body_state(
                     E
             end
     end;
-consume_body_state(#{framing := chunked} = BS, all) ->
+consume_body_reader(#{framing := chunked} = BS, all) ->
     %% Drain everything left: any pending decoded bytes plus all
     %% remaining chunks, accumulated in one return. Iodata stays unflattened
     %% so callers that only need `iolist_size/1` or want to forward via
     %% `gen_tcp:send/2` skip a flatten.
     chunked_collect(BS, infinity);
-consume_body_state(#{framing := chunked} = BS, {length, N}) ->
+consume_body_reader(#{framing := chunked} = BS, {length, N}) ->
     chunked_collect(BS, N);
-consume_body_state(#{framing := chunked} = BS, next_chunk) ->
+consume_body_reader(#{framing := chunked} = BS, next_chunk) ->
     next_chunk(BS).
 %% Non-chunked framing (none, content_length) is handled by the
 %% earlier clauses above — `next_chunk` is treated as a full drain
@@ -637,10 +621,10 @@ consume_body_state(#{framing := chunked} = BS, next_chunk) ->
 %% `infinity` (drain to end — caller asked for `all`) or a positive
 %% integer (caller asked for `{length, N}`). Returns
 %% `{ok | more, Bytes, BS2}` with Bytes as iodata (propagated through
-%% `consume_body_state` to the public API unflattened).
--spec chunked_collect(body_state(), infinity | non_neg_integer()) ->
-    {ok, iodata(), body_state()}
-    | {more, iodata(), body_state()}
+%% `consume_body_reader` to the public API unflattened).
+-spec chunked_collect(roadrunner_req:body_reader(), infinity | non_neg_integer()) ->
+    {ok, iodata(), roadrunner_req:body_reader()}
+    | {more, iodata(), roadrunner_req:body_reader()}
     | {error, term()}.
 chunked_collect(#{pending := Pending} = BS, Want) when
     Want =/= infinity, byte_size(Pending) >= Want
@@ -691,13 +675,13 @@ chunked_collect(#{buffered := Buf, recv := Recv, max := Max, bytes_read := Read}
             E
     end.
 
-%% Pull exactly one decoded chunk out of a chunked body_state. Pending
+%% Pull exactly one decoded chunk out of a chunked body_reader. Pending
 %% bytes (left over from a length-bounded read) are returned first; if
 %% pending is empty, parse the next wire chunk. End-of-body returns
 %% `{ok, <<>>, BS}`.
--spec next_chunk(body_state()) ->
-    {ok, binary(), body_state()}
-    | {more, binary(), body_state()}
+-spec next_chunk(roadrunner_req:body_reader()) ->
+    {ok, binary(), roadrunner_req:body_reader()}
+    | {more, binary(), roadrunner_req:body_reader()}
     | {error, term()}.
 next_chunk(#{pending := Pending} = BS) when byte_size(Pending) > 0 ->
     {more, Pending, BS#{pending := <<>>}};
@@ -733,7 +717,7 @@ fill_n(N, Buf, _Recv) when byte_size(Buf) >= N ->
     {ok, Bytes, Rest};
 fill_n(N, Buf, Recv) ->
     %% Body recursion that conses each recv chunk onto the iolist on
-    %% the way OUT. The iolist propagates through `consume_body_state`
+    %% the way OUT. The iolist propagates through `consume_body_reader`
     %% to the caller unflattened so callers that only need
     %% `iolist_size/1` (or want to forward via `gen_tcp:send/2`) avoid
     %% an O(total-body) copy.
@@ -770,7 +754,7 @@ fill_iolist(Need, Recv) ->
             E
     end.
 
--spec content_length(roadrunner_http1:request()) ->
+-spec content_length(roadrunner_req:request()) ->
     none | {ok, non_neg_integer()} | {error, bad_content_length}.
 content_length(Req) ->
     case roadrunner_req:header(~"content-length", Req) of
@@ -787,7 +771,7 @@ content_length(Req) ->
 
 -doc false.
 -spec parse_loop(binary(), fun(() -> {ok, binary()} | {error, term()})) ->
-    {ok, roadrunner_http1:request(), binary()} | {error, term()}.
+    {ok, roadrunner_req:request(), binary()} | {error, term()}.
 parse_loop(Buf, RecvFun) ->
     case roadrunner_http1:parse_request(Buf) of
         {ok, Req, Rest} ->
@@ -804,7 +788,7 @@ parse_loop(Buf, RecvFun) ->
 %% Order matters — `{websocket, _, _}` is a 3-tuple too, so the
 %% atom-tagged variants must precede the buffered catch-all.
 -doc false.
--spec response_status(roadrunner_handler:response()) -> roadrunner_http1:status().
+-spec response_status(roadrunner_handler:response()) -> roadrunner_http:status().
 response_status({stream, Status, _, _}) -> Status;
 response_status({loop, Status, _, _}) -> Status;
 response_status({sendfile, Status, _, _}) -> Status;
@@ -823,7 +807,7 @@ response_kind({_, _, _}) -> buffered.
 %% HTTP/1.0 default close. HTTP/1.1 keep-alive unless either side
 %% set Connection: close.
 -doc false.
--spec keep_alive_decision(roadrunner_http1:request(), roadrunner_http1:headers()) ->
+-spec keep_alive_decision(roadrunner_req:request(), roadrunner_http:headers()) ->
     keep_alive | close.
 %% Common-case fast path: HTTP/1.1, parser-cached request `Connection`
 %% empty, response has no `connection` header → `keep_alive` directly.
@@ -843,7 +827,7 @@ keep_alive_decision(
 keep_alive_decision(Req, RespHeaders) ->
     keep_alive_decision_full(Req, RespHeaders).
 
--spec keep_alive_decision_full(roadrunner_http1:request(), roadrunner_http1:headers()) ->
+-spec keep_alive_decision_full(roadrunner_req:request(), roadrunner_http:headers()) ->
     keep_alive | close.
 keep_alive_decision_full(Req, RespHeaders) ->
     ReqConn = req_connection_lower(Req),
@@ -876,7 +860,7 @@ keep_alive_decision_full(Req, RespHeaders) ->
 %% Returns the request's `Connection` header value, lowercased. Reads from
 %% `cached_decisions` when present (parser populates it once per request)
 %% and falls back to a per-call lowercase for manually-built request maps.
--spec req_connection_lower(roadrunner_http1:request()) -> binary().
+-spec req_connection_lower(roadrunner_req:request()) -> binary().
 req_connection_lower(#{cached_decisions := #{connection_lower := V}}) ->
     V;
 req_connection_lower(Req) ->
@@ -885,7 +869,7 @@ req_connection_lower(Req) ->
         V -> roadrunner_bin:ascii_lowercase(V)
     end.
 
--spec resp_connection_token(roadrunner_http1:headers()) -> binary().
+-spec resp_connection_token(roadrunner_http:headers()) -> binary().
 resp_connection_token(Headers) ->
     case header_value(~"connection", Headers) of
         undefined -> ~"";
@@ -902,7 +886,7 @@ init_patterns() ->
     persistent_term:put(?KEEP_ALIVE_CP_KEY, binary:compile_pattern(~"keep-alive")),
     ok.
 
--spec header_value(binary(), roadrunner_http1:headers()) -> binary() | undefined.
+-spec header_value(binary(), roadrunner_http:headers()) -> binary() | undefined.
 header_value(Name, Headers) ->
     case lists:keyfind(Name, 1, Headers) of
         {_, V} -> V;

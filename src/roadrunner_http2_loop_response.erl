@@ -26,8 +26,8 @@ Returns when the handler's `handle_info/3` returns `{stop, _}`.
 -spec run(
     pid(),
     pos_integer(),
-    roadrunner_req:status(),
-    roadrunner_req:headers(),
+    roadrunner_http:status(),
+    roadrunner_http:headers(),
     {module(), term()}
 ) -> ok.
 run(ConnPid, StreamId, Status, Headers, {Handler, State}) ->
@@ -84,8 +84,8 @@ make_push(ConnPid, StreamId) ->
 -spec sync_send_headers(
     pid(),
     pos_integer(),
-    roadrunner_req:status(),
-    roadrunner_req:headers(),
+    roadrunner_http:status(),
+    roadrunner_http:headers(),
     boolean()
 ) -> ok.
 sync_send_headers(ConnPid, StreamId, Status, Headers, EndStream) ->

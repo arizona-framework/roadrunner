@@ -55,13 +55,13 @@ affected stream, not tear down the whole connection. The conn
 sees the `'DOWN'` and emits `RST_STREAM(INTERNAL_ERROR)` for the
 stream's id, leaving the other 99 streams intact.
 """.
--spec start(pid(), pos_integer(), roadrunner_http1:request(), map()) ->
+-spec start(pid(), pos_integer(), roadrunner_req:request(), map()) ->
     {pid(), reference()}.
 start(ConnPid, StreamId, Req, ProtoOpts) ->
     spawn_monitor(?MODULE, init, [ConnPid, StreamId, Req, ProtoOpts]).
 
 -doc false.
--spec init(pid(), pos_integer(), roadrunner_http1:request(), map()) -> ok.
+-spec init(pid(), pos_integer(), roadrunner_req:request(), map()) -> ok.
 init(ConnPid, StreamId, Req, ProtoOpts) ->
     proc_lib:set_label({roadrunner_http2_stream_worker, StreamId}),
     %% Mirror the h1 path: attach request-scoped metadata so any
@@ -132,7 +132,7 @@ invoke(ConnPid, StreamId, Handler, Pipeline, Req, Metadata, ReqStart) ->
             )
     end.
 
--spec telemetry_metadata(roadrunner_http1:request()) -> roadrunner_telemetry:metadata().
+-spec telemetry_metadata(roadrunner_req:request()) -> roadrunner_telemetry:metadata().
 telemetry_metadata(#{
     request_id := RequestId,
     peer := Peer,

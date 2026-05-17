@@ -11,8 +11,8 @@ shape.
 
 -export([handle_info/3]).
 
--spec handle(roadrunner_http1:request()) ->
-    {roadrunner_handler:response(), roadrunner_http1:request()}.
+-spec handle(roadrunner_req:request()) ->
+    {roadrunner_handler:response(), roadrunner_req:request()}.
 handle(#{target := ~"/empty"} = Req) ->
     {{200, [], ~""}, Req};
 handle(#{target := ~"/stream"} = Req) ->

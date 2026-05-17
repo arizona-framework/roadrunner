@@ -19,7 +19,7 @@ the payload size.
 -define(CHUNK_SIZE, 64).
 -define(NUM_CHUNKS, 100).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Chunk = persistent_term:get(?CHUNK_KEY),
     Fun = fun(Send) ->

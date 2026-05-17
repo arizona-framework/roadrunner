@@ -18,7 +18,7 @@ behavior, not body construction.
 -define(BODY_KEY, {?MODULE, body}).
 -define(BODY_SIZE, 65536).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Body = persistent_term:get(?BODY_KEY),
     Resp =

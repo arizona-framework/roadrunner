@@ -37,8 +37,10 @@
 
 -export([encode/1, decode/1]).
 
--export_type([decode_error/0]).
-
+%% Internal-only: HPACK's `decode_error/0` union (the public surface)
+%% folds these two Huffman-specific variants into the single
+%% `huffman_decode_error` token in `roadrunner_http2_hpack:decode/2`'s
+%% spec. Callers that need to discriminate them stay inside this module.
 -type decode_error() ::
     invalid_padding
     | eos_in_string.

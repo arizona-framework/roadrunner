@@ -11,7 +11,7 @@ single-handler dispatch helper that stashes state there) or from
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Path = persistent_term:get({?MODULE, file}),
     {ok, Info} = file:read_file_info(Path),

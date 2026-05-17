@@ -9,7 +9,7 @@ body into the handler's request map.
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Body = roadrunner_req:body(Req),
     Resp =

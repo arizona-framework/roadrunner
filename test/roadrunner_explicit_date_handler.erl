@@ -10,7 +10,7 @@ handler-supplied values.
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Headers = [
         {~"content-type", ~"text/plain; charset=utf-8"},
