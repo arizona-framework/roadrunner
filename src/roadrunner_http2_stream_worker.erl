@@ -84,7 +84,7 @@ run_handler(ConnPid, StreamId, Req, ProtoOpts) ->
     Metadata = telemetry_metadata(Req),
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
-        {ok, Handler, Bindings, Pipeline} ->
+        {ok, Handler, Bindings, Pipeline, _State} ->
             invoke(
                 ConnPid,
                 StreamId,

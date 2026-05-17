@@ -548,14 +548,16 @@ build_proto_opts(Opts, ListenerName) ->
 
 %% `routes` is the unified dispatch option. Single-handler forms
 %% (bare atom, `{Mod, State}` tuple, or `#{handler := Mod, ...}` map)
-%% all compile to a `{handler, Mod, Pipeline}` dispatch tag where
-%% `Pipeline` is the pre-composed `next()` fun: listener mws ++
-%% per-handler mws, optionally wrapped in a state-injecting closure,
-%% ending in `fun Mod:handle/1`. A list of route entries uses the
-%% router. When `routes` is omitted, fall back to the default
-%% hello-world handler. List-form routes are published to
-%% `persistent_term` by `publish_routes/2` — the dispatch tag carries
-%% the listener name so the conn can look the table up.
+%% all compile to a `{handler, Mod, Pipeline, State}` dispatch tag
+%% where `Pipeline` is the pre-composed `next()` fun (listener mws
+%% ++ per-handler mws, optionally wrapped in a state-injecting
+%% closure, ending in `fun Mod:handle/1`) and `State` is the user's
+%% attached state (or `undefined`) exposed alongside for callers
+%% that need to introspect outside the request flow. A list of route
+%% entries uses the router. When `routes` is omitted, fall back to
+%% the default hello-world handler. List-form routes are published
+%% to `persistent_term` by `publish_routes/2` — the dispatch tag
+%% carries the listener name so the conn can look the table up.
 -spec build_dispatch(opts(), atom()) -> roadrunner_conn:dispatch().
 %% Validate + normalize the `protocols` opt. Returns a 2-tuple:
 %%
@@ -660,9 +662,9 @@ flatten_http2_opts(Entries) ->
     end.
 
 build_dispatch(#{routes := Module} = Opts, _ListenerName) when is_atom(Module) ->
-    {handler, Module, bake_pipeline(Module, Opts, [], no_state)};
+    bake_dispatch(Module, Opts, [], no_state);
 build_dispatch(#{routes := {Module, State}} = Opts, _ListenerName) when is_atom(Module) ->
-    {handler, Module, bake_pipeline(Module, Opts, [], {state, State})};
+    bake_dispatch(Module, Opts, [], {state, State});
 build_dispatch(#{routes := #{handler := Module} = Route} = Opts, _ListenerName) when
     is_atom(Module)
 ->
@@ -672,25 +674,35 @@ build_dispatch(#{routes := #{handler := Module} = Route} = Opts, _ListenerName) 
             #{state := S} -> {state, S};
             _ -> no_state
         end,
-    {handler, Module, bake_pipeline(Module, Opts, HandlerMws, StateArg)};
+    bake_dispatch(Module, Opts, HandlerMws, StateArg);
 build_dispatch(#{routes := Routes}, ListenerName) when is_list(Routes) ->
     {router, ListenerName};
 build_dispatch(Opts, _ListenerName) ->
-    {handler, roadrunner_default_handler,
-        bake_pipeline(roadrunner_default_handler, Opts, [], no_state)}.
+    bake_dispatch(roadrunner_default_handler, Opts, [], no_state).
 
 %% Single-handler dispatch counterpart of the router's compile path.
 %% Defers to `roadrunner_middleware:compile_pipeline/3` after combining
-%% the listener-wide and per-handler mws lists.
--spec bake_pipeline(
+%% the listener-wide and per-handler mws lists. State is exposed
+%% alongside the pipeline so `roadrunner_router:match/2`-shaped
+%% callers (and other introspection paths) can read it without
+%% running the pipeline.
+-spec bake_dispatch(
     module(),
     opts(),
     roadrunner_middleware:middleware_list(),
     no_state | {state, term()}
-) -> roadrunner_middleware:next().
-bake_pipeline(Handler, Opts, HandlerMws, StateArg) ->
+) -> roadrunner_conn:dispatch().
+bake_dispatch(Handler, Opts, HandlerMws, StateArg) ->
     ListenerMws = maps:get(middlewares, Opts, []),
-    roadrunner_middleware:compile_pipeline(ListenerMws ++ HandlerMws, Handler, StateArg).
+    Pipeline = roadrunner_middleware:compile_pipeline(
+        ListenerMws ++ HandlerMws, Handler, StateArg
+    ),
+    State =
+        case StateArg of
+            no_state -> undefined;
+            {state, S} -> S
+        end,
+    {handler, Handler, Pipeline, State}.
 
 -doc false.
 -spec handle_call(
@@ -736,7 +748,7 @@ do_reload_routes(
         roadrunner_router:compile(Routes, ListenerMws)
     ),
     ok;
-do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _}}}, _Routes) ->
+do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _, _}}}, _Routes) ->
     {error, no_routes}.
 
 -spec do_drain(#state{}, non_neg_integer()) ->

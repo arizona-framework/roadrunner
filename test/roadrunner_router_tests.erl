@@ -417,7 +417,7 @@ compile_returns_callable_pipeline_test() ->
     [
         ?assert(is_function(P, 1))
      || Path <- [~"/", ~"/x", ~"/y"],
-        {ok, _, _, P} <- [roadrunner_router:match(Path, Compiled)]
+        {ok, _, _, P, _} <- [roadrunner_router:match(Path, Compiled)]
     ].
 
 compile_bakes_state_into_pipeline_test() ->
@@ -428,19 +428,44 @@ compile_bakes_state_into_pipeline_test() ->
     Compiled = roadrunner_router:compile(
         [{~"/", roadrunner_state_echo_handler, #{my => state}}], []
     ),
-    {ok, _, _, Pipeline} = roadrunner_router:match(~"/", Compiled),
+    {ok, _, _, Pipeline, _State} = roadrunner_router:match(~"/", Compiled),
     {{200, _, Body}, _} = Pipeline(empty_req()),
     ?assertEqual(#{my => state}, binary_to_term(Body)).
 
+match_exposes_state_as_5th_element_test() ->
+    %% State is also surfaced statically as the 5th element so callers
+    %% that need to introspect a route can read it without running
+    %% the pipeline.
+    Compiled = roadrunner_router:compile(
+        [
+            {~"/none", h},
+            {~"/legacy", h, undefined},
+            {~"/three", h, #{role => admin}},
+            #{path => ~"/map_no_state", handler => h},
+            #{path => ~"/map_with_state", handler => h, state => keep_me}
+        ],
+        []
+    ),
+    [
+        ?assertEqual(Expected, element(5, roadrunner_router:match(P, Compiled)))
+     || {P, Expected} <- [
+            {~"/none", undefined},
+            {~"/legacy", undefined},
+            {~"/three", #{role => admin}},
+            {~"/map_no_state", undefined},
+            {~"/map_with_state", keep_me}
+        ]
+    ].
+
 %% --- helpers ---
 
-%% Drop the 4th element (the pipeline fun, funs-are-not-comparable) so
-%% the handler module + bindings can be asserted with `?assertEqual`.
-%% State injection is covered separately by
-%% `compile_bakes_state_into_pipeline_test`.
+%% Drop the pipeline (4th element) and state (5th) so the handler
+%% module + bindings can be asserted with `?assertEqual`. The
+%% pipeline is funs-are-not-comparable, and state has its own
+%% dedicated test (`match_exposes_state_as_5th_element_test`).
 match_no_pipeline(Path, Compiled) ->
     case roadrunner_router:match(Path, Compiled) of
-        {ok, Mod, Bindings, _Pipeline} -> {ok, Mod, Bindings, #{}};
+        {ok, Mod, Bindings, _Pipeline, _State} -> {ok, Mod, Bindings, #{}};
         Other -> Other
     end.
 

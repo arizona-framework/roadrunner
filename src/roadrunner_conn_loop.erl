@@ -557,7 +557,7 @@ dispatch_phase(
     Req
 ) ->
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
-        {ok, Handler, Bindings, Pipeline} ->
+        {ok, Handler, Bindings, Pipeline, _State} ->
             run_pipeline(S, Handler, Req#{bindings => Bindings}, Pipeline);
         not_found ->
             _ = roadrunner_conn:send_not_found(Socket),

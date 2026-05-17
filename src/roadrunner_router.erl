@@ -87,7 +87,7 @@ remaining path segments
 The compiled-routes representation `match/2` consumes. Treat as
 opaque: the shape is an implementation detail and may change.
 """.
--opaque compiled() :: [{[segment()], module(), roadrunner_middleware:next()}].
+-opaque compiled() :: [{[segment()], module(), roadrunner_middleware:next(), term()}].
 
 -doc """
 Compile a list of routes into the lookup form `match/2` expects.
@@ -107,30 +107,37 @@ compile(Routes, ListenerMws) when is_list(Routes), is_list(ListenerMws) ->
     [compile_route(R, ListenerMws) || R <- Routes].
 
 -spec compile_route(route(), roadrunner_middleware:middleware_list()) ->
-    {[segment()], module(), roadrunner_middleware:next()}.
+    {[segment()], module(), roadrunner_middleware:next(), term()}.
 compile_route({Path, Handler}, ListenerMws) when is_binary(Path), is_atom(Handler) ->
     {
         compile_path(Path),
         Handler,
-        roadrunner_middleware:compile_pipeline(ListenerMws, Handler, no_state)
+        roadrunner_middleware:compile_pipeline(ListenerMws, Handler, no_state),
+        undefined
     };
 compile_route({Path, Handler, State}, ListenerMws) when is_binary(Path), is_atom(Handler) ->
     {
         compile_path(Path),
         Handler,
-        roadrunner_middleware:compile_pipeline(ListenerMws, Handler, {state, State})
+        roadrunner_middleware:compile_pipeline(ListenerMws, Handler, {state, State}),
+        State
     };
 compile_route(#{path := Path, handler := Handler} = Route, ListenerMws) when
     is_binary(Path), is_atom(Handler)
 ->
     RouteMws = maps:get(middlewares, Route, []),
     Mws = ListenerMws ++ RouteMws,
-    StateArg =
+    {StateArg, StateValue} =
         case Route of
-            #{state := S} -> {state, S};
-            _ -> no_state
+            #{state := S} -> {{state, S}, S};
+            _ -> {no_state, undefined}
         end,
-    {compile_path(Path), Handler, roadrunner_middleware:compile_pipeline(Mws, Handler, StateArg)}.
+    {
+        compile_path(Path),
+        Handler,
+        roadrunner_middleware:compile_pipeline(Mws, Handler, StateArg),
+        StateValue
+    }.
 
 -spec compile_path(binary()) -> [segment()].
 compile_path(Path) ->
@@ -144,27 +151,30 @@ compile_segment(Lit) -> {literal, Lit}.
 -doc """
 Look up the handler for a given request path.
 
-Returns `{ok, Handler, Bindings, Pipeline}` on a match — `Bindings`
-is a map populated with captures from `:param` segments (empty for
-purely literal routes); `Pipeline` is the pre-composed `next()` fun
-built at compile time (listener mws ++ per-route mws, optionally
-wrapped in a state-injecting outermost closure, ending in
-`fun Handler:handle/1`). The conn loop calls it with the request.
-Returns `not_found` when no compiled route matches.
+Returns `{ok, Handler, Bindings, Pipeline, State}` on a match —
+`Bindings` is a map populated with captures from `:param` segments
+(empty for purely literal routes); `Pipeline` is the pre-composed
+`next()` fun built at compile time (listener mws ++ per-route mws,
+optionally wrapped in a state-injecting outermost closure, ending in
+`fun Handler:handle/1`); `State` is the per-route opaque state
+attached by the user at compile time (or `undefined` when the route
+shape didn't carry any). The conn loop just calls `Pipeline` —
+`State` is for callers who need to introspect a route outside the
+request flow. Returns `not_found` when no compiled route matches.
 """.
 -spec match(Path :: binary(), compiled()) ->
-    {ok, module(), bindings(), roadrunner_middleware:next()} | not_found.
+    {ok, module(), bindings(), roadrunner_middleware:next(), term()} | not_found.
 match(Path, Compiled) when is_binary(Path), is_list(Compiled) ->
     Segments = path_segments(Path),
     match_first(Segments, Compiled).
 
 -spec match_first([binary()], compiled()) ->
-    {ok, module(), bindings(), roadrunner_middleware:next()} | not_found.
+    {ok, module(), bindings(), roadrunner_middleware:next(), term()} | not_found.
 match_first(_Segments, []) ->
     not_found;
-match_first(Segments, [{Pattern, Handler, Pipeline} | Rest]) ->
+match_first(Segments, [{Pattern, Handler, Pipeline, State} | Rest]) ->
     case match_pattern(Pattern, Segments, #{}) of
-        {ok, Bindings} -> {ok, Handler, Bindings, Pipeline};
+        {ok, Bindings} -> {ok, Handler, Bindings, Pipeline, State};
         no_match -> match_first(Segments, Rest)
     end.
 

@@ -28,7 +28,7 @@ prop_param_bindings_round_trip() ->
             RouteBin = build_route(Pattern),
             Compiled = roadrunner_router:compile([{RouteBin, my_handler}], []),
             case roadrunner_router:match(PathBin, Compiled) of
-                {ok, my_handler, Bindings, Pipeline} when is_function(Pipeline, 1) ->
+                {ok, my_handler, Bindings, Pipeline, _State} when is_function(Pipeline, 1) ->
                     %% Every `:Name` in the pattern must show up in
                     %% Bindings under that exact binary name and value.
                     Expected = expected_bindings(Pattern, Values),
