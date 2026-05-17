@@ -74,7 +74,7 @@
 -define(KEEP_ALIVE_CP_KEY, {?MODULE, keep_alive_cp}).
 
 -type dispatch() ::
-    {handler, module()}
+    {handler, module(), term()}
     | {router, ListenerName :: atom()}.
 
 -type proto_opts() :: #{
@@ -327,8 +327,8 @@ scheme({fake, _}) -> http.
 -doc false.
 -spec resolve_handler(dispatch(), roadrunner_http1:request()) ->
     {ok, module(), roadrunner_router:bindings(), term()} | not_found.
-resolve_handler({handler, Mod}, _Req) ->
-    {ok, Mod, #{}, undefined};
+resolve_handler({handler, Mod, Opts}, _Req) ->
+    {ok, Mod, #{}, Opts};
 resolve_handler({router, ListenerName}, Req) ->
     %% Routes are stored in `persistent_term` by `roadrunner_listener` so
     %% the lookup is O(1) and `roadrunner_listener:reload_routes/2` can

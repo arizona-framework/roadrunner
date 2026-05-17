@@ -173,7 +173,7 @@ ensure_pg() ->
 
 proto_opts(ListenerName, Counter) ->
     #{
-        dispatch => {handler, roadrunner_hello_handler},
+        dispatch => {handler, roadrunner_hello_handler, undefined},
         middlewares => [],
         max_content_length => 1_000_000,
         request_timeout => 200,

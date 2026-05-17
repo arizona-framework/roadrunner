@@ -599,6 +599,43 @@ routes_persistent_term_erased_on_listener_stop_test() ->
     %% Stopping the listener erases it.
     ?assertException(error, badarg, persistent_term:get({roadrunner_routes, Name})).
 
+single_handler_tuple_form_threads_opts_to_route_opts_test_() ->
+    {setup,
+        fun() ->
+            Name = listener_test_single_handler_opts,
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                routes => {roadrunner_route_opts_echo_handler, #{greeting => ~"hi"}}
+            }),
+            {Name, roadrunner_listener:port(Name)}
+        end,
+        fun({Name, _Port}) -> ok = roadrunner_listener:stop(Name) end, fun({_Name, Port}) ->
+            {"routes => {Mod, Opts} surfaces Opts via roadrunner_req:route_opts/1", fun() ->
+                Reply = http_get_close(Port, ~"/"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                [_Head, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(#{greeting => ~"hi"}, binary_to_term(Body))
+            end}
+        end}.
+
+single_handler_bare_atom_form_yields_undefined_route_opts_test_() ->
+    {setup,
+        fun() ->
+            Name = listener_test_single_handler_no_opts,
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0, routes => roadrunner_route_opts_echo_handler
+            }),
+            {Name, roadrunner_listener:port(Name)}
+        end,
+        fun({Name, _Port}) -> ok = roadrunner_listener:stop(Name) end, fun({_Name, Port}) ->
+            {"routes => Mod leaves route_opts/1 as undefined", fun() ->
+                Reply = http_get_close(Port, ~"/"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                [_Head, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(undefined, binary_to_term(Body))
+            end}
+        end}.
+
 listener_without_routes_opt_falls_back_to_default_handler_test() ->
     Name = listener_test_default_handler_fallback,
     {ok, _} = roadrunner_listener:start_link(Name, #{port => 0}),

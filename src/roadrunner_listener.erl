@@ -46,7 +46,11 @@ Required:
 
 Routing (pick one):
 - `routes => module()` — single-handler dispatch. Every request
-  goes to `Module:handle/1`.
+  goes to `Module:handle/1` and `roadrunner_req:route_opts/1`
+  returns `undefined`.
+- `routes => {module(), term()}` — single-handler dispatch with
+  per-handler opts. The opaque second element is reachable from
+  the handler via `roadrunner_req:route_opts/1`.
 - `routes => roadrunner_router:routes()` — list of
   `{Path, Handler, Opts}` tuples; first match wins.
 
@@ -87,7 +91,7 @@ ops-tuning rationale.
 """.
 -type opts() :: #{
     port := inet:port_number(),
-    routes => module() | roadrunner_router:routes(),
+    routes => module() | {module(), term()} | roadrunner_router:routes(),
     middlewares => roadrunner_middleware:middleware_list(),
     max_content_length => non_neg_integer(),
     request_timeout => non_neg_integer(),
@@ -524,11 +528,13 @@ build_proto_opts(Opts, ListenerName) ->
     end.
 
 %% `routes` is the unified dispatch option. A bare module atom sends
-%% every request to that handler; a list of `{Path, Module, Opts}`
-%% tuples uses the router. When `routes` is omitted, fall back to the
-%% default hello-world handler. List-form routes are published to
-%% `persistent_term` by `publish_routes/2` — the dispatch tag carries
-%% the listener name so the conn can look the table up.
+%% every request to that handler; `{Module, Opts}` is the same plus
+%% per-handler opts surfaced via `roadrunner_req:route_opts/1`; a list
+%% of `{Path, Module, Opts}` tuples uses the router. When `routes` is
+%% omitted, fall back to the default hello-world handler. List-form
+%% routes are published to `persistent_term` by `publish_routes/2` —
+%% the dispatch tag carries the listener name so the conn can look
+%% the table up.
 -spec build_dispatch(opts(), atom()) -> roadrunner_conn:dispatch().
 %% Validate + normalize the `protocols` opt. Returns a 2-tuple:
 %%
@@ -633,11 +639,13 @@ flatten_http2_opts(Entries) ->
     end.
 
 build_dispatch(#{routes := Module}, _ListenerName) when is_atom(Module) ->
-    {handler, Module};
+    {handler, Module, undefined};
+build_dispatch(#{routes := {Module, Opts}}, _ListenerName) when is_atom(Module) ->
+    {handler, Module, Opts};
 build_dispatch(#{routes := Routes}, ListenerName) when is_list(Routes) ->
     {router, ListenerName};
 build_dispatch(_Opts, _ListenerName) ->
-    {handler, roadrunner_default_handler}.
+    {handler, roadrunner_default_handler, undefined}.
 
 -doc false.
 -spec handle_call(
@@ -677,7 +685,7 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
 do_reload_routes(#state{proto_opts = #{dispatch := {router, Name}}}, Routes) ->
     persistent_term:put({roadrunner_routes, Name}, roadrunner_router:compile(Routes)),
     ok;
-do_reload_routes(#state{proto_opts = #{dispatch := {handler, _}}}, _Routes) ->
+do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _}}}, _Routes) ->
     {error, no_routes}.
 
 -spec do_drain(#state{}, non_neg_integer()) ->
