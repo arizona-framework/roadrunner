@@ -438,14 +438,14 @@ scheme_https_test() ->
 scheme_absent_defaults_to_http_test() ->
     ?assertEqual(http, roadrunner_req:scheme(sample_req())).
 
-%% --- route_opts/1 ---
+%% --- state/1 ---
 
-route_opts_present_test() ->
-    Req = (sample_req())#{route_opts => #{dir => ~"/var/www"}},
-    ?assertEqual(#{dir => ~"/var/www"}, roadrunner_req:route_opts(Req)).
+state_present_test() ->
+    Req = (sample_req())#{state => #{dir => ~"/var/www"}},
+    ?assertEqual(#{dir => ~"/var/www"}, roadrunner_req:state(Req)).
 
-route_opts_absent_returns_undefined_test() ->
-    ?assertEqual(undefined, roadrunner_req:route_opts(sample_req())).
+state_absent_returns_undefined_test() ->
+    ?assertEqual(undefined, roadrunner_req:state(sample_req())).
 
 %% --- request_id/1 ---
 

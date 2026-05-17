@@ -309,6 +309,59 @@ grammar enforcement is callers-write-bugs ergonomics, not security.
 
 **Scope:** small per attribute. Add when a real caller hits the gap.
 
+## Per-route framework knobs the map shape unlocks
+
+The map-shape route entry (`#{path => ..., handler => ..., state =>
+..., middlewares => [...]}`) is intentionally extensible — new
+top-level keys add new per-route capabilities without breaking
+existing routes. None of the below is wired up yet; the map shape
+is ready when one of these has a real caller behind it.
+
+### Per-route `name => atom()` for telemetry / reverse routing — small
+
+**What:** Let a route declare a stable name (e.g. `name =>
+users_show`) and surface it in telemetry metadata (`[roadrunner,
+request, start | stop | exception]`) plus expose a
+`roadrunner_router:url_for/2,3` for reverse-resolving the name back
+to a path.
+
+**Why deferred:** no telemetry consumer asking for it today.
+`(listener_name, method, path)` is already enough to identify a
+route in dashboards; named lookup is a niceness, not a need.
+
+### Per-route `methods => [binary()]` allowlist with automatic 405 — small
+
+**What:** `methods => [~"GET", ~"PUT"]` on a route map means the
+framework returns `405 Method Not Allowed` (with the right `Allow`
+header) for any other method on that path. Eliminates the
+boilerplate every handler currently writes to gate on
+`roadrunner_req:method/1`.
+
+**Why deferred:** simple to bolt on once a couple of real handlers
+demonstrate the pattern they want. The single-route equality check
+is the wrong model for catch-all routes (`/api/*path`) that
+multiplex methods downstream.
+
+### Nested route groups with shared prefix + middlewares — medium
+
+**What:** Phoenix-style scope / pipeline:
+
+```erlang
+[#{prefix => ~"/api", middlewares => [auth_mw], routes => [
+    #{path => ~"/users/:id", handler => users_show},
+    #{path => ~"/posts/:id", handler => posts_show}
+ ]}]
+```
+
+The framework flattens these at compile time into the existing
+linear route list, concatenating the prefix and prepending the
+group's middlewares to each leaf route.
+
+**Why deferred:** the flat list is fine until the route table has
+shared per-section middlewares (auth, rate limit, body-limit
+overrides) duplicated across many entries. Add when a real codebase
+shows that duplication.
+
 ## Out of scope
 
 These are deliberately out of scope, not "deferred":

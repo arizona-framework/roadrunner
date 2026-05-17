@@ -111,10 +111,11 @@
     %% Connection scheme — `http` for plain TCP, `https` for TLS. Set
     %% once per connection by `roadrunner_conn` from the transport tag.
     scheme => http | https,
-    %% Per-route opts attached at compile time via the 3-tuple route shape
-    %% `{Path, Handler, Opts}`. `undefined` for 2-tuple routes and for
-    %% single-handler dispatch (no router involved).
-    route_opts => term(),
+    %% Per-route handler state attached at compile time via the 3-tuple
+    %% route shape `{Path, Handler, State}` or the map shape's `state` key
+    %% (and the listener's `{Module, State}` single-handler form).
+    %% `undefined` when no state was attached.
+    state => term(),
     %% Body-read state attached by `roadrunner_conn` in `body_buffering => manual`
     %% mode. Threaded through `roadrunner_req:read_body/1,2`. Never present in
     %% `auto` mode or in manually-constructed request maps.

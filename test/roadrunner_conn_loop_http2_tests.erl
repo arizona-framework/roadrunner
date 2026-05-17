@@ -312,7 +312,7 @@ concurrent_streams_both_dispatch() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_concurrent_test,
-        dispatch => {handler, roadrunner_h2_test_handler},
+        dispatch => {handler, roadrunner_h2_test_handler, #{}},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -374,7 +374,7 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
         client_counter => Counter,
         requests_counter => RequestsCounter,
         listener_name => h2c_dispatch_test,
-        dispatch => {handler, roadrunner_hello_handler},
+        dispatch => {handler, roadrunner_hello_handler, #{}},
         middlewares => [],
         max_content_length => 1_048_576,
         request_timeout => 30000,
@@ -423,7 +423,7 @@ plaintext_listener_without_h2c_stays_h1() ->
         client_counter => Counter,
         requests_counter => RequestsCounter,
         listener_name => h1_dispatch_test,
-        dispatch => {handler, roadrunner_hello_handler},
+        dispatch => {handler, roadrunner_hello_handler, #{}},
         middlewares => [],
         max_content_length => 1_048_576,
         request_timeout => 30000,
@@ -884,7 +884,7 @@ middleware_chain_runs() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_mw_test,
-        dispatch => {handler, roadrunner_hello_handler},
+        dispatch => {handler, roadrunner_hello_handler, #{}},
         middlewares => [Mw]
     },
     Self = self(),
@@ -938,7 +938,7 @@ router_404_returns_not_found() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     %% Publish empty routes for a fake listener.
-    persistent_term:put({roadrunner_routes, h2_404_listener}, roadrunner_router:compile([])),
+    persistent_term:put({roadrunner_routes, h2_404_listener}, roadrunner_router:compile([], [])),
     Self = self(),
     Counter = atomics:new(1, [{signed, false}]),
     ok = atomics:add(Counter, 1, 1),
@@ -1535,7 +1535,7 @@ rst_during_stream_response_unwinds_worker() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_rst_during_stream,
-        dispatch => {handler, roadrunner_h2_test_handler},
+        dispatch => {handler, roadrunner_h2_test_handler, #{}},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -1611,7 +1611,7 @@ drain_refuses_new_streams() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_test,
-        dispatch => {handler, roadrunner_h2_test_handler},
+        dispatch => {handler, roadrunner_h2_test_handler, #{}},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -1662,7 +1662,7 @@ drain_with_in_flight_stream_waits() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_inflight_test,
-        dispatch => {handler, roadrunner_h2_test_handler},
+        dispatch => {handler, roadrunner_h2_test_handler, #{}},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -1720,7 +1720,7 @@ drain_message_is_idempotent() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_dup_test,
-        dispatch => {handler, roadrunner_h2_test_handler},
+        dispatch => {handler, roadrunner_h2_test_handler, #{}},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -1768,7 +1768,7 @@ drain_then_peer_rst_exits_via_frame_loop() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_rst_test,
-        dispatch => {handler, roadrunner_h2_test_handler},
+        dispatch => {handler, roadrunner_h2_test_handler, #{}},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -1852,7 +1852,7 @@ telemetry_request_stop_fires_for_router_404() ->
     try
         {ok, _} = application:ensure_all_started(telemetry),
         drain_mailbox(),
-        persistent_term:put({roadrunner_routes, h2_telem_404}, roadrunner_router:compile([])),
+        persistent_term:put({roadrunner_routes, h2_telem_404}, roadrunner_router:compile([], [])),
         Self = self(),
         Counter = atomics:new(1, [{signed, false}]),
         ok = atomics:add(Counter, 1, 1),
@@ -1940,7 +1940,8 @@ run_h2_with_compress_middleware(Path, ExtraHeaders) ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_compress_test,
-        dispatch => {handler, roadrunner_h2_test_handler},
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, #{middlewares => [roadrunner_compress]}},
         middlewares => [roadrunner_compress]
     },
     Sock = {fake, Self},
@@ -2609,7 +2610,7 @@ post_handshake_handler(Handler) ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_strict_test,
-        dispatch => {handler, Handler},
+        dispatch => {handler, Handler, #{}},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -2731,7 +2732,7 @@ start_http2_conn() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => http2_test,
-        dispatch => {handler, roadrunner_hello_handler},
+        dispatch => {handler, roadrunner_hello_handler, #{}},
         middlewares => [],
         protocols => [http2],
         http2_conn_window => 65535,
@@ -2852,7 +2853,7 @@ run_h2_request_with_handler(Handler, Path) ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_handler_test,
-        dispatch => {handler, Handler},
+        dispatch => {handler, Handler, #{}},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -2905,7 +2906,7 @@ run_stream_request(Path) ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_stream_test,
-        dispatch => {handler, roadrunner_h2_test_handler},
+        dispatch => {handler, roadrunner_h2_test_handler, #{}},
         middlewares => []
     },
     Sock = {fake, Self},

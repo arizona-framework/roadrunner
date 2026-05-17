@@ -354,6 +354,46 @@ chunked_recv(Chunks) ->
     end.
 
 %% =============================================================================
+%% resolve_handler/2 — dispatch tag → {ok, Mod, Bindings, RouteCfg}
+%% =============================================================================
+
+resolve_handler_empty_cfg_form_returns_empty_cfg_test() ->
+    ?assertEqual(
+        {ok, some_mod, #{}, #{}},
+        roadrunner_conn:resolve_handler({handler, some_mod, #{}}, dummy_req())
+    ).
+
+resolve_handler_cfg_with_state_test() ->
+    Cfg = #{state => #{greeting => ~"hi"}},
+    ?assertEqual(
+        {ok, some_mod, #{}, Cfg},
+        roadrunner_conn:resolve_handler({handler, some_mod, Cfg}, dummy_req())
+    ).
+
+resolve_handler_cfg_with_state_and_middlewares_test() ->
+    Cfg = #{state => #{role => admin}, middlewares => [auth_mw]},
+    ?assertEqual(
+        {ok, some_mod, #{}, Cfg},
+        roadrunner_conn:resolve_handler({handler, some_mod, Cfg}, dummy_req())
+    ).
+
+resolve_handler_router_no_match_returns_not_found_test() ->
+    Name = resolve_handler_router_no_match,
+    persistent_term:put(
+        {roadrunner_routes, Name},
+        roadrunner_router:compile([{~"/known", some_mod}], [])
+    ),
+    try
+        Req = #{target => ~"/missing"},
+        ?assertEqual(not_found, roadrunner_conn:resolve_handler({router, Name}, Req))
+    after
+        persistent_term:erase({roadrunner_routes, Name})
+    end.
+
+dummy_req() ->
+    #{target => ~"/"}.
+
+%% =============================================================================
 %% End-to-end integration over a real TCP socket
 %% =============================================================================
 

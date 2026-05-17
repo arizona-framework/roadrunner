@@ -85,7 +85,8 @@ compose_module_form_dispatches_via_call2_test() ->
     ?assertEqual({200, [], ~"yes"}, {Status, Headers, Body}).
 
 %% =============================================================================
-%% End-to-end through roadrunner_conn — exercises route_opts.middlewares plumbing.
+%% End-to-end through roadrunner_conn — exercises the map-shape route's
+%% top-level `middlewares` key.
 %% =============================================================================
 
 route_middlewares_run_before_handler_test_() ->
@@ -94,12 +95,14 @@ route_middlewares_run_before_handler_test_() ->
             {ok, _} = roadrunner_listener:start_link(mw_test_route, #{
                 port => 0,
                 routes => [
-                    {~"/echo", roadrunner_echo_headers_handler, #{
+                    #{
+                        path => ~"/echo",
+                        handler => roadrunner_echo_headers_handler,
                         middlewares => [
                             fun roadrunner_test_middlewares:tag_request/2,
                             roadrunner_test_middlewares
                         ]
-                    }}
+                    }
                 ]
             }),
             roadrunner_listener:port(mw_test_route)
@@ -118,9 +121,11 @@ route_middleware_can_halt_test_() ->
             {ok, _} = roadrunner_listener:start_link(mw_test_halt, #{
                 port => 0,
                 routes => [
-                    {~"/secret", roadrunner_echo_headers_handler, #{
+                    #{
+                        path => ~"/secret",
+                        handler => roadrunner_echo_headers_handler,
                         middlewares => [fun roadrunner_test_middlewares:halt_401/2]
-                    }}
+                    }
                 ]
             }),
             roadrunner_listener:port(mw_test_halt)
@@ -138,9 +143,11 @@ route_middleware_can_wrap_response_test_() ->
             {ok, _} = roadrunner_listener:start_link(mw_test_wrap, #{
                 port => 0,
                 routes => [
-                    {~"/wrapped", roadrunner_echo_headers_handler, #{
+                    #{
+                        path => ~"/wrapped",
+                        handler => roadrunner_echo_headers_handler,
                         middlewares => [fun roadrunner_test_middlewares:wrap_response/2]
-                    }}
+                    }
                 ]
             }),
             roadrunner_listener:port(mw_test_wrap)
@@ -161,9 +168,11 @@ route_middleware_crash_returns_500_test_() ->
             {ok, _} = roadrunner_listener:start_link(mw_test_crash, #{
                 port => 0,
                 routes => [
-                    {~"/boom", roadrunner_echo_headers_handler, #{
+                    #{
+                        path => ~"/boom",
+                        handler => roadrunner_echo_headers_handler,
                         middlewares => [fun roadrunner_test_middlewares:crash/2]
-                    }}
+                    }
                 ]
             }),
             roadrunner_listener:port(mw_test_crash)
@@ -209,9 +218,11 @@ listener_middleware_runs_outside_route_middleware_test_() ->
                 port => 0,
                 middlewares => [fun roadrunner_test_middlewares:wrap_response/2],
                 routes => [
-                    {~"/x", roadrunner_echo_headers_handler, #{
+                    #{
+                        path => ~"/x",
+                        handler => roadrunner_echo_headers_handler,
                         middlewares => [fun roadrunner_test_middlewares:tag_request/2]
-                    }}
+                    }
                 ]
             }),
             roadrunner_listener:port(mw_test_combo)

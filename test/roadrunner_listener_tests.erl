@@ -574,6 +574,37 @@ reload_routes_swaps_dispatch_table_test_() ->
             end}
         end}.
 
+reload_routes_rebakes_listener_middlewares_test_() ->
+    %% reload_routes/2 must re-bake the listener's `middlewares` opt
+    %% onto the new route cfg. Regression guard for `do_reload_routes/2`
+    %% accidentally passing `[]` instead of the real `ListenerMws` from
+    %% proto_opts — that would silently strip listener-level
+    %% middlewares on reloaded routes.
+    {setup,
+        fun() ->
+            ensure_pg_started(),
+            Name = listener_test_reload_listener_mws,
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                middlewares => [fun roadrunner_test_middlewares:wrap_response/2],
+                routes => [{~"/old", roadrunner_hello_handler, undefined}]
+            }),
+            {Name, roadrunner_listener:port(Name)}
+        end,
+        fun({Name, _Port}) -> ok = roadrunner_listener:stop(Name) end, fun({Name, Port}) ->
+            {"listener middleware survives reload_routes/2 onto the new routes", fun() ->
+                Reply1 = http_get_close(Port, ~"/old"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply1),
+                {match, _} = re:run(Reply1, ~"x-wrapped: yes", [caseless]),
+                ok = roadrunner_listener:reload_routes(
+                    Name, [{~"/new", roadrunner_hello_handler, undefined}]
+                ),
+                Reply2 = http_get_close(Port, ~"/new"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply2),
+                {match, _} = re:run(Reply2, ~"x-wrapped: yes", [caseless])
+            end}
+        end}.
+
 reload_routes_on_handler_listener_returns_no_routes_error_test() ->
     Name = listener_test_reload_no_routes,
     {ok, _} = roadrunner_listener:start_link(Name, #{
@@ -598,6 +629,65 @@ routes_persistent_term_erased_on_listener_stop_test() ->
     ok = roadrunner_listener:stop(Name),
     %% Stopping the listener erases it.
     ?assertException(error, badarg, persistent_term:get({roadrunner_routes, Name})).
+
+single_handler_tuple_form_threads_state_test_() ->
+    {setup,
+        fun() ->
+            Name = listener_test_single_handler_state,
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                routes => {roadrunner_state_echo_handler, #{greeting => ~"hi"}}
+            }),
+            {Name, roadrunner_listener:port(Name)}
+        end,
+        fun({Name, _Port}) -> ok = roadrunner_listener:stop(Name) end, fun({_Name, Port}) ->
+            {"routes => {Mod, State} surfaces State via roadrunner_req:state/1", fun() ->
+                Reply = http_get_close(Port, ~"/"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                [_Head, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(#{greeting => ~"hi"}, binary_to_term(Body))
+            end}
+        end}.
+
+single_handler_map_form_threads_state_test_() ->
+    {setup,
+        fun() ->
+            Name = listener_test_single_handler_map,
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                routes => #{
+                    handler => roadrunner_state_echo_handler,
+                    state => #{greeting => ~"map"}
+                }
+            }),
+            {Name, roadrunner_listener:port(Name)}
+        end,
+        fun({Name, _Port}) -> ok = roadrunner_listener:stop(Name) end, fun({_Name, Port}) ->
+            {"routes => #{handler, state, ...} surfaces state via roadrunner_req:state/1", fun() ->
+                Reply = http_get_close(Port, ~"/"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                [_Head, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(#{greeting => ~"map"}, binary_to_term(Body))
+            end}
+        end}.
+
+single_handler_bare_atom_form_yields_undefined_state_test_() ->
+    {setup,
+        fun() ->
+            Name = listener_test_single_handler_no_state,
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0, routes => roadrunner_state_echo_handler
+            }),
+            {Name, roadrunner_listener:port(Name)}
+        end,
+        fun({Name, _Port}) -> ok = roadrunner_listener:stop(Name) end, fun({_Name, Port}) ->
+            {"routes => Mod leaves state/1 as undefined", fun() ->
+                Reply = http_get_close(Port, ~"/"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                [_Head, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(undefined, binary_to_term(Body))
+            end}
+        end}.
 
 listener_without_routes_opt_falls_back_to_default_handler_test() ->
     Name = listener_test_default_handler_fallback,
