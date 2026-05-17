@@ -75,10 +75,11 @@ init(ConnPid, StreamId, Req, ProtoOpts) ->
 
 run_handler(ConnPid, StreamId, Req, ProtoOpts) ->
     %% `dispatch` is set by listener init and always present. The
-    %% matched route's `Cfg.pipeline` is a pre-composed `next()` fun
-    %% (listener mws ++ per-route mws ending in `fun Handler:handle/1`),
-    %% built once at compile / `reload_routes/2` time — we just call
-    %% it with the request, no per-request closure allocation.
+    %% matched route's `Pipeline` is a pre-composed `next()` fun
+    %% (listener mws ++ per-route mws, with `state` injected up front
+    %% if attached, ending in `fun Handler:handle/1`), built once at
+    %% compile / `reload_routes/2` time — we just call it with the
+    %% request, no per-request closure allocation.
     #{dispatch := Dispatch} = ProtoOpts,
     Metadata = telemetry_metadata(Req),
     ReqStart = roadrunner_telemetry:request_start(Metadata),
