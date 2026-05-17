@@ -48,7 +48,7 @@ care which protocol delivered the bytes.
     %% it directly to avoid re-lowercasing header values per request.
     %% Handlers should ignore this field — it's absent on h2 requests
     %% and on manually-built request maps.
-    cached_decisions => roadrunner_http1:cached_decisions(),
+    cached_decisions => term(),
     %% Body is set by `roadrunner_conn` before the handler is
     %% invoked. Auto mode delivers the full body as `iodata()` (an
     %% iolist of recv chunks for multi-chunk bodies, a single binary
@@ -79,7 +79,7 @@ care which protocol delivered the bytes.
     %% `body_buffering => manual` mode. Threaded through
     %% `roadrunner_req:read_body/1,2`. Never present in `auto` mode
     %% or in manually-constructed request maps.
-    body_reader => roadrunner_conn:body_reader(),
+    body_reader => term(),
     %% Per-request correlation token attached by `roadrunner_conn`
     %% once the headers parse. 16 lowercase hex chars (8 bytes of
     %% CSPRNG output). Mirrored into `logger:set_process_metadata/1`
