@@ -120,7 +120,7 @@
     header_fragment := binary(),
     end_headers := boolean(),
     end_stream_seen := boolean(),
-    headers := undefined | [roadrunner_http2_hpack:header()],
+    headers := undefined | roadrunner_http:headers(),
     body := iolist(),
     %% Cumulative byte count of received DATA payload, used to
     %% validate against the request's `content-length` header at

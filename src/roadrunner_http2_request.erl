@@ -62,7 +62,7 @@ read it via `roadrunner_req:header/2` still work.
 for header-only requests). Stored on the request map as `iodata()`;
 handlers requiring a flat binary call `iolist_to_binary/1` themselves.
 """.
--spec from_headers([roadrunner_http2_hpack:header()], iodata(), conn_info()) ->
+-spec from_headers(roadrunner_http:headers(), iodata(), conn_info()) ->
     {ok, roadrunner_req:request()} | {error, build_error()}.
 from_headers(Headers, Body, ConnInfo) ->
     maybe
@@ -85,13 +85,13 @@ from_headers(Headers, Body, ConnInfo) ->
 %% which body-recurses the rest. Splitting the two phases avoids
 %% the prior shape's double recursion (cons-forward AND cons-back
 %% on every regular header).
--spec partition([roadrunner_http2_hpack:header()]) ->
-    {ok, map(), [roadrunner_http2_hpack:header()]} | {error, build_error()}.
+-spec partition(roadrunner_http:headers()) ->
+    {ok, map(), roadrunner_http:headers()} | {error, build_error()}.
 partition(Headers) ->
     partition(Headers, #{}).
 
--spec partition([roadrunner_http2_hpack:header()], map()) ->
-    {ok, map(), [roadrunner_http2_hpack:header()]} | {error, build_error()}.
+-spec partition(roadrunner_http:headers(), map()) ->
+    {ok, map(), roadrunner_http:headers()} | {error, build_error()}.
 partition([], Pseudo) ->
     {ok, Pseudo, []};
 partition([{<<":", _/binary>> = Name, Value} | Rest], Pseudo) ->
@@ -116,8 +116,8 @@ partition([H | Rest], Pseudo) ->
 
 %% Body-recurse the regular-header tail. A pseudo-header arriving
 %% here is RFC 9113 §8.1.2.1 PROTOCOL_ERROR.
--spec partition_regular([roadrunner_http2_hpack:header()]) ->
-    {ok, [roadrunner_http2_hpack:header()]} | {error, build_error()}.
+-spec partition_regular(roadrunner_http:headers()) ->
+    {ok, roadrunner_http:headers()} | {error, build_error()}.
 partition_regular([]) ->
     {ok, []};
 partition_regular([{<<":", _/binary>>, _} | _]) ->
@@ -150,7 +150,7 @@ validate_pseudo(Pseudo) ->
 %% keeps the hot path branch-friendly: the BEAM compiles the
 %% literal-binary clauses to a hash/select, no `lists:member`
 %% function call per header.
--spec check_banned([roadrunner_http2_hpack:header()]) ->
+-spec check_banned(roadrunner_http:headers()) ->
     ok | {error, connection_specific_header}.
 check_banned([]) -> ok;
 check_banned([{~"connection", _} | _]) -> {error, connection_specific_header};
@@ -166,7 +166,7 @@ check_banned([_ | Rest]) -> check_banned(Rest).
     binary(),
     binary(),
     binary() | undefined,
-    [roadrunner_http2_hpack:header()],
+    roadrunner_http:headers(),
     binary(),
     map()
 ) -> roadrunner_req:request().
