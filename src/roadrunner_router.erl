@@ -42,7 +42,7 @@ swapping to a trie/DAG later is a non-breaking change for callers.
 
 -export([compile/2, match/2]).
 
--export_type([route/0, routes/0, route_cfg/0, compiled/0, bindings/0]).
+-export_type([route/0, routes/0, compiled/0, bindings/0]).
 
 -doc """
 A single route entry. Three shapes are accepted:
@@ -68,21 +68,6 @@ to the handler via `roadrunner_req:state/1`; unset → `undefined`.
         middlewares => roadrunner_middleware:middleware_list()
     }.
 
--doc """
-Per-route configuration map carried alongside the matched handler.
-The 4th element of `match/2`'s `{ok, ...}` return.
-
-- `state` mirrors what the route entry attached (`undefined` when
-  the route used the 2-tuple shorthand).
-- `middlewares`, when present, is the **pre-baked** combined list:
-  `compile/2`'s `ListenerMws` argument prepended onto the route's
-  own list. Absent when both are empty.
-""".
--type route_cfg() :: #{
-    state => term(),
-    middlewares => roadrunner_middleware:middleware_list()
-}.
-
 -doc "An ordered list of routes; matched first-to-last.".
 -type routes() :: [route()].
 
@@ -102,7 +87,7 @@ remaining path segments
 The compiled-routes representation `match/2` consumes. Treat as
 opaque: the shape is an implementation detail and may change.
 """.
--opaque compiled() :: [{[segment()], module(), route_cfg()}].
+-opaque compiled() :: [{[segment()], module(), roadrunner_middleware:next(), term()}].
 
 -doc """
 Compile a list of routes into the lookup form `match/2` expects.
@@ -111,37 +96,48 @@ Each path is split on `/` (empty leading/trailing segments dropped),
 and segments starting with `:` are recorded as named captures.
 
 `ListenerMws` is the listener-wide middleware list; it is prepended
-to each route's own `middlewares` so the conn loop reads the full
-pipeline straight from the matched route's cfg — no per-request
-concatenation. Pass `[]` when compiling routes outside a listener
-(typically only in tests).
+to each route's own `middlewares` and composed once into a single
+`next()` fun (with any per-route `state` injected before middlewares
+run). The conn loop calls that fun straight with the request —
+zero closure allocations per request. Pass `[]` for `ListenerMws`
+when compiling routes outside a listener (typically only in tests).
 """.
 -spec compile(routes(), roadrunner_middleware:middleware_list()) -> compiled().
 compile(Routes, ListenerMws) when is_list(Routes), is_list(ListenerMws) ->
     [compile_route(R, ListenerMws) || R <- Routes].
 
 -spec compile_route(route(), roadrunner_middleware:middleware_list()) ->
-    {[segment()], module(), route_cfg()}.
+    {[segment()], module(), roadrunner_middleware:next(), term()}.
 compile_route({Path, Handler}, ListenerMws) when is_binary(Path), is_atom(Handler) ->
-    {compile_path(Path), Handler, with_listener_mws(#{}, ListenerMws)};
+    {
+        compile_path(Path),
+        Handler,
+        roadrunner_middleware:compile_pipeline(ListenerMws, Handler, no_state),
+        undefined
+    };
 compile_route({Path, Handler, State}, ListenerMws) when is_binary(Path), is_atom(Handler) ->
-    {compile_path(Path), Handler, with_listener_mws(#{state => State}, ListenerMws)};
+    {
+        compile_path(Path),
+        Handler,
+        roadrunner_middleware:compile_pipeline(ListenerMws, Handler, {state, State}),
+        State
+    };
 compile_route(#{path := Path, handler := Handler} = Route, ListenerMws) when
     is_binary(Path), is_atom(Handler)
 ->
-    Cfg = maps:without([path, handler], Route),
-    {compile_path(Path), Handler, with_listener_mws(Cfg, ListenerMws)}.
-
-%% Bake listener-level mws onto the per-route cfg's `middlewares` key
-%% so the conn loop reads the full pipeline directly. Omit the key
-%% entirely when the combined list is empty to preserve the no-mws
-%% fast path (`build_pipeline([], Handler)` returns the bare
-%% `fun Handler:handle/1`).
--spec with_listener_mws(route_cfg(), roadrunner_middleware:middleware_list()) -> route_cfg().
-with_listener_mws(Cfg, []) ->
-    Cfg;
-with_listener_mws(Cfg, ListenerMws) ->
-    Cfg#{middlewares => ListenerMws ++ maps:get(middlewares, Cfg, [])}.
+    RouteMws = maps:get(middlewares, Route, []),
+    Mws = ListenerMws ++ RouteMws,
+    {StateArg, StateValue} =
+        case Route of
+            #{state := S} -> {{state, S}, S};
+            _ -> {no_state, undefined}
+        end,
+    {
+        compile_path(Path),
+        Handler,
+        roadrunner_middleware:compile_pipeline(Mws, Handler, StateArg),
+        StateValue
+    }.
 
 -spec compile_path(binary()) -> [segment()].
 compile_path(Path) ->
@@ -155,25 +151,30 @@ compile_segment(Lit) -> {literal, Lit}.
 -doc """
 Look up the handler for a given request path.
 
-Returns `{ok, Handler, Bindings, RouteCfg}` on a match — `Bindings`
-is a map populated with captures from `:param` segments (empty for
-purely literal routes); `RouteCfg` is the per-route configuration
-map produced at compile time. See `t:route_cfg/0` for its shape.
-Returns `not_found` when no compiled route matches.
+Returns `{ok, Handler, Bindings, Pipeline, State}` on a match —
+`Bindings` is a map populated with captures from `:param` segments
+(empty for purely literal routes); `Pipeline` is the pre-composed
+`next()` fun built at compile time (listener mws ++ per-route mws,
+optionally wrapped in a state-injecting outermost closure, ending in
+`fun Handler:handle/1`); `State` is the per-route opaque state
+attached by the user at compile time (or `undefined` when the route
+shape didn't carry any). The conn loop just calls `Pipeline` —
+`State` is for callers who need to introspect a route outside the
+request flow. Returns `not_found` when no compiled route matches.
 """.
 -spec match(Path :: binary(), compiled()) ->
-    {ok, module(), bindings(), route_cfg()} | not_found.
+    {ok, module(), bindings(), roadrunner_middleware:next(), term()} | not_found.
 match(Path, Compiled) when is_binary(Path), is_list(Compiled) ->
     Segments = path_segments(Path),
     match_first(Segments, Compiled).
 
 -spec match_first([binary()], compiled()) ->
-    {ok, module(), bindings(), route_cfg()} | not_found.
+    {ok, module(), bindings(), roadrunner_middleware:next(), term()} | not_found.
 match_first(_Segments, []) ->
     not_found;
-match_first(Segments, [{Pattern, Handler, Cfg} | Rest]) ->
+match_first(Segments, [{Pattern, Handler, Pipeline, State} | Rest]) ->
     case match_pattern(Pattern, Segments, #{}) of
-        {ok, Bindings} -> {ok, Handler, Bindings, Cfg};
+        {ok, Bindings} -> {ok, Handler, Bindings, Pipeline, State};
         no_match -> match_first(Segments, Rest)
     end.
 

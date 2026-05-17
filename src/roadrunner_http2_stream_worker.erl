@@ -75,17 +75,25 @@ init(ConnPid, StreamId, Req, ProtoOpts) ->
 
 run_handler(ConnPid, StreamId, Req, ProtoOpts) ->
     %% `dispatch` is set by listener init and always present. The
-    %% per-route middleware list (listener-wide ++ per-route) is baked
-    %% into the matched route's `Cfg.middlewares` at compile time, so
-    %% we just read it out — no per-request concat.
+    %% matched route's `Pipeline` is a pre-composed `next()` fun
+    %% (listener mws ++ per-route mws, with `state` injected up front
+    %% if attached, ending in `fun Handler:handle/1`), built once at
+    %% compile / `reload_routes/2` time — we just call it with the
+    %% request, no per-request closure allocation.
     #{dispatch := Dispatch} = ProtoOpts,
     Metadata = telemetry_metadata(Req),
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
-        {ok, Handler, Bindings, Cfg} ->
-            FullReq = roadrunner_conn:thread_route_cfg(Req#{bindings => Bindings}, Cfg),
-            Mws = maps:get(middlewares, Cfg, []),
-            invoke(ConnPid, StreamId, Handler, Mws, FullReq, Metadata, ReqStart);
+        {ok, Handler, Bindings, Pipeline, _State} ->
+            invoke(
+                ConnPid,
+                StreamId,
+                Handler,
+                Pipeline,
+                Req#{bindings => Bindings},
+                Metadata,
+                ReqStart
+            );
         not_found ->
             send_buffered(
                 ConnPid, StreamId, 404, [{~"content-type", ~"text/plain"}], ~"Not Found"
@@ -95,8 +103,7 @@ run_handler(ConnPid, StreamId, Req, ProtoOpts) ->
             })
     end.
 
-invoke(ConnPid, StreamId, Handler, Mws, Req, Metadata, ReqStart) ->
-    Pipeline = roadrunner_middleware:build_pipeline(Mws, Handler),
+invoke(ConnPid, StreamId, Handler, Pipeline, Req, Metadata, ReqStart) ->
     try Pipeline(Req) of
         {Response, _Req2} ->
             emit_handler_response(ConnPid, StreamId, Handler, Response),

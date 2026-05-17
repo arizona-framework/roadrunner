@@ -354,27 +354,30 @@ chunked_recv(Chunks) ->
     end.
 
 %% =============================================================================
-%% resolve_handler/2 — dispatch tag → {ok, Mod, Bindings, RouteCfg}
+%% resolve_handler/2 — dispatch tag → {ok, Mod, Bindings, Pipeline, State}
 %% =============================================================================
 
-resolve_handler_empty_cfg_form_returns_empty_cfg_test() ->
+resolve_handler_passes_pipeline_and_state_through_test() ->
+    %% The handler-form dispatch tag just unpacks: the pre-baked
+    %% pipeline fun comes back as the 4th element and the user's
+    %% attached state as the 5th. Bindings is empty (no router
+    %% involved).
+    Pipeline = fun some_mod:handle/1,
+    State = #{role => admin},
     ?assertEqual(
-        {ok, some_mod, #{}, #{}},
-        roadrunner_conn:resolve_handler({handler, some_mod, #{}}, dummy_req())
+        {ok, some_mod, #{}, Pipeline, State},
+        roadrunner_conn:resolve_handler(
+            {handler, some_mod, Pipeline, State}, dummy_req()
+        )
     ).
 
-resolve_handler_cfg_with_state_test() ->
-    Cfg = #{state => #{greeting => ~"hi"}},
+resolve_handler_returns_undefined_state_for_stateless_handler_test() ->
+    Pipeline = fun some_mod:handle/1,
     ?assertEqual(
-        {ok, some_mod, #{}, Cfg},
-        roadrunner_conn:resolve_handler({handler, some_mod, Cfg}, dummy_req())
-    ).
-
-resolve_handler_cfg_with_state_and_middlewares_test() ->
-    Cfg = #{state => #{role => admin}, middlewares => [auth_mw]},
-    ?assertEqual(
-        {ok, some_mod, #{}, Cfg},
-        roadrunner_conn:resolve_handler({handler, some_mod, Cfg}, dummy_req())
+        {ok, some_mod, #{}, Pipeline, undefined},
+        roadrunner_conn:resolve_handler(
+            {handler, some_mod, Pipeline, undefined}, dummy_req()
+        )
     ).
 
 resolve_handler_router_no_match_returns_not_found_test() ->

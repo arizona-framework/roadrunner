@@ -106,7 +106,7 @@ server_header(Req, Next) ->
 ```
 """.
 
--export([compose/2, build_pipeline/2]).
+-export([compose/2, build_pipeline/2, compile_pipeline/3]).
 -export_type([middleware/0, middleware_list/0, next/0]).
 
 -doc """
@@ -162,25 +162,44 @@ compose([Mw | Rest], Handler) ->
     Inner = compose(Rest, Handler),
     fun(Req) -> apply_one(Mw, Req, Inner) end.
 
-%% Build the per-request handler pipeline from a combined middleware
-%% list (listener-level ++ per-route) and a target handler module.
-%% Callers concat the two lists at the dispatch site; the order is
-%% listener-first so listener middlewares wrap route middlewares wrap
-%% the handler — first in each list runs outermost.
+%% Build the handler pipeline from a combined middleware list
+%% (listener-level ++ per-route) and a target handler module. The
+%% resulting `next()` fun captures only `Mw` and
+%% `fun Handler:handle/1`, both compile-time constants — no request
+%% state — so it's safe to compose once and reuse across every
+%% request that matches the route.
+%%
+%% Called once per route at listener init / `reload_routes/2` time,
+%% from the router compile path (router-form routes) and the
+%% listener's dispatch builder (single-handler dispatch tag). The
+%% resulting `next()` fun lands directly in the compiled route entry
+%% (and the `{handler, Mod, Pipeline, State}` dispatch tag) — no
+%% wrapper map. The conn loops just call it with the request.
 %%
 %% Empty list → returns `fun Handler:handle/1` directly, skipping
 %% `compose/2` to save one closure allocation + one indirection on the
 %% no-mws fast path most production handlers hit.
-%%
-%% Used by both the h1 conn loop (`roadrunner_conn_loop:run_pipeline`)
-%% and the h2 stream worker (`roadrunner_http2_stream_worker:invoke`)
-%% so the dispatch shape stays identical across protocols.
 -doc false.
 -spec build_pipeline(middleware_list(), module()) -> next().
 build_pipeline([], Handler) ->
     fun Handler:handle/1;
 build_pipeline(Mws, Handler) ->
     compose(Mws, fun Handler:handle/1).
+
+%% Compile a per-request pipeline `next()` fun: composes the mws
+%% ending in `fun Handler:handle/1`, optionally wrapped in an
+%% outermost closure that injects `state` onto the request before
+%% middlewares run. Used by `roadrunner_router:compile/2` and
+%% `roadrunner_listener:build_dispatch/2` to pre-bake the full
+%% pipeline at compile / `reload_routes/2` time so the conn loops
+%% don't allocate closures per request.
+-doc false.
+-spec compile_pipeline(middleware_list(), module(), no_state | {state, term()}) -> next().
+compile_pipeline(Mws, Handler, no_state) ->
+    build_pipeline(Mws, Handler);
+compile_pipeline(Mws, Handler, {state, State}) ->
+    Inner = build_pipeline(Mws, Handler),
+    fun(Req) -> Inner(Req#{state => State}) end.
 
 -spec apply_one(middleware(), roadrunner_req:request(), next()) ->
     roadrunner_handler:result().

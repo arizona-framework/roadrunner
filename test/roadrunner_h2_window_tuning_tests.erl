@@ -223,7 +223,8 @@ start_conn(H2Opts) ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_window_test,
-        dispatch => {handler, roadrunner_hello_handler, #{}},
+        dispatch =>
+            {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1, undefined},
         middlewares => [],
         protocols => [http2],
         http2_conn_window => maps:get(conn_window, H2Opts, 65535),

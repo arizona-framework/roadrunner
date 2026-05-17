@@ -312,7 +312,9 @@ concurrent_streams_both_dispatch() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_concurrent_test,
-        dispatch => {handler, roadrunner_h2_test_handler, #{}},
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -374,7 +376,8 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
         client_counter => Counter,
         requests_counter => RequestsCounter,
         listener_name => h2c_dispatch_test,
-        dispatch => {handler, roadrunner_hello_handler, #{}},
+        dispatch =>
+            {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1, undefined},
         middlewares => [],
         max_content_length => 1_048_576,
         request_timeout => 30000,
@@ -423,7 +426,8 @@ plaintext_listener_without_h2c_stays_h1() ->
         client_counter => Counter,
         requests_counter => RequestsCounter,
         listener_name => h1_dispatch_test,
-        dispatch => {handler, roadrunner_hello_handler, #{}},
+        dispatch =>
+            {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1, undefined},
         middlewares => [],
         max_content_length => 1_048_576,
         request_timeout => 30000,
@@ -884,7 +888,8 @@ middleware_chain_runs() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_mw_test,
-        dispatch => {handler, roadrunner_hello_handler, #{}},
+        dispatch =>
+            {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1, undefined},
         middlewares => [Mw]
     },
     Self = self(),
@@ -1535,7 +1540,9 @@ rst_during_stream_response_unwinds_worker() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_rst_during_stream,
-        dispatch => {handler, roadrunner_h2_test_handler, #{}},
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -1611,7 +1618,9 @@ drain_refuses_new_streams() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_test,
-        dispatch => {handler, roadrunner_h2_test_handler, #{}},
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -1662,7 +1671,9 @@ drain_with_in_flight_stream_waits() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_inflight_test,
-        dispatch => {handler, roadrunner_h2_test_handler, #{}},
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -1720,7 +1731,9 @@ drain_message_is_idempotent() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_dup_test,
-        dispatch => {handler, roadrunner_h2_test_handler, #{}},
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -1768,7 +1781,9 @@ drain_then_peer_rst_exits_via_frame_loop() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_rst_test,
-        dispatch => {handler, roadrunner_h2_test_handler, #{}},
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -1941,7 +1956,11 @@ run_h2_with_compress_middleware(Path, ExtraHeaders) ->
         client_counter => Counter,
         listener_name => h2_compress_test,
         dispatch =>
-            {handler, roadrunner_h2_test_handler, #{middlewares => [roadrunner_compress]}},
+            {handler, roadrunner_h2_test_handler,
+                roadrunner_middleware:build_pipeline(
+                    [roadrunner_compress], roadrunner_h2_test_handler
+                ),
+                undefined},
         middlewares => [roadrunner_compress]
     },
     Sock = {fake, Self},
@@ -2610,7 +2629,7 @@ post_handshake_handler(Handler) ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_strict_test,
-        dispatch => {handler, Handler, #{}},
+        dispatch => {handler, Handler, fun Handler:handle/1, undefined},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -2732,7 +2751,8 @@ start_http2_conn() ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => http2_test,
-        dispatch => {handler, roadrunner_hello_handler, #{}},
+        dispatch =>
+            {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1, undefined},
         middlewares => [],
         protocols => [http2],
         http2_conn_window => 65535,
@@ -2853,7 +2873,7 @@ run_h2_request_with_handler(Handler, Path) ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_handler_test,
-        dispatch => {handler, Handler, #{}},
+        dispatch => {handler, Handler, fun Handler:handle/1, undefined},
         middlewares => []
     },
     Sock = {fake, Self},
@@ -2906,7 +2926,9 @@ run_stream_request(Path) ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_stream_test,
-        dispatch => {handler, roadrunner_h2_test_handler, #{}},
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined},
         middlewares => []
     },
     Sock = {fake, Self},
