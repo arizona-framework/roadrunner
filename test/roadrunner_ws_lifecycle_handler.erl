@@ -1,10 +1,10 @@
 -module(roadrunner_ws_lifecycle_handler).
 -moduledoc """
-Test fixture — exports all three callbacks (`init/1`, `handle_frame/2`,
-`handle_info/2`) and dispatches each to the return shape encoded in
-the state map. Lets a single handler module drive every optional-
-callback path in `roadrunner_ws_session_tests` without N tiny fixture
-modules.
+Test fixture — exports all four callbacks (`init/1`, `handle_frame/2`,
+`handle_info/2`, `handle_drain/2`) and dispatches each to the return
+shape encoded in the state map. Lets a single handler module drive
+every optional-callback path in `roadrunner_ws_session_tests` without
+N tiny fixture modules.
 
 Usage: pass a state map of the form
 
@@ -12,7 +12,8 @@ Usage: pass a state map of the form
         on_init  => Action,  % optional, defaults to `ok`
         on_frame => Action,  % optional, defaults to `ok`
         on_info  => Action,  % optional, defaults to `ok`
-        sink     => SinkPid  % optional — receives `{event, init|frame|info}`
+        on_drain => Action,  % optional, defaults to `ok`
+        sink     => SinkPid  % optional — receives `{event, init|frame|info|drain}`
                              % so tests can confirm a callback ran
     }
 
@@ -28,7 +29,7 @@ Usage: pass a state map of the form
 
 -behaviour(roadrunner_ws_handler).
 
--export([init/1, handle_frame/2, handle_info/2]).
+-export([init/1, handle_frame/2, handle_info/2, handle_drain/2]).
 
 -spec init(map()) -> roadrunner_ws_handler:result().
 init(#{on_init := Action} = State) ->
@@ -52,6 +53,14 @@ handle_info(_Msg, #{on_info := Action} = State) ->
     resolve(Action, State);
 handle_info(_Msg, State) ->
     notify(State, info),
+    {ok, State}.
+
+-spec handle_drain(integer(), map()) -> roadrunner_ws_handler:result().
+handle_drain(_Deadline, #{on_drain := Action} = State) ->
+    notify(State, drain),
+    resolve(Action, State);
+handle_drain(_Deadline, State) ->
+    notify(State, drain),
     {ok, State}.
 
 %% --- helpers ---

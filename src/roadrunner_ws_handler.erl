@@ -122,6 +122,27 @@ unknown messages dropped silently.
 """.
 -callback handle_info(Info :: term(), State :: term()) -> result().
 
--optional_callbacks([init/1, handle_info/2]).
+-doc """
+Optional. Fires when the listener broadcasts `{roadrunner_drain,
+Deadline}` (typically during a deploy via
+`roadrunner_listener:drain/2` or `roadrunner_listener:notify_drain/2`).
+The session pid is auto-joined into the listener's pg drain group at
+upgrade time, so every WS session sees the broadcast.
+
+`Deadline` is the integer monotonic-time millisecond after which the
+listener will hard-kill conns that haven't wound down. Handlers can
+subtract `erlang:monotonic_time(millisecond)` to compute remaining
+grace.
+
+Returns the same shape as `handle_frame/2`: push final frames, keep
+the session open, or close gracefully (typically `{close, 1000, ~"",
+NewState}` so the client reconnects to the new server version).
+Handlers that don't export this callback let the session keep
+running until the deadline expires; the listener then sends
+`exit(Pid, shutdown)`.
+""".
+-callback handle_drain(Deadline :: integer(), State :: term()) -> result().
+
+-optional_callbacks([init/1, handle_info/2, handle_drain/2]).
 
 -export_type([opt/0, result/0]).

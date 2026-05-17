@@ -400,6 +400,80 @@ handle_info_callback_close_terminates_session_test() ->
     Sink ! stop.
 
 %% =============================================================================
+%% Drain dispatch (handle_drain/2).
+%% =============================================================================
+
+handle_drain_callback_dispatches_when_exported_test() ->
+    %% Handler exports handle_drain/2 — drain message must reach it and
+    %% produce wire output via the returned reply frames.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_drain => {reply, [{text, ~"draining"}]}},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        []
+    ),
+    Pid ! socket_ready,
+    timer:sleep(20),
+    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 30000},
+    receive
+        {event, drain} -> ok
+    after 200 -> ?assert(false)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"draining")),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+handle_drain_callback_close_terminates_session_test() ->
+    %% Handler returns `{close, 1000, _, _}` from handle_drain — session
+    %% sends a close frame and exits normal. Cleanest production path:
+    %% client reconnects to the new server version.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_drain => {close, 1000, ~"draining"}},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    timer:sleep(20),
+    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 30000},
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> ?assert(false)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 50)),
+    ?assertMatch(<<16#88, _/binary>>, Sent),
+    Sink ! stop.
+
+handle_drain_drops_when_handler_does_not_export_test() ->
+    %% Echo handler exports only handle_frame; no handle_drain. Session
+    %% must drop the drain message silently — handler never sees it
+    %% (not even as a stray info, because drain has dedicated dispatch).
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        []
+    ),
+    Pid ! socket_ready,
+    timer:sleep(20),
+    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 30000},
+    timer:sleep(50),
+    ?assertEqual(<<>>, iolist_to_binary(collect_sends(Tag, 50))),
+    ?assert(is_process_alive(Pid)),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
+%% =============================================================================
 %% Handler-driven close with status code + reason (RFC 6455 §5.5.1).
 %% =============================================================================
 
