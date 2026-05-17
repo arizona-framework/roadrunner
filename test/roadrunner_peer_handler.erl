@@ -9,7 +9,7 @@ populates the peer field for accepted connections.
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Body =
         case roadrunner_req:peer(Req) of

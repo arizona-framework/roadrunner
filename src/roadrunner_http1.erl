@@ -20,7 +20,7 @@
     compute_cached_decisions/1
 ]).
 
--export_type([version/0, headers/0, request/0, status/0, redirect_status/0, cached_decisions/0]).
+-export_type([version/0, headers/0, status/0, redirect_status/0, cached_decisions/0]).
 
 -on_load(init_patterns/0).
 
@@ -47,7 +47,7 @@
 -define(SEMICOLON_KEY, {?MODULE, semicolon_cp}).
 
 %% Re-exported as type aliases from `roadrunner_http` so existing
-%% callers using `roadrunner_http1:request()` / `:headers()` /
+%% callers using `roadrunner_req:request()` / `:headers()` /
 %% `:status()` / `:redirect_status()` / `:version()` keep compiling.
 %% New code calls the shared module directly.
 -type version() :: roadrunner_http:version().
@@ -81,57 +81,6 @@
     %% keymember walk.
     has_host := boolean()
 }.
--type request() :: #{
-    method := binary(),
-    target := binary(),
-    version := version(),
-    headers := headers(),
-    %% Pre-computed decisions for known case-insensitive headers, populated
-    %% by `parse_request/1`. Hot-path consumers (`roadrunner_conn:body_framing/1`,
-    %% `keep_alive_decision/2`, `has_continue_expectation/1`) read these
-    %% instead of re-lowercasing header values per request. Absent for
-    %% manually-built request maps — consumers fall back to the raw
-    %% `headers` list when missing.
-    cached_decisions => cached_decisions(),
-    %% Body is set by `roadrunner_conn` before the handler is invoked. Auto
-    %% mode delivers the full body here as `iodata()` (an iolist of recv
-    %% chunks for multi-chunk bodies, a single binary otherwise) so the conn
-    %% can skip a flatten that many handlers do not need. Handlers that
-    %% require a flat binary call `iolist_to_binary/1` themselves. The parser
-    %% never populates this field; it leaves the buffered body in the
-    %% `Rest` element of `parse_request/1` instead.
-    body => iodata(),
-    %% Bindings captured from `:param` segments by `roadrunner_router`, also set
-    %% by `roadrunner_conn` before dispatch. Empty map when the dispatch is a
-    %% single-handler one (no routing) or the route has no params.
-    bindings => roadrunner_router:bindings(),
-    %% Client TCP peer captured once per connection from `inet:peername/1`.
-    %% `undefined` when the OS call fails (rare; usually socket teardown).
-    peer => {inet:ip_address(), inet:port_number()} | undefined,
-    %% Connection scheme — `http` for plain TCP, `https` for TLS. Set
-    %% once per connection by `roadrunner_conn` from the transport tag.
-    scheme => http | https,
-    %% Per-route handler state attached at compile time via the 3-tuple
-    %% route shape `{Path, Handler, State}` or the map shape's `state` key
-    %% (and the listener's `{Module, State}` single-handler form).
-    %% `undefined` when no state was attached.
-    state => term(),
-    %% Body-read state attached by `roadrunner_conn` in `body_buffering => manual`
-    %% mode. Threaded through `roadrunner_req:read_body/1,2`. Never present in
-    %% `auto` mode or in manually-constructed request maps.
-    body_state => roadrunner_conn:body_state(),
-    %% Per-request correlation token attached by `roadrunner_conn` once the
-    %% headers parse. 16 lowercase hex chars (8 bytes of CSPRNG output).
-    %% Mirrored into `logger:set_process_metadata/1` so any `?LOG_*` call
-    %% from middleware or the handler picks it up automatically.
-    request_id => binary(),
-    %% Registered name of the owning `roadrunner_listener`. Set once per
-    %% conn from `proto_opts.listener_name`. Surfaced in
-    %% `roadrunner_telemetry` event metadata so subscribers can filter by
-    %% listener in multi-listener deployments.
-    listener_name => atom()
-}.
-
 -doc """
 Parse the HTTP/1.1 request line.
 
@@ -624,7 +573,7 @@ Spec deviates from the original plan: the result is a map rather than
 a record, so callers don't need to include a header file.
 """.
 -spec parse_request(binary()) ->
-    {ok, request(), Rest :: binary()}
+    {ok, roadrunner_req:request(), Rest :: binary()}
     | {more, undefined}
     | {error,
         bad_request_line

@@ -27,7 +27,7 @@ peak on the 20 MB upload validator.
 
 -define(CHUNK_LIMIT, 65536).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(#{body := Body} = Req) ->
     ack(iolist_size(Body), Req);
 handle(Req) ->

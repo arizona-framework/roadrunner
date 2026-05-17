@@ -253,7 +253,7 @@ generate_request_id(_Empty) ->
 %% Replaces (not merges) the conn process's logger metadata so a
 %% keep-alive request never inherits the previous request's correlation.
 -doc false.
--spec set_request_logger_metadata(roadrunner_http1:request()) -> ok.
+-spec set_request_logger_metadata(roadrunner_req:request()) -> ok.
 set_request_logger_metadata(#{
     request_id := RequestId,
     method := Method,
@@ -325,7 +325,7 @@ scheme({ssl, _}) -> https;
 scheme({fake, _}) -> http.
 
 -doc false.
--spec resolve_handler(dispatch(), roadrunner_http1:request()) ->
+-spec resolve_handler(dispatch(), roadrunner_req:request()) ->
     {ok, module(), roadrunner_router:bindings(), roadrunner_middleware:next(), term()}
     | not_found.
 resolve_handler({handler, Mod, Pipeline, State}, _Req) ->
@@ -339,7 +339,7 @@ resolve_handler({router, ListenerName}, Req) ->
 
 -doc false.
 -spec read_body(
-    roadrunner_http1:request(),
+    roadrunner_req:request(),
     binary(),
     fun(() -> {ok, binary()} | {error, term()}),
     non_neg_integer()
@@ -376,7 +376,7 @@ read_body(Req, Buffered, RecvFun, MaxCL) ->
 %% see body data the client clearly didn't wait, and the 100 line is
 %% redundant.
 -doc false.
--spec maybe_send_continue(roadrunner_transport:socket(), roadrunner_http1:request(), binary()) ->
+-spec maybe_send_continue(roadrunner_transport:socket(), roadrunner_req:request(), binary()) ->
     ok.
 maybe_send_continue(Socket, Req, Buffered) ->
     case Buffered =:= ~"" andalso has_continue_expectation(Req) of
@@ -387,7 +387,7 @@ maybe_send_continue(Socket, Req, Buffered) ->
             ok
     end.
 
--spec has_continue_expectation(roadrunner_http1:request()) -> boolean().
+-spec has_continue_expectation(roadrunner_req:request()) -> boolean().
 has_continue_expectation(#{cached_decisions := #{expects_continue := EC}}) ->
     EC;
 has_continue_expectation(Req) ->
@@ -417,7 +417,7 @@ make_body_state(Framing, Buffered, Recv, Max) ->
     }.
 
 -doc false.
--spec body_framing(roadrunner_http1:request()) ->
+-spec body_framing(roadrunner_req:request()) ->
     none
     | chunked
     | {content_length, non_neg_integer()}
@@ -553,7 +553,7 @@ read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
 %% forward into the next `reading_request` parse so pipelined
 %% clients get their N+1 request seen.
 -doc false.
--spec drain_body(roadrunner_http1:request()) -> {ok, binary()} | {error, term()}.
+-spec drain_body(roadrunner_req:request()) -> {ok, binary()} | {error, term()}.
 drain_body(#{body_state := BS}) ->
     case consume_body_state(BS, all) of
         {ok, _Bytes, #{buffered := Leftover}} -> {ok, Leftover};
@@ -770,7 +770,7 @@ fill_iolist(Need, Recv) ->
             E
     end.
 
--spec content_length(roadrunner_http1:request()) ->
+-spec content_length(roadrunner_req:request()) ->
     none | {ok, non_neg_integer()} | {error, bad_content_length}.
 content_length(Req) ->
     case roadrunner_req:header(~"content-length", Req) of
@@ -787,7 +787,7 @@ content_length(Req) ->
 
 -doc false.
 -spec parse_loop(binary(), fun(() -> {ok, binary()} | {error, term()})) ->
-    {ok, roadrunner_http1:request(), binary()} | {error, term()}.
+    {ok, roadrunner_req:request(), binary()} | {error, term()}.
 parse_loop(Buf, RecvFun) ->
     case roadrunner_http1:parse_request(Buf) of
         {ok, Req, Rest} ->
@@ -823,7 +823,7 @@ response_kind({_, _, _}) -> buffered.
 %% HTTP/1.0 default close. HTTP/1.1 keep-alive unless either side
 %% set Connection: close.
 -doc false.
--spec keep_alive_decision(roadrunner_http1:request(), roadrunner_http1:headers()) ->
+-spec keep_alive_decision(roadrunner_req:request(), roadrunner_http1:headers()) ->
     keep_alive | close.
 %% Common-case fast path: HTTP/1.1, parser-cached request `Connection`
 %% empty, response has no `connection` header → `keep_alive` directly.
@@ -843,7 +843,7 @@ keep_alive_decision(
 keep_alive_decision(Req, RespHeaders) ->
     keep_alive_decision_full(Req, RespHeaders).
 
--spec keep_alive_decision_full(roadrunner_http1:request(), roadrunner_http1:headers()) ->
+-spec keep_alive_decision_full(roadrunner_req:request(), roadrunner_http1:headers()) ->
     keep_alive | close.
 keep_alive_decision_full(Req, RespHeaders) ->
     ReqConn = req_connection_lower(Req),
@@ -876,7 +876,7 @@ keep_alive_decision_full(Req, RespHeaders) ->
 %% Returns the request's `Connection` header value, lowercased. Reads from
 %% `cached_decisions` when present (parser populates it once per request)
 %% and falls back to a per-call lowercase for manually-built request maps.
--spec req_connection_lower(roadrunner_http1:request()) -> binary().
+-spec req_connection_lower(roadrunner_req:request()) -> binary().
 req_connection_lower(#{cached_decisions := #{connection_lower := V}}) ->
     V;
 req_connection_lower(Req) ->

@@ -19,7 +19,7 @@ The compress middleware (configured at the listener level) adds
 
 -define(BODY_KEY, {?MODULE, body}).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Body = persistent_term:get(?BODY_KEY),
     Resp =

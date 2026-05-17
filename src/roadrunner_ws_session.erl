@@ -146,7 +146,7 @@ socket. Returns `ok` once the session has ended (or the
 handshake check fails — in which case 400 has been sent and
 the gen_statem is never started).
 """.
--spec run(roadrunner_transport:socket(), roadrunner_http1:request(), module(), term()) -> ok.
+-spec run(roadrunner_transport:socket(), roadrunner_req:request(), module(), term()) -> ok.
 run(Socket, Req, Mod, State) ->
     case roadrunner_ws:handshake_response(roadrunner_req:headers(Req)) of
         {ok, Status, RespHeaders, _, Negotiated} ->
@@ -166,7 +166,7 @@ run(Socket, Req, Mod, State) ->
 
 -spec run_session(
     roadrunner_transport:socket(),
-    roadrunner_http1:request(),
+    roadrunner_req:request(),
     module(),
     term(),
     iodata(),
@@ -927,7 +927,7 @@ close_payload(Code, Reason) ->
 
 %% --- helpers ---
 
--spec ws_context(roadrunner_http1:request(), module()) -> map().
+-spec ws_context(roadrunner_req:request(), module()) -> map().
 ws_context(Req, Mod) ->
     #{
         listener_name => maps:get(listener_name, Req, undefined),

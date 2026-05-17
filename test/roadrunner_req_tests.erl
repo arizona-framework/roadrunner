@@ -3,7 +3,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %% =============================================================================
-%% Pure accessors over a roadrunner_http1:request() map.
+%% Pure accessors over a roadrunner_req:request() map.
 %% =============================================================================
 
 method_test() ->

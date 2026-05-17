@@ -14,7 +14,7 @@ rate-limit interaction — paths with unit coverage but no bench coverage.
 
 -define(CHUNK_LIMIT, 65536).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Final = drain(Req),
     Resp =

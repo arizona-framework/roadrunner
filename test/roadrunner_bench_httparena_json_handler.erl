@@ -29,7 +29,7 @@ size to expect.
 -define(BENCH_COUNT, 50).
 -define(BENCH_MULTIPLIER, 1).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Count = binding_int(~"count", Req, 0),
     M = qs_int(~"m", Req, 1),

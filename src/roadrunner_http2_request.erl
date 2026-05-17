@@ -4,7 +4,7 @@
 %% Build a roadrunner request map from an HTTP/2 HEADERS block
 %% (decoded HPACK header list) per RFC 9113 §8.3.
 %%
-%% The request shape is the same `roadrunner_http1:request()` map
+%% The request shape is the same `roadrunner_req:request()` map
 %% that HTTP/1.1 produces — pseudo-headers (`:method`, `:scheme`,
 %% `:authority`, `:path`) get normalized into the existing `method`
 %% / `scheme` / `target` / regular-header fields so handler code
@@ -52,7 +52,7 @@ Build a request map from a decoded HPACK header list. `ConnInfo`
 carries the per-connection bits the HTTP/1 conn already has —
 peer, scheme (from the TLS tag), listener_name, request_id.
 
-The returned map is `roadrunner_http1:request()` shape with
+The returned map is `roadrunner_req:request()` shape with
 `version => {2, 0}`, `target` set to the `:path` pseudo-header
 value, and `method` set to `:method`. The `:authority`
 pseudo-header is forwarded as a `host` header so handlers that
@@ -63,7 +63,7 @@ for header-only requests). Stored on the request map as `iodata()`;
 handlers requiring a flat binary call `iolist_to_binary/1` themselves.
 """.
 -spec from_headers([roadrunner_http2_hpack:header()], iodata(), conn_info()) ->
-    {ok, roadrunner_http1:request()} | {error, build_error()}.
+    {ok, roadrunner_req:request()} | {error, build_error()}.
 from_headers(Headers, Body, ConnInfo) ->
     maybe
         {ok, Pseudo, Regular} ?= partition(Headers),
@@ -169,7 +169,7 @@ check_banned([_ | Rest]) -> check_banned(Rest).
     [roadrunner_http2_hpack:header()],
     binary(),
     map()
-) -> roadrunner_http1:request().
+) -> roadrunner_req:request().
 build(Method, Path, Authority, Regular, Body, ConnInfo) ->
     %% Forward `:authority` as a `host` header so existing h1
     %% handler code that reads `Host` still works. (RFC 9113

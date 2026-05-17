@@ -9,7 +9,7 @@ size-0 terminator. Used to verify `roadrunner_conn` honors the
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Resp =
         {stream, 200, [{~"content-type", ~"text/plain; charset=utf-8"}], fun(Send) ->

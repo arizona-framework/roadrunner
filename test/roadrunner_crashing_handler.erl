@@ -9,6 +9,6 @@ with 500 instead of leaving the client hanging.
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> no_return().
+-spec handle(roadrunner_req:request()) -> no_return().
 handle(_Req) ->
     error(boom).

@@ -9,7 +9,7 @@ actually reaches the user-supplied handler module.
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Body = ~"custom handler response",
     Resp =

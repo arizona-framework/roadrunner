@@ -10,7 +10,7 @@ response (no `Connection: close`).
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     {ok, _Body, Req2} = roadrunner_req:read_body(Req),
     Resp = {200, [{~"content-length", ~"2"}], ~"ok"},

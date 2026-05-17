@@ -13,7 +13,7 @@ conn must exit cleanly. Covers
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Resp = {200, [{~"content-length", ~"2"}], ~"ok"},
     {Resp, Req}.

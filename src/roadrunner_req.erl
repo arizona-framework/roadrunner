@@ -30,23 +30,65 @@ delivers; optional fields are populated by the framework when
 applicable (e.g. `body` in `body_buffering => auto` mode,
 `bindings` for routed dispatch, `request_id` for telemetry).
 
-The `cached_decisions` and `body_state` fields are framework
-internals — typed as `term()` here because their precise shapes
-are not part of the public contract and can change between releases.
+The same shape flows through both the h1 and h2 paths — h2's
+`roadrunner_http2_request` synthesizes a request matching this
+type from frames + pseudo-headers, so handlers don't have to
+care which protocol delivered the bytes.
 """.
 -type request() :: #{
     method := binary(),
     target := binary(),
     version := version(),
     headers := headers(),
-    cached_decisions => term(),
+    %% Pre-computed decisions for known case-insensitive headers,
+    %% populated by `roadrunner_http1:parse_request/1`. Hot-path
+    %% consumers (`roadrunner_conn:body_framing/1`,
+    %% `keep_alive_decision/2`, `has_continue_expectation/1`) read
+    %% these instead of re-lowercasing header values per request.
+    %% Absent for manually-built request maps — consumers fall back
+    %% to the raw `headers` list when missing.
+    cached_decisions => roadrunner_http1:cached_decisions(),
+    %% Body is set by `roadrunner_conn` before the handler is
+    %% invoked. Auto mode delivers the full body as `iodata()` (an
+    %% iolist of recv chunks for multi-chunk bodies, a single binary
+    %% otherwise) so the conn can skip a flatten that many handlers
+    %% do not need. Handlers that require a flat binary call
+    %% `iolist_to_binary/1` themselves. The parser never populates
+    %% this field; it leaves the buffered body in the `Rest` element
+    %% of `roadrunner_http1:parse_request/1` instead.
     body => iodata(),
+    %% Bindings captured from `:param` segments by
+    %% `roadrunner_router`, set by `roadrunner_conn` before dispatch.
+    %% Empty map for single-handler dispatch or routes with no params.
     bindings => roadrunner_router:bindings(),
+    %% Client TCP peer captured once per connection from
+    %% `inet:peername/1`. `undefined` when the OS call fails (rare;
+    %% usually socket teardown).
     peer => {inet:ip_address(), inet:port_number()} | undefined,
+    %% Connection scheme — `http` for plain TCP, `https` for TLS.
+    %% Set once per connection by `roadrunner_conn` from the
+    %% transport tag.
     scheme => http | https,
+    %% Per-route handler state attached at compile time via the
+    %% 3-tuple route shape `{Path, Handler, State}` or the map
+    %% shape's `state` key (and the listener's `{Module, State}`
+    %% single-handler form). `undefined` when no state was attached.
     state => term(),
-    body_state => term(),
+    %% Body-read state attached by `roadrunner_conn` in
+    %% `body_buffering => manual` mode. Threaded through
+    %% `roadrunner_req:read_body/1,2`. Never present in `auto` mode
+    %% or in manually-constructed request maps.
+    body_state => roadrunner_conn:body_state(),
+    %% Per-request correlation token attached by `roadrunner_conn`
+    %% once the headers parse. 16 lowercase hex chars (8 bytes of
+    %% CSPRNG output). Mirrored into `logger:set_process_metadata/1`
+    %% so any `?LOG_*` call from middleware or the handler picks it
+    %% up automatically.
     request_id => binary(),
+    %% Registered name of the owning `roadrunner_listener`. Set
+    %% once per conn from `proto_opts.listener_name`. Surfaced in
+    %% `roadrunner_telemetry` event metadata so subscribers can
+    %% filter by listener in multi-listener deployments.
     listener_name => atom()
 }.
 

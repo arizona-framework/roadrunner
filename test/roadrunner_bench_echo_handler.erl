@@ -10,7 +10,7 @@ back in the response with `Content-Type: application/octet-stream`.
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(#{body := Body} = Req) ->
     Resp =
         {200,

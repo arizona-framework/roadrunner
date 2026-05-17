@@ -23,7 +23,7 @@ Routes:
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(#{target := ~"/"} = Req) ->
     plain(Req, ~"hello\n", []);
 handle(#{target := ~"/json"} = Req) ->

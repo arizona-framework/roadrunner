@@ -9,7 +9,7 @@ Used to verify router bindings reach the handler via
 
 -export([handle/1]).
 
--spec handle(roadrunner_http1:request()) -> roadrunner_handler:result().
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     Bindings = roadrunner_req:bindings(Req),
     Id = maps:get(~"id", Bindings, ~"<unbound>"),
