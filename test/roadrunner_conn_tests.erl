@@ -357,21 +357,17 @@ chunked_recv(Chunks) ->
 %% resolve_handler/2 — dispatch tag → {ok, Mod, Bindings, RouteCfg}
 %% =============================================================================
 
-resolve_handler_empty_cfg_form_returns_empty_cfg_test() ->
-    ?assertEqual(
-        {ok, some_mod, #{}, #{}},
-        roadrunner_conn:resolve_handler({handler, some_mod, #{}}, dummy_req())
-    ).
-
-resolve_handler_cfg_with_state_test() ->
-    Cfg = #{state => #{greeting => ~"hi"}},
+resolve_handler_passes_cfg_through_test() ->
+    %% The handler-form dispatch tag just unpacks: same cfg comes back
+    %% as the 4th element. Bindings is empty (no router involved).
+    Cfg = #{pipeline => fun some_mod:handle/1},
     ?assertEqual(
         {ok, some_mod, #{}, Cfg},
         roadrunner_conn:resolve_handler({handler, some_mod, Cfg}, dummy_req())
     ).
 
-resolve_handler_cfg_with_state_and_middlewares_test() ->
-    Cfg = #{state => #{role => admin}, middlewares => [auth_mw]},
+resolve_handler_cfg_with_state_test() ->
+    Cfg = #{pipeline => fun some_mod:handle/1, state => #{greeting => ~"hi"}},
     ?assertEqual(
         {ok, some_mod, #{}, Cfg},
         roadrunner_conn:resolve_handler({handler, some_mod, Cfg}, dummy_req())

@@ -162,19 +162,22 @@ compose([Mw | Rest], Handler) ->
     Inner = compose(Rest, Handler),
     fun(Req) -> apply_one(Mw, Req, Inner) end.
 
-%% Build the per-request handler pipeline from a combined middleware
-%% list (listener-level ++ per-route) and a target handler module.
-%% Callers concat the two lists at the dispatch site; the order is
-%% listener-first so listener middlewares wrap route middlewares wrap
-%% the handler — first in each list runs outermost.
+%% Build the handler pipeline from a combined middleware list
+%% (listener-level ++ per-route) and a target handler module. The
+%% resulting `next()` fun captures only `Mw` and
+%% `fun Handler:handle/1`, both compile-time constants — no request
+%% state — so it's safe to compose once and reuse across every
+%% request that matches the route.
+%%
+%% Called once per route at listener init / `reload_routes/2` time,
+%% from the router compile path (router-form routes) and the
+%% listener's dispatch builder (single-handler dispatch tag). The
+%% result is stashed under the `pipeline` key on the route cfg; the
+%% conn loops read it straight out and call it with the request.
 %%
 %% Empty list → returns `fun Handler:handle/1` directly, skipping
 %% `compose/2` to save one closure allocation + one indirection on the
 %% no-mws fast path most production handlers hit.
-%%
-%% Used by both the h1 conn loop (`roadrunner_conn_loop:run_pipeline`)
-%% and the h2 stream worker (`roadrunner_http2_stream_worker:invoke`)
-%% so the dispatch shape stays identical across protocols.
 -doc false.
 -spec build_pipeline(middleware_list(), module()) -> next().
 build_pipeline([], Handler) ->

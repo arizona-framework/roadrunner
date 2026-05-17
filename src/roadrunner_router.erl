@@ -69,18 +69,23 @@ to the handler via `roadrunner_req:state/1`; unset → `undefined`.
     }.
 
 -doc """
-Per-route configuration map carried alongside the matched handler.
-The 4th element of `match/2`'s `{ok, ...}` return.
+Per-route configuration carried alongside the matched handler.
 
-- `state` mirrors what the route entry attached (`undefined` when
-  the route used the 2-tuple shorthand).
-- `middlewares`, when present, is the **pre-baked** combined list:
-  `compile/2`'s `ListenerMws` argument prepended onto the route's
-  own list. Absent when both are empty.
+- `pipeline` is the pre-composed middleware chain ending in
+  `fun Handler:handle/1`. Built once at compile / `reload_routes/2`
+  time from the listener-wide mws prepended onto the route's own
+  mws, so the conn loop calls it with the request and gets the
+  handler result back, zero closure allocations per request. Always
+  present in the 4th element of `match/2`'s `{ok, ...}` return; the
+  `=>` arity covers the pre-compile shape the bake helpers accept as
+  input.
+- `state` mirrors what the route entry attached (absent when the
+  route used the 2-tuple shorthand or the bare-atom single-handler
+  form).
 """.
 -type route_cfg() :: #{
-    state => term(),
-    middlewares => roadrunner_middleware:middleware_list()
+    pipeline => roadrunner_middleware:next(),
+    state => term()
 }.
 
 -doc "An ordered list of routes; matched first-to-last.".
@@ -123,25 +128,23 @@ compile(Routes, ListenerMws) when is_list(Routes), is_list(ListenerMws) ->
 -spec compile_route(route(), roadrunner_middleware:middleware_list()) ->
     {[segment()], module(), route_cfg()}.
 compile_route({Path, Handler}, ListenerMws) when is_binary(Path), is_atom(Handler) ->
-    {compile_path(Path), Handler, with_listener_mws(#{}, ListenerMws)};
+    {compile_path(Path), Handler, base_cfg(Handler, ListenerMws, #{})};
 compile_route({Path, Handler, State}, ListenerMws) when is_binary(Path), is_atom(Handler) ->
-    {compile_path(Path), Handler, with_listener_mws(#{state => State}, ListenerMws)};
+    {compile_path(Path), Handler, base_cfg(Handler, ListenerMws, #{state => State})};
 compile_route(#{path := Path, handler := Handler} = Route, ListenerMws) when
     is_binary(Path), is_atom(Handler)
 ->
-    Cfg = maps:without([path, handler], Route),
-    {compile_path(Path), Handler, with_listener_mws(Cfg, ListenerMws)}.
+    RouteMws = maps:get(middlewares, Route, []),
+    Cfg = maps:without([path, handler, middlewares], Route),
+    {compile_path(Path), Handler, base_cfg(Handler, ListenerMws ++ RouteMws, Cfg)}.
 
-%% Bake listener-level mws onto the per-route cfg's `middlewares` key
-%% so the conn loop reads the full pipeline directly. Omit the key
-%% entirely when the combined list is empty to preserve the no-mws
-%% fast path (`build_pipeline([], Handler)` returns the bare
-%% `fun Handler:handle/1`).
--spec with_listener_mws(route_cfg(), roadrunner_middleware:middleware_list()) -> route_cfg().
-with_listener_mws(Cfg, []) ->
-    Cfg;
-with_listener_mws(Cfg, ListenerMws) ->
-    Cfg#{middlewares => ListenerMws ++ maps:get(middlewares, Cfg, [])}.
+%% Compose the combined mws ending in `fun Handler:handle/1` once and
+%% stash the result under `pipeline` on the cfg. The conn loop reads
+%% the fun and calls it with the request — no per-request closure
+%% allocation, regardless of mws count.
+-spec base_cfg(module(), roadrunner_middleware:middleware_list(), route_cfg()) -> route_cfg().
+base_cfg(Handler, Mws, Cfg) ->
+    Cfg#{pipeline => roadrunner_middleware:build_pipeline(Mws, Handler)}.
 
 -spec compile_path(binary()) -> [segment()].
 compile_path(Path) ->

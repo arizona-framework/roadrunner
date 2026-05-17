@@ -8,11 +8,11 @@
 
 compile_empty_test() ->
     Compiled = roadrunner_router:compile([], []),
-    ?assertEqual(not_found, roadrunner_router:match(~"/", Compiled)).
+    ?assertEqual(not_found, match_no_pipeline(~"/", Compiled)).
 
 match_root_path_test() ->
     Compiled = roadrunner_router:compile([{~"/", home_handler}], []),
-    ?assertEqual({ok, home_handler, #{}, #{}}, roadrunner_router:match(~"/", Compiled)).
+    ?assertEqual({ok, home_handler, #{}, #{}}, match_no_pipeline(~"/", Compiled)).
 
 match_literal_paths_test() ->
     Compiled = roadrunner_router:compile(
@@ -23,18 +23,18 @@ match_literal_paths_test() ->
         ],
         []
     ),
-    ?assertEqual({ok, home_handler, #{}, #{}}, roadrunner_router:match(~"/", Compiled)),
-    ?assertEqual({ok, about_handler, #{}, #{}}, roadrunner_router:match(~"/about", Compiled)),
-    ?assertEqual({ok, users_handler, #{}, #{}}, roadrunner_router:match(~"/users", Compiled)).
+    ?assertEqual({ok, home_handler, #{}, #{}}, match_no_pipeline(~"/", Compiled)),
+    ?assertEqual({ok, about_handler, #{}, #{}}, match_no_pipeline(~"/about", Compiled)),
+    ?assertEqual({ok, users_handler, #{}, #{}}, match_no_pipeline(~"/users", Compiled)).
 
 match_missing_path_returns_not_found_test() ->
     Compiled = roadrunner_router:compile([{~"/", home_handler}], []),
-    ?assertEqual(not_found, roadrunner_router:match(~"/nope", Compiled)).
+    ?assertEqual(not_found, match_no_pipeline(~"/nope", Compiled)).
 
 match_is_case_sensitive_test() ->
     %% Paths are case-sensitive per RFC 3986 — `/About` is not `/about`.
     Compiled = roadrunner_router:compile([{~"/about", about_handler}], []),
-    ?assertEqual(not_found, roadrunner_router:match(~"/About", Compiled)).
+    ?assertEqual(not_found, match_no_pipeline(~"/About", Compiled)).
 
 %% =============================================================================
 %% Parameterized segments
@@ -44,27 +44,27 @@ match_single_param_test() ->
     Compiled = roadrunner_router:compile([{~"/users/:id", users_handler}], []),
     ?assertEqual(
         {ok, users_handler, #{~"id" => ~"42"}, #{}},
-        roadrunner_router:match(~"/users/42", Compiled)
+        match_no_pipeline(~"/users/42", Compiled)
     ).
 
 match_multiple_params_test() ->
     Compiled = roadrunner_router:compile([{~"/users/:id/posts/:post_id", post_handler}], []),
     ?assertEqual(
         {ok, post_handler, #{~"id" => ~"42", ~"post_id" => ~"7"}, #{}},
-        roadrunner_router:match(~"/users/42/posts/7", Compiled)
+        match_no_pipeline(~"/users/42/posts/7", Compiled)
     ).
 
 match_too_few_segments_test() ->
     Compiled = roadrunner_router:compile([{~"/users/:id", users_handler}], []),
-    ?assertEqual(not_found, roadrunner_router:match(~"/users", Compiled)).
+    ?assertEqual(not_found, match_no_pipeline(~"/users", Compiled)).
 
 match_too_many_segments_test() ->
     Compiled = roadrunner_router:compile([{~"/users/:id", users_handler}], []),
-    ?assertEqual(not_found, roadrunner_router:match(~"/users/42/extra", Compiled)).
+    ?assertEqual(not_found, match_no_pipeline(~"/users/42/extra", Compiled)).
 
 match_wrong_literal_segment_test() ->
     Compiled = roadrunner_router:compile([{~"/users/:id", users_handler}], []),
-    ?assertEqual(not_found, roadrunner_router:match(~"/posts/42", Compiled)).
+    ?assertEqual(not_found, match_no_pipeline(~"/posts/42", Compiled)).
 
 match_first_route_wins_test() ->
     %% Earlier routes are tried first — a literal entry shadows a wildcard
@@ -78,11 +78,11 @@ match_first_route_wins_test() ->
     ),
     ?assertEqual(
         {ok, me_handler, #{}, #{}},
-        roadrunner_router:match(~"/users/me", Compiled)
+        match_no_pipeline(~"/users/me", Compiled)
     ),
     ?assertEqual(
         {ok, users_handler, #{~"id" => ~"42"}, #{}},
-        roadrunner_router:match(~"/users/42", Compiled)
+        match_no_pipeline(~"/users/42", Compiled)
     ).
 
 %% =============================================================================
@@ -93,14 +93,14 @@ match_wildcard_captures_remainder_test() ->
     Compiled = roadrunner_router:compile([{~"/static/*path", static_handler}], []),
     ?assertEqual(
         {ok, static_handler, #{~"path" => [~"css", ~"main.css"]}, #{}},
-        roadrunner_router:match(~"/static/css/main.css", Compiled)
+        match_no_pipeline(~"/static/css/main.css", Compiled)
     ).
 
 match_wildcard_captures_single_segment_test() ->
     Compiled = roadrunner_router:compile([{~"/static/*path", static_handler}], []),
     ?assertEqual(
         {ok, static_handler, #{~"path" => [~"file.txt"]}, #{}},
-        roadrunner_router:match(~"/static/file.txt", Compiled)
+        match_no_pipeline(~"/static/file.txt", Compiled)
     ).
 
 match_wildcard_captures_empty_remainder_test() ->
@@ -109,18 +109,18 @@ match_wildcard_captures_empty_remainder_test() ->
     Compiled = roadrunner_router:compile([{~"/static/*path", static_handler}], []),
     ?assertEqual(
         {ok, static_handler, #{~"path" => []}, #{}},
-        roadrunner_router:match(~"/static", Compiled)
+        match_no_pipeline(~"/static", Compiled)
     ).
 
 match_root_wildcard_test() ->
     Compiled = roadrunner_router:compile([{~"/*all", catchall_handler}], []),
     ?assertEqual(
         {ok, catchall_handler, #{~"all" => [~"a", ~"b", ~"c"]}, #{}},
-        roadrunner_router:match(~"/a/b/c", Compiled)
+        match_no_pipeline(~"/a/b/c", Compiled)
     ),
     ?assertEqual(
         {ok, catchall_handler, #{~"all" => []}, #{}},
-        roadrunner_router:match(~"/", Compiled)
+        match_no_pipeline(~"/", Compiled)
     ).
 
 match_route_with_state_test() ->
@@ -134,7 +134,7 @@ match_route_with_state_test() ->
     ),
     ?assertEqual(
         {ok, static_handler, #{~"path" => [~"a.css"]}, #{state => #{dir => ~"/var/www"}}},
-        roadrunner_router:match(~"/static/a.css", Compiled)
+        match_no_pipeline(~"/static/a.css", Compiled)
     ).
 
 match_two_tuple_route_returns_empty_cfg_test() ->
@@ -142,14 +142,14 @@ match_two_tuple_route_returns_empty_cfg_test() ->
     Compiled = roadrunner_router:compile([{~"/", home_handler}], []),
     ?assertEqual(
         {ok, home_handler, #{}, #{}},
-        roadrunner_router:match(~"/", Compiled)
+        match_no_pipeline(~"/", Compiled)
     ).
 
 match_two_tuple_with_params_test() ->
     Compiled = roadrunner_router:compile([{~"/users/:id", users_handler}], []),
     ?assertEqual(
         {ok, users_handler, #{~"id" => ~"42"}, #{}},
-        roadrunner_router:match(~"/users/42", Compiled)
+        match_no_pipeline(~"/users/42", Compiled)
     ).
 
 match_mixed_two_and_three_tuple_routes_test() ->
@@ -162,11 +162,11 @@ match_mixed_two_and_three_tuple_routes_test() ->
     ),
     ?assertEqual(
         {ok, home_handler, #{}, #{}},
-        roadrunner_router:match(~"/", Compiled)
+        match_no_pipeline(~"/", Compiled)
     ),
     ?assertEqual(
         {ok, static_handler, #{~"path" => [~"a.css"]}, #{state => #{dir => ~"/var/www"}}},
-        roadrunner_router:match(~"/static/a.css", Compiled)
+        match_no_pipeline(~"/static/a.css", Compiled)
     ).
 
 %% =============================================================================
@@ -183,7 +183,7 @@ match_map_route_minimum_test() ->
     ),
     ?assertEqual(
         {ok, home_handler, #{}, #{}},
-        roadrunner_router:match(~"/", Compiled)
+        match_no_pipeline(~"/", Compiled)
     ).
 
 match_map_route_with_state_test() ->
@@ -195,10 +195,13 @@ match_map_route_with_state_test() ->
     ),
     ?assertEqual(
         {ok, users_handler, #{~"id" => ~"42"}, #{state => #{role => admin}}},
-        roadrunner_router:match(~"/users/42", Compiled)
+        match_no_pipeline(~"/users/42", Compiled)
     ).
 
 match_map_route_with_middlewares_test() ->
+    %% Map-form route with middlewares: cfg carries `pipeline` post-compile;
+    %% the per-route mws are baked into it. Behavior (mws actually fire) is
+    %% covered end-to-end in `roadrunner_middleware_tests`.
     Compiled = roadrunner_router:compile(
         [
             #{path => ~"/admin/*p", handler => admin_handler, middlewares => [auth_mw, log_mw]}
@@ -206,8 +209,8 @@ match_map_route_with_middlewares_test() ->
         []
     ),
     ?assertEqual(
-        {ok, admin_handler, #{~"p" => [~"x"]}, #{middlewares => [auth_mw, log_mw]}},
-        roadrunner_router:match(~"/admin/x", Compiled)
+        {ok, admin_handler, #{~"p" => [~"x"]}, #{}},
+        match_no_pipeline(~"/admin/x", Compiled)
     ).
 
 match_map_route_with_state_and_middlewares_test() ->
@@ -223,14 +226,12 @@ match_map_route_with_state_and_middlewares_test() ->
         []
     ),
     ?assertEqual(
-        {ok, api_handler, #{~"resource" => ~"users"}, #{
-            state => #{db => primary}, middlewares => [auth_mw]
-        }},
-        roadrunner_router:match(~"/api/users", Compiled)
+        {ok, api_handler, #{~"resource" => ~"users"}, #{state => #{db => primary}}},
+        match_no_pipeline(~"/api/users", Compiled)
     ).
 
 match_mixed_tuple_and_map_routes_test() ->
-    %% Tuple and map entries coexist; each carries its own cfg map.
+    %% Tuple and map entries coexist; each carries its own cfg.
     Compiled = roadrunner_router:compile(
         [
             {~"/", home_handler},
@@ -241,15 +242,15 @@ match_mixed_tuple_and_map_routes_test() ->
     ),
     ?assertEqual(
         {ok, home_handler, #{}, #{}},
-        roadrunner_router:match(~"/", Compiled)
+        match_no_pipeline(~"/", Compiled)
     ),
     ?assertEqual(
         {ok, about_handler, #{}, #{state => ~"hello"}},
-        roadrunner_router:match(~"/about", Compiled)
+        match_no_pipeline(~"/about", Compiled)
     ),
     ?assertEqual(
-        {ok, api_handler, #{~"p" => [~"users"]}, #{middlewares => [auth_mw]}},
-        roadrunner_router:match(~"/api/users", Compiled)
+        {ok, api_handler, #{~"p" => [~"users"]}, #{}},
+        match_no_pipeline(~"/api/users", Compiled)
     ).
 
 match_wildcard_not_last_falls_through_test() ->
@@ -264,7 +265,7 @@ match_wildcard_not_last_falls_through_test() ->
     ),
     ?assertEqual(
         {ok, normal_handler, #{~"rest" => [~"x", ~"y"]}, #{}},
-        roadrunner_router:match(~"/foo/x/y", Compiled)
+        match_no_pipeline(~"/foo/x/y", Compiled)
     ).
 
 %% =============================================================================
@@ -277,20 +278,20 @@ match_double_slash_collapses_to_single_test() ->
     Compiled = roadrunner_router:compile([{~"/users/:id", users_handler}], []),
     ?assertEqual(
         {ok, users_handler, #{~"id" => ~"42"}, #{}},
-        roadrunner_router:match(~"/users//42", Compiled)
+        match_no_pipeline(~"/users//42", Compiled)
     ).
 
 match_trailing_slash_treated_as_no_slash_test() ->
     Compiled = roadrunner_router:compile([{~"/about", about_handler}], []),
     ?assertEqual(
         {ok, about_handler, #{}, #{}},
-        roadrunner_router:match(~"/about/", Compiled)
+        match_no_pipeline(~"/about/", Compiled)
     ).
 
 match_empty_path_matches_root_route_test() ->
     %% `<<>>` and `<<"/">>` both produce zero segments — equivalent.
     Compiled = roadrunner_router:compile([{~"/", home_handler}], []),
-    ?assertEqual({ok, home_handler, #{}, #{}}, roadrunner_router:match(~"", Compiled)).
+    ?assertEqual({ok, home_handler, #{}, #{}}, match_no_pipeline(~"", Compiled)).
 
 match_param_captures_percent_encoded_segment_test() ->
     %% Router does not percent-decode — handlers see the raw segment.
@@ -298,7 +299,7 @@ match_param_captures_percent_encoded_segment_test() ->
     Compiled = roadrunner_router:compile([{~"/users/:id", users_handler}], []),
     ?assertEqual(
         {ok, users_handler, #{~"id" => ~"joe%20bob"}, #{}},
-        roadrunner_router:match(~"/users/joe%20bob", Compiled)
+        match_no_pipeline(~"/users/joe%20bob", Compiled)
     ).
 
 match_param_with_special_chars_in_segment_test() ->
@@ -307,7 +308,7 @@ match_param_with_special_chars_in_segment_test() ->
     Compiled = roadrunner_router:compile([{~"/users/:id", users_handler}], []),
     ?assertEqual(
         {ok, users_handler, #{~"id" => ~":star*dot."}, #{}},
-        roadrunner_router:match(~"/users/:star*dot.", Compiled)
+        match_no_pipeline(~"/users/:star*dot.", Compiled)
     ).
 
 match_route_path_with_only_slashes_test() ->
@@ -316,11 +317,11 @@ match_route_path_with_only_slashes_test() ->
     Compiled = roadrunner_router:compile([{~"////", root_handler}], []),
     ?assertEqual(
         {ok, root_handler, #{}, #{}},
-        roadrunner_router:match(~"/", Compiled)
+        match_no_pipeline(~"/", Compiled)
     ),
     ?assertEqual(
         not_found,
-        roadrunner_router:match(~"/anything", Compiled)
+        match_no_pipeline(~"/anything", Compiled)
     ).
 
 %% =============================================================================
@@ -336,7 +337,7 @@ match_empty_param_name_binds_under_empty_binary_test() ->
     Compiled = roadrunner_router:compile([{~"/:", h}], []),
     ?assertEqual(
         {ok, h, #{<<>> => ~"foo"}, #{}},
-        roadrunner_router:match(~"/foo", Compiled)
+        match_no_pipeline(~"/foo", Compiled)
     ).
 
 match_empty_wildcard_name_binds_remainder_under_empty_binary_test() ->
@@ -344,7 +345,7 @@ match_empty_wildcard_name_binds_remainder_under_empty_binary_test() ->
     Compiled = roadrunner_router:compile([{~"/*", h}], []),
     ?assertEqual(
         {ok, h, #{<<>> => [~"a", ~"b", ~"c"]}, #{}},
-        roadrunner_router:match(~"/a/b/c", Compiled)
+        match_no_pipeline(~"/a/b/c", Compiled)
     ).
 
 match_duplicate_param_names_keep_last_binding_test() ->
@@ -354,7 +355,7 @@ match_duplicate_param_names_keep_last_binding_test() ->
     Compiled = roadrunner_router:compile([{~"/:x/:x", h}], []),
     ?assertEqual(
         {ok, h, #{~"x" => ~"second"}, #{}},
-        roadrunner_router:match(~"/first/second", Compiled)
+        match_no_pipeline(~"/first/second", Compiled)
     ).
 
 match_multiple_wildcards_pattern_does_not_match_test() ->
@@ -363,13 +364,13 @@ match_multiple_wildcards_pattern_does_not_match_test() ->
     %% second is treated as a literal. Document so a future change to
     %% allow nested wildcards is intentional.
     Compiled = roadrunner_router:compile([{~"/*a/*b", h}], []),
-    ?assertEqual(not_found, roadrunner_router:match(~"/x/y/z", Compiled)).
+    ?assertEqual(not_found, match_no_pipeline(~"/x/y/z", Compiled)).
 
 match_wildcard_followed_by_literal_does_not_match_test() ->
     %% Same constraint: anything declared after a wildcard segment is
     %% unreachable.
     Compiled = roadrunner_router:compile([{~"/*tail/post", h}], []),
-    ?assertEqual(not_found, roadrunner_router:match(~"/a/b/post", Compiled)).
+    ?assertEqual(not_found, match_no_pipeline(~"/a/b/post", Compiled)).
 
 match_nul_byte_in_segment_is_captured_raw_test() ->
     %% NUL is just a byte to the router — the request-line parser
@@ -380,7 +381,7 @@ match_nul_byte_in_segment_is_captured_raw_test() ->
     Compiled = roadrunner_router:compile([{~"/admin/:p", h}], []),
     ?assertEqual(
         {ok, h, #{~"p" => <<"sec", 0, "ret">>}, #{}},
-        roadrunner_router:match(<<"/admin/sec", 0, "ret">>, Compiled)
+        match_no_pipeline(<<"/admin/sec", 0, "ret">>, Compiled)
     ).
 
 match_path_without_leading_slash_resolves_same_as_with_test() ->
@@ -389,5 +390,39 @@ match_path_without_leading_slash_resolves_same_as_with_test() ->
     %% `[~"users", ~"joe"]` and match identically.
     Compiled = roadrunner_router:compile([{~"/users/:id", h}], []),
     Expected = {ok, h, #{~"id" => ~"joe"}, #{}},
-    ?assertEqual(Expected, roadrunner_router:match(~"/users/joe", Compiled)),
-    ?assertEqual(Expected, roadrunner_router:match(~"users/joe", Compiled)).
+    ?assertEqual(Expected, match_no_pipeline(~"/users/joe", Compiled)),
+    ?assertEqual(Expected, match_no_pipeline(~"users/joe", Compiled)).
+
+%% =============================================================================
+%% Pipeline shape (the post-compile `pipeline` key)
+%% =============================================================================
+
+compile_sets_pipeline_on_every_cfg_test() ->
+    %% Every compiled route, regardless of shape, carries a callable
+    %% `pipeline` fun. Shape only — behavior is covered by
+    %% `roadrunner_middleware_tests`.
+    Compiled = roadrunner_router:compile(
+        [
+            {~"/", h},
+            {~"/x", h, undefined},
+            #{path => ~"/y", handler => h, middlewares => [auth_mw]}
+        ],
+        []
+    ),
+    [
+        ?assert(is_function(P, 1))
+     || Path <- [~"/", ~"/x", ~"/y"],
+        {ok, _, _, #{pipeline := P}} <- [roadrunner_router:match(Path, Compiled)]
+    ].
+
+%% --- helpers ---
+
+%% Strip the always-present `pipeline` fun from a match result so the
+%% remaining cfg keys can be asserted with `?assertEqual`. The
+%% pipeline itself is funs-are-not-comparable; its behavior is
+%% covered by `roadrunner_middleware_tests`.
+match_no_pipeline(Path, Compiled) ->
+    case roadrunner_router:match(Path, Compiled) of
+        {ok, Mod, Bindings, Cfg} -> {ok, Mod, Bindings, maps:without([pipeline], Cfg)};
+        Other -> Other
+    end.
