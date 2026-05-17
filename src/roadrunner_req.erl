@@ -20,7 +20,7 @@ re-exported alongside it (`headers/0`, `version/0`, `status/0`,
 -define(EQ_CP_KEY, {?MODULE, eq_cp}).
 -define(QUOTE_CP_KEY, {?MODULE, quote_cp}).
 
--export_type([request/0]).
+-export_type([request/0, body_reader/0, cached_decisions/0]).
 
 -doc """
 The parsed request map handlers receive.
@@ -41,13 +41,11 @@ care which protocol delivered the bytes.
     version := version(),
     headers := headers(),
     %% H1-parser internal optimization — handlers should ignore.
-    %% See `t:roadrunner_http1:cached_decisions/0` for the shape.
-    %% Hot-path framework code (`roadrunner_conn:body_framing/1`,
-    %% `keep_alive_decision/2`, `has_continue_expectation/1`) reads
-    %% it directly to avoid re-lowercasing header values per
-    %% request. Absent on h2 requests and on manually-built request
-    %% maps.
-    cached_decisions => roadrunner_http1:cached_decisions(),
+    %% Hot-path conn helpers (`body_framing/1`,
+    %% `keep_alive_decision/2`, `has_continue_expectation/1`) read
+    %% this directly to skip per-request header re-lowercasing.
+    %% Absent on h2 requests and on manually-built request maps.
+    cached_decisions => cached_decisions(),
     %% Body is set by `roadrunner_conn` before the handler is
     %% invoked. Auto mode delivers the full body as `iodata()` (an
     %% iolist of recv chunks for multi-chunk bodies, a single binary
@@ -78,7 +76,7 @@ care which protocol delivered the bytes.
     %% `body_buffering => manual` mode. Threaded through
     %% `roadrunner_req:read_body/1,2`. Never present in `auto` mode
     %% or in manually-constructed request maps.
-    body_reader => roadrunner_conn:body_reader(),
+    body_reader => body_reader(),
     %% Per-request correlation token attached by `roadrunner_conn`
     %% once the headers parse. 16 lowercase hex chars (8 bytes of
     %% CSPRNG output). Mirrored into `logger:set_process_metadata/1`
@@ -94,6 +92,43 @@ care which protocol delivered the bytes.
 
 -type headers() :: roadrunner_http:headers().
 -type version() :: roadrunner_http:version().
+
+-doc """
+Framework-internal h1-parser hot-path optimization carried on the
+request map's `cached_decisions` field. Handlers should ignore both
+the field and this type — they're absent on h2 requests and on
+manually-built request maps. Populated by the h1 parser at
+request-read time and consumed by framework code to skip
+per-request header re-lowercasing on the dispatch hot path.
+""".
+-type cached_decisions() :: #{
+    is_chunked := boolean(),
+    has_transfer_encoding := boolean(),
+    expects_continue := boolean(),
+    connection_lower := binary(),
+    content_length := none | {ok, non_neg_integer()} | {error, bad_content_length},
+    has_host := boolean()
+}.
+
+-doc """
+Body-read envelope attached to the request in `body_buffering =>
+manual` mode. `read_body/1,2` consumes from it; the conn owns the
+recv closure and tracks how much remains.
+
+`pending` holds decoded body bytes that have been parsed off the
+wire but not yet handed to the caller — used for chunked framing
+to absorb a chunk's payload across multiple length-bounded calls.
+`done` flips true once the size-0 last chunk is parsed.
+""".
+-type body_reader() :: #{
+    framing := none | chunked | {content_length, non_neg_integer()},
+    buffered := binary(),
+    bytes_read := non_neg_integer(),
+    pending := binary(),
+    done := boolean(),
+    recv := fun(() -> {ok, binary()} | {error, term()}),
+    max := non_neg_integer()
+}.
 
 -export([
     method/1,
