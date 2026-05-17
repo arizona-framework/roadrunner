@@ -1445,6 +1445,24 @@ join_drain_group_disabled_skips_pg_test() ->
     %% use to skip per-conn pg overhead on short-lived workloads.
     ?assertEqual(ok, roadrunner_conn:join_drain_group(some_listener, false)).
 
+join_drain_group_for_undefined_listener_test() ->
+    %% `join_drain_group_for/2` joins on behalf of another pid (used by
+    %% roadrunner_ws_session). `undefined` listener short-circuits.
+    ?assertEqual(ok, roadrunner_conn:join_drain_group_for(self(), undefined)).
+
+join_drain_group_for_without_pg_scope_test() ->
+    %% Without the `pg` scope (test harness skips the supervision
+    %% tree), the join is silently skipped. Caller never crashes.
+    case whereis(pg) of
+        undefined ->
+            ?assertEqual(ok, roadrunner_conn:join_drain_group_for(self(), some_listener));
+        _ ->
+            %% Scope is running — join then leave so the test doesn't
+            %% pollute other suites' membership.
+            ok = roadrunner_conn:join_drain_group_for(self(), some_listener),
+            ok = pg:leave({roadrunner_drain, some_listener}, self())
+    end.
+
 consume_state_next_chunk_for_content_length_drains_fully_test() ->
     %% Non-chunked framing: `next_chunk` drains the full body in one
     %% shot — there are no chunk boundaries to honor.

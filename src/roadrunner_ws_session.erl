@@ -182,6 +182,11 @@ run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated) ->
     %% a monitor instead.
     case gen_statem:start(?MODULE, {Socket, Mod, State, Ctx, Negotiated}, []) of
         {ok, Pid} ->
+            %% Auto-join the session into the listener's drain `pg` group
+            %% so `roadrunner_listener:drain/2` broadcasts reach long-lived
+            %% sessions directly — the conn's membership does not carry
+            %% across the unlinked `gen_statem:start` boundary above.
+            ok = roadrunner_conn:join_drain_group_for(Pid, roadrunner_req:listener_name(Req)),
             ok = roadrunner_telemetry:ws_upgrade(Ctx),
             _ = roadrunner_telemetry:response_send(
                 roadrunner_transport:send(Socket, UpgradeResp), websocket_upgrade_response
