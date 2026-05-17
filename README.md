@@ -7,31 +7,41 @@
 
 ![roadrunner logo](https://raw.githubusercontent.com/arizona-framework/roadrunner/main/assets/logo.jpg)
 
-Pure-Erlang HTTP/1.1 + HTTP/2 + WebSocket server for OTP 29+. **Beep beep.**
+Pure-Erlang HTTP/1.1 + HTTP/2 + WebSocket server for OTP 29+.
+**Built for low tail latency at sustained load.** Beep beep.
 
-Built ground-up via TDD as the HTTP backbone for the
-[arizona-framework](https://github.com/arizona-framework/arizona). The
-user-facing API is a handler behaviour, request/response accessors,
-listener controls, and a handful of opt-in helpers (cookies, qs,
-multipart, SSE, WebSocket). RFC-correct parsing, modern OTP idioms
-throughout, and predictable per-connection lifecycle observability.
+Roadrunner is the HTTP backbone of the
+[arizona-framework](https://github.com/arizona-framework/arizona).
+Strict RFC 9110 / 9112 / 9113 parsing, with **strict 100 %
+[h2spec](https://github.com/summerwind/h2spec)** (HTTP/2 conformance)
+and **strict 100 %
+[Autobahn fuzzingclient](https://github.com/crossbario/autobahn-testsuite)**
+(WebSocket, no exclusions). The user-facing API is a handler
+behaviour, request/response accessors, listener controls, and a
+handful of opt-in helpers (cookies, qs, multipart, SSE, WebSocket).
+Modern OTP idioms throughout, predictable per-connection lifecycle
+observability.
 
 ## ⚠️ Requirements
 
-Roadrunner requires **OTP 29**. Older OTPs won't compile, and the
-throughput numbers in the [performance section](#performance-at-a-glance)
-assume 29.
+Requires **OTP 29**.
 
 ## 🚧 Status
 
 Roadrunner is in `0.x`. The core is functional and covered by tests,
-but the API may change between minor versions. Pin an exact commit
-ref in your deps (e.g. `{ref, "<sha>"}`) if you need stability
+but the API may change between minor versions. Pin an exact version
+in your deps (e.g. `{roadrunner, "0.1.0"}`) if you need stability
 across upgrades.
+
+## ✅ Conformance
 
 Eunit + Common Test (incl. PropEr) suites with **100 % line coverage**,
 dialyzer-clean, h2spec strict 100 %, Autobahn fuzzingclient strict
-100 % across the full WebSocket matrix (no exclusions).
+100 % across the full WebSocket matrix (no exclusions). HTTP/1.1
+parsers stress-tested against the
+[llhttp](https://github.com/nodejs/llhttp) test corpus and the
+canonical [PortSwigger](https://portswigger.net/web-security/request-smuggling)
+request-smuggling vectors.
 
 Standards conformance:
 
@@ -80,11 +90,38 @@ streaming-POST endpoint). On simple GETs and small POSTs
 Roadrunner and elli are within the bench's ~15 % variance band on
 those rows; the comparison doc has the full honest framing.
 
-The numbers above are throughput from `scripts/bench.escript`
-(closed-loop). For Coordinated-Omission-corrected tail latency at
-sustained rates (open-loop, via wrk2), see
-[`docs/wrk2_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/wrk2_results.md);
-the comparison doc has the methodology breakdown.
+### Feature matrix
+
+If your workload needs a feature, the server has to ship it. `—`
+means achievable in user code but no helper / option built in; `✗`
+means out of scope for that server.
+
+| feature                                   | roadrunner | cowboy | elli |
+|-------------------------------------------|:----------:|:------:|:----:|
+| HTTP/2 + HPACK                            |     ✓      |   ✓    |  ✗   |
+| WebSocket (RFC 6455)                      |     ✓      |   ✓    |  —   |
+| permessage-deflate (RFC 7692)             |     ✓      |   ✓    |  ✗   |
+| Native router                             |     ✓      |   ✓    |  ✗   |
+| gzip / deflate response negotiation       |     ✓      |   ✓    |  —   |
+| Streaming request bodies                  |     ✓      |   ✓    |  —   |
+| Native qs / cookie / multipart            |     ✓      |   ✓    |  —   |
+| Server-Sent Events helper                 |     ✓      |   —    |  —   |
+| Sendfile                                  |     ✓      |   ✓    |  ✓   |
+| Static handler (ETag / Range / IMS)       |     ✓      |   ✓    |  —   |
+| Graceful drain with deadline + broadcast  |     ✓      |   —    |  ✗   |
+| Per-request `request_id` in logger meta   |     ✓      |   —    |  ✗   |
+
+### Tail latency at sustained load
+
+Open-loop, Coordinated-Omission-corrected (wrk2, `hello`, 8 threads,
+50 connections, 3-run median): Roadrunner sustains **270 k req/s**
+at p50 1.06 ms, p99 2.26 ms, p99.99 3.34 ms. Full per-scenario
+matrix with all four rate-points per server in
+[`docs/wrk2_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/wrk2_results.md).
+
+The throughput numbers above are from `scripts/bench.escript`
+(closed-loop); the comparison doc has the full methodology
+breakdown.
 
 ## Quickstart
 
@@ -92,7 +129,7 @@ Add to `rebar.config`:
 
 ```erlang
 {deps, [
-    {roadrunner, {git, "https://github.com/arizona-framework/roadrunner.git", {branch, "main"}}}
+    {roadrunner, "0.1.0"}
 ]}.
 ```
 
@@ -232,23 +269,6 @@ roadrunner:start_listener(my_listener, #{port => 8080, routes => hello_handler})
   enable in production where you can't trust every exit path to run
   `terminate/3` (`kill` signals, OOM kills, supervisor brutal-kill).
 
-### Test surface
-
-- **PropEr properties** via `ct_property_test`: `roadrunner_uri`
-  percent round-trip + encode shape, `roadrunner_qs` round-trip,
-  `roadrunner_cookie` adversarial robustness, `roadrunner_http1`
-  parsers never-crash + incremental-feed equivalence, plus
-  `roadrunner_conn_loop` robustness over random recv/drain/stray
-  inputs (clean exit + slot release) and `request_id` consistency
-  between `request_start` / `request_stop` telemetry.
-- **Malformed-input corpus**: `roadrunner_http1_corpus_tests`
-  exercises HTTP/1.1 patterns lifted from the
-  [llhttp](https://github.com/nodejs/llhttp) test corpus and the
-  canonical request-smuggling vectors documented by Portswigger.
-- **Conformance harnesses**: `scripts/h2spec.sh` (HTTP/2),
-  `scripts/autobahn.escript` (WebSocket),
-  `scripts/redbot.escript` (HTTP/1.1 response hygiene).
-
 ## Documentation
 
 - [`docs/comparison.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/comparison.md) — full side-by-side
@@ -274,9 +294,8 @@ roadrunner:start_listener(my_listener, #{port => 8080, routes => hello_handler})
   on the way out), binary keys for wire-derived data, `-doc` /
   `-moduledoc` markdown, dialyzer-clean specs. No `binary_to_atom` on
   parsed names.
-- **Continuation-style middleware** over Plug.Conn-style transformation
-  — strictly more expressive than cowboy's deprecated `(Req, Env)`
-  shape and dramatically simpler than cowboy's stream handlers.
+- **Continuation-style middleware.** `(Req, Next) -> {Response, Req2}`,
+  composable at listener and per-route level. Outermost first.
 - **Telemetry over custom callbacks.** `telemetry` is the de facto
   standard (Phoenix, Ecto, gleam_otp); zero-overhead when no subscribers,
   integrates with prometheus / opentelemetry / datadog out of the box.
