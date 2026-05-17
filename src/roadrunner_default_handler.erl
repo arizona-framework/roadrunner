@@ -15,22 +15,24 @@
 
 -export([handle/1]).
 
--define(BODY, ~"""
-roadrunner: no routes configured for this listener.
+-define(BODY,
+    ~"""
+    roadrunner: no routes configured for this listener.
 
-Quickstart:
-  roadrunner:start_listener(my_listener, #{
-      port => 8080,
-      routes => my_handler
-  }).
+    Quickstart:
+      roadrunner:start_listener(my_listener, #{
+          port => 8080,
+          routes => my_handler
+      }).
 
-  roadrunner:start_listener(my_listener, #{
-      port => 8080,
-      routes => [{~"/", my_handler, #{}}]
-  }).
+      roadrunner:start_listener(my_listener, #{
+          port => 8080,
+          routes => [{~"/", my_handler, #{}}]
+      }).
 
-Docs: https://github.com/arizona-framework/roadrunner
-""").
+    Docs: https://github.com/arizona-framework/roadrunner
+    """
+).
 
 -spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->

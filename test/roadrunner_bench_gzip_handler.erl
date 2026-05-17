@@ -35,9 +35,10 @@ handle(Req) ->
 init_body() ->
     %% Build ~16 KB of repeating JSON record shape — gzip should
     %% reduce this by ~95% (one repeating dictionary entry).
-    Record = ~"""
-    {"id":"01J8X9Z3K7QFRBQ4PCVE5K8RNH","name":"item","status":"active","tags":["a","b","c"]}
-    """,
+    Record =
+        ~"""
+        {"id":"01J8X9Z3K7QFRBQ4PCVE5K8RNH","name":"item","status":"active","tags":["a","b","c"]}
+        """,
     %% 90 bytes per record, 180 records ≈ 16.2 KB.
     Records = [Record || _ <- lists:seq(1, 180)],
     Body = iolist_to_binary([
