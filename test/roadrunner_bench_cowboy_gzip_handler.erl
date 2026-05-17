@@ -28,9 +28,10 @@ init(Req0, State) ->
 
 -spec init_body() -> ok.
 init_body() ->
-    Record = ~"""
-    {"id":"01J8X9Z3K7QFRBQ4PCVE5K8RNH","name":"item","status":"active","tags":["a","b","c"]}
-    """,
+    Record =
+        ~"""
+        {"id":"01J8X9Z3K7QFRBQ4PCVE5K8RNH","name":"item","status":"active","tags":["a","b","c"]}
+        """,
     Records = [Record || _ <- lists:seq(1, 180)],
     Body = iolist_to_binary([
         ~"[",
