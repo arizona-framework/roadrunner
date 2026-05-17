@@ -1,12 +1,17 @@
 -module(roadrunner_resp).
 -moduledoc """
-Convenience builders for the `{Status, Headers, Body}` triple roadrunner
-handlers return.
+Convenience builders for the buffered `{Status, Headers, Body}`
+triple — one of the five shapes a roadrunner handler can return.
 
-Each helper sets `Content-Type` and `Content-Length` so handlers don't
-repeat the boilerplate. Body framing (`Connection: close`,
-`Transfer-Encoding`, etc.) is still the connection layer's job — these
-helpers only fill in what the handler can know.
+Each helper sets `Content-Type` and `Content-Length` so handlers
+don't repeat the boilerplate. Body framing (`Connection: close`,
+`Transfer-Encoding`, etc.) is still the connection layer's job —
+these helpers only fill in what the handler can know.
+
+These helpers only construct the buffered form
+(`t:buffered_response/0`). Streaming, loop, sendfile, and
+WebSocket-upgrade handlers build their own tuple directly; see
+`t:roadrunner_handler:response/0` for the full union.
 """.
 
 -export([
@@ -25,12 +30,12 @@ helpers only fill in what the handler can know.
     status/1
 ]).
 
--export_type([response/0]).
+-export_type([buffered_response/0]).
 
--type response() :: {roadrunner_http:status(), roadrunner_http:headers(), iodata()}.
+-type buffered_response() :: {roadrunner_http:status(), roadrunner_http:headers(), iodata()}.
 
 -doc "Plain-text response with `text/plain; charset=utf-8`.".
--spec text(StatusCode :: roadrunner_http:status(), Body :: iodata()) -> response().
+-spec text(StatusCode :: roadrunner_http:status(), Body :: iodata()) -> buffered_response().
 text(Status, Body) ->
     with_length(Status, ~"text/plain; charset=utf-8", Body).
 
@@ -51,7 +56,7 @@ roadrunner_resp:add_header(
 
 `add_header/3` prepends, so the bare value wins on header lookup.
 """.
--spec html(StatusCode :: roadrunner_http:status(), Body :: iodata()) -> response().
+-spec html(StatusCode :: roadrunner_http:status(), Body :: iodata()) -> buffered_response().
 html(Status, Body) ->
     with_length(Status, ~"text/html; charset=utf-8", Body).
 
@@ -59,7 +64,7 @@ html(Status, Body) ->
 JSON response — the term is encoded via the stdlib `json` module
 (OTP 27+) and `Content-Type` is set to `application/json`.
 """.
--spec json(StatusCode :: roadrunner_http:status(), Term :: term()) -> response().
+-spec json(StatusCode :: roadrunner_http:status(), Term :: term()) -> buffered_response().
 json(Status, Term) ->
     Body = json:encode(Term),
     with_length(Status, ~"application/json", Body).
@@ -69,7 +74,7 @@ Redirect response — sets the `Location` header and an empty body.
 Use a 3xx status (typically 301, 302, 303, 307, or 308).
 """.
 -spec redirect(StatusCode :: roadrunner_http:redirect_status(), Location :: binary()) ->
-    response().
+    buffered_response().
 redirect(Status, Location) when is_binary(Location) ->
     {Status,
         [
@@ -78,7 +83,7 @@ redirect(Status, Location) when is_binary(Location) ->
         ],
         ~""}.
 
--spec with_length(roadrunner_http:status(), binary(), iodata()) -> response().
+-spec with_length(roadrunner_http:status(), binary(), iodata()) -> buffered_response().
 with_length(Status, ContentType, Body) ->
     {Status,
         [
@@ -94,7 +99,7 @@ The header is added to the front of the list — last-write-wins for
 any subsequent lookup. `Value` may be iodata; it is flattened into a
 binary so the wire encoder doesn't have to.
 """.
--spec add_header(response(), Name :: binary(), Value :: iodata()) -> response().
+-spec add_header(buffered_response(), Name :: binary(), Value :: iodata()) -> buffered_response().
 add_header({Status, Headers, Body}, Name, Value) when is_binary(Name) ->
     {Status, [{Name, iolist_to_binary(Value)} | Headers], Body}.
 
@@ -103,43 +108,43 @@ Add a `Set-Cookie` header to a response — wraps `roadrunner_cookie:serialize/3
 so handlers don't have to.
 """.
 -spec set_cookie(
-    response(), Name :: binary(), Value :: binary(), roadrunner_cookie:serialize_opts()
+    buffered_response(), Name :: binary(), Value :: binary(), roadrunner_cookie:serialize_opts()
 ) ->
-    response().
+    buffered_response().
 set_cookie(Resp, Name, Value, Opts) ->
     add_header(Resp, ~"set-cookie", roadrunner_cookie:serialize(Name, Value, Opts)).
 
 -doc "Empty 204 No Content response.".
--spec no_content() -> response().
+-spec no_content() -> buffered_response().
 no_content() -> empty_status(204).
 
 -doc "Empty 400 Bad Request response.".
--spec bad_request() -> response().
+-spec bad_request() -> buffered_response().
 bad_request() -> empty_status(400).
 
 -doc "Empty 401 Unauthorized response.".
--spec unauthorized() -> response().
+-spec unauthorized() -> buffered_response().
 unauthorized() -> empty_status(401).
 
 -doc "Empty 403 Forbidden response.".
--spec forbidden() -> response().
+-spec forbidden() -> buffered_response().
 forbidden() -> empty_status(403).
 
 -doc "Empty 404 Not Found response.".
--spec not_found() -> response().
+-spec not_found() -> buffered_response().
 not_found() -> empty_status(404).
 
 -doc "Empty 500 Internal Server Error response.".
--spec internal_error() -> response().
+-spec internal_error() -> buffered_response().
 internal_error() -> empty_status(500).
 
 -doc """
 Empty-body response with an arbitrary status code — handy for
 statuses outside the named shortcut set (e.g., 418, 503).
 """.
--spec status(roadrunner_http:status()) -> response().
+-spec status(roadrunner_http:status()) -> buffered_response().
 status(Code) -> empty_status(Code).
 
--spec empty_status(roadrunner_http:status()) -> response().
+-spec empty_status(roadrunner_http:status()) -> buffered_response().
 empty_status(Status) ->
     {Status, [{~"content-length", ~"0"}], ~""}.
