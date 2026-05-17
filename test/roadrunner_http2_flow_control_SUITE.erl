@@ -354,7 +354,7 @@ start_conn(Handler) ->
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_flow_test,
-        dispatch => {handler, Handler, undefined},
+        dispatch => {handler, Handler, #{}},
         middlewares => []
     },
     Sock = {fake, Self},

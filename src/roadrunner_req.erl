@@ -45,6 +45,7 @@ are not part of the public contract and can change between releases.
     peer => {inet:ip_address(), inet:port_number()} | undefined,
     scheme => http | https,
     state => term(),
+    route_middlewares => roadrunner_middleware:middleware_list(),
     body_state => term(),
     request_id => binary(),
     listener_name => atom()

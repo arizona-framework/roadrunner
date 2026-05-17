@@ -5,26 +5,35 @@
 -moduledoc """
 Path → handler dispatch with parameterized segments.
 
-Routes are written as `{Path, Handler}` or `{Path, Handler, Opts}`
-where `Path` is a binary like `/users/:id/posts/:post_id`. The
-2-tuple form is shorthand for `Opts = undefined`. Segments starting
-with `:` capture a single segment into bindings keyed by the
-**binary** name that follows the colon — we deliberately avoid
+A route is either a tuple shorthand or a map. Both forms share the
+same `Path` and `Handler`:
+
+- `{Path, Handler}` — only routes the path; no state, no per-route
+  middlewares.
+- `{Path, Handler, State}` — adds opaque per-handler state surfaced
+  via `roadrunner_req:state/1`.
+- `#{path => Path, handler => Handler, state => State, middlewares
+  => [Mw, ...]}` — full map form. Use this when you want to attach
+  per-route middlewares (or any future per-route framework knob).
+  Only `path` and `handler` are required.
+
+The tuple shorthand intentionally cannot carry middlewares — that
+keeps the simple case syntactically light and pushes "more than just
+state" to the more verbose map form.
+
+`Path` is a binary like `/users/:id/posts/:post_id`. Segments
+starting with `:` capture a single segment into bindings keyed by
+the **binary** name that follows the colon — we deliberately avoid
 `binary_to_atom/1` on the parsed name to keep the "everything is
 binary on the wire" rule we already use for header names.
 
 Segments starting with `*` (e.g. `/static/*path`) are wildcard
-captures: they consume all remaining path segments and bind them as a
-list under the given name. A wildcard must be the last segment in a
-pattern; anything after it never matches.
+captures: they consume all remaining path segments and bind them as
+a list under the given name. A wildcard must be the last segment in
+a pattern; anything after it never matches.
 
-Literal segments must match byte-exactly; comparison is case-sensitive
-per RFC 3986.
-
-`State` is an opaque per-route term threaded through to the handler
-via `roadrunner_req:state/1`. Omit it (use the 2-tuple form) when a
-route has no state; `roadrunner_req:state/1` then returns
-`undefined`.
+Literal segments must match byte-exactly; comparison is
+case-sensitive per RFC 3986.
 
 Routes are tried in declaration order — earlier entries win. The
 opaque `compiled()` shape is a list of pre-parsed segment patterns;
@@ -33,23 +42,41 @@ swapping to a trie/DAG later is a non-breaking change for callers.
 
 -export([compile/1, match/2]).
 
--export_type([route/0, routes/0, compiled/0, bindings/0]).
+-export_type([route/0, routes/0, route_cfg/0, compiled/0, bindings/0]).
 
 -doc """
-A single route entry. Two shapes are accepted:
+A single route entry. Three shapes are accepted:
 
-- `{Path, Handler}` — shorthand for routes without per-route state;
-  `roadrunner_req:state/1` returns `undefined`.
-- `{Path, Handler, State}` — full shape; `State` is opaque per-route
-  data threaded back to the handler via `roadrunner_req:state/1`.
+- `{Path, Handler}` — shorthand: no state, no middlewares.
+- `{Path, Handler, State}` — shorthand with state only.
+- `#{path := Path, handler := Handler, state => State,
+   middlewares => Mws}` — map form; use this to attach per-route
+  middlewares or future per-route framework knobs.
 
 `Path` is a binary pattern (literal segments, `:param` captures, or
-`*wildcard` catch-all) and `Handler` is the module implementing
-`roadrunner_handler`.
+`*wildcard` catch-all). `Handler` is the module implementing
+`roadrunner_handler`. `State` is opaque per-route data threaded back
+to the handler via `roadrunner_req:state/1`; unset → `undefined`.
 """.
 -type route() ::
     {Path :: binary(), Handler :: module()}
-    | {Path :: binary(), Handler :: module(), State :: term()}.
+    | {Path :: binary(), Handler :: module(), State :: term()}
+    | #{
+        path := binary(),
+        handler := module(),
+        state => term(),
+        middlewares => roadrunner_middleware:middleware_list()
+    }.
+
+-doc """
+Per-route configuration map carried alongside the matched handler.
+The 4th element of `match/2`'s `{ok, ...}` return. Keys present
+reflect what the route entry attached; missing keys mean "not set".
+""".
+-type route_cfg() :: #{
+    state => term(),
+    middlewares => roadrunner_middleware:middleware_list()
+}.
 
 -doc "An ordered list of routes; matched first-to-last.".
 -type routes() :: [route()].
@@ -70,7 +97,7 @@ remaining path segments
 The compiled-routes representation `match/2` consumes. Treat as
 opaque: the shape is an implementation detail and may change.
 """.
--opaque compiled() :: [{[segment()], module(), term()}].
+-opaque compiled() :: [{[segment()], module(), route_cfg()}].
 
 -doc """
 Compile a list of routes into the lookup form `match/2` expects.
@@ -82,9 +109,15 @@ and segments starting with `:` are recorded as named captures.
 compile(Routes) when is_list(Routes) ->
     [compile_route(R) || R <- Routes].
 
--spec compile_route(route()) -> {[segment()], module(), term()}.
-compile_route({Path, Handler}) -> {compile_path(Path), Handler, undefined};
-compile_route({Path, Handler, State}) -> {compile_path(Path), Handler, State}.
+-spec compile_route(route()) -> {[segment()], module(), route_cfg()}.
+compile_route({Path, Handler}) when is_binary(Path), is_atom(Handler) ->
+    {compile_path(Path), Handler, #{}};
+compile_route({Path, Handler, State}) when is_binary(Path), is_atom(Handler) ->
+    {compile_path(Path), Handler, #{state => State}};
+compile_route(#{path := Path, handler := Handler} = Route) when
+    is_binary(Path), is_atom(Handler)
+->
+    {compile_path(Path), Handler, maps:without([path, handler], Route)}.
 
 -spec compile_path(binary()) -> [segment()].
 compile_path(Path) ->
@@ -98,25 +131,27 @@ compile_segment(Lit) -> {literal, Lit}.
 -doc """
 Look up the handler for a given request path.
 
-Returns `{ok, Handler, Bindings, State}` on a match — `Bindings` is a
-map populated with captures from `:param` segments (empty for purely
-literal routes); `State` is the per-route opaque attached at compile
-time (or `undefined` for a 2-tuple route). Returns `not_found` when
-no compiled route matches.
+Returns `{ok, Handler, Bindings, RouteCfg}` on a match — `Bindings`
+is a map populated with captures from `:param` segments (empty for
+purely literal routes); `RouteCfg` is the per-route configuration
+map attached at compile time (`#{}` for bare 2-tuple routes,
+`#{state => S}` for 3-tuple routes, the user's map (minus `path`
+and `handler`) for map-form routes). Returns `not_found` when no
+compiled route matches.
 """.
 -spec match(Path :: binary(), compiled()) ->
-    {ok, module(), bindings(), term()} | not_found.
+    {ok, module(), bindings(), route_cfg()} | not_found.
 match(Path, Compiled) when is_binary(Path), is_list(Compiled) ->
     Segments = path_segments(Path),
     match_first(Segments, Compiled).
 
 -spec match_first([binary()], compiled()) ->
-    {ok, module(), bindings(), term()} | not_found.
+    {ok, module(), bindings(), route_cfg()} | not_found.
 match_first(_Segments, []) ->
     not_found;
-match_first(Segments, [{Pattern, Handler, State} | Rest]) ->
+match_first(Segments, [{Pattern, Handler, Cfg} | Rest]) ->
     case match_pattern(Pattern, Segments, #{}) of
-        {ok, Bindings} -> {ok, Handler, Bindings, State};
+        {ok, Bindings} -> {ok, Handler, Bindings, Cfg};
         no_match -> match_first(Segments, Rest)
     end.
 

@@ -62,6 +62,7 @@
     send_internal_error/1,
     send_not_found/1,
     resolve_handler/2,
+    thread_route_cfg/2,
     response_status/1,
     response_kind/1
 ]).
@@ -74,7 +75,7 @@
 -define(KEEP_ALIVE_CP_KEY, {?MODULE, keep_alive_cp}).
 
 -type dispatch() ::
-    {handler, module(), term()}
+    {handler, module(), roadrunner_router:route_cfg()}
     | {router, ListenerName :: atom()}.
 
 -type proto_opts() :: #{
@@ -326,15 +327,35 @@ scheme({fake, _}) -> http.
 
 -doc false.
 -spec resolve_handler(dispatch(), roadrunner_http1:request()) ->
-    {ok, module(), roadrunner_router:bindings(), term()} | not_found.
-resolve_handler({handler, Mod, Opts}, _Req) ->
-    {ok, Mod, #{}, Opts};
+    {ok, module(), roadrunner_router:bindings(), roadrunner_router:route_cfg()} | not_found.
+resolve_handler({handler, Mod, Cfg}, _Req) ->
+    {ok, Mod, #{}, Cfg};
 resolve_handler({router, ListenerName}, Req) ->
     %% Routes are stored in `persistent_term` by `roadrunner_listener` so
     %% the lookup is O(1) and `roadrunner_listener:reload_routes/2` can
     %% atomically swap the table without bouncing the listener.
     Compiled = persistent_term:get({roadrunner_routes, ListenerName}),
     roadrunner_router:match(roadrunner_req:path(Req), Compiled).
+
+%% Splat the matched route's `route_cfg()` onto the request: `state` goes
+%% into the req's `state` field (read by `roadrunner_req:state/1`),
+%% `middlewares` into `route_middlewares` (read by
+%% `roadrunner_middleware:route_mws/1`). Only sets a field when the cfg
+%% map carries it — keeps the no-state / no-mws fast path off both
+%% map writes.
+-doc false.
+-spec thread_route_cfg(roadrunner_http1:request(), roadrunner_router:route_cfg()) ->
+    roadrunner_http1:request().
+thread_route_cfg(Req, Cfg) ->
+    Req1 =
+        case Cfg of
+            #{state := S} -> Req#{state => S};
+            _ -> Req
+        end,
+    case Cfg of
+        #{middlewares := Mws} -> Req1#{route_middlewares => Mws};
+        _ -> Req1
+    end.
 
 -doc false.
 -spec read_body(

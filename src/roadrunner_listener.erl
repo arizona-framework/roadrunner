@@ -51,9 +51,14 @@ Routing (pick one):
 - `routes => {module(), term()}` — single-handler dispatch with
   per-handler state. The opaque second element is reachable from
   the handler via `roadrunner_req:state/1`.
-- `routes => roadrunner_router:routes()` — list of
-  `{Path, Handler}` or `{Path, Handler, State}` tuples; first
-  match wins. The 2-tuple form is shorthand for `State = undefined`.
+- `routes => #{handler := module(), state => term(),
+   middlewares => [...]}` — map form for single-handler dispatch;
+  use it to attach per-handler middlewares (or future per-handler
+  framework knobs) alongside the state.
+- `routes => roadrunner_router:routes()` — list of route entries;
+  each entry is either a `{Path, Handler}` / `{Path, Handler, State}`
+  tuple or a `#{path := Path, handler := Handler, state => ...,
+  middlewares => [...]}` map. First match wins.
 
 Optional middleware and timing knobs (durations in milliseconds):
 - `middlewares` — listener-wide pipeline applied to every request.
@@ -92,7 +97,15 @@ ops-tuning rationale.
 """.
 -type opts() :: #{
     port := inet:port_number(),
-    routes => module() | {module(), term()} | roadrunner_router:routes(),
+    routes =>
+        module()
+        | {module(), term()}
+        | #{
+            handler := module(),
+            state => term(),
+            middlewares => roadrunner_middleware:middleware_list()
+        }
+        | roadrunner_router:routes(),
     middlewares => roadrunner_middleware:middleware_list(),
     max_content_length => non_neg_integer(),
     request_timeout => non_neg_integer(),
@@ -528,14 +541,15 @@ build_proto_opts(Opts, ListenerName) ->
             WithHibernate
     end.
 
-%% `routes` is the unified dispatch option. A bare module atom sends
-%% every request to that handler; `{Module, State}` is the same plus
-%% per-handler state surfaced via `roadrunner_req:state/1`; a list
-%% of `{Path, Module, State}` tuples uses the router. When `routes` is
-%% omitted, fall back to the default hello-world handler. List-form
-%% routes are published to `persistent_term` by `publish_routes/2` —
-%% the dispatch tag carries the listener name so the conn can look
-%% the table up.
+%% `routes` is the unified dispatch option. Single-handler forms
+%% (bare atom, `{Mod, State}` tuple, or `#{handler := Mod, ...}` map)
+%% all compile to a `{handler, Mod, RouteCfg}` dispatch tag where
+%% `RouteCfg` is a small map carrying `state` and `middlewares` (and
+%% any future per-handler framework knob). A list of route entries
+%% uses the router. When `routes` is omitted, fall back to the default
+%% hello-world handler. List-form routes are published to
+%% `persistent_term` by `publish_routes/2` — the dispatch tag carries
+%% the listener name so the conn can look the table up.
 -spec build_dispatch(opts(), atom()) -> roadrunner_conn:dispatch().
 %% Validate + normalize the `protocols` opt. Returns a 2-tuple:
 %%
@@ -640,13 +654,15 @@ flatten_http2_opts(Entries) ->
     end.
 
 build_dispatch(#{routes := Module}, _ListenerName) when is_atom(Module) ->
-    {handler, Module, undefined};
-build_dispatch(#{routes := {Module, Opts}}, _ListenerName) when is_atom(Module) ->
-    {handler, Module, Opts};
+    {handler, Module, #{}};
+build_dispatch(#{routes := {Module, State}}, _ListenerName) when is_atom(Module) ->
+    {handler, Module, #{state => State}};
+build_dispatch(#{routes := #{handler := Module} = Route}, _ListenerName) when is_atom(Module) ->
+    {handler, Module, maps:without([handler], Route)};
 build_dispatch(#{routes := Routes}, ListenerName) when is_list(Routes) ->
     {router, ListenerName};
 build_dispatch(_Opts, _ListenerName) ->
-    {handler, roadrunner_default_handler, undefined}.
+    {handler, roadrunner_default_handler, #{}}.
 
 -doc false.
 -spec handle_call(

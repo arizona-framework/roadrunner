@@ -27,7 +27,7 @@ logger_metadata_set_in_h2_worker_test_() ->
             listener_name => http2_worker_md_test
         },
         ProtoOpts = #{
-            dispatch => {handler, roadrunner_logger_probe_handler, undefined},
+            dispatch => {handler, roadrunner_logger_probe_handler, #{}},
             middlewares => []
         },
         {_WorkerPid, _MonRef} = roadrunner_http2_stream_worker:start(

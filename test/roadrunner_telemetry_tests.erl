@@ -119,7 +119,7 @@ request_rejected_event_fires_on_bad_request_line_test() ->
         Tag = make_ref(),
         Sink = spawn(fun() -> drain_recv_sink(Tag, Self, [{recv, ~"NOT-A-REQUEST\r\n\r\n"}]) end),
         Opts = #{
-            dispatch => {handler, roadrunner_hello_handler, undefined},
+            dispatch => {handler, roadrunner_hello_handler, #{}},
             middlewares => [],
             max_content_length => 1_000_000,
             request_timeout => 200,

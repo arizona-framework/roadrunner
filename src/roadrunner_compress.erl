@@ -4,10 +4,10 @@
 %% Response-compression middleware. Supports `gzip` and `deflate`
 %% Content-Encoding per RFC 9110 §8.4.1.
 %%
-%% Add to a listener's `middlewares` opt (or a route's `state.middlewares`)
-%% to compress eligible response bodies based on the request's `Accept-Encoding`
-%% header. Replaces cowboy's deprecated `cowboy_compress_h` stream handler
-%% for arizona's migration.
+%% Add to a listener's `middlewares` opt (or a map-shape route's
+%% `middlewares` key) to compress eligible response bodies based on
+%% the request's `Accept-Encoding` header. Replaces cowboy's deprecated
+%% `cowboy_compress_h` stream handler for arizona's migration.
 %%
 %% ```erlang
 %% roadrunner_listener:start_link(my_app, #{

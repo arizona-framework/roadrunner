@@ -81,8 +81,8 @@ run_handler(ConnPid, StreamId, Req, ProtoOpts) ->
     Metadata = telemetry_metadata(Req),
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
-        {ok, Handler, Bindings, State} ->
-            FullReq = Req#{bindings => Bindings, state => State},
+        {ok, Handler, Bindings, Cfg} ->
+            FullReq = roadrunner_conn:thread_route_cfg(Req#{bindings => Bindings}, Cfg),
             invoke(ConnPid, StreamId, Handler, Mws, FullReq, Metadata, ReqStart);
         not_found ->
             send_buffered(
