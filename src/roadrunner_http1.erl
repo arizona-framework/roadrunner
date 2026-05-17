@@ -16,7 +16,8 @@
     parse_request/1,
     parse_chunk/1,
     check_header_safe/2,
-    response/3
+    response/3,
+    compute_cached_decisions/1
 ]).
 
 -export_type([cached_decisions/0]).
@@ -53,7 +54,11 @@
 -type headers() :: roadrunner_http:headers().
 -type status() :: roadrunner_http:status().
 
--doc false.
+%% H1-parser internal hot-path optimization (no public contract).
+%% Surfaces on the request map as the `cached_decisions` field; both
+%% the field and this type are framework internals — handlers should
+%% ignore them. Exported only so cross-module specs (e.g. the field's
+%% type annotation in `roadrunner_req:request/0`) can reference it.
 -type cached_decisions() :: #{
     %% True iff `Transfer-Encoding: chunked` (case-insensitive). Hot path
     %% at body-framing time — saves a per-request lowercase scan.
@@ -496,9 +501,13 @@ check_cls_consistent(_, []) -> ok;
 check_cls_consistent(V, [V | Rest]) -> check_cls_consistent(V, Rest);
 check_cls_consistent(_, _) -> error.
 
-%% Walk a parsed header list once and return pre-computed decisions for
-%% the case-insensitive headers that the connection layer reads on every
-%% request.
+%% Walk a parsed header list once and return pre-computed decisions
+%% for the case-insensitive headers that the connection layer reads
+%% on every request.
+%%
+%% Internal hot-path helper — not part of the public handler API. The
+%% result is stashed on the request map's `cached_decisions` field
+%% for `roadrunner_conn` to read; handlers should ignore it.
 %%
 %% Header names are already lowercased by `parse_header/1`; this pass
 %% also lowercases the value of `Connection` (whose tokens are
@@ -507,10 +516,6 @@ check_cls_consistent(_, _) -> error.
 %%
 %% Reusing the cached values avoids ~3 lowercase scans per request on
 %% the hot path measured via `scripts/stress.escript --profile`.
-%%
-%% Internal hot-path helper — not part of the public API. The result
-%% is stashed on the request map's `cached_decisions` field for
-%% `roadrunner_conn` to read; handlers should ignore it.
 -doc false.
 -spec compute_cached_decisions(headers()) -> cached_decisions().
 compute_cached_decisions(Headers) ->
