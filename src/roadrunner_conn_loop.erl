@@ -636,15 +636,29 @@ dispatch_response(
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Head), sendfile_response_head
     ),
-    _ =
+    ok =
         case roadrunner_req:method(Req) of
             ~"HEAD" ->
                 ok;
             _ ->
-                roadrunner_telemetry:response_send(
-                    roadrunner_transport:sendfile(Socket, Filename, Offset, Length),
-                    sendfile_body
-                )
+                SendResult = roadrunner_transport:sendfile(
+                    Socket, Filename, Offset, Length
+                ),
+                _ = roadrunner_telemetry:response_send(SendResult, sendfile_body),
+                %% A `{error, _}` here means the wire is mid-framing
+                %% (short write, socket error, etc.). With keep-alive
+                %% enabled on sendfile responses, the client would
+                %% otherwise hang waiting for missing body bytes until
+                %% its own timeout. Close the socket so the next
+                %% read_request_phase recv returns `{error, closed}`
+                %% and the conn exits normally instead of idling.
+                case SendResult of
+                    ok ->
+                        ok;
+                    {error, _} ->
+                        _ = roadrunner_transport:close(Socket),
+                        ok
+                end
         end,
     ok;
 %% Buffered (3-tuple) response shape. RFC 9110 §9.3.2: HEAD must NOT

@@ -344,6 +344,26 @@ sendfile_via_fake_forwards_slice_test() ->
         file:delete(Path)
     end.
 
+sendfile_result_full_send_returns_ok_test() ->
+    ?assertEqual(ok, roadrunner_transport:sendfile_result(100, {ok, 100})).
+
+sendfile_result_short_write_returns_error_test() ->
+    %% `file:sendfile/5` returning fewer bytes than requested means the
+    %% wire is mid-framing — the client has the Content-Length header
+    %% but only part of the body. The classifier flips this to
+    %% `{error, short_write}` so the caller can close the conn.
+    ?assertEqual(
+        {error, short_write},
+        roadrunner_transport:sendfile_result(100, {ok, 50})
+    ).
+
+sendfile_result_propagates_error_test() ->
+    %% Raw errors from `file:sendfile/5` pass through unchanged.
+    ?assertEqual(
+        {error, closed},
+        roadrunner_transport:sendfile_result(100, {error, closed})
+    ).
+
 sendfile_missing_file_returns_error_test() ->
     ?assertMatch(
         {error, _},

@@ -1155,6 +1155,47 @@ sendfile_response_skips_body_for_head_method_test() ->
     persistent_term:erase({roadrunner_conn_loop_sendfile_handler, file}),
     file:delete(Path).
 
+sendfile_dispatch_closes_socket_on_error_test() ->
+    %% Sendfile responses honor keep-alive (per finishing_phase/3), so a
+    %% mid-write failure would otherwise leave the conn idling for a
+    %% truncated request the client will never send. dispatch_response/4
+    %% must force-close the socket on `roadrunner_transport:sendfile/4`
+    %% errors so the keep-alive loop sees `closed` on its next recv and
+    %% the conn exits normally.
+    %%
+    %% We trigger the error by returning a sendfile response pointing at
+    %% a missing path: `roadrunner_transport:sendfile/4` returns
+    %% `{error, enoent}` from `file:open/2`, exercising the same
+    %% close-on-error path a short_write would take in production.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    HandlerFun = fun(Req) ->
+        Resp =
+            {sendfile, 200, [{~"content-length", ~"100"}], {
+                ~"/tmp/rr_sendfile_missing_xyz_does_not_exist", 0, 100
+            }},
+        {Resp, Req}
+    end,
+    Opts = (fake_opts(sendf_err))#{
+        dispatch := {handler, dummy_handler, HandlerFun, undefined}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    %% The conn must exit normally within the deadline. Without the
+    %% close-on-error guard, the keep-alive recursion would idle in
+    %% read_request_phase until `keep_alive_timeout` (5s in fake_opts)
+    %% fires — well past the 2s assertion deadline.
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sink ! stop.
+
 websocket_dispatch_invokes_session_run_test() ->
     %% Without proper ws upgrade headers `ws_session:run/4` writes 400
     %% and returns. We're covering the dispatch_response websocket

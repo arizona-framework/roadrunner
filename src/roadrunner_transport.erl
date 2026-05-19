@@ -57,6 +57,7 @@
     build_tls_opts/2,
     negotiated_alpn/1
 ]).
+-export([sendfile_result/2]).
 
 -export_type([socket/0]).
 
@@ -224,16 +225,29 @@ sendfile(Sock, Filename, Offset, Length) ->
     socket(), file:io_device(), non_neg_integer(), non_neg_integer()
 ) -> ok | {error, term()}.
 do_sendfile({gen_tcp, S}, File, Offset, Length) ->
-    case file:sendfile(File, S, Offset, Length, []) of
-        {ok, _} -> ok;
-        {error, _} = Err -> Err
-    end;
+    sendfile_result(Length, file:sendfile(File, S, Offset, Length, []));
 do_sendfile({ssl, S}, File, Offset, Length) ->
     sendfile_chunked(fun(Data) -> ssl:send(S, Data) end, File, Offset, Length);
 do_sendfile({fake, Pid}, File, Offset, Length) ->
     {ok, Bytes} = file:pread(File, Offset, Length),
     Pid ! {roadrunner_fake_send, self(), Bytes},
     ok.
+
+%% Classify a `file:sendfile/5` result against the requested `Length`.
+%% A short write (`{ok, N}` with `N < Length`) means the wire is mid-framing:
+%% the client has the header's `Content-Length` but only part of the body,
+%% so it will hang waiting for the rest. The caller should treat
+%% `{error, short_write}` like any other write error and close the conn.
+%% Exported only so the eunit suite can drive the classification directly
+%% (the `file:sendfile/5` BIF doesn't naturally short-write on a healthy
+%% loopback socket).
+-doc false.
+-spec sendfile_result(
+    non_neg_integer(), {ok, non_neg_integer()} | {error, term()}
+) -> ok | {error, term()}.
+sendfile_result(Length, {ok, Length}) -> ok;
+sendfile_result(_Length, {ok, _Less}) -> {error, short_write};
+sendfile_result(_Length, {error, _} = Err) -> Err.
 
 %% TLS fallback: positioned read + ssl:send in 64 KiB chunks. The file
 %% is freshly opened with `[read, raw, binary]` so positioning and
