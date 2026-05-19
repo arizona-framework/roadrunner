@@ -51,6 +51,26 @@ directories are still followed by the kernel.
   points (nginx `disable_symlinks off` equivalent). Use only when
   the docroot's filesystem permissions prevent untrusted writes.
 - `refuse` — every symlink returns 404, even safe in-docroot ones.
+
+## Metadata cache
+
+`#{cache_ttl_ms => N}` caches the `stat` result (size, mtime) for
+each regular file in `persistent_term` for `N` milliseconds. Hot
+paths skip the per-request `read_link_info` syscall after the
+first hit. Symlinks always bypass the cache because the policy
+gate needs the un-followed lookup.
+
+The default is `0` (disabled). Enabling the cache assumes files
+are **immutable during the TTL window**: the cached `size` feeds
+the `Content-Length` header while `sendfile` reads the file fresh
+from disk, so a file replaced or resized mid-window produces a
+length / body mismatch (truncated or short response). Safe for
+deploy-then-restart workflows with versioned-by-hash assets;
+unsafe for mutable files (user uploads, dev hot-reload).
+
+Set to a positive integer to opt in (e.g., `cache_ttl_ms => 1000`).
+nginx's `open_file_cache` makes the same trade-off and is also
+off by default.
 """.
 
 -behaviour(roadrunner_handler).
@@ -61,8 +81,14 @@ directories are still followed by the kernel.
 
 -define(COMMA_CP_KEY, {?MODULE, comma_cp}).
 -define(DASH_CP_KEY, {?MODULE, dash_cp}).
+-define(META_CACHE_KEY(FilePath), {roadrunner_static_meta, FilePath}).
+
+%% Caching is opt-in: default is `0` (disabled). See `## Metadata cache`
+%% in the moduledoc above for when to enable and the trade-offs.
+-define(DEFAULT_CACHE_TTL_MS, 0).
 
 -export([handle/1]).
+-export([cache_get/1, cache_put/4]).
 
 -define(MIME_TYPES, #{
     ~".html" => ~"text/html; charset=utf-8",
@@ -80,20 +106,51 @@ directories are still followed by the kernel.
 
 -spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
-    #{dir := Dir} = roadrunner_req:state(Req),
     Segments = maps:get(~"path", roadrunner_req:bindings(Req), []),
-    Resp =
-        case validate_segments(Segments) of
-            ok ->
-                FilePath = filename:join([Dir | Segments]),
-                serve_file(FilePath, Req);
-            traversal ->
-                roadrunner_resp:not_found()
-        end,
-    {Resp, Req}.
+    case validate_segments(Segments) of
+        ok ->
+            State = roadrunner_req:state(Req),
+            TtlMs =
+                case State of
+                    #{cache_ttl_ms := T} -> T;
+                    _ -> ?DEFAULT_CACHE_TTL_MS
+                end,
+            Dir = maps:get(dir, State),
+            FilePath = filename:join([Dir | Segments]),
+            {serve_file(FilePath, TtlMs, Req), Req};
+        traversal ->
+            {roadrunner_resp:not_found(), Req}
+    end.
 
--spec serve_file(file:filename_all(), roadrunner_req:request()) -> roadrunner_handler:response().
-serve_file(FilePath, Req) ->
+-spec serve_file(
+    file:filename_all(), non_neg_integer(), roadrunner_req:request()
+) -> roadrunner_handler:response().
+serve_file(FilePath, TtlMs, Req) ->
+    case cached_lookup(FilePath, TtlMs) of
+        {ok, Size, Mtime} ->
+            serve_regular_file(FilePath, Size, Mtime, Req);
+        miss ->
+            fresh_lookup(FilePath, TtlMs, Req)
+    end.
+
+%% Cache-aware regular-file metadata lookup. Returns `miss` when the
+%% TTL is non-positive (caching disabled) or when no fresh entry is in
+%% the cache. Symlinks always bypass the cache because the policy gate
+%% needs the un-followed `read_link_info` result.
+-spec cached_lookup(file:filename_all(), non_neg_integer()) ->
+    {ok, non_neg_integer(), integer()} | miss.
+cached_lookup(_FilePath, TtlMs) when TtlMs =< 0 ->
+    miss;
+cached_lookup(FilePath, _TtlMs) ->
+    cache_get(FilePath).
+
+%% Stat the file, populate the cache when applicable, and dispatch on
+%% the file type. Mirrors the original `serve_file/2` body. Used on
+%% cache miss and for symlink leaves (which never cache).
+-spec fresh_lookup(
+    file:filename_all(), non_neg_integer(), roadrunner_req:request()
+) -> roadrunner_handler:response().
+fresh_lookup(FilePath, TtlMs, Req) ->
     %% `read_link_info/1` does not follow the leaf symlink — we need
     %% the un-followed type so the symlink-policy gate can decide
     %% whether the target is allowed to be served.
@@ -104,10 +161,49 @@ serve_file(FilePath, Req) ->
                 false -> roadrunner_resp:not_found()
             end;
         {ok, #file_info{type = regular, size = Size, mtime = Mtime}} ->
+            ok = maybe_cache_put(FilePath, Size, Mtime, TtlMs),
             serve_regular_file(FilePath, Size, Mtime, Req);
         _ ->
             roadrunner_resp:not_found()
     end.
+
+%% Read a cached `{Size, Mtime}` for `FilePath` if the entry is still
+%% within its TTL. Returns `miss` if absent or expired. Exported so
+%% the eunit suite can drive the cache directly.
+-doc false.
+-spec cache_get(file:filename_all()) ->
+    {ok, non_neg_integer(), integer()} | miss.
+cache_get(FilePath) ->
+    case persistent_term:get(?META_CACHE_KEY(FilePath), undefined) of
+        undefined ->
+            miss;
+        {Size, Mtime, ExpiresAt} ->
+            case erlang:monotonic_time(millisecond) of
+                Now when Now =< ExpiresAt ->
+                    {ok, Size, Mtime};
+                _ ->
+                    miss
+            end
+    end.
+
+%% Store `{Size, Mtime}` for `FilePath` with a TTL of `TtlMs` ms from
+%% now. The entry is keyed by absolute path; concurrent puts for the
+%% same path are idempotent under the eventual-consistency semantics
+%% of `persistent_term`. Exported for direct eunit coverage.
+-doc false.
+-spec cache_put(file:filename_all(), non_neg_integer(), integer(), pos_integer()) -> ok.
+cache_put(FilePath, Size, Mtime, TtlMs) ->
+    ExpiresAt = erlang:monotonic_time(millisecond) + TtlMs,
+    persistent_term:put(?META_CACHE_KEY(FilePath), {Size, Mtime, ExpiresAt}),
+    ok.
+
+-spec maybe_cache_put(
+    file:filename_all(), non_neg_integer(), integer(), non_neg_integer()
+) -> ok.
+maybe_cache_put(_FilePath, _Size, _Mtime, TtlMs) when TtlMs =< 0 ->
+    ok;
+maybe_cache_put(FilePath, Size, Mtime, TtlMs) ->
+    cache_put(FilePath, Size, Mtime, TtlMs).
 
 %% Read leaf-stat after the symlink-policy gate has approved follow.
 -spec serve_followed_file(file:filename_all(), roadrunner_req:request()) ->

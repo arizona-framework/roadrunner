@@ -446,6 +446,118 @@ symlink_policy_refuse_test_() ->
             ]
         end}.
 
+%% =============================================================================
+%% Metadata cache — direct cache helpers plus end-to-end coverage of the
+%% `cache_ttl_ms` route opt.
+%% =============================================================================
+
+cache_helpers_test_() ->
+    {setup, fun cache_helpers_setup/0, fun cache_helpers_cleanup/1, fun({Dir}) ->
+        [
+            {"cache_get returns miss when no entry exists", fun() ->
+                FilePath = filename:join(Dir, "no_cache_yet.txt"),
+                ?assertEqual(miss, roadrunner_static:cache_get(FilePath))
+            end},
+            {"cache_put then cache_get within TTL returns the entry", fun() ->
+                FilePath = filename:join(Dir, "fresh.txt"),
+                ok = roadrunner_static:cache_put(FilePath, 100, 1700000000, 60000),
+                ?assertEqual(
+                    {ok, 100, 1700000000},
+                    roadrunner_static:cache_get(FilePath)
+                )
+            end},
+            {"cache_get returns miss after TTL expires", fun() ->
+                FilePath = filename:join(Dir, "expiring.txt"),
+                ok = roadrunner_static:cache_put(FilePath, 50, 1700000000, 1),
+                timer:sleep(20),
+                ?assertEqual(miss, roadrunner_static:cache_get(FilePath))
+            end}
+        ]
+    end}.
+
+cache_populated_after_request_test_() ->
+    {setup, fun cache_enabled_setup/0, fun cache_enabled_cleanup/1, fun(
+        {_Name, Dir, Port}
+    ) ->
+        [
+            {"first request populates the metadata cache when ttl > 0", fun() ->
+                %% The handler builds FilePath from `Dir` + binary segments
+                %% so the resulting cache key is a binary; match that here.
+                FilePath = filename:join([Dir, ~"cached.txt"]),
+                _ = persistent_term:erase({roadrunner_static_meta, FilePath}),
+                ?assertEqual(miss, roadrunner_static:cache_get(FilePath)),
+                _Reply = http_get(Port, ~"/static/cached.txt"),
+                ?assertMatch({ok, _Size, _Mtime}, roadrunner_static:cache_get(FilePath))
+            end},
+            {"second request hits the cache and serves the same body", fun() ->
+                %% Drive `serve_file` through its cache-hit branch by
+                %% issuing a follow-up GET after the first populated the
+                %% cache. Body must match.
+                Reply1 = http_get(Port, ~"/static/cached.txt"),
+                Reply2 = http_get(Port, ~"/static/cached.txt"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply1),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply2),
+                [_, Body1] = binary:split(Reply1, ~"\r\n\r\n"),
+                [_, Body2] = binary:split(Reply2, ~"\r\n\r\n"),
+                ?assertEqual(Body1, Body2),
+                ?assertEqual(~"cached", Body1)
+            end}
+        ]
+    end}.
+
+cache_default_off_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun({Dir, Port}) ->
+        {"default cache_ttl_ms is 0; nothing is cached", fun() ->
+            FilePath = filename:join([Dir, ~"hello.html"]),
+            _ = persistent_term:erase({roadrunner_static_meta, FilePath}),
+            _Reply = http_get(Port, ~"/static/hello.html"),
+            ?assertEqual(miss, roadrunner_static:cache_get(FilePath))
+        end}
+    end}.
+
+cache_helpers_setup() ->
+    Dir = filename:join(
+        "/tmp", "rr_cache_helpers_" ++ integer_to_list(rand:uniform(1000000))
+    ),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    {Dir}.
+
+cache_helpers_cleanup({Dir}) ->
+    lists:foreach(
+        fun
+            ({{roadrunner_static_meta, _Path} = K, _V}) ->
+                _ = persistent_term:erase(K),
+                ok;
+            (_) ->
+                ok
+        end,
+        persistent_term:get()
+    ),
+    _ = file:del_dir_r(Dir),
+    ok.
+
+cache_enabled_setup() ->
+    Name = static_test_cache_on,
+    Dir = filename:join(
+        "/tmp", "rr_cache_on_" ++ integer_to_list(rand:uniform(1000000))
+    ),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    ok = file:write_file(filename:join(Dir, "cached.txt"), ~"cached"),
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        routes => [
+            {~"/static/*path", roadrunner_static, #{
+                dir => Dir, cache_ttl_ms => 60000
+            }}
+        ]
+    }),
+    {Name, Dir, roadrunner_listener:port(Name)}.
+
+cache_enabled_cleanup({Name, Dir, _Port}) ->
+    ok = roadrunner_listener:stop(Name),
+    _ = file:del_dir_r(Dir),
+    ok.
+
 setup_with_policy(Name, Policy) ->
     Dir = filename:join(
         "/tmp",
