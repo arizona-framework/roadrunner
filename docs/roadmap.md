@@ -224,7 +224,7 @@ streams):** beam total 296 MiB. Breakdown:
 | code | 9 MiB | 3 % |
 | ets | 3 MiB | 1 % |
 
-Top processes mid-bench, init=`proc_lib:init_p/5`,
+Top processes mid-bench, init=proc_lib's `init_p/5`,
 current=`gen:do_call/4`: all clustered at **~112 KiB each** (10 of 10
 sampled).
 
@@ -281,7 +281,8 @@ re-attempt** without new evidence.
 [raw, binary])` returns an fd that `prim_file:get_fd_data/1` tags
 with the opening process's pid and rejects from any other caller
 (`{error, not_on_controlling_process}`). `file:sendfile/5` goes
-through the same check. There is no `file:controlling_process/2`.
+through the same check. There is no file equivalent of
+`gen_tcp:controlling_process/2`.
 A supervised gen_server holding fds for all conns therefore can't
 hand them out to acceptors. See
 `erts-17.0/src/prim_file.erl:499-504`.
