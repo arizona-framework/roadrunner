@@ -207,6 +207,46 @@ finding from the survey.
 **Scope:** medium — fprof + targeted refactor + A/B precommit
 verification.
 
+### Investigate HTTP/2 high-concurrency memory
+
+**What:** `json-h2c @ 4096c` uses 1.6 GiB at 124K rps in the HttpArena
+benchmark, high vs the same scenario over h1 (513 MiB at 193K rps) and
+vs peer h2 frameworks (actix at 1 GiB for 1.2M rps). Several candidate
+hotspots have been named (per-stream state size in
+`roadrunner_conn_loop_http2:stream_entry/0`, HPACK dynamic table,
+eager WINDOW_UPDATE refills, pending-send queues, BEAM
+message-passing GC pressure) but none measured.
+
+**Why deferred:** premature optimization risks shipping changes with
+deltas inside noise. Profile first (`recon:proc_count(memory, 5)`
+during a representative load plus `erlang:memory/0` snapshots),
+identify the dominant bucket, then design the smallest change.
+
+**Scope:** investigation, then a targeted fix sized to the finding.
+
+### roadrunner_static FD cache for safe default-on caching
+
+**What:** Pair the opt-in metadata cache from `roadrunner_static`
+(commit `a7670f4`, `cache_ttl_ms` opt) with a bounded fd cache. The
+fd, opened once and reused, gives `file:sendfile/5` an at-open
+inode snapshot, so a file replaced or resized mid-window stops
+producing `Content-Length` / body mismatch responses. Combined fd
++ meta cache is safe enough to consider default-on.
+
+**Why deferred:** the meta-only cache today is opt-in precisely
+because it has that staleness footgun (nginx makes the same
+trade-off with `open_file_cache`). The fd cache also needs:
+- A bounded LRU keyed by `{Path, Mtime}` with a default cap.
+- Owner process (likely a tiny `gen_server` under `roadrunner_sup`)
+  so the fd survives caller exits.
+- A focused correctness test proving concurrent `file:sendfile/5`
+  against a shared raw fd preserves byte ranges across schedulers
+  (the kernel does the right thing under positional sendfile with
+  a non-NULL offset, but verify before relying on it).
+
+**Scope:** small-medium. Per-listener fd cache process plus the
+sendfile call site in `src/roadrunner_transport.erl:213`.
+
 ### Sync headline scenarios in comparison.md + resource_results.md
 
 **What:** `docs/comparison.md` and `docs/resource_results.md` still
