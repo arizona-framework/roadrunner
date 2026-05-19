@@ -130,7 +130,8 @@
     streaming_response,
     multi_stream_h2,
     small_chunked_response,
-    tls_handshake_throughput
+    tls_handshake_throughput,
+    large_post_h2
 ]).
 
 -define(KNOWN_SCENARIOS,
@@ -1531,6 +1532,12 @@ scenario_roadrunner_opts(large_post_streaming, BaseOpts) ->
         body_buffering => manual,
         routes => [{~"/drain", roadrunner_bench_drain_handler, undefined}]
     };
+scenario_roadrunner_opts(large_post_h2, BaseOpts) ->
+    %% h2 has no manual body-buffering mode yet — the auto-buffered
+    %% body shape is enough to exercise inbound DATA frames and the
+    %% WINDOW_UPDATE refill path that the conn loop's flow-control
+    %% bookkeeping drives.
+    BaseOpts#{routes => [{~"/drain", roadrunner_bench_drain_handler, undefined}]};
 scenario_roadrunner_opts(gzip_response, BaseOpts) ->
     %% Enable roadrunner_compress middleware at the listener level so
     %% all routes get gzip when the client asks for it.
@@ -1699,6 +1706,8 @@ scenario_cowboy_routes(mixed_workload) ->
 scenario_cowboy_routes(post_4kb_form) ->
     [{'_', [{"/form", roadrunner_bench_cowboy_form_handler, []}]}];
 scenario_cowboy_routes(large_post_streaming) ->
+    [{'_', [{"/drain", roadrunner_bench_cowboy_drain_handler, []}]}];
+scenario_cowboy_routes(large_post_h2) ->
     [{'_', [{"/drain", roadrunner_bench_cowboy_drain_handler, []}]}];
 scenario_cowboy_routes(router_404_storm) ->
     [
@@ -2895,6 +2904,7 @@ scenario_method(echo) -> ~"POST";
 scenario_method(large_response) -> ~"GET";
 scenario_method(json) -> ~"GET";
 scenario_method(large_post_streaming) -> ~"POST";
+scenario_method(large_post_h2) -> ~"POST";
 scenario_method(gzip_response) -> ~"GET";
 scenario_method(backpressure_sustained) -> ~"GET";
 scenario_method(large_keepalive_session) -> ~"GET";
@@ -2922,6 +2932,7 @@ scenario_path(echo) -> ~"/echo";
 scenario_path(large_response) -> ~"/large";
 scenario_path(json) -> ~"/json";
 scenario_path(large_post_streaming) -> ~"/drain";
+scenario_path(large_post_h2) -> ~"/drain";
 scenario_path(gzip_response) -> ~"/gzip";
 scenario_path(backpressure_sustained) -> ~"/";
 scenario_path(large_keepalive_session) -> ~"/";
@@ -2995,6 +3006,13 @@ build_request(large_post_streaming) ->
         BodyLenBin/binary,
         "\r\n\r\n",
         Body/binary>>;
+build_request(large_post_h2) ->
+    io:format(
+        standard_error,
+        "error: --scenarios large_post_h2 is h2-only (use --protocols h2)~n",
+        []
+    ),
+    halt(2);
 build_request(gzip_response) ->
     ~"GET /gzip HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n";
 build_request(backpressure_sustained) ->
@@ -3152,6 +3170,7 @@ expected_body_len(post_4kb_form) ->
     Pairs = post_4kb_form_pair_count(),
     byte_size(integer_to_binary(Pairs));
 expected_body_len(large_post_streaming) -> 2;
+expected_body_len(large_post_h2) -> 2;
 expected_body_len(gzip_response) ->
     %% 16 KB JSON body of repeating records compresses to ~180-200
     %% bytes via gzip (almost all dictionary references). Cowboy and
@@ -3484,14 +3503,24 @@ h2_request_shape(post_4kb_form) ->
         "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(large_post_streaming) ->
-    %% h2 has a different body-delivery model (DATA frames with
-    %% per-stream WINDOW_UPDATE flow control); a 1 MB POST over
-    %% h2 is a separate scenario worth adding later but the
-    %% current focus is the h1 body-state machine.
+    %% h1-only because the scenario exercises roadrunner's manual
+    %% body-buffering mode; for the equivalent h2 inbound-DATA test
+    %% see `large_post_h2`.
     io:format(standard_error,
         "error: --scenarios large_post_streaming is h1-only "
         "(use --protocols h1)~n", []),
     halt(2);
+h2_request_shape(large_post_h2) ->
+    %% 48 KB POST over h2 — three DATA frames (16 KB cap each), the
+    %% third drops both conn + stream recv windows below the 32 KB
+    %% refill threshold so each request fires one coalesced
+    %% WINDOW_UPDATE pair via
+    %% `roadrunner_conn_loop_http2:maybe_refill_recv_windows/2`.
+    %% Sized to fit in the default 65 KB initial recv-window peak so
+    %% the (flow-control-naive) bench client doesn't have to wait
+    %% for the server's WINDOW_UPDATE before sending the next request.
+    {~"POST", ~"/drain", [{~"content-type", ~"application/octet-stream"}],
+        binary:copy(~"x", 48 * 1024)};
 h2_request_shape(router_404_storm) ->
     %% Connection lifecycle is the dominant cost on this scenario;
     %% h2 conns + per-conn TLS handshake would obscure the
@@ -3847,6 +3876,8 @@ scenario_request_summary(post_4kb_form) ->
     "POST /form HTTP/1.1, 4 KB application/x-www-form-urlencoded body (router)";
 scenario_request_summary(large_post_streaming) ->
     "POST /drain HTTP/1.1, 1 MB body, manual-mode 64 KB chunks (router)";
+scenario_request_summary(large_post_h2) ->
+    "POST /drain over h2, 1 MB body in DATA frames (exercises WINDOW_UPDATE refills)";
 scenario_request_summary(router_404_storm) ->
     "GET /nope HTTP/1.1 + Connection: close, fresh conn per request, 404 expected (router)";
 scenario_request_summary(varied_paths_router) ->

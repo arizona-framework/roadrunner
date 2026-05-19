@@ -175,7 +175,7 @@ request(
     HFrame = roadrunner_http2_frame:encode({headers, Sid, HFlags, undefined, BlockBin}),
     Frames =
         case HasBody of
-            true -> [HFrame, roadrunner_http2_frame:encode({data, Sid, 16#01, Body})];
+            true -> [HFrame | encode_data_frames(Sid, Body)];
             false -> HFrame
         end,
     case ssl:send(Sock, Frames) of
@@ -324,6 +324,28 @@ recv_h2_streams(Sock, Buf, Pending, Dec) ->
 %% =============================================================================
 %% h1 helpers
 %% =============================================================================
+
+%% RFC 9113 §6.5.2 default MAX_FRAME_SIZE. The bench client doesn't
+%% negotiate a larger value via SETTINGS so this stays the cap.
+-define(H2_MAX_FRAME_SIZE, 16384).
+
+%% Chunk `Body` into DATA frames bounded by `?H2_MAX_FRAME_SIZE`,
+%% setting END_STREAM (`0x01`) on the last frame. Each chunk goes
+%% out as part of the same `ssl:send` iolist, so the wire shape is
+%% an h1-style "headers + body" round-trip — no flow-control wait,
+%% which limits the usable `Body` size to the server's initial
+%% recv-window peak (default 65535, raised by `proto_opts` knobs).
+encode_data_frames(Sid, Body) ->
+    encode_data_frames(Sid, Body, byte_size(Body)).
+
+encode_data_frames(Sid, Body, Size) when Size =< ?H2_MAX_FRAME_SIZE ->
+    [roadrunner_http2_frame:encode({data, Sid, 16#01, Body})];
+encode_data_frames(Sid, Body, Size) ->
+    <<Chunk:?H2_MAX_FRAME_SIZE/binary, Rest/binary>> = Body,
+    [
+        roadrunner_http2_frame:encode({data, Sid, 0, Chunk})
+        | encode_data_frames(Sid, Rest, Size - ?H2_MAX_FRAME_SIZE)
+    ].
 
 build_h1_request(Method, Path, ExtraHeaders, Body) ->
     BodyLen = byte_size(Body),
