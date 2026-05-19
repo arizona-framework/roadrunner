@@ -189,23 +189,54 @@ test in `roadrunner_conn_loop_http2_tests` that advertises a higher
 `MAX_FRAME_SIZE` in the client SETTINGS and asserts the resulting
 DATA frames scale up accordingly.
 
-### Investigate small-body POST RSS gap
+### Small-body POST RSS gap — investigated, it's the keep-alive GC trade-off
 
 **What:** A `--with-resources` survey (see `docs/resource_results.md`)
 shows roadrunner using **+51 % RSS** vs cowboy on `post_4kb_form` and
 **+17 %** on `echo` (256-byte body). The hot-path GETs and large-body
 streaming scenarios don't show this gap — only small-body POST.
 
-**Why deferred:** the likely cause is the per-request `body_state`
-machinery + manual-mode reader being allocated even for auto-mode
-small-body workloads. Investigation needs fprof under load to
-confirm the allocation site, then a targeted fix (e.g. lazy
-allocation of the body-state map / reader closures only when the
-handler opts into manual mode). Single most actionable resource
-finding from the survey.
+**Investigated on `perf/httparena-followups`.** The earlier
+hypothesis (per-request `body_state` / manual-reader allocated even
+in auto mode) was wrong: auto mode never builds the body_reader (see
+`roadrunner_conn_loop:read_body_phase`'s `auto` branch). The actual
+cause is the **keep-alive process model**: roadrunner reuses one conn
+process across keep-alive requests, so each request's garbage (body
+iolist, refc-binary body in the binary bucket, request-map copies,
+parser scratch) lingers until the BEAM fires a heap-growth-triggered
+GC — and small per-request allocations don't grow the heap fast
+enough to collect promptly. Cowboy spawns a fresh process per
+request that dies and reclaims immediately, so its steady-state
+footprint is lower.
 
-**Scope:** medium — fprof + targeted refactor + A/B precommit
-verification.
+**Important framing:** in the same measurement roadrunner ran ~2×
+cowboy's throughput (183 K vs 95 K rps on `post_4kb_form @ 64c`).
+Per-rps, roadrunner is *leaner* (0.53 vs 0.73 KB-beam/rps). The
+absolute-RSS gap is a consequence of pushing more requests through
+fewer, longer-lived processes.
+
+**Measured GC-frequency trade-off (`post_4kb_form @ 64c`):**
+
+| GC cadence | beam | rps | vs baseline |
+|---|---|---|---|
+| none (default) | 97 MB | 183 K | — |
+| every 16th req | ~96 MB | ~178 K | no mem gain, −3 % rps |
+| every request | 67 MB | 169 K | **−31 % mem, −8 % rps** |
+
+The benefit is steeply non-linear: 16 requests' garbage between
+collects is already most of the steady state, so only near-per-request
+GC moves the needle — and that costs throughput. `fullsweep_after`
+tuning was also tried (changes GC *type*, not *frequency*) and made
+memory slightly worse.
+
+**Why no fix shipped:** forcing GC trades away roadrunner's throughput
+lead to match cowboy's absolute memory, on a workload where roadrunner
+is already more memory-efficient per request. Not a clear win, and
+pre-v0.1 we don't add opt-in knobs. If a memory-constrained
+deployment ever needs it, the lever is a per-request `garbage_collect/0`
+at the keep-alive loop-back in `buffered_finish/3` (or an adaptive
+heap-size-threshold check) — but that's a deliberate policy choice,
+not a default.
 
 ### Reduce HTTP/2 per-stream worker heap
 
