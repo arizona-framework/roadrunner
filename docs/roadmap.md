@@ -247,41 +247,62 @@ enough to be `process_info`-d (8 K die between `erlang:processes/0`
 and the iteration). Their per-proc heap is small but the high churn
 sums.
 
+**Per-proc detail on the top 10 conn_loop procs (full
+`process_info` via the enhanced
+`test/roadrunner_bench_memprofile.erl`):**
+
+- `memory = 109 KiB`, `heap_size = 6772 words`,
+  `total_heap_size = 13544 words`, `stack_size = 30`,
+  **`message_queue_len = 16-29`**
+- `current_function = gen:do_call/4` — parked inside `ssl:send/2`,
+  which dispatches to the per-connection ssl gen_statem
+- All 10 top procs match this profile
+
+**Real bottleneck driving per-conn heap, not state layout:** the
+conn_loop's heap balloons during TLS `ssl:send` blocking because
+worker `h2_send_response` messages back up in the conn's mailbox.
+Each pending message carries its response payload (headers list +
+body iolist). With 16 concurrent streams per conn, the mailbox holds
+on the order of 16+ response messages × iolist size each while the
+conn is parked in `gen:do_call/4` waiting for the ssl gen_statem to
+drain. The 60 KiB average + 109 KiB outliers come mostly from this
+mailbox content, NOT the static `loop_state` record or the streams
+map.
+
 **Implications for the fix shape:**
 
-- The 112 KiB procs originally observed in `gen:do_call/4` are
-  `ssl_gen_statem` (over TLS, the conn loop's `ssl:send/2` blocks
-  the ssl gen_statem). They're OTP's, not ours, and they vanish for
-  HttpArena's `json-h2c` (cleartext) bench.
-- Our own per-conn footprint is ~60 KiB held in `roadrunner_conn_loop`
-  (mostly the conn_loop_http2 state: streams map, hpack contexts,
-  pending sends, recv buffer). At 4 K conns this scales to ~240 MiB
-  before any worker churn.
-- Stream-worker peak heap is a secondary lever — they're already
-  short-lived so hibernation in `sync/1` (the candidate the prior
-  draft of this entry leaned on) gives less than the conn_loop
-  reduction would. Plus the worker post-sync flow (`telemetry`,
-  `h2_worker_done`) makes `erlang:hibernate/3` (a tail call that
-  discards the stack) structurally awkward — would need CPS-style
-  refactor or a buffered-fast-path split.
+- Field-level pruning of `stream_entry/0` (e.g. clear `headers` after
+  worker dispatch) gives sub-1 % savings here — the workers already
+  copy `headers`/`body` away from the conn, and the conn's static
+  per-stream footprint is small relative to the in-flight mailbox.
+- The mailbox inflation is intrinsic to "workers send full responses
+  via messages to a conn that batches them onto a single TLS socket."
+  Mitigations are architectural (split the wire-write off the conn
+  loop, or have workers stage payloads in ets / persistent_term and
+  message only the pointer) — every option is a sizeable refactor and
+  trades message size for an indirection on the hot path.
+- Worker hibernation in `sync/1` would not help: workers are already
+  short-lived (the bench memprofile shows ~8 K procs die between
+  `erlang:processes/0` and `process_info` per snapshot pass).
 
-**Likely smallest impactful change — shrink conn_loop_http2 per-stream
-state.** Inspect `roadrunner_conn_loop_http2`'s streams map and the
-`stream_entry/0` shape: which fields are present for the lifetime of
-the stream vs only during specific phases? Per-stream HPACK contexts,
-pending-send queues, decoded request maps held across the handler
-dispatch — all candidates for tighter lifetimes. Even 5 KiB shaved
-per stream × 16 streams × 4 K conns = 320 MiB.
+**General roadrunner-on-TLS implication:** any h2-over-TLS workload
+shares this shape — the OTP ssl gen_statem dispatch is in the hot
+path of every outbound frame. Profiling-driven changes that reduce
+per-`ssl:send` latency (e.g. coalescing HEADERS + small DATA into a
+single send when the response fits in one frame, already in place at
+`send_buffered`) help across all TLS users.
 
 **Where NOT to look:** binary (23 MiB) and ets (3 MiB) are small —
 HPACK dynamic-table reaping and WINDOW_UPDATE batching wouldn't move
-the needle relative to the per-conn-state win.
+the needle. Per-stream state layout is similarly not the lever; the
+streams map is small relative to the mailbox.
 
-**Scope:** medium. Survey `stream_entry/0` field lifetimes, drop
-fields after their last reader, measure with the new `--with-resources`
-breakdown on `multi_stream_h2 @ 1024c` and HttpArena `json-h2c @ 4096c`.
-Verification target: `roadrunner_conn_loop` per-proc avg drops below
-40 KiB and total process MB at peak drops correspondingly.
+**Scope:** medium-to-large. The remaining levers are architectural
+(wire-write split or pointer-only worker→conn protocol), and the
+prerequisite is a workload where the gain would justify the
+refactor — for example, a measured h2c (cleartext) bench where the
+ssl gen_statem isn't in the picture, to confirm the mailbox-inflation
+finding is TLS-specific and not present without it.
 
 ### roadrunner_static FD cache for sendfile — investigated, not viable
 
