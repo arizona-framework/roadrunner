@@ -307,8 +307,8 @@ concurrent_streams_both_dispatch() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_concurrent_test,
@@ -369,8 +369,8 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     RequestsCounter = atomics:new(1, [{signed, false}]),
     ProtoOpts = #{
         client_counter => Counter,
@@ -419,8 +419,8 @@ plaintext_listener_without_h2c_stays_h1() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     RequestsCounter = atomics:new(1, [{signed, false}]),
     ProtoOpts = #{
         client_counter => Counter,
@@ -883,8 +883,8 @@ middleware_chain_runs() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Mw = fun(Req, Next) -> Next(Req) end,
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_mw_test,
@@ -945,8 +945,8 @@ router_404_returns_not_found() ->
     %% Publish empty routes for a fake listener.
     persistent_term:put({roadrunner_routes, h2_404_listener}, roadrunner_router:compile([], [])),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_404_listener,
@@ -1535,8 +1535,8 @@ rst_during_stream_response_unwinds_worker() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_rst_during_stream,
@@ -1613,8 +1613,8 @@ drain_refuses_new_streams() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_test,
@@ -1666,8 +1666,8 @@ drain_with_in_flight_stream_waits() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_inflight_test,
@@ -1726,8 +1726,8 @@ drain_message_is_idempotent() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_dup_test,
@@ -1776,8 +1776,8 @@ drain_then_peer_rst_exits_via_frame_loop() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_rst_test,
@@ -1869,8 +1869,8 @@ telemetry_request_stop_fires_for_router_404() ->
         drain_mailbox(),
         persistent_term:put({roadrunner_routes, h2_telem_404}, roadrunner_router:compile([], [])),
         Self = self(),
-        Counter = atomics:new(1, [{signed, false}]),
-        ok = atomics:add(Counter, 1, 1),
+        Counter = counters:new(1, [write_concurrency]),
+        ok = counters:add(Counter, 1, 1),
         ProtoOpts = #{
             client_counter => Counter,
             listener_name => h2_telem_404,
@@ -1950,8 +1950,8 @@ run_h2_with_compress_middleware(Path, ExtraHeaders) ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_compress_test,
@@ -2624,8 +2624,8 @@ post_handshake_handler(Handler) ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_strict_test,
@@ -2742,8 +2742,8 @@ idle_timeout_emits_goaway() ->
 
 start_http2_conn() ->
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     %% Phase H5 dispatch needs at least the route resolver + an
     %% empty middleware chain. Tests don't actually exercise a
     %% handler in this file (they exit before any HEADERS frame
@@ -2868,8 +2868,8 @@ run_h2_request_with_handler(Handler, Path) ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_handler_test,
@@ -2921,8 +2921,8 @@ run_stream_request(Path) ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_stream_test,

@@ -86,7 +86,7 @@
     keep_alive_timeout := non_neg_integer(),
     max_keep_alive_requests := pos_integer(),
     max_clients := pos_integer(),
-    client_counter := atomics:atomics_ref(),
+    client_counter := counters:counters_ref(),
     requests_counter := atomics:atomics_ref(),
     min_bytes_per_second := non_neg_integer(),
     body_buffering := auto | manual,
@@ -188,10 +188,14 @@ Try to bump the live-connection counter under `max_clients`. Returns
 `true` on success (caller may proceed to spawn a conn), `false` if
 the cap is already met (caller must close the accepted socket).
 
-The check is racy by a small amount: between increment and rollback
-multiple acceptors may briefly observe a count slightly above the
-cap, but the count is corrected immediately by the rollback. The
-overshoot is at most `num_acceptors - 1` — bounded and harmless.
+The check is racy by a small amount. The counter uses `counters` with
+`write_concurrency`, so `counters:get/2` returns an eventually-consistent
+sum across per-scheduler sub-counters: a fresh increment on one
+scheduler may not be visible to a concurrent read on another for a
+short window. Combined with the increment / rollback pattern, this
+allows the count to briefly observe a value slightly above the cap
+before rollbacks reconcile. The overshoot is bounded by the number of
+acceptors in flight at the moment of the storm: bounded and harmless.
 
 ## Slot leak under abnormal exits
 
@@ -209,18 +213,19 @@ against the live counter and reconciles the difference.
 """.
 -spec try_acquire_slot(proto_opts()) -> boolean().
 try_acquire_slot(#{client_counter := Ref, max_clients := Max}) ->
-    case atomics:add_get(Ref, 1, 1) of
+    ok = counters:add(Ref, 1, 1),
+    case counters:get(Ref, 1) of
         N when N =< Max ->
             true;
         _ ->
-            atomics:sub(Ref, 1, 1),
+            ok = counters:sub(Ref, 1, 1),
             false
     end.
 
--doc "Decrement the live-connection counter — paired with `try_acquire_slot/1`.".
+-doc "Decrement the live-connection counter, paired with `try_acquire_slot/1`.".
 -spec release_slot(proto_opts()) -> ok.
 release_slot(#{client_counter := Ref}) ->
-    _ = atomics:sub(Ref, 1, 1),
+    ok = counters:sub(Ref, 1, 1),
     ok.
 
 -doc false.

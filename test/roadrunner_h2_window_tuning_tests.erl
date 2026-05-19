@@ -218,8 +218,8 @@ start_conn(H2Opts) ->
     %% flat `http2_` prefix the conn loop reads via single `maps:get/2`.
     {ok, _} = application:ensure_all_started(telemetry),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_window_test,

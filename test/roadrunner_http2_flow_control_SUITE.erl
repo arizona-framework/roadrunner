@@ -349,8 +349,8 @@ blocked_send_idle_timeout_emits_goaway(_Config) ->
 %% eunit suite's API for symmetry.
 start_conn(Handler) ->
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_flow_test,

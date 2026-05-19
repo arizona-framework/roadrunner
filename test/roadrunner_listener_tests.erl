@@ -170,14 +170,14 @@ slot_reconciliation_releases_sustained_orphan_slots_test() ->
         State = sys:get_state(ListenerPid),
         ProtoOpts = element(4, State),
         Counter = maps:get(client_counter, ProtoOpts),
-        ?assertEqual(0, atomics:get(Counter, 1)),
+        ?assertEqual(0, counters:get(Counter, 1)),
         %% Plant 3 orphan slots — bumped without a corresponding pg join.
-        ok = atomics:add(Counter, 1, 3),
-        ?assertEqual(3, atomics:get(Counter, 1)),
+        ok = counters:add(Counter, 1, 3),
+        ?assertEqual(3, counters:get(Counter, 1)),
         %% First tick at 30ms records prev_diff=3; second tick at 60ms
         %% reaps. Wait long enough to be safe across CI jitter.
         timer:sleep(200),
-        ?assertEqual(0, atomics:get(Counter, 1)),
+        ?assertEqual(0, counters:get(Counter, 1)),
         receive
             {ev, [roadrunner, listener, slots_reconciled], _, Md} ->
                 ?assertEqual(Name, maps:get(listener_name, Md)),
@@ -223,9 +223,9 @@ slot_reconciliation_only_reaps_excess_over_pg_members_test() ->
     end),
     %% Wait briefly for both joins to register.
     timer:sleep(20),
-    ok = atomics:add(Counter, 1, 5),
+    ok = counters:add(Counter, 1, 5),
     timer:sleep(200),
-    ?assertEqual(2, atomics:get(Counter, 1)),
+    ?assertEqual(2, counters:get(Counter, 1)),
     Stub1 ! stop,
     Stub2 ! stop,
     ok = roadrunner_listener:stop(Name).
@@ -376,9 +376,9 @@ slot_reconciliation_disabled_by_default_test() ->
     ProtoOpts = element(4, State),
     Counter = maps:get(client_counter, ProtoOpts),
     %% Plant orphan slots; without reconciliation they stay forever.
-    ok = atomics:add(Counter, 1, 3),
+    ok = counters:add(Counter, 1, 3),
     timer:sleep(100),
-    ?assertEqual(3, atomics:get(Counter, 1)),
+    ?assertEqual(3, counters:get(Counter, 1)),
     ok = roadrunner_listener:stop(Name).
 
 listener_info_initial_zero_test() ->

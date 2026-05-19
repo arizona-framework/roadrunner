@@ -521,11 +521,15 @@ build_proto_opts(Opts, ListenerName) ->
     %% with an `http2_` prefix so the hot path reads each knob via
     %% a single `maps:get/2` instead of a nested map dive.
     {Protocols, ProtoFlats} = normalize_protocols(Opts),
-    %% Per-listener atomics: live-connection counter (acceptors bump on
+    %% Per-listener counters: live-connection counter (acceptors bump on
     %% accept; conns decrement on exit) and a cumulative requests-served
-    %% counter (conn bumps on each handler dispatch). Lock-free, ~1ns
-    %% per op — cheap enough on the hot path.
-    ClientCounter = atomics:new(1, [{signed, false}]),
+    %% counter (conn bumps on each handler dispatch). `client_counter`
+    %% uses the `counters` module with `write_concurrency` so each
+    %% scheduler bumps a private sub-counter (lock-free, no cache-line
+    %% ping-pong across cores). `counters:get/2` returns an
+    %% eventually-consistent sum, which matches the bounded-overshoot
+    %% contract `try_acquire_slot/1` already documents.
+    ClientCounter = counters:new(1, [write_concurrency]),
     RequestsCounter = atomics:new(1, [{signed, false}]),
     Base = maps:merge(
         #{
@@ -759,7 +763,7 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
         max_clients := MaxClients
     } = ProtoOpts,
     Reply = #{
-        active_clients => atomics:get(ClientCounter, 1),
+        active_clients => counters:get(ClientCounter, 1),
         max_clients => MaxClients,
         requests_served => atomics:get(RequestsCounter, 1)
     },
@@ -801,12 +805,12 @@ notify_conns(Group, Deadline) ->
     _ = [Pid ! {roadrunner_drain, Deadline} || Pid <- pg:get_members(Group)],
     ok.
 
-%% Poll the active-clients atomics counter every 50ms (or whatever
-%% remains, if smaller) until it hits zero or the deadline expires.
--spec wait_for_drain(atomics:atomics_ref(), integer(), term()) ->
+%% Poll the active-clients counter every 50ms (or whatever remains,
+%% if smaller) until it hits zero or the deadline expires.
+-spec wait_for_drain(counters:counters_ref(), integer(), term()) ->
     {ok, drained} | {timeout, non_neg_integer()}.
 wait_for_drain(Counter, Deadline, Group) ->
-    case atomics:get(Counter, 1) of
+    case counters:get(Counter, 1) of
         0 ->
             {ok, drained};
         N ->
@@ -854,7 +858,7 @@ handle_info(
     %% `length(members) < counter` (orphans = counter - length); a
     %% bounded count short-circuits at the counter so the worst case
     %% is `min(length(members), counter)` element visits.
-    Counter0 = atomics:get(Counter, 1),
+    Counter0 = counters:get(Counter, 1),
     PgCountBounded = count_up_to(pg:get_members({roadrunner_drain, Name}), Counter0),
     NewDiff = Counter0 - PgCountBounded,
     %% Only release slots that have been orphaned for two consecutive
@@ -865,7 +869,7 @@ handle_info(
         0 ->
             ok;
         N when N > 0 ->
-            _ = atomics:sub(Counter, 1, N),
+            ok = counters:sub(Counter, 1, N),
             logger:notice(#{
                 msg => "roadrunner_listener reconciled orphan slots",
                 listener_name => Name,

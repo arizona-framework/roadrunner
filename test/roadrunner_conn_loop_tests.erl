@@ -80,8 +80,8 @@ stray_msg_in_awaiting_shoot_is_ignored_test() ->
 
 slot_released_on_drain_in_awaiting_shoot_test() ->
     ensure_pg(),
-    Counter = atomics:new(1, [{signed, false}]),
-    _ = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     Opts = (fake_opts(slot))#{client_counter := Counter},
     {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_sink()}, Opts),
     Ref = monitor(process, Pid),
@@ -90,7 +90,7 @@ slot_released_on_drain_in_awaiting_shoot_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 2000 -> error(no_normal_exit)
     end,
-    ?assertEqual(0, atomics:get(Counter, 1)).
+    ?assertEqual(0, counters:get(Counter, 1)).
 
 %% --- read_request + dispatch ---
 
@@ -1183,8 +1183,8 @@ slot_released_after_parse_exit_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Counter = atomics:new(1, [{signed, false}]),
-    _ = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     Opts = (fake_opts(slot_parse))#{client_counter := Counter},
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
@@ -1193,7 +1193,7 @@ slot_released_after_parse_exit_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 2000 -> error(no_normal_exit)
     end,
-    ?assertEqual(0, atomics:get(Counter, 1)),
+    ?assertEqual(0, counters:get(Counter, 1)),
     Sink ! stop.
 
 %% --- helpers ---
@@ -1217,7 +1217,7 @@ fake_opts(ListenerName) ->
         keep_alive_timeout => 5000,
         max_keep_alive_requests => 100,
         max_clients => 10,
-        client_counter => atomics:new(1, [{signed, false}]),
+        client_counter => counters:new(1, [write_concurrency]),
         requests_counter => atomics:new(1, [{signed, false}]),
         min_bytes_per_second => 0,
         body_buffering => auto,
