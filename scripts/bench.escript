@@ -1199,16 +1199,51 @@ sampler_loop(Peer, OsPid, Acc) ->
     receive
         {_, stop} -> Acc
     after 100 ->
+        Now = erlang:monotonic_time(millisecond),
         Rss = read_proc_rss_kb(OsPid),
         BeamTotal =
             try proplists:get_value(total, peer:call(Peer, erlang, memory, [], 1000), 0)
             catch _:_ -> 0
             end,
-        sampler_loop(Peer, OsPid, Acc#{
+        Acc1 = Acc#{
             peak_rss_kb => max(maps:get(peak_rss_kb, Acc), Rss),
             peak_beam_total => max(maps:get(peak_beam_total, Acc), BeamTotal)
-        })
+        },
+        Acc2 = maybe_capture_mem_profile(Peer, BeamTotal, Now, Acc1),
+        sampler_loop(Peer, OsPid, Acc2)
     end.
+
+%% Per-`initial_call` memory snapshot, refreshed every 1 s while
+%% `erlang:memory(total)` is above 100 MB. Re-sampling matters
+%% because process counts ramp up during warmup; an early snapshot
+%% catches a fraction of the steady-state load. Keep the LATEST,
+%% so by the time the sampler stops we have a near-peak view.
+-define(MEM_PROFILE_THRESHOLD_BYTES, 100 * 1024 * 1024).
+-define(MEM_PROFILE_REFRESH_MS, 1000).
+
+maybe_capture_mem_profile(Peer, BeamTotal, Now, Acc) when
+    BeamTotal >= ?MEM_PROFILE_THRESHOLD_BYTES
+->
+    Due =
+        case maps:find(mem_profile_at_ms, Acc) of
+            error -> true;
+            {ok, LastMs} -> Now - LastMs >= ?MEM_PROFILE_REFRESH_MS
+        end,
+    case Due of
+        true ->
+            try peer:call(Peer, roadrunner_bench_memprofile, snapshot, [], 5000) of
+                {_, _} = Snapshot ->
+                    Acc#{mem_profile => Snapshot, mem_profile_at_ms => Now};
+                _ ->
+                    Acc
+            catch
+                _:_ -> Acc
+            end;
+        false ->
+            Acc
+    end;
+maybe_capture_mem_profile(_Peer, _BeamTotal, _Now, Acc) ->
+    Acc.
 
 read_proc_rss_kb(OsPid) ->
     case file:read_file("/proc/" ++ OsPid ++ "/status") of
@@ -4001,6 +4036,100 @@ print_summary(SidesAndResults) ->
         "        variance — re-run several times before drawing conclusions.~n"
         "        Latency deltas (p50/p99) tend to be more stable.~n",
         []
+    ),
+    print_mem_profiles(Sorted).
+
+print_mem_profiles(Rows) ->
+    lists:foreach(
+        fun({Side, Row}) ->
+            case maps:get(mem_profile, Row, undefined) of
+                {TotalProcs, Groups} ->
+                    print_mem_profile(Side, TotalProcs, Groups);
+                _ ->
+                    ok
+            end
+        end,
+        Rows
+    ).
+
+print_mem_profile(Side, TotalProcs, Groups) ->
+    Sum = lists:foldl(
+        fun({_, #{total_bytes := T}}, Acc) -> Acc + T end, 0, Groups
+    ),
+    Top = lists:sublist(Groups, 20),
+    Tail = lists:nthtail(min(20, length(Groups)), Groups),
+    TailCount = lists:sum([C || {_, #{count := C}} <- Tail]),
+    TailBytes = lists:sum([T || {_, #{total_bytes := T}} <- Tail]),
+    io:format(
+        "~nmem profile (~s, near-peak): ~B procs, ~B MB total across all groups~n",
+        [atom_to_list(Side), TotalProcs, Sum div (1024 * 1024)]
+    ),
+    io:format("~s~n", [string:copies("-", 100)]),
+    io:format(
+        "~-50s ~8s ~10s ~10s   top current_function~n",
+        ["initial_call", "count", "total MB", "max KB"]
+    ),
+    lists:foreach(
+        fun({InitialCall, Stats}) ->
+            #{
+                count := C,
+                total_bytes := T,
+                max_bytes := M,
+                top_current_funcs := TopCurFns
+            } = Stats,
+            TopStr =
+                case TopCurFns of
+                    [{Cur, N} | _] -> io_lib:format("~p (~B)", [Cur, N]);
+                    _ -> ""
+                end,
+            io:format(
+                "~-50s ~8B ~10B ~10B   ~s~n",
+                [
+                    io_lib:format("~p", [InitialCall]),
+                    C,
+                    T div (1024 * 1024),
+                    M div 1024,
+                    TopStr
+                ]
+            )
+        end,
+        Top
+    ),
+    case Tail of
+        [] ->
+            ok;
+        _ ->
+            io:format(
+                "~-50s ~8B ~10B ~10s~n",
+                [
+                    io_lib:format("(other ~B groups)", [length(Tail)]),
+                    TailCount,
+                    TailBytes div (1024 * 1024),
+                    ""
+                ]
+            )
+    end,
+    %% Also surface the top single procs to spot fat outliers the
+    %% group view smooths over.
+    print_top_procs(Groups).
+
+print_top_procs(Groups) ->
+    TopProcs = lists:sublist(
+        lists:sort(
+            fun({_, #{max_bytes := A}}, {_, #{max_bytes := B}}) -> A >= B end,
+            Groups
+        ),
+        5
+    ),
+    io:format("~nfattest single procs (by max_bytes within group):~n"),
+    lists:foreach(
+        fun({InitialCall, #{max_bytes := M, count := C}}) ->
+            io:format(
+                "  ~6B KB  count=~-6B  ~p~n",
+                [M div 1024, C, InitialCall]
+            )
+        end,
+        TopProcs
     ).
 
 %% ===========================================================================
