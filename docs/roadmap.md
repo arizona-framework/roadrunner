@@ -228,49 +228,60 @@ Top processes mid-bench, init=proc_lib's `init_p/5`,
 current=`gen:do_call/4`: all clustered at **~112 KiB each** (10 of 10
 sampled).
 
-**Important caveat — those 112 KiB procs are not our stream workers.**
-Stream workers spawn via `spawn_monitor(?MODULE, init, [_])` (so
-`initial_call = {roadrunner_http2_stream_worker, init, 4}`, not
-proc_lib's `init_p/5`) and block in a raw `receive` in `sync/1` (so
-`current_function = {?MODULE, sync, 1}`, not `gen:do_call/4`). The
-heavy processes are therefore gen_server / gen_statem callers — over
-the local TLS bench, most likely the conn loops blocked in
-`ssl:send/2`, which internally does `gen_statem:call` to the
-per-connection ssl gen_statem. HttpArena's `json-h2c` is cleartext
-(no ssl gen_statem) so the bottleneck shape there is probably
-different from local; need a focused h2c profile to know.
+**Granular per-`initial_call` breakdown (local
+`multi_stream_h2 @ 1024c`, captured via
+`test/roadrunner_bench_memprofile.erl` + `scripts/bench.escript
+--with-resources`):**
 
-**Next step — granular profile, not a refactor yet.** Group
-`process_info(_, [memory])` by `initial_call` (and by `current_function`
-within the top tier) over both the local TLS bench AND HttpArena h2c.
-That separates "conn loops blocked in ssl gen_statem" (TLS-only) from
-"stream workers" (both) from other gen_servers. Without that
-breakdown we can't tell which structural fix matches the actual
-distribution.
+| initial_call | count | total MB | per-proc avg | top current_function |
+|---|---|---|---|---|
+| roadrunner_conn_loop init_loop/3 | ~935 | 57 | ~60 KiB | roadrunner_conn_loop_http2 recv_more/1 |
+| ssl_gen_statem init/1 | ~935 | 48 | ~53 KiB | gen_statem loop/3 |
+| tls_sender init/1 | ~935 | 11 | ~12 KiB | gen_statem loop/3 |
+| other 60 groups | ~2 K | ~8 | — | mixed |
+
+Total accounted across all groups: **~125 MiB**. Process bucket at
+the same instant: **~190 MiB**. The ~65 MiB gap is short-lived stream
+workers — total processes count is ~12 K but only ~3.8 K survive long
+enough to be `process_info`-d (8 K die between `erlang:processes/0`
+and the iteration). Their per-proc heap is small but the high churn
+sums.
+
+**Implications for the fix shape:**
+
+- The 112 KiB procs originally observed in `gen:do_call/4` are
+  `ssl_gen_statem` (over TLS, the conn loop's `ssl:send/2` blocks
+  the ssl gen_statem). They're OTP's, not ours, and they vanish for
+  HttpArena's `json-h2c` (cleartext) bench.
+- Our own per-conn footprint is ~60 KiB held in `roadrunner_conn_loop`
+  (mostly the conn_loop_http2 state: streams map, hpack contexts,
+  pending sends, recv buffer). At 4 K conns this scales to ~240 MiB
+  before any worker churn.
+- Stream-worker peak heap is a secondary lever — they're already
+  short-lived so hibernation in `sync/1` (the candidate the prior
+  draft of this entry leaned on) gives less than the conn_loop
+  reduction would. Plus the worker post-sync flow (`telemetry`,
+  `h2_worker_done`) makes `erlang:hibernate/3` (a tail call that
+  discards the stack) structurally awkward — would need CPS-style
+  refactor or a buffered-fast-path split.
+
+**Likely smallest impactful change — shrink conn_loop_http2 per-stream
+state.** Inspect `roadrunner_conn_loop_http2`'s streams map and the
+`stream_entry/0` shape: which fields are present for the lifetime of
+the stream vs only during specific phases? Per-stream HPACK contexts,
+pending-send queues, decoded request maps held across the handler
+dispatch — all candidates for tighter lifetimes. Even 5 KiB shaved
+per stream × 16 streams × 4 K conns = 320 MiB.
 
 **Where NOT to look:** binary (23 MiB) and ets (3 MiB) are small —
 HPACK dynamic-table reaping and WINDOW_UPDATE batching wouldn't move
-the needle relative to the per-process win.
+the needle relative to the per-conn-state win.
 
-**Candidate fix once workers are confirmed as a top tier — hibernate
-parked workers.** Workers park in `sync/1` waiting for `h2_send_ack`,
-which can be delayed by stream / conn send-window flow control.
-Hibernation collapses the heap to ~233 words (~2 KiB). Naively
-dropping `erlang:hibernate/3` into `sync/1` does NOT work, though:
-hibernate is a tail call that discards the calling stack, but the
-worker has post-sync work (`telemetry:request_stop`, then
-`ConnPid ! {h2_worker_done, StreamId}` in `init/4`). A clean
-implementation either (a) restructures the worker into
-continuation-passing style so each wait point is a hibernate with an
-explicit continuation, or (b) splits the buffered path (single sync,
-fold post-sync work into the hibernated wait function) from the
-streaming / loop paths (multi-sync, keep current shape).
-
-**Scope:** medium. Touches `roadrunner_http2_stream_worker`'s wait
-loop AND its surrounding flow (telemetry stop site, `h2_worker_done`
-emission). Verification: re-run `multi_stream_h2 @ 1024c` and check
-per-process top-10 drops below ~10 KiB, then re-run HttpArena
-`json-h2c @ 4096c` and check the 1.6 GiB total falls meaningfully.
+**Scope:** medium. Survey `stream_entry/0` field lifetimes, drop
+fields after their last reader, measure with the new `--with-resources`
+breakdown on `multi_stream_h2 @ 1024c` and HttpArena `json-h2c @ 4096c`.
+Verification target: `roadrunner_conn_loop` per-proc avg drops below
+40 KiB and total process MB at peak drops correspondingly.
 
 ### roadrunner_static FD cache for sendfile — investigated, not viable
 
