@@ -471,6 +471,21 @@ cache_helpers_test_() ->
                 ok = roadrunner_static:cache_put(FilePath, 50, 1700000000, 1),
                 timer:sleep(20),
                 ?assertEqual(miss, roadrunner_static:cache_get(FilePath))
+            end},
+            {"cache_ttl_ms => infinity entries never expire", fun() ->
+                %% No `monotonic_time + infinity` arithmetic; sleeping
+                %% past any finite TTL must still return the entry.
+                FilePath = filename:join(Dir, "forever.txt"),
+                ok = roadrunner_static:cache_put(FilePath, 42, 1700000000, infinity),
+                ?assertEqual(
+                    {ok, 42, 1700000000},
+                    roadrunner_static:cache_get(FilePath)
+                ),
+                timer:sleep(10),
+                ?assertEqual(
+                    {ok, 42, 1700000000},
+                    roadrunner_static:cache_get(FilePath)
+                )
             end}
         ]
     end}.

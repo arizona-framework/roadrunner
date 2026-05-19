@@ -68,9 +68,10 @@ length / body mismatch (truncated or short response). Safe for
 deploy-then-restart workflows with versioned-by-hash assets;
 unsafe for mutable files (user uploads, dev hot-reload).
 
-Set to a positive integer to opt in (e.g., `cache_ttl_ms => 1000`).
-nginx's `open_file_cache` makes the same trade-off and is also
-off by default.
+Set to a positive integer to opt in (e.g., `cache_ttl_ms => 1000`),
+or `infinity` for "cache for the lifetime of the listener; only a
+listener restart re-stats". nginx's `open_file_cache` makes the same
+trade-off and is also off by default.
 """.
 
 -behaviour(roadrunner_handler).
@@ -123,7 +124,7 @@ handle(Req) ->
     end.
 
 -spec serve_file(
-    file:filename_all(), non_neg_integer(), roadrunner_req:request()
+    file:filename_all(), non_neg_integer() | infinity, roadrunner_req:request()
 ) -> roadrunner_handler:response().
 serve_file(FilePath, TtlMs, Req) ->
     case cached_lookup(FilePath, TtlMs) of
@@ -135,11 +136,12 @@ serve_file(FilePath, TtlMs, Req) ->
 
 %% Cache-aware regular-file metadata lookup. Returns `miss` when the
 %% TTL is non-positive (caching disabled) or when no fresh entry is in
-%% the cache. Symlinks always bypass the cache because the policy gate
-%% needs the un-followed `read_link_info` result.
--spec cached_lookup(file:filename_all(), non_neg_integer()) ->
+%% the cache. `infinity` falls through to `cache_get/1` and stays a hit
+%% until the listener restarts. Symlinks always bypass the cache
+%% because the policy gate needs the un-followed `read_link_info` result.
+-spec cached_lookup(file:filename_all(), non_neg_integer() | infinity) ->
     {ok, non_neg_integer(), integer()} | miss.
-cached_lookup(_FilePath, TtlMs) when TtlMs =< 0 ->
+cached_lookup(_FilePath, TtlMs) when is_integer(TtlMs), TtlMs =< 0 ->
     miss;
 cached_lookup(FilePath, _TtlMs) ->
     cache_get(FilePath).
@@ -148,7 +150,7 @@ cached_lookup(FilePath, _TtlMs) ->
 %% the file type. Mirrors the original `serve_file/2` body. Used on
 %% cache miss and for symlink leaves (which never cache).
 -spec fresh_lookup(
-    file:filename_all(), non_neg_integer(), roadrunner_req:request()
+    file:filename_all(), non_neg_integer() | infinity, roadrunner_req:request()
 ) -> roadrunner_handler:response().
 fresh_lookup(FilePath, TtlMs, Req) ->
     %% `read_link_info/1` does not follow the leaf symlink — we need
@@ -168,8 +170,11 @@ fresh_lookup(FilePath, TtlMs, Req) ->
     end.
 
 %% Read a cached `{Size, Mtime}` for `FilePath` if the entry is still
-%% within its TTL. Returns `miss` if absent or expired. Exported so
-%% the eunit suite can drive the cache directly.
+%% within its TTL. Returns `miss` if absent or expired. The `infinity`
+%% sentinel in `ExpiresAt` is for entries that never expire (set via
+%% `cache_ttl_ms => infinity`); for those, every read is a hit until
+%% the listener restarts. Exported so the eunit suite can drive the
+%% cache directly.
 -doc false.
 -spec cache_get(file:filename_all()) ->
     {ok, non_neg_integer(), integer()} | miss.
@@ -177,6 +182,8 @@ cache_get(FilePath) ->
     case persistent_term:get(?META_CACHE_KEY(FilePath), undefined) of
         undefined ->
             miss;
+        {Size, Mtime, infinity} ->
+            {ok, Size, Mtime};
         {Size, Mtime, ExpiresAt} ->
             case erlang:monotonic_time(millisecond) of
                 Now when Now =< ExpiresAt ->
@@ -187,20 +194,25 @@ cache_get(FilePath) ->
     end.
 
 %% Store `{Size, Mtime}` for `FilePath` with a TTL of `TtlMs` ms from
-%% now. The entry is keyed by absolute path; concurrent puts for the
-%% same path are idempotent under the eventual-consistency semantics
-%% of `persistent_term`. Exported for direct eunit coverage.
+%% now, or forever when `TtlMs` is `infinity`. The entry is keyed by
+%% absolute path; concurrent puts for the same path are idempotent
+%% under the eventual-consistency semantics of `persistent_term`.
+%% Exported for direct eunit coverage.
 -doc false.
--spec cache_put(file:filename_all(), non_neg_integer(), integer(), pos_integer()) -> ok.
-cache_put(FilePath, Size, Mtime, TtlMs) ->
+-spec cache_put(file:filename_all(), non_neg_integer(), integer(), pos_integer() | infinity) ->
+    ok.
+cache_put(FilePath, Size, Mtime, infinity) ->
+    persistent_term:put(?META_CACHE_KEY(FilePath), {Size, Mtime, infinity}),
+    ok;
+cache_put(FilePath, Size, Mtime, TtlMs) when is_integer(TtlMs), TtlMs > 0 ->
     ExpiresAt = erlang:monotonic_time(millisecond) + TtlMs,
     persistent_term:put(?META_CACHE_KEY(FilePath), {Size, Mtime, ExpiresAt}),
     ok.
 
 -spec maybe_cache_put(
-    file:filename_all(), non_neg_integer(), integer(), non_neg_integer()
+    file:filename_all(), non_neg_integer(), integer(), non_neg_integer() | infinity
 ) -> ok.
-maybe_cache_put(_FilePath, _Size, _Mtime, TtlMs) when TtlMs =< 0 ->
+maybe_cache_put(_FilePath, _Size, _Mtime, TtlMs) when is_integer(TtlMs), TtlMs =< 0 ->
     ok;
 maybe_cache_put(FilePath, Size, Mtime, TtlMs) ->
     cache_put(FilePath, Size, Mtime, TtlMs).
