@@ -224,28 +224,34 @@ identify the dominant bucket, then design the smallest change.
 
 **Scope:** investigation, then a targeted fix sized to the finding.
 
-### roadrunner_static FD cache for safe default-on caching
+### roadrunner_static FD cache for sendfile — investigated, not viable
 
-**What:** Pair the opt-in metadata cache from `roadrunner_static`
-(commit `a7670f4`, `cache_ttl_ms` opt) with a bounded fd cache. The
-fd, opened once and reused, gives `file:sendfile/5` an at-open
-inode snapshot, so a file replaced or resized mid-window stops
-producing `Content-Length` / body mismatch responses. Combined fd
-+ meta cache is safe enough to consider default-on.
+**Status:** investigated on `perf/httparena-followups`; **don't
+re-attempt** without new evidence.
 
-**Why deferred:** the meta-only cache today is opt-in precisely
-because it has that staleness footgun (nginx makes the same
-trade-off with `open_file_cache`). The fd cache also needs:
-- A bounded LRU keyed by `{Path, Mtime}` with a default cap.
-- Owner process (likely a tiny `gen_server` under `roadrunner_sup`)
-  so the fd survives caller exits.
-- A focused correctness test proving concurrent `file:sendfile/5`
-  against a shared raw fd preserves byte ranges across schedulers
-  (the kernel does the right thing under positional sendfile with
-  a non-NULL offset, but verify before relying on it).
+**Finding 1 — global fd cache is infeasible in BEAM.** `file:open(_,
+[raw, binary])` returns an fd that `prim_file:get_fd_data/1` tags
+with the opening process's pid and rejects from any other caller
+(`{error, not_on_controlling_process}`). `file:sendfile/5` goes
+through the same check. There is no `file:controlling_process/2`.
+A supervised gen_server holding fds for all conns therefore can't
+hand them out to acceptors. See
+`erts-17.0/src/prim_file.erl:499-504`.
 
-**Scope:** small-medium. Per-listener fd cache process plus the
-sendfile call site in `src/roadrunner_transport.erl:213`.
+**Finding 2 — per-conn fd cache (the BEAM-correct fallback) doesn't
+move the needle.** Stashing `#{Path => {Fd, Tick}}` in the conn
+process's pdict, with a 16-entry LRU cap, was implemented and
+A/B'd against current HEAD on `httparena_static @ 16c` (3×5s per
+side): mean 146.8 k → 143.8 k rps, post slightly **slower** (−2 %),
+well inside run-to-run variance. `file:open(_, [raw, binary])` is
+sub-µs on a hot OS page cache; the pdict map lookup + tick bump +
+`maps:put` overhead cancels the saving.
+
+**If revisited:** would need either (a) a measured workload where
+`file:open` shows up as a clear hotspot in fprof / eprof (none seen
+to date), or (b) a NIF-backed cache that bypasses the prim_file
+owner check entirely (custom C / Rust code, well outside the
+"pure-Erlang" property the framework markets).
 
 ### Sync headline scenarios in comparison.md + resource_results.md
 
