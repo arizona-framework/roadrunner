@@ -144,14 +144,13 @@ custom_threshold_changes_refill_trigger() ->
      || _ <- lists:seq(1, 6)
     ],
     %% Expect 2 WINDOW_UPDATE frames — conn (stream 0) and stream 1.
-    %% The refill brings each window back to its peak, so the
-    %% increment is the bytes consumed since last refill.
-    Wu1 = expect_send(),
-    {ok, {window_update, S1, Inc1}, _} =
-        roadrunner_http2_frame:parse(Wu1, 16384),
-    Wu2 = expect_send(),
-    {ok, {window_update, S2, Inc2}, _} =
-        roadrunner_http2_frame:parse(Wu2, 16384),
+    %% Coalesced into a single send so they share one transport
+    %% trip; parse both out of the combined buffer.
+    Combined = expect_send(),
+    {ok, {window_update, S1, Inc1}, Rest1} =
+        roadrunner_http2_frame:parse(Combined, 16384),
+    {ok, {window_update, S2, Inc2}, <<>>} =
+        roadrunner_http2_frame:parse(Rest1, 16384),
     %% Both updates fire (one for conn, one for stream); we don't
     %% care about order. After 60 KB consumed, the increment that
     %% restores the window to 100 KB is exactly 60 KB.

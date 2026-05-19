@@ -767,13 +767,25 @@ on_data(StreamId, Flags, Payload, #loop{streams = Streams} = State) ->
     end.
 
 %% Refill the conn-level + stream-level recv windows whenever they
-%% drop below `?WINDOW_REFILL_THRESHOLD`.
+%% drop below the configured threshold. Both refills can fire on
+%% the same `on_data` event (one DATA payload drains both windows
+%% past the threshold simultaneously); when that happens, the two
+%% WINDOW_UPDATE frames go out in a single `send/2` so they share
+%% one trip through the ssl gen_statem (or `gen_tcp:send` for h2c)
+%% instead of paying two.
 -spec maybe_refill_recv_windows(#loop{}, stream_id()) -> #loop{}.
 maybe_refill_recv_windows(State, StreamId) ->
-    State1 = maybe_refill_conn(State),
-    maybe_refill_stream(State1, StreamId).
+    {ConnFrame, State1} = build_conn_refill(State),
+    {StreamFrame, State2} = build_stream_refill(State1, StreamId),
+    case {ConnFrame, StreamFrame} of
+        {[], []} ->
+            State2;
+        {_, _} ->
+            _ = send(State2, [ConnFrame, StreamFrame]),
+            State2
+    end.
 
-maybe_refill_conn(
+build_conn_refill(
     #loop{
         conn_recv_window = W,
         recv_window_peak = Peak,
@@ -781,12 +793,11 @@ maybe_refill_conn(
     } = State
 ) when W < Threshold ->
     Inc = Peak - W,
-    _ = send(State, roadrunner_http2_frame:encode({window_update, 0, Inc})),
-    State#loop{conn_recv_window = W + Inc};
-maybe_refill_conn(State) ->
-    State.
+    {roadrunner_http2_frame:encode({window_update, 0, Inc}), State#loop{conn_recv_window = W + Inc}};
+build_conn_refill(State) ->
+    {[], State}.
 
-maybe_refill_stream(
+build_stream_refill(
     #loop{
         streams = Streams,
         stream_recv_window_peak = Peak,
@@ -798,13 +809,11 @@ maybe_refill_stream(
     if
         W < Threshold ->
             Inc = Peak - W,
-            _ = send(
-                State,
-                roadrunner_http2_frame:encode({window_update, StreamId, Inc})
-            ),
-            State#loop{streams = Streams#{StreamId := Stream#{recv_window := W + Inc}}};
+            {roadrunner_http2_frame:encode({window_update, StreamId, Inc}), State#loop{
+                streams = Streams#{StreamId := Stream#{recv_window := W + Inc}}
+            }};
         true ->
-            State
+            {[], State}
     end.
 
 %% =============================================================================
