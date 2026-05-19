@@ -584,6 +584,53 @@ sendfile_response_supports_keep_alive_test_() ->
         end}
     end}.
 
+sendfile_range_response_supports_keep_alive_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun({_Dir, Port}) ->
+        {"two 206 range responses succeed on a single TCP conn", fun() ->
+            {ok, Sock} = gen_tcp:connect(
+                {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+            ),
+            %% `bytes=0-3` against `hello.html` (14 bytes) returns
+            %% 206 with the first 4 bytes `<h1>` as body. The 206 path
+            %% emits a sendfile response with a partial Length; the
+            %% conn must keep-alive after it just like a full 200.
+            Req = ~"GET /static/hello.html HTTP/1.1\r\nHost: x\r\nRange: bytes=0-3\r\n\r\n",
+            ok = gen_tcp:send(Sock, Req),
+            Reply1 = recv_response_with_body(Sock, 4),
+            ok = gen_tcp:send(Sock, Req),
+            Reply2 = recv_response_with_body(Sock, 4),
+            ok = gen_tcp:close(Sock),
+            ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply1),
+            ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply2),
+            ?assertNotEqual(nomatch, binary:match(Reply1, ~"<h1>")),
+            ?assertNotEqual(nomatch, binary:match(Reply2, ~"<h1>"))
+        end}
+    end}.
+
+pipelined_sendfile_responses_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun({_Dir, Port}) ->
+        {"two pipelined sendfile GETs return ordered responses", fun() ->
+            %% Pipelining: send two complete requests in a single
+            %% `gen_tcp:send` before reading either response. The conn
+            %% loop must process both, emit two responses in order, and
+            %% keep the conn alive between them. Exercises the
+            %% `pipelined_leftover` carry-forward in `buffered_finish`
+            %% when sendfile takes that path.
+            {ok, Sock} = gen_tcp:connect(
+                {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+            ),
+            Req = ~"GET /static/hello.html HTTP/1.1\r\nHost: x\r\n\r\n",
+            ok = gen_tcp:send(Sock, <<Req/binary, Req/binary>>),
+            Reply1 = recv_response_with_body(Sock, 14),
+            Reply2 = recv_response_with_body(Sock, 14),
+            ok = gen_tcp:close(Sock),
+            ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply1),
+            ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply2),
+            ?assertNotEqual(nomatch, binary:match(Reply1, ~"<h1>Hello</h1>")),
+            ?assertNotEqual(nomatch, binary:match(Reply2, ~"<h1>Hello</h1>"))
+        end}
+    end}.
+
 %% Read a single response: drain bytes until both the
 %% header / body separator is present AND `BodyLen` bytes of body are
 %% buffered. Stops as soon as one response is complete so the next
