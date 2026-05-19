@@ -118,7 +118,8 @@
     httparena_baseline,
     httparena_json,
     httparena_upload_20mb_auto,
-    httparena_upload_20mb_manual
+    httparena_upload_20mb_manual,
+    httparena_limited_conn
 ]).
 
 %% Scenarios that only make sense over HTTP/2. Mirrors the
@@ -386,6 +387,9 @@ preflight_scenario(#{scenario := httparena_upload_20mb_auto, servers := Servers}
 preflight_scenario(#{scenario := httparena_upload_20mb_manual, servers := Servers} = Opts) ->
     filter_servers(httparena_upload_20mb_manual, [cowboy, elli], Servers, Opts,
         ~"roadrunner-only fixture; mirrors HttpArena's `upload` profile (manual streaming)");
+preflight_scenario(#{scenario := httparena_limited_conn, servers := Servers} = Opts) ->
+    filter_servers(httparena_limited_conn, [cowboy, elli], Servers, Opts,
+        ~"roadrunner-only fixture; mirrors HttpArena's `limited-conn` profile");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -805,6 +809,15 @@ cli() ->
                                     chunk size; auto-mode peer
                                     pays the full-body buffering
                                     cost.
+                    httparena_limited_conn:
+                                    h1-only, roadrunner-only.
+                                    GET /baseline11 against a
+                                    listener with `max_clients =>
+                                    8000`. Mirrors HttpArena's
+                                    `limited-conn` profile, which
+                                    surfaces contention on the
+                                    per-listener slot counter
+                                    under high-conn waves.
                     """
             },
             #{
@@ -1580,6 +1593,17 @@ scenario_roadrunner_opts(httparena_upload_20mb_manual, BaseOpts) ->
         max_content_length => ?HTTPARENA_UPLOAD_BODY_SIZE + 1024,
         routes => [
             {~"/upload", roadrunner_bench_httparena_upload_handler, undefined}
+        ]
+    };
+scenario_roadrunner_opts(httparena_limited_conn, BaseOpts) ->
+    %% Override the bench's default `max_clients => 100K` to a tight
+    %% cap that the bench's high-conn waves can saturate. Mirrors
+    %% HttpArena's `limited-conn` profile, which surfaces contention
+    %% on the per-listener slot counter under load.
+    BaseOpts#{
+        max_clients => 8000,
+        routes => [
+            {~"/baseline11", roadrunner_bench_httparena_baseline_handler, undefined}
         ]
     }.
 
@@ -2828,7 +2852,8 @@ scenario_method(headers_heavy) -> ~"GET";
 scenario_method(httparena_baseline) -> ~"GET";
 scenario_method(httparena_json) -> ~"GET";
 scenario_method(httparena_upload_20mb_auto) -> ~"POST";
-scenario_method(httparena_upload_20mb_manual) -> ~"POST".
+scenario_method(httparena_upload_20mb_manual) -> ~"POST";
+scenario_method(httparena_limited_conn) -> ~"GET".
 
 scenario_path(hello) -> ~"/";
 scenario_path(echo) -> ~"/echo";
@@ -2855,7 +2880,8 @@ scenario_path(headers_heavy) -> ~"/";
 scenario_path(httparena_baseline) -> ~"/baseline11?a=123&b=456";
 scenario_path(httparena_json) -> ~"/httparena_json/50?m=1";
 scenario_path(httparena_upload_20mb_auto) -> ~"/upload";
-scenario_path(httparena_upload_20mb_manual) -> ~"/upload".
+scenario_path(httparena_upload_20mb_manual) -> ~"/upload";
+scenario_path(httparena_limited_conn) -> ~"/baseline11?a=123&b=456".
 
 %% Pre-built per-iteration request bytes so the worker hot loop doesn't
 %% allocate. Both scenarios assume the same handler returns
@@ -3031,7 +3057,9 @@ build_request(httparena_json) ->
 build_request(httparena_upload_20mb_auto) ->
     httparena_upload_request();
 build_request(httparena_upload_20mb_manual) ->
-    httparena_upload_request().
+    httparena_upload_request();
+build_request(httparena_limited_conn) ->
+    ~"GET /baseline11?a=123&b=456 HTTP/1.1\r\nHost: x\r\n\r\n".
 
 httparena_upload_request() ->
     Body = binary:copy(~"x", ?HTTPARENA_UPLOAD_BODY_SIZE),
@@ -3097,7 +3125,10 @@ expected_body_len(httparena_upload_20mb_auto) ->
     %% Response is `integer_to_binary(20*1024*1024)` = "20971520" (8 B).
     byte_size(integer_to_binary(?HTTPARENA_UPLOAD_BODY_SIZE));
 expected_body_len(httparena_upload_20mb_manual) ->
-    byte_size(integer_to_binary(?HTTPARENA_UPLOAD_BODY_SIZE)).
+    byte_size(integer_to_binary(?HTTPARENA_UPLOAD_BODY_SIZE));
+expected_body_len(httparena_limited_conn) ->
+    %% Same `/baseline11` handler as `httparena_baseline`: "579".
+    byte_size(integer_to_binary(123 + 456)).
 
 %% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
 %% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
@@ -3566,6 +3597,11 @@ h2_request_shape(httparena_upload_20mb_manual) ->
     io:format(standard_error,
         "error: --scenarios httparena_upload_20mb_manual is h1-only "
         "(use --protocols h1)~n", []),
+    halt(2);
+h2_request_shape(httparena_limited_conn) ->
+    io:format(standard_error,
+        "error: --scenarios httparena_limited_conn is h1-only "
+        "(use --protocols h1)~n", []),
     halt(2).
 
 h2_worker_loop(Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->
@@ -3788,7 +3824,9 @@ scenario_request_summary(httparena_json) ->
 scenario_request_summary(httparena_upload_20mb_auto) ->
     "POST /upload HTTP/1.1, 20 MB body, body_buffering=auto (router, roadrunner-only)";
 scenario_request_summary(httparena_upload_20mb_manual) ->
-    "POST /upload HTTP/1.1, 20 MB body, body_buffering=manual 64 KB chunks (router, roadrunner-only)".
+    "POST /upload HTTP/1.1, 20 MB body, body_buffering=manual 64 KB chunks (router, roadrunner-only)";
+scenario_request_summary(httparena_limited_conn) ->
+    "GET /baseline11 HTTP/1.1 against max_clients=8000 listener (router, roadrunner-only)".
 
 result_to_row(Side, #{
     total := Total,
