@@ -224,37 +224,53 @@ streams):** beam total 296 MiB. Breakdown:
 | code | 9 MiB | 3 % |
 | ets | 3 MiB | 1 % |
 
-Top processes mid-bench, init=`proc_lib:init_p/5`, current=`gen:do_call/4`:
-all clustered at **~112 KiB each** (10 of 10 sampled). Average across
-~16 K processes: ~9 KiB; the top tail is ~12× that, indicating the
-h2 stream workers in mid-handler `gen_server:call` (likely to the conn
-process for window / send arbitration) are the heavy ones.
+Top processes mid-bench, init=`proc_lib:init_p/5`,
+current=`gen:do_call/4`: all clustered at **~112 KiB each** (10 of 10
+sampled).
 
-**Where to look:** `src/roadrunner_conn_loop_http2.erl` worker spawn
-+ stream-worker state. Specifically:
-- `stream_entry/0` map (per-stream state held on the conn process —
-  body iolist, hpack contexts, send/recv windows, pending-send
-  queue).
-- `roadrunner_http2_stream_worker` process state (request struct +
-  body buffer + handler closure).
-- Whether workers `hibernate` when blocked in `gen_server:call` for
-  window credit; today they don't, so their heap stays inflated.
+**Important caveat — those 112 KiB procs are not our stream workers.**
+Stream workers spawn via `spawn_monitor(?MODULE, init, [_])` (so
+`initial_call = {roadrunner_http2_stream_worker, init, 4}`, not
+proc_lib's `init_p/5`) and block in a raw `receive` in `sync/1` (so
+`current_function = {?MODULE, sync, 1}`, not `gen:do_call/4`). The
+heavy processes are therefore gen_server / gen_statem callers — over
+the local TLS bench, most likely the conn loops blocked in
+`ssl:send/2`, which internally does `gen_statem:call` to the
+per-connection ssl gen_statem. HttpArena's `json-h2c` is cleartext
+(no ssl gen_statem) so the bottleneck shape there is probably
+different from local; need a focused h2c profile to know.
 
-**Where NOT to look:** binary (23 MiB) and ets (3 MiB) are
-small — HPACK dynamic table reaping and WINDOW_UPDATE batching
-wouldn't move the needle relative to the per-process win.
+**Next step — granular profile, not a refactor yet.** Group
+`process_info(_, [memory])` by `initial_call` (and by `current_function`
+within the top tier) over both the local TLS bench AND HttpArena h2c.
+That separates "conn loops blocked in ssl gen_statem" (TLS-only) from
+"stream workers" (both) from other gen_servers. Without that
+breakdown we can't tell which structural fix matches the actual
+distribution.
 
-**Likely smallest impactful change:** make the stream worker
-hibernate while parked in `gen_server:call` waiting for send-window
-credit. Erlang hibernation collapses the heap to the bare reduction
-frame (~233 words), so a worker that's mostly waiting drops from
-~112 KiB to ~2 KiB until it's resumed. At 16 K parked workers that's
-a ~1.6 GiB → ~30 MiB reduction in the worst case.
+**Where NOT to look:** binary (23 MiB) and ets (3 MiB) are small —
+HPACK dynamic-table reaping and WINDOW_UPDATE batching wouldn't move
+the needle relative to the per-process win.
+
+**Candidate fix once workers are confirmed as a top tier — hibernate
+parked workers.** Workers park in `sync/1` waiting for `h2_send_ack`,
+which can be delayed by stream / conn send-window flow control.
+Hibernation collapses the heap to ~233 words (~2 KiB). Naively
+dropping `erlang:hibernate/3` into `sync/1` does NOT work, though:
+hibernate is a tail call that discards the calling stack, but the
+worker has post-sync work (`telemetry:request_stop`, then
+`ConnPid ! {h2_worker_done, StreamId}` in `init/4`). A clean
+implementation either (a) restructures the worker into
+continuation-passing style so each wait point is a hibernate with an
+explicit continuation, or (b) splits the buffered path (single sync,
+fold post-sync work into the hibernated wait function) from the
+streaming / loop paths (multi-sync, keep current shape).
 
 **Scope:** medium. Touches `roadrunner_http2_stream_worker`'s wait
-loop and possibly the conn-side `pending_sends` arbitration.
-Verification: re-run `multi_stream_h2 @ 1024c` and check the
-per-process top-10 drops below ~10 KiB.
+loop AND its surrounding flow (telemetry stop site, `h2_worker_done`
+emission). Verification: re-run `multi_stream_h2 @ 1024c` and check
+per-process top-10 drops below ~10 KiB, then re-run HttpArena
+`json-h2c @ 4096c` and check the 1.6 GiB total falls meaningfully.
 
 ### roadrunner_static FD cache for sendfile — investigated, not viable
 
