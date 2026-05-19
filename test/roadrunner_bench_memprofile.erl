@@ -17,7 +17,7 @@ matching how observer reports it.
 -export([snapshot/0]).
 
 -doc """
-Return `{TotalProcs, Groups, TopProcs}` where:
+Return `{TotalProcs, Groups, TopProcs, MemBuckets}` where:
 
 - `Groups` is a list of `{InitialCall, Stats}` tuples sorted by total
   memory descending. `Stats` is `#{count, total_bytes, avg_bytes,
@@ -27,9 +27,13 @@ Return `{TotalProcs, Groups, TopProcs}` where:
   memory, heap_size, total_heap_size, stack_size, message_queue_len,
   garbage_collection}`. Useful for spotting what's in a fat conn_loop
   vs a fat ssl_gen_statem.
+- `MemBuckets` is the `erlang:memory/0` proplist (total, processes,
+  binary, code, ets, system, ...). Surfaces refcounted-binary growth
+  that doesn't show up in per-proc `memory` (e.g. auto-buffered POST
+  bodies).
 """.
 -spec snapshot() ->
-    {non_neg_integer(), [{term(), map()}], [map()]}.
+    {non_neg_integer(), [{term(), map()}], [map()], [{atom(), non_neg_integer()}]}.
 snapshot() ->
     Procs = erlang:processes(),
     {Acc, Tops} = lists:foldl(fun fold_proc/2, {#{}, []}, Procs),
@@ -41,7 +45,8 @@ snapshot() ->
         lists:sort(fun(#{memory := A}, #{memory := B}) -> A >= B end, Tops),
         10
     ),
-    {length(Procs), Groups, TopProcs}.
+    MemBuckets = erlang:memory(),
+    {length(Procs), Groups, TopProcs, MemBuckets}.
 
 fold_proc(Pid, {Acc, Tops}) ->
     case

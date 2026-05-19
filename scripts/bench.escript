@@ -1233,7 +1233,7 @@ maybe_capture_mem_profile(Peer, BeamTotal, Now, Acc) when
     case Due of
         true ->
             try peer:call(Peer, roadrunner_bench_memprofile, snapshot, [], 5000) of
-                {_, _, _} = Snapshot ->
+                {_, _, _, _} = Snapshot ->
                     Acc#{mem_profile => Snapshot, mem_profile_at_ms => Now};
                 _ ->
                     Acc
@@ -4074,8 +4074,10 @@ print_mem_profiles(Rows) ->
     lists:foreach(
         fun({Side, Row}) ->
             case maps:get(mem_profile, Row, undefined) of
-                {TotalProcs, Groups, TopProcs} ->
-                    print_mem_profile(Side, TotalProcs, Groups, TopProcs);
+                {TotalProcs, Groups, TopProcs, MemBuckets} ->
+                    print_mem_profile(
+                        Side, TotalProcs, Groups, TopProcs, MemBuckets
+                    );
                 _ ->
                     ok
             end
@@ -4083,7 +4085,7 @@ print_mem_profiles(Rows) ->
         Rows
     ).
 
-print_mem_profile(Side, TotalProcs, Groups, TopProcs) ->
+print_mem_profile(Side, TotalProcs, Groups, TopProcs, MemBuckets) ->
     Sum = lists:foldl(
         fun({_, #{total_bytes := T}}, Acc) -> Acc + T end, 0, Groups
     ),
@@ -4091,6 +4093,7 @@ print_mem_profile(Side, TotalProcs, Groups, TopProcs) ->
     Tail = lists:nthtail(min(20, length(Groups)), Groups),
     TailCount = lists:sum([C || {_, #{count := C}} <- Tail]),
     TailBytes = lists:sum([T || {_, #{total_bytes := T}} <- Tail]),
+    print_mem_buckets(Side, MemBuckets),
     io:format(
         "~nmem profile (~s, near-peak): ~B procs, ~B MB total across all groups~n",
         [atom_to_list(Side), TotalProcs, Sum div (1024 * 1024)]
@@ -4141,6 +4144,20 @@ print_mem_profile(Side, TotalProcs, Groups, TopProcs) ->
             )
     end,
     print_top_procs(TopProcs).
+
+print_mem_buckets(Side, MemBuckets) ->
+    io:format(
+        "~nerlang:memory (~s, near-peak):~n", [atom_to_list(Side)]
+    ),
+    Sorted = lists:sort(
+        fun({_, A}, {_, B}) -> A >= B end, MemBuckets
+    ),
+    lists:foreach(
+        fun({K, V}) ->
+            io:format("  ~-20s ~6B MB~n", [atom_to_list(K), V div (1024 * 1024)])
+        end,
+        Sorted
+    ).
 
 print_top_procs(TopProcs) ->
     io:format("~ntop 10 single procs (full process_info detail):~n"),
