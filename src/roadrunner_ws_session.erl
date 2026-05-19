@@ -183,11 +183,6 @@ run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated) ->
     %% a monitor instead.
     case gen_statem:start(?MODULE, {Socket, Mod, State, Ctx, Negotiated}, []) of
         {ok, Pid} ->
-            %% Auto-join the session into the listener's drain `pg` group
-            %% so `roadrunner_listener:drain/2` broadcasts reach long-lived
-            %% sessions directly — the conn's membership does not carry
-            %% across the unlinked `gen_statem:start` boundary above.
-            ok = roadrunner_conn:join_drain_group_for(Pid, roadrunner_req:listener_name(Req)),
             ok = roadrunner_telemetry:ws_upgrade(Ctx),
             _ = roadrunner_telemetry:response_send(
                 roadrunner_transport:send(Socket, UpgradeResp), websocket_upgrade_response
@@ -195,9 +190,7 @@ run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated) ->
             Ref = monitor(process, Pid),
             ok = roadrunner_transport:controlling_process(Socket, Pid),
             Pid ! socket_ready,
-            receive
-                {'DOWN', Ref, process, Pid, _Reason} -> ok
-            end;
+            wait_for_session(Ref, Pid);
         {error, _Reason} ->
             %% Couldn't start the session — the 101 was never on the
             %% wire, so we can fall back to 500 without a protocol leak.
@@ -210,6 +203,24 @@ run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated) ->
                 )
             ),
             ok
+    end.
+
+%% The conn process is already a member of the listener's drain `pg`
+%% group via `roadrunner_conn:join_drain_group/2` (joined at conn
+%% start). While the conn waits here for the session to terminate,
+%% forward any `{roadrunner_drain, _}` broadcast to the session pid so
+%% the session's `frame_loop` can dispatch `handle_drain/2`. This
+%% avoids a per-session `pg:join` on the WS upgrade hot path: that
+%% per-session join doubled the rate of joins through the single `pg`
+%% scope process and serialized the upgrade hot path under load.
+-spec wait_for_session(reference(), pid()) -> ok.
+wait_for_session(Ref, Pid) ->
+    receive
+        {'DOWN', Ref, process, Pid, _Reason} ->
+            ok;
+        {roadrunner_drain, _Deadline} = Msg ->
+            Pid ! Msg,
+            wait_for_session(Ref, Pid)
     end.
 
 -spec callback_mode() -> gen_statem:callback_mode_result().
@@ -286,7 +297,12 @@ awaiting_socket(info, socket_ready, #data{has_init = true, mod = Mod, mod_state 
     %% might re-enter `frame_loop`.
     apply_handler_result(Mod:init(State), Data, false, fun continue_to_frame_loop/2);
 awaiting_socket(info, socket_ready, Data) ->
-    {next_state, frame_loop, Data}.
+    {next_state, frame_loop, Data};
+awaiting_socket(info, {roadrunner_drain, _}, _Data) ->
+    %% Drain forwarded from the conn before this gen_statem processes
+    %% `socket_ready`. Defer until `frame_loop`, where the existing
+    %% drain dispatch handles it.
+    {keep_state_and_data, [postpone]}.
 
 -spec frame_loop(gen_statem:event_type(), term(), #data{}) ->
     gen_statem:event_handler_result(atom()).

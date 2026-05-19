@@ -164,15 +164,11 @@ join_drain_group(Name, true) ->
 
 -doc """
 Join `Pid` into the per-listener `pg` drain group on behalf of another
-process. Used by `roadrunner_ws_session:run/4` so each WS session
-pid (spawned via `gen_statem:start` and thus NOT inheriting the
-conn's `pg` membership) still receives `{roadrunner_drain, Deadline}`
-broadcasts.
-
-WS sessions always join, regardless of the conn's `graceful_drain`
-setting: that flag is documented as a perf opt-out for short-lived
-HTTP/1 conns, and WS sessions are never short-lived. Skipping the
-join here would silently strand long-lived sessions during deploys.
+process. Reserved for future use cases where a non-conn process needs
+direct drain membership (e.g., a long-lived worker spawned outside
+the conn lifecycle). The WS upgrade path no longer calls this: the
+conn (already in pg) forwards `{roadrunner_drain, _}` to its session
+from `roadrunner_ws_session:wait_for_session/2` instead.
 
 Silently no-ops when `Name` is `undefined` (manually constructed
 requests in tests) or when the `pg` scope is absent (listener

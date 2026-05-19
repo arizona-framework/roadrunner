@@ -1463,6 +1463,21 @@ join_drain_group_for_without_pg_scope_test() ->
             ok = pg:leave({roadrunner_drain, some_listener}, self())
     end.
 
+join_drain_group_for_joins_pid_when_pg_scope_running_test() ->
+    %% pg-running branch of `join_drain_group_for/2`: the helper calls
+    %% `pg:join` and the caller's pid lands in the listener's drain
+    %% group. Start pg explicitly so the test is deterministic
+    %% regardless of sibling-test sequencing.
+    _ =
+        case whereis(pg) of
+            undefined -> {ok, _} = pg:start_link();
+            _ -> ok
+        end,
+    Listener = join_drain_group_for_joins_pid_when_pg_scope_running,
+    ok = roadrunner_conn:join_drain_group_for(self(), Listener),
+    ?assert(lists:member(self(), pg:get_members({roadrunner_drain, Listener}))),
+    ok = pg:leave({roadrunner_drain, Listener}, self()).
+
 consume_state_next_chunk_for_content_length_drains_fully_test() ->
     %% Non-chunked framing: `next_chunk` drains the full body in one
     %% shot — there are no chunk boundaries to honor.

@@ -473,6 +473,91 @@ handle_drain_drops_when_handler_does_not_export_test() ->
     Sink ! stop,
     ok = gen_statem:stop(Pid).
 
+run_session_forwards_drain_to_session_test() ->
+    %% End-to-end: run/4 → run_session/6 → wait_for_session/2 forwards
+    %% `{roadrunner_drain, _}` sent to the conn (the run/4 caller) onward
+    %% to the session pid, where the existing frame_loop drain dispatch
+    %% calls handle_drain/2. The conn is already a `pg` member via
+    %% `roadrunner_conn:join_drain_group/2` so forwarding replaces the
+    %% per-session pg:join the WS upgrade path used to do.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_drain => {close, 1000, ~"draining"}},
+    Headers = [
+        {~"upgrade", ~"websocket"},
+        {~"connection", ~"Upgrade"},
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
+        {~"sec-websocket-version", ~"13"}
+    ],
+    Req = #{
+        headers => Headers,
+        peer => undefined,
+        listener_name => undefined,
+        request_id => undefined
+    },
+    Worker = spawn(fun() ->
+        ok = roadrunner_ws_session:run(
+            {fake, Sink}, Req, roadrunner_ws_lifecycle_handler, State
+        ),
+        Self ! {worker_done, self()}
+    end),
+    Wref = monitor(process, Worker),
+    %% Give the gen_statem time to transition awaiting_socket → frame_loop
+    %% so the forwarded drain hits the steady-state drain dispatch and
+    %% not the awaiting_socket postpone path (that path is covered by
+    %% awaiting_socket_postpones_drain_until_frame_loop_test/0 below).
+    timer:sleep(50),
+    Worker ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 30000},
+    receive
+        {event, drain} -> ok
+    after 500 -> ?assert(false)
+    end,
+    %% on_drain => {close, ...} terminates the session; wait_for_session's
+    %% 'DOWN' clause fires, run/4 returns ok, the worker pid exits normal.
+    receive
+        {worker_done, Worker} -> ok
+    after 500 -> ?assert(false)
+    end,
+    receive
+        {'DOWN', Wref, process, Worker, normal} -> ok
+    after 500 -> ?assert(false)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 50)),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"101")),
+    %% Close frame opcode 0x88.
+    ?assertNotEqual(nomatch, binary:match(Sent, <<16#88>>)),
+    Sink ! stop.
+
+awaiting_socket_postpones_drain_until_frame_loop_test() ->
+    %% Race: drain forwarded by the conn before the session has processed
+    %% socket_ready. The awaiting_socket state postpones the event;
+    %% frame_loop's existing drain dispatch picks it up after the
+    %% state transition.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_drain => {close, 1000, ~"draining"}},
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        []
+    ),
+    Ref = monitor(process, Pid),
+    %% Drain BEFORE socket_ready — must be postponed and replayed in
+    %% frame_loop.
+    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 30000},
+    Pid ! socket_ready,
+    receive
+        {event, drain} -> ok
+    after 500 -> ?assert(false)
+    end,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> ?assert(false)
+    end,
+    Sink ! stop.
+
 %% =============================================================================
 %% Handler-driven close with status code + reason (RFC 6455 §5.5.1).
 %% =============================================================================
