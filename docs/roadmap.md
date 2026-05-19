@@ -304,6 +304,40 @@ refactor — for example, a measured h2c (cleartext) bench where the
 ssl gen_statem isn't in the picture, to confirm the mailbox-inflation
 finding is TLS-specific and not present without it.
 
+### Large-POST auto-buffering memory — measured, no roadrunner-side fix in scope
+
+**Status:** investigated on `perf/httparena-followups`; the
+auto-vs-manual trade-off is intrinsic to the API.
+
+**Measured (`httparena_upload_20mb_auto @ 32c`, 20 MB POST):**
+
+| Bucket | Auto | Manual |
+|---|---|---|
+| beam total | 997 MB | 97 MB |
+| binary | 944 MB | small |
+| processes | 21 MB | small |
+| throughput | 643 rps | 930 rps |
+
+32 conns × 20 MB raw body = 640 MB. The 944 MB binary bucket is
+640 MB of in-flight body data + ~300 MB overhead (BEAM refcounted
+binary allocator's chunk pages, sub-binary refs, delayed GC of the
+prior request's body iolist before the next one arrives).
+
+**Why no fix:** auto-buffering's contract IS "the conn pre-buffers
+the full body into the request map before dispatch." A roadrunner-
+side change can't trim memory below that floor without either (a)
+breaking the contract (e.g. flushing the body to disk — overkill
+for small bodies, slow for large) or (b) tuning BEAM's binary
+allocator (deep emulator-config territory, off-limits to the
+framework). Users with large uploads should use
+`body_buffering => manual` (see `roadrunner_listener` `opts/0`),
+which the API already exposes and the docs steer towards.
+
+**If revisited:** would need a workload where manual mode isn't
+suitable (e.g. a use case that genuinely wants the whole body
+present as one value) AND where 47 % overhead-above-raw matters.
+No such workload identified to date.
+
 ### roadrunner_static FD cache for sendfile — investigated, not viable
 
 **Status:** investigated on `perf/httparena-followups`; **don't
