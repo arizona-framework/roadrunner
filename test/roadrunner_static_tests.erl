@@ -486,6 +486,23 @@ cache_helpers_test_() ->
                     {ok, 42, 1700000000},
                     roadrunner_static:cache_get(FilePath)
                 )
+            end},
+            {"cache_clear/0 drops every static-meta entry", fun() ->
+                F1 = filename:join(Dir, "clear_a.txt"),
+                F2 = filename:join(Dir, "clear_b.txt"),
+                Sentinel = {?MODULE, cache_clear_sentinel},
+                ok = roadrunner_static:cache_put(F1, 10, 1700000000, infinity),
+                ok = roadrunner_static:cache_put(F2, 20, 1700000000, 60000),
+                %% A non-static persistent_term entry must NOT be erased.
+                ok = persistent_term:put(Sentinel, kept),
+                try
+                    ok = roadrunner_static:cache_clear(),
+                    ?assertEqual(miss, roadrunner_static:cache_get(F1)),
+                    ?assertEqual(miss, roadrunner_static:cache_get(F2)),
+                    ?assertEqual(kept, persistent_term:get(Sentinel))
+                after
+                    _ = persistent_term:erase(Sentinel)
+                end
             end}
         ]
     end}.

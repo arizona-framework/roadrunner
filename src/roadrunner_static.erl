@@ -72,6 +72,10 @@ Set to a positive integer to opt in (e.g., `cache_ttl_ms => 1000`),
 or `infinity` for "cache for the lifetime of the listener; only a
 listener restart re-stats". nginx's `open_file_cache` makes the same
 trade-off and is also off by default.
+
+Call `roadrunner_static:cache_clear/0` to flush every cached entry
+without a listener restart — useful after a deploy that swaps files
+under an `infinity` (or long) TTL.
 """.
 
 -behaviour(roadrunner_handler).
@@ -88,7 +92,7 @@ trade-off and is also off by default.
 %% in the moduledoc above for when to enable and the trade-offs.
 -define(DEFAULT_CACHE_TTL_MS, 0).
 
--export([handle/1]).
+-export([handle/1, cache_clear/0]).
 -export([cache_get/1, cache_put/4]).
 
 -define(MIME_TYPES, #{
@@ -122,6 +126,31 @@ handle(Req) ->
         traversal ->
             {roadrunner_resp:not_found(), Req}
     end.
+
+-doc """
+Drop every cached static-file metadata entry. Pair with
+`cache_ttl_ms => infinity` (or any TTL longer than your deploy
+cycle) to flush stale metadata after replacing files in the
+docroot, without restarting the listener.
+
+Walks `persistent_term:get/0` once to find the static-meta keys —
+cheap on small caches, O(N) over **all** persistent_term entries
+on a busy node. Intended for occasional, deploy-time use, not a
+per-request hot path.
+""".
+-spec cache_clear() -> ok.
+cache_clear() ->
+    lists:foreach(
+        fun
+            ({{roadrunner_static_meta, _Path} = K, _V}) ->
+                _ = persistent_term:erase(K),
+                ok;
+            (_) ->
+                ok
+        end,
+        persistent_term:get()
+    ),
+    ok.
 
 -spec serve_file(
     file:filename_all(), non_neg_integer() | infinity, roadrunner_req:request()
