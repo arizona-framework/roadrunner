@@ -174,20 +174,25 @@ match_first(_Segments, []) ->
     not_found;
 match_first(Segments, [{Pattern, Handler, Pipeline, State} | Rest]) ->
     case match_pattern(Pattern, Segments, #{}) of
-        {ok, Bindings} -> {ok, Handler, Bindings, Pipeline, State};
-        no_match -> match_first(Segments, Rest)
+        no_match -> match_first(Segments, Rest);
+        Bindings -> {ok, Handler, Bindings, Pipeline, State}
     end.
 
+%% Returns the bare bindings map on a match (no `{ok, _}` wrap) so the
+%% caller `match_first/2` can splice it straight into its own
+%% `{ok, Handler, Bindings, _, _}` tuple without paying the intermediate
+%% 2-tuple alloc per matched route. `no_match` is the sentinel for the
+%% miss path — disjoint from any map shape `match_pattern` would produce.
 -spec match_pattern([segment()], [binary()], bindings()) ->
-    {ok, bindings()} | no_match.
+    bindings() | no_match.
 match_pattern([], [], Bindings) ->
-    {ok, Bindings};
+    Bindings;
 match_pattern([{literal, S} | P], [S | Segs], Bindings) ->
     match_pattern(P, Segs, Bindings);
 match_pattern([{param, Name} | P], [Value | Segs], Bindings) ->
     match_pattern(P, Segs, Bindings#{Name => Value});
 match_pattern([{wildcard, Name}], Segs, Bindings) ->
-    {ok, Bindings#{Name => Segs}};
+    Bindings#{Name => Segs};
 match_pattern(_, _, _) ->
     no_match.
 
