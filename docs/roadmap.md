@@ -207,22 +207,54 @@ finding from the survey.
 **Scope:** medium — fprof + targeted refactor + A/B precommit
 verification.
 
-### Investigate HTTP/2 high-concurrency memory
+### Reduce HTTP/2 per-stream worker heap
 
 **What:** `json-h2c @ 4096c` uses 1.6 GiB at 124K rps in the HttpArena
 benchmark, high vs the same scenario over h1 (513 MiB at 193K rps) and
-vs peer h2 frameworks (actix at 1 GiB for 1.2M rps). Several candidate
-hotspots have been named (per-stream state size in
-`roadrunner_conn_loop_http2:stream_entry/0`, HPACK dynamic table,
-eager WINDOW_UPDATE refills, pending-send queues, BEAM
-message-passing GC pressure) but none measured.
+vs peer h2 frameworks (actix at 1 GiB for 1.2M rps).
 
-**Why deferred:** premature optimization risks shipping changes with
-deltas inside noise. Profile first (`recon:proc_count(memory, 5)`
-during a representative load plus `erlang:memory/0` snapshots),
-identify the dominant bucket, then design the smallest change.
+**Measured (local `multi_stream_h2 @ 1024c`, 16 streams/conn = 16 K live
+streams):** beam total 296 MiB. Breakdown:
 
-**Scope:** investigation, then a targeted fix sized to the finding.
+| Bucket | Size | Share |
+|---|---|---|
+| processes | 235 MiB | **76 %** |
+| system | 71 MiB | 23 % |
+| binary | 23 MiB | 7 % |
+| code | 9 MiB | 3 % |
+| ets | 3 MiB | 1 % |
+
+Top processes mid-bench, init=`proc_lib:init_p/5`, current=`gen:do_call/4`:
+all clustered at **~112 KiB each** (10 of 10 sampled). Average across
+~16 K processes: ~9 KiB; the top tail is ~12× that, indicating the
+h2 stream workers in mid-handler `gen_server:call` (likely to the conn
+process for window / send arbitration) are the heavy ones.
+
+**Where to look:** `src/roadrunner_conn_loop_http2.erl` worker spawn
++ stream-worker state. Specifically:
+- `stream_entry/0` map (per-stream state held on the conn process —
+  body iolist, hpack contexts, send/recv windows, pending-send
+  queue).
+- `roadrunner_http2_stream_worker` process state (request struct +
+  body buffer + handler closure).
+- Whether workers `hibernate` when blocked in `gen_server:call` for
+  window credit; today they don't, so their heap stays inflated.
+
+**Where NOT to look:** binary (23 MiB) and ets (3 MiB) are
+small — HPACK dynamic table reaping and WINDOW_UPDATE batching
+wouldn't move the needle relative to the per-process win.
+
+**Likely smallest impactful change:** make the stream worker
+hibernate while parked in `gen_server:call` waiting for send-window
+credit. Erlang hibernation collapses the heap to the bare reduction
+frame (~233 words), so a worker that's mostly waiting drops from
+~112 KiB to ~2 KiB until it's resumed. At 16 K parked workers that's
+a ~1.6 GiB → ~30 MiB reduction in the worst case.
+
+**Scope:** medium. Touches `roadrunner_http2_stream_worker`'s wait
+loop and possibly the conn-side `pending_sends` arbitration.
+Verification: re-run `multi_stream_h2 @ 1024c` and check the
+per-process top-10 drops below ~10 KiB.
 
 ### roadrunner_static FD cache for sendfile — investigated, not viable
 
