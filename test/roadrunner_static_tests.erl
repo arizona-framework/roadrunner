@@ -558,6 +558,51 @@ cache_enabled_cleanup({Name, Dir, _Port}) ->
     _ = file:del_dir_r(Dir),
     ok.
 
+%% =============================================================================
+%% Sendfile responses are now keep-alive eligible (same wire framing as
+%% buffered 3-tuple responses: Content-Length + bounded body).
+%% =============================================================================
+
+sendfile_response_supports_keep_alive_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun({_Dir, Port}) ->
+        {"two sendfile responses succeed on a single TCP conn", fun() ->
+            {ok, Sock} = gen_tcp:connect(
+                {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+            ),
+            %% No `Connection: close`: rely on HTTP/1.1's keep-alive
+            %% default and the new sendfile keep-alive support.
+            Req = ~"GET /static/hello.html HTTP/1.1\r\nHost: x\r\n\r\n",
+            ok = gen_tcp:send(Sock, Req),
+            Reply1 = recv_response_with_body(Sock, 14),
+            ok = gen_tcp:send(Sock, Req),
+            Reply2 = recv_response_with_body(Sock, 14),
+            ok = gen_tcp:close(Sock),
+            ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply1),
+            ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply2),
+            ?assertNotEqual(nomatch, binary:match(Reply1, ~"<h1>Hello</h1>")),
+            ?assertNotEqual(nomatch, binary:match(Reply2, ~"<h1>Hello</h1>"))
+        end}
+    end}.
+
+%% Read a single response: drain bytes until both the
+%% header / body separator is present AND `BodyLen` bytes of body are
+%% buffered. Stops as soon as one response is complete so the next
+%% recv on the same socket starts cleanly.
+recv_response_with_body(Sock, BodyLen) ->
+    recv_response_with_body_loop(Sock, <<>>, BodyLen).
+
+recv_response_with_body_loop(Sock, Buf, BodyLen) ->
+    case binary:split(Buf, ~"\r\n\r\n") of
+        [Head, Body] when byte_size(Body) >= BodyLen ->
+            <<Trim:(byte_size(Head) + 4 + BodyLen)/binary, _/binary>> = Buf,
+            Trim;
+        _ ->
+            {ok, Data} = gen_tcp:recv(Sock, 0, 1000),
+            recv_response_with_body_loop(
+                Sock, <<Buf/binary, Data/binary>>, BodyLen
+            )
+    end.
+
 setup_with_policy(Name, Policy) ->
     Dir = filename:join(
         "/tmp",

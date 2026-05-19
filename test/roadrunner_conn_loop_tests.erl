@@ -1095,8 +1095,11 @@ sendfile_response_writes_head_then_body_test() ->
     Path = filename:join(["/tmp", "rr_conn_loop_sendfile.txt"]),
     ok = file:write_file(Path, ~"sendfile-content"),
     persistent_term:put({roadrunner_conn_loop_sendfile_handler, file}, Path),
+    %% `Connection: close` so the conn exits after this single response.
+    %% Sendfile responses honor keep-alive now (see finishing_phase/3);
+    %% without the header the conn would idle past this test's deadline.
     Sink = spawn_active_sink_with_send_log(
-        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
     ),
     Opts = (fake_opts(sendf))#{
         dispatch :=
@@ -1126,8 +1129,11 @@ sendfile_response_skips_body_for_head_method_test() ->
     Path = filename:join(["/tmp", "rr_conn_loop_sendfile_head.txt"]),
     ok = file:write_file(Path, ~"never-sent"),
     persistent_term:put({roadrunner_conn_loop_sendfile_handler, file}, Path),
+    %% `Connection: close`: sendfile responses are keep-alive eligible,
+    %% so an unconditional close header keeps this single-request test
+    %% from idling past its deadline.
     Sink = spawn_active_sink_with_send_log(
-        Self, Tag, ~"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n"
+        Self, Tag, ~"HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
     ),
     Opts = (fake_opts(sendf_head))#{
         dispatch :=

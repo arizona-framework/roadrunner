@@ -247,30 +247,6 @@ trade-off with `open_file_cache`). The fd cache also needs:
 **Scope:** small-medium. Per-listener fd cache process plus the
 sendfile call site in `src/roadrunner_transport.erl:213`.
 
-### Keep-alive across sendfile responses
-
-**What:** `roadrunner_conn_loop:dispatch_response` (around line
-605) force-closes the connection after streaming a `{sendfile, ...}`
-response. The comment cites "the underlying writers manage their
-own keep-alive semantics" but `sendfile` writes a well-framed body
-with a known Content-Length, so the keep-alive decision is the
-same as a buffered response. Reusing the connection across
-sendfile responses would dramatically lift `roadrunner_static`
-throughput.
-
-**Why deferred:** small surface-area change but needs careful
-review of the existing "writers manage their own lifecycle"
-contract, plus integration tests that drive two sendfile responses
-back-to-back on one TCP connection. The static cache work
-(commit `a7670f4`) sets the meta path up; this commit unlocks the
-realistic perf. Local A/B currently caps static at the
-connection-establishment rate (`scripts/bench.escript`'s
-`httparena_static` scenario was deferred for this reason).
-
-**Scope:** small. Branch on the sendfile case in `dispatch_response/4`
-to reuse the `keep_alive_decision/2` helper the buffered branch
-already calls.
-
 ### Sync headline scenarios in comparison.md + resource_results.md
 
 **What:** `docs/comparison.md` and `docs/resource_results.md` still
