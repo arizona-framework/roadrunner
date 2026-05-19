@@ -1232,7 +1232,7 @@ maybe_capture_mem_profile(Peer, BeamTotal, Now, Acc) when
     case Due of
         true ->
             try peer:call(Peer, roadrunner_bench_memprofile, snapshot, [], 5000) of
-                {_, _} = Snapshot ->
+                {_, _, _} = Snapshot ->
                     Acc#{mem_profile => Snapshot, mem_profile_at_ms => Now};
                 _ ->
                     Acc
@@ -4043,8 +4043,8 @@ print_mem_profiles(Rows) ->
     lists:foreach(
         fun({Side, Row}) ->
             case maps:get(mem_profile, Row, undefined) of
-                {TotalProcs, Groups} ->
-                    print_mem_profile(Side, TotalProcs, Groups);
+                {TotalProcs, Groups, TopProcs} ->
+                    print_mem_profile(Side, TotalProcs, Groups, TopProcs);
                 _ ->
                     ok
             end
@@ -4052,7 +4052,7 @@ print_mem_profiles(Rows) ->
         Rows
     ).
 
-print_mem_profile(Side, TotalProcs, Groups) ->
+print_mem_profile(Side, TotalProcs, Groups, TopProcs) ->
     Sum = lists:foldl(
         fun({_, #{total_bytes := T}}, Acc) -> Acc + T end, 0, Groups
     ),
@@ -4109,24 +4109,28 @@ print_mem_profile(Side, TotalProcs, Groups) ->
                 ]
             )
     end,
-    %% Also surface the top single procs to spot fat outliers the
-    %% group view smooths over.
-    print_top_procs(Groups).
+    print_top_procs(TopProcs).
 
-print_top_procs(Groups) ->
-    TopProcs = lists:sublist(
-        lists:sort(
-            fun({_, #{max_bytes := A}}, {_, #{max_bytes := B}}) -> A >= B end,
-            Groups
-        ),
-        5
-    ),
-    io:format("~nfattest single procs (by max_bytes within group):~n"),
+print_top_procs(TopProcs) ->
+    io:format("~ntop 10 single procs (full process_info detail):~n"),
     lists:foreach(
-        fun({InitialCall, #{max_bytes := M, count := C}}) ->
+        fun(#{
+            pid := Pid,
+            initial_call := IC,
+            current_function := Cur,
+            memory := Mem,
+            heap_size := H,
+            total_heap_size := TH,
+            stack_size := S,
+            message_queue_len := Mq
+        }) ->
             io:format(
-                "  ~6B KB  count=~-6B  ~p~n",
-                [M div 1024, C, InitialCall]
+                "  ~6B KB  heap=~B/~B words  stack=~B  mq=~B  ~p ~p~n",
+                [Mem div 1024, H, TH, S, Mq, Pid, IC]
+            ),
+            io:format(
+                "          current=~p~n",
+                [Cur]
             )
         end,
         TopProcs

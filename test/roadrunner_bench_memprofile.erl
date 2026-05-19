@@ -17,37 +17,65 @@ matching how observer reports it.
 -export([snapshot/0]).
 
 -doc """
-Return `{TotalProcs, Groups}` where `Groups` is a list of
-`{InitialCall, Stats}` tuples sorted by total memory descending.
+Return `{TotalProcs, Groups, TopProcs}` where:
 
-`Stats` is `#{count, total_bytes, avg_bytes, max_bytes,
-top_current_funcs}` where `top_current_funcs` is the top-5
-`current_function` values by occurrence count within the group.
+- `Groups` is a list of `{InitialCall, Stats}` tuples sorted by total
+  memory descending. `Stats` is `#{count, total_bytes, avg_bytes,
+  max_bytes, top_current_funcs}`.
+- `TopProcs` is a list of the 10 individual processes with the largest
+  `memory`, each a map of `#{pid, initial_call, current_function,
+  memory, heap_size, total_heap_size, stack_size, message_queue_len,
+  garbage_collection}`. Useful for spotting what's in a fat conn_loop
+  vs a fat ssl_gen_statem.
 """.
 -spec snapshot() ->
-    {non_neg_integer(), [{term(), map()}]}.
+    {non_neg_integer(), [{term(), map()}], [map()]}.
 snapshot() ->
     Procs = erlang:processes(),
-    Acc = lists:foldl(fun fold_proc/2, #{}, Procs),
+    {Acc, Tops} = lists:foldl(fun fold_proc/2, {#{}, []}, Procs),
     Groups = lists:sort(
         fun({_, #{total_bytes := A}}, {_, #{total_bytes := B}}) -> A >= B end,
         [{IC, finalize(Stats)} || {IC, Stats} <- maps:to_list(Acc)]
     ),
-    {length(Procs), Groups}.
+    TopProcs = lists:sublist(
+        lists:sort(fun(#{memory := A}, #{memory := B}) -> A >= B end, Tops),
+        10
+    ),
+    {length(Procs), Groups, TopProcs}.
 
-fold_proc(Pid, Acc) ->
+fold_proc(Pid, {Acc, Tops}) ->
     case
         erlang:process_info(Pid, [
-            initial_call, dictionary, memory, current_function
+            initial_call,
+            dictionary,
+            memory,
+            current_function,
+            heap_size,
+            total_heap_size,
+            stack_size,
+            message_queue_len,
+            garbage_collection
         ])
     of
         undefined ->
-            Acc;
+            {Acc, Tops};
         Info ->
             InitialCall = resolve_initial_call(Info),
             Memory = proplists:get_value(memory, Info, 0),
             CurrentFun = proplists:get_value(current_function, Info, undefined),
-            update_group(InitialCall, Memory, CurrentFun, Acc)
+            Acc1 = update_group(InitialCall, Memory, CurrentFun, Acc),
+            ProcDetail = #{
+                pid => Pid,
+                initial_call => InitialCall,
+                current_function => CurrentFun,
+                memory => Memory,
+                heap_size => proplists:get_value(heap_size, Info, 0),
+                total_heap_size => proplists:get_value(total_heap_size, Info, 0),
+                stack_size => proplists:get_value(stack_size, Info, 0),
+                message_queue_len => proplists:get_value(message_queue_len, Info, 0),
+                garbage_collection => proplists:get_value(garbage_collection, Info, [])
+            },
+            {Acc1, [ProcDetail | Tops]}
     end.
 
 %% proc_lib stashes the real MFA under `$initial_call` so observer can
