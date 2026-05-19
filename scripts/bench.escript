@@ -119,7 +119,8 @@
     httparena_json,
     httparena_upload_20mb_auto,
     httparena_upload_20mb_manual,
-    httparena_limited_conn
+    httparena_limited_conn,
+    httparena_static
 ]).
 
 %% Scenarios that only make sense over HTTP/2. Mirrors the
@@ -390,6 +391,9 @@ preflight_scenario(#{scenario := httparena_upload_20mb_manual, servers := Server
 preflight_scenario(#{scenario := httparena_limited_conn, servers := Servers} = Opts) ->
     filter_servers(httparena_limited_conn, [cowboy, elli], Servers, Opts,
         ~"roadrunner-only fixture; mirrors HttpArena's `limited-conn` profile");
+preflight_scenario(#{scenario := httparena_static, servers := Servers} = Opts) ->
+    filter_servers(httparena_static, [cowboy, elli], Servers, Opts,
+        ~"roadrunner-only fixture; mirrors HttpArena's `static` profile");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -818,6 +822,15 @@ cli() ->
                                     surfaces contention on the
                                     per-listener slot counter
                                     under high-conn waves.
+                    httparena_static:
+                                    h1-only, roadrunner-only.
+                                    GET /static/hello.txt served
+                                    via `roadrunner_static` against
+                                    `test/bench_static/` with
+                                    `cache_ttl_ms => 1000`. Mirrors
+                                    HttpArena's `static` profile:
+                                    cached stat + sendfile reusing
+                                    the conn across requests.
                     """
             },
             #{
@@ -1604,6 +1617,19 @@ scenario_roadrunner_opts(httparena_limited_conn, BaseOpts) ->
         max_clients => 8000,
         routes => [
             {~"/baseline11", roadrunner_bench_httparena_baseline_handler, undefined}
+        ]
+    };
+scenario_roadrunner_opts(httparena_static, BaseOpts) ->
+    %% Serves `test/bench_static/hello.txt` via `roadrunner_static`
+    %% with the metadata cache opted in. Mirrors HttpArena's `static`
+    %% profile (hot path: cached stat + sendfile of a small immutable
+    %% asset, reusing the conn across requests).
+    Dir = filename:join([project_dir(), "test", "bench_static"]),
+    BaseOpts#{
+        routes => [
+            {~"/static/*path", roadrunner_static, #{
+                dir => Dir, cache_ttl_ms => 1000
+            }}
         ]
     }.
 
@@ -2853,7 +2879,8 @@ scenario_method(httparena_baseline) -> ~"GET";
 scenario_method(httparena_json) -> ~"GET";
 scenario_method(httparena_upload_20mb_auto) -> ~"POST";
 scenario_method(httparena_upload_20mb_manual) -> ~"POST";
-scenario_method(httparena_limited_conn) -> ~"GET".
+scenario_method(httparena_limited_conn) -> ~"GET";
+scenario_method(httparena_static) -> ~"GET".
 
 scenario_path(hello) -> ~"/";
 scenario_path(echo) -> ~"/echo";
@@ -2881,7 +2908,8 @@ scenario_path(httparena_baseline) -> ~"/baseline11?a=123&b=456";
 scenario_path(httparena_json) -> ~"/httparena_json/50?m=1";
 scenario_path(httparena_upload_20mb_auto) -> ~"/upload";
 scenario_path(httparena_upload_20mb_manual) -> ~"/upload";
-scenario_path(httparena_limited_conn) -> ~"/baseline11?a=123&b=456".
+scenario_path(httparena_limited_conn) -> ~"/baseline11?a=123&b=456";
+scenario_path(httparena_static) -> ~"/static/hello.txt".
 
 %% Pre-built per-iteration request bytes so the worker hot loop doesn't
 %% allocate. Both scenarios assume the same handler returns
@@ -3059,7 +3087,9 @@ build_request(httparena_upload_20mb_auto) ->
 build_request(httparena_upload_20mb_manual) ->
     httparena_upload_request();
 build_request(httparena_limited_conn) ->
-    ~"GET /baseline11?a=123&b=456 HTTP/1.1\r\nHost: x\r\n\r\n".
+    ~"GET /baseline11?a=123&b=456 HTTP/1.1\r\nHost: x\r\n\r\n";
+build_request(httparena_static) ->
+    ~"GET /static/hello.txt HTTP/1.1\r\nHost: x\r\n\r\n".
 
 httparena_upload_request() ->
     Body = binary:copy(~"x", ?HTTPARENA_UPLOAD_BODY_SIZE),
@@ -3128,7 +3158,11 @@ expected_body_len(httparena_upload_20mb_manual) ->
     byte_size(integer_to_binary(?HTTPARENA_UPLOAD_BODY_SIZE));
 expected_body_len(httparena_limited_conn) ->
     %% Same `/baseline11` handler as `httparena_baseline`: "579".
-    byte_size(integer_to_binary(123 + 456)).
+    byte_size(integer_to_binary(123 + 456));
+expected_body_len(httparena_static) ->
+    %% Body is `test/bench_static/hello.txt`. Size pinned to the file
+    %% byte count so the recv loop knows when to stop.
+    filelib:file_size(filename:join([project_dir(), "test", "bench_static", "hello.txt"])).
 
 %% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
 %% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
@@ -3602,6 +3636,11 @@ h2_request_shape(httparena_limited_conn) ->
     io:format(standard_error,
         "error: --scenarios httparena_limited_conn is h1-only "
         "(use --protocols h1)~n", []),
+    halt(2);
+h2_request_shape(httparena_static) ->
+    io:format(standard_error,
+        "error: --scenarios httparena_static is h1-only "
+        "(use --protocols h1)~n", []),
     halt(2).
 
 h2_worker_loop(Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->
@@ -3826,7 +3865,9 @@ scenario_request_summary(httparena_upload_20mb_auto) ->
 scenario_request_summary(httparena_upload_20mb_manual) ->
     "POST /upload HTTP/1.1, 20 MB body, body_buffering=manual 64 KB chunks (router, roadrunner-only)";
 scenario_request_summary(httparena_limited_conn) ->
-    "GET /baseline11 HTTP/1.1 against max_clients=8000 listener (router, roadrunner-only)".
+    "GET /baseline11 HTTP/1.1 against max_clients=8000 listener (router, roadrunner-only)";
+scenario_request_summary(httparena_static) ->
+    "GET /static/hello.txt HTTP/1.1, roadrunner_static + cache_ttl_ms=1000 (router, roadrunner-only)".
 
 result_to_row(Side, #{
     total := Total,

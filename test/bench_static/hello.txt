@@ -1,0 +1,1 @@
+HttpArena static-asset fixture; served by roadrunner_static.
