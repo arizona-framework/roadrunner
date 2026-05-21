@@ -393,8 +393,8 @@ preflight_scenario(#{scenario := httparena_limited_conn, servers := Servers} = O
     filter_servers(httparena_limited_conn, [cowboy, elli], Servers, Opts,
         ~"roadrunner-only fixture; mirrors HttpArena's `limited-conn` profile");
 preflight_scenario(#{scenario := httparena_static, servers := Servers} = Opts) ->
-    filter_servers(httparena_static, [cowboy, elli], Servers, Opts,
-        ~"roadrunner-only fixture; mirrors HttpArena's `static` profile");
+    filter_servers(httparena_static, [elli], Servers, Opts,
+        ~"elli fixture has no static-file route; roadrunner_static vs cowboy_static");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -1705,6 +1705,11 @@ scenario_cowboy_routes(mixed_workload) ->
     ];
 scenario_cowboy_routes(post_4kb_form) ->
     [{'_', [{"/form", roadrunner_bench_cowboy_form_handler, []}]}];
+scenario_cowboy_routes(httparena_static) ->
+    %% cowboy's built-in static handler over the same file roadrunner
+    %% serves, for an apples-to-apples static-serving comparison.
+    Dir = filename:join([project_dir(), "test", "bench_static"]),
+    [{'_', [{"/static/[...]", cowboy_static, {dir, Dir}}]}];
 scenario_cowboy_routes(large_post_streaming) ->
     [{'_', [{"/drain", roadrunner_bench_cowboy_drain_handler, []}]}];
 scenario_cowboy_routes(large_post_h2) ->
@@ -3933,7 +3938,7 @@ scenario_request_summary(httparena_upload_20mb_manual) ->
 scenario_request_summary(httparena_limited_conn) ->
     "GET /baseline11 HTTP/1.1 against max_clients=8000 listener (router, roadrunner-only)";
 scenario_request_summary(httparena_static) ->
-    "GET /static/hello.txt HTTP/1.1, roadrunner_static + cache_ttl_ms=1000 (router, roadrunner-only)".
+    "GET /static/hello.txt HTTP/1.1, roadrunner_static + cache_ttl_ms=1000 vs cowboy_static (router)".
 
 result_to_row(Side, #{
     total := Total,
