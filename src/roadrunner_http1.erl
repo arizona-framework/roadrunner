@@ -499,13 +499,14 @@ compute_cached_decisions(Headers) ->
 compute_cached_decisions_loop([], Acc) ->
     Acc;
 compute_cached_decisions_loop([{~"transfer-encoding", V} | Rest], Acc) ->
-    Acc1 = Acc#{has_transfer_encoding := true},
-    Acc2 =
+    %% Set both keys in a single map update on the chunked path — two
+    %% sequential `:=` updates would allocate two map terms.
+    Acc1 =
         case roadrunner_bin:ascii_lowercase(V) of
-            ~"chunked" -> Acc1#{is_chunked := true};
-            _ -> Acc1
+            ~"chunked" -> Acc#{has_transfer_encoding := true, is_chunked := true};
+            _ -> Acc#{has_transfer_encoding := true}
         end,
-    compute_cached_decisions_loop(Rest, Acc2);
+    compute_cached_decisions_loop(Rest, Acc1);
 compute_cached_decisions_loop([{~"expect", V} | Rest], Acc) ->
     Acc1 =
         case roadrunner_bin:ascii_lowercase(V) of

@@ -791,10 +791,12 @@ do_drain(#state{listen_socket = LSocket, proto_opts = ProtoOpts} = State, Timeou
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     Group = drain_group(ProtoOpts),
     notify_conns(Group, Deadline),
-    DrainingState = State#state{listen_socket = closed, phase = draining},
     Counter = maps:get(client_counter, ProtoOpts),
     Reply = wait_for_drain(Counter, Deadline, Group),
-    {Reply, DrainingState#state{phase = stopped}}.
+    %% `phase = draining` was never observable here (the gen_server is
+    %% blocked in wait_for_drain and the local state isn't committed),
+    %% so settle straight to the final stopped state in one update.
+    {Reply, State#state{listen_socket = closed, phase = stopped}}.
 
 %% Best-effort broadcast to in-flight conns. Loop / SSE / WebSocket
 %% handlers can pattern-match on `{roadrunner_drain, Deadline}` in

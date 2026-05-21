@@ -714,11 +714,16 @@ on_continuation(StreamId, Flags, Fragment, #loop{streams = Streams} = State) ->
             Combined = <<Existing/binary, Fragment/binary>>,
             EndHeaders = (Flags band 16#04) =/= 0,
             Stream1 = Stream#{header_fragment := Combined, end_headers := EndHeaders},
-            State1 = State#loop{streams = Streams#{StreamId := Stream1}},
+            Streams1 = Streams#{StreamId := Stream1},
+            %% Set streams + awaiting_continuation in one record update on
+            %% the END_HEADERS path — two sequential `#loop{}` updates
+            %% would copy the record twice.
             State2 =
                 case EndHeaders of
-                    true -> State1#loop{awaiting_continuation = undefined};
-                    false -> State1
+                    true ->
+                        State#loop{streams = Streams1, awaiting_continuation = undefined};
+                    false ->
+                        State#loop{streams = Streams1}
                 end,
             case {EndHeaders, PriorHeaders =:= undefined} of
                 {true, true} -> finalize_headers(StreamId, State2);
