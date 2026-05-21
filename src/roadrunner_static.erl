@@ -185,7 +185,7 @@ fresh_lookup(FilePath, TtlMs, Req) ->
     %% `read_link_info/1` does not follow the leaf symlink — we need
     %% the un-followed type so the symlink-policy gate can decide
     %% whether the target is allowed to be served.
-    case file:read_link_info(FilePath, [{time, posix}]) of
+    case file:read_link_info(FilePath, [raw, {time, posix}]) of
         {ok, #file_info{type = symlink}} ->
             case symlink_allowed(FilePath, Req) of
                 true -> serve_followed_file(FilePath, Req);
@@ -250,7 +250,7 @@ maybe_cache_put(FilePath, Size, Mtime, TtlMs) ->
 -spec serve_followed_file(file:filename_all(), roadrunner_req:request()) ->
     roadrunner_handler:response().
 serve_followed_file(FilePath, Req) ->
-    case file:read_file_info(FilePath, [{time, posix}]) of
+    case file:read_file_info(FilePath, [raw, {time, posix}]) of
         {ok, #file_info{type = regular, size = Size, mtime = Mtime}} ->
             serve_regular_file(FilePath, Size, Mtime, Req);
         _ ->
@@ -293,7 +293,7 @@ maybe_serve_gzip(FilePath, ETag, LastMod, Req) ->
     of
         true ->
             GzPath = iolist_to_binary([FilePath, ~".gz"]),
-            case file:read_file_info(GzPath, [{time, posix}]) of
+            case file:read_file_info(GzPath, [raw, {time, posix}]) of
                 {ok, #file_info{type = regular, size = GzSize}} ->
                     {ok, gzip_response(FilePath, GzPath, GzSize, ETag, LastMod)};
                 _ ->
