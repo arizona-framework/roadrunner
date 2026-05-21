@@ -36,7 +36,7 @@ prop_loop_terminates_normal_on_random_inputs() ->
         begin
             {ok, _} = application:ensure_all_started(telemetry),
             ensure_pg(),
-            Counter = atomics:new(1, [{signed, false}]),
+            Counter = counters:new(1, [write_concurrency]),
             Opts = proto_opts(prop_listener, Counter),
             %% Mirror the acceptor's slot acquisition so the conn's
             %% release brings the counter back to 0 (not below).
@@ -72,7 +72,7 @@ prop_loop_terminates_normal_on_random_inputs() ->
             %% (acquired above) back to 0. Anything else means the conn
             %% either crashed before exit_clean or something leaked the
             %% slot.
-            CounterOk = atomics:get(Counter, 1) =:= 0,
+            CounterOk = counters:get(Counter, 1) =:= 0,
             ExitOk andalso CounterOk
         end
     ).
@@ -101,7 +101,7 @@ prop_request_start_and_stop_share_request_id() ->
                 undefined
             ),
             try
-                Counter = atomics:new(1, [{signed, false}]),
+                Counter = counters:new(1, [write_concurrency]),
                 Sink = spawn_recv_sink([
                     {recv,
                         <<Method/binary, " / HTTP/1.1\r\nHost: x\r\n",

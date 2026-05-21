@@ -189,23 +189,293 @@ test in `roadrunner_conn_loop_http2_tests` that advertises a higher
 `MAX_FRAME_SIZE` in the client SETTINGS and asserts the resulting
 DATA frames scale up accordingly.
 
-### Investigate small-body POST RSS gap
+### Small-body POST RSS gap — investigated, it's the keep-alive GC trade-off
 
 **What:** A `--with-resources` survey (see `docs/resource_results.md`)
 shows roadrunner using **+51 % RSS** vs cowboy on `post_4kb_form` and
 **+17 %** on `echo` (256-byte body). The hot-path GETs and large-body
 streaming scenarios don't show this gap — only small-body POST.
 
-**Why deferred:** the likely cause is the per-request `body_state`
-machinery + manual-mode reader being allocated even for auto-mode
-small-body workloads. Investigation needs fprof under load to
-confirm the allocation site, then a targeted fix (e.g. lazy
-allocation of the body-state map / reader closures only when the
-handler opts into manual mode). Single most actionable resource
-finding from the survey.
+**Investigated on `perf/httparena-followups`.** The earlier
+hypothesis (per-request `body_state` / manual-reader allocated even
+in auto mode) was wrong: auto mode never builds the body_reader (see
+`roadrunner_conn_loop:read_body_phase`'s `auto` branch). The actual
+cause is the **keep-alive process model**: roadrunner reuses one conn
+process across keep-alive requests, so each request's garbage (body
+iolist, refc-binary body in the binary bucket, request-map copies,
+parser scratch) lingers until the BEAM fires a heap-growth-triggered
+GC — and small per-request allocations don't grow the heap fast
+enough to collect promptly. Cowboy spawns a fresh process per
+request that dies and reclaims immediately, so its steady-state
+footprint is lower.
 
-**Scope:** medium — fprof + targeted refactor + A/B precommit
-verification.
+**Important framing:** in the same measurement roadrunner ran ~2×
+cowboy's throughput (183 K vs 95 K rps on `post_4kb_form @ 64c`).
+Per-rps, roadrunner is *leaner* (0.53 vs 0.73 KB-beam/rps). The
+absolute-RSS gap is a consequence of pushing more requests through
+fewer, longer-lived processes.
+
+**Measured GC-frequency trade-off (`post_4kb_form @ 64c`):**
+
+| GC cadence | beam | rps | vs baseline |
+|---|---|---|---|
+| none (default) | 97 MB | 183 K | — |
+| every 16th req | ~96 MB | ~178 K | no mem gain, −3 % rps |
+| every request | 67 MB | 169 K | **−31 % mem, −8 % rps** |
+
+The benefit is steeply non-linear: 16 requests' garbage between
+collects is already most of the steady state, so only near-per-request
+GC moves the needle — and that costs throughput. `fullsweep_after`
+tuning was also tried (changes GC *type*, not *frequency*) and made
+memory slightly worse.
+
+**Why no fix shipped:** forcing GC trades away roadrunner's throughput
+lead to match cowboy's absolute memory, on a workload where roadrunner
+is already more memory-efficient per request. Not a clear win, and
+pre-v0.1 we don't add opt-in knobs. If a memory-constrained
+deployment ever needs it, the lever is a per-request `garbage_collect/0`
+at the keep-alive loop-back in `buffered_finish/3` (or an adaptive
+heap-size-threshold check) — but that's a deliberate policy choice,
+not a default.
+
+### Reduce HTTP/2 per-stream worker heap
+
+**What:** `json-h2c @ 4096c` uses 1.6 GiB at 124K rps in the HttpArena
+benchmark, high vs the same scenario over h1 (513 MiB at 193K rps) and
+vs peer h2 frameworks (actix at 1 GiB for 1.2M rps).
+
+**Measured (local `multi_stream_h2 @ 1024c`, 16 streams/conn = 16 K live
+streams):** beam total 296 MiB. Breakdown:
+
+| Bucket | Size | Share |
+|---|---|---|
+| processes | 235 MiB | **76 %** |
+| system | 71 MiB | 23 % |
+| binary | 23 MiB | 7 % |
+| code | 9 MiB | 3 % |
+| ets | 3 MiB | 1 % |
+
+Top processes mid-bench, init=proc_lib's `init_p/5`,
+current=`gen:do_call/4`: all clustered at **~112 KiB each** (10 of 10
+sampled).
+
+**Granular per-`initial_call` breakdown (local
+`multi_stream_h2 @ 1024c`, captured via
+`test/roadrunner_bench_memprofile.erl` + `scripts/bench.escript
+--with-resources`):**
+
+| initial_call | count | total MB | per-proc avg | top current_function |
+|---|---|---|---|---|
+| roadrunner_conn_loop init_loop/3 | ~935 | 57 | ~60 KiB | roadrunner_conn_loop_http2 recv_more/1 |
+| ssl_gen_statem init/1 | ~935 | 48 | ~53 KiB | gen_statem loop/3 |
+| tls_sender init/1 | ~935 | 11 | ~12 KiB | gen_statem loop/3 |
+| other 60 groups | ~2 K | ~8 | — | mixed |
+
+Total accounted across all groups: **~125 MiB**. Process bucket at
+the same instant: **~190 MiB**. The ~65 MiB gap is short-lived stream
+workers — total processes count is ~12 K but only ~3.8 K survive long
+enough to be `process_info`-d (8 K die between `erlang:processes/0`
+and the iteration). Their per-proc heap is small but the high churn
+sums.
+
+**Per-proc detail on the top 10 conn_loop procs (full
+`process_info` via the enhanced
+`test/roadrunner_bench_memprofile.erl`):**
+
+- `memory = 109 KiB`, `heap_size = 6772 words`,
+  `total_heap_size = 13544 words`, `stack_size = 30`,
+  **`message_queue_len = 16-29`**
+- `current_function = gen:do_call/4` — parked inside `ssl:send/2`,
+  which dispatches to the per-connection ssl gen_statem
+- All 10 top procs match this profile
+
+**Real bottleneck driving per-conn heap, not state layout:** the
+conn_loop's heap balloons during TLS `ssl:send` blocking because
+worker `h2_send_response` messages back up in the conn's mailbox.
+Each pending message carries its response payload (headers list +
+body iolist). With 16 concurrent streams per conn, the mailbox holds
+on the order of 16+ response messages × iolist size each while the
+conn is parked in `gen:do_call/4` waiting for the ssl gen_statem to
+drain. The 60 KiB average + 109 KiB outliers come mostly from this
+mailbox content, NOT the static `loop_state` record or the streams
+map.
+
+**Implications for the fix shape:**
+
+- Field-level pruning of `stream_entry/0` (e.g. clear `headers` after
+  worker dispatch) gives sub-1 % savings here — the workers already
+  copy `headers`/`body` away from the conn, and the conn's static
+  per-stream footprint is small relative to the in-flight mailbox.
+- The mailbox inflation is intrinsic to "workers send full responses
+  via messages to a conn that batches them onto a single TLS socket."
+  Mitigations are architectural (split the wire-write off the conn
+  loop, or have workers stage payloads in ets / persistent_term and
+  message only the pointer) — every option is a sizeable refactor and
+  trades message size for an indirection on the hot path.
+- Worker hibernation in `sync/1` would not help: workers are already
+  short-lived (the bench memprofile shows ~8 K procs die between
+  `erlang:processes/0` and `process_info` per snapshot pass).
+
+**General roadrunner-on-TLS implication:** any h2-over-TLS workload
+shares this shape — the OTP ssl gen_statem dispatch is in the hot
+path of every outbound frame. Profiling-driven changes that reduce
+per-`ssl:send` latency (e.g. coalescing HEADERS + small DATA into a
+single send when the response fits in one frame, already in place at
+`send_buffered`) help across all TLS users.
+
+**Where NOT to look:** binary (23 MiB) and ets (3 MiB) are small —
+HPACK dynamic-table reaping and WINDOW_UPDATE batching wouldn't move
+the needle. Per-stream state layout is similarly not the lever; the
+streams map is small relative to the mailbox.
+
+**h2c (cleartext) measured — the mailbox effect is TLS-only, and the
+big number is mostly OS-level.** The bench now drives cleartext h2c
+(`--protocols h2c`, plain-TCP `protocols => [http2]` listener), so the
+HttpArena `*-h2c` profiles are reproducible locally. `multi_stream_h2`
+over h2c:
+
+| | rps | erlang:memory peak | RSS | per-conn |
+|---|---|---|---|---|
+| h2c @ 1024c | 535 k | 302 MiB | 426 MiB | ~60 KiB |
+| h2c @ 4096c | 442 k | 212 MiB | 718 MiB | — |
+| TLS @ 1024c | ~330 k | 296 MiB (incl. ssl procs) | — | ~60 KiB |
+
+Findings:
+- **No mailbox inflation on h2c.** The conn_loop sits in
+  `roadrunner_conn_loop_http2:recv_more/1`, never `gen:do_call/4` —
+  `gen_tcp:send` doesn't block on a gen_statem, so the inflation above
+  is confirmed TLS-only.
+- **h2c is ~60 % faster than TLS** and leaner (no `ssl_gen_statem` /
+  `tls_sender` procs). The json-h2c throughput rank reflects the
+  per-stream-worker model vs a native h2 stack, not a roadrunner-h2
+  defect.
+- **The 1.6 GiB on HttpArena `json-h2c @ 4096c` is mostly outside the
+  BEAM.** At 4096c locally, `erlang:memory(total)` peaks ~212 MiB
+  while RSS is 718 MiB — ~70 % is per-socket kernel buffers × 4096
+  conns + allocator carriers. RSS scales with conn count; Erlang heap
+  tracks in-flight work, not conns. json's variable-array payloads
+  add the rest (in-flight response bytes), pushing RSS toward the
+  HttpArena figure. h2o (C) uses *more* on the same profile (1.9 GiB),
+  so this is the cost of 4096 concurrent connections, not a roadrunner
+  leak.
+
+**Shipped — idle-conn hibernation (h1 parity).** The h2 conn loop now
+honors `hibernate_after` like the h1 loop: when the streams map is
+empty and the conn is parked waiting for the next frame past the
+window, it `erlang:hibernate/3`s, collapsing the heap until the next
+frame wakes it. Demonstrated ~3.6× idle-conn heap reduction (4.9 KiB →
+1.4 KiB on lightly-used conns; more for conns with a populated hpack
+dynamic table). This is a **memory** win for idle/bursty keep-alive
+(browsers, API clients) — opt-in, default off, zero throughput effect
+(`recv_timeout/1` is ~60 ns/call and the hibernate branch never fires
+under load). It does **not** touch the all-busy `json-h2c @ 4096c`
+figure: those conns never idle past the window.
+
+**Scope:** medium-to-large, and now de-prioritized. The remaining
+reducible roadrunner-side memory is the *active* per-conn
+`conn_loop_http2` state (~60 KiB: streams map, hpack contexts, recv
+buffer) — ~246 MiB of Erlang heap at 4096c, a minority of the RSS
+that's dominated by sockets + payload. Trimming it is a real but
+capped win that won't move the headline RSS; the remaining big levers
+(wire-write split, pointer-only worker→conn protocol) are
+architectural and lack a workload that justifies the refactor.
+
+### Large-POST auto-buffering memory — measured, no roadrunner-side fix in scope
+
+**Status:** investigated on `perf/httparena-followups`; the
+auto-vs-manual trade-off is intrinsic to the API.
+
+**Measured (`httparena_upload_20mb_auto @ 32c`, 20 MB POST):**
+
+| Bucket | Auto | Manual |
+|---|---|---|
+| beam total | 997 MB | 97 MB |
+| binary | 944 MB | small |
+| processes | 21 MB | small |
+| throughput | 643 rps | 930 rps |
+
+32 conns × 20 MB raw body = 640 MB. The 944 MB binary bucket is
+640 MB of in-flight body data + ~300 MB overhead (BEAM refcounted
+binary allocator's chunk pages, sub-binary refs, delayed GC of the
+prior request's body iolist before the next one arrives).
+
+**Why no fix:** auto-buffering's contract IS "the conn pre-buffers
+the full body into the request map before dispatch." A roadrunner-
+side change can't trim memory below that floor without either (a)
+breaking the contract (e.g. flushing the body to disk — overkill
+for small bodies, slow for large) or (b) tuning BEAM's binary
+allocator (deep emulator-config territory, off-limits to the
+framework). Users with large uploads should use
+`body_buffering => manual` (see `roadrunner_listener` `opts/0`),
+which the API already exposes and the docs steer towards.
+
+**If revisited:** would need a workload where manual mode isn't
+suitable (e.g. a use case that genuinely wants the whole body
+present as one value) AND where 47 % overhead-above-raw matters.
+No such workload identified to date.
+
+### roadrunner_static FD cache for sendfile — investigated, not viable
+
+**Status:** investigated on `perf/httparena-followups`; **don't
+re-attempt** without new evidence.
+
+**Finding 1 — global fd cache is infeasible in BEAM.** `file:open(_,
+[raw, binary])` returns an fd that `prim_file:get_fd_data/1` tags
+with the opening process's pid and rejects from any other caller
+(`{error, not_on_controlling_process}`). `file:sendfile/5` goes
+through the same check. There is no file equivalent of
+`gen_tcp:controlling_process/2`.
+A supervised gen_server holding fds for all conns therefore can't
+hand them out to acceptors. See
+`erts-17.0/src/prim_file.erl:499-504`.
+
+**Finding 2 — per-conn fd cache (the BEAM-correct fallback) doesn't
+move the needle.** Stashing `#{Path => {Fd, Tick}}` in the conn
+process's pdict, with a 16-entry LRU cap, was implemented and
+A/B'd against current HEAD on `httparena_static @ 16c` (3×5s per
+side): mean 146.8 k → 143.8 k rps, post slightly **slower** (−2 %),
+well inside run-to-run variance. `file:open(_, [raw, binary])` is
+sub-µs on a hot OS page cache; the pdict map lookup + tick bump +
+`maps:put` overhead cancels the saving.
+
+**Finding 3 — the fd-term owner-rewrite hack works but is
+catastrophically unsafe (do not use).** A raw fd CAN be handed to
+another process by destructuring its term and rewriting the owner
+field:
+
+```erlang
+{file_descriptor, prim_file, Data} = Fd,
+Fd1 = {file_descriptor, prim_file, Data#{owner => self()}}.
+```
+
+This bypasses the `not_on_controlling_process` check, so a shared
+cross-conn fd cache could in principle be built on it. It is
+undocumented and unsafe: the runtime tracks fd ownership for cleanup
+via an atomic compare-and-swap, so if the owning process dies while
+operations are in flight from other processes, they all signal close
+of the underlying OS fd. Since OS fd integers are reused, that can
+close an UNRELATED descriptor (a live socket or another open file) —
+rare but equivalent to memory corruption, with no recovery. OTP issue
+#9239 (raw pread from multiple processes) is stalled awaiting the VM
+team; POSIX pread/sendfile are thread-safe at the OS level but Erlang
+exposes no sanctioned multi-process raw-fd API. Sources: erlang.org
+file docs, OTP issue #9239, Erlang Forums "is it safe to share Fd
+between processes".
+
+**What we ship instead — raw open per process (the sanctioned path).**
+Both the stat and the sendfile open use `raw` in the calling process
+(`roadrunner_static` read_link_info / read_file_info, and
+`roadrunner_transport:sendfile`'s `file:open(_, [read, raw, binary])`),
+which bypasses the `file_server` gen_server with no fd sharing. On the
+uncached static path the `raw` stat removed a `file_server`
+serialization bottleneck under concurrency: 70k → 125k rps at 256c.
+
+**If revisited:** would need either (a) a measured workload where
+`file:open` shows up as a clear hotspot in fprof / eprof (none seen
+to date), or (b) a NIF-backed cache that owns the fds and serves
+reads/sendfile itself (custom C / Rust, well outside the "pure-Erlang"
+property the framework markets) — the owner-rewrite hack in Finding 3
+is NOT a safe shortcut around this.
 
 ### Sync headline scenarios in comparison.md + resource_results.md
 

@@ -1,6 +1,6 @@
 # Benchmark results
 
-Captured by `scripts/bench_matrix.sh` on 2026-05-15 at `90fba12`.
+Captured by `scripts/bench_matrix.sh` on 2026-05-20 at `1e8be80`.
 
 **Hardware / runtime**
 
@@ -29,30 +29,30 @@ Set `SKIP_BENCH=1` to regenerate the CSV / MD from the existing
 
 | scenario | roadrunner | cowboy | elli | rr p50 / p99 |
 |---|---:|---:|---:|---:|
-| `hello` | 287 k | 189 k | 281 k | 115 µs / 1.7 ms |
-| `json` | 290 k | 194 k | 316 k | 115 µs / 1.7 ms |
-| `echo` | 284 k | 153 k | 294 k | 123 µs / 1.5 ms |
-| `headers_heavy` | 254 k | 143 k | 249 k | 135 µs / 1.8 ms |
-| `large_response` | 121 k | 95 k | 129 k | 315 µs / 3.0 ms |
-| `multi_request_body` | 271 k | 120 k | 275 k | 129 µs / 1.5 ms |
-| `varied_paths_router` | 292 k | 168 k | — | 119 µs / 1.4 ms |
-| `post_4kb_form` | 174 k | 95 k | — | 220 µs / 1.8 ms |
-| `large_post_streaming` | 19 k | 7.0 k | — | 2.5 ms / 5.9 ms |
-| `pipelined_h1` | 572 k | 362 k | 4.8 k | 69 µs / 609 µs |
-| `websocket_msg_throughput` | 231 k | 171 k | — | 153 µs / 1.9 ms |
-| `gzip_response` | 137 k | 108 k | — | 287 µs / 2.2 ms |
+| `hello` | 307 k | 201 k | 299 k | 112 µs / 1.4 ms |
+| `json` | 299 k | 189 k | 304 k | 112 µs / 1.5 ms |
+| `echo` | 304 k | 162 k | 282 k | 116 µs / 1.2 ms |
+| `headers_heavy` | 257 k | 141 k | 253 k | 134 µs / 1.8 ms |
+| `large_response` | 124 k | 98 k | 123 k | 310 µs / 2.7 ms |
+| `multi_request_body` | 262 k | 125 k | 274 k | 134 µs / 1.5 ms |
+| `varied_paths_router` | 290 k | 175 k | — | 118 µs / 1.5 ms |
+| `post_4kb_form` | 193 k | 98 k | — | 199 µs / 1.5 ms |
+| `large_post_streaming` | 20 k | 6.9 k | — | 2.5 ms / 5.7 ms |
+| `pipelined_h1` | 580 k | 371 k | 4.8 k | 68 µs / 615 µs |
+| `websocket_msg_throughput` | 232 k | 179 k | — | 149 µs / 2.0 ms |
+| `gzip_response` | 138 k | 111 k | — | 286 µs / 2.2 ms |
 
 ## HTTP/2
 
 | scenario | roadrunner | cowboy | elli | rr p50 / p99 |
 |---|---:|---:|---:|---:|
-| `hello` | 172 k | 166 k | — | 215 µs / 2.5 ms |
-| `json` | 167 k | 151 k | — | 224 µs / 2.4 ms |
-| `echo` | 163 k | 118 k | — | 237 µs / 2.1 ms |
-| `headers_heavy` | 163 k | 89 k | — | 240 µs / 2.1 ms |
-| `multi_request_body` | 138 k | 33 k | — | 285 µs / 2.5 ms |
-| `multi_stream_h2` | 350 k | 339 k | — | 126 µs / 379 µs |
-| `streaming_response` | 61 k | 60 k | — | 644 µs / 4.1 ms |
+| `hello` | 167 k | 163 k | — | 219 µs / 2.5 ms |
+| `json` | 168 k | 153 k | — | 226 µs / 2.3 ms |
+| `echo` | 164 k | 112 k | — | 235 µs / 2.2 ms |
+| `headers_heavy` | 161 k | 90 k | — | 236 µs / 2.5 ms |
+| `multi_request_body` | 140 k | 28 k | — | 279 µs / 2.4 ms |
+| `multi_stream_h2` | 351 k | 335 k | — | 125 µs / 374 µs |
+| `streaming_response` | 62 k | 61 k | — | 640 µs / 4.1 ms |
 
 ## Notes / known gaps
 

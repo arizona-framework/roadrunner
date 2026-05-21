@@ -446,6 +446,242 @@ symlink_policy_refuse_test_() ->
             ]
         end}.
 
+%% =============================================================================
+%% Metadata cache — direct cache helpers plus end-to-end coverage of the
+%% `cache_ttl_ms` route opt.
+%% =============================================================================
+
+cache_helpers_test_() ->
+    {setup, fun cache_helpers_setup/0, fun cache_helpers_cleanup/1, fun({Dir}) ->
+        [
+            {"cache_get returns miss when no entry exists", fun() ->
+                FilePath = filename:join(Dir, "no_cache_yet.txt"),
+                ?assertEqual(miss, roadrunner_static:cache_get(FilePath))
+            end},
+            {"cache_put then cache_get within TTL returns the entry", fun() ->
+                FilePath = filename:join(Dir, "fresh.txt"),
+                ok = roadrunner_static:cache_put(FilePath, 100, 1700000000, 60000),
+                ?assertEqual(
+                    {ok, 100, 1700000000},
+                    roadrunner_static:cache_get(FilePath)
+                )
+            end},
+            {"cache_get returns miss after TTL expires", fun() ->
+                FilePath = filename:join(Dir, "expiring.txt"),
+                ok = roadrunner_static:cache_put(FilePath, 50, 1700000000, 1),
+                timer:sleep(20),
+                ?assertEqual(miss, roadrunner_static:cache_get(FilePath))
+            end},
+            {"cache_ttl_ms => infinity entries never expire", fun() ->
+                %% No `monotonic_time + infinity` arithmetic; sleeping
+                %% past any finite TTL must still return the entry.
+                FilePath = filename:join(Dir, "forever.txt"),
+                ok = roadrunner_static:cache_put(FilePath, 42, 1700000000, infinity),
+                ?assertEqual(
+                    {ok, 42, 1700000000},
+                    roadrunner_static:cache_get(FilePath)
+                ),
+                timer:sleep(10),
+                ?assertEqual(
+                    {ok, 42, 1700000000},
+                    roadrunner_static:cache_get(FilePath)
+                )
+            end},
+            {"cache_clear/0 drops every static-meta entry", fun() ->
+                F1 = filename:join(Dir, "clear_a.txt"),
+                F2 = filename:join(Dir, "clear_b.txt"),
+                Sentinel = {?MODULE, cache_clear_sentinel},
+                ok = roadrunner_static:cache_put(F1, 10, 1700000000, infinity),
+                ok = roadrunner_static:cache_put(F2, 20, 1700000000, 60000),
+                %% A non-static persistent_term entry must NOT be erased.
+                ok = persistent_term:put(Sentinel, kept),
+                try
+                    ok = roadrunner_static:cache_clear(),
+                    ?assertEqual(miss, roadrunner_static:cache_get(F1)),
+                    ?assertEqual(miss, roadrunner_static:cache_get(F2)),
+                    ?assertEqual(kept, persistent_term:get(Sentinel))
+                after
+                    _ = persistent_term:erase(Sentinel)
+                end
+            end}
+        ]
+    end}.
+
+cache_populated_after_request_test_() ->
+    {setup, fun cache_enabled_setup/0, fun cache_enabled_cleanup/1, fun(
+        {_Name, Dir, Port}
+    ) ->
+        [
+            {"first request populates the metadata cache when ttl > 0", fun() ->
+                %% The handler builds FilePath from `Dir` + binary segments
+                %% so the resulting cache key is a binary; match that here.
+                FilePath = filename:join([Dir, ~"cached.txt"]),
+                _ = persistent_term:erase({roadrunner_static_meta, FilePath}),
+                ?assertEqual(miss, roadrunner_static:cache_get(FilePath)),
+                _Reply = http_get(Port, ~"/static/cached.txt"),
+                ?assertMatch({ok, _Size, _Mtime}, roadrunner_static:cache_get(FilePath))
+            end},
+            {"second request hits the cache and serves the same body", fun() ->
+                %% Drive `serve_file` through its cache-hit branch by
+                %% issuing a follow-up GET after the first populated the
+                %% cache. Body must match.
+                Reply1 = http_get(Port, ~"/static/cached.txt"),
+                Reply2 = http_get(Port, ~"/static/cached.txt"),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply1),
+                ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply2),
+                [_, Body1] = binary:split(Reply1, ~"\r\n\r\n"),
+                [_, Body2] = binary:split(Reply2, ~"\r\n\r\n"),
+                ?assertEqual(Body1, Body2),
+                ?assertEqual(~"cached", Body1)
+            end}
+        ]
+    end}.
+
+cache_default_off_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun({Dir, Port}) ->
+        {"default cache_ttl_ms is 0; nothing is cached", fun() ->
+            FilePath = filename:join([Dir, ~"hello.html"]),
+            _ = persistent_term:erase({roadrunner_static_meta, FilePath}),
+            _Reply = http_get(Port, ~"/static/hello.html"),
+            ?assertEqual(miss, roadrunner_static:cache_get(FilePath))
+        end}
+    end}.
+
+cache_helpers_setup() ->
+    Dir = filename:join(
+        "/tmp", "rr_cache_helpers_" ++ integer_to_list(rand:uniform(1000000))
+    ),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    {Dir}.
+
+cache_helpers_cleanup({Dir}) ->
+    lists:foreach(
+        fun
+            ({{roadrunner_static_meta, _Path} = K, _V}) ->
+                _ = persistent_term:erase(K),
+                ok;
+            (_) ->
+                ok
+        end,
+        persistent_term:get()
+    ),
+    _ = file:del_dir_r(Dir),
+    ok.
+
+cache_enabled_setup() ->
+    Name = static_test_cache_on,
+    Dir = filename:join(
+        "/tmp", "rr_cache_on_" ++ integer_to_list(rand:uniform(1000000))
+    ),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    ok = file:write_file(filename:join(Dir, "cached.txt"), ~"cached"),
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        routes => [
+            {~"/static/*path", roadrunner_static, #{
+                dir => Dir, cache_ttl_ms => 60000
+            }}
+        ]
+    }),
+    {Name, Dir, roadrunner_listener:port(Name)}.
+
+cache_enabled_cleanup({Name, Dir, _Port}) ->
+    ok = roadrunner_listener:stop(Name),
+    _ = file:del_dir_r(Dir),
+    ok.
+
+%% =============================================================================
+%% Sendfile responses are now keep-alive eligible (same wire framing as
+%% buffered 3-tuple responses: Content-Length + bounded body).
+%% =============================================================================
+
+sendfile_response_supports_keep_alive_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun({_Dir, Port}) ->
+        {"two sendfile responses succeed on a single TCP conn", fun() ->
+            {ok, Sock} = gen_tcp:connect(
+                {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+            ),
+            %% No `Connection: close`: rely on HTTP/1.1's keep-alive
+            %% default and the new sendfile keep-alive support.
+            Req = ~"GET /static/hello.html HTTP/1.1\r\nHost: x\r\n\r\n",
+            ok = gen_tcp:send(Sock, Req),
+            Reply1 = recv_response_with_body(Sock, 14),
+            ok = gen_tcp:send(Sock, Req),
+            Reply2 = recv_response_with_body(Sock, 14),
+            ok = gen_tcp:close(Sock),
+            ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply1),
+            ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply2),
+            ?assertNotEqual(nomatch, binary:match(Reply1, ~"<h1>Hello</h1>")),
+            ?assertNotEqual(nomatch, binary:match(Reply2, ~"<h1>Hello</h1>"))
+        end}
+    end}.
+
+sendfile_range_response_supports_keep_alive_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun({_Dir, Port}) ->
+        {"two 206 range responses succeed on a single TCP conn", fun() ->
+            {ok, Sock} = gen_tcp:connect(
+                {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+            ),
+            %% `bytes=0-3` against `hello.html` (14 bytes) returns
+            %% 206 with the first 4 bytes `<h1>` as body. The 206 path
+            %% emits a sendfile response with a partial Length; the
+            %% conn must keep-alive after it just like a full 200.
+            Req = ~"GET /static/hello.html HTTP/1.1\r\nHost: x\r\nRange: bytes=0-3\r\n\r\n",
+            ok = gen_tcp:send(Sock, Req),
+            Reply1 = recv_response_with_body(Sock, 4),
+            ok = gen_tcp:send(Sock, Req),
+            Reply2 = recv_response_with_body(Sock, 4),
+            ok = gen_tcp:close(Sock),
+            ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply1),
+            ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply2),
+            ?assertNotEqual(nomatch, binary:match(Reply1, ~"<h1>")),
+            ?assertNotEqual(nomatch, binary:match(Reply2, ~"<h1>"))
+        end}
+    end}.
+
+pipelined_sendfile_responses_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun({_Dir, Port}) ->
+        {"two pipelined sendfile GETs return ordered responses", fun() ->
+            %% Pipelining: send two complete requests in a single
+            %% `gen_tcp:send` before reading either response. The conn
+            %% loop must process both, emit two responses in order, and
+            %% keep the conn alive between them. Exercises the
+            %% `pipelined_leftover` carry-forward in `buffered_finish`
+            %% when sendfile takes that path.
+            {ok, Sock} = gen_tcp:connect(
+                {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+            ),
+            Req = ~"GET /static/hello.html HTTP/1.1\r\nHost: x\r\n\r\n",
+            ok = gen_tcp:send(Sock, <<Req/binary, Req/binary>>),
+            Reply1 = recv_response_with_body(Sock, 14),
+            Reply2 = recv_response_with_body(Sock, 14),
+            ok = gen_tcp:close(Sock),
+            ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply1),
+            ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply2),
+            ?assertNotEqual(nomatch, binary:match(Reply1, ~"<h1>Hello</h1>")),
+            ?assertNotEqual(nomatch, binary:match(Reply2, ~"<h1>Hello</h1>"))
+        end}
+    end}.
+
+%% Read a single response: drain bytes until both the
+%% header / body separator is present AND `BodyLen` bytes of body are
+%% buffered. Stops as soon as one response is complete so the next
+%% recv on the same socket starts cleanly.
+recv_response_with_body(Sock, BodyLen) ->
+    recv_response_with_body_loop(Sock, <<>>, BodyLen).
+
+recv_response_with_body_loop(Sock, Buf, BodyLen) ->
+    case binary:split(Buf, ~"\r\n\r\n") of
+        [Head, Body] when byte_size(Body) >= BodyLen ->
+            <<Trim:(byte_size(Head) + 4 + BodyLen)/binary, _/binary>> = Buf,
+            Trim;
+        _ ->
+            {ok, Data} = gen_tcp:recv(Sock, 0, 1000),
+            recv_response_with_body_loop(
+                Sock, <<Buf/binary, Data/binary>>, BodyLen
+            )
+    end.
+
 setup_with_policy(Name, Policy) ->
     Dir = filename:join(
         "/tmp",

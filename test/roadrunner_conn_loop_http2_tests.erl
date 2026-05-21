@@ -61,9 +61,12 @@ all_test_() ->
         fun handshake_closed_during_partial_preface/0,
         fun handshake_error_during_partial_preface/0,
         fun handshake_timeout_during_partial_preface/0,
+        fun handshake_succeeds_with_fragmented_preface/0,
         fun frame_loop_parse_error_triggers_goaway/0,
         fun runtime_transport_error_triggers_goaway/0,
         fun runtime_idle_timeout_emits_goaway/0,
+        fun hibernate_after_fires_when_idle/0,
+        fun idle_timeout_with_open_stream_emits_goaway/0,
         fun rst_stream_active_stream_synced/0,
         fun stream_window_update_grows_window_synced/0,
         fun rst_stream_unknown_stream_ignored/0,
@@ -307,8 +310,8 @@ concurrent_streams_both_dispatch() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_concurrent_test,
@@ -369,8 +372,8 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     RequestsCounter = atomics:new(1, [{signed, false}]),
     ProtoOpts = #{
         client_counter => Counter,
@@ -419,8 +422,8 @@ plaintext_listener_without_h2c_stays_h1() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     RequestsCounter = atomics:new(1, [{signed, false}]),
     ProtoOpts = #{
         client_counter => Counter,
@@ -883,8 +886,8 @@ middleware_chain_runs() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Mw = fun(Req, Next) -> Next(Req) end,
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_mw_test,
@@ -945,8 +948,8 @@ router_404_returns_not_found() ->
     %% Publish empty routes for a fake listener.
     persistent_term:put({roadrunner_routes, h2_404_listener}, roadrunner_router:compile([], [])),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_404_listener,
@@ -1129,6 +1132,39 @@ handshake_timeout_during_partial_preface() ->
         persistent_term:erase({roadrunner_conn_loop_http2, handshake_timeout})
     end.
 
+handshake_succeeds_with_fragmented_preface() ->
+    %% The 24-byte preface split across two TCP segments must NOT close
+    %% the conn mid-preface: `handshake_phase_preface/1` waits for the
+    %% full PREFACE_LEN bytes before deciding. (Guards against a
+    %% partial-buffer clause that exits before the preface completes.)
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    <<First:12/binary, Second/binary>> = ?PREFACE,
+    serve_recv(ConnPid, First),
+    serve_recv(ConnPid, Second),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"}
+        ],
+        Enc
+    ),
+    Hf = iolist_to_binary(
+        roadrunner_http2_frame:encode(
+            {headers, 1, 16#04 bor 16#01, undefined, iolist_to_binary(Hpack)}
+        )
+    ),
+    serve_recv(ConnPid, Hf),
+    ?assertMatch(<<_:24, 1, _/binary>>, expect_send()),
+    cleanup(Pid, Ref).
+
 frame_loop_parse_error_triggers_goaway() ->
     %% Garbage frame bytes after a clean handshake — the buffer
     %% parses to `{error, _}`, server emits GOAWAY and exits.
@@ -1172,6 +1208,103 @@ runtime_idle_timeout_emits_goaway() ->
         end
     after
         persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
+    end.
+
+hibernate_after_fires_when_idle() ->
+    %% With `hibernate_after` set and no streams in flight, the conn
+    %% hibernates instead of GOAWAY-ing on idle: heap collapses, the
+    %% process stays alive, and the next request wakes it cleanly.
+    %% idle_timeout is set well above hibernate_after so the GOAWAY
+    %% path would lose the race if hibernation weren't wired in.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 5000),
+    try
+        {Pid, Ref, ConnPid} = start_http2_conn(#{hibernate_after => 100}),
+        %% Handshake + one GET to completion so the streams map empties.
+        drive_simple_get(ConnPid),
+        %% Poll for hibernation: status=waiting AND a collapsed heap.
+        ok = wait_for_hibernation(Pid, 2000),
+        %% Wake with a second request on a fresh stream id; it must
+        %% still produce a response (HEADERS frame, type 1).
+        Enc = roadrunner_http2_hpack:new_encoder(4096),
+        {Hpack, _} = roadrunner_http2_hpack:encode(
+            [
+                {~":method", ~"GET"},
+                {~":scheme", ~"https"},
+                {~":authority", ~"x"},
+                {~":path", ~"/"}
+            ],
+            Enc
+        ),
+        Hf = iolist_to_binary(
+            roadrunner_http2_frame:encode(
+                {headers, 3, 16#04 bor 16#01, undefined, iolist_to_binary(Hpack)}
+            )
+        ),
+        serve_recv(ConnPid, Hf),
+        ?assertMatch(<<_:24, 1, _/binary>>, expect_send()),
+        cleanup(Pid, Ref)
+    after
+        persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
+    end.
+
+idle_timeout_with_open_stream_emits_goaway() ->
+    %% A stream open but incomplete (HEADERS without END_STREAM) keeps
+    %% the streams map non-empty, so the idle timeout takes the
+    %% non-empty branch of `recv_idle_expired/1` — GOAWAY, never
+    %% hibernate, even though `hibernate_after` is set.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 100),
+    try
+        {Pid, Ref, ConnPid} = start_http2_conn(#{hibernate_after => 5000}),
+        _ = expect_send(),
+        serve_recv(ConnPid, ?PREFACE),
+        serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        Enc = roadrunner_http2_hpack:new_encoder(4096),
+        {Hpack, _} = roadrunner_http2_hpack:encode(
+            [
+                {~":method", ~"POST"},
+                {~":scheme", ~"https"},
+                {~":authority", ~"x"},
+                {~":path", ~"/"}
+            ],
+            Enc
+        ),
+        %% END_HEADERS (0x04) only — no END_STREAM, so the stream stays
+        %% open in the map and no worker dispatches.
+        Hf = iolist_to_binary(
+            roadrunner_http2_frame:encode(
+                {headers, 1, 16#04, undefined, iolist_to_binary(Hpack)}
+            )
+        ),
+        serve_recv(ConnPid, Hf),
+        ?assertMatch(<<0, 0, 8, 7, _/binary>>, expect_send()),
+        expect_close(),
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 1000 -> error(process_did_not_exit)
+        end
+    after
+        persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
+    end.
+
+%% Poll until the conn process has actually hibernated. A hibernated
+%% process reports `current_function = {erlang, hibernate, 3}` — the
+%% reliable signal. (A freshly-idle conn can already be `waiting` with
+%% a small heap without having hibernated, so a heap-size check gives
+%% false positives and never exercises the hibernate call.)
+wait_for_hibernation(Pid, Remaining) when Remaining =< 0 ->
+    error({not_hibernated, process_info(Pid, [status, current_function])});
+wait_for_hibernation(Pid, Remaining) ->
+    case process_info(Pid, current_function) of
+        {current_function, {erlang, hibernate, 3}} ->
+            ok;
+        _ ->
+            timer:sleep(20),
+            wait_for_hibernation(Pid, Remaining - 20)
     end.
 
 rst_stream_active_stream_synced() ->
@@ -1535,8 +1668,8 @@ rst_during_stream_response_unwinds_worker() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_rst_during_stream,
@@ -1613,8 +1746,8 @@ drain_refuses_new_streams() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_test,
@@ -1666,8 +1799,8 @@ drain_with_in_flight_stream_waits() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_inflight_test,
@@ -1726,8 +1859,8 @@ drain_message_is_idempotent() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_dup_test,
@@ -1776,8 +1909,8 @@ drain_then_peer_rst_exits_via_frame_loop() ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_drain_rst_test,
@@ -1869,8 +2002,8 @@ telemetry_request_stop_fires_for_router_404() ->
         drain_mailbox(),
         persistent_term:put({roadrunner_routes, h2_telem_404}, roadrunner_router:compile([], [])),
         Self = self(),
-        Counter = atomics:new(1, [{signed, false}]),
-        ok = atomics:add(Counter, 1, 1),
+        Counter = counters:new(1, [write_concurrency]),
+        ok = counters:add(Counter, 1, 1),
         ProtoOpts = #{
             client_counter => Counter,
             listener_name => h2_telem_404,
@@ -1950,8 +2083,8 @@ run_h2_with_compress_middleware(Path, ExtraHeaders) ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_compress_test,
@@ -2624,8 +2757,8 @@ post_handshake_handler(Handler) ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_strict_test,
@@ -2741,24 +2874,30 @@ idle_timeout_emits_goaway() ->
 %% --- helpers ---
 
 start_http2_conn() ->
+    start_http2_conn(#{}).
+
+start_http2_conn(Extra) ->
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     %% Phase H5 dispatch needs at least the route resolver + an
-    %% empty middleware chain. Tests don't actually exercise a
-    %% handler in this file (they exit before any HEADERS frame
-    %% gets dispatched).
-    ProtoOpts = #{
-        client_counter => Counter,
-        listener_name => http2_test,
-        dispatch =>
-            {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1, undefined},
-        middlewares => [],
-        protocols => [http2],
-        http2_conn_window => 65535,
-        http2_stream_window => 65535,
-        http2_window_refill_threshold => 32768
-    },
+    %% empty middleware chain. `Extra` overrides / adds proto_opts
+    %% (e.g. `hibernate_after` for the idle-hibernation tests).
+    ProtoOpts = maps:merge(
+        #{
+            client_counter => Counter,
+            listener_name => http2_test,
+            dispatch =>
+                {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1,
+                    undefined},
+            middlewares => [],
+            protocols => [http2],
+            http2_conn_window => 65535,
+            http2_stream_window => 65535,
+            http2_window_refill_threshold => 32768
+        },
+        Extra
+    ),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive
@@ -2868,8 +3007,8 @@ run_h2_request_with_handler(Handler, Path) ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_handler_test,
@@ -2921,8 +3060,8 @@ run_stream_request(Path) ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_stream_test,

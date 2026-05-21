@@ -188,7 +188,7 @@ sendfile_large_response_blocked_resumes_on_window_update(_Config) ->
 large_inbound_body_refills_recv_windows(_Config) ->
     %% Sending 4 × 10 KB DATA frames drops both recv windows below
     %% the refill threshold; the server emits two WINDOW_UPDATE
-    %% frames (conn + stream).
+    %% frames (conn + stream) coalesced into a single send.
     {Pid, Ref, ConnPid} = start_conn(roadrunner_hello_handler),
     handshake(ConnPid),
     HpackBin = encode_request_headers(~"POST", ~"/"),
@@ -199,11 +199,10 @@ large_inbound_body_refills_recv_windows(_Config) ->
         serve_recv(ConnPid, encode_frame({data, 1, 0, Chunk}))
      || _ <- lists:seq(1, 4)
     ],
-    Out1 = expect_send(),
-    Out2 = expect_send(),
-    %% Both must be type-8 (WINDOW_UPDATE) — type byte at offset 3.
-    <<_:24, 8, _/binary>> = Out1,
-    <<_:24, 8, _/binary>> = Out2,
+    Combined = expect_send(),
+    %% Two type-8 (WINDOW_UPDATE) frames back-to-back. Each frame is
+    %% 9-byte header + 4-byte payload = 13 bytes.
+    <<_:24, 8, _:8, _:32, _:32, _:24, 8, _:8, _:32, _:32>> = Combined,
     cleanup(Pid, Ref).
 
 rst_stream_during_blocked_send_drops_body(_Config) ->
@@ -349,8 +348,8 @@ blocked_send_idle_timeout_emits_goaway(_Config) ->
 %% eunit suite's API for symmetry.
 start_conn(Handler) ->
     Self = self(),
-    Counter = atomics:new(1, [{signed, false}]),
-    ok = atomics:add(Counter, 1, 1),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
         client_counter => Counter,
         listener_name => h2_flow_test,

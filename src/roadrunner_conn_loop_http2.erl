@@ -54,8 +54,13 @@
 
 -export([enter/5]).
 
+%% Hibernate continuation — invoked via `erlang:hibernate/3` when an
+%% idle conn parks past `hibernate_after`. Must stay exported so the
+%% runtime can re-enter the loop on wake.
+-export([recv_more_hib/1]).
+
 %% RFC 9113 §3.4 client connection preface — fixed 24 bytes.
--define(PREFACE, ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
+-define(PREFACE, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
 -define(PREFACE_LEN, 24).
 
 %% Read-deadline caps for the handshake and idle states. Tests
@@ -286,14 +291,10 @@ idle_timeout() ->
     persistent_term:get({?MODULE, idle_timeout}, ?IDLE_TIMEOUT_DEFAULT).
 
 -spec handshake_phase_preface(#loop{}) -> no_return().
-handshake_phase_preface(#loop{buffer = Buf} = State) when byte_size(Buf) >= ?PREFACE_LEN ->
-    <<Head:?PREFACE_LEN/binary, Rest/binary>> = Buf,
-    case Head of
-        ?PREFACE ->
-            handshake_phase_settings(State#loop{buffer = Rest});
-        _ ->
-            exit_clean(State)
-    end;
+handshake_phase_preface(#loop{buffer = <<?PREFACE, Rest/binary>>} = State) ->
+    handshake_phase_settings(State#loop{buffer = Rest});
+handshake_phase_preface(#loop{buffer = <<_:?PREFACE_LEN/binary, _/binary>>} = State) ->
+    exit_clean(State);
 handshake_phase_preface(State) ->
     handshake_recv(State, fun handshake_phase_preface/1).
 
@@ -395,10 +396,57 @@ recv_more(
             recv_more(maybe_exit_when_drained(handle_worker_down(State, MonRef, Reason)));
         {roadrunner_drain, _Deadline} ->
             recv_more(maybe_exit_when_drained(start_drain(State)))
-    after idle_timeout() ->
-        _ = send_goaway(State, protocol_error),
-        exit_clean(State)
+    after recv_timeout(State) ->
+        recv_idle_expired(State)
     end.
+
+%% Idle-wait timeout selection. When no streams are in flight AND the
+%% listener opted into `hibernate_after`, park for that (typically
+%% shorter) window so `recv_idle_expired/1` can hibernate. Otherwise
+%% the GOAWAY idle timeout applies — including whenever streams are
+%% active, where worker messages are imminent and hibernating would be
+%% pointless.
+-spec recv_timeout(#loop{}) -> non_neg_integer().
+recv_timeout(#loop{streams = Streams, proto_opts = ProtoOpts}) when
+    map_size(Streams) =:= 0
+->
+    case ProtoOpts of
+        #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 -> Ms;
+        _ -> idle_timeout()
+    end;
+recv_timeout(_State) ->
+    idle_timeout().
+
+%% Fired when `recv_more/1` sees no traffic for `recv_timeout/1`. With
+%% an empty streams map and `hibernate_after` set, collapse the heap
+%% via hibernation; the socket is already `{active, once}`-armed (we
+%% reached recv_more through `arm_and_recv/1`), so the next inbound
+%% frame — or any worker / `'DOWN'` / drain message — wakes us and
+%% `recv_more_hib/1` resumes the loop. Otherwise emit the idle GOAWAY.
+-spec recv_idle_expired(#loop{}) -> no_return().
+recv_idle_expired(#loop{streams = Streams, proto_opts = ProtoOpts} = State) when
+    map_size(Streams) =:= 0
+->
+    case ProtoOpts of
+        #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 ->
+            erlang:hibernate(?MODULE, recv_more_hib, [State]);
+        _ ->
+            idle_goaway(State)
+    end;
+recv_idle_expired(State) ->
+    idle_goaway(State).
+
+-spec idle_goaway(#loop{}) -> no_return().
+idle_goaway(State) ->
+    _ = send_goaway(State, protocol_error),
+    exit_clean(State).
+
+%% Hibernate re-entry (see `recv_idle_expired/1`). Resumes the unified
+%% mailbox loop after an idle conn wakes from `erlang:hibernate/3`.
+-doc false.
+-spec recv_more_hib(#loop{}) -> no_return().
+recv_more_hib(State) ->
+    recv_more(State).
 
 %% Begin a graceful drain: emit GOAWAY(NO_ERROR) once, refuse new
 %% streams henceforth. In-flight workers continue to completion.
@@ -666,11 +714,16 @@ on_continuation(StreamId, Flags, Fragment, #loop{streams = Streams} = State) ->
             Combined = <<Existing/binary, Fragment/binary>>,
             EndHeaders = (Flags band 16#04) =/= 0,
             Stream1 = Stream#{header_fragment := Combined, end_headers := EndHeaders},
-            State1 = State#loop{streams = Streams#{StreamId := Stream1}},
+            Streams1 = Streams#{StreamId := Stream1},
+            %% Set streams + awaiting_continuation in one record update on
+            %% the END_HEADERS path — two sequential `#loop{}` updates
+            %% would copy the record twice.
             State2 =
                 case EndHeaders of
-                    true -> State1#loop{awaiting_continuation = undefined};
-                    false -> State1
+                    true ->
+                        State#loop{streams = Streams1, awaiting_continuation = undefined};
+                    false ->
+                        State#loop{streams = Streams1}
                 end,
             case {EndHeaders, PriorHeaders =:= undefined} of
                 {true, true} -> finalize_headers(StreamId, State2);
@@ -767,13 +820,25 @@ on_data(StreamId, Flags, Payload, #loop{streams = Streams} = State) ->
     end.
 
 %% Refill the conn-level + stream-level recv windows whenever they
-%% drop below `?WINDOW_REFILL_THRESHOLD`.
+%% drop below the configured threshold. Both refills can fire on
+%% the same `on_data` event (one DATA payload drains both windows
+%% past the threshold simultaneously); when that happens, the two
+%% WINDOW_UPDATE frames go out in a single `send/2` so they share
+%% one trip through the ssl gen_statem (or `gen_tcp:send` for h2c)
+%% instead of paying two.
 -spec maybe_refill_recv_windows(#loop{}, stream_id()) -> #loop{}.
 maybe_refill_recv_windows(State, StreamId) ->
-    State1 = maybe_refill_conn(State),
-    maybe_refill_stream(State1, StreamId).
+    {ConnFrame, State1} = build_conn_refill(State),
+    {StreamFrame, State2} = build_stream_refill(State1, StreamId),
+    case {ConnFrame, StreamFrame} of
+        {[], []} ->
+            State2;
+        {_, _} ->
+            _ = send(State2, [ConnFrame, StreamFrame]),
+            State2
+    end.
 
-maybe_refill_conn(
+build_conn_refill(
     #loop{
         conn_recv_window = W,
         recv_window_peak = Peak,
@@ -781,12 +846,11 @@ maybe_refill_conn(
     } = State
 ) when W < Threshold ->
     Inc = Peak - W,
-    _ = send(State, roadrunner_http2_frame:encode({window_update, 0, Inc})),
-    State#loop{conn_recv_window = W + Inc};
-maybe_refill_conn(State) ->
-    State.
+    {roadrunner_http2_frame:encode({window_update, 0, Inc}), State#loop{conn_recv_window = W + Inc}};
+build_conn_refill(State) ->
+    {[], State}.
 
-maybe_refill_stream(
+build_stream_refill(
     #loop{
         streams = Streams,
         stream_recv_window_peak = Peak,
@@ -798,13 +862,11 @@ maybe_refill_stream(
     if
         W < Threshold ->
             Inc = Peak - W,
-            _ = send(
-                State,
-                roadrunner_http2_frame:encode({window_update, StreamId, Inc})
-            ),
-            State#loop{streams = Streams#{StreamId := Stream#{recv_window := W + Inc}}};
+            {roadrunner_http2_frame:encode({window_update, StreamId, Inc}), State#loop{
+                streams = Streams#{StreamId := Stream#{recv_window := W + Inc}}
+            }};
         true ->
-            State
+            {[], State}
     end.
 
 %% =============================================================================

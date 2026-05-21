@@ -147,25 +147,25 @@ declare -A EXTRA_HEADERS=(
 # 75%, 95% of these. Estimates can drift with code changes; the
 # achieved-rate column makes the gap visible.
 declare -A PEAK=(
-    [roadrunner.hello]=285000           [cowboy.hello]=196000           [elli.hello]=289000
-    [roadrunner.json]=292000            [cowboy.json]=182000            [elli.json]=301000
-    [roadrunner.echo]=270000            [cowboy.echo]=148000            [elli.echo]=281000
-    [roadrunner.headers_heavy]=267000   [cowboy.headers_heavy]=134000   [elli.headers_heavy]=241000
-    [roadrunner.large_response]=124000  [cowboy.large_response]=94000   [elli.large_response]=125000
+    [roadrunner.hello]=307000           [cowboy.hello]=201000           [elli.hello]=299000
+    [roadrunner.json]=299000            [cowboy.json]=189000            [elli.json]=304000
+    [roadrunner.echo]=304000            [cowboy.echo]=162000            [elli.echo]=282000
+    [roadrunner.headers_heavy]=257000   [cowboy.headers_heavy]=141000   [elli.headers_heavy]=253000
+    [roadrunner.large_response]=124000  [cowboy.large_response]=98000   [elli.large_response]=123000
     [roadrunner.url_with_qs]=247000     [cowboy.url_with_qs]=167000
     [roadrunner.path_with_unicode]=235000 [cowboy.path_with_unicode]=167000
     [roadrunner.cors_preflight]=242000  [cowboy.cors_preflight]=162000
     [roadrunner.redirect_response]=258000 [cowboy.redirect_response]=176000
     [roadrunner.head_method]=251000     [cowboy.head_method]=176000
-    [roadrunner.post_4kb_form]=193000   [cowboy.post_4kb_form]=92500
+    [roadrunner.post_4kb_form]=193000   [cowboy.post_4kb_form]=98000
     [roadrunner.chunked_request_body]=266000 [cowboy.chunked_request_body]=137000
     [roadrunner.compressed_request_body]=289000 [cowboy.compressed_request_body]=154000 [elli.compressed_request_body]=298000
-    [roadrunner.multi_request_body]=257000 [cowboy.multi_request_body]=121000 [elli.multi_request_body]=272000
-    [roadrunner.large_post_streaming]=18900 [cowboy.large_post_streaming]=6800
+    [roadrunner.multi_request_body]=262000 [cowboy.multi_request_body]=125000 [elli.multi_request_body]=274000
+    [roadrunner.large_post_streaming]=20000 [cowboy.large_post_streaming]=6900
     [roadrunner.cookies_heavy]=287000   [cowboy.cookies_heavy]=163000
     [roadrunner.etag_304]=234000        [cowboy.etag_304]=169000
     [roadrunner.large_keepalive_session]=227000 [cowboy.large_keepalive_session]=175000 [elli.large_keepalive_session]=279000
-    [roadrunner.gzip_response]=136000   [cowboy.gzip_response]=108000
+    [roadrunner.gzip_response]=138000   [cowboy.gzip_response]=111000
     [roadrunner.backpressure_sustained]=249000 [cowboy.backpressure_sustained]=182000
     [roadrunner.varied_paths_router]=239000 [cowboy.varied_paths_router]=168000
     # roadrunner-only HttpArena-shape scenarios. The upload scenarios

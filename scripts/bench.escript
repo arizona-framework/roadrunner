@@ -61,7 +61,7 @@
 %% Adding a new protocol (e.g. h3) requires appending it here, wiring
 %% `preflight_protocol/1`, and tagging incompatible scenarios in the
 %% `?H?_ONLY_SCENARIOS` macros below.
--define(KNOWN_PROTOCOLS, [h1, h2]).
+-define(KNOWN_PROTOCOLS, [h1, h2, h2c]).
 
 %% Scenarios are partitioned by protocol compatibility. Each scenario
 %% name lives in exactly one of these three macros; adding a new
@@ -118,7 +118,9 @@
     httparena_baseline,
     httparena_json,
     httparena_upload_20mb_auto,
-    httparena_upload_20mb_manual
+    httparena_upload_20mb_manual,
+    httparena_limited_conn,
+    httparena_static
 ]).
 
 %% Scenarios that only make sense over HTTP/2. Mirrors the
@@ -128,7 +130,8 @@
     streaming_response,
     multi_stream_h2,
     small_chunked_response,
-    tls_handshake_throughput
+    tls_handshake_throughput,
+    large_post_h2
 ]).
 
 -define(KNOWN_SCENARIOS,
@@ -246,7 +249,8 @@ expand_scenarios(all, Protocol) ->
     Drop =
         case Protocol of
             h1 -> ?H2_ONLY_SCENARIOS;
-            h2 -> ?H1_ONLY_SCENARIOS
+            h2 -> ?H1_ONLY_SCENARIOS;
+            h2c -> ?H1_ONLY_SCENARIOS
         end,
     Kept = [S || S <- ?KNOWN_SCENARIOS, not lists:member(S, Drop)],
     Dropped = [S || S <- ?KNOWN_SCENARIOS, lists:member(S, Drop)],
@@ -386,6 +390,12 @@ preflight_scenario(#{scenario := httparena_upload_20mb_auto, servers := Servers}
 preflight_scenario(#{scenario := httparena_upload_20mb_manual, servers := Servers} = Opts) ->
     filter_servers(httparena_upload_20mb_manual, [cowboy, elli], Servers, Opts,
         ~"roadrunner-only fixture; mirrors HttpArena's `upload` profile (manual streaming)");
+preflight_scenario(#{scenario := httparena_limited_conn, servers := Servers} = Opts) ->
+    filter_servers(httparena_limited_conn, [cowboy, elli], Servers, Opts,
+        ~"roadrunner-only fixture; mirrors HttpArena's `limited-conn` profile");
+preflight_scenario(#{scenario := httparena_static, servers := Servers} = Opts) ->
+    filter_servers(httparena_static, [elli], Servers, Opts,
+        ~"elli fixture has no static-file route; roadrunner_static vs cowboy_static");
 preflight_scenario(Opts) ->
     Opts.
 
@@ -417,7 +427,23 @@ preflight_protocol(#{protocol := h2, servers := Servers} = Opts) ->
             ok
     end,
     {ok, _} = application:ensure_all_started(ssl),
-    Opts#{servers => Filtered, cert_dir => CertDir}.
+    Opts#{servers => Filtered, cert_dir => CertDir};
+preflight_protocol(#{protocol := h2c, servers := Servers} = Opts) ->
+    %% Cleartext prior-knowledge HTTP/2: plain TCP, no certs. Only
+    %% roadrunner is wired for h2c here (cowboy/elli need their own
+    %% h2c listener setup); keep it roadrunner-only.
+    Filtered = [S || S <- Servers, S =:= roadrunner],
+    case Filtered =/= Servers of
+        true ->
+            io:format(
+                "note: --protocols h2c is roadrunner-only here "
+                "(cowboy/elli h2c not wired)~n",
+                []
+            );
+        false ->
+            ok
+    end,
+    Opts#{servers => Filtered}.
 
 generate_test_cert() ->
     Dir = string:trim(os:cmd("mktemp -d")),
@@ -805,6 +831,24 @@ cli() ->
                                     chunk size; auto-mode peer
                                     pays the full-body buffering
                                     cost.
+                    httparena_limited_conn:
+                                    h1-only, roadrunner-only.
+                                    GET /baseline11 against a
+                                    listener with `max_clients =>
+                                    8000`. Mirrors HttpArena's
+                                    `limited-conn` profile, which
+                                    surfaces contention on the
+                                    per-listener slot counter
+                                    under high-conn waves.
+                    httparena_static:
+                                    h1-only, roadrunner-only.
+                                    GET /static/hello.txt served
+                                    via `roadrunner_static` against
+                                    `test/bench_static/` with
+                                    `cache_ttl_ms => 1000`. Mirrors
+                                    HttpArena's `static` profile:
+                                    cached stat + sendfile reusing
+                                    the conn across requests.
                     """
             },
             #{
@@ -1173,16 +1217,51 @@ sampler_loop(Peer, OsPid, Acc) ->
     receive
         {_, stop} -> Acc
     after 100 ->
+        Now = erlang:monotonic_time(millisecond),
         Rss = read_proc_rss_kb(OsPid),
         BeamTotal =
             try proplists:get_value(total, peer:call(Peer, erlang, memory, [], 1000), 0)
             catch _:_ -> 0
             end,
-        sampler_loop(Peer, OsPid, Acc#{
+        Acc1 = Acc#{
             peak_rss_kb => max(maps:get(peak_rss_kb, Acc), Rss),
             peak_beam_total => max(maps:get(peak_beam_total, Acc), BeamTotal)
-        })
+        },
+        Acc2 = maybe_capture_mem_profile(Peer, BeamTotal, Now, Acc1),
+        sampler_loop(Peer, OsPid, Acc2)
     end.
+
+%% Per-`initial_call` memory snapshot, refreshed every 1 s while
+%% `erlang:memory(total)` is above 100 MB. Re-sampling matters
+%% because process counts ramp up during warmup; an early snapshot
+%% catches a fraction of the steady-state load. Keep the LATEST,
+%% so by the time the sampler stops we have a near-peak view.
+-define(MEM_PROFILE_THRESHOLD_BYTES, 100 * 1024 * 1024).
+-define(MEM_PROFILE_REFRESH_MS, 1000).
+
+maybe_capture_mem_profile(Peer, BeamTotal, Now, Acc) when
+    BeamTotal >= ?MEM_PROFILE_THRESHOLD_BYTES
+->
+    Due =
+        case maps:find(mem_profile_at_ms, Acc) of
+            error -> true;
+            {ok, LastMs} -> Now - LastMs >= ?MEM_PROFILE_REFRESH_MS
+        end,
+    case Due of
+        true ->
+            try peer:call(Peer, roadrunner_bench_memprofile, snapshot, [], 5000) of
+                {_, _, _, _} = Snapshot ->
+                    Acc#{mem_profile => Snapshot, mem_profile_at_ms => Now};
+                _ ->
+                    Acc
+            catch
+                _:_ -> Acc
+            end;
+        false ->
+            Acc
+    end;
+maybe_capture_mem_profile(_Peer, _BeamTotal, _Now, Acc) ->
+    Acc.
 
 read_proc_rss_kb(OsPid) ->
     case file:read_file("/proc/" ++ OsPid ++ "/status") of
@@ -1265,6 +1344,8 @@ start_server(roadrunner, #{protocol := h1, scenario := Scenario}) ->
     start_roadrunner(Scenario);
 start_server(roadrunner, #{protocol := h2, scenario := Scenario, cert_dir := CertDir}) ->
     start_roadrunner_h2(Scenario, CertDir);
+start_server(roadrunner, #{protocol := h2c, scenario := Scenario}) ->
+    start_roadrunner_h2c(Scenario);
 start_server(cowboy, #{protocol := h1, scenario := Scenario}) ->
     start_cowboy_h1(Scenario);
 start_server(cowboy, #{protocol := h2, scenario := Scenario, cert_dir := CertDir}) ->
@@ -1383,6 +1464,29 @@ start_roadrunner_h2(Scenario, CertDir) ->
     print_listener_config([{"listener_opts", ListenerOpts}]),
     {Peer, Port}.
 
+start_roadrunner_h2c(Scenario) ->
+    {ok, Peer, _Node} = peer:start_link(#{
+        name => peer:random_name(),
+        connection => standard_io,
+        args => pa_args_for_peer(),
+        wait_boot => 10000
+    }),
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [roadrunner]),
+    %% `protocols => [http2]` on plain TCP = RFC 7540 §3.4 prior-knowledge
+    %% h2c: the conn goes straight to the HTTP/2 loop, no TLS, no ALPN.
+    BaseOpts = #{
+        port => 0,
+        protocols => [http2],
+        keep_alive_timeout => 60000,
+        max_clients => 100000,
+        max_keep_alive_requests => 1000000
+    },
+    ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
+    {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr_h2c, ListenerOpts]),
+    Port = peer:call(Peer, roadrunner_listener, port, [bench_rr_h2c]),
+    print_listener_config([{"listener_opts", ListenerOpts}]),
+    {Peer, Port}.
+
 start_cowboy_h2(Scenario, CertDir) ->
     {ok, Peer, _Node} = peer:start_link(#{
         name => peer:random_name(),
@@ -1470,6 +1574,12 @@ scenario_roadrunner_opts(large_post_streaming, BaseOpts) ->
         body_buffering => manual,
         routes => [{~"/drain", roadrunner_bench_drain_handler, undefined}]
     };
+scenario_roadrunner_opts(large_post_h2, BaseOpts) ->
+    %% h2 has no manual body-buffering mode yet — the auto-buffered
+    %% body shape is enough to exercise inbound DATA frames and the
+    %% WINDOW_UPDATE refill path that the conn loop's flow-control
+    %% bookkeeping drives.
+    BaseOpts#{routes => [{~"/drain", roadrunner_bench_drain_handler, undefined}]};
 scenario_roadrunner_opts(gzip_response, BaseOpts) ->
     %% Enable roadrunner_compress middleware at the listener level so
     %% all routes get gzip when the client asks for it.
@@ -1581,6 +1691,30 @@ scenario_roadrunner_opts(httparena_upload_20mb_manual, BaseOpts) ->
         routes => [
             {~"/upload", roadrunner_bench_httparena_upload_handler, undefined}
         ]
+    };
+scenario_roadrunner_opts(httparena_limited_conn, BaseOpts) ->
+    %% Override the bench's default `max_clients => 100K` to a tight
+    %% cap that the bench's high-conn waves can saturate. Mirrors
+    %% HttpArena's `limited-conn` profile, which surfaces contention
+    %% on the per-listener slot counter under load.
+    BaseOpts#{
+        max_clients => 8000,
+        routes => [
+            {~"/baseline11", roadrunner_bench_httparena_baseline_handler, undefined}
+        ]
+    };
+scenario_roadrunner_opts(httparena_static, BaseOpts) ->
+    %% Serves `test/bench_static/hello.txt` via `roadrunner_static`
+    %% with the metadata cache opted in. Mirrors HttpArena's `static`
+    %% profile (hot path: cached stat + sendfile of a small immutable
+    %% asset, reusing the conn across requests).
+    Dir = filename:join([project_dir(), "test", "bench_static"]),
+    BaseOpts#{
+        routes => [
+            {~"/static/*path", roadrunner_static, #{
+                dir => Dir, cache_ttl_ms => 1000
+            }}
+        ]
     }.
 
 scenario_cowboy_routes(hello) ->
@@ -1613,7 +1747,14 @@ scenario_cowboy_routes(mixed_workload) ->
     ];
 scenario_cowboy_routes(post_4kb_form) ->
     [{'_', [{"/form", roadrunner_bench_cowboy_form_handler, []}]}];
+scenario_cowboy_routes(httparena_static) ->
+    %% cowboy's built-in static handler over the same file roadrunner
+    %% serves, for an apples-to-apples static-serving comparison.
+    Dir = filename:join([project_dir(), "test", "bench_static"]),
+    [{'_', [{"/static/[...]", cowboy_static, {dir, Dir}}]}];
 scenario_cowboy_routes(large_post_streaming) ->
+    [{'_', [{"/drain", roadrunner_bench_cowboy_drain_handler, []}]}];
+scenario_cowboy_routes(large_post_h2) ->
     [{'_', [{"/drain", roadrunner_bench_cowboy_drain_handler, []}]}];
 scenario_cowboy_routes(router_404_storm) ->
     [
@@ -1717,7 +1858,18 @@ run_measured(Port, #{duration_s := D} = Opts) ->
 run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
     run_phase_h1(Port, Opts, DurationMs);
 run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
+    _ = persistent_term:put('$bench_h2_client_proto', h2),
+    run_phase_h2(Port, Opts, DurationMs);
+run_phase(Port, #{protocol := h2c} = Opts, DurationMs) ->
+    %% h2c reuses the entire h2 run phase; only the client's transport
+    %% differs (plain TCP vs TLS), selected via `h2_client_proto/0`.
+    _ = persistent_term:put('$bench_h2_client_proto', h2c),
     run_phase_h2(Port, Opts, DurationMs).
+
+%% Which protocol the bench client opens for the h2 run phase — `h2`
+%% (TLS+ALPN) or `h2c` (cleartext). Set by `run_phase/3`.
+h2_client_proto() ->
+    persistent_term:get('$bench_h2_client_proto', h2).
 
 run_phase_h1(
     Port, #{clients := C, host := Host, scenario := partial_body_drop}, DurationMs
@@ -2810,6 +2962,7 @@ scenario_method(echo) -> ~"POST";
 scenario_method(large_response) -> ~"GET";
 scenario_method(json) -> ~"GET";
 scenario_method(large_post_streaming) -> ~"POST";
+scenario_method(large_post_h2) -> ~"POST";
 scenario_method(gzip_response) -> ~"GET";
 scenario_method(backpressure_sustained) -> ~"GET";
 scenario_method(large_keepalive_session) -> ~"GET";
@@ -2828,13 +2981,16 @@ scenario_method(headers_heavy) -> ~"GET";
 scenario_method(httparena_baseline) -> ~"GET";
 scenario_method(httparena_json) -> ~"GET";
 scenario_method(httparena_upload_20mb_auto) -> ~"POST";
-scenario_method(httparena_upload_20mb_manual) -> ~"POST".
+scenario_method(httparena_upload_20mb_manual) -> ~"POST";
+scenario_method(httparena_limited_conn) -> ~"GET";
+scenario_method(httparena_static) -> ~"GET".
 
 scenario_path(hello) -> ~"/";
 scenario_path(echo) -> ~"/echo";
 scenario_path(large_response) -> ~"/large";
 scenario_path(json) -> ~"/json";
 scenario_path(large_post_streaming) -> ~"/drain";
+scenario_path(large_post_h2) -> ~"/drain";
 scenario_path(gzip_response) -> ~"/gzip";
 scenario_path(backpressure_sustained) -> ~"/";
 scenario_path(large_keepalive_session) -> ~"/";
@@ -2855,7 +3011,9 @@ scenario_path(headers_heavy) -> ~"/";
 scenario_path(httparena_baseline) -> ~"/baseline11?a=123&b=456";
 scenario_path(httparena_json) -> ~"/httparena_json/50?m=1";
 scenario_path(httparena_upload_20mb_auto) -> ~"/upload";
-scenario_path(httparena_upload_20mb_manual) -> ~"/upload".
+scenario_path(httparena_upload_20mb_manual) -> ~"/upload";
+scenario_path(httparena_limited_conn) -> ~"/baseline11?a=123&b=456";
+scenario_path(httparena_static) -> ~"/static/hello.txt".
 
 %% Pre-built per-iteration request bytes so the worker hot loop doesn't
 %% allocate. Both scenarios assume the same handler returns
@@ -2906,6 +3064,13 @@ build_request(large_post_streaming) ->
         BodyLenBin/binary,
         "\r\n\r\n",
         Body/binary>>;
+build_request(large_post_h2) ->
+    io:format(
+        standard_error,
+        "error: --scenarios large_post_h2 is h2-only (use --protocols h2)~n",
+        []
+    ),
+    halt(2);
 build_request(gzip_response) ->
     ~"GET /gzip HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n";
 build_request(backpressure_sustained) ->
@@ -3031,7 +3196,11 @@ build_request(httparena_json) ->
 build_request(httparena_upload_20mb_auto) ->
     httparena_upload_request();
 build_request(httparena_upload_20mb_manual) ->
-    httparena_upload_request().
+    httparena_upload_request();
+build_request(httparena_limited_conn) ->
+    ~"GET /baseline11?a=123&b=456 HTTP/1.1\r\nHost: x\r\n\r\n";
+build_request(httparena_static) ->
+    ~"GET /static/hello.txt HTTP/1.1\r\nHost: x\r\n\r\n".
 
 httparena_upload_request() ->
     Body = binary:copy(~"x", ?HTTPARENA_UPLOAD_BODY_SIZE),
@@ -3059,6 +3228,7 @@ expected_body_len(post_4kb_form) ->
     Pairs = post_4kb_form_pair_count(),
     byte_size(integer_to_binary(Pairs));
 expected_body_len(large_post_streaming) -> 2;
+expected_body_len(large_post_h2) -> 2;
 expected_body_len(gzip_response) ->
     %% 16 KB JSON body of repeating records compresses to ~180-200
     %% bytes via gzip (almost all dictionary references). Cowboy and
@@ -3097,7 +3267,14 @@ expected_body_len(httparena_upload_20mb_auto) ->
     %% Response is `integer_to_binary(20*1024*1024)` = "20971520" (8 B).
     byte_size(integer_to_binary(?HTTPARENA_UPLOAD_BODY_SIZE));
 expected_body_len(httparena_upload_20mb_manual) ->
-    byte_size(integer_to_binary(?HTTPARENA_UPLOAD_BODY_SIZE)).
+    byte_size(integer_to_binary(?HTTPARENA_UPLOAD_BODY_SIZE));
+expected_body_len(httparena_limited_conn) ->
+    %% Same `/baseline11` handler as `httparena_baseline`: "579".
+    byte_size(integer_to_binary(123 + 456));
+expected_body_len(httparena_static) ->
+    %% Body is `test/bench_static/hello.txt`. Size pinned to the file
+    %% byte count so the recv loop knows when to stop.
+    filelib:file_size(filename:join([project_dir(), "test", "bench_static", "hello.txt"])).
 
 %% 128 pairs of `kNNN=` + 27-char value, joined by `&`. Each
 %% pair = 32 bytes; 128 × 32 - 1 (trailing `&` dropped) = 4095
@@ -3267,7 +3444,7 @@ tls_handshake_worker(Host, Port, Deadline, Acc) ->
             Acc;
         false ->
             T0 = erlang:monotonic_time(nanosecond),
-            case roadrunner_bench_client:open(Host, Port, h2) of
+            case roadrunner_bench_client:open(Host, Port, h2_client_proto()) of
                 {ok, Conn} ->
                     case
                         roadrunner_bench_client:request(Conn, ~"GET", ~"/", [], <<>>)
@@ -3294,7 +3471,7 @@ tls_handshake_worker(Host, Port, Deadline, Acc) ->
 -define(MULTI_STREAM_BATCH, 16).
 
 h2_multi_stream_worker(Host, Port, Deadline, Acc) ->
-    case roadrunner_bench_client:open(Host, Port, h2) of
+    case roadrunner_bench_client:open(Host, Port, h2_client_proto()) of
         {ok, Conn} ->
             Final = h2_multi_stream_loop(Conn, Deadline, Acc),
             _ = roadrunner_bench_client:close(Conn),
@@ -3384,14 +3561,24 @@ h2_request_shape(post_4kb_form) ->
         "(use --protocols h1)~n", []),
     halt(2);
 h2_request_shape(large_post_streaming) ->
-    %% h2 has a different body-delivery model (DATA frames with
-    %% per-stream WINDOW_UPDATE flow control); a 1 MB POST over
-    %% h2 is a separate scenario worth adding later but the
-    %% current focus is the h1 body-state machine.
+    %% h1-only because the scenario exercises roadrunner's manual
+    %% body-buffering mode; for the equivalent h2 inbound-DATA test
+    %% see `large_post_h2`.
     io:format(standard_error,
         "error: --scenarios large_post_streaming is h1-only "
         "(use --protocols h1)~n", []),
     halt(2);
+h2_request_shape(large_post_h2) ->
+    %% 48 KB POST over h2 — three DATA frames (16 KB cap each), the
+    %% third drops both conn + stream recv windows below the 32 KB
+    %% refill threshold so each request fires one coalesced
+    %% WINDOW_UPDATE pair via
+    %% `roadrunner_conn_loop_http2:maybe_refill_recv_windows/2`.
+    %% Sized to fit in the default 65 KB initial recv-window peak so
+    %% the (flow-control-naive) bench client doesn't have to wait
+    %% for the server's WINDOW_UPDATE before sending the next request.
+    {~"POST", ~"/drain", [{~"content-type", ~"application/octet-stream"}],
+        binary:copy(~"x", 48 * 1024)};
 h2_request_shape(router_404_storm) ->
     %% Connection lifecycle is the dominant cost on this scenario;
     %% h2 conns + per-conn TLS handshake would obscure the
@@ -3566,10 +3753,20 @@ h2_request_shape(httparena_upload_20mb_manual) ->
     io:format(standard_error,
         "error: --scenarios httparena_upload_20mb_manual is h1-only "
         "(use --protocols h1)~n", []),
+    halt(2);
+h2_request_shape(httparena_limited_conn) ->
+    io:format(standard_error,
+        "error: --scenarios httparena_limited_conn is h1-only "
+        "(use --protocols h1)~n", []),
+    halt(2);
+h2_request_shape(httparena_static) ->
+    io:format(standard_error,
+        "error: --scenarios httparena_static is h1-only "
+        "(use --protocols h1)~n", []),
     halt(2).
 
 h2_worker_loop(Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->
-    case roadrunner_bench_client:open(Host, Port, h2) of
+    case roadrunner_bench_client:open(Host, Port, h2_client_proto()) of
         {ok, Conn} ->
             h2_keep_alive_loop(Conn, Method, Path, ReqHeaders, ReqBody, Deadline, Acc);
         {error, _} ->
@@ -3737,6 +3934,8 @@ scenario_request_summary(post_4kb_form) ->
     "POST /form HTTP/1.1, 4 KB application/x-www-form-urlencoded body (router)";
 scenario_request_summary(large_post_streaming) ->
     "POST /drain HTTP/1.1, 1 MB body, manual-mode 64 KB chunks (router)";
+scenario_request_summary(large_post_h2) ->
+    "POST /drain over h2, 1 MB body in DATA frames (exercises WINDOW_UPDATE refills)";
 scenario_request_summary(router_404_storm) ->
     "GET /nope HTTP/1.1 + Connection: close, fresh conn per request, 404 expected (router)";
 scenario_request_summary(varied_paths_router) ->
@@ -3788,7 +3987,11 @@ scenario_request_summary(httparena_json) ->
 scenario_request_summary(httparena_upload_20mb_auto) ->
     "POST /upload HTTP/1.1, 20 MB body, body_buffering=auto (router, roadrunner-only)";
 scenario_request_summary(httparena_upload_20mb_manual) ->
-    "POST /upload HTTP/1.1, 20 MB body, body_buffering=manual 64 KB chunks (router, roadrunner-only)".
+    "POST /upload HTTP/1.1, 20 MB body, body_buffering=manual 64 KB chunks (router, roadrunner-only)";
+scenario_request_summary(httparena_limited_conn) ->
+    "GET /baseline11 HTTP/1.1 against max_clients=8000 listener (router, roadrunner-only)";
+scenario_request_summary(httparena_static) ->
+    "GET /static/hello.txt HTTP/1.1, roadrunner_static + cache_ttl_ms=1000 vs cowboy_static (router)".
 
 result_to_row(Side, #{
     total := Total,
@@ -3922,6 +4125,121 @@ print_summary(SidesAndResults) ->
         "        variance — re-run several times before drawing conclusions.~n"
         "        Latency deltas (p50/p99) tend to be more stable.~n",
         []
+    ),
+    print_mem_profiles(Sorted).
+
+print_mem_profiles(Rows) ->
+    lists:foreach(
+        fun({Side, Row}) ->
+            case maps:get(mem_profile, Row, undefined) of
+                {TotalProcs, Groups, TopProcs, MemBuckets} ->
+                    print_mem_profile(
+                        Side, TotalProcs, Groups, TopProcs, MemBuckets
+                    );
+                _ ->
+                    ok
+            end
+        end,
+        Rows
+    ).
+
+print_mem_profile(Side, TotalProcs, Groups, TopProcs, MemBuckets) ->
+    Sum = lists:foldl(
+        fun({_, #{total_bytes := T}}, Acc) -> Acc + T end, 0, Groups
+    ),
+    Top = lists:sublist(Groups, 20),
+    Tail = lists:nthtail(min(20, length(Groups)), Groups),
+    TailCount = lists:sum([C || {_, #{count := C}} <- Tail]),
+    TailBytes = lists:sum([T || {_, #{total_bytes := T}} <- Tail]),
+    print_mem_buckets(Side, MemBuckets),
+    io:format(
+        "~nmem profile (~s, near-peak): ~B procs, ~B MB total across all groups~n",
+        [atom_to_list(Side), TotalProcs, Sum div (1024 * 1024)]
+    ),
+    io:format("~s~n", [string:copies("-", 100)]),
+    io:format(
+        "~-50s ~8s ~10s ~10s   top current_function~n",
+        ["initial_call", "count", "total MB", "max KB"]
+    ),
+    lists:foreach(
+        fun({InitialCall, Stats}) ->
+            #{
+                count := C,
+                total_bytes := T,
+                max_bytes := M,
+                top_current_funcs := TopCurFns
+            } = Stats,
+            TopStr =
+                case TopCurFns of
+                    [{Cur, N} | _] -> io_lib:format("~p (~B)", [Cur, N]);
+                    _ -> ""
+                end,
+            io:format(
+                "~-50s ~8B ~10B ~10B   ~s~n",
+                [
+                    io_lib:format("~p", [InitialCall]),
+                    C,
+                    T div (1024 * 1024),
+                    M div 1024,
+                    TopStr
+                ]
+            )
+        end,
+        Top
+    ),
+    case Tail of
+        [] ->
+            ok;
+        _ ->
+            io:format(
+                "~-50s ~8B ~10B ~10s~n",
+                [
+                    io_lib:format("(other ~B groups)", [length(Tail)]),
+                    TailCount,
+                    TailBytes div (1024 * 1024),
+                    ""
+                ]
+            )
+    end,
+    print_top_procs(TopProcs).
+
+print_mem_buckets(Side, MemBuckets) ->
+    io:format(
+        "~nerlang:memory (~s, near-peak):~n", [atom_to_list(Side)]
+    ),
+    Sorted = lists:sort(
+        fun({_, A}, {_, B}) -> A >= B end, MemBuckets
+    ),
+    lists:foreach(
+        fun({K, V}) ->
+            io:format("  ~-20s ~6B MB~n", [atom_to_list(K), V div (1024 * 1024)])
+        end,
+        Sorted
+    ).
+
+print_top_procs(TopProcs) ->
+    io:format("~ntop 10 single procs (full process_info detail):~n"),
+    lists:foreach(
+        fun(#{
+            pid := Pid,
+            initial_call := IC,
+            current_function := Cur,
+            memory := Mem,
+            heap_size := H,
+            total_heap_size := TH,
+            stack_size := S,
+            message_queue_len := Mq
+        }) ->
+            io:format(
+                "  ~6B KB  heap=~B/~B words  stack=~B  mq=~B  ~p ~p~n",
+                [Mem div 1024, H, TH, S, Mq, Pid, IC]
+            ),
+            io:format(
+                "          current=~p~n",
+                [Cur]
+            )
+        end,
+        TopProcs
     ).
 
 %% ===========================================================================

@@ -64,25 +64,25 @@ Standards conformance:
 ## Performance at a glance
 
 Median req/s over HTTP/1.1 on a 12th-gen i9-12900HX, 50 clients,
-5 s warmup + 5 s measure, loopback. HTTP/2 numbers, p50 / p99
+2 s warmup + 5 s measure, loopback. HTTP/2 numbers, p50 / p99
 percentiles, and memory shape sit in
 [`docs/bench_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/bench_results.md)
 and [`docs/comparison.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/comparison.md).
 
 | scenario                  | roadrunner    | cowboy        | elli          |
 |---------------------------|--------------:|--------------:|--------------:|
-| `hello`                   |   **287 k**   |       189 k   |       281 k   |
-| `json`                    |       290 k   |       194 k   |   **316 k**   |
-| `echo`                    |       284 k   |       153 k   |   **294 k**   |
-| `headers_heavy`           |   **254 k**   |       143 k   |       249 k   |
-| `large_response`          |       121 k   |        95 k   |   **129 k**   |
-| `multi_request_body`      |       271 k   |       120 k   |   **275 k**   |
-| `varied_paths_router`     |   **292 k**   |       168 k   |          —    |
-| `post_4kb_form`           |   **174 k**   |        95 k   |          —    |
-| `large_post_streaming`    |    **19 k**   |       7.0 k   |          —    |
-| `pipelined_h1`            |   **572 k**   |       362 k   |       4.8 k   |
-| `websocket_msg_throughput`|   **231 k**   |       171 k   |          —    |
-| `gzip_response`           |   **137 k**   |       108 k   |          —    |
+| `hello`                   |   **307 k**   |       201 k   |       299 k   |
+| `json`                    |       299 k   |       189 k   |   **304 k**   |
+| `echo`                    |   **304 k**   |       162 k   |       282 k   |
+| `headers_heavy`           |   **257 k**   |       141 k   |       253 k   |
+| `large_response`          |   **124 k**   |        98 k   |       123 k   |
+| `multi_request_body`      |       262 k   |       125 k   |   **274 k**   |
+| `varied_paths_router`     |   **290 k**   |       175 k   |          —    |
+| `post_4kb_form`           |   **193 k**   |        98 k   |          —    |
+| `large_post_streaming`    |    **20 k**   |       6.9 k   |          —    |
+| `pipelined_h1`            |   **580 k**   |       371 k   |       4.8 k   |
+| `websocket_msg_throughput`|   **232 k**   |       179 k   |          —    |
+| `gzip_response`           |   **138 k**   |       111 k   |          —    |
 
 Bold = fastest in row. `—` means the elli fixture doesn't expose
 that workload (no router, no gzip middleware, no WebSocket, no
@@ -93,8 +93,8 @@ those rows; the comparison doc has the full honest framing.
 ### Tail latency at sustained load
 
 Open-loop, Coordinated-Omission-corrected (wrk2, `hello`, 8 threads,
-50 connections, 3-run median): Roadrunner sustains **270 k req/s**
-at p50 1.06 ms, p99 2.26 ms, p99.99 3.34 ms. Full per-scenario
+50 connections, 3-run median): Roadrunner sustains **291 k req/s**
+at p50 1.07 ms, p99 2.31 ms, p99.99 4.70 ms. Full per-scenario
 matrix with all four rate-points per server in
 [`docs/wrk2_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/wrk2_results.md).
 

@@ -636,15 +636,29 @@ dispatch_response(
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Head), sendfile_response_head
     ),
-    _ =
+    ok =
         case roadrunner_req:method(Req) of
             ~"HEAD" ->
                 ok;
             _ ->
-                roadrunner_telemetry:response_send(
-                    roadrunner_transport:sendfile(Socket, Filename, Offset, Length),
-                    sendfile_body
-                )
+                SendResult = roadrunner_transport:sendfile(
+                    Socket, Filename, Offset, Length
+                ),
+                _ = roadrunner_telemetry:response_send(SendResult, sendfile_body),
+                %% A `{error, _}` here means the wire is mid-framing
+                %% (short write, socket error, etc.). With keep-alive
+                %% enabled on sendfile responses, the client would
+                %% otherwise hang waiting for missing body bytes until
+                %% its own timeout. Close the socket so the next
+                %% read_request_phase recv returns `{error, closed}`
+                %% and the conn exits normally instead of idling.
+                case SendResult of
+                    ok ->
+                        ok;
+                    {error, _} ->
+                        _ = roadrunner_transport:close(Socket),
+                        ok
+                end
         end,
     ok;
 %% Buffered (3-tuple) response shape. RFC 9110 §9.3.2: HEAD must NOT
@@ -684,28 +698,29 @@ with_date(Headers) ->
 %% --- finishing phase ---
 %%
 %% Drain any unread manual-mode body bytes, then decide keep-alive
-%% vs close. Stream / loop / sendfile / websocket all force close
-%% (their writers manage their own lifecycle); only buffered
-%% (3-tuple) responses are eligible for keep-alive.
+%% vs close. Buffered (3-tuple) and sendfile responses share the
+%% same wire framing: a Content-Length header followed by exactly
+%% that many body bytes. Both are keep-alive eligible. Stream /
+%% loop / websocket writers emit arbitrary frame sequences with
+%% their own lifecycle and force close.
 %%
 %% On keep-alive, recurse into `read_request_phase` with phase
 %% flipped to `keep_alive`, the request-specific scratch fields
 %% reset to defaults, and any pipelined leftover bytes carried in
 %% `buffered` so the next iteration can parse them without waiting
 %% on more inbound packets.
-%% Pattern-matched on the response shape directly — saves the
-%% cross-module call to `roadrunner_conn:response_kind/1` and the
-%% subsequent `case` dispatch. Buffered (3-tuple) is the only shape
-%% eligible for keep-alive; stream/loop/sendfile/websocket writers
-%% own the wire from here and force close.
+%% Pattern-matched on the response shape directly so we skip the
+%% cross-module call to `roadrunner_conn:response_kind/1`.
 -spec finishing_phase(#loop_state{}, roadrunner_req:request(), roadrunner_handler:response()) ->
     no_return().
 finishing_phase(S, Req, {Status, Headers, _Body}) when is_integer(Status) ->
     buffered_finish(S, Req, Headers);
+finishing_phase(S, Req, {sendfile, Status, Headers, _}) when is_integer(Status) ->
+    buffered_finish(S, Req, Headers);
 finishing_phase(S, Req, _Response) ->
-    %% Stream / loop / sendfile / websocket: writer owns the wire.
-    %% In auto-mode the body is already fully read; manual-mode
-    %% may have leftover that needs draining.
+    %% Stream / loop / websocket: writer owns the wire. In auto-mode
+    %% the body is already fully read; manual-mode may have leftover
+    %% that needs draining.
     _ = drain_body_if_manual(Req),
     exit_normal(S).
 
