@@ -61,7 +61,7 @@
 %% Adding a new protocol (e.g. h3) requires appending it here, wiring
 %% `preflight_protocol/1`, and tagging incompatible scenarios in the
 %% `?H?_ONLY_SCENARIOS` macros below.
--define(KNOWN_PROTOCOLS, [h1, h2]).
+-define(KNOWN_PROTOCOLS, [h1, h2, h2c]).
 
 %% Scenarios are partitioned by protocol compatibility. Each scenario
 %% name lives in exactly one of these three macros; adding a new
@@ -249,7 +249,8 @@ expand_scenarios(all, Protocol) ->
     Drop =
         case Protocol of
             h1 -> ?H2_ONLY_SCENARIOS;
-            h2 -> ?H1_ONLY_SCENARIOS
+            h2 -> ?H1_ONLY_SCENARIOS;
+            h2c -> ?H1_ONLY_SCENARIOS
         end,
     Kept = [S || S <- ?KNOWN_SCENARIOS, not lists:member(S, Drop)],
     Dropped = [S || S <- ?KNOWN_SCENARIOS, lists:member(S, Drop)],
@@ -426,7 +427,23 @@ preflight_protocol(#{protocol := h2, servers := Servers} = Opts) ->
             ok
     end,
     {ok, _} = application:ensure_all_started(ssl),
-    Opts#{servers => Filtered, cert_dir => CertDir}.
+    Opts#{servers => Filtered, cert_dir => CertDir};
+preflight_protocol(#{protocol := h2c, servers := Servers} = Opts) ->
+    %% Cleartext prior-knowledge HTTP/2: plain TCP, no certs. Only
+    %% roadrunner is wired for h2c here (cowboy/elli need their own
+    %% h2c listener setup); keep it roadrunner-only.
+    Filtered = [S || S <- Servers, S =:= roadrunner],
+    case Filtered =/= Servers of
+        true ->
+            io:format(
+                "note: --protocols h2c is roadrunner-only here "
+                "(cowboy/elli h2c not wired)~n",
+                []
+            );
+        false ->
+            ok
+    end,
+    Opts#{servers => Filtered}.
 
 generate_test_cert() ->
     Dir = string:trim(os:cmd("mktemp -d")),
@@ -1327,6 +1344,8 @@ start_server(roadrunner, #{protocol := h1, scenario := Scenario}) ->
     start_roadrunner(Scenario);
 start_server(roadrunner, #{protocol := h2, scenario := Scenario, cert_dir := CertDir}) ->
     start_roadrunner_h2(Scenario, CertDir);
+start_server(roadrunner, #{protocol := h2c, scenario := Scenario}) ->
+    start_roadrunner_h2c(Scenario);
 start_server(cowboy, #{protocol := h1, scenario := Scenario}) ->
     start_cowboy_h1(Scenario);
 start_server(cowboy, #{protocol := h2, scenario := Scenario, cert_dir := CertDir}) ->
@@ -1442,6 +1461,29 @@ start_roadrunner_h2(Scenario, CertDir) ->
     ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
     {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr_h2, ListenerOpts]),
     Port = peer:call(Peer, roadrunner_listener, port, [bench_rr_h2]),
+    print_listener_config([{"listener_opts", ListenerOpts}]),
+    {Peer, Port}.
+
+start_roadrunner_h2c(Scenario) ->
+    {ok, Peer, _Node} = peer:start_link(#{
+        name => peer:random_name(),
+        connection => standard_io,
+        args => pa_args_for_peer(),
+        wait_boot => 10000
+    }),
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [roadrunner]),
+    %% `protocols => [http2]` on plain TCP = RFC 7540 §3.4 prior-knowledge
+    %% h2c: the conn goes straight to the HTTP/2 loop, no TLS, no ALPN.
+    BaseOpts = #{
+        port => 0,
+        protocols => [http2],
+        keep_alive_timeout => 60000,
+        max_clients => 100000,
+        max_keep_alive_requests => 1000000
+    },
+    ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
+    {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr_h2c, ListenerOpts]),
+    Port = peer:call(Peer, roadrunner_listener, port, [bench_rr_h2c]),
     print_listener_config([{"listener_opts", ListenerOpts}]),
     {Peer, Port}.
 
@@ -1816,7 +1858,18 @@ run_measured(Port, #{duration_s := D} = Opts) ->
 run_phase(Port, #{protocol := h1} = Opts, DurationMs) ->
     run_phase_h1(Port, Opts, DurationMs);
 run_phase(Port, #{protocol := h2} = Opts, DurationMs) ->
+    _ = persistent_term:put('$bench_h2_client_proto', h2),
+    run_phase_h2(Port, Opts, DurationMs);
+run_phase(Port, #{protocol := h2c} = Opts, DurationMs) ->
+    %% h2c reuses the entire h2 run phase; only the client's transport
+    %% differs (plain TCP vs TLS), selected via `h2_client_proto/0`.
+    _ = persistent_term:put('$bench_h2_client_proto', h2c),
     run_phase_h2(Port, Opts, DurationMs).
+
+%% Which protocol the bench client opens for the h2 run phase — `h2`
+%% (TLS+ALPN) or `h2c` (cleartext). Set by `run_phase/3`.
+h2_client_proto() ->
+    persistent_term:get('$bench_h2_client_proto', h2).
 
 run_phase_h1(
     Port, #{clients := C, host := Host, scenario := partial_body_drop}, DurationMs
@@ -3391,7 +3444,7 @@ tls_handshake_worker(Host, Port, Deadline, Acc) ->
             Acc;
         false ->
             T0 = erlang:monotonic_time(nanosecond),
-            case roadrunner_bench_client:open(Host, Port, h2) of
+            case roadrunner_bench_client:open(Host, Port, h2_client_proto()) of
                 {ok, Conn} ->
                     case
                         roadrunner_bench_client:request(Conn, ~"GET", ~"/", [], <<>>)
@@ -3418,7 +3471,7 @@ tls_handshake_worker(Host, Port, Deadline, Acc) ->
 -define(MULTI_STREAM_BATCH, 16).
 
 h2_multi_stream_worker(Host, Port, Deadline, Acc) ->
-    case roadrunner_bench_client:open(Host, Port, h2) of
+    case roadrunner_bench_client:open(Host, Port, h2_client_proto()) of
         {ok, Conn} ->
             Final = h2_multi_stream_loop(Conn, Deadline, Acc),
             _ = roadrunner_bench_client:close(Conn),
@@ -3713,7 +3766,7 @@ h2_request_shape(httparena_static) ->
     halt(2).
 
 h2_worker_loop(Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->
-    case roadrunner_bench_client:open(Host, Port, h2) of
+    case roadrunner_bench_client:open(Host, Port, h2_client_proto()) of
         {ok, Conn} ->
             h2_keep_alive_loop(Conn, Method, Path, ReqHeaders, ReqBody, Deadline, Acc);
         {error, _} ->

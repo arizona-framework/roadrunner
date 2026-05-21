@@ -38,7 +38,7 @@ ms. That's now fixed at the listener layer
 %% RFC 9113 §6.5.2 default frame size cap (we never request larger).
 -define(MAX_FRAME_SIZE, 16384).
 
--type protocol() :: h1 | h2 | h3.
+-type protocol() :: h1 | h2 | h2c | h3.
 
 -record(h1_conn, {
     sock :: gen_tcp:socket(),
@@ -46,7 +46,7 @@ ms. That's now fixed at the listener layer
 }).
 
 -record(h2_conn, {
-    sock :: ssl:sslsocket(),
+    sock :: {ssl, ssl:sslsocket()} | {tcp, gen_tcp:socket()},
     buf = <<>> :: binary(),
     enc :: roadrunner_http2_hpack:context(),
     dec :: roadrunner_http2_hpack:context(),
@@ -78,44 +78,56 @@ open(Host, Port, h2) ->
         {verify, verify_none},
         {server_name_indication, disable}
     ],
-    HostArg = host_arg(Host),
-    case ssl:connect(HostArg, Port, SslOpts, 5000) of
-        {ok, Sock} ->
-            %% Preface + empty SETTINGS + a connection-level
-            %% WINDOW_UPDATE that bumps the server's `conn_send_window`
-            %% from the default 65 535 to (65 535 + (2^31-1 - 65 535)) =
-            %% 2^31-1. Without this, a long-running keep-alive bench
-            %% accumulates 65 535 bytes of response data and stalls the
-            %% server (which is correctly waiting on the peer to refill
-            %% the window). Real h2 clients (browsers, h2load, nghttp2)
-            %% all manage flow control like this.
-            BigBumpInc = 16#7FFFFFFF - 65535,
-            BumpFrame = roadrunner_http2_frame:encode(
-                {window_update, 0, BigBumpInc}
-            ),
-            ok = ssl:send(Sock, [
-                ?PREFACE,
-                h2_empty_settings_frame(),
-                BumpFrame
-            ]),
-            case h2_handshake(Sock, <<>>, false, false) of
-                {ok, Buf} ->
-                    {ok, #h2_conn{
-                        sock = Sock,
-                        buf = Buf,
-                        enc = roadrunner_http2_hpack:new_encoder(4096),
-                        dec = roadrunner_http2_hpack:new_decoder(4096),
-                        authority = host_to_authority(Host)
-                    }};
-                {error, _} = E ->
-                    _ = ssl:close(Sock),
-                    E
-            end;
-        {error, _} = E ->
-            E
+    case ssl:connect(host_arg(Host), Port, SslOpts, 5000) of
+        {ok, S} -> h2_open_common({ssl, S}, Host);
+        {error, _} = E -> E
+    end;
+open(Host, Port, h2c) ->
+    %% Cleartext prior-knowledge HTTP/2 (RFC 7540 §3.4): plain TCP, no
+    %% ALPN, send the connection preface directly. Mirrors HttpArena's
+    %% `*-h2c` profiles.
+    TcpOpts = [binary, {active, false}, {nodelay, true}],
+    case gen_tcp:connect(host_arg(Host), Port, TcpOpts, 5000) of
+        {ok, S} -> h2_open_common({tcp, S}, Host);
+        {error, _} = E -> E
     end;
 open(_Host, _Port, h3) ->
     {error, not_implemented}.
+
+%% Shared post-connect handshake for h2 (TLS) and h2c (cleartext).
+%% `Sock` is the tagged transport — `{ssl, _}` or `{tcp, _}` — so the
+%% rest of the h2 path is transport-agnostic via `tsend/trecv/tclose`.
+h2_open_common(Sock, Host) ->
+    %% Preface + empty SETTINGS + a connection-level WINDOW_UPDATE that
+    %% bumps the server's `conn_send_window` from 65 535 to 2^31-1.
+    %% Without it a long-running keep-alive bench accumulates 65 535
+    %% bytes of response data and stalls. Real h2 clients all do this.
+    BigBumpInc = 16#7FFFFFFF - 65535,
+    BumpFrame = roadrunner_http2_frame:encode({window_update, 0, BigBumpInc}),
+    ok = tsend(Sock, [?PREFACE, h2_empty_settings_frame(), BumpFrame]),
+    case h2_handshake(Sock, <<>>, false, false) of
+        {ok, Buf} ->
+            {ok, #h2_conn{
+                sock = Sock,
+                buf = Buf,
+                enc = roadrunner_http2_hpack:new_encoder(4096),
+                dec = roadrunner_http2_hpack:new_decoder(4096),
+                authority = host_to_authority(Host)
+            }};
+        {error, _} = E ->
+            _ = tclose(Sock),
+            E
+    end.
+
+%% Transport dispatch for the tagged h2 socket.
+tsend({ssl, S}, Data) -> ssl:send(S, Data);
+tsend({tcp, S}, Data) -> gen_tcp:send(S, Data).
+
+trecv({ssl, S}, N, T) -> ssl:recv(S, N, T);
+trecv({tcp, S}, N, T) -> gen_tcp:recv(S, N, T).
+
+tclose({ssl, S}) -> ssl:close(S);
+tclose({tcp, S}) -> gen_tcp:close(S).
 
 -doc """
 Issue one request on `Conn` and read the full response. Returns
@@ -178,7 +190,7 @@ request(
             true -> [HFrame | encode_data_frames(Sid, Body)];
             false -> HFrame
         end,
-    case ssl:send(Sock, Frames) of
+    case tsend(Sock, Frames) of
         ok ->
             case recv_h2_response(Sock, Buf, Sid, Dec) of
                 {ok, Status, RespHeaders, RespBody, Buf1, Dec1} ->
@@ -201,7 +213,7 @@ close(#h1_conn{sock = Sock}) ->
     _ = gen_tcp:close(Sock),
     ok;
 close(#h2_conn{sock = Sock}) ->
-    _ = ssl:close(Sock),
+    _ = tclose(Sock),
     ok.
 
 -doc """
@@ -236,7 +248,7 @@ request_many(
     %% Encode N HEADERS frames in a row; the encoder's dyn table
     %% mutates across the batch, so we thread Enc through.
     {Frames, Enc1, LastSid} = build_h2_batch(Pseudo, Enc, Sid0, N),
-    case ssl:send(Sock, Frames) of
+    case tsend(Sock, Frames) of
         ok ->
             %% Track outstanding stream ids in a map sid → undefined.
             %% Each END_STREAM response removes its key; we're done
@@ -301,15 +313,15 @@ recv_h2_streams(Sock, Buf, Pending, Dec) ->
                 end,
             recv_h2_streams(Sock, Rest, Pending1, Dec);
         {ok, {settings, 0, _}, Rest} ->
-            ok = ssl:send(Sock, h2_settings_ack_frame()),
+            ok = tsend(Sock, h2_settings_ack_frame()),
             recv_h2_streams(Sock, Rest, Pending, Dec);
         {ok, {ping, 0, Opaque}, Rest} ->
-            ok = ssl:send(Sock, roadrunner_http2_frame:encode({ping, 1, Opaque})),
+            ok = tsend(Sock, roadrunner_http2_frame:encode({ping, 1, Opaque})),
             recv_h2_streams(Sock, Rest, Pending, Dec);
         {ok, _Other, Rest} ->
             recv_h2_streams(Sock, Rest, Pending, Dec);
         {more, _Need} ->
-            case ssl:recv(Sock, 0, 5000) of
+            case trecv(Sock, 0, 5000) of
                 {ok, More} ->
                     recv_h2_streams(
                         Sock, <<Buf/binary, More/binary>>, Pending, Dec
@@ -429,12 +441,12 @@ h2_handshake(Sock, Buf, GotS, GotA) ->
         {ok, {settings, 1, _}, Rest} ->
             h2_handshake(Sock, Rest, GotS, true);
         {ok, {settings, 0, _Params}, Rest} ->
-            ok = ssl:send(Sock, h2_settings_ack_frame()),
+            ok = tsend(Sock, h2_settings_ack_frame()),
             h2_handshake(Sock, Rest, true, GotA);
         {ok, _Other, Rest} ->
             h2_handshake(Sock, Rest, GotS, GotA);
         {more, _Need} ->
-            case ssl:recv(Sock, 0, 5000) of
+            case trecv(Sock, 0, 5000) of
                 {ok, More} ->
                     h2_handshake(Sock, <<Buf/binary, More/binary>>, GotS, GotA);
                 {error, _} = E ->
@@ -468,15 +480,15 @@ recv_h2_loop(Sock, Buf, Sid, Dec, Status, Headers, Body) ->
                 false -> recv_h2_loop(Sock, Rest, Sid, Dec, Status, Headers, Body1)
             end;
         {ok, {settings, 0, _}, Rest} ->
-            ok = ssl:send(Sock, h2_settings_ack_frame()),
+            ok = tsend(Sock, h2_settings_ack_frame()),
             recv_h2_loop(Sock, Rest, Sid, Dec, Status, Headers, Body);
         {ok, {ping, 0, Opaque}, Rest} ->
-            ok = ssl:send(Sock, roadrunner_http2_frame:encode({ping, 1, Opaque})),
+            ok = tsend(Sock, roadrunner_http2_frame:encode({ping, 1, Opaque})),
             recv_h2_loop(Sock, Rest, Sid, Dec, Status, Headers, Body);
         {ok, _Other, Rest} ->
             recv_h2_loop(Sock, Rest, Sid, Dec, Status, Headers, Body);
         {more, _Need} ->
-            case ssl:recv(Sock, 0, 5000) of
+            case trecv(Sock, 0, 5000) of
                 {ok, More} ->
                     recv_h2_loop(
                         Sock, <<Buf/binary, More/binary>>, Sid, Dec, Status, Headers, Body
