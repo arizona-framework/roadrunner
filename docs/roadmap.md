@@ -359,14 +359,26 @@ Findings:
   so this is the cost of 4096 concurrent connections, not a roadrunner
   leak.
 
-**Scope:** medium-to-large, and now de-prioritized. The reducible
-roadrunner-side memory is the per-conn `conn_loop_http2` state
-(~60 KiB: streams map, hpack contexts, recv buffer) — ~246 MiB of
-Erlang heap at 4096c, a minority of the RSS that's dominated by
-sockets + payload. Trimming it is a real but capped win that won't
-move the headline RSS; the remaining big levers (wire-write split,
-pointer-only worker→conn protocol) are architectural and lack a
-workload that justifies the refactor.
+**Shipped — idle-conn hibernation (h1 parity).** The h2 conn loop now
+honors `hibernate_after` like the h1 loop: when the streams map is
+empty and the conn is parked waiting for the next frame past the
+window, it `erlang:hibernate/3`s, collapsing the heap until the next
+frame wakes it. Demonstrated ~3.6× idle-conn heap reduction (4.9 KiB →
+1.4 KiB on lightly-used conns; more for conns with a populated hpack
+dynamic table). This is a **memory** win for idle/bursty keep-alive
+(browsers, API clients) — opt-in, default off, zero throughput effect
+(`recv_timeout/1` is ~60 ns/call and the hibernate branch never fires
+under load). It does **not** touch the all-busy `json-h2c @ 4096c`
+figure: those conns never idle past the window.
+
+**Scope:** medium-to-large, and now de-prioritized. The remaining
+reducible roadrunner-side memory is the *active* per-conn
+`conn_loop_http2` state (~60 KiB: streams map, hpack contexts, recv
+buffer) — ~246 MiB of Erlang heap at 4096c, a minority of the RSS
+that's dominated by sockets + payload. Trimming it is a real but
+capped win that won't move the headline RSS; the remaining big levers
+(wire-write split, pointer-only worker→conn protocol) are
+architectural and lack a workload that justifies the refactor.
 
 ### Large-POST auto-buffering memory — measured, no roadrunner-side fix in scope
 

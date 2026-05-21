@@ -54,6 +54,11 @@
 
 -export([enter/5]).
 
+%% Hibernate continuation — invoked via `erlang:hibernate/3` when an
+%% idle conn parks past `hibernate_after`. Must stay exported so the
+%% runtime can re-enter the loop on wake.
+-export([recv_more_hib/1]).
+
 %% RFC 9113 §3.4 client connection preface — fixed 24 bytes.
 -define(PREFACE, ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
 -define(PREFACE_LEN, 24).
@@ -395,10 +400,57 @@ recv_more(
             recv_more(maybe_exit_when_drained(handle_worker_down(State, MonRef, Reason)));
         {roadrunner_drain, _Deadline} ->
             recv_more(maybe_exit_when_drained(start_drain(State)))
-    after idle_timeout() ->
-        _ = send_goaway(State, protocol_error),
-        exit_clean(State)
+    after recv_timeout(State) ->
+        recv_idle_expired(State)
     end.
+
+%% Idle-wait timeout selection. When no streams are in flight AND the
+%% listener opted into `hibernate_after`, park for that (typically
+%% shorter) window so `recv_idle_expired/1` can hibernate. Otherwise
+%% the GOAWAY idle timeout applies — including whenever streams are
+%% active, where worker messages are imminent and hibernating would be
+%% pointless.
+-spec recv_timeout(#loop{}) -> non_neg_integer().
+recv_timeout(#loop{streams = Streams, proto_opts = ProtoOpts}) when
+    map_size(Streams) =:= 0
+->
+    case ProtoOpts of
+        #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 -> Ms;
+        _ -> idle_timeout()
+    end;
+recv_timeout(_State) ->
+    idle_timeout().
+
+%% Fired when `recv_more/1` sees no traffic for `recv_timeout/1`. With
+%% an empty streams map and `hibernate_after` set, collapse the heap
+%% via hibernation; the socket is already `{active, once}`-armed (we
+%% reached recv_more through `arm_and_recv/1`), so the next inbound
+%% frame — or any worker / `'DOWN'` / drain message — wakes us and
+%% `recv_more_hib/1` resumes the loop. Otherwise emit the idle GOAWAY.
+-spec recv_idle_expired(#loop{}) -> no_return().
+recv_idle_expired(#loop{streams = Streams, proto_opts = ProtoOpts} = State) when
+    map_size(Streams) =:= 0
+->
+    case ProtoOpts of
+        #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 ->
+            erlang:hibernate(?MODULE, recv_more_hib, [State]);
+        _ ->
+            idle_goaway(State)
+    end;
+recv_idle_expired(State) ->
+    idle_goaway(State).
+
+-spec idle_goaway(#loop{}) -> no_return().
+idle_goaway(State) ->
+    _ = send_goaway(State, protocol_error),
+    exit_clean(State).
+
+%% Hibernate re-entry (see `recv_idle_expired/1`). Resumes the unified
+%% mailbox loop after an idle conn wakes from `erlang:hibernate/3`.
+-doc false.
+-spec recv_more_hib(#loop{}) -> no_return().
+recv_more_hib(State) ->
+    recv_more(State).
 
 %% Begin a graceful drain: emit GOAWAY(NO_ERROR) once, refuse new
 %% streams henceforth. In-flight workers continue to completion.
