@@ -328,12 +328,45 @@ HPACK dynamic-table reaping and WINDOW_UPDATE batching wouldn't move
 the needle. Per-stream state layout is similarly not the lever; the
 streams map is small relative to the mailbox.
 
-**Scope:** medium-to-large. The remaining levers are architectural
-(wire-write split or pointer-only worker→conn protocol), and the
-prerequisite is a workload where the gain would justify the
-refactor — for example, a measured h2c (cleartext) bench where the
-ssl gen_statem isn't in the picture, to confirm the mailbox-inflation
-finding is TLS-specific and not present without it.
+**h2c (cleartext) measured — the mailbox effect is TLS-only, and the
+big number is mostly OS-level.** The bench now drives cleartext h2c
+(`--protocols h2c`, plain-TCP `protocols => [http2]` listener), so the
+HttpArena `*-h2c` profiles are reproducible locally. `multi_stream_h2`
+over h2c:
+
+| | rps | erlang:memory peak | RSS | per-conn |
+|---|---|---|---|---|
+| h2c @ 1024c | 535 k | 302 MiB | 426 MiB | ~60 KiB |
+| h2c @ 4096c | 442 k | 212 MiB | 718 MiB | — |
+| TLS @ 1024c | ~330 k | 296 MiB (incl. ssl procs) | — | ~60 KiB |
+
+Findings:
+- **No mailbox inflation on h2c.** The conn_loop sits in
+  `roadrunner_conn_loop_http2:recv_more/1`, never `gen:do_call/4` —
+  `gen_tcp:send` doesn't block on a gen_statem, so the inflation above
+  is confirmed TLS-only.
+- **h2c is ~60 % faster than TLS** and leaner (no `ssl_gen_statem` /
+  `tls_sender` procs). The json-h2c throughput rank reflects the
+  per-stream-worker model vs a native h2 stack, not a roadrunner-h2
+  defect.
+- **The 1.6 GiB on HttpArena `json-h2c @ 4096c` is mostly outside the
+  BEAM.** At 4096c locally, `erlang:memory(total)` peaks ~212 MiB
+  while RSS is 718 MiB — ~70 % is per-socket kernel buffers × 4096
+  conns + allocator carriers. RSS scales with conn count; Erlang heap
+  tracks in-flight work, not conns. json's variable-array payloads
+  add the rest (in-flight response bytes), pushing RSS toward the
+  HttpArena figure. h2o (C) uses *more* on the same profile (1.9 GiB),
+  so this is the cost of 4096 concurrent connections, not a roadrunner
+  leak.
+
+**Scope:** medium-to-large, and now de-prioritized. The reducible
+roadrunner-side memory is the per-conn `conn_loop_http2` state
+(~60 KiB: streams map, hpack contexts, recv buffer) — ~246 MiB of
+Erlang heap at 4096c, a minority of the RSS that's dominated by
+sockets + payload. Trimming it is a real but capped win that won't
+move the headline RSS; the remaining big levers (wire-write split,
+pointer-only worker→conn protocol) are architectural and lack a
+workload that justifies the refactor.
 
 ### Large-POST auto-buffering memory — measured, no roadrunner-side fix in scope
 
@@ -393,11 +426,44 @@ well inside run-to-run variance. `file:open(_, [raw, binary])` is
 sub-µs on a hot OS page cache; the pdict map lookup + tick bump +
 `maps:put` overhead cancels the saving.
 
+**Finding 3 — the fd-term owner-rewrite hack works but is
+catastrophically unsafe (do not use).** A raw fd CAN be handed to
+another process by destructuring its term and rewriting the owner
+field:
+
+```erlang
+{file_descriptor, prim_file, Data} = Fd,
+Fd1 = {file_descriptor, prim_file, Data#{owner => self()}}.
+```
+
+This bypasses the `not_on_controlling_process` check, so a shared
+cross-conn fd cache could in principle be built on it. It is
+undocumented and unsafe: the runtime tracks fd ownership for cleanup
+via an atomic compare-and-swap, so if the owning process dies while
+operations are in flight from other processes, they all signal close
+of the underlying OS fd. Since OS fd integers are reused, that can
+close an UNRELATED descriptor (a live socket or another open file) —
+rare but equivalent to memory corruption, with no recovery. OTP issue
+#9239 (raw pread from multiple processes) is stalled awaiting the VM
+team; POSIX pread/sendfile are thread-safe at the OS level but Erlang
+exposes no sanctioned multi-process raw-fd API. Sources: erlang.org
+file docs, OTP issue #9239, Erlang Forums "is it safe to share Fd
+between processes".
+
+**What we ship instead — raw open per process (the sanctioned path).**
+Both the stat and the sendfile open use `raw` in the calling process
+(`roadrunner_static` read_link_info / read_file_info, and
+`roadrunner_transport:sendfile`'s `file:open(_, [read, raw, binary])`),
+which bypasses the `file_server` gen_server with no fd sharing. On the
+uncached static path the `raw` stat removed a `file_server`
+serialization bottleneck under concurrency: 70k → 125k rps at 256c.
+
 **If revisited:** would need either (a) a measured workload where
 `file:open` shows up as a clear hotspot in fprof / eprof (none seen
-to date), or (b) a NIF-backed cache that bypasses the prim_file
-owner check entirely (custom C / Rust code, well outside the
-"pure-Erlang" property the framework markets).
+to date), or (b) a NIF-backed cache that owns the fds and serves
+reads/sendfile itself (custom C / Rust, well outside the "pure-Erlang"
+property the framework markets) — the owner-rewrite hack in Finding 3
+is NOT a safe shortcut around this.
 
 ### Sync headline scenarios in comparison.md + resource_results.md
 
