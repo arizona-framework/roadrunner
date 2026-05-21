@@ -60,7 +60,7 @@
 -export([recv_more_hib/1]).
 
 %% RFC 9113 §3.4 client connection preface — fixed 24 bytes.
--define(PREFACE, ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
+-define(PREFACE, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
 -define(PREFACE_LEN, 24).
 
 %% Read-deadline caps for the handshake and idle states. Tests
@@ -291,14 +291,10 @@ idle_timeout() ->
     persistent_term:get({?MODULE, idle_timeout}, ?IDLE_TIMEOUT_DEFAULT).
 
 -spec handshake_phase_preface(#loop{}) -> no_return().
-handshake_phase_preface(#loop{buffer = Buf} = State) when byte_size(Buf) >= ?PREFACE_LEN ->
-    <<Head:?PREFACE_LEN/binary, Rest/binary>> = Buf,
-    case Head of
-        ?PREFACE ->
-            handshake_phase_settings(State#loop{buffer = Rest});
-        _ ->
-            exit_clean(State)
-    end;
+handshake_phase_preface(#loop{buffer = <<?PREFACE, Rest/binary>>} = State) ->
+    handshake_phase_settings(State#loop{buffer = Rest});
+handshake_phase_preface(#loop{buffer = <<_:?PREFACE_LEN/binary, _/binary>>} = State) ->
+    exit_clean(State);
 handshake_phase_preface(State) ->
     handshake_recv(State, fun handshake_phase_preface/1).
 

@@ -61,6 +61,7 @@ all_test_() ->
         fun handshake_closed_during_partial_preface/0,
         fun handshake_error_during_partial_preface/0,
         fun handshake_timeout_during_partial_preface/0,
+        fun handshake_succeeds_with_fragmented_preface/0,
         fun frame_loop_parse_error_triggers_goaway/0,
         fun runtime_transport_error_triggers_goaway/0,
         fun runtime_idle_timeout_emits_goaway/0,
@@ -1130,6 +1131,39 @@ handshake_timeout_during_partial_preface() ->
     after
         persistent_term:erase({roadrunner_conn_loop_http2, handshake_timeout})
     end.
+
+handshake_succeeds_with_fragmented_preface() ->
+    %% The 24-byte preface split across two TCP segments must NOT close
+    %% the conn mid-preface: `handshake_phase_preface/1` waits for the
+    %% full PREFACE_LEN bytes before deciding. (Guards against a
+    %% partial-buffer clause that exits before the preface completes.)
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    <<First:12/binary, Second/binary>> = ?PREFACE,
+    serve_recv(ConnPid, First),
+    serve_recv(ConnPid, Second),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"}
+        ],
+        Enc
+    ),
+    Hf = iolist_to_binary(
+        roadrunner_http2_frame:encode(
+            {headers, 1, 16#04 bor 16#01, undefined, iolist_to_binary(Hpack)}
+        )
+    ),
+    serve_recv(ConnPid, Hf),
+    ?assertMatch(<<_:24, 1, _/binary>>, expect_send()),
+    cleanup(Pid, Ref).
 
 frame_loop_parse_error_triggers_goaway() ->
     %% Garbage frame bytes after a clean handshake — the buffer
