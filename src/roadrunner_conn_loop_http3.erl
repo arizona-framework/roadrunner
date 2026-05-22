@@ -40,7 +40,7 @@
 -export([init/2]).
 %% Exported for unit testing of the pure request-stream frame folding;
 %% not part of any public surface.
--export([decode_request_frames/3, set_header_block/2, new_request_stream/0]).
+-export([decode_request_frames/3, new_request_stream/0]).
 
 %% RFC 9114 §8.1 / RFC 9204 §8.3 error codes.
 -define(H3_NO_ERROR, 16#0100).
@@ -173,39 +173,53 @@ handle_stream_data(State, StreamId, Data, Fin) ->
 handle_request_stream(
     #h3{streams = Streams, max_content_length = MaxLen} = State, StreamId, Data, Fin
 ) ->
-    %% Only in-progress (still-accumulating) streams live in the map;
-    %% `dispatch_request` removes a stream once it's handed to a worker,
-    %% and QUIC never delivers data after a stream's FIN, so a stream
-    %% seen here is always mid-accumulation.
-    #{buf := Buf0} = Stream0 = maps:get(StreamId, Streams, new_request_stream()),
-    case decode_request_frames(<<Buf0/binary, Data/binary>>, Stream0, MaxLen) of
-        {ok, Stream1} ->
-            State1 = State#h3{streams = Streams#{StreamId => Stream1}},
+    Stream0 = maps:get(StreamId, Streams, new_request_stream()),
+    case maps:get(frame_state, Stream0) of
+        discarding ->
+            %% The stream was already answered (413). Residual in-flight
+            %% body must be ignored — it is continued body on an answered
+            %% request, NOT a new header-less request, so it must not trip
+            %% the DATA-before-HEADERS check or re-trigger a 413. The
+            %% marker is freed when the client finishes (FIN) or resets
+            %% the stream, so it never outlives the stream.
             case Fin of
-                true -> dispatch_request(State1, StreamId);
-                false -> State1
+                true -> drop_stream(State, StreamId);
+                false -> State
             end;
-        too_large ->
-            ok = roadrunner_http3_stream_worker:send_buffered(
-                State#h3.conn,
-                StreamId,
-                413,
-                [{~"content-type", ~"text/plain"}],
-                ~"Payload Too Large"
-            ),
-            %% Abort the client's upload and drop the stream. Keeping a
-            %% "done" marker would leak: QUIC retires the completed
-            %% stream (returning credit) but a map entry would persist
-            %% for the connection's lifetime, so repeated oversized
-            %% requests grow it without bound. `stop_sending` tells the
-            %% client to stop, so trailing DATA doesn't re-trigger a 413.
-            _ = quic:stop_sending(State#h3.conn, StreamId, ?H3_NO_ERROR),
-            drop_stream(State, StreamId);
-        {error, Reason} ->
-            %% A frame-level decode failure is a connection error per
-            %% RFC 9114 §7.1 (malformed/oversized frame) and §7.2.8
-            %% (HTTP/2-reserved frame type).
-            {conn_error, frame_error_code(Reason), ~"frame error"}
+        _ ->
+            #{buf := Buf0} = Stream0,
+            case decode_request_frames(<<Buf0/binary, Data/binary>>, Stream0, MaxLen) of
+                {ok, Stream1} ->
+                    State1 = State#h3{streams = Streams#{StreamId => Stream1}},
+                    case Fin of
+                        true -> dispatch_request(State1, StreamId);
+                        false -> State1
+                    end;
+                too_large ->
+                    ok = roadrunner_http3_stream_worker:send_buffered(
+                        State#h3.conn,
+                        StreamId,
+                        413,
+                        [{~"content-type", ~"text/plain"}],
+                        ~"Payload Too Large"
+                    ),
+                    %% Ask the client to stop and mark the stream
+                    %% `discarding` so residual body is dropped rather
+                    %% than mistaken for a new request.
+                    _ = quic:stop_sending(State#h3.conn, StreamId, ?H3_NO_ERROR),
+                    State#h3{
+                        streams = Streams#{
+                            StreamId => Stream0#{
+                                frame_state := discarding,
+                                buf := <<>>,
+                                body := [],
+                                body_len := 0
+                            }
+                        }
+                    };
+                {conn_error, _, _} = ConnError ->
+                    ConnError
+            end
     end.
 
 %% RFC 9114 §7.2.8: HTTP/2-reserved frame types → H3_FRAME_UNEXPECTED;
@@ -216,45 +230,65 @@ frame_error_code(_) -> ?H3_FRAME_ERROR.
 
 -spec new_request_stream() -> map().
 new_request_stream() ->
-    #{buf => <<>>, header_block => undefined, body => [], body_len => 0}.
+    #{
+        buf => <<>>,
+        header_block => undefined,
+        body => [],
+        body_len => 0,
+        %% RFC 9114 §4.1 request frame sequence: HEADERS, then DATA, then
+        %% optional trailing HEADERS, then nothing.
+        frame_state => expecting_headers
+    }.
 
-%% Decode as many complete HTTP/3 frames as the buffer holds, folding
-%% them into the stream's accumulated request. The undecoded remainder
-%% is stashed back in `buf` for the next `stream_data` message.
--spec decode_request_frames(binary(), map(), non_neg_integer()) ->
-    {ok, map()} | too_large | {error, term()}.
+-type decode_result() :: {ok, map()} | too_large | {conn_error, non_neg_integer(), binary()}.
+
+%% Decode as many complete HTTP/3 frames as the buffer holds, applying
+%% the request frame-sequence rules and folding payloads into the
+%% accumulated request. The undecoded remainder is stashed in `buf` for
+%% the next `stream_data` message.
+-spec decode_request_frames(binary(), map(), non_neg_integer()) -> decode_result().
 decode_request_frames(Buf, Stream, MaxLen) ->
     case quic_h3_frame:decode(Buf) of
-        {ok, {headers, Block}, Rest} ->
-            decode_request_frames(Rest, set_header_block(Stream, Block), MaxLen);
-        {ok, {data, Payload}, Rest} ->
-            #{body := Body, body_len := Len} = Stream,
-            NewLen = Len + byte_size(Payload),
-            case NewLen > MaxLen of
-                true ->
-                    too_large;
-                false ->
-                    decode_request_frames(
-                        Rest, Stream#{body := [Body, Payload], body_len := NewLen}, MaxLen
-                    )
+        {ok, Frame, Rest} ->
+            case apply_frame(Frame, Stream, MaxLen) of
+                {ok, Stream1} -> decode_request_frames(Rest, Stream1, MaxLen);
+                Other -> Other
             end;
-        {ok, _Ignored, Rest} ->
-            %% SETTINGS / GOAWAY / unknown / grease on a request stream —
-            %% not meaningful to a buffered request; skip.
-            decode_request_frames(Rest, Stream, MaxLen);
         {more, _} ->
             {ok, Stream#{buf := Buf}};
-        {error, _} = Error ->
-            Error
+        {error, Reason} ->
+            %% A frame-level decode failure is a connection error per
+            %% RFC 9114 §7.1 (malformed/oversized frame) and §7.2.8
+            %% (HTTP/2-reserved frame type).
+            {conn_error, frame_error_code(Reason), ~"frame error"}
     end.
 
-%% Keep the first HEADERS block as the request headers; a later HEADERS
-%% frame is trailers, which the buffered path does not surface.
--spec set_header_block(map(), binary()) -> map().
-set_header_block(#{header_block := undefined} = Stream, Block) ->
-    Stream#{header_block := Block};
-set_header_block(Stream, _Block) ->
-    Stream.
+%% Apply one decoded frame against the request frame-sequence state
+%% machine (RFC 9114 §4.1). An out-of-sequence or control-stream-only
+%% frame on a request stream is a connection error of type
+%% H3_FRAME_UNEXPECTED (§4.1, §7.2.4); unknown/reserved frames are
+%% ignored (§9). Trailers (a HEADERS after the body) are accepted but
+%% not surfaced by the buffered path.
+-spec apply_frame(quic_h3_frame:frame(), map(), non_neg_integer()) ->
+    {ok, map()} | too_large | {conn_error, non_neg_integer(), binary()}.
+apply_frame({headers, Block}, #{frame_state := expecting_headers} = Stream, _MaxLen) ->
+    {ok, Stream#{header_block := Block, frame_state := expecting_data}};
+apply_frame({headers, _Trailers}, #{frame_state := expecting_data} = Stream, _MaxLen) ->
+    {ok, Stream#{frame_state := expecting_done}};
+apply_frame({data, Payload}, #{frame_state := expecting_data} = Stream, MaxLen) ->
+    #{body := Body, body_len := Len} = Stream,
+    NewLen = Len + byte_size(Payload),
+    case NewLen > MaxLen of
+        true -> too_large;
+        false -> {ok, Stream#{body := [Body, Payload], body_len := NewLen}}
+    end;
+apply_frame({unknown, _Type, _Payload}, Stream, _MaxLen) ->
+    {ok, Stream};
+apply_frame(_Frame, _Stream, _MaxLen) ->
+    %% DATA before HEADERS, a frame after trailers, or a control-stream
+    %% frame (SETTINGS / GOAWAY / MAX_PUSH_ID / CANCEL_PUSH / PUSH_PROMISE)
+    %% on a request stream — RFC 9114 §4.1 / §7.2: H3_FRAME_UNEXPECTED.
+    {conn_error, ?H3_FRAME_UNEXPECTED, ~"unexpected frame on request stream"}.
 
 -spec dispatch_request(#h3{}, non_neg_integer()) -> handle_result().
 dispatch_request(#h3{streams = Streams} = State, StreamId) ->

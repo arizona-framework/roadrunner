@@ -36,6 +36,8 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     badheaders_reset/1,
     fin_without_headers/1,
     malformed_request/1,
+    data_before_headers/1,
+    request_with_trailers/1,
     malformed_frame/1,
     oversized_frame/1,
     qpack_decompression_failed/1,
@@ -71,6 +73,8 @@ all() ->
         badheaders_reset,
         fin_without_headers,
         malformed_request,
+        data_before_headers,
+        request_with_trailers,
         malformed_frame,
         oversized_frame,
         qpack_decompression_failed,
@@ -418,6 +422,26 @@ malformed_request(Config) ->
     ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
     ll_close(Conn).
 
+data_before_headers(Config) ->
+    %% A DATA frame before any HEADERS is an invalid frame sequence
+    %% (RFC 9114 §4.1) → H3_FRAME_UNEXPECTED connection error.
+    Conn = ll_connect(?config(port, Config)),
+    {ok, StreamId} = quic:open_stream(Conn),
+    ok = quic:send_data(Conn, StreamId, quic_h3_frame:encode_data(~"x"), false),
+    ll_await_closed(Conn).
+
+request_with_trailers(Config) ->
+    %% A request with trailing HEADERS (trailers) after the body is valid
+    %% (RFC 9114 §4.1); the trailers are ignored and the request is served.
+    Conn = ll_connect(?config(port, Config)),
+    ReqHeaders = quic_h3_frame:encode_headers(quic_qpack:encode(headers(~"POST", ~"/echo"))),
+    Data = quic_h3_frame:encode_data(~"body"),
+    Trailers = quic_h3_frame:encode_headers(quic_qpack:encode([{~"x-checksum", ~"abc"}])),
+    {ok, StreamId} = quic:open_stream(Conn),
+    ok = quic:send_data(Conn, StreamId, <<ReqHeaders/binary, Data/binary, Trailers/binary>>, true),
+    ?assertEqual({200, ~"body"}, ll_collect(Conn, StreamId, <<>>)),
+    ll_close(Conn).
+
 malformed_frame(Config) ->
     %% Frame type 0x02 is reserved for HTTP/2 — a connection error of
     %% type H3_FRAME_UNEXPECTED (RFC 9114 §7.2.8): the whole connection
@@ -444,20 +468,26 @@ qpack_decompression_failed(Config) ->
     ll_await_closed(Conn).
 
 extra_data_after_413(_Config) ->
-    %% A body over the cap is answered with 413 and the stream dropped +
-    %% stop_sent. A small trailing frame that races in must not leak or
-    %% crash the conn: it lands as a fresh (incomplete) stream entry and
-    %% the connection keeps serving.
+    %% A body over the cap is answered with 413 and the stream enters
+    %% `discarding`. Residual in-flight body (further DATA frames, with
+    %% and without FIN) must be ignored — neither leaking, re-triggering
+    %% a 413, nor tripping the DATA-before-HEADERS check — and the
+    %% connection keeps serving.
     Name = listener_name(extra_data_after_413),
     {ok, _} = start_h3(Name, #{max_content_length => 8}),
     Conn = ll_connect(roadrunner_listener:port(Name)),
     try
         {ok, StreamId} = quic:open_stream(Conn),
+        ReqHeaders = quic_h3_frame:encode_headers(quic_qpack:encode(headers(~"POST", ~"/echo"))),
         Over = quic_h3_frame:encode_data(binary:copy(<<"x">>, 32)),
-        ok = quic:send_data(Conn, StreamId, Over, false),
+        ok = quic:send_data(Conn, StreamId, <<ReqHeaders/binary, Over/binary>>, false),
         timer:sleep(100),
-        _ = quic:send_data(Conn, StreamId, quic_h3_frame:encode_data(~"more"), false),
-        timer:sleep(100),
+        %% residual DATA without FIN — ignored
+        ok = quic:send_data(Conn, StreamId, quic_h3_frame:encode_data(~"more"), false),
+        timer:sleep(50),
+        %% final residual DATA with FIN — drops the discarding marker
+        ok = quic:send_data(Conn, StreamId, quic_h3_frame:encode_data(~"end"), true),
+        timer:sleep(50),
         ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/"))
     after
         ll_close(Conn),
