@@ -109,6 +109,7 @@ listener_honors_num_acceptors_opt_test() ->
 notify_drain_reaches_pg_members_test() ->
     %% Self-join the drain group so the broadcast reaches this process,
     %% then call notify_drain and assert the message lands.
+    ok = ensure_pg_started(),
     Name = listener_test_notify_drain,
     Group = {roadrunner_drain, Name},
     ok = pg:join(Group, self()),
@@ -126,6 +127,7 @@ notify_drain_reaches_pg_members_test() ->
 
 notify_drain_with_no_members_is_noop_test() ->
     %% Empty group — just confirms the call returns ok and doesn't crash.
+    ok = ensure_pg_started(),
     ?assertEqual(
         ok,
         roadrunner_listener:notify_drain(
@@ -144,10 +146,7 @@ slot_reconciliation_releases_sustained_orphan_slots_test() ->
     %% `kill`-bypasses-`terminate` recovery. Also asserts the
     %% `[roadrunner, listener, slots_reconciled]` telemetry event fires
     %% with the released count.
-    case whereis(pg) of
-        undefined -> {ok, _} = pg:start_link();
-        _ -> ok
-    end,
+    ok = ensure_pg_started(),
     {ok, _} = application:ensure_all_started(telemetry),
     Self = self(),
     HandlerId = make_ref(),
@@ -192,10 +191,7 @@ slot_reconciliation_releases_sustained_orphan_slots_test() ->
 slot_reconciliation_only_reaps_excess_over_pg_members_test() ->
     %% Counter > pg members → only the diff is orphan; pg members
     %% themselves represent live conns and must NOT be touched.
-    case whereis(pg) of
-        undefined -> {ok, _} = pg:start_link();
-        _ -> ok
-    end,
+    ok = ensure_pg_started(),
     Name = listener_test_reap_partial,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
@@ -398,10 +394,7 @@ listener_drops_unknown_info_message_test() ->
     ok = roadrunner_listener:stop(Name).
 
 slot_reconciliation_disabled_by_default_test() ->
-    case whereis(pg) of
-        undefined -> {ok, _} = pg:start_link();
-        _ -> ok
-    end,
+    ok = ensure_pg_started(),
     Name = listener_test_no_reap,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0, routes => roadrunner_hello_handler
@@ -465,7 +458,7 @@ drain(Sock) ->
 drain_with_no_active_conns_returns_immediately_test_() ->
     {setup,
         fun() ->
-            ensure_pg_started(),
+            ok = ensure_pg_started(),
             Name = listener_test_drain_idle,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0, routes => roadrunner_hello_handler
@@ -483,7 +476,7 @@ drain_with_no_active_conns_returns_immediately_test_() ->
 drain_waits_for_in_flight_loop_to_close_test_() ->
     {setup,
         fun() ->
-            ensure_pg_started(),
+            ok = ensure_pg_started(),
             Name = listener_test_drain_loop,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0,
@@ -511,7 +504,7 @@ drain_waits_for_in_flight_loop_to_close_test_() ->
 drain_timeout_kills_unresponsive_conns_test_() ->
     {setup,
         fun() ->
-            ensure_pg_started(),
+            ok = ensure_pg_started(),
             Name = listener_test_drain_kill,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0,
@@ -538,7 +531,7 @@ drain_timeout_kills_unresponsive_conns_test_() ->
 drain_closes_keep_alive_conn_after_in_flight_request_test_() ->
     {setup,
         fun() ->
-            ensure_pg_started(),
+            ok = ensure_pg_started(),
             Name = listener_test_drain_ka,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0, routes => roadrunner_drain_pause_handler
@@ -616,7 +609,7 @@ parse_cl(Head) ->
 reload_routes_swaps_dispatch_table_test_() ->
     {setup,
         fun() ->
-            ensure_pg_started(),
+            ok = ensure_pg_started(),
             Name = listener_test_reload,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0,
@@ -648,7 +641,7 @@ reload_routes_rebakes_listener_middlewares_test_() ->
     %% middlewares on reloaded routes.
     {setup,
         fun() ->
-            ensure_pg_started(),
+            ok = ensure_pg_started(),
             Name = listener_test_reload_listener_mws,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0,
@@ -809,7 +802,7 @@ drain_close(Sock, Acc) ->
 status_returns_phase_test_() ->
     {setup,
         fun() ->
-            ensure_pg_started(),
+            ok = ensure_pg_started(),
             Name = listener_test_status,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0, routes => roadrunner_hello_handler
@@ -831,7 +824,8 @@ status_returns_phase_test_() ->
 ensure_pg_started() ->
     case whereis(pg) of
         undefined ->
-            {ok, _} = pg:start_link();
+            {ok, _} = pg:start_link(),
+            ok;
         _ ->
             ok
     end.
