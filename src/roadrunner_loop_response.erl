@@ -3,7 +3,7 @@
 
 %% Per-connection `{loop, ...}` response — message-driven streaming.
 %%
-%% Called by `roadrunner_conn_loop:dispatch_response/4` after a handler
+%% Called by `roadrunner_conn_loop:dispatch_response/5` after a handler
 %% returns `{loop, Status, Headers, State}`. Writes the status line +
 %% chunked headers, then runs a recursive selective-receive loop that
 %% dispatches every Erlang message through `Module:handle_info/3`. The

@@ -45,6 +45,8 @@ All duration and interval values in `opts()` are in milliseconds —
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
 -define(DEFAULT_MAX_CLIENTS, 150).
 -define(DEFAULT_MIN_BYTES_PER_SECOND, 100).
+-define(DEFAULT_WS_MAX_FRAME_SIZE, 16777216).
+-define(DEFAULT_WS_MAX_MESSAGE_SIZE, 16777216).
 
 -doc """
 Listener configuration map.
@@ -73,6 +75,12 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `middlewares` — listener-wide pipeline applied to every request.
 - `max_content_length` — request-body cap; over-cap reads return
   `payload_too_large`. Default 10 MB.
+- `ws_max_frame_size` — per-WebSocket-frame payload cap. An inbound
+  frame declaring more bytes than this closes the connection with
+  code 1009 before the payload is buffered. Default 16 MB.
+- `ws_max_message_size` — cap on a reassembled WebSocket message
+  (the running sum of fragment payloads). Over-cap closes with code
+  1009. Default 16 MB.
 - `request_timeout` — header-read timeout on a fresh conn.
   Default 30 s.
 - `keep_alive_timeout` — idle timeout between requests on a
@@ -117,6 +125,8 @@ ops-tuning rationale.
         | roadrunner_router:routes(),
     middlewares => roadrunner_middleware:middleware_list(),
     max_content_length => non_neg_integer(),
+    ws_max_frame_size => non_neg_integer(),
+    ws_max_message_size => non_neg_integer(),
     request_timeout => non_neg_integer(),
     keep_alive_timeout => non_neg_integer(),
     num_acceptors => pos_integer(),
@@ -537,6 +547,10 @@ build_proto_opts(Opts, ListenerName) ->
             middlewares => maps:get(middlewares, Opts, []),
             max_content_length =>
                 maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
+            ws_max_frame_size =>
+                maps:get(ws_max_frame_size, Opts, ?DEFAULT_WS_MAX_FRAME_SIZE),
+            ws_max_message_size =>
+                maps:get(ws_max_message_size, Opts, ?DEFAULT_WS_MAX_MESSAGE_SIZE),
             request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
             keep_alive_timeout =>
                 maps:get(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT),

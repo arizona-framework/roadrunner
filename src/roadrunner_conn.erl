@@ -82,6 +82,13 @@
     dispatch := dispatch(),
     middlewares := roadrunner_middleware:middleware_list(),
     max_content_length := non_neg_integer(),
+    %% WebSocket inbound size caps. `ws_max_frame_size` bounds a single
+    %% frame's declared payload (enforced before buffering);
+    %% `ws_max_message_size` bounds a reassembled message (the running
+    %% sum of fragment payloads). Both always present —
+    %% `roadrunner_listener:build_proto_opts/2` fills defaults.
+    ws_max_frame_size := non_neg_integer(),
+    ws_max_message_size := non_neg_integer(),
     request_timeout := non_neg_integer(),
     keep_alive_timeout := non_neg_integer(),
     max_keep_alive_requests := pos_integer(),

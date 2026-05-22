@@ -62,7 +62,7 @@
 
 -behaviour(gen_statem).
 
--export([run/4]).
+-export([run/5]).
 -export([init/1, callback_mode/0, terminate/3]).
 -export([awaiting_socket/3, frame_loop/3]).
 -export([unmask_slice/3]).
@@ -102,6 +102,15 @@
     msg_acc :: undefined | iodata(),
     msg_opcode :: undefined | text | binary,
     msg_compressed :: boolean(),
+    %% Inbound size caps (from listener `proto_opts`, set once in
+    %% `init/1`). `max_frame_size` bounds a single frame's declared
+    %% payload — enforced in `process_buffer/2` against the peeked
+    %% header before the body is buffered. `max_message_size` bounds a
+    %% reassembled message via `msg_size`, the running sum of fragment
+    %% payloads. Over either cap closes the connection with 1009.
+    max_frame_size :: non_neg_integer(),
+    max_message_size :: non_neg_integer(),
+    msg_size = 0 :: non_neg_integer(),
     %% Trailing UTF-8 bytes carried over from a previous fragment that
     %% form the start of a multi-byte sequence whose continuation
     %% bytes haven't arrived yet. RFC 6455 §8.1 + §5.4 require that
@@ -147,12 +156,18 @@ socket. Returns `ok` once the session has ended (or the
 handshake check fails — in which case 400 has been sent and
 the gen_statem is never started).
 """.
--spec run(roadrunner_transport:socket(), roadrunner_req:request(), module(), term()) -> ok.
-run(Socket, Req, Mod, State) ->
+-spec run(
+    roadrunner_transport:socket(),
+    roadrunner_req:request(),
+    module(),
+    term(),
+    roadrunner_conn:proto_opts()
+) -> ok.
+run(Socket, Req, Mod, State, ProtoOpts) ->
     case roadrunner_ws:handshake_response(roadrunner_req:headers(Req)) of
         {ok, Status, RespHeaders, _, Negotiated} ->
             UpgradeResp = roadrunner_http1:response(Status, RespHeaders, ~""),
-            run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated);
+            run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, ProtoOpts);
         {error, _} ->
             _ = roadrunner_transport:send(
                 Socket,
@@ -171,9 +186,10 @@ run(Socket, Req, Mod, State) ->
     module(),
     term(),
     iodata(),
-    roadrunner_ws:negotiated()
+    roadrunner_ws:negotiated(),
+    roadrunner_conn:proto_opts()
 ) -> ok.
-run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated) ->
+run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, ProtoOpts) ->
     Ctx = ws_context(Req, Mod),
     %% Start the gen_statem **before** writing the 101 to the wire so a
     %% start failure never leaves the upgrade response sent with no
@@ -181,7 +197,7 @@ run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated) ->
     %% conn is intentionally unlinked from its children so a session
     %% crash never propagates to the conn process. We synchronise via
     %% a monitor instead.
-    case gen_statem:start(?MODULE, {Socket, Mod, State, Ctx, Negotiated}, []) of
+    case gen_statem:start(?MODULE, {Socket, Mod, State, Ctx, Negotiated, ProtoOpts}, []) of
         {ok, Pid} ->
             ok = roadrunner_telemetry:ws_upgrade(Ctx),
             _ = roadrunner_telemetry:response_send(
@@ -227,10 +243,15 @@ wait_for_session(Ref, Pid) ->
 callback_mode() -> [state_functions, state_enter].
 
 -spec init({
-    roadrunner_transport:socket(), module(), term(), map(), roadrunner_ws:negotiated()
+    roadrunner_transport:socket(),
+    module(),
+    term(),
+    map(),
+    roadrunner_ws:negotiated(),
+    roadrunner_conn:proto_opts()
 }) ->
     {ok, awaiting_socket, #data{}} | {stop, {bad_handler, module()}}.
-init({Socket, Mod, State, Ctx, Negotiated}) ->
+init({Socket, Mod, State, Ctx, Negotiated, ProtoOpts}) ->
     %% Reject unloadable handlers up front so `gen_statem:start/3`
     %% returns `{error, _}` and the launcher's 500 fallback runs —
     %% otherwise the session would crash later inside `handle_frame`
@@ -241,6 +262,10 @@ init({Socket, Mod, State, Ctx, Negotiated}) ->
     of
         true ->
             {PmdParams, InflateZ, DeflateZ} = init_pmd(Negotiated),
+            #{
+                ws_max_frame_size := MaxFrame,
+                ws_max_message_size := MaxMsg
+            } = ProtoOpts,
             {ok, awaiting_socket, #data{
                 socket = Socket,
                 buffer = <<>>,
@@ -253,9 +278,12 @@ init({Socket, Mod, State, Ctx, Negotiated}) ->
                 pmd_params = PmdParams,
                 inflate_z = InflateZ,
                 deflate_z = DeflateZ,
+                max_frame_size = MaxFrame,
+                max_message_size = MaxMsg,
                 msg_acc = undefined,
                 msg_opcode = undefined,
                 msg_compressed = false,
+                msg_size = 0,
                 utf8_pending = <<>>,
                 frame_validated = 0,
                 unmasked_buf = <<>>
@@ -358,7 +386,7 @@ close_zlib(Z) -> zlib:close(Z).
 %% honor the hibernate flag if any handler set it.
 -spec process_buffer(#data{}, boolean()) ->
     gen_statem:event_handler_result(atom()).
-process_buffer(#data{socket = Socket, buffer = Buf, pmd_params = Pmd} = Data, HibernateAcc) ->
+process_buffer(#data{buffer = Buf, pmd_params = Pmd} = Data, HibernateAcc) ->
     Opts =
         case Pmd of
             undefined -> #{};
@@ -366,31 +394,45 @@ process_buffer(#data{socket = Socket, buffer = Buf, pmd_params = Pmd} = Data, Hi
         end,
     case early_validate_text(Data, Buf, Opts) of
         {ok, Data1, MaybeTotalLen} ->
-            ParseOpts = parse_opts_with_pre_unmasked(Opts, Data1, MaybeTotalLen),
-            case roadrunner_ws:parse_frame(Buf, ParseOpts) of
-                {ok, Frame, NewBuffer} ->
-                    ok = roadrunner_telemetry:ws_frame_in(
-                        (Data1#data.ctx)#{opcode => maps:get(opcode, Frame)},
-                        payload_size(Frame)
-                    ),
-                    %% Frame parsed. Carry `frame_validated` into
-                    %% handle_frame so accumulate_fragment can skip
-                    %% redundant per-fragment UTF-8 validation. The
-                    %% reset happens AFTER fragment-level dispatch
-                    %% (in `reset_msg/1`), so the next frame's
-                    %% wire-level cursor starts from zero.
-                    handle_frame(
-                        Frame,
-                        Data1#data{buffer = NewBuffer},
-                        HibernateAcc
-                    );
-                {more, _} ->
-                    arm_or_stop(Socket, Data1, hibernate_actions(HibernateAcc));
-                {error, _} ->
-                    {stop, normal, Data1}
+            case frame_within_cap(MaybeTotalLen, Data1) of
+                false ->
+                    %% Declared frame payload exceeds `max_frame_size`.
+                    %% The header is in hand but the body isn't buffered
+                    %% yet — close now (RFC 6455 §7.4 code 1009) instead
+                    %% of letting the `{more, _}` re-arm keep reading.
+                    close_with(close_message_too_big(), reset_msg(Data1));
+                true ->
+                    process_parsed_frame(Data1, Buf, Opts, MaybeTotalLen, HibernateAcc)
             end;
         invalid_utf8 ->
             close_with(close_invalid_payload(), reset_msg(Data))
+    end.
+
+-spec process_parsed_frame(
+    #data{}, binary(), roadrunner_ws:parse_opts(), non_neg_integer() | undefined, boolean()
+) -> gen_statem:event_handler_result(atom()).
+process_parsed_frame(#data{socket = Socket} = Data1, Buf, Opts, MaybeTotalLen, HibernateAcc) ->
+    ParseOpts = parse_opts_with_pre_unmasked(Opts, Data1, MaybeTotalLen),
+    case roadrunner_ws:parse_frame(Buf, ParseOpts) of
+        {ok, Frame, NewBuffer} ->
+            ok = roadrunner_telemetry:ws_frame_in(
+                (Data1#data.ctx)#{opcode => maps:get(opcode, Frame)},
+                payload_size(Frame)
+            ),
+            %% Frame parsed. Carry `frame_validated` into handle_frame
+            %% so accumulate_fragment can skip redundant per-fragment
+            %% UTF-8 validation. The reset happens AFTER fragment-level
+            %% dispatch (in `reset_msg/1`), so the next frame's
+            %% wire-level cursor starts from zero.
+            handle_frame(
+                Frame,
+                Data1#data{buffer = NewBuffer},
+                HibernateAcc
+            );
+        {more, _} ->
+            arm_or_stop(Socket, Data1, hibernate_actions(HibernateAcc));
+        {error, _} ->
+            {stop, normal, Data1}
     end.
 
 %% Hand the cached unmasked payload to `parse_frame` when (and only
@@ -406,6 +448,18 @@ parse_opts_with_pre_unmasked(Opts, #data{unmasked_buf = Buf}, TotalLen) when
     Opts#{pre_unmasked => Buf};
 parse_opts_with_pre_unmasked(Opts, _Data, _TotalLen) ->
     Opts.
+
+%% Per-frame size cap. The peeked header reveals the frame's declared
+%% payload length before the body is buffered, so an oversized frame is
+%% rejected on the header alone (≤14 bytes seen) rather than after the
+%% `{more, _}` re-arm reads the whole payload. `undefined` means the
+%% length isn't known yet — let parsing continue and re-check on the
+%% next pass.
+-spec frame_within_cap(non_neg_integer() | undefined, #data{}) -> boolean().
+frame_within_cap(undefined, _Data) ->
+    true;
+frame_within_cap(TotalLen, #data{max_frame_size = Max}) ->
+    TotalLen =< Max.
 
 %% Sneak-peek a partially-buffered frame and validate any NEW
 %% text-payload bytes that have arrived since the last process_buffer
@@ -460,11 +514,18 @@ early_validate_text(Data, Buf, Opts) ->
                             invalid_utf8
                     end
             end;
+        {ok, #{total_payload_len := TotalLen}, _Available} ->
+            %% Header is peekable but the in-progress frame isn't a
+            %% fresh uncompressed text frame (binary / control /
+            %% continuation / compressed). No incremental UTF-8
+            %% validation applies, but surface the declared length so
+            %% `process_buffer/2` can apply the per-frame size cap
+            %% before the body is buffered.
+            {ok, Data, TotalLen};
         _ ->
-            %% Header isn't peekable yet, OR the in-progress frame
-            %% isn't a fresh uncompressed text frame — skip early
-            %% validation. parse_frame will catch protocol errors;
-            %% UTF-8 validation happens at fragment / FIN time.
+            %% Header isn't peekable yet — not enough buffered bytes to
+            %% know the declared length. parse_frame will catch protocol
+            %% errors; UTF-8 validation happens at fragment / FIN time.
             {ok, Data, undefined}
     end.
 
@@ -595,33 +656,59 @@ classify_data_frame(#{rsv1 := Rsv1, opcode := Op}, Data) when Op =:= text orelse
     gen_statem:event_handler_result(atom()).
 accumulate_fragment(
     #{fin := false, payload := P} = _Frame,
-    #data{msg_acc = Acc, msg_opcode = Op, msg_compressed = Compressed} = Data,
+    #data{
+        msg_acc = Acc,
+        msg_opcode = Op,
+        msg_compressed = Compressed,
+        msg_size = Size,
+        max_message_size = MaxMsg
+    } = Data,
     Hibernate
 ) ->
-    case fragment_validate(Op, Compressed, Data#data.utf8_pending, P, Data) of
-        {ok, NewPending} ->
-            NewAcc =
-                case Acc of
-                    undefined -> [P];
-                    _ -> [Acc, P]
-                end,
-            process_buffer(
-                Data#data{
-                    msg_acc = NewAcc,
-                    utf8_pending = NewPending,
-                    %% Reset wire-level cursor + unmasked-buffer so
-                    %% the NEXT frame's bytes are validated and
-                    %% accumulated from scratch when they arrive.
-                    frame_validated = 0,
-                    unmasked_buf = <<>>
-                },
-                Hibernate
-            );
-        invalid_utf8 ->
-            %% RFC 6455 §8.1: close 1007 on the first invalid UTF-8
-            %% byte sequence — don't wait for FIN.
-            close_with(close_invalid_payload(), reset_msg(Data))
+    NewSize = Size + byte_size(P),
+    case NewSize > MaxMsg of
+        true ->
+            %% Reassembled message (running sum of fragment payloads)
+            %% exceeds `max_message_size`. Close with 1009 instead of
+            %% buffering more — this is what stops a continuation flood
+            %% that never sets fin=1.
+            close_with(close_message_too_big(), reset_msg(Data));
+        false ->
+            case fragment_validate(Op, Compressed, Data#data.utf8_pending, P, Data) of
+                {ok, NewPending} ->
+                    NewAcc =
+                        case Acc of
+                            undefined -> [P];
+                            _ -> [Acc, P]
+                        end,
+                    process_buffer(
+                        Data#data{
+                            msg_acc = NewAcc,
+                            msg_size = NewSize,
+                            utf8_pending = NewPending,
+                            %% Reset wire-level cursor + unmasked-buffer so
+                            %% the NEXT frame's bytes are validated and
+                            %% accumulated from scratch when they arrive.
+                            frame_validated = 0,
+                            unmasked_buf = <<>>
+                        },
+                        Hibernate
+                    );
+                invalid_utf8 ->
+                    %% RFC 6455 §8.1: close 1007 on the first invalid
+                    %% UTF-8 byte sequence — don't wait for FIN.
+                    close_with(close_invalid_payload(), reset_msg(Data))
+            end
     end;
+accumulate_fragment(
+    #{fin := true, payload := P} = _Frame,
+    #data{msg_size = Size, max_message_size = MaxMsg} = Data,
+    _Hibernate
+) when Size + byte_size(P) > MaxMsg ->
+    %% The final fragment pushes the reassembled message over
+    %% `max_message_size` — close with 1009. (For compressed messages
+    %% this bounds the wire-level accumulated payload.)
+    close_with(close_message_too_big(), reset_msg(Data));
 accumulate_fragment(
     #{fin := true, payload := P} = _Frame,
     #data{
@@ -733,6 +820,7 @@ reset_msg(Data) ->
         msg_acc = undefined,
         msg_opcode = undefined,
         msg_compressed = false,
+        msg_size = 0,
         utf8_pending = <<>>,
         frame_validated = 0,
         unmasked_buf = <<>>
@@ -826,6 +914,13 @@ close_protocol_error() ->
 -spec close_invalid_payload() -> binary().
 close_invalid_payload() ->
     <<1007:16>>.
+
+%% RFC 6455 §7.4: 1009 = message too big — a single frame's declared
+%% payload, a reassembled message, or an inflated payload exceeded the
+%% configured cap.
+-spec close_message_too_big() -> binary().
+close_message_too_big() ->
+    <<1009:16>>.
 
 -spec close_with(binary(), #data{}) -> {stop, normal, #data{}}.
 close_with(StatusBin, Data) ->

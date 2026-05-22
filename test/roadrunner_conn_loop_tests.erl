@@ -1008,7 +1008,7 @@ request_start_and_stop_pair_with_shared_request_id_test() ->
 
 head_method_buffered_response_omits_body_test() ->
     %% RFC 9110 §9.3.2 — HEAD must NOT include a message body even
-    %% when the handler returns one. The dispatch_response/4 fast
+    %% when the handler returns one. The dispatch_response/5 fast
     %% path in conn_loop pattern-matches on `method := ~"HEAD"` and
     %% forces the body to `~""`. Headers (including content-length)
     %% stay as-is so the framing matches what GET would have returned.
@@ -1122,7 +1122,7 @@ sendfile_response_writes_head_then_body_test() ->
 
 sendfile_response_skips_body_for_head_method_test() ->
     %% RFC 9110 §9.3.2 — HEAD must not include a message body.
-    %% Covers the `~"HEAD"` branch of dispatch_response/4's sendfile clause.
+    %% Covers the `~"HEAD"` branch of dispatch_response/5's sendfile clause.
     ensure_pg(),
     Self = self(),
     Tag = make_ref(),
@@ -1158,7 +1158,7 @@ sendfile_response_skips_body_for_head_method_test() ->
 sendfile_dispatch_closes_socket_on_error_test() ->
     %% Sendfile responses honor keep-alive (per finishing_phase/3), so a
     %% mid-write failure would otherwise leave the conn idling for a
-    %% truncated request the client will never send. dispatch_response/4
+    %% truncated request the client will never send. dispatch_response/5
     %% must force-close the socket on `roadrunner_transport:sendfile/4`
     %% errors so the keep-alive loop sees `closed` on its next recv and
     %% the conn exits normally.
@@ -1197,7 +1197,7 @@ sendfile_dispatch_closes_socket_on_error_test() ->
     Sink ! stop.
 
 websocket_dispatch_invokes_session_run_test() ->
-    %% Without proper ws upgrade headers `ws_session:run/4` writes 400
+    %% Without proper ws upgrade headers `ws_session:run/5` writes 400
     %% and returns. We're covering the dispatch_response websocket
     %% clause — a full handshake test lives in the WS suite.
     ensure_pg(),
