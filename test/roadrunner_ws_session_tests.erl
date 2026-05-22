@@ -1049,6 +1049,41 @@ final_fragment_over_message_cap_closes_with_1009_test() ->
     ?assertEqual(<<16#88, 2, 1009:16>>, Sent),
     Sink ! stop.
 
+empty_continuation_flood_over_message_cap_closes_with_1009_test() ->
+    %% Empty continuation frames (payload <<>>, fin=0) carry no payload
+    %% bytes but still grow the reassembly buffer. Each fragment is
+    %% charged at least ?WS_FRAGMENT_OVERHEAD (64) toward the cap, so a
+    %% flood of empties is bounded: with cap 200, the 2-byte start
+    %% charges 64, then each empty charges 64 — the 3rd empty crosses
+    %% 200 and closes 1009.
+    Self = self(),
+    Tag = make_ref(),
+    Start = uncompressed_fragment(text, ~"ab", false),
+    Empty = uncompressed_fragment(continuation, <<>>, false),
+    Flood = <<Start/binary, Empty/binary, Empty/binary, Empty/binary, Empty/binary>>,
+    Sink = spawn_active_sink(Self, Tag, [{recv, Flood}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            ws_proto_opts(16777216, 200)
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertEqual(<<16#88, 2, 1009:16>>, Sent),
+    Sink ! stop.
+
 permessage_deflate_inflate_bomb_closes_with_1009_test() ->
     %% A small compressed frame whose inflated payload exceeds
     %% `ws_max_message_size` must be rejected during inflate (RFC 6455

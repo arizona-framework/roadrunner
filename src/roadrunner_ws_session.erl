@@ -106,9 +106,11 @@
     %% `init/1`). `max_frame_size` bounds a single frame's declared
     %% payload — enforced in `process_buffer/2` against the peeked
     %% header before the body is buffered. `max_message_size` bounds a
-    %% reassembled message via `msg_size`, the running sum of fragment
-    %% payloads; under permessage-deflate it also caps the decompressed
-    %% size (`finalize_message/3`). Over either cap closes with 1009.
+    %% reassembled message via `msg_size`, the running charged size of
+    %% the fragments (each charged at least `?WS_FRAGMENT_OVERHEAD` so
+    %% empty/tiny fragments can't grow `msg_acc` unbounded); under
+    %% permessage-deflate it also caps the decompressed size
+    %% (`finalize_message/3`). Over either cap closes with 1009.
     max_frame_size :: non_neg_integer(),
     max_message_size :: non_neg_integer(),
     msg_size = 0 :: non_neg_integer(),
@@ -146,6 +148,15 @@
 %% from the deflate output; receiver appends it before inflating to
 %% terminate the deflate block.
 -define(PMD_TAIL, <<0, 0, 16#FF, 16#FF>>).
+
+%% Per-fragment charge (bytes) added to the running message size on top
+%% of the payload. Each accumulated fragment costs ~32 bytes of cons
+%% cells in `msg_acc` regardless of its payload, so without a floor a
+%% flood of empty/tiny continuation frames would grow the heap while
+%% the payload-byte total stayed under `max_message_size`. Charging at
+%% least this much per fragment keeps real reassembly memory bounded by
+%% the cap (this is ~2x the actual cons-cell cost, a safe over-estimate).
+-define(WS_FRAGMENT_OVERHEAD, 64).
 
 -doc """
 Run the WebSocket session synchronously: spawn the gen_statem,
@@ -666,13 +677,14 @@ accumulate_fragment(
     } = Data,
     Hibernate
 ) ->
-    NewSize = Size + byte_size(P),
+    NewSize = Size + max(byte_size(P), ?WS_FRAGMENT_OVERHEAD),
     case NewSize > MaxMsg of
         true ->
-            %% Reassembled message (running sum of fragment payloads)
-            %% exceeds `max_message_size`. Close with 1009 instead of
-            %% buffering more — this is what stops a continuation flood
-            %% that never sets fin=1.
+            %% Charged message size exceeds `max_message_size`. Close
+            %% with 1009 instead of buffering more — this stops a
+            %% continuation flood that never sets fin=1, including one
+            %% built from empty/tiny frames (each charged the per-
+            %% fragment overhead so the cap bounds real memory).
             close_with(close_message_too_big(), reset_msg(Data));
         false ->
             case fragment_validate(Op, Compressed, Data#data.utf8_pending, P, Data) of
@@ -705,8 +717,8 @@ accumulate_fragment(
     #{fin := true, payload := P} = _Frame,
     #data{msg_size = Size, max_message_size = MaxMsg} = Data,
     _Hibernate
-) when Size + byte_size(P) > MaxMsg ->
-    %% The final fragment pushes the reassembled message over
+) when Size + max(byte_size(P), ?WS_FRAGMENT_OVERHEAD) > MaxMsg ->
+    %% The final fragment pushes the charged message size over
     %% `max_message_size` — close with 1009. (For compressed messages
     %% this bounds the wire-level accumulated payload.)
     close_with(close_message_too_big(), reset_msg(Data));
