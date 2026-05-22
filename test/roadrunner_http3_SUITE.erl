@@ -31,6 +31,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     rejects_http3_without_tls/1,
     max_clients_refuse/1,
     stream_cancel/1,
+    response_to_cancelled_stream/1,
     badheaders_reset/1,
     fin_without_headers/1,
     malformed_frame/1,
@@ -61,6 +62,7 @@ all() ->
         rejects_http3_without_tls,
         max_clients_refuse,
         stream_cancel,
+        response_to_cancelled_stream,
         badheaders_reset,
         fin_without_headers,
         malformed_frame,
@@ -82,10 +84,19 @@ init_per_suite(Config) ->
     Config.
 
 ensure_pg_started() ->
+    %% Start the default `pg` scope unlinked so it survives this
+    %% transient `init_per_suite` process (a plain `pg:start_link/0`
+    %% would link it here and it would die before the testcases run,
+    %% leaving the drain group empty).
     case whereis(pg) of
         undefined ->
-            {ok, _} = pg:start_link(),
-            ok;
+            case pg:start_link() of
+                {ok, Pid} ->
+                    _ = unlink(Pid),
+                    ok;
+                {error, {already_started, _}} ->
+                    ok
+            end;
         _ ->
             ok
     end.
@@ -345,6 +356,19 @@ stream_cancel(Config) ->
     ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
     close(Conn).
 
+response_to_cancelled_stream(Config) ->
+    %% The client STOP_SENDINGs a request stream while the (slow) handler
+    %% is still running, so the worker's later send onto the stopped
+    %% stream fails — that must be tolerated, not crash the connection.
+    Conn = ll_connect(?config(port, Config)),
+    Frame = quic_h3_frame:encode_headers(quic_qpack:encode(headers(~"GET", ~"/slow"))),
+    {ok, StreamId} = quic:open_stream(Conn),
+    ok = quic:send_data(Conn, StreamId, Frame, true),
+    _ = quic:stop_sending(Conn, StreamId, 0),
+    timer:sleep(300),
+    ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
+    ll_close(Conn).
+
 badheaders_reset(Config) ->
     Conn = connect(?config(port, Config)),
     %% The handler returns a malformed response, crashing the worker; the
@@ -371,8 +395,10 @@ malformed_frame(Config) ->
     ll_close(Conn).
 
 extra_data_after_413(_Config) ->
-    %% After a body exceeds the cap and the stream is answered with 413,
-    %% trailing DATA on the same stream is ignored (not reprocessed).
+    %% A body over the cap is answered with 413 and the stream dropped +
+    %% stop_sent. A small trailing frame that races in must not leak or
+    %% crash the conn: it lands as a fresh (incomplete) stream entry and
+    %% the connection keeps serving.
     Name = listener_name(extra_data_after_413),
     {ok, _} = start_h3(Name, #{max_content_length => 8}),
     Conn = ll_connect(roadrunner_listener:port(Name)),
@@ -381,8 +407,7 @@ extra_data_after_413(_Config) ->
         Over = quic_h3_frame:encode_data(binary:copy(<<"x">>, 32)),
         ok = quic:send_data(Conn, StreamId, Over, false),
         timer:sleep(100),
-        More = quic_h3_frame:encode_data(~"more"),
-        ok = quic:send_data(Conn, StreamId, More, false),
+        _ = quic:send_data(Conn, StreamId, quic_h3_frame:encode_data(~"more"), false),
         timer:sleep(100),
         ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/"))
     after
@@ -405,6 +430,9 @@ drain(Config) ->
     Name = ?config(listener, Config),
     Conn = connect(?config(port, Config)),
     ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
+    %% The h3 conn loop joined the listener's drain group, so drain
+    %% notifies it (the conn-loop drain branch) before the deadline.
+    ?assertMatch([_ | _], pg:get_members({roadrunner_drain, Name})),
     %% Conn stays open, so drain notifies it and then times out forcing
     %% the deadline — exercises the h3 conn loop's drain branch and the
     %% listener stopping the QUIC listener.

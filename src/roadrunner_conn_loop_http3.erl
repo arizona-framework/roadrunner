@@ -43,6 +43,7 @@
 -export([decode_request_frames/3, set_header_block/2, new_request_stream/0]).
 
 %% RFC 9114 §8.1 error codes.
+-define(H3_NO_ERROR, 16#0100).
 -define(H3_INTERNAL_ERROR, 16#0102).
 
 -record(h3, {
@@ -163,38 +164,41 @@ handle_stream_data(State, StreamId, Data, Fin) ->
 handle_request_stream(
     #h3{streams = Streams, max_content_length = MaxLen} = State, StreamId, Data, Fin
 ) ->
-    Stream0 = maps:get(StreamId, Streams, new_request_stream()),
-    case maps:get(worker, Stream0) of
-        undefined ->
-            #{buf := Buf0} = Stream0,
-            case decode_request_frames(<<Buf0/binary, Data/binary>>, Stream0, MaxLen) of
-                {ok, Stream1} ->
-                    State1 = State#h3{streams = Streams#{StreamId => Stream1}},
-                    case Fin of
-                        true -> dispatch_request(State1, StreamId);
-                        false -> State1
-                    end;
-                too_large ->
-                    ok = roadrunner_http3_stream_worker:send_buffered(
-                        State#h3.conn,
-                        StreamId,
-                        413,
-                        [{~"content-type", ~"text/plain"}],
-                        ~"Payload Too Large"
-                    ),
-                    %% Mark responded so trailing client DATA is ignored.
-                    State#h3{streams = Streams#{StreamId => Stream0#{worker := done}}};
-                error ->
-                    reset_and_drop(State, StreamId)
+    %% Only in-progress (still-accumulating) streams live in the map;
+    %% `dispatch_request` removes a stream once it's handed to a worker,
+    %% and QUIC never delivers data after a stream's FIN, so a stream
+    %% seen here is always mid-accumulation.
+    #{buf := Buf0} = Stream0 = maps:get(StreamId, Streams, new_request_stream()),
+    case decode_request_frames(<<Buf0/binary, Data/binary>>, Stream0, MaxLen) of
+        {ok, Stream1} ->
+            State1 = State#h3{streams = Streams#{StreamId => Stream1}},
+            case Fin of
+                true -> dispatch_request(State1, StreamId);
+                false -> State1
             end;
-        _Responded ->
-            %% Request already dispatched / answered — ignore extra data.
-            State
+        too_large ->
+            ok = roadrunner_http3_stream_worker:send_buffered(
+                State#h3.conn,
+                StreamId,
+                413,
+                [{~"content-type", ~"text/plain"}],
+                ~"Payload Too Large"
+            ),
+            %% Abort the client's upload and drop the stream. Keeping a
+            %% "done" marker would leak: QUIC retires the completed
+            %% stream (returning credit) but a map entry would persist
+            %% for the connection's lifetime, so repeated oversized
+            %% requests grow it without bound. `stop_sending` tells the
+            %% client to stop, so trailing DATA doesn't re-trigger a 413.
+            _ = quic:stop_sending(State#h3.conn, StreamId, ?H3_NO_ERROR),
+            drop_stream(State, StreamId);
+        error ->
+            reset_and_drop(State, StreamId)
     end.
 
 -spec new_request_stream() -> map().
 new_request_stream() ->
-    #{buf => <<>>, header_block => undefined, body => [], body_len => 0, worker => undefined}.
+    #{buf => <<>>, header_block => undefined, body => [], body_len => 0}.
 
 %% Decode as many complete HTTP/3 frames as the buffer holds, folding
 %% them into the stream's accumulated request. The undecoded remainder
@@ -240,7 +244,7 @@ dispatch_request(#h3{streams = Streams} = State, StreamId) ->
         #{header_block := undefined} ->
             %% Stream FIN with no HEADERS frame — malformed request.
             reset_and_drop(State, StreamId);
-        #{header_block := Block, body := Body} = Stream ->
+        #{header_block := Block, body := Body} ->
             {ReqId, NewBuf} = roadrunner_conn:generate_request_id(State#h3.req_id_buffer),
             RequestContext = #{
                 peer => State#h3.peer,
@@ -248,11 +252,14 @@ dispatch_request(#h3{streams = Streams} = State, StreamId) ->
                 listener_name => State#h3.listener_name,
                 request_id => ReqId
             },
-            {WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
+            {_WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
                 State#h3.conn, StreamId, Block, Body, RequestContext, State#h3.proto_opts
             ),
+            %% The worker owns the response now, tracked by its monitor
+            %% ref; drop the (no-longer-needed) frame-accumulation entry
+            %% so the streams map only ever holds in-progress requests.
             State#h3{
-                streams = Streams#{StreamId := Stream#{worker := {WorkerPid, MonRef}}},
+                streams = maps:remove(StreamId, Streams),
                 worker_refs = (State#h3.worker_refs)#{MonRef => StreamId},
                 req_id_buffer = NewBuf
             }

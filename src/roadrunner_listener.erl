@@ -1013,17 +1013,23 @@ do_drain(
     #state{listen_socket = LSocket, quic_listener = QuicListener, proto_opts = ProtoOpts} = State,
     Timeout
 ) ->
-    %% Close both transports — TCP accept fails so acceptors exit
-    %% cleanly, and stopping the QUIC listener refuses new QUIC
-    %% connections. In-flight conns of either protocol are then drained
-    %% via the shared pg group + client counter below.
+    %% Close the TCP listen socket so accept fails and acceptors exit;
+    %% existing TCP conns keep their own sockets and drain below.
     ok = close_tcp(LSocket),
-    ok = stop_quic(QuicListener),
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     Group = drain_group(ProtoOpts),
     notify_conns(Group, Deadline),
     Counter = maps:get(client_counter, ProtoOpts),
     Reply = wait_for_drain(Counter, Deadline, Group),
+    %% Stop the QUIC listener LAST: `quic_listener:stop/1` kills the
+    %% connections it `start_link`ed (and the h3 conn loops linked to
+    %% them), so doing it before the notify/wait above would abruptly
+    %% kill in-flight h3 conns instead of letting them drain. (New h3
+    %% conns can still arrive during the window — the QUIC listener has
+    %% no "stop accepting but keep existing" mode; they're force-closed
+    %% at the deadline like any other. A GOAWAY-based graceful h3 drain
+    %% is a roadmap follow-up.)
+    ok = stop_quic(QuicListener),
     %% `phase = draining` was never observable here (the gen_server is
     %% blocked in wait_for_drain and the local state isn't committed),
     %% so settle straight to the final stopped state in one update.

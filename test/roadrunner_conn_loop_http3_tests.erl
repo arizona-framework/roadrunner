@@ -14,7 +14,7 @@ decode(Buf, MaxLen) ->
 
 new_request_stream_test() ->
     ?assertEqual(
-        #{buf => <<>>, header_block => undefined, body => [], body_len => 0, worker => undefined},
+        #{buf => <<>>, header_block => undefined, body => [], body_len => 0},
         new()
     ).
 

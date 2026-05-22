@@ -20,6 +20,11 @@ handle(#{target := ~"/empty"} = Req) ->
     {{204, [], ~""}, Req};
 handle(#{target := ~"/big"} = Req) ->
     {{200, [{~"content-type", ~"application/octet-stream"}], binary:copy(<<"x">>, 100_000)}, Req};
+handle(#{target := ~"/slow"} = Req) ->
+    %% Sleeps so a test can cancel the stream before the worker sends,
+    %% exercising the response path's tolerance of a gone stream.
+    timer:sleep(100),
+    {{200, [], ~"slow"}, Req};
 handle(#{target := ~"/crash"} = _Req) ->
     error(boom);
 handle(#{target := ~"/badheaders"} = Req) ->
