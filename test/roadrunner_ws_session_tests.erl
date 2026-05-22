@@ -2,7 +2,7 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-%% `roadrunner_ws_session:run/4` must start the gen_statem **before** the
+%% `roadrunner_ws_session:run/5` must start the gen_statem **before** the
 %% 101 upgrade response is written. If `gen_statem:start/3` fails
 %% (here forced via an unknown handler module — `init/1` rejects it,
 %% turning into `{error, _}` from start), the 101 must never reach
@@ -24,7 +24,7 @@ run_with_unloadable_handler_sends_500_and_no_101_test() ->
         request_id => undefined
     },
     ok = roadrunner_ws_session:run(
-        {fake, Sink}, Req, this_module_does_not_exist_xyz_42, undefined
+        {fake, Sink}, Req, this_module_does_not_exist_xyz_42, undefined, ws_proto_opts()
     ),
     Sent = iolist_to_binary(collect_sends(Tag, 100)),
     Sink ! stop,
@@ -42,7 +42,9 @@ run_with_bad_handshake_still_returns_400_test() ->
         listener_name => undefined,
         request_id => undefined
     },
-    ok = roadrunner_ws_session:run({fake, Sink}, Req, roadrunner_ws_echo_handler, undefined),
+    ok = roadrunner_ws_session:run(
+        {fake, Sink}, Req, roadrunner_ws_echo_handler, undefined, ws_proto_opts()
+    ),
     Sent = iolist_to_binary(collect_sends(Tag, 100)),
     Sink ! stop,
     ?assertNotEqual(nomatch, binary:match(Sent, ~"400")),
@@ -50,7 +52,7 @@ run_with_bad_handshake_still_returns_400_test() ->
 
 %% =============================================================================
 %% Active-mode frame_loop — hibernate, transport error, and stray-info
-%% paths. Drives the gen_statem directly (skipping the run/4 launcher)
+%% paths. Drives the gen_statem directly (skipping the run/5 launcher)
 %% with a script-driven fake sink that delivers `roadrunner_fake_data`
 %% messages on `setopts({active, once})`.
 %% =============================================================================
@@ -68,7 +70,7 @@ frame_loop_hibernates_when_handler_returns_hibernate_opt_test() ->
     ]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_hibernate_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_hibernate_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -89,7 +91,7 @@ frame_loop_hibernates_on_ok_opt_variant_test() ->
     ]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_hibernate_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_hibernate_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -107,7 +109,7 @@ frame_loop_no_hibernate_for_3_tuple_returns_test() ->
     ]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -129,7 +131,7 @@ frame_loop_stops_on_transport_error_event_test() ->
     Sink = spawn_active_sink(Self, Tag, [{error, econnreset}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -155,7 +157,7 @@ frame_loop_closed_after_partial_frame_stops_cleanly_test() ->
     ]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -180,7 +182,7 @@ frame_loop_setopts_error_stops_cleanly_test() ->
     Sink = spawn_active_sink(Self, Tag, []),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -211,7 +213,7 @@ frame_loop_processes_multiple_frames_in_one_chunk_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, TwoFrames}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -231,7 +233,7 @@ frame_loop_drops_unexpected_info_event_test() ->
     Sink = spawn_active_sink(Self, Tag, []),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -257,7 +259,7 @@ init_callback_runs_once_at_session_start_test() ->
     State = #{sink => Self, on_init => ok},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -278,7 +280,7 @@ init_callback_can_push_priming_frames_test() ->
     State = #{sink => Self, on_init => {reply, [{text, ~"snapshot"}]}},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -296,7 +298,7 @@ init_callback_can_request_hibernate_test() ->
     State = #{sink => Self, on_init => ok_hibernate},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -317,7 +319,7 @@ init_callback_close_terminates_session_test() ->
     State = #{sink => Self, on_init => close},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -340,7 +342,7 @@ handle_info_callback_forwards_stray_message_test() ->
     State = #{sink => Self, on_info => {reply, [{text, ~"forwarded"}]}},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -360,7 +362,7 @@ handle_info_callback_can_request_hibernate_test() ->
     State = #{sink => Self, on_info => ok_hibernate},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -383,7 +385,7 @@ handle_info_callback_close_terminates_session_test() ->
     State = #{sink => Self, on_info => close},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -412,7 +414,7 @@ handle_drain_callback_dispatches_when_exported_test() ->
     State = #{sink => Self, on_drain => {reply, [{text, ~"draining"}]}},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -437,7 +439,7 @@ handle_drain_callback_close_terminates_session_test() ->
     State = #{sink => Self, on_drain => {close, 1000, ~"draining"}},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -461,7 +463,7 @@ handle_drain_drops_when_handler_does_not_export_test() ->
     Sink = spawn_active_sink(Self, Tag, []),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -498,7 +500,7 @@ run_session_forwards_drain_to_session_test() ->
     },
     Worker = spawn(fun() ->
         ok = roadrunner_ws_session:run(
-            {fake, Sink}, Req, roadrunner_ws_lifecycle_handler, State
+            {fake, Sink}, Req, roadrunner_ws_lifecycle_handler, State, ws_proto_opts()
         ),
         Self ! {worker_done, self()}
     end),
@@ -540,7 +542,7 @@ awaiting_socket_postpones_drain_until_frame_loop_test() ->
     State = #{sink => Self, on_drain => {close, 1000, ~"draining"}},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -572,7 +574,7 @@ close_with_code_emits_status_and_reason_test() ->
     State = #{sink => Self, on_init => {close, 1000, ~"bye"}},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -595,7 +597,7 @@ close_with_code_accepts_iodata_reason_test() ->
     State = #{sink => Self, on_init => {close, 1001, [~"hello", ~" ", ~"world"]}},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -615,7 +617,7 @@ close_with_empty_reason_emits_only_code_test() ->
     State = #{sink => Self, on_init => {close, 1000, ~""}},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -638,7 +640,7 @@ close_with_invalid_code_crashes_session_test() ->
     State = #{sink => Self, on_init => {close, 5000, ~"reason"}},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -658,7 +660,7 @@ close_with_invalid_utf8_reason_crashes_session_test() ->
     State = #{sink => Self, on_init => {close, 1000, <<16#FF>>}},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_lifecycle_handler, State, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -694,7 +696,14 @@ pmd_inflates_compressed_inbound_text_message_test() ->
             ~"permessage-deflate"},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            ws_proto_opts()
+        },
         []
     ),
     Pid ! socket_ready,
@@ -736,7 +745,14 @@ pmd_concatenates_compressed_fragments_before_inflate_test() ->
             ~"permessage-deflate"},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            ws_proto_opts()
+        },
         []
     ),
     Pid ! socket_ready,
@@ -766,7 +782,14 @@ pmd_uncompressed_frame_passes_through_when_pmd_negotiated_test() ->
             ~"permessage-deflate"},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            ws_proto_opts()
+        },
         []
     ),
     Pid ! socket_ready,
@@ -799,7 +822,14 @@ pmd_three_way_fragmented_compressed_message_test() ->
     Negotiated = pmd_negotiated(),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            ws_proto_opts()
+        },
         []
     ),
     Pid ! socket_ready,
@@ -821,7 +851,14 @@ pmd_corrupt_compressed_payload_stops_session_test() ->
     Negotiated = pmd_negotiated(),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            ws_proto_opts()
+        },
         []
     ),
     Ref = monitor(process, Pid),
@@ -855,7 +892,14 @@ pmd_no_context_takeover_resets_inflate_after_each_message_test() ->
             ~"permessage-deflate; server_no_context_takeover; client_no_context_takeover"},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            ws_proto_opts()
+        },
         []
     ),
     Pid ! socket_ready,
@@ -878,7 +922,7 @@ fragmented_text_message_dispatches_complete_payload_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -897,7 +941,7 @@ continuation_outside_message_closes_with_protocol_error_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, Stray}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -911,6 +955,273 @@ continuation_outside_message_closes_with_protocol_error_test() ->
     ?assertEqual(<<16#88, 2, 1002:16>>, Sent),
     Sink ! stop.
 
+oversized_single_frame_closes_with_1009_test() ->
+    %% A single frame whose declared payload exceeds `ws_max_frame_size`
+    %% is rejected with RFC 6455 §7.4 code 1009. Cap set to 10 bytes;
+    %% the frame declares a 50-byte payload.
+    Self = self(),
+    Tag = make_ref(),
+    Big = frame(binary, binary:copy(<<$x>>, 50)),
+    Sink = spawn_active_sink(Self, Tag, [{recv, Big}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            ws_proto_opts(10, 16777216)
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertEqual(<<16#88, 2, 1009:16>>, Sent),
+    Sink ! stop.
+
+continuation_flood_over_message_cap_closes_with_1009_test() ->
+    %% A fragmented message that never sets fin=1 must not grow without
+    %% bound. Each 100-byte fragment is under `ws_max_frame_size` but
+    %% the running total crosses `ws_max_message_size` (150) on the
+    %% second fragment, closing with code 1009.
+    Self = self(),
+    Tag = make_ref(),
+    Chunk = binary:copy(<<$a>>, 100),
+    Start = uncompressed_fragment(text, Chunk, false),
+    Cont = uncompressed_fragment(continuation, Chunk, false),
+    Sink = spawn_active_sink(Self, Tag, [{recv, <<Start/binary, Cont/binary>>}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            ws_proto_opts(16777216, 150)
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertEqual(<<16#88, 2, 1009:16>>, Sent),
+    Sink ! stop.
+
+final_fragment_over_message_cap_closes_with_1009_test() ->
+    %% The cap also fires when the FINAL (fin=1) fragment is what pushes
+    %% the reassembled message over `ws_max_message_size` — close 1009.
+    Self = self(),
+    Tag = make_ref(),
+    Chunk = binary:copy(<<$a>>, 100),
+    Start = uncompressed_fragment(text, Chunk, false),
+    Final = uncompressed_fragment(continuation, Chunk, true),
+    Sink = spawn_active_sink(Self, Tag, [{recv, <<Start/binary, Final/binary>>}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            ws_proto_opts(16777216, 150)
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertEqual(<<16#88, 2, 1009:16>>, Sent),
+    Sink ! stop.
+
+empty_continuation_flood_over_message_cap_closes_with_1009_test() ->
+    %% Empty continuation frames (payload <<>>, fin=0) carry no payload
+    %% bytes but still grow the reassembly buffer. Each fragment is
+    %% charged at least ?WS_FRAGMENT_OVERHEAD (64) toward the cap, so a
+    %% flood of empties is bounded: with cap 200, the 2-byte start
+    %% charges 64, then each empty charges 64 — the 3rd empty crosses
+    %% 200 and closes 1009.
+    Self = self(),
+    Tag = make_ref(),
+    Start = uncompressed_fragment(text, ~"ab", false),
+    Empty = uncompressed_fragment(continuation, <<>>, false),
+    Flood = <<Start/binary, Empty/binary, Empty/binary, Empty/binary, Empty/binary>>,
+    Sink = spawn_active_sink(Self, Tag, [{recv, Flood}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            ws_proto_opts(16777216, 200)
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertEqual(<<16#88, 2, 1009:16>>, Sent),
+    Sink ! stop.
+
+size_cap_rejection_emits_frame_rejected_telemetry_test() ->
+    %% A cap rejection emits [roadrunner, ws, frame_rejected] with the
+    %% reason and offending size before the 1009 close. Here a 50-byte
+    %% frame trips a 10-byte frame cap.
+    {ok, _} = application:ensure_all_started(telemetry),
+    Self = self(),
+    HandlerId = make_ref(),
+    ok = telemetry:attach(
+        HandlerId,
+        [roadrunner, ws, frame_rejected],
+        fun(Event, M, Md, _) -> Self ! {tev, Event, M, Md} end,
+        undefined
+    ),
+    try
+        Tag = make_ref(),
+        Big = frame(binary, binary:copy(<<$x>>, 50)),
+        Sink = spawn_active_sink(Self, Tag, [{recv, Big}]),
+        {ok, Pid} = gen_statem:start(
+            roadrunner_ws_session,
+            {
+                {fake, Sink},
+                roadrunner_ws_echo_handler,
+                undefined,
+                ws_ctx(),
+                none,
+                ws_proto_opts(10, 16777216)
+            },
+            []
+        ),
+        Ref = monitor(process, Pid),
+        Pid ! socket_ready,
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 1000 -> error(no_close)
+        end,
+        receive
+            {tev, [roadrunner, ws, frame_rejected], M, Md} ->
+                ?assertEqual(max_frame_size, maps:get(reason, Md)),
+                ?assertEqual(50, maps:get(size, M))
+        after 500 -> error(no_frame_rejected_event)
+        end,
+        Sink ! stop
+    after
+        telemetry:detach(HandlerId)
+    end.
+
+permessage_deflate_inflate_bomb_closes_with_1009_test() ->
+    %% A small compressed frame whose inflated payload exceeds
+    %% `ws_max_message_size` must be rejected during inflate (RFC 6455
+    %% §7.4 code 1009), not expanded in full. 5000 bytes deflate to a
+    %% tiny frame and inflate in a single zlib chunk; the cap is 1000.
+    Self = self(),
+    Tag = make_ref(),
+    Compressed = pmd_compress(binary:copy(<<$a>>, 5000)),
+    InboundFrame = pmd_frame(binary, Compressed),
+    Sink = spawn_active_sink(Self, Tag, [{recv, InboundFrame}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            pmd_negotiated(),
+            ws_proto_opts(16777216, 1000)
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertEqual(<<16#88, 2, 1009:16>>, Sent),
+    Sink ! stop.
+
+permessage_deflate_chunked_inflate_bomb_closes_with_1009_test() ->
+    %% zlib inflates in 16 KiB chunks. A payload that decompresses to
+    %% 50000 bytes crosses the 1000-byte cap on the FIRST chunk, so the
+    %% bounded loop bails mid-stream (1009) without producing the rest.
+    Self = self(),
+    Tag = make_ref(),
+    Compressed = pmd_compress(binary:copy(<<$a>>, 50000)),
+    InboundFrame = pmd_frame(binary, Compressed),
+    Sink = spawn_active_sink(Self, Tag, [{recv, InboundFrame}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            pmd_negotiated(),
+            ws_proto_opts(16777216, 1000)
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertEqual(<<16#88, 2, 1009:16>>, Sent),
+    Sink ! stop.
+
+permessage_deflate_large_message_under_cap_inflates_test() ->
+    %% A 50000-byte message inflates across several 16 KiB zlib chunks
+    %% but stays under the default cap — the bounded loop must reassemble
+    %% all chunks and dispatch the complete payload, not reject it. The
+    %% echo handler replies with a compressed text frame (0xC1), proving
+    %% the message was accepted rather than closed (0x88).
+    Self = self(),
+    Tag = make_ref(),
+    Compressed = pmd_compress(binary:copy(<<$a>>, 50000)),
+    InboundFrame = pmd_frame(text, Compressed),
+    Sink = spawn_active_sink(Self, Tag, [{recv, InboundFrame}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            pmd_negotiated(),
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 300)),
+    ?assertMatch(<<16#c1, _/binary>>, Sent),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
 new_data_frame_mid_message_closes_with_protocol_error_test() ->
     %% A non-FIN text frame in progress, then ANOTHER text frame
     %% (instead of a continuation) — protocol error.
@@ -921,7 +1232,7 @@ new_data_frame_mid_message_closes_with_protocol_error_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -943,7 +1254,7 @@ invalid_utf8_in_text_message_closes_1007_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, F}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -971,7 +1282,7 @@ out_of_range_utf8_at_fragment_2_closes_immediately_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary, F3/binary>>}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -1050,7 +1361,7 @@ empty_text_frame_round_trips_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, Empty}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -1073,7 +1384,7 @@ continuation_with_invalid_utf8_at_fin_closes_1007_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -1096,7 +1407,7 @@ continuation_with_incomplete_utf8_at_fin_closes_1007_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -1119,7 +1430,7 @@ overlong_3byte_e0_8x_closes_immediately_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -1140,7 +1451,7 @@ overlong_4byte_f0_8x_closes_immediately_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -1162,7 +1473,7 @@ invalid_leader_f5_closes_immediately_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -1186,7 +1497,7 @@ incomplete_utf8_at_fin_closes_with_1007_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, F}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -1212,7 +1523,14 @@ pmd_compressed_text_with_invalid_utf8_closes_1007_test() ->
     Negotiated = pmd_negotiated(),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            ws_proto_opts()
+        },
         []
     ),
     Ref = monitor(process, Pid),
@@ -1235,7 +1553,7 @@ surrogate_pair_in_utf8_closes_immediately_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -1260,7 +1578,7 @@ invalid_utf8_mid_fragment_closes_immediately_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),
@@ -1286,7 +1604,7 @@ incomplete_utf8_at_fragment_boundary_carries_forward_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -1311,7 +1629,7 @@ binary_fragments_skip_utf8_validation_test() ->
     Sink = spawn_active_sink(Self, Tag, [{recv, <<F1/binary, F2/binary>>}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_autobahn_handler, no_state, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_autobahn_handler, no_state, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Pid ! socket_ready,
@@ -1339,7 +1657,14 @@ pmd_control_frames_stay_uncompressed_test() ->
             ~"permessage-deflate"},
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), Negotiated},
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            ws_proto_opts()
+        },
         []
     ),
     Pid ! socket_ready,
@@ -1358,6 +1683,15 @@ ws_ctx() ->
         request_id => undefined,
         module => roadrunner_ws_echo_handler
     }.
+
+%% Minimal `proto_opts` slice the session reads in `init/1`. Defaults to
+%% the production 16 MB caps so existing small-frame tests are
+%% unaffected; cap tests call `ws_proto_opts/2` with tight values.
+ws_proto_opts() ->
+    ws_proto_opts(16777216, 16777216).
+
+ws_proto_opts(MaxFrame, MaxMsg) ->
+    #{ws_max_frame_size => MaxFrame, ws_max_message_size => MaxMsg}.
 
 %% A minimal text/binary single-fragment unmasked frame. Server-side
 %% receives masked frames per the WebSocket spec, so we mark fin=true
@@ -1481,7 +1815,7 @@ run_close_test(ClosePayload) ->
     Sink = spawn_active_sink(Self, Tag, [{recv, Frame}]),
     {ok, Pid} = gen_statem:start(
         roadrunner_ws_session,
-        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none},
+        {{fake, Sink}, roadrunner_ws_echo_handler, undefined, ws_ctx(), none, ws_proto_opts()},
         []
     ),
     Ref = monitor(process, Pid),

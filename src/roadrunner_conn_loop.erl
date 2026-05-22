@@ -547,7 +547,7 @@ read_body_phase(
 %% pipeline, run it bracketed by request_start / request_stop |
 %% request_exception telemetry. The 5 response shapes (buffered,
 %% stream, loop, sendfile, websocket) dispatch to their respective
-%% writers via `dispatch_response/4`.
+%% writers via `dispatch_response/5`.
 -spec dispatch_phase(#loop_state{}, roadrunner_req:request()) -> no_return().
 dispatch_phase(
     #loop_state{
@@ -575,7 +575,7 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     try Pipeline(Req) of
         {Response, Req2} when is_map(Req2) ->
-            _ = dispatch_response(Socket, Handler, Req2, Response),
+            _ = dispatch_response(Socket, Handler, Req2, Response, S#loop_state.proto_opts),
             ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, #{
                 status => roadrunner_conn:response_status(Response),
                 response_kind => roadrunner_conn:response_kind(Response)
@@ -609,25 +609,26 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
     roadrunner_transport:socket(),
     module(),
     roadrunner_req:request(),
-    roadrunner_handler:response()
+    roadrunner_handler:response(),
+    roadrunner_conn:proto_opts()
 ) -> ok.
-dispatch_response(Socket, _Handler, Req, {websocket, Mod, State}) when is_atom(Mod) ->
-    _ = roadrunner_ws_session:run(Socket, Req, Mod, State),
+dispatch_response(Socket, _Handler, Req, {websocket, Mod, State}, ProtoOpts) when is_atom(Mod) ->
+    ok = roadrunner_ws_session:run(Socket, Req, Mod, State, ProtoOpts),
     ok;
-dispatch_response(Socket, _Handler, _Req, {stream, Status, Headers0, Fun}) when
+dispatch_response(Socket, _Handler, _Req, {stream, Status, Headers0, Fun}, _ProtoOpts) when
     is_function(Fun, 1)
 ->
     Headers = with_date(Headers0),
     _ = roadrunner_stream_response:run(Socket, Status, Headers, Fun),
     ok;
-dispatch_response(Socket, Handler, _Req, {loop, Status, Headers0, LoopState}) when
+dispatch_response(Socket, Handler, _Req, {loop, Status, Headers0, LoopState}, _ProtoOpts) when
     is_integer(Status)
 ->
     Headers = with_date(Headers0),
     _ = roadrunner_loop_response:run(Socket, Status, Headers, Handler, LoopState),
     ok;
 dispatch_response(
-    Socket, _Handler, Req, {sendfile, Status, Headers0, {Filename, Offset, Length}}
+    Socket, _Handler, Req, {sendfile, Status, Headers0, {Filename, Offset, Length}}, _ProtoOpts
 ) when
     is_integer(Status)
 ->
@@ -665,7 +666,9 @@ dispatch_response(
 %% include a message body — match on `method := ~"HEAD"` in the
 %% function head and emit the response with an empty body. Free
 %% pattern-match dispatch (no `maps:get(method, _)` per response).
-dispatch_response(Socket, _Handler, #{method := ~"HEAD"}, {Status, Headers0, _Body}) when
+dispatch_response(
+    Socket, _Handler, #{method := ~"HEAD"}, {Status, Headers0, _Body}, _ProtoOpts
+) when
     is_integer(Status)
 ->
     Headers = with_date(Headers0),
@@ -674,7 +677,9 @@ dispatch_response(Socket, _Handler, #{method := ~"HEAD"}, {Status, Headers0, _Bo
         roadrunner_transport:send(Socket, Resp), buffered_response
     ),
     ok;
-dispatch_response(Socket, _Handler, _Req, {Status, Headers0, Body}) when is_integer(Status) ->
+dispatch_response(Socket, _Handler, _Req, {Status, Headers0, Body}, _ProtoOpts) when
+    is_integer(Status)
+->
     Headers = with_date(Headers0),
     Resp = roadrunner_http1:response(Status, Headers, Body),
     _ = roadrunner_telemetry:response_send(

@@ -45,6 +45,8 @@ All duration and interval values in `opts()` are in milliseconds —
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
 -define(DEFAULT_MAX_CLIENTS, 150).
 -define(DEFAULT_MIN_BYTES_PER_SECOND, 100).
+-define(DEFAULT_WS_MAX_FRAME_SIZE, 10485760).
+-define(DEFAULT_WS_MAX_MESSAGE_SIZE, 10485760).
 
 -doc """
 Listener configuration map.
@@ -73,6 +75,10 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `middlewares` — listener-wide pipeline applied to every request.
 - `max_content_length` — request-body cap; over-cap reads return
   `payload_too_large`. Default 10 MB.
+- `ws` — WebSocket inbound size caps as a nested map (see
+  `t:ws_opts/0`): `max_frame_size` (per-frame payload cap) and
+  `max_message_size` (reassembled + decompressed message cap). Both
+  default to 10 MB; over-cap closes the connection with code 1009.
 - `request_timeout` — header-read timeout on a fresh conn.
   Default 30 s.
 - `keep_alive_timeout` — idle timeout between requests on a
@@ -117,6 +123,7 @@ ops-tuning rationale.
         | roadrunner_router:routes(),
     middlewares => roadrunner_middleware:middleware_list(),
     max_content_length => non_neg_integer(),
+    ws => ws_opts(),
     request_timeout => non_neg_integer(),
     keep_alive_timeout => non_neg_integer(),
     num_acceptors => pos_integer(),
@@ -234,6 +241,22 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
     conn_window => 1..16#7FFFFFFF,
     stream_window => 1..16#7FFFFFFF,
     window_refill_threshold => 1..16#7FFFFFFF
+}.
+
+-doc """
+WebSocket inbound size caps (under `ws` in the listener opts).
+
+- `max_frame_size` — per-frame payload cap in bytes. An inbound
+  frame declaring more than this closes the connection with code
+  1009 before the payload is buffered. Default 10 MB.
+- `max_message_size` — cap on a reassembled message in bytes: the
+  running fragment total, and the decompressed size when
+  permessage-deflate is negotiated. Over-cap closes with 1009. Must
+  be `>= max_frame_size`. Default 10 MB.
+""".
+-type ws_opts() :: #{
+    max_frame_size => 0..16#7FFFFFFF,
+    max_message_size => 0..16#7FFFFFFF
 }.
 
 -record(state, {
@@ -531,12 +554,19 @@ build_proto_opts(Opts, ListenerName) ->
     %% contract `try_acquire_slot/1` already documents.
     ClientCounter = counters:new(1, [write_concurrency]),
     RequestsCounter = atomics:new(1, [{signed, false}]),
+    %% Public `ws` opts are a nested map; flatten to the `ws_*`
+    %% proto_opts keys the hot path reads, mirroring the `{http2, #{}}`
+    %% → `http2_*` flattening above.
+    #{max_frame_size := WsFrame, max_message_size := WsMsg} =
+        validate_ws_opts(maps:get(ws, Opts, #{})),
     Base = maps:merge(
         #{
             dispatch => build_dispatch(Opts, ListenerName),
             middlewares => maps:get(middlewares, Opts, []),
             max_content_length =>
                 maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
+            ws_max_frame_size => WsFrame,
+            ws_max_message_size => WsMsg,
             request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
             keep_alive_timeout =>
                 maps:get(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT),
@@ -692,6 +722,41 @@ flatten_http2_opts(Entries) ->
                 http2_window_refill_threshold => Threshold
             }
     end.
+
+-spec ws_defaults() ->
+    #{max_frame_size := non_neg_integer(), max_message_size := non_neg_integer()}.
+ws_defaults() ->
+    #{
+        max_frame_size => ?DEFAULT_WS_MAX_FRAME_SIZE,
+        max_message_size => ?DEFAULT_WS_MAX_MESSAGE_SIZE
+    }.
+
+%% Resolve the `ws` opts map against defaults, rejecting unknown keys
+%% and out-of-range values (mirroring `validate_http2_opts/2`). A
+%% reassembled message is built from frames, so a single unfragmented
+%% frame is also a whole message: `max_message_size` below
+%% `max_frame_size` is contradictory and rejected at startup.
+-spec validate_ws_opts(term()) ->
+    #{max_frame_size := non_neg_integer(), max_message_size := non_neg_integer()}.
+validate_ws_opts(Opts) when is_map(Opts) ->
+    Defaults = ws_defaults(),
+    Resolved = maps:fold(
+        fun(K, V, Acc) ->
+            case is_map_key(K, Defaults) of
+                false -> error({invalid_listener_opt, ws, Opts});
+                true when is_integer(V, 0, 16#7FFFFFFF) -> Acc#{K => V};
+                true -> error({invalid_listener_opt, ws, Opts})
+            end
+        end,
+        Defaults,
+        Opts
+    ),
+    #{max_frame_size := Frame, max_message_size := Msg} = Resolved,
+    Msg >= Frame orelse
+        error({listener_opt_conflict, ws, Opts, max_message_size_below_max_frame_size}),
+    Resolved;
+validate_ws_opts(Other) ->
+    error({invalid_listener_opt, ws, Other}).
 
 build_dispatch(#{routes := Module} = Opts, _ListenerName) when is_atom(Module) ->
     bake_dispatch(Module, Opts, [], no_state);
