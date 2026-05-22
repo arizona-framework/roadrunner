@@ -90,6 +90,18 @@
 %%   - **Metadata:** `listener_name`, `peer`, `request_id`, `module`,
 %%     `opcode`.
 %%
+%% - `[roadrunner, ws, frame_rejected]` — fired when the conn closes the
+%%   connection (with code 1009) because an inbound frame or
+%%   reassembled message exceeded a configured size cap. Lets operators
+%%   see oversize/flood attempts that a generic close frame doesn't
+%%   distinguish.
+%%
+%%   - **Measurements:** `system_time`, `size` (the offending byte
+%%     count: declared frame length, charged message size, or inflated
+%%     size).
+%%   - **Metadata:** `listener_name`, `peer`, `request_id`, `module`,
+%%     `reason` (`max_frame_size | max_message_size`).
+%%
 %% The `start_time` value returned by `request_start/1` must be passed
 %% back into `request_stop/3` / `request_exception/4` to compute
 %% `duration`. Subscribers can wire up via `telemetry:attach/4` in
@@ -114,7 +126,7 @@
 %% `request, exception`, `response, send_failed`,
 %% `listener, accept`, `listener, conn_close`,
 %% `request, rejected`, `listener, slots_reconciled`,
-%% `drain, acknowledged`, `ws, frame_in`) are **unstable**: their
+%% `drain, acknowledged`, `ws, frame_in`, `ws, frame_rejected`) are **unstable**: their
 %% event name, measurement keys, or metadata schema may change in
 %% any minor release. Production subscribers depending on those
 %% events should pin a roadrunner version.
@@ -134,7 +146,8 @@
     drain_acknowledged/1,
     ws_upgrade/1,
     ws_frame_in/2,
-    ws_frame_out/2
+    ws_frame_out/2,
+    ws_frame_rejected/2
 ]).
 
 -export_type([metadata/0]).
@@ -327,6 +340,16 @@ ws_frame_out(Metadata, PayloadSize) ->
     telemetry:execute(
         [roadrunner, ws, frame_out],
         #{system_time => erlang:system_time(), payload_size => PayloadSize},
+        Metadata
+    ),
+    ok.
+
+-doc "Emit `[roadrunner, ws, frame_rejected]` when an inbound size cap is exceeded.".
+-spec ws_frame_rejected(map(), non_neg_integer()) -> ok.
+ws_frame_rejected(Metadata, Size) ->
+    telemetry:execute(
+        [roadrunner, ws, frame_rejected],
+        #{system_time => erlang:system_time(), size => Size},
         Metadata
     ),
     ok.

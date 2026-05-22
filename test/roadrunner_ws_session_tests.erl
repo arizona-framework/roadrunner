@@ -1084,6 +1084,52 @@ empty_continuation_flood_over_message_cap_closes_with_1009_test() ->
     ?assertEqual(<<16#88, 2, 1009:16>>, Sent),
     Sink ! stop.
 
+size_cap_rejection_emits_frame_rejected_telemetry_test() ->
+    %% A cap rejection emits [roadrunner, ws, frame_rejected] with the
+    %% reason and offending size before the 1009 close. Here a 50-byte
+    %% frame trips a 10-byte frame cap.
+    {ok, _} = application:ensure_all_started(telemetry),
+    Self = self(),
+    HandlerId = make_ref(),
+    ok = telemetry:attach(
+        HandlerId,
+        [roadrunner, ws, frame_rejected],
+        fun(Event, M, Md, _) -> Self ! {tev, Event, M, Md} end,
+        undefined
+    ),
+    try
+        Tag = make_ref(),
+        Big = frame(binary, binary:copy(<<$x>>, 50)),
+        Sink = spawn_active_sink(Self, Tag, [{recv, Big}]),
+        {ok, Pid} = gen_statem:start(
+            roadrunner_ws_session,
+            {
+                {fake, Sink},
+                roadrunner_ws_echo_handler,
+                undefined,
+                ws_ctx(),
+                none,
+                ws_proto_opts(10, 16777216)
+            },
+            []
+        ),
+        Ref = monitor(process, Pid),
+        Pid ! socket_ready,
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 1000 -> error(no_close)
+        end,
+        receive
+            {tev, [roadrunner, ws, frame_rejected], M, Md} ->
+                ?assertEqual(max_frame_size, maps:get(reason, Md)),
+                ?assertEqual(50, maps:get(size, M))
+        after 500 -> error(no_frame_rejected_event)
+        end,
+        Sink ! stop
+    after
+        telemetry:detach(HandlerId)
+    end.
+
 permessage_deflate_inflate_bomb_closes_with_1009_test() ->
     %% A small compressed frame whose inflated payload exceeds
     %% `ws_max_message_size` must be rejected during inflate (RFC 6455

@@ -412,7 +412,7 @@ process_buffer(#data{buffer = Buf, pmd_params = Pmd} = Data, HibernateAcc) ->
                     %% The header is in hand but the body isn't buffered
                     %% yet — close now (RFC 6455 §7.4 code 1009) instead
                     %% of letting the `{more, _}` re-arm keep reading.
-                    close_with(close_message_too_big(), reset_msg(Data1));
+                    close_oversize(max_frame_size, MaybeTotalLen, Data1);
                 true ->
                     process_parsed_frame(Data1, Buf, Opts, MaybeTotalLen, HibernateAcc)
             end;
@@ -685,7 +685,7 @@ accumulate_fragment(
             %% continuation flood that never sets fin=1, including one
             %% built from empty/tiny frames (each charged the per-
             %% fragment overhead so the cap bounds real memory).
-            close_with(close_message_too_big(), reset_msg(Data));
+            close_oversize(max_message_size, NewSize, Data);
         false ->
             case fragment_validate(Op, Compressed, Data#data.utf8_pending, P, Data) of
                 {ok, NewPending} ->
@@ -721,7 +721,7 @@ accumulate_fragment(
     %% The final fragment pushes the charged message size over
     %% `max_message_size` — close with 1009. (For compressed messages
     %% this bounds the wire-level accumulated payload.)
-    close_with(close_message_too_big(), reset_msg(Data));
+    close_oversize(max_message_size, Size + max(byte_size(P), ?WS_FRAGMENT_OVERHEAD), Data);
 accumulate_fragment(
     #{fin := true, payload := P} = _Frame,
     #data{
@@ -760,9 +760,9 @@ accumulate_fragment(
                         invalid_utf8 ->
                             close_with(close_invalid_payload(), Data1)
                     end;
-                {error, message_too_big} ->
+                {error, {message_too_big, Size}} ->
                     %% Inflated payload would exceed `max_message_size`.
-                    close_with(close_message_too_big(), Reset);
+                    close_oversize(max_message_size, Size, Reset);
                 {error, _} ->
                     close_with(close_protocol_error(), Reset)
             end;
@@ -922,22 +922,23 @@ finalize_message(
 %% call, so we stop and reject the moment the output would cross the cap
 %% rather than allocating the whole bomb.
 -spec bounded_inflate(zlib:zstream(), binary(), non_neg_integer()) ->
-    {ok, binary()} | {error, message_too_big}.
+    {ok, binary()} | {error, {message_too_big, non_neg_integer()}}.
 bounded_inflate(Z, Compressed, Max) ->
     bounded_inflate(zlib:safeInflate(Z, Compressed), Z, Max, 0, []).
 
 -spec bounded_inflate(
     {continue | finished, iolist()}, zlib:zstream(), non_neg_integer(), non_neg_integer(), iolist()
-) -> {ok, binary()} | {error, message_too_big}.
+) -> {ok, binary()} | {error, {message_too_big, non_neg_integer()}}.
 bounded_inflate({continue, Output}, Z, Max, Total, Acc) ->
     NewTotal = Total + iolist_size(Output),
     case NewTotal > Max of
-        true -> {error, message_too_big};
+        true -> {error, {message_too_big, NewTotal}};
         false -> bounded_inflate(zlib:safeInflate(Z, []), Z, Max, NewTotal, [Acc, Output])
     end;
 bounded_inflate({finished, Output}, _Z, Max, Total, Acc) ->
-    case Total + iolist_size(Output) > Max of
-        true -> {error, message_too_big};
+    Final = Total + iolist_size(Output),
+    case Final > Max of
+        true -> {error, {message_too_big, Final}};
         false -> {ok, iolist_to_binary([Acc, Output])}
     end.
 
@@ -974,6 +975,16 @@ close_message_too_big() ->
 close_with(StatusBin, Data) ->
     ok = send_ws_frame(Data, close, StatusBin),
     {stop, normal, Data}.
+
+%% Close with 1009 because an inbound size cap was exceeded, emitting
+%% `[roadrunner, ws, frame_rejected]` first so operators can see the
+%% rejection (and its reason + offending size) — a plain close frame
+%% doesn't distinguish a cap rejection from a normal close.
+-spec close_oversize(max_frame_size | max_message_size, non_neg_integer(), #data{}) ->
+    {stop, normal, #data{}}.
+close_oversize(Reason, Size, #data{ctx = Ctx} = Data) ->
+    ok = roadrunner_telemetry:ws_frame_rejected(Ctx#{reason => Reason}, Size),
+    close_with(close_message_too_big(), reset_msg(Data)).
 
 %% Build the payload for the close-handshake reply. RFC 6455 §5.5.1
 %% says servers typically echo the received status code back, BUT
