@@ -107,7 +107,8 @@
     %% payload — enforced in `process_buffer/2` against the peeked
     %% header before the body is buffered. `max_message_size` bounds a
     %% reassembled message via `msg_size`, the running sum of fragment
-    %% payloads. Over either cap closes the connection with 1009.
+    %% payloads; under permessage-deflate it also caps the decompressed
+    %% size (`finalize_message/3`). Over either cap closes with 1009.
     max_frame_size :: non_neg_integer(),
     max_message_size :: non_neg_integer(),
     msg_size = 0 :: non_neg_integer(),
@@ -747,6 +748,9 @@ accumulate_fragment(
                         invalid_utf8 ->
                             close_with(close_invalid_payload(), Data1)
                     end;
+                {error, message_too_big} ->
+                    %% Inflated payload would exceed `max_message_size`.
+                    close_with(close_message_too_big(), Reset);
                 {error, _} ->
                     close_with(close_protocol_error(), Reset)
             end;
@@ -880,17 +884,49 @@ incomplete_is_provably_invalid(_) -> false.
     {ok, binary(), #data{}} | {error, term()}.
 finalize_message(Data, Iolist, false) ->
     {ok, iolist_to_binary(Iolist), Data};
-finalize_message(#data{inflate_z = Z, pmd_params = Params} = Data, Iolist, true) ->
+finalize_message(
+    #data{inflate_z = Z, pmd_params = Params, max_message_size = MaxMsg} = Data, Iolist, true
+) ->
     Compressed = iolist_to_binary([Iolist, ?PMD_TAIL]),
-    try
-        Inflated = iolist_to_binary(zlib:inflate(Z, Compressed)),
-        case maps:get(client_no_context_takeover, Params, false) of
-            true -> ok = zlib:inflateReset(Z);
-            false -> ok
-        end,
-        {ok, Inflated, Data}
+    try bounded_inflate(Z, Compressed, MaxMsg) of
+        {ok, Inflated} ->
+            case maps:get(client_no_context_takeover, Params, false) of
+                true -> ok = zlib:inflateReset(Z);
+                false -> ok
+            end,
+            {ok, Inflated, Data};
+        {error, _} = Err ->
+            %% Over the decompressed cap — the connection is about to be
+            %% closed (1009), so the inflate stream isn't reset for reuse.
+            Err
     catch
         _:Reason -> {error, Reason}
+    end.
+
+%% Inflate `Compressed` in bounded chunks, enforcing `Max` on the
+%% running decompressed total. permessage-deflate (RFC 7692) lets a
+%% small high-ratio frame expand to GiB; `zlib:inflate/2` materializes
+%% all of it at once. `zlib:safeInflate/2` yields one bounded chunk per
+%% call, so we stop and reject the moment the output would cross the cap
+%% rather than allocating the whole bomb.
+-spec bounded_inflate(zlib:zstream(), binary(), non_neg_integer()) ->
+    {ok, binary()} | {error, message_too_big}.
+bounded_inflate(Z, Compressed, Max) ->
+    bounded_inflate(zlib:safeInflate(Z, Compressed), Z, Max, 0, []).
+
+-spec bounded_inflate(
+    {continue | finished, iolist()}, zlib:zstream(), non_neg_integer(), non_neg_integer(), iolist()
+) -> {ok, binary()} | {error, message_too_big}.
+bounded_inflate({continue, Output}, Z, Max, Total, Acc) ->
+    NewTotal = Total + iolist_size(Output),
+    case NewTotal > Max of
+        true -> {error, message_too_big};
+        false -> bounded_inflate(zlib:safeInflate(Z, []), Z, Max, NewTotal, [Acc, Output])
+    end;
+bounded_inflate({finished, Output}, _Z, Max, Total, Acc) ->
+    case Total + iolist_size(Output) > Max of
+        true -> {error, message_too_big};
+        false -> {ok, iolist_to_binary([Acc, Output])}
     end.
 
 %% RFC 6455 §8.1: text-message payloads MUST be valid UTF-8. Binary

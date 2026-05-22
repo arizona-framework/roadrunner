@@ -78,8 +78,9 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `ws_max_frame_size` — per-WebSocket-frame payload cap. An inbound
   frame declaring more bytes than this closes the connection with
   code 1009 before the payload is buffered. Default 16 MB.
-- `ws_max_message_size` — cap on a reassembled WebSocket message
-  (the running sum of fragment payloads). Over-cap closes with code
+- `ws_max_message_size` — cap on a reassembled WebSocket message:
+  the running sum of fragment payloads, and (when permessage-deflate
+  is negotiated) the decompressed size. Over-cap closes with code
   1009. Default 16 MB.
 - `request_timeout` — header-read timeout on a fresh conn.
   Default 30 s.

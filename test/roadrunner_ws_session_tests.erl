@@ -1049,6 +1049,98 @@ final_fragment_over_message_cap_closes_with_1009_test() ->
     ?assertEqual(<<16#88, 2, 1009:16>>, Sent),
     Sink ! stop.
 
+permessage_deflate_inflate_bomb_closes_with_1009_test() ->
+    %% A small compressed frame whose inflated payload exceeds
+    %% `ws_max_message_size` must be rejected during inflate (RFC 6455
+    %% §7.4 code 1009), not expanded in full. 5000 bytes deflate to a
+    %% tiny frame and inflate in a single zlib chunk; the cap is 1000.
+    Self = self(),
+    Tag = make_ref(),
+    Compressed = pmd_compress(binary:copy(<<$a>>, 5000)),
+    InboundFrame = pmd_frame(binary, Compressed),
+    Sink = spawn_active_sink(Self, Tag, [{recv, InboundFrame}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            pmd_negotiated(),
+            ws_proto_opts(16777216, 1000)
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertEqual(<<16#88, 2, 1009:16>>, Sent),
+    Sink ! stop.
+
+permessage_deflate_chunked_inflate_bomb_closes_with_1009_test() ->
+    %% zlib inflates in 16 KiB chunks. A payload that decompresses to
+    %% 50000 bytes crosses the 1000-byte cap on the FIRST chunk, so the
+    %% bounded loop bails mid-stream (1009) without producing the rest.
+    Self = self(),
+    Tag = make_ref(),
+    Compressed = pmd_compress(binary:copy(<<$a>>, 50000)),
+    InboundFrame = pmd_frame(binary, Compressed),
+    Sink = spawn_active_sink(Self, Tag, [{recv, InboundFrame}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            pmd_negotiated(),
+            ws_proto_opts(16777216, 1000)
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertEqual(<<16#88, 2, 1009:16>>, Sent),
+    Sink ! stop.
+
+permessage_deflate_large_message_under_cap_inflates_test() ->
+    %% A 50000-byte message inflates across several 16 KiB zlib chunks
+    %% but stays under the default cap — the bounded loop must reassemble
+    %% all chunks and dispatch the complete payload, not reject it. The
+    %% echo handler replies with a compressed text frame (0xC1), proving
+    %% the message was accepted rather than closed (0x88).
+    Self = self(),
+    Tag = make_ref(),
+    Compressed = pmd_compress(binary:copy(<<$a>>, 50000)),
+    InboundFrame = pmd_frame(text, Compressed),
+    Sink = spawn_active_sink(Self, Tag, [{recv, InboundFrame}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            pmd_negotiated(),
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 300)),
+    ?assertMatch(<<16#c1, _/binary>>, Sent),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
 new_data_frame_mid_message_closes_with_protocol_error_test() ->
     %% A non-FIN text frame in progress, then ANOTHER text frame
     %% (instead of a continuation) — protocol error.

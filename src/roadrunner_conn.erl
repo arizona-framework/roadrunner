@@ -85,7 +85,8 @@
     %% WebSocket inbound size caps. `ws_max_frame_size` bounds a single
     %% frame's declared payload (enforced before buffering);
     %% `ws_max_message_size` bounds a reassembled message (the running
-    %% sum of fragment payloads). Both always present —
+    %% sum of fragment payloads, and the decompressed size under
+    %% permessage-deflate). Both always present —
     %% `roadrunner_listener:build_proto_opts/2` fills defaults.
     ws_max_frame_size := non_neg_integer(),
     ws_max_message_size := non_neg_integer(),
