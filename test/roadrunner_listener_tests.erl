@@ -341,21 +341,36 @@ listener_rejects_invalid_protocols_value_test() ->
 
 listener_rejects_ws_message_cap_below_frame_cap_test() ->
     %% A reassembled message is built from frames, so a single
-    %% unfragmented frame is also a whole message — `ws_max_message_size`
-    %% below `ws_max_frame_size` is contradictory and must reject at
+    %% unfragmented frame is also a whole message — `max_message_size`
+    %% below `max_frame_size` is contradictory and must reject at
     %% `init/1`.
     process_flag(trap_exit, true),
     R = roadrunner_listener:start_link(listener_test_ws_cap_conflict, #{
         port => 0,
-        ws_max_frame_size => 1048576,
-        ws_max_message_size => 1024,
+        ws => #{max_frame_size => 1048576, max_message_size => 1024},
         routes => roadrunner_hello_handler
     }),
     ?assertMatch(
-        {error, {
-            {listener_opt_conflict, ws_max_message_size, 1024, below_ws_max_frame_size}, _Stack
-        }},
+        {error, {{listener_opt_conflict, ws, _, max_message_size_below_max_frame_size}, _Stack}},
         R
+    ).
+
+listener_rejects_invalid_ws_opt_test() ->
+    %% Unknown keys, out-of-range / non-integer values, and non-map
+    %% shapes in `ws` all reject (mirrors the strict `{http2, #{...}}`
+    %% sub-opt validation), so a typo can't silently fall back to the
+    %% default cap.
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(listener_test_ws_invalid, #{
+                port => 0,
+                ws => Bad,
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, ws, _}, _Stack}}, R)
+        end,
+        [#{frame_size => 1}, #{max_frame_size => -1}, #{max_frame_size => bad}, not_a_map]
     ).
 
 slot_reconciliation_disabled_drops_reconcile_slots_message_test() ->

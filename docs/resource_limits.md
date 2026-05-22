@@ -32,20 +32,23 @@ default to the same value as `max_content_length`. Both are enforced
 before the payload reaches the handler, and crossing either closes the
 connection with RFC 6455 code 1009 (message too big).
 
-| Limit | Default | Configurable | What it bounds |
-|---|---|---|---|
-| `ws_max_frame_size` | 10 MB | yes | one frame's declared payload, checked on the frame header before the body is buffered |
-| `ws_max_message_size` | 10 MB | yes | a reassembled message: the running total across fragments, and the decompressed size when permessage-deflate is negotiated |
+These are configured under the `ws` listener option as a nested map,
+e.g. `ws => #{max_frame_size => N, max_message_size => N}`.
+
+| Limit | Default | What it bounds |
+|---|---|---|
+| `ws.max_frame_size` | 10 MB | one frame's declared payload, checked on the frame header before the body is buffered |
+| `ws.max_message_size` | 10 MB | a reassembled message: the running total across fragments, and the decompressed size when permessage-deflate is negotiated |
 
 Notes:
 
-- `ws_max_message_size` must be `>= ws_max_frame_size`; a listener
-  configured otherwise refuses to start
+- `max_message_size` must be `>= max_frame_size`; a listener configured
+  otherwise refuses to start
 - each fragment is charged at least a small fixed overhead toward
-  `ws_max_message_size`, so a flood of empty or tiny continuation frames
-  is bounded by the cap, not just the total payload bytes
+  `max_message_size`, so a flood of empty or tiny continuation frames is
+  bounded by the cap, not just the total payload bytes
 - permessage-deflate is inflated in bounded chunks against
-  `ws_max_message_size`, so a small high-ratio frame cannot expand into
+  `max_message_size`, so a small high-ratio frame cannot expand into
   gigabytes before the cap fires
 
 When a cap closes a connection, roadrunner emits
@@ -88,8 +91,7 @@ roadrunner:start_listener(my_api, #{
     port => 8080,
     routes => my_handler,
     max_content_length => 5_242_880,
-    ws_max_frame_size => 1_048_576,
-    ws_max_message_size => 8_388_608
+    ws => #{max_frame_size => 1_048_576, max_message_size => 8_388_608}
 }).
 ```
 
