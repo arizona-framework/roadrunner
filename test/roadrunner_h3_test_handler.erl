@@ -25,6 +25,10 @@ handle(#{target := ~"/slow"} = Req) ->
     %% exercising the response path's tolerance of a gone stream.
     timer:sleep(100),
     {{200, [], ~"slow"}, Req};
+handle(#{target := <<"/forbidden/", Name/binary>>} = Req) ->
+    %% Emits a connection-specific response header (named by the path),
+    %% which RFC 9114 §4.2 forbids over h3.
+    {{200, [{Name, ~"x"}], ~"x"}, Req};
 handle(#{target := ~"/crash"} = _Req) ->
     error(boom);
 handle(#{target := ~"/badheaders"} = Req) ->

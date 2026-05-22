@@ -24,8 +24,8 @@
 %% stream on the `'DOWN'` — leaving the connection's other streams
 %% untouched.
 
--export([start/6]).
--export([init/6]).
+-export([start/4]).
+-export([init/4]).
 %% Exported for `roadrunner_conn_loop_http3` to emit a buffered
 %% response (e.g. 413) directly, without spawning a worker.
 -export([send_buffered/5]).
@@ -34,18 +34,20 @@
 Spawn a monitored worker for `StreamId`. Returns `{Pid, MonitorRef}`
 so the conn loop can correlate the eventual `'DOWN'` back to the
 stream id (normal exit → stream done; abnormal → reset the stream).
+
+The conn loop has already QPACK-decoded the field block and built
+`Req` (so QPACK-decompression and malformed-message errors are raised
+at the connection / stream level, not by crashing this worker).
 """.
--spec start(pid(), non_neg_integer(), binary(), iodata(), map(), map()) ->
+-spec start(pid(), non_neg_integer(), roadrunner_req:request(), map()) ->
     {pid(), reference()}.
-start(Conn, StreamId, HeaderBlock, Body, RequestContext, ProtoOpts) ->
-    spawn_monitor(?MODULE, init, [Conn, StreamId, HeaderBlock, Body, RequestContext, ProtoOpts]).
+start(Conn, StreamId, Req, ProtoOpts) ->
+    spawn_monitor(?MODULE, init, [Conn, StreamId, Req, ProtoOpts]).
 
 -doc false.
--spec init(pid(), non_neg_integer(), binary(), iodata(), map(), map()) -> ok.
-init(Conn, StreamId, HeaderBlock, Body, RequestContext, ProtoOpts) ->
+-spec init(pid(), non_neg_integer(), roadrunner_req:request(), map()) -> ok.
+init(Conn, StreamId, Req, ProtoOpts) ->
     proc_lib:set_label({roadrunner_http3_stream_worker, StreamId}),
-    {ok, Headers} = quic_qpack:decode(HeaderBlock),
-    {ok, Req} = roadrunner_http3_request:from_headers(Headers, Body, RequestContext),
     %% Attach request-scoped logger metadata so any `?LOG_*` from
     %% middleware/handlers is auto-correlated by `request_id` — the
     %% handler runs in this worker, not on the conn loop.
@@ -75,9 +77,14 @@ run_handler(Conn, StreamId, Req, ProtoOpts) ->
 invoke(Conn, StreamId, Handler, Pipeline, Req, Metadata, ReqStart) ->
     try Pipeline(Req) of
         {Response, _Req2} ->
-            emit_handler_response(Conn, StreamId, Response),
+            %% `emit_handler_response/3` returns the status actually sent
+            %% (which differs from the handler's when we override a bad
+            %% response with 500 / 501) so telemetry reports the truth.
+            %% It runs in the `of` body, whose exceptions a `try` does
+            %% NOT catch — so it must not raise; it sends the response.
+            Status = emit_handler_response(Conn, StreamId, Response),
             ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, #{
-                status => roadrunner_conn:response_status(Response),
+                status => Status,
                 response_kind => roadrunner_conn:response_kind(Response)
             })
     catch
@@ -113,28 +120,63 @@ telemetry_metadata(#{
         listener_name => ListenerName
     }.
 
+-spec emit_handler_response(pid(), non_neg_integer(), roadrunner_handler:response()) ->
+    roadrunner_http:status().
 emit_handler_response(Conn, StreamId, {Status, Headers, Body}) when
     is_integer(Status, 100, 599)
 ->
-    send_buffered(Conn, StreamId, Status, Headers, Body);
-emit_handler_response(Conn, StreamId, {stream, Status, _, _}) when
-    is_integer(Status, 100, 599)
-->
+    case forbidden_header(Headers) of
+        {true, Name} ->
+            %% RFC 9114 §4.2: connection-specific header fields MUST NOT
+            %% be generated. A handler emitting one (e.g. a shared h1/h2
+            %% handler with `connection: close`) is a server bug, not a
+            %% received malformed message — answer 500 rather than write
+            %% a response the client rejects.
+            logger:error(#{
+                msg => "roadrunner h3 handler returned a connection-specific header",
+                header => Name
+            }),
+            send_buffered(
+                Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
+            ),
+            500;
+        false ->
+            send_buffered(Conn, StreamId, Status, Headers, Body),
+            Status
+    end;
+emit_handler_response(Conn, StreamId, {stream, _, _, _}) ->
     emit_501(Conn, StreamId);
-emit_handler_response(Conn, StreamId, {loop, Status, _, _}) when
-    is_integer(Status, 100, 599)
-->
+emit_handler_response(Conn, StreamId, {loop, _, _, _}) ->
     emit_501(Conn, StreamId);
-emit_handler_response(Conn, StreamId, {sendfile, Status, _, _}) when
-    is_integer(Status, 100, 599)
-->
+emit_handler_response(Conn, StreamId, {sendfile, _, _, _}) ->
     emit_501(Conn, StreamId);
 emit_handler_response(Conn, StreamId, {websocket, _, _}) ->
     emit_501(Conn, StreamId).
 
+%% RFC 9114 §4.2 connection-specific header set. Function-clause
+%% dispatch (mirrors `roadrunner_http3_request:check_banned/1`) keeps it
+%% branch-friendly; returns the offending name for the log.
+-spec forbidden_header(roadrunner_http:headers()) -> {true, binary()} | false.
+forbidden_header([]) ->
+    false;
+forbidden_header([{Name, _} | Rest]) ->
+    case is_forbidden_header(Name) of
+        true -> {true, Name};
+        false -> forbidden_header(Rest)
+    end.
+
+-spec is_forbidden_header(binary()) -> boolean().
+is_forbidden_header(~"connection") -> true;
+is_forbidden_header(~"keep-alive") -> true;
+is_forbidden_header(~"proxy-connection") -> true;
+is_forbidden_header(~"transfer-encoding") -> true;
+is_forbidden_header(~"upgrade") -> true;
+is_forbidden_header(_) -> false.
+
 %% Stream / loop / sendfile / websocket response shapes are phase-2 for
 %% HTTP/3; until then they answer 501 (mirroring how h2 answers 501 for
 %% the WebSocket shape).
+-spec emit_501(pid(), non_neg_integer()) -> 501.
 emit_501(Conn, StreamId) ->
     send_buffered(
         Conn,
@@ -142,7 +184,8 @@ emit_501(Conn, StreamId) ->
         501,
         [{~"content-type", ~"text/plain"}],
         ~"HTTP/3 does not yet support this response shape"
-    ).
+    ),
+    501.
 
 %% Encode the response as a HEADERS frame (QPACK-encoded `:status` +
 %% the handler's headers) followed by a single DATA frame, and write

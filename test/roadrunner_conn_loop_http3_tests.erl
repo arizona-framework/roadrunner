@@ -51,8 +51,9 @@ partial_frame_buffered_test() ->
     ?assertEqual(<<1>>, maps:get(buf, Stream)).
 
 malformed_frame_test() ->
-    %% Frame type 0x02 is an HTTP/2-reserved type — a frame error.
-    ?assertEqual(error, decode(<<2, 0>>, 1000)).
+    %% Frame type 0x02 is an HTTP/2-reserved type — a frame error
+    %% carrying its reason (mapped to an h3 code by the conn loop).
+    ?assertMatch({error, {h2_reserved_frame, 2}}, decode(<<2, 0>>, 1000)).
 
 set_header_block_first_test() ->
     Stream = roadrunner_conn_loop_http3:set_header_block(new(), ~"first"),

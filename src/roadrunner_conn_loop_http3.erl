@@ -42,9 +42,13 @@
 %% not part of any public surface.
 -export([decode_request_frames/3, set_header_block/2, new_request_stream/0]).
 
-%% RFC 9114 §8.1 error codes.
+%% RFC 9114 §8.1 / RFC 9204 §8.3 error codes.
 -define(H3_NO_ERROR, 16#0100).
 -define(H3_INTERNAL_ERROR, 16#0102).
+-define(H3_FRAME_UNEXPECTED, 16#0105).
+-define(H3_FRAME_ERROR, 16#0106).
+-define(H3_MESSAGE_ERROR, 16#010E).
+-define(H3_QPACK_DECOMPRESSION_FAILED, 16#0200).
 
 -record(h3, {
     conn :: pid(),
@@ -118,7 +122,10 @@ loop(#h3{conn = Conn} = State) ->
         {quic, Conn, {stream_opened, _StreamId}} ->
             loop(State);
         {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
-            loop(handle_stream_data(State, StreamId, Data, Fin));
+            case handle_stream_data(State, StreamId, Data, Fin) of
+                {conn_error, Code, Reason} -> close_connection(State, Code, Reason);
+                State1 -> loop(State1)
+            end;
         {quic, Conn, {stream_reset, StreamId, _ErrorCode}} ->
             loop(drop_stream(State, StreamId));
         {quic, Conn, {closed, _Reason}} ->
@@ -150,7 +157,9 @@ send_control_stream(#h3{conn = Conn} = State) ->
     ok = quic:send_data(Conn, CtrlStreamId, [Prefix, Settings], false),
     State.
 
--spec handle_stream_data(#h3{}, non_neg_integer(), binary(), boolean()) -> #h3{}.
+-type handle_result() :: #h3{} | {conn_error, non_neg_integer(), binary()}.
+
+-spec handle_stream_data(#h3{}, non_neg_integer(), binary(), boolean()) -> handle_result().
 handle_stream_data(State, StreamId, Data, Fin) ->
     case StreamId rem 4 of
         %% Client-initiated bidirectional stream — an HTTP/3 request.
@@ -160,7 +169,7 @@ handle_stream_data(State, StreamId, Data, Fin) ->
         _ -> State
     end.
 
--spec handle_request_stream(#h3{}, non_neg_integer(), binary(), boolean()) -> #h3{}.
+-spec handle_request_stream(#h3{}, non_neg_integer(), binary(), boolean()) -> handle_result().
 handle_request_stream(
     #h3{streams = Streams, max_content_length = MaxLen} = State, StreamId, Data, Fin
 ) ->
@@ -192,9 +201,18 @@ handle_request_stream(
             %% client to stop, so trailing DATA doesn't re-trigger a 413.
             _ = quic:stop_sending(State#h3.conn, StreamId, ?H3_NO_ERROR),
             drop_stream(State, StreamId);
-        error ->
-            reset_and_drop(State, StreamId)
+        {error, Reason} ->
+            %% A frame-level decode failure is a connection error per
+            %% RFC 9114 §7.1 (malformed/oversized frame) and §7.2.8
+            %% (HTTP/2-reserved frame type).
+            {conn_error, frame_error_code(Reason), ~"frame error"}
     end.
+
+%% RFC 9114 §7.2.8: HTTP/2-reserved frame types → H3_FRAME_UNEXPECTED;
+%% other malformed/oversized frames (§7.1) → H3_FRAME_ERROR.
+-spec frame_error_code(term()) -> non_neg_integer().
+frame_error_code({h2_reserved_frame, _}) -> ?H3_FRAME_UNEXPECTED;
+frame_error_code(_) -> ?H3_FRAME_ERROR.
 
 -spec new_request_stream() -> map().
 new_request_stream() ->
@@ -204,7 +222,7 @@ new_request_stream() ->
 %% them into the stream's accumulated request. The undecoded remainder
 %% is stashed back in `buf` for the next `stream_data` message.
 -spec decode_request_frames(binary(), map(), non_neg_integer()) ->
-    {ok, map()} | too_large | error.
+    {ok, map()} | too_large | {error, term()}.
 decode_request_frames(Buf, Stream, MaxLen) ->
     case quic_h3_frame:decode(Buf) of
         {ok, {headers, Block}, Rest} ->
@@ -226,8 +244,8 @@ decode_request_frames(Buf, Stream, MaxLen) ->
             decode_request_frames(Rest, Stream, MaxLen);
         {more, _} ->
             {ok, Stream#{buf := Buf}};
-        {error, _} ->
-            error
+        {error, _} = Error ->
+            Error
     end.
 
 %% Keep the first HEADERS block as the request headers; a later HEADERS
@@ -238,30 +256,53 @@ set_header_block(#{header_block := undefined} = Stream, Block) ->
 set_header_block(Stream, _Block) ->
     Stream.
 
--spec dispatch_request(#h3{}, non_neg_integer()) -> #h3{}.
+-spec dispatch_request(#h3{}, non_neg_integer()) -> handle_result().
 dispatch_request(#h3{streams = Streams} = State, StreamId) ->
     case maps:get(StreamId, Streams) of
         #{header_block := undefined} ->
-            %% Stream FIN with no HEADERS frame — malformed request.
-            reset_and_drop(State, StreamId);
+            %% Stream ended with no HEADERS frame — a malformed message
+            %% (RFC 9114 §4.1): stream error H3_MESSAGE_ERROR.
+            reset_and_drop(State, StreamId, ?H3_MESSAGE_ERROR);
         #{header_block := Block, body := Body} ->
-            {ReqId, NewBuf} = roadrunner_conn:generate_request_id(State#h3.req_id_buffer),
-            RequestContext = #{
-                peer => State#h3.peer,
-                scheme => https,
-                listener_name => State#h3.listener_name,
-                request_id => ReqId
-            },
+            %% QPACK decode happens here (not in the worker) because a
+            %% decompression failure is a CONNECTION error per RFC 9204
+            %% §2.2 — the dynamic-table state is unrecoverable — whereas
+            %% a malformed message is a per-stream error.
+            case quic_qpack:decode(Block) of
+                {error, _} ->
+                    {conn_error, ?H3_QPACK_DECOMPRESSION_FAILED, ~"QPACK decompression failed"};
+                {ok, Headers} ->
+                    dispatch_decoded(State, StreamId, Headers, Body)
+            end
+    end.
+
+-spec dispatch_decoded(#h3{}, non_neg_integer(), roadrunner_http:headers(), iodata()) ->
+    handle_result().
+dispatch_decoded(#h3{streams = Streams} = State, StreamId, Headers, Body) ->
+    {ReqId, NewBuf} = roadrunner_conn:generate_request_id(State#h3.req_id_buffer),
+    RequestContext = #{
+        peer => State#h3.peer,
+        scheme => https,
+        listener_name => State#h3.listener_name,
+        request_id => ReqId
+    },
+    State1 = State#h3{req_id_buffer = NewBuf},
+    case roadrunner_http3_request:from_headers(Headers, Body, RequestContext) of
+        {error, _} ->
+            %% Malformed request (bad/missing pseudo-headers, a
+            %% connection-specific header) — RFC 9114 §4.1.2 / §4.2:
+            %% stream error H3_MESSAGE_ERROR.
+            reset_and_drop(State1, StreamId, ?H3_MESSAGE_ERROR);
+        {ok, Req} ->
             {_WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
-                State#h3.conn, StreamId, Block, Body, RequestContext, State#h3.proto_opts
+                State1#h3.conn, StreamId, Req, State1#h3.proto_opts
             ),
             %% The worker owns the response now, tracked by its monitor
             %% ref; drop the (no-longer-needed) frame-accumulation entry
             %% so the streams map only ever holds in-progress requests.
-            State#h3{
+            State1#h3{
                 streams = maps:remove(StreamId, Streams),
-                worker_refs = (State#h3.worker_refs)#{MonRef => StreamId},
-                req_id_buffer = NewBuf
+                worker_refs = (State1#h3.worker_refs)#{MonRef => StreamId}
             }
     end.
 
@@ -276,14 +317,28 @@ handle_worker_down(#h3{worker_refs = WorkerRefs} = State, MonRef, Reason) ->
     {StreamId, WorkerRefs1} = maps:take(MonRef, WorkerRefs),
     State1 = State#h3{worker_refs = WorkerRefs1},
     case Reason of
-        normal -> drop_stream(State1, StreamId);
-        _ -> reset_and_drop(State1, StreamId)
+        normal ->
+            drop_stream(State1, StreamId);
+        _ ->
+            %% A worker that died after dispatch is a genuine internal
+            %% failure (e.g. a response-encoding crash) — H3_INTERNAL_ERROR.
+            reset_and_drop(State1, StreamId, ?H3_INTERNAL_ERROR)
     end.
 
--spec reset_and_drop(#h3{}, non_neg_integer()) -> #h3{}.
-reset_and_drop(#h3{conn = Conn} = State, StreamId) ->
-    _ = quic:reset_stream(Conn, StreamId, ?H3_INTERNAL_ERROR),
+-spec reset_and_drop(#h3{}, non_neg_integer(), non_neg_integer()) -> #h3{}.
+reset_and_drop(#h3{conn = Conn} = State, StreamId, ErrorCode) ->
+    _ = quic:reset_stream(Conn, StreamId, ErrorCode),
     drop_stream(State, StreamId).
+
+%% A connection error (RFC 9114 §8): close the QUIC connection with the
+%% h3 error code + reason, then run the normal teardown. The peer sees
+%% CONNECTION_CLOSE; the linked conn process stopping ends this loop too,
+%% but we tear down explicitly so the slot is released and telemetry
+%% fires regardless.
+-spec close_connection(#h3{}, non_neg_integer(), binary()) -> ok.
+close_connection(#h3{conn = Conn} = State, ErrorCode, Reason) ->
+    _ = quic:close(Conn, ErrorCode, Reason),
+    terminate(State).
 
 -spec drop_stream(#h3{}, non_neg_integer()) -> #h3{}.
 drop_stream(#h3{streams = Streams} = State, StreamId) ->

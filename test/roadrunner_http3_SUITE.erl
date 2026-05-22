@@ -22,6 +22,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     large_post/1,
     not_found/1,
     crash_500/1,
+    forbidden_response_header_500/1,
     unsupported_shapes_501/1,
     oversized_413/1,
     protocols_tuple_form/1,
@@ -34,7 +35,10 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     response_to_cancelled_stream/1,
     badheaders_reset/1,
     fin_without_headers/1,
+    malformed_request/1,
     malformed_frame/1,
+    oversized_frame/1,
+    qpack_decompression_failed/1,
     extra_data_after_413/1,
     stop_sending_ignored/1,
     drain/1
@@ -53,6 +57,7 @@ all() ->
         large_post,
         not_found,
         crash_500,
+        forbidden_response_header_500,
         unsupported_shapes_501,
         oversized_413,
         protocols_tuple_form,
@@ -65,7 +70,10 @@ all() ->
         response_to_cancelled_stream,
         badheaders_reset,
         fin_without_headers,
+        malformed_request,
         malformed_frame,
+        oversized_frame,
+        qpack_decompression_failed,
         extra_data_after_413,
         stop_sending_ignored,
         drain
@@ -187,6 +195,18 @@ not_found(_Config) ->
 crash_500(Config) ->
     Conn = connect(?config(port, Config)),
     ?assertMatch({500, _}, status_body(get(Conn, ~"/crash"))),
+    close(Conn).
+
+forbidden_response_header_500(Config) ->
+    %% A handler returning any connection-specific header is rejected
+    %% (RFC 9114 §4.2): the client sees 500 and the connection survives.
+    Conn = connect(?config(port, Config)),
+    lists:foreach(
+        fun(Name) ->
+            ?assertMatch({500, _}, status_body(get(Conn, <<"/forbidden/", Name/binary>>)))
+        end,
+        [~"connection", ~"keep-alive", ~"proxy-connection", ~"transfer-encoding", ~"upgrade"]
+    ),
     close(Conn).
 
 unsupported_shapes_501(Config) ->
@@ -386,13 +406,42 @@ fin_without_headers(Config) ->
     ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
     ll_close(Conn).
 
-malformed_frame(Config) ->
-    %% Frame type 0x02 is reserved for HTTP/2 — a frame error that resets
-    %% the stream. The connection survives for later requests.
+malformed_request(Config) ->
+    %% A syntactically valid HEADERS block that's missing a required
+    %% pseudo-header (`:path`) is a malformed message (RFC 9114 §4.1.2):
+    %% the stream is reset with H3_MESSAGE_ERROR, the connection lives.
     Conn = ll_connect(?config(port, Config)),
-    _ = ll_send(Conn, <<2, 0>>, true),
+    Block = quic_qpack:encode([{~":method", ~"GET"}, {~":scheme", ~"https"}]),
+    {ok, StreamId} = quic:open_stream(Conn),
+    ok = quic:send_data(Conn, StreamId, quic_h3_frame:encode_headers(Block), true),
+    timer:sleep(100),
     ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
     ll_close(Conn).
+
+malformed_frame(Config) ->
+    %% Frame type 0x02 is reserved for HTTP/2 — a connection error of
+    %% type H3_FRAME_UNEXPECTED (RFC 9114 §7.2.8): the whole connection
+    %% closes.
+    Conn = ll_connect(?config(port, Config)),
+    _ = ll_send(Conn, <<2, 0>>, true),
+    ll_await_closed(Conn).
+
+oversized_frame(Config) ->
+    %% A frame declaring a length above the max is a frame error
+    %% (RFC 9114 §7.1, H3_FRAME_ERROR) — a connection error.
+    Conn = ll_connect(?config(port, Config)),
+    Oversized = iolist_to_binary([quic_varint:encode(0), quic_varint:encode(16#FFFFFFFF)]),
+    {ok, StreamId} = quic:open_stream(Conn),
+    ok = quic:send_data(Conn, StreamId, Oversized, false),
+    ll_await_closed(Conn).
+
+qpack_decompression_failed(Config) ->
+    %% A HEADERS frame whose field block can't be QPACK-decoded is a
+    %% connection error (RFC 9204 §2.2): the connection closes.
+    Conn = ll_connect(?config(port, Config)),
+    {ok, StreamId} = quic:open_stream(Conn),
+    ok = quic:send_data(Conn, StreamId, quic_h3_frame:encode_headers(<<>>), true),
+    ll_await_closed(Conn).
 
 extra_data_after_413(_Config) ->
     %% A body over the cap is answered with 413 and the stream dropped +
@@ -560,6 +609,13 @@ ll_connect(Port) ->
 ll_close(Conn) ->
     _ = quic:close(Conn),
     ok.
+
+ll_await_closed(Conn) ->
+    receive
+        {quic, Conn, {closed, _}} -> ok
+    after 5000 ->
+        ct:fail(connection_not_closed)
+    end.
 
 ll_send(Conn, Bytes, Fin) ->
     {ok, StreamId} = quic:open_stream(Conn),
