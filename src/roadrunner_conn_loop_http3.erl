@@ -29,26 +29,49 @@
 %% accumulate HEADERS + DATA frames; on the stream FIN a per-stream
 %% `roadrunner_http3_stream_worker` is spawned to dispatch the request
 %% and write the response. Peer-initiated unidirectional streams
-%% (control / QPACK, `rem 4 =:= 2`) are ignored: with a zero QPACK
-%% table there are no encoder/decoder instructions to apply, and the
-%% peer's SETTINGS carry nothing this server depends on.
+%% (`rem 4 =:= 2`) are demultiplexed by stream type (RFC 9114 §6.2):
+%% the peer control stream is validated (exactly one, SETTINGS as its
+%% first frame, no request frames), the QPACK encoder/decoder streams
+%% are accepted and drained (zero table capacity means no instructions
+%% are expected), a client-initiated push stream is refused, and
+%% unknown stream types are ignored. A violation on any of these closes
+%% the connection with the matching RFC 9114 §8.1 error code.
 %%
 %% Streaming response shapes (`stream` / `loop` / `sendfile`) and
 %% WebSocket-over-h3 are phase-2 and answer 501 for now (in the worker).
 
 -export([start/2]).
 -export([init/2]).
-%% Exported for unit testing of the pure request-stream frame folding;
-%% not part of any public surface.
--export([decode_request_frames/3, new_request_stream/0]).
+%% Exported for unit testing of the pure request-stream frame folding
+%% and the pure peer-uni-stream state machine; not part of any public
+%% surface.
+-export([decode_request_frames/3, new_request_stream/0, uni_event/4, uni_reset/1]).
 
 %% RFC 9114 §8.1 / RFC 9204 §8.3 error codes.
 -define(H3_NO_ERROR, 16#0100).
 -define(H3_INTERNAL_ERROR, 16#0102).
+-define(H3_STREAM_CREATION_ERROR, 16#0103).
+-define(H3_CLOSED_CRITICAL_STREAM, 16#0104).
 -define(H3_FRAME_UNEXPECTED, 16#0105).
 -define(H3_FRAME_ERROR, 16#0106).
+-define(H3_SETTINGS_ERROR, 16#0109).
+-define(H3_MISSING_SETTINGS, 16#010A).
 -define(H3_MESSAGE_ERROR, 16#010E).
 -define(H3_QPACK_DECOMPRESSION_FAILED, 16#0200).
+
+%% A critical stream role can be claimed at most once per connection.
+-type critical_role() :: control | qpack_encoder | qpack_decoder.
+-type critical_set() :: #{critical_role() => true}.
+
+%% Per peer-uni-stream state: `pending` while the leading stream-type
+%% varint is still arriving, `control` once it is known to be the peer
+%% control stream (buffering frames + tracking whether SETTINGS was
+%% seen), `drain` for streams whose bytes we read and discard (QPACK
+%% encoder/decoder = `critical`, unknown types = `noncritical`).
+-type uni_state() ::
+    {pending, binary()}
+    | {control, binary(), SettingsReceived :: boolean()}
+    | {drain, critical | noncritical}.
 
 -record(h3, {
     conn :: pid(),
@@ -63,6 +86,11 @@
     streams = #{} :: #{non_neg_integer() => map()},
     %% Worker monitor ref => StreamId, for correlating `'DOWN'`.
     worker_refs = #{} :: #{reference() => non_neg_integer()},
+    %% StreamId => peer-uni-stream state (see `uni_event/4`).
+    uni = #{} :: #{non_neg_integer() => uni_state()},
+    %% Critical stream roles already claimed, so a duplicate control or
+    %% QPACK stream is rejected (RFC 9114 §6.2.1, §7.2.1).
+    critical = #{} :: critical_set(),
     max_content_length :: non_neg_integer()
 }).
 
@@ -127,7 +155,10 @@ loop(#h3{conn = Conn} = State) ->
                 State1 -> loop(State1)
             end;
         {quic, Conn, {stream_reset, StreamId, _ErrorCode}} ->
-            loop(drop_stream(State, StreamId));
+            case handle_stream_reset(State, StreamId) of
+                {conn_error, Code, Reason} -> close_connection(State, Code, Reason);
+                State1 -> loop(State1)
+            end;
         {quic, Conn, {closed, _Reason}} ->
             terminate(State);
         {'DOWN', MonRef, process, _Pid, Reason} ->
@@ -164,9 +195,11 @@ handle_stream_data(State, StreamId, Data, Fin) ->
     case StreamId rem 4 of
         %% Client-initiated bidirectional stream — an HTTP/3 request.
         0 -> handle_request_stream(State, StreamId, Data, Fin);
-        %% Client-initiated unidirectional (control / QPACK) — ignored
-        %% (see moduledoc); server-initiated ids never carry peer data.
-        _ -> State
+        %% Client-initiated unidirectional (control / QPACK / push /
+        %% unknown) — demultiplexed by stream type (RFC 9114 §6.2).
+        2 -> handle_uni_stream(State, StreamId, Data, Fin)
+        %% Server-initiated ids (1, 3) only carry data this side writes,
+        %% so inbound `stream_data` for one cannot occur.
     end.
 
 -spec handle_request_stream(#h3{}, non_neg_integer(), binary(), boolean()) -> handle_result().
@@ -220,6 +253,42 @@ handle_request_stream(
                 {conn_error, _, _} = ConnError ->
                     ConnError
             end
+    end.
+
+%% Advance a peer-initiated unidirectional stream by one chunk. The
+%% per-stream and connection-wide critical-role state lives in the `#h3`
+%% record; the decision logic is the pure `uni_event/4` (unit-tested),
+%% so this wrapper just slices the relevant state in and folds the
+%% result back.
+-spec handle_uni_stream(#h3{}, non_neg_integer(), binary(), boolean()) -> handle_result().
+handle_uni_stream(#h3{uni = Uni, critical = Critical} = State, StreamId, Data, Fin) ->
+    UniState = maps:get(StreamId, Uni, {pending, <<>>}),
+    case uni_event(UniState, Critical, Data, Fin) of
+        {conn_error, _, _} = ConnError ->
+            ConnError;
+        {drop, Critical1} ->
+            State#h3{uni = maps:remove(StreamId, Uni), critical = Critical1};
+        {UniState1, Critical1} ->
+            State#h3{uni = Uni#{StreamId => UniState1}, critical = Critical1}
+    end.
+
+%% A RESET_STREAM aborts a stream. For a critical stream (peer control /
+%% QPACK) that is a connection error of type H3_CLOSED_CRITICAL_STREAM
+%% (RFC 9114 §6.2.1, §7.2.1); for any other stream (a request stream, a
+%% not-yet-typed or unknown uni stream) it just drops the per-stream
+%% state we hold.
+-spec handle_stream_reset(#h3{}, non_neg_integer()) -> handle_result().
+handle_stream_reset(#h3{uni = Uni, streams = Streams} = State, StreamId) ->
+    case Uni of
+        #{StreamId := UniState} ->
+            case uni_reset(UniState) of
+                critical ->
+                    {conn_error, ?H3_CLOSED_CRITICAL_STREAM, ~"peer reset a critical stream"};
+                noncritical ->
+                    State#h3{uni = maps:remove(StreamId, Uni)}
+            end;
+        _ ->
+            State#h3{streams = maps:remove(StreamId, Streams)}
     end.
 
 %% RFC 9114 §7.2.8: HTTP/2-reserved frame types → H3_FRAME_UNEXPECTED;
@@ -289,6 +358,174 @@ apply_frame(_Frame, _Stream, _MaxLen) ->
     %% frame (SETTINGS / GOAWAY / MAX_PUSH_ID / CANCEL_PUSH / PUSH_PROMISE)
     %% on a request stream — RFC 9114 §4.1 / §7.2: H3_FRAME_UNEXPECTED.
     {conn_error, ?H3_FRAME_UNEXPECTED, ~"unexpected frame on request stream"}.
+
+-type uni_result() ::
+    {uni_state() | drop, critical_set()} | {conn_error, non_neg_integer(), binary()}.
+
+%% Advance one peer-initiated unidirectional stream by a chunk of bytes
+%% (RFC 9114 §6.2). `Critical` is the connection-wide set of claimed
+%% critical roles, threaded through so a duplicate control / QPACK
+%% stream is rejected. Returns the new per-stream state (or `drop` when
+%% the stream is finished and needs no further tracking) plus the
+%% updated claim set, or a connection error. Pure — the `#h3` plumbing
+%% is in `handle_uni_stream/4`.
+-spec uni_event(uni_state(), critical_set(), binary(), boolean()) -> uni_result().
+uni_event({pending, Buf}, Critical, Data, Fin) ->
+    uni_classify(<<Buf/binary, Data/binary>>, Critical, Fin);
+uni_event({control, Buf, SettingsReceived}, Critical, Data, Fin) ->
+    uni_control(<<Buf/binary, Data/binary>>, SettingsReceived, Critical, Fin);
+uni_event({drain, Criticality}, Critical, _Data, Fin) ->
+    uni_drain(Criticality, Critical, Fin).
+
+%% Read the leading stream-type varint and dispatch on it.
+-spec uni_classify(binary(), critical_set(), boolean()) -> uni_result().
+uni_classify(Buf, Critical, Fin) ->
+    case quic_h3_frame:decode_stream_type(Buf) of
+        {more, _} ->
+            uni_more(Buf, Critical, Fin);
+        {ok, control, Rest} ->
+            case claim(Critical, control) of
+                {error, dup} ->
+                    {conn_error, ?H3_STREAM_CREATION_ERROR, ~"duplicate control stream"};
+                {ok, Critical1} ->
+                    uni_control(Rest, false, Critical1, Fin)
+            end;
+        {ok, qpack_encoder, _Rest} ->
+            uni_qpack(Critical, qpack_encoder, Fin);
+        {ok, qpack_decoder, _Rest} ->
+            uni_qpack(Critical, qpack_decoder, Fin);
+        {ok, push, _Rest} ->
+            %% RFC 9114 §6.2.2 / §7.2.5: only servers open push streams.
+            {conn_error, ?H3_STREAM_CREATION_ERROR, ~"client-initiated push stream"};
+        {ok, {unknown, _Type}, _Rest} ->
+            uni_unknown(Critical, Fin)
+    end.
+
+%% The stream-type varint has not fully arrived yet. If the peer also
+%% closed the stream there is no type to enforce, so just drop it.
+-spec uni_more(binary(), critical_set(), boolean()) -> uni_result().
+uni_more(_Buf, Critical, true) ->
+    {drop, Critical};
+uni_more(Buf, Critical, false) ->
+    {{pending, Buf}, Critical}.
+
+%% RFC 9114 §6.2.3: an unknown unidirectional stream type carries no
+%% obligation; read and discard it (dropping a closed one).
+-spec uni_unknown(critical_set(), boolean()) -> uni_result().
+uni_unknown(Critical, true) ->
+    {drop, Critical};
+uni_unknown(Critical, false) ->
+    {{drain, noncritical}, Critical}.
+
+%% A QPACK encoder / decoder stream (RFC 9204 §4.2). One of each only; a
+%% peer closing it is H3_CLOSED_CRITICAL_STREAM. We advertised table
+%% capacity 0, so no instructions are expected — keep it open and drain.
+-spec uni_qpack(critical_set(), qpack_encoder | qpack_decoder, boolean()) -> uni_result().
+uni_qpack(Critical, Role, Fin) ->
+    case claim(Critical, Role) of
+        {error, dup} ->
+            {conn_error, ?H3_STREAM_CREATION_ERROR, ~"duplicate QPACK stream"};
+        {ok, Critical1} ->
+            case Fin of
+                true -> {conn_error, ?H3_CLOSED_CRITICAL_STREAM, ~"peer closed a QPACK stream"};
+                false -> {{drain, critical}, Critical1}
+            end
+    end.
+
+%% Validate buffered bytes of the peer control stream against the
+%% control-frame sequence rules, then (if not closed) keep the leftover
+%% partial frame and the running `SettingsReceived` flag.
+-spec uni_control(binary(), boolean(), critical_set(), boolean()) -> uni_result().
+uni_control(Buf, SettingsReceived, Critical, Fin) ->
+    case validate_control_frames(Buf, SettingsReceived) of
+        {conn_error, _, _} = ConnError ->
+            ConnError;
+        {ok, Leftover, SettingsReceived1} ->
+            case Fin of
+                true ->
+                    %% RFC 9114 §6.2.1: the control stream is critical and
+                    %% MUST NOT be closed.
+                    {conn_error, ?H3_CLOSED_CRITICAL_STREAM, ~"peer closed the control stream"};
+                false ->
+                    {{control, Leftover, SettingsReceived1}, Critical}
+            end
+    end.
+
+%% Bytes on a stream we only drain. A closed critical stream (QPACK) is
+%% an error; a closed non-critical stream (unknown type) is dropped.
+-spec uni_drain(critical | noncritical, critical_set(), boolean()) -> uni_result().
+uni_drain(critical, _Critical, true) ->
+    {conn_error, ?H3_CLOSED_CRITICAL_STREAM, ~"peer closed a critical stream"};
+uni_drain(noncritical, Critical, true) ->
+    {drop, Critical};
+uni_drain(Criticality, Critical, false) ->
+    {{drain, Criticality}, Critical}.
+
+%% Claim a critical stream role, rejecting a second of the same kind.
+-spec claim(critical_set(), critical_role()) -> {ok, critical_set()} | {error, dup}.
+claim(Critical, Role) when is_map_key(Role, Critical) ->
+    {error, dup};
+claim(Critical, Role) ->
+    {ok, Critical#{Role => true}}.
+
+%% Decode and validate as many complete control-stream frames as the
+%% buffer holds (RFC 9114 §7.2). SETTINGS MUST be the first frame and
+%% MUST appear only once; request frames (DATA / HEADERS / PUSH_PROMISE)
+%% are forbidden; other frames (GOAWAY / MAX_PUSH_ID / CANCEL_PUSH /
+%% reserved) are allowed. The undecoded remainder is returned to be
+%% buffered for the next chunk.
+-spec validate_control_frames(binary(), boolean()) ->
+    {ok, binary(), boolean()} | {conn_error, non_neg_integer(), binary()}.
+validate_control_frames(Buf, SettingsReceived) ->
+    case quic_h3_frame:decode(Buf) of
+        {ok, Frame, Rest} ->
+            case control_frame(Frame, SettingsReceived) of
+                {ok, SettingsReceived1} -> validate_control_frames(Rest, SettingsReceived1);
+                {conn_error, _, _} = ConnError -> ConnError
+            end;
+        {more, _} ->
+            {ok, Buf, SettingsReceived};
+        {error, {frame_error, settings, _}} ->
+            %% RFC 9114 §7.2.4 / §7.2.4.1: a forbidden HTTP/2 setting,
+            %% a duplicate identifier, or other malformed SETTINGS
+            %% content → H3_SETTINGS_ERROR.
+            {conn_error, ?H3_SETTINGS_ERROR, ~"invalid SETTINGS frame"};
+        {error, Reason} ->
+            {conn_error, frame_error_code(Reason), ~"control frame error"}
+    end.
+
+-spec control_frame(quic_h3_frame:frame(), boolean()) ->
+    {ok, boolean()} | {conn_error, non_neg_integer(), binary()}.
+control_frame({settings, _}, false) ->
+    {ok, true};
+control_frame(_Frame, false) ->
+    %% RFC 9114 §6.2.1: SETTINGS MUST be the first frame on the control
+    %% stream — anything before it is H3_MISSING_SETTINGS.
+    {conn_error, ?H3_MISSING_SETTINGS, ~"SETTINGS expected as first control frame"};
+control_frame({settings, _}, true) ->
+    %% RFC 9114 §7.2.4: SETTINGS occurs at most once.
+    {conn_error, ?H3_FRAME_UNEXPECTED, ~"duplicate SETTINGS on control stream"};
+control_frame(Frame, true) ->
+    case is_control_allowed(Frame) of
+        true -> {ok, true};
+        false -> {conn_error, ?H3_FRAME_UNEXPECTED, ~"request frame on control stream"}
+    end.
+
+%% RFC 9114 §7.2: DATA / HEADERS / PUSH_PROMISE belong on request (or
+%% push) streams, never the control stream; everything else (GOAWAY,
+%% MAX_PUSH_ID, CANCEL_PUSH, reserved/grease) is fine after SETTINGS.
+-spec is_control_allowed(quic_h3_frame:frame()) -> boolean().
+is_control_allowed({data, _}) -> false;
+is_control_allowed({headers, _}) -> false;
+is_control_allowed({push_promise, _, _}) -> false;
+is_control_allowed(_Frame) -> true.
+
+%% Whether a RESET_STREAM on a tracked uni stream is on a critical
+%% stream (so it must close the connection).
+-spec uni_reset(uni_state()) -> critical | noncritical.
+uni_reset({control, _, _}) -> critical;
+uni_reset({drain, critical}) -> critical;
+uni_reset(_UniState) -> noncritical.
 
 -spec dispatch_request(#h3{}, non_neg_integer()) -> handle_result().
 dispatch_request(#h3{streams = Streams} = State, StreamId) ->

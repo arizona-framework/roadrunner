@@ -43,6 +43,11 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     qpack_decompression_failed/1,
     extra_data_after_413/1,
     stop_sending_ignored/1,
+    peer_push_stream_closes_conn/1,
+    peer_control_stream_closed/1,
+    unknown_uni_stream_ignored/1,
+    peer_control_stream_reset/1,
+    noncritical_uni_stream_reset/1,
     drain/1
 ]).
 
@@ -80,6 +85,11 @@ all() ->
         qpack_decompression_failed,
         extra_data_after_413,
         stop_sending_ignored,
+        peer_push_stream_closes_conn,
+        peer_control_stream_closed,
+        unknown_uni_stream_ignored,
+        peer_control_stream_reset,
+        noncritical_uni_stream_reset,
         drain
     ].
 
@@ -505,6 +515,50 @@ stop_sending_ignored(Config) ->
     ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
     ll_close(Conn).
 
+peer_push_stream_closes_conn(Config) ->
+    %% RFC 9114 §6.2.2 / §7.2.5: only servers open push streams, so a
+    %% client-initiated one is a connection error
+    %% (H3_STREAM_CREATION_ERROR) — the connection closes.
+    Conn = ll_connect(?config(port, Config)),
+    _ = ll_open_uni(Conn, quic_h3_frame:encode_stream_type(push), false),
+    ll_await_closed(Conn).
+
+peer_control_stream_closed(Config) ->
+    %% RFC 9114 §6.2.1: the control stream is critical; the peer closing
+    %% it (FIN) is a connection error of type H3_CLOSED_CRITICAL_STREAM.
+    Conn = ll_connect(?config(port, Config)),
+    _ = ll_open_uni(Conn, control_with_settings(), true),
+    ll_await_closed(Conn).
+
+unknown_uni_stream_ignored(Config) ->
+    %% RFC 9114 §6.2.3: an unknown unidirectional stream type is ignored
+    %% (read and discarded); the connection keeps serving.
+    Conn = ll_connect(?config(port, Config)),
+    _ = ll_open_uni(Conn, quic_h3_frame:encode_stream_type(16#21), true),
+    timer:sleep(50),
+    ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
+    ll_close(Conn).
+
+peer_control_stream_reset(Config) ->
+    %% RESET_STREAM on the control stream aborts a critical stream →
+    %% H3_CLOSED_CRITICAL_STREAM connection error.
+    Conn = ll_connect(?config(port, Config)),
+    StreamId = ll_open_uni(Conn, control_with_settings(), false),
+    timer:sleep(50),
+    _ = quic:reset_stream(Conn, StreamId, 0),
+    ll_await_closed(Conn).
+
+noncritical_uni_stream_reset(Config) ->
+    %% RESET_STREAM on a non-critical uni stream just drops its state;
+    %% the connection keeps serving.
+    Conn = ll_connect(?config(port, Config)),
+    StreamId = ll_open_uni(Conn, quic_h3_frame:encode_stream_type(16#21), false),
+    timer:sleep(50),
+    _ = quic:reset_stream(Conn, StreamId, 0),
+    timer:sleep(50),
+    ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
+    ll_close(Conn).
+
 drain(Config) ->
     Name = ?config(listener, Config),
     Conn = connect(?config(port, Config)),
@@ -651,6 +705,21 @@ ll_send(Conn, Bytes, Fin) ->
     {ok, StreamId} = quic:open_stream(Conn),
     ok = quic:send_data(Conn, StreamId, Bytes, Fin),
     StreamId.
+
+%% Open a client-initiated unidirectional stream and write `Bytes` (the
+%% stream-type prefix + any frames) onto it.
+ll_open_uni(Conn, Bytes, Fin) ->
+    {ok, StreamId} = quic:open_unidirectional_stream(Conn),
+    ok = quic:send_data(Conn, StreamId, Bytes, Fin),
+    StreamId.
+
+%% A valid control stream payload: the control stream-type prefix
+%% followed by a SETTINGS frame.
+control_with_settings() ->
+    <<
+        (quic_h3_frame:encode_stream_type(control))/binary,
+        (quic_h3_frame:encode_settings(#{qpack_max_table_capacity => 0}))/binary
+    >>.
 
 ll_get(Conn, Path) ->
     Frame = quic_h3_frame:encode_headers(quic_qpack:encode(headers(~"GET", Path))),
