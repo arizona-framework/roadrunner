@@ -114,50 +114,55 @@
 -doc """
 Spawn the connection-owner loop for a freshly accepted QUIC
 connection. Called from the QUIC listener's `connection_handler` (in
-the listener's process), so it just spawns and returns the pid — the
-QUIC listener then transfers connection ownership to it. Unlinked so a
-connection crash never reaches the listener.
+the listener's process) before ownership is transferred, so the
+`max_clients` slot is acquired here, synchronously: on refusal the
+connection is closed and `{error, max_clients}` is returned, and the
+QUIC listener never transfers ownership to (or `set_owner_sync`s) a
+connection we will not serve. On success the loop is spawned unlinked,
+so a connection crash never reaches the listener, and it releases the
+slot in `terminate/1`.
 """.
--spec start(pid(), roadrunner_conn:proto_opts()) -> {ok, pid()}.
+-spec start(pid(), roadrunner_conn:proto_opts()) -> {ok, pid()} | {error, max_clients}.
 start(ConnPid, ProtoOpts) ->
-    {ok, proc_lib:spawn(?MODULE, init, [ConnPid, ProtoOpts])}.
+    case roadrunner_conn:try_acquire_slot(ProtoOpts) of
+        false ->
+            %% Over `max_clients` — refuse before ownership transfer.
+            %% `try_acquire_slot/1` already rolled the counter back.
+            _ = quic:close(ConnPid, ?H3_NO_ERROR),
+            {error, max_clients};
+        true ->
+            {ok, proc_lib:spawn(?MODULE, init, [ConnPid, ProtoOpts])}
+    end.
 
 -doc false.
 -spec init(pid(), roadrunner_conn:proto_opts()) -> ok.
 init(Conn, ProtoOpts) ->
     ListenerName = maps:get(listener_name, ProtoOpts),
     proc_lib:set_label({roadrunner_conn_loop_http3, ListenerName, Conn}),
-    case roadrunner_conn:try_acquire_slot(ProtoOpts) of
-        false ->
-            %% Over `max_clients` — refuse by closing the connection.
-            %% `try_acquire_slot/1` already rolled the counter back.
-            _ = quic:close(Conn),
-            ok;
-        true ->
-            DrainGroup = maps:get(graceful_drain, ProtoOpts, true),
-            ok = roadrunner_conn:join_drain_group(ListenerName, DrainGroup),
-            %% Share fate with the QUIC connection process: if it dies
-            %% abnormally (without a `closed` event) the loop dies too,
-            %% rather than hanging. The slot then leaks until slot
-            %% reconciliation reaps it, the same bound h1/h2 carry for a
-            %% `kill`-ed conn. The graceful path releases it in
-            %% `terminate/1` on the `closed` event.
-            true = link(Conn),
-            %% `remote_addr` is set at connection creation, so peername
-            %% is available from the start (idle / handshaking states).
-            {ok, Peer} = quic:peername(Conn),
-            StartMono = roadrunner_telemetry:listener_accept(#{
-                listener_name => ListenerName, peer => Peer
-            }),
-            loop(#h3{
-                conn = Conn,
-                proto_opts = ProtoOpts,
-                listener_name = ListenerName,
-                peer = Peer,
-                start_mono = StartMono,
-                max_content_length = maps:get(max_content_length, ProtoOpts)
-            })
-    end.
+    %% The `max_clients` slot was acquired by `start/2` (in the listener
+    %% process); it is released in `terminate/1`.
+    DrainGroup = maps:get(graceful_drain, ProtoOpts, true),
+    ok = roadrunner_conn:join_drain_group(ListenerName, DrainGroup),
+    %% Share fate with the QUIC connection process: if it dies abnormally
+    %% (without a `closed` event) the loop dies too, rather than hanging.
+    %% The slot then leaks until slot reconciliation reaps it, the same
+    %% bound h1/h2 carry for a `kill`-ed conn. The graceful path releases
+    %% it in `terminate/1` on the `closed` event.
+    true = link(Conn),
+    %% `remote_addr` is set at connection creation, so peername is
+    %% available from the start (idle / handshaking states).
+    {ok, Peer} = quic:peername(Conn),
+    StartMono = roadrunner_telemetry:listener_accept(#{
+        listener_name => ListenerName, peer => Peer
+    }),
+    loop(#h3{
+        conn = Conn,
+        proto_opts = ProtoOpts,
+        listener_name = ListenerName,
+        peer = Peer,
+        start_mono = StartMono,
+        max_content_length = maps:get(max_content_length, ProtoOpts)
+    }).
 
 -spec loop(#h3{}) -> ok.
 loop(State) ->

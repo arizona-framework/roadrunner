@@ -47,6 +47,11 @@ All duration and interval values in `opts()` are in milliseconds —
 -define(DEFAULT_MIN_BYTES_PER_SECOND, 100).
 -define(DEFAULT_WS_MAX_FRAME_SIZE, 10485760).
 -define(DEFAULT_WS_MAX_MESSAGE_SIZE, 10485760).
+%% Per-connection concurrent client-initiated request (bidirectional)
+%% stream cap advertised to HTTP/3 peers. Set explicitly so the bound
+%% (and the memory it implies: streams × `max_content_length`) is
+%% roadrunner's, not whatever default the QUIC transport happens to use.
+-define(H3_MAX_STREAMS_BIDI, 100).
 
 -doc """
 Listener configuration map.
@@ -495,6 +500,7 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
                     cert => Cert,
                     key => Key,
                     alpn => [~"h3"],
+                    max_streams_bidi => ?H3_MAX_STREAMS_BIDI,
                     connection_handler => Handler
                 })
             of
