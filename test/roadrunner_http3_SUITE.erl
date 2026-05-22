@@ -27,6 +27,8 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     oversized_413/1,
     protocols_tuple_form/1,
     certfile_keyfile/1,
+    certs_keys_form/1,
+    cert_chain/1,
     quic_start_failure_releases_tcp/1,
     co_listen/1,
     rejects_http3_without_tls/1,
@@ -70,6 +72,8 @@ all() ->
         oversized_413,
         protocols_tuple_form,
         certfile_keyfile,
+        certs_keys_form,
+        cert_chain,
         quic_start_failure_releases_tcp,
         co_listen,
         rejects_http3_without_tls,
@@ -136,6 +140,8 @@ init_per_testcase(Case, Config) when
     Case =:= oversized_413;
     Case =:= protocols_tuple_form;
     Case =:= certfile_keyfile;
+    Case =:= certs_keys_form;
+    Case =:= cert_chain;
     Case =:= quic_start_failure_releases_tcp;
     Case =:= co_listen;
     Case =:= rejects_http3_without_tls;
@@ -287,6 +293,61 @@ certfile_keyfile(Config) ->
         port => 0,
         protocols => [http3],
         tls => [{certfile, CertFile}, {keyfile, KeyFile}],
+        routes => roadrunner_h3_test_handler
+    }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/")))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+certs_keys_form(_Config) ->
+    %% OTP's modern `certs_keys` form (a list of cert/key config maps)
+    %% works for h3, the same as on the TCP listener.
+    Server = roadrunner_test_certs:server_opts(),
+    {cert, CertDer} = lists:keyfind(cert, 1, Server),
+    {key, Key} = lists:keyfind(key, 1, Server),
+    Name = listener_name(certs_keys_form),
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        protocols => [http3],
+        tls => [{certs_keys, [#{cert => CertDer, key => Key}]}],
+        routes => roadrunner_h3_test_handler
+    }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/")))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+cert_chain(Config) ->
+    %% A `certfile` bundling the leaf cert and an intermediate (a
+    %% Let's Encrypt style `fullchain.pem`) is split into the leaf and
+    %% its chain; the listener starts and serves with the chain set.
+    Server = roadrunner_test_certs:server_opts(),
+    {cert, LeafDer} = lists:keyfind(cert, 1, Server),
+    {key, {KeyType, KeyDer}} = lists:keyfind(key, 1, Server),
+    {cacerts, [CaDer | _]} = lists:keyfind(cacerts, 1, Server),
+    Dir = ?config(priv_dir, Config),
+    FullChain = filename:join(Dir, "h3_fullchain.pem"),
+    KeyFile = filename:join(Dir, "h3_chain_key.pem"),
+    ok = file:write_file(
+        FullChain,
+        public_key:pem_encode([
+            {'Certificate', LeafDer, not_encrypted},
+            {'Certificate', CaDer, not_encrypted}
+        ])
+    ),
+    ok = file:write_file(KeyFile, public_key:pem_encode([{KeyType, KeyDer, not_encrypted}])),
+    Name = listener_name(cert_chain),
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        protocols => [http3],
+        tls => [{certfile, FullChain}, {keyfile, KeyFile}],
         routes => roadrunner_h3_test_handler
     }),
     Conn = connect(roadrunner_listener:port(Name)),

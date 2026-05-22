@@ -488,7 +488,7 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
         true ->
             {ok, _Started} = application:ensure_all_started(quic),
             #{tls := UserTlsOpts} = Opts,
-            {Cert, Key} = quic_cert_key(UserTlsOpts),
+            {Cert, CertChain, Key} = quic_cert_key(UserTlsOpts),
             Handler = fun(ConnPid) -> roadrunner_conn_loop_http3:start(ConnPid, ProtoOpts) end,
             %% Start unlinked, then link on success: an `init`-time bind
             %% failure returns `{error, _}` cleanly (so `init/1` can close
@@ -499,6 +499,7 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
                 quic_listener:start(Port, #{
                     cert => Cert,
                     key => Key,
+                    cert_chain => CertChain,
                     alpn => [~"h3"],
                     max_streams_bidi => ?H3_MAX_STREAMS_BIDI,
                     connection_handler => Handler
@@ -527,38 +528,63 @@ close_tcp(none) -> ok;
 close_tcp(closed) -> ok;
 close_tcp(LSocket) -> roadrunner_transport:close(LSocket).
 
-%% Extract a DER cert + decoded private key from the user's `tls` opts
-%% for the QUIC listener, which takes `cert => DER` and `key =>
-%% DecodedKey` rather than OTP `ssl`'s opt forms. Supports the inline
-%% DER forms `ssl` and the test PKI produce (`{cert, DER}` / `{key,
-%% {Algo, DER}}`) and `certfile` / `keyfile` PEM paths.
--spec quic_cert_key([ssl:tls_server_option()]) -> {binary(), public_key:private_key()}.
+%% Extract the leaf cert, its intermediate chain, and the decoded
+%% private key from the user's `tls` opts for the QUIC listener, which
+%% takes `cert => LeafDER`, `cert_chain => [IntermediateDER]`, and
+%% `key => DecodedKey` rather than OTP `ssl`'s opt forms. Supports the
+%% inline DER forms `ssl` and the test PKI produce (`{cert, DER}` /
+%% `{key, {Algo, DER}}`), `certfile` / `keyfile` PEM paths (a `certfile`
+%% may bundle the chain, e.g. a Let's Encrypt `fullchain.pem`), and
+%% OTP's modern `{certs_keys, [...]}` form — so a TLS config that works
+%% on the TCP listener also works on h3.
+-spec quic_cert_key([ssl:tls_server_option()]) ->
+    {binary(), [binary()], public_key:private_key()}.
 quic_cert_key(TlsOpts) ->
-    {quic_cert(TlsOpts), quic_key(TlsOpts)}.
+    Source = certs_keys_source(TlsOpts),
+    [Leaf | Chain] = cert_chain(Source),
+    {Leaf, Chain, quic_key(Source)}.
 
--spec quic_cert([ssl:tls_server_option()]) -> binary().
-quic_cert(TlsOpts) ->
-    case lists:keyfind(cert, 1, TlsOpts) of
-        {cert, Der} when is_binary(Der) ->
-            Der;
-        false ->
-            {certfile, File} = lists:keyfind(certfile, 1, TlsOpts),
-            {_Type, Der} = first_pem_entry(File),
-            Der
+%% A `certs_keys` entry (OTP's multi-config form) bundles cert + key in
+%% one map; unwrap the first entry to a proplist so the same extraction
+%% handles it. Plain `tls` opts are already in that shape.
+-spec certs_keys_source([ssl:tls_server_option()]) -> [tuple()].
+certs_keys_source(TlsOpts) ->
+    case lists:keyfind(certs_keys, 1, TlsOpts) of
+        {certs_keys, [Conf | _]} -> maps:to_list(Conf);
+        false -> TlsOpts
     end.
 
--spec quic_key([ssl:tls_server_option()]) -> public_key:private_key().
-quic_key(TlsOpts) ->
-    case lists:keyfind(key, 1, TlsOpts) of
+%% The server certificate as `[Leaf | Intermediates]` (DER). Inline
+%% `cert` is the single leaf; a `certfile` PEM may carry the leaf
+%% followed by its intermediate chain.
+-spec cert_chain([tuple()]) -> [binary()].
+cert_chain(Source) ->
+    case lists:keyfind(cert, 1, Source) of
+        {cert, Der} when is_binary(Der) ->
+            [Der];
+        false ->
+            {certfile, File} = lists:keyfind(certfile, 1, Source),
+            cert_entries(File)
+    end.
+
+%% Every `Certificate` DER in a PEM file, in file order (leaf first).
+-spec cert_entries(file:name_all()) -> [binary()].
+cert_entries(File) ->
+    {ok, Pem} = file:read_file(File),
+    [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(Pem)].
+
+-spec quic_key([tuple()]) -> public_key:private_key().
+quic_key(Source) ->
+    case lists:keyfind(key, 1, Source) of
         {key, {Algo, Der}} when is_atom(Algo), is_binary(Der) ->
             public_key:der_decode(Algo, Der);
         false ->
-            {keyfile, File} = lists:keyfind(keyfile, 1, TlsOpts),
+            {keyfile, File} = lists:keyfind(keyfile, 1, Source),
             {Algo, Der} = first_pem_entry(File),
             public_key:der_decode(Algo, Der)
     end.
 
-%% First PEM entry of a cert/key file as `{Asn1Type, DER}`.
+%% First PEM entry of a key file as `{Asn1Type, DER}`.
 -spec first_pem_entry(file:name_all()) -> {atom(), binary()}.
 first_pem_entry(File) ->
     {ok, Pem} = file:read_file(File),
