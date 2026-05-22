@@ -37,6 +37,13 @@
 %% unknown stream types are ignored. A violation on any of these closes
 %% the connection with the matching RFC 9114 §8.1 error code.
 %%
+%% On a graceful drain (a `{roadrunner_drain, _}` message from the
+%% listener) it sends a GOAWAY on its control stream (RFC 9114 §5.2),
+%% refuses request streams opened at or beyond the GOAWAY id with
+%% H3_REQUEST_REJECTED, lets in-flight requests finish, and then closes
+%% the connection; the listener force-exits it at the deadline if a
+%% request is still running.
+%%
 %% Streaming response shapes (`stream` / `loop` / `sendfile`) and
 %% WebSocket-over-h3 are phase-2 and answer 501 for now (in the worker).
 
@@ -56,6 +63,7 @@
 -define(H3_FRAME_ERROR, 16#0106).
 -define(H3_SETTINGS_ERROR, 16#0109).
 -define(H3_MISSING_SETTINGS, 16#010A).
+-define(H3_REQUEST_REJECTED, 16#010B).
 -define(H3_MESSAGE_ERROR, 16#010E).
 -define(H3_QPACK_DECOMPRESSION_FAILED, 16#0200).
 
@@ -91,6 +99,15 @@
     %% Critical stream roles already claimed, so a duplicate control or
     %% QPACK stream is rejected (RFC 9114 §6.2.1, §7.2.1).
     critical = #{} :: critical_set(),
+    %% Our control stream id, set on `connected` — GOAWAY is sent on it.
+    control_stream_id = undefined :: non_neg_integer() | undefined,
+    %% Highest client-initiated request stream id accepted, so a drain
+    %% GOAWAY can name the first request we will not process.
+    last_request_id = 0 :: non_neg_integer(),
+    %% Set once a graceful drain starts (RFC 9114 §5.2): the GOAWAY id we
+    %% sent. While set, the connection is draining and request streams at
+    %% or beyond it are refused. `undefined` means not draining.
+    goaway_id = undefined :: non_neg_integer() | undefined,
     max_content_length :: non_neg_integer()
 }).
 
@@ -143,7 +160,18 @@ init(Conn, ProtoOpts) ->
     end.
 
 -spec loop(#h3{}) -> ok.
-loop(#h3{conn = Conn} = State) ->
+loop(State) ->
+    case is_drained(State) of
+        true ->
+            %% Graceful drain complete (RFC 9114 §5.2): GOAWAY was sent
+            %% and no request remains in flight — close cleanly.
+            close_connection(State, ?H3_NO_ERROR, ~"graceful shutdown");
+        false ->
+            recv_loop(State)
+    end.
+
+-spec recv_loop(#h3{}) -> ok.
+recv_loop(#h3{conn = Conn} = State) ->
     receive
         {quic, Conn, {connected, _Info}} ->
             loop(send_control_stream(State));
@@ -164,10 +192,11 @@ loop(#h3{conn = Conn} = State) ->
         {'DOWN', MonRef, process, _Pid, Reason} ->
             loop(handle_worker_down(State, MonRef, Reason));
         {roadrunner_drain, _Deadline} ->
-            %% Phase 1: buffered requests are short-lived, so keep
-            %% serving. The listener force-exits us at the deadline if
-            %% the connection is still up.
-            loop(State);
+            %% Begin a graceful drain: send GOAWAY, refuse new requests,
+            %% let in-flight ones finish (the `loop/1` head closes the
+            %% connection once they do). The listener force-exits us at
+            %% the deadline if a request is still running then.
+            loop(start_drain(State));
         _Other ->
             loop(State)
     end.
@@ -186,6 +215,38 @@ send_control_stream(#h3{conn = Conn} = State) ->
         qpack_blocked_streams => 0
     }),
     ok = quic:send_data(Conn, CtrlStreamId, [Prefix, Settings], false),
+    State#h3{control_stream_id = CtrlStreamId}.
+
+%% Begin a graceful drain (RFC 9114 §5.2): send a GOAWAY on the control
+%% stream naming the first request-stream id we will not process
+%% (`last_request_id + 4`, the next client-initiated bidirectional id),
+%% and mark the connection draining so later request streams are
+%% refused. Re-sending the same id on a repeated drain is harmless and
+%% RFC-compliant (the id never increases — refused streams are not
+%% counted). The control stream always exists here: `connected` (which
+%% opens it) is delivered before any request, and a drain only follows
+%% an established connection.
+-spec start_drain(#h3{}) -> #h3{}.
+start_drain(#h3{conn = Conn, control_stream_id = CtrlId, last_request_id = LastId} = State) when
+    is_integer(CtrlId)
+->
+    GoawayId = LastId + 4,
+    _ = quic:send_data(Conn, CtrlId, quic_h3_frame:encode_goaway(GoawayId), false),
+    State#h3{goaway_id = GoawayId}.
+
+%% A draining connection is done once no request is in flight — neither
+%% mid-receive (`streams`) nor awaiting a worker response (`worker_refs`).
+-spec is_drained(#h3{}) -> boolean().
+is_drained(#h3{goaway_id = undefined}) ->
+    false;
+is_drained(#h3{streams = Streams, worker_refs = WorkerRefs}) ->
+    map_size(Streams) =:= 0 andalso map_size(WorkerRefs) =:= 0.
+
+%% Track the highest request stream id accepted, for the drain GOAWAY id.
+-spec note_request_id(#h3{}, non_neg_integer()) -> #h3{}.
+note_request_id(#h3{last_request_id = Last} = State, StreamId) when StreamId > Last ->
+    State#h3{last_request_id = StreamId};
+note_request_id(State, _StreamId) ->
     State.
 
 -type handle_result() :: #h3{} | {conn_error, non_neg_integer(), binary()}.
@@ -203,9 +264,14 @@ handle_stream_data(State, StreamId, Data, Fin) ->
     end.
 
 -spec handle_request_stream(#h3{}, non_neg_integer(), binary(), boolean()) -> handle_result().
-handle_request_stream(
-    #h3{streams = Streams, max_content_length = MaxLen} = State, StreamId, Data, Fin
-) ->
+handle_request_stream(#h3{goaway_id = GoawayId} = State, StreamId, _Data, _Fin) when
+    is_integer(GoawayId), StreamId >= GoawayId
+->
+    %% RFC 9114 §5.2: a request stream opened at or beyond the GOAWAY id
+    %% will not be processed — reject it with H3_REQUEST_REJECTED.
+    reset_and_drop(State, StreamId, ?H3_REQUEST_REJECTED);
+handle_request_stream(State0, StreamId, Data, Fin) ->
+    #h3{streams = Streams, max_content_length = MaxLen} = State = note_request_id(State0, StreamId),
     Stream0 = maps:get(StreamId, Streams, new_request_stream()),
     case maps:get(frame_state, Stream0) of
         discarding ->

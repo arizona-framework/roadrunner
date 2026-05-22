@@ -48,7 +48,8 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     unknown_uni_stream_ignored/1,
     peer_control_stream_reset/1,
     noncritical_uni_stream_reset/1,
-    drain/1
+    drain/1,
+    refuse_request_during_drain/1
 ]).
 
 suite() ->
@@ -90,7 +91,8 @@ all() ->
         unknown_uni_stream_ignored,
         peer_control_stream_reset,
         noncritical_uni_stream_reset,
-        drain
+        drain,
+        refuse_request_during_drain
     ].
 
 init_per_suite(Config) ->
@@ -563,14 +565,38 @@ drain(Config) ->
     Name = ?config(listener, Config),
     Conn = connect(?config(port, Config)),
     ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
-    %% The h3 conn loop joined the listener's drain group, so drain
-    %% notifies it (the conn-loop drain branch) before the deadline.
+    %% The h3 conn loop joined the listener's drain group.
     ?assertMatch([_ | _], pg:get_members({roadrunner_drain, Name})),
-    %% Conn stays open, so drain notifies it and then times out forcing
-    %% the deadline — exercises the h3 conn loop's drain branch and the
-    %% listener stopping the QUIC listener.
-    ?assertMatch({timeout, _}, roadrunner_listener:drain(Name, 300)),
+    %% With no request in flight, draining sends a GOAWAY and closes the
+    %% idle connection cleanly, so the listener drains before the
+    %% deadline (exercises the conn-loop drain branch + clean close).
+    ?assertEqual({ok, drained}, roadrunner_listener:drain(Name, 2000)),
     close(Conn).
+
+refuse_request_during_drain(Config) ->
+    %% RFC 9114 §5.2: after GOAWAY, a request stream opened at or beyond
+    %% the GOAWAY id is rejected with H3_REQUEST_REJECTED, while an
+    %% in-flight request still completes.
+    Name = ?config(listener, Config),
+    Conn = ll_connect(?config(port, Config)),
+    %% A slow request keeps a worker in flight across the drain.
+    SlowFrame = quic_h3_frame:encode_headers(quic_qpack:encode(headers(~"GET", ~"/slow"))),
+    {ok, SlowId} = quic:open_stream(Conn),
+    ok = quic:send_data(Conn, SlowId, SlowFrame, true),
+    timer:sleep(20),
+    %% Drive the conn loop's drain directly — the same message the
+    %% listener broadcasts (its synchronous `drain/2` would block here).
+    [LoopPid] = pg:get_members({roadrunner_drain, Name}),
+    LoopPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5000},
+    timer:sleep(20),
+    %% A request opened after the GOAWAY is rejected.
+    NewFrame = quic_h3_frame:encode_headers(quic_qpack:encode(headers(~"GET", ~"/"))),
+    {ok, NewId} = quic:open_stream(Conn),
+    ok = quic:send_data(Conn, NewId, NewFrame, true),
+    ?assertEqual(16#10b, ll_await_reset(Conn, NewId)),
+    %% The in-flight slow request still completes.
+    ?assertEqual({200, ~"slow"}, ll_collect(Conn, SlowId, <<>>)),
+    ll_close(Conn).
 
 %% --- listener helpers ---
 
@@ -699,6 +725,14 @@ ll_await_closed(Conn) ->
         {quic, Conn, {closed, _}} -> ok
     after 5000 ->
         ct:fail(connection_not_closed)
+    end.
+
+%% Wait for the server to reset `StreamId`, returning the error code.
+ll_await_reset(Conn, StreamId) ->
+    receive
+        {quic, Conn, {stream_reset, StreamId, ErrorCode}} -> ErrorCode
+    after 5000 ->
+        ct:fail(no_stream_reset)
     end.
 
 ll_send(Conn, Bytes, Fin) ->
