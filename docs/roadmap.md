@@ -40,35 +40,42 @@ Autobahn re-run.
 
 **Source:** Arizona handoff R-h2-1.
 
-## HTTP/3 — placeholder
+## HTTP/3
 
-**What:** RFC 9114 (HTTP semantics over QUIC) listener path.
+**Phase 1 shipped:** a roadrunner-owned HTTP/3 listener over QUIC
+(RFC 9114). Enable it with `protocols => [http3]` (requires `tls`,
+since QUIC mandates TLS 1.3); it co-listens with `http1` / `http2` on
+the same port number (TCP for h1/h2, UDP for h3). roadrunner owns the
+listener and the connection loop (`roadrunner_conn_loop_http3`),
+applying its own rules (slot tracking, drain group, telemetry,
+dispatch, response shapes, per-stream crash isolation). It leans on
+the pure-Erlang [`quic`](https://github.com/benoitc/erlang_quic)
+dependency only as a transport + codec helper layer (`quic` /
+`quic_listener` for the QUIC transport, `quic_h3_frame` / `quic_qpack`
+for h3 framing and QPACK), not its turnkey `quic_h3` server, mirroring
+how roadrunner owns its own HTTP/1.1 and HTTP/2 stacks. `quic` is
+started on demand, so HTTP/1.1/HTTP/2-only deployments never boot it.
 
-**Why deferred:** OTP doesn't ship a QUIC stack, and the
-production options are imperfect:
+The buffered response shape (`{Status, Headers, Body}`) works for
+GET/POST; QPACK runs static-table only
+(`qpack_max_table_capacity = 0`). `quic` is a young (1.x) dependency,
+so treat HTTP/3 as experimental for now.
 
-- [`quicer`](https://github.com/emqx/quicer) — NIF over Microsoft's
-  `msquic`. Mature, fast. Trade-off: a C dep + NIF means it breaks
-  the "pure-Erlang" property roadrunner currently markets.
-- [`erlang_quic`](https://github.com/benoitc/erlang_quic) — Benoît
-  Chesneau's **pure-Erlang** RFC 9000/9001 + RFC 9114 implementation,
-  Apache-2.0 (declared in the project README). Already has a full h3
-  server with QPACK (RFC 9204), HTTP datagrams (RFC 9297), Extended
-  CONNECT (RFC 9220 / WebTransport), server push, RFC 9218
-  priorities. Min OTP 26. Zero runtime deps. Tagged through v1.3.0.
-  Looks like the right architectural fit. Worth filing an upstream
-  PR adding a `LICENSE` file at repo root so dep tooling and
-  GitHub's license API pick it up automatically; the README
-  declaration is unambiguous but unconventional.
+**Follow-ups:**
 
-`--protocols h3` in `scripts/bench.escript` is currently a stub;
-ALPN advertisement does not include `h3`.
-
-**Scope:** medium-large. Wiring is mostly: ALPN advertise `h3`,
-route h3 traffic to a new `roadrunner_conn_loop_http3` that adapts
-`erlang_quic`'s stream events to our handler / middleware /
-telemetry surface. Most of the protocol-heavy work is already done
-by the dep.
+- Streaming response shapes over h3 (`stream` / `loop` / `sendfile`),
+  which answer `501` today
+- Auto `Alt-Svc: h3=":<port>"` on TCP (h1/h2) responses when a listener
+  co-serves h3, so browsers upgrade from TCP to QUIC
+- Graceful drain for h3 (per-stream wind-down + GOAWAY); today h3 conns
+  join the drain group and are force-closed at the deadline like h1/h2
+- h3 manual-mode body reading (parity with the deferred h2 item)
+- QPACK dynamic table (non-zero capacity)
+- Bench client h3 wiring (`quic_h3:connect`, currently a stub in
+  `scripts/bench.escript` / `test/roadrunner_bench_client.erl`) plus
+  the HttpArena `baseline-h3` / `static-h3` profiles
+- WebTransport / Extended CONNECT (RFC 9220) and HTTP datagrams
+  (RFC 9297), both already provided by the dep
 
 ## HttpArena coverage gaps
 

@@ -114,7 +114,7 @@
     %% `http2_window_refill_threshold` — see those keys below. The
     %% user-facing nested shape (`{http2, #{conn_window => N, ...}}`)
     %% is documented in `t:roadrunner_listener:opts/0`.
-    protocols => [http1 | http2, ...],
+    protocols => [http1 | http2 | http3, ...],
     %% HTTP/2 receive-window tuning, populated by the listener only
     %% when `http2` is in the protocols list. Pattern-match these
     %% keys directly in code paths that already know http2 is

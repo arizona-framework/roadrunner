@@ -1,8 +1,11 @@
 {"1.2.0",
-[{<<"telemetry">>,{pkg,<<"telemetry">>,<<"1.4.2">>},0}]}.
+[{<<"quic">>,{pkg,<<"quic">>,<<"1.4.0">>},0},
+ {<<"telemetry">>,{pkg,<<"telemetry">>,<<"1.4.2">>},0}]}.
 [
 {pkg_hash,[
+ {<<"quic">>, <<"0A532AF61BA2EDA5531F7744EBAF1190C0B6C34A922FAB24888061926D0A4703">>},
  {<<"telemetry">>, <<"A0CB522801DFFB1C49FE6E30561BADFFC7B6D0E180DB1300DF759FAA22062855">>}]},
 {pkg_hash_ext,[
+ {<<"quic">>, <<"CEAAE5E0372ED578CCFD0F33360F574F07A2AFD2873ACC0B78822F164BACE35E">>},
  {<<"telemetry">>, <<"928F6495066506077862C0D1646609EED891A4326BEE3126BA54B60AF61FEBB1">>}]}
 ].

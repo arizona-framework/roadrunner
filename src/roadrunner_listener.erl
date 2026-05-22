@@ -207,17 +207,25 @@ ops-tuning rationale.
 
 -doc """
 One protocol entry in the listener's `protocols` list. Either a
-bare atom (`http1` / `http2`) for default opts, or a tuple
-`{Proto, ProtoOpts}` carrying protocol-specific tuning. HTTP/1
-currently has no tunables (its opts map must be empty); HTTP/2
-tunables live under `t:http2_opts/0`.
+bare atom (`http1` / `http2` / `http3`) for default opts, or a tuple
+`{Proto, ProtoOpts}` carrying protocol-specific tuning. HTTP/1 and
+HTTP/3 currently have no tunables (their opts map must be empty);
+HTTP/2 tunables live under `t:http2_opts/0`.
 
-On TLS the list drives `alpn_preferred_protocols`. On plain TCP,
-`[http2]` means prior-knowledge h2c (client sends the h2 preface
-directly); `[http1, http2]` on plain TCP is rejected at `init/1`
-since there's no `Upgrade: h2c` implementation.
+On TLS the list drives `alpn_preferred_protocols` for the TCP
+protocols. On plain TCP, `[http2]` means prior-knowledge h2c (client
+sends the h2 preface directly); `[http1, http2]` on plain TCP is
+rejected at `init/1` since there's no `Upgrade: h2c` implementation.
+
+`http3` runs HTTP/3 over QUIC on the UDP port of the same number, and
+requires `tls` (QUIC mandates TLS 1.3) — listing it without `tls` is
+rejected at `init/1`. It co-listens with the TCP protocols: e.g.
+`[http1, http2, http3]` serves h1/h2 over TCP and h3 over UDP on the
+same port. The QUIC handshake advertises the `h3` ALPN itself, so
+`http3` does not appear in the TCP `alpn_preferred_protocols`.
 """.
--type protocol_entry() :: http1 | http2 | {http1, #{}} | {http2, http2_opts()}.
+-type protocol_entry() ::
+    http1 | http2 | http3 | {http1, #{}} | {http2, http2_opts()} | {http3, #{}}.
 
 -doc """
 HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
@@ -260,7 +268,9 @@ WebSocket inbound size caps (under `ws` in the listener opts).
 }.
 
 -record(state, {
-    listen_socket :: roadrunner_transport:socket() | closed,
+    %% `none` when the listener serves HTTP/3 only (no TCP socket);
+    %% `closed` after `drain/2` shuts the TCP socket on its way out.
+    listen_socket :: roadrunner_transport:socket() | closed | none,
     port :: inet:port_number(),
     proto_opts :: roadrunner_conn:proto_opts(),
     phase = accepting :: accepting | draining | stopped,
@@ -276,7 +286,14 @@ WebSocket inbound size caps (under `ws` in the listener opts).
         | #{
             interval := pos_integer(),
             prev_diff := non_neg_integer()
-        }
+        },
+    %% QUIC listener pid when `http3` is in `protocols`, else
+    %% `undefined`. roadrunner owns its lifecycle (started in `init/1`,
+    %% stopped in `terminate/1` / `do_drain/2`); the QUIC transport
+    %% drives the UDP socket while roadrunner owns the h3 conn loop.
+    %% Kept last so the record's existing field positions are unchanged
+    %% (some tests read `proto_opts` positionally via `element/2`).
+    quic_listener = undefined :: pid() | undefined
 }).
 
 -doc """
@@ -401,21 +418,146 @@ init(#{port := Port} = Opts) ->
     ProtoOpts = build_proto_opts(Opts, ListenerName),
     proc_lib:set_label({roadrunner_listener, ListenerName, Port}),
     Protocols = maps:get(protocols, ProtoOpts),
-    case open_listen_socket(Port, Opts, Protocols) of
+    %% TCP (`http1`/`http2`) and QUIC (`http3`) are independent
+    %% transports that co-listen on the same port number. Bring up
+    %% whichever the `protocols` list selects; an `http3`-only listener
+    %% has no TCP socket (`none`), and a TCP-only listener no QUIC pid.
+    case start_tcp(Port, Opts, Protocols, ProtoOpts) of
         {ok, LSocket} ->
-            {ok, BoundPort} = roadrunner_transport:port(LSocket),
-            NumAcceptors = maps:get(num_acceptors, Opts, ?DEFAULT_NUM_ACCEPTORS),
-            ok = spawn_acceptors(LSocket, ProtoOpts, NumAcceptors),
-            Reconciliation = setup_reconciliation(Opts),
-            {ok, #state{
-                listen_socket = LSocket,
-                port = BoundPort,
-                proto_opts = ProtoOpts,
-                reconciliation = Reconciliation
-            }};
+            case start_quic(Port, Opts, Protocols, ProtoOpts) of
+                {ok, QuicListener} ->
+                    Reconciliation = setup_reconciliation(Opts),
+                    {ok, #state{
+                        listen_socket = LSocket,
+                        quic_listener = QuicListener,
+                        port = bound_port(LSocket, QuicListener),
+                        proto_opts = ProtoOpts,
+                        reconciliation = Reconciliation
+                    }};
+                {error, Reason} ->
+                    %% TCP bound but QUIC failed — release the TCP port
+                    %% so the failed start doesn't leave it held.
+                    ok = close_tcp(LSocket),
+                    {stop, {listen_failed, Reason}}
+            end;
         {error, Reason} ->
             {stop, {listen_failed, Reason}}
     end.
+
+%% Open the TCP listen socket + acceptor pool when the listener serves
+%% any TCP protocol (`http1`/`http2`). An HTTP/3-only listener skips
+%% the TCP socket entirely and returns `none`.
+-spec start_tcp(
+    inet:port_number(), opts(), [http1 | http2 | http3, ...], roadrunner_conn:proto_opts()
+) -> {ok, roadrunner_transport:socket() | none} | {error, term()}.
+start_tcp(Port, Opts, Protocols, ProtoOpts) ->
+    case [P || P <- Protocols, P =/= http3] of
+        [] ->
+            {ok, none};
+        TcpProtocols ->
+            case open_listen_socket(Port, Opts, TcpProtocols) of
+                {ok, LSocket} ->
+                    NumAcceptors = maps:get(num_acceptors, Opts, ?DEFAULT_NUM_ACCEPTORS),
+                    ok = spawn_acceptors(LSocket, ProtoOpts, NumAcceptors),
+                    {ok, LSocket};
+                {error, _} = Error ->
+                    Error
+            end
+    end.
+
+%% Start the QUIC listener roadrunner owns when `http3` is requested.
+%% `quic` is started on demand here (kept out of roadrunner's
+%% `applications` so HTTP/1.1/HTTP/2-only deployments never boot it).
+%% Each accepted QUIC connection is handed to a fresh
+%% `roadrunner_conn_loop_http3` owner via the arity-1
+%% `connection_handler`; the QUIC listener then transfers ownership to
+%% the returned pid. `http3` having been validated to require `tls`,
+%% the `tls` opt is always present here.
+-spec start_quic(
+    inet:port_number(), opts(), [http1 | http2 | http3, ...], roadrunner_conn:proto_opts()
+) -> {ok, pid() | undefined} | {error, term()}.
+start_quic(Port, Opts, Protocols, ProtoOpts) ->
+    case lists:member(http3, Protocols) of
+        false ->
+            {ok, undefined};
+        true ->
+            {ok, _Started} = application:ensure_all_started(quic),
+            #{tls := UserTlsOpts} = Opts,
+            {Cert, Key} = quic_cert_key(UserTlsOpts),
+            Handler = fun(ConnPid) -> roadrunner_conn_loop_http3:start(ConnPid, ProtoOpts) end,
+            %% Start unlinked, then link on success: an `init`-time bind
+            %% failure returns `{error, _}` cleanly (so `init/1` can close
+            %% the already-opened TCP socket) instead of taking the
+            %% listener down via the link. The link on success gives the
+            %% running QUIC listener shared fate with this gen_server.
+            case
+                quic_listener:start(Port, #{
+                    cert => Cert,
+                    key => Key,
+                    alpn => [~"h3"],
+                    connection_handler => Handler
+                })
+            of
+                {ok, QuicListener} ->
+                    true = link(QuicListener),
+                    {ok, QuicListener};
+                {error, _} = Error ->
+                    Error
+            end
+    end.
+
+%% The bound port comes from whichever transport owns it. TCP wins when
+%% present (co-listen reuses the same number for UDP); an HTTP/3-only
+%% listener reads it back from the QUIC listener.
+-spec bound_port(roadrunner_transport:socket() | none, pid() | undefined) -> inet:port_number().
+bound_port(none, QuicListener) ->
+    quic_listener:get_port(QuicListener);
+bound_port(LSocket, _QuicListener) ->
+    {ok, BoundPort} = roadrunner_transport:port(LSocket),
+    BoundPort.
+
+-spec close_tcp(roadrunner_transport:socket() | none | closed) -> ok.
+close_tcp(none) -> ok;
+close_tcp(closed) -> ok;
+close_tcp(LSocket) -> roadrunner_transport:close(LSocket).
+
+%% Extract a DER cert + decoded private key from the user's `tls` opts
+%% for the QUIC listener, which takes `cert => DER` and `key =>
+%% DecodedKey` rather than OTP `ssl`'s opt forms. Supports the inline
+%% DER forms `ssl` and the test PKI produce (`{cert, DER}` / `{key,
+%% {Algo, DER}}`) and `certfile` / `keyfile` PEM paths.
+-spec quic_cert_key([ssl:tls_server_option()]) -> {binary(), public_key:private_key()}.
+quic_cert_key(TlsOpts) ->
+    {quic_cert(TlsOpts), quic_key(TlsOpts)}.
+
+-spec quic_cert([ssl:tls_server_option()]) -> binary().
+quic_cert(TlsOpts) ->
+    case lists:keyfind(cert, 1, TlsOpts) of
+        {cert, Der} when is_binary(Der) ->
+            Der;
+        false ->
+            {certfile, File} = lists:keyfind(certfile, 1, TlsOpts),
+            {_Type, Der} = first_pem_entry(File),
+            Der
+    end.
+
+-spec quic_key([ssl:tls_server_option()]) -> public_key:private_key().
+quic_key(TlsOpts) ->
+    case lists:keyfind(key, 1, TlsOpts) of
+        {key, {Algo, Der}} when is_atom(Algo), is_binary(Der) ->
+            public_key:der_decode(Algo, Der);
+        false ->
+            {keyfile, File} = lists:keyfind(keyfile, 1, TlsOpts),
+            {Algo, Der} = first_pem_entry(File),
+            public_key:der_decode(Algo, Der)
+    end.
+
+%% First PEM entry of a cert/key file as `{Asn1Type, DER}`.
+-spec first_pem_entry(file:name_all()) -> {atom(), binary()}.
+first_pem_entry(File) ->
+    {ok, Pem} = file:read_file(File),
+    [{Type, Der, not_encrypted} | _] = public_key:pem_decode(Pem),
+    {Type, Der}.
 
 -spec setup_reconciliation(opts()) ->
     disabled | #{interval := pos_integer(), prev_diff := non_neg_integer()}.
@@ -644,12 +786,16 @@ build_proto_opts(Opts, ListenerName) ->
 %%   `Upgrade: h2c` implementation, so the two cannot share a
 %%   plaintext port; the reason token spells that out so the error
 %%   message is honest.
--spec normalize_protocols(opts()) -> {[http1 | http2, ...], #{atom() => term()}}.
+-spec normalize_protocols(opts()) -> {[http1 | http2 | http3, ...], #{atom() => term()}}.
 normalize_protocols(Opts) ->
     Raw = maps:get(protocols, Opts, [http1]),
     HasTls = maps:is_key(tls, Opts),
     Entries = normalize_protocols_list(Raw),
     Names = [N || {N, _} <- Entries],
+    %% QUIC mandates TLS 1.3, so `http3` without `tls` is a config
+    %% error — caught here before the `[http1, http2]` h2c check below
+    %% (which only fires on plain TCP, where `http3` can't appear).
+    ok = require_tls_for_h3(Names, HasTls, Raw),
     case Names of
         [http1, http2] when not HasTls ->
             error({listener_opt_conflict, protocols, Raw, no_h2c_upgrade});
@@ -659,7 +805,16 @@ normalize_protocols(Opts) ->
             {Names, flatten_http2_opts(Entries)}
     end.
 
--type protocol_entry_norm() :: {http1, #{}} | {http2, http2_opts()}.
+-spec require_tls_for_h3([http1 | http2 | http3, ...], boolean(), term()) -> ok.
+require_tls_for_h3(Names, HasTls, Raw) ->
+    case lists:member(http3, Names) of
+        true when not HasTls ->
+            error({listener_opt_conflict, protocols, Raw, http3_requires_tls});
+        _ ->
+            ok
+    end.
+
+-type protocol_entry_norm() :: {http1, #{}} | {http2, http2_opts()} | {http3, #{}}.
 
 -spec normalize_protocols_list(term()) -> [protocol_entry_norm(), ...].
 normalize_protocols_list(L) when is_list(L), L =/= [] ->
@@ -681,6 +836,10 @@ normalize_protocol_entry({http1, Opts}, _Raw) when is_map(Opts), map_size(Opts) 
     {http1, #{}};
 normalize_protocol_entry({http2, Opts}, Raw) when is_map(Opts) ->
     {http2, validate_http2_opts(Opts, Raw)};
+normalize_protocol_entry(http3, _Raw) ->
+    {http3, #{}};
+normalize_protocol_entry({http3, Opts}, _Raw) when is_map(Opts), map_size(Opts) =:= 0 ->
+    {http3, #{}};
 normalize_protocol_entry(_, Raw) ->
     error({invalid_listener_opt, protocols, Raw}).
 
@@ -850,9 +1009,16 @@ do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _, _}}}, _Routes
 
 -spec do_drain(#state{}, non_neg_integer()) ->
     {{ok, drained} | {timeout, non_neg_integer()}, #state{}}.
-do_drain(#state{listen_socket = LSocket, proto_opts = ProtoOpts} = State, Timeout) ->
-    %% Close listen socket — accept fails, acceptors exit cleanly.
-    ok = roadrunner_transport:close(LSocket),
+do_drain(
+    #state{listen_socket = LSocket, quic_listener = QuicListener, proto_opts = ProtoOpts} = State,
+    Timeout
+) ->
+    %% Close both transports — TCP accept fails so acceptors exit
+    %% cleanly, and stopping the QUIC listener refuses new QUIC
+    %% connections. In-flight conns of either protocol are then drained
+    %% via the shared pg group + client counter below.
+    ok = close_tcp(LSocket),
+    ok = stop_quic(QuicListener),
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     Group = drain_group(ProtoOpts),
     notify_conns(Group, Deadline),
@@ -861,7 +1027,7 @@ do_drain(#state{listen_socket = LSocket, proto_opts = ProtoOpts} = State, Timeou
     %% `phase = draining` was never observable here (the gen_server is
     %% blocked in wait_for_drain and the local state isn't committed),
     %% so settle straight to the final stopped state in one update.
-    {Reply, State#state{listen_socket = closed, phase = stopped}}.
+    {Reply, State#state{listen_socket = closed, quic_listener = undefined, phase = stopped}}.
 
 %% Best-effort broadcast to in-flight conns. Loop / SSE / WebSocket
 %% handlers can pattern-match on `{roadrunner_drain, Deadline}` in
@@ -972,13 +1138,18 @@ count_up_to([_ | T], Cap, N) -> count_up_to(T, Cap, N + 1).
 
 -doc false.
 -spec terminate(term(), #state{}) -> ok.
-terminate(_Reason, #state{listen_socket = LSocket, proto_opts = ProtoOpts}) ->
+terminate(_Reason, #state{
+    listen_socket = LSocket, quic_listener = QuicListener, proto_opts = ProtoOpts
+}) ->
     erase_routes(ProtoOpts),
-    case LSocket of
-        %% `drain/2` already closed the listen socket on its way out.
-        closed -> ok;
-        _ -> roadrunner_transport:close(LSocket)
-    end.
+    ok = stop_quic(QuicListener),
+    %% `drain/2` already closed the TCP socket on its way out
+    %% (`closed`), and an HTTP/3-only listener never had one (`none`).
+    close_tcp(LSocket).
+
+-spec stop_quic(pid() | undefined) -> ok.
+stop_quic(undefined) -> ok;
+stop_quic(QuicListener) -> quic_listener:stop(QuicListener).
 
 -spec erase_routes(roadrunner_conn:proto_opts()) -> ok.
 erase_routes(#{dispatch := {router, Name}}) ->

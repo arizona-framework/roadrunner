@@ -9,8 +9,8 @@ share the same connection and share HPACK state for h2.
 
 `h3` is reserved as a stub clause so the bench only has to track a
 single client surface across protocol versions; switching the
-clause body to `quicer:connect` lands h3 support in one focused
-PR when QUIC arrives.
+clause body to `quic_h3:connect` (the `quic` dep is now in tree, used
+by the HTTP/3 listener) lands h3 support in one focused PR.
 
 ## Why pure-Erlang and not h2load
 
