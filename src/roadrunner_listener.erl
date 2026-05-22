@@ -45,8 +45,8 @@ All duration and interval values in `opts()` are in milliseconds —
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
 -define(DEFAULT_MAX_CLIENTS, 150).
 -define(DEFAULT_MIN_BYTES_PER_SECOND, 100).
--define(DEFAULT_WS_MAX_FRAME_SIZE, 16777216).
--define(DEFAULT_WS_MAX_MESSAGE_SIZE, 16777216).
+-define(DEFAULT_WS_MAX_FRAME_SIZE, 10485760).
+-define(DEFAULT_WS_MAX_MESSAGE_SIZE, 10485760).
 
 -doc """
 Listener configuration map.
@@ -77,11 +77,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   `payload_too_large`. Default 10 MB.
 - `ws_max_frame_size` — per-WebSocket-frame payload cap. An inbound
   frame declaring more bytes than this closes the connection with
-  code 1009 before the payload is buffered. Default 16 MB.
+  code 1009 before the payload is buffered. Default 10 MB.
 - `ws_max_message_size` — cap on a reassembled WebSocket message:
   the running sum of fragment payloads, and (when permessage-deflate
   is negotiated) the decompressed size. Over-cap closes with code
-  1009. Default 16 MB.
+  1009. Must be `>= ws_max_frame_size`. Default 10 MB.
 - `request_timeout` — header-read timeout on a fresh conn.
   Default 30 s.
 - `keep_alive_timeout` — idle timeout between requests on a
@@ -542,16 +542,22 @@ build_proto_opts(Opts, ListenerName) ->
     %% contract `try_acquire_slot/1` already documents.
     ClientCounter = counters:new(1, [write_concurrency]),
     RequestsCounter = atomics:new(1, [{signed, false}]),
+    %% A reassembled message is built from frames, so a single
+    %% unfragmented frame is also a whole message — `ws_max_message_size`
+    %% below `ws_max_frame_size` is contradictory (a max-size frame would
+    %% be rejected as too-big-a-message). Reject it at startup.
+    WsFrame = maps:get(ws_max_frame_size, Opts, ?DEFAULT_WS_MAX_FRAME_SIZE),
+    WsMsg = maps:get(ws_max_message_size, Opts, ?DEFAULT_WS_MAX_MESSAGE_SIZE),
+    WsMsg >= WsFrame orelse
+        error({listener_opt_conflict, ws_max_message_size, WsMsg, below_ws_max_frame_size}),
     Base = maps:merge(
         #{
             dispatch => build_dispatch(Opts, ListenerName),
             middlewares => maps:get(middlewares, Opts, []),
             max_content_length =>
                 maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
-            ws_max_frame_size =>
-                maps:get(ws_max_frame_size, Opts, ?DEFAULT_WS_MAX_FRAME_SIZE),
-            ws_max_message_size =>
-                maps:get(ws_max_message_size, Opts, ?DEFAULT_WS_MAX_MESSAGE_SIZE),
+            ws_max_frame_size => WsFrame,
+            ws_max_message_size => WsMsg,
             request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
             keep_alive_timeout =>
                 maps:get(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT),

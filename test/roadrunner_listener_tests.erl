@@ -339,6 +339,25 @@ listener_rejects_invalid_protocols_value_test() ->
         [[], [http3], [http1, http1], not_a_list]
     ).
 
+listener_rejects_ws_message_cap_below_frame_cap_test() ->
+    %% A reassembled message is built from frames, so a single
+    %% unfragmented frame is also a whole message — `ws_max_message_size`
+    %% below `ws_max_frame_size` is contradictory and must reject at
+    %% `init/1`.
+    process_flag(trap_exit, true),
+    R = roadrunner_listener:start_link(listener_test_ws_cap_conflict, #{
+        port => 0,
+        ws_max_frame_size => 1048576,
+        ws_max_message_size => 1024,
+        routes => roadrunner_hello_handler
+    }),
+    ?assertMatch(
+        {error, {
+            {listener_opt_conflict, ws_max_message_size, 1024, below_ws_max_frame_size}, _Stack
+        }},
+        R
+    ).
+
 slot_reconciliation_disabled_drops_reconcile_slots_message_test() ->
     %% A `reconcile_slots` arriving at a listener with reconciliation
     %% disabled (race after a hypothetical config change) is just
