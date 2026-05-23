@@ -732,7 +732,11 @@ peer_control_stream_reset(Config) ->
     %% H3_CLOSED_CRITICAL_STREAM connection error.
     Conn = ll_connect(?config(port, Config)),
     StreamId = ll_open_uni(Conn, control_with_settings(), false),
-    timer:sleep(50),
+    %% Round-trip a request so the server has surely classified the
+    %% control stream (processed its SETTINGS, sent before this request)
+    %% before we reset it — a fixed sleep races under load, leaving the
+    %% reset to hit an unclassified stream that is silently dropped.
+    ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
     _ = quic:reset_stream(Conn, StreamId, 0),
     ll_await_closed(Conn).
 
