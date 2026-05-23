@@ -30,6 +30,12 @@
 %% response (e.g. 413) directly, without spawning a worker.
 -export([send_buffered/5]).
 
+%% RFC 9114 §7.2.1: the DATA frame type is 0x00. We frame the body by
+%% hand (type + length varints, then the body by reference) instead of
+%% `quic_h3_frame:encode_data/1` so a large body is never flattened
+%% into one binary on the response path.
+-define(H3_FRAME_DATA, 16#00).
+
 -doc """
 Spawn a monitored worker for `StreamId`. Returns `{Pid, MonitorRef}`
 so the conn loop can correlate the eventual `'DOWN'` back to the
@@ -200,7 +206,13 @@ send_buffered(Conn, StreamId, Status, Headers, Body) ->
     HeadersFrame = quic_h3_frame:encode_headers(quic_qpack:encode(HeaderList)),
     Frames =
         case iolist_size(Body) of
-            0 -> HeadersFrame;
-            _ -> [HeadersFrame, quic_h3_frame:encode_data(iolist_to_binary(Body))]
+            0 ->
+                HeadersFrame;
+            BodyLen ->
+                %% DATA frame as iodata: type + length varints, then the
+                %% body by reference (no flatten). `quic:send_data/4`
+                %% takes iodata and the transport `writev()`s it.
+                DataHeader = [quic_varint:encode(?H3_FRAME_DATA), quic_varint:encode(BodyLen)],
+                [HeadersFrame, DataHeader, Body]
         end,
     ok = quic:send_data(Conn, StreamId, Frames, true).
