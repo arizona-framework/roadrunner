@@ -28,7 +28,7 @@ accessors that operate on it.
 
 -on_load(init_cache/0).
 
--export([http_date_now/0, format_http_date/1, with_date/1]).
+-export([http_date_now/0, format_http_date/1, with_date/1, auto_headers/2]).
 
 -export_type([headers/0, status/0, redirect_status/0, version/0]).
 
@@ -87,6 +87,28 @@ with_date(Headers) ->
         true -> Headers;
         false -> [{~"date", http_date_now()} | Headers]
     end.
+
+-doc """
+Inject the framework's automatic response headers for an HTTP/1 or
+HTTP/2 (TCP) response: `Date` always (RFC 9110 §6.6.1) plus `Alt-Svc`
+advertising the listener's HTTP/3 endpoint (RFC 7838) when it co-serves
+h3 on a fixed port (`proto_opts` carries the precomputed value only
+then). HTTP/3 responses use `with_date/1` directly — a client already
+on h3 needs no Alt-Svc.
+""".
+-spec auto_headers(headers(), map()) -> headers().
+auto_headers(Headers, ProtoOpts) ->
+    with_alt_svc(with_date(Headers), ProtoOpts).
+
+%% Prepend the precomputed `Alt-Svc` value when the listener co-serves
+%% h3 — `proto_opts` carries `alt_svc` only then. `Alt-Svc` is
+%% list-valued (RFC 7838 §3 / RFC 9110 §5.3), so it composes with any
+%% handler-set value; no de-dup needed (unlike the singular `Date`).
+-spec with_alt_svc(headers(), map()) -> headers().
+with_alt_svc(Headers, #{alt_svc := Value}) ->
+    [{~"alt-svc", Value} | Headers];
+with_alt_svc(Headers, #{}) ->
+    Headers.
 
 -doc """
 Format a posix timestamp (seconds since epoch) as an IMF-fixdate

@@ -410,7 +410,11 @@ co_listen(_Config) ->
         ),
         ok = ssl:send(Sock, ~"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
         {ok, Reply} = ssl:recv(Sock, 0, 5000),
-        ?assertMatch(<<"HTTP/1.1 200", _/binary>>, iolist_to_binary(Reply)),
+        ReplyBin = iolist_to_binary(Reply),
+        ?assertMatch(<<"HTTP/1.1 200", _/binary>>, ReplyBin),
+        %% RFC 7838: the h1 response advertises the co-served h3 endpoint.
+        AltSvc = <<"h3=\":", (integer_to_binary(Port))/binary, "\"">>,
+        ?assertNotEqual(nomatch, binary:match(ReplyBin, AltSvc)),
         ok = ssl:close(Sock),
         %% h3 over UDP on the same port.
         Conn = connect(Port),

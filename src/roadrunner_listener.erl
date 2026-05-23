@@ -734,7 +734,7 @@ build_proto_opts(Opts, ListenerName) ->
     #{max_frame_size := WsFrame, max_message_size := WsMsg} =
         validate_ws_opts(maps:get(ws, Opts, #{})),
     Base = maps:merge(
-        #{
+        maps:merge(maybe_alt_svc(Protocols, Opts), #{
             dispatch => build_dispatch(Opts, ListenerName),
             middlewares => maps:get(middlewares, Opts, []),
             max_content_length =>
@@ -755,7 +755,7 @@ build_proto_opts(Opts, ListenerName) ->
             listener_name => ListenerName,
             graceful_drain => maps:get(graceful_drain, Opts, true),
             protocols => Protocols
-        },
+        }),
         ProtoFlats
     ),
     WithHibernate =
@@ -781,6 +781,28 @@ build_proto_opts(Opts, ListenerName) ->
         #{} ->
             WithHibernate
     end.
+
+%% Precompute the `Alt-Svc` response-header value (RFC 7838) when the
+%% listener co-serves HTTP/3 alongside a TCP protocol on a fixed port,
+%% so h1/h2 responses advertise the h3 endpoint and browsers upgrade to
+%% QUIC. Skipped on ephemeral (`port => 0`) listeners: there is no
+%% stable port to advertise, and TCP/UDP would not even share one.
+-spec maybe_alt_svc([http1 | http2 | http3, ...], opts()) -> map().
+maybe_alt_svc(Protocols, #{port := Port}) ->
+    case h3_co_served(Protocols) andalso is_integer(Port) andalso Port > 0 of
+        true -> #{alt_svc => alt_svc_value(Port)};
+        false -> #{}
+    end.
+
+-spec h3_co_served([http1 | http2 | http3, ...]) -> boolean().
+h3_co_served(Protocols) ->
+    lists:member(http3, Protocols) andalso lists:any(fun(P) -> P =/= http3 end, Protocols).
+
+%% RFC 7838 §3: advertise h3 on the same host at `Port`; `ma` caps how
+%% long clients cache the mapping (24h).
+-spec alt_svc_value(inet:port_number()) -> binary().
+alt_svc_value(Port) ->
+    <<"h3=\":", (integer_to_binary(Port))/binary, "\"; ma=86400">>.
 
 %% `routes` is the unified dispatch option. Single-handler forms
 %% (bare atom, `{Mod, State}` tuple, or `#{handler := Mod, ...}` map)

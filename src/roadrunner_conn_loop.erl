@@ -615,24 +615,24 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
 dispatch_response(Socket, _Handler, Req, {websocket, Mod, State}, ProtoOpts) when is_atom(Mod) ->
     ok = roadrunner_ws_session:run(Socket, Req, Mod, State, ProtoOpts),
     ok;
-dispatch_response(Socket, _Handler, _Req, {stream, Status, Headers0, Fun}, _ProtoOpts) when
+dispatch_response(Socket, _Handler, _Req, {stream, Status, Headers0, Fun}, ProtoOpts) when
     is_function(Fun, 1)
 ->
-    Headers = roadrunner_http:with_date(Headers0),
+    Headers = roadrunner_http:auto_headers(Headers0, ProtoOpts),
     _ = roadrunner_stream_response:run(Socket, Status, Headers, Fun),
     ok;
-dispatch_response(Socket, Handler, _Req, {loop, Status, Headers0, LoopState}, _ProtoOpts) when
+dispatch_response(Socket, Handler, _Req, {loop, Status, Headers0, LoopState}, ProtoOpts) when
     is_integer(Status)
 ->
-    Headers = roadrunner_http:with_date(Headers0),
+    Headers = roadrunner_http:auto_headers(Headers0, ProtoOpts),
     _ = roadrunner_loop_response:run(Socket, Status, Headers, Handler, LoopState),
     ok;
 dispatch_response(
-    Socket, _Handler, Req, {sendfile, Status, Headers0, {Filename, Offset, Length}}, _ProtoOpts
+    Socket, _Handler, Req, {sendfile, Status, Headers0, {Filename, Offset, Length}}, ProtoOpts
 ) when
     is_integer(Status)
 ->
-    Headers = roadrunner_http:with_date(Headers0),
+    Headers = roadrunner_http:auto_headers(Headers0, ProtoOpts),
     Head = roadrunner_http1:response(Status, Headers, ~""),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Head), sendfile_response_head
@@ -667,20 +667,20 @@ dispatch_response(
 %% function head and emit the response with an empty body. Free
 %% pattern-match dispatch (no `maps:get(method, _)` per response).
 dispatch_response(
-    Socket, _Handler, #{method := ~"HEAD"}, {Status, Headers0, _Body}, _ProtoOpts
+    Socket, _Handler, #{method := ~"HEAD"}, {Status, Headers0, _Body}, ProtoOpts
 ) when
     is_integer(Status)
 ->
-    Headers = roadrunner_http:with_date(Headers0),
+    Headers = roadrunner_http:auto_headers(Headers0, ProtoOpts),
     Resp = roadrunner_http1:response(Status, Headers, ~""),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Resp), buffered_response
     ),
     ok;
-dispatch_response(Socket, _Handler, _Req, {Status, Headers0, Body}, _ProtoOpts) when
+dispatch_response(Socket, _Handler, _Req, {Status, Headers0, Body}, ProtoOpts) when
     is_integer(Status)
 ->
-    Headers = roadrunner_http:with_date(Headers0),
+    Headers = roadrunner_http:auto_headers(Headers0, ProtoOpts),
     Resp = roadrunner_http1:response(Status, Headers, Body),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Resp), buffered_response
