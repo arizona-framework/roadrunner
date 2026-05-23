@@ -9,6 +9,7 @@ only h3-legal headers (no `connection` / `keep-alive`, which RFC 9114
 -behaviour(roadrunner_handler).
 
 -export([handle/1]).
+-export([handle_info/3]).
 
 -spec handle(roadrunner_req:request()) ->
     {roadrunner_handler:response(), roadrunner_req:request()}.
@@ -55,7 +56,15 @@ handle(#{target := ~"/stream-forbidden"} = Req) ->
     %% A connection-specific header on a stream response → 500.
     {{stream, 200, [{~"connection", ~"close"}], fun(Send) -> ok = Send(~"x", fin) end}, Req};
 handle(#{target := ~"/loop"} = Req) ->
-    {{loop, 200, [], 0}, Req};
+    %% Register the worker so the test can drive it from outside.
+    %% Unregister first in case a prior test's worker leaked the name.
+    try
+        unregister(roadrunner_h3_loop_test)
+    catch
+        _:_ -> ok
+    end,
+    true = register(roadrunner_h3_loop_test, self()),
+    {{loop, 200, [{~"content-type", ~"text/event-stream"}], 0}, Req};
 handle(#{target := ~"/sendfile"} = Req) ->
     %% Zero-length range — header-only, exercises the empty-range path.
     {{sendfile, 200, [], {"/dev/null", 0, 0}}, Req};
@@ -69,3 +78,19 @@ handle(#{target := ~"/websocket"} = Req) ->
     {{websocket, some_module, state}, Req};
 handle(Req) ->
     {{200, [{~"content-type", ~"text/plain"}], ~"ok"}, Req}.
+
+%% `handle_info/3` is consulted only by `{loop, _}` responses. The
+%% `/loop` clause registers the worker; the test sends `{push, _}` to
+%% emit an SSE chunk, `push_empty` to exercise the empty-push no-op, and
+%% `stop` to terminate.
+-spec handle_info(term(), roadrunner_handler:push_fun(), term()) ->
+    {ok, term()} | {stop, term()}.
+handle_info({push, Data}, Push, N) ->
+    _ = Push([~"data: ", Data, ~"\n\n"]),
+    {ok, N + 1};
+handle_info(push_empty, Push, N) ->
+    _ = Push(<<>>),
+    {ok, N};
+handle_info(stop, Push, N) ->
+    _ = Push([~"data: bye(", integer_to_binary(N), ~")\n\n"]),
+    {stop, N}.

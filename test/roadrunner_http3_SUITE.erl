@@ -26,6 +26,8 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     crash_500/1,
     forbidden_response_header_500/1,
     unsupported_shapes_501/1,
+    loop_response/1,
+    loop_filters_otp/1,
     stream_response/1,
     stream_trailers/1,
     stream_autoclose/1,
@@ -81,6 +83,8 @@ all() ->
         crash_500,
         forbidden_response_header_500,
         unsupported_shapes_501,
+        loop_response,
+        loop_filters_otp,
         stream_response,
         stream_trailers,
         stream_autoclose,
@@ -272,8 +276,36 @@ unsupported_shapes_501(Config) ->
         fun(Path) ->
             ?assertMatch({501, _}, status_body(get(Conn, Path)))
         end,
-        [~"/loop", ~"/websocket"]
+        [~"/websocket"]
     ),
+    close(Conn).
+
+loop_response(Config) ->
+    %% A `{loop, ...}` response: HEADERS, then DATA chunks pushed from
+    %% the handler's `handle_info/3`, FIN on `{stop, _}`.
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = quic_h3:request(Conn, headers(~"GET", ~"/loop")),
+    Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
+    Worker ! {push, ~"hi"},
+    Worker ! push_empty,
+    Worker ! stop,
+    {200, _Headers, Body} = collect(Conn, StreamId),
+    ?assertEqual(~"data: hi\n\ndata: bye(1)\n\n", Body),
+    close(Conn).
+
+loop_filters_otp(Config) ->
+    %% OTP message shapes are dropped (never reach `handle_info/3`), so
+    %% only the real push advances the counter.
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = quic_h3:request(Conn, headers(~"GET", ~"/loop")),
+    Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
+    Worker ! {system, self(), get_state},
+    Worker ! {'$gen_call', {self(), make_ref()}, ping},
+    Worker ! {'$gen_cast', noop},
+    Worker ! {push, ~"x"},
+    Worker ! stop,
+    {200, _Headers, Body} = collect(Conn, StreamId),
+    ?assertEqual(~"data: x\n\ndata: bye(1)\n\n", Body),
     close(Conn).
 
 sendfile_empty(Config) ->
@@ -890,6 +922,19 @@ ll_await_reset(Conn, StreamId) ->
         {quic, Conn, {stream_reset, StreamId, ErrorCode}} -> ErrorCode
     after 5000 ->
         ct:fail(no_stream_reset)
+    end.
+
+%% Spin until a `{loop, _}` handler registers `Name` (it does so from
+%% `handle/1`), so the test can address the worker from outside.
+wait_for_register(_Name, RemainingMs) when RemainingMs =< 0 ->
+    ct:fail(worker_not_registered);
+wait_for_register(Name, RemainingMs) ->
+    case whereis(Name) of
+        undefined ->
+            timer:sleep(10),
+            wait_for_register(Name, RemainingMs - 10);
+        Pid ->
+            Pid
     end.
 
 ll_send(Conn, Bytes, Fin) ->

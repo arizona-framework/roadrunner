@@ -93,7 +93,7 @@ run_handler(Conn, StreamId, Req, ProtoOpts) ->
 invoke(Conn, StreamId, Handler, Pipeline, #{method := Method} = Req, Metadata, ReqStart) ->
     try Pipeline(Req) of
         {Response, _Req2} ->
-            %% `emit_handler_response/3` returns the status actually sent
+            %% `emit_handler_response/4` returns the status actually sent
             %% (which differs from the handler's when we override a bad
             %% response with 500 / 501) so telemetry reports the truth.
             %% It runs in the `of` body, whose exceptions a `try` does
@@ -102,7 +102,7 @@ invoke(Conn, StreamId, Handler, Pipeline, #{method := Method} = Req, Metadata, R
             %% emit the body-stripped form; telemetry keeps the handler's
             %% original shape (`response_kind/1` below).
             Status = emit_handler_response(
-                Conn, StreamId, roadrunner_conn:head_response(Response, Method)
+                Conn, StreamId, Handler, roadrunner_conn:head_response(Response, Method)
             ),
             ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, #{
                 status => Status,
@@ -141,28 +141,31 @@ telemetry_metadata(#{
         listener_name => ListenerName
     }.
 
--spec emit_handler_response(pid(), non_neg_integer(), roadrunner_handler:response()) ->
+-spec emit_handler_response(pid(), non_neg_integer(), module(), roadrunner_handler:response()) ->
     roadrunner_http:status().
-emit_handler_response(Conn, StreamId, {Status, Headers, Body}) when
+emit_handler_response(Conn, StreamId, _Handler, {Status, Headers, Body}) when
     is_integer(Status, 100, 599)
 ->
     emit_checked(Conn, StreamId, Headers, fun() ->
         send_buffered(Conn, StreamId, Status, Headers, Body),
         Status
     end);
-emit_handler_response(Conn, StreamId, {stream, Status, Headers, Fun}) ->
+emit_handler_response(Conn, StreamId, _Handler, {stream, Status, Headers, Fun}) ->
     emit_checked(Conn, StreamId, Headers, fun() ->
         send_stream(Conn, StreamId, Status, Headers, Fun),
         Status
     end);
-emit_handler_response(Conn, StreamId, {sendfile, Status, Headers, Spec}) ->
+emit_handler_response(Conn, StreamId, _Handler, {sendfile, Status, Headers, Spec}) ->
     emit_checked(Conn, StreamId, Headers, fun() ->
         send_sendfile(Conn, StreamId, Status, Headers, Spec),
         Status
     end);
-emit_handler_response(Conn, StreamId, {loop, _, _, _}) ->
-    emit_501(Conn, StreamId);
-emit_handler_response(Conn, StreamId, {websocket, _, _}) ->
+emit_handler_response(Conn, StreamId, Handler, {loop, Status, Headers, State}) ->
+    emit_checked(Conn, StreamId, Headers, fun() ->
+        send_loop(Conn, StreamId, Status, Headers, Handler, State),
+        Status
+    end);
+emit_handler_response(Conn, StreamId, _Handler, {websocket, _, _}) ->
     emit_501(Conn, StreamId).
 
 %% Emit a response unless it carries a connection-specific header
@@ -214,9 +217,10 @@ reject_forbidden(Conn, StreamId, Name) ->
     ),
     500.
 
-%% `loop` / `websocket` response shapes are not yet wired for HTTP/3;
-%% until then they answer 501 (mirroring how h2 answers 501 for the
-%% WebSocket shape). The `stream` and `sendfile` shapes are supported.
+%% The `websocket` response shape is not yet wired for HTTP/3 (it needs
+%% Extended CONNECT, RFC 9220); until then it answers 501, mirroring how
+%% h2 answers 501 for it. The buffered / stream / sendfile / loop shapes
+%% are supported.
 -spec emit_501(pid(), non_neg_integer()) -> 501.
 emit_501(Conn, StreamId) ->
     send_buffered(
@@ -325,6 +329,57 @@ sendfile_loop(IoDev, Remaining, Send) ->
         NextRemaining ->
             _ = Send(Bin, nofin),
             sendfile_loop(IoDev, NextRemaining, Send)
+    end.
+
+%% `{loop, ...}` response: HEADERS (no FIN), then a message-receive loop
+%% dispatching each non-OTP message through the handler's
+%% `handle_info/3` with a `Push` callback that emits a DATA frame; FIN
+%% on `{stop, _}`. Runs in the per-stream worker, so a handler's
+%% `self() ! Msg` / `register/2` from `handle/1` works (the worker IS
+%% the dispatch process). Mirrors `roadrunner_http2_loop_response`.
+-spec send_loop(
+    pid(),
+    non_neg_integer(),
+    roadrunner_http:status(),
+    roadrunner_http:headers(),
+    module(),
+    term()
+) -> ok.
+send_loop(Conn, StreamId, Status, Headers, Handler, State) ->
+    ok = quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
+    Push = fun(Data) -> loop_push(Conn, StreamId, Data) end,
+    info_loop(Conn, StreamId, Handler, Push, State).
+
+%% OTP message shapes are dropped (we are a plain spawn, not a `gen_*`,
+%% so a `gen_server:call/2,3` against the worker times out rather than
+%% surfacing in `handle_info/3`); any other message is the handler's.
+-spec info_loop(pid(), non_neg_integer(), module(), roadrunner_handler:push_fun(), term()) -> ok.
+info_loop(Conn, StreamId, Handler, Push, State) ->
+    receive
+        {system, _, _} ->
+            info_loop(Conn, StreamId, Handler, Push, State);
+        {'$gen_call', _, _} ->
+            info_loop(Conn, StreamId, Handler, Push, State);
+        {'$gen_cast', _} ->
+            info_loop(Conn, StreamId, Handler, Push, State);
+        Info ->
+            case Handler:handle_info(Info, Push, State) of
+                {ok, NewState} ->
+                    info_loop(Conn, StreamId, Handler, Push, NewState);
+                {stop, _NewState} ->
+                    %% Close the stream with an empty DATA frame + FIN.
+                    _ = quic:send_data(Conn, StreamId, data_frame(<<>>, 0), true),
+                    ok
+            end
+    end.
+
+%% Push handed to the loop handler: empty data is a no-op (matches the
+%% h1/h2 contract), non-empty ships as one DATA frame (no FIN).
+-spec loop_push(pid(), non_neg_integer(), iodata()) -> ok | {error, term()}.
+loop_push(Conn, StreamId, Data) ->
+    case iolist_size(Data) of
+        0 -> ok;
+        Len -> quic:send_data(Conn, StreamId, data_frame(Data, Len), false)
     end.
 
 %% HEADERS frame: QPACK-encoded `:status` + the handler's headers, plus
