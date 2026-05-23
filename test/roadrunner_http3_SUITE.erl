@@ -25,6 +25,10 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     crash_500/1,
     forbidden_response_header_500/1,
     unsupported_shapes_501/1,
+    stream_response/1,
+    stream_trailers/1,
+    stream_autoclose/1,
+    stream_forbidden_header_500/1,
     oversized_413/1,
     protocols_tuple_form/1,
     certfile_keyfile/1,
@@ -71,6 +75,10 @@ all() ->
         crash_500,
         forbidden_response_header_500,
         unsupported_shapes_501,
+        stream_response,
+        stream_trailers,
+        stream_autoclose,
+        stream_forbidden_header_500,
         oversized_413,
         protocols_tuple_form,
         certfile_keyfile,
@@ -246,8 +254,33 @@ unsupported_shapes_501(Config) ->
         fun(Path) ->
             ?assertMatch({501, _}, status_body(get(Conn, Path)))
         end,
-        [~"/stream", ~"/loop", ~"/sendfile", ~"/websocket"]
+        [~"/loop", ~"/sendfile", ~"/websocket"]
     ),
+    close(Conn).
+
+stream_response(Config) ->
+    %% A `{stream, ...}` response: HEADERS then DATA chunks then FIN.
+    Conn = connect(?config(port, Config)),
+    ?assertEqual({200, ~"chunk1-chunk2"}, status_body(get(Conn, ~"/stream"))),
+    close(Conn).
+
+stream_trailers(Config) ->
+    %% `Send(Data, {fin, Trailers})` ends with a trailing HEADERS frame.
+    Conn = connect(?config(port, Config)),
+    ?assertEqual({200, ~"body"}, status_body(get(Conn, ~"/stream-trailers"))),
+    close(Conn).
+
+stream_autoclose(Config) ->
+    %% A stream fun that returns without `fin` is auto-closed.
+    Conn = connect(?config(port, Config)),
+    ?assertEqual({200, ~"data"}, status_body(get(Conn, ~"/stream-noend"))),
+    close(Conn).
+
+stream_forbidden_header_500(Config) ->
+    %% A streaming response carrying a connection-specific header is
+    %% rejected with 500 (RFC 9114 §4.2), same as the buffered path.
+    Conn = connect(?config(port, Config)),
+    ?assertMatch({500, _}, status_body(get(Conn, ~"/stream-forbidden"))),
     close(Conn).
 
 oversized_413(_Config) ->
@@ -767,7 +800,10 @@ collect_body(Conn, StreamId, Status, Headers, Acc) ->
         {quic_h3, Conn, {data, StreamId, Data, true}} ->
             {Status, Headers, <<Acc/binary, Data/binary>>};
         {quic_h3, Conn, {data, StreamId, Data, false}} ->
-            collect_body(Conn, StreamId, Status, Headers, <<Acc/binary, Data/binary>>)
+            collect_body(Conn, StreamId, Status, Headers, <<Acc/binary, Data/binary>>);
+        %% Trailing HEADERS (trailers) end the stream with no fin DATA.
+        {quic_h3, Conn, {trailers, StreamId, _Trailers}} ->
+            {Status, Headers, Acc}
     after 5000 ->
         timeout
     end.

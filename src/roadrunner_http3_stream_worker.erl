@@ -36,6 +36,11 @@
 %% into one binary on the response path.
 -define(H3_FRAME_DATA, 16#00).
 
+%% Worker process-dict flag: set once a `{stream, ...}` `Send` observed
+%% a fin variant, so `send_stream/5` knows whether to auto-close. Lives
+%% in this per-stream worker's dict, so stream isolation is automatic.
+-define(FIN_KEY, '$roadrunner_http3_stream_fin').
+
 -doc """
 Spawn a monitored worker for `StreamId`. Returns `{Pid, MonitorRef}`
 so the conn loop can correlate the eventual `'DOWN'` back to the
@@ -133,25 +138,19 @@ emit_handler_response(Conn, StreamId, {Status, Headers, Body}) when
 ->
     case forbidden_header(Headers) of
         {true, Name} ->
-            %% RFC 9114 §4.2: connection-specific header fields MUST NOT
-            %% be generated. A handler emitting one (e.g. a shared h1/h2
-            %% handler with `connection: close`) is a server bug, not a
-            %% received malformed message — answer 500 rather than write
-            %% a response the client rejects.
-            logger:error(#{
-                msg => "roadrunner h3 handler returned a connection-specific header",
-                header => Name
-            }),
-            send_buffered(
-                Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
-            ),
-            500;
+            reject_forbidden(Conn, StreamId, Name);
         false ->
             send_buffered(Conn, StreamId, Status, Headers, Body),
             Status
     end;
-emit_handler_response(Conn, StreamId, {stream, _, _, _}) ->
-    emit_501(Conn, StreamId);
+emit_handler_response(Conn, StreamId, {stream, Status, Headers, Fun}) ->
+    case forbidden_header(Headers) of
+        {true, Name} ->
+            reject_forbidden(Conn, StreamId, Name);
+        false ->
+            send_stream(Conn, StreamId, Status, Headers, Fun),
+            Status
+    end;
 emit_handler_response(Conn, StreamId, {loop, _, _, _}) ->
     emit_501(Conn, StreamId);
 emit_handler_response(Conn, StreamId, {sendfile, _, _, _}) ->
@@ -179,9 +178,25 @@ is_forbidden_header(~"transfer-encoding") -> true;
 is_forbidden_header(~"upgrade") -> true;
 is_forbidden_header(_) -> false.
 
-%% Stream / loop / sendfile / websocket response shapes are phase-2 for
-%% HTTP/3; until then they answer 501 (mirroring how h2 answers 501 for
-%% the WebSocket shape).
+%% RFC 9114 §4.2: connection-specific header fields MUST NOT be
+%% generated. A handler emitting one (e.g. a shared h1/h2 handler with
+%% `connection: close`) is a server bug, not a received malformed
+%% message — answer 500 rather than write a response the client rejects.
+%% Shared by the buffered and streaming response paths.
+-spec reject_forbidden(pid(), non_neg_integer(), binary()) -> 500.
+reject_forbidden(Conn, StreamId, Name) ->
+    logger:error(#{
+        msg => "roadrunner h3 handler returned a connection-specific header",
+        header => Name
+    }),
+    send_buffered(
+        Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
+    ),
+    500.
+
+%% `loop` / `sendfile` / `websocket` response shapes are not yet wired
+%% for HTTP/3; until then they answer 501 (mirroring how h2 answers 501
+%% for the WebSocket shape). The `stream` shape is supported.
 -spec emit_501(pid(), non_neg_integer()) -> 501.
 emit_501(Conn, StreamId) ->
     send_buffered(
@@ -202,17 +217,66 @@ emit_501(Conn, StreamId) ->
 ) ->
     ok.
 send_buffered(Conn, StreamId, Status, Headers, Body) ->
-    HeaderList = [{~":status", integer_to_binary(Status)} | roadrunner_http:with_date(Headers)],
-    HeadersFrame = quic_h3_frame:encode_headers(quic_qpack:encode(HeaderList)),
+    HeadersFrame = header_frame(Status, Headers),
     Frames =
         case iolist_size(Body) of
-            0 ->
-                HeadersFrame;
-            BodyLen ->
-                %% DATA frame as iodata: type + length varints, then the
-                %% body by reference (no flatten). `quic:send_data/4`
-                %% takes iodata and the transport `writev()`s it.
-                DataHeader = [quic_varint:encode(?H3_FRAME_DATA), quic_varint:encode(BodyLen)],
-                [HeadersFrame, DataHeader, Body]
+            0 -> HeadersFrame;
+            BodyLen -> [HeadersFrame, data_frame(Body, BodyLen)]
         end,
     ok = quic:send_data(Conn, StreamId, Frames, true).
+
+%% `{stream, ...}` response: HEADERS (no FIN), then the handler's fun
+%% emits DATA chunks through a `Send/2` callback, then the stream FIN.
+%% `Send(Data, nofin | fin | {fin, Trailers})` is the protocol-agnostic
+%% contract shared with h1/h2 (see `roadrunner_stream_response` /
+%% `roadrunner_http2_stream_response`); if the fun returns without a
+%% fin variant we close the stream so the peer never sees it half-open.
+%% The worker writes straight to the QUIC stream — QPACK is static-only
+%% and QUIC streams are independent, so no conn round-trip (unlike h2).
+-spec send_stream(
+    pid(),
+    non_neg_integer(),
+    roadrunner_http:status(),
+    roadrunner_http:headers(),
+    roadrunner_handler:stream_fun()
+) -> ok.
+send_stream(Conn, StreamId, Status, Headers, Fun) ->
+    ok = quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
+    erase(?FIN_KEY),
+    Send = fun(Data, FinFlag) -> stream_send(Conn, StreamId, Data, FinFlag) end,
+    _ = Fun(Send),
+    erase(?FIN_KEY) =:= true orelse stream_send(Conn, StreamId, <<>>, fin),
+    ok.
+
+%% One `Send/2` emission. Empty `nofin` data is a no-op (matches the
+%% h1/h2 contract); `fin` / `{fin, Trailers}` carry the stream FIN, the
+%% trailers riding a closing HEADERS frame after the DATA (RFC 9114 §4.1).
+-spec stream_send(
+    pid(), non_neg_integer(), iodata(), nofin | fin | {fin, roadrunner_http:headers()}
+) -> ok | {error, term()}.
+stream_send(Conn, StreamId, Data, nofin) ->
+    case iolist_size(Data) of
+        0 -> ok;
+        Len -> quic:send_data(Conn, StreamId, data_frame(Data, Len), false)
+    end;
+stream_send(Conn, StreamId, Data, fin) ->
+    put(?FIN_KEY, true),
+    quic:send_data(Conn, StreamId, data_frame(Data, iolist_size(Data)), true);
+stream_send(Conn, StreamId, Data, {fin, Trailers}) ->
+    put(?FIN_KEY, true),
+    TrailersFrame = quic_h3_frame:encode_headers(quic_qpack:encode(Trailers)),
+    quic:send_data(Conn, StreamId, [data_frame(Data, iolist_size(Data)), TrailersFrame], true).
+
+%% HEADERS frame: QPACK-encoded `:status` + the handler's headers, plus
+%% the auto-injected `Date` (RFC 9110 §6.6.1).
+-spec header_frame(roadrunner_http:status(), roadrunner_http:headers()) -> binary().
+header_frame(Status, Headers) ->
+    HeaderList = [{~":status", integer_to_binary(Status)} | roadrunner_http:with_date(Headers)],
+    quic_h3_frame:encode_headers(quic_qpack:encode(HeaderList)).
+
+%% DATA frame as iodata (type + length varints, then the body by
+%% reference) so a large body is never flattened. `Len` is the caller's
+%% already-computed `iolist_size(Body)`.
+-spec data_frame(iodata(), non_neg_integer()) -> iodata().
+data_frame(Body, Len) ->
+    [quic_varint:encode(?H3_FRAME_DATA), quic_varint:encode(Len), Body].

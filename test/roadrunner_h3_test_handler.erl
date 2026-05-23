@@ -37,7 +37,23 @@ handle(#{target := ~"/badheaders"} = Req) ->
     %% resets the stream on the worker's abnormal `'DOWN'`.
     {{200, not_a_list, ~"x"}, Req};
 handle(#{target := ~"/stream"} = Req) ->
-    {{stream, 200, [], fun(Send) -> Send(~"hi", fin) end}, Req};
+    %% Empty `nofin` is a no-op; two real chunks then `fin`.
+    {
+        {stream, 200, [], fun(Send) ->
+            ok = Send(<<>>, nofin),
+            ok = Send(~"chunk1-", nofin),
+            ok = Send(~"chunk2", fin)
+        end},
+        Req
+    };
+handle(#{target := ~"/stream-trailers"} = Req) ->
+    {{stream, 200, [], fun(Send) -> ok = Send(~"body", {fin, [{~"x-trailer", ~"v"}]}) end}, Req};
+handle(#{target := ~"/stream-noend"} = Req) ->
+    %% Returns without a `fin` — the framework auto-closes the stream.
+    {{stream, 200, [], fun(Send) -> ok = Send(~"data", nofin) end}, Req};
+handle(#{target := ~"/stream-forbidden"} = Req) ->
+    %% A connection-specific header on a stream response → 500.
+    {{stream, 200, [{~"connection", ~"close"}], fun(Send) -> ok = Send(~"x", fin) end}, Req};
 handle(#{target := ~"/loop"} = Req) ->
     {{loop, 200, [], 0}, Req};
 handle(#{target := ~"/sendfile"} = Req) ->
