@@ -80,11 +80,18 @@ experimental for now.
   until the connection's QUIC/TCP teardown reaps it; a uniform fix
   (e.g. the conn loop killing in-flight workers, or `sync` honoring the
   monitor) would close the narrow remaining window for `stream` + `loop`
-- h3 manual-mode body reading (parity with the deferred h2 item)
-- QPACK dynamic table (non-zero capacity)
-- Bench client h3 wiring (`quic_h3:connect`, currently a stub in
-  `scripts/bench.escript` / `test/roadrunner_bench_client.erl`) plus
-  the HttpArena `baseline-h3` / `static-h3` profiles
+- h3 manual-mode body reading (parity with the deferred h2 item) —
+  needs the same conn-loop→worker inbound routing WebSocket would, so
+  do it alongside that work, not standalone
+- WebSocket over h3 (`websocket` shape, still `501`) — RFC 9220
+  Extended CONNECT; do WebSocket over h2 (RFC 8441) first, since it's
+  the more common transport and h2 has no WebSocket either
+- QPACK dynamic table (non-zero capacity) — the `quic` dep has the full
+  RFC 9204 machinery; the work is wiring encoder/decoder streams +
+  section acks + blocked-stream buffering into the owned conn loop
+- HttpArena `baseline-h3` / `static-h3` profiles (the local
+  `scripts/bench.escript` h3 path is wired and measured; these live in
+  the separate `MDA2AV/HttpArena` repo)
 - WebTransport / Extended CONNECT (RFC 9220) and HTTP datagrams
   (RFC 9297), both already provided by the dep
 
