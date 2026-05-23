@@ -73,10 +73,13 @@ experimental for now.
 
 - WebSocket over h3 (the `websocket` shape, still `501`) — needs
   Extended CONNECT (RFC 9220); see the WebTransport item below
-- Stop a `{loop, _}` worker when its connection dies (it currently
-  blocks forever in `receive` if the conn goes away — the same
-  pre-existing gap h2 has; fix once for both, e.g. each conn loop kills
-  its in-flight workers on terminate)
+- Wake an h2 worker blocked in its send-`sync` when the conn dies. The
+  idle `{loop, _}` leak (worker parked in `info_loop`) is fixed on both
+  h2 and h3 (the worker monitors the conn and stops on its `DOWN`), but
+  an h2 worker stalled in `sync/1` waiting for a frame ack still blocks
+  until the connection's QUIC/TCP teardown reaps it; a uniform fix
+  (e.g. the conn loop killing in-flight workers, or `sync` honoring the
+  monitor) would close the narrow remaining window for `stream` + `loop`
 - h3 manual-mode body reading (parity with the deferred h2 item)
 - QPACK dynamic table (non-zero capacity)
 - Bench client h3 wiring (`quic_h3:connect`, currently a stub in
