@@ -2,15 +2,16 @@
 -moduledoc """
 Pure-Erlang HTTP client for the bench / stress / profile harness.
 
-Drives `h1` over plain TCP and `h2` over TLS+ALPN against a real
-roadrunner listener (or any RFC-conformant HTTP server). One
-connection per `open/3`; many `request/5` calls in a tight loop
-share the same connection and share HPACK state for h2.
+Drives `h1` over plain TCP, `h2` over TLS+ALPN, and `h3` over QUIC
+against a real roadrunner listener (or any RFC-conformant HTTP
+server). One connection per `open/3`; many `request/5` calls in a
+tight loop share the same connection (and HPACK state for h2).
 
-`h3` is reserved as a stub clause so the bench only has to track a
-single client surface across protocol versions; switching the
-clause body to `quic_h3:connect` (the `quic` dep is now in tree, used
-by the HTTP/3 listener) lands h3 support in one focused PR.
+`h3` uses the `quic` dep's turnkey `quic_h3` *client* (the same one
+`roadrunner_http3_SUITE` drives) — only the turnkey *server* is
+avoided. Its responses arrive as mailbox events; `request/5` collects
+them synchronously so the closed-loop contract is identical across
+protocols.
 
 ## Why pure-Erlang and not h2load
 
@@ -54,7 +55,15 @@ ms. That's now fixed at the listener layer
     authority :: binary()
 }).
 
--type conn() :: #h1_conn{} | #h2_conn{}.
+-record(h3_conn, {
+    %% The `quic_h3` connection process. QPACK + stream-id allocation
+    %% live in the dep; responses arrive as `{quic_h3, Conn, _}` events,
+    %% so there's no buffer / codec / stream-id state to thread here.
+    conn :: pid(),
+    authority :: binary()
+}).
+
+-type conn() :: #h1_conn{} | #h2_conn{} | #h3_conn{}.
 
 -doc """
 Open a connection. For `h2` performs the full preface + initial
@@ -91,8 +100,23 @@ open(Host, Port, h2c) ->
         {ok, S} -> h2_open_common({tcp, S}, Host);
         {error, _} = E -> E
     end;
-open(_Host, _Port, h3) ->
-    {error, not_implemented}.
+open(Host, Port, h3) ->
+    %% QUIC over UDP via the turnkey `quic_h3` client; `wait_connected`
+    %% blocks through the handshake so the first `request/5` can issue a
+    %% stream straight away (mirrors the h2 SETTINGS round-trip above).
+    HostBin = host_to_authority(Host),
+    case quic_h3:connect(HostBin, Port, #{verify => verify_none}) of
+        {ok, Conn} ->
+            case quic_h3:wait_connected(Conn, 5000) of
+                ok ->
+                    {ok, #h3_conn{conn = Conn, authority = HostBin}};
+                {error, _} = E ->
+                    _ = quic_h3:close(Conn),
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
 
 %% Shared post-connect handshake for h2 (TLS) and h2c (cleartext).
 %% `Sock` is the tagged transport — `{ssl, _}` or `{tcp, _}` — so the
@@ -205,6 +229,25 @@ request(
             end;
         {error, _} = E ->
             E
+    end;
+request(#h3_conn{conn = Conn, authority = Auth} = C, Method, Path, Headers, Body) ->
+    AllHeaders = [
+        {~":method", Method},
+        {~":scheme", ~"https"},
+        {~":authority", Auth},
+        {~":path", Path}
+        | Headers
+    ],
+    case h3_send_request(Conn, AllHeaders, Body) of
+        {ok, StreamId} ->
+            case h3_collect(Conn, StreamId, undefined, [], <<>>) of
+                {ok, Status, RespHeaders, RespBody} ->
+                    {ok, Status, RespHeaders, RespBody, C};
+                {error, _} = E ->
+                    E
+            end;
+        {error, _} = E ->
+            E
     end.
 
 -doc "Close the underlying TCP / TLS socket.".
@@ -214,6 +257,9 @@ close(#h1_conn{sock = Sock}) ->
     ok;
 close(#h2_conn{sock = Sock}) ->
     _ = tclose(Sock),
+    ok;
+close(#h3_conn{conn = Conn}) ->
+    _ = quic_h3:close(Conn),
     ok.
 
 -doc """
@@ -514,6 +560,57 @@ merge_h2_headers(Decoded, Status0, Headers0) ->
         end,
     Regular = [{N, V} || {N, V} <- Decoded, binary:first(N) =/= $:],
     {Status, Headers0 ++ Regular}.
+
+%% =============================================================================
+%% h3 helpers
+%% =============================================================================
+
+%% Issue the request HEADERS (and body, if any) and return the stream id.
+%% An empty body FINs on the HEADERS frame; a non-empty body FINs on the
+%% trailing DATA.
+h3_send_request(Conn, AllHeaders, <<>>) ->
+    quic_h3:request(Conn, AllHeaders);
+h3_send_request(Conn, AllHeaders, Body) ->
+    case quic_h3:request(Conn, AllHeaders, #{end_stream => false}) of
+        {ok, StreamId} ->
+            case quic_h3:send_data(Conn, StreamId, Body, true) of
+                ok -> {ok, StreamId};
+                {error, _} = E -> E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+%% Collect the response for `StreamId` from the connection's mailbox: the
+%% `{response, _}` event carries status + headers, `{data, _, Fin}` events
+%% accumulate the body, and a reset / connection error / close ends it.
+%% Other connection events are dropped so the mailbox can't grow across a
+%% long bench run.
+h3_collect(Conn, StreamId, Status, Headers, Acc) ->
+    receive
+        {quic_h3, Conn, {response, StreamId, S, H}} ->
+            h3_collect(Conn, StreamId, S, H, Acc);
+        {quic_h3, Conn, {data, StreamId, Data, true}} ->
+            {ok, Status, Headers, <<Acc/binary, Data/binary>>};
+        {quic_h3, Conn, {data, StreamId, Data, false}} ->
+            h3_collect(Conn, StreamId, Status, Headers, <<Acc/binary, Data/binary>>);
+        {quic_h3, Conn, {trailers, StreamId, _Trailers}} ->
+            {ok, Status, Headers, Acc};
+        {quic_h3, Conn, {stream_reset, StreamId, ErrorCode}} ->
+            {error, {stream_reset, ErrorCode}};
+        {quic_h3, Conn, {error, ErrorCode, _Reason}} ->
+            {error, {conn_error, ErrorCode}};
+        {quic_h3, Conn, closed} ->
+            {error, closed};
+        {quic_h3, Conn, _Other} ->
+            h3_collect(Conn, StreamId, Status, Headers, Acc)
+    after 5000 ->
+        {error, timeout}
+    end.
+
+%% =============================================================================
+%% shared helpers
+%% =============================================================================
 
 %% `:authority` MUST be a binary; tolerate hostname-as-list AND
 %% IP-tuple inputs from the bench's --host arg / `inet:ip_address()`.
