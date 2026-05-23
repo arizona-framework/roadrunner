@@ -841,13 +841,16 @@ response_kind({websocket, _, _}) -> websocket;
 response_kind({_, _, _}) -> buffered.
 
 %% RFC 9110 §9.3.2: a HEAD response carries the same headers the GET
-%% would but no content. Drop the body from a buffered response on a
-%% HEAD request; other shapes are unchanged (h1 strips only buffered +
-%% sendfile, and the streaming shapes leave framing to the handler).
-%% Used by the h2 / h3 workers, which otherwise have no method-aware
-%% response step — h1 handles HEAD directly in `dispatch_response/5`.
+%% would but no content. Collapse the body-bearing shapes (buffered,
+%% sendfile) to a header-only response on a HEAD request; the streaming
+%% shapes (stream / loop) are left to the handler, matching h1 (which
+%% strips only buffered + sendfile). Used by the h2 / h3 workers, which
+%% otherwise have no method-aware response step — h1 handles HEAD
+%% directly in `dispatch_response/5`.
 -doc false.
 -spec head_response(roadrunner_handler:response(), binary()) -> roadrunner_handler:response().
+head_response({sendfile, Status, Headers, _Spec}, ~"HEAD") ->
+    {Status, Headers, <<>>};
 head_response({Status, Headers, _Body}, ~"HEAD") when is_integer(Status) ->
     {Status, Headers, <<>>};
 head_response(Response, _Method) ->

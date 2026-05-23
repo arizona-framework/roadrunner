@@ -41,6 +41,11 @@
 %% in this per-stream worker's dict, so stream isolation is automatic.
 -define(FIN_KEY, '$roadrunner_http3_stream_fin').
 
+%% File-read granularity for the sendfile path. QUIC has no small frame
+%% cap (unlike h2's 16 KB DATA frames), so this is just a bounded read
+%% buffer that keeps the whole file off the heap.
+-define(SENDFILE_CHUNK_SIZE, 65536).
+
 -doc """
 Spawn a monitored worker for `StreamId`. Returns `{Pid, MonitorRef}`
 so the conn loop can correlate the eventual `'DOWN'` back to the
@@ -141,27 +146,37 @@ telemetry_metadata(#{
 emit_handler_response(Conn, StreamId, {Status, Headers, Body}) when
     is_integer(Status, 100, 599)
 ->
-    case forbidden_header(Headers) of
-        {true, Name} ->
-            reject_forbidden(Conn, StreamId, Name);
-        false ->
-            send_buffered(Conn, StreamId, Status, Headers, Body),
-            Status
-    end;
+    emit_checked(Conn, StreamId, Headers, fun() ->
+        send_buffered(Conn, StreamId, Status, Headers, Body),
+        Status
+    end);
 emit_handler_response(Conn, StreamId, {stream, Status, Headers, Fun}) ->
-    case forbidden_header(Headers) of
-        {true, Name} ->
-            reject_forbidden(Conn, StreamId, Name);
-        false ->
-            send_stream(Conn, StreamId, Status, Headers, Fun),
-            Status
-    end;
+    emit_checked(Conn, StreamId, Headers, fun() ->
+        send_stream(Conn, StreamId, Status, Headers, Fun),
+        Status
+    end);
+emit_handler_response(Conn, StreamId, {sendfile, Status, Headers, Spec}) ->
+    emit_checked(Conn, StreamId, Headers, fun() ->
+        send_sendfile(Conn, StreamId, Status, Headers, Spec),
+        Status
+    end);
 emit_handler_response(Conn, StreamId, {loop, _, _, _}) ->
-    emit_501(Conn, StreamId);
-emit_handler_response(Conn, StreamId, {sendfile, _, _, _}) ->
     emit_501(Conn, StreamId);
 emit_handler_response(Conn, StreamId, {websocket, _, _}) ->
     emit_501(Conn, StreamId).
+
+%% Emit a response unless it carries a connection-specific header
+%% (RFC 9114 §4.2), in which case answer 500. `Emit` performs the send
+%% and returns the status sent; shared by the buffered / stream /
+%% sendfile paths.
+-spec emit_checked(
+    pid(), non_neg_integer(), roadrunner_http:headers(), fun(() -> roadrunner_http:status())
+) -> roadrunner_http:status().
+emit_checked(Conn, StreamId, Headers, Emit) ->
+    case forbidden_header(Headers) of
+        {true, Name} -> reject_forbidden(Conn, StreamId, Name);
+        false -> Emit()
+    end.
 
 %% RFC 9114 §4.2 connection-specific header set. Function-clause
 %% dispatch (mirrors `roadrunner_http3_request:check_banned/1`) keeps it
@@ -199,9 +214,9 @@ reject_forbidden(Conn, StreamId, Name) ->
     ),
     500.
 
-%% `loop` / `sendfile` / `websocket` response shapes are not yet wired
-%% for HTTP/3; until then they answer 501 (mirroring how h2 answers 501
-%% for the WebSocket shape). The `stream` shape is supported.
+%% `loop` / `websocket` response shapes are not yet wired for HTTP/3;
+%% until then they answer 501 (mirroring how h2 answers 501 for the
+%% WebSocket shape). The `stream` and `sendfile` shapes are supported.
 -spec emit_501(pid(), non_neg_integer()) -> 501.
 emit_501(Conn, StreamId) ->
     send_buffered(
@@ -271,6 +286,46 @@ stream_send(Conn, StreamId, Data, {fin, Trailers}) ->
     put(?FIN_KEY, true),
     TrailersFrame = quic_h3_frame:encode_headers(quic_qpack:encode(Trailers)),
     quic:send_data(Conn, StreamId, [data_frame(Data, iolist_size(Data)), TrailersFrame], true).
+
+%% `{sendfile, ...}` response. There is no kernel sendfile over QUIC
+%% (the stream bytes are encrypted), so read the file in chunks and feed
+%% the streaming machinery, mirroring the h2 sendfile path. A file-open
+%% failure crashes the worker; the conn loop resets the stream.
+-spec send_sendfile(
+    pid(),
+    non_neg_integer(),
+    roadrunner_http:status(),
+    roadrunner_http:headers(),
+    roadrunner_handler:sendfile_spec()
+) -> ok.
+send_sendfile(Conn, StreamId, Status, Headers, {File, Offset, Length}) ->
+    Fun = fun(Send) ->
+        {ok, IoDev} = file:open(File, [read, raw, binary]),
+        try
+            {ok, _} = file:position(IoDev, Offset),
+            sendfile_loop(IoDev, Length, Send)
+        after
+            _ = file:close(IoDev)
+        end
+    end,
+    send_stream(Conn, StreamId, Status, Headers, Fun).
+
+%% Stream `Length` bytes from the open file as DATA chunks, FIN on the
+%% last (or an immediate empty FIN for a zero-length range).
+-spec sendfile_loop(file:io_device(), non_neg_integer(), roadrunner_handler:send_fun()) -> ok.
+sendfile_loop(_IoDev, 0, Send) ->
+    _ = Send(<<>>, fin),
+    ok;
+sendfile_loop(IoDev, Remaining, Send) ->
+    {ok, Bin} = file:read(IoDev, min(Remaining, ?SENDFILE_CHUNK_SIZE)),
+    case Remaining - byte_size(Bin) of
+        0 ->
+            _ = Send(Bin, fin),
+            ok;
+        NextRemaining ->
+            _ = Send(Bin, nofin),
+            sendfile_loop(IoDev, NextRemaining, Send)
+    end.
 
 %% HEADERS frame: QPACK-encoded `:status` + the handler's headers, plus
 %% the auto-injected `Date` (RFC 9110 §6.6.1).

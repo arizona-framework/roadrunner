@@ -57,7 +57,14 @@ handle(#{target := ~"/stream-forbidden"} = Req) ->
 handle(#{target := ~"/loop"} = Req) ->
     {{loop, 200, [], 0}, Req};
 handle(#{target := ~"/sendfile"} = Req) ->
+    %% Zero-length range — header-only, exercises the empty-range path.
     {{sendfile, 200, [], {"/dev/null", 0, 0}}, Req};
+handle(#{target := ~"/sendfile-small"} = Req) ->
+    %% 100 zero bytes from /dev/zero — a single read chunk.
+    {{sendfile, 200, [{~"content-length", ~"100"}], {"/dev/zero", 0, 100}}, Req};
+handle(#{target := ~"/sendfile-large"} = Req) ->
+    %% 100 KB — exceeds the read chunk, so the loop fragments.
+    {{sendfile, 200, [{~"content-length", ~"100000"}], {"/dev/zero", 0, 100_000}}, Req};
 handle(#{target := ~"/websocket"} = Req) ->
     {{websocket, some_module, state}, Req};
 handle(Req) ->

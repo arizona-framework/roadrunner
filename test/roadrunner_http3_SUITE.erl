@@ -30,6 +30,10 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     stream_trailers/1,
     stream_autoclose/1,
     stream_forbidden_header_500/1,
+    sendfile_empty/1,
+    sendfile_small/1,
+    sendfile_large/1,
+    head_sendfile/1,
     oversized_413/1,
     protocols_tuple_form/1,
     certfile_keyfile/1,
@@ -81,6 +85,10 @@ all() ->
         stream_trailers,
         stream_autoclose,
         stream_forbidden_header_500,
+        sendfile_empty,
+        sendfile_small,
+        sendfile_large,
+        head_sendfile,
         oversized_413,
         protocols_tuple_form,
         certfile_keyfile,
@@ -264,8 +272,37 @@ unsupported_shapes_501(Config) ->
         fun(Path) ->
             ?assertMatch({501, _}, status_body(get(Conn, Path)))
         end,
-        [~"/loop", ~"/sendfile", ~"/websocket"]
+        [~"/loop", ~"/websocket"]
     ),
+    close(Conn).
+
+sendfile_empty(Config) ->
+    %% A zero-length sendfile range is a header-only response.
+    Conn = connect(?config(port, Config)),
+    ?assertEqual({200, ~""}, status_body(get(Conn, ~"/sendfile"))),
+    close(Conn).
+
+sendfile_small(Config) ->
+    %% 100 bytes from /dev/zero, sent in a single DATA frame.
+    Conn = connect(?config(port, Config)),
+    {200, _Headers, Body} = get(Conn, ~"/sendfile-small"),
+    ?assertEqual(binary:copy(<<0>>, 100), Body),
+    close(Conn).
+
+sendfile_large(Config) ->
+    %% 100 KB from /dev/zero — exceeds the read chunk, so multiple DATA
+    %% frames are streamed and reassembled by the client.
+    Conn = connect(?config(port, Config)),
+    {200, _Headers, Body} = get(Conn, ~"/sendfile-large"),
+    ?assertEqual(binary:copy(<<0>>, 100_000), Body),
+    close(Conn).
+
+head_sendfile(Config) ->
+    %% RFC 9110 §9.3.2: HEAD on a sendfile route returns the headers but
+    %% no body (and never reads the file).
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = quic_h3:request(Conn, headers(~"HEAD", ~"/sendfile-small")),
+    ?assertEqual({200, ~""}, status_body(collect(Conn, StreamId))),
     close(Conn).
 
 stream_response(Config) ->
