@@ -56,8 +56,9 @@ for h3 framing and QPACK), not its turnkey `quic_h3` server, mirroring
 how roadrunner owns its own HTTP/1.1 and HTTP/2 stacks. `quic` is
 started on demand, so HTTP/1.1/HTTP/2-only deployments never boot it.
 
-The buffered response shape (`{Status, Headers, Body}`) works for
-GET/POST; QPACK runs static-table only
+Every non-WebSocket response shape works — buffered, `stream`,
+`sendfile`, and `loop` — with `HEAD` requests returning headers and no
+body; QPACK runs static-table only
 (`qpack_max_table_capacity = 0`). A conformance pass followed,
 bringing the owned connection loop in line with RFC 9114 / 9204:
 request-stream frame ordering, peer control / QPACK stream validation,
@@ -70,8 +71,12 @@ experimental for now.
 
 **Follow-ups:**
 
-- Streaming response shapes over h3 (`stream` / `loop` / `sendfile`),
-  which answer `501` today
+- WebSocket over h3 (the `websocket` shape, still `501`) — needs
+  Extended CONNECT (RFC 9220); see the WebTransport item below
+- Stop a `{loop, _}` worker when its connection dies (it currently
+  blocks forever in `receive` if the conn goes away — the same
+  pre-existing gap h2 has; fix once for both, e.g. each conn loop kills
+  its in-flight workers on terminate)
 - h3 manual-mode body reading (parity with the deferred h2 item)
 - QPACK dynamic table (non-zero capacity)
 - Bench client h3 wiring (`quic_h3:connect`, currently a stub in
