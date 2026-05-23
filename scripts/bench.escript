@@ -973,6 +973,23 @@ cli() ->
                     """
             },
             #{
+                name => profile_scope,
+                long => "-profile-scope",
+                type => {atom, [roadrunner, all]},
+                default => roadrunner,
+                help =>
+                    """
+                    Process seed for the profiler. `roadrunner` (default)
+                    traces only the roadrunner supervisor tree plus the
+                    conns/workers it spawns. `all` traces every process in
+                    the server BEAM — required for h3, whose connection
+                    processes are spawned by the `quic` dependency (not a
+                    roadrunner acceptor) and are invisible to the
+                    roadrunner-only seed; also use it to attribute time
+                    across roadrunner vs quic vs crypto.
+                    """
+            },
+            #{
                 name => protocols,
                 long => "-protocols",
                 type => {custom, fun parse_protocols/1},
@@ -1332,11 +1349,21 @@ cpu_pct(_, _, _) ->
 
 maybe_start_profile(_Peer, #{profile := false}) ->
     ok;
-maybe_start_profile(Peer, #{profile := true, profile_tool := fprof}) ->
+maybe_start_profile(Peer, #{profile := true, profile_tool := fprof, profile_scope := Scope}) ->
     Trace = "/tmp/roadrunner_bench_fprof.trace",
-    ok = peer:call(Peer, roadrunner_bench_profiler, start_fprof, [Trace]);
-maybe_start_profile(Peer, #{profile := true}) ->
-    ok = peer:call(Peer, roadrunner_bench_profiler, start, []).
+    Fun =
+        case Scope of
+            all -> start_fprof_all;
+            roadrunner -> start_fprof
+        end,
+    ok = peer:call(Peer, roadrunner_bench_profiler, Fun, [Trace]);
+maybe_start_profile(Peer, #{profile := true, profile_scope := Scope}) ->
+    Fun =
+        case Scope of
+            all -> start_all;
+            roadrunner -> start
+        end,
+    ok = peer:call(Peer, roadrunner_bench_profiler, Fun, []).
 
 maybe_stop_profile(_Peer, _Side, #{profile := false}) ->
     ok;
@@ -1353,7 +1380,10 @@ maybe_stop_profile(Peer, Side, #{profile := true, profile_tool := fprof}) ->
     io:format("~nprofile (fprof, ~s) written to ~s~n", [Side, Analysis]);
 maybe_stop_profile(Peer, Side, #{profile := true, profile_min_ms := MinMs}) ->
     Path = filename:join(["/tmp", "roadrunner_bench_eprof_" ++ atom_to_list(Side) ++ ".log"]),
-    ok = peer:call(Peer, roadrunner_bench_profiler, stop_and_dump, [Path, MinMs]),
+    %% `--profile-scope all` traces every process, so eprof's stop +
+    %% analyze walks a far larger trace than the roadrunner-only seed;
+    %% give it the same generous timeout as the fprof path.
+    ok = peer:call(Peer, roadrunner_bench_profiler, stop_and_dump, [Path, MinMs], 120000),
     %% Read the log written inside the peer's BEAM and print to the
     %% bench's own stdout. Files are visible to both because they
     %% share the host filesystem.

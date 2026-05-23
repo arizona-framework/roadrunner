@@ -11,13 +11,18 @@ the eprof totals.
 
 ## Profile scope
 
-Seeds profiling with the roadrunner supervisor tree (top sup +
-recursively-collected children) plus `{set_on_spawn, true}` so
-acceptor-spawned connection processes get auto-traced. This keeps
-the report focused on roadrunner internals and excludes
-peer-control, code_server, application_controller, and other
-framework processes whose `lists:foldl` / `gen:do_call` chatter
-would otherwise dominate the totals.
+`start/0` / `start_fprof/1` seed profiling with the roadrunner
+supervisor tree (top sup + recursively-collected children) plus
+`{set_on_spawn, true}` so acceptor-spawned connection processes get
+auto-traced. This keeps the report focused on roadrunner internals and
+excludes peer-control, code_server, application_controller, and other
+framework processes whose `lists:foldl` / `gen:do_call` chatter would
+otherwise dominate the totals.
+
+`start_all/0` / `start_fprof_all/1` seed every process in the node
+instead. Use them for HTTP/3 (whose connections the `quic` dependency
+spawns outside the roadrunner tree, invisible to the seed above) and to
+attribute time across roadrunner vs `quic` vs `crypto`.
 
 If `roadrunner_sup` isn't registered (e.g. the app didn't start),
 falls back to `processes()` so the profiler still works for
@@ -35,12 +40,34 @@ diagnosing startup failures.
    protocol, not free for arbitrary writes.
 """.
 
--export([start/0, stop_and_dump/2, start_fprof/1, stop_fprof_and_dump/2]).
+-export([
+    start/0, start_all/0, stop_and_dump/2, start_fprof/1, start_fprof_all/1, stop_fprof_and_dump/2
+]).
 
 -spec start() -> ok.
 start() ->
+    do_eprof_start(roadrunner_pids()).
+
+-doc """
+Like `start/0` but seeds *every* process in the node (`processes()`),
+not just the roadrunner tree. Required for HTTP/3: its connection
+processes are spawned by the `quic` dependency (the `connection_handler`
+fun runs in a dep process), not by a roadrunner acceptor, so they are
+neither in the roadrunner seed nor children of a traced process and the
+`set_on_spawn` propagation in `start/0` misses them entirely. Also use
+it to attribute time across roadrunner vs `quic` vs `crypto` modules.
+""".
+-spec start_all() -> ok.
+start_all() ->
+    do_eprof_start(processes()).
+
+%% Shared eprof bring-up: filter the seed to alive pids and start a
+%% total-time profiling session with `set_on_spawn` so children spawned
+%% mid-run are traced too.
+-spec do_eprof_start([pid()]) -> ok.
+do_eprof_start(Seed) ->
     {ok, _} = eprof:start(),
-    Pids = [P || P <- roadrunner_pids(), is_process_alive(P)],
+    Pids = [P || P <- Seed, is_process_alive(P)],
     case eprof:start_profiling(Pids, {'_', '_', '_'}, [{set_on_spawn, true}]) of
         profiling ->
             ok;
@@ -77,7 +104,21 @@ eprof times out (see `docs/conn_lifecycle_investigation.md`).
 """.
 -spec start_fprof(file:filename()) -> ok.
 start_fprof(TraceFile) ->
-    Pids = [P || P <- roadrunner_pids(), is_process_alive(P)],
+    do_fprof_start(TraceFile, roadrunner_pids()).
+
+-doc """
+Like `start_fprof/1` but seeds every process in the node, for the same
+HTTP/3 / attribution reasons as `start_all/0`.
+""".
+-spec start_fprof_all(file:filename()) -> ok.
+start_fprof_all(TraceFile) ->
+    do_fprof_start(TraceFile, processes()).
+
+%% Shared fprof bring-up: filter the seed to alive pids and start a
+%% verbose trace to `TraceFile`.
+-spec do_fprof_start(file:filename(), [pid()]) -> ok.
+do_fprof_start(TraceFile, Seed) ->
+    Pids = [P || P <- Seed, is_process_alive(P)],
     ok = fprof:trace([
         start,
         {procs, Pids},
