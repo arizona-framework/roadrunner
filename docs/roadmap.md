@@ -58,8 +58,13 @@ started on demand, so HTTP/1.1/HTTP/2-only deployments never boot it.
 
 The buffered response shape (`{Status, Headers, Body}`) works for
 GET/POST; QPACK runs static-table only
-(`qpack_max_table_capacity = 0`). `quic` is a young (1.x) dependency,
-so treat HTTP/3 as experimental for now.
+(`qpack_max_table_capacity = 0`). A conformance pass followed,
+bringing the owned connection loop in line with RFC 9114 / 9204:
+request-stream frame ordering, peer control / QPACK stream validation,
+GOAWAY on graceful drain, the matching connection error codes, an
+explicit per-connection request-stream cap, `certs_keys` / cert-chain
+TLS config, and a shared `Date` header across h1/h2/h3. `quic` is a
+young (1.x) dependency, so treat HTTP/3 as experimental for now.
 
 **Follow-ups:**
 
@@ -67,8 +72,6 @@ so treat HTTP/3 as experimental for now.
   which answer `501` today
 - Auto `Alt-Svc: h3=":<port>"` on TCP (h1/h2) responses when a listener
   co-serves h3, so browsers upgrade from TCP to QUIC
-- Graceful drain for h3 (per-stream wind-down + GOAWAY); today h3 conns
-  join the drain group and are force-closed at the deadline like h1/h2
 - h3 manual-mode body reading (parity with the deferred h2 item)
 - QPACK dynamic table (non-zero capacity)
 - Bench client h3 wiring (`quic_h3:connect`, currently a stub in
