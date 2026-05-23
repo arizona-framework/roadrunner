@@ -234,6 +234,8 @@ full_get_request_returns_response() ->
         roadrunner_http2_frame:parse(AllResponse, 16384),
     {ok, RespHeaders, _} = roadrunner_http2_hpack:decode(RespHpack, Dec0),
     ?assertEqual(~"200", proplists:get_value(~":status", RespHeaders)),
+    %% RFC 9110 §6.6.1: the response carries an auto-injected `date`.
+    ?assert(is_binary(proplists:get_value(~"date", RespHeaders))),
     %% Followed by a DATA frame on stream 1.
     {ok, {data, 1, DataFlags, _Body}, _} =
         roadrunner_http2_frame:parse(AfterHeaders, 16384),

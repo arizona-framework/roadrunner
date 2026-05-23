@@ -196,7 +196,7 @@ emit_501(Conn, StreamId) ->
 ) ->
     ok.
 send_buffered(Conn, StreamId, Status, Headers, Body) ->
-    HeaderList = [{~":status", integer_to_binary(Status)} | Headers],
+    HeaderList = [{~":status", integer_to_binary(Status)} | roadrunner_http:with_date(Headers)],
     HeadersFrame = quic_h3_frame:encode_headers(quic_qpack:encode(HeaderList)),
     Frames =
         case iolist_size(Body) of

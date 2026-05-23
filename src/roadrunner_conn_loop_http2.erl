@@ -1089,7 +1089,7 @@ encode_and_send_headers(
     %% RFC 9110 §5.5 field-value charset (CR/LF/NUL) crash here so the
     %% h2 path matches h1's `encode_headers/1` discipline.
     ok = validate_headers(Headers),
-    AllHeaders = [{~":status", StatusBin} | Headers],
+    AllHeaders = [{~":status", StatusBin} | roadrunner_http:with_date(Headers)],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     %% `frame:encode` accepts iodata for the header block — skip
     %% the upfront flatten; ssl:send walks the iolist anyway.
@@ -1126,7 +1126,7 @@ encode_and_send_response_atomic(
     %% reject CR/LF/NUL anywhere in the pair so they cannot reach the peer
     %% or split at an h2->h1 reverse proxy.
     ok = validate_headers(Headers),
-    AllHeaders = [{~":status", StatusBin} | Headers],
+    AllHeaders = [{~":status", StatusBin} | roadrunner_http:with_date(Headers)],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     HFrame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04, undefined, HpackBlock}

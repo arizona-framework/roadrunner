@@ -618,13 +618,13 @@ dispatch_response(Socket, _Handler, Req, {websocket, Mod, State}, ProtoOpts) whe
 dispatch_response(Socket, _Handler, _Req, {stream, Status, Headers0, Fun}, _ProtoOpts) when
     is_function(Fun, 1)
 ->
-    Headers = with_date(Headers0),
+    Headers = roadrunner_http:with_date(Headers0),
     _ = roadrunner_stream_response:run(Socket, Status, Headers, Fun),
     ok;
 dispatch_response(Socket, Handler, _Req, {loop, Status, Headers0, LoopState}, _ProtoOpts) when
     is_integer(Status)
 ->
-    Headers = with_date(Headers0),
+    Headers = roadrunner_http:with_date(Headers0),
     _ = roadrunner_loop_response:run(Socket, Status, Headers, Handler, LoopState),
     ok;
 dispatch_response(
@@ -632,7 +632,7 @@ dispatch_response(
 ) when
     is_integer(Status)
 ->
-    Headers = with_date(Headers0),
+    Headers = roadrunner_http:with_date(Headers0),
     Head = roadrunner_http1:response(Status, Headers, ~""),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Head), sendfile_response_head
@@ -671,7 +671,7 @@ dispatch_response(
 ) when
     is_integer(Status)
 ->
-    Headers = with_date(Headers0),
+    Headers = roadrunner_http:with_date(Headers0),
     Resp = roadrunner_http1:response(Status, Headers, ~""),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Resp), buffered_response
@@ -680,25 +680,12 @@ dispatch_response(
 dispatch_response(Socket, _Handler, _Req, {Status, Headers0, Body}, _ProtoOpts) when
     is_integer(Status)
 ->
-    Headers = with_date(Headers0),
+    Headers = roadrunner_http:with_date(Headers0),
     Resp = roadrunner_http1:response(Status, Headers, Body),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Resp), buffered_response
     ),
     ok.
-
-%% RFC 9110 §6.6.1: an origin server MUST emit `Date` on every
-%% response. We always have a clock (BEAM `erlang:system_time/0`),
-%% so inject Date unless the handler already set it. dispatch_response
-%% only fires for handler-emitted responses (status ≥ 200); 1xx
-%% interim responses are emitted by the framework directly without
-%% routing through this path, so we don't need a 1xx skip here.
--spec with_date(roadrunner_http:headers()) -> roadrunner_http:headers().
-with_date(Headers) ->
-    case lists:keymember(~"date", 1, Headers) of
-        true -> Headers;
-        false -> [{~"date", roadrunner_http:http_date_now()} | Headers]
-    end.
 
 %% --- finishing phase ---
 %%

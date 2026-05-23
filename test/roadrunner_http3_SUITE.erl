@@ -15,6 +15,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
 -export([suite/0, all/0, init_per_suite/1, end_per_suite/1, init_per_testcase/2, end_per_testcase/2]).
 -export([
     get_default/1,
+    response_has_date/1,
     get_method/1,
     post_echo/1,
     empty_204/1,
@@ -60,6 +61,7 @@ suite() ->
 all() ->
     [
         get_default,
+        response_has_date,
         get_method,
         post_echo,
         empty_204,
@@ -173,6 +175,13 @@ end_per_testcase(_Case, Config) ->
 get_default(Config) ->
     Conn = connect(?config(port, Config)),
     ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
+    close(Conn).
+
+response_has_date(Config) ->
+    %% RFC 9110 §6.6.1: every HTTP/3 response carries a `date` header.
+    Conn = connect(?config(port, Config)),
+    {200, Headers, _Body} = get(Conn, ~"/"),
+    ?assert(is_binary(proplists:get_value(~"date", Headers))),
     close(Conn).
 
 get_method(Config) ->
