@@ -20,6 +20,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     post_echo/1,
     empty_204/1,
     large_body/1,
+    head_request/1,
     large_post/1,
     not_found/1,
     crash_500/1,
@@ -70,6 +71,7 @@ all() ->
         post_echo,
         empty_204,
         large_body,
+        head_request,
         large_post,
         not_found,
         crash_500,
@@ -211,6 +213,14 @@ large_body(Config) ->
     Conn = connect(?config(port, Config)),
     {200, _Headers, Body} = get(Conn, ~"/big"),
     ?assertEqual(100_000, byte_size(Body)),
+    close(Conn).
+
+head_request(Config) ->
+    %% RFC 9110 §9.3.2: a HEAD response carries the GET headers but no
+    %% body — `/big` would be 100 KB on GET, empty on HEAD.
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = quic_h3:request(Conn, headers(~"HEAD", ~"/big")),
+    ?assertEqual({200, ~""}, status_body(collect(Conn, StreamId))),
     close(Conn).
 
 large_post(Config) ->

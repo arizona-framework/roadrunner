@@ -85,7 +85,7 @@ run_handler(Conn, StreamId, Req, ProtoOpts) ->
             })
     end.
 
-invoke(Conn, StreamId, Handler, Pipeline, Req, Metadata, ReqStart) ->
+invoke(Conn, StreamId, Handler, Pipeline, #{method := Method} = Req, Metadata, ReqStart) ->
     try Pipeline(Req) of
         {Response, _Req2} ->
             %% `emit_handler_response/3` returns the status actually sent
@@ -93,7 +93,12 @@ invoke(Conn, StreamId, Handler, Pipeline, Req, Metadata, ReqStart) ->
             %% response with 500 / 501) so telemetry reports the truth.
             %% It runs in the `of` body, whose exceptions a `try` does
             %% NOT catch — so it must not raise; it sends the response.
-            Status = emit_handler_response(Conn, StreamId, Response),
+            %% RFC 9110 §9.3.2: a HEAD response carries no content, so
+            %% emit the body-stripped form; telemetry keeps the handler's
+            %% original shape (`response_kind/1` below).
+            Status = emit_handler_response(
+                Conn, StreamId, roadrunner_conn:head_response(Response, Method)
+            ),
             ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, #{
                 status => Status,
                 response_kind => roadrunner_conn:response_kind(Response)

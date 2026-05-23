@@ -22,6 +22,7 @@ all_test_() ->
         fun bad_preface_closes_connection/0,
         fun non_settings_first_frame_triggers_goaway/0,
         fun full_get_request_returns_response/0,
+        fun head_request_omits_body/0,
         fun all_frame_types_handled/0,
         fun goaway_received_closes_connection/0,
         fun concurrent_streams_both_dispatch/0,
@@ -240,6 +241,47 @@ full_get_request_returns_response() ->
     {ok, {data, 1, DataFlags, _Body}, _} =
         roadrunner_http2_frame:parse(AfterHeaders, 16384),
     ?assertNotEqual(0, DataFlags band 16#01),
+    cleanup(Pid, Ref).
+
+head_request_omits_body() ->
+    %% RFC 9110 §9.3.2: a HEAD response is HEADERS with END_STREAM and
+    %% no DATA frame, even though the handler returns a body for `/`.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _InitialSettings = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ServerAck = expect_send(),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {HpackBlock, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"HEAD"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"localhost"},
+            {~":path", ~"/"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(HpackBlock),
+    HeadersFrame = iolist_to_binary(
+        roadrunner_http2_frame:encode(
+            {headers, 1, 16#04 bor 16#01, undefined, HpackBin}
+        )
+    ),
+    serve_recv(ConnPid, HeadersFrame),
+    Response1 = expect_send(),
+    Response2 = drain_send(50),
+    AllResponse =
+        case Response2 of
+            undefined -> Response1;
+            _ -> <<Response1/binary, Response2/binary>>
+        end,
+    %% HEADERS carries END_STREAM and nothing follows it (no DATA frame).
+    {ok, {headers, 1, HFlags, _, _RespHpack}, AfterHeaders} =
+        roadrunner_http2_frame:parse(AllResponse, 16384),
+    ?assertNotEqual(0, HFlags band 16#01),
+    ?assertEqual(<<>>, AfterHeaders),
     cleanup(Pid, Ref).
 
 all_frame_types_handled() ->
