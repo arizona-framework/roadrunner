@@ -28,6 +28,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     unsupported_shapes_501/1,
     loop_response/1,
     loop_filters_otp/1,
+    loop_conn_close_stops_worker/1,
     stream_response/1,
     stream_trailers/1,
     stream_autoclose/1,
@@ -85,6 +86,7 @@ all() ->
         unsupported_shapes_501,
         loop_response,
         loop_filters_otp,
+        loop_conn_close_stops_worker,
         stream_response,
         stream_trailers,
         stream_autoclose,
@@ -306,6 +308,23 @@ loop_filters_otp(Config) ->
     Worker ! stop,
     {200, _Headers, Body} = collect(Conn, StreamId),
     ?assertEqual(~"data: x\n\ndata: bye(1)\n\n", Body),
+    close(Conn).
+
+loop_conn_close_stops_worker(Config) ->
+    %% An idle `{loop, _}` worker stops when its connection dies, rather
+    %% than blocking forever in `receive`. Stopping the listener kills
+    %% the QUIC connection, which fires the worker's monitor.
+    Name = ?config(listener, Config),
+    Conn = connect(?config(port, Config)),
+    {ok, _StreamId} = quic_h3:request(Conn, headers(~"GET", ~"/loop")),
+    Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
+    WorkerRef = monitor(process, Worker),
+    ok = roadrunner_listener:stop(Name),
+    receive
+        {'DOWN', WorkerRef, process, Worker, _} -> ok
+    after 5000 ->
+        ct:fail(loop_worker_did_not_exit)
+    end,
     close(Conn).
 
 sendfile_empty(Config) ->

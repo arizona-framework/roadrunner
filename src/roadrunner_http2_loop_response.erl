@@ -32,6 +32,10 @@ Returns when the handler's `handle_info/3` returns `{stop, _}`.
 ) -> ok.
 run(ConnPid, StreamId, Status, Headers, {Handler, State}) ->
     sync_send_headers(ConnPid, StreamId, Status, Headers, false),
+    %% Stop looping if the conn process dies — otherwise an idle loop
+    %% worker (blocked in `info_loop` waiting for a message) leaks
+    %% forever once the conn is gone.
+    _ = monitor(process, ConnPid),
     Push = make_push(ConnPid, StreamId),
     info_loop(ConnPid, StreamId, Handler, Push, State).
 
@@ -40,6 +44,9 @@ run(ConnPid, StreamId, Status, Headers, {Handler, State}) ->
 ) -> ok.
 info_loop(ConnPid, StreamId, Handler, Push, State) ->
     receive
+        {'DOWN', _MonRef, process, ConnPid, _Reason} ->
+            %% Connection gone — stop looping.
+            ok;
         {system, _, _} ->
             info_loop(ConnPid, StreamId, Handler, Push, State);
         {'$gen_call', _, _} ->

@@ -347,6 +347,12 @@ sendfile_loop(IoDev, Remaining, Send) ->
 ) -> ok.
 send_loop(Conn, StreamId, Status, Headers, Handler, State) ->
     ok = quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
+    %% Stop looping if the connection dies — otherwise an idle loop
+    %% worker (blocked in `info_loop` waiting for a message) leaks
+    %% forever once the conn is gone. The monitor fires when the QUIC
+    %% connection process exits (promptly on a force-close / abort, or
+    %% after its drain timeout on a graceful close).
+    _ = monitor(process, Conn),
     Push = fun(Data) -> loop_push(Conn, StreamId, Data) end,
     info_loop(Conn, StreamId, Handler, Push, State).
 
@@ -356,6 +362,9 @@ send_loop(Conn, StreamId, Status, Headers, Handler, State) ->
 -spec info_loop(pid(), non_neg_integer(), module(), roadrunner_handler:push_fun(), term()) -> ok.
 info_loop(Conn, StreamId, Handler, Push, State) ->
     receive
+        {'DOWN', _MonRef, process, Conn, _Reason} ->
+            %% Connection gone — stop looping.
+            ok;
         {system, _, _} ->
             info_loop(Conn, StreamId, Handler, Push, State);
         {'$gen_call', _, _} ->

@@ -45,6 +45,7 @@ all_test_() ->
         fun stream_response_skips_empty_nofin/0,
         fun loop_response_emits_data_then_closes_on_stop/0,
         fun loop_response_filters_otp_messages/0,
+        fun loop_response_worker_stops_when_conn_dies/0,
         fun sendfile_empty_emits_empty_data/0,
         fun sendfile_small_file_emits_single_data_frame/0,
         fun sendfile_multi_frame_chunks_at_max_frame_size/0,
@@ -825,6 +826,22 @@ loop_response_filters_otp_messages() ->
         Frames
     ),
     cleanup(Pid, Ref).
+
+loop_response_worker_stops_when_conn_dies() ->
+    %% An idle loop worker (blocked in `info_loop`) monitors the conn
+    %% process and exits when it dies, instead of leaking forever.
+    {Pid, Ref} = run_stream_request(~"/loop"),
+    wait_for_register(roadrunner_h2_loop_test, 1000),
+    Worker = whereis(roadrunner_h2_loop_test),
+    WorkerRef = monitor(process, Worker),
+    %% `cleanup/2` kills the conn loop and waits for its `'DOWN'`; the
+    %% worker, monitoring that conn, then stops too.
+    cleanup(Pid, Ref),
+    receive
+        {'DOWN', WorkerRef, process, Worker, _} -> ok
+    after 1000 ->
+        error(loop_worker_did_not_exit)
+    end.
 
 sendfile_empty_emits_empty_data() ->
     %% Length=0: file is opened but never read. The base clause of
