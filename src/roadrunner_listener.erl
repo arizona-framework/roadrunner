@@ -53,6 +53,13 @@ All duration and interval values in `opts()` are in milliseconds —
 %% roadrunner's, not whatever default the QUIC transport happens to use.
 -define(H3_MAX_STREAMS_BIDI, 100).
 
+%% Number of extra reuseport listeners in the HTTP/3 pool (the dep adds
+%% one base listener, so the pool size is this + 1). N listeners bind the
+%% same UDP port with SO_REUSEPORT and share one connection registry; the
+%% kernel spreads inbound datagrams across them so demux parallelizes
+%% across cores instead of funnelling through one process.
+-define(H3_LISTENER_POOL_SIZE, 7).
+
 -doc """
 Listener configuration map.
 
@@ -292,10 +299,11 @@ WebSocket inbound size caps (under `ws` in the listener opts).
             interval := pos_integer(),
             prev_diff := non_neg_integer()
         },
-    %% QUIC listener pid when `http3` is in `protocols`, else
-    %% `undefined`. roadrunner owns its lifecycle (started in `init/1`,
-    %% stopped in `terminate/1` / `do_drain/2`); the QUIC transport
-    %% drives the UDP socket while roadrunner owns the h3 conn loop.
+    %% QUIC listener pool supervisor pid when `http3` is in `protocols`,
+    %% else `undefined`. roadrunner owns its lifecycle (started in
+    %% `init/1`, stopped in `terminate/1` / `do_drain/2`); the pooled
+    %% reuseport listeners drive the UDP sockets while roadrunner owns
+    %% the h3 conn loop.
     %% Kept last so the record's existing field positions are unchanged
     %% (some tests read `proto_opts` positionally via `element/2`).
     quic_listener = undefined :: pid() | undefined
@@ -490,35 +498,71 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
             #{tls := UserTlsOpts} = Opts,
             {Cert, CertChain, Key} = quic_cert_key(UserTlsOpts),
             Handler = fun(ConnPid) -> roadrunner_conn_loop_http3:start(ConnPid, ProtoOpts) end,
-            %% Start unlinked, then link on success: an `init`-time bind
-            %% failure returns `{error, _}` cleanly (so `init/1` can close
-            %% the already-opened TCP socket) instead of taking the
-            %% listener down via the link. The link on success gives the
-            %% running QUIC listener shared fate with this gen_server.
-            case
-                quic_listener:start(Port, #{
-                    cert => Cert,
-                    key => Key,
-                    cert_chain => CertChain,
-                    alpn => [~"h3"],
-                    max_streams_bidi => ?H3_MAX_STREAMS_BIDI,
-                    connection_handler => Handler
-                })
-            of
-                {ok, QuicListener} ->
-                    true = link(QuicListener),
-                    {ok, QuicListener};
-                {error, _} = Error ->
-                    Error
-            end
+            %% Start a POOL of reuseport listeners (the dep enables
+            %% SO_REUSEPORT when pool_size > 0 and shares one connection
+            %% registry across them) so inbound demux parallelizes across
+            %% cores rather than funnelling through one listener process.
+            %% `quic_listener_sup:start_link` links the pool supervisor to
+            %% this gen_server for shared fate; an `init`-time bind failure
+            %% comes back as `{error, _}` from the synchronous start (so
+            %% `init/1` can still close the already-opened TCP socket).
+            %% A reuseport pool needs a CONCRETE port: binding port 0 on
+            %% each listener would hand out a different ephemeral port. So
+            %% when asked for an ephemeral port, hold a reuseport probe
+            %% socket to pin a free port, start the pool on it, then drop
+            %% the probe (the pool listeners keep the port via reuseport).
+            {QuicPort, Probe} = resolve_quic_port(Port),
+            Res = start_quic_pool(QuicPort, #{
+                cert => Cert,
+                key => Key,
+                cert_chain => CertChain,
+                alpn => [~"h3"],
+                max_streams_bidi => ?H3_MAX_STREAMS_BIDI,
+                connection_handler => Handler,
+                pool_size => ?H3_LISTENER_POOL_SIZE
+            }),
+            ok = close_quic_probe(Probe),
+            Res
     end.
+
+%% The pool is a supervisor, so it can only be `start_link`ed - which
+%% makes this gen_server its parent (the pool then lives as long as the
+%% listener, and they share fate). Trap exits only across the start so a
+%% bind failure surfaces as `{error, _}` rather than the supervisor's
+%% startup EXIT killing this otherwise non-trapping process. Trap is
+%% restored immediately; any stray trapped EXIT left in the mailbox is
+%% harmlessly dropped by the catch-all `handle_info/2`.
+-spec start_quic_pool(inet:port_number(), map()) -> {ok, pid()} | {error, term()}.
+start_quic_pool(Port, PoolOpts) ->
+    OldTrap = process_flag(trap_exit, true),
+    try
+        quic_listener_sup:start_link(Port, PoolOpts)
+    after
+        _ = process_flag(trap_exit, OldTrap)
+    end.
+
+%% Pin a free UDP port with a reuseport probe socket so all pool
+%% listeners bind the same concrete port; a fixed port is used as-is.
+-spec resolve_quic_port(inet:port_number()) ->
+    {inet:port_number(), gen_udp:socket() | undefined}.
+resolve_quic_port(0) ->
+    {ok, Probe} = gen_udp:open(0, [{reuseport, true}]),
+    {ok, ProbePort} = inet:port(Probe),
+    {ProbePort, Probe};
+resolve_quic_port(Port) ->
+    {Port, undefined}.
+
+-spec close_quic_probe(gen_udp:socket() | undefined) -> ok.
+close_quic_probe(undefined) -> ok;
+close_quic_probe(Probe) -> gen_udp:close(Probe).
 
 %% The bound port comes from whichever transport owns it. TCP wins when
 %% present (co-listen reuses the same number for UDP); an HTTP/3-only
 %% listener reads it back from the QUIC listener.
 -spec bound_port(roadrunner_transport:socket() | none, pid() | undefined) -> inet:port_number().
-bound_port(none, QuicListener) ->
-    quic_listener:get_port(QuicListener);
+bound_port(none, QuicPool) ->
+    [Listener | _] = quic_listener_sup:get_listeners(QuicPool),
+    quic_listener:get_port(Listener);
 bound_port(LSocket, _QuicListener) ->
     {ok, BoundPort} = roadrunner_transport:port(LSocket),
     BoundPort.
@@ -1208,8 +1252,13 @@ terminate(_Reason, #state{
     close_tcp(LSocket).
 
 -spec stop_quic(pid() | undefined) -> ok.
-stop_quic(undefined) -> ok;
-stop_quic(QuicListener) -> quic_listener:stop(QuicListener).
+stop_quic(undefined) ->
+    ok;
+stop_quic(QuicPool) ->
+    %% Unlink first so stopping the pool (which `exit/2`s the supervisor)
+    %% doesn't deliver a teardown EXIT back to this gen_server.
+    true = unlink(QuicPool),
+    quic_listener_sup:stop(QuicPool).
 
 -spec erase_routes(roadrunner_conn:proto_opts()) -> ok.
 erase_routes(#{dispatch := {router, Name}}) ->
