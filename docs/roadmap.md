@@ -69,6 +69,25 @@ advertising on the co-served h1/h2 responses so browsers upgrade from
 TCP to QUIC. `quic` is a young (1.x) dependency, so treat HTTP/3 as
 experimental for now.
 
+**Capability parity across protocols:**
+
+| Capability | h1 | h2 | h3 |
+| --- | --- | --- | --- |
+| Response shapes (buffered / `stream` / `sendfile` / `loop`) | yes | yes | yes |
+| `HEAD` returns headers, no body | yes | yes | yes |
+| Manual body reading (`body_buffering => manual`, `read_body`) | yes | no (auto-buffers) | no (auto-buffers) |
+| Dynamic header-table compression | n/a (no header table) | HPACK, encode + decode | QPACK static-only (no dynamic table) |
+| WebSocket | yes (RFC 6455) | `501` | `501` |
+| Advertises `Alt-Svc: h3` | yes | yes | n/a |
+
+The gaps are deliberate: manual body reading and WebSocket are absent on
+h2 too, and both want the same conn-loop->worker inbound routing, so
+they are "do h2 first" items, not h3-specific. The header-compression
+gap is the one place where h3 is BEHIND h2 (h2 does HPACK dynamically
+both ways); closing it on the decode side (so clients may compress
+repeated request headers) is the next h3 step, with dynamic ENCODE of
+responses deferred behind the same routing work.
+
 **Performance (per-request cost):** h3's per-request cost is dominated by
 the `quic` dependency's transport, not roadrunner. A whole-node profile
 (`--profile-scope all`, eprof and fprof cross-checked) puts roadrunner's
