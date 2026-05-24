@@ -211,6 +211,15 @@ recv_loop(#h3{conn = Conn} = State) ->
 %% SETTINGS as its first frame). Ownership transfers in the handshaking
 %% state, so `connected` is delivered to this loop exactly once. The
 %% control stream stays open (no FIN) for the connection's lifetime.
+%%
+%% The SETTINGS send is fire-and-forget (`_ =`, as in `start_drain/1`): a
+%% peer that closes right after the handshake (e.g. rejecting a field
+%% section) leaves the connection draining, so the send returns
+%% `{error, {invalid_state, draining}}`. That is an expected race, not a
+%% fault — the queued `{closed, _}` event terminates the loop cleanly, so
+%% there is nothing to recover and no reason to crash on it. The open
+%% runs the instant the handshake completes, before any peer close can
+%% arrive, so it stays strictly matched.
 -spec send_control_stream(#h3{}) -> #h3{}.
 send_control_stream(#h3{conn = Conn} = State) ->
     {ok, CtrlStreamId} = quic:open_unidirectional_stream(Conn),
@@ -219,7 +228,7 @@ send_control_stream(#h3{conn = Conn} = State) ->
         qpack_max_table_capacity => 0,
         qpack_blocked_streams => 0
     }),
-    ok = quic:send_data(Conn, CtrlStreamId, [Prefix, Settings], false),
+    _ = quic:send_data(Conn, CtrlStreamId, [Prefix, Settings], false),
     State#h3{control_stream_id = CtrlStreamId}.
 
 %% Begin a graceful drain (RFC 9114 §5.2): send a GOAWAY on the control
