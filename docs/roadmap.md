@@ -90,6 +90,12 @@ over the dep's existing reuseport listener pool (`quic_listener_sup` with
 one connection registry) recovers multi-core scaling: 36.2k at 50
 clients, 33.4k at 400 (+14% / +55%), and the under-load drop shrinks from
 32% to 8%. No dep change - the pinned hex `quic` already ships the pool.
+Bumping the dep to 1.4.2 (h3 HEADERS+DATA coalescing + lazy connection
+timers) lifts the pool further to ~44k / ~40k. h3 response headers now
+coalesce with the first body chunk: roadrunner's streaming shapes are
+unaffected (the h3 suite stays green), but a headers-first / body-later
+response such as SSE-over-h3 emits its headers with the first chunk
+rather than immediately - a first-byte latency nuance, not a break.
 
 Open h3 perf follow-ups:
 - The pool size is configurable via `{http3, #{listeners => N}}`
