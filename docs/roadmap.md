@@ -69,26 +69,37 @@ advertising on the co-served h1/h2 responses so browsers upgrade from
 TCP to QUIC. `quic` is a young (1.x) dependency, so treat HTTP/3 as
 experimental for now.
 
-**Performance:** the local closed-loop bench (`scripts/bench.escript
---protocols h3`) puts h3 at ~30k req/s on localhost, vs ~171k for h2
-and ~351k for h1. A whole-node profile (`--profile-scope all`, eprof
-and fprof cross-checked) attributes that gap almost entirely to the
-QUIC transport in the `quic` dependency, not to roadrunner: roadrunner's
-own h3 code (conn loop + stream workers) is ~1.5-2.5% of server CPU,
-while ~90% is the dep's pure-Erlang packet/frame processing
-(`quic_connection`), AEAD framing plus `crypto` NIFs (~17%), and QPACK
-(~5%). Two consequences. First, optimizing roadrunner's h3 layer cannot
-move throughput, so no such change is worth making (the buffered-send
-`gen_statem:call` -> async-cast swap was evaluated and dropped on this
-basis). Second, moving QUIC logic into roadrunner is not justified on
-perf grounds: the cost is inherent pure-Erlang QUIC work the dep already
-does about as well as a reimplementation would, and the one structural
-saving (a hand-rolled connection loop instead of the dep's `gen_statem`)
-is only ~3.5%. The real lever for h3 speed is a faster transport
-(upstream `quic` work, or a NIF / kernel-assisted QUIC), a far larger
-effort than the expected gain and one that cuts against the "own the
-listener, lean on deps as helpers" design. h3 stays correct-but-slower
-and experimental until the transport matures.
+**Performance (per-request cost):** h3's per-request cost is dominated by
+the `quic` dependency's transport, not roadrunner. A whole-node profile
+(`--profile-scope all`, eprof and fprof cross-checked) puts roadrunner's
+own h3 code (conn loop + stream workers) at ~1.5-2.5% of server CPU,
+while ~90% is the dep's pure-Erlang packet/frame processing, AEAD framing
+plus `crypto` NIFs (~17%), and QPACK (~5%). So optimizing roadrunner's h3
+hot path can't move per-request throughput (a QPACK-huffman encoder
+rewrite and a buffered-send async-cast swap were both evaluated and
+dropped on this basis), and reimplementing QUIC in roadrunner isn't
+justified. The lever there is a faster transport (upstream `quic` work or
+a NIF / kernel-assisted stack), out of scope for now.
+
+**Scalability (fixed):** a single QUIC listener received and demuxed
+every inbound datagram, so h3 throughput FELL under load (closed-loop
+hello: 31.7k req/s at 50 clients down to 21.5k at 400, CPU stuck at
+~10/24 cores) - inbound serialization, not per-request cost. Serving h3
+over the dep's existing reuseport listener pool (`quic_listener_sup` with
+`pool_size`; the kernel spreads datagrams across N listeners that share
+one connection registry) recovers multi-core scaling: 36.2k at 50
+clients, 33.4k at 400 (+14% / +55%), and the under-load drop shrinks from
+32% to 8%. No dep change - the pinned hex `quic` already ships the pool.
+
+Open h3 perf follow-ups:
+- The pool size is a fixed 8 listeners (`?H3_LISTENER_POOL_SIZE`); make
+  it a validated listener option and/or scale it with scheduler count
+- Reuseport routes by the kernel's 4-tuple hash, so a client that
+  MIGRATES to a server-issued CID could land on a shard that doesn't know
+  it: the dep registers only the initial CIDs in the shared table
+  (stable-address benches are unaffected). Dep-side fix: register
+  `NEW_CONNECTION_ID`s in the shared table, or `quic_lb`-encode a shard
+  index into them
 
 **Follow-ups:**
 
