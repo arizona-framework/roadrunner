@@ -95,12 +95,15 @@ Open h3 perf follow-ups:
 - The pool size is configurable via `{http3, #{listeners => N}}`
   (validated `1..1024`, default 8, `1` = no pooling); a scheduler-scaled
   default is a possible future tweak but is currently unmeasured
-- Reuseport routes by the kernel's 4-tuple hash, so a client that
-  MIGRATES to a server-issued CID could land on a shard that doesn't know
-  it: the dep registers only the initial CIDs in the shared table
-  (stable-address benches are unaffected). Dep-side fix: register
-  `NEW_CONNECTION_ID`s in the shared table, or `quic_lb`-encode a shard
-  index into them
+- The reuseport pool does NOT break migration routing (an earlier worry,
+  checked and dismissed): the dep never issues spare server connection
+  IDs - `issue_new_connection_ids` has no caller and is externally
+  uncallable - so a migrating client keeps using the initial server CID,
+  which every pool listener resolves via the shared registry regardless
+  of which shard receives the packet. Full RFC 9000 CID rotation (issuing
+  spare server CIDs and registering them so packets using them route) is
+  a separate, currently-unwired dep feature, not a sharding gap; a
+  deliberate upstream effort if wanted
 
 **Follow-ups:**
 
