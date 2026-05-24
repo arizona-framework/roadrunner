@@ -502,8 +502,12 @@ quic_start_failure_releases_tcp(_Config) ->
     %% TCP binds but the QUIC listener can't (its UDP port is taken), so
     %% `init/1` closes the TCP socket it already opened and fails to start.
     process_flag(trap_exit, true),
-    {ok, Occupier} = gen_udp:open(0, []),
-    {ok, Port} = inet:port(Occupier),
+    %% Pin a port that is free for TCP but occupied for UDP, so the TCP
+    %% listen reliably succeeds and only the QUIC (UDP) bind fails. Using
+    %% a bare UDP-ephemeral port let the TCP listen occasionally fail
+    %% first (when that port happened to be TCP-taken), which dodged the
+    %% "release TCP after QUIC fails" branch this test is meant to cover.
+    {Occupier, Port} = udp_occupied_tcp_free_port(),
     try
         Result = roadrunner_listener:start_link(listener_name(quic_start_failure_releases_tcp), #{
             port => Port,
@@ -831,6 +835,22 @@ free_udp_port() ->
     {ok, Port} = inet:port(S),
     ok = gen_udp:close(S),
     Port.
+
+%% Return an open UDP socket plus its port, having confirmed that port is
+%% also free for TCP. The caller occupies UDP while leaving TCP free, so
+%% a co-listening h1+h3 listener binds TCP fine and only its QUIC bind
+%% fails. Retries until it finds a port free for both protocols.
+udp_occupied_tcp_free_port() ->
+    {ok, Occupier} = gen_udp:open(0, []),
+    {ok, Port} = inet:port(Occupier),
+    case gen_tcp:listen(Port, []) of
+        {ok, Probe} ->
+            ok = gen_tcp:close(Probe),
+            {Occupier, Port};
+        {error, _} ->
+            ok = gen_udp:close(Occupier),
+            udp_occupied_tcp_free_port()
+    end.
 
 %% --- h3 client helpers ---
 
