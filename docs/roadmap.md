@@ -92,8 +92,9 @@ clients, 33.4k at 400 (+14% / +55%), and the under-load drop shrinks from
 32% to 8%. No dep change - the pinned hex `quic` already ships the pool.
 
 Open h3 perf follow-ups:
-- The pool size is a fixed 8 listeners (`?H3_LISTENER_POOL_SIZE`); make
-  it a validated listener option and/or scale it with scheduler count
+- The pool size is configurable via `{http3, #{listeners => N}}`
+  (validated `1..1024`, default 8, `1` = no pooling); a scheduler-scaled
+  default is a possible future tweak but is currently unmeasured
 - Reuseport routes by the kernel's 4-tuple hash, so a client that
   MIGRATES to a server-issued CID could land on a shard that doesn't know
   it: the dep registers only the initial CIDs in the shared table
