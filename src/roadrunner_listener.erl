@@ -53,12 +53,15 @@ All duration and interval values in `opts()` are in milliseconds —
 %% roadrunner's, not whatever default the QUIC transport happens to use.
 -define(H3_MAX_STREAMS_BIDI, 100).
 
-%% Number of extra reuseport listeners in the HTTP/3 pool (the dep adds
-%% one base listener, so the pool size is this + 1). N listeners bind the
-%% same UDP port with SO_REUSEPORT and share one connection registry; the
-%% kernel spreads inbound datagrams across them so demux parallelizes
-%% across cores instead of funnelling through one process.
--define(H3_LISTENER_POOL_SIZE, 7).
+%% Default number of reuseport listeners in the HTTP/3 pool, overridable
+%% per listener via `{http3, #{listeners => N}}` in `protocols`. The N
+%% listeners bind the same UDP port with SO_REUSEPORT and share one
+%% connection registry; the kernel spreads inbound datagrams across them
+%% so demux parallelizes across cores instead of funnelling through one
+%% process. (The dep's pool takes `pool_size`, the count BEYOND its base
+%% listener, so the wiring passes `listeners - 1`.)
+-define(DEFAULT_H3_LISTENERS, 8).
+-define(MAX_H3_LISTENERS, 1024).
 
 -doc """
 Listener configuration map.
@@ -237,7 +240,7 @@ same port. The QUIC handshake advertises the `h3` ALPN itself, so
 `http3` does not appear in the TCP `alpn_preferred_protocols`.
 """.
 -type protocol_entry() ::
-    http1 | http2 | http3 | {http1, #{}} | {http2, http2_opts()} | {http3, #{}}.
+    http1 | http2 | http3 | {http1, #{}} | {http2, http2_opts()} | {http3, http3_opts()}.
 
 -doc """
 HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
@@ -261,6 +264,19 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
     conn_window => 1..16#7FFFFFFF,
     stream_window => 1..16#7FFFFFFF,
     window_refill_threshold => 1..16#7FFFFFFF
+}.
+
+-doc """
+HTTP/3 listener tunables (under `{http3, ThisMap}` in `protocols`).
+
+- `listeners` — number of reuseport listener processes in the QUIC
+  pool (`1..1024`). They bind the same UDP port and share one
+  connection registry; the kernel spreads inbound datagrams across
+  them, so inbound demux parallelizes across cores. Default 8.
+  `1` disables pooling (a single listener, no `SO_REUSEPORT`).
+""".
+-type http3_opts() :: #{
+    listeners => 1..?MAX_H3_LISTENERS
 }.
 
 -doc """
@@ -512,6 +528,7 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
             %% socket to pin a free port, start the pool on it, then drop
             %% the probe (the pool listeners keep the port via reuseport).
             {QuicPort, Probe} = resolve_quic_port(Port),
+            Listeners = maps:get(http3_listeners, ProtoOpts, ?DEFAULT_H3_LISTENERS),
             Res = start_quic_pool(QuicPort, #{
                 cert => Cert,
                 key => Key,
@@ -519,7 +536,7 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
                 alpn => [~"h3"],
                 max_streams_bidi => ?H3_MAX_STREAMS_BIDI,
                 connection_handler => Handler,
-                pool_size => ?H3_LISTENER_POOL_SIZE
+                pool_size => Listeners - 1
             }),
             ok = close_quic_probe(Probe),
             Res
@@ -900,7 +917,7 @@ normalize_protocols(Opts) ->
         [http2, http1] when not HasTls ->
             error({listener_opt_conflict, protocols, Raw, no_h2c_upgrade});
         _ ->
-            {Names, flatten_http2_opts(Entries)}
+            {Names, maps:merge(flatten_http2_opts(Entries), flatten_http3_opts(Entries))}
     end.
 
 -spec require_tls_for_h3([http1 | http2 | http3, ...], boolean(), term()) -> ok.
@@ -912,7 +929,7 @@ require_tls_for_h3(Names, HasTls, Raw) ->
             ok
     end.
 
--type protocol_entry_norm() :: {http1, #{}} | {http2, http2_opts()} | {http3, #{}}.
+-type protocol_entry_norm() :: {http1, #{}} | {http2, http2_opts()} | {http3, http3_opts()}.
 
 -spec normalize_protocols_list(term()) -> [protocol_entry_norm(), ...].
 normalize_protocols_list(L) when is_list(L), L =/= [] ->
@@ -935,9 +952,9 @@ normalize_protocol_entry({http1, Opts}, _Raw) when is_map(Opts), map_size(Opts) 
 normalize_protocol_entry({http2, Opts}, Raw) when is_map(Opts) ->
     {http2, validate_http2_opts(Opts, Raw)};
 normalize_protocol_entry(http3, _Raw) ->
-    {http3, #{}};
-normalize_protocol_entry({http3, Opts}, _Raw) when is_map(Opts), map_size(Opts) =:= 0 ->
-    {http3, #{}};
+    {http3, http3_defaults()};
+normalize_protocol_entry({http3, Opts}, Raw) when is_map(Opts) ->
+    {http3, validate_http3_opts(Opts, Raw)};
 normalize_protocol_entry(_, Raw) ->
     error({invalid_listener_opt, protocols, Raw}).
 
@@ -978,6 +995,37 @@ flatten_http2_opts(Entries) ->
                 http2_stream_window => Stream,
                 http2_window_refill_threshold => Threshold
             }
+    end.
+
+-spec http3_defaults() -> http3_opts().
+http3_defaults() ->
+    #{listeners => ?DEFAULT_H3_LISTENERS}.
+
+-spec validate_http3_opts(map(), term()) -> http3_opts().
+validate_http3_opts(Opts, Raw) ->
+    Defaults = http3_defaults(),
+    maps:fold(
+        fun(K, V, Acc) ->
+            case is_map_key(K, Defaults) of
+                false -> error({invalid_listener_opt, protocols, Raw});
+                true when is_integer(V, 1, ?MAX_H3_LISTENERS) -> Acc#{K => V};
+                true -> error({invalid_listener_opt, protocols, Raw})
+            end
+        end,
+        Defaults,
+        Opts
+    ).
+
+%% Flatten the http3 sub-opts onto proto_opts top-level (`http3_*`) so
+%% `start_quic/4` reads the listener count with a single `maps:get/2`.
+%% Returns an empty map when http3 isn't in the list.
+-spec flatten_http3_opts([protocol_entry_norm(), ...]) -> #{atom() => term()}.
+flatten_http3_opts(Entries) ->
+    case lists:keyfind(http3, 1, Entries) of
+        false ->
+            #{};
+        {http3, #{listeners := Listeners}} ->
+            #{http3_listeners => Listeners}
     end.
 
 -spec ws_defaults() ->
