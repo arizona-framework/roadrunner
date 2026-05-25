@@ -148,12 +148,11 @@ Open h3 perf follow-ups:
 - h3 manual-mode body reading (parity with the deferred h2 item) —
   needs the same conn-loop→worker inbound routing WebSocket would, so
   do it alongside that work, not standalone
-- Bound the h3 request header block. The body is capped by
-  `max_content_length`, but the HEADERS field section and the per-stream
-  decode buffer are not, so within QUIC flow control a peer can buffer a
-  large header block. Add a size cap (and consider advertising
-  `SETTINGS_MAX_FIELD_SECTION_SIZE`), to match how the body and h1/h2
-  inbound are bounded
+- Advertise `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §7.2.4.1). The
+  encoded request header block is now capped (16384 bytes, 431 on
+  overflow, like h1's MAX_HEADER_BLOCK); advertising the decoded-size
+  limit would let conformant clients avoid sending an oversized field
+  section in the first place rather than learning via the 431
 - WebSocket over h3 (`websocket` shape, still `501`) — RFC 9220
   Extended CONNECT; do WebSocket over h2 (RFC 8441) first, since it's
   the more common transport and h2 has no WebSocket either
