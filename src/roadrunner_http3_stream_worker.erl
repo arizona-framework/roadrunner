@@ -55,13 +55,13 @@ The conn loop has already QPACK-decoded the field block and built
 `Req` (so QPACK-decompression and malformed-message errors are raised
 at the connection / stream level, not by crashing this worker).
 """.
--spec start(pid(), non_neg_integer(), roadrunner_req:request(), map()) ->
+-spec start(pid(), non_neg_integer(), roadrunner_req:request(), roadrunner_conn:proto_opts()) ->
     {pid(), reference()}.
 start(Conn, StreamId, Req, ProtoOpts) ->
     spawn_monitor(?MODULE, init, [Conn, StreamId, Req, ProtoOpts]).
 
 -doc false.
--spec init(pid(), non_neg_integer(), roadrunner_req:request(), map()) -> ok.
+-spec init(pid(), non_neg_integer(), roadrunner_req:request(), roadrunner_conn:proto_opts()) -> ok.
 init(Conn, StreamId, Req, ProtoOpts) ->
     proc_lib:set_label({roadrunner_http3_stream_worker, StreamId}),
     %% Attach request-scoped logger metadata so any `?LOG_*` from
@@ -71,7 +71,8 @@ init(Conn, StreamId, Req, ProtoOpts) ->
     run_handler(Conn, StreamId, Req, ProtoOpts),
     ok.
 
--spec run_handler(pid(), non_neg_integer(), roadrunner_req:request(), map()) -> ok.
+-spec run_handler(pid(), non_neg_integer(), roadrunner_req:request(), roadrunner_conn:proto_opts()) ->
+    ok.
 run_handler(Conn, StreamId, Req, ProtoOpts) ->
     %% `dispatch` is set by listener init and always present; the
     %% matched route's `Pipeline` is the pre-composed `next()` fun
