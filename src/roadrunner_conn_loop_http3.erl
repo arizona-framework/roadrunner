@@ -44,8 +44,9 @@
 %% the connection; the listener force-exits it at the deadline if a
 %% request is still running.
 %%
-%% Streaming response shapes (`stream` / `loop` / `sendfile`) and
-%% WebSocket-over-h3 are phase-2 and answer 501 for now (in the worker).
+%% All response shapes are supported (buffered, `stream`, `loop`,
+%% `sendfile`). WebSocket over h3 (RFC 9220 Extended CONNECT) is not
+%% implemented and answers 501 in the worker.
 
 -export([start/2]).
 -export([init/2]).

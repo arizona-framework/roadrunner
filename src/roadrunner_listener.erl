@@ -223,9 +223,9 @@ ops-tuning rationale.
 -doc """
 One protocol entry in the listener's `protocols` list. Either a
 bare atom (`http1` / `http2` / `http3`) for default opts, or a tuple
-`{Proto, ProtoOpts}` carrying protocol-specific tuning. HTTP/1 and
-HTTP/3 currently have no tunables (their opts map must be empty);
-HTTP/2 tunables live under `t:http2_opts/0`.
+`{Proto, ProtoOpts}` carrying protocol-specific tuning. HTTP/1 has no
+tunables (its opts map must be empty); HTTP/2 tunables live under
+`t:http2_opts/0` and HTTP/3 under `t:http3_opts/0`.
 
 On TLS the list drives `alpn_preferred_protocols` for the TCP
 protocols. On plain TCP, `[http2]` means prior-knowledge h2c (client

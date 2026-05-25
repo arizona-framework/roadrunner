@@ -88,6 +88,12 @@ both ways); closing it on the decode side (so clients may compress
 repeated request headers) is the next h3 step, with dynamic ENCODE of
 responses deferred behind the same routing work.
 
+The QPACK *encode* path was non-conformant in the dep until quic 1.4.3:
+the field-section prefix Base and the dynamic-table encoding were wrong,
+so conformant clients (nghttp3) rejected roadrunner's h3 response
+headers. Fixed upstream (benoitc/erlang_quic#142) and picked up by the
+1.4.3 bump, so h3 now interoperates with strict clients.
+
 **Performance (per-request cost):** h3's per-request cost is dominated by
 the `quic` dependency's transport, not roadrunner. A whole-node profile
 (`--profile-scope all`, eprof and fprof cross-checked) puts roadrunner's
@@ -142,6 +148,12 @@ Open h3 perf follow-ups:
 - h3 manual-mode body reading (parity with the deferred h2 item) —
   needs the same conn-loop→worker inbound routing WebSocket would, so
   do it alongside that work, not standalone
+- Bound the h3 request header block. The body is capped by
+  `max_content_length`, but the HEADERS field section and the per-stream
+  decode buffer are not, so within QUIC flow control a peer can buffer a
+  large header block. Add a size cap (and consider advertising
+  `SETTINGS_MAX_FIELD_SECTION_SIZE`), to match how the body and h1/h2
+  inbound are bounded
 - WebSocket over h3 (`websocket` shape, still `501`) — RFC 9220
   Extended CONNECT; do WebSocket over h2 (RFC 8441) first, since it's
   the more common transport and h2 has no WebSocket either
