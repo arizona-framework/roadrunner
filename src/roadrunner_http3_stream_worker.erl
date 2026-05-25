@@ -71,6 +71,7 @@ init(Conn, StreamId, Req, ProtoOpts) ->
     run_handler(Conn, StreamId, Req, ProtoOpts),
     ok.
 
+-spec run_handler(pid(), non_neg_integer(), roadrunner_req:request(), map()) -> ok.
 run_handler(Conn, StreamId, Req, ProtoOpts) ->
     %% `dispatch` is set by listener init and always present; the
     %% matched route's `Pipeline` is the pre-composed `next()` fun
@@ -90,6 +91,15 @@ run_handler(Conn, StreamId, Req, ProtoOpts) ->
             })
     end.
 
+-spec invoke(
+    pid(),
+    non_neg_integer(),
+    module(),
+    roadrunner_middleware:next(),
+    roadrunner_req:request(),
+    roadrunner_telemetry:metadata(),
+    integer()
+) -> ok.
 invoke(Conn, StreamId, Handler, Pipeline, #{method := Method} = Req, Metadata, ReqStart) ->
     try Pipeline(Req) of
         {Response, _Req2} ->
@@ -247,7 +257,12 @@ send_buffered(Conn, StreamId, Status, Headers, Body) ->
             0 -> HeadersFrame;
             BodyLen -> [HeadersFrame, data_frame(Body, BodyLen)]
         end,
-    ok = quic:send_data(Conn, StreamId, Frames, true).
+    %% Fire-and-forget: if the peer closed between its request and our
+    %% response, the connection is draining and the send returns an error.
+    %% That is fine, the worker exits and the conn loop cleans up the stream
+    %% (same rationale as the control-stream and GOAWAY sends).
+    _ = quic:send_data(Conn, StreamId, Frames, true),
+    ok.
 
 %% `{stream, ...}` response: HEADERS (no FIN), then the handler's fun
 %% emits DATA chunks through a `Send/2` callback, then the stream FIN.
@@ -265,7 +280,7 @@ send_buffered(Conn, StreamId, Status, Headers, Body) ->
     roadrunner_handler:stream_fun()
 ) -> ok.
 send_stream(Conn, StreamId, Status, Headers, Fun) ->
-    ok = quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
+    _ = quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
     erase(?FIN_KEY),
     Send = fun(Data, FinFlag) -> stream_send(Conn, StreamId, Data, FinFlag) end,
     _ = Fun(Send),
@@ -346,7 +361,7 @@ sendfile_loop(IoDev, Remaining, Send) ->
     term()
 ) -> ok.
 send_loop(Conn, StreamId, Status, Headers, Handler, State) ->
-    ok = quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
+    _ = quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
     %% Stop looping if the connection dies — otherwise an idle loop
     %% worker (blocked in `info_loop` waiting for a message) leaks
     %% forever once the conn is gone. The monitor fires when the QUIC
