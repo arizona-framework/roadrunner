@@ -103,10 +103,15 @@ run_handler(ConnPid, StreamId, Req, ProtoOpts) ->
             })
     end.
 
-invoke(ConnPid, StreamId, Handler, Pipeline, Req, Metadata, ReqStart) ->
+invoke(ConnPid, StreamId, Handler, Pipeline, #{method := Method} = Req, Metadata, ReqStart) ->
     try Pipeline(Req) of
         {Response, _Req2} ->
-            emit_handler_response(ConnPid, StreamId, Handler, Response),
+            %% RFC 9110 §9.3.2: a HEAD response carries no content; emit
+            %% the body-stripped form but report the handler's original
+            %% shape / status to telemetry.
+            emit_handler_response(
+                ConnPid, StreamId, Handler, roadrunner_conn:head_response(Response, Method)
+            ),
             ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, #{
                 status => roadrunner_conn:response_status(Response),
                 response_kind => roadrunner_conn:response_kind(Response)

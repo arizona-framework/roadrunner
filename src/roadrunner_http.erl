@@ -28,7 +28,7 @@ accessors that operate on it.
 
 -on_load(init_cache/0).
 
--export([http_date_now/0, format_http_date/1]).
+-export([http_date_now/0, format_http_date/1, with_date/1, auto_headers/2]).
 
 -export_type([headers/0, status/0, redirect_status/0, version/0]).
 
@@ -37,7 +37,7 @@ accessors that operate on it.
 -type headers() :: [{Name :: binary(), Value :: binary()}].
 -type status() :: 100..599.
 -type redirect_status() :: 300..399.
--type version() :: {1, 0} | {1, 1} | {2, 0}.
+-type version() :: {1, 0} | {1, 1} | {2, 0} | {3, 0}.
 
 -define(DAY_NAMES, {~"Mon", ~"Tue", ~"Wed", ~"Thu", ~"Fri", ~"Sat", ~"Sun"}).
 -define(MONTH_NAMES, {
@@ -73,6 +73,42 @@ http_date_now() ->
             persistent_term:put(?DATE_CACHE_KEY, {Now, Bin}),
             Bin
     end.
+
+-doc """
+Inject a `Date` response header (RFC 9110 §6.6.1) unless the handler
+already set one. Shared by the HTTP/1, HTTP/2, and HTTP/3 response
+paths so every response carries `Date` from the one cached clock
+(`http_date_now/0`). RFC 9110 makes `Date` a MUST on 2xx/3xx/4xx and
+a MAY on 1xx/5xx, so injecting it unconditionally is conformant.
+""".
+-spec with_date(headers()) -> headers().
+with_date(Headers) ->
+    case lists:keymember(~"date", 1, Headers) of
+        true -> Headers;
+        false -> [{~"date", http_date_now()} | Headers]
+    end.
+
+-doc """
+Inject the framework's automatic response headers for an HTTP/1 or
+HTTP/2 (TCP) response: `Date` always (RFC 9110 §6.6.1) plus `Alt-Svc`
+advertising the listener's HTTP/3 endpoint (RFC 7838) when it co-serves
+h3 on a fixed port (`proto_opts` carries the precomputed value only
+then). HTTP/3 responses use `with_date/1` directly — a client already
+on h3 needs no Alt-Svc.
+""".
+-spec auto_headers(headers(), map()) -> headers().
+auto_headers(Headers, ProtoOpts) ->
+    with_alt_svc(with_date(Headers), ProtoOpts).
+
+%% Prepend the precomputed `Alt-Svc` value when the listener co-serves
+%% h3 — `proto_opts` carries `alt_svc` only then. `Alt-Svc` is
+%% list-valued (RFC 7838 §3 / RFC 9110 §5.3), so it composes with any
+%% handler-set value; no de-dup needed (unlike the singular `Date`).
+-spec with_alt_svc(headers(), map()) -> headers().
+with_alt_svc(Headers, #{alt_svc := Value}) ->
+    [{~"alt-svc", Value} | Headers];
+with_alt_svc(Headers, #{}) ->
+    Headers.
 
 -doc """
 Format a posix timestamp (seconds since epoch) as an IMF-fixdate

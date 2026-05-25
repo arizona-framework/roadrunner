@@ -40,35 +40,130 @@ Autobahn re-run.
 
 **Source:** Arizona handoff R-h2-1.
 
-## HTTP/3 — placeholder
+## HTTP/3
 
-**What:** RFC 9114 (HTTP semantics over QUIC) listener path.
+**Phase 1 shipped:** a roadrunner-owned HTTP/3 listener over QUIC
+(RFC 9114). Enable it with `protocols => [http3]` (requires `tls`,
+since QUIC mandates TLS 1.3); it co-listens with `http1` / `http2` on
+the same port number (TCP for h1/h2, UDP for h3). roadrunner owns the
+listener and the connection loop (`roadrunner_conn_loop_http3`),
+applying its own rules (slot tracking, drain group, telemetry,
+dispatch, response shapes, per-stream crash isolation). It leans on
+the pure-Erlang [`quic`](https://github.com/benoitc/erlang_quic)
+dependency only as a transport + codec helper layer (`quic` /
+`quic_listener` for the QUIC transport, `quic_h3_frame` / `quic_qpack`
+for h3 framing and QPACK), not its turnkey `quic_h3` server, mirroring
+how roadrunner owns its own HTTP/1.1 and HTTP/2 stacks. `quic` is
+started on demand, so HTTP/1.1/HTTP/2-only deployments never boot it.
 
-**Why deferred:** OTP doesn't ship a QUIC stack, and the
-production options are imperfect:
+Every non-WebSocket response shape works — buffered, `stream`,
+`sendfile`, and `loop` — with `HEAD` requests returning headers and no
+body; QPACK runs static-table only
+(`qpack_max_table_capacity = 0`). A conformance pass followed,
+bringing the owned connection loop in line with RFC 9114 / 9204:
+request-stream frame ordering, peer control / QPACK stream validation,
+GOAWAY on graceful drain, the matching connection error codes, an
+explicit per-connection request-stream cap, `certs_keys` / cert-chain
+TLS config, a shared `Date` header across h1/h2/h3, and `Alt-Svc`
+advertising on the co-served h1/h2 responses so browsers upgrade from
+TCP to QUIC. `quic` is a young (1.x) dependency, so treat HTTP/3 as
+experimental for now.
 
-- [`quicer`](https://github.com/emqx/quicer) — NIF over Microsoft's
-  `msquic`. Mature, fast. Trade-off: a C dep + NIF means it breaks
-  the "pure-Erlang" property roadrunner currently markets.
-- [`erlang_quic`](https://github.com/benoitc/erlang_quic) — Benoît
-  Chesneau's **pure-Erlang** RFC 9000/9001 + RFC 9114 implementation,
-  Apache-2.0 (declared in the project README). Already has a full h3
-  server with QPACK (RFC 9204), HTTP datagrams (RFC 9297), Extended
-  CONNECT (RFC 9220 / WebTransport), server push, RFC 9218
-  priorities. Min OTP 26. Zero runtime deps. Tagged through v1.3.0.
-  Looks like the right architectural fit. Worth filing an upstream
-  PR adding a `LICENSE` file at repo root so dep tooling and
-  GitHub's license API pick it up automatically; the README
-  declaration is unambiguous but unconventional.
+**Capability parity across protocols:**
 
-`--protocols h3` in `scripts/bench.escript` is currently a stub;
-ALPN advertisement does not include `h3`.
+| Capability | h1 | h2 | h3 |
+| --- | --- | --- | --- |
+| Response shapes (buffered / `stream` / `sendfile` / `loop`) | yes | yes | yes |
+| `HEAD` returns headers, no body | yes | yes | yes |
+| Manual body reading (`body_buffering => manual`, `read_body`) | yes | no (auto-buffers) | no (auto-buffers) |
+| Dynamic header-table compression | n/a (no header table) | HPACK, encode + decode | QPACK static-only (no dynamic table) |
+| WebSocket | yes (RFC 6455) | `501` | `501` |
+| Advertises `Alt-Svc: h3` | yes | yes | n/a |
 
-**Scope:** medium-large. Wiring is mostly: ALPN advertise `h3`,
-route h3 traffic to a new `roadrunner_conn_loop_http3` that adapts
-`erlang_quic`'s stream events to our handler / middleware /
-telemetry surface. Most of the protocol-heavy work is already done
-by the dep.
+The gaps are deliberate: manual body reading and WebSocket are absent on
+h2 too, and both want the same conn-loop->worker inbound routing, so
+they are "do h2 first" items, not h3-specific. The header-compression
+gap is the one place where h3 is BEHIND h2 (h2 does HPACK dynamically
+both ways); closing it on the decode side (so clients may compress
+repeated request headers) is the next h3 step, with dynamic ENCODE of
+responses deferred behind the same routing work.
+
+The QPACK *encode* path was non-conformant in the dep until quic 1.4.3:
+the field-section prefix Base and the dynamic-table encoding were wrong,
+so conformant clients (nghttp3) rejected roadrunner's h3 response
+headers. Fixed upstream (benoitc/erlang_quic#142) and picked up by the
+1.4.3 bump, so h3 now interoperates with strict clients.
+
+**Performance (per-request cost):** h3's per-request cost is dominated by
+the `quic` dependency's transport, not roadrunner. A whole-node profile
+(`--profile-scope all`, eprof and fprof cross-checked) puts roadrunner's
+own h3 code (conn loop + stream workers) at ~1.5-2.5% of server CPU,
+while ~90% is the dep's pure-Erlang packet/frame processing, AEAD framing
+plus `crypto` NIFs (~17%), and QPACK (~5%). So optimizing roadrunner's h3
+hot path can't move per-request throughput (a QPACK-huffman encoder
+rewrite and a buffered-send async-cast swap were both evaluated and
+dropped on this basis), and reimplementing QUIC in roadrunner isn't
+justified. The lever there is a faster transport (upstream `quic` work or
+a NIF / kernel-assisted stack), out of scope for now.
+
+**Scalability (fixed):** a single QUIC listener received and demuxed
+every inbound datagram, so h3 throughput FELL under load (closed-loop
+hello: 31.7k req/s at 50 clients down to 21.5k at 400, CPU stuck at
+~10/24 cores) - inbound serialization, not per-request cost. Serving h3
+over the dep's existing reuseport listener pool (`quic_listener_sup` with
+`pool_size`; the kernel spreads datagrams across N listeners that share
+one connection registry) recovers multi-core scaling: 36.2k at 50
+clients, 33.4k at 400 (+14% / +55%), and the under-load drop shrinks from
+32% to 8%. No dep change - the pinned hex `quic` already ships the pool.
+Bumping the dep to 1.4.2 (h3 HEADERS+DATA coalescing + lazy connection
+timers) lifts the pool further to ~44k / ~40k. h3 response headers now
+coalesce with the first body chunk: roadrunner's streaming shapes are
+unaffected (the h3 suite stays green), but a headers-first / body-later
+response such as SSE-over-h3 emits its headers with the first chunk
+rather than immediately - a first-byte latency nuance, not a break.
+
+Open h3 perf follow-ups:
+- The pool size is configurable via `{http3, #{listeners => N}}`
+  (validated `1..1024`, default 8, `1` = no pooling); a scheduler-scaled
+  default is a possible future tweak but is currently unmeasured
+- The reuseport pool does NOT break migration routing (an earlier worry,
+  checked and dismissed): the dep never issues spare server connection
+  IDs - `issue_new_connection_ids` has no caller and is externally
+  uncallable - so a migrating client keeps using the initial server CID,
+  which every pool listener resolves via the shared registry regardless
+  of which shard receives the packet. Full RFC 9000 CID rotation (issuing
+  spare server CIDs and registering them so packets using them route) is
+  a separate, currently-unwired dep feature, not a sharding gap; a
+  deliberate upstream effort if wanted
+
+**Follow-ups:**
+
+- Wake an h2 worker blocked in its send-`sync` when the conn dies. The
+  idle `{loop, _}` leak (worker parked in `info_loop`) is fixed on both
+  h2 and h3 (the worker monitors the conn and stops on its `DOWN`), but
+  an h2 worker stalled in `sync/1` waiting for a frame ack still blocks
+  until the connection's QUIC/TCP teardown reaps it; a uniform fix
+  (e.g. the conn loop killing in-flight workers, or `sync` honoring the
+  monitor) would close the narrow remaining window for `stream` + `loop`
+- h3 manual-mode body reading (parity with the deferred h2 item) —
+  needs the same conn-loop→worker inbound routing WebSocket would, so
+  do it alongside that work, not standalone
+- Advertise `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §7.2.4.1). The
+  encoded request header block is now capped (16384 bytes, 431 on
+  overflow, like h1's MAX_HEADER_BLOCK); advertising the decoded-size
+  limit would let conformant clients avoid sending an oversized field
+  section in the first place rather than learning via the 431
+- WebSocket over h3 (`websocket` shape, still `501`) — RFC 9220
+  Extended CONNECT; do WebSocket over h2 (RFC 8441) first, since it's
+  the more common transport and h2 has no WebSocket either
+- QPACK dynamic table (non-zero capacity) — the `quic` dep has the full
+  RFC 9204 machinery; the work is wiring encoder/decoder streams +
+  section acks + blocked-stream buffering into the owned conn loop
+- HttpArena `baseline-h3` / `static-h3` profiles (the local
+  `scripts/bench.escript` h3 path is wired and measured; these live in
+  the separate `MDA2AV/HttpArena` repo)
+- WebTransport / Extended CONNECT (RFC 9220) and HTTP datagrams
+  (RFC 9297), both already provided by the dep
 
 ## HttpArena coverage gaps
 

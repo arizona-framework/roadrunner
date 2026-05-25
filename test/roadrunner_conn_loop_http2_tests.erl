@@ -22,6 +22,7 @@ all_test_() ->
         fun bad_preface_closes_connection/0,
         fun non_settings_first_frame_triggers_goaway/0,
         fun full_get_request_returns_response/0,
+        fun head_request_omits_body/0,
         fun all_frame_types_handled/0,
         fun goaway_received_closes_connection/0,
         fun concurrent_streams_both_dispatch/0,
@@ -44,6 +45,7 @@ all_test_() ->
         fun stream_response_skips_empty_nofin/0,
         fun loop_response_emits_data_then_closes_on_stop/0,
         fun loop_response_filters_otp_messages/0,
+        fun loop_response_worker_stops_when_conn_dies/0,
         fun sendfile_empty_emits_empty_data/0,
         fun sendfile_small_file_emits_single_data_frame/0,
         fun sendfile_multi_frame_chunks_at_max_frame_size/0,
@@ -234,10 +236,53 @@ full_get_request_returns_response() ->
         roadrunner_http2_frame:parse(AllResponse, 16384),
     {ok, RespHeaders, _} = roadrunner_http2_hpack:decode(RespHpack, Dec0),
     ?assertEqual(~"200", proplists:get_value(~":status", RespHeaders)),
+    %% RFC 9110 §6.6.1: the response carries an auto-injected `date`.
+    ?assert(is_binary(proplists:get_value(~"date", RespHeaders))),
     %% Followed by a DATA frame on stream 1.
     {ok, {data, 1, DataFlags, _Body}, _} =
         roadrunner_http2_frame:parse(AfterHeaders, 16384),
     ?assertNotEqual(0, DataFlags band 16#01),
+    cleanup(Pid, Ref).
+
+head_request_omits_body() ->
+    %% RFC 9110 §9.3.2: a HEAD response is HEADERS with END_STREAM and
+    %% no DATA frame, even though the handler returns a body for `/`.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _InitialSettings = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ServerAck = expect_send(),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {HpackBlock, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"HEAD"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"localhost"},
+            {~":path", ~"/"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(HpackBlock),
+    HeadersFrame = iolist_to_binary(
+        roadrunner_http2_frame:encode(
+            {headers, 1, 16#04 bor 16#01, undefined, HpackBin}
+        )
+    ),
+    serve_recv(ConnPid, HeadersFrame),
+    Response1 = expect_send(),
+    Response2 = drain_send(50),
+    AllResponse =
+        case Response2 of
+            undefined -> Response1;
+            _ -> <<Response1/binary, Response2/binary>>
+        end,
+    %% HEADERS carries END_STREAM and nothing follows it (no DATA frame).
+    {ok, {headers, 1, HFlags, _, _RespHpack}, AfterHeaders} =
+        roadrunner_http2_frame:parse(AllResponse, 16384),
+    ?assertNotEqual(0, HFlags band 16#01),
+    ?assertEqual(<<>>, AfterHeaders),
     cleanup(Pid, Ref).
 
 all_frame_types_handled() ->
@@ -781,6 +826,22 @@ loop_response_filters_otp_messages() ->
         Frames
     ),
     cleanup(Pid, Ref).
+
+loop_response_worker_stops_when_conn_dies() ->
+    %% An idle loop worker (blocked in `info_loop`) monitors the conn
+    %% process and exits when it dies, instead of leaking forever.
+    {Pid, Ref} = run_stream_request(~"/loop"),
+    wait_for_register(roadrunner_h2_loop_test, 1000),
+    Worker = whereis(roadrunner_h2_loop_test),
+    WorkerRef = monitor(process, Worker),
+    %% `cleanup/2` kills the conn loop and waits for its `'DOWN'`; the
+    %% worker, monitoring that conn, then stops too.
+    cleanup(Pid, Ref),
+    receive
+        {'DOWN', WorkerRef, process, Worker, _} -> ok
+    after 1000 ->
+        error(loop_worker_did_not_exit)
+    end.
 
 sendfile_empty_emits_empty_data() ->
     %% Length=0: file is opened but never read. The base clause of

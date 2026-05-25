@@ -332,7 +332,7 @@ listener_rejects_invalid_protocols_value_test() ->
             }),
             ?assertMatch({error, {{invalid_listener_opt, protocols, _}, _Stack}}, R)
         end,
-        [[], [http3], [http1, http1], not_a_list]
+        [[], [bogus], [http1, http1], not_a_list]
     ).
 
 listener_rejects_ws_message_cap_below_frame_cap_test() ->

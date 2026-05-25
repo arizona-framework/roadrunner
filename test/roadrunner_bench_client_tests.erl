@@ -16,7 +16,9 @@ all_test_() ->
         fun h2_get_returns_200/0,
         fun h2_post_echoes_body/0,
         fun h2_keepalive_n_requests/0,
-        fun h3_returns_not_implemented/0,
+        fun h3_get_returns_200/0,
+        fun h3_post_echoes_body/0,
+        fun h3_keepalive_n_requests/0,
         fun open_h1_to_dead_port_errors/0
     ],
     [{spawn, F} || F <- Tests].
@@ -95,11 +97,43 @@ h2_keepalive_n_requests() ->
         stop_listener(client_h2_ka)
     end.
 
-h3_returns_not_implemented() ->
-    ?assertEqual(
-        {error, not_implemented},
-        roadrunner_bench_client:open(~"127.0.0.1", 1, h3)
-    ).
+h3_get_returns_200() ->
+    %% `roadrunner_keepalive_handler` emits only h3-legal headers (no
+    %% `connection`, which RFC 9114 §4.2 forbids), unlike the hello
+    %% handler the h1/h2 GET tests use.
+    Port = start_h3_listener(client_h3_get, roadrunner_keepalive_handler),
+    try
+        {ok, Conn0} = roadrunner_bench_client:open(~"127.0.0.1", Port, h3),
+        {ok, 200, _Headers, Body, Conn1} =
+            roadrunner_bench_client:request(Conn0, ~"GET", ~"/", [], <<>>),
+        ?assertEqual(~"alive\r\n", Body),
+        ok = roadrunner_bench_client:close(Conn1)
+    after
+        stop_listener(client_h3_get)
+    end.
+
+h3_post_echoes_body() ->
+    Port = start_h3_listener(client_h3_post, roadrunner_bench_echo_handler),
+    try
+        {ok, Conn0} = roadrunner_bench_client:open(~"127.0.0.1", Port, h3),
+        Body = <<"echo-this-payload">>,
+        {ok, 200, _Headers, RespBody, Conn1} =
+            roadrunner_bench_client:request(Conn0, ~"POST", ~"/echo", [], Body),
+        ?assertEqual(Body, RespBody),
+        ok = roadrunner_bench_client:close(Conn1)
+    after
+        stop_listener(client_h3_post)
+    end.
+
+h3_keepalive_n_requests() ->
+    Port = start_h3_listener(client_h3_ka, roadrunner_keepalive_handler),
+    try
+        {ok, Conn0} = roadrunner_bench_client:open(~"127.0.0.1", Port, h3),
+        Conn5 = drive_n_alive(5, Conn0),
+        ok = roadrunner_bench_client:close(Conn5)
+    after
+        stop_listener(client_h3_ka)
+    end.
 
 open_h1_to_dead_port_errors() ->
     %% Port 1 is privileged — open returns {error, _} without crashing.
@@ -160,6 +194,18 @@ start_h2_listener(Name, Handler) ->
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0,
         protocols => [http1, http2],
+        tls => roadrunner_test_certs:server_opts(),
+        routes => Handler
+    }),
+    roadrunner_listener:port(Name).
+
+start_h3_listener(Name, Handler) ->
+    {ok, _} = application:ensure_all_started(ssl),
+    {ok, _} = application:ensure_all_started(quic),
+    ensure_pg(),
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        protocols => [http3],
         tls => roadrunner_test_certs:server_opts(),
         routes => Handler
     }),

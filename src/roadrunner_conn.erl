@@ -64,7 +64,8 @@
     send_not_found/1,
     resolve_handler/2,
     response_status/1,
-    response_kind/1
+    response_kind/1,
+    head_response/2
 ]).
 
 -export_type([proto_opts/0, dispatch/0]).
@@ -114,7 +115,7 @@
     %% `http2_window_refill_threshold` — see those keys below. The
     %% user-facing nested shape (`{http2, #{conn_window => N, ...}}`)
     %% is documented in `t:roadrunner_listener:opts/0`.
-    protocols => [http1 | http2, ...],
+    protocols => [http1 | http2 | http3, ...],
     %% HTTP/2 receive-window tuning, populated by the listener only
     %% when `http2` is in the protocols list. Pattern-match these
     %% keys directly in code paths that already know http2 is
@@ -838,6 +839,22 @@ response_kind({loop, _, _, _}) -> loop;
 response_kind({sendfile, _, _, _}) -> sendfile;
 response_kind({websocket, _, _}) -> websocket;
 response_kind({_, _, _}) -> buffered.
+
+%% RFC 9110 §9.3.2: a HEAD response carries the same headers the GET
+%% would but no content. Collapse the body-bearing shapes (buffered,
+%% sendfile) to a header-only response on a HEAD request; the streaming
+%% shapes (stream / loop) are left to the handler, matching h1 (which
+%% strips only buffered + sendfile). Used by the h2 / h3 workers, which
+%% otherwise have no method-aware response step — h1 handles HEAD
+%% directly in `dispatch_response/5`.
+-doc false.
+-spec head_response(roadrunner_handler:response(), binary()) -> roadrunner_handler:response().
+head_response({sendfile, Status, Headers, _Spec}, ~"HEAD") ->
+    {Status, Headers, <<>>};
+head_response({Status, Headers, _Body}, ~"HEAD") when is_integer(Status) ->
+    {Status, Headers, <<>>};
+head_response(Response, _Method) ->
+    Response.
 
 %% HTTP/1.0 default close. HTTP/1.1 keep-alive unless either side
 %% set Connection: close.

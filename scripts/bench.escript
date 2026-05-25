@@ -61,7 +61,7 @@
 %% Adding a new protocol (e.g. h3) requires appending it here, wiring
 %% `preflight_protocol/1`, and tagging incompatible scenarios in the
 %% `?H?_ONLY_SCENARIOS` macros below.
--define(KNOWN_PROTOCOLS, [h1, h2, h2c]).
+-define(KNOWN_PROTOCOLS, [h1, h2, h2c, h3]).
 
 %% Scenarios are partitioned by protocol compatibility. Each scenario
 %% name lives in exactly one of these three macros; adding a new
@@ -250,7 +250,11 @@ expand_scenarios(all, Protocol) ->
         case Protocol of
             h1 -> ?H2_ONLY_SCENARIOS;
             h2 -> ?H1_ONLY_SCENARIOS;
-            h2c -> ?H1_ONLY_SCENARIOS
+            h2c -> ?H1_ONLY_SCENARIOS;
+            %% h3 carries only the protocol-agnostic scenarios — the
+            %% h1- and h2-specific ones lean on transport details h3
+            %% doesn't share.
+            h3 -> ?H1_ONLY_SCENARIOS ++ ?H2_ONLY_SCENARIOS
         end,
     Kept = [S || S <- ?KNOWN_SCENARIOS, not lists:member(S, Drop)],
     Dropped = [S || S <- ?KNOWN_SCENARIOS, lists:member(S, Drop)],
@@ -443,7 +447,27 @@ preflight_protocol(#{protocol := h2c, servers := Servers} = Opts) ->
         false ->
             ok
     end,
-    Opts#{servers => Filtered}.
+    Opts#{servers => Filtered};
+preflight_protocol(#{protocol := h3, servers := Servers} = Opts) ->
+    %% QUIC over UDP. Only roadrunner is wired for h3 (cowboy/elli have
+    %% no HTTP/3 listener here); QUIC mandates TLS 1.3 so it reuses the
+    %% generated cert, and the bench node needs `quic` + `ssl` started
+    %% for the `quic_h3` client.
+    CertDir = generate_test_cert(),
+    Filtered = [S || S <- Servers, S =:= roadrunner],
+    case Filtered =/= Servers of
+        true ->
+            io:format(
+                "note: --protocols h3 is roadrunner-only here "
+                "(cowboy/elli have no HTTP/3)~n",
+                []
+            );
+        false ->
+            ok
+    end,
+    {ok, _} = application:ensure_all_started(ssl),
+    {ok, _} = application:ensure_all_started(quic),
+    Opts#{servers => Filtered, cert_dir => CertDir}.
 
 generate_test_cert() ->
     Dir = string:trim(os:cmd("mktemp -d")),
@@ -949,6 +973,23 @@ cli() ->
                     """
             },
             #{
+                name => profile_scope,
+                long => "-profile-scope",
+                type => {atom, [roadrunner, all]},
+                default => roadrunner,
+                help =>
+                    """
+                    Process seed for the profiler. `roadrunner` (default)
+                    traces only the roadrunner supervisor tree plus the
+                    conns/workers it spawns. `all` traces every process in
+                    the server BEAM — required for h3, whose connection
+                    processes are spawned by the `quic` dependency (not a
+                    roadrunner acceptor) and are invisible to the
+                    roadrunner-only seed; also use it to attribute time
+                    across roadrunner vs quic vs crypto.
+                    """
+            },
+            #{
                 name => protocols,
                 long => "-protocols",
                 type => {custom, fun parse_protocols/1},
@@ -1308,11 +1349,21 @@ cpu_pct(_, _, _) ->
 
 maybe_start_profile(_Peer, #{profile := false}) ->
     ok;
-maybe_start_profile(Peer, #{profile := true, profile_tool := fprof}) ->
+maybe_start_profile(Peer, #{profile := true, profile_tool := fprof, profile_scope := Scope}) ->
     Trace = "/tmp/roadrunner_bench_fprof.trace",
-    ok = peer:call(Peer, roadrunner_bench_profiler, start_fprof, [Trace]);
-maybe_start_profile(Peer, #{profile := true}) ->
-    ok = peer:call(Peer, roadrunner_bench_profiler, start, []).
+    Fun =
+        case Scope of
+            all -> start_fprof_all;
+            roadrunner -> start_fprof
+        end,
+    ok = peer:call(Peer, roadrunner_bench_profiler, Fun, [Trace]);
+maybe_start_profile(Peer, #{profile := true, profile_scope := Scope}) ->
+    Fun =
+        case Scope of
+            all -> start_all;
+            roadrunner -> start
+        end,
+    ok = peer:call(Peer, roadrunner_bench_profiler, Fun, []).
 
 maybe_stop_profile(_Peer, _Side, #{profile := false}) ->
     ok;
@@ -1329,7 +1380,10 @@ maybe_stop_profile(Peer, Side, #{profile := true, profile_tool := fprof}) ->
     io:format("~nprofile (fprof, ~s) written to ~s~n", [Side, Analysis]);
 maybe_stop_profile(Peer, Side, #{profile := true, profile_min_ms := MinMs}) ->
     Path = filename:join(["/tmp", "roadrunner_bench_eprof_" ++ atom_to_list(Side) ++ ".log"]),
-    ok = peer:call(Peer, roadrunner_bench_profiler, stop_and_dump, [Path, MinMs]),
+    %% `--profile-scope all` traces every process, so eprof's stop +
+    %% analyze walks a far larger trace than the roadrunner-only seed;
+    %% give it the same generous timeout as the fprof path.
+    ok = peer:call(Peer, roadrunner_bench_profiler, stop_and_dump, [Path, MinMs], 120000),
     %% Read the log written inside the peer's BEAM and print to the
     %% bench's own stdout. Files are visible to both because they
     %% share the host filesystem.
@@ -1346,6 +1400,8 @@ start_server(roadrunner, #{protocol := h2, scenario := Scenario, cert_dir := Cer
     start_roadrunner_h2(Scenario, CertDir);
 start_server(roadrunner, #{protocol := h2c, scenario := Scenario}) ->
     start_roadrunner_h2c(Scenario);
+start_server(roadrunner, #{protocol := h3, scenario := Scenario, cert_dir := CertDir}) ->
+    start_roadrunner_h3(Scenario, CertDir);
 start_server(cowboy, #{protocol := h1, scenario := Scenario}) ->
     start_cowboy_h1(Scenario);
 start_server(cowboy, #{protocol := h2, scenario := Scenario, cert_dir := CertDir}) ->
@@ -1484,6 +1540,35 @@ start_roadrunner_h2c(Scenario) ->
     ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
     {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr_h2c, ListenerOpts]),
     Port = peer:call(Peer, roadrunner_listener, port, [bench_rr_h2c]),
+    print_listener_config([{"listener_opts", ListenerOpts}]),
+    {Peer, Port}.
+
+start_roadrunner_h3(Scenario, CertDir) ->
+    {ok, Peer, _Node} = peer:start_link(#{
+        name => peer:random_name(),
+        connection => standard_io,
+        args => pa_args_for_peer(),
+        wait_boot => 10000
+    }),
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [ssl]),
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [roadrunner]),
+    %% `protocols => [http3]` over QUIC/UDP; the listener brings up the
+    %% `quic` app on demand. TLS 1.3 is mandatory for QUIC, so reuse the
+    %% same cert as h2. The bound UDP port is read back like the TCP ones.
+    BaseOpts = #{
+        port => 0,
+        protocols => [http3],
+        tls => [
+            {certfile, CertDir ++ "/cert.pem"},
+            {keyfile, CertDir ++ "/key.pem"}
+        ],
+        keep_alive_timeout => 60000,
+        max_clients => 100000,
+        max_keep_alive_requests => 1000000
+    },
+    ListenerOpts = scenario_roadrunner_opts(Scenario, BaseOpts),
+    {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr_h3, ListenerOpts]),
+    Port = peer:call(Peer, roadrunner_listener, port, [bench_rr_h3]),
     print_listener_config([{"listener_opts", ListenerOpts}]),
     {Peer, Port}.
 
@@ -1864,7 +1949,9 @@ run_phase(Port, #{protocol := h2c} = Opts, DurationMs) ->
     %% h2c reuses the entire h2 run phase; only the client's transport
     %% differs (plain TCP vs TLS), selected via `h2_client_proto/0`.
     _ = persistent_term:put('$bench_h2_client_proto', h2c),
-    run_phase_h2(Port, Opts, DurationMs).
+    run_phase_h2(Port, Opts, DurationMs);
+run_phase(Port, #{protocol := h3} = Opts, DurationMs) ->
+    run_phase_h3(Port, Opts, DurationMs).
 
 %% Which protocol the bench client opens for the h2 run phase — `h2`
 %% (TLS+ALPN) or `h2c` (cleartext). Set by `run_phase/3`.
@@ -3432,6 +3519,37 @@ run_phase_h2(Port, #{clients := C, host := Host, scenario := Scenario}, Duration
     PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
     EndUs = erlang:monotonic_time(microsecond),
     aggregate(PerWorker, EndUs - StartUs).
+
+run_phase_h3(Port, #{clients := C, host := Host, scenario := Scenario}, DurationMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    {Method, Path, ReqHeaders, ReqBody} = h2_request_shape(Scenario),
+    Self = self(),
+    StartUs = erlang:monotonic_time(microsecond),
+    Workers = [
+        spawn_link(fun() ->
+            Self !
+                {self(),
+                    h3_worker_loop(
+                        Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, init_acc()
+                    )}
+        end)
+     || _ <- lists:seq(1, C)
+    ],
+    PerWorker = [collect(W, DurationMs + 30000) || W <- Workers],
+    EndUs = erlang:monotonic_time(microsecond),
+    aggregate(PerWorker, EndUs - StartUs).
+
+%% One keep-alive QUIC connection per worker. Reuses the protocol-neutral
+%% `h2_keep_alive_loop` (it only calls `roadrunner_bench_client:request/
+%% close`, which dispatch on the conn record) + the shared
+%% `h2_request_shape/1` scenario table.
+h3_worker_loop(Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->
+    case roadrunner_bench_client:open(Host, Port, h3) of
+        {ok, Conn} ->
+            h2_keep_alive_loop(Conn, Method, Path, ReqHeaders, ReqBody, Deadline, Acc);
+        {error, _} ->
+            bump_err(Acc)
+    end.
 
 %% tls_handshake_throughput: open a fresh TLS+ALPN-h2 conn per
 %% iteration, do 1 GET, close. Throughput is dominated by the
