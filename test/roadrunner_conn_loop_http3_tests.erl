@@ -85,3 +85,15 @@ oversized_frame_test() ->
     %% A frame declaring a length above the cap → H3_FRAME_ERROR (§7.1).
     Oversized = iolist_to_binary([quic_varint:encode(0), quic_varint:encode(16#FFFFFFFF)]),
     ?assertMatch({conn_error, 16#0106, _}, decode(Oversized, 1000)).
+
+oversized_header_block_test() ->
+    %% A complete HEADERS frame whose field section exceeds MAX_HEADER_BLOCK
+    %% (16384) is rejected; the conn loop answers 431.
+    ?assertEqual(headers_too_large, decode(hf(binary:copy(<<"x">>, 16385)), 1000000)).
+
+dribbled_header_block_test() ->
+    %% A still-incomplete HEADERS frame already past the cap is rejected
+    %% without buffering the rest (the dribble guard in the `{more}` branch).
+    Frame = hf(binary:copy(<<"x">>, 20000)),
+    Partial = binary:part(Frame, 0, 17000),
+    ?assertEqual(headers_too_large, decode(Partial, 1000000)).

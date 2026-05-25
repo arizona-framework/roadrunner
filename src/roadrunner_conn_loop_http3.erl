@@ -68,6 +68,12 @@
 -define(H3_MESSAGE_ERROR, 16#010E).
 -define(H3_QPACK_DECOMPRESSION_FAILED, 16#0200).
 
+%% Cap on the encoded request field section (the HEADERS block). The body
+%% is bounded by `max_content_length`; this bounds header memory the same
+%% way h1 does (`roadrunner_http1` MAX_HEADER_BLOCK), so a peer cannot make
+%% the conn buffer an unbounded header block. Over-cap answers 431.
+-define(MAX_HEADER_BLOCK, 16384).
+
 %% A critical stream role can be claimed at most once per connection.
 -type critical_role() :: control | qpack_encoder | qpack_decoder.
 -type critical_set() :: #{critical_role() => true}.
@@ -331,6 +337,25 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
                             }
                         }
                     };
+                headers_too_large ->
+                    ok = roadrunner_http3_stream_worker:send_buffered(
+                        State#h3.conn,
+                        StreamId,
+                        431,
+                        [{~"content-type", ~"text/plain"}],
+                        ~"Request Header Fields Too Large"
+                    ),
+                    _ = quic:stop_sending(State#h3.conn, StreamId, ?H3_NO_ERROR),
+                    State#h3{
+                        streams = Streams#{
+                            StreamId => Stream0#{
+                                frame_state := discarding,
+                                buf := <<>>,
+                                body := [],
+                                body_len := 0
+                            }
+                        }
+                    };
                 {conn_error, _, _} = ConnError ->
                     ConnError
             end
@@ -390,7 +415,8 @@ new_request_stream() ->
         frame_state => expecting_headers
     }.
 
--type decode_result() :: {ok, map()} | too_large | {conn_error, non_neg_integer(), binary()}.
+-type decode_result() ::
+    {ok, map()} | too_large | headers_too_large | {conn_error, non_neg_integer(), binary()}.
 
 %% Decode as many complete HTTP/3 frames as the buffer holds, applying
 %% the request frame-sequence rules and folding payloads into the
@@ -405,7 +431,15 @@ decode_request_frames(Buf, Stream, MaxLen) ->
                 Other -> Other
             end;
         {more, _} ->
-            {ok, Stream#{buf := Buf}};
+            %% A still-incomplete HEADERS frame already over the cap is an
+            %% oversized field section: reject now instead of buffering more.
+            %% Once in `expecting_data` the body cap governs the buffer.
+            case Stream of
+                #{frame_state := expecting_headers} when byte_size(Buf) > ?MAX_HEADER_BLOCK ->
+                    headers_too_large;
+                _ ->
+                    {ok, Stream#{buf := Buf}}
+            end;
         {error, Reason} ->
             %% A frame-level decode failure is a connection error per
             %% RFC 9114 §7.1 (malformed/oversized frame) and §7.2.8
@@ -420,7 +454,11 @@ decode_request_frames(Buf, Stream, MaxLen) ->
 %% ignored (§9). Trailers (a HEADERS after the body) are accepted but
 %% not surfaced by the buffered path.
 -spec apply_frame(quic_h3_frame:frame(), map(), non_neg_integer()) ->
-    {ok, map()} | too_large | {conn_error, non_neg_integer(), binary()}.
+    {ok, map()} | too_large | headers_too_large | {conn_error, non_neg_integer(), binary()}.
+apply_frame({headers, Block}, #{frame_state := expecting_headers}, _MaxLen) when
+    byte_size(Block) > ?MAX_HEADER_BLOCK
+->
+    headers_too_large;
 apply_frame({headers, Block}, #{frame_state := expecting_headers} = Stream, _MaxLen) ->
     {ok, Stream#{header_block := Block, frame_state := expecting_data}};
 apply_frame({headers, _Trailers}, #{frame_state := expecting_data} = Stream, _MaxLen) ->

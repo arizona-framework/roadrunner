@@ -38,6 +38,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     sendfile_large/1,
     head_sendfile/1,
     oversized_413/1,
+    oversized_headers_431/1,
     protocols_tuple_form/1,
     certfile_keyfile/1,
     certs_keys_form/1,
@@ -96,6 +97,7 @@ all() ->
         sendfile_large,
         head_sendfile,
         oversized_413,
+        oversized_headers_431,
         protocols_tuple_form,
         certfile_keyfile,
         certs_keys_form,
@@ -397,6 +399,16 @@ oversized_413(_Config) ->
         close(Conn),
         roadrunner_listener:stop(Name)
     end.
+
+oversized_headers_431(Config) ->
+    %% A request whose encoded field section exceeds MAX_HEADER_BLOCK
+    %% (16384) is answered 431, rejected by the conn loop before dispatch
+    %% (parity with the body 413). Uses the shared default listener.
+    Conn = connect(?config(port, Config)),
+    Big = binary:copy(<<"x">>, 50000),
+    {ok, StreamId} = quic_h3:request(Conn, headers(~"GET", ~"/") ++ [{~"x-big", Big}]),
+    ?assertMatch({431, _, _}, collect(Conn, StreamId)),
+    close(Conn).
 
 protocols_tuple_form(_Config) ->
     Name = listener_name(protocols_tuple_form),
