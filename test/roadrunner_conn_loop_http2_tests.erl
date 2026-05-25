@@ -33,6 +33,8 @@ all_test_() ->
         fun push_promise_from_client_triggers_goaway/0,
         fun even_stream_id_triggers_goaway/0,
         fun continuation_without_pending_triggers_goaway/0,
+        fun continuation_flood_triggers_goaway/0,
+        fun continuation_empty_frame_flood_triggers_goaway/0,
         fun data_on_unknown_stream_triggers_goaway/0,
         fun malformed_hpack_block_triggers_goaway/0,
         fun missing_pseudo_header_rst_stream/0,
@@ -643,6 +645,65 @@ continuation_without_pending_triggers_goaway() ->
     Cf = iolist_to_binary(roadrunner_http2_frame:encode({continuation, 1, 16#04, <<>>})),
     serve_recv(ConnPid, Cf),
     _ = expect_send(),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+continuation_flood_triggers_goaway() ->
+    %% HEADERS without END_HEADERS, then a CONTINUATION that pushes the
+    %% assembled block past ?MAX_HEADER_BLOCK. Each frame is within
+    %% MAX_FRAME_SIZE but the cumulative block is not (the HTTP/2
+    %% CONTINUATION Flood), so the conn is torn down with
+    %% GOAWAY(ENHANCE_YOUR_CALM). The fragments are never HPACK-decoded.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    HeadersF = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 0, undefined, binary:copy(~"x", 100)})
+    ),
+    serve_recv(ConnPid, HeadersF),
+    ContinuationF = iolist_to_binary(
+        roadrunner_http2_frame:encode({continuation, 1, 0, binary:copy(~"x", 16384)})
+    ),
+    serve_recv(ConnPid, ContinuationF),
+    Out = expect_send(),
+    %% GOAWAY (type 7) carrying ENHANCE_YOUR_CALM (0x0B): after the 9-byte
+    %% frame header the payload is Last-Stream-Id (32 bits) then the error
+    %% code (32 bits).
+    ?assertMatch(<<_:24, 7:8, _:8, _:32, _:32, 16#0B:32, _/binary>>, Out),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+continuation_empty_frame_flood_triggers_goaway() ->
+    %% HEADERS without END_HEADERS, then a non-final empty CONTINUATION.
+    %% It makes no forward progress and never grows the byte total, so the
+    %% size cap alone would never catch an endless stream of them. Treated
+    %% as a flood: GOAWAY(ENHANCE_YOUR_CALM). An empty CONTINUATION that
+    %% carries END_HEADERS, the only sane empty case, is still accepted.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    HeadersF = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 0, undefined, binary:copy(~"x", 100)})
+    ),
+    serve_recv(ConnPid, HeadersF),
+    EmptyF = iolist_to_binary(roadrunner_http2_frame:encode({continuation, 1, 0, <<>>})),
+    serve_recv(ConnPid, EmptyF),
+    Out = expect_send(),
+    ?assertMatch(<<_:24, 7:8, _:8, _:32, _:32, 16#0B:32, _/binary>>, Out),
     expect_close(),
     receive
         {'DOWN', Ref, process, Pid, normal} -> ok

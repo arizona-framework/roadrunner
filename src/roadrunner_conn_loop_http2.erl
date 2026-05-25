@@ -73,6 +73,14 @@
 %% RFC 9113 §6.5.2 default `MAX_FRAME_SIZE`.
 -define(MAX_FRAME_SIZE, 16_384).
 
+%% Cumulative cap on an assembled HEADERS+CONTINUATION block. Each frame
+%% is already bounded to MAX_FRAME_SIZE, but the number of CONTINUATION
+%% frames is not, so without this a peer can flood CONTINUATION frames and
+%% grow the block without bound (the HTTP/2 CONTINUATION Flood). h1 and h3
+%% bound the same way (`roadrunner_http1` / `roadrunner_conn_loop_http3`
+%% MAX_HEADER_BLOCK).
+-define(MAX_HEADER_BLOCK, 16_384).
+
 %% RFC 9113 §6.9.2 initial window size for both the connection and
 %% each stream.
 -define(INITIAL_WINDOW, 65535).
@@ -122,7 +130,14 @@
 
 -type stream_entry() :: #{
     state := stream_state(),
-    header_fragment := binary(),
+    %% Field block fragments (the HEADERS frame plus any CONTINUATIONs):
+    %% a bare binary for a single frame, an iolist once CONTINUATIONs
+    %% append, flattened once at finalize (like `body` accumulates DATA).
+    header_fragment := iodata(),
+    %% Running byte count of `header_fragment`, so the CONTINUATION-flood
+    %% cap can compare against a counter instead of re-measuring the
+    %% accumulated block on every frame.
+    header_len := non_neg_integer(),
     end_headers := boolean(),
     end_stream_seen := boolean(),
     headers := undefined | roadrunner_http:headers(),
@@ -620,6 +635,7 @@ on_headers(StreamId, Flags, _Priority, Fragment, #loop{streams = Streams} = Stat
             EndHeaders = (Flags band 16#04) =/= 0,
             Stream1 = Stream#{
                 header_fragment := Fragment,
+                header_len := byte_size(Fragment),
                 end_headers := EndHeaders,
                 end_stream_seen := true
             },
@@ -689,6 +705,7 @@ new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow) ->
     #{
         state => open,
         header_fragment => Fragment,
+        header_len => byte_size(Fragment),
         end_headers => EndHeaders,
         end_stream_seen => EndStream,
         headers => undefined,
@@ -707,28 +724,50 @@ on_continuation(StreamId, Flags, Fragment, #loop{streams = Streams} = State) ->
             StreamId :=
                 #{
                     end_headers := false,
-                    header_fragment := Existing,
+                    header_fragment := Frags,
+                    header_len := Len,
                     headers := PriorHeaders
                 } = Stream
         } ->
-            Combined = <<Existing/binary, Fragment/binary>>,
+            FragLen = byte_size(Fragment),
+            NewLen = Len + FragLen,
             EndHeaders = (Flags band 16#04) =/= 0,
-            Stream1 = Stream#{header_fragment := Combined, end_headers := EndHeaders},
-            Streams1 = Streams#{StreamId := Stream1},
-            %% Set streams + awaiting_continuation in one record update on
-            %% the END_HEADERS path — two sequential `#loop{}` updates
-            %% would copy the record twice.
-            State2 =
-                case EndHeaders of
-                    true ->
-                        State#loop{streams = Streams1, awaiting_continuation = undefined};
-                    false ->
-                        State#loop{streams = Streams1}
-                end,
-            case {EndHeaders, PriorHeaders =:= undefined} of
-                {true, true} -> finalize_headers(StreamId, State2);
-                {true, false} -> finalize_trailers(StreamId, State2);
-                {false, _} -> frame_loop(State2)
+            %% CONTINUATION-flood guard, both variants. The assembled
+            %% block crossed the cap (memory exhaustion), or a non-final
+            %% empty CONTINUATION made no forward progress (an endless
+            %% stream of those pins the conn in header assembly without
+            %% ever growing the byte total). Each frame is bounded by
+            %% MAX_FRAME_SIZE but neither the cumulative size nor the
+            %% frame count is otherwise limited. The per-connection HPACK
+            %% context can't be resynced if we skip the block, so this is
+            %% a connection error rather than a per-stream reject.
+            %% ENHANCE_YOUR_CALM is the RFC 9113 §6.5.2 resource-limit code.
+            case NewLen > ?MAX_HEADER_BLOCK orelse (FragLen =:= 0 andalso not EndHeaders) of
+                true ->
+                    _ = send_goaway(State, enhance_your_calm),
+                    exit_clean(State);
+                false ->
+                    Stream1 = Stream#{
+                        header_fragment := [Frags, Fragment],
+                        header_len := NewLen,
+                        end_headers := EndHeaders
+                    },
+                    Streams1 = Streams#{StreamId := Stream1},
+                    %% Set streams + awaiting_continuation in one record update on
+                    %% the END_HEADERS path — two sequential `#loop{}` updates
+                    %% would copy the record twice.
+                    State2 =
+                        case EndHeaders of
+                            true ->
+                                State#loop{streams = Streams1, awaiting_continuation = undefined};
+                            false ->
+                                State#loop{streams = Streams1}
+                        end,
+                    case {EndHeaders, PriorHeaders =:= undefined} of
+                        {true, true} -> finalize_headers(StreamId, State2);
+                        {true, false} -> finalize_trailers(StreamId, State2);
+                        {false, _} -> frame_loop(State2)
+                    end
             end;
         _ ->
             _ = send_goaway(State, protocol_error),
@@ -742,7 +781,7 @@ on_continuation(StreamId, Flags, Fragment, #loop{streams = Streams} = State) ->
 %% pending request (END_STREAM was already set by `on_headers/5`).
 finalize_trailers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) ->
     #{StreamId := #{header_fragment := Fragment} = Stream} = Streams,
-    case roadrunner_http2_hpack:decode(Fragment, Dec) of
+    case roadrunner_http2_hpack:decode(iolist_to_binary(Fragment), Dec) of
         {ok, _Trailers, Dec1} ->
             Stream1 = Stream#{header_fragment := <<>>},
             State1 = State#loop{
@@ -765,7 +804,7 @@ finalize_headers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) ->
             end_stream_seen := EndStreamSeen
         } = Stream
     } = Streams,
-    case roadrunner_http2_hpack:decode(Fragment, Dec) of
+    case roadrunner_http2_hpack:decode(iolist_to_binary(Fragment), Dec) of
         {ok, Headers, Dec1} ->
             Stream1 = Stream#{headers := Headers, header_fragment := <<>>},
             State1 = State#loop{

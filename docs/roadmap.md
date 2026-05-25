@@ -255,6 +255,28 @@ workloads (server-side, large-POST upload patterns) before shipping.
 have to drain the new SETTINGS entry + early WINDOW_UPDATE in
 their handshake fixture).
 
+### Advertise SETTINGS_MAX_HEADER_LIST_SIZE
+
+**What:** Advertise `SETTINGS_MAX_HEADER_LIST_SIZE` (RFC 9113 §6.5.2,
+id 0x06) in the server's SETTINGS frame. The cumulative HEADERS +
+CONTINUATION block is now capped (16384 bytes, GOAWAY(ENHANCE_YOUR_CALM)
+on overflow, the same bound h1 and h3 use), which closes the
+CONTINUATION-flood memory gap. Advertising the decoded-size limit lets
+conformant clients avoid sending an oversized block in the first place
+rather than learning via the connection close.
+
+**Why deferred:** The setting bounds the *decoded* header-list size, a
+different unit from the encoded-block cap that does the real memory
+bounding, so it is an advisory courtesy rather than the load-bearing
+fix. The h3 sibling (`SETTINGS_MAX_FIELD_SECTION_SIZE`, under the
+HTTP/3 follow-ups above) wants the same treatment.
+
+**Scope:** small (`server_settings_frame/1` in
+`roadrunner_conn_loop_http2.erl` prepends `{6, Limit}`; the setting
+already exists defaulted to `infinity` in
+`roadrunner_http2_settings.erl`; the ~50 handshake fixtures that drain
+the server SETTINGS need to tolerate the extra entry).
+
 ### Sendfile chunk size tracks the peer's negotiated MAX_FRAME_SIZE
 
 **What:** Today `?SENDFILE_CHUNK_SIZE` in
