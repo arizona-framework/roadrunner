@@ -7,7 +7,7 @@
 
 ![roadrunner logo](https://raw.githubusercontent.com/arizona-framework/roadrunner/main/assets/logo.jpg)
 
-Pure-Erlang HTTP/1.1 + HTTP/2 + WebSocket server for OTP 29+.
+Pure-Erlang HTTP/1.1 + HTTP/2 + HTTP/3 + WebSocket server for OTP 29+.
 **Built for low tail latency at sustained load.** Beep beep.
 
 Roadrunner is the HTTP backbone of the
@@ -51,6 +51,13 @@ Standards conformance:
   `[http2]` for h2c prior-knowledge on plain TCP). Conformance
   harness: [`scripts/h2spec.sh`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/h2spec.sh) (drives
   [h2spec](https://github.com/summerwind/h2spec)).
+- **HTTP/3** (experimental): RFC 9114 over QUIC with QPACK (RFC 9204)
+  static-table compression. Enable per listener via
+  `protocols => [http3]` (requires `tls`; QUIC mandates TLS 1.3); it
+  co-serves with h1/h2 on the same port number (TCP for h1/h2, UDP for
+  h3) and advertises `Alt-Svc` so browsers upgrade. Built on the
+  pure-Erlang [`quic`](https://github.com/benoitc/erlang_quic) transport
+  (still 1.x), so treat HTTP/3 as experimental.
 - **Content-Encoding** (RFC 9110 §8.4.1): gzip + deflate with
   qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3),
   works unchanged over HTTP/2.
@@ -112,6 +119,7 @@ means out of scope for that server.
 |-------------------------------------------|:----------:|:------:|:----:|
 | HTTP/1.1                                  |     ✓      |   ✓    |  ✓   |
 | HTTP/2 + HPACK                            |     ✓      |   ✓    |  ✗   |
+| HTTP/3 (QUIC, experimental)               |     ✓      |   ✗    |  ✗   |
 | WebSocket (RFC 6455)                      |     ✓      |   ✓    |  —   |
 | permessage-deflate (RFC 7692)             |     ✓      |   ✓    |  ✗   |
 | Native router                             |     ✓      |   ✓    |  ✗   |
@@ -187,6 +195,12 @@ the list to disable HTTP/2. For HTTP/2 on plain TCP (h2c
 prior-knowledge per RFC 7540 §3.4), use `protocols => [http2]` without
 the `tls` opt.
 
+For HTTP/3 (experimental), add `http3` to a TLS listener's `protocols`
+(e.g. `protocols => [http1, http2, http3]`). It serves h3 over UDP on the
+same port number and advertises `Alt-Svc` so browsers upgrade from TCP;
+the `quic` transport starts on demand, so h1/h2-only listeners never boot
+it.
+
 For listeners that don't need routing, `routes => Mod` (or
 `{Mod, State}` to seed handler state) skips the router entirely and
 dispatches every request to `Mod:handle/1`:
@@ -215,6 +229,8 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
 - **HTTP/2 tunables** (under the `{http2, Opts}` entry in
   `protocols`) — `conn_window`, `stream_window`,
   `window_refill_threshold`
+- **HTTP/3 tunables** (under the `{http3, Opts}` entry in
+  `protocols`) — `listeners` (reuseport pool size)
 
 ## Features
 
