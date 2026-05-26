@@ -122,6 +122,7 @@ all_test_() ->
         fun headers_for_closed_stream_protocol_error/0,
         fun settings_initial_window_size_shifts_stream_window/0,
         fun settings_initial_window_size_flushes_pending_data/0,
+        fun preface_settings_initial_window_applied/0,
         fun content_length_multi_valued_rst_stream/0,
         fun trailers_after_first_end_stream_protocol_error/0
     ],
@@ -2792,6 +2793,25 @@ headers_for_closed_stream_protocol_error() ->
     after 500 -> error(no_exit)
     end.
 
+preface_settings_initial_window_applied() ->
+    %% RFC 9113 §3.4: the server must apply the client's connection-
+    %% preface SETTINGS. Advertise INITIAL_WINDOW_SIZE = 20000 in the
+    %% preface, then GET a 50 KB body: the per-stream send window caps
+    %% the response at 20000 bytes (two DATA frames, neither with
+    %% END_STREAM) until a WINDOW_UPDATE that never comes. If the
+    %% preface SETTINGS were dropped (the old bug), the default 65535
+    %% window would let the whole 50 KB out with END_STREAM.
+    Preface = iolist_to_binary(
+        roadrunner_http2_frame:encode({settings, 0, [{4, 20000}]})
+    ),
+    {Pid, Ref} = run_stream_request(~"/large50k", Preface),
+    Frames = collect_response_frames(),
+    ?assertMatch([{headers, 1, false} | _], Frames),
+    DataBytes = lists:sum([byte_size(P) || {data, _, _, P} <- Frames]),
+    ?assertEqual(20000, DataBytes),
+    ?assertEqual([], [F || {data, _, true, _} = F <- Frames]),
+    cleanup(Pid, Ref).
+
 settings_initial_window_size_shifts_stream_window() ->
     %% Open a stream, then SETTINGS with a new INITIAL_WINDOW_SIZE
     %% mixed with an unrelated setting id (3, MAX_CONCURRENT_STREAMS)
@@ -3248,6 +3268,9 @@ run_h2_request_with_handler(Handler, Path) ->
 %% mailbox so the test can decode + assert on them via
 %% `collect_response_frames/0`.
 run_stream_request(Path) ->
+    run_stream_request(Path, ?EMPTY_SETTINGS_FRAME).
+
+run_stream_request(Path, PrefaceSettings) ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
@@ -3274,7 +3297,7 @@ run_stream_request(Path) ->
     Pid ! ready,
     _ = expect_send(),
     serve_recv(Pid, ?PREFACE),
-    serve_recv(Pid, ?EMPTY_SETTINGS_FRAME),
+    serve_recv(Pid, PrefaceSettings),
     _ = expect_send(),
     Enc = roadrunner_http2_hpack:new_encoder(4096),
     {Hpack, _} = roadrunner_http2_hpack:encode(
