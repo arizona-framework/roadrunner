@@ -22,7 +22,7 @@ handful of opt-in helpers (cookies, qs, multipart, SSE, WebSocket).
 Modern OTP idioms throughout, with predictable per-connection
 lifecycle observability.
 
-## ⚠️ Requirements
+## Requirements
 
 Requires **OTP 29 or newer**.
 
@@ -30,16 +30,13 @@ Requires **OTP 29 or newer**.
 
 Roadrunner is in `0.x`. The core is functional and covered by tests,
 but the API may change between minor versions. Pin an exact version
-in your deps (e.g. `{roadrunner, "0.2.0"}`) if you need stability
-across upgrades.
+in your deps if you need stability across upgrades.
 
-## ✅ Conformance
+## Conformance
 
-Eunit + Common Test (incl. PropEr) suites with **100 % line coverage**,
-dialyzer-clean, h2spec strict 100 %, Autobahn fuzzingclient strict
-100 % across the full WebSocket matrix (no exclusions). HTTP/1.1
-parsers stress-tested against the
-[llhttp](https://github.com/nodejs/llhttp) test corpus and the
+Strict 100 % h2spec (HTTP/2) and Autobahn fuzzingclient across the full
+WebSocket matrix (no exclusions). HTTP/1.1 parsers stress-tested against
+the [llhttp](https://github.com/nodejs/llhttp) test corpus and the
 canonical [PortSwigger](https://portswigger.net/web-security/request-smuggling)
 request-smuggling vectors.
 
