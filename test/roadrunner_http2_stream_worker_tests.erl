@@ -32,11 +32,11 @@ logger_metadata_set_in_h2_worker_test_() ->
                     fun roadrunner_logger_probe_handler:handle/1, undefined},
             middlewares => []
         },
-        {_WorkerPid, _MonRef} = roadrunner_http2_stream_worker:start(
+        {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
             ConnPid, StreamId, Req, ProtoOpts
         ),
         Body = recv_response_body(StreamId),
-        ok = recv_worker_done(StreamId),
+        ok = recv_worker_exit(MonRef, WorkerPid),
         Probe = binary_to_term(Body, [safe]),
         Md = maps:get(logger_metadata, Probe),
         ?assertEqual(~"deadbeefdeadbeef", maps:get(request_id, Md)),
@@ -54,9 +54,9 @@ recv_response_body(StreamId) ->
         error(no_h2_send_response)
     end.
 
-recv_worker_done(StreamId) ->
+recv_worker_exit(MonRef, WorkerPid) ->
     receive
-        {h2_worker_done, StreamId} -> ok
+        {'DOWN', MonRef, process, WorkerPid, normal} -> ok
     after 1000 ->
-        error(no_h2_worker_done)
+        error(no_worker_exit)
     end.
