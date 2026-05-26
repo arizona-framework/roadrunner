@@ -512,8 +512,11 @@ handle_frame({settings, 0, Params}, State) ->
         ok ->
             case apply_initial_window_size(Params, State) of
                 {ok, State1} ->
+                    %% Raising INITIAL_WINDOW_SIZE grows open streams' send
+                    %% windows (RFC 9113 §6.9.2): ACK, then drain any sends
+                    %% blocked at the old window, like the WINDOW_UPDATE path.
                     _ = send(State1, roadrunner_http2_frame:encode({settings, 1, []})),
-                    frame_loop(State1);
+                    frame_loop(flush_all_pending_data(State1));
                 {error, flow_control_error} ->
                     _ = send_goaway(State, flow_control_error),
                     exit_clean(State)

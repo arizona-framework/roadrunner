@@ -120,6 +120,7 @@ all_test_() ->
         fun hpack_table_size_update_after_block_goaway/0,
         fun headers_for_closed_stream_protocol_error/0,
         fun settings_initial_window_size_shifts_stream_window/0,
+        fun settings_initial_window_size_flushes_pending_data/0,
         fun content_length_multi_valued_rst_stream/0,
         fun trailers_after_first_end_stream_protocol_error/0
     ],
@@ -2789,6 +2790,49 @@ settings_initial_window_size_shifts_stream_window() ->
     serve_recv(ConnPid, Ping),
     PingAck = expect_send(),
     ?assertMatch(<<_:24, 6, 1, _/binary>>, PingAck),
+    cleanup(Pid, Ref).
+
+settings_initial_window_size_flushes_pending_data() ->
+    %% Regression for h2spec 6.9.2: when the peer raises
+    %% INITIAL_WINDOW_SIZE, body queued at a zero send window MUST be
+    %% flushed, not left waiting for a WINDOW_UPDATE. Pin the peer
+    %% window to 0 so a streaming body queues, then raise it via
+    %% SETTINGS and assert the DATA frame ships.
+    {Pid, Ref, ConnPid} = post_handshake_handler(roadrunner_h2_test_handler),
+    %% Peer INITIAL_WINDOW_SIZE = 0 → new streams open with a closed
+    %% send window.
+    Zero = iolist_to_binary(roadrunner_http2_frame:encode({settings, 0, [{4, 0}]})),
+    serve_recv(ConnPid, Zero),
+    ?assertMatch(<<_:24, 4, 1, _/binary>>, expect_send()),
+    %% GET /stream emits "hello " (nofin) then "world" (fin).
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/stream"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    %% Response HEADERS go out (not flow-controlled); the body queues
+    %% because the send window is 0 — no DATA frame yet.
+    ?assertMatch(<<_:24, 1, _/binary>>, expect_send()),
+    ?assertEqual(undefined, drain_send(100)),
+    %% Raise the window: the SETTINGS ACK goes first, then the queued
+    %% DATA flushes on the same handle_frame pass.
+    Raise = iolist_to_binary(roadrunner_http2_frame:encode({settings, 0, [{4, 65535}]})),
+    serve_recv(ConnPid, Raise),
+    ?assertMatch(<<_:24, 4, 1, _/binary>>, expect_send()),
+    ?assertMatch(<<_:24, 0, _, _:1, 1:31, "hello ", _/binary>>, expect_send()),
+    %% Worker unblocks on the flush's ack and streams the rest (fin), so
+    %% it finishes before teardown rather than leaking in `sync/1`.
+    ?assertMatch(<<_:24, 0, 1, _:1, 1:31, "world", _/binary>>, expect_send()),
     cleanup(Pid, Ref).
 
 content_length_multi_valued_rst_stream() ->
