@@ -29,7 +29,6 @@
 %% {h2_send_headers, Worker, Ref, StreamId, Status, Headers, EndStream}
 %% {h2_send_data,    Worker, Ref, StreamId, Data,   EndStream}
 %% {h2_send_trailers, Worker, Ref, StreamId, Trailers}
-%% {h2_worker_done,  StreamId}
 %% ```
 %%
 %% The conn replies `{h2_send_ack, Ref}` once the corresponding
@@ -405,8 +404,6 @@ recv_more(
             recv_more(handle_send_trailers(State, From, Ref, StreamId, Trailers));
         {h2_send_response, From, Ref, StreamId, Status, Headers, Body} ->
             recv_more(handle_send_response(State, From, Ref, StreamId, Status, Headers, Body));
-        {h2_worker_done, StreamId} ->
-            recv_more(handle_worker_done(State, StreamId));
         {'DOWN', MonRef, process, _Pid, Reason} ->
             recv_more(maybe_exit_when_drained(handle_worker_down(State, MonRef, Reason)));
         {roadrunner_drain, _Deadline} ->
@@ -1086,12 +1083,6 @@ handle_send_trailers(State, From, Ref, StreamId, Trailers) ->
             _ = (From ! {h2_send_ack, Ref}),
             State1
     end.
-
-handle_worker_done(State, StreamId) ->
-    %% The worker exits after this message; the DOWN cleanup will
-    %% remove the stream. Nothing to do here.
-    _ = StreamId,
-    State.
 
 handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
     case Refs of

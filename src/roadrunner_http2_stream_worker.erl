@@ -26,9 +26,10 @@
 %%
 %% Worker → Conn: {h2_send_trailers, Worker, Ref, StreamId, Trailers}
 %% Conn   → Worker: {h2_send_ack, Ref}
-%%
-%% Worker → Conn: {h2_worker_done, StreamId}                 %% normal exit
 %% ```
+%%
+%% The worker has no explicit "done" message: it is spawn_monitored, so
+%% the conn finalises the stream on the worker's `DOWN`.
 %%
 %% If the peer cancels the stream (`RST_STREAM` or worker-level error
 %% on the conn side), the conn sends `{h2_stream_reset, StreamId}` —
@@ -70,7 +71,9 @@ init(ConnPid, StreamId, Req, ProtoOpts) ->
     %% handler runs in this worker, not on the conn.
     ok = roadrunner_conn:set_request_logger_metadata(Req),
     run_handler(ConnPid, StreamId, Req, ProtoOpts),
-    ConnPid ! {h2_worker_done, StreamId},
+    %% No explicit completion message: the worker is spawn_monitored by
+    %% the conn, which finalises the stream on the worker's `DOWN`
+    %% (`normal` -> clean removal, anything else -> RST_STREAM).
     ok.
 
 run_handler(ConnPid, StreamId, Req, ProtoOpts) ->
