@@ -135,7 +135,7 @@ Add to `rebar.config`:
 
 ```erlang
 {deps, [
-    {roadrunner, "0.2.1"}
+    {roadrunner, "0.2.2"}
 ]}.
 ```
 
