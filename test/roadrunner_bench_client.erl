@@ -122,13 +122,16 @@ open(Host, Port, h3) ->
 %% `Sock` is the tagged transport — `{ssl, _}` or `{tcp, _}` — so the
 %% rest of the h2 path is transport-agnostic via `tsend/trecv/tclose`.
 h2_open_common(Sock, Host) ->
-    %% Preface + empty SETTINGS + a connection-level WINDOW_UPDATE that
-    %% bumps the server's `conn_send_window` from 65 535 to 2^31-1.
-    %% Without it a long-running keep-alive bench accumulates 65 535
-    %% bytes of response data and stalls. Real h2 clients all do this.
+    %% Preface + SETTINGS (raising SETTINGS_INITIAL_WINDOW_SIZE so each
+    %% stream's send window starts at the max) + a connection-level
+    %% WINDOW_UPDATE that lifts the server's `conn_send_window` to
+    %% 2^31-1. The SETTINGS covers per-stream flow control, the
+    %% WINDOW_UPDATE the connection level; without both, response data
+    %% past the 65 535 defaults stalls (a single-stream response over
+    %% 65 535 bytes, or a long keep-alive run). Real h2 clients raise both.
     BigBumpInc = 16#7FFFFFFF - 65535,
     BumpFrame = roadrunner_http2_frame:encode({window_update, 0, BigBumpInc}),
-    ok = tsend(Sock, [?PREFACE, h2_empty_settings_frame(), BumpFrame]),
+    ok = tsend(Sock, [?PREFACE, h2_settings_frame(), BumpFrame]),
     case h2_handshake(Sock, <<>>, false, false) of
         {ok, Buf} ->
             {ok, #h2_conn{
@@ -471,8 +474,10 @@ h1_content_length(Headers) ->
 %% h2 helpers
 %% =============================================================================
 
-h2_empty_settings_frame() ->
-    <<0:24, 4, 0, 0:32>>.
+h2_settings_frame() ->
+    %% SETTINGS_INITIAL_WINDOW_SIZE (0x04) = 2^31-1 so the server's
+    %% per-stream send window starts at the maximum.
+    roadrunner_http2_frame:encode({settings, 0, [{4, 16#7FFFFFFF}]}).
 
 h2_settings_ack_frame() ->
     <<0:24, 4, 1, 0:32>>.

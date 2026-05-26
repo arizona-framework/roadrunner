@@ -315,10 +315,15 @@ handshake_phase_preface(State) ->
 -spec handshake_phase_settings(#loop{}) -> no_return().
 handshake_phase_settings(#loop{buffer = Buf} = State) ->
     case roadrunner_http2_frame:parse(Buf, ?MAX_FRAME_SIZE) of
-        {ok, {settings, Flags, _Params}, Rest} when (Flags band 1) =:= 0 ->
-            State1 = State#loop{buffer = Rest},
-            _ = send(State1, roadrunner_http2_frame:encode({settings, 1, []})),
-            frame_loop(State1);
+        {ok, {settings, Flags, Params}, Rest} when (Flags band 1) =:= 0 ->
+            %% RFC 9113 §3.4: the connection-preface SETTINGS is a normal
+            %% SETTINGS frame, so apply its parameters through the shared
+            %% handler (validate, apply INITIAL_WINDOW_SIZE, ACK, enter the
+            %% loop). Previously the parameters were dropped, pinning every
+            %% stream's send window to the 65535 default no matter what the
+            %% client advertised — forcing extra WINDOW_UPDATE round-trips
+            %% (or stalling clients that never send one) on large responses.
+            handle_frame({settings, 0, Params}, State#loop{buffer = Rest});
         {ok, _, _} ->
             _ = send_goaway(State, protocol_error),
             exit_clean(State);
