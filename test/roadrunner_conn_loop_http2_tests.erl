@@ -40,6 +40,7 @@ all_test_() ->
         fun missing_pseudo_header_rst_stream/0,
         fun empty_body_response_omits_data_frame/0,
         fun stream_response_emits_data/0,
+        fun stream_response_multi_frame_nofin_chunk/0,
         fun stream_response_no_explicit_fin_auto_closes/0,
         fun stream_response_empty_fin_emits_empty_data/0,
         fun stream_response_with_trailers/0,
@@ -790,6 +791,30 @@ stream_response_emits_data() ->
     [_, F2, F3] = Frames,
     ?assertEqual({data, 1, false, ~"hello "}, F2),
     ?assertEqual({data, 1, true, ~"world"}, F3),
+    cleanup(Pid, Ref).
+
+stream_response_multi_frame_nofin_chunk() ->
+    %% A 20000-byte `nofin` chunk exceeds ?MAX_FRAME_SIZE (16384) but
+    %% fits the default 65535 send window, so `send_data_chunks/8` emits
+    %% two DATA frames in one send, neither carrying END_STREAM, then
+    %% the small final chunk closes the stream. Guards the multi-frame
+    %% coalescing branch: the wire is still distinct frames at the frame
+    %% cap, only the per-frame send count drops.
+    {Pid, Ref} = run_stream_request(~"/stream/multiframe"),
+    Frames = collect_response_frames(),
+    ?assertMatch(
+        [
+            {headers, 1, false},
+            {data, 1, false, _},
+            {data, 1, false, _},
+            {data, 1, true, ~"end"}
+        ],
+        Frames
+    ),
+    [_, {data, 1, false, D1}, {data, 1, false, D2}, _] = Frames,
+    ?assertEqual(16384, byte_size(D1)),
+    ?assertEqual(20000 - 16384, byte_size(D2)),
+    ?assertEqual(binary:copy(~"x", 20000), <<D1/binary, D2/binary>>),
     cleanup(Pid, Ref).
 
 stream_response_no_explicit_fin_auto_closes() ->

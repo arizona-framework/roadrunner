@@ -1230,27 +1230,21 @@ try_send_data(State, Stream, StreamId, From, Ref, Data, EndStream) ->
             _ = (From ! {h2_send_ack, Ref}),
             close_stream_send_side(State, StreamId);
         Total ->
-            case window_budget(State, Stream) of
-                0 ->
-                    %% Window closed — queue the whole send.
-                    Stream1 = enqueue_pending(Stream, {data, Ref, From, Data, EndStream}),
-                    update_stream(State, StreamId, Stream1);
-                _ ->
-                    send_data_chunks(State, Stream, StreamId, From, Ref, Data, Total, EndStream)
-            end
+            %% `send_data_chunks/8` owns the window check: it queues the
+            %% whole send when the window is closed (its `0 ->` clause).
+            send_data_chunks(State, Stream, StreamId, From, Ref, Data, Total, EndStream)
     end.
 
 send_data_chunks(State, Stream, StreamId, From, Ref, Data, Total, EndStream) ->
     Available = window_budget(State, Stream),
-    Take = min(min(Total, Available), ?MAX_FRAME_SIZE),
-    case Take of
+    case min(Total, Available) of
         0 ->
             %% Window closed mid-body — queue the remainder.
             Stream1 = enqueue_pending(Stream, {data, Ref, From, Data, EndStream}),
             update_stream(State, StreamId, Stream1);
-        N when N =:= Total ->
-            %% Fits in one DATA frame and within the window: ship
-            %% iodata straight through. Frame encoder accepts iodata
+        Total when Total =< ?MAX_FRAME_SIZE ->
+            %% Whole body fits the window in a single DATA frame: ship
+            %% iodata straight through. The frame encoder accepts iodata
             %% and the transport's writev() avoids the flatten.
             Flags =
                 if
@@ -1259,26 +1253,61 @@ send_data_chunks(State, Stream, StreamId, From, Ref, Data, Total, EndStream) ->
                 end,
             Frame = roadrunner_http2_frame:encode({data, StreamId, Flags, Data}),
             _ = send(State, Frame),
-            State1 = consume_send_window(State, StreamId, Stream, N),
+            State1 = consume_send_window(State, StreamId, Stream, Total),
             _ = (From ! {h2_send_ack, Ref}),
             if
                 EndStream -> close_stream_send_side(State1, StreamId);
                 true -> State1
             end;
-        N ->
-            %% Chunking across window/MAX_FRAME_SIZE boundaries:
-            %% materialise once so we can slice with binary patterns
-            %% (sub-binaries, no per-chunk copy). On recursion `Rest`
-            %% is a binary and we thread the running size as `Total -
-            %% N`, so no further `iolist_size/1` walk is needed.
+        Sendable ->
+            %% Multiple DATA frames: the body is larger than
+            %% ?MAX_FRAME_SIZE and/or the window only covers `Sendable`
+            %% of `Total`. Encode every frame that fits and emit them in
+            %% ONE transport send (one writev) rather than one ssl:send
+            %% per frame — the wire bytes are byte-for-byte identical,
+            %% only the syscall + tls_sender round-trip count drops.
+            %% Materialise once so the slices are sub-binaries.
             Bin = iolist_to_binary(Data),
-            <<Chunk:N/binary, Rest/binary>> = Bin,
-            Frame = roadrunner_http2_frame:encode({data, StreamId, 0, Chunk}),
-            _ = send(State, Frame),
-            State1 = consume_send_window(State, StreamId, Stream, N),
-            #{StreamId := Stream1} = State1#loop.streams,
-            send_data_chunks(State1, Stream1, StreamId, From, Ref, Rest, Total - N, EndStream)
+            <<ToSend:Sendable/binary, Rest/binary>> = Bin,
+            Full = Sendable =:= Total,
+            Frames = data_frames(StreamId, ToSend, EndStream andalso Full),
+            _ = send(State, Frames),
+            State1 = consume_send_window(State, StreamId, Stream, Sendable),
+            case Full of
+                true ->
+                    _ = (From ! {h2_send_ack, Ref}),
+                    if
+                        EndStream -> close_stream_send_side(State1, StreamId);
+                        true -> State1
+                    end;
+                false ->
+                    %% Window exhausted mid-body: queue the unsent
+                    %% remainder and defer the ack until a WINDOW_UPDATE
+                    %% drains it (unchanged back-pressure contract).
+                    #{StreamId := Stream1} = State1#loop.streams,
+                    Stream2 = enqueue_pending(Stream1, {data, Ref, From, Rest, EndStream}),
+                    update_stream(State1, StreamId, Stream2)
+            end
     end.
+
+%% Encode `Bin` into consecutive DATA frames, each at most
+%% ?MAX_FRAME_SIZE. END_STREAM is set on the last frame only when
+%% `Fin` is true; intermediate frames carry no flags. Cons on the way
+%% out (no reverse). The caller emits the whole list in one send.
+-spec data_frames(pos_integer(), binary(), boolean()) -> iodata().
+data_frames(StreamId, Bin, Fin) when byte_size(Bin) =< ?MAX_FRAME_SIZE ->
+    Flags =
+        if
+            Fin -> 16#01;
+            true -> 0
+        end,
+    [roadrunner_http2_frame:encode({data, StreamId, Flags, Bin})];
+data_frames(StreamId, Bin, Fin) ->
+    <<Chunk:?MAX_FRAME_SIZE/binary, Rest/binary>> = Bin,
+    [
+        roadrunner_http2_frame:encode({data, StreamId, 0, Chunk})
+        | data_frames(StreamId, Rest, Fin)
+    ].
 
 window_budget(#loop{conn_send_window = ConnW}, #{send_window := StreamW}) ->
     max(0, min(ConnW, StreamW)).
