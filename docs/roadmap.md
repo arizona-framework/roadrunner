@@ -1,21 +1,8 @@
 # Roadmap
 
-The TODO backlog past v0.1: open work only. Each item carries a short
-rationale and a rough effort estimate (small, medium, large). Items drop
-off as they ship.
-
-## v0.2 targets
-
-Work to finish before tagging v0.2:
-
-- Re-sync `docs/comparison.md` and `docs/resource_results.md` to the
-  curated `?MAIN_SCENARIOS` in `scripts/bench.escript` (a re-pick plus a
-  fresh `--with-resources` run, not a text edit). The other two bench docs
-  (`bench_results.md`, `wrk2_results.md`) are already resynced.
-
-Optional polish that can fold into v0.2, cheapest first: advertise
-`SETTINGS_MAX_FIELD_SECTION_SIZE` (h3) and `SETTINGS_MAX_HEADER_LIST_SIZE`
-(h2), both detailed below, then h2c Upgrade-mode on a shared port.
+The TODO backlog on the road to v1.0: open work only. Each item carries a
+short rationale and a rough effort estimate (small, medium, large). Items
+drop off as they ship.
 
 ## HTTP/2 response-shape coverage
 
