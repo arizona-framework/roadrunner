@@ -23,6 +23,19 @@ handle(#{target := ~"/stream"} = Req) ->
         end},
         Req
     };
+handle(#{target := ~"/stream/multiframe"} = Req) ->
+    %% A single chunk larger than ?MAX_FRAME_SIZE (16384) but within the
+    %% default 65535 send window, with `nofin`: `send_data_chunks/8`
+    %% ships it in full as multiple DATA frames in one send, none
+    %% carrying END_STREAM (the multi-frame, window-covers-the-send
+    %% branch). A small final chunk then closes the stream.
+    {
+        {stream, 200, [], fun(Send) ->
+            Send(binary:copy(~"x", 20000), nofin),
+            Send(~"end", fin)
+        end},
+        Req
+    };
 handle(#{target := ~"/stream/empty"} = Req) ->
     {{stream, 200, [], fun(_Send) -> ok end}, Req};
 handle(#{target := ~"/stream/empty-fin"} = Req) ->

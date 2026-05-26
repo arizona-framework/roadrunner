@@ -201,15 +201,21 @@ emit_handler_response(
 emit_handler_response(ConnPid, StreamId, _Handler, {websocket, _, _}) ->
     emit_501(ConnPid, StreamId).
 
-%% h2 DATA frame payload cap. The default SETTINGS_MAX_FRAME_SIZE is
-%% 16384 (RFC 9113 §6.5.2); larger reads just force the framer to
-%% split, so cap at the floor.
--define(SENDFILE_CHUNK_SIZE, 16384).
+%% File-read block per worker->conn round-trip. Decoupled from the
+%% wire frame size: the conn (`send_data_chunks/8`) splits each block
+%% into ?MAX_FRAME_SIZE (16384) DATA frames and emits them in one
+%% transport send, so a larger read here means fewer worker->conn
+%% round-trips and fewer ssl:send calls, with byte-identical wire
+%% output. Kept to 4 frames' worth (≈ the default 65535 send window)
+%% so the conn rarely buffers a remainder in its pending-send queue;
+%% reading much past the window would just grow that per-stream buffer
+%% without sending more per round-trip (the window caps each send).
+-define(SENDFILE_READ_BLOCK, 4 * 16384).
 
 sendfile_loop(_IoDev, 0, Send) ->
     Send(<<>>, fin);
 sendfile_loop(IoDev, Remaining, Send) ->
-    Want = min(Remaining, ?SENDFILE_CHUNK_SIZE),
+    Want = min(Remaining, ?SENDFILE_READ_BLOCK),
     {ok, Bin} = file:read(IoDev, Want),
     case Remaining - byte_size(Bin) of
         0 ->
