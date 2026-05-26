@@ -55,16 +55,22 @@
 -define(STATIC_TABLE_LEN, 61).
 
 -record(hpack_ctx, {
-    %% FIFO queue of dynamic-table entries. Newest at the front
-    %% (lowest dynamic index = 62). Eldest is dropped first when
-    %% the size limit forces eviction.
-    %% Implemented as a list (cons at front, drop-and-rebuild on
-    %% eviction) — for typical h2 dynamic tables (<=64 entries) a
-    %% list is faster than a queue.
-    table = [] :: [header()],
+    %% Dynamic-table entries, newest at element 1 (lowest dynamic
+    %% index, HPACK index 62). Eldest is dropped first when the size
+    %% limit forces eviction.
+    %% A tuple so decode-time index lookup is `element/2` (O(1)) — the
+    %% hot path when a header-heavy request references a populated
+    %% dynamic table. Insert (`insert_element/3`) and eviction (rebuild)
+    %% are O(n), but the table is small (<=64 entries) and read far more
+    %% often than it is mutated.
+    table = {} :: tuple(),
     %% Sum of `byte_size(Name) + byte_size(Value) + 32` per entry,
     %% per RFC 7541 §4.1.
     size = 0 :: non_neg_integer(),
+    %% Number of dynamic-table entries (always == tuple_size(table)),
+    %% maintained on mutation so index lookups bounds-check against a
+    %% field instead of recomputing the tuple arity on every call.
+    count = 0 :: non_neg_integer(),
     %% Currently-applied table size limit. Starts at the value
     %% passed to `new_decoder/1` / `new_encoder/1` and changes via
     %% Dynamic Table Size Update reps (decoder side) or
@@ -416,11 +422,11 @@ validate_lower(<<_, Rest/binary>>) -> validate_lower(Rest).
 -spec lookup(pos_integer(), context()) -> {ok, header()} | {error, invalid_index}.
 lookup(Idx, _Ctx) when Idx =< ?STATIC_TABLE_LEN ->
     {ok, lookup_static(Idx)};
-lookup(Idx, #hpack_ctx{table = Table}) ->
+lookup(Idx, #hpack_ctx{table = Table, count = Count}) ->
     DynIdx = Idx - ?STATIC_TABLE_LEN,
-    case nth_or_undefined(DynIdx, Table) of
-        undefined -> {error, invalid_index};
-        H -> {ok, H}
+    case DynIdx =< Count of
+        true -> {ok, element(DynIdx, Table)};
+        false -> {error, invalid_index}
     end.
 
 %% Like `lookup/2` but rejects index 0 — RFC 7541 §6.1 disallows
@@ -432,11 +438,6 @@ lookup(Idx, #hpack_ctx{table = Table}) ->
 lookup_indexed(0, _Ctx) -> {error, invalid_index};
 lookup_indexed(Idx, Ctx) -> lookup(Idx, Ctx).
 
--spec nth_or_undefined(pos_integer(), [term()]) -> term() | undefined.
-nth_or_undefined(_, []) -> undefined;
-nth_or_undefined(1, [H | _]) -> H;
-nth_or_undefined(N, [_ | T]) -> nth_or_undefined(N - 1, T).
-
 -spec insert(header(), context()) -> context().
 insert({Name, Value} = H, #hpack_ctx{max_size = Max} = Ctx) ->
     EntrySize = byte_size(Name) + byte_size(Value) + 32,
@@ -445,12 +446,13 @@ insert({Name, Value} = H, #hpack_ctx{max_size = Max} = Ctx) ->
             %% RFC 7541 §4.4: an entry larger than the table is
             %% silently dropped, evicting the entire current table
             %% in the process.
-            Ctx#hpack_ctx{table = [], size = 0};
+            Ctx#hpack_ctx{table = {}, size = 0, count = 0};
         false ->
             Evicted = evict_to(Max - EntrySize, Ctx),
             Evicted#hpack_ctx{
-                table = [H | Evicted#hpack_ctx.table],
-                size = Evicted#hpack_ctx.size + EntrySize
+                table = erlang:insert_element(1, Evicted#hpack_ctx.table, H),
+                size = Evicted#hpack_ctx.size + EntrySize,
+                count = Evicted#hpack_ctx.count + 1
             }
     end.
 
@@ -458,12 +460,13 @@ insert({Name, Value} = H, #hpack_ctx{max_size = Max} = Ctx) ->
 evict_to(Target, #hpack_ctx{size = Size} = Ctx) when Size =< Target ->
     Ctx;
 evict_to(Target, #hpack_ctx{table = Table} = Ctx) ->
-    %% Eldest is at the END of the list. Walk from the newest end
-    %% with a remaining-budget; the first entry that doesn't fit
-    %% truncates the list there. Body recursion — kept entries
-    %% cons on the way back out.
-    {Kept, NewSize} = keep_within(Table, Target),
-    Ctx#hpack_ctx{table = Kept, size = NewSize}.
+    %% Eldest is at the END. Walk from the newest end with a remaining
+    %% budget; the first entry that doesn't fit truncates there. Reuse
+    %% the list-based `keep_within/2` around the tuple — eviction only
+    %% happens when the size limit is exceeded and the table is small.
+    {Kept, NewSize} = keep_within(tuple_to_list(Table), Target),
+    KeptTable = list_to_tuple(Kept),
+    Ctx#hpack_ctx{table = KeptTable, size = NewSize, count = tuple_size(KeptTable)}.
 
 %% `evict_to/2` early-exits when the current size already fits the
 %% target, so this never sees an empty table — the trim point is
@@ -498,14 +501,14 @@ full_match(Name, Value, #hpack_ctx{table = Dyn}) ->
     %% table); we still indirect through the wrapper so a hit
     %% returns directly without scanning the dynamic table.
     case static_full_match(Name, Value) of
-        none -> dyn_full_match(Name, Value, Dyn, 1);
+        none -> dyn_full_match(Name, Value, tuple_to_list(Dyn), 1);
         Idx -> Idx
     end.
 
 -spec name_match(binary(), context()) -> pos_integer() | none.
 name_match(Name, #hpack_ctx{table = Dyn}) ->
     case static_name_match(Name) of
-        none -> dyn_name_match(Name, Dyn, 1);
+        none -> dyn_name_match(Name, tuple_to_list(Dyn), 1);
         Idx -> Idx
     end.
 

@@ -545,7 +545,7 @@ decode_indexed_out_of_range_is_error_test() ->
 
 decode_indexed_dynamic_2nd_entry_test() ->
     %% Push 2 entries, index dyn[2] (= 63). Exercises the
-    %% recursive `nth_or_undefined/2` clause.
+    %% dynamic-table `element/2` index lookup at the eldest entry.
     Push = <<16#40, 1, "a", 1, "1", 16#40, 1, "b", 1, "2">>,
     Ctx0 = roadrunner_http2_hpack:new_decoder(4096),
     {ok, _, Ctx1} = roadrunner_http2_hpack:decode(Push, Ctx0),
@@ -816,8 +816,9 @@ decode_string_with_empty_input_after_indicator_test() ->
 
 dyn(Ctx) ->
     %% The opaque type makes us peek via element/2 — index 2 of the
-    %% record tuple is the table list.
-    element(2, Ctx).
+    %% record tuple is the dynamic-table tuple (newest first). Convert
+    %% to a list so the assertions below read as ordered entries.
+    tuple_to_list(element(2, Ctx)).
 
 ctx_size(Ctx) ->
     element(3, Ctx).
