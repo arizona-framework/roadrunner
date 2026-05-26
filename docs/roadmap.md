@@ -45,18 +45,12 @@ Autobahn re-run.
 h3 shipped experimentally (`protocols => [http3]`, QPACK static-table
 only). Remaining work:
 
-- Wake an h2 worker stalled in `sync/1` (waiting for a frame ack) when the
-  conn dies. Today it blocks until the QUIC/TCP teardown reaps it. The
-  idle `info_loop` leak is already handled (the worker monitors the conn
-  and stops on its `DOWN`); this is the narrow remaining window for
-  `stream` + `loop`. A uniform fix: the conn loop kills in-flight workers,
-  or `sync` honors the monitor.
 - h3 manual-mode body reading (parity with the deferred h2 item) —
   needs the same conn-loop→worker inbound routing WebSocket would, so
   do it alongside that work, not standalone
 - Advertise `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §7.2.4.1). The
   encoded request header block is now capped (16384 bytes, 431 on
-  overflow, like h1's MAX_HEADER_BLOCK); advertising the decoded-size
+  overflow, as h1's MAX_HEADER_BLOCK does); advertising the decoded-size
   limit would let conformant clients avoid sending an oversized field
   section in the first place rather than learning via the 431
 - WebSocket over h3 (`websocket` shape, still `501`) — RFC 9220
@@ -156,7 +150,7 @@ their handshake fixture).
 **What:** Advertise `SETTINGS_MAX_HEADER_LIST_SIZE` (RFC 9113 §6.5.2,
 id 0x06) in the server's SETTINGS frame. The cumulative HEADERS +
 CONTINUATION block is now capped (16384 bytes, GOAWAY(ENHANCE_YOUR_CALM)
-on overflow, the same bound h1 and h3 use), which closes the
+on overflow, the same way h1 and h3 bound it), which closes the
 CONTINUATION-flood memory gap. Advertising the decoded-size limit lets
 conformant clients avoid sending an oversized block in the first place
 rather than learning via the connection close.
@@ -175,35 +169,6 @@ value to ship and (to be truthful) decode-side enforcement, since today we
 only parse the peer's value and bound inbound via the encoded
 `?MAX_HEADER_BLOCK`. The ~50 handshake fixtures that drain the server
 SETTINGS need to tolerate the extra entry.
-
-### Sendfile chunk size tracks the peer's negotiated MAX_FRAME_SIZE
-
-**What:** Today `?SENDFILE_CHUNK_SIZE` in
-`src/roadrunner_http2_stream_worker.erl` is pinned at 16384, the
-RFC 9113 §6.5.2 default for `SETTINGS_MAX_FRAME_SIZE`. Peers can
-advertise up to `16777215` in their SETTINGS frame; gun, h2o, and
-other clients routinely raise it. Reading the peer's actual
-negotiated value (already tracked at
-`roadrunner_http2_settings:settings.max_frame_size`,
-`src/roadrunner_http2_settings.erl:47`) and using it as the cap in
-`sendfile_loop/3` would let large sendfile responses ship fewer,
-larger DATA frames.
-
-**Why deferred:** Per-DATA-frame overhead is 9 bytes of header vs
-payloads typically thousands of bytes long, so the bandwidth win is
-sub-1%. Plumbing the peer's settings into the stream worker also
-isn't trivial: the worker is handed `(ConnPid, StreamId, ...)` at
-spawn time, not the conn's per-stream peer-settings view, so the
-handoff path needs a new field. No measured case yet where the
-framing overhead matters.
-
-**Scope:** small once measured. Add the peer `max_frame_size` to
-the stream worker's spawn args (or a fetch-on-demand call into the
-conn); replace `min(Remaining, ?SENDFILE_CHUNK_SIZE)` with
-`min(Remaining, PeerMaxFrameSize)` in `sendfile_loop/3`. One new
-test in `roadrunner_conn_loop_http2_tests` that advertises a higher
-`MAX_FRAME_SIZE` in the client SETTINGS and asserts the resulting
-DATA frames scale up accordingly.
 
 ### Sync headline scenarios in comparison.md + resource_results.md
 
@@ -257,16 +222,17 @@ presentation are the bulk; the artifact upload already ships.
 
 ### Proper OTP citizenship in loop responses
 
-**What:** Both `roadrunner_loop_response:info_loop/4` (h1) and
-`roadrunner_http2_loop_response:info_loop/5` (h2) silently drop
-`{system, _, _}`, `{'$gen_call', _, _}`, and `{'$gen_cast', _}`
+**What:** The h1 (`roadrunner_loop_response:info_loop/4`), h2
+(`roadrunner_http2_loop_response:info_loop/5`), and h3
+(`roadrunner_http3_stream_worker:info_loop/5`) loops all silently
+drop `{system, _, _}`, `{'$gen_call', _, _}`, and `{'$gen_cast', _}`
 messages. A more polite implementation would call
 `sys:handle_system_msg/6` on the system message, reply to gen-calls
 with `gen:reply(From, {error, not_supported})`, and so on.
 
-**Why deferred:** the conn (h1) and worker (h2) are plain
-`proc_lib`-spawned loops, not `gen_*` behaviours, so the only path
-for these shapes to reach them is misuse (`gen_server:call(ConnPid, _)`
+**Why deferred:** the conn (h1) and the h2/h3 stream workers are
+plain `proc_lib`-spawned loops, not `gen_*` behaviours, so the only
+path for these shapes to reach them is misuse (`gen_server:call(ConnPid, _)`
 or `sys:get_state(ConnPid)`). The current contract is "those calls
 appear to hang; the caller should expect to time out", documented
 in the `roadrunner_loop_response` moduledoc. Proper handling would
@@ -274,9 +240,27 @@ make these calls observable (e.g. `sys:get_state/1` would return the
 loop state), which has debugging value but no functional fix.
 
 **Scope:** small. New helper `roadrunner_loop_sys` exporting a
-single `handle/3` (sys message, From, ProcessState) used from both
-h1 and h2 info_loops. Tests covering sys/get_state, sys/replace_state,
+single `handle/3` (sys message, From, ProcessState) used from the
+h1, h2, and h3 info_loops. Tests covering sys/get_state, sys/replace_state,
 gen_call rejection, gen_cast no-op.
+
+### Wake an h2 worker blocked in `sync/1` when the conn dies
+
+**What:** An h2 stream worker blocked in
+`roadrunner_http2_stream_worker:sync/1` (waiting on `h2_send_ack`)
+does not wake when the conn dies: its selective receive matches only
+the ack and `h2_stream_reset`, so it blocks until the conn's TCP
+teardown reaps it. The idle `info_loop` case already stops on the
+conn's `DOWN`, so this is the narrow remaining window for the
+`stream` and `loop` response modes.
+
+**Why deferred:** h3 does not share the gap (its worker sends frames
+directly via `quic:send_data` and its `info_loop/5` already handles
+the conn `DOWN`), and the window is narrow. Fix: the conn loop kills
+in-flight workers on teardown, or `sync/1` adds the conn monitor to
+its receive.
+
+**Scope:** small.
 
 ### h2 manual-mode body reading
 
