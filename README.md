@@ -30,7 +30,7 @@ Requires **OTP 29 or newer**.
 
 Roadrunner is in `0.x`. The core is functional and covered by tests,
 but the API may change between minor versions. Pin an exact version
-in your deps (e.g. `{roadrunner, "0.1.0"}`) if you need stability
+in your deps (e.g. `{roadrunner, "0.2.0"}`) if you need stability
 across upgrades.
 
 ## ✅ Conformance
@@ -130,7 +130,7 @@ Add to `rebar.config`:
 
 ```erlang
 {deps, [
-    {roadrunner, "0.1.0"}
+    {roadrunner, "0.2.0"}
 ]}.
 ```
 
