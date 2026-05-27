@@ -131,11 +131,12 @@ means out of scope for that server.
 
 ## Quickstart
 
-Add to `rebar.config`:
+Add to `rebar.config` (latest version on
+[Hex](https://hex.pm/packages/roadrunner)):
 
 ```erlang
 {deps, [
-    {roadrunner, "0.2.2"}
+    roadrunner
 ]}.
 ```
 
