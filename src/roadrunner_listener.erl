@@ -495,13 +495,18 @@ start_tcp(Port, Opts, Protocols, ProtoOpts) ->
     end.
 
 %% Start the QUIC listener roadrunner owns when `http3` is requested.
-%% `quic` is started on demand here (kept out of roadrunner's
-%% `applications` so HTTP/1.1/HTTP/2-only deployments never boot it).
-%% Each accepted QUIC connection is handed to a fresh
-%% `roadrunner_conn_loop_http3` owner via the arity-1
-%% `connection_handler`; the QUIC listener then transfers ownership to
-%% the returned pid. `http3` having been validated to require `tls`,
-%% the `tls` opt is always present here.
+%% Only the self-contained `quic_listener_sup` pool is started (via
+%% `start_quic_pool/2`), NOT the whole `quic` application. That app's
+%% supervisor tree backs the dep's own turnkey server (`server_registry`
+%% / `server_sup`), client (`token_cache`), and distribution
+%% (`dist_sup`) features — none of which roadrunner's owned listener
+%% uses — and `crypto` + `ssl` are already up as roadrunner's own deps.
+%% Keeping the `quic` app out of the boot path means a co-serving
+%% instance carries no idle supervisors it never uses. Each accepted
+%% QUIC connection is handed to a fresh `roadrunner_conn_loop_http3`
+%% owner via the arity-1 `connection_handler`; the QUIC listener then
+%% transfers ownership to the returned pid. `http3` having been
+%% validated to require `tls`, the `tls` opt is always present here.
 -spec start_quic(
     inet:port_number(), opts(), [http1 | http2 | http3, ...], roadrunner_conn:proto_opts()
 ) -> {ok, pid() | undefined} | {error, term()}.
@@ -510,7 +515,6 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
         false ->
             {ok, undefined};
         true ->
-            {ok, _Started} = application:ensure_all_started(quic),
             #{tls := UserTlsOpts} = Opts,
             {Cert, CertChain, Key} = quic_cert_key(UserTlsOpts),
             Handler = fun(ConnPid) -> roadrunner_conn_loop_http3:start(ConnPid, ProtoOpts) end,

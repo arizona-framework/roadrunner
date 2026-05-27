@@ -130,8 +130,13 @@ all() ->
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
     {ok, _} = application:ensure_all_started(ssl),
-    %% The h3 listener starts `quic` on demand, but the client needs it
-    %% too — bring it up once here for the whole suite.
+    %% roadrunner's h3 listener is self-contained and does NOT start the
+    %% `quic` app (see `roadrunner_listener:start_quic/4`); the test CLIENT
+    %% below is what needs it, so bring it up once for the whole suite.
+    %% Consequence: these cases run with `quic` already up, so they don't
+    %% exercise the server's standalone (no-app) path — that's covered
+    %% separately by `bench.escript --protocols h3`, where the server peer
+    %% serves h3 with no `quic` app running.
     {ok, _} = application:ensure_all_started(quic),
     %% Start the default `pg` scope standalone (the drain group lives
     %% there) rather than the whole roadrunner app, so this suite
