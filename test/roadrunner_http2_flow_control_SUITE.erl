@@ -354,7 +354,9 @@ start_conn(Handler) ->
         client_counter => Counter,
         listener_name => h2_flow_test,
         dispatch => {handler, Handler, fun Handler:handle/1, undefined},
-        middlewares => []
+        middlewares => [],
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity
     },
     Sock = {fake, Self},
     Pid = spawn(fun() ->

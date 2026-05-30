@@ -115,7 +115,8 @@ start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
     %% so existing acceptor handoff (`controlling_process` then `! shoot`)
     %% works without modification.
     Parent = self(),
-    proc_lib:start(?MODULE, init_loop, [Parent, Socket, ProtoOpts]).
+    #{handler_spawn_opts := SpawnOpts, handler_start_timeout := StartTimeout} = ProtoOpts,
+    proc_lib:start(?MODULE, init_loop, [Parent, Socket, ProtoOpts], StartTimeout, SpawnOpts).
 
 -doc false.
 -spec init_loop(pid(), roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->

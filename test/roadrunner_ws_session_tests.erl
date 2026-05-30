@@ -1691,7 +1691,12 @@ ws_proto_opts() ->
     ws_proto_opts(16777216, 16777216).
 
 ws_proto_opts(MaxFrame, MaxMsg) ->
-    #{ws_max_frame_size => MaxFrame, ws_max_message_size => MaxMsg}.
+    #{
+        ws_max_frame_size => MaxFrame,
+        ws_max_message_size => MaxMsg,
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity
+    }.
 
 %% A minimal text/binary single-fragment unmasked frame. Server-side
 %% receives masked frames per the WebSocket spec, so we mark fin=true

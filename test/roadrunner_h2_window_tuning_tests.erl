@@ -225,6 +225,8 @@ start_conn(H2Opts) ->
         dispatch =>
             {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1, undefined},
         middlewares => [],
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         protocols => [http2],
         http2_conn_window => maps:get(conn_window, H2Opts, 65535),
         http2_stream_window => maps:get(stream_window, H2Opts, 65535),

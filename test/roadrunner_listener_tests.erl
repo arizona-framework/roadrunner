@@ -283,6 +283,40 @@ listener_protocols_default_is_http1_only_test() ->
     ?assertEqual([http1], maps:get(protocols, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
+listener_threads_handler_spawn_defaults_into_proto_opts_test() ->
+    %% With no `handler_spawn` opt the listener fills the flattened
+    %% `handler_spawn_opts` / `handler_start_timeout` proto_opts keys from the
+    %% defaults: `{fullsweep_after, 0}` (reclaim the per-conn response
+    %% heap instead of hoarding it as old-gen garbage across keep-alive
+    %% requests) and `infinity` (no init-ack deadline).
+    Name = listener_test_handler_spawn_default,
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        routes => roadrunner_hello_handler
+    }),
+    State = sys:get_state(ListenerPid),
+    ProtoOpts = element(4, State),
+    ?assertEqual([{fullsweep_after, 0}], maps:get(handler_spawn_opts, ProtoOpts)),
+    ?assertEqual(infinity, maps:get(handler_start_timeout, ProtoOpts)),
+    ok = roadrunner_listener:stop(Name).
+
+listener_threads_custom_handler_spawn_into_proto_opts_test() ->
+    %% A custom `handler_spawn` map is flattened to the two top-level
+    %% proto_opts keys the spawn sites read directly (no nested lookup
+    %% on the hot path), mirroring the `ws` / `http2` flattening.
+    Name = listener_test_handler_spawn_custom,
+    SpawnOpts = [{fullsweep_after, 20}, {min_bin_vheap_size, 1024}],
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        handler_spawn => #{opts => SpawnOpts, start_timeout => 5000},
+        routes => roadrunner_hello_handler
+    }),
+    State = sys:get_state(ListenerPid),
+    ProtoOpts = element(4, State),
+    ?assertEqual(SpawnOpts, maps:get(handler_spawn_opts, ProtoOpts)),
+    ?assertEqual(5000, maps:get(handler_start_timeout, ProtoOpts)),
+    ok = roadrunner_listener:stop(Name).
+
 listener_accepts_http1_tuple_form_test() ->
     %% `{http1, #{}}` is the explicit tuple shape — accepted but
     %% currently must be empty (no http1 tunables yet; reserved for
@@ -367,6 +401,33 @@ listener_rejects_invalid_ws_opt_test() ->
             ?assertMatch({error, {{invalid_listener_opt, ws, _}, _Stack}}, R)
         end,
         [#{frame_size => 1}, #{max_frame_size => -1}, #{max_frame_size => bad}, not_a_map]
+    ).
+
+listener_rejects_invalid_handler_spawn_test() ->
+    %% `handler_spawn` must be a map; `opts` a list that does not carry the
+    %% roadrunner-owned linkage (`link` / `monitor` / `{monitor, _}`,
+    %% which would break the unlinked-conn + monitored-worker
+    %% semantics); `start_timeout` a non-negative integer or `infinity`.
+    %% Anything else rejects at `init/1` rather than per-connection.
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(listener_test_handler_spawn_invalid, #{
+                port => 0,
+                handler_spawn => Bad,
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, handler_spawn, _}, _Stack}}, R)
+        end,
+        [
+            #{opts => [link]},
+            #{opts => [monitor]},
+            #{opts => [{monitor, []}]},
+            #{opts => not_a_list},
+            #{start_timeout => -1},
+            #{start_timeout => bad},
+            not_a_map
+        ]
     ).
 
 slot_reconciliation_disabled_drops_reconcile_slots_message_test() ->

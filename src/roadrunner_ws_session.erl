@@ -209,7 +209,9 @@ run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, ProtoOpts) ->
     %% conn is intentionally unlinked from its children so a session
     %% crash never propagates to the conn process. We synchronise via
     %% a monitor instead.
-    case gen_statem:start(?MODULE, {Socket, Mod, State, Ctx, Negotiated, ProtoOpts}, []) of
+    #{handler_spawn_opts := SpawnOpts, handler_start_timeout := StartTimeout} = ProtoOpts,
+    StartOpts = [{spawn_opt, SpawnOpts}, {timeout, StartTimeout}],
+    case gen_statem:start(?MODULE, {Socket, Mod, State, Ctx, Negotiated, ProtoOpts}, StartOpts) of
         {ok, Pid} ->
             ok = roadrunner_telemetry:ws_upgrade(Ctx),
             _ = roadrunner_telemetry:response_send(

@@ -133,7 +133,13 @@
     %% Declared here so dialyzer accepts pattern matches like
     %% `#{hibernate_after := Ms}` against `proto_opts()`.
     hibernate_after => pos_integer(),
-    rate_check_interval => pos_integer()
+    rate_check_interval => pos_integer(),
+    %% Flattened spawn config for every handler-running process. The public
+    %% `handler_spawn => #{opts, start_timeout}` listener opt is expanded into
+    %% these top-level keys by `roadrunner_listener:build_proto_opts/2` so the
+    %% spawn sites read them with a single `maps:get/2`, never a nested lookup.
+    handler_spawn_opts => [proc_lib:start_spawn_option()],
+    handler_start_timeout => timeout()
 }.
 
 -doc """

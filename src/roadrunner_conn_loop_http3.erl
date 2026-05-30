@@ -138,7 +138,8 @@ start(ConnPid, ProtoOpts) ->
             _ = quic:close(ConnPid, ?H3_NO_ERROR),
             {error, max_clients};
         true ->
-            {ok, proc_lib:spawn(?MODULE, init, [ConnPid, ProtoOpts])}
+            #{handler_spawn_opts := SpawnOpts} = ProtoOpts,
+            {ok, proc_lib:spawn_opt(?MODULE, init, [ConnPid, ProtoOpts], SpawnOpts)}
     end.
 
 -doc false.
