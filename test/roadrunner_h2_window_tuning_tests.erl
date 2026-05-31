@@ -222,7 +222,8 @@ valid_window_opts_let_listener_boot() ->
                 conn_window => 1_048_576,
                 stream_window => 524_288,
                 window_refill_threshold => 65_536,
-                max_concurrent_streams => 250
+                max_concurrent_streams => 250,
+                max_header_block => 32_768
             }}
         ],
         routes => roadrunner_hello_handler
