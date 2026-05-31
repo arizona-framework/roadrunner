@@ -1,0 +1,50 @@
+---
+# Composite action: set up BEAM from .tool-versions and restore the _build +
+# rebar3 caches seeded by the `cache-erlang` job. Every downstream job in
+# erlang.yml shares this identical setup; keeping it here removes the block
+# that was otherwise copy-pasted per job.
+#
+# The caller must run `actions/checkout` BEFORE referencing this action: a
+# local `uses: ./...` action can only be found once the repo is on disk, so
+# checkout cannot live inside the composite.
+#
+# The cache keys/prefixes can't be read from `needs.*` inside a composite, so
+# the caller threads them in as inputs from the `cache-erlang` job outputs.
+name: Setup Erlang
+description: Set up BEAM and restore the shared _build / rebar3 caches.
+
+inputs:
+  build-cache-key:
+    description: Exact _build cache key (cache-erlang `build-cache-key` output).
+    required: true
+  build-cache-prefix:
+    description: _build cache restore-keys prefix (cache-erlang `build-cache-prefix` output).
+    required: true
+  rebar-cache-key:
+    description: Exact rebar3 cache key (cache-erlang `rebar-cache-key` output).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24
+      id: setup-beam
+      with:
+        version-type: strict
+        version-file: .tool-versions
+
+    - name: Restore _build cache
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: _build
+        key: ${{ inputs.build-cache-key }}
+        restore-keys: ${{ inputs.build-cache-prefix }}
+
+    - name: Restore rebar3 cache
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ~/.cache/rebar3
+        key: ${{ inputs.rebar-cache-key }}
+        restore-keys: |
+          rebar3-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-
+          rebar3-${{ runner.os }}-

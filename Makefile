@@ -3,7 +3,7 @@
 SHELL := /bin/bash
 
 .PHONY: all help compile test precommit doc fmt fmt-check \
-	xref hank dialyzer eunit ct cover \
+	xref hank dialyzer eunit ct cover lint \
 	bench bench-quick wrk2 wrk2-quick h2spec autobahn redbot \
 	clean clean-doc clean-build distclean
 
@@ -18,6 +18,7 @@ help:
 	@echo "  doc           rebar3 ex_doc (writes ./doc/)"
 	@echo "  fmt           rebar3 fmt (writes)"
 	@echo "  fmt-check     rebar3 fmt --check (CI / pre-push)"
+	@echo "  lint          fmt-check + xref + hank + doc (CI Lint job)"
 	@echo "  xref / hank / dialyzer / eunit / ct / cover  individual rebar3 stages"
 	@echo ""
 	@echo "  bench         scripts/bench.escript (full closed-loop matrix)"
@@ -65,6 +66,11 @@ ct:
 
 cover:
 	rebar3 cover --verbose --min_coverage=100
+
+# The fast static checks, grouped for the split CI `Lint` job (erlang.yml).
+# `make precommit` stays the single local pre-push gate; CI runs `lint`,
+# `dialyzer`, and the eunit/ct/cover trio as separate parallel jobs.
+lint: fmt-check xref hank doc
 
 bench:
 	./scripts/bench_matrix.sh

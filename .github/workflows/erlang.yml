@@ -1,17 +1,24 @@
 ---
-# Erlang CI — runs the same `rebar3 precommit` gate contributors run
-# locally (fmt-check, compile, xref, hank, dialyzer, eunit + ct with
-# cover, 100 % line-coverage gate) plus external conformance harnesses
-# (h2spec for HTTP/2, Autobahn for WebSocket) that back the README's
-# Status claims.
+# Erlang CI — the `rebar3 precommit` gate that contributors run locally
+# (fmt-check, compile, xref, hank, dialyzer, ex_doc, eunit + ct with cover,
+# 100 % line-coverage) is split here into parallel, independently-named jobs
+# so each signal lands as its own check on the PR dashboard and the wall time
+# is the slowest single job instead of the serial sum. External conformance
+# harnesses (h2spec, Autobahn) and the wrk2 smoke back the README's Status
+# claims.
 #
-# Job dependency structure:
-# - cache-erlang: Standalone, sets up Erlang and caches build artifacts.
-#                 Exposes cache keys as outputs.
-# - precommit / h2spec / autobahn: Depend on cache-erlang only, restore
-#                 the same cache, run in parallel. Failure of one
-#                 doesn't block the others — the dashboard shows each
-#                 Status claim as its own check.
+# Job dependency structure (all fan out from cache-erlang, run in parallel):
+# - cache-erlang: sets up Erlang, computes cache keys, compiles + caches
+#                 _build / rebar3. Exposes cache keys as outputs.
+# - Lint:      fmt-check + xref + hank + ex_doc (fast static checks).
+# - Dialyzer:  PLT analysis on its own (slow, independent).
+# - Test:      eunit + ct (both with cover), then the aggregated 100 %
+#              coverage gate — kept in one job because the gate sums the
+#              eunit + ct coverdata, which must share a workspace.
+# - h2spec / autobahn / wrk2-smoke: conformance + smoke harnesses.
+#
+# The shared checkout + setup-beam + cache-restore boilerplate lives in the
+# `./.github/actions/setup-erlang` composite action.
 name: Erlang
 
 "on":
@@ -101,8 +108,10 @@ jobs:
       - name: Compile test profile
         run: rebar3 as test compile
 
-  precommit:
-    name: precommit
+  # Fast static checks: fmt-check + xref + hank + ex_doc. All run in seconds,
+  # so they share one job rather than paying the runner-setup tax four times.
+  lint:
+    name: Lint
 
     needs: cache-erlang
 
@@ -111,33 +120,64 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24
-        id: setup-beam
+      - uses: ./.github/actions/setup-erlang
         with:
-          version-type: strict
-          version-file: .tool-versions
+          build-cache-key: ${{ needs.cache-erlang.outputs.build-cache-key }}
+          build-cache-prefix: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
+          rebar-cache-key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
 
-      - name: Restore _build cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      - name: Run lint (fmt-check, xref, hank, doc)
+        run: make lint
+
+  # Dialyzer on its own: it's the slowest non-test stage and fully independent,
+  # so isolating it keeps a type error from hiding behind the test run and lets
+  # it run parallel to Test instead of before it.
+  dialyzer:
+    name: Dialyzer
+
+    needs: cache-erlang
+
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: ./.github/actions/setup-erlang
         with:
-          path: _build
-          key: ${{ needs.cache-erlang.outputs.build-cache-key }}
-          restore-keys: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
+          build-cache-key: ${{ needs.cache-erlang.outputs.build-cache-key }}
+          build-cache-prefix: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
+          rebar-cache-key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
 
-      - name: Restore rebar3 cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      - name: Run dialyzer
+        run: make dialyzer
+
+  # eunit + ct + the 100 % coverage gate. The gate sums the eunit and ct
+  # coverdata (the suite deliberately splits coverage between them), so all
+  # three must run in one job to share `_build/test/cover/`.
+  test:
+    name: Test
+
+    needs: cache-erlang
+
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: ./.github/actions/setup-erlang
         with:
-          path: ~/.cache/rebar3
-          key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
-          restore-keys: |
-            rebar3-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-
-            rebar3-${{ runner.os }}-
+          build-cache-key: ${{ needs.cache-erlang.outputs.build-cache-key }}
+          build-cache-prefix: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
+          rebar-cache-key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
 
-      - name: Run precommit
-        run: rebar3 precommit
+      - name: Run eunit + ct (with cover)
+        run: make eunit ct
+
+      - name: Coverage gate (100 %)
+        run: make cover
 
   # HTTP/2 conformance — backs the README "h2spec strict 100 %" claim.
-  # Runs in parallel with precommit so a lint/fmt issue doesn't block
+  # Runs in parallel with the quality jobs so a lint/fmt issue doesn't block
   # the conformance signal.
   h2spec:
     name: h2spec (HTTP/2 conformance)
@@ -149,27 +189,11 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24
-        id: setup-beam
+      - uses: ./.github/actions/setup-erlang
         with:
-          version-type: strict
-          version-file: .tool-versions
-
-      - name: Restore _build cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: _build
-          key: ${{ needs.cache-erlang.outputs.build-cache-key }}
-          restore-keys: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
-
-      - name: Restore rebar3 cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.cache/rebar3
-          key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
-          restore-keys: |
-            rebar3-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-
-            rebar3-${{ runner.os }}-
+          build-cache-key: ${{ needs.cache-erlang.outputs.build-cache-key }}
+          build-cache-prefix: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
+          rebar-cache-key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
 
       - name: Run h2spec strict
         run: ./scripts/h2spec.sh
@@ -191,27 +215,11 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24
-        id: setup-beam
+      - uses: ./.github/actions/setup-erlang
         with:
-          version-type: strict
-          version-file: .tool-versions
-
-      - name: Restore _build cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: _build
-          key: ${{ needs.cache-erlang.outputs.build-cache-key }}
-          restore-keys: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
-
-      - name: Restore rebar3 cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.cache/rebar3
-          key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
-          restore-keys: |
-            rebar3-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-
-            rebar3-${{ runner.os }}-
+          build-cache-key: ${{ needs.cache-erlang.outputs.build-cache-key }}
+          build-cache-prefix: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
+          rebar-cache-key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
 
       - name: Run Autobahn fuzzingclient
         run: ./scripts/autobahn.escript
@@ -234,27 +242,11 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24
-        id: setup-beam
+      - uses: ./.github/actions/setup-erlang
         with:
-          version-type: strict
-          version-file: .tool-versions
-
-      - name: Restore _build cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: _build
-          key: ${{ needs.cache-erlang.outputs.build-cache-key }}
-          restore-keys: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
-
-      - name: Restore rebar3 cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.cache/rebar3
-          key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
-          restore-keys: |
-            rebar3-${{ runner.os }}-otp-${{ steps.setup-beam.outputs.otp-version }}-
-            rebar3-${{ runner.os }}-
+          build-cache-key: ${{ needs.cache-erlang.outputs.build-cache-key }}
+          build-cache-prefix: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
+          rebar-cache-key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
 
       - name: Run wrk2 smoke (hello + echo, --quick, 10s)
         run: |
