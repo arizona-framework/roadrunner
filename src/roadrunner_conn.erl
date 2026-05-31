@@ -134,6 +134,11 @@
     %% HTTP/3 tuning, flattened from `{http3, #{...}}` when http3 is enabled.
     http3_listeners => 1..1024,
     http3_max_header_block => 1..16#7FFFFFFF,
+    %% HTTP/1 inbound size limits, flattened from `{http1, #{...}}`.
+    http1_max_request_line => 1..16#7FFFFFFF,
+    http1_max_header_line => 1..16#7FFFFFFF,
+    http1_max_header_block => 1..16#7FFFFFFF,
+    http1_max_header_count => 1..16#7FFFFFFF,
     %% Optional fields the listener injects only when the user
     %% supplies them — see `roadrunner_listener:build_proto_opts/2`.
     %% Declared here so dialyzer accepts pattern matches like

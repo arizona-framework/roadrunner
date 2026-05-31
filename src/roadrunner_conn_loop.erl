@@ -95,6 +95,13 @@
     middlewares = [] :: roadrunner_middleware:middleware_list(),
     max_content_length = 0 :: non_neg_integer(),
     max_keep_alive_requests = 1 :: pos_integer(),
+    %% HTTP/1 inbound size limits as the
+    %% `{max_request_line, max_header_line, max_header_block, max_header_count}`
+    %% tuple `roadrunner_http1:parse_request/2` takes. Cached from the
+    %% `http1_*` proto_opts keys at `shoot` (defaults match the parser's
+    %% own `?MAX_*` macros).
+    http1_limits = {8192, 8192, 10240, 100} ::
+        {pos_integer(), pos_integer(), pos_integer(), pos_integer()},
     %% Anti-slowloris on the request-read phase. `min_rate` is cached
     %% from `proto_opts.min_bytes_per_second` at `shoot`. When > 0,
     %% `recv_passive/2` tracks bytes received since `recv_phase_start`
@@ -166,7 +173,13 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
                         middlewares = maps:get(middlewares, ProtoOpts),
                         max_content_length = maps:get(max_content_length, ProtoOpts),
                         max_keep_alive_requests = maps:get(max_keep_alive_requests, ProtoOpts),
-                        min_rate = maps:get(min_bytes_per_second, ProtoOpts)
+                        min_rate = maps:get(min_bytes_per_second, ProtoOpts),
+                        http1_limits = {
+                            maps:get(http1_max_request_line, ProtoOpts, 8192),
+                            maps:get(http1_max_header_line, ProtoOpts, 8192),
+                            maps:get(http1_max_header_block, ProtoOpts, 10240),
+                            maps:get(http1_max_header_count, ProtoOpts, 100)
+                        }
                     },
                     read_request_phase(S)
             end;
@@ -440,12 +453,13 @@ handle_request_bytes(
         listener_name = ListenerName,
         peer = Peer,
         scheme = Scheme,
-        requests_counter = ReqCounter
+        requests_counter = ReqCounter,
+        http1_limits = Http1Limits
     } = S,
     Deadline
 ) ->
     Buf = S#loop_state.buffered,
-    case roadrunner_http1:parse_request(Buf) of
+    case roadrunner_http1:parse_request(Buf, Http1Limits) of
         {ok, Req0, Rest} ->
             _ = atomics:add(ReqCounter, 1, 1),
             {RequestId, NewBuffer} = roadrunner_conn:generate_request_id(

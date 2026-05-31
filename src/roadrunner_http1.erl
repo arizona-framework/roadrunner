@@ -14,6 +14,7 @@
     parse_header/1,
     parse_headers/1,
     parse_request/1,
+    parse_request/2,
     parse_chunk/1,
     check_header_safe/2,
     response/3,
@@ -76,34 +77,48 @@ Bare LF terminators are rejected as `bad_request_line` per RFC 9112 §2.2.
 %% optional leading `\r\n` and then parse normally. Two consecutive
 %% leading CRLFs still fail (the second one becomes a malformed
 %% request-line) so this doesn't open a slowloris-style padding vector.
-parse_request_line(<<"\r\n", Rest/binary>>) ->
-    do_parse_request_line(Rest, persistent_term:get(?LF_KEY), persistent_term:get(?SPACE_KEY));
-parse_request_line(Bin) when is_binary(Bin) ->
-    do_parse_request_line(Bin, persistent_term:get(?LF_KEY), persistent_term:get(?SPACE_KEY)).
+parse_request_line(Bin) ->
+    parse_request_line(Bin, ?MAX_REQUEST_LINE).
 
--spec do_parse_request_line(binary(), binary:cp(), binary:cp()) ->
+%% Internal — `MaxReqLine` caps the request-line length. `parse_request/2`
+%% threads the listener's configured limit; the public `parse_request_line/1`
+%% above passes the `?MAX_REQUEST_LINE` default.
+-spec parse_request_line(binary(), pos_integer()) ->
     {ok, Method :: binary(), Target :: binary(), version(), Rest :: binary()}
     | {more, undefined}
     | {error, bad_request_line | bad_version | request_line_too_long}.
-do_parse_request_line(Bin, LfCp, SpaceCp) ->
+parse_request_line(<<"\r\n", Rest/binary>>, MaxReqLine) ->
+    do_parse_request_line(
+        Rest, persistent_term:get(?LF_KEY), persistent_term:get(?SPACE_KEY), MaxReqLine
+    );
+parse_request_line(Bin, MaxReqLine) when is_binary(Bin) ->
+    do_parse_request_line(
+        Bin, persistent_term:get(?LF_KEY), persistent_term:get(?SPACE_KEY), MaxReqLine
+    ).
+
+-spec do_parse_request_line(binary(), binary:cp(), binary:cp(), pos_integer()) ->
+    {ok, Method :: binary(), Target :: binary(), version(), Rest :: binary()}
+    | {more, undefined}
+    | {error, bad_request_line | bad_version | request_line_too_long}.
+do_parse_request_line(Bin, LfCp, SpaceCp, MaxReqLine) ->
     case binary:match(Bin, LfCp) of
-        nomatch when byte_size(Bin) > ?MAX_REQUEST_LINE ->
+        nomatch when byte_size(Bin) > MaxReqLine ->
             {error, request_line_too_long};
         nomatch ->
             {more, undefined};
         {0, 1} ->
             {error, bad_request_line};
         {LfPos, 1} ->
-            extract_line(Bin, LfPos, SpaceCp)
+            extract_line(Bin, LfPos, SpaceCp, MaxReqLine)
     end.
 
--spec extract_line(binary(), pos_integer(), binary:cp()) ->
+-spec extract_line(binary(), pos_integer(), binary:cp(), pos_integer()) ->
     {ok, binary(), binary(), version(), binary()}
     | {error, bad_request_line | bad_version | request_line_too_long}.
-extract_line(Bin, LfPos, SpaceCp) ->
+extract_line(Bin, LfPos, SpaceCp, MaxReqLine) ->
     LineLen = LfPos - 1,
     case Bin of
-        <<Line:LineLen/binary, "\r\n", Rest/binary>> when LineLen =< ?MAX_REQUEST_LINE ->
+        <<Line:LineLen/binary, "\r\n", Rest/binary>> when LineLen =< MaxReqLine ->
             parse_line(Line, Rest, SpaceCp);
         <<_:LineLen/binary, "\r\n", _/binary>> ->
             {error, request_line_too_long};
@@ -220,25 +235,34 @@ parse_header(Bin) when is_binary(Bin) ->
     | {more, undefined}
     | {error, bad_header | header_too_long}.
 parse_header(Bin, LfCp, ColonCp) ->
+    parse_header(Bin, LfCp, ColonCp, ?MAX_HEADER_LINE).
+
+%% Internal — `MaxLine` caps the per-header-line length.
+-spec parse_header(binary(), binary:cp(), binary:cp(), pos_integer()) ->
+    {ok, binary(), binary(), binary()}
+    | {end_of_headers, binary()}
+    | {more, undefined}
+    | {error, bad_header | header_too_long}.
+parse_header(Bin, LfCp, ColonCp, MaxLine) ->
     case binary:match(Bin, LfCp) of
-        nomatch when byte_size(Bin) > ?MAX_HEADER_LINE ->
+        nomatch when byte_size(Bin) > MaxLine ->
             {error, header_too_long};
         nomatch ->
             {more, undefined};
         {0, 1} ->
             {error, bad_header};
         {LfPos, 1} ->
-            extract_header_line(Bin, LfPos, ColonCp)
+            extract_header_line(Bin, LfPos, ColonCp, MaxLine)
     end.
 
--spec extract_header_line(binary(), pos_integer(), binary:cp()) ->
+-spec extract_header_line(binary(), pos_integer(), binary:cp(), pos_integer()) ->
     {ok, binary(), binary(), binary()}
     | {end_of_headers, binary()}
     | {error, bad_header | header_too_long}.
-extract_header_line(Bin, LfPos, ColonCp) ->
+extract_header_line(Bin, LfPos, ColonCp, MaxLine) ->
     LineLen = LfPos - 1,
     case Bin of
-        <<Line:LineLen/binary, "\r\n", Rest/binary>> when LineLen =< ?MAX_HEADER_LINE ->
+        <<Line:LineLen/binary, "\r\n", Rest/binary>> when LineLen =< MaxLine ->
             case Line of
                 <<>> -> {end_of_headers, Rest};
                 _ -> parse_header_line(Line, Rest, ColonCp)
@@ -387,14 +411,30 @@ Enforces three hardening limits per OTP PR #11073:
         | header_block_too_long
         | too_many_headers
         | conflicting_framing}.
-parse_headers(Bin) when is_binary(Bin) ->
+parse_headers(Bin) ->
+    parse_headers(Bin, {?MAX_HEADER_LINE, ?MAX_HEADER_BLOCK, ?MAX_HEADER_COUNT}).
+
+%% Internal — `Limits` is `{MaxLine, MaxBlock, MaxCount}`, bundled into
+%% one tuple so the per-header loop carries a single extra arg rather than
+%% three. `parse_request/2` threads the listener's configured limits;
+%% `parse_headers/1` above passes the macro defaults.
+-spec parse_headers(binary(), {pos_integer(), pos_integer(), pos_integer()}) ->
+    {ok, headers(), Rest :: binary()}
+    | {more, undefined}
+    | {error,
+        bad_header
+        | header_too_long
+        | header_block_too_long
+        | too_many_headers
+        | conflicting_framing}.
+parse_headers(Bin, {MaxLine, MaxBlock, MaxCount}) when is_binary(Bin) ->
     %% Fetch the compiled LF + colon patterns ONCE here and thread
     %% them through the per-header loop. Saves two
     %% `persistent_term:get/1` calls per header (was ~12 per parse on
     %% a typical request; now 2).
     LfCp = persistent_term:get(?LF_KEY),
     ColonCp = persistent_term:get(?COLON_KEY),
-    case parse_headers_loop(Bin, 0, 0, LfCp, ColonCp) of
+    case parse_headers_loop(Bin, 0, 0, LfCp, ColonCp, MaxLine, MaxBlock, MaxCount) of
         {ok, Headers, Rest} ->
             case check_framing(Headers) of
                 ok -> {ok, Headers, Rest};
@@ -405,7 +445,14 @@ parse_headers(Bin) when is_binary(Bin) ->
     end.
 
 -spec parse_headers_loop(
-    binary(), non_neg_integer(), non_neg_integer(), binary:cp(), binary:cp()
+    binary(),
+    non_neg_integer(),
+    non_neg_integer(),
+    binary:cp(),
+    binary:cp(),
+    pos_integer(),
+    pos_integer(),
+    pos_integer()
 ) ->
     {ok, headers(), binary()}
     | {more, undefined}
@@ -414,15 +461,23 @@ parse_headers(Bin) when is_binary(Bin) ->
         | header_too_long
         | header_block_too_long
         | too_many_headers}.
-parse_headers_loop(_Bin, Count, _Consumed, _LfCp, _ColonCp) when Count > ?MAX_HEADER_COUNT ->
+parse_headers_loop(_Bin, Count, _Consumed, _LfCp, _ColonCp, _MaxLine, _MaxBlock, MaxCount) when
+    Count > MaxCount
+->
     {error, too_many_headers};
-parse_headers_loop(_Bin, _Count, Consumed, _LfCp, _ColonCp) when Consumed > ?MAX_HEADER_BLOCK ->
+parse_headers_loop(_Bin, _Count, Consumed, _LfCp, _ColonCp, _MaxLine, MaxBlock, _MaxCount) when
+    Consumed > MaxBlock
+->
     {error, header_block_too_long};
-parse_headers_loop(Bin, Count, Consumed, LfCp, ColonCp) ->
-    case parse_header(Bin, LfCp, ColonCp) of
+parse_headers_loop(Bin, Count, Consumed, LfCp, ColonCp, MaxLine, MaxBlock, MaxCount) ->
+    case parse_header(Bin, LfCp, ColonCp, MaxLine) of
         {ok, Name, Value, Rest} ->
             Used = byte_size(Bin) - byte_size(Rest),
-            case parse_headers_loop(Rest, Count + 1, Consumed + Used, LfCp, ColonCp) of
+            case
+                parse_headers_loop(
+                    Rest, Count + 1, Consumed + Used, LfCp, ColonCp, MaxLine, MaxBlock, MaxCount
+                )
+            of
                 {ok, Tail, FinalRest} -> {ok, [{Name, Value} | Tail], FinalRest};
                 Other -> Other
             end;
@@ -562,10 +617,36 @@ a record, so callers don't need to include a header file.
         | too_many_headers
         | conflicting_framing
         | missing_host}.
-parse_request(Bin) when is_binary(Bin) ->
+parse_request(Bin) ->
+    parse_request(
+        Bin, {?MAX_REQUEST_LINE, ?MAX_HEADER_LINE, ?MAX_HEADER_BLOCK, ?MAX_HEADER_COUNT}
+    ).
+
+-doc """
+Like `parse_request/1`, but with caller-supplied size limits as a
+`{MaxRequestLine, MaxHeaderLine, MaxHeaderBlock, MaxHeaderCount}` tuple.
+The conn loop passes the listener's configured `http1_*` limits;
+`parse_request/1` passes the `?MAX_*` defaults.
+""".
+-spec parse_request(
+    binary(), {pos_integer(), pos_integer(), pos_integer(), pos_integer()}
+) ->
+    {ok, roadrunner_req:request(), Rest :: binary()}
+    | {more, undefined}
+    | {error,
+        bad_request_line
+        | bad_version
+        | request_line_too_long
+        | bad_header
+        | header_too_long
+        | header_block_too_long
+        | too_many_headers
+        | conflicting_framing
+        | missing_host}.
+parse_request(Bin, {MaxReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}) when is_binary(Bin) ->
     maybe
-        {ok, Method, Target, Version, Rest} ?= parse_request_line(Bin),
-        {ok, Headers, Rest2} ?= parse_headers(Rest),
+        {ok, Method, Target, Version, Rest} ?= parse_request_line(Bin, MaxReqLine),
+        {ok, Headers, Rest2} ?= parse_headers(Rest, {MaxHdrLine, MaxHdrBlock, MaxHdrCount}),
         Decisions = compute_cached_decisions(Headers),
         ok ?= validate_host(Version, Decisions),
         Req = #{
