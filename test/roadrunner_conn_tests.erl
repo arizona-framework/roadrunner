@@ -2108,3 +2108,24 @@ recv_response_with_body(Sock, BodyLen) ->
                 <<BodySoFar/binary, More/binary>>
         end,
     <<Head/binary, "\r\n\r\n", Body/binary>>.
+
+%% =============================================================================
+%% parse_error_status/1 — pure unit tests
+%% =============================================================================
+
+parse_error_status_request_line_too_long_test() ->
+    ?assertEqual(414, roadrunner_conn:parse_error_status(request_line_too_long)).
+
+parse_error_status_header_too_long_test() ->
+    ?assertEqual(431, roadrunner_conn:parse_error_status(header_too_long)).
+
+parse_error_status_header_block_too_long_test() ->
+    ?assertEqual(431, roadrunner_conn:parse_error_status(header_block_too_long)).
+
+parse_error_status_too_many_headers_test() ->
+    ?assertEqual(431, roadrunner_conn:parse_error_status(too_many_headers)).
+
+parse_error_status_other_is_400_test() ->
+    ?assertEqual(400, roadrunner_conn:parse_error_status(bad_request_line)),
+    ?assertEqual(400, roadrunner_conn:parse_error_status(bad_version)),
+    ?assertEqual(400, roadrunner_conn:parse_error_status(missing_host)).

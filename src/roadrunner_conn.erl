@@ -58,6 +58,8 @@
     keep_alive_decision/2,
     send_request_timeout/1,
     send_bad_request/1,
+    send_status/2,
+    parse_error_status/1,
     send_payload_too_large/1,
     drain_oversized_body/3,
     send_internal_error/1,
@@ -988,12 +990,32 @@ header_value(Name, Headers) ->
 -doc false.
 -spec send_bad_request(roadrunner_transport:socket()) -> ok | {error, term()}.
 send_bad_request(Socket) ->
+    send_status(Socket, 400).
+
+%% Send a bare status line (empty body, `Connection: close`) for a request
+%% rejected before any handler runs.
+-doc false.
+-spec send_status(roadrunner_transport:socket(), roadrunner_http:status()) ->
+    ok | {error, term()}.
+send_status(Socket, Status) ->
     Resp = roadrunner_http1:response(
-        400,
+        Status,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
         ~""
     ),
     roadrunner_transport:send(Socket, Resp).
+
+%% Map an `roadrunner_http1:parse_request/2` error reason to its HTTP
+%% status. Size-limit overruns get the RFC-specific codes (414 URI Too
+%% Long per RFC 9110 §15.5.15, 431 Request Header Fields Too Large per
+%% RFC 6585 §5); every other malformed-input reason is a generic 400.
+-doc false.
+-spec parse_error_status(atom()) -> roadrunner_http:status().
+parse_error_status(request_line_too_long) -> 414;
+parse_error_status(header_too_long) -> 431;
+parse_error_status(header_block_too_long) -> 431;
+parse_error_status(too_many_headers) -> 431;
+parse_error_status(_) -> 400.
 
 %% Drain up to `2 * MaxCL` bytes from the socket (counting the
 %% already-buffered bytes), discarding them. Used to flush an
