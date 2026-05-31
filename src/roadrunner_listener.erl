@@ -45,6 +45,10 @@ All duration and interval values in `opts()` are in milliseconds —
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
 -define(DEFAULT_MAX_CLIENTS, 150).
 -define(DEFAULT_MIN_BYTES_PER_SECOND, 100).
+%% TCP listen backlog (kernel SYN/accept queue depth). OTP defaults to 5,
+%% which a burst of concurrent connects overflows; 1024 matches cowboy.
+%% Linux clamps the effective value at `net.core.somaxconn`.
+-define(DEFAULT_SOCKET_BACKLOG, 1024).
 %% Spawn config for every handler-running process (connection process +
 %% HTTP/2/3 stream workers). `fullsweep_after, 0` reclaims the per-connection
 %% heap that grows building a response (e.g. a JSON encoder's transient iolist)
@@ -116,6 +120,10 @@ Optional middleware and timing knobs (durations in milliseconds):
   `[roadrunner, listener, conn_rejected]` and increments the `rejected`
   count from `info/1`, so a rising `rejected` is the signal that the
   cap is the binding limit.
+- `socket_backlog` — TCP listen backlog (kernel SYN/accept queue
+  depth). Default 1024. Raise it for connection bursts (load tests,
+  health-check storms); Linux clamps the effective value at
+  `net.core.somaxconn`.
 - `min_bytes_per_second` — slow-loris guard on the request-read
   phase (0 disables). Default 100.
 - `rate_check_interval` — how often the rate guard re-checks
@@ -169,6 +177,7 @@ ops-tuning rationale.
     num_acceptors => pos_integer(),
     max_keep_alive_requests => pos_integer(),
     max_clients => pos_integer(),
+    socket_backlog => pos_integer(),
     min_bytes_per_second => non_neg_integer(),
     %% How often `reading_request` re-checks the running
     %% bytes-per-second average against `min_bytes_per_second`.
@@ -745,7 +754,7 @@ listener_name() ->
 -spec open_listen_socket(
     inet:port_number(), opts(), [http1 | http2, ...]
 ) -> {ok, roadrunner_transport:socket()} | {error, term()}.
-open_listen_socket(Port, #{tls := UserTlsOpts}, Protocols) ->
+open_listen_socket(Port, #{tls := UserTlsOpts} = Opts, Protocols) ->
     %% TLS path — caller supplies cert/key. ALPN is derived from the
     %% normalized `protocols` list (`http2` → `~"h2"`, `http1` →
     %% `~"http/1.1"`) unless the user supplied
@@ -754,8 +763,8 @@ open_listen_socket(Port, #{tls := UserTlsOpts}, Protocols) ->
     %% (user values win), and the standard transport options sit on
     %% top so accepted sockets behave like the plain-TCP variant.
     TlsOpts = roadrunner_transport:build_tls_opts(Protocols, UserTlsOpts),
-    roadrunner_transport:listen_tls(Port, TlsOpts ++ base_listen_opts());
-open_listen_socket(Port, _Opts, _Protocols) ->
+    roadrunner_transport:listen_tls(Port, TlsOpts ++ base_listen_opts(Opts));
+open_listen_socket(Port, Opts, _Protocols) ->
     %% Plain TCP. The legacy `inet_drv` backend (gen_tcp default) has
     %% lower per-call overhead than the OTP-27 `socket` backend on
     %% short-lived connections. fprof on `connection_storm` shows the
@@ -765,10 +774,10 @@ open_listen_socket(Port, _Opts, _Protocols) ->
     %% `docs/conn_lifecycle_investigation.md`. The new backend's
     %% async I/O wins are real for long-lived connections; revisit
     %% if/when the workload mix shifts there.
-    roadrunner_transport:listen(Port, base_listen_opts()).
+    roadrunner_transport:listen(Port, base_listen_opts(Opts)).
 
--spec base_listen_opts() -> [gen_tcp:listen_option()].
-base_listen_opts() ->
+-spec base_listen_opts(opts()) -> [gen_tcp:listen_option()].
+base_listen_opts(Opts) ->
     %% `nodelay` disables Nagle's algorithm on accepted sockets.
     %% RFC 9113 §5.2 doesn't mandate it, but every production h2
     %% server (nginx, h2o, cowboy, …) sets it because h2 responses
@@ -785,10 +794,11 @@ base_listen_opts() ->
     %% storms) overflows the kernel listen queue and the new SYNs
     %% get dropped — `gen_tcp:connect` succeeds (kernel SYN-cookie
     %% path), then the first `send` returns `{error, closed}`
-    %% because the conn was never queued for `accept`. Cowboy
-    %% defaults to 1024; matching that. Linux clamps at
-    %% `net.core.somaxconn` (typically 4096), so this is safely
-    %% non-truncated everywhere.
+    %% because the conn was never queued for `accept`. Defaults to
+    %% 1024 (matching cowboy), overridable via the `socket_backlog`
+    %% listener opt. Linux clamps the effective value at
+    %% `net.core.somaxconn` (typically 4096), so the default is
+    %% safely non-truncated everywhere.
     %%
     %% `buffer` is the emulator's user-space buffer that bounds how
     %% many bytes each `{tcp, _, Data}` message carries in
@@ -808,7 +818,7 @@ base_listen_opts() ->
         {reuseaddr, true},
         {packet, raw},
         {nodelay, true},
-        {backlog, 1024},
+        {backlog, maps:get(socket_backlog, Opts, ?DEFAULT_SOCKET_BACKLOG)},
         {buffer, 65536}
     ].
 
