@@ -496,7 +496,10 @@ handle_request_bytes(
                 peer => Peer,
                 reason => Reason
             }),
-            _ = roadrunner_conn:send_bad_request(Socket),
+            %% Size-limit overruns get the RFC-specific status (414 for an
+            %% over-long request line, 431 for oversized/too-many headers);
+            %% other malformed input is a generic 400.
+            _ = roadrunner_conn:send_status(Socket, roadrunner_conn:parse_error_status(Reason)),
             exit_normal(S)
     end.
 
@@ -543,7 +546,12 @@ read_body_phase(
                     exit_normal(S);
                 {error, BodyReason} ->
                     ok = rejection(S, BodyReason),
-                    _ = roadrunner_conn:send_bad_request(Socket),
+                    %% A chunked body's trailer block obeys the same header
+                    %% limits as request headers, so an oversized/too-many
+                    %% trailer reason maps to 431 the same way.
+                    _ = roadrunner_conn:send_status(
+                        Socket, roadrunner_conn:parse_error_status(BodyReason)
+                    ),
                     exit_normal(S)
             end;
         manual ->

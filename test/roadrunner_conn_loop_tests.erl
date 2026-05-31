@@ -145,6 +145,52 @@ bad_request_writes_400_then_exits_test() ->
     ?assertMatch(<<"HTTP/1.1 400", _/binary>>, Sent),
     Sink ! stop.
 
+oversized_request_line_writes_414_then_exits_test() ->
+    %% A request line past the 8192-byte cap is `request_line_too_long`,
+    %% which answers 414 URI Too Long (RFC 9110 §15.5.15), not a generic
+    %% 400.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    LongTarget = binary:copy(~"a", 9000),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, <<"GET /", LongTarget/binary, " HTTP/1.1\r\nHost: x\r\n\r\n">>
+    ),
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, fake_opts(uri_414)),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 414", _/binary>>, Sent),
+    Sink ! stop.
+
+too_many_headers_writes_431_then_exits_test() ->
+    %% More than 100 header lines is `too_many_headers`, which answers
+    %% 431 Request Header Fields Too Large (RFC 6585 §5), not a 400.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Headers = iolist_to_binary([
+        [~"X-", integer_to_binary(N), ~": v\r\n"]
+     || N <- lists:seq(1, 150)
+    ]),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, <<"GET / HTTP/1.1\r\nHost: x\r\n", Headers/binary, "\r\n">>
+    ),
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, fake_opts(hdr_431)),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 431", _/binary>>, Sent),
+    Sink ! stop.
+
 request_timeout_writes_408_then_exits_test() ->
     %% No bytes — the request_timeout `after` clause should fire and
     %% the conn should write 408 before exiting.
