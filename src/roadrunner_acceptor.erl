@@ -52,7 +52,17 @@ handle_accepted(Socket, ProtoOpts) ->
             ConnPid ! shoot,
             ok;
         false ->
-            %% Over max_clients — drop the new connection on the floor.
+            %% Over max_clients — drop the new connection on the floor, but
+            %% make the drop observable: bump the cumulative reject counter
+            %% (surfaced via `roadrunner_listener:info/1`) and emit
+            %% `[roadrunner, listener, conn_rejected]`. No `peername` lookup
+            %% here — this is the floodable path, so it stays cheap.
+            #{rejected_counter := RejectedCounter} = ProtoOpts,
+            ok = atomics:add(RejectedCounter, 1, 1),
+            ok = roadrunner_telemetry:listener_conn_rejected(#{
+                listener_name => maps:get(listener_name, ProtoOpts, undefined),
+                reason => max_clients
+            }),
             _ = roadrunner_transport:close(Socket),
             ok
     end.

@@ -97,6 +97,7 @@
     max_clients := pos_integer(),
     client_counter := counters:counters_ref(),
     requests_counter := atomics:atomics_ref(),
+    rejected_counter := atomics:atomics_ref(),
     min_bytes_per_second := non_neg_integer(),
     body_buffering := auto | manual,
     listener_name => atom(),

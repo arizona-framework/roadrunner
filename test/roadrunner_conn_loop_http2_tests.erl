@@ -432,6 +432,7 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
         handler_start_timeout => infinity,
         client_counter => Counter,
         requests_counter => RequestsCounter,
+        rejected_counter => atomics:new(1, [{signed, false}]),
         listener_name => h2c_dispatch_test,
         dispatch =>
             {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1, undefined},
@@ -484,6 +485,7 @@ plaintext_listener_without_h2c_stays_h1() ->
         handler_start_timeout => infinity,
         client_counter => Counter,
         requests_counter => RequestsCounter,
+        rejected_counter => atomics:new(1, [{signed, false}]),
         listener_name => h1_dispatch_test,
         dispatch =>
             {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1, undefined},
