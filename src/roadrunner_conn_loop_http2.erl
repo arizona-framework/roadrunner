@@ -38,8 +38,9 @@
 %% Workers are spawn_monitored (NOT linked) so a handler crash
 %% resets only the affected stream — `'DOWN'` triggers
 %% `RST_STREAM(INTERNAL_ERROR)` and the other in-flight streams
-%% keep running. `MAX_CONCURRENT_STREAMS=100` is advertised; HEADERS
-%% beyond that limit get `RST_STREAM(REFUSED_STREAM)`.
+%% keep running. `MAX_CONCURRENT_STREAMS` is advertised (default 100,
+%% overridable via the `max_concurrent_streams` http2 listener opt);
+%% HEADERS beyond that limit get `RST_STREAM(REFUSED_STREAM)`.
 %%
 %% Response shapes supported:
 %%
@@ -104,8 +105,9 @@
 %% FLOW_CONTROL_ERROR.
 -define(MAX_WINDOW, 16#7FFFFFFF).
 
-%% Phase H8b: lift from 1 (serial) to 100 concurrent streams.
-%% Clients exceeding this on this connection get
+%% Default cap on concurrent client-initiated streams (Phase H8b lifted
+%% it from 1 serial to 100). Overridable per listener via the
+%% `max_concurrent_streams` http2 opt; clients exceeding the live cap get
 %% RST_STREAM(REFUSED_STREAM) on the over-limit HEADERS.
 -define(MAX_CONCURRENT_STREAMS, 100).
 
@@ -190,6 +192,9 @@
     recv_window_peak = ?DEFAULT_CONN_RECV_WINDOW :: pos_integer(),
     stream_recv_window_peak = ?DEFAULT_STREAM_RECV_WINDOW :: pos_integer(),
     recv_window_threshold = ?DEFAULT_WINDOW_REFILL_THRESHOLD :: pos_integer(),
+    %% Max concurrent client-initiated streams: advertised in our SETTINGS
+    %% and enforced in `on_headers/5`. Read from proto_opts at `enter/5`.
+    max_concurrent_streams = ?MAX_CONCURRENT_STREAMS :: pos_integer(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -238,6 +243,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
     Threshold = maps:get(
         http2_window_refill_threshold, ProtoOpts, ?DEFAULT_WINDOW_REFILL_THRESHOLD
     ),
+    MaxStreams = maps:get(http2_max_concurrent_streams, ProtoOpts, ?MAX_CONCURRENT_STREAMS),
     State = #loop{
         socket = Socket,
         proto_opts = ProtoOpts,
@@ -252,7 +258,8 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
         hpack_enc = roadrunner_http2_hpack:new_encoder(4096),
         recv_window_peak = ConnPeak,
         stream_recv_window_peak = StreamPeak,
-        recv_window_threshold = Threshold
+        recv_window_threshold = Threshold,
+        max_concurrent_streams = MaxStreams
     },
     handshake(State).
 
@@ -262,9 +269,13 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
 
 -spec handshake(#loop{}) -> no_return().
 handshake(
-    #loop{recv_window_peak = ConnPeak, stream_recv_window_peak = StreamPeak} = State
+    #loop{
+        recv_window_peak = ConnPeak,
+        stream_recv_window_peak = StreamPeak,
+        max_concurrent_streams = MaxStreams
+    } = State
 ) ->
-    _ = send(State, server_settings_frame(StreamPeak)),
+    _ = send(State, server_settings_frame(StreamPeak, MaxStreams)),
     %% RFC 9113 §6.9.2: SETTINGS_INITIAL_WINDOW_SIZE only affects
     %% stream-level recv windows. The conn-level recv window stays
     %% at the 65535 default until an explicit `WINDOW_UPDATE(0, _)`,
@@ -280,15 +291,15 @@ handshake(
         end,
     handshake_phase_preface(State1).
 
--spec server_settings_frame(pos_integer()) -> iodata().
-server_settings_frame(StreamPeak) ->
-    %% Advertise MAX_CONCURRENT_STREAMS=100 and MAX_FRAME_SIZE.
+-spec server_settings_frame(pos_integer(), pos_integer()) -> iodata().
+server_settings_frame(StreamPeak, MaxStreams) ->
+    %% Advertise MAX_CONCURRENT_STREAMS and MAX_FRAME_SIZE.
     %% IDs from RFC 9113 §6.5.2: 3 = MAX_CONCURRENT_STREAMS,
     %% 5 = MAX_FRAME_SIZE.  When the stream-level recv peak is bigger
     %% than the RFC 65535 default, also advertise
     %% SETTINGS_INITIAL_WINDOW_SIZE (id 4) so streams the peer opens
     %% start with the larger receive allowance.
-    Base = [{3, ?MAX_CONCURRENT_STREAMS}, {5, ?MAX_FRAME_SIZE}],
+    Base = [{3, MaxStreams}, {5, ?MAX_FRAME_SIZE}],
     Settings =
         case StreamPeak > ?INITIAL_WINDOW of
             true -> [{4, StreamPeak} | Base];
@@ -676,8 +687,14 @@ on_headers(StreamId, _Flags, _Priority, _Fragment, #loop{draining = true} = Stat
     %% won't be served.
     _ = send_rst_stream(State, StreamId, refused_stream),
     frame_loop(State);
-on_headers(StreamId, _Flags, _Priority, _Fragment, #loop{streams = Streams} = State) when
-    map_size(Streams) >= ?MAX_CONCURRENT_STREAMS
+on_headers(
+    StreamId,
+    _Flags,
+    _Priority,
+    _Fragment,
+    #loop{streams = Streams, max_concurrent_streams = MaxStreams} = State
+) when
+    map_size(Streams) >= MaxStreams
 ->
     %% Over the advertised concurrency limit — refuse the stream.
     _ = send_rst_stream(State, StreamId, refused_stream),
