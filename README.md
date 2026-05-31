@@ -217,18 +217,24 @@ All listener options live in the
 type, with per-key defaults and tuning rationale. Beyond `port`,
 `protocols`, `tls`, and `routes` from the Quickstart, the type covers:
 
-- **DoS bounds** — `max_clients`, `max_content_length`,
-  `request_timeout`, `keep_alive_timeout`,
+- **DoS bounds** — `max_clients`, `socket_backlog`,
+  `max_content_length`, `request_timeout`, `keep_alive_timeout`,
   `min_bytes_per_second`, `max_keep_alive_requests`
 - **Middleware** — `middlewares`
 - **Body buffering** — `body_buffering`
 - **Graceful drain** — `graceful_drain`, `slot_reconciliation`
 - **Per-conn hibernation** — `hibernate_after`
+- **Handler spawn opts** — `handler_spawn`
+- **HTTP/1 tunables** (under the `{http1, Opts}` entry in
+  `protocols`) — `max_request_line`, `max_header_line`,
+  `max_header_block`, `max_header_count`
 - **HTTP/2 tunables** (under the `{http2, Opts}` entry in
   `protocols`) — `conn_window`, `stream_window`,
-  `window_refill_threshold`
+  `window_refill_threshold`, `max_concurrent_streams`,
+  `max_header_block`
 - **HTTP/3 tunables** (under the `{http3, Opts}` entry in
-  `protocols`) — `listeners` (reuseport pool size)
+  `protocols`) — `listeners` (reuseport pool size),
+  `max_header_block`
 
 ## Features
 
@@ -276,7 +282,7 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
   client renegotiation off, post-quantum hybrid `x25519mlkem768` first
   when the OpenSSL build supports it. Full settings list in the
   `roadrunner_listener` module docs.
-- DoS bounds — `max_clients`, `max_content_length`,
+- DoS bounds — `max_clients`, `socket_backlog`, `max_content_length`,
   `min_bytes_per_second`, `request_timeout`, `keep_alive_timeout`,
   `max_keep_alive_requests`.
 
