@@ -64,6 +64,18 @@
 %%   - **Measurements:** `duration` in `native` time units.
 %%   - **Metadata:** `listener_name`, `peer`, `requests_served`.
 %%
+%% - `[roadrunner, listener, conn_rejected]` — fired in the acceptor when a
+%%   freshly-accepted connection is dropped because the listener is at its
+%%   `max_clients` cap. Lets operators see they've hit the connection
+%%   ceiling instead of mistaking the rejections for slowness; pair it
+%%   with the cumulative `rejected` count from `roadrunner_listener:info/1`.
+%%   Carries no `peer` (unlike `accept`): the reject path is the floodable
+%%   one, so it skips the `peername` lookup to stay cheap under a connection
+%%   flood.
+%%
+%%   - **Measurements:** `system_time`.
+%%   - **Metadata:** `listener_name`, `reason` (`max_clients`).
+%%
 %% - `[roadrunner, ws, upgrade]` — fired in the conn process once the
 %%   WebSocket handshake response has been written. Marks the
 %%   transition from HTTP/1.1 keep-alive into the WS frame loop.
@@ -125,8 +137,9 @@
 %% All other events listed above (`request, start`,
 %% `request, exception`, `response, send_failed`,
 %% `listener, accept`, `listener, conn_close`,
-%% `request, rejected`, `listener, slots_reconciled`,
-%% `drain, acknowledged`, `ws, frame_in`, `ws, frame_rejected`) are **unstable**: their
+%% `listener, conn_rejected`, `request, rejected`,
+%% `listener, slots_reconciled`, `drain, acknowledged`,
+%% `ws, frame_in`, `ws, frame_rejected`) are **unstable**: their
 %% event name, measurement keys, or metadata schema may change in
 %% any minor release. Production subscribers depending on those
 %% events should pin a roadrunner version.
@@ -141,6 +154,7 @@
     response_send/2,
     listener_accept/1,
     listener_conn_close/2,
+    listener_conn_rejected/1,
     request_rejected/1,
     slots_reconciled/1,
     drain_acknowledged/1,
@@ -256,6 +270,22 @@ listener_conn_close(StartMono, Metadata) ->
     telemetry:execute(
         [roadrunner, listener, conn_close],
         #{duration => erlang:monotonic_time() - StartMono},
+        Metadata
+    ),
+    ok.
+
+-doc """
+Emit `[roadrunner, listener, conn_rejected]` when a freshly-accepted
+connection is dropped at the `max_clients` cap. `Metadata` should
+include `listener_name` and `reason` (`max_clients`). Carries no `peer`:
+the reject path is the floodable one, so it skips the `peername` lookup
+to stay cheap under a connection flood.
+""".
+-spec listener_conn_rejected(map()) -> ok.
+listener_conn_rejected(Metadata) ->
+    telemetry:execute(
+        [roadrunner, listener, conn_rejected],
+        #{system_time => erlang:system_time()},
         Metadata
     ),
     ok.

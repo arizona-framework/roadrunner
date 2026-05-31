@@ -478,7 +478,65 @@ listener_info_initial_zero_test() ->
     ?assertEqual(0, maps:get(active_clients, Info)),
     ?assertEqual(42, maps:get(max_clients, Info)),
     ?assertEqual(0, maps:get(requests_served, Info)),
+    ?assertEqual(0, maps:get(rejected, Info)),
     ok = roadrunner_listener:stop(Name).
+
+over_cap_connection_rejected_fires_event_and_counts_test() ->
+    %% A listener at `max_clients` drops the next connection on the floor.
+    %% That used to be silent; assert it now bumps `info/1`'s `rejected`
+    %% and emits `[roadrunner, listener, conn_rejected]` with
+    %% `reason => max_clients`.
+    {ok, _} = application:ensure_all_started(telemetry),
+    Self = self(),
+    HandlerId = make_ref(),
+    ok = telemetry:attach(
+        HandlerId,
+        [roadrunner, listener, conn_rejected],
+        fun(Event, M, Md, _) -> Self ! {ev, Event, M, Md} end,
+        undefined
+    ),
+    Name = listener_test_over_cap,
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0, max_clients => 1, routes => roadrunner_hello_handler
+    }),
+    Port = roadrunner_listener:port(Name),
+    try
+        %% Hold one connection open to occupy the single slot. The slot is
+        %% taken on accept (before any request is read), so an idle socket
+        %% that sends nothing keeps it — the hello handler answers with
+        %% `Connection: close`, so sending a request would free the slot.
+        {ok, Hold} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+        %% Wait until the slot is actually accounted for before probing.
+        ok = wait_active_clients(Name, 1, 50),
+        %% A second connection must be rejected at the cap.
+        {ok, Rejected} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+        %% The server closes it without a response — recv hits EOF.
+        ?assertMatch({error, closed}, gen_tcp:recv(Rejected, 0, 1000)),
+        ok = gen_tcp:close(Rejected),
+        receive
+            {ev, [roadrunner, listener, conn_rejected], M, Md} ->
+                ?assert(is_integer(maps:get(system_time, M))),
+                ?assertEqual(Name, maps:get(listener_name, Md)),
+                ?assertEqual(max_clients, maps:get(reason, Md))
+        after 1000 -> error(no_conn_rejected_event)
+        end,
+        ?assertEqual(1, maps:get(rejected, roadrunner_listener:info(Name))),
+        ok = gen_tcp:close(Hold)
+    after
+        telemetry:detach(HandlerId),
+        ok = roadrunner_listener:stop(Name)
+    end.
+
+wait_active_clients(_Name, _Want, 0) ->
+    error(active_clients_never_reached);
+wait_active_clients(Name, Want, Tries) ->
+    case maps:get(active_clients, roadrunner_listener:info(Name)) of
+        Want ->
+            ok;
+        _ ->
+            timer:sleep(20),
+            wait_active_clients(Name, Want, Tries - 1)
+    end.
 
 listener_info_counts_served_requests_test_() ->
     {setup,

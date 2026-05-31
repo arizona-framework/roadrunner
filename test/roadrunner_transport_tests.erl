@@ -566,6 +566,7 @@ fake_proto_opts(Handler) ->
         max_clients => 10,
         client_counter => counters:new(1, [write_concurrency]),
         requests_counter => atomics:new(1, [{signed, false}]),
+        rejected_counter => atomics:new(1, [{signed, false}]),
         min_bytes_per_second => 0,
         body_buffering => auto,
         handler_spawn_opts => [{fullsweep_after, 0}],

@@ -108,7 +108,14 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `num_acceptors` — size of the acceptor pool. Default 10.
 - `max_keep_alive_requests` — requests served per conn before
   forced close. Default 1000.
-- `max_clients` — concurrent connection cap. Default 150.
+- `max_clients` — concurrent connection cap. Default 150. Connections
+  accepted while already at the cap are closed immediately without a
+  response. The default bounds memory (the recv `buffer` alone is
+  `max_clients × 64 KB`), so high-concurrency deployments should raise
+  it. Rejections are observable: each one emits
+  `[roadrunner, listener, conn_rejected]` and increments the `rejected`
+  count from `info/1`, so a rising `rejected` is the signal that the
+  cap is the binding limit.
 - `min_bytes_per_second` — slow-loris guard on the request-read
   phase (0 disables). Default 100.
 - `rate_check_interval` — how often the rate guard re-checks
@@ -130,8 +137,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   `[{fullsweep_after, 0}]` so the per-conn response heap is reclaimed
   instead of hoarding it as old-gen garbage across keep-alive
   requests) and `start_timeout` (init-ack deadline, default
-  `infinity`). Pair with `+MHacul 0 +MBacul 0` in `vm.args` to return
-  freed allocator carriers to the OS for the lowest resident memory.
+  `infinity`). For the lowest *resident* memory you can also add
+  `+MHacul 0 +MBacul 0` to `vm.args` to return freed allocator carriers
+  to the OS, but that is a tradeoff, not a free win: it raises
+  allocator↔OS traffic and can hurt throughput at high core counts, so
+  measure it for your workload rather than enabling it blindly.
 - `protocols` — list of `t:protocol_entry/0`. Default `[http1]`.
   On TLS this drives `alpn_preferred_protocols` automatically.
 - `tls` — `[ssl:tls_server_option()]` for HTTPS. Empty / absent
@@ -202,8 +212,11 @@ ops-tuning rationale.
     %% `Time`: how long to wait for a started process to ack init before
     %% killing it with `{error, timeout}` (default `infinity`); it applies to
     %% the connection process and the WebSocket session (the fire-and-forget
-    %% HTTP/3 conn and stream-worker spawns have no init handshake). For lowest
-    %% OS-resident memory also set `+MHacul 0 +MBacul 0` in `vm.args`.
+    %% HTTP/3 conn and stream-worker spawns have no init handshake). For lower
+    %% OS-resident memory `+MHacul 0 +MBacul 0` in `vm.args` returns freed
+    %% allocator carriers to the OS, but it trades throughput for RSS (more
+    %% allocator↔OS traffic, costly at high core counts) — measure it, don't
+    %% enable it blindly.
     handler_spawn => #{
         opts => [proc_lib:start_spawn_option()],
         start_timeout => timeout()
@@ -431,6 +444,10 @@ Return runtime introspection for a listener:
   responses from the router (404) and the body-size pre-check (413);
   excludes wire-level parse failures, idle keep-alive timeouts, and
   silent slow-client closes.
+- `rejected` — cumulative count of connections dropped because the
+  listener was at its `max_clients` cap when they arrived. A rising
+  `rejected` means the cap is the binding limit and should be raised.
+  Also emitted in real time as `[roadrunner, listener, conn_rejected]`.
 
 Useful for ops dashboards / health endpoints.
 """.
@@ -438,7 +455,8 @@ Useful for ops dashboards / health endpoints.
     #{
         active_clients := non_neg_integer(),
         max_clients := pos_integer(),
-        requests_served := non_neg_integer()
+        requests_served := non_neg_integer(),
+        rejected := non_neg_integer()
     }.
 info(Name) ->
     gen_server:call(Name, info).
@@ -820,15 +838,18 @@ build_proto_opts(Opts, ListenerName) ->
     %% a single `maps:get/2` instead of a nested map dive.
     {Protocols, ProtoFlats} = normalize_protocols(Opts),
     %% Per-listener counters: live-connection counter (acceptors bump on
-    %% accept; conns decrement on exit) and a cumulative requests-served
-    %% counter (conn bumps on each handler dispatch). `client_counter`
-    %% uses the `counters` module with `write_concurrency` so each
-    %% scheduler bumps a private sub-counter (lock-free, no cache-line
-    %% ping-pong across cores). `counters:get/2` returns an
-    %% eventually-consistent sum, which matches the bounded-overshoot
-    %% contract `try_acquire_slot/1` already documents.
+    %% accept; conns decrement on exit), a cumulative requests-served
+    %% counter (conn bumps on each handler dispatch), and a cumulative
+    %% rejected-connections counter (acceptor bumps when a connection is
+    %% dropped at the `max_clients` cap). `client_counter` uses the
+    %% `counters` module with `write_concurrency` so each scheduler bumps a
+    %% private sub-counter (lock-free, no cache-line ping-pong across
+    %% cores). `counters:get/2` returns an eventually-consistent sum, which
+    %% matches the bounded-overshoot contract `try_acquire_slot/1` already
+    %% documents.
     ClientCounter = counters:new(1, [write_concurrency]),
     RequestsCounter = atomics:new(1, [{signed, false}]),
+    RejectedCounter = atomics:new(1, [{signed, false}]),
     %% Public `ws` opts are a nested map; flatten to the `ws_*`
     %% proto_opts keys the hot path reads, mirroring the `{http2, #{}}`
     %% → `http2_*` flattening above.
@@ -853,6 +874,7 @@ build_proto_opts(Opts, ListenerName) ->
             max_clients => maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
             client_counter => ClientCounter,
             requests_counter => RequestsCounter,
+            rejected_counter => RejectedCounter,
             min_bytes_per_second =>
                 maps:get(min_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
             body_buffering => maps:get(body_buffering, Opts, auto),
@@ -1212,12 +1234,14 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
     #{
         client_counter := ClientCounter,
         requests_counter := RequestsCounter,
+        rejected_counter := RejectedCounter,
         max_clients := MaxClients
     } = ProtoOpts,
     Reply = #{
         active_clients => counters:get(ClientCounter, 1),
         max_clients => MaxClients,
-        requests_served => atomics:get(RequestsCounter, 1)
+        requests_served => atomics:get(RequestsCounter, 1),
+        rejected => atomics:get(RejectedCounter, 1)
     },
     {reply, Reply, State}.
 
