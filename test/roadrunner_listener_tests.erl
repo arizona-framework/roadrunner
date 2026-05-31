@@ -337,10 +337,9 @@ listener_threads_custom_handler_spawn_into_proto_opts_test() ->
     ok = roadrunner_listener:stop(Name).
 
 listener_accepts_http1_tuple_form_test() ->
-    %% `{http1, #{}}` is the explicit tuple shape — accepted but
-    %% currently must be empty (no http1 tunables yet; reserved for
-    %% future additions). Normalizes to the same internal `[http1]`
-    %% atom list as the bare-atom form.
+    %% `{http1, #{}}` is the explicit tuple shape — an empty map keeps
+    %% the defaults. Normalizes to the same internal `[http1]` atom list
+    %% as the bare-atom form.
     Name = listener_test_protocols_http1_tuple,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
@@ -351,6 +350,65 @@ listener_accepts_http1_tuple_form_test() ->
     ProtoOpts = element(4, State),
     ?assertEqual([http1], maps:get(protocols, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
+
+listener_threads_http1_limits_into_proto_opts_test() ->
+    %% Custom `{http1, #{...}}` limits flatten to the `http1_*` proto_opts
+    %% keys the conn loop reads.
+    Name = listener_test_http1_limits,
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        protocols => [
+            {http1, #{
+                max_request_line => 16384,
+                max_header_line => 16384,
+                max_header_block => 65536,
+                max_header_count => 250
+            }}
+        ],
+        routes => roadrunner_hello_handler
+    }),
+    State = sys:get_state(ListenerPid),
+    ProtoOpts = element(4, State),
+    ?assertEqual(16384, maps:get(http1_max_request_line, ProtoOpts)),
+    ?assertEqual(16384, maps:get(http1_max_header_line, ProtoOpts)),
+    ?assertEqual(65536, maps:get(http1_max_header_block, ProtoOpts)),
+    ?assertEqual(250, maps:get(http1_max_header_count, ProtoOpts)),
+    ok = roadrunner_listener:stop(Name).
+
+listener_http1_defaults_thread_into_proto_opts_test() ->
+    %% Bare `http1` (no tuple) fills the default limits into proto_opts.
+    Name = listener_test_http1_defaults,
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        protocols => [http1],
+        routes => roadrunner_hello_handler
+    }),
+    State = sys:get_state(ListenerPid),
+    ProtoOpts = element(4, State),
+    ?assertEqual(8192, maps:get(http1_max_request_line, ProtoOpts)),
+    ?assertEqual(100, maps:get(http1_max_header_count, ProtoOpts)),
+    ok = roadrunner_listener:stop(Name).
+
+listener_rejects_invalid_http1_opt_test() ->
+    %% Unknown keys and out-of-range / non-integer values in `{http1, _}`
+    %% reject at `init/1` (mirrors the `{http2, _}` sub-opt validation).
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(listener_test_http1_invalid, #{
+                port => 0,
+                protocols => [{http1, Bad}],
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, protocols, _}, _Stack}}, R)
+        end,
+        [
+            #{bogus_key => 1},
+            #{max_header_count => 0},
+            #{max_header_count => -1},
+            #{max_request_line => not_an_integer}
+        ]
+    ).
 
 listener_rejects_h1_and_h2_on_plain_tcp_test() ->
     %% `[http1, http2]` (and the reverse order) on plain TCP needs

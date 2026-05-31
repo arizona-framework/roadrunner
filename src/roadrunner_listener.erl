@@ -247,8 +247,10 @@ ops-tuning rationale.
     %% `init/1` — roadrunner has no `Upgrade: h2c` implementation,
     %% so the two cannot share a plaintext port.
     %%
-    %% HTTP/1 currently has no tunables; its opts map must be empty
-    %% (room reserved for future additions without an API break).
+    %% HTTP/1 tunables live under the `http1` tuple's opts map (see
+    %% `t:http1_opts/0`): `max_request_line`, `max_header_line`,
+    %% `max_header_block`, `max_header_count` — the inbound request-size
+    %% caps. An empty map keeps the defaults.
     %%
     %% HTTP/2 tunables live under the `http2` tuple's opts map:
     %%
@@ -288,9 +290,9 @@ ops-tuning rationale.
 -doc """
 One protocol entry in the listener's `protocols` list. Either a
 bare atom (`http1` / `http2` / `http3`) for default opts, or a tuple
-`{Proto, ProtoOpts}` carrying protocol-specific tuning. HTTP/1 has no
-tunables (its opts map must be empty); HTTP/2 tunables live under
-`t:http2_opts/0` and HTTP/3 under `t:http3_opts/0`.
+`{Proto, ProtoOpts}` carrying protocol-specific tuning. HTTP/1 tunables
+live under `t:http1_opts/0`, HTTP/2 under `t:http2_opts/0`, and HTTP/3
+under `t:http3_opts/0`.
 
 On TLS the list drives `alpn_preferred_protocols` for the TCP
 protocols. On plain TCP, `[http2]` means prior-knowledge h2c (client
@@ -305,7 +307,31 @@ same port. The QUIC handshake advertises the `h3` ALPN itself, so
 `http3` does not appear in the TCP `alpn_preferred_protocols`.
 """.
 -type protocol_entry() ::
-    http1 | http2 | http3 | {http1, #{}} | {http2, http2_opts()} | {http3, http3_opts()}.
+    http1 | http2 | http3 | {http1, http1_opts()} | {http2, http2_opts()} | {http3, http3_opts()}.
+
+-doc """
+HTTP/1.1 listener tunables (under `{http1, ThisMap}` in `protocols`).
+
+All four cap inbound request sizes; oversized input is rejected before
+the handler runs (414 for the request line, 431 for headers). Raise them
+for clients that send large headers (long JWTs / cookies / tracing
+metadata); lower them to tighten the attack surface.
+
+- `max_request_line` — request-line byte cap (method + target +
+  version). Over-cap → `414 URI Too Long`. Default `8192`.
+- `max_header_line` — per-header-line byte cap. Over-cap → `431`.
+  Default `8192`.
+- `max_header_block` — cumulative header-block byte cap. Over-cap →
+  `431`. Default `10240`.
+- `max_header_count` — maximum number of header lines. Over-cap →
+  `431`. Default `100`.
+""".
+-type http1_opts() :: #{
+    max_request_line => 1..16#7FFFFFFF,
+    max_header_line => 1..16#7FFFFFFF,
+    max_header_block => 1..16#7FFFFFFF,
+    max_header_count => 1..16#7FFFFFFF
+}.
 
 -doc """
 HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
@@ -1056,7 +1082,11 @@ normalize_protocols(Opts) ->
         [http2, http1] when not HasTls ->
             error({listener_opt_conflict, protocols, Raw, no_h2c_upgrade});
         _ ->
-            {Names, maps:merge(flatten_http2_opts(Entries), flatten_http3_opts(Entries))}
+            {Names,
+                maps:merge(
+                    flatten_http1_opts(Entries),
+                    maps:merge(flatten_http2_opts(Entries), flatten_http3_opts(Entries))
+                )}
     end.
 
 -spec require_tls_for_h3([http1 | http2 | http3, ...], boolean(), term()) -> ok.
@@ -1068,7 +1098,8 @@ require_tls_for_h3(Names, HasTls, Raw) ->
             ok
     end.
 
--type protocol_entry_norm() :: {http1, #{}} | {http2, http2_opts()} | {http3, http3_opts()}.
+-type protocol_entry_norm() ::
+    {http1, http1_opts()} | {http2, http2_opts()} | {http3, http3_opts()}.
 
 -spec normalize_protocols_list(term()) -> [protocol_entry_norm(), ...].
 normalize_protocols_list(L) when is_list(L), L =/= [] ->
@@ -1083,11 +1114,11 @@ normalize_protocols_list(L) ->
 
 -spec normalize_protocol_entry(term(), term()) -> protocol_entry_norm().
 normalize_protocol_entry(http1, _Raw) ->
-    {http1, #{}};
+    {http1, http1_defaults()};
 normalize_protocol_entry(http2, _Raw) ->
     {http2, http2_defaults()};
-normalize_protocol_entry({http1, Opts}, _Raw) when is_map(Opts), map_size(Opts) =:= 0 ->
-    {http1, #{}};
+normalize_protocol_entry({http1, Opts}, Raw) when is_map(Opts) ->
+    {http1, validate_http1_opts(Opts, Raw)};
 normalize_protocol_entry({http2, Opts}, Raw) when is_map(Opts) ->
     {http2, validate_http2_opts(Opts, Raw)};
 normalize_protocol_entry(http3, _Raw) ->
@@ -1096,6 +1127,52 @@ normalize_protocol_entry({http3, Opts}, Raw) when is_map(Opts) ->
     {http3, validate_http3_opts(Opts, Raw)};
 normalize_protocol_entry(_, Raw) ->
     error({invalid_listener_opt, protocols, Raw}).
+
+-spec http1_defaults() -> http1_opts().
+http1_defaults() ->
+    #{
+        max_request_line => 8192,
+        max_header_line => 8192,
+        max_header_block => 10240,
+        max_header_count => 100
+    }.
+
+-spec validate_http1_opts(map(), term()) -> http1_opts().
+validate_http1_opts(Opts, Raw) ->
+    Defaults = http1_defaults(),
+    maps:fold(
+        fun(K, V, Acc) ->
+            case is_map_key(K, Defaults) of
+                false -> error({invalid_listener_opt, protocols, Raw});
+                true when is_integer(V, 1, 16#7FFFFFFF) -> Acc#{K => V};
+                true -> error({invalid_listener_opt, protocols, Raw})
+            end
+        end,
+        Defaults,
+        Opts
+    ).
+
+%% Flatten the http1 sub-opts onto proto_opts top-level with an `http1_`
+%% prefix so the conn loop reads each limit with a single `maps:get/2`.
+%% Returns an empty map when http1 isn't in the list.
+-spec flatten_http1_opts([protocol_entry_norm(), ...]) -> #{atom() => term()}.
+flatten_http1_opts(Entries) ->
+    case lists:keyfind(http1, 1, Entries) of
+        false ->
+            #{};
+        {http1, #{
+            max_request_line := ReqLine,
+            max_header_line := HdrLine,
+            max_header_block := HdrBlock,
+            max_header_count := HdrCount
+        }} ->
+            #{
+                http1_max_request_line => ReqLine,
+                http1_max_header_line => HdrLine,
+                http1_max_header_block => HdrBlock,
+                http1_max_header_count => HdrCount
+            }
+    end.
 
 -spec http2_defaults() -> http2_opts().
 http2_defaults() ->

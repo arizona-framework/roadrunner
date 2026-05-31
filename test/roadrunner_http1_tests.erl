@@ -987,3 +987,67 @@ response_rejects_nul_in_header_name_test() ->
         {header_injection, name, _},
         roadrunner_http1:response(200, [{<<"x-name", 0, "bad">>, ~"v"}], ~"")
     ).
+
+%% --- parse_request/2 configurable limits ---
+
+%% Each limit's reject path flips when the configured limit changes:
+%% the same request is rejected under a tight limit and accepted under a
+%% loose one. `Limits` is
+%% `{max_request_line, max_header_line, max_header_block, max_header_count}`.
+
+config_max_request_line_enforced_test() ->
+    %% A 40-byte request line: rejected at a 16-byte cap, accepted at 8192.
+    Req = ~"GET /a-fairly-long-path HTTP/1.1\r\nHost: x\r\n\r\n",
+    ?assertEqual(
+        {error, request_line_too_long},
+        roadrunner_http1:parse_request(Req, {16, 8192, 10240, 100})
+    ),
+    ?assertMatch(
+        {ok, #{method := ~"GET"}, _},
+        roadrunner_http1:parse_request(Req, {8192, 8192, 10240, 100})
+    ).
+
+config_max_header_line_enforced_test() ->
+    %% A ~60-byte header line: rejected at a 20-byte cap, accepted at 8192.
+    Req = ~"GET / HTTP/1.1\r\nHost: x\r\nX-Trace: 0123456789abcdef0123456789\r\n\r\n",
+    ?assertEqual(
+        {error, header_too_long},
+        roadrunner_http1:parse_request(Req, {8192, 20, 10240, 100})
+    ),
+    ?assertMatch(
+        {ok, _, _},
+        roadrunner_http1:parse_request(Req, {8192, 8192, 10240, 100})
+    ).
+
+config_max_header_count_enforced_test() ->
+    %% Three headers: rejected when the count cap is 2, accepted at 100.
+    Req = ~"GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\n\r\n",
+    ?assertEqual(
+        {error, too_many_headers},
+        roadrunner_http1:parse_request(Req, {8192, 8192, 10240, 2})
+    ),
+    ?assertMatch(
+        {ok, _, _},
+        roadrunner_http1:parse_request(Req, {8192, 8192, 10240, 100})
+    ).
+
+config_max_header_block_enforced_test() ->
+    %% The cumulative header block is ~30 bytes: rejected at a 20-byte
+    %% block cap, accepted at 10240.
+    Req = ~"GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\n\r\n",
+    ?assertEqual(
+        {error, header_block_too_long},
+        roadrunner_http1:parse_request(Req, {8192, 8192, 20, 100})
+    ),
+    ?assertMatch(
+        {ok, _, _},
+        roadrunner_http1:parse_request(Req, {8192, 8192, 10240, 100})
+    ).
+
+config_defaults_match_parse_request_1_test() ->
+    %% parse_request/1 must equal parse_request/2 with the default tuple.
+    Req = ~"GET /x HTTP/1.1\r\nHost: x\r\nAccept: */*\r\n\r\n",
+    ?assertEqual(
+        roadrunner_http1:parse_request(Req),
+        roadrunner_http1:parse_request(Req, {8192, 8192, 10240, 100})
+    ).

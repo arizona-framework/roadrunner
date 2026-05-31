@@ -127,7 +127,10 @@ to absorb a chunk's payload across multiple length-bounded calls.
     pending := binary(),
     done := boolean(),
     recv := fun(() -> {ok, binary()} | {error, term()}),
-    max := non_neg_integer()
+    max := non_neg_integer(),
+    %% Trailer-header limits `{max_header_line, max_header_block,
+    %% max_header_count}` threaded to `roadrunner_http1:parse_chunk/2`.
+    trailer_limits := {pos_integer(), pos_integer(), pos_integer()}
 }.
 
 -export([

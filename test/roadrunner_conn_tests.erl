@@ -45,7 +45,7 @@ read_body_no_content_length_test() ->
     NoRecv = fun() -> error(should_not_be_called) end,
     ?assertEqual(
         {ok, <<>>, ~"leftover bytes"},
-        roadrunner_conn:read_body(Req, ~"leftover bytes", NoRecv, 1000)
+        roadrunner_conn:read_body(Req, ~"leftover bytes", NoRecv, 1000, {8192, 10240, 100})
     ).
 
 read_body_cl_within_buffer_test() ->
@@ -53,13 +53,13 @@ read_body_cl_within_buffer_test() ->
     NoRecv = fun() -> error(should_not_be_called) end,
     ?assertEqual(
         {ok, ~"hello", ~" world"},
-        roadrunner_conn:read_body(Req, ~"hello world", NoRecv, 1000)
+        roadrunner_conn:read_body(Req, ~"hello world", NoRecv, 1000, {8192, 10240, 100})
     ).
 
 read_body_cl_needs_more_recv_test() ->
     Req = req_with_headers([{~"content-length", ~"11"}]),
     Recv = fun() -> {ok, ~" world"} end,
-    {ok, Body, Leftover} = roadrunner_conn:read_body(Req, ~"hello", Recv, 1000),
+    {ok, Body, Leftover} = roadrunner_conn:read_body(Req, ~"hello", Recv, 1000, {8192, 10240, 100}),
     ?assertEqual(~"hello world", iolist_to_binary(Body)),
     ?assertEqual(<<>>, Leftover).
 
@@ -69,7 +69,7 @@ read_body_cl_multi_chunk_recv_test() ->
     %% iolist accumulator in `read_body_until_io/2`.
     Req = req_with_headers([{~"content-length", ~"15"}]),
     Recv = chunked_recv([~"abc", ~"defgh", ~"ijklmnop"]),
-    {ok, Body, Leftover} = roadrunner_conn:read_body(Req, <<>>, Recv, 1000),
+    {ok, Body, Leftover} = roadrunner_conn:read_body(Req, <<>>, Recv, 1000, {8192, 10240, 100}),
     ?assertEqual(~"abcdefghijklmno", iolist_to_binary(Body)),
     ?assertEqual(~"p", Leftover).
 
@@ -79,7 +79,7 @@ read_body_cl_recv_error_test() ->
     Recv = fun() -> {error, closed} end,
     ?assertEqual(
         {error, closed},
-        roadrunner_conn:read_body(Req, <<>>, Recv, 1000)
+        roadrunner_conn:read_body(Req, <<>>, Recv, 1000, {8192, 10240, 100})
     ).
 
 read_body_cl_too_large_test() ->
@@ -87,7 +87,7 @@ read_body_cl_too_large_test() ->
     NoRecv = fun() -> error(should_not_be_called) end,
     ?assertEqual(
         {error, content_length_too_large},
-        roadrunner_conn:read_body(Req, ~"", NoRecv, 1000)
+        roadrunner_conn:read_body(Req, ~"", NoRecv, 1000, {8192, 10240, 100})
     ).
 
 drain_oversized_body_caps_at_2x_max_test() ->
@@ -153,7 +153,7 @@ read_body_bad_cl_test() ->
     NoRecv = fun() -> error(should_not_be_called) end,
     ?assertEqual(
         {error, bad_content_length},
-        roadrunner_conn:read_body(Req, ~"", NoRecv, 1000)
+        roadrunner_conn:read_body(Req, ~"", NoRecv, 1000, {8192, 10240, 100})
     ).
 
 read_body_negative_cl_test() ->
@@ -161,7 +161,7 @@ read_body_negative_cl_test() ->
     NoRecv = fun() -> error(should_not_be_called) end,
     ?assertEqual(
         {error, bad_content_length},
-        roadrunner_conn:read_body(Req, ~"", NoRecv, 1000)
+        roadrunner_conn:read_body(Req, ~"", NoRecv, 1000, {8192, 10240, 100})
     ).
 
 read_body_recv_error_test() ->
@@ -169,7 +169,7 @@ read_body_recv_error_test() ->
     Recv = fun() -> {error, closed} end,
     ?assertEqual(
         {error, closed},
-        roadrunner_conn:read_body(Req, ~"hi", Recv, 1000)
+        roadrunner_conn:read_body(Req, ~"hi", Recv, 1000, {8192, 10240, 100})
     ).
 
 %% --- chunked transfer-encoding ---
@@ -179,7 +179,7 @@ read_body_chunked_single_in_buffer_test() ->
     NoRecv = fun() -> error(should_not_be_called) end,
     ?assertEqual(
         {ok, ~"hello", <<>>},
-        roadrunner_conn:read_body(Req, ~"5\r\nhello\r\n0\r\n\r\n", NoRecv, 1000)
+        roadrunner_conn:read_body(Req, ~"5\r\nhello\r\n0\r\n\r\n", NoRecv, 1000, {8192, 10240, 100})
     ).
 
 read_body_chunked_multiple_in_buffer_test() ->
@@ -187,7 +187,9 @@ read_body_chunked_multiple_in_buffer_test() ->
     NoRecv = fun() -> error(should_not_be_called) end,
     ?assertEqual(
         {ok, ~"hellofoo", <<>>},
-        roadrunner_conn:read_body(Req, ~"5\r\nhello\r\n3\r\nfoo\r\n0\r\n\r\n", NoRecv, 1000)
+        roadrunner_conn:read_body(
+            Req, ~"5\r\nhello\r\n3\r\nfoo\r\n0\r\n\r\n", NoRecv, 1000, {8192, 10240, 100}
+        )
     ).
 
 read_body_chunked_needs_more_recv_test() ->
@@ -196,7 +198,7 @@ read_body_chunked_needs_more_recv_test() ->
     Recv = fun() -> {ok, ~"0\r\n\r\n"} end,
     ?assertEqual(
         {ok, ~"hi", <<>>},
-        roadrunner_conn:read_body(Req, ~"2\r\nhi\r\n", Recv, 1000)
+        roadrunner_conn:read_body(Req, ~"2\r\nhi\r\n", Recv, 1000, {8192, 10240, 100})
     ).
 
 read_body_chunked_exceeds_max_test() ->
@@ -205,7 +207,7 @@ read_body_chunked_exceeds_max_test() ->
     %% MaxCL=3 but the single chunk is 5 bytes.
     ?assertEqual(
         {error, content_length_too_large},
-        roadrunner_conn:read_body(Req, ~"5\r\nhello\r\n0\r\n\r\n", NoRecv, 3)
+        roadrunner_conn:read_body(Req, ~"5\r\nhello\r\n0\r\n\r\n", NoRecv, 3, {8192, 10240, 100})
     ).
 
 read_body_chunked_second_chunk_exceeds_max_test() ->
@@ -215,7 +217,9 @@ read_body_chunked_second_chunk_exceeds_max_test() ->
     %% the error must propagate out of the recursive read_chunked call.
     ?assertEqual(
         {error, content_length_too_large},
-        roadrunner_conn:read_body(Req, ~"3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n", NoRecv, 4)
+        roadrunner_conn:read_body(
+            Req, ~"3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n", NoRecv, 4, {8192, 10240, 100}
+        )
     ).
 
 read_body_chunked_bad_chunk_size_test() ->
@@ -223,7 +227,7 @@ read_body_chunked_bad_chunk_size_test() ->
     NoRecv = fun() -> error(should_not_be_called) end,
     ?assertEqual(
         {error, bad_chunk_size},
-        roadrunner_conn:read_body(Req, ~"xyz\r\nhello\r\n", NoRecv, 1000)
+        roadrunner_conn:read_body(Req, ~"xyz\r\nhello\r\n", NoRecv, 1000, {8192, 10240, 100})
     ).
 
 read_body_chunked_recv_error_test() ->
@@ -231,7 +235,7 @@ read_body_chunked_recv_error_test() ->
     Recv = fun() -> {error, closed} end,
     ?assertEqual(
         {error, closed},
-        roadrunner_conn:read_body(Req, ~"5\r\nhel", Recv, 1000)
+        roadrunner_conn:read_body(Req, ~"5\r\nhel", Recv, 1000, {8192, 10240, 100})
     ).
 
 read_body_unknown_transfer_encoding_rejected_test() ->
@@ -239,7 +243,39 @@ read_body_unknown_transfer_encoding_rejected_test() ->
     NoRecv = fun() -> error(should_not_be_called) end,
     ?assertEqual(
         {error, bad_transfer_encoding},
-        roadrunner_conn:read_body(Req, ~"", NoRecv, 1000)
+        roadrunner_conn:read_body(Req, ~"", NoRecv, 1000, {8192, 10240, 100})
+    ).
+
+read_body_chunked_trailer_limits_enforced_test() ->
+    %% A chunked body with a ~40-byte trailer block: rejected when the
+    %% configured trailer `max_header_block` is 16, accepted at the
+    %% default 10240. Proves the configured limits reach the trailer
+    %% parser (not just request headers).
+    Req = req_with_headers([{~"transfer-encoding", ~"chunked"}]),
+    NoRecv = fun() -> error(should_not_be_called) end,
+    Body = ~"5\r\nhello\r\n0\r\nX-Trace: 0123456789abcdef\r\n\r\n",
+    ?assertEqual(
+        {error, header_block_too_long},
+        roadrunner_conn:read_body(Req, Body, NoRecv, 1000, {8192, 16, 100})
+    ),
+    ?assertEqual(
+        {ok, ~"hello", <<>>},
+        roadrunner_conn:read_body(Req, Body, NoRecv, 1000, {8192, 10240, 100})
+    ).
+
+read_body_chunked_trailer_count_enforced_test() ->
+    %% Two trailer headers: rejected when the trailer `max_header_count`
+    %% is 1, accepted at 100.
+    Req = req_with_headers([{~"transfer-encoding", ~"chunked"}]),
+    NoRecv = fun() -> error(should_not_be_called) end,
+    Body = ~"5\r\nhello\r\n0\r\nA: 1\r\nB: 2\r\n\r\n",
+    ?assertEqual(
+        {error, too_many_headers},
+        roadrunner_conn:read_body(Req, Body, NoRecv, 1000, {8192, 10240, 1})
+    ),
+    ?assertEqual(
+        {ok, ~"hello", <<>>},
+        roadrunner_conn:read_body(Req, Body, NoRecv, 1000, {8192, 10240, 100})
     ).
 
 read_body_chunked_case_insensitive_test() ->
@@ -253,7 +289,8 @@ read_body_chunked_case_insensitive_test() ->
                 req_with_headers([{~"transfer-encoding", V}]),
                 ~"2\r\nhi\r\n0\r\n\r\n",
                 NoRecv,
-                1000
+                1000,
+                {8192, 10240, 100}
             )
         )
      || V <- [~"chunked", ~"Chunked", ~"CHUNKED", ~"ChUnKeD"]
@@ -1220,7 +1257,8 @@ consume_state_no_framing_returns_empty_test() ->
         buffered => ~"hi",
         bytes_read => 0,
         recv => fun() -> error(unused) end,
-        max => 1000
+        max => 1000,
+        trailer_limits => {8192, 10240, 100}
     },
     ?assertMatch({ok, <<>>, #{buffered := ~"hi"}}, roadrunner_conn:consume_body_reader(State, all)).
 
@@ -1230,7 +1268,8 @@ consume_state_already_drained_returns_empty_test() ->
         buffered => <<>>,
         bytes_read => 5,
         recv => fun() -> error(unused) end,
-        max => 1000
+        max => 1000,
+        trailer_limits => {8192, 10240, 100}
     },
     ?assertMatch({ok, <<>>, _}, roadrunner_conn:consume_body_reader(State, all)).
 
@@ -1240,7 +1279,8 @@ consume_state_length_returns_more_then_ok_test() ->
         buffered => ~"abcdef",
         bytes_read => 0,
         recv => fun() -> error(unused) end,
-        max => 1000
+        max => 1000,
+        trailer_limits => {8192, 10240, 100}
     },
     {more, First, State1} = roadrunner_conn:consume_body_reader(State0, {length, 4}),
     ?assertEqual(~"abcd", First),
@@ -1253,7 +1293,8 @@ consume_state_length_recv_error_propagates_test() ->
         buffered => <<>>,
         bytes_read => 0,
         recv => fun() -> {error, closed} end,
-        max => 1000
+        max => 1000,
+        trailer_limits => {8192, 10240, 100}
     },
     ?assertEqual({error, closed}, roadrunner_conn:consume_body_reader(State, all)).
 
@@ -1280,7 +1321,8 @@ consume_state_length_multi_recv_test() ->
         buffered => <<>>,
         bytes_read => 0,
         recv => Recv,
-        max => 1000
+        max => 1000,
+        trailer_limits => {8192, 10240, 100}
     },
     {more, Bytes, State1} = roadrunner_conn:consume_body_reader(State0, {length, 8}),
     ?assertEqual(~"abcdefgh", iolist_to_binary(Bytes)),
@@ -1305,7 +1347,8 @@ consume_state_length_multi_recv_error_test() ->
         buffered => <<>>,
         bytes_read => 0,
         recv => Recv,
-        max => 1000
+        max => 1000,
+        trailer_limits => {8192, 10240, 100}
     },
     ?assertEqual(
         {error, closed},
@@ -1318,7 +1361,8 @@ consume_state_request_too_large_test() ->
         buffered => <<>>,
         bytes_read => 0,
         recv => fun() -> error(unused) end,
-        max => 10
+        max => 10,
+        trailer_limits => {8192, 10240, 100}
     },
     ?assertEqual(
         {error, content_length_too_large},
@@ -1488,7 +1532,8 @@ consume_state_next_chunk_for_content_length_drains_fully_test() ->
         pending => <<>>,
         done => false,
         recv => fun() -> error(unused) end,
-        max => 1000
+        max => 1000,
+        trailer_limits => {8192, 10240, 100}
     },
     ?assertMatch({ok, ~"hello", _}, roadrunner_conn:consume_body_reader(State, next_chunk)).
 
@@ -1516,7 +1561,8 @@ chunked_state(Buf, Recv) ->
         pending => <<>>,
         done => false,
         recv => Recv,
-        max => 1000
+        max => 1000,
+        trailer_limits => {8192, 10240, 100}
     }.
 
 consume_state_recvs_more_when_buffer_short_test() ->
@@ -1531,7 +1577,8 @@ consume_state_recvs_more_when_buffer_short_test() ->
             Self ! recv_called,
             {ok, ~"llo"}
         end,
-        max => 1000
+        max => 1000,
+        trailer_limits => {8192, 10240, 100}
     },
     {ok, Bytes, _} = roadrunner_conn:consume_body_reader(State, all),
     ?assertEqual(~"hello", iolist_to_binary(Bytes)),
