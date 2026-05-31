@@ -268,6 +268,10 @@ ops-tuning rationale.
     %%   the conn refills back to the peak. Lower threshold = fewer
     %%   `WINDOW_UPDATE` frames per byte consumed but a smaller live
     %%   window between refills. Default `32768`.
+    %% - `max_concurrent_streams` — cap on concurrent client-initiated
+    %%   streams per connection (`pos_integer`), advertised in our
+    %%   SETTINGS; HEADERS that would exceed it get
+    %%   RST_STREAM(REFUSED_STREAM). Default `100`.
     %%
     %% Empty list, unknown protocol atoms, duplicate entries, bad
     %% tuple shape, unknown sub-option keys, or out-of-range sub-
@@ -317,11 +321,16 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
   the peak. Lower threshold = fewer `WINDOW_UPDATE` frames per
   byte consumed but a smaller live window between refills.
   Default `32768`.
+- `max_concurrent_streams` — cap on concurrent client-initiated
+  streams per connection, advertised via
+  `SETTINGS_MAX_CONCURRENT_STREAMS`. HEADERS that would exceed it
+  get `RST_STREAM(REFUSED_STREAM)`. Default `100`.
 """.
 -type http2_opts() :: #{
     conn_window => 1..16#7FFFFFFF,
     stream_window => 1..16#7FFFFFFF,
-    window_refill_threshold => 1..16#7FFFFFFF
+    window_refill_threshold => 1..16#7FFFFFFF,
+    max_concurrent_streams => 1..16#7FFFFFFF
 }.
 
 -doc """
@@ -1074,7 +1083,12 @@ normalize_protocol_entry(_, Raw) ->
 
 -spec http2_defaults() -> http2_opts().
 http2_defaults() ->
-    #{conn_window => 65535, stream_window => 65535, window_refill_threshold => 32768}.
+    #{
+        conn_window => 65535,
+        stream_window => 65535,
+        window_refill_threshold => 32768,
+        max_concurrent_streams => 100
+    }.
 
 -spec validate_http2_opts(map(), term()) -> http2_opts().
 validate_http2_opts(Opts, Raw) ->
@@ -1102,12 +1116,14 @@ flatten_http2_opts(Entries) ->
         {http2, #{
             conn_window := Conn,
             stream_window := Stream,
-            window_refill_threshold := Threshold
+            window_refill_threshold := Threshold,
+            max_concurrent_streams := MaxStreams
         }} ->
             #{
                 http2_conn_window => Conn,
                 http2_stream_window => Stream,
-                http2_window_refill_threshold => Threshold
+                http2_window_refill_threshold => Threshold,
+                http2_max_concurrent_streams => MaxStreams
             }
     end.
 

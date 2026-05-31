@@ -29,6 +29,8 @@ all_test_() ->
         fun bumped_stream_window_advertises_initial_window_size/0,
         fun bumped_both_emits_settings_with_size_then_window_update/0,
         fun custom_threshold_changes_refill_trigger/0,
+        fun default_advertises_100_max_concurrent_streams/0,
+        fun custom_max_concurrent_streams_advertised/0,
         fun invalid_window_opt_fails_listener_start/0,
         fun valid_window_opts_let_listener_boot/0
     ],
@@ -159,6 +161,23 @@ custom_threshold_changes_refill_trigger() ->
     ?assertEqual(60_000, Inc2),
     cleanup(Pid, Ref).
 
+default_advertises_100_max_concurrent_streams() ->
+    %% With no override the handshake SETTINGS advertises
+    %% MAX_CONCURRENT_STREAMS (id 3) = 100, the default.
+    {Pid, Ref} = start_conn(#{}),
+    Settings = expect_send(),
+    {ok, {settings, 0, Entries}, _} = roadrunner_http2_frame:parse(Settings, 16384),
+    ?assertEqual(100, proplists:get_value(3, Entries)),
+    cleanup(Pid, Ref).
+
+custom_max_concurrent_streams_advertised() ->
+    %% max_concurrent_streams = 250 must be advertised as id 3 = 250.
+    {Pid, Ref} = start_conn(#{max_concurrent_streams => 250}),
+    Settings = expect_send(),
+    {ok, {settings, 0, Entries}, _} = roadrunner_http2_frame:parse(Settings, 16384),
+    ?assertEqual(250, proplists:get_value(3, Entries)),
+    cleanup(Pid, Ref).
+
 invalid_window_opt_fails_listener_start() ->
     %% A non-positive integer (or anything outside 1..2^31-1) should
     %% surface at listener init/1 rather than mid-handshake. Each
@@ -202,7 +221,8 @@ valid_window_opts_let_listener_boot() ->
             {http2, #{
                 conn_window => 1_048_576,
                 stream_window => 524_288,
-                window_refill_threshold => 65_536
+                window_refill_threshold => 65_536,
+                max_concurrent_streams => 250
             }}
         ],
         routes => roadrunner_hello_handler
@@ -230,7 +250,8 @@ start_conn(H2Opts) ->
         protocols => [http2],
         http2_conn_window => maps:get(conn_window, H2Opts, 65535),
         http2_stream_window => maps:get(stream_window, H2Opts, 65535),
-        http2_window_refill_threshold => maps:get(window_refill_threshold, H2Opts, 32768)
+        http2_window_refill_threshold => maps:get(window_refill_threshold, H2Opts, 32768),
+        http2_max_concurrent_streams => maps:get(max_concurrent_streams, H2Opts, 100)
     },
     Sock = {fake, Self},
     Pid = spawn(fun() ->
