@@ -676,7 +676,7 @@ recv_response_with_body_loop(Sock, Buf, BodyLen) ->
             <<Trim:(byte_size(Head) + 4 + BodyLen)/binary, _/binary>> = Buf,
             Trim;
         _ ->
-            {ok, Data} = gen_tcp:recv(Sock, 0, 1000),
+            {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
             recv_response_with_body_loop(
                 Sock, <<Buf/binary, Data/binary>>, BodyLen
             )
@@ -806,7 +806,7 @@ http_request(Port, Method, Path, ExtraHeaders) ->
     Reply.
 
 recv_until_closed(Sock, Acc) ->
-    case gen_tcp:recv(Sock, 0, 1000) of
+    case gen_tcp:recv(Sock, 0, 5000) of
         {ok, Data} -> recv_until_closed(Sock, <<Acc/binary, Data/binary>>);
         {error, _} -> Acc
     end.
