@@ -34,6 +34,7 @@ all_test_() ->
         fun even_stream_id_triggers_goaway/0,
         fun continuation_without_pending_triggers_goaway/0,
         fun continuation_flood_triggers_goaway/0,
+        fun configured_max_header_block_triggers_goaway/0,
         fun continuation_empty_frame_flood_triggers_goaway/0,
         fun data_on_unknown_stream_triggers_goaway/0,
         fun malformed_hpack_block_triggers_goaway/0,
@@ -687,6 +688,34 @@ continuation_flood_triggers_goaway() ->
     %% GOAWAY (type 7) carrying ENHANCE_YOUR_CALM (0x0B): after the 9-byte
     %% frame header the payload is Last-Stream-Id (32 bits) then the error
     %% code (32 bits).
+    ?assertMatch(<<_:24, 7:8, _:8, _:32, _:32, 16#0B:32, _/binary>>, Out),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 500 -> error(no_exit)
+    end.
+
+configured_max_header_block_triggers_goaway() ->
+    %% With `max_header_block => 200`, a CONTINUATION block of ~300 bytes
+    %% (well UNDER the default 16384) must still trip the flood guard and
+    %% close with GOAWAY(ENHANCE_YOUR_CALM) — proving the configured cap,
+    %% not the macro default, is what's enforced.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{http2_max_header_block => 200}),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    HeadersF = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 0, undefined, binary:copy(~"x", 100)})
+    ),
+    serve_recv(ConnPid, HeadersF),
+    ContinuationF = iolist_to_binary(
+        roadrunner_http2_frame:encode({continuation, 1, 0, binary:copy(~"x", 300)})
+    ),
+    serve_recv(ConnPid, ContinuationF),
+    Out = expect_send(),
     ?assertMatch(<<_:24, 7:8, _:8, _:32, _:32, 16#0B:32, _/binary>>, Out),
     expect_close(),
     receive

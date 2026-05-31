@@ -272,6 +272,9 @@ ops-tuning rationale.
     %%   streams per connection (`pos_integer`), advertised in our
     %%   SETTINGS; HEADERS that would exceed it get
     %%   RST_STREAM(REFUSED_STREAM). Default `100`.
+    %% - `max_header_block` — cumulative HEADERS+CONTINUATION block cap
+    %%   (`pos_integer`); over-cap closes the conn with
+    %%   GOAWAY(ENHANCE_YOUR_CALM). Default `16384`.
     %%
     %% Empty list, unknown protocol atoms, duplicate entries, bad
     %% tuple shape, unknown sub-option keys, or out-of-range sub-
@@ -325,12 +328,19 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
   streams per connection, advertised via
   `SETTINGS_MAX_CONCURRENT_STREAMS`. HEADERS that would exceed it
   get `RST_STREAM(REFUSED_STREAM)`. Default `100`.
+- `max_header_block` — cumulative cap on an assembled
+  HEADERS+CONTINUATION block (the CONTINUATION-flood guard);
+  over-cap closes the connection with `GOAWAY(ENHANCE_YOUR_CALM)`.
+  Default `16384`. This is the h2 counterpart to the `{http1, ...}`
+  `max_header_block` opt, but the two are independent and default
+  differently (h1 `10240`, h2 `16384`).
 """.
 -type http2_opts() :: #{
     conn_window => 1..16#7FFFFFFF,
     stream_window => 1..16#7FFFFFFF,
     window_refill_threshold => 1..16#7FFFFFFF,
-    max_concurrent_streams => 1..16#7FFFFFFF
+    max_concurrent_streams => 1..16#7FFFFFFF,
+    max_header_block => 1..16#7FFFFFFF
 }.
 
 -doc """
@@ -1087,7 +1097,8 @@ http2_defaults() ->
         conn_window => 65535,
         stream_window => 65535,
         window_refill_threshold => 32768,
-        max_concurrent_streams => 100
+        max_concurrent_streams => 100,
+        max_header_block => 16384
     }.
 
 -spec validate_http2_opts(map(), term()) -> http2_opts().
@@ -1117,13 +1128,15 @@ flatten_http2_opts(Entries) ->
             conn_window := Conn,
             stream_window := Stream,
             window_refill_threshold := Threshold,
-            max_concurrent_streams := MaxStreams
+            max_concurrent_streams := MaxStreams,
+            max_header_block := MaxHeaderBlock
         }} ->
             #{
                 http2_conn_window => Conn,
                 http2_stream_window => Stream,
                 http2_window_refill_threshold => Threshold,
-                http2_max_concurrent_streams => MaxStreams
+                http2_max_concurrent_streams => MaxStreams,
+                http2_max_header_block => MaxHeaderBlock
             }
     end.
 

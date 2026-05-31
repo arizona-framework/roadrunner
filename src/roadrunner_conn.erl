@@ -129,6 +129,8 @@
     http2_conn_window => 1..16#7FFFFFFF,
     http2_stream_window => 1..16#7FFFFFFF,
     http2_window_refill_threshold => 1..16#7FFFFFFF,
+    http2_max_concurrent_streams => 1..16#7FFFFFFF,
+    http2_max_header_block => 1..16#7FFFFFFF,
     %% Optional fields the listener injects only when the user
     %% supplies them — see `roadrunner_listener:build_proto_opts/2`.
     %% Declared here so dialyzer accepts pattern matches like

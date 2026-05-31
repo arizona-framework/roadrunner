@@ -73,12 +73,13 @@
 %% RFC 9113 §6.5.2 default `MAX_FRAME_SIZE`.
 -define(MAX_FRAME_SIZE, 16_384).
 
-%% Cumulative cap on an assembled HEADERS+CONTINUATION block. Each frame
-%% is already bounded to MAX_FRAME_SIZE, but the number of CONTINUATION
+%% Default cumulative cap on an assembled HEADERS+CONTINUATION block. Each
+%% frame is already bounded to MAX_FRAME_SIZE, but the number of CONTINUATION
 %% frames is not, so without this a peer can flood CONTINUATION frames and
-%% grow the block without bound (the HTTP/2 CONTINUATION Flood). h1 and h3
-%% bound the same way (`roadrunner_http1` / `roadrunner_conn_loop_http3`
-%% MAX_HEADER_BLOCK).
+%% grow the block without bound (the HTTP/2 CONTINUATION Flood). Overridable
+%% per listener via the `max_header_block` http2 opt. h1 and h3 have their own
+%% header-block caps (each separately configurable; h1 defaults to 10240, h3
+%% to 16384).
 -define(MAX_HEADER_BLOCK, 16_384).
 
 %% RFC 9113 §6.9.2 initial window size for both the connection and
@@ -195,6 +196,9 @@
     %% Max concurrent client-initiated streams: advertised in our SETTINGS
     %% and enforced in `on_headers/5`. Read from proto_opts at `enter/5`.
     max_concurrent_streams = ?MAX_CONCURRENT_STREAMS :: pos_integer(),
+    %% Cumulative HEADERS+CONTINUATION block cap (CONTINUATION-flood guard).
+    %% Read from proto_opts at `enter/5`.
+    max_header_block = ?MAX_HEADER_BLOCK :: pos_integer(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -244,6 +248,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
         http2_window_refill_threshold, ProtoOpts, ?DEFAULT_WINDOW_REFILL_THRESHOLD
     ),
     MaxStreams = maps:get(http2_max_concurrent_streams, ProtoOpts, ?MAX_CONCURRENT_STREAMS),
+    MaxHeaderBlock = maps:get(http2_max_header_block, ProtoOpts, ?MAX_HEADER_BLOCK),
     State = #loop{
         socket = Socket,
         proto_opts = ProtoOpts,
@@ -259,7 +264,8 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
         recv_window_peak = ConnPeak,
         stream_recv_window_peak = StreamPeak,
         recv_window_threshold = Threshold,
-        max_concurrent_streams = MaxStreams
+        max_concurrent_streams = MaxStreams,
+        max_header_block = MaxHeaderBlock
     },
     handshake(State).
 
@@ -740,7 +746,9 @@ new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow) ->
         pending_sends => queue:new()
     }.
 
-on_continuation(StreamId, Flags, Fragment, #loop{streams = Streams} = State) ->
+on_continuation(
+    StreamId, Flags, Fragment, #loop{streams = Streams, max_header_block = MaxHeaderBlock} = State
+) ->
     case Streams of
         #{
             StreamId :=
@@ -764,7 +772,7 @@ on_continuation(StreamId, Flags, Fragment, #loop{streams = Streams} = State) ->
             %% context can't be resynced if we skip the block, so this is
             %% a connection error rather than a per-stream reject.
             %% ENHANCE_YOUR_CALM is the RFC 9113 §6.5.2 resource-limit code.
-            case NewLen > ?MAX_HEADER_BLOCK orelse (FragLen =:= 0 andalso not EndHeaders) of
+            case NewLen > MaxHeaderBlock orelse (FragLen =:= 0 andalso not EndHeaders) of
                 true ->
                     _ = send_goaway(State, enhance_your_calm),
                     exit_clean(State);
