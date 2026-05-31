@@ -30,7 +30,7 @@
 -export([
     start/2,
     parse_loop/2,
-    read_body/4,
+    read_body/5,
     peer/1,
     try_acquire_slot/1,
     release_slot/1,
@@ -53,7 +53,7 @@
     maybe_send_continue/3,
     refine_conn_label/2,
     scheme/1,
-    make_body_reader/4,
+    make_body_reader/5,
     drain_body/1,
     keep_alive_decision/2,
     send_request_timeout/1,
@@ -377,7 +377,8 @@ resolve_handler({router, ListenerName}, Req) ->
     roadrunner_req:request(),
     binary(),
     fun(() -> {ok, binary()} | {error, term()}),
-    non_neg_integer()
+    non_neg_integer(),
+    {pos_integer(), pos_integer(), pos_integer()}
 ) ->
     {ok, Body :: iodata(), Leftover :: binary()}
     | {error,
@@ -385,7 +386,7 @@ resolve_handler({router, ListenerName}, Req) ->
         | bad_content_length
         | bad_transfer_encoding
         | term()}.
-read_body(Req, Buffered, RecvFun, MaxCL) ->
+read_body(Req, Buffered, RecvFun, MaxCL, TrailerLimits) ->
     case body_framing(Req) of
         none ->
             %% Per RFC 9112 §6.3: a request without `Content-Length`
@@ -395,7 +396,7 @@ read_body(Req, Buffered, RecvFun, MaxCL) ->
             %% can feed them into the next `reading_request` parse.
             {ok, <<>>, Buffered};
         chunked ->
-            read_chunked(Buffered, RecvFun, MaxCL, 0);
+            read_chunked(Buffered, RecvFun, MaxCL, 0, TrailerLimits);
         {content_length, N} when N > MaxCL ->
             {error, content_length_too_large};
         {content_length, N} ->
@@ -438,9 +439,10 @@ has_continue_expectation(Req) ->
     none | chunked | {content_length, non_neg_integer()},
     binary(),
     fun(() -> {ok, binary()} | {error, term()}),
-    non_neg_integer()
+    non_neg_integer(),
+    {pos_integer(), pos_integer(), pos_integer()}
 ) -> roadrunner_req:body_reader().
-make_body_reader(Framing, Buffered, Recv, Max) ->
+make_body_reader(Framing, Buffered, Recv, Max, TrailerLimits) ->
     #{
         framing => Framing,
         buffered => Buffered,
@@ -448,7 +450,8 @@ make_body_reader(Framing, Buffered, Recv, Max) ->
         pending => <<>>,
         done => false,
         recv => Recv,
-        max => Max
+        max => Max,
+        trailer_limits => TrailerLimits
     }.
 
 -doc false.
@@ -547,11 +550,12 @@ read_body_until_io(N, RecvFun) ->
     binary(),
     fun(() -> {ok, binary()} | {error, term()}),
     non_neg_integer(),
-    non_neg_integer()
+    non_neg_integer(),
+    {pos_integer(), pos_integer(), pos_integer()}
 ) ->
     {ok, binary(), binary()} | {error, content_length_too_large | term()}.
-read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
-    case roadrunner_http1:parse_chunk(Buf) of
+read_chunked(Buf, RecvFun, MaxCL, Decoded, TrailerLimits) ->
+    case roadrunner_http1:parse_chunk(Buf, TrailerLimits) of
         {ok, last, _Trailers, Leftover} ->
             %% Bytes after the size-0 last-chunk + trailer block are
             %% pipelined-next-request leftover; thread them up so the
@@ -563,7 +567,7 @@ read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
                 NewDecoded > MaxCL ->
                     {error, content_length_too_large};
                 true ->
-                    case read_chunked(Rest, RecvFun, MaxCL, NewDecoded) of
+                    case read_chunked(Rest, RecvFun, MaxCL, NewDecoded, TrailerLimits) of
                         {ok, More, Leftover} ->
                             {ok, <<Data/binary, More/binary>>, Leftover};
                         {error, _} = E ->
@@ -573,7 +577,9 @@ read_chunked(Buf, RecvFun, MaxCL, Decoded) ->
         {more, _} ->
             case RecvFun() of
                 {ok, More} ->
-                    read_chunked(<<Buf/binary, More/binary>>, RecvFun, MaxCL, Decoded);
+                    read_chunked(
+                        <<Buf/binary, More/binary>>, RecvFun, MaxCL, Decoded, TrailerLimits
+                    );
                 {error, _} = E ->
                     E
             end;
@@ -704,8 +710,17 @@ chunked_collect(#{pending := Pending} = BS, Want) when byte_size(Pending) > 0 ->
     end;
 chunked_collect(#{done := true} = BS, _Want) ->
     {ok, [], BS};
-chunked_collect(#{buffered := Buf, recv := Recv, max := Max, bytes_read := Read} = BS, Want) ->
-    case roadrunner_http1:parse_chunk(Buf) of
+chunked_collect(
+    #{
+        buffered := Buf,
+        recv := Recv,
+        max := Max,
+        bytes_read := Read,
+        trailer_limits := TrailerLimits
+    } = BS,
+    Want
+) ->
+    case roadrunner_http1:parse_chunk(Buf, TrailerLimits) of
         {ok, Data, Rest} ->
             NewRead = Read + byte_size(Data),
             case NewRead > Max of
@@ -740,8 +755,16 @@ next_chunk(#{pending := Pending} = BS) when byte_size(Pending) > 0 ->
     {more, Pending, BS#{pending := <<>>}};
 next_chunk(#{done := true} = BS) ->
     {ok, <<>>, BS};
-next_chunk(#{buffered := Buf, recv := Recv, max := Max, bytes_read := Read} = BS) ->
-    case roadrunner_http1:parse_chunk(Buf) of
+next_chunk(
+    #{
+        buffered := Buf,
+        recv := Recv,
+        max := Max,
+        bytes_read := Read,
+        trailer_limits := TrailerLimits
+    } = BS
+) ->
+    case roadrunner_http1:parse_chunk(Buf, TrailerLimits) of
         {ok, Data, Rest} ->
             NewRead = Read + byte_size(Data),
             case NewRead > Max of

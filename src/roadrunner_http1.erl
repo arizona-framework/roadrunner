@@ -16,6 +16,7 @@
     parse_request/1,
     parse_request/2,
     parse_chunk/1,
+    parse_chunk/2,
     check_header_safe/2,
     response/3,
     compute_cached_decisions/1
@@ -699,7 +700,30 @@ header line is capped at 8192 bytes.
         | header_block_too_long
         | too_many_headers
         | conflicting_framing}.
-parse_chunk(Bin) when is_binary(Bin) ->
+parse_chunk(Bin) ->
+    parse_chunk(Bin, {?MAX_HEADER_LINE, ?MAX_HEADER_BLOCK, ?MAX_HEADER_COUNT}).
+
+-doc """
+Like `parse_chunk/1`, but with caller-supplied trailer-header limits as a
+`{MaxHeaderLine, MaxHeaderBlock, MaxHeaderCount}` tuple (the same shape
+`parse_headers/2` takes; there is no request-line in a trailer block). The
+conn loop passes the listener's configured `http1_*` header limits so a
+chunked request's trailer headers obey the same caps as its request
+headers; `parse_chunk/1` passes the `?MAX_*` defaults.
+""".
+-spec parse_chunk(binary(), {pos_integer(), pos_integer(), pos_integer()}) ->
+    {ok, Data :: binary(), Rest :: binary()}
+    | {ok, last, Trailers :: headers(), Rest :: binary()}
+    | {more, undefined}
+    | {error,
+        bad_chunk_size
+        | bad_chunk
+        | bad_header
+        | header_too_long
+        | header_block_too_long
+        | too_many_headers
+        | conflicting_framing}.
+parse_chunk(Bin, Limits) when is_binary(Bin) ->
     %% Fetch the compiled CRLF + semicolon patterns ONCE here and
     %% thread them into `parse_chunk_size_line/3` (and onward to
     %% `parse_size_line/3`) so the chunked-decode loop in
@@ -709,14 +733,14 @@ parse_chunk(Bin) when is_binary(Bin) ->
     SemiCp = persistent_term:get(?SEMICOLON_KEY),
     case parse_chunk_size_line(Bin, CrlfCp, SemiCp) of
         {ok, 0, AfterSize} ->
-            parse_last_chunk(AfterSize);
+            parse_last_chunk(AfterSize, Limits);
         {ok, Size, AfterSize} ->
             parse_chunk_data(Size, AfterSize);
         Other ->
             Other
     end.
 
--spec parse_last_chunk(binary()) ->
+-spec parse_last_chunk(binary(), {pos_integer(), pos_integer(), pos_integer()}) ->
     {ok, last, headers(), binary()}
     | {more, undefined}
     | {error,
@@ -725,8 +749,8 @@ parse_chunk(Bin) when is_binary(Bin) ->
         | header_block_too_long
         | too_many_headers
         | conflicting_framing}.
-parse_last_chunk(AfterSize) ->
-    case parse_headers(AfterSize) of
+parse_last_chunk(AfterSize, Limits) ->
+    case parse_headers(AfterSize, Limits) of
         {ok, Trailers, Rest} -> {ok, last, Trailers, Rest};
         {more, _} = More -> More;
         {error, _} = Err -> Err

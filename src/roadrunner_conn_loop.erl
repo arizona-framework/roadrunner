@@ -511,7 +511,8 @@ read_body_phase(
     #loop_state{
         socket = Socket,
         proto_opts = ProtoOpts,
-        max_content_length = MaxCL
+        max_content_length = MaxCL,
+        http1_limits = {_ReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}
     } = S,
     Req,
     Deadline
@@ -519,9 +520,12 @@ read_body_phase(
     MinRate = maps:get(min_bytes_per_second, ProtoOpts),
     Recv = roadrunner_conn:make_recv(Socket, Deadline, MinRate),
     Buffered = S#loop_state.buffered,
+    %% Trailer headers (chunked bodies) obey the same caps as request
+    %% headers; the request-line cap doesn't apply to a trailer block.
+    TrailerLimits = {MaxHdrLine, MaxHdrBlock, MaxHdrCount},
     case maps:get(body_buffering, ProtoOpts) of
         auto ->
-            case roadrunner_conn:read_body(Req, Buffered, Recv, MaxCL) of
+            case roadrunner_conn:read_body(Req, Buffered, Recv, MaxCL, TrailerLimits) of
                 {ok, Body, Leftover} ->
                     %% Leftover is bytes past the body — feed it
                     %% back to the next read_request_phase iteration
@@ -550,7 +554,7 @@ read_body_phase(
                     exit_normal(S);
                 Framing ->
                     BodyState = roadrunner_conn:make_body_reader(
-                        Framing, Buffered, Recv, MaxCL
+                        Framing, Buffered, Recv, MaxCL, TrailerLimits
                     ),
                     dispatch_phase(S, Req#{body_reader => BodyState})
             end
