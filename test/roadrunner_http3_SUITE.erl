@@ -448,7 +448,9 @@ certfile_keyfile(Config) ->
     Name = listener_name(certfile_keyfile),
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0,
-        protocols => [http3],
+        %% Exercise the `{http3, #{...}}` tuple form + the
+        %% `max_header_block` flatten path through a real boot.
+        protocols => [{http3, #{max_header_block => 32768}}],
         tls => [{certfile, CertFile}, {keyfile, KeyFile}],
         routes => roadrunner_h3_test_handler
     }),
