@@ -351,9 +351,15 @@ HTTP/3 listener tunables (under `{http3, ThisMap}` in `protocols`).
   connection registry; the kernel spreads inbound datagrams across
   them, so inbound demux parallelizes across cores. Default 8.
   `1` disables pooling (a single listener, no `SO_REUSEPORT`).
+- `max_header_block` — cap on the encoded request field section (the
+  HEADERS block); over-cap answers `431`. Default `16384`. The h3
+  counterpart to the `{http1, ...}` / `{http2, ...}` `max_header_block`
+  opts; the three are independent (h1 defaults to `10240`, h2/h3 to
+  `16384`).
 """.
 -type http3_opts() :: #{
-    listeners => 1..?MAX_H3_LISTENERS
+    listeners => 1..?MAX_H3_LISTENERS,
+    max_header_block => 1..16#7FFFFFFF
 }.
 
 -doc """
@@ -1142,16 +1148,24 @@ flatten_http2_opts(Entries) ->
 
 -spec http3_defaults() -> http3_opts().
 http3_defaults() ->
-    #{listeners => ?DEFAULT_H3_LISTENERS}.
+    #{listeners => ?DEFAULT_H3_LISTENERS, max_header_block => 16384}.
 
 -spec validate_http3_opts(map(), term()) -> http3_opts().
 validate_http3_opts(Opts, Raw) ->
     Defaults = http3_defaults(),
     maps:fold(
         fun(K, V, Acc) ->
+            %% `listeners` caps at the reuseport-pool limit; `max_header_block`
+            %% is a byte size up to the 31-bit ceiling.
+            Max =
+                case K of
+                    listeners -> ?MAX_H3_LISTENERS;
+                    max_header_block -> 16#7FFFFFFF;
+                    _ -> 0
+                end,
             case is_map_key(K, Defaults) of
                 false -> error({invalid_listener_opt, protocols, Raw});
-                true when is_integer(V, 1, ?MAX_H3_LISTENERS) -> Acc#{K => V};
+                true when is_integer(V, 1, Max) -> Acc#{K => V};
                 true -> error({invalid_listener_opt, protocols, Raw})
             end
         end,
@@ -1160,15 +1174,15 @@ validate_http3_opts(Opts, Raw) ->
     ).
 
 %% Flatten the http3 sub-opts onto proto_opts top-level (`http3_*`) so
-%% `start_quic/4` reads the listener count with a single `maps:get/2`.
-%% Returns an empty map when http3 isn't in the list.
+%% the conn loop reads each knob with a single `maps:get/2`. Returns an
+%% empty map when http3 isn't in the list.
 -spec flatten_http3_opts([protocol_entry_norm(), ...]) -> #{atom() => term()}.
 flatten_http3_opts(Entries) ->
     case lists:keyfind(http3, 1, Entries) of
         false ->
             #{};
-        {http3, #{listeners := Listeners}} ->
-            #{http3_listeners => Listeners}
+        {http3, #{listeners := Listeners, max_header_block := MaxHeaderBlock}} ->
+            #{http3_listeners => Listeners, http3_max_header_block => MaxHeaderBlock}
     end.
 
 -spec ws_defaults() ->

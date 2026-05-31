@@ -15,6 +15,9 @@ new() ->
 decode(Buf, MaxLen) ->
     roadrunner_conn_loop_http3:decode_request_frames(Buf, new(), MaxLen).
 
+decode(Buf, MaxLen, MaxHdrBlock) ->
+    roadrunner_conn_loop_http3:decode_request_frames(Buf, new(), MaxLen, MaxHdrBlock).
+
 %% A HEADERS frame wrapping an arbitrary field block (the block is only
 %% QPACK-decoded later, in the conn loop's dispatch, not here).
 hf(Block) -> quic_h3_frame:encode_headers(Block).
@@ -97,3 +100,18 @@ dribbled_header_block_test() ->
     Frame = hf(binary:copy(<<"x">>, 20000)),
     Partial = binary:part(Frame, 0, 17000),
     ?assertEqual(headers_too_large, decode(Partial, 1000000)).
+
+configured_max_header_block_complete_test() ->
+    %% A complete 300-byte HEADERS block (well under the default 16384) is
+    %% rejected when the configured `max_header_block` is 200, accepted at
+    %% the default. Proves the configured cap, not the macro, is enforced.
+    Block = binary:copy(<<"x">>, 300),
+    ?assertEqual(headers_too_large, decode(hf(Block), 1000000, 200)),
+    ?assertMatch({ok, _}, decode(hf(Block), 1000000, 16384)).
+
+configured_max_header_block_dribbled_test() ->
+    %% The `{more}` dribble guard also honors the configured cap: a partial
+    %% HEADERS frame already past a 200-byte cap is rejected.
+    Frame = hf(binary:copy(<<"x">>, 1000)),
+    Partial = binary:part(Frame, 0, 400),
+    ?assertEqual(headers_too_large, decode(Partial, 1000000, 200)).

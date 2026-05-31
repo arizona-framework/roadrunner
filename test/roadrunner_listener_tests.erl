@@ -388,6 +388,28 @@ listener_rejects_invalid_protocols_value_test() ->
         [[], [bogus], [http1, http1], not_a_list]
     ).
 
+listener_rejects_invalid_http3_opt_test() ->
+    %% Unknown keys and out-of-range values in `{http3, _}` reject at
+    %% `init/1` (the protocol-entry normalizer runs before the
+    %% http3-requires-tls check, so a bad opt fails without needing TLS).
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(listener_test_http3_invalid, #{
+                port => 0,
+                protocols => [{http3, Bad}],
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, protocols, _}, _Stack}}, R)
+        end,
+        [
+            #{bogus_key => 1},
+            #{max_header_block => 0},
+            #{max_header_block => not_an_integer},
+            #{listeners => 16#80000000}
+        ]
+    ).
+
 listener_rejects_ws_message_cap_below_frame_cap_test() ->
     %% A reassembled message is built from frames, so a single
     %% unfragmented frame is also a whole message — `max_message_size`
