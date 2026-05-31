@@ -49,10 +49,11 @@ only). Remaining work:
   needs the same conn-loop→worker inbound routing WebSocket would, so
   do it alongside that work, not standalone
 - Advertise `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §7.2.4.1). The
-  encoded request header block is now capped (16384 bytes, 431 on
-  overflow, as h1's MAX_HEADER_BLOCK does); advertising the decoded-size
-  limit would let conformant clients avoid sending an oversized field
-  section in the first place rather than learning via the 431
+  encoded request header block is now capped (16384-byte default, 431 on
+  overflow, as the h1 and h2 `max_header_block` caps do); advertising the
+  decoded-size limit would let conformant clients avoid sending an
+  oversized field section in the first place rather than learning via the
+  431
 - WebSocket over h3 (`websocket` shape, still `501`) — RFC 9220
   Extended CONNECT; do WebSocket over h2 (RFC 8441) first, since it's
   the more common transport and h2 has no WebSocket either
@@ -177,7 +178,7 @@ their handshake fixture).
 
 **What:** Advertise `SETTINGS_MAX_HEADER_LIST_SIZE` (RFC 9113 §6.5.2,
 id 0x06) in the server's SETTINGS frame. The cumulative HEADERS +
-CONTINUATION block is now capped (16384 bytes, GOAWAY(ENHANCE_YOUR_CALM)
+CONTINUATION block is now capped (16384-byte default, GOAWAY(ENHANCE_YOUR_CALM)
 on overflow, the same way h1 and h3 bound it), which closes the
 CONTINUATION-flood memory gap. Advertising the decoded-size limit lets
 conformant clients avoid sending an oversized block in the first place
@@ -195,7 +196,7 @@ exists defaulted to `infinity` in `roadrunner_http2_settings.erl` and the
 encoder skips `infinity`, so advertising it meaningfully needs a concrete
 value to ship and (to be truthful) decode-side enforcement, since today we
 only parse the peer's value and bound inbound via the encoded
-`?MAX_HEADER_BLOCK`. The ~50 handshake fixtures that drain the server
+`max_header_block` cap. The ~50 handshake fixtures that drain the server
 SETTINGS need to tolerate the extra entry.
 
 ### Sync headline scenarios in comparison.md + resource_results.md

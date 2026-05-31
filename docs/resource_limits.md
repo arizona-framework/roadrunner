@@ -14,11 +14,17 @@ This page is an operator reference. For the reporting policy, see
 
 | Limit | Default | Configurable | Over-limit behavior |
 |---|---|---|---|
-| Request line | 8 KB | no (fixed) | 400, connection closed |
-| Header line | 8 KB | no (fixed) | 400, connection closed |
-| Header block (cumulative) | 10 KB | no (fixed) | 400, connection closed |
-| Header count | 100 | no (fixed) | 400, connection closed |
+| Request line | 8 KB | yes | 414 URI Too Long, connection closed |
+| Header line | 8 KB | yes | 431 Request Header Fields Too Large, connection closed |
+| Header block (cumulative) | 10 KB | yes | 431 Request Header Fields Too Large, connection closed |
+| Header count | 100 | yes | 431 Request Header Fields Too Large, connection closed |
 | Body (`max_content_length`) | 10 MB | yes | 413 Payload Too Large |
+
+The request line, header line, header block, and header count caps are
+tuned under `{http1, #{...}}` in the `protocols` list, with the keys
+`max_request_line`, `max_header_line`, `max_header_block`, and
+`max_header_count`. A chunked body's trailer block obeys the same header
+caps and is rejected the same way.
 
 The body cap is enforced the same way for both `Content-Length` and
 `Transfer-Encoding: chunked` requests: the cap is checked as the body is
@@ -57,25 +63,43 @@ When a cap closes a connection, roadrunner emits
 
 ## HTTP/2 framing limits
 
-These are advertised to the peer in the initial `SETTINGS` frame and
-enforced by the framing layer.
+The framing layer enforces these. The ones with a `SETTINGS` counterpart
+are advertised to the peer in the initial `SETTINGS` frame.
 
 | Limit | Default | Configurable |
 |---|---|---|
 | `SETTINGS_MAX_FRAME_SIZE` | 16 KB | no (fixed) |
-| `SETTINGS_MAX_CONCURRENT_STREAMS` | 100 | no (fixed) |
+| `SETTINGS_MAX_CONCURRENT_STREAMS` | 100 | yes |
 | HPACK decoder table | 4 KB | no (fixed) |
+| Header block (HEADERS + CONTINUATION) | 16 KB | yes |
 | Connection receive window (`conn_window`) | 65535 | yes |
 | Stream receive window (`stream_window`) | 65535 | yes |
 
 A frame whose declared length exceeds the negotiated max frame size is
 rejected on its 9-byte header, before the body is buffered. Streams over
-the concurrency limit are refused.
+the concurrency limit are refused. The cumulative header block has no
+`SETTINGS` counterpart yet, so it is enforced silently: a peer that
+overruns it gets `GOAWAY(ENHANCE_YOUR_CALM)`. The concurrency and
+header-block caps are tuned under `{http2, #{...}}` in the `protocols`
+list, with the keys `max_concurrent_streams` and `max_header_block`.
+
+## HTTP/3 framing limits
+
+| Limit | Default | Configurable |
+|---|---|---|
+| Field section block (encoded HEADERS) | 16 KB | yes |
+
+The encoded request field section is capped before it reaches the
+handler; an overrun answers `431 Request Header Fields Too Large`. It is
+tuned under `{http3, #{...}}` in the `protocols` list, with the key
+`max_header_block`. QPACK runs static-table only, so there is no
+dynamic-table memory to bound yet.
 
 ## Connection and slow-client guards
 
 | Limit | Default | Configurable | Purpose |
 |---|---|---|---|
+| `socket_backlog` | 1024 | yes | TCP listen backlog (kernel SYN/accept queue depth) |
 | `max_clients` | 150 | yes | concurrent connection cap per listener |
 | `request_timeout` | 30 s | yes | header-read timeout on a fresh connection |
 | `keep_alive_timeout` | 60 s | yes | idle timeout between requests |
@@ -90,7 +114,13 @@ Pass any configurable limit in the listener options map:
 roadrunner:start_listener(my_api, #{
     port => 8080,
     routes => my_handler,
+    socket_backlog => 4096,
     max_content_length => 5_242_880,
+    protocols => [
+        {http1, #{max_header_count => 200}},
+        {http2, #{max_concurrent_streams => 250, max_header_block => 32_768}},
+        {http3, #{max_header_block => 32_768}}
+    ],
     ws => #{max_frame_size => 1_048_576, max_message_size => 8_388_608}
 }).
 ```
