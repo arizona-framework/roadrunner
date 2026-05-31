@@ -59,7 +59,8 @@ stream's id, leaving the other 99 streams intact.
 -spec start(pid(), pos_integer(), roadrunner_req:request(), map()) ->
     {pid(), reference()}.
 start(ConnPid, StreamId, Req, ProtoOpts) ->
-    spawn_monitor(?MODULE, init, [ConnPid, StreamId, Req, ProtoOpts]).
+    #{handler_spawn_opts := SpawnOpts} = ProtoOpts,
+    spawn_opt(?MODULE, init, [ConnPid, StreamId, Req, ProtoOpts], [monitor | SpawnOpts]).
 
 -doc false.
 -spec init(pid(), pos_integer(), roadrunner_req:request(), map()) -> ok.

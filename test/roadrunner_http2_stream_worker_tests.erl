@@ -30,7 +30,9 @@ logger_metadata_set_in_h2_worker_test_() ->
             dispatch =>
                 {handler, roadrunner_logger_probe_handler,
                     fun roadrunner_logger_probe_handler:handle/1, undefined},
-            middlewares => []
+            middlewares => [],
+            handler_spawn_opts => [{fullsweep_after, 0}],
+            handler_start_timeout => infinity
         },
         {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
             ConnPid, StreamId, Req, ProtoOpts

@@ -363,6 +363,8 @@ concurrent_streams_both_dispatch() ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         client_counter => Counter,
         listener_name => h2_concurrent_test,
         dispatch =>
@@ -426,6 +428,8 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
     ok = counters:add(Counter, 1, 1),
     RequestsCounter = atomics:new(1, [{signed, false}]),
     ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         client_counter => Counter,
         requests_counter => RequestsCounter,
         listener_name => h2c_dispatch_test,
@@ -476,6 +480,8 @@ plaintext_listener_without_h2c_stays_h1() ->
     ok = counters:add(Counter, 1, 1),
     RequestsCounter = atomics:new(1, [{signed, false}]),
     ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         client_counter => Counter,
         requests_counter => RequestsCounter,
         listener_name => h1_dispatch_test,
@@ -1038,6 +1044,8 @@ middleware_chain_runs() ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         client_counter => Counter,
         listener_name => h2_mw_test,
         dispatch =>
@@ -1100,6 +1108,8 @@ router_404_returns_not_found() ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         client_counter => Counter,
         listener_name => h2_404_listener,
         dispatch => {router, h2_404_listener},
@@ -1820,6 +1830,8 @@ rst_during_stream_response_unwinds_worker() ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         client_counter => Counter,
         listener_name => h2_rst_during_stream,
         dispatch =>
@@ -1898,6 +1910,8 @@ drain_refuses_new_streams() ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         client_counter => Counter,
         listener_name => h2_drain_test,
         dispatch =>
@@ -1951,6 +1965,8 @@ drain_with_in_flight_stream_waits() ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         client_counter => Counter,
         listener_name => h2_drain_inflight_test,
         dispatch =>
@@ -2011,6 +2027,8 @@ drain_message_is_idempotent() ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         client_counter => Counter,
         listener_name => h2_drain_dup_test,
         dispatch =>
@@ -2061,6 +2079,8 @@ drain_then_peer_rst_exits_via_frame_loop() ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         client_counter => Counter,
         listener_name => h2_drain_rst_test,
         dispatch =>
@@ -2154,6 +2174,8 @@ telemetry_request_stop_fires_for_router_404() ->
         Counter = counters:new(1, [write_concurrency]),
         ok = counters:add(Counter, 1, 1),
         ProtoOpts = #{
+            handler_spawn_opts => [{fullsweep_after, 0}],
+            handler_start_timeout => infinity,
             client_counter => Counter,
             listener_name => h2_telem_404,
             dispatch => {router, h2_telem_404},
@@ -2235,6 +2257,8 @@ run_h2_with_compress_middleware(Path, ExtraHeaders) ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         client_counter => Counter,
         listener_name => h2_compress_test,
         dispatch =>
@@ -2971,6 +2995,8 @@ post_handshake_handler(Handler) ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         client_counter => Counter,
         listener_name => h2_strict_test,
         dispatch => {handler, Handler, fun Handler:handle/1, undefined},
@@ -3098,6 +3124,8 @@ start_http2_conn(Extra) ->
         #{
             client_counter => Counter,
             listener_name => http2_test,
+            handler_spawn_opts => [{fullsweep_after, 0}],
+            handler_start_timeout => infinity,
             dispatch =>
                 {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1,
                     undefined},
@@ -3221,6 +3249,8 @@ run_h2_request_with_handler(Handler, Path) ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         client_counter => Counter,
         listener_name => h2_handler_test,
         dispatch => {handler, Handler, fun Handler:handle/1, undefined},
@@ -3277,6 +3307,8 @@ run_stream_request(Path, PrefaceSettings) ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
         client_counter => Counter,
         listener_name => h2_stream_test,
         dispatch =>

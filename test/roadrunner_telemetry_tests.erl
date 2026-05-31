@@ -132,7 +132,9 @@ request_rejected_event_fires_on_bad_request_line_test() ->
             requests_counter => atomics:new(1, [{signed, false}]),
             min_bytes_per_second => 0,
             body_buffering => auto,
-            listener_name => probe_listener_rej
+            listener_name => probe_listener_rej,
+            handler_spawn_opts => [{fullsweep_after, 0}],
+            handler_start_timeout => infinity
         },
         true = roadrunner_conn:try_acquire_slot(Opts),
         {ok, Pid} = roadrunner_conn:start({fake, Sink}, Opts),

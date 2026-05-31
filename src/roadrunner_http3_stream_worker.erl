@@ -58,7 +58,8 @@ at the connection / stream level, not by crashing this worker).
 -spec start(pid(), non_neg_integer(), roadrunner_req:request(), roadrunner_conn:proto_opts()) ->
     {pid(), reference()}.
 start(Conn, StreamId, Req, ProtoOpts) ->
-    spawn_monitor(?MODULE, init, [Conn, StreamId, Req, ProtoOpts]).
+    #{handler_spawn_opts := SpawnOpts} = ProtoOpts,
+    spawn_opt(?MODULE, init, [Conn, StreamId, Req, ProtoOpts], [monitor | SpawnOpts]).
 
 -doc false.
 -spec init(pid(), non_neg_integer(), roadrunner_req:request(), roadrunner_conn:proto_opts()) -> ok.

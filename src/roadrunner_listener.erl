@@ -45,6 +45,13 @@ All duration and interval values in `opts()` are in milliseconds —
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
 -define(DEFAULT_MAX_CLIENTS, 150).
 -define(DEFAULT_MIN_BYTES_PER_SECOND, 100).
+%% Spawn config for every handler-running process (connection process +
+%% HTTP/2/3 stream workers). `fullsweep_after, 0` reclaims the per-connection
+%% heap that grows building a response (e.g. a JSON encoder's transient iolist)
+%% instead of hoarding it as old-gen garbage across keep-alive requests — at
+%% high connection counts the difference between hundreds of MB and a few GB.
+-define(DEFAULT_HANDLER_SPAWN_OPTS, [{fullsweep_after, 0}]).
+-define(DEFAULT_HANDLER_START_TIMEOUT, infinity).
 -define(DEFAULT_WS_MAX_FRAME_SIZE, 10485760).
 -define(DEFAULT_WS_MAX_MESSAGE_SIZE, 10485760).
 %% Per-connection concurrent client-initiated request (bidirectional)
@@ -117,6 +124,14 @@ Optional middleware and timing knobs (durations in milliseconds):
   lower per-conn overhead on short-lived workloads).
 - `hibernate_after` — when set, idle conns hibernate after this
   many milliseconds of main-loop idle time.
+- `handler_spawn` — spawn config for every handler-running process (the
+  connection process and HTTP/2/3 stream workers) as a nested map:
+  `opts` (`spawn_opt` / `proc_lib` options, default
+  `[{fullsweep_after, 0}]` so the per-conn response heap is reclaimed
+  instead of hoarding it as old-gen garbage across keep-alive
+  requests) and `start_timeout` (init-ack deadline, default
+  `infinity`). Pair with `+MHacul 0 +MBacul 0` in `vm.args` to return
+  freed allocator carriers to the OS for the lowest resident memory.
 - `protocols` — list of `t:protocol_entry/0`. Default `[http1]`.
   On TLS this drives `alpn_preferred_protocols` automatically.
 - `tls` — `[ssl:tls_server_option()]` for HTTPS. Empty / absent
@@ -172,6 +187,27 @@ ops-tuning rationale.
     %% receive's `after` clause has a window to call
     %% `erlang:hibernate/3`.
     hibernate_after => pos_integer(),
+    %% Spawn config for every handler-running process — the connection process
+    %% and the HTTP/2/3 stream workers. `opts` is a passthrough to `spawn_opt`
+    %% (default `[{fullsweep_after, 0}]`): the default reclaims the
+    %% per-connection heap that grows building a response (e.g. a JSON
+    %% encoder's transient iolist) instead of hoarding it as old-gen garbage
+    %% across keep-alive requests — at high connection counts the difference
+    %% between hundreds of MB and a few GB of resident memory. Free on
+    %% allocation-heavy handlers; ~3-4% on trivial passthrough handlers, so
+    %% pass `{fullsweep_after, 65535}` to restore the BEAM default. Also useful
+    %% here: `{max_heap_size, _}` (OOM/DoS cap), `{message_queue_data,
+    %% off_heap}`, `{min_bin_vheap_size, _}`. `link`/`monitor` are rejected —
+    %% roadrunner owns process linkage. `start_timeout` is the `proc_lib:start`
+    %% `Time`: how long to wait for a started process to ack init before
+    %% killing it with `{error, timeout}` (default `infinity`); it applies to
+    %% the connection process and the WebSocket session (the fire-and-forget
+    %% HTTP/3 conn and stream-worker spawns have no init handshake). For lowest
+    %% OS-resident memory also set `+MHacul 0 +MBacul 0` in `vm.args`.
+    handler_spawn => #{
+        opts => [proc_lib:start_spawn_option()],
+        start_timeout => timeout()
+    },
     %% Protocols this listener accepts. Each entry is either a bare
     %% atom (`http1` / `http2`) or a `{Proto, Opts}` tuple carrying
     %% protocol-specific tuning. Bare atom means "default opts".
@@ -798,6 +834,9 @@ build_proto_opts(Opts, ListenerName) ->
     %% → `http2_*` flattening above.
     #{max_frame_size := WsFrame, max_message_size := WsMsg} =
         validate_ws_opts(maps:get(ws, Opts, #{})),
+    %% Flatten the nested `handler_spawn` opt to top-level proto_opts keys the
+    %% spawn sites read directly, mirroring the `ws` / `http2` flattening above.
+    #{opts := HandlerSpawnOpts, start_timeout := HandlerStartTimeout} = resolve_handler_spawn(Opts),
     Base = maps:merge(
         maps:merge(maybe_alt_svc(Protocols, Opts), #{
             dispatch => build_dispatch(Opts, ListenerName),
@@ -819,6 +858,8 @@ build_proto_opts(Opts, ListenerName) ->
             body_buffering => maps:get(body_buffering, Opts, auto),
             listener_name => ListenerName,
             graceful_drain => maps:get(graceful_drain, Opts, true),
+            handler_spawn_opts => HandlerSpawnOpts,
+            handler_start_timeout => HandlerStartTimeout,
             protocols => Protocols
         }),
         ProtoFlats
@@ -846,6 +887,43 @@ build_proto_opts(Opts, ListenerName) ->
         #{} ->
             WithHibernate
     end.
+
+%% Resolve the public `handler_spawn` opt into the proto_opts shape the spawn
+%% sites read: `#{opts := [start_spawn_option()], start_timeout := timeout()}`.
+%% `link`/`monitor` are rejected — roadrunner owns process linkage (the conn is
+%% intentionally unlinked, stream workers are monitored), so honoring them would
+%% break that crash-isolation contract.
+resolve_handler_spawn(Opts) ->
+    case maps:get(handler_spawn, Opts, #{}) of
+        HandlerSpawn when is_map(HandlerSpawn) ->
+            SpawnOpts = maps:get(opts, HandlerSpawn, ?DEFAULT_HANDLER_SPAWN_OPTS),
+            Timeout = maps:get(start_timeout, HandlerSpawn, ?DEFAULT_HANDLER_START_TIMEOUT),
+            ok = validate_handler_spawn_opts(SpawnOpts, HandlerSpawn),
+            ok = validate_handler_start_timeout(Timeout, HandlerSpawn),
+            #{opts => SpawnOpts, start_timeout => Timeout};
+        Other ->
+            error({invalid_listener_opt, handler_spawn, Other})
+    end.
+
+validate_handler_spawn_opts(SpawnOpts, Raw) when is_list(SpawnOpts) ->
+    case lists:any(fun is_reserved_spawn_opt/1, SpawnOpts) of
+        true -> error({invalid_listener_opt, handler_spawn, Raw});
+        false -> ok
+    end;
+validate_handler_spawn_opts(_SpawnOpts, Raw) ->
+    error({invalid_listener_opt, handler_spawn, Raw}).
+
+is_reserved_spawn_opt(link) -> true;
+is_reserved_spawn_opt(monitor) -> true;
+is_reserved_spawn_opt({monitor, _}) -> true;
+is_reserved_spawn_opt(_) -> false.
+
+validate_handler_start_timeout(infinity, _Raw) ->
+    ok;
+validate_handler_start_timeout(Timeout, _Raw) when is_integer(Timeout, 0, 16#7FFFFFFF) ->
+    ok;
+validate_handler_start_timeout(_Timeout, Raw) ->
+    error({invalid_listener_opt, handler_spawn, Raw}).
 
 %% Precompute the `Alt-Svc` response-header value (RFC 7838) when the
 %% listener co-serves HTTP/3 alongside a TCP protocol on a fixed port,

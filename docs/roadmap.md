@@ -118,6 +118,31 @@ lot of them.
 
 ## Other
 
+### Connection-process memory tuning follow-ups
+
+**What:** The `conn_spawn` listener opt already exposes the full
+`proc_lib:start/5` spawn config (`opts` + `start_timeout`) for every
+handler-running process, defaulting to `[{fullsweep_after, 0}]`.
+Remaining polish:
+- a named convenience opt (e.g. a top-level `max_heap_size`) if the
+  raw `opts` passthrough proves clumsy in practice
+- ship a recommended `vm.args` carrying `+MHacul 0 +MBacul 0` so the
+  allocator returns freed carriers to the OS (the opt's doc points at
+  this today, but nothing packages it)
+- revisit whether `fullsweep_after, 0` should stay the default: it is
+  free on allocation-heavy handlers but costs ~3-4% on trivial
+  passthrough, so an adaptive policy (or a different default) may be
+  better once measured on more workloads
+- verify the per-process memory win extends to the HTTP/2 and HTTP/3
+  stream-worker processes under load (validated so far on the h1
+  connection process)
+
+**Why deferred:** the passthrough plus default already capture the
+~72% process-memory reduction; these are refinements that each want
+their own measurement before shipping.
+
+**Scope:** small.
+
 ### h2 receive-window defaults
 
 **What:** Bump the listener's default receive-window peaks above the

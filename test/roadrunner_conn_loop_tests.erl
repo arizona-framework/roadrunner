@@ -29,6 +29,18 @@ start_returns_ok_pid_test() ->
     ?assert(is_process_alive(Pid)),
     drain_then_wait(Pid).
 
+start_applies_handler_spawn_opts_to_process_test() ->
+    %% `handler_spawn_opts` must reach the spawned connection process, not
+    %% just sit in proto_opts: start a conn with a non-default
+    %% `fullsweep_after` and read it back from the live process's own
+    %% garbage-collection info.
+    ensure_pg(),
+    Opts = (fake_opts(gc_flag))#{handler_spawn_opts := [{fullsweep_after, 42}]},
+    {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_sink()}, Opts),
+    {garbage_collection, GcInfo} = process_info(Pid, garbage_collection),
+    ?assertEqual(42, proplists:get_value(fullsweep_after, GcInfo)),
+    drain_then_wait(Pid).
+
 conn_start_routes_through_loop_test() ->
     ensure_pg(),
     {ok, Pid} = roadrunner_conn:start({fake, spawn_sink()}, fake_opts(dispatch)),
@@ -1268,7 +1280,9 @@ fake_opts(ListenerName) ->
         requests_counter => atomics:new(1, [{signed, false}]),
         min_bytes_per_second => 0,
         body_buffering => auto,
-        listener_name => ListenerName
+        listener_name => ListenerName,
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity
     }.
 
 %% Plain sink — discards every message. Used when the test doesn't need
