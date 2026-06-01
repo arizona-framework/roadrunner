@@ -76,27 +76,19 @@ do_send(ConnPid, StreamId, Data, {fin, Trailers}) ->
     ok.
 
 sync_send_headers(ConnPid, StreamId, Status, Headers, EndStream) ->
-    sync(fun(Ref) ->
+    roadrunner_http2_worker_sync:sync(ConnPid, fun(Ref) ->
         _ = (ConnPid ! {h2_send_headers, self(), Ref, StreamId, Status, Headers, EndStream}),
         ok
     end).
 
 sync_send_data(ConnPid, StreamId, Data, EndStream) ->
-    sync(fun(Ref) ->
+    roadrunner_http2_worker_sync:sync(ConnPid, fun(Ref) ->
         _ = (ConnPid ! {h2_send_data, self(), Ref, StreamId, Data, EndStream}),
         ok
     end).
 
 sync_send_trailers(ConnPid, StreamId, Trailers) ->
-    sync(fun(Ref) ->
+    roadrunner_http2_worker_sync:sync(ConnPid, fun(Ref) ->
         _ = (ConnPid ! {h2_send_trailers, self(), Ref, StreamId, Trailers}),
         ok
     end).
-
-sync(SendFun) ->
-    Ref = make_ref(),
-    ok = SendFun(Ref),
-    receive
-        {h2_send_ack, Ref} -> ok;
-        {h2_stream_reset, _StreamId} -> exit(stream_reset)
-    end.
