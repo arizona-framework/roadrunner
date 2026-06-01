@@ -564,6 +564,7 @@ fake_proto_opts(Handler) ->
         keep_alive_timeout => 5000,
         max_keep_alive_requests => 100,
         max_clients => 10,
+        max_concurrent_requests => infinity,
         client_counter => counters:new(1, [write_concurrency]),
         requests_counter => atomics:new(1, [{signed, false}]),
         rejected_counter => atomics:new(1, [{signed, false}]),

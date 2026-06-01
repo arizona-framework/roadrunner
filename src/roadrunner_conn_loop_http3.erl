@@ -700,16 +700,25 @@ dispatch_decoded(#h3{streams = Streams} = State, StreamId, Headers, Body) ->
             %% stream error H3_MESSAGE_ERROR.
             reset_and_drop(State1, StreamId, ?H3_MESSAGE_ERROR);
         {ok, Req} ->
-            {_WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
-                State1#h3.conn, StreamId, Req, State1#h3.proto_opts
-            ),
-            %% The worker owns the response now, tracked by its monitor
-            %% ref; drop the (no-longer-needed) frame-accumulation entry
-            %% so the streams map only ever holds in-progress requests.
-            State1#h3{
-                streams = maps:remove(StreamId, Streams),
-                worker_refs = (State1#h3.worker_refs)#{MonRef => StreamId}
-            }
+            case roadrunner_conn:try_acquire_request_slot(State1#h3.proto_opts) of
+                true ->
+                    {_WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
+                        State1#h3.conn, StreamId, Req, State1#h3.proto_opts
+                    ),
+                    %% The worker owns the response now, tracked by its monitor
+                    %% ref; drop the (no-longer-needed) frame-accumulation entry
+                    %% so the streams map only ever holds in-progress requests.
+                    State1#h3{
+                        streams = maps:remove(StreamId, Streams),
+                        worker_refs = (State1#h3.worker_refs)#{MonRef => StreamId}
+                    };
+                false ->
+                    %% Listener-wide in-flight ceiling reached — refuse the
+                    %% stream (retry-safe H3_REQUEST_REJECTED) without spawning
+                    %% a worker.
+                    ok = throttle_stream(State1),
+                    reset_and_drop(State1, StreamId, ?H3_REQUEST_REJECTED)
+            end
     end.
 
 %% A worker exit: normal means it sent its response with the stream FIN
@@ -721,6 +730,10 @@ handle_worker_down(#h3{worker_refs = WorkerRefs} = State, MonRef, Reason) ->
     %% Every monitor the loop holds is a stream worker (the QUIC conn is
     %% linked, not monitored), so the ref is always present.
     {StreamId, WorkerRefs1} = maps:take(MonRef, WorkerRefs),
+    %% Release the in-flight slot exactly once, tied to removing the worker
+    %% ref so it is accounted for by this `DOWN` or by the conn's clean
+    %% exit, never both.
+    ok = roadrunner_conn:release_request_slot(State#h3.proto_opts),
     State1 = State#h3{worker_refs = WorkerRefs1},
     case Reason of
         normal ->
@@ -735,6 +748,16 @@ handle_worker_down(#h3{worker_refs = WorkerRefs} = State, MonRef, Reason) ->
 reset_and_drop(#h3{conn = Conn} = State, StreamId, ErrorCode) ->
     _ = quic:reset_stream(Conn, StreamId, ErrorCode),
     drop_stream(State, StreamId).
+
+%% Bump the cumulative throttled counter and emit the throttled telemetry
+%% when a stream is refused at the `max_concurrent_requests` ceiling.
+-spec throttle_stream(#h3{}) -> ok.
+throttle_stream(#h3{proto_opts = #{throttled_counter := Counter}, listener_name = ListenerName}) ->
+    ok = atomics:add(Counter, 1, 1),
+    roadrunner_telemetry:request_throttled(#{
+        listener_name => ListenerName,
+        reason => max_concurrent_requests
+    }).
 
 %% A connection error (RFC 9114 §8): close the QUIC connection with the
 %% h3 error code + reason, then run the normal teardown. The peer sees
@@ -752,11 +775,19 @@ drop_stream(#h3{streams = Streams} = State, StreamId) ->
 
 -spec terminate(#h3{}) -> ok.
 terminate(#h3{
-    proto_opts = ProtoOpts, listener_name = ListenerName, peer = Peer, start_mono = StartMono
+    proto_opts = ProtoOpts,
+    listener_name = ListenerName,
+    peer = Peer,
+    start_mono = StartMono,
+    worker_refs = Refs
 }) ->
     ok = roadrunner_telemetry:listener_conn_close(StartMono, #{
         listener_name => ListenerName,
         peer => Peer,
         requests_served => 0
     }),
+    %% Account for any stream workers still live at teardown (each holds one
+    %% in-flight slot); workers whose `DOWN` already fired were removed from
+    %% `worker_refs`, so this releases each remaining worker exactly once.
+    ok = roadrunner_conn:release_request_slots(ProtoOpts, map_size(Refs)),
     ok = roadrunner_conn:release_slot(ProtoOpts).

@@ -180,6 +180,7 @@ proto_opts(ListenerName, Counter) ->
         keep_alive_timeout => 200,
         max_keep_alive_requests => 100,
         max_clients => 1000,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         requests_counter => atomics:new(1, [{signed, false}]),
         rejected_counter => atomics:new(1, [{signed, false}]),

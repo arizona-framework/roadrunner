@@ -241,6 +241,7 @@ start_conn(H2Opts) ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_window_test,
         dispatch =>

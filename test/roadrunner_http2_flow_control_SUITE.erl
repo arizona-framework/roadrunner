@@ -351,6 +351,7 @@ start_conn(Handler) ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = #{
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_flow_test,
         dispatch => {handler, Handler, fun Handler:handle/1, undefined},

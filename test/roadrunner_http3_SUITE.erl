@@ -47,6 +47,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     co_listen/1,
     rejects_http3_without_tls/1,
     max_clients_refuse/1,
+    max_concurrent_requests_refuse/1,
     stream_cancel/1,
     response_to_cancelled_stream/1,
     badheaders_reset/1,
@@ -106,6 +107,7 @@ all() ->
         co_listen,
         rejects_http3_without_tls,
         max_clients_refuse,
+        max_concurrent_requests_refuse,
         stream_cancel,
         response_to_cancelled_stream,
         badheaders_reset,
@@ -179,6 +181,7 @@ init_per_testcase(Case, Config) when
     Case =:= co_listen;
     Case =:= rejects_http3_without_tls;
     Case =:= max_clients_refuse;
+    Case =:= max_concurrent_requests_refuse;
     Case =:= extra_data_after_413
 ->
     Config;
@@ -610,6 +613,53 @@ max_clients_refuse(_Config) ->
     after
         close(Conn1),
         roadrunner_listener:stop(Name)
+    end.
+
+max_concurrent_requests_refuse(_Config) ->
+    %% A listener with an in-flight ceiling of 1. A `/loop` request parks a
+    %% long-lived worker holding the only slot; a second request on the same
+    %% connection is refused (H3_REQUEST_REJECTED) and bumps the `throttled`
+    %% count from `info/1`. Stopping the loop worker frees the slot.
+    Name = listener_name(max_concurrent_requests_refuse),
+    {ok, _} = start_h3(Name, #{max_concurrent_requests => 1}),
+    Port = roadrunner_listener:port(Name),
+    Conn = connect(Port),
+    try
+        {ok, _StreamId} = quic_h3:request(Conn, headers(~"GET", ~"/loop")),
+        Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
+        %% The parked worker holds the single in-flight slot, so the next
+        %% request is over the ceiling and gets no response.
+        ?assertEqual(error, try_get(Conn, ~"/")),
+        ?assert(maps:get(throttled, roadrunner_listener:info(Name)) >= 1),
+        %% Releasing the worker frees the slot; a fresh request succeeds once
+        %% the worker's `DOWN` has run (the slot release is async, so retry).
+        WorkerRef = monitor(process, Worker),
+        Worker ! stop,
+        receive
+            {'DOWN', WorkerRef, process, Worker, _} -> ok
+        after 5000 -> ct:fail(loop_worker_did_not_exit)
+        end,
+        ?assertEqual({200, ~"ok"}, status_body(retry_get(Conn, ~"/", 50)))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+%% Retry a GET until it succeeds: the in-flight slot is released on the
+%% worker's `DOWN`, which is processed by the conn loop slightly after the
+%% monitor fires here, so the first follow-up request can still race it.
+retry_get(_Conn, _Path, 0) ->
+    error(retry_get_exhausted);
+retry_get(Conn, Path, Tries) ->
+    case get(Conn, Path) of
+        {error, _} ->
+            timer:sleep(20),
+            retry_get(Conn, Path, Tries - 1);
+        timeout ->
+            timer:sleep(20),
+            retry_get(Conn, Path, Tries - 1);
+        Response ->
+            Response
     end.
 
 stream_cancel(Config) ->

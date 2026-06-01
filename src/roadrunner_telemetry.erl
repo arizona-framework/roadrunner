@@ -156,6 +156,7 @@
     listener_conn_close/2,
     listener_conn_rejected/1,
     request_rejected/1,
+    request_throttled/1,
     slots_reconciled/1,
     drain_acknowledged/1,
     ws_upgrade/1,
@@ -303,6 +304,25 @@ debug logs. `Metadata` should include `listener_name`, `peer`, and
 request_rejected(Metadata) ->
     telemetry:execute(
         [roadrunner, request, rejected],
+        #{system_time => erlang:system_time()},
+        Metadata
+    ),
+    ok.
+
+-doc """
+Emit `[roadrunner, request, throttled]` when an HTTP/2 or HTTP/3 stream is
+refused because the listener is at its `max_concurrent_requests` in-flight
+ceiling. The stream is reset (`REFUSED_STREAM` / `H3_REQUEST_REJECTED`,
+both retry-safe per RFC 9113 §8.7) before any handler runs. Lets ops see
+the in-flight cap is binding instead of mistaking the refusals for errors;
+pair it with the cumulative `throttled` count from
+`roadrunner_listener:info/1`. `Metadata` should include `listener_name`
+and `reason` (`max_concurrent_requests`).
+""".
+-spec request_throttled(map()) -> ok.
+request_throttled(Metadata) ->
+    telemetry:execute(
+        [roadrunner, request, throttled],
         #{system_time => erlang:system_time()},
         Metadata
     ),
