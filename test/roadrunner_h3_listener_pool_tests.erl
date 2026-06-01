@@ -1,17 +1,20 @@
 -module(roadrunner_h3_listener_pool_tests).
 -include_lib("eunit/include/eunit.hrl").
 
-%% Tests the listener-level HTTP/3 reuseport-pool knob, nested under
-%% `protocols => [{http3, #{listeners => N}}]`: the validator's reject
-%% path (a bad count fails listener start fast) and accept path (a tuned
-%% count boots a listener cleanly). The pooling behaviour itself
-%% (parallel inbound demux) is a perf property measured by the bench, not
-%% asserted here.
+%% Tests the listener-level HTTP/3 sub-opts, nested under
+%% `protocols => [{http3, #{...}}]`: the reuseport-pool `listeners` knob
+%% and the `max_streams_bidi` cap. Covers the validator's reject path (a
+%% bad value fails listener start fast), the accept path (a tuned value
+%% boots a listener cleanly), and that a custom `max_streams_bidi`
+%% threads through to proto_opts. The pooling behaviour itself (parallel
+%% inbound demux) is a perf property measured by the bench, not asserted
+%% here.
 
 all_test_() ->
     Tests = [
         fun invalid_listeners_opt_fails_listener_start/0,
-        fun valid_listeners_opt_lets_listener_boot/0
+        fun valid_listeners_opt_lets_listener_boot/0,
+        fun custom_max_streams_bidi_threads_into_proto_opts/0
     ],
     [{spawn, T} || T <- Tests].
 
@@ -59,6 +62,27 @@ valid_listeners_opt_lets_listener_boot() ->
         tls => roadrunner_test_certs:server_opts(),
         routes => roadrunner_keepalive_handler
     }),
+    ok = roadrunner_listener:stop(Name).
+
+custom_max_streams_bidi_threads_into_proto_opts() ->
+    %% A tuned `max_streams_bidi` flattens to the `http3_max_streams_bidi`
+    %% proto_opts key the QUIC pool reads when advertising the peer's
+    %% bidirectional-stream cap in the transport parameters.
+    {ok, _} = application:ensure_all_started(ssl),
+    {ok, _} = application:ensure_all_started(quic),
+    ensure_pg(),
+    Name = list_to_atom(
+        "h3_max_streams_bidi_test_" ++ integer_to_list(erlang:unique_integer([positive]))
+    ),
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        protocols => [{http3, #{max_streams_bidi => 256}}],
+        tls => roadrunner_test_certs:server_opts(),
+        routes => roadrunner_keepalive_handler
+    }),
+    State = sys:get_state(ListenerPid),
+    ProtoOpts = element(4, State),
+    ?assertEqual(256, maps:get(http3_max_streams_bidi, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
 ensure_pg() ->
