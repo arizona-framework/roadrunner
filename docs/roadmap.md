@@ -199,23 +199,25 @@ only parse the peer's value and bound inbound via the encoded
 `max_header_block` cap. The ~50 handshake fixtures that drain the server
 SETTINGS need to tolerate the extra entry.
 
-### Sync headline scenarios in comparison.md + resource_results.md
+### Refresh resource_results.md against the current headline scenarios
 
-**What:** `docs/comparison.md` and `docs/resource_results.md` still
-carry their own scenario picks predating the curated
-`?MAIN_SCENARIOS` in `scripts/bench.escript`. The README's
-quick-look table and the two bench-script-driven docs
-(`docs/bench_results.md`, `docs/wrk2_results.md`) have already
-been resynced.
+**What:** `docs/resource_results.md` still carries its own scenario
+pick (captured 2026-05-06) predating the curated `?MAIN_SCENARIOS` in
+`scripts/bench.escript`: it is missing `multi_request_body`,
+`post_4kb_form`, `large_post_streaming`, `streaming_response` and still
+lists the dropped `cookies_heavy` / `tls_handshake_throughput`.
+`comparison.md` was resynced to `?MAIN_SCENARIOS`; the README quick-look
+table and the bench-script-driven docs (`bench_results.md`,
+`wrk2_results.md`) were already current.
 
-**Why deferred:** both docs cross-reference broader investigations
-(memory shape, architectural trade-offs) — a mechanical sync isn't
-the right move, but a deliberate re-pick against `?MAIN_SCENARIOS`
-is.
+**Why deferred:** the resource doc's memory / CPU numbers are a
+single-run snapshot that can only be refreshed by re-running
+`scripts/bench.escript --with-resources` against the current 14
+scenarios, not edited by hand. Fold it into the next matrix run rather
+than re-running the bench just for this.
 
-**Scope:** small. Re-render the comparison-doc throughput tables
-and refresh the resource doc's per-scenario notes against the new
-headline.
+**Scope:** small (one `--with-resources` matrix pass + re-render the
+three tables and trim the dropped-scenario notes).
 
 ### Automate `docs/resource_results.md` regeneration
 

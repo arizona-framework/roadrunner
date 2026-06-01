@@ -217,9 +217,9 @@ All listener options live in the
 type, with per-key defaults and tuning rationale. Beyond `port`,
 `protocols`, `tls`, and `routes` from the Quickstart, the type covers:
 
-- **DoS bounds** — `max_clients`, `socket_backlog`,
-  `max_content_length`, `request_timeout`, `keep_alive_timeout`,
-  `min_bytes_per_second`, `max_keep_alive_requests`
+- **DoS bounds** — `max_clients`, `max_concurrent_requests`,
+  `socket_backlog`, `max_content_length`, `request_timeout`,
+  `keep_alive_timeout`, `min_bytes_per_second`, `max_keep_alive_requests`
 - **Middleware** — `middlewares`
 - **Body buffering** — `body_buffering`
 - **Graceful drain** — `graceful_drain`, `slot_reconciliation`
@@ -282,9 +282,9 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
   client renegotiation off, post-quantum hybrid `x25519mlkem768` first
   when the OpenSSL build supports it. Full settings list in the
   `roadrunner_listener` module docs.
-- DoS bounds — `max_clients`, `socket_backlog`, `max_content_length`,
-  `min_bytes_per_second`, `request_timeout`, `keep_alive_timeout`,
-  `max_keep_alive_requests`.
+- DoS bounds — `max_clients`, `max_concurrent_requests`,
+  `socket_backlog`, `max_content_length`, `min_bytes_per_second`,
+  `request_timeout`, `keep_alive_timeout`, `max_keep_alive_requests`.
 
 ### Observability
 

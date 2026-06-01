@@ -76,6 +76,15 @@
 %%   - **Measurements:** `system_time`.
 %%   - **Metadata:** `listener_name`, `reason` (`max_clients`).
 %%
+%% - `[roadrunner, request, throttled]` — fired when an HTTP/2 or HTTP/3
+%%   stream is refused because the listener is at its
+%%   `max_concurrent_requests` in-flight ceiling, before any handler runs.
+%%   The stream is reset (`REFUSED_STREAM` / `H3_REQUEST_REJECTED`); pair
+%%   with the cumulative `throttled` count from `roadrunner_listener:info/1`.
+%%
+%%   - **Measurements:** `system_time`.
+%%   - **Metadata:** `listener_name`, `reason` (`max_concurrent_requests`).
+%%
 %% - `[roadrunner, ws, upgrade]` — fired in the conn process once the
 %%   WebSocket handshake response has been written. Marks the
 %%   transition from HTTP/1.1 keep-alive into the WS frame loop.
@@ -137,7 +146,7 @@
 %% All other events listed above (`request, start`,
 %% `request, exception`, `response, send_failed`,
 %% `listener, accept`, `listener, conn_close`,
-%% `listener, conn_rejected`, `request, rejected`,
+%% `listener, conn_rejected`, `request, rejected`, `request, throttled`,
 %% `listener, slots_reconciled`, `drain, acknowledged`,
 %% `ws, frame_in`, `ws, frame_rejected`) are **unstable**: their
 %% event name, measurement keys, or metadata schema may change in
