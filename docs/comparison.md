@@ -9,7 +9,9 @@ points here for readers comparing roadrunner against the alternatives.
 `scripts/bench.escript` runs the same loadgen against each server in
 its own peer BEAM. `scripts/bench_matrix.sh` drives 30+ scenarios
 across both protocols and writes the consolidated tables that ship
-in [`bench_results.md`](bench_results.md). Numbers below are the
+in [`bench_results.md`](bench_results.md). The cross-section below is
+drawn from that same matrix run (the full per-protocol tables, plus
+roadrunner's p50 / p99, live in `bench_results.md`). Numbers are the
 median of 3 runs at 50 concurrent clients, loopback only (no NIC).
 Re-run locally to see what your hardware shows; absolute numbers
 shift, relative ordering tends to hold.
@@ -49,16 +51,18 @@ inside variance and shouldn't be read as a win.
 
 | scenario                  | roadrunner    | elli          | cowboy        |
 |---------------------------|--------------:|--------------:|--------------:|
-| `hello`                   |       285 k   |       289 k   |       196 k   |
-| `json`                    |       292 k   |       301 k   |       182 k   |
-| `echo`                    |       270 k   |       281 k   |       148 k   |
-| `large_response`          |       124 k   |       125 k   |        94 k   |
-| `headers_heavy`           |       267 k   |       241 k   |       134 k   |
-| `cookies_heavy`           |   **287 k**   |          —    |       163 k   |
-| `pipelined_h1`            |   **526 k**   |       4.9 k   |       357 k   |
-| `varied_paths_router`     |   **294 k**   |          —    |       170 k   |
-| `gzip_response`           |   **136 k**   |          —    |       108 k   |
-| `websocket_msg_throughput`|   **230 k**   |          —    |       167 k   |
+| `hello`                   |       307 k   |       299 k   |       201 k   |
+| `json`                    |       299 k   |       304 k   |       189 k   |
+| `echo`                    |       304 k   |       282 k   |       162 k   |
+| `large_response`          |       124 k   |       123 k   |        98 k   |
+| `headers_heavy`           |       257 k   |       253 k   |       141 k   |
+| `multi_request_body`      |       262 k   |       274 k   |       125 k   |
+| `pipelined_h1`            |   **580 k**   |       4.8 k   |       371 k   |
+| `varied_paths_router`     |   **290 k**   |          —    |       175 k   |
+| `post_4kb_form`           |   **193 k**   |          —    |        98 k   |
+| `large_post_streaming`    |   **20 k**    |          —    |       6.9 k   |
+| `gzip_response`           |   **138 k**   |          —    |       111 k   |
+| `websocket_msg_throughput`|   **232 k**   |          —    |       179 k   |
 
 `—` means the elli test fixture doesn't support that scenario shape
 (no h2, no WebSocket, no gzip middleware, no router, no native qs
@@ -69,17 +73,20 @@ needs any of these, elli isn't on the table.
 
 | scenario                   | roadrunner    | cowboy        |
 |----------------------------|--------------:|--------------:|
-| `hello`                    |       178 k   |       169 k   |
-| `json`                     |       170 k   |       151 k   |
-| `echo`                     |   **163 k**   |       118 k   |
-| `headers_heavy`            |   **162 k**   |        89 k   |
-| `multi_stream_h2`          |       351 k   |       331 k   |
-| `tls_handshake_throughput` |       2.7 k   |     **3.2 k** |
+| `hello`                    |       167 k   |       163 k   |
+| `json`                     |       168 k   |       153 k   |
+| `echo`                     |   **164 k**   |       112 k   |
+| `headers_heavy`            |   **161 k**   |        90 k   |
+| `multi_request_body`       |   **140 k**   |        28 k   |
+| `multi_stream_h2`          |       351 k   |       335 k   |
+| `streaming_response`       |        62 k   |        61 k   |
 
 Multi-stream and basic-req h2 line up with the h1 picture — large
-wins on bigger headers/bodies, smaller wins on the simple paths.
-`tls_handshake_throughput` is the one cowboy-wins case; documented
-honestly in
+wins on bigger headers/bodies, smaller wins on the simple paths. The
+one documented cowboy-wins case is `tls_handshake_throughput`
+(fresh-TLS-conn-per-request, runnable ad-hoc via
+`./scripts/bench.escript --scenarios tls_handshake_throughput`),
+explained in
 [`conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md).
 
 ## Latency — p50 / p99 (lower = better)
@@ -91,7 +98,6 @@ file. Spot-checks from the same run:
 |------------------------|-----------------:|----------------------:|-----------------:|
 | `hello`                | 119 µs / 1.65 ms |      117 µs / 1.53 ms | 196 µs / 1.87 ms |
 | `echo`                 | 126 µs / 1.77 ms |      119 µs / 1.70 ms | 261 µs / 2.75 ms |
-| `cookies_heavy`        | 120 µs / 1.56 ms |           —           | 235 µs / 2.62 ms |
 | `pipelined_h1`         |  74 µs / 0.71 ms |   10.35 ms / 10.67 ms | 117 µs / 0.82 ms |
 
 ## Open-loop tail latency (wrk2)
@@ -134,13 +140,12 @@ Requires Docker and a compiled test profile. See
   [`conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md)).
   Connection-storm-shape scenarios (in the full results) tie
   within variance.
-- **vs elli: tied or just ahead on simple hot-path GETs.**
-  Roadrunner now matches or slightly leads elli on `hello` /
-  `echo` (within ~7 %), and trails by ~2–7 % on `json` /
-  `large_response`. The gap (either way) is inside the bench's
-  variance band — elli's minimal surface still wins the cleanest
-  hot path some runs. Add a router / cookie parse / gzip /
-  pipeline / h2 / WebSocket and elli either falls behind or
+- **vs elli: tied on simple hot-path GETs.**
+  Roadrunner and elli trade the lead within a few percent on
+  `hello` / `echo` / `json` / `large_response` — every gap (either
+  way) sits inside the bench's ~15 % variance band, so neither
+  server has a real edge on the cleanest hot path. Add a router /
+  gzip / pipeline / h2 / WebSocket and elli either falls behind or
   drops out (no support). Elli also still wins the
   connection-storm-shape scenarios where the per-conn process
   model dominates.
