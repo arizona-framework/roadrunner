@@ -34,6 +34,9 @@
     peer/1,
     try_acquire_slot/1,
     release_slot/1,
+    try_acquire_request_slot/1,
+    release_request_slot/1,
+    release_request_slots/2,
     consume_body_reader/2,
     join_drain_group/2,
     join_drain_group_for/2
@@ -100,6 +103,16 @@
     client_counter := counters:counters_ref(),
     requests_counter := atomics:atomics_ref(),
     rejected_counter := atomics:atomics_ref(),
+    %% Aggregate in-flight ceiling for the multiplexed protocols (h2/h3):
+    %% a cap on concurrent live stream-worker processes across the whole
+    %% listener, independent of `max_clients` and `max_concurrent_streams`.
+    %% `infinity` (default) disables it. `inflight_counter` is the live
+    %% gauge (acquired before a worker spawns, released on its `DOWN`);
+    %% `throttled_counter` is the cumulative count of streams refused at
+    %% the ceiling. h1 is bounded by `max_clients` and does not use these.
+    max_concurrent_requests := infinity | pos_integer(),
+    inflight_counter := counters:counters_ref(),
+    throttled_counter := atomics:atomics_ref(),
     min_bytes_per_second := non_neg_integer(),
     body_buffering := auto | manual,
     listener_name => atom(),
@@ -254,6 +267,56 @@ try_acquire_slot(#{client_counter := Ref, max_clients := Max}) ->
 -spec release_slot(proto_opts()) -> ok.
 release_slot(#{client_counter := Ref}) ->
     ok = counters:sub(Ref, 1, 1),
+    ok.
+
+-doc """
+Try to bump the live in-flight-request counter under
+`max_concurrent_requests`. Returns `true` if a worker may be spawned,
+`false` if the listener is already at the ceiling (caller must refuse the
+stream). `infinity` short-circuits to `true` with no counter touch, so an
+unconfigured listener pays nothing on the hot path.
+
+Same eventually-consistent overshoot contract as `try_acquire_slot/1`: the
+`counters` ref uses `write_concurrency`, so a brief read slightly above the
+cap is possible before rollbacks reconcile, bounded by in-flight admissions.
+Paired with `release_request_slot/1`, which must run exactly once per
+successfully-acquired worker (tie it to the worker monitor-ref removal so a
+worker is released by its `DOWN` or by the conn's clean exit, never both).
+""".
+-spec try_acquire_request_slot(proto_opts()) -> boolean().
+try_acquire_request_slot(#{max_concurrent_requests := infinity}) ->
+    true;
+try_acquire_request_slot(#{inflight_counter := Ref, max_concurrent_requests := Max}) ->
+    ok = counters:add(Ref, 1, 1),
+    case counters:get(Ref, 1) of
+        N when N =< Max ->
+            true;
+        _ ->
+            ok = counters:sub(Ref, 1, 1),
+            false
+    end.
+
+-doc "Decrement the in-flight-request counter, paired with `try_acquire_request_slot/1`.".
+-spec release_request_slot(proto_opts()) -> ok.
+release_request_slot(#{max_concurrent_requests := infinity}) ->
+    ok;
+release_request_slot(#{inflight_counter := Ref}) ->
+    ok = counters:sub(Ref, 1, 1),
+    ok.
+
+-doc """
+Release `N` in-flight slots at once. Used by the conn clean-exit path to
+account for stream workers still live at teardown (each held one slot), so
+their slots are not leaked until the listener restarts. `N = 0` and
+`infinity` are no-ops.
+""".
+-spec release_request_slots(proto_opts(), non_neg_integer()) -> ok.
+release_request_slots(_ProtoOpts, 0) ->
+    ok;
+release_request_slots(#{max_concurrent_requests := infinity}, _N) ->
+    ok;
+release_request_slots(#{inflight_counter := Ref}, N) ->
+    ok = counters:sub(Ref, 1, N),
     ok.
 
 -doc false.

@@ -578,6 +578,20 @@ listener_info_initial_zero_test() ->
     ?assertEqual(42, maps:get(max_clients, Info)),
     ?assertEqual(0, maps:get(requests_served, Info)),
     ?assertEqual(0, maps:get(rejected, Info)),
+    %% `max_concurrent_requests` defaults to `infinity` (off); the
+    %% cumulative `throttled` gauge starts at zero.
+    ?assertEqual(infinity, maps:get(max_concurrent_requests, Info)),
+    ?assertEqual(0, maps:get(throttled, Info)),
+    ok = roadrunner_listener:stop(Name).
+
+listener_info_reports_configured_max_concurrent_requests_test() ->
+    Name = listener_test_info_mcr,
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0, max_concurrent_requests => 256, routes => roadrunner_hello_handler
+    }),
+    Info = roadrunner_listener:info(Name),
+    ?assertEqual(256, maps:get(max_concurrent_requests, Info)),
+    ?assertEqual(0, maps:get(throttled, Info)),
     ok = roadrunner_listener:stop(Name).
 
 over_cap_connection_rejected_fires_event_and_counts_test() ->

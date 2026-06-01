@@ -101,10 +101,25 @@ dynamic-table memory to bound yet.
 |---|---|---|---|
 | `socket_backlog` | 1024 | yes | TCP listen backlog (kernel SYN/accept queue depth) |
 | `max_clients` | 150 | yes | concurrent connection cap per listener |
+| `max_concurrent_requests` | `infinity` | yes | concurrent in-flight request cap per listener (HTTP/2 and HTTP/3) |
 | `request_timeout` | 30 s | yes | header-read timeout on a fresh connection |
 | `keep_alive_timeout` | 60 s | yes | idle timeout between requests |
 | `max_keep_alive_requests` | 1000 | yes | requests served per connection before close |
 | `min_bytes_per_second` | 100 | yes (0 disables) | slow-loris guard on the request-read phase |
+
+`max_clients` bounds connections and the HTTP/2 / HTTP/3
+`max_concurrent_streams` bounds streams per connection, but their product
+(the worst-case number of concurrent handler processes) is otherwise
+unbounded. A high `max_clients`, set for burst tolerance, can let
+concurrent handler memory grow without limit under heavy multiplexing.
+`max_concurrent_requests` caps that product directly: a listener-wide
+ceiling on live handler processes for the multiplexed protocols. Over the
+ceiling, a new HTTP/2 or HTTP/3 stream is refused with `REFUSED_STREAM` /
+`H3_REQUEST_REJECTED` (both retry-safe per RFC 9113 §8.7) before any
+handler runs, and the refusal emits `[roadrunner, request, throttled]` and
+increments the `throttled` count from `roadrunner_listener:info/1`. HTTP/1
+is unaffected: it serves one request per connection, so `max_clients`
+already bounds it.
 
 ## Configuring
 

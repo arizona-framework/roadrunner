@@ -86,6 +86,8 @@ all_test_() ->
         fun handler_returning_invalid_shape_resets_stream/0,
         fun unrelated_down_ignored/0,
         fun over_max_concurrent_streams_refused/0,
+        fun over_inflight_ceiling_refused_and_throttled/0,
+        fun reset_stream_releases_inflight_slot/0,
         fun rst_during_stream_response_unwinds_worker/0,
         fun drain_with_no_streams_exits_immediately/0,
         fun drain_refuses_new_streams/0,
@@ -366,6 +368,7 @@ concurrent_streams_both_dispatch() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_concurrent_test,
         dispatch =>
@@ -431,6 +434,7 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         requests_counter => RequestsCounter,
         rejected_counter => atomics:new(1, [{signed, false}]),
@@ -484,6 +488,7 @@ plaintext_listener_without_h2c_stays_h1() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         requests_counter => RequestsCounter,
         rejected_counter => atomics:new(1, [{signed, false}]),
@@ -1077,6 +1082,7 @@ middleware_chain_runs() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_mw_test,
         dispatch =>
@@ -1141,6 +1147,7 @@ router_404_returns_not_found() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_404_listener,
         dispatch => {router, h2_404_listener},
@@ -1846,6 +1853,140 @@ over_max_concurrent_streams_refused() ->
         roadrunner_http2_frame:parse(Rst, 16384),
     cleanup(Pid, Ref).
 
+over_inflight_ceiling_refused_and_throttled() ->
+    %% Listener-wide in-flight ceiling of 1. The first complete request
+    %% dispatches a long-lived `{loop, _}` worker that holds the only slot;
+    %% the second complete request is refused with RST_STREAM(refused_stream),
+    %% bumps the `throttled_counter`, and emits `[roadrunner, request,
+    %% throttled]`. Releasing the worker frees the slot again.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    Self = self(),
+    HandlerId = make_ref(),
+    ok = telemetry:attach(
+        HandlerId,
+        [roadrunner, request, throttled],
+        fun(Event, M, Md, _) -> Self ! {ev, Event, M, Md} end,
+        undefined
+    ),
+    Inflight = counters:new(1, [write_concurrency]),
+    Throttled = atomics:new(1, [{signed, false}]),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{
+        max_concurrent_requests => 1,
+        inflight_counter => Inflight,
+        throttled_counter => Throttled,
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined}
+    }),
+    try
+        _ = expect_send(),
+        serve_recv(ConnPid, ?PREFACE),
+        serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        %% Stream 1: GET /loop — the handler registers itself and parks,
+        %% so its worker stays alive holding the single in-flight slot.
+        serve_recv(ConnPid, complete_get_headers(1, ~"/loop")),
+        _ = wait_for_register(roadrunner_h2_loop_test, 1000),
+        _ = drain_send(50),
+        ?assertEqual(1, counters:get(Inflight, 1)),
+        %% Stream 3: a second complete request is over the ceiling.
+        serve_recv(ConnPid, complete_get_headers(3, ~"/empty")),
+        Rst = expect_send(),
+        ?assertMatch(
+            {ok, {rst_stream, 3, refused_stream}, _},
+            roadrunner_http2_frame:parse(Rst, 16384)
+        ),
+        ?assertEqual(1, atomics:get(Throttled, 1)),
+        receive
+            {ev, [roadrunner, request, throttled], M, Md} ->
+                ?assert(is_integer(maps:get(system_time, M))),
+                ?assertEqual(http2_test, maps:get(listener_name, Md)),
+                ?assertEqual(max_concurrent_requests, maps:get(reason, Md))
+        after 1000 -> error(no_throttled_event)
+        end,
+        %% The slot is still held by the parked loop worker.
+        ?assertEqual(1, counters:get(Inflight, 1)),
+        %% Stop the loop worker; its `DOWN` releases the slot.
+        roadrunner_h2_loop_test ! stop,
+        ok = wait_inflight(Inflight, 0, 50)
+    after
+        telemetry:detach(HandlerId),
+        cleanup(Pid, Ref)
+    end.
+
+reset_stream_releases_inflight_slot() ->
+    %% A peer RST_STREAM for a dispatched stream must release the in-flight
+    %% slot the worker held. `reset_stream/2` demonitors the worker (so no
+    %% `DOWN` fires) and drops the worker ref, so without an explicit release
+    %% on that path the slot leaks: the gauge would never return to 0 and a
+    %% later request would be wrongly refused.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    Inflight = counters:new(1, [write_concurrency]),
+    Throttled = atomics:new(1, [{signed, false}]),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{
+        max_concurrent_requests => 1,
+        inflight_counter => Inflight,
+        throttled_counter => Throttled,
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined}
+    }),
+    try
+        _ = expect_send(),
+        serve_recv(ConnPid, ?PREFACE),
+        serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        %% Stream 1: a long-lived `/loop` worker takes the only slot.
+        serve_recv(ConnPid, complete_get_headers(1, ~"/loop")),
+        _ = wait_for_register(roadrunner_h2_loop_test, 1000),
+        _ = drain_send(50),
+        ?assertEqual(1, counters:get(Inflight, 1)),
+        %% Peer cancels stream 1. `reset_stream/2` tears the worker down
+        %% and must free the slot.
+        Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
+        serve_recv(ConnPid, Rst),
+        ok = wait_inflight(Inflight, 0, 50),
+        %% The slot is genuinely free again: stream 3 is admitted (worker
+        %% spawns), not refused.
+        serve_recv(ConnPid, complete_get_headers(3, ~"/empty")),
+        _ = drain_send(100),
+        ?assertEqual(0, atomics:get(Throttled, 1))
+    after
+        cleanup(Pid, Ref)
+    end.
+
+%% Build a complete (END_HEADERS + END_STREAM) GET HEADERS frame for `Path`
+%% on `StreamId`, so dispatch fires immediately (no body to wait for).
+complete_get_headers(StreamId, Path) ->
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", Path}
+        ],
+        Enc
+    ),
+    iolist_to_binary(
+        roadrunner_http2_frame:encode(
+            {headers, StreamId, 16#04 bor 16#01, undefined, iolist_to_binary(Hpack)}
+        )
+    ).
+
+wait_inflight(_Ref, _Want, 0) ->
+    error(inflight_never_reached);
+wait_inflight(Ref, Want, Tries) ->
+    case counters:get(Ref, 1) of
+        Want ->
+            ok;
+        _ ->
+            timer:sleep(20),
+            wait_inflight(Ref, Want, Tries - 1)
+    end.
+
 rst_during_stream_response_unwinds_worker() ->
     %% A `{stream, _}` handler pauses mid-response. Peer sends
     %% RST_STREAM during the pause. Conn's `reset_stream/2` tells
@@ -1863,6 +2004,7 @@ rst_during_stream_response_unwinds_worker() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_rst_during_stream,
         dispatch =>
@@ -1943,6 +2085,7 @@ drain_refuses_new_streams() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_drain_test,
         dispatch =>
@@ -1998,6 +2141,7 @@ drain_with_in_flight_stream_waits() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_drain_inflight_test,
         dispatch =>
@@ -2060,6 +2204,7 @@ drain_message_is_idempotent() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_drain_dup_test,
         dispatch =>
@@ -2112,6 +2257,7 @@ drain_then_peer_rst_exits_via_frame_loop() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_drain_rst_test,
         dispatch =>
@@ -2207,6 +2353,7 @@ telemetry_request_stop_fires_for_router_404() ->
         ProtoOpts = #{
             handler_spawn_opts => [{fullsweep_after, 0}],
             handler_start_timeout => infinity,
+            max_concurrent_requests => infinity,
             client_counter => Counter,
             listener_name => h2_telem_404,
             dispatch => {router, h2_telem_404},
@@ -2290,6 +2437,7 @@ run_h2_with_compress_middleware(Path, ExtraHeaders) ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_compress_test,
         dispatch =>
@@ -3028,6 +3176,7 @@ post_handshake_handler(Handler) ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_strict_test,
         dispatch => {handler, Handler, fun Handler:handle/1, undefined},
@@ -3153,6 +3302,7 @@ start_http2_conn(Extra) ->
     %% (e.g. `hibernate_after` for the idle-hibernation tests).
     ProtoOpts = maps:merge(
         #{
+            max_concurrent_requests => infinity,
             client_counter => Counter,
             listener_name => http2_test,
             handler_spawn_opts => [{fullsweep_after, 0}],
@@ -3282,6 +3432,7 @@ run_h2_request_with_handler(Handler, Path) ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_handler_test,
         dispatch => {handler, Handler, fun Handler:handle/1, undefined},
@@ -3340,6 +3491,7 @@ run_stream_request(Path, PrefaceSettings) ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_stream_test,
         dispatch =>

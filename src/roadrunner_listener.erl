@@ -44,6 +44,7 @@ All duration and interval values in `opts()` are in milliseconds —
 -define(DEFAULT_NUM_ACCEPTORS, 10).
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
 -define(DEFAULT_MAX_CLIENTS, 150).
+-define(DEFAULT_MAX_CONCURRENT_REQUESTS, infinity).
 -define(DEFAULT_MIN_BYTES_PER_SECOND, 100).
 %% TCP listen backlog (kernel SYN/accept queue depth). OTP defaults to 5,
 %% which a burst of concurrent connects overflows; 1024 matches cowboy.
@@ -120,6 +121,19 @@ Optional middleware and timing knobs (durations in milliseconds):
   `[roadrunner, listener, conn_rejected]` and increments the `rejected`
   count from `info/1`, so a rising `rejected` is the signal that the
   cap is the binding limit.
+- `max_concurrent_requests` — cap on concurrent in-flight requests
+  (live handler processes) across the whole listener, for the
+  multiplexed protocols (HTTP/2 and HTTP/3). Default `infinity` (off).
+  `max_clients` bounds connections and `max_concurrent_streams` bounds
+  streams per connection, but their product (the worst-case live-handler
+  count) is otherwise unbounded; a high `max_clients` set for burst
+  tolerance can let concurrent handler memory grow without limit under
+  heavy multiplexing. This caps the product directly. Over-limit streams
+  are refused with `REFUSED_STREAM` (h2) / `H3_REQUEST_REJECTED` (h3),
+  which RFC 9113 §8.7 marks safe to retry; each refusal emits
+  `[roadrunner, request, throttled]` and increments the `throttled`
+  count from `info/1`. HTTP/1 is unaffected (one request per connection,
+  already bounded by `max_clients`).
 - `socket_backlog` — TCP listen backlog (kernel SYN/accept queue
   depth). Default 1024. Raise it for connection bursts (load tests,
   health-check storms); Linux clamps the effective value at
@@ -177,6 +191,7 @@ ops-tuning rationale.
     num_acceptors => pos_integer(),
     max_keep_alive_requests => pos_integer(),
     max_clients => pos_integer(),
+    max_concurrent_requests => infinity | pos_integer(),
     socket_backlog => pos_integer(),
     min_bytes_per_second => non_neg_integer(),
     %% How often `reading_request` re-checks the running
@@ -508,6 +523,12 @@ Return runtime introspection for a listener:
   listener was at its `max_clients` cap when they arrived. A rising
   `rejected` means the cap is the binding limit and should be raised.
   Also emitted in real time as `[roadrunner, listener, conn_rejected]`.
+- `max_concurrent_requests` — the configured in-flight ceiling
+  (`infinity` when off).
+- `throttled` — cumulative count of streams refused because the listener
+  was at its `max_concurrent_requests` ceiling. A rising `throttled`
+  means the in-flight cap is binding. Also emitted in real time as
+  `[roadrunner, request, throttled]`.
 
 Useful for ops dashboards / health endpoints.
 """.
@@ -516,7 +537,9 @@ Useful for ops dashboards / health endpoints.
         active_clients := non_neg_integer(),
         max_clients := pos_integer(),
         requests_served := non_neg_integer(),
-        rejected := non_neg_integer()
+        rejected := non_neg_integer(),
+        max_concurrent_requests := infinity | pos_integer(),
+        throttled := non_neg_integer()
     }.
 info(Name) ->
     gen_server:call(Name, info).
@@ -911,6 +934,13 @@ build_proto_opts(Opts, ListenerName) ->
     ClientCounter = counters:new(1, [write_concurrency]),
     RequestsCounter = atomics:new(1, [{signed, false}]),
     RejectedCounter = atomics:new(1, [{signed, false}]),
+    %% `inflight_counter` is the live in-flight-request gauge (h2/h3 stream
+    %% workers acquire before spawn, release on `DOWN`), same lock-free
+    %% `write_concurrency` shape as `client_counter`. `throttled_counter`
+    %% is the cumulative count of streams refused at the
+    %% `max_concurrent_requests` ceiling, mirroring `rejected_counter`.
+    InflightCounter = counters:new(1, [write_concurrency]),
+    ThrottledCounter = atomics:new(1, [{signed, false}]),
     %% Public `ws` opts are a nested map; flatten to the `ws_*`
     %% proto_opts keys the hot path reads, mirroring the `{http2, #{}}`
     %% → `http2_*` flattening above.
@@ -933,9 +963,13 @@ build_proto_opts(Opts, ListenerName) ->
             max_keep_alive_requests =>
                 maps:get(max_keep_alive_requests, Opts, ?DEFAULT_MAX_KEEP_ALIVE),
             max_clients => maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
+            max_concurrent_requests =>
+                maps:get(max_concurrent_requests, Opts, ?DEFAULT_MAX_CONCURRENT_REQUESTS),
             client_counter => ClientCounter,
             requests_counter => RequestsCounter,
             rejected_counter => RejectedCounter,
+            inflight_counter => InflightCounter,
+            throttled_counter => ThrottledCounter,
             min_bytes_per_second =>
                 maps:get(min_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
             body_buffering => maps:get(body_buffering, Opts, auto),
@@ -1365,13 +1399,17 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
         client_counter := ClientCounter,
         requests_counter := RequestsCounter,
         rejected_counter := RejectedCounter,
-        max_clients := MaxClients
+        throttled_counter := ThrottledCounter,
+        max_clients := MaxClients,
+        max_concurrent_requests := MaxConcurrentRequests
     } = ProtoOpts,
     Reply = #{
         active_clients => counters:get(ClientCounter, 1),
         max_clients => MaxClients,
         requests_served => atomics:get(RequestsCounter, 1),
-        rejected => atomics:get(RejectedCounter, 1)
+        rejected => atomics:get(RejectedCounter, 1),
+        max_concurrent_requests => MaxConcurrentRequests,
+        throttled => atomics:get(ThrottledCounter, 1)
     },
     {reply, Reply, State}.
 

@@ -2129,3 +2129,44 @@ parse_error_status_other_is_400_test() ->
     ?assertEqual(400, roadrunner_conn:parse_error_status(bad_request_line)),
     ?assertEqual(400, roadrunner_conn:parse_error_status(bad_version)),
     ?assertEqual(400, roadrunner_conn:parse_error_status(missing_host)).
+
+%% =============================================================================
+%% try_acquire_request_slot/1 + release_request_slot[s] — pure unit tests
+%% =============================================================================
+
+request_slot_infinity_is_noop_test() ->
+    %% `infinity` short-circuits before touching any counter, so the map
+    %% needs no `inflight_counter`. Acquire always succeeds; release is a
+    %% no-op.
+    Opts = #{max_concurrent_requests => infinity},
+    ?assert(roadrunner_conn:try_acquire_request_slot(Opts)),
+    ?assert(roadrunner_conn:try_acquire_request_slot(Opts)),
+    ?assertEqual(ok, roadrunner_conn:release_request_slot(Opts)),
+    ?assertEqual(ok, roadrunner_conn:release_request_slots(Opts, 5)).
+
+request_slot_admits_up_to_cap_then_refuses_test() ->
+    Ref = counters:new(1, [write_concurrency]),
+    Opts = #{max_concurrent_requests => 2, inflight_counter => Ref},
+    %% Two admits up to the cap, the third is refused and rolls back so the
+    %% gauge stays at the cap.
+    ?assert(roadrunner_conn:try_acquire_request_slot(Opts)),
+    ?assert(roadrunner_conn:try_acquire_request_slot(Opts)),
+    ?assertNot(roadrunner_conn:try_acquire_request_slot(Opts)),
+    ?assertEqual(2, counters:get(Ref, 1)),
+    %% Releasing one frees a slot; the next acquire succeeds again.
+    ?assertEqual(ok, roadrunner_conn:release_request_slot(Opts)),
+    ?assertEqual(1, counters:get(Ref, 1)),
+    ?assert(roadrunner_conn:try_acquire_request_slot(Opts)),
+    ?assertEqual(2, counters:get(Ref, 1)).
+
+request_slot_release_many_test() ->
+    Ref = counters:new(1, [write_concurrency]),
+    Opts = #{max_concurrent_requests => 10, inflight_counter => Ref},
+    [?assert(roadrunner_conn:try_acquire_request_slot(Opts)) || _ <- lists:seq(1, 4)],
+    ?assertEqual(4, counters:get(Ref, 1)),
+    %% Bulk release (conn teardown with N live workers) drops the gauge by N;
+    %% N = 0 is a no-op.
+    ?assertEqual(ok, roadrunner_conn:release_request_slots(Opts, 0)),
+    ?assertEqual(4, counters:get(Ref, 1)),
+    ?assertEqual(ok, roadrunner_conn:release_request_slots(Opts, 4)),
+    ?assertEqual(0, counters:get(Ref, 1)).

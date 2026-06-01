@@ -128,6 +128,7 @@ request_rejected_event_fires_on_bad_request_line_test() ->
             keep_alive_timeout => 200,
             max_keep_alive_requests => 100,
             max_clients => 10,
+            max_concurrent_requests => infinity,
             client_counter => counters:new(1, [write_concurrency]),
             requests_counter => atomics:new(1, [{signed, false}]),
             rejected_counter => atomics:new(1, [{signed, false}]),
