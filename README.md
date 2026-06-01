@@ -7,7 +7,7 @@
 
 ![roadrunner logo](https://raw.githubusercontent.com/arizona-framework/roadrunner/main/assets/logo.jpg)
 
-Pure-Erlang HTTP/1.1 + HTTP/2 + HTTP/3 + WebSocket server for OTP 29+.
+Pure-Erlang HTTP/1.1 + HTTP/2 + HTTP/3 + WebSocket server for Erlang/OTP.
 **Built for low tail latency at sustained load.** Beep beep.
 
 Roadrunner is the HTTP backbone of the
@@ -24,7 +24,7 @@ lifecycle observability.
 
 ## Requirements
 
-Requires **OTP 29 or newer**.
+Requires **OTP 27+**.
 
 ## 🚧 Status
 

@@ -156,7 +156,7 @@ telemetry_metadata(#{
 -spec emit_handler_response(pid(), non_neg_integer(), module(), roadrunner_handler:response()) ->
     roadrunner_http:status().
 emit_handler_response(Conn, StreamId, _Handler, {Status, Headers, Body}) when
-    is_integer(Status, 100, 599)
+    is_integer(Status), Status >= 100, Status =< 599
 ->
     emit_checked(Conn, StreamId, Headers, fun() ->
         send_buffered(Conn, StreamId, Status, Headers, Body),

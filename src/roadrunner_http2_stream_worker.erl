@@ -163,15 +163,15 @@ telemetry_metadata(#{
     }.
 
 emit_handler_response(ConnPid, StreamId, _Handler, {Status, Headers, Body}) when
-    is_integer(Status, 100, 599)
+    is_integer(Status), Status >= 100, Status =< 599
 ->
     send_buffered(ConnPid, StreamId, Status, Headers, Body);
 emit_handler_response(ConnPid, StreamId, _Handler, {stream, Status, Headers, Fun}) when
-    is_integer(Status, 100, 599), is_function(Fun, 1)
+    is_integer(Status), Status >= 100, Status =< 599, is_function(Fun, 1)
 ->
     roadrunner_http2_stream_response:run(ConnPid, StreamId, Status, Headers, Fun);
 emit_handler_response(ConnPid, StreamId, Handler, {loop, Status, Headers, State}) when
-    is_integer(Status, 100, 599)
+    is_integer(Status), Status >= 100, Status =< 599
 ->
     %% Mirrors h1's `{loop, _}` path: enter a selective-receive loop
     %% in the worker (sharing the handler's mailbox), dispatch each
@@ -183,7 +183,7 @@ emit_handler_response(ConnPid, StreamId, Handler, {loop, Status, Headers, State}
     );
 emit_handler_response(
     ConnPid, StreamId, _Handler, {sendfile, Status, Headers, {File, Offset, Length}}
-) when is_integer(Status, 100, 599) ->
+) when is_integer(Status), Status >= 100, Status =< 599 ->
     %% h2 has no kernel sendfile path. Wrap the file-read loop in a
     %% stream_fun so the existing streaming machinery handles
     %% HEADERS, DATA framing, MAX_FRAME_SIZE chunking, and per-stream

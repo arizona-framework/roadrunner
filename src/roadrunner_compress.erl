@@ -78,10 +78,10 @@ call(Req, Next) ->
 
 -spec transform(roadrunner_req:request(), roadrunner_handler:response()) ->
     roadrunner_handler:response().
-transform(Req, {Status, Headers, Body}) when is_integer(Status, 100, 599) ->
+transform(Req, {Status, Headers, Body}) when is_integer(Status), Status >= 100, Status =< 599 ->
     transform_buffered(Req, Status, Headers, Body);
 transform(Req, {stream, Status, Headers, Fun}) when
-    is_integer(Status, 100, 599), is_function(Fun, 1)
+    is_integer(Status), Status >= 100, Status =< 599, is_function(Fun, 1)
 ->
     transform_stream(Req, Status, Headers, Fun);
 transform(_Req, Other) ->

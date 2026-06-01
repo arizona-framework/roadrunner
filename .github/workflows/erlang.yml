@@ -151,9 +151,14 @@ jobs:
       - name: Run dialyzer
         run: make dialyzer
 
-  # eunit + ct + the 100 % coverage gate. The gate sums the eunit and ct
-  # coverdata (the suite deliberately splits coverage between them), so all
-  # three must run in one job to share `_build/test/cover/`.
+  # eunit + ct + the 100 % coverage gate on the primary OTP (the
+  # `.tool-versions` dev/CI target). The gate sums the eunit and ct coverdata
+  # (the suite deliberately splits coverage between them), so all three steps
+  # stay in one job to share `_build/test/cover/`. Coverage is intentionally
+  # gated on this version ONLY: which lines a run reaches varies by OTP (e.g.
+  # version-specific guard / library branches), so a 100 % bar across older
+  # runtimes would flap; the older versions run the suite without the gate
+  # below.
   test:
     name: Test
 
@@ -176,50 +181,92 @@ jobs:
       - name: Coverage gate (100 %)
         run: make cover
 
-  # HTTP/2 conformance — backs the README "h2spec strict 100 %" claim.
-  # Runs in parallel with the quality jobs so a lint/fmt issue doesn't block
-  # the conformance signal.
-  h2spec:
-    name: h2spec (HTTP/2 conformance)
-
-    needs: cache-erlang
+  # The same eunit + ct suite on the older supported OTP releases, to prove
+  # behaviour holds on every version the `minimum_otp_vsn` floor claims. No
+  # coverage gate here (coverage is version-specific, see Test above) and no
+  # shared cache (it's keyed on the primary OTP), so these are self-contained
+  # and can't perturb the single-version pipeline. 29 is covered by Test.
+  test-older-otp:
+    name: Test (OTP ${{ matrix.otp }})
 
     runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ["27", "28"]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: ./.github/actions/setup-erlang
+      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24
         with:
-          build-cache-key: ${{ needs.cache-erlang.outputs.build-cache-key }}
-          build-cache-prefix: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
-          rebar-cache-key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
+          otp-version: ${{ matrix.otp }}
+          rebar3-version: "3"
+
+      - name: Compile
+        run: rebar3 as test compile
+
+      - name: Run eunit + ct
+        run: make eunit ct
+
+  # HTTP/2 conformance — backs the README "h2spec strict 100 %" claim, on
+  # every supported OTP (h2 framing behaviour can shift with the runtime).
+  # Self-contained per matrix version like Test; `h2spec.sh` already retries
+  # to absorb the §5.1 timing flake without masking a real regression. Runs
+  # in parallel with the quality jobs so a lint/fmt issue doesn't block the
+  # conformance signal.
+  h2spec:
+    name: h2spec (OTP ${{ matrix.otp }})
+
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ["27", "28", "29"]
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24
+        with:
+          otp-version: ${{ matrix.otp }}
+          rebar3-version: "3"
+
+      - name: Compile test profile
+        run: rebar3 as test compile
 
       - name: Run h2spec strict
         run: ./scripts/h2spec.sh
 
   # WebSocket conformance — backs the README "Autobahn fuzzingclient
-  # strict 100 %" claim. Slow (~5 min) — runs only on push to main,
-  # merge_group, and manual dispatch, not every PR. Use
-  # `workflow_dispatch` to trigger on a feature branch when WS code
-  # is touched.
+  # strict 100 %" claim, on every supported OTP. Slow (~5 min/version) —
+  # runs only on push to main, merge_group, and manual dispatch, not every
+  # PR. Use `workflow_dispatch` to trigger on a feature branch when WS code
+  # is touched. Self-contained per matrix version like Test / h2spec.
   autobahn:
-    name: autobahn (WebSocket conformance)
-
-    needs: cache-erlang
+    name: autobahn (OTP ${{ matrix.otp }})
 
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
 
     runs-on: ubuntu-24.04
 
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ["27", "28", "29"]
+
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: ./.github/actions/setup-erlang
+      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24
         with:
-          build-cache-key: ${{ needs.cache-erlang.outputs.build-cache-key }}
-          build-cache-prefix: ${{ needs.cache-erlang.outputs.build-cache-prefix }}
-          rebar-cache-key: ${{ needs.cache-erlang.outputs.rebar-cache-key }}
+          otp-version: ${{ matrix.otp }}
+          rebar3-version: "3"
+
+      - name: Compile test profile
+        run: rebar3 as test compile
 
       - name: Run Autobahn fuzzingclient
         run: ./scripts/autobahn.escript

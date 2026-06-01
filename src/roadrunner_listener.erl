@@ -1037,7 +1037,9 @@ is_reserved_spawn_opt(_) -> false.
 
 validate_handler_start_timeout(infinity, _Raw) ->
     ok;
-validate_handler_start_timeout(Timeout, _Raw) when is_integer(Timeout, 0, 16#7FFFFFFF) ->
+validate_handler_start_timeout(Timeout, _Raw) when
+    is_integer(Timeout), Timeout >= 0, Timeout =< 16#7FFFFFFF
+->
     ok;
 validate_handler_start_timeout(_Timeout, Raw) ->
     error({invalid_listener_opt, handler_spawn, Raw}).
@@ -1178,7 +1180,7 @@ validate_http1_opts(Opts, Raw) ->
         fun(K, V, Acc) ->
             case is_map_key(K, Defaults) of
                 false -> error({invalid_listener_opt, protocols, Raw});
-                true when is_integer(V, 1, 16#7FFFFFFF) -> Acc#{K => V};
+                true when is_integer(V), V >= 1, V =< 16#7FFFFFFF -> Acc#{K => V};
                 true -> error({invalid_listener_opt, protocols, Raw})
             end
         end,
@@ -1225,7 +1227,7 @@ validate_http2_opts(Opts, Raw) ->
         fun(K, V, Acc) ->
             case is_map_key(K, Defaults) of
                 false -> error({invalid_listener_opt, protocols, Raw});
-                true when is_integer(V, 1, 16#7FFFFFFF) -> Acc#{K => V};
+                true when is_integer(V), V >= 1, V =< 16#7FFFFFFF -> Acc#{K => V};
                 true -> error({invalid_listener_opt, protocols, Raw})
             end
         end,
@@ -1276,7 +1278,7 @@ validate_http3_opts(Opts, Raw) ->
                 end,
             case is_map_key(K, Defaults) of
                 false -> error({invalid_listener_opt, protocols, Raw});
-                true when is_integer(V, 1, Max) -> Acc#{K => V};
+                true when is_integer(V), V >= 1, V =< Max -> Acc#{K => V};
                 true -> error({invalid_listener_opt, protocols, Raw})
             end
         end,
@@ -1317,7 +1319,7 @@ validate_ws_opts(Opts) when is_map(Opts) ->
         fun(K, V, Acc) ->
             case is_map_key(K, Defaults) of
                 false -> error({invalid_listener_opt, ws, Opts});
-                true when is_integer(V, 0, 16#7FFFFFFF) -> Acc#{K => V};
+                true when is_integer(V), V >= 0, V =< 16#7FFFFFFF -> Acc#{K => V};
                 true -> error({invalid_listener_opt, ws, Opts})
             end
         end,
