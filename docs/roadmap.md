@@ -147,6 +147,46 @@ own measurement before shipping.
 
 **Scope:** small.
 
+### Aggregate in-flight ceiling with backpressure — v0.4
+
+**What:** A per-listener cap on the *total* number of concurrent
+in-flight requests (live handler / stream-worker processes), enforced
+independently of `max_clients` and `max_concurrent_streams`. Today the
+worst-case live-handler count is the product of those two caps
+(`max_clients × max_concurrent_streams`), and nothing bounds the
+product itself: a deployment that raises `max_clients` for burst
+tolerance also, unintentionally, authorizes that many times the
+per-connection stream count of concurrent handler processes. Under
+adversarial or just high multiplexing that working set can grow until
+the box OOMs. The fix is a shared admission counter (incremented when a
+handler spawns, decremented on exit) plus backpressure when over the
+limit: h2/h3 refuse the new stream with `REFUSED_STREAM` (RFC 9113
+§8.7 explicitly allows this when the server cannot process the stream),
+h1 pauses the connection read until capacity frees up. A new listener
+opt (e.g. `max_concurrent_requests`, default `infinity` so existing
+behaviour is unchanged) plus a telemetry event mirroring the
+`max_clients` / `conn_rejected` pattern.
+
+**Why this and not a lower `max_concurrent_streams` default:**
+`max_concurrent_streams` is a *per-connection* parallelism limit;
+RFC 9113 §6.5.2 recommends keeping it at least 100 so a single client
+is not throttled when the server has capacity to serve it. Lowering it
+to bound aggregate memory is the wrong axis: it cripples legitimate
+per-connection multiplexing for everyone to limit total load. An
+aggregate ceiling bounds the actual unbounded quantity (total
+concurrent work) while leaving per-connection parallelism at the
+RFC default. (This came out of the HttpArena json-h2c run, where
+`max_clients = 65536` × 100 streams pinned a huge live-worker set; the
+honest fix is this ceiling, not a bench-shaped per-connection cap.)
+
+**Why deferred:** real feature scope across three protocols (the
+counter is simple, but each of h1/h2/h3 needs its own correct
+refuse-and-recover path with tests), and it trades peak throughput for
+safety, so it wants deliberate design and benchmarking rather than a
+rush. Targeted at v0.4.
+
+**Scope:** medium-to-large.
+
 ### h2 receive-window defaults
 
 **What:** Bump the listener's default receive-window peaks above the
