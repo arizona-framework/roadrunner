@@ -88,12 +88,16 @@ list, with the keys `max_concurrent_streams` and `max_header_block`.
 | Limit | Default | Configurable |
 |---|---|---|
 | Field section block (encoded HEADERS) | 16 KB | yes |
+| `initial_max_streams_bidi` | 100 | yes |
 
 The encoded request field section is capped before it reaches the
-handler; an overrun answers `431 Request Header Fields Too Large`. It is
-tuned under `{http3, #{...}}` in the `protocols` list, with the key
-`max_header_block`. QPACK runs static-table only, so there is no
-dynamic-table memory to bound yet.
+handler; an overrun answers `431 Request Header Fields Too Large`. The
+concurrent client-initiated bidirectional (request) stream count is
+advertised to the peer in the QUIC transport parameters, the h3
+counterpart to HTTP/2's `max_concurrent_streams`. Both are tuned under
+`{http3, #{...}}` in the `protocols` list, with the keys
+`max_header_block` and `max_streams_bidi`. QPACK runs static-table only,
+so there is no dynamic-table memory to bound yet.
 
 ## Connection and slow-client guards
 
@@ -134,7 +138,7 @@ roadrunner:start_listener(my_api, #{
     protocols => [
         {http1, #{max_header_count => 200}},
         {http2, #{max_concurrent_streams => 250, max_header_block => 32_768}},
-        {http3, #{max_header_block => 32_768}}
+        {http3, #{max_header_block => 32_768, max_streams_bidi => 250}}
     ],
     ws => #{max_frame_size => 1_048_576, max_message_size => 8_388_608}
 }).

@@ -464,7 +464,10 @@ listener_rejects_invalid_http3_opt_test() ->
             #{bogus_key => 1},
             #{max_header_block => 0},
             #{max_header_block => not_an_integer},
-            #{listeners => 16#80000000}
+            #{listeners => 16#80000000},
+            #{max_streams_bidi => 0},
+            #{max_streams_bidi => 16#80000000},
+            #{max_streams_bidi => not_an_integer}
         ]
     ).
 

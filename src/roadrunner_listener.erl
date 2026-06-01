@@ -397,10 +397,15 @@ HTTP/3 listener tunables (under `{http3, ThisMap}` in `protocols`).
   counterpart to the `{http1, ...}` / `{http2, ...}` `max_header_block`
   opts; the three are independent (h1 defaults to `10240`, h2/h3 to
   `16384`).
+- `max_streams_bidi` — cap on concurrent client-initiated bidirectional
+  (request) streams, advertised to the peer in the QUIC transport
+  parameters. Default `100`. The h3 counterpart to the `{http2, ...}`
+  `max_concurrent_streams` opt.
 """.
 -type http3_opts() :: #{
     listeners => 1..?MAX_H3_LISTENERS,
-    max_header_block => 1..16#7FFFFFFF
+    max_header_block => 1..16#7FFFFFFF,
+    max_streams_bidi => 1..16#7FFFFFFF
 }.
 
 -doc """
@@ -670,12 +675,13 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
             %% the probe (the pool listeners keep the port via reuseport).
             {QuicPort, Probe} = resolve_quic_port(Port),
             Listeners = maps:get(http3_listeners, ProtoOpts, ?DEFAULT_H3_LISTENERS),
+            MaxStreamsBidi = maps:get(http3_max_streams_bidi, ProtoOpts, ?H3_MAX_STREAMS_BIDI),
             Res = start_quic_pool(QuicPort, #{
                 cert => Cert,
                 key => Key,
                 cert_chain => CertChain,
                 alpn => [~"h3"],
-                max_streams_bidi => ?H3_MAX_STREAMS_BIDI,
+                max_streams_bidi => MaxStreamsBidi,
                 connection_handler => Handler,
                 pool_size => Listeners - 1
             }),
@@ -1261,7 +1267,11 @@ flatten_http2_opts(Entries) ->
 
 -spec http3_defaults() -> http3_opts().
 http3_defaults() ->
-    #{listeners => ?DEFAULT_H3_LISTENERS, max_header_block => 16384}.
+    #{
+        listeners => ?DEFAULT_H3_LISTENERS,
+        max_header_block => 16384,
+        max_streams_bidi => ?H3_MAX_STREAMS_BIDI
+    }.
 
 -spec validate_http3_opts(map(), term()) -> http3_opts().
 validate_http3_opts(Opts, Raw) ->
@@ -1269,11 +1279,13 @@ validate_http3_opts(Opts, Raw) ->
     maps:fold(
         fun(K, V, Acc) ->
             %% `listeners` caps at the reuseport-pool limit; `max_header_block`
-            %% is a byte size up to the 31-bit ceiling.
+            %% (a byte size) and `max_streams_bidi` (a stream count) go up to
+            %% the 31-bit ceiling.
             Max =
                 case K of
                     listeners -> ?MAX_H3_LISTENERS;
                     max_header_block -> 16#7FFFFFFF;
+                    max_streams_bidi -> 16#7FFFFFFF;
                     _ -> 0
                 end,
             case is_map_key(K, Defaults) of
@@ -1294,8 +1306,16 @@ flatten_http3_opts(Entries) ->
     case lists:keyfind(http3, 1, Entries) of
         false ->
             #{};
-        {http3, #{listeners := Listeners, max_header_block := MaxHeaderBlock}} ->
-            #{http3_listeners => Listeners, http3_max_header_block => MaxHeaderBlock}
+        {http3, #{
+            listeners := Listeners,
+            max_header_block := MaxHeaderBlock,
+            max_streams_bidi := MaxStreamsBidi
+        }} ->
+            #{
+                http3_listeners => Listeners,
+                http3_max_header_block => MaxHeaderBlock,
+                http3_max_streams_bidi => MaxStreamsBidi
+            }
     end.
 
 -spec ws_defaults() ->
