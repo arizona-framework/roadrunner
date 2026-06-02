@@ -228,6 +228,10 @@
     %% When > 0 and no streams are in flight, the idle-wait path parks
     %% for this window and hibernates. Read from proto_opts at `enter/5`.
     hibernate_after = 0 :: non_neg_integer(),
+    %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
+    %% Prepended to every response by `roadrunner_http:auto_headers/2`.
+    %% Read from proto_opts at `enter/5`.
+    alt_svc = undefined :: binary() | undefined,
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -283,6 +287,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
     MaxHeaderListSize = maps:get(http2_max_header_list_size, ProtoOpts, 2 * MaxHeaderBlock),
     MaxContentLength = maps:get(max_content_length, ProtoOpts, ?DEFAULT_MAX_CONTENT_LENGTH),
     HibernateAfter = maps:get(hibernate_after, ProtoOpts, 0),
+    AltSvc = maps:get(alt_svc, ProtoOpts, undefined),
     State = #loop{
         socket = Socket,
         proto_opts = ProtoOpts,
@@ -302,7 +307,8 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
         max_header_block = MaxHeaderBlock,
         max_header_list_size = MaxHeaderListSize,
         max_content_length = MaxContentLength,
-        hibernate_after = HibernateAfter
+        hibernate_after = HibernateAfter,
+        alt_svc = AltSvc
     },
     handshake(State).
 
@@ -1292,7 +1298,7 @@ encode_and_send_headers(
     %% h2 path matches h1's `encode_headers/1` discipline.
     ok = validate_headers(Headers),
     AllHeaders =
-        [{~":status", StatusBin} | roadrunner_http:auto_headers(Headers, State#loop.proto_opts)],
+        [{~":status", StatusBin} | roadrunner_http:auto_headers(Headers, State#loop.alt_svc)],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     %% `frame:encode` accepts iodata for the header block — skip
     %% the upfront flatten; ssl:send walks the iolist anyway.
@@ -1330,7 +1336,7 @@ encode_and_send_response_atomic(
     %% or split at an h2->h1 reverse proxy.
     ok = validate_headers(Headers),
     AllHeaders =
-        [{~":status", StatusBin} | roadrunner_http:auto_headers(Headers, State#loop.proto_opts)],
+        [{~":status", StatusBin} | roadrunner_http:auto_headers(Headers, State#loop.alt_svc)],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     HFrame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04, undefined, HpackBlock}

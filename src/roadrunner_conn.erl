@@ -938,7 +938,7 @@ response_kind({_, _, _}) -> buffered.
 %% shapes (stream / loop) are left to the handler, matching h1 (which
 %% strips only buffered + sendfile). Used by the h2 / h3 workers, which
 %% otherwise have no method-aware response step — h1 handles HEAD
-%% directly in `dispatch_response/5`.
+%% directly in `dispatch_response/4`.
 -doc false.
 -spec head_response(roadrunner_handler:response(), binary()) -> roadrunner_handler:response().
 head_response({sendfile, Status, Headers, _Spec}, ~"HEAD") ->
