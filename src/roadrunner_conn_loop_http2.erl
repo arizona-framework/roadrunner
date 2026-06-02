@@ -883,8 +883,19 @@ on_data(StreamId, Flags, Payload, #loop{streams = Streams, max_content_length = 
                 #{state := open, body := Body, body_len := Len, recv_window := RW} = Stream
         } ->
             PayloadLen = byte_size(Payload),
-            case Len + PayloadLen > MaxCL of
-                true ->
+            if
+                PayloadLen > State#loop.conn_recv_window ->
+                    %% RFC 9113 §6.9.1: more DATA than the connection-level
+                    %% receive window permits is a connection-level
+                    %% FLOW_CONTROL_ERROR.
+                    _ = send_goaway(State, flow_control_error),
+                    exit_clean(State);
+                PayloadLen > RW ->
+                    %% More DATA than the stream-level window permits is a
+                    %% stream-level FLOW_CONTROL_ERROR.
+                    _ = send_rst_stream(State, StreamId, flow_control_error),
+                    frame_loop(reset_stream(State, StreamId));
+                Len + PayloadLen > MaxCL ->
                     %% RFC 9113 §8.1: the request body exceeds
                     %% `max_content_length`. Answer 413 before the full
                     %% request, then RST_STREAM(NO_ERROR) to ask the client to
@@ -901,7 +912,7 @@ on_data(StreamId, Flags, Payload, #loop{streams = Streams, max_content_length = 
                     ),
                     _ = send_rst_stream(State1, StreamId, no_error),
                     frame_loop(remove_stream(State1, StreamId));
-                false ->
+                true ->
                     EndStream = (Flags band 16#01) =/= 0,
                     Stream1 = Stream#{
                         body := [Body, Payload],
