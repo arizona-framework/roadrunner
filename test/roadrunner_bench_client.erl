@@ -354,7 +354,7 @@ recv_h2_streams(Sock, Buf, Pending, Dec) ->
                 false ->
                     {error, no_status}
             end;
-        {ok, {data, Sid, F, _Payload}, Rest} ->
+        {ok, {data, Sid, F, _Payload, _FlowLen}, Rest} ->
             Pending1 =
                 case (F band 16#01) =/= 0 of
                     true -> maps:remove(Sid, Pending);
@@ -524,7 +524,7 @@ recv_h2_loop(Sock, Buf, Sid, Dec, Status, Headers, Body) ->
                 true -> {ok, NewStatus, NewHeaders, Body, Rest, Dec1};
                 false -> recv_h2_loop(Sock, Rest, Sid, Dec1, NewStatus, NewHeaders, Body)
             end;
-        {ok, {data, Sid, F, Payload}, Rest} ->
+        {ok, {data, Sid, F, Payload, _FlowLen}, Rest} ->
             Body1 = <<Body/binary, Payload/binary>>,
             case (F band 16#01) =/= 0 of
                 true -> {ok, Status, Headers, Body1, Rest, Dec};

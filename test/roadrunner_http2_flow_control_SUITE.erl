@@ -24,6 +24,7 @@ reuse / scheduling races.
     stream_window_update_overflow_triggers_rst_stream/1,
     inbound_data_over_stream_window_triggers_rst_stream/1,
     inbound_data_over_conn_window_triggers_goaway/1,
+    inbound_padded_data_counts_padding_against_window/1,
     window_update_for_unknown_stream_ignored/1,
     stream_window_update_grows_send_window/1,
     large_response_chunks_through_send_window/1,
@@ -54,6 +55,7 @@ all() ->
         stream_window_update_overflow_triggers_rst_stream,
         inbound_data_over_stream_window_triggers_rst_stream,
         inbound_data_over_conn_window_triggers_goaway,
+        inbound_padded_data_counts_padding_against_window,
         window_update_for_unknown_stream_ignored,
         stream_window_update_grows_send_window,
         large_response_chunks_through_send_window,
@@ -140,6 +142,27 @@ inbound_data_over_conn_window_triggers_goaway(_Config) ->
     expect_send_type(7),
     expect_close(),
     wait_down(Pid, Ref).
+
+inbound_padded_data_counts_padding_against_window(_Config) ->
+    %% RFC 9113 §6.9.1: the whole DATA payload (pad-length byte + padding)
+    %% is flow-controlled, not just the stripped body. A 5-byte body fits
+    %% the 10-byte stream window, but the padded frame is 14 bytes on the
+    %% wire (1 pad-length + 5 body + 8 padding), so it overruns the stream
+    %% window. Without counting the padding this frame would be accepted.
+    {Pid, Ref, ConnPid} = start_conn(roadrunner_hello_handler, #{http2_stream_window => 10}),
+    handshake(ConnPid),
+    HpackBin = encode_request_headers(~"POST", ~"/"),
+    serve_recv(ConnPid, encode_frame({headers, 1, 16#04, undefined, HpackBin})),
+    Body = binary:copy(<<"x">>, 5),
+    PadLen = 8,
+    Payload = <<PadLen:8, Body/binary, 0:(PadLen * 8)>>,
+    PaddedData = <<(byte_size(Payload)):24, 0, 16#08, 0:1, 1:31, Payload/binary>>,
+    serve_recv(ConnPid, PaddedData),
+    Rst = expect_send_type(3),
+    {ok, {rst_stream, 1, flow_control_error}, <<>>} =
+        roadrunner_http2_frame:parse(Rst, 16384),
+    true = is_process_alive(Pid),
+    cleanup(Pid, Ref).
 
 window_update_for_unknown_stream_ignored(_Config) ->
     %% WINDOW_UPDATE for a stream that's not currently open is

@@ -118,7 +118,12 @@
 -type settings_param() :: {ParamId :: non_neg_integer(), Value :: non_neg_integer()}.
 
 -type frame() ::
+    %% `encode/1` builds the 4-tuple DATA frame; `parse/2` yields the
+    %% 5-tuple form, where `FlowLen` is the on-wire payload size (the
+    %% pad-length byte + padding included) that RFC 9113 §6.9.1 counts
+    %% against the flow-control windows, distinct from the stripped body.
     {data, stream_id(), flags(), Payload :: iodata()}
+    | {data, stream_id(), flags(), Body :: binary(), FlowLen :: non_neg_integer()}
     | {headers, stream_id(), flags(), Priority :: priority() | undefined, HeaderBlock :: iodata()}
     | {priority, stream_id(), priority()}
     | {rst_stream, stream_id(), error_code()}
@@ -215,7 +220,10 @@ decode(?TYPE_DATA, _Flags, 0, _Payload) ->
     {error, stream_id_violation};
 decode(?TYPE_DATA, Flags, StreamId, Payload) ->
     case strip_padding(Flags, Payload) of
-        {ok, Body} -> {ok, {data, StreamId, Flags, Body}};
+        %% `byte_size(Payload)` is the full on-wire payload (pad-length
+        %% byte + padding included): the flow-controlled length per
+        %% RFC 9113 §6.9.1, kept distinct from the stripped `Body`.
+        {ok, Body} -> {ok, {data, StreamId, Flags, Body, byte_size(Payload)}};
         {error, _} = E -> E
     end;
 decode(?TYPE_HEADERS, _Flags, 0, _Payload) ->

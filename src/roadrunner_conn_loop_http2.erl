@@ -636,8 +636,8 @@ handle_frame({headers, StreamId, Flags, Priority, Fragment}, State) ->
     on_headers(StreamId, Flags, Priority, Fragment, State);
 handle_frame({continuation, StreamId, Flags, Fragment}, State) ->
     on_continuation(StreamId, Flags, Fragment, State);
-handle_frame({data, StreamId, Flags, Payload}, State) ->
-    on_data(StreamId, Flags, Payload, State);
+handle_frame({data, StreamId, Flags, Payload, FlowLen}, State) ->
+    on_data(StreamId, Flags, Payload, FlowLen, State);
 handle_frame({push_promise, _, _, _, _}, State) ->
     %% Servers MUST NOT receive PUSH_PROMISE — RFC 9113 §6.6.
     _ = send_goaway(State, protocol_error),
@@ -869,71 +869,81 @@ finalize_headers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) ->
 
 %% --- DATA ---
 
-on_data(StreamId, _Flags, _Payload, State) when StreamId > State#loop.last_stream_id ->
+on_data(StreamId, _Flags, _Payload, _FlowLen, State) when StreamId > State#loop.last_stream_id ->
     %% RFC 9113 §5.1: DATA on an idle stream is PROTOCOL_ERROR.
     _ = send_goaway(State, protocol_error),
     exit_clean(State);
-on_data(StreamId, _Flags, Payload, #loop{streams = Streams} = State) when
+on_data(StreamId, _Flags, _Payload, FlowLen, #loop{streams = Streams} = State) when
     not is_map_key(StreamId, Streams)
 ->
     %% RFC 9113 §6.1: DATA on a closed stream is STREAM_CLOSED. The bytes
     %% still consumed the peer's connection-level send window (§6.9.1);
-    %% return it since we're discarding them, so the conn window doesn't
-    %% drift down across stream resets.
+    %% return the full on-wire `FlowLen` (padding included) since we're
+    %% discarding them, so the conn window doesn't drift down across resets.
     _ = send_rst_stream(State, StreamId, stream_closed),
-    frame_loop(replenish_conn_window(State, byte_size(Payload)));
-on_data(StreamId, Flags, Payload, #loop{streams = Streams, max_content_length = MaxCL} = State) ->
+    frame_loop(replenish_conn_window(State, FlowLen));
+on_data(
+    StreamId, Flags, Payload, FlowLen, #loop{streams = Streams, max_content_length = MaxCL} = State
+) ->
     case Streams of
         #{
             StreamId :=
                 #{state := open, body := Body, body_len := Len, recv_window := RW} = Stream
         } ->
-            PayloadLen = byte_size(Payload),
+            %% Flow control charges the full on-wire `FlowLen` (RFC 9113
+            %% §6.9.1: pad-length byte + padding count). Past the window
+            %% gates, the body cap and buffering use the stripped `Payload`
+            %% the handler will see, so its length is only needed there.
             if
-                PayloadLen > State#loop.conn_recv_window ->
+                FlowLen > State#loop.conn_recv_window ->
                     %% RFC 9113 §6.9.1: more DATA than the connection-level
                     %% receive window permits is a connection-level
                     %% FLOW_CONTROL_ERROR.
                     _ = send_goaway(State, flow_control_error),
                     exit_clean(State);
-                PayloadLen > RW ->
+                FlowLen > RW ->
                     %% More DATA than the stream-level window permits is a
                     %% stream-level FLOW_CONTROL_ERROR.
                     _ = send_rst_stream(State, StreamId, flow_control_error),
                     frame_loop(reset_stream(State, StreamId));
-                Len + PayloadLen > MaxCL ->
-                    %% RFC 9113 §8.1: the request body exceeds
-                    %% `max_content_length`. Answer 413 before the full
-                    %% request, then RST_STREAM(NO_ERROR) to ask the client to
-                    %% stop sending the rest, and drop the stream (no worker
-                    %% was dispatched — dispatch is at END_STREAM).
-                    Resp = ~"Payload Too Large",
-                    State1 = encode_and_send_response_atomic(
-                        State,
-                        StreamId,
-                        413,
-                        [{~"content-type", ~"text/plain"}],
-                        Resp,
-                        byte_size(Resp)
-                    ),
-                    _ = send_rst_stream(State1, StreamId, no_error),
-                    frame_loop(remove_stream(State1, StreamId));
                 true ->
-                    EndStream = (Flags band 16#01) =/= 0,
-                    Stream1 = Stream#{
-                        body := [Body, Payload],
-                        body_len := Len + PayloadLen,
-                        end_stream_seen := EndStream,
-                        recv_window := RW - PayloadLen
-                    },
-                    State1 = State#loop{
-                        streams = Streams#{StreamId := Stream1},
-                        conn_recv_window = State#loop.conn_recv_window - PayloadLen
-                    },
-                    State2 = maybe_refill_recv_windows(State1, StreamId),
-                    case EndStream of
-                        true -> dispatch_stream(StreamId, State2);
-                        false -> frame_loop(State2)
+                    PayloadLen = byte_size(Payload),
+                    if
+                        Len + PayloadLen > MaxCL ->
+                            %% RFC 9113 §8.1: the request body exceeds
+                            %% `max_content_length`. Answer 413 before the
+                            %% full request, then RST_STREAM(NO_ERROR) to ask
+                            %% the client to stop sending the rest, and drop
+                            %% the stream (no worker was dispatched — dispatch
+                            %% is at END_STREAM).
+                            Resp = ~"Payload Too Large",
+                            State1 = encode_and_send_response_atomic(
+                                State,
+                                StreamId,
+                                413,
+                                [{~"content-type", ~"text/plain"}],
+                                Resp,
+                                byte_size(Resp)
+                            ),
+                            _ = send_rst_stream(State1, StreamId, no_error),
+                            frame_loop(remove_stream(State1, StreamId));
+                        true ->
+                            EndStream = (Flags band 16#01) =/= 0,
+                            Stream1 = Stream#{
+                                body := [Body, Payload],
+                                body_len := Len + PayloadLen,
+                                end_stream_seen := EndStream,
+                                recv_window := RW - FlowLen
+                            },
+                            State1 = State#loop{
+                                streams = Streams#{StreamId := Stream1},
+                                conn_recv_window = State#loop.conn_recv_window - FlowLen
+                            },
+                            State2 = maybe_refill_recv_windows(State1, StreamId),
+                            case EndStream of
+                                true -> dispatch_stream(StreamId, State2);
+                                false -> frame_loop(State2)
+                            end
                     end
             end;
         #{StreamId := _} ->
@@ -945,7 +955,7 @@ on_data(StreamId, Flags, Payload, #loop{streams = Streams, max_content_length = 
             %% delivered (which would also re-dispatch on a second
             %% END_STREAM).
             _ = send_rst_stream(State, StreamId, stream_closed),
-            frame_loop(replenish_conn_window(reset_stream(State, StreamId), byte_size(Payload)))
+            frame_loop(replenish_conn_window(reset_stream(State, StreamId), FlowLen))
     end.
 
 %% Return `N` bytes of connection-level receive window to the peer after
