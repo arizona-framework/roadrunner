@@ -22,6 +22,8 @@ reuse / scheduling races.
 -export([
     conn_window_update_overflow_triggers_goaway/1,
     stream_window_update_overflow_triggers_rst_stream/1,
+    inbound_data_over_stream_window_triggers_rst_stream/1,
+    inbound_data_over_conn_window_triggers_goaway/1,
     window_update_for_unknown_stream_ignored/1,
     stream_window_update_grows_send_window/1,
     large_response_chunks_through_send_window/1,
@@ -50,6 +52,8 @@ all() ->
     [
         conn_window_update_overflow_triggers_goaway,
         stream_window_update_overflow_triggers_rst_stream,
+        inbound_data_over_stream_window_triggers_rst_stream,
+        inbound_data_over_conn_window_triggers_goaway,
         window_update_for_unknown_stream_ignored,
         stream_window_update_grows_send_window,
         large_response_chunks_through_send_window,
@@ -106,6 +110,36 @@ stream_window_update_overflow_triggers_rst_stream(_Config) ->
     %% Conn stays alive — only the stream was reset.
     true = is_process_alive(Pid),
     cleanup(Pid, Ref).
+
+inbound_data_over_stream_window_triggers_rst_stream(_Config) ->
+    %% RFC 9113 §6.9.1: a DATA frame larger than the stream-level recv
+    %% window is a stream error. A tiny stream window (10) is overrun by
+    %% one 50-byte frame; the conn stays alive.
+    {Pid, Ref, ConnPid} = start_conn(roadrunner_hello_handler, #{http2_stream_window => 10}),
+    handshake(ConnPid),
+    HpackBin = encode_request_headers(~"POST", ~"/"),
+    serve_recv(ConnPid, encode_frame({headers, 1, 16#04, undefined, HpackBin})),
+    serve_recv(ConnPid, encode_frame({data, 1, 0, binary:copy(<<"x">>, 50)})),
+    expect_send_type(3),
+    true = is_process_alive(Pid),
+    cleanup(Pid, Ref).
+
+inbound_data_over_conn_window_triggers_goaway(_Config) ->
+    %% RFC 9113 §6.9.1: DATA exceeding the connection-level recv window
+    %% is a connection error. The conn window starts at 65535 and can
+    %% only grow, so disable refill (threshold 1) and stream four
+    %% max-size frames — the fourth overruns the drawn-down conn window.
+    {Pid, Ref, ConnPid} = start_conn(roadrunner_hello_handler, #{
+        http2_window_refill_threshold => 1
+    }),
+    handshake(ConnPid),
+    HpackBin = encode_request_headers(~"POST", ~"/"),
+    serve_recv(ConnPid, encode_frame({headers, 1, 16#04, undefined, HpackBin})),
+    Chunk = binary:copy(<<"x">>, 16384),
+    [serve_recv(ConnPid, encode_frame({data, 1, 0, Chunk})) || _ <- lists:seq(1, 4)],
+    expect_send_type(7),
+    expect_close(),
+    wait_down(Pid, Ref).
 
 window_update_for_unknown_stream_ignored(_Config) ->
     %% WINDOW_UPDATE for a stream that's not currently open is
@@ -347,18 +381,24 @@ blocked_send_idle_timeout_emits_goaway(_Config) ->
 %% `ConnPid` are the same process; the duplication mirrors the
 %% eunit suite's API for symmetry.
 start_conn(Handler) ->
+    start_conn(Handler, #{}).
+
+start_conn(Handler, Extra) ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
-        max_concurrent_requests => infinity,
-        client_counter => Counter,
-        listener_name => h2_flow_test,
-        dispatch => {handler, Handler, fun Handler:handle/1, undefined},
-        middlewares => [],
-        handler_spawn_opts => [{fullsweep_after, 0}],
-        handler_start_timeout => infinity
-    },
+    ProtoOpts = maps:merge(
+        #{
+            max_concurrent_requests => infinity,
+            client_counter => Counter,
+            listener_name => h2_flow_test,
+            dispatch => {handler, Handler, fun Handler:handle/1, undefined},
+            middlewares => [],
+            handler_spawn_opts => [{fullsweep_after, 0}],
+            handler_start_timeout => infinity
+        },
+        Extra
+    ),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive
