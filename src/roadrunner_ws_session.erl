@@ -466,7 +466,12 @@ process_parsed_frame(#data{socket = Socket} = Data1, Buf, Opts, MaybeTotalLen, H
         {more, _} ->
             arm_or_stop(Socket, Data1, hibernate_actions(HibernateAcc));
         {error, _} ->
-            {stop, normal, Data1}
+            %% RFC 6455 §5.5.1 / §7.4.1: a framing violation (bad opcode,
+            %% RSV, unmasked client frame, fragmented control, oversize
+            %% control, or a 64-bit length with the high bit set) is a
+            %% protocol error — send a 1002 Close before closing rather
+            %% than dropping the TCP connection silently.
+            close_with(close_protocol_error(), Data1)
     end.
 
 %% Hand the cached unmasked payload to `parse_frame` when (and only

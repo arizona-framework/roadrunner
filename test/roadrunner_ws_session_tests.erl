@@ -1225,6 +1225,64 @@ continuation_outside_message_closes_with_protocol_error_test() ->
     ?assertEqual(<<16#88, 2, 1002:16>>, Sent),
     Sink ! stop.
 
+unmasked_client_frame_closes_with_protocol_error_test() ->
+    %% RFC 6455 §5.1: a client frame without the MASK bit is a protocol
+    %% error. The session must send a 1002 Close, not drop TCP silently.
+    Self = self(),
+    Tag = make_ref(),
+    Unmasked = <<16#81, 5, "hello">>,
+    Sink = spawn_active_sink(Self, Tag, [{recv, Unmasked}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    ?assertEqual(<<16#88, 2, 1002:16>>, iolist_to_binary(collect_sends(Tag, 100))),
+    Sink ! stop.
+
+high_bit_64bit_length_closes_with_protocol_error_test() ->
+    %% RFC 6455 §5.2: a 64-bit extended length with the most significant
+    %% bit set is a protocol error (1002), not an oversize (1009).
+    Self = self(),
+    Tag = make_ref(),
+    BadLen = <<16#82, 16#FF, (1 bsl 63):64, 1, 2, 3, 4>>,
+    Sink = spawn_active_sink(Self, Tag, [{recv, BadLen}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    ?assertEqual(<<16#88, 2, 1002:16>>, iolist_to_binary(collect_sends(Tag, 100))),
+    Sink ! stop.
+
 oversized_single_frame_closes_with_1009_test() ->
     %% A single frame whose declared payload exceeds `ws_max_frame_size`
     %% is rejected with RFC 6455 §7.4 code 1009. Cap set to 10 bytes;
