@@ -26,10 +26,14 @@ tuned under `{http1, #{...}}` in the `protocols` list, with the keys
 `max_header_count`. A chunked body's trailer block obeys the same header
 caps and is rejected the same way.
 
-The body cap is enforced the same way for both `Content-Length` and
-`Transfer-Encoding: chunked` requests: the cap is checked as the body is
-read, so an oversized chunked body is rejected without buffering the
-whole thing.
+The body cap is enforced across all three protocols. For HTTP/1.1 it
+covers both `Content-Length` and `Transfer-Encoding: chunked` requests:
+the cap is checked as the body is read (a chunked body on its declared
+size line), so an oversized body is rejected without buffering the whole
+thing. HTTP/2 and HTTP/3 accumulate DATA frames against the same cap; an
+over-cap body answers `413 Payload Too Large` and resets the stream
+(`RST_STREAM(NO_ERROR)` on h2, `STOP_SENDING` on h3) so the client stops
+sending.
 
 ## WebSocket limits
 
