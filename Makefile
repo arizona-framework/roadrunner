@@ -21,10 +21,10 @@ help:
 	@echo "  lint          fmt-check + xref + hank + doc (CI Lint job)"
 	@echo "  xref / hank / dialyzer / eunit / ct / cover  individual rebar3 stages"
 	@echo ""
-	@echo "  bench         scripts/bench.escript (full closed-loop matrix)"
-	@echo "  bench-quick   scripts/bench.escript --scenario hello --duration 5 (smoke)"
+	@echo "  bench         scripts/bench_matrix.sh (full closed-loop matrix)"
+	@echo "  bench-quick   scripts/bench.escript --scenarios hello --duration 5 (smoke)"
 	@echo "  wrk2          scripts/wrk2_bench.sh (open-loop matrix, ~2-10h)"
-	@echo "  wrk2-quick    scripts/wrk2_bench.sh --quick --scenario hello"
+	@echo "  wrk2-quick    scripts/wrk2_bench.sh --quick --scenarios hello"
 	@echo "  h2spec        scripts/h2spec.sh"
 	@echo "  autobahn      scripts/autobahn.escript"
 	@echo "  redbot        scripts/redbot.escript"
@@ -76,13 +76,13 @@ bench:
 	./scripts/bench_matrix.sh
 
 bench-quick:
-	./scripts/bench.escript --scenario hello --duration 5 --warmup 1
+	./scripts/bench.escript --scenarios hello --duration 5 --warmup 1
 
 wrk2:
 	./scripts/wrk2_bench.sh
 
 wrk2-quick:
-	./scripts/wrk2_bench.sh --quick --scenario hello
+	./scripts/wrk2_bench.sh --quick --scenarios hello
 
 h2spec:
 	./scripts/h2spec.sh
