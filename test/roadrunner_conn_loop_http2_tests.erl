@@ -50,6 +50,7 @@ all_test_() ->
         fun loop_response_emits_data_then_closes_on_stop/0,
         fun loop_response_filters_otp_messages/0,
         fun loop_response_worker_stops_when_conn_dies/0,
+        fun loop_response_worker_stops_on_stream_reset/0,
         fun sendfile_empty_emits_empty_data/0,
         fun sendfile_small_file_emits_single_data_frame/0,
         fun sendfile_multi_frame_chunks_at_max_frame_size/0,
@@ -973,6 +974,27 @@ loop_response_worker_stops_when_conn_dies() ->
     after 1000 ->
         error(loop_worker_did_not_exit)
     end.
+
+loop_response_worker_stops_on_stream_reset() ->
+    %% A peer RST_STREAM on a live loop stream must stop the worker, not
+    %% deliver `{h2_stream_reset, _}` to the handler's `handle_info/3`
+    %% (the `/loop` handler has no clause for it, so a misdelivery would
+    %% crash with function_clause — the worker must exit `normal`).
+    {Pid, Ref} = run_stream_request(~"/loop"),
+    Worker = wait_for_register(roadrunner_h2_loop_test, 1000),
+    %% Drain the 200 HEADERS so the worker is past `sync_send_headers`
+    %% and parked in `info_loop` before the reset arrives.
+    _ = expect_send(),
+    WorkerRef = monitor(process, Worker),
+    Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
+    serve_recv(Pid, Rst),
+    receive
+        {'DOWN', WorkerRef, process, Worker, Reason} ->
+            ?assertEqual(normal, Reason)
+    after 1000 ->
+        error(loop_worker_did_not_stop)
+    end,
+    cleanup(Pid, Ref).
 
 sendfile_empty_emits_empty_data() ->
     %% Length=0: file is opened but never read. The base clause of
