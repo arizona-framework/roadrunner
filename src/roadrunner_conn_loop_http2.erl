@@ -232,6 +232,12 @@
     %% Prepended to every response by `roadrunner_http:auto_headers/2`.
     %% Read from proto_opts at `enter/5`.
     alt_svc = undefined :: binary() | undefined,
+    %% In-flight-request slot accounting (cross-listener cap). `infinity`
+    %% (default) disables it; `inflight_counter` is the shared gauge.
+    %% Read from proto_opts at `enter/5` so the per-stream acquire/release
+    %% passes them to `roadrunner_conn` directly. See `dispatch_stream/2`.
+    max_concurrent_requests = infinity :: infinity | pos_integer(),
+    inflight_counter :: counters:counters_ref() | undefined,
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -288,6 +294,8 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
     MaxContentLength = maps:get(max_content_length, ProtoOpts, ?DEFAULT_MAX_CONTENT_LENGTH),
     HibernateAfter = maps:get(hibernate_after, ProtoOpts, 0),
     AltSvc = maps:get(alt_svc, ProtoOpts, undefined),
+    MaxConcReq = maps:get(max_concurrent_requests, ProtoOpts, infinity),
+    InflightCounter = maps:get(inflight_counter, ProtoOpts, undefined),
     State = #loop{
         socket = Socket,
         proto_opts = ProtoOpts,
@@ -308,7 +316,9 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
         max_header_list_size = MaxHeaderListSize,
         max_content_length = MaxContentLength,
         hibernate_after = HibernateAfter,
-        alt_svc = AltSvc
+        alt_svc = AltSvc,
+        max_concurrent_requests = MaxConcReq,
+        inflight_counter = InflightCounter
     },
     handshake(State).
 
@@ -1078,7 +1088,9 @@ dispatch_stream(
         proto_opts = ProtoOpts,
         peer = Peer,
         scheme = Scheme,
-        listener_name = ListenerName
+        listener_name = ListenerName,
+        max_concurrent_requests = MaxConcReq,
+        inflight_counter = InflightCounter
     } = State
 ) ->
     #{
@@ -1104,7 +1116,7 @@ dispatch_stream(
             },
             case roadrunner_http2_request:from_headers(Headers, BodyIolist, RequestContext) of
                 {ok, Req} ->
-                    case roadrunner_conn:try_acquire_request_slot(ProtoOpts) of
+                    case roadrunner_conn:try_acquire_request_slot(MaxConcReq, InflightCounter) of
                         true ->
                             {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
                                 self(), StreamId, Req, ProtoOpts
@@ -1261,7 +1273,9 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
             %% Release the in-flight slot exactly once, tied to removing the
             %% worker ref so a worker is accounted for by its `DOWN` here or
             %% by the conn's clean exit, never both.
-            ok = roadrunner_conn:release_request_slot(State#loop.proto_opts),
+            ok = roadrunner_conn:release_request_slot(
+                State#loop.max_concurrent_requests, State#loop.inflight_counter
+            ),
             State1 = State#loop{worker_refs = maps:remove(MonRef, Refs)},
             case Reason of
                 normal -> remove_stream(State1, StreamId);
@@ -1572,7 +1586,9 @@ reset_stream(#loop{streams = Streams, worker_refs = Refs} = State, StreamId) ->
                 %% `DOWN` fires) and drop its ref here, so this is the only
                 %% place that can release the slot — `handle_worker_down`
                 %% never runs and `exit_clean` no longer sees the ref.
-                ok = roadrunner_conn:release_request_slot(State#loop.proto_opts),
+                ok = roadrunner_conn:release_request_slot(
+                    State#loop.max_concurrent_requests, State#loop.inflight_counter
+                ),
                 maps:remove(MonRef, Refs)
         end,
     State#loop{
@@ -1743,7 +1759,9 @@ exit_clean(#loop{
     listener_name = ListenerName,
     peer = Peer,
     start_mono = StartMono,
-    worker_refs = Refs
+    worker_refs = Refs,
+    max_concurrent_requests = MaxConcReq,
+    inflight_counter = InflightCounter
 }) ->
     roadrunner_telemetry:listener_conn_close(StartMono, #{
         listener_name => ListenerName,
@@ -1753,7 +1771,7 @@ exit_clean(#loop{
     %% Account for any stream workers still live at teardown (each holds one
     %% in-flight slot). Workers whose `DOWN` already fired were removed from
     %% `worker_refs`, so this releases each remaining worker exactly once.
-    ok = roadrunner_conn:release_request_slots(ProtoOpts, map_size(Refs)),
+    ok = roadrunner_conn:release_request_slots(MaxConcReq, InflightCounter, map_size(Refs)),
     ok = roadrunner_conn:release_slot(ProtoOpts),
     ok = roadrunner_transport:close(Socket),
     exit(normal).
