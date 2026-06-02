@@ -89,12 +89,23 @@
     req_id_buffer = <<>> :: binary(),
     %% Conn-stable values pulled from `proto_opts` once at `shoot`
     %% time so the per-request hot path doesn't re-`maps:get` them.
-    %% Saves ~5 hash lookups per request.
+    %% Saves ~8 hash lookups per request.
     requests_counter :: atomics:atomics_ref() | undefined,
     dispatch :: roadrunner_conn:dispatch() | undefined,
     middlewares = [] :: roadrunner_middleware:middleware_list(),
     max_content_length = 0 :: non_neg_integer(),
     max_keep_alive_requests = 1 :: pos_integer(),
+    %% Read-phase deadlines: `request_timeout` for the first request on a
+    %% fresh conn, `keep_alive_timeout` for keep-alive loop-backs. Picked
+    %% by `phase_timeout/1` per `phase`.
+    request_timeout = 0 :: non_neg_integer(),
+    keep_alive_timeout = 0 :: non_neg_integer(),
+    %% `auto` reads the full body synchronously; `manual` builds a
+    %% body_reader the handler pulls from. Drives `read_body_phase/3`.
+    body_buffering = auto :: auto | manual,
+    %% `proto_opts.hibernate_after`, or 0 when unset (the common case).
+    %% When > 0, `recv_request_bytes/2` takes the active+hibernate path.
+    hibernate_after = 0 :: non_neg_integer(),
     %% HTTP/1 inbound size limits as the
     %% `{max_request_line, max_header_line, max_header_block, max_header_count}`
     %% tuple `roadrunner_http1:parse_request/2` takes. Cached from the
@@ -174,6 +185,10 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
                         max_content_length = maps:get(max_content_length, ProtoOpts),
                         max_keep_alive_requests = maps:get(max_keep_alive_requests, ProtoOpts),
                         min_rate = maps:get(min_bytes_per_second, ProtoOpts),
+                        request_timeout = maps:get(request_timeout, ProtoOpts),
+                        keep_alive_timeout = maps:get(keep_alive_timeout, ProtoOpts),
+                        body_buffering = maps:get(body_buffering, ProtoOpts),
+                        hibernate_after = maps:get(hibernate_after, ProtoOpts, 0),
                         http1_limits = {
                             maps:get(http1_max_request_line, ProtoOpts, 8192),
                             maps:get(http1_max_header_line, ProtoOpts, 8192),
@@ -259,10 +274,10 @@ read_request_phase(#loop_state{buffered = Buf} = S) ->
 %% `keep_alive_timeout` (typically shorter — connections that have
 %% nothing to do drop faster).
 -spec phase_timeout(#loop_state{}) -> non_neg_integer().
-phase_timeout(#loop_state{phase = first, proto_opts = ProtoOpts}) ->
-    maps:get(request_timeout, ProtoOpts);
-phase_timeout(#loop_state{phase = keep_alive, proto_opts = ProtoOpts}) ->
-    maps:get(keep_alive_timeout, ProtoOpts).
+phase_timeout(#loop_state{phase = first, request_timeout = T}) ->
+    T;
+phase_timeout(#loop_state{phase = keep_alive, keep_alive_timeout = T}) ->
+    T.
 
 %% Drain-detection cap when in passive recv. Each `gen_tcp:recv` call
 %% is bounded to at most this many ms so the conn re-checks its
@@ -273,14 +288,11 @@ phase_timeout(#loop_state{phase = keep_alive, proto_opts = ProtoOpts}) ->
 -define(DRAIN_CHECK_INTERVAL_MS, 100).
 
 -spec recv_request_bytes(#loop_state{}, integer()) -> no_return().
+recv_request_bytes(#loop_state{hibernate_after = Ms} = S, Deadline) when Ms > 0 ->
+    arm_active_once(S),
+    recv_with_hibernate(S, Deadline, Ms);
 recv_request_bytes(S, Deadline) ->
-    case S#loop_state.proto_opts of
-        #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 ->
-            arm_active_once(S),
-            recv_with_hibernate(S, Deadline, Ms);
-        #{} ->
-            recv_passive(S, Deadline)
-    end.
+    recv_passive(S, Deadline).
 
 %% Passive-mode recv path (default — `hibernate_after` unset or 0).
 %% Bypasses `gen_tcp_socket`'s gen_statem dispatch entirely — direct
@@ -513,20 +525,20 @@ handle_request_bytes(
 read_body_phase(
     #loop_state{
         socket = Socket,
-        proto_opts = ProtoOpts,
+        min_rate = MinRate,
+        body_buffering = BodyMode,
         max_content_length = MaxCL,
         http1_limits = {_ReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}
     } = S,
     Req,
     Deadline
 ) ->
-    MinRate = maps:get(min_bytes_per_second, ProtoOpts),
     Recv = roadrunner_conn:make_recv(Socket, Deadline, MinRate),
     Buffered = S#loop_state.buffered,
     %% Trailer headers (chunked bodies) obey the same caps as request
     %% headers; the request-line cap doesn't apply to a trailer block.
     TrailerLimits = {MaxHdrLine, MaxHdrBlock, MaxHdrCount},
-    case maps:get(body_buffering, ProtoOpts) of
+    case BodyMode of
         auto ->
             case roadrunner_conn:read_body(Req, Buffered, Recv, MaxCL, TrailerLimits) of
                 {ok, Body, Leftover} ->
