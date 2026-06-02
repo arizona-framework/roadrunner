@@ -47,6 +47,12 @@ info_loop(ConnPid, StreamId, Handler, Push, State) ->
         {'DOWN', _MonRef, process, ConnPid, _Reason} ->
             %% Connection gone — stop looping.
             ok;
+        {h2_stream_reset, StreamId} ->
+            %% The conn reset this stream (peer RST_STREAM, or a
+            %% protocol violation on the conn side) and already dropped
+            %% it. Stop looping rather than forwarding the reset to the
+            %% handler's `handle_info/3` as if it were application data.
+            ok;
         {system, _, _} ->
             info_loop(ConnPid, StreamId, Handler, Push, State);
         {'$gen_call', _, _} ->
