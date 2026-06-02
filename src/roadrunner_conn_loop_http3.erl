@@ -135,7 +135,13 @@
     %% (so conformant clients self-limit, §4.2.2) and enforced after QPACK
     %% decode in `dispatch_request/2`. Read from proto_opts; defaults to
     %% `2 * max_header_block`.
-    max_field_section_size = ?DEFAULT_MAX_FIELD_SECTION_SIZE :: pos_integer()
+    max_field_section_size = ?DEFAULT_MAX_FIELD_SECTION_SIZE :: pos_integer(),
+    %% In-flight-request slot accounting (cross-listener cap). `infinity`
+    %% (default) disables it; `inflight_counter` is the shared gauge. Read
+    %% from proto_opts at `init/2` so the per-stream acquire/release passes
+    %% them to `roadrunner_conn` directly. See `dispatch_decoded/3`.
+    max_concurrent_requests = infinity :: infinity | pos_integer(),
+    inflight_counter :: counters:counters_ref() | undefined
 }).
 
 -doc """
@@ -196,7 +202,9 @@ init(Conn, ProtoOpts) ->
         %% cap, so raising `max_header_block` lifts both gates together.
         max_field_section_size = maps:get(
             http3_max_field_section_size, ProtoOpts, 2 * MaxHeaderBlock
-        )
+        ),
+        max_concurrent_requests = maps:get(max_concurrent_requests, ProtoOpts, infinity),
+        inflight_counter = maps:get(inflight_counter, ProtoOpts, undefined)
     }).
 
 -spec loop(#h3{}) -> ok.
@@ -748,7 +756,11 @@ dispatch_decoded(#h3{streams = Streams} = State, StreamId, Headers, Body) ->
             %% stream error H3_MESSAGE_ERROR.
             reset_and_drop(State1, StreamId, ?H3_MESSAGE_ERROR);
         {ok, Req} ->
-            case roadrunner_conn:try_acquire_request_slot(State1#h3.proto_opts) of
+            case
+                roadrunner_conn:try_acquire_request_slot(
+                    State1#h3.max_concurrent_requests, State1#h3.inflight_counter
+                )
+            of
                 true ->
                     {_WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
                         State1#h3.conn, StreamId, Req, State1#h3.proto_opts
@@ -781,7 +793,9 @@ handle_worker_down(#h3{worker_refs = WorkerRefs} = State, MonRef, Reason) ->
     %% Release the in-flight slot exactly once, tied to removing the worker
     %% ref so it is accounted for by this `DOWN` or by the conn's clean
     %% exit, never both.
-    ok = roadrunner_conn:release_request_slot(State#h3.proto_opts),
+    ok = roadrunner_conn:release_request_slot(
+        State#h3.max_concurrent_requests, State#h3.inflight_counter
+    ),
     State1 = State#h3{worker_refs = WorkerRefs1},
     case Reason of
         normal ->
@@ -827,7 +841,9 @@ terminate(#h3{
     listener_name = ListenerName,
     peer = Peer,
     start_mono = StartMono,
-    worker_refs = Refs
+    worker_refs = Refs,
+    max_concurrent_requests = MaxConcReq,
+    inflight_counter = InflightCounter
 }) ->
     ok = roadrunner_telemetry:listener_conn_close(StartMono, #{
         listener_name => ListenerName,
@@ -837,5 +853,5 @@ terminate(#h3{
     %% Account for any stream workers still live at teardown (each holds one
     %% in-flight slot); workers whose `DOWN` already fired were removed from
     %% `worker_refs`, so this releases each remaining worker exactly once.
-    ok = roadrunner_conn:release_request_slots(ProtoOpts, map_size(Refs)),
+    ok = roadrunner_conn:release_request_slots(MaxConcReq, InflightCounter, map_size(Refs)),
     ok = roadrunner_conn:release_slot(ProtoOpts).

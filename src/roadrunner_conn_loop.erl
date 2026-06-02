@@ -89,12 +89,26 @@
     req_id_buffer = <<>> :: binary(),
     %% Conn-stable values pulled from `proto_opts` once at `shoot`
     %% time so the per-request hot path doesn't re-`maps:get` them.
-    %% Saves ~5 hash lookups per request.
+    %% Saves ~8 hash lookups per request.
     requests_counter :: atomics:atomics_ref() | undefined,
     dispatch :: roadrunner_conn:dispatch() | undefined,
     middlewares = [] :: roadrunner_middleware:middleware_list(),
     max_content_length = 0 :: non_neg_integer(),
     max_keep_alive_requests = 1 :: pos_integer(),
+    %% Read-phase deadlines: `request_timeout` for the first request on a
+    %% fresh conn, `keep_alive_timeout` for keep-alive loop-backs. Picked
+    %% by `phase_timeout/1` per `phase`.
+    request_timeout = 0 :: non_neg_integer(),
+    keep_alive_timeout = 0 :: non_neg_integer(),
+    %% `auto` reads the full body synchronously; `manual` builds a
+    %% body_reader the handler pulls from. Drives `read_body_phase/3`.
+    body_buffering = auto :: auto | manual,
+    %% `proto_opts.hibernate_after`, or 0 when unset (the common case).
+    %% When > 0, `recv_request_bytes/2` takes the active+hibernate path.
+    hibernate_after = 0 :: non_neg_integer(),
+    %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
+    %% Prepended to every response by `roadrunner_http:auto_headers/2`.
+    alt_svc = undefined :: binary() | undefined,
     %% HTTP/1 inbound size limits as the
     %% `{max_request_line, max_header_line, max_header_block, max_header_count}`
     %% tuple `roadrunner_http1:parse_request/2` takes. Cached from the
@@ -174,6 +188,11 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
                         max_content_length = maps:get(max_content_length, ProtoOpts),
                         max_keep_alive_requests = maps:get(max_keep_alive_requests, ProtoOpts),
                         min_rate = maps:get(min_bytes_per_second, ProtoOpts),
+                        request_timeout = maps:get(request_timeout, ProtoOpts),
+                        keep_alive_timeout = maps:get(keep_alive_timeout, ProtoOpts),
+                        body_buffering = maps:get(body_buffering, ProtoOpts),
+                        hibernate_after = maps:get(hibernate_after, ProtoOpts, 0),
+                        alt_svc = maps:get(alt_svc, ProtoOpts, undefined),
                         http1_limits = {
                             maps:get(http1_max_request_line, ProtoOpts, 8192),
                             maps:get(http1_max_header_line, ProtoOpts, 8192),
@@ -259,10 +278,10 @@ read_request_phase(#loop_state{buffered = Buf} = S) ->
 %% `keep_alive_timeout` (typically shorter — connections that have
 %% nothing to do drop faster).
 -spec phase_timeout(#loop_state{}) -> non_neg_integer().
-phase_timeout(#loop_state{phase = first, proto_opts = ProtoOpts}) ->
-    maps:get(request_timeout, ProtoOpts);
-phase_timeout(#loop_state{phase = keep_alive, proto_opts = ProtoOpts}) ->
-    maps:get(keep_alive_timeout, ProtoOpts).
+phase_timeout(#loop_state{phase = first, request_timeout = T}) ->
+    T;
+phase_timeout(#loop_state{phase = keep_alive, keep_alive_timeout = T}) ->
+    T.
 
 %% Drain-detection cap when in passive recv. Each `gen_tcp:recv` call
 %% is bounded to at most this many ms so the conn re-checks its
@@ -273,14 +292,11 @@ phase_timeout(#loop_state{phase = keep_alive, proto_opts = ProtoOpts}) ->
 -define(DRAIN_CHECK_INTERVAL_MS, 100).
 
 -spec recv_request_bytes(#loop_state{}, integer()) -> no_return().
+recv_request_bytes(#loop_state{hibernate_after = Ms} = S, Deadline) when Ms > 0 ->
+    arm_active_once(S),
+    recv_with_hibernate(S, Deadline, Ms);
 recv_request_bytes(S, Deadline) ->
-    case S#loop_state.proto_opts of
-        #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 ->
-            arm_active_once(S),
-            recv_with_hibernate(S, Deadline, Ms);
-        #{} ->
-            recv_passive(S, Deadline)
-    end.
+    recv_passive(S, Deadline).
 
 %% Passive-mode recv path (default — `hibernate_after` unset or 0).
 %% Bypasses `gen_tcp_socket`'s gen_statem dispatch entirely — direct
@@ -513,20 +529,20 @@ handle_request_bytes(
 read_body_phase(
     #loop_state{
         socket = Socket,
-        proto_opts = ProtoOpts,
+        min_rate = MinRate,
+        body_buffering = BodyMode,
         max_content_length = MaxCL,
         http1_limits = {_ReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}
     } = S,
     Req,
     Deadline
 ) ->
-    MinRate = maps:get(min_bytes_per_second, ProtoOpts),
     Recv = roadrunner_conn:make_recv(Socket, Deadline, MinRate),
     Buffered = S#loop_state.buffered,
     %% Trailer headers (chunked bodies) obey the same caps as request
     %% headers; the request-line cap doesn't apply to a trailer block.
     TrailerLimits = {MaxHdrLine, MaxHdrBlock, MaxHdrCount},
-    case maps:get(body_buffering, ProtoOpts) of
+    case BodyMode of
         auto ->
             case roadrunner_conn:read_body(Req, Buffered, Recv, MaxCL, TrailerLimits) of
                 {ok, Body, Leftover} ->
@@ -574,7 +590,7 @@ read_body_phase(
 %% pipeline, run it bracketed by request_start / request_stop |
 %% request_exception telemetry. The 5 response shapes (buffered,
 %% stream, loop, sendfile, websocket) dispatch to their respective
-%% writers via `dispatch_response/5`.
+%% writers via `dispatch_response/4`.
 -spec dispatch_phase(#loop_state{}, roadrunner_req:request()) -> no_return().
 dispatch_phase(
     #loop_state{
@@ -602,9 +618,7 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     try Pipeline(Req) of
         {Response, Req2} when is_map(Req2) ->
-            _ = dispatch_response(
-                Socket, Handler, Req2, Response, S#loop_state.buffered, S#loop_state.proto_opts
-            ),
+            _ = dispatch_response(S, Handler, Req2, Response),
             ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, #{
                 status => roadrunner_conn:response_status(Response),
                 response_kind => roadrunner_conn:response_kind(Response)
@@ -635,45 +649,52 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
 %% sendfile / websocket force connection close (the underlying
 %% writers manage their own keep-alive semantics — generally none).
 -spec dispatch_response(
-    roadrunner_transport:socket(),
+    #loop_state{},
     module(),
     roadrunner_req:request(),
-    roadrunner_handler:response(),
-    binary(),
-    roadrunner_conn:proto_opts()
+    roadrunner_handler:response()
 ) -> ok.
-dispatch_response(Socket, _Handler, Req, {websocket, Mod, State}, Buffered, ProtoOpts) when
+dispatch_response(
+    #loop_state{socket = Socket, buffered = Buffered, proto_opts = ProtoOpts},
+    _Handler,
+    Req,
+    {websocket, Mod, State}
+) when
     is_atom(Mod)
 ->
     ok = roadrunner_ws_session:run(Socket, Req, Mod, State, Buffered, ProtoOpts),
     ok;
 dispatch_response(
-    Socket, _Handler, _Req, {stream, Status, Headers0, Fun}, _Buffered, ProtoOpts
+    #loop_state{socket = Socket, alt_svc = AltSvc},
+    _Handler,
+    _Req,
+    {stream, Status, Headers0, Fun}
 ) when
     is_function(Fun, 1)
 ->
-    Headers = roadrunner_http:auto_headers(Headers0, ProtoOpts),
+    Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     _ = roadrunner_stream_response:run(Socket, Status, Headers, Fun),
     ok;
 dispatch_response(
-    Socket, Handler, _Req, {loop, Status, Headers0, LoopState}, _Buffered, ProtoOpts
+    #loop_state{socket = Socket, alt_svc = AltSvc},
+    Handler,
+    _Req,
+    {loop, Status, Headers0, LoopState}
 ) when
     is_integer(Status)
 ->
-    Headers = roadrunner_http:auto_headers(Headers0, ProtoOpts),
+    Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     _ = roadrunner_loop_response:run(Socket, Status, Headers, Handler, LoopState),
     ok;
 dispatch_response(
-    Socket,
+    #loop_state{socket = Socket, alt_svc = AltSvc},
     _Handler,
     Req,
-    {sendfile, Status, Headers0, {Filename, Offset, Length}},
-    _Buffered,
-    ProtoOpts
+    {sendfile, Status, Headers0, {Filename, Offset, Length}}
 ) when
     is_integer(Status)
 ->
-    Headers = roadrunner_http:auto_headers(Headers0, ProtoOpts),
+    Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     Head = roadrunner_http1:response(Status, Headers, ~""),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Head), sendfile_response_head
@@ -708,20 +729,28 @@ dispatch_response(
 %% function head and emit the response with an empty body. Free
 %% pattern-match dispatch (no `maps:get(method, _)` per response).
 dispatch_response(
-    Socket, _Handler, #{method := ~"HEAD"}, {Status, Headers0, _Body}, _Buffered, ProtoOpts
+    #loop_state{socket = Socket, alt_svc = AltSvc},
+    _Handler,
+    #{method := ~"HEAD"},
+    {Status, Headers0, _Body}
 ) when
     is_integer(Status)
 ->
-    Headers = roadrunner_http:auto_headers(Headers0, ProtoOpts),
+    Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     Resp = roadrunner_http1:response(Status, Headers, ~""),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Resp), buffered_response
     ),
     ok;
-dispatch_response(Socket, _Handler, _Req, {Status, Headers0, Body}, _Buffered, ProtoOpts) when
+dispatch_response(
+    #loop_state{socket = Socket, alt_svc = AltSvc},
+    _Handler,
+    _Req,
+    {Status, Headers0, Body}
+) when
     is_integer(Status)
 ->
-    Headers = roadrunner_http:auto_headers(Headers0, ProtoOpts),
+    Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     Resp = roadrunner_http1:response(Status, Headers, Body),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Resp), buffered_response

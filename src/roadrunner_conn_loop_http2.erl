@@ -224,6 +224,20 @@
     %% advertised in our SETTINGS and enforced after HPACK decode in
     %% `finalize_headers/2`. Read from proto_opts at `enter/5`.
     max_header_list_size = ?DEFAULT_MAX_HEADER_LIST_SIZE :: pos_integer(),
+    %% `proto_opts.hibernate_after`, or 0 when unset (the common case).
+    %% When > 0 and no streams are in flight, the idle-wait path parks
+    %% for this window and hibernates. Read from proto_opts at `enter/5`.
+    hibernate_after = 0 :: non_neg_integer(),
+    %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
+    %% Prepended to every response by `roadrunner_http:auto_headers/2`.
+    %% Read from proto_opts at `enter/5`.
+    alt_svc = undefined :: binary() | undefined,
+    %% In-flight-request slot accounting (cross-listener cap). `infinity`
+    %% (default) disables it; `inflight_counter` is the shared gauge.
+    %% Read from proto_opts at `enter/5` so the per-stream acquire/release
+    %% passes them to `roadrunner_conn` directly. See `dispatch_stream/2`.
+    max_concurrent_requests = infinity :: infinity | pos_integer(),
+    inflight_counter :: counters:counters_ref() | undefined,
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -278,6 +292,10 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
     %% so raising `max_header_block` for big headers lifts both gates together.
     MaxHeaderListSize = maps:get(http2_max_header_list_size, ProtoOpts, 2 * MaxHeaderBlock),
     MaxContentLength = maps:get(max_content_length, ProtoOpts, ?DEFAULT_MAX_CONTENT_LENGTH),
+    HibernateAfter = maps:get(hibernate_after, ProtoOpts, 0),
+    AltSvc = maps:get(alt_svc, ProtoOpts, undefined),
+    MaxConcReq = maps:get(max_concurrent_requests, ProtoOpts, infinity),
+    InflightCounter = maps:get(inflight_counter, ProtoOpts, undefined),
     State = #loop{
         socket = Socket,
         proto_opts = ProtoOpts,
@@ -296,7 +314,11 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
         max_concurrent_streams = MaxStreams,
         max_header_block = MaxHeaderBlock,
         max_header_list_size = MaxHeaderListSize,
-        max_content_length = MaxContentLength
+        max_content_length = MaxContentLength,
+        hibernate_after = HibernateAfter,
+        alt_svc = AltSvc,
+        max_concurrent_requests = MaxConcReq,
+        inflight_counter = InflightCounter
     },
     handshake(State).
 
@@ -474,13 +496,10 @@ recv_more(
 %% active, where worker messages are imminent and hibernating would be
 %% pointless.
 -spec recv_timeout(#loop{}) -> non_neg_integer().
-recv_timeout(#loop{streams = Streams, proto_opts = ProtoOpts}) when
-    map_size(Streams) =:= 0
+recv_timeout(#loop{streams = Streams, hibernate_after = Ms}) when
+    map_size(Streams) =:= 0, Ms > 0
 ->
-    case ProtoOpts of
-        #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 -> Ms;
-        _ -> idle_timeout()
-    end;
+    Ms;
 recv_timeout(_State) ->
     idle_timeout().
 
@@ -491,15 +510,10 @@ recv_timeout(_State) ->
 %% frame — or any worker / `'DOWN'` / drain message — wakes us and
 %% `recv_more_hib/1` resumes the loop. Otherwise emit the idle GOAWAY.
 -spec recv_idle_expired(#loop{}) -> no_return().
-recv_idle_expired(#loop{streams = Streams, proto_opts = ProtoOpts} = State) when
-    map_size(Streams) =:= 0
+recv_idle_expired(#loop{streams = Streams, hibernate_after = Ms} = State) when
+    map_size(Streams) =:= 0, Ms > 0
 ->
-    case ProtoOpts of
-        #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 ->
-            erlang:hibernate(?MODULE, recv_more_hib, [State]);
-        _ ->
-            idle_goaway(State)
-    end;
+    erlang:hibernate(?MODULE, recv_more_hib, [State]);
 recv_idle_expired(State) ->
     idle_goaway(State).
 
@@ -1074,7 +1088,9 @@ dispatch_stream(
         proto_opts = ProtoOpts,
         peer = Peer,
         scheme = Scheme,
-        listener_name = ListenerName
+        listener_name = ListenerName,
+        max_concurrent_requests = MaxConcReq,
+        inflight_counter = InflightCounter
     } = State
 ) ->
     #{
@@ -1100,7 +1116,7 @@ dispatch_stream(
             },
             case roadrunner_http2_request:from_headers(Headers, BodyIolist, RequestContext) of
                 {ok, Req} ->
-                    case roadrunner_conn:try_acquire_request_slot(ProtoOpts) of
+                    case roadrunner_conn:try_acquire_request_slot(MaxConcReq, InflightCounter) of
                         true ->
                             {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
                                 self(), StreamId, Req, ProtoOpts
@@ -1257,7 +1273,9 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
             %% Release the in-flight slot exactly once, tied to removing the
             %% worker ref so a worker is accounted for by its `DOWN` here or
             %% by the conn's clean exit, never both.
-            ok = roadrunner_conn:release_request_slot(State#loop.proto_opts),
+            ok = roadrunner_conn:release_request_slot(
+                State#loop.max_concurrent_requests, State#loop.inflight_counter
+            ),
             State1 = State#loop{worker_refs = maps:remove(MonRef, Refs)},
             case Reason of
                 normal -> remove_stream(State1, StreamId);
@@ -1294,7 +1312,7 @@ encode_and_send_headers(
     %% h2 path matches h1's `encode_headers/1` discipline.
     ok = validate_headers(Headers),
     AllHeaders =
-        [{~":status", StatusBin} | roadrunner_http:auto_headers(Headers, State#loop.proto_opts)],
+        [{~":status", StatusBin} | roadrunner_http:auto_headers(Headers, State#loop.alt_svc)],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     %% `frame:encode` accepts iodata for the header block — skip
     %% the upfront flatten; ssl:send walks the iolist anyway.
@@ -1332,7 +1350,7 @@ encode_and_send_response_atomic(
     %% or split at an h2->h1 reverse proxy.
     ok = validate_headers(Headers),
     AllHeaders =
-        [{~":status", StatusBin} | roadrunner_http:auto_headers(Headers, State#loop.proto_opts)],
+        [{~":status", StatusBin} | roadrunner_http:auto_headers(Headers, State#loop.alt_svc)],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     HFrame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04, undefined, HpackBlock}
@@ -1568,7 +1586,9 @@ reset_stream(#loop{streams = Streams, worker_refs = Refs} = State, StreamId) ->
                 %% `DOWN` fires) and drop its ref here, so this is the only
                 %% place that can release the slot — `handle_worker_down`
                 %% never runs and `exit_clean` no longer sees the ref.
-                ok = roadrunner_conn:release_request_slot(State#loop.proto_opts),
+                ok = roadrunner_conn:release_request_slot(
+                    State#loop.max_concurrent_requests, State#loop.inflight_counter
+                ),
                 maps:remove(MonRef, Refs)
         end,
     State#loop{
@@ -1739,7 +1759,9 @@ exit_clean(#loop{
     listener_name = ListenerName,
     peer = Peer,
     start_mono = StartMono,
-    worker_refs = Refs
+    worker_refs = Refs,
+    max_concurrent_requests = MaxConcReq,
+    inflight_counter = InflightCounter
 }) ->
     roadrunner_telemetry:listener_conn_close(StartMono, #{
         listener_name => ListenerName,
@@ -1749,7 +1771,7 @@ exit_clean(#loop{
     %% Account for any stream workers still live at teardown (each holds one
     %% in-flight slot). Workers whose `DOWN` already fired were removed from
     %% `worker_refs`, so this releases each remaining worker exactly once.
-    ok = roadrunner_conn:release_request_slots(ProtoOpts, map_size(Refs)),
+    ok = roadrunner_conn:release_request_slots(MaxConcReq, InflightCounter, map_size(Refs)),
     ok = roadrunner_conn:release_slot(ProtoOpts),
     ok = roadrunner_transport:close(Socket),
     exit(normal).

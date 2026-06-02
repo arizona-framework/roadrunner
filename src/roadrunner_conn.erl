@@ -34,9 +34,9 @@
     peer/1,
     try_acquire_slot/1,
     release_slot/1,
-    try_acquire_request_slot/1,
-    release_request_slot/1,
-    release_request_slots/2,
+    try_acquire_request_slot/2,
+    release_request_slot/2,
+    release_request_slots/3,
     consume_body_reader/2,
     join_drain_group/2,
     join_drain_group_for/2
@@ -278,29 +278,33 @@ unconfigured listener pays nothing on the hot path.
 Same eventually-consistent overshoot contract as `try_acquire_slot/1`: the
 `counters` ref uses `write_concurrency`, so a brief read slightly above the
 cap is possible before rollbacks reconcile, bounded by in-flight admissions.
-Paired with `release_request_slot/1`, which must run exactly once per
+Paired with `release_request_slot/2`, which must run exactly once per
 successfully-acquired worker (tie it to the worker monitor-ref removal so a
 worker is released by its `DOWN` or by the conn's clean exit, never both).
+
+The `Max` and `Counter` are cached on the connection loop record at setup so
+the per-stream path passes them directly instead of re-reading `proto_opts`.
 """.
--spec try_acquire_request_slot(proto_opts()) -> boolean().
-try_acquire_request_slot(#{max_concurrent_requests := infinity}) ->
+-spec try_acquire_request_slot(infinity | pos_integer(), counters:counters_ref() | undefined) ->
+    boolean().
+try_acquire_request_slot(infinity, _Counter) ->
     true;
-try_acquire_request_slot(#{inflight_counter := Ref, max_concurrent_requests := Max}) ->
-    ok = counters:add(Ref, 1, 1),
-    case counters:get(Ref, 1) of
+try_acquire_request_slot(Max, Counter) ->
+    ok = counters:add(Counter, 1, 1),
+    case counters:get(Counter, 1) of
         N when N =< Max ->
             true;
         _ ->
-            ok = counters:sub(Ref, 1, 1),
+            ok = counters:sub(Counter, 1, 1),
             false
     end.
 
--doc "Decrement the in-flight-request counter, paired with `try_acquire_request_slot/1`.".
--spec release_request_slot(proto_opts()) -> ok.
-release_request_slot(#{max_concurrent_requests := infinity}) ->
+-doc "Decrement the in-flight-request counter, paired with `try_acquire_request_slot/2`.".
+-spec release_request_slot(infinity | pos_integer(), counters:counters_ref() | undefined) -> ok.
+release_request_slot(infinity, _Counter) ->
     ok;
-release_request_slot(#{inflight_counter := Ref}) ->
-    ok = counters:sub(Ref, 1, 1),
+release_request_slot(_Max, Counter) ->
+    ok = counters:sub(Counter, 1, 1),
     ok.
 
 -doc """
@@ -309,13 +313,15 @@ account for stream workers still live at teardown (each held one slot), so
 their slots are not leaked until the listener restarts. `N = 0` and
 `infinity` are no-ops.
 """.
--spec release_request_slots(proto_opts(), non_neg_integer()) -> ok.
-release_request_slots(_ProtoOpts, 0) ->
+-spec release_request_slots(
+    infinity | pos_integer(), counters:counters_ref() | undefined, non_neg_integer()
+) -> ok.
+release_request_slots(_Max, _Counter, 0) ->
     ok;
-release_request_slots(#{max_concurrent_requests := infinity}, _N) ->
+release_request_slots(infinity, _Counter, _N) ->
     ok;
-release_request_slots(#{inflight_counter := Ref}, N) ->
-    ok = counters:sub(Ref, 1, N),
+release_request_slots(_Max, Counter, N) ->
+    ok = counters:sub(Counter, 1, N),
     ok.
 
 -doc false.
@@ -938,7 +944,7 @@ response_kind({_, _, _}) -> buffered.
 %% shapes (stream / loop) are left to the handler, matching h1 (which
 %% strips only buffered + sendfile). Used by the h2 / h3 workers, which
 %% otherwise have no method-aware response step — h1 handles HEAD
-%% directly in `dispatch_response/5`.
+%% directly in `dispatch_response/4`.
 -doc false.
 -spec head_response(roadrunner_handler:response(), binary()) -> roadrunner_handler:response().
 head_response({sendfile, Status, Headers, _Spec}, ~"HEAD") ->

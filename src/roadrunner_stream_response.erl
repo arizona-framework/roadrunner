@@ -3,7 +3,7 @@
 
 %% Per-connection `{stream, ...}` response — chunked Transfer-Encoding.
 %%
-%% Called by `roadrunner_conn_loop:dispatch_response/5` after a handler returns
+%% Called by `roadrunner_conn_loop:dispatch_response/4` after a handler returns
 %% `{stream, Status, Headers, Fun}`. Writes the status line + chunked
 %% headers, then calls the user's `Fun(Send)` with a `Send/2` callback
 %% that frames each emission as one chunk on the wire.
