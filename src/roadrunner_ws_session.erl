@@ -62,7 +62,7 @@
 
 -behaviour(gen_statem).
 
--export([run/5]).
+-export([run/6]).
 -export([init/1, callback_mode/0, terminate/3]).
 -export([awaiting_socket/3, frame_loop/3]).
 -export([unmask_slice/3]).
@@ -167,19 +167,24 @@ leaving the upgrade response sent with no process owning the
 socket. Returns `ok` once the session has ended (or the
 handshake check fails — in which case 400 has been sent and
 the gen_statem is never started).
+
+`Buffered` is any bytes the conn already read past the upgrade request
+(a client that pipelines its first frame in the handshake segment).
+They seed the session buffer so the first frame isn't lost.
 """.
 -spec run(
     roadrunner_transport:socket(),
     roadrunner_req:request(),
     module(),
     term(),
+    binary(),
     roadrunner_conn:proto_opts()
 ) -> ok.
-run(Socket, Req, Mod, State, ProtoOpts) ->
+run(Socket, Req, Mod, State, Buffered, ProtoOpts) ->
     case roadrunner_ws:handshake_response(roadrunner_req:headers(Req)) of
         {ok, Status, RespHeaders, _, Negotiated} ->
             UpgradeResp = roadrunner_http1:response(Status, RespHeaders, ~""),
-            run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, ProtoOpts);
+            run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts);
         {error, _} ->
             _ = roadrunner_transport:send(
                 Socket,
@@ -199,9 +204,10 @@ run(Socket, Req, Mod, State, ProtoOpts) ->
     term(),
     iodata(),
     roadrunner_ws:negotiated(),
+    binary(),
     roadrunner_conn:proto_opts()
 ) -> ok.
-run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, ProtoOpts) ->
+run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts) ->
     Ctx = ws_context(Req, Mod),
     %% Start the gen_statem **before** writing the 101 to the wire so a
     %% start failure never leaves the upgrade response sent with no
@@ -211,7 +217,11 @@ run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, ProtoOpts) ->
     %% a monitor instead.
     #{handler_spawn_opts := SpawnOpts, handler_start_timeout := StartTimeout} = ProtoOpts,
     StartOpts = [{spawn_opt, SpawnOpts}, {timeout, StartTimeout}],
-    case gen_statem:start(?MODULE, {Socket, Mod, State, Ctx, Negotiated, ProtoOpts}, StartOpts) of
+    case
+        gen_statem:start(
+            ?MODULE, {Socket, Mod, State, Ctx, Negotiated, Buffered, ProtoOpts}, StartOpts
+        )
+    of
         {ok, Pid} ->
             ok = roadrunner_telemetry:ws_upgrade(Ctx),
             _ = roadrunner_telemetry:response_send(
@@ -262,10 +272,11 @@ callback_mode() -> [state_functions, state_enter].
     term(),
     map(),
     roadrunner_ws:negotiated(),
+    binary(),
     roadrunner_conn:proto_opts()
 }) ->
     {ok, awaiting_socket, #data{}} | {stop, {bad_handler, module()}}.
-init({Socket, Mod, State, Ctx, Negotiated, ProtoOpts}) ->
+init({Socket, Mod, State, Ctx, Negotiated, Buffered, ProtoOpts}) ->
     %% Reject unloadable handlers up front so `gen_statem:start/3`
     %% returns `{error, _}` and the launcher's 500 fallback runs —
     %% otherwise the session would crash later inside `handle_frame`
@@ -282,7 +293,7 @@ init({Socket, Mod, State, Ctx, Negotiated, ProtoOpts}) ->
             } = ProtoOpts,
             {ok, awaiting_socket, #data{
                 socket = Socket,
-                buffer = <<>>,
+                buffer = Buffered,
                 mod = Mod,
                 mod_state = State,
                 ctx = Ctx,
@@ -348,12 +359,21 @@ awaiting_socket(info, {roadrunner_drain, _}, _Data) ->
 
 -spec frame_loop(gen_statem:event_type(), term(), #data{}) ->
     gen_statem:event_handler_result(atom()).
-frame_loop(enter, _Old, #data{socket = Socket} = Data) ->
+frame_loop(enter, _Old, #data{buffer = <<>>, socket = Socket} = Data) ->
     %% Arm the socket for one chunk of inbound bytes. Each event below
     %% re-arms after parsing whatever's in the buffer, so the
     %% gen_statem is back in its main loop receive between events —
     %% which is the only place `hibernate` actions can take effect.
     arm_or_stop(Socket, Data, []);
+frame_loop(enter, _Old, Data) ->
+    %% A client that pipelined its first frame in the same segment as
+    %% the upgrade handshake had those bytes seeded into the buffer at
+    %% init. Process them before arming, the same way an inbound chunk
+    %% is handled in `frame_loop(info, ...)` (a complete frame
+    %% dispatches now; a partial one is held and `arm_or_stop` arms for
+    %% the rest). `process_buffer` only ever returns `keep_state` or
+    %% `stop` — both legal from a state-enter call.
+    process_buffer(Data, false);
 frame_loop(info, Msg, #data{socket = Socket} = Data) ->
     {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
     %% `_Sock` discarded — one socket per gen_statem (captured in
