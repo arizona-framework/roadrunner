@@ -29,6 +29,7 @@ accessors that operate on it.
 -on_load(init_cache/0).
 
 -export([http_date_now/0, format_http_date/1, with_date/1, auto_headers/2]).
+-export([header_list_size/1]).
 
 -export_type([headers/0, status/0, redirect_status/0, version/0]).
 
@@ -109,6 +110,18 @@ with_alt_svc(Headers, #{alt_svc := Value}) ->
     [{~"alt-svc", Value} | Headers];
 with_alt_svc(Headers, #{}) ->
     Headers.
+
+%% RFC 7541 §4.1: the uncompressed size of a header list is the sum over
+%% its fields of `byte_size(Name) + byte_size(Value) + 32`. This is the
+%% unit bounded by SETTINGS_MAX_HEADER_LIST_SIZE (h2, RFC 9113 §6.5.2)
+%% and SETTINGS_MAX_FIELD_SECTION_SIZE (h3, RFC 9114 §7.2.4.1), distinct
+%% from the compressed on-wire block the `max_header_block` cap bounds.
+-doc false.
+-spec header_list_size(headers()) -> non_neg_integer().
+header_list_size([{Name, Value} | Rest]) ->
+    byte_size(Name) + byte_size(Value) + 32 + header_list_size(Rest);
+header_list_size([]) ->
+    0.
 
 -doc """
 Format a posix timestamp (seconds since epoch) as an IMF-fixdate

@@ -132,6 +132,8 @@ all_test_() ->
         fun preface_settings_initial_window_applied/0,
         fun settings_header_table_size_shrinks_encoder/0,
         fun settings_header_table_size_above_default_emits_no_update/0,
+        fun settings_advertises_max_header_list_size/0,
+        fun header_list_too_large_returns_431_and_keeps_hpack_in_sync/0,
         fun content_length_multi_valued_rst_stream/0,
         fun trailers_after_first_end_stream_protocol_error/0
     ],
@@ -3217,6 +3219,67 @@ settings_header_table_size_above_default_emits_no_update() ->
     ?assertNotEqual(16#20, First band 16#E0),
     cleanup(Pid, Ref).
 
+settings_advertises_max_header_list_size() ->
+    %% RFC 9113 §6.5.2: the server's initial SETTINGS advertises
+    %% SETTINGS_MAX_HEADER_LIST_SIZE (id 6) with the configured value.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, _ConnPid} = start_http2_conn(#{http2_max_header_list_size => 12345}),
+    InitialSettings = expect_send(),
+    {ok, {settings, 0, Params}, _} = roadrunner_http2_frame:parse(InitialSettings, 16384),
+    ?assertEqual(12345, proplists:get_value(6, Params)),
+    cleanup(Pid, Ref).
+
+header_list_too_large_returns_431_and_keeps_hpack_in_sync() ->
+    %% RFC 9113 §6.5.2: a request whose DECODED header list exceeds the
+    %% advertised MAX_HEADER_LIST_SIZE gets 431 + RST_STREAM(NO_ERROR). The
+    %% connection and its HPACK decoder survive: a follow-up request that
+    %% references a dynamic-table entry the rejected block inserted still
+    %% decodes, proving the decoder context was committed before the reject.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{http2_max_header_list_size => 200}),
+    Enc0 = roadrunner_http2_hpack:new_encoder(4096),
+    Big = binary:copy(<<"v">>, 100),
+    {Block1, Enc1} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"example"},
+            {~":path", ~"/"},
+            {~"x-pad", Big}
+        ],
+        Enc0
+    ),
+    serve_recv(ConnPid, headers_frame_complete(1, Block1)),
+    Resp1 = collect_send_bytes(<<>>),
+    Dec0 = roadrunner_http2_hpack:new_decoder(4096),
+    {ok, {headers, 1, _, _, Hpack431}, _} = roadrunner_http2_frame:parse(Resp1, 16384),
+    {ok, Headers431, Dec1} = roadrunner_http2_hpack:decode(Hpack431, Dec0),
+    ?assertEqual(~"431", proplists:get_value(~":status", Headers431)),
+    %% Stream 3 references {:authority, example} (inserted by the rejected
+    %% block) via a dynamic index — only decodable if the server kept Dec1.
+    {Block2, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"example"},
+            {~":path", ~"/"}
+        ],
+        Enc1
+    ),
+    serve_recv(ConnPid, headers_frame_complete(3, Block2)),
+    Resp2 = collect_send_bytes(<<>>),
+    {ok, {headers, 3, _, _, Hpack200}, _} = roadrunner_http2_frame:parse(Resp2, 16384),
+    {ok, Headers200, _} = roadrunner_http2_hpack:decode(Hpack200, Dec1),
+    ?assertEqual(~"200", proplists:get_value(~":status", Headers200)),
+    cleanup(Pid, Ref).
+
+headers_frame_complete(StreamId, Block) ->
+    iolist_to_binary(
+        roadrunner_http2_frame:encode(
+            {headers, StreamId, 16#04 bor 16#01, undefined, iolist_to_binary(Block)}
+        )
+    ).
+
 settings_initial_window_size_shifts_stream_window() ->
     %% Open a stream, then SETTINGS with a new INITIAL_WINDOW_SIZE
     %% mixed with an unrelated setting id (3, MAX_CONCURRENT_STREAMS)
@@ -3360,9 +3423,12 @@ drain_until_goaway() ->
 %% return the handles so the test can drive whatever frame it
 %% wants next.
 post_handshake_conn() ->
+    post_handshake_conn(#{}).
+
+post_handshake_conn(Extra) ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
-    {Pid, Ref, ConnPid} = start_http2_conn(),
+    {Pid, Ref, ConnPid} = start_http2_conn(Extra),
     _ = expect_send(),
     serve_recv(ConnPid, ?PREFACE),
     serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),

@@ -82,6 +82,13 @@
 %% to 16384).
 -define(MAX_HEADER_BLOCK, 16_384).
 
+%% Default SETTINGS_MAX_HEADER_LIST_SIZE: 2x the encoded-block cap. The
+%% decoded list is always larger than the compressed block (the +32/field
+%% overhead alone pushes it up), so giving it headroom over `max_header_block`
+%% means the decoded gate only fires on genuinely huge header sets. When the
+%% encoded cap is overridden, the default tracks it (`2 * max_header_block`).
+-define(DEFAULT_MAX_HEADER_LIST_SIZE, (2 * ?MAX_HEADER_BLOCK)).
+
 %% RFC 7541 §4.2 default HPACK dynamic-table size: what we tell the peer
 %% its encoder may use (our decoder), and the ceiling we hold our own
 %% encoder to even when the peer advertises a larger table.
@@ -213,6 +220,10 @@
     %% body answers 413 + RST_STREAM(NO_ERROR). Read from proto_opts at
     %% `enter/5`.
     max_content_length = ?DEFAULT_MAX_CONTENT_LENGTH :: non_neg_integer(),
+    %% Decoded header-list cap (RFC 9113 §6.5.2 SETTINGS_MAX_HEADER_LIST_SIZE):
+    %% advertised in our SETTINGS and enforced after HPACK decode in
+    %% `finalize_headers/2`. Read from proto_opts at `enter/5`.
+    max_header_list_size = ?DEFAULT_MAX_HEADER_LIST_SIZE :: pos_integer(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -263,6 +274,9 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
     ),
     MaxStreams = maps:get(http2_max_concurrent_streams, ProtoOpts, ?MAX_CONCURRENT_STREAMS),
     MaxHeaderBlock = maps:get(http2_max_header_block, ProtoOpts, ?MAX_HEADER_BLOCK),
+    %% Decoded-list cap defaults to 2x the (possibly overridden) encoded cap,
+    %% so raising `max_header_block` for big headers lifts both gates together.
+    MaxHeaderListSize = maps:get(http2_max_header_list_size, ProtoOpts, 2 * MaxHeaderBlock),
     MaxContentLength = maps:get(max_content_length, ProtoOpts, ?DEFAULT_MAX_CONTENT_LENGTH),
     State = #loop{
         socket = Socket,
@@ -281,6 +295,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
         recv_window_threshold = Threshold,
         max_concurrent_streams = MaxStreams,
         max_header_block = MaxHeaderBlock,
+        max_header_list_size = MaxHeaderListSize,
         max_content_length = MaxContentLength
     },
     handshake(State).
@@ -294,10 +309,11 @@ handshake(
     #loop{
         recv_window_peak = ConnPeak,
         stream_recv_window_peak = StreamPeak,
-        max_concurrent_streams = MaxStreams
+        max_concurrent_streams = MaxStreams,
+        max_header_list_size = MaxHeaderListSize
     } = State
 ) ->
-    _ = send(State, server_settings_frame(StreamPeak, MaxStreams)),
+    _ = send(State, server_settings_frame(StreamPeak, MaxStreams, MaxHeaderListSize)),
     %% RFC 9113 §6.9.2: SETTINGS_INITIAL_WINDOW_SIZE only affects
     %% stream-level recv windows. The conn-level recv window stays
     %% at the 65535 default until an explicit `WINDOW_UPDATE(0, _)`,
@@ -313,15 +329,16 @@ handshake(
         end,
     handshake_phase_preface(State1).
 
--spec server_settings_frame(pos_integer(), pos_integer()) -> iodata().
-server_settings_frame(StreamPeak, MaxStreams) ->
-    %% Advertise MAX_CONCURRENT_STREAMS and MAX_FRAME_SIZE.
-    %% IDs from RFC 9113 §6.5.2: 3 = MAX_CONCURRENT_STREAMS,
-    %% 5 = MAX_FRAME_SIZE.  When the stream-level recv peak is bigger
+-spec server_settings_frame(pos_integer(), pos_integer(), pos_integer()) -> iodata().
+server_settings_frame(StreamPeak, MaxStreams, MaxHeaderListSize) ->
+    %% Advertise MAX_CONCURRENT_STREAMS, MAX_FRAME_SIZE and
+    %% MAX_HEADER_LIST_SIZE. IDs from RFC 9113 §6.5.2: 3 =
+    %% MAX_CONCURRENT_STREAMS, 5 = MAX_FRAME_SIZE, 6 =
+    %% MAX_HEADER_LIST_SIZE. When the stream-level recv peak is bigger
     %% than the RFC 65535 default, also advertise
     %% SETTINGS_INITIAL_WINDOW_SIZE (id 4) so streams the peer opens
     %% start with the larger receive allowance.
-    Base = [{3, MaxStreams}, {5, ?MAX_FRAME_SIZE}],
+    Base = [{3, MaxStreams}, {5, ?MAX_FRAME_SIZE}, {6, MaxHeaderListSize}],
     Settings =
         case StreamPeak > ?INITIAL_WINDOW of
             true -> [{4, StreamPeak} | Base];
@@ -844,7 +861,9 @@ finalize_trailers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) -
 %% Decode the accumulated HPACK fragment, store decoded headers on
 %% the stream entry. If END_STREAM was set on the HEADERS frame,
 %% dispatch the worker now (no body); otherwise wait for DATA.
-finalize_headers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) ->
+finalize_headers(
+    StreamId, #loop{streams = Streams, hpack_dec = Dec, max_header_list_size = MaxHLS} = State
+) ->
     #{
         StreamId := #{
             header_fragment := Fragment,
@@ -854,13 +873,36 @@ finalize_headers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) ->
     case roadrunner_http2_hpack:decode(iolist_to_binary(Fragment), Dec) of
         {ok, Headers, Dec1} ->
             Stream1 = Stream#{headers := Headers, header_fragment := <<>>},
+            %% Commit the mutated HPACK context even if we reject below: the
+            %% decode advanced the dynamic table, so dropping it would desync
+            %% our decoder from the peer's encoder for every later block.
             State1 = State#loop{
                 hpack_dec = Dec1,
                 streams = Streams#{StreamId := Stream1}
             },
-            case EndStreamSeen of
-                true -> dispatch_stream(StreamId, State1);
-                false -> frame_loop(State1)
+            case roadrunner_http:header_list_size(Headers) > MaxHLS of
+                true ->
+                    %% RFC 9113 §6.5.2: the decoded list exceeds the
+                    %% MAX_HEADER_LIST_SIZE we advertised. Answer 431, then
+                    %% RST_STREAM(NO_ERROR) (decode succeeded, so the
+                    %% connection is intact), and drop the stream — no worker
+                    %% is dispatched until END_STREAM.
+                    Resp = ~"Request Header Fields Too Large",
+                    State2 = encode_and_send_response_atomic(
+                        State1,
+                        StreamId,
+                        431,
+                        [{~"content-type", ~"text/plain"}],
+                        Resp,
+                        byte_size(Resp)
+                    ),
+                    _ = send_rst_stream(State2, StreamId, no_error),
+                    frame_loop(remove_stream(State2, StreamId));
+                false ->
+                    case EndStreamSeen of
+                        true -> dispatch_stream(StreamId, State1);
+                        false -> frame_loop(State1)
+                    end
             end;
         {error, _} ->
             _ = send_goaway(State, protocol_error),
