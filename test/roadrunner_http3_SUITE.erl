@@ -39,6 +39,8 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     head_sendfile/1,
     oversized_413/1,
     oversized_headers_431/1,
+    advertises_max_field_section_size/1,
+    field_section_too_large_431/1,
     protocols_tuple_form/1,
     certfile_keyfile/1,
     certs_keys_form/1,
@@ -99,6 +101,8 @@ all() ->
         head_sendfile,
         oversized_413,
         oversized_headers_431,
+        advertises_max_field_section_size,
+        field_section_too_large_431,
         protocols_tuple_form,
         certfile_keyfile,
         certs_keys_form,
@@ -182,7 +186,10 @@ init_per_testcase(Case, Config) when
     Case =:= rejects_http3_without_tls;
     Case =:= max_clients_refuse;
     Case =:= max_concurrent_requests_refuse;
-    Case =:= extra_data_after_413
+    Case =:= extra_data_after_413;
+    Case =:= oversized_headers_431;
+    Case =:= advertises_max_field_section_size;
+    Case =:= field_section_too_large_431
 ->
     Config;
 init_per_testcase(Case, Config) ->
@@ -408,15 +415,88 @@ oversized_413(_Config) ->
         roadrunner_listener:stop(Name)
     end.
 
-oversized_headers_431(Config) ->
+oversized_headers_431(_Config) ->
     %% A request whose encoded field section exceeds MAX_HEADER_BLOCK
     %% (16384) is answered 431, rejected by the conn loop before dispatch
-    %% (parity with the body 413). Uses the shared default listener.
-    Conn = connect(?config(port, Config)),
-    Big = binary:copy(<<"x">>, 50000),
-    {ok, StreamId} = quic_h3:request(Conn, headers(~"GET", ~"/") ++ [{~"x-big", Big}]),
-    ?assertMatch({431, _, _}, collect(Conn, StreamId)),
-    close(Conn).
+    %% (parity with the body 413). Advertise a huge MAX_FIELD_SECTION_SIZE
+    %% so the conformant client doesn't self-limit on the decoded size
+    %% before the request reaches the encoded cap.
+    Name = listener_name(oversized_headers_431),
+    {ok, _} = start_h3(Name, #{
+        protocols => [{http3, #{max_field_section_size => 16#7FFFFFFF}}]
+    }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        Big = binary:copy(<<"x">>, 50000),
+        {ok, StreamId} = quic_h3:request(Conn, headers(~"GET", ~"/") ++ [{~"x-big", Big}]),
+        ?assertMatch({431, _, _}, collect(Conn, StreamId))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+advertises_max_field_section_size(_Config) ->
+    %% RFC 9114 §7.2.4.1: the server advertises SETTINGS_MAX_FIELD_SECTION_SIZE
+    %% on its control stream so conformant clients self-limit (§4.2.2). A
+    %% connected client reads it back via get_peer_settings.
+    Name = listener_name(advertises_max_field_section_size),
+    {ok, _} = start_h3(Name, #{
+        protocols => [{http3, #{max_field_section_size => 54321}}]
+    }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        Settings = quic_h3:get_peer_settings(Conn),
+        ?assertEqual(54321, maps:get(max_field_section_size, Settings))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+field_section_too_large_431(_Config) ->
+    %% RFC 9114 §4.2.2: a request whose DECODED field section exceeds the
+    %% advertised MAX_FIELD_SECTION_SIZE is answered 431. The conformant
+    %% `quic_h3` client self-limits to the advertised value, so this drives
+    %% a raw, non-conformant client (the same codecs roadrunner's server
+    %% uses) over a plain QUIC stream. A 300-byte header stays well under
+    %% the 16384 encoded cap but blows the tiny 200-byte decoded limit.
+    Name = listener_name(field_section_too_large_431),
+    {ok, _} = start_h3(Name, #{
+        protocols => [{http3, #{max_field_section_size => 200}}]
+    }),
+    Conn = ll_connect(roadrunner_listener:port(Name)),
+    try
+        {ok, StreamId} = quic:open_stream(Conn),
+        Headers = headers(~"GET", ~"/") ++ [{~"x-pad", binary:copy(<<"v">>, 300)}],
+        Block = quic_qpack:encode(Headers),
+        %% Stay under the 16384 encoded cap so the ENCODED gate can't fire;
+        %% the decoded size (well over the 200 cap) is what triggers the 431.
+        ?assert(byte_size(Block) < 16384),
+        ok = quic:send_data(Conn, StreamId, quic_h3_frame:encode_headers(Block), true),
+        ?assertEqual(431, raw_h3_response_status(Conn, StreamId, <<>>))
+    after
+        ll_close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+%% Accumulate raw QUIC stream data on `StreamId` until the leading h3
+%% HEADERS frame is complete, then QPACK-decode it and return `:status`
+%% as an integer. Ignores frames on the server's control / QPACK streams.
+raw_h3_response_status(Conn, StreamId, Acc) ->
+    receive
+        {quic, Conn, {stream_data, StreamId, Bin, _Fin}} ->
+            Buf = <<Acc/binary, Bin/binary>>,
+            case quic_h3_frame:decode(Buf) of
+                {ok, {headers, Block}, _Rest} ->
+                    {ok, Hdrs} = quic_qpack:decode(Block),
+                    binary_to_integer(proplists:get_value(~":status", Hdrs));
+                {more, _} ->
+                    raw_h3_response_status(Conn, StreamId, Buf);
+                {error, Reason} ->
+                    ct:fail({h3_frame_decode_error, Reason})
+            end
+    after 5000 ->
+        ct:fail(no_h3_response)
+    end.
 
 protocols_tuple_form(_Config) ->
     Name = listener_name(protocols_tuple_form),

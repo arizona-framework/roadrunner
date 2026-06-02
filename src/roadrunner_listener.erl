@@ -410,11 +410,21 @@ HTTP/3 listener tunables (under `{http3, ThisMap}` in `protocols`).
   (request) streams, advertised to the peer in the QUIC transport
   parameters. Default `100`. The h3 counterpart to the `{http2, ...}`
   `max_concurrent_streams` opt.
+- `max_field_section_size` — cap on the *decoded* (uncompressed)
+  field-section size (RFC 7541 §4.1: sum of name + value + 32 per field),
+  advertised via `SETTINGS_MAX_FIELD_SECTION_SIZE` (so conformant clients
+  self-limit, RFC 9114 §4.2.2) and enforced after QPACK decode: an
+  over-cap request gets `431`. Bounds a different unit than
+  `max_header_block` (which caps the compressed block). Defaults to
+  `2 * max_header_block`, so raising the encoded cap lifts this one too
+  unless set explicitly. The h3 counterpart to the `{http2, ...}`
+  `max_header_list_size` opt.
 """.
 -type http3_opts() :: #{
     listeners => 1..?MAX_H3_LISTENERS,
     max_header_block => 1..16#7FFFFFFF,
-    max_streams_bidi => 1..16#7FFFFFFF
+    max_streams_bidi => 1..16#7FFFFFFF,
+    max_field_section_size => 1..16#7FFFFFFF
 }.
 
 -doc """
@@ -1294,22 +1304,26 @@ http3_defaults() ->
     #{
         listeners => ?DEFAULT_H3_LISTENERS,
         max_header_block => 16384,
-        max_streams_bidi => ?H3_MAX_STREAMS_BIDI
+        max_streams_bidi => ?H3_MAX_STREAMS_BIDI,
+        %% Placeholder: resolved to `2 * max_header_block` when not set
+        %% explicitly (see `resolve_max_field_section_size/2`).
+        max_field_section_size => 32768
     }.
 
 -spec validate_http3_opts(map(), term()) -> http3_opts().
 validate_http3_opts(Opts, Raw) ->
     Defaults = http3_defaults(),
-    maps:fold(
+    Merged = maps:fold(
         fun(K, V, Acc) ->
             %% `listeners` caps at the reuseport-pool limit; `max_header_block`
-            %% (a byte size) and `max_streams_bidi` (a stream count) go up to
-            %% the 31-bit ceiling.
+            %% (a byte size), `max_streams_bidi` (a stream count) and
+            %% `max_field_section_size` (a byte size) go up to the 31-bit ceiling.
             Max =
                 case K of
                     listeners -> ?MAX_H3_LISTENERS;
                     max_header_block -> 16#7FFFFFFF;
                     max_streams_bidi -> 16#7FFFFFFF;
+                    max_field_section_size -> 16#7FFFFFFF;
                     _ -> 0
                 end,
             case is_map_key(K, Defaults) of
@@ -1320,7 +1334,17 @@ validate_http3_opts(Opts, Raw) ->
         end,
         Defaults,
         Opts
-    ).
+    ),
+    resolve_max_field_section_size(Merged, Opts).
+
+%% MAX_FIELD_SECTION_SIZE defaults to 2x the resolved encoded-block cap so
+%% raising `max_header_block` lifts both gates together; an explicit value
+%% (already range-checked above) is kept as-is.
+-spec resolve_max_field_section_size(http3_opts(), map()) -> http3_opts().
+resolve_max_field_section_size(Merged, Opts) when is_map_key(max_field_section_size, Opts) ->
+    Merged;
+resolve_max_field_section_size(#{max_header_block := MaxHeaderBlock} = Merged, _Opts) ->
+    Merged#{max_field_section_size => 2 * MaxHeaderBlock}.
 
 %% Flatten the http3 sub-opts onto proto_opts top-level (`http3_*`) so
 %% the conn loop reads each knob with a single `maps:get/2`. Returns an
@@ -1333,12 +1357,14 @@ flatten_http3_opts(Entries) ->
         {http3, #{
             listeners := Listeners,
             max_header_block := MaxHeaderBlock,
-            max_streams_bidi := MaxStreamsBidi
+            max_streams_bidi := MaxStreamsBidi,
+            max_field_section_size := MaxFieldSection
         }} ->
             #{
                 http3_listeners => Listeners,
                 http3_max_header_block => MaxHeaderBlock,
-                http3_max_streams_bidi => MaxStreamsBidi
+                http3_max_streams_bidi => MaxStreamsBidi,
+                http3_max_field_section_size => MaxFieldSection
             }
     end.
 

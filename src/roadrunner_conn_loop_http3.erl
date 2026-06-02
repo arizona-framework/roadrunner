@@ -78,6 +78,13 @@
 %% configurable; h1 defaults to 10240, h2 to 16384).
 -define(MAX_HEADER_BLOCK, 16384).
 
+%% Default SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 §7.2.4.1): 2x the
+%% encoded-block cap, mirroring the h2 MAX_HEADER_LIST_SIZE default. The
+%% decoded field section is always larger than the compressed block (the
+%% +32/field overhead alone), so the headroom means the decoded gate only
+%% fires on genuinely huge header sets; tracks `max_header_block` when set.
+-define(DEFAULT_MAX_FIELD_SECTION_SIZE, (2 * ?MAX_HEADER_BLOCK)).
+
 %% A critical stream role can be claimed at most once per connection.
 -type critical_role() :: control | qpack_encoder | qpack_decoder.
 -type critical_set() :: #{critical_role() => true}.
@@ -122,7 +129,13 @@
     max_content_length :: non_neg_integer(),
     %% Cap on the encoded request field section (HEADERS block). Read from
     %% proto_opts at conn start; defaults to `?MAX_HEADER_BLOCK`.
-    max_header_block = ?MAX_HEADER_BLOCK :: pos_integer()
+    max_header_block = ?MAX_HEADER_BLOCK :: pos_integer(),
+    %% Cap on the DECODED field-section size (RFC 9114 §7.2.4.1
+    %% SETTINGS_MAX_FIELD_SECTION_SIZE): advertised on the control stream
+    %% (so conformant clients self-limit, §4.2.2) and enforced after QPACK
+    %% decode in `dispatch_request/2`. Read from proto_opts; defaults to
+    %% `2 * max_header_block`.
+    max_field_section_size = ?DEFAULT_MAX_FIELD_SECTION_SIZE :: pos_integer()
 }).
 
 -doc """
@@ -170,6 +183,7 @@ init(Conn, ProtoOpts) ->
     StartMono = roadrunner_telemetry:listener_accept(#{
         listener_name => ListenerName, peer => Peer
     }),
+    MaxHeaderBlock = maps:get(http3_max_header_block, ProtoOpts, ?MAX_HEADER_BLOCK),
     loop(#h3{
         conn = Conn,
         proto_opts = ProtoOpts,
@@ -177,7 +191,12 @@ init(Conn, ProtoOpts) ->
         peer = Peer,
         start_mono = StartMono,
         max_content_length = maps:get(max_content_length, ProtoOpts),
-        max_header_block = maps:get(http3_max_header_block, ProtoOpts, ?MAX_HEADER_BLOCK)
+        max_header_block = MaxHeaderBlock,
+        %% Decoded-section cap defaults to 2x the (possibly overridden) encoded
+        %% cap, so raising `max_header_block` lifts both gates together.
+        max_field_section_size = maps:get(
+            http3_max_field_section_size, ProtoOpts, 2 * MaxHeaderBlock
+        )
     }).
 
 -spec loop(#h3{}) -> ok.
@@ -237,12 +256,13 @@ recv_loop(#h3{conn = Conn} = State) ->
 %% runs the instant the handshake completes, before any peer close can
 %% arrive, so it stays strictly matched.
 -spec send_control_stream(#h3{}) -> #h3{}.
-send_control_stream(#h3{conn = Conn} = State) ->
+send_control_stream(#h3{conn = Conn, max_field_section_size = MaxFieldSection} = State) ->
     {ok, CtrlStreamId} = quic:open_unidirectional_stream(Conn),
     Prefix = quic_h3_frame:encode_stream_type(control),
     Settings = quic_h3_frame:encode_settings(#{
         qpack_max_table_capacity => 0,
-        qpack_blocked_streams => 0
+        qpack_blocked_streams => 0,
+        max_field_section_size => MaxFieldSection
     }),
     _ = quic:send_data(Conn, CtrlStreamId, [Prefix, Settings], false),
     State#h3{control_stream_id = CtrlStreamId}.
@@ -669,7 +689,7 @@ dispatch_request(#h3{streams = Streams} = State, StreamId) ->
             %% Stream ended with no HEADERS frame — a malformed message
             %% (RFC 9114 §4.1): stream error H3_MESSAGE_ERROR.
             reset_and_drop(State, StreamId, ?H3_MESSAGE_ERROR);
-        #{header_block := Block, body := Body} ->
+        #{header_block := Block} = Stream ->
             %% QPACK decode happens here (not in the worker) because a
             %% decompression failure is a CONNECTION error per RFC 9204
             %% §2.2 — the dynamic-table state is unrecoverable — whereas
@@ -678,9 +698,37 @@ dispatch_request(#h3{streams = Streams} = State, StreamId) ->
                 {error, _} ->
                     {conn_error, ?H3_QPACK_DECOMPRESSION_FAILED, ~"QPACK decompression failed"};
                 {ok, Headers} ->
-                    dispatch_decoded(State, StreamId, Headers, Body)
+                    case
+                        roadrunner_http:header_list_size(Headers) >
+                            State#h3.max_field_section_size
+                    of
+                        true ->
+                            %% RFC 9114 §4.2.2: the decoded field section
+                            %% exceeds the MAX_FIELD_SECTION_SIZE we advertised.
+                            %% QPACK is static-only here, so there's no decoder
+                            %% state to desync — answer 431 and drop the stream.
+                            respond_field_section_too_large(State, StreamId);
+                        false ->
+                            #{body := Body} = Stream,
+                            dispatch_decoded(State, StreamId, Headers, Body)
+                    end
             end
     end.
+
+%% RFC 9114 §4.2.2: a request whose decoded field section exceeds the
+%% advertised MAX_FIELD_SECTION_SIZE gets 431. The request stream has
+%% already ended (we dispatch at stream close), so no `stop_sending` is
+%% needed — just answer and drop the stream.
+-spec respond_field_section_too_large(#h3{}, non_neg_integer()) -> #h3{}.
+respond_field_section_too_large(#h3{conn = Conn} = State, StreamId) ->
+    ok = roadrunner_http3_stream_worker:send_buffered(
+        Conn,
+        StreamId,
+        431,
+        [{~"content-type", ~"text/plain"}],
+        ~"Request Header Fields Too Large"
+    ),
+    drop_stream(State, StreamId).
 
 -spec dispatch_decoded(#h3{}, non_neg_integer(), roadrunner_http:headers(), iodata()) ->
     handle_result().
