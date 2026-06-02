@@ -376,13 +376,21 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
   Default `16384`. This is the h2 counterpart to the `{http1, ...}`
   `max_header_block` opt, but the two are independent and default
   differently (h1 `10240`, h2 `16384`).
+- `max_header_list_size` — cap on the *decoded* (uncompressed)
+  header-list size (RFC 7541 §4.1: sum of name + value + 32 per
+  field), advertised via `SETTINGS_MAX_HEADER_LIST_SIZE`; an
+  over-cap request gets `431` + `RST_STREAM(NO_ERROR)`. Bounds a
+  different unit than `max_header_block` (which caps the compressed
+  block). Defaults to `2 * max_header_block`, so raising the encoded
+  cap lifts this one too unless set explicitly.
 """.
 -type http2_opts() :: #{
     conn_window => 1..16#7FFFFFFF,
     stream_window => 1..16#7FFFFFFF,
     window_refill_threshold => 1..16#7FFFFFFF,
     max_concurrent_streams => 1..16#7FFFFFFF,
-    max_header_block => 1..16#7FFFFFFF
+    max_header_block => 1..16#7FFFFFFF,
+    max_header_list_size => 1..16#7FFFFFFF
 }.
 
 -doc """
@@ -1224,13 +1232,16 @@ http2_defaults() ->
         stream_window => 65535,
         window_refill_threshold => 32768,
         max_concurrent_streams => 100,
-        max_header_block => 16384
+        max_header_block => 16384,
+        %% Placeholder: resolved to `2 * max_header_block` when not set
+        %% explicitly (see `resolve_max_header_list_size/2`).
+        max_header_list_size => 32768
     }.
 
 -spec validate_http2_opts(map(), term()) -> http2_opts().
 validate_http2_opts(Opts, Raw) ->
     Defaults = http2_defaults(),
-    maps:fold(
+    Merged = maps:fold(
         fun(K, V, Acc) ->
             case is_map_key(K, Defaults) of
                 false -> error({invalid_listener_opt, protocols, Raw});
@@ -1240,7 +1251,17 @@ validate_http2_opts(Opts, Raw) ->
         end,
         Defaults,
         Opts
-    ).
+    ),
+    resolve_max_header_list_size(Merged, Opts).
+
+%% MAX_HEADER_LIST_SIZE defaults to 2x the resolved encoded-block cap so
+%% raising `max_header_block` lifts both gates together; an explicit value
+%% (already range-checked above) is kept as-is.
+-spec resolve_max_header_list_size(http2_opts(), map()) -> http2_opts().
+resolve_max_header_list_size(Merged, Opts) when is_map_key(max_header_list_size, Opts) ->
+    Merged;
+resolve_max_header_list_size(#{max_header_block := MaxHeaderBlock} = Merged, _Opts) ->
+    Merged#{max_header_list_size => 2 * MaxHeaderBlock}.
 
 %% Flatten the http2 sub-opts onto proto_opts top-level with an
 %% `http2_` prefix so the hot path reads each knob with a single
@@ -1255,14 +1276,16 @@ flatten_http2_opts(Entries) ->
             stream_window := Stream,
             window_refill_threshold := Threshold,
             max_concurrent_streams := MaxStreams,
-            max_header_block := MaxHeaderBlock
+            max_header_block := MaxHeaderBlock,
+            max_header_list_size := MaxHeaderListSize
         }} ->
             #{
                 http2_conn_window => Conn,
                 http2_stream_window => Stream,
                 http2_window_refill_threshold => Threshold,
                 http2_max_concurrent_streams => MaxStreams,
-                http2_max_header_block => MaxHeaderBlock
+                http2_max_header_block => MaxHeaderBlock,
+                http2_max_header_list_size => MaxHeaderListSize
             }
     end.
 

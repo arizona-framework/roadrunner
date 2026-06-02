@@ -40,3 +40,12 @@ format_http_date_pads_single_digits_test() ->
     %% clause is exercised regardless of wall-clock at test run time.
     Date = roadrunner_http:format_http_date(0),
     ?assertEqual(~"Thu, 01 Jan 1970 00:00:00 GMT", Date).
+
+header_list_size_sums_fields_with_overhead_test() ->
+    %% RFC 7541 §4.1: each field contributes name + value + 32 bytes.
+    ?assertEqual(0, roadrunner_http:header_list_size([])),
+    %% "a"(1) + "bb"(2) + 32 = 35; plus "ccc"(3) + ""(0) + 32 = 35 → 70.
+    ?assertEqual(
+        70,
+        roadrunner_http:header_list_size([{~"a", ~"bb"}, {~"ccc", ~""}])
+    ).

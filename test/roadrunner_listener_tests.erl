@@ -375,6 +375,30 @@ listener_threads_http1_limits_into_proto_opts_test() ->
     ?assertEqual(250, maps:get(http1_max_header_count, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
+listener_http2_max_header_list_size_threads_into_proto_opts_test() ->
+    %% An explicit `max_header_list_size` flattens through verbatim;
+    %% omitting it derives `2 * max_header_block` so raising the encoded
+    %% cap lifts the decoded gate too.
+    Explicit = listener_test_h2_hls_explicit,
+    {ok, P1} = roadrunner_listener:start_link(Explicit, #{
+        port => 0,
+        protocols => [{http2, #{max_header_list_size => 50000}}],
+        routes => roadrunner_hello_handler
+    }),
+    PO1 = element(4, sys:get_state(P1)),
+    ?assertEqual(50000, maps:get(http2_max_header_list_size, PO1)),
+    ok = roadrunner_listener:stop(Explicit),
+    Derived = listener_test_h2_hls_derived,
+    {ok, P2} = roadrunner_listener:start_link(Derived, #{
+        port => 0,
+        protocols => [{http2, #{max_header_block => 65536}}],
+        routes => roadrunner_hello_handler
+    }),
+    PO2 = element(4, sys:get_state(P2)),
+    ?assertEqual(65536, maps:get(http2_max_header_block, PO2)),
+    ?assertEqual(131072, maps:get(http2_max_header_list_size, PO2)),
+    ok = roadrunner_listener:stop(Derived).
+
 listener_http1_defaults_thread_into_proto_opts_test() ->
     %% Bare `http1` (no tuple) fills the default limits into proto_opts.
     Name = listener_test_http1_defaults,
