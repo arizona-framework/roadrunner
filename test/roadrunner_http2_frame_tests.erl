@@ -41,12 +41,16 @@ parse_returns_remainder_after_frame_test() ->
 %% =============================================================================
 
 data_frame_round_trip_test() ->
-    Frame = {data, 1, 0, ~"hello"},
-    ?assertEqual({ok, Frame, <<>>}, parse(Frame)).
+    %% `encode/1` takes the 4-tuple; `parse/2` yields the 5-tuple with the
+    %% on-wire flow-control length (= the body size when unpadded).
+    ?assertEqual(
+        {ok, {data, 1, 0, ~"hello", 5}, <<>>}, parse({data, 1, 0, ~"hello"})
+    ).
 
 data_frame_with_end_stream_round_trip_test() ->
-    Frame = {data, 3, 16#01, ~"bye"},
-    ?assertEqual({ok, Frame, <<>>}, parse(Frame)).
+    ?assertEqual(
+        {ok, {data, 3, 16#01, ~"bye", 3}, <<>>}, parse({data, 3, 16#01, ~"bye"})
+    ).
 
 data_frame_with_padding_strips_pad_bytes_test() ->
     %% Manually encode a padded DATA frame: <<PadLen, Body, Pad>>.
@@ -56,7 +60,12 @@ data_frame_with_padding_strips_pad_bytes_test() ->
     Payload = <<PadLen:8, Body/binary, Padding/binary>>,
     Header = <<(byte_size(Payload)):24, 0, 16#08, 0:1, 1:31>>,
     Bin = <<Header/binary, Payload/binary>>,
-    ?assertEqual({ok, {data, 1, 16#08, Body}, <<>>}, roadrunner_http2_frame:parse(Bin, ?MAX)).
+    %% Parse strips padding to `Body` but reports the full on-wire payload
+    %% (1 pad-length byte + 5 body + 5 padding = 11) as the flow length.
+    ?assertEqual(
+        {ok, {data, 1, 16#08, Body, byte_size(Payload)}, <<>>},
+        roadrunner_http2_frame:parse(Bin, ?MAX)
+    ).
 
 data_frame_pad_too_long_returns_bad_padding_test() ->
     %% PadLen=10 but only 5 bytes available after the length byte —

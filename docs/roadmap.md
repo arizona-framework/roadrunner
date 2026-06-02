@@ -199,22 +199,6 @@ only parse the peer's value and bound inbound via the encoded
 `max_header_block` cap. The ~50 handshake fixtures that drain the server
 SETTINGS need to tolerate the extra entry.
 
-### h2 padded-DATA flow-control accounting
-
-**What:** A padded DATA frame undercounts its flow-control debit by the
-padding bytes — the codec strips padding before `on_data` sees the
-length, so the stream / connection recv windows (and the conn-window
-replenish on a reset stream) are charged the unpadded length.
-
-**Why deferred:** DATA padding is essentially never used by real
-clients, the undercount is at most 256 bytes per frame, and
-`max_content_length` already bounds the buffered body — so it's a
-codec-shape change for near-zero practical benefit. A correct fix
-threads the frame's declared Length through the codec (the decoded DATA
-tuple is matched in several places).
-
-**Scope:** small-to-medium.
-
 ### Refresh resource_results.md against the current headline scenarios
 
 **What:** `docs/resource_results.md` still carries its own scenario
