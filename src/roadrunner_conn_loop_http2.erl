@@ -112,6 +112,11 @@
 %% RST_STREAM(REFUSED_STREAM) on the over-limit HEADERS.
 -define(MAX_CONCURRENT_STREAMS, 100).
 
+%% Request-body cap fallback when proto_opts omits `max_content_length`
+%% (only test harnesses do; the listener always sets it). Matches the
+%% listener default.
+-define(DEFAULT_MAX_CONTENT_LENGTH, 10_485_760).
+
 -define(GOAWAY(LastStreamId, ErrorCode),
     roadrunner_http2_frame:encode({goaway, (LastStreamId), (ErrorCode), <<>>})
 ).
@@ -199,6 +204,10 @@
     %% Cumulative HEADERS+CONTINUATION block cap (CONTINUATION-flood guard).
     %% Read from proto_opts at `enter/5`.
     max_header_block = ?MAX_HEADER_BLOCK :: pos_integer(),
+    %% Request-body cap (`max_content_length` listener opt); an over-cap
+    %% body answers 413 + RST_STREAM(NO_ERROR). Read from proto_opts at
+    %% `enter/5`.
+    max_content_length = ?DEFAULT_MAX_CONTENT_LENGTH :: non_neg_integer(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -249,6 +258,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
     ),
     MaxStreams = maps:get(http2_max_concurrent_streams, ProtoOpts, ?MAX_CONCURRENT_STREAMS),
     MaxHeaderBlock = maps:get(http2_max_header_block, ProtoOpts, ?MAX_HEADER_BLOCK),
+    MaxContentLength = maps:get(max_content_length, ProtoOpts, ?DEFAULT_MAX_CONTENT_LENGTH),
     State = #loop{
         socket = Socket,
         proto_opts = ProtoOpts,
@@ -265,7 +275,8 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
         stream_recv_window_peak = StreamPeak,
         recv_window_threshold = Threshold,
         max_concurrent_streams = MaxStreams,
-        max_header_block = MaxHeaderBlock
+        max_header_block = MaxHeaderBlock,
+        max_content_length = MaxContentLength
     },
     handshake(State).
 
@@ -865,28 +876,48 @@ on_data(StreamId, _Flags, _Payload, #loop{streams = Streams} = State) when
     %% RST_STREAM rather than ignoring.
     _ = send_rst_stream(State, StreamId, stream_closed),
     frame_loop(State);
-on_data(StreamId, Flags, Payload, #loop{streams = Streams} = State) ->
+on_data(StreamId, Flags, Payload, #loop{streams = Streams, max_content_length = MaxCL} = State) ->
     case Streams of
         #{
             StreamId :=
                 #{state := open, body := Body, body_len := Len, recv_window := RW} = Stream
         } ->
-            EndStream = (Flags band 16#01) =/= 0,
             PayloadLen = byte_size(Payload),
-            Stream1 = Stream#{
-                body := [Body, Payload],
-                body_len := Len + PayloadLen,
-                end_stream_seen := EndStream,
-                recv_window := RW - PayloadLen
-            },
-            State1 = State#loop{
-                streams = Streams#{StreamId := Stream1},
-                conn_recv_window = State#loop.conn_recv_window - PayloadLen
-            },
-            State2 = maybe_refill_recv_windows(State1, StreamId),
-            case EndStream of
-                true -> dispatch_stream(StreamId, State2);
-                false -> frame_loop(State2)
+            case Len + PayloadLen > MaxCL of
+                true ->
+                    %% RFC 9113 §8.1: the request body exceeds
+                    %% `max_content_length`. Answer 413 before the full
+                    %% request, then RST_STREAM(NO_ERROR) to ask the client to
+                    %% stop sending the rest, and drop the stream (no worker
+                    %% was dispatched — dispatch is at END_STREAM).
+                    Resp = ~"Payload Too Large",
+                    State1 = encode_and_send_response_atomic(
+                        State,
+                        StreamId,
+                        413,
+                        [{~"content-type", ~"text/plain"}],
+                        Resp,
+                        byte_size(Resp)
+                    ),
+                    _ = send_rst_stream(State1, StreamId, no_error),
+                    frame_loop(remove_stream(State1, StreamId));
+                false ->
+                    EndStream = (Flags band 16#01) =/= 0,
+                    Stream1 = Stream#{
+                        body := [Body, Payload],
+                        body_len := Len + PayloadLen,
+                        end_stream_seen := EndStream,
+                        recv_window := RW - PayloadLen
+                    },
+                    State1 = State#loop{
+                        streams = Streams#{StreamId := Stream1},
+                        conn_recv_window = State#loop.conn_recv_window - PayloadLen
+                    },
+                    State2 = maybe_refill_recv_windows(State1, StreamId),
+                    case EndStream of
+                        true -> dispatch_stream(StreamId, State2);
+                        false -> frame_loop(State2)
+                    end
             end;
         #{StreamId := _} ->
             %% RFC 9113 §5.1: the peer already sent END_STREAM (the
