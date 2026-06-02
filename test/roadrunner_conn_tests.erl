@@ -859,10 +859,12 @@ conn_websocket_pong_silently_handled_test_() ->
 
 conn_websocket_bad_frame_closes_test_() ->
     {setup, fun ws_setup/0, fun ws_cleanup/1, fun(Port) ->
-        {"frame with RSV bit set causes the server to close silently", fun() ->
+        {"frame with RSV bit set closes with a 1002 protocol-error frame", fun() ->
             Sock = ws_handshake(Port),
             %% byte1 = 0xc1: FIN=1, RSV1=1, opcode=text — RSV1 forbidden.
             ok = gen_tcp:send(Sock, <<16#c1, 16#80, 1, 2, 3, 4>>),
+            %% RFC 6455 §5.5.1: a 1002 Close frame, then the TCP close.
+            ?assertEqual({ok, <<16#88, 2, 1002:16>>}, gen_tcp:recv(Sock, 0, 1000)),
             ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 1000)),
             ok = gen_tcp:close(Sock)
         end}
@@ -870,11 +872,12 @@ conn_websocket_bad_frame_closes_test_() ->
 
 conn_websocket_unmasked_frame_closes_test_() ->
     {setup, fun ws_setup/0, fun ws_cleanup/1, fun(Port) ->
-        {"RFC 6455 §5.1: client MUST mask frames; server closes on unmasked", fun() ->
+        {"RFC 6455 §5.1: client MUST mask frames; server closes with 1002 on unmasked", fun() ->
             Sock = ws_handshake(Port),
             %% byte1 = 0x81 (FIN+text), byte2 = 0x05 (mask=0, len=5), then
-            %% raw payload. Server must reject and close.
+            %% raw payload. Server rejects with a 1002 Close, then closes.
             ok = gen_tcp:send(Sock, <<16#81, 16#05, "hello">>),
+            ?assertEqual({ok, <<16#88, 2, 1002:16>>}, gen_tcp:recv(Sock, 0, 1000)),
             ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 1000)),
             ok = gen_tcp:close(Sock)
         end}

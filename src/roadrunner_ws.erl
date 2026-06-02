@@ -486,7 +486,13 @@ format_pmd_kv(Name, Value, _Default) -> [~"; ", Name, ~"=", integer_to_binary(Va
 -spec parse_frame(binary()) ->
     {ok, frame(), Rest :: binary()}
     | {more, undefined}
-    | {error, bad_opcode | bad_rsv | not_masked | fragmented_control | control_frame_too_large}.
+    | {error,
+        bad_opcode
+        | bad_rsv
+        | not_masked
+        | fragmented_control
+        | control_frame_too_large
+        | bad_length}.
 parse_frame(Bin) ->
     parse_frame(Bin, #{}).
 
@@ -499,7 +505,13 @@ parse_frame(Bin) ->
 -spec parse_frame(binary(), parse_opts()) ->
     {ok, frame(), Rest :: binary()}
     | {more, undefined}
-    | {error, bad_opcode | bad_rsv | not_masked | fragmented_control | control_frame_too_large}.
+    | {error,
+        bad_opcode
+        | bad_rsv
+        | not_masked
+        | fragmented_control
+        | control_frame_too_large
+        | bad_length}.
 parse_frame(Bin, Opts) ->
     do_parse_frame(
         Bin,
@@ -510,7 +522,13 @@ parse_frame(Bin, Opts) ->
 -spec do_parse_frame(binary(), boolean(), binary() | undefined) ->
     {ok, frame(), Rest :: binary()}
     | {more, undefined}
-    | {error, bad_opcode | bad_rsv | not_masked | fragmented_control | control_frame_too_large}.
+    | {error,
+        bad_opcode
+        | bad_rsv
+        | not_masked
+        | fragmented_control
+        | control_frame_too_large
+        | bad_length}.
 do_parse_frame(<<_Fin:1, _Rsv1:1, Rsv23:2, _:4, _/bitstring>>, _AllowRsv1, _Pre) when
     Rsv23 =/= 0
 ->
@@ -551,14 +569,26 @@ do_parse_frame(_, _AllowRsv1, _Pre) ->
 -spec peek_frame_header(binary(), parse_opts()) ->
     {ok, map(), non_neg_integer()}
     | {more, undefined}
-    | {error, bad_opcode | bad_rsv | not_masked | fragmented_control | control_frame_too_large}.
+    | {error,
+        bad_opcode
+        | bad_rsv
+        | not_masked
+        | fragmented_control
+        | control_frame_too_large
+        | bad_length}.
 peek_frame_header(Bin, Opts) ->
     do_peek(Bin, maps:get(allow_rsv1, Opts, false)).
 
 -spec do_peek(binary(), boolean()) ->
     {ok, map(), non_neg_integer()}
     | {more, undefined}
-    | {error, bad_opcode | bad_rsv | not_masked | fragmented_control | control_frame_too_large}.
+    | {error,
+        bad_opcode
+        | bad_rsv
+        | not_masked
+        | fragmented_control
+        | control_frame_too_large
+        | bad_length}.
 do_peek(<<_Fin:1, _Rsv1:1, Rsv23:2, _:4, _/bitstring>>, _AllowRsv1) when Rsv23 =/= 0 ->
     {error, bad_rsv};
 do_peek(<<_Fin:1, 1:1, 0:2, _:4, _/bitstring>>, false) ->
@@ -577,11 +607,15 @@ do_peek(_, _AllowRsv1) ->
     {more, undefined}.
 
 -spec peek_extract(opcode(), 0 | 1, 0 | 1, 0 | 1, 0..127, binary()) ->
-    {ok, map(), non_neg_integer()} | {more, undefined} | {error, not_masked}.
+    {ok, map(), non_neg_integer()} | {more, undefined} | {error, not_masked | bad_length}.
 peek_extract(_Opcode, _Fin, _Rsv1, 0, _Len7, _Rest) ->
     {error, not_masked};
 peek_extract(Opcode, Fin, Rsv1, 1, 126, <<Len:16, MaskKey:4/binary, Body/binary>>) ->
     {ok, peek_header(Opcode, Fin, Rsv1, Len, MaskKey, 8), byte_size(Body)};
+peek_extract(_Opcode, _Fin, _Rsv1, 1, 127, <<Len:64, _/binary>>) when Len >= (1 bsl 63) ->
+    %% RFC 6455 §5.2: the 64-bit extended length's most significant bit
+    %% MUST be 0. A protocol error (closed 1002), not an oversize (1009).
+    {error, bad_length};
 peek_extract(Opcode, Fin, Rsv1, 1, 127, <<Len:64, MaskKey:4/binary, Body/binary>>) ->
     {ok, peek_header(Opcode, Fin, Rsv1, Len, MaskKey, 14), byte_size(Body)};
 peek_extract(Opcode, Fin, Rsv1, 1, Len7, <<MaskKey:4/binary, Body/binary>>) when Len7 < 126 ->
@@ -636,9 +670,13 @@ decode_opcode(_) -> error.
 ) ->
     {ok, frame(), binary()}
     | {more, undefined}
-    | {error, not_masked}.
+    | {error, not_masked | bad_length}.
 parse_length(126, Mask, <<Len:16, Rest/binary>>, Fin, Rsv1, Op, Pre) ->
     parse_payload(Len, Mask, Rest, Fin, Rsv1, Op, Pre);
+parse_length(127, _Mask, <<Len:64, _Rest/binary>>, _Fin, _Rsv1, _Op, _Pre) when Len >= (1 bsl 63) ->
+    %% RFC 6455 §5.2: the 64-bit extended length's most significant bit
+    %% MUST be 0.
+    {error, bad_length};
 parse_length(127, Mask, <<Len:64, Rest/binary>>, Fin, Rsv1, Op, Pre) ->
     parse_payload(Len, Mask, Rest, Fin, Rsv1, Op, Pre);
 parse_length(Len7, Mask, Rest, Fin, Rsv1, Op, Pre) when Len7 < 126 ->
