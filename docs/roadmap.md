@@ -245,30 +245,6 @@ variance). Eyeball-from-summary covers the v1 use case.
 **Scope:** medium. The parser, distribution stats, baseline storage, and
 presentation are the bulk; the artifact upload already ships.
 
-### Proper OTP citizenship in loop responses
-
-**What:** The h1 (`roadrunner_loop_response:info_loop/4`), h2
-(`roadrunner_http2_loop_response:info_loop/5`), and h3
-(`roadrunner_http3_stream_worker:info_loop/5`) loops all silently
-drop `{system, _, _}`, `{'$gen_call', _, _}`, and `{'$gen_cast', _}`
-messages. A more polite implementation would call
-`sys:handle_system_msg/6` on the system message, reply to gen-calls
-with `gen:reply(From, {error, not_supported})`, and so on.
-
-**Why deferred:** the conn (h1) and the h2/h3 stream workers are
-plain `proc_lib`-spawned loops, not `gen_*` behaviours, so the only
-path for these shapes to reach them is misuse (`gen_server:call(ConnPid, _)`
-or `sys:get_state(ConnPid)`). The current contract is "those calls
-appear to hang; the caller should expect to time out", documented
-in the `roadrunner_loop_response` moduledoc. Proper handling would
-make these calls observable (e.g. `sys:get_state/1` would return the
-loop state), which has debugging value but no functional fix.
-
-**Scope:** small. New helper `roadrunner_loop_sys` exporting a
-single `handle/3` (sys message, From, ProcessState) used from the
-h1, h2, and h3 info_loops. Tests covering sys/get_state, sys/replace_state,
-gen_call rejection, gen_cast no-op.
-
 ### h2 manual-mode body reading
 
 **What:** Parity with the h1 manual-mode body reader for h2 streams

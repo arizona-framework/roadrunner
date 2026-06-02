@@ -18,11 +18,9 @@ handle_info(Msg, _Push, ProbePid) ->
 
 %% `info_loop/4` must NOT deliver `{system, _, _}`,
 %% `{'$gen_call', _, _}`, or `{'$gen_cast', _}` to the handler.
-%% Those shapes only reach the conn via misuse (the conn doesn't
-%% speak the OTP gen_* protocols) and surfacing them at
-%% `handle_info/3` would force handlers to defensively match on
-%% bytes they have no reason to handle. Skipped messages remain
-%% queued and are dropped when the conn exits.
+%% Those shapes are answered by `roadrunner_loop_sys` (the dedicated
+%% behaviour tests below cover the answers); the handler only ever sees
+%% the user-bound messages.
 loop_skips_otp_internal_messages_test() ->
     Tag = make_ref(),
     Self = self(),
@@ -51,6 +49,49 @@ loop_skips_otp_internal_messages_test() ->
     %% The handler must see the two user messages in order, and
     %% nothing else.
     ?assertEqual([user_msg_1, user_msg_2], Got).
+
+%% A `gen_server:call/2,3` against the loop replies `{error, not_supported}`
+%% instead of hanging.
+loop_gen_call_replies_not_supported_test() ->
+    {Worker, Ref} = start_loop_worker(some_state),
+    ?assertEqual({error, not_supported}, gen_server:call(Worker, ping)),
+    stop_loop_worker(Worker, Ref).
+
+%% `sys:get_state/1` returns the handler's loop state.
+loop_sys_get_state_returns_state_test() ->
+    {Worker, Ref} = start_loop_worker({loop_state, 42}),
+    ?assertEqual({loop_state, 42}, sys:get_state(Worker)),
+    stop_loop_worker(Worker, Ref).
+
+%% `sys:replace_state/2` swaps the loop state in place.
+loop_sys_replace_state_test() ->
+    {Worker, Ref} = start_loop_worker(0),
+    ?assertEqual(1, sys:replace_state(Worker, fun(N) -> N + 1 end)),
+    ?assertEqual(1, sys:get_state(Worker)),
+    stop_loop_worker(Worker, Ref).
+
+%% `sys:terminate/2` stops the loop with the given reason.
+loop_sys_terminate_stops_worker_test() ->
+    {Worker, Ref} = start_loop_worker(some_state),
+    ok = sys:terminate(Worker, shutdown),
+    receive
+        {'DOWN', Ref, process, Worker, shutdown} -> ok
+    after 1000 -> error(worker_not_terminated)
+    end.
+
+%% Spawn the loop in a monitored worker over a fake socket. No user
+%% messages are sent in the sys/gen tests, so the handler's forward
+%% logic is never exercised and the loop state can be any term.
+stop_loop_worker(Worker, Ref) ->
+    ok = sys:terminate(Worker, normal),
+    _ = erlang:demonitor(Ref, [flush]),
+    ok.
+
+start_loop_worker(State) ->
+    Sink = spawn_send_log_sink(self(), make_ref()),
+    spawn_monitor(fun() ->
+        roadrunner_loop_response:run({fake, Sink}, 200, [], ?MODULE, State)
+    end).
 
 collect_handler_msgs(Acc, Timeout) ->
     receive

@@ -373,18 +373,22 @@ send_loop(Conn, StreamId, Status, Headers, Handler, State) ->
     Push = fun(Data) -> loop_push(Conn, StreamId, Data) end,
     info_loop(Conn, StreamId, Handler, Push, State).
 
-%% OTP message shapes are dropped (we are a plain spawn, not a `gen_*`,
-%% so a `gen_server:call/2,3` against the worker times out rather than
-%% surfacing in `handle_info/3`); any other message is the handler's.
+%% OTP message shapes are answered via `roadrunner_loop_sys` rather than
+%% surfacing in `handle_info/3`: `sys:get_state/1` & friends work and a
+%% `gen_server:call/2,3` against the worker gets `{error, not_supported}`
+%% instead of hanging (see `roadrunner_loop_response` for the full
+%% contract); any other message is the handler's.
 -spec info_loop(pid(), non_neg_integer(), module(), roadrunner_handler:push_fun(), term()) -> ok.
 info_loop(Conn, StreamId, Handler, Push, State) ->
     receive
         {'DOWN', _MonRef, process, Conn, _Reason} ->
             %% Connection gone — stop looping.
             ok;
-        {system, _, _} ->
-            info_loop(Conn, StreamId, Handler, Push, State);
-        {'$gen_call', _, _} ->
+        {system, From, Req} ->
+            Resume = fun(S) -> info_loop(Conn, StreamId, Handler, Push, S) end,
+            roadrunner_loop_sys:handle_system(Req, From, State, Resume);
+        {'$gen_call', From, _} ->
+            ok = roadrunner_loop_sys:gen_call_unsupported(From),
             info_loop(Conn, StreamId, Handler, Push, State);
         {'$gen_cast', _} ->
             info_loop(Conn, StreamId, Handler, Push, State);

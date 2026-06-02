@@ -942,15 +942,15 @@ loop_response_emits_data_then_closes_on_stop() ->
     cleanup(Pid, Ref).
 
 loop_response_filters_otp_messages() ->
-    %% sys / gen_call / gen_cast shapes must NOT reach `handle_info/3`.
-    %% The handler increments `N` only on `{push, _}`; if any OTP
-    %% message slipped through to handle_info the `bye(N)` chunk
-    %% would show a larger counter.
+    %% sys / gen_call / gen_cast shapes are answered (not delivered to
+    %% `handle_info/3`). The handler increments `N` only on `{push, _}`, so
+    %% the OTP shapes must not advance it: `sys:get_state/1` returns the
+    %% counter, a gen-call gets `{error, not_supported}`, a gen-cast no-ops.
     {Pid, Ref} = run_stream_request(~"/loop"),
     wait_for_register(roadrunner_h2_loop_test, 1000),
-    roadrunner_h2_loop_test ! {system, make_ref(), get_state},
-    roadrunner_h2_loop_test ! {'$gen_call', {self(), make_ref()}, ping},
-    roadrunner_h2_loop_test ! {'$gen_cast', whatever},
+    ?assertEqual(0, sys:get_state(roadrunner_h2_loop_test)),
+    ?assertEqual({error, not_supported}, gen_server:call(roadrunner_h2_loop_test, ping)),
+    ok = gen_server:cast(roadrunner_h2_loop_test, whatever),
     roadrunner_h2_loop_test ! {push, ~"real"},
     roadrunner_h2_loop_test ! stop,
     Frames = collect_response_frames(),

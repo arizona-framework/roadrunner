@@ -9,9 +9,10 @@
 %% h1: a handler's `self() ! Msg` and `register/2` calls from
 %% `handle/1` work because the worker IS the dispatch process. OTP
 %% shapes (`{system, _, _}`, `{'$gen_call', _, _}`, `{'$gen_cast', _}`)
-%% are silently dropped via dedicated receive clauses; we're a plain
-%% spawn, not a `gen_*`, so `gen_server:call/2,3` against the worker
-%% will time out instead of surfacing in `handle_info/3`.
+%% are answered via `roadrunner_loop_sys` rather than surfacing in
+%% `handle_info/3`: `sys:get_state/1` & friends work, and
+%% `gen_server:call/2,3` against the worker gets `{error, not_supported}`
+%% instead of hanging (see `roadrunner_loop_response` for the full contract).
 %%
 %% On `{stop, _NewState}` the worker emits an empty DATA frame with
 %% END_STREAM and returns; the conn cleans up the stream slot via the
@@ -53,9 +54,11 @@ info_loop(ConnPid, StreamId, Handler, Push, State) ->
             %% it. Stop looping rather than forwarding the reset to the
             %% handler's `handle_info/3` as if it were application data.
             ok;
-        {system, _, _} ->
-            info_loop(ConnPid, StreamId, Handler, Push, State);
-        {'$gen_call', _, _} ->
+        {system, From, Req} ->
+            Resume = fun(S) -> info_loop(ConnPid, StreamId, Handler, Push, S) end,
+            roadrunner_loop_sys:handle_system(Req, From, State, Resume);
+        {'$gen_call', From, _} ->
+            ok = roadrunner_loop_sys:gen_call_unsupported(From),
             info_loop(ConnPid, StreamId, Handler, Push, State);
         {'$gen_cast', _} ->
             info_loop(ConnPid, StreamId, Handler, Push, State);
