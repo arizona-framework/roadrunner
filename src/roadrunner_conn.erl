@@ -620,7 +620,10 @@ read_body_until_io(N, RecvFun) ->
 ) ->
     {ok, binary(), binary()} | {error, content_length_too_large | term()}.
 read_chunked(Buf, RecvFun, MaxCL, Decoded, TrailerLimits) ->
-    case roadrunner_http1:parse_chunk(Buf, TrailerLimits) of
+    %% `parse_chunk/3` rejects a declared chunk size over the remaining
+    %% budget on its size line, so an oversized chunk can't buffer past
+    %% the cap before this loop sees it.
+    case roadrunner_http1:parse_chunk(Buf, TrailerLimits, MaxCL - Decoded) of
         {ok, last, _Trailers, Leftover} ->
             %% Bytes after the size-0 last-chunk + trailer block are
             %% pipelined-next-request leftover; thread them up so the
@@ -628,16 +631,11 @@ read_chunked(Buf, RecvFun, MaxCL, Decoded, TrailerLimits) ->
             {ok, <<>>, Leftover};
         {ok, Data, Rest} ->
             NewDecoded = Decoded + byte_size(Data),
-            if
-                NewDecoded > MaxCL ->
-                    {error, content_length_too_large};
-                true ->
-                    case read_chunked(Rest, RecvFun, MaxCL, NewDecoded, TrailerLimits) of
-                        {ok, More, Leftover} ->
-                            {ok, <<Data/binary, More/binary>>, Leftover};
-                        {error, _} = E ->
-                            E
-                    end
+            case read_chunked(Rest, RecvFun, MaxCL, NewDecoded, TrailerLimits) of
+                {ok, More, Leftover} ->
+                    {ok, <<Data/binary, More/binary>>, Leftover};
+                {error, _} = E ->
+                    E
             end;
         {more, _} ->
             case RecvFun() of
@@ -785,16 +783,11 @@ chunked_collect(
     } = BS,
     Want
 ) ->
-    case roadrunner_http1:parse_chunk(Buf, TrailerLimits) of
+    case roadrunner_http1:parse_chunk(Buf, TrailerLimits, Max - Read) of
         {ok, Data, Rest} ->
             NewRead = Read + byte_size(Data),
-            case NewRead > Max of
-                true ->
-                    {error, content_length_too_large};
-                false ->
-                    BS2 = BS#{buffered := Rest, bytes_read := NewRead, pending := Data},
-                    chunked_collect(BS2, Want)
-            end;
+            BS2 = BS#{buffered := Rest, bytes_read := NewRead, pending := Data},
+            chunked_collect(BS2, Want);
         {ok, last, _Trailers, Rest} ->
             chunked_collect(BS#{buffered := Rest, done := true}, Want);
         {more, _} ->
@@ -829,15 +822,10 @@ next_chunk(
         trailer_limits := TrailerLimits
     } = BS
 ) ->
-    case roadrunner_http1:parse_chunk(Buf, TrailerLimits) of
+    case roadrunner_http1:parse_chunk(Buf, TrailerLimits, Max - Read) of
         {ok, Data, Rest} ->
             NewRead = Read + byte_size(Data),
-            case NewRead > Max of
-                true ->
-                    {error, content_length_too_large};
-                false ->
-                    {more, Data, BS#{buffered := Rest, bytes_read := NewRead}}
-            end;
+            {more, Data, BS#{buffered := Rest, bytes_read := NewRead}};
         {ok, last, _Trailers, Rest} ->
             {ok, <<>>, BS#{buffered := Rest, done := true}};
         {more, _} ->

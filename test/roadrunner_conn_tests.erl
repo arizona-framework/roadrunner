@@ -222,6 +222,18 @@ read_body_chunked_second_chunk_exceeds_max_test() ->
         )
     ).
 
+read_body_chunked_declared_size_over_max_rejected_before_buffering_test() ->
+    %% A chunk that DECLARES a huge size but supplies no body bytes is
+    %% rejected on its size line, before any recv. `NoRecv` proves the
+    %% cap fires from the declared size alone: pre-fix this looped into
+    %% RecvFun asking for the ~2GB body before any 413.
+    Req = req_with_headers([{~"transfer-encoding", ~"chunked"}]),
+    NoRecv = fun() -> error(should_not_be_called) end,
+    ?assertEqual(
+        {error, content_length_too_large},
+        roadrunner_conn:read_body(Req, ~"7fffffff\r\n", NoRecv, 100, {8192, 10240, 100})
+    ).
+
 read_body_chunked_bad_chunk_size_test() ->
     Req = req_with_headers([{~"transfer-encoding", ~"chunked"}]),
     NoRecv = fun() -> error(should_not_be_called) end,

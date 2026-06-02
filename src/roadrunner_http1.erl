@@ -17,6 +17,7 @@
     parse_request/2,
     parse_chunk/1,
     parse_chunk/2,
+    parse_chunk/3,
     check_header_safe/2,
     response/3,
     compute_cached_decisions/1
@@ -723,17 +724,50 @@ headers; `parse_chunk/1` passes the `?MAX_*` defaults.
         | header_block_too_long
         | too_many_headers
         | conflicting_framing}.
-parse_chunk(Bin, Limits) when is_binary(Bin) ->
+parse_chunk(Bin, Limits) ->
+    parse_chunk(Bin, Limits, infinity).
+
+-doc """
+Like `parse_chunk/2`, but caps the *declared* chunk size against `Budget`
+(the caller's remaining `max_content_length` allowance) so an oversized
+chunk is rejected on its size line, before its data is buffered.
+
+`Budget` is a `non_neg_integer()` (the cap) or `infinity` (no cap, the
+`parse_chunk/1,2` behaviour). A declared size over `Budget` returns
+`{error, content_length_too_large}` without waiting for or buffering the
+chunk body, so a `7fffffff\r\n` size line can't drive the connection's
+heap up before the cap fires.
+""".
+-spec parse_chunk(
+    binary(),
+    {pos_integer(), pos_integer(), pos_integer()},
+    non_neg_integer() | infinity
+) ->
+    {ok, Data :: binary(), Rest :: binary()}
+    | {ok, last, Trailers :: headers(), Rest :: binary()}
+    | {more, undefined}
+    | {error,
+        bad_chunk_size
+        | bad_chunk
+        | bad_header
+        | header_too_long
+        | header_block_too_long
+        | too_many_headers
+        | conflicting_framing
+        | content_length_too_large}.
+parse_chunk(Bin, Limits, Budget) when is_binary(Bin) ->
     %% Fetch the compiled CRLF + semicolon patterns ONCE here and
     %% thread them into `parse_chunk_size_line/3` (and onward to
     %% `parse_size_line/3`) so the chunked-decode loop in
-    %% `roadrunner_conn:read_chunked/4` doesn't pay two
+    %% `roadrunner_conn:read_chunked/5` doesn't pay two
     %% `persistent_term:get/1` per chunk through this entry.
     CrlfCp = persistent_term:get(?CRLF_KEY),
     SemiCp = persistent_term:get(?SEMICOLON_KEY),
     case parse_chunk_size_line(Bin, CrlfCp, SemiCp) of
         {ok, 0, AfterSize} ->
             parse_last_chunk(AfterSize, Limits);
+        {ok, Size, _AfterSize} when is_integer(Budget), Size > Budget ->
+            {error, content_length_too_large};
         {ok, Size, AfterSize} ->
             parse_chunk_data(Size, AfterSize);
         Other ->
