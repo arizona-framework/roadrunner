@@ -130,6 +130,8 @@ all_test_() ->
         fun settings_initial_window_size_shifts_stream_window/0,
         fun settings_initial_window_size_flushes_pending_data/0,
         fun preface_settings_initial_window_applied/0,
+        fun settings_header_table_size_shrinks_encoder/0,
+        fun settings_header_table_size_above_default_emits_no_update/0,
         fun content_length_multi_valued_rst_stream/0,
         fun trailers_after_first_end_stream_protocol_error/0
     ],
@@ -3174,6 +3176,45 @@ preface_settings_initial_window_applied() ->
     DataBytes = lists:sum([byte_size(P) || {data, _, _, P} <- Frames]),
     ?assertEqual(20000, DataBytes),
     ?assertEqual([], [F || {data, _, true, _} = F <- Frames]),
+    cleanup(Pid, Ref).
+
+settings_header_table_size_shrinks_encoder() ->
+    %% RFC 9113 §6.5.2 / RFC 7541 §6.3: SETTINGS_HEADER_TABLE_SIZE below our
+    %% 4096 default caps our encoder. Advertising 0 makes the next response
+    %% HEADERS block lead with a Dynamic Table Size Update to 0 (the byte
+    %% 0x20), and the block still decodes to a valid 200.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    Settings = iolist_to_binary(
+        roadrunner_http2_frame:encode({settings, 0, [{1, 0}]})
+    ),
+    serve_recv(ConnPid, Settings),
+    _SettingsAck = expect_send(),
+    serve_recv(ConnPid, complete_get_headers(1, ~"/")),
+    Response = collect_send_bytes(<<>>),
+    {ok, {headers, 1, _, _, RespHpack}, _} =
+        roadrunner_http2_frame:parse(Response, 16384),
+    ?assertMatch(<<16#20, _/binary>>, RespHpack),
+    {ok, RespHeaders, _} =
+        roadrunner_http2_hpack:decode(RespHpack, roadrunner_http2_hpack:new_decoder(4096)),
+    ?assertEqual(~"200", proplists:get_value(~":status", RespHeaders)),
+    cleanup(Pid, Ref).
+
+settings_header_table_size_above_default_emits_no_update() ->
+    %% A peer advertising >= our 4096 default must not trigger a redundant
+    %% Size Update: we clamp at 4096 (already our size), so the next HEADERS
+    %% block opens at a header representation, not a 001xxxxx Size Update.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    Settings = iolist_to_binary(
+        roadrunner_http2_frame:encode({settings, 0, [{1, 8192}]})
+    ),
+    serve_recv(ConnPid, Settings),
+    _SettingsAck = expect_send(),
+    serve_recv(ConnPid, complete_get_headers(1, ~"/")),
+    Response = collect_send_bytes(<<>>),
+    {ok, {headers, 1, _, _, RespHpack}, _} =
+        roadrunner_http2_frame:parse(Response, 16384),
+    <<First, _/binary>> = RespHpack,
+    ?assertNotEqual(16#20, First band 16#E0),
     cleanup(Pid, Ref).
 
 settings_initial_window_size_shifts_stream_window() ->

@@ -483,6 +483,14 @@ encoder_emits_size_update_after_cap_change_test() ->
     BlockBin = iolist_to_binary(Block),
     ?assertMatch(<<16#3F, 16#E1, 16#0F, _:8>>, BlockBin).
 
+max_table_size_reflects_cap_test() ->
+    %% The getter returns the cap last set (or the initial size), so the
+    %% conn loop can skip a redundant set_max_table_size + Size Update.
+    Enc0 = roadrunner_http2_hpack:new_encoder(4096),
+    ?assertEqual(4096, roadrunner_http2_hpack:max_table_size(Enc0)),
+    Enc1 = roadrunner_http2_hpack:set_max_table_size(2048, Enc0),
+    ?assertEqual(2048, roadrunner_http2_hpack:max_table_size(Enc1)).
+
 %% =============================================================================
 %% RFC 7541 §C.4 — Huffman-encoded string fields.
 %% =============================================================================
