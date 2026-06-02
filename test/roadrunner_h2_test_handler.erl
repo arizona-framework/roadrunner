@@ -15,6 +15,21 @@ shape.
     {roadrunner_handler:response(), roadrunner_req:request()}.
 handle(#{target := ~"/empty"} = Req) ->
     {{200, [], ~""}, Req};
+handle(#{target := ~"/block"} = Req) ->
+    %% Park the worker before responding so the stream stays
+    %% half-closed-remote while a test sends a protocol-violating DATA
+    %% frame on it. Unregister first in case a prior failed test leaked
+    %% the name (see the `/loop` clause); the test releases or kills the
+    %% worker in teardown.
+    try
+        unregister(roadrunner_h2_block_test)
+    catch
+        _:_ -> ok
+    end,
+    true = register(roadrunner_h2_block_test, self()),
+    receive
+        release -> {{200, [], ~"ok"}, Req}
+    end;
 handle(#{target := ~"/stream"} = Req) ->
     {
         {stream, 200, [{~"content-type", ~"text/plain"}], fun(Send) ->
