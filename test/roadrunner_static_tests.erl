@@ -605,9 +605,9 @@ sendfile_response_supports_keep_alive_test_() ->
             %% default and the new sendfile keep-alive support.
             Req = ~"GET /static/hello.html HTTP/1.1\r\nHost: x\r\n\r\n",
             ok = gen_tcp:send(Sock, Req),
-            Reply1 = recv_response_with_body(Sock, 14),
+            {Reply1, Rest1} = recv_response_with_body(Sock, <<>>, 14),
             ok = gen_tcp:send(Sock, Req),
-            Reply2 = recv_response_with_body(Sock, 14),
+            {Reply2, _Rest2} = recv_response_with_body(Sock, Rest1, 14),
             ok = gen_tcp:close(Sock),
             ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply1),
             ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply2),
@@ -628,9 +628,9 @@ sendfile_range_response_supports_keep_alive_test_() ->
             %% conn must keep-alive after it just like a full 200.
             Req = ~"GET /static/hello.html HTTP/1.1\r\nHost: x\r\nRange: bytes=0-3\r\n\r\n",
             ok = gen_tcp:send(Sock, Req),
-            Reply1 = recv_response_with_body(Sock, 4),
+            {Reply1, Rest1} = recv_response_with_body(Sock, <<>>, 4),
             ok = gen_tcp:send(Sock, Req),
-            Reply2 = recv_response_with_body(Sock, 4),
+            {Reply2, _Rest2} = recv_response_with_body(Sock, Rest1, 4),
             ok = gen_tcp:close(Sock),
             ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply1),
             ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply2),
@@ -653,8 +653,8 @@ pipelined_sendfile_responses_test_() ->
             ),
             Req = ~"GET /static/hello.html HTTP/1.1\r\nHost: x\r\n\r\n",
             ok = gen_tcp:send(Sock, <<Req/binary, Req/binary>>),
-            Reply1 = recv_response_with_body(Sock, 14),
-            Reply2 = recv_response_with_body(Sock, 14),
+            {Reply1, Rest1} = recv_response_with_body(Sock, <<>>, 14),
+            {Reply2, _Rest2} = recv_response_with_body(Sock, Rest1, 14),
             ok = gen_tcp:close(Sock),
             ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply1),
             ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply2),
@@ -663,23 +663,20 @@ pipelined_sendfile_responses_test_() ->
         end}
     end}.
 
-%% Read a single response: drain bytes until both the
-%% header / body separator is present AND `BodyLen` bytes of body are
-%% buffered. Stops as soon as one response is complete so the next
-%% recv on the same socket starts cleanly.
-recv_response_with_body(Sock, BodyLen) ->
-    recv_response_with_body_loop(Sock, <<>>, BodyLen).
-
-recv_response_with_body_loop(Sock, Buf, BodyLen) ->
+%% Read one response (headers + `BodyLen` body bytes) starting from any
+%% bytes already in `Buf`, returning `{Response, Rest}` where `Rest` is
+%% the unconsumed remainder. Pipelined callers feed `Rest` into the next
+%% read: a single `gen_tcp:recv` often returns both pipelined responses
+%% at once, and without carrying the remainder forward the second
+%% response's bytes get dropped and the next recv then blocks.
+recv_response_with_body(Sock, Buf, BodyLen) ->
     case binary:split(Buf, ~"\r\n\r\n") of
         [Head, Body] when byte_size(Body) >= BodyLen ->
-            <<Trim:(byte_size(Head) + 4 + BodyLen)/binary, _/binary>> = Buf,
-            Trim;
+            <<Resp:(byte_size(Head) + 4 + BodyLen)/binary, Rest/binary>> = Buf,
+            {Resp, Rest};
         _ ->
             {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
-            recv_response_with_body_loop(
-                Sock, <<Buf/binary, Data/binary>>, BodyLen
-            )
+            recv_response_with_body(Sock, <<Buf/binary, Data/binary>>, BodyLen)
     end.
 
 setup_with_policy(Name, Policy) ->
