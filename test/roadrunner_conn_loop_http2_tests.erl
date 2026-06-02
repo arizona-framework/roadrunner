@@ -112,6 +112,7 @@ all_test_() ->
         fun max_frame_size_too_large_protocol_error/0,
         fun initial_window_size_change_overflows_flow_control_error/0,
         fun content_length_mismatch_rst_stream/0,
+        fun oversized_body_413_then_rst/0,
         fun request_trailers_dispatched/0,
         fun request_trailers_via_continuation/0,
         fun awaiting_continuation_blocks_other_frames/0,
@@ -2772,6 +2773,63 @@ content_length_mismatch_rst_stream() ->
     serve_recv(ConnPid, Data),
     Out = expect_send(),
     ?assertMatch(<<_:24, 3, _/binary>>, Out),
+    cleanup(Pid, Ref).
+
+oversized_body_413_then_rst() ->
+    %% RFC 9113 §8.1: a request body over `max_content_length` is
+    %% answered with a 413 from the conn before END_STREAM, then
+    %% RST_STREAM(NO_ERROR) to stop the upload; the connection stays
+    %% usable. The worker is never dispatched (dispatch is at
+    %% END_STREAM), so the conn emits the 413 directly, mirroring h3.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{max_content_length => 8}),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"POST"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    %% HEADERS with END_HEADERS but NOT END_STREAM: a body follows.
+    HeadersF = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, HeadersF),
+    %% A 10-byte DATA frame exceeds max_content_length (8).
+    DataF = iolist_to_binary(
+        roadrunner_http2_frame:encode({data, 1, 0, ~"helloworld"})
+    ),
+    serve_recv(ConnPid, DataF),
+    %% Conn answers HEADERS+DATA (the 413), then RST_STREAM(no_error).
+    Resp1 = expect_send(),
+    Resp2 = drain_send(50),
+    AllResponse =
+        case Resp2 of
+            undefined -> Resp1;
+            _ -> <<Resp1/binary, Resp2/binary>>
+        end,
+    Dec0 = roadrunner_http2_hpack:new_decoder(4096),
+    {ok, {headers, 1, _, _, RespHpack}, AfterHeaders} =
+        roadrunner_http2_frame:parse(AllResponse, 16384),
+    {ok, RespHeaders, _} = roadrunner_http2_hpack:decode(RespHpack, Dec0),
+    ?assertEqual(~"413", proplists:get_value(~":status", RespHeaders)),
+    {ok, {data, 1, DataFlags, _Body}, AfterData} =
+        roadrunner_http2_frame:parse(AfterHeaders, 16384),
+    ?assertNotEqual(0, DataFlags band 16#01),
+    ?assertMatch(
+        {ok, {rst_stream, 1, no_error}, _},
+        roadrunner_http2_frame:parse(AfterData, 16384)
+    ),
+    ?assert(is_process_alive(Pid)),
     cleanup(Pid, Ref).
 
 request_trailers_dispatched() ->
