@@ -61,6 +61,22 @@ sync_exits_on_stream_reset_test() ->
     end,
     FakeConn ! stop.
 
+%% --- OTP messages are answered, not delivered to the handler ---
+
+loop_answers_otp_messages_test() ->
+    %% `gen_server:call` gets `{error, not_supported}` (not a hang),
+    %% `sys:get_state/1` returns the loop state, and `gen_server:cast` is
+    %% a no-op that leaves the loop running.
+    {FakeConn, Worker} = spawn_loop([stop]),
+    ?assertEqual({error, not_supported}, gen_server:call(Worker, ping)),
+    ?assertEqual([stop], sys:get_state(Worker)),
+    ok = gen_server:cast(Worker, noop),
+    ?assertEqual([stop], sys:get_state(Worker)),
+    %% Drive the loop to stop so the worker exits cleanly.
+    Worker ! go,
+    ok = wait_for_exit(Worker, 1000),
+    FakeConn ! stop.
+
 %% --- helpers ---
 
 spawn_loop(Directives) ->

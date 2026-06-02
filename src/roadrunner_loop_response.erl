@@ -19,15 +19,16 @@
 %% ## Mailbox contract
 %%
 %% The conn is a plain `proc_lib`-spawned loop, not a `gen_*` behaviour,
-%% so it doesn't speak the OTP `sys` / `gen_call` / `gen_cast` protocols.
-%% The receive selectively skips those shapes (`{system, _, _}`,
-%% `{'$gen_call', _, _}`, `{'$gen_cast', _}`) so a misuse like
-%% `gen_server:call(ConnPid, _)` doesn't accidentally surface as an
-%% `handle_info/3` event to the user handler. Concretely:
+%% but it still answers the OTP message shapes (via `roadrunner_loop_sys`)
+%% so they don't leak to the user handler:
 %%
-%% - `sys:get_state/1`, `sys:trace/2`, `gen_server:call/2,3` and
-%%   friends against the conn process will appear to hang — the
-%%   caller should expect to time out.
+%% - `{system, _, _}` — `sys:get_state/1`, `sys:replace_state/2`,
+%%   `sys:get_status/1` and `sys:terminate/2` work (`get_state` returns the
+%%   handler state). Live tracing (`sys:trace`/`sys:log`) installs but emits
+%%   no events: the loop does not thread `sys:handle_debug/4` per message.
+%% - `{'$gen_call', _, _}` — replied `{error, not_supported}`, so
+%%   `gen_server:call(ConnPid, _)` fails fast instead of hanging.
+%% - `{'$gen_cast', _}` — a no-op (casts expect no reply).
 %% - Any other Erlang message reaches the handler's `handle_info/3`
 %%   verbatim. Handlers should pattern-match defensively (with a
 %%   catch-all clause) rather than crash on unexpected messages.
@@ -55,15 +56,12 @@ run(Socket, Status, UserHeaders, Handler, State) ->
     info_loop(Socket, Handler, Push, State).
 
 %% Selective receive on every Erlang message → handler:handle_info/3,
-%% **except** OTP-internal shapes (`{system, _, _}` for the `sys`
-%% protocol, `{'$gen_call', _, _}` and `{'$gen_cast', _}` for
-%% gen_server/gen_statem requests). Those would only reach the conn
-%% via misuse (the conn is a plain proc_lib loop, not a gen_*) and
-%% delivering them to the user handler would surface a confusing
-%% shape it has no reason to pattern-match on. Each OTP shape gets
-%% its own no-op clause that re-enters the loop; non-OTP messages
-%% fall through to the catch-all `Info` clause. On `{stop, _}` we
-%% emit the size-0 chunked terminator and return.
+%% **except** the OTP-internal shapes, which are answered via
+%% `roadrunner_loop_sys` rather than delivered to the user handler:
+%% `{system, _, _}` goes to the `sys` protocol handler, `{'$gen_call', _, _}`
+%% is replied `{error, not_supported}`, and `{'$gen_cast', _}` is a no-op.
+%% Non-OTP messages fall through to the catch-all `Info` clause. On
+%% `{stop, _}` we emit the size-0 chunked terminator and return.
 %%
 %% **No `after` clause:** the loop blocks indefinitely until the
 %% handler returns `{stop, _}` from `handle_info/3`. A handler that
@@ -74,9 +72,11 @@ run(Socket, Status, UserHeaders, Handler, State) ->
     ok.
 info_loop(Socket, Handler, Push, State) ->
     receive
-        {system, _, _} ->
-            info_loop(Socket, Handler, Push, State);
-        {'$gen_call', _, _} ->
+        {system, From, Req} ->
+            Resume = fun(S) -> info_loop(Socket, Handler, Push, S) end,
+            roadrunner_loop_sys:handle_system(Req, From, State, Resume);
+        {'$gen_call', From, _} ->
+            ok = roadrunner_loop_sys:gen_call_unsupported(From),
             info_loop(Socket, Handler, Push, State);
         {'$gen_cast', _} ->
             info_loop(Socket, Handler, Push, State);

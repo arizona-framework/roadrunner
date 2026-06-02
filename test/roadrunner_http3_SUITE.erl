@@ -313,14 +313,16 @@ loop_response(Config) ->
     close(Conn).
 
 loop_filters_otp(Config) ->
-    %% OTP message shapes are dropped (never reach `handle_info/3`), so
-    %% only the real push advances the counter.
+    %% OTP message shapes are answered by `roadrunner_loop_sys` (not
+    %% delivered to `handle_info/3`), so only the real push advances the
+    %% counter: `sys:get_state/1` returns the loop counter, a gen-call
+    %% gets `{error, not_supported}`, and a gen-cast is a no-op.
     Conn = connect(?config(port, Config)),
     {ok, StreamId} = quic_h3:request(Conn, headers(~"GET", ~"/loop")),
     Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
-    Worker ! {system, self(), get_state},
-    Worker ! {'$gen_call', {self(), make_ref()}, ping},
-    Worker ! {'$gen_cast', noop},
+    ?assertEqual(0, sys:get_state(Worker)),
+    ?assertEqual({error, not_supported}, gen_server:call(Worker, ping)),
+    ok = gen_server:cast(Worker, noop),
     Worker ! {push, ~"x"},
     Worker ! stop,
     {200, _Headers, Body} = collect(Conn, StreamId),
