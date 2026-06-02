@@ -224,6 +224,10 @@
     %% advertised in our SETTINGS and enforced after HPACK decode in
     %% `finalize_headers/2`. Read from proto_opts at `enter/5`.
     max_header_list_size = ?DEFAULT_MAX_HEADER_LIST_SIZE :: pos_integer(),
+    %% `proto_opts.hibernate_after`, or 0 when unset (the common case).
+    %% When > 0 and no streams are in flight, the idle-wait path parks
+    %% for this window and hibernates. Read from proto_opts at `enter/5`.
+    hibernate_after = 0 :: non_neg_integer(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -278,6 +282,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
     %% so raising `max_header_block` for big headers lifts both gates together.
     MaxHeaderListSize = maps:get(http2_max_header_list_size, ProtoOpts, 2 * MaxHeaderBlock),
     MaxContentLength = maps:get(max_content_length, ProtoOpts, ?DEFAULT_MAX_CONTENT_LENGTH),
+    HibernateAfter = maps:get(hibernate_after, ProtoOpts, 0),
     State = #loop{
         socket = Socket,
         proto_opts = ProtoOpts,
@@ -296,7 +301,8 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
         max_concurrent_streams = MaxStreams,
         max_header_block = MaxHeaderBlock,
         max_header_list_size = MaxHeaderListSize,
-        max_content_length = MaxContentLength
+        max_content_length = MaxContentLength,
+        hibernate_after = HibernateAfter
     },
     handshake(State).
 
@@ -474,13 +480,10 @@ recv_more(
 %% active, where worker messages are imminent and hibernating would be
 %% pointless.
 -spec recv_timeout(#loop{}) -> non_neg_integer().
-recv_timeout(#loop{streams = Streams, proto_opts = ProtoOpts}) when
-    map_size(Streams) =:= 0
+recv_timeout(#loop{streams = Streams, hibernate_after = Ms}) when
+    map_size(Streams) =:= 0, Ms > 0
 ->
-    case ProtoOpts of
-        #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 -> Ms;
-        _ -> idle_timeout()
-    end;
+    Ms;
 recv_timeout(_State) ->
     idle_timeout().
 
@@ -491,15 +494,10 @@ recv_timeout(_State) ->
 %% frame — or any worker / `'DOWN'` / drain message — wakes us and
 %% `recv_more_hib/1` resumes the loop. Otherwise emit the idle GOAWAY.
 -spec recv_idle_expired(#loop{}) -> no_return().
-recv_idle_expired(#loop{streams = Streams, proto_opts = ProtoOpts} = State) when
-    map_size(Streams) =:= 0
+recv_idle_expired(#loop{streams = Streams, hibernate_after = Ms} = State) when
+    map_size(Streams) =:= 0, Ms > 0
 ->
-    case ProtoOpts of
-        #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 ->
-            erlang:hibernate(?MODULE, recv_more_hib, [State]);
-        _ ->
-            idle_goaway(State)
-    end;
+    erlang:hibernate(?MODULE, recv_more_hib, [State]);
 recv_idle_expired(State) ->
     idle_goaway(State).
 
