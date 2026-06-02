@@ -465,6 +465,34 @@ format_pmd_flag(Name, true) -> [~"; ", Name].
 format_pmd_kv(_Name, Default, Default) -> [];
 format_pmd_kv(Name, Value, _Default) -> [~"; ", Name, ~"=", integer_to_binary(Value)].
 
+%% Protocol-violation reasons the frame parse/peek entry points reject
+%% (documented per-atom on `parse_frame/1` below). The inner helpers
+%% return narrower subsets of these.
+-type frame_error() ::
+    bad_opcode
+    | bad_rsv
+    | not_masked
+    | fragmented_control
+    | control_frame_too_large
+    | bad_length.
+
+%% Return shape of the frame parse entry points (`parse_frame/1,2`,
+%% `do_parse_frame/3`): a decoded frame plus the unconsumed tail,
+%% `{more, undefined}` when the buffer is short of a full frame, or a
+%% protocol error.
+-type parse_result() ::
+    {ok, frame(), Rest :: binary()}
+    | {more, undefined}
+    | {error, frame_error()}.
+
+%% Return shape of the header-peek entry points (`peek_frame_header/2`,
+%% `do_peek/2`): the header fields plus the count of payload bytes
+%% already buffered, `{more, undefined}`, or a protocol error.
+-type peek_result() ::
+    {ok, map(), non_neg_integer()}
+    | {more, undefined}
+    | {error, frame_error()}.
+
 %% Decode a single WebSocket frame from the buffer.
 %%
 %% Returns `{ok, Frame, Rest}` on success — `Frame` is a map with
@@ -483,16 +511,7 @@ format_pmd_kv(Name, Value, _Default) -> [~"; ", Name, ~"=", integer_to_binary(Va
 %% Use `parse_frame/2` with `#{allow_rsv1 => true}` once a permessage
 %% extension (RFC 7692) has been negotiated.
 -doc false.
--spec parse_frame(binary()) ->
-    {ok, frame(), Rest :: binary()}
-    | {more, undefined}
-    | {error,
-        bad_opcode
-        | bad_rsv
-        | not_masked
-        | fragmented_control
-        | control_frame_too_large
-        | bad_length}.
+-spec parse_frame(binary()) -> parse_result().
 parse_frame(Bin) ->
     parse_frame(Bin, #{}).
 
@@ -502,16 +521,7 @@ parse_frame(Bin) ->
 %% (needed once `permessage-deflate` is negotiated per RFC 7692).
 %% RSV2 and RSV3 remain unconditionally rejected.
 -doc false.
--spec parse_frame(binary(), parse_opts()) ->
-    {ok, frame(), Rest :: binary()}
-    | {more, undefined}
-    | {error,
-        bad_opcode
-        | bad_rsv
-        | not_masked
-        | fragmented_control
-        | control_frame_too_large
-        | bad_length}.
+-spec parse_frame(binary(), parse_opts()) -> parse_result().
 parse_frame(Bin, Opts) ->
     do_parse_frame(
         Bin,
@@ -519,16 +529,7 @@ parse_frame(Bin, Opts) ->
         maps:get(pre_unmasked, Opts, undefined)
     ).
 
--spec do_parse_frame(binary(), boolean(), binary() | undefined) ->
-    {ok, frame(), Rest :: binary()}
-    | {more, undefined}
-    | {error,
-        bad_opcode
-        | bad_rsv
-        | not_masked
-        | fragmented_control
-        | control_frame_too_large
-        | bad_length}.
+-spec do_parse_frame(binary(), boolean(), binary() | undefined) -> parse_result().
 do_parse_frame(<<_Fin:1, _Rsv1:1, Rsv23:2, _:4, _/bitstring>>, _AllowRsv1, _Pre) when
     Rsv23 =/= 0
 ->
@@ -566,29 +567,11 @@ do_parse_frame(_, _AllowRsv1, _Pre) ->
 %% the frame as a whole completes. Honors `allow_rsv1` the same way
 %% `parse_frame/2` does.
 -doc false.
--spec peek_frame_header(binary(), parse_opts()) ->
-    {ok, map(), non_neg_integer()}
-    | {more, undefined}
-    | {error,
-        bad_opcode
-        | bad_rsv
-        | not_masked
-        | fragmented_control
-        | control_frame_too_large
-        | bad_length}.
+-spec peek_frame_header(binary(), parse_opts()) -> peek_result().
 peek_frame_header(Bin, Opts) ->
     do_peek(Bin, maps:get(allow_rsv1, Opts, false)).
 
--spec do_peek(binary(), boolean()) ->
-    {ok, map(), non_neg_integer()}
-    | {more, undefined}
-    | {error,
-        bad_opcode
-        | bad_rsv
-        | not_masked
-        | fragmented_control
-        | control_frame_too_large
-        | bad_length}.
+-spec do_peek(binary(), boolean()) -> peek_result().
 do_peek(<<_Fin:1, _Rsv1:1, Rsv23:2, _:4, _/bitstring>>, _AllowRsv1) when Rsv23 =/= 0 ->
     {error, bad_rsv};
 do_peek(<<_Fin:1, 1:1, 0:2, _:4, _/bitstring>>, false) ->
