@@ -45,7 +45,8 @@
     new_encoder/1,
     decode/2,
     encode/2,
-    set_max_table_size/2
+    set_max_table_size/2,
+    max_table_size/1
 ]).
 
 -export_type([context/0, decode_error/0]).
@@ -141,6 +142,16 @@ set_max_table_size(NewLimit, #hpack_ctx{} = Ctx) ->
                 Ctx
         end,
     Ctx1#hpack_ctx{limit = NewLimit, pending_update = true}.
+
+-doc """
+The current maximum dynamic-table size cap (the value last set by
+`set_max_table_size/2`, or the initial size). Lets a caller skip a
+redundant `set_max_table_size/2` (and its Size Update) when the cap
+is unchanged.
+""".
+-spec max_table_size(context()) -> non_neg_integer().
+max_table_size(#hpack_ctx{limit = Limit}) ->
+    Limit.
 
 %% =============================================================================
 %% decode/2 — parse a header block fragment

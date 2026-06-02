@@ -82,6 +82,11 @@
 %% to 16384).
 -define(MAX_HEADER_BLOCK, 16_384).
 
+%% RFC 7541 §4.2 default HPACK dynamic-table size: what we tell the peer
+%% its encoder may use (our decoder), and the ceiling we hold our own
+%% encoder to even when the peer advertises a larger table.
+-define(HPACK_TABLE_SIZE, 4096).
+
 %% RFC 9113 §6.9.2 initial window size for both the connection and
 %% each stream.
 -define(INITIAL_WINDOW, 65535).
@@ -269,8 +274,8 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
         msg_data = Data,
         msg_closed = Closed,
         msg_error = Error,
-        hpack_dec = roadrunner_http2_hpack:new_decoder(4096),
-        hpack_enc = roadrunner_http2_hpack:new_encoder(4096),
+        hpack_dec = roadrunner_http2_hpack:new_decoder(?HPACK_TABLE_SIZE),
+        hpack_enc = roadrunner_http2_hpack:new_encoder(?HPACK_TABLE_SIZE),
         recv_window_peak = ConnPeak,
         stream_recv_window_peak = StreamPeak,
         recv_window_threshold = Threshold,
@@ -545,8 +550,9 @@ handle_frame({settings, 0, Params}, State) ->
                     %% Raising INITIAL_WINDOW_SIZE grows open streams' send
                     %% windows (RFC 9113 §6.9.2): ACK, then drain any sends
                     %% blocked at the old window, like the WINDOW_UPDATE path.
-                    _ = send(State1, roadrunner_http2_frame:encode({settings, 1, []})),
-                    frame_loop(flush_all_pending_data(State1));
+                    State2 = apply_header_table_size(Params, State1),
+                    _ = send(State2, roadrunner_http2_frame:encode({settings, 1, []})),
+                    frame_loop(flush_all_pending_data(State2));
                 {error, flow_control_error} ->
                     _ = send_goaway(State, flow_control_error),
                     exit_clean(State)
@@ -1582,6 +1588,32 @@ apply_initial_window_size(Params, #loop{peer_initial_window = Old} = State) ->
                     }};
                 {error, _} = E ->
                     E
+            end
+    end.
+
+%% RFC 9113 §6.5.2 / RFC 7541 §6.3: the peer's SETTINGS_HEADER_TABLE_SIZE
+%% (id 1) caps OUR encoder's dynamic table. Apply the last value (§6.5.3),
+%% clamped at our own ?HPACK_TABLE_SIZE ceiling so a generous peer can't
+%% grow our table, and a smaller one shrinks it (evicting entries the
+%% peer's decoder dropped, avoiding a desync). set_max_table_size flags
+%% the encoder to emit the matching dynamic-table-size update on its next
+%% encode.
+-spec apply_header_table_size(
+    [{non_neg_integer(), non_neg_integer()}], #loop{}
+) -> #loop{}.
+apply_header_table_size(Params, #loop{hpack_enc = Enc} = State) ->
+    case last_setting(Params, 1, undefined) of
+        undefined ->
+            State;
+        Limit ->
+            Size = min(?HPACK_TABLE_SIZE, Limit),
+            case roadrunner_http2_hpack:max_table_size(Enc) of
+                Size ->
+                    %% Already at this cap (e.g. the peer advertised our
+                    %% default or larger): don't flag a redundant Size Update.
+                    State;
+                _ ->
+                    State#loop{hpack_enc = roadrunner_http2_hpack:set_max_table_size(Size, Enc)}
             end
     end.
 
