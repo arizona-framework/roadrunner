@@ -102,6 +102,7 @@ all_test_() ->
         fun data_on_stream_zero_protocol_error/0,
         fun data_on_idle_stream_protocol_error/0,
         fun data_on_closed_stream_rst/0,
+        fun data_after_end_stream_on_half_closed_remote_rst/0,
         fun headers_self_dependency_rst_stream/0,
         fun priority_self_dependency_rst_stream/0,
         fun enable_push_invalid_value_protocol_error/0,
@@ -2553,6 +2554,57 @@ data_on_closed_stream_rst() ->
     serve_recv(ConnPid, <<1:24, 0, 0, 0:1, 1:31, 0>>),
     Out = expect_send(),
     ?assertMatch(<<_:24, 3, _/binary>>, Out),
+    cleanup(Pid, Ref).
+
+data_after_end_stream_on_half_closed_remote_rst() ->
+    %% RFC 9113 §5.1: once the peer sends END_STREAM the stream is
+    %% half-closed (remote); a later DATA frame is STREAM_CLOSED. Unlike
+    %% `data_on_closed_stream_rst/0` (stream already removed from the
+    %% map), here the worker is still in flight — a blocking handler
+    %% keeps the stream half-closed-remote in the map — so this
+    %% exercises the state-guarded `on_data` path. Without the guard the
+    %% DATA was silently appended (no reset) and the handler's response
+    %% raced the violation, the h2spec §5.1 / §6.1 flake.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined}
+    }),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/block"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    %% HEADERS with END_HEADERS + END_STREAM: request complete, the
+    %% stream goes half-closed-remote and the worker is dispatched.
+    HeadersF = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, HeadersF),
+    %% Park until the worker is in `handle/1`: the stream is still in
+    %% the map, half-closed-remote.
+    Worker = wait_for_register(roadrunner_h2_block_test, 1000),
+    DataF = iolist_to_binary(roadrunner_http2_frame:encode({data, 1, 0, ~"x"})),
+    serve_recv(ConnPid, DataF),
+    ?assertMatch(
+        {ok, {rst_stream, 1, stream_closed}, _},
+        roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    %% The worker is parked in `handle/1`; `reset_stream/2` already
+    %% demonitored it, so drop it directly before tearing down the conn.
+    exit(Worker, kill),
     cleanup(Pid, Ref).
 
 headers_self_dependency_rst_stream() ->

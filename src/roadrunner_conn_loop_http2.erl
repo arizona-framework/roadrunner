@@ -866,26 +866,38 @@ on_data(StreamId, _Flags, _Payload, #loop{streams = Streams} = State) when
     _ = send_rst_stream(State, StreamId, stream_closed),
     frame_loop(State);
 on_data(StreamId, Flags, Payload, #loop{streams = Streams} = State) ->
-    #{
-        StreamId :=
-            #{body := Body, body_len := Len, recv_window := RW} = Stream
-    } = Streams,
-    EndStream = (Flags band 16#01) =/= 0,
-    PayloadLen = byte_size(Payload),
-    Stream1 = Stream#{
-        body := [Body, Payload],
-        body_len := Len + PayloadLen,
-        end_stream_seen := EndStream,
-        recv_window := RW - PayloadLen
-    },
-    State1 = State#loop{
-        streams = Streams#{StreamId := Stream1},
-        conn_recv_window = State#loop.conn_recv_window - PayloadLen
-    },
-    State2 = maybe_refill_recv_windows(State1, StreamId),
-    case EndStream of
-        true -> dispatch_stream(StreamId, State2);
-        false -> frame_loop(State2)
+    case Streams of
+        #{
+            StreamId :=
+                #{state := open, body := Body, body_len := Len, recv_window := RW} = Stream
+        } ->
+            EndStream = (Flags band 16#01) =/= 0,
+            PayloadLen = byte_size(Payload),
+            Stream1 = Stream#{
+                body := [Body, Payload],
+                body_len := Len + PayloadLen,
+                end_stream_seen := EndStream,
+                recv_window := RW - PayloadLen
+            },
+            State1 = State#loop{
+                streams = Streams#{StreamId := Stream1},
+                conn_recv_window = State#loop.conn_recv_window - PayloadLen
+            },
+            State2 = maybe_refill_recv_windows(State1, StreamId),
+            case EndStream of
+                true -> dispatch_stream(StreamId, State2);
+                false -> frame_loop(State2)
+            end;
+        #{StreamId := _} ->
+            %% RFC 9113 §5.1: the peer already sent END_STREAM (the
+            %% stream is half-closed remote, with a worker dispatched),
+            %% so any further DATA is a STREAM_CLOSED stream error.
+            %% Reset the peer and unwind the in-flight worker rather
+            %% than appending to a request body that was already
+            %% delivered (which would also re-dispatch on a second
+            %% END_STREAM).
+            _ = send_rst_stream(State, StreamId, stream_closed),
+            frame_loop(reset_stream(State, StreamId))
     end.
 
 %% Refill the conn-level + stream-level recv windows whenever they
