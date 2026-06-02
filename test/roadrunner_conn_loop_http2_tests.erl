@@ -103,6 +103,7 @@ all_test_() ->
         fun data_on_stream_zero_protocol_error/0,
         fun data_on_idle_stream_protocol_error/0,
         fun data_on_closed_stream_rst/0,
+        fun data_empty_payload_on_closed_stream_no_window_update/0,
         fun data_after_end_stream_on_half_closed_remote_rst/0,
         fun headers_self_dependency_rst_stream/0,
         fun priority_self_dependency_rst_stream/0,
@@ -2573,10 +2574,33 @@ data_on_closed_stream_rst() ->
     %% RST stream 1 — removes from map.
     Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
     serve_recv(ConnPid, Rst),
-    %% Now send DATA on closed stream 1.
+    %% Now send DATA (1-byte payload) on closed stream 1.
     serve_recv(ConnPid, <<1:24, 0, 0, 0:1, 1:31, 0>>),
     Out = expect_send(),
     ?assertMatch(<<_:24, 3, _/binary>>, Out),
+    %% The discarded byte's conn-level window is returned so the window
+    %% doesn't drift down across the reset (RFC 9113 §6.9.1).
+    ?assertMatch(
+        {ok, {window_update, 0, 1}, _},
+        roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    cleanup(Pid, Ref).
+
+data_empty_payload_on_closed_stream_no_window_update() ->
+    %% An empty DATA frame on a closed stream consumed no flow-control
+    %% window, so it resets but emits no WINDOW_UPDATE (a 0-increment
+    %% WINDOW_UPDATE is itself a protocol error).
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    HpackBin = encode_post_root_headers(),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    serve_recv(ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel}))),
+    %% Empty DATA (length 0) on closed stream 1.
+    serve_recv(ConnPid, <<0:24, 0, 0, 0:1, 1:31>>),
+    ?assertMatch(<<_:24, 3, _/binary>>, expect_send()),
+    ?assertEqual(undefined, drain_send(50)),
     cleanup(Pid, Ref).
 
 data_after_end_stream_on_half_closed_remote_rst() ->
@@ -2623,6 +2647,11 @@ data_after_end_stream_on_half_closed_remote_rst() ->
     serve_recv(ConnPid, DataF),
     ?assertMatch(
         {ok, {rst_stream, 1, stream_closed}, _},
+        roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    %% The discarded byte's conn-level window is returned (RFC 9113 §6.9.1).
+    ?assertMatch(
+        {ok, {window_update, 0, 1}, _},
         roadrunner_http2_frame:parse(expect_send(), 16384)
     ),
     %% The worker is parked in `handle/1`; `reset_stream/2` already

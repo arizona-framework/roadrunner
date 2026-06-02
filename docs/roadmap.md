@@ -199,6 +199,22 @@ only parse the peer's value and bound inbound via the encoded
 `max_header_block` cap. The ~50 handshake fixtures that drain the server
 SETTINGS need to tolerate the extra entry.
 
+### h2 padded-DATA flow-control accounting
+
+**What:** A padded DATA frame undercounts its flow-control debit by the
+padding bytes — the codec strips padding before `on_data` sees the
+length, so the stream / connection recv windows (and the conn-window
+replenish on a reset stream) are charged the unpadded length.
+
+**Why deferred:** DATA padding is essentially never used by real
+clients, the undercount is at most 256 bytes per frame, and
+`max_content_length` already bounds the buffered body — so it's a
+codec-shape change for near-zero practical benefit. A correct fix
+threads the frame's declared Length through the codec (the decoded DATA
+tuple is matched in several places).
+
+**Scope:** small-to-medium.
+
 ### Refresh resource_results.md against the current headline scenarios
 
 **What:** `docs/resource_results.md` still carries its own scenario
@@ -274,24 +290,6 @@ loop state), which has debugging value but no functional fix.
 single `handle/3` (sys message, From, ProcessState) used from the
 h1, h2, and h3 info_loops. Tests covering sys/get_state, sys/replace_state,
 gen_call rejection, gen_cast no-op.
-
-### Wake an h2 worker blocked in `sync/1` when the conn dies
-
-**What:** An h2 stream worker blocked in
-`roadrunner_http2_stream_worker:sync/1` (waiting on `h2_send_ack`)
-does not wake when the conn dies: its selective receive matches only
-the ack and `h2_stream_reset`, so it blocks until the conn's TCP
-teardown reaps it. The idle `info_loop` case already stops on the
-conn's `DOWN`, so this is the narrow remaining window for the
-`stream` and `loop` response modes.
-
-**Why deferred:** h3 does not share the gap (its worker sends frames
-directly via `quic:send_data` and its `info_loop/5` already handles
-the conn `DOWN`), and the window is narrow. Fix: the conn loop kills
-in-flight workers on teardown, or `sync/1` adds the conn monitor to
-its receive.
-
-**Scope:** small.
 
 ### h2 manual-mode body reading
 
