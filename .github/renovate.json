@@ -6,9 +6,6 @@
     ":pinDevDependencies",
     ":pinDigestsDisabled"
   ],
-  "lockFileMaintenance": {
-    "enabled": true
-  },
   "packageRules": [
     {
       "matchFileNames": [".github/**/*.yml", ".tool-versions"],
