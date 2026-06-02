@@ -32,10 +32,10 @@ Returns when the handler's `handle_info/3` returns `{stop, _}`.
 ) -> ok.
 run(ConnPid, StreamId, Status, Headers, {Handler, State}) ->
     sync_send_headers(ConnPid, StreamId, Status, Headers, false),
-    %% Stop looping if the conn process dies — otherwise an idle loop
-    %% worker (blocked in `info_loop` waiting for a message) leaks
-    %% forever once the conn is gone.
-    _ = monitor(process, ConnPid),
+    %% The worker already monitors the conn (see
+    %% `roadrunner_http2_stream_worker:init/4`), so an idle `info_loop`
+    %% blocked waiting for a message wakes on the conn's `DOWN` instead
+    %% of leaking once the conn is gone.
     Push = make_push(ConnPid, StreamId),
     info_loop(ConnPid, StreamId, Handler, Push, State).
 
@@ -88,11 +88,8 @@ make_push(ConnPid, StreamId) ->
         end
     end.
 
-%% Sync helpers: send a frame request to the conn and block on its
-%% ack. Duplicated from `roadrunner_http2_stream_response`. Two
-%% callers is the threshold for extracting a shared module; a third
-%% caller (e.g. a future `{loop, _}` middleware path) would justify
-%% factoring them out into `roadrunner_http2_worker_sync`.
+%% Sync helpers: send a frame request to the conn and block on its ack
+%% via the shared `roadrunner_http2_worker_sync`.
 
 -spec sync_send_headers(
     pid(),
@@ -102,7 +99,7 @@ make_push(ConnPid, StreamId) ->
     boolean()
 ) -> ok.
 sync_send_headers(ConnPid, StreamId, Status, Headers, EndStream) ->
-    sync(fun(Ref) ->
+    roadrunner_http2_worker_sync:sync(ConnPid, fun(Ref) ->
         _ =
             (ConnPid !
                 {h2_send_headers, self(), Ref, StreamId, Status, Headers, EndStream}),
@@ -111,18 +108,9 @@ sync_send_headers(ConnPid, StreamId, Status, Headers, EndStream) ->
 
 -spec sync_send_data(pid(), pos_integer(), iodata(), boolean()) -> ok.
 sync_send_data(ConnPid, StreamId, Data, EndStream) ->
-    sync(fun(Ref) ->
+    roadrunner_http2_worker_sync:sync(ConnPid, fun(Ref) ->
         _ =
             (ConnPid !
                 {h2_send_data, self(), Ref, StreamId, Data, EndStream}),
         ok
     end).
-
--spec sync(fun((reference()) -> ok)) -> ok.
-sync(SendFun) ->
-    Ref = make_ref(),
-    ok = SendFun(Ref),
-    receive
-        {h2_send_ack, Ref} -> ok;
-        {h2_stream_reset, _StreamId} -> exit(stream_reset)
-    end.
