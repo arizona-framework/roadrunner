@@ -45,7 +45,7 @@ Per the SSE spec ([WHATWG HTML §9.2](https://html.spec.whatwg.org/multipage/ser
 
 -on_load(init_patterns/0).
 
--define(LF_CP_KEY, {?MODULE, lf_cp}).
+-define(DATA_SPLIT_CP_KEY, {?MODULE, data_split_cp}).
 -define(LINE_BREAK_CP_KEY, {?MODULE, line_break_cp}).
 
 -export([
@@ -108,19 +108,23 @@ after a connection drop.
 retry(Ms) when is_integer(Ms), Ms >= 0 ->
     [~"retry: ", integer_to_binary(Ms), ~"\n\n"].
 
-%% Encode `Data` as one or more `data:` lines (split on each `\n`),
-%% each terminated by a single newline. The caller appends the
-%% trailing blank line that ends the event.
+%% Encode `Data` as one or more `data:` lines, each terminated by a
+%% single newline. `data` is allowed to span multiple lines, but the
+%% split must cover every separator the client recognises — the
+%% event-stream spec treats CR, LF, and CRLF as line breaks — so a bare
+%% `\r` in untrusted data becomes a new `data:` line rather than
+%% injecting an `event:` / `id:` / `retry:` field. The caller appends
+%% the trailing blank line that ends the event.
 -spec data_lines(binary()) -> iodata().
 data_lines(Data) ->
     [
         [~"data: ", Line, $\n]
-     || Line <- binary:split(Data, persistent_term:get(?LF_CP_KEY), [global])
+     || Line <- binary:split(Data, persistent_term:get(?DATA_SPLIT_CP_KEY), [global])
     ].
 
 %% `-on_load` callback. See `feedback_compile_pattern_convention`.
 -spec init_patterns() -> ok.
 init_patterns() ->
-    persistent_term:put(?LF_CP_KEY, binary:compile_pattern(~"\n")),
+    persistent_term:put(?DATA_SPLIT_CP_KEY, binary:compile_pattern([~"\r\n", ~"\r", ~"\n"])),
     persistent_term:put(?LINE_BREAK_CP_KEY, binary:compile_pattern([~"\r", ~"\n"])),
     ok.

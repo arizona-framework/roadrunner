@@ -45,6 +45,28 @@ event_with_name_and_multiline_data_test() ->
         iolist_to_binary(roadrunner_sse:event(~"log", ~"hello\nworld"))
     ).
 
+%% Security: a bare `\r` in `data` must split into its own `data:` line,
+%% not pass through to inject an `event:` / `id:` / `retry:` field — the
+%% client treats CR, LF, and CRLF as line breaks.
+event_data_with_cr_splits_test() ->
+    ?assertEqual(
+        ~"data: line one\ndata: event: steal\n\n",
+        iolist_to_binary(roadrunner_sse:event(~"line one\revent: steal"))
+    ).
+
+event_data_with_crlf_splits_once_test() ->
+    %% CRLF is a single separator: no empty `data:` line between the two.
+    ?assertEqual(
+        ~"data: line one\ndata: line two\n\n",
+        iolist_to_binary(roadrunner_sse:event(~"line one\r\nline two"))
+    ).
+
+event_data_mixed_line_breaks_test() ->
+    ?assertEqual(
+        ~"data: a\ndata: b\ndata: c\ndata: d\n\n",
+        iolist_to_binary(roadrunner_sse:event(~"a\rb\nc\r\nd"))
+    ).
+
 comment_test() ->
     ?assertEqual(
         ~": keepalive\n\n",
