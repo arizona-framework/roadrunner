@@ -48,12 +48,6 @@ only). Remaining work:
 - h3 manual-mode body reading (parity with the deferred h2 item) —
   needs the same conn-loop→worker inbound routing WebSocket would, so
   do it alongside that work, not standalone
-- Advertise `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §7.2.4.1). The
-  encoded request header block is now capped (16384-byte default, 431 on
-  overflow, as the h1 and h2 `max_header_block` caps do); advertising the
-  decoded-size limit would let conformant clients avoid sending an
-  oversized field section in the first place rather than learning via the
-  431
 - WebSocket over h3 (`websocket` shape, still `501`) — RFC 9220
   Extended CONNECT; do WebSocket over h2 (RFC 8441) first, since it's
   the more common transport and h2 has no WebSocket either

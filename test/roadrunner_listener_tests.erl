@@ -491,7 +491,10 @@ listener_rejects_invalid_http3_opt_test() ->
             #{listeners => 16#80000000},
             #{max_streams_bidi => 0},
             #{max_streams_bidi => 16#80000000},
-            #{max_streams_bidi => not_an_integer}
+            #{max_streams_bidi => not_an_integer},
+            #{max_field_section_size => 0},
+            #{max_field_section_size => 16#80000000},
+            #{max_field_section_size => not_an_integer}
         ]
     ).
 
