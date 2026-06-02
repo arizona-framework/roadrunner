@@ -867,15 +867,15 @@ on_data(StreamId, _Flags, _Payload, State) when StreamId > State#loop.last_strea
     %% RFC 9113 §5.1: DATA on an idle stream is PROTOCOL_ERROR.
     _ = send_goaway(State, protocol_error),
     exit_clean(State);
-on_data(StreamId, _Flags, _Payload, #loop{streams = Streams} = State) when
+on_data(StreamId, _Flags, Payload, #loop{streams = Streams} = State) when
     not is_map_key(StreamId, Streams)
 ->
-    %% RFC 9113 §6.1: DATA on a closed stream is STREAM_CLOSED.
-    %% In our setup the conn-level recv window has already been
-    %% partially consumed by the peer's send so we still emit a
-    %% RST_STREAM rather than ignoring.
+    %% RFC 9113 §6.1: DATA on a closed stream is STREAM_CLOSED. The bytes
+    %% still consumed the peer's connection-level send window (§6.9.1);
+    %% return it since we're discarding them, so the conn window doesn't
+    %% drift down across stream resets.
     _ = send_rst_stream(State, StreamId, stream_closed),
-    frame_loop(State);
+    frame_loop(replenish_conn_window(State, byte_size(Payload)));
 on_data(StreamId, Flags, Payload, #loop{streams = Streams, max_content_length = MaxCL} = State) ->
     case Streams of
         #{
@@ -939,8 +939,21 @@ on_data(StreamId, Flags, Payload, #loop{streams = Streams, max_content_length = 
             %% delivered (which would also re-dispatch on a second
             %% END_STREAM).
             _ = send_rst_stream(State, StreamId, stream_closed),
-            frame_loop(reset_stream(State, StreamId))
+            frame_loop(replenish_conn_window(reset_stream(State, StreamId), byte_size(Payload)))
     end.
+
+%% Return `N` bytes of connection-level receive window to the peer after
+%% discarding a DATA payload on a closed / reset stream (RFC 9113
+%% §6.9.1: flow-controlled bytes count against the conn window
+%% regardless of stream state). A zero-length payload consumed no
+%% window, and a WINDOW_UPDATE with a 0 increment is itself a protocol
+%% error, so skip it.
+-spec replenish_conn_window(#loop{}, non_neg_integer()) -> #loop{}.
+replenish_conn_window(State, 0) ->
+    State;
+replenish_conn_window(State, N) ->
+    _ = send(State, roadrunner_http2_frame:encode({window_update, 0, N})),
+    State.
 
 %% Refill the conn-level + stream-level recv windows whenever they
 %% drop below the configured threshold. Both refills can fire on
