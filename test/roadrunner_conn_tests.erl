@@ -366,6 +366,29 @@ keep_alive_decision_without_cached_decisions_no_connection_header_keeps_alive_te
     Req = req_with_headers([]),
     ?assertEqual(keep_alive, roadrunner_conn:keep_alive_decision(Req, [])).
 
+keep_alive_decision_close_substring_is_not_the_token_test() ->
+    %% RFC 9110 §7.6.1: `Connection` is a comma-separated token list. A
+    %% value that merely contains "close" as a substring (`enclosed`) is
+    %% not the `close` token, so an HTTP/1.1 conn stays keep-alive.
+    Req = req_with_headers([{~"connection", ~"enclosed"}]),
+    ?assertEqual(keep_alive, roadrunner_conn:keep_alive_decision(Req, [])).
+
+keep_alive_decision_close_token_in_list_with_ows_test() ->
+    %% `close` as one OWS-padded token in a list still forces close.
+    Req = req_with_headers([{~"connection", ~"close , x-foo"}]),
+    ?assertEqual(close, roadrunner_conn:keep_alive_decision(Req, [])).
+
+keep_alive_decision_http10_keep_alive_substring_is_not_the_token_test() ->
+    %% HTTP/1.0 default is close; `x-keep-alive` is not the `keep-alive`
+    %% token, so it must NOT opt into keep-alive.
+    Req = req_v10([{~"connection", ~"x-keep-alive"}]),
+    ?assertEqual(close, roadrunner_conn:keep_alive_decision(Req, [])).
+
+keep_alive_decision_http10_keep_alive_token_in_list_test() ->
+    %% HTTP/1.0 + `keep-alive` as a list token opts into keep-alive.
+    Req = req_v10([{~"connection", ~"keep-alive, x-foo"}]),
+    ?assertEqual(keep_alive, roadrunner_conn:keep_alive_decision(Req, [])).
+
 %% --- peer/1 ---
 
 peer_on_closed_socket_returns_undefined_test() ->
@@ -385,6 +408,9 @@ req_with_headers(Headers) ->
         version => {1, 1},
         headers => Headers
     }.
+
+req_v10(Headers) ->
+    (req_with_headers(Headers))#{version => {1, 0}}.
 
 %% Recv closure that yields the given chunks one per call, then
 %% `{error, closed}` once exhausted. Backed by the process dictionary

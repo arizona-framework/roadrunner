@@ -77,8 +77,7 @@
 
 -on_load(init_patterns/0).
 
--define(CLOSE_CP_KEY, {?MODULE, close_cp}).
--define(KEEP_ALIVE_CP_KEY, {?MODULE, keep_alive_cp}).
+-define(CONN_COMMA_CP_KEY, {?MODULE, conn_comma_cp}).
 
 -type dispatch() ::
     {handler, module(), roadrunner_middleware:next(), State :: term()}
@@ -977,7 +976,7 @@ keep_alive_decision(Req, RespHeaders) ->
 keep_alive_decision_full(Req, RespHeaders) ->
     ReqConn = req_connection_lower(Req),
     RespConn = roadrunner_bin:ascii_lowercase(resp_connection_token(RespHeaders)),
-    CloseCp = persistent_term:get(?CLOSE_CP_KEY),
+    Close = ~"close",
     case roadrunner_req:version(Req) of
         {1, 0} ->
             %% RFC 9112 §9.3 + RFC 9110 §7.6.1: HTTP/1.0 default is close, but
@@ -986,8 +985,8 @@ keep_alive_decision_full(Req, RespHeaders) ->
             %% circuits on the keep-alive check so the response-side
             %% `has_token` only fires when the client opted in.
             case
-                has_token(ReqConn, persistent_term:get(?KEEP_ALIVE_CP_KEY)) andalso
-                    not has_token(RespConn, CloseCp)
+                has_token(ReqConn, ~"keep-alive") andalso
+                    not has_token(RespConn, Close)
             of
                 true -> keep_alive;
                 false -> close
@@ -996,7 +995,7 @@ keep_alive_decision_full(Req, RespHeaders) ->
             %% `orelse` short-circuits on ReqClose = true so the
             %% response-side `has_token` only fires when the client
             %% didn't already say `close`.
-            case has_token(ReqConn, CloseCp) orelse has_token(RespConn, CloseCp) of
+            case has_token(ReqConn, Close) orelse has_token(RespConn, Close) of
                 true -> close;
                 false -> keep_alive
             end
@@ -1021,14 +1020,28 @@ resp_connection_token(Headers) ->
         V -> V
     end.
 
--spec has_token(binary(), binary:cp()) -> boolean().
-has_token(Value, TokenCp) ->
-    binary:match(Value, TokenCp) =/= nomatch.
+%% RFC 9110 §7.6.1: `Connection` is a comma-separated list of tokens, so
+%% match `Token` against each comma-split, OWS-trimmed element, not as a
+%% substring (`Connection: enclosed` must not match the `close` token).
+%% Two fast paths skip the split/trim/persistent_term for the common
+%% values: an empty header (the response side is almost always `<<>>`)
+%% has no token, and a single-token value equals the token outright
+%% (`Connection: close` / `keep-alive`).
+-spec has_token(binary(), binary()) -> boolean().
+has_token(<<>>, _Token) ->
+    false;
+has_token(Token, Token) ->
+    true;
+has_token(Value, Token) ->
+    CommaCp = persistent_term:get(?CONN_COMMA_CP_KEY),
+    lists:any(
+        fun(Part) -> roadrunner_bin:trim_ows(Part) =:= Token end,
+        binary:split(Value, CommaCp, [global])
+    ).
 
 -spec init_patterns() -> ok.
 init_patterns() ->
-    persistent_term:put(?CLOSE_CP_KEY, binary:compile_pattern(~"close")),
-    persistent_term:put(?KEEP_ALIVE_CP_KEY, binary:compile_pattern(~"keep-alive")),
+    persistent_term:put(?CONN_COMMA_CP_KEY, binary:compile_pattern(~",")),
     ok.
 
 -spec header_value(binary(), roadrunner_http:headers()) -> binary() | undefined.
