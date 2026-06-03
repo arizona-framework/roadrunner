@@ -339,7 +339,7 @@ listener_opts(#{protocol := h2, cert_dir := CertDir}) ->
             {certfile, CertDir ++ "/cert.pem"},
             {keyfile, CertDir ++ "/key.pem"}
         ],
-        http2_enabled => true,
+        protocols => [http2],
         routes => roadrunner_keepalive_handler,
         keep_alive_timeout => 60000,
         max_clients => 100000,
