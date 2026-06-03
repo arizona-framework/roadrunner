@@ -42,7 +42,7 @@ is_documented_shape({ok, _, _, _}) -> true;
 is_documented_shape({ok, _, _, _, _}) -> true;
 is_documented_shape({more, _}) -> true;
 is_documented_shape({error, _}) -> true;
-is_documented_shape(end_of_headers) -> true;
+is_documented_shape({end_of_headers, _}) -> true;
 is_documented_shape(_) -> false.
 
 %% =============================================================================
