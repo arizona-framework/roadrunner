@@ -201,8 +201,7 @@ path_segments(Path) ->
     binary:split(Path, persistent_term:get(?SLASH_CP_KEY), [global, trim_all]).
 
 %% `-on_load` callback. Compiles the path-segment separator once at
-%% module load — see the `feedback_compile_pattern_convention`
-%% project rule.
+%% module load into `persistent_term` so the hot path reads a constant.
 -spec init_patterns() -> ok.
 init_patterns() ->
     persistent_term:put(?SLASH_CP_KEY, binary:compile_pattern(~"/")),
