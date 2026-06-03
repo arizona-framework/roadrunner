@@ -26,8 +26,6 @@ The request map shape lives in `roadrunner_req` alongside the
 accessors that operate on it.
 """.
 
--on_load(init_cache/0).
-
 -export([http_date_now/0, format_http_date/1, with_date/1, auto_headers/2]).
 -export([header_list_size/1]).
 
@@ -56,22 +54,26 @@ Built via direct bit-syntax binary construction rather than
 exact widths and the day/month abbreviations) and this function
 runs on the response hot path.
 
-Cached via `persistent_term` keyed by the current Posix second:
-the formatted binary is identical for every request that lands in
-the same second, so we recompute it only when the second ticks
-over. Updates are racy on the second boundary (multiple processes
-may put the same value), but each put writes the same binary so
-the race is benign.
+Cached per process in the process dictionary, keyed by the current
+Posix second: the formatted binary is identical for every response
+a process emits within the same second, so we recompute it only when
+the second ticks over. Per-process rather than via `persistent_term`
+because the value changes every second, and a `persistent_term:put`
+that frequent forces a global scan of every process heap on the
+response hot path; the per-process cache pays a cheap dictionary read
+instead, and reformats at most once per second per process: once per
+connection on h1/h2, once per request on h3 (its stream workers are
+per-request).
 """.
 -spec http_date_now() -> binary().
 http_date_now() ->
     Now = erlang:system_time(second),
-    case persistent_term:get(?DATE_CACHE_KEY, undefined) of
+    case get(?DATE_CACHE_KEY) of
         {Now, Bin} ->
             Bin;
         _ ->
             Bin = format_http_date(Now),
-            persistent_term:put(?DATE_CACHE_KEY, {Now, Bin}),
+            _ = put(?DATE_CACHE_KEY, {Now, Bin}),
             Bin
     end.
 
@@ -146,11 +148,3 @@ format_http_date(Posix) ->
 -spec pad2(0..99) -> binary().
 pad2(N) when N < 10 -> <<$0, ($0 + N)>>;
 pad2(N) -> integer_to_binary(N).
-
-%% `-on_load` callback. Pre-populate the date cache so the very first
-%% `http_date_now/0` call after module load is a hit, not a miss.
--spec init_cache() -> ok.
-init_cache() ->
-    Now = erlang:system_time(second),
-    persistent_term:put(?DATE_CACHE_KEY, {Now, format_http_date(Now)}),
-    ok.
