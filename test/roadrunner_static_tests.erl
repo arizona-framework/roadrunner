@@ -456,45 +456,45 @@ cache_helpers_test_() ->
         [
             {"cache_get returns miss when no entry exists", fun() ->
                 FilePath = filename:join(Dir, "no_cache_yet.txt"),
-                ?assertEqual(miss, roadrunner_static:cache_get(FilePath))
+                ?assertEqual(miss, roadrunner_static_cache:lookup(FilePath))
             end},
             {"cache_put then cache_get within TTL returns the entry", fun() ->
                 FilePath = filename:join(Dir, "fresh.txt"),
-                ok = roadrunner_static:cache_put(FilePath, 100, 1700000000, 60000),
+                ok = roadrunner_static_cache:store(FilePath, 100, 1700000000, 60000),
                 ?assertEqual(
                     {ok, 100, 1700000000},
-                    roadrunner_static:cache_get(FilePath)
+                    roadrunner_static_cache:lookup(FilePath)
                 )
             end},
             {"cache_get returns miss after TTL expires", fun() ->
                 FilePath = filename:join(Dir, "expiring.txt"),
-                ok = roadrunner_static:cache_put(FilePath, 50, 1700000000, 1),
+                ok = roadrunner_static_cache:store(FilePath, 50, 1700000000, 1),
                 timer:sleep(20),
-                ?assertEqual(miss, roadrunner_static:cache_get(FilePath))
+                ?assertEqual(miss, roadrunner_static_cache:lookup(FilePath))
             end},
             {"cache_ttl_ms => infinity entries never expire", fun() ->
                 %% No `monotonic_time + infinity` arithmetic; sleeping
                 %% past any finite TTL must still return the entry.
                 FilePath = filename:join(Dir, "forever.txt"),
-                ok = roadrunner_static:cache_put(FilePath, 42, 1700000000, infinity),
+                ok = roadrunner_static_cache:store(FilePath, 42, 1700000000, infinity),
                 ?assertEqual(
                     {ok, 42, 1700000000},
-                    roadrunner_static:cache_get(FilePath)
+                    roadrunner_static_cache:lookup(FilePath)
                 ),
                 timer:sleep(10),
                 ?assertEqual(
                     {ok, 42, 1700000000},
-                    roadrunner_static:cache_get(FilePath)
+                    roadrunner_static_cache:lookup(FilePath)
                 )
             end},
             {"cache_clear/0 drops every cached entry", fun() ->
                 F1 = filename:join(Dir, "clear_a.txt"),
                 F2 = filename:join(Dir, "clear_b.txt"),
-                ok = roadrunner_static:cache_put(F1, 10, 1700000000, infinity),
-                ok = roadrunner_static:cache_put(F2, 20, 1700000000, 60000),
+                ok = roadrunner_static_cache:store(F1, 10, 1700000000, infinity),
+                ok = roadrunner_static_cache:store(F2, 20, 1700000000, 60000),
                 ok = roadrunner_static:cache_clear(),
-                ?assertEqual(miss, roadrunner_static:cache_get(F1)),
-                ?assertEqual(miss, roadrunner_static:cache_get(F2))
+                ?assertEqual(miss, roadrunner_static_cache:lookup(F1)),
+                ?assertEqual(miss, roadrunner_static_cache:lookup(F2))
             end}
         ]
     end}.
@@ -509,9 +509,9 @@ cache_populated_after_request_test_() ->
                 %% so the resulting cache key is a binary; match that here.
                 FilePath = filename:join([Dir, ~"cached.txt"]),
                 ok = roadrunner_static:cache_clear(),
-                ?assertEqual(miss, roadrunner_static:cache_get(FilePath)),
+                ?assertEqual(miss, roadrunner_static_cache:lookup(FilePath)),
                 _Reply = http_get(Port, ~"/static/cached.txt"),
-                ?assertMatch({ok, _Size, _Mtime}, roadrunner_static:cache_get(FilePath))
+                ?assertMatch({ok, _Size, _Mtime}, roadrunner_static_cache:lookup(FilePath))
             end},
             {"second request hits the cache and serves the same body", fun() ->
                 %% Drive `serve_file` through its cache-hit branch by
@@ -544,7 +544,7 @@ cache_default_off_test_() ->
                 FilePath = filename:join([Dir, ~"hello.html"]),
                 ok = roadrunner_static:cache_clear(),
                 _Reply = http_get(Port, ~"/static/hello.html"),
-                ?assertEqual(miss, roadrunner_static:cache_get(FilePath))
+                ?assertEqual(miss, roadrunner_static_cache:lookup(FilePath))
             end}
         end}.
 
