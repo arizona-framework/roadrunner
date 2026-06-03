@@ -327,6 +327,68 @@ shared per-section middlewares (auth, rate limit, body-limit
 overrides) duplicated across many entries. Add when a real codebase
 shows that duplication.
 
+## Hot-path micro-optimizations
+
+A profiling + fresh-eyes review of the h1 / h2 / static request paths
+surfaced these repeated-work eliminations. Each is its own commit, validated
+by microbench / interleaved A/B / profile share (not headline req/s), per the
+rule that a perf win counts at any size only when it is constant,
+reproducible, and proven. Listed best-first.
+
+### Thread the compiled unsafe-bytes pattern through h2 header validation — small
+
+**What:** `roadrunner_conn_loop_http2:validate_headers/1` calls the two-arg
+`check_header_safe/2` in `roadrunner_http1`, which does a
+`persistent_term:get(?UNSAFE_BYTES_KEY)` for every name and every value (2N
+lookups per response). The h1 response path already solved this:
+`encode_headers_loop/2` fetches the compiled `binary:cp()` once and threads
+it through the exported three-arg `check_header_safe/3`. Mirror that on h2:
+fetch once in `validate_headers/1`, thread the pattern through the recursion.
+
+**Why deferred:** zero-risk reuse of a shipped pattern, but a constant
+per-response saving rather than a throughput change, so it lands on its own
+once measured.
+
+**Validate:** microbench `validate_headers/1` at 4 / 8 / 16 headers; the
+`persistent_term:get` removal is a stable-sign win.
+
+**Scope:** small.
+
+### Cache the static gzip-sibling stat + content-type in the metadata entry — small
+
+**What:** On the opt-in `cache_ttl_ms` path a cache hit still runs
+`file:read_file_info(<file>.gz)` on every request (`maybe_serve_gzip/4`) and
+recomputes `content_type_for/1`. Fold the gzip-sibling presence and size and
+the content-type binary into the `roadrunner_static_cache` tuple, populated
+on the cold lookup that already stats the main file, so a hit serves both
+with no extra syscall or recompute until the TTL expires.
+
+**Why deferred:** only affects the opt-in static cache path, and the saved
+`stat` is cheap relative to the sendfile that dominates static serving, so
+the win wants measuring before it ships. The cache then also assumes the
+`.gz` sibling is immutable for the TTL, the same assumption it already
+documents for the main file.
+
+**Validate:** `strace` stat-count per cache hit (expect 1 to 0) plus an
+interleaved A/B on a small-file gzip scenario.
+
+**Scope:** small.
+
+### Skip iolist_to_binary on single-frame h2 HEADERS — small, measure first
+
+**What:** `roadrunner_conn_loop_http2` calls
+`roadrunner_http2_hpack:decode(iolist_to_binary(Fragment), Dec)`, but on the
+common single-frame END_HEADERS request `Fragment` is already a binary (only
+a CONTINUATION makes it an iolist). Guard on the binary shape to skip the
+call.
+
+**Why deferred:** it is unclear whether `iolist_to_binary` actually copies a
+sub-binary in our OTP build; if it does not, the change saves only the BIF
+call overhead. Measure the copy (fprof own-time / profile share) before
+committing.
+
+**Scope:** small.
+
 ## Out of scope
 
 These are deliberately out of scope, not "deferred":
