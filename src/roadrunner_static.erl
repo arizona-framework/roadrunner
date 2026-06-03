@@ -55,7 +55,7 @@ directories are still followed by the kernel.
 ## Metadata cache
 
 `#{cache_ttl_ms => N}` caches the `stat` result (size, mtime) for
-each regular file in `persistent_term` for `N` milliseconds. Hot
+each regular file in a node-global ETS table for `N` milliseconds. Hot
 paths skip the per-request `read_link_info` syscall after the
 first hit. Symlinks always bypass the cache because the policy
 gate needs the un-followed lookup.
@@ -86,7 +86,8 @@ under an `infinity` (or long) TTL.
 
 -define(COMMA_CP_KEY, {?MODULE, comma_cp}).
 -define(DASH_CP_KEY, {?MODULE, dash_cp}).
--define(META_CACHE_KEY(FilePath), {roadrunner_static_meta, FilePath}).
+%% Node-global ETS table owned by `roadrunner_static_cache`.
+-define(CACHE_TABLE, roadrunner_static_meta).
 
 %% Caching is opt-in: default is `0` (disabled). See `## Metadata cache`
 %% in the moduledoc above for when to enable and the trade-offs.
@@ -133,23 +134,11 @@ Drop every cached static-file metadata entry. Pair with
 cycle) to flush stale metadata after replacing files in the
 docroot, without restarting the listener.
 
-Walks `persistent_term:get/0` once to find the static-meta keys —
-cheap on small caches, O(N) over **all** persistent_term entries
-on a busy node. Intended for occasional, deploy-time use, not a
-per-request hot path.
+Clears the static-meta ETS table in one call (`ets:delete_all_objects/1`).
 """.
 -spec cache_clear() -> ok.
 cache_clear() ->
-    lists:foreach(
-        fun
-            ({{roadrunner_static_meta, _Path} = K, _V}) ->
-                _ = persistent_term:erase(K),
-                ok;
-            (_) ->
-                ok
-        end,
-        persistent_term:get()
-    ),
+    true = ets:delete_all_objects(?CACHE_TABLE),
     ok.
 
 -spec serve_file(
@@ -202,40 +191,43 @@ fresh_lookup(FilePath, TtlMs, Req) ->
 %% within its TTL. Returns `miss` if absent or expired. The `infinity`
 %% sentinel in `ExpiresAt` is for entries that never expire (set via
 %% `cache_ttl_ms => infinity`); for those, every read is a hit until
-%% the listener restarts. Exported so the eunit suite can drive the
-%% cache directly.
+%% `cache_clear/0` or a node restart. Exported so the eunit suite can
+%% drive the cache directly.
 -doc false.
 -spec cache_get(file:filename_all()) ->
     {ok, non_neg_integer(), integer()} | miss.
 cache_get(FilePath) ->
-    case persistent_term:get(?META_CACHE_KEY(FilePath), undefined) of
-        undefined ->
+    case ets:lookup(?CACHE_TABLE, FilePath) of
+        [] ->
             miss;
-        {Size, Mtime, infinity} ->
+        [{_, {Size, Mtime, infinity}}] ->
             {ok, Size, Mtime};
-        {Size, Mtime, ExpiresAt} ->
+        [{_, {Size, Mtime, ExpiresAt}}] ->
             case erlang:monotonic_time(millisecond) of
                 Now when Now =< ExpiresAt ->
                     {ok, Size, Mtime};
                 _ ->
+                    %% Drop the expired row so stale entries don't pile
+                    %% up — cheap in ETS, unlike a persistent_term erase.
+                    true = ets:delete(?CACHE_TABLE, FilePath),
                     miss
             end
     end.
 
 %% Store `{Size, Mtime}` for `FilePath` with a TTL of `TtlMs` ms from
 %% now, or forever when `TtlMs` is `infinity`. The entry is keyed by
-%% absolute path; concurrent puts for the same path are idempotent
-%% under the eventual-consistency semantics of `persistent_term`.
-%% Exported for direct eunit coverage.
+%% absolute path; concurrent inserts for the same path are last-writer-
+%% wins (each `ets:insert` is atomic per key). Exported for direct
+%% eunit coverage.
 -doc false.
 -spec cache_put(file:filename_all(), non_neg_integer(), integer(), pos_integer() | infinity) ->
     ok.
 cache_put(FilePath, Size, Mtime, infinity) ->
-    persistent_term:put(?META_CACHE_KEY(FilePath), {Size, Mtime, infinity}),
+    true = ets:insert(?CACHE_TABLE, {FilePath, {Size, Mtime, infinity}}),
     ok;
 cache_put(FilePath, Size, Mtime, TtlMs) when is_integer(TtlMs), TtlMs > 0 ->
     ExpiresAt = erlang:monotonic_time(millisecond) + TtlMs,
-    persistent_term:put(?META_CACHE_KEY(FilePath), {Size, Mtime, ExpiresAt}),
+    true = ets:insert(?CACHE_TABLE, {FilePath, {Size, Mtime, ExpiresAt}}),
     ok.
 
 -spec maybe_cache_put(

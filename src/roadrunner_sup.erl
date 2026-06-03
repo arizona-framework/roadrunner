@@ -17,11 +17,11 @@ start_link() ->
 
 -spec init([]) -> {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
 init([]) ->
-    %% Listeners are added dynamically via roadrunner:start_listener/2 — the
-    %% only static child is `pg`'s default scope, which `roadrunner_conn`
-    %% joins so `roadrunner_listener:drain/2` can find conns to notify.
-    %% one_for_one isolates per-listener crashes; pg only restarts on
-    %% its own crash, which is a true protocol break.
+    %% Listeners are added dynamically via roadrunner:start_listener/2. The
+    %% static children are `pg`'s default scope (which `roadrunner_conn` joins
+    %% so `roadrunner_listener:drain/2` can find conns to notify) and the
+    %% static-file metadata cache table owner. one_for_one isolates per-listener
+    %% crashes; the static children only restart on their own crash.
     SupFlags = #{
         strategy => one_for_one,
         intensity => 5,
@@ -35,6 +35,14 @@ init([]) ->
         shutdown => 5000,
         modules => [pg]
     },
-    {ok, {SupFlags, [PgScope]}}.
+    StaticCache = #{
+        id => roadrunner_static_cache,
+        start => {roadrunner_static_cache, start_link, []},
+        type => worker,
+        restart => permanent,
+        shutdown => 5000,
+        modules => [roadrunner_static_cache]
+    },
+    {ok, {SupFlags, [PgScope, StaticCache]}}.
 
 %% internal functions
