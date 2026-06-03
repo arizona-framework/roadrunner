@@ -506,30 +506,39 @@ entry_size({Name, Value}) ->
 %% =============================================================================
 
 -spec full_match(binary(), binary(), context()) -> pos_integer() | none.
-full_match(Name, Value, #hpack_ctx{table = Dyn}) ->
+full_match(Name, Value, #hpack_ctx{table = Dyn, count = Count}) ->
     %% Static lookup is a function-clause dispatch (BEAM JIT turns
     %% the 60-clause `static_full_match/2` into a hash/select jump
     %% table); we still indirect through the wrapper so a hit
     %% returns directly without scanning the dynamic table.
     case static_full_match(Name, Value) of
-        none -> dyn_full_match(Name, Value, tuple_to_list(Dyn), 1);
+        none -> dyn_full_match(Name, Value, Dyn, 1, Count);
         Idx -> Idx
     end.
 
 -spec name_match(binary(), context()) -> pos_integer() | none.
-name_match(Name, #hpack_ctx{table = Dyn}) ->
+name_match(Name, #hpack_ctx{table = Dyn, count = Count}) ->
     case static_name_match(Name) of
-        none -> dyn_name_match(Name, tuple_to_list(Dyn), 1);
+        none -> dyn_name_match(Name, Dyn, 1, Count);
         Idx -> Idx
     end.
 
-dyn_full_match(_, _, [], _) -> none;
-dyn_full_match(Name, Value, [{Name, Value} | _], I) -> ?STATIC_TABLE_LEN + I;
-dyn_full_match(Name, Value, [_ | T], I) -> dyn_full_match(Name, Value, T, I + 1).
+%% Scan the dynamic-table tuple (newest at index 1) with `element/2`
+%% instead of `tuple_to_list/1` + list scan — same O(n) walk, no
+%% per-lookup list allocation.
+dyn_full_match(_Name, _Value, _Dyn, I, Count) when I > Count -> none;
+dyn_full_match(Name, Value, Dyn, I, Count) ->
+    case element(I, Dyn) of
+        {Name, Value} -> ?STATIC_TABLE_LEN + I;
+        _ -> dyn_full_match(Name, Value, Dyn, I + 1, Count)
+    end.
 
-dyn_name_match(_, [], _) -> none;
-dyn_name_match(Name, [{Name, _} | _], I) -> ?STATIC_TABLE_LEN + I;
-dyn_name_match(Name, [_ | T], I) -> dyn_name_match(Name, T, I + 1).
+dyn_name_match(_Name, _Dyn, I, Count) when I > Count -> none;
+dyn_name_match(Name, Dyn, I, Count) ->
+    case element(I, Dyn) of
+        {Name, _} -> ?STATIC_TABLE_LEN + I;
+        _ -> dyn_name_match(Name, Dyn, I + 1, Count)
+    end.
 
 %% =============================================================================
 %% RFC 7541 Appendix A — static table (61 entries)
