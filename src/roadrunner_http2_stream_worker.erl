@@ -107,9 +107,7 @@ run_handler(ConnPid, StreamId, Req, ProtoOpts) ->
             send_buffered(
                 ConnPid, StreamId, 404, [{~"content-type", ~"text/plain"}], ~"Not Found"
             ),
-            ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, #{
-                status => 404, response_kind => buffered
-            })
+            ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, 404, buffered)
     end.
 
 invoke(ConnPid, StreamId, Handler, Pipeline, #{method := Method} = Req, Metadata, ReqStart) ->
@@ -121,10 +119,12 @@ invoke(ConnPid, StreamId, Handler, Pipeline, #{method := Method} = Req, Metadata
             emit_handler_response(
                 ConnPid, StreamId, Handler, roadrunner_conn:head_response(Response, Method)
             ),
-            ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, #{
-                status => roadrunner_conn:response_status(Response),
-                response_kind => roadrunner_conn:response_kind(Response)
-            })
+            ok = roadrunner_telemetry:request_stop(
+                ReqStart,
+                Metadata,
+                roadrunner_conn:response_status(Response),
+                roadrunner_conn:response_kind(Response)
+            )
     catch
         Class:Reason:Stack ->
             ok = roadrunner_telemetry:request_exception(
