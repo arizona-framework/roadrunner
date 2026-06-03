@@ -619,10 +619,12 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
     try Pipeline(Req) of
         {Response, Req2} when is_map(Req2) ->
             _ = dispatch_response(S, Handler, Req2, Response),
-            ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, #{
-                status => roadrunner_conn:response_status(Response),
-                response_kind => roadrunner_conn:response_kind(Response)
-            }),
+            ok = roadrunner_telemetry:request_stop(
+                ReqStart,
+                Metadata,
+                roadrunner_conn:response_status(Response),
+                roadrunner_conn:response_kind(Response)
+            ),
             finishing_phase(
                 S#loop_state{requests_served = S#loop_state.requests_served + 1},
                 Req2,

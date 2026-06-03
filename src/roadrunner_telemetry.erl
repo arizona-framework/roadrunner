@@ -124,7 +124,7 @@
 %%     `reason` (`max_frame_size | max_message_size`).
 %%
 %% The `start_time` value returned by `request_start/1` must be passed
-%% back into `request_stop/3` / `request_exception/4` to compute
+%% back into `request_stop/4` / `request_exception/4` to compute
 %% `duration`. Subscribers can wire up via `telemetry:attach/4` in
 %% production or `telemetry_test:attach_event_handlers/2` in tests.
 %%
@@ -158,7 +158,7 @@
 
 -export([
     request_start/1,
-    request_stop/3,
+    request_stop/4,
     request_exception/4,
     response_send/2,
     listener_accept/1,
@@ -198,14 +198,19 @@ request_start(Metadata) ->
 
 -doc """
 Emit `[roadrunner, request, stop]` with `duration = now - StartMono` and
-the start metadata merged with `Extra` (status + response_kind).
+the start metadata extended with `status` and `response_kind`.
 """.
--spec request_stop(integer(), metadata(), map()) -> ok.
-request_stop(StartMono, Metadata, Extra) ->
+-spec request_stop(
+    integer(),
+    metadata(),
+    roadrunner_http:status(),
+    buffered | stream | loop | sendfile | websocket
+) -> ok.
+request_stop(StartMono, Metadata, Status, Kind) ->
     telemetry:execute(
         [roadrunner, request, stop],
         #{duration => erlang:monotonic_time() - StartMono},
-        maps:merge(Metadata, Extra)
+        Metadata#{status => Status, response_kind => Kind}
     ),
     ok.
 
