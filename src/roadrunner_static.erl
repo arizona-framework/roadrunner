@@ -140,8 +140,8 @@ cache_clear() ->
 ) -> roadrunner_handler:response().
 serve_file(FilePath, TtlMs, Req) ->
     case cached_lookup(FilePath, TtlMs) of
-        {ok, Size, Mtime} ->
-            serve_regular_file(FilePath, Size, Mtime, Req);
+        {ok, Size, Mtime, ETag, LastMod} ->
+            serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Req);
         miss ->
             fresh_lookup(FilePath, TtlMs, Req)
     end.
@@ -152,7 +152,7 @@ serve_file(FilePath, TtlMs, Req) ->
 %% always bypass the cache because the policy gate needs the un-followed
 %% `read_link_info` result.
 -spec cached_lookup(file:filename_all(), non_neg_integer() | infinity) ->
-    {ok, non_neg_integer(), integer()} | miss.
+    {ok, non_neg_integer(), integer(), binary(), binary()} | miss.
 cached_lookup(_FilePath, TtlMs) when is_integer(TtlMs), TtlMs =< 0 ->
     miss;
 cached_lookup(FilePath, _TtlMs) ->
@@ -175,19 +175,28 @@ fresh_lookup(FilePath, TtlMs, Req) ->
                 false -> roadrunner_resp:not_found()
             end;
         {ok, #file_info{type = regular, size = Size, mtime = Mtime}} ->
-            ok = maybe_cache_put(FilePath, Size, Mtime, TtlMs),
-            serve_regular_file(FilePath, Size, Mtime, Req);
+            ETag = etag(Size, Mtime),
+            LastMod = roadrunner_http:format_http_date(Mtime),
+            ok = maybe_cache_put(FilePath, Size, Mtime, ETag, LastMod, TtlMs),
+            serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Req);
         _ ->
             roadrunner_resp:not_found()
     end.
 
 -spec maybe_cache_put(
-    file:filename_all(), non_neg_integer(), integer(), non_neg_integer() | infinity
+    file:filename_all(),
+    non_neg_integer(),
+    integer(),
+    binary(),
+    binary(),
+    non_neg_integer() | infinity
 ) -> ok.
-maybe_cache_put(_FilePath, _Size, _Mtime, TtlMs) when is_integer(TtlMs), TtlMs =< 0 ->
+maybe_cache_put(_FilePath, _Size, _Mtime, _ETag, _LastMod, TtlMs) when
+    is_integer(TtlMs), TtlMs =< 0
+->
     ok;
-maybe_cache_put(FilePath, Size, Mtime, TtlMs) ->
-    roadrunner_static_cache:store(FilePath, Size, Mtime, TtlMs).
+maybe_cache_put(FilePath, Size, Mtime, ETag, LastMod, TtlMs) ->
+    roadrunner_static_cache:store(FilePath, Size, Mtime, ETag, LastMod, TtlMs).
 
 %% Read leaf-stat after the symlink-policy gate has approved follow.
 -spec serve_followed_file(file:filename_all(), roadrunner_req:request()) ->
@@ -195,17 +204,22 @@ maybe_cache_put(FilePath, Size, Mtime, TtlMs) ->
 serve_followed_file(FilePath, Req) ->
     case file:read_file_info(FilePath, [raw, {time, posix}]) of
         {ok, #file_info{type = regular, size = Size, mtime = Mtime}} ->
-            serve_regular_file(FilePath, Size, Mtime, Req);
+            ETag = etag(Size, Mtime),
+            LastMod = roadrunner_http:format_http_date(Mtime),
+            serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Req);
         _ ->
             roadrunner_resp:not_found()
     end.
 
 -spec serve_regular_file(
-    file:filename_all(), non_neg_integer(), integer(), roadrunner_req:request()
+    file:filename_all(),
+    non_neg_integer(),
+    integer(),
+    binary(),
+    binary(),
+    roadrunner_req:request()
 ) -> roadrunner_handler:response().
-serve_regular_file(FilePath, Size, Mtime, Req) ->
-    ETag = etag(Size, Mtime),
-    LastMod = roadrunner_http:format_http_date(Mtime),
+serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Req) ->
     case is_cached(Req, ETag, Mtime) of
         true ->
             {304,

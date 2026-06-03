@@ -18,7 +18,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, lookup/1, store/4, clear/0]).
+-export([start_link/0, lookup/1, store/6, clear/0]).
 -export([init/1, handle_call/3, handle_cast/2]).
 
 -define(TABLE, roadrunner_static_meta).
@@ -29,34 +29,39 @@ start_link() ->
 
 %% Read the cached size and mtime for FilePath if it is still within its
 %% TTL. An infinity entry is always a hit; an expired entry is dropped
-%% (cheap in ETS) and reported as a miss.
--spec lookup(file:filename_all()) -> {ok, non_neg_integer(), integer()} | miss.
+%% (cheap in ETS) and reported as a miss. The cached value carries the
+%% derived ETag + Last-Modified strings so a hit skips recomputing them.
+-spec lookup(file:filename_all()) ->
+    {ok, non_neg_integer(), integer(), binary(), binary()} | miss.
 lookup(FilePath) ->
     case ets:lookup(?TABLE, FilePath) of
         [] ->
             miss;
-        [{_, {Size, Mtime, infinity}}] ->
-            {ok, Size, Mtime};
-        [{_, {Size, Mtime, ExpiresAt}}] ->
+        [{_, {Size, Mtime, ETag, LastMod, infinity}}] ->
+            {ok, Size, Mtime, ETag, LastMod};
+        [{_, {Size, Mtime, ETag, LastMod, ExpiresAt}}] ->
             case erlang:monotonic_time(millisecond) of
                 Now when Now =< ExpiresAt ->
-                    {ok, Size, Mtime};
+                    {ok, Size, Mtime, ETag, LastMod};
                 _ ->
                     true = ets:delete(?TABLE, FilePath),
                     miss
             end
     end.
 
-%% Store the size and mtime for FilePath with a TTL of TtlMs ms from now,
-%% or forever when TtlMs is infinity. Concurrent stores for the same path
-%% are last-writer-wins (each insert is atomic per key).
--spec store(file:filename_all(), non_neg_integer(), integer(), pos_integer() | infinity) -> ok.
-store(FilePath, Size, Mtime, infinity) ->
-    true = ets:insert(?TABLE, {FilePath, {Size, Mtime, infinity}}),
+%% Store the size, mtime, and derived ETag + Last-Modified strings for
+%% FilePath with a TTL of TtlMs ms from now, or forever when TtlMs is
+%% infinity. Concurrent stores for the same path are last-writer-wins
+%% (each insert is atomic per key).
+-spec store(
+    file:filename_all(), non_neg_integer(), integer(), binary(), binary(), pos_integer() | infinity
+) -> ok.
+store(FilePath, Size, Mtime, ETag, LastMod, infinity) ->
+    true = ets:insert(?TABLE, {FilePath, {Size, Mtime, ETag, LastMod, infinity}}),
     ok;
-store(FilePath, Size, Mtime, TtlMs) when is_integer(TtlMs), TtlMs > 0 ->
+store(FilePath, Size, Mtime, ETag, LastMod, TtlMs) when is_integer(TtlMs), TtlMs > 0 ->
     ExpiresAt = erlang:monotonic_time(millisecond) + TtlMs,
-    true = ets:insert(?TABLE, {FilePath, {Size, Mtime, ExpiresAt}}),
+    true = ets:insert(?TABLE, {FilePath, {Size, Mtime, ETag, LastMod, ExpiresAt}}),
     ok.
 
 %% Drop every cached entry in one call.
