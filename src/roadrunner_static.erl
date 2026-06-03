@@ -55,7 +55,7 @@ directories are still followed by the kernel.
 ## Metadata cache
 
 `#{cache_ttl_ms => N}` caches the `stat` result (size, mtime) for
-each regular file in `persistent_term` for `N` milliseconds. Hot
+each regular file in a node-global ETS table for `N` milliseconds. Hot
 paths skip the per-request `read_link_info` syscall after the
 first hit. Symlinks always bypass the cache because the policy
 gate needs the un-followed lookup.
@@ -86,14 +86,12 @@ under an `infinity` (or long) TTL.
 
 -define(COMMA_CP_KEY, {?MODULE, comma_cp}).
 -define(DASH_CP_KEY, {?MODULE, dash_cp}).
--define(META_CACHE_KEY(FilePath), {roadrunner_static_meta, FilePath}).
 
 %% Caching is opt-in: default is `0` (disabled). See `## Metadata cache`
 %% in the moduledoc above for when to enable and the trade-offs.
 -define(DEFAULT_CACHE_TTL_MS, 0).
 
 -export([handle/1, cache_clear/0]).
--export([cache_get/1, cache_put/4]).
 
 -define(MIME_TYPES, #{
     ~".html" => ~"text/html; charset=utf-8",
@@ -132,25 +130,10 @@ Drop every cached static-file metadata entry. Pair with
 `cache_ttl_ms => infinity` (or any TTL longer than your deploy
 cycle) to flush stale metadata after replacing files in the
 docroot, without restarting the listener.
-
-Walks `persistent_term:get/0` once to find the static-meta keys —
-cheap on small caches, O(N) over **all** persistent_term entries
-on a busy node. Intended for occasional, deploy-time use, not a
-per-request hot path.
 """.
 -spec cache_clear() -> ok.
 cache_clear() ->
-    lists:foreach(
-        fun
-            ({{roadrunner_static_meta, _Path} = K, _V}) ->
-                _ = persistent_term:erase(K),
-                ok;
-            (_) ->
-                ok
-        end,
-        persistent_term:get()
-    ),
-    ok.
+    roadrunner_static_cache:clear().
 
 -spec serve_file(
     file:filename_all(), non_neg_integer() | infinity, roadrunner_req:request()
@@ -165,15 +148,15 @@ serve_file(FilePath, TtlMs, Req) ->
 
 %% Cache-aware regular-file metadata lookup. Returns `miss` when the
 %% TTL is non-positive (caching disabled) or when no fresh entry is in
-%% the cache. `infinity` falls through to `cache_get/1` and stays a hit
-%% until the listener restarts. Symlinks always bypass the cache
-%% because the policy gate needs the un-followed `read_link_info` result.
+%% the cache. `infinity` entries stay a hit until cleared. Symlinks
+%% always bypass the cache because the policy gate needs the un-followed
+%% `read_link_info` result.
 -spec cached_lookup(file:filename_all(), non_neg_integer() | infinity) ->
     {ok, non_neg_integer(), integer()} | miss.
 cached_lookup(_FilePath, TtlMs) when is_integer(TtlMs), TtlMs =< 0 ->
     miss;
 cached_lookup(FilePath, _TtlMs) ->
-    cache_get(FilePath).
+    roadrunner_static_cache:lookup(FilePath).
 
 %% Stat the file, populate the cache when applicable, and dispatch on
 %% the file type. Mirrors the original `serve_file/2` body. Used on
@@ -198,53 +181,13 @@ fresh_lookup(FilePath, TtlMs, Req) ->
             roadrunner_resp:not_found()
     end.
 
-%% Read a cached `{Size, Mtime}` for `FilePath` if the entry is still
-%% within its TTL. Returns `miss` if absent or expired. The `infinity`
-%% sentinel in `ExpiresAt` is for entries that never expire (set via
-%% `cache_ttl_ms => infinity`); for those, every read is a hit until
-%% the listener restarts. Exported so the eunit suite can drive the
-%% cache directly.
--doc false.
--spec cache_get(file:filename_all()) ->
-    {ok, non_neg_integer(), integer()} | miss.
-cache_get(FilePath) ->
-    case persistent_term:get(?META_CACHE_KEY(FilePath), undefined) of
-        undefined ->
-            miss;
-        {Size, Mtime, infinity} ->
-            {ok, Size, Mtime};
-        {Size, Mtime, ExpiresAt} ->
-            case erlang:monotonic_time(millisecond) of
-                Now when Now =< ExpiresAt ->
-                    {ok, Size, Mtime};
-                _ ->
-                    miss
-            end
-    end.
-
-%% Store `{Size, Mtime}` for `FilePath` with a TTL of `TtlMs` ms from
-%% now, or forever when `TtlMs` is `infinity`. The entry is keyed by
-%% absolute path; concurrent puts for the same path are idempotent
-%% under the eventual-consistency semantics of `persistent_term`.
-%% Exported for direct eunit coverage.
--doc false.
--spec cache_put(file:filename_all(), non_neg_integer(), integer(), pos_integer() | infinity) ->
-    ok.
-cache_put(FilePath, Size, Mtime, infinity) ->
-    persistent_term:put(?META_CACHE_KEY(FilePath), {Size, Mtime, infinity}),
-    ok;
-cache_put(FilePath, Size, Mtime, TtlMs) when is_integer(TtlMs), TtlMs > 0 ->
-    ExpiresAt = erlang:monotonic_time(millisecond) + TtlMs,
-    persistent_term:put(?META_CACHE_KEY(FilePath), {Size, Mtime, ExpiresAt}),
-    ok.
-
 -spec maybe_cache_put(
     file:filename_all(), non_neg_integer(), integer(), non_neg_integer() | infinity
 ) -> ok.
 maybe_cache_put(_FilePath, _Size, _Mtime, TtlMs) when is_integer(TtlMs), TtlMs =< 0 ->
     ok;
 maybe_cache_put(FilePath, Size, Mtime, TtlMs) ->
-    cache_put(FilePath, Size, Mtime, TtlMs).
+    roadrunner_static_cache:store(FilePath, Size, Mtime, TtlMs).
 
 %% Read leaf-stat after the symlink-policy gate has approved follow.
 -spec serve_followed_file(file:filename_all(), roadrunner_req:request()) ->

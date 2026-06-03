@@ -456,53 +456,45 @@ cache_helpers_test_() ->
         [
             {"cache_get returns miss when no entry exists", fun() ->
                 FilePath = filename:join(Dir, "no_cache_yet.txt"),
-                ?assertEqual(miss, roadrunner_static:cache_get(FilePath))
+                ?assertEqual(miss, roadrunner_static_cache:lookup(FilePath))
             end},
             {"cache_put then cache_get within TTL returns the entry", fun() ->
                 FilePath = filename:join(Dir, "fresh.txt"),
-                ok = roadrunner_static:cache_put(FilePath, 100, 1700000000, 60000),
+                ok = roadrunner_static_cache:store(FilePath, 100, 1700000000, 60000),
                 ?assertEqual(
                     {ok, 100, 1700000000},
-                    roadrunner_static:cache_get(FilePath)
+                    roadrunner_static_cache:lookup(FilePath)
                 )
             end},
             {"cache_get returns miss after TTL expires", fun() ->
                 FilePath = filename:join(Dir, "expiring.txt"),
-                ok = roadrunner_static:cache_put(FilePath, 50, 1700000000, 1),
+                ok = roadrunner_static_cache:store(FilePath, 50, 1700000000, 1),
                 timer:sleep(20),
-                ?assertEqual(miss, roadrunner_static:cache_get(FilePath))
+                ?assertEqual(miss, roadrunner_static_cache:lookup(FilePath))
             end},
             {"cache_ttl_ms => infinity entries never expire", fun() ->
                 %% No `monotonic_time + infinity` arithmetic; sleeping
                 %% past any finite TTL must still return the entry.
                 FilePath = filename:join(Dir, "forever.txt"),
-                ok = roadrunner_static:cache_put(FilePath, 42, 1700000000, infinity),
+                ok = roadrunner_static_cache:store(FilePath, 42, 1700000000, infinity),
                 ?assertEqual(
                     {ok, 42, 1700000000},
-                    roadrunner_static:cache_get(FilePath)
+                    roadrunner_static_cache:lookup(FilePath)
                 ),
                 timer:sleep(10),
                 ?assertEqual(
                     {ok, 42, 1700000000},
-                    roadrunner_static:cache_get(FilePath)
+                    roadrunner_static_cache:lookup(FilePath)
                 )
             end},
-            {"cache_clear/0 drops every static-meta entry", fun() ->
+            {"cache_clear/0 drops every cached entry", fun() ->
                 F1 = filename:join(Dir, "clear_a.txt"),
                 F2 = filename:join(Dir, "clear_b.txt"),
-                Sentinel = {?MODULE, cache_clear_sentinel},
-                ok = roadrunner_static:cache_put(F1, 10, 1700000000, infinity),
-                ok = roadrunner_static:cache_put(F2, 20, 1700000000, 60000),
-                %% A non-static persistent_term entry must NOT be erased.
-                ok = persistent_term:put(Sentinel, kept),
-                try
-                    ok = roadrunner_static:cache_clear(),
-                    ?assertEqual(miss, roadrunner_static:cache_get(F1)),
-                    ?assertEqual(miss, roadrunner_static:cache_get(F2)),
-                    ?assertEqual(kept, persistent_term:get(Sentinel))
-                after
-                    _ = persistent_term:erase(Sentinel)
-                end
+                ok = roadrunner_static_cache:store(F1, 10, 1700000000, infinity),
+                ok = roadrunner_static_cache:store(F2, 20, 1700000000, 60000),
+                ok = roadrunner_static:cache_clear(),
+                ?assertEqual(miss, roadrunner_static_cache:lookup(F1)),
+                ?assertEqual(miss, roadrunner_static_cache:lookup(F2))
             end}
         ]
     end}.
@@ -516,10 +508,10 @@ cache_populated_after_request_test_() ->
                 %% The handler builds FilePath from `Dir` + binary segments
                 %% so the resulting cache key is a binary; match that here.
                 FilePath = filename:join([Dir, ~"cached.txt"]),
-                _ = persistent_term:erase({roadrunner_static_meta, FilePath}),
-                ?assertEqual(miss, roadrunner_static:cache_get(FilePath)),
+                ok = roadrunner_static:cache_clear(),
+                ?assertEqual(miss, roadrunner_static_cache:lookup(FilePath)),
                 _Reply = http_get(Port, ~"/static/cached.txt"),
-                ?assertMatch({ok, _Size, _Mtime}, roadrunner_static:cache_get(FilePath))
+                ?assertMatch({ok, _Size, _Mtime}, roadrunner_static_cache:lookup(FilePath))
             end},
             {"second request hits the cache and serves the same body", fun() ->
                 %% Drive `serve_file` through its cache-hit branch by
@@ -538,16 +530,41 @@ cache_populated_after_request_test_() ->
     end}.
 
 cache_default_off_test_() ->
-    {setup, fun setup/0, fun cleanup/1, fun({Dir, Port}) ->
-        {"default cache_ttl_ms is 0; nothing is cached", fun() ->
-            FilePath = filename:join([Dir, ~"hello.html"]),
-            _ = persistent_term:erase({roadrunner_static_meta, FilePath}),
-            _Reply = http_get(Port, ~"/static/hello.html"),
-            ?assertEqual(miss, roadrunner_static:cache_get(FilePath))
+    {setup,
+        fun() ->
+            ok = start_static_cache(),
+            setup()
+        end,
+        fun(X) ->
+            cleanup(X),
+            ok = stop_static_cache()
+        end,
+        fun({Dir, Port}) ->
+            {"default cache_ttl_ms is 0; nothing is cached", fun() ->
+                FilePath = filename:join([Dir, ~"hello.html"]),
+                ok = roadrunner_static:cache_clear(),
+                _Reply = http_get(Port, ~"/static/hello.html"),
+                ?assertEqual(miss, roadrunner_static_cache:lookup(FilePath))
+            end}
+        end}.
+
+%% Cover the static-cache owner's gen_server callbacks (init is covered by
+%% the start in the cache setups; the call/cast clauses are not otherwise
+%% exercised). The sync call after the cast guarantees the cast was
+%% processed (so handle_cast actually ran) before the assertion.
+static_cache_owner_test_() ->
+    {setup, fun() -> ok = start_static_cache() end, fun(_) -> ok = stop_static_cache() end, [
+        {"handle_call replies ok", fun() ->
+            ?assertEqual(ok, gen_server:call(roadrunner_static_cache, ping))
+        end},
+        {"handle_cast is accepted", fun() ->
+            ok = gen_server:cast(roadrunner_static_cache, noop),
+            ?assertEqual(ok, gen_server:call(roadrunner_static_cache, sync))
         end}
-    end}.
+    ]}.
 
 cache_helpers_setup() ->
+    ok = start_static_cache(),
     Dir = filename:join(
         "/tmp", "rr_cache_helpers_" ++ integer_to_list(rand:uniform(1000000))
     ),
@@ -555,20 +572,28 @@ cache_helpers_setup() ->
     {Dir}.
 
 cache_helpers_cleanup({Dir}) ->
-    lists:foreach(
-        fun
-            ({{roadrunner_static_meta, _Path} = K, _V}) ->
-                _ = persistent_term:erase(K),
-                ok;
-            (_) ->
-                ok
-        end,
-        persistent_term:get()
-    ),
+    ok = roadrunner_static:cache_clear(),
+    ok = stop_static_cache(),
     _ = file:del_dir_r(Dir),
     ok.
 
+%% The static-meta cache lives in a node-global ETS table owned by
+%% `roadrunner_static_cache`. eunit bypasses the app supervisor, so the
+%% tests that drive the cache start the owner themselves.
+start_static_cache() ->
+    case roadrunner_static_cache:start_link() of
+        {ok, _} -> ok;
+        {error, {already_started, _}} -> ok
+    end.
+
+stop_static_cache() ->
+    case whereis(roadrunner_static_cache) of
+        undefined -> ok;
+        Pid -> ok = gen_server:stop(Pid)
+    end.
+
 cache_enabled_setup() ->
+    ok = start_static_cache(),
     Name = static_test_cache_on,
     Dir = filename:join(
         "/tmp", "rr_cache_on_" ++ integer_to_list(rand:uniform(1000000))
@@ -587,6 +612,7 @@ cache_enabled_setup() ->
 
 cache_enabled_cleanup({Name, Dir, _Port}) ->
     ok = roadrunner_listener:stop(Name),
+    ok = stop_static_cache(),
     _ = file:del_dir_r(Dir),
     ok.
 

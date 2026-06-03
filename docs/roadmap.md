@@ -274,28 +274,6 @@ grammar enforcement is callers-write-bugs ergonomics, not security.
 
 **Scope:** small per attribute. Add when a real caller hits the gap.
 
-### Static-file metadata cache in persistent_term — small
-
-**What:** `roadrunner_static` caches each file's `{Size, Mtime, Expiry}` in
-`persistent_term` keyed by path (opt-in via `cache_ttl_ms`). Move it to a
-named `read_concurrency` ETS table owned by a small supervised process.
-
-**Why deferred:** off by default and bounded by the docroot in practice, so
-it is hygiene, not a hot-path fix. But `persistent_term` is the wrong store
-for runtime-mutated, per-key-unbounded data: each `cache_put` is a global
-heap scan (only a problem with a short TTL over many hot files), entries
-never evict (one key per file served, until `cache_clear/0` or restart), and
-`cache_clear/0` walks every term on the node. ETS gives cheap writes, native
-eviction, and an O(1) clear. (The `Date` header cache moved to a per-process
-dictionary for the same "wrong store for mutable data" reason; static-meta is
-read across requests so it needs a shared store, hence ETS rather than the
-dictionary.)
-
-**Scope:** small. Add the table owner under `roadrunner_sup`, swap the
-`persistent_term` calls in `cache_get/1` / `cache_put/4` / `cache_clear/0`,
-and start the owner in the eunit setup so the cache tests still drive the
-table directly.
-
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>

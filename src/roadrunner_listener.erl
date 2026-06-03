@@ -593,6 +593,11 @@ time, but every subsequent dispatch sees the new table.
 Returns `ok` on success or `{error, no_routes}` if the listener was
 started in single-handler mode (`routes => Module` or no `routes`
 opt) — there's no router table to reload.
+
+Each call performs one global `persistent_term` swap, which scans every
+process heap to reclaim the old table. That cost is acceptable for a
+whole-table swap at deploy time, but callers should batch route changes
+into a single `reload_routes/2` rather than calling it per route.
 """.
 -spec reload_routes(Name :: atom(), roadrunner_router:routes()) ->
     ok | {error, no_routes}.
