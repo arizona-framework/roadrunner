@@ -839,13 +839,24 @@ drain_body_if_manual(_Req) ->
     {ok, <<>>}.
 
 -spec telemetry_metadata(roadrunner_req:request()) -> roadrunner_telemetry:metadata().
-telemetry_metadata(Req) ->
+telemetry_metadata(
     #{
-        request_id => maps:get(request_id, Req),
-        peer => maps:get(peer, Req),
-        method => maps:get(method, Req),
-        path => maps:get(target, Req),
-        scheme => maps:get(scheme, Req),
+        request_id := RequestId,
+        peer := Peer,
+        method := Method,
+        target := Target,
+        scheme := Scheme
+    } = Req
+) ->
+    %% Destructure the five always-present keys in one match instead of
+    %% a `maps:get/2` each (matching the h2/h3 builders); `listener_name`
+    %% keeps its defaulted lookup since it is optional in the request map.
+    #{
+        request_id => RequestId,
+        peer => Peer,
+        method => Method,
+        path => Target,
+        scheme => Scheme,
         listener_name => maps:get(listener_name, Req, undefined)
     }.
 
