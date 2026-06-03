@@ -91,7 +91,7 @@ with_optional_profile(#{profile := true}, Fun) ->
 maybe_print_profile(#{profile := false}) ->
     ok;
 maybe_print_profile(#{profile := true, profile_min_ms := MinMs}) ->
-    io:format("profile (eprof, total time, rows >= ~.2f ms)~n", [MinMs]),
+    io:format("profile (eprof, total time, rows >= ~.2f ms)~n", [float(MinMs)]),
     %% eprof's analyze prints to whatever was set via log/1; pipe to a
     %% temp file so we can trim out the chatty per-process headers and
     %% keep only the totals table.
