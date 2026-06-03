@@ -841,20 +841,20 @@ on_continuation(
                         end_headers := EndHeaders
                     },
                     Streams1 = Streams#{StreamId := Stream1},
-                    %% Set streams + awaiting_continuation in one record update on
-                    %% the END_HEADERS path — two sequential `#loop{}` updates
-                    %% would copy the record twice.
-                    State2 =
-                        case EndHeaders of
-                            true ->
-                                State#loop{streams = Streams1, awaiting_continuation = undefined};
-                            false ->
-                                State#loop{streams = Streams1}
-                        end,
-                    case {EndHeaders, PriorHeaders =:= undefined} of
-                        {true, true} -> finalize_headers(StreamId, State2);
-                        {true, false} -> finalize_trailers(StreamId, State2);
-                        {false, _} -> frame_loop(State2)
+                    case EndHeaders of
+                        false ->
+                            frame_loop(State#loop{streams = Streams1});
+                        true ->
+                            %% Reset awaiting_continuation in the same record
+                            %% update on the END_HEADERS path; two sequential
+                            %% `#loop{}` updates would copy the record twice.
+                            State1 = State#loop{
+                                streams = Streams1, awaiting_continuation = undefined
+                            },
+                            case PriorHeaders of
+                                undefined -> finalize_headers(StreamId, State1);
+                                _ -> finalize_trailers(StreamId, State1)
+                            end
                     end
             end;
         _ ->
