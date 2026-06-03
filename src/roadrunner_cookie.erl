@@ -248,9 +248,9 @@ valid_attr_expires(<<C, R/binary>>, Orig) when
 valid_attr_expires(<<_, _/binary>>, Orig) ->
     error({invalid_cookie_attr, expires, Orig}).
 
-%% `-on_load` callback. See `feedback_compile_pattern_convention` —
-%% binary:match/split patterns belong in `persistent_term` so the
-%% per-cookie hot path doesn't recompile on every call.
+%% `-on_load` callback. binary:match/split patterns belong in
+%% `persistent_term` so the per-cookie hot path doesn't recompile on
+%% every call.
 -spec init_patterns() -> ok.
 init_patterns() ->
     persistent_term:put(?SEMI_CP_KEY, binary:compile_pattern(~";")),

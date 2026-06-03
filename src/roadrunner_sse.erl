@@ -122,7 +122,8 @@ data_lines(Data) ->
      || Line <- binary:split(Data, persistent_term:get(?DATA_SPLIT_CP_KEY), [global])
     ].
 
-%% `-on_load` callback. See `feedback_compile_pattern_convention`.
+%% `-on_load` callback. Compiles the binary patterns once into
+%% `persistent_term` so the hot path reads a constant, not a recompile.
 -spec init_patterns() -> ok.
 init_patterns() ->
     persistent_term:put(?DATA_SPLIT_CP_KEY, binary:compile_pattern([~"\r\n", ~"\r", ~"\n"])),

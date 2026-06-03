@@ -598,7 +598,8 @@ listener name).
 listener_name(#{listener_name := Name}) -> Name;
 listener_name(_) -> undefined.
 
-%% `-on_load` callback. See `feedback_compile_pattern_convention`.
+%% `-on_load` callback. Compiles the binary patterns once into
+%% `persistent_term` so the hot path reads a constant, not a recompile.
 -spec init_patterns() -> ok.
 init_patterns() ->
     persistent_term:put(?QMARK_CP_KEY, binary:compile_pattern(~"?")),
