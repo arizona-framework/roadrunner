@@ -228,6 +228,12 @@
     %% When > 0 and no streams are in flight, the idle-wait path parks
     %% for this window and hibernates. Read from proto_opts at `enter/5`.
     hibernate_after = 0 :: non_neg_integer(),
+    %% Read-deadline caps, cached once at `enter/5` so the per-iteration
+    %% handshake/idle waits read a record field instead of re-reading
+    %% persistent_term every loop. The persistent_term override (a test
+    %% hook) is captured at `enter/5`, so it must be set before connect.
+    handshake_timeout = ?HANDSHAKE_TIMEOUT_DEFAULT :: non_neg_integer(),
+    idle_timeout = ?IDLE_TIMEOUT_DEFAULT :: non_neg_integer(),
     %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
     %% Prepended to every response by `roadrunner_http:auto_headers/2`.
     %% Read from proto_opts at `enter/5`.
@@ -296,6 +302,8 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
     AltSvc = maps:get(alt_svc, ProtoOpts, undefined),
     MaxConcReq = maps:get(max_concurrent_requests, ProtoOpts, infinity),
     InflightCounter = maps:get(inflight_counter, ProtoOpts, undefined),
+    HandshakeTimeout = handshake_timeout(),
+    IdleTimeout = idle_timeout(),
     State = #loop{
         socket = Socket,
         proto_opts = ProtoOpts,
@@ -318,7 +326,9 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
         hibernate_after = HibernateAfter,
         alt_svc = AltSvc,
         max_concurrent_requests = MaxConcReq,
-        inflight_counter = InflightCounter
+        inflight_counter = InflightCounter,
+        handshake_timeout = HandshakeTimeout,
+        idle_timeout = IdleTimeout
     },
     handshake(State).
 
@@ -425,7 +435,7 @@ handshake_recv(
             exit_clean(State);
         {MError, _, _} ->
             exit_clean(State)
-    after handshake_timeout() ->
+    after State#loop.handshake_timeout ->
         exit_clean(State)
     end.
 
@@ -500,8 +510,8 @@ recv_timeout(#loop{streams = Streams, hibernate_after = Ms}) when
     map_size(Streams) =:= 0, Ms > 0
 ->
     Ms;
-recv_timeout(_State) ->
-    idle_timeout().
+recv_timeout(#loop{idle_timeout = T}) ->
+    T.
 
 %% Fired when `recv_more/1` sees no traffic for `recv_timeout/1`. With
 %% an empty streams map and `hibernate_after` set, collapse the heap

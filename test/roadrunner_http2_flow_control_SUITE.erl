@@ -375,17 +375,17 @@ blocked_send_peer_closes_exits_clean(_Config) ->
     wait_down(Pid, Ref).
 
 blocked_send_idle_timeout_emits_goaway(_Config) ->
-    %% Stalled-send waits past the idle deadline. `idle_timeout()`
-    %% is evaluated at receive entry, so we lower the deadline
-    %% AFTER the body drain finishes and then poke the conn with
-    %% an unknown-stream WINDOW_UPDATE — that's silently ignored
-    %% by `handle_frame_during_send/4` and forces a re-entry into
-    %% `recv_more_during_send/3`, which reads the new 100-ms
-    %% timeout and fires shortly after.
-    {Pid, Ref, ConnPid} = setup_blocked_send(),
-    drain_all_sends(),
-    persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 100),
+    %% Stalled-send waits past the idle deadline → GOAWAY. The idle
+    %% timeout is cached at connection setup (`enter/5`), so the override
+    %% is set BEFORE the connection starts; 500 ms clears the blocked-send
+    %% setup + `drain_all_sends/0` (which waits ~200 ms) without a
+    %% premature fire, and the unknown-stream WINDOW_UPDATE poke (silently
+    %% ignored) resets the recv timer to a known point so the deadline
+    %% fires shortly after.
+    persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 500),
     try
+        {Pid, Ref, ConnPid} = setup_blocked_send(),
+        drain_all_sends(),
         Wu = encode_frame({window_update, 99, 1024}),
         serve_recv(ConnPid, Wu),
         expect_send_type(7),
