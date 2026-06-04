@@ -13,7 +13,7 @@
 %% roadrunner_listener:start_link(my_app, #{
 %%     port => 8080,
 %%     routes => Routes,
-%%     middlewares => [{roadrunner_compress, undefined}]
+%%     middlewares => [roadrunner_compress]
 %% }).
 %% ```
 %%

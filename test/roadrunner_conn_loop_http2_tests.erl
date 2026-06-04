@@ -2536,10 +2536,10 @@ run_h2_with_compress_middleware(Path, ExtraHeaders) ->
         dispatch =>
             {handler, roadrunner_h2_test_handler,
                 roadrunner_middleware:build_pipeline(
-                    [{roadrunner_compress, undefined}], roadrunner_h2_test_handler
+                    [roadrunner_compress], roadrunner_h2_test_handler
                 ),
                 undefined},
-        middlewares => [{roadrunner_compress, undefined}]
+        middlewares => [roadrunner_compress]
     },
     Sock = {fake, Self},
     Pid = spawn(fun() ->

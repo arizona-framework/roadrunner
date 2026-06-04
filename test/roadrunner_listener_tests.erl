@@ -907,7 +907,7 @@ reload_routes_rebakes_listener_middlewares_test_() ->
             Name = listener_test_reload_listener_mws,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0,
-                middlewares => [{fun roadrunner_test_middlewares:wrap_response/3, undefined}],
+                middlewares => [fun roadrunner_test_middlewares:wrap_response/3],
                 routes => [{~"/old", roadrunner_hello_handler, undefined}]
             }),
             {Name, roadrunner_listener:port(Name)}
