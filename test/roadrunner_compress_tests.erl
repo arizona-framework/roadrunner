@@ -3,14 +3,14 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %% =============================================================================
-%% Pure unit tests against `call/2` — no listener, no socket.
+%% Pure unit tests against `call/3` — no listener, no socket.
 %% =============================================================================
 
 passes_through_when_client_does_not_accept_gzip_test() ->
     Req = req([]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{Status, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{Status, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(200, Status),
     %% Body was not compressed.
     ?assertEqual(iolist_to_binary(Body), iolist_to_binary(OutBody)),
@@ -21,7 +21,7 @@ compresses_when_client_accepts_gzip_test() ->
     Req = req([{~"accept-encoding", ~"gzip"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)),
     ?assertEqual(~"Accept-Encoding", header(~"vary", Headers)),
     %% Round-trip via zlib:gunzip.
@@ -31,7 +31,7 @@ compresses_when_gzip_listed_among_others_test() ->
     Req = req([{~"accept-encoding", ~"deflate, gzip, br"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
 
 skips_when_only_other_encodings_offered_test() ->
@@ -40,14 +40,14 @@ skips_when_only_other_encodings_offered_test() ->
     Req = req([{~"accept-encoding", ~"br"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(undefined, header(~"content-encoding", Headers)).
 
 compresses_with_deflate_when_only_deflate_offered_test() ->
     Req = req([{~"accept-encoding", ~"deflate"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(~"deflate", header(~"content-encoding", Headers)),
     ?assertEqual(~"Accept-Encoding", header(~"vary", Headers)),
     %% RFC 9110 §8.4.1.3: deflate = zlib data format (RFC 1950) — round-
@@ -60,7 +60,7 @@ prefers_gzip_when_both_gzip_and_deflate_offered_test() ->
     Req = req([{~"accept-encoding", ~"deflate, gzip"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)),
     ?assertEqual(iolist_to_binary(Body), zlib:gunzip(iolist_to_binary(OutBody))).
 
@@ -71,7 +71,7 @@ qvalue_zero_excludes_encoding_test() ->
     Req = req([{~"accept-encoding", ~"gzip;q=0"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(undefined, header(~"content-encoding", Headers)).
 
 higher_qvalue_wins_when_gzip_lower_test() ->
@@ -80,7 +80,7 @@ higher_qvalue_wins_when_gzip_lower_test() ->
     Req = req([{~"accept-encoding", ~"gzip;q=0.5, deflate;q=0.8"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(~"deflate", header(~"content-encoding", Headers)),
     ?assertEqual(iolist_to_binary(Body), zlib:uncompress(iolist_to_binary(OutBody))).
 
@@ -88,7 +88,7 @@ equal_qvalues_tie_break_to_gzip_test() ->
     Req = req([{~"accept-encoding", ~"gzip;q=0.5, deflate;q=0.5"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
 
 wildcard_with_positive_qvalue_accepts_supported_test() ->
@@ -97,7 +97,7 @@ wildcard_with_positive_qvalue_accepts_supported_test() ->
     Req = req([{~"accept-encoding", ~"*;q=1"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
 
 wildcard_zero_excludes_unlisted_encodings_test() ->
@@ -106,7 +106,7 @@ wildcard_zero_excludes_unlisted_encodings_test() ->
     Req = req([{~"accept-encoding", ~"*;q=0"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(undefined, header(~"content-encoding", Headers)).
 
 explicit_token_overrides_wildcard_test() ->
@@ -114,7 +114,7 @@ explicit_token_overrides_wildcard_test() ->
     Req = req([{~"accept-encoding", ~"*;q=0, gzip;q=1"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
 
 absent_qvalue_defaults_to_one_test() ->
@@ -123,7 +123,7 @@ absent_qvalue_defaults_to_one_test() ->
     Req = req([{~"accept-encoding", ~"deflate;q=0.5, gzip"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
 
 non_q_parameters_are_ignored_test() ->
@@ -131,7 +131,7 @@ non_q_parameters_are_ignored_test() ->
     Req = req([{~"accept-encoding", ~"gzip;level=fast"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
 
 malformed_qvalue_falls_back_to_default_test() ->
@@ -140,7 +140,7 @@ malformed_qvalue_falls_back_to_default_test() ->
     Req = req([{~"accept-encoding", ~"gzip;q=garbage"}]),
     Body = big_body(),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
 
 skips_when_response_already_encoded_test() ->
@@ -149,7 +149,7 @@ skips_when_response_already_encoded_test() ->
     Body = zlib:gzip(big_body()),
     Headers0 = [{~"content-encoding", ~"gzip"}],
     Next = fun(R) -> {{200, Headers0, Body}, R} end,
-    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     %% Body and Content-Encoding unchanged.
     ?assertEqual(iolist_to_binary(Body), iolist_to_binary(OutBody)),
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
@@ -158,7 +158,7 @@ skips_when_body_below_threshold_test() ->
     Req = req([{~"accept-encoding", ~"gzip"}]),
     Body = ~"tiny",
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(iolist_to_binary(Body), iolist_to_binary(OutBody)),
     ?assertEqual(undefined, header(~"content-encoding", Headers)),
     %% Vary still added so a cache keys on Accept-Encoding.
@@ -173,7 +173,7 @@ updates_content_length_on_compress_test() ->
         {~"content-length", OriginalLength}
     ],
     Next = fun(R) -> {{200, Headers0, Body}, R} end,
-    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     NewLength = header(~"content-length", Headers),
     ?assertEqual(
         integer_to_binary(byte_size(iolist_to_binary(OutBody))),
@@ -189,7 +189,7 @@ body_just_below_threshold_not_compressed_test() ->
     Req = req([{~"accept-encoding", ~"gzip"}]),
     Body = binary:copy(~"a", 859),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(undefined, header(~"content-encoding", Headers)),
     ?assertEqual(~"Accept-Encoding", header(~"vary", Headers)),
     ?assertEqual(Body, iolist_to_binary(OutBody)).
@@ -199,7 +199,7 @@ body_at_threshold_compressed_test() ->
     Req = req([{~"accept-encoding", ~"gzip"}]),
     Body = binary:copy(~"a", 860),
     Next = fun(R) -> {{200, [], Body}, R} end,
-    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)),
     ?assertEqual(Body, zlib:gunzip(iolist_to_binary(OutBody))).
 
@@ -211,7 +211,7 @@ does_not_duplicate_vary_when_handler_already_set_it_test() ->
     Body = ~"tiny",
     Headers0 = [{~"vary", ~"Cookie"}],
     Next = fun(R) -> {{200, Headers0, Body}, R} end,
-    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{200, Headers, _OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     Varys = [V || {N, V} <- Headers, N =:= ~"vary"],
     ?assertEqual([~"Cookie"], Varys).
 
@@ -219,7 +219,7 @@ stream_response_passes_through_when_client_does_not_accept_gzip_test() ->
     Req = req([]),
     Fun = fun(_Send) -> ok end,
     Next = fun(R) -> {{stream, 200, [], Fun}, R} end,
-    {{stream, 200, Headers, OutFun}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{stream, 200, Headers, OutFun}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     %% Same fun, no Content-Encoding added.
     ?assertEqual(Fun, OutFun),
     ?assertEqual(undefined, header(~"content-encoding", Headers)).
@@ -229,7 +229,7 @@ stream_response_passes_through_when_already_encoded_test() ->
     Fun = fun(_Send) -> ok end,
     Headers0 = [{~"content-encoding", ~"gzip"}],
     Next = fun(R) -> {{stream, 200, Headers0, Fun}, R} end,
-    {{stream, 200, Headers, OutFun}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{stream, 200, Headers, OutFun}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     %% Already-encoded response is passed through verbatim.
     ?assertEqual(Fun, OutFun),
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)).
@@ -246,7 +246,7 @@ stream_response_wrapped_with_gzip_test() ->
         ok = Send(~"world", fin)
     end,
     Next = fun(R) -> {{stream, 200, [], Fun}, R} end,
-    {{stream, 200, Headers, WrappedFun}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{stream, 200, Headers, WrappedFun}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(~"gzip", header(~"content-encoding", Headers)),
     ?assertEqual(~"Accept-Encoding", header(~"vary", Headers)),
     Capture = fun(Data, _Flag) ->
@@ -267,7 +267,7 @@ stream_response_wrapped_with_deflate_test() ->
         ok = Send(~"world", fin)
     end,
     Next = fun(R) -> {{stream, 200, [], Fun}, R} end,
-    {{stream, 200, Headers, WrappedFun}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{stream, 200, Headers, WrappedFun}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertEqual(~"deflate", header(~"content-encoding", Headers)),
     Capture = fun(Data, _Flag) ->
         Self ! {chunk, iolist_to_binary(Data)},
@@ -287,7 +287,7 @@ stream_response_wrapped_with_gzip_passes_trailers_test() ->
         ok = Send(~"hello", {fin, Trailers})
     end,
     Next = fun(R) -> {{stream, 200, [], Fun}, R} end,
-    {{stream, 200, _Headers, WrappedFun}, _Req2} = roadrunner_compress:call(Req, Next),
+    {{stream, 200, _Headers, WrappedFun}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     Capture = fun(Data, Flag) ->
         Self ! {emit, iolist_to_binary(Data), Flag},
         ok
@@ -303,13 +303,13 @@ stream_response_wrapped_with_gzip_passes_trailers_test() ->
 passes_loop_response_through_test() ->
     Req = req([{~"accept-encoding", ~"gzip"}]),
     Next = fun(R) -> {{loop, 200, [], state}, R} end,
-    {Response, _Req2} = roadrunner_compress:call(Req, Next),
+    {Response, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertMatch({loop, 200, _, state}, Response).
 
 passes_websocket_response_through_test() ->
     Req = req([{~"accept-encoding", ~"gzip"}]),
     Next = fun(R) -> {{websocket, some_mod, init_state}, R} end,
-    {Response, _Req2} = roadrunner_compress:call(Req, Next),
+    {Response, _Req2} = roadrunner_compress:call(Req, Next, undefined),
     ?assertMatch({websocket, some_mod, init_state}, Response).
 
 %% =============================================================================

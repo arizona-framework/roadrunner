@@ -63,7 +63,7 @@
 
 -on_load(init_patterns/0).
 
--export([call/2]).
+-export([call/3]).
 
 -define(THRESHOLD, 860).
 -define(COMMA_CP_KEY, {?MODULE, comma_cp}).
@@ -71,8 +71,9 @@
 
 -type encoding() :: gzip | deflate | none.
 
--spec call(roadrunner_req:request(), roadrunner_middleware:next()) -> roadrunner_handler:result().
-call(Req, Next) ->
+-spec call(roadrunner_req:request(), roadrunner_middleware:next(), term()) ->
+    roadrunner_handler:result().
+call(Req, Next, _State) ->
     {Response, Req2} = Next(Req),
     {transform(Req, Response), Req2}.
 
