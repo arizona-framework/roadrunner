@@ -82,8 +82,8 @@ encode_trailers(Trailers) ->
     %% phantom trailer header.
     [
         begin
-            ok = roadrunner_http1:check_header_safe(Name, name),
-            ok = roadrunner_http1:check_header_safe(Value, value),
+            ok = roadrunner_http:check_header_safe(Name, name),
+            ok = roadrunner_http:check_header_safe(Value, value),
             [Name, ~": ", Value, ~"\r\n"]
         end
      || {Name, Value} <- Trailers

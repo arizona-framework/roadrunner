@@ -19,6 +19,10 @@ Items here:
   time, `format_http_date/1` for an arbitrary posix timestamp)
   for the `Date` response header per RFC 9110 §5.6.7 and the
   `Last-Modified` response header used by the static handler.
+- Header field-value safety (RFC 9110 §5.5): reject CR/LF/NUL in a
+  header name or value before it reaches the wire
+  (`check_header_safe/2`, `check_headers_safe/1`), shared by every
+  version's response path.
 
 `roadrunner_http1` and `roadrunner_req` re-export the primitive
 types as aliases so existing callers keep compiling unchanged.
@@ -28,10 +32,15 @@ accessors that operate on it.
 
 -export([http_date_now/0, format_http_date/1, with_date/1, auto_headers/2]).
 -export([header_list_size/1]).
+-export([check_header_safe/2, check_header_safe/3, check_headers_safe/1]).
+-export([unsafe_bytes_pattern/0]).
 
 -export_type([headers/0, status/0, redirect_status/0, version/0]).
 
+-on_load(init_patterns/0).
+
 -define(DATE_CACHE_KEY, {?MODULE, date_cache}).
+-define(UNSAFE_BYTES_KEY, {?MODULE, unsafe_bytes_cp}).
 
 -type headers() :: [{Name :: binary(), Value :: binary()}].
 -type status() :: 100..599.
@@ -148,3 +157,74 @@ format_http_date(Posix) ->
 -spec pad2(0..99) -> binary().
 pad2(N) when N < 10 -> <<$0, ($0 + N)>>;
 pad2(N) -> integer_to_binary(N).
+
+-doc """
+Validate that a header name or value contains no CR, LF, or NUL —
+the bytes that would let an attacker who controls the value inject
+new headers (or terminate the header block early). Crashes with
+`{header_injection, Kind, Bin}` when an unsafe byte is present.
+
+Public so any response path emitting a single header (e.g.
+`roadrunner_stream_response` for chunked-response trailers) can run
+the check before writing to the wire.
+""".
+-spec check_header_safe(binary(), name | value) -> ok.
+check_header_safe(Bin, Kind) when is_binary(Bin) ->
+    check_header_safe(Bin, Kind, persistent_term:get(?UNSAFE_BYTES_KEY)).
+
+%% Accepts a pre-fetched pattern so a caller iterating a header list
+%% (`check_headers_safe/2`, or h1's fused `encode_headers/1`) pays one
+%% `persistent_term:get/1` instead of one per field. Exported for the
+%% h1 encode path; most callers want `check_header_safe/2`.
+-doc false.
+-spec check_header_safe(binary(), name | value, binary:cp()) -> ok.
+check_header_safe(Bin, Kind, UnsafeCp) when is_binary(Bin) ->
+    case binary:match(Bin, UnsafeCp) of
+        nomatch -> ok;
+        _ -> error({header_injection, Kind, Bin})
+    end.
+
+-doc """
+Run the header-injection check over every name and value in a header
+list, fetching the compiled unsafe-bytes pattern once and threading it
+through (vs `check_header_safe/2`, which fetches per call). Crashes with
+`{header_injection, Kind, Bin}` on the first unsafe byte.
+
+Public so each version's response path runs the same single-fetch
+check: h1 `roadrunner_http1:encode_headers/1` and the HTTP/2 conn loop.
+""".
+-spec check_headers_safe(headers()) -> ok.
+check_headers_safe(Headers) ->
+    check_headers_safe(Headers, persistent_term:get(?UNSAFE_BYTES_KEY)).
+
+%% Loop with the pre-fetched pattern.
+-spec check_headers_safe(headers(), binary:cp()) -> ok.
+check_headers_safe([], _UnsafeCp) ->
+    ok;
+check_headers_safe([{Name, Value} | Rest], UnsafeCp) ->
+    ok = check_header_safe(Name, name, UnsafeCp),
+    ok = check_header_safe(Value, value, UnsafeCp),
+    check_headers_safe(Rest, UnsafeCp).
+
+%% The compiled CR/LF/NUL pattern, for a caller that runs the check in
+%% a loop and wants a single `persistent_term:get/1` for the whole list
+%% (h1's fused `encode_headers/1`), passing it to `check_header_safe/3`.
+%% Callers not already iterating want `check_header_safe/2` or
+%% `check_headers_safe/1` instead.
+-doc false.
+-spec unsafe_bytes_pattern() -> binary:cp().
+unsafe_bytes_pattern() ->
+    persistent_term:get(?UNSAFE_BYTES_KEY).
+
+%% `-on_load` callback. Stashes the compiled unsafe-bytes pattern in
+%% `persistent_term` so `check_header_safe/3` reads a constant on the
+%% response hot path. Returns `ok` so module load succeeds; if the
+%% compile fails (it shouldn't, the pattern is a literal), the module
+%% won't load and we'll see it loudly.
+-spec init_patterns() -> ok.
+init_patterns() ->
+    persistent_term:put(
+        ?UNSAFE_BYTES_KEY,
+        binary:compile_pattern([~"\r", ~"\n", ~"\0"])
+    ),
+    ok.
