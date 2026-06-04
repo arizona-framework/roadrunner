@@ -208,11 +208,11 @@ check_headers_safe([{Name, Value} | Rest], UnsafeCp) ->
     ok = check_header_safe(Value, value, UnsafeCp),
     check_headers_safe(Rest, UnsafeCp).
 
-%% The compiled CR/LF/NUL pattern, for a caller that runs the check in
-%% a loop and wants a single `persistent_term:get/1` for the whole list
-%% (h1's fused `encode_headers/1`), passing it to `check_header_safe/3`.
-%% Callers not already iterating want `check_header_safe/2` or
-%% `check_headers_safe/1` instead.
+%% The compiled CR/LF/NUL pattern, for a caller that runs the check in a
+%% loop and wants a single `persistent_term:get/1` for the whole list:
+%% h1's fused `encode_headers/1` (via `check_header_safe/3`) and the
+%% HTTP/3 emit gate (inline `binary:match`). Callers not already iterating
+%% want `check_header_safe/2` or `check_headers_safe/1` instead.
 -doc false.
 -spec unsafe_bytes_pattern() -> binary:cp().
 unsafe_bytes_pattern() ->

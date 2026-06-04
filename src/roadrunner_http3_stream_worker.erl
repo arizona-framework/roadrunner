@@ -185,21 +185,41 @@ emit_handler_response(Conn, StreamId, _Handler, {websocket, _, _}) ->
     pid(), non_neg_integer(), roadrunner_http:headers(), fun(() -> roadrunner_http:status())
 ) -> roadrunner_http:status().
 emit_checked(Conn, StreamId, Headers, Emit) ->
-    case forbidden_header(Headers) of
-        {true, Name} -> reject_forbidden(Conn, StreamId, Name);
-        false -> Emit()
+    case validate_response_headers(Headers) of
+        ok -> Emit();
+        {unsafe, Kind} -> reject_unsafe(Conn, StreamId, Kind);
+        {forbidden, Name} -> reject_forbidden(Conn, StreamId, Name)
     end.
 
-%% RFC 9114 §4.2 connection-specific header set. Function-clause
-%% dispatch (mirrors `roadrunner_http3_request:check_banned/1`) keeps it
-%% branch-friendly; returns the offending name for the log.
--spec forbidden_header(roadrunner_http:headers()) -> {true, binary()} | false.
-forbidden_header([]) ->
-    false;
-forbidden_header([{Name, _} | Rest]) ->
+%% One pass over the response headers, applying both gates per field: the
+%% RFC 9114 §4.2 connection-specific name set, and the RFC 9110 §5.5
+%% CR/LF/NUL field-byte check (the shared compiled pattern, fetched once).
+%% `is_forbidden_header/1` is function-clause dispatch (mirrors
+%% `roadrunner_http3_request:check_banned/1`); a forbidden name returns it
+%% for the log, an unsafe field returns only the kind (never raw bytes).
+-spec validate_response_headers(roadrunner_http:headers()) ->
+    ok | {unsafe, name | value} | {forbidden, binary()}.
+validate_response_headers(Headers) ->
+    validate_response_headers(Headers, roadrunner_http:unsafe_bytes_pattern()).
+
+-spec validate_response_headers(roadrunner_http:headers(), binary:cp()) ->
+    ok | {unsafe, name | value} | {forbidden, binary()}.
+validate_response_headers([], _UnsafeCp) ->
+    ok;
+validate_response_headers([{Name, Value} | Rest], UnsafeCp) ->
     case is_forbidden_header(Name) of
-        true -> {true, Name};
-        false -> forbidden_header(Rest)
+        true ->
+            {forbidden, Name};
+        false ->
+            case binary:match(Name, UnsafeCp) of
+                nomatch ->
+                    case binary:match(Value, UnsafeCp) of
+                        nomatch -> validate_response_headers(Rest, UnsafeCp);
+                        _ -> {unsafe, value}
+                    end;
+                _ ->
+                    {unsafe, name}
+            end
     end.
 
 -spec is_forbidden_header(binary()) -> boolean().
@@ -220,6 +240,23 @@ reject_forbidden(Conn, StreamId, Name) ->
     logger:error(#{
         msg => "roadrunner h3 handler returned a connection-specific header",
         header => Name
+    }),
+    send_buffered(
+        Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
+    ),
+    500.
+
+%% RFC 9110 §5.5: a response header name or value containing CR, LF, or
+%% NUL is a handler bug (usually unvalidated user input echoed into a
+%% header) that would put malformed bytes on the wire, or split at a
+%% downstream h3->h1 reverse proxy. Answer 500 rather than emit it; only
+%% the kind is logged, never the raw bytes. Shared by every response
+%% shape via `emit_checked/4`.
+-spec reject_unsafe(pid(), non_neg_integer(), name | value) -> 500.
+reject_unsafe(Conn, StreamId, Kind) ->
+    logger:error(#{
+        msg => "roadrunner h3 handler returned a header with CR/LF/NUL",
+        kind => Kind
     }),
     send_buffered(
         Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"

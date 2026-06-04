@@ -30,6 +30,15 @@ handle(#{target := <<"/forbidden/", Name/binary>>} = Req) ->
     %% Emits a connection-specific response header (named by the path),
     %% which RFC 9114 §4.2 forbids over h3.
     {{200, [{Name, ~"x"}], ~"x"}, Req};
+handle(#{target := ~"/inject-value"} = Req) ->
+    %% A response header VALUE with CR/LF (RFC 9110 §5.5 bans CTLs) → 500.
+    {{200, [{~"x-evil", ~"a\r\nb"}], ~"x"}, Req};
+handle(#{target := ~"/inject-name"} = Req) ->
+    %% A response header NAME with CR/LF → 500.
+    {{200, [{~"x-ev\r\nil", ~"v"}], ~"x"}, Req};
+handle(#{target := ~"/stream-inject"} = Req) ->
+    %% Same defect on a streaming response's headers → 500.
+    {{stream, 200, [{~"x-evil", ~"a\r\nb"}], fun(Send) -> ok = Send(~"x", fin) end}, Req};
 handle(#{target := ~"/crash"} = _Req) ->
     error(boom);
 handle(#{target := ~"/badheaders"} = Req) ->

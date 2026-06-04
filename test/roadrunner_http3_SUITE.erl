@@ -25,6 +25,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     not_found/1,
     crash_500/1,
     forbidden_response_header_500/1,
+    unsafe_response_header_500/1,
     unsupported_shapes_501/1,
     loop_response/1,
     loop_filters_otp/1,
@@ -33,6 +34,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     stream_trailers/1,
     stream_autoclose/1,
     stream_forbidden_header_500/1,
+    stream_unsafe_header_500/1,
     sendfile_empty/1,
     sendfile_small/1,
     sendfile_large/1,
@@ -87,6 +89,7 @@ all() ->
         not_found,
         crash_500,
         forbidden_response_header_500,
+        unsafe_response_header_500,
         unsupported_shapes_501,
         loop_response,
         loop_filters_otp,
@@ -95,6 +98,7 @@ all() ->
         stream_trailers,
         stream_autoclose,
         stream_forbidden_header_500,
+        stream_unsafe_header_500,
         sendfile_empty,
         sendfile_small,
         sendfile_large,
@@ -289,6 +293,14 @@ forbidden_response_header_500(Config) ->
     ),
     close(Conn).
 
+unsafe_response_header_500(Config) ->
+    %% A handler returning a response header with CR/LF/NUL in the name or
+    %% value is rejected (RFC 9110 §5.5): 500, and the connection survives.
+    Conn = connect(?config(port, Config)),
+    ?assertMatch({500, _}, status_body(get(Conn, ~"/inject-value"))),
+    ?assertMatch({500, _}, status_body(get(Conn, ~"/inject-name"))),
+    close(Conn).
+
 unsupported_shapes_501(Config) ->
     Conn = connect(?config(port, Config)),
     lists:foreach(
@@ -398,6 +410,13 @@ stream_forbidden_header_500(Config) ->
     %% rejected with 500 (RFC 9114 §4.2), same as the buffered path.
     Conn = connect(?config(port, Config)),
     ?assertMatch({500, _}, status_body(get(Conn, ~"/stream-forbidden"))),
+    close(Conn).
+
+stream_unsafe_header_500(Config) ->
+    %% A streaming response carrying a header with CR/LF/NUL is rejected
+    %% with 500 (RFC 9110 §5.5), same as the buffered path.
+    Conn = connect(?config(port, Config)),
+    ?assertMatch({500, _}, status_body(get(Conn, ~"/stream-inject"))),
     close(Conn).
 
 oversized_413(_Config) ->
