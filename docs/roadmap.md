@@ -274,6 +274,59 @@ grammar enforcement is callers-write-bugs ergonomics, not security.
 
 **Scope:** small per attribute. Add when a real caller hits the gap.
 
+### Cancel a handler on client disconnect — medium
+
+**What:** Signal a running handler when the client goes away. For
+`{loop, ...}` (SSE / long-poll) and streaming handlers that block in
+`receive` or keep producing chunks after the request, deliver a
+`{roadrunner_disconnect, _}` message (or expose a monitor) the moment
+the connection closes, so the handler can drop pubsub subscriptions and
+stop expensive work instead of discovering the dead socket only on its
+next write.
+
+**Why deferred:** ordinary request/response handlers finish before the
+client can leave, so they never need it; it only matters for the
+long-lived streaming shapes, and none has a caller blocked on it today.
+
+**Scope:** medium. The conn loop already owns the socket so it can watch
+for close; the work is routing that into the loop/stream lifecycle
+across h1, h2, and h3 without racing the normal finish path.
+
+### NDJSON streaming response builder — small
+
+**What:** A first-class newline-delimited-JSON response, the JSON
+sibling of `roadrunner_sse`: a builder that frames each item as one
+`<json>\n` chunk over the existing chunked-streaming path, for streaming
+list endpoints and token-by-token responses.
+
+**Why deferred:** the chunked-streaming primitive already lets a handler
+emit NDJSON by hand; a named builder is ergonomics, worth adding once a
+handler wants the framing (and the `application/x-ndjson` content type)
+for free.
+
+**Scope:** small. A thin wrapper over the streaming response shape plus
+the content-type default.
+
+### PROXY protocol for the real client address — medium
+
+**What:** Parse the PROXY protocol header (v1 text and v2 binary) that a
+TCP load balancer (haproxy, AWS NLB, and friends) prepends before the
+first request byte, and populate `roadrunner_req:peer/1` with the real
+client address instead of the balancer's. Opt-in per listener, since
+trusting that header from an untrusted peer would let a client spoof its
+own address.
+
+**Why deferred:** direct-to-internet and TLS-terminating-proxy
+deployments do not need it (the socket peer is already the client, or the
+proxy speaks HTTP and can set `Forwarded`). It matters specifically
+behind an L4 balancer, where today the peer address is the balancer's.
+Real-IP-aware logging, the per-peer rate guard, and any geo or authz
+keyed on client IP all depend on it.
+
+**Scope:** medium. A pre-request parse stage on accept (gated by a
+listener opt), plus threading the parsed address into the request's peer
+field across h1, h2, and h3.
+
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>
@@ -326,6 +379,90 @@ group's middlewares to each leaf route.
 shared per-section middlewares (auth, rate limit, body-limit
 overrides) duplicated across many entries. Add when a real codebase
 shows that duplication.
+
+## Built-in edge middleware
+
+The continuation-middleware model (`call(Req, Next, State)`, configured
+per entry via `{Module, State}`) makes browser-facing and abuse-control
+concerns composable at the listener or per-route level. Each is
+boilerplate every public service rewrites today; shipping configurable,
+default-safe versions removes it. None is wired yet.
+
+### CORS middleware — small-medium
+
+**What:** A configurable `roadrunner_cors` middleware: origin allowlist
+or predicate, allowed methods and headers, credentials, exposed headers,
+max-age, an `OPTIONS` preflight short-circuit with the right
+`Access-Control-*` headers, and a cache-correct `Vary: Origin`.
+
+**Why deferred:** every browser-facing service needs it, but the exact
+policy is app-specific, so it stays unwired until a real caller drives
+the shape rather than a guess. The middleware slot is ready.
+
+**Scope:** small-medium. The preflight branch plus header echoing is the
+bulk; `Vary` correctness mirrors `roadrunner_compress`.
+
+### Security-headers middleware — small
+
+**What:** A `roadrunner_security_headers` middleware that applies a
+default-safe set on every response: `X-Content-Type-Options: nosniff`,
+frame options, referrer policy, `Strict-Transport-Security` on TLS
+listeners, and opt-in CSP. Every value overridable; a header the handler
+already set wins.
+
+**Why deferred:** trivial to hand-roll, but it is the same dozen lines in
+every service; a curated default earns its keep once one service asks.
+
+**Scope:** small.
+
+### Conditional requests for dynamic responses — small
+
+**What:** A `roadrunner_etag` middleware that derives a (strong or weak)
+`ETag` from the handler's response body, or honors one the handler
+already set, and turns a matching `If-None-Match` into a bodyless `304
+Not Modified`. The same ETag / `If-None-Match` logic the static handler
+already runs, lifted to apply to dynamic handler responses.
+
+**Why deferred:** static assets already get conditional requests via
+`roadrunner_static`; extending it to dynamic responses saves bandwidth on
+read-heavy JSON endpoints, but wants a real caller to confirm the hashing
+cost is worth it at their response sizes.
+
+**Scope:** small. Reuses the static handler's ETag and `If-None-Match`
+comparison; the new part is hashing the dynamic body and the 304 path.
+
+### Per-peer request-rate guard — medium
+
+**What:** A token-bucket abuse guard keyed by peer (the real client IP,
+accurate behind a proxy once PROXY-protocol support lands), answering
+`429 Too Many Requests` with `Retry-After` when one peer exceeds a
+configured request rate. It belongs to the same DoS-protection family as
+the slowloris `min_bytes_per_second` guard and `max_clients`: it stops a
+single source monopolizing the server rather than enforcing application
+quotas.
+
+**Why deferred:** the existing caps already bound total load; per-peer
+fairness matters once a deployment sees one source flooding it. The
+per-peer bucket state (an `atomics` / ETS store) wants a clean ownership
+and sweep story before it ships. Richer per-user or per-route quota
+policy is application logic, expressed above the server.
+
+**Scope:** medium. The bucket math is small; the per-peer store and its
+sweep are the bulk.
+
+### Graceful load-shedding — small-medium
+
+**What:** Turn the hard `max_clients` / `max_concurrent_requests` caps
+into a graceful shed: over a soft threshold, answer `503 Service
+Unavailable` with `Retry-After` instead of refusing the connection, so
+clients back off cleanly rather than hammering a closed port.
+
+**Why deferred:** the hard caps already protect the server from overload;
+graceful shedding is a client-experience refinement, useful once a
+deployment reports clients retry-storming a refused port.
+
+**Scope:** small-medium. Reuses the existing slot counters; the work is
+the soft-threshold check and the 503 path on the conn loop.
 
 ## Out of scope
 
