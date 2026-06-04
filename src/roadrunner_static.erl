@@ -140,8 +140,8 @@ cache_clear() ->
 ) -> roadrunner_handler:response().
 serve_file(FilePath, TtlMs, Req) ->
     case cached_lookup(FilePath, TtlMs) of
-        {ok, Size, Mtime, ETag, LastMod} ->
-            serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Req);
+        {ok, Size, Mtime, ETag, LastMod, GzInfo} ->
+            serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, GzInfo, Req);
         miss ->
             fresh_lookup(FilePath, TtlMs, Req)
     end.
@@ -152,7 +152,7 @@ serve_file(FilePath, TtlMs, Req) ->
 %% always bypass the cache because the policy gate needs the un-followed
 %% `read_link_info` result.
 -spec cached_lookup(file:filename_all(), non_neg_integer() | infinity) ->
-    {ok, non_neg_integer(), integer(), binary(), binary()} | miss.
+    {ok, non_neg_integer(), integer(), binary(), binary(), {gz, non_neg_integer()} | nogz} | miss.
 cached_lookup(_FilePath, TtlMs) when is_integer(TtlMs), TtlMs =< 0 ->
     miss;
 cached_lookup(FilePath, _TtlMs) ->
@@ -177,26 +177,34 @@ fresh_lookup(FilePath, TtlMs, Req) ->
         {ok, #file_info{type = regular, size = Size, mtime = Mtime}} ->
             ETag = etag(Size, Mtime),
             LastMod = roadrunner_http:format_http_date(Mtime),
-            ok = maybe_cache_put(FilePath, Size, Mtime, ETag, LastMod, TtlMs),
-            serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Req);
+            serve_and_maybe_cache(FilePath, Size, Mtime, ETag, LastMod, TtlMs, Req);
         _ ->
             roadrunner_resp:not_found()
     end.
 
--spec maybe_cache_put(
+%% Caching off (non-positive TTL): serve `lazy` — the gzip sibling is
+%% stat'd per request only when the client accepts gzip, the default-path
+%% behaviour, and nothing is cached. Caching on (positive TTL or
+%% infinity): stat the gzip sibling once now and cache the full metadata,
+%% so every later hit skips both that stat and the ETag/Last-Modified
+%% recompute.
+-spec serve_and_maybe_cache(
     file:filename_all(),
     non_neg_integer(),
     integer(),
     binary(),
     binary(),
-    non_neg_integer() | infinity
-) -> ok.
-maybe_cache_put(_FilePath, _Size, _Mtime, _ETag, _LastMod, TtlMs) when
+    non_neg_integer() | infinity,
+    roadrunner_req:request()
+) -> roadrunner_handler:response().
+serve_and_maybe_cache(FilePath, Size, Mtime, ETag, LastMod, TtlMs, Req) when
     is_integer(TtlMs), TtlMs =< 0
 ->
-    ok;
-maybe_cache_put(FilePath, Size, Mtime, ETag, LastMod, TtlMs) ->
-    roadrunner_static_cache:store(FilePath, Size, Mtime, ETag, LastMod, TtlMs).
+    serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, lazy, Req);
+serve_and_maybe_cache(FilePath, Size, Mtime, ETag, LastMod, TtlMs, Req) ->
+    GzInfo = stat_gz(FilePath),
+    ok = roadrunner_static_cache:store(FilePath, Size, Mtime, ETag, LastMod, GzInfo, TtlMs),
+    serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, GzInfo, Req).
 
 %% Read leaf-stat after the symlink-policy gate has approved follow.
 -spec serve_followed_file(file:filename_all(), roadrunner_req:request()) ->
@@ -206,7 +214,9 @@ serve_followed_file(FilePath, Req) ->
         {ok, #file_info{type = regular, size = Size, mtime = Mtime}} ->
             ETag = etag(Size, Mtime),
             LastMod = roadrunner_http:format_http_date(Mtime),
-            serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Req);
+            %% Symlink leaves never cache, so the gzip sibling is resolved
+            %% lazily (stat'd per request, only when gzip is accepted).
+            serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, lazy, Req);
         _ ->
             roadrunner_resp:not_found()
     end.
@@ -217,9 +227,10 @@ serve_followed_file(FilePath, Req) ->
     integer(),
     binary(),
     binary(),
+    lazy | {gz, non_neg_integer()} | nogz,
     roadrunner_req:request()
 ) -> roadrunner_handler:response().
-serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Req) ->
+serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, GzMeta, Req) ->
     case is_cached(Req, ETag, Mtime) of
         true ->
             {304,
@@ -230,7 +241,7 @@ serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Req) ->
                 ],
                 ~""};
         false ->
-            case maybe_serve_gzip(FilePath, ETag, LastMod, Req) of
+            case maybe_serve_gzip(FilePath, ETag, LastMod, GzMeta, Req) of
                 {ok, Resp} -> Resp;
                 none -> serve_with_range(FilePath, Size, ETag, LastMod, Req)
             end
@@ -241,24 +252,48 @@ serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Req) ->
 %% requests skip this path — byte offsets over a compressed
 %% representation have subtle semantics, so we let Range win and
 %% serve the raw file.
--spec maybe_serve_gzip(file:filename_all(), binary(), binary(), roadrunner_req:request()) ->
-    {ok, roadrunner_handler:response()} | none.
-maybe_serve_gzip(FilePath, ETag, LastMod, Req) ->
+-spec maybe_serve_gzip(
+    file:filename_all(),
+    binary(),
+    binary(),
+    lazy | {gz, non_neg_integer()} | nogz,
+    roadrunner_req:request()
+) -> {ok, roadrunner_handler:response()} | none.
+maybe_serve_gzip(FilePath, ETag, LastMod, GzMeta, Req) ->
     case
         (roadrunner_req:header(~"range", Req) =:= undefined) andalso
             accepts_gzip(Req)
     of
         true ->
-            GzPath = iolist_to_binary([FilePath, ~".gz"]),
-            case file:read_file_info(GzPath, [raw, {time, posix}]) of
-                {ok, #file_info{type = regular, size = GzSize}} ->
-                    {ok, gzip_response(FilePath, GzPath, GzSize, ETag, LastMod)};
-                _ ->
+            case resolve_gz(FilePath, GzMeta) of
+                {gz, GzSize} ->
+                    {ok, gzip_response(FilePath, gz_path(FilePath), GzSize, ETag, LastMod)};
+                nogz ->
                     none
             end;
         false ->
             none
     end.
+
+%% Resolve the gzip-sibling result: use the cached value, or stat the
+%% sibling now (`lazy` — the no-cache / symlink path).
+-spec resolve_gz(file:filename_all(), lazy | {gz, non_neg_integer()} | nogz) ->
+    {gz, non_neg_integer()} | nogz.
+resolve_gz(FilePath, lazy) -> stat_gz(FilePath);
+resolve_gz(_FilePath, GzInfo) -> GzInfo.
+
+%% Stat the `<file>.gz` sibling: `{gz, GzSize}` when it is a regular file,
+%% `nogz` otherwise.
+-spec stat_gz(file:filename_all()) -> {gz, non_neg_integer()} | nogz.
+stat_gz(FilePath) ->
+    case file:read_file_info(gz_path(FilePath), [raw, {time, posix}]) of
+        {ok, #file_info{type = regular, size = GzSize}} -> {gz, GzSize};
+        _ -> nogz
+    end.
+
+-spec gz_path(file:filename_all()) -> binary().
+gz_path(FilePath) ->
+    iolist_to_binary([FilePath, ~".gz"]).
 
 -spec accepts_gzip(roadrunner_req:request()) -> boolean().
 accepts_gzip(Req) ->

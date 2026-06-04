@@ -461,16 +461,16 @@ cache_helpers_test_() ->
             {"cache_put then cache_get within TTL returns the entry", fun() ->
                 FilePath = filename:join(Dir, "fresh.txt"),
                 ok = roadrunner_static_cache:store(
-                    FilePath, 100, 1700000000, ~"etag-fresh", ~"lm-fresh", 60000
+                    FilePath, 100, 1700000000, ~"etag-fresh", ~"lm-fresh", nogz, 60000
                 ),
                 ?assertEqual(
-                    {ok, 100, 1700000000, ~"etag-fresh", ~"lm-fresh"},
+                    {ok, 100, 1700000000, ~"etag-fresh", ~"lm-fresh", nogz},
                     roadrunner_static_cache:lookup(FilePath)
                 )
             end},
             {"cache_get returns miss after TTL expires", fun() ->
                 FilePath = filename:join(Dir, "expiring.txt"),
-                ok = roadrunner_static_cache:store(FilePath, 50, 1700000000, ~"e", ~"lm", 1),
+                ok = roadrunner_static_cache:store(FilePath, 50, 1700000000, ~"e", ~"lm", nogz, 1),
                 timer:sleep(20),
                 ?assertEqual(miss, roadrunner_static_cache:lookup(FilePath))
             end},
@@ -479,23 +479,25 @@ cache_helpers_test_() ->
                 %% past any finite TTL must still return the entry.
                 FilePath = filename:join(Dir, "forever.txt"),
                 ok = roadrunner_static_cache:store(
-                    FilePath, 42, 1700000000, ~"etag-fvr", ~"lm-fvr", infinity
+                    FilePath, 42, 1700000000, ~"etag-fvr", ~"lm-fvr", {gz, 17}, infinity
                 ),
                 ?assertEqual(
-                    {ok, 42, 1700000000, ~"etag-fvr", ~"lm-fvr"},
+                    {ok, 42, 1700000000, ~"etag-fvr", ~"lm-fvr", {gz, 17}},
                     roadrunner_static_cache:lookup(FilePath)
                 ),
                 timer:sleep(10),
                 ?assertEqual(
-                    {ok, 42, 1700000000, ~"etag-fvr", ~"lm-fvr"},
+                    {ok, 42, 1700000000, ~"etag-fvr", ~"lm-fvr", {gz, 17}},
                     roadrunner_static_cache:lookup(FilePath)
                 )
             end},
             {"cache_clear/0 drops every cached entry", fun() ->
                 F1 = filename:join(Dir, "clear_a.txt"),
                 F2 = filename:join(Dir, "clear_b.txt"),
-                ok = roadrunner_static_cache:store(F1, 10, 1700000000, ~"e1", ~"lm1", infinity),
-                ok = roadrunner_static_cache:store(F2, 20, 1700000000, ~"e2", ~"lm2", 60000),
+                ok = roadrunner_static_cache:store(
+                    F1, 10, 1700000000, ~"e1", ~"lm1", nogz, infinity
+                ),
+                ok = roadrunner_static_cache:store(F2, 20, 1700000000, ~"e2", ~"lm2", nogz, 60000),
                 ok = roadrunner_static:cache_clear(),
                 ?assertEqual(miss, roadrunner_static_cache:lookup(F1)),
                 ?assertEqual(miss, roadrunner_static_cache:lookup(F2))
@@ -516,7 +518,7 @@ cache_populated_after_request_test_() ->
                 ?assertEqual(miss, roadrunner_static_cache:lookup(FilePath)),
                 _Reply = http_get(Port, ~"/static/cached.txt"),
                 ?assertMatch(
-                    {ok, _Size, _Mtime, _ETag, _LastMod},
+                    {ok, _Size, _Mtime, _ETag, _LastMod, _GzInfo},
                     roadrunner_static_cache:lookup(FilePath)
                 )
             end},
@@ -532,6 +534,19 @@ cache_populated_after_request_test_() ->
                 [_, Body2] = binary:split(Reply2, ~"\r\n\r\n"),
                 ?assertEqual(Body1, Body2),
                 ?assertEqual(~"cached", Body1)
+            end},
+            {"cache hit serves the gzip sibling from the cached result", fun() ->
+                %% Two gzip requests to a cached, .gz-backed file: the cold
+                %% one caches the gzip-sibling result, the hit serves from it
+                %% (no per-request `.gz` stat). Both carry gzip encoding.
+                R1 = http_get_with(
+                    Port, ~"/static/gz_cached.css", [{~"Accept-Encoding", ~"gzip"}]
+                ),
+                R2 = http_get_with(
+                    Port, ~"/static/gz_cached.css", [{~"Accept-Encoding", ~"gzip"}]
+                ),
+                {match, _} = re:run(R1, ~"content-encoding: gzip", [caseless]),
+                {match, _} = re:run(R2, ~"content-encoding: gzip", [caseless])
             end}
         ]
     end}.
@@ -607,6 +622,8 @@ cache_enabled_setup() ->
     ),
     ok = filelib:ensure_dir(filename:join(Dir, "x")),
     ok = file:write_file(filename:join(Dir, "cached.txt"), ~"cached"),
+    ok = file:write_file(filename:join(Dir, "gz_cached.css"), ~"body{}"),
+    ok = file:write_file(filename:join(Dir, "gz_cached.css.gz"), zlib:gzip(~"body{}")),
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0,
         routes => [
