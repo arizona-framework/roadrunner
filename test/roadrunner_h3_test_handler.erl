@@ -28,7 +28,7 @@ handle(#{target := ~"/slow"} = Req) ->
     {{200, [], ~"slow"}, Req};
 handle(#{target := <<"/forbidden/", Name/binary>>} = Req) ->
     %% Emits a connection-specific response header (named by the path),
-    %% which RFC 9114 §4.2 forbids over h3.
+    %% which RFC 9114 §4.2 forbids over h3 — the server strips it.
     {{200, [{Name, ~"x"}], ~"x"}, Req};
 handle(#{target := ~"/inject-value"} = Req) ->
     %% A response header VALUE with CR/LF (RFC 9110 §5.5 bans CTLs) → 500.
@@ -69,8 +69,17 @@ handle(#{target := ~"/stream-noend"} = Req) ->
     %% Returns without a `fin` — the framework auto-closes the stream.
     {{stream, 200, [], fun(Send) -> ok = Send(~"data", nofin) end}, Req};
 handle(#{target := ~"/stream-forbidden"} = Req) ->
-    %% A connection-specific header on a stream response → 500.
+    %% A connection-specific header on a stream response → stripped.
     {{stream, 200, [{~"connection", ~"close"}], fun(Send) -> ok = Send(~"x", fin) end}, Req};
+handle(#{target := ~"/stream-forbidden-trailers"} = Req) ->
+    %% A connection-specific field in a trailer → stripped; the legit
+    %% trailer rides through (RFC 9114 §4.2).
+    {
+        {stream, 200, [], fun(Send) ->
+            ok = Send(~"body", {fin, [{~"connection", ~"close"}, {~"x-trailer", ~"v"}]})
+        end},
+        Req
+    };
 handle(#{target := ~"/loop"} = Req) ->
     %% Register the worker so the test can drive it from outside.
     %% Unregister first in case a prior test's worker leaked the name.

@@ -1317,12 +1317,13 @@ encode_and_send_headers(
 ) ->
     StatusBin = integer_to_binary(Status),
     %% Handler-supplied header names MUST already be lowercase per RFC 9113
-    %% §8.1.2 (see `roadrunner_handler:response/0`). Bytes outside the
-    %% RFC 9110 §5.5 field-value charset (CR/LF/NUL) crash here so the
-    %% h2 path matches h1's `encode_headers/1` discipline.
-    ok = roadrunner_http:check_headers_safe(Headers),
+    %% §8.1.2 (see `roadrunner_handler:response/0`). In one pass: crash on
+    %% CR/LF/NUL outside the RFC 9110 §5.5 field-value charset (matching h1's
+    %% `encode_headers/1` discipline) and strip the connection-specific fields
+    %% RFC 9113 §8.2.2 forbids h2 from generating.
+    WireHeaders = roadrunner_http:strip_connection_specific_fields_safe(Headers),
     AllHeaders =
-        [{~":status", StatusBin} | roadrunner_http:auto_headers(Headers, State#loop.alt_svc)],
+        [{~":status", StatusBin} | roadrunner_http:auto_headers(WireHeaders, State#loop.alt_svc)],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     %% `frame:encode` accepts iodata for the header block — skip
     %% the upfront flatten; ssl:send walks the iolist anyway.
@@ -1355,12 +1356,13 @@ encode_and_send_response_atomic(
 ) ->
     #{StreamId := Stream} = Streams,
     StatusBin = integer_to_binary(Status),
-    %% Names already lowercase per `roadrunner_handler:response/0` contract;
-    %% reject CR/LF/NUL anywhere in the pair so they cannot reach the peer
-    %% or split at an h2->h1 reverse proxy.
-    ok = roadrunner_http:check_headers_safe(Headers),
+    %% Names already lowercase per `roadrunner_handler:response/0` contract.
+    %% One pass rejects CR/LF/NUL anywhere in the pair (so they cannot reach
+    %% the peer or split at an h2->h1 reverse proxy) and strips the
+    %% connection-specific fields RFC 9113 §8.2.2 forbids h2 from generating.
+    WireHeaders = roadrunner_http:strip_connection_specific_fields_safe(Headers),
     AllHeaders =
-        [{~":status", StatusBin} | roadrunner_http:auto_headers(Headers, State#loop.alt_svc)],
+        [{~":status", StatusBin} | roadrunner_http:auto_headers(WireHeaders, State#loop.alt_svc)],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
     HFrame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04, undefined, HpackBlock}
@@ -1373,9 +1375,11 @@ encode_and_send_response_atomic(
 
 encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
     %% Trailer names already lowercase per `roadrunner_handler:response/0`;
-    %% h1 trailers run the same check in `roadrunner_stream_response`.
-    ok = roadrunner_http:check_headers_safe(Trailers),
-    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(Trailers, Enc),
+    %% h1 trailers run the same check in `roadrunner_stream_response`. One
+    %% pass rejects CR/LF/NUL and strips connection-specific fields (RFC 9113
+    %% §8.2.2).
+    WireTrailers = roadrunner_http:strip_connection_specific_fields_safe(Trailers),
+    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(WireTrailers, Enc),
     Frame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04 bor 16#01, undefined, HpackBlock}
     ),

@@ -21,8 +21,14 @@ Items here:
   `Last-Modified` response header used by the static handler.
 - Header field-value safety (RFC 9110 §5.5): reject CR/LF/NUL in a
   header name or value before it reaches the wire
-  (`check_header_safe/2`, `check_headers_safe/1`), shared by every
-  version's response path.
+  (`check_header_safe/2`), shared by every version's response path.
+- Connection-specific field stripping (RFC 9113 §8.2.2 / RFC 9114
+  §4.2): drop the hop-by-hop fields HTTP/2 and HTTP/3 MUST NOT
+  generate from a response field section
+  (`strip_connection_specific_fields/1`), or do it fused with the
+  field-value check in a single pass
+  (`strip_connection_specific_fields_safe/1`); HTTP/1.1 honours these
+  fields, so it does not strip.
 
 `roadrunner_http1` and `roadrunner_req` re-export the primitive
 types as aliases so existing callers keep compiling unchanged.
@@ -32,8 +38,9 @@ accessors that operate on it.
 
 -export([http_date_now/0, format_http_date/1, with_date/1, auto_headers/2]).
 -export([header_list_size/1]).
--export([check_header_safe/2, check_header_safe/3, check_headers_safe/1]).
+-export([check_header_safe/2, check_header_safe/3]).
 -export([unsafe_bytes_pattern/0]).
+-export([strip_connection_specific_fields/1, strip_connection_specific_fields_safe/1]).
 
 -export_type([headers/0, status/0, redirect_status/0, version/0]).
 
@@ -173,9 +180,9 @@ check_header_safe(Bin, Kind) when is_binary(Bin) ->
     check_header_safe(Bin, Kind, persistent_term:get(?UNSAFE_BYTES_KEY)).
 
 %% Accepts a pre-fetched pattern so a caller iterating a header list
-%% (`check_headers_safe/2`, or h1's fused `encode_headers/1`) pays one
-%% `persistent_term:get/1` instead of one per field. Exported for the
-%% h1 encode path; most callers want `check_header_safe/2`.
+%% (`strip_connection_specific_fields_safe/1`, or h1's fused
+%% `encode_headers/1`) pays one `persistent_term:get/1` instead of one
+%% per field. Exported for those; most callers want `check_header_safe/2`.
 -doc false.
 -spec check_header_safe(binary(), name | value, binary:cp()) -> ok.
 check_header_safe(Bin, Kind, UnsafeCp) when is_binary(Bin) ->
@@ -184,39 +191,73 @@ check_header_safe(Bin, Kind, UnsafeCp) when is_binary(Bin) ->
         _ -> error({header_injection, Kind, Bin})
     end.
 
--doc """
-Run the header-injection check over every name and value in a header
-list, fetching the compiled unsafe-bytes pattern once and threading it
-through (vs `check_header_safe/2`, which fetches per call). Crashes with
-`{header_injection, Kind, Bin}` on the first unsafe byte.
-
-The list-validating entry for response paths that emit headers via a
-binary codec rather than the CRLF encoder: the HTTP/2 conn loop, and
-HTTP/3 once its check is wired. h1's CRLF encoder fuses the per-field
-check into its build pass instead, so it does not use this entry.
-""".
--spec check_headers_safe(headers()) -> ok.
-check_headers_safe(Headers) ->
-    check_headers_safe(Headers, persistent_term:get(?UNSAFE_BYTES_KEY)).
-
-%% Loop with the pre-fetched pattern.
--spec check_headers_safe(headers(), binary:cp()) -> ok.
-check_headers_safe([], _UnsafeCp) ->
-    ok;
-check_headers_safe([{Name, Value} | Rest], UnsafeCp) ->
-    ok = check_header_safe(Name, name, UnsafeCp),
-    ok = check_header_safe(Value, value, UnsafeCp),
-    check_headers_safe(Rest, UnsafeCp).
-
 %% The compiled CR/LF/NUL pattern, for a caller that runs the check in a
 %% loop and wants a single `persistent_term:get/1` for the whole list:
-%% h1's fused `encode_headers/1` (via `check_header_safe/3`) and the
-%% HTTP/3 emit gate (inline `binary:match`). Callers not already iterating
-%% want `check_header_safe/2` or `check_headers_safe/1` instead.
+%% h1's fused `encode_headers/1`, the fused
+%% `strip_connection_specific_fields_safe/1`, and the HTTP/3 emit gate
+%% (all via `check_header_safe/3` or inline `binary:match`). Callers not
+%% already iterating want `check_header_safe/2`.
 -doc false.
 -spec unsafe_bytes_pattern() -> binary:cp().
 unsafe_bytes_pattern() ->
     persistent_term:get(?UNSAFE_BYTES_KEY).
+
+-doc """
+Drop connection-specific header fields from an HTTP/2 or HTTP/3
+response field section. RFC 9113 §8.2.2 and RFC 9114 §4.2 forbid
+*generating* `connection`, `keep-alive`, `proxy-connection`,
+`transfer-encoding`, or `upgrade` over those protocols — they are
+hop-by-hop fields (RFC 9110 §7.6.1) meaningful only on an HTTP/1.1
+connection. A handler shared across protocols may set one (e.g.
+`connection: close`, idiomatic on h1); stripping it on h2/h3 keeps that
+handler working while staying conformant, since the framework never
+puts the field on the wire. HTTP/1.1 honours these fields, so its
+response path does not strip.
+""".
+-spec strip_connection_specific_fields(headers()) -> headers().
+strip_connection_specific_fields(Headers) ->
+    [Field || {Name, _} = Field <- Headers, not connection_specific_field(Name)].
+
+-doc """
+Single-pass combination of `check_header_safe/2` and
+`strip_connection_specific_fields/1` for the response paths that crash
+on injection (the HTTP/2 conn loop and the HTTP/3 trailer path): in one
+traversal it rejects CR/LF/NUL in any name or value (crashing with
+`{header_injection, Kind, Bin}`, like `check_header_safe/2`) and drops
+the connection-specific fields h2/h3 MUST NOT generate. HTTP/3 response
+headers answer 500 on injection instead of crashing, so they run the
+non-crashing check and `strip_connection_specific_fields/1` separately.
+""".
+-spec strip_connection_specific_fields_safe(headers()) -> headers().
+strip_connection_specific_fields_safe(Headers) ->
+    strip_connection_specific_fields_safe(Headers, persistent_term:get(?UNSAFE_BYTES_KEY)).
+
+%% One pass with the pre-fetched pattern: check CR/LF/NUL on every field
+%% (including ones about to be dropped, matching the prior two-pass
+%% behaviour) and cons the field only when it is not connection-specific.
+%% Mirrors h1's fused `encode_headers_loop/2`.
+-spec strip_connection_specific_fields_safe(headers(), binary:cp()) -> headers().
+strip_connection_specific_fields_safe([], _UnsafeCp) ->
+    [];
+strip_connection_specific_fields_safe([{Name, Value} = Field | Rest], UnsafeCp) ->
+    ok = check_header_safe(Name, name, UnsafeCp),
+    ok = check_header_safe(Value, value, UnsafeCp),
+    case connection_specific_field(Name) of
+        true -> strip_connection_specific_fields_safe(Rest, UnsafeCp);
+        false -> [Field | strip_connection_specific_fields_safe(Rest, UnsafeCp)]
+    end.
+
+%% The RFC 9110 §7.6.1 connection-specific (hop-by-hop) field names that
+%% RFC 9113 §8.2.2 / RFC 9114 §4.2 forbid an h2/h3 endpoint from
+%% generating. Function-clause dispatch mirrors the request-side
+%% `check_banned/1` in `roadrunner_http2_request` / `roadrunner_http3_request`.
+-spec connection_specific_field(binary()) -> boolean().
+connection_specific_field(~"connection") -> true;
+connection_specific_field(~"keep-alive") -> true;
+connection_specific_field(~"proxy-connection") -> true;
+connection_specific_field(~"transfer-encoding") -> true;
+connection_specific_field(~"upgrade") -> true;
+connection_specific_field(_) -> false.
 
 %% `-on_load` callback. Stashes the compiled unsafe-bytes pattern in
 %% `persistent_term` so `check_header_safe/3` reads a constant on the

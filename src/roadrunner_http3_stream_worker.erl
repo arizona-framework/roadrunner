@@ -177,74 +177,44 @@ emit_handler_response(Conn, StreamId, Handler, {loop, Status, Headers, State}) -
 emit_handler_response(Conn, StreamId, _Handler, {websocket, _, _}) ->
     emit_501(Conn, StreamId).
 
-%% Emit a response unless it carries a connection-specific header
-%% (RFC 9114 §4.2), in which case answer 500. `Emit` performs the send
-%% and returns the status sent; shared by the buffered / stream /
-%% sendfile paths.
+%% Emit a response unless it carries a header with CR/LF/NUL (RFC 9110
+%% §5.5), in which case answer 500. Connection-specific fields (RFC 9114
+%% §4.2) are not rejected here — `header_frame/2` strips them. `Emit`
+%% performs the send and returns the status sent; shared by the buffered
+%% / stream / sendfile paths.
 -spec emit_checked(
     pid(), non_neg_integer(), roadrunner_http:headers(), fun(() -> roadrunner_http:status())
 ) -> roadrunner_http:status().
 emit_checked(Conn, StreamId, Headers, Emit) ->
     case validate_response_headers(Headers) of
         ok -> Emit();
-        {unsafe, Kind} -> reject_unsafe(Conn, StreamId, Kind);
-        {forbidden, Name} -> reject_forbidden(Conn, StreamId, Name)
+        {unsafe, Kind} -> reject_unsafe(Conn, StreamId, Kind)
     end.
 
-%% One pass over the response headers, applying both gates per field: the
-%% RFC 9114 §4.2 connection-specific name set, and the RFC 9110 §5.5
-%% CR/LF/NUL field-byte check (the shared compiled pattern, fetched once).
-%% `is_forbidden_header/1` is function-clause dispatch (mirrors
-%% `roadrunner_http3_request:check_banned/1`); a forbidden name returns it
-%% for the log, an unsafe field returns only the kind (never raw bytes).
+%% One pass over the response headers running the RFC 9110 §5.5 CR/LF/NUL
+%% field-byte check (the shared compiled pattern, fetched once), returning
+%% the offending kind (never the raw bytes) on the first unsafe field.
+%% Non-crashing because `emit_checked/4` runs in the `try ... of` body,
+%% whose exceptions the `try` does NOT catch.
 -spec validate_response_headers(roadrunner_http:headers()) ->
-    ok | {unsafe, name | value} | {forbidden, binary()}.
+    ok | {unsafe, name | value}.
 validate_response_headers(Headers) ->
     validate_response_headers(Headers, roadrunner_http:unsafe_bytes_pattern()).
 
 -spec validate_response_headers(roadrunner_http:headers(), binary:cp()) ->
-    ok | {unsafe, name | value} | {forbidden, binary()}.
+    ok | {unsafe, name | value}.
 validate_response_headers([], _UnsafeCp) ->
     ok;
 validate_response_headers([{Name, Value} | Rest], UnsafeCp) ->
-    case is_forbidden_header(Name) of
-        true ->
-            {forbidden, Name};
-        false ->
-            case binary:match(Name, UnsafeCp) of
-                nomatch ->
-                    case binary:match(Value, UnsafeCp) of
-                        nomatch -> validate_response_headers(Rest, UnsafeCp);
-                        _ -> {unsafe, value}
-                    end;
-                _ ->
-                    {unsafe, name}
-            end
+    case binary:match(Name, UnsafeCp) of
+        nomatch ->
+            case binary:match(Value, UnsafeCp) of
+                nomatch -> validate_response_headers(Rest, UnsafeCp);
+                _ -> {unsafe, value}
+            end;
+        _ ->
+            {unsafe, name}
     end.
-
--spec is_forbidden_header(binary()) -> boolean().
-is_forbidden_header(~"connection") -> true;
-is_forbidden_header(~"keep-alive") -> true;
-is_forbidden_header(~"proxy-connection") -> true;
-is_forbidden_header(~"transfer-encoding") -> true;
-is_forbidden_header(~"upgrade") -> true;
-is_forbidden_header(_) -> false.
-
-%% RFC 9114 §4.2: connection-specific header fields MUST NOT be
-%% generated. A handler emitting one (e.g. a shared h1/h2 handler with
-%% `connection: close`) is a server bug, not a received malformed
-%% message — answer 500 rather than write a response the client rejects.
-%% Shared by the buffered and streaming response paths.
--spec reject_forbidden(pid(), non_neg_integer(), binary()) -> 500.
-reject_forbidden(Conn, StreamId, Name) ->
-    logger:error(#{
-        msg => "roadrunner h3 handler returned a connection-specific header",
-        header => Name
-    }),
-    send_buffered(
-        Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
-    ),
-    500.
 
 %% RFC 9110 §5.5: a response header name or value containing CR, LF, or
 %% NUL is a handler bug (usually unvalidated user input echoed into a
@@ -339,12 +309,14 @@ stream_send(Conn, StreamId, Data, fin) ->
     quic:send_data(Conn, StreamId, data_frame(Data, iolist_size(Data)), true);
 stream_send(Conn, StreamId, Data, {fin, Trailers}) ->
     %% Trailers go out after the status + body, so an injected one cannot
-    %% become a 500; crash on the RFC 9110 §5.5 check before writing the
-    %% frame so the conn loop resets the stream and the malformed bytes
-    %% never reach the client, the same cut-off h1 does for chunked trailers.
-    ok = roadrunner_http:check_headers_safe(Trailers),
+    %% become a 500. One pass crashes on the RFC 9110 §5.5 check (so the conn
+    %% loop resets the stream and the malformed bytes never reach the client,
+    %% the same cut-off h1 does for chunked trailers) and strips the
+    %% connection-specific fields RFC 9114 §4.2 forbids, matching the header
+    %% path. The crash must happen before `?FIN_KEY` is set, so run it first.
+    Stripped = roadrunner_http:strip_connection_specific_fields_safe(Trailers),
     put(?FIN_KEY, true),
-    TrailersFrame = quic_h3_frame:encode_headers(quic_qpack:encode(Trailers)),
+    TrailersFrame = quic_h3_frame:encode_headers(quic_qpack:encode(Stripped)),
     quic:send_data(Conn, StreamId, [data_frame(Data, iolist_size(Data)), TrailersFrame], true).
 
 %% `{sendfile, ...}` response. There is no kernel sendfile over QUIC
@@ -451,11 +423,13 @@ loop_push(Conn, StreamId, Data) ->
         Len -> quic:send_data(Conn, StreamId, data_frame(Data, Len), false)
     end.
 
-%% HEADERS frame: QPACK-encoded `:status` + the handler's headers, plus
-%% the auto-injected `Date` (RFC 9110 §6.6.1).
+%% HEADERS frame: QPACK-encoded `:status` + the handler's headers, with
+%% connection-specific fields stripped (RFC 9114 §4.2 — h3 MUST NOT
+%% generate them) and the auto-injected `Date` (RFC 9110 §6.6.1) added.
 -spec header_frame(roadrunner_http:status(), roadrunner_http:headers()) -> binary().
 header_frame(Status, Headers) ->
-    HeaderList = [{~":status", integer_to_binary(Status)} | roadrunner_http:with_date(Headers)],
+    Stripped = roadrunner_http:strip_connection_specific_fields(Headers),
+    HeaderList = [{~":status", integer_to_binary(Status)} | roadrunner_http:with_date(Stripped)],
     quic_h3_frame:encode_headers(quic_qpack:encode(HeaderList)).
 
 %% DATA frame as iodata (type + length varints, then the body by

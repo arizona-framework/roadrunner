@@ -62,6 +62,16 @@ handle(#{target := ~"/stream/trailers"} = Req) ->
         end},
         Req
     };
+handle(#{target := ~"/stream/strip"} = Req) ->
+    %% Connection-specific fields in BOTH the streaming HEADERS and the
+    %% trailers. RFC 9113 §8.2.2 forbids generating them over h2, so the
+    %% server strips both; the legit `x-checksum` trailer rides through.
+    {
+        {stream, 200, [{~"connection", ~"close"}, {~"trailer", ~"x-checksum"}], fun(Send) ->
+            Send(~"hi", {fin, [{~"connection", ~"close"}, {~"x-checksum", ~"deadbeef"}]})
+        end},
+        Req
+    };
 handle(#{target := ~"/stream/trailers-only"} = Req) ->
     {
         {stream, 200, [{~"trailer", ~"x-checksum"}], fun(Send) ->
