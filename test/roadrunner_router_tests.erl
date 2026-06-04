@@ -207,7 +207,11 @@ match_map_route_with_middlewares_test() ->
     %% covered end-to-end in `roadrunner_middleware_tests`.
     Compiled = roadrunner_router:compile(
         [
-            #{path => ~"/admin/*p", handler => admin_handler, middlewares => [auth_mw, log_mw]}
+            #{
+                path => ~"/admin/*p",
+                handler => admin_handler,
+                middlewares => [{auth_mw, undefined}, {log_mw, undefined}]
+            }
         ],
         []
     ),
@@ -223,7 +227,7 @@ match_map_route_with_state_and_middlewares_test() ->
                 path => ~"/api/:resource",
                 handler => api_handler,
                 state => #{db => primary},
-                middlewares => [auth_mw]
+                middlewares => [{auth_mw, undefined}]
             }
         ],
         []
@@ -239,7 +243,7 @@ match_mixed_tuple_and_map_routes_test() ->
         [
             {~"/", home_handler},
             {~"/about", about_handler, ~"hello"},
-            #{path => ~"/api/*p", handler => api_handler, middlewares => [auth_mw]}
+            #{path => ~"/api/*p", handler => api_handler, middlewares => [{auth_mw, undefined}]}
         ],
         []
     ),
@@ -410,7 +414,7 @@ compile_returns_callable_pipeline_test() ->
         [
             {~"/", h},
             {~"/x", h, undefined},
-            #{path => ~"/y", handler => h, middlewares => [auth_mw]}
+            #{path => ~"/y", handler => h, middlewares => [{auth_mw, undefined}]}
         ],
         []
     ),

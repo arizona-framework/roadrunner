@@ -5,9 +5,10 @@ Continuation-style middleware for roadrunner handlers.
 A middleware wraps the rest of the request pipeline:
 
 ```erlang
--callback call(Request, Next) -> Result when
+-callback call(Request, Next, State) -> Result when
     Request :: roadrunner_req:request(),
     Next :: fun((Request) -> Result),
+    State :: term(),
     Result :: roadrunner_handler:result().
 ```
 
@@ -77,40 +78,55 @@ which wrap the handler — first in each list runs outermost.
 
 ## Middleware shape
 
-Each entry in a middlewares list is one of:
+Each entry in a middlewares list is a `{Callable, State}` pair. `State`
+is the middleware's own configuration — its analog of a handler's route
+state — and always comes from the entry; pass `undefined` for a
+stateless middleware.
 
-- `module()` — the module's `call/2` (this behaviour callback) is invoked.
-- `fun((Request, Next) -> Result)` — invoked directly.
+- `{module(), State}` — the module's `call/3` behaviour callback is
+  invoked as `Mod:call(Req, Next, State)`.
+- `{fun((Request, Next, State) -> Result), State}` — the fun is invoked
+  directly as `Fun(Req, Next, State)`.
+
+The same module can appear more than once in a list with different
+`State`, e.g. `[{rate_limit, #{rps => 10}}, {rate_limit, #{rps => 100}}]`.
+
+Middleware `State` is **not** the request's `state` field. Route state
+(`{Path, Handler, State}`) is injected onto the request map and read
+with `roadrunner_req:state/1`; middleware `State` is handed to `call/3`
+as an argument and never touches the request.
 
 ## Examples
 
 ```erlang
-%% Auth check — halt with 401 when missing.
-auth(Req, Next) ->
+%% Stateless auth check — halt with 401 when missing. Wire it as
+%% `{fun ?MODULE:auth/3, undefined}`.
+auth(Req, Next, _State) ->
     case roadrunner_req:header(~"authorization", Req) of
         undefined -> {roadrunner_resp:unauthorized(), Req};
         _ -> Next(Req)
     end.
 
 %% Around: time the whole request including the response write.
-timing(Req, Next) ->
+timing(Req, Next, _State) ->
     Start = erlang:monotonic_time(millisecond),
     Result = Next(Req),
     logger:info(#{took_ms => erlang:monotonic_time(millisecond) - Start}),
     Result.
 
-%% Inject a server header on every response.
-server_header(Req, Next) ->
+%% Stateful: inject a configurable `server` header on every response.
+%% Wire it as `{fun ?MODULE:server_header/3, ~"roadrunner"}`.
+server_header(Req, Next, Server) ->
     {{S, H, B}, Req2} = Next(Req),
-    {{S, [{~"server", ~"roadrunner"} | H], B}, Req2}.
+    {{S, [{~"server", Server} | H], B}, Req2}.
 ```
 """.
 
 -export([compose/2, build_pipeline/2, compile_pipeline/3]).
--export_type([middleware/0, middleware_list/0, next/0]).
+-export_type([middleware/0, middleware_fun/0, middleware_list/0, next/0]).
 
 -doc """
-The continuation passed to a middleware's `call/2`: a fun that runs
+The continuation passed to a middleware's `call/3`: a fun that runs
 the rest of the pipeline (other middlewares + the inner handler)
 and returns the same `t:roadrunner_handler:result/0` shape every
 middleware returns.
@@ -118,13 +134,23 @@ middleware returns.
 -type next() :: fun((roadrunner_req:request()) -> roadrunner_handler:result()).
 
 -doc """
-A single entry in a `middlewares` list. Either a module that
-implements `-behaviour(roadrunner_middleware)` (its `call/2` is
-invoked) or a `fun((Request, Next) -> Result)` invoked directly.
+The function shape of a fun-form middleware: it receives the request,
+the continuation, and the entry's `State`.
+""".
+-type middleware_fun() ::
+    fun((roadrunner_req:request(), next(), State :: term()) -> roadrunner_handler:result()).
+
+-doc """
+A single entry in a `middlewares` list: a `{Callable, State}` pair.
+`Callable` is either a module implementing
+`-behaviour(roadrunner_middleware)` (its `call/3` is invoked) or a
+`t:middleware_fun/0` invoked directly. `State` is the middleware's own
+configuration, passed through as the third argument; use `undefined`
+when the middleware needs none.
 """.
 -type middleware() ::
-    module()
-    | fun((roadrunner_req:request(), next()) -> roadrunner_handler:result()).
+    {module(), State :: term()}
+    | {middleware_fun(), State :: term()}.
 
 -doc "An ordered list of `t:middleware/0` entries.".
 -type middleware_list() :: [middleware()].
@@ -133,7 +159,9 @@ invoked) or a `fun((Request, Next) -> Result)` invoked directly.
 The middleware contract. `Request` is the current request map;
 `Next` is a continuation that runs the rest of the pipeline (other
 middlewares + the inner handler) and returns the same
-`t:roadrunner_handler:result/0` shape every middleware returns.
+`t:roadrunner_handler:result/0` shape every middleware returns. `State`
+is the entry's configuration (the second element of the `{module(),
+State}` pair) — `undefined` when the middleware needs none.
 
 The middleware decides whether to:
 - pass through unchanged (`Next(Req)`),
@@ -143,7 +171,11 @@ The middleware decides whether to:
   returned),
 - run side effects around the call (log, time, instrument).
 """.
--callback call(Request :: roadrunner_req:request(), Next :: next()) ->
+-callback call(
+    Request :: roadrunner_req:request(),
+    Next :: next(),
+    State :: term()
+) ->
     roadrunner_handler:result().
 
 -doc """
@@ -203,7 +235,7 @@ compile_pipeline(Mws, Handler, {state, State}) ->
 
 -spec apply_one(middleware(), roadrunner_req:request(), next()) ->
     roadrunner_handler:result().
-apply_one(Mod, Req, Next) when is_atom(Mod) ->
-    Mod:call(Req, Next);
-apply_one(Fun, Req, Next) when is_function(Fun, 2) ->
-    Fun(Req, Next).
+apply_one({Mod, State}, Req, Next) when is_atom(Mod) ->
+    Mod:call(Req, Next, State);
+apply_one({Fun, State}, Req, Next) when is_function(Fun, 3) ->
+    Fun(Req, Next, State).

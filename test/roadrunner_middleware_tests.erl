@@ -13,7 +13,7 @@ compose_empty_returns_handler_test() ->
     ?assertEqual({{200, [], ~"ok"}, Req}, Pipeline(Req)).
 
 compose_single_fun_passes_through_test() ->
-    Mw = fun(R, Next) -> Next(R) end,
+    Mw = {fun(R, Next, _State) -> Next(R) end, undefined},
     Handler = fun(R) -> {{201, [], ~"handler"}, R} end,
     Pipeline = roadrunner_middleware:compose([Mw], Handler),
     Req = req(),
@@ -22,7 +22,7 @@ compose_single_fun_passes_through_test() ->
 compose_halt_skips_handler_test() ->
     HandlerCalled = make_ref(),
     Self = self(),
-    Mw = fun(R, _Next) -> {{401, [], ~"nope"}, R} end,
+    Mw = {fun(R, _Next, _State) -> {{401, [], ~"nope"}, R} end, undefined},
     Handler = fun(R) ->
         Self ! HandlerCalled,
         {{200, [], ~"reached"}, R}
@@ -38,10 +38,14 @@ compose_halt_skips_handler_test() ->
 
 compose_request_mutation_visible_to_handler_test() ->
     %% Middleware adds a header; handler reads it.
-    Mw = fun(R, Next) ->
-        H = maps:get(headers, R),
-        Next(R#{headers := [{~"x-from-mw", ~"yes"} | H]})
-    end,
+    Mw =
+        {
+            fun(R, Next, _State) ->
+                H = maps:get(headers, R),
+                Next(R#{headers := [{~"x-from-mw", ~"yes"} | H]})
+            end,
+            undefined
+        },
     Handler = fun(R) ->
         {{200, [], roadrunner_req:header(~"x-from-mw", R)}, R}
     end,
@@ -51,10 +55,14 @@ compose_request_mutation_visible_to_handler_test() ->
 
 compose_response_wrapping_works_test() ->
     %% Middleware calls Next then transforms the response.
-    Mw = fun(R, Next) ->
-        {{S, H, B}, R2} = Next(R),
-        {{S, [{~"x-wrapped", ~"1"} | H], <<"[", B/binary, "]">>}, R2}
-    end,
+    Mw =
+        {
+            fun(R, Next, _State) ->
+                {{S, H, B}, R2} = Next(R),
+                {{S, [{~"x-wrapped", ~"1"} | H], <<"[", B/binary, "]">>}, R2}
+            end,
+            undefined
+        },
     Handler = fun(R) -> {{200, [], ~"hi"}, R} end,
     Pipeline = roadrunner_middleware:compose([Mw], Handler),
     {{Status, Headers, Body}, _Req2} = Pipeline(req()),
@@ -63,26 +71,65 @@ compose_response_wrapping_works_test() ->
 compose_two_middlewares_outer_wraps_inner_test() ->
     %% First middleware in the list runs OUTERMOST. It sees the response
     %% the second middleware (and ultimately the handler) produced.
-    Outer = fun(R, Next) ->
-        {{S, H, B}, R2} = Next(R),
-        {{S, H, <<"O(", B/binary, ")">>}, R2}
-    end,
-    Inner = fun(R, Next) ->
-        {{S, H, B}, R2} = Next(R),
-        {{S, H, <<"I(", B/binary, ")">>}, R2}
-    end,
+    Outer =
+        {
+            fun(R, Next, _State) ->
+                {{S, H, B}, R2} = Next(R),
+                {{S, H, <<"O(", B/binary, ")">>}, R2}
+            end,
+            undefined
+        },
+    Inner =
+        {
+            fun(R, Next, _State) ->
+                {{S, H, B}, R2} = Next(R),
+                {{S, H, <<"I(", B/binary, ")">>}, R2}
+            end,
+            undefined
+        },
     Handler = fun(R) -> {{200, [], ~"x"}, R} end,
     Pipeline = roadrunner_middleware:compose([Outer, Inner], Handler),
     {{Status, Headers, Body}, _Req2} = Pipeline(req()),
     ?assertEqual({200, [], ~"O(I(x))"}, {Status, Headers, Body}).
 
-compose_module_form_dispatches_via_call2_test() ->
+compose_module_form_dispatches_via_call3_test() ->
+    %% `{Mod, State}` dispatches to the behaviour `call/3` with State.
     Handler = fun(R) ->
         {{200, [], roadrunner_req:header(~"x-mw-mod", R)}, R}
     end,
-    Pipeline = roadrunner_middleware:compose([roadrunner_test_middlewares], Handler),
+    Pipeline = roadrunner_middleware:compose(
+        [{roadrunner_test_middlewares, ~"yes"}], Handler
+    ),
     {{Status, Headers, Body}, _Req2} = Pipeline(req()),
     ?assertEqual({200, [], ~"yes"}, {Status, Headers, Body}).
+
+compose_fun_form_threads_state_test() ->
+    %% A `{fun/3, State}` entry receives its State as the third argument.
+    Mw =
+        {
+            fun(R, Next, S) ->
+                {{St, H, B}, R2} = Next(R),
+                {{St, [{~"x-state", S} | H], B}, R2}
+            end,
+            ~"xyz"
+        },
+    Handler = fun(R) -> {{200, [], ~"ok"}, R} end,
+    Pipeline = roadrunner_middleware:compose([Mw], Handler),
+    {{200, Headers, _Body}, _Req2} = Pipeline(req()),
+    ?assertEqual(~"xyz", proplists:get_value(~"x-state", Headers)).
+
+compose_same_module_twice_with_different_state_test() ->
+    %% The headline benefit: the same module listed twice, each carrying
+    %% its own State. Outermost ({Mod, ~"a"}) prepends first, then the
+    %% inner ({Mod, ~"b"}) prepends, so the handler sees [b, a].
+    Mod = roadrunner_test_middlewares,
+    Handler = fun(R) ->
+        Vals = [V || {~"x-mw-mod", V} <- maps:get(headers, R)],
+        {{200, [], iolist_to_binary(lists:join(~",", Vals))}, R}
+    end,
+    Pipeline = roadrunner_middleware:compose([{Mod, ~"a"}, {Mod, ~"b"}], Handler),
+    {{200, [], Body}, _Req2} = Pipeline(req()),
+    ?assertEqual(~"b,a", Body).
 
 %% =============================================================================
 %% End-to-end through roadrunner_conn — exercises the map-shape route's
@@ -99,8 +146,8 @@ route_middlewares_run_before_handler_test_() ->
                         path => ~"/echo",
                         handler => roadrunner_echo_headers_handler,
                         middlewares => [
-                            fun roadrunner_test_middlewares:tag_request/2,
-                            roadrunner_test_middlewares
+                            {fun roadrunner_test_middlewares:tag_request/3, undefined},
+                            {roadrunner_test_middlewares, ~"yes"}
                         ]
                     }
                 ]
@@ -124,7 +171,7 @@ route_middleware_can_halt_test_() ->
                     #{
                         path => ~"/secret",
                         handler => roadrunner_echo_headers_handler,
-                        middlewares => [fun roadrunner_test_middlewares:halt_401/2]
+                        middlewares => [{fun roadrunner_test_middlewares:halt_401/3, undefined}]
                     }
                 ]
             }),
@@ -146,7 +193,9 @@ route_middleware_can_wrap_response_test_() ->
                     #{
                         path => ~"/wrapped",
                         handler => roadrunner_echo_headers_handler,
-                        middlewares => [fun roadrunner_test_middlewares:wrap_response/2]
+                        middlewares => [
+                            {fun roadrunner_test_middlewares:wrap_response/3, undefined}
+                        ]
                     }
                 ]
             }),
@@ -171,7 +220,7 @@ route_middleware_crash_returns_500_test_() ->
                     #{
                         path => ~"/boom",
                         handler => roadrunner_echo_headers_handler,
-                        middlewares => [fun roadrunner_test_middlewares:crash/2]
+                        middlewares => [{fun roadrunner_test_middlewares:crash/3, undefined}]
                     }
                 ]
             }),
@@ -199,7 +248,7 @@ listener_middleware_runs_without_router_test_() ->
             {ok, _} = roadrunner_listener:start_link(mw_test_listener, #{
                 port => 0,
                 routes => roadrunner_echo_headers_handler,
-                middlewares => [fun roadrunner_test_middlewares:tag_request/2]
+                middlewares => [{fun roadrunner_test_middlewares:tag_request/3, undefined}]
             }),
             roadrunner_listener:port(mw_test_listener)
         end,
@@ -216,12 +265,12 @@ listener_middleware_runs_outside_route_middleware_test_() ->
         fun() ->
             {ok, _} = roadrunner_listener:start_link(mw_test_combo, #{
                 port => 0,
-                middlewares => [fun roadrunner_test_middlewares:wrap_response/2],
+                middlewares => [{fun roadrunner_test_middlewares:wrap_response/3, undefined}],
                 routes => [
                     #{
                         path => ~"/x",
                         handler => roadrunner_echo_headers_handler,
-                        middlewares => [fun roadrunner_test_middlewares:tag_request/2]
+                        middlewares => [{fun roadrunner_test_middlewares:tag_request/3, undefined}]
                     }
                 ]
             }),

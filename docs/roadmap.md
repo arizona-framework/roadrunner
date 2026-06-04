@@ -312,7 +312,7 @@ multiplex methods downstream.
 **What:** Phoenix-style scope / pipeline:
 
 ```erlang
-[#{prefix => ~"/api", middlewares => [auth_mw], routes => [
+[#{prefix => ~"/api", middlewares => [{auth_mw, undefined}], routes => [
     #{path => ~"/users/:id", handler => users_show},
     #{path => ~"/posts/:id", handler => posts_show}
  ]}]
