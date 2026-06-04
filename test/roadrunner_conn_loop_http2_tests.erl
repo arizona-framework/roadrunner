@@ -22,6 +22,8 @@ all_test_() ->
         fun bad_preface_closes_connection/0,
         fun non_settings_first_frame_triggers_goaway/0,
         fun full_get_request_returns_response/0,
+        fun buffered_response_strips_connection_specific_fields/0,
+        fun streaming_response_strips_connection_specific_fields/0,
         fun head_request_omits_body/0,
         fun all_frame_types_handled/0,
         fun goaway_received_closes_connection/0,
@@ -258,6 +260,68 @@ full_get_request_returns_response() ->
     {ok, {data, 1, DataFlags, _Body, _}, _} =
         roadrunner_http2_frame:parse(AfterHeaders, 16384),
     ?assertNotEqual(0, DataFlags band 16#01),
+    cleanup(Pid, Ref).
+
+buffered_response_strips_connection_specific_fields() ->
+    %% RFC 9113 §8.2.2: h2 MUST NOT generate connection-specific fields.
+    %% The hello handler sets `connection: close` (idiomatic on h1); it is
+    %% stripped from the buffered (HEADERS + DATA atomic) response.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _InitialSettings = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ServerAck = expect_send(),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {HpackBlock, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"localhost"},
+            {~":path", ~"/"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(HpackBlock),
+    HeadersFrame = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, HeadersFrame),
+    Response1 = expect_send(),
+    Response2 = drain_send(50),
+    AllResponse =
+        case Response2 of
+            undefined -> Response1;
+            _ -> <<Response1/binary, Response2/binary>>
+        end,
+    Dec0 = roadrunner_http2_hpack:new_decoder(4096),
+    {ok, {headers, 1, _, _, RespHpack}, _} =
+        roadrunner_http2_frame:parse(AllResponse, 16384),
+    {ok, RespHeaders, _} = roadrunner_http2_hpack:decode(RespHpack, Dec0),
+    ?assertEqual(~"200", proplists:get_value(~":status", RespHeaders)),
+    ?assertEqual(undefined, proplists:get_value(~"connection", RespHeaders)),
+    cleanup(Pid, Ref).
+
+streaming_response_strips_connection_specific_fields() ->
+    %% RFC 9113 §8.2.2: connection-specific fields are stripped from both
+    %% the streaming response's HEADERS and its trailers; the legit
+    %% `x-checksum` trailer rides through.
+    {Pid, Ref} = run_stream_request(~"/stream/strip"),
+    Bin = collect_send_bytes(<<>>),
+    Dec0 = roadrunner_http2_hpack:new_decoder(4096),
+    {ok, {headers, 1, _, _, StatusHpack}, Rest1} =
+        roadrunner_http2_frame:parse(Bin, 16384),
+    {ok, StatusHeaders, Dec1} = roadrunner_http2_hpack:decode(StatusHpack, Dec0),
+    ?assertEqual(~"200", proplists:get_value(~":status", StatusHeaders)),
+    ?assertEqual(undefined, proplists:get_value(~"connection", StatusHeaders)),
+    {ok, {data, 1, _, _Body, _}, Rest2} =
+        roadrunner_http2_frame:parse(Rest1, 16384),
+    {ok, {headers, 1, _, _, TrailerHpack}, _} =
+        roadrunner_http2_frame:parse(Rest2, 16384),
+    {ok, TrailerHeaders, _} = roadrunner_http2_hpack:decode(TrailerHpack, Dec1),
+    ?assertEqual(undefined, proplists:get_value(~"connection", TrailerHeaders)),
+    ?assertEqual(~"deadbeef", proplists:get_value(~"x-checksum", TrailerHeaders)),
     cleanup(Pid, Ref).
 
 head_request_omits_body() ->

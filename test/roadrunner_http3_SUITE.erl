@@ -24,7 +24,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     large_post/1,
     not_found/1,
     crash_500/1,
-    forbidden_response_header_500/1,
+    forbidden_response_header_stripped/1,
     unsafe_response_header_500/1,
     unsupported_shapes_501/1,
     loop_response/1,
@@ -33,7 +33,8 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     stream_response/1,
     stream_trailers/1,
     stream_autoclose/1,
-    stream_forbidden_header_500/1,
+    stream_forbidden_header_stripped/1,
+    stream_forbidden_trailer_stripped/1,
     stream_unsafe_header_500/1,
     stream_trailer_injection_aborts/1,
     sendfile_empty/1,
@@ -89,7 +90,7 @@ all() ->
         large_post,
         not_found,
         crash_500,
-        forbidden_response_header_500,
+        forbidden_response_header_stripped,
         unsafe_response_header_500,
         unsupported_shapes_501,
         loop_response,
@@ -98,7 +99,8 @@ all() ->
         stream_response,
         stream_trailers,
         stream_autoclose,
-        stream_forbidden_header_500,
+        stream_forbidden_header_stripped,
+        stream_forbidden_trailer_stripped,
         stream_unsafe_header_500,
         stream_trailer_injection_aborts,
         sendfile_empty,
@@ -283,13 +285,14 @@ crash_500(Config) ->
     ?assertMatch({500, _}, status_body(get(Conn, ~"/crash"))),
     close(Conn).
 
-forbidden_response_header_500(Config) ->
-    %% A handler returning any connection-specific header is rejected
-    %% (RFC 9114 §4.2): the client sees 500 and the connection survives.
+forbidden_response_header_stripped(Config) ->
+    %% A handler returning any connection-specific header has it stripped
+    %% (RFC 9114 §4.2): the client sees a clean 200 without the field.
     Conn = connect(?config(port, Config)),
     lists:foreach(
         fun(Name) ->
-            ?assertMatch({500, _}, status_body(get(Conn, <<"/forbidden/", Name/binary>>)))
+            {200, Headers, ~"x"} = get(Conn, <<"/forbidden/", Name/binary>>),
+            ?assertEqual(false, lists:keymember(Name, 1, Headers))
         end,
         [~"connection", ~"keep-alive", ~"proxy-connection", ~"transfer-encoding", ~"upgrade"]
     ),
@@ -407,11 +410,19 @@ stream_autoclose(Config) ->
     ?assertEqual({200, ~"data"}, status_body(get(Conn, ~"/stream-noend"))),
     close(Conn).
 
-stream_forbidden_header_500(Config) ->
-    %% A streaming response carrying a connection-specific header is
-    %% rejected with 500 (RFC 9114 §4.2), same as the buffered path.
+stream_forbidden_header_stripped(Config) ->
+    %% A streaming response carrying a connection-specific header has it
+    %% stripped (RFC 9114 §4.2), same as the buffered path.
     Conn = connect(?config(port, Config)),
-    ?assertMatch({500, _}, status_body(get(Conn, ~"/stream-forbidden"))),
+    {200, Headers, ~"x"} = get(Conn, ~"/stream-forbidden"),
+    ?assertEqual(false, lists:keymember(~"connection", 1, Headers)),
+    close(Conn).
+
+stream_forbidden_trailer_stripped(Config) ->
+    %% A connection-specific field in a response trailer is stripped
+    %% (RFC 9114 §4.2); a legitimate trailer rides through.
+    Conn = connect(?config(port, Config)),
+    {200, _Headers, ~"body"} = get(Conn, ~"/stream-forbidden-trailers"),
     close(Conn).
 
 stream_unsafe_header_500(Config) ->
