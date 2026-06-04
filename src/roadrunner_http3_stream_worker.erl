@@ -338,6 +338,11 @@ stream_send(Conn, StreamId, Data, fin) ->
     put(?FIN_KEY, true),
     quic:send_data(Conn, StreamId, data_frame(Data, iolist_size(Data)), true);
 stream_send(Conn, StreamId, Data, {fin, Trailers}) ->
+    %% Trailers go out after the status + body, so an injected one cannot
+    %% become a 500; crash on the RFC 9110 §5.5 check before writing the
+    %% frame so the conn loop resets the stream and the malformed bytes
+    %% never reach the client, the same cut-off h1 does for chunked trailers.
+    ok = roadrunner_http:check_headers_safe(Trailers),
     put(?FIN_KEY, true),
     TrailersFrame = quic_h3_frame:encode_headers(quic_qpack:encode(Trailers)),
     quic:send_data(Conn, StreamId, [data_frame(Data, iolist_size(Data)), TrailersFrame], true).

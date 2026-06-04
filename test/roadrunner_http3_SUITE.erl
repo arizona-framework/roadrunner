@@ -35,6 +35,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     stream_autoclose/1,
     stream_forbidden_header_500/1,
     stream_unsafe_header_500/1,
+    stream_trailer_injection_aborts/1,
     sendfile_empty/1,
     sendfile_small/1,
     sendfile_large/1,
@@ -99,6 +100,7 @@ all() ->
         stream_autoclose,
         stream_forbidden_header_500,
         stream_unsafe_header_500,
+        stream_trailer_injection_aborts,
         sendfile_empty,
         sendfile_small,
         sendfile_large,
@@ -418,6 +420,29 @@ stream_unsafe_header_500(Config) ->
     Conn = connect(?config(port, Config)),
     ?assertMatch({500, _}, status_body(get(Conn, ~"/stream-inject"))),
     close(Conn).
+
+stream_trailer_injection_aborts(Config) ->
+    %% Wire-level proof that a CR/LF in a response trailer never reaches the
+    %% wire. A raw client reads the server's actual stream bytes: with the
+    %% check the server sends the 200 HEADERS then RESETS the stream, so the
+    %% malformed value ("a\r\nb" = <<97,13,10,98>>) is never emitted; without
+    %% it, QPACK encodes those bytes into a trailer frame and the stream
+    %% finishes cleanly. The conformant `quic_h3` client cannot show this --
+    %% it rejects the bad field either way -- so this drives a raw client.
+    Conn = ll_connect(?config(port, Config)),
+    try
+        {ok, StreamId} = quic:open_stream(Conn),
+        Block = quic_qpack:encode(headers(~"GET", ~"/stream-bad-trailers")),
+        ok = quic:send_data(Conn, StreamId, quic_h3_frame:encode_headers(Block), true),
+        Result = ll_collect_until_end(Conn, StreamId, <<>>),
+        %% The server aborts the stream rather than completing it normally,
+        ?assertMatch({reset, _, _}, Result),
+        {reset, _ErrorCode, Bytes} = Result,
+        %% and the malformed trailer value never appears on the wire.
+        ?assertEqual(nomatch, binary:match(Bytes, <<$a, $\r, $\n, $b>>))
+    after
+        ll_close(Conn)
+    end.
 
 oversized_413(_Config) ->
     Name = listener_name(oversized_413),
@@ -1135,6 +1160,21 @@ ll_await_reset(Conn, StreamId) ->
         {quic, Conn, {stream_reset, StreamId, ErrorCode}} -> ErrorCode
     after 5000 ->
         ct:fail(no_stream_reset)
+    end.
+
+%% Read every byte the server writes on `StreamId` until it finishes the
+%% stream (`{fin, Bytes}`) or resets it (`{reset, ErrorCode, Bytes}`), so a
+%% test can inspect exactly what reached the wire.
+ll_collect_until_end(Conn, StreamId, Acc) ->
+    receive
+        {quic, Conn, {stream_data, StreamId, Bin, true}} ->
+            {fin, <<Acc/binary, Bin/binary>>};
+        {quic, Conn, {stream_data, StreamId, Bin, false}} ->
+            ll_collect_until_end(Conn, StreamId, <<Acc/binary, Bin/binary>>);
+        {quic, Conn, {stream_reset, StreamId, ErrorCode}} ->
+            {reset, ErrorCode, Acc}
+    after 5000 ->
+        ct:fail(no_stream_end)
     end.
 
 %% Spin until a `{loop, _}` handler registers `Name` (it does so from

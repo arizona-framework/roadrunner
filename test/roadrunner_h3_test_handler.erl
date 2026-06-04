@@ -58,6 +58,13 @@ handle(#{target := ~"/stream"} = Req) ->
     };
 handle(#{target := ~"/stream-trailers"} = Req) ->
     {{stream, 200, [], fun(Send) -> ok = Send(~"body", {fin, [{~"x-trailer", ~"v"}]}) end}, Req};
+handle(#{target := ~"/stream-bad-trailers"} = Req) ->
+    %% CR/LF in a trailer value → the injection check crashes mid-stream
+    %% (status already sent), so the conn loop resets the stream.
+    {
+        {stream, 200, [], fun(Send) -> ok = Send(~"body", {fin, [{~"x-trailer", ~"a\r\nb"}]}) end},
+        Req
+    };
 handle(#{target := ~"/stream-noend"} = Req) ->
     %% Returns without a `fin` — the framework auto-closes the stream.
     {{stream, 200, [], fun(Send) -> ok = Send(~"data", nofin) end}, Req};
