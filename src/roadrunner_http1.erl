@@ -19,6 +19,7 @@
     parse_chunk/2,
     parse_chunk/3,
     check_header_safe/2,
+    check_headers_safe/1,
     response/3,
     compute_cached_decisions/1
 ]).
@@ -939,6 +940,28 @@ check_header_safe(Bin, Kind, UnsafeCp) when is_binary(Bin) ->
         nomatch -> ok;
         _ -> error({header_injection, Kind, Bin})
     end.
+
+-doc """
+Run the header-injection check over every name and value in a header
+list, fetching the compiled unsafe-bytes pattern once and threading it
+through (vs `check_header_safe/2`, which fetches per call). Crashes with
+`{header_injection, Kind, Bin}` on the first unsafe byte.
+
+Public so the HTTP/2 response path, which emits headers via HPACK
+rather than `encode_headers/1`, runs the same single-fetch check.
+""".
+-spec check_headers_safe(headers()) -> ok.
+check_headers_safe(Headers) ->
+    check_headers_safe(Headers, persistent_term:get(?UNSAFE_BYTES_KEY)).
+
+%% Loop with the pre-fetched pattern.
+-spec check_headers_safe(headers(), binary:cp()) -> ok.
+check_headers_safe([], _UnsafeCp) ->
+    ok;
+check_headers_safe([{Name, Value} | Rest], UnsafeCp) ->
+    ok = check_header_safe(Name, name, UnsafeCp),
+    ok = check_header_safe(Value, value, UnsafeCp),
+    check_headers_safe(Rest, UnsafeCp).
 
 %% `-on_load` callback. Returns `ok` so module load succeeds; if the
 %% compile fails (it shouldn't — the pattern is a literal), the module
