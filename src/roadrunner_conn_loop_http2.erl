@@ -1320,7 +1320,7 @@ encode_and_send_headers(
     %% §8.1.2 (see `roadrunner_handler:response/0`). Bytes outside the
     %% RFC 9110 §5.5 field-value charset (CR/LF/NUL) crash here so the
     %% h2 path matches h1's `encode_headers/1` discipline.
-    ok = roadrunner_http1:check_headers_safe(Headers),
+    ok = roadrunner_http:check_headers_safe(Headers),
     AllHeaders =
         [{~":status", StatusBin} | roadrunner_http:auto_headers(Headers, State#loop.alt_svc)],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
@@ -1358,7 +1358,7 @@ encode_and_send_response_atomic(
     %% Names already lowercase per `roadrunner_handler:response/0` contract;
     %% reject CR/LF/NUL anywhere in the pair so they cannot reach the peer
     %% or split at an h2->h1 reverse proxy.
-    ok = roadrunner_http1:check_headers_safe(Headers),
+    ok = roadrunner_http:check_headers_safe(Headers),
     AllHeaders =
         [{~":status", StatusBin} | roadrunner_http:auto_headers(Headers, State#loop.alt_svc)],
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
@@ -1374,7 +1374,7 @@ encode_and_send_response_atomic(
 encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
     %% Trailer names already lowercase per `roadrunner_handler:response/0`;
     %% h1 trailers run the same check in `roadrunner_stream_response`.
-    ok = roadrunner_http1:check_headers_safe(Trailers),
+    ok = roadrunner_http:check_headers_safe(Trailers),
     {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(Trailers, Enc),
     Frame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04 bor 16#01, undefined, HpackBlock}

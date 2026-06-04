@@ -18,8 +18,6 @@
     parse_chunk/1,
     parse_chunk/2,
     parse_chunk/3,
-    check_header_safe/2,
-    check_headers_safe/1,
     response/3,
     compute_cached_decisions/1
 ]).
@@ -41,7 +39,6 @@
 %% We compile the patterns the parser uses repeatedly and stash them in
 %% `persistent_term` so each call reads a constant — `persistent_term:get/1`
 %% measured at the same speed as a bound variable.
--define(UNSAFE_BYTES_KEY, {?MODULE, unsafe_bytes_cp}).
 -define(LF_KEY, {?MODULE, lf_cp}).
 -define(CRLF_KEY, {?MODULE, crlf_cp}).
 -define(COLON_KEY, {?MODULE, colon_cp}).
@@ -897,81 +894,29 @@ status_line(Status) -> [~"HTTP/1.1 ", integer_to_binary(Status), ~" \r\n"].
 
 -spec encode_headers(headers()) -> iodata().
 encode_headers(Headers) ->
-    %% Fetch the unsafe-bytes pattern ONCE here and thread it through
-    %% the per-header injection check. Saves a `persistent_term:get/1`
-    %% per header (was 2 per header for name + value).
-    UnsafeCp = persistent_term:get(?UNSAFE_BYTES_KEY),
+    %% Fetch the shared unsafe-bytes pattern ONCE and thread it through
+    %% the fused injection-check + encode pass, so the whole header list
+    %% costs a single `persistent_term:get/1`.
+    UnsafeCp = roadrunner_http:unsafe_bytes_pattern(),
     encode_headers_loop(Headers, UnsafeCp).
 
 -spec encode_headers_loop(headers(), binary:cp()) -> iodata().
 encode_headers_loop([], _UnsafeCp) ->
     [];
 encode_headers_loop([{Name, Value} | Rest], UnsafeCp) ->
-    %% Defend against HTTP response splitting / header injection: any
-    %% CR, LF, or NUL in a header name or value would let an attacker
-    %% who controls part of either inject an entirely new header (or
-    %% terminate the header block early). Crash hard so a programmer
-    %% bug — usually echoing user input into a header without
-    %% validation — turns into a 500, not a wire-level vulnerability.
-    ok = check_header_safe(Name, name, UnsafeCp),
-    ok = check_header_safe(Value, value, UnsafeCp),
+    %% Reject CR/LF/NUL in a name or value: either would let an attacker
+    %% who controls part of it inject a new header or terminate the block
+    %% early. Crash hard so a handler echoing unvalidated user input into
+    %% a header turns into a 500, not a wire-level vulnerability.
+    ok = roadrunner_http:check_header_safe(Name, name, UnsafeCp),
+    ok = roadrunner_http:check_header_safe(Value, value, UnsafeCp),
     [Name, ~": ", Value, ~"\r\n" | encode_headers_loop(Rest, UnsafeCp)].
-
--doc """
-Validate that a header name or value contains no CR, LF, or NUL —
-the bytes that would let an attacker who controls the value inject
-new headers (or terminate the header block early). Crashes with
-`{header_injection, Kind, Bin}` when an unsafe byte is present.
-
-Public so other modules emitting headers (e.g. `roadrunner_conn` for
-chunked-response trailers) can run the same check before writing
-to the wire.
-""".
--spec check_header_safe(binary(), name | value) -> ok.
-check_header_safe(Bin, Kind) when is_binary(Bin) ->
-    check_header_safe(Bin, Kind, persistent_term:get(?UNSAFE_BYTES_KEY)).
-
-%% Internal entry that accepts a pre-fetched pattern. Used by
-%% `encode_headers/1` to avoid a `persistent_term:get/1` per
-%% (name, value) pair on the response hot path.
--spec check_header_safe(binary(), name | value, binary:cp()) -> ok.
-check_header_safe(Bin, Kind, UnsafeCp) when is_binary(Bin) ->
-    case binary:match(Bin, UnsafeCp) of
-        nomatch -> ok;
-        _ -> error({header_injection, Kind, Bin})
-    end.
-
--doc """
-Run the header-injection check over every name and value in a header
-list, fetching the compiled unsafe-bytes pattern once and threading it
-through (vs `check_header_safe/2`, which fetches per call). Crashes with
-`{header_injection, Kind, Bin}` on the first unsafe byte.
-
-Public so the HTTP/2 response path, which emits headers via HPACK
-rather than `encode_headers/1`, runs the same single-fetch check.
-""".
--spec check_headers_safe(headers()) -> ok.
-check_headers_safe(Headers) ->
-    check_headers_safe(Headers, persistent_term:get(?UNSAFE_BYTES_KEY)).
-
-%% Loop with the pre-fetched pattern.
--spec check_headers_safe(headers(), binary:cp()) -> ok.
-check_headers_safe([], _UnsafeCp) ->
-    ok;
-check_headers_safe([{Name, Value} | Rest], UnsafeCp) ->
-    ok = check_header_safe(Name, name, UnsafeCp),
-    ok = check_header_safe(Value, value, UnsafeCp),
-    check_headers_safe(Rest, UnsafeCp).
 
 %% `-on_load` callback. Returns `ok` so module load succeeds; if the
 %% compile fails (it shouldn't — the pattern is a literal), the module
 %% won't load and we'll see it loudly.
 -spec init_patterns() -> ok.
 init_patterns() ->
-    persistent_term:put(
-        ?UNSAFE_BYTES_KEY,
-        binary:compile_pattern([~"\r", ~"\n", ~"\0"])
-    ),
     persistent_term:put(?LF_KEY, binary:compile_pattern(~"\n")),
     persistent_term:put(?CRLF_KEY, binary:compile_pattern(~"\r\n")),
     persistent_term:put(?COLON_KEY, binary:compile_pattern(~":")),
