@@ -190,8 +190,10 @@ list, fetching the compiled unsafe-bytes pattern once and threading it
 through (vs `check_header_safe/2`, which fetches per call). Crashes with
 `{header_injection, Kind, Bin}` on the first unsafe byte.
 
-Public so each version's response path runs the same single-fetch
-check: h1 `roadrunner_http1:encode_headers/1` and the HTTP/2 conn loop.
+The list-validating entry for response paths that emit headers via a
+binary codec rather than the CRLF encoder: the HTTP/2 conn loop, and
+HTTP/3 once its check is wired. h1's CRLF encoder fuses the per-field
+check into its build pass instead, so it does not use this entry.
 """.
 -spec check_headers_safe(headers()) -> ok.
 check_headers_safe(Headers) ->
