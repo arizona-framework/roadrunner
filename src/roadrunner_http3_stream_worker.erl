@@ -185,26 +185,41 @@ emit_handler_response(Conn, StreamId, _Handler, {websocket, _, _}) ->
     pid(), non_neg_integer(), roadrunner_http:headers(), fun(() -> roadrunner_http:status())
 ) -> roadrunner_http:status().
 emit_checked(Conn, StreamId, Headers, Emit) ->
-    case roadrunner_http:first_unsafe_field(Headers) of
-        {unsafe, Kind} ->
-            reject_unsafe(Conn, StreamId, Kind);
-        ok ->
-            case forbidden_header(Headers) of
-                {true, Name} -> reject_forbidden(Conn, StreamId, Name);
-                false -> Emit()
-            end
+    case validate_response_headers(Headers) of
+        ok -> Emit();
+        {unsafe, Kind} -> reject_unsafe(Conn, StreamId, Kind);
+        {forbidden, Name} -> reject_forbidden(Conn, StreamId, Name)
     end.
 
-%% RFC 9114 §4.2 connection-specific header set. Function-clause
-%% dispatch (mirrors `roadrunner_http3_request:check_banned/1`) keeps it
-%% branch-friendly; returns the offending name for the log.
--spec forbidden_header(roadrunner_http:headers()) -> {true, binary()} | false.
-forbidden_header([]) ->
-    false;
-forbidden_header([{Name, _} | Rest]) ->
+%% One pass over the response headers, applying both gates per field: the
+%% RFC 9114 §4.2 connection-specific name set, and the RFC 9110 §5.5
+%% CR/LF/NUL field-byte check (the shared compiled pattern, fetched once).
+%% `is_forbidden_header/1` is function-clause dispatch (mirrors
+%% `roadrunner_http3_request:check_banned/1`); a forbidden name returns it
+%% for the log, an unsafe field returns only the kind (never raw bytes).
+-spec validate_response_headers(roadrunner_http:headers()) ->
+    ok | {unsafe, name | value} | {forbidden, binary()}.
+validate_response_headers(Headers) ->
+    validate_response_headers(Headers, roadrunner_http:unsafe_bytes_pattern()).
+
+-spec validate_response_headers(roadrunner_http:headers(), binary:cp()) ->
+    ok | {unsafe, name | value} | {forbidden, binary()}.
+validate_response_headers([], _UnsafeCp) ->
+    ok;
+validate_response_headers([{Name, Value} | Rest], UnsafeCp) ->
     case is_forbidden_header(Name) of
-        true -> {true, Name};
-        false -> forbidden_header(Rest)
+        true ->
+            {forbidden, Name};
+        false ->
+            case binary:match(Name, UnsafeCp) of
+                nomatch ->
+                    case binary:match(Value, UnsafeCp) of
+                        nomatch -> validate_response_headers(Rest, UnsafeCp);
+                        _ -> {unsafe, value}
+                    end;
+                _ ->
+                    {unsafe, name}
+            end
     end.
 
 -spec is_forbidden_header(binary()) -> boolean().
