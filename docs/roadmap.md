@@ -464,6 +464,44 @@ deployment reports clients retry-storming a refused port.
 **Scope:** small-medium. Reuses the existing slot counters; the work is
 the soft-threshold check and the 503 path on the conn loop.
 
+## Deferred to the application layer
+
+Capabilities that are real, but sit above the HTTP server core: in
+whatever application, framework, or library runs on top of roadrunner.
+That could be a framework (Arizona is one), a third-party library, or the
+service's own code. Roadrunner deliberately stops at the HTTP layer and
+hands these up. It supplies the mechanism, an ordered middleware slot,
+immutable request and response values, and `telemetry` events; the layer
+above supplies the policy and the ergonomics. Listed so the boundary is
+explicit.
+
+- **Identity, authorization, and sessions.** Token validation, session
+  cookies, and single sign-on (OIDC and the like) are application trust
+  policy. Roadrunner exposes the request (headers, cookies) and the
+  connection; a middleware above decides who a caller is and what they
+  may do.
+- **API description and input validation.** Generated schemas and docs
+  (OpenAPI and friends) and parse-and-validate-into-typed-values are
+  bound to the application's own routes and data shapes, which roadrunner
+  never sees; it dispatches opaque handlers.
+- **Application protocols layered on HTTP.** RPC, GraphQL, and agent/tool
+  surfaces (MCP and similar) are an application concern; the layer above
+  mounts them on ordinary roadrunner routes, no extra listener.
+- **Outbound requests.** A client (pooling, retries, circuit breaking,
+  load balancing) is not a server concern; it belongs with the
+  application's integrations.
+- **Observability backends.** Roadrunner emits `telemetry` events with
+  zero overhead when nothing is subscribed; exporting them as traces and
+  metrics to a chosen backend (OpenTelemetry, Prometheus, and the like)
+  is an integration the layer above wires up.
+- **Per-identity quotas and policy.** The application half of rate
+  limiting: who gets how much, keyed by authenticated identity.
+  Roadrunner keeps the connection-level abuse guard; the layer above owns
+  user-level quotas.
+- **Service lifecycle endpoints.** Readiness and health checks
+  (dependencies reachable, warm-up complete) are application-defined, a
+  single route handler above the server.
+
 ## Out of scope
 
 These are deliberately out of scope, not "deferred":
