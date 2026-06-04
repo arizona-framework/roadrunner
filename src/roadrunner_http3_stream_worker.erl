@@ -185,9 +185,14 @@ emit_handler_response(Conn, StreamId, _Handler, {websocket, _, _}) ->
     pid(), non_neg_integer(), roadrunner_http:headers(), fun(() -> roadrunner_http:status())
 ) -> roadrunner_http:status().
 emit_checked(Conn, StreamId, Headers, Emit) ->
-    case forbidden_header(Headers) of
-        {true, Name} -> reject_forbidden(Conn, StreamId, Name);
-        false -> Emit()
+    case roadrunner_http:first_unsafe_field(Headers) of
+        {unsafe, Kind} ->
+            reject_unsafe(Conn, StreamId, Kind);
+        ok ->
+            case forbidden_header(Headers) of
+                {true, Name} -> reject_forbidden(Conn, StreamId, Name);
+                false -> Emit()
+            end
     end.
 
 %% RFC 9114 §4.2 connection-specific header set. Function-clause
@@ -220,6 +225,23 @@ reject_forbidden(Conn, StreamId, Name) ->
     logger:error(#{
         msg => "roadrunner h3 handler returned a connection-specific header",
         header => Name
+    }),
+    send_buffered(
+        Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
+    ),
+    500.
+
+%% RFC 9110 §5.5: a response header name or value containing CR, LF, or
+%% NUL is a handler bug (usually unvalidated user input echoed into a
+%% header) that would put malformed bytes on the wire, or split at a
+%% downstream h3->h1 reverse proxy. Answer 500 rather than emit it; only
+%% the kind is logged, never the raw bytes. Shared by every response
+%% shape via `emit_checked/4`.
+-spec reject_unsafe(pid(), non_neg_integer(), name | value) -> 500.
+reject_unsafe(Conn, StreamId, Kind) ->
+    logger:error(#{
+        msg => "roadrunner h3 handler returned a header with CR/LF/NUL",
+        kind => Kind
     }),
     send_buffered(
         Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"

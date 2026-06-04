@@ -32,7 +32,7 @@ accessors that operate on it.
 
 -export([http_date_now/0, format_http_date/1, with_date/1, auto_headers/2]).
 -export([header_list_size/1]).
--export([check_header_safe/2, check_header_safe/3, check_headers_safe/1]).
+-export([check_header_safe/2, check_header_safe/3, check_headers_safe/1, first_unsafe_field/1]).
 -export([unsafe_bytes_pattern/0]).
 
 -export_type([headers/0, status/0, redirect_status/0, version/0]).
@@ -207,6 +207,37 @@ check_headers_safe([{Name, Value} | Rest], UnsafeCp) ->
     ok = check_header_safe(Name, name, UnsafeCp),
     ok = check_header_safe(Value, value, UnsafeCp),
     check_headers_safe(Rest, UnsafeCp).
+
+-doc """
+Non-crashing form of the header-injection check: scan a header list and
+return `{unsafe, name | value}` for the first field whose name or value
+contains CR, LF, or NUL, or `ok` when all are clean. The kind (not the
+offending bytes) is returned so a caller logging the result cannot echo
+control bytes onto a log line.
+
+For response paths that must answer a clean error rather than crash, e.g.
+the HTTP/3 emit gate, whose `try ... of` body does not catch a raise.
+`check_headers_safe/1` is the crashing form, used where a crash is caught
+upstream (h1/h2).
+""".
+-spec first_unsafe_field(headers()) -> {unsafe, name | value} | ok.
+first_unsafe_field(Headers) ->
+    first_unsafe_field(Headers, persistent_term:get(?UNSAFE_BYTES_KEY)).
+
+%% Loop with the pre-fetched pattern.
+-spec first_unsafe_field(headers(), binary:cp()) -> {unsafe, name | value} | ok.
+first_unsafe_field([], _UnsafeCp) ->
+    ok;
+first_unsafe_field([{Name, Value} | Rest], UnsafeCp) ->
+    case binary:match(Name, UnsafeCp) of
+        nomatch ->
+            case binary:match(Value, UnsafeCp) of
+                nomatch -> first_unsafe_field(Rest, UnsafeCp);
+                _ -> {unsafe, value}
+            end;
+        _ ->
+            {unsafe, name}
+    end.
 
 %% The compiled CR/LF/NUL pattern, for a caller that runs the check in
 %% a loop and wants a single `persistent_term:get/1` for the whole list
