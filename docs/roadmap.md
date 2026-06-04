@@ -327,34 +327,6 @@ shared per-section middlewares (auth, rate limit, body-limit
 overrides) duplicated across many entries. Add when a real codebase
 shows that duplication.
 
-## Hot-path micro-optimizations
-
-A profiling + fresh-eyes review of the h1 / h2 / static request paths
-surfaced these repeated-work eliminations. Each is its own commit, validated
-by microbench / interleaved A/B / profile share (not headline req/s), per the
-rule that a perf win counts at any size only when it is constant,
-reproducible, and proven. Listed best-first.
-
-### Cache the static gzip-sibling stat + content-type in the metadata entry — small
-
-**What:** On the opt-in `cache_ttl_ms` path a cache hit still runs
-`file:read_file_info(<file>.gz)` on every request (`maybe_serve_gzip/4`) and
-recomputes `content_type_for/1`. Fold the gzip-sibling presence and size and
-the content-type binary into the `roadrunner_static_cache` tuple, populated
-on the cold lookup that already stats the main file, so a hit serves both
-with no extra syscall or recompute until the TTL expires.
-
-**Why deferred:** only affects the opt-in static cache path, and the saved
-`stat` is cheap relative to the sendfile that dominates static serving, so
-the win wants measuring before it ships. The cache then also assumes the
-`.gz` sibling is immutable for the TTL, the same assumption it already
-documents for the main file.
-
-**Validate:** `strace` stat-count per cache hit (expect 1 to 0) plus an
-interleaved A/B on a small-file gzip scenario.
-
-**Scope:** small.
-
 ## Out of scope
 
 These are deliberately out of scope, not "deferred":
