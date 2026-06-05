@@ -22,6 +22,29 @@ handful of opt-in helpers (cookies, qs, multipart, SSE, WebSocket).
 Modern OTP idioms throughout, with predictable per-connection
 lifecycle observability.
 
+## Why Roadrunner?
+
+A small, fast HTTP core you can trust on the hot path.
+
+- **Fast where it counts.** Tuned for low p50 and p99 under sustained load. See
+  [Performance at a glance](#performance-at-a-glance).
+- **Correct and hostile-input-safe.** Strict RFC 9110 / 9112 / 9113 parsing,
+  100% h2spec and 100% Autobahn (no exclusions), and stress-tested against
+  request-smuggling corpora. See [Conformance](#conformance).
+- **Every HTTP version, one server.** HTTP/1.1, HTTP/2, HTTP/3 (experimental),
+  and WebSocket served from one listener; browsers upgrade to h3 over the same
+  port via `Alt-Svc`.
+- **Pure Erlang, almost no dependencies.** One runtime dep (`telemetry`), no C
+  NIFs, and roadrunner owns its own h1/h2/h3 codecs: easy to read, easy to audit,
+  nothing to sprawl.
+- **Pleasant to build on.** Plain-Erlang request and response values, composable
+  middleware, and opt-in helpers for cookies, query strings, multipart, SSE, and
+  WebSocket.
+- **Production lifecycle in the box.** Graceful drain with a deadline, telemetry
+  events, per-request `request_id` log correlation, and configurable DoS bounds.
+
+Built to give you a fast, correct HTTP core you can build on with confidence.
+
 ## Requirements
 
 Requires **OTP 27+**.
