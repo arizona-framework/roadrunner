@@ -13,8 +13,8 @@ Pure-Erlang HTTP/1.1 + HTTP/2 + HTTP/3 + WebSocket server for Erlang/OTP.
 Roadrunner is the HTTP backbone of the
 [arizona-framework](https://github.com/arizona-framework/arizona), and works
 standalone too. The API is small: a handler behaviour, request and response
-accessors, listener controls, and opt-in helpers (cookies, qs, multipart, SSE,
-WebSocket).
+accessors, listener controls, and opt-in helpers (cookies, query strings,
+multipart, SSE, WebSocket).
 
 ## Why Roadrunner?
 
@@ -28,16 +28,15 @@ A small, fast HTTP core you can trust on the hot path.
 - **Every HTTP version, one server.** HTTP/1.1, HTTP/2, HTTP/3 (experimental),
   and WebSocket served from one listener; browsers upgrade to h3 over the same
   port via `Alt-Svc`.
-- **Pure Erlang, almost no dependencies.** One runtime dep (`telemetry`), no C
-  NIFs, and roadrunner owns its own h1/h2/h3 codecs: easy to read, easy to audit,
-  nothing to sprawl.
+- **Pure Erlang, almost no dependencies.** Two runtime deps (`telemetry` and
+  `quic`, the HTTP/3 transport), no C NIFs, and Roadrunner owns its own
+  h1/h2/h3 codecs: easy to read and audit. `quic` only starts for HTTP/3, so
+  h1/h2 deployments never load it.
 - **Pleasant to build on.** Plain-Erlang request and response values, composable
   middleware, and opt-in helpers for cookies, query strings, multipart, SSE, and
   WebSocket.
 - **Production lifecycle in the box.** Graceful drain with a deadline, telemetry
   events, per-request `request_id` log correlation, and configurable DoS bounds.
-
-Built to give you a fast, correct HTTP core you can build on with confidence.
 
 ## Requirements
 
@@ -51,7 +50,7 @@ in your deps if you need stability across upgrades.
 
 ## Conformance
 
-Strict 100 % h2spec (HTTP/2) and Autobahn fuzzingclient across the full
+Strict 100% h2spec (HTTP/2) and Autobahn fuzzingclient across the full
 WebSocket matrix (no exclusions). HTTP/1.1 parsers stress-tested against
 the [llhttp](https://github.com/nodejs/llhttp) test corpus and the
 canonical [PortSwigger](https://portswigger.net/web-security/request-smuggling)
@@ -105,11 +104,10 @@ and [`docs/comparison.md`](https://github.com/arizona-framework/roadrunner/blob/
 | `websocket_msg_throughput`|   **232 k**   |       179 k   |          —    |
 | `gzip_response`           |   **138 k**   |       111 k   |          —    |
 
-Bold = fastest in row. `—` means the elli fixture doesn't expose
-that workload (no router, no gzip middleware, no WebSocket, no
-streaming-POST endpoint). On simple GETs and small POSTs
-Roadrunner and elli are within the bench's ~15 % variance band on
-those rows; the comparison doc has the full honest framing.
+Bold = fastest in row. `—` means that workload has no elli fixture. On
+simple GETs and small POSTs Roadrunner and elli sit within the bench's
+~15% variance band on those rows; the comparison doc has the full
+methodology.
 
 ### Tail latency at sustained load
 
@@ -189,6 +187,56 @@ content-length: 18
 hello, roadrunner!
 ```
 
+A handler is a module with `handle/1`. To read path parameters from a `:param`
+route (`roadrunner_req:bindings/1`), read the body (`read_body/1` returns
+`iodata` and threads `Req2` back), and reply with JSON
+(`roadrunner_resp:json/2` encodes the term):
+
+```erlang
+-module(users_handler).
+-behaviour(roadrunner_handler).
+-export([handle/1]).
+
+handle(Req) ->
+    #{~"id" := Id} = roadrunner_req:bindings(Req),
+    {ok, Body, Req2} = roadrunner_req:read_body(Req),
+    Reply = #{id => Id, received => byte_size(iolist_to_binary(Body))},
+    {roadrunner_resp:json(200, Reply), Req2}.
+```
+
+Mix literal and `:param` routes:
+
+```erlang
+routes => [
+    {~"/", hello_handler, #{greeting => ~"hi"}},
+    {~"/users/:id", users_handler, undefined}
+]
+```
+
+The request accessors (`method/1`, `path/1`, `header/2`, `parse_qs/1`,
+`bindings/1`, `peer/1`, `read_body/1`) all live in `roadrunner_req`.
+
+To wrap every response, register a middleware. An entry is a `Callable` or a
+`{Callable, State}` pair, and the first in the list runs outermost:
+
+```erlang
+-module(server_header_mw).
+-behaviour(roadrunner_middleware).
+-export([call/3]).
+
+call(Req, Next, _State) ->
+    {{Status, Headers, Body}, Req2} = Next(Req),
+    {{Status, [{~"server", ~"roadrunner"} | Headers], Body}, Req2}.
+```
+
+```erlang
+roadrunner:start_listener(api, #{
+    port => 8080,
+    middlewares => [server_header_mw],
+    routes => [{~"/", hello_handler, #{greeting => ~"hi"}}]
+}).
+```
+
 For HTTP/2 over TLS, add a cert and list both protocols. ALPN is
 derived from `protocols` automatically:
 
@@ -260,7 +308,7 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
 - **Buffered responses:** `{Status, Headers, Body}` — `roadrunner_resp:text/2`,
   `:html/2`, `:json/2`, `:redirect/2`, plus empty-status shortcuts.
 - **Streaming:** `{stream, Status, Headers, Fun}` — chunked transfer with a
-  `Send/2` callback; supports trailer headers per RFC 7230 §4.1.2.
+  `Send/2` callback; supports trailer headers per RFC 9112 §7.1.2.
 - **Loop / SSE:** `{loop, Status, Headers, State}` + optional
   `handle_info/3` callback for message-driven push.
 - **WebSocket:** `{websocket, Module, State}` upgrade with
@@ -366,12 +414,12 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
   `{Callable, State}`, invoked as `call(Req, Next, State)`; composable at
   listener and per-route level, outermost first.
 - **Telemetry over custom callbacks.** `telemetry` is the de facto
-  standard (Phoenix, Ecto, gleam_otp); zero-overhead when no subscribers,
-  and integrates with Prometheus / OpenTelemetry / Datadog through the
-  telemetry ecosystem.
-- **No external deps unless stdlib genuinely can't.** Only runtime dep
-  is `telemetry` (tiny, no transitive deps); only dev-time dep is the
-  `erlfmt` plugin.
+  standard (Phoenix, Ecto, gleam_otp); no dispatch overhead when nothing is
+  subscribed, and integrates with Prometheus / OpenTelemetry / Datadog through
+  the telemetry ecosystem.
+- **No external deps unless stdlib genuinely can't.** Runtime deps are
+  `telemetry` (tiny, no transitive deps) and `quic` (the pure-Erlang HTTP/3
+  transport, started on demand); the only dev-time dep is the `erlfmt` plugin.
 
 ## Sponsors
 
