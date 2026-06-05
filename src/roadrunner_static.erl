@@ -538,7 +538,6 @@ target_inside_docroot(FilePath, Req) ->
     %% we let a TOCTOU race (symlink removed between the two stats)
     %% crash and bubble up as a 500 instead of silently 404'ing.
     {ok, Target} = file:read_link(FilePath),
-    #{dir := Dir} = roadrunner_req:state(Req),
     case filename:pathtype(Target) of
         relative ->
             %% A relative target without any `..` segments must land
@@ -555,6 +554,7 @@ target_inside_docroot(FilePath, Req) ->
             %% to make `string:prefix/2` an exact directory check
             %% rather than a sibling-prefix false positive. `string:prefix/2`
             %% accepts chardata, so neither argument needs flattening.
+            #{dir := Dir} = roadrunner_req:state(Req),
             string:prefix(Target, [filename:absname(Dir), $/]) =/= nomatch
     end.
 
