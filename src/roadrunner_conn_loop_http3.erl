@@ -170,11 +170,7 @@ start(ConnPid, ProtoOpts) ->
 
 -doc false.
 -spec init(pid(), roadrunner_conn:proto_opts()) -> ok.
-init(Conn, ProtoOpts) ->
-    #{
-        listener_name := ListenerName,
-        max_content_length := MaxContentLength
-    } = ProtoOpts,
+init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLength} = ProtoOpts) ->
     proc_lib:set_label({roadrunner_conn_loop_http3, ListenerName, Conn}),
     %% The `max_clients` slot was acquired by `start/2` (in the listener
     %% process); it is released in `terminate/1`.

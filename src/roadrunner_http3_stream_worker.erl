@@ -57,28 +57,26 @@ at the connection / stream level, not by crashing this worker).
 """.
 -spec start(pid(), non_neg_integer(), roadrunner_req:request(), roadrunner_conn:proto_opts()) ->
     {pid(), reference()}.
-start(Conn, StreamId, Req, ProtoOpts) ->
-    #{handler_spawn_opts := SpawnOpts} = ProtoOpts,
-    spawn_opt(?MODULE, init, [Conn, StreamId, Req, ProtoOpts], [monitor | SpawnOpts]).
+start(Conn, StreamId, Req, #{handler_spawn_opts := SpawnOpts, dispatch := Dispatch}) ->
+    spawn_opt(?MODULE, init, [Conn, StreamId, Req, Dispatch], [monitor | SpawnOpts]).
 
 -doc false.
--spec init(pid(), non_neg_integer(), roadrunner_req:request(), roadrunner_conn:proto_opts()) -> ok.
-init(Conn, StreamId, Req, ProtoOpts) ->
+-spec init(pid(), non_neg_integer(), roadrunner_req:request(), roadrunner_conn:dispatch()) -> ok.
+init(Conn, StreamId, Req, Dispatch) ->
     proc_lib:set_label({roadrunner_http3_stream_worker, StreamId}),
     %% Attach request-scoped logger metadata so any `?LOG_*` from
     %% middleware/handlers is auto-correlated by `request_id` — the
     %% handler runs in this worker, not on the conn loop.
     ok = roadrunner_conn:set_request_logger_metadata(Req),
-    run_handler(Conn, StreamId, Req, ProtoOpts),
+    run_handler(Conn, StreamId, Req, Dispatch),
     ok.
 
--spec run_handler(pid(), non_neg_integer(), roadrunner_req:request(), roadrunner_conn:proto_opts()) ->
+-spec run_handler(pid(), non_neg_integer(), roadrunner_req:request(), roadrunner_conn:dispatch()) ->
     ok.
-run_handler(Conn, StreamId, Req, ProtoOpts) ->
+run_handler(Conn, StreamId, Req, Dispatch) ->
     %% `dispatch` is set by listener init and always present; the
     %% matched route's `Pipeline` is the pre-composed `next()` fun
     %% built once at compile / `reload_routes/2` time.
-    #{dispatch := Dispatch} = ProtoOpts,
     Metadata = telemetry_metadata(Req),
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of

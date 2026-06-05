@@ -207,7 +207,16 @@ run(Socket, Req, Mod, State, Buffered, ProtoOpts) ->
     binary(),
     roadrunner_conn:proto_opts()
 ) -> ok.
-run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts) ->
+run_session(
+    Socket,
+    Req,
+    Mod,
+    State,
+    UpgradeResp,
+    Negotiated,
+    Buffered,
+    #{handler_spawn_opts := SpawnOpts, handler_start_timeout := StartTimeout} = ProtoOpts
+) ->
     Ctx = ws_context(Req, Mod),
     %% Start the gen_statem **before** writing the 101 to the wire so a
     %% start failure never leaves the upgrade response sent with no
@@ -215,7 +224,6 @@ run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpt
     %% conn is intentionally unlinked from its children so a session
     %% crash never propagates to the conn process. We synchronise via
     %% a monitor instead.
-    #{handler_spawn_opts := SpawnOpts, handler_start_timeout := StartTimeout} = ProtoOpts,
     StartOpts = [{spawn_opt, SpawnOpts}, {timeout, StartTimeout}],
     case
         gen_statem:start(

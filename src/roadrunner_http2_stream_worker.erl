@@ -58,13 +58,12 @@ stream's id, leaving the other 99 streams intact.
 """.
 -spec start(pid(), pos_integer(), roadrunner_req:request(), map()) ->
     {pid(), reference()}.
-start(ConnPid, StreamId, Req, ProtoOpts) ->
-    #{handler_spawn_opts := SpawnOpts} = ProtoOpts,
-    spawn_opt(?MODULE, init, [ConnPid, StreamId, Req, ProtoOpts], [monitor | SpawnOpts]).
+start(ConnPid, StreamId, Req, #{handler_spawn_opts := SpawnOpts, dispatch := Dispatch}) ->
+    spawn_opt(?MODULE, init, [ConnPid, StreamId, Req, Dispatch], [monitor | SpawnOpts]).
 
 -doc false.
--spec init(pid(), pos_integer(), roadrunner_req:request(), map()) -> ok.
-init(ConnPid, StreamId, Req, ProtoOpts) ->
+-spec init(pid(), pos_integer(), roadrunner_req:request(), roadrunner_conn:dispatch()) -> ok.
+init(ConnPid, StreamId, Req, Dispatch) ->
     proc_lib:set_label({roadrunner_http2_stream_worker, StreamId}),
     %% Mirror the h1 path: attach request-scoped metadata so any
     %% `?LOG_*` from middleware/handlers is auto-correlated by
@@ -76,20 +75,19 @@ init(ConnPid, StreamId, Req, ProtoOpts) ->
     %% dies, instead of blocking on an ack that never comes until TCP
     %% teardown reaps the worker.
     _ = roadrunner_http2_worker_sync:monitor_conn(ConnPid),
-    run_handler(ConnPid, StreamId, Req, ProtoOpts),
+    run_handler(ConnPid, StreamId, Req, Dispatch),
     %% No explicit completion message: the worker is spawn_monitored by
     %% the conn, which finalises the stream on the worker's `DOWN`
     %% (`normal` -> clean removal, anything else -> RST_STREAM).
     ok.
 
-run_handler(ConnPid, StreamId, Req, ProtoOpts) ->
+run_handler(ConnPid, StreamId, Req, Dispatch) ->
     %% `dispatch` is set by listener init and always present. The
     %% matched route's `Pipeline` is a pre-composed `next()` fun
     %% (listener mws ++ per-route mws, with `state` injected up front
     %% if attached, ending in `fun Handler:handle/1`), built once at
     %% compile / `reload_routes/2` time — we just call it with the
     %% request, no per-request closure allocation.
-    #{dispatch := Dispatch} = ProtoOpts,
     Metadata = telemetry_metadata(Req),
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of

@@ -130,13 +130,14 @@
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
     {ok, pid()}.
-start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
+start(
+    Socket, #{handler_spawn_opts := SpawnOpts, handler_start_timeout := StartTimeout} = ProtoOpts
+) ->
     %% Unlinked from the acceptor — a single-conn crash never propagates
     %% to the acceptor pool. Mirrors `gen_statem:start/3` (NOT start_link)
     %% so existing acceptor handoff (`controlling_process` then `! shoot`)
     %% works without modification.
     Parent = self(),
-    #{handler_spawn_opts := SpawnOpts, handler_start_timeout := StartTimeout} = ProtoOpts,
     proc_lib:start(?MODULE, init_loop, [Parent, Socket, ProtoOpts], StartTimeout, SpawnOpts).
 
 -doc false.
