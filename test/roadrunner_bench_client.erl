@@ -27,8 +27,7 @@ percentiles).
 The previous attempt at this stalled because of a server-side
 TCP Nagle interaction that capped h2 keep-alive latency at ~50
 ms. That's now fixed at the listener layer
-(`roadrunner_listener:base_listen_opts/0`) — see
-`docs/h2_loadgen_artifact.md`.
+(`roadrunner_listener:base_listen_opts/0`).
 """.
 
 -export([open/3, request/5, request_many/2, close/1]).
