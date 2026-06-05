@@ -612,7 +612,7 @@ init(#{port := Port} = Opts) ->
     publish_routes(ListenerName, Opts),
     ProtoOpts = build_proto_opts(Opts, ListenerName),
     proc_lib:set_label({roadrunner_listener, ListenerName, Port}),
-    Protocols = maps:get(protocols, ProtoOpts),
+    #{protocols := Protocols} = ProtoOpts,
     %% TCP (`http1`/`http2`) and QUIC (`http3`) are independent
     %% transports that co-listen on the same port number. Bring up
     %% whichever the `protocols` list selects; an `http3`-only listener
@@ -1515,7 +1515,7 @@ do_drain(
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     Group = drain_group(ProtoOpts),
     notify_conns(Group, Deadline),
-    Counter = maps:get(client_counter, ProtoOpts),
+    #{client_counter := Counter} = ProtoOpts,
     Reply = wait_for_drain(Counter, Deadline, Group),
     %% Stop the QUIC listener LAST: `quic_listener:stop/1` kills the
     %% connections it `start_link`ed (and the h3 conn loops linked to

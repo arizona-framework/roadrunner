@@ -171,7 +171,10 @@ start(ConnPid, ProtoOpts) ->
 -doc false.
 -spec init(pid(), roadrunner_conn:proto_opts()) -> ok.
 init(Conn, ProtoOpts) ->
-    ListenerName = maps:get(listener_name, ProtoOpts),
+    #{
+        listener_name := ListenerName,
+        max_content_length := MaxContentLength
+    } = ProtoOpts,
     proc_lib:set_label({roadrunner_conn_loop_http3, ListenerName, Conn}),
     %% The `max_clients` slot was acquired by `start/2` (in the listener
     %% process); it is released in `terminate/1`.
@@ -196,7 +199,7 @@ init(Conn, ProtoOpts) ->
         listener_name = ListenerName,
         peer = Peer,
         start_mono = StartMono,
-        max_content_length = maps:get(max_content_length, ProtoOpts),
+        max_content_length = MaxContentLength,
         max_header_block = MaxHeaderBlock,
         %% Decoded-section cap defaults to 2x the (possibly overridden) encoded
         %% cap, so raising `max_header_block` lifts both gates together.
@@ -332,8 +335,8 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
     #h3{streams = Streams, max_content_length = MaxLen, max_header_block = MaxHdrBlock} =
         State = note_request_id(State0, StreamId),
     Stream0 = maps:get(StreamId, Streams, new_request_stream()),
-    case maps:get(frame_state, Stream0) of
-        discarding ->
+    case Stream0 of
+        #{frame_state := discarding} ->
             %% The stream was already answered (413). Residual in-flight
             %% body must be ignored — it is continued body on an answered
             %% request, NOT a new header-less request, so it must not trip
@@ -344,8 +347,7 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
                 true -> drop_stream(State, StreamId);
                 false -> State
             end;
-        _ ->
-            #{buf := Buf0} = Stream0,
+        #{buf := Buf0} ->
             case
                 decode_request_frames(<<Buf0/binary, Data/binary>>, Stream0, MaxLen, MaxHdrBlock)
             of

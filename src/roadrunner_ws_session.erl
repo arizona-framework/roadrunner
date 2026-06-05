@@ -448,9 +448,9 @@ process_buffer(#data{buffer = Buf, pmd_params = Pmd} = Data, HibernateAcc) ->
 process_parsed_frame(#data{socket = Socket} = Data1, Buf, Opts, MaybeTotalLen, HibernateAcc) ->
     ParseOpts = parse_opts_with_pre_unmasked(Opts, Data1, MaybeTotalLen),
     case roadrunner_ws:parse_frame(Buf, ParseOpts) of
-        {ok, Frame, NewBuffer} ->
+        {ok, #{opcode := Opcode} = Frame, NewBuffer} ->
             ok = roadrunner_telemetry:ws_frame_in(
-                (Data1#data.ctx)#{opcode => maps:get(opcode, Frame)},
+                (Data1#data.ctx)#{opcode => Opcode},
                 payload_size(Frame)
             ),
             %% Frame parsed. Carry `frame_validated` into handle_frame
@@ -929,9 +929,9 @@ finalize_message(
     Compressed = iolist_to_binary([Iolist, ?PMD_TAIL]),
     try bounded_inflate(Z, Compressed, MaxMsg) of
         {ok, Inflated} ->
-            case maps:get(client_no_context_takeover, Params, false) of
-                true -> ok = zlib:inflateReset(Z);
-                false -> ok
+            case Params of
+                #{client_no_context_takeover := true} -> ok = zlib:inflateReset(Z);
+                #{} -> ok
             end,
             {ok, Inflated, Data};
         {error, _} = Err ->
@@ -1220,9 +1220,9 @@ encode_outbound(Data, Opcode, Payload) ->
 -spec deflate_message(#data{}, iodata()) -> binary().
 deflate_message(#data{deflate_z = Z, pmd_params = Params}, Payload) ->
     Iolist = zlib:deflate(Z, Payload, sync),
-    case maps:get(server_no_context_takeover, Params, false) of
-        true -> ok = zlib:deflateReset(Z);
-        false -> ok
+    case Params of
+        #{server_no_context_takeover := true} -> ok = zlib:deflateReset(Z);
+        #{} -> ok
     end,
     Bin = iolist_to_binary(Iolist),
     %% Strip the per-message tail (last 4 bytes of `0x00 0x00 0xff 0xff`).
