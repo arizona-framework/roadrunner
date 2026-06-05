@@ -393,6 +393,9 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
   all rate-points per server).
 - [`docs/resource_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/resource_results.md): memory + CPU
   shape per scenario.
+- [`docs/resource_limits.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/resource_limits.md): the
+  per-connection and per-peer memory / CPU limits, with defaults and
+  over-limit behavior (operator reference).
 - [`docs/conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md):
   the connection-process model trade-offs and the one h2 case
   cowboy still wins.
