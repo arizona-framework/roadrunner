@@ -11,16 +11,10 @@ Pure-Erlang HTTP/1.1 + HTTP/2 + HTTP/3 + WebSocket server for Erlang/OTP.
 **Built for low tail latency at sustained load.** Beep beep.
 
 Roadrunner is the HTTP backbone of the
-[arizona-framework](https://github.com/arizona-framework/arizona).
-Strict RFC 9110 / 9112 / 9113 parsing, with **strict 100 %
-[h2spec](https://github.com/summerwind/h2spec)** (HTTP/2 conformance)
-and **strict 100 %
-[Autobahn fuzzingclient](https://github.com/crossbario/autobahn-testsuite)**
-(WebSocket, no exclusions). The user-facing API is a handler
-behaviour, request/response accessors, listener controls, and a
-handful of opt-in helpers (cookies, qs, multipart, SSE, WebSocket).
-Modern OTP idioms throughout, with predictable per-connection
-lifecycle observability.
+[arizona-framework](https://github.com/arizona-framework/arizona), and works
+standalone too. The API is small: a handler behaviour, request and response
+accessors, listener controls, and opt-in helpers (cookies, qs, multipart, SSE,
+WebSocket).
 
 ## Why Roadrunner?
 
@@ -283,8 +277,10 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
 
 ### Middleware
 
-- Continuation-style `(Req, Next) -> {Response, Req2}` — listener-level +
-  per-route, first-in-list = outermost.
+- Continuation-style middleware. Each entry is a `Callable` or a
+  `{Callable, State}` pair, where `Callable` is a module (`call/3`) or a
+  `fun((Req, Next, State) -> {Response, Req2})`. Listener-level + per-route,
+  first-in-list = outermost.
 
 ### Built-in handlers
 
@@ -366,11 +362,13 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
   on the way out), binary keys for wire-derived data, `-doc` /
   `-moduledoc` markdown, dialyzer-clean specs. No `binary_to_atom` on
   parsed names.
-- **Continuation-style middleware.** `(Req, Next) -> {Response, Req2}`,
-  composable at listener and per-route level. Outermost first.
+- **Continuation-style middleware.** Entries are `Callable` or
+  `{Callable, State}`, invoked as `call(Req, Next, State)`; composable at
+  listener and per-route level, outermost first.
 - **Telemetry over custom callbacks.** `telemetry` is the de facto
   standard (Phoenix, Ecto, gleam_otp); zero-overhead when no subscribers,
-  integrates with prometheus / opentelemetry / datadog out of the box.
+  and integrates with Prometheus / OpenTelemetry / Datadog through the
+  telemetry ecosystem.
 - **No external deps unless stdlib genuinely can't.** Only runtime dep
   is `telemetry` (tiny, no transitive deps); only dev-time dep is the
   `erlfmt` plugin.
