@@ -118,7 +118,7 @@ handle(Req) ->
                     #{cache_ttl_ms := T} -> T;
                     _ -> ?DEFAULT_CACHE_TTL_MS
                 end,
-            Dir = maps:get(dir, State),
+            #{dir := Dir} = State,
             FilePath = filename:join([Dir | Segments]),
             {serve_file(FilePath, TtlMs, Req), Req};
         traversal ->

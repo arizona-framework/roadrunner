@@ -207,7 +207,16 @@ run(Socket, Req, Mod, State, Buffered, ProtoOpts) ->
     binary(),
     roadrunner_conn:proto_opts()
 ) -> ok.
-run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts) ->
+run_session(
+    Socket,
+    Req,
+    Mod,
+    State,
+    UpgradeResp,
+    Negotiated,
+    Buffered,
+    #{handler_spawn_opts := SpawnOpts, handler_start_timeout := StartTimeout} = ProtoOpts
+) ->
     Ctx = ws_context(Req, Mod),
     %% Start the gen_statem **before** writing the 101 to the wire so a
     %% start failure never leaves the upgrade response sent with no
@@ -215,7 +224,6 @@ run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpt
     %% conn is intentionally unlinked from its children so a session
     %% crash never propagates to the conn process. We synchronise via
     %% a monitor instead.
-    #{handler_spawn_opts := SpawnOpts, handler_start_timeout := StartTimeout} = ProtoOpts,
     StartOpts = [{spawn_opt, SpawnOpts}, {timeout, StartTimeout}],
     case
         gen_statem:start(
@@ -448,9 +456,9 @@ process_buffer(#data{buffer = Buf, pmd_params = Pmd} = Data, HibernateAcc) ->
 process_parsed_frame(#data{socket = Socket} = Data1, Buf, Opts, MaybeTotalLen, HibernateAcc) ->
     ParseOpts = parse_opts_with_pre_unmasked(Opts, Data1, MaybeTotalLen),
     case roadrunner_ws:parse_frame(Buf, ParseOpts) of
-        {ok, Frame, NewBuffer} ->
+        {ok, #{opcode := Opcode} = Frame, NewBuffer} ->
             ok = roadrunner_telemetry:ws_frame_in(
-                (Data1#data.ctx)#{opcode => maps:get(opcode, Frame)},
+                (Data1#data.ctx)#{opcode => Opcode},
                 payload_size(Frame)
             ),
             %% Frame parsed. Carry `frame_validated` into handle_frame
@@ -929,9 +937,9 @@ finalize_message(
     Compressed = iolist_to_binary([Iolist, ?PMD_TAIL]),
     try bounded_inflate(Z, Compressed, MaxMsg) of
         {ok, Inflated} ->
-            case maps:get(client_no_context_takeover, Params, false) of
-                true -> ok = zlib:inflateReset(Z);
-                false -> ok
+            case Params of
+                #{client_no_context_takeover := true} -> ok = zlib:inflateReset(Z);
+                #{} -> ok
             end,
             {ok, Inflated, Data};
         {error, _} = Err ->
@@ -1220,9 +1228,9 @@ encode_outbound(Data, Opcode, Payload) ->
 -spec deflate_message(#data{}, iodata()) -> binary().
 deflate_message(#data{deflate_z = Z, pmd_params = Params}, Payload) ->
     Iolist = zlib:deflate(Z, Payload, sync),
-    case maps:get(server_no_context_takeover, Params, false) of
-        true -> ok = zlib:deflateReset(Z);
-        false -> ok
+    case Params of
+        #{server_no_context_takeover := true} -> ok = zlib:deflateReset(Z);
+        #{} -> ok
     end,
     Bin = iolist_to_binary(Iolist),
     %% Strip the per-message tail (last 4 bytes of `0x00 0x00 0xff 0xff`).

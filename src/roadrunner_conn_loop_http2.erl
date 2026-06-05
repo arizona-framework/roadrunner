@@ -960,8 +960,9 @@ on_data(
             %% §6.9.1: pad-length byte + padding count). Past the window
             %% gates, the body cap and buffering use the stripped `Payload`
             %% the handler will see, so its length is only needed there.
+            ConnWindow = State#loop.conn_recv_window,
             if
-                FlowLen > State#loop.conn_recv_window ->
+                FlowLen > ConnWindow ->
                     %% RFC 9113 §6.9.1: more DATA than the connection-level
                     %% receive window permits is a connection-level
                     %% FLOW_CONTROL_ERROR.
@@ -1003,7 +1004,7 @@ on_data(
                             },
                             State1 = State#loop{
                                 streams = Streams#{StreamId := Stream1},
-                                conn_recv_window = State#loop.conn_recv_window - FlowLen
+                                conn_recv_window = ConnWindow - FlowLen
                             },
                             State2 = maybe_refill_recv_windows(State1, StreamId),
                             case EndStream of
