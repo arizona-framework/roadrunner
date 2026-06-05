@@ -399,24 +399,6 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
 - [`docs/roadmap.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/roadmap.md): deferred items, with rough
   effort estimates for each.
 
-## Design philosophy
-
-- **RFC-correct, hostile-input-safe**: Parsers are pure incremental
-  binary matchers; only programmer errors raise, wire input always
-  becomes `{error, _}`. Malformed bytes are bounded by length and
-  rejected before reaching application code.
-- **Modern OTP idioms**: Sigils for binary literals, body recursion (cons
-  on the way out), binary keys for wire-derived data, `-doc` /
-  `-moduledoc` markdown, dialyzer-clean specs. No `binary_to_atom` on
-  parsed names.
-- **Telemetry over custom callbacks**: `telemetry` is the de facto
-  standard (Phoenix, Ecto, gleam_otp); no dispatch overhead when nothing is
-  subscribed, and integrates with Prometheus / OpenTelemetry / Datadog through
-  the telemetry ecosystem.
-- **No external deps unless stdlib genuinely can't**: Runtime deps are
-  `telemetry` (tiny, no transitive deps) and `quic` (the pure-Erlang HTTP/3
-  transport, started on demand); the only dev-time dep is the `erlfmt` plugin.
-
 ## Sponsors
 
 Roadrunner is open source and maintained on personal time. If you or your company find it useful,
