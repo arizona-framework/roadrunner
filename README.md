@@ -155,7 +155,7 @@ Add to `rebar.config` (latest version on
 ]}.
 ```
 
-Write a handler — the third route element is per-route state, threaded
+Write a handler. The third route element is per-route state, threaded
 to the handler via `roadrunner_req:state/1`:
 
 ```erlang
@@ -171,11 +171,11 @@ handle(Req) ->
 Boot a listener:
 
 ```erlang
-1> application:ensure_all_started(roadrunner).
-2> roadrunner:start_listener(my_listener, #{
-       port => 8080,
-       routes => [{~"/", hello_handler, #{greeting => ~"hello"}}]
-   }).
+application:ensure_all_started(roadrunner).
+roadrunner:start_listener(my_listener, #{
+    port => 8080,
+    routes => [{~"/", hello_handler, #{greeting => ~"hello"}}]
+}).
 ```
 
 ```
@@ -208,7 +208,7 @@ Mix literal and `:param` routes:
 
 ```erlang
 routes => [
-    {~"/", hello_handler, #{greeting => ~"hi"}},
+    {~"/", hello_handler, #{greeting => ~"hello"}},
     {~"/users/:id", users_handler, undefined}
 ]
 ```
@@ -233,7 +233,7 @@ call(Req, Next, _State) ->
 roadrunner:start_listener(api, #{
     port => 8080,
     middlewares => [server_header_mw],
-    routes => [{~"/", hello_handler, #{greeting => ~"hi"}}]
+    routes => [{~"/", hello_handler, #{greeting => ~"hello"}}]
 }).
 ```
 
@@ -241,15 +241,15 @@ For HTTP/2 over TLS, add a cert and list both protocols. ALPN is
 derived from `protocols` automatically:
 
 ```erlang
-3> roadrunner:start_listener(my_tls_listener, #{
-       port => 8443,
-       protocols => [http1, http2],
-       tls => [
-           {certfile, "cert.pem"},
-           {keyfile, "key.pem"}
-       ],
-       routes => [{~"/", hello_handler, #{greeting => ~"hello"}}]
-   }).
+roadrunner:start_listener(my_tls_listener, #{
+    port => 8443,
+    protocols => [http1, http2],
+    tls => [
+        {certfile, "cert.pem"},
+        {keyfile, "key.pem"}
+    ],
+    routes => [{~"/", hello_handler, #{greeting => ~"hello"}}]
+}).
 ```
 
 ALPN routes `h2` clients to the HTTP/2 path and `http/1.1` clients (or
@@ -261,7 +261,7 @@ the `tls` opt.
 For HTTP/3 (experimental), add `http3` to a TLS listener's `protocols`
 (e.g. `protocols => [http1, http2, http3]`). It serves h3 over UDP on the
 same port number and advertises `Alt-Svc` so browsers upgrade from TCP;
-the `quic` transport starts on demand, so h1/h2-only listeners never boot
+the `quic` transport starts on demand, so h1/h2-only listeners never load
 it.
 
 For listeners that don't need routing, `routes => Mod` (or
@@ -409,9 +409,6 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
   on the way out), binary keys for wire-derived data, `-doc` /
   `-moduledoc` markdown, dialyzer-clean specs. No `binary_to_atom` on
   parsed names.
-- **Continuation-style middleware.** Entries are `Callable` or
-  `{Callable, State}`, invoked as `call(Req, Next, State)`; composable at
-  listener and per-route level, outermost first.
 - **Telemetry over custom callbacks.** `telemetry` is the de facto
   standard (Phoenix, Ecto, gleam_otp); no dispatch overhead when nothing is
   subscribed, and integrates with Prometheus / OpenTelemetry / Datadog through
