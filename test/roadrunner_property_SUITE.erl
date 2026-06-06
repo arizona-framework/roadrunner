@@ -38,7 +38,9 @@ Add a new property:
     quic_keys_matches_dep/1,
     quic_aead_matches_dep/1,
     quic_amp_invariants/1,
-    quic_ack_matches_dep/1
+    quic_ack_matches_dep/1,
+    quic_loss_rtt_matches_dep/1,
+    quic_loss_matches_dep/1
 ]).
 
 suite() ->
@@ -67,7 +69,9 @@ all() ->
         quic_keys_matches_dep,
         quic_aead_matches_dep,
         quic_amp_invariants,
-        quic_ack_matches_dep
+        quic_ack_matches_dep,
+        quic_loss_rtt_matches_dep,
+        quic_loss_matches_dep
     ].
 
 init_per_suite(Config) ->
@@ -205,5 +209,17 @@ quic_amp_invariants(Config) ->
 quic_ack_matches_dep(Config) ->
     ct_property_test:quickcheck(
         roadrunner_quic_ack_props:prop_matches_dep(),
+        Config
+    ).
+
+quic_loss_rtt_matches_dep(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_quic_loss_props:prop_rtt_matches_dep(),
+        Config
+    ).
+
+quic_loss_matches_dep(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_quic_loss_props:prop_loss_matches_dep(),
         Config
     ).
