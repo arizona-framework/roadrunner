@@ -43,7 +43,8 @@ Add a new property:
     quic_loss_matches_dep/1,
     quic_cc_newreno_invariants/1,
     quic_flow_matches_dep/1,
-    quic_tls_crypto_matches_dep/1
+    quic_tls_crypto_matches_dep/1,
+    quic_tls_handshake_matches_dep/1
 ]).
 
 suite() ->
@@ -77,7 +78,8 @@ all() ->
         quic_loss_matches_dep,
         quic_cc_newreno_invariants,
         quic_flow_matches_dep,
-        quic_tls_crypto_matches_dep
+        quic_tls_crypto_matches_dep,
+        quic_tls_handshake_matches_dep
     ].
 
 init_per_suite(Config) ->
@@ -245,5 +247,11 @@ quic_flow_matches_dep(Config) ->
 quic_tls_crypto_matches_dep(Config) ->
     ct_property_test:quickcheck(
         roadrunner_quic_tls_crypto_props:prop_matches_dep(),
+        Config
+    ).
+
+quic_tls_handshake_matches_dep(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_quic_tls_handshake_props:prop_encode_decode_matches_dep(),
         Config
     ).
