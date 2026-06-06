@@ -35,7 +35,8 @@ Add a new property:
     router_param_bindings_round_trip/1,
     quic_varint_encode_matches_dep/1,
     quic_hkdf_matches_dep/1,
-    quic_keys_matches_dep/1
+    quic_keys_matches_dep/1,
+    quic_aead_matches_dep/1
 ]).
 
 suite() ->
@@ -61,7 +62,8 @@ all() ->
         router_param_bindings_round_trip,
         quic_varint_encode_matches_dep,
         quic_hkdf_matches_dep,
-        quic_keys_matches_dep
+        quic_keys_matches_dep,
+        quic_aead_matches_dep
     ].
 
 init_per_suite(Config) ->
@@ -181,5 +183,11 @@ quic_hkdf_matches_dep(Config) ->
 quic_keys_matches_dep(Config) ->
     ct_property_test:quickcheck(
         roadrunner_quic_keys_props:prop_matches_dep(),
+        Config
+    ).
+
+quic_aead_matches_dep(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_quic_aead_props:prop_matches_dep(),
         Config
     ).
