@@ -39,10 +39,10 @@ oracle_header_sets() ->
     ].
 
 oracle_encode_is_byte_identical_test() ->
-    [?assertEqual(?DEP:encode(H), ?M:encode(H)) || H <- oracle_header_sets()].
+    [?assertEqual(?DEP:encode(H), enc(H)) || H <- oracle_header_sets()].
 
 oracle_dep_decodes_our_encoding_test() ->
-    [?assertEqual({ok, H}, ?DEP:decode(?M:encode(H))) || H <- oracle_header_sets()].
+    [?assertEqual({ok, H}, ?DEP:decode(enc(H))) || H <- oracle_header_sets()].
 
 oracle_we_decode_dep_encoding_test() ->
     [?assertEqual({ok, H}, ?M:decode(?DEP:encode(H))) || H <- oracle_header_sets()].
@@ -60,7 +60,7 @@ roundtrip_every_static_index_test() ->
     [
         begin
             {ok, [Entry]} = ?M:decode(indexed_section(I)),
-            ?assertEqual({ok, [Entry]}, ?M:decode(?M:encode([Entry])))
+            ?assertEqual({ok, [Entry]}, ?M:decode(enc([Entry])))
         end
      || I <- lists:seq(0, 98)
     ].
@@ -75,7 +75,7 @@ name_reference_every_static_name_test() ->
     ]),
     [
         ?assertEqual(
-            {ok, [{Name, ~"zzz-not-in-table"}]}, ?M:decode(?M:encode([{Name, ~"zzz-not-in-table"}]))
+            {ok, [{Name, ~"zzz-not-in-table"}]}, ?M:decode(enc([{Name, ~"zzz-not-in-table"}]))
         )
      || Name <- Names
     ].
@@ -83,8 +83,8 @@ name_reference_every_static_name_test() ->
 %% A name absent from the table encodes as a Literal with Literal Name.
 literal_literal_name_test() ->
     H = [{~"x-totally-unknown", ~"value"}],
-    ?assertEqual({ok, H}, ?M:decode(?M:encode(H))),
-    ?assertEqual(?DEP:encode(H), ?M:encode(H)).
+    ?assertEqual({ok, H}, ?M:decode(enc(H))),
+    ?assertEqual(?DEP:encode(H), enc(H)).
 
 %% =============================================================================
 %% Encode string: Huffman vs raw branch.
@@ -95,11 +95,11 @@ encode_string_branches_test() ->
     %% does not (raw branch). Both round-trip.
     Huffy = [{~"x-h", binary:copy(~"a", 40)}],
     Raw = [{~"x-r", ~"q"}],
-    ?assertEqual({ok, Huffy}, ?M:decode(?M:encode(Huffy))),
-    ?assertEqual({ok, Raw}, ?M:decode(?M:encode(Raw))),
+    ?assertEqual({ok, Huffy}, ?M:decode(enc(Huffy))),
+    ?assertEqual({ok, Raw}, ?M:decode(enc(Raw))),
     %% Cross-check the Huffman decision against the dep byte-for-byte.
-    ?assertEqual(?DEP:encode(Huffy), ?M:encode(Huffy)),
-    ?assertEqual(?DEP:encode(Raw), ?M:encode(Raw)).
+    ?assertEqual(?DEP:encode(Huffy), enc(Huffy)),
+    ?assertEqual(?DEP:encode(Raw), enc(Raw)).
 
 %% =============================================================================
 %% Decode error paths.
@@ -158,6 +158,12 @@ decode_second_field_line_error_propagates_test() ->
 %% =============================================================================
 %% Helpers
 %% =============================================================================
+
+%% `roadrunner_qpack:encode/1` returns iodata (it is framed and sent as
+%% iodata in production); flatten it here, where the dep oracle and the
+%% native decoder both want the on-wire binary.
+enc(Headers) ->
+    iolist_to_binary(roadrunner_qpack:encode(Headers)).
 
 %% A field section whose single field line is an Indexed Field Line (static)
 %% for `Index`.

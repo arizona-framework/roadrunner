@@ -32,7 +32,7 @@
 
 %% RFC 9114 §7.2.1: the DATA frame type is 0x00. We frame the body by
 %% hand (type + length varints, then the body by reference) instead of
-%% `quic_h3_frame:encode_data/1` so a large body is never flattened
+%% `roadrunner_quic_h3_frame:encode_data/1` so a large body is never flattened
 %% into one binary on the response path.
 -define(H3_FRAME_DATA, 16#00).
 
@@ -314,7 +314,7 @@ stream_send(Conn, StreamId, Data, {fin, Trailers}) ->
     %% path. The crash must happen before `?FIN_KEY` is set, so run it first.
     Stripped = roadrunner_http:strip_connection_specific_fields_safe(Trailers),
     put(?FIN_KEY, true),
-    TrailersFrame = quic_h3_frame:encode_headers(quic_qpack:encode(Stripped)),
+    TrailersFrame = roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(Stripped)),
     quic:send_data(Conn, StreamId, [data_frame(Data, iolist_size(Data)), TrailersFrame], true).
 
 %% `{sendfile, ...}` response. There is no kernel sendfile over QUIC
@@ -424,15 +424,15 @@ loop_push(Conn, StreamId, Data) ->
 %% HEADERS frame: QPACK-encoded `:status` + the handler's headers, with
 %% connection-specific fields stripped (RFC 9114 §4.2 — h3 MUST NOT
 %% generate them) and the auto-injected `Date` (RFC 9110 §6.6.1) added.
--spec header_frame(roadrunner_http:status(), roadrunner_http:headers()) -> binary().
+-spec header_frame(roadrunner_http:status(), roadrunner_http:headers()) -> iolist().
 header_frame(Status, Headers) ->
     Stripped = roadrunner_http:strip_connection_specific_fields(Headers),
     HeaderList = [{~":status", integer_to_binary(Status)} | roadrunner_http:with_date(Stripped)],
-    quic_h3_frame:encode_headers(quic_qpack:encode(HeaderList)).
+    roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(HeaderList)).
 
-%% DATA frame as iodata (type + length varints, then the body by
+%% DATA frame as an iolist (type + length varints, then the body by
 %% reference) so a large body is never flattened. `Len` is the caller's
 %% already-computed `iolist_size(Body)`.
--spec data_frame(iodata(), non_neg_integer()) -> iodata().
+-spec data_frame(iodata(), non_neg_integer()) -> iolist().
 data_frame(Body, Len) ->
-    [quic_varint:encode(?H3_FRAME_DATA), quic_varint:encode(Len), Body].
+    [roadrunner_quic_varint:encode(?H3_FRAME_DATA), roadrunner_quic_varint:encode(Len), Body].

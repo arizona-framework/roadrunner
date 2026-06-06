@@ -16,12 +16,25 @@ ev(UniState, Critical, Data, Fin) ->
 
 %% --- frame / stream-type builders ---
 
-t(Type) -> quic_h3_frame:encode_stream_type(Type).
-settings() -> quic_h3_frame:encode_settings(#{qpack_max_table_capacity => 0}).
-goaway() -> quic_h3_frame:encode_goaway(0).
-data() -> quic_h3_frame:encode_data(~"x").
-headers() -> quic_h3_frame:encode_headers(~"blk").
-push_promise() -> quic_h3_frame:encode_push_promise(0, ~"blk").
+%% The native encoders return iodata; these helpers build on-wire frames
+%% (binary) fed into the decode-side state machine, so flatten them.
+%% `encode_stream_type/1` is already a single varint binary.
+t(Type) -> roadrunner_quic_h3_frame:encode_stream_type(Type).
+settings() ->
+    iolist_to_binary(roadrunner_quic_h3_frame:encode_settings(#{qpack_max_table_capacity => 0})).
+goaway() -> iolist_to_binary(roadrunner_quic_h3_frame:encode_goaway(0)).
+data() -> iolist_to_binary(roadrunner_quic_h3_frame:encode_data(~"x")).
+headers() -> iolist_to_binary(roadrunner_quic_h3_frame:encode_headers(~"blk")).
+%% PUSH_PROMISE (type 0x05): a server never sends one, so the native h3
+%% codec has no encoder for it; build the wire frame directly to exercise
+%% the decode-side rejection on the control stream.
+push_promise() ->
+    Payload = [roadrunner_quic_varint:encode(0), ~"blk"],
+    iolist_to_binary([
+        roadrunner_quic_varint:encode(16#05),
+        roadrunner_quic_varint:encode(iolist_size(Payload)),
+        Payload
+    ]).
 
 %% --- stream-type classification (from {pending, ...}) ---
 
@@ -118,13 +131,15 @@ control_h2_reserved_frame_test() ->
     ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, true}, #{}, <<2, 0>>, false)).
 
 control_oversized_frame_test() ->
-    Oversized = iolist_to_binary([quic_varint:encode(0), quic_varint:encode(16#FFFFFFFF)]),
+    Oversized = iolist_to_binary([
+        roadrunner_quic_varint:encode(0), roadrunner_quic_varint:encode(16#FFFFFFFF)
+    ]),
     ?assertMatch({conn_error, 16#0106, _}, ev({control, <<>>, true}, #{}, Oversized, false)).
 
 control_forbidden_setting_test() ->
     %% An HTTP/2-only setting (MAX_CONCURRENT_STREAMS = 0x03) is
     %% forbidden in HTTP/3 → H3_SETTINGS_ERROR.
-    Forbidden = quic_h3_frame:encode_settings(#{16#03 => 100}),
+    Forbidden = iolist_to_binary(roadrunner_quic_h3_frame:encode_settings(#{16#03 => 100})),
     ?assertMatch({conn_error, 16#0109, _}, ev({control, <<>>, false}, #{}, Forbidden, false)).
 
 control_stream_closed_test() ->

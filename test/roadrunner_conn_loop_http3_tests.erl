@@ -19,9 +19,11 @@ decode(Buf, MaxLen, MaxHdrBlock) ->
     roadrunner_conn_loop_http3:decode_request_frames(Buf, new(), MaxLen, MaxHdrBlock).
 
 %% A HEADERS frame wrapping an arbitrary field block (the block is only
-%% QPACK-decoded later, in the conn loop's dispatch, not here).
-hf(Block) -> quic_h3_frame:encode_headers(Block).
-df(Bin) -> quic_h3_frame:encode_data(Bin).
+%% QPACK-decoded later, in the conn loop's dispatch, not here). The native
+%% encoders return iodata; these build on-wire frames (binary) fed to the
+%% decoder, so flatten them.
+hf(Block) -> iolist_to_binary(roadrunner_quic_h3_frame:encode_headers(Block)).
+df(Bin) -> iolist_to_binary(roadrunner_quic_h3_frame:encode_data(Bin)).
 
 new_request_stream_test() ->
     ?assertEqual(
@@ -69,7 +71,10 @@ frame_after_trailers_test() ->
 
 settings_on_request_stream_test() ->
     %% A control-stream-only frame on a request stream → H3_FRAME_UNEXPECTED.
-    ?assertMatch({conn_error, 16#0105, _}, decode(quic_h3_frame:encode_settings(#{}), 1000)).
+    ?assertMatch(
+        {conn_error, 16#0105, _},
+        decode(iolist_to_binary(roadrunner_quic_h3_frame:encode_settings(#{})), 1000)
+    ).
 
 unknown_frame_ignored_test() ->
     %% Grease frame type 0x21 (empty payload) — ignored (RFC 9114 §9).
@@ -86,7 +91,9 @@ h2_reserved_frame_test() ->
 
 oversized_frame_test() ->
     %% A frame declaring a length above the cap → H3_FRAME_ERROR (§7.1).
-    Oversized = iolist_to_binary([quic_varint:encode(0), quic_varint:encode(16#FFFFFFFF)]),
+    Oversized = iolist_to_binary([
+        roadrunner_quic_varint:encode(0), roadrunner_quic_varint:encode(16#FFFFFFFF)
+    ]),
     ?assertMatch({conn_error, 16#0106, _}, decode(Oversized, 1000)).
 
 oversized_header_block_test() ->

@@ -38,16 +38,17 @@
 %% =============================================================================
 
 -doc """
-Encode a header list as a static-only QPACK field section. Returns a
-binary (the encoder builds iodata internally and flattens at the API
-boundary, where the caller wants a binary to frame as HEADERS).
+Encode a header list as a static-only QPACK field section, returned as
+an iolist. The caller frames it with
+`roadrunner_quic_h3_frame:encode_headers/1` and sends it as iodata, so the
+field section is never flattened here.
 """.
--spec encode(headers()) -> binary().
+-spec encode(headers()) -> iolist().
 encode(Headers) ->
     %% Field Section Prefix `00 00` (RIC 0, Base 0) then one field line each.
-    iolist_to_binary([<<0, 0>> | encode_field_lines(Headers)]).
+    [<<0, 0>> | encode_field_lines(Headers)].
 
--spec encode_field_lines(headers()) -> iodata().
+-spec encode_field_lines(headers()) -> iolist().
 encode_field_lines([]) ->
     [];
 encode_field_lines([Header | Rest]) ->
@@ -63,7 +64,7 @@ encode_field_line({Name, Value}) ->
             encode_literal(Name, Value)
     end.
 
--spec encode_literal(binary(), binary()) -> iodata().
+-spec encode_literal(binary(), binary()) -> iolist().
 encode_literal(Name, Value) ->
     case static_name_match(Name) of
         Index when is_integer(Index) ->
@@ -86,7 +87,7 @@ encode_literal(Name, Value) ->
 
 %% A string is `H` (1 bit) + a 7-bit-prefix length + the octets, Huffman
 %% coded when that is shorter (RFC 9204 §4.1.2).
--spec encode_string(binary()) -> iodata().
+-spec encode_string(binary()) -> iolist().
 encode_string(Str) ->
     Huffman = roadrunner_http2_hpack_huffman:encode(Str),
     HuffmanSize = byte_size(Huffman),

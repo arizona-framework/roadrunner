@@ -81,13 +81,13 @@
 %% Frame encoding
 %% =============================================================================
 
--doc "Encode a DATA frame (RFC 9114 §7.2.1) as iodata.".
--spec encode_data(binary()) -> iodata().
+-doc "Encode a DATA frame (RFC 9114 §7.2.1) as an iolist.".
+-spec encode_data(iodata()) -> iolist().
 encode_data(Payload) ->
     frame_io(?FRAME_DATA, Payload).
 
 -doc "Encode a HEADERS frame (RFC 9114 §7.2.2) wrapping a QPACK field section.".
--spec encode_headers(binary()) -> iodata().
+-spec encode_headers(iodata()) -> iolist().
 encode_headers(HeaderBlock) ->
     frame_io(?FRAME_HEADERS, HeaderBlock).
 
@@ -96,12 +96,12 @@ Encode a SETTINGS frame (RFC 9114 §7.2.4) from a settings map. Every
 entry in the map is emitted as an id+value varint pair, in
 `maps:to_list/1` order.
 """.
--spec encode_settings(map()) -> iodata().
+-spec encode_settings(map()) -> iolist().
 encode_settings(Settings) ->
     frame_io(?FRAME_SETTINGS, encode_settings_pairs(maps:to_list(Settings))).
 
 -doc "Encode a GOAWAY frame (RFC 9114 §7.2.6) naming the last stream id.".
--spec encode_goaway(non_neg_integer()) -> iodata().
+-spec encode_goaway(non_neg_integer()) -> iolist().
 encode_goaway(StreamId) ->
     frame_io(?FRAME_GOAWAY, roadrunner_quic_varint:encode(StreamId)).
 
@@ -115,8 +115,8 @@ encode_stream_type(push) -> roadrunner_quic_varint:encode(?STREAM_PUSH);
 encode_stream_type(Type) when is_integer(Type) -> roadrunner_quic_varint:encode(Type).
 
 %% A frame is its type varint, its length varint, then the payload. Kept
-%% as iodata so the (possibly large) payload is never recopied.
--spec frame_io(non_neg_integer(), iodata()) -> iodata().
+%% as an iolist so the (possibly large) payload is never recopied.
+-spec frame_io(non_neg_integer(), iodata()) -> iolist().
 frame_io(Type, Payload) ->
     [
         roadrunner_quic_varint:encode(Type),
@@ -126,7 +126,7 @@ frame_io(Type, Payload) ->
 
 %% Encode each {id, value} setting as a varint pair, building the payload
 %% by consing on the way out (no reverse, no quadratic binary append).
--spec encode_settings_pairs([{atom() | non_neg_integer(), non_neg_integer()}]) -> iodata().
+-spec encode_settings_pairs([{atom() | non_neg_integer(), non_neg_integer()}]) -> iolist().
 encode_settings_pairs([]) ->
     [];
 encode_settings_pairs([{Key, Value} | Rest]) ->

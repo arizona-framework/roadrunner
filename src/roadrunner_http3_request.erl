@@ -21,7 +21,7 @@
 %%   malformed request.
 %% - Pseudo-headers other than the four defined are rejected.
 %% - `:path` MUST NOT be empty.
-%% - Header field names are lowercase — `quic_qpack:decode/1` returns
+%% - Header field names are lowercase — `roadrunner_qpack:decode/1` returns
 %%   them as received, and an h3 client MUST send them lowercase.
 %% - Connection-specific headers MUST NOT appear (RFC 9114 §4.2).
 

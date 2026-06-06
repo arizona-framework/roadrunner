@@ -265,8 +265,8 @@ recv_loop(#h3{conn = Conn} = State) ->
 -spec send_control_stream(#h3{}) -> #h3{}.
 send_control_stream(#h3{conn = Conn, max_field_section_size = MaxFieldSection} = State) ->
     {ok, CtrlStreamId} = quic:open_unidirectional_stream(Conn),
-    Prefix = quic_h3_frame:encode_stream_type(control),
-    Settings = quic_h3_frame:encode_settings(#{
+    Prefix = roadrunner_quic_h3_frame:encode_stream_type(control),
+    Settings = roadrunner_quic_h3_frame:encode_settings(#{
         qpack_max_table_capacity => 0,
         qpack_blocked_streams => 0,
         max_field_section_size => MaxFieldSection
@@ -288,7 +288,7 @@ start_drain(#h3{conn = Conn, control_stream_id = CtrlId, last_request_id = LastI
     is_integer(CtrlId)
 ->
     GoawayId = LastId + 4,
-    _ = quic:send_data(Conn, CtrlId, quic_h3_frame:encode_goaway(GoawayId), false),
+    _ = quic:send_data(Conn, CtrlId, roadrunner_quic_h3_frame:encode_goaway(GoawayId), false),
     State#h3{goaway_id = GoawayId}.
 
 %% A draining connection is done once no request is in flight — neither
@@ -466,7 +466,7 @@ decode_request_frames(Buf, Stream, MaxLen) ->
 
 -spec decode_request_frames(binary(), map(), non_neg_integer(), pos_integer()) -> decode_result().
 decode_request_frames(Buf, Stream, MaxLen, MaxHdrBlock) ->
-    case quic_h3_frame:decode(Buf) of
+    case roadrunner_quic_h3_frame:decode(Buf) of
         {ok, Frame, Rest} ->
             case apply_frame(Frame, Stream, MaxLen, MaxHdrBlock) of
                 {ok, Stream1} -> decode_request_frames(Rest, Stream1, MaxLen, MaxHdrBlock);
@@ -495,7 +495,7 @@ decode_request_frames(Buf, Stream, MaxLen, MaxHdrBlock) ->
 %% H3_FRAME_UNEXPECTED (§4.1, §7.2.4); unknown/reserved frames are
 %% ignored (§9). Trailers (a HEADERS after the body) are accepted but
 %% not surfaced by the buffered path.
--spec apply_frame(quic_h3_frame:frame(), map(), non_neg_integer(), pos_integer()) ->
+-spec apply_frame(roadrunner_quic_h3_frame:frame(), map(), non_neg_integer(), pos_integer()) ->
     {ok, map()} | too_large | headers_too_large | {conn_error, non_neg_integer(), binary()}.
 apply_frame({headers, Block}, #{frame_state := expecting_headers}, _MaxLen, MaxHdrBlock) when
     byte_size(Block) > MaxHdrBlock
@@ -541,7 +541,7 @@ uni_event({drain, Criticality}, Critical, _Data, Fin) ->
 %% Read the leading stream-type varint and dispatch on it.
 -spec uni_classify(binary(), critical_set(), boolean()) -> uni_result().
 uni_classify(Buf, Critical, Fin) ->
-    case quic_h3_frame:decode_stream_type(Buf) of
+    case roadrunner_quic_h3_frame:decode_stream_type(Buf) of
         {more, _} ->
             uni_more(Buf, Critical, Fin);
         {ok, control, Rest} ->
@@ -638,7 +638,7 @@ claim(Critical, Role) ->
 -spec validate_control_frames(binary(), boolean()) ->
     {ok, binary(), boolean()} | {conn_error, non_neg_integer(), binary()}.
 validate_control_frames(Buf, SettingsReceived) ->
-    case quic_h3_frame:decode(Buf) of
+    case roadrunner_quic_h3_frame:decode(Buf) of
         {ok, Frame, Rest} ->
             case control_frame(Frame, SettingsReceived) of
                 {ok, SettingsReceived1} -> validate_control_frames(Rest, SettingsReceived1);
@@ -655,7 +655,7 @@ validate_control_frames(Buf, SettingsReceived) ->
             {conn_error, frame_error_code(Reason), ~"control frame error"}
     end.
 
--spec control_frame(quic_h3_frame:frame(), boolean()) ->
+-spec control_frame(roadrunner_quic_h3_frame:frame(), boolean()) ->
     {ok, boolean()} | {conn_error, non_neg_integer(), binary()}.
 control_frame({settings, _}, false) ->
     {ok, true};
@@ -675,7 +675,7 @@ control_frame(Frame, true) ->
 %% RFC 9114 §7.2: DATA / HEADERS / PUSH_PROMISE belong on request (or
 %% push) streams, never the control stream; everything else (GOAWAY,
 %% MAX_PUSH_ID, CANCEL_PUSH, reserved/grease) is fine after SETTINGS.
--spec is_control_allowed(quic_h3_frame:frame()) -> boolean().
+-spec is_control_allowed(roadrunner_quic_h3_frame:frame()) -> boolean().
 is_control_allowed({data, _}) -> false;
 is_control_allowed({headers, _}) -> false;
 is_control_allowed({push_promise, _, _}) -> false;
@@ -700,7 +700,7 @@ dispatch_request(#h3{streams = Streams} = State, StreamId) ->
             %% decompression failure is a CONNECTION error per RFC 9204
             %% §2.2 — the dynamic-table state is unrecoverable — whereas
             %% a malformed message is a per-stream error.
-            case quic_qpack:decode(Block) of
+            case roadrunner_qpack:decode(Block) of
                 {error, _} ->
                     {conn_error, ?H3_QPACK_DECOMPRESSION_FAILED, ~"QPACK decompression failed"};
                 {ok, Headers} ->
