@@ -40,7 +40,8 @@ Add a new property:
     quic_amp_invariants/1,
     quic_ack_matches_dep/1,
     quic_loss_rtt_matches_dep/1,
-    quic_loss_matches_dep/1
+    quic_loss_matches_dep/1,
+    quic_cc_newreno_invariants/1
 ]).
 
 suite() ->
@@ -71,7 +72,8 @@ all() ->
         quic_amp_invariants,
         quic_ack_matches_dep,
         quic_loss_rtt_matches_dep,
-        quic_loss_matches_dep
+        quic_loss_matches_dep,
+        quic_cc_newreno_invariants
     ].
 
 init_per_suite(Config) ->
@@ -221,5 +223,11 @@ quic_loss_rtt_matches_dep(Config) ->
 quic_loss_matches_dep(Config) ->
     ct_property_test:quickcheck(
         roadrunner_quic_loss_props:prop_loss_matches_dep(),
+        Config
+    ).
+
+quic_cc_newreno_invariants(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_quic_cc_newreno_props:prop_cwnd_never_below_minimum(),
         Config
     ).
