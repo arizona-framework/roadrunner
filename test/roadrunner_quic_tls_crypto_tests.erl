@@ -74,6 +74,87 @@ matches_dep_test() ->
      || Shared <- [binary:copy(<<16#2a>>, 32), shared_secret()]
     ].
 
+%% =============================================================================
+%% Traffic secrets, Finished key, and verify_data vs the dep oracle (the
+%% dep is RFC-8448-faithful, confirmed by the backbone vectors above).
+%% =============================================================================
+
+traffic_secrets_match_dep_test() ->
+    HandshakeSecret = ?M:handshake_secret(?M:early_secret(), shared_secret()),
+    MasterSecret = ?M:master_secret(HandshakeSecret),
+    HsHash = ?M:transcript_hash(~"client-hello..server-hello"),
+    ApHash = ?M:transcript_hash(~"client-hello..server-finished"),
+    ?assertEqual(
+        ?DEP:derive_client_handshake_secret(HandshakeSecret, HsHash),
+        ?M:traffic_secret(client, handshake, HandshakeSecret, HsHash)
+    ),
+    ?assertEqual(
+        ?DEP:derive_server_handshake_secret(HandshakeSecret, HsHash),
+        ?M:traffic_secret(server, handshake, HandshakeSecret, HsHash)
+    ),
+    ?assertEqual(
+        ?DEP:derive_client_app_secret(MasterSecret, ApHash),
+        ?M:traffic_secret(client, application, MasterSecret, ApHash)
+    ),
+    ?assertEqual(
+        ?DEP:derive_server_app_secret(MasterSecret, ApHash),
+        ?M:traffic_secret(server, application, MasterSecret, ApHash)
+    ).
+
+finished_and_verify_data_match_dep_test() ->
+    HandshakeSecret = ?M:handshake_secret(?M:early_secret(), shared_secret()),
+    Hash = ?M:transcript_hash(~"client-hello..server-hello"),
+    ServerSecret = ?M:traffic_secret(server, handshake, HandshakeSecret, Hash),
+    FinishedKey = ?M:finished_key(ServerSecret),
+    ?assertEqual(?DEP:derive_finished_key(ServerSecret), FinishedKey),
+    ?assertEqual(
+        ?DEP:compute_finished_verify(FinishedKey, Hash),
+        ?M:verify_data(FinishedKey, Hash)
+    ).
+
+%% =============================================================================
+%% RFC 8448 §3 traffic secrets + Finished — the authority (hardcoded, not
+%% via the dep). The transcript-hash contexts are the §3 values.
+%% =============================================================================
+
+rfc8448_traffic_secrets_test() ->
+    HandshakeSecret = ?M:handshake_secret(?M:early_secret(), shared_secret()),
+    MasterSecret = ?M:master_secret(HandshakeSecret),
+    HsHash = hex(~"860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8"),
+    ApHash = hex(~"96088718a85d2c0d2b21a16a7f637eba132bd1a01feac57b8f8ec571ef41c47c"),
+    ?assertEqual(
+        hex(~"b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"),
+        ?M:traffic_secret(client, handshake, HandshakeSecret, HsHash)
+    ),
+    ?assertEqual(
+        hex(~"b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"),
+        ?M:traffic_secret(server, handshake, HandshakeSecret, HsHash)
+    ),
+    ?assertEqual(
+        hex(~"775fae04efd2ee7a546c9544a5070c639fe9a67945b7d18310b269e0e9e98069"),
+        ?M:traffic_secret(client, application, MasterSecret, ApHash)
+    ),
+    ?assertEqual(
+        hex(~"40d3a34fd7b0c9651bb55866a650eddf179237a2923b2124be7f6eae319aeca0"),
+        ?M:traffic_secret(server, application, MasterSecret, ApHash)
+    ).
+
+rfc8448_finished_test() ->
+    HandshakeSecret = ?M:handshake_secret(?M:early_secret(), shared_secret()),
+    HsHash = hex(~"860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8"),
+    ServerSecret = ?M:traffic_secret(server, handshake, HandshakeSecret, HsHash),
+    FinishedKey = ?M:finished_key(ServerSecret),
+    ?assertEqual(
+        hex(~"008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8"),
+        FinishedKey
+    ),
+    %% Transcript hash over ClientHello..server CertificateVerify.
+    FinishedInput = hex(~"91208a9082bb48b14e2f607d839c0d3a55c4f8e1fbb88e3c1ba0e2a32be88a59"),
+    ?assertEqual(
+        hex(~"5d84b2762deff4fcd2a765d6567d94a9f32e4553166893ad86769457e40564ca"),
+        ?M:verify_data(FinishedKey, FinishedInput)
+    ).
+
 %% RFC 8448 §3 ECDHE (x25519) shared secret.
 shared_secret() ->
     hex(~"8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d").

@@ -18,6 +18,7 @@ prop_matches_dep() ->
         {Secret, Label, Hash, Shared, Messages},
         {binary(32), non_empty(binary()), binary(32), binary(32), binary()},
         begin
+            FinishedKey = roadrunner_quic_tls_crypto:finished_key(Secret),
             roadrunner_quic_tls_crypto:transcript_hash(Messages) =:=
                 quic_crypto:transcript_hash(Messages) andalso
                 roadrunner_quic_tls_crypto:derive_secret(Secret, Label, Hash) =:=
@@ -25,6 +26,17 @@ prop_matches_dep() ->
                 roadrunner_quic_tls_crypto:handshake_secret(Secret, Shared) =:=
                     quic_crypto:derive_handshake_secret(Secret, Shared) andalso
                 roadrunner_quic_tls_crypto:master_secret(Secret) =:=
-                    quic_crypto:derive_master_secret(Secret)
+                    quic_crypto:derive_master_secret(Secret) andalso
+                roadrunner_quic_tls_crypto:traffic_secret(client, handshake, Secret, Hash) =:=
+                    quic_crypto:derive_client_handshake_secret(Secret, Hash) andalso
+                roadrunner_quic_tls_crypto:traffic_secret(server, handshake, Secret, Hash) =:=
+                    quic_crypto:derive_server_handshake_secret(Secret, Hash) andalso
+                roadrunner_quic_tls_crypto:traffic_secret(client, application, Secret, Hash) =:=
+                    quic_crypto:derive_client_app_secret(Secret, Hash) andalso
+                roadrunner_quic_tls_crypto:traffic_secret(server, application, Secret, Hash) =:=
+                    quic_crypto:derive_server_app_secret(Secret, Hash) andalso
+                FinishedKey =:= quic_crypto:derive_finished_key(Secret) andalso
+                roadrunner_quic_tls_crypto:verify_data(FinishedKey, Hash) =:=
+                    quic_crypto:compute_finished_verify(FinishedKey, Hash)
         end
     ).
