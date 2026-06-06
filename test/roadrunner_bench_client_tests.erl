@@ -20,18 +20,16 @@ all_test_() ->
         fun open_h1_to_dead_port_errors/0
     ],
     %% The h3 tests run a real QUIC/UDP handshake (dep `quic_h3` client ->
-    %% roadrunner h3 server). Under CI load that handshake can exceed
-    %% eunit's 5s default per-test timeout, which aborts the test as
-    %% "cancelled" while it is still inside `wait_connected`. Give them a
-    %% timeout above `open/3`'s own `wait_connected` deadline so a
-    %% slow-but-progressing handshake still completes, and a genuinely
-    %% stuck one surfaces as a clean error rather than a cancel.
+    %% roadrunner h3 server). `open/3` retries a stalled handshake a few
+    %% times (5 attempts x 5s each), so give these tests a timeout that
+    %% comfortably covers the whole retry budget, well above eunit's 5s
+    %% default (which would otherwise abort the test mid-retry).
     H3 = [
         fun h3_get_returns_200/0,
         fun h3_post_echoes_body/0,
         fun h3_keepalive_n_requests/0
     ],
-    [{spawn, F} || F <- Fast] ++ [{timeout, 30, {spawn, F}} || F <- H3].
+    [{spawn, F} || F <- Fast] ++ [{timeout, 60, {spawn, F}} || F <- H3].
 
 h1_get_returns_200() ->
     Port = start_h1_listener(client_h1_get, roadrunner_hello_handler),
