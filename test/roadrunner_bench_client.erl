@@ -100,24 +100,32 @@ open(Host, Port, h2c) ->
         {error, _} = E -> E
     end;
 open(Host, Port, h3) ->
-    %% QUIC over UDP via the turnkey `quic_h3` client; `wait_connected`
-    %% blocks through the handshake so the first `request/5` can issue a
-    %% stream straight away (mirrors the h2 SETTINGS round-trip above).
-    %% The deadline is generous: under CI load the UDP/QUIC handshake can
-    %% take several seconds, and a tight one flakes the h3 tests. It still
-    %% bounds a genuinely stuck handshake to a clean `{error, timeout}`.
-    HostBin = host_to_authority(Host),
+    %% QUIC over UDP via the turnkey `quic_h3` client. Under CI load the
+    %% dep's handshake intermittently stalls (a single `wait_connected`
+    %% times out) even though a fresh connection handshakes immediately, so
+    %% retry with a new connection a few times rather than lean on one long
+    %% deadline. The common case connects on the first attempt in well under
+    %% a second. `wait_connected` blocks through the handshake so the first
+    %% `request/5` can issue a stream straight away.
+    open_h3(host_to_authority(Host), Port, 5).
+
+%% Connect over QUIC, retrying a stalled handshake with a fresh connection
+%% (see `open/3`). Each attempt bounds the handshake to 5s; the eunit
+%% per-test timeout covers the whole retry budget.
+open_h3(_HostBin, _Port, 0) ->
+    {error, timeout};
+open_h3(HostBin, Port, Attempts) ->
     case quic_h3:connect(HostBin, Port, #{verify => verify_none}) of
         {ok, Conn} ->
-            case quic_h3:wait_connected(Conn, 15000) of
+            case quic_h3:wait_connected(Conn, 5000) of
                 ok ->
                     {ok, #h3_conn{conn = Conn, authority = HostBin}};
-                {error, _} = E ->
+                {error, _} ->
                     _ = quic_h3:close(Conn),
-                    E
+                    open_h3(HostBin, Port, Attempts - 1)
             end;
-        {error, _} = E ->
-            E
+        {error, _} = Error ->
+            Error
     end.
 
 %% Shared post-connect handshake for h2 (TLS) and h2c (cleartext).
