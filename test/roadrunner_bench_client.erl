@@ -103,10 +103,13 @@ open(Host, Port, h3) ->
     %% QUIC over UDP via the turnkey `quic_h3` client; `wait_connected`
     %% blocks through the handshake so the first `request/5` can issue a
     %% stream straight away (mirrors the h2 SETTINGS round-trip above).
+    %% The deadline is generous: under CI load the UDP/QUIC handshake can
+    %% take several seconds, and a tight one flakes the h3 tests. It still
+    %% bounds a genuinely stuck handshake to a clean `{error, timeout}`.
     HostBin = host_to_authority(Host),
     case quic_h3:connect(HostBin, Port, #{verify => verify_none}) of
         {ok, Conn} ->
-            case quic_h3:wait_connected(Conn, 5000) of
+            case quic_h3:wait_connected(Conn, 15000) of
                 ok ->
                     {ok, #h3_conn{conn = Conn, authority = HostBin}};
                 {error, _} = E ->
