@@ -37,7 +37,8 @@ Add a new property:
     quic_hkdf_matches_dep/1,
     quic_keys_matches_dep/1,
     quic_aead_matches_dep/1,
-    quic_amp_invariants/1
+    quic_amp_invariants/1,
+    quic_ack_matches_dep/1
 ]).
 
 suite() ->
@@ -65,7 +66,8 @@ all() ->
         quic_hkdf_matches_dep,
         quic_keys_matches_dep,
         quic_aead_matches_dep,
-        quic_amp_invariants
+        quic_amp_invariants,
+        quic_ack_matches_dep
     ].
 
 init_per_suite(Config) ->
@@ -197,5 +199,11 @@ quic_aead_matches_dep(Config) ->
 quic_amp_invariants(Config) ->
     ct_property_test:quickcheck(
         roadrunner_quic_amp_props:prop_invariants(),
+        Config
+    ).
+
+quic_ack_matches_dep(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_quic_ack_props:prop_matches_dep(),
         Config
     ).
