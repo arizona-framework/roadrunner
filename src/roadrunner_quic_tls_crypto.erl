@@ -13,8 +13,22 @@
 %% Derive-Secret takes the already-computed transcript hash rather than
 %% the raw messages, so the caller is explicit about what is hashed (use
 %% `transcript_hash(<<>>)` for the empty context of the "derived" steps).
+%%
+%% From the Handshake and Master Secrets it derives the client/server
+%% handshake and application traffic secrets, and from a traffic secret
+%% the Finished key and a Finished message's verify_data (RFC 8446
+%% §4.4.4), used to authenticate the handshake.
 
--export([transcript_hash/1, derive_secret/3, early_secret/0, handshake_secret/2, master_secret/1]).
+-export([
+    transcript_hash/1,
+    derive_secret/3,
+    early_secret/0,
+    handshake_secret/2,
+    master_secret/1,
+    traffic_secret/4,
+    finished_key/1,
+    verify_data/2
+]).
 
 %% SHA-256 output length (the negotiated hash for v1).
 -define(HASH_LEN, 32).
@@ -56,6 +70,40 @@ salted by the "derived" secret of the Handshake Secret.
 master_secret(HandshakeSecret) ->
     Salt = derive_secret(HandshakeSecret, ~"derived", transcript_hash(<<>>)),
     roadrunner_quic_hkdf:extract(Salt, zeros()).
+
+-doc """
+A traffic secret (RFC 8446 §7.1), selected by `Direction` (client or
+server) and `Level` (handshake or application), derived from the base
+secret for that level (the Handshake Secret for `handshake`, the Master
+Secret for `application`) and the transcript hash up to that point.
+""".
+-spec traffic_secret(client | server, handshake | application, binary(), binary()) -> binary().
+traffic_secret(client, handshake, HandshakeSecret, TranscriptHash) ->
+    derive_secret(HandshakeSecret, ~"c hs traffic", TranscriptHash);
+traffic_secret(server, handshake, HandshakeSecret, TranscriptHash) ->
+    derive_secret(HandshakeSecret, ~"s hs traffic", TranscriptHash);
+traffic_secret(client, application, MasterSecret, TranscriptHash) ->
+    derive_secret(MasterSecret, ~"c ap traffic", TranscriptHash);
+traffic_secret(server, application, MasterSecret, TranscriptHash) ->
+    derive_secret(MasterSecret, ~"s ap traffic", TranscriptHash).
+
+-doc """
+The Finished key for a traffic secret (RFC 8446 §4.4.4):
+`HKDF-Expand-Label(TrafficSecret, "finished", "", 32)`.
+""".
+-spec finished_key(binary()) -> binary().
+finished_key(TrafficSecret) ->
+    roadrunner_quic_hkdf:expand_label(TrafficSecret, ~"finished", <<>>, ?HASH_LEN).
+
+-doc """
+A Finished message's verify_data (RFC 8446 §4.4.4):
+`HMAC(FinishedKey, TranscriptHash)` over the handshake context. The
+server computes it with its own Finished key and verifies the client's
+with the client's.
+""".
+-spec verify_data(binary(), binary()) -> binary().
+verify_data(FinishedKey, TranscriptHash) ->
+    crypto:mac(hmac, sha256, FinishedKey, TranscriptHash).
 
 %% =============================================================================
 %% Internal
