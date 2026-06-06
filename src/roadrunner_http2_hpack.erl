@@ -49,6 +49,11 @@
     max_table_size/1
 ]).
 
+%% The RFC 7541 §5.1 prefixed-integer codec is byte-identical to QPACK's
+%% RFC 9204 §4.1.1 prefixed integers, so `roadrunner_qpack` reuses these two
+%% rather than duplicating the math. Exported for that cross-module use only.
+-export([encode_integer/3, decode_integer/2]).
+
 -export_type([context/0, decode_error/0]).
 
 %% RFC 7541 Appendix A — 61 static-table entries. Defined up here
@@ -334,6 +339,7 @@ encode_size_update(N) ->
 %% integer plus the rest of the bitstring (which is byte-aligned
 %% afterwards if Rest is byte-aligned at start — the integer
 %% codec only emits/consumes whole bytes after the prefix).
+-doc false.
 -spec decode_integer(pos_integer(), bitstring()) ->
     {ok, non_neg_integer(), bitstring()} | {error, bad_integer}.
 decode_integer(N, Bits) ->
@@ -357,6 +363,7 @@ decode_integer_continuation(_, _, _) ->
 %% Encode an integer with an N-bit prefix and a leading byte that
 %% has the prefix-bit pattern set in its high bits (encoded by
 %% caller via `Marker bor I` for the prefix byte).
+-doc false.
 -spec encode_integer(pos_integer(), 0..255, non_neg_integer()) -> iodata().
 encode_integer(N, Marker, I) ->
     Max = (1 bsl N) - 1,
