@@ -45,7 +45,8 @@ Add a new property:
     quic_flow_matches_dep/1,
     quic_tls_crypto_matches_dep/1,
     quic_tls_handshake_matches_dep/1,
-    quic_transport_params_matches_dep/1
+    quic_transport_params_matches_dep/1,
+    quic_tls_hello_parse_never_crashes/1
 ]).
 
 suite() ->
@@ -81,7 +82,8 @@ all() ->
         quic_flow_matches_dep,
         quic_tls_crypto_matches_dep,
         quic_tls_handshake_matches_dep,
-        quic_transport_params_matches_dep
+        quic_transport_params_matches_dep,
+        quic_tls_hello_parse_never_crashes
     ].
 
 init_per_suite(Config) ->
@@ -261,5 +263,11 @@ quic_tls_handshake_matches_dep(Config) ->
 quic_transport_params_matches_dep(Config) ->
     ct_property_test:quickcheck(
         roadrunner_quic_transport_params_props:prop_encode_decode_matches_dep(),
+        Config
+    ).
+
+quic_tls_hello_parse_never_crashes(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_quic_tls_hello_props:prop_parse_client_hello_never_crashes(),
         Config
     ).
