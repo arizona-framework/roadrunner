@@ -32,7 +32,8 @@ Add a new property:
     http1_parse_chunk_incremental/1,
     loop_terminates_normal_on_random_inputs/1,
     loop_request_start_and_stop_share_request_id/1,
-    router_param_bindings_round_trip/1
+    router_param_bindings_round_trip/1,
+    quic_varint_encode_matches_dep/1
 ]).
 
 suite() ->
@@ -55,7 +56,8 @@ all() ->
         http1_parse_chunk_incremental,
         loop_terminates_normal_on_random_inputs,
         loop_request_start_and_stop_share_request_id,
-        router_param_bindings_round_trip
+        router_param_bindings_round_trip,
+        quic_varint_encode_matches_dep
     ].
 
 init_per_suite(Config) ->
@@ -157,5 +159,11 @@ loop_request_start_and_stop_share_request_id(Config) ->
 router_param_bindings_round_trip(Config) ->
     ct_property_test:quickcheck(
         roadrunner_router_props:prop_param_bindings_round_trip(),
+        Config
+    ).
+
+quic_varint_encode_matches_dep(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_quic_varint_props:prop_encode_matches_dep_and_round_trips(),
         Config
     ).
