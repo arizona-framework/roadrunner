@@ -33,7 +33,9 @@ Add a new property:
     loop_terminates_normal_on_random_inputs/1,
     loop_request_start_and_stop_share_request_id/1,
     router_param_bindings_round_trip/1,
-    quic_varint_encode_matches_dep/1
+    quic_varint_encode_matches_dep/1,
+    quic_hkdf_matches_dep/1,
+    quic_keys_matches_dep/1
 ]).
 
 suite() ->
@@ -57,7 +59,9 @@ all() ->
         loop_terminates_normal_on_random_inputs,
         loop_request_start_and_stop_share_request_id,
         router_param_bindings_round_trip,
-        quic_varint_encode_matches_dep
+        quic_varint_encode_matches_dep,
+        quic_hkdf_matches_dep,
+        quic_keys_matches_dep
     ].
 
 init_per_suite(Config) ->
@@ -165,5 +169,17 @@ router_param_bindings_round_trip(Config) ->
 quic_varint_encode_matches_dep(Config) ->
     ct_property_test:quickcheck(
         roadrunner_quic_varint_props:prop_encode_matches_dep_and_round_trips(),
+        Config
+    ).
+
+quic_hkdf_matches_dep(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_quic_hkdf_props:prop_matches_dep(),
+        Config
+    ).
+
+quic_keys_matches_dep(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_quic_keys_props:prop_matches_dep(),
         Config
     ).
