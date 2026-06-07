@@ -133,14 +133,14 @@
 
 %% Async owner notifications (conn -> owner). `stream_data` carries the
 %% FIN-only end-of-stream as `{stream_data, Sid, <<>>, true}`. `closed` is the
-%% terminal event; `{peer, ErrorCode}` is a peer CONNECTION_CLOSE (local and
-%% idle-timeout close reasons join it in later teardown slices).
+%% terminal event: `{peer, ErrorCode}` is a peer CONNECTION_CLOSE, `{local,
+%% Reason}` a connection error we detected (idle-timeout joins them later).
 -type event() ::
     {connected, info()}
     | {stream_opened, non_neg_integer()}
     | {stream_data, non_neg_integer(), binary(), boolean()}
     | {stream_reset, non_neg_integer(), non_neg_integer()}
-    | {closed, {peer, non_neg_integer()}}.
+    | {closed, {peer, non_neg_integer()} | {local, atom()}}.
 
 %% The `connected` payload. The h3 owner ignores it; it carries the
 %% negotiated ALPN and the advertised transport params for forward-compat.
@@ -394,8 +394,19 @@ process_frame(_Now, _Level, _Frame, #state{phase = closed} = State) ->
     %% A CONNECTION_CLOSE earlier in this packet already closed the connection;
     %% ignore the remaining frames (RFC 9000 §10.2.2).
     State;
-process_frame(_Now, _Level, {connection_close, _Variant, ErrorCode, _FrameType, _Reason}, State) ->
+process_frame(
+    _Now, application, {connection_close, _Variant, ErrorCode, _FrameType, _Reason}, State
+) ->
     process_close(ErrorCode, State);
+process_frame(_Now, _Level, {connection_close, transport, ErrorCode, _FrameType, _Reason}, State) ->
+    process_close(ErrorCode, State);
+process_frame(
+    _Now, _Level, {connection_close, application, _ErrorCode, _FrameType, _Reason}, State
+) ->
+    %% The application CONNECTION_CLOSE (0x1d) is 0-RTT/1-RTT only (RFC 9000
+    %% §19.19); one decoded from an Initial/Handshake packet is a protocol
+    %% violation.
+    connection_fatal(protocol_violation, State);
 process_frame(_Now, Level, {crypto, Offset, Data}, State) ->
     process_crypto(Level, Offset, Data, State);
 process_frame(Now, Level, {ack, _, _, _, _, _} = Ack, State) ->
@@ -442,7 +453,7 @@ process_handshake(initial, {?CLIENT_HELLO, Body}, #state{tls = Tls} = State) ->
             State2 = queue_crypto(initial, InitialFlight, State1),
             queue_crypto(handshake, HandshakeFlight, State2);
         {error, Reason} ->
-            connection_fatal(Reason)
+            connection_fatal(Reason, State)
     end;
 process_handshake(handshake, {?FINISHED, Body}, #state{tls = Tls} = State) ->
     case roadrunner_quic_tls_server:process_client_finished(Body, Tls) of
@@ -453,12 +464,12 @@ process_handshake(handshake, {?FINISHED, Body}, #state{tls = Tls} = State) ->
             State1 = discard_space(handshake, State#state{phase = connected}),
             queue_frame(application, handshake_done, State1);
         {error, Reason} ->
-            connection_fatal(Reason)
+            connection_fatal(Reason, State)
     end;
-process_handshake(_Level, {_Type, _Body}, _State) ->
+process_handshake(_Level, {_Type, _Body}, State) ->
     %% An out-of-sequence or unknown handshake message (RFC 8446 unexpected
     %% message); connection-fatal like the other handshake failures.
-    connection_fatal(unexpected_message).
+    connection_fatal(unexpected_message, State).
 
 %% Arm the keys the TLS flight produced: server installs protect outgoing
 %% packets, client installs decrypt incoming ones; the Application space
@@ -528,15 +539,17 @@ process_ack(Now, Level, Ack, State) ->
 %% (RFC 9000 §4.1), so retransmitted or overlapping bytes never re-consume
 %% the window. A STREAM frame on a server-initiated id is the peer writing to
 %% a stream it cannot send on (RFC 9000 §19.8). A flow-control overrun, a
-%% final-size violation, or that stream-state error is connection-fatal and
-%% let-it-crash here (graceful CONNECTION_CLOSE is a later slice). Emits
-%% {stream_opened, Sid} on a peer stream's first frame and {stream_data, Sid,
+%% final-size violation, or that stream-state error is a peer-reachable
+%% connection error: it closes the connection gracefully via connection_fatal/2
+%% ({closed, {local, Reason}}), not a crash (transmitting a CONNECTION_CLOSE to
+%% the peer is a later slice). Emits {stream_opened, Sid} on a peer stream's
+%% first frame and {stream_data, Sid,
 %% Bin, Fin} (including the FIN-only {<<>>, true}). Granting more credit
 %% (MAX_DATA / MAX_STREAM_DATA) and seeding the windows from the advertised
 %% transport parameters are send-side follow-ups.
 -spec process_stream(non_neg_integer(), non_neg_integer(), binary(), boolean(), t()) -> t().
-process_stream(Sid, _Offset, _Data, _Fin, _State) when Sid rem 4 =:= 1; Sid rem 4 =:= 3 ->
-    connection_fatal(stream_state_error);
+process_stream(Sid, _Offset, _Data, _Fin, State) when Sid rem 4 =:= 1; Sid rem 4 =:= 3 ->
+    connection_fatal(stream_state_error, State);
 process_stream(Sid, Offset, Data, Fin, State) ->
     {Stream0, StreamFlow0, State1} = ensure_stream(Sid, State),
     #state{conn_flow = ConnFlow} = State1,
@@ -549,44 +562,45 @@ process_stream(Sid, Offset, Data, Fin, State) ->
         State2 = put_stream(Sid, Stream1, StreamFlow1, State1#state{conn_flow = ConnFlow1}),
         deliver_stream(Sid, Deliverable, FinReached, State2)
     else
-        {error, Reason} -> connection_fatal(Reason)
+        {error, Reason} -> connection_fatal(Reason, State)
     end.
 
 %% A RESET_STREAM aborts the peer's send side and surfaces the abort code. On
 %% a server-initiated id it is the peer resetting a stream it cannot send on
 %% (RFC 9000 §19.4 STREAM_STATE_ERROR).
 -spec process_reset_stream(non_neg_integer(), non_neg_integer(), non_neg_integer(), t()) -> t().
-process_reset_stream(Sid, _ErrorCode, _FinalSize, _State) when Sid rem 4 =:= 1; Sid rem 4 =:= 3 ->
-    connection_fatal(stream_state_error);
+process_reset_stream(Sid, _ErrorCode, _FinalSize, State) when Sid rem 4 =:= 1; Sid rem 4 =:= 3 ->
+    connection_fatal(stream_state_error, State);
 process_reset_stream(Sid, ErrorCode, FinalSize, State) ->
     {Stream0, Flow, State1} = ensure_stream(Sid, State),
     case roadrunner_quic_stream:reset(FinalSize, Stream0) of
         {ok, Stream1} ->
             emit({stream_reset, Sid, ErrorCode}, put_stream(Sid, Stream1, Flow, State1));
         {error, Reason} ->
-            connection_fatal(Reason)
+            connection_fatal(Reason, State)
     end.
 
-%% A peer CONNECTION_CLOSE ends the connection: surface it to the owner and
-%% mark the connection closed so the send pass is skipped and the shell exits.
-%% Both the transport (0x1c) and application (0x1d) variants are accepted at
-%% any level here (a clean terminate); rejecting a 0x1d before 1-RTT as a
-%% PROTOCOL_VIOLATION (RFC 9000 §19.19) waits for the graceful error-close
-%% path. Lingering in `draining` for 3x PTO to absorb the peer's reordered
-%% packets is a follow-up; for now the listener drops late packets to the
-%% gone pid.
+%% A well-placed peer CONNECTION_CLOSE (transport at any level, or application
+%% at 1-RTT) ends the connection: surface it to the owner and mark the
+%% connection closed so the send pass is skipped and the shell exits. Lingering
+%% in `draining` for 3x PTO to absorb the peer's reordered packets is a
+%% follow-up; for now the listener drops late packets to the gone pid.
 -spec process_close(non_neg_integer(), t()) -> t().
 process_close(ErrorCode, State) ->
     emit({closed, {peer, ErrorCode}}, State#state{phase = closed}).
 
-%% Terminate this single, isolated connection on a peer-reachable protocol
-%% error (flow control §4.1, final size §4.5, stream state §19.8, or a failed
-%% TLS handshake), tagging it with a named reason. The graceful
-%% CONNECTION_CLOSE + draining response is the teardown slice that replaces
-%% this.
--spec connection_fatal(atom()) -> no_return().
-connection_fatal(Reason) ->
-    error({quic_connection_error, Reason}).
+%% Close this single, isolated connection on a peer-reachable protocol error
+%% (flow control §4.1, final size §4.5, stream state §19.8, an out-of-place
+%% application CONNECTION_CLOSE §19.19, or a failed TLS handshake): surface a
+%% terminal {closed, {local, Reason}} to the owner and mark the connection
+%% closed so the fold short-circuits and the shell exits cleanly (no crash, no
+%% slot leak). Sending a CONNECTION_CLOSE to inform the peer of the error (at
+%% the triggering packet's encryption level) is a follow-up; a conformant peer
+%% never triggers these, and the listener drops a misbehaving peer's later
+%% packets to the gone pid.
+-spec connection_fatal(atom(), t()) -> t().
+connection_fatal(Reason, State) ->
+    emit({closed, {local, Reason}}, State#state{phase = closed}).
 
 %% Look up a stream, or create it. The first frame of a peer-initiated stream
 %% is announced with {stream_opened, Sid} (server-initiated ids never reach

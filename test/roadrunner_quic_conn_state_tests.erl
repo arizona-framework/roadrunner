@@ -158,31 +158,31 @@ packet_for_discarded_space_ignored_test() ->
     {State2, _Effects} = ?M:handle_datagram(?NOW, <<Finished/binary, Trailing/binary>>, State1),
     ?assertEqual(connected, ?M:phase(State2)).
 
-tampered_client_finished_is_connection_fatal_test() ->
-    %% A forged Finished fails verification: a connection-fatal protocol
-    %% error (the graceful CONNECTION_CLOSE response is the teardown slice).
+tampered_client_finished_closes_test() ->
+    %% A forged Finished fails verification: the connection closes gracefully
+    %% with {closed, {local, handshake_failure}} rather than crashing.
     #{state1 := State1, client_hs_secret := ClientHsSecret, cf_framed := ClientFinished} = connect(),
     <<Type, Len:24, First, Rest/binary>> = ClientFinished,
     Tampered = <<Type, Len:24, (First bxor 1), Rest/binary>>,
     HsKeys = roadrunner_quic_keys:traffic_keys(ClientHsSecret),
     Datagram = ?TC:seal(handshake, 0, HsKeys, [{crypto, 0, Tampered}], ?DCID, ?SCID),
-    ?assertError(
-        {quic_connection_error, handshake_failure}, ?M:handle_datagram(?NOW, Datagram, State1)
-    ).
+    {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State1)),
+    ?assertEqual(closed, ?M:phase(State2)),
+    ?assertEqual([{emit, self(), {closed, {local, handshake_failure}}}], emits(Effects)).
 
-malformed_client_hello_is_connection_fatal_test() ->
-    %% A ClientHello body the TLS layer cannot parse is connection-fatal.
+malformed_client_hello_closes_test() ->
+    %% A ClientHello body the TLS layer cannot parse closes the connection.
     {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
     Garbage = iolist_to_binary(roadrunner_quic_tls_handshake:encode(?CLIENT_HELLO, ~"not a hello")),
     Datagram = ?TC:seal(
         initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Garbage}], ?DCID, ?SCID
     ),
-    ?assertError(
-        {quic_connection_error, malformed_client_hello}, ?M:handle_datagram(?NOW, Datagram, State0)
-    ).
+    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, malformed_client_hello}}}], emits(Effects)).
 
-unexpected_handshake_message_is_connection_fatal_test() ->
-    %% An out-of-sequence handshake message type is connection-fatal.
+unexpected_handshake_message_closes_test() ->
+    %% An out-of-sequence handshake message type closes the connection.
     {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
     Unexpected = iolist_to_binary(roadrunner_quic_tls_handshake:encode(?FINISHED, <<>>)),
     Datagram = ?TC:seal(
@@ -193,9 +193,35 @@ unexpected_handshake_message_is_connection_fatal_test() ->
         ?DCID,
         ?SCID
     ),
-    ?assertError(
-        {quic_connection_error, unexpected_message}, ?M:handle_datagram(?NOW, Datagram, State0)
-    ).
+    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, unexpected_message}}}], emits(Effects)).
+
+application_close_at_initial_level_closes_test() ->
+    %% An application-variant CONNECTION_CLOSE (0x1d) decoded from an Initial
+    %% packet is a protocol violation (RFC 9000 §19.19, 0x1d is 1-RTT only):
+    %% the connection closes with {closed, {local, protocol_violation}}.
+    {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
+    Datagram = ?TC:seal(
+        initial,
+        0,
+        roadrunner_quic_keys:initial_client(?DCID),
+        [{connection_close, application, 7, undefined, <<>>}],
+        ?DCID,
+        ?SCID
+    ),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
+
+application_close_at_1rtt_closes_test() ->
+    %% An application-variant CONNECTION_CLOSE (0x1d) is legal at 1-RTT (an h3
+    %% client's graceful close) and surfaces {closed, {peer, ErrorCode}}.
+    {State, ApSecret} = connected_with_owner(),
+    Close = app_datagram([{connection_close, application, 9, undefined, <<>>}], 0, ApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Close, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {peer, 9}}}], emits(Effects)).
 
 %% =============================================================================
 %% Timers and anti-amplification
@@ -341,21 +367,26 @@ out_of_order_stream_not_delivered_test() ->
     {_State1, Effects} = ?M:handle_datagram(?NOW, Datagram, State),
     ?assertEqual([{emit, self(), {stream_opened, 0}}], emits(Effects)).
 
-stream_on_server_initiated_id_is_connection_fatal_test() ->
+stream_on_server_initiated_id_closes_test() ->
     %% A peer STREAM on a server-initiated id (rem 4 == 3, a send-only stream
-    %% from the peer) is an RFC 9000 §19.8 STREAM_STATE_ERROR, not delivered.
+    %% from the peer) is an RFC 9000 §19.8 STREAM_STATE_ERROR: the connection
+    %% closes rather than delivering the data.
     {State, ApSecret} = connected_with_owner(),
     Bad = app_datagram([{stream, 3, 0, ~"x", true}], 0, ApSecret),
-    ?assertError({quic_connection_error, stream_state_error}, ?M:handle_datagram(?NOW, Bad, State)).
+    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, stream_state_error}}}], emits(Effects)).
 
-reset_stream_on_server_initiated_id_is_connection_fatal_test() ->
+reset_stream_on_server_initiated_id_closes_test() ->
     %% A RESET_STREAM on a server-initiated id (rem 4 == 1) is likewise an
     %% RFC 9000 §19.4 STREAM_STATE_ERROR.
     {State, ApSecret} = connected_with_owner(),
     Bad = app_datagram([{reset_stream, 1, 7, 0}], 0, ApSecret),
-    ?assertError({quic_connection_error, stream_state_error}, ?M:handle_datagram(?NOW, Bad, State)).
+    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, stream_state_error}}}], emits(Effects)).
 
-stream_final_size_violation_is_connection_fatal_test() ->
+stream_final_size_violation_closes_test() ->
     %% A FIN declaring a final size below the bytes already received is an
     %% RFC 9000 §4.5 connection error.
     {State, ApSecret} = connected_with_owner(),
@@ -363,9 +394,11 @@ stream_final_size_violation_is_connection_fatal_test() ->
         ?NOW, app_datagram([{stream, 0, 0, ~"hello", false}], 0, ApSecret), State
     ),
     Bad = app_datagram([{stream, 0, 0, <<>>, true}], 1, ApSecret),
-    ?assertError({quic_connection_error, final_size_error}, ?M:handle_datagram(?NOW, Bad, State1)).
+    {State2, Effects} = ?M:handle_datagram(?NOW, Bad, State1),
+    ?assertEqual(closed, ?M:phase(State2)),
+    ?assertEqual([{emit, self(), {closed, {local, final_size_error}}}], emits(Effects)).
 
-reset_final_size_violation_is_connection_fatal_test() ->
+reset_final_size_violation_closes_test() ->
     %% A RESET_STREAM final size below the bytes already received is likewise
     %% an RFC 9000 §4.5 connection error.
     {State, ApSecret} = connected_with_owner(),
@@ -373,16 +406,20 @@ reset_final_size_violation_is_connection_fatal_test() ->
         ?NOW, app_datagram([{stream, 0, 0, ~"hello", false}], 0, ApSecret), State
     ),
     Bad = app_datagram([{reset_stream, 0, 7, 2}], 1, ApSecret),
-    ?assertError({quic_connection_error, final_size_error}, ?M:handle_datagram(?NOW, Bad, State1)).
+    {State2, Effects} = ?M:handle_datagram(?NOW, Bad, State1),
+    ?assertEqual(closed, ?M:phase(State2)),
+    ?assertEqual([{emit, self(), {closed, {local, final_size_error}}}], emits(Effects)).
 
-stream_over_connection_flow_limit_is_connection_fatal_test() ->
+stream_over_connection_flow_limit_closes_test() ->
     %% A peer STREAM whose highest offset exceeds the connection's
     %% 786432-byte receive window is an RFC 9000 §4.1 flow-control connection
     %% error.
     {State, ApSecret} = connected_with_owner(),
     Oversized = binary:copy(~"x", 786433),
     Bad = app_datagram([{stream, 0, 0, Oversized, false}], 0, ApSecret),
-    ?assertError({quic_connection_error, flow_control_error}, ?M:handle_datagram(?NOW, Bad, State)).
+    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, flow_control_error}}}], emits(Effects)).
 
 stream_retransmit_does_not_re_consume_flow_test() ->
     %% Flow control is charged by the increase in the highest received offset,
@@ -535,6 +572,22 @@ frames_after_connection_close_are_ignored_test() ->
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {peer, 7}}}], emits(Effects)).
 
+peer_handshake_level_close_test() ->
+    %% A transport CONNECTION_CLOSE at the Handshake level (the peer aborting
+    %% mid-handshake) closes the connection just like a 1-RTT one.
+    #{state1 := State1, client_hs_secret := ClientHsSecret} = connect(),
+    Close = ?TC:seal(
+        handshake,
+        0,
+        roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+        [{connection_close, transport, 2, 0, <<>>}],
+        ?DCID,
+        ?SCID
+    ),
+    {State2, Effects} = ?M:handle_datagram(?NOW, Close, with_owner(State1)),
+    ?assertEqual(closed, ?M:phase(State2)),
+    ?assertEqual([{emit, self(), {closed, {peer, 2}}}], emits(Effects)).
+
 %% =============================================================================
 %% Handshake driver (plays the QUIC client with the shared test client)
 %% =============================================================================
@@ -665,6 +718,12 @@ transport_params() ->
 %% The connected payload conn_state caches at new/1 (alpn + advertised params).
 expected_info() ->
     #{alpn => ~"h3", transport_params => transport_params()}.
+
+%% Install this process as the owner (no emit while handshaking) so a later
+%% close surfaces {closed, _} here.
+with_owner(State) ->
+    {State1, _} = ?M:handle_call(self(), make_ref(), {set_owner, self()}, State),
+    State1.
 
 %% Drive to connected with this process installed as owner (set during
 %% handshaking, the normal ordering). Returns the state plus both application
