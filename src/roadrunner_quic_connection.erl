@@ -49,7 +49,8 @@ start(Socket, Config) ->
     {ok, proc_lib:spawn_opt(?MODULE, init, [Socket, Config], [])}.
 
 -doc false.
--spec init(roadrunner_quic_socket:socket(), roadrunner_quic_conn_state:config()) -> no_return().
+-spec init(roadrunner_quic_socket:socket(), roadrunner_quic_conn_state:config()) ->
+    ok | no_return().
 init(Socket, #{peer := Peer} = Config) ->
     proc_lib:set_label({?MODULE, Peer}),
     loop(#shell{
@@ -63,7 +64,7 @@ init(Socket, #{peer := Peer} = Config) ->
 %% Loop
 %% =============================================================================
 
--spec loop(#shell{}) -> no_return().
+-spec loop(#shell{}) -> ok | no_return().
 loop(State) ->
     receive
         {system, From, Req} ->
@@ -78,23 +79,34 @@ loop(State) ->
             {Conn, Effects} = roadrunner_quic_conn_state:handle_call(
                 From, Ref, Request, State#shell.conn
             ),
-            loop(perform(Effects, Now, State#shell{conn = Conn}));
+            continue(perform(Effects, Now, State#shell{conn = Conn}));
         {quic_send, From, Ref, Sid, IoData, Fin} ->
             Now = erlang:monotonic_time(millisecond),
             {Conn, Effects} = roadrunner_quic_conn_state:handle_send(
                 From, Ref, Sid, IoData, Fin, Now, State#shell.conn
             ),
-            loop(perform(Effects, Now, State#shell{conn = Conn}));
+            continue(perform(Effects, Now, State#shell{conn = Conn}));
         {quic_datagram, _Peer, Datagram} ->
             Now = erlang:monotonic_time(millisecond),
             {Conn, Effects} = roadrunner_quic_conn_state:handle_datagram(
                 Now, Datagram, State#shell.conn
             ),
-            loop(perform(Effects, Now, State#shell{conn = Conn}));
+            continue(perform(Effects, Now, State#shell{conn = Conn}));
         {?MODULE, timer, Kind, Ref} ->
-            loop(fire_timer(Ref, Kind, State));
+            continue(fire_timer(Ref, Kind, State));
         _Other ->
             loop(State)
+    end.
+
+%% Resume the loop, or exit normally once the pure core has moved to the
+%% `closed` phase. proc_lib treats a normal return as a clean process exit,
+%% and the owner already learned of the close via the {closed, _} emit, so
+%% there is no further teardown to do here.
+-spec continue(#shell{}) -> ok | no_return().
+continue(#shell{conn = Conn} = State) ->
+    case roadrunner_quic_conn_state:phase(Conn) of
+        closed -> ok;
+        _ -> loop(State)
     end.
 
 %% Run a fired timer only when its ref is still the armed one; a stale fire

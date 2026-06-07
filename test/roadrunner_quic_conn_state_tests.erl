@@ -511,6 +511,31 @@ fully_sent_stream_is_skipped_on_later_pass_test() ->
     ?assertEqual([], sent_stream_frames(Effects, ServerApSecret)).
 
 %% =============================================================================
+%% Connection close (peer-initiated)
+%% =============================================================================
+
+peer_connection_close_emits_closed_and_sends_nothing_test() ->
+    %% A peer CONNECTION_CLOSE moves the connection to `closed`, surfaces
+    %% {closed, {peer, ErrorCode}} to the owner, and sends nothing back.
+    {State, ApSecret} = connected_with_owner(),
+    Close = app_datagram([{connection_close, transport, 0, 0, <<>>}], 0, ApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Close, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {peer, 0}}}], emits(Effects)),
+    ?assertEqual([], sends(Effects)).
+
+frames_after_connection_close_are_ignored_test() ->
+    %% Once a CONNECTION_CLOSE is seen, the rest of the packet is dropped: a
+    %% trailing STREAM frame produces no stream events.
+    {State, ApSecret} = connected_with_owner(),
+    Close = app_datagram(
+        [{connection_close, transport, 7, 0, <<>>}, {stream, 0, 0, ~"x", true}], 0, ApSecret
+    ),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Close, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {peer, 7}}}], emits(Effects)).
+
+%% =============================================================================
 %% Handshake driver (plays the QUIC client with the shared test client)
 %% =============================================================================
 

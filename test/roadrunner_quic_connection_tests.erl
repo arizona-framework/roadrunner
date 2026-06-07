@@ -18,6 +18,7 @@ shell_test_() ->
     {foreach, fun setup/0, fun cleanup/1, [
         fun handshake_completes/1,
         fun send_data_round_trip/1,
+        fun peer_close_terminates_shell/1,
         fun peername_round_trip/1,
         fun set_owner_emits_connected/1,
         fun system_message_handled/1,
@@ -48,7 +49,7 @@ cleanup(#{shell := Shell, client := ClientSocket, server := ServerSocket}) ->
 
 handshake_completes(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
     fun() ->
-        ServerApSecret = do_handshake(Shell, Peer, ClientSocket, Ctx),
+        {_ClientApSecret, ServerApSecret} = do_handshake(Shell, Peer, ClientSocket, Ctx),
         AppFrames = ?TC:frames(
             recv_all(ClientSocket),
             application,
@@ -62,7 +63,7 @@ handshake_completes(#{shell := Shell, peer := Peer, client := ClientSocket, ctx 
 %% with {quic_reply, Ref, ok} and the data goes out as a 1-RTT STREAM frame.
 send_data_round_trip(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
     fun() ->
-        ServerApSecret = do_handshake(Shell, Peer, ClientSocket, Ctx),
+        {_ClientApSecret, ServerApSecret} = do_handshake(Shell, Peer, ClientSocket, Ctx),
         Ref = make_ref(),
         Shell ! {quic_send, self(), Ref, 0, ~"hello", true},
         receive
@@ -78,6 +79,42 @@ send_data_round_trip(#{shell := Shell, peer := Peer, client := ClientSocket, ctx
         ),
         ?assert(lists:member({stream, 0, 0, ~"hello", true}, Frames))
     end.
+
+%% A peer CONNECTION_CLOSE emits {closed, _} to the owner and terminates the
+%% shell process cleanly (a normal proc_lib exit, not a crash).
+peer_close_terminates_shell(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
+    {timeout, 10, fun() ->
+        {ClientApSecret, _ServerApSecret} = do_handshake(Shell, Peer, ClientSocket, Ctx),
+        %% Install self as owner (handshake already done, so {connected, _}
+        %% comes back immediately) to receive the {closed, _} event.
+        Ref = make_ref(),
+        Shell ! {quic_call, self(), Ref, {set_owner, self()}},
+        receive
+            {quic_reply, Ref, ok} -> ok
+        after 1000 ->
+            erlang:error(no_reply)
+        end,
+        receive
+            {quic, Shell, {connected, _}} -> ok
+        after 1000 ->
+            erlang:error(no_connected_event)
+        end,
+        Close = ?TC:seal(
+            application,
+            0,
+            roadrunner_quic_keys:traffic_keys(ClientApSecret),
+            [{connection_close, transport, 0, 0, <<>>}],
+            ?DCID,
+            ?SCID
+        ),
+        Shell ! {quic_datagram, Peer, Close},
+        receive
+            {quic, Shell, {closed, {peer, 0}}} -> ok
+        after 1000 ->
+            erlang:error(no_closed_event)
+        end,
+        wait_dead(Shell, 50)
+    end}.
 
 %% A synchronous peername control call round-trips through the shell.
 peername_round_trip(#{shell := Shell, peer := Peer}) ->
@@ -95,7 +132,7 @@ peername_round_trip(#{shell := Shell, peer := Peer}) ->
 %% {connected, _} event back to it.
 set_owner_emits_connected(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
     fun() ->
-        _ServerApSecret = do_handshake(Shell, Peer, ClientSocket, Ctx),
+        _Secrets = do_handshake(Shell, Peer, ClientSocket, Ctx),
         %% do_handshake sent the client Finished before this set_owner, so by
         %% mailbox FIFO the shell is already connected when set_owner runs and
         %% the {connected, _} emit takes the deferred (install_owner) path.
@@ -255,7 +292,13 @@ do_handshake(Shell, Peer, ClientSocket, Ctx) ->
     ),
     Shell ! {quic_datagram, Peer, FinishedDatagram},
     MasterSecret = roadrunner_quic_tls_crypto:master_secret(HandshakeSecret),
-    roadrunner_quic_tls_crypto:traffic_secret(server, application, MasterSecret, FinishedHash).
+    ServerApSecret = roadrunner_quic_tls_crypto:traffic_secret(
+        server, application, MasterSecret, FinishedHash
+    ),
+    ClientApSecret = roadrunner_quic_tls_crypto:traffic_secret(
+        client, application, MasterSecret, FinishedHash
+    ),
+    {ClientApSecret, ServerApSecret}.
 
 %% Collect datagrams the shell sent until a quiet gap (no in-test loss, so
 %% the whole flight arrives back to back).
@@ -270,3 +313,16 @@ recv_all(Socket) ->
 still_running(Shell) ->
     _State = sys:get_state(Shell),
     is_process_alive(Shell).
+
+%% Poll until the shell process has exited (a clean teardown), failing if it
+%% is still alive after the budget of ~20ms ticks.
+wait_dead(_Shell, 0) ->
+    erlang:error(still_alive);
+wait_dead(Shell, N) ->
+    case is_process_alive(Shell) of
+        false ->
+            ok;
+        true ->
+            timer:sleep(20),
+            wait_dead(Shell, N - 1)
+    end.

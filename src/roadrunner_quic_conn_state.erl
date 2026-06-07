@@ -132,12 +132,15 @@
     | {reply, pid(), reference(), term()}.
 
 %% Async owner notifications (conn -> owner). `stream_data` carries the
-%% FIN-only end-of-stream as `{stream_data, Sid, <<>>, true}`.
+%% FIN-only end-of-stream as `{stream_data, Sid, <<>>, true}`. `closed` is the
+%% terminal event; `{peer, ErrorCode}` is a peer CONNECTION_CLOSE (local and
+%% idle-timeout close reasons join it in later teardown slices).
 -type event() ::
     {connected, info()}
     | {stream_opened, non_neg_integer()}
     | {stream_data, non_neg_integer(), binary(), boolean()}
-    | {stream_reset, non_neg_integer(), non_neg_integer()}.
+    | {stream_reset, non_neg_integer(), non_neg_integer()}
+    | {closed, {peer, non_neg_integer()}}.
 
 %% The `connected` payload. The h3 owner ignores it; it carries the
 %% negotiated ALPN and the advertised transport params for forward-compat.
@@ -225,11 +228,20 @@ handle_datagram(Now, Datagram, #state{amp = Amp, recv_keys = RecvKeys, phase = B
         Datagram, ?SCID_LEN, RecvKeys, largest_map(State1)
     ),
     State2 = lists:foldl(fun(O, S) -> process_outcome(Now, O, S) end, State1, Outcomes),
-    {State3, SendEffects} = send_pass(Now, State2),
+    finish_datagram(Now, Before, State2).
+
+%% After folding a datagram's frames: a peer CONNECTION_CLOSE during the fold
+%% closes the connection, so deliver the {closed, _} emit and send nothing
+%% further (RFC 9000 §10.2.2); otherwise run the send pass and drain owner
+%% events, with {connected, _} ordered ahead of any stream events from the
+%% same datagram so the owner opens its control stream before the first
+%% request.
+-spec finish_datagram(integer(), phase(), t()) -> {t(), [effect()]}.
+finish_datagram(_Now, _Before, #state{phase = closed} = State) ->
+    drain_emits(State);
+finish_datagram(Now, Before, State) ->
+    {State3, SendEffects} = send_pass(Now, State),
     {State4, EmitEffects} = drain_emits(State3),
-    %% {connected, _} precedes any stream events drained from the same
-    %% datagram (a coalesced Handshake-Finished + 1-RTT STREAM), so the owner
-    %% opens its control stream before it sees the first request.
     {State4, connected_effects(Before, State4) ++ EmitEffects ++ SendEffects}.
 
 %% Owner events accumulate (newest-first) in #state.emits while the
@@ -378,6 +390,12 @@ record_received(Level, PN, Frames, #state{spaces = Spaces} = State) ->
 %% =============================================================================
 
 -spec process_frame(integer(), level(), roadrunner_quic_frame:frame(), t()) -> t().
+process_frame(_Now, _Level, _Frame, #state{phase = closed} = State) ->
+    %% A CONNECTION_CLOSE earlier in this packet already closed the connection;
+    %% ignore the remaining frames (RFC 9000 §10.2.2).
+    State;
+process_frame(_Now, _Level, {connection_close, _Variant, ErrorCode, _FrameType, _Reason}, State) ->
+    process_close(ErrorCode, State);
 process_frame(_Now, Level, {crypto, Offset, Data}, State) ->
     process_crypto(Level, Offset, Data, State);
 process_frame(Now, Level, {ack, _, _, _, _, _} = Ack, State) ->
@@ -548,6 +566,18 @@ process_reset_stream(Sid, ErrorCode, FinalSize, State) ->
         {error, Reason} ->
             connection_fatal(Reason)
     end.
+
+%% A peer CONNECTION_CLOSE ends the connection: surface it to the owner and
+%% mark the connection closed so the send pass is skipped and the shell exits.
+%% Both the transport (0x1c) and application (0x1d) variants are accepted at
+%% any level here (a clean terminate); rejecting a 0x1d before 1-RTT as a
+%% PROTOCOL_VIOLATION (RFC 9000 §19.19) waits for the graceful error-close
+%% path. Lingering in `draining` for 3x PTO to absorb the peer's reordered
+%% packets is a follow-up; for now the listener drops late packets to the
+%% gone pid.
+-spec process_close(non_neg_integer(), t()) -> t().
+process_close(ErrorCode, State) ->
+    emit({closed, {peer, ErrorCode}}, State#state{phase = closed}).
 
 %% Terminate this single, isolated connection on a peer-reachable protocol
 %% error (flow control §4.1, final size §4.5, stream state §19.8, or a failed
