@@ -47,7 +47,8 @@ Add a new property:
     quic_tls_handshake_matches_dep/1,
     quic_transport_params_matches_dep/1,
     quic_tls_hello_parse_never_crashes/1,
-    quic_tls_auth_certificate_verify_roundtrips/1
+    quic_tls_auth_certificate_verify_roundtrips/1,
+    quic_stream_reassembles/1
 ]).
 
 suite() ->
@@ -85,7 +86,8 @@ all() ->
         quic_tls_handshake_matches_dep,
         quic_transport_params_matches_dep,
         quic_tls_hello_parse_never_crashes,
-        quic_tls_auth_certificate_verify_roundtrips
+        quic_tls_auth_certificate_verify_roundtrips,
+        quic_stream_reassembles
     ].
 
 init_per_suite(Config) ->
@@ -277,5 +279,11 @@ quic_tls_hello_parse_never_crashes(Config) ->
 quic_tls_auth_certificate_verify_roundtrips(Config) ->
     ct_property_test:quickcheck(
         roadrunner_quic_tls_auth_props:prop_certificate_verify_roundtrips(),
+        Config
+    ).
+
+quic_stream_reassembles(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_quic_stream_props:prop_reassembles_in_any_order(),
         Config
     ).
