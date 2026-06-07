@@ -80,8 +80,18 @@
     %% installed by the listener (via set_owner) during handshaking.
     owner :: pid() | undefined,
     %% The `connected` payload, built once at new/1.
-    info :: info()
+    info :: info(),
+    %% Application streams (peer-initiated, application space), each with its
+    %% own receive reassembly + flow window, keyed by stream id.
+    streams = #{} :: #{non_neg_integer() => stream()},
+    %% Connection-level flow control (RFC 9000 §4).
+    conn_flow :: roadrunner_quic_flow:t(),
+    %% Owner events accumulated while folding a datagram's frames, drained in
+    %% order at the end of handle_datagram (newest-first, reversed on drain).
+    emits = [] :: [effect()]
 }).
+
+-type stream() :: {roadrunner_quic_stream:t(), roadrunner_quic_flow:t()}.
 
 -opaque t() :: #state{}.
 
@@ -109,9 +119,13 @@
     | {emit, pid(), event()}
     | {reply, pid(), reference(), term()}.
 
-%% Async owner notifications (conn -> owner); extended with stream events
-%% in a later slice.
--type event() :: {connected, info()}.
+%% Async owner notifications (conn -> owner). `stream_data` carries the
+%% FIN-only end-of-stream as `{stream_data, Sid, <<>>, true}`.
+-type event() ::
+    {connected, info()}
+    | {stream_opened, non_neg_integer()}
+    | {stream_data, non_neg_integer(), binary(), boolean()}
+    | {stream_reset, non_neg_integer(), non_neg_integer()}.
 
 %% The `connected` payload. The h3 owner ignores it; it carries the
 %% negotiated ALPN and the advertised transport params for forward-compat.
@@ -160,7 +174,8 @@ new(#{
         spaces = #{initial => new_space(), handshake => new_space()},
         amp = roadrunner_quic_amp:new(),
         owner = undefined,
-        info = #{alpn => Alpn, transport_params => TransportParams}
+        info = #{alpn => Alpn, transport_params => TransportParams},
+        conn_flow = roadrunner_quic_flow:new(#{})
     }.
 
 -spec new_space() -> #space{}.
@@ -198,8 +213,25 @@ handle_datagram(Now, Datagram, #state{amp = Amp, recv_keys = RecvKeys, phase = B
         Datagram, ?SCID_LEN, RecvKeys, largest_map(State1)
     ),
     State2 = lists:foldl(fun(O, S) -> process_outcome(Now, O, S) end, State1, Outcomes),
-    {State3, Effects} = send_pass(Now, State2),
-    {State3, Effects ++ connected_effects(Before, State3)}.
+    {State3, SendEffects} = send_pass(Now, State2),
+    {State4, EmitEffects} = drain_emits(State3),
+    %% {connected, _} precedes any stream events drained from the same
+    %% datagram (a coalesced Handshake-Finished + 1-RTT STREAM), so the owner
+    %% opens its control stream before it sees the first request.
+    {State4, connected_effects(Before, State4) ++ EmitEffects ++ SendEffects}.
+
+%% Owner events accumulate (newest-first) in #state.emits while the
+%% datagram's frames are folded; hand them back in arrival order and clear.
+-spec drain_emits(t()) -> {t(), [effect()]}.
+drain_emits(#state{emits = Emits} = State) ->
+    {State#state{emits = []}, lists:reverse(Emits)}.
+
+%% Queue an owner event for the current datagram (dropped if no owner yet).
+-spec emit(event(), t()) -> t().
+emit(_Event, #state{owner = undefined} = State) ->
+    State;
+emit(Event, #state{owner = Owner, emits = Emits} = State) ->
+    State#state{emits = [{emit, Owner, Event} | Emits]}.
 
 %% Emit `{connected, Info}` exactly when this datagram drove the
 %% handshaking -> connected transition AND an owner is installed. With no
@@ -294,8 +326,12 @@ process_frame(_Now, Level, {crypto, Offset, Data}, State) ->
     process_crypto(Level, Offset, Data, State);
 process_frame(Now, Level, {ack, _, _, _, _, _} = Ack, State) ->
     process_ack(Now, Level, Ack, State);
+process_frame(_Now, application, {stream, Sid, Offset, Data, Fin}, State) ->
+    process_stream(Sid, Offset, Data, Fin, State);
+process_frame(_Now, application, {reset_stream, Sid, ErrorCode, FinalSize}, State) ->
+    process_reset_stream(Sid, ErrorCode, FinalSize, State);
 process_frame(_Now, _Level, _Frame, State) ->
-    %% ping / padding / (other frames arrive with the application phase).
+    %% ping / padding / peer flow-credit grants (handled with the send side).
     State.
 
 %% Reassemble CRYPTO, deframe complete handshake messages, and drive the
@@ -324,17 +360,29 @@ deframe(Buffer) ->
 
 -spec process_handshake(level(), {byte(), binary()}, t()) -> t().
 process_handshake(initial, {?CLIENT_HELLO, Body}, #state{tls = Tls} = State) ->
-    {ok, #{initial := InitialFlight, handshake := HandshakeFlight}, Installs, Tls1} =
-        roadrunner_quic_tls_server:process_client_hello(Body, Tls),
-    State1 = install_keys(Installs, State#state{tls = Tls1}),
-    State2 = queue_crypto(initial, InitialFlight, State1),
-    queue_crypto(handshake, HandshakeFlight, State2);
+    case roadrunner_quic_tls_server:process_client_hello(Body, Tls) of
+        {ok, #{initial := InitialFlight, handshake := HandshakeFlight}, Installs, Tls1} ->
+            State1 = install_keys(Installs, State#state{tls = Tls1}),
+            State2 = queue_crypto(initial, InitialFlight, State1),
+            queue_crypto(handshake, HandshakeFlight, State2);
+        {error, Reason} ->
+            connection_fatal(Reason)
+    end;
 process_handshake(handshake, {?FINISHED, Body}, #state{tls = Tls} = State) ->
-    ok = roadrunner_quic_tls_server:process_client_finished(Body, Tls),
-    %% Handshake confirmed: discard the Handshake space (RFC 9001 §4.9.2),
-    %% become connected, and send HANDSHAKE_DONE at the application level.
-    State1 = discard_space(handshake, State#state{phase = connected}),
-    queue_frame(application, handshake_done, State1).
+    case roadrunner_quic_tls_server:process_client_finished(Body, Tls) of
+        ok ->
+            %% Handshake confirmed: discard the Handshake space (RFC 9001
+            %% §4.9.2), become connected, and send HANDSHAKE_DONE at the
+            %% application level.
+            State1 = discard_space(handshake, State#state{phase = connected}),
+            queue_frame(application, handshake_done, State1);
+        {error, Reason} ->
+            connection_fatal(Reason)
+    end;
+process_handshake(_Level, {_Type, _Body}, _State) ->
+    %% An out-of-sequence or unknown handshake message (RFC 8446 unexpected
+    %% message); connection-fatal like the other handshake failures.
+    connection_fatal(unexpected_message).
 
 %% Arm the keys the TLS flight produced: server installs protect outgoing
 %% packets, client installs decrypt incoming ones; the Application space
@@ -394,6 +442,94 @@ process_ack(Now, Level, Ack, State) ->
                 State
             )
     end.
+
+%% =============================================================================
+%% Application streams (peer-initiated, receive side)
+%% =============================================================================
+
+%% Reassemble a peer STREAM frame, charging the increase in its highest
+%% received offset against the connection and per-stream receive windows
+%% (RFC 9000 §4.1), so retransmitted or overlapping bytes never re-consume
+%% the window. A STREAM frame on a server-initiated id is the peer writing to
+%% a stream it cannot send on (RFC 9000 §19.8). A flow-control overrun, a
+%% final-size violation, or that stream-state error is connection-fatal and
+%% let-it-crash here (graceful CONNECTION_CLOSE is a later slice). Emits
+%% {stream_opened, Sid} on a peer stream's first frame and {stream_data, Sid,
+%% Bin, Fin} (including the FIN-only {<<>>, true}). Granting more credit
+%% (MAX_DATA / MAX_STREAM_DATA) and seeding the windows from the advertised
+%% transport parameters are send-side follow-ups.
+-spec process_stream(non_neg_integer(), non_neg_integer(), binary(), boolean(), t()) -> t().
+process_stream(Sid, _Offset, _Data, _Fin, _State) when Sid rem 4 =:= 1; Sid rem 4 =:= 3 ->
+    connection_fatal(stream_state_error);
+process_stream(Sid, Offset, Data, Fin, State) ->
+    {Stream0, StreamFlow0, State1} = ensure_stream(Sid, State),
+    #state{conn_flow = ConnFlow} = State1,
+    Delta = max(0, Offset + byte_size(Data) - roadrunner_quic_flow:bytes_received(StreamFlow0)),
+    maybe
+        {ok, ConnFlow1} ?= roadrunner_quic_flow:on_data_received(Delta, ConnFlow),
+        {ok, StreamFlow1} ?= roadrunner_quic_flow:on_data_received(Delta, StreamFlow0),
+        {ok, Deliverable, FinReached, Stream1} ?=
+            roadrunner_quic_stream:receive_data(Offset, Data, Fin, Stream0),
+        State2 = put_stream(Sid, Stream1, StreamFlow1, State1#state{conn_flow = ConnFlow1}),
+        deliver_stream(Sid, Deliverable, FinReached, State2)
+    else
+        {error, Reason} -> connection_fatal(Reason)
+    end.
+
+%% A RESET_STREAM aborts the peer's send side and surfaces the abort code. On
+%% a server-initiated id it is the peer resetting a stream it cannot send on
+%% (RFC 9000 §19.4 STREAM_STATE_ERROR).
+-spec process_reset_stream(non_neg_integer(), non_neg_integer(), non_neg_integer(), t()) -> t().
+process_reset_stream(Sid, _ErrorCode, _FinalSize, _State) when Sid rem 4 =:= 1; Sid rem 4 =:= 3 ->
+    connection_fatal(stream_state_error);
+process_reset_stream(Sid, ErrorCode, FinalSize, State) ->
+    {Stream0, Flow, State1} = ensure_stream(Sid, State),
+    case roadrunner_quic_stream:reset(FinalSize, Stream0) of
+        {ok, Stream1} ->
+            emit({stream_reset, Sid, ErrorCode}, put_stream(Sid, Stream1, Flow, State1));
+        {error, Reason} ->
+            connection_fatal(Reason)
+    end.
+
+%% Terminate this single, isolated connection on a peer-reachable protocol
+%% error (flow control §4.1, final size §4.5, stream state §19.8, or a failed
+%% TLS handshake), tagging it with a named reason. The graceful
+%% CONNECTION_CLOSE + draining response is the teardown slice that replaces
+%% this.
+-spec connection_fatal(atom()) -> no_return().
+connection_fatal(Reason) ->
+    error({quic_connection_error, Reason}).
+
+%% Look up a stream, or create it. The first frame of a peer-initiated stream
+%% is announced with {stream_opened, Sid} (server-initiated ids never reach
+%% here; process_stream/process_reset_stream reject them upstream). Returns
+%% the stream, its flow, and the state carrying any queued event.
+-spec ensure_stream(non_neg_integer(), t()) ->
+    {roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()}.
+ensure_stream(Sid, #state{streams = Streams} = State) ->
+    case Streams of
+        #{Sid := {Stream, Flow}} ->
+            {Stream, Flow, State};
+        #{} ->
+            {
+                roadrunner_quic_stream:new(),
+                roadrunner_quic_flow:new(#{}),
+                emit({stream_opened, Sid}, State)
+            }
+    end.
+
+-spec put_stream(non_neg_integer(), roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()) ->
+    t().
+put_stream(Sid, Stream, Flow, #state{streams = Streams} = State) ->
+    State#state{streams = Streams#{Sid => {Stream, Flow}}}.
+
+%% Emit {stream_data, ...} when there are newly-contiguous bytes OR the FIN
+%% was reached (the FIN-only {<<>>, true} end-of-stream the h3 layer needs).
+-spec deliver_stream(non_neg_integer(), binary(), boolean(), t()) -> t().
+deliver_stream(Sid, Deliverable, FinReached, State) when Deliverable =/= <<>>; FinReached ->
+    emit({stream_data, Sid, Deliverable, FinReached}, State);
+deliver_stream(_Sid, _Deliverable, _FinReached, State) ->
+    State.
 
 %% =============================================================================
 %% Outbound send pass
