@@ -36,7 +36,7 @@
 %% / sent times / the oldest unacknowledged frames, a separate follow-up.
 
 -export([
-    new/1, handle_datagram/3, handle_timeout/3, handle_call/4, handle_send/7, peername/1, phase/1
+    new/2, handle_datagram/3, handle_timeout/3, handle_call/4, handle_send/7, peername/1, phase/1
 ]).
 
 -export_type([t/0, config/0, effect/0, event/0, info/0]).
@@ -50,6 +50,10 @@
 %% frame, the STREAM frame header, and the AEAD tag within the 1200-byte
 %% datagram (RFC 9000 §14).
 -define(STREAM_BUDGET, 1000).
+%% Default idle timeout (RFC 9000 §10.1): the connection silently closes after
+%% this many ms with no packet received. Seeding it from the advertised / peer
+%% max_idle_timeout is a follow-up.
+-define(IDLE_TIMEOUT, 30000).
 %% TLS handshake message types carried in CRYPTO (RFC 8446 §4).
 -define(CLIENT_HELLO, 1).
 -define(FINISHED, 20).
@@ -104,7 +108,14 @@
     %% A locally-detected error to signal: {Level, WireErrorCode} for the one
     %% CONNECTION_CLOSE to transmit at that encryption level. `undefined` for a
     %% live connection or a peer-initiated close (which sends nothing back).
-    pending_close = undefined :: undefined | {level(), non_neg_integer()}
+    pending_close = undefined :: undefined | {level(), non_neg_integer()},
+    %% Absolute time (ms) the connection idle-times-out; reset to Now +
+    %% ?IDLE_TIMEOUT on every received datagram (RFC 9000 §10.1). Always set
+    %% (from new/2's birth time), so it is the timer floor when nothing is in
+    %% flight. Also restarting it on the first ack-eliciting send since the
+    %% last receive (§10.1) is a follow-up; receive-only is conservative
+    %% (it closes no later than a strict implementation would).
+    idle_deadline :: integer()
 }).
 
 -type stream() :: {roadrunner_quic_stream:t(), roadrunner_quic_flow:t()}.
@@ -155,25 +166,29 @@
 %% =============================================================================
 
 -doc """
-Build the connection state from the per-connection config. Bootstraps the
-Initial keys from the client's Destination Connection ID, the TLS server
-sequencer (the server transport parameters already carry the
-original/initial connection ids), and the Initial and Handshake
-packet-number spaces (the Application space appears once 1-RTT keys arm).
+Build the connection state from the per-connection config and the birth time
+`Now` (ms). Bootstraps the Initial keys from the client's Destination
+Connection ID, the TLS server sequencer (the server transport parameters
+already carry the original/initial connection ids), the Initial and Handshake
+packet-number spaces (the Application space appears once 1-RTT keys arm), and
+the idle-timeout deadline anchored at `Now`.
 """.
--spec new(config()) -> t().
-new(#{
-    dcid := DCID,
-    scid := SCID,
-    peer := Peer,
-    cert_chain := CertChain,
-    priv_key := PrivKey,
-    alpn := Alpn,
-    transport_params := TransportParams,
-    eph_pub := EphPub,
-    eph_priv := EphPriv,
-    server_random := ServerRandom
-}) ->
+-spec new(config(), integer()) -> t().
+new(
+    #{
+        dcid := DCID,
+        scid := SCID,
+        peer := Peer,
+        cert_chain := CertChain,
+        priv_key := PrivKey,
+        alpn := Alpn,
+        transport_params := TransportParams,
+        eph_pub := EphPub,
+        eph_priv := EphPriv,
+        server_random := ServerRandom
+    },
+    Now
+) ->
     Tls = roadrunner_quic_tls_server:new(#{
         cert_chain => CertChain,
         priv_key => PrivKey,
@@ -194,7 +209,8 @@ new(#{
         amp = roadrunner_quic_amp:new(),
         owner = undefined,
         info = #{alpn => Alpn, transport_params => TransportParams},
-        conn_flow = roadrunner_quic_flow:new(#{})
+        conn_flow = roadrunner_quic_flow:new(#{}),
+        idle_deadline = Now + ?IDLE_TIMEOUT
     }.
 
 -spec new_space() -> #space{}.
@@ -227,7 +243,10 @@ state and the effects to perform.
 """.
 -spec handle_datagram(integer(), binary(), t()) -> {t(), [effect()]}.
 handle_datagram(Now, Datagram, #state{amp = Amp, recv_keys = RecvKeys, phase = Before} = State0) ->
-    State1 = State0#state{amp = roadrunner_quic_amp:received(byte_size(Datagram), Amp)},
+    State1 = State0#state{
+        amp = roadrunner_quic_amp:received(byte_size(Datagram), Amp),
+        idle_deadline = Now + ?IDLE_TIMEOUT
+    },
     Outcomes = roadrunner_quic_recv:datagram(
         Datagram, ?SCID_LEN, RecvKeys, largest_map(State1)
     ),
@@ -861,15 +880,19 @@ record_one_sent(
 %% =============================================================================
 
 -doc """
-Handle a fired probe timer: re-run loss detection on every space (queueing
-any lost frames to retransmit), back off the probe timeout, then run a send
-pass. The backoff is what guarantees forward progress, so a probe that
-detects no loss re-arms strictly later rather than re-firing immediately.
+Handle a fired timer. A probe timeout (`pto`) re-runs loss detection on every
+space (queueing any lost frames to retransmit), backs off the probe timeout
+(so a probe that detects no loss re-arms strictly later, guaranteeing forward
+progress), then runs a send pass. An idle timeout (`idle`) silently closes the
+connection (RFC 9000 §10.1, no CONNECTION_CLOSE) and surfaces the terminal
+`{closed, _}` event to the owner.
 """.
 -spec handle_timeout(integer(), atom(), t()) -> {t(), [effect()]}.
 handle_timeout(Now, pto, State) ->
     State1 = lists:foldl(fun(Level, S) -> on_pto(Now, Level, S) end, State, present_levels(State)),
-    send_pass(Now, State1).
+    send_pass(Now, State1);
+handle_timeout(_Now, idle, State) ->
+    drain_emits(emit({closed, {local, idle_timeout}}, State#state{phase = closed})).
 
 %% On a probe timeout: queue any time-threshold losses to retransmit and
 %% increment the space's probe-timeout backoff (RFC 9002 §6.2.1), so the
@@ -883,14 +906,22 @@ on_pto(Now, Level, State) ->
     Loss2 = roadrunner_quic_loss:on_pto_expired(Loss1),
     put_space(Level, Space#space{loss = Loss2, pending = Pending ++ retransmittable(Lost)}, State).
 
-%% Arm one probe timer at the earliest per-space deadline (now plus the
-%% space's probe timeout) across spaces that still hold ack-eliciting bytes
-%% in flight; nothing in flight means nothing to probe for, so no timer.
+%% Arm ONE timer at the nearest deadline: the earliest per-space probe timeout
+%% (across spaces with ack-eliciting bytes in flight) or the always-present
+%% idle deadline, whichever is sooner. A single nearest-deadline timer keeps
+%% the per-datagram re-arm to one timer operation; the loser is re-derived
+%% after the winner fires (RFC 9000 §10.1, RFC 9002 §6.2).
 -spec timer_effects(integer(), t()) -> [effect()].
 timer_effects(Now, State) ->
+    {Kind, AtMs} = earliest_deadline(Now, State),
+    [{arm_timer, Kind, AtMs}].
+
+-spec earliest_deadline(integer(), t()) -> {pto | idle, integer()}.
+earliest_deadline(Now, #state{idle_deadline = Idle} = State) ->
     case earliest_pto(Now, State) of
-        undefined -> [];
-        AtMs -> [{arm_timer, pto, AtMs}]
+        undefined -> {idle, Idle};
+        PtoAt when PtoAt =< Idle -> {pto, PtoAt};
+        _PtoAt -> {idle, Idle}
     end.
 
 -spec earliest_pto(integer(), t()) -> integer() | undefined.

@@ -56,7 +56,7 @@ init(Socket, #{peer := Peer} = Config) ->
     loop(#shell{
         socket = Socket,
         peer = Peer,
-        conn = roadrunner_quic_conn_state:new(Config),
+        conn = roadrunner_quic_conn_state:new(Config, erlang:monotonic_time(millisecond)),
         timer = undefined
     }).
 

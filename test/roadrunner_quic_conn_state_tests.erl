@@ -18,6 +18,8 @@
 -define(SCID, <<8, 7, 6, 5, 4, 3, 2, 1>>).
 -define(PEER, {{127, 0, 0, 1}, 12345}).
 -define(NOW, 1000).
+%% Must match roadrunner_quic_conn_state's ?IDLE_TIMEOUT default.
+-define(IDLE_TIMEOUT, 30000).
 
 %% =============================================================================
 %% Construction
@@ -256,6 +258,52 @@ amplification_limit_caps_first_flight_test() ->
     {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, State0),
     ?assertEqual(handshaking, ?M:phase(State1)),
     ?assert(lists:sum([byte_size(D) || D <- sends(Effects)]) =< 3 * 1200).
+
+idle_timeout_closes_test() ->
+    %% A fired idle timer silently closes the connection (RFC 9000 §10.1, no
+    %% CONNECTION_CLOSE) and surfaces {closed, {local, idle_timeout}}.
+    {State, _ApSecret} = connected_with_owner(),
+    {State1, Effects} = ?M:handle_timeout(?NOW, idle, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, idle_timeout}}}], emits(Effects)),
+    ?assertEqual([], sends(Effects)).
+
+idle_timer_armed_when_nothing_in_flight_test() ->
+    %% With no ack-eliciting bytes in flight (the peer just acknowledged the
+    %% server's HANDSHAKE_DONE), the idle deadline (Now + ?IDLE_TIMEOUT) is the
+    %% nearest, and only, timer armed.
+    {State, ApSecret} = connected_with_owner(),
+    Ack = app_datagram([{ack, 0, 0, 0, [], undefined}], 0, ApSecret),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, Ack, State),
+    ?assertEqual([?NOW + ?IDLE_TIMEOUT], [At || {arm_timer, idle, At} <- Effects]).
+
+idle_deadline_reset_on_receive_test() ->
+    %% Each received datagram pushes the idle deadline to that datagram's Now +
+    %% ?IDLE_TIMEOUT (RFC 9000 §10.1 reset-on-receive), proving the reset moved
+    %% the deadline rather than leaving the birth anchor.
+    {State, ApSecret} = connected_with_owner(),
+    Later = ?NOW + 5000,
+    Ack = app_datagram([{ack, 0, 0, 0, [], undefined}], 0, ApSecret),
+    {_State1, Effects} = ?M:handle_datagram(Later, Ack, State),
+    ?assertEqual([Later + ?IDLE_TIMEOUT], [At || {arm_timer, idle, At} <- Effects]).
+
+idle_timer_armed_after_pto_backoff_test() ->
+    %% With data in flight the probe timer is nearer (armed FIRST); only once
+    %% repeated probe backoffs push the PTO deadline past the idle deadline is
+    %% the idle timer armed instead.
+    {State, _ApSecret} = connected_with_owner(),
+    {State1, Effects1} = ?M:handle_timeout(?NOW, pto, State),
+    ?assertNotEqual([], [At || {arm_timer, pto, At} <- Effects1]),
+    ?assertNotEqual([], drive_until_idle_armed(State1, 12)).
+
+drive_until_idle_armed(_State, 0) ->
+    [];
+drive_until_idle_armed(State, N) ->
+    {State1, Effects} = ?M:handle_timeout(?NOW, pto, State),
+    case [At || {arm_timer, idle, At} <- Effects] of
+        [] -> drive_until_idle_armed(State1, N - 1);
+        Idle -> Idle
+    end.
 
 %% =============================================================================
 %% Control calls + owner notification
@@ -746,18 +794,21 @@ new_conn(CertChain) ->
     {ClientPub, ClientPriv} = ?TC:gen_keypair(),
     {ServerPub, ServerPriv} = ?TC:gen_keypair(),
     TransportParams = transport_params(),
-    State = ?M:new(#{
-        dcid => ?DCID,
-        scid => ?SCID,
-        peer => ?PEER,
-        cert_chain => CertChain,
-        priv_key => PrivKey,
-        alpn => ~"h3",
-        transport_params => TransportParams,
-        eph_pub => ServerPub,
-        eph_priv => ServerPriv,
-        server_random => crypto:strong_rand_bytes(32)
-    }),
+    State = ?M:new(
+        #{
+            dcid => ?DCID,
+            scid => ?SCID,
+            peer => ?PEER,
+            cert_chain => CertChain,
+            priv_key => PrivKey,
+            alpn => ~"h3",
+            transport_params => TransportParams,
+            eph_pub => ServerPub,
+            eph_priv => ServerPriv,
+            server_random => crypto:strong_rand_bytes(32)
+        },
+        ?NOW
+    ),
     {State, #{
         scheme => Scheme,
         client_pub => ClientPub,
