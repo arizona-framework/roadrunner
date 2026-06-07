@@ -17,6 +17,8 @@
 shell_test_() ->
     {foreach, fun setup/0, fun cleanup/1, [
         fun handshake_completes/1,
+        fun peername_round_trip/1,
+        fun set_owner_emits_connected/1,
         fun system_message_handled/1,
         fun unsupported_call_replies/1,
         fun cast_ignored/1,
@@ -45,70 +47,48 @@ cleanup(#{shell := Shell, client := ClientSocket, server := ServerSocket}) ->
 
 handshake_completes(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
     fun() ->
-        #{client_priv := ClientPriv, server_pub := ServerPub} = Ctx,
-
-        %% Client Initial -> the shell answers with its first flight.
-        {InitialDatagram, ClientHelloFramed} = client_hello(Ctx),
-        Shell ! {quic_datagram, Peer, InitialDatagram},
-        Flight1 = recv_all(ClientSocket),
-
-        ServerHello = ?TC:crypto_bytes(
-            Flight1,
-            initial,
-            #{initial => roadrunner_quic_keys:initial_server(?DCID)},
-            byte_size(?DCID)
-        ),
-        ?assertNotEqual(<<>>, ServerHello),
-        Shared = crypto:compute_key(ecdh, ServerPub, ClientPriv, x25519),
-        HandshakeSecret = roadrunner_quic_tls_crypto:handshake_secret(
-            roadrunner_quic_tls_crypto:early_secret(), Shared
-        ),
-        HelloHash = roadrunner_quic_tls_crypto:transcript_hash([ClientHelloFramed, ServerHello]),
-        ClientHsSecret = roadrunner_quic_tls_crypto:traffic_secret(
-            client, handshake, HandshakeSecret, HelloHash
-        ),
-        ServerHsSecret = roadrunner_quic_tls_crypto:traffic_secret(
-            server, handshake, HandshakeSecret, HelloHash
-        ),
-        Flight = ?TC:crypto_bytes(
-            Flight1,
-            handshake,
-            #{handshake => roadrunner_quic_keys:traffic_keys(ServerHsSecret)},
-            byte_size(?DCID)
-        ),
-        FinishedHash = roadrunner_quic_tls_crypto:transcript_hash([
-            ClientHelloFramed, ServerHello, Flight
-        ]),
-
-        %% Client Finished -> the shell becomes connected and sends HANDSHAKE_DONE.
-        ClientFinishedBody = roadrunner_quic_tls_crypto:verify_data(
-            roadrunner_quic_tls_crypto:finished_key(ClientHsSecret), FinishedHash
-        ),
-        ClientFinishedFramed = iolist_to_binary(
-            roadrunner_quic_tls_handshake:encode(?FINISHED, ClientFinishedBody)
-        ),
-        FinishedDatagram = ?TC:seal(
-            handshake,
-            0,
-            roadrunner_quic_keys:traffic_keys(ClientHsSecret),
-            [{crypto, 0, ClientFinishedFramed}],
-            ?DCID,
-            ?SCID
-        ),
-        Shell ! {quic_datagram, Peer, FinishedDatagram},
-        Flight2 = recv_all(ClientSocket),
-
-        MasterSecret = roadrunner_quic_tls_crypto:master_secret(HandshakeSecret),
-        ServerApSecret = roadrunner_quic_tls_crypto:traffic_secret(
-            server, application, MasterSecret, FinishedHash
-        ),
+        ServerApSecret = do_handshake(Shell, Peer, ClientSocket, Ctx),
         AppFrames = ?TC:frames(
-            Flight2,
+            recv_all(ClientSocket),
             application,
             #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
             byte_size(?DCID)
         ),
         ?assert(lists:member(handshake_done, AppFrames))
+    end.
+
+%% A synchronous peername control call round-trips through the shell.
+peername_round_trip(#{shell := Shell, peer := Peer}) ->
+    fun() ->
+        Ref = make_ref(),
+        Shell ! {quic_call, self(), Ref, peername},
+        receive
+            {quic_reply, Ref, Result} -> ?assertEqual({ok, Peer}, Result)
+        after 1000 ->
+            erlang:error(no_reply)
+        end
+    end.
+
+%% Installing this process as owner on a connected shell emits the once-only
+%% {connected, _} event back to it.
+set_owner_emits_connected(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
+    fun() ->
+        _ServerApSecret = do_handshake(Shell, Peer, ClientSocket, Ctx),
+        %% do_handshake sent the client Finished before this set_owner, so by
+        %% mailbox FIFO the shell is already connected when set_owner runs and
+        %% the {connected, _} emit takes the deferred (install_owner) path.
+        Ref = make_ref(),
+        Shell ! {quic_call, self(), Ref, {set_owner, self()}},
+        receive
+            {quic_reply, Ref, ok} -> ok
+        after 1000 ->
+            erlang:error(no_reply)
+        end,
+        receive
+            {quic, Shell, {connected, Info}} -> ?assertMatch(#{alpn := _}, Info)
+        after 1000 ->
+            erlang:error(no_connected_event)
+        end
     end.
 
 %% =============================================================================
@@ -203,6 +183,57 @@ client_hello(#{scheme := Scheme, client_pub := ClientPub}) ->
         initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
     ),
     {Datagram, Framed}.
+
+%% Drive the shell to `connected`: feed the ClientHello, derive the schedule
+%% from the server's flight, then feed the client Finished. The shell sends
+%% HANDSHAKE_DONE (left on the socket for the caller). Returns the server
+%% application secret for decoding the 1-RTT reply.
+do_handshake(Shell, Peer, ClientSocket, Ctx) ->
+    #{client_priv := ClientPriv, server_pub := ServerPub} = Ctx,
+    {InitialDatagram, ClientHelloFramed} = client_hello(Ctx),
+    Shell ! {quic_datagram, Peer, InitialDatagram},
+    Flight1 = recv_all(ClientSocket),
+    ServerHello = ?TC:crypto_bytes(
+        Flight1, initial, #{initial => roadrunner_quic_keys:initial_server(?DCID)}, byte_size(?DCID)
+    ),
+    ?assertNotEqual(<<>>, ServerHello),
+    Shared = crypto:compute_key(ecdh, ServerPub, ClientPriv, x25519),
+    HandshakeSecret = roadrunner_quic_tls_crypto:handshake_secret(
+        roadrunner_quic_tls_crypto:early_secret(), Shared
+    ),
+    HelloHash = roadrunner_quic_tls_crypto:transcript_hash([ClientHelloFramed, ServerHello]),
+    ClientHsSecret = roadrunner_quic_tls_crypto:traffic_secret(
+        client, handshake, HandshakeSecret, HelloHash
+    ),
+    ServerHsSecret = roadrunner_quic_tls_crypto:traffic_secret(
+        server, handshake, HandshakeSecret, HelloHash
+    ),
+    Flight = ?TC:crypto_bytes(
+        Flight1,
+        handshake,
+        #{handshake => roadrunner_quic_keys:traffic_keys(ServerHsSecret)},
+        byte_size(?DCID)
+    ),
+    FinishedHash = roadrunner_quic_tls_crypto:transcript_hash([
+        ClientHelloFramed, ServerHello, Flight
+    ]),
+    ClientFinishedBody = roadrunner_quic_tls_crypto:verify_data(
+        roadrunner_quic_tls_crypto:finished_key(ClientHsSecret), FinishedHash
+    ),
+    ClientFinishedFramed = iolist_to_binary(
+        roadrunner_quic_tls_handshake:encode(?FINISHED, ClientFinishedBody)
+    ),
+    FinishedDatagram = ?TC:seal(
+        handshake,
+        0,
+        roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+        [{crypto, 0, ClientFinishedFramed}],
+        ?DCID,
+        ?SCID
+    ),
+    Shell ! {quic_datagram, Peer, FinishedDatagram},
+    MasterSecret = roadrunner_quic_tls_crypto:master_secret(HandshakeSecret),
+    roadrunner_quic_tls_crypto:traffic_secret(server, application, MasterSecret, FinishedHash).
 
 %% Collect datagrams the shell sent until a quiet gap (no in-test loss, so
 %% the whole flight arrives back to back).

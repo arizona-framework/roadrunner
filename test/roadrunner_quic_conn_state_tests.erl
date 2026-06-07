@@ -194,6 +194,78 @@ amplification_limit_caps_first_flight_test() ->
     ?assert(lists:sum([byte_size(D) || D <- sends(Effects)]) =< 3 * 1200).
 
 %% =============================================================================
+%% Control calls + owner notification
+%% =============================================================================
+
+peername_call_replies_test() ->
+    {State, _Ctx} = new_conn([~"leaf-cert-der"]),
+    Ref = make_ref(),
+    ?assertEqual(
+        {State, [{reply, self(), Ref, {ok, ?PEER}}]},
+        ?M:handle_call(self(), Ref, peername, State)
+    ).
+
+owner_set_in_handshaking_gets_connected_on_completion_test() ->
+    %% The normal listener ordering: the owner is installed while still
+    %% handshaking (no emit yet), then the confirming datagram emits
+    %% {connected, _} to it exactly once.
+    #{state1 := State1, client_hs_secret := ClientHsSecret, cf_framed := ClientFinished} = connect(),
+    Owner = self(),
+    Ref = make_ref(),
+    {State1b, Installed} = ?M:handle_call(Owner, Ref, {set_owner, Owner}, State1),
+    ?assertEqual([{reply, Owner, Ref, ok}], Installed),
+    Datagram = ?TC:seal(
+        handshake,
+        0,
+        roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+        [{crypto, 0, ClientFinished}],
+        ?DCID,
+        ?SCID
+    ),
+    {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, State1b),
+    ?assertEqual(connected, ?M:phase(State2)),
+    ?assertEqual([{emit, Owner, {connected, expected_info()}}], emits(Effects)).
+
+owner_set_after_connection_gets_connected_now_test() ->
+    %% The deferred ordering: if the handshake confirms before the owner is
+    %% installed, set_owner emits {connected, _} immediately.
+    #{state2 := State2} = connect(),
+    Owner = self(),
+    Ref = make_ref(),
+    {_State3, Effects} = ?M:handle_call(Owner, Ref, {set_owner, Owner}, State2),
+    ?assertEqual([{reply, Owner, Ref, ok}, {emit, Owner, {connected, expected_info()}}], Effects).
+
+connected_not_re_emitted_on_later_datagram_test() ->
+    %% The once-only guard: with an owner installed, a datagram AFTER the
+    %% connection completes must NOT re-emit {connected, _}. There is no
+    %% emitted-flag; this pins that the emit rides the handshaking -> connected
+    %% transition only, so dropping that guard would be caught here.
+    #{
+        state1 := State1,
+        client_hs_secret := ClientHsSecret,
+        cf_framed := ClientFinished,
+        client_ap_secret := ClientApSecret
+    } = connect(),
+    Owner = self(),
+    {State1b, _} = ?M:handle_call(Owner, make_ref(), {set_owner, Owner}, State1),
+    Finished = ?TC:seal(
+        handshake,
+        0,
+        roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+        [{crypto, 0, ClientFinished}],
+        ?DCID,
+        ?SCID
+    ),
+    {State2, FirstEffects} = ?M:handle_datagram(?NOW, Finished, State1b),
+    ?assertEqual([{emit, Owner, {connected, expected_info()}}], emits(FirstEffects)),
+    %% A processed 1-RTT packet once connected: still exactly zero re-emits.
+    AppPing = ?TC:seal(
+        application, 0, roadrunner_quic_keys:traffic_keys(ClientApSecret), [ping], ?DCID, ?SCID
+    ),
+    {_State3, LaterEffects} = ?M:handle_datagram(?NOW, AppPing, State2),
+    ?assertEqual([], emits(LaterEffects)).
+
+%% =============================================================================
 %% Handshake driver (plays the QUIC client with the shared test client)
 %% =============================================================================
 
@@ -252,10 +324,14 @@ connect() ->
     ),
     {State2, Effects2} = ?M:handle_datagram(?NOW, HandshakeDatagram, State1),
 
-    %% Application keys, for reading the HANDSHAKE_DONE.
+    %% Application keys, for reading the HANDSHAKE_DONE and sealing a
+    %% post-connected client 1-RTT packet.
     MasterSecret = roadrunner_quic_tls_crypto:master_secret(HandshakeSecret),
     ServerApSecret = roadrunner_quic_tls_crypto:traffic_secret(
         server, application, MasterSecret, FinishedHash
+    ),
+    ClientApSecret = roadrunner_quic_tls_crypto:traffic_secret(
+        client, application, MasterSecret, FinishedHash
     ),
 
     #{
@@ -269,6 +345,7 @@ connect() ->
         cf_framed => ClientFinishedFramed,
         client_hs_secret => ClientHsSecret,
         server_ap_secret => ServerApSecret,
+        client_ap_secret => ClientApSecret,
         ctx => Ctx
     }.
 
@@ -277,10 +354,7 @@ new_conn(CertChain) ->
     {Scheme, PrivKey} = ?TC:key_material(),
     {ClientPub, ClientPriv} = ?TC:gen_keypair(),
     {ServerPub, ServerPriv} = ?TC:gen_keypair(),
-    TransportParams = #{
-        original_destination_connection_id => ?DCID,
-        initial_source_connection_id => ?SCID
-    },
+    TransportParams = transport_params(),
     State = ?M:new(#{
         dcid => ?DCID,
         scid => ?SCID,
@@ -314,6 +388,16 @@ sends(Effects) ->
 
 is_ack({ack, _Largest, _Delay, _First, _Ranges, _Ecn}) -> true;
 is_ack(_Frame) -> false.
+
+transport_params() ->
+    #{original_destination_connection_id => ?DCID, initial_source_connection_id => ?SCID}.
+
+%% The connected payload conn_state caches at new/1 (alpn + advertised params).
+expected_info() ->
+    #{alpn => ~"h3", transport_params => transport_params()}.
+
+emits(Effects) ->
+    [Emit || {emit, _Owner, _Event} = Emit <- Effects].
 
 arm_deadline(Effects) ->
     [AtMs] = [At || {arm_timer, pto, At} <- Effects],

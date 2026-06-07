@@ -12,8 +12,9 @@
 %% gate; the shell only does the irreducible I/O.
 %%
 %% Effects: `{send, Datagram}` (hand to the socket), `{arm_timer, Kind,
-%% AtMs}` ((re)arm a timer). The owner events and control replies arrive
-%% with the application phase.
+%% AtMs}` ((re)arm a timer), `{emit, Owner, Event}` (async owner
+%% notification, e.g. `{connected, Info}`), and `{reply, To, Ref, Result}`
+%% (answer a synchronous control call).
 %%
 %% A connection keeps up to three packet-number spaces (Initial, Handshake,
 %% Application). The server reads with the peer's keys and writes with its
@@ -33,9 +34,9 @@
 %% sending an explicit probe both need the loss layer to surface acked bytes
 %% / sent times / the oldest unacknowledged frames, a separate follow-up.
 
--export([new/1, handle_datagram/3, handle_timeout/3, peername/1, phase/1]).
+-export([new/1, handle_datagram/3, handle_timeout/3, handle_call/4, peername/1, phase/1]).
 
--export_type([t/0, config/0, effect/0]).
+-export_type([t/0, config/0, effect/0, event/0, info/0]).
 
 %% RFC 9000 §17.2: the server uses a fixed-length SCID so short headers demux.
 -define(SCID_LEN, 8).
@@ -47,6 +48,7 @@
 -define(FINISHED, 20).
 
 -type level() :: initial | handshake | application.
+-type phase() :: handshaking | connected | draining | closed.
 
 -record(space, {
     ack :: roadrunner_quic_ack:t(),
@@ -64,7 +66,7 @@
     dcid :: binary(),
     scid :: binary(),
     peer :: {inet:ip_address(), inet:port_number()},
-    phase = handshaking :: handshaking | connected | draining | closed,
+    phase = handshaking :: phase(),
     tls :: roadrunner_quic_tls_server:t(),
     %% Keys to decrypt incoming packets (the peer's), by level.
     recv_keys :: #{level() => roadrunner_quic_keys:keys()},
@@ -73,7 +75,12 @@
     spaces :: #{level() => #space{}},
     amp :: roadrunner_quic_amp:t(),
     %% Cleared once a Handshake packet decrypts (address validated, §8.1).
-    validated = false :: boolean()
+    validated = false :: boolean(),
+    %% The application owner: the async sink for `{emit, _, _}` events,
+    %% installed by the listener (via set_owner) during handshaking.
+    owner :: pid() | undefined,
+    %% The `connected` payload, built once at new/1.
+    info :: info()
 }).
 
 -opaque t() :: #state{}.
@@ -93,7 +100,22 @@
 
 %% A monotonic-clock millisecond, the same epoch `erlang:monotonic_time/1`
 %% returns (negative on the BEAM), so an `arm_timer` deadline is `integer()`.
--type effect() :: {send, binary()} | {arm_timer, atom(), integer()}.
+%% `{emit, Owner, Event}` is an async owner notification (the shell does
+%% `Owner ! {quic, self(), Event}`); `{reply, To, Ref, Result}` answers a
+%% synchronous control call.
+-type effect() ::
+    {send, binary()}
+    | {arm_timer, atom(), integer()}
+    | {emit, pid(), event()}
+    | {reply, pid(), reference(), term()}.
+
+%% Async owner notifications (conn -> owner); extended with stream events
+%% in a later slice.
+-type event() :: {connected, info()}.
+
+%% The `connected` payload. The h3 owner ignores it; it carries the
+%% negotiated ALPN and the advertised transport params for forward-compat.
+-type info() :: #{alpn := binary(), transport_params := roadrunner_quic_transport_params:params()}.
 
 %% =============================================================================
 %% Construction
@@ -136,7 +158,9 @@ new(#{
         recv_keys = #{initial => roadrunner_quic_keys:initial_client(DCID)},
         send_keys = #{initial => roadrunner_quic_keys:initial_server(DCID)},
         spaces = #{initial => new_space(), handshake => new_space()},
-        amp = roadrunner_quic_amp:new()
+        amp = roadrunner_quic_amp:new(),
+        owner = undefined,
+        info = #{alpn => Alpn, transport_params => TransportParams}
     }.
 
 -spec new_space() -> #space{}.
@@ -153,7 +177,7 @@ peername(#state{peer = Peer}) ->
     {ok, Peer}.
 
 -doc "The connection's current phase.".
--spec phase(t()) -> handshaking | connected | draining | closed.
+-spec phase(t()) -> phase().
 phase(#state{phase = Phase}) ->
     Phase.
 
@@ -168,13 +192,55 @@ frames into the connection state, then run a send pass. Returns the new
 state and the effects to perform.
 """.
 -spec handle_datagram(integer(), binary(), t()) -> {t(), [effect()]}.
-handle_datagram(Now, Datagram, #state{amp = Amp, recv_keys = RecvKeys} = State0) ->
+handle_datagram(Now, Datagram, #state{amp = Amp, recv_keys = RecvKeys, phase = Before} = State0) ->
     State1 = State0#state{amp = roadrunner_quic_amp:received(byte_size(Datagram), Amp)},
     Outcomes = roadrunner_quic_recv:datagram(
         Datagram, ?SCID_LEN, RecvKeys, largest_map(State1)
     ),
     State2 = lists:foldl(fun(O, S) -> process_outcome(Now, O, S) end, State1, Outcomes),
-    send_pass(Now, State2).
+    {State3, Effects} = send_pass(Now, State2),
+    {State3, Effects ++ connected_effects(Before, State3)}.
+
+%% Emit `{connected, Info}` exactly when this datagram drove the
+%% handshaking -> connected transition AND an owner is installed. With no
+%% owner yet (the listener has not run set_owner), the emit is deferred to
+%% install_owner. The two sites are mutually exclusive, so it fires once.
+-spec connected_effects(phase(), t()) -> [effect()].
+connected_effects(handshaking, #state{phase = connected, owner = Owner, info = Info}) when
+    is_pid(Owner)
+->
+    [{emit, Owner, {connected, Info}}];
+connected_effects(_Before, _State) ->
+    [].
+
+%% =============================================================================
+%% Control calls (owner / listener -> conn, synchronous)
+%% =============================================================================
+
+-doc """
+Answer a synchronous control call: the shell forwards `{quic_call, From,
+Ref, Request}` here and performs the returned `{reply, From, Ref, Result}`
+(plus any deferred `{emit, _, _}`). Owner and listener calls into the
+connection are synchronous; the connection only ever notifies the owner
+with async `{emit, _, _}` effects, so it never blocks on the owner.
+""".
+-spec handle_call(pid(), reference(), Request, t()) -> {t(), [effect()]} when
+    Request :: peername | {set_owner, pid()}.
+handle_call(From, Ref, peername, #state{peer = Peer} = State) ->
+    {State, [{reply, From, Ref, {ok, Peer}}]};
+handle_call(From, Ref, {set_owner, Owner}, State) ->
+    {State1, EmitEffects} = install_owner(Owner, State),
+    {State1, [{reply, From, Ref, ok} | EmitEffects]}.
+
+%% Install the owner. When the handshake already completed before the owner
+%% was set (the deferred path), emit the once-only `{connected, Info}` now;
+%% normally the listener sets the owner during handshaking, so the emit
+%% instead rides out of handle_datagram at the transition.
+-spec install_owner(pid(), t()) -> {t(), [effect()]}.
+install_owner(Owner, #state{phase = connected, info = Info} = State) ->
+    {State#state{owner = Owner}, [{emit, Owner, {connected, Info}}]};
+install_owner(Owner, State) ->
+    {State#state{owner = Owner}, []}.
 
 -spec process_outcome(integer(), roadrunner_quic_recv:outcome(), t()) -> t().
 process_outcome(

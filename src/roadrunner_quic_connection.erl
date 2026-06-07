@@ -16,6 +16,12 @@
 %% `{send, Datagram}` goes out the socket to the peer, and `{arm_timer,
 %% Kind, AtMs}` (re)arms a self-tagged timer whose stale fires (from a timer
 %% that was re-armed before firing) are dropped by a reference match.
+%%
+%% Synchronous control calls from the owner or listener arrive as
+%% `{quic_call, From, Ref, Request}` and are answered with a `{reply, From,
+%% Ref, Result}` effect; owner notifications go out as async `{emit, Owner,
+%% Event}` effects (`Owner ! {quic, self(), Event}`). The connection only
+%% ever sends to the owner asynchronously, so it never blocks on it.
 
 -export([start/2]).
 -export([init/2]).
@@ -65,6 +71,12 @@ loop(State) ->
             loop(State);
         {'$gen_cast', _Request} ->
             loop(State);
+        {quic_call, From, Ref, Request} ->
+            Now = erlang:monotonic_time(millisecond),
+            {Conn, Effects} = roadrunner_quic_conn_state:handle_call(
+                From, Ref, Request, State#shell.conn
+            ),
+            loop(perform(Effects, Now, State#shell{conn = Conn}));
         {quic_datagram, _Peer, Datagram} ->
             Now = erlang:monotonic_time(millisecond),
             {Conn, Effects} = roadrunner_quic_conn_state:handle_datagram(
@@ -98,6 +110,12 @@ perform(Effects, Now, State) ->
 -spec perform_effect(roadrunner_quic_conn_state:effect(), integer(), #shell{}) -> #shell{}.
 perform_effect({send, Datagram}, _Now, #shell{socket = Socket, peer = {Ip, Port}} = State) ->
     _ = roadrunner_quic_socket:send(Socket, Ip, Port, Datagram),
+    State;
+perform_effect({emit, Owner, Event}, _Now, State) ->
+    _ = Owner ! {quic, self(), Event},
+    State;
+perform_effect({reply, To, Ref, Result}, _Now, State) ->
+    _ = To ! {quic_reply, Ref, Result},
     State;
 perform_effect({arm_timer, Kind, AtMs}, Now, #shell{timer = Prev} = State) ->
     _ = cancel(Prev),
