@@ -1,30 +1,37 @@
 -module(roadrunner_quic_stream).
 -moduledoc false.
 
-%% QUIC stream receive-side reassembly (RFC 9000 §2.2/§4.5), pure.
+%% QUIC stream state (RFC 9000 §2/§3), pure: both directions of one stream.
 %%
-%% A per-stream state that turns out-of-order, overlapping, and
-%% retransmitted STREAM frame pieces into the in-order byte stream the
-%% application reads. The connection loop holds one of these per stream id
-%% (the peer of `roadrunner_quic_flow`, which it also holds per stream),
-%% feeds each received STREAM frame in with `receive_data/4`, and turns the
-%% result into a `{stream_data, StreamId, Bytes, Fin}` event, including the
-%% FIN-only `{<<>>, true}` case the HTTP/3 layer dispatches a request on.
-%% A RESET_STREAM aborts the receive side via `reset/2`.
+%% RECEIVE side: turns out-of-order, overlapping, and retransmitted STREAM
+%% frame pieces into the in-order byte stream the application reads. The
+%% connection loop feeds each received STREAM frame in with
+%% `receive_data/4` and turns the result into a `{stream_data, StreamId,
+%% Bytes, Fin}` event, including the FIN-only `{<<>>, true}` case the
+%% HTTP/3 layer dispatches a request on. A RESET_STREAM aborts the receive
+%% side via `reset/2`. Buffered out-of-order data is a sorted,
+%% non-overlapping list of `{Offset, Bytes}` segments (overlaps trimmed on
+%% insert, since the bytes at an offset never change), so the contiguous
+%% prefix drains cleanly from the read cursor.
 %%
-%% Pure and stateless about windows: flow control (the receive-window
-%% limit and MAX_STREAM_DATA grants) stays in the loop's
-%% `roadrunner_quic_flow`, which already returns `flow_control_error`. This
-%% module owns only ordering and the RFC 9000 §4.5 final-size rules, so it
-%% returns `final_size_error` and nothing else. The outbound send buffer is
-%% a separate concern, added in a follow-up.
+%% SEND side: holds only the not-yet-sent bytes plus the send offset. The
+%% loop `enqueue/2`s outbound bytes, `finish/1`es the stream, and pulls the
+%% next STREAM-frame slice with `next_frame/2` within a byte budget it
+%% computed from flow credit; the FIN rides the slice that drains the
+%% buffer (or a lone empty frame when there is no data left), once.
+%% Retransmission is the loop's loss layer replaying the frames it recorded,
+%% so this buffer keeps no sent-but-unacknowledged copy. A received
+%% STOP_SENDING clears the buffer via `stop_sending/1`.
 %%
-%% Buffered out-of-order data is kept as a sorted, non-overlapping list of
-%% `{Offset, Bytes}` segments (overlaps are trimmed on insert, since the
-%% bytes at an offset never change), so the contiguous prefix drains
-%% cleanly from the read cursor.
+%% Pure and stateless about windows: flow control (both the receive-window
+%% limit / MAX_STREAM_DATA grants and the send credit) stays in the loop's
+%% `roadrunner_quic_flow`. This module owns ordering, the RFC 9000 §4.5
+%% final-size rules (returning `final_size_error`), and the send-offset /
+%% FIN bookkeeping. The loop holds one of these per stream id, alongside
+%% the per-stream flow window.
 
 -export([new/0, receive_data/4, reset/2]).
+-export([enqueue/2, finish/1, next_frame/2, stop_sending/1, send_pending/1]).
 
 -export_type([t/0]).
 
@@ -42,7 +49,16 @@
     fin_delivered = false :: boolean(),
     %% Set by a RESET_STREAM: the receive side is aborted, so later STREAM
     %% frames deliver nothing (RFC 9000 §3.2).
-    aborted = false :: boolean()
+    aborted = false :: boolean(),
+    %% Send side: the offset of the next byte to put on the wire.
+    send_offset = 0 :: non_neg_integer(),
+    %% Send side: the bytes enqueued but not yet sliced into a frame.
+    send_buf = <<>> :: binary(),
+    %% Send side: whether finish/1 has marked the stream's FIN.
+    send_fin = false :: boolean(),
+    %% Send side: whether a slice carrying the FIN has been produced, so it
+    %% is not emitted twice (a retransmit replays the recorded frame).
+    fin_sent = false :: boolean()
 }).
 
 -opaque t() :: #stream{}.
@@ -105,6 +121,66 @@ reset(FinalSize, #stream{final_size = Existing} = Stream) ->
         true -> {error, final_size_error};
         false -> {ok, Stream#stream{final_size = FinalSize, segments = [], aborted = true}}
     end.
+
+%% =============================================================================
+%% Send side
+%% =============================================================================
+
+-doc "Append outbound bytes to the stream's send buffer.".
+-spec enqueue(iodata(), t()) -> t().
+enqueue(Data, #stream{send_buf = Buf} = Stream) ->
+    Stream#stream{send_buf = <<Buf/binary, (iolist_to_binary(Data))/binary>>}.
+
+-doc """
+Mark the stream's FIN; the next slice that drains the send buffer carries
+it (or a lone empty frame when there is no data left). Idempotent.
+""".
+-spec finish(t()) -> t().
+finish(#stream{} = Stream) ->
+    Stream#stream{send_fin = true}.
+
+-doc """
+Produce the next STREAM-frame slice, at most `MaxBytes` data bytes (the
+loop's flow/packet budget). Returns `{Offset, Data, Fin, State}` where
+`Offset` is the slice's first byte and `Fin` is set only when the slice
+drains the buffer on a finished stream, or `nothing` when there is no data
+and no pending FIN (or the FIN was already produced). A FIN with no data
+left is a single empty frame, emitted once.
+""".
+-spec next_frame(non_neg_integer(), t()) ->
+    {non_neg_integer(), binary(), boolean(), t()} | nothing.
+next_frame(_MaxBytes, #stream{fin_sent = true}) ->
+    nothing;
+next_frame(_MaxBytes, #stream{send_buf = <<>>, send_fin = false}) ->
+    nothing;
+next_frame(_MaxBytes, #stream{send_buf = <<>>, send_fin = true, send_offset = Offset} = Stream) ->
+    {Offset, <<>>, true, Stream#stream{fin_sent = true}};
+next_frame(MaxBytes, #stream{send_buf = Buf, send_offset = Offset, send_fin = SendFin} = Stream) ->
+    case min(MaxBytes, byte_size(Buf)) of
+        0 ->
+            nothing;
+        Take ->
+            <<Slice:Take/binary, Rest/binary>> = Buf,
+            Fin = SendFin andalso Rest =:= <<>>,
+            {Offset, Slice, Fin, Stream#stream{
+                send_offset = Offset + Take, send_buf = Rest, fin_sent = Fin
+            }}
+    end.
+
+-doc """
+Stop sending on a received STOP_SENDING (RFC 9000 §3.5): discard the
+unsent buffer and cancel any pending FIN, so `next_frame/2` produces
+nothing more. The loop sends a RESET_STREAM separately.
+""".
+-spec stop_sending(t()) -> t().
+stop_sending(#stream{} = Stream) ->
+    Stream#stream{send_buf = <<>>, send_fin = false}.
+
+-doc "Whether the stream has unsent data or an unsent FIN to send.".
+-spec send_pending(t()) -> boolean().
+send_pending(#stream{fin_sent = true}) -> false;
+send_pending(#stream{send_buf = <<>>, send_fin = false}) -> false;
+send_pending(#stream{}) -> true.
 
 %% =============================================================================
 %% Internal

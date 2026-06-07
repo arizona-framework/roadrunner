@@ -158,3 +158,96 @@ reset_aborts_receive_test() ->
     {ok, D, FinReached, _} = ?M:receive_data(0, <<"ab">>, false, S2),
     ?assertEqual(<<>>, D),
     ?assertNot(FinReached).
+
+%% =============================================================================
+%% Send side.
+%% =============================================================================
+
+next_frame_single_slice_test() ->
+    S = ?M:enqueue(<<"hello">>, ?M:new()),
+    {Offset, Data, Fin, _} = ?M:next_frame(100, S),
+    ?assertEqual({0, <<"hello">>, false}, {Offset, Data, Fin}).
+
+next_frame_budget_split_test() ->
+    S = ?M:enqueue(<<"abcdef">>, ?M:new()),
+    {0, <<"abcd">>, false, S1} = ?M:next_frame(4, S),
+    {4, <<"ef">>, false, _} = ?M:next_frame(4, S1).
+
+enqueue_after_partial_send_test() ->
+    %% A later enqueue appends in order to the unsent remainder, and the
+    %% next slice starts at the advanced send offset.
+    S0 = ?M:enqueue(<<"abcd">>, ?M:new()),
+    {0, <<"ab">>, false, S1} = ?M:next_frame(2, S0),
+    S2 = ?M:enqueue(<<"ef">>, S1),
+    {2, <<"cdef">>, false, _} = ?M:next_frame(100, S2).
+
+next_frame_nothing_when_empty_test() ->
+    ?assertEqual(nothing, ?M:next_frame(100, ?M:new())).
+
+next_frame_nothing_with_zero_budget_test() ->
+    S = ?M:enqueue(<<"data">>, ?M:new()),
+    ?assertEqual(nothing, ?M:next_frame(0, S)).
+
+fin_rides_last_slice_test() ->
+    S = ?M:finish(?M:enqueue(<<"abcdef">>, ?M:new())),
+    %% A budget split: the FIN is deferred until the slice that drains the
+    %% buffer.
+    {0, <<"abcd">>, false, S1} = ?M:next_frame(4, S),
+    {4, <<"ef">>, true, _} = ?M:next_frame(4, S1).
+
+fin_only_frame_test() ->
+    %% finish with no data: a single empty FIN frame, then nothing.
+    S = ?M:finish(?M:new()),
+    {0, <<>>, true, S1} = ?M:next_frame(100, S),
+    ?assertEqual(nothing, ?M:next_frame(100, S1)).
+
+fin_after_data_drains_test() ->
+    %% Data sent without a FIN, then finish: the FIN follows as an empty
+    %% frame at the post-data offset.
+    S = ?M:enqueue(<<"body">>, ?M:new()),
+    {0, <<"body">>, false, S1} = ?M:next_frame(100, S),
+    S2 = ?M:finish(S1),
+    {4, <<>>, true, _} = ?M:next_frame(100, S2).
+
+next_frame_idempotent_after_fin_test() ->
+    S = ?M:finish(?M:enqueue(<<"x">>, ?M:new())),
+    {0, <<"x">>, true, S1} = ?M:next_frame(100, S),
+    ?assertEqual(nothing, ?M:next_frame(100, S1)).
+
+stop_sending_clears_buffer_test() ->
+    S = ?M:finish(?M:enqueue(<<"unsent">>, ?M:new())),
+    S1 = ?M:stop_sending(S),
+    ?assertEqual(nothing, ?M:next_frame(100, S1)).
+
+send_pending_test() ->
+    ?assertNot(?M:send_pending(?M:new())),
+    ?assert(?M:send_pending(?M:enqueue(<<"d">>, ?M:new()))),
+    ?assert(?M:send_pending(?M:finish(?M:new()))),
+    {_, _, _, Sent} = ?M:next_frame(100, ?M:finish(?M:enqueue(<<"d">>, ?M:new()))),
+    ?assertNot(?M:send_pending(Sent)).
+
+%% A response enqueued + finished on a sender drains into small slices that
+%% reassemble, in order, to the original bytes with the FIN on the receiver.
+send_recv_round_trip_test() ->
+    Payload = <<"a response body spanning several stream frames">>,
+    Sender = ?M:finish(?M:enqueue(Payload, ?M:new())),
+    Slices = drain_all(Sender, 7),
+    {Delivered, FinReached} = feed(Slices, ?M:new(), <<>>, false),
+    ?assertEqual(Payload, Delivered),
+    ?assert(FinReached).
+
+%% =============================================================================
+%% Helpers
+%% =============================================================================
+
+drain_all(Stream, Budget) ->
+    case ?M:next_frame(Budget, Stream) of
+        nothing -> [];
+        {Offset, Data, Fin, Stream1} -> [{Offset, Data, Fin} | drain_all(Stream1, Budget)]
+    end.
+
+feed([], _Stream, Acc, Fin) ->
+    {Acc, Fin};
+feed([{Offset, Data, FrameFin} | Rest], Stream, Acc, Fin) ->
+    {ok, Bin, FinReached, Stream1} = ?M:receive_data(Offset, Data, FrameFin, Stream),
+    feed(Rest, Stream1, <<Acc/binary, Bin/binary>>, Fin orelse FinReached).
