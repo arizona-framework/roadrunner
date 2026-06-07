@@ -181,11 +181,12 @@ coalesced_split(<<>>) ->
 coalesced_split(<<FirstByte, _/binary>>) when (FirstByte band 16#40) =:= 0 ->
     %% Fixed bit clear (includes a zero padding byte): no more packets.
     done;
-coalesced_split(<<1:1, _:7, _Version:32, DCIDLen, Rest/binary>> = Bin) when DCIDLen =< ?MAX_CID ->
-    <<FirstByte, _/binary>> = Bin,
+coalesced_split(<<1:1, _:1, Type:2, _:4, _Version:32, DCIDLen, Rest/binary>> = Bin) when
+    DCIDLen =< ?MAX_CID
+->
     maybe
         {ok, AfterCids} ?= skip_scid(DCIDLen, Rest),
-        {ok, AfterPrefix} ?= skip_token(bits_to_type((FirstByte bsr 4) band 2#11), AfterCids),
+        {ok, AfterPrefix} ?= skip_token(bits_to_type(Type), AfterCids),
         {ok, Length, AfterLength} ?= take_varint(AfterPrefix),
         split_at(Bin, byte_size(Bin) - byte_size(AfterLength) + Length)
     end;
