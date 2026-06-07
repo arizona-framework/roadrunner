@@ -1,0 +1,287 @@
+-module(roadrunner_quic_listener).
+-moduledoc false.
+
+%% A single native QUIC listener: one UDP socket, a connection-id routing
+%% table, and the per-connection spawn ordering. A hand-rolled proc_lib
+%% receive loop (never a gen_server, mirroring the connection shell), driving
+%% the socket in `active => once` mode so datagrams interleave with monitor
+%% and system messages in one loop.
+%%
+%% Each datagram is routed by its Destination Connection ID
+%% (`roadrunner_quic_cid_registry`): a hit forwards `{quic_datagram, Peer,
+%% Bytes}` to the owning connection; a miss on a QUIC v1 Initial spawns a new
+%% connection. Spawning follows the strict ordering the handshake depends on
+%% (RFC 9000 / the dep's contract): spawn the connection, monitor it (so a
+%% fast death is reaped before its connection ids are registered), register
+%% its CIDs (so a fast follow-up datagram already routes), run the
+%% connection_handler to get the application owner, install the owner
+%% SYNCHRONOUSLY (so ownership transfers before the handshake can complete and
+%% race the `{connected, _}` event), and only then feed the first Initial. Slot
+%% limiting, telemetry, and drain stay in the owner the handler returns; the
+%% listener owns none of them.
+%%
+%% A new server Source Connection ID is generated per connection at a fixed
+%% length, so short-header 1-RTT packets (which carry no CID-length field)
+%% demux by slicing that many leading bytes. The SO_REUSEPORT pool, the
+%% Version Negotiation trigger, and the supervisor are later slices.
+
+-export([start_link/1, get_port/1, stop/1]).
+-export([init/1]).
+%% Exported for exhaustive eunit branch coverage of the pure routing decision.
+-export([classify/2]).
+
+-export_type([opts/0]).
+
+%% Must match roadrunner_quic_conn_state's ?SCID_LEN: the server issues SCIDs
+%% of this length so short-header packets demux by slicing it.
+-define(SCID_LEN, 8).
+%% QUIC version 1 (RFC 9000 §15); also defined in roadrunner_quic_send.
+-define(QUIC_V1, 16#00000001).
+%% RFC 9000 §14.1: a server MUST discard an Initial packet carried in a UDP
+%% datagram whose payload is smaller than 1200 bytes, so a too-small Initial
+%% never spawns a connection (clients pad Initial datagrams to this floor).
+-define(MIN_INITIAL_DATAGRAM, 1200).
+
+-type opts() :: #{
+    port := inet:port_number(),
+    cert_chain := [binary()],
+    priv_key := public_key:private_key(),
+    alpn := binary(),
+    transport_params := roadrunner_quic_transport_params:params(),
+    connection_handler := fun((pid()) -> {ok, pid()} | {error, term()}),
+    reuseport => boolean()
+}.
+
+-record(listener, {
+    socket :: roadrunner_quic_socket:socket(),
+    port :: inet:port_number(),
+    registry :: roadrunner_quic_cid_registry:t(),
+    cert_chain :: [binary()],
+    priv_key :: public_key:private_key(),
+    alpn :: binary(),
+    %% The base transport parameters (flow/stream/idle limits); the per-
+    %% connection original/initial connection ids are filled in at spawn.
+    transport_params :: roadrunner_quic_transport_params:params(),
+    handler :: fun((pid()) -> {ok, pid()} | {error, term()})
+}).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-doc """
+Start a listener bound to `port` (0 picks an ephemeral port, read back with
+get_port/1). Returns once the socket is bound, so a bind failure surfaces
+synchronously as `{error, _}`.
+""".
+-spec start_link(opts()) -> {ok, pid()} | {error, term()}.
+start_link(Opts) ->
+    proc_lib:start_link(?MODULE, init, [Opts]).
+
+-doc "The port the listener is bound to.".
+-spec get_port(pid()) -> inet:port_number().
+get_port(Pid) ->
+    gen_server:call(Pid, get_port).
+
+-doc "Stop the listener and close its socket.".
+-spec stop(pid()) -> ok.
+stop(Pid) ->
+    gen_server:call(Pid, stop).
+
+%% =============================================================================
+%% Loop
+%% =============================================================================
+
+-doc false.
+-spec init(opts()) -> no_return().
+init(
+    #{
+        port := Port,
+        cert_chain := CertChain,
+        priv_key := PrivKey,
+        alpn := Alpn,
+        transport_params := TransportParams,
+        connection_handler := Handler
+    } = Opts
+) ->
+    ReusePort = maps:get(reuseport, Opts, false),
+    case roadrunner_quic_socket:open(Port, #{active => once, reuseport => ReusePort}) of
+        {ok, Socket} ->
+            {ok, {_Ip, BoundPort}} = roadrunner_quic_socket:sockname(Socket),
+            proc_lib:set_label({?MODULE, BoundPort}),
+            proc_lib:init_ack({ok, self()}),
+            loop(#listener{
+                socket = Socket,
+                port = BoundPort,
+                registry = roadrunner_quic_cid_registry:new(),
+                cert_chain = CertChain,
+                priv_key = PrivKey,
+                alpn = Alpn,
+                transport_params = TransportParams,
+                handler = Handler
+            });
+        {error, Reason} ->
+            proc_lib:init_ack({error, Reason}),
+            exit(normal)
+    end.
+
+-spec loop(#listener{}) -> no_return().
+loop(#listener{socket = Socket} = State) ->
+    receive
+        {system, From, Req} ->
+            roadrunner_loop_sys:handle_system(Req, From, State, fun loop/1);
+        {'$gen_call', From, get_port} ->
+            ok = gen_server:reply(From, State#listener.port),
+            loop(State);
+        {'$gen_call', From, stop} ->
+            ok = gen_server:reply(From, ok),
+            ok = roadrunner_quic_socket:close(Socket),
+            exit(normal);
+        {'$gen_call', From, _Request} ->
+            ok = roadrunner_loop_sys:gen_call_unsupported(From),
+            loop(State);
+        {'$gen_cast', _Request} ->
+            loop(State);
+        {'DOWN', _Ref, process, Pid, _Reason} ->
+            ok = roadrunner_quic_cid_registry:delete_pid(State#listener.registry, Pid),
+            loop(State);
+        Message ->
+            loop(handle_message(Message, State))
+    end.
+
+%% A datagram from the active socket is routed (re-arming the socket first so
+%% the next datagram is already queued during the spawn round-trip); anything
+%% else is a stray message and dropped.
+-spec handle_message(term(), #listener{}) -> #listener{}.
+handle_message(Message, #listener{socket = Socket} = State) ->
+    case roadrunner_quic_socket:from_message(Socket, Message) of
+        {ok, Peer, Datagram} ->
+            ok = roadrunner_quic_socket:activate(Socket),
+            route(Datagram, Peer, State);
+        ignore ->
+            State
+    end.
+
+%% =============================================================================
+%% Routing
+%% =============================================================================
+
+%% Execute a datagram's routing decision: forward to the owning connection,
+%% spawn one for a new client, or drop.
+-spec route(binary(), {inet:ip_address(), inet:port_number()}, #listener{}) -> #listener{}.
+route(Datagram, Peer, #listener{registry = Registry} = State) ->
+    case classify(Datagram, Registry) of
+        {forward, ConnPid} ->
+            _ = ConnPid ! {quic_datagram, Peer, Datagram},
+            State;
+        {spawn, ClientDCID} ->
+            spawn_connection(Datagram, Peer, ClientDCID, State);
+        drop ->
+            State
+    end.
+
+%% Decide a datagram's fate from its Destination Connection ID and the routing
+%% table (a pure decision given the table): `{forward, Pid}` to the owning
+%% connection, `{spawn, DCID}` for a QUIC v1 Initial (in a datagram at the RFC
+%% 9000 §14.1 1200-byte floor) to an unknown id, or `drop` otherwise: a
+%% malformed header, a packet to an unknown id that is not a v1 Initial (a
+%% stray short-header packet; an unknown version is the Version Negotiation
+%% slice), or a v1 Initial below the §14.1 floor (a server MUST discard those,
+%% so we never spawn for one). The forward path is size-unconditional; the
+%% owning connection enforces §14.1 on its own received Initials.
+-doc false.
+-spec classify(binary(), roadrunner_quic_cid_registry:t()) ->
+    {forward, pid()} | {spawn, binary()} | drop.
+classify(Datagram, Registry) ->
+    case roadrunner_quic_packet:dcid(Datagram, ?SCID_LEN) of
+        {ok, DCID} ->
+            case roadrunner_quic_cid_registry:lookup(Registry, DCID) of
+                {ok, ConnPid} ->
+                    {forward, ConnPid};
+                error ->
+                    case
+                        is_v1_initial(Datagram) andalso
+                            byte_size(Datagram) >= ?MIN_INITIAL_DATAGRAM
+                    of
+                        true -> {spawn, DCID};
+                        false -> drop
+                    end
+            end;
+        {error, _Reason} ->
+            drop
+    end.
+
+-spec is_v1_initial(binary()) -> boolean().
+is_v1_initial(<<1:1, _Fixed:1, 0:2, _TypeSpecific:4, Version:32, _/binary>>) ->
+    Version =:= ?QUIC_V1;
+is_v1_initial(_Datagram) ->
+    false.
+
+%% Spawn a connection for a new client and feed it its first Initial, in the
+%% order the handshake depends on: spawn -> monitor -> register both connection
+%% ids -> run the handler for the owner -> install the owner synchronously ->
+%% feed.
+-spec spawn_connection(binary(), {inet:ip_address(), inet:port_number()}, binary(), #listener{}) ->
+    #listener{}.
+spawn_connection(
+    Datagram,
+    Peer,
+    ClientDCID,
+    #listener{socket = Socket, registry = Registry, handler = Handler} = State
+) ->
+    ServerSCID = crypto:strong_rand_bytes(?SCID_LEN),
+    {ok, ConnPid} = roadrunner_quic_connection:start(
+        Socket, conn_config(ClientDCID, ServerSCID, Peer, State)
+    ),
+    _Ref = monitor(process, ConnPid),
+    ok = roadrunner_quic_cid_registry:register_pair(Registry, ClientDCID, ServerSCID, ConnPid),
+    ok = install_owner(ConnPid, Handler),
+    _ = ConnPid ! {quic_datagram, Peer, Datagram},
+    State.
+
+%% Run the connection_handler to get the application owner and install it
+%% synchronously. On a refusal (e.g. {error, max_clients}) the owner is simply
+%% not installed; the connection will idle out (graceful refusal is a later
+%% slice).
+-spec install_owner(pid(), fun((pid()) -> {ok, pid()} | {error, term()})) -> ok.
+install_owner(ConnPid, Handler) ->
+    case Handler(ConnPid) of
+        {ok, Owner} when is_pid(Owner) ->
+            set_owner_sync(ConnPid, Owner);
+        {error, Reason} ->
+            logger:warning(#{what => quic_connection_handler_refused, reason => Reason}),
+            ok
+    end.
+
+%% The synchronous set_owner round-trip (mirrors the connection's control-call
+%% wire): the connection records the owner before any datagram drives the
+%% handshake, so the {connected, _} event cannot race ahead of ownership.
+-spec set_owner_sync(pid(), pid()) -> ok.
+set_owner_sync(ConnPid, Owner) ->
+    Ref = make_ref(),
+    _ = ConnPid ! {quic_call, self(), Ref, {set_owner, Owner}},
+    receive
+        {quic_reply, Ref, ok} -> ok
+    end.
+
+-spec conn_config(binary(), binary(), {inet:ip_address(), inet:port_number()}, #listener{}) ->
+    roadrunner_quic_conn_state:config().
+conn_config(ClientDCID, ServerSCID, Peer, #listener{
+    cert_chain = CertChain, priv_key = PrivKey, alpn = Alpn, transport_params = TransportParams
+}) ->
+    {EphPub, EphPriv} = crypto:generate_key(ecdh, x25519),
+    #{
+        dcid => ClientDCID,
+        scid => ServerSCID,
+        peer => Peer,
+        cert_chain => CertChain,
+        priv_key => PrivKey,
+        alpn => Alpn,
+        transport_params => TransportParams#{
+            original_destination_connection_id => ClientDCID,
+            initial_source_connection_id => ServerSCID
+        },
+        eph_pub => EphPub,
+        eph_priv => EphPriv,
+        server_random => crypto:strong_rand_bytes(32)
+    }.
