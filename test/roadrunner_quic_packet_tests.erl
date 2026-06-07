@@ -138,6 +138,47 @@ decode_coalesced_test() ->
     ?assertEqual(Second, Rest).
 
 %% =============================================================================
+%% coalesced_split/1 (works on a still-protected datagram).
+%% =============================================================================
+
+%% A long-header packet is bounded by its Length field, leaving the
+%% following coalesced packet as the remainder.
+coalesced_split_long_test() ->
+    First = enc(?M:encode_long(initial, ?V1, ?DCID, ?SCID, #{pn => 1, payload => <<"abc">>})),
+    Second = enc(?M:encode_short(?DCID, 2, <<"d">>, false)),
+    ?assertEqual(
+        {ok, First, Second}, ?M:coalesced_split(<<First/binary, Second/binary>>)
+    ).
+
+%% A short-header packet runs to the end of the datagram (no remainder).
+coalesced_split_short_test() ->
+    Short = enc(?M:encode_short(?DCID, 2, <<"body">>, false)),
+    ?assertEqual({ok, Short, <<>>}, ?M:coalesced_split(Short)).
+
+%% Empty input and trailing padding (a zero first byte / cleared fixed
+%% bit) end the coalesced run.
+coalesced_split_done_test() ->
+    ?assertEqual(done, ?M:coalesced_split(<<>>)),
+    ?assertEqual(done, ?M:coalesced_split(<<0, 0, 0>>)).
+
+%% A long header truncated before its connection IDs cannot be bounded.
+coalesced_split_truncated_test() ->
+    ?assertEqual({error, truncated}, ?M:coalesced_split(<<16#C0, ?V1:32, 8>>)).
+
+%% A long header whose Length field claims more bytes than the datagram
+%% holds cannot be sliced.
+coalesced_split_length_exceeds_test() ->
+    Full = enc(?M:encode_long(initial, ?V1, ?DCID, ?SCID, #{pn => 1, payload => <<"abcdefgh">>})),
+    Truncated = binary:part(Full, 0, byte_size(Full) - 4),
+    ?assertEqual({error, truncated}, ?M:coalesced_split(Truncated)).
+
+%% A long header whose DCID length exceeds the 20-byte maximum is invalid.
+coalesced_split_invalid_cid_test() ->
+    ?assertEqual(
+        {error, invalid_packet}, ?M:coalesced_split(<<16#C0, ?V1:32, 21>>)
+    ).
+
+%% =============================================================================
 %% dcid/2 routing (works on a still-protected packet).
 %% =============================================================================
 
