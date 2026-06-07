@@ -179,7 +179,16 @@ malformed_client_hello_closes_test() ->
     ),
     {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
     ?assertEqual(closed, ?M:phase(State1)),
-    ?assertEqual([{emit, self(), {closed, {local, malformed_client_hello}}}], emits(Effects)).
+    ?assertEqual([{emit, self(), {closed, {local, malformed_client_hello}}}], emits(Effects)),
+    %% The CONNECTION_CLOSE is transmitted at the Initial level (a TLS error
+    %% the client can still read with Initial keys).
+    Frames = ?TC:frames(
+        sends(Effects),
+        initial,
+        #{initial => roadrunner_quic_keys:initial_server(?DCID)},
+        byte_size(?DCID)
+    ),
+    ?assertMatch([{connection_close, transport, _Code, 0, <<>>}], Frames).
 
 unexpected_handshake_message_closes_test() ->
     %% An out-of-sequence handshake message type closes the connection.
@@ -587,6 +596,65 @@ peer_handshake_level_close_test() ->
     {State2, Effects} = ?M:handle_datagram(?NOW, Close, with_owner(State1)),
     ?assertEqual(closed, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {peer, 2}}}], emits(Effects)).
+
+local_error_transmits_connection_close_test() ->
+    %% A locally-detected error transmits one CONNECTION_CLOSE at the
+    %% triggering packet's level (here application), carrying the mapped wire
+    %% error code; a peer-initiated close, by contrast, sends nothing back.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Bad = app_datagram([{stream, 3, 0, ~"x", true}], 0, ClientApSecret),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    Frames = ?TC:frames(
+        sends(Effects),
+        application,
+        #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+        byte_size(?DCID)
+    ),
+    ?assertEqual(
+        [
+            {connection_close, transport, roadrunner_quic_error:code_int(stream_state_error), 0,
+                <<>>}
+        ],
+        Frames
+    ).
+
+undersized_initial_close_is_suppressed_test() ->
+    %% A close that would breach the §8.1 3x budget for an undersized (spoofed
+    %% or non-conformant) peer Initial is dropped, so the server is never an
+    %% amplification reflector. The connection still closes and the owner still
+    %% learns via {closed, _}, but nothing is sent back.
+    {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
+    CloseFrame = iolist_to_binary(
+        roadrunner_quic_frame:encode({connection_close, application, 7, undefined, <<>>})
+    ),
+    Tiny = ?TC:seal_raw(
+        initial, 0, roadrunner_quic_keys:initial_client(?DCID), CloseFrame, ?DCID, ?SCID
+    ),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Tiny, with_owner(State0)),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)),
+    ?assertEqual([], sends(Effects)).
+
+coalesced_initial_error_then_handshake_does_not_crash_test() ->
+    %% A datagram coalescing an Initial-level error (a 0x1d at Initial) with a
+    %% Handshake packet must not let the Handshake packet's space-discard run
+    %% after the close; the connection closes cleanly without crashing on the
+    %% Initial keys the pending close still needs.
+    #{state1 := State1, client_hs_secret := ClientHsSecret} = connect(),
+    CloseFrame = iolist_to_binary(
+        roadrunner_quic_frame:encode({connection_close, application, 7, undefined, <<>>})
+    ),
+    BadInitial = ?TC:seal_raw(
+        initial, 0, roadrunner_quic_keys:initial_client(?DCID), CloseFrame, ?DCID, ?SCID
+    ),
+    HandshakePing = ?TC:seal(
+        handshake, 1, roadrunner_quic_keys:traffic_keys(ClientHsSecret), [ping], ?DCID, ?SCID
+    ),
+    {State2, Effects} = ?M:handle_datagram(
+        ?NOW, <<BadInitial/binary, HandshakePing/binary>>, with_owner(State1)
+    ),
+    ?assertEqual(closed, ?M:phase(State2)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
 
 %% =============================================================================
 %% Handshake driver (plays the QUIC client with the shared test client)

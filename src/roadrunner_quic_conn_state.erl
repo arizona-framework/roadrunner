@@ -100,7 +100,11 @@
     conn_flow :: roadrunner_quic_flow:t(),
     %% Owner events accumulated while folding a datagram's frames, drained in
     %% order at the end of handle_datagram (newest-first, reversed on drain).
-    emits = [] :: [effect()]
+    emits = [] :: [effect()],
+    %% A locally-detected error to signal: {Level, WireErrorCode} for the one
+    %% CONNECTION_CLOSE to transmit at that encryption level. `undefined` for a
+    %% live connection or a peer-initiated close (which sends nothing back).
+    pending_close = undefined :: undefined | {level(), non_neg_integer()}
 }).
 
 -type stream() :: {roadrunner_quic_stream:t(), roadrunner_quic_flow:t()}.
@@ -230,15 +234,19 @@ handle_datagram(Now, Datagram, #state{amp = Amp, recv_keys = RecvKeys, phase = B
     State2 = lists:foldl(fun(O, S) -> process_outcome(Now, O, S) end, State1, Outcomes),
     finish_datagram(Now, Before, State2).
 
-%% After folding a datagram's frames: a peer CONNECTION_CLOSE during the fold
-%% closes the connection, so deliver the {closed, _} emit and send nothing
-%% further (RFC 9000 §10.2.2); otherwise run the send pass and drain owner
-%% events, with {connected, _} ordered ahead of any stream events from the
-%% same datagram so the owner opens its control stream before the first
-%% request.
+%% After folding a datagram's frames: if a close fired during the fold,
+%% transmit our CONNECTION_CLOSE for a locally-detected error (RFC 9000
+%% §10.2.3) or send nothing for a peer CONNECTION_CLOSE (§10.2.2), then deliver
+%% the {closed, _} emit. Otherwise run the send pass and drain owner events,
+%% with {connected, _} ordered ahead of any stream events from the same
+%% datagram so the owner opens its control stream before the first request.
 -spec finish_datagram(integer(), phase(), t()) -> {t(), [effect()]}.
-finish_datagram(_Now, _Before, #state{phase = closed} = State) ->
+finish_datagram(_Now, _Before, #state{phase = closed, pending_close = undefined} = State) ->
     drain_emits(State);
+finish_datagram(_Now, _Before, #state{phase = closed} = State) ->
+    {State1, CloseEffects} = send_close(State),
+    {State2, EmitEffects} = drain_emits(State1),
+    {State2, CloseEffects ++ EmitEffects};
 finish_datagram(Now, Before, State) ->
     {State3, SendEffects} = send_pass(Now, State),
     {State4, EmitEffects} = drain_emits(State3),
@@ -343,6 +351,11 @@ stream_for_send(Sid, #state{streams = Streams} = State) ->
     end.
 
 -spec process_outcome(integer(), roadrunner_quic_recv:outcome(), t()) -> t().
+process_outcome(_Now, _Outcome, #state{phase = closed} = State) ->
+    %% A close fired on an earlier packet in this datagram; skip the rest so we
+    %% neither act on their frames nor discard (via validate_on_handshake) the
+    %% space and keys a pending local close still needs to send its frame.
+    State;
 process_outcome(
     Now, {ok, #{level := Level, pn := PN, frames := Frames}}, #state{spaces = Spaces} = State
 ) ->
@@ -401,12 +414,12 @@ process_frame(
 process_frame(_Now, _Level, {connection_close, transport, ErrorCode, _FrameType, _Reason}, State) ->
     process_close(ErrorCode, State);
 process_frame(
-    _Now, _Level, {connection_close, application, _ErrorCode, _FrameType, _Reason}, State
+    _Now, Level, {connection_close, application, _ErrorCode, _FrameType, _Reason}, State
 ) ->
     %% The application CONNECTION_CLOSE (0x1d) is 0-RTT/1-RTT only (RFC 9000
     %% §19.19); one decoded from an Initial/Handshake packet is a protocol
     %% violation.
-    connection_fatal(protocol_violation, State);
+    connection_fatal(Level, protocol_violation, State);
 process_frame(_Now, Level, {crypto, Offset, Data}, State) ->
     process_crypto(Level, Offset, Data, State);
 process_frame(Now, Level, {ack, _, _, _, _, _} = Ack, State) ->
@@ -453,7 +466,7 @@ process_handshake(initial, {?CLIENT_HELLO, Body}, #state{tls = Tls} = State) ->
             State2 = queue_crypto(initial, InitialFlight, State1),
             queue_crypto(handshake, HandshakeFlight, State2);
         {error, Reason} ->
-            connection_fatal(Reason, State)
+            connection_fatal(initial, Reason, State)
     end;
 process_handshake(handshake, {?FINISHED, Body}, #state{tls = Tls} = State) ->
     case roadrunner_quic_tls_server:process_client_finished(Body, Tls) of
@@ -464,12 +477,12 @@ process_handshake(handshake, {?FINISHED, Body}, #state{tls = Tls} = State) ->
             State1 = discard_space(handshake, State#state{phase = connected}),
             queue_frame(application, handshake_done, State1);
         {error, Reason} ->
-            connection_fatal(Reason, State)
+            connection_fatal(handshake, Reason, State)
     end;
-process_handshake(_Level, {_Type, _Body}, State) ->
+process_handshake(Level, {_Type, _Body}, State) ->
     %% An out-of-sequence or unknown handshake message (RFC 8446 unexpected
     %% message); connection-fatal like the other handshake failures.
-    connection_fatal(unexpected_message, State).
+    connection_fatal(Level, unexpected_message, State).
 
 %% Arm the keys the TLS flight produced: server installs protect outgoing
 %% packets, client installs decrypt incoming ones; the Application space
@@ -549,7 +562,7 @@ process_ack(Now, Level, Ack, State) ->
 %% transport parameters are send-side follow-ups.
 -spec process_stream(non_neg_integer(), non_neg_integer(), binary(), boolean(), t()) -> t().
 process_stream(Sid, _Offset, _Data, _Fin, State) when Sid rem 4 =:= 1; Sid rem 4 =:= 3 ->
-    connection_fatal(stream_state_error, State);
+    connection_fatal(application, stream_state_error, State);
 process_stream(Sid, Offset, Data, Fin, State) ->
     {Stream0, StreamFlow0, State1} = ensure_stream(Sid, State),
     #state{conn_flow = ConnFlow} = State1,
@@ -562,7 +575,7 @@ process_stream(Sid, Offset, Data, Fin, State) ->
         State2 = put_stream(Sid, Stream1, StreamFlow1, State1#state{conn_flow = ConnFlow1}),
         deliver_stream(Sid, Deliverable, FinReached, State2)
     else
-        {error, Reason} -> connection_fatal(Reason, State)
+        {error, Reason} -> connection_fatal(application, Reason, State)
     end.
 
 %% A RESET_STREAM aborts the peer's send side and surfaces the abort code. On
@@ -570,14 +583,14 @@ process_stream(Sid, Offset, Data, Fin, State) ->
 %% (RFC 9000 §19.4 STREAM_STATE_ERROR).
 -spec process_reset_stream(non_neg_integer(), non_neg_integer(), non_neg_integer(), t()) -> t().
 process_reset_stream(Sid, _ErrorCode, _FinalSize, State) when Sid rem 4 =:= 1; Sid rem 4 =:= 3 ->
-    connection_fatal(stream_state_error, State);
+    connection_fatal(application, stream_state_error, State);
 process_reset_stream(Sid, ErrorCode, FinalSize, State) ->
     {Stream0, Flow, State1} = ensure_stream(Sid, State),
     case roadrunner_quic_stream:reset(FinalSize, Stream0) of
         {ok, Stream1} ->
             emit({stream_reset, Sid, ErrorCode}, put_stream(Sid, Stream1, Flow, State1));
         {error, Reason} ->
-            connection_fatal(Reason, State)
+            connection_fatal(application, Reason, State)
     end.
 
 %% A well-placed peer CONNECTION_CLOSE (transport at any level, or application
@@ -591,16 +604,68 @@ process_close(ErrorCode, State) ->
 
 %% Close this single, isolated connection on a peer-reachable protocol error
 %% (flow control §4.1, final size §4.5, stream state §19.8, an out-of-place
-%% application CONNECTION_CLOSE §19.19, or a failed TLS handshake): surface a
-%% terminal {closed, {local, Reason}} to the owner and mark the connection
-%% closed so the fold short-circuits and the shell exits cleanly (no crash, no
-%% slot leak). Sending a CONNECTION_CLOSE to inform the peer of the error (at
-%% the triggering packet's encryption level) is a follow-up; a conformant peer
-%% never triggers these, and the listener drops a misbehaving peer's later
-%% packets to the gone pid.
--spec connection_fatal(atom(), t()) -> t().
-connection_fatal(Reason, State) ->
-    emit({closed, {local, Reason}}, State#state{phase = closed}).
+%% application CONNECTION_CLOSE §19.19, or a failed TLS handshake): record a
+%% CONNECTION_CLOSE to transmit at the triggering packet's level (Level), mark
+%% the connection closed so the fold short-circuits and the shell exits
+%% cleanly (no crash, no slot leak), and surface a terminal {closed, {local,
+%% Reason}} to the owner.
+-spec connection_fatal(level(), atom(), t()) -> t().
+connection_fatal(Level, Reason, State) ->
+    State1 = State#state{phase = closed, pending_close = {Level, close_code(Reason)}},
+    emit({closed, {local, Reason}}, State1).
+
+%% Map a connection-error reason to its CONNECTION_CLOSE wire error code: a TLS
+%% handshake failure becomes a CRYPTO_ERROR (RFC 9001 §4.8: 0x0100 + alert), a
+%% transport error maps directly (RFC 9000 §20).
+-spec close_code(atom()) -> non_neg_integer().
+close_code(Reason) when
+    Reason =:= flow_control_error;
+    Reason =:= final_size_error;
+    Reason =:= stream_state_error;
+    Reason =:= protocol_violation
+->
+    roadrunner_quic_error:code_int(Reason);
+close_code(_TlsReason) ->
+    %% Every other connection_fatal reason is a TLS handshake failure (a
+    %% malformed or rejected ClientHello, a bad Finished, or an unexpected
+    %% message); RFC 9001 §4.8 carries these as CRYPTO_ERROR (0x0100 + alert).
+    %% TLS alert 40 (handshake_failure); a per-alert mapping is a refinement.
+    roadrunner_quic_error:code_int({crypto_error, 40}).
+
+%% Build and send exactly one CONNECTION_CLOSE at the recorded level (the
+%% triggering packet's level, which the peer can decrypt), advancing that
+%% space's packet number. Only the close travels (RFC 9000 §10.2.3); no other
+%% queued frame is drained. The close always fits the §8.1 budget: it answers a
+%% received packet, so 3x bytes-received covers a <=1200-byte close.
+-spec send_close(t()) -> {t(), [effect()]}.
+send_close(
+    #state{
+        pending_close = {Level, ErrorCode},
+        dcid = DCID,
+        scid = SCID,
+        send_keys = SendKeys,
+        amp = Amp
+    } = State
+) ->
+    #{Level := Keys} = SendKeys,
+    Space = space(Level, State),
+    PN = Space#space.next_pn,
+    Frame = {connection_close, transport, ErrorCode, 0, <<>>},
+    Entry = #{Level => #{frames => [Frame], keys => Keys, pn => PN}},
+    {Datagram, _Sent} = roadrunner_quic_send:datagram(Entry, DCID, SCID),
+    case roadrunner_quic_amp:can_send(byte_size(Datagram), Amp) of
+        false ->
+            %% An Initial close is padded to 1200; for an undersized or spoofed
+            %% peer Initial that would exceed the §8.1 3x budget, so drop it
+            %% (no amplification reflector). The connection still closes and the
+            %% owner still learns via the {closed, _} emit, same as a silent
+            %% close.
+            {State, []};
+        true ->
+            Amp1 = roadrunner_quic_amp:sent(byte_size(Datagram), Amp),
+            State1 = put_space(Level, Space#space{next_pn = PN + 1}, State#state{amp = Amp1}),
+            {State1, [{send, Datagram}]}
+    end.
 
 %% Look up a stream, or create it. The first frame of a peer-initiated stream
 %% is announced with {stream_opened, Sid} (server-initiated ids never reach
