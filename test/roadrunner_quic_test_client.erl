@@ -1,0 +1,191 @@
+-module(roadrunner_quic_test_client).
+-moduledoc false.
+
+%% Shared in-test QUIC client driver: the crypto/codec primitives a test
+%% needs to play the QUIC client against the native server modules, used by
+%% both the pure-value `roadrunner_quic_conn_state` tests and the
+%% `roadrunner_quic_connection` process tests. The TLS 1.3 key schedule
+%% itself is a handful of `roadrunner_quic_tls_crypto` calls each test makes
+%% inline (the explicit client derivation is part of what the test asserts);
+%% this module supplies the ClientHello codec, the packet sealing, and the
+%% server-reply decoding so neither is duplicated.
+
+-include_lib("public_key/include/public_key.hrl").
+
+-export([key_material/0, gen_keypair/0]).
+-export([client_hello_framed/2]).
+-export([seal/6, seal_raw/6]).
+-export([crypto_bytes/4, frames/4]).
+-export([server_hello_key_share/1, deframe_all/1]).
+
+%% TLS handshake message types (RFC 8446 §4).
+-define(CLIENT_HELLO, 1).
+-define(SERVER_HELLO, 2).
+
+%% ClientHello wire constants (RFC 8446 §4.1.2).
+-define(LEGACY_VERSION, 16#0303).
+-define(CIPHER_AES_128_GCM_SHA256, 16#1301).
+-define(GROUP_X25519, 16#001D).
+-define(EXT_SIGNATURE_ALGORITHMS, 16#000D).
+-define(EXT_ALPN, 16#0010).
+-define(EXT_KEY_SHARE, 16#0033).
+
+%% =============================================================================
+%% Key material
+%% =============================================================================
+
+-doc "A fresh RSA key pair and its signature scheme (rsa_pss_rsae_sha256).".
+-spec key_material() -> {Scheme :: 16#0804, public_key:private_key()}.
+key_material() ->
+    PrivKey = public_key:generate_key({rsa, 2048, 65537}),
+    {16#0804, PrivKey}.
+
+-doc "A fresh x25519 ephemeral key pair.".
+-spec gen_keypair() -> {Pub :: binary(), Priv :: binary()}.
+gen_keypair() ->
+    crypto:generate_key(ecdh, x25519).
+
+%% =============================================================================
+%% ClientHello
+%% =============================================================================
+
+-doc """
+A framed ClientHello (handshake-message bytes, RFC 8446 §4.1.2) offering
+the given signature scheme, the x25519 key share, and the `h3` ALPN. These
+bytes are both the CRYPTO-frame payload and the first transcript element.
+""".
+-spec client_hello_framed(Scheme :: non_neg_integer(), ClientPub :: binary()) -> binary().
+client_hello_framed(Scheme, ClientPub) ->
+    Random = crypto:strong_rand_bytes(32),
+    Extensions = iolist_to_binary([
+        signature_algorithms_ext([Scheme]),
+        alpn_ext(~"h3"),
+        key_share_ext(ClientPub)
+    ]),
+    CipherSuites = <<?CIPHER_AES_128_GCM_SHA256:16>>,
+    Body =
+        <<?LEGACY_VERSION:16, Random/binary, 0:8, (byte_size(CipherSuites)):16, CipherSuites/binary,
+            1:8, 0:8, (byte_size(Extensions)):16, Extensions/binary>>,
+    iolist_to_binary(roadrunner_quic_tls_handshake:encode(?CLIENT_HELLO, Body)).
+
+signature_algorithms_ext(Schemes) ->
+    List = <<<<S:16>> || S <- Schemes>>,
+    extension(?EXT_SIGNATURE_ALGORITHMS, <<(byte_size(List)):16, List/binary>>).
+
+alpn_ext(Protocol) ->
+    Entry = <<(byte_size(Protocol)):8, Protocol/binary>>,
+    extension(?EXT_ALPN, <<(byte_size(Entry)):16, Entry/binary>>).
+
+key_share_ext(PubKey) ->
+    Entry = <<?GROUP_X25519:16, (byte_size(PubKey)):16, PubKey/binary>>,
+    extension(?EXT_KEY_SHARE, <<(byte_size(Entry)):16, Entry/binary>>).
+
+extension(Type, Data) ->
+    <<Type:16, (byte_size(Data)):16, Data/binary>>.
+
+%% =============================================================================
+%% Packet sealing (build client datagrams)
+%% =============================================================================
+
+-doc """
+Build a one-level client datagram through the send pipeline. An Initial is
+padded to 1200, satisfying the server's anti-amplification budget.
+""".
+-spec seal(
+    roadrunner_quic_send:level(),
+    non_neg_integer(),
+    roadrunner_quic_keys:keys(),
+    [roadrunner_quic_frame:frame()],
+    binary(),
+    binary()
+) -> binary().
+seal(Level, PN, Keys, Frames, DCID, SCID) ->
+    Entries = #{Level => #{frames => Frames, keys => Keys, pn => PN}},
+    {Datagram, _Sent} = roadrunner_quic_send:datagram(Entries, DCID, SCID),
+    Datagram.
+
+-doc """
+Seal raw plaintext (bypassing frame encoding) so a packet can carry a
+deliberately malformed frame, mirroring the send path's header sizing.
+""".
+-spec seal_raw(
+    roadrunner_quic_packet:long_type(),
+    non_neg_integer(),
+    roadrunner_quic_keys:keys(),
+    binary(),
+    binary(),
+    binary()
+) -> binary().
+seal_raw(Level, PN, #{key := Key, iv := IV, hp := HP}, Plaintext, DCID, SCID) ->
+    PNLen = roadrunner_quic_packet:pn_length(PN),
+    SealedSize = byte_size(Plaintext) + 16,
+    [Header, _Payload] = roadrunner_quic_packet:encode_long(
+        Level, 1, DCID, SCID, #{pn => PN, payload => <<0:(SealedSize * 8)>>}
+    ),
+    Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
+    Protected = roadrunner_quic_aead:protect_header(HP, Header, Sealed, byte_size(Header) - PNLen),
+    <<Protected/binary, Sealed/binary>>.
+
+%% =============================================================================
+%% Decode server datagrams
+%% =============================================================================
+
+-doc """
+Contiguous CRYPTO bytes for a level across the server's datagrams. The
+per-level keys map filters out the other levels' packets (they decode to
+`{drop, no_keys}`); with no in-test loss a sorted concat reassembles the
+flight.
+""".
+-spec crypto_bytes(
+    [binary()],
+    roadrunner_quic_recv:level(),
+    #{roadrunner_quic_recv:level() => map()},
+    non_neg_integer()
+) -> binary().
+crypto_bytes(Datagrams, Level, Keys, DCIDLen) ->
+    Slices = [{Offset, Data} || {crypto, Offset, Data} <- frames(Datagrams, Level, Keys, DCIDLen)],
+    iolist_to_binary([Data || {_Offset, Data} <- lists:sort(Slices)]).
+
+-doc "Every frame decoded at a level across the server's datagrams.".
+-spec frames(
+    [binary()],
+    roadrunner_quic_recv:level(),
+    #{roadrunner_quic_recv:level() => map()},
+    non_neg_integer()
+) -> [roadrunner_quic_frame:frame()].
+frames(Datagrams, Level, Keys, DCIDLen) ->
+    lists:append([level_frames(Datagram, Level, Keys, DCIDLen) || Datagram <- Datagrams]).
+
+level_frames(Datagram, Level, Keys, DCIDLen) ->
+    Outcomes = roadrunner_quic_recv:datagram(Datagram, DCIDLen, Keys, #{}),
+    lists:append([Fs || {ok, #{level := L, frames := Fs}} <- Outcomes, L =:= Level]).
+
+%% =============================================================================
+%% Handshake-message decoding
+%% =============================================================================
+
+-doc "The server's x25519 public key from a ServerHello's key_share extension.".
+-spec server_hello_key_share(binary()) -> binary().
+server_hello_key_share(ServerHello) ->
+    [{?SERVER_HELLO, Body} | _] = deframe_all(ServerHello),
+    <<_LegacyVersion:16, _Random:32/binary, SessionLen:8, _Session:SessionLen/binary, _Cipher:16,
+        _Compression:8, _ExtsLen:16, Extensions/binary>> = Body,
+    <<?GROUP_X25519:16, KeyLen:16, PubKey:KeyLen/binary>> =
+        extract_extension(?EXT_KEY_SHARE, Extensions),
+    PubKey.
+
+extract_extension(Type, <<Type:16, Len:16, Data:Len/binary, _Rest/binary>>) ->
+    Data;
+extract_extension(Type, <<_OtherType:16, Len:16, _Data:Len/binary, Rest/binary>>) ->
+    extract_extension(Type, Rest).
+
+-doc "Decode all framed handshake messages into `{Type, Body}` pairs.".
+-spec deframe_all(iodata()) -> [{byte(), binary()}].
+deframe_all(Iolist) ->
+    deframe_all_bin(iolist_to_binary(Iolist)).
+
+deframe_all_bin(<<>>) ->
+    [];
+deframe_all_bin(Bin) ->
+    {ok, {Type, Body}, Rest} = roadrunner_quic_tls_handshake:decode(Bin),
+    [{Type, Body} | deframe_all_bin(Rest)].

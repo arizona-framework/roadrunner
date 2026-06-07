@@ -27,9 +27,11 @@
 %% anti-amplification budget, and records each sent packet for loss
 %% recovery.
 %%
-%% Congestion control is deferred (the connection sends within the
-%% anti-amplification and flow limits, the MUSTs); wiring NewReno needs the
-%% loss layer to surface acked bytes / sent times, a separate follow-up.
+%% Congestion control and probe transmission are deferred: the connection
+%% sends within the anti-amplification and flow limits (the MUSTs) and a
+%% probe timeout only re-checks for losses and backs off. Wiring NewReno and
+%% sending an explicit probe both need the loss layer to surface acked bytes
+%% / sent times / the oldest unacknowledged frames, a separate follow-up.
 
 -export([new/1, handle_datagram/3, handle_timeout/3, peername/1, phase/1]).
 
@@ -89,7 +91,9 @@
     server_random := binary()
 }.
 
--type effect() :: {send, binary()} | {arm_timer, atom(), non_neg_integer()}.
+%% A monotonic-clock millisecond, the same epoch `erlang:monotonic_time/1`
+%% returns (negative on the BEAM), so an `arm_timer` deadline is `integer()`.
+-type effect() :: {send, binary()} | {arm_timer, atom(), integer()}.
 
 %% =============================================================================
 %% Construction
@@ -163,7 +167,7 @@ amplification budget, decode and decrypt its packets, fold each packet's
 frames into the connection state, then run a send pass. Returns the new
 state and the effects to perform.
 """.
--spec handle_datagram(non_neg_integer(), binary(), t()) -> {t(), [effect()]}.
+-spec handle_datagram(integer(), binary(), t()) -> {t(), [effect()]}.
 handle_datagram(Now, Datagram, #state{amp = Amp, recv_keys = RecvKeys} = State0) ->
     State1 = State0#state{amp = roadrunner_quic_amp:received(byte_size(Datagram), Amp)},
     Outcomes = roadrunner_quic_recv:datagram(
@@ -172,7 +176,7 @@ handle_datagram(Now, Datagram, #state{amp = Amp, recv_keys = RecvKeys} = State0)
     State2 = lists:foldl(fun(O, S) -> process_outcome(Now, O, S) end, State1, Outcomes),
     send_pass(Now, State2).
 
--spec process_outcome(non_neg_integer(), roadrunner_quic_recv:outcome(), t()) -> t().
+-spec process_outcome(integer(), roadrunner_quic_recv:outcome(), t()) -> t().
 process_outcome(
     Now, {ok, #{level := Level, pn := PN, frames := Frames}}, #state{spaces = Spaces} = State
 ) ->
@@ -219,7 +223,7 @@ record_received(Level, PN, Frames, #state{spaces = Spaces} = State) ->
 %% Per-frame handlers
 %% =============================================================================
 
--spec process_frame(non_neg_integer(), level(), roadrunner_quic_frame:frame(), t()) -> t().
+-spec process_frame(integer(), level(), roadrunner_quic_frame:frame(), t()) -> t().
 process_frame(_Now, Level, {crypto, Offset, Data}, State) ->
     process_crypto(Level, Offset, Data, State);
 process_frame(Now, Level, {ack, _, _, _, _, _} = Ack, State) ->
@@ -311,7 +315,7 @@ queue_frame(Level, Frame, State) ->
     Space = space(Level, State),
     put_space(Level, Space#space{pending = Space#space.pending ++ [Frame]}, State).
 
--spec process_ack(non_neg_integer(), level(), tuple(), t()) -> t().
+-spec process_ack(integer(), level(), tuple(), t()) -> t().
 process_ack(Now, Level, Ack, State) ->
     Space = space(Level, State),
     case roadrunner_quic_loss:on_ack_received(Ack, Now, Space#space.loss) of
@@ -329,15 +333,15 @@ process_ack(Now, Level, Ack, State) ->
 %% Outbound send pass
 %% =============================================================================
 
--spec send_pass(non_neg_integer(), t()) -> {t(), [effect()]}.
+-spec send_pass(integer(), t()) -> {t(), [effect()]}.
 send_pass(Now, State) ->
     {State1, SendEffects} = drain_send(Now, State, []),
-    {State1, SendEffects ++ timer_effects(State1)}.
+    {State1, SendEffects ++ timer_effects(Now, State1)}.
 
 %% Build and send one datagram per iteration until nothing is pending or
 %% the anti-amplification budget blocks; roll back the built state if the
 %% datagram cannot be sent.
--spec drain_send(non_neg_integer(), t(), [effect()]) -> {t(), [effect()]}.
+-spec drain_send(integer(), t(), [effect()]) -> {t(), [effect()]}.
 drain_send(Now, State, Acc) ->
     case build_packets(State) of
         none ->
@@ -423,11 +427,11 @@ take_crypto(Crypto) ->
         {Offset, Data, _Fin, Crypto1} -> {[{crypto, Offset, Data}], Crypto1}
     end.
 
--spec record_sent(non_neg_integer(), [roadrunner_quic_send:sent()], t()) -> t().
+-spec record_sent(integer(), [roadrunner_quic_send:sent()], t()) -> t().
 record_sent(Now, Sent, State) ->
     lists:foldl(fun(S, Acc) -> record_one_sent(Now, S, Acc) end, State, Sent).
 
--spec record_one_sent(non_neg_integer(), roadrunner_quic_send:sent(), t()) -> t().
+-spec record_one_sent(integer(), roadrunner_quic_send:sent(), t()) -> t().
 record_one_sent(
     Now,
     #{level := Level, pn := PN, length := Len, ack_eliciting := AckEliciting, frames := Frames},
@@ -444,43 +448,52 @@ record_one_sent(
 %% =============================================================================
 
 -doc """
-Handle a fired loss/PTO timer: re-run loss detection on every space,
-queueing lost frames to retransmit, then run a send pass so a dropped
-handshake packet recovers.
+Handle a fired probe timer: re-run loss detection on every space (queueing
+any lost frames to retransmit), back off the probe timeout, then run a send
+pass. The backoff is what guarantees forward progress, so a probe that
+detects no loss re-arms strictly later rather than re-firing immediately.
 """.
--spec handle_timeout(non_neg_integer(), atom(), t()) -> {t(), [effect()]}.
+-spec handle_timeout(integer(), atom(), t()) -> {t(), [effect()]}.
 handle_timeout(Now, pto, State) ->
-    State1 = lists:foldl(
-        fun(Level, S) -> detect_loss(Now, Level, S) end, State, present_levels(State)
-    ),
+    State1 = lists:foldl(fun(Level, S) -> on_pto(Now, Level, S) end, State, present_levels(State)),
     send_pass(Now, State1).
 
--spec detect_loss(non_neg_integer(), level(), t()) -> t().
-detect_loss(Now, Level, State) ->
+%% On a probe timeout: queue any time-threshold losses to retransmit and
+%% increment the space's probe-timeout backoff (RFC 9002 §6.2.1), so the
+%% next deadline is strictly later. Sending an explicit probe when nothing
+%% is detected as lost is deferred with congestion control (it needs the
+%% loss layer to surface the oldest unacknowledged frames).
+-spec on_pto(integer(), level(), t()) -> t().
+on_pto(Now, Level, State) ->
     #space{loss = Loss0, pending = Pending} = Space = space(Level, State),
-    {Loss, Lost} = roadrunner_quic_loss:detect_lost(Now, Loss0),
-    put_space(
-        Level,
-        Space#space{loss = Loss, pending = Pending ++ retransmittable(Lost)},
-        State
-    ).
+    {Loss1, Lost} = roadrunner_quic_loss:detect_lost(Now, Loss0),
+    Loss2 = roadrunner_quic_loss:on_pto_expired(Loss1),
+    put_space(Level, Space#space{loss = Loss2, pending = Pending ++ retransmittable(Lost)}, State).
 
--spec timer_effects(t()) -> [effect()].
-timer_effects(State) ->
-    case earliest_loss_time(State) of
+%% Arm one probe timer at the earliest per-space deadline (now plus the
+%% space's probe timeout) across spaces that still hold ack-eliciting bytes
+%% in flight; nothing in flight means nothing to probe for, so no timer.
+-spec timer_effects(integer(), t()) -> [effect()].
+timer_effects(Now, State) ->
+    case earliest_pto(Now, State) of
         undefined -> [];
         AtMs -> [{arm_timer, pto, AtMs}]
     end.
 
--spec earliest_loss_time(t()) -> non_neg_integer() | undefined.
-earliest_loss_time(State) ->
+-spec earliest_pto(integer(), t()) -> integer() | undefined.
+earliest_pto(Now, State) ->
     lists:foldl(
-        fun(Level, Earliest) ->
-            min_defined(Earliest, roadrunner_quic_loss:loss_time((space(Level, State))#space.loss))
-        end,
+        fun(Level, Earliest) -> min_defined(Earliest, space_pto(Now, space(Level, State))) end,
         undefined,
         present_levels(State)
     ).
+
+-spec space_pto(integer(), #space{}) -> integer() | undefined.
+space_pto(Now, #space{loss = Loss}) ->
+    case roadrunner_quic_loss:bytes_in_flight(Loss) of
+        0 -> undefined;
+        _ -> Now + roadrunner_quic_loss:get_pto(Loss)
+    end.
 
 %% =============================================================================
 %% Internal
@@ -512,8 +525,7 @@ space(Level, #state{spaces = Spaces}) ->
 put_space(Level, Space, #state{spaces = Spaces} = State) ->
     State#state{spaces = Spaces#{Level => Space}}.
 
--spec min_defined(non_neg_integer() | undefined, non_neg_integer() | undefined) ->
-    non_neg_integer() | undefined.
+-spec min_defined(integer() | undefined, integer() | undefined) -> integer() | undefined.
 min_defined(undefined, B) -> B;
 min_defined(A, undefined) -> A;
 min_defined(A, B) -> min(A, B).

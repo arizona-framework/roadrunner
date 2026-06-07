@@ -1,25 +1,15 @@
 -module(roadrunner_quic_conn_state_tests).
 
 -include_lib("eunit/include/eunit.hrl").
--include_lib("public_key/include/public_key.hrl").
 
 -define(M, roadrunner_quic_conn_state).
+-define(TC, roadrunner_quic_test_client).
 
-%% TLS handshake message types (RFC 8446 §4).
--define(CLIENT_HELLO, 1).
--define(SERVER_HELLO, 2).
+%% TLS handshake message types asserted on (RFC 8446 §4).
 -define(ENCRYPTED_EXTENSIONS, 8).
 -define(CERTIFICATE, 11).
 -define(CERTIFICATE_VERIFY, 15).
 -define(FINISHED, 20).
-
-%% ClientHello wire constants (RFC 8446 §4.1.2).
--define(LEGACY_VERSION, 16#0303).
--define(CIPHER_AES_128_GCM_SHA256, 16#1301).
--define(GROUP_X25519, 16#001D).
--define(EXT_SIGNATURE_ALGORITHMS, 16#000D).
--define(EXT_ALPN, 16#0010).
--define(EXT_KEY_SHARE, 16#0033).
 
 %% A fixed client DCID (the server's routing id), an 8-byte server SCID to
 %% match the server's fixed ?SCID_LEN, the peer address, and a clock.
@@ -52,28 +42,32 @@ handshake_reaches_connected_test() ->
 
 server_hello_carries_server_key_share_test() ->
     #{sh_framed := ServerHello, ctx := #{server_pub := ServerPub}} = connect(),
-    ?assertEqual(ServerPub, server_hello_key_share(ServerHello)).
+    ?assertEqual(ServerPub, ?TC:server_hello_key_share(ServerHello)).
 
 server_flight_carries_auth_messages_test() ->
     #{flight := Flight} = connect(),
     ?assertEqual(
         [?ENCRYPTED_EXTENSIONS, ?CERTIFICATE, ?CERTIFICATE_VERIFY, ?FINISHED],
-        [Type || {Type, _Body} <- deframe_all(Flight)]
+        [Type || {Type, _Body} <- ?TC:deframe_all(Flight)]
     ).
 
 initial_reply_acknowledges_client_test() ->
     #{effects1 := Effects1} = connect(),
-    Frames = server_frames(
-        sends(Effects1), initial, #{initial => roadrunner_quic_keys:initial_server(?DCID)}
+    Frames = ?TC:frames(
+        sends(Effects1),
+        initial,
+        #{initial => roadrunner_quic_keys:initial_server(?DCID)},
+        byte_size(?DCID)
     ),
     ?assert(lists:any(fun is_ack/1, Frames)).
 
 handshake_done_emitted_when_connected_test() ->
     #{effects2 := Effects2, server_ap_secret := ServerApSecret} = connect(),
-    Frames = server_frames(
+    Frames = ?TC:frames(
         sends(Effects2),
         application,
-        #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)}
+        #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+        byte_size(?DCID)
     ),
     ?assert(lists:member(handshake_done, Frames)).
 
@@ -85,9 +79,14 @@ client_ack_processed_test() ->
     %% A valid ACK of the server's ServerHello drives loss detection and is
     %% itself not acknowledged (an ACK is not ack-eliciting).
     #{state1 := State1} = connect(),
-    Datagram = seal(initial, 1, roadrunner_quic_keys:initial_client(?DCID), [
-        {ack, 0, 0, 0, [], undefined}
-    ]),
+    Datagram = ?TC:seal(
+        initial,
+        1,
+        roadrunner_quic_keys:initial_client(?DCID),
+        [{ack, 0, 0, 0, [], undefined}],
+        ?DCID,
+        ?SCID
+    ),
     {State2, _Effects} = ?M:handle_datagram(?NOW, Datagram, State1),
     ?assertEqual(handshaking, ?M:phase(State2)).
 
@@ -95,9 +94,14 @@ oversized_ack_range_ignored_test() ->
     %% An ACK claiming more packets than the loss layer accepts is dropped
     %% without disturbing the connection.
     #{state1 := State1} = connect(),
-    Datagram = seal(initial, 1, roadrunner_quic_keys:initial_client(?DCID), [
-        {ack, 70000, 0, 70000, [], undefined}
-    ]),
+    Datagram = ?TC:seal(
+        initial,
+        1,
+        roadrunner_quic_keys:initial_client(?DCID),
+        [{ack, 70000, 0, 70000, [], undefined}],
+        ?DCID,
+        ?SCID
+    ),
     {State2, _Effects} = ?M:handle_datagram(?NOW, Datagram, State1),
     ?assertEqual(handshaking, ?M:phase(State2)).
 
@@ -105,7 +109,9 @@ ping_and_padding_frames_handled_test() ->
     %% A PING (ack-eliciting) padded for the header-protection sample
     %% exercises the catch-all frame handler for both PING and PADDING.
     #{state1 := State1} = connect(),
-    Datagram = seal(initial, 1, roadrunner_quic_keys:initial_client(?DCID), [ping]),
+    Datagram = ?TC:seal(
+        initial, 1, roadrunner_quic_keys:initial_client(?DCID), [ping], ?DCID, ?SCID
+    ),
     {State2, _Effects} = ?M:handle_datagram(?NOW, Datagram, State1),
     ?assertEqual(handshaking, ?M:phase(State2)).
 
@@ -118,7 +124,7 @@ undecryptable_packet_dropped_test() ->
     %% §5.4.2); the connection neither advances nor replies.
     {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
     WrongKeys = #{key => <<0:128>>, iv => <<0:96>>, hp => <<0:128>>},
-    Datagram = seal(initial, 0, WrongKeys, [{crypto, 0, ~"hello"}]),
+    Datagram = ?TC:seal(initial, 0, WrongKeys, [{crypto, 0, ~"hello"}], ?DCID, ?SCID),
     {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, State0),
     ?assertEqual(handshaking, ?M:phase(State1)),
     ?assertEqual([], sends(Effects)).
@@ -128,8 +134,13 @@ malformed_frame_ignored_test() ->
     %% connection error the decision core absorbs (a CRYPTO frame claiming
     %% eight bytes but carrying three).
     {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
-    Datagram = seal_raw(
-        initial, 0, roadrunner_quic_keys:initial_client(?DCID), <<16#06, 16#00, 16#08, 1, 2, 3>>
+    Datagram = ?TC:seal_raw(
+        initial,
+        0,
+        roadrunner_quic_keys:initial_client(?DCID),
+        <<16#06, 16#00, 16#08, 1, 2, 3>>,
+        ?DCID,
+        ?SCID
     ),
     {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, State0),
     ?assertEqual(handshaking, ?M:phase(State1)),
@@ -141,8 +152,8 @@ packet_for_discarded_space_ignored_test() ->
     %% packet that then lands on the now-absent space.
     #{state1 := State1, client_hs_secret := ClientHsSecret, cf_framed := ClientFinished} = connect(),
     HsKeys = roadrunner_quic_keys:traffic_keys(ClientHsSecret),
-    Finished = seal(handshake, 0, HsKeys, [{crypto, 0, ClientFinished}]),
-    Trailing = seal(handshake, 1, HsKeys, [ping]),
+    Finished = ?TC:seal(handshake, 0, HsKeys, [{crypto, 0, ClientFinished}], ?DCID, ?SCID),
+    Trailing = ?TC:seal(handshake, 1, HsKeys, [ping], ?DCID, ?SCID),
     {State2, _Effects} = ?M:handle_datagram(?NOW, <<Finished/binary, Trailing/binary>>, State1),
     ?assertEqual(connected, ?M:phase(State2)).
 
@@ -154,27 +165,22 @@ tampered_client_finished_crashes_test() ->
     <<Type, Len:24, First, Rest/binary>> = ClientFinished,
     Tampered = <<Type, Len:24, (First bxor 1), Rest/binary>>,
     HsKeys = roadrunner_quic_keys:traffic_keys(ClientHsSecret),
-    Datagram = seal(handshake, 0, HsKeys, [{crypto, 0, Tampered}]),
+    Datagram = ?TC:seal(handshake, 0, HsKeys, [{crypto, 0, Tampered}], ?DCID, ?SCID),
     ?assertError(_, ?M:handle_datagram(?NOW, Datagram, State1)).
 
 %% =============================================================================
 %% Timers and anti-amplification
 %% =============================================================================
 
-pto_timeout_rearms_loss_timer_test() ->
-    %% A PTO fire re-runs loss detection across every live space and rearms
-    %% the loss timer from the oldest unacknowledged packet.
+pto_backoff_advances_deadline_test() ->
+    %% Each probe timeout that detects no loss must re-arm strictly later
+    %% (RFC 9002 §6.2.1 exponential backoff), never re-fire at the same past
+    %% deadline. Two fires at the same clock prove the deadline advances, so
+    %% the shell never busy-spins on send_after(0).
     #{state1 := State1} = connect(),
-    {_State2, Effects} = ?M:handle_timeout(?NOW + 100000, pto, State1),
-    ?assert(
-        lists:any(
-            fun
-                ({arm_timer, pto, _AtMs}) -> true;
-                (_) -> false
-            end,
-            Effects
-        )
-    ).
+    {State2, Effects1} = ?M:handle_timeout(?NOW, pto, State1),
+    {_State3, Effects2} = ?M:handle_timeout(?NOW, pto, State2),
+    ?assert(arm_deadline(Effects2) > arm_deadline(Effects1)).
 
 amplification_limit_caps_first_flight_test() ->
     %% A large certificate chain makes the server flight exceed 3x the
@@ -188,7 +194,7 @@ amplification_limit_caps_first_flight_test() ->
     ?assert(lists:sum([byte_size(D) || D <- sends(Effects)]) =< 3 * 1200).
 
 %% =============================================================================
-%% Handshake driver (plays the QUIC client with the merged leaves)
+%% Handshake driver (plays the QUIC client with the shared test client)
 %% =============================================================================
 
 %% Run a full RSA handshake against a fresh connection and return every
@@ -203,8 +209,8 @@ connect() ->
     Server1 = sends(Effects1),
 
     %% Recover the ServerHello and derive the handshake secrets.
-    ServerHello = server_crypto(
-        Server1, initial, #{initial => roadrunner_quic_keys:initial_server(?DCID)}
+    ServerHello = ?TC:crypto_bytes(
+        Server1, initial, #{initial => roadrunner_quic_keys:initial_server(?DCID)}, byte_size(?DCID)
     ),
     Shared = crypto:compute_key(ecdh, ServerPub, ClientPriv, x25519),
     HandshakeSecret = roadrunner_quic_tls_crypto:handshake_secret(
@@ -219,8 +225,11 @@ connect() ->
     ),
 
     %% Recover the server's authentication flight.
-    Flight = server_crypto(
-        Server1, handshake, #{handshake => roadrunner_quic_keys:traffic_keys(ServerHsSecret)}
+    Flight = ?TC:crypto_bytes(
+        Server1,
+        handshake,
+        #{handshake => roadrunner_quic_keys:traffic_keys(ServerHsSecret)},
+        byte_size(?DCID)
     ),
     FinishedHash = roadrunner_quic_tls_crypto:transcript_hash([
         ClientHelloFramed, ServerHello, Flight
@@ -233,11 +242,13 @@ connect() ->
     ClientFinishedFramed = iolist_to_binary(
         roadrunner_quic_tls_handshake:encode(?FINISHED, ClientFinishedBody)
     ),
-    HandshakeDatagram = seal(
+    HandshakeDatagram = ?TC:seal(
         handshake,
         0,
         roadrunner_quic_keys:traffic_keys(ClientHsSecret),
-        [{crypto, 0, ClientFinishedFramed}]
+        [{crypto, 0, ClientFinishedFramed}],
+        ?DCID,
+        ?SCID
     ),
     {State2, Effects2} = ?M:handle_datagram(?NOW, HandshakeDatagram, State1),
 
@@ -263,9 +274,9 @@ connect() ->
 
 %% A fresh server connection plus the client material the driver reuses.
 new_conn(CertChain) ->
-    {Scheme, PrivKey, _VerifyKey, _SigInputs} = key_material(rsa),
-    {ClientPub, ClientPriv} = crypto:generate_key(ecdh, x25519),
-    {ServerPub, ServerPriv} = crypto:generate_key(ecdh, x25519),
+    {Scheme, PrivKey} = ?TC:key_material(),
+    {ClientPub, ClientPriv} = ?TC:gen_keypair(),
+    {ServerPub, ServerPriv} = ?TC:gen_keypair(),
     TransportParams = #{
         original_destination_connection_id => ?DCID,
         initial_source_connection_id => ?SCID
@@ -292,119 +303,18 @@ new_conn(CertChain) ->
 %% The client Initial datagram and the framed ClientHello it carries (the
 %% first transcript element).
 client_hello_datagram(#{scheme := Scheme, client_pub := ClientPub}) ->
-    Body = client_hello_body(#{
-        key_share => ClientPub, sig_algs => [Scheme], alpn => ~"h3", session_id => <<>>
-    }),
-    Framed = iolist_to_binary(roadrunner_quic_tls_handshake:encode(?CLIENT_HELLO, Body)),
-    Datagram = seal(initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}]),
-    {Datagram, Framed}.
-
-%% Build a one-level client datagram through the send pipeline (an Initial
-%% is padded to 1200, so it satisfies the server's anti-amplification
-%% budget).
-seal(Level, PN, Keys, Frames) ->
-    Entries = #{Level => #{frames => Frames, keys => Keys, pn => PN}},
-    {Datagram, _Sent} = roadrunner_quic_send:datagram(Entries, ?DCID, ?SCID),
-    Datagram.
-
-%% Seal raw plaintext (bypassing frame encoding) so a packet can carry a
-%% deliberately malformed frame, mirroring the send path's header sizing.
-seal_raw(Level, PN, #{key := Key, iv := IV, hp := HP}, Plaintext) ->
-    PNLen = roadrunner_quic_packet:pn_length(PN),
-    SealedSize = byte_size(Plaintext) + 16,
-    [Header, _Payload] = roadrunner_quic_packet:encode_long(
-        Level, 1, ?DCID, ?SCID, #{pn => PN, payload => <<0:(SealedSize * 8)>>}
+    Framed = ?TC:client_hello_framed(Scheme, ClientPub),
+    Datagram = ?TC:seal(
+        initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
     ),
-    Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
-    Protected = roadrunner_quic_aead:protect_header(HP, Header, Sealed, byte_size(Header) - PNLen),
-    <<Protected/binary, Sealed/binary>>.
+    {Datagram, Framed}.
 
 sends(Effects) ->
     [Datagram || {send, Datagram} <- Effects].
 
-%% Contiguous CRYPTO bytes for a level across the server's datagrams. The
-%% per-level keys map naturally filters out the other levels' packets (they
-%% decode to {drop, no_keys}); with no in-test loss a sorted concat
-%% reassembles the flight.
-server_crypto(Datagrams, Level, Keys) ->
-    Slices = [{Offset, Data} || {crypto, Offset, Data} <- server_frames(Datagrams, Level, Keys)],
-    iolist_to_binary([Data || {_Offset, Data} <- lists:sort(Slices)]).
-
-server_frames(Datagrams, Level, Keys) ->
-    lists:append([level_frames(Datagram, Level, Keys) || Datagram <- Datagrams]).
-
-level_frames(Datagram, Level, Keys) ->
-    Outcomes = roadrunner_quic_recv:datagram(Datagram, byte_size(?DCID), Keys, #{}),
-    lists:append([Frames || {ok, #{level := L, frames := Frames}} <- Outcomes, L =:= Level]).
-
 is_ack({ack, _Largest, _Delay, _First, _Ranges, _Ecn}) -> true;
 is_ack(_Frame) -> false.
 
-%% A generated key pair per scheme plus the crypto:verify inputs for its
-%% public half (mirrors roadrunner_quic_tls_server_tests:key_material/1).
-key_material(rsa) ->
-    #'RSAPrivateKey'{publicExponent = E, modulus = N} =
-        PrivKey = public_key:generate_key({rsa, 2048, 65537}),
-    {16#0804, PrivKey, [E, N],
-        {rsa, sha256, [{rsa_padding, rsa_pkcs1_pss_padding}, {rsa_pss_saltlen, -1}]}}.
-
-%% Build a ClientHello body (RFC 8446 §4.1.2) carrying the requested
-%% extensions; the x25519 key_share is omitted when no key is given.
-client_hello_body(Opts) ->
-    Random = maps:get(random, Opts, crypto:strong_rand_bytes(32)),
-    SessionId = maps:get(session_id, Opts, <<>>),
-    SigAlgs = maps:get(sig_algs, Opts, [16#0804]),
-    Alpn = maps:get(alpn, Opts, ~"h3"),
-    Extensions = iolist_to_binary([
-        signature_algorithms_ext(SigAlgs),
-        alpn_ext(Alpn),
-        key_share_ext(maps:get(key_share, Opts, undefined))
-    ]),
-    CipherSuites = <<?CIPHER_AES_128_GCM_SHA256:16>>,
-    <<?LEGACY_VERSION:16, Random/binary, (byte_size(SessionId)):8, SessionId/binary,
-        (byte_size(CipherSuites)):16, CipherSuites/binary, 1:8, 0:8, (byte_size(Extensions)):16,
-        Extensions/binary>>.
-
-signature_algorithms_ext(Schemes) ->
-    List = <<<<S:16>> || S <- Schemes>>,
-    extension(?EXT_SIGNATURE_ALGORITHMS, <<(byte_size(List)):16, List/binary>>).
-
-alpn_ext(Protocol) ->
-    Entry = <<(byte_size(Protocol)):8, Protocol/binary>>,
-    extension(?EXT_ALPN, <<(byte_size(Entry)):16, Entry/binary>>).
-
-key_share_ext(undefined) ->
-    <<>>;
-key_share_ext(PubKey) ->
-    Entry = <<?GROUP_X25519:16, (byte_size(PubKey)):16, PubKey/binary>>,
-    extension(?EXT_KEY_SHARE, <<(byte_size(Entry)):16, Entry/binary>>).
-
-extension(Type, Data) ->
-    <<Type:16, (byte_size(Data)):16, Data/binary>>.
-
-%% The server's x25519 public key from a ServerHello's key_share extension.
-server_hello_key_share(ServerHello) ->
-    {?SERVER_HELLO, Body} = deframe(ServerHello),
-    <<_LegacyVersion:16, _Random:32/binary, SessionLen:8, _Session:SessionLen/binary, _Cipher:16,
-        _Compression:8, _ExtsLen:16, Extensions/binary>> = Body,
-    <<?GROUP_X25519:16, KeyLen:16, PubKey:KeyLen/binary>> =
-        extract_extension(?EXT_KEY_SHARE, Extensions),
-    PubKey.
-
-extract_extension(Type, <<Type:16, Len:16, Data:Len/binary, _Rest/binary>>) ->
-    Data;
-extract_extension(Type, <<_OtherType:16, Len:16, _Data:Len/binary, Rest/binary>>) ->
-    extract_extension(Type, Rest).
-
-deframe(Iolist) ->
-    {ok, {Type, Body}, <<>>} = roadrunner_quic_tls_handshake:decode(iolist_to_binary(Iolist)),
-    {Type, Body}.
-
-deframe_all(Iolist) ->
-    deframe_all_bin(iolist_to_binary(Iolist)).
-
-deframe_all_bin(<<>>) ->
-    [];
-deframe_all_bin(Bin) ->
-    {ok, {Type, Body}, Rest} = roadrunner_quic_tls_handshake:decode(Bin),
-    [{Type, Body} | deframe_all_bin(Rest)].
+arm_deadline(Effects) ->
+    [AtMs] = [At || {arm_timer, pto, At} <- Effects],
+    AtMs.
