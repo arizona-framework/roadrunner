@@ -20,3 +20,16 @@ open_rejects_negative_sndbuf_test() ->
 
 open_rejects_non_boolean_reuseport_test() ->
     ?assertError({invalid_quic_socket_opt, reuseport, yes}, ?M:open(0, #{reuseport => yes})).
+
+open_rejects_invalid_active_test() ->
+    ?assertError({invalid_quic_socket_opt, active, true}, ?M:open(0, #{active => true})).
+
+from_message_ignores_foreign_message_test() ->
+    %% A message that is not this socket's datagram (a different socket's data,
+    %% a DOWN, a system message) parses to `ignore` without opening any I/O.
+    {ok, Socket} = ?M:open(0),
+    ?assertEqual(
+        ignore, ?M:from_message(Socket, {udp, some_other_socket, {127, 0, 0, 1}, 1, ~"x"})
+    ),
+    ?assertEqual(ignore, ?M:from_message(Socket, {'DOWN', ref, process, self(), normal})),
+    ok = ?M:close(Socket).

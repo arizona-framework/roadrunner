@@ -13,14 +13,17 @@
 %% send/receive pipeline, not the shared socket. The socket delivers each
 %% UDP datagram whole, with its source address.
 
--export([open/1, open/2, send/4, recv/2, close/1, sockname/1]).
+-export([open/1, open/2, send/4, recv/2, activate/1, from_message/2, close/1, sockname/1]).
 
 -export_type([socket/0, open_opts/0]).
 
 -opaque socket() :: {gen_udp, gen_udp:socket()}.
 
 -type open_opts() :: #{
-    recbuf => pos_integer(), sndbuf => pos_integer(), reuseport => boolean()
+    recbuf => pos_integer(),
+    sndbuf => pos_integer(),
+    reuseport => boolean(),
+    active => once | false
 }.
 
 %% Larger than the OS default, so a burst of datagrams is not dropped
@@ -34,21 +37,28 @@ open(Port) ->
     open(Port, #{}).
 
 -doc """
-Open a UDP socket on `Port`. The socket is binary and passive
-(`{active, false}`), with `reuseaddr` set; `recbuf` and `sndbuf` may be
-overridden via `Opts`. Port 0 picks an ephemeral port (read it back with
-`sockname/1`).
+Open a UDP socket on `Port`. The socket is binary, with `reuseaddr` set;
+`recbuf` and `sndbuf` may be overridden via `Opts`. Port 0 picks an ephemeral
+port (read it back with `sockname/1`).
 
-Set `reuseport` to `true` to enable `SO_REUSEPORT`, which lets a pool
-of sockets share one concrete port with kernel datagram fan-out (the
-shape the listener pool uses); it defaults to `false` for a lone socket.
+`active` defaults to `false` (passive: drain with `recv/2`). Set it to `once`
+for the listener: each datagram is then delivered to the controlling process
+as one message, parsed with `from_message/2` and re-armed with `activate/1`,
+so the listener can interleave datagrams with monitor/system messages in a
+single receive loop.
+
+Set `reuseport` to `true` to enable `SO_REUSEPORT`, which lets a pool of
+sockets share one concrete port with kernel datagram fan-out (the shape the
+listener pool uses); it defaults to `false` for a lone socket.
 """.
 -spec open(inet:port_number(), open_opts()) -> {ok, socket()} | {error, term()}.
 open(Port, Opts) ->
-    #{recbuf := RecBuf, sndbuf := SndBuf, reuseport := ReusePort} = validate_opts(Opts),
+    #{recbuf := RecBuf, sndbuf := SndBuf, reuseport := ReusePort, active := Active} = validate_opts(
+        Opts
+    ),
     SocketOpts = [
         binary,
-        {active, false},
+        {active, Active},
         {reuseaddr, true},
         {reuseport, ReusePort},
         {recbuf, RecBuf},
@@ -80,6 +90,28 @@ recv({gen_udp, Socket}, Timeout) ->
         {error, _} = Error -> Error
     end.
 
+-doc """
+Re-arm an `active => once` socket for the next datagram. Called after each
+message parsed with `from_message/2`, giving one-datagram-at-a-time
+back-pressure rather than an unbounded `{active, true}` flood.
+""".
+-spec activate(socket()) -> ok | {error, term()}.
+activate({gen_udp, Socket}) ->
+    inet:setopts(Socket, [{active, once}]).
+
+-doc """
+Parse a mailbox message from an `active => once` socket: returns the source
+address and datagram bytes for this socket's data message, or `ignore` for
+anything else (a different socket's data, a monitor `DOWN`, a system message),
+so the listener loop can dispatch the rest itself.
+""".
+-spec from_message(socket(), term()) ->
+    {ok, {inet:ip_address(), inet:port_number()}, binary()} | ignore.
+from_message({gen_udp, Socket}, {udp, Socket, Ip, Port, Data}) ->
+    {ok, {Ip, Port}, Data};
+from_message(_Socket, _Message) ->
+    ignore.
+
 -doc "Close the socket.".
 -spec close(socket()) -> ok.
 close({gen_udp, Socket}) ->
@@ -97,9 +129,19 @@ sockname({gen_udp, Socket}) ->
 %% Merge the caller's options over the defaults, rejecting unknown keys
 %% and out-of-range values (mirrors the listener-opt validation idiom).
 -spec validate_opts(open_opts()) ->
-    #{recbuf := pos_integer(), sndbuf := pos_integer(), reuseport := boolean()}.
+    #{
+        recbuf := pos_integer(),
+        sndbuf := pos_integer(),
+        reuseport := boolean(),
+        active := once | false
+    }.
 validate_opts(Opts) ->
-    Defaults = #{recbuf => ?DEFAULT_RECBUF, sndbuf => ?DEFAULT_SNDBUF, reuseport => false},
+    Defaults = #{
+        recbuf => ?DEFAULT_RECBUF,
+        sndbuf => ?DEFAULT_SNDBUF,
+        reuseport => false,
+        active => false
+    },
     maps:fold(fun validate_opt/3, Defaults, Opts).
 
 -spec validate_opt(atom(), term(), map()) -> map().
@@ -109,5 +151,7 @@ validate_opt(sndbuf, Value, Acc) when is_integer(Value), Value > 0 ->
     Acc#{sndbuf => Value};
 validate_opt(reuseport, Value, Acc) when is_boolean(Value) ->
     Acc#{reuseport => Value};
+validate_opt(active, Value, Acc) when Value =:= once; Value =:= false ->
+    Acc#{active => Value};
 validate_opt(Key, Value, _Acc) ->
     error({invalid_quic_socket_opt, Key, Value}).
