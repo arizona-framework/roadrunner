@@ -23,7 +23,8 @@
 %% Handshake state once the handshake is confirmed (RFC 9001 §4.9), which
 %% also keeps the send pass from ever coalescing an Initial with a 1-RTT
 %% packet. The send pass collects, per space in order, an ACK frame, the
-%% TLS flight / retransmits, and (at Application) HANDSHAKE_DONE, packs them
+%% TLS flight / retransmits, and (at the Application level) HANDSHAKE_DONE
+%% plus outbound STREAM data sliced within the send-flow windows, packs them
 %% with `roadrunner_quic_send`, gates the datagram against the §8.1
 %% anti-amplification budget, and records each sent packet for loss
 %% recovery.
@@ -34,7 +35,9 @@
 %% sending an explicit probe both need the loss layer to surface acked bytes
 %% / sent times / the oldest unacknowledged frames, a separate follow-up.
 
--export([new/1, handle_datagram/3, handle_timeout/3, handle_call/4, peername/1, phase/1]).
+-export([
+    new/1, handle_datagram/3, handle_timeout/3, handle_call/4, handle_send/7, peername/1, phase/1
+]).
 
 -export_type([t/0, config/0, effect/0, event/0, info/0]).
 
@@ -43,6 +46,10 @@
 %% A CRYPTO slice budget that leaves room for the packet header, an ACK
 %% frame, and the AEAD tag within the 1200-byte datagram (RFC 9000 §14).
 -define(CRYPTO_BUDGET, 1000).
+%% A STREAM data-slice budget, leaving room for the short header, an ACK
+%% frame, the STREAM frame header, and the AEAD tag within the 1200-byte
+%% datagram (RFC 9000 §14).
+-define(STREAM_BUDGET, 1000).
 %% TLS handshake message types carried in CRYPTO (RFC 8446 §4).
 -define(CLIENT_HELLO, 1).
 -define(FINISHED, 20).
@@ -81,9 +88,14 @@
     owner :: pid() | undefined,
     %% The `connected` payload, built once at new/1.
     info :: info(),
-    %% Application streams (peer-initiated, application space), each with its
-    %% own receive reassembly + flow window, keyed by stream id.
+    %% Application streams, each with its own reassembly + flow window, keyed
+    %% by stream id (peer-initiated on receive; server-initiated and client
+    %% request streams on send).
     streams = #{} :: #{non_neg_integer() => stream()},
+    %% Next server-initiated unidirectional stream id to hand out (RFC 9000
+    %% §2.1: server uni ids are 3, 7, 11, ...); the owner opens its h3
+    %% control stream this way.
+    next_uni = 3 :: non_neg_integer(),
     %% Connection-level flow control (RFC 9000 §4).
     conn_flow :: roadrunner_quic_flow:t(),
     %% Owner events accumulated while folding a datagram's frames, drained in
@@ -257,12 +269,17 @@ connection are synchronous; the connection only ever notifies the owner
 with async `{emit, _, _}` effects, so it never blocks on the owner.
 """.
 -spec handle_call(pid(), reference(), Request, t()) -> {t(), [effect()]} when
-    Request :: peername | {set_owner, pid()}.
+    Request :: peername | {set_owner, pid()} | open_uni.
 handle_call(From, Ref, peername, #state{peer = Peer} = State) ->
     {State, [{reply, From, Ref, {ok, Peer}}]};
 handle_call(From, Ref, {set_owner, Owner}, State) ->
     {State1, EmitEffects} = install_owner(Owner, State),
-    {State1, [{reply, From, Ref, ok} | EmitEffects]}.
+    {State1, [{reply, From, Ref, ok} | EmitEffects]};
+handle_call(From, Ref, open_uni, #state{next_uni = Id} = State) ->
+    %% Allocate the next server-initiated unidirectional stream id. The stream
+    %% itself is created lazily on the first send_data; the h3 layer writes the
+    %% stream-type byte + SETTINGS, never this layer.
+    {State#state{next_uni = Id + 4}, [{reply, From, Ref, {ok, Id}}]}.
 
 %% Install the owner. When the handshake already completed before the owner
 %% was set (the deferred path), emit the once-only `{connected, Info}` now;
@@ -273,6 +290,45 @@ install_owner(Owner, #state{phase = connected, info = Info} = State) ->
     {State#state{owner = Owner}, [{emit, Owner, {connected, Info}}]};
 install_owner(Owner, State) ->
     {State#state{owner = Owner}, []}.
+
+-doc """
+Buffer outbound stream data and run a send pass: the shell forwards
+`{quic_send, From, Ref, Sid, IoData, Fin}` here. The data is enqueued on the
+stream's send buffer (the stream is created on first reference), an optional
+FIN is flagged, then the queued bytes are flushed as STREAM frames within the
+connection and per-stream send-flow credit. Always replies `ok`; rejecting a
+send on a draining/closed connection is a teardown-slice follow-up.
+""".
+-spec handle_send(pid(), reference(), non_neg_integer(), iodata(), boolean(), integer(), t()) ->
+    {t(), [effect()]}.
+handle_send(From, Ref, Sid, IoData, Fin, Now, State) ->
+    State1 = enqueue_send(Sid, IoData, Fin, State),
+    {State2, SendEffects} = send_pass(Now, State1),
+    {State2, [{reply, From, Ref, ok} | SendEffects]}.
+
+%% Append outbound bytes to a stream's send buffer (creating the stream on
+%% first reference) and flag the FIN when this is the final write.
+-spec enqueue_send(non_neg_integer(), iodata(), boolean(), t()) -> t().
+enqueue_send(Sid, IoData, Fin, State) ->
+    {Stream0, Flow, State1} = stream_for_send(Sid, State),
+    Stream1 = roadrunner_quic_stream:enqueue(IoData, Stream0),
+    Stream2 =
+        case Fin of
+            true -> roadrunner_quic_stream:finish(Stream1);
+            false -> Stream1
+        end,
+    put_stream(Sid, Stream2, Flow, State1).
+
+%% Look up a stream for sending, or create it without announcing. Sends go to
+%% the server's own streams or to existing client request streams, never to a
+%% peer stream the owner has not already seen via {stream_opened, _}.
+-spec stream_for_send(non_neg_integer(), t()) ->
+    {roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()}.
+stream_for_send(Sid, #state{streams = Streams} = State) ->
+    case Streams of
+        #{Sid := {Stream, Flow}} -> {Stream, Flow, State};
+        #{} -> {roadrunner_quic_stream:new(), roadrunner_quic_flow:new(#{}), State}
+    end.
 
 -spec process_outcome(integer(), roadrunner_quic_recv:outcome(), t()) -> t().
 process_outcome(
@@ -331,7 +387,9 @@ process_frame(_Now, application, {stream, Sid, Offset, Data, Fin}, State) ->
 process_frame(_Now, application, {reset_stream, Sid, ErrorCode, FinalSize}, State) ->
     process_reset_stream(Sid, ErrorCode, FinalSize, State);
 process_frame(_Now, _Level, _Frame, State) ->
-    %% ping / padding / peer flow-credit grants (handled with the send side).
+    %% ping / padding are no-ops. Peer flow-credit grants (MAX_DATA /
+    %% MAX_STREAM_DATA) and MAX_STREAMS are accepted but not yet acted on, so
+    %% the send side keeps the default window until that follow-up lands.
     State.
 
 %% Reassemble CRYPTO, deframe complete handshake messages, and drive the
@@ -589,16 +647,60 @@ build_level(Level, State) ->
     {AckFrames, Ack} = take_ack(Space#space.ack),
     case Space#space.pending of
         [_ | _] = Pending ->
-            %% Retransmits travel in their own packet (no fresh CRYPTO
-            %% slice), so a replayed CRYPTO frame plus a new slice can
-            %% never overflow the datagram.
+            %% Retransmits travel in their own packet (no fresh CRYPTO or
+            %% STREAM slice), so a replayed frame plus a new slice can never
+            %% overflow the datagram.
             build_entry(Level, AckFrames ++ Pending, Space#space{ack = Ack, pending = []}, State);
         [] ->
-            {CryptoFrames, Crypto} = take_crypto(Space#space.crypto),
-            case AckFrames ++ CryptoFrames of
-                [] -> none;
-                Frames -> build_entry(Level, Frames, Space#space{ack = Ack, crypto = Crypto}, State)
-            end
+            build_data(Level, AckFrames, Space#space{ack = Ack}, State)
+    end.
+
+%% With nothing pending to retransmit, fill the packet after any ACK with
+%% fresh data: CRYPTO at the handshake levels, application STREAM frames at
+%% the application level (which never carries CRYPTO).
+-spec build_data(level(), [roadrunner_quic_frame:frame()], #space{}, t()) -> none | {map(), t()}.
+build_data(application, AckFrames, Space, State) ->
+    {StreamFrames, State1} = take_stream(State),
+    case AckFrames ++ StreamFrames of
+        [] -> none;
+        Frames -> build_entry(application, Frames, Space, State1)
+    end;
+build_data(Level, AckFrames, Space, State) ->
+    {CryptoFrames, Crypto} = take_crypto(Space#space.crypto),
+    case AckFrames ++ CryptoFrames of
+        [] -> none;
+        Frames -> build_entry(Level, Frames, Space#space{crypto = Crypto}, State)
+    end.
+
+%% Pull ONE outbound STREAM frame from the lowest-id stream that has data or a
+%% FIN to send and the credit to send it, skipping streams blocked by send
+%% flow control (a buffered-but-unsendable stream yields `nothing`; a pending
+%% FIN-only frame costs no credit and is always emitted). The slice is bounded
+%% by the connection and per-stream send windows and the per-packet budget,
+%% and the bytes are accounted against both windows.
+-spec take_stream(t()) -> {[roadrunner_quic_frame:frame()], t()}.
+take_stream(#state{streams = Streams} = State) ->
+    take_stream(lists:sort(maps:keys(Streams)), State).
+
+-spec take_stream([non_neg_integer()], t()) -> {[roadrunner_quic_frame:frame()], t()}.
+take_stream([], State) ->
+    {[], State};
+take_stream([Sid | Rest], #state{streams = Streams, conn_flow = ConnFlow} = State) ->
+    #{Sid := {Stream0, StreamFlow0}} = Streams,
+    Budget = lists:min([
+        ?STREAM_BUDGET,
+        roadrunner_quic_flow:send_window(ConnFlow),
+        roadrunner_quic_flow:send_window(StreamFlow0)
+    ]),
+    case roadrunner_quic_stream:next_frame(Budget, Stream0) of
+        nothing ->
+            take_stream(Rest, State);
+        {Offset, Data, Fin, Stream1} ->
+            Size = byte_size(Data),
+            {_, ConnFlow1} = roadrunner_quic_flow:on_data_sent(Size, ConnFlow),
+            {_, StreamFlow1} = roadrunner_quic_flow:on_data_sent(Size, StreamFlow0),
+            State1 = put_stream(Sid, Stream1, StreamFlow1, State#state{conn_flow = ConnFlow1}),
+            {[{stream, Sid, Offset, Data, Fin}], State1}
     end.
 
 -spec build_entry(level(), [roadrunner_quic_frame:frame()], #space{}, t()) -> {map(), t()}.

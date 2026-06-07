@@ -17,6 +17,7 @@
 shell_test_() ->
     {foreach, fun setup/0, fun cleanup/1, [
         fun handshake_completes/1,
+        fun send_data_round_trip/1,
         fun peername_round_trip/1,
         fun set_owner_emits_connected/1,
         fun system_message_handled/1,
@@ -55,6 +56,27 @@ handshake_completes(#{shell := Shell, peer := Peer, client := ClientSocket, ctx 
             byte_size(?DCID)
         ),
         ?assert(lists:member(handshake_done, AppFrames))
+    end.
+
+%% A stream write round-trips through the shell: {quic_send, ...} is answered
+%% with {quic_reply, Ref, ok} and the data goes out as a 1-RTT STREAM frame.
+send_data_round_trip(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
+    fun() ->
+        ServerApSecret = do_handshake(Shell, Peer, ClientSocket, Ctx),
+        Ref = make_ref(),
+        Shell ! {quic_send, self(), Ref, 0, ~"hello", true},
+        receive
+            {quic_reply, Ref, ok} -> ok
+        after 1000 ->
+            erlang:error(no_reply)
+        end,
+        Frames = ?TC:frames(
+            recv_all(ClientSocket),
+            application,
+            #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+            byte_size(?DCID)
+        ),
+        ?assert(lists:member({stream, 0, 0, ~"hello", true}, Frames))
     end.
 
 %% A synchronous peername control call round-trips through the shell.

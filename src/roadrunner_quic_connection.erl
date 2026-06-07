@@ -18,10 +18,12 @@
 %% that was re-armed before firing) are dropped by a reference match.
 %%
 %% Synchronous control calls from the owner or listener arrive as
-%% `{quic_call, From, Ref, Request}` and are answered with a `{reply, From,
-%% Ref, Result}` effect; owner notifications go out as async `{emit, Owner,
-%% Event}` effects (`Owner ! {quic, self(), Event}`). The connection only
-%% ever sends to the owner asynchronously, so it never blocks on it.
+%% `{quic_call, From, Ref, Request}` and stream writes as `{quic_send, From,
+%% Ref, Sid, IoData, Fin}`; both are answered with a `{reply, From, Ref,
+%% Result}` effect (delivered as `From ! {quic_reply, Ref, Result}`). Owner
+%% notifications go out as async `{emit, Owner, Event}` effects (`Owner !
+%% {quic, self(), Event}`). The connection only ever sends to the owner
+%% asynchronously, so it never blocks on it.
 
 -export([start/2]).
 -export([init/2]).
@@ -75,6 +77,12 @@ loop(State) ->
             Now = erlang:monotonic_time(millisecond),
             {Conn, Effects} = roadrunner_quic_conn_state:handle_call(
                 From, Ref, Request, State#shell.conn
+            ),
+            loop(perform(Effects, Now, State#shell{conn = Conn}));
+        {quic_send, From, Ref, Sid, IoData, Fin} ->
+            Now = erlang:monotonic_time(millisecond),
+            {Conn, Effects} = roadrunner_quic_conn_state:handle_send(
+                From, Ref, Sid, IoData, Fin, Now, State#shell.conn
             ),
             loop(perform(Effects, Now, State#shell{conn = Conn}));
         {quic_datagram, _Peer, Datagram} ->

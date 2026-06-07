@@ -440,6 +440,77 @@ stream_without_owner_not_emitted_test() ->
     ?assertEqual([], emits(Effects)).
 
 %% =============================================================================
+%% Application streams (send side)
+%% =============================================================================
+
+open_uni_allocates_server_uni_ids_test() ->
+    %% Each open_unidirectional_stream hands out the next server-initiated uni
+    %% id (RFC 9000 §2.1: 3, 7, 11, ...) and replies with it.
+    {State, _ApSecret} = connected_for_send(),
+    Ref1 = make_ref(),
+    {State1, Effects1} = ?M:handle_call(self(), Ref1, open_uni, State),
+    ?assertEqual([{reply, self(), Ref1, {ok, 3}}], Effects1),
+    Ref2 = make_ref(),
+    {_State2, Effects2} = ?M:handle_call(self(), Ref2, open_uni, State1),
+    ?assertEqual([{reply, self(), Ref2, {ok, 7}}], Effects2).
+
+send_data_emits_stream_frame_with_fin_test() ->
+    %% A finished send becomes a single STREAM frame carrying the data and FIN,
+    %% and the call is acknowledged with ok.
+    {State, ApSecret} = connected_for_send(),
+    Ref = make_ref(),
+    {_State1, Effects} = ?M:handle_send(self(), Ref, 0, ~"hello", true, ?NOW, State),
+    ?assertEqual({reply, self(), Ref, ok}, hd(Effects)),
+    ?assertEqual([{stream, 0, 0, ~"hello", true}], sent_stream_frames(Effects, ApSecret)).
+
+send_data_without_fin_leaves_stream_open_test() ->
+    %% A non-final send carries Fin = false (used for the control stream's
+    %% SETTINGS, which keeps the stream open).
+    {State, ApSecret} = connected_for_send(),
+    {_State1, Effects} = ?M:handle_send(self(), make_ref(), 3, ~"settings", false, ?NOW, State),
+    ?assertEqual([{stream, 3, 0, ~"settings", false}], sent_stream_frames(Effects, ApSecret)).
+
+send_data_multi_call_advances_offset_test() ->
+    %% Successive sends on one stream advance the stream offset; the FIN rides
+    %% the final write.
+    {State, ApSecret} = connected_for_send(),
+    {State1, E1} = ?M:handle_send(self(), make_ref(), 0, ~"foo", false, ?NOW, State),
+    ?assertEqual([{stream, 0, 0, ~"foo", false}], sent_stream_frames(E1, ApSecret)),
+    {_State2, E2} = ?M:handle_send(self(), make_ref(), 0, ~"bar", true, ?NOW, State1),
+    ?assertEqual([{stream, 0, 3, ~"bar", true}], sent_stream_frames(E2, ApSecret)).
+
+send_data_slices_large_payload_test() ->
+    %% A payload larger than the per-packet budget is sliced across datagrams
+    %% (one STREAM frame each), offsets contiguous, FIN on the last slice, and
+    %% the bytes reassemble to the original.
+    {State, ApSecret} = connected_for_send(),
+    Payload = binary:copy(~"x", 2500),
+    {_State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, true, ?NOW, State),
+    Frames = sent_stream_frames(Effects, ApSecret),
+    ?assertEqual([0, 1000, 2000], [Off || {stream, 0, Off, _, _} <- Frames]),
+    ?assertEqual([false, false, true], [Fin || {stream, 0, _, _, Fin} <- Frames]),
+    ?assertEqual(Payload, iolist_to_binary([D || {stream, 0, _, D, _} <- Frames])).
+
+send_data_on_control_then_request_stream_test() ->
+    %% The two load-bearing GET writes: SETTINGS on the server control stream
+    %% (id 3) then a response on the client request stream (id 0), each on its
+    %% own stream.
+    {State, ApSecret} = connected_for_send(),
+    {State1, E1} = ?M:handle_send(self(), make_ref(), 3, ~"settings", false, ?NOW, State),
+    ?assertEqual([{stream, 3, 0, ~"settings", false}], sent_stream_frames(E1, ApSecret)),
+    {_State2, E2} = ?M:handle_send(self(), make_ref(), 0, ~"response", true, ?NOW, State1),
+    ?assertEqual([{stream, 0, 0, ~"response", true}], sent_stream_frames(E2, ApSecret)).
+
+fully_sent_stream_is_skipped_on_later_pass_test() ->
+    %% Once a stream is finished and drained, a later send pass (here driven by
+    %% a peer PING that elicits an ACK) emits no STREAM frame for it.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, _} = ?M:handle_send(self(), make_ref(), 0, ~"done", true, ?NOW, State),
+    Ping = app_datagram([ping], 0, ClientApSecret),
+    {_State2, Effects} = ?M:handle_datagram(?NOW, Ping, State1),
+    ?assertEqual([], sent_stream_frames(Effects, ServerApSecret)).
+
+%% =============================================================================
 %% Handshake driver (plays the QUIC client with the shared test client)
 %% =============================================================================
 
@@ -570,15 +641,17 @@ transport_params() ->
 expected_info() ->
     #{alpn => ~"h3", transport_params => transport_params()}.
 
-%% A connected connection with this process installed as owner (set during
-%% handshaking, the normal ordering), plus the client application secret for
-%% sealing peer 1-RTT packets.
-connected_with_owner() ->
+%% Drive to connected with this process installed as owner (set during
+%% handshaking, the normal ordering). Returns the state plus both application
+%% secrets: the client secret seals peer 1-RTT packets (receive-side tests),
+%% the server secret decodes the connection's own 1-RTT (send-side tests).
+connect_owned() ->
     #{
         state1 := State1,
         client_hs_secret := ClientHsSecret,
         cf_framed := ClientFinished,
-        client_ap_secret := ClientApSecret
+        client_ap_secret := ClientApSecret,
+        server_ap_secret := ServerApSecret
     } = connect(),
     {State1b, _} = ?M:handle_call(self(), make_ref(), {set_owner, self()}, State1),
     Finished = ?TC:seal(
@@ -590,13 +663,35 @@ connected_with_owner() ->
         ?SCID
     ),
     {State2, _Effects} = ?M:handle_datagram(?NOW, Finished, State1b),
+    {State2, ClientApSecret, ServerApSecret}.
+
+%% Connected, owner installed, with the client secret for sealing peer 1-RTT.
+connected_with_owner() ->
+    {State2, ClientApSecret, _ServerApSecret} = connect_owned(),
     {State2, ClientApSecret}.
+
+%% Connected, owner installed, with the server secret for decoding the
+%% connection's own outbound 1-RTT.
+connected_for_send() ->
+    {State2, _ClientApSecret, ServerApSecret} = connect_owned(),
+    {State2, ServerApSecret}.
 
 %% Seal a peer 1-RTT (application) datagram carrying the given frames.
 app_datagram(Frames, PN, ClientApSecret) ->
     ?TC:seal(
         application, PN, roadrunner_quic_keys:traffic_keys(ClientApSecret), Frames, ?DCID, ?SCID
     ).
+
+%% Decode the application (1-RTT) frames the connection sent, then keep just
+%% the STREAM frames.
+sent_stream_frames(Effects, ServerApSecret) ->
+    Frames = ?TC:frames(
+        sends(Effects),
+        application,
+        #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+        byte_size(?DCID)
+    ),
+    [Frame || {stream, _Sid, _Off, _Data, _Fin} = Frame <- Frames].
 
 emits(Effects) ->
     [Emit || {emit, _Owner, _Event} = Emit <- Effects].
