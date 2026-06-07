@@ -31,6 +31,7 @@
     encode_version_negotiation/3,
     decode/2,
     dcid/2,
+    coalesced_split/1,
     pn_offset/2,
     encode_pn/2,
     decode_pn/2,
@@ -161,6 +162,45 @@ dcid(<<0:1, _:7, Rest/binary>>, DCIDLen) ->
     end;
 dcid(_, _) ->
     {error, invalid_packet}.
+
+-doc """
+Split the first packet of a (possibly coalesced) datagram (RFC 9000
+§12.2), reading only header-protection-independent bytes so it works on a
+still-protected datagram. A long-header packet is bounded by its Length
+field; a short-header packet carries no length and so runs to the end of
+the datagram (it can only be the last packet). Returns `{ok, Packet, Rest}`
+(`Rest` being the following coalesced packets), or `done` at the end of
+the datagram or on trailing padding (a zero first byte / cleared fixed
+bit), which the receive loop treats as a clean stop. A server never
+receives Retry or Version Negotiation, so their lengthless layout is not
+special-cased (such a packet mis-slices and is dropped downstream).
+""".
+-spec coalesced_split(binary()) -> {ok, binary(), binary()} | done | {error, term()}.
+coalesced_split(<<>>) ->
+    done;
+coalesced_split(<<FirstByte, _/binary>>) when (FirstByte band 16#40) =:= 0 ->
+    %% Fixed bit clear (includes a zero padding byte): no more packets.
+    done;
+coalesced_split(<<1:1, _:7, _Version:32, DCIDLen, Rest/binary>> = Bin) when DCIDLen =< ?MAX_CID ->
+    <<FirstByte, _/binary>> = Bin,
+    maybe
+        {ok, AfterCids} ?= skip_scid(DCIDLen, Rest),
+        {ok, AfterPrefix} ?= skip_token(bits_to_type((FirstByte bsr 4) band 2#11), AfterCids),
+        {ok, Length, AfterLength} ?= take_varint(AfterPrefix),
+        split_at(Bin, byte_size(Bin) - byte_size(AfterLength) + Length)
+    end;
+coalesced_split(<<0:1, _:7, _/binary>> = Bin) ->
+    %% Short header: the packet runs to the end of the datagram.
+    {ok, Bin, <<>>};
+coalesced_split(_) ->
+    {error, invalid_packet}.
+
+-spec split_at(binary(), non_neg_integer()) -> {ok, binary(), binary()} | {error, truncated}.
+split_at(Bin, PacketLen) ->
+    case Bin of
+        <<Packet:PacketLen/binary, Rest/binary>> -> {ok, Packet, Rest};
+        _ -> {error, truncated}
+    end.
 
 -doc """
 Locate the Packet Number field's byte offset, so the AEAD layer can take
