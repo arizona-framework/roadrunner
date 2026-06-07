@@ -36,6 +36,9 @@
 %% frames so the loop can retransmit them if it is later declared lost.
 
 -export([datagram/3]).
+%% Exported for the connection loop's ack-tracking and loss-retransmit
+%% decisions: the single source of truth for which frames are ack-eliciting.
+-export([ack_eliciting/1, is_ack_eliciting/1]).
 
 -export_type([level/0, entry/0, sent/0]).
 
@@ -166,10 +169,14 @@ pad_datagram(Datagram, _Entries) ->
 
 %% A packet is ack-eliciting if it carries any frame other than PADDING,
 %% ACK, or CONNECTION_CLOSE (RFC 9002 §2).
+-doc false.
 -spec ack_eliciting([roadrunner_quic_frame:frame()]) -> boolean().
 ack_eliciting(Frames) ->
     lists:any(fun is_ack_eliciting/1, Frames).
 
+%% A single frame is ack-eliciting unless it is PADDING, ACK, or
+%% CONNECTION_CLOSE.
+-doc false.
 -spec is_ack_eliciting(roadrunner_quic_frame:frame()) -> boolean().
 is_ack_eliciting(padding) -> false;
 is_ack_eliciting({ack, _, _, _, _, _}) -> false;
