@@ -224,7 +224,10 @@ config(Peer) ->
         alpn => ~"h3",
         transport_params => #{
             original_destination_connection_id => ?DCID,
-            initial_source_connection_id => ?SCID
+            initial_source_connection_id => ?SCID,
+            initial_max_data => 1048576,
+            initial_max_stream_data_bidi_remote => 262144,
+            initial_max_stream_data_uni => 262144
         },
         eph_pub => ServerPub,
         eph_priv => ServerPriv,

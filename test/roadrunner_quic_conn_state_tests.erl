@@ -24,6 +24,11 @@
 -define(NOW, 1000).
 %% Must match roadrunner_quic_conn_state's ?IDLE_TIMEOUT default.
 -define(IDLE_TIMEOUT, 30000).
+%% Advertised receive windows (RFC 9000 §4.1), deliberately small and distinct
+%% from roadrunner_quic_flow's 786432-byte default so a test can prove a window
+%% is seeded from the advertised value rather than that default.
+-define(CONN_RECV_WINDOW, 2000).
+-define(STREAM_RECV_WINDOW, 1000).
 
 %% =============================================================================
 %% Construction
@@ -484,24 +489,48 @@ reset_final_size_violation_closes_test() ->
     ?assertEqual(closed, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, final_size_error}}}], emits(Effects)).
 
-stream_over_connection_flow_limit_closes_test() ->
-    %% A peer STREAM whose highest offset exceeds the connection's
-    %% 786432-byte receive window is an RFC 9000 §4.1 flow-control connection
-    %% error.
+stream_over_advertised_stream_flow_limit_closes_test() ->
+    %% A peer STREAM whose highest offset exceeds the per-stream receive window
+    %% we advertised (initial_max_stream_data_bidi_remote) is an RFC 9000 §4.1
+    %% flow-control connection error. The window is the advertised value (here
+    %% ?STREAM_RECV_WINDOW, well under the connection window so it is what
+    %% trips), not a larger hardcoded default that would let the overrun pass.
     {State, ApSecret} = connected_with_owner(),
-    Oversized = binary:copy(~"x", 786433),
+    Oversized = binary:copy(~"x", ?STREAM_RECV_WINDOW + 1),
     Bad = app_datagram([{stream, 0, 0, Oversized, false}], 0, ApSecret),
     {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, flow_control_error}}}], emits(Effects)).
 
+data_over_advertised_connection_flow_limit_closes_test() ->
+    %% Data spread across streams, each within its per-stream window but
+    %% together exceeding the advertised connection window (initial_max_data),
+    %% is an RFC 9000 §4.1 flow-control connection error. Two full per-stream
+    %% windows fill the connection window exactly; one more byte on a third
+    %% stream overflows it, proving the window is the advertised value (it would
+    %% not trip this early under a larger default).
+    {State0, ApSecret} = connected_with_owner(),
+    Chunk = binary:copy(~"x", ?STREAM_RECV_WINDOW),
+    {State1, _} = ?M:handle_datagram(
+        ?NOW, app_datagram([{stream, 0, 0, Chunk, false}], 0, ApSecret), State0
+    ),
+    {State2, _} = ?M:handle_datagram(
+        ?NOW, app_datagram([{stream, 4, 0, Chunk, false}], 1, ApSecret), State1
+    ),
+    ?assertEqual(connected, ?M:phase(State2)),
+    {State3, Effects} = ?M:handle_datagram(
+        ?NOW, app_datagram([{stream, 8, 0, ~"x", false}], 2, ApSecret), State2
+    ),
+    ?assertEqual(closed, ?M:phase(State3)),
+    ?assertEqual([{emit, self(), {closed, {local, flow_control_error}}}], emits(Effects)).
+
 stream_retransmit_does_not_re_consume_flow_test() ->
     %% Flow control is charged by the increase in the highest received offset,
-    %% so resending bytes already received does not re-consume the connection
+    %% so resending bytes already received does not re-consume the receive
     %% window (RFC 9000 §4.1) even when the raw byte sum exceeds it; the
     %% duplicate also delivers no new stream_data.
     {State, ApSecret} = connected_with_owner(),
-    Chunk = binary:copy(~"x", 500000),
+    Chunk = binary:copy(~"x", ?STREAM_RECV_WINDOW - 200),
     {State1, _} = ?M:handle_datagram(
         ?NOW, app_datagram([{stream, 0, 0, Chunk, false}], 0, ApSecret), State
     ),
@@ -906,7 +935,13 @@ is_ack({ack, _Largest, _Delay, _First, _Ranges, _Ecn}) -> true;
 is_ack(_Frame) -> false.
 
 transport_params() ->
-    #{original_destination_connection_id => ?DCID, initial_source_connection_id => ?SCID}.
+    #{
+        original_destination_connection_id => ?DCID,
+        initial_source_connection_id => ?SCID,
+        initial_max_data => ?CONN_RECV_WINDOW,
+        initial_max_stream_data_bidi_remote => ?STREAM_RECV_WINDOW,
+        initial_max_stream_data_uni => ?STREAM_RECV_WINDOW
+    }.
 
 %% The connected payload conn_state caches at new/1 (alpn + advertised params).
 expected_info() ->

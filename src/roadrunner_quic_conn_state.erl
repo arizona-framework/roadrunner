@@ -207,6 +207,10 @@ new(
         eph_priv => EphPriv,
         server_random => ServerRandom
     }),
+    %% Seed the connection receive window from the limit we advertise, so the
+    %% window enforced (RFC 9000 §4.1) is exactly the one the peer was told it
+    %% may use, never a smaller hardcoded default it would trip early on.
+    #{initial_max_data := ConnMaxData} = TransportParams,
     #state{
         dcid = DCID,
         scid = SCID,
@@ -219,7 +223,7 @@ new(
         amp = roadrunner_quic_amp:new(),
         owner = undefined,
         info = #{alpn => Alpn, transport_params => TransportParams},
-        conn_flow = roadrunner_quic_flow:new(#{}),
+        conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ConnMaxData}),
         idle_deadline = Now + ?IDLE_TIMEOUT
     }.
 
@@ -776,17 +780,29 @@ send_close(
 %% the stream, its flow, and the state carrying any queued event.
 -spec ensure_stream(non_neg_integer(), t()) ->
     {roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()}.
-ensure_stream(Sid, #state{streams = Streams} = State) ->
+ensure_stream(Sid, #state{streams = Streams, info = #{transport_params := TP}} = State) ->
     case Streams of
         #{Sid := {Stream, Flow}} ->
             {Stream, Flow, State};
         #{} ->
             {
                 roadrunner_quic_stream:new(),
-                roadrunner_quic_flow:new(#{}),
+                roadrunner_quic_flow:new(#{initial_max_data => stream_recv_window(Sid, TP)}),
                 emit({stream_opened, Sid}, State)
             }
     end.
+
+%% The receive window we advertised for a peer-initiated stream (RFC 9000
+%% §18.2): client-initiated bidirectional streams (Sid rem 4 == 0) get
+%% initial_max_stream_data_bidi_remote, client-initiated unidirectional streams
+%% (Sid rem 4 == 2) get initial_max_stream_data_uni. Server-initiated ids never
+%% reach here (process_stream/process_reset_stream reject them upstream).
+-spec stream_recv_window(non_neg_integer(), roadrunner_quic_transport_params:params()) ->
+    non_neg_integer().
+stream_recv_window(Sid, #{initial_max_stream_data_bidi_remote := Bidi}) when Sid rem 4 =:= 0 ->
+    Bidi;
+stream_recv_window(_Sid, #{initial_max_stream_data_uni := Uni}) ->
+    Uni.
 
 -spec put_stream(non_neg_integer(), roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()) ->
     t().
