@@ -23,6 +23,7 @@ an outer guard. The pure routing decision (`classify/2`) is unit-tested in
     system_message_exposes_state/1,
     stray_message_is_ignored/1,
     malformed_datagram_is_dropped/1,
+    sends_version_negotiation_for_unsupported_version/1,
     conn_down_is_cleaned_up/1
 ]).
 
@@ -42,6 +43,7 @@ all() ->
         system_message_exposes_state,
         stray_message_is_ignored,
         malformed_datagram_is_dropped,
+        sends_version_negotiation_for_unsupported_version,
         conn_down_is_cleaned_up
     ].
 
@@ -174,6 +176,35 @@ malformed_datagram_is_dropped(_Config) ->
     ?assert(is_pid(ConnPid)),
     ?assertEqual(Port, roadrunner_quic_listener:get_port(Listener)),
     exit(ConnPid, kill),
+    ok = roadrunner_quic_socket:close(Client),
+    ok = roadrunner_quic_listener:stop(Listener).
+
+%% RFC 9000 §5.2.2/§17.2.1: an unsupported-version Initial at the 1200-byte
+%% floor draws a Version Negotiation reply listing the supported versions, with
+%% the client's connection ids echoed swapped (the reply's destination id is the
+%% client's source id, its source id is the client's destination id). No
+%% connection is spawned.
+sends_version_negotiation_for_unsupported_version(_Config) ->
+    {Listener, Port} = start_listener(drain_handler()),
+    {ok, Client} = roadrunner_quic_socket:open(0),
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    SCID = <<9, 9, 9>>,
+    Header =
+        <<16#C0, 16#FF000001:32, (byte_size(DCID)), DCID/binary, (byte_size(SCID)), SCID/binary>>,
+    Initial = <<Header/binary, 0:((1200 - byte_size(Header)) * 8)>>,
+    ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, Port, Initial),
+    VN =
+        case roadrunner_quic_socket:recv(Client, 2000) of
+            {ok, _Peer, Datagram} -> Datagram;
+            Other -> ct:fail({no_version_negotiation, Other})
+        end,
+    <<FirstByte, 0:32, VNDcidLen, VNDcid:VNDcidLen/binary, VNScidLen, VNScid:VNScidLen/binary,
+        VersionsBin/binary>> = VN,
+    %% Long-header form bit and the RFC7983 fixed-bit position are both set.
+    ?assertEqual(16#C0, FirstByte band 16#C0),
+    ?assertEqual(SCID, VNDcid),
+    ?assertEqual(DCID, VNScid),
+    ?assertEqual([?QUIC_V1], [V || <<V:32>> <= VersionsBin]),
     ok = roadrunner_quic_socket:close(Client),
     ok = roadrunner_quic_listener:stop(Listener).
 

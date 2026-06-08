@@ -10,7 +10,9 @@
 %% Each datagram is routed by its Destination Connection ID
 %% (`roadrunner_quic_cid_registry`): a hit forwards `{quic_datagram, Peer,
 %% Bytes}` to the owning connection; a miss on a QUIC v1 Initial spawns a new
-%% connection. Spawning follows the strict ordering the handshake depends on
+%% connection; a miss on an unsupported-version long header answers with a
+%% Version Negotiation packet (RFC 9000 §5.2.2). Spawning follows the strict
+%% ordering the handshake depends on
 %% (RFC 9000 / the dep's contract): spawn the connection, monitor it (so a
 %% fast death is reaped before its connection ids are registered), register
 %% its CIDs (so a fast follow-up datagram already routes), run the
@@ -22,8 +24,8 @@
 %%
 %% A new server Source Connection ID is generated per connection at a fixed
 %% length, so short-header 1-RTT packets (which carry no CID-length field)
-%% demux by slicing that many leading bytes. The SO_REUSEPORT pool, the
-%% Version Negotiation trigger, and the supervisor are later slices.
+%% demux by slicing that many leading bytes. The SO_REUSEPORT pool and the
+%% supervisor are later slices.
 
 -export([start_link/1, get_port/1, stop/1]).
 -export([init/1]).
@@ -37,6 +39,9 @@
 -define(SCID_LEN, 8).
 %% QUIC version 1 (RFC 9000 §15); also defined in roadrunner_quic_send.
 -define(QUIC_V1, 16#00000001).
+%% The versions advertised in a Version Negotiation packet (RFC 9000 §17.2.1).
+%% A reserved 0x?a?a?a?a "grease" version (§6.3) is an optional addition.
+-define(SUPPORTED_VERSIONS, [?QUIC_V1]).
 %% RFC 9000 §14.1: a server MUST discard an Initial packet carried in a UDP
 %% datagram whose payload is smaller than 1200 bytes, so a too-small Initial
 %% never spawns a connection (clients pad Initial datagrams to this floor).
@@ -167,7 +172,7 @@ handle_message(Message, #listener{socket = Socket} = State) ->
 %% =============================================================================
 
 %% Execute a datagram's routing decision: forward to the owning connection,
-%% spawn one for a new client, or drop.
+%% spawn one for a new client, answer with Version Negotiation, or drop.
 -spec route(binary(), {inet:ip_address(), inet:port_number()}, #listener{}) -> #listener{}.
 route(Datagram, Peer, #listener{registry = Registry} = State) ->
     case classify(Datagram, Registry) of
@@ -176,40 +181,82 @@ route(Datagram, Peer, #listener{registry = Registry} = State) ->
             State;
         {spawn, ClientDCID} ->
             spawn_connection(Datagram, Peer, ClientDCID, State);
+        {version_negotiation, ClientDCID, ClientSCID} ->
+            send_version_negotiation(ClientDCID, ClientSCID, Peer, State);
         drop ->
             State
     end.
 
-%% Decide a datagram's fate from its Destination Connection ID and the routing
-%% table (a pure decision given the table): `{forward, Pid}` to the owning
-%% connection, `{spawn, DCID}` for a QUIC v1 Initial (in a datagram at the RFC
-%% 9000 §14.1 1200-byte floor) to an unknown id, or `drop` otherwise: a
-%% malformed header, a packet to an unknown id that is not a v1 Initial (a
-%% stray short-header packet; an unknown version is the Version Negotiation
-%% slice), or a v1 Initial below the §14.1 floor (a server MUST discard those,
-%% so we never spawn for one). The forward path is size-unconditional; the
-%% owning connection enforces §14.1 on its own received Initials.
+%% RFC 9000 §17.2.1: a Version Negotiation packet lists the versions the server
+%% supports and echoes the client's connection ids swapped (our destination id
+%% is the client's source id, our source id is the client's destination id) so
+%% the client accepts it. It consumes the whole datagram; exactly one is sent
+%% per received datagram.
+-spec send_version_negotiation(
+    binary(), binary(), {inet:ip_address(), inet:port_number()}, #listener{}
+) -> #listener{}.
+send_version_negotiation(ClientDCID, ClientSCID, {Ip, Port}, #listener{socket = Socket} = State) ->
+    Datagram = roadrunner_quic_packet:encode_version_negotiation(
+        ClientSCID, ClientDCID, ?SUPPORTED_VERSIONS
+    ),
+    _ = roadrunner_quic_socket:send(Socket, Ip, Port, Datagram),
+    State.
+
+%% Decide a datagram's fate from its connection ids and the routing table (a
+%% pure decision given the table): `{forward, Pid}` to the owning connection,
+%% `{spawn, DCID}` for a QUIC v1 Initial (at the RFC 9000 §14.1 1200-byte floor)
+%% to an unknown id, `{version_negotiation, DCID, SCID}` for an unsupported
+%% version at that floor (RFC 9000 §5.2.2), or `drop` otherwise: a malformed or
+%% short-header packet to an unknown id, a v1 Initial below the floor, or an
+%% unsupported-version packet below it (a server MUST discard those). The
+%% forward path is size-unconditional; the owning connection enforces §14.1 on
+%% its own received Initials.
 -doc false.
 -spec classify(binary(), roadrunner_quic_cid_registry:t()) ->
-    {forward, pid()} | {spawn, binary()} | drop.
+    {forward, pid()} | {spawn, binary()} | {version_negotiation, binary(), binary()} | drop.
 classify(Datagram, Registry) ->
     case roadrunner_quic_packet:dcid(Datagram, ?SCID_LEN) of
         {ok, DCID} ->
             case roadrunner_quic_cid_registry:lookup(Registry, DCID) of
-                {ok, ConnPid} ->
-                    {forward, ConnPid};
-                error ->
-                    case
-                        is_v1_initial(Datagram) andalso
-                            byte_size(Datagram) >= ?MIN_INITIAL_DATAGRAM
-                    of
-                        true -> {spawn, DCID};
-                        false -> drop
-                    end
+                {ok, ConnPid} -> {forward, ConnPid};
+                error -> classify_unrouted(Datagram, DCID)
             end;
         {error, _Reason} ->
-            drop
+            %% A datagram whose routable connection id could not be read: a
+            %% short header shorter than the fixed id length, or a long header
+            %% carrying a connection id longer than v1 allows. It is no known
+            %% connection and no v1 Initial, but an unsupported-version long
+            %% header still triggers Version Negotiation (connection-id length
+            %% must not gate that decision, RFC 9000 §17.2.1).
+            maybe_version_negotiation(Datagram)
     end.
+
+%% An unknown destination id at the §14.1 floor: a v1 Initial starts a
+%% connection; anything else falls through to the Version Negotiation check.
+-spec classify_unrouted(binary(), binary()) ->
+    {spawn, binary()} | {version_negotiation, binary(), binary()} | drop.
+classify_unrouted(Datagram, DCID) ->
+    case is_v1_initial(Datagram) andalso byte_size(Datagram) >= ?MIN_INITIAL_DATAGRAM of
+        true -> {spawn, DCID};
+        false -> maybe_version_negotiation(Datagram)
+    end.
+
+%% RFC 9000 §5.2.2: answer an unsupported-version long header (one we cannot
+%% serve, and which is not itself a Version Negotiation packet, version 0) with
+%% Version Negotiation, provided the datagram is at the 1200-byte floor; a
+%% server MUST drop smaller such packets, and short headers never negotiate.
+-spec maybe_version_negotiation(binary()) -> {version_negotiation, binary(), binary()} | drop.
+maybe_version_negotiation(Datagram) when byte_size(Datagram) >= ?MIN_INITIAL_DATAGRAM ->
+    case roadrunner_quic_packet:long_header_info(Datagram) of
+        {ok, #{version := Version, dcid := DCID, scid := SCID}} when
+            Version =/= 0, Version =/= ?QUIC_V1
+        ->
+            {version_negotiation, DCID, SCID};
+        _ ->
+            drop
+    end;
+maybe_version_negotiation(_Datagram) ->
+    drop.
 
 -spec is_v1_initial(binary()) -> boolean().
 is_v1_initial(<<1:1, _Fixed:1, 0:2, _TypeSpecific:4, Version:32, _/binary>>) ->
