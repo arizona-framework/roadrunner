@@ -313,7 +313,9 @@ with async `{emit, _, _}` effects, so it never blocks on the owner.
         | {set_owner, pid()}
         | open_uni
         | {reset_stream, non_neg_integer(), non_neg_integer()}
-        | {stop_sending, non_neg_integer(), non_neg_integer()}.
+        | {stop_sending, non_neg_integer(), non_neg_integer()}
+        | {close, non_neg_integer()}
+        | {close, non_neg_integer(), binary()}.
 handle_call(From, Ref, peername, _Now, #state{peer = Peer} = State) ->
     {State, [{reply, From, Ref, {ok, Peer}}]};
 handle_call(From, Ref, {set_owner, Owner}, _Now, State) ->
@@ -329,7 +331,47 @@ handle_call(From, Ref, {reset_stream, Sid, ErrorCode}, Now, State) ->
     {State1, [{reply, From, Ref, ok} | SendEffects]};
 handle_call(From, Ref, {stop_sending, Sid, ErrorCode}, Now, State) ->
     {State1, SendEffects} = do_stop_sending(Sid, ErrorCode, Now, State),
-    {State1, [{reply, From, Ref, ok} | SendEffects]}.
+    {State1, [{reply, From, Ref, ok} | SendEffects]};
+handle_call(From, Ref, {close, ErrorCode}, _Now, State) ->
+    {State1, CloseEffects} = owner_close(ErrorCode, <<>>, State),
+    {State1, [{reply, From, Ref, ok} | CloseEffects]};
+handle_call(From, Ref, {close, ErrorCode, Reason}, _Now, State) ->
+    {State1, CloseEffects} = owner_close(ErrorCode, Reason, State),
+    {State1, [{reply, From, Ref, ok} | CloseEffects]}.
+
+%% The owner closes the connection (RFC 9000 §10.2.2): send one application
+%% CONNECTION_CLOSE (0x1d, carrying the h3 error code and reason phrase) at the
+%% 1-RTT level and mark the connection closed so the shell exits. The owner
+%% triggered this, so no {closed, _} is emitted back; this runs only once the
+%% connection is established (1-RTT keys present), which is the only state the
+%% owner has a connection to close in. Distinct from connection_fatal/send_close
+%% (a locally-detected transport error during datagram processing): this is the
+%% application-variant close and never coalesces with other frames.
+-spec owner_close(non_neg_integer(), binary(), t()) -> {t(), [effect()]}.
+owner_close(ErrorCode, Reason, #state{send_keys = SendKeys} = State) ->
+    case SendKeys of
+        #{application := Keys} ->
+            send_owner_close(ErrorCode, Reason, Keys, State);
+        #{} ->
+            %% The owner closed before the handshake completed (e.g. the
+            %% connection_handler refusing on max_clients): there are no 1-RTT
+            %% keys to carry an application CONNECTION_CLOSE, so close silently
+            %% and let the client time out. The connection still ends.
+            {State#state{phase = closed}, []}
+    end.
+
+-spec send_owner_close(non_neg_integer(), binary(), roadrunner_quic_keys:keys(), t()) ->
+    {t(), [effect()]}.
+send_owner_close(ErrorCode, Reason, Keys, #state{dcid = DCID, scid = SCID} = State) ->
+    Space = space(application, State),
+    PN = Space#space.next_pn,
+    Frame = {connection_close, application, ErrorCode, undefined, Reason},
+    Entry = #{application => #{frames => [Frame], keys => Keys, pn => PN}},
+    {Datagram, _Sent} = roadrunner_quic_send:datagram(Entry, DCID, SCID),
+    State1 = put_space(
+        application, Space#space{next_pn = PN + 1}, State#state{phase = closed}
+    ),
+    {State1, [{send, Datagram}]}.
 
 %% Abandon the send side of a stream and tell the peer with a RESET_STREAM (RFC
 %% 9000 §19.4): discard the unsent buffer, record the bytes already sent as the

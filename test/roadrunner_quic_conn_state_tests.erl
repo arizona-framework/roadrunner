@@ -575,6 +575,44 @@ stop_sending_sends_stop_sending_frame_test() ->
     ?assertEqual({reply, self(), Ref, ok}, hd(Effects)),
     ?assert(lists:member({stop_sending, 0, 7}, sent_app_frames(Effects, ApSecret))).
 
+owner_close_sends_application_close_test() ->
+    %% An owner close sends one application-variant CONNECTION_CLOSE carrying the
+    %% h3 error code and reason phrase, marks the connection closed, and replies
+    %% ok (no {closed, _} back: the owner triggered it).
+    {State, ApSecret} = connected_for_send(),
+    Ref = make_ref(),
+    {State1, Effects} = ?M:handle_call(self(), Ref, {close, 16#0100, ~"bye"}, ?NOW, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual({reply, self(), Ref, ok}, hd(Effects)),
+    ?assertEqual([], emits(Effects)),
+    ?assert(
+        lists:member(
+            {connection_close, application, 16#0100, undefined, ~"bye"},
+            sent_app_frames(Effects, ApSecret)
+        )
+    ).
+
+owner_close_without_reason_sends_empty_phrase_test() ->
+    %% close/2 (no reason) carries an empty reason phrase.
+    {State, ApSecret} = connected_for_send(),
+    {State1, Effects} = ?M:handle_call(self(), make_ref(), {close, 16#0100}, ?NOW, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assert(
+        lists:member(
+            {connection_close, application, 16#0100, undefined, <<>>},
+            sent_app_frames(Effects, ApSecret)
+        )
+    ).
+
+owner_close_before_connected_closes_silently_test() ->
+    %% A close before the handshake completes (no 1-RTT keys, e.g. the
+    %% connection_handler refusing on max_clients) closes the connection without
+    %% sending a CONNECTION_CLOSE there are no application keys to seal one.
+    #{state0 := State0} = connect(),
+    {State1, Effects} = ?M:handle_call(self(), make_ref(), {close, 16#0100}, ?NOW, State0),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([], sends(Effects)).
+
 send_data_without_fin_leaves_stream_open_test() ->
     %% A non-final send carries Fin = false (used for the control stream's
     %% SETTINGS, which keeps the stream open).
