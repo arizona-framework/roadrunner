@@ -24,6 +24,8 @@ an outer guard. The pure routing decision (`classify/2`) is unit-tested in
     stray_message_is_ignored/1,
     malformed_datagram_is_dropped/1,
     sends_version_negotiation_for_unsupported_version/1,
+    uses_injected_registry/1,
+    conn_death_before_set_owner_does_not_wedge/1,
     conn_down_is_cleaned_up/1
 ]).
 
@@ -44,6 +46,8 @@ all() ->
         stray_message_is_ignored,
         malformed_datagram_is_dropped,
         sends_version_negotiation_for_unsupported_version,
+        uses_injected_registry,
+        conn_death_before_set_owner_does_not_wedge,
         conn_down_is_cleaned_up
     ].
 
@@ -245,6 +249,56 @@ conn_down_is_cleaned_up(_Config) ->
     ?assertNotEqual(Conn1, Conn2),
 
     exit(Conn2, kill),
+    ok = roadrunner_quic_socket:close(Client),
+    ok = roadrunner_quic_listener:stop(Listener).
+
+%% A connection that dies before accepting ownership does not wedge the listener
+%% in set_owner_sync: its private monitor sees the death and aborts, so the loop
+%% keeps serving. Without the guard the loop would block on the never-arriving
+%% reply forever, a silent loss of a pool listener (no crash, no restart).
+conn_death_before_set_owner_does_not_wedge(_Config) ->
+    Test = self(),
+    Handler = fun(ConnPid) ->
+        %% Kill the connection before returning, so set_owner_sync races a dead
+        %% conn (a stand-in for the connection crashing in its own init).
+        exit(ConnPid, kill),
+        Test ! {killed, ConnPid},
+        {ok, spawn(fun drain/0)}
+    end,
+    {Listener, Port} = start_listener(Handler),
+    {ok, Client} = roadrunner_quic_socket:open(0),
+    ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, Port, crafted_initial()),
+    receive
+        {killed, _ConnPid} -> ok
+    after 2000 ->
+        ct:fail(handler_not_invoked)
+    end,
+    %% The listener did not wedge: it still answers.
+    ?assertEqual(Port, roadrunner_quic_listener:get_port(Listener)),
+    ok = roadrunner_quic_socket:close(Client),
+    ok = roadrunner_quic_listener:stop(Listener).
+
+%% A listener routes through an INJECTED registry (the pool's shared table), not
+%% a private one: a datagram for a connection id registered in the injected
+%% table is forwarded to that connection. This is what lets a SO_REUSEPORT pool
+%% route a datagram landing on any listener to the owning connection.
+uses_injected_registry(_Config) ->
+    Registry = roadrunner_quic_cid_registry:new(),
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    ok = roadrunner_quic_cid_registry:register_pair(
+        Registry, DCID, <<9, 9, 9, 9, 9, 9, 9, 9>>, self()
+    ),
+    Opts = (listener_opts(0, drain_handler()))#{registry => Registry},
+    {ok, Listener} = roadrunner_quic_listener:start_link(Opts),
+    Port = roadrunner_quic_listener:get_port(Listener),
+    {ok, Client} = roadrunner_quic_socket:open(0),
+    %% A short-header (1-RTT) datagram whose destination id is the registered id.
+    ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, Port, <<16#40, DCID/binary, 0>>),
+    receive
+        {quic_datagram, _Peer, _Bytes} -> ok
+    after 2000 ->
+        ct:fail(not_forwarded_via_injected_registry)
+    end,
     ok = roadrunner_quic_socket:close(Client),
     ok = roadrunner_quic_listener:stop(Listener).
 

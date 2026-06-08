@@ -24,8 +24,8 @@
 %%
 %% A new server Source Connection ID is generated per connection at a fixed
 %% length, so short-header 1-RTT packets (which carry no CID-length field)
-%% demux by slicing that many leading bytes. The SO_REUSEPORT pool and the
-%% supervisor are later slices.
+%% demux by slicing that many leading bytes. `roadrunner_quic_listener_sup`
+%% runs a SO_REUSEPORT pool of these listeners sharing one injected registry.
 
 -export([start_link/1, get_port/1, stop/1]).
 -export([init/1]).
@@ -54,7 +54,12 @@
     alpn := binary(),
     transport_params := roadrunner_quic_transport_params:params(),
     connection_handler := fun((pid()) -> {ok, pid()} | {error, term()}),
-    reuseport => boolean()
+    reuseport => boolean(),
+    %% The connection-id routing table. A SO_REUSEPORT pool injects one shared
+    %% table (owned by the pool supervisor) so a datagram landing on any pool
+    %% socket routes to the owning connection; a standalone listener omits it
+    %% and creates (and owns) its own.
+    registry => roadrunner_quic_cid_registry:t()
 }.
 
 -record(listener, {
@@ -115,10 +120,14 @@ init(
             {ok, {_Ip, BoundPort}} = roadrunner_quic_socket:sockname(Socket),
             proc_lib:set_label({?MODULE, BoundPort}),
             proc_lib:init_ack({ok, self()}),
+            %% A pool injects one shared registry; a standalone listener owns its
+            %% own. Either way the listener never deletes the table on stop, so a
+            %% shared one outlives any single listener.
+            Registry = maps:get(registry, Opts, roadrunner_quic_cid_registry:new()),
             loop(#listener{
                 socket = Socket,
                 port = BoundPort,
-                registry = roadrunner_quic_cid_registry:new(),
+                registry = Registry,
                 cert_chain = CertChain,
                 priv_key = PrivKey,
                 alpn = Alpn,
@@ -302,13 +311,23 @@ install_owner(ConnPid, Handler) ->
 
 %% The synchronous set_owner round-trip (mirrors the connection's control-call
 %% wire): the connection records the owner before any datagram drives the
-%% handshake, so the {connected, _} event cannot race ahead of ownership.
+%% handshake, so the {connected, _} event cannot race ahead of ownership. A
+%% private monitor guards against the connection dying before it replies (e.g.
+%% a crash in its init): without it the loop would block here forever, which in
+%% a pool is a silent loss of one listener. The connection's id rows are reaped
+%% by the loop's own monitor (set in spawn_connection), so the abort here only
+%% skips the now-moot ownership install.
 -spec set_owner_sync(pid(), pid()) -> ok.
 set_owner_sync(ConnPid, Owner) ->
     Ref = make_ref(),
+    MonRef = monitor(process, ConnPid),
     _ = ConnPid ! {quic_call, self(), Ref, {set_owner, Owner}},
     receive
-        {quic_reply, Ref, ok} -> ok
+        {quic_reply, Ref, ok} ->
+            _ = demonitor(MonRef, [flush]),
+            ok;
+        {'DOWN', MonRef, process, ConnPid, _Reason} ->
+            ok
     end.
 
 -spec conn_config(binary(), binary(), {inet:ip_address(), inet:port_number()}, #listener{}) ->
