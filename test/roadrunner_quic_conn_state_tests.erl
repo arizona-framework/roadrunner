@@ -13,9 +13,13 @@
 -define(FINISHED, 20).
 
 %% A fixed client DCID (the server's routing id), an 8-byte server SCID to
-%% match the server's fixed ?SCID_LEN, the peer address, and a clock.
+%% match the server's fixed ?SCID_LEN, the client's source id (which the
+%% server's replies are addressed to, RFC 9000 §7.2: distinct from both the
+%% other two so a reply DCID can be attributed to exactly one of them), the
+%% peer address, and a clock.
 -define(DCID, <<1, 2, 3, 4, 5, 6, 7, 8>>).
 -define(SCID, <<8, 7, 6, 5, 4, 3, 2, 1>>).
+-define(CLIENT_SCID, <<11, 12, 13, 14, 15, 16, 17, 18>>).
 -define(PEER, {{127, 0, 0, 1}, 12345}).
 -define(NOW, 1000).
 %% Must match roadrunner_quic_conn_state's ?IDLE_TIMEOUT default.
@@ -32,6 +36,19 @@ new_starts_handshaking_test() ->
 peername_answers_in_handshaking_test() ->
     {State, _Ctx} = new_conn([~"leaf-cert-der"]),
     ?assertEqual({ok, ?PEER}, ?M:peername(State)).
+
+%% RFC 9000 §7.2/§17.2: a server addresses its replies with the client's source
+%% connection id, not the client's destination id (which only derives the
+%% Initial keys). A strict client matches inbound packets on its own source id,
+%% so a reply carrying anything else is dropped. The reply's wire DCID must be
+%% the configured peer_scid, distinct from both the routing dcid and the server
+%% scid.
+reply_addressed_to_client_source_cid_test() ->
+    #{effects1 := Effects1} = connect(),
+    [InitialReply | _] = sends(Effects1),
+    {ok, #{dcid := ReplyDCID}} = roadrunner_quic_packet:long_header_info(InitialReply),
+    ?assertEqual(?CLIENT_SCID, ReplyDCID),
+    ?assertNotEqual(?DCID, ReplyDCID).
 
 %% =============================================================================
 %% Full handshake: the in-test client completes a real handshake against the
@@ -854,6 +871,7 @@ new_conn(CertChain) ->
         #{
             dcid => ?DCID,
             scid => ?SCID,
+            peer_scid => ?CLIENT_SCID,
             peer => ?PEER,
             cert_chain => CertChain,
             priv_key => PrivKey,

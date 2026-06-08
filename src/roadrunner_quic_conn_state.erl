@@ -74,8 +74,13 @@
 }).
 
 -record(state, {
+    %% The client's Initial Destination Connection ID: derives the Initial keys
+    %% and echoes as original_destination_connection_id. NOT the reply wire DCID.
     dcid :: binary(),
     scid :: binary(),
+    %% The client's Source Connection ID, which every server reply addresses as
+    %% its Destination Connection ID (RFC 9000 §7.2/§17.2).
+    peer_scid :: binary(),
     peer :: {inet:ip_address(), inet:port_number()},
     phase = handshaking :: phase(),
     tls :: roadrunner_quic_tls_server:t(),
@@ -125,6 +130,7 @@
 -type config() :: #{
     dcid := binary(),
     scid := binary(),
+    peer_scid := binary(),
     peer := {inet:ip_address(), inet:port_number()},
     cert_chain := [binary()],
     priv_key := public_key:private_key(),
@@ -168,16 +174,19 @@
 -doc """
 Build the connection state from the per-connection config and the birth time
 `Now` (ms). Bootstraps the Initial keys from the client's Destination
-Connection ID, the TLS server sequencer (the server transport parameters
-already carry the original/initial connection ids), the Initial and Handshake
-packet-number spaces (the Application space appears once 1-RTT keys arm), and
-the idle-timeout deadline anchored at `Now`.
+Connection ID (`dcid`), records the client's Source Connection ID (`peer_scid`)
+as the destination every reply is addressed to (RFC 9000 §7.2), the TLS server
+sequencer (the server transport parameters already carry the original/initial
+connection ids), the Initial and Handshake packet-number spaces (the Application
+space appears once 1-RTT keys arm), and the idle-timeout deadline anchored at
+`Now`.
 """.
 -spec new(config(), integer()) -> t().
 new(
     #{
         dcid := DCID,
         scid := SCID,
+        peer_scid := PeerSCID,
         peer := Peer,
         cert_chain := CertChain,
         priv_key := PrivKey,
@@ -201,6 +210,7 @@ new(
     #state{
         dcid = DCID,
         scid = SCID,
+        peer_scid = PeerSCID,
         peer = Peer,
         tls = Tls,
         recv_keys = #{initial => roadrunner_quic_keys:initial_client(DCID)},
@@ -362,7 +372,7 @@ owner_close(ErrorCode, Reason, #state{send_keys = SendKeys} = State) ->
 
 -spec send_owner_close(non_neg_integer(), binary(), roadrunner_quic_keys:keys(), t()) ->
     {t(), [effect()]}.
-send_owner_close(ErrorCode, Reason, Keys, #state{dcid = DCID, scid = SCID} = State) ->
+send_owner_close(ErrorCode, Reason, Keys, #state{peer_scid = DCID, scid = SCID} = State) ->
     Space = space(application, State),
     PN = Space#space.next_pn,
     Frame = {connection_close, application, ErrorCode, undefined, Reason},
@@ -734,7 +744,7 @@ close_code(_TlsReason) ->
 send_close(
     #state{
         pending_close = {Level, ErrorCode},
-        dcid = DCID,
+        peer_scid = DCID,
         scid = SCID,
         send_keys = SendKeys,
         amp = Amp
@@ -809,7 +819,7 @@ drain_send(Now, State, Acc) ->
         none ->
             {State, lists:reverse(Acc)};
         {Entries, Built} ->
-            #state{dcid = DCID, scid = SCID, amp = Amp} = State,
+            #state{peer_scid = DCID, scid = SCID, amp = Amp} = State,
             {Datagram, Sent} = roadrunner_quic_send:datagram(Entries, DCID, SCID),
             case roadrunner_quic_amp:can_send(byte_size(Datagram), Amp) of
                 false ->

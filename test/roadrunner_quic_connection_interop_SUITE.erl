@@ -89,17 +89,19 @@ pump_loop(Socket, Conns) ->
     end.
 
 %% Build the per-connection config from the first Initial and spawn (and
-%% link) the native shell. The reply DCID stays the client's chosen DCID,
-%% an RFC 9000 §17.2 deviation the key-routing dep client tolerates; a
-%% strict client would need the client's source CID echoed instead.
+%% link) the native shell. The reply DCID echoes the client's source CID
+%% (RFC 9000 §17.2/§7.2); the client's destination id is kept only as the
+%% routing / Initial-key / original_destination_connection_id anchor.
 start_shell(Socket, Peer, FirstDatagram) ->
     {ok, ClientDCID} = roadrunner_quic_packet:dcid(FirstDatagram, 8),
+    {ok, #{scid := ClientSCID}} = roadrunner_quic_packet:long_header_info(FirstDatagram),
     ServerSCID = crypto:strong_rand_bytes(8),
     {EphPub, EphPriv} = crypto:generate_key(ecdh, x25519),
     {CertChain, PrivKey} = cert_key(),
     Config = #{
         dcid => ClientDCID,
         scid => ServerSCID,
+        peer_scid => ClientSCID,
         peer => Peer,
         cert_chain => CertChain,
         priv_key => PrivKey,

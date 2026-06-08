@@ -217,6 +217,7 @@ config(Peer) ->
     Config = #{
         dcid => ?DCID,
         scid => ?SCID,
+        peer_scid => ?SCID,
         peer => Peer,
         cert_chain => [~"leaf-cert-der"],
         priv_key => PrivKey,
