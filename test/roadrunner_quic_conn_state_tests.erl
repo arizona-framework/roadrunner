@@ -314,7 +314,7 @@ peername_call_replies_test() ->
     Ref = make_ref(),
     ?assertEqual(
         {State, [{reply, self(), Ref, {ok, ?PEER}}]},
-        ?M:handle_call(self(), Ref, peername, State)
+        ?M:handle_call(self(), Ref, peername, 0, State)
     ).
 
 owner_set_in_handshaking_gets_connected_on_completion_test() ->
@@ -324,7 +324,7 @@ owner_set_in_handshaking_gets_connected_on_completion_test() ->
     #{state1 := State1, client_hs_secret := ClientHsSecret, cf_framed := ClientFinished} = connect(),
     Owner = self(),
     Ref = make_ref(),
-    {State1b, Installed} = ?M:handle_call(Owner, Ref, {set_owner, Owner}, State1),
+    {State1b, Installed} = ?M:handle_call(Owner, Ref, {set_owner, Owner}, 0, State1),
     ?assertEqual([{reply, Owner, Ref, ok}], Installed),
     Datagram = ?TC:seal(
         handshake,
@@ -344,7 +344,7 @@ owner_set_after_connection_gets_connected_now_test() ->
     #{state2 := State2} = connect(),
     Owner = self(),
     Ref = make_ref(),
-    {_State3, Effects} = ?M:handle_call(Owner, Ref, {set_owner, Owner}, State2),
+    {_State3, Effects} = ?M:handle_call(Owner, Ref, {set_owner, Owner}, 0, State2),
     ?assertEqual([{reply, Owner, Ref, ok}, {emit, Owner, {connected, expected_info()}}], Effects).
 
 connected_not_re_emitted_on_later_datagram_test() ->
@@ -359,7 +359,7 @@ connected_not_re_emitted_on_later_datagram_test() ->
         client_ap_secret := ClientApSecret
     } = connect(),
     Owner = self(),
-    {State1b, _} = ?M:handle_call(Owner, make_ref(), {set_owner, Owner}, State1),
+    {State1b, _} = ?M:handle_call(Owner, make_ref(), {set_owner, Owner}, 0, State1),
     Finished = ?TC:seal(
         handshake,
         0,
@@ -505,7 +505,7 @@ connected_precedes_stream_events_in_coalesced_datagram_test() ->
         client_ap_secret := ClientApSecret
     } = connect(),
     Owner = self(),
-    {State1b, _} = ?M:handle_call(Owner, make_ref(), {set_owner, Owner}, State1),
+    {State1b, _} = ?M:handle_call(Owner, make_ref(), {set_owner, Owner}, 0, State1),
     Finished = ?TC:seal(
         handshake,
         0,
@@ -542,10 +542,10 @@ open_uni_allocates_server_uni_ids_test() ->
     %% id (RFC 9000 §2.1: 3, 7, 11, ...) and replies with it.
     {State, _ApSecret} = connected_for_send(),
     Ref1 = make_ref(),
-    {State1, Effects1} = ?M:handle_call(self(), Ref1, open_uni, State),
+    {State1, Effects1} = ?M:handle_call(self(), Ref1, open_uni, 0, State),
     ?assertEqual([{reply, self(), Ref1, {ok, 3}}], Effects1),
     Ref2 = make_ref(),
-    {_State2, Effects2} = ?M:handle_call(self(), Ref2, open_uni, State1),
+    {_State2, Effects2} = ?M:handle_call(self(), Ref2, open_uni, 0, State1),
     ?assertEqual([{reply, self(), Ref2, {ok, 7}}], Effects2).
 
 send_data_emits_stream_frame_with_fin_test() ->
@@ -556,6 +556,62 @@ send_data_emits_stream_frame_with_fin_test() ->
     {_State1, Effects} = ?M:handle_send(self(), Ref, 0, ~"hello", true, ?NOW, State),
     ?assertEqual({reply, self(), Ref, ok}, hd(Effects)),
     ?assertEqual([{stream, 0, 0, ~"hello", true}], sent_stream_frames(Effects, ApSecret)).
+
+reset_stream_sends_reset_with_final_size_test() ->
+    %% reset_stream abandons the send side and emits a RESET_STREAM whose Final
+    %% Size is the bytes already sent (5 from the prior send), and replies ok.
+    {State, ApSecret} = connected_for_send(),
+    {State1, _} = ?M:handle_send(self(), make_ref(), 0, ~"hello", false, ?NOW, State),
+    Ref = make_ref(),
+    {_State2, Effects} = ?M:handle_call(self(), Ref, {reset_stream, 0, 7}, ?NOW, State1),
+    ?assertEqual({reply, self(), Ref, ok}, hd(Effects)),
+    ?assert(lists:member({reset_stream, 0, 7, 5}, sent_app_frames(Effects, ApSecret))).
+
+stop_sending_sends_stop_sending_frame_test() ->
+    %% stop_sending emits a STOP_SENDING frame for the stream and replies ok.
+    {State, ApSecret} = connected_for_send(),
+    Ref = make_ref(),
+    {_State1, Effects} = ?M:handle_call(self(), Ref, {stop_sending, 0, 7}, ?NOW, State),
+    ?assertEqual({reply, self(), Ref, ok}, hd(Effects)),
+    ?assert(lists:member({stop_sending, 0, 7}, sent_app_frames(Effects, ApSecret))).
+
+owner_close_sends_application_close_test() ->
+    %% An owner close sends one application-variant CONNECTION_CLOSE carrying the
+    %% h3 error code and reason phrase, marks the connection closed, and replies
+    %% ok (no {closed, _} back: the owner triggered it).
+    {State, ApSecret} = connected_for_send(),
+    Ref = make_ref(),
+    {State1, Effects} = ?M:handle_call(self(), Ref, {close, 16#0100, ~"bye"}, ?NOW, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual({reply, self(), Ref, ok}, hd(Effects)),
+    ?assertEqual([], emits(Effects)),
+    ?assert(
+        lists:member(
+            {connection_close, application, 16#0100, undefined, ~"bye"},
+            sent_app_frames(Effects, ApSecret)
+        )
+    ).
+
+owner_close_without_reason_sends_empty_phrase_test() ->
+    %% close/2 (no reason) carries an empty reason phrase.
+    {State, ApSecret} = connected_for_send(),
+    {State1, Effects} = ?M:handle_call(self(), make_ref(), {close, 16#0100}, ?NOW, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assert(
+        lists:member(
+            {connection_close, application, 16#0100, undefined, <<>>},
+            sent_app_frames(Effects, ApSecret)
+        )
+    ).
+
+owner_close_before_connected_closes_silently_test() ->
+    %% A close before the handshake completes (no 1-RTT keys, e.g. the
+    %% connection_handler refusing on max_clients) closes the connection without
+    %% sending a CONNECTION_CLOSE there are no application keys to seal one.
+    #{state0 := State0} = connect(),
+    {State1, Effects} = ?M:handle_call(self(), make_ref(), {close, 16#0100}, ?NOW, State0),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([], sends(Effects)).
 
 send_data_without_fin_leaves_stream_open_test() ->
     %% A non-final send carries Fin = false (used for the control stream's
@@ -841,7 +897,7 @@ expected_info() ->
 %% Install this process as the owner (no emit while handshaking) so a later
 %% close surfaces {closed, _} here.
 with_owner(State) ->
-    {State1, _} = ?M:handle_call(self(), make_ref(), {set_owner, self()}, State),
+    {State1, _} = ?M:handle_call(self(), make_ref(), {set_owner, self()}, 0, State),
     State1.
 
 %% Drive to connected with this process installed as owner (set during
@@ -856,7 +912,7 @@ connect_owned() ->
         client_ap_secret := ClientApSecret,
         server_ap_secret := ServerApSecret
     } = connect(),
-    {State1b, _} = ?M:handle_call(self(), make_ref(), {set_owner, self()}, State1),
+    {State1b, _} = ?M:handle_call(self(), make_ref(), {set_owner, self()}, 0, State1),
     Finished = ?TC:seal(
         handshake,
         0,
@@ -895,6 +951,16 @@ sent_stream_frames(Effects, ServerApSecret) ->
         byte_size(?DCID)
     ),
     [Frame || {stream, _Sid, _Off, _Data, _Fin} = Frame <- Frames].
+
+%% Every frame the server put on the wire at the application level (decoded with
+%% its 1-RTT keys), for asserting control frames like RESET_STREAM/STOP_SENDING.
+sent_app_frames(Effects, ServerApSecret) ->
+    ?TC:frames(
+        sends(Effects),
+        application,
+        #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+        byte_size(?DCID)
+    ).
 
 emits(Effects) ->
     [Emit || {emit, _Owner, _Event} = Emit <- Effects].

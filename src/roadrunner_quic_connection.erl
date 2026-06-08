@@ -77,7 +77,7 @@ loop(State) ->
         {quic_call, From, Ref, Request} ->
             Now = erlang:monotonic_time(millisecond),
             {Conn, Effects} = roadrunner_quic_conn_state:handle_call(
-                From, Ref, Request, State#shell.conn
+                From, Ref, Request, Now, State#shell.conn
             ),
             continue(perform(Effects, Now, State#shell{conn = Conn}));
         {quic_send, From, Ref, Sid, IoData, Fin} ->

@@ -31,7 +31,7 @@
 %% the per-stream flow window.
 
 -export([new/0, receive_data/4, reset/2]).
--export([enqueue/2, finish/1, next_frame/2, stop_sending/1, send_pending/1]).
+-export([enqueue/2, finish/1, next_frame/2, stop_sending/1, send_pending/1, send_offset/1]).
 
 -export_type([t/0]).
 
@@ -181,6 +181,14 @@ stop_sending(#stream{} = Stream) ->
 send_pending(#stream{fin_sent = true}) -> false;
 send_pending(#stream{send_buf = <<>>, send_fin = false}) -> false;
 send_pending(#stream{}) -> true.
+
+-doc """
+The send offset: the number of stream bytes already put on the wire, which is
+the Final Size to carry in a RESET_STREAM (RFC 9000 §19.4) once the send side
+is abandoned.
+""".
+-spec send_offset(t()) -> non_neg_integer().
+send_offset(#stream{send_offset = Offset}) -> Offset.
 
 %% =============================================================================
 %% Internal
