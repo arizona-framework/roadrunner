@@ -24,6 +24,7 @@
     parse_certificate_verify/1,
     parse_finished/1
 ]).
+-export([verify_server_certificate_verify/4]).
 
 %% TLS handshake message types (RFC 8446 §4).
 -define(CLIENT_HELLO, 1).
@@ -37,6 +38,14 @@
 -define(EXT_ALPN, 16#0010).
 -define(EXT_KEY_SHARE, 16#0033).
 -define(EXT_QUIC_TRANSPORT_PARAMS, 16#0039).
+
+%% Signature schemes (RFC 8446 §4.2.3) the server may sign with.
+-define(SIG_RSA_PSS_RSAE_SHA256, 16#0804).
+-define(SIG_ECDSA_SECP256R1_SHA256, 16#0403).
+-define(SIG_ED25519, 16#0807).
+
+%% The server CertificateVerify signature context (RFC 8446 §4.4.3).
+-define(CERT_VERIFY_CONTEXT, ~"TLS 1.3, server CertificateVerify").
 
 %% =============================================================================
 %% Key material
@@ -281,3 +290,40 @@ extension_map(<<>>) ->
     #{};
 extension_map(<<Type:16, Len:16, Data:Len/binary, Rest/binary>>) ->
     (extension_map(Rest))#{Type => Data}.
+
+%% =============================================================================
+%% Server CertificateVerify verification (RFC 8446 §4.4.3) - the client side
+%% of the server's signing. Reconstructs the signed content (64 spaces, the
+%% context string, a 0 separator, then the transcript hash through the
+%% Certificate message) and verifies `Signature` under `Scheme` with the
+%% server's public key.
+%% =============================================================================
+
+-doc "Verify a server CertificateVerify signature over `TranscriptHash` with the server's `PublicKey`.".
+-spec verify_server_certificate_verify(
+    non_neg_integer(), binary(), public_key:public_key(), binary()
+) -> boolean().
+verify_server_certificate_verify(Scheme, Signature, PublicKey, TranscriptHash) ->
+    Content = iolist_to_binary([
+        binary:copy(<<16#20>>, 64), ?CERT_VERIFY_CONTEXT, 0, TranscriptHash
+    ]),
+    {SigAlg, HashAlg, Options} = verify_params(Scheme),
+    crypto:verify(SigAlg, HashAlg, Content, Signature, crypto_pubkey(Scheme, PublicKey), Options).
+
+-spec verify_params(non_neg_integer()) -> {atom(), atom(), [{atom(), atom() | integer()}]}.
+verify_params(?SIG_RSA_PSS_RSAE_SHA256) ->
+    {rsa, sha256, [{rsa_padding, rsa_pkcs1_pss_padding}, {rsa_pss_saltlen, -1}]};
+verify_params(?SIG_ECDSA_SECP256R1_SHA256) ->
+    {ecdsa, sha256, []};
+verify_params(?SIG_ED25519) ->
+    {eddsa, none, []}.
+
+%% Convert the public_key public-key term into the key form crypto:verify
+%% expects for the scheme (mirror of the server-side crypto_key/2).
+-spec crypto_pubkey(non_neg_integer(), public_key:public_key()) -> [integer() | binary() | atom()].
+crypto_pubkey(?SIG_RSA_PSS_RSAE_SHA256, #'RSAPublicKey'{publicExponent = E, modulus = N}) ->
+    [E, N];
+crypto_pubkey(?SIG_ECDSA_SECP256R1_SHA256, {#'ECPoint'{point = Point}, _Params}) ->
+    [Point, secp256r1];
+crypto_pubkey(?SIG_ED25519, {#'ECPoint'{point = Point}, _Params}) ->
+    [Point, ed25519].

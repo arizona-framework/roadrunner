@@ -1,6 +1,7 @@
 -module(roadrunner_quic_test_client_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("public_key/include/public_key.hrl").
 
 -define(C, roadrunner_quic_test_client).
 
@@ -61,3 +62,19 @@ finished_round_trip_test() ->
     FinishedKey = roadrunner_quic_tls_crypto:finished_key(TrafficSecret),
     Expected = roadrunner_quic_tls_crypto:verify_data(FinishedKey, Hash),
     ?assertEqual(Expected, ?C:parse_finished(Body)).
+
+certificate_verify_signature_verifies_test() ->
+    {Scheme, Priv} = ?C:key_material(),
+    Pub = #'RSAPublicKey'{
+        modulus = Priv#'RSAPrivateKey'.modulus,
+        publicExponent = Priv#'RSAPrivateKey'.publicExponent
+    },
+    Hash = crypto:strong_rand_bytes(32),
+    Framed = roadrunner_quic_tls_auth:build_certificate_verify(Scheme, Priv, Hash),
+    [{15, Body}] = ?C:deframe_all(Framed),
+    {Scheme, Signature} = ?C:parse_certificate_verify(Body),
+    ?assert(?C:verify_server_certificate_verify(Scheme, Signature, Pub, Hash)),
+    %% A signature over a different transcript hash must not verify.
+    ?assertNot(
+        ?C:verify_server_certificate_verify(Scheme, Signature, Pub, crypto:strong_rand_bytes(32))
+    ).
