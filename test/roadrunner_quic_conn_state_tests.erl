@@ -13,13 +13,22 @@
 -define(FINISHED, 20).
 
 %% A fixed client DCID (the server's routing id), an 8-byte server SCID to
-%% match the server's fixed ?SCID_LEN, the peer address, and a clock.
+%% match the server's fixed ?SCID_LEN, the client's source id (which the
+%% server's replies are addressed to, RFC 9000 §7.2: distinct from both the
+%% other two so a reply DCID can be attributed to exactly one of them), the
+%% peer address, and a clock.
 -define(DCID, <<1, 2, 3, 4, 5, 6, 7, 8>>).
 -define(SCID, <<8, 7, 6, 5, 4, 3, 2, 1>>).
+-define(CLIENT_SCID, <<11, 12, 13, 14, 15, 16, 17, 18>>).
 -define(PEER, {{127, 0, 0, 1}, 12345}).
 -define(NOW, 1000).
 %% Must match roadrunner_quic_conn_state's ?IDLE_TIMEOUT default.
 -define(IDLE_TIMEOUT, 30000).
+%% Advertised receive windows (RFC 9000 §4.1), deliberately small and distinct
+%% from roadrunner_quic_flow's 786432-byte default so a test can prove a window
+%% is seeded from the advertised value rather than that default.
+-define(CONN_RECV_WINDOW, 2000).
+-define(STREAM_RECV_WINDOW, 1000).
 
 %% =============================================================================
 %% Construction
@@ -32,6 +41,19 @@ new_starts_handshaking_test() ->
 peername_answers_in_handshaking_test() ->
     {State, _Ctx} = new_conn([~"leaf-cert-der"]),
     ?assertEqual({ok, ?PEER}, ?M:peername(State)).
+
+%% RFC 9000 §7.2/§17.2: a server addresses its replies with the client's source
+%% connection id, not the client's destination id (which only derives the
+%% Initial keys). A strict client matches inbound packets on its own source id,
+%% so a reply carrying anything else is dropped. The reply's wire DCID must be
+%% the configured peer_scid, distinct from both the routing dcid and the server
+%% scid.
+reply_addressed_to_client_source_cid_test() ->
+    #{effects1 := Effects1} = connect(),
+    [InitialReply | _] = sends(Effects1),
+    {ok, #{dcid := ReplyDCID}} = roadrunner_quic_packet:long_header_info(InitialReply),
+    ?assertEqual(?CLIENT_SCID, ReplyDCID),
+    ?assertNotEqual(?DCID, ReplyDCID).
 
 %% =============================================================================
 %% Full handshake: the in-test client completes a real handshake against the
@@ -191,6 +213,48 @@ malformed_client_hello_closes_test() ->
         byte_size(?DCID)
     ),
     ?assertMatch([{connection_close, transport, _Code, 0, <<>>}], Frames).
+
+initial_scid_mismatch_closes_test() ->
+    %% RFC 9000 §7.3: a client whose initial_source_connection_id does not equal
+    %% the conn's peer_scid (?CLIENT_SCID) closes with transport_parameter_error,
+    %% transmitted at the Initial level with wire code 0x08.
+    {State0, #{scheme := Scheme, client_pub := ClientPub}} = new_conn([~"leaf-cert-der"]),
+    Framed = ?TC:client_hello_framed(Scheme, ClientPub, ?DCID),
+    Datagram = ?TC:seal(
+        initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
+    ),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, transport_parameter_error}}}], emits(Effects)),
+    Frames = ?TC:frames(
+        sends(Effects),
+        initial,
+        #{initial => roadrunner_quic_keys:initial_server(?DCID)},
+        byte_size(?DCID)
+    ),
+    ExpectedCode = roadrunner_quic_error:code_int(transport_parameter_error),
+    ?assertMatch([{connection_close, transport, ExpectedCode, 0, <<>>}], Frames).
+
+missing_transport_params_closes_test() ->
+    %% RFC 9001 §8.2: a ClientHello without the quic_transport_parameters
+    %% extension closes with missing_transport_params, transmitted at the
+    %% Initial level with wire code 0x016d (CRYPTO_ERROR + missing_extension).
+    {State0, #{scheme := Scheme, client_pub := ClientPub}} = new_conn([~"leaf-cert-der"]),
+    Framed = ?TC:client_hello_framed(Scheme, ClientPub, none),
+    Datagram = ?TC:seal(
+        initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
+    ),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, missing_transport_params}}}], emits(Effects)),
+    Frames = ?TC:frames(
+        sends(Effects),
+        initial,
+        #{initial => roadrunner_quic_keys:initial_server(?DCID)},
+        byte_size(?DCID)
+    ),
+    ExpectedCode = roadrunner_quic_error:code_int({crypto_error, 109}),
+    ?assertMatch([{connection_close, transport, ExpectedCode, 0, <<>>}], Frames).
 
 unexpected_handshake_message_closes_test() ->
     %% An out-of-sequence handshake message type closes the connection.
@@ -467,24 +531,48 @@ reset_final_size_violation_closes_test() ->
     ?assertEqual(closed, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, final_size_error}}}], emits(Effects)).
 
-stream_over_connection_flow_limit_closes_test() ->
-    %% A peer STREAM whose highest offset exceeds the connection's
-    %% 786432-byte receive window is an RFC 9000 §4.1 flow-control connection
-    %% error.
+stream_over_advertised_stream_flow_limit_closes_test() ->
+    %% A peer STREAM whose highest offset exceeds the per-stream receive window
+    %% we advertised (initial_max_stream_data_bidi_remote) is an RFC 9000 §4.1
+    %% flow-control connection error. The window is the advertised value (here
+    %% ?STREAM_RECV_WINDOW, well under the connection window so it is what
+    %% trips), not a larger hardcoded default that would let the overrun pass.
     {State, ApSecret} = connected_with_owner(),
-    Oversized = binary:copy(~"x", 786433),
+    Oversized = binary:copy(~"x", ?STREAM_RECV_WINDOW + 1),
     Bad = app_datagram([{stream, 0, 0, Oversized, false}], 0, ApSecret),
     {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, flow_control_error}}}], emits(Effects)).
 
+data_over_advertised_connection_flow_limit_closes_test() ->
+    %% Data spread across streams, each within its per-stream window but
+    %% together exceeding the advertised connection window (initial_max_data),
+    %% is an RFC 9000 §4.1 flow-control connection error. Two full per-stream
+    %% windows fill the connection window exactly; one more byte on a third
+    %% stream overflows it, proving the window is the advertised value (it would
+    %% not trip this early under a larger default).
+    {State0, ApSecret} = connected_with_owner(),
+    Chunk = binary:copy(~"x", ?STREAM_RECV_WINDOW),
+    {State1, _} = ?M:handle_datagram(
+        ?NOW, app_datagram([{stream, 0, 0, Chunk, false}], 0, ApSecret), State0
+    ),
+    {State2, _} = ?M:handle_datagram(
+        ?NOW, app_datagram([{stream, 4, 0, Chunk, false}], 1, ApSecret), State1
+    ),
+    ?assertEqual(connected, ?M:phase(State2)),
+    {State3, Effects} = ?M:handle_datagram(
+        ?NOW, app_datagram([{stream, 8, 0, ~"x", false}], 2, ApSecret), State2
+    ),
+    ?assertEqual(closed, ?M:phase(State3)),
+    ?assertEqual([{emit, self(), {closed, {local, flow_control_error}}}], emits(Effects)).
+
 stream_retransmit_does_not_re_consume_flow_test() ->
     %% Flow control is charged by the increase in the highest received offset,
-    %% so resending bytes already received does not re-consume the connection
+    %% so resending bytes already received does not re-consume the receive
     %% window (RFC 9000 §4.1) even when the raw byte sum exceeds it; the
     %% duplicate also delivers no new stream_data.
     {State, ApSecret} = connected_with_owner(),
-    Chunk = binary:copy(~"x", 500000),
+    Chunk = binary:copy(~"x", ?STREAM_RECV_WINDOW - 200),
     {State1, _} = ?M:handle_datagram(
         ?NOW, app_datagram([{stream, 0, 0, Chunk, false}], 0, ApSecret), State
     ),
@@ -854,6 +942,7 @@ new_conn(CertChain) ->
         #{
             dcid => ?DCID,
             scid => ?SCID,
+            peer_scid => ?CLIENT_SCID,
             peer => ?PEER,
             cert_chain => CertChain,
             priv_key => PrivKey,
@@ -875,7 +964,7 @@ new_conn(CertChain) ->
 %% The client Initial datagram and the framed ClientHello it carries (the
 %% first transcript element).
 client_hello_datagram(#{scheme := Scheme, client_pub := ClientPub}) ->
-    Framed = ?TC:client_hello_framed(Scheme, ClientPub),
+    Framed = ?TC:client_hello_framed(Scheme, ClientPub, ?CLIENT_SCID),
     Datagram = ?TC:seal(
         initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
     ),
@@ -888,7 +977,13 @@ is_ack({ack, _Largest, _Delay, _First, _Ranges, _Ecn}) -> true;
 is_ack(_Frame) -> false.
 
 transport_params() ->
-    #{original_destination_connection_id => ?DCID, initial_source_connection_id => ?SCID}.
+    #{
+        original_destination_connection_id => ?DCID,
+        initial_source_connection_id => ?SCID,
+        initial_max_data => ?CONN_RECV_WINDOW,
+        initial_max_stream_data_bidi_remote => ?STREAM_RECV_WINDOW,
+        initial_max_stream_data_uni => ?STREAM_RECV_WINDOW
+    }.
 
 %% The connected payload conn_state caches at new/1 (alpn + advertised params).
 expected_info() ->

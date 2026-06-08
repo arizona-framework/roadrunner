@@ -13,14 +13,14 @@
 %% connection; a miss on an unsupported-version long header answers with a
 %% Version Negotiation packet (RFC 9000 §5.2.2). Spawning follows the strict
 %% ordering the handshake depends on
-%% (RFC 9000 / the dep's contract): spawn the connection, monitor it (so a
-%% fast death is reaped before its connection ids are registered), register
-%% its CIDs (so a fast follow-up datagram already routes), run the
-%% connection_handler to get the application owner, install the owner
-%% SYNCHRONOUSLY (so ownership transfers before the handshake can complete and
-%% race the `{connected, _}` event), and only then feed the first Initial. Slot
-%% limiting, telemetry, and drain stay in the owner the handler returns; the
-%% listener owns none of them.
+%% (RFC 9000 / the dep's contract): spawn the connection, link it (so the
+%% listener's own shutdown tears its connections down, and a connection's death
+%% reaps its routing rows), register its CIDs (so a fast follow-up datagram
+%% already routes), run the connection_handler to get the application owner,
+%% install the owner SYNCHRONOUSLY (so ownership transfers before the handshake
+%% can complete and race the `{connected, _}` event), and only then feed the
+%% first Initial. Slot limiting, telemetry, and drain stay in the owner the
+%% handler returns; the listener owns none of them.
 %%
 %% A new server Source Connection ID is generated per connection at a fixed
 %% length, so short-header 1-RTT packets (which carry no CID-length field)
@@ -65,6 +65,9 @@
 -record(listener, {
     socket :: roadrunner_quic_socket:socket(),
     port :: inet:port_number(),
+    %% The process that started (and is linked to) the listener — the pool
+    %% supervisor, or a standalone owner. Its `'EXIT'` is a shutdown request.
+    parent :: pid(),
     registry :: roadrunner_quic_cid_registry:t(),
     cert_chain :: [binary()],
     priv_key :: public_key:private_key(),
@@ -114,6 +117,13 @@ init(
         connection_handler := Handler
     } = Opts
 ) ->
+    %% Trap exits and link each spawned connection (in spawn_connection): a
+    %% connection's `'EXIT'` reaps its routing rows, and the listener's own
+    %% shutdown then tears its connections down (so their owners and stream
+    %% workers stop), matching the dep's listener-stop semantics the drain
+    %% relies on.
+    process_flag(trap_exit, true),
+    [Parent | _] = get('$ancestors'),
     ReusePort = maps:get(reuseport, Opts, false),
     case roadrunner_quic_socket:open(Port, #{active => once, reuseport => ReusePort}) of
         {ok, Socket} ->
@@ -127,6 +137,7 @@ init(
             loop(#listener{
                 socket = Socket,
                 port = BoundPort,
+                parent = Parent,
                 registry = Registry,
                 cert_chain = CertChain,
                 priv_key = PrivKey,
@@ -140,7 +151,7 @@ init(
     end.
 
 -spec loop(#listener{}) -> no_return().
-loop(#listener{socket = Socket} = State) ->
+loop(#listener{socket = Socket, parent = Parent} = State) ->
     receive
         {system, From, Req} ->
             roadrunner_loop_sys:handle_system(Req, From, State, fun loop/1);
@@ -156,7 +167,16 @@ loop(#listener{socket = Socket} = State) ->
             loop(State);
         {'$gen_cast', _Request} ->
             loop(State);
-        {'DOWN', _Ref, process, Pid, _Reason} ->
+        {'EXIT', Parent, Reason} ->
+            %% The (pool supervisor) parent is shutting us down: close the socket
+            %% and exit with its reason so our linked connections are torn down
+            %% with us (their owners and stream workers then stop on the loss).
+            ok = roadrunner_quic_socket:close(Socket),
+            exit(Reason);
+        {'EXIT', Pid, _Reason} ->
+            %% A linked connection ended (clean close, error, or our teardown
+            %% reaping it); drop its routing rows. delete_pid keys on the pid, so
+            %% it only reaps that connection's ids.
             ok = roadrunner_quic_cid_registry:delete_pid(State#listener.registry, Pid),
             loop(State);
         Message ->
@@ -188,8 +208,8 @@ route(Datagram, Peer, #listener{registry = Registry} = State) ->
         {forward, ConnPid} ->
             _ = ConnPid ! {quic_datagram, Peer, Datagram},
             State;
-        {spawn, ClientDCID} ->
-            spawn_connection(Datagram, Peer, ClientDCID, State);
+        {spawn, ClientDCID, ClientSCID} ->
+            spawn_connection(Datagram, Peer, ClientDCID, ClientSCID, State);
         {version_negotiation, ClientDCID, ClientSCID} ->
             send_version_negotiation(ClientDCID, ClientSCID, Peer, State);
         drop ->
@@ -213,8 +233,9 @@ send_version_negotiation(ClientDCID, ClientSCID, {Ip, Port}, #listener{socket = 
 
 %% Decide a datagram's fate from its connection ids and the routing table (a
 %% pure decision given the table): `{forward, Pid}` to the owning connection,
-%% `{spawn, DCID}` for a QUIC v1 Initial (at the RFC 9000 §14.1 1200-byte floor)
-%% to an unknown id, `{version_negotiation, DCID, SCID}` for an unsupported
+%% `{spawn, DCID, SCID}` for a QUIC v1 Initial (at the RFC 9000 §14.1 1200-byte
+%% floor) to an unknown id (carrying the client's source id, which the server's
+%% replies address per §7.2), `{version_negotiation, DCID, SCID}` for an unsupported
 %% version at that floor (RFC 9000 §5.2.2), or `drop` otherwise: a malformed or
 %% short-header packet to an unknown id, a v1 Initial below the floor, or an
 %% unsupported-version packet below it (a server MUST discard those). The
@@ -222,7 +243,10 @@ send_version_negotiation(ClientDCID, ClientSCID, {Ip, Port}, #listener{socket = 
 %% its own received Initials.
 -doc false.
 -spec classify(binary(), roadrunner_quic_cid_registry:t()) ->
-    {forward, pid()} | {spawn, binary()} | {version_negotiation, binary(), binary()} | drop.
+    {forward, pid()}
+    | {spawn, binary(), binary()}
+    | {version_negotiation, binary(), binary()}
+    | drop.
 classify(Datagram, Registry) ->
     case roadrunner_quic_packet:dcid(Datagram, ?SCID_LEN) of
         {ok, DCID} ->
@@ -241,13 +265,20 @@ classify(Datagram, Registry) ->
     end.
 
 %% An unknown destination id at the §14.1 floor: a v1 Initial starts a
-%% connection; anything else falls through to the Version Negotiation check.
+%% connection; anything else falls through to the Version Negotiation check. The
+%% client's source id is read alongside the routing id: the server addresses its
+%% replies with it (RFC 9000 §7.2), distinct from the client's destination id
+%% (which derives the Initial keys and echoes as original_destination_connection_id).
+%% A floor-sized v1 Initial always carries both ids, so long_header_info succeeds.
 -spec classify_unrouted(binary(), binary()) ->
-    {spawn, binary()} | {version_negotiation, binary(), binary()} | drop.
+    {spawn, binary(), binary()} | {version_negotiation, binary(), binary()} | drop.
 classify_unrouted(Datagram, DCID) ->
     case is_v1_initial(Datagram) andalso byte_size(Datagram) >= ?MIN_INITIAL_DATAGRAM of
-        true -> {spawn, DCID};
-        false -> maybe_version_negotiation(Datagram)
+        true ->
+            {ok, #{scid := SCID}} = roadrunner_quic_packet:long_header_info(Datagram),
+            {spawn, DCID, SCID};
+        false ->
+            maybe_version_negotiation(Datagram)
     end.
 
 %% RFC 9000 §5.2.2: answer an unsupported-version long header (one we cannot
@@ -274,22 +305,27 @@ is_v1_initial(_Datagram) ->
     false.
 
 %% Spawn a connection for a new client and feed it its first Initial, in the
-%% order the handshake depends on: spawn -> monitor -> register both connection
+%% order the handshake depends on: spawn -> link -> register both connection
 %% ids -> run the handler for the owner -> install the owner synchronously ->
-%% feed.
--spec spawn_connection(binary(), {inet:ip_address(), inet:port_number()}, binary(), #listener{}) ->
+%% feed. `ClientSCID` is the client's source id; the connection addresses its
+%% replies with it (RFC 9000 §7.2), while `ClientDCID` is the routing id (also
+%% the Initial-key and original_destination_connection_id anchor).
+-spec spawn_connection(
+    binary(), {inet:ip_address(), inet:port_number()}, binary(), binary(), #listener{}
+) ->
     #listener{}.
 spawn_connection(
     Datagram,
     Peer,
     ClientDCID,
+    ClientSCID,
     #listener{socket = Socket, registry = Registry, handler = Handler} = State
 ) ->
     ServerSCID = crypto:strong_rand_bytes(?SCID_LEN),
     {ok, ConnPid} = roadrunner_quic_connection:start(
-        Socket, conn_config(ClientDCID, ServerSCID, Peer, State)
+        Socket, conn_config(ClientDCID, ClientSCID, ServerSCID, Peer, State)
     ),
-    _Ref = monitor(process, ConnPid),
+    true = link(ConnPid),
     ok = roadrunner_quic_cid_registry:register_pair(Registry, ClientDCID, ServerSCID, ConnPid),
     ok = install_owner(ConnPid, Handler),
     _ = ConnPid ! {quic_datagram, Peer, Datagram},
@@ -330,15 +366,18 @@ set_owner_sync(ConnPid, Owner) ->
             ok
     end.
 
--spec conn_config(binary(), binary(), {inet:ip_address(), inet:port_number()}, #listener{}) ->
+-spec conn_config(
+    binary(), binary(), binary(), {inet:ip_address(), inet:port_number()}, #listener{}
+) ->
     roadrunner_quic_conn_state:config().
-conn_config(ClientDCID, ServerSCID, Peer, #listener{
+conn_config(ClientDCID, ClientSCID, ServerSCID, Peer, #listener{
     cert_chain = CertChain, priv_key = PrivKey, alpn = Alpn, transport_params = TransportParams
 }) ->
     {EphPub, EphPriv} = crypto:generate_key(ecdh, x25519),
     #{
         dcid => ClientDCID,
         scid => ServerSCID,
+        peer_scid => ClientSCID,
         peer => Peer,
         cert_chain => CertChain,
         priv_key => PrivKey,

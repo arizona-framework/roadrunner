@@ -26,8 +26,11 @@ classify_forwards_short_header_to_registered_connection_test() ->
     ok = ?REG:register_pair(Registry, ?DCID, <<9, 9, 9, 9, 9, 9, 9, 9>>, self()),
     ?assertEqual({forward, self()}, ?M:classify(short_header(?DCID), Registry)).
 
+%% A v1 Initial to an unknown id spawns, capturing both the routing destination
+%% id and the client's source id (the latter is what the server's replies are
+%% addressed to, RFC 9000 §7.2): the two are distinct.
 classify_spawns_for_v1_initial_to_unknown_cid_test() ->
-    ?assertEqual({spawn, ?DCID}, ?M:classify(v1_initial_min(?DCID), ?REG:new())).
+    ?assertEqual({spawn, ?DCID, ?SCID}, ?M:classify(v1_initial_min(?DCID), ?REG:new())).
 
 classify_drops_malformed_datagram_test() ->
     ?assertEqual(drop, ?M:classify(<<>>, ?REG:new())).

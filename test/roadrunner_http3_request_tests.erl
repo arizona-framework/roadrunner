@@ -7,6 +7,9 @@ ctx() ->
 from(Headers) ->
     roadrunner_http3_request:from_headers(Headers, ~"", ctx()).
 
+from(Headers, Body) ->
+    roadrunner_http3_request:from_headers(Headers, Body, ctx()).
+
 base() ->
     [{~":method", ~"GET"}, {~":scheme", ~"https"}, {~":path", ~"/"}].
 
@@ -29,8 +32,11 @@ build_ok_test() ->
     ?assertEqual([{~"host", ~"example.com"}, {~"accept", ~"*/*"}], maps:get(headers, Req)).
 
 build_without_authority_test() ->
-    {ok, Req} = from(base()),
-    ?assertEqual([], maps:get(headers, Req)).
+    %% No :authority pseudo, but a Host header supplies the mandatory authority
+    %% component (RFC 9114 §4.3.1), so the request is valid and Host passes
+    %% through unchanged.
+    {ok, Req} = from(base() ++ [{~"host", ~"example.com"}]),
+    ?assertEqual([{~"host", ~"example.com"}], maps:get(headers, Req)).
 
 missing_pseudo_test() ->
     ?assertEqual(
@@ -75,12 +81,72 @@ banned_headers_test() ->
     ).
 
 te_trailers_allowed_test() ->
-    ?assertMatch({ok, _}, from(base() ++ [{~"te", ~"trailers"}])).
+    ?assertMatch({ok, _}, from(base() ++ [{~":authority", ~"h"}, {~"te", ~"trailers"}])).
 
 te_other_rejected_test() ->
     ?assertEqual({error, connection_specific_header}, from(base() ++ [{~"te", ~"gzip"}])).
 
 regular_header_passthrough_test() ->
-    %% Two regular headers exercise the body-recursion of partition_regular/1.
-    {ok, Req} = from(base() ++ [{~"x-a", ~"1"}, {~"x-b", ~"2"}]),
-    ?assertEqual([{~"x-a", ~"1"}, {~"x-b", ~"2"}], maps:get(headers, Req)).
+    %% Two regular headers exercise the body-recursion of partition_regular/1;
+    %% a Host header supplies the mandatory authority component.
+    {ok, Req} = from(base() ++ [{~"host", ~"h"}, {~"x-a", ~"1"}, {~"x-b", ~"2"}]),
+    ?assertEqual([{~"host", ~"h"}, {~"x-a", ~"1"}, {~"x-b", ~"2"}], maps:get(headers, Req)).
+
+%% =============================================================================
+%% RFC 9114 §4.3.1 authority, §4.1.2 content-length, §4.2 uppercase names
+%% =============================================================================
+
+missing_authority_test() ->
+    %% Neither :authority nor Host: malformed (https has a mandatory authority).
+    ?assertEqual({error, missing_authority}, from(base())).
+
+empty_authority_pseudo_test() ->
+    ?assertEqual({error, empty_authority}, from(base() ++ [{~":authority", ~""}])).
+
+empty_host_header_test() ->
+    ?assertEqual({error, empty_authority}, from(base() ++ [{~"host", ~""}])).
+
+authority_host_match_test() ->
+    %% Both present and equal is valid; the duplicate host header is collapsed
+    %% to a single canonical entry.
+    {ok, Req} = from(base() ++ [{~":authority", ~"example.com"}, {~"host", ~"example.com"}]),
+    ?assertEqual([{~"host", ~"example.com"}], maps:get(headers, Req)).
+
+authority_host_mismatch_test() ->
+    ?assertEqual(
+        {error, authority_mismatch},
+        from(base() ++ [{~":authority", ~"a.com"}, {~"host", ~"b.com"}])
+    ).
+
+uppercase_field_name_test() ->
+    %% RFC 9114 §4.2: an uppercase field name makes the request malformed (the
+    %% banned-header scan catches it before the authority check).
+    ?assertEqual({error, uppercase_field_name}, from(base() ++ [{~"X-Custom", ~"v"}])).
+
+mixedcase_value_allowed_test() ->
+    %% Only field NAMES are case-checked; an uppercase VALUE is fine.
+    ?assertMatch({ok, _}, from(base() ++ [{~"host", ~"h"}, {~"x-token", ~"AbC123"}])).
+
+content_length_match_test() ->
+    ?assertMatch(
+        {ok, _},
+        from(base() ++ [{~"host", ~"h"}, {~"content-length", ~"5"}], ~"abcde")
+    ).
+
+content_length_mismatch_test() ->
+    ?assertEqual(
+        {error, content_length_mismatch},
+        from(base() ++ [{~"content-length", ~"5"}], ~"abc")
+    ).
+
+content_length_non_integer_test() ->
+    ?assertEqual(
+        {error, content_length_mismatch},
+        from(base() ++ [{~"content-length", ~"banana"}], ~"")
+    ).
+
+content_length_multi_valued_test() ->
+    ?assertEqual(
+        {error, content_length_mismatch},
+        from(base() ++ [{~"content-length", ~"5"}, {~"content-length", ~"5"}], ~"abcde")
+    ).

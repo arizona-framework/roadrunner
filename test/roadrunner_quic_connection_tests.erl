@@ -217,13 +217,17 @@ config(Peer) ->
     Config = #{
         dcid => ?DCID,
         scid => ?SCID,
+        peer_scid => ?SCID,
         peer => Peer,
         cert_chain => [~"leaf-cert-der"],
         priv_key => PrivKey,
         alpn => ~"h3",
         transport_params => #{
             original_destination_connection_id => ?DCID,
-            initial_source_connection_id => ?SCID
+            initial_source_connection_id => ?SCID,
+            initial_max_data => 1048576,
+            initial_max_stream_data_bidi_remote => 262144,
+            initial_max_stream_data_uni => 262144
         },
         eph_pub => ServerPub,
         eph_priv => ServerPriv,
@@ -237,7 +241,7 @@ config(Peer) ->
     }}.
 
 client_hello(#{scheme := Scheme, client_pub := ClientPub}) ->
-    Framed = ?TC:client_hello_framed(Scheme, ClientPub),
+    Framed = ?TC:client_hello_framed(Scheme, ClientPub, ?SCID),
     Datagram = ?TC:seal(
         initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
     ),

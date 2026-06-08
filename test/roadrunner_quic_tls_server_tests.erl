@@ -46,12 +46,19 @@ assert_full_handshake(KeyType) ->
     {ClientPub, ClientPriv} = crypto:generate_key(ecdh, x25519),
     {ServerPub, ServerPriv} = crypto:generate_key(ecdh, x25519),
     ServerRandom = crypto:strong_rand_bytes(32),
+    %% The client's Initial SCID; its ClientHello advertises the same value as
+    %% initial_source_connection_id so the §7.3 check passes.
+    ClientSCID = <<10, 11, 12, 13>>,
     TransportParams = #{
         original_destination_connection_id => <<5, 6, 7, 8>>,
         initial_source_connection_id => <<1, 2, 3, 4>>
     },
     ClientHelloBody = client_hello_body(#{
-        key_share => ClientPub, sig_algs => [Scheme], alpn => ~"h3", session_id => <<>>
+        key_share => ClientPub,
+        sig_algs => [Scheme],
+        alpn => ~"h3",
+        session_id => <<>>,
+        transport_params => #{initial_source_connection_id => ClientSCID}
     }),
     State = ?M:new(#{
         cert_chain => [~"leaf-cert-der", ~"intermediate-cert-der"],
@@ -60,7 +67,8 @@ assert_full_handshake(KeyType) ->
         transport_params => TransportParams,
         eph_pub => ServerPub,
         eph_priv => ServerPriv,
-        server_random => ServerRandom
+        server_random => ServerRandom,
+        peer_scid => ClientSCID
     }),
 
     {ok, Flight, Installs, State1} = ?M:process_client_hello(ClientHelloBody, State),
@@ -192,6 +200,45 @@ malformed_client_hello_rejected_test() ->
         {error, malformed_client_hello}, ?M:process_client_hello(~"not a client hello", State)
     ).
 
+%% RFC 9001 §8.2: a ClientHello without the quic_transport_parameters extension
+%% MUST close the connection. The key_share/scheme/alpn gates pass, so the
+%% missing-extension gate is what fails.
+missing_transport_params_rejected_test() ->
+    State = rsa_state(),
+    {ClientPub, _} = crypto:generate_key(ecdh, x25519),
+    Body = client_hello_body(#{
+        key_share => ClientPub, sig_algs => [16#0804], alpn => ~"h3", session_id => <<>>
+    }),
+    ?assertEqual({error, missing_transport_params}, ?M:process_client_hello(Body, State)).
+
+%% RFC 9000 §7.3: the quic_transport_parameters extension is present but omits
+%% initial_source_connection_id, so the connection-id binding cannot be verified.
+missing_initial_scid_rejected_test() ->
+    State = rsa_state(),
+    {ClientPub, _} = crypto:generate_key(ecdh, x25519),
+    Body = client_hello_body(#{
+        key_share => ClientPub,
+        sig_algs => [16#0804],
+        alpn => ~"h3",
+        session_id => <<>>,
+        transport_params => #{initial_max_data => 4096}
+    }),
+    ?assertEqual({error, transport_parameter_error}, ?M:process_client_hello(Body, State)).
+
+%% RFC 9000 §7.3: the client's advertised initial_source_connection_id does not
+%% equal the Source Connection ID of its Initial (rsa_state's peer_scid).
+initial_scid_mismatch_rejected_test() ->
+    State = rsa_state(),
+    {ClientPub, _} = crypto:generate_key(ecdh, x25519),
+    Body = client_hello_body(#{
+        key_share => ClientPub,
+        sig_algs => [16#0804],
+        alpn => ~"h3",
+        session_id => <<>>,
+        transport_params => #{initial_source_connection_id => <<9, 9, 9, 9>>}
+    }),
+    ?assertEqual({error, transport_parameter_error}, ?M:process_client_hello(Body, State)).
+
 %% =============================================================================
 %% Helpers
 %% =============================================================================
@@ -206,7 +253,10 @@ rsa_state() ->
         transport_params => #{initial_source_connection_id => <<1, 2, 3, 4>>},
         eph_pub => ServerPub,
         eph_priv => ServerPriv,
-        server_random => crypto:strong_rand_bytes(32)
+        server_random => crypto:strong_rand_bytes(32),
+        %% The client Initial SCID the §7.3 check compares against; the
+        %% error-path tests fail at an earlier gate, so any binary serves.
+        peer_scid => <<1, 2, 3, 4>>
     }).
 
 %% A generated key pair per scheme, plus the crypto:verify inputs for its
@@ -233,7 +283,8 @@ client_hello_body(Opts) ->
     Extensions = iolist_to_binary([
         signature_algorithms_ext(SigAlgs),
         alpn_ext(Alpn),
-        key_share_ext(maps:get(key_share, Opts, undefined))
+        key_share_ext(maps:get(key_share, Opts, undefined)),
+        transport_params_ext(maps:get(transport_params, Opts, undefined))
     ]),
     CipherSuites = <<?CIPHER_AES_128_GCM_SHA256:16>>,
     <<?LEGACY_VERSION:16, Random/binary, (byte_size(SessionId)):8, SessionId/binary,
@@ -253,6 +304,17 @@ key_share_ext(undefined) ->
 key_share_ext(PubKey) ->
     Entry = <<?GROUP_X25519:16, (byte_size(PubKey)):16, PubKey/binary>>,
     extension(?EXT_KEY_SHARE, <<(byte_size(Entry)):16, Entry/binary>>).
+
+%% `undefined` emits no quic_transport_parameters extension (so a test can
+%% exercise the §8.2 missing-extension path); a params map is encoded with the
+%% production codec.
+transport_params_ext(undefined) ->
+    <<>>;
+transport_params_ext(Params) ->
+    extension(
+        ?EXT_QUIC_TRANSPORT_PARAMS,
+        iolist_to_binary(roadrunner_quic_transport_params:encode(Params))
+    ).
 
 extension(Type, Data) ->
     <<Type:16, (byte_size(Data)):16, Data/binary>>.

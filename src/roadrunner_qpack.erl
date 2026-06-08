@@ -238,7 +238,7 @@ static_entry(0) ->
 static_entry(1) ->
     {~":path", ~"/"};
 static_entry(2) ->
-    {~":age", ~"0"};
+    {~"age", ~"0"};
 static_entry(3) ->
     {~"content-disposition", ~""};
 static_entry(4) ->
@@ -438,7 +438,7 @@ static_entry(_) ->
 -spec static_full_match(binary(), binary()) -> non_neg_integer() | none.
 static_full_match(~":path", ~"/") ->
     1;
-static_full_match(~":age", ~"0") ->
+static_full_match(~"age", ~"0") ->
     2;
 static_full_match(~"content-length", ~"0") ->
     4;
@@ -601,7 +601,7 @@ static_full_match(_, _) ->
 -spec static_name_match(binary()) -> non_neg_integer() | none.
 static_name_match(~":authority") -> 0;
 static_name_match(~":path") -> 1;
-static_name_match(~":age") -> 2;
+static_name_match(~"age") -> 2;
 static_name_match(~"content-disposition") -> 3;
 static_name_match(~"content-length") -> 4;
 static_name_match(~"cookie") -> 5;

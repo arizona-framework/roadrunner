@@ -28,11 +28,15 @@
 %% shared secret (ECDHE over the client's key_share), the CertificateVerify
 %% signature scheme (the cert key's scheme intersected with the client's
 %% offer), and the ALPN protocol (the client must offer the configured one,
-%% RFC 7301 §3.2). Attacker-controlled inputs fail with a flat
-%% `{error, atom()}` (a malformed ClientHello, a missing x25519 key_share,
-%% no common signature scheme, no offered ALPN match, a client Finished
-%% mismatch); a cert/key whose type is unsupported is server config and
-%% legitimately crashes.
+%% RFC 7301 §3.2). The mandatory quic_transport_parameters extension
+%% (RFC 9001 §8.2) and the client's initial_source_connection_id binding
+%% (RFC 9000 §7.3, against the Initial Source Connection ID passed in as
+%% `peer_scid`) are also enforced here. Attacker-controlled inputs fail with a
+%% flat `{error, atom()}` (a malformed ClientHello, a missing x25519 key_share,
+%% no common signature scheme, no offered ALPN match, a missing transport-
+%% parameters extension, a connection-id mismatch, a client Finished mismatch);
+%% a cert/key whose type is unsupported is server config and legitimately
+%% crashes.
 %%
 %% The server's x25519 ephemeral key pair and ServerHello random are
 %% inputs (the connection loop generates them per connection), which keeps
@@ -61,6 +65,10 @@
     eph_pub :: binary(),
     eph_priv :: binary(),
     server_random :: binary(),
+    %% The Source Connection ID of the client's first Initial packet: the
+    %% client's initial_source_connection_id transport parameter must equal it
+    %% (RFC 9000 §7.3).
+    peer_scid :: binary(),
     %% Filled by process_client_hello/2, read by process_client_finished/2.
     client_hs_secret = <<>> :: binary(),
     client_finished_hash = <<>> :: binary()
@@ -75,7 +83,8 @@
     transport_params := roadrunner_quic_transport_params:params(),
     eph_pub := binary(),
     eph_priv := binary(),
-    server_random := binary()
+    server_random := binary(),
+    peer_scid := binary()
 }.
 
 -type flight() :: #{initial := iolist(), handshake := iolist()}.
@@ -88,8 +97,10 @@ Build the handshake state from the per-connection config: the server's DER
 certificate chain (leaf first) and private key, the selected ALPN
 protocol, the server transport parameters (already carrying the
 `original_destination_connection_id` and `initial_source_connection_id`
-the loop fills in), the server's x25519 ephemeral key pair, and the
-ServerHello random.
+the loop fills in), the server's x25519 ephemeral key pair, the ServerHello
+random, and the client's Initial Source Connection ID (`peer_scid`, the value
+the client's `initial_source_connection_id` transport parameter must match,
+RFC 9000 §7.3).
 """.
 -spec new(config()) -> t().
 new(#{
@@ -99,7 +110,8 @@ new(#{
     transport_params := TransportParams,
     eph_pub := EphPub,
     eph_priv := EphPriv,
-    server_random := ServerRandom
+    server_random := ServerRandom,
+    peer_scid := PeerSCID
 }) ->
     #server{
         cert_chain = CertChain,
@@ -108,7 +120,8 @@ new(#{
         transport_params = TransportParams,
         eph_pub = EphPub,
         eph_priv = EphPriv,
-        server_random = ServerRandom
+        server_random = ServerRandom,
+        peer_scid = PeerSCID
     }.
 
 -doc """
@@ -126,12 +139,19 @@ The returned `State` carries what `process_client_finished/2` needs.
 
 Fails with `{error, Reason}` on a malformed ClientHello, a missing x25519
 key_share (`missing_key_share`), no signature scheme shared between the
-cert key and the client's offer (`no_common_sig_alg`), or a client that
-did not offer the configured ALPN protocol (`no_application_protocol`).
+cert key and the client's offer (`no_common_sig_alg`), a client that did
+not offer the configured ALPN protocol (`no_application_protocol`), a
+ClientHello without the quic_transport_parameters extension
+(`missing_transport_params`, RFC 9001 §8.2), or a client
+`initial_source_connection_id` that does not equal (or is absent for) the
+Source Connection ID of its first Initial packet (`transport_parameter_error`,
+RFC 9000 §7.3).
 """.
 -spec process_client_hello(binary(), t()) ->
     {ok, flight(), [install()], t()} | {error, atom()}.
-process_client_hello(ClientHelloBody, #server{priv_key = PrivKey, alpn = Alpn} = State) ->
+process_client_hello(
+    ClientHelloBody, #server{priv_key = PrivKey, alpn = Alpn, peer_scid = PeerSCID} = State
+) ->
     maybe
         {ok,
             #{
@@ -143,6 +163,8 @@ process_client_hello(ClientHelloBody, #server{priv_key = PrivKey, alpn = Alpn} =
         {ok, ClientKeyShare} ?= client_key_share(ClientHello),
         {ok, Scheme} ?= negotiate_scheme(PrivKey, SigAlgs),
         ok ?= check_alpn(Alpn, ClientAlpns),
+        ok ?= check_transport_params(ClientHello),
+        ok ?= check_initial_scid(ClientHello, PeerSCID),
         build_flight(ClientHelloBody, SessionId, ClientKeyShare, Scheme, State)
     end.
 
@@ -175,6 +197,29 @@ process_client_finished(ClientFinishedBody, #server{
     {ok, binary()} | {error, missing_key_share}.
 client_key_share(#{key_share := ClientPub}) -> {ok, ClientPub};
 client_key_share(#{}) -> {error, missing_key_share}.
+
+%% RFC 9001 §8.2: a ClientHello MUST carry the quic_transport_parameters
+%% extension; its absence is a fatal missing_extension. The codec leaves an
+%% absent extension out of the parsed map, so presence is the key being set (a
+%% present-but-malformed extension already failed the parse with its own error).
+-spec check_transport_params(roadrunner_quic_tls_hello:client_hello()) ->
+    ok | {error, missing_transport_params}.
+check_transport_params(#{transport_params := _}) -> ok;
+check_transport_params(#{}) -> {error, missing_transport_params}.
+
+%% RFC 9000 §7.3: the client's initial_source_connection_id transport parameter
+%% MUST equal the Source Connection ID of its first Initial packet (the value
+%% the loop captured as peer_scid). The first clause binds PeerSCID twice (the
+%% function argument and the map value), so it matches ONLY when they are equal;
+%% a mismatch, a missing initial_source_connection_id, or (after
+%% check_transport_params) an absent extension all fall to the second clause as
+%% a transport_parameter_error.
+-spec check_initial_scid(roadrunner_quic_tls_hello:client_hello(), binary()) ->
+    ok | {error, transport_parameter_error}.
+check_initial_scid(#{transport_params := #{initial_source_connection_id := PeerSCID}}, PeerSCID) ->
+    ok;
+check_initial_scid(#{}, _PeerSCID) ->
+    {error, transport_parameter_error}.
 
 %% The CertificateVerify scheme for the cert key, if the client offered it
 %% in its signature_algorithms. The scheme is fixed by the key type (v1

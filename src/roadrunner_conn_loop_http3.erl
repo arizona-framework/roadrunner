@@ -8,10 +8,10 @@
 %%
 %% roadrunner owns this loop and applies its own rules (slot tracking,
 %% drain group, telemetry, dispatch, response shapes, crash isolation);
-%% the `quic` dependency provides the transport (`quic` / `quic_listener`
-%% drive the UDP socket + QUIC streams) and the codec helpers
-%% (`quic_h3_frame` for framing, `quic_qpack` for QPACK). The turnkey
-%% `quic_h3` server is deliberately not used.
+%% the native `roadrunner_quic` stack provides the transport
+%% (`roadrunner_quic_listener` drives the UDP socket, `roadrunner_quic` the
+%% per-connection control + streams) and the codecs
+%% (`roadrunner_quic_h3_frame` for framing, `roadrunner_qpack` for QPACK).
 %%
 %% The loop receives QUIC stream events as messages from the connection
 %% process:
@@ -161,7 +161,7 @@ start(ConnPid, ProtoOpts) ->
         false ->
             %% Over `max_clients` — refuse before ownership transfer.
             %% `try_acquire_slot/1` already rolled the counter back.
-            _ = quic:close(ConnPid, ?H3_NO_ERROR),
+            _ = roadrunner_quic:close(ConnPid, ?H3_NO_ERROR),
             {error, max_clients};
         true ->
             #{handler_spawn_opts := SpawnOpts} = ProtoOpts,
@@ -184,7 +184,7 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
     true = link(Conn),
     %% `remote_addr` is set at connection creation, so peername is
     %% available from the start (idle / handshaking states).
-    {ok, Peer} = quic:peername(Conn),
+    {ok, Peer} = roadrunner_quic:peername(Conn),
     StartMono = roadrunner_telemetry:listener_accept(#{
         listener_name => ListenerName, peer => Peer
     }),
@@ -243,9 +243,11 @@ recv_loop(#h3{conn = Conn} = State) ->
             %% let in-flight ones finish (the `loop/1` head closes the
             %% connection once they do). The listener force-exits us at
             %% the deadline if a request is still running then.
-            loop(start_drain(State));
-        _Other ->
-            loop(State)
+            loop(start_drain(State))
+        %% No catch-all: like the h2 connection loop, the owner uses a
+        %% selective receive. The native transport only ever sends it the
+        %% `{quic, Conn, Event}` notifications matched above, so an unmatched
+        %% message stays queued rather than being silently dropped.
     end.
 
 %% Open the server control stream and send SETTINGS on the `connected`
@@ -264,14 +266,14 @@ recv_loop(#h3{conn = Conn} = State) ->
 %% arrive, so it stays strictly matched.
 -spec send_control_stream(#h3{}) -> #h3{}.
 send_control_stream(#h3{conn = Conn, max_field_section_size = MaxFieldSection} = State) ->
-    {ok, CtrlStreamId} = quic:open_unidirectional_stream(Conn),
+    {ok, CtrlStreamId} = roadrunner_quic:open_unidirectional_stream(Conn),
     Prefix = roadrunner_quic_h3_frame:encode_stream_type(control),
     Settings = roadrunner_quic_h3_frame:encode_settings(#{
         qpack_max_table_capacity => 0,
         qpack_blocked_streams => 0,
         max_field_section_size => MaxFieldSection
     }),
-    _ = quic:send_data(Conn, CtrlStreamId, [Prefix, Settings], false),
+    _ = roadrunner_quic:send_data(Conn, CtrlStreamId, [Prefix, Settings], false),
     State#h3{control_stream_id = CtrlStreamId}.
 
 %% Begin a graceful drain (RFC 9114 §5.2): send a GOAWAY on the control
@@ -288,7 +290,9 @@ start_drain(#h3{conn = Conn, control_stream_id = CtrlId, last_request_id = LastI
     is_integer(CtrlId)
 ->
     GoawayId = LastId + 4,
-    _ = quic:send_data(Conn, CtrlId, roadrunner_quic_h3_frame:encode_goaway(GoawayId), false),
+    _ = roadrunner_quic:send_data(
+        Conn, CtrlId, roadrunner_quic_h3_frame:encode_goaway(GoawayId), false
+    ),
     State#h3{goaway_id = GoawayId}.
 
 %% A draining connection is done once no request is in flight — neither
@@ -364,7 +368,7 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
                     %% Ask the client to stop and mark the stream
                     %% `discarding` so residual body is dropped rather
                     %% than mistaken for a new request.
-                    _ = quic:stop_sending(State#h3.conn, StreamId, ?H3_NO_ERROR),
+                    _ = roadrunner_quic:stop_sending(State#h3.conn, StreamId, ?H3_NO_ERROR),
                     State#h3{
                         streams = Streams#{
                             StreamId => Stream0#{
@@ -383,7 +387,7 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
                         [{~"content-type", ~"text/plain"}],
                         ~"Request Header Fields Too Large"
                     ),
-                    _ = quic:stop_sending(State#h3.conn, StreamId, ?H3_NO_ERROR),
+                    _ = roadrunner_quic:stop_sending(State#h3.conn, StreamId, ?H3_NO_ERROR),
                     State#h3{
                         streams = Streams#{
                             StreamId => Stream0#{
@@ -806,7 +810,7 @@ handle_worker_down(#h3{worker_refs = WorkerRefs} = State, MonRef, Reason) ->
 
 -spec reset_and_drop(#h3{}, non_neg_integer(), non_neg_integer()) -> #h3{}.
 reset_and_drop(#h3{conn = Conn} = State, StreamId, ErrorCode) ->
-    _ = quic:reset_stream(Conn, StreamId, ErrorCode),
+    _ = roadrunner_quic:reset_stream(Conn, StreamId, ErrorCode),
     drop_stream(State, StreamId).
 
 %% Bump the cumulative throttled counter and emit the throttled telemetry
@@ -826,7 +830,7 @@ throttle_stream(#h3{proto_opts = #{throttled_counter := Counter}, listener_name 
 %% fires regardless.
 -spec close_connection(#h3{}, non_neg_integer(), binary()) -> ok.
 close_connection(#h3{conn = Conn} = State, ErrorCode, Reason) ->
-    _ = quic:close(Conn, ErrorCode, Reason),
+    _ = roadrunner_quic:close(Conn, ErrorCode, Reason),
     terminate(State).
 
 -spec drop_stream(#h3{}, non_neg_integer()) -> #h3{}.

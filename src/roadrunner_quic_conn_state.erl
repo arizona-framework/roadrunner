@@ -74,8 +74,13 @@
 }).
 
 -record(state, {
+    %% The client's Initial Destination Connection ID: derives the Initial keys
+    %% and echoes as original_destination_connection_id. NOT the reply wire DCID.
     dcid :: binary(),
     scid :: binary(),
+    %% The client's Source Connection ID, which every server reply addresses as
+    %% its Destination Connection ID (RFC 9000 §7.2/§17.2).
+    peer_scid :: binary(),
     peer :: {inet:ip_address(), inet:port_number()},
     phase = handshaking :: phase(),
     tls :: roadrunner_quic_tls_server:t(),
@@ -125,6 +130,7 @@
 -type config() :: #{
     dcid := binary(),
     scid := binary(),
+    peer_scid := binary(),
     peer := {inet:ip_address(), inet:port_number()},
     cert_chain := [binary()],
     priv_key := public_key:private_key(),
@@ -168,16 +174,19 @@
 -doc """
 Build the connection state from the per-connection config and the birth time
 `Now` (ms). Bootstraps the Initial keys from the client's Destination
-Connection ID, the TLS server sequencer (the server transport parameters
-already carry the original/initial connection ids), the Initial and Handshake
-packet-number spaces (the Application space appears once 1-RTT keys arm), and
-the idle-timeout deadline anchored at `Now`.
+Connection ID (`dcid`), records the client's Source Connection ID (`peer_scid`)
+as the destination every reply is addressed to (RFC 9000 §7.2), the TLS server
+sequencer (the server transport parameters already carry the original/initial
+connection ids), the Initial and Handshake packet-number spaces (the Application
+space appears once 1-RTT keys arm), and the idle-timeout deadline anchored at
+`Now`.
 """.
 -spec new(config(), integer()) -> t().
 new(
     #{
         dcid := DCID,
         scid := SCID,
+        peer_scid := PeerSCID,
         peer := Peer,
         cert_chain := CertChain,
         priv_key := PrivKey,
@@ -196,11 +205,17 @@ new(
         transport_params => TransportParams,
         eph_pub => EphPub,
         eph_priv => EphPriv,
-        server_random => ServerRandom
+        server_random => ServerRandom,
+        peer_scid => PeerSCID
     }),
+    %% Seed the connection receive window from the limit we advertise, so the
+    %% window enforced (RFC 9000 §4.1) is exactly the one the peer was told it
+    %% may use, never a smaller hardcoded default it would trip early on.
+    #{initial_max_data := ConnMaxData} = TransportParams,
     #state{
         dcid = DCID,
         scid = SCID,
+        peer_scid = PeerSCID,
         peer = Peer,
         tls = Tls,
         recv_keys = #{initial => roadrunner_quic_keys:initial_client(DCID)},
@@ -209,7 +224,7 @@ new(
         amp = roadrunner_quic_amp:new(),
         owner = undefined,
         info = #{alpn => Alpn, transport_params => TransportParams},
-        conn_flow = roadrunner_quic_flow:new(#{}),
+        conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ConnMaxData}),
         idle_deadline = Now + ?IDLE_TIMEOUT
     }.
 
@@ -362,7 +377,7 @@ owner_close(ErrorCode, Reason, #state{send_keys = SendKeys} = State) ->
 
 -spec send_owner_close(non_neg_integer(), binary(), roadrunner_quic_keys:keys(), t()) ->
     {t(), [effect()]}.
-send_owner_close(ErrorCode, Reason, Keys, #state{dcid = DCID, scid = SCID} = State) ->
+send_owner_close(ErrorCode, Reason, Keys, #state{peer_scid = DCID, scid = SCID} = State) ->
     Space = space(application, State),
     PN = Space#space.next_pn,
     Frame = {connection_close, application, ErrorCode, undefined, Reason},
@@ -715,9 +730,15 @@ close_code(Reason) when
     Reason =:= flow_control_error;
     Reason =:= final_size_error;
     Reason =:= stream_state_error;
-    Reason =:= protocol_violation
+    Reason =:= protocol_violation;
+    Reason =:= transport_parameter_error
 ->
     roadrunner_quic_error:code_int(Reason);
+close_code(missing_transport_params) ->
+    %% RFC 9001 §8.2: a ClientHello without the quic_transport_parameters
+    %% extension MUST close with 0x016d, a CRYPTO_ERROR carrying the TLS
+    %% missing_extension alert (109).
+    roadrunner_quic_error:code_int({crypto_error, 109});
 close_code(_TlsReason) ->
     %% Every other connection_fatal reason is a TLS handshake failure (a
     %% malformed or rejected ClientHello, a bad Finished, or an unexpected
@@ -734,7 +755,7 @@ close_code(_TlsReason) ->
 send_close(
     #state{
         pending_close = {Level, ErrorCode},
-        dcid = DCID,
+        peer_scid = DCID,
         scid = SCID,
         send_keys = SendKeys,
         amp = Amp
@@ -766,17 +787,29 @@ send_close(
 %% the stream, its flow, and the state carrying any queued event.
 -spec ensure_stream(non_neg_integer(), t()) ->
     {roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()}.
-ensure_stream(Sid, #state{streams = Streams} = State) ->
+ensure_stream(Sid, #state{streams = Streams, info = #{transport_params := TP}} = State) ->
     case Streams of
         #{Sid := {Stream, Flow}} ->
             {Stream, Flow, State};
         #{} ->
             {
                 roadrunner_quic_stream:new(),
-                roadrunner_quic_flow:new(#{}),
+                roadrunner_quic_flow:new(#{initial_max_data => stream_recv_window(Sid, TP)}),
                 emit({stream_opened, Sid}, State)
             }
     end.
+
+%% The receive window we advertised for a peer-initiated stream (RFC 9000
+%% §18.2): client-initiated bidirectional streams (Sid rem 4 == 0) get
+%% initial_max_stream_data_bidi_remote, client-initiated unidirectional streams
+%% (Sid rem 4 == 2) get initial_max_stream_data_uni. Server-initiated ids never
+%% reach here (process_stream/process_reset_stream reject them upstream).
+-spec stream_recv_window(non_neg_integer(), roadrunner_quic_transport_params:params()) ->
+    non_neg_integer().
+stream_recv_window(Sid, #{initial_max_stream_data_bidi_remote := Bidi}) when Sid rem 4 =:= 0 ->
+    Bidi;
+stream_recv_window(_Sid, #{initial_max_stream_data_uni := Uni}) ->
+    Uni.
 
 -spec put_stream(non_neg_integer(), roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()) ->
     t().
@@ -809,7 +842,7 @@ drain_send(Now, State, Acc) ->
         none ->
             {State, lists:reverse(Acc)};
         {Entries, Built} ->
-            #state{dcid = DCID, scid = SCID, amp = Amp} = State,
+            #state{peer_scid = DCID, scid = SCID, amp = Amp} = State,
             {Datagram, Sent} = roadrunner_quic_send:datagram(Entries, DCID, SCID),
             case roadrunner_quic_amp:can_send(byte_size(Datagram), Amp) of
                 false ->
