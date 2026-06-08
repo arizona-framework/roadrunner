@@ -36,7 +36,7 @@
 %% / sent times / the oldest unacknowledged frames, a separate follow-up.
 
 -export([
-    new/2, handle_datagram/3, handle_timeout/3, handle_call/4, handle_send/7, peername/1, phase/1
+    new/2, handle_datagram/3, handle_timeout/3, handle_call/5, handle_send/7, peername/1, phase/1
 ]).
 
 -export_type([t/0, config/0, effect/0, event/0, info/0]).
@@ -307,18 +307,50 @@ Ref, Request}` here and performs the returned `{reply, From, Ref, Result}`
 connection are synchronous; the connection only ever notifies the owner
 with async `{emit, _, _}` effects, so it never blocks on the owner.
 """.
--spec handle_call(pid(), reference(), Request, t()) -> {t(), [effect()]} when
-    Request :: peername | {set_owner, pid()} | open_uni.
-handle_call(From, Ref, peername, #state{peer = Peer} = State) ->
+-spec handle_call(pid(), reference(), Request, integer(), t()) -> {t(), [effect()]} when
+    Request ::
+        peername
+        | {set_owner, pid()}
+        | open_uni
+        | {reset_stream, non_neg_integer(), non_neg_integer()}
+        | {stop_sending, non_neg_integer(), non_neg_integer()}.
+handle_call(From, Ref, peername, _Now, #state{peer = Peer} = State) ->
     {State, [{reply, From, Ref, {ok, Peer}}]};
-handle_call(From, Ref, {set_owner, Owner}, State) ->
+handle_call(From, Ref, {set_owner, Owner}, _Now, State) ->
     {State1, EmitEffects} = install_owner(Owner, State),
     {State1, [{reply, From, Ref, ok} | EmitEffects]};
-handle_call(From, Ref, open_uni, #state{next_uni = Id} = State) ->
+handle_call(From, Ref, open_uni, _Now, #state{next_uni = Id} = State) ->
     %% Allocate the next server-initiated unidirectional stream id. The stream
     %% itself is created lazily on the first send_data; the h3 layer writes the
     %% stream-type byte + SETTINGS, never this layer.
-    {State#state{next_uni = Id + 4}, [{reply, From, Ref, {ok, Id}}]}.
+    {State#state{next_uni = Id + 4}, [{reply, From, Ref, {ok, Id}}]};
+handle_call(From, Ref, {reset_stream, Sid, ErrorCode}, Now, State) ->
+    {State1, SendEffects} = do_reset_stream(Sid, ErrorCode, Now, State),
+    {State1, [{reply, From, Ref, ok} | SendEffects]};
+handle_call(From, Ref, {stop_sending, Sid, ErrorCode}, Now, State) ->
+    {State1, SendEffects} = do_stop_sending(Sid, ErrorCode, Now, State),
+    {State1, [{reply, From, Ref, ok} | SendEffects]}.
+
+%% Abandon the send side of a stream and tell the peer with a RESET_STREAM (RFC
+%% 9000 §19.4): discard the unsent buffer, record the bytes already sent as the
+%% Final Size, queue the frame at the application level, and flush it. The h3
+%% layer uses this to abort a response stream.
+-spec do_reset_stream(non_neg_integer(), non_neg_integer(), integer(), t()) -> {t(), [effect()]}.
+do_reset_stream(Sid, ErrorCode, Now, State) ->
+    {Stream, Flow, State1} = stream_for_send(Sid, State),
+    FinalSize = roadrunner_quic_stream:send_offset(Stream),
+    Stream1 = roadrunner_quic_stream:stop_sending(Stream),
+    State2 = put_stream(Sid, Stream1, Flow, State1),
+    State3 = queue_frame(application, {reset_stream, Sid, ErrorCode, FinalSize}, State2),
+    send_pass(Now, State3).
+
+%% Ask the peer to stop sending on a stream with a STOP_SENDING (RFC 9000
+%% §19.5): queue the frame at the application level and flush it. The h3 layer
+%% uses this to decline a request body it will not read.
+-spec do_stop_sending(non_neg_integer(), non_neg_integer(), integer(), t()) -> {t(), [effect()]}.
+do_stop_sending(Sid, ErrorCode, Now, State) ->
+    State1 = queue_frame(application, {stop_sending, Sid, ErrorCode}, State),
+    send_pass(Now, State1).
 
 %% Install the owner. When the handshake already completed before the owner
 %% was set (the deferred path), emit the once-only `{connected, Info}` now;
