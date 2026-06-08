@@ -66,6 +66,71 @@ only). Remaining work:
   registering them so packets using them route. A currently-unwired
   dep feature, a deliberate upstream effort if wanted
 
+## Native QUIC transport follow-ups
+
+The HTTP/3 path now runs on the native `roadrunner_quic_*` stack (the `quic`
+dep is a test-profile differential oracle + CT client only). The RFC MUSTs a
+browser depends on are implemented; the items below are conformance hardening
+and transport completeness that a real browser GET / POST does not need.
+
+### SHOULD/MAY conformance — harden against non-conformant peers
+
+A conformant browser / quiche / ngtcp2 never trips these; they tighten the
+advisory or malformed cases the server currently tolerates or omits.
+
+- Report a real ACK Delay (always 0 today) and advertise `ack_delay_exponent`
+  / `max_ack_delay` (RFC 9000 §13.2.5) — small-medium
+- Intersect the client's offered cipher / TLS version (`supported_versions`) /
+  group (`supported_groups`) against the hardcoded `TLS_AES_128_GCM_SHA256` /
+  TLS 1.3 / x25519, aborting on no overlap (RFC 8446 §4.1.1) — medium
+- Emit a reserved "GREASE" setting in the h3 SETTINGS frame (RFC 9114
+  §7.2.4.1) — small
+- Honor the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` when sizing response
+  headers (RFC 9114 §4.2.2) — small-medium
+- Reject non-zero packet reserved bits as PROTOCOL_VIOLATION after
+  header-protection removal (RFC 9000 §17.2 / §17.3.1) — small
+
+### Transport completeness — bites large transfers / advanced cases
+
+- Send-side flow control: seed send windows from the peer's advertised
+  transport params, process inbound `MAX_DATA` / `MAX_STREAM_DATA`, grant
+  outbound `MAX_DATA` / `MAX_STREAM_DATA`, and emit `DATA_BLOCKED` /
+  `STREAM_DATA_BLOCKED` (RFC 9000 §4). Each window is seeded from our own
+  advertised value and never raised, so a transfer past the initial grant
+  stalls; the suite max is 100 KB, well under it — medium
+- Respond to a peer-initiated key update (RFC 9001 §6). Security-sensitive:
+  trial-decrypt the next-phase keys and commit ONLY on success (not the dep's
+  commit-then-decrypt, which a single forged flipped-bit datagram desyncs),
+  keep the header-protection key fixed, enforce the AEAD integrity limit —
+  large
+- Draining state: linger ~3×PTO to absorb the peer's reordered packets before
+  close, and reject `send_data` on a draining connection (RFC 9000 §10.2) —
+  medium
+- Seed the idle timeout from the negotiated `max_idle_timeout` (a fixed 30s
+  today) (RFC 9000 §10.1) — small-medium
+- NewReno congestion control (RFC 9002 §7); needs the loss layer to surface
+  acked bytes + sent times. Sending is bounded only by the §8.1
+  anti-amplification limit and flow control today — large
+- A no-flatten / by-reference stream send buffer, so a large response body is
+  not flattened into one binary before sending — medium
+
+### Retire the dep
+
+- Build a native QUIC test client so the `quic` dep can leave the test profile
+  too; the h3 SUITE + bench drive the native server with the dep's client, its
+  last remaining use — large
+- Then move `quic` out of production `deps` into `profiles.test.deps` and drop
+  it from the dialyzer `plt_extra_apps`, so production deps become
+  `[telemetry]` — small
+
+### Known dep deviation (informational)
+
+The `quic` dep's QPACK static table has a `:age` typo at index 2 (RFC 9204
+Appendix A is `age`, no colon). The native stack is RFC-correct, so this entry
+is the one place the dep oracle cannot validate the native encode/decode; not a
+roadrunner bug, recorded so a future dep cross-check does not "correct" the
+native value back to the dep's.
+
 ## HttpArena profile gaps
 
 Remaining HttpArena profiles need roadrunner-side features.
