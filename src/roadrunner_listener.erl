@@ -660,18 +660,13 @@ start_tcp(Port, Opts, Protocols, ProtoOpts) ->
             end
     end.
 
-%% Start the QUIC listener roadrunner owns when `http3` is requested.
-%% Only the self-contained `quic_listener_sup` pool is started (via
-%% `start_quic_pool/2`), NOT the whole `quic` application. That app's
-%% supervisor tree backs the dep's own turnkey server (`server_registry`
-%% / `server_sup`), client (`token_cache`), and distribution
-%% (`dist_sup`) features — none of which roadrunner's owned listener
-%% uses — and `crypto` + `ssl` are already up as roadrunner's own deps.
-%% Keeping the `quic` app out of the boot path means a co-serving
-%% instance carries no idle supervisors it never uses. Each accepted
-%% QUIC connection is handed to a fresh `roadrunner_conn_loop_http3`
-%% owner via the arity-1 `connection_handler`; the QUIC listener then
-%% transfers ownership to the returned pid. `http3` having been
+%% Start the native QUIC listener pool roadrunner owns when `http3` is
+%% requested. `roadrunner_quic_listener_sup` is a self-contained supervisor
+%% (no OTP application to boot; `crypto` + `ssl` are already up as roadrunner's
+%% own deps), started directly by this gen_server via `start_quic_pool/2`.
+%% Each accepted QUIC connection is handed to a fresh
+%% `roadrunner_conn_loop_http3` owner via the arity-1 `connection_handler`; the
+%% listener then transfers ownership to the returned pid. `http3` having been
 %% validated to require `tls`, the `tls` opt is always present here.
 -spec start_quic(
     inet:port_number(), opts(), [http1 | http2 | http3, ...], roadrunner_conn:proto_opts()
@@ -684,11 +679,11 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
             #{tls := UserTlsOpts} = Opts,
             {Cert, CertChain, Key} = quic_cert_key(UserTlsOpts),
             Handler = fun(ConnPid) -> roadrunner_conn_loop_http3:start(ConnPid, ProtoOpts) end,
-            %% Start a POOL of reuseport listeners (the dep enables
-            %% SO_REUSEPORT when pool_size > 0 and shares one connection
-            %% registry across them) so inbound demux parallelizes across
-            %% cores rather than funnelling through one listener process.
-            %% `quic_listener_sup:start_link` links the pool supervisor to
+            %% Start a POOL of reuseport listeners (the native pool sup enables
+            %% SO_REUSEPORT when there is more than one listener and shares one
+            %% connection registry across them) so inbound demux parallelizes
+            %% across cores rather than funnelling through one listener process.
+            %% `roadrunner_quic_listener_sup:start_link` links the pool supervisor to
             %% this gen_server for shared fate; an `init`-time bind failure
             %% comes back as `{error, _}` from the synchronous start (so
             %% `init/1` can still close the already-opened TCP socket).
@@ -724,7 +719,7 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
 start_quic_pool(Port, PoolOpts) ->
     OldTrap = process_flag(trap_exit, true),
     try
-        quic_listener_sup:start_link(Port, PoolOpts)
+        roadrunner_quic_listener_sup:start_link(Port, PoolOpts)
     after
         _ = process_flag(trap_exit, OldTrap)
     end.
@@ -749,8 +744,8 @@ close_quic_probe(Probe) -> gen_udp:close(Probe).
 %% listener reads it back from the QUIC listener.
 -spec bound_port(roadrunner_transport:socket() | none, pid() | undefined) -> inet:port_number().
 bound_port(none, QuicPool) ->
-    [Listener | _] = quic_listener_sup:get_listeners(QuicPool),
-    quic_listener:get_port(Listener);
+    [Listener | _] = roadrunner_quic_listener_sup:get_listeners(QuicPool),
+    roadrunner_quic_listener:get_port(Listener);
 bound_port(LSocket, _QuicListener) ->
     {ok, BoundPort} = roadrunner_transport:port(LSocket),
     BoundPort.
@@ -1517,7 +1512,7 @@ do_drain(
     notify_conns(Group, Deadline),
     #{client_counter := Counter} = ProtoOpts,
     Reply = wait_for_drain(Counter, Deadline, Group),
-    %% Stop the QUIC listener LAST: `quic_listener:stop/1` kills the
+    %% Stop the QUIC listener LAST: `roadrunner_quic_listener:stop/1` kills the
     %% connections it `start_link`ed (and the h3 conn loops linked to
     %% them), so doing it before the notify/wait above would abruptly
     %% kill in-flight h3 conns instead of letting them drain. (New h3
@@ -1656,7 +1651,7 @@ stop_quic(QuicPool) ->
     %% Unlink first so stopping the pool (which `exit/2`s the supervisor)
     %% doesn't deliver a teardown EXIT back to this gen_server.
     true = unlink(QuicPool),
-    quic_listener_sup:stop(QuicPool).
+    roadrunner_quic_listener_sup:stop(QuicPool).
 
 -spec erase_routes(roadrunner_conn:proto_opts()) -> ok.
 erase_routes(#{dispatch := {router, Name}}) ->

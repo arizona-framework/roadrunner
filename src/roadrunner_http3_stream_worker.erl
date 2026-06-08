@@ -13,9 +13,10 @@
 %%    sharing the exact dispatch path h1/h2 use
 %%    (`roadrunner_conn:resolve_handler/2` + the pre-composed pipeline).
 %% 3. Writes the response straight onto the QUIC stream via
-%%    `quic:send_data/4` — QUIC connections are gen_statem-backed, so a
-%%    non-owner process can send with the `Conn` handle (no h2-style
-%%    conn-mediated send protocol needed).
+%%    `roadrunner_quic:send_data/4` — a synchronous round-trip to the
+%%    connection (make_ref + reply) keyed by the `Conn` handle, so this
+%%    non-owner worker gets flow-control back-pressure without a separate
+%%    h2-style conn-mediated send module.
 %%
 %% Crash isolation: workers are spawn_monitored (NOT linked) by the
 %% conn loop. A handler crash is caught here and turned into a 500; any
@@ -248,7 +249,7 @@ emit_501(Conn, StreamId) ->
 
 %% Encode the response as a HEADERS frame (QPACK-encoded `:status` +
 %% the handler's headers) followed by a single DATA frame, and write
-%% both in one `quic:send_data/4` with the stream's FIN. A header-only
+%% both in one `roadrunner_quic:send_data/4` with the stream's FIN. A header-only
 %% response (empty body) sends just the HEADERS frame with FIN.
 -spec send_buffered(
     pid(), non_neg_integer(), roadrunner_http:status(), roadrunner_http:headers(), iodata()
@@ -265,7 +266,7 @@ send_buffered(Conn, StreamId, Status, Headers, Body) ->
     %% response, the connection is draining and the send returns an error.
     %% That is fine, the worker exits and the conn loop cleans up the stream
     %% (same rationale as the control-stream and GOAWAY sends).
-    _ = quic:send_data(Conn, StreamId, Frames, true),
+    _ = roadrunner_quic:send_data(Conn, StreamId, Frames, true),
     ok.
 
 %% `{stream, ...}` response: HEADERS (no FIN), then the handler's fun
@@ -284,7 +285,7 @@ send_buffered(Conn, StreamId, Status, Headers, Body) ->
     roadrunner_handler:stream_fun()
 ) -> ok.
 send_stream(Conn, StreamId, Status, Headers, Fun) ->
-    _ = quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
+    _ = roadrunner_quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
     erase(?FIN_KEY),
     Send = fun(Data, FinFlag) -> stream_send(Conn, StreamId, Data, FinFlag) end,
     _ = Fun(Send),
@@ -300,11 +301,11 @@ send_stream(Conn, StreamId, Status, Headers, Fun) ->
 stream_send(Conn, StreamId, Data, nofin) ->
     case iolist_size(Data) of
         0 -> ok;
-        Len -> quic:send_data(Conn, StreamId, data_frame(Data, Len), false)
+        Len -> roadrunner_quic:send_data(Conn, StreamId, data_frame(Data, Len), false)
     end;
 stream_send(Conn, StreamId, Data, fin) ->
     put(?FIN_KEY, true),
-    quic:send_data(Conn, StreamId, data_frame(Data, iolist_size(Data)), true);
+    roadrunner_quic:send_data(Conn, StreamId, data_frame(Data, iolist_size(Data)), true);
 stream_send(Conn, StreamId, Data, {fin, Trailers}) ->
     %% Trailers go out after the status + body, so an injected one cannot
     %% become a 500. One pass crashes on the RFC 9110 §5.5 check (so the conn
@@ -315,7 +316,9 @@ stream_send(Conn, StreamId, Data, {fin, Trailers}) ->
     Stripped = roadrunner_http:strip_connection_specific_fields_safe(Trailers),
     put(?FIN_KEY, true),
     TrailersFrame = roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(Stripped)),
-    quic:send_data(Conn, StreamId, [data_frame(Data, iolist_size(Data)), TrailersFrame], true).
+    roadrunner_quic:send_data(
+        Conn, StreamId, [data_frame(Data, iolist_size(Data)), TrailersFrame], true
+    ).
 
 %% `{sendfile, ...}` response. There is no kernel sendfile over QUIC
 %% (the stream bytes are encrypted), so read the file in chunks and feed
@@ -372,7 +375,7 @@ sendfile_loop(IoDev, Remaining, Send) ->
     term()
 ) -> ok.
 send_loop(Conn, StreamId, Status, Headers, Handler, State) ->
-    _ = quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
+    _ = roadrunner_quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
     %% Stop looping if the connection dies — otherwise an idle loop
     %% worker (blocked in `info_loop` waiting for a message) leaks
     %% forever once the conn is gone. The monitor fires when the QUIC
@@ -407,7 +410,7 @@ info_loop(Conn, StreamId, Handler, Push, State) ->
                     info_loop(Conn, StreamId, Handler, Push, NewState);
                 {stop, _NewState} ->
                     %% Close the stream with an empty DATA frame + FIN.
-                    _ = quic:send_data(Conn, StreamId, data_frame(<<>>, 0), true),
+                    _ = roadrunner_quic:send_data(Conn, StreamId, data_frame(<<>>, 0), true),
                     ok
             end
     end.
@@ -418,7 +421,7 @@ info_loop(Conn, StreamId, Handler, Push, State) ->
 loop_push(Conn, StreamId, Data) ->
     case iolist_size(Data) of
         0 -> ok;
-        Len -> quic:send_data(Conn, StreamId, data_frame(Data, Len), false)
+        Len -> roadrunner_quic:send_data(Conn, StreamId, data_frame(Data, Len), false)
     end.
 
 %% HEADERS frame: QPACK-encoded `:status` + the handler's headers, with
