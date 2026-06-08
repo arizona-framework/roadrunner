@@ -2,14 +2,20 @@
 -moduledoc false.
 
 %% In-test native QUIC CLIENT connection: a proc_lib process that connects to
-%% the native server over UDP and completes the QUIC + TLS 1.3 handshake, the
-%% client counterpart to roadrunner_quic_connection. Scope: the handshake to
-%% "connected" (the server's HANDSHAKE_DONE received). It owns its own UDP
-%% socket and reads it directly (unlike the server shell, which the listener
-%% feeds). The packet/frame/key pipeline is the production roadrunner_quic_*
-%% modules (role-agnostic); the TLS handshake is driven by
+%% the native server over UDP, completes the QUIC + TLS 1.3 handshake, and
+%% then carries 1-RTT application streams. The client counterpart to
+%% roadrunner_quic_connection. It owns its own UDP socket and reads it
+%% directly (unlike the server shell, which the listener feeds). The
+%% packet/frame/key pipeline is the production roadrunner_quic_* modules
+%% (role-agnostic); the TLS handshake is driven by
 %% roadrunner_quic_test_handshake over the client primitives in
 %% roadrunner_quic_test_client.
+%%
+%% Once connected, the owner opens streams (open_bidi/open_uni) and writes
+%% with send/4; the loop sends each as a STREAM frame in a 1-RTT packet and
+%% delivers received stream data back to the owner as
+%% {quic_test_stream, Conn, StreamId, Data, Fin}. The h3 framing on top is
+%% roadrunner_quic_test_h3.
 %%
 %% The CID flow (RFC 9000 §17.2/§7.2): the client picks a random Initial DCID
 %% (the server's Initial-key + original_destination_connection_id anchor) and
@@ -25,7 +31,7 @@
 
 -include_lib("public_key/include/public_key.hrl").
 
--export([connect/2, close/1]).
+-export([connect/2, close/1, open_bidi/1, open_uni/1, send/4]).
 
 %% v1 connection-id length and signature scheme (the test cert is RSA).
 -define(CID_LEN, 8).
@@ -50,8 +56,16 @@
         #{server := roadrunner_quic_keys:keys(), client := roadrunner_quic_keys:keys()}
         | undefined,
     app_server_keys :: roadrunner_quic_keys:keys() | undefined,
+    app_client_keys :: roadrunner_quic_keys:keys() | undefined,
+    owner :: pid() | undefined,
     finished_sent = false :: boolean(),
-    datagrams = [] :: [binary()]
+    datagrams = [] :: [binary()],
+    %% 1-RTT stream state (RFC 9000 §2.1 client-initiated stream ids).
+    next_bidi = 0 :: non_neg_integer(),
+    next_uni = 2 :: non_neg_integer(),
+    send_pn = 0 :: non_neg_integer(),
+    send_offsets = #{} :: #{non_neg_integer() => non_neg_integer()},
+    recv_streams = #{} :: #{non_neg_integer() => roadrunner_quic_stream:t()}
 }).
 
 %% =============================================================================
@@ -90,6 +104,40 @@ close(Pid) ->
     Pid ! stop,
     ok.
 
+-doc "Allocate a client-initiated bidirectional stream id (RFC 9000 §2.1).".
+-spec open_bidi(pid()) -> non_neg_integer().
+open_bidi(Pid) ->
+    call(Pid, open_bidi).
+
+-doc "Allocate a client-initiated unidirectional stream id (RFC 9000 §2.1).".
+-spec open_uni(pid()) -> non_neg_integer().
+open_uni(Pid) ->
+    call(Pid, open_uni).
+
+-doc """
+Send `Data` on `StreamId` in a 1-RTT packet, with the FIN bit when `Fin`.
+Received stream data is delivered to the connection owner as
+`{quic_test_stream, Conn, StreamId, Data, Fin}`.
+""".
+-spec send(pid(), non_neg_integer(), binary(), boolean()) -> ok.
+send(Pid, StreamId, Data, Fin) ->
+    Ref = make_ref(),
+    Pid ! {send, self(), Ref, StreamId, Data, Fin},
+    receive
+        {Ref, ok} -> ok
+    after 5000 ->
+        {error, timeout}
+    end.
+
+call(Pid, Request) ->
+    Ref = make_ref(),
+    Pid ! {Request, self(), Ref},
+    receive
+        {Ref, Result} -> Result
+    after 5000 ->
+        {error, timeout}
+    end.
+
 %% =============================================================================
 %% Handshake
 %% =============================================================================
@@ -114,6 +162,7 @@ init(Parent, Ref, Host, Port) ->
         scid = Scid,
         eph_priv = EphPriv,
         ch_framed = ChFramed,
+        owner = Parent,
         server_initial_keys = roadrunner_quic_keys:initial_server(Dcid0)
     },
     case handshake(Conn) of
@@ -225,7 +274,9 @@ complete(Conn, ServerHelloFramed, HandshakeBytes) ->
         {ok, #{installs := Installs, client_finished := ClientFinished}} ->
             send_client_finished(Conn, keys_for(handshake, client, Installs), ClientFinished),
             {continue, Conn#conn{
-                finished_sent = true, app_server_keys = keys_for(application, server, Installs)
+                finished_sent = true,
+                app_server_keys = keys_for(application, server, Installs),
+                app_client_keys = keys_for(application, client, Installs)
             }};
         {error, Reason} ->
             {error, Reason}
@@ -270,16 +321,98 @@ server_public_key(HandshakeBytes) ->
 %% Connected
 %% =============================================================================
 
-%% Idle once connected; the handshake milestone is reached. close/1 stops it.
+%% The 1-RTT loop: serve the owner's stream control calls, and read the
+%% socket for the server's 1-RTT packets, delivering received stream data to
+%% the owner. Owner calls are handled ahead of socket reads (the `after 0`),
+%% and the socket is polled briefly so both stay responsive in one process.
 -spec connected_loop(#conn{}) -> ok.
 connected_loop(#conn{socket = Socket} = Conn) ->
     receive
+        {open_bidi, From, Ref} ->
+            Id = Conn#conn.next_bidi,
+            From ! {Ref, Id},
+            connected_loop(Conn#conn{next_bidi = Id + 4});
+        {open_uni, From, Ref} ->
+            Id = Conn#conn.next_uni,
+            From ! {Ref, Id},
+            connected_loop(Conn#conn{next_uni = Id + 4});
+        {send, From, Ref, StreamId, Data, Fin} ->
+            Conn1 = send_stream(Conn, StreamId, Data, Fin),
+            From ! {Ref, ok},
+            connected_loop(Conn1);
         stop ->
             _ = roadrunner_quic_socket:close(Socket),
             ok;
         _Other ->
             connected_loop(Conn)
+    after 0 ->
+        case roadrunner_quic_socket:recv(Socket, 50) of
+            {ok, _Peer, Datagram} -> connected_loop(handle_app_datagram(Conn, Datagram));
+            {error, timeout} -> connected_loop(Conn)
+        end
     end.
+
+%% Send a STREAM frame on a 1-RTT (short-header) packet addressed to the
+%% server's CID, tracking the per-stream offset and the 1-RTT packet number.
+-spec send_stream(#conn{}, non_neg_integer(), binary(), boolean()) -> #conn{}.
+send_stream(
+    #conn{
+        socket = Socket,
+        host = Host,
+        port = Port,
+        scid = Scid,
+        server_scid = ServerScid,
+        app_client_keys = Keys,
+        send_pn = Pn,
+        send_offsets = Offsets
+    } = Conn,
+    StreamId,
+    Data,
+    Fin
+) ->
+    Offset = maps:get(StreamId, Offsets, 0),
+    Frame = {stream, StreamId, Offset, Data, Fin},
+    {Datagram, _Sent} = roadrunner_quic_send:datagram(
+        #{application => #{frames => [Frame], keys => Keys, pn => Pn}}, ServerScid, Scid
+    ),
+    ok = roadrunner_quic_socket:send(Socket, Host, Port, Datagram),
+    Conn#conn{send_pn = Pn + 1, send_offsets = Offsets#{StreamId => Offset + byte_size(Data)}}.
+
+%% Decrypt a 1-RTT datagram and route its STREAM frames through per-stream
+%% reassembly, delivering deliverable bytes to the owner.
+-spec handle_app_datagram(#conn{}, binary()) -> #conn{}.
+handle_app_datagram(#conn{app_server_keys = Keys, scid = Scid} = Conn, Datagram) ->
+    Outcomes = roadrunner_quic_recv:datagram(
+        Datagram, byte_size(Scid), #{application => Keys}, #{}
+    ),
+    Frames = lists:append([Fs || {ok, #{level := application, frames := Fs}} <- Outcomes]),
+    lists:foldl(fun handle_app_frame/2, Conn, Frames).
+
+-spec handle_app_frame(roadrunner_quic_frame:frame(), #conn{}) -> #conn{}.
+handle_app_frame({stream, StreamId, Offset, Data, Fin}, Conn) ->
+    deliver_stream(Conn, StreamId, Offset, Data, Fin);
+handle_app_frame(_Other, Conn) ->
+    Conn.
+
+-spec deliver_stream(#conn{}, non_neg_integer(), non_neg_integer(), binary(), boolean()) -> #conn{}.
+deliver_stream(#conn{recv_streams = Streams, owner = Owner} = Conn, StreamId, Offset, Data, Fin) ->
+    Stream0 = maps:get(StreamId, Streams, roadrunner_quic_stream:new()),
+    case roadrunner_quic_stream:receive_data(Offset, Data, Fin, Stream0) of
+        {ok, Deliverable, FinReached, Stream1} ->
+            maybe_deliver(Owner, StreamId, Deliverable, FinReached),
+            Conn#conn{recv_streams = Streams#{StreamId => Stream1}};
+        {error, _Reason} ->
+            Conn
+    end.
+
+%% Deliver new contiguous bytes (or a bare FIN) to the owner; a gap that
+%% produced nothing new and no FIN is silent.
+-spec maybe_deliver(pid(), non_neg_integer(), binary(), boolean()) -> ok.
+maybe_deliver(_Owner, _StreamId, <<>>, false) ->
+    ok;
+maybe_deliver(Owner, StreamId, Deliverable, FinReached) ->
+    _ = Owner ! {quic_test_stream, self(), StreamId, Deliverable, FinReached},
+    ok.
 
 %% =============================================================================
 %% Internal
