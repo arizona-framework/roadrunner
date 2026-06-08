@@ -51,7 +51,6 @@ valid_listeners_opt_lets_listener_boot() ->
     %% non-default pool wiring: boot a listener with a tuned `{http3, _}`
     %% entry. It comes up clean and stops clean.
     {ok, _} = application:ensure_all_started(ssl),
-    {ok, _} = application:ensure_all_started(quic),
     ensure_pg(),
     Name = list_to_atom(
         "h3_pool_test_valid_" ++ integer_to_list(erlang:unique_integer([positive]))
@@ -69,7 +68,6 @@ custom_max_streams_bidi_threads_into_proto_opts() ->
     %% proto_opts key the QUIC pool reads when advertising the peer's
     %% bidirectional-stream cap in the transport parameters.
     {ok, _} = application:ensure_all_started(ssl),
-    {ok, _} = application:ensure_all_started(quic),
     ensure_pg(),
     Name = list_to_atom(
         "h3_max_streams_bidi_test_" ++ integer_to_list(erlang:unique_integer([positive]))

@@ -19,11 +19,11 @@ all_test_() ->
         fun h2_keepalive_n_requests/0,
         fun open_h1_to_dead_port_errors/0
     ],
-    %% The h3 tests run a real QUIC/UDP handshake (dep `quic_h3` client ->
+    %% The h3 tests run a real QUIC/UDP handshake (native client ->
     %% roadrunner h3 server). `open/3` retries a stalled handshake a few
-    %% times (5 attempts x 5s each), so give these tests a timeout that
-    %% comfortably covers the whole retry budget, well above eunit's 5s
-    %% default (which would otherwise abort the test mid-retry).
+    %% times, so give these tests a timeout that comfortably covers the
+    %% whole retry budget, well above eunit's 5s default (which would
+    %% otherwise abort the test mid-retry).
     H3 = [
         fun h3_get_returns_200/0,
         fun h3_post_echoes_body/0,
@@ -209,7 +209,6 @@ start_h2_listener(Name, Handler) ->
 
 start_h3_listener(Name, Handler) ->
     {ok, _} = application:ensure_all_started(ssl),
-    {ok, _} = application:ensure_all_started(quic),
     ensure_pg(),
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0,

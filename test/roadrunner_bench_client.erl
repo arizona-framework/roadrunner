@@ -7,11 +7,9 @@ against a real roadrunner listener (or any RFC-conformant HTTP
 server). One connection per `open/3`; many `request/5` calls in a
 tight loop share the same connection (and HPACK state for h2).
 
-`h3` uses the `quic` dep's turnkey `quic_h3` *client* (the same one
-`roadrunner_http3_SUITE` drives) — only the turnkey *server* is
-avoided. Its responses arrive as mailbox events; `request/5` collects
-them synchronously so the closed-loop contract is identical across
-protocols.
+`h3` uses the in-tree native client (`roadrunner_quic_test_h3` over
+`roadrunner_quic_test_conn`); `request/5` collects the response
+synchronously so the closed-loop contract is identical across protocols.
 
 ## Why pure-Erlang and not h2load
 
@@ -55,9 +53,9 @@ ms. That's now fixed at the listener layer
 }).
 
 -record(h3_conn, {
-    %% The `quic_h3` connection process. QPACK + stream-id allocation
-    %% live in the dep; responses arrive as `{quic_h3, Conn, _}` events,
-    %% so there's no buffer / codec / stream-id state to thread here.
+    %% The native client connection process (roadrunner_quic_test_conn). It
+    %% owns the QPACK + stream-id + reassembly state, delivering each
+    %% response on its stream, so there is nothing to thread here.
     conn :: pid(),
     authority :: binary()
 }).
@@ -100,32 +98,23 @@ open(Host, Port, h2c) ->
         {error, _} = E -> E
     end;
 open(Host, Port, h3) ->
-    %% QUIC over UDP via the turnkey `quic_h3` client. Under CI load the
-    %% dep's handshake intermittently stalls (a single `wait_connected`
-    %% times out) even though a fresh connection handshakes immediately, so
-    %% retry with a new connection a few times rather than lean on one long
-    %% deadline. The common case connects on the first attempt in well under
-    %% a second. `wait_connected` blocks through the handshake so the first
-    %% `request/5` can issue a stream straight away.
-    open_h3(host_to_authority(Host), Port, 5).
+    %% QUIC over UDP via the native client. Under CI load a handshake can
+    %% intermittently stall even though a fresh connection completes
+    %% immediately, so retry with a new connection a few times. connect/2
+    %% blocks through the handshake, so the first request/5 can issue a
+    %% stream straight away.
+    open_h3(connect_host(Host), host_to_authority(Host), Port, 5).
 
 %% Connect over QUIC, retrying a stalled handshake with a fresh connection
-%% (see `open/3`). Each attempt bounds the handshake to 5s; the eunit
-%% per-test timeout covers the whole retry budget.
-open_h3(_HostBin, _Port, 0) ->
+%% (see `open/3`). The eunit per-test timeout covers the whole retry budget.
+open_h3(_Host, _Auth, _Port, 0) ->
     {error, timeout};
-open_h3(HostBin, Port, Attempts) ->
-    case quic_h3:connect(HostBin, Port, #{verify => verify_none}) of
+open_h3(Host, Auth, Port, Attempts) ->
+    case roadrunner_quic_test_h3:connect(Host, Port) of
         {ok, Conn} ->
-            case quic_h3:wait_connected(Conn, 5000) of
-                ok ->
-                    {ok, #h3_conn{conn = Conn, authority = HostBin}};
-                {error, _} ->
-                    _ = quic_h3:close(Conn),
-                    open_h3(HostBin, Port, Attempts - 1)
-            end;
-        {error, _} = Error ->
-            Error
+            {ok, #h3_conn{conn = Conn, authority = Auth}};
+        {error, _} ->
+            open_h3(Host, Auth, Port, Attempts - 1)
     end.
 
 %% Shared post-connect handshake for h2 (TLS) and h2c (cleartext).
@@ -251,16 +240,9 @@ request(#h3_conn{conn = Conn, authority = Auth} = C, Method, Path, Headers, Body
         {~":path", Path}
         | Headers
     ],
-    case h3_send_request(Conn, AllHeaders, Body) of
-        {ok, StreamId} ->
-            case h3_collect(Conn, StreamId, undefined, [], <<>>) of
-                {ok, Status, RespHeaders, RespBody} ->
-                    {ok, Status, RespHeaders, RespBody, C};
-                {error, _} = E ->
-                    E
-            end;
-        {error, _} = E ->
-            E
+    case roadrunner_quic_test_h3:request(Conn, AllHeaders, Body) of
+        {Status, RespHeaders, RespBody} -> {ok, Status, RespHeaders, RespBody, C};
+        timeout -> {error, timeout}
     end.
 
 -doc "Close the underlying TCP / TLS socket.".
@@ -272,7 +254,7 @@ close(#h2_conn{sock = Sock}) ->
     _ = tclose(Sock),
     ok;
 close(#h3_conn{conn = Conn}) ->
-    _ = quic_h3:close(Conn),
+    _ = roadrunner_quic_test_h3:close(Conn),
     ok.
 
 -doc """
@@ -577,53 +559,6 @@ merge_h2_headers(Decoded, Status0, Headers0) ->
     {Status, Headers0 ++ Regular}.
 
 %% =============================================================================
-%% h3 helpers
-%% =============================================================================
-
-%% Issue the request HEADERS (and body, if any) and return the stream id.
-%% An empty body FINs on the HEADERS frame; a non-empty body FINs on the
-%% trailing DATA.
-h3_send_request(Conn, AllHeaders, <<>>) ->
-    quic_h3:request(Conn, AllHeaders);
-h3_send_request(Conn, AllHeaders, Body) ->
-    case quic_h3:request(Conn, AllHeaders, #{end_stream => false}) of
-        {ok, StreamId} ->
-            case quic_h3:send_data(Conn, StreamId, Body, true) of
-                ok -> {ok, StreamId};
-                {error, _} = E -> E
-            end;
-        {error, _} = E ->
-            E
-    end.
-
-%% Collect the response for `StreamId` from the connection's mailbox: the
-%% `{response, _}` event carries status + headers, `{data, _, Fin}` events
-%% accumulate the body, and a reset / connection error / close ends it.
-%% Other connection events are dropped so the mailbox can't grow across a
-%% long bench run.
-h3_collect(Conn, StreamId, Status, Headers, Acc) ->
-    receive
-        {quic_h3, Conn, {response, StreamId, S, H}} ->
-            h3_collect(Conn, StreamId, S, H, Acc);
-        {quic_h3, Conn, {data, StreamId, Data, true}} ->
-            {ok, Status, Headers, <<Acc/binary, Data/binary>>};
-        {quic_h3, Conn, {data, StreamId, Data, false}} ->
-            h3_collect(Conn, StreamId, Status, Headers, <<Acc/binary, Data/binary>>);
-        {quic_h3, Conn, {trailers, StreamId, _Trailers}} ->
-            {ok, Status, Headers, Acc};
-        {quic_h3, Conn, {stream_reset, StreamId, ErrorCode}} ->
-            {error, {stream_reset, ErrorCode}};
-        {quic_h3, Conn, {error, ErrorCode, _Reason}} ->
-            {error, {conn_error, ErrorCode}};
-        {quic_h3, Conn, closed} ->
-            {error, closed};
-        {quic_h3, Conn, _Other} ->
-            h3_collect(Conn, StreamId, Status, Headers, Acc)
-    after 5000 ->
-        {error, timeout}
-    end.
-
-%% =============================================================================
 %% shared helpers
 %% =============================================================================
 
@@ -632,6 +567,11 @@ h3_collect(Conn, StreamId, Status, Headers, Acc) ->
 host_to_authority(Host) when is_list(Host) -> list_to_binary(Host);
 host_to_authority(Host) when is_binary(Host) -> Host;
 host_to_authority(Host) when is_tuple(Host) -> list_to_binary(inet:ntoa(Host)).
+
+%% The native client's connect/2 sends via gen_udp, which needs a hostname
+%% (string/atom) or ip tuple, not a binary.
+connect_host(Host) when is_binary(Host) -> binary_to_list(Host);
+connect_host(Host) -> Host.
 
 %% `gen_tcp:connect` and `ssl:connect` accept hostname as a list
 %% (string) or an `inet:ip_address()` tuple, NOT a binary. The
