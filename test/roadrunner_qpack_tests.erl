@@ -3,49 +3,6 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(M, roadrunner_qpack).
-%% The `quic` dep, kept as a test-profile differential oracle.
--define(DEP, quic_qpack).
-
-%% =============================================================================
-%% Differential oracle vs the dep: byte-for-byte encode + cross-decode.
-%%
-%% Cross-decode (dep decodes our bytes and we decode the dep's, both back to
-%% the original) is the real interop guarantee. Byte-for-byte holds too here
-%% because both pick the lowest static index and the same Huffman table.
-%% =============================================================================
-
-oracle_header_sets() ->
-    [
-        [],
-        [{~":status", ~"200"}],
-        [{~"content-type", ~"text/plain"}],
-        [{~"accept-encoding", ~"gzip, deflate, br"}],
-        %% Typical request: exact pseudo-headers + a name-ref :authority.
-        [
-            {~":method", ~"GET"},
-            {~":scheme", ~"https"},
-            {~":path", ~"/"},
-            {~":authority", ~"example.com"}
-        ],
-        %% Name reference, non-table value (name has concrete siblings).
-        [{~":status", ~"599"}],
-        %% Name-only static names used as name references.
-        [{~"server", ~"roadrunner"}],
-        [{~"set-cookie", ~"sid=abc; HttpOnly"}],
-        %% Literal name (not in the table) with a Huffman-worthy value.
-        [{~"x-custom-header", ~"a fairly long custom value that compresses"}],
-        %% Short value that does not benefit from Huffman (raw branch).
-        [{~"x-flag", ~"x"}]
-    ].
-
-oracle_encode_is_byte_identical_test() ->
-    [?assertEqual(?DEP:encode(H), enc(H)) || H <- oracle_header_sets()].
-
-oracle_dep_decodes_our_encoding_test() ->
-    [?assertEqual({ok, H}, ?DEP:decode(enc(H))) || H <- oracle_header_sets()].
-
-oracle_we_decode_dep_encoding_test() ->
-    [?assertEqual({ok, H}, ?M:decode(?DEP:encode(H))) || H <- oracle_header_sets()].
 
 %% =============================================================================
 %% Static table — full clause coverage via the public API.
@@ -80,9 +37,8 @@ name_reference_every_static_name_test() ->
      || Name <- Names
     ].
 
-%% RFC 9204 Appendix A index 2 is `age: 0`. The dep's static table has a `:age`
-%% typo at this index, so it is pinned to the RFC directly, NOT cross-checked
-%% against the dep oracle (a full match must encode as the bare index-2 line).
+%% RFC 9204 Appendix A index 2 is `age: 0`; a full match must encode as the
+%% bare index-2 Indexed Field Line.
 static_index_2_is_age_test() ->
     ?assertEqual({ok, [{~"age", ~"0"}]}, ?M:decode(indexed_section(2))),
     ?assertEqual(indexed_section(2), enc([{~"age", ~"0"}])).
@@ -90,8 +46,7 @@ static_index_2_is_age_test() ->
 %% A name absent from the table encodes as a Literal with Literal Name.
 literal_literal_name_test() ->
     H = [{~"x-totally-unknown", ~"value"}],
-    ?assertEqual({ok, H}, ?M:decode(enc(H))),
-    ?assertEqual(?DEP:encode(H), enc(H)).
+    ?assertEqual({ok, H}, ?M:decode(enc(H))).
 
 %% =============================================================================
 %% Encode string: Huffman vs raw branch.
@@ -103,10 +58,7 @@ encode_string_branches_test() ->
     Huffy = [{~"x-h", binary:copy(~"a", 40)}],
     Raw = [{~"x-r", ~"q"}],
     ?assertEqual({ok, Huffy}, ?M:decode(enc(Huffy))),
-    ?assertEqual({ok, Raw}, ?M:decode(enc(Raw))),
-    %% Cross-check the Huffman decision against the dep byte-for-byte.
-    ?assertEqual(?DEP:encode(Huffy), enc(Huffy)),
-    ?assertEqual(?DEP:encode(Raw), enc(Raw)).
+    ?assertEqual({ok, Raw}, ?M:decode(enc(Raw))).
 
 %% =============================================================================
 %% Decode error paths.

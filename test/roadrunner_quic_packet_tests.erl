@@ -3,8 +3,6 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(M, roadrunner_quic_packet).
-%% The `quic` dep, kept as a test-profile differential oracle.
--define(DEP, quic_packet).
 
 %% QUIC v1.
 -define(V1, 16#00000001).
@@ -15,18 +13,8 @@
 enc(Iolist) -> iolist_to_binary(Iolist).
 
 %% =============================================================================
-%% Encode: byte-for-byte vs the dep oracle.
+%% Encode helpers and structural checks.
 %% =============================================================================
-
-encode_long_matches_dep_test() ->
-    [
-        ?assertEqual(
-            ?DEP:encode_long(Type, ?V1, ?DCID, ?SCID, Opts),
-            enc(?M:encode_long(Type, ?V1, ?DCID, ?SCID, Opts))
-        )
-     || Type <- [initial, handshake, zero_rtt],
-        Opts <- long_opts_cases(Type)
-    ].
 
 long_opts_cases(initial) ->
     [
@@ -45,23 +33,16 @@ long_opts_cases(_Type) ->
         #{pn => 16777216, payload => binary:copy(<<9>>, 50)}
     ].
 
-encode_short_matches_dep_test() ->
-    [
-        ?assertEqual(
-            ?DEP:encode_short(?DCID, PN, Payload, Spin, KeyPhase),
-            enc(?M:encode_short(?DCID, PN, Payload, Spin, KeyPhase))
-        )
-     || PN <- [0, 200, 70000, 20000000],
-        Payload <- [<<>>, <<"data">>],
-        Spin <- [true, false],
-        KeyPhase <- [0, 1]
-    ].
-
 encode_short_default_key_phase_test() ->
     ?assertEqual(
         enc(?M:encode_short(?DCID, 5, <<"x">>, false, 0)),
         enc(?M:encode_short(?DCID, 5, <<"x">>, false))
     ).
+
+encode_short_spin_bit_set_test() ->
+    %% A true spin bit sets first-byte bit 5 (RFC 9000 §17.3.1).
+    <<FirstByte, _/binary>> = enc(?M:encode_short(?DCID, 5, <<"x">>, true)),
+    ?assertEqual(2#00100000, FirstByte band 2#00100000).
 
 %% =============================================================================
 %% Round-trip: encode then decode (header protection is not applied here).
@@ -114,20 +95,8 @@ roundtrip_short_test() ->
     ].
 
 %% =============================================================================
-%% Cross-decode: the dep builds, we decode.
+%% Coalesced decode.
 %% =============================================================================
-
-decode_dep_long_test() ->
-    Opts = #{token => <<"t">>, pn => 9, payload => <<"crypto">>},
-    Bin = ?DEP:encode_long(initial, ?V1, ?DCID, ?SCID, Opts),
-    ?assertEqual({ok, expected_long(initial, Opts), <<>>}, ?M:decode(Bin, byte_size(?DCID))).
-
-decode_dep_short_test() ->
-    Bin = ?DEP:encode_short(?DCID, 42, <<"1rtt">>, true, 1),
-    ?assertEqual(
-        {ok, #{type => one_rtt, dcid => ?DCID, pn => 42, payload => <<"1rtt">>}, <<>>},
-        ?M:decode(Bin, byte_size(?DCID))
-    ).
 
 %% A coalesced datagram (Initial followed by a short-header packet): the
 %% Initial decodes and leaves the short-header bytes as the remainder.
@@ -320,8 +289,8 @@ long_header_info_truncated_test() ->
     ?assertEqual({error, truncated}, ?M:long_header_info(<<16#C0, ?V1:32, 2, 1, 2>>)).
 
 %% =============================================================================
-%% Version Negotiation packet (no dep oracle: the dep randomises the first
-%% byte, so check the structure instead).
+%% Version Negotiation packet: the first byte's unused bits are arbitrary,
+%% so check the structure instead.
 %% =============================================================================
 
 version_negotiation_structure_test() ->

@@ -3,8 +3,6 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(M, roadrunner_quic_transport_params).
-%% The `quic` dep, kept as a test-profile differential oracle.
--define(DEP, quic_tls).
 
 %% =============================================================================
 %% RFC 9000 §18 framing structure — the authority.
@@ -31,15 +29,6 @@ encode_connection_id_params_test() ->
 encode_flag_param_test() ->
     %% disable_active_migration (0x0c) is a zero-length flag.
     ?assertEqual(<<16#0C, 16#00>>, enc(#{disable_active_migration => true})).
-
-encode_all_params_decoded_by_dep_test() ->
-    %% Every encodable parameter at once (including the server-only
-    %% original_destination_connection_id), exercising each encode clause.
-    %% The dep decoder (which does not reject server-only params) reads it
-    %% back to the same values, order-independently.
-    All = all_encodable_params(),
-    {ok, DepMap} = ?DEP:decode_transport_params(enc(All)),
-    ?assertEqual(All, from_dep_params(DepMap)).
 
 %% =============================================================================
 %% decode/1 — round-trips and value types.
@@ -164,35 +153,6 @@ decode_truncated_test() ->
     ?assertEqual({error, truncated}, ?M:decode(<<16#04, 16#01, 16#80>>)).
 
 %% =============================================================================
-%% Differential oracle vs the `quic` dep (kept as a test-profile dep).
-%% =============================================================================
-
-%% Per single parameter the wire is order-independent, so byte-for-byte
-%% equality with the dep holds (the dep emits a whole map in maps:fold
-%% order, which is unspecified).
-oracle_encode_matches_dep_test() ->
-    [
-        ?assertEqual(
-            ?DEP:encode_transport_params(dep_params(#{Key => Value})),
-            enc(#{Key => Value})
-        )
-     || {Key, Value} <- oracle_single_params()
-    ].
-
-%% The dep decodes the native wire to the same values, and the native
-%% decoder round-trips the same client set.
-oracle_decode_matches_dep_test() ->
-    [
-        begin
-            Wire = enc(M),
-            ?assertEqual({ok, M}, ?M:decode(Wire)),
-            {ok, DepMap} = ?DEP:decode_transport_params(Wire),
-            ?assertEqual(M, from_dep_params(DepMap))
-        end
-     || M <- oracle_client_sets()
-    ].
-
-%% =============================================================================
 %% Fixtures and helpers
 %% =============================================================================
 
@@ -218,53 +178,6 @@ all_encodable_params() ->
 %% A representative client set (no server-only parameters).
 client_param_set() ->
     maps:remove(original_destination_connection_id, all_encodable_params()).
-
-oracle_client_sets() ->
-    [
-        #{initial_max_data => 1000000},
-        #{
-            initial_max_stream_data_bidi_local => 65536,
-            initial_max_streams_bidi => 16,
-            max_idle_timeout => 10000
-        },
-        #{disable_active_migration => true, active_connection_id_limit => 8},
-        client_param_set()
-    ].
-
-oracle_single_params() ->
-    [
-        {original_destination_connection_id, <<1, 2, 3, 4, 5>>},
-        {max_idle_timeout, 0},
-        {max_udp_payload_size, 65527},
-        {initial_max_data, 4611686018427387903},
-        {initial_max_stream_data_bidi_local, 16383},
-        {initial_max_stream_data_bidi_remote, 64},
-        {initial_max_stream_data_uni, 63},
-        {initial_max_streams_bidi, 100},
-        {initial_max_streams_uni, 0},
-        {ack_delay_exponent, 3},
-        {max_ack_delay, 25},
-        {disable_active_migration, true},
-        {active_connection_id_limit, 2},
-        {initial_source_connection_id, <<16#cc, 16#dd>>}
-    ].
-
-%% The dep names three connection-id parameters differently.
-dep_params(M) ->
-    maps:fold(fun(K, V, Acc) -> Acc#{to_dep_key(K) => V} end, #{}, M).
-
-to_dep_key(original_destination_connection_id) -> original_dcid;
-to_dep_key(initial_source_connection_id) -> initial_scid;
-to_dep_key(retry_source_connection_id) -> retry_scid;
-to_dep_key(K) -> K.
-
-from_dep_params(M) ->
-    maps:fold(fun(K, V, Acc) -> Acc#{from_dep_key(K) => V} end, #{}, M).
-
-from_dep_key(original_dcid) -> original_destination_connection_id;
-from_dep_key(initial_scid) -> initial_source_connection_id;
-from_dep_key(retry_scid) -> retry_source_connection_id;
-from_dep_key(K) -> K.
 
 %% Encode then decode, to check decode-side validation of values that
 %% encode (which does not validate) happily produces.

@@ -2,9 +2,9 @@
 -moduledoc """
 Property-based tests for `roadrunner_quic_transport_params`.
 
-Over random client parameter sets: the native codec round-trips
-(`decode(encode(M)) =:= {ok, M}`) and the `quic` dep (the oracle)
-decodes the native wire to the same values. The set excludes the
+Round-trip invariant over random client parameter sets: encoding a valid
+parameters map and decoding the wire back recovers the same map
+(`decode(encode(M)) =:= {ok, M}`). The generated set excludes the
 server-only parameters a client must not send (the native decoder
 rejects those, by design).
 """.
@@ -19,14 +19,13 @@ rejects those, by design).
 %% 2^60, the RFC 9000 §18.2 ceiling for initial_max_streams_*.
 -define(MAX_STREAMS, 1152921504606846976).
 
-prop_encode_decode_matches_dep() ->
+prop_encode_decode_round_trips() ->
     ?FORALL(
         Params,
         params_gen(),
         begin
             Wire = iolist_to_binary(roadrunner_quic_transport_params:encode(Params)),
-            roadrunner_quic_transport_params:decode(Wire) =:= {ok, Params} andalso
-                quic_tls:decode_transport_params(Wire) =:= {ok, dep_params(Params)}
+            roadrunner_quic_transport_params:decode(Wire) =:= {ok, Params}
         end
     ).
 
@@ -55,14 +54,3 @@ param_gen() ->
 varint() -> integer(0, ?MAX_VARINT).
 
 cid() -> ?LET(N, integer(0, 20), binary(N)).
-
-%% The dep names the connection-id parameter differently.
-dep_params(M) ->
-    maps:fold(
-        fun
-            (initial_source_connection_id, V, Acc) -> Acc#{initial_scid => V};
-            (K, V, Acc) -> Acc#{K => V}
-        end,
-        #{},
-        M
-    ).

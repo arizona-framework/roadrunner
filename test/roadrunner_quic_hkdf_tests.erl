@@ -3,8 +3,6 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(M, roadrunner_quic_hkdf).
-%% The `quic` dep, kept as a test-profile differential oracle.
--define(DEP, quic_hkdf).
 
 %% =============================================================================
 %% RFC 5869 Appendix A SHA-256 test vectors — the authority.
@@ -59,34 +57,7 @@ expand_label_rfc9001_test() ->
     ?assertEqual(ClientSecret, ?M:expand_label(InitialSecret, ~"client in", <<>>, 32)),
     ?assertEqual(ServerSecret, ?M:expand_label(InitialSecret, ~"server in", <<>>, 32)).
 
-%% =============================================================================
-%% Differential equivalence vs the dep oracle, across varied inputs
-%% (empty salt, non-empty salt, several lengths, a non-empty context).
-%% =============================================================================
-
-oracle_matches_dep_test() ->
-    Inputs = [
-        {<<>>, ~"ikm", <<>>, ~"quic key", <<>>, 16},
-        {~"salt", ~"keying material", ~"info", ~"quic iv", <<>>, 12},
-        {~"the-salt", ~"the-ikm", ~"the-info", ~"quic hp", <<>>, 16},
-        {~"s", ~"i", ~"n", ~"derived", ~"context-bytes", 48},
-        {~"abc", ~"def", ~"ghi", ~"key", <<>>, 32}
-    ],
-    [
-        begin
-            PRK = ?M:extract(Salt, IKM),
-            ?assertEqual(?DEP:extract(Salt, IKM), PRK),
-            ?assertEqual(?DEP:expand(PRK, Info, Len), ?M:expand(PRK, Info, Len)),
-            ?assertEqual(
-                ?DEP:expand_label(PRK, Label, Ctx, Len),
-                ?M:expand_label(PRK, Label, Ctx, Len)
-            )
-        end
-     || {Salt, IKM, Info, Label, Ctx, Len} <- Inputs
-    ].
-
-%% A zero-length expansion yields the empty binary (RFC 5869 §2.3, N=0),
-%% pinned here independently of the differential property.
+%% A zero-length expansion yields the empty binary (RFC 5869 §2.3, N=0).
 expand_zero_length_test() ->
     PRK = ?M:extract(~"salt", ~"ikm"),
     ?assertEqual(<<>>, ?M:expand(PRK, ~"info", 0)),

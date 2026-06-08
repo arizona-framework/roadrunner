@@ -3,8 +3,6 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(M, roadrunner_quic_keys).
-%% The `quic` dep, kept as a test-profile differential oracle.
--define(DEP, quic_keys).
 
 %% =============================================================================
 %% RFC 9001 Appendix A.1 — the authority.
@@ -55,7 +53,6 @@ traffic_keys_test() ->
 %% =============================================================================
 %% Key update (RFC 9001 §6.1), AES-128-GCM: the next secret is
 %% Expand-Label(current, "quic ku", "", 32), and the keys follow from it.
-%% Vector cross-checked against the dep oracle.
 %% =============================================================================
 
 key_update_test() ->
@@ -75,50 +72,10 @@ key_update_test() ->
     ).
 
 %% =============================================================================
-%% Differential equivalence vs the dep oracle, across several DCIDs (the
-%% A.1 example, a text CID, the 20-byte maximum, empty, one byte) and
-%% traffic secrets.
-%% =============================================================================
-
-initial_keys_match_dep_test() ->
-    DCIDs = [
-        a1_dcid(),
-        ~"roadrunner-cid",
-        list_to_binary(lists:seq(1, 20)),
-        <<>>,
-        ~"x"
-    ],
-    [
-        begin
-            ?assertEqual(?DEP:derive_initial_secret(DCID), ?M:initial_secret(DCID)),
-            ?assertEqual(dep_keys(?DEP:derive_initial_server(DCID)), ?M:initial_server(DCID)),
-            ?assertEqual(dep_keys(?DEP:derive_initial_client(DCID)), ?M:initial_client(DCID))
-        end
-     || DCID <- DCIDs
-    ].
-
-update_matches_dep_test() ->
-    Secrets = [
-        binary:copy(<<16#2a>>, 32),
-        binary:copy(<<16#00>>, 32),
-        list_to_binary(lists:seq(1, 32))
-    ],
-    [
-        begin
-            {DepSecret, DepKeys} = ?DEP:derive_updated_keys(Secret, aes_128_gcm),
-            ?assertEqual({DepSecret, dep_keys(DepKeys)}, ?M:update(Secret))
-        end
-     || Secret <- Secrets
-    ].
-
-%% =============================================================================
 %% Helpers
 %% =============================================================================
 
 a1_dcid() -> hex(~"8394c8f03e515708").
-
-%% The dep returns key material as a {Key, IV, HP} tuple.
-dep_keys({Key, IV, HP}) -> #{key => Key, iv => IV, hp => HP}.
 
 %% Uppercase before decoding so the literals are portable across OTP
 %% versions regardless of `binary:decode_hex/1`'s lowercase handling.

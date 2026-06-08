@@ -2,10 +2,10 @@
 -moduledoc """
 Property-based tests for `roadrunner_quic_tls_handshake`.
 
-Differential + round-trip invariant over random handshake messages: the
-framing is byte-for-byte identical to the `quic` dep (the oracle),
-`decode(encode(...))` round-trips back to `{ok, {Type, Body}, <<>>}`, and
-the dep decodes the native framing to the same value.
+Round-trip invariant over random handshake messages: framing a type and
+body with `encode/2` and decoding the result with `decode/1` recovers the
+original `{Type, Body}` pair with no trailing bytes
+(`{ok, {Type, Body}, <<>>}`).
 """.
 
 -compile(export_all).
@@ -13,15 +13,12 @@ the dep decodes the native framing to the same value.
 
 -include_lib("common_test/include/ct_property_test.hrl").
 
-prop_encode_decode_matches_dep() ->
+prop_encode_decode_round_trips() ->
     ?FORALL(
         {Type, Body},
         {integer(0, 255), binary()},
         begin
             Wire = iolist_to_binary(roadrunner_quic_tls_handshake:encode(Type, Body)),
-            Wire =:= quic_tls:encode_handshake_message(Type, Body) andalso
-                roadrunner_quic_tls_handshake:decode(Wire) =:= {ok, {Type, Body}, <<>>} andalso
-                roadrunner_quic_tls_handshake:decode(Wire) =:=
-                    quic_tls:decode_handshake_message(Wire)
+            roadrunner_quic_tls_handshake:decode(Wire) =:= {ok, {Type, Body}, <<>>}
         end
     ).

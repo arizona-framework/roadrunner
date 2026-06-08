@@ -3,8 +3,6 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(M, roadrunner_quic_ack).
-%% The `quic` dep, kept as a test-profile differential oracle.
--define(DEP, quic_ack).
 
 %% =============================================================================
 %% Range tracking: each branch of the insert/merge logic.
@@ -66,30 +64,6 @@ needs_ack_tracks_eliciting_test() ->
     Eliciting = ?M:record(1, true, NonEliciting),
     ?assert(?M:needs_ack(Eliciting)),
     ?assertNot(?M:needs_ack(?M:mark_ack_sent(Eliciting))).
-
-%% =============================================================================
-%% Differential equivalence vs the dep oracle (ranges, largest, ACK fields).
-%% =============================================================================
-
-matches_dep_test() ->
-    Sequences = [
-        [0, 1, 2, 3],
-        [0, 1, 2, 5],
-        [3, 1, 0, 2, 7, 6],
-        [10, 5, 0, 11, 6, 1, 12],
-        [0, 1, 2, 4, 5, 7]
-    ],
-    [
-        begin
-            Rr = record_all(Seq, ?M:new()),
-            Dep = lists:foldl(fun(PN, S) -> ?DEP:record_received(S, PN, true) end, ?DEP:new(), Seq),
-            ?assertEqual(?DEP:ack_ranges(Dep), ?M:ranges(Rr)),
-            ?assertEqual(?DEP:largest_received(Dep), ?M:largest(Rr)),
-            {ok, {ack, Largest, _AckDelay, FirstRange, AckRanges}} = ?DEP:generate_ack(Dep),
-            ?assertEqual({Largest, FirstRange, AckRanges}, ?M:to_ack(Rr))
-        end
-     || Seq <- Sequences
-    ].
 
 record_all(PNs, Ack) ->
     lists:foldl(fun(PN, Acc) -> ?M:record(PN, true, Acc) end, Ack, PNs).

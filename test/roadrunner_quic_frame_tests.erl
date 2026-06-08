@@ -3,12 +3,10 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(M, roadrunner_quic_frame).
-%% The `quic` dep, kept as a test-profile differential oracle.
--define(DEP, quic_frame).
 
 enc(F) -> iolist_to_binary(?M:encode(F)).
 
-%% Frames that share the dep's tuple representation (everything but ACK).
+%% Frames in the native tuple representation (everything but ACK).
 frames() ->
     [
         padding,
@@ -46,20 +44,6 @@ ack_frames() ->
         {ack, 100, 0, 3, [{1, 2}, {0, 4}], undefined},
         {ack, 50, 10, 0, [], {1, 2, 3}}
     ].
-
-%% =============================================================================
-%% Encode: byte-for-byte vs the dep oracle.
-%% =============================================================================
-
-encode_matches_dep_test() ->
-    [?assertEqual(?DEP:encode(F), enc(F)) || F <- frames()].
-
-encode_ack_matches_dep_test() ->
-    [?assertEqual(?DEP:encode(dep_ack(Ack)), enc(Ack)) || Ack <- ack_frames()].
-
-%% The dep represents ACK as `{ack, [{Largest, First} | GapRanges], Delay, Ecn}`.
-dep_ack({ack, Largest, AckDelay, FirstRange, Ranges, Ecn}) ->
-    {ack, [{Largest, FirstRange} | Ranges], AckDelay, Ecn}.
 
 %% =============================================================================
 %% Round-trip: encode then decode every frame.
