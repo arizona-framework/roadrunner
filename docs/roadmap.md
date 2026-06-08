@@ -402,6 +402,43 @@ keyed on client IP all depend on it.
 listener opt), plus threading the parsed address into the request's peer
 field across h1, h2, and h3.
 
+### Decide handler 1xx response handling uniformly — small
+
+**What:** A handler that returns a status of 100..199 has it sent as the
+FINAL response (headers + end-of-stream) on h1, h2, and h3 alike, via three
+identical `Status >= 100, Status =< 599` guards (`roadrunner_http1:865`,
+`roadrunner_http2_stream_worker`, `roadrunner_http3_stream_worker`). A 1xx is
+interim (RFC 9110 §15.2): it cannot carry content or terminate the response,
+and a final response must follow. The single-response handler API cannot
+express "interim 1xx then final", so a returned 1xx is always a misuse. Pick
+ONE cross-protocol behavior: reject it (answer 500, log) or add a real
+interim-response mechanism.
+
+**Why deferred:** legitimate interim 1xx is already automatic where it matters
+(h1 `Expect: 100-continue` via `roadrunner_conn:maybe_send_continue`); a
+handler returning a 1xx is rare, and the current uniform behavior is at least
+consistent. It is a deliberate framework-wide decision, not an h3-only patch
+(which would diverge from h1/h2). Surfaced by the post-merge HTTP/3 review.
+
+**Scope:** small, but touches the three response paths together.
+
+### Cap outbound response header size — small
+
+**What:** h1/h2/h3 all cap INBOUND headers (the security-relevant direction,
+against untrusted clients: h3 answers 431, h1/h2 their own limits) but none
+bounds an OUTBOUND response header block, so a handler emitting a
+pathologically large header set produces an unbounded HEADERS frame. A
+self-cap (e.g. at the listener's `max_header_block`) answering 500 on overflow
+would bound it.
+
+**Why deferred:** outbound headers come from trusted handler code, not an
+untrusted peer, so the memory/abuse risk is low and the inbound caps already
+cover the attack surface. This is distinct from honoring the peer's advertised
+`SETTINGS_MAX_FIELD_SECTION_SIZE` (a separate SHOULD in the protocol sections).
+Surfaced by the post-merge HTTP/3 review.
+
+**Scope:** small, cross-protocol (the same response paths as the 1xx item).
+
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>
