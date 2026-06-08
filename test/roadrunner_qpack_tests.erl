@@ -80,6 +80,13 @@ name_reference_every_static_name_test() ->
      || Name <- Names
     ].
 
+%% RFC 9204 Appendix A index 2 is `age: 0`. The dep's static table has a `:age`
+%% typo at this index, so it is pinned to the RFC directly, NOT cross-checked
+%% against the dep oracle (a full match must encode as the bare index-2 line).
+static_index_2_is_age_test() ->
+    ?assertEqual({ok, [{~"age", ~"0"}]}, ?M:decode(indexed_section(2))),
+    ?assertEqual(indexed_section(2), enc([{~"age", ~"0"}])).
+
 %% A name absent from the table encodes as a Literal with Literal Name.
 literal_literal_name_test() ->
     H = [{~"x-totally-unknown", ~"value"}],
