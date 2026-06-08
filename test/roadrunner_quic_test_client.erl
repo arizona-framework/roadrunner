@@ -17,6 +17,13 @@
 -export([seal/6, seal_raw/6]).
 -export([crypto_bytes/4, frames/4]).
 -export([server_hello_key_share/1, deframe_all/1]).
+-export([
+    parse_server_hello/1,
+    parse_encrypted_extensions/1,
+    parse_certificate/1,
+    parse_certificate_verify/1,
+    parse_finished/1
+]).
 
 %% TLS handshake message types (RFC 8446 §4).
 -define(CLIENT_HELLO, 1).
@@ -184,15 +191,11 @@ level_frames(Datagram, Level, Keys, DCIDLen) ->
 %% Handshake-message decoding
 %% =============================================================================
 
--doc "The server's x25519 public key from a ServerHello's key_share extension.".
+-doc "The server's x25519 public key from a (framed) ServerHello's key_share extension.".
 -spec server_hello_key_share(binary()) -> binary().
 server_hello_key_share(ServerHello) ->
     [{?SERVER_HELLO, Body} | _] = deframe_all(ServerHello),
-    <<_LegacyVersion:16, _Random:32/binary, SessionLen:8, _Session:SessionLen/binary, _Cipher:16,
-        _Compression:8, _ExtsLen:16, Extensions/binary>> = Body,
-    <<?GROUP_X25519:16, KeyLen:16, PubKey:KeyLen/binary>> =
-        extract_extension(?EXT_KEY_SHARE, Extensions),
-    PubKey.
+    maps:get(key_share, parse_server_hello(Body)).
 
 extract_extension(Type, <<Type:16, Len:16, Data:Len/binary, _Rest/binary>>) ->
     Data;
@@ -209,3 +212,72 @@ deframe_all_bin(<<>>) ->
 deframe_all_bin(Bin) ->
     {ok, {Type, Body}, Rest} = roadrunner_quic_tls_handshake:decode(Bin),
     [{Type, Body} | deframe_all_bin(Rest)].
+
+%% =============================================================================
+%% Server-flight parsing (the client mirror of the server-side build,
+%% RFC 8446 §4.1.3/§4.3.1/§4.4). Each takes a deframed handshake-message body.
+%% These parse trusted server output in tests, so they pattern-match strictly
+%% and let it crash on a malformed buffer rather than returning `{error, _}`.
+%% =============================================================================
+
+-doc "ServerHello body: the server random, echoed session id, selected cipher, and x25519 key share.".
+-spec parse_server_hello(binary()) ->
+    #{
+        random := binary(),
+        session_id := binary(),
+        cipher := non_neg_integer(),
+        key_share := binary()
+    }.
+parse_server_hello(Body) ->
+    <<?LEGACY_VERSION:16, Random:32/binary, SidLen:8, SessionId:SidLen/binary, Cipher:16, 0:8,
+        ExtsLen:16, Exts:ExtsLen/binary>> = Body,
+    <<?GROUP_X25519:16, KeyLen:16, KeyShare:KeyLen/binary>> =
+        extract_extension(?EXT_KEY_SHARE, Exts),
+    #{random => Random, session_id => SessionId, cipher => Cipher, key_share => KeyShare}.
+
+-doc "EncryptedExtensions body: the selected ALPN protocol and decoded QUIC transport parameters, each present when the server sent it.".
+-spec parse_encrypted_extensions(binary()) ->
+    #{
+        alpn => binary(), transport_params => roadrunner_quic_transport_params:params()
+    }.
+parse_encrypted_extensions(<<ExtsLen:16, Exts:ExtsLen/binary>>) ->
+    ExtMap = extension_map(Exts),
+    add_transport_params(ExtMap, add_alpn(ExtMap, #{})).
+
+add_alpn(#{?EXT_ALPN := <<_ListLen:16, NameLen:8, Proto:NameLen/binary>>}, Acc) ->
+    Acc#{alpn => Proto};
+add_alpn(#{}, Acc) ->
+    Acc.
+
+add_transport_params(#{?EXT_QUIC_TRANSPORT_PARAMS := Data}, Acc) ->
+    {ok, Params} = roadrunner_quic_transport_params:decode(Data),
+    Acc#{transport_params => Params};
+add_transport_params(#{}, Acc) ->
+    Acc.
+
+-doc "Certificate body: the DER certificate chain, leaf first (RFC 8446 §4.4.2).".
+-spec parse_certificate(binary()) -> [binary()].
+parse_certificate(<<CtxLen:8, _Ctx:CtxLen/binary, ListLen:24, List:ListLen/binary>>) ->
+    cert_entries(List).
+
+cert_entries(<<>>) ->
+    [];
+cert_entries(<<CertLen:24, Cert:CertLen/binary, ExtLen:16, _Exts:ExtLen/binary, Rest/binary>>) ->
+    [Cert | cert_entries(Rest)].
+
+-doc "CertificateVerify body: the signature scheme and signature bytes (RFC 8446 §4.4.3).".
+-spec parse_certificate_verify(binary()) -> {non_neg_integer(), binary()}.
+parse_certificate_verify(<<Scheme:16, SigLen:16, Signature:SigLen/binary>>) ->
+    {Scheme, Signature}.
+
+-doc "Finished body: the verify_data MAC itself (RFC 8446 §4.4.4).".
+-spec parse_finished(binary()) -> binary().
+parse_finished(VerifyData) ->
+    VerifyData.
+
+%% A lenient type => data map of an extension vector, for the optional
+%% EncryptedExtensions extensions.
+extension_map(<<>>) ->
+    #{};
+extension_map(<<Type:16, Len:16, Data:Len/binary, Rest/binary>>) ->
+    (extension_map(Rest))#{Type => Data}.
