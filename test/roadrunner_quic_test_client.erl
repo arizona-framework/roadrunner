@@ -244,11 +244,15 @@ parse_server_hello(Body) ->
         extract_extension(?EXT_KEY_SHARE, Exts),
     #{random => Random, session_id => SessionId, cipher => Cipher, key_share => KeyShare}.
 
--doc "EncryptedExtensions body: the selected ALPN protocol and decoded QUIC transport parameters, each present when the server sent it.".
--spec parse_encrypted_extensions(binary()) ->
-    #{
-        alpn => binary(), transport_params => roadrunner_quic_transport_params:params()
-    }.
+-doc """
+EncryptedExtensions body: the selected ALPN protocol and the server's raw
+QUIC transport-parameters bytes, each present when the server sent it. The
+parameters are kept as raw bytes rather than decoded: the production decoder
+is the server's (it rejects the server-only parameters a server legitimately
+sends, e.g. original_destination_connection_id), and the test client does
+not need to interpret them (it sends within the generous default windows).
+""".
+-spec parse_encrypted_extensions(binary()) -> #{alpn => binary(), transport_params => binary()}.
 parse_encrypted_extensions(<<ExtsLen:16, Exts:ExtsLen/binary>>) ->
     ExtMap = extension_map(Exts),
     add_transport_params(ExtMap, add_alpn(ExtMap, #{})).
@@ -259,8 +263,7 @@ add_alpn(#{}, Acc) ->
     Acc.
 
 add_transport_params(#{?EXT_QUIC_TRANSPORT_PARAMS := Data}, Acc) ->
-    {ok, Params} = roadrunner_quic_transport_params:decode(Data),
-    Acc#{transport_params => Params};
+    Acc#{transport_params => Data};
 add_transport_params(#{}, Acc) ->
     Acc.
 

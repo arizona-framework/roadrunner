@@ -31,7 +31,12 @@ encrypted_extensions_round_trip_test() ->
     [{8, Body}] = ?C:deframe_all(Framed),
     Parsed = ?C:parse_encrypted_extensions(Body),
     ?assertEqual(~"h3", maps:get(alpn, Parsed)),
-    ?assertEqual(Params, maps:get(transport_params, Parsed)).
+    %% The transport parameters are captured as raw bytes (the client does not
+    %% decode them); they equal the server's encoding.
+    ?assertEqual(
+        iolist_to_binary(roadrunner_quic_transport_params:encode(Params)),
+        maps:get(transport_params, Parsed)
+    ).
 
 encrypted_extensions_absent_extensions_test() ->
     %% No ALPN, no transport params: both keys are simply absent.

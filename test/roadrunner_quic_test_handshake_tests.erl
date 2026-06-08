@@ -50,9 +50,13 @@ full_handshake_round_trip_test() ->
 
     %% The client derived the same ordered key installs as the server.
     ?assertEqual(ServerInstalls, maps:get(installs, Result)),
-    %% The client learned the negotiated ALPN and the server's transport params.
+    %% The client learned the negotiated ALPN and the server's transport
+    %% params (captured as raw bytes, equal to the server's encoding).
     ?assertEqual(~"h3", maps:get(alpn, Result)),
-    ?assertEqual(ServerParams, maps:get(peer_transport_params, Result)),
+    ?assertEqual(
+        iolist_to_binary(roadrunner_quic_transport_params:encode(ServerParams)),
+        maps:get(peer_transport_params, Result)
+    ),
     %% The server accepts the client's Finished.
     [{20, ClientFinishedBody}] = ?TC:deframe_all(maps:get(client_finished, Result)),
     ?assertEqual(ok, ?SERVER:process_client_finished(ClientFinishedBody, ServerState1)).
