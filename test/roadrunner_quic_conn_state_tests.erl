@@ -29,6 +29,11 @@
 %% is seeded from the advertised value rather than that default.
 -define(CONN_RECV_WINDOW, 2000).
 -define(STREAM_RECV_WINDOW, 1000).
+%% Advertised stream-count limits (RFC 9000 §4.6), small and distinct so a
+%% bidi/uni mix-up is caught. Existing tests open client-bidi ordinals 0..2
+%% (stream ids 0, 4, 8), so the bidi limit must leave those within range.
+-define(MAX_STREAMS_BIDI, 3).
+-define(MAX_STREAMS_UNI, 2).
 
 %% =============================================================================
 %% Construction
@@ -507,6 +512,52 @@ reset_stream_on_server_initiated_id_closes_test() ->
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, stream_state_error}}}], emits(Effects)).
 
+stream_over_advertised_bidi_count_closes_test() ->
+    %% RFC 9000 §4.6: a client bidi stream whose ordinal (id div 4) reaches the
+    %% advertised initial_max_streams_bidi is a STREAM_LIMIT_ERROR, transmitted
+    %% at the 1-RTT level with wire code 0x04 (not the larger no-limit default).
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    OverLimit = ?MAX_STREAMS_BIDI * 4,
+    Bad = app_datagram([{stream, OverLimit, 0, ~"x", true}], 0, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, stream_limit_error}}}], emits(Effects)),
+    ExpectedCode = roadrunner_quic_error:code_int(stream_limit_error),
+    ?assert(
+        lists:member(
+            {connection_close, transport, ExpectedCode, 0, <<>>},
+            sent_app_frames(Effects, ServerApSecret)
+        )
+    ).
+
+stream_over_advertised_uni_count_closes_test() ->
+    %% Same §4.6 limit on client unidirectional streams (rem 4 == 2), against the
+    %% distinct initial_max_streams_uni.
+    {State, ApSecret} = connected_with_owner(),
+    OverLimit = ?MAX_STREAMS_UNI * 4 + 2,
+    Bad = app_datagram([{stream, OverLimit, 0, ~"x", true}], 0, ApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, stream_limit_error}}}], emits(Effects)).
+
+reset_over_advertised_bidi_count_closes_test() ->
+    %% A RESET_STREAM on an over-limit client bidi id is the same §4.6 error.
+    {State, ApSecret} = connected_with_owner(),
+    OverLimit = ?MAX_STREAMS_BIDI * 4,
+    Bad = app_datagram([{reset_stream, OverLimit, 7, 0}], 0, ApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, stream_limit_error}}}], emits(Effects)).
+
+reset_over_advertised_uni_count_closes_test() ->
+    %% A RESET_STREAM on an over-limit client uni id, against initial_max_streams_uni.
+    {State, ApSecret} = connected_with_owner(),
+    OverLimit = ?MAX_STREAMS_UNI * 4 + 2,
+    Bad = app_datagram([{reset_stream, OverLimit, 7, 0}], 0, ApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, stream_limit_error}}}], emits(Effects)).
+
 stream_final_size_violation_closes_test() ->
     %% A FIN declaring a final size below the bytes already received is an
     %% RFC 9000 §4.5 connection error.
@@ -982,7 +1033,9 @@ transport_params() ->
         initial_source_connection_id => ?SCID,
         initial_max_data => ?CONN_RECV_WINDOW,
         initial_max_stream_data_bidi_remote => ?STREAM_RECV_WINDOW,
-        initial_max_stream_data_uni => ?STREAM_RECV_WINDOW
+        initial_max_stream_data_uni => ?STREAM_RECV_WINDOW,
+        initial_max_streams_bidi => ?MAX_STREAMS_BIDI,
+        initial_max_streams_uni => ?MAX_STREAMS_UNI
     }.
 
 %% The connected payload conn_state caches at new/1 (alpn + advertised params).

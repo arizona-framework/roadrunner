@@ -105,6 +105,12 @@
     %% §2.1: server uni ids are 3, 7, 11, ...); the owner opens its h3
     %% control stream this way.
     next_uni = 3 :: non_neg_integer(),
+    %% The stream counts we advertised the peer may open
+    %% (initial_max_streams_bidi/uni, RFC 9000 §4.6): a client-initiated stream
+    %% whose ordinal (id div 4) is >= the limit for its type is a
+    %% STREAM_LIMIT_ERROR.
+    max_streams_bidi :: non_neg_integer(),
+    max_streams_uni :: non_neg_integer(),
     %% Connection-level flow control (RFC 9000 §4).
     conn_flow :: roadrunner_quic_flow:t(),
     %% Owner events accumulated while folding a datagram's frames, drained in
@@ -208,10 +214,14 @@ new(
         server_random => ServerRandom,
         peer_scid => PeerSCID
     }),
-    %% Seed the connection receive window from the limit we advertise, so the
-    %% window enforced (RFC 9000 §4.1) is exactly the one the peer was told it
-    %% may use, never a smaller hardcoded default it would trip early on.
-    #{initial_max_data := ConnMaxData} = TransportParams,
+    %% Seed the connection receive window and the stream-count limits from the
+    %% values we advertise, so what is enforced (RFC 9000 §4.1 / §4.6) is exactly
+    %% what the peer was told it may use, never a hardcoded default.
+    #{
+        initial_max_data := ConnMaxData,
+        initial_max_streams_bidi := MaxStreamsBidi,
+        initial_max_streams_uni := MaxStreamsUni
+    } = TransportParams,
     #state{
         dcid = DCID,
         scid = SCID,
@@ -224,6 +234,8 @@ new(
         amp = roadrunner_quic_amp:new(),
         owner = undefined,
         info = #{alpn => Alpn, transport_params => TransportParams},
+        max_streams_bidi = MaxStreamsBidi,
+        max_streams_uni = MaxStreamsUni,
         conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ConnMaxData}),
         idle_deadline = Now + ?IDLE_TIMEOUT
     }.
@@ -671,6 +683,14 @@ process_ack(Now, Level, Ack, State) ->
 -spec process_stream(non_neg_integer(), non_neg_integer(), binary(), boolean(), t()) -> t().
 process_stream(Sid, _Offset, _Data, _Fin, State) when Sid rem 4 =:= 1; Sid rem 4 =:= 3 ->
     connection_fatal(application, stream_state_error, State);
+process_stream(Sid, _Offset, _Data, _Fin, #state{max_streams_bidi = Max} = State) when
+    Sid rem 4 =:= 0, Sid div 4 >= Max
+->
+    connection_fatal(application, stream_limit_error, State);
+process_stream(Sid, _Offset, _Data, _Fin, #state{max_streams_uni = Max} = State) when
+    Sid rem 4 =:= 2, Sid div 4 >= Max
+->
+    connection_fatal(application, stream_limit_error, State);
 process_stream(Sid, Offset, Data, Fin, State) ->
     {Stream0, StreamFlow0, State1} = ensure_stream(Sid, State),
     #state{conn_flow = ConnFlow} = State1,
@@ -692,6 +712,14 @@ process_stream(Sid, Offset, Data, Fin, State) ->
 -spec process_reset_stream(non_neg_integer(), non_neg_integer(), non_neg_integer(), t()) -> t().
 process_reset_stream(Sid, _ErrorCode, _FinalSize, State) when Sid rem 4 =:= 1; Sid rem 4 =:= 3 ->
     connection_fatal(application, stream_state_error, State);
+process_reset_stream(Sid, _ErrorCode, _FinalSize, #state{max_streams_bidi = Max} = State) when
+    Sid rem 4 =:= 0, Sid div 4 >= Max
+->
+    connection_fatal(application, stream_limit_error, State);
+process_reset_stream(Sid, _ErrorCode, _FinalSize, #state{max_streams_uni = Max} = State) when
+    Sid rem 4 =:= 2, Sid div 4 >= Max
+->
+    connection_fatal(application, stream_limit_error, State);
 process_reset_stream(Sid, ErrorCode, FinalSize, State) ->
     {Stream0, Flow, State1} = ensure_stream(Sid, State),
     case roadrunner_quic_stream:reset(FinalSize, Stream0) of
@@ -730,6 +758,7 @@ close_code(Reason) when
     Reason =:= flow_control_error;
     Reason =:= final_size_error;
     Reason =:= stream_state_error;
+    Reason =:= stream_limit_error;
     Reason =:= protocol_violation;
     Reason =:= transport_parameter_error
 ->
