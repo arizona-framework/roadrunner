@@ -21,9 +21,14 @@
 %%   malformed request.
 %% - Pseudo-headers other than the four defined are rejected.
 %% - `:path` MUST NOT be empty.
-%% - Header field names are lowercase — `roadrunner_qpack:decode/1` returns
-%%   them as received, and an h3 client MUST send them lowercase.
+%% - Regular field names MUST be lowercase; an uppercase character makes the
+%%   request malformed (RFC 9114 §4.2).
 %% - Connection-specific headers MUST NOT appear (RFC 9114 §4.2).
+%% - The request MUST carry an `:authority` pseudo-header or a `host` header
+%%   (https has a mandatory authority component); if present neither is empty,
+%%   and if both appear they MUST match (RFC 9114 §4.3.1).
+%% - A `content-length` header MUST equal the received body length and MUST NOT
+%%   be repeated (RFC 9114 §4.1.2, RFC 9110 §8.6).
 
 -export([from_headers/3]).
 
@@ -35,7 +40,12 @@
     | unknown_pseudo_header
     | pseudo_after_regular
     | empty_path
-    | connection_specific_header.
+    | connection_specific_header
+    | uppercase_field_name
+    | content_length_mismatch
+    | missing_authority
+    | empty_authority
+    | authority_mismatch.
 
 -type request_context() :: #{
     peer := {inet:ip_address(), inet:port_number()} | undefined,
@@ -70,6 +80,8 @@ from_headers(Headers, Body, RequestContext) ->
         %% QUIC) since clients can lie about the pseudo-header value.
         {ok, Method, _Scheme, Path, Authority} ?= validate_pseudo(Pseudo),
         ok ?= check_banned(Regular),
+        ok ?= check_content_length(Regular, Body),
+        ok ?= check_authority(Authority, Regular),
         {ok, build(Method, Path, Authority, Regular, Body, RequestContext)}
     end.
 
@@ -143,16 +155,99 @@ validate_pseudo(Pseudo) ->
 %% the hot path branch-friendly: the BEAM compiles the literal-binary
 %% clauses to a hash/select, no `lists:member` call per header.
 -spec check_banned(roadrunner_http:headers()) ->
-    ok | {error, connection_specific_header}.
-check_banned([]) -> ok;
-check_banned([{~"connection", _} | _]) -> {error, connection_specific_header};
-check_banned([{~"keep-alive", _} | _]) -> {error, connection_specific_header};
-check_banned([{~"proxy-connection", _} | _]) -> {error, connection_specific_header};
-check_banned([{~"transfer-encoding", _} | _]) -> {error, connection_specific_header};
-check_banned([{~"upgrade", _} | _]) -> {error, connection_specific_header};
-check_banned([{~"te", ~"trailers"} | Rest]) -> check_banned(Rest);
-check_banned([{~"te", _} | _]) -> {error, connection_specific_header};
-check_banned([_ | Rest]) -> check_banned(Rest).
+    ok | {error, connection_specific_header | uppercase_field_name}.
+check_banned([]) ->
+    ok;
+check_banned([{~"connection", _} | _]) ->
+    {error, connection_specific_header};
+check_banned([{~"keep-alive", _} | _]) ->
+    {error, connection_specific_header};
+check_banned([{~"proxy-connection", _} | _]) ->
+    {error, connection_specific_header};
+check_banned([{~"transfer-encoding", _} | _]) ->
+    {error, connection_specific_header};
+check_banned([{~"upgrade", _} | _]) ->
+    {error, connection_specific_header};
+check_banned([{~"te", ~"trailers"} | Rest]) ->
+    check_banned(Rest);
+check_banned([{~"te", _} | _]) ->
+    {error, connection_specific_header};
+check_banned([{Name, _} | Rest]) ->
+    %% Any other name is not connection-specific, but RFC 9114 §4.2 makes a
+    %% request with an uppercase field name malformed; the banned literals
+    %% above are already lowercase, so only these unrecognised names need the
+    %% scan. Folding it here keeps one pass over the regular headers.
+    case lower_name(Name) of
+        ok -> check_banned(Rest);
+        {error, _} = Error -> Error
+    end.
+
+%% Reject any uppercase ASCII letter in a regular field name (RFC 9114 §4.2:
+%% uppercase field names MUST be treated as malformed). Mirrors
+%% roadrunner_http2_hpack:validate_lower/1.
+-spec lower_name(binary()) -> ok | {error, uppercase_field_name}.
+lower_name(<<>>) -> ok;
+lower_name(<<C, _/binary>>) when C >= $A, C =< $Z -> {error, uppercase_field_name};
+lower_name(<<_, Rest/binary>>) -> lower_name(Rest).
+
+%% RFC 9114 §4.1.2 / RFC 9110 §8.6: a `content-length` header whose value does
+%% not equal the bytes received in DATA frames (or a multi-valued or
+%% non-integer value) makes the request malformed; an absent header is always
+%% acceptable. Single-pass walk; the body size is taken only when a value is
+%% actually present. Mirrors roadrunner_conn_loop_http2:content_length_matches/2.
+-spec check_content_length(roadrunner_http:headers(), iodata()) ->
+    ok | {error, content_length_mismatch}.
+check_content_length(Headers, Body) ->
+    case find_content_length(Headers, undefined) of
+        none ->
+            ok;
+        multiple ->
+            {error, content_length_mismatch};
+        Value ->
+            BodyLen = iolist_size(Body),
+            try binary_to_integer(Value) of
+                BodyLen -> ok;
+                _ -> {error, content_length_mismatch}
+            catch
+                error:badarg -> {error, content_length_mismatch}
+            end
+    end.
+
+-spec find_content_length(roadrunner_http:headers(), binary() | undefined) ->
+    binary() | none | multiple.
+find_content_length([], undefined) ->
+    none;
+find_content_length([], Value) ->
+    Value;
+find_content_length([{~"content-length", _} | _], Value) when Value =/= undefined -> multiple;
+find_content_length([{~"content-length", Value} | Rest], undefined) ->
+    find_content_length(Rest, Value);
+find_content_length([_ | Rest], Value) ->
+    find_content_length(Rest, Value).
+
+%% RFC 9114 §4.3.1: over QUIC the scheme is always https (a mandatory authority
+%% component), so the request MUST carry an `:authority` pseudo-header or a
+%% `host` header; if present neither is empty, and if both appear they MUST
+%% match. The empty-value clauses precede the equality clause so an empty value
+%% loses even when both sides are equally empty.
+-spec check_authority(binary() | undefined, roadrunner_http:headers()) ->
+    ok | {error, missing_authority | empty_authority | authority_mismatch}.
+check_authority(Authority, Regular) ->
+    case {Authority, find_host(Regular)} of
+        {undefined, undefined} -> {error, missing_authority};
+        {~"", _} -> {error, empty_authority};
+        {_, ~""} -> {error, empty_authority};
+        {Same, Same} -> ok;
+        {_, undefined} -> ok;
+        {undefined, _} -> ok;
+        {_, _} -> {error, authority_mismatch}
+    end.
+
+%% The first `host` header value, or `undefined`.
+-spec find_host(roadrunner_http:headers()) -> binary() | undefined.
+find_host([]) -> undefined;
+find_host([{~"host", Value} | _]) -> Value;
+find_host([_ | Rest]) -> find_host(Rest).
 
 -spec build(
     binary(),
@@ -164,12 +259,14 @@ check_banned([_ | Rest]) -> check_banned(Rest).
 ) -> roadrunner_req:request().
 build(Method, Path, Authority, Regular, Body, RequestContext) ->
     %% Forward `:authority` as a `host` header so existing handler code
-    %% that reads `Host` still works (RFC 9114 §4.3.1 treats
-    %% `:authority` like `Host`).
+    %% that reads `Host` still works (RFC 9114 §4.3.1 treats `:authority`
+    %% like `Host`). When the client also sent a (validated equal) `host`
+    %% header, drop it first so a single canonical entry survives instead
+    %% of a duplicate.
     HeadersWithHost =
         case Authority of
             undefined -> Regular;
-            _ -> [{~"host", Authority} | Regular]
+            _ -> [{~"host", Authority} | lists:keydelete(~"host", 1, Regular)]
         end,
     %% The conn loop always builds `RequestContext` with all four
     %% fields populated, so pattern-matching wins vs. four `maps:get/3`.
