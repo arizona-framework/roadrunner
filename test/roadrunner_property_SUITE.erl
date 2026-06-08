@@ -41,8 +41,11 @@ Add a new property:
     quic_ack_matches_dep/1,
     quic_loss_rtt_matches_dep/1,
     quic_loss_matches_dep/1,
+    quic_loss_rtt_pto_invariants/1,
+    quic_loss_classification_invariants/1,
     quic_cc_newreno_invariants/1,
     quic_flow_matches_dep/1,
+    quic_flow_invariants/1,
     quic_tls_crypto_matches_dep/1,
     quic_tls_handshake_matches_dep/1,
     quic_transport_params_matches_dep/1,
@@ -80,8 +83,11 @@ all() ->
         quic_ack_matches_dep,
         quic_loss_rtt_matches_dep,
         quic_loss_matches_dep,
+        quic_loss_rtt_pto_invariants,
+        quic_loss_classification_invariants,
         quic_cc_newreno_invariants,
         quic_flow_matches_dep,
+        quic_flow_invariants,
         quic_tls_crypto_matches_dep,
         quic_tls_handshake_matches_dep,
         quic_transport_params_matches_dep,
@@ -240,6 +246,18 @@ quic_loss_matches_dep(Config) ->
         Config
     ).
 
+quic_loss_rtt_pto_invariants(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_quic_loss_props:prop_rtt_and_pto_invariants(),
+        Config
+    ).
+
+quic_loss_classification_invariants(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_quic_loss_props:prop_loss_classification_invariants(),
+        Config
+    ).
+
 quic_cc_newreno_invariants(Config) ->
     ct_property_test:quickcheck(
         roadrunner_quic_cc_newreno_props:prop_cwnd_never_below_minimum(),
@@ -249,6 +267,12 @@ quic_cc_newreno_invariants(Config) ->
 quic_flow_matches_dep(Config) ->
     ct_property_test:quickcheck(
         roadrunner_quic_flow_props:prop_matches_dep(),
+        Config
+    ).
+
+quic_flow_invariants(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_quic_flow_props:prop_invariants(),
         Config
     ).
 
