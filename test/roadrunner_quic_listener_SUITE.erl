@@ -2,8 +2,8 @@
 -moduledoc """
 Integration tests for `roadrunner_quic_listener`.
 
-A CT suite rather than eunit: the load-bearing case drives the dep `quic`
-client through a real QUIC handshake against the native listener over
+A CT suite rather than eunit: the load-bearing case drives the native QUIC
+client through a real handshake against the native listener over
 loopback, and the process-loop edges (sys/gen messages, monitor cleanup,
 datagram routing) need a live listener process with the suite timetrap as
 an outer guard. The pure routing decision (`classify/2`) is unit-tested in
@@ -15,7 +15,7 @@ an outer guard. The pure routing decision (`classify/2`) is unit-tested in
 
 -export([suite/0, all/0, init_per_suite/1, end_per_suite/1]).
 -export([
-    dep_client_handshakes_through_listener/1,
+    native_client_handshakes_through_listener/1,
     bind_failure_is_reported/1,
     stop_closes_listener/1,
     unsupported_gen_call_replies_error/1,
@@ -37,7 +37,7 @@ suite() ->
 
 all() ->
     [
-        dep_client_handshakes_through_listener,
+        native_client_handshakes_through_listener,
         bind_failure_is_reported,
         stop_closes_listener,
         unsupported_gen_call_replies_error,
@@ -54,10 +54,8 @@ all() ->
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
     {ok, _} = application:ensure_all_started(ssl),
-    %% The dep `quic` app backs the test CLIENT only; the native listener does
-    %% not depend on it. The default `pg` scope hosts the client's drain group,
-    %% started unlinked so it outlives this transient process.
-    {ok, _} = application:ensure_all_started(quic),
+    %% The default `pg` scope hosts a connection owner's drain group; start it
+    %% unlinked so it outlives this transient process.
     ok = ensure_pg_started(),
     Config.
 
@@ -65,14 +63,14 @@ end_per_suite(_Config) ->
     ok.
 
 %% =============================================================================
-%% The dep `quic` client completes a real handshake routed through the native
+%% The native client completes a real handshake routed through the native
 %% listener: this exercises the whole spawn ordering (spawn -> register CIDs ->
 %% run handler -> set_owner_sync -> feed first Initial), the active-socket read
 %% path, and datagram routing (the first Initial spawns, every follow-up
 %% datagram forwards to the registered connection by its server SCID).
 %% =============================================================================
 
-dep_client_handshakes_through_listener(_Config) ->
+native_client_handshakes_through_listener(_Config) ->
     %% Report the spawned owner so it can be torn down with the case rather than
     %% leaking an idle drain process for the rest of the suite run.
     Test = self(),
@@ -83,20 +81,17 @@ dep_client_handshakes_through_listener(_Config) ->
     end,
     {Listener, Port} = start_listener(Handler),
 
-    %% Drive the dep as a raw QUIC client. The QUIC `connected` event fires on
-    %% transport-handshake completion; the H3 SETTINGS exchange belongs to the
-    %% owner (a later slice), so the assertion is at the QUIC layer.
-    {ok, Conn} = quic:connect(
-        ~"127.0.0.1", Port, #{alpn => [~"h3"], verify => verify_none}, self()
-    ),
+    %% A {ok, _} from connect/2 means the full QUIC + TLS 1.3 handshake
+    %% completed (the server's HANDSHAKE_DONE arrived) through the listener.
     Result =
-        receive
-            {quic, Conn, {connected, _Info}} -> ok
-        after 5000 ->
-            timeout
+        case roadrunner_quic_test_conn:connect(?LOOPBACK, Port) of
+            {ok, Conn} ->
+                ok = roadrunner_quic_test_conn:close(Conn),
+                ok;
+            {error, Reason} ->
+                {error, Reason}
         end,
 
-    _ = quic:close(Conn),
     receive
         {owner, Owner} -> exit(Owner, kill)
     after 0 -> ok
