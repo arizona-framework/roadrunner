@@ -205,7 +205,8 @@ new(
         transport_params => TransportParams,
         eph_pub => EphPub,
         eph_priv => EphPriv,
-        server_random => ServerRandom
+        server_random => ServerRandom,
+        peer_scid => PeerSCID
     }),
     %% Seed the connection receive window from the limit we advertise, so the
     %% window enforced (RFC 9000 §4.1) is exactly the one the peer was told it
@@ -729,9 +730,15 @@ close_code(Reason) when
     Reason =:= flow_control_error;
     Reason =:= final_size_error;
     Reason =:= stream_state_error;
-    Reason =:= protocol_violation
+    Reason =:= protocol_violation;
+    Reason =:= transport_parameter_error
 ->
     roadrunner_quic_error:code_int(Reason);
+close_code(missing_transport_params) ->
+    %% RFC 9001 §8.2: a ClientHello without the quic_transport_parameters
+    %% extension MUST close with 0x016d, a CRYPTO_ERROR carrying the TLS
+    %% missing_extension alert (109).
+    roadrunner_quic_error:code_int({crypto_error, 109});
 close_code(_TlsReason) ->
     %% Every other connection_fatal reason is a TLS handshake failure (a
     %% malformed or rejected ClientHello, a bad Finished, or an unexpected

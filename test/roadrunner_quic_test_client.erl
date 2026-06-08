@@ -13,7 +13,7 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -export([key_material/0, gen_keypair/0]).
--export([client_hello_framed/2]).
+-export([client_hello_framed/3]).
 -export([seal/6, seal_raw/6]).
 -export([crypto_bytes/4, frames/4]).
 -export([server_hello_key_share/1, deframe_all/1]).
@@ -29,6 +29,7 @@
 -define(EXT_SIGNATURE_ALGORITHMS, 16#000D).
 -define(EXT_ALPN, 16#0010).
 -define(EXT_KEY_SHARE, 16#0033).
+-define(EXT_QUIC_TRANSPORT_PARAMS, 16#0039).
 
 %% =============================================================================
 %% Key material
@@ -51,16 +52,24 @@ gen_keypair() ->
 
 -doc """
 A framed ClientHello (handshake-message bytes, RFC 8446 §4.1.2) offering
-the given signature scheme, the x25519 key share, and the `h3` ALPN. These
-bytes are both the CRYPTO-frame payload and the first transcript element.
+the given signature scheme, the x25519 key share, the `h3` ALPN, and a
+quic_transport_parameters extension carrying `ClientSCID` as the
+`initial_source_connection_id` (the server checks it against the client's
+Initial SCID, RFC 9000 §7.3, and requires the extension's presence, RFC 9001
+§8.2). `ClientSCID = none` omits the extension entirely, to exercise the §8.2
+missing-extension path. These bytes are both the CRYPTO-frame payload and the
+first transcript element.
 """.
--spec client_hello_framed(Scheme :: non_neg_integer(), ClientPub :: binary()) -> binary().
-client_hello_framed(Scheme, ClientPub) ->
+-spec client_hello_framed(
+    Scheme :: non_neg_integer(), ClientPub :: binary(), ClientSCID :: binary() | none
+) -> binary().
+client_hello_framed(Scheme, ClientPub, ClientSCID) ->
     Random = crypto:strong_rand_bytes(32),
     Extensions = iolist_to_binary([
         signature_algorithms_ext([Scheme]),
         alpn_ext(~"h3"),
-        key_share_ext(ClientPub)
+        key_share_ext(ClientPub),
+        transport_params_ext(ClientSCID)
     ]),
     CipherSuites = <<?CIPHER_AES_128_GCM_SHA256:16>>,
     Body =
@@ -79,6 +88,17 @@ alpn_ext(Protocol) ->
 key_share_ext(PubKey) ->
     Entry = <<?GROUP_X25519:16, (byte_size(PubKey)):16, PubKey/binary>>,
     extension(?EXT_KEY_SHARE, <<(byte_size(Entry)):16, Entry/binary>>).
+
+%% A quic_transport_parameters extension carrying just the client's
+%% initial_source_connection_id, encoded with the production codec so the wire
+%% bytes stay authoritative. `none` emits no extension at all.
+transport_params_ext(none) ->
+    <<>>;
+transport_params_ext(ClientSCID) ->
+    Body = iolist_to_binary(
+        roadrunner_quic_transport_params:encode(#{initial_source_connection_id => ClientSCID})
+    ),
+    extension(?EXT_QUIC_TRANSPORT_PARAMS, Body).
 
 extension(Type, Data) ->
     <<Type:16, (byte_size(Data)):16, Data/binary>>.

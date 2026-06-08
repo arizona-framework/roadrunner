@@ -241,7 +241,7 @@ config(Peer) ->
     }}.
 
 client_hello(#{scheme := Scheme, client_pub := ClientPub}) ->
-    Framed = ?TC:client_hello_framed(Scheme, ClientPub),
+    Framed = ?TC:client_hello_framed(Scheme, ClientPub, ?SCID),
     Datagram = ?TC:seal(
         initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
     ),

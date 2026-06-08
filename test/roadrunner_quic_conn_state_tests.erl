@@ -214,6 +214,48 @@ malformed_client_hello_closes_test() ->
     ),
     ?assertMatch([{connection_close, transport, _Code, 0, <<>>}], Frames).
 
+initial_scid_mismatch_closes_test() ->
+    %% RFC 9000 §7.3: a client whose initial_source_connection_id does not equal
+    %% the conn's peer_scid (?CLIENT_SCID) closes with transport_parameter_error,
+    %% transmitted at the Initial level with wire code 0x08.
+    {State0, #{scheme := Scheme, client_pub := ClientPub}} = new_conn([~"leaf-cert-der"]),
+    Framed = ?TC:client_hello_framed(Scheme, ClientPub, ?DCID),
+    Datagram = ?TC:seal(
+        initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
+    ),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, transport_parameter_error}}}], emits(Effects)),
+    Frames = ?TC:frames(
+        sends(Effects),
+        initial,
+        #{initial => roadrunner_quic_keys:initial_server(?DCID)},
+        byte_size(?DCID)
+    ),
+    ExpectedCode = roadrunner_quic_error:code_int(transport_parameter_error),
+    ?assertMatch([{connection_close, transport, ExpectedCode, 0, <<>>}], Frames).
+
+missing_transport_params_closes_test() ->
+    %% RFC 9001 §8.2: a ClientHello without the quic_transport_parameters
+    %% extension closes with missing_transport_params, transmitted at the
+    %% Initial level with wire code 0x016d (CRYPTO_ERROR + missing_extension).
+    {State0, #{scheme := Scheme, client_pub := ClientPub}} = new_conn([~"leaf-cert-der"]),
+    Framed = ?TC:client_hello_framed(Scheme, ClientPub, none),
+    Datagram = ?TC:seal(
+        initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
+    ),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, missing_transport_params}}}], emits(Effects)),
+    Frames = ?TC:frames(
+        sends(Effects),
+        initial,
+        #{initial => roadrunner_quic_keys:initial_server(?DCID)},
+        byte_size(?DCID)
+    ),
+    ExpectedCode = roadrunner_quic_error:code_int({crypto_error, 109}),
+    ?assertMatch([{connection_close, transport, ExpectedCode, 0, <<>>}], Frames).
+
 unexpected_handshake_message_closes_test() ->
     %% An out-of-sequence handshake message type closes the connection.
     {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
@@ -922,7 +964,7 @@ new_conn(CertChain) ->
 %% The client Initial datagram and the framed ClientHello it carries (the
 %% first transcript element).
 client_hello_datagram(#{scheme := Scheme, client_pub := ClientPub}) ->
-    Framed = ?TC:client_hello_framed(Scheme, ClientPub),
+    Framed = ?TC:client_hello_framed(Scheme, ClientPub, ?CLIENT_SCID),
     Datagram = ?TC:seal(
         initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
     ),
