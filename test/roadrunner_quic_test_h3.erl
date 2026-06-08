@@ -10,7 +10,7 @@
 %% module's caller (the connection owner), so connect/2 and the request calls
 %% run in the same process.
 
--export([connect/2, close/1, get/2, post/3]).
+-export([connect/2, close/1, get/2, post/3, request/3]).
 
 -define(COLLECT_TIMEOUT, 5000).
 
@@ -42,18 +42,32 @@ close(Conn) ->
 -doc "Issue a GET and collect the response as `{Status, Headers, Body}`.".
 -spec get(pid(), binary()) -> {non_neg_integer(), [{binary(), binary()}], binary()} | timeout.
 get(Conn, Path) ->
-    StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
-    send_headers(Conn, StreamId, headers(~"GET", Path), true),
-    collect(Conn, StreamId, <<>>).
+    request(Conn, headers(~"GET", Path), <<>>).
 
 -doc "Issue a POST with `Body` and collect the response as `{Status, Headers, Body}`.".
 -spec post(pid(), binary(), binary()) ->
     {non_neg_integer(), [{binary(), binary()}], binary()} | timeout.
 post(Conn, Path, Body) ->
+    request(Conn, headers(~"POST", Path), Body).
+
+-doc """
+Issue a request with the given full header list (pseudo-headers included)
+and body on a fresh bidirectional stream, collecting the response as
+`{Status, Headers, Body}`. An empty body finishes the stream on the HEADERS
+frame; a non-empty body finishes on the trailing DATA.
+""".
+-spec request(pid(), [{binary(), binary()}], binary()) ->
+    {non_neg_integer(), [{binary(), binary()}], binary()} | timeout.
+request(Conn, Headers, Body) ->
     StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
-    send_headers(Conn, StreamId, headers(~"POST", Path), false),
-    DataFrame = roadrunner_quic_h3_frame:encode_data(Body),
-    ok = roadrunner_quic_test_conn:send(Conn, StreamId, iolist_to_binary(DataFrame), true),
+    case Body of
+        <<>> ->
+            send_headers(Conn, StreamId, Headers, true);
+        _ ->
+            send_headers(Conn, StreamId, Headers, false),
+            DataFrame = roadrunner_quic_h3_frame:encode_data(Body),
+            ok = roadrunner_quic_test_conn:send(Conn, StreamId, iolist_to_binary(DataFrame), true)
+    end,
     collect(Conn, StreamId, <<>>).
 
 %% =============================================================================

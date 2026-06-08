@@ -451,8 +451,8 @@ preflight_protocol(#{protocol := h2c, servers := Servers} = Opts) ->
 preflight_protocol(#{protocol := h3, servers := Servers} = Opts) ->
     %% QUIC over UDP. Only roadrunner is wired for h3 (cowboy/elli have
     %% no HTTP/3 listener here); QUIC mandates TLS 1.3 so it reuses the
-    %% generated cert, and the bench node needs `quic` + `ssl` started
-    %% for the `quic_h3` client.
+    %% generated cert, and the bench node needs `ssl` started for the
+    %% cert / crypto primitives the native client and server share.
     CertDir = generate_test_cert(),
     Filtered = [S || S <- Servers, S =:= roadrunner],
     case Filtered =/= Servers of
@@ -466,7 +466,6 @@ preflight_protocol(#{protocol := h3, servers := Servers} = Opts) ->
             ok
     end,
     {ok, _} = application:ensure_all_started(ssl),
-    {ok, _} = application:ensure_all_started(quic),
     Opts#{servers => Filtered, cert_dir => CertDir}.
 
 generate_test_cert() ->
