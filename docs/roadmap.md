@@ -51,20 +51,20 @@ only). Remaining work:
 - WebSocket over h3 (`websocket` shape, still `501`) — RFC 9220
   Extended CONNECT; do WebSocket over h2 (RFC 8441) first, since it's
   the more common transport and h2 has no WebSocket either
-- QPACK dynamic table (non-zero capacity) — the `quic` dep has the full
-  RFC 9204 machinery; the work is wiring encoder/decoder streams +
-  section acks + blocked-stream buffering into the owned conn loop
+- QPACK dynamic table (non-zero capacity) — static-table compression ships
+  today; the work is wiring encoder/decoder streams + section acks +
+  blocked-stream buffering into the owned conn loop
 - HttpArena `baseline-h3` / `static-h3` profiles (the local
   `scripts/bench.escript` h3 path is wired and measured; these live in
   the separate `MDA2AV/HttpArena` repo)
 - WebTransport / Extended CONNECT (RFC 9220) and HTTP datagrams
-  (RFC 9297), both already provided by the dep
+  (RFC 9297)
 - A scheduler-scaled default for the reuseport pool size
   (`{http3, #{listeners => N}}`, validated `1..1024`, default 8,
   `1` = no pooling); currently unmeasured
 - Full RFC 9000 connection-ID rotation: issuing spare server CIDs and
-  registering them so packets using them route. A currently-unwired
-  dep feature, a deliberate upstream effort if wanted
+  registering them so packets using them route; currently unimplemented
+  in the native stack
 
 ## Native QUIC transport follow-ups
 
@@ -126,12 +126,12 @@ advisory or malformed cases the server currently tolerates or omits.
 
 ### Retire the dep
 
+`quic` is now production-free (test-profile-only; production deps are just
+`telemetry`). The last step to drop it entirely:
+
 - Build a native QUIC test client so the `quic` dep can leave the test profile
-  too; the h3 SUITE + bench drive the native server with the dep's client, its
-  last remaining use — large
-- Then move `quic` out of production `deps` into `profiles.test.deps` and drop
-  it from the dialyzer `plt_extra_apps`, so production deps become
-  `[telemetry]` — small
+  too; the differential-oracle tests, the h3 SUITE's CT client, and the bench
+  client are its only remaining users — large
 
 ### Known dep deviation (informational)
 

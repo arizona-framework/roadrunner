@@ -28,10 +28,9 @@ A small, fast HTTP core you can trust on the hot path.
 - **Every HTTP version, one server**: HTTP/1.1, HTTP/2, HTTP/3 (experimental),
   and WebSocket served from one listener; browsers upgrade to h3 over the same
   port via `Alt-Svc`.
-- **Pure Erlang, almost no dependencies**: Two runtime deps (`telemetry` and
-  `quic`, the HTTP/3 transport), no C NIFs, and Roadrunner owns its own
-  h1/h2/h3 codecs: easy to read and audit. `quic` only starts for HTTP/3, so
-  h1/h2 deployments never load it.
+- **Pure Erlang, almost no dependencies**: One runtime dep (`telemetry`),
+  no C NIFs, and Roadrunner owns its own h1/h2/h3 codecs and its own QUIC
+  transport: easy to read and audit.
 - **Pleasant to build on**: Plain-Erlang request and response values, composable
   middleware, and opt-in helpers for cookies, query strings, multipart, SSE, and
   WebSocket.
@@ -68,9 +67,8 @@ Standards conformance:
   static-table compression. Enable per listener via
   `protocols => [http3]` (requires `tls`; QUIC mandates TLS 1.3); it
   co-serves with h1/h2 on the same port number (TCP for h1/h2, UDP for
-  h3) and advertises `Alt-Svc` so browsers upgrade. Built on the
-  pure-Erlang [`quic`](https://github.com/benoitc/erlang_quic) transport
-  (still 1.x), so treat HTTP/3 as experimental.
+  h3) and advertises `Alt-Svc` so browsers upgrade. Roadrunner ships its
+  own pure-Erlang QUIC transport; treat HTTP/3 as experimental.
 - **Content-Encoding (RFC 9110 §8.4.1)**: gzip + deflate with
   qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3),
   works unchanged over HTTP/2.
@@ -261,8 +259,8 @@ the `tls` opt.
 For HTTP/3 (experimental), add `http3` to a TLS listener's `protocols`
 (e.g. `protocols => [http1, http2, http3]`). It serves h3 over UDP on the
 same port number and advertises `Alt-Svc` so browsers upgrade from TCP;
-the `quic` transport starts on demand, so h1/h2-only listeners never load
-it.
+the QUIC transport starts on demand, so h1/h2-only listeners never open a
+UDP socket.
 
 For listeners that don't need routing, `routes => Mod` (or
 `{Mod, State}` to seed handler state) skips the router entirely and
