@@ -18,7 +18,8 @@ clause is unit-tested in `roadrunner_quic_socket_tests`.
     recv_timeout/1,
     open_in_use_errors/1,
     open_with_custom_buffers/1,
-    reuseport_allows_shared_bind/1
+    reuseport_allows_shared_bind/1,
+    active_once_delivers_messages/1
 ]).
 
 -define(LOOPBACK, {127, 0, 0, 1}).
@@ -32,8 +33,48 @@ all() ->
         recv_timeout,
         open_in_use_errors,
         open_with_custom_buffers,
-        reuseport_allows_shared_bind
+        reuseport_allows_shared_bind,
+        active_once_delivers_messages
     ].
+
+%% An `active => once` socket delivers each datagram as one mailbox message,
+%% parsed with from_message/2 and re-armed with activate/1; before re-arming
+%% no further message arrives (one-at-a-time back-pressure).
+active_once_delivers_messages(_Config) ->
+    {ok, Server} = roadrunner_quic_socket:open(0, #{active => once}),
+    {ok, Client} = roadrunner_quic_socket:open(0),
+    {ok, {_, ServerPort}} = roadrunner_quic_socket:sockname(Server),
+    {ok, {_, ClientPort}} = roadrunner_quic_socket:sockname(Client),
+
+    ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, ServerPort, ~"one"),
+    Msg1 =
+        receive
+            M1 -> M1
+        after 1000 -> ct:fail(no_active_message)
+        end,
+    ?assertEqual(
+        {ok, {?LOOPBACK, ClientPort}, ~"one"}, roadrunner_quic_socket:from_message(Server, Msg1)
+    ),
+
+    %% Not re-armed yet: a second datagram buffers but is not delivered.
+    ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, ServerPort, ~"two"),
+    receive
+        Premature -> ct:fail({delivered_before_rearm, Premature})
+    after 200 -> ok
+    end,
+
+    ok = roadrunner_quic_socket:activate(Server),
+    Msg2 =
+        receive
+            M2 -> M2
+        after 1000 -> ct:fail(no_message_after_rearm)
+        end,
+    ?assertEqual(
+        {ok, {?LOOPBACK, ClientPort}, ~"two"}, roadrunner_quic_socket:from_message(Server, Msg2)
+    ),
+
+    ok = roadrunner_quic_socket:close(Server),
+    ok = roadrunner_quic_socket:close(Client).
 
 %% A datagram travels client -> server with its source address, then the
 %% server echoes back to that address. Exercises open/1 (default opts),
