@@ -31,6 +31,7 @@
     encode_version_negotiation/3,
     decode/2,
     dcid/2,
+    long_header_info/1,
     coalesced_split/1,
     pn_offset/2,
     encode_pn/2,
@@ -162,6 +163,27 @@ dcid(<<0:1, _:7, Rest/binary>>, DCIDLen) ->
     end;
 dcid(_, _) ->
     {error, invalid_packet}.
+
+-doc """
+Extract a long-header packet's version and connection ids: the
+version-independent invariant fields (RFC 8999 §5.1), readable for a packet
+whose version the server may not support. The connection-id lengths are read
+as the full 8-bit invariant lengths (not the v1 20-byte limit, `dcid/2`),
+because connection-id rules MUST NOT influence the Version Negotiation
+decision (RFC 9000 §17.2.1). Returns `{error, not_long_header}` for a short
+header and `{error, truncated}` for a clipped long header.
+""".
+-spec long_header_info(binary()) ->
+    {ok, #{version := non_neg_integer(), dcid := binary(), scid := binary()}}
+    | {error, not_long_header | truncated}.
+long_header_info(
+    <<1:1, _:7, Version:32, DCIDLen, DCID:DCIDLen/binary, SCIDLen, SCID:SCIDLen/binary, _/binary>>
+) ->
+    {ok, #{version => Version, dcid => DCID, scid => SCID}};
+long_header_info(<<1:1, _/bitstring>>) ->
+    {error, truncated};
+long_header_info(_) ->
+    {error, not_long_header}.
 
 -doc """
 Split the first packet of a (possibly coalesced) datagram (RFC 9000

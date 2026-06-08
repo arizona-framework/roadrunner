@@ -286,6 +286,39 @@ pn_offset_errors_test() ->
     %% Initial whose Length varint is missing.
     ?assertEqual({error, truncated}, ?M:pn_offset(<<16#C0, ?V1:32, 0, 0, 0>>, 0)).
 
+long_header_info_test() ->
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    SCID = <<9, 9, 9, 9>>,
+    Bin =
+        <<16#C0, 16#FF000001:32, (byte_size(DCID)), DCID/binary, (byte_size(SCID)), SCID/binary,
+            "payload">>,
+    ?assertEqual(
+        {ok, #{version => 16#FF000001, dcid => DCID, scid => SCID}},
+        ?M:long_header_info(Bin)
+    ).
+
+%% Connection ids longer than the v1 20-byte limit are still parsed (the
+%% invariant lengths are a full 8 bits), so an unsupported version carried with
+%% a long connection id can still elicit Version Negotiation (RFC 9000 §17.2.1).
+long_header_info_allows_oversized_cids_test() ->
+    DCID = binary:copy(<<7>>, 30),
+    SCID = binary:copy(<<8>>, 25),
+    Bin = <<16#C0, 16#FF000001:32, (byte_size(DCID)), DCID/binary, (byte_size(SCID)), SCID/binary>>,
+    ?assertEqual(
+        {ok, #{version => 16#FF000001, dcid => DCID, scid => SCID}},
+        ?M:long_header_info(Bin)
+    ).
+
+long_header_info_rejects_short_header_test() ->
+    ?assertEqual({error, not_long_header}, ?M:long_header_info(<<16#40, 1, 2, 3>>)),
+    ?assertEqual({error, not_long_header}, ?M:long_header_info(<<>>)).
+
+long_header_info_truncated_test() ->
+    %% Long header that ends inside the SCID (length 5, only 2 present).
+    ?assertEqual({error, truncated}, ?M:long_header_info(<<16#C0, ?V1:32, 0, 5, 1, 2>>)),
+    %% Long header missing its SCID length byte.
+    ?assertEqual({error, truncated}, ?M:long_header_info(<<16#C0, ?V1:32, 2, 1, 2>>)).
+
 %% =============================================================================
 %% Version Negotiation packet (no dep oracle: the dep randomises the first
 %% byte, so check the structure instead).
