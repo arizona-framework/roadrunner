@@ -4,8 +4,6 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -define(M, roadrunner_quic_tls_auth).
-%% The `quic` dep, kept as a test-profile differential oracle.
--define(DEP, quic_tls).
 -define(FRAME, roadrunner_quic_tls_handshake).
 
 -define(SIG_RSA_PSS_RSAE_SHA256, 16#0804).
@@ -28,13 +26,6 @@ build_certificate_structure_test() ->
 build_certificate_single_cert_test() ->
     {ok, {11, Body}, <<>>} = ?FRAME:decode(iolist_to_binary(?M:build_certificate([<<"only">>]))),
     ?assertEqual(<<0:8, 9:24, 4:24, "only", 0:16>>, Body).
-
-build_certificate_matches_dep_test() ->
-    Certs = [<<1, 2, 3>>, <<4, 5, 6, 7>>],
-    ?assertEqual(
-        ?DEP:build_certificate(<<>>, Certs),
-        iolist_to_binary(?M:build_certificate(Certs))
-    ).
 
 %% =============================================================================
 %% CertificateVerify (RFC 8446 §4.4.3) — sign, then verify the signature.

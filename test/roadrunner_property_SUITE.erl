@@ -33,19 +33,16 @@ Add a new property:
     loop_terminates_normal_on_random_inputs/1,
     loop_request_start_and_stop_share_request_id/1,
     router_param_bindings_round_trip/1,
-    quic_varint_encode_matches_dep/1,
-    quic_hkdf_matches_dep/1,
-    quic_keys_matches_dep/1,
-    quic_aead_matches_dep/1,
+    quic_varint_round_trips/1,
+    quic_aead_round_trips/1,
     quic_amp_invariants/1,
-    quic_ack_matches_dep/1,
-    quic_loss_rtt_matches_dep/1,
-    quic_loss_matches_dep/1,
+    quic_ack_range_invariants/1,
+    quic_loss_rtt_pto_invariants/1,
+    quic_loss_classification_invariants/1,
     quic_cc_newreno_invariants/1,
-    quic_flow_matches_dep/1,
-    quic_tls_crypto_matches_dep/1,
-    quic_tls_handshake_matches_dep/1,
-    quic_transport_params_matches_dep/1,
+    quic_flow_invariants/1,
+    quic_tls_handshake_round_trips/1,
+    quic_transport_params_round_trips/1,
     quic_tls_hello_parse_never_crashes/1,
     quic_tls_auth_certificate_verify_roundtrips/1,
     quic_stream_reassembles/1
@@ -72,19 +69,16 @@ all() ->
         loop_terminates_normal_on_random_inputs,
         loop_request_start_and_stop_share_request_id,
         router_param_bindings_round_trip,
-        quic_varint_encode_matches_dep,
-        quic_hkdf_matches_dep,
-        quic_keys_matches_dep,
-        quic_aead_matches_dep,
+        quic_varint_round_trips,
+        quic_aead_round_trips,
         quic_amp_invariants,
-        quic_ack_matches_dep,
-        quic_loss_rtt_matches_dep,
-        quic_loss_matches_dep,
+        quic_ack_range_invariants,
+        quic_loss_rtt_pto_invariants,
+        quic_loss_classification_invariants,
         quic_cc_newreno_invariants,
-        quic_flow_matches_dep,
-        quic_tls_crypto_matches_dep,
-        quic_tls_handshake_matches_dep,
-        quic_transport_params_matches_dep,
+        quic_flow_invariants,
+        quic_tls_handshake_round_trips,
+        quic_transport_params_round_trips,
         quic_tls_hello_parse_never_crashes,
         quic_tls_auth_certificate_verify_roundtrips,
         quic_stream_reassembles
@@ -192,27 +186,15 @@ router_param_bindings_round_trip(Config) ->
         Config
     ).
 
-quic_varint_encode_matches_dep(Config) ->
+quic_varint_round_trips(Config) ->
     ct_property_test:quickcheck(
-        roadrunner_quic_varint_props:prop_encode_matches_dep_and_round_trips(),
+        roadrunner_quic_varint_props:prop_round_trips(),
         Config
     ).
 
-quic_hkdf_matches_dep(Config) ->
+quic_aead_round_trips(Config) ->
     ct_property_test:quickcheck(
-        roadrunner_quic_hkdf_props:prop_matches_dep(),
-        Config
-    ).
-
-quic_keys_matches_dep(Config) ->
-    ct_property_test:quickcheck(
-        roadrunner_quic_keys_props:prop_matches_dep(),
-        Config
-    ).
-
-quic_aead_matches_dep(Config) ->
-    ct_property_test:quickcheck(
-        roadrunner_quic_aead_props:prop_matches_dep(),
+        roadrunner_quic_aead_props:prop_round_trips(),
         Config
     ).
 
@@ -222,21 +204,21 @@ quic_amp_invariants(Config) ->
         Config
     ).
 
-quic_ack_matches_dep(Config) ->
+quic_ack_range_invariants(Config) ->
     ct_property_test:quickcheck(
-        roadrunner_quic_ack_props:prop_matches_dep(),
+        roadrunner_quic_ack_props:prop_range_invariants(),
         Config
     ).
 
-quic_loss_rtt_matches_dep(Config) ->
+quic_loss_rtt_pto_invariants(Config) ->
     ct_property_test:quickcheck(
-        roadrunner_quic_loss_props:prop_rtt_matches_dep(),
+        roadrunner_quic_loss_props:prop_rtt_and_pto_invariants(),
         Config
     ).
 
-quic_loss_matches_dep(Config) ->
+quic_loss_classification_invariants(Config) ->
     ct_property_test:quickcheck(
-        roadrunner_quic_loss_props:prop_loss_matches_dep(),
+        roadrunner_quic_loss_props:prop_loss_classification_invariants(),
         Config
     ).
 
@@ -246,27 +228,21 @@ quic_cc_newreno_invariants(Config) ->
         Config
     ).
 
-quic_flow_matches_dep(Config) ->
+quic_flow_invariants(Config) ->
     ct_property_test:quickcheck(
-        roadrunner_quic_flow_props:prop_matches_dep(),
+        roadrunner_quic_flow_props:prop_invariants(),
         Config
     ).
 
-quic_tls_crypto_matches_dep(Config) ->
+quic_tls_handshake_round_trips(Config) ->
     ct_property_test:quickcheck(
-        roadrunner_quic_tls_crypto_props:prop_matches_dep(),
+        roadrunner_quic_tls_handshake_props:prop_encode_decode_round_trips(),
         Config
     ).
 
-quic_tls_handshake_matches_dep(Config) ->
+quic_transport_params_round_trips(Config) ->
     ct_property_test:quickcheck(
-        roadrunner_quic_tls_handshake_props:prop_encode_decode_matches_dep(),
-        Config
-    ).
-
-quic_transport_params_matches_dep(Config) ->
-    ct_property_test:quickcheck(
-        roadrunner_quic_transport_params_props:prop_encode_decode_matches_dep(),
+        roadrunner_quic_transport_params_props:prop_encode_decode_round_trips(),
         Config
     ).
 

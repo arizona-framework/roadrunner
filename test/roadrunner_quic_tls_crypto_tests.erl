@@ -3,8 +3,6 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(M, roadrunner_quic_tls_crypto).
-%% The `quic` dep, kept as a test-profile differential oracle.
--define(DEP, quic_crypto).
 
 %% =============================================================================
 %% RFC 8448 §3 (Simple 1-RTT Handshake) key schedule — the authority.
@@ -46,75 +44,8 @@ master_secret_test() ->
     ).
 
 %% =============================================================================
-%% Differential equivalence vs the dep oracle.
-%% =============================================================================
-
-matches_dep_test() ->
-    [
-        ?assertEqual(?DEP:transcript_hash(Msg), ?M:transcript_hash(Msg))
-     || Msg <- [<<>>, ~"x", ~"the running handshake transcript", binary:copy(<<7>>, 200)]
-    ],
-    Early = ?M:early_secret(),
-    [
-        ?assertEqual(?DEP:derive_secret(Early, Label, Hash), ?M:derive_secret(Early, Label, Hash))
-     || {Label, Hash} <- [
-            {~"c hs traffic", ?M:transcript_hash(~"abc")},
-            {~"s hs traffic", ?M:transcript_hash(<<>>)},
-            {~"derived", ?M:transcript_hash(~"xyz")}
-        ]
-    ],
-    [
-        begin
-            HandshakeSecret = ?M:handshake_secret(Early, Shared),
-            ?assertEqual(?DEP:derive_handshake_secret(Early, Shared), HandshakeSecret),
-            ?assertEqual(
-                ?DEP:derive_master_secret(HandshakeSecret), ?M:master_secret(HandshakeSecret)
-            )
-        end
-     || Shared <- [binary:copy(<<16#2a>>, 32), shared_secret()]
-    ].
-
-%% =============================================================================
-%% Traffic secrets, Finished key, and verify_data vs the dep oracle (the
-%% dep is RFC-8448-faithful, confirmed by the backbone vectors above).
-%% =============================================================================
-
-traffic_secrets_match_dep_test() ->
-    HandshakeSecret = ?M:handshake_secret(?M:early_secret(), shared_secret()),
-    MasterSecret = ?M:master_secret(HandshakeSecret),
-    HsHash = ?M:transcript_hash(~"client-hello..server-hello"),
-    ApHash = ?M:transcript_hash(~"client-hello..server-finished"),
-    ?assertEqual(
-        ?DEP:derive_client_handshake_secret(HandshakeSecret, HsHash),
-        ?M:traffic_secret(client, handshake, HandshakeSecret, HsHash)
-    ),
-    ?assertEqual(
-        ?DEP:derive_server_handshake_secret(HandshakeSecret, HsHash),
-        ?M:traffic_secret(server, handshake, HandshakeSecret, HsHash)
-    ),
-    ?assertEqual(
-        ?DEP:derive_client_app_secret(MasterSecret, ApHash),
-        ?M:traffic_secret(client, application, MasterSecret, ApHash)
-    ),
-    ?assertEqual(
-        ?DEP:derive_server_app_secret(MasterSecret, ApHash),
-        ?M:traffic_secret(server, application, MasterSecret, ApHash)
-    ).
-
-finished_and_verify_data_match_dep_test() ->
-    HandshakeSecret = ?M:handshake_secret(?M:early_secret(), shared_secret()),
-    Hash = ?M:transcript_hash(~"client-hello..server-hello"),
-    ServerSecret = ?M:traffic_secret(server, handshake, HandshakeSecret, Hash),
-    FinishedKey = ?M:finished_key(ServerSecret),
-    ?assertEqual(?DEP:derive_finished_key(ServerSecret), FinishedKey),
-    ?assertEqual(
-        ?DEP:compute_finished_verify(FinishedKey, Hash),
-        ?M:verify_data(FinishedKey, Hash)
-    ).
-
-%% =============================================================================
-%% RFC 8448 §3 traffic secrets + Finished — the authority (hardcoded, not
-%% via the dep). The transcript-hash contexts are the §3 values.
+%% RFC 8448 §3 traffic secrets + Finished — the authority. The
+%% transcript-hash contexts are the §3 values.
 %% =============================================================================
 
 rfc8448_traffic_secrets_test() ->

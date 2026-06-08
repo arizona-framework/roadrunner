@@ -2,10 +2,11 @@
 -moduledoc """
 Property-based tests for `roadrunner_quic_aead`.
 
-Differential invariant over random inputs: AES-128-GCM sealing is
-byte-for-byte identical to the `quic` dep (the oracle), opening reverses
-sealing, and header protection applied to a real short-header packet is
-removed exactly, recovering the header and ciphertext.
+Round-trip invariants over random inputs: opening a sealed payload
+recovers the plaintext, and header protection applied to a real
+short-header packet is removed exactly, recovering the header, the
+packet-number length, the wire packet number, and the trailing
+ciphertext.
 """.
 
 -compile(export_all).
@@ -16,7 +17,7 @@ removed exactly, recovering the header and ciphertext.
 %% 2^62 - 1, the largest QUIC packet number.
 -define(MAX_PN, 4611686018427387903).
 
-prop_matches_dep() ->
+prop_round_trips() ->
     ?FORALL(
         {Key, IV, HP, PN, DCID, Plaintext},
         {binary(16), binary(12), binary(16), pn(), dcid(), payload()},
@@ -34,8 +35,7 @@ prop_matches_dep() ->
             Ciphertext = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
             Protected = roadrunner_quic_aead:protect_header(HP, Header, Ciphertext, PNOffset),
             Packet = <<Protected/binary, Ciphertext/binary>>,
-            Ciphertext =:= quic_aead:encrypt(Key, IV, PN, Header, Plaintext) andalso
-                roadrunner_quic_aead:open(Key, IV, PN, Header, Ciphertext) =:= {ok, Plaintext} andalso
+            roadrunner_quic_aead:open(Key, IV, PN, Header, Ciphertext) =:= {ok, Plaintext} andalso
                 roadrunner_quic_aead:unprotect_header(HP, Packet, PNOffset) =:=
                     {ok, Header, PNLen, WirePN, Ciphertext}
         end

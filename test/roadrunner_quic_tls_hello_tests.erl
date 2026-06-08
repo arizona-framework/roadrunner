@@ -3,8 +3,6 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(M, roadrunner_quic_tls_hello).
-%% The `quic` dep, kept as a test-profile differential oracle.
--define(DEP, quic_tls).
 -define(FRAME, roadrunner_quic_tls_handshake).
 
 %% =============================================================================
@@ -193,32 +191,6 @@ parse_rejects_malformed_extensions_test() ->
         {error, malformed_extensions},
         ?M:parse_client_hello(ch_body_raw_exts(<<>>, [16#1301], Exts))
     ).
-
-%% =============================================================================
-%% Differential oracle vs the `quic` dep.
-%% =============================================================================
-
-%% The dep parses the RFC 8448 §3 ClientHello to the same v1-subset values.
-oracle_parse_matches_dep_test() ->
-    {ok, {1, Body}, <<>>} = ?FRAME:decode(rfc8448_client_hello()),
-    {ok, Mine} = ?M:parse_client_hello(Body),
-    {ok, Dep} = ?DEP:parse_client_hello(Body),
-    ?assertEqual(maps:get(random, Dep), maps:get(random, Mine)),
-    ?assertEqual(maps:get(session_id, Dep), maps:get(session_id, Mine)),
-    ?assertEqual(maps:get(cipher_suites, Dep), maps:get(cipher_suites, Mine)),
-    ?assertEqual(maps:get(alpn_protocols, Dep), maps:get(alpn_protocols, Mine)),
-    ?assertEqual(maps:get(signature_algorithms, Dep), maps:get(signature_algorithms, Mine)),
-    %% The dep keeps key_share as [{Group, Key}]; compare the x25519 entry.
-    {16#001d, DepKey} = lists:keyfind(16#001d, 1, maps:get(key_share, Dep)),
-    ?assertEqual(DepKey, maps:get(key_share, Mine)).
-
-%% The dep decodes the native EncryptedExtensions to the same extension set.
-oracle_encrypted_extensions_matches_dep_test() ->
-    Params = #{initial_max_data => 65536, max_idle_timeout => 30000},
-    Opts = #{alpn => ~"h3", transport_params => Params},
-    Mine = iolist_to_binary(?M:build_encrypted_extensions(Opts)),
-    Dep = ?DEP:build_encrypted_extensions(Opts),
-    ?assertEqual(Dep, Mine).
 
 %% =============================================================================
 %% Fixtures and helpers

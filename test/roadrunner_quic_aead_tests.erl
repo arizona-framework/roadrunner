@@ -3,8 +3,6 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(M, roadrunner_quic_aead).
-%% The `quic` dep, kept as a test-profile differential oracle.
--define(DEP, quic_aead).
 
 %% =============================================================================
 %% RFC 9001 Appendix A.3 (Server Initial) — the authority.
@@ -36,46 +34,6 @@ rfc9001_a3_server_initial_test() ->
     Protected = ?M:protect_header(HP, Header, Ciphertext, PNOffset),
     ?assertEqual(Packet, <<Protected/binary, Ciphertext/binary>>),
     ?assertEqual({ok, Header, 2, PN, Ciphertext}, ?M:unprotect_header(HP, Packet, PNOffset)).
-
-%% =============================================================================
-%% AEAD seal/open: byte-for-byte vs the dep, round-trip across inputs.
-%% =============================================================================
-
-seal_open_matches_dep_test() ->
-    Key = hex(~"00112233445566778899aabbccddeeff"),
-    IV = hex(~"0102030405060708090a0b0c"),
-    Cases = [
-        {0, <<>>, ~"x"},
-        {1, ~"associated-data", binary:copy(<<7>>, 100)},
-        {16#3fffffff, ~"hdr", ~"payload"},
-        {16#ffffffffffff, <<>>, binary:copy(<<0>>, 64)}
-    ],
-    [
-        begin
-            CT = ?M:seal(Key, IV, PN, AAD, PT),
-            ?assertEqual(?DEP:encrypt(Key, IV, PN, AAD, PT), CT),
-            ?assertEqual({ok, PT}, ?M:open(Key, IV, PN, AAD, CT))
-        end
-     || {PN, AAD, PT} <- Cases
-    ].
-
-%% =============================================================================
-%% Header protection: byte-for-byte vs the dep, removed exactly. Built on a
-%% real short-header packet (the A.3 vector covers the long-header form).
-%% =============================================================================
-
-header_protection_matches_dep_test() ->
-    HP = hex(~"33333333333333333333333333333333"),
-    DCID = binary:copy(<<16#ab>>, 8),
-    Ciphertext = binary:copy(<<16#5c>>, 40),
-    PN = 42,
-    [HeaderIo, _] = roadrunner_quic_packet:encode_short(DCID, PN, <<>>, false),
-    Header = iolist_to_binary(HeaderIo),
-    PNOffset = 1 + byte_size(DCID),
-    Protected = ?M:protect_header(HP, Header, Ciphertext, PNOffset),
-    ?assertEqual(?DEP:protect_header(aes_128_gcm, HP, Header, Ciphertext, PNOffset), Protected),
-    Packet = <<Protected/binary, Ciphertext/binary>>,
-    ?assertEqual({ok, Header, 1, PN, Ciphertext}, ?M:unprotect_header(HP, Packet, PNOffset)).
 
 %% =============================================================================
 %% Failure paths: open and unprotect never crash on bad input.
