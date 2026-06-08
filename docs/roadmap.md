@@ -98,6 +98,12 @@ advisory or malformed cases the server currently tolerates or omits.
   `STREAM_DATA_BLOCKED` (RFC 9000 §4). Each window is seeded from our own
   advertised value and never raised, so a transfer past the initial grant
   stalls; the suite max is 100 KB, well under it — medium
+- Stream-count grants and self-limiting (RFC 9000 §4.6): the server now rejects
+  a client stream id over the advertised `initial_max_streams_*`, but never
+  *sends* `MAX_STREAMS` to raise the limit, ignores an inbound `MAX_STREAMS`, and
+  does not check the peer's `initial_max_streams_uni` before opening its own
+  control / QPACK uni streams (it opens ~3, always within a sane client's
+  limit) — small
 - Respond to a peer-initiated key update (RFC 9001 §6). Security-sensitive:
   trial-decrypt the next-phase keys and commit ONLY on success (not the dep's
   commit-then-decrypt, which a single forged flipped-bit datagram desyncs),
@@ -111,6 +117,10 @@ advisory or malformed cases the server currently tolerates or omits.
 - NewReno congestion control (RFC 9002 §7); needs the loss layer to surface
   acked bytes + sent times. Sending is bounded only by the §8.1
   anti-amplification limit and flow control today — large
+- PTO explicit probe (RFC 9002 §6.2.4): a probe timeout only re-checks for
+  losses and backs off; it does not retransmit the oldest unacked ack-eliciting
+  frames as a probe. Bundle with NewReno (both need the loss layer to surface
+  the oldest-unacked) — medium
 - A no-flatten / by-reference stream send buffer, so a large response body is
   not flattened into one binary before sending — medium
 
