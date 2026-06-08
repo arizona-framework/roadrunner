@@ -2,9 +2,7 @@
 -moduledoc false.
 
 %% The control API the HTTP/3 layer (`roadrunner_conn_loop_http3`,
-%% `roadrunner_http3_stream_worker`) calls on a native QUIC connection: the
-%% same surface the dep's `quic` module gave, so the h3 files change only the
-%% `quic:*` -> `roadrunner_quic:*` qualifier.
+%% `roadrunner_http3_stream_worker`) calls on a native QUIC connection.
 %%
 %% The native connection is a hand-rolled `proc_lib` loop, not a gen_statem, so
 %% this module replicates `gen_statem:call` semantics itself: a `make_ref`
