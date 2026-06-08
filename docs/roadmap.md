@@ -98,6 +98,12 @@ advisory or malformed cases the server currently tolerates or omits.
   `STREAM_DATA_BLOCKED` (RFC 9000 §4). Each window is seeded from our own
   advertised value and never raised, so a transfer past the initial grant
   stalls; the suite max is 100 KB, well under it — medium
+- Stream-count grants and self-limiting (RFC 9000 §4.6): the server now rejects
+  a client stream id over the advertised `initial_max_streams_*`, but never
+  *sends* `MAX_STREAMS` to raise the limit, ignores an inbound `MAX_STREAMS`, and
+  does not check the peer's `initial_max_streams_uni` before opening its own
+  control / QPACK uni streams (it opens ~3, always within a sane client's
+  limit) — small
 - Respond to a peer-initiated key update (RFC 9001 §6). Security-sensitive:
   trial-decrypt the next-phase keys and commit ONLY on success (not the dep's
   commit-then-decrypt, which a single forged flipped-bit datagram desyncs),
@@ -111,6 +117,10 @@ advisory or malformed cases the server currently tolerates or omits.
 - NewReno congestion control (RFC 9002 §7); needs the loss layer to surface
   acked bytes + sent times. Sending is bounded only by the §8.1
   anti-amplification limit and flow control today — large
+- PTO explicit probe (RFC 9002 §6.2.4): a probe timeout only re-checks for
+  losses and backs off; it does not retransmit the oldest unacked ack-eliciting
+  frames as a probe. Bundle with NewReno (both need the loss layer to surface
+  the oldest-unacked) — medium
 - A no-flatten / by-reference stream send buffer, so a large response body is
   not flattened into one binary before sending — medium
 
@@ -391,6 +401,43 @@ keyed on client IP all depend on it.
 **Scope:** medium. A pre-request parse stage on accept (gated by a
 listener opt), plus threading the parsed address into the request's peer
 field across h1, h2, and h3.
+
+### Decide handler 1xx response handling uniformly — small
+
+**What:** A handler that returns a status of 100..199 has it sent as the
+FINAL response (headers + end-of-stream) on h1, h2, and h3 alike, via three
+identical `Status >= 100, Status =< 599` guards (`roadrunner_http1:865`,
+`roadrunner_http2_stream_worker`, `roadrunner_http3_stream_worker`). A 1xx is
+interim (RFC 9110 §15.2): it cannot carry content or terminate the response,
+and a final response must follow. The single-response handler API cannot
+express "interim 1xx then final", so a returned 1xx is always a misuse. Pick
+ONE cross-protocol behavior: reject it (answer 500, log) or add a real
+interim-response mechanism.
+
+**Why deferred:** legitimate interim 1xx is already automatic where it matters
+(h1 `Expect: 100-continue` via `roadrunner_conn:maybe_send_continue`); a
+handler returning a 1xx is rare, and the current uniform behavior is at least
+consistent. It is a deliberate framework-wide decision, not an h3-only patch
+(which would diverge from h1/h2). Surfaced by the post-merge HTTP/3 review.
+
+**Scope:** small, but touches the three response paths together.
+
+### Cap outbound response header size — small
+
+**What:** h1/h2/h3 all cap INBOUND headers (the security-relevant direction,
+against untrusted clients: h3 answers 431, h1/h2 their own limits) but none
+bounds an OUTBOUND response header block, so a handler emitting a
+pathologically large header set produces an unbounded HEADERS frame. A
+self-cap (e.g. at the listener's `max_header_block`) answering 500 on overflow
+would bound it.
+
+**Why deferred:** outbound headers come from trusted handler code, not an
+untrusted peer, so the memory/abuse risk is low and the inbound caps already
+cover the attack surface. This is distinct from honoring the peer's advertised
+`SETTINGS_MAX_FIELD_SECTION_SIZE` (a separate SHOULD in the protocol sections).
+Surfaced by the post-merge HTTP/3 review.
+
+**Scope:** small, cross-protocol (the same response paths as the 1xx item).
 
 ## Per-route framework knobs the map shape unlocks
 
