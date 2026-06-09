@@ -262,17 +262,21 @@ insert_segment(Offset, Data, [{SegOffset, SegData} = Segment | Rest]) ->
         Offset >= SegEnd ->
             [Segment | insert_segment(Offset, Data, Rest)];
         true ->
-            before_segment(Offset, Data, SegOffset) ++
-                [Segment | after_segment(Offset, Data, End, SegEnd, Rest)]
+            before_segment(
+                Offset, Data, SegOffset, [Segment | after_segment(Offset, Data, End, SegEnd, Rest)]
+            )
     end.
 
-%% The part of an overlapping piece that falls before the segment it hit.
--spec before_segment(non_neg_integer(), binary(), non_neg_integer()) ->
+%% The part of an overlapping piece that falls before the segment it hit, consed
+%% onto the rest of the segment list (no list append).
+-spec before_segment(non_neg_integer(), binary(), non_neg_integer(), [
+    {non_neg_integer(), binary()}
+]) ->
     [{non_neg_integer(), binary()}].
-before_segment(Offset, Data, SegOffset) when Offset < SegOffset ->
-    [{Offset, binary:part(Data, 0, SegOffset - Offset)}];
-before_segment(_Offset, _Data, _SegOffset) ->
-    [].
+before_segment(Offset, Data, SegOffset, Tail) when Offset < SegOffset ->
+    [{Offset, binary:part(Data, 0, SegOffset - Offset)} | Tail];
+before_segment(_Offset, _Data, _SegOffset, Tail) ->
+    Tail.
 
 %% The part of an overlapping piece that falls after the segment it hit,
 %% re-inserted against the remaining segments.

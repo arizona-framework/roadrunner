@@ -294,17 +294,30 @@ finish_datagram(_Now, _Before, #state{phase = closed, pending_close = undefined}
 finish_datagram(_Now, _Before, #state{phase = closed} = State) ->
     {State1, CloseEffects} = send_close(State),
     {State2, EmitEffects} = drain_emits(State1),
-    {State2, CloseEffects ++ EmitEffects};
+    case CloseEffects of
+        [] -> {State2, EmitEffects};
+        [Close] -> {State2, [Close | EmitEffects]}
+    end;
 finish_datagram(Now, Before, State) ->
     {State3, SendEffects} = send_pass(Now, State),
-    {State4, EmitEffects} = drain_emits(State3),
-    {State4, connected_effects(Before, State4) ++ EmitEffects ++ SendEffects}.
+    {State4, Emits} = take_emits(State3),
+    %% {connected, _} first (so the owner opens its control stream before the
+    %% first request), then the datagram's owner events in arrival order, then
+    %% the sends; reverse the newest-first emits onto the sends in one pass.
+    {State4, connected_effects(Before, State4, lists:reverse(Emits, SendEffects))}.
 
 %% Owner events accumulate (newest-first) in #state.emits while the
 %% datagram's frames are folded; hand them back in arrival order and clear.
 -spec drain_emits(t()) -> {t(), [effect()]}.
-drain_emits(#state{emits = Emits} = State) ->
-    {State#state{emits = []}, lists:reverse(Emits)}.
+drain_emits(State) ->
+    {State1, Emits} = take_emits(State),
+    {State1, lists:reverse(Emits)}.
+
+%% Take the owner events newest-first (as accumulated) and clear them, for a
+%% caller that will reverse them onto a tail itself.
+-spec take_emits(t()) -> {t(), [effect()]}.
+take_emits(#state{emits = Emits} = State) ->
+    {State#state{emits = []}, Emits}.
 
 %% Queue an owner event for the current datagram (dropped if no owner yet).
 -spec emit(event(), t()) -> t().
@@ -317,13 +330,13 @@ emit(Event, #state{owner = Owner, emits = Emits} = State) ->
 %% handshaking -> connected transition AND an owner is installed. With no
 %% owner yet (the listener has not run set_owner), the emit is deferred to
 %% install_owner. The two sites are mutually exclusive, so it fires once.
--spec connected_effects(phase(), t()) -> [effect()].
-connected_effects(handshaking, #state{phase = connected, owner = Owner, info = Info}) when
+-spec connected_effects(phase(), t(), [effect()]) -> [effect()].
+connected_effects(handshaking, #state{phase = connected, owner = Owner, info = Info}, Tail) when
     is_pid(Owner)
 ->
-    [{emit, Owner, {connected, Info}}];
-connected_effects(_Before, _State) ->
-    [].
+    [{emit, Owner, {connected, Info}} | Tail];
+connected_effects(_Before, _State, Tail) ->
+    Tail.
 
 %% =============================================================================
 %% Control calls (owner / listener -> conn, synchronous)
@@ -645,11 +658,13 @@ queue_crypto(Level, Bytes, State) ->
         State
     ).
 
-%% Queue a control frame to send at a level.
+%% Queue a control frame to send at a level. The pending list is flushed into
+%% one packet wholesale and frame order within a packet is irrelevant, so a
+%% frame is consed on rather than appended.
 -spec queue_frame(level(), roadrunner_quic_frame:frame(), t()) -> t().
 queue_frame(Level, Frame, State) ->
     Space = space(Level, State),
-    put_space(Level, Space#space{pending = Space#space.pending ++ [Frame]}, State).
+    put_space(Level, Space#space{pending = [Frame | Space#space.pending]}, State).
 
 -spec process_ack(integer(), level(), tuple(), t()) -> t().
 process_ack(Now, Level, Ack, State) ->
@@ -660,7 +675,9 @@ process_ack(Now, Level, Ack, State) ->
         {Loss, _Acked, Lost} ->
             put_space(
                 Level,
-                Space#space{loss = Loss, pending = Space#space.pending ++ retransmittable(Lost)},
+                Space#space{
+                    loss = Loss, pending = lists:reverse(retransmittable(Lost), Space#space.pending)
+                },
                 State
             )
     end.
@@ -1080,7 +1097,11 @@ on_pto(Now, Level, State) ->
     #space{loss = Loss0, pending = Pending} = Space = space(Level, State),
     {Loss1, Lost} = roadrunner_quic_loss:detect_lost(Now, Loss0),
     Loss2 = roadrunner_quic_loss:on_pto_expired(Loss1),
-    put_space(Level, Space#space{loss = Loss2, pending = Pending ++ retransmittable(Lost)}, State).
+    put_space(
+        Level,
+        Space#space{loss = Loss2, pending = lists:reverse(retransmittable(Lost), Pending)},
+        State
+    ).
 
 %% Arm ONE timer at the nearest deadline: the earliest per-space probe timeout
 %% (across spaces with ack-eliciting bytes in flight) or the always-present
@@ -1157,7 +1178,9 @@ min_defined(A, B) -> min(A, B).
 %% frames worth resending: ACK / PADDING / CONNECTION_CLOSE are regenerated
 %% fresh or terminal, never replayed (RFC 9002 §13.3).
 %% `roadrunner_quic_send:ack_eliciting/1` is the single source of truth for
-%% which frames are ack-eliciting.
+%% which frames are ack-eliciting. Callers fold the result onto the existing
+%% pending list with `lists:reverse/2` (order within the flushed packet is
+%% irrelevant), so no list append is needed.
 -spec retransmittable([[roadrunner_quic_frame:frame()]]) -> [roadrunner_quic_frame:frame()].
 retransmittable(Lost) ->
     [Frame || Frame <- lists:append(Lost), roadrunner_quic_send:is_ack_eliciting(Frame)].
