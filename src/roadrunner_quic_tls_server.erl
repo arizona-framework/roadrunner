@@ -148,7 +148,7 @@ Source Connection ID of its first Initial packet (`transport_parameter_error`,
 RFC 9000 §7.3).
 """.
 -spec process_client_hello(binary(), t()) ->
-    {ok, flight(), [install()], t()} | {error, atom()}.
+    {ok, flight(), [install()], roadrunner_quic_transport_params:params(), t()} | {error, atom()}.
 process_client_hello(
     ClientHelloBody, #server{priv_key = PrivKey, alpn = Alpn, peer_scid = PeerSCID} = State
 ) ->
@@ -165,7 +165,11 @@ process_client_hello(
         ok ?= check_alpn(Alpn, ClientAlpns),
         ok ?= check_transport_params(ClientHello),
         ok ?= check_initial_scid(ClientHello, PeerSCID),
-        build_flight(ClientHelloBody, SessionId, ClientKeyShare, Scheme, State)
+        {ok, Flight, Installs, State1} =
+            build_flight(ClientHelloBody, SessionId, ClientKeyShare, Scheme, State),
+        %% Surface the client's advertised transport params (presence already
+        %% checked) so the loop can seed its send windows from them.
+        {ok, Flight, Installs, maps:get(transport_params, ClientHello), State1}
     end.
 
 -doc """

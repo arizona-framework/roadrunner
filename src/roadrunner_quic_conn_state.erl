@@ -121,6 +121,11 @@
     uni_opened = 0 :: non_neg_integer(),
     %% Connection-level flow control (RFC 9000 §4).
     conn_flow :: roadrunner_quic_flow:t(),
+    %% The client's advertised transport parameters, captured from the
+    %% ClientHello. The send windows (connection and per-stream) are seeded from
+    %% these so the server never sends past what the peer granted (RFC 9000 §4.1);
+    %% empty until the handshake delivers them.
+    peer_params = #{} :: roadrunner_quic_transport_params:params(),
     %% Owner events accumulated while folding a datagram's frames, drained in
     %% order at the end of handle_datagram (newest-first, reversed on drain).
     emits = [] :: [effect()],
@@ -485,10 +490,22 @@ enqueue_send(Sid, IoData, Fin, State) ->
 %% peer stream the owner has not already seen via {stream_opened, _}.
 -spec stream_for_send(non_neg_integer(), t()) ->
     {roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()}.
-stream_for_send(Sid, #state{streams = Streams} = State) ->
+stream_for_send(
+    Sid,
+    #state{streams = Streams, info = #{transport_params := TP}, peer_params = PeerParams} = State
+) ->
     case Streams of
-        #{Sid := {Stream, Flow}} -> {Stream, Flow, State};
-        #{} -> {roadrunner_quic_stream:new(), roadrunner_quic_flow:new(#{}), State}
+        #{Sid := {Stream, Flow}} ->
+            {Stream, Flow, State};
+        #{} ->
+            %% A server-first stream (response on a client request stream, or a
+            %% server control / QPACK stream): seed its send window from what the
+            %% client granted for that stream type, like the receive path does.
+            Flow = roadrunner_quic_flow:new(#{
+                initial_max_data => stream_recv_window(Sid, TP),
+                peer_initial_max_data => peer_stream_send_window(Sid, PeerParams)
+            }),
+            {roadrunner_quic_stream:new(), Flow, State}
     end.
 
 -spec process_outcome(integer(), roadrunner_quic_recv:outcome(), t()) -> t().
@@ -618,10 +635,24 @@ deframe(Buffer) ->
     end.
 
 -spec process_handshake(level(), {byte(), binary()}, t()) -> t().
-process_handshake(initial, {?CLIENT_HELLO, Body}, #state{tls = Tls} = State) ->
+process_handshake(
+    initial,
+    {?CLIENT_HELLO, Body},
+    #state{tls = Tls, info = #{transport_params := #{initial_max_data := OurMaxData}}} = State
+) ->
     case roadrunner_quic_tls_server:process_client_hello(Body, Tls) of
-        {ok, #{initial := InitialFlight, handshake := HandshakeFlight}, Installs, Tls1} ->
-            State1 = install_keys(Installs, State#state{tls = Tls1}),
+        {ok, #{initial := InitialFlight, handshake := HandshakeFlight}, Installs, PeerParams, Tls1} ->
+            %% Seed the connection send window from the client's advertised
+            %% initial_max_data (absent -> 0, RFC 9000 §18.2), not a default. Safe
+            %% to re-create conn_flow here: no 1-RTT data flows before the
+            %% handshake completes.
+            ConnFlow = roadrunner_quic_flow:new(#{
+                initial_max_data => OurMaxData,
+                peer_initial_max_data => maps:get(initial_max_data, PeerParams, 0)
+            }),
+            State1 = install_keys(
+                Installs, State#state{tls = Tls1, peer_params = PeerParams, conn_flow = ConnFlow}
+            ),
             State2 = queue_crypto(initial, InitialFlight, State1),
             queue_crypto(handshake, HandshakeFlight, State2);
         {error, Reason} ->
@@ -925,10 +956,28 @@ opened_before(Sid, #state{uni_opened = Opened}) ->
 %% and announce it with {stream_opened, Sid}.
 -spec open_stream(non_neg_integer(), t()) ->
     {ok, roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()}.
-open_stream(Sid, #state{info = #{transport_params := TP}} = State) ->
+open_stream(Sid, #state{info = #{transport_params := TP}, peer_params = PeerParams} = State) ->
     Stream = roadrunner_quic_stream:new(),
-    Flow = roadrunner_quic_flow:new(#{initial_max_data => stream_recv_window(Sid, TP)}),
+    Flow = roadrunner_quic_flow:new(#{
+        initial_max_data => stream_recv_window(Sid, TP),
+        peer_initial_max_data => peer_stream_send_window(Sid, PeerParams)
+    }),
     {ok, Stream, Flow, emit({stream_opened, Sid}, bump_opened(Sid, State))}.
+
+%% The send window for a stream the server writes to: the limit the client
+%% advertised for that stream type (RFC 9000 §18.2; absent -> 0). A
+%% client-initiated bidi (request) stream where the server sends the response
+%% uses initial_max_stream_data_bidi_local; a server-initiated uni (control /
+%% QPACK) stream uses initial_max_stream_data_uni. A client uni stream is
+%% receive-only for the server, so 0.
+-spec peer_stream_send_window(non_neg_integer(), roadrunner_quic_transport_params:params()) ->
+    non_neg_integer().
+peer_stream_send_window(Sid, PeerParams) when Sid rem 4 =:= 0 ->
+    maps:get(initial_max_stream_data_bidi_local, PeerParams, 0);
+peer_stream_send_window(Sid, PeerParams) when Sid rem 4 =:= 3 ->
+    maps:get(initial_max_stream_data_uni, PeerParams, 0);
+peer_stream_send_window(_Sid, _PeerParams) ->
+    0.
 
 %% Advance the per-type high-water past `Sid`'s ordinal. Opening a bidi stream
 %% also tops up the peer's bidi-stream credit.
@@ -962,11 +1011,12 @@ grant_max_streams_bidi(
             State
     end.
 
-%% The receive window we advertised for a peer-initiated stream (RFC 9000
-%% §18.2): client-initiated bidirectional streams (Sid rem 4 == 0) get
-%% initial_max_stream_data_bidi_remote, client-initiated unidirectional streams
-%% (Sid rem 4 == 2) get initial_max_stream_data_uni. Server-initiated ids never
-%% reach here (process_stream/process_reset_stream reject them upstream).
+%% Our advertised receive window for a stream by type (RFC 9000 §18.2):
+%% client-initiated bidirectional streams (Sid rem 4 == 0) get
+%% initial_max_stream_data_bidi_remote; every other type gets
+%% initial_max_stream_data_uni. The receive path passes only client-initiated
+%% ids; the send path (stream_for_send) also passes server uni ids, where the
+%% receive window is moot since the server never receives there.
 -spec stream_recv_window(non_neg_integer(), roadrunner_quic_transport_params:params()) ->
     non_neg_integer().
 stream_recv_window(Sid, #{initial_max_stream_data_bidi_remote := Bidi}) when Sid rem 4 =:= 0 ->

@@ -105,14 +105,23 @@ key_share_ext(PubKey) ->
     Entry = <<?GROUP_X25519:16, (byte_size(PubKey)):16, PubKey/binary>>,
     extension(?EXT_KEY_SHARE, <<(byte_size(Entry)):16, Entry/binary>>).
 
-%% A quic_transport_parameters extension carrying just the client's
-%% initial_source_connection_id, encoded with the production codec so the wire
-%% bytes stay authoritative. `none` emits no extension at all.
+%% A quic_transport_parameters extension carrying the client's
+%% initial_source_connection_id plus flow-control limits, encoded with the
+%% production codec so the wire bytes stay authoritative. The 800000-byte
+%% windows are what the server seeds its send windows from (deliberately
+%% distinct from roadrunner_quic_flow's 786432 default, so a send test proves
+%% the window is the client's advertised value, not a hardcoded fallback).
+%% `none` emits no extension at all.
 transport_params_ext(none) ->
     <<>>;
 transport_params_ext(ClientSCID) ->
     Body = iolist_to_binary(
-        roadrunner_quic_transport_params:encode(#{initial_source_connection_id => ClientSCID})
+        roadrunner_quic_transport_params:encode(#{
+            initial_source_connection_id => ClientSCID,
+            initial_max_data => 800000,
+            initial_max_stream_data_bidi_local => 800000,
+            initial_max_stream_data_uni => 800000
+        })
     ),
     extension(?EXT_QUIC_TRANSPORT_PARAMS, Body).
 

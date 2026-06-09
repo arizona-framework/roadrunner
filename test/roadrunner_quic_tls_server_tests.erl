@@ -71,7 +71,7 @@ assert_full_handshake(KeyType) ->
         peer_scid => ClientSCID
     }),
 
-    {ok, Flight, Installs, State1} = ?M:process_client_hello(ClientHelloBody, State),
+    {ok, Flight, Installs, _PeerParams, State1} = ?M:process_client_hello(ClientHelloBody, State),
 
     %% Flight grouping: ServerHello at Initial; EE/Cert/CertVerify/Finished
     %% at Handshake, in order, each properly framed and concatenable.

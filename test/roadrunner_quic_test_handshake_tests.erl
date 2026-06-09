@@ -36,7 +36,7 @@ full_handshake_round_trip_test() ->
 
     ClientHelloFramed = ?TC:client_hello_framed(Scheme, ClientPub, ClientSCID),
     [{1, ClientHelloBody}] = ?TC:deframe_all(ClientHelloFramed),
-    {ok, Flight, ServerInstalls, ServerState1} =
+    {ok, Flight, ServerInstalls, _PeerParams, ServerState1} =
         ?SERVER:process_client_hello(ClientHelloBody, ServerState),
 
     {ok, Result} = ?CLIENT:process_server_flight(
@@ -83,7 +83,7 @@ rejects_bad_certificate_verify_test() ->
     }),
     ClientHelloFramed = ?TC:client_hello_framed(Scheme, ClientPub, ClientSCID),
     [{1, ClientHelloBody}] = ?TC:deframe_all(ClientHelloFramed),
-    {ok, Flight, _, _} = ?SERVER:process_client_hello(ClientHelloBody, ServerState),
+    {ok, Flight, _, _, _} = ?SERVER:process_client_hello(ClientHelloBody, ServerState),
     %% Verify the signature against a public key that did not sign it.
     ?assertEqual(
         {error, handshake_verification_failed},

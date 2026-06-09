@@ -796,13 +796,16 @@ send_blocked_by_exhausted_send_window_test() ->
     %% send pass walking only streams that have pending data, this block is the
     %% one path that reaches take_stream's no-frame branch.
     {State, ApSecret} = connected_for_send(),
-    %% The conn and per-stream send windows both default to roadrunner_quic_flow's
-    %% initial_max_data (786432), so the payload must exceed it to block.
-    Payload = binary:copy(~"x", 786432 + 1000),
+    %% The send windows are seeded from the client's advertised 800000-byte
+    %% initial_max_data / initial_max_stream_data (see roadrunner_quic_test_client),
+    %% so the payload must exceed that to block — and the server stops at exactly
+    %% the client's window, proving the limit is sourced from the peer rather than
+    %% roadrunner_quic_flow's 786432 default.
+    Window = 800000,
+    Payload = binary:copy(~"x", Window + 1000),
     {_State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
     Sent = iolist_to_binary([D || {stream, 0, _, D, _} <- sent_stream_frames(Effects, ApSecret)]),
-    ?assert(byte_size(Sent) > 0),
-    ?assert(byte_size(Sent) < byte_size(Payload)).
+    ?assertEqual(Window, byte_size(Sent)).
 
 send_resumes_after_max_data_and_max_stream_data_test() ->
     %% After the send window fills (RFC 9000 §4.1), the peer's MAX_DATA /
@@ -810,12 +813,13 @@ send_resumes_after_max_data_and_max_stream_data_test() ->
     %% the next send pass resumes the still-pending stream, so the whole payload
     %% eventually reaches the wire.
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
-    Payload = binary:copy(~"x", 786432 + 1000),
+    Window = 800000,
+    Payload = binary:copy(~"x", Window + 1000),
     {State1, E1} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
     Sent1 = iolist_to_binary([D || {stream, 0, _, D, _} <- sent_stream_frames(E1, ServerApSecret)]),
     ?assert(byte_size(Sent1) < byte_size(Payload)),
     Grant = app_datagram(
-        [{max_data, 786432 * 2}, {max_stream_data, 0, 786432 * 2}], 0, ClientApSecret
+        [{max_data, Window * 2}, {max_stream_data, 0, Window * 2}], 0, ClientApSecret
     ),
     {_State2, E2} = ?M:handle_datagram(?NOW, Grant, State1),
     Sent2 = iolist_to_binary([D || {stream, 0, _, D, _} <- sent_stream_frames(E2, ServerApSecret)]),
