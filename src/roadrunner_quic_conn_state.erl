@@ -877,7 +877,14 @@ send_pass(Now, State) ->
 %% datagram cannot be sent.
 -spec drain_send(integer(), t(), [effect()]) -> {t(), [effect()]}.
 drain_send(Now, State, Acc) ->
-    case build_packets(State) of
+    %% The present encryption levels are invariant across a send burst (spaces
+    %% are added or discarded only on the receive path), so resolve them once
+    %% here rather than on every packet built in the loop.
+    drain_send(Now, present_levels(State), State, Acc).
+
+-spec drain_send(integer(), [level()], t(), [effect()]) -> {t(), [effect()]}.
+drain_send(Now, Levels, State, Acc) ->
+    case build_first(Levels, State) of
         none ->
             {State, lists:reverse(Acc)};
         {Entries, Built} ->
@@ -889,7 +896,7 @@ drain_send(Now, State, Acc) ->
                 true ->
                     Recorded = record_sent(Now, Sent, Built),
                     Amp1 = roadrunner_quic_amp:sent(byte_size(Datagram), Amp),
-                    drain_send(Now, Recorded#state{amp = Amp1}, [{send, Datagram} | Acc])
+                    drain_send(Now, Levels, Recorded#state{amp = Amp1}, [{send, Datagram} | Acc])
             end
     end.
 
@@ -902,10 +909,6 @@ drain_send(Now, State, Acc) ->
 %% flight would overflow. It also makes the forbidden Initial+1-RTT
 %% coalescing structurally impossible. Coalescing Initial+Handshake is a
 %% deferred optimization. Returns `none` when nothing is pending anywhere.
--spec build_packets(t()) -> none | {#{level() => map()}, t()}.
-build_packets(State) ->
-    build_first(present_levels(State), State).
-
 -spec build_first([level()], t()) -> none | {#{level() => map()}, t()}.
 build_first([], _State) ->
     none;
