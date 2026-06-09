@@ -869,12 +869,16 @@ deliver_stream(_Sid, _Deliverable, _FinReached, State) ->
 
 -spec send_pass(integer(), t()) -> {t(), [effect()]}.
 send_pass(Now, State) ->
-    {State1, SendEffects} = drain_send(Now, State, []),
-    {State1, SendEffects ++ timer_effects(Now, State1)}.
+    {State1, RevSends} = drain_send(Now, State, []),
+    %% `drain_send` returns the send effects newest-first; reverse them into
+    %% order and fold the (single) timer effect onto the end in the same pass,
+    %% rather than a second traversal to append it.
+    {State1, lists:reverse(RevSends, timer_effects(Now, State1))}.
 
 %% Build and send one datagram per iteration until nothing is pending or
 %% the anti-amplification budget blocks; roll back the built state if the
-%% datagram cannot be sent.
+%% datagram cannot be sent. Returns the send effects newest-first (the caller
+%% reverses them and adds the timer effect).
 -spec drain_send(integer(), t(), [effect()]) -> {t(), [effect()]}.
 drain_send(Now, State, Acc) ->
     %% The present encryption levels are invariant across a send burst (spaces
@@ -886,13 +890,13 @@ drain_send(Now, State, Acc) ->
 drain_send(Now, Levels, State, Acc) ->
     case build_first(Levels, State) of
         none ->
-            {State, lists:reverse(Acc)};
+            {State, Acc};
         {Entries, Built} ->
             #state{peer_scid = DCID, scid = SCID, amp = Amp} = State,
             {Datagram, Sent} = roadrunner_quic_send:datagram(Entries, DCID, SCID),
             case roadrunner_quic_amp:can_send(byte_size(Datagram), Amp) of
                 false ->
-                    {State, lists:reverse(Acc)};
+                    {State, Acc};
                 true ->
                     Recorded = record_sent(Now, Sent, Built),
                     Amp1 = roadrunner_quic_amp:sent(byte_size(Datagram), Amp),
@@ -927,7 +931,9 @@ build_level(Level, State) ->
             %% Retransmits travel in their own packet (no fresh CRYPTO or
             %% STREAM slice), so a replayed frame plus a new slice can never
             %% overflow the datagram.
-            build_entry(Level, AckFrames ++ Pending, Space#space{ack = Ack, pending = []}, State);
+            build_entry(
+                Level, prepend_ack(AckFrames, Pending), Space#space{ack = Ack, pending = []}, State
+            );
         [] ->
             build_data(Level, AckFrames, Space#space{ack = Ack}, State)
     end.
@@ -938,16 +944,24 @@ build_level(Level, State) ->
 -spec build_data(level(), [roadrunner_quic_frame:frame()], #space{}, t()) -> none | {map(), t()}.
 build_data(application, AckFrames, #space{next_pn = PN} = Space, State) ->
     {StreamFrames, State1} = take_stream(AckFrames, PN, State),
-    case AckFrames ++ StreamFrames of
+    case prepend_ack(AckFrames, StreamFrames) of
         [] -> none;
         Frames -> build_entry(application, Frames, Space, State1)
     end;
 build_data(Level, AckFrames, Space, State) ->
     {CryptoFrames, Crypto} = take_crypto(Space#space.crypto),
-    case AckFrames ++ CryptoFrames of
+    case prepend_ack(AckFrames, CryptoFrames) of
         [] -> none;
         Frames -> build_entry(Level, Frames, Space#space{crypto = Crypto}, State)
     end.
+
+%% Put the ACK frame (if any) ahead of the data frames. `take_ack` yields an
+%% empty list or a single `[AckFrame]`, so this prepends without the traversal a
+%% list append would cost on the hot send path.
+-spec prepend_ack([roadrunner_quic_frame:frame()], [roadrunner_quic_frame:frame()]) ->
+    [roadrunner_quic_frame:frame()].
+prepend_ack([], Frames) -> Frames;
+prepend_ack([Ack], Frames) -> [Ack | Frames].
 
 %% Pull ONE outbound STREAM frame from the lowest-id stream that has data or a
 %% FIN to send and the credit to send it, skipping streams blocked by send
