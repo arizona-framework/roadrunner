@@ -54,7 +54,7 @@
 %% Servers known to the bench, in default-run order. Adding a new
 %% server is two steps: append it here and add a clause for it in
 %% `start_server/2` (plus any `scenario_*` config helpers below).
--define(KNOWN_SERVERS, [roadrunner, cowboy, elli]).
+-define(KNOWN_SERVERS, [roadrunner, cowboy, elli, erlang_quic]).
 
 %% Wire protocols the bench can drive. `--protocols` accepts a
 %% comma-separated subset; omitting the flag iterates every protocol.
@@ -454,11 +454,11 @@ preflight_protocol(#{protocol := h3, servers := Servers} = Opts) ->
     %% generated cert, and the bench node needs `ssl` started for the
     %% cert / crypto primitives the native client and server share.
     CertDir = generate_test_cert(),
-    Filtered = [S || S <- Servers, S =:= roadrunner],
+    Filtered = [S || S <- Servers, S =:= roadrunner orelse S =:= erlang_quic],
     case Filtered =/= Servers of
         true ->
             io:format(
-                "note: --protocols h3 is roadrunner-only here "
+                "note: --protocols h3 runs roadrunner + erlang_quic only "
                 "(cowboy/elli have no HTTP/3)~n",
                 []
             );
@@ -1008,6 +1008,23 @@ cli() ->
                     """
             },
             #{
+                name => h3_client,
+                long => "-h3-client",
+                type => {atom, [native, dep]},
+                default => native,
+                help =>
+                    """
+                    h3 loadgen to drive the `--protocols h3` servers with.
+                      native (default): the in-tree native client
+                          (`roadrunner_quic_test_h3`), dep-free.
+                      dep: the `quic` dep's `quic_h3` client (a strong
+                          loadgen), for an honest server-vs-server compare
+                          of roadrunner against `erlang_quic` under the
+                          same base. Needs the `bench` profile
+                          (`rebar3 as test,bench compile`).
+                    """
+            },
+            #{
                 name => standalone,
                 long => "-standalone",
                 type => boolean,
@@ -1399,6 +1416,8 @@ start_server(roadrunner, #{protocol := h2c, scenario := Scenario}) ->
     start_roadrunner_h2c(Scenario);
 start_server(roadrunner, #{protocol := h3, scenario := Scenario, cert_dir := CertDir}) ->
     start_roadrunner_h3(Scenario, CertDir);
+start_server(erlang_quic, #{protocol := h3, scenario := Scenario, cert_dir := CertDir}) ->
+    start_erlang_quic_h3(Scenario, CertDir);
 start_server(cowboy, #{protocol := h1, scenario := Scenario}) ->
     start_cowboy_h1(Scenario);
 start_server(cowboy, #{protocol := h2, scenario := Scenario, cert_dir := CertDir}) ->
@@ -1567,6 +1586,23 @@ start_roadrunner_h3(Scenario, CertDir) ->
     {ok, _} = peer:call(Peer, roadrunner, start_listener, [bench_rr_h3, ListenerOpts]),
     Port = peer:call(Peer, roadrunner_listener, port, [bench_rr_h3]),
     print_listener_config([{"listener_opts", ListenerOpts}]),
+    {Peer, Port}.
+
+%% The `quic` dep's turnkey HTTP/3 server, the `erlang_quic` comparison target.
+%% Mirrors `start_roadrunner_h3/2`: a peer BEAM serves the scenario over QUIC
+%% with the same generated cert, and the bound UDP port is read back. The
+%% dep-using starter lives in `bench/bench_erlang_quic_server.erl` (bench
+%% profile only).
+start_erlang_quic_h3(Scenario, CertDir) ->
+    {ok, Peer, _Node} = peer:start_link(#{
+        name => peer:random_name(),
+        connection => standard_io,
+        args => pa_args_for_peer(),
+        wait_boot => 10000
+    }),
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [quic]),
+    {ok, Port} = peer:call(Peer, bench_erlang_quic_server, start, [CertDir, Scenario]),
+    print_listener_config([{"server", "erlang_quic (quic dep) http3"}, {"port", Port}]),
     {Peer, Port}.
 
 start_cowboy_h2(Scenario, CertDir) ->
@@ -3517,7 +3553,8 @@ run_phase_h2(Port, #{clients := C, host := Host, scenario := Scenario}, Duration
     EndUs = erlang:monotonic_time(microsecond),
     aggregate(PerWorker, EndUs - StartUs).
 
-run_phase_h3(Port, #{clients := C, host := Host, scenario := Scenario}, DurationMs) ->
+run_phase_h3(Port, #{clients := C, host := Host, scenario := Scenario} = Opts, DurationMs) ->
+    Client = h3_client_mod(Opts),
     Deadline = erlang:monotonic_time(millisecond) + DurationMs,
     {Method, Path, ReqHeaders, ReqBody} = h2_request_shape(Scenario),
     Self = self(),
@@ -3527,7 +3564,7 @@ run_phase_h3(Port, #{clients := C, host := Host, scenario := Scenario}, Duration
             Self !
                 {self(),
                     h3_worker_loop(
-                        Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, init_acc()
+                        Client, Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, init_acc()
                     )}
         end)
      || _ <- lists:seq(1, C)
@@ -3540,12 +3577,20 @@ run_phase_h3(Port, #{clients := C, host := Host, scenario := Scenario}, Duration
 %% `h2_keep_alive_loop` (it only calls `roadrunner_bench_client:request/
 %% close`, which dispatch on the conn record) + the shared
 %% `h2_request_shape/1` scenario table.
-h3_worker_loop(Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->
-    case roadrunner_bench_client:open(Host, Port, h3) of
+h3_worker_loop(Client, Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->
+    case Client:open(Host, Port, h3) of
         {ok, Conn} ->
-            h2_keep_alive_loop(Conn, Method, Path, ReqHeaders, ReqBody, Deadline, Acc);
+            h2_keep_alive_loop(Client, Conn, Method, Path, ReqHeaders, ReqBody, Deadline, Acc);
         {error, _} ->
             bump_err(Acc)
+    end.
+
+%% The h3 loadgen module for the run (`--h3-client`): the dep-free native
+%% client by default, or the `quic` dep client for the server comparison.
+h3_client_mod(Opts) ->
+    case maps:get(h3_client, Opts, native) of
+        dep -> bench_quic_h3_loadgen;
+        native -> roadrunner_bench_client
     end.
 
 %% tls_handshake_throughput: open a fresh TLS+ALPN-h2 conn per
@@ -3883,27 +3928,32 @@ h2_request_shape(httparena_static) ->
 h2_worker_loop(Host, Port, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->
     case roadrunner_bench_client:open(Host, Port, h2_client_proto()) of
         {ok, Conn} ->
-            h2_keep_alive_loop(Conn, Method, Path, ReqHeaders, ReqBody, Deadline, Acc);
+            h2_keep_alive_loop(
+                roadrunner_bench_client, Conn, Method, Path, ReqHeaders, ReqBody, Deadline, Acc
+            );
         {error, _} ->
             bump_err(Acc)
     end.
 
-h2_keep_alive_loop(Conn, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->
+%% Shared keep-alive request loop for h2 and h3. `Client` is the loadgen module
+%% (`roadrunner_bench_client` or, for the h3 dep comparison,
+%% `bench_quic_h3_loadgen`); both expose `request/5` + `close/1` over the conn.
+h2_keep_alive_loop(Client, Conn, Method, Path, ReqHeaders, ReqBody, Deadline, Acc) ->
     case erlang:monotonic_time(millisecond) >= Deadline of
         true ->
-            _ = roadrunner_bench_client:close(Conn),
+            _ = Client:close(Conn),
             Acc;
         false ->
             T0 = erlang:monotonic_time(nanosecond),
-            case roadrunner_bench_client:request(Conn, Method, Path, ReqHeaders, ReqBody) of
+            case Client:request(Conn, Method, Path, ReqHeaders, ReqBody) of
                 {ok, 200, _RespHeaders, RespBody, Conn1} ->
                     T1 = erlang:monotonic_time(nanosecond),
                     h2_keep_alive_loop(
-                        Conn1, Method, Path, ReqHeaders, ReqBody, Deadline,
+                        Client, Conn1, Method, Path, ReqHeaders, ReqBody, Deadline,
                         bump_ok(Acc, T1 - T0, byte_size(RespBody))
                     );
                 _Other ->
-                    _ = roadrunner_bench_client:close(Conn),
+                    _ = Client:close(Conn),
                     bump_err(Acc)
             end
     end.
@@ -4379,6 +4429,10 @@ fmt_ns(N) -> io_lib:format("~.2f s", [N / 1000000000]).
 
 setup_code_paths(BaseDir) ->
     Candidates = [
+        %% `--h3-client dep` / `--servers erlang_quic` build with the `bench`
+        %% profile combined with `test`, which lands under `test+bench`; prefer
+        %% it so the `quic` dep beams are on the path.
+        filename:join([BaseDir, "_build", "test+bench", "lib"]),
         filename:join([BaseDir, "_build", "test", "lib"]),
         filename:join([BaseDir, "_build", "default", "lib"])
     ],
@@ -4403,6 +4457,13 @@ setup_code_paths(BaseDir) ->
             TestDir = filename:join([LibDir, Lib, "test"]),
             case filelib:is_dir(TestDir) of
                 true -> code:add_pathz(TestDir);
+                false -> ok
+            end,
+            %% The `bench` profile's extra_src_dir (the dep-using h3
+            %% comparison code) lands here, not in ebin.
+            BenchDir = filename:join([LibDir, Lib, "bench"]),
+            case filelib:is_dir(BenchDir) of
+                true -> code:add_pathz(BenchDir);
                 false -> ok
             end
         end,
