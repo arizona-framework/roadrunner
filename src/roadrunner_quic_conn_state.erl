@@ -563,11 +563,29 @@ process_frame(_Now, application, {stream, Sid, Offset, Data, Fin}, State) ->
     process_stream(Sid, Offset, Data, Fin, State);
 process_frame(_Now, application, {reset_stream, Sid, ErrorCode, FinalSize}, State) ->
     process_reset_stream(Sid, ErrorCode, FinalSize, State);
+process_frame(_Now, application, {max_data, Max}, #state{conn_flow = ConnFlow} = State) ->
+    %% Peer raised the connection-level send limit (RFC 9000 §4.1): grow the
+    %% send window so a transfer past the initial grant keeps flowing. The send
+    %% pass at the end of the datagram serves any stream this unblocks.
+    State#state{conn_flow = roadrunner_quic_flow:on_max_data_received(Max, ConnFlow)};
+process_frame(_Now, application, {max_stream_data, Sid, Max}, State) ->
+    on_max_stream_data(Sid, Max, State);
 process_frame(_Now, _Level, _Frame, State) ->
-    %% ping / padding are no-ops. Peer flow-credit grants (MAX_DATA /
-    %% MAX_STREAM_DATA) and MAX_STREAMS are accepted but not yet acted on, so
-    %% the send side keeps the default window until that follow-up lands.
+    %% ping / padding are no-ops. MAX_STREAMS is accepted but not yet acted on
+    %% (the server never opens enough streams to need the raised limit).
     State.
+
+%% Raise a stream's send limit from a received MAX_STREAM_DATA (RFC 9000 §4.1).
+%% Only a tracked stream can have unsent data to unblock; a grant for an unknown
+%% id is ignored.
+-spec on_max_stream_data(non_neg_integer(), non_neg_integer(), t()) -> t().
+on_max_stream_data(Sid, Max, #state{streams = Streams} = State) ->
+    case Streams of
+        #{Sid := {Stream, Flow}} ->
+            put_stream(Sid, Stream, roadrunner_quic_flow:on_max_data_received(Max, Flow), State);
+        #{} ->
+            State
+    end.
 
 %% Reassemble CRYPTO, deframe complete handshake messages, and drive the
 %% TLS sequencer.

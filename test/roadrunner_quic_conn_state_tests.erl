@@ -800,6 +800,32 @@ send_blocked_by_exhausted_send_window_test() ->
     ?assert(byte_size(Sent) > 0),
     ?assert(byte_size(Sent) < byte_size(Payload)).
 
+send_resumes_after_max_data_and_max_stream_data_test() ->
+    %% After the send window fills (RFC 9000 §4.1), the peer's MAX_DATA /
+    %% MAX_STREAM_DATA grants raise the connection and per-stream send limits and
+    %% the next send pass resumes the still-pending stream, so the whole payload
+    %% eventually reaches the wire.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Payload = binary:copy(~"x", 786432 + 1000),
+    {State1, E1} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
+    Sent1 = iolist_to_binary([D || {stream, 0, _, D, _} <- sent_stream_frames(E1, ServerApSecret)]),
+    ?assert(byte_size(Sent1) < byte_size(Payload)),
+    Grant = app_datagram(
+        [{max_data, 786432 * 2}, {max_stream_data, 0, 786432 * 2}], 0, ClientApSecret
+    ),
+    {_State2, E2} = ?M:handle_datagram(?NOW, Grant, State1),
+    Sent2 = iolist_to_binary([D || {stream, 0, _, D, _} <- sent_stream_frames(E2, ServerApSecret)]),
+    ?assert(byte_size(Sent2) > 0),
+    ?assertEqual(byte_size(Payload), byte_size(Sent1) + byte_size(Sent2)).
+
+max_stream_data_for_untracked_stream_ignored_test() ->
+    %% A MAX_STREAM_DATA grant for a stream the server is not tracking is ignored
+    %% (on_max_stream_data's unknown-id branch); the connection survives.
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    Grant = app_datagram([{max_stream_data, 4, 1000000}], 0, ClientApSecret),
+    {State1, _Effects} = ?M:handle_datagram(?NOW, Grant, State),
+    ?assertEqual(connected, ?M:phase(State1)).
+
 send_data_on_control_then_request_stream_test() ->
     %% The two load-bearing GET writes: SETTINGS on the server control stream
     %% (id 3) then a response on the client request stream (id 0), each on its
