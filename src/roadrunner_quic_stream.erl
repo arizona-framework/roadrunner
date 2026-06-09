@@ -128,6 +128,11 @@ reset(FinalSize, #stream{final_size = Existing} = Stream) ->
 
 -doc "Append outbound bytes to the stream's send buffer.".
 -spec enqueue(iodata(), t()) -> t().
+enqueue(Data, #stream{send_buf = <<>>} = Stream) ->
+    %% First write into an empty buffer (the common single-response case): store
+    %% the bytes directly, with no copy when Data is already a binary, instead of
+    %% concatenating onto the empty buffer (which copies the whole body).
+    Stream#stream{send_buf = iolist_to_binary(Data)};
 enqueue(Data, #stream{send_buf = Buf} = Stream) ->
     Stream#stream{send_buf = <<Buf/binary, (iolist_to_binary(Data))/binary>>}.
 
