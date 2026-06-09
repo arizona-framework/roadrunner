@@ -771,12 +771,17 @@ send_data_multi_call_advances_offset_test() ->
 send_data_slices_large_payload_test() ->
     %% A payload larger than the per-packet budget is sliced across datagrams
     %% (one STREAM frame each), offsets contiguous, FIN on the last slice, and
-    %% the bytes reassemble to the original.
+    %% the bytes reassemble to the original. Each slice fills toward the
+    %% 1200-byte datagram, so the first slice carries well past the bytes an
+    %% old fixed 1000-byte budget would have allowed.
     {State, ApSecret} = connected_for_send(),
     Payload = binary:copy(~"x", 2500),
     {_State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, true, ?NOW, State),
     Frames = sent_stream_frames(Effects, ApSecret),
-    ?assertEqual([0, 1000, 2000], [Off || {stream, 0, Off, _, _} <- Frames]),
+    Sizes = [byte_size(D) || {stream, 0, _, D, _} <- Frames],
+    ?assert(length(Frames) > 1),
+    ?assert(hd(Sizes) > 1000),
+    ?assertEqual(expected_offsets(0, Sizes), [Off || {stream, 0, Off, _, _} <- Frames]),
     ?assertEqual([false, false, true], [Fin || {stream, 0, _, _, Fin} <- Frames]),
     ?assertEqual(Payload, iolist_to_binary([D || {stream, 0, _, D, _} <- Frames])).
 
@@ -1131,3 +1136,10 @@ emits(Effects) ->
 arm_deadline(Effects) ->
     [AtMs] = [At || {arm_timer, pto, At} <- Effects],
     AtMs.
+
+%% The contiguous send offsets for a run of slice sizes: each offset is the
+%% total bytes emitted before it.
+expected_offsets(_Acc, []) ->
+    [];
+expected_offsets(Acc, [Size | Rest]) ->
+    [Acc | expected_offsets(Acc + Size, Rest)].

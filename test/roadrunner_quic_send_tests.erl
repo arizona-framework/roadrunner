@@ -162,8 +162,49 @@ ack_eliciting_classification_test() ->
     ].
 
 %% =============================================================================
+%% STREAM data budget: a budgeted slice fills the 1200-byte datagram without
+%% exceeding it (RFC 9000 §14).
+%% =============================================================================
+
+%% With the minimal overhead (8-byte DCID, 1-byte packet number, stream 0 at
+%% offset 0, no same-packet ACK), the budgeted slice plus its framing exactly
+%% fills the 1200-byte datagram.
+stream_data_budget_fills_to_limit_test() ->
+    {Budget, Size} = budget_datagram_size(?DCID, 0, [], 0, 0),
+    ?assertEqual(1170, Budget),
+    ?assertEqual(1200, Size).
+
+%% Across a same-packet ACK, wide stream id / offset / packet number, and a
+%% zero-length DCID, the budgeted slice never pushes the datagram past 1200.
+stream_data_budget_never_exceeds_limit_test() ->
+    Cases = [
+        {?DCID, 0, [{ack, 5, 0, 3, [], undefined}], 0, 0},
+        {?DCID, 16#1234, [], 100000, 1000000},
+        {?DCID, 16#123456, [{ack, 9, 0, 0, [{0, 0}], undefined}], 16#3FFFFFFF, 16#3FFFFFFF},
+        {<<>>, 0, [], 0, 0}
+    ],
+    [
+        begin
+            {Budget, Size} = budget_datagram_size(DCID, PN, AckFrames, Sid, Offset),
+            ?assert(Budget > 0),
+            ?assert(Size =< 1200)
+        end
+     || {DCID, PN, AckFrames, Sid, Offset} <- Cases
+    ].
+
+%% =============================================================================
 %% Helpers
 %% =============================================================================
+
+%% Build a 1-RTT datagram whose STREAM frame carries exactly a budgeted slice
+%% (preceded by any same-packet ACK), returning the budget and the datagram
+%% size for the fits-within-1200 assertions.
+budget_datagram_size(DCID, PN, AckFrames, Sid, Offset) ->
+    Budget = ?M:stream_data_budget(DCID, PN, AckFrames, Sid, Offset),
+    Frames = AckFrames ++ [{stream, Sid, Offset, <<0:(Budget * 8)>>, false}],
+    Entry = #{frames => Frames, keys => application_keys(), pn => PN},
+    {Datagram, _} = ?M:datagram(#{application => Entry}, DCID, ?SCID),
+    {Budget, byte_size(Datagram)}.
 
 recv(Datagram, Keys) ->
     roadrunner_quic_recv:datagram(Datagram, byte_size(?DCID), Keys, #{}).

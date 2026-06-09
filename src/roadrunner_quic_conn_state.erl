@@ -46,10 +46,6 @@
 %% A CRYPTO slice budget that leaves room for the packet header, an ACK
 %% frame, and the AEAD tag within the 1200-byte datagram (RFC 9000 §14).
 -define(CRYPTO_BUDGET, 1000).
-%% A STREAM data-slice budget, leaving room for the short header, an ACK
-%% frame, the STREAM frame header, and the AEAD tag within the 1200-byte
-%% datagram (RFC 9000 §14).
--define(STREAM_BUDGET, 1000).
 %% Default idle timeout (RFC 9000 §10.1): the connection silently closes after
 %% this many ms with no packet received. Seeding it from the advertised / peer
 %% max_idle_timeout is a follow-up.
@@ -937,8 +933,8 @@ build_level(Level, State) ->
 %% fresh data: CRYPTO at the handshake levels, application STREAM frames at
 %% the application level (which never carries CRYPTO).
 -spec build_data(level(), [roadrunner_quic_frame:frame()], #space{}, t()) -> none | {map(), t()}.
-build_data(application, AckFrames, Space, State) ->
-    {StreamFrames, State1} = take_stream(State),
+build_data(application, AckFrames, #space{next_pn = PN} = Space, State) ->
+    {StreamFrames, State1} = take_stream(AckFrames, PN, State),
     case AckFrames ++ StreamFrames of
         [] -> none;
         Frames -> build_entry(application, Frames, Space, State1)
@@ -954,27 +950,38 @@ build_data(Level, AckFrames, Space, State) ->
 %% FIN to send and the credit to send it, skipping streams blocked by send
 %% flow control (a buffered-but-unsendable stream yields `nothing`; a pending
 %% FIN-only frame costs no credit and is always emitted). The slice is bounded
-%% by the connection and per-stream send windows and the per-packet budget,
-%% and the bytes are accounted against both windows.
--spec take_stream(t()) -> {[roadrunner_quic_frame:frame()], t()}.
-take_stream(#state{sendable = Sendable} = State) ->
+%% by the connection and per-stream send windows and by the room left in the
+%% datagram after the header, the same-packet ACK, the STREAM frame header, and
+%% the AEAD tag (so the datagram fills the 1200-byte path limit without
+%% exceeding it); the bytes are accounted against both windows. The same-packet
+%% ACK frames and the packet number size the per-datagram room.
+-spec take_stream([roadrunner_quic_frame:frame()], non_neg_integer(), t()) ->
+    {[roadrunner_quic_frame:frame()], t()}.
+take_stream(AckFrames, PN, #state{sendable = Sendable} = State) ->
     %% Only streams with pending send data are candidates, already ascending;
     %% finished/drained streams never enter the walk (see `put_stream/4`).
-    take_stream(Sendable, State).
+    take_stream(Sendable, AckFrames, PN, State).
 
--spec take_stream([non_neg_integer()], t()) -> {[roadrunner_quic_frame:frame()], t()}.
-take_stream([], State) ->
+-spec take_stream([non_neg_integer()], [roadrunner_quic_frame:frame()], non_neg_integer(), t()) ->
+    {[roadrunner_quic_frame:frame()], t()}.
+take_stream([], _AckFrames, _PN, State) ->
     {[], State};
-take_stream([Sid | Rest], #state{streams = Streams, conn_flow = ConnFlow} = State) ->
+take_stream(
+    [Sid | Rest],
+    AckFrames,
+    PN,
+    #state{streams = Streams, conn_flow = ConnFlow, peer_scid = DCID} = State
+) ->
     #{Sid := {Stream0, StreamFlow0}} = Streams,
+    Offset0 = roadrunner_quic_stream:send_offset(Stream0),
     Budget = lists:min([
-        ?STREAM_BUDGET,
+        roadrunner_quic_send:stream_data_budget(DCID, PN, AckFrames, Sid, Offset0),
         roadrunner_quic_flow:send_window(ConnFlow),
         roadrunner_quic_flow:send_window(StreamFlow0)
     ]),
     case roadrunner_quic_stream:next_frame(Budget, Stream0) of
         nothing ->
-            take_stream(Rest, State);
+            take_stream(Rest, AckFrames, PN, State);
         {Offset, Data, Fin, Stream1} ->
             Size = byte_size(Data),
             {_, ConnFlow1} = roadrunner_quic_flow:on_data_sent(Size, ConnFlow),
