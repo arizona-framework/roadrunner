@@ -596,26 +596,30 @@ stream_over_advertised_stream_flow_limit_closes_test() ->
     ?assertEqual([{emit, self(), {closed, {local, flow_control_error}}}], emits(Effects)).
 
 data_over_advertised_connection_flow_limit_closes_test() ->
-    %% Data spread across streams, each within its per-stream window but
-    %% together exceeding the advertised connection window (initial_max_data),
-    %% is an RFC 9000 §4.1 flow-control connection error. Two full per-stream
-    %% windows fill the connection window exactly; one more byte on a third
-    %% stream overflows it, proving the window is the advertised value (it would
-    %% not trip this early under a larger default).
-    {State0, ApSecret} = connected_with_owner(),
-    Chunk = binary:copy(~"x", ?STREAM_RECV_WINDOW),
-    {State1, _} = ?M:handle_datagram(
-        ?NOW, app_datagram([{stream, 0, 0, Chunk, false}], 0, ApSecret), State0
-    ),
-    {State2, _} = ?M:handle_datagram(
-        ?NOW, app_datagram([{stream, 4, 0, Chunk, false}], 1, ApSecret), State1
-    ),
-    ?assertEqual(connected, ?M:phase(State2)),
-    {State3, Effects} = ?M:handle_datagram(
-        ?NOW, app_datagram([{stream, 8, 0, ~"x", false}], 2, ApSecret), State2
-    ),
-    ?assertEqual(closed, ?M:phase(State3)),
+    %% A STREAM frame whose length exceeds the advertised connection window
+    %% (initial_max_data, checked before the per-stream window) is an RFC 9000
+    %% §4.1 flow-control connection error. Incremental uploads within the window
+    %% are instead kept flowing by MAX_DATA grants (see
+    %% recv_window_refilled_with_max_data_and_max_stream_data_test); enforcement
+    %% trips only on exceeding the current limit in one shot, ahead of any grant.
+    {State, ApSecret} = connected_with_owner(),
+    Oversized = binary:copy(~"x", ?CONN_RECV_WINDOW + 1),
+    Bad = app_datagram([{stream, 0, 0, Oversized, false}], 0, ApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, flow_control_error}}}], emits(Effects)).
+
+%% As the peer uploads past the refill threshold, the server advertises fresh
+%% receive credit with MAX_DATA (connection) and MAX_STREAM_DATA (stream) so a
+%% large upload keeps flowing (RFC 9000 §4.1). 600 bytes is past 3/4 of both the
+%% connection (2000) and stream (1000) windows.
+recv_window_refilled_with_max_data_and_max_stream_data_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Upload = app_datagram([{stream, 0, 0, binary:copy(~"u", 600), false}], 0, ClientApSecret),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, Upload, State),
+    Frames = sent_app_frames(Effects, ServerApSecret),
+    ?assert(lists:member({max_data, 600 + ?CONN_RECV_WINDOW}, Frames)),
+    ?assert(lists:member({max_stream_data, 0, 600 + ?STREAM_RECV_WINDOW}, Frames)).
 
 stream_retransmit_does_not_re_consume_flow_test() ->
     %% Flow control is charged by the increase in the highest received offset,
