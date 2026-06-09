@@ -314,6 +314,24 @@ handle_datagram(
 %% with {connected, _} ordered ahead of any stream events from the same
 %% datagram so the owner opens its control stream before the first request.
 -spec finish_datagram(integer(), phase(), t()) -> {t(), [effect()]}.
+finish_datagram(_Now, draining, #state{phase = draining} = State) ->
+    %% A packet arrived during an established connection's drain window: absorb it
+    %% silently (RFC 9000 §10.2.2). Send nothing and arm no timer, so the drain
+    %% timer set on entry keeps running in the shell.
+    drain_emits(State);
+finish_datagram(Now, _Before, #state{phase = draining, pending_close = undefined} = State) ->
+    %% Just entered draining via a peer CONNECTION_CLOSE: deliver {closed, _} and
+    %% arm the drain timer; send nothing.
+    {State1, EmitEffects} = drain_emits(State),
+    {State1, [{arm_timer, drain, drain_deadline(Now, State1)} | EmitEffects]};
+finish_datagram(Now, _Before, #state{phase = draining} = State) ->
+    %% Just entered draining via a locally-detected error: send our one
+    %% CONNECTION_CLOSE, deliver {closed, _}, and arm the drain timer. An
+    %% established connection's address is validated, so the close always fits the
+    %% §8.1 budget (send_close emits exactly one datagram).
+    {State1, [Close]} = send_close(State),
+    {State2, EmitEffects} = drain_emits(State1),
+    {State2, [Close, {arm_timer, drain, drain_deadline(Now, State2)} | EmitEffects]};
 finish_datagram(_Now, _Before, #state{phase = closed, pending_close = undefined} = State) ->
     drain_emits(State);
 finish_datagram(_Now, _Before, #state{phase = closed} = State) ->
@@ -399,46 +417,47 @@ handle_call(From, Ref, {reset_stream, Sid, ErrorCode}, Now, State) ->
 handle_call(From, Ref, {stop_sending, Sid, ErrorCode}, Now, State) ->
     {State1, SendEffects} = do_stop_sending(Sid, ErrorCode, Now, State),
     {State1, [{reply, From, Ref, ok} | SendEffects]};
-handle_call(From, Ref, {close, ErrorCode}, _Now, State) ->
-    {State1, CloseEffects} = owner_close(ErrorCode, <<>>, State),
+handle_call(From, Ref, {close, ErrorCode}, Now, State) ->
+    {State1, CloseEffects} = owner_close(ErrorCode, <<>>, Now, State),
     {State1, [{reply, From, Ref, ok} | CloseEffects]};
-handle_call(From, Ref, {close, ErrorCode, Reason}, _Now, State) ->
-    {State1, CloseEffects} = owner_close(ErrorCode, Reason, State),
+handle_call(From, Ref, {close, ErrorCode, Reason}, Now, State) ->
+    {State1, CloseEffects} = owner_close(ErrorCode, Reason, Now, State),
     {State1, [{reply, From, Ref, ok} | CloseEffects]}.
 
 %% The owner closes the connection (RFC 9000 §10.2.2): send one application
 %% CONNECTION_CLOSE (0x1d, carrying the h3 error code and reason phrase) at the
-%% 1-RTT level and mark the connection closed so the shell exits. The owner
-%% triggered this, so no {closed, _} is emitted back; this runs only once the
-%% connection is established (1-RTT keys present), which is the only state the
-%% owner has a connection to close in. Distinct from connection_fatal/send_close
-%% (a locally-detected transport error during datagram processing): this is the
+%% 1-RTT level and linger in `draining` for 3x PTO so the peer's reordered
+%% packets are absorbed before the shell tears down. The owner triggered this, so
+%% no {closed, _} is emitted back; this runs only once the connection is
+%% established (1-RTT keys present), which is the only state the owner has a
+%% connection to close in. Distinct from connection_fatal/send_close (a
+%% locally-detected transport error during datagram processing): this is the
 %% application-variant close and never coalesces with other frames.
--spec owner_close(non_neg_integer(), binary(), t()) -> {t(), [effect()]}.
-owner_close(ErrorCode, Reason, #state{send_keys = SendKeys} = State) ->
+-spec owner_close(non_neg_integer(), binary(), integer(), t()) -> {t(), [effect()]}.
+owner_close(ErrorCode, Reason, Now, #state{send_keys = SendKeys} = State) ->
     case SendKeys of
         #{application := Keys} ->
-            send_owner_close(ErrorCode, Reason, Keys, State);
+            send_owner_close(ErrorCode, Reason, Keys, Now, State);
         #{} ->
             %% The owner closed before the handshake completed (e.g. the
             %% connection_handler refusing on max_clients): there are no 1-RTT
             %% keys to carry an application CONNECTION_CLOSE, so close silently
-            %% and let the client time out. The connection still ends.
+            %% and let the client time out. No 1-RTT packets exist to drain.
             {State#state{phase = closed}, []}
     end.
 
--spec send_owner_close(non_neg_integer(), binary(), roadrunner_quic_keys:keys(), t()) ->
+-spec send_owner_close(non_neg_integer(), binary(), roadrunner_quic_keys:keys(), integer(), t()) ->
     {t(), [effect()]}.
-send_owner_close(ErrorCode, Reason, Keys, #state{peer_scid = DCID, scid = SCID} = State) ->
+send_owner_close(ErrorCode, Reason, Keys, Now, #state{peer_scid = DCID, scid = SCID} = State) ->
     Space = space(application, State),
     PN = Space#space.next_pn,
     Frame = {connection_close, application, ErrorCode, undefined, Reason},
     Entry = #{application => #{frames => [Frame], keys => Keys, pn => PN}},
     {Datagram, _Sent} = roadrunner_quic_send:datagram(Entry, DCID, SCID),
     State1 = put_space(
-        application, Space#space{next_pn = PN + 1}, State#state{phase = closed}
+        application, Space#space{next_pn = PN + 1}, State#state{phase = draining}
     ),
-    {State1, [{send, Datagram}]}.
+    {State1, [{send, Datagram}, {arm_timer, drain, drain_deadline(Now, State1)}]}.
 
 %% Abandon the send side of a stream and tell the peer with a RESET_STREAM (RFC
 %% 9000 §19.4): discard the unsent buffer, record the bytes already sent as the
@@ -476,11 +495,13 @@ Buffer outbound stream data and run a send pass: the shell forwards
 `{quic_send, From, Ref, Sid, IoData, Fin}` here. The data is enqueued on the
 stream's send buffer (the stream is created on first reference), an optional
 FIN is flagged, then the queued bytes are flushed as STREAM frames within the
-connection and per-stream send-flow credit. Always replies `ok`; rejecting a
-send on a draining/closed connection is a teardown-slice follow-up.
+connection and per-stream send-flow credit. Replies `ok`, or `{error, closed}`
+on a draining connection, which sends no application data (RFC 9000 §10.2.2).
 """.
 -spec handle_send(pid(), reference(), non_neg_integer(), iodata(), boolean(), integer(), t()) ->
     {t(), [effect()]}.
+handle_send(From, Ref, _Sid, _IoData, _Fin, _Now, #state{phase = draining} = State) ->
+    {State, [{reply, From, Ref, {error, closed}}]};
 handle_send(From, Ref, Sid, IoData, Fin, Now, State) ->
     State1 = enqueue_send(Sid, IoData, Fin, State),
     {State2, SendEffects} = send_pass(Now, State1),
@@ -523,10 +544,13 @@ stream_for_send(
     end.
 
 -spec process_outcome(integer(), roadrunner_quic_recv:outcome(), t()) -> t().
-process_outcome(_Now, _Outcome, #state{phase = closed} = State) ->
-    %% A close fired on an earlier packet in this datagram; skip the rest so we
-    %% neither act on their frames nor discard (via validate_on_handshake) the
-    %% space and keys a pending local close still needs to send its frame.
+process_outcome(_Now, _Outcome, #state{phase = Phase} = State) when
+    Phase =:= closed; Phase =:= draining
+->
+    %% A close fired on an earlier packet in this datagram, or a packet arrived
+    %% during the drain window: skip the rest so we neither act on their frames
+    %% nor discard (via validate_on_handshake) the space and keys a pending local
+    %% close still needs to send its frame.
     State;
 process_outcome(
     Now, {ok, #{level := Level, pn := PN, frames := Frames}}, #state{spaces = Spaces} = State
@@ -575,9 +599,12 @@ record_received(Level, PN, Frames, #state{spaces = Spaces} = State) ->
 %% =============================================================================
 
 -spec process_frame(integer(), level(), roadrunner_quic_frame:frame(), t()) -> t().
-process_frame(_Now, _Level, _Frame, #state{phase = closed} = State) ->
-    %% A CONNECTION_CLOSE earlier in this packet already closed the connection;
-    %% ignore the remaining frames (RFC 9000 §10.2.2).
+process_frame(_Now, _Level, _Frame, #state{phase = Phase} = State) when
+    Phase =:= closed; Phase =:= draining
+->
+    %% A CONNECTION_CLOSE earlier in this packet already closed the connection, or
+    %% the packet arrived during the drain window; ignore the remaining frames
+    %% (RFC 9000 §10.2.2).
     State;
 process_frame(
     _Now, application, {connection_close, _Variant, ErrorCode, _FrameType, _Reason}, State
@@ -869,25 +896,50 @@ process_reset_stream(Sid, ErrorCode, FinalSize, State) ->
     end.
 
 %% A well-placed peer CONNECTION_CLOSE (transport at any level, or application
-%% at 1-RTT) ends the connection: surface it to the owner and mark the
-%% connection closed so the send pass is skipped and the shell exits. Lingering
-%% in `draining` for 3x PTO to absorb the peer's reordered packets is a
-%% follow-up; for now the listener drops late packets to the gone pid.
+%% at 1-RTT) ends the connection: surface it to the owner and move to the
+%% terminal phase so the send pass is skipped. An established connection lingers
+%% in `draining` (closing_phase/1) to absorb the peer's reordered 1-RTT packets;
+%% a handshake-phase close ends at once.
 -spec process_close(non_neg_integer(), t()) -> t().
 process_close(ErrorCode, State) ->
-    emit({closed, {peer, ErrorCode}}, State#state{phase = closed}).
+    emit({closed, {peer, ErrorCode}}, State#state{phase = closing_phase(State)}).
 
 %% Close this single, isolated connection on a peer-reachable protocol error
 %% (flow control §4.1, final size §4.5, stream state §19.8, an out-of-place
 %% application CONNECTION_CLOSE §19.19, or a failed TLS handshake): record a
-%% CONNECTION_CLOSE to transmit at the triggering packet's level (Level), mark
-%% the connection closed so the fold short-circuits and the shell exits
-%% cleanly (no crash, no slot leak), and surface a terminal {closed, {local,
-%% Reason}} to the owner.
+%% CONNECTION_CLOSE to transmit at the triggering packet's level (Level), move to
+%% the terminal phase so the fold short-circuits and the shell tears down cleanly
+%% (no crash, no slot leak), and surface a terminal {closed, {local, Reason}} to
+%% the owner. An established connection lingers in `draining` (closing_phase/1).
 -spec connection_fatal(level(), atom(), t()) -> t().
 connection_fatal(Level, Reason, State) ->
-    State1 = State#state{phase = closed, pending_close = {Level, close_code(Reason)}},
+    State1 = State#state{
+        phase = closing_phase(State), pending_close = {Level, close_code(Reason)}
+    },
     emit({closed, {local, Reason}}, State1).
+
+%% The terminal phase a close moves to (RFC 9000 §10.2): an established
+%% connection lingers in `draining` for 3x PTO so the peer's reordered 1-RTT
+%% packets are absorbed before its connection id is freed; a close during the
+%% handshake has no 1-RTT packets to absorb, so it ends immediately (and a
+%% handshake flood cannot accrue lingering draining connections).
+-spec closing_phase(t()) -> phase().
+closing_phase(#state{phase = connected}) -> draining;
+closing_phase(_State) -> closed.
+
+%% The absolute time the drain window ends: three PTOs from now (RFC 9000 §10.2),
+%% the largest across the still-present spaces.
+-spec drain_deadline(integer(), t()) -> integer().
+drain_deadline(Now, State) ->
+    Now + 3 * max_pto(State).
+
+-spec max_pto(t()) -> non_neg_integer().
+max_pto(#state{spaces = Spaces}) ->
+    maps:fold(
+        fun(_Level, #space{loss = Loss}, Acc) -> max(Acc, roadrunner_quic_loss:get_pto(Loss)) end,
+        0,
+        Spaces
+    ).
 
 %% Map a connection-error reason to its CONNECTION_CLOSE wire error code: a TLS
 %% handshake failure becomes a CRYPTO_ERROR (RFC 9001 §4.8: 0x0100 + alert), a
@@ -1301,7 +1353,11 @@ handle_timeout(Now, pto, State) ->
     State1 = lists:foldl(fun(Level, S) -> on_pto(Now, Level, S) end, State, present_levels(State)),
     send_pass(Now, State1);
 handle_timeout(_Now, idle, State) ->
-    drain_emits(emit({closed, {local, idle_timeout}}, State#state{phase = closed})).
+    drain_emits(emit({closed, {local, idle_timeout}}, State#state{phase = closed}));
+handle_timeout(_Now, drain, State) ->
+    %% The drain window elapsed (RFC 9000 §10.2): become closed so the shell
+    %% tears the connection down. The owner already learned of the close on entry.
+    {State#state{phase = closed}, []}.
 
 %% On a probe timeout: queue any time-threshold losses to retransmit and
 %% increment the space's probe-timeout backoff (RFC 9002 §6.2.1), so the

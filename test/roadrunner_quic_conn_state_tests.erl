@@ -300,7 +300,7 @@ application_close_at_1rtt_closes_test() ->
     {State, ApSecret} = connected_with_owner(),
     Close = app_datagram([{connection_close, application, 9, undefined, <<>>}], 0, ApSecret),
     {State1, Effects} = ?M:handle_datagram(?NOW, Close, State),
-    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {peer, 9}}}], emits(Effects)).
 
 %% =============================================================================
@@ -514,7 +514,7 @@ stream_on_server_initiated_id_closes_test() ->
     {State, ApSecret} = connected_with_owner(),
     Bad = app_datagram([{stream, 3, 0, ~"x", true}], 0, ApSecret),
     {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
-    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, stream_state_error}}}], emits(Effects)).
 
 reset_stream_on_server_initiated_id_closes_test() ->
@@ -523,7 +523,7 @@ reset_stream_on_server_initiated_id_closes_test() ->
     {State, ApSecret} = connected_with_owner(),
     Bad = app_datagram([{reset_stream, 1, 7, 0}], 0, ApSecret),
     {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
-    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, stream_state_error}}}], emits(Effects)).
 
 stream_over_advertised_bidi_count_closes_test() ->
@@ -534,7 +534,7 @@ stream_over_advertised_bidi_count_closes_test() ->
     OverLimit = ?MAX_STREAMS_BIDI * 4,
     Bad = app_datagram([{stream, OverLimit, 0, ~"x", true}], 0, ClientApSecret),
     {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
-    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, stream_limit_error}}}], emits(Effects)),
     ExpectedCode = roadrunner_quic_error:code_int(stream_limit_error),
     ?assert(
@@ -551,7 +551,7 @@ stream_over_advertised_uni_count_closes_test() ->
     OverLimit = ?MAX_STREAMS_UNI * 4 + 2,
     Bad = app_datagram([{stream, OverLimit, 0, ~"x", true}], 0, ApSecret),
     {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
-    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, stream_limit_error}}}], emits(Effects)).
 
 reset_over_advertised_bidi_count_closes_test() ->
@@ -560,7 +560,7 @@ reset_over_advertised_bidi_count_closes_test() ->
     OverLimit = ?MAX_STREAMS_BIDI * 4,
     Bad = app_datagram([{reset_stream, OverLimit, 7, 0}], 0, ApSecret),
     {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
-    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, stream_limit_error}}}], emits(Effects)).
 
 reset_over_advertised_uni_count_closes_test() ->
@@ -569,7 +569,7 @@ reset_over_advertised_uni_count_closes_test() ->
     OverLimit = ?MAX_STREAMS_UNI * 4 + 2,
     Bad = app_datagram([{reset_stream, OverLimit, 7, 0}], 0, ApSecret),
     {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
-    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, stream_limit_error}}}], emits(Effects)).
 
 stream_final_size_violation_closes_test() ->
@@ -581,7 +581,7 @@ stream_final_size_violation_closes_test() ->
     ),
     Bad = app_datagram([{stream, 0, 0, <<>>, true}], 1, ApSecret),
     {State2, Effects} = ?M:handle_datagram(?NOW, Bad, State1),
-    ?assertEqual(closed, ?M:phase(State2)),
+    ?assertEqual(draining, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, final_size_error}}}], emits(Effects)).
 
 reset_final_size_violation_closes_test() ->
@@ -593,7 +593,7 @@ reset_final_size_violation_closes_test() ->
     ),
     Bad = app_datagram([{reset_stream, 0, 7, 2}], 1, ApSecret),
     {State2, Effects} = ?M:handle_datagram(?NOW, Bad, State1),
-    ?assertEqual(closed, ?M:phase(State2)),
+    ?assertEqual(draining, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, final_size_error}}}], emits(Effects)).
 
 stream_over_advertised_stream_flow_limit_closes_test() ->
@@ -606,7 +606,7 @@ stream_over_advertised_stream_flow_limit_closes_test() ->
     Oversized = binary:copy(~"x", ?STREAM_RECV_WINDOW + 1),
     Bad = app_datagram([{stream, 0, 0, Oversized, false}], 0, ApSecret),
     {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
-    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, flow_control_error}}}], emits(Effects)).
 
 data_over_advertised_connection_flow_limit_closes_test() ->
@@ -620,7 +620,7 @@ data_over_advertised_connection_flow_limit_closes_test() ->
     Oversized = binary:copy(~"x", ?CONN_RECV_WINDOW + 1),
     Bad = app_datagram([{stream, 0, 0, Oversized, false}], 0, ApSecret),
     {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
-    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, flow_control_error}}}], emits(Effects)).
 
 %% As the peer uploads past the refill threshold, the server advertises fresh
@@ -734,14 +734,15 @@ stop_sending_sends_stop_sending_frame_test() ->
 
 owner_close_sends_application_close_test() ->
     %% An owner close sends one application-variant CONNECTION_CLOSE carrying the
-    %% h3 error code and reason phrase, marks the connection closed, and replies
-    %% ok (no {closed, _} back: the owner triggered it).
+    %% h3 error code and reason phrase, lingers in draining with a drain timer
+    %% armed, and replies ok (no {closed, _} back: the owner triggered it).
     {State, ApSecret} = connected_for_send(),
     Ref = make_ref(),
     {State1, Effects} = ?M:handle_call(self(), Ref, {close, 16#0100, ~"bye"}, ?NOW, State),
-    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual({reply, self(), Ref, ok}, hd(Effects)),
     ?assertEqual([], emits(Effects)),
+    ?assertMatch([_], [At || {arm_timer, drain, At} <- Effects]),
     ?assert(
         lists:member(
             {connection_close, application, 16#0100, undefined, ~"bye"},
@@ -753,7 +754,7 @@ owner_close_without_reason_sends_empty_phrase_test() ->
     %% close/2 (no reason) carries an empty reason phrase.
     {State, ApSecret} = connected_for_send(),
     {State1, Effects} = ?M:handle_call(self(), make_ref(), {close, 16#0100}, ?NOW, State),
-    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual(draining, ?M:phase(State1)),
     ?assert(
         lists:member(
             {connection_close, application, 16#0100, undefined, <<>>},
@@ -924,14 +925,17 @@ fully_sent_stream_is_skipped_on_later_pass_test() ->
 %% =============================================================================
 
 peer_connection_close_emits_closed_and_sends_nothing_test() ->
-    %% A peer CONNECTION_CLOSE moves the connection to `closed`, surfaces
-    %% {closed, {peer, ErrorCode}} to the owner, and sends nothing back.
+    %% A peer CONNECTION_CLOSE on an established connection lingers in `draining`
+    %% with a drain timer armed, surfaces {closed, {peer, ErrorCode}} to the
+    %% owner, and sends nothing back (RFC 9000 §10.2).
     {State, ApSecret} = connected_with_owner(),
     Close = app_datagram([{connection_close, transport, 0, 0, <<>>}], 0, ApSecret),
     {State1, Effects} = ?M:handle_datagram(?NOW, Close, State),
-    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {peer, 0}}}], emits(Effects)),
-    ?assertEqual([], sends(Effects)).
+    ?assertEqual([], sends(Effects)),
+    [DrainAt] = [At || {arm_timer, drain, At} <- Effects],
+    ?assert(DrainAt > ?NOW).
 
 frames_after_connection_close_are_ignored_test() ->
     %% Once a CONNECTION_CLOSE is seen, the rest of the packet is dropped: a
@@ -941,7 +945,7 @@ frames_after_connection_close_are_ignored_test() ->
         [{connection_close, transport, 7, 0, <<>>}, {stream, 0, 0, ~"x", true}], 0, ApSecret
     ),
     {State1, Effects} = ?M:handle_datagram(?NOW, Close, State),
-    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {peer, 7}}}], emits(Effects)).
 
 peer_handshake_level_close_test() ->
@@ -1018,6 +1022,44 @@ coalesced_initial_error_then_handshake_does_not_crash_test() ->
     ),
     ?assertEqual(closed, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
+
+late_packet_during_draining_is_absorbed_test() ->
+    %% A packet arriving during the drain window is absorbed silently (RFC 9000
+    %% §10.2.2): the phase stays draining, the late frame is not reprocessed,
+    %% nothing is sent, and no timer is re-armed so the entry drain timer keeps
+    %% running.
+    {State, ApSecret} = connected_with_owner(),
+    Close = app_datagram([{connection_close, transport, 0, 0, <<>>}], 0, ApSecret),
+    {Draining, _} = ?M:handle_datagram(?NOW, Close, State),
+    Late = app_datagram([{stream, 0, 0, ~"x", true}], 1, ApSecret),
+    {Draining1, Effects} = ?M:handle_datagram(?NOW + 10, Late, Draining),
+    ?assertEqual(draining, ?M:phase(Draining1)),
+    ?assertEqual([], sends(Effects)),
+    ?assertEqual([], emits(Effects)),
+    ?assertEqual([], [E || {arm_timer, _, _} = E <- Effects]).
+
+drain_timeout_closes_test() ->
+    %% When the drain timer fires the connection becomes closed (the shell then
+    %% tears it down); the owner already learned of the close on entry, so the
+    %% timeout emits nothing.
+    {State, ApSecret} = connected_with_owner(),
+    Close = app_datagram([{connection_close, transport, 0, 0, <<>>}], 0, ApSecret),
+    {Draining, _} = ?M:handle_datagram(?NOW, Close, State),
+    {Closed, Effects} = ?M:handle_timeout(?NOW + 999999, drain, Draining),
+    ?assertEqual(closed, ?M:phase(Closed)),
+    ?assertEqual([], Effects).
+
+send_on_draining_connection_is_rejected_test() ->
+    %% RFC 9000 §10.2.2: a draining connection sends no application data; an owner
+    %% write is answered {error, closed} and nothing goes out.
+    {State, ApSecret} = connected_with_owner(),
+    Close = app_datagram([{connection_close, transport, 0, 0, <<>>}], 0, ApSecret),
+    {Draining, _} = ?M:handle_datagram(?NOW, Close, State),
+    Ref = make_ref(),
+    {Draining1, Effects} = ?M:handle_send(self(), Ref, 0, ~"data", true, ?NOW, Draining),
+    ?assertEqual(draining, ?M:phase(Draining1)),
+    ?assertEqual([{reply, self(), Ref, {error, closed}}], Effects),
+    ?assertEqual([], sends(Effects)).
 
 %% =============================================================================
 %% Handshake driver (plays the QUIC client with the shared test client)
