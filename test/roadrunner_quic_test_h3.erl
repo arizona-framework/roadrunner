@@ -9,13 +9,22 @@
 %% both directions). The connection delivers received stream data to this
 %% module's caller (the connection owner), so connect/2 and the request calls
 %% run in the same process.
+%%
+%% Both a synchronous surface (get/post/request, which return the whole
+%% response) and the dep-shaped split surface (open_request -> stream id,
+%% send_data, collect) are offered, so a test can interleave work between the
+%% request and the response.
 
--export([connect/2, close/1, get/2, post/3, request/3]).
+-export([connect/2, close/1]).
+-export([get/2, post/3, request/3]).
+-export([open_request/2, open_request/3, send_data/4, collect/2, cancel/2, get_peer_settings/1]).
 
 -define(COLLECT_TIMEOUT, 5000).
+%% RFC 9114 §8.1 H3_REQUEST_CANCELLED.
+-define(H3_REQUEST_CANCELLED, 16#010C).
 
 %% =============================================================================
-%% API
+%% Connection
 %% =============================================================================
 
 -doc """
@@ -39,62 +48,109 @@ connect(Host, Port) ->
 close(Conn) ->
     roadrunner_quic_test_conn:close(Conn).
 
+%% =============================================================================
+%% Requests
+%% =============================================================================
+
 -doc "Issue a GET and collect the response as `{Status, Headers, Body}`.".
--spec get(pid(), binary()) -> {non_neg_integer(), [{binary(), binary()}], binary()} | timeout.
+-spec get(pid(), binary()) -> response() | timeout | {error, term()}.
 get(Conn, Path) ->
     request(Conn, headers(~"GET", Path), <<>>).
 
 -doc "Issue a POST with `Body` and collect the response as `{Status, Headers, Body}`.".
--spec post(pid(), binary(), binary()) ->
-    {non_neg_integer(), [{binary(), binary()}], binary()} | timeout.
+-spec post(pid(), binary(), binary()) -> response() | timeout | {error, term()}.
 post(Conn, Path, Body) ->
     request(Conn, headers(~"POST", Path), Body).
 
 -doc """
 Issue a request with the given full header list (pseudo-headers included)
-and body on a fresh bidirectional stream, collecting the response as
-`{Status, Headers, Body}`. An empty body finishes the stream on the HEADERS
-frame; a non-empty body finishes on the trailing DATA.
+and body, collecting the response. An empty body finishes the stream on the
+HEADERS frame; a non-empty body finishes on the trailing DATA.
 """.
--spec request(pid(), [{binary(), binary()}], binary()) ->
-    {non_neg_integer(), [{binary(), binary()}], binary()} | timeout.
+-spec request(pid(), headers(), binary()) -> response() | timeout | {error, term()}.
+request(Conn, Headers, <<>>) ->
+    {ok, StreamId} = open_request(Conn, Headers),
+    collect(Conn, StreamId);
 request(Conn, Headers, Body) ->
+    {ok, StreamId} = open_request(Conn, Headers, false),
+    ok = send_data(Conn, StreamId, Body, true),
+    collect(Conn, StreamId).
+
+-doc "Open a request stream and send its HEADERS, finishing the stream.".
+-spec open_request(pid(), headers()) -> {ok, non_neg_integer()}.
+open_request(Conn, Headers) ->
+    open_request(Conn, Headers, true).
+
+-doc "Open a request stream and send its HEADERS, finishing the stream when `EndStream`.".
+-spec open_request(pid(), headers(), boolean()) -> {ok, non_neg_integer()}.
+open_request(Conn, Headers, EndStream) ->
     StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
-    case Body of
-        <<>> ->
-            send_headers(Conn, StreamId, Headers, true);
-        _ ->
-            send_headers(Conn, StreamId, Headers, false),
-            DataFrame = roadrunner_quic_h3_frame:encode_data(Body),
-            ok = roadrunner_quic_test_conn:send(Conn, StreamId, iolist_to_binary(DataFrame), true)
-    end,
+    Frame = roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(Headers)),
+    ok = roadrunner_quic_test_conn:send(Conn, StreamId, iolist_to_binary(Frame), EndStream),
+    {ok, StreamId}.
+
+-doc "Send a DATA frame on a request stream, with the FIN bit when `Fin`.".
+-spec send_data(pid(), non_neg_integer(), binary(), boolean()) -> ok.
+send_data(Conn, StreamId, Data, Fin) ->
+    Frame = roadrunner_quic_h3_frame:encode_data(Data),
+    roadrunner_quic_test_conn:send(Conn, StreamId, iolist_to_binary(Frame), Fin).
+
+-doc "Cancel a request: RESET_STREAM + STOP_SENDING with H3_REQUEST_CANCELLED.".
+-spec cancel(pid(), non_neg_integer()) -> ok.
+cancel(Conn, StreamId) ->
+    ok = roadrunner_quic_test_conn:reset_stream(Conn, StreamId, ?H3_REQUEST_CANCELLED),
+    ok = roadrunner_quic_test_conn:stop_sending(Conn, StreamId, ?H3_REQUEST_CANCELLED).
+
+-doc """
+Collect the response on `StreamId`: accumulate its bytes until FIN, then
+decode the h3 response. Returns `{error, {stream_reset, Code}}` if the server
+resets the stream. Stream data for other streams stays in the mailbox.
+""".
+-spec collect(pid(), non_neg_integer()) -> response() | timeout | {error, term()}.
+collect(Conn, StreamId) ->
     collect(Conn, StreamId, <<>>).
+
+%% =============================================================================
+%% Peer settings
+%% =============================================================================
+
+-doc """
+Read the server's SETTINGS off its control stream (the server unidirectional
+stream whose type prefix is `control`), returning the decoded settings map.
+""".
+-spec get_peer_settings(pid()) -> map().
+get_peer_settings(Conn) ->
+    receive
+        {quic_test_stream, Conn, StreamId, Data, _Fin} when StreamId rem 4 =:= 3 ->
+            case control_settings(Data) of
+                {ok, Settings} -> Settings;
+                more -> get_peer_settings(Conn)
+            end
+    after ?COLLECT_TIMEOUT ->
+        #{}
+    end.
 
 %% =============================================================================
 %% Internal
 %% =============================================================================
 
--spec send_headers(pid(), non_neg_integer(), [{binary(), binary()}], boolean()) -> ok.
-send_headers(Conn, StreamId, Headers, Fin) ->
-    Frame = roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(Headers)),
-    ok = roadrunner_quic_test_conn:send(Conn, StreamId, iolist_to_binary(Frame), Fin).
+-type headers() :: [{binary(), binary()}].
+-type response() :: {non_neg_integer(), headers(), binary()}.
 
-%% Accumulate the request stream's bytes until its FIN, then decode the h3
-%% response. Stream data for other streams (the server's control / QPACK
-%% streams) is left in the mailbox.
--spec collect(pid(), non_neg_integer(), binary()) ->
-    {non_neg_integer(), [{binary(), binary()}], binary()} | timeout.
+-spec collect(pid(), non_neg_integer(), binary()) -> response() | timeout | {error, term()}.
 collect(Conn, StreamId, Acc) ->
     receive
         {quic_test_stream, Conn, StreamId, Data, true} ->
             decode_response(<<Acc/binary, Data/binary>>);
         {quic_test_stream, Conn, StreamId, Data, false} ->
-            collect(Conn, StreamId, <<Acc/binary, Data/binary>>)
+            collect(Conn, StreamId, <<Acc/binary, Data/binary>>);
+        {quic_test_stream_reset, Conn, StreamId, ErrorCode} ->
+            {error, {stream_reset, ErrorCode}}
     after ?COLLECT_TIMEOUT ->
         timeout
     end.
 
--spec decode_response(binary()) -> {non_neg_integer(), [{binary(), binary()}], binary()}.
+-spec decode_response(binary()) -> response().
 decode_response(Bytes) ->
     Frames = decode_frames(Bytes),
     {ok, Headers} = roadrunner_qpack:decode(first_headers_block(Frames)),
@@ -115,10 +171,24 @@ first_headers_block([_ | Rest]) -> first_headers_block(Rest).
 response_body(Frames) ->
     iolist_to_binary([Data || {data, Data} <- Frames]).
 
--spec status([{binary(), binary()}]) -> non_neg_integer().
+-spec status(headers()) -> non_neg_integer().
 status(Headers) ->
     {~":status", Value} = lists:keyfind(~":status", 1, Headers),
     binary_to_integer(Value).
+
+%% The SETTINGS map from a control stream's bytes (its `control` type prefix
+%% then a SETTINGS frame), or `more` when the bytes are not the control stream.
+-spec control_settings(binary()) -> {ok, map()} | more.
+control_settings(Data) ->
+    case roadrunner_quic_h3_frame:decode_stream_type(Data) of
+        {ok, control, Rest} ->
+            case roadrunner_quic_h3_frame:decode(Rest) of
+                {ok, {settings, Settings}, _} -> {ok, Settings};
+                _ -> more
+            end;
+        _ ->
+            more
+    end.
 
 %% The control stream-type prefix followed by a SETTINGS frame (RFC 9114
 %% §6.2.1 / §7.2.4); static-table-only QPACK advertises a zero table capacity.
@@ -129,7 +199,7 @@ control_with_settings() ->
         roadrunner_quic_h3_frame:encode_settings(#{qpack_max_table_capacity => 0})
     ]).
 
--spec headers(binary(), binary()) -> [{binary(), binary()}].
+-spec headers(binary(), binary()) -> headers().
 headers(Method, Path) ->
     [
         {~":method", Method},

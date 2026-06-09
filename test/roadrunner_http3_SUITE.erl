@@ -1,9 +1,8 @@
 -module(roadrunner_http3_SUITE).
 -moduledoc """
 End-to-end HTTP/3 tests. Each testcase starts a roadrunner h3 listener
-(`protocols => [http3]` over QUIC) and drives it with the `quic`
-dependency's HTTP/3 *client* (`quic_h3:connect`) — only the turnkey
-*server* is avoided; the client is fine as a test driver.
+(`protocols => [http3]` over QUIC) and drives it with the native test
+client (`roadrunner_quic_test_h3` / `roadrunner_quic_test_conn`).
 
 Lives as a CT suite (not eunit) so each testcase runs in its own
 process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
@@ -144,14 +143,6 @@ all() ->
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
     {ok, _} = application:ensure_all_started(ssl),
-    %% roadrunner's h3 listener is self-contained and does NOT start the
-    %% `quic` app (see `roadrunner_listener:start_quic/4`); the test CLIENT
-    %% below is what needs it, so bring it up once for the whole suite.
-    %% Consequence: these cases run with `quic` already up, so they don't
-    %% exercise the server's standalone (no-app) path — that's covered
-    %% separately by `bench.escript --protocols h3`, where the server peer
-    %% serves h3 with no `quic` app running.
-    {ok, _} = application:ensure_all_started(quic),
     %% Start the default `pg` scope standalone (the drain group lives
     %% there) rather than the whole roadrunner app, so this suite
     %% coexists with others that started pg in the shared CT node.
@@ -258,7 +249,7 @@ head_request(Config) ->
     %% RFC 9110 §9.3.2: a HEAD response carries the GET headers but no
     %% body — `/big` would be 100 KB on GET, empty on HEAD.
     Conn = connect(?config(port, Config)),
-    {ok, StreamId} = quic_h3:request(Conn, headers(~"HEAD", ~"/big")),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"HEAD", ~"/big")),
     ?assertEqual({200, ~""}, status_body(collect(Conn, StreamId))),
     close(Conn).
 
@@ -320,7 +311,7 @@ loop_response(Config) ->
     %% A `{loop, ...}` response: HEADERS, then DATA chunks pushed from
     %% the handler's `handle_info/3`, FIN on `{stop, _}`.
     Conn = connect(?config(port, Config)),
-    {ok, StreamId} = quic_h3:request(Conn, headers(~"GET", ~"/loop")),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/loop")),
     Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
     Worker ! {push, ~"hi"},
     Worker ! push_empty,
@@ -335,7 +326,7 @@ loop_filters_otp(Config) ->
     %% counter: `sys:get_state/1` returns the loop counter, a gen-call
     %% gets `{error, not_supported}`, and a gen-cast is a no-op.
     Conn = connect(?config(port, Config)),
-    {ok, StreamId} = quic_h3:request(Conn, headers(~"GET", ~"/loop")),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/loop")),
     Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
     ?assertEqual(0, sys:get_state(Worker)),
     ?assertEqual({error, not_supported}, gen_server:call(Worker, ping)),
@@ -352,7 +343,7 @@ loop_conn_close_stops_worker(Config) ->
     %% the QUIC connection, which fires the worker's monitor.
     Name = ?config(listener, Config),
     Conn = connect(?config(port, Config)),
-    {ok, _StreamId} = quic_h3:request(Conn, headers(~"GET", ~"/loop")),
+    {ok, _StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/loop")),
     Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
     WorkerRef = monitor(process, Worker),
     ok = roadrunner_listener:stop(Name),
@@ -388,7 +379,9 @@ head_sendfile(Config) ->
     %% RFC 9110 §9.3.2: HEAD on a sendfile route returns the headers but
     %% no body (and never reads the file).
     Conn = connect(?config(port, Config)),
-    {ok, StreamId} = quic_h3:request(Conn, headers(~"HEAD", ~"/sendfile-small")),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(
+        Conn, headers(~"HEAD", ~"/sendfile-small")
+    ),
     ?assertEqual({200, ~""}, status_body(collect(Conn, StreamId))),
     close(Conn).
 
@@ -438,13 +431,15 @@ stream_trailer_injection_aborts(Config) ->
     %% check the server sends the 200 HEADERS then RESETS the stream, so the
     %% malformed value ("a\r\nb" = <<97,13,10,98>>) is never emitted; without
     %% it, QPACK encodes those bytes into a trailer frame and the stream
-    %% finishes cleanly. The conformant `quic_h3` client cannot show this --
-    %% it rejects the bad field either way -- so this drives a raw client.
+    %% finishes cleanly. A conformant h3 client cannot show this -- it
+    %% rejects the bad field either way -- so this drives a raw client.
     Conn = ll_connect(?config(port, Config)),
     try
-        {ok, StreamId} = quic:open_stream(Conn),
-        Block = quic_qpack:encode(headers(~"GET", ~"/stream-bad-trailers")),
-        ok = quic:send_data(Conn, StreamId, quic_h3_frame:encode_headers(Block), true),
+        StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+        Block = roadrunner_qpack:encode(headers(~"GET", ~"/stream-bad-trailers")),
+        ok = roadrunner_quic_test_conn:send(
+            Conn, StreamId, roadrunner_quic_h3_frame:encode_headers(Block), true
+        ),
         Result = ll_collect_until_end(Conn, StreamId, <<>>),
         %% The server aborts the stream rather than completing it normally,
         ?assertMatch({reset, _, _}, Result),
@@ -460,12 +455,14 @@ oversized_413(_Config) ->
     {ok, _} = start_h3(Name, #{max_content_length => 8}),
     Conn = connect(roadrunner_listener:port(Name)),
     try
-        {ok, StreamId} = quic_h3:request(Conn, headers(~"POST", ~"/echo"), #{end_stream => false}),
+        {ok, StreamId} = roadrunner_quic_test_h3:open_request(
+            Conn, headers(~"POST", ~"/echo"), false
+        ),
         %% First chunk already exceeds the 8-byte cap → 413.
-        ok = quic_h3:send_data(Conn, StreamId, binary:copy(<<"x">>, 32), false),
+        ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, binary:copy(<<"x">>, 32), false),
         ?assertMatch({413, _, _}, collect(Conn, StreamId)),
         %% A trailing chunk on the already-answered stream is ignored.
-        _ = quic_h3:send_data(Conn, StreamId, ~"more", true),
+        _ = roadrunner_quic_test_h3:send_data(Conn, StreamId, ~"more", true),
         ok
     after
         close(Conn),
@@ -473,20 +470,21 @@ oversized_413(_Config) ->
     end.
 
 oversized_headers_431(_Config) ->
-    %% A request whose encoded field section exceeds MAX_HEADER_BLOCK
-    %% (16384) is answered 431, rejected by the conn loop before dispatch
-    %% (parity with the body 413). Advertise a huge MAX_FIELD_SECTION_SIZE
-    %% so the conformant client doesn't self-limit on the decoded size
-    %% before the request reaches the encoded cap.
+    %% A request whose encoded field section exceeds `max_header_block` is
+    %% answered 431, rejected by the conn loop before dispatch (parity with
+    %% the body 413). A small cap keeps the over-cap header inside one packet,
+    %% so the server rejects it on the first frame rather than mid-flood.
     Name = listener_name(oversized_headers_431),
     {ok, _} = start_h3(Name, #{
-        protocols => [{http3, #{max_field_section_size => 16#7FFFFFFF}}]
+        protocols => [{http3, #{max_header_block => 100}}]
     }),
     Conn = connect(roadrunner_listener:port(Name)),
     try
-        Big = binary:copy(<<"x">>, 50000),
-        {ok, StreamId} = quic_h3:request(Conn, headers(~"GET", ~"/") ++ [{~"x-big", Big}]),
-        ?assertMatch({431, _, _}, collect(Conn, StreamId))
+        Headers = headers(~"GET", ~"/") ++ [{~"x-big", binary:copy(<<"v">>, 300)}],
+        {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, Headers, false),
+        ?assertMatch({431, _, _}, collect(Conn, StreamId)),
+        %% The connection survives the rejection and serves a fresh request.
+        ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/")))
     after
         close(Conn),
         roadrunner_listener:stop(Name)
@@ -502,7 +500,7 @@ advertises_max_field_section_size(_Config) ->
     }),
     Conn = connect(roadrunner_listener:port(Name)),
     try
-        Settings = quic_h3:get_peer_settings(Conn),
+        Settings = roadrunner_quic_test_h3:get_peer_settings(Conn),
         ?assertEqual(54321, maps:get(max_field_section_size, Settings))
     after
         close(Conn),
@@ -511,10 +509,10 @@ advertises_max_field_section_size(_Config) ->
 
 field_section_too_large_431(_Config) ->
     %% RFC 9114 §4.2.2: a request whose DECODED field section exceeds the
-    %% advertised MAX_FIELD_SECTION_SIZE is answered 431. The conformant
-    %% `quic_h3` client self-limits to the advertised value, so this drives
-    %% a raw, non-conformant client (the same codecs roadrunner's server
-    %% uses) over a plain QUIC stream. A 300-byte header stays well under
+    %% advertised MAX_FIELD_SECTION_SIZE is answered 431. A conformant h3
+    %% client self-limits to the advertised value, so this drives a raw,
+    %% non-conformant client (the same codecs roadrunner's server uses)
+    %% over a plain QUIC stream. A 300-byte header stays well under
     %% the 16384 encoded cap but blows the tiny 200-byte decoded limit.
     Name = listener_name(field_section_too_large_431),
     {ok, _} = start_h3(Name, #{
@@ -522,13 +520,15 @@ field_section_too_large_431(_Config) ->
     }),
     Conn = ll_connect(roadrunner_listener:port(Name)),
     try
-        {ok, StreamId} = quic:open_stream(Conn),
+        StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
         Headers = headers(~"GET", ~"/") ++ [{~"x-pad", binary:copy(<<"v">>, 300)}],
-        Block = quic_qpack:encode(Headers),
+        Block = iolist_to_binary(roadrunner_qpack:encode(Headers)),
         %% Stay under the 16384 encoded cap so the ENCODED gate can't fire;
         %% the decoded size (well over the 200 cap) is what triggers the 431.
         ?assert(byte_size(Block) < 16384),
-        ok = quic:send_data(Conn, StreamId, quic_h3_frame:encode_headers(Block), true),
+        ok = roadrunner_quic_test_conn:send(
+            Conn, StreamId, roadrunner_quic_h3_frame:encode_headers(Block), true
+        ),
         ?assertEqual(431, raw_h3_response_status(Conn, StreamId, <<>>))
     after
         ll_close(Conn),
@@ -540,11 +540,11 @@ field_section_too_large_431(_Config) ->
 %% as an integer. Ignores frames on the server's control / QPACK streams.
 raw_h3_response_status(Conn, StreamId, Acc) ->
     receive
-        {quic, Conn, {stream_data, StreamId, Bin, _Fin}} ->
+        {quic_test_stream, Conn, StreamId, Bin, _Fin} ->
             Buf = <<Acc/binary, Bin/binary>>,
-            case quic_h3_frame:decode(Buf) of
+            case roadrunner_quic_h3_frame:decode(Buf) of
                 {ok, {headers, Block}, _Rest} ->
-                    {ok, Hdrs} = quic_qpack:decode(Block),
+                    {ok, Hdrs} = roadrunner_qpack:decode(Block),
                     binary_to_integer(proplists:get_value(~":status", Hdrs));
                 {more, _} ->
                     raw_h3_response_status(Conn, StreamId, Buf);
@@ -762,7 +762,7 @@ max_concurrent_requests_refuse(_Config) ->
     Port = roadrunner_listener:port(Name),
     Conn = connect(Port),
     try
-        {ok, _StreamId} = quic_h3:request(Conn, headers(~"GET", ~"/loop")),
+        {ok, _StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/loop")),
         Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
         %% The parked worker holds the single in-flight slot, so the next
         %% request is over the ceiling and gets no response.
@@ -801,8 +801,8 @@ retry_get(Conn, Path, Tries) ->
 
 stream_cancel(Config) ->
     Conn = connect(?config(port, Config)),
-    {ok, StreamId} = quic_h3:request(Conn, headers(~"POST", ~"/echo"), #{end_stream => false}),
-    _ = quic_h3:cancel(Conn, StreamId),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"POST", ~"/echo"), false),
+    _ = roadrunner_quic_test_h3:cancel(Conn, StreamId),
     %% The connection survives a peer stream cancel — a fresh request works.
     ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
     close(Conn).
@@ -812,10 +812,12 @@ response_to_cancelled_stream(Config) ->
     %% is still running, so the worker's later send onto the stopped
     %% stream fails — that must be tolerated, not crash the connection.
     Conn = ll_connect(?config(port, Config)),
-    Frame = quic_h3_frame:encode_headers(quic_qpack:encode(headers(~"GET", ~"/slow"))),
-    {ok, StreamId} = quic:open_stream(Conn),
-    ok = quic:send_data(Conn, StreamId, Frame, true),
-    _ = quic:stop_sending(Conn, StreamId, 0),
+    Frame = roadrunner_quic_h3_frame:encode_headers(
+        roadrunner_qpack:encode(headers(~"GET", ~"/slow"))
+    ),
+    StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(Conn, StreamId, Frame, true),
+    _ = roadrunner_quic_test_conn:stop_sending(Conn, StreamId, 0),
     timer:sleep(300),
     ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
     ll_close(Conn).
@@ -842,9 +844,11 @@ malformed_request(Config) ->
     %% pseudo-header (`:path`) is a malformed message (RFC 9114 §4.1.2):
     %% the stream is reset with H3_MESSAGE_ERROR, the connection lives.
     Conn = ll_connect(?config(port, Config)),
-    Block = quic_qpack:encode([{~":method", ~"GET"}, {~":scheme", ~"https"}]),
-    {ok, StreamId} = quic:open_stream(Conn),
-    ok = quic:send_data(Conn, StreamId, quic_h3_frame:encode_headers(Block), true),
+    Block = roadrunner_qpack:encode([{~":method", ~"GET"}, {~":scheme", ~"https"}]),
+    StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(
+        Conn, StreamId, roadrunner_quic_h3_frame:encode_headers(Block), true
+    ),
     timer:sleep(100),
     ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
     ll_close(Conn).
@@ -853,19 +857,27 @@ data_before_headers(Config) ->
     %% A DATA frame before any HEADERS is an invalid frame sequence
     %% (RFC 9114 §4.1) → H3_FRAME_UNEXPECTED connection error.
     Conn = ll_connect(?config(port, Config)),
-    {ok, StreamId} = quic:open_stream(Conn),
-    ok = quic:send_data(Conn, StreamId, quic_h3_frame:encode_data(~"x"), false),
+    StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(
+        Conn, StreamId, roadrunner_quic_h3_frame:encode_data(~"x"), false
+    ),
     ll_await_closed(Conn).
 
 request_with_trailers(Config) ->
     %% A request with trailing HEADERS (trailers) after the body is valid
     %% (RFC 9114 §4.1); the trailers are ignored and the request is served.
     Conn = ll_connect(?config(port, Config)),
-    ReqHeaders = quic_h3_frame:encode_headers(quic_qpack:encode(headers(~"POST", ~"/echo"))),
-    Data = quic_h3_frame:encode_data(~"body"),
-    Trailers = quic_h3_frame:encode_headers(quic_qpack:encode([{~"x-checksum", ~"abc"}])),
-    {ok, StreamId} = quic:open_stream(Conn),
-    ok = quic:send_data(Conn, StreamId, <<ReqHeaders/binary, Data/binary, Trailers/binary>>, true),
+    ReqHeaders = roadrunner_quic_h3_frame:encode_headers(
+        roadrunner_qpack:encode(headers(~"POST", ~"/echo"))
+    ),
+    Data = roadrunner_quic_h3_frame:encode_data(~"body"),
+    Trailers = roadrunner_quic_h3_frame:encode_headers(
+        roadrunner_qpack:encode([{~"x-checksum", ~"abc"}])
+    ),
+    StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(
+        Conn, StreamId, [ReqHeaders, Data, Trailers], true
+    ),
     ?assertEqual({200, ~"body"}, ll_collect(Conn, StreamId, <<>>)),
     ll_close(Conn).
 
@@ -881,17 +893,21 @@ oversized_frame(Config) ->
     %% A frame declaring a length above the max is a frame error
     %% (RFC 9114 §7.1, H3_FRAME_ERROR) — a connection error.
     Conn = ll_connect(?config(port, Config)),
-    Oversized = iolist_to_binary([quic_varint:encode(0), quic_varint:encode(16#FFFFFFFF)]),
-    {ok, StreamId} = quic:open_stream(Conn),
-    ok = quic:send_data(Conn, StreamId, Oversized, false),
+    Oversized = iolist_to_binary([
+        roadrunner_quic_varint:encode(0), roadrunner_quic_varint:encode(16#FFFFFFFF)
+    ]),
+    StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(Conn, StreamId, Oversized, false),
     ll_await_closed(Conn).
 
 qpack_decompression_failed(Config) ->
     %% A HEADERS frame whose field block can't be QPACK-decoded is a
     %% connection error (RFC 9204 §2.2): the connection closes.
     Conn = ll_connect(?config(port, Config)),
-    {ok, StreamId} = quic:open_stream(Conn),
-    ok = quic:send_data(Conn, StreamId, quic_h3_frame:encode_headers(<<>>), true),
+    StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(
+        Conn, StreamId, roadrunner_quic_h3_frame:encode_headers(<<>>), true
+    ),
     ll_await_closed(Conn).
 
 extra_data_after_413(_Config) ->
@@ -904,16 +920,24 @@ extra_data_after_413(_Config) ->
     {ok, _} = start_h3(Name, #{max_content_length => 8}),
     Conn = ll_connect(roadrunner_listener:port(Name)),
     try
-        {ok, StreamId} = quic:open_stream(Conn),
-        ReqHeaders = quic_h3_frame:encode_headers(quic_qpack:encode(headers(~"POST", ~"/echo"))),
-        Over = quic_h3_frame:encode_data(binary:copy(<<"x">>, 32)),
-        ok = quic:send_data(Conn, StreamId, <<ReqHeaders/binary, Over/binary>>, false),
+        StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+        ReqHeaders = roadrunner_quic_h3_frame:encode_headers(
+            roadrunner_qpack:encode(headers(~"POST", ~"/echo"))
+        ),
+        Over = roadrunner_quic_h3_frame:encode_data(binary:copy(<<"x">>, 32)),
+        ok = roadrunner_quic_test_conn:send(
+            Conn, StreamId, [ReqHeaders, Over], false
+        ),
         timer:sleep(100),
         %% residual DATA without FIN — ignored
-        ok = quic:send_data(Conn, StreamId, quic_h3_frame:encode_data(~"more"), false),
+        ok = roadrunner_quic_test_conn:send(
+            Conn, StreamId, roadrunner_quic_h3_frame:encode_data(~"more"), false
+        ),
         timer:sleep(50),
         %% final residual DATA with FIN — drops the discarding marker
-        ok = quic:send_data(Conn, StreamId, quic_h3_frame:encode_data(~"end"), true),
+        ok = roadrunner_quic_test_conn:send(
+            Conn, StreamId, roadrunner_quic_h3_frame:encode_data(~"end"), true
+        ),
         timer:sleep(50),
         ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/"))
     after
@@ -925,9 +949,9 @@ stop_sending_ignored(Config) ->
     %% A peer STOP_SENDING surfaces as an event the conn loop doesn't act
     %% on; it is ignored and the connection keeps serving.
     Conn = ll_connect(?config(port, Config)),
-    {ok, StreamId} = quic:open_stream(Conn),
-    ok = quic:send_data(Conn, StreamId, <<>>, false),
-    _ = quic:stop_sending(Conn, StreamId, 0),
+    StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(Conn, StreamId, <<>>, false),
+    _ = roadrunner_quic_test_conn:stop_sending(Conn, StreamId, 0),
     timer:sleep(100),
     ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
     ll_close(Conn).
@@ -937,7 +961,7 @@ peer_push_stream_closes_conn(Config) ->
     %% client-initiated one is a connection error
     %% (H3_STREAM_CREATION_ERROR) — the connection closes.
     Conn = ll_connect(?config(port, Config)),
-    _ = ll_open_uni(Conn, quic_h3_frame:encode_stream_type(push), false),
+    _ = ll_open_uni(Conn, roadrunner_quic_h3_frame:encode_stream_type(push), false),
     ll_await_closed(Conn).
 
 peer_control_stream_closed(Config) ->
@@ -951,7 +975,7 @@ unknown_uni_stream_ignored(Config) ->
     %% RFC 9114 §6.2.3: an unknown unidirectional stream type is ignored
     %% (read and discarded); the connection keeps serving.
     Conn = ll_connect(?config(port, Config)),
-    _ = ll_open_uni(Conn, quic_h3_frame:encode_stream_type(16#21), true),
+    _ = ll_open_uni(Conn, roadrunner_quic_h3_frame:encode_stream_type(16#21), true),
     timer:sleep(50),
     ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
     ll_close(Conn).
@@ -966,16 +990,16 @@ peer_control_stream_reset(Config) ->
     %% before we reset it — a fixed sleep races under load, leaving the
     %% reset to hit an unclassified stream that is silently dropped.
     ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
-    _ = quic:reset_stream(Conn, StreamId, 0),
+    _ = roadrunner_quic_test_conn:reset_stream(Conn, StreamId, 0),
     ll_await_closed(Conn).
 
 noncritical_uni_stream_reset(Config) ->
     %% RESET_STREAM on a non-critical uni stream just drops its state;
     %% the connection keeps serving.
     Conn = ll_connect(?config(port, Config)),
-    StreamId = ll_open_uni(Conn, quic_h3_frame:encode_stream_type(16#21), false),
+    StreamId = ll_open_uni(Conn, roadrunner_quic_h3_frame:encode_stream_type(16#21), false),
     timer:sleep(50),
-    _ = quic:reset_stream(Conn, StreamId, 0),
+    _ = roadrunner_quic_test_conn:reset_stream(Conn, StreamId, 0),
     timer:sleep(50),
     ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
     ll_close(Conn).
@@ -999,9 +1023,11 @@ refuse_request_during_drain(Config) ->
     Name = ?config(listener, Config),
     Conn = ll_connect(?config(port, Config)),
     %% A slow request keeps a worker in flight across the drain.
-    SlowFrame = quic_h3_frame:encode_headers(quic_qpack:encode(headers(~"GET", ~"/slow"))),
-    {ok, SlowId} = quic:open_stream(Conn),
-    ok = quic:send_data(Conn, SlowId, SlowFrame, true),
+    SlowFrame = roadrunner_quic_h3_frame:encode_headers(
+        roadrunner_qpack:encode(headers(~"GET", ~"/slow"))
+    ),
+    SlowId = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(Conn, SlowId, SlowFrame, true),
     timer:sleep(20),
     %% Drive the conn loop's drain directly — the same message the
     %% listener broadcasts (its synchronous `drain/2` would block here).
@@ -1009,9 +1035,11 @@ refuse_request_during_drain(Config) ->
     LoopPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5000},
     timer:sleep(20),
     %% A request opened after the GOAWAY is rejected.
-    NewFrame = quic_h3_frame:encode_headers(quic_qpack:encode(headers(~"GET", ~"/"))),
-    {ok, NewId} = quic:open_stream(Conn),
-    ok = quic:send_data(Conn, NewId, NewFrame, true),
+    NewFrame = roadrunner_quic_h3_frame:encode_headers(
+        roadrunner_qpack:encode(headers(~"GET", ~"/"))
+    ),
+    NewId = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(Conn, NewId, NewFrame, true),
     ?assertEqual(16#10b, ll_await_reset(Conn, NewId)),
     %% The in-flight slow request still completes.
     ?assertEqual({200, ~"slow"}, ll_collect(Conn, SlowId, <<>>)),
@@ -1061,37 +1089,28 @@ udp_occupied_tcp_free_port() ->
 %% --- h3 client helpers ---
 
 connect(Port) ->
-    {ok, Conn} = quic_h3:connect(~"127.0.0.1", Port, #{verify => verify_none}),
-    ok = quic_h3:wait_connected(Conn, 5000),
+    {ok, Conn} = roadrunner_quic_test_h3:connect({127, 0, 0, 1}, Port),
     Conn.
 
 try_connect(Port) ->
-    case quic_h3:connect(~"127.0.0.1", Port, #{verify => verify_none}) of
-        {ok, Conn} ->
-            case quic_h3:wait_connected(Conn, 2000) of
-                ok -> {ok, Conn};
-                {error, _} = E -> E
-            end;
-        {error, _} = E ->
-            E
-    end.
+    roadrunner_quic_test_h3:connect({127, 0, 0, 1}, Port).
 
 close(Conn) ->
-    _ = quic_h3:close(Conn),
+    _ = roadrunner_quic_test_h3:close(Conn),
     ok.
 
 get(Conn, Path) ->
-    {ok, StreamId} = quic_h3:request(Conn, headers(~"GET", Path)),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", Path)),
     collect(Conn, StreamId).
 
 post(Conn, Path, Body) ->
-    {ok, StreamId} = quic_h3:request(Conn, headers(~"POST", Path), #{end_stream => false}),
-    ok = quic_h3:send_data(Conn, StreamId, Body, true),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"POST", Path), false),
+    ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, Body, true),
     collect(Conn, StreamId).
 
 %% A request expected to fail (reset / no response) — returns `error`.
 try_get(Conn, Path) ->
-    {ok, StreamId} = quic_h3:request(Conn, headers(~"GET", Path)),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", Path)),
     case collect(Conn, StreamId) of
         {error, _} -> error;
         timeout -> error;
@@ -1110,57 +1129,26 @@ status_body({Status, _Headers, Body}) -> {Status, Body};
 status_body(Other) -> Other.
 
 collect(Conn, StreamId) ->
-    receive
-        {quic_h3, Conn, {response, StreamId, Status, Headers}} ->
-            collect_body(Conn, StreamId, Status, Headers, <<>>);
-        {quic_h3, Conn, {stream_reset, StreamId, ErrorCode}} ->
-            {error, {stream_reset, ErrorCode}};
-        {quic_h3, Conn, {error, ErrorCode, _Reason}} ->
-            {error, {conn_error, ErrorCode}};
-        {quic_h3, Conn, closed} ->
-            {error, closed}
-    after 5000 ->
-        timeout
-    end.
-
-collect_body(Conn, StreamId, Status, Headers, Acc) ->
-    receive
-        {quic_h3, Conn, {data, StreamId, Data, true}} ->
-            {Status, Headers, <<Acc/binary, Data/binary>>};
-        {quic_h3, Conn, {data, StreamId, Data, false}} ->
-            collect_body(Conn, StreamId, Status, Headers, <<Acc/binary, Data/binary>>);
-        %% Trailing HEADERS (trailers) end the stream with no fin DATA.
-        {quic_h3, Conn, {trailers, StreamId, _Trailers}} ->
-            {Status, Headers, Acc}
-    after 5000 ->
-        timeout
-    end.
+    roadrunner_quic_test_h3:collect(Conn, StreamId).
 
 %% --- low-level QUIC client (raw h3 framing under our control) ---
 %%
-%% Drives the server over the bare `quic` transport so a testcase can
-%% put exact bytes on a request stream — malformed frames, a FIN with
-%% no HEADERS, trailing DATA — that the turnkey `quic_h3` client would
-%% never emit. We own the HEADERS/QPACK framing here.
+%% Drives the server over a raw QUIC connection (`roadrunner_quic_test_conn`)
+%% so a testcase can put exact bytes on a request stream — malformed frames, a
+%% FIN with no HEADERS, trailing DATA — that a conformant h3 client would never
+%% emit. We own the HEADERS/QPACK framing here.
 
 ll_connect(Port) ->
-    {ok, Conn} = quic:connect(
-        ~"127.0.0.1", Port, #{alpn => [~"h3"], verify => verify_none}, self()
-    ),
-    receive
-        {quic, Conn, {connected, _}} -> ok
-    after 5000 ->
-        ct:fail(ll_not_connected)
-    end,
+    {ok, Conn} = roadrunner_quic_test_conn:connect({127, 0, 0, 1}, Port),
     Conn.
 
 ll_close(Conn) ->
-    _ = quic:close(Conn),
+    _ = roadrunner_quic_test_conn:close(Conn),
     ok.
 
 ll_await_closed(Conn) ->
     receive
-        {quic, Conn, {closed, _}} -> ok
+        {quic_test_closed, Conn, _} -> ok
     after 5000 ->
         ct:fail(connection_not_closed)
     end.
@@ -1168,7 +1156,7 @@ ll_await_closed(Conn) ->
 %% Wait for the server to reset `StreamId`, returning the error code.
 ll_await_reset(Conn, StreamId) ->
     receive
-        {quic, Conn, {stream_reset, StreamId, ErrorCode}} -> ErrorCode
+        {quic_test_stream_reset, Conn, StreamId, ErrorCode} -> ErrorCode
     after 5000 ->
         ct:fail(no_stream_reset)
     end.
@@ -1178,11 +1166,11 @@ ll_await_reset(Conn, StreamId) ->
 %% test can inspect exactly what reached the wire.
 ll_collect_until_end(Conn, StreamId, Acc) ->
     receive
-        {quic, Conn, {stream_data, StreamId, Bin, true}} ->
+        {quic_test_stream, Conn, StreamId, Bin, true} ->
             {fin, <<Acc/binary, Bin/binary>>};
-        {quic, Conn, {stream_data, StreamId, Bin, false}} ->
+        {quic_test_stream, Conn, StreamId, Bin, false} ->
             ll_collect_until_end(Conn, StreamId, <<Acc/binary, Bin/binary>>);
-        {quic, Conn, {stream_reset, StreamId, ErrorCode}} ->
+        {quic_test_stream_reset, Conn, StreamId, ErrorCode} ->
             {reset, ErrorCode, Acc}
     after 5000 ->
         ct:fail(no_stream_end)
@@ -1202,47 +1190,47 @@ wait_for_register(Name, RemainingMs) ->
     end.
 
 ll_send(Conn, Bytes, Fin) ->
-    {ok, StreamId} = quic:open_stream(Conn),
-    ok = quic:send_data(Conn, StreamId, Bytes, Fin),
+    StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(Conn, StreamId, Bytes, Fin),
     StreamId.
 
 %% Open a client-initiated unidirectional stream and write `Bytes` (the
 %% stream-type prefix + any frames) onto it.
 ll_open_uni(Conn, Bytes, Fin) ->
-    {ok, StreamId} = quic:open_unidirectional_stream(Conn),
-    ok = quic:send_data(Conn, StreamId, Bytes, Fin),
+    StreamId = roadrunner_quic_test_conn:open_uni(Conn),
+    ok = roadrunner_quic_test_conn:send(Conn, StreamId, Bytes, Fin),
     StreamId.
 
 %% A valid control stream payload: the control stream-type prefix
 %% followed by a SETTINGS frame.
 control_with_settings() ->
-    <<
-        (quic_h3_frame:encode_stream_type(control))/binary,
-        (quic_h3_frame:encode_settings(#{qpack_max_table_capacity => 0}))/binary
-    >>.
+    iolist_to_binary([
+        roadrunner_quic_h3_frame:encode_stream_type(control),
+        roadrunner_quic_h3_frame:encode_settings(#{qpack_max_table_capacity => 0})
+    ]).
 
 ll_get(Conn, Path) ->
-    Frame = quic_h3_frame:encode_headers(quic_qpack:encode(headers(~"GET", Path))),
-    {ok, StreamId} = quic:open_stream(Conn),
-    ok = quic:send_data(Conn, StreamId, Frame, true),
+    Frame = roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(headers(~"GET", Path))),
+    StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(Conn, StreamId, Frame, true),
     ll_collect(Conn, StreamId, <<>>).
 
 ll_collect(Conn, StreamId, Acc) ->
     receive
-        {quic, Conn, {stream_data, StreamId, Data, true}} ->
+        {quic_test_stream, Conn, StreamId, Data, true} ->
             ll_decode(<<Acc/binary, Data/binary>>);
-        {quic, Conn, {stream_data, StreamId, Data, false}} ->
+        {quic_test_stream, Conn, StreamId, Data, false} ->
             ll_collect(Conn, StreamId, <<Acc/binary, Data/binary>>)
     after 5000 ->
         ct:fail(ll_no_response)
     end.
 
 ll_decode(Bytes) ->
-    {ok, {headers, Block}, Rest} = quic_h3_frame:decode(Bytes),
-    {ok, RespHeaders} = quic_qpack:decode(Block),
+    {ok, {headers, Block}, Rest} = roadrunner_quic_h3_frame:decode(Bytes),
+    {ok, RespHeaders} = roadrunner_qpack:decode(Block),
     Status = binary_to_integer(proplists:get_value(~":status", RespHeaders)),
     Body =
-        case quic_h3_frame:decode(Rest) of
+        case roadrunner_quic_h3_frame:decode(Rest) of
             {ok, {data, Data}, _} -> Data;
             _ -> <<>>
         end,

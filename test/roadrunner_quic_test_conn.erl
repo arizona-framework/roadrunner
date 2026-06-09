@@ -31,11 +31,14 @@
 
 -include_lib("public_key/include/public_key.hrl").
 
--export([connect/2, close/1, open_bidi/1, open_uni/1, send/4]).
+-export([connect/2, close/1, open_bidi/1, open_uni/1, send/4, reset_stream/3, stop_sending/3]).
 
 %% v1 connection-id length and signature scheme (the test cert is RSA).
 -define(CID_LEN, 8).
 -define(SIG_SCHEME, 16#0804).
+%% Max stream bytes per 1-RTT packet, leaving room for the short header,
+%% STREAM frame header, and AEAD tag within the MTU.
+-define(MAX_STREAM_CHUNK, 1000).
 -define(RECV_TIMEOUT, 3000).
 -define(CONNECT_TIMEOUT, 8000).
 
@@ -59,6 +62,9 @@
     app_client_keys :: roadrunner_quic_keys:keys() | undefined,
     owner :: pid() | undefined,
     finished_sent = false :: boolean(),
+    %% Client Handshake-level packet number space (RFC 9000 §12.3): the
+    %% address-validation PING takes pn 0, the client Finished pn 1.
+    hs_pn = 0 :: non_neg_integer(),
     datagrams = [] :: [binary()],
     %% 1-RTT stream state (RFC 9000 §2.1 client-initiated stream ids).
     next_bidi = 0 :: non_neg_integer(),
@@ -119,10 +125,34 @@ Send `Data` on `StreamId` in a 1-RTT packet, with the FIN bit when `Fin`.
 Received stream data is delivered to the connection owner as
 `{quic_test_stream, Conn, StreamId, Data, Fin}`.
 """.
--spec send(pid(), non_neg_integer(), binary(), boolean()) -> ok.
+-spec send(pid(), non_neg_integer(), iodata(), boolean()) -> ok.
 send(Pid, StreamId, Data, Fin) ->
     Ref = make_ref(),
     Pid ! {send, self(), Ref, StreamId, Data, Fin},
+    receive
+        {Ref, ok} -> ok
+    after 5000 ->
+        {error, timeout}
+    end.
+
+-doc """
+Send a RESET_STREAM for `StreamId` with `ErrorCode` (RFC 9000 §19.4). The
+final size is the number of bytes already sent on the stream; declaring a
+smaller one than the peer received is a FINAL_SIZE_ERROR (§4.5), so the loop
+fills it in from its per-stream send offset.
+""".
+-spec reset_stream(pid(), non_neg_integer(), non_neg_integer()) -> ok.
+reset_stream(Pid, StreamId, ErrorCode) ->
+    cast_frame(Pid, {reset_stream, StreamId, ErrorCode}).
+
+-doc "Send a STOP_SENDING for `StreamId` with `ErrorCode` (RFC 9000 §19.5).".
+-spec stop_sending(pid(), non_neg_integer(), non_neg_integer()) -> ok.
+stop_sending(Pid, StreamId, ErrorCode) ->
+    cast_frame(Pid, {stop_sending, StreamId, ErrorCode}).
+
+cast_frame(Pid, Frame) ->
+    Ref = make_ref(),
+    Pid ! {frame, self(), Ref, Frame},
     receive
         {Ref, ok} -> ok
     after 5000 ->
@@ -167,6 +197,10 @@ init(Parent, Ref, Host, Port) ->
     },
     case handshake(Conn) of
         {ok, Conn1} ->
+            %% Switch to active-once so the loop's single receive wakes on
+            %% both owner control calls and inbound datagrams; a blocking
+            %% socket recv would starve owner calls while the peer is idle.
+            ok = roadrunner_quic_socket:activate(Socket),
             Parent ! {Ref, connected},
             connected_loop(Conn1);
         {error, Reason} ->
@@ -214,7 +248,14 @@ advance(#conn{finished_sent = false, hs_keys = undefined} = Conn) ->
                 #{eph_priv => Conn#conn.eph_priv, client_hello_framed => Conn#conn.ch_framed},
                 ServerHelloFramed
             ),
-            advance(Conn#conn{hs_keys = HsKeys})
+            %% A Handshake-level packet from the client validates its address and
+            %% lifts the server's 3x anti-amplification limit (RFC 9000 §8.1), so
+            %% the server flushes the rest of its flight. Send a PING now, before
+            %% the whole flight is in hand: a larger flight (e.g. a cert chain)
+            %% exceeds the 3x budget, and the server stalls without it.
+            #{client := ClientHsKeys} = HsKeys,
+            Conn1 = send_handshake_ping(Conn#conn{hs_keys = HsKeys}, ClientHsKeys),
+            advance(Conn1)
     end;
 advance(#conn{finished_sent = false} = Conn) ->
     %% Have the handshake keys; try to complete the server flight.
@@ -272,8 +313,10 @@ complete(Conn, ServerHelloFramed, HandshakeBytes) ->
     Flight = #{initial => ServerHelloFramed, handshake => HandshakeBytes},
     case roadrunner_quic_test_handshake:process_server_flight(Config, Flight) of
         {ok, #{installs := Installs, client_finished := ClientFinished}} ->
-            send_client_finished(Conn, keys_for(handshake, client, Installs), ClientFinished),
-            {continue, Conn#conn{
+            Conn1 = send_client_finished(
+                Conn, keys_for(handshake, client, Installs), ClientFinished
+            ),
+            {continue, Conn1#conn{
                 finished_sent = true,
                 app_server_keys = keys_for(application, server, Installs),
                 app_client_keys = keys_for(application, client, Installs)
@@ -282,19 +325,40 @@ complete(Conn, ServerHelloFramed, HandshakeBytes) ->
             {error, Reason}
     end.
 
+%% Send a bare Handshake-level PING to validate the client's address, lifting
+%% the server's 3x anti-amplification limit (RFC 9000 §8.1) so it flushes the
+%% rest of its flight.
+-spec send_handshake_ping(#conn{}, roadrunner_quic_keys:keys()) -> #conn{}.
+send_handshake_ping(Conn, ClientHsKeys) ->
+    send_handshake(Conn, ClientHsKeys, [ping]).
+
 %% Send the client Finished as a Handshake-level CRYPTO frame, addressed to
 %% the server's SCID.
--spec send_client_finished(#conn{}, roadrunner_quic_keys:keys(), iolist()) -> ok.
-send_client_finished(
-    #conn{socket = Socket, host = Host, port = Port, scid = Scid, server_scid = ServerScid},
+-spec send_client_finished(#conn{}, roadrunner_quic_keys:keys(), iolist()) -> #conn{}.
+send_client_finished(Conn, ClientHsKeys, ClientFinished) ->
+    send_handshake(Conn, ClientHsKeys, [{crypto, 0, iolist_to_binary(ClientFinished)}]).
+
+%% Send a Handshake-level datagram carrying `Frames`, addressed to the server's
+%% SCID, taking the next handshake packet number so each packet is distinct.
+-spec send_handshake(#conn{}, roadrunner_quic_keys:keys(), [roadrunner_quic_frame:frame()]) ->
+    #conn{}.
+send_handshake(
+    #conn{
+        socket = Socket,
+        host = Host,
+        port = Port,
+        scid = Scid,
+        server_scid = ServerScid,
+        hs_pn = Pn
+    } = Conn,
     ClientHsKeys,
-    ClientFinished
+    Frames
 ) ->
-    Frames = [{crypto, 0, iolist_to_binary(ClientFinished)}],
     {Datagram, _Sent} = roadrunner_quic_send:datagram(
-        #{handshake => #{frames => Frames, keys => ClientHsKeys, pn => 0}}, ServerScid, Scid
+        #{handshake => #{frames => Frames, keys => ClientHsKeys, pn => Pn}}, ServerScid, Scid
     ),
-    ok = roadrunner_quic_socket:send(Socket, Host, Port, Datagram).
+    ok = roadrunner_quic_socket:send(Socket, Host, Port, Datagram),
+    Conn#conn{hs_pn = Pn + 1}.
 
 %% Whether the server's 1-RTT packets carry HANDSHAKE_DONE (RFC 9001 §4.1.2).
 %% Short-header packets are addressed to the client's source CID.
@@ -321,10 +385,11 @@ server_public_key(HandshakeBytes) ->
 %% Connected
 %% =============================================================================
 
-%% The 1-RTT loop: serve the owner's stream control calls, and read the
-%% socket for the server's 1-RTT packets, delivering received stream data to
-%% the owner. Owner calls are handled ahead of socket reads (the `after 0`),
-%% and the socket is polled briefly so both stay responsive in one process.
+%% The 1-RTT loop: serve the owner's stream control calls and process the
+%% server's 1-RTT datagrams, delivering received stream data to the owner.
+%% The socket is active-once, so both owner calls and inbound datagrams
+%% arrive as mailbox messages and a single receive handles both without a
+%% blocking socket read that would delay owner calls while the peer is idle.
 -spec connected_loop(#conn{}) -> ok.
 connected_loop(#conn{socket = Socket} = Conn) ->
     receive
@@ -340,22 +405,46 @@ connected_loop(#conn{socket = Socket} = Conn) ->
             Conn1 = send_stream(Conn, StreamId, Data, Fin),
             From ! {Ref, ok},
             connected_loop(Conn1);
+        {frame, From, Ref, Frame} ->
+            Conn1 = send_frame(Conn, Frame),
+            From ! {Ref, ok},
+            connected_loop(Conn1);
         stop ->
+            %% RFC 9000 §10.2: send an application CONNECTION_CLOSE so the
+            %% server tears the connection down promptly (its owner loop
+            %% observes the close) instead of waiting out the idle timeout.
+            _ = send_wire_frame(Conn, {connection_close, application, 0, 0, <<>>}),
             _ = roadrunner_quic_socket:close(Socket),
             ok;
-        _Other ->
-            connected_loop(Conn)
-    after 0 ->
-        case roadrunner_quic_socket:recv(Socket, 50) of
-            {ok, _Peer, Datagram} -> connected_loop(handle_app_datagram(Conn, Datagram));
-            {error, timeout} -> connected_loop(Conn)
-        end
+        Message ->
+            case roadrunner_quic_socket:from_message(Socket, Message) of
+                {ok, _Peer, Datagram} ->
+                    %% Re-arm before processing so the next datagram is already
+                    %% queued while we work (1-RTT packets keep arriving).
+                    ok = roadrunner_quic_socket:activate(Socket),
+                    connected_loop(handle_app_datagram(Conn, Datagram));
+                ignore ->
+                    connected_loop(Conn)
+            end
     end.
 
-%% Send a STREAM frame on a 1-RTT (short-header) packet addressed to the
-%% server's CID, tracking the per-stream offset and the 1-RTT packet number.
--spec send_stream(#conn{}, non_neg_integer(), binary(), boolean()) -> #conn{}.
-send_stream(
+%% Send stream data, splitting it across 1-RTT packets so each datagram stays
+%% within the MTU; the FIN rides the last chunk.
+-spec send_stream(#conn{}, non_neg_integer(), iodata(), boolean()) -> #conn{}.
+send_stream(Conn, StreamId, Data, Fin) ->
+    send_stream_bin(Conn, StreamId, iolist_to_binary(Data), Fin).
+
+-spec send_stream_bin(#conn{}, non_neg_integer(), binary(), boolean()) -> #conn{}.
+send_stream_bin(Conn, StreamId, Bin, Fin) when byte_size(Bin) =< ?MAX_STREAM_CHUNK ->
+    send_stream_packet(Conn, StreamId, Bin, Fin);
+send_stream_bin(Conn, StreamId, Bin, Fin) ->
+    <<Chunk:(?MAX_STREAM_CHUNK)/binary, Rest/binary>> = Bin,
+    send_stream_bin(send_stream_packet(Conn, StreamId, Chunk, false), StreamId, Rest, Fin).
+
+%% One STREAM frame on a 1-RTT (short-header) packet addressed to the server's
+%% CID, tracking the per-stream offset and the 1-RTT packet number.
+-spec send_stream_packet(#conn{}, non_neg_integer(), binary(), boolean()) -> #conn{}.
+send_stream_packet(
     #conn{
         socket = Socket,
         host = Host,
@@ -367,16 +456,48 @@ send_stream(
         send_offsets = Offsets
     } = Conn,
     StreamId,
-    Data,
+    Chunk,
     Fin
 ) ->
     Offset = maps:get(StreamId, Offsets, 0),
-    Frame = {stream, StreamId, Offset, Data, Fin},
+    Frame = {stream, StreamId, Offset, Chunk, Fin},
     {Datagram, _Sent} = roadrunner_quic_send:datagram(
         #{application => #{frames => [Frame], keys => Keys, pn => Pn}}, ServerScid, Scid
     ),
-    ok = roadrunner_quic_socket:send(Socket, Host, Port, Datagram),
-    Conn#conn{send_pn = Pn + 1, send_offsets = Offsets#{StreamId => Offset + byte_size(Data)}}.
+    _ = roadrunner_quic_socket:send(Socket, Host, Port, Datagram),
+    Conn#conn{send_pn = Pn + 1, send_offsets = Offsets#{StreamId => Offset + byte_size(Chunk)}}.
+
+%% Send a single non-STREAM frame (RESET_STREAM, STOP_SENDING) on a 1-RTT
+%% packet. A RESET_STREAM marker (no final size) is resolved here against the
+%% bytes already sent on the stream, since a final size below the largest sent
+%% offset is a FINAL_SIZE_ERROR (RFC 9000 §4.5).
+-spec send_frame(
+    #conn{}, {reset_stream, non_neg_integer(), non_neg_integer()} | roadrunner_quic_frame:frame()
+) -> #conn{}.
+send_frame(#conn{send_offsets = Offsets} = Conn, {reset_stream, StreamId, ErrorCode}) ->
+    FinalSize = maps:get(StreamId, Offsets, 0),
+    send_wire_frame(Conn, {reset_stream, StreamId, ErrorCode, FinalSize});
+send_frame(Conn, Frame) ->
+    send_wire_frame(Conn, Frame).
+
+-spec send_wire_frame(#conn{}, roadrunner_quic_frame:frame()) -> #conn{}.
+send_wire_frame(
+    #conn{
+        socket = Socket,
+        host = Host,
+        port = Port,
+        scid = Scid,
+        server_scid = ServerScid,
+        app_client_keys = Keys,
+        send_pn = Pn
+    } = Conn,
+    Frame
+) ->
+    {Datagram, _Sent} = roadrunner_quic_send:datagram(
+        #{application => #{frames => [Frame], keys => Keys, pn => Pn}}, ServerScid, Scid
+    ),
+    _ = roadrunner_quic_socket:send(Socket, Host, Port, Datagram),
+    Conn#conn{send_pn = Pn + 1}.
 
 %% Decrypt a 1-RTT datagram and route its STREAM frames through per-stream
 %% reassembly, delivering deliverable bytes to the owner.
@@ -391,6 +512,12 @@ handle_app_datagram(#conn{app_server_keys = Keys, scid = Scid} = Conn, Datagram)
 -spec handle_app_frame(roadrunner_quic_frame:frame(), #conn{}) -> #conn{}.
 handle_app_frame({stream, StreamId, Offset, Data, Fin}, Conn) ->
     deliver_stream(Conn, StreamId, Offset, Data, Fin);
+handle_app_frame({reset_stream, StreamId, ErrorCode, _FinalSize}, #conn{owner = Owner} = Conn) ->
+    _ = Owner ! {quic_test_stream_reset, self(), StreamId, ErrorCode},
+    Conn;
+handle_app_frame({connection_close, _Domain, ErrorCode, _FrameType, _Reason}, Conn) ->
+    _ = Conn#conn.owner ! {quic_test_closed, self(), ErrorCode},
+    Conn;
 handle_app_frame(_Other, Conn) ->
     Conn.
 
