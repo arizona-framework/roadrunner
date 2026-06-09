@@ -80,8 +80,11 @@ send_data_round_trip(#{shell := Shell, peer := Peer, client := ClientSocket, ctx
         ?assert(lists:member({stream, 0, 0, ~"hello", true}, Frames))
     end.
 
-%% A peer CONNECTION_CLOSE emits {closed, _} to the owner and terminates the
-%% shell process cleanly (a normal proc_lib exit, not a crash).
+%% A peer CONNECTION_CLOSE emits {closed, _} to the owner immediately, lingers in
+%% draining for ~3x PTO (RFC 9000 §10.2), then terminates the shell cleanly (a
+%% normal proc_lib exit, not a crash). The close also acks the server's
+%% HANDSHAKE_DONE so a real RTT sample collapses the drain to tens of ms, the way
+%% an established connection that exchanged data drains.
 peer_close_terminates_shell(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
     {timeout, 10, fun() ->
         {ClientApSecret, _ServerApSecret} = do_handshake(Shell, Peer, ClientSocket, Ctx),
@@ -103,7 +106,7 @@ peer_close_terminates_shell(#{shell := Shell, peer := Peer, client := ClientSock
             application,
             0,
             roadrunner_quic_keys:traffic_keys(ClientApSecret),
-            [{connection_close, transport, 0, 0, <<>>}],
+            [{ack, 0, 0, 0, [], undefined}, {connection_close, transport, 0, 0, <<>>}],
             ?DCID,
             ?SCID
         ),
@@ -113,7 +116,7 @@ peer_close_terminates_shell(#{shell := Shell, peer := Peer, client := ClientSock
         after 1000 ->
             erlang:error(no_closed_event)
         end,
-        wait_dead(Shell, 50)
+        wait_dead(Shell, 150)
     end}.
 
 %% A synchronous peername control call round-trips through the shell.
