@@ -13,17 +13,21 @@
 %% send/receive pipeline, not the shared socket. The socket delivers each
 %% UDP datagram whole, with its source address.
 
--export([open/1, open/2, send/4, recv/2, activate/1, from_message/2, close/1, sockname/1]).
+-export([
+    open/1, open/2, send/4, recv/2, activate/1, activate/2, from_message/2, close/1, sockname/1
+]).
 
 -export_type([socket/0, open_opts/0]).
 
 -opaque socket() :: {gen_udp, gen_udp:socket()}.
 
+-type active() :: once | false | pos_integer().
+
 -type open_opts() :: #{
     recbuf => pos_integer(),
     sndbuf => pos_integer(),
     reuseport => boolean(),
-    active => once | false
+    active => active()
 }.
 
 %% Larger than the OS default, so a burst of datagrams is not dropped
@@ -42,10 +46,13 @@ Open a UDP socket on `Port`. The socket is binary, with `reuseaddr` set;
 port (read it back with `sockname/1`).
 
 `active` defaults to `false` (passive: drain with `recv/2`). Set it to `once`
-for the listener: each datagram is then delivered to the controlling process
-as one message, parsed with `from_message/2` and re-armed with `activate/1`,
-so the listener can interleave datagrams with monitor/system messages in a
-single receive loop.
+or a positive integer `N` for the listener: each datagram is then delivered to
+the controlling process as one message, parsed with `from_message/2`, so the
+listener can interleave datagrams with monitor/system messages in a single
+receive loop. With `N`, the socket delivers up to `N` datagrams and then one
+`{udp_passive, _}` message (`from_message/2` returns `passive`); re-arming once
+per `N` datagrams with `activate/2` instead of once per datagram with
+`activate/1` amortizes the re-arm syscall while keeping the mailbox bounded.
 
 Set `reuseport` to `true` to enable `SO_REUSEPORT`, which lets a pool of
 sockets share one concrete port with kernel datagram fan-out (the shape the
@@ -91,24 +98,37 @@ recv({gen_udp, Socket}, Timeout) ->
     end.
 
 -doc """
-Re-arm an `active => once` socket for the next datagram. Called after each
-message parsed with `from_message/2`, giving one-datagram-at-a-time
-back-pressure rather than an unbounded `{active, true}` flood.
+Re-arm a socket for one more datagram (`{active, once}`). Re-arms after a single
+datagram; for batched re-arming use `activate/2`.
 """.
 -spec activate(socket()) -> ok | {error, term()}.
-activate({gen_udp, Socket}) ->
-    inet:setopts(Socket, [{active, once}]).
+activate(Socket) ->
+    activate(Socket, once).
 
 -doc """
-Parse a mailbox message from an `active => once` socket: returns the source
-address and datagram bytes for this socket's data message, or `ignore` for
-anything else (a different socket's data, a monitor `DOWN`, a system message),
-so the listener loop can dispatch the rest itself.
+Re-arm a socket with the given active mode: `once` for one more datagram, or a
+positive integer `N` to deliver up to `N` datagrams before the next
+`{udp_passive, _}`. The listener re-arms with its `N` on each `passive` so the
+re-arm syscall is paid once per `N` datagrams, not once per datagram.
+""".
+-spec activate(socket(), once | pos_integer()) -> ok | {error, term()}.
+activate({gen_udp, Socket}, Active) ->
+    inet:setopts(Socket, [{active, Active}]).
+
+-doc """
+Parse a mailbox message from an active socket: returns the source address and
+datagram bytes for this socket's data message, `passive` for its
+`{udp_passive, _}` budget-exhausted notice (the loop should re-arm with
+`activate/2`), or `ignore` for anything else (a different socket's data, a
+monitor `DOWN`, a system message), so the listener loop can dispatch the rest
+itself.
 """.
 -spec from_message(socket(), term()) ->
-    {ok, {inet:ip_address(), inet:port_number()}, binary()} | ignore.
+    {ok, {inet:ip_address(), inet:port_number()}, binary()} | passive | ignore.
 from_message({gen_udp, Socket}, {udp, Socket, Ip, Port, Data}) ->
     {ok, {Ip, Port}, Data};
+from_message({gen_udp, Socket}, {udp_passive, Socket}) ->
+    passive;
 from_message(_Socket, _Message) ->
     ignore.
 
@@ -133,7 +153,7 @@ sockname({gen_udp, Socket}) ->
         recbuf := pos_integer(),
         sndbuf := pos_integer(),
         reuseport := boolean(),
-        active := once | false
+        active := active()
     }.
 validate_opts(Opts) ->
     Defaults = #{
@@ -152,6 +172,8 @@ validate_opt(sndbuf, Value, Acc) when is_integer(Value), Value > 0 ->
 validate_opt(reuseport, Value, Acc) when is_boolean(Value) ->
     Acc#{reuseport => Value};
 validate_opt(active, Value, Acc) when Value =:= once; Value =:= false ->
+    Acc#{active => Value};
+validate_opt(active, Value, Acc) when is_integer(Value), Value > 0 ->
     Acc#{active => Value};
 validate_opt(Key, Value, _Acc) ->
     error({invalid_quic_socket_opt, Key, Value}).
