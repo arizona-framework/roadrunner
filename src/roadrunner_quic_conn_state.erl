@@ -1087,11 +1087,14 @@ earliest_deadline(Now, #state{idle_deadline = Idle} = State) ->
     end.
 
 -spec earliest_pto(integer(), t()) -> integer() | undefined.
-earliest_pto(Now, State) ->
-    lists:foldl(
-        fun(Level, Earliest) -> min_defined(Earliest, space_pto(Now, space(Level, State))) end,
+earliest_pto(Now, #state{spaces = Spaces}) ->
+    %% The earliest PTO across all spaces; fold the map directly (order is
+    %% irrelevant to a min) rather than rebuilding the level list and looking
+    %% each space up again.
+    maps:fold(
+        fun(_Level, Space, Earliest) -> min_defined(Earliest, space_pto(Now, Space)) end,
         undefined,
-        present_levels(State)
+        Spaces
     ).
 
 -spec space_pto(integer(), #space{}) -> integer() | undefined.
