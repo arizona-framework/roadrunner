@@ -111,34 +111,54 @@ advisory or malformed cases the server currently tolerates or omits.
   draining after a local close absorbs the peer's late packets but does not
   re-send its CONNECTION_CLOSE in response (rate-limited), so a peer that lost the
   close learns only by timeout — small-medium
-- NewReno congestion control (RFC 9002 §7); needs the loss layer to surface
-  acked bytes + sent times. Sending is bounded only by the §8.1
-  anti-amplification limit and flow control today — large
+- NewReno congestion control (RFC 9002 §7): `roadrunner_quic_cc_newreno` is built
+  and tested but wired nowhere — `drain_send` gates only on anti-amplification +
+  flow control, never on a congestion window, so on a lossy WAN the server
+  overshoots and self-induces loss with no backoff. The acked/lost bytes per ACK
+  are already computed in `roadrunner_quic_loss:on_ack_received`; the work is
+  threading a `cc` state into the connection and gating the send loop on it.
+  Validate by the CC unit tests + a simulated-loss test, not loopback throughput
+  (it correctly adds ACK-pacing the loopback bench can't show) — large
 - PTO explicit probe (RFC 9002 §6.2.4): a probe timeout only re-checks for
   losses and backs off; it does not retransmit the oldest unacked ack-eliciting
   frames as a probe. Bundle with NewReno (both need the loss layer to surface
   the oldest-unacked) — medium
-- A no-flatten / by-reference stream send buffer, so a large response body is
-  not flattened into one binary before sending — medium
 
 ### Throughput levers identified by profiling
 
-Profiling the native h3 server under load (`scripts/bench.escript --servers
-roadrunner --protocols h3 --scenarios large_response --profile --profile-tool
-eprof --profile-scope all`) leaves two large costs that are not hot-path Erlang,
-so the send-path optimizations did not touch them.
+All-scope eprof on current `main` over a steady-state download (`scripts/bench.escript
+--servers roadrunner --protocols h3 --scenarios large_response --profile
+--profile-tool eprof --profile-scope all`). Harness note: the native loadgen now
+replenishes its receive window with MAX_DATA, so a connection sustains a download
+(~330 MB/s aggregate on a 24-core box) instead of stalling at the advertised
+`initial_max_data`; the per-connection bench numbers stay loadgen-bound (one
+Erlang process per connection, serial per-datagram decrypt), so validate server
+changes by profile-share, not headline req/s.
 
-- Batch UDP sends: each datagram is one `gen_udp:send`, i.e. one `port_command`
-  syscall, and that is ~7% of server time on a download. Sending several
-  datagrams per syscall via `sendmmsg` or UDP generic segmentation offload (GSO)
-  would cut it, but `gen_udp` has no batched-send primitive, so it needs the OTP
-  `socket` API (or a NIF) plus careful per-path sizing — large
-- TLS session resumption / 0-RTT (RFC 8446 §2.2, RFC 9001 §4.6): the RSA-2048
-  CertificateVerify signature is ~6-7 ms per full handshake, the single biggest
-  per-connection cost. Session tickets let a returning client skip the signature
-  entirely. Independently, deploying an ECDSA P-256 server certificate instead of
-  RSA-2048 cuts that signature ~30-60x today with no code change (operator
-  guidance, worth a deployment note) — large
+- Batch UDP sends — the #1 steady-state download cost (~18%): each datagram is
+  one `gen_udp:send`, i.e. one `port_command` syscall, ~56 per 64 KB response.
+  Coalescing them into one `socket:sendmsg` with a `UDP_SEGMENT` cmsg (GSO) cuts
+  it, but `gen_udp` has no batched-send primitive, so it needs the OTP `socket`
+  API (or a NIF) plus per-path sizing; Linux-only with a per-datagram fallback.
+  Helps multi-datagram downloads only (a 1-datagram small response can't batch).
+  `drain_send` already accumulates a pass's datagrams into one list, so the core
+  can emit one `{send_batch, [Datagram]}` effect — large
+- Per-packet AEAD + header protection (~10%) and packet assembly
+  (`build_packet/4` + `stream_data_budget/5`, ~13% together): mostly inherent
+  per-packet work. `stream_data_budget/5` re-encodes the pending ACK frames each
+  packet just to size them; caching that size across a burst is a possible
+  micro-lever — small
+- QPACK / HPACK-Huffman response-header encode (~10% on small responses): the
+  Huffman encoder is unvalidated, so an interleaved A/B of the encode loop is a
+  possible small-response lever — small-medium
+- TLS handshake is a connection-SETUP lever only, not steady-state: with the
+  loadgen sustaining connections the RSA-2048 CertificateVerify is ~0% of
+  steady-state time (it read ~10% only on the old stall-and-die loadgen). It
+  still dominates connection churn — deploying an ECDSA P-256 cert cuts the
+  signature ~30-60x with no server code change (the server already signs ECDSA;
+  the bench generates RSA-2048), so switch the bench cert + add a deployment
+  note. TLS session tickets / 0-RTT (RFC 8446 §2.2, RFC 9001 §4.6) skip the
+  signature entirely for returning clients — small (cert/note) / large (tickets)
 
 ### External interop check
 

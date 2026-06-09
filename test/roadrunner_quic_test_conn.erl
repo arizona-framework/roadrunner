@@ -41,6 +41,10 @@
 -define(MAX_STREAM_CHUNK, 1000).
 -define(RECV_TIMEOUT, 3000).
 -define(CONNECT_TIMEOUT, 8000).
+%% The connection-level receive window this client advertises and replenishes.
+%% Must match the `initial_max_data` in roadrunner_quic_test_client's transport
+%% params: the flow accounting starts from the value the handshake advertised.
+-define(CONN_MAX_DATA, 800000).
 
 %% Handshake message types (RFC 8446 §4).
 -define(CERTIFICATE, 11).
@@ -71,7 +75,11 @@
     next_uni = 2 :: non_neg_integer(),
     send_pn = 0 :: non_neg_integer(),
     send_offsets = #{} :: #{non_neg_integer() => non_neg_integer()},
-    recv_streams = #{} :: #{non_neg_integer() => roadrunner_quic_stream:t()}
+    recv_streams = #{} :: #{non_neg_integer() => roadrunner_quic_stream:t()},
+    %% Connection-level receive flow control (RFC 9000 §4.1): tracks received
+    %% bytes and replenishes the limit with MAX_DATA so the server's send window
+    %% never stalls on a long-lived connection.
+    conn_flow :: roadrunner_quic_flow:t() | undefined
 }).
 
 %% =============================================================================
@@ -193,7 +201,8 @@ init(Parent, Ref, Host, Port) ->
         eph_priv = EphPriv,
         ch_framed = ChFramed,
         owner = Parent,
-        server_initial_keys = roadrunner_quic_keys:initial_server(Dcid0)
+        server_initial_keys = roadrunner_quic_keys:initial_server(Dcid0),
+        conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ?CONN_MAX_DATA})
     },
     case handshake(Conn) of
         {ok, Conn1} ->
@@ -511,7 +520,7 @@ handle_app_datagram(#conn{app_server_keys = Keys, scid = Scid} = Conn, Datagram)
 
 -spec handle_app_frame(roadrunner_quic_frame:frame(), #conn{}) -> #conn{}.
 handle_app_frame({stream, StreamId, Offset, Data, Fin}, Conn) ->
-    deliver_stream(Conn, StreamId, Offset, Data, Fin);
+    deliver_stream(grant_conn_credit(byte_size(Data), Conn), StreamId, Offset, Data, Fin);
 handle_app_frame({reset_stream, StreamId, ErrorCode, _FinalSize}, #conn{owner = Owner} = Conn) ->
     _ = Owner ! {quic_test_stream_reset, self(), StreamId, ErrorCode},
     Conn;
@@ -540,6 +549,22 @@ maybe_deliver(_Owner, _StreamId, <<>>, false) ->
 maybe_deliver(Owner, StreamId, Deliverable, FinReached) ->
     _ = Owner ! {quic_test_stream, self(), StreamId, Deliverable, FinReached},
     ok.
+
+%% Account received stream bytes against the connection-level receive window and,
+%% as it fills, send MAX_DATA so the server's send window is replenished (RFC 9000
+%% §4.1). Mirrors the server's own receive-credit granting: without it the server
+%% correctly stops after the advertised initial_max_data, so a connection serving
+%% more than that many bytes (many responses, or a large download) stalls.
+-spec grant_conn_credit(non_neg_integer(), #conn{}) -> #conn{}.
+grant_conn_credit(Size, #conn{conn_flow = Flow0} = Conn) ->
+    {ok, Flow1} = roadrunner_quic_flow:on_data_received(Size, Flow0),
+    case roadrunner_quic_flow:should_send_max_data(Flow1) of
+        true ->
+            {NewMax, Flow2} = roadrunner_quic_flow:grant_max_data(Flow1),
+            send_wire_frame(Conn#conn{conn_flow = Flow2}, {max_data, NewMax});
+        false ->
+            Conn#conn{conn_flow = Flow1}
+    end.
 
 %% =============================================================================
 %% Internal
