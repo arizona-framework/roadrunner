@@ -124,6 +124,13 @@ advisory or malformed cases the server currently tolerates or omits.
   the oldest-unacked) — medium
 - A no-flatten / by-reference stream send buffer, so a large response body is
   not flattened into one binary before sending — medium
+- Prune fully-terminal streams (send + receive both closed, or reset) from the
+  connection's stream map, which grows unbounded over a keep-alive connection
+  today (every served request's bidi stream lingers). The send pass already
+  walks only a pending-data working set, so this is now a memory bound, not a
+  CPU one; it needs an RFC 9000 §3 late-packet guard (a high-water mark so a
+  late or retransmitted frame for a removed id is ignored, not recreated) —
+  medium
 
 ### External interop check
 

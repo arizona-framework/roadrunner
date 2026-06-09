@@ -780,6 +780,21 @@ send_data_slices_large_payload_test() ->
     ?assertEqual([false, false, true], [Fin || {stream, 0, _, _, Fin} <- Frames]),
     ?assertEqual(Payload, iolist_to_binary([D || {stream, 0, _, D, _} <- Frames])).
 
+send_blocked_by_exhausted_send_window_test() ->
+    %% Send-side flow control (RFC 9000 §4.1): a payload larger than the send
+    %% window fills the window across packets, then the send pass finds the
+    %% still-pending stream flow-blocked and emits nothing more for it. With the
+    %% send pass walking only streams that have pending data, this block is the
+    %% one path that reaches take_stream's no-frame branch.
+    {State, ApSecret} = connected_for_send(),
+    %% The conn and per-stream send windows both default to roadrunner_quic_flow's
+    %% initial_max_data (786432), so the payload must exceed it to block.
+    Payload = binary:copy(~"x", 786432 + 1000),
+    {_State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
+    Sent = iolist_to_binary([D || {stream, 0, _, D, _} <- sent_stream_frames(Effects, ApSecret)]),
+    ?assert(byte_size(Sent) > 0),
+    ?assert(byte_size(Sent) < byte_size(Payload)).
+
 send_data_on_control_then_request_stream_test() ->
     %% The two load-bearing GET writes: SETTINGS on the server control stream
     %% (id 3) then a response on the client request stream (id 0), each on its

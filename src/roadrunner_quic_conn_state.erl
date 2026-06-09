@@ -101,6 +101,12 @@
     %% by stream id (peer-initiated on receive; server-initiated and client
     %% request streams on send).
     streams = #{} :: #{non_neg_integer() => stream()},
+    %% The subset of `streams` ids with unsent data or an unsent FIN, kept
+    %% ascending (RFC 9000 stream priority: lowest id first). The send pass
+    %% walks only these instead of re-sorting and scanning every stream
+    %% (finished streams stay in `streams` but leave this set), so per-pass
+    %% work is O(streams-with-pending-data), not O(all-streams-ever).
+    sendable = [] :: ordsets:ordset(non_neg_integer()),
     %% Next server-initiated unidirectional stream id to hand out (RFC 9000
     %% §2.1: server uni ids are 3, 7, 11, ...); the owner opens its h3
     %% control stream this way.
@@ -842,8 +848,16 @@ stream_recv_window(_Sid, #{initial_max_stream_data_uni := Uni}) ->
 
 -spec put_stream(non_neg_integer(), roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()) ->
     t().
-put_stream(Sid, Stream, Flow, #state{streams = Streams} = State) ->
-    State#state{streams = Streams#{Sid => {Stream, Flow}}}.
+put_stream(Sid, Stream, Flow, #state{streams = Streams, sendable = Sendable} = State) ->
+    %% The single writer of `streams`, so it is also where the `sendable`
+    %% working set stays in step: a stream with unsent data/FIN joins it, a
+    %% drained or finished one leaves it.
+    Sendable1 =
+        case roadrunner_quic_stream:send_pending(Stream) of
+            true -> ordsets:add_element(Sid, Sendable);
+            false -> ordsets:del_element(Sid, Sendable)
+        end,
+    State#state{streams = Streams#{Sid => {Stream, Flow}}, sendable = Sendable1}.
 
 %% Emit {stream_data, ...} when there are newly-contiguous bytes OR the FIN
 %% was reached (the FIN-only {<<>>, true} end-of-stream the h3 layer needs).
@@ -943,8 +957,10 @@ build_data(Level, AckFrames, Space, State) ->
 %% by the connection and per-stream send windows and the per-packet budget,
 %% and the bytes are accounted against both windows.
 -spec take_stream(t()) -> {[roadrunner_quic_frame:frame()], t()}.
-take_stream(#state{streams = Streams} = State) ->
-    take_stream(lists:sort(maps:keys(Streams)), State).
+take_stream(#state{sendable = Sendable} = State) ->
+    %% Only streams with pending send data are candidates, already ascending;
+    %% finished/drained streams never enter the walk (see `put_stream/4`).
+    take_stream(Sendable, State).
 
 -spec take_stream([non_neg_integer()], t()) -> {[roadrunner_quic_frame:frame()], t()}.
 take_stream([], State) ->
