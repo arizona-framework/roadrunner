@@ -31,7 +31,9 @@
 %% the per-stream flow window.
 
 -export([new/0, receive_data/4, reset/2]).
--export([enqueue/2, finish/1, next_frame/2, stop_sending/1, send_pending/1, send_offset/1]).
+-export([
+    enqueue/2, finish/1, next_frame/2, stop_sending/1, send_pending/1, send_offset/1, is_terminal/1
+]).
 
 -export_type([t/0]).
 
@@ -186,6 +188,23 @@ stop_sending(#stream{} = Stream) ->
 send_pending(#stream{fin_sent = true}) -> false;
 send_pending(#stream{send_buf = <<>>, send_fin = false}) -> false;
 send_pending(#stream{}) -> true.
+
+-doc """
+Whether both directions are finished, so the stream can be pruned: the send FIN
+is on the wire (`fin_sent`) and the receive side has reached its final size and
+either delivered its FIN or been reset (RFC 9000 §3). A send side abandoned via
+STOP_SENDING without a FIN is conservatively not terminal (it lingers rather
+than risk pruning a stream still in use).
+""".
+-spec is_terminal(t()) -> boolean().
+is_terminal(#stream{
+    fin_sent = true, final_size = FinalSize, fin_delivered = FinDelivered, aborted = Aborted
+}) when
+    FinalSize =/= undefined
+->
+    FinDelivered orelse Aborted;
+is_terminal(#stream{}) ->
+    false.
 
 -doc """
 The send offset: the number of stream bytes already put on the wire, which is
