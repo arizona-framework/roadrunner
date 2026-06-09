@@ -902,12 +902,37 @@ open_stream(Sid, #state{info = #{transport_params := TP}} = State) ->
     Flow = roadrunner_quic_flow:new(#{initial_max_data => stream_recv_window(Sid, TP)}),
     {ok, Stream, Flow, emit({stream_opened, Sid}, bump_opened(Sid, State))}.
 
-%% Advance the per-type high-water past `Sid`'s ordinal.
+%% Advance the per-type high-water past `Sid`'s ordinal. Opening a bidi stream
+%% also tops up the peer's bidi-stream credit.
 -spec bump_opened(non_neg_integer(), t()) -> t().
 bump_opened(Sid, #state{bidi_opened = Opened} = State) when Sid rem 4 =:= 0 ->
-    State#state{bidi_opened = max(Opened, Sid div 4 + 1)};
+    grant_max_streams_bidi(State#state{bidi_opened = max(Opened, Sid div 4 + 1)});
 bump_opened(Sid, #state{uni_opened = Opened} = State) ->
     State#state{uni_opened = max(Opened, Sid div 4 + 1)}.
+
+%% Keep the peer in bidi-stream credit (RFC 9000 §4.6): once the opened count is
+%% within a quarter-window of the advertised limit, raise the limit to a fresh
+%% window above what is opened and queue a MAX_STREAMS so the peer can keep
+%% opening request streams. Mirrors the receive-flow MAX_DATA refill
+%% (`roadrunner_quic_flow`, the 3/4 threshold); the window is the originally
+%% advertised `initial_max_streams_bidi`.
+-spec grant_max_streams_bidi(t()) -> t().
+grant_max_streams_bidi(
+    #state{
+        bidi_opened = Opened,
+        max_streams_bidi = Max,
+        info = #{transport_params := #{initial_max_streams_bidi := Window}}
+    } = State
+) ->
+    case Opened > Max - Window * 3 div 4 of
+        true ->
+            NewMax = Opened + Window,
+            queue_frame(
+                application, {max_streams, bidi, NewMax}, State#state{max_streams_bidi = NewMax}
+            );
+        false ->
+            State
+    end.
 
 %% The receive window we advertised for a peer-initiated stream (RFC 9000
 %% §18.2): client-initiated bidirectional streams (Sid rem 4 == 0) get

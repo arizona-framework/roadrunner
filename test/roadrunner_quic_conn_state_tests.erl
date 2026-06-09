@@ -862,6 +862,22 @@ reset_for_pruned_stream_ignored_test() ->
     {State3, _} = ?M:handle_datagram(?NOW, Rst, State2),
     ?assertEqual(connected, ?M:phase(State3)).
 
+%% As the peer opens bidi streams toward the advertised limit (test TP = 3), the
+%% server raises the limit and sends MAX_STREAMS so the peer can keep opening
+%% request streams (RFC 9000 §4.6). The first open is still within credit (no
+%% grant); the second crosses the refill threshold and grants a fresh window.
+max_streams_granted_as_bidi_credit_consumed_test() ->
+    {State0, ClientApSecret, ServerApSecret} = connect_owned(),
+    Open0 = app_datagram([{stream, 0, 0, ~"a", true}], 0, ClientApSecret),
+    {State1, E0} = ?M:handle_datagram(?NOW, Open0, State0),
+    ?assertEqual([], max_streams_frames(E0, ServerApSecret)),
+    Open4 = app_datagram([{stream, 4, 0, ~"b", true}], 1, ClientApSecret),
+    {_State2, E4} = ?M:handle_datagram(?NOW, Open4, State1),
+    ?assertEqual([{max_streams, bidi, 5}], max_streams_frames(E4, ServerApSecret)).
+
+max_streams_frames(Effects, ServerApSecret) ->
+    [F || {max_streams, _, _} = F <- sent_app_frames(Effects, ServerApSecret)].
+
 send_data_on_control_then_request_stream_test() ->
     %% The two load-bearing GET writes: SETTINGS on the server control stream
     %% (id 3) then a response on the client request stream (id 0), each on its
