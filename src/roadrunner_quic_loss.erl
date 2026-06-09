@@ -6,13 +6,17 @@
 %%
 %% The module is pure: the monotonic clock is passed in as `Now`
 %% (milliseconds) on every state transition, so all timing decisions are
-%% deterministic and unit-testable. Sent packets are tracked newest-first
-%% (an O(1) prepend on send); on an ACK they are classified acknowledged,
-%% lost, or still in flight in one pass, the RTT is updated from the
-%% largest acknowledged ack-eliciting packet (RFC 9002 §5), and the rest
-%% are checked against the packet and time loss thresholds (§6.1). The
-%% caller retransmits the data carried by the returned lost packets and
-%% feeds the acknowledged/lost byte counts to congestion control.
+%% deterministic and unit-testable. Sent packets are tracked in a queue,
+%% oldest at the front (an O(1) enqueue on send); on an ACK only the
+%% packets at or below the largest acknowledged are resolved off the front
+%% (acknowledged, lost, or a still-in-flight gap), while the higher-numbered
+%% packets sent ahead stay in the queue untouched. This keeps ACK processing
+%% O(packets-this-ack-resolves) rather than O(in flight), which matters for a
+%% large response burst with no congestion window to bound the in-flight set.
+%% The RTT is updated from the largest acknowledged ack-eliciting packet (RFC
+%% 9002 §5) and loss is judged by the packet and time thresholds (§6.1). The
+%% caller retransmits the data carried by the returned lost packets and feeds
+%% the acknowledged/lost byte counts to congestion control.
 
 -export([
     new/1,
@@ -63,8 +67,10 @@
 }).
 
 -record(loss, {
-    %% Sent-but-not-resolved packets, newest first.
-    sent = [] :: [#sent{}],
+    %% Sent-but-not-resolved packets, a queue with the oldest (lowest packet
+    %% number) at the front, so an ACK resolves them from the front and the
+    %% higher-numbered in-flight packets stay as the shared remaining queue.
+    sent = queue:new() :: queue:queue(#sent{}),
     %% RTT estimation (RFC 9002 §5).
     latest_rtt = 0 :: non_neg_integer(),
     smoothed_rtt :: non_neg_integer(),
@@ -130,7 +136,7 @@ on_packet_sent(
         pn = PN, time_sent = Now, ack_eliciting = AckEliciting, size = Size, data = Data
     },
     Loss#loss{
-        sent = [Packet | Sent],
+        sent = queue:in(Packet, Sent),
         bytes_in_flight = InFlight + ack_eliciting_bytes(AckEliciting, Size)
     }.
 
@@ -154,15 +160,19 @@ on_ack_received(Ack, Now, Loss) ->
         {error, _} = Error ->
             Error;
         Ranges ->
-            {Acked, Unacked} = classify(Loss#loss.sent, Ranges),
-            Loss1 = maybe_update_rtt(Loss, LargestAcked, Acked, AckDelay, Now),
             NewLargest = max_largest_acked(Loss#loss.largest_acked, LargestAcked),
-            LossDelay = loss_delay(Loss1),
-            {Lost, Survivors} = split_lost(Unacked, NewLargest, Now, LossDelay),
+            %% Only packets at or below the largest acknowledged can be
+            %% acknowledged or declared lost by this ACK; the higher-numbered
+            %% packets sent ahead stay in flight. Resolving just that prefix off
+            %% the front keeps the work O(packets-this-ack-resolves).
+            {Resolvable, Ahead} = pop_resolvable(Loss#loss.sent, NewLargest, []),
+            {Acked, Unacked} = classify(Resolvable, Ranges),
+            Loss1 = maybe_update_rtt(Loss, LargestAcked, Acked, AckDelay, Now),
+            {Lost, Survivors} = split_lost(Unacked, NewLargest, Now, loss_delay(Loss1)),
             AckedBytes = in_flight_bytes(Acked),
             LostBytes = in_flight_bytes(Lost),
             Loss2 = Loss1#loss{
-                sent = Survivors,
+                sent = requeue(Survivors, Ahead),
                 largest_acked = NewLargest,
                 pto_count = 0,
                 bytes_in_flight = max(0, Loss1#loss.bytes_in_flight - AckedBytes - LostBytes)
@@ -185,7 +195,10 @@ retransmit.
 detect_lost(_Now, #loss{largest_acked = undefined} = Loss) ->
     {Loss, []};
 detect_lost(Now, #loss{sent = Sent, largest_acked = LargestAcked} = Loss) ->
-    {Lost, Survivors} = split_lost(Sent, LargestAcked, Now, loss_delay(Loss)),
+    %% The loss condition is monotonic from the oldest end (lowest number,
+    %% earliest sent), so the lost packets are a front prefix: take them off
+    %% and stop at the first survivor (the rest of the queue stays).
+    {Lost, Survivors} = take_lost_front(Sent, LargestAcked, Now, loss_delay(Loss), []),
     Loss1 = Loss#loss{
         sent = Survivors,
         bytes_in_flight = max(0, Loss#loss.bytes_in_flight - in_flight_bytes(Lost))
@@ -197,11 +210,11 @@ When the loss timer should next fire: the oldest sent packet's send time
 plus the loss delay, or `undefined` if nothing is outstanding.
 """.
 -spec loss_time(t()) -> non_neg_integer() | undefined.
-loss_time(#loss{sent = []}) ->
-    undefined;
 loss_time(#loss{sent = Sent} = Loss) ->
-    #sent{time_sent = Oldest} = lists:last(Sent),
-    Oldest + loss_delay(Loss).
+    case queue:peek(Sent) of
+        empty -> undefined;
+        {value, #sent{time_sent = Oldest}} -> Oldest + loss_delay(Loss)
+    end.
 
 %% =============================================================================
 %% RTT estimation (RFC 9002 §5)
@@ -330,18 +343,62 @@ classify([#sent{pn = PN} = Packet | Rest], Ranges) ->
     {[#sent{}], [#sent{}]}.
 split_lost([], _LargestAcked, _Now, _LossDelay) ->
     {[], []};
-split_lost([#sent{pn = PN, time_sent = Sent} = Packet | Rest], LargestAcked, Now, LossDelay) ->
+split_lost([Packet | Rest], LargestAcked, Now, LossDelay) ->
     {Lost, Survivors} = split_lost(Rest, LargestAcked, Now, LossDelay),
-    %% Only packets below the largest acknowledged are loss candidates
-    %% (RFC 9002 §6.1): declaring loss requires a later packet to have been
-    %% acknowledged, so packets above the largest acked stay in flight.
-    case
-        PN < LargestAcked andalso
-            (PN =< LargestAcked - ?PACKET_THRESHOLD orelse Now - Sent > LossDelay)
-    of
+    case lost_packet(Packet, LargestAcked, Now, LossDelay) of
         true -> {[Packet | Lost], Survivors};
         false -> {Lost, [Packet | Survivors]}
     end.
+
+%% Whether a still-unacknowledged packet is lost (RFC 9002 §6.1): only packets
+%% below the largest acknowledged are candidates (declaring loss requires a
+%% later packet to have been acknowledged), then by the packet threshold (at
+%% least three below the largest acked) or the time threshold.
+-spec lost_packet(#sent{}, non_neg_integer(), non_neg_integer(), non_neg_integer()) -> boolean().
+lost_packet(#sent{pn = PN, time_sent = Sent}, LargestAcked, Now, LossDelay) ->
+    PN < LargestAcked andalso
+        (PN =< LargestAcked - ?PACKET_THRESHOLD orelse Now - Sent > LossDelay).
+
+%% Take the packets at or below `NewLargest` off the front (oldest first) into a
+%% newest-first list, the candidates this ACK can resolve; the higher-numbered
+%% in-flight packets stay in the returned queue. The queue is ordered by packet
+%% number, so the candidates are exactly a front prefix.
+-spec pop_resolvable(queue:queue(#sent{}), non_neg_integer(), [#sent{}]) ->
+    {[#sent{}], queue:queue(#sent{})}.
+pop_resolvable(Queue, NewLargest, Acc) ->
+    case queue:peek(Queue) of
+        {value, #sent{pn = PN} = Packet} when PN =< NewLargest ->
+            {{value, Packet}, Rest} = queue:out(Queue),
+            pop_resolvable(Rest, NewLargest, [Packet | Acc]);
+        _ ->
+            {Acc, Queue}
+    end.
+
+%% Take the lost packets off the front (oldest first), stopping at the first
+%% survivor; `lost_packet/4` is monotonic from the front, so the lost packets
+%% are a prefix and the rest of the queue stays in flight.
+-spec take_lost_front(
+    queue:queue(#sent{}), non_neg_integer(), non_neg_integer(), non_neg_integer(), [#sent{}]
+) -> {[#sent{}], queue:queue(#sent{})}.
+take_lost_front(Queue, LargestAcked, Now, LossDelay, Acc) ->
+    case queue:peek(Queue) of
+        {value, #sent{} = Packet} ->
+            case lost_packet(Packet, LargestAcked, Now, LossDelay) of
+                true ->
+                    {{value, Packet}, Rest} = queue:out(Queue),
+                    take_lost_front(Rest, LargestAcked, Now, LossDelay, [Packet | Acc]);
+                false ->
+                    {Acc, Queue}
+            end;
+        empty ->
+            {Acc, Queue}
+    end.
+
+%% Put the still-in-flight gap survivors (newest-first, all numbered below the
+%% queue's front) back onto the front, restoring the by-packet-number order.
+-spec requeue([#sent{}], queue:queue(#sent{})) -> queue:queue(#sent{}).
+requeue(Survivors, Queue) ->
+    lists:foldl(fun queue:in_r/2, Queue, Survivors).
 
 %% RFC 9002 §6.1.2: max(time_threshold * max(latest, smoothed), granularity).
 loss_delay(#loss{latest_rtt = Latest, smoothed_rtt = SRtt}) ->
