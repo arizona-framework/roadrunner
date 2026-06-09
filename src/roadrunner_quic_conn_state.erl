@@ -750,11 +750,39 @@ process_stream(Sid, Offset, Data, Fin, State) ->
                 {ok, StreamFlow1} ?= roadrunner_quic_flow:on_data_received(Delta, StreamFlow0),
                 {ok, Deliverable, FinReached, Stream1} ?=
                     roadrunner_quic_stream:receive_data(Offset, Data, Fin, Stream0),
-                State2 = put_stream(Sid, Stream1, StreamFlow1, State1#state{conn_flow = ConnFlow1}),
-                deliver_stream(Sid, Deliverable, FinReached, State2)
+                {ConnFlow2, State2} = grant_conn_credit(ConnFlow1, State1),
+                {StreamFlow2, State3} = grant_stream_credit(Sid, StreamFlow1, State2),
+                State4 = put_stream(Sid, Stream1, StreamFlow2, State3#state{conn_flow = ConnFlow2}),
+                deliver_stream(Sid, Deliverable, FinReached, State4)
             else
                 {error, Reason} -> connection_fatal(application, Reason, State)
             end
+    end.
+
+%% Refill the connection-level receive window as the peer consumes it (RFC 9000
+%% §4.1): once more than the refill threshold is used, advertise a fresh window
+%% with a MAX_DATA frame so a large upload keeps flowing instead of stalling at
+%% the initial grant.
+-spec grant_conn_credit(roadrunner_quic_flow:t(), t()) -> {roadrunner_quic_flow:t(), t()}.
+grant_conn_credit(ConnFlow, State) ->
+    case roadrunner_quic_flow:should_send_max_data(ConnFlow) of
+        true ->
+            {NewMax, ConnFlow1} = roadrunner_quic_flow:grant_max_data(ConnFlow),
+            {ConnFlow1, queue_frame(application, {max_data, NewMax}, State)};
+        false ->
+            {ConnFlow, State}
+    end.
+
+%% Refill a stream's receive window the same way, with MAX_STREAM_DATA.
+-spec grant_stream_credit(non_neg_integer(), roadrunner_quic_flow:t(), t()) ->
+    {roadrunner_quic_flow:t(), t()}.
+grant_stream_credit(Sid, StreamFlow, State) ->
+    case roadrunner_quic_flow:should_send_max_data(StreamFlow) of
+        true ->
+            {NewMax, StreamFlow1} = roadrunner_quic_flow:grant_max_data(StreamFlow),
+            {StreamFlow1, queue_frame(application, {max_stream_data, Sid, NewMax}, State)};
+        false ->
+            {StreamFlow, State}
     end.
 
 %% A RESET_STREAM aborts the peer's send side and surfaces the abort code. On
