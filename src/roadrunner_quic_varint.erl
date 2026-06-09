@@ -18,7 +18,7 @@
 %% crashing, so callers (`roadrunner_quic_h3_frame`, the packet/frame
 %% codecs) can thread incremental input without a `try`.
 
--export([encode/1, decode/1]).
+-export([encode/1, encoded_size/1, decode/1]).
 
 -export_type([decode_result/0]).
 
@@ -50,6 +50,17 @@ encode(V) when is_integer(V), V >= 0, V =< ?MAX_1 -> <<0:2, V:6>>;
 encode(V) when is_integer(V), V > ?MAX_1, V =< ?MAX_2 -> <<1:2, V:14>>;
 encode(V) when is_integer(V), V > ?MAX_2, V =< ?MAX_4 -> <<2:2, V:30>>;
 encode(V) when is_integer(V), V > ?MAX_4, V =< ?MAX_8 -> <<3:2, V:62>>.
+
+-doc """
+The number of bytes `encode/1` produces for `V`, computed from its range
+without building the binary (RFC 9000 §16 minimal-length form). The value must
+fit in 62 bits.
+""".
+-spec encoded_size(non_neg_integer()) -> 1 | 2 | 4 | 8.
+encoded_size(V) when is_integer(V), V >= 0, V =< ?MAX_1 -> 1;
+encoded_size(V) when is_integer(V), V > ?MAX_1, V =< ?MAX_2 -> 2;
+encoded_size(V) when is_integer(V), V > ?MAX_2, V =< ?MAX_4 -> 4;
+encoded_size(V) when is_integer(V), V > ?MAX_4, V =< ?MAX_8 -> 8.
 
 %% =============================================================================
 %% decode/1

@@ -194,9 +194,9 @@ stream_data_budget(DCID, PN, AckFrames, Sid, Offset) ->
     OffsetBytes =
         case Offset of
             0 -> 0;
-            _ -> byte_size(roadrunner_quic_varint:encode(Offset))
+            _ -> roadrunner_quic_varint:encoded_size(Offset)
         end,
-    StreamHeader = 1 + byte_size(roadrunner_quic_varint:encode(Sid)) + OffsetBytes + 2,
+    StreamHeader = 1 + roadrunner_quic_varint:encoded_size(Sid) + OffsetBytes + 2,
     Overhead = ShortHeader + AckBytes + StreamHeader + ?TAG_LEN,
     max(0, ?MAX_1RTT_DATAGRAM - Overhead).
 
