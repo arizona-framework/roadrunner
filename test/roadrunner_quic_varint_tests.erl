@@ -59,6 +59,17 @@ encode_class_boundaries_test() ->
 encode_above_max_crashes_test() ->
     ?assertError(function_clause, roadrunner_quic_varint:encode(4611686018427387904)).
 
+%% encoded_size/1 returns the width encode/1 would produce, at every class
+%% boundary and above the maximum (function_clause).
+encoded_size_class_boundaries_test() ->
+    [
+        ?assertEqual(
+            byte_size(roadrunner_quic_varint:encode(V)), roadrunner_quic_varint:encoded_size(V)
+        )
+     || V <- [0, 63, 64, 16383, 16384, 1073741823, 1073741824, 4611686018427387903]
+    ],
+    ?assertError(function_clause, roadrunner_quic_varint:encoded_size(4611686018427387904)).
+
 %% =============================================================================
 %% decode/1 — trailing bytes, incomplete buffers, empty buffer.
 %% =============================================================================

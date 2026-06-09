@@ -23,6 +23,7 @@ an outer guard. The pure routing decision (`classify/2`) is unit-tested in
     system_message_exposes_state/1,
     stray_message_is_ignored/1,
     malformed_datagram_is_dropped/1,
+    rearms_after_active_batch/1,
     sends_version_negotiation_for_unsupported_version/1,
     uses_injected_registry/1,
     conn_death_before_set_owner_does_not_wedge/1,
@@ -45,6 +46,7 @@ all() ->
         system_message_exposes_state,
         stray_message_is_ignored,
         malformed_datagram_is_dropped,
+        rearms_after_active_batch,
         sends_version_negotiation_for_unsupported_version,
         uses_injected_registry,
         conn_death_before_set_owner_does_not_wedge,
@@ -170,6 +172,35 @@ malformed_datagram_is_dropped(_Config) ->
     %% A short-header first byte with too few bytes for the fixed 8-byte SCID:
     %% dcid/2 reports {error, truncated}, so classify -> drop.
     ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, Port, <<16#40, 1, 2, 3>>),
+    ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, Port, crafted_initial()),
+    ConnPid = receive_server_conn(),
+    ?assert(is_pid(ConnPid)),
+    ?assertEqual(Port, roadrunner_quic_listener:get_port(Listener)),
+    exit(ConnPid, kill),
+    ok = roadrunner_quic_socket:close(Client),
+    ok = roadrunner_quic_listener:stop(Listener).
+
+%% The shared socket runs in `{active, N}` mode, so it delivers up to ?ACTIVE_N
+%% datagrams and then a `{udp_passive, _}` notice that drives handle_message's
+%% `passive` branch (re-arm via activate/2). Flooding more than ?ACTIVE_N
+%% malformed datagrams (each dropped) before a valid Initial proves the re-arm
+%% works: the Initial lands past the first batch, so the handler firing for it
+%% means a passive re-arm already ran. The refusing handler keeps the spawned
+%% connection owner-less, so killing it for cleanup cannot race a set_owner_sync.
+rearms_after_active_batch(_Config) ->
+    Test = self(),
+    Handler = fun(ConnPid) ->
+        Test ! {server_conn, ConnPid},
+        {error, max_clients}
+    end,
+    {Listener, Port} = start_listener(Handler),
+    {ok, Client} = roadrunner_quic_socket:open(0),
+    %% More than roadrunner_quic_listener's ?ACTIVE_N (100), so at least one
+    %% batch boundary is crossed before the Initial is delivered.
+    _ = [
+        roadrunner_quic_socket:send(Client, ?LOOPBACK, Port, <<16#40, 1, 2, 3>>)
+     || _ <- lists:seq(1, 120)
+    ],
     ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, Port, crafted_initial()),
     ConnPid = receive_server_conn(),
     ?assert(is_pid(ConnPid)),

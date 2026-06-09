@@ -73,6 +73,23 @@ decode_all_propagates_error_test() ->
     Bin = <<16#01, 16#06, 16#00>>,
     ?assertEqual({error, truncated}, ?M:decode_all(Bin)).
 
+%% A run of consecutive PADDING bytes decodes to a single `padding` frame
+%% (RFC 9000 §19.1 makes padding a no-op), whether the run trails the packet
+%% or sits between other frames.
+decode_all_collapses_padding_run_test() ->
+    %% A trailing run longer than a machine word exercises the word-wide skip
+    %% and the single-byte tail; a short middle run uses the single-byte path.
+    Trailing = iolist_to_binary([?M:encode(ping), binary:copy(<<0>>, 10)]),
+    ?assertEqual({ok, [ping, padding]}, ?M:decode_all(Trailing)),
+    Middle = iolist_to_binary([<<0, 0, 0>>, ?M:encode(ping), <<0, 0>>]),
+    ?assertEqual({ok, [padding, ping, padding]}, ?M:decode_all(Middle)).
+
+%% An error after a leading PADDING run still propagates (covers the run
+%% fast-path's error branch).
+decode_all_padding_run_then_error_test() ->
+    %% Two PADDING bytes, then a CRYPTO frame truncated mid-field.
+    ?assertEqual({error, truncated}, ?M:decode_all(<<0, 0, 16#06, 16#00>>)).
+
 %% =============================================================================
 %% Malformed input: errors, never a crash.
 %% =============================================================================

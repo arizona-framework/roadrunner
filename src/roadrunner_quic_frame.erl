@@ -402,11 +402,30 @@ decode_ack_ecn(Largest, AckDelay, FirstRange, Ranges, ecn, Bin) ->
 -spec decode_all(binary()) -> {ok, [frame()]} | {error, term()}.
 decode_all(<<>>) ->
     {ok, []};
+decode_all(<<?PADDING, Rest/binary>>) ->
+    %% PADDING is a no-op (RFC 9000 §19.1) and packets pad in long runs (a
+    %% client Initial is padded to 1200 bytes), so collapse a whole run into a
+    %% single `padding` frame rather than decoding each zero byte on its own.
+    decode_all_padding(Rest);
 decode_all(Bin) ->
     maybe
         {ok, Frame, Rest} ?= decode(Bin),
         {ok, Frames} ?= decode_all(Rest),
         {ok, [Frame | Frames]}
+    end.
+
+%% Skip the rest of a PADDING run, then emit one `padding` frame ahead of
+%% whatever follows it. Pad runs are long (a client Initial pads ~1150 bytes),
+%% so step a machine word at a time and fall back to single bytes at the tail.
+-spec decode_all_padding(binary()) -> {ok, [frame()]} | {error, term()}.
+decode_all_padding(<<0:64, Rest/binary>>) ->
+    decode_all_padding(Rest);
+decode_all_padding(<<?PADDING, Rest/binary>>) ->
+    decode_all_padding(Rest);
+decode_all_padding(Bin) ->
+    maybe
+        {ok, Frames} ?= decode_all(Bin),
+        {ok, [padding | Frames]}
     end.
 
 %% =============================================================================

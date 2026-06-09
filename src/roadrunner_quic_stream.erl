@@ -128,6 +128,11 @@ reset(FinalSize, #stream{final_size = Existing} = Stream) ->
 
 -doc "Append outbound bytes to the stream's send buffer.".
 -spec enqueue(iodata(), t()) -> t().
+enqueue(Data, #stream{send_buf = <<>>} = Stream) ->
+    %% First write into an empty buffer (the common single-response case): store
+    %% the bytes directly, with no copy when Data is already a binary, instead of
+    %% concatenating onto the empty buffer (which copies the whole body).
+    Stream#stream{send_buf = iolist_to_binary(Data)};
 enqueue(Data, #stream{send_buf = Buf} = Stream) ->
     Stream#stream{send_buf = <<Buf/binary, (iolist_to_binary(Data))/binary>>}.
 
@@ -257,17 +262,21 @@ insert_segment(Offset, Data, [{SegOffset, SegData} = Segment | Rest]) ->
         Offset >= SegEnd ->
             [Segment | insert_segment(Offset, Data, Rest)];
         true ->
-            before_segment(Offset, Data, SegOffset) ++
-                [Segment | after_segment(Offset, Data, End, SegEnd, Rest)]
+            before_segment(
+                Offset, Data, SegOffset, [Segment | after_segment(Offset, Data, End, SegEnd, Rest)]
+            )
     end.
 
-%% The part of an overlapping piece that falls before the segment it hit.
--spec before_segment(non_neg_integer(), binary(), non_neg_integer()) ->
+%% The part of an overlapping piece that falls before the segment it hit, consed
+%% onto the rest of the segment list (no list append).
+-spec before_segment(non_neg_integer(), binary(), non_neg_integer(), [
+    {non_neg_integer(), binary()}
+]) ->
     [{non_neg_integer(), binary()}].
-before_segment(Offset, Data, SegOffset) when Offset < SegOffset ->
-    [{Offset, binary:part(Data, 0, SegOffset - Offset)}];
-before_segment(_Offset, _Data, _SegOffset) ->
-    [].
+before_segment(Offset, Data, SegOffset, Tail) when Offset < SegOffset ->
+    [{Offset, binary:part(Data, 0, SegOffset - Offset)} | Tail];
+before_segment(_Offset, _Data, _SegOffset, Tail) ->
+    Tail.
 
 %% The part of an overlapping piece that falls after the segment it hit,
 %% re-inserted against the remaining segments.

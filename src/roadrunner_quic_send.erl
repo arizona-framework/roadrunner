@@ -35,7 +35,7 @@
 %% the returned datagram's size. The record also carries the packet's
 %% frames so the loop can retransmit them if it is later declared lost.
 
--export([datagram/3]).
+-export([datagram/3, stream_data_budget/5]).
 %% Exported for the connection loop's ack-tracking and loss-retransmit
 %% decisions: the single source of truth for which frames are ack-eliciting.
 -export([ack_eliciting/1, is_ack_eliciting/1]).
@@ -46,6 +46,10 @@
 -define(QUIC_V1, 16#00000001).
 %% RFC 9000 §14.1: a datagram carrying an Initial packet is >= 1200 bytes.
 -define(MIN_INITIAL_DATAGRAM, 1200).
+%% RFC 9000 §14: 1200 bytes is the conservative path limit every QUIC path is
+%% guaranteed to carry without fragmentation, and the ceiling a 1-RTT datagram
+%% targets until path MTU discovery (a follow-up) proves a larger size.
+-define(MAX_1RTT_DATAGRAM, 1200).
 %% RFC 9001 §5.4.2: the header-protection sample is 16 bytes at 4 past the
 %% packet-number start, so the plaintext must seal to at least that; 4
 %% bytes of plaintext covers the worst case (a 1-byte packet number).
@@ -166,6 +170,35 @@ pad_datagram(Datagram, #{initial := _}) when byte_size(Datagram) < ?MIN_INITIAL_
     <<Datagram/binary, 0:((?MIN_INITIAL_DATAGRAM - byte_size(Datagram)) * 8)>>;
 pad_datagram(Datagram, _Entries) ->
     Datagram.
+
+-doc """
+The largest STREAM-frame data slice whose 1-RTT datagram still fits the
+conservative `?MAX_1RTT_DATAGRAM` path limit. The datagram is the short header
+(first byte, the peer's `DCID`, the packet number), the ACK frame carried in
+the same packet (if any), the STREAM frame header (type, Stream ID, Offset,
+Length), the data, and the AEAD tag. The Length field is sized for a 2-byte
+varint, which holds for every slice up to 16383 bytes (far past the limit), so
+the returned budget can never make the datagram exceed it.
+""".
+-spec stream_data_budget(
+    binary(),
+    non_neg_integer(),
+    [roadrunner_quic_frame:frame()],
+    non_neg_integer(),
+    non_neg_integer()
+) ->
+    non_neg_integer().
+stream_data_budget(DCID, PN, AckFrames, Sid, Offset) ->
+    ShortHeader = 1 + byte_size(DCID) + roadrunner_quic_packet:pn_length(PN),
+    AckBytes = iolist_size([roadrunner_quic_frame:encode(F) || F <- AckFrames]),
+    OffsetBytes =
+        case Offset of
+            0 -> 0;
+            _ -> roadrunner_quic_varint:encoded_size(Offset)
+        end,
+    StreamHeader = 1 + roadrunner_quic_varint:encoded_size(Sid) + OffsetBytes + 2,
+    Overhead = ShortHeader + AckBytes + StreamHeader + ?TAG_LEN,
+    max(0, ?MAX_1RTT_DATAGRAM - Overhead).
 
 %% A packet is ack-eliciting if it carries any frame other than PADDING,
 %% ACK, or CONNECTION_CLOSE (RFC 9002 §2).

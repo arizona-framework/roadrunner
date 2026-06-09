@@ -771,14 +771,34 @@ send_data_multi_call_advances_offset_test() ->
 send_data_slices_large_payload_test() ->
     %% A payload larger than the per-packet budget is sliced across datagrams
     %% (one STREAM frame each), offsets contiguous, FIN on the last slice, and
-    %% the bytes reassemble to the original.
+    %% the bytes reassemble to the original. Each slice fills toward the
+    %% 1200-byte datagram, so the first slice carries well past the bytes an
+    %% old fixed 1000-byte budget would have allowed.
     {State, ApSecret} = connected_for_send(),
     Payload = binary:copy(~"x", 2500),
     {_State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, true, ?NOW, State),
     Frames = sent_stream_frames(Effects, ApSecret),
-    ?assertEqual([0, 1000, 2000], [Off || {stream, 0, Off, _, _} <- Frames]),
+    Sizes = [byte_size(D) || {stream, 0, _, D, _} <- Frames],
+    ?assert(length(Frames) > 1),
+    ?assert(hd(Sizes) > 1000),
+    ?assertEqual(expected_offsets(0, Sizes), [Off || {stream, 0, Off, _, _} <- Frames]),
     ?assertEqual([false, false, true], [Fin || {stream, 0, _, _, Fin} <- Frames]),
     ?assertEqual(Payload, iolist_to_binary([D || {stream, 0, _, D, _} <- Frames])).
+
+send_blocked_by_exhausted_send_window_test() ->
+    %% Send-side flow control (RFC 9000 §4.1): a payload larger than the send
+    %% window fills the window across packets, then the send pass finds the
+    %% still-pending stream flow-blocked and emits nothing more for it. With the
+    %% send pass walking only streams that have pending data, this block is the
+    %% one path that reaches take_stream's no-frame branch.
+    {State, ApSecret} = connected_for_send(),
+    %% The conn and per-stream send windows both default to roadrunner_quic_flow's
+    %% initial_max_data (786432), so the payload must exceed it to block.
+    Payload = binary:copy(~"x", 786432 + 1000),
+    {_State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
+    Sent = iolist_to_binary([D || {stream, 0, _, D, _} <- sent_stream_frames(Effects, ApSecret)]),
+    ?assert(byte_size(Sent) > 0),
+    ?assert(byte_size(Sent) < byte_size(Payload)).
 
 send_data_on_control_then_request_stream_test() ->
     %% The two load-bearing GET writes: SETTINGS on the server control stream
@@ -1116,3 +1136,10 @@ emits(Effects) ->
 arm_deadline(Effects) ->
     [AtMs] = [At || {arm_timer, pto, At} <- Effects],
     AtMs.
+
+%% The contiguous send offsets for a run of slice sizes: each offset is the
+%% total bytes emitted before it.
+expected_offsets(_Acc, []) ->
+    [];
+expected_offsets(Acc, [Size | Rest]) ->
+    [Acc | expected_offsets(Acc + Size, Rest)].

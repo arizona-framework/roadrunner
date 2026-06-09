@@ -177,6 +177,14 @@ detect_lost_test() ->
     {_Loss2, Lost} = ?M:detect_lost(10000, Loss1),
     ?assertEqual([2, 3], lists:sort(Lost)).
 
+detect_lost_stops_at_in_flight_packet_test() ->
+    %% Packets numbered above the largest acknowledged were sent ahead and are
+    %% not loss candidates; the loss timer reaches the oldest of them and stops,
+    %% declaring nothing lost and leaving the in-flight set unchanged.
+    Loss0 = send_run(0, 4, ?M:new(#{})),
+    {Loss1, _, _} = ?M:on_ack_received({ack, 0, 0, 0, []}, 100, Loss0),
+    ?assertEqual({Loss1, []}, ?M:detect_lost(100, Loss1)).
+
 loss_time_test() ->
     ?assertEqual(undefined, ?M:loss_time(?M:new(#{}))),
     %% First sample sets srtt; oldest packet sent at 0, loss delay 9*srtt/8.

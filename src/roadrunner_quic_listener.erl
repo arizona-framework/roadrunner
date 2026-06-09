@@ -46,6 +46,10 @@
 %% datagram whose payload is smaller than 1200 bytes, so a too-small Initial
 %% never spawns a connection (clients pad Initial datagrams to this floor).
 -define(MIN_INITIAL_DATAGRAM, 1200).
+%% Datagrams the shared socket delivers per re-arm: large enough that the
+%% per-batch `{active, N}` setopts is a small fraction of the per-datagram work,
+%% small enough that the listener mailbox between re-arms stays bounded.
+-define(ACTIVE_N, 100).
 
 -type opts() :: #{
     port := inet:port_number(),
@@ -125,7 +129,7 @@ init(
     process_flag(trap_exit, true),
     [Parent | _] = get('$ancestors'),
     ReusePort = maps:get(reuseport, Opts, false),
-    case roadrunner_quic_socket:open(Port, #{active => once, reuseport => ReusePort}) of
+    case roadrunner_quic_socket:open(Port, #{active => ?ACTIVE_N, reuseport => ReusePort}) of
         {ok, Socket} ->
             {ok, {_Ip, BoundPort}} = roadrunner_quic_socket:sockname(Socket),
             proc_lib:set_label({?MODULE, BoundPort}),
@@ -183,15 +187,17 @@ loop(#listener{socket = Socket, parent = Parent} = State) ->
             loop(handle_message(Message, State))
     end.
 
-%% A datagram from the active socket is routed (re-arming the socket first so
-%% the next datagram is already queued during the spawn round-trip); anything
-%% else is a stray message and dropped.
+%% A datagram from the active socket is routed; the socket delivers up to
+%% `?ACTIVE_N` datagrams before a `passive` notice, at which point we re-arm
+%% the whole batch in one syscall. Anything else is a stray message and dropped.
 -spec handle_message(term(), #listener{}) -> #listener{}.
 handle_message(Message, #listener{socket = Socket} = State) ->
     case roadrunner_quic_socket:from_message(Socket, Message) of
         {ok, Peer, Datagram} ->
-            ok = roadrunner_quic_socket:activate(Socket),
             route(Datagram, Peer, State);
+        passive ->
+            ok = roadrunner_quic_socket:activate(Socket, ?ACTIVE_N),
+            State;
         ignore ->
             State
     end.

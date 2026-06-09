@@ -19,7 +19,8 @@ clause is unit-tested in `roadrunner_quic_socket_tests`.
     open_in_use_errors/1,
     open_with_custom_buffers/1,
     reuseport_allows_shared_bind/1,
-    active_once_delivers_messages/1
+    active_once_delivers_messages/1,
+    active_n_batches_then_passive/1
 ]).
 
 -define(LOOPBACK, {127, 0, 0, 1}).
@@ -34,7 +35,8 @@ all() ->
         open_in_use_errors,
         open_with_custom_buffers,
         reuseport_allows_shared_bind,
-        active_once_delivers_messages
+        active_once_delivers_messages,
+        active_n_batches_then_passive
     ].
 
 %% An `active => once` socket delivers each datagram as one mailbox message,
@@ -75,6 +77,31 @@ active_once_delivers_messages(_Config) ->
 
     ok = roadrunner_quic_socket:close(Server),
     ok = roadrunner_quic_socket:close(Client).
+
+%% An `active => N` socket delivers up to N datagrams, then a `passive` notice
+%% (from_message/2's udp_passive clause); the (N+1)th buffers until re-armed
+%% with activate/2.
+active_n_batches_then_passive(_Config) ->
+    N = 2,
+    {ok, Server} = roadrunner_quic_socket:open(0, #{active => N}),
+    {ok, Client} = roadrunner_quic_socket:open(0),
+    {ok, {_, ServerPort}} = roadrunner_quic_socket:sockname(Server),
+    ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, ServerPort, ~"a"),
+    ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, ServerPort, ~"b"),
+    ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, ServerPort, ~"c"),
+    ?assertMatch({ok, _, _}, next_parsed(Server)),
+    ?assertMatch({ok, _, _}, next_parsed(Server)),
+    ?assertEqual(passive, next_parsed(Server)),
+    ok = roadrunner_quic_socket:activate(Server, N),
+    ?assertMatch({ok, _, _}, next_parsed(Server)),
+    ok = roadrunner_quic_socket:close(Server),
+    ok = roadrunner_quic_socket:close(Client).
+
+next_parsed(Socket) ->
+    receive
+        Msg -> roadrunner_quic_socket:from_message(Socket, Msg)
+    after 1000 -> ct:fail(no_active_message)
+    end.
 
 %% A datagram travels client -> server with its source address, then the
 %% server echoes back to that address. Exercises open/1 (default opts),

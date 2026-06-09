@@ -46,10 +46,6 @@
 %% A CRYPTO slice budget that leaves room for the packet header, an ACK
 %% frame, and the AEAD tag within the 1200-byte datagram (RFC 9000 §14).
 -define(CRYPTO_BUDGET, 1000).
-%% A STREAM data-slice budget, leaving room for the short header, an ACK
-%% frame, the STREAM frame header, and the AEAD tag within the 1200-byte
-%% datagram (RFC 9000 §14).
--define(STREAM_BUDGET, 1000).
 %% Default idle timeout (RFC 9000 §10.1): the connection silently closes after
 %% this many ms with no packet received. Seeding it from the advertised / peer
 %% max_idle_timeout is a follow-up.
@@ -101,6 +97,12 @@
     %% by stream id (peer-initiated on receive; server-initiated and client
     %% request streams on send).
     streams = #{} :: #{non_neg_integer() => stream()},
+    %% The subset of `streams` ids with unsent data or an unsent FIN, kept
+    %% ascending (RFC 9000 stream priority: lowest id first). The send pass
+    %% walks only these instead of re-sorting and scanning every stream
+    %% (finished streams stay in `streams` but leave this set), so per-pass
+    %% work is O(streams-with-pending-data), not O(all-streams-ever).
+    sendable = [] :: ordsets:ordset(non_neg_integer()),
     %% Next server-initiated unidirectional stream id to hand out (RFC 9000
     %% §2.1: server uni ids are 3, 7, 11, ...); the owner opens its h3
     %% control stream this way.
@@ -292,17 +294,30 @@ finish_datagram(_Now, _Before, #state{phase = closed, pending_close = undefined}
 finish_datagram(_Now, _Before, #state{phase = closed} = State) ->
     {State1, CloseEffects} = send_close(State),
     {State2, EmitEffects} = drain_emits(State1),
-    {State2, CloseEffects ++ EmitEffects};
+    case CloseEffects of
+        [] -> {State2, EmitEffects};
+        [Close] -> {State2, [Close | EmitEffects]}
+    end;
 finish_datagram(Now, Before, State) ->
     {State3, SendEffects} = send_pass(Now, State),
-    {State4, EmitEffects} = drain_emits(State3),
-    {State4, connected_effects(Before, State4) ++ EmitEffects ++ SendEffects}.
+    {State4, Emits} = take_emits(State3),
+    %% {connected, _} first (so the owner opens its control stream before the
+    %% first request), then the datagram's owner events in arrival order, then
+    %% the sends; reverse the newest-first emits onto the sends in one pass.
+    {State4, connected_effects(Before, State4, lists:reverse(Emits, SendEffects))}.
 
 %% Owner events accumulate (newest-first) in #state.emits while the
 %% datagram's frames are folded; hand them back in arrival order and clear.
 -spec drain_emits(t()) -> {t(), [effect()]}.
-drain_emits(#state{emits = Emits} = State) ->
-    {State#state{emits = []}, lists:reverse(Emits)}.
+drain_emits(State) ->
+    {State1, Emits} = take_emits(State),
+    {State1, lists:reverse(Emits)}.
+
+%% Take the owner events newest-first (as accumulated) and clear them, for a
+%% caller that will reverse them onto a tail itself.
+-spec take_emits(t()) -> {t(), [effect()]}.
+take_emits(#state{emits = Emits} = State) ->
+    {State#state{emits = []}, Emits}.
 
 %% Queue an owner event for the current datagram (dropped if no owner yet).
 -spec emit(event(), t()) -> t().
@@ -315,13 +330,13 @@ emit(Event, #state{owner = Owner, emits = Emits} = State) ->
 %% handshaking -> connected transition AND an owner is installed. With no
 %% owner yet (the listener has not run set_owner), the emit is deferred to
 %% install_owner. The two sites are mutually exclusive, so it fires once.
--spec connected_effects(phase(), t()) -> [effect()].
-connected_effects(handshaking, #state{phase = connected, owner = Owner, info = Info}) when
+-spec connected_effects(phase(), t(), [effect()]) -> [effect()].
+connected_effects(handshaking, #state{phase = connected, owner = Owner, info = Info}, Tail) when
     is_pid(Owner)
 ->
-    [{emit, Owner, {connected, Info}}];
-connected_effects(_Before, _State) ->
-    [].
+    [{emit, Owner, {connected, Info}} | Tail];
+connected_effects(_Before, _State, Tail) ->
+    Tail.
 
 %% =============================================================================
 %% Control calls (owner / listener -> conn, synchronous)
@@ -643,11 +658,13 @@ queue_crypto(Level, Bytes, State) ->
         State
     ).
 
-%% Queue a control frame to send at a level.
+%% Queue a control frame to send at a level. The pending list is flushed into
+%% one packet wholesale and frame order within a packet is irrelevant, so a
+%% frame is consed on rather than appended.
 -spec queue_frame(level(), roadrunner_quic_frame:frame(), t()) -> t().
 queue_frame(Level, Frame, State) ->
     Space = space(Level, State),
-    put_space(Level, Space#space{pending = Space#space.pending ++ [Frame]}, State).
+    put_space(Level, Space#space{pending = [Frame | Space#space.pending]}, State).
 
 -spec process_ack(integer(), level(), tuple(), t()) -> t().
 process_ack(Now, Level, Ack, State) ->
@@ -658,7 +675,9 @@ process_ack(Now, Level, Ack, State) ->
         {Loss, _Acked, Lost} ->
             put_space(
                 Level,
-                Space#space{loss = Loss, pending = Space#space.pending ++ retransmittable(Lost)},
+                Space#space{
+                    loss = Loss, pending = lists:reverse(retransmittable(Lost), Space#space.pending)
+                },
                 State
             )
     end.
@@ -842,8 +861,16 @@ stream_recv_window(_Sid, #{initial_max_stream_data_uni := Uni}) ->
 
 -spec put_stream(non_neg_integer(), roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()) ->
     t().
-put_stream(Sid, Stream, Flow, #state{streams = Streams} = State) ->
-    State#state{streams = Streams#{Sid => {Stream, Flow}}}.
+put_stream(Sid, Stream, Flow, #state{streams = Streams, sendable = Sendable} = State) ->
+    %% The single writer of `streams`, so it is also where the `sendable`
+    %% working set stays in step: a stream with unsent data/FIN joins it, a
+    %% drained or finished one leaves it.
+    Sendable1 =
+        case roadrunner_quic_stream:send_pending(Stream) of
+            true -> ordsets:add_element(Sid, Sendable);
+            false -> ordsets:del_element(Sid, Sendable)
+        end,
+    State#state{streams = Streams#{Sid => {Stream, Flow}}, sendable = Sendable1}.
 
 %% Emit {stream_data, ...} when there are newly-contiguous bytes OR the FIN
 %% was reached (the FIN-only {<<>>, true} end-of-stream the h3 layer needs).
@@ -859,27 +886,38 @@ deliver_stream(_Sid, _Deliverable, _FinReached, State) ->
 
 -spec send_pass(integer(), t()) -> {t(), [effect()]}.
 send_pass(Now, State) ->
-    {State1, SendEffects} = drain_send(Now, State, []),
-    {State1, SendEffects ++ timer_effects(Now, State1)}.
+    {State1, RevSends} = drain_send(Now, State, []),
+    %% `drain_send` returns the send effects newest-first; reverse them into
+    %% order and fold the (single) timer effect onto the end in the same pass,
+    %% rather than a second traversal to append it.
+    {State1, lists:reverse(RevSends, timer_effects(Now, State1))}.
 
 %% Build and send one datagram per iteration until nothing is pending or
 %% the anti-amplification budget blocks; roll back the built state if the
-%% datagram cannot be sent.
+%% datagram cannot be sent. Returns the send effects newest-first (the caller
+%% reverses them and adds the timer effect).
 -spec drain_send(integer(), t(), [effect()]) -> {t(), [effect()]}.
 drain_send(Now, State, Acc) ->
-    case build_packets(State) of
+    %% The present encryption levels are invariant across a send burst (spaces
+    %% are added or discarded only on the receive path), so resolve them once
+    %% here rather than on every packet built in the loop.
+    drain_send(Now, present_levels(State), State, Acc).
+
+-spec drain_send(integer(), [level()], t(), [effect()]) -> {t(), [effect()]}.
+drain_send(Now, Levels, State, Acc) ->
+    case build_first(Levels, State) of
         none ->
-            {State, lists:reverse(Acc)};
+            {State, Acc};
         {Entries, Built} ->
             #state{peer_scid = DCID, scid = SCID, amp = Amp} = State,
             {Datagram, Sent} = roadrunner_quic_send:datagram(Entries, DCID, SCID),
             case roadrunner_quic_amp:can_send(byte_size(Datagram), Amp) of
                 false ->
-                    {State, lists:reverse(Acc)};
+                    {State, Acc};
                 true ->
                     Recorded = record_sent(Now, Sent, Built),
                     Amp1 = roadrunner_quic_amp:sent(byte_size(Datagram), Amp),
-                    drain_send(Now, Recorded#state{amp = Amp1}, [{send, Datagram} | Acc])
+                    drain_send(Now, Levels, Recorded#state{amp = Amp1}, [{send, Datagram} | Acc])
             end
     end.
 
@@ -892,10 +930,6 @@ drain_send(Now, State, Acc) ->
 %% flight would overflow. It also makes the forbidden Initial+1-RTT
 %% coalescing structurally impossible. Coalescing Initial+Handshake is a
 %% deferred optimization. Returns `none` when nothing is pending anywhere.
--spec build_packets(t()) -> none | {#{level() => map()}, t()}.
-build_packets(State) ->
-    build_first(present_levels(State), State).
-
 -spec build_first([level()], t()) -> none | {#{level() => map()}, t()}.
 build_first([], _State) ->
     none;
@@ -914,7 +948,9 @@ build_level(Level, State) ->
             %% Retransmits travel in their own packet (no fresh CRYPTO or
             %% STREAM slice), so a replayed frame plus a new slice can never
             %% overflow the datagram.
-            build_entry(Level, AckFrames ++ Pending, Space#space{ack = Ack, pending = []}, State);
+            build_entry(
+                Level, prepend_ack(AckFrames, Pending), Space#space{ack = Ack, pending = []}, State
+            );
         [] ->
             build_data(Level, AckFrames, Space#space{ack = Ack}, State)
     end.
@@ -923,42 +959,63 @@ build_level(Level, State) ->
 %% fresh data: CRYPTO at the handshake levels, application STREAM frames at
 %% the application level (which never carries CRYPTO).
 -spec build_data(level(), [roadrunner_quic_frame:frame()], #space{}, t()) -> none | {map(), t()}.
-build_data(application, AckFrames, Space, State) ->
-    {StreamFrames, State1} = take_stream(State),
-    case AckFrames ++ StreamFrames of
+build_data(application, AckFrames, #space{next_pn = PN} = Space, State) ->
+    {StreamFrames, State1} = take_stream(AckFrames, PN, State),
+    case prepend_ack(AckFrames, StreamFrames) of
         [] -> none;
         Frames -> build_entry(application, Frames, Space, State1)
     end;
 build_data(Level, AckFrames, Space, State) ->
     {CryptoFrames, Crypto} = take_crypto(Space#space.crypto),
-    case AckFrames ++ CryptoFrames of
+    case prepend_ack(AckFrames, CryptoFrames) of
         [] -> none;
         Frames -> build_entry(Level, Frames, Space#space{crypto = Crypto}, State)
     end.
+
+%% Put the ACK frame (if any) ahead of the data frames. `take_ack` yields an
+%% empty list or a single `[AckFrame]`, so this prepends without the traversal a
+%% list append would cost on the hot send path.
+-spec prepend_ack([roadrunner_quic_frame:frame()], [roadrunner_quic_frame:frame()]) ->
+    [roadrunner_quic_frame:frame()].
+prepend_ack([], Frames) -> Frames;
+prepend_ack([Ack], Frames) -> [Ack | Frames].
 
 %% Pull ONE outbound STREAM frame from the lowest-id stream that has data or a
 %% FIN to send and the credit to send it, skipping streams blocked by send
 %% flow control (a buffered-but-unsendable stream yields `nothing`; a pending
 %% FIN-only frame costs no credit and is always emitted). The slice is bounded
-%% by the connection and per-stream send windows and the per-packet budget,
-%% and the bytes are accounted against both windows.
--spec take_stream(t()) -> {[roadrunner_quic_frame:frame()], t()}.
-take_stream(#state{streams = Streams} = State) ->
-    take_stream(lists:sort(maps:keys(Streams)), State).
+%% by the connection and per-stream send windows and by the room left in the
+%% datagram after the header, the same-packet ACK, the STREAM frame header, and
+%% the AEAD tag (so the datagram fills the 1200-byte path limit without
+%% exceeding it); the bytes are accounted against both windows. The same-packet
+%% ACK frames and the packet number size the per-datagram room.
+-spec take_stream([roadrunner_quic_frame:frame()], non_neg_integer(), t()) ->
+    {[roadrunner_quic_frame:frame()], t()}.
+take_stream(AckFrames, PN, #state{sendable = Sendable} = State) ->
+    %% Only streams with pending send data are candidates, already ascending;
+    %% finished/drained streams never enter the walk (see `put_stream/4`).
+    take_stream(Sendable, AckFrames, PN, State).
 
--spec take_stream([non_neg_integer()], t()) -> {[roadrunner_quic_frame:frame()], t()}.
-take_stream([], State) ->
+-spec take_stream([non_neg_integer()], [roadrunner_quic_frame:frame()], non_neg_integer(), t()) ->
+    {[roadrunner_quic_frame:frame()], t()}.
+take_stream([], _AckFrames, _PN, State) ->
     {[], State};
-take_stream([Sid | Rest], #state{streams = Streams, conn_flow = ConnFlow} = State) ->
+take_stream(
+    [Sid | Rest],
+    AckFrames,
+    PN,
+    #state{streams = Streams, conn_flow = ConnFlow, peer_scid = DCID} = State
+) ->
     #{Sid := {Stream0, StreamFlow0}} = Streams,
+    Offset0 = roadrunner_quic_stream:send_offset(Stream0),
     Budget = lists:min([
-        ?STREAM_BUDGET,
+        roadrunner_quic_send:stream_data_budget(DCID, PN, AckFrames, Sid, Offset0),
         roadrunner_quic_flow:send_window(ConnFlow),
         roadrunner_quic_flow:send_window(StreamFlow0)
     ]),
     case roadrunner_quic_stream:next_frame(Budget, Stream0) of
         nothing ->
-            take_stream(Rest, State);
+            take_stream(Rest, AckFrames, PN, State);
         {Offset, Data, Fin, Stream1} ->
             Size = byte_size(Data),
             {_, ConnFlow1} = roadrunner_quic_flow:on_data_sent(Size, ConnFlow),
@@ -1040,7 +1097,11 @@ on_pto(Now, Level, State) ->
     #space{loss = Loss0, pending = Pending} = Space = space(Level, State),
     {Loss1, Lost} = roadrunner_quic_loss:detect_lost(Now, Loss0),
     Loss2 = roadrunner_quic_loss:on_pto_expired(Loss1),
-    put_space(Level, Space#space{loss = Loss2, pending = Pending ++ retransmittable(Lost)}, State).
+    put_space(
+        Level,
+        Space#space{loss = Loss2, pending = lists:reverse(retransmittable(Lost), Pending)},
+        State
+    ).
 
 %% Arm ONE timer at the nearest deadline: the earliest per-space probe timeout
 %% (across spaces with ack-eliciting bytes in flight) or the always-present
@@ -1061,11 +1122,14 @@ earliest_deadline(Now, #state{idle_deadline = Idle} = State) ->
     end.
 
 -spec earliest_pto(integer(), t()) -> integer() | undefined.
-earliest_pto(Now, State) ->
-    lists:foldl(
-        fun(Level, Earliest) -> min_defined(Earliest, space_pto(Now, space(Level, State))) end,
+earliest_pto(Now, #state{spaces = Spaces}) ->
+    %% The earliest PTO across all spaces; fold the map directly (order is
+    %% irrelevant to a min) rather than rebuilding the level list and looking
+    %% each space up again.
+    maps:fold(
+        fun(_Level, Space, Earliest) -> min_defined(Earliest, space_pto(Now, Space)) end,
         undefined,
-        present_levels(State)
+        Spaces
     ).
 
 -spec space_pto(integer(), #space{}) -> integer() | undefined.
@@ -1114,7 +1178,9 @@ min_defined(A, B) -> min(A, B).
 %% frames worth resending: ACK / PADDING / CONNECTION_CLOSE are regenerated
 %% fresh or terminal, never replayed (RFC 9002 §13.3).
 %% `roadrunner_quic_send:ack_eliciting/1` is the single source of truth for
-%% which frames are ack-eliciting.
+%% which frames are ack-eliciting. Callers fold the result onto the existing
+%% pending list with `lists:reverse/2` (order within the flushed packet is
+%% irrelevant), so no list append is needed.
 -spec retransmittable([[roadrunner_quic_frame:frame()]]) -> [roadrunner_quic_frame:frame()].
 retransmittable(Lost) ->
     [Frame || Frame <- lists:append(Lost), roadrunner_quic_send:is_ack_eliciting(Frame)].
