@@ -132,6 +132,25 @@ advisory or malformed cases the server currently tolerates or omits.
   late or retransmitted frame for a removed id is ignored, not recreated) —
   medium
 
+### Throughput levers identified by profiling
+
+Profiling the native h3 server under load (`scripts/bench.escript --servers
+roadrunner --protocols h3 --scenarios large_response --profile --profile-tool
+eprof --profile-scope all`) leaves two large costs that are not hot-path Erlang,
+so the send-path optimizations did not touch them.
+
+- Batch UDP sends: each datagram is one `gen_udp:send`, i.e. one `port_command`
+  syscall, and that is ~7% of server time on a download. Sending several
+  datagrams per syscall via `sendmmsg` or UDP generic segmentation offload (GSO)
+  would cut it, but `gen_udp` has no batched-send primitive, so it needs the OTP
+  `socket` API (or a NIF) plus careful per-path sizing — large
+- TLS session resumption / 0-RTT (RFC 8446 §2.2, RFC 9001 §4.6): the RSA-2048
+  CertificateVerify signature is ~6-7 ms per full handshake, the single biggest
+  per-connection cost. Session tickets let a returning client skip the signature
+  entirely. Independently, deploying an ECDSA P-256 server certificate instead of
+  RSA-2048 cuts that signature ~30-60x today with no code change (operator
+  guidance, worth a deployment note) — large
+
 ### External interop check
 
 The native test client runs the same codecs as the native server, so a
