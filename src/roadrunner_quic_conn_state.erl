@@ -38,6 +38,8 @@
 -export([
     new/2, handle_datagram/3, handle_timeout/3, handle_call/5, handle_send/7, peername/1, phase/1
 ]).
+%% Exported for direct eunit branch coverage of the idle-timeout negotiation.
+-export([negotiated_idle_timeout/2]).
 
 -export_type([t/0, config/0, effect/0, event/0, info/0]).
 
@@ -46,9 +48,9 @@
 %% A CRYPTO slice budget that leaves room for the packet header, an ACK
 %% frame, and the AEAD tag within the 1200-byte datagram (RFC 9000 §14).
 -define(CRYPTO_BUDGET, 1000).
-%% Default idle timeout (RFC 9000 §10.1): the connection silently closes after
-%% this many ms with no packet received. Seeding it from the advertised / peer
-%% max_idle_timeout is a follow-up.
+%% Idle-timeout fallback (RFC 9000 §10.1): used only when neither endpoint
+%% advertises a max_idle_timeout, so a dead peer cannot pin the connection. The
+%% live value is the negotiated minimum of the two advertised limits.
 -define(IDLE_TIMEOUT, 30000).
 %% TLS handshake message types carried in CRYPTO (RFC 8446 §4).
 -define(CLIENT_HELLO, 1).
@@ -133,8 +135,12 @@
     %% CONNECTION_CLOSE to transmit at that encryption level. `undefined` for a
     %% live connection or a peer-initiated close (which sends nothing back).
     pending_close = undefined :: undefined | {level(), non_neg_integer()},
+    %% The negotiated idle timeout in ms (RFC 9000 §10.1): the minimum of our
+    %% advertised max_idle_timeout and the peer's, set from our value at birth and
+    %% lowered to the negotiated minimum once the ClientHello delivers the peer's.
+    idle_timeout :: non_neg_integer(),
     %% Absolute time (ms) the connection idle-times-out; reset to Now +
-    %% ?IDLE_TIMEOUT on every received datagram (RFC 9000 §10.1). Always set
+    %% idle_timeout on every received datagram (RFC 9000 §10.1). Always set
     %% (from new/2's birth time), so it is the timer floor when nothing is in
     %% flight. Also restarting it on the first ack-eliciting send since the
     %% last receive (§10.1) is a follow-up; receive-only is conservative
@@ -235,6 +241,9 @@ new(
         initial_max_streams_bidi := MaxStreamsBidi,
         initial_max_streams_uni := MaxStreamsUni
     } = TransportParams,
+    %% Until the ClientHello delivers the peer's value, the idle timeout is our
+    %% own advertised one (RFC 9000 §10.1).
+    IdleTimeout = negotiated_idle_timeout(TransportParams, #{}),
     #state{
         dcid = DCID,
         scid = SCID,
@@ -250,7 +259,8 @@ new(
         max_streams_bidi = MaxStreamsBidi,
         max_streams_uni = MaxStreamsUni,
         conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ConnMaxData}),
-        idle_deadline = Now + ?IDLE_TIMEOUT
+        idle_timeout = IdleTimeout,
+        idle_deadline = Now + IdleTimeout
     }.
 
 -spec new_space() -> #space{}.
@@ -282,10 +292,14 @@ frames into the connection state, then run a send pass. Returns the new
 state and the effects to perform.
 """.
 -spec handle_datagram(integer(), binary(), t()) -> {t(), [effect()]}.
-handle_datagram(Now, Datagram, #state{amp = Amp, recv_keys = RecvKeys, phase = Before} = State0) ->
+handle_datagram(
+    Now,
+    Datagram,
+    #state{amp = Amp, recv_keys = RecvKeys, phase = Before, idle_timeout = IdleTimeout} = State0
+) ->
     State1 = State0#state{
         amp = roadrunner_quic_amp:received(byte_size(Datagram), Amp),
-        idle_deadline = Now + ?IDLE_TIMEOUT
+        idle_deadline = Now + IdleTimeout
     },
     Outcomes = roadrunner_quic_recv:datagram(
         Datagram, ?SCID_LEN, RecvKeys, largest_map(State1)
@@ -638,7 +652,8 @@ deframe(Buffer) ->
 process_handshake(
     initial,
     {?CLIENT_HELLO, Body},
-    #state{tls = Tls, info = #{transport_params := #{initial_max_data := OurMaxData}}} = State
+    #state{tls = Tls, info = #{transport_params := #{initial_max_data := OurMaxData} = OurParams}} =
+        State
 ) ->
     case roadrunner_quic_tls_server:process_client_hello(Body, Tls) of
         {ok, #{initial := InitialFlight, handshake := HandshakeFlight}, Installs, PeerParams, Tls1} ->
@@ -650,8 +665,17 @@ process_handshake(
                 initial_max_data => OurMaxData,
                 peer_initial_max_data => maps:get(initial_max_data, PeerParams, 0)
             }),
+            %% Lower the idle timeout to the negotiated minimum (RFC 9000 §10.1)
+            %% now that the peer's advertised value is known.
+            IdleTimeout = negotiated_idle_timeout(OurParams, PeerParams),
             State1 = install_keys(
-                Installs, State#state{tls = Tls1, peer_params = PeerParams, conn_flow = ConnFlow}
+                Installs,
+                State#state{
+                    tls = Tls1,
+                    peer_params = PeerParams,
+                    conn_flow = ConnFlow,
+                    idle_timeout = IdleTimeout
+                }
             ),
             State2 = queue_crypto(initial, InitialFlight, State1),
             queue_crypto(handshake, HandshakeFlight, State2);
@@ -978,6 +1002,23 @@ peer_stream_send_window(Sid, PeerParams) when Sid rem 4 =:= 3 ->
     maps:get(initial_max_stream_data_uni, PeerParams, 0);
 peer_stream_send_window(_Sid, _PeerParams) ->
     0.
+
+%% The effective idle timeout (RFC 9000 §10.1): the minimum of the two advertised
+%% max_idle_timeout values, or the only non-zero one. A zero or absent value on a
+%% side means "no limit from me"; with neither side advertising one we fall back
+%% to ?IDLE_TIMEOUT so a dead peer cannot pin the connection open.
+-spec negotiated_idle_timeout(
+    roadrunner_quic_transport_params:params(), roadrunner_quic_transport_params:params()
+) -> non_neg_integer().
+negotiated_idle_timeout(OurParams, PeerParams) ->
+    Ours = maps:get(max_idle_timeout, OurParams, 0),
+    Peer = maps:get(max_idle_timeout, PeerParams, 0),
+    case {Ours, Peer} of
+        {0, 0} -> ?IDLE_TIMEOUT;
+        {0, P} -> P;
+        {O, 0} -> O;
+        {O, P} -> min(O, P)
+    end.
 
 %% Advance the per-type high-water past `Sid`'s ordinal. Opening a bidi stream
 %% also tops up the peer's bidi-stream credit.

@@ -374,6 +374,20 @@ drive_until_idle_armed(State, N) ->
         Idle -> Idle
     end.
 
+negotiated_idle_timeout_test() ->
+    %% RFC 9000 §10.1: the effective idle timeout is the minimum of the two
+    %% advertised values, or the only non-zero one; with neither side advertising
+    %% one it falls back to the ?IDLE_TIMEOUT default.
+    ?assertEqual(?IDLE_TIMEOUT, ?M:negotiated_idle_timeout(#{}, #{})),
+    ?assertEqual(5000, ?M:negotiated_idle_timeout(#{}, #{max_idle_timeout => 5000})),
+    ?assertEqual(8000, ?M:negotiated_idle_timeout(#{max_idle_timeout => 8000}, #{})),
+    ?assertEqual(
+        5000,
+        ?M:negotiated_idle_timeout(
+            #{max_idle_timeout => 8000}, #{max_idle_timeout => 5000}
+        )
+    ).
+
 %% =============================================================================
 %% Control calls + owner notification
 %% =============================================================================
