@@ -979,13 +979,11 @@ cli() ->
                 help =>
                     """
                     Process seed for the profiler. `roadrunner` (default)
-                    traces only the roadrunner supervisor tree plus the
-                    conns/workers it spawns. `all` traces every process in
-                    the server BEAM — required for h3, whose connection
-                    processes are spawned by the `quic` dependency (not a
-                    roadrunner acceptor) and are invisible to the
-                    roadrunner-only seed; also use it to attribute time
-                    across roadrunner vs quic vs crypto.
+                    traces every `roadrunner_*`-named process (the
+                    listener, connections, and workers). `all` traces
+                    every process in the server BEAM, including
+                    non-roadrunner libraries; use it to attribute time
+                    across roadrunner vs crypto.
                     """
             },
             #{

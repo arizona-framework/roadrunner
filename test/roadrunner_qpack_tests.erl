@@ -119,8 +119,8 @@ decode_second_field_line_error_propagates_test() ->
 %% =============================================================================
 
 %% `roadrunner_qpack:encode/1` returns iodata (it is framed and sent as
-%% iodata in production); flatten it here, where the dep oracle and the
-%% native decoder both want the on-wire binary.
+%% iodata in production); flatten it here, where the decoder wants the
+%% on-wire binary.
 enc(Headers) ->
     iolist_to_binary(roadrunner_qpack:encode(Headers)).
 

@@ -70,7 +70,7 @@ All duration and interval values in `opts()` are in milliseconds —
 %% listeners bind the same UDP port with SO_REUSEPORT and share one
 %% connection registry; the kernel spreads inbound datagrams across them
 %% so demux parallelizes across cores instead of funnelling through one
-%% process. (The dep's pool takes `pool_size`, the count BEYOND its base
+%% process. (The pool sup takes `pool_size`, the count BEYOND its base
 %% listener, so the wiring passes `listeners - 1`.)
 -define(DEFAULT_H3_LISTENERS, 8).
 -define(MAX_H3_LISTENERS, 1024).
