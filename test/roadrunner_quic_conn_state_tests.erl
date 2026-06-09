@@ -826,6 +826,58 @@ max_stream_data_for_untracked_stream_ignored_test() ->
     {State1, _Effects} = ?M:handle_datagram(?NOW, Grant, State),
     ?assertEqual(connected, ?M:phase(State1)).
 
+%% A request stream finishes both ways (client FIN received, server response +
+%% FIN sent) and is pruned. A later STREAM frame for that id carrying data past
+%% its final size would be a final_size_error and close the connection if the
+%% stream were still tracked; pruned and guarded as closed (RFC 9000 §3) it is
+%% ignored and the connection stays up.
+terminal_stream_is_pruned_and_late_frame_ignored_test() ->
+    {State0, ClientApSecret, _ServerApSecret} = connect_owned(),
+    Req = app_datagram([{stream, 0, 0, ~"req", true}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, Req, State0),
+    {State2, _} = ?M:handle_send(self(), make_ref(), 0, ~"resp", true, ?NOW, State1),
+    Late = app_datagram([{stream, 0, 100, ~"late", false}], 1, ClientApSecret),
+    {State3, _} = ?M:handle_datagram(?NOW, Late, State2),
+    ?assertEqual(connected, ?M:phase(State3)).
+
+%% After a stream is pruned, a genuinely new request on a higher id (above the
+%% per-type high-water) still opens normally.
+new_stream_after_prune_opens_test() ->
+    {State0, ClientApSecret, _ServerApSecret} = connect_owned(),
+    Req0 = app_datagram([{stream, 0, 0, ~"a", true}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, Req0, State0),
+    {State2, _} = ?M:handle_send(self(), make_ref(), 0, ~"r", true, ?NOW, State1),
+    Req4 = app_datagram([{stream, 4, 0, ~"b", true}], 1, ClientApSecret),
+    {_State3, Effects} = ?M:handle_datagram(?NOW, Req4, State2),
+    ?assert(lists:member({stream_opened, 4}, [E || {emit, _Owner, E} <- Effects])).
+
+%% A late/reordered RESET_STREAM for a pruned stream is ignored as closed
+%% (RFC 9000 §3), not recreated; the connection stays up.
+reset_for_pruned_stream_ignored_test() ->
+    {State0, ClientApSecret, _ServerApSecret} = connect_owned(),
+    Req = app_datagram([{stream, 0, 0, ~"req", true}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, Req, State0),
+    {State2, _} = ?M:handle_send(self(), make_ref(), 0, ~"resp", true, ?NOW, State1),
+    Rst = app_datagram([{reset_stream, 0, 7, 3}], 1, ClientApSecret),
+    {State3, _} = ?M:handle_datagram(?NOW, Rst, State2),
+    ?assertEqual(connected, ?M:phase(State3)).
+
+%% As the peer opens bidi streams toward the advertised limit (test TP = 3), the
+%% server raises the limit and sends MAX_STREAMS so the peer can keep opening
+%% request streams (RFC 9000 §4.6). The first open is still within credit (no
+%% grant); the second crosses the refill threshold and grants a fresh window.
+max_streams_granted_as_bidi_credit_consumed_test() ->
+    {State0, ClientApSecret, ServerApSecret} = connect_owned(),
+    Open0 = app_datagram([{stream, 0, 0, ~"a", true}], 0, ClientApSecret),
+    {State1, E0} = ?M:handle_datagram(?NOW, Open0, State0),
+    ?assertEqual([], max_streams_frames(E0, ServerApSecret)),
+    Open4 = app_datagram([{stream, 4, 0, ~"b", true}], 1, ClientApSecret),
+    {_State2, E4} = ?M:handle_datagram(?NOW, Open4, State1),
+    ?assertEqual([{max_streams, bidi, 5}], max_streams_frames(E4, ServerApSecret)).
+
+max_streams_frames(Effects, ServerApSecret) ->
+    [F || {max_streams, _, _} = F <- sent_app_frames(Effects, ServerApSecret)].
+
 send_data_on_control_then_request_stream_test() ->
     %% The two load-bearing GET writes: SETTINGS on the server control stream
     %% (id 3) then a response on the client request stream (id 0), each on its

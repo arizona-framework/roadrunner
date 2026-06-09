@@ -226,6 +226,20 @@ send_pending_test() ->
     {_, _, _, Sent} = ?M:next_frame(100, ?M:finish(?M:enqueue(<<"d">>, ?M:new()))),
     ?assertNot(?M:send_pending(Sent)).
 
+%% A stream is terminal only when the send FIN is on the wire AND the receive
+%% side has reached its final size (FIN delivered or reset) — one side alone is
+%% not enough.
+is_terminal_test() ->
+    ?assertNot(?M:is_terminal(?M:new())),
+    {_, _, true, SendDone} = ?M:next_frame(100, ?M:finish(?M:enqueue(~"x", ?M:new()))),
+    ?assertNot(?M:is_terminal(SendDone)),
+    {ok, _, true, RecvDone} = ?M:receive_data(0, ~"y", true, ?M:new()),
+    ?assertNot(?M:is_terminal(RecvDone)),
+    {ok, _, true, BothDone} = ?M:receive_data(0, ~"y", true, SendDone),
+    ?assert(?M:is_terminal(BothDone)),
+    {ok, ResetDone} = ?M:reset(0, SendDone),
+    ?assert(?M:is_terminal(ResetDone)).
+
 %% A response enqueued + finished on a sender drains into small slices that
 %% reassemble, in order, to the original bytes with the FIN on the receiver.
 send_recv_round_trip_test() ->

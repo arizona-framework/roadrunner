@@ -99,9 +99,9 @@
     streams = #{} :: #{non_neg_integer() => stream()},
     %% The subset of `streams` ids with unsent data or an unsent FIN, kept
     %% ascending (RFC 9000 stream priority: lowest id first). The send pass
-    %% walks only these instead of re-sorting and scanning every stream
-    %% (finished streams stay in `streams` but leave this set), so per-pass
-    %% work is O(streams-with-pending-data), not O(all-streams-ever).
+    %% walks only these instead of re-sorting and scanning every stream, so
+    %% per-pass work is O(streams-with-pending-data); a fully-terminal stream
+    %% leaves both this set and `streams` (pruned in `put_stream`).
     sendable = [] :: ordsets:ordset(non_neg_integer()),
     %% Next server-initiated unidirectional stream id to hand out (RFC 9000
     %% §2.1: server uni ids are 3, 7, 11, ...); the owner opens its h3
@@ -113,6 +113,12 @@
     %% STREAM_LIMIT_ERROR.
     max_streams_bidi :: non_neg_integer(),
     max_streams_uni :: non_neg_integer(),
+    %% Per-type count of peer-initiated stream ordinals opened so far (1 + the
+    %% highest ordinal seen). A peer frame for an ordinal below this that is no
+    %% longer in `streams` is a late/reordered frame for a pruned stream
+    %% (RFC 9000 §3): it is ignored, not recreated as a fresh stream.
+    bidi_opened = 0 :: non_neg_integer(),
+    uni_opened = 0 :: non_neg_integer(),
     %% Connection-level flow control (RFC 9000 §4).
     conn_flow :: roadrunner_quic_flow:t(),
     %% Owner events accumulated while folding a datagram's frames, drained in
@@ -729,18 +735,26 @@ process_stream(Sid, _Offset, _Data, _Fin, #state{max_streams_uni = Max} = State)
 ->
     connection_fatal(application, stream_limit_error, State);
 process_stream(Sid, Offset, Data, Fin, State) ->
-    {Stream0, StreamFlow0, State1} = ensure_stream(Sid, State),
-    #state{conn_flow = ConnFlow} = State1,
-    Delta = max(0, Offset + byte_size(Data) - roadrunner_quic_flow:bytes_received(StreamFlow0)),
-    maybe
-        {ok, ConnFlow1} ?= roadrunner_quic_flow:on_data_received(Delta, ConnFlow),
-        {ok, StreamFlow1} ?= roadrunner_quic_flow:on_data_received(Delta, StreamFlow0),
-        {ok, Deliverable, FinReached, Stream1} ?=
-            roadrunner_quic_stream:receive_data(Offset, Data, Fin, Stream0),
-        State2 = put_stream(Sid, Stream1, StreamFlow1, State1#state{conn_flow = ConnFlow1}),
-        deliver_stream(Sid, Deliverable, FinReached, State2)
-    else
-        {error, Reason} -> connection_fatal(application, Reason, State)
+    case ensure_stream(Sid, State) of
+        closed ->
+            %% Late/reordered STREAM frame for a pruned stream (RFC 9000 §3): the
+            %% packet is still acknowledged, but the frame is ignored.
+            State;
+        {ok, Stream0, StreamFlow0, State1} ->
+            #state{conn_flow = ConnFlow} = State1,
+            Delta = max(
+                0, Offset + byte_size(Data) - roadrunner_quic_flow:bytes_received(StreamFlow0)
+            ),
+            maybe
+                {ok, ConnFlow1} ?= roadrunner_quic_flow:on_data_received(Delta, ConnFlow),
+                {ok, StreamFlow1} ?= roadrunner_quic_flow:on_data_received(Delta, StreamFlow0),
+                {ok, Deliverable, FinReached, Stream1} ?=
+                    roadrunner_quic_stream:receive_data(Offset, Data, Fin, Stream0),
+                State2 = put_stream(Sid, Stream1, StreamFlow1, State1#state{conn_flow = ConnFlow1}),
+                deliver_stream(Sid, Deliverable, FinReached, State2)
+            else
+                {error, Reason} -> connection_fatal(application, Reason, State)
+            end
     end.
 
 %% A RESET_STREAM aborts the peer's send side and surfaces the abort code. On
@@ -758,12 +772,17 @@ process_reset_stream(Sid, _ErrorCode, _FinalSize, #state{max_streams_uni = Max} 
 ->
     connection_fatal(application, stream_limit_error, State);
 process_reset_stream(Sid, ErrorCode, FinalSize, State) ->
-    {Stream0, Flow, State1} = ensure_stream(Sid, State),
-    case roadrunner_quic_stream:reset(FinalSize, Stream0) of
-        {ok, Stream1} ->
-            emit({stream_reset, Sid, ErrorCode}, put_stream(Sid, Stream1, Flow, State1));
-        {error, Reason} ->
-            connection_fatal(application, Reason, State)
+    case ensure_stream(Sid, State) of
+        closed ->
+            %% Late/reordered RESET_STREAM for a pruned stream (RFC 9000 §3).
+            State;
+        {ok, Stream0, Flow, State1} ->
+            case roadrunner_quic_stream:reset(FinalSize, Stream0) of
+                {ok, Stream1} ->
+                    emit({stream_reset, Sid, ErrorCode}, put_stream(Sid, Stream1, Flow, State1));
+                {error, Reason} ->
+                    connection_fatal(application, Reason, State)
+            end
     end.
 
 %% A well-placed peer CONNECTION_CLOSE (transport at any level, or application
@@ -847,22 +866,72 @@ send_close(
             {State1, [{send, Datagram}]}
     end.
 
-%% Look up a stream, or create it. The first frame of a peer-initiated stream
-%% is announced with {stream_opened, Sid} (server-initiated ids never reach
-%% here; process_stream/process_reset_stream reject them upstream). Returns
-%% the stream, its flow, and the state carrying any queued event.
+%% Look up a peer stream and return `{ok, Stream, Flow, State}`: an existing
+%% entry, or a fresh one for a genuinely new id (announced with
+%% {stream_opened, Sid}). A first frame of a new id advances the per-type
+%% high-water; an id at or below the high-water that is no longer tracked was
+%% opened and pruned, so `closed` is returned and the frame ignored (RFC 9000
+%% §3). Server-initiated ids never reach here (rejected upstream).
 -spec ensure_stream(non_neg_integer(), t()) ->
-    {roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()}.
-ensure_stream(Sid, #state{streams = Streams, info = #{transport_params := TP}} = State) ->
+    {ok, roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()} | closed.
+ensure_stream(Sid, #state{streams = Streams} = State) ->
     case Streams of
         #{Sid := {Stream, Flow}} ->
-            {Stream, Flow, State};
+            {ok, Stream, Flow, State};
         #{} ->
-            {
-                roadrunner_quic_stream:new(),
-                roadrunner_quic_flow:new(#{initial_max_data => stream_recv_window(Sid, TP)}),
-                emit({stream_opened, Sid}, State)
-            }
+            case opened_before(Sid, State) of
+                true -> closed;
+                false -> open_stream(Sid, State)
+            end
+    end.
+
+%% Whether `Sid`'s ordinal is below the per-type high-water: it was opened
+%% earlier and, since it is no longer in `streams`, has been pruned.
+-spec opened_before(non_neg_integer(), t()) -> boolean().
+opened_before(Sid, #state{bidi_opened = Opened}) when Sid rem 4 =:= 0 ->
+    Sid div 4 < Opened;
+opened_before(Sid, #state{uni_opened = Opened}) ->
+    Sid div 4 < Opened.
+
+%% Create a fresh peer stream, advance the per-type high-water past its ordinal,
+%% and announce it with {stream_opened, Sid}.
+-spec open_stream(non_neg_integer(), t()) ->
+    {ok, roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()}.
+open_stream(Sid, #state{info = #{transport_params := TP}} = State) ->
+    Stream = roadrunner_quic_stream:new(),
+    Flow = roadrunner_quic_flow:new(#{initial_max_data => stream_recv_window(Sid, TP)}),
+    {ok, Stream, Flow, emit({stream_opened, Sid}, bump_opened(Sid, State))}.
+
+%% Advance the per-type high-water past `Sid`'s ordinal. Opening a bidi stream
+%% also tops up the peer's bidi-stream credit.
+-spec bump_opened(non_neg_integer(), t()) -> t().
+bump_opened(Sid, #state{bidi_opened = Opened} = State) when Sid rem 4 =:= 0 ->
+    grant_max_streams_bidi(State#state{bidi_opened = max(Opened, Sid div 4 + 1)});
+bump_opened(Sid, #state{uni_opened = Opened} = State) ->
+    State#state{uni_opened = max(Opened, Sid div 4 + 1)}.
+
+%% Keep the peer in bidi-stream credit (RFC 9000 §4.6): once the opened count is
+%% within a quarter-window of the advertised limit, raise the limit to a fresh
+%% window above what is opened and queue a MAX_STREAMS so the peer can keep
+%% opening request streams. Mirrors the receive-flow MAX_DATA refill
+%% (`roadrunner_quic_flow`, the 3/4 threshold); the window is the originally
+%% advertised `initial_max_streams_bidi`.
+-spec grant_max_streams_bidi(t()) -> t().
+grant_max_streams_bidi(
+    #state{
+        bidi_opened = Opened,
+        max_streams_bidi = Max,
+        info = #{transport_params := #{initial_max_streams_bidi := Window}}
+    } = State
+) ->
+    case Opened > Max - Window * 3 div 4 of
+        true ->
+            NewMax = Opened + Window,
+            queue_frame(
+                application, {max_streams, bidi, NewMax}, State#state{max_streams_bidi = NewMax}
+            );
+        false ->
+            State
     end.
 
 %% The receive window we advertised for a peer-initiated stream (RFC 9000
@@ -880,15 +949,25 @@ stream_recv_window(_Sid, #{initial_max_stream_data_uni := Uni}) ->
 -spec put_stream(non_neg_integer(), roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()) ->
     t().
 put_stream(Sid, Stream, Flow, #state{streams = Streams, sendable = Sendable} = State) ->
-    %% The single writer of `streams`, so it is also where the `sendable`
-    %% working set stays in step: a stream with unsent data/FIN joins it, a
-    %% drained or finished one leaves it.
-    Sendable1 =
-        case roadrunner_quic_stream:send_pending(Stream) of
-            true -> ordsets:add_element(Sid, Sendable);
-            false -> ordsets:del_element(Sid, Sendable)
-        end,
-    State#state{streams = Streams#{Sid => {Stream, Flow}}, sendable = Sendable1}.
+    %% The single writer of `streams`. A fully-terminal stream (both directions
+    %% finished) is pruned so the map stays bounded to live streams; the
+    %% high-water keeps a late frame for its id from recreating it. Otherwise it
+    %% is stored and the `sendable` working set kept in step (unsent data/FIN
+    %% joins it, a drained one leaves it).
+    case roadrunner_quic_stream:is_terminal(Stream) of
+        true ->
+            State#state{
+                streams = maps:remove(Sid, Streams),
+                sendable = ordsets:del_element(Sid, Sendable)
+            };
+        false ->
+            Sendable1 =
+                case roadrunner_quic_stream:send_pending(Stream) of
+                    true -> ordsets:add_element(Sid, Sendable);
+                    false -> ordsets:del_element(Sid, Sendable)
+                end,
+            State#state{streams = Streams#{Sid => {Stream, Flow}}, sendable = Sendable1}
+    end.
 
 %% Emit {stream_data, ...} when there are newly-contiguous bytes OR the FIN
 %% was reached (the FIN-only {<<>>, true} end-of-stream the h3 layer needs).
