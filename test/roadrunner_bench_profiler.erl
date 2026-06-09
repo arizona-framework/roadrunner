@@ -20,9 +20,9 @@ framework processes whose `lists:foldl` / `gen:do_call` chatter would
 otherwise dominate the totals.
 
 `start_all/0` / `start_fprof_all/1` seed every process in the node
-instead. Use them for HTTP/3 (whose connections the `quic` dependency
-spawns outside the roadrunner tree, invisible to the seed above) and to
-attribute time across roadrunner vs `quic` vs `crypto`.
+instead, so non-roadrunner libraries are traced too. Use them to
+attribute time across roadrunner vs `crypto`, which the roadrunner-only
+seed above cannot show.
 
 If `roadrunner_sup` isn't registered (e.g. the app didn't start),
 falls back to `processes()` so the profiler still works for
@@ -50,12 +50,9 @@ start() ->
 
 -doc """
 Like `start/0` but seeds *every* process in the node (`processes()`),
-not just the roadrunner tree. Required for HTTP/3: its connection
-processes are spawned by the `quic` dependency (the `connection_handler`
-fun runs in a dep process), not by a roadrunner acceptor, so they are
-neither in the roadrunner seed nor children of a traced process and the
-`set_on_spawn` propagation in `start/0` misses them entirely. Also use
-it to attribute time across roadrunner vs `quic` vs `crypto` modules.
+not just the `roadrunner_*`-named ones. The name-based `start/0` seed
+omits non-roadrunner libraries, so use this to attribute time across
+roadrunner vs `crypto` (and other library) modules.
 """.
 -spec start_all() -> ok.
 start_all() ->

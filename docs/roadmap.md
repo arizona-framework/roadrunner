@@ -68,8 +68,9 @@ only). Remaining work:
 
 ## Native QUIC transport follow-ups
 
-The HTTP/3 path now runs on the native `roadrunner_quic_*` stack (the `quic`
-dep is a test-profile differential oracle + CT client only). The RFC MUSTs a
+The HTTP/3 path runs on the native `roadrunner_quic_*` stack end to end, with no
+`quic` dependency in any profile (production deps are just `telemetry`, and the
+test profile drives the server with a native QUIC client). The RFC MUSTs a
 browser depends on are implemented; the items below are conformance hardening
 and transport completeness that a real browser GET / POST does not need.
 
@@ -105,7 +106,7 @@ advisory or malformed cases the server currently tolerates or omits.
   control / QPACK uni streams (it opens ~3, always within a sane client's
   limit) — small
 - Respond to a peer-initiated key update (RFC 9001 §6). Security-sensitive:
-  trial-decrypt the next-phase keys and commit ONLY on success (not the dep's
+  trial-decrypt the next-phase keys and commit ONLY on success (not
   commit-then-decrypt, which a single forged flipped-bit datagram desyncs),
   keep the header-protection key fixed, enforce the AEAD integrity limit —
   large
@@ -124,22 +125,15 @@ advisory or malformed cases the server currently tolerates or omits.
 - A no-flatten / by-reference stream send buffer, so a large response body is
   not flattened into one binary before sending — medium
 
-### Retire the dep
+### External interop check
 
-`quic` is now production-free (test-profile-only; production deps are just
-`telemetry`). The last step to drop it entirely:
+The native test client runs the same codecs as the native server, so a
+symmetric codec bug round-trips cleanly and survives. The RFC published vectors
+cover the codecs and crypto as external truth, but an independent implementation
+is a stronger guard.
 
-- Build a native QUIC test client so the `quic` dep can leave the test profile
-  too; the differential-oracle tests, the h3 SUITE's CT client, and the bench
-  client are its only remaining users — large
-
-### Known dep deviation (informational)
-
-The `quic` dep's QPACK static table has a `:age` typo at index 2 (RFC 9204
-Appendix A is `age`, no colon). The native stack is RFC-correct, so this entry
-is the one place the dep oracle cannot validate the native encode/decode; not a
-roadrunner bug, recorded so a future dep cross-check does not "correct" the
-native value back to the dep's.
+- Drive the native server from a real QUIC stack (quiche / ngtcp2 / headless
+  Chrome) in CI as an end-to-end interop gate — medium
 
 ## HttpArena profile gaps
 

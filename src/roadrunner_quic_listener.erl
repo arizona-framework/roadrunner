@@ -13,7 +13,7 @@
 %% connection; a miss on an unsupported-version long header answers with a
 %% Version Negotiation packet (RFC 9000 §5.2.2). Spawning follows the strict
 %% ordering the handshake depends on
-%% (RFC 9000 / the dep's contract): spawn the connection, link it (so the
+%% (RFC 9000): spawn the connection, link it (so the
 %% listener's own shutdown tears its connections down, and a connection's death
 %% reaps its routing rows), register its CIDs (so a fast follow-up datagram
 %% already routes), run the connection_handler to get the application owner,
