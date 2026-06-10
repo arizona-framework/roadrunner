@@ -95,6 +95,30 @@ on_ack_received_ecn_variant_test() ->
     {_Loss1, Acked, _Lost} = ?M:on_ack_received({ack, 9, 0, 0, [], {1, 2, 3}}, 20, Loss),
     ?assertEqual([9], Acked).
 
+%% The congestion-control signal an ACK leaves for the connection: acked bytes
+%% and the send times of the largest acked / latest lost ack-eliciting packets.
+cc_signal_test() ->
+    Fresh = ?M:cc_signal(?M:new(#{})),
+    ?assertEqual(0, maps:get(acked_bytes, Fresh)),
+    ?assertEqual(undefined, maps:get(largest_acked_time, Fresh)),
+    ?assertEqual(undefined, maps:get(largest_lost_time, Fresh)),
+    %% Ack the largest of ten in-flight packets (send time = packet number): the
+    %% signal carries the acked bytes, the largest's time, and the latest lost.
+    Loss = send_run(0, 9, ?M:new(#{})),
+    {Loss1, _, _} = ?M:on_ack_received({ack, 9, 0, 0, []}, 20, Loss),
+    ?assertEqual(
+        #{acked_bytes => 100, largest_acked_time => 9, largest_lost_time => 7},
+        ?M:cc_signal(Loss1)
+    ),
+    %% A non-ack-eliciting largest acked yields no acked send time and no lost
+    %% time, so the connection grows nothing.
+    NonElic = ?M:on_packet_sent(3, 100, false, 3, 3, ?M:new(#{})),
+    {Loss2, _, _} = ?M:on_ack_received({ack, 3, 0, 0, []}, 30, NonElic),
+    ?assertEqual(
+        #{acked_bytes => 0, largest_acked_time => undefined, largest_lost_time => undefined},
+        ?M:cc_signal(Loss2)
+    ).
+
 %% A non-ack-eliciting largest acked, and a largest we never sent, both
 %% leave the RTT untouched (no sample taken).
 on_ack_received_no_rtt_sample_test() ->

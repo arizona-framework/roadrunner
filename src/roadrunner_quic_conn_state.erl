@@ -40,6 +40,8 @@
 ]).
 %% Exported for direct eunit branch coverage of the idle-timeout negotiation.
 -export([negotiated_idle_timeout/2]).
+%% Exported so tests can observe the congestion window's growth and backoff.
+-export([cwnd/1]).
 
 -export_type([t/0, config/0, effect/0, event/0, info/0]).
 
@@ -123,6 +125,10 @@
     uni_opened = 0 :: non_neg_integer(),
     %% Connection-level flow control (RFC 9000 §4).
     conn_flow :: roadrunner_quic_flow:t(),
+    %% Connection-wide congestion control (RFC 9002 §7): bounds the bytes in
+    %% flight across all spaces by the congestion window, grown on ACK and halved
+    %% on loss.
+    cc :: roadrunner_quic_cc_newreno:t(),
     %% The client's advertised transport parameters, captured from the
     %% ClientHello. The send windows (connection and per-stream) are seeded from
     %% these so the server never sends past what the peer granted (RFC 9000 §4.1);
@@ -259,6 +265,7 @@ new(
         max_streams_bidi = MaxStreamsBidi,
         max_streams_uni = MaxStreamsUni,
         conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ConnMaxData}),
+        cc = roadrunner_quic_cc_newreno:new(),
         idle_timeout = IdleTimeout,
         idle_deadline = Now + IdleTimeout
     }.
@@ -280,6 +287,13 @@ peername(#state{peer = Peer}) ->
 -spec phase(t()) -> phase().
 phase(#state{phase = Phase}) ->
     Phase.
+
+%% The congestion window in bytes (RFC 9002 §7), for tests to observe its
+%% slow-start growth and on-loss backoff.
+-doc false.
+-spec cwnd(t()) -> non_neg_integer().
+cwnd(#state{cc = Cc}) ->
+    roadrunner_quic_cc_newreno:cwnd(Cc).
 
 %% =============================================================================
 %% Inbound datagram
@@ -773,19 +787,42 @@ queue_frame(Level, Frame, State) ->
     put_space(Level, Space#space{pending = [Frame | Space#space.pending]}, State).
 
 -spec process_ack(integer(), level(), tuple(), t()) -> t().
-process_ack(Now, Level, Ack, State) ->
+process_ack(Now, Level, Ack, #state{cc = Cc} = State) ->
     Space = space(Level, State),
     case roadrunner_quic_loss:on_ack_received(Ack, Now, Space#space.loss) of
         {error, _} ->
             State;
         {Loss, _Acked, Lost} ->
+            Cc1 = apply_cc_signal(roadrunner_quic_loss:cc_signal(Loss), Now, Cc),
             put_space(
                 Level,
                 Space#space{
                     loss = Loss, pending = lists:reverse(retransmittable(Lost), Space#space.pending)
                 },
-                State
+                State#state{cc = Cc1}
             )
+    end.
+
+%% Feed the loss layer's per-ACK congestion signal to NewReno: grow the window
+%% for the acknowledged bytes first, then react to any loss (RFC 9002 §7.3, ack
+%% before loss). A defined largest-acked send time means the largest acked was
+%% ack-eliciting, so the acked bytes are positive; `undefined` (nothing newly
+%% acked, or a non-ack-eliciting largest) skips the growth.
+-spec apply_cc_signal(roadrunner_quic_loss:cc_signal(), integer(), roadrunner_quic_cc_newreno:t()) ->
+    roadrunner_quic_cc_newreno:t().
+apply_cc_signal(
+    #{acked_bytes := AckedBytes, largest_acked_time := AckedTime, largest_lost_time := LostTime},
+    Now,
+    Cc
+) ->
+    Grown =
+        case AckedTime of
+            undefined -> Cc;
+            _ -> roadrunner_quic_cc_newreno:on_packets_acked(AckedBytes, AckedTime, Cc)
+        end,
+    case LostTime of
+        undefined -> Grown;
+        _ -> roadrunner_quic_cc_newreno:on_congestion_event(LostTime, Now, Grown)
     end.
 
 %% =============================================================================
@@ -1177,9 +1214,17 @@ drain_send(Now, Levels, State, Acc) ->
         none ->
             {State, Acc};
         {Entries, Built} ->
-            #state{peer_scid = DCID, scid = SCID, amp = Amp} = State,
+            #state{peer_scid = DCID, scid = SCID, amp = Amp, cc = Cc} = State,
             {Datagram, Sent} = roadrunner_quic_send:datagram(Entries, DCID, SCID),
-            case roadrunner_quic_amp:can_send(byte_size(Datagram), Amp) of
+            %% Gate ack-eliciting datagrams on the congestion window (RFC 9002
+            %% §7); ACK-only datagrams are not congestion-controlled and always
+            %% pass. On a block, return the pre-build State so the consumed ACK /
+            %% stream slice stays pending for the next pass.
+            AckEliciting = lists:any(fun(#{ack_eliciting := Elicit}) -> Elicit end, Sent),
+            CcOk =
+                not AckEliciting orelse
+                    roadrunner_quic_cc_newreno:can_send(total_bytes_in_flight(State), Cc),
+            case roadrunner_quic_amp:can_send(byte_size(Datagram), Amp) andalso CcOk of
                 false ->
                     {State, Acc};
                 true ->
@@ -1392,6 +1437,19 @@ earliest_deadline(Now, #state{idle_deadline = Idle} = State) ->
         PtoAt when PtoAt =< Idle -> {pto, PtoAt};
         _PtoAt -> {idle, Idle}
     end.
+
+%% The congestion-controlled bytes in flight across every space, the value the
+%% congestion window bounds (RFC 9002 §B.2 keeps one count per connection). A
+%% discarded space leaves the map, so its in-flight cannot count stale.
+-spec total_bytes_in_flight(t()) -> non_neg_integer().
+total_bytes_in_flight(#state{spaces = Spaces}) ->
+    maps:fold(
+        fun(_Level, #space{loss = Loss}, Total) ->
+            Total + roadrunner_quic_loss:bytes_in_flight(Loss)
+        end,
+        0,
+        Spaces
+    ).
 
 -spec earliest_pto(integer(), t()) -> integer() | undefined.
 earliest_pto(Now, #state{spaces = Spaces}) ->

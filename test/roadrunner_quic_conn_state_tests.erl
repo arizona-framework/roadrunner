@@ -805,41 +805,87 @@ send_data_slices_large_payload_test() ->
     ?assertEqual(Payload, iolist_to_binary([D || {stream, 0, _, D, _} <- Frames])).
 
 send_blocked_by_exhausted_send_window_test() ->
-    %% Send-side flow control (RFC 9000 §4.1): a payload larger than the send
-    %% window fills the window across packets, then the send pass finds the
-    %% still-pending stream flow-blocked and emits nothing more for it. With the
-    %% send pass walking only streams that have pending data, this block is the
-    %% one path that reaches take_stream's no-frame branch.
-    {State, ApSecret} = connected_for_send(),
-    %% The send windows are seeded from the client's advertised 800000-byte
-    %% initial_max_data / initial_max_stream_data (see roadrunner_quic_test_client),
-    %% so the payload must exceed that to block — and the server stops at exactly
-    %% the client's window, proving the limit is sourced from the peer rather than
-    %% roadrunner_quic_flow's 786432 default.
+    %% Send-side flow control (RFC 9000 §4.1): across ACK-paced rounds (which grow
+    %% the congestion window past the flow window) the server sends at most the
+    %% client's advertised 800000-byte initial_max_data / initial_max_stream_data
+    %% (see roadrunner_quic_test_client), proving the cap is sourced from the peer
+    %% rather than roadrunner_quic_flow's 786432 default.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
     Window = 800000,
     Payload = binary:copy(~"x", Window + 1000),
-    {_State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
-    Sent = iolist_to_binary([D || {stream, 0, _, D, _} <- sent_stream_frames(Effects, ApSecret)]),
+    {State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
+    {Sent, _State2, _AckPN} = flush_with_acks(State1, Effects, ServerApSecret, ClientApSecret, 0),
     ?assertEqual(Window, byte_size(Sent)).
 
 send_resumes_after_max_data_and_max_stream_data_test() ->
     %% After the send window fills (RFC 9000 §4.1), the peer's MAX_DATA /
     %% MAX_STREAM_DATA grants raise the connection and per-stream send limits and
-    %% the next send pass resumes the still-pending stream, so the whole payload
-    %% eventually reaches the wire.
+    %% the rest of the payload reaches the wire on the following ACK-paced rounds.
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     Window = 800000,
     Payload = binary:copy(~"x", Window + 1000),
-    {State1, E1} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
-    Sent1 = iolist_to_binary([D || {stream, 0, _, D, _} <- sent_stream_frames(E1, ServerApSecret)]),
-    ?assert(byte_size(Sent1) < byte_size(Payload)),
+    {State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
+    {Sent1, State2, AckPN} = flush_with_acks(State1, Effects, ServerApSecret, ClientApSecret, 0),
+    ?assertEqual(Window, byte_size(Sent1)),
     Grant = app_datagram(
-        [{max_data, Window * 2}, {max_stream_data, 0, Window * 2}], 0, ClientApSecret
+        [{max_data, Window * 2}, {max_stream_data, 0, Window * 2}], AckPN, ClientApSecret
     ),
-    {_State2, E2} = ?M:handle_datagram(?NOW, Grant, State1),
-    Sent2 = iolist_to_binary([D || {stream, 0, _, D, _} <- sent_stream_frames(E2, ServerApSecret)]),
+    {State3, E3} = ?M:handle_datagram(?NOW, Grant, State2),
+    {Sent2, _State4, _} = flush_with_acks(State3, E3, ServerApSecret, ClientApSecret, AckPN + 1),
     ?assert(byte_size(Sent2) > 0),
     ?assertEqual(byte_size(Payload), byte_size(Sent1) + byte_size(Sent2)).
+
+congestion_window_caps_first_burst_test() ->
+    %% A payload far larger than the initial congestion window is capped at about
+    %% one window on the first pass, with no ACKs yet to grow it (RFC 9002 §7).
+    {State, ServerApSecret} = connected_for_send(),
+    Payload = binary:copy(~"x", 100000),
+    {State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
+    Sent = iolist_to_binary([
+        D
+     || {stream, 0, _, D, _} <- sent_stream_frames(Effects, ServerApSecret)
+    ]),
+    ?assert(byte_size(Sent) < byte_size(Payload)),
+    %% Initial window 12000 bytes; the strict-< gate allows one datagram overshoot.
+    ?assert(byte_size(Sent) =< 12000 + 1200),
+    ?assertEqual(12000, ?M:cwnd(State1)).
+
+ack_grows_congestion_window_test() ->
+    %% Acknowledging in-flight packets grows the window in slow start (RFC 9002
+    %% §7.3.1); a duplicate ACK that acknowledges nothing new does not.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Payload = binary:copy(~"x", 100000),
+    {State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
+    Largest = largest_app_pn(Effects, ServerApSecret),
+    Ack = app_datagram([{ack, Largest, 0, Largest, [], undefined}], 0, ClientApSecret),
+    {State2, _E2} = ?M:handle_datagram(?NOW, Ack, State1),
+    Grown = ?M:cwnd(State2),
+    ?assert(Grown > ?M:cwnd(State1)),
+    Dup = app_datagram([{ack, Largest, 0, Largest, [], undefined}], 1, ClientApSecret),
+    {State3, _E3} = ?M:handle_datagram(?NOW, Dup, State2),
+    ?assertEqual(Grown, ?M:cwnd(State3)).
+
+loss_halves_congestion_window_test() ->
+    %% A gap ACK that acknowledges only the largest packet leaves the older
+    %% packets past the packet threshold, so they are declared lost and the window
+    %% halves (RFC 9002 §7.3.2).
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Payload = binary:copy(~"x", 100000),
+    {State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
+    Largest = largest_app_pn(Effects, ServerApSecret),
+    Gap = app_datagram([{ack, Largest, 0, 0, [], undefined}], 0, ClientApSecret),
+    {State2, _E2} = ?M:handle_datagram(?NOW, Gap, State1),
+    ?assert(?M:cwnd(State2) < ?M:cwnd(State1)).
+
+ack_only_datagram_not_congestion_controlled_test() ->
+    %% A datagram carrying only an ACK is not ack-eliciting, so the congestion
+    %% window never gates it (RFC 9002 §7): the gate short-circuits on
+    %% not-ack-eliciting before consulting the window, full or not. A peer PING
+    %% with no server data to send produces exactly such an ACK-only datagram.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Ping = app_datagram([ping], 0, ClientApSecret),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, Ping, State),
+    ?assert(lists:any(fun is_ack/1, sent_app_frames(Effects, ServerApSecret))).
 
 max_stream_data_for_untracked_stream_ignored_test() ->
     %% A MAX_STREAM_DATA grant for a stream the server is not tracking is ignored
@@ -1274,6 +1320,40 @@ sent_app_frames(Effects, ServerApSecret) ->
 
 emits(Effects) ->
     [Emit || {emit, _Owner, _Event} = Emit <- Effects].
+
+%% The largest 1-RTT packet number among the server's sent datagrams, decoded
+%% with the server's application keys; used to acknowledge what is in flight.
+largest_app_pn(Effects, ServerApSecret) ->
+    Keys = #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+    PNs = [
+        PN
+     || Datagram <- sends(Effects),
+        {ok, #{level := application, pn := PN}} <-
+            roadrunner_quic_recv:datagram(Datagram, byte_size(?DCID), Keys, #{})
+    ],
+    lists:max(PNs).
+
+%% Drive send + ACK rounds until the server stops sending stream-0 data
+%% (flow-blocked): each cumulative ACK grows the congestion window and frees the
+%% in-flight bytes so the next pass sends more. Returns the total stream bytes
+%% sent, the final state, and the next free client packet number.
+flush_with_acks(State, Effects, ServerApSecret, ClientApSecret, AckPN) ->
+    Sent = iolist_to_binary([
+        D
+     || {stream, 0, _, D, _} <- sent_stream_frames(Effects, ServerApSecret)
+    ]),
+    case Sent of
+        <<>> ->
+            {<<>>, State, AckPN};
+        _ ->
+            Largest = largest_app_pn(Effects, ServerApSecret),
+            Ack = app_datagram([{ack, Largest, 0, Largest, [], undefined}], AckPN, ClientApSecret),
+            {State1, Effects1} = ?M:handle_datagram(?NOW, Ack, State),
+            {Rest, Final, FinalAckPN} = flush_with_acks(
+                State1, Effects1, ServerApSecret, ClientApSecret, AckPN + 1
+            ),
+            {<<Sent/binary, Rest/binary>>, Final, FinalAckPN}
+    end.
 
 arm_deadline(Effects) ->
     [AtMs] = [At || {arm_timer, pto, At} <- Effects],

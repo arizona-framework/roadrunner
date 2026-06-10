@@ -22,6 +22,7 @@
     new/1,
     on_packet_sent/6,
     on_ack_received/3,
+    cc_signal/1,
     detect_lost/2,
     loss_time/1,
     update_rtt/3,
@@ -37,7 +38,7 @@
     pto_count/1
 ]).
 
--export_type([t/0, opts/0]).
+-export_type([t/0, opts/0, cc_signal/0]).
 
 %% RFC 9002 §6.1.1: a packet is lost if one numbered at least three higher
 %% has been acknowledged.
@@ -57,6 +58,10 @@
 %% Bound the packet numbers expanded from one received ACK frame, so a
 %% peer cannot make us materialise an enormous range (RFC 9000 §13.2.3).
 -define(MAX_ACK_RANGE, 65536).
+%% A congestion-control signal with nothing acknowledged or lost.
+-define(NO_CC_SIGNAL, #{
+    acked_bytes => 0, largest_acked_time => undefined, largest_lost_time => undefined
+}).
 
 -record(sent, {
     pn :: non_neg_integer(),
@@ -83,11 +88,22 @@
     pto_count = 0 :: non_neg_integer(),
     %% Congestion-controlled bytes outstanding.
     bytes_in_flight = 0 :: non_neg_integer(),
+    %% The congestion-control signal from the most recent on_ack_received: the
+    %% acknowledged bytes and the send times of the largest acked / latest lost
+    %% ack-eliciting packets, for the connection's congestion controller to read
+    %% via cc_signal/1 immediately after the ACK.
+    cc_signal = ?NO_CC_SIGNAL :: cc_signal(),
     max_ack_delay :: non_neg_integer(),
     ack_delay_exponent :: non_neg_integer()
 }).
 
 -opaque t() :: #loss{}.
+
+-type cc_signal() :: #{
+    acked_bytes := non_neg_integer(),
+    largest_acked_time := non_neg_integer() | undefined,
+    largest_lost_time := non_neg_integer() | undefined
+}.
 
 -type opts() :: #{
     initial_rtt => non_neg_integer(),
@@ -175,9 +191,42 @@ on_ack_received(Ack, Now, Loss) ->
                 sent = requeue(Survivors, Ahead),
                 largest_acked = NewLargest,
                 pto_count = 0,
-                bytes_in_flight = max(0, Loss1#loss.bytes_in_flight - AckedBytes - LostBytes)
+                bytes_in_flight = max(0, Loss1#loss.bytes_in_flight - AckedBytes - LostBytes),
+                cc_signal = #{
+                    acked_bytes => AckedBytes,
+                    largest_acked_time => largest_acked_time(NewLargest, Acked),
+                    largest_lost_time => largest_lost_time(Lost)
+                }
             },
             {Loss2, datas(Acked), datas(Lost)}
+    end.
+
+-doc """
+The congestion-control signal from the most recent `on_ack_received/3`: a map
+with the acknowledged bytes and the send times of the largest acknowledged and
+latest lost ack-eliciting packets (`undefined` when none), for the connection's
+congestion controller. Read it immediately after the ACK.
+""".
+-spec cc_signal(t()) -> cc_signal().
+cc_signal(#loss{cc_signal = Signal}) ->
+    Signal.
+
+%% The send time of the largest acknowledged packet, the same one the RTT
+%% sample uses, or `undefined` when it is not an ack-eliciting tracked packet.
+-spec largest_acked_time(non_neg_integer(), [#sent{}]) -> non_neg_integer() | undefined.
+largest_acked_time(LargestAcked, Acked) ->
+    case lists:keyfind(LargestAcked, #sent.pn, Acked) of
+        #sent{ack_eliciting = true, time_sent = Sent} -> Sent;
+        _ -> undefined
+    end.
+
+%% The send time of the latest (largest) lost ack-eliciting packet, the
+%% congestion event's trigger time, or `undefined` when nothing was lost.
+-spec largest_lost_time([#sent{}]) -> non_neg_integer() | undefined.
+largest_lost_time(Lost) ->
+    case [Sent || #sent{ack_eliciting = true, time_sent = Sent} <- Lost] of
+        [] -> undefined;
+        Times -> lists:max(Times)
     end.
 
 %% =============================================================================
