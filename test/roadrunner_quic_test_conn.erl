@@ -45,6 +45,9 @@
 %% Must match the `initial_max_data` in roadrunner_quic_test_client's transport
 %% params: the flow accounting starts from the value the handshake advertised.
 -define(CONN_MAX_DATA, 800000).
+%% Delayed-ACK bound (RFC 9000 §13.2.1): acknowledge every second ack-eliciting
+%% packet, and otherwise within this many ms so a lone tail packet is still acked.
+-define(MAX_ACK_DELAY, 25).
 
 %% Handshake message types (RFC 8446 §4).
 -define(CERTIFICATE, 11).
@@ -79,7 +82,15 @@
     %% Connection-level receive flow control (RFC 9000 §4.1): tracks received
     %% bytes and replenishes the limit with MAX_DATA so the server's send window
     %% never stalls on a long-lived connection.
-    conn_flow :: roadrunner_quic_flow:t() | undefined
+    conn_flow :: roadrunner_quic_flow:t() | undefined,
+    %% 1-RTT received-packet tracking (RFC 9000 §13.1): the client acknowledges
+    %% the server's ack-eliciting packets so the server samples RTT, detects loss,
+    %% and frees its in-flight window for congestion control.
+    ack = undefined :: roadrunner_quic_ack:t() | undefined,
+    %% Ack-eliciting packets received since the last ACK; an ACK goes out on the
+    %% second one, or after ?MAX_ACK_DELAY if a lone packet is left (RFC 9000
+    %% §13.2.1), halving the client's per-packet crypto versus acking every one.
+    unacked = 0 :: non_neg_integer()
 }).
 
 %% =============================================================================
@@ -202,7 +213,8 @@ init(Parent, Ref, Host, Port) ->
         ch_framed = ChFramed,
         owner = Parent,
         server_initial_keys = roadrunner_quic_keys:initial_server(Dcid0),
-        conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ?CONN_MAX_DATA})
+        conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ?CONN_MAX_DATA}),
+        ack = roadrunner_quic_ack:new()
     },
     case handshake(Conn) of
         {ok, Conn1} ->
@@ -400,7 +412,14 @@ server_public_key(HandshakeBytes) ->
 %% arrive as mailbox messages and a single receive handles both without a
 %% blocking socket read that would delay owner calls while the peer is idle.
 -spec connected_loop(#conn{}) -> ok.
-connected_loop(#conn{socket = Socket} = Conn) ->
+connected_loop(#conn{socket = Socket, unacked = Unacked} = Conn) ->
+    %% Wait indefinitely with nothing to acknowledge; with a lone unacked packet,
+    %% flush it after ?MAX_ACK_DELAY (RFC 9000 §13.2.1) if no second arrives.
+    AckDeadline =
+        case Unacked of
+            0 -> infinity;
+            _ -> ?MAX_ACK_DELAY
+        end,
     receive
         {open_bidi, From, Ref} ->
             Id = Conn#conn.next_bidi,
@@ -435,6 +454,8 @@ connected_loop(#conn{socket = Socket} = Conn) ->
                 ignore ->
                     connected_loop(Conn)
             end
+    after AckDeadline ->
+        connected_loop(flush_ack(Conn))
     end.
 
 %% Send stream data, splitting it across 1-RTT packets so each datagram stays
@@ -515,8 +536,45 @@ handle_app_datagram(#conn{app_server_keys = Keys, scid = Scid} = Conn, Datagram)
     Outcomes = roadrunner_quic_recv:datagram(
         Datagram, byte_size(Scid), #{application => Keys}, #{}
     ),
-    Frames = lists:append([Fs || {ok, #{level := application, frames := Fs}} <- Outcomes]),
-    lists:foldl(fun handle_app_frame/2, Conn, Frames).
+    maybe_send_ack(lists:foldl(fun handle_app_packet/2, Conn, Outcomes)).
+
+%% Record one decrypted 1-RTT packet against the ack tracker (so its ack-eliciting
+%% packets get acknowledged) and fold its frames.
+-spec handle_app_packet(roadrunner_quic_recv:outcome(), #conn{}) -> #conn{}.
+handle_app_packet({ok, #{level := application, pn := PN, frames := Frames}}, Conn) ->
+    Elicit = roadrunner_quic_send:ack_eliciting(Frames),
+    Ack = roadrunner_quic_ack:record(PN, Elicit, Conn#conn.ack),
+    Unacked = Conn#conn.unacked + ack_eliciting_count(Elicit),
+    lists:foldl(fun handle_app_frame/2, Conn#conn{ack = Ack, unacked = Unacked}, Frames);
+handle_app_packet(_Outcome, Conn) ->
+    Conn.
+
+-spec ack_eliciting_count(boolean()) -> 0 | 1.
+ack_eliciting_count(true) -> 1;
+ack_eliciting_count(false) -> 0.
+
+%% Acknowledge the server's 1-RTT packets once a second ack-eliciting one has
+%% arrived (RFC 9000 §13.2.1); a lone one is flushed later by the loop's
+%% ?MAX_ACK_DELAY timeout. The ACK is not itself ack-eliciting, so the server
+%% never acknowledges it back.
+-spec maybe_send_ack(#conn{}) -> #conn{}.
+maybe_send_ack(#conn{unacked = Unacked} = Conn) when Unacked >= 2 ->
+    flush_ack(Conn);
+maybe_send_ack(Conn) ->
+    Conn.
+
+%% Send one ACK frame covering everything received so far, or nothing if there is
+%% no ack-eliciting packet outstanding.
+-spec flush_ack(#conn{}) -> #conn{}.
+flush_ack(#conn{ack = Ack} = Conn) ->
+    case roadrunner_quic_ack:needs_ack(Ack) of
+        false ->
+            Conn#conn{unacked = 0};
+        true ->
+            {Largest, FirstRange, Ranges} = roadrunner_quic_ack:to_ack(Ack),
+            Conn1 = send_wire_frame(Conn, {ack, Largest, 0, FirstRange, Ranges, undefined}),
+            Conn1#conn{ack = roadrunner_quic_ack:mark_ack_sent(Ack), unacked = 0}
+    end.
 
 -spec handle_app_frame(roadrunner_quic_frame:frame(), #conn{}) -> #conn{}.
 handle_app_frame({stream, StreamId, Offset, Data, Fin}, Conn) ->

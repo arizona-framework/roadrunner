@@ -111,18 +111,15 @@ advisory or malformed cases the server currently tolerates or omits.
   draining after a local close absorbs the peer's late packets but does not
   re-send its CONNECTION_CLOSE in response (rate-limited), so a peer that lost the
   close learns only by timeout — small-medium
-- NewReno congestion control (RFC 9002 §7): `roadrunner_quic_cc_newreno` is built
-  and tested but wired nowhere — `drain_send` gates only on anti-amplification +
-  flow control, never on a congestion window, so on a lossy WAN the server
-  overshoots and self-induces loss with no backoff. The acked/lost bytes per ACK
-  are already computed in `roadrunner_quic_loss:on_ack_received`; the work is
-  threading a `cc` state into the connection and gating the send loop on it.
-  Validate by the CC unit tests + a simulated-loss test, not loopback throughput
-  (it correctly adds ACK-pacing the loopback bench can't show) — large
+- Congestion-control refinements (RFC 9002): NewReno gates the send loop (slow
+  start, congestion avoidance, and recovery halving on ACK-detected loss), but two
+  pieces are deferred — feeding timer/PTO-detected losses to the controller (only
+  ACK-detected losses back off the window today), and persistent congestion (§7.6,
+  resetting the window to the minimum when a PTO spans all in-flight packets) —
+  medium
 - PTO explicit probe (RFC 9002 §6.2.4): a probe timeout only re-checks for
   losses and backs off; it does not retransmit the oldest unacked ack-eliciting
-  frames as a probe. Bundle with NewReno (both need the loss layer to surface
-  the oldest-unacked) — medium
+  frames as a probe — medium
 
 ### Throughput levers identified by profiling
 
