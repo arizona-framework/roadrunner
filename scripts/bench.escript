@@ -420,6 +420,12 @@ preflight_scenario(#{scenario := httparena_limited_conn, servers := Servers} = O
 preflight_scenario(#{scenario := httparena_static, servers := Servers} = Opts) ->
     filter_servers(httparena_static, [elli], Servers, Opts,
         ~"elli fixture has no static-file route; roadrunner_static vs cowboy_static");
+preflight_scenario(#{scenario := echo, servers := Servers} = Opts) ->
+    filter_servers(echo, [erlang_quic], Servers, Opts,
+        ~"dep's request handler exposes no POST body (only a late set_stream_handler)");
+preflight_scenario(#{scenario := multi_request_body, servers := Servers} = Opts) ->
+    filter_servers(multi_request_body, [erlang_quic], Servers, Opts,
+        ~"dep's request handler exposes no POST body (only a late set_stream_handler)");
 preflight_scenario(Opts) ->
     Opts.
 
