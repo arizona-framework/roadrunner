@@ -1046,10 +1046,16 @@ loop_response_worker_stops_when_conn_dies() ->
     end.
 
 loop_response_worker_stops_on_stream_reset() ->
-    %% A peer RST_STREAM on a live loop stream must stop the worker, not
-    %% deliver `{h2_stream_reset, _}` to the handler's `handle_info/3`
-    %% (the `/loop` handler has no clause for it, so a misdelivery would
-    %% crash with function_clause — the worker must exit `normal`).
+    %% A peer RST_STREAM on a live loop stream delivers
+    %% `{roadrunner_disconnect, reset}` to the handler's `handle_info/3`
+    %% (its one chance to drop subscriptions) and then stops the worker
+    %% cleanly, with no END_STREAM DATA frame — the stream is gone.
+    try
+        unregister(roadrunner_h2_loop_observer)
+    catch
+        _:_ -> ok
+    end,
+    true = register(roadrunner_h2_loop_observer, self()),
     {Pid, Ref} = run_stream_request(~"/loop"),
     Worker = wait_for_register(roadrunner_h2_loop_test, 1000),
     %% Drain the 200 HEADERS so the worker is past `sync_send_headers`
@@ -1059,11 +1065,18 @@ loop_response_worker_stops_on_stream_reset() ->
     Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
     serve_recv(Pid, Rst),
     receive
+        {handler_disconnect, DisReason} ->
+            ?assertEqual(reset, DisReason)
+    after 1000 ->
+        error(disconnect_not_delivered)
+    end,
+    receive
         {'DOWN', WorkerRef, process, Worker, Reason} ->
             ?assertEqual(normal, Reason)
     after 1000 ->
         error(loop_worker_did_not_stop)
     end,
+    true = unregister(roadrunner_h2_loop_observer),
     cleanup(Pid, Ref).
 
 sendfile_empty_emits_empty_data() ->
