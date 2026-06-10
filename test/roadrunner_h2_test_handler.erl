@@ -177,4 +177,14 @@ handle_info({push, Data}, Push, N) ->
     {ok, N + 1};
 handle_info(stop, Push, N) ->
     _ = Push([~"data: bye(", integer_to_binary(N), ~")\n\n"]),
+    {stop, N};
+handle_info({roadrunner_disconnect, Reason}, _Push, N) ->
+    %% The client went away: surface the reason to the test observer (if
+    %% one registered) so the end-to-end disconnect path can be asserted,
+    %% then stop. The wire is gone, so the loop ends regardless.
+    _ =
+        case whereis(roadrunner_h2_loop_observer) of
+            undefined -> ok;
+            Observer -> Observer ! {handler_disconnect, Reason}
+        end,
     {stop, N}.

@@ -15,7 +15,11 @@ handle_info(go, Push, [{push, Data} | Rest]) ->
     self() ! go,
     {ok, Rest};
 handle_info(go, _Push, [stop | _]) ->
-    {stop, undefined}.
+    {stop, undefined};
+%% Disconnect tests run the loop with the probe pid as state.
+handle_info({roadrunner_disconnect, Reason}, _Push, Probe) when is_pid(Probe) ->
+    Probe ! {handler_got_disconnect, Reason},
+    {ok, Probe}.
 
 %% --- empty push is a no-op ---
 
@@ -61,6 +65,37 @@ sync_exits_on_stream_reset_test() ->
     end,
     FakeConn ! stop.
 
+%% --- client disconnect delivers {roadrunner_disconnect, _} ---
+
+%% A peer RST_STREAM arriving while the loop is idle (surfaced by the
+%% conn as `{h2_stream_reset, StreamId}`) delivers
+%% `{roadrunner_disconnect, reset}` and ends the loop with no END_STREAM
+%% DATA frame. Spawned so the fake conn's `{sends, _}` reply can't bleed
+%% into a sibling test's mailbox.
+loop_delivers_disconnect_on_stream_reset_test_() ->
+    {spawn, fun() ->
+        {FakeConn, Worker} = spawn_loop_with_state(self()),
+        ok = wait_until_looping(Worker),
+        Worker ! {h2_stream_reset, 1},
+        ok = wait_for_exit(Worker, 1000),
+        ?assertEqual(reset, recv_disconnect()),
+        ?assertEqual([{send_headers, 1, 200, [], false}], collect_sends(FakeConn)),
+        FakeConn ! stop
+    end}.
+
+%% The conn process dying (the worker's monitor `'DOWN'`) delivers
+%% `{roadrunner_disconnect, conn_down}` and ends the loop.
+loop_delivers_disconnect_on_conn_down_test_() ->
+    {spawn, fun() ->
+        {FakeConn, Worker} = spawn_loop_with_state(self()),
+        ok = wait_until_looping(Worker),
+        Worker ! {'DOWN', make_ref(), process, FakeConn, killed},
+        ok = wait_for_exit(Worker, 1000),
+        ?assertEqual(conn_down, recv_disconnect()),
+        ?assertEqual([{send_headers, 1, 200, [], false}], collect_sends(FakeConn)),
+        FakeConn ! stop
+    end}.
+
 %% --- OTP messages are answered, not delivered to the handler ---
 
 loop_answers_otp_messages_test() ->
@@ -86,6 +121,28 @@ spawn_loop(Directives) ->
         roadrunner_http2_loop_response:run(FakeConn, 1, 200, [], {?MODULE, Directives})
     end),
     {FakeConn, Worker}.
+
+spawn_loop_with_state(State) ->
+    Self = self(),
+    FakeConn = spawn(fun() -> fake_conn_loop(Self, []) end),
+    Worker = spawn(fun() ->
+        roadrunner_http2_loop_response:run(FakeConn, 1, 200, [], {?MODULE, State})
+    end),
+    {FakeConn, Worker}.
+
+%% Block until the worker has sent its headers and is idle in
+%% `info_loop`. `sys:get_state/1` is answered only from the loop, so it
+%% returns only after the worker is past `sync_send_headers` — without
+%% this a disconnect message could be intercepted by the sync receive.
+wait_until_looping(Worker) ->
+    _ = sys:get_state(Worker, 1000),
+    ok.
+
+recv_disconnect() ->
+    receive
+        {handler_got_disconnect, Reason} -> Reason
+    after 1000 -> error(no_disconnect_delivered)
+    end.
 
 fake_conn_loop(Reporter, Sends) ->
     fake_conn_loop(Reporter, Sends, undefined).

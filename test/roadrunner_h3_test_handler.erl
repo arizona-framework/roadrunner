@@ -107,7 +107,9 @@ handle(Req) ->
 %% `handle_info/3` is consulted only by `{loop, _}` responses. The
 %% `/loop` clause registers the worker; the test sends `{push, _}` to
 %% emit an SSE chunk, `push_empty` to exercise the empty-push no-op, and
-%% `stop` to terminate.
+%% `stop` to terminate. On a client disconnect the framework delivers
+%% `{roadrunner_disconnect, _}`, surfaced to a test observer (if
+%% registered) so the reset path can be asserted.
 -spec handle_info(term(), roadrunner_handler:push_fun(), term()) ->
     {ok, term()} | {stop, term()}.
 handle_info({push, Data}, Push, N) ->
@@ -118,4 +120,11 @@ handle_info(push_empty, Push, N) ->
     {ok, N};
 handle_info(stop, Push, N) ->
     _ = Push([~"data: bye(", integer_to_binary(N), ~")\n\n"]),
+    {stop, N};
+handle_info({roadrunner_disconnect, Reason}, _Push, N) ->
+    _ =
+        case whereis(roadrunner_h3_loop_observer) of
+            undefined -> ok;
+            Observer -> Observer ! {handler_disconnect, Reason}
+        end,
     {stop, N}.

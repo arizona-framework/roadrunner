@@ -112,6 +112,9 @@
     streams = #{} :: #{non_neg_integer() => map()},
     %% Worker monitor ref => StreamId, for correlating `'DOWN'`.
     worker_refs = #{} :: #{reference() => non_neg_integer()},
+    %% StreamId => worker pid, so a peer RESET_STREAM on a dispatched
+    %% stream can be routed to its worker (`{roadrunner_stream_reset, _}`).
+    worker_pids = #{} :: #{non_neg_integer() => pid()},
     %% StreamId => peer-uni-stream state (see `uni_event/4`).
     uni = #{} :: #{non_neg_integer() => uni_state()},
     %% Critical stream roles already claimed, so a duplicate control or
@@ -426,7 +429,7 @@ handle_uni_stream(#h3{uni = Uni, critical = Critical} = State, StreamId, Data, F
 %% not-yet-typed or unknown uni stream) it just drops the per-stream
 %% state we hold.
 -spec handle_stream_reset(#h3{}, non_neg_integer()) -> handle_result().
-handle_stream_reset(#h3{uni = Uni, streams = Streams} = State, StreamId) ->
+handle_stream_reset(#h3{uni = Uni, streams = Streams, worker_pids = WorkerPids} = State, StreamId) ->
     case Uni of
         #{StreamId := UniState} ->
             case uni_reset(UniState) of
@@ -436,7 +439,20 @@ handle_stream_reset(#h3{uni = Uni, streams = Streams} = State, StreamId) ->
                     State#h3{uni = maps:remove(StreamId, Uni)}
             end;
         _ ->
-            State#h3{streams = maps:remove(StreamId, Streams)}
+            case WorkerPids of
+                #{StreamId := WorkerPid} ->
+                    %% Peer cancelled a dispatched request stream. Tell the
+                    %% worker so a `{loop, ...}` handler gets its disconnect;
+                    %% the worker's normal exit then releases the slot and
+                    %% drops the stream via `handle_worker_down/3` (no RST
+                    %% back — the peer already reset it).
+                    _ = (WorkerPid ! {roadrunner_stream_reset, StreamId}),
+                    State;
+                _ ->
+                    %% Still mid-receive (or already gone) — drop the
+                    %% in-progress frame-accumulation entry.
+                    State#h3{streams = maps:remove(StreamId, Streams)}
+            end
     end.
 
 %% RFC 9114 §7.2.8: HTTP/2-reserved frame types → H3_FRAME_UNEXPECTED;
@@ -764,15 +780,17 @@ dispatch_decoded(#h3{streams = Streams} = State, StreamId, Headers, Body) ->
                 )
             of
                 true ->
-                    {_WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
+                    {WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
                         State1#h3.conn, StreamId, Req, State1#h3.proto_opts
                     ),
                     %% The worker owns the response now, tracked by its monitor
                     %% ref; drop the (no-longer-needed) frame-accumulation entry
                     %% so the streams map only ever holds in-progress requests.
+                    %% Record the pid too so a peer reset can reach the worker.
                     State1#h3{
                         streams = maps:remove(StreamId, Streams),
-                        worker_refs = (State1#h3.worker_refs)#{MonRef => StreamId}
+                        worker_refs = (State1#h3.worker_refs)#{MonRef => StreamId},
+                        worker_pids = (State1#h3.worker_pids)#{StreamId => WorkerPid}
                     };
                 false ->
                     %% Listener-wide in-flight ceiling reached — refuse the
@@ -788,7 +806,7 @@ dispatch_decoded(#h3{streams = Streams} = State, StreamId, Headers, Body) ->
 %% pseudo-headers, response encoding) resets the stream, leaving the
 %% connection's other streams untouched.
 -spec handle_worker_down(#h3{}, reference(), term()) -> #h3{}.
-handle_worker_down(#h3{worker_refs = WorkerRefs} = State, MonRef, Reason) ->
+handle_worker_down(#h3{worker_refs = WorkerRefs, worker_pids = WorkerPids} = State, MonRef, Reason) ->
     %% Every monitor the loop holds is a stream worker (the QUIC conn is
     %% linked, not monitored), so the ref is always present.
     {StreamId, WorkerRefs1} = maps:take(MonRef, WorkerRefs),
@@ -798,7 +816,9 @@ handle_worker_down(#h3{worker_refs = WorkerRefs} = State, MonRef, Reason) ->
     ok = roadrunner_conn:release_request_slot(
         State#h3.max_concurrent_requests, State#h3.inflight_counter
     ),
-    State1 = State#h3{worker_refs = WorkerRefs1},
+    State1 = State#h3{
+        worker_refs = WorkerRefs1, worker_pids = maps:remove(StreamId, WorkerPids)
+    },
     case Reason of
         normal ->
             drop_stream(State1, StreamId);

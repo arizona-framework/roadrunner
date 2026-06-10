@@ -395,24 +395,6 @@ grammar enforcement is callers-write-bugs ergonomics, not security.
 
 **Scope:** small per attribute. Add when a real caller hits the gap.
 
-### Cancel a handler on client disconnect — medium
-
-**What:** Signal a running handler when the client goes away. For
-`{loop, ...}` (SSE / long-poll) and streaming handlers that block in
-`receive` or keep producing chunks after the request, deliver a
-`{roadrunner_disconnect, _}` message (or expose a monitor) the moment
-the connection closes, so the handler can drop pubsub subscriptions and
-stop expensive work instead of discovering the dead socket only on its
-next write.
-
-**Why deferred:** ordinary request/response handlers finish before the
-client can leave, so they never need it; it only matters for the
-long-lived streaming shapes, and none has a caller blocked on it today.
-
-**Scope:** medium. The conn loop already owns the socket so it can watch
-for close; the work is routing that into the loop/stream lifecycle
-across h1, h2, and h3 without racing the normal finish path.
-
 ### NDJSON streaming response builder — small
 
 **What:** A first-class newline-delimited-JSON response, the JSON

@@ -50,6 +50,66 @@ loop_skips_otp_internal_messages_test() ->
     %% nothing else.
     ?assertEqual([user_msg_1, user_msg_2], Got).
 
+%% A peer close (the transport's `closed` tag) delivers one
+%% `{roadrunner_disconnect, closed}` to the handler and ends the loop
+%% without writing the chunked terminator.
+loop_delivers_disconnect_on_close_test_() ->
+    {spawn, fun() ->
+        {Worker, Sink, Tag} = start_disconnect_worker(),
+        Worker ! {roadrunner_fake_closed, fake_sock},
+        await_worker_done(Worker),
+        Sink ! stop,
+        ?assertEqual([{roadrunner_disconnect, closed}], collect_handler_msgs([], 100)),
+        ?assertNot(lists:member(~"0\r\n\r\n", collect_sent([], Tag, 100)))
+    end}.
+
+%% A transport error (the transport's `error` tag) is treated the same
+%% as a close: one `{roadrunner_disconnect, closed}`, no terminator.
+loop_delivers_disconnect_on_error_test_() ->
+    {spawn, fun() ->
+        {Worker, Sink, Tag} = start_disconnect_worker(),
+        Worker ! {roadrunner_fake_error, fake_sock, econnreset},
+        await_worker_done(Worker),
+        Sink ! stop,
+        ?assertEqual([{roadrunner_disconnect, closed}], collect_handler_msgs([], 100)),
+        ?assertNot(lists:member(~"0\r\n\r\n", collect_sent([], Tag, 100)))
+    end}.
+
+%% Inbound bytes on the (unidirectional) streaming socket are discarded
+%% and the loop keeps running — the handler never sees them, and a later
+%% `done` still stops cleanly with the chunked terminator.
+loop_discards_inbound_data_and_continues_test_() ->
+    {spawn, fun() ->
+        {Worker, Sink, Tag} = start_disconnect_worker(),
+        Worker ! {roadrunner_fake_data, fake_sock, ~"junk"},
+        Worker ! user_msg_1,
+        Worker ! done,
+        await_worker_done(Worker),
+        Sink ! stop,
+        ?assertEqual([user_msg_1], collect_handler_msgs([], 100)),
+        ?assert(lists:member(~"0\r\n\r\n", collect_sent([], Tag, 100)))
+    end}.
+
+%% If arming `{active, once}` fails (socket already gone), the loop
+%% delivers the disconnect immediately rather than blocking forever.
+loop_arm_failure_delivers_disconnect_test_() ->
+    {spawn, fun() ->
+        Self = self(),
+        DeadSink = spawn(fun() -> ok end),
+        DeadRef = monitor(process, DeadSink),
+        receive
+            {'DOWN', DeadRef, process, DeadSink, _} -> ok
+        after 1000 -> error(sink_not_dead)
+        end,
+        Probe = self(),
+        Worker = spawn(fun() ->
+            roadrunner_loop_response:run({fake, DeadSink}, 200, [], ?MODULE, Probe),
+            Self ! {worker_done, self()}
+        end),
+        await_worker_done(Worker),
+        ?assertEqual([{roadrunner_disconnect, closed}], collect_handler_msgs([], 100))
+    end}.
+
 %% A `gen_server:call/2,3` against the loop replies `{error, not_supported}`
 %% instead of hanging.
 loop_gen_call_replies_not_supported_test() ->
@@ -96,6 +156,32 @@ start_loop_worker(State) ->
 collect_handler_msgs(Acc, Timeout) ->
     receive
         {handler_got, Msg} -> collect_handler_msgs([Msg | Acc], 0)
+    after Timeout ->
+        lists:reverse(Acc)
+    end.
+
+%% Spawn the loop over a fresh send-logging sink, forwarding handler
+%% messages and finish notifications to the test process. Returns the
+%% worker pid, the sink pid, and the send-log tag.
+start_disconnect_worker() ->
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_send_log_sink(Self, Tag),
+    Worker = spawn(fun() ->
+        roadrunner_loop_response:run({fake, Sink}, 200, [], ?MODULE, Self),
+        Self ! {worker_done, self()}
+    end),
+    {Worker, Sink, Tag}.
+
+await_worker_done(Worker) ->
+    receive
+        {worker_done, Worker} -> ok
+    after 1000 -> error(worker_did_not_finish)
+    end.
+
+collect_sent(Acc, Tag, Timeout) ->
+    receive
+        {sent, Tag, Data} -> collect_sent([iolist_to_binary(Data) | Acc], Tag, 0)
     after Timeout ->
         lists:reverse(Acc)
     end.
