@@ -29,6 +29,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     loop_response/1,
     loop_filters_otp/1,
     loop_conn_close_stops_worker/1,
+    loop_stream_reset_delivers_disconnect/1,
     stream_response/1,
     stream_trailers/1,
     stream_autoclose/1,
@@ -95,6 +96,7 @@ all() ->
         loop_response,
         loop_filters_otp,
         loop_conn_close_stops_worker,
+        loop_stream_reset_delivers_disconnect,
         stream_response,
         stream_trailers,
         stream_autoclose,
@@ -352,6 +354,30 @@ loop_conn_close_stops_worker(Config) ->
     after 5000 ->
         ct:fail(loop_worker_did_not_exit)
     end,
+    close(Conn).
+
+loop_stream_reset_delivers_disconnect(Config) ->
+    %% A peer cancelling a live `{loop, _}` stream (RESET_STREAM) is routed
+    %% by the conn loop to the worker, which hands the handler
+    %% `{roadrunner_disconnect, reset}` and stops — rather than leaking
+    %% until the whole connection dies.
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/loop")),
+    Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
+    true = register(roadrunner_h3_loop_observer, self()),
+    WorkerRef = monitor(process, Worker),
+    ok = roadrunner_quic_test_h3:cancel(Conn, StreamId),
+    receive
+        {handler_disconnect, Reason} -> ?assertEqual(reset, Reason)
+    after 5000 ->
+        ct:fail(disconnect_not_delivered)
+    end,
+    receive
+        {'DOWN', WorkerRef, process, Worker, _} -> ok
+    after 5000 ->
+        ct:fail(loop_worker_did_not_exit)
+    end,
+    true = unregister(roadrunner_h3_loop_observer),
     close(Conn).
 
 sendfile_empty(Config) ->

@@ -376,16 +376,20 @@ sendfile_loop(IoDev, Remaining, Send) ->
 ) -> ok.
 send_loop(Conn, StreamId, Status, Headers, Handler, State) ->
     _ = roadrunner_quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
-    %% Stop looping if the connection dies — otherwise an idle loop
-    %% worker (blocked in `info_loop` waiting for a message) leaks
-    %% forever once the conn is gone. The monitor fires when the QUIC
-    %% connection process exits (promptly on a force-close / abort, or
-    %% after its drain timeout on a graceful close).
+    %% Monitor the conn so an idle loop worker (blocked in `info_loop`)
+    %% does not leak once the conn is gone: its `'DOWN'` becomes a
+    %% `{roadrunner_disconnect, conn_down}` for the handler. The monitor
+    %% fires when the QUIC connection process exits (promptly on a
+    %% force-close / abort, or after its drain timeout on a graceful
+    %% close).
     _ = monitor(process, Conn),
     Push = fun(Data) -> loop_push(Conn, StreamId, Data) end,
     info_loop(Conn, StreamId, Handler, Push, State).
 
-%% OTP message shapes are answered via `roadrunner_loop_sys` rather than
+%% The conn's `'DOWN'` and a peer `{roadrunner_stream_reset, _}` (routed
+%% by the conn loop on RESET_STREAM) each deliver one final
+%% `{roadrunner_disconnect, _}` to the handler and end the loop. OTP
+%% message shapes are answered via `roadrunner_loop_sys` rather than
 %% surfacing in `handle_info/3`: `sys:get_state/1` & friends work and a
 %% `gen_server:call/2,3` against the worker gets `{error, not_supported}`
 %% instead of hanging (see `roadrunner_loop_response` for the full
@@ -394,8 +398,13 @@ send_loop(Conn, StreamId, Status, Headers, Handler, State) ->
 info_loop(Conn, StreamId, Handler, Push, State) ->
     receive
         {'DOWN', _MonRef, process, Conn, _Reason} ->
-            %% Connection gone — stop looping.
-            ok;
+            %% Connection gone — give the handler its disconnect and stop.
+            deliver_disconnect(Handler, Push, State, conn_down);
+        {roadrunner_stream_reset, StreamId} ->
+            %% The conn loop routed a peer RESET_STREAM for this stream
+            %% (RFC 9114 §4.1). Hand the handler the disconnect and stop;
+            %% no FIN frame — the stream is gone.
+            deliver_disconnect(Handler, Push, State, reset);
         {system, From, Req} ->
             Resume = fun(S) -> info_loop(Conn, StreamId, Handler, Push, S) end,
             roadrunner_loop_sys:handle_system(Req, From, State, Resume);
@@ -414,6 +423,14 @@ info_loop(Conn, StreamId, Handler, Push, State) ->
                     ok
             end
     end.
+
+%% Hand the handler one final `{roadrunner_disconnect, Reason}` so it can
+%% drop subscriptions / stop work, then end the loop. The stream/conn is
+%% gone: we neither emit the FIN frame nor honour the return.
+-spec deliver_disconnect(module(), roadrunner_handler:push_fun(), term(), reset | conn_down) -> ok.
+deliver_disconnect(Handler, Push, State, Reason) ->
+    _ = Handler:handle_info({roadrunner_disconnect, Reason}, Push, State),
+    ok.
 
 %% Push handed to the loop handler: empty data is a no-op (matches the
 %% h1/h2 contract), non-empty ships as one DATA frame (no FIN).
