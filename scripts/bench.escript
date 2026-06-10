@@ -180,8 +180,28 @@ main(Args) ->
         true ->
             run_standalone_one(Opts0, Protocols, Scenarios0);
         false ->
-            run_each_protocol(Opts0, Protocols, Scenarios0)
+            run_each_protocol(apply_scheduler_split(Opts0), Protocols, Scenarios0)
     end.
+
+%% Cap the loadgen (this BEAM) and the server peer to disjoint scheduler counts
+%% that sum to the online schedulers, so the two never oversubscribe the cores.
+%% Running both at the full count puts 2N scheduler threads on N cores and the
+%% context-switching depresses throughput. The loadgen cap is applied here,
+%% before any load runs; run_side applies the server's count to its peer.
+apply_scheduler_split(#{server_schedulers := Requested} = Opts) ->
+    Online = erlang:system_info(schedulers_online),
+    ServerScheds =
+        case Requested of
+            N when is_integer(N), N > 0, N < Online -> N;
+            _ -> Online - (Online div 2)
+        end,
+    LoadgenScheds = max(1, Online - ServerScheds),
+    _ = erlang:system_flag(schedulers_online, LoadgenScheds),
+    io:format(
+        "~nscheduler split: server ~B + loadgen ~B of ~B online (no oversubscription)~n",
+        [ServerScheds, LoadgenScheds, Online]
+    ),
+    Opts#{server_schedulers := ServerScheds}.
 
 %% Standalone mode brings up ONE listener for an out-of-process wrk2
 %% driver, so exactly one protocol AND exactly one scenario must be
@@ -935,6 +955,21 @@ cli() ->
                     """
             },
             #{
+                name => server_schedulers,
+                long => "-server-schedulers",
+                type => integer,
+                default => 0,
+                help =>
+                    """
+                    Cap the server BEAM to this many online schedulers and the
+                    loadgen (this escript's BEAM) to the rest, so the two never
+                    oversubscribe the machine's cores. Running both at the full
+                    scheduler count puts 2N scheduler threads on N cores, whose
+                    context-switching depresses throughput and inflates latency.
+                    0 (the default) splits the online schedulers in half.
+                    """
+            },
+            #{
                 name => profile,
                 long => "-profile",
                 type => boolean,
@@ -1219,6 +1254,7 @@ standalone_error(Fmt, Args) ->
 run_side(Side, Opts) ->
     io:format("~n~s~n", [Side]),
     {Peer, Port} = start_server(Side, Opts),
+    _ = peer:call(Peer, erlang, system_flag, [schedulers_online, maps:get(server_schedulers, Opts)]),
     try
         run_warmup(Port, Opts),
         ok = maybe_start_profile(Peer, Opts),
