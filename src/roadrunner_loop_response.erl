@@ -32,6 +32,18 @@
 %% - Any other Erlang message reaches the handler's `handle_info/3`
 %%   verbatim. Handlers should pattern-match defensively (with a
 %%   catch-all clause) rather than crash on unexpected messages.
+%%
+%% ## Client disconnect
+%%
+%% The socket is armed `{active, once}` before the loop blocks, so a
+%% peer close/error arrives as a mailbox message the selective receive
+%% can match — otherwise a passive, unread socket only reveals the dead
+%% peer on the next write, which may be minutes away on a quiet SSE
+%% channel. On close/error the loop delivers one final
+%% `{roadrunner_disconnect, closed}` through `handle_info/3` (the
+%% handler's chance to drop subscriptions) and then ends without writing
+%% the chunked terminator — the wire is already gone. Inbound bytes (an
+%% h1 streaming response is unidirectional) re-arm and are discarded.
 
 -export([run/5]).
 
@@ -53,42 +65,90 @@ run(Socket, Status, UserHeaders, Handler, State) ->
         roadrunner_transport:send(Socket, Head), loop_response_head
     ),
     Push = make_push(Socket),
-    info_loop(Socket, Handler, Push, State).
+    %% Active-mode tags for this transport (`{tcp, tcp_closed, tcp_error}`
+    %% / `{ssl, ssl_closed, ssl_error}`), matched in `info_loop` so a peer
+    %% close surfaces as a message rather than only on the next write.
+    Tags = roadrunner_transport:messages(Socket),
+    arm_and_loop(Socket, Tags, Handler, Push, State).
+
+%% Arm `{active, once}` and enter the loop. If arming fails the socket
+%% is already gone, so deliver the disconnect straight away. Shared by
+%% `run/5` (initial arm) and the inbound-data clause (re-arm).
+-spec arm_and_loop(
+    roadrunner_transport:socket(),
+    {atom(), atom(), atom()},
+    module(),
+    roadrunner_handler:push_fun(),
+    term()
+) -> ok.
+arm_and_loop(Socket, Tags, Handler, Push, State) ->
+    case roadrunner_transport:setopts(Socket, [{active, once}]) of
+        ok -> info_loop(Socket, Tags, Handler, Push, State);
+        {error, _} -> deliver_disconnect(Handler, Push, State, closed)
+    end.
 
 %% Selective receive on every Erlang message → handler:handle_info/3,
-%% **except** the OTP-internal shapes, which are answered via
-%% `roadrunner_loop_sys` rather than delivered to the user handler:
-%% `{system, _, _}` goes to the `sys` protocol handler, `{'$gen_call', _, _}`
-%% is replied `{error, not_supported}`, and `{'$gen_cast', _}` is a no-op.
-%% Non-OTP messages fall through to the catch-all `Info` clause. On
-%% `{stop, _}` we emit the size-0 chunked terminator and return.
+%% **except** the active-mode socket events and the OTP-internal shapes.
+%% The transport's close/error tags deliver a final
+%% `{roadrunner_disconnect, closed}` and end the loop (no terminator —
+%% the wire is gone); its data tag re-arms and discards inbound bytes.
+%% The OTP shapes are answered via `roadrunner_loop_sys` rather than
+%% delivered to the user handler: `{system, _, _}` goes to the `sys`
+%% protocol handler, `{'$gen_call', _, _}` is replied
+%% `{error, not_supported}`, and `{'$gen_cast', _}` is a no-op. Non-OTP
+%% messages fall through to the catch-all `Info` clause. On `{stop, _}`
+%% we emit the size-0 chunked terminator and return.
 %%
-%% **No `after` clause:** the loop blocks indefinitely until the
-%% handler returns `{stop, _}` from `handle_info/3`. A handler that
-%% never receives a stop-triggering message keeps the connection
-%% open forever; that's the contract for `{loop, ...}` responses
-%% (e.g. SSE feeds).
--spec info_loop(roadrunner_transport:socket(), module(), roadrunner_handler:push_fun(), term()) ->
-    ok.
-info_loop(Socket, Handler, Push, State) ->
+%% **No `after` clause:** absent a peer disconnect the loop blocks
+%% indefinitely until the handler returns `{stop, _}` from
+%% `handle_info/3`. A handler that never receives a stop-triggering
+%% message keeps the connection open until the client goes away; that's
+%% the contract for `{loop, ...}` responses (e.g. SSE feeds).
+-spec info_loop(
+    roadrunner_transport:socket(),
+    {atom(), atom(), atom()},
+    module(),
+    roadrunner_handler:push_fun(),
+    term()
+) -> ok.
+info_loop(Socket, {DataTag, ClosedTag, ErrorTag} = Tags, Handler, Push, State) ->
     receive
+        {ClosedTag, _} ->
+            deliver_disconnect(Handler, Push, State, closed);
+        {ErrorTag, _, _} ->
+            deliver_disconnect(Handler, Push, State, closed);
+        {DataTag, _, _} ->
+            %% Inbound bytes on a unidirectional streaming response (the
+            %% request body was already read before dispatch); discard
+            %% them and re-arm so the next socket event is still seen.
+            arm_and_loop(Socket, Tags, Handler, Push, State);
         {system, From, Req} ->
-            Resume = fun(S) -> info_loop(Socket, Handler, Push, S) end,
+            Resume = fun(S) -> info_loop(Socket, Tags, Handler, Push, S) end,
             roadrunner_loop_sys:handle_system(Req, From, State, Resume);
         {'$gen_call', From, _} ->
             ok = roadrunner_loop_sys:gen_call_unsupported(From),
-            info_loop(Socket, Handler, Push, State);
+            info_loop(Socket, Tags, Handler, Push, State);
         {'$gen_cast', _} ->
-            info_loop(Socket, Handler, Push, State);
+            info_loop(Socket, Tags, Handler, Push, State);
         Info ->
             case Handler:handle_info(Info, Push, State) of
                 {ok, NewState} ->
-                    info_loop(Socket, Handler, Push, NewState);
+                    info_loop(Socket, Tags, Handler, Push, NewState);
                 {stop, _NewState} ->
                     _ = roadrunner_transport:send(Socket, ~"0\r\n\r\n"),
                     ok
             end
     end.
+
+%% Hand the handler one final `{roadrunner_disconnect, Reason}` so it can
+%% drop subscriptions / stop work, then end the loop. The wire is gone:
+%% we neither write the chunked terminator nor honour the return (the
+%% channel is dead either way). A handler with no matching clause falls
+%% through to its catch-all; the loop ends regardless.
+-spec deliver_disconnect(module(), roadrunner_handler:push_fun(), term(), closed) -> ok.
+deliver_disconnect(Handler, Push, State, Reason) ->
+    _ = Handler:handle_info({roadrunner_disconnect, Reason}, Push, State),
+    ok.
 
 %% Push fun handed to the user handler. Same special-case as
 %% `roadrunner_stream_response:stream_frame/2`: zero-length data

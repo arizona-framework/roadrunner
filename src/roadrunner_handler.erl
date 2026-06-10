@@ -138,6 +138,24 @@ writes one chunk to the wire. Return `{ok, NewState}` to keep
 looping or `{stop, NewState}` to emit the size-0 terminator and
 close. Handlers that don't export this callback can't use
 `{loop, ...}` responses.
+
+When the client connection goes away while the loop is still running,
+the framework delivers a final `{roadrunner_disconnect, Reason}`
+message through this callback so the handler can drop pubsub
+subscriptions and stop work instead of discovering the dead socket on
+its next push:
+
+- `{roadrunner_disconnect, closed}` — the peer closed (or errored) the
+  HTTP/1 connection.
+- `{roadrunner_disconnect, reset}` — the peer cancelled this stream
+  (HTTP/2 `RST_STREAM`, HTTP/3 `RESET_STREAM`).
+- `{roadrunner_disconnect, conn_down}` — the owning connection process
+  died (HTTP/2 / HTTP/3).
+
+It is delivered at most once, the loop then ends regardless of the
+return value (the wire is gone, so no terminator is written). A handler
+that does not match it explicitly falls through to its catch-all clause;
+the loop still ends.
 """.
 -callback handle_info(Info :: term(), Push :: push_fun(), State :: term()) ->
     {ok, NewState :: term()} | {stop, NewState :: term()}.
