@@ -13,7 +13,7 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -export([key_material/0, gen_keypair/0]).
--export([client_hello_framed/3]).
+-export([client_hello_framed/3, client_hello_framed/4]).
 -export([seal/6, seal_raw/6]).
 -export([crypto_bytes/4, frames/4]).
 -export([server_hello_key_share/1, deframe_all/1]).
@@ -80,12 +80,26 @@ first transcript element.
     Scheme :: non_neg_integer(), ClientPub :: binary(), ClientSCID :: binary() | none
 ) -> binary().
 client_hello_framed(Scheme, ClientPub, ClientSCID) ->
+    client_hello_framed(Scheme, ClientPub, ClientSCID, 800000).
+
+-doc """
+As `client_hello_framed/3` but advertising `StreamWindow` as the per-stream
+flow-control limit (initial_max_stream_data_*), so a test can pin a small
+per-stream send window on the server to exercise stream-level backpressure.
+""".
+-spec client_hello_framed(
+    Scheme :: non_neg_integer(),
+    ClientPub :: binary(),
+    ClientSCID :: binary() | none,
+    StreamWindow :: non_neg_integer()
+) -> binary().
+client_hello_framed(Scheme, ClientPub, ClientSCID, StreamWindow) ->
     Random = crypto:strong_rand_bytes(32),
     Extensions = iolist_to_binary([
         signature_algorithms_ext([Scheme]),
         alpn_ext(~"h3"),
         key_share_ext(ClientPub),
-        transport_params_ext(ClientSCID)
+        transport_params_ext(ClientSCID, StreamWindow)
     ]),
     CipherSuites = <<?CIPHER_AES_128_GCM_SHA256:16>>,
     Body =
@@ -111,16 +125,18 @@ key_share_ext(PubKey) ->
 %% windows are what the server seeds its send windows from (deliberately
 %% distinct from roadrunner_quic_flow's 786432 default, so a send test proves
 %% the window is the client's advertised value, not a hardcoded fallback).
-%% `none` emits no extension at all.
-transport_params_ext(none) ->
+%% `none` emits no extension at all. `StreamWindow` is the advertised
+%% per-stream limit (default 800000); a test pins a small value to make the
+%% server's per-stream send window the binding constraint.
+transport_params_ext(none, _StreamWindow) ->
     <<>>;
-transport_params_ext(ClientSCID) ->
+transport_params_ext(ClientSCID, StreamWindow) ->
     Body = iolist_to_binary(
         roadrunner_quic_transport_params:encode(#{
             initial_source_connection_id => ClientSCID,
             initial_max_data => 800000,
-            initial_max_stream_data_bidi_local => 800000,
-            initial_max_stream_data_uni => 800000
+            initial_max_stream_data_bidi_local => StreamWindow,
+            initial_max_stream_data_uni => StreamWindow
         })
     ),
     extension(?EXT_QUIC_TRANSPORT_PARAMS, Body).

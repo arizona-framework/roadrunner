@@ -107,6 +107,15 @@
     %% per-pass work is O(streams-with-pending-data); a fully-terminal stream
     %% leaves both this set and `streams` (pruned in `put_stream`).
     sendable = [] :: ordsets:ordset(non_neg_integer()),
+    %% Deferred send replies, one per stream id: a synchronous `send_data`
+    %% whose bytes did not fully flush this pass (closed flow / congestion
+    %% window) is parked here instead of replied, so the stream worker (and
+    %% the loop handler's Push) blocks until the buffer drains — the HTTP/3
+    %% analogue of h2's defer-ack backpressure. At most one entry per stream:
+    %% the worker blocks in `roadrunner_quic:await/3`, so it cannot have a
+    %% second `send_data` outstanding. Released by `release_drained/1` (drain
+    %% or abort) and `release_all/2` (connection teardown).
+    parked = #{} :: #{non_neg_integer() => {pid(), reference()}},
     %% Next server-initiated unidirectional stream id to hand out (RFC 9000
     %% §2.1: server uni ids are 3, 7, 11, ...); the owner opens its h3
     %% control stream this way.
@@ -334,18 +343,23 @@ finish_datagram(_Now, draining, #state{phase = draining} = State) ->
     %% timer set on entry keeps running in the shell.
     drain_emits(State);
 finish_datagram(Now, _Before, #state{phase = draining, pending_close = undefined} = State) ->
-    %% Just entered draining via a peer CONNECTION_CLOSE: deliver {closed, _} and
-    %% arm the drain timer; send nothing.
-    {State1, EmitEffects} = drain_emits(State),
-    {State1, [{arm_timer, drain, drain_deadline(Now, State1)} | EmitEffects]};
+    %% Just entered draining via a peer CONNECTION_CLOSE: release any parked
+    %% send replies (the send pass is skipped here, so a parked worker would
+    %% otherwise stall the whole drain window), deliver {closed, _}, and arm
+    %% the drain timer; send nothing.
+    {State1, Releases} = release_all({error, closed}, State),
+    {State2, EmitEffects} = drain_emits(State1),
+    {State2, [{arm_timer, drain, drain_deadline(Now, State2)} | Releases ++ EmitEffects]};
 finish_datagram(Now, _Before, #state{phase = draining} = State) ->
     %% Just entered draining via a locally-detected error: send our one
-    %% CONNECTION_CLOSE, deliver {closed, _}, and arm the drain timer. An
-    %% established connection's address is validated, so the close always fits the
-    %% §8.1 budget (send_close emits exactly one datagram).
+    %% CONNECTION_CLOSE, release any parked send replies, deliver {closed, _},
+    %% and arm the drain timer. An established connection's address is
+    %% validated, so the close always fits the §8.1 budget (send_close emits
+    %% exactly one datagram).
     {State1, [Close]} = send_close(State),
-    {State2, EmitEffects} = drain_emits(State1),
-    {State2, [Close, {arm_timer, drain, drain_deadline(Now, State2)} | EmitEffects]};
+    {State2, Releases} = release_all({error, closed}, State1),
+    {State3, EmitEffects} = drain_emits(State2),
+    {State3, [Close, {arm_timer, drain, drain_deadline(Now, State3)} | Releases ++ EmitEffects]};
 finish_datagram(_Now, _Before, #state{phase = closed, pending_close = undefined} = State) ->
     drain_emits(State);
 finish_datagram(_Now, _Before, #state{phase = closed} = State) ->
@@ -471,7 +485,10 @@ send_owner_close(ErrorCode, Reason, Keys, Now, #state{peer_scid = DCID, scid = S
     State1 = put_space(
         application, Space#space{next_pn = PN + 1}, State#state{phase = draining}
     ),
-    {State1, [{send, Datagram}, {arm_timer, drain, drain_deadline(Now, State1)}]}.
+    %% Release any parked send reply: a streaming worker can be mid-Push when
+    %% the owner closes, and this path skips the send pass.
+    {State2, Releases} = release_all({error, closed}, State1),
+    {State2, [{send, Datagram}, {arm_timer, drain, drain_deadline(Now, State2)} | Releases]}.
 
 %% Abandon the send side of a stream and tell the peer with a RESET_STREAM (RFC
 %% 9000 §19.4): discard the unsent buffer, record the bytes already sent as the
@@ -519,7 +536,46 @@ handle_send(From, Ref, _Sid, _IoData, _Fin, _Now, #state{phase = draining} = Sta
 handle_send(From, Ref, Sid, IoData, Fin, Now, State) ->
     State1 = enqueue_send(Sid, IoData, Fin, State),
     {State2, SendEffects} = send_pass(Now, State1),
-    {State2, [{reply, From, Ref, ok} | SendEffects]}.
+    case park_send(Sid, From, Ref, State2) of
+        {parked, State3} ->
+            %% Backpressure: the bytes did not fully flush, so withhold the
+            %% reply. The worker blocks in `await/3` until `release_drained/1`
+            %% (from a later send pass once the window opens, or on abort)
+            %% emits it. Bytes already went out in SendEffects.
+            {State3, SendEffects};
+        {reply, Result} ->
+            {State2, [{reply, From, Ref, Result} | SendEffects]}
+    end.
+
+%% Decide a send's reply: park (withhold) it iff this is a client-initiated
+%% bidi request stream (`Sid rem 4 =:= 0`, where response workers write) that
+%% is still present, not abandoned, and did not fully drain this pass —
+%% mirroring `release_result/2`. An abandoned stream (peer reset / STOP_SENDING)
+%% replies `{error, closed}` at once so the worker does not park on a dead
+%% stream. A fully-drained or pruned send, or a server-uni control send
+%% (`Sid rem 4 =/= 0`, which the conn-loop owner makes synchronously and must
+%% never block), replies `ok`.
+-spec park_send(non_neg_integer(), pid(), reference(), t()) ->
+    {parked, t()} | {reply, ok | {error, closed}}.
+park_send(Sid, From, Ref, #state{streams = Streams, parked = Parked} = State) when
+    Sid rem 4 =:= 0
+->
+    case Streams of
+        #{Sid := {Stream, _Flow}} ->
+            case roadrunner_quic_stream:send_abandoned(Stream) of
+                true ->
+                    {reply, {error, closed}};
+                false ->
+                    case roadrunner_quic_stream:send_pending(Stream) of
+                        true -> {parked, State#state{parked = Parked#{Sid => {From, Ref}}}};
+                        false -> {reply, ok}
+                    end
+            end;
+        #{} ->
+            {reply, ok}
+    end;
+park_send(_Sid, _From, _Ref, _State) ->
+    {reply, ok}.
 
 %% Append outbound bytes to a stream's send buffer (creating the stream on
 %% first reference) and flag the FIN when this is the final write.
@@ -648,6 +704,8 @@ process_frame(_Now, application, {max_data, Max}, #state{conn_flow = ConnFlow} =
     State#state{conn_flow = roadrunner_quic_flow:on_max_data_received(Max, ConnFlow)};
 process_frame(_Now, application, {max_stream_data, Sid, Max}, State) ->
     on_max_stream_data(Sid, Max, State);
+process_frame(_Now, application, {stop_sending, Sid, ErrorCode}, State) ->
+    process_stop_sending(Sid, ErrorCode, State);
 process_frame(_Now, _Level, _Frame, State) ->
     %% ping / padding are no-ops. MAX_STREAMS is accepted but not yet acted on
     %% (the server never opens enough streams to need the raised limit).
@@ -932,6 +990,25 @@ process_reset_stream(Sid, ErrorCode, FinalSize, State) ->
             end
     end.
 
+%% Peer STOP_SENDING (RFC 9000 §3.5): the peer will not read more of our
+%% response on this stream. Abandon our send side — `stop_sending/1` discards
+%% the unsent buffer and marks the stream send-stopped, so a parked send reply
+%% releases with `{error, closed}` (via `release_drained/1` at the end of this
+%% datagram) instead of `ok` — and surface it to the owner as a stream reset so
+%% a response worker stops (reusing the reset routing) rather than buffering more
+%% onto a stopped stream. A frame for a stream we hold no send state for is
+%% ignored, like a late RESET_STREAM.
+-spec process_stop_sending(non_neg_integer(), non_neg_integer(), t()) -> t().
+process_stop_sending(Sid, ErrorCode, #state{streams = Streams} = State) ->
+    case Streams of
+        #{Sid := {Stream0, Flow}} ->
+            Stream1 = roadrunner_quic_stream:stop_sending(Stream0),
+            State1 = put_stream(Sid, Stream1, Flow, State),
+            emit({stream_reset, Sid, ErrorCode}, State1);
+        #{} ->
+            State
+    end.
+
 %% A well-placed peer CONNECTION_CLOSE (transport at any level, or application
 %% at 1-RTT) ends the connection: surface it to the owner and move to the
 %% terminal phase so the send pass is skipped. An established connection lingers
@@ -1161,7 +1238,10 @@ put_stream(Sid, Stream, Flow, #state{streams = Streams, sendable = Sendable} = S
     %% finished) is pruned so the map stays bounded to live streams; the
     %% high-water keeps a late frame for its id from recreating it. Otherwise it
     %% is stored and the `sendable` working set kept in step (unsent data/FIN
-    %% joins it, a drained one leaves it).
+    %% joins it, a drained one leaves it). An abandoned send side (peer
+    %% RESET_STREAM left `aborted`, or STOP_SENDING / local reset set
+    %% `send_stopped`) leaves `sendable` even with buffered bytes, so the send
+    %% pass never emits STREAM frames on a stream the peer reset.
     case roadrunner_quic_stream:is_terminal(Stream) of
         true ->
             State#state{
@@ -1170,7 +1250,10 @@ put_stream(Sid, Stream, Flow, #state{streams = Streams, sendable = Sendable} = S
             };
         false ->
             Sendable1 =
-                case roadrunner_quic_stream:send_pending(Stream) of
+                case
+                    roadrunner_quic_stream:send_pending(Stream) andalso
+                        not roadrunner_quic_stream:send_abandoned(Stream)
+                of
                     true -> ordsets:add_element(Sid, Sendable);
                     false -> ordsets:del_element(Sid, Sendable)
                 end,
@@ -1192,10 +1275,68 @@ deliver_stream(_Sid, _Deliverable, _FinReached, State) ->
 -spec send_pass(integer(), t()) -> {t(), [effect()]}.
 send_pass(Now, State) ->
     {State1, RevSends} = drain_send(Now, State, []),
+    %% Release any parked send reply whose stream drained (or was aborted)
+    %% this pass. The release effects ride AFTER the reversed sends so the
+    %% bytes are on the wire before the worker is told it may send more
+    %% (`perform/3` folds effects left-to-right). This is the single choke
+    %% point: every flow / congestion relief (MAX_STREAM_DATA, MAX_DATA, an
+    %% ACK growing cwnd) runs in the datagram fold before `finish_datagram`
+    %% calls `send_pass`, so the scan here catches them all.
+    {State2, Releases} = release_drained(State1),
     %% `drain_send` returns the send effects newest-first; reverse them into
-    %% order and fold the (single) timer effect onto the end in the same pass,
-    %% rather than a second traversal to append it.
-    {State1, lists:reverse(RevSends, timer_effects(Now, State1))}.
+    %% order and fold the releases + the (single) timer effect onto the end in
+    %% the same pass, rather than a second traversal to append them.
+    {State2, lists:reverse(RevSends, Releases ++ timer_effects(Now, State2))}.
+
+%% Release each parked reply whose stream can no longer make progress toward
+%% draining: the stream is gone (pruned after its FIN flushed -> `ok`), its
+%% send side was abandoned by a reset / STOP_SENDING (`send_abandoned/1` ->
+%% `{error, closed}`, so a streaming worker does not treat the data as sent
+%% and re-send to a dead stream), or it fully drained (`ok`). A stream still
+%% holding unsent bytes stays parked. Each released entry is removed from
+%% `parked`, so a later scan in the same datagram cannot double-reply.
+-spec release_drained(t()) -> {t(), [effect()]}.
+release_drained(#state{parked = Parked, streams = Streams} = State) ->
+    {Parked1, Effects} = maps:fold(
+        fun(Sid, {From, Ref}, {Acc, Eff}) ->
+            case release_result(Sid, Streams) of
+                keep -> {Acc#{Sid => {From, Ref}}, Eff};
+                Result -> {Acc, [{reply, From, Ref, Result} | Eff]}
+            end
+        end,
+        {#{}, []},
+        Parked
+    ),
+    {State#state{parked = Parked1}, Effects}.
+
+%% The reply value for a parked stream id, or `keep` to leave it parked.
+-spec release_result(non_neg_integer(), #{non_neg_integer() => stream()}) ->
+    ok | {error, closed} | keep.
+release_result(Sid, Streams) ->
+    case Streams of
+        #{Sid := {Stream, _Flow}} ->
+            case roadrunner_quic_stream:send_abandoned(Stream) of
+                true ->
+                    {error, closed};
+                false ->
+                    case roadrunner_quic_stream:send_pending(Stream) of
+                        true -> keep;
+                        false -> ok
+                    end
+            end;
+        #{} ->
+            %% Pruned (terminal: its FIN flushed) — the send completed.
+            ok
+    end.
+
+%% Release every parked reply with `Result`, clearing the map. Used by the
+%% connection-teardown paths (draining / closed / owner close / idle) that
+%% skip `send_pass`, so a parked worker unblocks promptly instead of stalling
+%% until its conn monitor fires on the eventual process exit.
+-spec release_all(term(), t()) -> {t(), [effect()]}.
+release_all(Result, #state{parked = Parked} = State) ->
+    Effects = [{reply, From, Ref, Result} || {From, Ref} <- maps:values(Parked)],
+    {State#state{parked = #{}}, Effects}.
 
 %% Build and send one datagram per iteration until nothing is pending or
 %% the anti-amplification budget blocks; roll back the built state if the
@@ -1398,7 +1539,14 @@ handle_timeout(Now, pto, State) ->
     State1 = lists:foldl(fun(Level, S) -> on_pto(Now, Level, S) end, State, present_levels(State)),
     send_pass(Now, State1);
 handle_timeout(_Now, idle, State) ->
-    drain_emits(emit({closed, {local, idle_timeout}}, State#state{phase = closed}));
+    %% Release any parked send reply before the shell tears down, so a parked
+    %% worker unblocks and runs its disconnect path cleanly rather than only
+    %% crashing on the conn-process exit its monitor sees.
+    {State1, Releases} = release_all({error, closed}, State),
+    {State2, EmitEffects} = drain_emits(
+        emit({closed, {local, idle_timeout}}, State1#state{phase = closed})
+    ),
+    {State2, Releases ++ EmitEffects};
 handle_timeout(_Now, drain, State) ->
     %% The drain window elapsed (RFC 9000 §10.2): become closed so the shell
     %% tears the connection down. The owner already learned of the close on entry.

@@ -32,7 +32,14 @@
 
 -export([new/0, receive_data/4, reset/2]).
 -export([
-    enqueue/2, finish/1, next_frame/2, stop_sending/1, send_pending/1, send_offset/1, is_terminal/1
+    enqueue/2,
+    finish/1,
+    next_frame/2,
+    stop_sending/1,
+    send_pending/1,
+    send_abandoned/1,
+    send_offset/1,
+    is_terminal/1
 ]).
 
 -export_type([t/0]).
@@ -60,7 +67,12 @@
     send_fin = false :: boolean(),
     %% Send side: whether a slice carrying the FIN has been produced, so it
     %% is not emitted twice (a retransmit replays the recorded frame).
-    fin_sent = false :: boolean()
+    fin_sent = false :: boolean(),
+    %% Send side: set by stop_sending/1 (a received STOP_SENDING or a local
+    %% reset abandoned the send side). Distinguishes an aborted send from a
+    %% naturally drained one, so a deferred backpressure reply releases with
+    %% an error rather than ok. See `send_abandoned/1`.
+    send_stopped = false :: boolean()
 }).
 
 -opaque t() :: #stream{}.
@@ -181,13 +193,24 @@ nothing more. The loop sends a RESET_STREAM separately.
 """.
 -spec stop_sending(t()) -> t().
 stop_sending(#stream{} = Stream) ->
-    Stream#stream{send_buf = <<>>, send_fin = false}.
+    Stream#stream{send_buf = <<>>, send_fin = false, send_stopped = true}.
 
 -doc "Whether the stream has unsent data or an unsent FIN to send.".
 -spec send_pending(t()) -> boolean().
 send_pending(#stream{fin_sent = true}) -> false;
 send_pending(#stream{send_buf = <<>>, send_fin = false}) -> false;
 send_pending(#stream{}) -> true.
+
+-doc """
+Whether the send side was abandoned rather than drained: the receive side
+was reset by the peer (`aborted`), or the send side was stopped via
+`stop_sending/1` (a received STOP_SENDING or a local reset). A deferred
+backpressure reply on such a stream releases with an error, not `ok`, so a
+streaming worker does not treat the data as delivered and re-send.
+""".
+-spec send_abandoned(t()) -> boolean().
+send_abandoned(#stream{aborted = Aborted, send_stopped = Stopped}) ->
+    Aborted orelse Stopped.
 
 -doc """
 Whether both directions are finished, so the stream can be pruned: the send FIN

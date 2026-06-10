@@ -931,6 +931,215 @@ reset_for_pruned_stream_ignored_test() ->
     {State3, _} = ?M:handle_datagram(?NOW, Rst, State2),
     ?assertEqual(connected, ?M:phase(State3)).
 
+%% --- deferred-ack backpressure (W3): park on a stalled stream, release on
+%% drain or on the stream/connection going away (so the worker never hangs) ---
+
+%% A payload larger than the initial congestion window cannot fully flush in one
+%% pass, so handle_send WITHHOLDS the reply (the worker blocks) while the
+%% credit-permitted bytes still go out. This is the primary backpressure branch.
+stalled_send_parks_reply_test() ->
+    {State, _ClientApSecret, ServerApSecret} = connect_owned(),
+    Ref = make_ref(),
+    Payload = binary:copy(~"x", 100000),
+    {_State1, Effects} = ?M:handle_send(self(), Ref, 0, Payload, false, ?NOW, State),
+    ?assertEqual([], replies_for(Effects, Ref)),
+    ?assertNotEqual([], sent_stream_frames(Effects, ServerApSecret)).
+
+%% A small send that fully drains in one pass is NOT parked: it replies ok
+%% immediately, exactly as before the fix (the healthy/common path).
+small_send_not_parked_test() ->
+    {State, _ClientApSecret, _ServerApSecret} = connect_owned(),
+    Ref = make_ref(),
+    {_State1, Effects} = ?M:handle_send(self(), Ref, 0, ~"hi", true, ?NOW, State),
+    ?assertEqual([ok], replies_for(Effects, Ref)).
+
+%% A control-stream send (server-uni, Sid 3) is NEVER parked even when it cannot
+%% fully flush — the conn-loop owner writes there synchronously and must not
+%% block.
+server_uni_send_not_parked_test() ->
+    {State, _ClientApSecret, _ServerApSecret} = connect_owned(),
+    Ref = make_ref(),
+    Payload = binary:copy(~"x", 100000),
+    {_State1, Effects} = ?M:handle_send(self(), Ref, 3, Payload, false, ?NOW, State),
+    ?assertEqual([ok], replies_for(Effects, Ref)).
+
+%% Growing the congestion window with a cumulative ACK drains the parked bytes
+%% and releases the deferred reply with ok — the release scan sits after
+%% process_ack in the same datagram fold, so the ACK-only credit path is covered.
+parked_reply_released_on_ack_credit_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Ref = make_ref(),
+    Payload = binary:copy(~"x", 13000),
+    {State1, E1} = ?M:handle_send(self(), Ref, 0, Payload, false, ?NOW, State),
+    ?assertEqual([], replies_for(E1, Ref)),
+    Largest = largest_app_pn(E1, ServerApSecret),
+    Ack = app_datagram([{ack, Largest, 0, Largest, [], undefined}], 0, ClientApSecret),
+    {_State2, E2} = ?M:handle_datagram(?NOW, Ack, State1),
+    ?assertEqual([ok], replies_for(E2, Ref)).
+
+%% A peer RESET_STREAM while parked releases the reply with {error, closed} (not
+%% ok), so a streaming worker does not treat the data as sent and re-send.
+parked_reply_released_on_peer_reset_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    Ref = make_ref(),
+    Payload = binary:copy(~"x", 100000),
+    {State1, E1} = ?M:handle_send(self(), Ref, 0, Payload, false, ?NOW, State),
+    ?assertEqual([], replies_for(E1, Ref)),
+    Reset = app_datagram([{reset_stream, 0, 7, 0}], 0, ClientApSecret),
+    {_State2, E2} = ?M:handle_datagram(?NOW, Reset, State1),
+    ?assertEqual([{error, closed}], replies_for(E2, Ref)).
+
+%% A peer STOP_SENDING while parked clears our send side and releases with
+%% {error, closed} (closing the pre-existing no-handler hang), and surfaces a
+%% stream reset to the owner so a response worker stops.
+parked_reply_released_on_peer_stop_sending_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    Ref = make_ref(),
+    Payload = binary:copy(~"x", 100000),
+    {State1, E1} = ?M:handle_send(self(), Ref, 0, Payload, false, ?NOW, State),
+    ?assertEqual([], replies_for(E1, Ref)),
+    Stop = app_datagram([{stop_sending, 0, 7}], 0, ClientApSecret),
+    {_State2, E2} = ?M:handle_datagram(?NOW, Stop, State1),
+    ?assertEqual([{error, closed}], replies_for(E2, Ref)),
+    ?assert(lists:member({stream_reset, 0, 7}, [Ev || {emit, _Owner, Ev} <- E2])).
+
+%% A local reset (handle_call {reset_stream, _}) while a send on that stream is
+%% parked releases the parked reply with {error, closed}; it clears send_buf, so
+%% without the send_abandoned guard the generic drain scan would wrongly reply ok.
+parked_reply_released_on_local_reset_test() ->
+    {State, _ClientApSecret, _ServerApSecret} = connect_owned(),
+    Ref = make_ref(),
+    Payload = binary:copy(~"x", 100000),
+    {State1, E1} = ?M:handle_send(self(), Ref, 0, Payload, false, ?NOW, State),
+    ?assertEqual([], replies_for(E1, Ref)),
+    {_State2, E2} = ?M:handle_call(self(), make_ref(), {reset_stream, 0, 7}, ?NOW, State1),
+    ?assertEqual([{error, closed}], replies_for(E2, Ref)).
+
+%% A peer CONNECTION_CLOSE while parked drains every parked reply with
+%% {error, closed} (the draining transition skips the send pass), so the worker
+%% unblocks promptly instead of stalling the drain window.
+parked_reply_released_on_draining_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    Ref = make_ref(),
+    Payload = binary:copy(~"x", 100000),
+    {State1, E1} = ?M:handle_send(self(), Ref, 0, Payload, false, ?NOW, State),
+    ?assertEqual([], replies_for(E1, Ref)),
+    Close = app_datagram(
+        [{connection_close, application, 9, undefined, <<>>}], 0, ClientApSecret
+    ),
+    {State2, E2} = ?M:handle_datagram(?NOW, Close, State1),
+    ?assertEqual(draining, ?M:phase(State2)),
+    ?assertEqual([{error, closed}], replies_for(E2, Ref)).
+
+%% An owner close while parked releases the parked reply with {error, closed}.
+parked_reply_released_on_owner_close_test() ->
+    {State, _ClientApSecret, _ServerApSecret} = connect_owned(),
+    Ref = make_ref(),
+    Payload = binary:copy(~"x", 100000),
+    {State1, E1} = ?M:handle_send(self(), Ref, 0, Payload, false, ?NOW, State),
+    ?assertEqual([], replies_for(E1, Ref)),
+    {State2, E2} = ?M:handle_call(self(), make_ref(), {close, 16#0100}, ?NOW, State1),
+    ?assertEqual(draining, ?M:phase(State2)),
+    ?assertEqual([{error, closed}], replies_for(E2, Ref)).
+
+%% An idle timeout while parked releases the parked reply with {error, closed}.
+parked_reply_released_on_idle_timeout_test() ->
+    {State, _ClientApSecret, _ServerApSecret} = connect_owned(),
+    Ref = make_ref(),
+    Payload = binary:copy(~"x", 100000),
+    {State1, E1} = ?M:handle_send(self(), Ref, 0, Payload, false, ?NOW, State),
+    ?assertEqual([], replies_for(E1, Ref)),
+    {State2, E2} = ?M:handle_timeout(?NOW, idle, State1),
+    ?assertEqual(closed, ?M:phase(State2)),
+    ?assertEqual([{error, closed}], replies_for(E2, Ref)).
+
+%% A parked reply stays parked across a send pass that drains some but not all
+%% of the buffer — backpressure holds until the buffer fully drains.
+parked_reply_kept_while_still_draining_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Ref = make_ref(),
+    Payload = binary:copy(~"x", 100000),
+    {State1, E1} = ?M:handle_send(self(), Ref, 0, Payload, false, ?NOW, State),
+    ?assertEqual([], replies_for(E1, Ref)),
+    Largest = largest_app_pn(E1, ServerApSecret),
+    Ack = app_datagram([{ack, Largest, 0, Largest, [], undefined}], 0, ClientApSecret),
+    {_State2, E2} = ?M:handle_datagram(?NOW, Ack, State1),
+    %% One ACK grows the window by far less than the 100000-byte payload, so the
+    %% reply is still withheld.
+    ?assertEqual([], replies_for(E2, Ref)).
+
+%% A STOP_SENDING for a stream the server holds no send state for is ignored.
+stop_sending_for_untracked_stream_ignored_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    Stop = app_datagram([{stop_sending, 8, 7}], 0, ClientApSecret),
+    {State1, _Effects} = ?M:handle_datagram(?NOW, Stop, State),
+    ?assertEqual(connected, ?M:phase(State1)).
+
+%% The final FIN-carrying push parks under the congestion window, then releases
+%% ok once the window opens; the FIN reaches the wire (loop termination does not
+%% deadlock).
+parked_fin_push_released_on_drain_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Ref = make_ref(),
+    Payload = binary:copy(~"x", 13000),
+    {State1, E1} = ?M:handle_send(self(), Ref, 0, Payload, true, ?NOW, State),
+    ?assertEqual([], replies_for(E1, Ref)),
+    Largest = largest_app_pn(E1, ServerApSecret),
+    Ack = app_datagram([{ack, Largest, 0, Largest, [], undefined}], 0, ClientApSecret),
+    {_State2, E2} = ?M:handle_datagram(?NOW, Ack, State1),
+    ?assertEqual([ok], replies_for(E2, Ref)),
+    ?assert(
+        lists:any(
+            fun
+                ({stream, 0, _, _, true}) -> true;
+                (_) -> false
+            end,
+            sent_stream_frames(E2, ServerApSecret)
+        )
+    ).
+
+%% After a peer RESET_STREAM, the server must NOT re-send STREAM frames on the
+%% aborted stream even once the window opens (the aborted stream leaves the
+%% sendable set despite its buffered bytes).
+peer_reset_does_not_resend_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Payload = binary:copy(~"x", 100000),
+    {State1, E1} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
+    Largest = largest_app_pn(E1, ServerApSecret),
+    Reset = app_datagram([{reset_stream, 0, 7, 0}], 0, ClientApSecret),
+    {State2, _E2} = ?M:handle_datagram(?NOW, Reset, State1),
+    %% An ACK grows cwnd and frees the in-flight bytes; a non-aborted stream
+    %% would re-send here, but the aborted stream must stay silent.
+    Ack = app_datagram([{ack, Largest, 0, Largest, [], undefined}], 1, ClientApSecret),
+    {_State3, E3} = ?M:handle_datagram(?NOW, Ack, State2),
+    ?assertEqual([], sent_stream_frames(E3, ServerApSecret)).
+
+%% A send on an already-aborted stream replies {error, closed} at once (it does
+%% not park on a dead stream waiting for credit that will never come).
+send_on_aborted_stream_replies_error_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    {State1, _E1} = ?M:handle_send(self(), make_ref(), 0, ~"hi", false, ?NOW, State),
+    Reset = app_datagram([{reset_stream, 0, 7, 0}], 0, ClientApSecret),
+    {State2, _E2} = ?M:handle_datagram(?NOW, Reset, State1),
+    Ref = make_ref(),
+    {_State3, E3} = ?M:handle_send(self(), Ref, 0, ~"more", false, ?NOW, State2),
+    ?assertEqual([{error, closed}], replies_for(E3, Ref)).
+
+%% A parked reply is released exactly once: after the release, a later send pass
+%% does not emit a second {quic_reply} for the same Ref.
+parked_reply_not_double_released_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    Ref = make_ref(),
+    Payload = binary:copy(~"x", 100000),
+    {State1, E1} = ?M:handle_send(self(), Ref, 0, Payload, false, ?NOW, State),
+    ?assertEqual([], replies_for(E1, Ref)),
+    Reset = app_datagram([{reset_stream, 0, 7, 0}], 0, ClientApSecret),
+    {State2, E2} = ?M:handle_datagram(?NOW, Reset, State1),
+    ?assertEqual([{error, closed}], replies_for(E2, Ref)),
+    Ack = app_datagram([{ack, 0, 0, 0, [], undefined}], 1, ClientApSecret),
+    {_State3, E3} = ?M:handle_datagram(?NOW, Ack, State2),
+    ?assertEqual([], replies_for(E3, Ref)).
+
 %% As the peer opens bidi streams toward the advertised limit (test TP = 3), the
 %% server raises the limit and sends MAX_STREAMS so the peer can keep opening
 %% request streams (RFC 9000 §4.6). The first open is still within credit (no
@@ -1320,6 +1529,11 @@ sent_app_frames(Effects, ServerApSecret) ->
 
 emits(Effects) ->
     [Emit || {emit, _Owner, _Event} = Emit <- Effects].
+
+%% The reply results addressed to a given send Ref (a parked send emits none
+%% until released; a released one emits exactly one).
+replies_for(Effects, Ref) ->
+    [Result || {reply, _From, R, Result} <- Effects, R =:= Ref].
 
 %% The largest 1-RTT packet number among the server's sent datagrams, decoded
 %% with the server's application keys; used to acknowledge what is in flight.
