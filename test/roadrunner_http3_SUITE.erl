@@ -31,6 +31,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     loop_conn_close_stops_worker/1,
     loop_stream_reset_delivers_disconnect/1,
     loop_push_flushes_per_event/1,
+    loop_backpressure_reset_while_parked/1,
     stream_response/1,
     stream_trailers/1,
     stream_autoclose/1,
@@ -99,6 +100,7 @@ all() ->
         loop_conn_close_stops_worker,
         loop_stream_reset_delivers_disconnect,
         loop_push_flushes_per_event,
+        loop_backpressure_reset_while_parked,
         stream_response,
         stream_trailers,
         stream_autoclose,
@@ -395,6 +397,32 @@ loop_push_flushes_per_event(Config) ->
     Worker ! {push, ~"e2"},
     _Acc2 = await_stream_bytes(Conn, StreamId, ~"data: e2\n\n", Acc1),
     Worker ! stop,
+    close(Conn).
+
+loop_backpressure_reset_while_parked(Config) ->
+    %% A loop worker blocked on a Push under a stalled per-stream send window
+    %% (the deferred-ack backpressure) is released and disconnected when the
+    %% client resets the stream — it does not hang in send_data forever.
+    Conn = connect(?config(port, Config), #{stream_window => 2000}),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/loop")),
+    Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
+    true = register(roadrunner_h3_loop_observer, self()),
+    WorkerRef = monitor(process, Worker),
+    %% A push far larger than the 2000-byte per-stream window parks the worker
+    %% (the client withholds MAX_STREAM_DATA, so it cannot drain).
+    Worker ! {push, binary:copy(~"x", 16000)},
+    ok = roadrunner_quic_test_h3:cancel(Conn, StreamId),
+    receive
+        {handler_disconnect, Reason} -> ?assertEqual(reset, Reason)
+    after 5000 ->
+        ct:fail(disconnect_not_delivered)
+    end,
+    receive
+        {'DOWN', WorkerRef, process, Worker, _} -> ok
+    after 5000 ->
+        ct:fail(loop_worker_did_not_exit)
+    end,
+    true = unregister(roadrunner_h3_loop_observer),
     close(Conn).
 
 %% Accumulate the stream's raw bytes until they contain `Needle` (the SSE
@@ -1150,6 +1178,10 @@ udp_occupied_tcp_free_port() ->
 
 connect(Port) ->
     {ok, Conn} = roadrunner_quic_test_h3:connect({127, 0, 0, 1}, Port),
+    Conn.
+
+connect(Port, Opts) ->
+    {ok, Conn} = roadrunner_quic_test_h3:connect({127, 0, 0, 1}, Port, Opts),
     Conn.
 
 try_connect(Port) ->

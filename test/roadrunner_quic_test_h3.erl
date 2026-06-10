@@ -15,9 +15,10 @@
 %% send_data, collect) are offered, so a test can interleave work between the
 %% request and the response.
 
--export([connect/2, close/1]).
+-export([connect/2, connect/3, close/1]).
 -export([get/2, post/3, request/3]).
 -export([open_request/2, open_request/3, send_data/4, collect/2, cancel/2, get_peer_settings/1]).
+-export([grant_stream_credit/3]).
 
 -define(COLLECT_TIMEOUT, 5000).
 %% RFC 9114 §8.1 H3_REQUEST_CANCELLED.
@@ -34,7 +35,16 @@ with a SETTINGS frame. Returns the underlying connection handle.
 -spec connect(inet:ip_address() | inet:hostname(), inet:port_number()) ->
     {ok, pid()} | {error, term()}.
 connect(Host, Port) ->
-    case roadrunner_quic_test_conn:connect(Host, Port) of
+    connect(Host, Port, #{}).
+
+-doc """
+As `connect/2` but with `Opts` passed to the underlying QUIC connection
+(e.g. `stream_window => N` to advertise a small per-stream window).
+""".
+-spec connect(inet:ip_address() | inet:hostname(), inet:port_number(), map()) ->
+    {ok, pid()} | {error, term()}.
+connect(Host, Port, Opts) ->
+    case roadrunner_quic_test_conn:connect(Host, Port, Opts) of
         {ok, Conn} ->
             Control = roadrunner_quic_test_conn:open_uni(Conn),
             ok = roadrunner_quic_test_conn:send(Conn, Control, control_with_settings(), false),
@@ -42,6 +52,11 @@ connect(Host, Port) ->
         {error, _} = Error ->
             Error
     end.
+
+-doc "Grant `StreamId` more send credit (MAX_STREAM_DATA) so a stalled server resumes.".
+-spec grant_stream_credit(pid(), non_neg_integer(), non_neg_integer()) -> ok.
+grant_stream_credit(Conn, StreamId, MaxStreamData) ->
+    roadrunner_quic_test_conn:grant_stream_credit(Conn, StreamId, MaxStreamData).
 
 -doc "Close the connection.".
 -spec close(pid()) -> ok.

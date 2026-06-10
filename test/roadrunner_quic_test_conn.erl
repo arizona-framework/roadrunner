@@ -31,7 +31,17 @@
 
 -include_lib("public_key/include/public_key.hrl").
 
--export([connect/2, close/1, open_bidi/1, open_uni/1, send/4, reset_stream/3, stop_sending/3]).
+-export([
+    connect/2,
+    connect/3,
+    close/1,
+    open_bidi/1,
+    open_uni/1,
+    send/4,
+    reset_stream/3,
+    stop_sending/3,
+    grant_stream_credit/3
+]).
 
 %% v1 connection-id length and signature scheme (the test cert is RSA).
 -define(CID_LEN, 8).
@@ -105,9 +115,19 @@ HANDSHAKE_DONE arrives) or the handshake fails. Returns the connection pid.
 -spec connect(inet:ip_address() | inet:hostname(), inet:port_number()) ->
     {ok, pid()} | {error, term()}.
 connect(Host, Port) ->
+    connect(Host, Port, #{}).
+
+-doc """
+As `connect/2` but with `Opts`. `stream_window => N` advertises a small
+per-stream flow-control window so a test can exercise stream-level
+backpressure on the server (default 800000).
+""".
+-spec connect(inet:ip_address() | inet:hostname(), inet:port_number(), map()) ->
+    {ok, pid()} | {error, term()}.
+connect(Host, Port, Opts) ->
     Ref = make_ref(),
     Parent = self(),
-    {Pid, Mon} = spawn_monitor(fun() -> init(Parent, Ref, Host, Port) end),
+    {Pid, Mon} = spawn_monitor(fun() -> init(Parent, Ref, Host, Port, Opts) end),
     receive
         {Ref, connected} ->
             erlang:demonitor(Mon, [flush]),
@@ -169,6 +189,15 @@ reset_stream(Pid, StreamId, ErrorCode) ->
 stop_sending(Pid, StreamId, ErrorCode) ->
     cast_frame(Pid, {stop_sending, StreamId, ErrorCode}).
 
+-doc """
+Grant `StreamId` more send credit by sending a MAX_STREAM_DATA raising its
+limit to `MaxStreamData` (RFC 9000 §19.10), so a server stalled on a small
+per-stream window resumes sending.
+""".
+-spec grant_stream_credit(pid(), non_neg_integer(), non_neg_integer()) -> ok.
+grant_stream_credit(Pid, StreamId, MaxStreamData) ->
+    cast_frame(Pid, {max_stream_data, StreamId, MaxStreamData}).
+
 cast_frame(Pid, Frame) ->
     Ref = make_ref(),
     Pid ! {frame, self(), Ref, Frame},
@@ -191,13 +220,17 @@ call(Pid, Request) ->
 %% Handshake
 %% =============================================================================
 
--spec init(pid(), reference(), inet:ip_address() | inet:hostname(), inet:port_number()) -> ok.
-init(Parent, Ref, Host, Port) ->
+-spec init(pid(), reference(), inet:ip_address() | inet:hostname(), inet:port_number(), map()) ->
+    ok.
+init(Parent, Ref, Host, Port, Opts) ->
     {ok, Socket} = roadrunner_quic_socket:open(0),
     Dcid0 = crypto:strong_rand_bytes(?CID_LEN),
     Scid = crypto:strong_rand_bytes(?CID_LEN),
     {EphPub, EphPriv} = crypto:generate_key(ecdh, x25519),
-    ChFramed = roadrunner_quic_test_client:client_hello_framed(?SIG_SCHEME, EphPub, Scid),
+    StreamWindow = maps:get(stream_window, Opts, 800000),
+    ChFramed = roadrunner_quic_test_client:client_hello_framed(
+        ?SIG_SCHEME, EphPub, Scid, StreamWindow
+    ),
     %% Send the Initial carrying the ClientHello (padded to 1200 by seal/6).
     ClientInitialKeys = roadrunner_quic_keys:initial_client(Dcid0),
     Initial = roadrunner_quic_test_client:seal(

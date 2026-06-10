@@ -30,6 +30,8 @@
 %% Exported for `roadrunner_conn_loop_http3` to emit a buffered
 %% response (e.g. 413) directly, without spawning a worker.
 -export([send_buffered/5]).
+%% Exported for eunit branch coverage of the stop-on-send-error path.
+-export([sendfile_loop/3]).
 
 %% RFC 9114 §7.2.1: the DATA frame type is 0x00. We frame the body by
 %% hand (type + length varints, then the body by reference) instead of
@@ -356,8 +358,14 @@ sendfile_loop(IoDev, Remaining, Send) ->
             _ = Send(Bin, fin),
             ok;
         NextRemaining ->
-            _ = Send(Bin, nofin),
-            sendfile_loop(IoDev, NextRemaining, Send)
+            %% Stop if the chunk could not be sent (the stream was reset /
+            %% the conn closed). Continuing would re-`Push` to a gone stream,
+            %% which the conn would recreate — read the rest only while the
+            %% wire is live.
+            case Send(Bin, nofin) of
+                ok -> sendfile_loop(IoDev, NextRemaining, Send);
+                {error, _} -> ok
+            end
     end.
 
 %% `{loop, ...}` response: HEADERS (no FIN), then a message-receive loop
