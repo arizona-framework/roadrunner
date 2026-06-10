@@ -69,10 +69,12 @@ only). Remaining work:
 ## Native QUIC transport follow-ups
 
 The HTTP/3 path runs on the native `roadrunner_quic_*` stack end to end, with no
-`quic` dependency in any profile (production deps are just `telemetry`, and the
-test profile drives the server with a native QUIC client). The RFC MUSTs a
-browser depends on are implemented; the items below are conformance hardening
-and transport completeness that a real browser GET / POST does not need.
+`quic` dependency in production or test (production deps are just `telemetry`,
+and the test profile drives the server with a native QUIC client); the `quic`
+dep is kept in the bench profile only, as an HTTP/3 comparison server. The RFC
+MUSTs a browser depends on are implemented; the items below are conformance
+hardening and transport completeness that a real browser GET / POST does not
+need.
 
 ### SHOULD/MAY conformance — harden against non-conformant peers
 
