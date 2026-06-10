@@ -346,6 +346,26 @@ variance). Eyeball-from-summary covers the v1 use case.
 **Scope:** medium. The parser, distribution stats, baseline storage, and
 presentation are the bulk; the artifact upload already ships.
 
+### Extend the erlang_quic h3 comparison past the small-response scenarios
+
+**What:** `bench_erlang_quic_server` serves the GET-side h3 scenarios (hello,
+json, large_response, headers_heavy, head_method, cookies_heavy) as the
+`erlang_quic` comparison target, but two gaps remain. `large_response` does not
+yield a usable number: the dep server stalls mid-download (CPU ~300%, err=50 at
+the deadline) because the native loadgen (`roadrunner_quic_test_conn`) sustains
+downloads from roadrunner's own server but not from the dep, so it needs to grant
+per-stream `MAX_STREAM_DATA`, not just connection-level `MAX_DATA`. `echo` and
+`multi_request_body` are filtered out (a preflight drops `erlang_quic` for them):
+the dep's 5-arg handler exposes no POST body, so echoing one needs the dep's
+`set_stream_handler` body-receive path.
+
+**Why deferred:** the five small-response scenarios compare cleanly, and the dep
+is bench-only tooling on its way out; the bulk-transfer and upload comparisons
+are the remaining gaps.
+
+**Scope:** small for `large_response` (loadgen per-stream credit grant),
+small-medium for the POST scenarios (dep body-receive wiring).
+
 ### h2 manual-mode body reading
 
 **What:** Parity with the h1 manual-mode body reader for h2 streams
