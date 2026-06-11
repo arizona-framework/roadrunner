@@ -52,7 +52,7 @@
 %% | `{sendfile, _}` | yes (chunked DATA via the stream-response engine) |
 %% | `{websocket, _, _}` | 501 (Phase H13) |
 
--export([enter/5]).
+-export([enter/6]).
 
 %% Hibernate continuation — invoked via `erlang:hibernate/3` when an
 %% idle conn parks past `hibernate_after`. Must stay exported so the
@@ -205,42 +205,42 @@
     conn_send_window = 65535 :: integer(),
     conn_recv_window = 65535 :: non_neg_integer(),
     %% Configured peaks + refill threshold. Read from proto_opts at
-    %% `enter/5`. See the `?DEFAULT_*` macros above for the policy
+    %% `enter/6`. See the `?DEFAULT_*` macros above for the policy
     %% baseline + the listener moduledoc for the override knobs.
     recv_window_peak = ?DEFAULT_CONN_RECV_WINDOW :: pos_integer(),
     stream_recv_window_peak = ?DEFAULT_STREAM_RECV_WINDOW :: pos_integer(),
     recv_window_threshold = ?DEFAULT_WINDOW_REFILL_THRESHOLD :: pos_integer(),
     %% Max concurrent client-initiated streams: advertised in our SETTINGS
-    %% and enforced in `on_headers/5`. Read from proto_opts at `enter/5`.
+    %% and enforced in `on_headers/5`. Read from proto_opts at `enter/6`.
     max_concurrent_streams = ?MAX_CONCURRENT_STREAMS :: pos_integer(),
     %% Cumulative HEADERS+CONTINUATION block cap (CONTINUATION-flood guard).
-    %% Read from proto_opts at `enter/5`.
+    %% Read from proto_opts at `enter/6`.
     max_header_block = ?MAX_HEADER_BLOCK :: pos_integer(),
     %% Request-body cap (`max_content_length` listener opt); an over-cap
     %% body answers 413 + RST_STREAM(NO_ERROR). Read from proto_opts at
-    %% `enter/5`.
+    %% `enter/6`.
     max_content_length = ?DEFAULT_MAX_CONTENT_LENGTH :: non_neg_integer(),
     %% Decoded header-list cap (RFC 9113 §6.5.2 SETTINGS_MAX_HEADER_LIST_SIZE):
     %% advertised in our SETTINGS and enforced after HPACK decode in
-    %% `finalize_headers/2`. Read from proto_opts at `enter/5`.
+    %% `finalize_headers/2`. Read from proto_opts at `enter/6`.
     max_header_list_size = ?DEFAULT_MAX_HEADER_LIST_SIZE :: pos_integer(),
     %% `proto_opts.hibernate_after`, or 0 when unset (the common case).
     %% When > 0 and no streams are in flight, the idle-wait path parks
-    %% for this window and hibernates. Read from proto_opts at `enter/5`.
+    %% for this window and hibernates. Read from proto_opts at `enter/6`.
     hibernate_after = 0 :: non_neg_integer(),
-    %% Read-deadline caps, cached once at `enter/5` so the per-iteration
+    %% Read-deadline caps, cached once at `enter/6` so the per-iteration
     %% handshake/idle waits read a record field instead of re-reading
     %% persistent_term every loop. The persistent_term override (a test
-    %% hook) is captured at `enter/5`, so it must be set before connect.
+    %% hook) is captured at `enter/6`, so it must be set before connect.
     handshake_timeout = ?HANDSHAKE_TIMEOUT_DEFAULT :: non_neg_integer(),
     idle_timeout = ?IDLE_TIMEOUT_DEFAULT :: non_neg_integer(),
     %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
     %% Prepended to every response by `roadrunner_http:auto_headers/2`.
-    %% Read from proto_opts at `enter/5`.
+    %% Read from proto_opts at `enter/6`.
     alt_svc = undefined :: binary() | undefined,
     %% In-flight-request slot accounting (cross-listener cap). `infinity`
     %% (default) disables it; `inflight_counter` is the shared gauge.
-    %% Read from proto_opts at `enter/5` so the per-stream acquire/release
+    %% Read from proto_opts at `enter/6` so the per-stream acquire/release
     %% passes them to `roadrunner_conn` directly. See `dispatch_stream/2`.
     max_concurrent_requests = infinity :: infinity | pos_integer(),
     inflight_counter :: counters:counters_ref() | undefined,
@@ -270,15 +270,20 @@
 Top-level entry from the HTTP/1.1 dispatch fork. Owns the socket
 from this point on; takes responsibility for releasing the listener
 slot and firing `[roadrunner, listener, conn_close]` telemetry.
+
+`Buffered` seeds the connection's initial read buffer — the bytes a
+coalesced TCP segment carried after a stripped PROXY-protocol header
+(which may be the start of the client preface). Empty for the normal path.
 """.
 -spec enter(
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),
     atom(),
     {inet:ip_address(), inet:port_number()} | undefined,
-    integer()
+    integer(),
+    binary()
 ) -> no_return().
-enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
+enter(Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered) ->
     proc_lib:set_label({roadrunner_conn_loop_http2, ListenerName, Peer}),
     Scheme = roadrunner_conn:scheme(Socket),
     {Data, Closed, Error} = roadrunner_transport:messages(Socket),
@@ -316,6 +321,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono) ->
         msg_error = Error,
         hpack_dec = roadrunner_http2_hpack:new_decoder(?HPACK_TABLE_SIZE),
         hpack_enc = roadrunner_http2_hpack:new_encoder(?HPACK_TABLE_SIZE),
+        buffer = Buffered,
         recv_window_peak = ConnPeak,
         stream_recv_window_peak = StreamPeak,
         recv_window_threshold = Threshold,

@@ -186,6 +186,7 @@ proto_opts(ListenerName, Counter) ->
         rejected_counter => atomics:new(1, [{signed, false}]),
         min_bytes_per_second => 0,
         body_buffering => auto,
+        proxy_protocol => false,
         listener_name => ListenerName,
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity

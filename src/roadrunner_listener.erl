@@ -213,6 +213,12 @@ ops-tuning rationale.
     %% WebSocket) still rely on this — keep `true` if your handlers
     %% have those.
     graceful_drain => boolean(),
+    %% Opt in to the PROXY protocol (HAProxy v1 text / v2 binary). When `true`,
+    %% the connection reads and strips the header an L4 balancer prepends before
+    %% the first byte, so `roadrunner_req:peer/1` is the real client. TCP-only:
+    %% rejected on an HTTP/3-only listener. Trust it only behind a balancer that
+    %% always prepends the header (otherwise a direct peer can spoof its IP).
+    proxy_protocol => boolean(),
     %% When set, the per-connection process auto-hibernates after
     %% `Ms` milliseconds of idle main-loop time. Most useful for
     %% long-lived keep-alive HTTP/1.1 connections that mostly sit
@@ -937,6 +943,20 @@ spawn_acceptors_loop(LSocket, ProtoOpts, I, N) ->
     {ok, _Pid} = roadrunner_acceptor:start_link(LSocket, ProtoOpts, I),
     spawn_acceptors_loop(LSocket, ProtoOpts, I + 1, N).
 
+%% Validate the opt-in `proxy_protocol` listener opt. It is a TCP-stream
+%% feature (an L4 balancer prepends the header before the first byte), so it
+%% conflicts with an HTTP/3-only (UDP) listener; on a mixed `[http1, http3]`
+%% listener the TCP side honors it and h3 ignores it.
+-spec validate_proxy_protocol(term(), [http1 | http2 | http3, ...]) -> boolean().
+validate_proxy_protocol(false, _Protocols) ->
+    false;
+validate_proxy_protocol(true, [http3]) ->
+    error({listener_opt_conflict, proxy_protocol, true, no_tcp_listener});
+validate_proxy_protocol(true, _Protocols) ->
+    true;
+validate_proxy_protocol(Other, _Protocols) ->
+    error({invalid_listener_opt, proxy_protocol, Other}).
+
 -spec build_proto_opts(opts(), atom()) -> roadrunner_conn:proto_opts().
 build_proto_opts(Opts, ListenerName) ->
     %% Validate + normalize the `protocols` list. Public input may
@@ -1001,6 +1021,9 @@ build_proto_opts(Opts, ListenerName) ->
             graceful_drain => maps:get(graceful_drain, Opts, true),
             handler_spawn_opts => HandlerSpawnOpts,
             handler_start_timeout => HandlerStartTimeout,
+            proxy_protocol => validate_proxy_protocol(
+                maps:get(proxy_protocol, Opts, false), Protocols
+            ),
             protocols => Protocols
         }),
         ProtoFlats

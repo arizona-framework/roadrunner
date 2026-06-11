@@ -461,6 +461,13 @@ delivered this request.
 connection. Returns `undefined` when the request map has no peer
 field (e.g. constructed manually outside the connection pipeline) or
 when the OS call failed at accept time.
+
+On a listener with `proxy_protocol => true` this is the client address
+the upstream balancer reported in its PROXY-protocol header, not the
+balancer's socket address. **Trust it only behind a balancer that always
+prepends the header** — the inverse of the `forwarded_for/1` warning: the
+opt is opt-in precisely because trusting a PROXY header from a peer that
+can reach the listener directly would let that peer spoof its own address.
 """.
 -spec peer(request()) ->
     {inet:ip_address(), inet:port_number()} | undefined.
