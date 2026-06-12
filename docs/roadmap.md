@@ -508,21 +508,7 @@ The continuation-middleware model (`call(Req, Next, State)`, configured
 per entry via `{Module, State}`) makes browser-facing and abuse-control
 concerns composable at the listener or per-route level. Each is
 boilerplate every public service rewrites today; shipping configurable,
-default-safe versions removes it. None is wired yet.
-
-### CORS middleware — small-medium
-
-**What:** A configurable `roadrunner_cors` middleware: origin allowlist
-or predicate, allowed methods and headers, credentials, exposed headers,
-max-age, an `OPTIONS` preflight short-circuit with the right
-`Access-Control-*` headers, and a cache-correct `Vary: Origin`.
-
-**Why deferred:** every browser-facing service needs it, but the exact
-policy is app-specific, so it stays unwired until a real caller drives
-the shape rather than a guess. The middleware slot is ready.
-
-**Scope:** small-medium. The preflight branch plus header echoing is the
-bulk; `Vary` correctness mirrors `roadrunner_compress`.
+default-safe versions removes it.
 
 ### Conditional requests for dynamic responses — small
 
