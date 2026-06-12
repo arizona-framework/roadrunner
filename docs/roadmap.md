@@ -524,19 +524,6 @@ the shape rather than a guess. The middleware slot is ready.
 **Scope:** small-medium. The preflight branch plus header echoing is the
 bulk; `Vary` correctness mirrors `roadrunner_compress`.
 
-### Security-headers middleware — small
-
-**What:** A `roadrunner_security_headers` middleware that applies a
-default-safe set on every response: `X-Content-Type-Options: nosniff`,
-frame options, referrer policy, `Strict-Transport-Security` on TLS
-listeners, and opt-in CSP. Every value overridable; a header the handler
-already set wins.
-
-**Why deferred:** trivial to hand-roll, but it is the same dozen lines in
-every service; a curated default earns its keep once one service asks.
-
-**Scope:** small.
-
 ### Conditional requests for dynamic responses — small
 
 **What:** A `roadrunner_etag` middleware that derives a (strong or weak)
