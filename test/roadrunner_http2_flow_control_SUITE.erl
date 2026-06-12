@@ -428,7 +428,7 @@ start_conn(Handler, Extra) ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_flow_test, undefined, erlang:monotonic_time()
+            Sock, ProtoOpts, h2_flow_test, undefined, erlang:monotonic_time(), <<>>
         )
     end),
     Ref = monitor(process, Pid),

@@ -453,6 +453,33 @@ listener_rejects_h1_and_h2_on_plain_tcp_test() ->
         [[http1, http2], [http2, http1]]
     ).
 
+listener_rejects_invalid_proxy_protocol_test() ->
+    %% `proxy_protocol` must be a boolean.
+    process_flag(trap_exit, true),
+    R = roadrunner_listener:start_link(listener_test_proxy_invalid, #{
+        port => 0,
+        protocols => [http1],
+        proxy_protocol => yes_please,
+        routes => roadrunner_hello_handler
+    }),
+    ?assertMatch({error, {{invalid_listener_opt, proxy_protocol, yes_please}, _Stack}}, R).
+
+listener_rejects_proxy_protocol_on_http3_only_test() ->
+    %% PROXY protocol is a TCP-stream feature (an L4 balancer prepends it before
+    %% the first byte); enabling it on an HTTP/3-only (UDP) listener conflicts.
+    %% h3 requires TLS, so supply a cert to get past that check to this one.
+    process_flag(trap_exit, true),
+    R = roadrunner_listener:start_link(listener_test_proxy_h3_only, #{
+        port => 0,
+        protocols => [http3],
+        proxy_protocol => true,
+        tls => roadrunner_test_certs:server_opts(),
+        routes => roadrunner_hello_handler
+    }),
+    ?assertMatch(
+        {error, {{listener_opt_conflict, proxy_protocol, true, no_tcp_listener}, _Stack}}, R
+    ).
+
 listener_rejects_invalid_protocols_value_test() ->
     %% Empty list, unknown atom, duplicates, and non-list shapes all
     %% reject with `{invalid_listener_opt, protocols, _}`.

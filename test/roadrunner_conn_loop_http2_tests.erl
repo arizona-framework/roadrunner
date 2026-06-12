@@ -454,7 +454,7 @@ concurrent_streams_both_dispatch() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_concurrent_test, undefined, erlang:monotonic_time()
+            Sock, ProtoOpts, h2_concurrent_test, undefined, erlang:monotonic_time(), <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -521,6 +521,7 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
         max_clients => 100,
         min_bytes_per_second => 0,
         body_buffering => auto,
+        proxy_protocol => false,
         graceful_drain => false,
         protocols => [http2],
         http2_conn_window => 65535,
@@ -575,6 +576,7 @@ plaintext_listener_without_h2c_stays_h1() ->
         max_clients => 100,
         min_bytes_per_second => 0,
         body_buffering => auto,
+        proxy_protocol => false,
         graceful_drain => false,
         protocols => [http1]
     },
@@ -1202,7 +1204,7 @@ middleware_chain_runs() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_mw_test, undefined, erlang:monotonic_time()
+            Sock, ProtoOpts, h2_mw_test, undefined, erlang:monotonic_time(), <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -1265,7 +1267,7 @@ router_404_returns_not_found() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_404_listener, undefined, erlang:monotonic_time()
+            Sock, ProtoOpts, h2_404_listener, undefined, erlang:monotonic_time(), <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -2124,7 +2126,7 @@ rst_during_stream_response_unwinds_worker() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_rst_during_stream, undefined, erlang:monotonic_time()
+            Sock, ProtoOpts, h2_rst_during_stream, undefined, erlang:monotonic_time(), <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -2205,7 +2207,7 @@ drain_refuses_new_streams() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_drain_test, undefined, erlang:monotonic_time()
+            Sock, ProtoOpts, h2_drain_test, undefined, erlang:monotonic_time(), <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -2261,7 +2263,7 @@ drain_with_in_flight_stream_waits() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_drain_inflight_test, undefined, erlang:monotonic_time()
+            Sock, ProtoOpts, h2_drain_inflight_test, undefined, erlang:monotonic_time(), <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -2324,7 +2326,7 @@ drain_message_is_idempotent() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_drain_dup_test, undefined, erlang:monotonic_time()
+            Sock, ProtoOpts, h2_drain_dup_test, undefined, erlang:monotonic_time(), <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -2377,7 +2379,7 @@ drain_then_peer_rst_exits_via_frame_loop() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_drain_rst_test, undefined, erlang:monotonic_time()
+            Sock, ProtoOpts, h2_drain_rst_test, undefined, erlang:monotonic_time(), <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -2471,7 +2473,7 @@ telemetry_request_stop_fires_for_router_404() ->
                 ready -> ok
             end,
             roadrunner_conn_loop_http2:enter(
-                Sock, ProtoOpts, h2_telem_404, undefined, erlang:monotonic_time()
+                Sock, ProtoOpts, h2_telem_404, undefined, erlang:monotonic_time(), <<>>
             )
         end),
         Ref = monitor(process, Pid),
@@ -2560,7 +2562,7 @@ run_h2_with_compress_middleware(Path, ExtraHeaders) ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_compress_test, undefined, erlang:monotonic_time()
+            Sock, ProtoOpts, h2_compress_test, undefined, erlang:monotonic_time(), <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -3533,7 +3535,7 @@ post_handshake_handler(Handler) ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_strict_test, undefined, erlang:monotonic_time()
+            Sock, ProtoOpts, h2_strict_test, undefined, erlang:monotonic_time(), <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -3669,7 +3671,7 @@ start_http2_conn(Extra) ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, http2_test, undefined, erlang:monotonic_time()
+            Sock, ProtoOpts, http2_test, undefined, erlang:monotonic_time(), <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -3789,7 +3791,7 @@ run_h2_request_with_handler(Handler, Path) ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_handler_test, undefined, erlang:monotonic_time()
+            Sock, ProtoOpts, h2_handler_test, undefined, erlang:monotonic_time(), <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -3850,7 +3852,7 @@ run_stream_request(Path, PrefaceSettings) ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_stream_test, undefined, erlang:monotonic_time()
+            Sock, ProtoOpts, h2_stream_test, undefined, erlang:monotonic_time(), <<>>
         )
     end),
     Ref = monitor(process, Pid),

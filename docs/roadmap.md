@@ -412,26 +412,6 @@ for free.
 **Scope:** small. A thin wrapper over the streaming response shape plus
 the content-type default.
 
-### PROXY protocol for the real client address — medium
-
-**What:** Parse the PROXY protocol header (v1 text and v2 binary) that a
-TCP load balancer (haproxy, AWS NLB, and friends) prepends before the
-first request byte, and populate `roadrunner_req:peer/1` with the real
-client address instead of the balancer's. Opt-in per listener, since
-trusting that header from an untrusted peer would let a client spoof its
-own address.
-
-**Why deferred:** direct-to-internet and TLS-terminating-proxy
-deployments do not need it (the socket peer is already the client, or the
-proxy speaks HTTP and can set `Forwarded`). It matters specifically
-behind an L4 balancer, where today the peer address is the balancer's.
-Real-IP-aware logging, the per-peer rate guard, and any geo or authz
-keyed on client IP all depend on it.
-
-**Scope:** medium. A pre-request parse stage on accept (gated by a
-listener opt), plus threading the parsed address into the request's peer
-field across h1, h2, and h3.
-
 ### Decide handler 1xx response handling uniformly — small
 
 **What:** A handler that returns a status of 100..199 has it sent as the

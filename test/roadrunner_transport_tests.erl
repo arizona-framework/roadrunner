@@ -570,6 +570,7 @@ fake_proto_opts(Handler) ->
         rejected_counter => atomics:new(1, [{signed, false}]),
         min_bytes_per_second => 0,
         body_buffering => auto,
+        proxy_protocol => false,
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity
     }.

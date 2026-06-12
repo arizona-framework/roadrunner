@@ -156,63 +156,21 @@ init_loop(Parent, Socket, ProtoOpts) ->
 awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
     receive
         shoot ->
-            %% Socket ownership has just transferred from the acceptor —
-            %% refine the proc_lib label with the peer (which we couldn't
-            %% know on init/1 because the OS-level socket wasn't ours yet).
-            Peer = roadrunner_conn:peer(Socket),
-            ok = roadrunner_conn:refine_conn_label(ProtoOpts, Peer),
-            Scheme = roadrunner_conn:scheme(Socket),
-            StartMono = roadrunner_telemetry:listener_accept(#{
-                listener_name => ListenerName, peer => Peer
-            }),
-            case http2_negotiated(Socket) orelse h2c_only(ProtoOpts) of
-                true ->
-                    %% Either ALPN landed on `h2` (TLS listener) or the
-                    %% listener is in prior-knowledge h2c mode (plain TCP
-                    %% with `protocols => [http2]`). The HTTP/2 path takes
-                    %% over; slot release and `listener_conn_close` happen
-                    %% inside the h2 module.
-                    roadrunner_conn_loop_http2:enter(
-                        Socket, ProtoOpts, ListenerName, Peer, StartMono
-                    );
-                false ->
-                    #{
-                        requests_counter := RequestsCounter,
-                        dispatch := Dispatch,
-                        middlewares := Middlewares,
-                        max_content_length := MaxContentLength,
-                        max_keep_alive_requests := MaxKeepAliveRequests,
-                        min_bytes_per_second := MinRate,
-                        request_timeout := RequestTimeout,
-                        keep_alive_timeout := KeepAliveTimeout,
-                        body_buffering := BodyBuffering
-                    } = ProtoOpts,
-                    S = #loop_state{
-                        socket = Socket,
-                        proto_opts = ProtoOpts,
-                        listener_name = ListenerName,
-                        start_mono = StartMono,
-                        peer = Peer,
-                        scheme = Scheme,
-                        requests_counter = RequestsCounter,
-                        dispatch = Dispatch,
-                        middlewares = Middlewares,
-                        max_content_length = MaxContentLength,
-                        max_keep_alive_requests = MaxKeepAliveRequests,
-                        min_rate = MinRate,
-                        request_timeout = RequestTimeout,
-                        keep_alive_timeout = KeepAliveTimeout,
-                        body_buffering = BodyBuffering,
-                        hibernate_after = maps:get(hibernate_after, ProtoOpts, 0),
-                        alt_svc = maps:get(alt_svc, ProtoOpts, undefined),
-                        http1_limits = {
-                            maps:get(http1_max_request_line, ProtoOpts, 8192),
-                            maps:get(http1_max_header_line, ProtoOpts, 8192),
-                            maps:get(http1_max_header_block, ProtoOpts, 10240),
-                            maps:get(http1_max_header_count, ProtoOpts, 100)
-                        }
-                    },
-                    read_request_phase(S)
+            %% Socket ownership has just transferred from the acceptor. If the
+            %% listener enabled the PROXY protocol, read and strip the header an
+            %% L4 balancer prepended so we serve the real client peer; otherwise
+            %% the OS peer passes through unchanged.
+            OsPeer = roadrunner_conn:peer(Socket),
+            case proxy_protocol_stage(Socket, ProtoOpts, OsPeer) of
+                {ok, Peer, Buffered} ->
+                    serve(Socket, ProtoOpts, ListenerName, Peer, Buffered);
+                close ->
+                    %% Malformed/absent PROXY header on a proxy_protocol
+                    %% listener (a misconfigured upstream). No accept telemetry
+                    %% has fired yet (it pairs with the real peer in serve/5),
+                    %% so release the slot and close silently, like the
+                    %% pre-`shoot` drain path below.
+                    exit_clean(Socket, ProtoOpts, undefined, undefined, ListenerName, 0, normal)
             end;
         {roadrunner_drain, _Deadline} ->
             %% Drain before `shoot` — no telemetry was fired yet (accept
@@ -224,6 +182,114 @@ awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
             %% silently; we do the same so a buggy library can't crash the
             %% conn with a typo'd message.
             awaiting_shoot(Socket, ProtoOpts, ListenerName)
+    end.
+
+%% Begin serving a connection once the peer is settled (the real client when
+%% the PROXY protocol is on). Fires the accept telemetry, refines the proc_lib
+%% label, then forks to HTTP/2 (ALPN `h2` or prior-knowledge h2c) or HTTP/1.
+%% `Buffered` seeds the read buffer with any bytes a coalesced segment carried
+%% after a stripped PROXY header (empty on the normal path).
+-spec serve(
+    roadrunner_transport:socket(),
+    roadrunner_conn:proto_opts(),
+    atom(),
+    {inet:ip_address(), inet:port_number()} | undefined,
+    binary()
+) -> no_return().
+serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
+    ok = roadrunner_conn:refine_conn_label(ProtoOpts, Peer),
+    Scheme = roadrunner_conn:scheme(Socket),
+    StartMono = roadrunner_telemetry:listener_accept(#{
+        listener_name => ListenerName, peer => Peer
+    }),
+    case http2_negotiated(Socket) orelse h2c_only(ProtoOpts) of
+        true ->
+            %% Either ALPN landed on `h2` (TLS listener) or the listener is in
+            %% prior-knowledge h2c mode (plain TCP with `protocols => [http2]`).
+            %% The HTTP/2 path takes over; slot release and `listener_conn_close`
+            %% happen inside the h2 module.
+            roadrunner_conn_loop_http2:enter(
+                Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered
+            );
+        false ->
+            #{
+                requests_counter := RequestsCounter,
+                dispatch := Dispatch,
+                middlewares := Middlewares,
+                max_content_length := MaxContentLength,
+                max_keep_alive_requests := MaxKeepAliveRequests,
+                min_bytes_per_second := MinRate,
+                request_timeout := RequestTimeout,
+                keep_alive_timeout := KeepAliveTimeout,
+                body_buffering := BodyBuffering
+            } = ProtoOpts,
+            S = #loop_state{
+                socket = Socket,
+                proto_opts = ProtoOpts,
+                listener_name = ListenerName,
+                start_mono = StartMono,
+                peer = Peer,
+                scheme = Scheme,
+                buffered = Buffered,
+                requests_counter = RequestsCounter,
+                dispatch = Dispatch,
+                middlewares = Middlewares,
+                max_content_length = MaxContentLength,
+                max_keep_alive_requests = MaxKeepAliveRequests,
+                min_rate = MinRate,
+                request_timeout = RequestTimeout,
+                keep_alive_timeout = KeepAliveTimeout,
+                body_buffering = BodyBuffering,
+                hibernate_after = maps:get(hibernate_after, ProtoOpts, 0),
+                alt_svc = maps:get(alt_svc, ProtoOpts, undefined),
+                http1_limits = {
+                    maps:get(http1_max_request_line, ProtoOpts, 8192),
+                    maps:get(http1_max_header_line, ProtoOpts, 8192),
+                    maps:get(http1_max_header_block, ProtoOpts, 10240),
+                    maps:get(http1_max_header_count, ProtoOpts, 100)
+                }
+            },
+            read_request_phase(S)
+    end.
+
+%% Read and strip a PROXY-protocol header when the listener enabled it. Returns
+%% `{ok, Peer, Leftover}` — the real client peer on a PROXY command, the OS peer
+%% on a LOCAL/UNKNOWN one — or `close` on a malformed header or read error. With
+%% the opt off the OS peer passes straight through and no bytes are read.
+-spec proxy_protocol_stage(
+    roadrunner_transport:socket(),
+    roadrunner_conn:proto_opts(),
+    {inet:ip_address(), inet:port_number()} | undefined
+) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | close.
+proxy_protocol_stage(Socket, #{proxy_protocol := ProxyProto} = ProtoOpts, OsPeer) ->
+    case ProxyProto of
+        false -> {ok, OsPeer, <<>>};
+        true -> read_proxy_header(Socket, ProtoOpts, OsPeer, <<>>)
+    end.
+
+%% The socket is passive at this phase, so read synchronously, accumulating
+%% until `roadrunner_proxy_protocol:parse/1` decides. The parser bounds the
+%% header size (v1 107 bytes, v2 by its declared length), so `Acc` cannot grow
+%% without bound, and each recv carries the per-request timeout against a
+%% dribbling sender.
+-spec read_proxy_header(
+    roadrunner_transport:socket(),
+    roadrunner_conn:proto_opts(),
+    {inet:ip_address(), inet:port_number()} | undefined,
+    binary()
+) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | close.
+read_proxy_header(Socket, #{request_timeout := Timeout} = ProtoOpts, OsPeer, Acc) ->
+    case roadrunner_transport:recv(Socket, 0, Timeout) of
+        {ok, Bytes} ->
+            Buf = <<Acc/binary, Bytes/binary>>,
+            case roadrunner_proxy_protocol:parse(Buf) of
+                {ok, Peer, Rest} -> {ok, Peer, Rest};
+                {local, Rest} -> {ok, OsPeer, Rest};
+                more -> read_proxy_header(Socket, ProtoOpts, OsPeer, Buf);
+                {error, _Reason} -> close
+            end;
+        {error, _} ->
+            close
     end.
 
 %% True iff the TLS handshake negotiated `h2`. Plain TCP and TLS

@@ -134,6 +134,7 @@ request_rejected_event_fires_on_bad_request_line_test() ->
             rejected_counter => atomics:new(1, [{signed, false}]),
             min_bytes_per_second => 0,
             body_buffering => auto,
+            proxy_protocol => false,
             listener_name => probe_listener_rej,
             handler_spawn_opts => [{fullsweep_after, 0}],
             handler_start_timeout => infinity

@@ -122,6 +122,11 @@
     %% SSE / WebSocket handlers depend on it. Short-lived h1
     %% workloads can opt out for ~10% lower per-conn overhead.
     graceful_drain => boolean(),
+    %% When `true`, `roadrunner_conn_loop:awaiting_shoot/3` reads and strips a
+    %% PROXY-protocol header (an L4 balancer prepends it) before serving, and
+    %% the request peer is the real client. TCP-only; the listener rejects it on
+    %% an HTTP/3-only listener.
+    proxy_protocol => boolean(),
     %% Enabled protocols as a flat atom list in user-supplied (ALPN
     %% preference) order. On plain TCP with `[http2]`,
     %% `roadrunner_conn_loop:awaiting_shoot/3` routes straight to the
