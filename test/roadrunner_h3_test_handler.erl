@@ -39,6 +39,10 @@ handle(#{target := ~"/inject-name"} = Req) ->
 handle(#{target := ~"/stream-inject"} = Req) ->
     %% Same defect on a streaming response's headers → 500.
     {{stream, 200, [{~"x-evil", ~"a\r\nb"}], fun(Send) -> ok = Send(~"x", fin) end}, Req};
+handle(#{target := ~"/interim"} = Req) ->
+    %% A buffered 1xx (interim) status returned as a final response is a
+    %% misuse (RFC 9110 §15.2); the worker rejects it with 500.
+    {{103, [], ~""}, Req};
 handle(#{target := ~"/crash"} = _Req) ->
     error(boom);
 handle(#{target := ~"/badheaders"} = Req) ->

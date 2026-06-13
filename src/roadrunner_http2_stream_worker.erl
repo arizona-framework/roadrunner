@@ -166,9 +166,13 @@ telemetry_metadata(#{
     }.
 
 emit_handler_response(ConnPid, StreamId, _Handler, {Status, Headers, Body}) when
-    is_integer(Status), Status >= 100, Status =< 599
+    is_integer(Status), Status >= 200, Status =< 599
 ->
     send_buffered(ConnPid, StreamId, Status, Headers, Body);
+emit_handler_response(ConnPid, StreamId, Handler, {Status, _Headers, _Body}) when
+    is_integer(Status), Status >= 100, Status =< 199
+->
+    reject_interim(ConnPid, StreamId, Handler, Status);
 emit_handler_response(ConnPid, StreamId, _Handler, {stream, Status, Headers, Fun}) when
     is_integer(Status), Status >= 100, Status =< 599, is_function(Fun, 1)
 ->
@@ -236,6 +240,21 @@ emit_501(ConnPid, StreamId) ->
         501,
         [{~"content-type", ~"text/plain"}],
         ~"HTTP/2 does not yet support this response shape"
+    ).
+
+%% RFC 9110 §15.2: a 1xx is interim and cannot be a final response. The
+%% single-response handler API cannot express "interim 1xx then final", so
+%% a returned 1xx is always a misuse; answer 500 rather than put an invalid
+%% final 1xx on the wire. Legitimate interim 100-continue is handled out of
+%% band; this only fires for a handler-returned buffered 1xx.
+reject_interim(ConnPid, StreamId, Handler, Status) ->
+    logger:error(#{
+        msg => "roadrunner h2 handler returned an interim 1xx status as a final response",
+        handler => Handler,
+        status => Status
+    }),
+    send_buffered(
+        ConnPid, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
     ).
 
 %% Buffered response: a single conn-side message that emits

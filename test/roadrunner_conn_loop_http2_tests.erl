@@ -60,6 +60,7 @@ all_test_() ->
         fun sendfile_missing_file_resets_stream/0,
         fun websocket_response_returns_501/0,
         fun handler_crash_returns_500/0,
+        fun interim_buffered_response_returns_500/0,
         fun middleware_chain_runs/0,
         fun rst_stream_cancels_active_stream/0,
         fun router_404_returns_not_found/0,
@@ -1177,6 +1178,12 @@ websocket_response_returns_501() ->
 
 handler_crash_returns_500() ->
     {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/crash"),
+    cleanup(Pid, Ref).
+
+interim_buffered_response_returns_500() ->
+    %% A handler returning a buffered 1xx status is a misuse (RFC 9110
+    %% §15.2): the worker rejects it with 500 and the conn survives.
+    {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/interim"),
     cleanup(Pid, Ref).
 
 middleware_chain_runs() ->

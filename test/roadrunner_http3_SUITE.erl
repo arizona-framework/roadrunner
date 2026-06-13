@@ -23,6 +23,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     large_post/1,
     not_found/1,
     crash_500/1,
+    interim_response_500/1,
     rate_limited/1,
     forbidden_response_header_stripped/1,
     unsafe_response_header_500/1,
@@ -93,6 +94,7 @@ all() ->
         large_post,
         not_found,
         crash_500,
+        interim_response_500,
         rate_limited,
         forbidden_response_header_stripped,
         unsafe_response_header_500,
@@ -283,6 +285,14 @@ not_found(_Config) ->
 crash_500(Config) ->
     Conn = connect(?config(port, Config)),
     ?assertMatch({500, _}, status_body(get(Conn, ~"/crash"))),
+    close(Conn).
+
+interim_response_500(Config) ->
+    %% A handler returning a buffered 1xx status is a misuse (RFC 9110
+    %% §15.2): the worker rejects it with 500 rather than send an invalid
+    %% interim status as the final response.
+    Conn = connect(?config(port, Config)),
+    ?assertMatch({500, _}, status_body(get(Conn, ~"/interim"))),
     close(Conn).
 
 rate_limited(_Config) ->

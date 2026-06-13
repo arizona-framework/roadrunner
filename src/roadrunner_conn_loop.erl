@@ -838,6 +838,31 @@ dispatch_response(
                 end
         end,
     ok;
+%% RFC 9110 §15.2: a 1xx is interim and cannot be a final response. The
+%% single-response handler API cannot express "interim 1xx then final", so
+%% a returned 1xx is always a misuse; answer 500 rather than put an invalid
+%% final 1xx on the wire. Legitimate interim 100-continue is handled by
+%% `roadrunner_conn:maybe_send_continue/3`, not this path. Placed before the
+%% buffered clauses so it intercepts a 1xx for any method (HEAD included).
+dispatch_response(
+    #loop_state{socket = Socket, alt_svc = AltSvc},
+    Handler,
+    _Req,
+    {Status, _Headers, _Body}
+) when
+    is_integer(Status), Status >= 100, Status =< 199
+->
+    logger:error(#{
+        msg => "roadrunner h1 handler returned an interim 1xx status as a final response",
+        handler => Handler,
+        status => Status
+    }),
+    Headers = roadrunner_http:auto_headers([{~"content-type", ~"text/plain"}], AltSvc),
+    Resp = roadrunner_http1:response(500, Headers, ~"Internal Server Error"),
+    _ = roadrunner_telemetry:response_send(
+        roadrunner_transport:send(Socket, Resp), buffered_response
+    ),
+    ok;
 %% Buffered (3-tuple) response shape. RFC 9110 §9.3.2: HEAD must NOT
 %% include a message body — match on `method := ~"HEAD"` in the
 %% function head and emit the response with an empty body. Free

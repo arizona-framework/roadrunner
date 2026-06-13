@@ -147,6 +147,10 @@ handle(#{target := ~"/sendfile/large"} = Req) ->
     {{sendfile, 200, [], {"/tmp/rr_h2_sf_large.bin", 0, 100_000}}, Req};
 handle(#{target := ~"/websocket"} = Req) ->
     {{websocket, some_module, state}, Req};
+handle(#{target := ~"/interim"} = Req) ->
+    %% A buffered 1xx (interim) status returned as a final response is a
+    %% misuse (RFC 9110 §15.2); the worker rejects it with 500.
+    {{103, [], ~""}, Req};
 handle(#{target := ~"/crash"} = _Req) ->
     error(boom);
 handle(#{target := ~"/badshape"} = Req) ->
