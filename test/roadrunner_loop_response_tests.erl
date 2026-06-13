@@ -87,7 +87,7 @@ loop_discards_inbound_data_and_continues_test_() ->
         await_worker_done(Worker),
         Sink ! stop,
         ?assertEqual([user_msg_1], collect_handler_msgs([], 100)),
-        ?assert(lists:member(~"0\r\n\r\n", collect_sent([], Tag, 100)))
+        ?assert(await_sent(~"0\r\n\r\n", Tag, 2000))
     end}.
 
 %% If arming `{active, once}` fails (socket already gone), the loop
@@ -184,6 +184,23 @@ collect_sent(Acc, Tag, Timeout) ->
         {sent, Tag, Data} -> collect_sent([iolist_to_binary(Data) | Acc], Tag, 0)
     after Timeout ->
         lists:reverse(Acc)
+    end.
+
+%% Wait up to TimeoutMs for a specific chunk to be sent, returning as soon
+%% as it arrives. The loop process flushes through the fake sink
+%% asynchronously, so a chunk can land shortly after the worker signals
+%% done; polling for the exact chunk is reliable where reading a fixed
+%% time window races the flush under load (collecting on a 0-timeout drain
+%% misses a chunk that arrives a moment later).
+await_sent(Target, Tag, TimeoutMs) ->
+    receive
+        {sent, Tag, Data} ->
+            case iolist_to_binary(Data) of
+                Target -> true;
+                _ -> await_sent(Target, Tag, TimeoutMs)
+            end
+    after TimeoutMs ->
+        false
     end.
 
 %% --- helpers ---

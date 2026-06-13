@@ -26,14 +26,14 @@ item_empty_container_test() ->
     ?assertEqual(~"{}\n", iolist_to_binary(roadrunner_ndjson:item(#{}))),
     ?assertEqual(~"[]\n", iolist_to_binary(roadrunner_ndjson:item([]))).
 
-%% Output is stable across runs: the encoder sorts object keys, so a
-%% multi-key map frames deterministically (matters for line-by-line
-%% clients and golden tests).
-item_sorts_map_keys_test() ->
-    ?assertEqual(
-        ~"{\"a\":2,\"b\":1}\n",
-        iolist_to_binary(roadrunner_ndjson:item(#{b => 1, a => 2}))
-    ).
+%% A multi-key object: the key ORDER in the output is not guaranteed (it
+%% follows the map's iteration order, which varies across terms and OTP
+%% versions), so assert via decode rather than byte-equality. The framing
+%% is still exactly one line.
+item_multikey_map_roundtrips_test() ->
+    Map = #{~"a" => 1, ~"b" => 2},
+    [Line, <<>>] = binary:split(iolist_to_binary(roadrunner_ndjson:item(Map)), ~"\n", [global]),
+    ?assertEqual(Map, json:decode(Line)).
 
 %% --- framing safety: the line delimiter is the ONLY raw newline ---
 
