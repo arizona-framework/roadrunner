@@ -7,14 +7,13 @@ compact JSON document followed by a single `\\n` delimiter and returns
 iodata, so it drops into every response shape unchanged. Set the
 response content-type to `content_type/0` (`application/x-ndjson`).
 
-A bounded result set as a buffered body (a list comprehension of items
-is itself valid iodata):
+A bounded result set as a buffered body — `roadrunner_resp:ndjson/2`
+frames the whole list and sets the headers (it calls `item/1` per row):
 
 ```erlang
 handle(Req) ->
     Rows = my_db:recent_orders(),
-    Body = [roadrunner_ndjson:item(Row) || Row <- Rows],
-    {{200, [{~"content-type", roadrunner_ndjson:content_type()}], Body}, Req}.
+    {roadrunner_resp:ndjson(200, Rows), Req}.
 ```
 
 A large or lazy result set, streamed one line per chunk without

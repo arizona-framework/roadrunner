@@ -47,6 +47,37 @@ json_test() ->
     Decoded = json:decode(iolist_to_binary(Body)),
     ?assertEqual(Term, Decoded).
 
+ndjson_test() ->
+    Items = [#{~"id" => 1}, #{~"id" => 2}],
+    {200, Headers, Body} = roadrunner_resp:ndjson(200, Items),
+    ?assertEqual(
+        ~"application/x-ndjson",
+        proplists:get_value(~"content-type", Headers)
+    ),
+    Bin = iolist_to_binary(Body),
+    ?assertEqual(~"{\"id\":1}\n{\"id\":2}\n", Bin),
+    %% Content-Length is the byte count of the framed lines.
+    ?assertEqual(
+        integer_to_binary(byte_size(Bin)),
+        proplists:get_value(~"content-length", Headers)
+    ),
+    %% Each line round-trips as one JSON document.
+    [L1, L2, <<>>] = binary:split(Bin, ~"\n", [global]),
+    ?assertEqual(#{~"id" => 1}, json:decode(L1)),
+    ?assertEqual(#{~"id" => 2}, json:decode(L2)).
+
+ndjson_empty_list_test() ->
+    %% No items → empty body, Content-Length 0.
+    ?assertEqual(
+        {200,
+            [
+                {~"content-type", ~"application/x-ndjson"},
+                {~"content-length", ~"0"}
+            ],
+            []},
+        roadrunner_resp:ndjson(200, [])
+    ).
+
 redirect_test() ->
     ?assertEqual(
         {302,

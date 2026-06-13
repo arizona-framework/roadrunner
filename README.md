@@ -306,7 +306,7 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
 ### Handlers
 
 - **Buffered responses**: `{Status, Headers, Body}` via `roadrunner_resp:text/2`,
-  `:html/2`, `:json/2`, `:redirect/2`, plus empty-status shortcuts.
+  `:html/2`, `:json/2`, `:ndjson/2`, `:redirect/2`, plus empty-status shortcuts.
 - **Streaming**: `{stream, Status, Headers, Fun}`, chunked transfer with a
   `Send/2` callback; supports trailer headers per RFC 9112 §7.1.2.
   `roadrunner_ndjson:item/1` frames newline-delimited JSON lines for a
