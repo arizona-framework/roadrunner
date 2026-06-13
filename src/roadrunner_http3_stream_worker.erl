@@ -154,12 +154,16 @@ telemetry_metadata(#{
 -spec emit_handler_response(pid(), non_neg_integer(), module(), roadrunner_handler:response()) ->
     roadrunner_http:status().
 emit_handler_response(Conn, StreamId, _Handler, {Status, Headers, Body}) when
-    is_integer(Status), Status >= 100, Status =< 599
+    is_integer(Status), Status >= 200, Status =< 599
 ->
     emit_checked(Conn, StreamId, Headers, fun() ->
         send_buffered(Conn, StreamId, Status, Headers, Body),
         Status
     end);
+emit_handler_response(Conn, StreamId, Handler, {Status, _Headers, _Body}) when
+    is_integer(Status), Status >= 100, Status =< 199
+->
+    reject_interim(Conn, StreamId, Handler, Status);
 emit_handler_response(Conn, StreamId, _Handler, {stream, Status, Headers, Fun}) ->
     emit_checked(Conn, StreamId, Headers, fun() ->
         send_stream(Conn, StreamId, Status, Headers, Fun),
@@ -228,6 +232,23 @@ reject_unsafe(Conn, StreamId, Kind) ->
     logger:error(#{
         msg => "roadrunner h3 handler returned a header with CR/LF/NUL",
         kind => Kind
+    }),
+    send_buffered(
+        Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
+    ),
+    500.
+
+%% RFC 9110 §15.2: a 1xx is interim and cannot be a final response. The
+%% single-response handler API cannot express "interim 1xx then final", so
+%% a returned 1xx is always a misuse; answer 500 rather than put an invalid
+%% final 1xx on the wire. Legitimate interim 100-continue is handled out of
+%% band; this only fires for a handler-returned buffered 1xx.
+-spec reject_interim(pid(), non_neg_integer(), module(), 100..199) -> 500.
+reject_interim(Conn, StreamId, Handler, Status) ->
+    logger:error(#{
+        msg => "roadrunner h3 handler returned an interim 1xx status as a final response",
+        handler => Handler,
+        status => Status
     }),
     send_buffered(
         Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"

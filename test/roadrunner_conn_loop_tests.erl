@@ -510,6 +510,32 @@ handler_crash_writes_500_and_fires_request_exception_test() ->
     detach_telemetry(Tag),
     Sink ! stop.
 
+interim_buffered_response_writes_500_test() ->
+    %% A handler returning a buffered 1xx status is a misuse (RFC 9110
+    %% §15.2): the conn loop rejects it with 500 rather than put an invalid
+    %% interim status on the wire as the final response.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(interim))#{
+        dispatch :=
+            {handler, roadrunner_interim_handler, fun roadrunner_interim_handler:handle/1,
+                undefined}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 500", _/binary>>, Sent),
+    Sink ! stop.
+
 post_body_echoes_via_auto_mode_test() ->
     ensure_pg(),
     Self = self(),
