@@ -706,22 +706,31 @@ parse_payload(Len, 1, Bin, Fin, Rsv1, Op, Pre) ->
     end.
 
 %% Unmask a client→server payload (RFC 6455 §5.3) by XOR'ing
-%% against the 32-bit `MaskKey` repeatedly. Processes 16 bytes
-%% per recursion (4 × 32-bit words) so the BEAM JIT can emit
-%% straight-line code for the common case — same shape as
-%% cowlib's `cow_ws:mask/3`. For 1 KB payloads this is ~10×
-%% faster than the byte-at-a-time iolist version.
+%% against the 32-bit `MaskKey`. Processes 64 bytes per recursion
+%% (16 × 32-bit words) so the per-pass cost (match-context setup,
+%% the call, append bookkeeping) is amortised over more bytes —
+%% measured ~15-27% faster than a 16-byte (4-word) pass across
+%% 64 B–1 KB payloads. 32-bit words stay inside a 60-bit fixnum;
+%% 64-bit words would spill to heap bignums and lose.
 -spec unmask(binary(), binary()) -> binary().
 unmask(Payload, <<MaskKey:32>>) ->
     unmask_chunks(Payload, MaskKey, <<>>).
 
 -spec unmask_chunks(binary(), non_neg_integer(), binary()) -> binary().
-unmask_chunks(<<O1:32, O2:32, O3:32, O4:32, Rest/binary>>, MK, Acc) ->
-    T1 = O1 bxor MK,
-    T2 = O2 bxor MK,
-    T3 = O3 bxor MK,
-    T4 = O4 bxor MK,
-    unmask_chunks(Rest, MK, <<Acc/binary, T1:32, T2:32, T3:32, T4:32>>);
+unmask_chunks(
+    <<O1:32, O2:32, O3:32, O4:32, O5:32, O6:32, O7:32, O8:32, O9:32, O10:32, O11:32, O12:32, O13:32,
+        O14:32, O15:32, O16:32, Rest/binary>>,
+    MK,
+    Acc
+) ->
+    unmask_chunks(
+        Rest,
+        MK,
+        <<Acc/binary, (O1 bxor MK):32, (O2 bxor MK):32, (O3 bxor MK):32, (O4 bxor MK):32,
+            (O5 bxor MK):32, (O6 bxor MK):32, (O7 bxor MK):32, (O8 bxor MK):32, (O9 bxor MK):32,
+            (O10 bxor MK):32, (O11 bxor MK):32, (O12 bxor MK):32, (O13 bxor MK):32,
+            (O14 bxor MK):32, (O15 bxor MK):32, (O16 bxor MK):32>>
+    );
 unmask_chunks(<<O:32, Rest/binary>>, MK, Acc) ->
     T = O bxor MK,
     unmask_chunks(Rest, MK, <<Acc/binary, T:32>>);

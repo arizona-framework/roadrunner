@@ -584,9 +584,9 @@ early_validate_text(Data, Buf, Opts) ->
 unmask_slice(Slice, <<MaskKey:32>>, Offset) ->
     %% Rotate the 32-bit mask so its byte at the slice's logical
     %% start lines up with bit position 0 — same trick as cowlib's
-    %% `cow_ws:unmask/3`. After rotation we can XOR 4 bytes at a
-    %% time (16 per recursion) instead of byte-at-a-time, which
-    %% on 1 KB payloads is ~10× faster than the old iolist version.
+    %% `cow_ws:unmask/3`. After rotation we XOR 4 bytes at a time,
+    %% 64 per recursion (16 × 32-bit words), which beats both the
+    %% byte-at-a-time iolist version and a narrower 4-word pass.
     Left = (Offset rem 4) * 8,
     Right = 32 - Left,
     Rotated = (MaskKey bsl Left) + (MaskKey bsr Right),
@@ -597,12 +597,20 @@ unmask_slice(Slice, <<MaskKey:32>>, Offset) ->
     unmask_slice_chunks(Slice, Rotated32, <<>>).
 
 -spec unmask_slice_chunks(binary(), non_neg_integer(), binary()) -> binary().
-unmask_slice_chunks(<<O1:32, O2:32, O3:32, O4:32, Rest/binary>>, MK, Acc) ->
-    T1 = O1 bxor MK,
-    T2 = O2 bxor MK,
-    T3 = O3 bxor MK,
-    T4 = O4 bxor MK,
-    unmask_slice_chunks(Rest, MK, <<Acc/binary, T1:32, T2:32, T3:32, T4:32>>);
+unmask_slice_chunks(
+    <<O1:32, O2:32, O3:32, O4:32, O5:32, O6:32, O7:32, O8:32, O9:32, O10:32, O11:32, O12:32, O13:32,
+        O14:32, O15:32, O16:32, Rest/binary>>,
+    MK,
+    Acc
+) ->
+    unmask_slice_chunks(
+        Rest,
+        MK,
+        <<Acc/binary, (O1 bxor MK):32, (O2 bxor MK):32, (O3 bxor MK):32, (O4 bxor MK):32,
+            (O5 bxor MK):32, (O6 bxor MK):32, (O7 bxor MK):32, (O8 bxor MK):32, (O9 bxor MK):32,
+            (O10 bxor MK):32, (O11 bxor MK):32, (O12 bxor MK):32, (O13 bxor MK):32,
+            (O14 bxor MK):32, (O15 bxor MK):32, (O16 bxor MK):32>>
+    );
 unmask_slice_chunks(<<O:32, Rest/binary>>, MK, Acc) ->
     T = O bxor MK,
     unmask_slice_chunks(Rest, MK, <<Acc/binary, T:32>>);
