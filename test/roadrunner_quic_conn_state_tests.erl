@@ -862,6 +862,21 @@ send_resumes_after_max_data_and_max_stream_data_test() ->
     ?assert(byte_size(Sent2) > 0),
     ?assertEqual(byte_size(Payload), byte_size(Sent1) + byte_size(Sent2)).
 
+send_window_exhaustion_emits_blocked_frames_test() ->
+    %% RFC 9000 §4.1 / §19.12-13: when a send fills the connection and
+    %% per-stream limits, the server signals each once with DATA_BLOCKED /
+    %% STREAM_DATA_BLOCKED carrying the limit it hit, so the peer knows to
+    %% grant more credit.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Window = 800000,
+    Payload = binary:copy(~"x", Window + 1000),
+    {State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
+    Frames = flush_app_frames(State1, Effects, ServerApSecret, ClientApSecret, 0),
+    ?assertEqual([{data_blocked, Window}], [F || {data_blocked, _} = F <- Frames]),
+    ?assertEqual(
+        [{stream_data_blocked, 0, Window}], [F || {stream_data_blocked, _, _} = F <- Frames]
+    ).
+
 congestion_window_caps_first_burst_test() ->
     %% A payload far larger than the initial congestion window is capped at about
     %% one window on the first pass, with no ACKs yet to grow it (RFC 9002 §7).
@@ -1594,6 +1609,26 @@ flush_with_acks(State, Effects, ServerApSecret, ClientApSecret, AckPN) ->
                 State1, Effects1, ServerApSecret, ClientApSecret, AckPN + 1
             ),
             {<<Sent/binary, Rest/binary>>, Final, FinalAckPN}
+    end.
+
+%% Like flush_with_acks/5 but accumulates every application frame across the
+%% ACK-paced rounds, so a test can find frames other than STREAM (e.g.
+%% DATA_BLOCKED). Stops once a round carries no more stream data; the
+%% accumulator order is irrelevant to the membership assertions.
+flush_app_frames(State, Effects, ServerApSecret, ClientApSecret, AckPN) ->
+    flush_app_frames(State, Effects, ServerApSecret, ClientApSecret, AckPN, []).
+
+flush_app_frames(State, Effects, ServerApSecret, ClientApSecret, AckPN, Acc) ->
+    Frames = sent_app_frames(Effects, ServerApSecret),
+    Acc1 = lists:foldl(fun(Frame, A) -> [Frame | A] end, Acc, Frames),
+    case [D || {stream, 0, _, D, _} <- Frames] of
+        [] ->
+            Acc1;
+        _ ->
+            Largest = largest_app_pn(Effects, ServerApSecret),
+            Ack = app_datagram([{ack, Largest, 0, Largest, [], undefined}], AckPN, ClientApSecret),
+            {State1, Effects1} = ?M:handle_datagram(?NOW, Ack, State),
+            flush_app_frames(State1, Effects1, ServerApSecret, ClientApSecret, AckPN + 1, Acc1)
     end.
 
 arm_deadline(Effects) ->

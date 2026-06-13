@@ -1479,11 +1479,45 @@ take_stream(
             take_stream(Rest, AckFrames, PN, State);
         {Offset, Data, Fin, Stream1} ->
             Size = byte_size(Data),
-            {_, ConnFlow1} = roadrunner_quic_flow:on_data_sent(Size, ConnFlow),
-            {_, StreamFlow1} = roadrunner_quic_flow:on_data_sent(Size, StreamFlow0),
+            {ConnResult, ConnFlow1} = roadrunner_quic_flow:on_data_sent(Size, ConnFlow),
+            {StreamResult, StreamFlow1} = roadrunner_quic_flow:on_data_sent(Size, StreamFlow0),
             State1 = put_stream(Sid, Stream1, StreamFlow1, State#state{conn_flow = ConnFlow1}),
-            {[{stream, Sid, Offset, Data, Fin}], State1}
+            Frames = [
+                {stream, Sid, Offset, Data, Fin}
+                | blocked_frames(Sid, ConnResult, ConnFlow1, StreamResult, StreamFlow1)
+            ],
+            {Frames, State1}
     end.
+
+%% RFC 9000 §4.1 / §19.12-13: when a send exhausts the connection- or
+%% stream-level limit, ride a DATA_BLOCKED / STREAM_DATA_BLOCKED along in the
+%% same packet (the stream frame was capped by the window, so the datagram has
+%% room) so the peer learns to grant more credit; the Limit is the value we
+%% hit. The flow reports the blocked transition once per limit (it clears on
+%% the matching MAX_DATA / MAX_STREAM_DATA), so this never repeats for a limit.
+-spec blocked_frames(
+    non_neg_integer(),
+    ok | blocked,
+    roadrunner_quic_flow:t(),
+    ok | blocked,
+    roadrunner_quic_flow:t()
+) -> [roadrunner_quic_frame:frame()].
+blocked_frames(Sid, ConnResult, ConnFlow, StreamResult, StreamFlow) ->
+    conn_blocked_frame(ConnResult, ConnFlow, stream_blocked_frame(Sid, StreamResult, StreamFlow)).
+
+-spec conn_blocked_frame(ok | blocked, roadrunner_quic_flow:t(), [roadrunner_quic_frame:frame()]) ->
+    [roadrunner_quic_frame:frame()].
+conn_blocked_frame(blocked, ConnFlow, Tail) ->
+    [{data_blocked, roadrunner_quic_flow:bytes_sent(ConnFlow)} | Tail];
+conn_blocked_frame(ok, _ConnFlow, Tail) ->
+    Tail.
+
+-spec stream_blocked_frame(non_neg_integer(), ok | blocked, roadrunner_quic_flow:t()) ->
+    [roadrunner_quic_frame:frame()].
+stream_blocked_frame(Sid, blocked, StreamFlow) ->
+    [{stream_data_blocked, Sid, roadrunner_quic_flow:bytes_sent(StreamFlow)}];
+stream_blocked_frame(_Sid, ok, _StreamFlow) ->
+    [].
 
 -spec build_entry(level(), [roadrunner_quic_frame:frame()], #space{}, t()) -> {map(), t()}.
 build_entry(Level, Frames, #space{next_pn = PN} = Space, #state{send_keys = SendKeys} = State) ->
