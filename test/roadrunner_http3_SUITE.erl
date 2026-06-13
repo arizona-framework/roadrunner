@@ -48,6 +48,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     oversized_413/1,
     oversized_headers_431/1,
     advertises_max_field_section_size/1,
+    advertises_grease_setting/1,
     field_section_too_large_431/1,
     protocols_tuple_form/1,
     certfile_keyfile/1,
@@ -119,6 +120,7 @@ all() ->
         oversized_413,
         oversized_headers_431,
         advertises_max_field_section_size,
+        advertises_grease_setting,
         field_section_too_large_431,
         protocols_tuple_form,
         certfile_keyfile,
@@ -623,6 +625,16 @@ advertises_max_field_section_size(_Config) ->
         close(Conn),
         roadrunner_listener:stop(Name)
     end.
+
+advertises_grease_setting(Config) ->
+    %% RFC 9114 §7.2.4.1: the server includes a reserved "GREASE" setting
+    %% (id 0x1f*N+0x21) in its control-stream SETTINGS so peers that
+    %% mishandle unknown settings are caught early. A conformant client
+    %% keeps the unknown id under its integer key and otherwise ignores it.
+    Conn = connect(?config(port, Config)),
+    Settings = roadrunner_quic_test_h3:get_peer_settings(Conn),
+    ?assertMatch(#{16#1f21 := 0}, Settings),
+    close(Conn).
 
 field_section_too_large_431(_Config) ->
     %% RFC 9114 §4.2.2: a request whose DECODED field section exceeds the

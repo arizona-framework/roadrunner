@@ -278,7 +278,13 @@ send_control_stream(#h3{conn = Conn, max_field_section_size = MaxFieldSection} =
     Settings = roadrunner_quic_h3_frame:encode_settings(#{
         qpack_max_table_capacity => 0,
         qpack_blocked_streams => 0,
-        max_field_section_size => MaxFieldSection
+        max_field_section_size => MaxFieldSection,
+        %% A reserved "GREASE" setting (RFC 9114 §7.2.4.1): an identifier of
+        %% the form 0x1f*N+0x21 a conformant peer MUST ignore, sent so peers
+        %% that mishandle unknown settings are shaken out early rather than
+        %% letting the wire format ossify. The identifier and value are
+        %% otherwise arbitrary.
+        16#1f21 => 0
     }),
     _ = roadrunner_quic:send_data(Conn, CtrlStreamId, [Prefix, Settings], false),
     State#h3{control_stream_id = CtrlStreamId}.
