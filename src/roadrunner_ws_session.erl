@@ -828,8 +828,7 @@ validate_fin_fragment(binary, _Compressed, _Pending, _Bytes) ->
 validate_fin_fragment(text, true, _Pending, _Bytes) ->
     ok;
 validate_fin_fragment(text, false, Pending, Bytes) ->
-    Combined = <<Pending/binary, Bytes/binary>>,
-    case unicode:characters_to_binary(Combined, utf8, utf8) of
+    case unicode:characters_to_binary(append_bin(Pending, Bytes), utf8, utf8) of
         Bin when is_binary(Bin) -> ok;
         %% Trailing bytes that didn't form a complete sequence are
         %% invalid at FIN time per RFC 6455 §8.1.
@@ -904,8 +903,10 @@ validate_incremental(binary, _Compressed, _Pending, _Bytes) ->
 validate_incremental(text, true, _Pending, _Bytes) ->
     {ok, <<>>};
 validate_incremental(text, false, Pending, Bytes) ->
-    Combined = <<Pending/binary, Bytes/binary>>,
-    case unicode:characters_to_binary(Combined, utf8, utf8) of
+    %% Empty `Pending` (the common case) hands the validator the payload
+    %% binary as-is — the BIF's fast binary path beats a pre-concat copy
+    %% and an iodata list alike.
+    case unicode:characters_to_binary(append_bin(Pending, Bytes), utf8, utf8) of
         Bin when is_binary(Bin) ->
             %% Fully-valid (no trailing incomplete sequence).
             {ok, <<>>};
