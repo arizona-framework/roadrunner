@@ -25,11 +25,13 @@ refill(Units, LastMs, NowMs, Rate, Cap) ->
     Elapsed = max(0, NowMs - LastMs),
     min(Cap, Units + Elapsed * Rate).
 
-%% Spend one request (`Cost` units). `{ok, Remaining}` when the bucket can cover
-%% it, else `denied`.
+%% Spend one request (`Cost` units): the remaining units when the bucket can
+%% cover it, else `denied`. Returns the bare integer (not `{ok, _}`) so the
+%% per-request allow path allocates nothing — the remaining count is a 64-bit
+%% immediate, the `denied` atom needs no heap.
 -doc false.
--spec spend(integer(), pos_integer()) -> {ok, integer()} | denied.
-spend(Units, Cost) when Units >= Cost -> {ok, Units - Cost};
+-spec spend(integer(), pos_integer()) -> non_neg_integer() | denied.
+spend(Units, Cost) when Units >= Cost -> Units - Cost;
 spend(_Units, _Cost) -> denied.
 
 %% Seconds until a depleted bucket can cover one request again, rounded up,

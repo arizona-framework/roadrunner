@@ -200,8 +200,9 @@
 }.
 
 %% The per-connection rate-limit guard state cached on each conn loop's record:
-%% the `{Rate, Burst, Period, Table, Counter, IP}` resolved from `proto_opts` +
-%% the peer once at setup (see `resolve_rate_limit/2`), or `undefined` when the
+%% the `{Rate, Cap, Cost, Table, Counter, IP}` resolved from `proto_opts` + the
+%% peer once at setup (see `resolve_rate_limit/2`) — with `Cap`/`Cost` already
+%% derived so the per-request check does no arithmetic — or `undefined` when the
 %% guard is off or the peer IP is unknown. Checked by `rate_limit_check/6`.
 -type rate_limit_state() ::
     {
@@ -363,7 +364,12 @@ resolve_rate_limit(
     },
     {IP, _Port}
 ) ->
-    {Rate, Burst, Period, Table, Counter, IP};
+    %% Bake the derived `Cost` (units/request) and `Cap` (bucket capacity) here,
+    %% once per connection, so the per-request `rate_limit_check/6` does no
+    %% multiplication.
+    Cost = Period * 1000,
+    Cap = Burst * Cost,
+    {Rate, Cap, Cost, Table, Counter, IP};
 resolve_rate_limit(_ProtoOpts, _Peer) ->
     undefined.
 
@@ -383,25 +389,26 @@ deterministically testable).
     ets:table(), inet:ip_address(), pos_integer(), pos_integer(), pos_integer(), integer()
 ) ->
     allow | {deny, pos_integer()}.
-rate_limit_check(Table, IP, Rate, Burst, Period, NowMs) ->
-    %% `Rate` requests per `Period` seconds: one request costs `Cost` units,
-    %% the bucket holds up to `Cap` (see `roadrunner_rate_limit`).
-    Cost = Period * 1000,
-    Cap = Burst * Cost,
-    {Units0, LastMs} =
+rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) ->
+    %% `Cap` (bucket capacity) and `Cost` (units per request) are resolved once
+    %% per connection (see `resolve_rate_limit/2`), not per request. A
+    %% never-seen peer starts at a full bucket (`Cap`) and needs no refill; an
+    %% existing one is refilled for the elapsed time in place (no intermediate
+    %% tuple).
+    Refilled =
         case ets:lookup(Table, IP) of
-            [{IP, U, L}] -> {U, L};
-            %% First request from this peer: a full bucket.
-            [] -> {Cap, NowMs}
+            [{IP, Units, LastMs}] ->
+                roadrunner_rate_limit:refill(Units, LastMs, NowMs, Rate, Cap);
+            [] ->
+                Cap
         end,
-    Refilled = roadrunner_rate_limit:refill(Units0, LastMs, NowMs, Rate, Cap),
     case roadrunner_rate_limit:spend(Refilled, Cost) of
-        {ok, Remaining} ->
-            true = ets:insert(Table, {IP, Remaining, NowMs}),
-            allow;
         denied ->
             true = ets:insert(Table, {IP, Refilled, NowMs}),
-            {deny, roadrunner_rate_limit:retry_after_secs(Refilled, Rate, Cost)}
+            {deny, roadrunner_rate_limit:retry_after_secs(Refilled, Rate, Cost)};
+        Remaining ->
+            true = ets:insert(Table, {IP, Remaining, NowMs}),
+            allow
     end.
 
 -doc "Record a rate-limit refusal: bump the cumulative counter and emit telemetry.".

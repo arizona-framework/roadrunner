@@ -708,9 +708,9 @@ dispatch_phase(
 ) -> boolean().
 rate_limit_allows(undefined, _Socket, _ListenerName) ->
     true;
-rate_limit_allows({Rate, Burst, Period, Table, Counter, IP}, Socket, ListenerName) ->
+rate_limit_allows({Rate, Cap, Cost, Table, Counter, IP}, Socket, ListenerName) ->
     NowMs = erlang:monotonic_time(millisecond),
-    case roadrunner_conn:rate_limit_check(Table, IP, Rate, Burst, Period, NowMs) of
+    case roadrunner_conn:rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) of
         allow ->
             true;
         {deny, RetryAfter} ->

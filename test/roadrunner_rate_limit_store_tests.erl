@@ -8,37 +8,40 @@
 %% --- rate_limit_check/6 (real ETS bucket store, injected clock; Period 1 =
 %% per-second unless noted) ---
 
+%% `rate_limit_check` takes the resolved `Cap`/`Cost` (not burst/period); the
+%% `cap/2` and `cost/1` helpers keep the burst/period intent visible.
+
 first_request_allowed_test() ->
     Table = new_table(),
-    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 2, 2, 1, 1000)).
+    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 2, cap(2, 1), cost(1), 1000)).
 
 burst_then_denied_test() ->
     Table = new_table(),
     %% Burst of 2: two requests pass, the third is denied (Retry-After 1s).
-    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 2, 2, 1, 1000)),
-    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 2, 2, 1, 1000)),
-    ?assertEqual({deny, 1}, ?M:rate_limit_check(Table, ?IP, 2, 2, 1, 1000)).
+    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 2, cap(2, 1), cost(1), 1000)),
+    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 2, cap(2, 1), cost(1), 1000)),
+    ?assertEqual({deny, 1}, ?M:rate_limit_check(Table, ?IP, 2, cap(2, 1), cost(1), 1000)).
 
 refills_after_time_test() ->
     Table = new_table(),
     %% Drain the burst of 1, then a request 500ms later (2/sec → one back) passes.
-    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 2, 1, 1, 1000)),
-    ?assertEqual({deny, 1}, ?M:rate_limit_check(Table, ?IP, 2, 1, 1, 1000)),
-    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 2, 1, 1, 1500)).
+    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 2, cap(1, 1), cost(1), 1000)),
+    ?assertEqual({deny, 1}, ?M:rate_limit_check(Table, ?IP, 2, cap(1, 1), cost(1), 1000)),
+    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 2, cap(1, 1), cost(1), 1500)).
 
 different_ips_are_independent_test() ->
     Table = new_table(),
     IP2 = {10, 0, 0, 9},
-    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 1, 1, 1, 1000)),
-    ?assertEqual({deny, 1}, ?M:rate_limit_check(Table, ?IP, 1, 1, 1, 1000)),
+    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 1, cap(1, 1), cost(1), 1000)),
+    ?assertEqual({deny, 1}, ?M:rate_limit_check(Table, ?IP, 1, cap(1, 1), cost(1), 1000)),
     %% A different peer has its own full bucket.
-    ?assertEqual(allow, ?M:rate_limit_check(Table, IP2, 1, 1, 1, 1000)).
+    ?assertEqual(allow, ?M:rate_limit_check(Table, IP2, 1, cap(1, 1), cost(1), 1000)).
 
 per_minute_rate_test() ->
     Table = new_table(),
     %% 1 request per 60s: the second is denied with a 60s Retry-After.
-    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 1, 1, 60, 1000)),
-    ?assertEqual({deny, 60}, ?M:rate_limit_check(Table, ?IP, 1, 1, 60, 1000)).
+    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 1, cap(1, 60), cost(60), 1000)),
+    ?assertEqual({deny, 60}, ?M:rate_limit_check(Table, ?IP, 1, cap(1, 60), cost(60), 1000)).
 
 %% --- resolve_rate_limit/2 ---
 
@@ -52,7 +55,10 @@ resolve_off_without_peer_test() ->
 resolve_on_test() ->
     Table = new_table(),
     {Counter, Opts} = proto_opts_with_counter(Table),
-    ?assertEqual({10, 20, 30, Table, Counter, ?IP}, ?M:resolve_rate_limit(Opts, {?IP, 5000})).
+    %% rate 10, burst 20, period 30 → Cost 30000, Cap 600000 baked in.
+    ?assertEqual(
+        {10, 600000, 30000, Table, Counter, ?IP}, ?M:resolve_rate_limit(Opts, {?IP, 5000})
+    ).
 
 %% --- rate_limited_telemetry/2 ---
 
@@ -90,6 +96,11 @@ evict_clears_all_idle_in_one_pass_test() ->
 
 new_table() ->
     ets:new(rate_limit_test, [public, {write_concurrency, true}]).
+
+%% Mirror the runtime derivation: one request costs `Period * 1000` units; a
+%% bucket holds `Burst` requests.
+cost(Period) -> Period * 1000.
+cap(Burst, Period) -> Burst * cost(Period).
 
 proto_opts(RateLimit) ->
     Cfg =

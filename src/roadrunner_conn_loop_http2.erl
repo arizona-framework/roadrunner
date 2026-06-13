@@ -1785,13 +1785,13 @@ rate_limit_refused(#loop{rate_limit = undefined}, _StreamId) ->
     ok;
 rate_limit_refused(
     #loop{
-        rate_limit = {Rate, Burst, Period, Table, Counter, IP},
+        rate_limit = {Rate, Cap, Cost, Table, Counter, IP},
         listener_name = ListenerName
     } = State,
     StreamId
 ) ->
     NowMs = erlang:monotonic_time(millisecond),
-    case roadrunner_conn:rate_limit_check(Table, IP, Rate, Burst, Period, NowMs) of
+    case roadrunner_conn:rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) of
         allow ->
             ok;
         {deny, RetryAfter} ->

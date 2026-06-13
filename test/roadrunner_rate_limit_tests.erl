@@ -27,11 +27,11 @@ refill_backwards_clock_clamps_to_zero_test() ->
 
 %% --- spend/2 ---
 
-spend_ok_deducts_one_request_test() ->
-    ?assertEqual({ok, 1500}, ?M:spend(2500, 1000)).
+spend_ok_returns_remaining_test() ->
+    ?assertEqual(1500, ?M:spend(2500, 1000)).
 
 spend_exactly_one_request_test() ->
-    ?assertEqual({ok, 0}, ?M:spend(1000, 1000)).
+    ?assertEqual(0, ?M:spend(1000, 1000)).
 
 spend_denied_below_one_request_test() ->
     ?assertEqual(denied, ?M:spend(999, 1000)).
