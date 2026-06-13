@@ -397,21 +397,6 @@ grammar enforcement is callers-write-bugs ergonomics, not security.
 
 **Scope:** small per attribute. Add when a real caller hits the gap.
 
-### NDJSON streaming response builder — small
-
-**What:** A first-class newline-delimited-JSON response, the JSON
-sibling of `roadrunner_sse`: a builder that frames each item as one
-`<json>\n` chunk over the existing chunked-streaming path, for streaming
-list endpoints and token-by-token responses.
-
-**Why deferred:** the chunked-streaming primitive already lets a handler
-emit NDJSON by hand; a named builder is ergonomics, worth adding once a
-handler wants the framing (and the `application/x-ndjson` content type)
-for free.
-
-**Scope:** small. A thin wrapper over the streaming response shape plus
-the content-type default.
-
 ### Cap outbound response header size — small
 
 **What:** h1/h2/h3 all cap INBOUND headers (the security-relevant direction,
