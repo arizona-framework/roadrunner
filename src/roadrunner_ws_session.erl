@@ -554,7 +554,7 @@ early_validate_text(Data, Buf, Opts) ->
                                 Data#data{
                                     utf8_pending = NewPending,
                                     frame_validated = AlreadyValidated + ToValidate,
-                                    unmasked_buf = <<UnmaskedBuf/binary, Unmasked/binary>>
+                                    unmasked_buf = append_bin(UnmaskedBuf, Unmasked)
                                 },
                                 TotalLen};
                         invalid_utf8 ->
@@ -623,7 +623,18 @@ unmask_slice_chunks(<<>>, _MK, Acc) ->
 
 -spec append_buffer(#data{}, binary()) -> #data{}.
 append_buffer(#data{buffer = Buf} = Data, Bytes) ->
-    Data#data{buffer = <<Buf/binary, Bytes/binary>>}.
+    Data#data{buffer = append_bin(Buf, Bytes)}.
+
+%% Append `New` onto `Acc`, returning `New` untouched when `Acc` is empty.
+%% The single-chunk hot path (a whole frame in one TCP read, the buffer
+%% and unmasked accumulator drained, no partial UTF-8 carried over) hits
+%% the empty case every time, skipping a full payload-sized copy per
+%% inbound frame. Returning the bare binary also lets the UTF-8 BIF take
+%% its fast binary path, which is measured well ahead of both a pre-concat
+%% copy and an iodata list (the BIF walks a list far slower).
+-spec append_bin(binary(), binary()) -> binary().
+append_bin(<<>>, New) -> New;
+append_bin(Acc, New) -> <<Acc/binary, New/binary>>.
 
 -spec hibernate_actions(boolean()) -> [hibernate].
 hibernate_actions(true) -> [hibernate];
