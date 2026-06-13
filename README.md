@@ -14,7 +14,7 @@ Roadrunner is the HTTP backbone of the
 [arizona-framework](https://github.com/arizona-framework/arizona), and works
 standalone too. The API is small: a handler behaviour, request and response
 accessors, listener controls, and opt-in helpers (cookies, query strings,
-multipart, SSE, WebSocket).
+multipart, SSE, NDJSON, WebSocket).
 
 ## Why Roadrunner?
 
@@ -32,8 +32,8 @@ A small, fast HTTP core you can trust on the hot path.
   no C NIFs, and Roadrunner owns its own h1/h2/h3 codecs and its own QUIC
   transport: easy to read and audit.
 - **Pleasant to build on**: Plain-Erlang request and response values, composable
-  middleware, and opt-in helpers for cookies, query strings, multipart, SSE, and
-  WebSocket.
+  middleware, and opt-in helpers for cookies, query strings, multipart, SSE,
+  NDJSON, and WebSocket.
 - **Production lifecycle in the box**: Graceful drain with a deadline, telemetry
   events, per-request `request_id` log correlation, and configurable DoS bounds.
 
@@ -137,6 +137,7 @@ means out of scope for that server.
 | Streaming request bodies                  |     ✓      |   ✓    |  —   |
 | Native qs / cookie / multipart            |     ✓      |   ✓    |  —   |
 | Server-Sent Events helper                 |     ✓      |   —    |  —   |
+| NDJSON streaming helper                   |     ✓      |   —    |  —   |
 | Sendfile                                  |     ✓      |   ✓    |  ✓   |
 | Static handler (ETag / Range / IMS)       |     ✓      |   ✓    |  —   |
 | Graceful drain with deadline + broadcast  |     ✓      |   —    |  ✗   |
@@ -305,9 +306,11 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
 ### Handlers
 
 - **Buffered responses**: `{Status, Headers, Body}` via `roadrunner_resp:text/2`,
-  `:html/2`, `:json/2`, `:redirect/2`, plus empty-status shortcuts.
+  `:html/2`, `:json/2`, `:ndjson/2`, `:redirect/2`, plus empty-status shortcuts.
 - **Streaming**: `{stream, Status, Headers, Fun}`, chunked transfer with a
   `Send/2` callback; supports trailer headers per RFC 9112 §7.1.2.
+  `roadrunner_ndjson:item/1` frames newline-delimited JSON lines for a
+  streamed or buffered response.
 - **Loop / SSE**: `{loop, Status, Headers, State}` plus an optional
   `handle_info/3` callback for message-driven push.
 - **WebSocket**: `{websocket, Module, State}` upgrade with a

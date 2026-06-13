@@ -18,6 +18,7 @@ WebSocket-upgrade handlers build their own tuple directly; see
     text/2,
     html/2,
     json/2,
+    ndjson/2,
     redirect/2,
     add_header/3,
     set_cookie/4,
@@ -68,6 +69,18 @@ JSON response — the term is encoded via the stdlib `json` module
 json(Status, Term) ->
     Body = json:encode(Term),
     with_length(Status, ~"application/json", Body).
+
+-doc """
+NDJSON response — each item in `Items` is framed as one compact JSON
+document on its own line via `roadrunner_ndjson:item/1`, and
+`Content-Type` is set to `application/x-ndjson`. The buffered companion
+to a `{stream, ...}` handler that pushes `roadrunner_ndjson:item/1` per
+line; reach for this when the whole list fits in memory.
+""".
+-spec ndjson(StatusCode :: roadrunner_http:status(), Items :: [term()]) -> buffered_response().
+ndjson(Status, Items) when is_list(Items) ->
+    Body = [roadrunner_ndjson:item(Item) || Item <- Items],
+    with_length(Status, roadrunner_ndjson:content_type(), Body).
 
 -doc """
 Redirect response — sets the `Location` header and an empty body.
