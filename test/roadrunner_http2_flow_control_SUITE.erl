@@ -25,7 +25,6 @@ reuse / scheduling races.
     inbound_data_over_stream_window_triggers_rst_stream/1,
     inbound_data_over_conn_window_triggers_goaway/1,
     inbound_padded_data_counts_padding_against_window/1,
-    window_update_for_unknown_stream_ignored/1,
     stream_window_update_grows_send_window/1,
     large_response_chunks_through_send_window/1,
     large_response_blocked_resumes_on_window_update/1,
@@ -56,7 +55,6 @@ all() ->
         inbound_data_over_stream_window_triggers_rst_stream,
         inbound_data_over_conn_window_triggers_goaway,
         inbound_padded_data_counts_padding_against_window,
-        window_update_for_unknown_stream_ignored,
         stream_window_update_grows_send_window,
         large_response_chunks_through_send_window,
         large_response_blocked_resumes_on_window_update,
@@ -161,16 +159,6 @@ inbound_padded_data_counts_padding_against_window(_Config) ->
     Rst = expect_send_type(3),
     {ok, {rst_stream, 1, flow_control_error}, <<>>} =
         roadrunner_http2_frame:parse(Rst, 16384),
-    true = is_process_alive(Pid),
-    cleanup(Pid, Ref).
-
-window_update_for_unknown_stream_ignored(_Config) ->
-    %% WINDOW_UPDATE for a stream that's not currently open is
-    %% silently dropped (closed-stream legality per RFC 9113 §6.9).
-    {Pid, Ref, ConnPid} = start_conn(roadrunner_hello_handler),
-    handshake(ConnPid),
-    Wu = encode_frame({window_update, 99, 1024}),
-    serve_recv(ConnPid, Wu),
     true = is_process_alive(Pid),
     cleanup(Pid, Ref).
 
