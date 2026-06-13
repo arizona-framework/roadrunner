@@ -96,11 +96,12 @@ advisory or malformed cases the server currently tolerates or omits.
 
 ### Transport completeness — bites large transfers / advanced cases
 
-- Send-side flow control: emit `DATA_BLOCKED` / `STREAM_DATA_BLOCKED` when a
-  transfer is held at the current limit (RFC 9000 §4) so the peer knows to grant
-  more. Seeding the windows from the peer's transport params, raising them on
-  inbound `MAX_DATA` / `MAX_STREAM_DATA`, and granting outbound credit are done;
-  the blocked-frame signal is the advisory remainder — small
+- Send-side flow control edge: signal `DATA_BLOCKED` / `STREAM_DATA_BLOCKED` when
+  the send window is zero *before any data is sent* (a peer that advertised
+  `initial_max_data` / `initial_max_stream_data` of 0). The common case — a
+  transfer that fills a non-zero window — already emits the frame on the
+  flow's blocked transition; this remainder is the never-sent-a-byte case a
+  conformant peer never produces — small
 - Stream-count self-limiting (RFC 9000 §4.6): honor an inbound `MAX_STREAMS`, and
   check the peer's `initial_max_streams_uni` before opening the server's own
   control / QPACK uni streams (it opens ~3, always within a sane client's limit).
