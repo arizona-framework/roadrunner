@@ -4,7 +4,7 @@ Roadrunner bounds how much memory and CPU a single connection or peer
 can pull in before any handler runs. The goal is that no client, by
 sending oversized, malformed, or slow input, can grow a connection's
 memory without bound or pin a worker. Every limit on this page is on by
-default.
+default, except the opt-in per-peer rate guard (`rate_limit`, below).
 
 This page is an operator reference. For the reporting policy, see
 `SECURITY.md`. For the exact option types, see
@@ -114,6 +114,7 @@ so there is no dynamic-table memory to bound yet.
 | `keep_alive_timeout` | 60 s | yes | idle timeout between requests |
 | `max_keep_alive_requests` | 1000 | yes | requests served per connection before close |
 | `min_bytes_per_second` | 100 | yes (0 disables) | slow-loris guard on the request-read phase |
+| `rate_limit` | off | opt-in | per-peer request-rate cap (`429` + `Retry-After`) |
 
 `max_clients` bounds connections and the HTTP/2 / HTTP/3
 `max_concurrent_streams` bounds streams per connection, but their product
@@ -128,6 +129,21 @@ handler runs, and the refusal emits `[roadrunner, request, throttled]` and
 increments the `throttled` count from `roadrunner_listener:info/1`. HTTP/1
 is unaffected: it serves one request per connection, so `max_clients`
 already bounds it.
+
+Where `max_clients` and `max_concurrent_requests` bound the listener's
+total load, `rate_limit` (off by default, the only opt-in guard here) caps
+a single **source**, so one peer cannot monopolize the server. It is a
+token bucket keyed on the client IP: `#{rate := N, period => Secs, burst
+=> B}` allows `N` requests per `period` seconds (default 1) with a burst
+of `B` (default `N`). A peer over its rate gets `429 Too Many Requests` +
+`Retry-After` before any handler runs (a real 429 on HTTP/2 and HTTP/3,
+not the retry-safe `REFUSED_STREAM` / `H3_REQUEST_REJECTED`, so clients
+back off instead of retrying at once), emitting `[roadrunner, request,
+throttled]` with `reason => rate_limit` and incrementing the
+`rate_limited` count from `roadrunner_listener:info/1`. Idle per-peer
+buckets are swept on a timer (`idle_ttl` / `sweep_interval`). It keys on
+the real client IP, so set `proxy_protocol` behind an L4 balancer for
+accurate per-client limiting.
 
 ## Configuring
 

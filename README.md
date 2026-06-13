@@ -282,7 +282,10 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
 
 - **DoS bounds**: `max_clients`, `max_concurrent_requests`,
   `socket_backlog`, `max_content_length`, `request_timeout`,
-  `keep_alive_timeout`, `min_bytes_per_second`, `max_keep_alive_requests`
+  `keep_alive_timeout`, `min_bytes_per_second`, `max_keep_alive_requests`,
+  `rate_limit` (opt-in per-peer request-rate guard)
+- **Real client IP**: `proxy_protocol` (read the PROXY-protocol header an
+  L4 balancer prepends, so `roadrunner_req:peer/1` is the real client)
 - **Middleware**: `middlewares`
 - **Body buffering**: `body_buffering`
 - **Graceful drain**: `graceful_drain`, `slot_reconciliation`
@@ -325,6 +328,16 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
   `{Callable, State}` pair, where `Callable` is a module (`call/3`) or a
   `fun((Req, Next, State) -> {Response, Req2})`. Listener-level + per-route,
   first-in-list = outermost.
+
+### Built-in middleware
+
+- **`roadrunner_compress`**: gzip / deflate response compression negotiated
+  on `Accept-Encoding`, with `Vary: Accept-Encoding`.
+- **`roadrunner_security_headers`**: a default-safe response header set
+  (`x-content-type-options`, `x-frame-options`, `referrer-policy`), with
+  opt-in HSTS and CSP; a header the handler already set wins.
+- **`roadrunner_cors`**: configurable CORS with an `OPTIONS` preflight
+  short-circuit, deny-by-default origins, and a cache-correct `Vary: Origin`.
 
 ### Built-in handlers
 
