@@ -883,6 +883,7 @@ status_line(400) -> ~"HTTP/1.1 400 Bad Request\r\n";
 status_line(401) -> ~"HTTP/1.1 401 Unauthorized\r\n";
 status_line(403) -> ~"HTTP/1.1 403 Forbidden\r\n";
 status_line(404) -> ~"HTTP/1.1 404 Not Found\r\n";
+status_line(429) -> ~"HTTP/1.1 429 Too Many Requests\r\n";
 status_line(500) -> ~"HTTP/1.1 500 Internal Server Error\r\n";
 status_line(503) -> ~"HTTP/1.1 503 Service Unavailable\r\n";
 %% Uncommon status codes — emit `HTTP/1.1 NNN \r\n` with an empty

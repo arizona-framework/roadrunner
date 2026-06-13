@@ -23,6 +23,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     large_post/1,
     not_found/1,
     crash_500/1,
+    rate_limited/1,
     forbidden_response_header_stripped/1,
     unsafe_response_header_500/1,
     unsupported_shapes_501/1,
@@ -92,6 +93,7 @@ all() ->
         large_post,
         not_found,
         crash_500,
+        rate_limited,
         forbidden_response_header_stripped,
         unsafe_response_header_500,
         unsupported_shapes_501,
@@ -181,6 +183,7 @@ end_per_suite(_Config) ->
 %% max_clients, no TLS) start their own and skip this one.
 init_per_testcase(Case, Config) when
     Case =:= not_found;
+    Case =:= rate_limited;
     Case =:= oversized_413;
     Case =:= protocols_tuple_form;
     Case =:= certfile_keyfile;
@@ -281,6 +284,22 @@ crash_500(Config) ->
     Conn = connect(?config(port, Config)),
     ?assertMatch({500, _}, status_body(get(Conn, ~"/crash"))),
     close(Conn).
+
+rate_limited(_Config) ->
+    %% Per-peer rate guard over h3: the first request (full bucket) reaches the
+    %% handler; the second from the same peer is refused with 429 + Retry-After
+    %% (a real response, not H3_REQUEST_REJECTED).
+    Name = listener_name(rate_limited),
+    {ok, _} = start_h3(Name, #{rate_limit => #{rate => 1, burst => 1}}),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        ?assertMatch({200, _}, status_body(get(Conn, ~"/"))),
+        {429, Headers, _} = get(Conn, ~"/"),
+        ?assertEqual(~"1", proplists:get_value(~"retry-after", Headers))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
 
 forbidden_response_header_stripped(Config) ->
     %% A handler returning any connection-specific header has it stripped
