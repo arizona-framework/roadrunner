@@ -680,6 +680,28 @@ handle_frame(#{opcode := ping, payload := P}, Data, Hibernate) ->
 handle_frame(#{opcode := pong}, Data, Hibernate) ->
     %% Server is not pinging clients yet — pong from client is dropped.
     process_buffer(Data, Hibernate);
+handle_frame(
+    #{fin := true, rsv1 := false, opcode := Op, payload := P} = Frame,
+    #data{msg_acc = undefined, utf8_pending = Pending, max_message_size = MaxMsg} = Data,
+    Hibernate
+) when
+    (Op =:= text orelse Op =:= binary), byte_size(P) =< MaxMsg
+->
+    %% Fast path for the dominant case: a complete, unfragmented,
+    %% uncompressed data message delivered in one frame, with no message
+    %% already in progress. The parsed `Frame` is already byte-identical
+    %% to what the reassembly path would synthesize, so dispatch it
+    %% directly and skip the fragment machinery (classify, the `[P]`
+    %% cons, `finalize_message`, and the synthesized map). Wire-level
+    %% UTF-8 ran incrementally; FIN only adds "no trailing incomplete
+    %% sequence". Oversized (> `max_message_size`), compressed (RSV1) and
+    %% mid-fragmentation frames fall through to the reassembly path below.
+    case fragment_validate_fin(Op, false, Pending, P, Data) of
+        ok ->
+            dispatch_data_frame(Frame, reset_msg(Data), Hibernate);
+        invalid_utf8 ->
+            close_with(close_invalid_payload(), reset_msg(Data))
+    end;
 handle_frame(Frame, Data, Hibernate) ->
     %% Data frames (text / binary / continuation). Per RFC 6455 §5.4 a
     %% message MAY be fragmented across multiple frames at the wire
