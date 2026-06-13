@@ -106,6 +106,35 @@ coalesced_split_first_frame_completes_from_socket_test() ->
     Sink ! stop,
     ok = gen_statem:stop(Pid).
 
+coalesced_split_after_header_completes_test() ->
+    %% Full header buffered but the body split across reads. Exercises the
+    %% `parse_frame_known {more}` re-arm in `process_parsed_frame/4` (the
+    %% header is decoded once by the peek; the body just isn't all here yet).
+    Self = self(),
+    Tag = make_ref(),
+    Full = frame(text, ~"hello"),
+    %% 6-byte header+mask for the 5-byte payload; split mid-body at byte 8.
+    <<First:8/binary, Second/binary>> = Full,
+    Sink = spawn_active_sink(Self, Tag, [{recv, Second}]),
+    {ok, Pid} = gen_statem:start(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            First,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"hello")),
+    Sink ! stop,
+    ok = gen_statem:stop(Pid).
+
 %% =============================================================================
 %% Active-mode frame_loop — hibernate, transport error, and stray-info
 %% paths. Drives the gen_statem directly (skipping the run/5 launcher)

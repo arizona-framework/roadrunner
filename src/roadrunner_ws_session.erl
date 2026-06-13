@@ -435,27 +435,38 @@ process_buffer(#data{buffer = Buf, pmd_params = Pmd} = Data, HibernateAcc) ->
             _ -> #{allow_rsv1 => true}
         end,
     case early_validate_text(Data, Buf, Opts) of
-        {ok, Data1, MaybeTotalLen} ->
-            case frame_within_cap(MaybeTotalLen, Data1) of
+        {frame, #{total_payload_len := TotalLen} = Header, Data1} ->
+            case frame_within_cap(TotalLen, Data1) of
                 false ->
                     %% Declared frame payload exceeds `max_frame_size`.
                     %% The header is in hand but the body isn't buffered
                     %% yet — close now (RFC 6455 §7.4 code 1009) instead
                     %% of letting the `{more, _}` re-arm keep reading.
-                    close_oversize(max_frame_size, MaybeTotalLen, Data1);
+                    close_oversize(max_frame_size, TotalLen, Data1);
                 true ->
-                    process_parsed_frame(Data1, Buf, Opts, MaybeTotalLen, HibernateAcc)
+                    process_parsed_frame(Data1, Buf, Header, HibernateAcc)
             end;
+        {more, Data1} ->
+            arm_or_stop(Data1#data.socket, Data1, hibernate_actions(HibernateAcc));
+        {error, _} ->
+            %% RFC 6455 §5.5.1 / §7.4.1: a header-level framing violation
+            %% (bad opcode, RSV, unmasked client frame, fragmented or
+            %% oversize control, or a 64-bit length with the high bit set)
+            %% the header peek already rejected — send a 1002 Close rather
+            %% than dropping the TCP connection silently.
+            close_with(close_protocol_error(), Data);
         invalid_utf8 ->
             close_with(close_invalid_payload(), reset_msg(Data))
     end.
 
--spec process_parsed_frame(
-    #data{}, binary(), roadrunner_ws:parse_opts(), non_neg_integer() | undefined, boolean()
-) -> gen_statem:event_handler_result(atom()).
-process_parsed_frame(#data{socket = Socket} = Data1, Buf, Opts, MaybeTotalLen, HibernateAcc) ->
-    ParseOpts = parse_opts_with_pre_unmasked(Opts, Data1, MaybeTotalLen),
-    case roadrunner_ws:parse_frame(Buf, ParseOpts) of
+-spec process_parsed_frame(#data{}, binary(), map(), boolean()) ->
+    gen_statem:event_handler_result(atom()).
+process_parsed_frame(#data{socket = Socket} = Data1, Buf, Header, HibernateAcc) ->
+    %% `Header` was decoded by the peek in `early_validate_text/3`;
+    %% `parse_frame_known` reuses it (no second decode) and only needs to
+    %% confirm the body is fully buffered. Header-level protocol errors
+    %% were already surfaced upstream, so there's no `{error, _}` here.
+    case roadrunner_ws:parse_frame_known(Buf, Header, pre_unmasked(Data1, Header)) of
         {ok, #{opcode := Opcode} = Frame, NewBuffer} ->
             ok = roadrunner_telemetry:ws_frame_in(
                 (Data1#data.ctx)#{opcode => Opcode},
@@ -472,39 +483,28 @@ process_parsed_frame(#data{socket = Socket} = Data1, Buf, Opts, MaybeTotalLen, H
                 HibernateAcc
             );
         {more, _} ->
-            arm_or_stop(Socket, Data1, hibernate_actions(HibernateAcc));
-        {error, _} ->
-            %% RFC 6455 §5.5.1 / §7.4.1: a framing violation (bad opcode,
-            %% RSV, unmasked client frame, fragmented control, oversize
-            %% control, or a 64-bit length with the high bit set) is a
-            %% protocol error — send a 1002 Close before closing rather
-            %% than dropping the TCP connection silently.
-            close_with(close_protocol_error(), Data1)
+            arm_or_stop(Socket, Data1, hibernate_actions(HibernateAcc))
     end.
 
-%% Hand the cached unmasked payload to `parse_frame` when (and only
+%% Hand the cached unmasked payload to `parse_frame_known` when (and only
 %% when) `early_validate_text/3` has unmasked the entire payload as a
-%% side-effect of UTF-8 validation. Keeps `parse_frame` from
-%% redundantly unmasking the same bytes a second time — saved ~40% of
-%% own time on the WS hot path.
-parse_opts_with_pre_unmasked(Opts, _Data, undefined) ->
-    Opts;
-parse_opts_with_pre_unmasked(Opts, #data{unmasked_buf = Buf}, TotalLen) when
+%% side-effect of UTF-8 validation. Keeps the parse from redundantly
+%% unmasking the same bytes a second time — saved ~40% of own time on the
+%% WS text hot path.
+-spec pre_unmasked(#data{}, map()) -> binary() | undefined.
+pre_unmasked(#data{unmasked_buf = Buf}, #{total_payload_len := TotalLen}) when
     byte_size(Buf) =:= TotalLen, TotalLen > 0
 ->
-    Opts#{pre_unmasked => Buf};
-parse_opts_with_pre_unmasked(Opts, _Data, _TotalLen) ->
-    Opts.
+    Buf;
+pre_unmasked(_Data, _Header) ->
+    undefined.
 
 %% Per-frame size cap. The peeked header reveals the frame's declared
 %% payload length before the body is buffered, so an oversized frame is
 %% rejected on the header alone (≤14 bytes seen) rather than after the
-%% `{more, _}` re-arm reads the whole payload. `undefined` means the
-%% length isn't known yet — let parsing continue and re-check on the
-%% next pass.
--spec frame_within_cap(non_neg_integer() | undefined, #data{}) -> boolean().
-frame_within_cap(undefined, _Data) ->
-    true;
+%% `{more, _}` re-arm reads the whole payload. Only reached once the peek
+%% has a full header, so the length is always known here.
+-spec frame_within_cap(non_neg_integer(), #data{}) -> boolean().
 frame_within_cap(TotalLen, #data{max_frame_size = Max}) ->
     TotalLen =< Max.
 
@@ -517,14 +517,17 @@ frame_within_cap(TotalLen, #data{max_frame_size = Max}) ->
 %% Skipped when the in-progress frame isn't a fresh text data frame
 %% (binary, control, continuation, or compressed all bypass — they
 %% have their own validation paths or no encoding constraint).
-%% Returns `{ok, Data, MaybeTotalLen}` — the third element carries
-%% the in-progress frame's total payload length when a header was
-%% peekable, or `undefined` when there isn't enough buffer to know
-%% yet (or the frame isn't a fresh uncompressed text frame). The
-%% caller (`process_buffer/2`) uses it to decide whether to hand the
-%% accumulated `unmasked_buf` to `parse_frame` via `pre_unmasked`.
+%% Returns the decoded peek header so the caller hands it straight to
+%% `roadrunner_ws:parse_frame_known/3` (no second header decode):
+%% - `{frame, Header, Data}` — full header peeked (text payload bytes
+%%   so far validated + unmasked into `Data`'s `unmasked_buf`);
+%% - `{more, Data}` — header not fully buffered yet, re-arm for the rest;
+%% - `{error, Reason}` — a header-level protocol violation the peek
+%%   already rejects (bad opcode/RSV/length, unmasked, oversized or
+%%   fragmented control), surfaced here so we don't re-decode to find it;
+%% - `invalid_utf8` — a text payload byte broke UTF-8 (close 1007).
 -spec early_validate_text(#data{}, binary(), roadrunner_ws:parse_opts()) ->
-    {ok, #data{}, non_neg_integer() | undefined} | invalid_utf8.
+    {frame, map(), #data{}} | {more, #data{}} | {error, term()} | invalid_utf8.
 early_validate_text(Data, Buf, Opts) ->
     case roadrunner_ws:peek_frame_header(Buf, Opts) of
         {ok,
@@ -534,7 +537,7 @@ early_validate_text(Data, Buf, Opts) ->
                 mask_key := MaskKey,
                 payload_offset := Off,
                 total_payload_len := TotalLen
-            },
+            } = Header,
             Available} ->
             #data{
                 frame_validated = AlreadyValidated,
@@ -544,36 +547,33 @@ early_validate_text(Data, Buf, Opts) ->
             ToValidate = min(Available, TotalLen) - AlreadyValidated,
             case ToValidate > 0 of
                 false ->
-                    {ok, Data, TotalLen};
+                    {frame, Header, Data};
                 true ->
                     Slice = binary:part(Buf, Off + AlreadyValidated, ToValidate),
                     Unmasked = unmask_slice(Slice, MaskKey, AlreadyValidated),
                     case validate_incremental(text, false, Pending, Unmasked) of
                         {ok, NewPending} ->
-                            {ok,
-                                Data#data{
-                                    utf8_pending = NewPending,
-                                    frame_validated = AlreadyValidated + ToValidate,
-                                    unmasked_buf = <<UnmaskedBuf/binary, Unmasked/binary>>
-                                },
-                                TotalLen};
+                            {frame, Header, Data#data{
+                                utf8_pending = NewPending,
+                                frame_validated = AlreadyValidated + ToValidate,
+                                unmasked_buf = append_bin(UnmaskedBuf, Unmasked)
+                            }};
                         invalid_utf8 ->
                             invalid_utf8
                     end
             end;
-        {ok, #{total_payload_len := TotalLen}, _Available} ->
+        {ok, Header, _Available} ->
             %% Header is peekable but the in-progress frame isn't a
             %% fresh uncompressed text frame (binary / control /
             %% continuation / compressed). No incremental UTF-8
-            %% validation applies, but surface the declared length so
-            %% `process_buffer/2` can apply the per-frame size cap
-            %% before the body is buffered.
-            {ok, Data, TotalLen};
-        _ ->
-            %% Header isn't peekable yet — not enough buffered bytes to
-            %% know the declared length. parse_frame will catch protocol
-            %% errors; UTF-8 validation happens at fragment / FIN time.
-            {ok, Data, undefined}
+            %% validation applies; hand the decoded header straight on so
+            %% the parse reuses it and the size cap still sees the length.
+            {frame, Header, Data};
+        {more, undefined} ->
+            %% Header isn't fully buffered yet — re-arm for the rest.
+            {more, Data};
+        {error, _} = Err ->
+            Err
     end.
 
 %% Unmask `Slice` where its first byte sits at `Offset` into the
@@ -584,9 +584,9 @@ early_validate_text(Data, Buf, Opts) ->
 unmask_slice(Slice, <<MaskKey:32>>, Offset) ->
     %% Rotate the 32-bit mask so its byte at the slice's logical
     %% start lines up with bit position 0 — same trick as cowlib's
-    %% `cow_ws:unmask/3`. After rotation we can XOR 4 bytes at a
-    %% time (16 per recursion) instead of byte-at-a-time, which
-    %% on 1 KB payloads is ~10× faster than the old iolist version.
+    %% `cow_ws:unmask/3`. After rotation we XOR 4 bytes at a time,
+    %% 64 per recursion (16 × 32-bit words), which beats both the
+    %% byte-at-a-time iolist version and a narrower 4-word pass.
     Left = (Offset rem 4) * 8,
     Right = 32 - Left,
     Rotated = (MaskKey bsl Left) + (MaskKey bsr Right),
@@ -597,12 +597,20 @@ unmask_slice(Slice, <<MaskKey:32>>, Offset) ->
     unmask_slice_chunks(Slice, Rotated32, <<>>).
 
 -spec unmask_slice_chunks(binary(), non_neg_integer(), binary()) -> binary().
-unmask_slice_chunks(<<O1:32, O2:32, O3:32, O4:32, Rest/binary>>, MK, Acc) ->
-    T1 = O1 bxor MK,
-    T2 = O2 bxor MK,
-    T3 = O3 bxor MK,
-    T4 = O4 bxor MK,
-    unmask_slice_chunks(Rest, MK, <<Acc/binary, T1:32, T2:32, T3:32, T4:32>>);
+unmask_slice_chunks(
+    <<O1:32, O2:32, O3:32, O4:32, O5:32, O6:32, O7:32, O8:32, O9:32, O10:32, O11:32, O12:32, O13:32,
+        O14:32, O15:32, O16:32, Rest/binary>>,
+    MK,
+    Acc
+) ->
+    unmask_slice_chunks(
+        Rest,
+        MK,
+        <<Acc/binary, (O1 bxor MK):32, (O2 bxor MK):32, (O3 bxor MK):32, (O4 bxor MK):32,
+            (O5 bxor MK):32, (O6 bxor MK):32, (O7 bxor MK):32, (O8 bxor MK):32, (O9 bxor MK):32,
+            (O10 bxor MK):32, (O11 bxor MK):32, (O12 bxor MK):32, (O13 bxor MK):32,
+            (O14 bxor MK):32, (O15 bxor MK):32, (O16 bxor MK):32>>
+    );
 unmask_slice_chunks(<<O:32, Rest/binary>>, MK, Acc) ->
     T = O bxor MK,
     unmask_slice_chunks(Rest, MK, <<Acc/binary, T:32>>);
@@ -623,7 +631,18 @@ unmask_slice_chunks(<<>>, _MK, Acc) ->
 
 -spec append_buffer(#data{}, binary()) -> #data{}.
 append_buffer(#data{buffer = Buf} = Data, Bytes) ->
-    Data#data{buffer = <<Buf/binary, Bytes/binary>>}.
+    Data#data{buffer = append_bin(Buf, Bytes)}.
+
+%% Append `New` onto `Acc`, returning `New` untouched when `Acc` is empty.
+%% The single-chunk hot path (a whole frame in one TCP read, the buffer
+%% and unmasked accumulator drained, no partial UTF-8 carried over) hits
+%% the empty case every time, skipping a full payload-sized copy per
+%% inbound frame. Returning the bare binary also lets the UTF-8 BIF take
+%% its fast binary path, which is measured well ahead of both a pre-concat
+%% copy and an iodata list (the BIF walks a list far slower).
+-spec append_bin(binary(), binary()) -> binary().
+append_bin(<<>>, New) -> New;
+append_bin(Acc, New) -> <<Acc/binary, New/binary>>.
 
 -spec hibernate_actions(boolean()) -> [hibernate].
 hibernate_actions(true) -> [hibernate];
@@ -661,6 +680,28 @@ handle_frame(#{opcode := ping, payload := P}, Data, Hibernate) ->
 handle_frame(#{opcode := pong}, Data, Hibernate) ->
     %% Server is not pinging clients yet — pong from client is dropped.
     process_buffer(Data, Hibernate);
+handle_frame(
+    #{fin := true, rsv1 := false, opcode := Op, payload := P} = Frame,
+    #data{msg_acc = undefined, utf8_pending = Pending, max_message_size = MaxMsg} = Data,
+    Hibernate
+) when
+    (Op =:= text orelse Op =:= binary), byte_size(P) =< MaxMsg
+->
+    %% Fast path for the dominant case: a complete, unfragmented,
+    %% uncompressed data message delivered in one frame, with no message
+    %% already in progress. The parsed `Frame` is already byte-identical
+    %% to what the reassembly path would synthesize, so dispatch it
+    %% directly and skip the fragment machinery (classify, the `[P]`
+    %% cons, `finalize_message`, and the synthesized map). Wire-level
+    %% UTF-8 ran incrementally; FIN only adds "no trailing incomplete
+    %% sequence". Oversized (> `max_message_size`), compressed (RSV1) and
+    %% mid-fragmentation frames fall through to the reassembly path below.
+    case fragment_validate_fin(Op, false, Pending, P, Data) of
+        ok ->
+            dispatch_data_frame(Frame, reset_msg(Data), Hibernate);
+        invalid_utf8 ->
+            close_with(close_invalid_payload(), reset_msg(Data))
+    end;
 handle_frame(Frame, Data, Hibernate) ->
     %% Data frames (text / binary / continuation). Per RFC 6455 §5.4 a
     %% message MAY be fragmented across multiple frames at the wire
@@ -817,8 +858,7 @@ validate_fin_fragment(binary, _Compressed, _Pending, _Bytes) ->
 validate_fin_fragment(text, true, _Pending, _Bytes) ->
     ok;
 validate_fin_fragment(text, false, Pending, Bytes) ->
-    Combined = <<Pending/binary, Bytes/binary>>,
-    case unicode:characters_to_binary(Combined, utf8, utf8) of
+    case unicode:characters_to_binary(append_bin(Pending, Bytes), utf8, utf8) of
         Bin when is_binary(Bin) -> ok;
         %% Trailing bytes that didn't form a complete sequence are
         %% invalid at FIN time per RFC 6455 §8.1.
@@ -893,8 +933,10 @@ validate_incremental(binary, _Compressed, _Pending, _Bytes) ->
 validate_incremental(text, true, _Pending, _Bytes) ->
     {ok, <<>>};
 validate_incremental(text, false, Pending, Bytes) ->
-    Combined = <<Pending/binary, Bytes/binary>>,
-    case unicode:characters_to_binary(Combined, utf8, utf8) of
+    %% Empty `Pending` (the common case) hands the validator the payload
+    %% binary as-is — the BIF's fast binary path beats a pre-concat copy
+    %% and an iodata list alike.
+    case unicode:characters_to_binary(append_bin(Pending, Bytes), utf8, utf8) of
         Bin when is_binary(Bin) ->
             %% Fully-valid (no trailing incomplete sequence).
             {ok, <<>>};

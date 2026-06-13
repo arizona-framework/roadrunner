@@ -18,6 +18,7 @@ frames.
 
 -export([accept_key/1, handshake_response/1]).
 -export([parse_frame/1, parse_frame/2]).
+-export([parse_frame_known/3]).
 -export([peek_frame_header/2]).
 -export([encode_frame/3, encode_frame/4]).
 -export([parse_extensions/1, negotiate_extensions/1]).
@@ -529,6 +530,53 @@ parse_frame(Bin, Opts) ->
         maps:get(pre_unmasked, Opts, undefined)
     ).
 
+%% Parse a frame whose header `roadrunner_ws_session` already decoded via
+%% `peek_frame_header/2`, skipping the redundant second header decode and
+%% re-validation. `Header` is the peek map; `Pre` is the caller's
+%% already-unmasked payload (when the whole payload was unmasked during
+%% incremental UTF-8 validation) or `undefined`. Returns `{more,
+%% undefined}` when the body isn't fully buffered yet. Header-level
+%% protocol errors (bad opcode/RSV/length, unmasked, oversized or
+%% fragmented control) were already surfaced by the peek, so this never
+%% returns `{error, _}`. `parse_frame/2` stays the standalone (test
+%% oracle) entry that decodes from scratch.
+-doc false.
+-spec parse_frame_known(binary(), map(), binary() | undefined) ->
+    {ok, frame(), Rest :: binary()} | {more, undefined}.
+parse_frame_known(
+    Buf,
+    #{
+        payload_offset := Off,
+        total_payload_len := Len,
+        mask_key := MaskKey,
+        fin := Fin,
+        rsv1 := Rsv1,
+        opcode := Op
+    },
+    Pre
+) ->
+    case Buf of
+        <<_Header:Off/binary, Payload:Len/binary, Rest/binary>> ->
+            {ok,
+                #{
+                    fin => Fin,
+                    rsv1 => Rsv1,
+                    opcode => Op,
+                    payload => known_payload(Pre, Payload, MaskKey)
+                },
+                Rest};
+        _ ->
+            {more, undefined}
+    end.
+
+%% Use the caller's already-unmasked payload when supplied, else unmask
+%% the masked bytes now. The session supplies `Pre` only when it unmasked
+%% the full payload during `early_validate_text/3`, so it always matches
+%% the frame length.
+-spec known_payload(binary() | undefined, binary(), binary()) -> binary().
+known_payload(undefined, Payload, MaskKey) -> unmask(Payload, MaskKey);
+known_payload(Pre, _Payload, _MaskKey) -> Pre.
+
 -spec do_parse_frame(binary(), boolean(), binary() | undefined) -> parse_result().
 do_parse_frame(<<_Fin:1, _Rsv1:1, Rsv23:2, _:4, _/bitstring>>, _AllowRsv1, _Pre) when
     Rsv23 =/= 0
@@ -706,22 +754,31 @@ parse_payload(Len, 1, Bin, Fin, Rsv1, Op, Pre) ->
     end.
 
 %% Unmask a client→server payload (RFC 6455 §5.3) by XOR'ing
-%% against the 32-bit `MaskKey` repeatedly. Processes 16 bytes
-%% per recursion (4 × 32-bit words) so the BEAM JIT can emit
-%% straight-line code for the common case — same shape as
-%% cowlib's `cow_ws:mask/3`. For 1 KB payloads this is ~10×
-%% faster than the byte-at-a-time iolist version.
+%% against the 32-bit `MaskKey`. Processes 64 bytes per recursion
+%% (16 × 32-bit words) so the per-pass cost (match-context setup,
+%% the call, append bookkeeping) is amortised over more bytes —
+%% measured ~15-27% faster than a 16-byte (4-word) pass across
+%% 64 B–1 KB payloads. 32-bit words stay inside a 60-bit fixnum;
+%% 64-bit words would spill to heap bignums and lose.
 -spec unmask(binary(), binary()) -> binary().
 unmask(Payload, <<MaskKey:32>>) ->
     unmask_chunks(Payload, MaskKey, <<>>).
 
 -spec unmask_chunks(binary(), non_neg_integer(), binary()) -> binary().
-unmask_chunks(<<O1:32, O2:32, O3:32, O4:32, Rest/binary>>, MK, Acc) ->
-    T1 = O1 bxor MK,
-    T2 = O2 bxor MK,
-    T3 = O3 bxor MK,
-    T4 = O4 bxor MK,
-    unmask_chunks(Rest, MK, <<Acc/binary, T1:32, T2:32, T3:32, T4:32>>);
+unmask_chunks(
+    <<O1:32, O2:32, O3:32, O4:32, O5:32, O6:32, O7:32, O8:32, O9:32, O10:32, O11:32, O12:32, O13:32,
+        O14:32, O15:32, O16:32, Rest/binary>>,
+    MK,
+    Acc
+) ->
+    unmask_chunks(
+        Rest,
+        MK,
+        <<Acc/binary, (O1 bxor MK):32, (O2 bxor MK):32, (O3 bxor MK):32, (O4 bxor MK):32,
+            (O5 bxor MK):32, (O6 bxor MK):32, (O7 bxor MK):32, (O8 bxor MK):32, (O9 bxor MK):32,
+            (O10 bxor MK):32, (O11 bxor MK):32, (O12 bxor MK):32, (O13 bxor MK):32,
+            (O14 bxor MK):32, (O15 bxor MK):32, (O16 bxor MK):32>>
+    );
 unmask_chunks(<<O:32, Rest/binary>>, MK, Acc) ->
     T = O bxor MK,
     unmask_chunks(Rest, MK, <<Acc/binary, T:32>>);
@@ -763,10 +820,9 @@ encode_frame(Opcode, Payload, Fin, Opts) ->
     Op = encode_opcode(Opcode),
     FinBit = fin_bit(Fin),
     Rsv1Bit = rsv_bit(maps:get(rsv1, Opts, false)),
-    PayloadBin = iolist_to_binary(Payload),
-    Len = byte_size(PayloadBin),
+    Len = iolist_size(Payload),
     Header = encode_header(FinBit, Rsv1Bit, Op, Len),
-    [Header, PayloadBin].
+    [Header, Payload].
 
 -spec encode_header(0 | 1, 0 | 1, 0..15, non_neg_integer()) -> binary().
 encode_header(FinBit, Rsv1Bit, Op, Len) when Len =< 125 ->

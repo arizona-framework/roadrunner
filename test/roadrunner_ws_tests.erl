@@ -456,6 +456,20 @@ parse_frame_bad_rsv_test() ->
     Frame = <<16#c1, 16#80, 1, 2, 3, 4>>,
     ?assertEqual({error, bad_rsv}, roadrunner_ws:parse_frame(Frame)).
 
+parse_frame_64bit_length_high_bit_rejected_test() ->
+    %% RFC 6455 §5.2: the 64-bit extended length's MSB must be 0.
+    Frame = <<16#81, 16#ff, (1 bsl 63):64, 1, 2, 3, 4>>,
+    ?assertEqual({error, bad_length}, roadrunner_ws:parse_frame(Frame)).
+
+parse_frame_pre_unmasked_skips_unmask_test() ->
+    %% The session supplies already-unmasked bytes via `pre_unmasked`;
+    %% parse_frame/2 uses them verbatim instead of unmasking a second time.
+    Payload = ~"hello",
+    Mask = <<1, 2, 3, 4>>,
+    Frame = <<16#81, 16#85, Mask/binary, (mask(Payload, Mask))/binary>>,
+    {ok, F, ~""} = roadrunner_ws:parse_frame(Frame, #{pre_unmasked => Payload}),
+    ?assertEqual(Payload, maps:get(payload, F)).
+
 %% peek_frame_header/2 — sneak-peek for the wire-level UTF-8
 %% validation path in roadrunner_ws_session.
 peek_frame_header_text_short_payload_test() ->
@@ -709,6 +723,65 @@ handshake_accepts_mixed_case_websocket_test() ->
         {~"sec-websocket-version", ~"13"}
     ],
     ?assertMatch({ok, 101, _, _, _}, roadrunner_ws:handshake_response(Headers)).
+
+%% =============================================================================
+%% parse_frame_known/3 — the session's fast path reuses the peeked header
+%% instead of decoding it a second time. It MUST agree byte-for-byte with
+%% the from-scratch parse_frame/2 oracle across every frame shape.
+%% =============================================================================
+
+parse_frame_known_matches_oracle_test() ->
+    Mask = <<16#aa, 16#bb, 16#cc, 16#dd>>,
+    P200 = binary:copy(~"a", 200),
+    Frames = [
+        %% text "Hello" (7-bit length)
+        {<<16#81, 16#85, 16#37, 16#fa, 16#21, 16#3d, 16#7f, 16#9f, 16#4d, 16#51, 16#58>>, #{}},
+        %% binary
+        {<<16#82, 16#85, Mask/binary, (mask(<<1, 2, 3, 4, 5>>, Mask))/binary>>, #{}},
+        %% continuation (FIN=0)
+        {<<16#00, 16#80, 1, 2, 3, 4>>, #{}},
+        %% control frames
+        {<<16#88, 16#80, 1, 2, 3, 4>>, #{}},
+        {<<16#89, 16#80, 1, 2, 3, 4>>, #{}},
+        {<<16#8a, 16#80, 1, 2, 3, 4>>, #{}},
+        %% 16-bit extended length
+        {<<16#82, 16#fe, 200:16, Mask/binary, (mask(P200, Mask))/binary>>, #{}},
+        %% 64-bit extended length
+        {<<16#82, 16#ff, 2:64, Mask/binary, (mask(~"hi", Mask))/binary>>, #{}},
+        %% trailing bytes after the frame must be preserved as Rest
+        {
+            <<16#81, 16#85, 16#37, 16#fa, 16#21, 16#3d, 16#7f, 16#9f, 16#4d, 16#51, 16#58, "TAIL">>,
+            #{}
+        },
+        %% RSV1 set with permessage-deflate negotiated
+        {<<16#c2, 16#85, Mask/binary, (mask(<<9, 8, 7, 6, 5>>, Mask))/binary>>, #{
+            allow_rsv1 => true
+        }}
+    ],
+    [assert_known_matches_oracle(Buf, Opts) || {Buf, Opts} <- Frames],
+    ok.
+
+parse_frame_known_uses_pre_unmasked_test() ->
+    %% Supplying the already-unmasked payload yields the same frame as the
+    %% oracle, without re-unmasking.
+    Buf = <<16#81, 16#85, 16#37, 16#fa, 16#21, 16#3d, 16#7f, 16#9f, 16#4d, 16#51, 16#58>>,
+    {ok, Header, _Available} = roadrunner_ws:peek_frame_header(Buf, #{}),
+    {ok, Oracle, ~""} = roadrunner_ws:parse_frame(Buf, #{}),
+    Pre = maps:get(payload, Oracle),
+    ?assertEqual({ok, Oracle, ~""}, roadrunner_ws:parse_frame_known(Buf, Header, Pre)).
+
+parse_frame_known_incomplete_body_returns_more_test() ->
+    %% Full header peekable, only 3 of 5 declared payload bytes present.
+    Buf = <<16#81, 16#85, 1, 2, 3, 4, 99, 99, 99>>,
+    {ok, Header, 3} = roadrunner_ws:peek_frame_header(Buf, #{}),
+    ?assertEqual({more, undefined}, roadrunner_ws:parse_frame_known(Buf, Header, undefined)).
+
+assert_known_matches_oracle(Buf, Opts) ->
+    {ok, Header, _Available} = roadrunner_ws:peek_frame_header(Buf, Opts),
+    ?assertEqual(
+        roadrunner_ws:parse_frame(Buf, Opts),
+        roadrunner_ws:parse_frame_known(Buf, Header, undefined)
+    ).
 
 %% --- helpers ---
 
