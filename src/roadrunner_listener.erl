@@ -45,9 +45,6 @@ All duration and interval values in `opts()` are in milliseconds —
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
 -define(DEFAULT_MAX_CLIENTS, 150).
 -define(DEFAULT_MAX_CONCURRENT_REQUESTS, infinity).
-%% Max per-peer rate-limit buckets evicted per sweep tick, so one tick can't
-%% stall the listener on a huge table (leftovers wait for the next tick).
--define(RATE_LIMIT_SWEEP_BUDGET, 1000).
 -define(DEFAULT_MIN_BYTES_PER_SECOND, 100).
 %% TCP listen backlog (kernel SYN/accept queue depth). OTP defaults to 5,
 %% which a burst of concurrent connects overflows; 1024 matches cowboy.
@@ -230,7 +227,10 @@ ops-tuning rationale.
     %% default 60000), and `sweep_interval` (ms between eviction passes, default
     %% 10000). A peer exceeding the rate gets `429 Too Many Requests` +
     %% `Retry-After` before the handler runs. Keyed on the real client IP, so
-    %% accurate behind a balancer when `proxy_protocol` is set.
+    %% accurate behind a balancer when `proxy_protocol` is set. The per-IP
+    %% bucket is lock-free (last-write-wins), so concurrent connections from one
+    %% IP can momentarily admit up to that many requests past `burst`; it bounds
+    %% the sustained per-source rate, not exact simultaneity.
     rate_limit => #{
         rate := pos_integer(),
         period => pos_integer(),
@@ -1751,7 +1751,7 @@ handle_info(
     %% Evict per-peer buckets idle past `idle_ttl` (bounded per tick), then
     %% reschedule. Keeps the store bounded by the active-peer working set.
     NowMs = erlang:monotonic_time(millisecond),
-    _ = roadrunner_conn:rate_limit_evict_idle(Table, NowMs, IdleTtl, ?RATE_LIMIT_SWEEP_BUDGET),
+    _ = roadrunner_conn:rate_limit_evict_idle(Table, NowMs, IdleTtl),
     _ = erlang:send_after(Interval, self(), rate_limit_sweep),
     {noreply, State};
 handle_info(_Msg, State) ->

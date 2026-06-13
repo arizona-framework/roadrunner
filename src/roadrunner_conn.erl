@@ -68,7 +68,7 @@
     rate_limit_check/6,
     resolve_rate_limit/2,
     rate_limited_telemetry/2,
-    rate_limit_evict_idle/4,
+    rate_limit_evict_idle/3,
     drain_oversized_body/3,
     send_internal_error/1,
     send_not_found/1,
@@ -414,25 +414,20 @@ rate_limited_telemetry(ListenerName, Counter) ->
     }).
 
 -doc """
-Evict per-peer buckets idle since before `NowMs - IdleTtl`, at most `MaxRows`
-per call so one listener sweep tick can't stall on a huge table (the rest wait
-for the next tick). Returns the number evicted. The bounded eviction is what
-keeps the bucket store from growing without limit at high `max_clients`.
+Evict every per-peer bucket idle since before `NowMs - IdleTtl`, in one
+`select_delete` pass, returning the number evicted. A single pass (rather than a
+per-tick row budget) is what actually bounds the store to the active-peer set: a
+budget would cap eviction below the rate new buckets are created under a
+high-cardinality scan, letting the table grow without limit. The pass runs on
+the listener gen_server (control plane, off the request path), so a full
+traversal every sweep tick is cheap.
 """.
--spec rate_limit_evict_idle(ets:table(), integer(), pos_integer(), pos_integer()) ->
-    non_neg_integer().
-rate_limit_evict_idle(Table, NowMs, IdleTtl, MaxRows) ->
+-spec rate_limit_evict_idle(ets:table(), integer(), pos_integer()) -> non_neg_integer().
+rate_limit_evict_idle(Table, NowMs, IdleTtl) ->
     Cutoff = NowMs - IdleTtl,
-    %% Row is `{IP, Tokens, LastMs}`; match those last touched before `Cutoff`
-    %% and return the `IP` key to delete.
-    Spec = [{{'$1', '_', '$2'}, [{'<', '$2', Cutoff}], ['$1']}],
-    case ets:select(Table, Spec, MaxRows) of
-        '$end_of_table' ->
-            0;
-        {Keys, _Cont} ->
-            lists:foreach(fun(Key) -> true = ets:delete(Table, Key) end, Keys),
-            length(Keys)
-    end.
+    %% Row is `{IP, Units, LastMs}`; delete those last touched before `Cutoff`.
+    Spec = [{{'_', '_', '$1'}, [{'<', '$1', Cutoff}], [true]}],
+    ets:select_delete(Table, Spec).
 
 -doc "Decrement the in-flight-request counter, paired with `try_acquire_request_slot/2`.".
 -spec release_request_slot(infinity | pos_integer(), counters:counters_ref() | undefined) -> ok.

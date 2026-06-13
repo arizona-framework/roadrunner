@@ -69,22 +69,22 @@ evicts_only_idle_rows_test() ->
     true = ets:insert(Table, {{1, 1, 1, 1}, 5000, 0}),
     true = ets:insert(Table, {{2, 2, 2, 2}, 5000, 1000}),
     %% Now=2000, ttl=1500 → cutoff 500. Only the row last touched at 0 is idle.
-    ?assertEqual(1, ?M:rate_limit_evict_idle(Table, 2000, 1500, 100)),
+    ?assertEqual(1, ?M:rate_limit_evict_idle(Table, 2000, 1500)),
     ?assertEqual([], ets:lookup(Table, {1, 1, 1, 1})),
     ?assertMatch([{{2, 2, 2, 2}, _, _}], ets:lookup(Table, {2, 2, 2, 2})).
 
 evict_empty_table_test() ->
     Table = new_table(),
-    ?assertEqual(0, ?M:rate_limit_evict_idle(Table, 2000, 1500, 100)).
+    ?assertEqual(0, ?M:rate_limit_evict_idle(Table, 2000, 1500)).
 
-evict_respects_budget_test() ->
+evict_clears_all_idle_in_one_pass_test() ->
     Table = new_table(),
     true = ets:insert(Table, {{1, 1, 1, 1}, 0, 0}),
     true = ets:insert(Table, {{2, 2, 2, 2}, 0, 0}),
     true = ets:insert(Table, {{3, 3, 3, 3}, 0, 0}),
-    %% Three idle rows, budget of 2: only two evicted this pass.
-    ?assertEqual(2, ?M:rate_limit_evict_idle(Table, 1000000, 1, 2)),
-    ?assertEqual(1, ets:info(Table, size)).
+    %% All three idle rows are evicted in a single pass (no per-tick budget).
+    ?assertEqual(3, ?M:rate_limit_evict_idle(Table, 1000000, 1)),
+    ?assertEqual(0, ets:info(Table, size)).
 
 %% --- helpers ---
 
