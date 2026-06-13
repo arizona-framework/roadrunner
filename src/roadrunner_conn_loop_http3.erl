@@ -144,7 +144,10 @@
     %% from proto_opts at `init/2` so the per-stream acquire/release passes
     %% them to `roadrunner_conn` directly. See `dispatch_decoded/3`.
     max_concurrent_requests = infinity :: infinity | pos_integer(),
-    inflight_counter :: counters:counters_ref() | undefined
+    inflight_counter :: counters:counters_ref() | undefined,
+    %% Per-peer rate-limit guard resolved from proto_opts + peer at conn start
+    %% (`undefined` when off). Checked in `dispatch_decoded/4`.
+    rate_limit = undefined :: roadrunner_conn:rate_limit_state()
 }).
 
 -doc """
@@ -206,7 +209,8 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
             http3_max_field_section_size, ProtoOpts, 2 * MaxHeaderBlock
         ),
         max_concurrent_requests = maps:get(max_concurrent_requests, ProtoOpts, infinity),
-        inflight_counter = maps:get(inflight_counter, ProtoOpts, undefined)
+        inflight_counter = maps:get(inflight_counter, ProtoOpts, undefined),
+        rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer)
     }).
 
 -spec loop(#h3{}) -> ok.
@@ -758,7 +762,7 @@ respond_field_section_too_large(#h3{conn = Conn} = State, StreamId) ->
 
 -spec dispatch_decoded(#h3{}, non_neg_integer(), roadrunner_http:headers(), iodata()) ->
     handle_result().
-dispatch_decoded(#h3{streams = Streams} = State, StreamId, Headers, Body) ->
+dispatch_decoded(State, StreamId, Headers, Body) ->
     {ReqId, NewBuf} = roadrunner_conn:generate_request_id(State#h3.req_id_buffer),
     RequestContext = #{
         peer => State#h3.peer,
@@ -774,31 +778,46 @@ dispatch_decoded(#h3{streams = Streams} = State, StreamId, Headers, Body) ->
             %% stream error H3_MESSAGE_ERROR.
             reset_and_drop(State1, StreamId, ?H3_MESSAGE_ERROR);
         {ok, Req} ->
-            case
-                roadrunner_conn:try_acquire_request_slot(
-                    State1#h3.max_concurrent_requests, State1#h3.inflight_counter
-                )
-            of
-                true ->
-                    {WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
-                        State1#h3.conn, StreamId, Req, State1#h3.proto_opts
-                    ),
-                    %% The worker owns the response now, tracked by its monitor
-                    %% ref; drop the (no-longer-needed) frame-accumulation entry
-                    %% so the streams map only ever holds in-progress requests.
-                    %% Record the pid too so a peer reset can reach the worker.
-                    State1#h3{
-                        streams = maps:remove(StreamId, Streams),
-                        worker_refs = (State1#h3.worker_refs)#{MonRef => StreamId},
-                        worker_pids = (State1#h3.worker_pids)#{StreamId => WorkerPid}
-                    };
-                false ->
-                    %% Listener-wide in-flight ceiling reached — refuse the
-                    %% stream (retry-safe H3_REQUEST_REJECTED) without spawning
-                    %% a worker.
-                    ok = throttle_stream(State1),
-                    reset_and_drop(State1, StreamId, ?H3_REQUEST_REJECTED)
+            case rate_limit_refused(State1, StreamId) of
+                {refused, State2} ->
+                    %% Per-peer rate exceeded: 429 + Retry-After sent, stream
+                    %% dropped. 429 (not H3_REQUEST_REJECTED) so the client backs
+                    %% off per Retry-After instead of retrying immediately.
+                    State2;
+                ok ->
+                    dispatch_with_slot(State1, StreamId, Req)
             end
+    end.
+
+%% Acquire the listener-wide in-flight slot and spawn the stream worker, or
+%% refuse with retry-safe H3_REQUEST_REJECTED at the ceiling.
+-spec dispatch_with_slot(#h3{}, non_neg_integer(), roadrunner_req:request()) ->
+    handle_result().
+dispatch_with_slot(#h3{streams = Streams} = State1, StreamId, Req) ->
+    case
+        roadrunner_conn:try_acquire_request_slot(
+            State1#h3.max_concurrent_requests, State1#h3.inflight_counter
+        )
+    of
+        true ->
+            {WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
+                State1#h3.conn, StreamId, Req, State1#h3.proto_opts
+            ),
+            %% The worker owns the response now, tracked by its monitor
+            %% ref; drop the (no-longer-needed) frame-accumulation entry
+            %% so the streams map only ever holds in-progress requests.
+            %% Record the pid too so a peer reset can reach the worker.
+            State1#h3{
+                streams = maps:remove(StreamId, Streams),
+                worker_refs = (State1#h3.worker_refs)#{MonRef => StreamId},
+                worker_pids = (State1#h3.worker_pids)#{StreamId => WorkerPid}
+            };
+        false ->
+            %% Listener-wide in-flight ceiling reached — refuse the
+            %% stream (retry-safe H3_REQUEST_REJECTED) without spawning
+            %% a worker.
+            ok = throttle_stream(State1),
+            reset_and_drop(State1, StreamId, ?H3_REQUEST_REJECTED)
     end.
 
 %% A worker exit: normal means it sent its response with the stream FIN
@@ -842,6 +861,35 @@ throttle_stream(#h3{proto_opts = #{throttled_counter := Counter}, listener_name 
         listener_name => ListenerName,
         reason => max_concurrent_requests
     }).
+
+%% Per-peer rate-limit gate before spawning a stream worker. `ok` to proceed;
+%% `{refused, State1}` after sending `429` + `Retry-After` as a buffered
+%% response and dropping the stream (the rate was exceeded). 429 (not
+%% H3_REQUEST_REJECTED) so the client honors `Retry-After` instead of retrying
+%% the request immediately. The guard being off (`undefined`) or a missing peer
+%% IP proceeds.
+-spec rate_limit_refused(#h3{}, non_neg_integer()) -> ok | {refused, #h3{}}.
+rate_limit_refused(#h3{rate_limit = undefined}, _StreamId) ->
+    ok;
+rate_limit_refused(
+    #h3{
+        rate_limit = {Rate, Cap, Cost, Table, Counter, IP},
+        conn = Conn,
+        listener_name = ListenerName
+    } = State,
+    StreamId
+) ->
+    NowMs = erlang:monotonic_time(millisecond),
+    case roadrunner_conn:rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) of
+        allow ->
+            ok;
+        {deny, RetryAfter} ->
+            ok = roadrunner_conn:rate_limited_telemetry(ListenerName, Counter),
+            ok = roadrunner_http3_stream_worker:send_buffered(
+                Conn, StreamId, 429, [{~"retry-after", integer_to_binary(RetryAfter)}], ~""
+            ),
+            {refused, drop_stream(State, StreamId)}
+    end.
 
 %% A connection error (RFC 9114 §8): close the QUIC connection with the
 %% h3 error code + reason, then run the normal teardown. The peer sees

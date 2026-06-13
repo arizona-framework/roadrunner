@@ -526,24 +526,24 @@ cost is worth it at their response sizes.
 **Scope:** small. Reuses the static handler's ETag and `If-None-Match`
 comparison; the new part is hashing the dynamic body and the 304 path.
 
-### Per-peer request-rate guard — medium
+### Rate-guard pre-body rejection — small, with a hazard
 
-**What:** A token-bucket abuse guard keyed by peer (the real client IP,
-accurate behind a proxy once PROXY-protocol support lands), answering
-`429 Too Many Requests` with `Retry-After` when one peer exceeds a
-configured request rate. It belongs to the same DoS-protection family as
-the slowloris `min_bytes_per_second` guard and `max_clients`: it stops a
-single source monopolizing the server rather than enforcing application
-quotas.
+**What:** The per-peer `rate_limit` check sits at handler dispatch (after the
+request body is read), matching the `max_concurrent_requests` sibling. Rejecting
+right after the request headers on HTTP/1 would avoid reading a rate-limited
+request's body.
 
-**Why deferred:** the existing caps already bound total load; per-peer
-fairness matters once a deployment sees one source flooding it. The
-per-peer bucket state (an `atomics` / ETS store) wants a clean ownership
-and sweep story before it ships. Richer per-user or per-route quota
-policy is application logic, expressed above the server.
+**Why deferred:** the expensive handler work is already skipped at the dispatch
+point, so this only saves the (already `max_content_length`-bounded) body read,
+on h1 only. And it carries a real hazard: closing the connection on a 429 while
+the client is still sending its body triggers a TCP reset that can discard the
+429 before the client reads it. The post-body placement drains the body first
+and delivers the response cleanly (the reason nginx/Apache drain before
+erroring); a correct pre-body version needs a read-some-then-drain strategy that
+undercuts the saving. Wants a real large-body-flood driver before taking it on.
 
-**Scope:** medium. The bucket math is small; the per-peer store and its
-sweep are the bulk.
+**Scope:** small code, but the RST-delivery hazard makes the current post-body
+placement the safer default.
 
 ### Graceful load-shedding — small-medium
 

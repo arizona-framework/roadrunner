@@ -125,7 +125,11 @@
     %% each request gets its own grace + budget).
     min_rate = 0 :: non_neg_integer(),
     recv_phase_start = 0 :: integer(),
-    recv_phase_bytes = 0 :: non_neg_integer()
+    recv_phase_bytes = 0 :: non_neg_integer(),
+    %% Per-peer rate-limit guard resolved from `proto_opts` + peer once at
+    %% `shoot` (`undefined` when off — the common case, a single branch in
+    %% `dispatch_phase/2`).
+    rate_limit = undefined :: roadrunner_conn:rate_limit_state()
 }).
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
@@ -247,7 +251,8 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                     maps:get(http1_max_header_line, ProtoOpts, 8192),
                     maps:get(http1_max_header_block, ProtoOpts, 10240),
                     maps:get(http1_max_header_count, ProtoOpts, 100)
-                }
+                },
+                rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer)
             },
             read_request_phase(S)
     end.
@@ -673,16 +678,45 @@ read_body_phase(
 dispatch_phase(
     #loop_state{
         socket = Socket,
-        dispatch = Dispatch
+        dispatch = Dispatch,
+        listener_name = ListenerName,
+        rate_limit = RateLimit
     } = S,
     Req
 ) ->
-    case roadrunner_conn:resolve_handler(Dispatch, Req) of
-        {ok, Handler, Bindings, Pipeline, _State} ->
-            run_pipeline(S, Handler, Req#{bindings => Bindings}, Pipeline);
-        not_found ->
-            _ = roadrunner_conn:send_not_found(Socket),
+    case rate_limit_allows(RateLimit, Socket, ListenerName) of
+        true ->
+            case roadrunner_conn:resolve_handler(Dispatch, Req) of
+                {ok, Handler, Bindings, Pipeline, _State} ->
+                    run_pipeline(S, Handler, Req#{bindings => Bindings}, Pipeline);
+                not_found ->
+                    _ = roadrunner_conn:send_not_found(Socket),
+                    exit_normal(S)
+            end;
+        false ->
+            %% Rate exceeded: `rate_limit_allows/4` already sent 429 + close.
             exit_normal(S)
+    end.
+
+%% Per-peer rate-limit gate before handler dispatch. `true` to proceed; `false`
+%% after a 429 + `Retry-After` was sent. The guard being off (`undefined`, which
+%% also covers a connection with no peer IP) always proceeds.
+-spec rate_limit_allows(
+    roadrunner_conn:rate_limit_state(),
+    roadrunner_transport:socket(),
+    atom()
+) -> boolean().
+rate_limit_allows(undefined, _Socket, _ListenerName) ->
+    true;
+rate_limit_allows({Rate, Cap, Cost, Table, Counter, IP}, Socket, ListenerName) ->
+    NowMs = erlang:monotonic_time(millisecond),
+    case roadrunner_conn:rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) of
+        allow ->
+            true;
+        {deny, RetryAfter} ->
+            ok = roadrunner_conn:rate_limited_telemetry(ListenerName, Counter),
+            _ = roadrunner_conn:send_rate_limited(Socket, RetryAfter),
+            false
     end.
 
 -spec run_pipeline(

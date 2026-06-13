@@ -244,6 +244,9 @@
     %% passes them to `roadrunner_conn` directly. See `dispatch_stream/2`.
     max_concurrent_requests = infinity :: infinity | pos_integer(),
     inflight_counter :: counters:counters_ref() | undefined,
+    %% Per-peer rate-limit guard resolved from proto_opts + peer at `enter/6`
+    %% (`undefined` when off). Checked in `dispatch_stream/2`.
+    rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -333,6 +336,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered) ->
         alt_svc = AltSvc,
         max_concurrent_requests = MaxConcReq,
         inflight_counter = InflightCounter,
+        rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
         handshake_timeout = HandshakeTimeout,
         idle_timeout = IdleTimeout
     },
@@ -1133,32 +1137,43 @@ dispatch_stream(
             },
             case roadrunner_http2_request:from_headers(Headers, BodyIolist, RequestContext) of
                 {ok, Req} ->
-                    case roadrunner_conn:try_acquire_request_slot(MaxConcReq, InflightCounter) of
-                        true ->
-                            {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
-                                self(), StreamId, Req, ProtoOpts
-                            ),
-                            Stream1 = Stream#{
-                                worker_pid := WorkerPid,
-                                worker_ref := MonRef,
-                                state := half_closed_remote,
-                                body := []
-                            },
-                            State1 = State#loop{
-                                streams = Streams#{StreamId := Stream1},
-                                worker_refs = (State#loop.worker_refs)#{MonRef => StreamId},
-                                req_id_buffer = NewBuf
-                            },
-                            frame_loop(State1);
-                        false ->
-                            %% Listener-wide in-flight ceiling reached — refuse
-                            %% the stream (retry-safe REFUSED_STREAM) without
-                            %% spawning a worker.
-                            ok = throttle_stream(State, ListenerName),
-                            _ = send_rst_stream(State, StreamId, refused_stream),
-                            frame_loop(
-                                remove_stream(State#loop{req_id_buffer = NewBuf}, StreamId)
-                            )
+                    StateBuf = State#loop{req_id_buffer = NewBuf},
+                    case rate_limit_refused(StateBuf, StreamId) of
+                        {refused, State1} ->
+                            %% Per-peer rate exceeded: 429 + RST(no_error) sent,
+                            %% no worker spawned. 429 (not REFUSED_STREAM) so the
+                            %% client backs off per Retry-After instead of
+                            %% retrying the stream immediately.
+                            frame_loop(remove_stream(State1, StreamId));
+                        ok ->
+                            case
+                                roadrunner_conn:try_acquire_request_slot(
+                                    MaxConcReq, InflightCounter
+                                )
+                            of
+                                true ->
+                                    {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
+                                        self(), StreamId, Req, ProtoOpts
+                                    ),
+                                    Stream1 = Stream#{
+                                        worker_pid := WorkerPid,
+                                        worker_ref := MonRef,
+                                        state := half_closed_remote,
+                                        body := []
+                                    },
+                                    frame_loop(StateBuf#loop{
+                                        streams = Streams#{StreamId := Stream1},
+                                        worker_refs =
+                                            (StateBuf#loop.worker_refs)#{MonRef => StreamId}
+                                    });
+                                false ->
+                                    %% Listener-wide in-flight ceiling reached —
+                                    %% refuse with retry-safe REFUSED_STREAM, no
+                                    %% worker spawned.
+                                    ok = throttle_stream(StateBuf, ListenerName),
+                                    _ = send_rst_stream(StateBuf, StreamId, refused_stream),
+                                    frame_loop(remove_stream(StateBuf, StreamId))
+                            end
                     end;
                 {error, _Reason} ->
                     _ = send_rst_stream(State, StreamId, protocol_error),
@@ -1758,6 +1773,35 @@ throttle_stream(#loop{proto_opts = #{throttled_counter := Counter}}, ListenerNam
         listener_name => ListenerName,
         reason => max_concurrent_requests
     }).
+
+%% Per-peer rate-limit gate before spawning a stream worker. `ok` to proceed;
+%% `{refused, State1}` after sending `429` + `Retry-After` and an
+%% `RST_STREAM(NO_ERROR)` on the request stream (the rate was exceeded). 429
+%% (not `REFUSED_STREAM`) so the client honors `Retry-After` instead of
+%% retrying the stream immediately. The guard being off (`undefined`) or a
+%% missing peer IP proceeds.
+-spec rate_limit_refused(#loop{}, stream_id()) -> ok | {refused, #loop{}}.
+rate_limit_refused(#loop{rate_limit = undefined}, _StreamId) ->
+    ok;
+rate_limit_refused(
+    #loop{
+        rate_limit = {Rate, Cap, Cost, Table, Counter, IP},
+        listener_name = ListenerName
+    } = State,
+    StreamId
+) ->
+    NowMs = erlang:monotonic_time(millisecond),
+    case roadrunner_conn:rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) of
+        allow ->
+            ok;
+        {deny, RetryAfter} ->
+            ok = roadrunner_conn:rate_limited_telemetry(ListenerName, Counter),
+            State1 = encode_and_send_response_atomic(
+                State, StreamId, 429, [{~"retry-after", integer_to_binary(RetryAfter)}], ~"", 0
+            ),
+            _ = send_rst_stream(State1, StreamId, no_error),
+            {refused, State1}
+    end.
 
 -spec exit_clean(#loop{}) -> no_return().
 exit_clean(#loop{

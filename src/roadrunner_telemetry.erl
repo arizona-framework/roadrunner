@@ -76,14 +76,19 @@
 %%   - **Measurements:** `system_time`.
 %%   - **Metadata:** `listener_name`, `reason` (`max_clients`).
 %%
-%% - `[roadrunner, request, throttled]` — fired when an HTTP/2 or HTTP/3
-%%   stream is refused because the listener is at its
-%%   `max_concurrent_requests` in-flight ceiling, before any handler runs.
-%%   The stream is reset (`REFUSED_STREAM` / `H3_REQUEST_REJECTED`); pair
-%%   with the cumulative `throttled` count from `roadrunner_listener:info/1`.
+%% - `[roadrunner, request, throttled]` — fired before any handler runs when a
+%%   request is refused at a listener limit, for one of two reasons:
+%%     - `max_concurrent_requests`: an HTTP/2 or HTTP/3 stream over the
+%%       listener's in-flight ceiling, reset with `REFUSED_STREAM` /
+%%       `H3_REQUEST_REJECTED`; pair with the cumulative `throttled` count from
+%%       `roadrunner_listener:info/1`.
+%%     - `rate_limit`: a peer over its per-peer `rate_limit`, answered with
+%%       `429` + `Retry-After` (HTTP/1, HTTP/2, and HTTP/3); pair with the
+%%       cumulative `rate_limited` count from `roadrunner_listener:info/1`.
 %%
 %%   - **Measurements:** `system_time`.
-%%   - **Metadata:** `listener_name`, `reason` (`max_concurrent_requests`).
+%%   - **Metadata:** `listener_name`, `reason`
+%%     (`max_concurrent_requests` | `rate_limit`).
 %%
 %% - `[roadrunner, ws, upgrade]` — fired in the conn process once the
 %%   WebSocket handshake response has been written. Marks the

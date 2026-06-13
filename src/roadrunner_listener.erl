@@ -219,6 +219,25 @@ ops-tuning rationale.
     %% rejected on an HTTP/3-only listener. Trust it only behind a balancer that
     %% always prepends the header (otherwise a direct peer can spoof its IP).
     proxy_protocol => boolean(),
+    %% Opt in to a per-peer request-rate guard keyed on the client IP. A map
+    %% `#{rate := pos_integer()}` (requests allowed per `period`, required) with
+    %% optional `period` (window in seconds, default 1, so `rate` is per-second
+    %% unless set), `burst` (bucket capacity in requests, default = `rate`),
+    %% `idle_ttl` (ms a peer's bucket survives without traffic before eviction,
+    %% default 60000), and `sweep_interval` (ms between eviction passes, default
+    %% 10000). A peer exceeding the rate gets `429 Too Many Requests` +
+    %% `Retry-After` before the handler runs. Keyed on the real client IP, so
+    %% accurate behind a balancer when `proxy_protocol` is set. The per-IP
+    %% bucket is lock-free (last-write-wins), so concurrent connections from one
+    %% IP can momentarily admit up to that many requests past `burst`; it bounds
+    %% the sustained per-source rate, not exact simultaneity.
+    rate_limit => #{
+        rate := pos_integer(),
+        period => pos_integer(),
+        burst => pos_integer(),
+        idle_ttl => pos_integer(),
+        sweep_interval => pos_integer()
+    },
     %% When set, the per-connection process auto-hibernates after
     %% `Ms` milliseconds of idle main-loop time. Most useful for
     %% long-lived keep-alive HTTP/1.1 connections that mostly sit
@@ -569,7 +588,8 @@ Useful for ops dashboards / health endpoints.
         requests_served := non_neg_integer(),
         rejected := non_neg_integer(),
         max_concurrent_requests := infinity | pos_integer(),
-        throttled := non_neg_integer()
+        throttled := non_neg_integer(),
+        rate_limited := non_neg_integer()
     }.
 info(Name) ->
     gen_server:call(Name, info).
@@ -628,6 +648,7 @@ init(#{port := Port} = Opts) ->
             case start_quic(Port, Opts, Protocols, ProtoOpts) of
                 {ok, QuicListener} ->
                     Reconciliation = setup_reconciliation(Opts),
+                    ok = setup_rate_limit_sweep(ProtoOpts),
                     {ok, #state{
                         listen_socket = LSocket,
                         quic_listener = QuicListener,
@@ -834,6 +855,17 @@ setup_reconciliation(#{slot_reconciliation := #{interval := IntervalMs}}) when
 setup_reconciliation(_Opts) ->
     disabled.
 
+%% Arm the periodic per-peer rate-limit bucket sweep when the guard is on. Like
+%% `setup_reconciliation`, the `erlang:send_after` timer auto-cancels when the
+%% listener exits, so there is no `terminate/2` cleanup; the ETS table dies with
+%% its owner (this gen_server) for the same reason.
+-spec setup_rate_limit_sweep(roadrunner_conn:proto_opts()) -> ok.
+setup_rate_limit_sweep(#{rate_limit := #{sweep_interval := IntervalMs}}) ->
+    _ = erlang:send_after(IntervalMs, self(), rate_limit_sweep),
+    ok;
+setup_rate_limit_sweep(_ProtoOpts) ->
+    ok.
+
 %% Compile + publish to `persistent_term` once, at listener start. The
 %% conn reads via `persistent_term:get/1` on every request, so the
 %% lookup is O(1) and the table is shared across all conns of this
@@ -985,6 +1017,12 @@ build_proto_opts(Opts, ListenerName) ->
     %% `max_concurrent_requests` ceiling, mirroring `rejected_counter`.
     InflightCounter = counters:new(1, [write_concurrency]),
     ThrottledCounter = atomics:new(1, [{signed, false}]),
+    %% `rate_limited_counter` is the cumulative count of requests refused at the
+    %% per-peer `rate_limit`, mirroring `throttled_counter`. Always created (so
+    %% `info/1` surfaces it as 0 when the guard is off); the per-peer bucket
+    %% store is created only when `rate_limit` is configured.
+    RateLimitedCounter = atomics:new(1, [{signed, false}]),
+    RateLimit = build_rate_limit(maps:get(rate_limit, Opts, undefined)),
     %% Public `ws` opts are a nested map; flatten to the `ws_*`
     %% proto_opts keys the hot path reads, mirroring the `{http2, #{}}`
     %% → `http2_*` flattening above.
@@ -1014,6 +1052,8 @@ build_proto_opts(Opts, ListenerName) ->
             rejected_counter => RejectedCounter,
             inflight_counter => InflightCounter,
             throttled_counter => ThrottledCounter,
+            rate_limited_counter => RateLimitedCounter,
+            rate_limit => RateLimit,
             min_bytes_per_second =>
                 maps:get(min_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
             body_buffering => maps:get(body_buffering, Opts, auto),
@@ -1425,6 +1465,68 @@ validate_ws_opts(Opts) when is_map(Opts) ->
 validate_ws_opts(Other) ->
     error({invalid_listener_opt, ws, Other}).
 
+%% Validate the `rate_limit` opt and, when set, create its per-listener ETS
+%% bucket store. `undefined` (the default) skips the guard entirely.
+-spec build_rate_limit(term()) -> undefined | roadrunner_conn:rate_limit().
+build_rate_limit(RawOpt) ->
+    case validate_rate_limit(RawOpt) of
+        undefined ->
+            undefined;
+        Config ->
+            %% Anonymous public table, one per listener, owned by this
+            %% gen_server so it dies with the listener. `write_concurrency, auto`
+            %% adapts the lock count to load (matching the QUIC CID registry);
+            %% no `read_concurrency` — each request reads then writes the same
+            %% key (interleaved RMW), the one pattern it would slow down.
+            Config#{
+                table => ets:new(roadrunner_rate_limit, [
+                    set, public, {write_concurrency, auto}
+                ])
+            }
+    end.
+
+-spec validate_rate_limit(term()) ->
+    undefined
+    | #{
+        rate := pos_integer(),
+        burst := pos_integer(),
+        period := pos_integer(),
+        idle_ttl := pos_integer(),
+        sweep_interval := pos_integer()
+    }.
+validate_rate_limit(undefined) ->
+    undefined;
+validate_rate_limit(Opts) when is_map(Opts) ->
+    %% Every supplied key must be a known positive integer.
+    Resolved = maps:fold(
+        fun(K, V, Acc) ->
+            case
+                lists:member(K, [rate, burst, period, idle_ttl, sweep_interval]) andalso
+                    is_integer(V) andalso V > 0
+            of
+                true -> Acc#{K => V};
+                false -> error({invalid_listener_opt, rate_limit, Opts})
+            end
+        end,
+        #{},
+        Opts
+    ),
+    case Resolved of
+        #{rate := Rate} ->
+            #{
+                rate => Rate,
+                burst => maps:get(burst, Resolved, Rate),
+                period => maps:get(period, Resolved, 1),
+                idle_ttl => maps:get(idle_ttl, Resolved, 60000),
+                sweep_interval => maps:get(sweep_interval, Resolved, 10000)
+            };
+        #{} ->
+            %% `rate` is required.
+            error({invalid_listener_opt, rate_limit, Opts})
+    end;
+validate_rate_limit(Other) ->
+    error({invalid_listener_opt, rate_limit, Other}).
+
 build_dispatch(#{routes := Module} = Opts, _ListenerName) when is_atom(Module) ->
     bake_dispatch(Module, Opts, [], no_state);
 build_dispatch(#{routes := {Module, State}} = Opts, _ListenerName) when is_atom(Module) ->
@@ -1494,6 +1596,7 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
         requests_counter := RequestsCounter,
         rejected_counter := RejectedCounter,
         throttled_counter := ThrottledCounter,
+        rate_limited_counter := RateLimitedCounter,
         max_clients := MaxClients,
         max_concurrent_requests := MaxConcurrentRequests
     } = ProtoOpts,
@@ -1503,7 +1606,8 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
         requests_served => atomics:get(RequestsCounter, 1),
         rejected => atomics:get(RejectedCounter, 1),
         max_concurrent_requests => MaxConcurrentRequests,
-        throttled => atomics:get(ThrottledCounter, 1)
+        throttled => atomics:get(ThrottledCounter, 1),
+        rate_limited => atomics:get(RateLimitedCounter, 1)
     },
     {reply, Reply, State}.
 
@@ -1640,6 +1744,22 @@ handle_info(
     {noreply, State#state{
         reconciliation = #{interval => Interval, prev_diff => NewDiff - Release}
     }};
+handle_info(
+    rate_limit_sweep,
+    #state{
+        proto_opts = #{
+            rate_limit := #{
+                table := Table, idle_ttl := IdleTtl, sweep_interval := Interval
+            }
+        }
+    } = State
+) ->
+    %% Evict per-peer buckets idle past `idle_ttl` (bounded per tick), then
+    %% reschedule. Keeps the store bounded by the active-peer working set.
+    NowMs = erlang:monotonic_time(millisecond),
+    _ = roadrunner_conn:rate_limit_evict_idle(Table, NowMs, IdleTtl),
+    _ = erlang:send_after(Interval, self(), rate_limit_sweep),
+    {noreply, State};
 handle_info(_Msg, State) ->
     {noreply, State}.
 

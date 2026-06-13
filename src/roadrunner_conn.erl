@@ -64,6 +64,11 @@
     send_status/2,
     parse_error_status/1,
     send_payload_too_large/1,
+    send_rate_limited/2,
+    rate_limit_check/6,
+    resolve_rate_limit/2,
+    rate_limited_telemetry/2,
+    rate_limit_evict_idle/3,
     drain_oversized_body/3,
     send_internal_error/1,
     send_not_found/1,
@@ -73,7 +78,7 @@
     head_response/2
 ]).
 
--export_type([proto_opts/0, dispatch/0]).
+-export_type([proto_opts/0, dispatch/0, rate_limit/0, rate_limit_state/0]).
 
 -on_load(init_patterns/0).
 
@@ -112,6 +117,14 @@
     max_concurrent_requests := infinity | pos_integer(),
     inflight_counter := counters:counters_ref(),
     throttled_counter := atomics:atomics_ref(),
+    %% Per-peer request-rate guard (off by default). `rate_limit` carries the
+    %% resolved config + per-listener ETS bucket store when the `rate_limit`
+    %% opt is set, else `undefined`. `rate_limited_counter` is the cumulative
+    %% count of requests refused at the per-peer rate, mirroring
+    %% `throttled_counter`, surfaced in `roadrunner_listener:info/1` (always
+    %% present, stays 0 when the guard is off).
+    rate_limit := undefined | rate_limit(),
+    rate_limited_counter := atomics:atomics_ref(),
     min_bytes_per_second := non_neg_integer(),
     body_buffering := auto | manual,
     listener_name => atom(),
@@ -171,6 +184,36 @@
     handler_spawn_opts => [proc_lib:start_spawn_option()],
     handler_start_timeout => timeout()
 }.
+
+%% Resolved per-peer rate-limit config, built by `roadrunner_listener` when the
+%% `rate_limit` opt is set: `rate` requests per `period` seconds with a `burst`
+%% bucket capacity, and an `idle_ttl`/`sweep_interval` (ms) eviction policy for
+%% the ETS `table` holding each peer's bucket. The cumulative refusal count
+%% lives in the top-level `rate_limited_counter`.
+-type rate_limit() :: #{
+    rate := pos_integer(),
+    burst := pos_integer(),
+    period := pos_integer(),
+    idle_ttl := pos_integer(),
+    sweep_interval := pos_integer(),
+    table := ets:table()
+}.
+
+%% The per-connection rate-limit guard state cached on each conn loop's record:
+%% the `{Rate, Cap, Cost, Table, Counter, IP}` resolved from `proto_opts` + the
+%% peer once at setup (see `resolve_rate_limit/2`) — with `Cap`/`Cost` already
+%% derived so the per-request check does no arithmetic — or `undefined` when the
+%% guard is off or the peer IP is unknown. Checked by `rate_limit_check/6`.
+-type rate_limit_state() ::
+    {
+        pos_integer(),
+        pos_integer(),
+        pos_integer(),
+        ets:table(),
+        atomics:atomics_ref(),
+        inet:ip_address()
+    }
+    | undefined.
 
 -doc """
 Spawn an unlinked connection process for the accepted `Socket` and the
@@ -303,6 +346,95 @@ try_acquire_request_slot(Max, Counter) ->
             ok = counters:sub(Counter, 1, 1),
             false
     end.
+
+%% Resolve the per-connection rate-limit tuple `{Rate, Burst, Table, Counter,
+%% IP}` from `proto_opts` + the (constant-per-conn) peer once at setup, or
+%% `undefined` when the guard is off, so the per-request check is a single
+%% branch on a cached value. The peer IP is baked in here, so the catch-all
+%% also covers a missing peer (a 2-tuple `{IP, _}` is required) as well as
+%% `rate_limit => undefined` and the hand-built proto_opts in unit tests.
+-doc false.
+-spec resolve_rate_limit(
+    proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
+) -> rate_limit_state().
+resolve_rate_limit(
+    #{
+        rate_limit := #{rate := Rate, burst := Burst, period := Period, table := Table},
+        rate_limited_counter := Counter
+    },
+    {IP, _Port}
+) ->
+    %% Bake the derived `Cost` (units/request) and `Cap` (bucket capacity) here,
+    %% once per connection, so the per-request `rate_limit_check/6` does no
+    %% multiplication.
+    Cost = Period * 1000,
+    Cap = Burst * Cost,
+    {Rate, Cap, Cost, Table, Counter, IP};
+resolve_rate_limit(_ProtoOpts, _Peer) ->
+    undefined.
+
+-doc """
+Per-peer token-bucket check, the per-source sibling of
+`try_acquire_request_slot/2`. Reads the peer `IP`'s bucket from the listener's
+ETS `Table` (a never-seen peer starts full), refills it for the elapsed time,
+and tries to spend one request. `allow` on success, `{deny, RetryAfterSecs}`
+when the bucket is empty. The read-refill-write is last-write-wins: concurrent
+connections from one IP can overshoot the bucket by a bounded amount, the same
+contract `try_acquire_request_slot/2` documents.
+
+`NowMs` is `erlang:monotonic_time(millisecond)` (passed in so the bucket math is
+deterministically testable).
+""".
+-spec rate_limit_check(
+    ets:table(), inet:ip_address(), pos_integer(), pos_integer(), pos_integer(), integer()
+) ->
+    allow | {deny, pos_integer()}.
+rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) ->
+    %% `Cap` (bucket capacity) and `Cost` (units per request) are resolved once
+    %% per connection (see `resolve_rate_limit/2`), not per request. A
+    %% never-seen peer starts at a full bucket (`Cap`) and needs no refill; an
+    %% existing one is refilled for the elapsed time in place (no intermediate
+    %% tuple).
+    Refilled =
+        case ets:lookup(Table, IP) of
+            [{IP, Units, LastMs}] ->
+                roadrunner_rate_limit:refill(Units, LastMs, NowMs, Rate, Cap);
+            [] ->
+                Cap
+        end,
+    case roadrunner_rate_limit:spend(Refilled, Cost) of
+        denied ->
+            true = ets:insert(Table, {IP, Refilled, NowMs}),
+            {deny, roadrunner_rate_limit:retry_after_secs(Refilled, Rate, Cost)};
+        Remaining ->
+            true = ets:insert(Table, {IP, Remaining, NowMs}),
+            allow
+    end.
+
+-doc "Record a rate-limit refusal: bump the cumulative counter and emit telemetry.".
+-spec rate_limited_telemetry(atom(), atomics:atomics_ref()) -> ok.
+rate_limited_telemetry(ListenerName, Counter) ->
+    ok = atomics:add(Counter, 1, 1),
+    roadrunner_telemetry:request_throttled(#{
+        listener_name => ListenerName,
+        reason => rate_limit
+    }).
+
+-doc """
+Evict every per-peer bucket idle since before `NowMs - IdleTtl`, in one
+`select_delete` pass, returning the number evicted. A single pass (rather than a
+per-tick row budget) is what actually bounds the store to the active-peer set: a
+budget would cap eviction below the rate new buckets are created under a
+high-cardinality scan, letting the table grow without limit. The pass runs on
+the listener gen_server (control plane, off the request path), so a full
+traversal every sweep tick is cheap.
+""".
+-spec rate_limit_evict_idle(ets:table(), integer(), pos_integer()) -> non_neg_integer().
+rate_limit_evict_idle(Table, NowMs, IdleTtl) ->
+    Cutoff = NowMs - IdleTtl,
+    %% Row is `{IP, Units, LastMs}`; delete those last touched before `Cutoff`.
+    Spec = [{{'_', '_', '$1'}, [{'<', '$1', Cutoff}], [true]}],
+    ets:select_delete(Table, Spec).
 
 -doc "Decrement the in-flight-request counter, paired with `try_acquire_request_slot/2`.".
 -spec release_request_slot(infinity | pos_integer(), counters:counters_ref() | undefined) -> ok.
@@ -1122,6 +1254,19 @@ send_payload_too_large(Socket) ->
     Resp = roadrunner_http1:response(
         413,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
+        ~""
+    ),
+    roadrunner_transport:send(Socket, Resp).
+
+-spec send_rate_limited(roadrunner_transport:socket(), pos_integer()) -> ok | {error, term()}.
+send_rate_limited(Socket, RetryAfterSecs) ->
+    Resp = roadrunner_http1:response(
+        429,
+        [
+            {~"content-length", ~"0"},
+            {~"connection", ~"close"},
+            {~"retry-after", integer_to_binary(RetryAfterSecs)}
+        ],
         ~""
     ),
     roadrunner_transport:send(Socket, Resp).
