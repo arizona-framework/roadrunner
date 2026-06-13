@@ -588,7 +588,8 @@ Useful for ops dashboards / health endpoints.
         requests_served := non_neg_integer(),
         rejected := non_neg_integer(),
         max_concurrent_requests := infinity | pos_integer(),
-        throttled := non_neg_integer()
+        throttled := non_neg_integer(),
+        rate_limited := non_neg_integer()
     }.
 info(Name) ->
     gen_server:call(Name, info).
