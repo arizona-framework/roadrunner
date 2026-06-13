@@ -18,6 +18,7 @@ frames.
 
 -export([accept_key/1, handshake_response/1]).
 -export([parse_frame/1, parse_frame/2]).
+-export([parse_frame_known/3]).
 -export([peek_frame_header/2]).
 -export([encode_frame/3, encode_frame/4]).
 -export([parse_extensions/1, negotiate_extensions/1]).
@@ -528,6 +529,53 @@ parse_frame(Bin, Opts) ->
         maps:get(allow_rsv1, Opts, false),
         maps:get(pre_unmasked, Opts, undefined)
     ).
+
+%% Parse a frame whose header `roadrunner_ws_session` already decoded via
+%% `peek_frame_header/2`, skipping the redundant second header decode and
+%% re-validation. `Header` is the peek map; `Pre` is the caller's
+%% already-unmasked payload (when the whole payload was unmasked during
+%% incremental UTF-8 validation) or `undefined`. Returns `{more,
+%% undefined}` when the body isn't fully buffered yet. Header-level
+%% protocol errors (bad opcode/RSV/length, unmasked, oversized or
+%% fragmented control) were already surfaced by the peek, so this never
+%% returns `{error, _}`. `parse_frame/2` stays the standalone (test
+%% oracle) entry that decodes from scratch.
+-doc false.
+-spec parse_frame_known(binary(), map(), binary() | undefined) ->
+    {ok, frame(), Rest :: binary()} | {more, undefined}.
+parse_frame_known(
+    Buf,
+    #{
+        payload_offset := Off,
+        total_payload_len := Len,
+        mask_key := MaskKey,
+        fin := Fin,
+        rsv1 := Rsv1,
+        opcode := Op
+    },
+    Pre
+) ->
+    case Buf of
+        <<_Header:Off/binary, Payload:Len/binary, Rest/binary>> ->
+            {ok,
+                #{
+                    fin => Fin,
+                    rsv1 => Rsv1,
+                    opcode => Op,
+                    payload => known_payload(Pre, Payload, MaskKey)
+                },
+                Rest};
+        _ ->
+            {more, undefined}
+    end.
+
+%% Use the caller's already-unmasked payload when supplied, else unmask
+%% the masked bytes now. The session supplies `Pre` only when it unmasked
+%% the full payload during `early_validate_text/3`, so it always matches
+%% the frame length.
+-spec known_payload(binary() | undefined, binary(), binary()) -> binary().
+known_payload(undefined, Payload, MaskKey) -> unmask(Payload, MaskKey);
+known_payload(Pre, _Payload, _MaskKey) -> Pre.
 
 -spec do_parse_frame(binary(), boolean(), binary() | undefined) -> parse_result().
 do_parse_frame(<<_Fin:1, _Rsv1:1, Rsv23:2, _:4, _/bitstring>>, _AllowRsv1, _Pre) when
