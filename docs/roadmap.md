@@ -476,22 +476,6 @@ concerns composable at the listener or per-route level. Each is
 boilerplate every public service rewrites today; shipping configurable,
 default-safe versions removes it.
 
-### Conditional requests for dynamic responses — small
-
-**What:** A `roadrunner_etag` middleware that derives a (strong or weak)
-`ETag` from the handler's response body, or honors one the handler
-already set, and turns a matching `If-None-Match` into a bodyless `304
-Not Modified`. The same ETag / `If-None-Match` logic the static handler
-already runs, lifted to apply to dynamic handler responses.
-
-**Why deferred:** static assets already get conditional requests via
-`roadrunner_static`; extending it to dynamic responses saves bandwidth on
-read-heavy JSON endpoints, but wants a real caller to confirm the hashing
-cost is worth it at their response sizes.
-
-**Scope:** small. Reuses the static handler's ETag and `If-None-Match`
-comparison; the new part is hashing the dynamic body and the 304 path.
-
 ### Rate-guard pre-body rejection — small, with a hazard
 
 **What:** The per-peer `rate_limit` check sits at handler dispatch (after the

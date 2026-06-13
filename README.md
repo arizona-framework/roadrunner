@@ -341,6 +341,9 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
   opt-in HSTS and CSP; a header the handler already set wins.
 - **`roadrunner_cors`**: configurable CORS with an `OPTIONS` preflight
   short-circuit, deny-by-default origins, and a cache-correct `Vary: Origin`.
+- **`roadrunner_etag`**: conditional requests for dynamic `GET` / `HEAD`
+  responses; derives a weak `ETag` from the body (or honors one the handler
+  set) and answers a matching `If-None-Match` with `304 Not Modified`.
 
 ### Built-in handlers
 
