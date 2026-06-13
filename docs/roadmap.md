@@ -86,8 +86,6 @@ advisory or malformed cases the server currently tolerates or omits.
 - Intersect the client's offered cipher / TLS version (`supported_versions`) /
   group (`supported_groups`) against the hardcoded `TLS_AES_128_GCM_SHA256` /
   TLS 1.3 / x25519, aborting on no overlap (RFC 8446 §4.1.1) — medium
-- Emit a reserved "GREASE" setting in the h3 SETTINGS frame (RFC 9114
-  §7.2.4.1) — small
 - Honor the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` when sizing response
   headers (RFC 9114 §4.2.2) — small-medium
 - Reject non-zero packet reserved bits as PROTOCOL_VIOLATION after
