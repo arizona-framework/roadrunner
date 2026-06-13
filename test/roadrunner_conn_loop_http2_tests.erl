@@ -896,7 +896,7 @@ missing_pseudo_header_rst_stream() ->
 empty_body_response_omits_data_frame() ->
     %% Handler returns `{200, [], <<>>}` — server emits a HEADERS
     %% frame with END_STREAM and no DATA frame.
-    {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/empty"),
+    {Pid, Ref, _} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/empty"),
     cleanup(Pid, Ref).
 
 stream_response_emits_data() ->
@@ -1167,23 +1167,26 @@ sendfile_missing_file_resets_stream() ->
     %% the loop continues. The conn process must still be alive
     %% afterwards.
     _ = file:delete("/tmp/rr_h2_sf_does_not_exist.bin"),
-    {Pid, Ref} = run_h2_request_with_handler(
+    {Pid, Ref, _} = run_h2_request_with_handler(
         roadrunner_h2_test_handler, ~"/sendfile/missing"
     ),
     cleanup(Pid, Ref).
 
 websocket_response_returns_501() ->
-    {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/websocket"),
+    {Pid, Ref, Resp} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/websocket"),
+    ?assertEqual(~"501", h2_response_status(Resp)),
     cleanup(Pid, Ref).
 
 handler_crash_returns_500() ->
-    {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/crash"),
+    {Pid, Ref, Resp} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/crash"),
+    ?assertEqual(~"500", h2_response_status(Resp)),
     cleanup(Pid, Ref).
 
 interim_buffered_response_returns_500() ->
     %% A handler returning a buffered 1xx status is a misuse (RFC 9110
     %% §15.2): the worker rejects it with 500 and the conn survives.
-    {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/interim"),
+    {Pid, Ref, Resp} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/interim"),
+    ?assertEqual(~"500", h2_response_status(Resp)),
     cleanup(Pid, Ref).
 
 middleware_chain_runs() ->
@@ -1912,7 +1915,7 @@ handler_returning_invalid_shape_resets_stream() ->
     %% that no `emit_handler_response/3` clause matches — worker
     %% dies with function_clause; conn observes DOWN with a
     %% non-normal reason and emits RST_STREAM(internal_error).
-    {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/badshape"),
+    {Pid, Ref, _} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/badshape"),
     cleanup(Pid, Ref).
 
 unrelated_down_ignored() ->
@@ -2421,7 +2424,7 @@ telemetry_request_start_stop_fires_for_h2() ->
         [roadrunner, request, stop]
     ]),
     try
-        {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/empty"),
+        {Pid, Ref, _} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/empty"),
         Events = collect_telemetry(2),
         [{StartEv, _, StartMd}, {StopEv, StopM, StopMd}] = sort_events(Events),
         ?assertEqual([roadrunner, request, start], StartEv),
@@ -2440,7 +2443,7 @@ telemetry_request_start_stop_fires_for_h2() ->
 telemetry_request_exception_fires_on_h2_handler_crash() ->
     HandlerId = attach_telemetry([[roadrunner, request, exception]]),
     try
-        {Pid, Ref} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/crash"),
+        {Pid, Ref, _} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/crash"),
         receive
             {telemetry_event, [roadrunner, request, exception], M, Md} ->
                 ?assert(is_integer(maps:get(duration, M))),
@@ -3774,9 +3777,11 @@ drain_until(Sentinel) ->
         _ -> drain_until(Sentinel)
     end.
 
-%% Spawn an h2 conn with `Handler` as the dispatch target, drive a
-%% GET against `Path`, drain the response. Returns the conn pid +
-%% monitor ref so the caller can wait for it.
+%% Handshake a fresh h2 conn dispatching to `Handler`, send a GET for
+%% `Path`, and return `{Pid, Ref, Resp}` where `Resp` is the first
+%% response frame the server sent. A handler that answers with a status
+%% sends a HEADERS frame (decode it via `h2_response_status/1`); a crash /
+%% malformed-shape path resets the stream instead.
 run_h2_request_with_handler(Handler, Path) ->
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
@@ -3822,12 +3827,17 @@ run_h2_request_with_handler(Handler, Path) ->
         roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
     ),
     serve_recv(Pid, Hf),
-    %% Drain whatever the server sent back. We don't assert
-    %% specific status here — the test just confirms the dispatch
-    %% path runs without crashing the conn.
-    _ = expect_send(),
+    Resp = expect_send(),
     _ = drain_send(50),
-    {Pid, Ref}.
+    {Pid, Ref, Resp}.
+
+%% Decode the `:status` pseudo-header from a response HEADERS frame.
+h2_response_status(RespBytes) ->
+    {ok, {headers, 1, _, _, Hpack}, _} = roadrunner_http2_frame:parse(RespBytes, 16384),
+    {ok, Headers, _} = roadrunner_http2_hpack:decode(
+        Hpack, roadrunner_http2_hpack:new_decoder(4096)
+    ),
+    proplists:get_value(~":status", Headers).
 
 %% Drive a GET against `Path` and return the conn pid + ref. Unlike
 %% `run_h2_request_with_handler`, leaves the response frames in our
