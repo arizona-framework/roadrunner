@@ -763,10 +763,9 @@ encode_frame(Opcode, Payload, Fin, Opts) ->
     Op = encode_opcode(Opcode),
     FinBit = fin_bit(Fin),
     Rsv1Bit = rsv_bit(maps:get(rsv1, Opts, false)),
-    PayloadBin = iolist_to_binary(Payload),
-    Len = byte_size(PayloadBin),
+    Len = iolist_size(Payload),
     Header = encode_header(FinBit, Rsv1Bit, Op, Len),
-    [Header, PayloadBin].
+    [Header, Payload].
 
 -spec encode_header(0 | 1, 0 | 1, 0..15, non_neg_integer()) -> binary().
 encode_header(FinBit, Rsv1Bit, Op, Len) when Len =< 125 ->
