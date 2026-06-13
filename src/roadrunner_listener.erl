@@ -1473,9 +1473,14 @@ build_rate_limit(RawOpt) ->
             undefined;
         Config ->
             %% Anonymous public table, one per listener, owned by this
-            %% gen_server so it dies with the listener.
+            %% gen_server so it dies with the listener. `write_concurrency, auto`
+            %% adapts the lock count to load (matching the QUIC CID registry);
+            %% no `read_concurrency` — each request reads then writes the same
+            %% key (interleaved RMW), the one pattern it would slow down.
             Config#{
-                table => ets:new(roadrunner_rate_limit, [public, {write_concurrency, true}])
+                table => ets:new(roadrunner_rate_limit, [
+                    set, public, {write_concurrency, auto}
+                ])
             }
     end.
 
