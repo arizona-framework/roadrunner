@@ -176,6 +176,33 @@ malformed_frame_ignored_test() ->
     ?assertEqual(handshaking, ?M:phase(State1)),
     ?assertEqual([], sends(Effects)).
 
+reserved_bits_close_with_protocol_violation_test() ->
+    %% RFC 9000 §17.2: a long-header packet whose reserved bits are non-zero
+    %% (detected only after the packet authenticates) is a PROTOCOL_VIOLATION;
+    %% the decision core closes rather than processing the packet.
+    {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
+    %% Pad like a real client Initial (RFC 9000 §14.1) so the server's 3x
+    %% anti-amplification budget covers the 1200-byte Initial CONNECTION_CLOSE.
+    Datagram = ?TC:seal_raw_reserved(
+        initial,
+        0,
+        roadrunner_quic_keys:initial_client(?DCID),
+        binary:copy(<<0>>, 400),
+        ?DCID,
+        ?SCID
+    ),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)),
+    Frames = ?TC:frames(
+        sends(Effects),
+        initial,
+        #{initial => roadrunner_quic_keys:initial_server(?DCID)},
+        byte_size(?DCID)
+    ),
+    Code = roadrunner_quic_error:code_int(protocol_violation),
+    ?assertEqual([{connection_close, transport, Code, 0, <<>>}], Frames).
+
 packet_for_discarded_space_ignored_test() ->
     %% One datagram coalescing the client Finished (which confirms the
     %% handshake and discards the Handshake space) with a trailing handshake

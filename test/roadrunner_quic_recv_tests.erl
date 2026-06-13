@@ -157,6 +157,17 @@ frame_error_reported_test() ->
         ?M:datagram(Wire, ?DCID_LEN, #{handshake => handshake_keys()}, #{})
     ).
 
+%% RFC 9000 §17.3.1: a 1-RTT packet whose reserved bits are non-zero (after
+%% header protection is removed and the packet authenticates) is a
+%% PROTOCOL_VIOLATION, kept distinct from a silent drop.
+short_header_reserved_bits_protocol_violation_test() ->
+    {Plaintext, _Frames} = frames_for([{stream, 0, 0, <<"x">>, true}]),
+    Wire = seal_short_reserved(7, application_keys(), Plaintext),
+    ?assertEqual(
+        [{frame_error, application, protocol_violation}],
+        ?M:datagram(Wire, ?DCID_LEN, #{application => application_keys()}, #{})
+    ).
+
 %% =============================================================================
 %% Packet-number reconstruction (RFC 9000 §A.3) — direct, all windows.
 %% =============================================================================
@@ -228,4 +239,14 @@ seal_short_pn(FullPN, WirePNLen, #{key := Key, iv := IV, hp := HP}, KeyPhase, Pl
     Protected = roadrunner_quic_aead:protect_header(
         HP, Header, Sealed, byte_size(Header) - WirePNLen
     ),
+    <<Protected/binary, Sealed/binary>>.
+
+%% A short-header packet with the reserved bits (mask 0x18) set; a
+%% conformant 1-RTT packet leaves them 0 (RFC 9000 §17.3.1).
+seal_short_reserved(PN, #{key := Key, iv := IV, hp := HP}, Plaintext) ->
+    PNLen = roadrunner_quic_packet:pn_length(PN),
+    FirstByte = 2#01000000 bor 16#18 bor (PNLen - 1),
+    Header = <<FirstByte, ?DCID/binary, (roadrunner_quic_packet:encode_pn(PN, PNLen))/binary>>,
+    Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
+    Protected = roadrunner_quic_aead:protect_header(HP, Header, Sealed, byte_size(Header) - PNLen),
     <<Protected/binary, Sealed/binary>>.

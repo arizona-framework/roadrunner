@@ -24,10 +24,11 @@
 %% Per packet it yields `{ok, Decoded}` (decrypted, frames decoded),
 %% `{drop, Reason}` for an undecryptable or unsupported packet (silently
 %% dropped, never the whole datagram, RFC 9001 §5.4.2), or
-%% `{frame_error, Level, Reason}` when an authenticated payload holds a
-%% malformed frame (a connection error the loop must act on, kept distinct
-%% from a drop). A decrypt failure drops only that packet and the loop
-%% continues with the rest of the datagram.
+%% `{frame_error, Level, Reason}` when an authenticated packet holds a
+%% malformed frame, or sets the header reserved bits (RFC 9000
+%% §17.2/§17.3.1, `Reason = protocol_violation`) — a connection error the
+%% loop must act on, kept distinct from a drop. A decrypt failure drops
+%% only that packet and the loop continues with the rest of the datagram.
 
 -export([datagram/4]).
 %% Exported for direct unit coverage of the RFC 9000 §A.3 windows; the
@@ -93,7 +94,14 @@ packet(Packet, DCIDLen, Keys, Largest) ->
             roadrunner_quic_aead:unprotect_header(HP, Packet, PNOffset),
         PN = reconstruct_pn(level_largest(Level, Largest), PNLen, TruncPN),
         {ok, Plaintext} ?= open(Key, IV, PN, Header, Ciphertext),
-        decode_frames(Level, PN, Header, Plaintext)
+        %% RFC 9000 §17.2 / §17.3.1: the header's reserved bits MUST be 0.
+        %% Checked only after the packet authenticates (open/5 above) so a
+        %% forged packet cannot spuriously close the connection; a non-zero
+        %% value is a PROTOCOL_VIOLATION the loop acts on, not a silent drop.
+        case reserved_bits_zero(Level, Header) of
+            true -> decode_frames(Level, PN, Header, Plaintext);
+            false -> {frame_error, Level, protocol_violation}
+        end
     else
         {drop, _} = Drop -> Drop;
         {error, Reason} -> {drop, Reason}
@@ -169,3 +177,16 @@ decoded(application, PN, <<FirstByte, _/binary>>, Frames) ->
     };
 decoded(Level, PN, _Header, Frames) ->
     #{level => Level, pn => PN, frames => Frames}.
+
+%% RFC 9000 §17.2 (long header) / §17.3.1 (short header): the reserved
+%% bits of the unprotected first byte are 0 in a conformant packet.
+-spec reserved_bits_zero(level(), binary()) -> boolean().
+reserved_bits_zero(Level, <<FirstByte, _/binary>>) ->
+    FirstByte band reserved_mask(Level) =:= 0.
+
+%% Reserved-bit mask: 0x18 in a 1-RTT short header, 0x0c in a long header
+%% (the two bits between the type / key-phase fields and the
+%% packet-number length).
+-spec reserved_mask(level()) -> non_neg_integer().
+reserved_mask(application) -> 16#18;
+reserved_mask(_Long) -> 16#0c.

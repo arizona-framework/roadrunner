@@ -14,7 +14,7 @@
 
 -export([key_material/0, gen_keypair/0]).
 -export([client_hello_framed/3, client_hello_framed/4]).
--export([seal/6, seal_raw/6]).
+-export([seal/6, seal_raw/6, seal_raw_reserved/6]).
 -export([crypto_bytes/4, frames/4]).
 -export([server_hello_key_share/1, deframe_all/1]).
 -export([
@@ -183,6 +183,30 @@ seal_raw(Level, PN, #{key := Key, iv := IV, hp := HP}, Plaintext, DCID, SCID) ->
     [Header, _Payload] = roadrunner_quic_packet:encode_long(
         Level, 1, DCID, SCID, #{pn => PN, payload => <<0:(SealedSize * 8)>>}
     ),
+    Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
+    Protected = roadrunner_quic_aead:protect_header(HP, Header, Sealed, byte_size(Header) - PNLen),
+    <<Protected/binary, Sealed/binary>>.
+
+-doc """
+Like `seal_raw/6`, but sets the long-header reserved bits (mask 0x0c) — a
+conformant packet leaves them 0, so the server MUST close with
+PROTOCOL_VIOLATION once it authenticates (RFC 9000 §17.2).
+""".
+-spec seal_raw_reserved(
+    roadrunner_quic_packet:long_type(),
+    non_neg_integer(),
+    roadrunner_quic_keys:keys(),
+    binary(),
+    binary(),
+    binary()
+) -> binary().
+seal_raw_reserved(Level, PN, #{key := Key, iv := IV, hp := HP}, Plaintext, DCID, SCID) ->
+    PNLen = roadrunner_quic_packet:pn_length(PN),
+    SealedSize = byte_size(Plaintext) + 16,
+    [<<FirstByte, HeaderRest/binary>>, _Payload] = roadrunner_quic_packet:encode_long(
+        Level, 1, DCID, SCID, #{pn => PN, payload => <<0:(SealedSize * 8)>>}
+    ),
+    Header = <<(FirstByte bor 16#0c), HeaderRest/binary>>,
     Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
     Protected = roadrunner_quic_aead:protect_header(HP, Header, Sealed, byte_size(Header) - PNLen),
     <<Protected/binary, Sealed/binary>>.

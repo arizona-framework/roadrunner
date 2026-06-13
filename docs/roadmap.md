@@ -88,8 +88,11 @@ advisory or malformed cases the server currently tolerates or omits.
   TLS 1.3 / x25519, aborting on no overlap (RFC 8446 §4.1.1) — medium
 - Honor the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` when sizing response
   headers (RFC 9114 §4.2.2) — small-medium
-- Reject non-zero packet reserved bits as PROTOCOL_VIOLATION after
-  header-protection removal (RFC 9000 §17.2 / §17.3.1) — small
+- Close on a malformed authenticated frame instead of absorbing it: the recv
+  pipeline already reports `{frame_error, _, Reason}`, but the loop only acts
+  on the packet-header reserved-bits case (PROTOCOL_VIOLATION); map a frame
+  decode reason to FRAME_ENCODING_ERROR / the frame-specific code (RFC 9000
+  §12.4) and close — small
 
 ### Transport completeness — bites large transfers / advanced cases
 

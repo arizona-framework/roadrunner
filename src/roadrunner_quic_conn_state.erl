@@ -638,7 +638,14 @@ process_outcome(
     end;
 process_outcome(_Now, {drop, _Reason}, State) ->
     State;
+process_outcome(_Now, {frame_error, Level, protocol_violation}, State) ->
+    %% A packet-header protocol violation the recv pipeline flagged after the
+    %% packet authenticated (non-zero reserved bits, RFC 9000 §17.2/§17.3.1):
+    %% close with PROTOCOL_VIOLATION.
+    connection_fatal(Level, protocol_violation, State);
 process_outcome(_Now, {frame_error, _Level, _Reason}, State) ->
+    %% Other recv-flagged frame errors (a malformed authenticated frame) are
+    %% absorbed for now rather than closing — see docs/roadmap.md.
     State.
 
 %% A decrypted Handshake packet proves the client received the server's
