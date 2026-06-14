@@ -10,25 +10,20 @@ by the `roadrunner_middleware` behaviour.
 
 Every entry takes the uniform `(Req, Next, State)` shape. The fun-form
 helpers ignore `State`; `call/3` stamps it into the request so tests can
-verify both behaviour dispatch and per-entry state threading. `init/1` is
-identity, so the entry's config reaches `call/3` unchanged.
+verify both behaviour dispatch and per-entry state threading. This module
+has **no** `init/1`, so it exercises the optional-init path: the entry's
+config reaches `call/3` verbatim.
 """.
 
 -behaviour(roadrunner_middleware).
 
 -export([
-    init/1,
     call/3,
     tag_request/3,
     wrap_response/3,
     halt_401/3,
     crash/3
 ]).
-
-%% Identity init — the entry's config is the `call/3` state verbatim, so
-%% the state-threading assertions read back exactly what was configured.
-init(Config) ->
-    Config.
 
 %% Module-form `call/3` callback. Stamps this entry's `State` as the
 %% `x-mw-mod` request header, so tests can assert the state threaded

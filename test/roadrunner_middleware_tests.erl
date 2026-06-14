@@ -77,7 +77,10 @@ compose_two_middlewares_outer_wraps_inner_test() ->
     ?assertEqual({200, [], ~"O(I(x))"}, {Status, Headers, Body}).
 
 compose_module_form_dispatches_via_call3_test() ->
-    %% `{Mod, State}` dispatches to the behaviour `call/3` with State.
+    %% `{Mod, Config}` dispatches to the behaviour `call/3`. The fixture has
+    %% no `init/1`, so the config reaches `call/3` verbatim (the optional-init
+    %% path); `compose_runs_module_init_and_threads_output_test` covers the
+    %% with-init case.
     Handler = fun(R) ->
         {{200, [], roadrunner_req:header(~"x-mw-mod", R)}, R}
     end,
@@ -155,6 +158,14 @@ compose_runs_module_init_and_threads_output_test() ->
     ),
     {{200, [], Body}, _Req2} = Pipeline(req()),
     ?assertEqual(~"compiled-ok", Body).
+
+resolve_unloadable_module_crashes_test() ->
+    %% A middleware module that can't be loaded is a config error: it fails
+    %% when the pipeline is resolved (listener start), not on a request.
+    ?assertError(
+        {middleware_module_not_loaded, roadrunner_no_such_middleware, _},
+        roadrunner_middleware:resolve([roadrunner_no_such_middleware])
+    ).
 
 %% =============================================================================
 %% End-to-end through roadrunner_conn — exercises the map-shape route's
