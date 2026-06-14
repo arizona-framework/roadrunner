@@ -96,13 +96,13 @@ init(Config) ->
     Credentials = credentials(Config),
     AllowCredentials = credentials_value(Credentials),
     {ReflectHeaders, AllowHeaders} = compile_allow_headers(Config),
-    PreflightStatic = drop_unset([
+    PreflightStatic = roadrunner_http:drop_unset([
         {~"access-control-allow-methods", join(methods(Config))},
         {~"access-control-allow-headers", AllowHeaders},
         {~"access-control-allow-credentials", AllowCredentials},
         {~"access-control-max-age", max_age_value(Config)}
     ]),
-    ActualStatic = drop_unset([
+    ActualStatic = roadrunner_http:drop_unset([
         {~"access-control-allow-credentials", AllowCredentials},
         {~"access-control-expose-headers", expose_value(Config)}
     ]),
@@ -125,12 +125,6 @@ compile_allow_headers(Config) ->
         [] -> {false, false};
         List -> {false, join(List)}
     end.
-
-%% Drop the entries whose value didn't apply under the policy (`false`), so the
-%% per-request path only ever prepends real headers.
--spec drop_unset([{binary(), binary() | false}]) -> roadrunner_http:headers().
-drop_unset(Headers) ->
-    [Header || {_Name, Value} = Header <- Headers, Value =/= false].
 
 -spec call(roadrunner_req:request(), roadrunner_middleware:next(), state()) ->
     roadrunner_handler:result().
@@ -176,7 +170,9 @@ preflight_response(#cors{origins = Origins} = State, Origin, Req) ->
                     ~"access-control-allow-origin",
                     allow_origin_value(Origin, Origins, State#cors.credentials)
                 },
-            Headers = add_headers([AllowOrigin | preflight_headers(State, Req)], Base),
+            Headers = roadrunner_http:with_defaults(
+                [AllowOrigin | preflight_headers(State, Req)], Base
+            ),
             {204, Headers, ~""}
     end.
 
@@ -245,7 +241,7 @@ actual_headers(Headers, #cors{origins = Origins} = State, Origin) ->
                     ~"access-control-allow-origin",
                     allow_origin_value(Origin, Origins, State#cors.credentials)
                 },
-            add_headers([AllowOrigin | State#cors.actual_static], WithVary)
+            roadrunner_http:with_defaults([AllowOrigin | State#cors.actual_static], WithVary)
     end.
 
 -spec expose_value(map()) -> binary() | false.
@@ -285,19 +281,6 @@ add_vary_origin(Headers) ->
             [{~"vary", ~"Origin"} | Headers];
         {_, Existing} ->
             lists:keystore(~"vary", 1, Headers, {~"vary", <<Existing/binary, ", Origin">>})
-    end.
-
-%% Prepend each pre-built candidate the handler didn't already set. The
-%% `false`-valued entries were dropped at compile time by `drop_unset/1`, so
-%% the only check left here is whether the handler already owns the header.
--spec add_headers(roadrunner_http:headers(), roadrunner_http:headers()) ->
-    roadrunner_http:headers().
-add_headers([], Headers) ->
-    Headers;
-add_headers([{Name, _} = Header | Rest], Headers) ->
-    case lists:keymember(Name, 1, Headers) of
-        true -> add_headers(Rest, Headers);
-        false -> [Header | add_headers(Rest, Headers)]
     end.
 
 %% Join binaries with ", " into one binary (header values must be binary).

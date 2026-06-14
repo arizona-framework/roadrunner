@@ -221,6 +221,22 @@ bad_max_age_crashes_test() ->
         preflight(?ORIGIN, ~"POST", [], cfg(#{max_age => -1}))
     ).
 
+bad_config_crashes_at_compile_test() ->
+    %% Routes are compiled (running each middleware's `init/1`) when the
+    %% listener starts or reloads, so an invalid policy crashes there with a
+    %% clear `{invalid_cors_opt, ...}` rather than surfacing on a request.
+    Routes = [
+        #{
+            path => ~"/",
+            handler => roadrunner_hello_handler,
+            middlewares => [{roadrunner_cors, #{origins => not_valid}}]
+        }
+    ],
+    ?assertError(
+        {invalid_cors_opt, origins, not_valid},
+        roadrunner_router:compile(Routes, [])
+    ).
+
 %% =============================================================================
 %% End-to-end through roadrunner_listener.
 %% =============================================================================

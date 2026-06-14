@@ -37,6 +37,7 @@ accessors that operate on it.
 """.
 
 -export([http_date_now/0, format_http_date/1, with_date/1, auto_headers/2]).
+-export([with_defaults/2, drop_unset/1]).
 -export([header_list_size/1]).
 -export([check_header_safe/2, check_header_safe/3]).
 -export([unsafe_bytes_pattern/0]).
@@ -129,6 +130,28 @@ with_alt_svc(Headers, undefined) ->
     Headers;
 with_alt_svc(Headers, AltSvc) ->
     [{~"alt-svc", AltSvc} | Headers].
+
+%% Prepend each candidate the existing list doesn't already carry, so a
+%% handler-set value always wins. Body recursion preserves candidate order.
+%% Used by middlewares (`roadrunner_cors`, `roadrunner_security_headers`) to
+%% merge their pre-built header set onto the handler's response.
+-doc false.
+-spec with_defaults(Defaults :: headers(), headers()) -> headers().
+with_defaults([], Headers) ->
+    Headers;
+with_defaults([{Name, _} = Default | Rest], Headers) ->
+    case lists:keymember(Name, 1, Headers) of
+        true -> with_defaults(Rest, Headers);
+        false -> [Default | with_defaults(Rest, Headers)]
+    end.
+
+%% Drop the candidates whose value resolved to `false` (the header doesn't
+%% apply), leaving a plain header list. Middlewares call this once, at compile
+%% time, so the per-request `with_defaults/2` only ever prepends real headers.
+-doc false.
+-spec drop_unset([{binary(), binary() | false}]) -> headers().
+drop_unset(Candidates) ->
+    [Header || {_Name, Value} = Header <- Candidates, Value =/= false].
 
 %% RFC 7541 §4.1: the uncompressed size of a header list is the sum over
 %% its fields of `byte_size(Name) + byte_size(Value) + 32`. This is the

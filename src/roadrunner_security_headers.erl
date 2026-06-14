@@ -75,7 +75,7 @@ headers, passes through.
     preload => boolean()
 }.
 
--export_type([state/0]).
+-export_type([config/0, state/0]).
 
 %% The compiled header set `init/1` produces: `static` is the pre-built,
 %% false-filtered list of the scheme-independent defaults, prepended onto the
@@ -92,21 +92,15 @@ headers, passes through.
 
 %% Resolve every default and the HSTS value once, at pipeline-compile time, and
 %% pre-build the scheme-independent set so a request only prepends HSTS.
--spec init(roadrunner_middleware:config()) -> state().
+-spec init(config()) -> state().
 init(Config) ->
-    Static = drop_unset([
+    Static = roadrunner_http:drop_unset([
         {~"x-content-type-options", opt(content_type_options, Config, ~"nosniff")},
         {~"x-frame-options", opt(frame_options, Config, ~"SAMEORIGIN")},
         {~"referrer-policy", opt(referrer_policy, Config, ~"strict-origin-when-cross-origin")},
         {~"content-security-policy", opt(content_security_policy, Config, false)}
     ]),
     #sec{static = Static, hsts = compile_hsts(Config)}.
-
-%% Drop entries whose value didn't apply under the config (`false`), so the
-%% per-request path only ever prepends real headers.
--spec drop_unset([{binary(), binary() | false}]) -> roadrunner_http:headers().
-drop_unset(Headers) ->
-    [Header || {_Name, Value} = Header <- Headers, Value =/= false].
 
 %% Pre-build the `strict-transport-security` value (or `false` when off). It is
 %% still emitted only over HTTPS — see `hsts_candidates/3`.
@@ -156,7 +150,9 @@ transform(_Req, _State, Other) ->
 -spec inject(roadrunner_req:request(), state(), roadrunner_http:headers()) ->
     roadrunner_http:headers().
 inject(Req, #sec{static = Static} = State, Headers) ->
-    add_defaults(hsts_candidates(roadrunner_req:scheme(Req), State, Static), Headers).
+    roadrunner_http:with_defaults(
+        hsts_candidates(roadrunner_req:scheme(Req), State, Static), Headers
+    ).
 
 %% HSTS is meaningful only over HTTPS (RFC 6797 §8.1: a browser ignores it on a
 %% plain-HTTP response) and only when configured; the value itself was pre-built
@@ -167,18 +163,6 @@ hsts_candidates(https, #sec{hsts = Hsts}, Static) when is_binary(Hsts) ->
     [{~"strict-transport-security", Hsts} | Static];
 hsts_candidates(_Scheme, _State, Static) ->
     Static.
-
-%% Prepend each pre-built default the handler didn't already set. The
-%% `false`-valued defaults were dropped at compile time by `drop_unset/1`.
--spec add_defaults(roadrunner_http:headers(), roadrunner_http:headers()) ->
-    roadrunner_http:headers().
-add_defaults([], Headers) ->
-    Headers;
-add_defaults([{Name, _} = Header | Rest], Headers) ->
-    case has_header(Name, Headers) of
-        true -> add_defaults(Rest, Headers);
-        false -> [Header | add_defaults(Rest, Headers)]
-    end.
 
 %% Build `max-age=N[; includeSubDomains][; preload]` from the HSTS sub-config.
 -spec hsts_value(hsts_config()) -> binary().
@@ -203,7 +187,3 @@ opt(Key, Config, Default) ->
         #{Key := Value} -> Value;
         #{} -> Default
     end.
-
--spec has_header(binary(), roadrunner_http:headers()) -> boolean().
-has_header(Name, Headers) ->
-    lists:keymember(Name, 1, Headers).
