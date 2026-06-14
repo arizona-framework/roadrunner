@@ -115,19 +115,18 @@ compose_same_module_twice_with_different_state_test() ->
     {{200, [], Body}, _Req2} = Pipeline(req()),
     ?assertEqual(~"b,a", Body).
 
-compose_bare_module_defaults_state_to_undefined_test() ->
-    %% A bare `module()` entry is shorthand for `{module(), undefined}`;
-    %% the behaviour `call/3` receives `undefined`.
-    Handler = fun(R) ->
-        {~"x-mw-mod", V} = lists:keyfind(~"x-mw-mod", 1, maps:get(headers, R)),
-        {{200, [], atom_to_binary(V)}, R}
-    end,
+compose_bare_module_defaults_config_to_empty_map_test() ->
+    %% A bare `module()` entry is shorthand for `{module(), #{}}`: `init/1`
+    %% receives `#{}`, and (identity here) `call/3` gets that `#{}` as its
+    %% state, stamped into `x-mw-mod`.
+    Handler = fun(R) -> {{200, maps:get(headers, R), ~"ok"}, R} end,
     Pipeline = roadrunner_middleware:compose([roadrunner_test_middlewares], Handler),
-    {{200, [], Body}, _Req2} = Pipeline(req()),
-    ?assertEqual(~"undefined", Body).
+    {{200, Headers, ~"ok"}, _Req2} = Pipeline(req()),
+    ?assertEqual(#{}, proplists:get_value(~"x-mw-mod", Headers)).
 
-compose_bare_fun_defaults_state_to_undefined_test() ->
-    %% A bare `fun/3` entry is shorthand for `{fun/3, undefined}`.
+compose_bare_fun_defaults_state_to_empty_map_test() ->
+    %% A bare `fun/3` entry is shorthand for `{fun/3, #{}}` — a fun has no
+    %% init, so the default config is its state verbatim.
     Self = self(),
     Ref = make_ref(),
     Mw = fun(R, Next, State) ->
@@ -139,9 +138,23 @@ compose_bare_fun_defaults_state_to_undefined_test() ->
     Req = req(),
     ?assertEqual({{200, [], ~"ok"}, Req}, Pipeline(Req)),
     receive
-        {Ref, State} -> ?assertEqual(undefined, State)
+        {Ref, State} -> ?assertEqual(#{}, State)
     after 50 -> error(no_state_received)
     end.
+
+compose_runs_module_init_and_threads_output_test() ->
+    %% A module entry's `init/1` runs at compose time and its OUTPUT (not
+    %% the raw config) is what `call/3` receives. The fixture compiles
+    %% `#{tag => ...}` into `{compiled, Tag}` and stamps the tag, so reading
+    %% it back proves the transform ran and threaded through.
+    Handler = fun(R) ->
+        {{200, [], roadrunner_req:header(~"x-init-tag", R)}, R}
+    end,
+    Pipeline = roadrunner_middleware:compose(
+        [{roadrunner_test_init_middleware, #{tag => ~"compiled-ok"}}], Handler
+    ),
+    {{200, [], Body}, _Req2} = Pipeline(req()),
+    ?assertEqual(~"compiled-ok", Body).
 
 %% =============================================================================
 %% End-to-end through roadrunner_conn — exercises the map-shape route's
@@ -294,6 +307,61 @@ listener_middleware_runs_outside_route_middleware_test_() ->
                 %% [wrapped] + x-wrapped header.
                 {match, _} = re:run(Reply, ~"x-wrapped: yes", [caseless]),
                 {match, _} = re:run(Reply, ~"\\[wrapped\\] fun=yes")
+            end}
+        end}.
+
+%% =============================================================================
+%% init/1 runs once at pipeline-compile time, never per request.
+%% =============================================================================
+
+init_runs_once_at_compile_not_per_request_test_() ->
+    {setup,
+        fun() ->
+            Ref = counters:new(1, []),
+            {ok, _} = roadrunner_listener:start_link(mw_test_init_once, #{
+                port => 0,
+                routes => #{
+                    handler => roadrunner_echo_headers_handler,
+                    middlewares => [
+                        {roadrunner_test_init_middleware, #{counter => Ref, tag => ~"x"}}
+                    ]
+                }
+            }),
+            {roadrunner_listener:port(mw_test_init_once), Ref}
+        end,
+        fun(_) -> ok = roadrunner_listener:stop(mw_test_init_once) end, fun({Port, Ref}) ->
+            {"init runs once while the pipeline is baked, not on each request", fun() ->
+                %% The pipeline was compiled at listener start, so init has
+                %% already run exactly once — before any request.
+                ?assertEqual(1, counters:get(Ref, 1)),
+                _ = http_get(Port, ~"/a"),
+                _ = http_get(Port, ~"/b"),
+                _ = http_get(Port, ~"/c"),
+                %% call/3 ran three times; init ran zero more times.
+                ?assertEqual(1, counters:get(Ref, 1))
+            end}
+        end}.
+
+listener_middleware_init_runs_once_across_routes_test_() ->
+    {setup,
+        fun() ->
+            Ref = counters:new(1, []),
+            {ok, _} = roadrunner_listener:start_link(mw_test_listener_init_once, #{
+                port => 0,
+                middlewares => [{roadrunner_test_init_middleware, #{counter => Ref, tag => ~"x"}}],
+                routes => [
+                    #{path => ~"/a", handler => roadrunner_echo_headers_handler},
+                    #{path => ~"/b", handler => roadrunner_echo_headers_handler},
+                    #{path => ~"/c", handler => roadrunner_echo_headers_handler}
+                ]
+            }),
+            Ref
+        end,
+        fun(_) -> ok = roadrunner_listener:stop(mw_test_listener_init_once) end, fun(Ref) ->
+            {"a listener middleware is resolved once, not once per route", fun() ->
+                %% Three routes share the one listener middleware, so its init
+                %% ran a single time when the routes were compiled.
+                ?assertEqual(1, counters:get(Ref, 1))
             end}
         end}.
 

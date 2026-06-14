@@ -15,7 +15,7 @@
 no_origin_passes_through_test() ->
     Req = req(~"GET", []),
     Next = fun(R) -> {{200, [{~"x", ~"y"}], ~"body"}, R} end,
-    {{200, Headers, ~"body"}, _Req2} = ?M:call(Req, Next, ?ALLOWLIST),
+    {{200, Headers, ~"body"}, _Req2} = call(Req, Next, ?ALLOWLIST),
     %% Untouched: no Access-Control / Vary headers added.
     ?assertEqual(undefined, header(~"access-control-allow-origin", Headers)),
     ?assertEqual(undefined, header(~"vary", Headers)).
@@ -65,13 +65,13 @@ expose_empty_omits_header_test() ->
 vary_appended_to_existing_test() ->
     Req = req(~"GET", [{~"origin", ?ORIGIN}]),
     Next = fun(R) -> {{200, [{~"vary", ~"Accept-Encoding"}], ~"b"}, R} end,
-    {{200, Headers, _}, _} = ?M:call(Req, Next, ?ALLOWLIST),
+    {{200, Headers, _}, _} = call(Req, Next, ?ALLOWLIST),
     ?assertEqual(~"Accept-Encoding, Origin", header(~"vary", Headers)).
 
 handler_acao_wins_test() ->
     Req = req(~"GET", [{~"origin", ?ORIGIN}]),
     Next = fun(R) -> {{200, [{~"access-control-allow-origin", ~"https://other"}], ~"b"}, R} end,
-    {{200, Headers, _}, _} = ?M:call(Req, Next, #{origins => any}),
+    {{200, Headers, _}, _} = call(Req, Next, #{origins => any}),
     ?assertEqual([~"https://other"], [V || {~"access-control-allow-origin", V} <- Headers]).
 
 %% --- response shapes ---
@@ -80,7 +80,7 @@ stream_response_decorated_test() ->
     Req = req(~"GET", [{~"origin", ?ORIGIN}]),
     Fun = fun(_Send) -> ok end,
     Next = fun(R) -> {{stream, 200, [], Fun}, R} end,
-    {{stream, 200, Headers, OutFun}, _} = ?M:call(Req, Next, ?ALLOWLIST),
+    {{stream, 200, Headers, OutFun}, _} = call(Req, Next, ?ALLOWLIST),
     ?assertEqual(Fun, OutFun),
     ?assertEqual(?ORIGIN, header(~"access-control-allow-origin", Headers)).
 
@@ -88,21 +88,21 @@ sendfile_response_decorated_test() ->
     Req = req(~"GET", [{~"origin", ?ORIGIN}]),
     Spec = {~"/tmp/x", 0, 10},
     Next = fun(R) -> {{sendfile, 200, [], Spec}, R} end,
-    {{sendfile, 200, Headers, OutSpec}, _} = ?M:call(Req, Next, ?ALLOWLIST),
+    {{sendfile, 200, Headers, OutSpec}, _} = call(Req, Next, ?ALLOWLIST),
     ?assertEqual(Spec, OutSpec),
     ?assertEqual(?ORIGIN, header(~"access-control-allow-origin", Headers)).
 
 loop_response_decorated_test() ->
     Req = req(~"GET", [{~"origin", ?ORIGIN}]),
     Next = fun(R) -> {{loop, 200, [], loop_state}, R} end,
-    {{loop, 200, Headers, OutState}, _} = ?M:call(Req, Next, ?ALLOWLIST),
+    {{loop, 200, Headers, OutState}, _} = call(Req, Next, ?ALLOWLIST),
     ?assertEqual(loop_state, OutState),
     ?assertEqual(?ORIGIN, header(~"access-control-allow-origin", Headers)).
 
 websocket_passes_through_test() ->
     Req = req(~"GET", [{~"origin", ?ORIGIN}]),
     Next = fun(R) -> {{websocket, some_mod, init_state}, R} end,
-    {Response, _} = ?M:call(Req, Next, ?ALLOWLIST),
+    {Response, _} = call(Req, Next, ?ALLOWLIST),
     ?assertMatch({websocket, some_mod, init_state}, Response).
 
 %% --- preflight ---
@@ -120,7 +120,7 @@ preflight_short_circuits_without_calling_next_test() ->
         {~"origin", ?ORIGIN}, {~"access-control-request-method", ~"POST"}
     ]),
     Next = fun(_R) -> error(next_must_not_run) end,
-    {{204, _Headers, ~""}, _} = ?M:call(Req, Next, ?ALLOWLIST).
+    {{204, _Headers, ~""}, _} = call(Req, Next, ?ALLOWLIST).
 
 preflight_disallowed_has_only_vary_test() ->
     {Status, Headers} = preflight(~"https://evil.example.com", ~"POST", [], ?ALLOWLIST),
@@ -167,7 +167,7 @@ options_without_request_method_is_not_preflight_test() ->
     %% not a preflight: the handler runs and gets the actual-request headers.
     Req = req(~"OPTIONS", [{~"origin", ?ORIGIN}]),
     Next = fun(R) -> {{200, [], ~"handled"}, R} end,
-    {{200, Headers, ~"handled"}, _} = ?M:call(Req, Next, ?ALLOWLIST),
+    {{200, Headers, ~"handled"}, _} = call(Req, Next, ?ALLOWLIST),
     ?assertEqual(?ORIGIN, header(~"access-control-allow-origin", Headers)).
 
 %% --- header injection guard ---
@@ -176,7 +176,7 @@ unsafe_origin_crashes_test() ->
     %% An attacker-controlled origin carrying CR/LF must not reach the wire.
     Req = req(~"GET", [{~"origin", <<"https://evil\r\nx-injected: 1">>}]),
     Next = fun(R) -> {{200, [], ~"b"}, R} end,
-    ?assertError({header_injection, value, _}, ?M:call(Req, Next, #{origins => any})).
+    ?assertError({header_injection, value, _}, call(Req, Next, #{origins => any})).
 
 %% --- config validation ---
 
@@ -220,6 +220,65 @@ bad_max_age_crashes_test() ->
         {invalid_cors_opt, max_age, -1},
         preflight(?ORIGIN, ~"POST", [], cfg(#{max_age => -1}))
     ).
+
+bad_config_crashes_at_compile_test() ->
+    %% Routes are compiled (running each middleware's `init/1`) when the
+    %% listener starts or reloads, so an invalid policy crashes there with a
+    %% clear `{invalid_cors_opt, ...}` rather than surfacing on a request.
+    Routes = [
+        #{
+            path => ~"/",
+            handler => roadrunner_hello_handler,
+            middlewares => [{roadrunner_cors, #{origins => not_valid}}]
+        }
+    ],
+    ?assertError(
+        {invalid_cors_opt, origins, not_valid},
+        roadrunner_router:compile(Routes, [])
+    ).
+
+per_route_config_is_isolated_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = roadrunner_listener:start_link(cors_per_route, #{
+                port => 0,
+                routes => [
+                    #{
+                        path => ~"/a",
+                        handler => roadrunner_hello_handler,
+                        middlewares => [{roadrunner_cors, #{origins => [~"https://a.example"]}}]
+                    },
+                    #{
+                        path => ~"/b",
+                        handler => roadrunner_hello_handler,
+                        middlewares => [{roadrunner_cors, #{origins => [~"https://b.example"]}}]
+                    }
+                ]
+            }),
+            roadrunner_listener:port(cors_per_route)
+        end,
+        fun(_) -> ok = roadrunner_listener:stop(cors_per_route) end, fun(Port) ->
+            {"each route is compiled with its own per-route policy", fun() ->
+                %% `https://a.example` is allowed on `/a` but not on `/b` —
+                %% each route's own `init/1` ran with its own config.
+                ReplyA = request(Port, [
+                    ~"GET /a HTTP/1.1\r\n",
+                    ~"Host: x\r\n",
+                    ~"Origin: https://a.example\r\n",
+                    ~"Connection: close\r\n\r\n"
+                ]),
+                {match, _} = re:run(
+                    ReplyA, ~"access-control-allow-origin: https://a.example", [caseless]
+                ),
+                ReplyB = request(Port, [
+                    ~"GET /b HTTP/1.1\r\n",
+                    ~"Host: x\r\n",
+                    ~"Origin: https://a.example\r\n",
+                    ~"Connection: close\r\n\r\n"
+                ]),
+                nomatch = re:run(ReplyB, ~"access-control-allow-origin", [caseless])
+            end}
+        end}.
 
 %% =============================================================================
 %% End-to-end through roadrunner_listener.
@@ -268,6 +327,13 @@ end_to_end_test_() ->
 
 %% --- helpers ---
 
+%% Compile the config through `init/1` (as the pipeline does at startup), then
+%% invoke `call/3` with the resulting state — the contract every test exercises.
+%% A bad config raises `{invalid_cors_opt, ...}` from `init/1` here, which the
+%% config-validation tests assert on.
+call(Req, Next, Config) ->
+    ?M:call(Req, Next, ?M:init(Config)).
+
 %% Allowlist config with `Extra` merged in. Updates the `Extra` variable (not a
 %% literal map) so the compiler's update-literal warning doesn't fire.
 cfg(Extra) ->
@@ -278,7 +344,7 @@ cfg(Extra) ->
 simple(Origin, Config) ->
     Req = req(~"GET", [{~"origin", Origin}]),
     Next = fun(R) -> {{200, [], ~"body"}, R} end,
-    {{200, Headers, ~"body"}, Req2} = ?M:call(Req, Next, Config),
+    {{200, Headers, ~"body"}, Req2} = call(Req, Next, Config),
     {Headers, Req2}.
 
 %% Run a preflight OPTIONS; returns the response status and headers. The Next
@@ -288,7 +354,7 @@ preflight(Origin, RequestMethod, ExtraHeaders, Config) ->
         {~"origin", Origin}, {~"access-control-request-method", RequestMethod} | ExtraHeaders
     ]),
     Next = fun(_R) -> error(next_must_not_run) end,
-    {{Status, Headers, ~""}, _} = ?M:call(Req, Next, Config),
+    {{Status, Headers, ~""}, _} = call(Req, Next, Config),
     {Status, Headers}.
 
 req(Method, Headers) ->
