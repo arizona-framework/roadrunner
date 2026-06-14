@@ -241,14 +241,14 @@ jobs:
         run: ./scripts/h2spec.sh
 
   # WebSocket conformance — backs the README "Autobahn fuzzingclient
-  # strict 100 %" claim, on every supported OTP. Slow (~5 min/version) —
-  # runs only on push to main, merge_group, and manual dispatch, not every
-  # PR. Use `workflow_dispatch` to trigger on a feature branch when WS code
-  # is touched. Self-contained per matrix version like Test / h2spec.
+  # strict 100 %" claim, on every supported OTP. Slow (~5 min/version) but
+  # runs on every push + PR + merge_group, in parallel with the other jobs,
+  # exactly like h2spec — so a WebSocket regression is caught before merge
+  # rather than only after landing on main. Needs Docker (the
+  # crossbario/autobahn-testsuite image), which the ubuntu runner provides.
+  # Self-contained per matrix version like Test / h2spec.
   autobahn:
     name: autobahn (OTP ${{ matrix.otp }})
-
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
 
     runs-on: ubuntu-24.04
 
