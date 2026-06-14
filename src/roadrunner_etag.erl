@@ -36,18 +36,12 @@
 
 -behaviour(roadrunner_middleware).
 
--export([init/1, call/3]).
+-export([call/3]).
 
 %% No per-instance config — the validator is derived from the response body
-%% and the request's `If-None-Match` per request, so the compiled state is
-%% just the empty map.
--type state() :: #{}.
-
--spec init(roadrunner_middleware:config()) -> state().
-init(_Config) ->
-    #{}.
-
--spec call(roadrunner_req:request(), roadrunner_middleware:next(), state()) ->
+%% and the request's `If-None-Match` per request. With no `init/1`, the entry's
+%% config reaches `call/3` as `State`, which is ignored.
+-spec call(roadrunner_req:request(), roadrunner_middleware:next(), roadrunner_middleware:state()) ->
     roadrunner_handler:result().
 call(Req, Next, _State) ->
     {Response, Req2} = Next(Req),

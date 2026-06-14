@@ -84,9 +84,10 @@ its config as `{Callable, Config}`. A bare `Callable` is shorthand for
 omits the state a `{Path, Handler, State}` route carries.
 
 - `module()` / `{module(), Config}` — a module implementing this
-  behaviour. Its `init(Config)` callback runs **once**, at
-  pipeline-compile time, and the value it returns becomes the `State`
-  handed to every `Mod:call(Req, Next, State)`. See "init/1" below.
+  behaviour. If it exports the optional `init(Config)` callback, that runs
+  **once** at pipeline-compile time and the value it returns becomes the
+  `State` handed to every `Mod:call(Req, Next, State)`; otherwise the
+  config is threaded verbatim. See "init/1" below.
 - `fun((Request, Next, State) -> Result)` / `{Fun, State}` — a fun has no
   init step, so its paired `State` is threaded verbatim as the third
   argument: `Fun(Req, Next, State)`. Reach for a fun for lightweight
@@ -101,11 +102,11 @@ Middleware `State` is **not** the request's `state` field. Route state
 with `roadrunner_req:state/1`; middleware `State` is handed to `call/3`
 as an argument and never touches the request.
 
-## init/1: compile-time setup (modules only)
+## init/1: optional compile-time setup (modules only)
 
-A module middleware **must** implement `init/1`. It runs once when the
-pipeline is compiled (listener boot and every `reload_routes/2`), never
-per request, and turns the user's raw config into the runtime state
+A module middleware **may** implement `init/1`. When present, it runs once
+when the pipeline is compiled (listener boot and every `reload_routes/2`),
+never per request, and turns the user's raw config into the runtime state
 `call/3` receives:
 
 ```erlang
@@ -120,9 +121,11 @@ once instead of per request. A bare `module()` entry is initialised with
 `#{}`, so an `init/1` that reads an all-defaults config should accept the
 empty map.
 
-A fun-form middleware has no `init/1` (there's no module to host the
-callback); its paired `State` is used as-is, so precompute it yourself or
-pass a module if you want the compile-time hook.
+When a module **omits** `init/1`, its config is threaded straight through
+as the `call/3` state (`#{}` for a bare entry), exactly like a fun. So
+`init/1` is purely opt-in: implement it for the compile-time hook, skip it
+for a stateless middleware that only needs `call/3`. A fun-form middleware
+never has an `init/1` (there's no module to host the callback).
 
 ## Examples
 
@@ -212,23 +215,29 @@ bare `Callable` defaults it to `#{}`.
 -type middleware_list() :: [middleware()].
 
 -doc """
-Compile-time setup. Runs **once** when the pipeline is built (listener
-boot and every `roadrunner_listener:reload_routes/2`), never per request,
-and turns the entry's raw `t:config/0` into the `t:state/0` handed to
-every `call/3`. A bare `module()` entry is initialised with `#{}`.
+Optional compile-time setup. When a module exports it, it runs **once**
+as the pipeline is built (listener boot and every
+`roadrunner_listener:reload_routes/2`), never per request, and turns the
+entry's raw `t:config/0` into the `t:state/0` handed to every `call/3`. A
+bare `module()` entry is initialised with `#{}`.
 
 This is the place for config validation and precompute (compile patterns,
 pre-join binaries, build lookup tables): a bad config fails loudly at
-listener start, and the work is paid once rather than per request.
+listener start, and the work is paid once rather than per request. A
+module that omits `init/1` has its config threaded straight through as the
+`call/3` state, the same as a fun.
 """.
 -callback init(Config :: config()) -> state().
+
+-optional_callbacks([init/1]).
 
 -doc """
 The middleware contract. `Request` is the current request map;
 `Next` is a continuation that runs the rest of the pipeline (other
 middlewares + the inner handler) and returns the same
 `t:roadrunner_handler:result/0` shape every middleware returns. `State`
-is what this entry's `init/1` returned at compile time.
+is what this entry's `init/1` returned at compile time, or the entry's
+config verbatim when the module has no `init/1`.
 
 The middleware decides whether to:
 - pass through unchanged (`Next(Req)`),
@@ -256,18 +265,37 @@ resolve(Mws) ->
     [resolve_entry(Mw) || Mw <- Mws].
 
 %% Resolve one entry to its `{Callable, State}` runtime pair. A module entry
-%% runs its required `init/1` callback here, so the per-request closure reuses
-%% the returned state; a fun entry has no init, so its config is the state
-%% verbatim. A bare entry defaults its config to `#{}`.
+%% that exports the optional `init/1` callback runs it here, so the per-request
+%% closure reuses the returned state; a module without `init/1` (and any fun)
+%% threads its config through verbatim. A bare entry defaults its config to
+%% `#{}`.
 -spec resolve_entry(middleware()) -> resolved().
 resolve_entry({Mod, Config}) when is_atom(Mod) ->
-    {Mod, Mod:init(Config)};
+    resolve_module(Mod, Config);
 resolve_entry({Fun, Config}) when is_function(Fun, 3) ->
     {Fun, Config};
 resolve_entry(Mod) when is_atom(Mod) ->
-    {Mod, Mod:init(#{})};
+    resolve_module(Mod, #{});
 resolve_entry(Fun) when is_function(Fun, 3) ->
     {Fun, #{}}.
+
+-spec resolve_module(module(), config()) -> resolved().
+resolve_module(Mod, Config) ->
+    case has_init(Mod) of
+        true -> {Mod, Mod:init(Config)};
+        false -> {Mod, Config}
+    end.
+
+%% Whether `Mod` exports the optional `init/1`. The module is loaded first so
+%% `function_exported/3` can see it (it reports `false` for an unloaded module
+%% even when the export exists). A middleware module that can't be loaded is a
+%% config error worth failing at compile time (listener start), not per request.
+-spec has_init(module()) -> boolean().
+has_init(Mod) ->
+    case code:ensure_loaded(Mod) of
+        {module, Mod} -> erlang:function_exported(Mod, init, 1);
+        {error, Reason} -> error({middleware_module_not_loaded, Mod, Reason})
+    end.
 
 -doc """
 Compose a middleware list around a handler call, returning a single
