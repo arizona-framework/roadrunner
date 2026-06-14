@@ -171,7 +171,7 @@ preflight_response(#cors{origins = Origins} = State, Origin, Req) ->
                     allow_origin_value(Origin, Origins, State#cors.credentials)
                 },
             Headers = roadrunner_http:with_defaults(
-                [AllowOrigin | preflight_headers(State, Req)], Base
+                Base, [AllowOrigin | preflight_headers(State, Req)]
             ),
             {204, Headers, ~""}
     end.
@@ -241,7 +241,7 @@ actual_headers(Headers, #cors{origins = Origins} = State, Origin) ->
                     ~"access-control-allow-origin",
                     allow_origin_value(Origin, Origins, State#cors.credentials)
                 },
-            roadrunner_http:with_defaults([AllowOrigin | State#cors.actual_static], WithVary)
+            roadrunner_http:with_defaults(WithVary, [AllowOrigin | State#cors.actual_static])
     end.
 
 -spec expose_value(map()) -> binary() | false.

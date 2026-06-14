@@ -71,3 +71,39 @@ header_list_size_sums_fields_with_overhead_test() ->
         70,
         roadrunner_http:header_list_size([{~"a", ~"bb"}, {~"ccc", ~""}])
     ).
+
+%% --- with_defaults/2 ---
+
+with_defaults_empty_defaults_returns_headers_unchanged_test() ->
+    Headers = [{~"a", ~"1"}],
+    ?assertEqual(Headers, roadrunner_http:with_defaults(Headers, [])).
+
+with_defaults_prepends_absent_defaults_in_order_test() ->
+    %% Absent defaults are prepended, keeping their order, ahead of the
+    %% existing headers.
+    ?assertEqual(
+        [{~"x", ~"1"}, {~"y", ~"2"}, {~"a", ~"0"}],
+        roadrunner_http:with_defaults([{~"a", ~"0"}], [{~"x", ~"1"}, {~"y", ~"2"}])
+    ).
+
+with_defaults_existing_header_wins_test() ->
+    %% A default whose name the headers already carry is skipped (the
+    %% existing value wins); the others are still added.
+    ?assertEqual(
+        [{~"y", ~"2"}, {~"a", ~"keep"}],
+        roadrunner_http:with_defaults([{~"a", ~"keep"}], [{~"a", ~"drop"}, {~"y", ~"2"}])
+    ).
+
+%% --- drop_unset/1 ---
+
+drop_unset_keeps_only_set_values_in_order_test() ->
+    ?assertEqual(
+        [{~"a", ~"1"}, {~"c", ~""}],
+        roadrunner_http:drop_unset([{~"a", ~"1"}, {~"b", false}, {~"c", ~""}])
+    ).
+
+drop_unset_all_false_returns_empty_test() ->
+    ?assertEqual([], roadrunner_http:drop_unset([{~"a", false}, {~"b", false}])).
+
+drop_unset_empty_returns_empty_test() ->
+    ?assertEqual([], roadrunner_http:drop_unset([])).

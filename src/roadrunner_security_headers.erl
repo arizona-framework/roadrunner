@@ -151,7 +151,7 @@ transform(_Req, _State, Other) ->
     roadrunner_http:headers().
 inject(Req, #sec{static = Static} = State, Headers) ->
     roadrunner_http:with_defaults(
-        hsts_candidates(roadrunner_req:scheme(Req), State, Static), Headers
+        Headers, hsts_candidates(roadrunner_req:scheme(Req), State, Static)
     ).
 
 %% HSTS is meaningful only over HTTPS (RFC 6797 §8.1: a browser ignores it on a

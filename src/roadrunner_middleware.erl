@@ -150,8 +150,10 @@ server_header(Req, Next, Server) ->
 ```
 """.
 
--export([compose/2, build_pipeline/2, compile_pipeline/3]).
--export_type([middleware/0, middleware_fun/0, middleware_list/0, next/0, config/0, state/0]).
+-export([compose/2, build_pipeline/2, compile_pipeline/3, compile_pipeline/4, resolve/1]).
+-export_type([
+    middleware/0, middleware_fun/0, middleware_list/0, next/0, config/0, state/0, resolved/0
+]).
 
 -doc """
 The continuation passed to a middleware's `call/3`: a fun that runs
@@ -176,6 +178,13 @@ A middleware entry's runtime state, passed as the third argument of
 time; for a fun entry it is the entry's `t:config/0` used verbatim.
 """.
 -type state() :: term().
+
+-doc """
+A middleware entry after resolution: the `{Callable, State}` pair produced
+by running `resolve/1` (which calls each module's `init/1` once). Opaque —
+callers thread it back into `compile_pipeline/4` without inspecting it.
+""".
+-opaque resolved() :: {module() | middleware_fun(), state()}.
 
 -doc """
 The function shape of a fun-form middleware: it receives the request,
@@ -237,38 +246,54 @@ The middleware decides whether to:
     roadrunner_handler:result().
 
 -doc """
+Resolve a middleware list to its runtime `t:resolved/0` pairs, running each
+module's `init/1` **once**. Use this to resolve listener-wide middlewares a
+single time and reuse the result across every route (via
+`compile_pipeline/4`) instead of re-running their init per route.
+""".
+-spec resolve(middleware_list()) -> [resolved()].
+resolve(Mws) ->
+    [resolve_entry(Mw) || Mw <- Mws].
+
+%% Resolve one entry to its `{Callable, State}` runtime pair. A module entry
+%% runs its required `init/1` callback here, so the per-request closure reuses
+%% the returned state; a fun entry has no init, so its config is the state
+%% verbatim. A bare entry defaults its config to `#{}`.
+-spec resolve_entry(middleware()) -> resolved().
+resolve_entry({Mod, Config}) when is_atom(Mod) ->
+    {Mod, Mod:init(Config)};
+resolve_entry({Fun, Config}) when is_function(Fun, 3) ->
+    {Fun, Config};
+resolve_entry(Mod) when is_atom(Mod) ->
+    {Mod, Mod:init(#{})};
+resolve_entry(Fun) when is_function(Fun, 3) ->
+    {Fun, #{}}.
+
+-doc """
 Compose a middleware list around a handler call, returning a single
 `next()` fun that runs the full pipeline.
 
 Each module entry's `init/1` is run **here**, once, as the pipeline is
-built; the resulting `t:state/0` is captured in the entry's closure and
-reused on every request. The first middleware in the list runs
-**outermost** — it gets the first crack at the request and the last crack
-at the response. The handler is the innermost call; an empty list returns
-the handler fun unchanged.
+built (via `resolve/1`); the resulting `t:state/0` is captured in the
+entry's closure and reused on every request. The first middleware in the
+list runs **outermost** — it gets the first crack at the request and the
+last crack at the response. The handler is the innermost call; an empty
+list returns the handler fun unchanged.
 """.
 -spec compose(middleware_list(), next()) -> next().
-compose([], Handler) ->
-    Handler;
-compose([Mw | Rest], Handler) ->
-    Inner = compose(Rest, Handler),
-    {Callable, State} = resolve(Mw),
-    fun(Req) -> apply_one(Callable, State, Req, Inner) end.
+compose(Mws, Handler) ->
+    compose_resolved(resolve(Mws), Handler).
 
-%% Resolve a middleware entry to its `{Callable, State}` runtime pair at
-%% pipeline-bake time. A module entry runs its required `init/1` callback
-%% once here, so the per-request closure reuses the returned state; a fun
-%% entry has no init, so its config is the state verbatim. A bare entry
-%% defaults its config to `#{}`.
--spec resolve(middleware()) -> {module() | middleware_fun(), state()}.
-resolve({Mod, Config}) when is_atom(Mod) ->
-    {Mod, Mod:init(Config)};
-resolve({Fun, Config}) when is_function(Fun, 3) ->
-    {Fun, Config};
-resolve(Mod) when is_atom(Mod) ->
-    {Mod, Mod:init(#{})};
-resolve(Fun) when is_function(Fun, 3) ->
-    {Fun, #{}}.
+%% Compose already-resolved entries around a handler. No `init/1` runs here
+%% (it ran in `resolve/1`); the captured state is reused per request. Split
+%% from `compose/2` so pre-resolved listener middlewares can be composed
+%% without re-resolving them.
+-spec compose_resolved([resolved()], next()) -> next().
+compose_resolved([], Handler) ->
+    Handler;
+compose_resolved([{Callable, State} | Rest], Handler) ->
+    Inner = compose_resolved(Rest, Handler),
+    fun(Req) -> apply_one(Callable, State, Req, Inner) end.
 
 %% Build the handler pipeline from a combined middleware list
 %% (listener-level ++ per-route) and a target handler module. The
@@ -294,13 +319,12 @@ build_pipeline([], Handler) ->
 build_pipeline(Mws, Handler) ->
     compose(Mws, fun Handler:handle/1).
 
-%% Compile a per-request pipeline `next()` fun: composes the mws
-%% ending in `fun Handler:handle/1`, optionally wrapped in an
-%% outermost closure that injects `state` onto the request before
-%% middlewares run. Used by `roadrunner_router:compile/2` and
-%% `roadrunner_listener:build_dispatch/2` to pre-bake the full
-%% pipeline at compile / `reload_routes/2` time so the conn loops
-%% don't allocate closures per request.
+%% Compile a per-request pipeline `next()` fun from one combined middleware
+%% list: composes the mws ending in `fun Handler:handle/1`, optionally wrapped
+%% in an outermost closure that injects `state` onto the request before
+%% middlewares run. Used by `roadrunner_listener:build_dispatch/2` for
+%% single-handler dispatch (one pipeline, so no listener/route split). Routes
+%% use `compile_pipeline/4`.
 -doc false.
 -spec compile_pipeline(middleware_list(), module(), no_state | {state, term()}) -> next().
 compile_pipeline(Mws, Handler, no_state) ->
@@ -308,6 +332,29 @@ compile_pipeline(Mws, Handler, no_state) ->
 compile_pipeline(Mws, Handler, {state, State}) ->
     Inner = build_pipeline(Mws, Handler),
     fun(Req) -> Inner(Req#{state => State}) end.
+
+%% Compile a route's pipeline from listener middlewares already resolved once
+%% (shared across all routes) and the route's own raw middlewares. Only the
+%% route's mws are resolved here; the listener entries wrap them (and the
+%% handler), staying outermost. Used by `roadrunner_router:compile/2` so a
+%% listener-wide middleware's `init/1` runs once, not once per route.
+-doc false.
+-spec compile_pipeline([resolved()], middleware_list(), module(), no_state | {state, term()}) ->
+    next().
+compile_pipeline(ResolvedListener, RouteMws, Handler, no_state) ->
+    build_resolved_pipeline(ResolvedListener, RouteMws, Handler);
+compile_pipeline(ResolvedListener, RouteMws, Handler, {state, State}) ->
+    Inner = build_resolved_pipeline(ResolvedListener, RouteMws, Handler),
+    fun(Req) -> Inner(Req#{state => State}) end.
+
+%% Wrap the resolved listener middlewares (outermost) around the route's own
+%% middlewares (resolved here) around the handler. An empty listener + route
+%% list collapses to `fun Handler:handle/1` (no closures) via the
+%% `compose_resolved/2` empty-list clause.
+-spec build_resolved_pipeline([resolved()], middleware_list(), module()) -> next().
+build_resolved_pipeline(ResolvedListener, RouteMws, Handler) ->
+    Inner = compose_resolved(resolve(RouteMws), fun Handler:handle/1),
+    compose_resolved(ResolvedListener, Inner).
 
 %% Invoke a resolved entry with the request and continuation. `Callable`
 %% and `State` are threaded individually (no per-request tuple rebuild);

@@ -237,6 +237,49 @@ bad_config_crashes_at_compile_test() ->
         roadrunner_router:compile(Routes, [])
     ).
 
+per_route_config_is_isolated_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = roadrunner_listener:start_link(cors_per_route, #{
+                port => 0,
+                routes => [
+                    #{
+                        path => ~"/a",
+                        handler => roadrunner_hello_handler,
+                        middlewares => [{roadrunner_cors, #{origins => [~"https://a.example"]}}]
+                    },
+                    #{
+                        path => ~"/b",
+                        handler => roadrunner_hello_handler,
+                        middlewares => [{roadrunner_cors, #{origins => [~"https://b.example"]}}]
+                    }
+                ]
+            }),
+            roadrunner_listener:port(cors_per_route)
+        end,
+        fun(_) -> ok = roadrunner_listener:stop(cors_per_route) end, fun(Port) ->
+            {"each route is compiled with its own per-route policy", fun() ->
+                %% `https://a.example` is allowed on `/a` but not on `/b` —
+                %% each route's own `init/1` ran with its own config.
+                ReplyA = request(Port, [
+                    ~"GET /a HTTP/1.1\r\n",
+                    ~"Host: x\r\n",
+                    ~"Origin: https://a.example\r\n",
+                    ~"Connection: close\r\n\r\n"
+                ]),
+                {match, _} = re:run(
+                    ReplyA, ~"access-control-allow-origin: https://a.example", [caseless]
+                ),
+                ReplyB = request(Port, [
+                    ~"GET /b HTTP/1.1\r\n",
+                    ~"Host: x\r\n",
+                    ~"Origin: https://a.example\r\n",
+                    ~"Connection: close\r\n\r\n"
+                ]),
+                nomatch = re:run(ReplyB, ~"access-control-allow-origin", [caseless])
+            end}
+        end}.
+
 %% =============================================================================
 %% End-to-end through roadrunner_listener.
 %% =============================================================================

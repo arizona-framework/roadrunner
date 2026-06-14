@@ -95,38 +95,39 @@ Compile a list of routes into the lookup form `match/2` expects.
 Each path is split on `/` (empty leading/trailing segments dropped),
 and segments starting with `:` are recorded as named captures.
 
-`ListenerMws` is the listener-wide middleware list; it is prepended
-to each route's own `middlewares` and composed once into a single
-`next()` fun (with any per-route `state` injected before middlewares
-run). The conn loop calls that fun straight with the request —
+`ListenerMws` is the listener-wide middleware list; it is resolved
+**once** (running each module's `init/1` a single time) and reused
+across every route, composed outermost around each route's own
+`middlewares` (with any per-route `state` injected before middlewares
+run). The conn loop calls the composed fun straight with the request —
 zero closure allocations per request. Pass `[]` for `ListenerMws`
 when compiling routes outside a listener (typically only in tests).
 """.
 -spec compile(routes(), roadrunner_middleware:middleware_list()) -> compiled().
 compile(Routes, ListenerMws) when is_list(Routes), is_list(ListenerMws) ->
-    [compile_route(R, ListenerMws) || R <- Routes].
+    ResolvedListener = roadrunner_middleware:resolve(ListenerMws),
+    [compile_route(R, ResolvedListener) || R <- Routes].
 
--spec compile_route(route(), roadrunner_middleware:middleware_list()) ->
+-spec compile_route(route(), [roadrunner_middleware:resolved()]) ->
     {[segment()], module(), roadrunner_middleware:next(), term()}.
-compile_route({Path, Handler}, ListenerMws) when is_binary(Path), is_atom(Handler) ->
+compile_route({Path, Handler}, ResolvedListener) when is_binary(Path), is_atom(Handler) ->
     {
         compile_path(Path),
         Handler,
-        roadrunner_middleware:compile_pipeline(ListenerMws, Handler, no_state),
+        roadrunner_middleware:compile_pipeline(ResolvedListener, [], Handler, no_state),
         undefined
     };
-compile_route({Path, Handler, State}, ListenerMws) when is_binary(Path), is_atom(Handler) ->
+compile_route({Path, Handler, State}, ResolvedListener) when is_binary(Path), is_atom(Handler) ->
     {
         compile_path(Path),
         Handler,
-        roadrunner_middleware:compile_pipeline(ListenerMws, Handler, {state, State}),
+        roadrunner_middleware:compile_pipeline(ResolvedListener, [], Handler, {state, State}),
         State
     };
-compile_route(#{path := Path, handler := Handler} = Route, ListenerMws) when
+compile_route(#{path := Path, handler := Handler} = Route, ResolvedListener) when
     is_binary(Path), is_atom(Handler)
 ->
     RouteMws = maps:get(middlewares, Route, []),
-    Mws = ListenerMws ++ RouteMws,
     {StateArg, StateValue} =
         case Route of
             #{state := S} -> {{state, S}, S};
@@ -135,7 +136,7 @@ compile_route(#{path := Path, handler := Handler} = Route, ListenerMws) when
     {
         compile_path(Path),
         Handler,
-        roadrunner_middleware:compile_pipeline(Mws, Handler, StateArg),
+        roadrunner_middleware:compile_pipeline(ResolvedListener, RouteMws, Handler, StateArg),
         StateValue
     }.
 

@@ -131,18 +131,19 @@ with_alt_svc(Headers, undefined) ->
 with_alt_svc(Headers, AltSvc) ->
     [{~"alt-svc", AltSvc} | Headers].
 
-%% Prepend each candidate the existing list doesn't already carry, so a
-%% handler-set value always wins. Body recursion preserves candidate order.
-%% Used by middlewares (`roadrunner_cors`, `roadrunner_security_headers`) to
-%% merge their pre-built header set onto the handler's response.
+%% Prepend each default the headers don't already carry, so a handler-set
+%% value always wins. Body recursion preserves the default order. Used by
+%% middlewares (`roadrunner_cors`, `roadrunner_security_headers`) to merge
+%% their pre-built header set onto the handler's response. Headers-first,
+%% matching `with_date/1` / `with_alt_svc/2`.
 -doc false.
--spec with_defaults(Defaults :: headers(), headers()) -> headers().
-with_defaults([], Headers) ->
+-spec with_defaults(headers(), Defaults :: headers()) -> headers().
+with_defaults(Headers, []) ->
     Headers;
-with_defaults([{Name, _} = Default | Rest], Headers) ->
+with_defaults(Headers, [{Name, _} = Default | Rest]) ->
     case lists:keymember(Name, 1, Headers) of
-        true -> with_defaults(Rest, Headers);
-        false -> [Default | with_defaults(Rest, Headers)]
+        true -> with_defaults(Headers, Rest);
+        false -> [Default | with_defaults(Headers, Rest)]
     end.
 
 %% Drop the candidates whose value resolved to `false` (the header doesn't

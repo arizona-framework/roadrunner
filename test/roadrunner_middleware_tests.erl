@@ -342,6 +342,29 @@ init_runs_once_at_compile_not_per_request_test_() ->
             end}
         end}.
 
+listener_middleware_init_runs_once_across_routes_test_() ->
+    {setup,
+        fun() ->
+            Ref = counters:new(1, []),
+            {ok, _} = roadrunner_listener:start_link(mw_test_listener_init_once, #{
+                port => 0,
+                middlewares => [{roadrunner_test_init_middleware, #{counter => Ref, tag => ~"x"}}],
+                routes => [
+                    #{path => ~"/a", handler => roadrunner_echo_headers_handler},
+                    #{path => ~"/b", handler => roadrunner_echo_headers_handler},
+                    #{path => ~"/c", handler => roadrunner_echo_headers_handler}
+                ]
+            }),
+            Ref
+        end,
+        fun(_) -> ok = roadrunner_listener:stop(mw_test_listener_init_once) end, fun(Ref) ->
+            {"a listener middleware is resolved once, not once per route", fun() ->
+                %% Three routes share the one listener middleware, so its init
+                %% ran a single time when the routes were compiled.
+                ?assertEqual(1, counters:get(Ref, 1))
+            end}
+        end}.
+
 %% --- helpers ---
 
 req() ->
