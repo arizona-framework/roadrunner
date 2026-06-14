@@ -79,25 +79,50 @@ which wrap the handler — first in each list runs outermost.
 ## Middleware shape
 
 Each entry in a middlewares list is a `Callable`, optionally paired with
-its `State` as `{Callable, State}`. `State` is the middleware's own
-configuration, handed to the third argument of the call. A bare
-`Callable` is shorthand for `{Callable, undefined}`, the same way a
-`{Path, Handler}` route omits the state a `{Path, Handler, State}` route
-carries.
+its config as `{Callable, Config}`. A bare `Callable` is shorthand for
+`{Callable, #{}}` (empty config), the same way a `{Path, Handler}` route
+omits the state a `{Path, Handler, State}` route carries.
 
-- `module()` / `{module(), State}` — the module's `call/3` behaviour
-  callback is invoked as `Mod:call(Req, Next, State)`.
-- `fun((Request, Next, State) -> Result)` / `{Fun, State}` — the fun is
-  invoked directly as `Fun(Req, Next, State)`.
+- `module()` / `{module(), Config}` — a module implementing this
+  behaviour. Its `init(Config)` callback runs **once**, at
+  pipeline-compile time, and the value it returns becomes the `State`
+  handed to every `Mod:call(Req, Next, State)`. See "init/1" below.
+- `fun((Request, Next, State) -> Result)` / `{Fun, State}` — a fun has no
+  init step, so its paired `State` is threaded verbatim as the third
+  argument: `Fun(Req, Next, State)`. Reach for a fun for lightweight
+  inline middleware, a module when you want compile-time setup.
 
-`State` defaults to `undefined` for the bare forms. The same callable can
-appear more than once with different `State`, e.g.
+Config (module) and `State` (fun) default to `#{}` for the bare forms.
+The same callable can appear more than once with different config, e.g.
 `[{rate_limit, #{rps => 10}}, {rate_limit, #{rps => 100}}]`.
 
 Middleware `State` is **not** the request's `state` field. Route state
 (`{Path, Handler, State}`) is injected onto the request map and read
 with `roadrunner_req:state/1`; middleware `State` is handed to `call/3`
 as an argument and never touches the request.
+
+## init/1: compile-time setup (modules only)
+
+A module middleware **must** implement `init/1`. It runs once when the
+pipeline is compiled (listener boot and every `reload_routes/2`), never
+per request, and turns the user's raw config into the runtime state
+`call/3` receives:
+
+```erlang
+init(Config) -> State.            %% once, at compile time
+call(Req, Next, State) -> Result. %% per request, the same State reused
+```
+
+Do config validation and any precompute (compile patterns, pre-join
+binaries, build lookup tables) in `init/1`: a bad config then fails
+loudly at listener start rather than on a request, and the work is paid
+once instead of per request. A bare `module()` entry is initialised with
+`#{}`, so an `init/1` that reads an all-defaults config should accept the
+empty map.
+
+A fun-form middleware has no `init/1` (there's no module to host the
+callback); its paired `State` is used as-is, so precompute it yourself or
+pass a module if you want the compile-time hook.
 
 ## Examples
 
@@ -126,7 +151,7 @@ server_header(Req, Next, Server) ->
 """.
 
 -export([compose/2, build_pipeline/2, compile_pipeline/3]).
--export_type([middleware/0, middleware_fun/0, middleware_list/0, next/0, state/0]).
+-export_type([middleware/0, middleware_fun/0, middleware_list/0, next/0, config/0, state/0]).
 
 -doc """
 The continuation passed to a middleware's `call/3`: a fun that runs
@@ -137,10 +162,20 @@ middleware returns.
 -type next() :: fun((roadrunner_req:request()) -> roadrunner_handler:result()).
 
 -doc """
-A middleware entry's per-instance state, passed as the third argument
-of `call/3`. `undefined` is the default for a bare `Callable` entry.
+A middleware entry's raw per-instance config: the second element of a
+`{Callable, Config}` entry, and the `#{}` default for a bare `Callable`.
+For a module it is the argument handed to `init/1`; a fun has no init, so
+its config is threaded straight through as the `call/3` state. Typically a
+map.
 """.
--type state() :: undefined | term().
+-type config() :: term().
+
+-doc """
+A middleware entry's runtime state, passed as the third argument of
+`call/3`. For a module entry it is whatever `init/1` returned at compile
+time; for a fun entry it is the entry's `t:config/0` used verbatim.
+""".
+-type state() :: term().
 
 -doc """
 The function shape of a fun-form middleware: it receives the request,
@@ -151,28 +186,40 @@ the continuation, and the entry's `t:state/0`.
 
 -doc """
 A single entry in a `middlewares` list: a `Callable`, or a
-`{Callable, State}` pair. `Callable` is either a module implementing
-`-behaviour(roadrunner_middleware)` (its `call/3` is invoked) or a
-`t:middleware_fun/0` invoked directly. `State` is the middleware's own
-configuration, passed through as the third argument; a bare `Callable`
-defaults it to `undefined`.
+`{Callable, Config}` pair. `Callable` is either a module
+implementing `-behaviour(roadrunner_middleware)` (its `init/1` runs at
+compile time, its `call/3` per request) or a `t:middleware_fun/0` invoked
+directly. The pair's second element is the entry's `t:config/0` — fed to
+`init/1` for a module, used verbatim as the `call/3` state for a fun; a
+bare `Callable` defaults it to `#{}`.
 """.
 -type middleware() ::
     module()
     | middleware_fun()
-    | {module(), state()}
-    | {middleware_fun(), state()}.
+    | {module(), config()}
+    | {middleware_fun(), config()}.
 
 -doc "An ordered list of `t:middleware/0` entries.".
 -type middleware_list() :: [middleware()].
+
+-doc """
+Compile-time setup. Runs **once** when the pipeline is built (listener
+boot and every `roadrunner_listener:reload_routes/2`), never per request,
+and turns the entry's raw `t:config/0` into the `t:state/0` handed to
+every `call/3`. A bare `module()` entry is initialised with `#{}`.
+
+This is the place for config validation and precompute (compile patterns,
+pre-join binaries, build lookup tables): a bad config fails loudly at
+listener start, and the work is paid once rather than per request.
+""".
+-callback init(Config :: config()) -> state().
 
 -doc """
 The middleware contract. `Request` is the current request map;
 `Next` is a continuation that runs the rest of the pipeline (other
 middlewares + the inner handler) and returns the same
 `t:roadrunner_handler:result/0` shape every middleware returns. `State`
-is the entry's configuration (the second element of a `{module(),
-State}` entry, or `undefined` for a bare `module()` entry).
+is what this entry's `init/1` returned at compile time.
 
 The middleware decides whether to:
 - pass through unchanged (`Next(Req)`),
@@ -193,17 +240,35 @@ The middleware decides whether to:
 Compose a middleware list around a handler call, returning a single
 `next()` fun that runs the full pipeline.
 
-The first middleware in the list runs **outermost** — it gets the
-first crack at the request and the last crack at the response. The
-handler is the innermost call; an empty list returns the handler fun
-unchanged.
+Each module entry's `init/1` is run **here**, once, as the pipeline is
+built; the resulting `t:state/0` is captured in the entry's closure and
+reused on every request. The first middleware in the list runs
+**outermost** — it gets the first crack at the request and the last crack
+at the response. The handler is the innermost call; an empty list returns
+the handler fun unchanged.
 """.
 -spec compose(middleware_list(), next()) -> next().
 compose([], Handler) ->
     Handler;
 compose([Mw | Rest], Handler) ->
     Inner = compose(Rest, Handler),
-    fun(Req) -> apply_one(Mw, Req, Inner) end.
+    {Callable, State} = resolve(Mw),
+    fun(Req) -> apply_one(Callable, State, Req, Inner) end.
+
+%% Resolve a middleware entry to its `{Callable, State}` runtime pair at
+%% pipeline-bake time. A module entry runs its required `init/1` callback
+%% once here, so the per-request closure reuses the returned state; a fun
+%% entry has no init, so its config is the state verbatim. A bare entry
+%% defaults its config to `#{}`.
+-spec resolve(middleware()) -> {module() | middleware_fun(), state()}.
+resolve({Mod, Config}) when is_atom(Mod) ->
+    {Mod, Mod:init(Config)};
+resolve({Fun, Config}) when is_function(Fun, 3) ->
+    {Fun, Config};
+resolve(Mod) when is_atom(Mod) ->
+    {Mod, Mod:init(#{})};
+resolve(Fun) when is_function(Fun, 3) ->
+    {Fun, #{}}.
 
 %% Build the handler pipeline from a combined middleware list
 %% (listener-level ++ per-route) and a target handler module. The
@@ -244,13 +309,13 @@ compile_pipeline(Mws, Handler, {state, State}) ->
     Inner = build_pipeline(Mws, Handler),
     fun(Req) -> Inner(Req#{state => State}) end.
 
--spec apply_one(middleware(), roadrunner_req:request(), next()) ->
+%% Invoke a resolved entry with the request and continuation. `Callable`
+%% and `State` are threaded individually (no per-request tuple rebuild);
+%% the `{Callable, State}` pair was already split by `resolve/1` at bake
+%% time.
+-spec apply_one(module() | middleware_fun(), state(), roadrunner_req:request(), next()) ->
     roadrunner_handler:result().
-apply_one({Mod, State}, Req, Next) when is_atom(Mod) ->
+apply_one(Mod, State, Req, Next) when is_atom(Mod) ->
     Mod:call(Req, Next, State);
-apply_one({Fun, State}, Req, Next) when is_function(Fun, 3) ->
-    Fun(Req, Next, State);
-apply_one(Mod, Req, Next) when is_atom(Mod) ->
-    Mod:call(Req, Next, undefined);
-apply_one(Fun, Req, Next) when is_function(Fun, 3) ->
-    Fun(Req, Next, undefined).
+apply_one(Fun, State, Req, Next) when is_function(Fun, 3) ->
+    Fun(Req, Next, State).

@@ -30,8 +30,9 @@ middlewares => [
 | `credentials` | `false` | when `true`, emit `Access-Control-Allow-Credentials: true` |
 | `max_age` | (omitted) | preflight cache lifetime in seconds (`Access-Control-Max-Age`) |
 
-A bad value crashes the request with `{invalid_cors_opt, Key, Value}` rather
-than failing silently.
+The policy is validated and compiled once when the listener starts (and on
+`reload_routes/2`), so a bad value crashes at startup with
+`{invalid_cors_opt, Key, Value}` rather than failing silently on a request.
 
 ## Behaviour
 
@@ -56,7 +57,7 @@ without credentials emits the literal `*`.
 
 -behaviour(roadrunner_middleware).
 
--export([call/3]).
+-export([init/1, call/3]).
 
 -type origins() :: any | [binary()] | fun((binary()) -> boolean()).
 -type config() :: #{
@@ -68,9 +69,72 @@ without credentials emits the literal `*`.
     max_age => non_neg_integer()
 }.
 
--spec call(roadrunner_req:request(), roadrunner_middleware:next(), roadrunner_middleware:state()) ->
+-export_type([config/0, state/0]).
+
+%% The compiled policy `init/1` produces. `origins` and `credentials` drive
+%% the per-request `Access-Control-Allow-Origin` decision; `reflect_headers`
+%% says whether `Access-Control-Allow-Headers` mirrors the request. The two
+%% header lists are fully built and false-filtered at compile time, so a
+%% request only prepends the origin-dependent header onto them.
+-record(cors, {
+    origins :: origins(),
+    credentials :: boolean(),
+    reflect_headers :: boolean(),
+    preflight_static :: roadrunner_http:headers(),
+    actual_static :: roadrunner_http:headers()
+}).
+
+-doc "The compiled policy produced by `init/1` and consumed by `call/3`.".
+-type state() :: #cors{}.
+
+%% Validate the policy and pre-build every static header once, at
+%% pipeline-compile time. A bad value crashes here (listener start) with a
+%% clear `{invalid_cors_opt, Key, Value}`, not on a request.
+-spec init(config()) -> state().
+init(Config) ->
+    Origins = origins(Config),
+    Credentials = credentials(Config),
+    AllowCredentials = credentials_value(Credentials),
+    {ReflectHeaders, AllowHeaders} = compile_allow_headers(Config),
+    PreflightStatic = drop_unset([
+        {~"access-control-allow-methods", join(methods(Config))},
+        {~"access-control-allow-headers", AllowHeaders},
+        {~"access-control-allow-credentials", AllowCredentials},
+        {~"access-control-max-age", max_age_value(Config)}
+    ]),
+    ActualStatic = drop_unset([
+        {~"access-control-allow-credentials", AllowCredentials},
+        {~"access-control-expose-headers", expose_value(Config)}
+    ]),
+    #cors{
+        origins = Origins,
+        credentials = Credentials,
+        reflect_headers = ReflectHeaders,
+        preflight_static = PreflightStatic,
+        actual_static = ActualStatic
+    }.
+
+%% The static `Access-Control-Allow-Headers` value, plus whether the policy
+%% reflects the request's headers. `reflect` is resolved per request (its value
+%% depends on `Access-Control-Request-Headers`), so the static value is `false`
+%% there; a configured list is pre-joined; `[]` emits nothing.
+-spec compile_allow_headers(map()) -> {boolean(), binary() | false}.
+compile_allow_headers(Config) ->
+    case headers(Config) of
+        reflect -> {true, false};
+        [] -> {false, false};
+        List -> {false, join(List)}
+    end.
+
+%% Drop the entries whose value didn't apply under the policy (`false`), so the
+%% per-request path only ever prepends real headers.
+-spec drop_unset([{binary(), binary() | false}]) -> roadrunner_http:headers().
+drop_unset(Headers) ->
+    [Header || {_Name, Value} = Header <- Headers, Value =/= false].
+
+-spec call(roadrunner_req:request(), roadrunner_middleware:next(), state()) ->
     roadrunner_handler:result().
-call(Req, Next, Config) ->
+call(Req, Next, #cors{} = State) ->
     case roadrunner_req:header(~"origin", Req) of
         undefined ->
             %% Not a CORS request — nothing to do.
@@ -79,10 +143,10 @@ call(Req, Next, Config) ->
             case is_preflight(Req) of
                 true ->
                     %% Preflight: answer 204 ourselves, never reaching the handler.
-                    {preflight_response(Config, Origin, Req), Req};
+                    {preflight_response(State, Origin, Req), Req};
                 false ->
                     {Response, Req2} = Next(Req),
-                    {add_actual_headers(Response, Config, Origin), Req2}
+                    {add_actual_headers(Response, State, Origin), Req2}
             end
     end.
 
@@ -97,51 +161,41 @@ is_preflight(Req) ->
 %% Preflight (204)
 %% =============================================================================
 
--spec preflight_response(config(), binary(), roadrunner_req:request()) ->
+-spec preflight_response(state(), binary(), roadrunner_req:request()) ->
     roadrunner_handler:response().
-preflight_response(Config, Origin, Req) ->
+preflight_response(#cors{origins = Origins} = State, Origin, Req) ->
     %% Vary: Origin even on a disallowed preflight, so a cache keys correctly.
     Base = add_vary_origin([]),
-    Origins = origins(Config),
     case allowed(Origin, Origins) of
         false ->
             {204, Base, ~""};
         true ->
-            Creds = credentials(Config),
             ok = roadrunner_http:check_header_safe(Origin, value),
-            Headers = add_cors(
-                [
-                    {~"access-control-allow-origin", allow_origin_value(Origin, Origins, Creds)},
-                    {~"access-control-allow-methods", join(methods(Config))},
-                    {~"access-control-allow-headers", allow_headers_value(Config, Req)},
-                    {~"access-control-allow-credentials", credentials_value(Creds)},
-                    {~"access-control-max-age", max_age_value(Config)}
-                ],
-                Base
-            ),
+            AllowOrigin =
+                {
+                    ~"access-control-allow-origin",
+                    allow_origin_value(Origin, Origins, State#cors.credentials)
+                },
+            Headers = add_headers([AllowOrigin | preflight_headers(State, Req)], Base),
             {204, Headers, ~""}
     end.
 
-%% The `Access-Control-Allow-Headers` value: mirror the request's requested
-%% headers (`reflect`), join a configured list, or omit when neither applies.
--spec allow_headers_value(config(), roadrunner_req:request()) -> binary() | false.
-allow_headers_value(Config, Req) ->
-    case headers(Config) of
-        reflect ->
-            case roadrunner_req:header(~"access-control-request-headers", Req) of
-                undefined ->
-                    false;
-                Requested ->
-                    ok = roadrunner_http:check_header_safe(Requested, value),
-                    Requested
-            end;
-        [] ->
-            false;
-        List ->
-            join(List)
+%% The pre-built preflight set, with the reflected `Access-Control-Allow-Headers`
+%% prepended when the policy mirrors the request (the only part that depends on
+%% the request, so the only part resolved here).
+-spec preflight_headers(state(), roadrunner_req:request()) -> roadrunner_http:headers().
+preflight_headers(#cors{reflect_headers = false, preflight_static = Static}, _Req) ->
+    Static;
+preflight_headers(#cors{reflect_headers = true, preflight_static = Static}, Req) ->
+    case roadrunner_req:header(~"access-control-request-headers", Req) of
+        undefined ->
+            Static;
+        Requested ->
+            ok = roadrunner_http:check_header_safe(Requested, value),
+            [{~"access-control-allow-headers", Requested} | Static]
     end.
 
--spec max_age_value(config()) -> binary() | false.
+-spec max_age_value(map()) -> binary() | false.
 max_age_value(Config) ->
     case max_age(Config) of
         undefined -> false;
@@ -155,50 +209,46 @@ max_age_value(Config) ->
 %% Decorate every header-bearing response shape; a `{websocket, _, _}` upgrade
 %% (no response headers) passes through. The `is_integer(Status)` guard on the
 %% buffered clause keeps the websocket triple out of it.
--spec add_actual_headers(roadrunner_handler:response(), config(), binary()) ->
+-spec add_actual_headers(roadrunner_handler:response(), state(), binary()) ->
     roadrunner_handler:response().
-add_actual_headers({Status, Headers, Body}, Config, Origin) when
+add_actual_headers({Status, Headers, Body}, State, Origin) when
     is_integer(Status), Status >= 100, Status =< 599
 ->
-    {Status, actual_headers(Headers, Config, Origin), Body};
-add_actual_headers({stream, Status, Headers, Fun}, Config, Origin) when
+    {Status, actual_headers(Headers, State, Origin), Body};
+add_actual_headers({stream, Status, Headers, Fun}, State, Origin) when
     is_integer(Status), Status >= 100, Status =< 599, is_function(Fun, 1)
 ->
-    {stream, Status, actual_headers(Headers, Config, Origin), Fun};
-add_actual_headers({sendfile, Status, Headers, Spec}, Config, Origin) when
+    {stream, Status, actual_headers(Headers, State, Origin), Fun};
+add_actual_headers({sendfile, Status, Headers, Spec}, State, Origin) when
     is_integer(Status), Status >= 100, Status =< 599
 ->
-    {sendfile, Status, actual_headers(Headers, Config, Origin), Spec};
-add_actual_headers({loop, Status, Headers, LoopState}, Config, Origin) when
+    {sendfile, Status, actual_headers(Headers, State, Origin), Spec};
+add_actual_headers({loop, Status, Headers, LoopState}, State, Origin) when
     is_integer(Status), Status >= 100, Status =< 599
 ->
-    {loop, Status, actual_headers(Headers, Config, Origin), LoopState};
-add_actual_headers(Other, _Config, _Origin) ->
+    {loop, Status, actual_headers(Headers, State, Origin), LoopState};
+add_actual_headers(Other, _State, _Origin) ->
     Other.
 
--spec actual_headers(roadrunner_http:headers(), config(), binary()) ->
+-spec actual_headers(roadrunner_http:headers(), state(), binary()) ->
     roadrunner_http:headers().
-actual_headers(Headers, Config, Origin) ->
+actual_headers(Headers, #cors{origins = Origins} = State, Origin) ->
     WithVary = add_vary_origin(Headers),
-    Origins = origins(Config),
     case allowed(Origin, Origins) of
         false ->
             %% Disallowed: only Vary: Origin, no Access-Control-Allow-Origin.
             WithVary;
         true ->
-            Creds = credentials(Config),
             ok = roadrunner_http:check_header_safe(Origin, value),
-            add_cors(
-                [
-                    {~"access-control-allow-origin", allow_origin_value(Origin, Origins, Creds)},
-                    {~"access-control-allow-credentials", credentials_value(Creds)},
-                    {~"access-control-expose-headers", expose_value(Config)}
-                ],
-                WithVary
-            )
+            AllowOrigin =
+                {
+                    ~"access-control-allow-origin",
+                    allow_origin_value(Origin, Origins, State#cors.credentials)
+                },
+            add_headers([AllowOrigin | State#cors.actual_static], WithVary)
     end.
 
--spec expose_value(config()) -> binary() | false.
+-spec expose_value(map()) -> binary() | false.
 expose_value(Config) ->
     case expose(Config) of
         [] -> false;
@@ -237,18 +287,17 @@ add_vary_origin(Headers) ->
             lists:keystore(~"vary", 1, Headers, {~"vary", <<Existing/binary, ", Origin">>})
     end.
 
-%% Prepend each candidate the handler didn't already set, skipping any whose
-%% value resolved to `false` (the header doesn't apply under this policy).
--spec add_cors([{binary(), binary() | false}], roadrunner_http:headers()) ->
+%% Prepend each pre-built candidate the handler didn't already set. The
+%% `false`-valued entries were dropped at compile time by `drop_unset/1`, so
+%% the only check left here is whether the handler already owns the header.
+-spec add_headers(roadrunner_http:headers(), roadrunner_http:headers()) ->
     roadrunner_http:headers().
-add_cors([], Headers) ->
+add_headers([], Headers) ->
     Headers;
-add_cors([{_Name, false} | Rest], Headers) ->
-    add_cors(Rest, Headers);
-add_cors([{Name, Value} | Rest], Headers) ->
+add_headers([{Name, _} = Header | Rest], Headers) ->
     case lists:keymember(Name, 1, Headers) of
-        true -> add_cors(Rest, Headers);
-        false -> [{Name, Value} | add_cors(Rest, Headers)]
+        true -> add_headers(Rest, Headers);
+        false -> [Header | add_headers(Rest, Headers)]
     end.
 
 %% Join binaries with ", " into one binary (header values must be binary).
@@ -258,8 +307,9 @@ join([Value]) -> Value;
 join([Value | Rest]) -> <<Value/binary, ", ", (join(Rest))/binary>>.
 
 %% =============================================================================
-%% Config readers (validated lazily; a bad value crashes the request with a
-%% clear `{invalid_cors_opt, Key, Value}` rather than denying silently)
+%% Config readers, run once by `init/1` at compile time; a bad value crashes
+%% at listener start with a clear `{invalid_cors_opt, Key, Value}` rather than
+%% denying silently
 %% =============================================================================
 
 -spec origins(map()) -> origins().

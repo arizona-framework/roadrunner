@@ -125,6 +125,23 @@ not_modified_keeps_cache_headers_test() ->
     ?assertEqual(undefined, header(~"content-type", Headers)),
     ?assertEqual(~"0", header(~"content-length", Headers)).
 
+%% =============================================================================
+%% Wired as a middleware — `compose/2` runs etag's stateless `init/1` once at
+%% compile time, then `call/3` per request, same conditional behavior.
+%% =============================================================================
+
+composed_pipeline_runs_init_then_handles_conditional_test() ->
+    Body = ~"hello",
+    Handler = fun(R) -> {{200, [{~"content-type", ~"text/plain"}], Body}, R} end,
+    Pipeline = roadrunner_middleware:compose([roadrunner_etag], Handler),
+    %% No If-None-Match → 200 carrying the derived weak ETag.
+    {{200, H200, Body}, _} = Pipeline(req(~"GET", [])),
+    ETag = header(~"etag", H200),
+    ?assertMatch(<<"W/\"", _/binary>>, ETag),
+    %% Echoing the ETag → 304, so init's state threaded into call/3.
+    {{304, _, RespBody}, _} = Pipeline(req(~"GET", [{~"if-none-match", ETag}])),
+    ?assertEqual(~"", iolist_to_binary(RespBody)).
+
 %% --- helpers ---
 
 req(Method, Headers) ->

@@ -11,7 +11,7 @@
 defaults_added_on_buffered_http_test() ->
     Req = req(http, []),
     Next = fun(R) -> {{200, [], ~"body"}, R} end,
-    {{200, Headers, ~"body"}, _Req2} = ?M:call(Req, Next, undefined),
+    {{200, Headers, ~"body"}, _Req2} = call(Req, Next, #{}),
     ?assertEqual(~"nosniff", header(~"x-content-type-options", Headers)),
     ?assertEqual(~"SAMEORIGIN", header(~"x-frame-options", Headers)),
     ?assertEqual(~"strict-origin-when-cross-origin", header(~"referrer-policy", Headers)),
@@ -24,14 +24,14 @@ hsts_off_by_default_on_https_test() ->
     %% host to HTTPS-only. The reversible defaults are still applied.
     Req = req(https, []),
     Next = fun(R) -> {{200, [], ~"body"}, R} end,
-    {{200, Headers, _}, _Req2} = ?M:call(Req, Next, undefined),
+    {{200, Headers, _}, _Req2} = call(Req, Next, #{}),
     ?assertEqual(undefined, header(~"strict-transport-security", Headers)),
     ?assertEqual(~"nosniff", header(~"x-content-type-options", Headers)).
 
 hsts_enabled_with_true_on_https_test() ->
     Req = req(https, []),
     Next = fun(R) -> {{200, [], ~"body"}, R} end,
-    {{200, Headers, _}, _Req2} = ?M:call(Req, Next, #{hsts => true}),
+    {{200, Headers, _}, _Req2} = call(Req, Next, #{hsts => true}),
     ?assertEqual(
         ~"max-age=31536000; includeSubDomains",
         header(~"strict-transport-security", Headers)
@@ -41,7 +41,7 @@ hsts_not_emitted_over_http_even_when_enabled_test() ->
     %% Enabled, but the connection is plain HTTP — no HSTS (RFC 6797 §8.1).
     Req = req(http, []),
     Next = fun(R) -> {{200, [], ~"body"}, R} end,
-    {{200, Headers, _}, _Req2} = ?M:call(Req, Next, #{hsts => true}),
+    {{200, Headers, _}, _Req2} = call(Req, Next, #{hsts => true}),
     ?assertEqual(undefined, header(~"strict-transport-security", Headers)).
 
 handler_header_wins_test() ->
@@ -49,7 +49,7 @@ handler_header_wins_test() ->
     %% or duplicate it.
     Req = req(http, []),
     Next = fun(R) -> {{200, [{~"x-frame-options", ~"DENY"}], ~"b"}, R} end,
-    {{200, Headers, _}, _Req2} = ?M:call(Req, Next, undefined),
+    {{200, Headers, _}, _Req2} = call(Req, Next, #{}),
     ?assertEqual([~"DENY"], [V || {~"x-frame-options", V} <- Headers]),
     %% The other defaults still get added.
     ?assertEqual(~"nosniff", header(~"x-content-type-options", Headers)).
@@ -57,14 +57,14 @@ handler_header_wins_test() ->
 handler_hsts_wins_test() ->
     Req = req(https, []),
     Next = fun(R) -> {{200, [{~"strict-transport-security", ~"max-age=0"}], ~"b"}, R} end,
-    {{200, Headers, _}, _Req2} = ?M:call(Req, Next, #{hsts => true}),
+    {{200, Headers, _}, _Req2} = call(Req, Next, #{hsts => true}),
     ?assertEqual([~"max-age=0"], [V || {~"strict-transport-security", V} <- Headers]).
 
 override_value_test() ->
     Req = req(http, []),
     Config = #{frame_options => ~"DENY", referrer_policy => ~"no-referrer"},
     Next = fun(R) -> {{200, [], ~"b"}, R} end,
-    {{200, Headers, _}, _Req2} = ?M:call(Req, Next, Config),
+    {{200, Headers, _}, _Req2} = call(Req, Next, Config),
     ?assertEqual(~"DENY", header(~"x-frame-options", Headers)),
     ?assertEqual(~"no-referrer", header(~"referrer-policy", Headers)),
     %% Unconfigured defaults are unchanged.
@@ -74,7 +74,7 @@ disable_header_test() ->
     Req = req(http, []),
     Config = #{content_type_options => false},
     Next = fun(R) -> {{200, [], ~"b"}, R} end,
-    {{200, Headers, _}, _Req2} = ?M:call(Req, Next, Config),
+    {{200, Headers, _}, _Req2} = call(Req, Next, Config),
     ?assertEqual(undefined, header(~"x-content-type-options", Headers)),
     ?assertEqual(~"SAMEORIGIN", header(~"x-frame-options", Headers)).
 
@@ -82,14 +82,14 @@ csp_opt_in_test() ->
     Req = req(http, []),
     Config = #{content_security_policy => ~"default-src 'self'"},
     Next = fun(R) -> {{200, [], ~"b"}, R} end,
-    {{200, Headers, _}, _Req2} = ?M:call(Req, Next, Config),
+    {{200, Headers, _}, _Req2} = call(Req, Next, Config),
     ?assertEqual(~"default-src 'self'", header(~"content-security-policy", Headers)).
 
 hsts_disable_test() ->
     Req = req(https, []),
     Config = #{hsts => false},
     Next = fun(R) -> {{200, [], ~"b"}, R} end,
-    {{200, Headers, _}, _Req2} = ?M:call(Req, Next, Config),
+    {{200, Headers, _}, _Req2} = call(Req, Next, Config),
     ?assertEqual(undefined, header(~"strict-transport-security", Headers)).
 
 hsts_sub_config_test() ->
@@ -97,14 +97,14 @@ hsts_sub_config_test() ->
     Req = req(https, []),
     Config = #{hsts => #{max_age => 600, include_subdomains => false, preload => true}},
     Next = fun(R) -> {{200, [], ~"b"}, R} end,
-    {{200, Headers, _}, _Req2} = ?M:call(Req, Next, Config),
+    {{200, Headers, _}, _Req2} = call(Req, Next, Config),
     ?assertEqual(~"max-age=600; preload", header(~"strict-transport-security", Headers)).
 
 hsts_subdomains_without_preload_test() ->
     Req = req(https, []),
     Config = #{hsts => #{max_age => 100, include_subdomains => true, preload => false}},
     Next = fun(R) -> {{200, [], ~"b"}, R} end,
-    {{200, Headers, _}, _Req2} = ?M:call(Req, Next, Config),
+    {{200, Headers, _}, _Req2} = call(Req, Next, Config),
     ?assertEqual(
         ~"max-age=100; includeSubDomains",
         header(~"strict-transport-security", Headers)
@@ -114,7 +114,7 @@ stream_response_decorated_test() ->
     Req = req(http, []),
     Fun = fun(_Send) -> ok end,
     Next = fun(R) -> {{stream, 200, [], Fun}, R} end,
-    {{stream, 200, Headers, OutFun}, _Req2} = ?M:call(Req, Next, undefined),
+    {{stream, 200, Headers, OutFun}, _Req2} = call(Req, Next, #{}),
     ?assertEqual(Fun, OutFun),
     ?assertEqual(~"nosniff", header(~"x-content-type-options", Headers)).
 
@@ -124,21 +124,21 @@ sendfile_response_decorated_test() ->
     Req = req(http, []),
     Spec = {~"/tmp/x", 0, 10},
     Next = fun(R) -> {{sendfile, 200, [], Spec}, R} end,
-    {{sendfile, 200, Headers, OutSpec}, _Req2} = ?M:call(Req, Next, undefined),
+    {{sendfile, 200, Headers, OutSpec}, _Req2} = call(Req, Next, #{}),
     ?assertEqual(Spec, OutSpec),
     ?assertEqual(~"nosniff", header(~"x-content-type-options", Headers)).
 
 loop_response_decorated_test() ->
     Req = req(http, []),
     Next = fun(R) -> {{loop, 200, [], loop_state}, R} end,
-    {{loop, 200, Headers, OutState}, _Req2} = ?M:call(Req, Next, undefined),
+    {{loop, 200, Headers, OutState}, _Req2} = call(Req, Next, #{}),
     ?assertEqual(loop_state, OutState),
     ?assertEqual(~"nosniff", header(~"x-content-type-options", Headers)).
 
 websocket_passes_through_test() ->
     Req = req(http, []),
     Next = fun(R) -> {{websocket, some_mod, init_state}, R} end,
-    {Response, _Req2} = ?M:call(Req, Next, undefined),
+    {Response, _Req2} = call(Req, Next, #{}),
     ?assertMatch({websocket, some_mod, init_state}, Response).
 
 %% =============================================================================
@@ -204,6 +204,11 @@ tls_listener_sets_hsts_test_() ->
         end}.
 
 %% --- helpers ---
+
+%% Compile the config through `init/1` (as the pipeline does at startup), then
+%% invoke `call/3` with the resulting state — the contract every test exercises.
+call(Req, Next, Config) ->
+    ?M:call(Req, Next, ?M:init(Config)).
 
 req(Scheme, Headers) ->
     #{

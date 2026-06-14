@@ -63,7 +63,7 @@
 
 -on_load(init_patterns/0).
 
--export([call/3]).
+-export([init/1, call/3]).
 
 -define(THRESHOLD, 860).
 -define(COMMA_CP_KEY, {?MODULE, comma_cp}).
@@ -71,7 +71,16 @@
 
 -type encoding() :: gzip | deflate | none.
 
--spec call(roadrunner_req:request(), roadrunner_middleware:next(), term()) ->
+%% No per-instance config — encoding is negotiated per request from
+%% `Accept-Encoding`, and the match patterns are compiled at load, so the
+%% compiled state is just the empty map.
+-type state() :: #{}.
+
+-spec init(roadrunner_middleware:config()) -> state().
+init(_Config) ->
+    #{}.
+
+-spec call(roadrunner_req:request(), roadrunner_middleware:next(), state()) ->
     roadrunner_handler:result().
 call(Req, Next, _State) ->
     {Response, Req2} = Next(Req),

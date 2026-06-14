@@ -60,7 +60,7 @@ headers, passes through.
 
 -behaviour(roadrunner_middleware).
 
--export([call/3]).
+-export([init/1, call/3]).
 
 -type config() :: #{
     content_type_options => binary() | false,
@@ -75,87 +75,110 @@ headers, passes through.
     preload => boolean()
 }.
 
--spec call(roadrunner_req:request(), roadrunner_middleware:next(), roadrunner_middleware:state()) ->
-    roadrunner_handler:result().
-call(Req, Next, State) ->
-    {Response, Req2} = Next(Req),
-    {transform(Req, config(State), Response), Req2}.
+-export_type([state/0]).
 
-%% A bare-callable entry hands `undefined` as the state, meaning "all defaults".
--spec config(roadrunner_middleware:state()) -> config().
-config(undefined) -> #{};
-config(Config) when is_map(Config) -> Config.
+%% The compiled header set `init/1` produces: `static` is the pre-built,
+%% false-filtered list of the scheme-independent defaults, prepended onto the
+%% handler's headers as-is per request. `hsts` is the pre-built
+%% `strict-transport-security` value (or `false` when off); it still emits only
+%% over HTTPS, gated per request on the scheme.
+-record(sec, {
+    static :: roadrunner_http:headers(),
+    hsts :: binary() | false
+}).
+
+-doc "The compiled header set produced by `init/1` and consumed by `call/3`.".
+-type state() :: #sec{}.
+
+%% Resolve every default and the HSTS value once, at pipeline-compile time, and
+%% pre-build the scheme-independent set so a request only prepends HSTS.
+-spec init(roadrunner_middleware:config()) -> state().
+init(Config) ->
+    Static = drop_unset([
+        {~"x-content-type-options", opt(content_type_options, Config, ~"nosniff")},
+        {~"x-frame-options", opt(frame_options, Config, ~"SAMEORIGIN")},
+        {~"referrer-policy", opt(referrer_policy, Config, ~"strict-origin-when-cross-origin")},
+        {~"content-security-policy", opt(content_security_policy, Config, false)}
+    ]),
+    #sec{static = Static, hsts = compile_hsts(Config)}.
+
+%% Drop entries whose value didn't apply under the config (`false`), so the
+%% per-request path only ever prepends real headers.
+-spec drop_unset([{binary(), binary() | false}]) -> roadrunner_http:headers().
+drop_unset(Headers) ->
+    [Header || {_Name, Value} = Header <- Headers, Value =/= false].
+
+%% Pre-build the `strict-transport-security` value (or `false` when off). It is
+%% still emitted only over HTTPS — see `hsts_candidates/3`.
+-spec compile_hsts(config()) -> binary() | false.
+compile_hsts(Config) ->
+    case opt(hsts, Config, false) of
+        false -> false;
+        true -> hsts_value(#{});
+        HstsConfig when is_map(HstsConfig) -> hsts_value(HstsConfig)
+    end.
+
+-spec call(roadrunner_req:request(), roadrunner_middleware:next(), state()) ->
+    roadrunner_handler:result().
+call(Req, Next, #sec{} = State) ->
+    {Response, Req2} = Next(Req),
+    {transform(Req, State, Response), Req2}.
 
 %% Decorate every header-bearing response shape; pass a `{websocket, _, _}`
 %% upgrade (no response headers) through. The `is_integer(Status)` guard on
 %% the buffered clause is load-bearing: it rejects the `{websocket, Mod, State}`
 %% triple, which shares the 3-tuple shape but carries an atom where the status
 %% would be.
--spec transform(roadrunner_req:request(), config(), roadrunner_handler:response()) ->
+-spec transform(roadrunner_req:request(), state(), roadrunner_handler:response()) ->
     roadrunner_handler:response().
-transform(Req, Config, {Status, Headers, Body}) when
+transform(Req, State, {Status, Headers, Body}) when
     is_integer(Status), Status >= 100, Status =< 599
 ->
-    {Status, inject(Req, Config, Headers), Body};
-transform(Req, Config, {stream, Status, Headers, Fun}) when
+    {Status, inject(Req, State, Headers), Body};
+transform(Req, State, {stream, Status, Headers, Fun}) when
     is_integer(Status), Status >= 100, Status =< 599, is_function(Fun, 1)
 ->
-    {stream, Status, inject(Req, Config, Headers), Fun};
-transform(Req, Config, {sendfile, Status, Headers, Spec}) when
+    {stream, Status, inject(Req, State, Headers), Fun};
+transform(Req, State, {sendfile, Status, Headers, Spec}) when
     is_integer(Status), Status >= 100, Status =< 599
 ->
-    {sendfile, Status, inject(Req, Config, Headers), Spec};
-transform(Req, Config, {loop, Status, Headers, LoopState}) when
+    {sendfile, Status, inject(Req, State, Headers), Spec};
+transform(Req, State, {loop, Status, Headers, LoopState}) when
     is_integer(Status), Status >= 100, Status =< 599
 ->
-    {loop, Status, inject(Req, Config, Headers), LoopState};
-transform(_Req, _Config, Other) ->
+    {loop, Status, inject(Req, State, Headers), LoopState};
+transform(_Req, _State, Other) ->
     Other.
 
-%% Prepend each enabled default the handler didn't already set. The full set
-%% is built once in emit order; `add_defaults/2` skips any whose value resolved
-%% to `false` (disabled by config, or HSTS off / over plain HTTP).
--spec inject(roadrunner_req:request(), config(), roadrunner_http:headers()) ->
+%% Prepend HSTS (over HTTPS, when configured) onto the pre-built static set,
+%% then prepend the lot onto the handler's headers, skipping any the handler
+%% already set.
+-spec inject(roadrunner_req:request(), state(), roadrunner_http:headers()) ->
     roadrunner_http:headers().
-inject(Req, Config, Headers) ->
-    Scheme = roadrunner_req:scheme(Req),
-    add_defaults(
-        [
-            {~"x-content-type-options", opt(content_type_options, Config, ~"nosniff")},
-            {~"x-frame-options", opt(frame_options, Config, ~"SAMEORIGIN")},
-            {~"referrer-policy", opt(referrer_policy, Config, ~"strict-origin-when-cross-origin")},
-            {~"strict-transport-security", hsts(Scheme, Config)},
-            {~"content-security-policy", opt(content_security_policy, Config, false)}
-        ],
-        Headers
-    ).
+inject(Req, #sec{static = Static} = State, Headers) ->
+    add_defaults(hsts_candidates(roadrunner_req:scheme(Req), State, Static), Headers).
 
--spec add_defaults([{binary(), binary() | false}], roadrunner_http:headers()) ->
+%% HSTS is meaningful only over HTTPS (RFC 6797 §8.1: a browser ignores it on a
+%% plain-HTTP response) and only when configured; the value itself was pre-built
+%% by `compile_hsts/1`. On plain HTTP, or when off, nothing is added.
+-spec hsts_candidates(http | https, state(), roadrunner_http:headers()) ->
+    roadrunner_http:headers().
+hsts_candidates(https, #sec{hsts = Hsts}, Static) when is_binary(Hsts) ->
+    [{~"strict-transport-security", Hsts} | Static];
+hsts_candidates(_Scheme, _State, Static) ->
+    Static.
+
+%% Prepend each pre-built default the handler didn't already set. The
+%% `false`-valued defaults were dropped at compile time by `drop_unset/1`.
+-spec add_defaults(roadrunner_http:headers(), roadrunner_http:headers()) ->
     roadrunner_http:headers().
 add_defaults([], Headers) ->
     Headers;
-add_defaults([{_Name, false} | Rest], Headers) ->
-    add_defaults(Rest, Headers);
-add_defaults([{Name, Value} | Rest], Headers) ->
+add_defaults([{Name, _} = Header | Rest], Headers) ->
     case has_header(Name, Headers) of
         true -> add_defaults(Rest, Headers);
-        false -> [{Name, Value} | add_defaults(Rest, Headers)]
+        false -> [Header | add_defaults(Rest, Headers)]
     end.
-
-%% `strict-transport-security` is opt-in (its commitment outlives the header,
-%% see the moduledoc) and meaningful only over HTTPS (RFC 6797 §8.1: a browser
-%% ignores it on a plain-HTTP response), so it resolves to `false` (skipped)
-%% on a plain-HTTP connection, when unset, or when `hsts => false`. `true`
-%% emits the recommended settings; a map tunes them.
--spec hsts(http | https, config()) -> binary() | false.
-hsts(https, Config) ->
-    case opt(hsts, Config, false) of
-        false -> false;
-        true -> hsts_value(#{});
-        HstsConfig when is_map(HstsConfig) -> hsts_value(HstsConfig)
-    end;
-hsts(http, _Config) ->
-    false.
 
 %% Build `max-age=N[; includeSubDomains][; preload]` from the HSTS sub-config.
 -spec hsts_value(hsts_config()) -> binary().
