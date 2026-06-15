@@ -292,9 +292,17 @@ take_pending_update(#hpack_ctx{pending_update = true, max_size = N} = Ctx) ->
     {encode_size_update(N), Ctx#hpack_ctx{pending_update = false}}.
 
 -spec encode_each([header()], context()) -> {iodata(), context()}.
-encode_each([], Ctx) ->
-    {[], Ctx};
-encode_each([{Name, Value} = H | Rest], Ctx) ->
+encode_each(Headers, Ctx) ->
+    encode_each(Headers, Ctx, []).
+
+%% Tail-recursive: the dynamic-table context threads forward as an
+%% argument and the per-header iodata conses in reverse (flipped once
+%% at the end), rather than unpacking and repacking the
+%% `{iodata(), context()}` tuple on every frame as body recursion does.
+-spec encode_each([header()], context(), [iodata()]) -> {iodata(), context()}.
+encode_each([], Ctx, Acc) ->
+    {lists:reverse(Acc), Ctx};
+encode_each([{Name, Value} = H | Rest], Ctx, Acc) ->
     %% `full_match/3` and `name_match/2` return a bare
     %% `pos_integer() | none` — skipping the prior `{ok, _}` tuple
     %% wrapper avoids a per-lookup heap alloc on the dyn-table hit
@@ -312,8 +320,7 @@ encode_each([{Name, Value} = H | Rest], Ctx) ->
             Idx ->
                 {encode_indexed(Idx), Ctx}
         end,
-    {Tail, Ctx2} = encode_each(Rest, Ctx1),
-    {[Bytes | Tail], Ctx2}.
+    encode_each(Rest, Ctx1, [Bytes | Acc]).
 
 -spec encode_indexed(pos_integer()) -> iodata().
 encode_indexed(Idx) ->
