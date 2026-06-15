@@ -114,19 +114,23 @@ partition([H | Rest], Pseudo) ->
         {error, _} = E -> E
     end.
 
-%% Body-recurse the regular-header tail. A pseudo-header arriving
-%% here is RFC 9113 §8.1.2.1 PROTOCOL_ERROR.
+%% A pseudo-header arriving in the regular-header tail is
+%% RFC 9113 §8.1.2.1 PROTOCOL_ERROR. Tail-recursive: the validated
+%% headers cons into an accumulator (flipped once at the end) rather
+%% than rebuilding the `{ok, _}` result tuple on every frame.
 -spec partition_regular(roadrunner_http:headers()) ->
     {ok, roadrunner_http:headers()} | {error, build_error()}.
-partition_regular([]) ->
-    {ok, []};
-partition_regular([{<<":", _/binary>>, _} | _]) ->
+partition_regular(Headers) ->
+    partition_regular(Headers, []).
+
+-spec partition_regular(roadrunner_http:headers(), roadrunner_http:headers()) ->
+    {ok, roadrunner_http:headers()} | {error, build_error()}.
+partition_regular([], Acc) ->
+    {ok, lists:reverse(Acc)};
+partition_regular([{<<":", _/binary>>, _} | _], _Acc) ->
     {error, pseudo_after_regular};
-partition_regular([H | Rest]) ->
-    case partition_regular(Rest) of
-        {ok, Tail} -> {ok, [H | Tail]};
-        {error, _} = E -> E
-    end.
+partition_regular([H | Rest], Acc) ->
+    partition_regular(Rest, [H | Acc]).
 
 -spec validate_pseudo(map()) ->
     {ok, binary(), binary(), binary(), binary() | undefined}

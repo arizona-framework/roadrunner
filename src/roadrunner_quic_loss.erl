@@ -372,31 +372,43 @@ ack_eliciting_bytes(false, _Size) -> 0.
 max_largest_acked(undefined, Largest) -> Largest;
 max_largest_acked(Current, Largest) -> max(Current, Largest).
 
-%% Body recursion (cons on the way out) preserves the newest-first order
-%% in both output lists.
+%% Tail-recursive partition; both output lists are reversed once at the end
+%% to preserve the newest-first order the caller relies on, rather than
+%% rebuilding the `{Acked, Unacked}` tuple on every frame.
 -spec classify([#sent{}], [{non_neg_integer(), non_neg_integer()}]) -> {[#sent{}], [#sent{}]}.
-classify([], _Ranges) ->
-    {[], []};
-classify([#sent{pn = PN} = Packet | Rest], Ranges) ->
-    {Acked, Unacked} = classify(Rest, Ranges),
+classify(Packets, Ranges) ->
+    classify(Packets, Ranges, [], []).
+
+-spec classify(
+    [#sent{}], [{non_neg_integer(), non_neg_integer()}], [#sent{}], [#sent{}]
+) -> {[#sent{}], [#sent{}]}.
+classify([], _Ranges, Acked, Unacked) ->
+    {lists:reverse(Acked), lists:reverse(Unacked)};
+classify([#sent{pn = PN} = Packet | Rest], Ranges, Acked, Unacked) ->
     case pn_in_ranges(PN, Ranges) of
-        true -> {[Packet | Acked], Unacked};
-        false -> {Acked, [Packet | Unacked]}
+        true -> classify(Rest, Ranges, [Packet | Acked], Unacked);
+        false -> classify(Rest, Ranges, Acked, [Packet | Unacked])
     end.
 
 %% Split the unacknowledged packets into newly lost and still-in-flight by
 %% the packet threshold (a packet at least 3 below the largest acked) and
-%% the time threshold (RFC 9002 §6.1). Survivors keep their newest-first
-%% order for the next prepend.
+%% the time threshold (RFC 9002 §6.1). Tail-recursive; both lists are
+%% reversed once at the end so survivors keep their newest-first order for
+%% the next prepend, rather than rebuilding the result tuple per frame.
 -spec split_lost([#sent{}], non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
     {[#sent{}], [#sent{}]}.
-split_lost([], _LargestAcked, _Now, _LossDelay) ->
-    {[], []};
-split_lost([Packet | Rest], LargestAcked, Now, LossDelay) ->
-    {Lost, Survivors} = split_lost(Rest, LargestAcked, Now, LossDelay),
+split_lost(Packets, LargestAcked, Now, LossDelay) ->
+    split_lost(Packets, LargestAcked, Now, LossDelay, [], []).
+
+-spec split_lost(
+    [#sent{}], non_neg_integer(), non_neg_integer(), non_neg_integer(), [#sent{}], [#sent{}]
+) -> {[#sent{}], [#sent{}]}.
+split_lost([], _LargestAcked, _Now, _LossDelay, Lost, Survivors) ->
+    {lists:reverse(Lost), lists:reverse(Survivors)};
+split_lost([Packet | Rest], LargestAcked, Now, LossDelay, Lost, Survivors) ->
     case lost_packet(Packet, LargestAcked, Now, LossDelay) of
-        true -> {[Packet | Lost], Survivors};
-        false -> {Lost, [Packet | Survivors]}
+        true -> split_lost(Rest, LargestAcked, Now, LossDelay, [Packet | Lost], Survivors);
+        false -> split_lost(Rest, LargestAcked, Now, LossDelay, Lost, [Packet | Survivors])
     end.
 
 %% Whether a still-unacknowledged packet is lost (RFC 9002 §6.1): only packets

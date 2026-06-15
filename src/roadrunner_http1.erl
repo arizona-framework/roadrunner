@@ -461,28 +461,60 @@ parse_headers(Bin, {MaxLine, MaxBlock, MaxCount}) when is_binary(Bin) ->
         | header_too_long
         | header_block_too_long
         | too_many_headers}.
-parse_headers_loop(_Bin, Count, _Consumed, _LfCp, _ColonCp, _MaxLine, _MaxBlock, MaxCount) when
+parse_headers_loop(Bin, Count, Consumed, LfCp, ColonCp, MaxLine, MaxBlock, MaxCount) ->
+    parse_headers_loop(Bin, Count, Consumed, LfCp, ColonCp, MaxLine, MaxBlock, MaxCount, []).
+
+%% Tail-recursive: the count, consumed-byte tally, and the parsed pairs
+%% thread forward as arguments (pairs consed in reverse, flipped once at
+%% the terminating blank line), rather than unpacking and repacking the
+%% `{ok, headers(), binary()}` tuple on every header as body recursion does.
+-spec parse_headers_loop(
+    binary(),
+    non_neg_integer(),
+    non_neg_integer(),
+    binary:cp(),
+    binary:cp(),
+    pos_integer(),
+    pos_integer(),
+    pos_integer(),
+    headers()
+) ->
+    {ok, headers(), binary()}
+    | {more, undefined}
+    | {error,
+        bad_header
+        | header_too_long
+        | header_block_too_long
+        | too_many_headers}.
+parse_headers_loop(
+    _Bin, Count, _Consumed, _LfCp, _ColonCp, _MaxLine, _MaxBlock, MaxCount, _Acc
+) when
     Count > MaxCount
 ->
     {error, too_many_headers};
-parse_headers_loop(_Bin, _Count, Consumed, _LfCp, _ColonCp, _MaxLine, MaxBlock, _MaxCount) when
+parse_headers_loop(
+    _Bin, _Count, Consumed, _LfCp, _ColonCp, _MaxLine, MaxBlock, _MaxCount, _Acc
+) when
     Consumed > MaxBlock
 ->
     {error, header_block_too_long};
-parse_headers_loop(Bin, Count, Consumed, LfCp, ColonCp, MaxLine, MaxBlock, MaxCount) ->
+parse_headers_loop(Bin, Count, Consumed, LfCp, ColonCp, MaxLine, MaxBlock, MaxCount, Acc) ->
     case parse_header(Bin, LfCp, ColonCp, MaxLine) of
         {ok, Name, Value, Rest} ->
             Used = byte_size(Bin) - byte_size(Rest),
-            case
-                parse_headers_loop(
-                    Rest, Count + 1, Consumed + Used, LfCp, ColonCp, MaxLine, MaxBlock, MaxCount
-                )
-            of
-                {ok, Tail, FinalRest} -> {ok, [{Name, Value} | Tail], FinalRest};
-                Other -> Other
-            end;
+            parse_headers_loop(
+                Rest,
+                Count + 1,
+                Consumed + Used,
+                LfCp,
+                ColonCp,
+                MaxLine,
+                MaxBlock,
+                MaxCount,
+                [{Name, Value} | Acc]
+            );
         {end_of_headers, Rest} ->
-            {ok, [], Rest};
+            {ok, lists:reverse(Acc), Rest};
         {more, _} = More ->
             More;
         {error, _} = Err ->
