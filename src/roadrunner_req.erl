@@ -20,7 +20,7 @@ re-exported alongside it (`headers/0`, `version/0`, `status/0`,
 -define(EQ_CP_KEY, {?MODULE, eq_cp}).
 -define(QUOTE_CP_KEY, {?MODULE, quote_cp}).
 
--export_type([request/0, body_reader/0, cached_decisions/0]).
+-export_type([request/0, body_reader/0, cached_decisions/0, private/0]).
 
 -doc """
 The parsed request map handlers receive.
@@ -28,7 +28,10 @@ The parsed request map handlers receive.
 Required fields are present on every request the framework
 delivers; optional fields are populated by the framework when
 applicable (e.g. `body` in `body_buffering => auto` mode,
-`bindings` for routed dispatch, `request_id` for telemetry).
+`bindings` for routed dispatch, `request_id` for telemetry). The
+`private` field is the exception roadrunner never populates itself:
+it is a scratchpad for frameworks and middlewares to stash their
+own data (see `private/1`).
 
 The same shape flows through both the h1 and h2 paths — h2's
 `roadrunner_http2_request` synthesizes a request matching this
@@ -87,11 +90,28 @@ care which protocol delivered the bytes.
     %% once per conn from `proto_opts.listener_name`. Surfaced in
     %% `roadrunner_telemetry` event metadata so subscribers can
     %% filter by listener in multi-listener deployments.
-    listener_name => atom()
+    listener_name => atom(),
+    %% Framework/middleware scratchpad — a bag of custom data threaded
+    %% through the pipeline to the handler. roadrunner core never reads
+    %% or writes it; it exists purely for downstream consumers, who
+    %% namespace their keys (a namespaced atom like `arizona_session`, or
+    %% a tuple like `{arizona, session}`) to coexist without collisions.
+    %% Read with `private/1,2`, write with `put_private/3`,
+    %% `merge_private/2`, `delete_private/2`, `update_private/4`. Absent
+    %% until first written; the accessors default it to `#{}`. Distinct
+    %% from `state` (the user's per-route config) — see `private/1`.
+    private => private()
 }.
 
 -type headers() :: roadrunner_http:headers().
 -type version() :: roadrunner_http:version().
+
+-doc """
+The framework/middleware scratchpad map carried on the request's
+`private` field. An arbitrary map — consumers choose their own
+(namespaced) keys and values. See `private/1`.
+""".
+-type private() :: map().
 
 -doc """
 Framework-internal h1-parser hot-path optimization carried on the
@@ -156,7 +176,13 @@ to absorb a chunk's payload across multiple length-bounded calls.
     scheme/1,
     state/1,
     request_id/1,
-    listener_name/1
+    listener_name/1,
+    private/1,
+    private/2,
+    put_private/3,
+    merge_private/2,
+    delete_private/2,
+    update_private/4
 ]).
 
 -doc "Return the request method (uppercase ASCII binary).".
@@ -576,6 +602,67 @@ bare-atom single-handler, map without a `state` key).
 -spec state(request()) -> term().
 state(#{state := S}) -> S;
 state(_) -> undefined.
+
+-doc """
+Return the request's `private` map: the framework/middleware scratchpad.
+
+roadrunner core never reads or writes this map; it is purely for
+frameworks and middlewares built on roadrunner to thread their own data
+through the pipeline to the handler. Keys should be namespaced (a
+namespaced atom like `arizona_session`, or a tuple like `{arizona,
+session}`) so independent consumers coexist without collisions.
+
+This is **not** the request's `state` field: `state/1` returns the user's
+opaque per-route handler config, set once in the route spec; `private` is
+a mutable bag accumulated as the request flows. Returns `#{}` when nothing
+has been stored.
+""".
+-spec private(request()) -> private().
+private(#{private := P}) -> P;
+private(_) -> #{}.
+
+-doc """
+Return the value stored under `Key` in the request's `private` map, or
+`undefined` when absent. See `private/1` for the contract.
+""".
+-spec private(term(), request()) -> term() | undefined.
+private(Key, Req) ->
+    maps:get(Key, private(Req), undefined).
+
+-doc """
+Store `Value` under `Key` in the request's `private` map, returning the
+updated request. Creates the map on first write. See `private/1` for the
+contract and key-namespacing convention.
+""".
+-spec put_private(term(), term(), request()) -> request().
+put_private(Key, Value, Req) ->
+    Req#{private => (private(Req))#{Key => Value}}.
+
+-doc """
+Merge `Map` into the request's `private` map, returning the updated
+request. On a key conflict the value from `Map` wins. See `private/1`.
+""".
+-spec merge_private(private(), request()) -> request().
+merge_private(Map, Req) ->
+    Req#{private => maps:merge(private(Req), Map)}.
+
+-doc """
+Remove `Key` from the request's `private` map, returning the updated
+request. A no-op when `Key` is absent. See `private/1`.
+""".
+-spec delete_private(term(), request()) -> request().
+delete_private(Key, Req) ->
+    Req#{private => maps:remove(Key, private(Req))}.
+
+-doc """
+Update the value under `Key` in the request's `private` map by applying
+`Fun` to it, returning the updated request. When `Key` is absent, it is
+seeded with `Init` (and `Fun` is not called) — the `maps:update_with/4`
+contract. See `private/1`.
+""".
+-spec update_private(term(), fun((term()) -> term()), term(), request()) -> request().
+update_private(Key, Fun, Init, Req) ->
+    Req#{private => maps:update_with(Key, Fun, Init, private(Req))}.
 
 -doc """
 Return the per-request correlation token attached by `roadrunner_conn`.
