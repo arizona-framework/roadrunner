@@ -473,6 +473,85 @@ listener_name_present_test() ->
 listener_name_absent_returns_undefined_test() ->
     ?assertEqual(undefined, roadrunner_req:listener_name(sample_req())).
 
+%% --- private/1,2 ---
+
+private_absent_returns_empty_map_test() ->
+    ?assertEqual(#{}, roadrunner_req:private(sample_req())).
+
+private_present_returns_map_test() ->
+    Req = (sample_req())#{private => #{a => 1}},
+    ?assertEqual(#{a => 1}, roadrunner_req:private(Req)).
+
+private_key_present_test() ->
+    Req = (sample_req())#{private => #{a => 1}},
+    ?assertEqual(1, roadrunner_req:private(a, Req)).
+
+private_key_absent_returns_undefined_test() ->
+    Req = (sample_req())#{private => #{a => 1}},
+    ?assertEqual(undefined, roadrunner_req:private(missing, Req)).
+
+private_key_on_untouched_req_returns_undefined_test() ->
+    ?assertEqual(undefined, roadrunner_req:private(any, sample_req())).
+
+%% --- put_private/3 ---
+
+put_private_creates_map_on_first_write_test() ->
+    Req = roadrunner_req:put_private(k, v, sample_req()),
+    ?assertEqual(#{k => v}, roadrunner_req:private(Req)).
+
+put_private_overwrites_existing_key_test() ->
+    Req0 = roadrunner_req:put_private(k, old, sample_req()),
+    Req1 = roadrunner_req:put_private(k, new, Req0),
+    ?assertEqual(new, roadrunner_req:private(k, Req1)).
+
+put_private_preserves_other_private_keys_test() ->
+    Req0 = roadrunner_req:put_private(a, 1, sample_req()),
+    Req1 = roadrunner_req:put_private(b, 2, Req0),
+    ?assertEqual(#{a => 1, b => 2}, roadrunner_req:private(Req1)).
+
+put_private_preserves_other_req_fields_test() ->
+    Req = roadrunner_req:put_private(k, v, (sample_req())#{state => kept}),
+    ?assertEqual(kept, roadrunner_req:state(Req)).
+
+%% --- merge_private/2 ---
+
+merge_private_creates_map_on_first_write_test() ->
+    Req = roadrunner_req:merge_private(#{a => 1, b => 2}, sample_req()),
+    ?assertEqual(#{a => 1, b => 2}, roadrunner_req:private(Req)).
+
+merge_private_caller_keys_win_on_conflict_test() ->
+    Req0 = roadrunner_req:put_private(a, 1, sample_req()),
+    Req1 = roadrunner_req:merge_private(#{a => 2, b => 3}, Req0),
+    ?assertEqual(#{a => 2, b => 3}, roadrunner_req:private(Req1)).
+
+merge_private_preserves_existing_keys_test() ->
+    Req0 = roadrunner_req:put_private(a, 1, sample_req()),
+    Req1 = roadrunner_req:merge_private(#{b => 2}, Req0),
+    ?assertEqual(#{a => 1, b => 2}, roadrunner_req:private(Req1)).
+
+%% --- delete_private/2 ---
+
+delete_private_removes_key_and_keeps_siblings_test() ->
+    Req0 = roadrunner_req:merge_private(#{a => 1, b => 2}, sample_req()),
+    Req1 = roadrunner_req:delete_private(a, Req0),
+    ?assertEqual(#{b => 2}, roadrunner_req:private(Req1)).
+
+delete_private_absent_key_is_noop_test() ->
+    Req0 = roadrunner_req:put_private(a, 1, sample_req()),
+    Req1 = roadrunner_req:delete_private(missing, Req0),
+    ?assertEqual(#{a => 1}, roadrunner_req:private(Req1)).
+
+%% --- update_private/4 ---
+
+update_private_seeds_init_when_absent_test() ->
+    Req = roadrunner_req:update_private(n, fun(X) -> X + 1 end, 0, sample_req()),
+    ?assertEqual(0, roadrunner_req:private(n, Req)).
+
+update_private_applies_fun_when_present_test() ->
+    Req0 = roadrunner_req:put_private(n, 1, sample_req()),
+    Req1 = roadrunner_req:update_private(n, fun(X) -> X + 1 end, 0, Req0),
+    ?assertEqual(2, roadrunner_req:private(n, Req1)).
+
 %% --- fixtures ---
 
 sample_req() ->
