@@ -500,15 +500,20 @@ evict_to(Target, #hpack_ctx{table = Table} = Ctx) ->
 %% on `[]` is the desired "trust the invariant" failure mode.
 -spec keep_within([header()], non_neg_integer()) ->
     {[header()], non_neg_integer()}.
-keep_within([H | T], Budget) ->
+keep_within(Headers, Budget) ->
+    keep_within(Headers, Budget, [], 0).
+
+%% Tail-recursive: the kept entries and their running size thread forward
+%% as arguments (entries flipped once when an entry first fails to fit),
+%% rather than rebuilding the `{[header()], size}` tuple on every frame.
+%% The first entry that doesn't fit drops H and every older entry.
+-spec keep_within([header()], non_neg_integer(), [header()], non_neg_integer()) ->
+    {[header()], non_neg_integer()}.
+keep_within([H | T], Budget, Kept, Size) ->
     HSize = entry_size(H),
     case HSize =< Budget of
-        true ->
-            {Kept, KeptSize} = keep_within(T, Budget - HSize),
-            {[H | Kept], KeptSize + HSize};
-        false ->
-            %% H itself doesn't fit — drop H and every older entry.
-            {[], 0}
+        true -> keep_within(T, Budget - HSize, [H | Kept], Size + HSize);
+        false -> {lists:reverse(Kept), Size}
     end.
 
 -spec entry_size(header()) -> non_neg_integer().
