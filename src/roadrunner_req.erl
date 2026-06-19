@@ -471,7 +471,7 @@ dispatch_form(unsupported, _ContentType, _Req) ->
 Return the router-captured bindings for this request as a
 `#{Name => Value}` map of binaries.
 
-`roadrunner_conn` populates this from `roadrunner_router:match/2` before
+`roadrunner_conn` populates this from `roadrunner_router:match/3` before
 invoking the handler. Empty map when the listener is in single-handler
 mode (no router) or the matched route has no `:param` segments.
 """.

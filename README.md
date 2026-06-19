@@ -212,6 +212,20 @@ routes => [
 ]
 ```
 
+Restrict a route to specific HTTP methods with the **map form**'s `methods` key
+(a non-empty list of uppercase method binaries). A request whose path matches a
+route but whose method is not listed gets `405 Method Not Allowed` with an `Allow`
+header; two routes may share a path with disjoint methods for REST-style dispatch.
+A route with no `methods` answers every method. Matching is literal -- a `[~"GET"]`
+route does not implicitly answer `HEAD`, so list every method the route accepts:
+
+```erlang
+routes => [
+    #{path => ~"/users", handler => users_index,  methods => [~"GET"]},
+    #{path => ~"/users", handler => users_create, methods => [~"POST"]}
+]
+```
+
 The request accessors (`method/1`, `path/1`, `header/2`, `parse_qs/1`,
 `bindings/1`, `peer/1`, `read_body/1`) all live in `roadrunner_req`.
 

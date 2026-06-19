@@ -126,6 +126,14 @@ forbidden_test() ->
 not_found_test() ->
     ?assertEqual({404, [{~"content-length", ~"0"}], ~""}, roadrunner_resp:not_found()).
 
+method_not_allowed_test() ->
+    %% 405 carries an `Allow` header (prepended, so it wins on lookup)
+    %% listing the permitted methods comma-separated.
+    ?assertEqual(
+        {405, [{~"allow", ~"GET, POST"}, {~"content-length", ~"0"}], ~""},
+        roadrunner_resp:method_not_allowed([~"GET", ~"POST"])
+    ).
+
 internal_error_test() ->
     ?assertEqual({500, [{~"content-length", ~"0"}], ~""}, roadrunner_resp:internal_error()).
 
