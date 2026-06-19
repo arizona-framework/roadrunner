@@ -87,17 +87,33 @@ parse_request_line(Bin) ->
     {ok, Method :: binary(), Target :: binary(), version(), Rest :: binary()}
     | {more, undefined}
     | {error, bad_request_line | bad_version | request_line_too_long}.
-parse_request_line(<<"\r\n", Rest/binary>>, MaxReqLine) ->
+parse_request_line(Bin, MaxReqLine) ->
+    %% The internal variant also returns `Path` (the target with any `?query`
+    %% sliced off, captured for free during target validation). The public
+    %% contract is the documented 5-tuple, so drop it here; `parse_request/2`
+    %% calls the path-carrying variant directly and stores `Path`.
+    case parse_request_line_p(Bin, MaxReqLine) of
+        {ok, Method, Target, _Path, Version, Rest} -> {ok, Method, Target, Version, Rest};
+        Other -> Other
+    end.
+
+%% Path-carrying variant of `parse_request_line/2`: same logic, but the success
+%% tuple also returns the `?`-free path captured during target validation.
+-spec parse_request_line_p(binary(), pos_integer()) ->
+    {ok, Method :: binary(), Target :: binary(), Path :: binary(), version(), Rest :: binary()}
+    | {more, undefined}
+    | {error, bad_request_line | bad_version | request_line_too_long}.
+parse_request_line_p(<<"\r\n", Rest/binary>>, MaxReqLine) ->
     do_parse_request_line(
         Rest, persistent_term:get(?LF_KEY), persistent_term:get(?SPACE_KEY), MaxReqLine
     );
-parse_request_line(Bin, MaxReqLine) when is_binary(Bin) ->
+parse_request_line_p(Bin, MaxReqLine) when is_binary(Bin) ->
     do_parse_request_line(
         Bin, persistent_term:get(?LF_KEY), persistent_term:get(?SPACE_KEY), MaxReqLine
     ).
 
 -spec do_parse_request_line(binary(), binary:cp(), binary:cp(), pos_integer()) ->
-    {ok, Method :: binary(), Target :: binary(), version(), Rest :: binary()}
+    {ok, Method :: binary(), Target :: binary(), Path :: binary(), version(), Rest :: binary()}
     | {more, undefined}
     | {error, bad_request_line | bad_version | request_line_too_long}.
 do_parse_request_line(Bin, LfCp, SpaceCp, MaxReqLine) ->
@@ -113,7 +129,7 @@ do_parse_request_line(Bin, LfCp, SpaceCp, MaxReqLine) ->
     end.
 
 -spec extract_line(binary(), pos_integer(), binary:cp(), pos_integer()) ->
-    {ok, binary(), binary(), version(), binary()}
+    {ok, binary(), binary(), binary(), version(), binary()}
     | {error, bad_request_line | bad_version | request_line_too_long}.
 extract_line(Bin, LfPos, SpaceCp, MaxReqLine) ->
     LineLen = LfPos - 1,
@@ -127,7 +143,7 @@ extract_line(Bin, LfPos, SpaceCp, MaxReqLine) ->
     end.
 
 -spec parse_line(binary(), binary(), binary:cp()) ->
-    {ok, binary(), binary(), version(), binary()}
+    {ok, binary(), binary(), binary(), version(), binary()}
     | {error, bad_request_line | bad_version}.
 parse_line(Line, Rest, SpaceCp) ->
     case binary:split(Line, SpaceCp, [global]) of
@@ -138,15 +154,15 @@ parse_line(Line, Rest, SpaceCp) ->
     end.
 
 -spec classify(binary(), binary(), binary(), binary()) ->
-    {ok, binary(), binary(), version(), binary()}
+    {ok, binary(), binary(), binary(), version(), binary()}
     | {error, bad_request_line | bad_version}.
 classify(Method, Target, VersionBin, Rest) ->
     case validate_method(Method) of
         ok ->
             case validate_target(Target) of
-                ok ->
+                {ok, Path} ->
                     case parse_version(VersionBin) of
-                        {ok, V} -> {ok, Method, Target, V, Rest};
+                        {ok, V} -> {ok, Method, Target, Path, V, Rest};
                         error -> {error, bad_version}
                     end;
                 error ->
@@ -180,16 +196,35 @@ validate_method_chars(<<C, Rest/binary>>) when C >= $A, C =< $Z ->
 validate_method_chars(_) ->
     error.
 
--spec validate_target(binary()) -> ok | error.
+%% Validate the request-target (RFC 9110 §5.6.2: reject CTLs, SP, DEL) and, in
+%% the SAME byte-walk, slice off the `?query` so the caller gets the `?`-free
+%% path for free. The first `?` switches to query validation (later `?`s are
+%% valid query bytes); the path prefix is derived from a `byte_size` diff (no
+%% per-byte position counter). `Path` shares the target binary when there is no
+%% query, or is a sub-binary slice when there is — neither copies.
+-spec validate_target(binary()) -> {ok, Path :: binary()} | error.
 validate_target(<<>>) -> error;
-validate_target(T) -> validate_target_chars(T).
+validate_target(T) -> validate_path(T, T).
 
--spec validate_target_chars(binary()) -> ok | error.
-validate_target_chars(<<>>) ->
+-spec validate_path(binary(), binary()) -> {ok, binary()} | error.
+validate_path(<<>>, Target) ->
+    {ok, Target};
+validate_path(<<$?, Rest/binary>>, Target) ->
+    case validate_query(Rest) of
+        ok -> {ok, binary:part(Target, 0, byte_size(Target) - byte_size(Rest) - 1)};
+        error -> error
+    end;
+validate_path(<<C, Rest/binary>>, Target) when C > 16#20, C =/= 16#7F ->
+    validate_path(Rest, Target);
+validate_path(_, _) ->
+    error.
+
+-spec validate_query(binary()) -> ok | error.
+validate_query(<<>>) ->
     ok;
-validate_target_chars(<<C, Rest/binary>>) when C > 16#20, C =/= 16#7F ->
-    validate_target_chars(Rest);
-validate_target_chars(_) ->
+validate_query(<<C, Rest/binary>>) when C > 16#20, C =/= 16#7F ->
+    validate_query(Rest);
+validate_query(_) ->
     error.
 
 -spec parse_version(binary()) -> {ok, version()} | error.
@@ -677,13 +712,14 @@ The conn loop passes the listener's configured `http1_*` limits;
         | missing_host}.
 parse_request(Bin, {MaxReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}) when is_binary(Bin) ->
     maybe
-        {ok, Method, Target, Version, Rest} ?= parse_request_line(Bin, MaxReqLine),
+        {ok, Method, Target, Path, Version, Rest} ?= parse_request_line_p(Bin, MaxReqLine),
         {ok, Headers, Rest2} ?= parse_headers(Rest, {MaxHdrLine, MaxHdrBlock, MaxHdrCount}),
         Decisions = compute_cached_decisions(Headers),
         ok ?= validate_host(Version, Decisions),
         Req = #{
             method => Method,
             target => Target,
+            path => Path,
             version => Version,
             headers => Headers,
             cached_decisions => Decisions
