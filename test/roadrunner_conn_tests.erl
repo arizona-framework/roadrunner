@@ -462,8 +462,28 @@ resolve_handler_router_no_match_returns_not_found_test() ->
         roadrunner_router:compile([{~"/known", some_mod}], [])
     ),
     try
-        Req = #{target => ~"/missing"},
+        Req = #{method => ~"GET", target => ~"/missing"},
         ?assertEqual(not_found, roadrunner_conn:resolve_handler({router, Name}, Req))
+    after
+        persistent_term:erase({roadrunner_routes, Name})
+    end.
+
+resolve_handler_router_method_not_allowed_test() ->
+    %% Path matches a method-restricted route but the verb doesn't:
+    %% resolve_handler surfaces the 405 + Allow set for the conn loop.
+    Name = resolve_handler_router_method_not_allowed,
+    persistent_term:put(
+        {roadrunner_routes, Name},
+        roadrunner_router:compile(
+            [#{path => ~"/known", handler => some_mod, methods => [~"POST"]}], []
+        )
+    ),
+    try
+        Req = #{method => ~"GET", target => ~"/known"},
+        ?assertEqual(
+            {method_not_allowed, [~"POST"]},
+            roadrunner_conn:resolve_handler({router, Name}, Req)
+        )
     after
         persistent_term:erase({roadrunner_routes, Name})
     end.
@@ -700,7 +720,12 @@ conn_dispatches_via_router_test_() ->
                 port => 0,
                 routes => [
                     {~"/", roadrunner_hello_handler, undefined},
-                    {~"/created", roadrunner_test_handler, undefined}
+                    {~"/created", roadrunner_test_handler, undefined},
+                    #{
+                        path => ~"/post-only",
+                        handler => roadrunner_test_handler,
+                        methods => [~"POST"]
+                    }
                 ]
             }),
             roadrunner_listener:port(conn_test_routes)
@@ -715,6 +740,9 @@ conn_dispatches_via_router_test_() ->
                 end},
                 {"unknown path returns 404", fun() ->
                     assert_status(Port, ~"GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 404)
+                end},
+                {"disallowed method on a matched path returns 405", fun() ->
+                    assert_status(Port, ~"GET /post-only HTTP/1.1\r\nHost: x\r\n\r\n", 405)
                 end}
             ]
         end}.

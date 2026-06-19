@@ -27,6 +27,7 @@ WebSocket-upgrade handlers build their own tuple directly; see
     unauthorized/0,
     forbidden/0,
     not_found/0,
+    method_not_allowed/1,
     internal_error/0,
     status/1
 ]).
@@ -146,6 +147,15 @@ forbidden() -> empty_status(403).
 -doc "Empty 404 Not Found response.".
 -spec not_found() -> buffered_response().
 not_found() -> empty_status(404).
+
+-doc """
+Empty 405 Method Not Allowed response with an `Allow` header listing
+the permitted methods, comma-separated (RFC 9110 requires `Allow` on a
+405). Pass the uppercase method binaries the resource accepts.
+""".
+-spec method_not_allowed([binary()]) -> buffered_response().
+method_not_allowed(Allowed) ->
+    add_header(empty_status(405), ~"allow", lists:join(~", ", Allowed)).
 
 -doc "Empty 500 Internal Server Error response.".
 -spec internal_error() -> buffered_response().

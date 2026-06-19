@@ -72,6 +72,7 @@
     drain_oversized_body/3,
     send_internal_error/1,
     send_not_found/1,
+    send_method_not_allowed/2,
     resolve_handler/2,
     response_status/1,
     response_kind/1,
@@ -569,6 +570,7 @@ scheme({fake, _}) -> http.
 -doc false.
 -spec resolve_handler(dispatch(), roadrunner_req:request()) ->
     {ok, module(), roadrunner_router:bindings(), roadrunner_middleware:next(), term()}
+    | {method_not_allowed, [binary()]}
     | not_found.
 resolve_handler({handler, Mod, Pipeline, State}, _Req) ->
     {ok, Mod, #{}, Pipeline, State};
@@ -577,7 +579,7 @@ resolve_handler({router, ListenerName}, Req) ->
     %% the lookup is O(1) and `roadrunner_listener:reload_routes/2` can
     %% atomically swap the table without bouncing the listener.
     Compiled = persistent_term:get({roadrunner_routes, ListenerName}),
-    roadrunner_router:match(roadrunner_req:path(Req), Compiled).
+    roadrunner_router:match(roadrunner_req:method(Req), roadrunner_req:path(Req), Compiled).
 
 -doc false.
 -spec read_body(
@@ -1277,6 +1279,20 @@ send_not_found(Socket) ->
     Resp = roadrunner_http1:response(
         404,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
+        ~""
+    ),
+    roadrunner_transport:send(Socket, Resp).
+
+-doc false.
+-spec send_method_not_allowed(roadrunner_transport:socket(), [binary()]) -> ok | {error, term()}.
+send_method_not_allowed(Socket, Allowed) ->
+    Resp = roadrunner_http1:response(
+        405,
+        [
+            {~"allow", iolist_to_binary(lists:join(~", ", Allowed))},
+            {~"content-length", ~"0"},
+            {~"connection", ~"close"}
+        ],
         ~""
     ),
     roadrunner_transport:send(Socket, Resp).

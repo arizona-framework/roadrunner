@@ -3,7 +3,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %% =============================================================================
-%% compile/1 + match/2 — literal paths
+%% compile/1 + match/3 — literal paths
 %% =============================================================================
 
 compile_empty_test() ->
@@ -386,7 +386,7 @@ match_wildcard_followed_by_literal_does_not_match_test() ->
 match_nul_byte_in_segment_is_captured_raw_test() ->
     %% NUL is just a byte to the router — the request-line parser
     %% rejects NUL upstream so a real wire request can't reach here
-    %% with a NUL, but a caller invoking `match/2` directly with a
+    %% with a NUL, but a caller invoking `match/3` directly with a
     %% poisoned binary gets it back verbatim. Documented as caller's
     %% responsibility to validate.
     Compiled = roadrunner_router:compile([{~"/admin/:p", h}], []),
@@ -412,7 +412,7 @@ match_path_without_leading_slash_resolves_same_as_with_test() ->
 
 compile_returns_callable_pipeline_test() ->
     %% Every compiled route, regardless of shape, ends with a 1-arity
-    %% fun in the 4th element of `match/2`'s return. Behavior is
+    %% fun in the 4th element of `match/3`'s return. Behavior is
     %% covered by `roadrunner_middleware_tests`.
     Compiled = roadrunner_router:compile(
         [
@@ -425,7 +425,7 @@ compile_returns_callable_pipeline_test() ->
     [
         ?assert(is_function(P, 1))
      || Path <- [~"/", ~"/x", ~"/y"],
-        {ok, _, _, P, _} <- [roadrunner_router:match(Path, Compiled)]
+        {ok, _, _, P, _} <- [roadrunner_router:match(~"GET", Path, Compiled)]
     ].
 
 compile_bakes_state_into_pipeline_test() ->
@@ -436,7 +436,7 @@ compile_bakes_state_into_pipeline_test() ->
     Compiled = roadrunner_router:compile(
         [{~"/", roadrunner_state_echo_handler, #{my => state}}], []
     ),
-    {ok, _, _, Pipeline, _State} = roadrunner_router:match(~"/", Compiled),
+    {ok, _, _, Pipeline, _State} = roadrunner_router:match(~"GET", ~"/", Compiled),
     {{200, _, Body}, _} = Pipeline(empty_req()),
     ?assertEqual(#{my => state}, binary_to_term(Body)).
 
@@ -455,7 +455,7 @@ match_exposes_state_as_5th_element_test() ->
         []
     ),
     [
-        ?assertEqual(Expected, element(5, roadrunner_router:match(P, Compiled)))
+        ?assertEqual(Expected, element(5, roadrunner_router:match(~"GET", P, Compiled)))
      || {P, Expected} <- [
             {~"/none", undefined},
             {~"/legacy", undefined},
@@ -465,14 +465,130 @@ match_exposes_state_as_5th_element_test() ->
         ]
     ].
 
+%% =============================================================================
+%% Method-aware routing (map-form `methods` allowlist)
+%% =============================================================================
+
+match_method_in_allowlist_test() ->
+    Compiled = roadrunner_router:compile(
+        [#{path => ~"/account", handler => acct_handler, methods => [~"POST"]}], []
+    ),
+    ?assertEqual(
+        {ok, acct_handler, #{}, #{}},
+        match_no_pipeline(~"POST", ~"/account", Compiled)
+    ).
+
+match_method_not_in_allowlist_returns_405_test() ->
+    Compiled = roadrunner_router:compile(
+        [#{path => ~"/account", handler => acct_handler, methods => [~"POST"]}], []
+    ),
+    ?assertEqual(
+        {method_not_allowed, [~"POST"]},
+        roadrunner_router:match(~"GET", ~"/account", Compiled)
+    ).
+
+match_no_methods_key_answers_every_method_test() ->
+    %% A route with no `methods` allowlist accepts any verb.
+    Compiled = roadrunner_router:compile(
+        [#{path => ~"/any", handler => any_handler}], []
+    ),
+    [
+        ?assertEqual(
+            {ok, any_handler, #{}, #{}},
+            match_no_pipeline(M, ~"/any", Compiled)
+        )
+     || M <- [~"GET", ~"POST", ~"DELETE", ~"PROPFIND"]
+    ].
+
+match_same_path_dispatches_on_method_test() ->
+    %% Two routes share a path with disjoint methods — the verb selects
+    %% the handler (REST-style dispatch).
+    Compiled = roadrunner_router:compile(
+        [
+            #{path => ~"/users", handler => users_index, methods => [~"GET"]},
+            #{path => ~"/users", handler => users_create, methods => [~"POST"]}
+        ],
+        []
+    ),
+    ?assertEqual(
+        {ok, users_index, #{}, #{}},
+        match_no_pipeline(~"GET", ~"/users", Compiled)
+    ),
+    ?assertEqual(
+        {ok, users_create, #{}, #{}},
+        match_no_pipeline(~"POST", ~"/users", Compiled)
+    ).
+
+match_405_allow_unions_same_path_methods_test() ->
+    %% A method matching neither same-path route yields a 405 whose Allow
+    %% set is the sorted, de-duplicated union — sorted regardless of the
+    %% order the methods were declared in (here `HEAD` before `GET`).
+    Compiled = roadrunner_router:compile(
+        [
+            #{path => ~"/users", handler => users_index, methods => [~"HEAD", ~"GET"]},
+            #{path => ~"/users", handler => users_create, methods => [~"GET", ~"POST"]}
+        ],
+        []
+    ),
+    ?assertEqual(
+        {method_not_allowed, [~"GET", ~"HEAD", ~"POST"]},
+        roadrunner_router:match(~"DELETE", ~"/users", Compiled)
+    ).
+
+match_method_mismatch_with_no_path_match_is_not_found_test() ->
+    %% A disallowed method only yields 405 when some path matched; an
+    %% unknown path is still a 404, not a 405.
+    Compiled = roadrunner_router:compile(
+        [#{path => ~"/account", handler => acct_handler, methods => [~"POST"]}], []
+    ),
+    ?assertEqual(not_found, roadrunner_router:match(~"GET", ~"/nope", Compiled)).
+
+compile_rejects_empty_methods_list_test() ->
+    %% An empty `methods` (a route that answers nothing) is a config error.
+    ?assertError(
+        {invalid_route_methods, []},
+        roadrunner_router:compile([#{path => ~"/x", handler => h, methods => []}], [])
+    ).
+
+compile_rejects_non_binary_methods_test() ->
+    %% Atom methods would never match the binary wire method — raise loudly.
+    ?assertError(
+        {invalid_route_methods, [get, post]},
+        roadrunner_router:compile([#{path => ~"/x", handler => h, methods => [get, post]}], [])
+    ).
+
+match_all_methods_route_shadows_later_specific_test() ->
+    %% Declaration order wins: an all-methods route on a path short-circuits
+    %% before a later same-path method-specific route is considered.
+    Compiled = roadrunner_router:compile(
+        [
+            #{path => ~"/x", handler => catch_all},
+            #{path => ~"/x", handler => only_post, methods => [~"POST"]}
+        ],
+        []
+    ),
+    ?assertEqual(
+        {ok, catch_all, #{}, #{}},
+        match_no_pipeline(~"POST", ~"/x", Compiled)
+    ),
+    ?assertEqual(
+        {ok, catch_all, #{}, #{}},
+        match_no_pipeline(~"GET", ~"/x", Compiled)
+    ).
+
 %% --- helpers ---
 
 %% Drop the pipeline (4th element) and state (5th) so the handler
 %% module + bindings can be asserted with `?assertEqual`. The
 %% pipeline is funs-are-not-comparable, and state has its own
 %% dedicated test (`match_exposes_state_as_5th_element_test`).
+%% Defaults the method to GET — the path-matching tests use routes with
+%% no `methods` allowlist, so every method (incl. GET) is accepted.
 match_no_pipeline(Path, Compiled) ->
-    case roadrunner_router:match(Path, Compiled) of
+    match_no_pipeline(~"GET", Path, Compiled).
+
+match_no_pipeline(Method, Path, Compiled) ->
+    case roadrunner_router:match(Method, Path, Compiled) of
         {ok, Mod, Bindings, _Pipeline, _State} -> {ok, Mod, Bindings, #{}};
         Other -> Other
     end.

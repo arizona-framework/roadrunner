@@ -689,6 +689,12 @@ dispatch_phase(
             case roadrunner_conn:resolve_handler(Dispatch, Req) of
                 {ok, Handler, Bindings, Pipeline, _State} ->
                     run_pipeline(S, Handler, Req#{bindings => Bindings}, Pipeline);
+                {method_not_allowed, Allowed} ->
+                    %% Path matched but no route answers this method: 405 +
+                    %% Allow before any pipeline runs (the method gate is a
+                    %% routing decision, ahead of per-route middleware).
+                    _ = roadrunner_conn:send_method_not_allowed(Socket, Allowed),
+                    exit_normal(S);
                 not_found ->
                     _ = roadrunner_conn:send_not_found(Socket),
                     exit_normal(S)

@@ -769,6 +769,45 @@ not_found_writes_404_test() ->
     Sink ! stop,
     persistent_term:erase({roadrunner_routes, Listener}).
 
+method_not_allowed_writes_405_test() ->
+    %% Router dispatch where the path matches but the method isn't in the
+    %% route's allowlist → 405 with a comma-joined, sorted Allow header,
+    %% emitted before any pipeline runs.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Listener = mna405,
+    Compiled = roadrunner_router:compile(
+        [
+            #{
+                path => ~"/post-only",
+                handler => roadrunner_test_handler,
+                methods => [~"POST", ~"DELETE"]
+            }
+        ],
+        []
+    ),
+    persistent_term:put({roadrunner_routes, Listener}, Compiled),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET /post-only HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(Listener))#{
+        dispatch := {router, Listener}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 405", _/binary>>, Sent),
+    %% Allow header is sorted: DELETE < POST.
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"DELETE, POST")),
+    Sink ! stop,
+    persistent_term:erase({roadrunner_routes, Listener}).
+
 two_pipelined_requests_in_one_packet_serve_both_test() ->
     %% RFC 7230 §6.3 pipelining — two requests delivered as one TCP
     %% packet should both be served. The keepalive handler (no

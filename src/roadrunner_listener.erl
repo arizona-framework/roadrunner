@@ -1549,7 +1549,7 @@ build_dispatch(Opts, _ListenerName) ->
 %% Single-handler dispatch counterpart of the router's compile path.
 %% Defers to `roadrunner_middleware:compile_pipeline/3` after combining
 %% the listener-wide and per-handler mws lists. State is exposed
-%% alongside the pipeline so `roadrunner_router:match/2`-shaped
+%% alongside the pipeline so `roadrunner_router:match/3`-shaped
 %% callers (and other introspection paths) can read it without
 %% running the pipeline.
 -spec bake_dispatch(

@@ -5,7 +5,7 @@ Property-based tests for `roadrunner_router`.
 Headline property: **parameter bindings round-trip.** Given a
 randomly-generated route pattern (a mix of literal and `:param`
 segments) and randomly-generated values for each `:param`, the
-constructed path must match the route and `roadrunner_router:match/2`
+constructed path must match the route and `roadrunner_router:match/3`
 must reproduce the param map verbatim.
 
 This catches off-by-one bugs in segment parsing, encoding mismatches,
@@ -27,7 +27,7 @@ prop_param_bindings_round_trip() ->
             PathBin = build_path(Pattern, Values),
             RouteBin = build_route(Pattern),
             Compiled = roadrunner_router:compile([{RouteBin, my_handler}], []),
-            case roadrunner_router:match(PathBin, Compiled) of
+            case roadrunner_router:match(~"GET", PathBin, Compiled) of
                 {ok, my_handler, Bindings, Pipeline, _State} when is_function(Pipeline, 1) ->
                     %% Every `:Name` in the pattern must show up in
                     %% Bindings under that exact binary name and value.
