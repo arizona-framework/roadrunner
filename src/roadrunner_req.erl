@@ -71,6 +71,11 @@ care which protocol delivered the bytes.
     %% `inet:peername/1`. `undefined` when the OS call fails (rare;
     %% usually socket teardown).
     peer => {inet:ip_address(), inet:port_number()} | undefined,
+    %% Trusted real client IP, resolved per request from the configured
+    %% forwarded header when the listener `real_ip` opt is set (see
+    %% `client_ip/1`). Absent when the opt is off, so the default hot path
+    %% carries no extra field.
+    client_ip => inet:ip_address(),
     %% Connection scheme — `http` for plain TCP, `https` for TLS.
     %% Set once per connection by `roadrunner_conn` from the
     %% transport tag.
@@ -177,6 +182,7 @@ to absorb a chunk's payload across multiple length-bounded calls.
     read_form/1,
     bindings/1,
     peer/1,
+    client_ip/1,
     forwarded_for/1,
     scheme/1,
     state/1,
@@ -508,6 +514,25 @@ can reach the listener directly would let that peer spoof its own address.
     {inet:ip_address(), inet:port_number()} | undefined.
 peer(#{peer := P}) -> P;
 peer(_) -> undefined.
+
+-doc """
+Return the trusted real client IP for this request.
+
+When the listener `real_ip` opt is set, `roadrunner_conn` resolves the client
+from the configured forwarded header (recursively, against the
+`trusted_proxies` allow-list — see `t:roadrunner_listener:opts/0`) and this
+returns that address. Without the opt it falls back to the connection peer's IP
+(the client when there is no proxy), and `undefined` when the peer is unknown.
+
+Unlike `forwarded_for/1`, this is safe to trust as the client identity: a
+forwarded header is honored only when the immediate peer is itself a configured
+proxy, so a direct client cannot spoof it. Returns the bare IP (no port);
+`X-Forwarded-For` carries no port.
+""".
+-spec client_ip(request()) -> inet:ip_address() | undefined.
+client_ip(#{client_ip := IP}) -> IP;
+client_ip(#{peer := {IP, _}}) -> IP;
+client_ip(_) -> undefined.
 
 -doc """
 Return the leftmost client identifier from the `Forwarded` header

@@ -247,6 +247,10 @@
     %% Per-peer rate-limit guard resolved from proto_opts + peer at `enter/6`
     %% (`undefined` when off). Checked in `dispatch_stream/2`.
     rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
+    %% Compiled `real_ip` config cached from proto_opts at `enter/6`
+    %% (`undefined` when off). When set, `dispatch_stream/2` resolves the client
+    %% IP per request onto the request map.
+    real_ip = undefined :: undefined | roadrunner_real_ip:config(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -337,6 +341,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered) ->
         max_concurrent_requests = MaxConcReq,
         inflight_counter = InflightCounter,
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
+        real_ip = maps:get(real_ip, ProtoOpts, undefined),
         handshake_timeout = HandshakeTimeout,
         idle_timeout = IdleTimeout
     },
@@ -1111,7 +1116,8 @@ dispatch_stream(
         scheme = Scheme,
         listener_name = ListenerName,
         max_concurrent_requests = MaxConcReq,
-        inflight_counter = InflightCounter
+        inflight_counter = InflightCounter,
+        real_ip = RealIp
     } = State
 ) ->
     #{
@@ -1136,7 +1142,8 @@ dispatch_stream(
                 request_id => RequestId
             },
             case roadrunner_http2_request:from_headers(Headers, BodyIolist, RequestContext) of
-                {ok, Req} ->
+                {ok, Req0} ->
+                    Req = roadrunner_conn:maybe_put_client_ip(RealIp, Req0, Peer),
                     StateBuf = State#loop{req_id_buffer = NewBuf},
                     case rate_limit_refused(StateBuf, StreamId) of
                         {refused, State1} ->

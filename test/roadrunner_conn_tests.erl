@@ -2251,3 +2251,22 @@ request_slot_release_many_test() ->
     ?assertEqual(4, counters:get(Ref, 1)),
     ?assertEqual(ok, roadrunner_conn:release_request_slots(10, Ref, 4)),
     ?assertEqual(0, counters:get(Ref, 1)).
+
+%% --- maybe_put_client_ip/3 ---
+
+maybe_put_client_ip_off_is_noop_test() ->
+    Req = #{headers => [{~"x-forwarded-for", ~"203.0.113.7"}]},
+    ?assertEqual(Req, roadrunner_conn:maybe_put_client_ip(undefined, Req, {{127, 0, 0, 1}, 80})).
+
+maybe_put_client_ip_resolves_test() ->
+    Cfg = roadrunner_real_ip:compile(#{trusted_proxies => [~"127.0.0.1/32"]}),
+    Req = #{headers => [{~"x-forwarded-for", ~"203.0.113.7"}]},
+    Result = roadrunner_conn:maybe_put_client_ip(Cfg, Req, {{127, 0, 0, 1}, 80}),
+    ?assertEqual({203, 0, 113, 7}, maps:get(client_ip, Result)).
+
+maybe_put_client_ip_unknown_peer_skips_field_test() ->
+    %% Peer unknown: resolution yields `undefined`, so no `client_ip` is stored
+    %% (it stays a concrete IP type) and the request is returned untouched.
+    Cfg = roadrunner_real_ip:compile(#{trusted_proxies => [~"127.0.0.1/32"]}),
+    Req = #{headers => [{~"x-forwarded-for", ~"203.0.113.7"}]},
+    ?assertEqual(Req, roadrunner_conn:maybe_put_client_ip(Cfg, Req, undefined)).

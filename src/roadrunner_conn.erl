@@ -67,6 +67,7 @@
     send_rate_limited/2,
     rate_limit_check/6,
     resolve_rate_limit/2,
+    maybe_put_client_ip/3,
     rate_limited_telemetry/2,
     rate_limit_evict_idle/3,
     drain_oversized_body/3,
@@ -141,6 +142,12 @@
     %% the request peer is the real client. TCP-only; the listener rejects it on
     %% an HTTP/3-only listener.
     proxy_protocol => boolean(),
+    %% Trusted real-client-IP resolution config, compiled by
+    %% `roadrunner_real_ip:compile/1` from the listener `real_ip` opt
+    %% (`undefined` when unset — the common case). When set, the conn loop
+    %% resolves the client IP per request from the forwarded header and stashes
+    %% it as `client_ip` on the request; see `t:roadrunner_listener:opts/0`.
+    real_ip => undefined | roadrunner_real_ip:config(),
     %% Enabled protocols as a flat atom list in user-supplied (ALPN
     %% preference) order. On plain TCP with `[http2]`,
     %% `roadrunner_conn_loop:awaiting_shoot/3` routes straight to the
@@ -373,6 +380,27 @@ resolve_rate_limit(
     {Rate, Cap, Cost, Table, Counter, IP};
 resolve_rate_limit(_ProtoOpts, _Peer) ->
     undefined.
+
+%% Stash the trusted real client IP on `Req` when the listener `real_ip` opt is
+%% set, resolving it from the request's forwarded header against the immediate
+%% `Peer`. The `undefined` clause (the opt is off) is the common path and
+%% returns `Req` untouched — no resolution, no added field. A resolution that
+%% yields `undefined` (unknown peer) is also left off so `client_ip` stays a
+%% concrete `inet:ip_address()`; `roadrunner_req:client_ip/1` falls back to the
+%% peer in that case.
+-doc false.
+-spec maybe_put_client_ip(
+    undefined | roadrunner_real_ip:config(),
+    roadrunner_req:request(),
+    {inet:ip_address(), inet:port_number()} | undefined
+) -> roadrunner_req:request().
+maybe_put_client_ip(undefined, Req, _Peer) ->
+    Req;
+maybe_put_client_ip(Cfg, #{headers := Headers} = Req, Peer) ->
+    case roadrunner_real_ip:resolve(Cfg, Peer, Headers) of
+        undefined -> Req;
+        IP -> Req#{client_ip => IP}
+    end.
 
 -doc """
 Per-peer token-bucket check, the per-source sibling of
