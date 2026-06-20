@@ -118,6 +118,69 @@ h2c_second_stream_is_rate_limited_test() ->
         ?assert(lists:member(~"429", Statuses))
     end).
 
+%% =============================================================================
+%% Per-route rate-limit overrides (HTTP/1 end-to-end).
+%% =============================================================================
+
+per_route_only_limits_one_route_test() ->
+    %% No listener-global limit; only `/login` is throttled. `/login` 429s on the
+    %% second request while `/` (no per-route limit) stays open.
+    Routes = [
+        #{
+            path => ~"/login",
+            handler => roadrunner_hello_handler,
+            rate_limit => #{rate => 1, burst => 1}
+        },
+        #{path => ~"/", handler => roadrunner_hello_handler}
+    ],
+    with_route_listener(Routes, undefined, fun(Port) ->
+        ?assertMatch(<<"HTTP/1.1 200", _/binary>>, h1_get(Port, ~"/login")),
+        ?assertMatch(<<"HTTP/1.1 429", _/binary>>, h1_get(Port, ~"/login")),
+        ?assertMatch(<<"HTTP/1.1 200", _/binary>>, h1_get(Port, ~"/")),
+        ?assertMatch(<<"HTTP/1.1 200", _/binary>>, h1_get(Port, ~"/"))
+    end).
+
+per_route_overrides_global_test() ->
+    %% A generous global limit with a stricter per-route override: `/login` 429s
+    %% on its second request (route limit 1), `/` rides the generous global.
+    Routes = [
+        #{
+            path => ~"/login",
+            handler => roadrunner_hello_handler,
+            rate_limit => #{rate => 1, burst => 1}
+        },
+        #{path => ~"/", handler => roadrunner_hello_handler}
+    ],
+    with_route_listener(Routes, #{rate => 1000, burst => 1000}, fun(Port) ->
+        ?assertMatch(<<"HTTP/1.1 200", _/binary>>, h1_get(Port, ~"/login")),
+        ?assertMatch(<<"HTTP/1.1 429", _/binary>>, h1_get(Port, ~"/login")),
+        ?assertMatch(<<"HTTP/1.1 200", _/binary>>, h1_get(Port, ~"/")),
+        ?assertMatch(<<"HTTP/1.1 200", _/binary>>, h1_get(Port, ~"/"))
+    end).
+
+per_route_unmatched_path_uses_global_test() ->
+    %% A path with no per-route limit falls back to the global limit.
+    Routes = [
+        #{
+            path => ~"/login",
+            handler => roadrunner_hello_handler,
+            rate_limit => #{rate => 1, burst => 1}
+        },
+        #{path => ~"/open", handler => roadrunner_hello_handler}
+    ],
+    with_route_listener(Routes, #{rate => 1, burst => 1}, fun(Port) ->
+        ?assertMatch(<<"HTTP/1.1 200", _/binary>>, h1_get(Port, ~"/open")),
+        ?assertMatch(<<"HTTP/1.1 429", _/binary>>, h1_get(Port, ~"/open"))
+    end).
+
+per_route_invalid_config_rejected_test() ->
+    process_flag(trap_exit, true),
+    Routes = [#{path => ~"/x", handler => roadrunner_hello_handler, rate_limit => #{rate => 0}}],
+    R = roadrunner_listener:start_link(unique(rl_bad_route), #{
+        port => 0, protocols => [http1], routes => Routes
+    }),
+    ?assertMatch({error, {{invalid_rate_limit, _}, _}}, R).
+
 %% --- helpers ---
 
 start(Name, Protocols, RateLimit) ->
@@ -144,8 +207,31 @@ with_listener(Protocols, RateLimit, Fun) ->
         ok = roadrunner_listener:stop(Name)
     end.
 
+with_route_listener(Routes, RateLimit, Fun) ->
+    Name = unique(rl_route_it),
+    Base = #{port => 0, protocols => [http1], routes => Routes},
+    Opts =
+        case RateLimit of
+            undefined -> Base;
+            _ -> Base#{rate_limit => RateLimit}
+        end,
+    {ok, _} = roadrunner_listener:start_link(Name, Opts),
+    Port = roadrunner_listener:port(Name),
+    try
+        Fun(Port)
+    after
+        ok = roadrunner_listener:stop(Name)
+    end.
+
 unique(Prefix) ->
     list_to_atom(atom_to_list(Prefix) ++ "_" ++ integer_to_list(erlang:unique_integer([positive]))).
+
+h1_get(Port, Path) ->
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Sock, [~"GET ", Path, ~" HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"]),
+    Reply = recv_for(Sock, <<>>, 1000),
+    ok = gen_tcp:close(Sock),
+    Reply.
 
 h1_request(Port) ->
     {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),

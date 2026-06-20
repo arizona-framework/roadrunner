@@ -642,3 +642,67 @@ match_no_pipeline(Method, Path, Compiled) ->
 
 empty_req() ->
     #{method => ~"GET", target => ~"/", version => {1, 1}, headers => []}.
+
+%% =============================================================================
+%% compile_rate_limits/1 + match_rate_limit/3 — per-route rate-limit overrides
+%% =============================================================================
+
+rate_limits_none_is_undefined_test() ->
+    %% No route declares a rate_limit → undefined (the gate skips the lookup).
+    ?assertEqual(
+        undefined,
+        roadrunner_router:compile_rate_limits([{~"/", h}, #{path => ~"/x", handler => h}])
+    ).
+
+rate_limits_match_hit_test() ->
+    Limits = roadrunner_router:compile_rate_limits([
+        #{path => ~"/login", handler => h, rate_limit => #{rate => 1}}
+    ]),
+    %% rate 1, burst/period default → {1, 1000, 1000}, keyed on the path binary.
+    ?assertEqual(
+        {1, 1000, 1000, ~"/login"},
+        roadrunner_router:match_rate_limit(~"POST", ~"/login", Limits)
+    ).
+
+rate_limits_match_miss_test() ->
+    Limits = roadrunner_router:compile_rate_limits([
+        #{path => ~"/login", handler => h, rate_limit => #{rate => 1}}
+    ]),
+    ?assertEqual(nomatch, roadrunner_router:match_rate_limit(~"GET", ~"/other", Limits)).
+
+rate_limits_undefined_subset_is_nomatch_test() ->
+    ?assertEqual(nomatch, roadrunner_router:match_rate_limit(~"GET", ~"/login", undefined)).
+
+rate_limits_method_specific_test() ->
+    %% A method allowlist scopes the override; other methods fall through.
+    Limits = roadrunner_router:compile_rate_limits([
+        #{path => ~"/login", handler => h, methods => [~"POST"], rate_limit => #{rate => 1}}
+    ]),
+    ?assertMatch(
+        {1, 1000, 1000, ~"/login"}, roadrunner_router:match_rate_limit(~"POST", ~"/login", Limits)
+    ),
+    ?assertEqual(nomatch, roadrunner_router:match_rate_limit(~"GET", ~"/login", Limits)).
+
+rate_limits_param_path_test() ->
+    Limits = roadrunner_router:compile_rate_limits([
+        #{path => ~"/users/:id", handler => h, rate_limit => #{rate => 5}}
+    ]),
+    ?assertMatch(
+        {5, 5000, 1000, ~"/users/:id"},
+        roadrunner_router:match_rate_limit(~"GET", ~"/users/42", Limits)
+    ).
+
+rate_limits_first_match_wins_test() ->
+    Limits = roadrunner_router:compile_rate_limits([
+        #{path => ~"/a", handler => h, rate_limit => #{rate => 1}},
+        #{path => ~"/a", handler => h, rate_limit => #{rate => 9}}
+    ]),
+    ?assertMatch({1, _, _, ~"/a"}, roadrunner_router:match_rate_limit(~"GET", ~"/a", Limits)).
+
+rate_limits_bad_config_raises_test() ->
+    ?assertError(
+        {invalid_rate_limit, _},
+        roadrunner_router:compile_rate_limits([
+            #{path => ~"/x", handler => h, rate_limit => #{rate => 0}}
+        ])
+    ).

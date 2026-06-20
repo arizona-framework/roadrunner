@@ -754,13 +754,11 @@ dispatch_phase(
 ) -> boolean().
 rate_limit_allows(undefined, _Socket, _ListenerName, _Req) ->
     true;
-rate_limit_allows({Rate, Cap, Cost, Table, Counter, KeySpec}, Socket, ListenerName, Req) ->
-    IP = roadrunner_conn:rate_limit_key(KeySpec, Req),
-    NowMs = erlang:monotonic_time(millisecond),
-    case roadrunner_conn:rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) of
+rate_limit_allows(RateLimit, Socket, ListenerName, Req) ->
+    case roadrunner_conn:rate_limit_apply(RateLimit, Req) of
         allow ->
             true;
-        {deny, RetryAfter} ->
+        {deny, RetryAfter, Counter} ->
             ok = roadrunner_conn:rate_limited_telemetry(ListenerName, Counter),
             _ = roadrunner_conn:send_rate_limited(Socket, RetryAfter),
             false

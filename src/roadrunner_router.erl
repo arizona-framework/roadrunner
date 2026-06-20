@@ -50,9 +50,9 @@ opaque `compiled()` shape is a list of pre-parsed segment patterns;
 swapping to a trie/DAG later is a non-breaking change for callers.
 """.
 
--export([compile/2, match/3]).
+-export([compile/2, match/3, compile_rate_limits/1, match_rate_limit/3]).
 
--export_type([route/0, routes/0, compiled/0, bindings/0, methods/0]).
+-export_type([route/0, routes/0, compiled/0, bindings/0, methods/0, route_rate_limits/0]).
 
 -doc """
 A single route entry. Three shapes are accepted:
@@ -79,7 +79,8 @@ unset → every method.
         handler := module(),
         state => term(),
         middlewares => roadrunner_middleware:middleware_list(),
-        methods => methods()
+        methods => methods(),
+        rate_limit => map()
     }.
 
 -doc """
@@ -137,6 +138,18 @@ opaque: the shape is an implementation detail and may change.
 -opaque compiled() :: [
     {[segment()], module(), roadrunner_middleware:next(), term(), method_lookup()}
 ].
+
+-doc """
+The compiled per-route `rate_limit` overrides `match_rate_limit/3` consumes: a
+path+method-keyed subset of the routes that declare a `rate_limit`, each with
+its pre-derived `{Rate, Cap, Cost}` unit triple and the route's path binary as
+the bucket-namespace key. `undefined` when no route declares one (so the gate
+pays nothing) — `roadrunner_conn` matches that to take its global-only fast
+path, so this is a plain (non-opaque) type.
+""".
+-type route_rate_limits() ::
+    [{[segment()], method_lookup(), {pos_integer(), pos_integer(), pos_integer()}, binary()}]
+    | undefined.
 
 -doc """
 Compile a list of routes into the lookup form `match/3` expects.
@@ -334,6 +347,72 @@ decode_segment(Segment) ->
     case roadrunner_uri:percent_decode(Segment) of
         {ok, Decoded} -> Decoded;
         {error, badarg} -> Segment
+    end.
+
+-doc """
+Compile the per-route `rate_limit` overrides out of a route list.
+
+Keeps only the map-form routes that carry a `rate_limit` key, pairing each
+route's compiled path + method allowlist with its pre-derived `{Rate, Cap, Cost}`
+triple (validated and derived by `roadrunner_rate_limit`) and its path binary
+(the bucket-namespace key). Returns `undefined` when no route declares one, so
+the caller can bake an absent subset and skip the lookup entirely. Raises
+`{invalid_rate_limit, Opts}` (from the config compiler) on a bad per-route
+config, at listener init.
+""".
+-spec compile_rate_limits(routes()) -> route_rate_limits().
+compile_rate_limits(Routes) when is_list(Routes) ->
+    case [compile_rate_limit(R) || R <- Routes, is_rate_limited(R)] of
+        [] -> undefined;
+        Limits -> Limits
+    end.
+
+-spec is_rate_limited(route()) -> boolean().
+is_rate_limited(#{rate_limit := _}) -> true;
+is_rate_limited(_) -> false.
+
+-spec compile_rate_limit(map()) ->
+    {[segment()], method_lookup(), {pos_integer(), pos_integer(), pos_integer()}, binary()}.
+compile_rate_limit(#{path := Path, rate_limit := Opts} = Route) when is_binary(Path) ->
+    {
+        compile_path(Path),
+        compile_methods(maps:get(methods, Route, undefined)),
+        roadrunner_rate_limit:compile_route_config(Opts),
+        Path
+    }.
+
+-doc """
+Find the per-route `rate_limit` for a request method + path, or `nomatch`.
+
+First-match-wins over the compiled subset (declaration order), reusing the same
+path + method matchers as `match/3`. A path-match whose method is not in the
+route's allowlist keeps scanning, so a per-route limit only applies to the
+methods that route declares; an exhausted scan returns `nomatch` and the caller
+falls back to the listener-global limit.
+""".
+-spec match_rate_limit(binary(), binary(), route_rate_limits()) ->
+    {pos_integer(), pos_integer(), pos_integer(), binary()} | nomatch.
+match_rate_limit(_Method, _Path, undefined) ->
+    nomatch;
+match_rate_limit(Method, Path, Limits) when is_binary(Method), is_binary(Path) ->
+    match_rate_limit_1(Method, path_segments(Path), Limits).
+
+-spec match_rate_limit_1(binary(), [binary()], [tuple()]) ->
+    {pos_integer(), pos_integer(), pos_integer(), binary()} | nomatch.
+match_rate_limit_1(_Method, _Segments, []) ->
+    nomatch;
+match_rate_limit_1(Method, Segments, [{Pattern, Methods, Units, Key} | Rest]) ->
+    case match_pattern(Pattern, Segments, #{}) of
+        no_match ->
+            match_rate_limit_1(Method, Segments, Rest);
+        _Bindings ->
+            case method_allowed(Method, Methods) of
+                true ->
+                    {Rate, Cap, Cost} = Units,
+                    {Rate, Cap, Cost, Key};
+                false ->
+                    match_rate_limit_1(Method, Segments, Rest)
+            end
     end.
 
 -spec path_segments(binary()) -> [binary()].

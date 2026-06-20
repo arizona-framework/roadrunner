@@ -467,6 +467,26 @@ demonstrate the pattern they want. The single-route equality check
 is the wrong model for catch-all routes (`/api/*path`) that
 multiplex methods downstream.
 
+### Per-route `max_body => non_neg_integer()` body-size override — medium
+
+**What:** A per-route override of the listener-global `max_content_length`, so an
+endpoint can cap its body tighter than the default (e.g. `/login` at 64 KB while
+the listener allows 10 MB). The per-route `rate_limit` override already ships;
+this is its body-size sibling.
+
+**Why harder than `rate_limit`:** `max_content_length` is enforced *during* body
+read/accumulation in all three protocols, which runs *before* the route is
+resolved today. The path is known right after headers, so the fix is early route
+resolution at headers-complete (gated on any route declaring `max_body`, to keep
+the common path unchanged), caching the matched route to reuse at dispatch: H1
+resolves before the body-read phase and passes the route's limit to the existing
+body reader (reusing the oversized-body drain + 413 path); H2/H3 store the
+effective limit on the stream entry and enforce it in the DATA-accumulation size
+check.
+
+**Scope:** medium. The early-route-match plumbing is the bulk; the limit
+enforcement reuses the existing oversized-body paths.
+
 ### Nested route groups with shared prefix + middlewares — medium
 
 **What:** Phoenix-style scope / pipeline:

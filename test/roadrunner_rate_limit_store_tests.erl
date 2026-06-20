@@ -55,9 +55,10 @@ resolve_off_without_peer_test() ->
 resolve_on_test() ->
     Table = new_table(),
     {Counter, Opts} = proto_opts_with_counter(Table),
-    %% rate 10, burst 20, period 30 → Cost 30000, Cap 600000 baked in.
+    %% rate 10, burst 20, period 30 → Cost 30000, Cap 600000 baked as the global
+    %% triple; no per-route subset (undefined); key is the peer IP.
     ?assertEqual(
-        {10, 600000, 30000, Table, Counter, ?IP},
+        {{10, 600000, 30000}, undefined, Table, Counter, ?IP},
         ?M:resolve_rate_limit(Opts, {?IP, 5000}, undefined)
     ).
 
@@ -69,7 +70,7 @@ resolve_on_with_trusted_peer_keys_per_request_test() ->
     {Counter, Opts} = proto_opts_with_counter(Table, RealIp),
     Prepared = roadrunner_real_ip:prepare(RealIp, {?IP, 5000}),
     ?assertEqual(
-        {10, 600000, 30000, Table, Counter, client_ip},
+        {{10, 600000, 30000}, undefined, Table, Counter, client_ip},
         ?M:resolve_rate_limit(Opts, {?IP, 5000}, Prepared)
     ).
 
@@ -83,7 +84,7 @@ resolve_on_with_untrusted_peer_bakes_the_key_test() ->
     {Counter, Opts} = proto_opts_with_counter(Table, RealIp),
     Prepared = roadrunner_real_ip:prepare(RealIp, {Peer, 5000}),
     ?assertEqual(
-        {10, 600000, 30000, Table, Counter, Peer},
+        {{10, 600000, 30000}, undefined, Table, Counter, Peer},
         ?M:resolve_rate_limit(Opts, {Peer, 5000}, Prepared)
     ).
 
@@ -106,8 +107,65 @@ resolve_on_without_optional_keys_test() ->
         rate_limited_counter => Counter
     },
     ?assertEqual(
-        {10, 600000, 30000, Table, Counter, ?IP},
+        {{10, 600000, 30000}, undefined, Table, Counter, ?IP},
         ?M:resolve_rate_limit(Opts, {?IP, 5000}, undefined)
+    ).
+
+%% --- rate_limit_lookup/2 ---
+
+lookup_undefined_skips_test() ->
+    ?assertEqual(skip, ?M:rate_limit_lookup(undefined, req(~"GET", ~"/x"))).
+
+lookup_global_only_test() ->
+    Table = new_table(),
+    Counter = atomics:new(1, [{signed, false}]),
+    State = {{10, 600000, 30000}, undefined, Table, Counter, ?IP},
+    ?assertEqual(
+        {check, Table, ?IP, 10, 600000, 30000, Counter},
+        ?M:rate_limit_lookup(State, req(~"GET", ~"/x"))
+    ).
+
+lookup_per_route_hit_keys_on_route_and_ip_test() ->
+    Table = new_table(),
+    Counter = atomics:new(1, [{signed, false}]),
+    Routes = roadrunner_router:compile_rate_limits([
+        #{path => ~"/login", handler => h, rate_limit => #{rate => 1}}
+    ]),
+    State = {{10, 600000, 30000}, Routes, Table, Counter, ?IP},
+    ?assertEqual(
+        {check, Table, {~"/login", ?IP}, 1, 1000, 1000, Counter},
+        ?M:rate_limit_lookup(State, req(~"POST", ~"/login"))
+    ).
+
+lookup_per_route_miss_falls_back_to_global_test() ->
+    Table = new_table(),
+    Counter = atomics:new(1, [{signed, false}]),
+    Routes = roadrunner_router:compile_rate_limits([
+        #{path => ~"/login", handler => h, rate_limit => #{rate => 1}}
+    ]),
+    State = {{10, 600000, 30000}, Routes, Table, Counter, ?IP},
+    ?assertEqual(
+        {check, Table, ?IP, 10, 600000, 30000, Counter},
+        ?M:rate_limit_lookup(State, req(~"GET", ~"/other"))
+    ).
+
+lookup_per_route_only_miss_skips_test() ->
+    Table = new_table(),
+    Counter = atomics:new(1, [{signed, false}]),
+    Routes = roadrunner_router:compile_rate_limits([
+        #{path => ~"/login", handler => h, rate_limit => #{rate => 1}}
+    ]),
+    State = {undefined, Routes, Table, Counter, ?IP},
+    ?assertEqual(skip, ?M:rate_limit_lookup(State, req(~"GET", ~"/other"))).
+
+lookup_resolves_client_ip_marker_test() ->
+    Table = new_table(),
+    Counter = atomics:new(1, [{signed, false}]),
+    State = {{10, 600000, 30000}, undefined, Table, Counter, client_ip},
+    Req = (req(~"GET", ~"/x"))#{client_ip => {203, 0, 113, 7}},
+    ?assertEqual(
+        {check, Table, {203, 0, 113, 7}, 10, 600000, 30000, Counter},
+        ?M:rate_limit_lookup(State, Req)
     ).
 
 %% --- rate_limit_key/2 ---
@@ -143,6 +201,16 @@ evicts_only_idle_rows_test() ->
 evict_empty_table_test() ->
     Table = new_table(),
     ?assertEqual(0, ?M:rate_limit_evict_idle(Table, 2000, 1500)).
+
+evicts_composite_route_keys_test() ->
+    %% Per-route buckets are keyed `{RoutePath, IP}`; the sweep matches on the
+    %% timestamp (element 3), so composite-keyed rows evict like bare-IP ones.
+    Table = new_table(),
+    true = ets:insert(Table, {{~"/login", {1, 1, 1, 1}}, 5000, 0}),
+    true = ets:insert(Table, {{~"/login", {2, 2, 2, 2}}, 5000, 1000}),
+    ?assertEqual(1, ?M:rate_limit_evict_idle(Table, 2000, 1500)),
+    ?assertEqual([], ets:lookup(Table, {~"/login", {1, 1, 1, 1}})),
+    ?assertMatch([{{~"/login", {2, 2, 2, 2}}, _, _}], ets:lookup(Table, {~"/login", {2, 2, 2, 2}})).
 
 evict_clears_all_idle_in_one_pass_test() ->
     Table = new_table(),
@@ -181,7 +249,8 @@ proto_opts(RateLimit) ->
     #{
         rate_limit => Cfg,
         rate_limited_counter => atomics:new(1, [{signed, false}]),
-        real_ip => undefined
+        real_ip => undefined,
+        listener_name => rate_limit_store_test
     }.
 
 proto_opts_with_counter(Table) ->
@@ -199,5 +268,11 @@ proto_opts_with_counter(Table, RealIp) ->
             table => Table
         },
         rate_limited_counter => Counter,
-        real_ip => RealIp
+        real_ip => RealIp,
+        listener_name => rate_limit_store_test
     }}.
+
+%% A minimal request map for `rate_limit_lookup/2` (needs only method + path,
+%% plus `client_ip` when exercising the marker key).
+req(Method, Path) ->
+    #{method => Method, path => Path, headers => []}.

@@ -918,9 +918,24 @@ publish_routes(ListenerName, #{routes := Routes} = Opts) when is_list(Routes) ->
     persistent_term:put(
         {roadrunner_routes, ListenerName},
         roadrunner_router:compile(Routes, ListenerMws)
-    );
+    ),
+    publish_rate_limit_routes(ListenerName, Routes);
 publish_routes(_ListenerName, _Opts) ->
     ok.
+
+%% Publish the compiled per-route `rate_limit` subset (or remove the entry when
+%% none), read per-connection by `roadrunner_conn:resolve_rate_limit/2`. Kept
+%% symmetric with the routes pterm so `reload_routes/2` updates both.
+-spec publish_rate_limit_routes(atom(), roadrunner_router:routes()) -> ok.
+publish_rate_limit_routes(ListenerName, Routes) ->
+    Key = {roadrunner_rate_limit_routes, ListenerName},
+    case roadrunner_router:compile_rate_limits(Routes) of
+        undefined ->
+            _ = persistent_term:erase(Key),
+            ok;
+        Limits ->
+            persistent_term:put(Key, Limits)
+    end.
 
 %% Recover the registered name we were started with. `start_link/2` always
 %% calls `gen_server:start_link({local, Name}, ...)` so the name is set
@@ -1073,7 +1088,12 @@ build_proto_opts(Opts, ListenerName) ->
     %% `info/1` surfaces it as 0 when the guard is off); the per-peer bucket
     %% store is created only when `rate_limit` is configured.
     RateLimitedCounter = atomics:new(1, [{signed, false}]),
-    RateLimit = build_rate_limit(maps:get(rate_limit, Opts, undefined)),
+    %% Per-route `rate_limit` overrides are published to persistent_term by
+    %% `publish_routes/2` (called just before this); their presence forces the
+    %% bucket table even when there is no listener-global `rate_limit`.
+    HasPerRouteRateLimit =
+        persistent_term:get({roadrunner_rate_limit_routes, ListenerName}, undefined) =/= undefined,
+    RateLimit = build_rate_limit(maps:get(rate_limit, Opts, undefined), HasPerRouteRateLimit),
     %% Public `ws` opts are a nested map; flatten to the `ws_*`
     %% proto_opts keys the hot path reads, mirroring the `{http2, #{}}`
     %% → `http2_*` flattening above.
@@ -1517,25 +1537,33 @@ validate_ws_opts(Opts) when is_map(Opts) ->
 validate_ws_opts(Other) ->
     error({invalid_listener_opt, ws, Other}).
 
-%% Validate the `rate_limit` opt and, when set, create its per-listener ETS
-%% bucket store. `undefined` (the default) skips the guard entirely.
--spec build_rate_limit(term()) -> undefined | roadrunner_conn:rate_limit().
-build_rate_limit(RawOpt) ->
-    case validate_rate_limit(RawOpt) of
-        undefined ->
+%% Validate the listener-global `rate_limit` opt and, when rate limiting is
+%% active (a global opt OR any per-route override, `HasPerRoute`), create the
+%% shared per-listener ETS bucket store. `undefined` (no global, no per-route)
+%% skips the guard entirely. When only per-route limits exist there is no global
+%% `rate`/`burst`/`period` — the map carries just the table + default eviction
+%% policy, and `roadrunner_conn:resolve_rate_limit/2` keys on the matched route.
+-spec build_rate_limit(term(), boolean()) -> undefined | roadrunner_conn:rate_limit().
+build_rate_limit(RawOpt, HasPerRoute) ->
+    case {validate_rate_limit(RawOpt), HasPerRoute} of
+        {undefined, false} ->
             undefined;
-        Config ->
-            %% Anonymous public table, one per listener, owned by this
-            %% gen_server so it dies with the listener. `write_concurrency, auto`
-            %% adapts the lock count to load (matching the QUIC CID registry);
-            %% no `read_concurrency` — each request reads then writes the same
-            %% key (interleaved RMW), the one pattern it would slow down.
-            Config#{
-                table => ets:new(roadrunner_rate_limit, [
-                    set, public, {write_concurrency, auto}
-                ])
-            }
+        {undefined, true} ->
+            #{table => new_rate_limit_table(), idle_ttl => 60000, sweep_interval => 10000};
+        {Config, _} ->
+            Config#{table => new_rate_limit_table()}
     end.
+
+%% Anonymous public table, one per listener, owned by this gen_server so it dies
+%% with the listener. `write_concurrency, auto` adapts the lock count to load
+%% (matching the QUIC CID registry); no `read_concurrency` — each request reads
+%% then writes the same key (interleaved RMW), the one pattern it would slow
+%% down. Rows are `{Key, Units, LastMs}` where `Key` is the client IP, or
+%% `{RoutePath, ClientIP}` for a per-route bucket — the check and eviction treat
+%% the key opaquely, so both shapes share the table.
+-spec new_rate_limit_table() -> ets:table().
+new_rate_limit_table() ->
+    ets:new(roadrunner_rate_limit, [set, public, {write_concurrency, auto}]).
 
 -spec validate_rate_limit(term()) ->
     undefined
@@ -1673,6 +1701,7 @@ do_reload_routes(
         {roadrunner_routes, Name},
         roadrunner_router:compile(Routes, ListenerMws)
     ),
+    ok = publish_rate_limit_routes(Name, Routes),
     ok;
 do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _, _}}}, _Routes) ->
     {error, no_routes}.
