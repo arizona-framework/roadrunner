@@ -800,7 +800,7 @@ dispatch_decoded(
             reset_and_drop(State1, StreamId, ?H3_MESSAGE_ERROR);
         {ok, Req0} ->
             Req = roadrunner_conn:maybe_put_client_ip(RealIp, Req0, Peer),
-            case rate_limit_refused(State1, StreamId) of
+            case rate_limit_refused(State1, StreamId, Req) of
                 {refused, State2} ->
                     %% Per-peer rate exceeded: 429 + Retry-After sent, stream
                     %% dropped. 429 (not H3_REQUEST_REJECTED) so the client backs
@@ -890,17 +890,20 @@ throttle_stream(#h3{proto_opts = #{throttled_counter := Counter}, listener_name 
 %% H3_REQUEST_REJECTED) so the client honors `Retry-After` instead of retrying
 %% the request immediately. The guard being off (`undefined`) or a missing peer
 %% IP proceeds.
--spec rate_limit_refused(#h3{}, non_neg_integer()) -> ok | {refused, #h3{}}.
-rate_limit_refused(#h3{rate_limit = undefined}, _StreamId) ->
+-spec rate_limit_refused(#h3{}, non_neg_integer(), roadrunner_req:request()) ->
+    ok | {refused, #h3{}}.
+rate_limit_refused(#h3{rate_limit = undefined}, _StreamId, _Req) ->
     ok;
 rate_limit_refused(
     #h3{
-        rate_limit = {Rate, Cap, Cost, Table, Counter, IP},
+        rate_limit = {Rate, Cap, Cost, Table, Counter, KeySpec},
         conn = Conn,
         listener_name = ListenerName
     } = State,
-    StreamId
+    StreamId,
+    Req
 ) ->
+    IP = roadrunner_conn:rate_limit_key(KeySpec, Req),
     NowMs = erlang:monotonic_time(millisecond),
     case roadrunner_conn:rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) of
         allow ->

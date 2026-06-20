@@ -60,6 +60,28 @@ resolve_on_test() ->
         {10, 600000, 30000, Table, Counter, ?IP}, ?M:resolve_rate_limit(Opts, {?IP, 5000})
     ).
 
+resolve_on_with_real_ip_keys_per_request_test() ->
+    %% With `real_ip` set, the baked key is the `client_ip` marker, not the peer:
+    %% the bucket keys on the per-request resolved client IP.
+    Table = new_table(),
+    RealIp = roadrunner_real_ip:compile(#{trusted_proxies => [~"127.0.0.1/32"]}),
+    {Counter, Opts} = proto_opts_with_counter(Table, RealIp),
+    ?assertEqual(
+        {10, 600000, 30000, Table, Counter, client_ip},
+        ?M:resolve_rate_limit(Opts, {?IP, 5000})
+    ).
+
+%% --- rate_limit_key/2 ---
+
+rate_limit_key_baked_ip_test() ->
+    ?assertEqual(?IP, ?M:rate_limit_key(?IP, #{headers => []})).
+
+rate_limit_key_marker_reads_client_ip_test() ->
+    ?assertEqual(
+        {203, 0, 113, 7},
+        ?M:rate_limit_key(client_ip, #{client_ip => {203, 0, 113, 7}})
+    ).
+
 %% --- rate_limited_telemetry/2 ---
 
 telemetry_bumps_counter_test() ->
@@ -119,10 +141,14 @@ proto_opts(RateLimit) ->
         end,
     #{
         rate_limit => Cfg,
-        rate_limited_counter => atomics:new(1, [{signed, false}])
+        rate_limited_counter => atomics:new(1, [{signed, false}]),
+        real_ip => undefined
     }.
 
 proto_opts_with_counter(Table) ->
+    proto_opts_with_counter(Table, undefined).
+
+proto_opts_with_counter(Table, RealIp) ->
     Counter = atomics:new(1, [{signed, false}]),
     {Counter, #{
         rate_limit => #{
@@ -133,5 +159,6 @@ proto_opts_with_counter(Table) ->
             sweep_interval => 10000,
             table => Table
         },
-        rate_limited_counter => Counter
+        rate_limited_counter => Counter,
+        real_ip => RealIp
     }}.

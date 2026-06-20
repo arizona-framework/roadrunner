@@ -514,6 +514,23 @@ undercuts the saving. Wants a real large-body-flood driver before taking it on.
 **Scope:** small code, but the RST-delivery hazard makes the current post-body
 placement the safer default.
 
+### Trusted `Forwarded` (RFC 7239) real-IP resolution — small
+
+**What:** The `real_ip` opt resolves the client from a bare-IP, comma-separated
+header (`X-Forwarded-For` and friends) against the `trusted_proxies` allow-list.
+Extend the trusted recursive walk to the RFC 7239 `Forwarded` header, parsing
+each element's `for=` identifier (quoted IPv6, optional `:port`, and the
+obfuscated/`unknown` forms).
+
+**Why deferred:** `X-Forwarded-For` and single-value headers
+(`X-Real-IP`, `CF-Connecting-IP`) cover nginx, Cloudflare, ALB, and GCP; the
+RFC 7239 grammar is a meaningfully larger parse for a header rarely emitted for
+real-IP. `roadrunner_req:forwarded_for/1` already exposes the leftmost
+`Forwarded`/`X-Forwarded-For` value untrusted for callers who want it.
+
+**Scope:** small. Per-element `for=` parsing on top of the existing
+`roadrunner_real_ip` walk; the trust model and CIDR matching are unchanged.
+
 ### Graceful load-shedding — small-medium
 
 **What:** Turn the hard `max_clients` / `max_concurrent_requests` caps

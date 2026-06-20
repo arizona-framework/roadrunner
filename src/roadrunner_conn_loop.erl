@@ -719,7 +719,7 @@ dispatch_phase(
     } = S,
     Req
 ) ->
-    case rate_limit_allows(RateLimit, Socket, ListenerName) of
+    case rate_limit_allows(RateLimit, Socket, ListenerName, Req) of
         true ->
             case roadrunner_conn:resolve_handler(Dispatch, Req) of
                 {ok, Handler, Bindings, Pipeline, _State} ->
@@ -745,11 +745,13 @@ dispatch_phase(
 -spec rate_limit_allows(
     roadrunner_conn:rate_limit_state(),
     roadrunner_transport:socket(),
-    atom()
+    atom(),
+    roadrunner_req:request()
 ) -> boolean().
-rate_limit_allows(undefined, _Socket, _ListenerName) ->
+rate_limit_allows(undefined, _Socket, _ListenerName, _Req) ->
     true;
-rate_limit_allows({Rate, Cap, Cost, Table, Counter, IP}, Socket, ListenerName) ->
+rate_limit_allows({Rate, Cap, Cost, Table, Counter, KeySpec}, Socket, ListenerName, Req) ->
+    IP = roadrunner_conn:rate_limit_key(KeySpec, Req),
     NowMs = erlang:monotonic_time(millisecond),
     case roadrunner_conn:rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) of
         allow ->

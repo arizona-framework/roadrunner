@@ -64,6 +64,34 @@ h1_recursive_skips_trusted_chain_test() ->
     end).
 
 %% =============================================================================
+%% Rate limiting keys on the resolved client IP (real_ip + rate_limit together).
+%% =============================================================================
+
+rate_limit_keys_per_resolved_ip_test() ->
+    %% rate 1/burst 1, loopback trusted. Two requests forwarding the same client
+    %% share a bucket (second refused); a different forwarded client gets its own.
+    with_rl_listener(#{trusted_proxies => [~"127.0.0.1/32"]}, #{rate => 1, burst => 1}, fun(Port) ->
+        ?assertMatch(<<"HTTP/1.1 200", _/binary>>, send(Port, ~"x-forwarded-for: 203.0.113.7\r\n")),
+        ?assertMatch(
+            <<"HTTP/1.1 429", _/binary>>, send(Port, ~"x-forwarded-for: 203.0.113.7\r\n")
+        ),
+        ?assertMatch(
+            <<"HTTP/1.1 200", _/binary>>, send(Port, ~"x-forwarded-for: 198.51.100.9\r\n")
+        )
+    end).
+
+rate_limit_untrusted_peer_shares_peer_bucket_test() ->
+    %% Loopback is untrusted, so the forwarded header is ignored and every
+    %% request keys on the socket peer — even distinct forwarded clients share
+    %% the one bucket, so the second is refused.
+    with_rl_listener(#{trusted_proxies => [~"10.0.0.0/8"]}, #{rate => 1, burst => 1}, fun(Port) ->
+        ?assertMatch(<<"HTTP/1.1 200", _/binary>>, send(Port, ~"x-forwarded-for: 203.0.113.7\r\n")),
+        ?assertMatch(
+            <<"HTTP/1.1 429", _/binary>>, send(Port, ~"x-forwarded-for: 198.51.100.9\r\n")
+        )
+    end).
+
+%% =============================================================================
 %% End-to-end resolution over HTTP/2 (h2c) — proves the multiplexed build path
 %% stashes the resolved client IP onto the request.
 %% =============================================================================
@@ -107,17 +135,38 @@ with_listener(Protocols, RealIp, Fun) ->
         ok = roadrunner_listener:stop(Name)
     end.
 
+with_rl_listener(RealIp, RateLimit, Fun) ->
+    Name = unique(ri_rl_it),
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        protocols => [http1],
+        real_ip => RealIp,
+        rate_limit => RateLimit,
+        routes => roadrunner_client_ip_handler
+    }),
+    Port = roadrunner_listener:port(Name),
+    try
+        Fun(Port)
+    after
+        ok = roadrunner_listener:stop(Name)
+    end.
+
 unique(Prefix) ->
     list_to_atom(atom_to_list(Prefix) ++ "_" ++ integer_to_list(erlang:unique_integer([positive]))).
 
-%% Send a GET with the given extra header lines and return the response body.
+%% Send a GET with the given extra header lines and return the resolved client
+%% IP the handler echoed (the response body).
 h1_client_ip(Port, ExtraHeaders) ->
+    body(send(Port, ExtraHeaders)).
+
+%% Send a GET with the given extra header lines and return the full response.
+send(Port, ExtraHeaders) ->
     {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
     Req = [~"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n", ExtraHeaders, ~"\r\n"],
     ok = gen_tcp:send(Sock, Req),
     Reply = recv_for(Sock, <<>>, 1000),
     ok = gen_tcp:close(Sock),
-    body(Reply).
+    Reply.
 
 body(Reply) ->
     case binary:split(Reply, ~"\r\n\r\n") of
