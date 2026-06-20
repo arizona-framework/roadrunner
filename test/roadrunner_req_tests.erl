@@ -32,6 +32,14 @@ path_no_query_test() ->
 path_with_query_test() ->
     ?assertEqual(~"/foo", roadrunner_req:path(sample_req_target(~"/foo?a=1&b=2"))).
 
+path_uses_stored_field_test() ->
+    %% When the h1 parser already sliced `path`, `path/1` reads it directly
+    %% (the O(1) fast clause) rather than re-splitting `target`.
+    ?assertEqual(
+        ~"/foo",
+        roadrunner_req:path(#{target => ~"/foo?a=1&b=2", path => ~"/foo"})
+    ).
+
 qs_no_query_test() ->
     ?assertEqual(~"", roadrunner_req:qs(sample_req_target(~"/foo"))).
 

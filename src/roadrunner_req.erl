@@ -41,6 +41,11 @@ care which protocol delivered the bytes.
 -type request() :: #{
     method := binary(),
     target := binary(),
+    %% The request target with any `?query` removed, sliced for free by the
+    %% h1 parser during target validation so `path/1` is an O(1) field read.
+    %% Absent on h2/h3 requests and on manually-built request maps, where
+    %% `path/1` falls back to splitting `target` on `?`.
+    path => binary(),
     version := version(),
     headers := headers(),
     %% H1-parser internal optimization — handlers should ignore.
@@ -208,7 +213,11 @@ are returned. The path is **not** percent-decoded — that's the
 router's job.
 """.
 -spec path(request()) -> binary().
+path(#{path := P}) ->
+    %% Fast path: the h1 parser sliced the `?`-free path at validation time.
+    P;
 path(#{target := T}) ->
+    %% Fallback for h2/h3 and manually-built maps that carry no `path`.
     case binary:split(T, persistent_term:get(?QMARK_CP_KEY)) of
         [P, _Q] -> P;
         [P] -> P

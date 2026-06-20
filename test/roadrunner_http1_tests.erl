@@ -476,6 +476,7 @@ request_full_test() ->
             #{
                 method => ~"GET",
                 target => ~"/foo",
+                path => ~"/foo",
                 version => {1, 1},
                 headers => [{~"host", ~"x"}],
                 cached_decisions => #{
@@ -508,6 +509,7 @@ request_http10_no_host_accepted_test() ->
             #{
                 method => ~"GET",
                 target => ~"/",
+                path => ~"/",
                 version => {1, 0},
                 headers => [],
                 cached_decisions => #{
@@ -530,6 +532,29 @@ request_http11_missing_host_returns_error_test() ->
     ?assertEqual(
         {error, missing_host},
         roadrunner_http1:parse_request(~"GET / HTTP/1.1\r\n\r\n")
+    ).
+
+request_query_sliced_into_path_test() ->
+    %% The parser slices the `?query` off into `path` while keeping the full
+    %% `target`, so `roadrunner_req:path/1` is an O(1) field read.
+    ?assertMatch(
+        {ok, #{target := ~"/foo?a=1&b=2", path := ~"/foo"}, ~""},
+        roadrunner_http1:parse_request(~"GET /foo?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n")
+    ).
+
+request_empty_query_keeps_path_test() ->
+    %% A trailing `?` with no query: path is the bytes before it, query empty.
+    ?assertMatch(
+        {ok, #{target := ~"/foo?", path := ~"/foo"}, ~""},
+        roadrunner_http1:parse_request(~"GET /foo? HTTP/1.1\r\nHost: x\r\n\r\n")
+    ).
+
+control_char_in_query_rejected_test() ->
+    %% Query bytes obey the same target char rules: a control char after the
+    %% `?` is still a malformed request-line.
+    ?assertEqual(
+        {error, bad_request_line},
+        roadrunner_http1:parse_request(~"GET /foo?a=\x{00} HTTP/1.1\r\nHost: x\r\n\r\n")
     ).
 
 cached_decisions_empty_for_empty_headers_test() ->
