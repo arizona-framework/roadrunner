@@ -990,19 +990,20 @@ telemetry_metadata(
         peer := Peer,
         method := Method,
         target := Target,
-        scheme := Scheme
-    } = Req
+        scheme := Scheme,
+        listener_name := ListenerName
+    }
 ) ->
-    %% Destructure the five always-present keys in one match instead of
-    %% a `maps:get/2` each (matching the h2/h3 builders); `listener_name`
-    %% keeps its defaulted lookup since it is optional in the request map.
+    %% Destructure the six always-present keys in one match instead of a
+    %% `maps:get` each (matching the h2/h3 builders). `listener_name` is
+    %% added by `handle_request_bytes/2` before dispatch, so it is present.
     #{
         request_id => RequestId,
         peer => Peer,
         method => Method,
         path => Target,
         scheme => Scheme,
-        listener_name => maps:get(listener_name, Req, undefined)
+        listener_name => ListenerName
     }.
 
 -spec rejection(#loop_state{}, atom()) -> ok.
