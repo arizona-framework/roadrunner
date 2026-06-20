@@ -25,6 +25,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     crash_500/1,
     interim_response_500/1,
     rate_limited/1,
+    per_route_body_limit_413/1,
     forbidden_response_header_stripped/1,
     unsafe_response_header_500/1,
     unsupported_shapes_501/1,
@@ -98,6 +99,7 @@ all() ->
         crash_500,
         interim_response_500,
         rate_limited,
+        per_route_body_limit_413,
         forbidden_response_header_stripped,
         unsafe_response_header_500,
         unsupported_shapes_501,
@@ -190,6 +192,7 @@ end_per_suite(_Config) ->
 init_per_testcase(Case, Config) when
     Case =:= not_found;
     Case =:= rate_limited;
+    Case =:= per_route_body_limit_413;
     Case =:= oversized_413;
     Case =:= protocols_tuple_form;
     Case =:= certfile_keyfile;
@@ -311,6 +314,27 @@ rate_limited(_Config) ->
         ?assertMatch({200, _}, status_body(get(Conn, ~"/"))),
         {429, Headers, _} = get(Conn, ~"/"),
         ?assertEqual(~"1", proplists:get_value(~"retry-after", Headers))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+per_route_body_limit_413(_Config) ->
+    %% Per-route `max_body` over h3: a body exceeding the matched route's cap is
+    %% answered 413 at dispatch (h3 decodes the path only there, so the global
+    %% cap bounds accumulation and this is a post-accumulation check); a body
+    %% under the cap reaches the handler.
+    Name = listener_name(per_route_body_limit_413),
+    Routes = [#{path => ~"/echo", handler => roadrunner_h3_test_handler, max_body => 10}],
+    {ok, _} = start_h3(Name, #{routes => Routes}),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        {ok, S1} = roadrunner_quic_test_h3:open_request(Conn, headers(~"POST", ~"/echo"), false),
+        ok = roadrunner_quic_test_h3:send_data(Conn, S1, binary:copy(<<"x">>, 20), true),
+        ?assertMatch({413, _, _}, collect(Conn, S1)),
+        {ok, S2} = roadrunner_quic_test_h3:open_request(Conn, headers(~"POST", ~"/echo"), false),
+        ok = roadrunner_quic_test_h3:send_data(Conn, S2, binary:copy(<<"x">>, 5), true),
+        ?assertMatch({200, _, _}, collect(Conn, S2))
     after
         close(Conn),
         roadrunner_listener:stop(Name)

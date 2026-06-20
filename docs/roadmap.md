@@ -472,25 +472,24 @@ to a path.
 `(listener_name, method, path)` is already enough to identify a
 route in dashboards; named lookup is a niceness, not a need.
 
-### Per-route `max_body => non_neg_integer()` body-size override — medium
+### Pre-read body-cap enforcement for per-route `max_body` on h2/h3 — medium
 
-**What:** A per-route override of the listener-global `max_content_length`, so an
-endpoint can cap its body tighter than the default (e.g. `/login` at 64 KB while
-the listener allows 10 MB). The per-route `rate_limit` override already ships;
-this is its body-size sibling.
+**What:** The per-route `max_body` override ships, but h2/h3 enforce it *after*
+the body is accumulated (a 413 at dispatch), not during. H1 already rejects
+before reading (it knows the path right after headers). For h2 the path is known
+at `finalize_headers` (before DATA), so the effective cap could move onto the
+stream entry and reject in `on_data` mid-accumulation. h3 decodes the QPACK
+header block only at dispatch today, so it needs an eager header decode at the
+HEADERS frame to know the path during DATA accumulation.
 
-**Why harder than `rate_limit`:** `max_content_length` is enforced *during* body
-read/accumulation in all three protocols, which runs *before* the route is
-resolved today. The path is known right after headers, so the fix is early route
-resolution at headers-complete (gated on any route declaring `max_body`, to keep
-the common path unchanged), caching the matched route to reuse at dispatch: H1
-resolves before the body-read phase and passes the route's limit to the existing
-body reader (reusing the oversized-body drain + 413 path); H2/H3 store the
-effective limit on the stream entry and enforce it in the DATA-accumulation size
-check.
+**Why deferred:** the global `max_content_length` already bounds what h2/h3
+accumulate, so the post-accumulation check is a correct tighter cap; reading up
+to the global before rejecting is an efficiency gap, not a correctness one, and
+matters only for direct (non-proxied) h2/h3 clients. The reverse-proxy path
+(nginx → h1) already gets pre-read rejection.
 
-**Scope:** medium. The early-route-match plumbing is the bulk; the limit
-enforcement reuses the existing oversized-body paths.
+**Scope:** medium. h2 is a stream-field + `on_data` change; h3 additionally
+needs eager QPACK decode at the HEADERS frame, threaded to dispatch.
 
 ### Nested route groups with shared prefix + middlewares — medium
 

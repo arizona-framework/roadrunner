@@ -919,7 +919,8 @@ publish_routes(ListenerName, #{routes := Routes} = Opts) when is_list(Routes) ->
         {roadrunner_routes, ListenerName},
         roadrunner_router:compile(Routes, ListenerMws)
     ),
-    publish_rate_limit_routes(ListenerName, Routes);
+    ok = publish_rate_limit_routes(ListenerName, Routes),
+    publish_body_limit_routes(ListenerName, Routes);
 publish_routes(_ListenerName, _Opts) ->
     ok.
 
@@ -930,6 +931,19 @@ publish_routes(_ListenerName, _Opts) ->
 publish_rate_limit_routes(ListenerName, Routes) ->
     Key = {roadrunner_rate_limit_routes, ListenerName},
     case roadrunner_router:compile_rate_limits(Routes) of
+        undefined ->
+            _ = persistent_term:erase(Key),
+            ok;
+        Limits ->
+            persistent_term:put(Key, Limits)
+    end.
+
+%% Publish the compiled per-route `max_body` subset (or remove it when none),
+%% read per-connection by the conn loops to resolve the effective body cap.
+-spec publish_body_limit_routes(atom(), roadrunner_router:routes()) -> ok.
+publish_body_limit_routes(ListenerName, Routes) ->
+    Key = {roadrunner_body_limit_routes, ListenerName},
+    case roadrunner_router:compile_body_limits(Routes) of
         undefined ->
             _ = persistent_term:erase(Key),
             ok;
@@ -1702,6 +1716,7 @@ do_reload_routes(
         roadrunner_router:compile(Routes, ListenerMws)
     ),
     ok = publish_rate_limit_routes(Name, Routes),
+    ok = publish_body_limit_routes(Name, Routes),
     ok;
 do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _, _}}}, _Routes) ->
     {error, no_routes}.

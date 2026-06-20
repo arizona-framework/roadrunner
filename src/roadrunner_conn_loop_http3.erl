@@ -151,7 +151,13 @@
     %% Compiled `real_ip` config cached from proto_opts at conn start
     %% (`undefined` when off). When set, `dispatch_decoded/4` resolves the
     %% client IP per request onto the request map.
-    real_ip = undefined :: roadrunner_real_ip:prepared()
+    real_ip = undefined :: roadrunner_real_ip:prepared(),
+    %% Per-route `max_body` subset cached from proto_opts at conn start
+    %% (`undefined` when no route declares one). When set, `dispatch_decoded/4`
+    %% answers 413 for a request whose body exceeds the matched route's cap (the
+    %% global `max_content_length` already bounded accumulation; h3 decodes the
+    %% header path only here, so the cap is a post-accumulation check).
+    body_limits = undefined :: roadrunner_router:route_body_limits()
 }).
 
 -doc """
@@ -218,7 +224,8 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
         max_concurrent_requests = maps:get(max_concurrent_requests, ProtoOpts, infinity),
         inflight_counter = maps:get(inflight_counter, ProtoOpts, undefined),
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer, RealIp),
-        real_ip = RealIp
+        real_ip = RealIp,
+        body_limits = roadrunner_conn:resolve_body_limits(ProtoOpts)
     }).
 
 -spec loop(#h3{}) -> ok.
@@ -779,9 +786,12 @@ respond_field_section_too_large(#h3{conn = Conn} = State, StreamId) ->
 dispatch_decoded(
     #h3{
         peer = Peer,
+        conn = Conn,
         listener_name = ListenerName,
         req_id_buffer = ReqIdBuffer,
-        real_ip = RealIp
+        real_ip = RealIp,
+        max_content_length = MaxCL,
+        body_limits = BodyLimits
     } = State,
     StreamId,
     Headers,
@@ -803,14 +813,32 @@ dispatch_decoded(
             reset_and_drop(State1, StreamId, ?H3_MESSAGE_ERROR);
         {ok, Req0} ->
             Req = roadrunner_conn:maybe_put_client_ip(RealIp, Req0),
-            case rate_limit_refused(State1, StreamId, Req) of
-                {refused, State2} ->
-                    %% Per-peer rate exceeded: 429 + Retry-After sent, stream
-                    %% dropped. 429 (not H3_REQUEST_REJECTED) so the client backs
-                    %% off per Retry-After instead of retrying immediately.
-                    State2;
-                ok ->
-                    dispatch_with_slot(State1, StreamId, Req)
+            case
+                BodyLimits =/= undefined andalso
+                    iolist_size(Body) > roadrunner_conn:effective_max_body(BodyLimits, Req, MaxCL)
+            of
+                true ->
+                    %% Per-route `max_body` exceeded: 413, stream dropped. The
+                    %% global cap already bounded accumulation; h3 decodes the
+                    %% header path only here, so this is a post-accumulation check.
+                    ok = roadrunner_http3_stream_worker:send_buffered(
+                        Conn,
+                        StreamId,
+                        413,
+                        [{~"content-type", ~"text/plain"}],
+                        ~"Payload Too Large"
+                    ),
+                    drop_stream(State1, StreamId);
+                false ->
+                    case rate_limit_refused(State1, StreamId, Req) of
+                        {refused, State2} ->
+                            %% Per-peer rate exceeded: 429 + Retry-After sent,
+                            %% stream dropped. 429 (not H3_REQUEST_REJECTED) so the
+                            %% client backs off per Retry-After instead of retrying.
+                            State2;
+                        ok ->
+                            dispatch_with_slot(State1, StreamId, Req)
+                    end
             end
     end.
 

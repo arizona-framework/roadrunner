@@ -70,6 +70,8 @@
     rate_limit_lookup/2,
     rate_limit_apply/2,
     resolve_rate_limit/3,
+    resolve_body_limits/1,
+    effective_max_body/3,
     maybe_put_client_ip/2,
     rate_limited_telemetry/2,
     rate_limit_evict_idle/3,
@@ -504,6 +506,36 @@ maybe_put_client_ip(undefined, Req) ->
     Req;
 maybe_put_client_ip(Prepared, #{headers := Headers} = Req) ->
     Req#{client_ip => roadrunner_real_ip:resolve(Prepared, Headers)}.
+
+%% Read the compiled per-route `max_body` subset for a listener (published by
+%% `roadrunner_listener`), or `undefined` when no route declares one. Read once
+%% per connection at setup and cached on the loop record.
+-doc false.
+-spec resolve_body_limits(proto_opts()) -> roadrunner_router:route_body_limits().
+resolve_body_limits(#{listener_name := ListenerName}) ->
+    persistent_term:get({roadrunner_body_limit_routes, ListenerName}, undefined);
+resolve_body_limits(_ProtoOpts) ->
+    undefined.
+
+%% Resolve the effective request-body cap: the per-route `max_body` when the
+%% request's method+path matches an override, else the listener-global
+%% `Global`. The `undefined` clause (no per-route caps) is the common path and
+%% returns `Global` without touching the request.
+-doc false.
+-spec effective_max_body(
+    roadrunner_router:route_body_limits(), roadrunner_req:request(), non_neg_integer()
+) -> non_neg_integer().
+effective_max_body(undefined, _Req, Global) ->
+    Global;
+effective_max_body(BodyLimits, Req, Global) ->
+    case
+        roadrunner_router:match_body_limit(
+            roadrunner_req:method(Req), roadrunner_req:path(Req), BodyLimits
+        )
+    of
+        nomatch -> Global;
+        MaxBody -> MaxBody
+    end.
 
 %% Resolve a rate-limit-state `Key` to the bucket IP. A baked `IP` keys on
 %% itself; the `client_ip` marker (the `real_ip` opt is set) keys on the

@@ -251,6 +251,11 @@
     %% (`undefined` when off). When set, `dispatch_stream/2` resolves the client
     %% IP per request onto the request map.
     real_ip = undefined :: roadrunner_real_ip:prepared(),
+    %% Per-route `max_body` subset cached from proto_opts at `enter/6`
+    %% (`undefined` when no route declares one). When set, `dispatch_stream/2`
+    %% answers 413 for a stream whose accumulated body exceeds the matched
+    %% route's cap (the global `max_content_length` already bounded accumulation).
+    body_limits = undefined :: roadrunner_router:route_body_limits(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -345,6 +350,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered) ->
         inflight_counter = InflightCounter,
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer, RealIp),
         real_ip = RealIp,
+        body_limits = roadrunner_conn:resolve_body_limits(ProtoOpts),
         handshake_timeout = HandshakeTimeout,
         idle_timeout = IdleTimeout
     },
@@ -1120,7 +1126,9 @@ dispatch_stream(
         listener_name = ListenerName,
         max_concurrent_requests = MaxConcReq,
         inflight_counter = InflightCounter,
-        real_ip = RealIp
+        real_ip = RealIp,
+        max_content_length = MaxCL,
+        body_limits = BodyLimits
     } = State
 ) ->
     #{
@@ -1148,42 +1156,37 @@ dispatch_stream(
                 {ok, Req0} ->
                     Req = roadrunner_conn:maybe_put_client_ip(RealIp, Req0),
                     StateBuf = State#loop{req_id_buffer = NewBuf},
-                    case rate_limit_refused(StateBuf, StreamId, Req) of
-                        {refused, State1} ->
-                            %% Per-peer rate exceeded: 429 + RST(no_error) sent,
-                            %% no worker spawned. 429 (not REFUSED_STREAM) so the
-                            %% client backs off per Retry-After instead of
-                            %% retrying the stream immediately.
-                            frame_loop(remove_stream(State1, StreamId));
-                        ok ->
-                            case
-                                roadrunner_conn:try_acquire_request_slot(
-                                    MaxConcReq, InflightCounter
-                                )
-                            of
-                                true ->
-                                    {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
-                                        self(), StreamId, Req, ProtoOpts
-                                    ),
-                                    Stream1 = Stream#{
-                                        worker_pid := WorkerPid,
-                                        worker_ref := MonRef,
-                                        state := half_closed_remote,
-                                        body := []
-                                    },
-                                    frame_loop(StateBuf#loop{
-                                        streams = Streams#{StreamId := Stream1},
-                                        worker_refs =
-                                            (StateBuf#loop.worker_refs)#{MonRef => StreamId}
-                                    });
-                                false ->
-                                    %% Listener-wide in-flight ceiling reached —
-                                    %% refuse with retry-safe REFUSED_STREAM, no
-                                    %% worker spawned.
-                                    ok = throttle_stream(StateBuf, ListenerName),
-                                    _ = send_rst_stream(StateBuf, StreamId, refused_stream),
-                                    frame_loop(remove_stream(StateBuf, StreamId))
-                            end
+                    case
+                        BodyLimits =/= undefined andalso
+                            BodyLen > roadrunner_conn:effective_max_body(BodyLimits, Req, MaxCL)
+                    of
+                        true ->
+                            %% Per-route `max_body` exceeded: 413 + RST(no_error),
+                            %% no worker. The global cap already bounded what was
+                            %% accumulated; this enforces the tighter route cap.
+                            Resp = ~"Payload Too Large",
+                            State413 = encode_and_send_response_atomic(
+                                StateBuf,
+                                StreamId,
+                                413,
+                                [{~"content-type", ~"text/plain"}],
+                                Resp,
+                                byte_size(Resp)
+                            ),
+                            _ = send_rst_stream(State413, StreamId, no_error),
+                            frame_loop(remove_stream(State413, StreamId));
+                        false ->
+                            dispatch_allowed_stream(
+                                StateBuf,
+                                StreamId,
+                                Req,
+                                Stream,
+                                Streams,
+                                ProtoOpts,
+                                MaxConcReq,
+                                InflightCounter,
+                                ListenerName
+                            )
                     end;
                 {error, _Reason} ->
                     _ = send_rst_stream(State, StreamId, protocol_error),
@@ -1194,6 +1197,55 @@ dispatch_stream(
             %% mismatch is a stream-error PROTOCOL_ERROR.
             _ = send_rst_stream(State, StreamId, protocol_error),
             frame_loop(remove_stream(State, StreamId))
+    end.
+
+%% A request that passed the body-size cap: run the per-peer rate-limit gate,
+%% then acquire the listener-wide in-flight slot and spawn the stream worker, or
+%% refuse (429 on rate, REFUSED_STREAM at the ceiling). No worker is spawned on a
+%% refusal.
+-spec dispatch_allowed_stream(
+    #loop{},
+    stream_id(),
+    roadrunner_req:request(),
+    stream_entry(),
+    #{stream_id() => stream_entry()},
+    roadrunner_conn:proto_opts(),
+    infinity | pos_integer(),
+    counters:counters_ref() | undefined,
+    atom()
+) -> no_return().
+dispatch_allowed_stream(
+    StateBuf, StreamId, Req, Stream, Streams, ProtoOpts, MaxConcReq, InflightCounter, ListenerName
+) ->
+    case rate_limit_refused(StateBuf, StreamId, Req) of
+        {refused, State1} ->
+            %% Per-peer rate exceeded: 429 + RST(no_error) sent, no worker
+            %% spawned. 429 (not REFUSED_STREAM) so the client backs off per
+            %% Retry-After instead of retrying the stream immediately.
+            frame_loop(remove_stream(State1, StreamId));
+        ok ->
+            case roadrunner_conn:try_acquire_request_slot(MaxConcReq, InflightCounter) of
+                true ->
+                    {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
+                        self(), StreamId, Req, ProtoOpts
+                    ),
+                    Stream1 = Stream#{
+                        worker_pid := WorkerPid,
+                        worker_ref := MonRef,
+                        state := half_closed_remote,
+                        body := []
+                    },
+                    frame_loop(StateBuf#loop{
+                        streams = Streams#{StreamId := Stream1},
+                        worker_refs = (StateBuf#loop.worker_refs)#{MonRef => StreamId}
+                    });
+                false ->
+                    %% Listener-wide in-flight ceiling reached — refuse with
+                    %% retry-safe REFUSED_STREAM, no worker spawned.
+                    ok = throttle_stream(StateBuf, ListenerName),
+                    _ = send_rst_stream(StateBuf, StreamId, refused_stream),
+                    frame_loop(remove_stream(StateBuf, StreamId))
+            end
     end.
 
 %% Verify that any client-supplied `content-length` header matches
