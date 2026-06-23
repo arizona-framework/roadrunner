@@ -1278,6 +1278,43 @@ sendfile_response_skips_body_for_head_method_test() ->
     persistent_term:erase({roadrunner_conn_loop_sendfile_handler, file}),
     file:delete(Path).
 
+sendfile_at_keep_alive_ceiling_signals_close_test() ->
+    %% RFC 9112 §9.6 — a sendfile response that trips
+    %% `max_keep_alive_requests` on an otherwise keep-alive connection must
+    %% carry `Connection: close`, even though the client never asked to
+    %% close. Mirrors the buffered ceiling case: `ensure_close_signaled/3`
+    %% routes both shapes through `with_close_if_last/3`.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Path = filename:join(["/tmp", "rr_conn_loop_sendfile_ceiling.txt"]),
+    ok = file:write_file(Path, ~"sendfile-content"),
+    persistent_term:put({roadrunner_conn_loop_sendfile_handler, file}, Path),
+    %% No client `Connection: close`: the count ceiling, not the client,
+    %% drives the close — exactly the server-initiated case under test.
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(sendf_ceiling))#{
+        max_keep_alive_requests := 1,
+        dispatch :=
+            {handler, roadrunner_conn_loop_sendfile_handler,
+                fun roadrunner_conn_loop_sendfile_handler:handle/1, undefined}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 200", _/binary>>, Sent),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"\r\nconnection: close\r\n")),
+    Sink ! stop,
+    persistent_term:erase({roadrunner_conn_loop_sendfile_handler, file}),
+    file:delete(Path).
+
 sendfile_dispatch_closes_socket_on_error_test() ->
     %% Sendfile responses honor keep-alive (per finishing_phase/3), so a
     %% mid-write failure would otherwise leave the conn idling for a

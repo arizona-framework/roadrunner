@@ -1082,6 +1082,9 @@ conn_loop_empty_push_emits_nothing_test_() ->
                 roadrunner_empty_push_test_conn ! stop,
                 Reply = recv_until_closed(Sock),
                 [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                %% A loop response always closes, so the server must signal it
+                %% (RFC 9112 §9.6) so a proxy stops reusing the connection.
+                ?assertNotEqual(nomatch, binary:match(Reply, ~"\r\nconnection: close\r\n")),
                 %% Empty push is no-op; only "hello" chunk + terminator.
                 ?assertEqual(~"5\r\nhello\r\n0\r\n\r\n", Body),
                 ok = gen_tcp:close(Sock)
@@ -1164,6 +1167,9 @@ conn_streams_chunked_response_test_() ->
                 Reply = recv_until_closed(Sock),
                 ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
                 {match, _} = re:run(Reply, ~"transfer-encoding: chunked", [caseless]),
+                %% A stream response always closes, so the server must say so
+                %% (RFC 9112 §9.6) or a proxy will try to reuse the connection.
+                ?assertNotEqual(nomatch, binary:match(Reply, ~"\r\nconnection: close\r\n")),
                 %% The chunk framing should land "hello world" in the body.
                 {match, _} = re:run(Reply, ~"hello"),
                 {match, _} = re:run(Reply, ~"world"),
@@ -1190,6 +1196,10 @@ conn_keep_alive_serves_two_requests_test_() ->
                 ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply1),
                 Reply2 = send_and_recv(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
                 ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply2),
+                %% Below the ceiling the connection is reused, so neither
+                %% response should carry `Connection: close`.
+                ?assertEqual(nomatch, binary:match(Reply1, ~"\r\nconnection: close\r\n")),
+                ?assertEqual(nomatch, binary:match(Reply2, ~"\r\nconnection: close\r\n")),
                 ok = gen_tcp:close(Sock)
             end}
         end}.
@@ -1205,13 +1215,18 @@ conn_keep_alive_count_limit_test_() ->
             roadrunner_listener:port(conn_test_ka_max)
         end,
         fun(_) -> ok = roadrunner_listener:stop(conn_test_ka_max) end, fun(Port) ->
-            {"max_keep_alive_requests=1 closes after first response", fun() ->
+            {"max_keep_alive_requests=1 sends Connection: close then closes", fun() ->
                 {ok, Sock} = gen_tcp:connect(
                     {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
                 ),
                 ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+                %% `recv_until_closed/1` returns only once the socket is closed,
+                %% so reaching this line already proves the server closed.
                 Reply = recv_until_closed(Sock),
                 ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                %% RFC 9112 §9.6: the ceiling-tripping response MUST tell the
+                %% client we are closing, so a fronting proxy stops reusing it.
+                ?assertNotEqual(nomatch, binary:match(Reply, ~"\r\nconnection: close\r\n")),
                 ok = gen_tcp:close(Sock)
             end}
         end}.

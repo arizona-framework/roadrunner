@@ -59,7 +59,11 @@ loop. Returns when the handler's `handle_info/3` returns `{stop, _}`.
     term()
 ) -> ok.
 run(Socket, Status, UserHeaders, Handler, State) ->
-    Headers = [{~"transfer-encoding", ~"chunked"} | UserHeaders],
+    %% A loop response always closes the connection (the conn loop force-
+    %% closes once this returns), so advertise it on the wire per RFC 9112
+    %% §9.6 — without it a fronting proxy treats the connection as reusable
+    %% and can race a request onto a socket we are about to drop.
+    Headers = [{~"transfer-encoding", ~"chunked"}, {~"connection", ~"close"} | UserHeaders],
     Head = roadrunner_http1:response(Status, Headers, ~""),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Head), loop_response_head
