@@ -735,19 +735,20 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
     Metadata = telemetry_metadata(Req),
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     try Pipeline(Req) of
-        {Response, Req2} when is_map(Req2) ->
-            _ = dispatch_response(S, Handler, Req2, Response),
+        {Response0, Req2} when is_map(Req2) ->
+            S2 = S#loop_state{requests_served = S#loop_state.requests_served + 1},
+            %% Decide keep-alive-vs-close BEFORE the response is sent so a
+            %% server-initiated close (count ceiling) lands on the wire as
+            %% `Connection: close` — see `ensure_close_signaled/3`.
+            Response = ensure_close_signaled(S2, Req2, Response0),
+            _ = dispatch_response(S2, Handler, Req2, Response),
             ok = roadrunner_telemetry:request_stop(
                 ReqStart,
                 Metadata,
                 roadrunner_conn:response_status(Response),
                 roadrunner_conn:response_kind(Response)
             ),
-            finishing_phase(
-                S#loop_state{requests_served = S#loop_state.requests_served + 1},
-                Req2,
-                Response
-            )
+            finishing_phase(S2, Req2, Response)
     catch
         Class:Reason:Stack ->
             ok = roadrunner_telemetry:request_exception(
@@ -762,6 +763,43 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
             }),
             _ = roadrunner_conn:send_internal_error(Socket),
             exit_normal(S)
+    end.
+
+%% RFC 9112 §9.6: a server that will not reuse the connection MUST signal it on
+%% the final response. The per-request keep-alive decision already reaches the
+%% wire whenever the client or handler set `Connection: close`; the gap is a
+%% *server-initiated* close the client cannot infer — reaching
+%% `max_keep_alive_requests` on a connection that was otherwise keep-alive. Add
+%% the header there (and only there) so a fronting proxy (nginx, ngrok) stops
+%% reusing a connection we are about to close, instead of racing a request onto
+%% it. Buffered + sendfile share Content-Length framing and are keep-alive
+%% eligible, so they get the header here. Websocket has already switched
+%% protocols (its 101 carried `Connection: Upgrade`), and stream / loop always
+%% force close in `finishing_phase` — none of the three runs through the
+%% request-count ceiling, so they pass through this helper untouched.
+-spec ensure_close_signaled(
+    #loop_state{}, roadrunner_req:request(), roadrunner_handler:response()
+) -> roadrunner_handler:response().
+ensure_close_signaled(S, Req, {Status, Headers, Body}) when is_integer(Status) ->
+    {Status, with_close_if_last(S, Req, Headers), Body};
+ensure_close_signaled(S, Req, {sendfile, Status, Headers, Spec}) when is_integer(Status) ->
+    {sendfile, Status, with_close_if_last(S, Req, Headers), Spec};
+ensure_close_signaled(_S, _Req, Response) ->
+    Response.
+
+%% Prepend `Connection: close` exactly when this request trips the keep-alive
+%% ceiling AND the connection would otherwise be reused. In the common case the
+%% response has no `connection` header, so the prepend is the only token; if a
+%% handler set one explicitly, `close` is the first token on the wire and takes
+%% precedence (RFC 9112 §9.6). Every other case is left byte-for-byte unchanged.
+-spec with_close_if_last(#loop_state{}, roadrunner_req:request(), roadrunner_http:headers()) ->
+    roadrunner_http:headers().
+with_close_if_last(
+    #loop_state{requests_served = Served, max_keep_alive_requests = Max}, Req, Headers
+) ->
+    case Served >= Max andalso roadrunner_conn:keep_alive_decision(Req, Headers) =:= keep_alive of
+        true -> [{~"connection", ~"close"} | Headers];
+        false -> Headers
     end.
 
 %% Dispatches the 5 response shapes that match the
@@ -941,19 +979,17 @@ buffered_finish(S, Req, Headers) ->
         {ok, ManualLeftover} ->
             case roadrunner_conn:keep_alive_decision(Req, Headers) of
                 close ->
+                    %% Either the client/handler asked to close, or
+                    %% `ensure_close_signaled/3` added `Connection: close`
+                    %% because this request tripped `max_keep_alive_requests`
+                    %% — both land here, and both close the connection.
                     exit_normal(S);
                 keep_alive ->
-                    Served = S#loop_state.requests_served,
-                    case Served >= S#loop_state.max_keep_alive_requests of
-                        true ->
-                            exit_normal(S);
-                        false ->
-                            Leftover = pipelined_leftover(Req, S, ManualLeftover),
-                            read_request_phase(S#loop_state{
-                                phase = keep_alive,
-                                buffered = Leftover
-                            })
-                    end
+                    Leftover = pipelined_leftover(Req, S, ManualLeftover),
+                    read_request_phase(S#loop_state{
+                        phase = keep_alive,
+                        buffered = Leftover
+                    })
             end;
         {error, _} ->
             %% Drain failure — close. Manual-mode handlers can leave the
