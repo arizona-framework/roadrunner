@@ -1082,6 +1082,9 @@ conn_loop_empty_push_emits_nothing_test_() ->
                 roadrunner_empty_push_test_conn ! stop,
                 Reply = recv_until_closed(Sock),
                 [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                %% A loop response always closes, so the server must signal it
+                %% (RFC 9112 §9.6) so a proxy stops reusing the connection.
+                ?assertNotEqual(nomatch, binary:match(Reply, ~"\r\nconnection: close\r\n")),
                 %% Empty push is no-op; only "hello" chunk + terminator.
                 ?assertEqual(~"5\r\nhello\r\n0\r\n\r\n", Body),
                 ok = gen_tcp:close(Sock)
@@ -1164,6 +1167,9 @@ conn_streams_chunked_response_test_() ->
                 Reply = recv_until_closed(Sock),
                 ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
                 {match, _} = re:run(Reply, ~"transfer-encoding: chunked", [caseless]),
+                %% A stream response always closes, so the server must say so
+                %% (RFC 9112 §9.6) or a proxy will try to reuse the connection.
+                ?assertNotEqual(nomatch, binary:match(Reply, ~"\r\nconnection: close\r\n")),
                 %% The chunk framing should land "hello world" in the body.
                 {match, _} = re:run(Reply, ~"hello"),
                 {match, _} = re:run(Reply, ~"world"),
