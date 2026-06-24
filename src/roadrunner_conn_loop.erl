@@ -121,8 +121,9 @@
     %% `recv_passive/2` tracks bytes received since `recv_phase_start`
     %% and closes the conn if the running average drops below
     %% `min_rate` after a 1 s grace (matches `roadrunner_conn:rate_ok/3`).
-    %% Reset at every `read_request_phase` entry (per-request window —
-    %% each request gets its own grace + budget).
+    %% `recv_phase_bytes` is reset to 0 at every `read_request_phase`
+    %% entry; `recv_phase_start` is then anchored at the first byte of
+    %% that request (per-request window, idle keep-alive gap excluded).
     min_rate = 0 :: non_neg_integer(),
     recv_phase_start = 0 :: integer(),
     recv_phase_bytes = 0 :: non_neg_integer(),
@@ -343,10 +344,13 @@ read_request_phase(#loop_state{buffered = Buf} = S) ->
     %% `state_timeout` semantics in a hand-rolled receive.
     Now = erlang:monotonic_time(millisecond),
     Deadline = Now + Timeout,
-    %% Reset the slowloris window at every read_request_phase entry —
-    %% pipelined keep-alive iterations get their own grace + budget,
-    %% same shape as `roadrunner_conn:make_recv/3`.
-    S1 = S#loop_state{recv_phase_start = Now, recv_phase_bytes = 0},
+    %% Reset the per-request byte counter. The slowloris rate window is
+    %% anchored at the first byte actually received (in `recv_passive/2`
+    %% and `recv_with_hibernate/3`), NOT at phase entry — so an idle
+    %% keep-alive gap before a reused connection's next request is not
+    %% counted as slow transmission. `recv_phase_bytes =:= 0` is the
+    %% "no byte yet this request" signal those paths key off to anchor.
+    S1 = S#loop_state{recv_phase_bytes = 0},
     case Buf of
         <<>> ->
             recv_request_bytes(S1, Deadline);
@@ -418,14 +422,24 @@ recv_passive(
                     %% the conn if `min_rate` isn't met after the 1 s
                     %% grace. Cheap when `min_rate = 0` because
                     %% `roadrunner_conn:rate_ok/3` short-circuits at
-                    %% `MinRate * Elapsed = 0`.
+                    %% `MinRate * Elapsed = 0`. Anchor the window at the
+                    %% first byte of the request (`PhaseBytes =:= 0`), not
+                    %% at phase entry — `recv` never returns `{ok, <<>>}`
+                    %% on a stream socket, so the first chunk always sets
+                    %% the anchor and subsequent chunks measure from there.
+                    PhaseStart1 =
+                        case PhaseBytes of
+                            0 -> Now;
+                            _ -> PhaseStart
+                        end,
                     NewBytes = PhaseBytes + byte_size(Bytes),
-                    case roadrunner_conn:rate_ok(Now - PhaseStart, NewBytes, MinRate) of
+                    case roadrunner_conn:rate_ok(Now - PhaseStart1, NewBytes, MinRate) of
                         true ->
                             handle_request_bytes(
                                 S#loop_state{
                                     buffered = <<Buf/binary, Bytes/binary>>,
-                                    recv_phase_bytes = NewBytes
+                                    recv_phase_bytes = NewBytes,
+                                    recv_phase_start = PhaseStart1
                                 },
                                 Deadline
                             );
@@ -485,14 +499,24 @@ recv_with_hibernate(
     receive
         {DataTag, _Sock, Bytes} ->
             _ = erlang:cancel_timer(DeadlineRef),
-            NewBytes = PhaseBytes + byte_size(Bytes),
             Now = erlang:monotonic_time(millisecond),
-            case roadrunner_conn:rate_ok(Now - PhaseStart, NewBytes, MinRate) of
+            %% Anchor the slowloris window at the first byte of the
+            %% request (`PhaseBytes =:= 0`), not at phase entry, so an
+            %% idle keep-alive gap before a reused connection's next
+            %% request is not counted as slow transmission.
+            PhaseStart1 =
+                case PhaseBytes of
+                    0 -> Now;
+                    _ -> PhaseStart
+                end,
+            NewBytes = PhaseBytes + byte_size(Bytes),
+            case roadrunner_conn:rate_ok(Now - PhaseStart1, NewBytes, MinRate) of
                 true ->
                     handle_request_bytes(
                         S#loop_state{
                             buffered = <<Buf/binary, Bytes/binary>>,
-                            recv_phase_bytes = NewBytes
+                            recv_phase_bytes = NewBytes,
+                            recv_phase_start = PhaseStart1
                         },
                         Deadline
                     );

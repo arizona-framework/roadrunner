@@ -416,6 +416,24 @@ Surfaced by the post-merge HTTP/3 review.
 
 **Scope:** small, cross-protocol (the same response paths as the 1xx item).
 
+### Anchor the manual-mode body rate window at the first body byte — small
+
+**What:** `make_recv/3` (`roadrunner_conn.erl`) captures its rate-window start at
+closure creation (`read_body_phase/3`), so in manual body-buffering mode a handler
+that delays before calling `roadrunner_req:read_body/1,2` has its think-time counted
+toward the body's minimum-byte-rate average. Auto mode has no gap (it reads the
+body synchronously right after the closure is built), and the request-read phase
+already anchors at the first byte.
+
+**Why deferred:** bounded today by the request_timeout `Deadline` threaded into the
+same closure (it fires first), and the residual is a narrow self-inflicted case
+(manual mode + a slow handler + a configured `min_bytes_per_second` + a small body).
+Anchoring at the first body recv would also slightly weaken Slowloris protection for
+a client that stalls between headers-done and body-start, so it is defensible as-is.
+Revisit only if a real workload reports false `slow_client` drops.
+
+**Scope:** small.
+
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>
