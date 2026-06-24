@@ -326,18 +326,29 @@ setopts_on_dead_socket_exits_silently_test() ->
     _ = Self.
 
 slowloris_during_passive_recv_drops_client_test() ->
-    %% Passive recv path: deliver a tiny amount of bytes after the
-    %% 1 s grace, with `min_rate` set high enough that the running
-    %% average falls under it. The conn must close silently.
+    %% Passive recv path: a real slowloris client dribbles bytes — one
+    %% byte inside the 1 s grace, then a second byte after the grace
+    %% boundary, keeping the running average far below `min_rate`. The
+    %% rate window is anchored at the FIRST byte (not at phase entry), so
+    %% the drop is driven by genuine slow transmission. The conn must
+    %% close silently.
     ensure_pg(),
     Self = self(),
-    %% Sink that waits past the grace window, then delivers 3 bytes
-    %% in response to the conn's first recv.
+    %% Deliver 1 byte immediately (anchors the window), then sleep past
+    %% the grace and deliver 1 more byte. Total 2 bytes over ~1.2 s
+    %% (~1.7 B/s), well under 1 MB/s. The conn's drain-tick recvs during
+    %% the sleep queue up; the held reply lands on whichever recv is
+    %% pending when the sink wakes.
     Sink = spawn(fun() ->
         receive
-            {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
-                timer:sleep(1100),
-                ConnPid ! {roadrunner_fake_recv_reply, {ok, ~"GET"}}
+            {roadrunner_fake_recv, C1, _, _} ->
+                C1 ! {roadrunner_fake_recv_reply, {ok, ~"G"}}
+        after 5000 -> ok
+        end,
+        timer:sleep(1200),
+        receive
+            {roadrunner_fake_recv, C2, _, _} ->
+                C2 ! {roadrunner_fake_recv_reply, {ok, ~"E"}}
         after 5000 -> ok
         end,
         receive
@@ -359,20 +370,27 @@ slowloris_during_passive_recv_drops_client_test() ->
     _ = Self.
 
 slowloris_during_active_mode_recv_drops_client_test() ->
-    %% Active-mode hibernate path: deliver a tiny amount of bytes
-    %% after the 1 s grace, with `min_rate` set high enough that the
-    %% running average falls under it. The conn must close silently
-    %% (no 408, same as the passive path's slowloris branch).
+    %% Active-mode hibernate path: a real slowloris client dribbles bytes
+    %% — one byte inside the 1 s grace, then a second byte after the
+    %% grace boundary, with `min_rate` set high enough that the running
+    %% average falls under it. The window is anchored at the first byte.
+    %% The conn must close silently (no 408, same as the passive path's
+    %% slowloris branch).
     ensure_pg(),
     Self = self(),
-    %% Sink that waits past the grace window, then delivers 3 bytes
-    %% — running average becomes `3 * 1000 / 1100 ≈ 2.7 B/s`, well
-    %% under 1 MB/s.
+    %% Deliver 1 byte immediately (anchors the window), then sleep past
+    %% the grace and deliver 1 more byte. Total 2 bytes over ~1.2 s
+    %% (~1.7 B/s), well under 1 MB/s.
     Sink = spawn(fun() ->
         receive
-            {roadrunner_fake_setopts, ConnPid, _Opts} ->
-                timer:sleep(1100),
-                ConnPid ! {roadrunner_fake_data, undefined, ~"GET"}
+            {roadrunner_fake_setopts, C1, _} ->
+                C1 ! {roadrunner_fake_data, undefined, ~"G"}
+        after 5000 -> ok
+        end,
+        timer:sleep(1200),
+        receive
+            {roadrunner_fake_setopts, C2, _} ->
+                C2 ! {roadrunner_fake_data, undefined, ~"E"}
         after 5000 -> ok
         end,
         receive
@@ -393,6 +411,68 @@ slowloris_during_active_mode_recv_drops_client_test() ->
     end,
     Sink ! stop,
     _ = Self.
+
+keep_alive_reuse_after_idle_serves_second_request_passive_test() ->
+    %% Regression: a reused keep-alive connection that idles past the
+    %% grace before its next request must NOT be dropped. The rate window
+    %% is anchored at the first byte of each request, so the idle gap is
+    %% not counted as slow transmission. Under the old phase-entry anchor
+    %% the second request was silently dropped (one response on the wire).
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Req = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    Sink = spawn_keepalive_idle_sink(Self, Tag, Req, 1500),
+    Opts = (fake_opts(ka_reuse_passive))#{
+        dispatch :=
+            {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
+                undefined},
+        max_keep_alive_requests := 2,
+        keep_alive_timeout := 5000,
+        request_timeout := 5000,
+        min_bytes_per_second => 1000000
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 6000 -> error(no_normal_exit_on_keep_alive_reuse)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    %% Two 200 OK responses on the wire (leading empty + one per response).
+    ?assertEqual(3, length(binary:split(Sent, ~"HTTP/1.1 ", [global]))),
+    Sink ! stop.
+
+keep_alive_reuse_after_idle_serves_second_request_hibernate_test() ->
+    %% Same regression on the active-mode hibernate path: `hibernate_after`
+    %% is short enough that the conn hibernates during the idle gap and
+    %% wakes via `recv_request_bytes_hib` when the second request arrives.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Req = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    Sink = spawn_keepalive_idle_sink(Self, Tag, Req, 1500),
+    Opts = (fake_opts(ka_reuse_hib))#{
+        dispatch :=
+            {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
+                undefined},
+        max_keep_alive_requests := 2,
+        keep_alive_timeout := 5000,
+        request_timeout := 5000,
+        hibernate_after => 50,
+        min_bytes_per_second => 1000000
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 6000 -> error(no_normal_exit_on_keep_alive_reuse)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    ?assertEqual(3, length(binary:split(Sent, ~"HTTP/1.1 ", [global]))),
+    Sink ! stop.
 
 stray_msg_during_read_request_is_ignored_test() ->
     ensure_pg(),
@@ -1482,6 +1562,56 @@ active_sink_loop(Logger, Tag, Bytes, Delivered) ->
         _Other ->
             active_sink_loop(Logger, Tag, Bytes, Delivered)
     end.
+
+%% Keep-alive reuse sink — serves `Req` for the first request, idles
+%% `IdleMs` (so the conn loops back into the keep-alive read phase and
+%% waits past the 1 s grace), then serves `Req` again for the second
+%% request. Handles both the passive recv path and the active-mode
+%% setopts path. Forwards sends to `Logger` so the test can count the
+%% responses on the wire. No sends arrive during the idle (the first
+%% response is already forwarded and the second request hasn't been
+%% dispatched yet), so sleeping inline doesn't drop any.
+spawn_keepalive_idle_sink(Logger, Tag, Req, IdleMs) ->
+    spawn(fun() -> keepalive_idle_sink_loop(Logger, Tag, Req, IdleMs, 0) end).
+
+keepalive_idle_sink_loop(Logger, Tag, Req, IdleMs, Delivered) ->
+    receive
+        stop ->
+            ok;
+        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
+            keepalive_idle_deliver(Logger, Tag, Req, IdleMs, Delivered, ConnPid, passive);
+        {roadrunner_fake_setopts, ConnPid, _Opts} ->
+            keepalive_idle_deliver(Logger, Tag, Req, IdleMs, Delivered, ConnPid, active);
+        {roadrunner_fake_send, _Pid, Data} ->
+            Logger ! {Tag, sent, Data},
+            keepalive_idle_sink_loop(Logger, Tag, Req, IdleMs, Delivered);
+        _Other ->
+            keepalive_idle_sink_loop(Logger, Tag, Req, IdleMs, Delivered)
+    end.
+
+keepalive_idle_deliver(Logger, Tag, Req, IdleMs, Delivered, ConnPid, Mode) ->
+    case Delivered of
+        0 ->
+            deliver_req(ConnPid, Req, Mode),
+            keepalive_idle_sink_loop(Logger, Tag, Req, IdleMs, 1);
+        1 ->
+            %% Second request: idle past the grace, then deliver. Under
+            %% the old phase-entry anchor this idle gap was miscounted as
+            %% slow transmission and the request was dropped.
+            timer:sleep(IdleMs),
+            deliver_req(ConnPid, Req, Mode),
+            keepalive_idle_sink_loop(Logger, Tag, Req, IdleMs, 2);
+        _ ->
+            %% No more requests — let any further passive recv close.
+            deliver_close(ConnPid, Mode),
+            keepalive_idle_sink_loop(Logger, Tag, Req, IdleMs, Delivered)
+    end.
+
+deliver_req(ConnPid, Req, passive) -> ConnPid ! {roadrunner_fake_recv_reply, {ok, Req}};
+deliver_req(ConnPid, Req, active) -> ConnPid ! {roadrunner_fake_data, undefined, Req}.
+
+deliver_close(ConnPid, passive) -> ConnPid ! {roadrunner_fake_recv_reply, {error, closed}};
+deliver_close(_ConnPid, active) -> ok.
 
 %% Scripted sink — handles BOTH active-mode setopts (replies with
 %% `{roadrunner_fake_data, _, Bytes}`) and passive-mode recv (replies
