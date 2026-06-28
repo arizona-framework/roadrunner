@@ -540,6 +540,146 @@ symlink_policy_refuse_test_() ->
         end}.
 
 %% =============================================================================
+%% Cache-Control route opt — the configured value rides every cacheable
+%% response (200 full file, 200 precompressed sibling, 206 range, 304) and
+%% never the 404 / 416. A dedicated listener carries the opt; the default
+%% setup (opt unset) guards the no-header regression.
+%% =============================================================================
+
+-define(CACHE_CONTROL_VALUE, ~"public, max-age=31536000, immutable").
+
+cache_control_test_() ->
+    {setup, fun cache_control_setup/0, fun cache_control_cleanup/1, fun({_Name, _Dir, Port}) ->
+        [
+            {"200 full file carries the configured Cache-Control verbatim", fun() ->
+                Reply = http_get(Port, ~"/static/asset.css"),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                assert_cache_control(Reply, ?CACHE_CONTROL_VALUE)
+            end},
+            {"200 gzip sibling carries Cache-Control", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/asset.css", [{~"Accept-Encoding", ~"gzip"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-encoding: gzip", [caseless]),
+                assert_cache_control(Reply, ?CACHE_CONTROL_VALUE)
+            end},
+            {"200 br sibling carries Cache-Control", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/asset.css", [{~"Accept-Encoding", ~"br"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-encoding: br", [caseless]),
+                assert_cache_control(Reply, ?CACHE_CONTROL_VALUE)
+            end},
+            {"206 range carries Cache-Control", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/asset.css", [{~"Range", ~"bytes=0-3"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply),
+                assert_cache_control(Reply, ?CACHE_CONTROL_VALUE)
+            end},
+            {"304 Not Modified carries Cache-Control", fun() ->
+                Reply1 = http_get(Port, ~"/static/asset.css"),
+                {match, [_, ETag]} = re:run(
+                    Reply1, ~"etag: (\"[^\"]+\")", [caseless, {capture, all, binary}]
+                ),
+                Reply2 = http_get_with(
+                    Port, ~"/static/asset.css", [{~"If-None-Match", ETag}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 304 ", _/binary>>, Reply2),
+                assert_cache_control(Reply2, ?CACHE_CONTROL_VALUE)
+            end},
+            {"416 unsatisfiable range never carries Cache-Control", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/asset.css", [{~"Range", ~"bytes=999-1000"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 416 ", _/binary>>, Reply),
+                assert_no_cache_control(Reply)
+            end},
+            {"404 missing file never carries Cache-Control", fun() ->
+                Reply = http_get(Port, ~"/static/nope.css"),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply),
+                assert_no_cache_control(Reply)
+            end}
+        ]
+    end}.
+
+cache_control_unset_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun({_Dir, Port}) ->
+        [
+            {"unset: 200 full file has no Cache-Control header", fun() ->
+                Reply = http_get(Port, ~"/static/hello.html"),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                assert_no_cache_control(Reply)
+            end},
+            {"unset: 200 gzip sibling has no Cache-Control header", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/compressible.css", [{~"Accept-Encoding", ~"gzip"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                assert_no_cache_control(Reply)
+            end},
+            {"unset: 206 range has no Cache-Control header", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=0-3"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply),
+                assert_no_cache_control(Reply)
+            end},
+            {"unset: 304 has no Cache-Control header", fun() ->
+                Reply1 = http_get(Port, ~"/static/hello.html"),
+                {match, [_, ETag]} = re:run(
+                    Reply1, ~"etag: (\"[^\"]+\")", [caseless, {capture, all, binary}]
+                ),
+                Reply2 = http_get_with(
+                    Port, ~"/static/hello.html", [{~"If-None-Match", ETag}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 304 ", _/binary>>, Reply2),
+                assert_no_cache_control(Reply2)
+            end},
+            {"unset: 416 has no Cache-Control header", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/hello.html", [{~"Range", ~"bytes=100-200"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 416 ", _/binary>>, Reply),
+                assert_no_cache_control(Reply)
+            end},
+            {"unset: 404 has no Cache-Control header", fun() ->
+                Reply = http_get(Port, ~"/static/missing.txt"),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply),
+                assert_no_cache_control(Reply)
+            end}
+        ]
+    end}.
+
+cache_control_setup() ->
+    Name = static_test_cache_control,
+    Dir = filename:join(
+        "/tmp", "rr_cache_control_" ++ integer_to_list(rand:uniform(1000000))
+    ),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    Css = ~"body { color: red; }",
+    ok = file:write_file(filename:join(Dir, "asset.css"), Css),
+    %% Both siblings present so the gzip and brotli 200 paths are reachable.
+    ok = file:write_file(filename:join(Dir, "asset.css.gz"), zlib:gzip(Css)),
+    ok = file:write_file(filename:join(Dir, "asset.css.br"), ~"brotli-bytes-asset"),
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        routes => [
+            {~"/static/*path", roadrunner_static, #{
+                dir => Dir, cache_control => ?CACHE_CONTROL_VALUE
+            }}
+        ]
+    }),
+    {Name, Dir, roadrunner_listener:port(Name)}.
+
+cache_control_cleanup({Name, Dir, _Port}) ->
+    ok = roadrunner_listener:stop(Name),
+    _ = file:del_dir_r(Dir),
+    ok.
+
+%% =============================================================================
 %% Metadata cache — direct cache helpers plus end-to-end coverage of the
 %% `cache_ttl_ms` route opt.
 %% =============================================================================
@@ -1016,3 +1156,12 @@ recv_until_closed(Sock, Acc) ->
         {ok, Data} -> recv_until_closed(Sock, <<Acc/binary, Data/binary>>);
         {error, _} -> Acc
     end.
+
+assert_cache_control(Reply, Value) ->
+    {match, [_, Got]} = re:run(
+        Reply, ~"cache-control: ([^\r\n]+)", [caseless, {capture, all, binary}]
+    ),
+    ?assertEqual(Value, Got).
+
+assert_no_cache_control(Reply) ->
+    ?assertEqual(nomatch, re:run(Reply, ~"cache-control:", [caseless])).

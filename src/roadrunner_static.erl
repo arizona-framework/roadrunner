@@ -46,6 +46,39 @@ semantics and the simple "Range wins" rule matches what nginx does.
 The `Content-Type` always reflects the original file's extension,
 not the sibling's.
 
+## Cache-Control
+
+`#{cache_control => Value}` sets a `Cache-Control` response header,
+verbatim, on every cacheable response for the file — the `200` (full
+file and any precompressed sibling), the `206` range, and the
+`304 Not Modified`. A `404` or a `416` never carries it, so a missing
+file or an unsatisfiable range is never marked cacheable.
+
+The value is an opaque binary the operator controls in full —
+roadrunner does not parse, validate, or merge directives. This mirrors
+nginx's `add_header Cache-Control`, where the operator writes the exact
+directive string.
+
+The option is off by default. With no `cache_control` key the responses
+are byte-for-byte what they are without it, carrying no `Cache-Control`
+header at all. `ETag` and `Last-Modified` only enable conditional
+revalidation — a follow-up request that may come back `304` — whereas
+`Cache-Control` is what lets a browser or a CDN reuse the resource from
+its own cache without contacting the server at all.
+
+A typical value for content-hashed build assets:
+
+```
+{~"/static/*path", roadrunner_static, #{
+    dir => ~"/var/www",
+    cache_control => ~"public, max-age=31536000, immutable"
+}}
+```
+
+`max-age` caps how many seconds a cache may reuse the response,
+`immutable` tells browsers not to revalidate during that window, and
+`public` lets shared caches such as CDNs and proxies store it.
+
 ## Symlink policy
 
 `#{symlink_policy => Policy}` (default `refuse_escapes`) controls
@@ -139,9 +172,14 @@ handle(Req) ->
                     #{cache_ttl_ms := T} -> T;
                     _ -> ?DEFAULT_CACHE_TTL_MS
                 end,
+            CacheControl =
+                case State of
+                    #{cache_control := V} -> V;
+                    _ -> undefined
+                end,
             #{dir := Dir} = State,
             FilePath = filename:join([Dir | Segments]),
-            {serve_file(FilePath, TtlMs, Req), Req};
+            {maybe_cache_control(serve_file(FilePath, TtlMs, Req), CacheControl), Req};
         traversal ->
             {roadrunner_resp:not_found(), Req}
     end.
@@ -155,6 +193,24 @@ docroot, without restarting the listener.
 -spec cache_clear() -> ok.
 cache_clear() ->
     roadrunner_static_cache:clear().
+
+%% Prepend the configured `Cache-Control` header to the cacheable
+%% responses. `sendfile` responses are the 200 (full file and
+%% precompressed sibling) and the 206 range; the only cacheable buffered
+%% response is the 304 Not Modified. The 416 and 404 (and any other
+%% shape) fall through unchanged so an unsatisfiable range or a missing
+%% file is never marked cacheable, and `undefined` (the option unset)
+%% returns every response verbatim.
+-spec maybe_cache_control(roadrunner_handler:response(), binary() | undefined) ->
+    roadrunner_handler:response().
+maybe_cache_control(Resp, undefined) ->
+    Resp;
+maybe_cache_control({sendfile, Status, Headers, FileSpec}, Value) ->
+    {sendfile, Status, [{~"cache-control", Value} | Headers], FileSpec};
+maybe_cache_control({304, Headers, Body}, Value) ->
+    {304, [{~"cache-control", Value} | Headers], Body};
+maybe_cache_control(Resp, _Value) ->
+    Resp.
 
 -spec serve_file(
     file:filename_all(), non_neg_integer() | infinity, roadrunner_req:request()
