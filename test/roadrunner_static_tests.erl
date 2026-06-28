@@ -412,6 +412,99 @@ static_test_() ->
                     ]
                 ),
                 ?assertMatch(<<"HTTP/1.1 304 ", _/binary>>, Reply2)
+            end},
+            {"Accept-Encoding br serves the .br sibling with Content-Encoding", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/bronly.css", [{~"Accept-Encoding", ~"br"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-encoding: br", [caseless]),
+                {match, _} = re:run(Reply, ~"vary: Accept-Encoding", [caseless]),
+                %% Content-Type reflects the original `.css`, not `.br`.
+                {match, _} = re:run(Reply, ~"content-type: text/css", [caseless]),
+                %% Content-Length is the `.br` sibling's size (19 bytes).
+                {match, _} = re:run(Reply, ~"content-length: 19", [caseless]),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(~"brotli-bytes-bronly", Body)
+            end},
+            {"br is preferred over gzip when both siblings exist", fun() ->
+                %% Browsers send `br;q=1, gzip;q=0.8`; plain substring of
+                %% both tokens matches, and brotli wins.
+                Reply = http_get_with(
+                    Port,
+                    ~"/static/both.css",
+                    [{~"Accept-Encoding", ~"br;q=1, gzip;q=0.8"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-encoding: br", [caseless]),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(~"brotli-bytes-both", Body)
+            end},
+            {"br accepted but no .br sibling falls back to the .gz sibling", fun() ->
+                %% compressible.css has a `.gz` but no `.br`; a client that
+                %% accepts both gets gzip.
+                Reply = http_get_with(
+                    Port,
+                    ~"/static/compressible.css",
+                    [{~"Accept-Encoding", ~"br, gzip"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-encoding: gzip", [caseless]),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(
+                    zlib:gzip(<<"body { background: white; padding: 1em; }">>), Body
+                )
+            end},
+            {"br-only accept with just a .gz sibling serves raw", fun() ->
+                %% br is accepted but no `.br` exists; gzip is not accepted,
+                %% so the existing `.gz` is not served — raw file wins.
+                Reply = http_get_with(
+                    Port, ~"/static/compressible.css", [{~"Accept-Encoding", ~"br"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                nomatch = re:run(Reply, ~"content-encoding:", [caseless]),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(<<"body { background: white; padding: 1em; }">>, Body)
+            end},
+            {"both encodings accepted but no siblings on disk serves raw", fun() ->
+                Reply = http_get_with(
+                    Port, ~"/static/main.css", [{~"Accept-Encoding", ~"br, gzip"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                nomatch = re:run(Reply, ~"content-encoding:", [caseless]),
+                {match, _} = re:run(Reply, ~"color: red")
+            end},
+            {"Range header disables the br-sibling and serves raw bytes", fun() ->
+                Reply = http_get_with(
+                    Port,
+                    ~"/static/bronly.css",
+                    [
+                        {~"Accept-Encoding", ~"br"},
+                        {~"Range", ~"bytes=0-1"}
+                    ]
+                ),
+                ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply),
+                nomatch = re:run(Reply, ~"content-encoding:", [caseless]),
+                [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(~"h1", Body)
+            end},
+            {"If-None-Match from a br-served response still 304s", fun() ->
+                %% ETag is the original file's, reused across variants.
+                Reply = http_get_with(
+                    Port, ~"/static/bronly.css", [{~"Accept-Encoding", ~"br"}]
+                ),
+                {match, [_, ETag]} = re:run(
+                    Reply, ~"etag: (\"[^\"]+\")", [caseless, {capture, all, binary}]
+                ),
+                Reply2 = http_get_with(
+                    Port,
+                    ~"/static/bronly.css",
+                    [
+                        {~"Accept-Encoding", ~"br"},
+                        {~"If-None-Match", ETag}
+                    ]
+                ),
+                ?assertMatch(<<"HTTP/1.1 304 ", _/binary>>, Reply2)
             end}
         ]
     end}.
@@ -461,33 +554,34 @@ cache_helpers_test_() ->
             {"cache_put then cache_get within TTL returns the entry", fun() ->
                 FilePath = filename:join(Dir, "fresh.txt"),
                 ok = roadrunner_static_cache:store(
-                    FilePath, 100, 1700000000, ~"etag-fresh", ~"lm-fresh", nogz, 60000
+                    FilePath, 100, 1700000000, ~"etag-fresh", ~"lm-fresh", #{}, 60000
                 ),
                 ?assertEqual(
-                    {ok, 100, 1700000000, ~"etag-fresh", ~"lm-fresh", nogz},
+                    {ok, 100, 1700000000, ~"etag-fresh", ~"lm-fresh", #{}},
                     roadrunner_static_cache:lookup(FilePath)
                 )
             end},
             {"cache_get returns miss after TTL expires", fun() ->
                 FilePath = filename:join(Dir, "expiring.txt"),
-                ok = roadrunner_static_cache:store(FilePath, 50, 1700000000, ~"e", ~"lm", nogz, 1),
+                ok = roadrunner_static_cache:store(FilePath, 50, 1700000000, ~"e", ~"lm", #{}, 1),
                 timer:sleep(20),
                 ?assertEqual(miss, roadrunner_static_cache:lookup(FilePath))
             end},
             {"cache_ttl_ms => infinity entries never expire", fun() ->
                 %% No `monotonic_time + infinity` arithmetic; sleeping
-                %% past any finite TTL must still return the entry.
+                %% past any finite TTL must still return the entry. The
+                %% siblings map carries both encodings' sizes.
                 FilePath = filename:join(Dir, "forever.txt"),
                 ok = roadrunner_static_cache:store(
-                    FilePath, 42, 1700000000, ~"etag-fvr", ~"lm-fvr", {gz, 17}, infinity
+                    FilePath, 42, 1700000000, ~"etag-fvr", ~"lm-fvr", #{br => 9, gz => 17}, infinity
                 ),
                 ?assertEqual(
-                    {ok, 42, 1700000000, ~"etag-fvr", ~"lm-fvr", {gz, 17}},
+                    {ok, 42, 1700000000, ~"etag-fvr", ~"lm-fvr", #{br => 9, gz => 17}},
                     roadrunner_static_cache:lookup(FilePath)
                 ),
                 timer:sleep(10),
                 ?assertEqual(
-                    {ok, 42, 1700000000, ~"etag-fvr", ~"lm-fvr", {gz, 17}},
+                    {ok, 42, 1700000000, ~"etag-fvr", ~"lm-fvr", #{br => 9, gz => 17}},
                     roadrunner_static_cache:lookup(FilePath)
                 )
             end},
@@ -495,9 +589,9 @@ cache_helpers_test_() ->
                 F1 = filename:join(Dir, "clear_a.txt"),
                 F2 = filename:join(Dir, "clear_b.txt"),
                 ok = roadrunner_static_cache:store(
-                    F1, 10, 1700000000, ~"e1", ~"lm1", nogz, infinity
+                    F1, 10, 1700000000, ~"e1", ~"lm1", #{}, infinity
                 ),
-                ok = roadrunner_static_cache:store(F2, 20, 1700000000, ~"e2", ~"lm2", nogz, 60000),
+                ok = roadrunner_static_cache:store(F2, 20, 1700000000, ~"e2", ~"lm2", #{}, 60000),
                 ok = roadrunner_static:cache_clear(),
                 ?assertEqual(miss, roadrunner_static_cache:lookup(F1)),
                 ?assertEqual(miss, roadrunner_static_cache:lookup(F2))
@@ -518,7 +612,7 @@ cache_populated_after_request_test_() ->
                 ?assertEqual(miss, roadrunner_static_cache:lookup(FilePath)),
                 _Reply = http_get(Port, ~"/static/cached.txt"),
                 ?assertMatch(
-                    {ok, _Size, _Mtime, _ETag, _LastMod, _GzInfo},
+                    {ok, _Size, _Mtime, _ETag, _LastMod, _Siblings},
                     roadrunner_static_cache:lookup(FilePath)
                 )
             end},
@@ -547,6 +641,56 @@ cache_populated_after_request_test_() ->
                 ),
                 {match, _} = re:run(R1, ~"content-encoding: gzip", [caseless]),
                 {match, _} = re:run(R2, ~"content-encoding: gzip", [caseless])
+            end},
+            {"cache hit serves the br sibling from the cached map", fun() ->
+                R1 = http_get_with(
+                    Port, ~"/static/br_cached.css", [{~"Accept-Encoding", ~"br"}]
+                ),
+                R2 = http_get_with(
+                    Port, ~"/static/br_cached.css", [{~"Accept-Encoding", ~"br"}]
+                ),
+                {match, _} = re:run(R1, ~"content-encoding: br", [caseless]),
+                {match, _} = re:run(R2, ~"content-encoding: br", [caseless]),
+                [_, Body] = binary:split(R2, ~"\r\n\r\n"),
+                ?assertEqual(~"brotli-cached-bytes", Body)
+            end},
+            {"cache hit prefers br over gz from the cached map", fun() ->
+                R1 = http_get_with(
+                    Port, ~"/static/dual_cached.css", [{~"Accept-Encoding", ~"br, gzip"}]
+                ),
+                R2 = http_get_with(
+                    Port, ~"/static/dual_cached.css", [{~"Accept-Encoding", ~"br, gzip"}]
+                ),
+                {match, _} = re:run(R1, ~"content-encoding: br", [caseless]),
+                {match, _} = re:run(R2, ~"content-encoding: br", [caseless]),
+                [_, Body] = binary:split(R2, ~"\r\n\r\n"),
+                ?assertEqual(~"brotli-dual-bytes", Body)
+            end},
+            {"cached br-absent falls back to gz from the map", fun() ->
+                %% gz_cached.css has only a `.gz`; a client accepting both
+                %% gets gzip from the cached map (no per-request stat).
+                R1 = http_get_with(
+                    Port, ~"/static/gz_cached.css", [{~"Accept-Encoding", ~"br, gzip"}]
+                ),
+                R2 = http_get_with(
+                    Port, ~"/static/gz_cached.css", [{~"Accept-Encoding", ~"br, gzip"}]
+                ),
+                {match, _} = re:run(R1, ~"content-encoding: gzip", [caseless]),
+                {match, _} = re:run(R2, ~"content-encoding: gzip", [caseless])
+            end},
+            {"cached gz-absent with gzip-only serves raw", fun() ->
+                %% br_cached.css has only a `.br`; a gzip-only client gets
+                %% the raw file from the cached map.
+                R1 = http_get_with(
+                    Port, ~"/static/br_cached.css", [{~"Accept-Encoding", ~"gzip"}]
+                ),
+                R2 = http_get_with(
+                    Port, ~"/static/br_cached.css", [{~"Accept-Encoding", ~"gzip"}]
+                ),
+                nomatch = re:run(R1, ~"content-encoding:", [caseless]),
+                nomatch = re:run(R2, ~"content-encoding:", [caseless]),
+                [_, Body] = binary:split(R2, ~"\r\n\r\n"),
+                ?assertEqual(~"a{}", Body)
             end}
         ]
     end}.
@@ -624,6 +768,12 @@ cache_enabled_setup() ->
     ok = file:write_file(filename:join(Dir, "cached.txt"), ~"cached"),
     ok = file:write_file(filename:join(Dir, "gz_cached.css"), ~"body{}"),
     ok = file:write_file(filename:join(Dir, "gz_cached.css.gz"), zlib:gzip(~"body{}")),
+    %% Brotli-only and both-siblings fixtures for the cached negotiation.
+    ok = file:write_file(filename:join(Dir, "br_cached.css"), ~"a{}"),
+    ok = file:write_file(filename:join(Dir, "br_cached.css.br"), ~"brotli-cached-bytes"),
+    ok = file:write_file(filename:join(Dir, "dual_cached.css"), ~"b{}"),
+    ok = file:write_file(filename:join(Dir, "dual_cached.css.br"), ~"brotli-dual-bytes"),
+    ok = file:write_file(filename:join(Dir, "dual_cached.css.gz"), zlib:gzip(~"b{}")),
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0,
         routes => [
@@ -774,6 +924,15 @@ setup() ->
     GzOriginal = <<"body { background: white; padding: 1em; }">>,
     ok = file:write_file(filename:join(Dir, "compressible.css"), GzOriginal),
     ok = file:write_file(filename:join(Dir, "compressible.css.gz"), zlib:gzip(GzOriginal)),
+    %% Brotli-sibling fixtures. We serve a `.br` sibling verbatim with no
+    %% codec dependency, so its bytes are an opaque marker — distinct from
+    %% the original so tests can verify which file was opened.
+    ok = file:write_file(filename:join(Dir, "bronly.css"), ~"h1 { color: blue; }"),
+    ok = file:write_file(filename:join(Dir, "bronly.css.br"), ~"brotli-bytes-bronly"),
+    %% Both siblings present — brotli must win when the client accepts both.
+    ok = file:write_file(filename:join(Dir, "both.css"), ~"p { margin: 0; }"),
+    ok = file:write_file(filename:join(Dir, "both.css.br"), ~"brotli-bytes-both"),
+    ok = file:write_file(filename:join(Dir, "both.css.gz"), zlib:gzip(~"p { margin: 0; }")),
     ok = file:write_file(filename:join(Dir, "empty.txt"), <<>>),
     ok = file:write_file(filename:join(Dir, "notes.txt"), ~"hello via link"),
     %% Safe in-docroot symlink (relative target, no `..`).
