@@ -141,3 +141,95 @@ status_with_arbitrary_code_test() ->
     %% 418 isn't in the named shortcuts.
     ?assertEqual({418, [{~"content-length", ~"0"}], ~""}, roadrunner_resp:status(418)),
     ?assertEqual({503, [{~"content-length", ~"0"}], ~""}, roadrunner_resp:status(503)).
+
+status_with_headers_test() ->
+    %% status/2 prepends caller headers ahead of the content-length, which
+    %% stays present and authoritative on lookup.
+    {503, Headers, ~""} = roadrunner_resp:status(503, [{~"retry-after", ~"30"}]),
+    ?assertEqual(~"30", proplists:get_value(~"retry-after", Headers)),
+    ?assertEqual(~"0", proplists:get_value(~"content-length", Headers)).
+
+%% --- generic body/3,4 builder ---
+
+body_binary_test() ->
+    ?assertEqual(
+        {200,
+            [
+                {~"content-type", ~"application/octet-stream"},
+                {~"content-length", ~"5"}
+            ],
+            ~"hello"},
+        roadrunner_resp:body(200, ~"application/octet-stream", ~"hello")
+    ).
+
+body_iolist_body_test() ->
+    %% iolist body: content-length is the byte count via iolist_size.
+    {200, Headers, Body} = roadrunner_resp:body(200, ~"text/csv", [~"a,", ~"b", $\n]),
+    ?assertEqual(~"text/csv", proplists:get_value(~"content-type", Headers)),
+    ?assertEqual(~"4", proplists:get_value(~"content-length", Headers)),
+    ?assertEqual([~"a,", ~"b", $\n], Body).
+
+body_with_headers_test() ->
+    %% Extra headers are additive, after the authoritative content-type and
+    %% content-length.
+    {201, Headers, ~"x"} = roadrunner_resp:body(
+        201, ~"text/plain", [{~"x-cache", ~"HIT"}], ~"x"
+    ),
+    ?assertEqual(~"text/plain", proplists:get_value(~"content-type", Headers)),
+    ?assertEqual(~"1", proplists:get_value(~"content-length", Headers)),
+    ?assertEqual(~"HIT", proplists:get_value(~"x-cache", Headers)),
+    %% content-type/content-length come first, the caller header trails.
+    ?assertMatch(
+        [{~"content-type", _}, {~"content-length", _}, {~"x-cache", ~"HIT"}],
+        Headers
+    ).
+
+%% --- header variants on the typed builders ---
+
+text_with_headers_test() ->
+    {200, Headers, ~"hi"} = roadrunner_resp:text(200, [{~"x-cache", ~"HIT"}], ~"hi"),
+    ?assertEqual(~"text/plain; charset=utf-8", proplists:get_value(~"content-type", Headers)),
+    ?assertEqual(~"2", proplists:get_value(~"content-length", Headers)),
+    ?assertEqual(~"HIT", proplists:get_value(~"x-cache", Headers)).
+
+html_with_headers_test() ->
+    {200, Headers, ~"<p>x</p>"} = roadrunner_resp:html(
+        200, [{~"x-cache", ~"HIT"}], ~"<p>x</p>"
+    ),
+    ?assertEqual(~"text/html; charset=utf-8", proplists:get_value(~"content-type", Headers)),
+    ?assertEqual(~"8", proplists:get_value(~"content-length", Headers)),
+    ?assertEqual(~"HIT", proplists:get_value(~"x-cache", Headers)).
+
+json_with_headers_test() ->
+    Term = #{~"name" => ~"Alice"},
+    {200, Headers, Body} = roadrunner_resp:json(200, [{~"x-cache", ~"HIT"}], Term),
+    ?assertEqual(~"application/json", proplists:get_value(~"content-type", Headers)),
+    ?assertEqual(~"HIT", proplists:get_value(~"x-cache", Headers)),
+    ?assertEqual(
+        integer_to_binary(iolist_size(Body)),
+        proplists:get_value(~"content-length", Headers)
+    ),
+    ?assertEqual(Term, json:decode(iolist_to_binary(Body))).
+
+ndjson_with_headers_test() ->
+    Items = [#{~"id" => 1}, #{~"id" => 2}],
+    {200, Headers, Body} = roadrunner_resp:ndjson(200, [{~"x-cache", ~"HIT"}], Items),
+    ?assertEqual(~"application/x-ndjson", proplists:get_value(~"content-type", Headers)),
+    ?assertEqual(~"HIT", proplists:get_value(~"x-cache", Headers)),
+    Bin = iolist_to_binary(Body),
+    ?assertEqual(~"{\"id\":1}\n{\"id\":2}\n", Bin),
+    ?assertEqual(
+        integer_to_binary(byte_size(Bin)),
+        proplists:get_value(~"content-length", Headers)
+    ).
+
+redirect_with_headers_test() ->
+    %% Caller headers trail the location/content-length, which stay authoritative.
+    {302, Headers, ~""} = roadrunner_resp:redirect(302, [{~"x-cache", ~"HIT"}], ~"/new"),
+    ?assertEqual(~"/new", proplists:get_value(~"location", Headers)),
+    ?assertEqual(~"0", proplists:get_value(~"content-length", Headers)),
+    ?assertEqual(~"HIT", proplists:get_value(~"x-cache", Headers)),
+    ?assertMatch(
+        [{~"location", ~"/new"}, {~"content-length", ~"0"}, {~"x-cache", ~"HIT"}],
+        Headers
+    ).
