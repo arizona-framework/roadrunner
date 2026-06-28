@@ -510,6 +510,8 @@ set_request_logger_metadata(#{
         peer => Peer
     }).
 
+-define(RECV_BYTES_PDKEY, {?MODULE, recv_bytes}).
+
 %% Build a recv closure with a single overall deadline plus a rolling
 %% rate check. `gen_tcp:recv` with a negative timeout is undefined, so
 %% we cap at 0 — which makes gen_tcp return `{error, timeout}`
@@ -519,20 +521,23 @@ set_request_logger_metadata(#{
 %% Rate enforcement (anti-Slowloris): track total bytes received and
 %% time since the first recv. After a 1-second grace, require the
 %% running average to meet `MinRate` bytes/sec, otherwise return
-%% `{error, slow_client}`. The state is a per-conn atomics ref — no
-%% cross-process contention.
+%% `{error, slow_client}`. The byte counter is a per-request atomics ref
+%% allocated lazily on the first recv (see `recv_byte_counter/0`), so a
+%% request with no body to read from the socket skips the allocation
+%% entirely. `Start` is captured eagerly here, so the rate window is
+%% anchored at body-phase entry exactly as before.
 -doc false.
 -spec make_recv(roadrunner_transport:socket(), integer(), non_neg_integer()) ->
     fun(() -> {ok, binary()} | {error, request_timeout | slow_client | term()}).
 make_recv(Socket, Deadline, MinRate) ->
-    Bytes = atomics:new(1, [{signed, false}]),
     Start = erlang:monotonic_time(millisecond),
+    _ = erase(?RECV_BYTES_PDKEY),
     fun() ->
         Now = erlang:monotonic_time(millisecond),
         Remaining = max(0, Deadline - Now),
         case roadrunner_transport:recv(Socket, 0, Remaining) of
             {ok, Data} ->
-                Total = atomics:add_get(Bytes, 1, byte_size(Data)),
+                Total = atomics:add_get(recv_byte_counter(), 1, byte_size(Data)),
                 case rate_ok(Now - Start, Total, MinRate) of
                     true -> {ok, Data};
                     false -> {error, slow_client}
@@ -542,6 +547,23 @@ make_recv(Socket, Deadline, MinRate) ->
             {error, _} = E ->
                 E
         end
+    end.
+
+%% Get-or-create the per-request received-byte counter. Allocated lazily
+%% on the first recv so a bodyless or fully-buffered request (whose recv
+%% closure is never invoked) skips the `atomics` allocation; memoized in
+%% the process dictionary until `make_recv/3` resets it for the next
+%% request. Process-local state is safe because the HTTP/1 connection
+%% process reads one request body at a time.
+-spec recv_byte_counter() -> atomics:atomics_ref().
+recv_byte_counter() ->
+    case get(?RECV_BYTES_PDKEY) of
+        undefined ->
+            Ref = atomics:new(1, [{signed, false}]),
+            _ = put(?RECV_BYTES_PDKEY, Ref),
+            Ref;
+        Ref ->
+            Ref
     end.
 
 -doc false.
