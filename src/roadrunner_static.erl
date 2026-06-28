@@ -12,27 +12,39 @@ Configure via a 3-tuple route with `#{dir => Path}` opts and a
 Reads the file from disk, sets `Content-Type` from the extension,
 returns 404 on a missing file or any path that contains `..`.
 
-## Gzip-sibling serving
+## Precompressed-sibling serving
 
-When a request carries `Accept-Encoding: gzip` and the requested
-file has a `<file>.gz` sibling on disk, the sibling is served
-verbatim with `Content-Encoding: gzip` plus `Vary: Accept-Encoding`.
-This matches nginx's `gzip_static on` behaviour and lets operators
-pre-compress build assets once instead of paying the deflate cost
-per request.
+When a request's `Accept-Encoding` opts into a compressed encoding
+and the requested file has a matching precompressed sibling on disk,
+the sibling is served verbatim with the corresponding
+`Content-Encoding` plus `Vary: Accept-Encoding`. This matches nginx's
+`gzip_static on` behaviour and lets operators pre-compress build
+assets once instead of paying the compression cost per request.
 
-`Accept-Encoding` is matched via plain substring (`gzip`) rather
-than full RFC 9110 §12.5.3 qvalue ranking. The static path is
-typically hit by browsers and benchmark clients that always
-include `gzip` plainly. Brotli (`.br`) siblings are not served —
-gzip is the universally supported encoding.
+Two encodings are negotiated, brotli first:
 
-The original file's ETag is reused for the gzip variant, so a
-follow-up `If-None-Match` returns 304 regardless of which variant
-was first served. A `Range` request disables the gzip path on that
-request — byte offsets over a compressed representation have
-subtle semantics and the simple "Range wins" rule matches what
-nginx does.
+- `Accept-Encoding: br` with a `<file>.br` sibling on disk →
+  `Content-Encoding: br`
+- `Accept-Encoding: gzip` with a `<file>.gz` sibling on disk →
+  `Content-Encoding: gzip`
+
+Brotli wins when the client accepts both and the `.br` sibling
+exists; gzip is the fallback. With neither sibling on disk (or
+neither encoding accepted) the raw file is served. Roadrunner never
+compresses on the fly — it only `sendfile`s a sibling an operator
+placed on disk, so there is no brotli or gzip codec dependency.
+
+`Accept-Encoding` is matched via plain substring (`br`, `gzip`)
+rather than full RFC 9110 §12.5.3 qvalue ranking. Browsers and
+clients that reach the static path send these tokens plainly.
+
+The original file's ETag is reused for every variant, so a follow-up
+`If-None-Match` returns 304 regardless of which variant was first
+served. A `Range` request disables the precompressed path on that
+request — byte offsets over a compressed representation have subtle
+semantics and the simple "Range wins" rule matches what nginx does.
+The `Content-Type` always reflects the original file's extension,
+not the sibling's.
 
 ## Symlink policy
 
@@ -93,6 +105,15 @@ under an `infinity` (or long) TTL.
 
 -export([handle/1, cache_clear/0]).
 
+-export_type([siblings/0]).
+
+-doc """
+Precompressed siblings found on disk for a regular file, keyed by
+encoding. A key is present only when that sibling is a regular file;
+the value is its size in bytes. `#{}` means neither sibling exists.
+""".
+-type siblings() :: #{br => non_neg_integer(), gz => non_neg_integer()}.
+
 -define(MIME_TYPES, #{
     ~".html" => ~"text/html; charset=utf-8",
     ~".css" => ~"text/css; charset=utf-8",
@@ -140,8 +161,8 @@ cache_clear() ->
 ) -> roadrunner_handler:response().
 serve_file(FilePath, TtlMs, Req) ->
     case cached_lookup(FilePath, TtlMs) of
-        {ok, Size, Mtime, ETag, LastMod, GzInfo} ->
-            serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, GzInfo, Req);
+        {ok, Size, Mtime, ETag, LastMod, Siblings} ->
+            serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Siblings, Req);
         miss ->
             fresh_lookup(FilePath, TtlMs, Req)
     end.
@@ -152,7 +173,7 @@ serve_file(FilePath, TtlMs, Req) ->
 %% always bypass the cache because the policy gate needs the un-followed
 %% `read_link_info` result.
 -spec cached_lookup(file:filename_all(), non_neg_integer() | infinity) ->
-    {ok, non_neg_integer(), integer(), binary(), binary(), {gz, non_neg_integer()} | nogz} | miss.
+    {ok, non_neg_integer(), integer(), binary(), binary(), siblings()} | miss.
 cached_lookup(_FilePath, TtlMs) when is_integer(TtlMs), TtlMs =< 0 ->
     miss;
 cached_lookup(FilePath, _TtlMs) ->
@@ -182,12 +203,12 @@ fresh_lookup(FilePath, TtlMs, Req) ->
             roadrunner_resp:not_found()
     end.
 
-%% Caching off (non-positive TTL): serve `lazy` — the gzip sibling is
-%% stat'd per request only when the client accepts gzip, the default-path
-%% behaviour, and nothing is cached. Caching on (positive TTL or
-%% infinity): stat the gzip sibling once now and cache the full metadata,
-%% so every later hit skips both that stat and the ETag/Last-Modified
-%% recompute.
+%% Caching off (non-positive TTL): serve `lazy` — a precompressed sibling
+%% is stat'd per request only for an encoding the client actually accepts,
+%% the default-path behaviour, and nothing is cached. Caching on (positive
+%% TTL or infinity): stat both siblings once now and cache the full
+%% metadata, so every later hit skips both that stat and the
+%% ETag/Last-Modified recompute.
 -spec serve_and_maybe_cache(
     file:filename_all(),
     non_neg_integer(),
@@ -202,9 +223,9 @@ serve_and_maybe_cache(FilePath, Size, Mtime, ETag, LastMod, TtlMs, Req) when
 ->
     serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, lazy, Req);
 serve_and_maybe_cache(FilePath, Size, Mtime, ETag, LastMod, TtlMs, Req) ->
-    GzInfo = stat_gz(FilePath),
-    ok = roadrunner_static_cache:store(FilePath, Size, Mtime, ETag, LastMod, GzInfo, TtlMs),
-    serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, GzInfo, Req).
+    Siblings = stat_siblings(FilePath),
+    ok = roadrunner_static_cache:store(FilePath, Size, Mtime, ETag, LastMod, Siblings, TtlMs),
+    serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Siblings, Req).
 
 %% Read leaf-stat after the symlink-policy gate has approved follow.
 -spec serve_followed_file(file:filename_all(), roadrunner_req:request()) ->
@@ -214,8 +235,9 @@ serve_followed_file(FilePath, Req) ->
         {ok, #file_info{type = regular, size = Size, mtime = Mtime}} ->
             ETag = etag(Size, Mtime),
             LastMod = roadrunner_http:format_http_date(Mtime),
-            %% Symlink leaves never cache, so the gzip sibling is resolved
-            %% lazily (stat'd per request, only when gzip is accepted).
+            %% Symlink leaves never cache, so a precompressed sibling is
+            %% resolved lazily (stat'd per request, only for an accepted
+            %% encoding).
             serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, lazy, Req);
         _ ->
             roadrunner_resp:not_found()
@@ -227,10 +249,10 @@ serve_followed_file(FilePath, Req) ->
     integer(),
     binary(),
     binary(),
-    lazy | {gz, non_neg_integer()} | nogz,
+    lazy | siblings(),
     roadrunner_req:request()
 ) -> roadrunner_handler:response().
-serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, GzMeta, Req) ->
+serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Siblings, Req) ->
     case is_cached(Req, ETag, Mtime) of
         true ->
             {304,
@@ -241,81 +263,128 @@ serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, GzMeta, Req) ->
                 ],
                 ~""};
         false ->
-            case maybe_serve_gzip(FilePath, ETag, LastMod, GzMeta, Req) of
+            case maybe_serve_precompressed(FilePath, ETag, LastMod, Siblings, Req) of
                 {ok, Resp} -> Resp;
                 none -> serve_with_range(FilePath, Size, ETag, LastMod, Req)
             end
     end.
 
-%% When the client opted into gzip and a `<file>.gz` sibling is on
-%% disk, serve the sibling with `Content-Encoding: gzip`. `Range`
-%% requests skip this path — byte offsets over a compressed
-%% representation have subtle semantics, so we let Range win and
-%% serve the raw file.
--spec maybe_serve_gzip(
+%% Serve a precompressed `<file>.br` / `<file>.gz` sibling when the
+%% client accepts a matching encoding and the sibling is on disk, brotli
+%% preferred. `Range` requests skip this path — byte offsets over a
+%% compressed representation have subtle semantics, so we let Range win
+%% and serve the raw file.
+-spec maybe_serve_precompressed(
     file:filename_all(),
     binary(),
     binary(),
-    lazy | {gz, non_neg_integer()} | nogz,
+    lazy | siblings(),
     roadrunner_req:request()
 ) -> {ok, roadrunner_handler:response()} | none.
-maybe_serve_gzip(FilePath, ETag, LastMod, GzMeta, Req) ->
-    case
-        (roadrunner_req:header(~"range", Req) =:= undefined) andalso
-            accepts_gzip(Req)
-    of
-        true ->
-            case resolve_gz(FilePath, GzMeta) of
-                {gz, GzSize} ->
-                    {ok, gzip_response(FilePath, gz_path(FilePath), GzSize, ETag, LastMod)};
-                nogz ->
+maybe_serve_precompressed(FilePath, ETag, LastMod, Siblings, Req) ->
+    case roadrunner_req:header(~"range", Req) of
+        undefined ->
+            case choose_sibling(FilePath, Siblings, Req) of
+                {Encoding, SiblingPath, SiblingSize} ->
+                    {ok,
+                        precompressed_response(
+                            FilePath, Encoding, SiblingPath, SiblingSize, ETag, LastMod
+                        )};
+                none ->
                     none
             end;
-        false ->
+        _ ->
             none
     end.
 
-%% Resolve the gzip-sibling result: use the cached value, or stat the
-%% sibling now (`lazy` — the no-cache / symlink path).
--spec resolve_gz(file:filename_all(), lazy | {gz, non_neg_integer()} | nogz) ->
-    {gz, non_neg_integer()} | nogz.
-resolve_gz(FilePath, lazy) -> stat_gz(FilePath);
-resolve_gz(_FilePath, GzInfo) -> GzInfo.
-
-%% Stat the `<file>.gz` sibling: `{gz, GzSize}` when it is a regular file,
-%% `nogz` otherwise.
--spec stat_gz(file:filename_all()) -> {gz, non_neg_integer()} | nogz.
-stat_gz(FilePath) ->
-    case file:read_file_info(gz_path(FilePath), [raw, {time, posix}]) of
-        {ok, #file_info{type = regular, size = GzSize}} -> {gz, GzSize};
-        _ -> nogz
+%% Negotiate which precompressed sibling (if any) to serve. Brotli wins
+%% over gzip when the client accepts both and the `.br` sibling exists.
+%% Returns `{ContentEncoding, SiblingPath, SiblingSize}` or `none`.
+-spec choose_sibling(file:filename_all(), lazy | siblings(), roadrunner_req:request()) ->
+    {binary(), binary(), non_neg_integer()} | none.
+choose_sibling(FilePath, Siblings, Req) ->
+    AcceptEnc = roadrunner_req:header(~"accept-encoding", Req),
+    case try_encoding(FilePath, br, ~"br", AcceptEnc, Siblings) of
+        none -> try_encoding(FilePath, gz, ~"gzip", AcceptEnc, Siblings);
+        Chosen -> Chosen
     end.
 
--spec gz_path(file:filename_all()) -> binary().
-gz_path(FilePath) ->
-    iolist_to_binary([FilePath, ~".gz"]).
-
--spec accepts_gzip(roadrunner_req:request()) -> boolean().
-accepts_gzip(Req) ->
-    case roadrunner_req:header(~"accept-encoding", Req) of
-        undefined -> false;
-        Bin -> binary:match(Bin, ~"gzip") =/= nomatch
+%% Resolve one candidate encoding: the client must accept its token and
+%% the sibling must be on disk. The `andalso` short-circuits so the lazy
+%% (no-cache) path only stats a sibling for an encoding the client
+%% accepts. The accept token doubles as the `Content-Encoding` value.
+-spec try_encoding(
+    file:filename_all(), br | gz, binary(), binary() | undefined, lazy | siblings()
+) -> {binary(), binary(), non_neg_integer()} | none.
+try_encoding(FilePath, Key, Token, AcceptEnc, Siblings) ->
+    case accepts(AcceptEnc, Token) andalso sibling_size(FilePath, Key, Siblings) of
+        false -> none;
+        none -> none;
+        Size -> {Token, sibling_path(FilePath, suffix(Key)), Size}
     end.
 
--spec gzip_response(
-    file:filename_all(), file:filename_all(), non_neg_integer(), binary(), binary()
+%% Plain substring match of an `Accept-Encoding` token, matching the
+%% module's documented simplification over RFC 9110 qvalue ranking.
+-spec accepts(binary() | undefined, binary()) -> boolean().
+accepts(undefined, _Token) -> false;
+accepts(AcceptEnc, Token) -> binary:match(AcceptEnc, Token) =/= nomatch.
+
+%% Size of a precompressed sibling, or `none` when it is not on disk.
+%% `lazy` (no-cache / symlink path) stats the sibling now; a cached
+%% `siblings()` map already carries the size under the encoding key.
+-spec sibling_size(file:filename_all(), br | gz, lazy | siblings()) ->
+    non_neg_integer() | none.
+sibling_size(FilePath, Key, lazy) ->
+    stat_sibling(sibling_path(FilePath, suffix(Key)));
+sibling_size(_FilePath, Key, Siblings) ->
+    case Siblings of
+        #{Key := Size} -> Size;
+        _ -> none
+    end.
+
+%% Stat both precompressed siblings once for caching: a `siblings()` map
+%% carrying the size of each sibling that is a regular file on disk.
+-spec stat_siblings(file:filename_all()) -> siblings().
+stat_siblings(FilePath) ->
+    Base = add_sibling(#{}, br, stat_sibling(sibling_path(FilePath, ~".br"))),
+    add_sibling(Base, gz, stat_sibling(sibling_path(FilePath, ~".gz"))).
+
+%% Insert an encoding's size into the siblings map only when on disk.
+-spec add_sibling(siblings(), br | gz, non_neg_integer() | none) -> siblings().
+add_sibling(Siblings, _Key, none) -> Siblings;
+add_sibling(Siblings, Key, Size) -> Siblings#{Key => Size}.
+
+%% Stat a precompressed sibling path: its byte size when it is a regular
+%% file, `none` otherwise.
+-spec stat_sibling(file:filename_all()) -> non_neg_integer() | none.
+stat_sibling(Path) ->
+    case file:read_file_info(Path, [raw, {time, posix}]) of
+        {ok, #file_info{type = regular, size = Size}} -> Size;
+        _ -> none
+    end.
+
+-spec suffix(br | gz) -> binary().
+suffix(br) -> ~".br";
+suffix(gz) -> ~".gz".
+
+-spec sibling_path(file:filename_all(), binary()) -> binary().
+sibling_path(FilePath, Suffix) ->
+    iolist_to_binary([FilePath, Suffix]).
+
+-spec precompressed_response(
+    file:filename_all(), binary(), file:filename_all(), non_neg_integer(), binary(), binary()
 ) -> roadrunner_handler:response().
-gzip_response(OrigPath, GzPath, GzSize, ETag, LastMod) ->
+precompressed_response(OrigPath, Encoding, SiblingPath, SiblingSize, ETag, LastMod) ->
     {sendfile, 200,
         [
             {~"content-type", content_type_for(OrigPath)},
-            {~"content-encoding", ~"gzip"},
-            {~"content-length", integer_to_binary(GzSize)},
+            {~"content-encoding", Encoding},
+            {~"content-length", integer_to_binary(SiblingSize)},
             {~"etag", ETag},
             {~"last-modified", LastMod},
             {~"vary", ~"Accept-Encoding"}
         ],
-        {GzPath, 0, GzSize}}.
+        {SiblingPath, 0, SiblingSize}}.
 
 %% Cache hit when either:
 %% - `If-None-Match` matches the current ETag (strong validator), or

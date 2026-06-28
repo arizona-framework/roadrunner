@@ -3,11 +3,12 @@
 
 %% Owner and API for the node-global static-file metadata cache.
 %%
-%% `roadrunner_static` caches each served file's `{Size, Mtime, Expiry}`
-%% (opt-in via the `cache_ttl_ms` route option) so hot paths skip the
-%% per-request `read_link_info` syscall. This module owns the backing
-%% store and exposes `lookup/1` / `store/4` / `clear/0`; callers never
-%% see the representation.
+%% `roadrunner_static` caches each served file's metadata (size, mtime,
+%% derived validators, precompressed-siblings map, expiry) opt-in via the
+%% `cache_ttl_ms` route option so hot paths skip the per-request
+%% `read_link_info` syscall. This module owns the backing store and
+%% exposes `lookup/1` / `store/7` / `clear/0`; callers never see the
+%% representation.
 %%
 %% The store is a public named ETS table, so `lookup`/`store`/`clear`
 %% run in the CALLER process (no message round-trip): reads and writes
@@ -30,20 +31,21 @@ start_link() ->
 %% Read the cached metadata for FilePath if it is still within its TTL.
 %% An infinity entry is always a hit; an expired entry is dropped (cheap
 %% in ETS) and reported as a miss. The cached value carries the derived
-%% ETag + Last-Modified strings and the gzip-sibling result, so a hit
-%% skips recomputing them and skips the per-request `<file>.gz` stat.
+%% ETag + Last-Modified strings and the precompressed-siblings map, so a
+%% hit skips recomputing them and skips the per-request `.br` / `.gz`
+%% sibling stats.
 -spec lookup(file:filename_all()) ->
-    {ok, non_neg_integer(), integer(), binary(), binary(), {gz, non_neg_integer()} | nogz} | miss.
+    {ok, non_neg_integer(), integer(), binary(), binary(), roadrunner_static:siblings()} | miss.
 lookup(FilePath) ->
     case ets:lookup(?TABLE, FilePath) of
         [] ->
             miss;
-        [{_, {Size, Mtime, ETag, LastMod, GzInfo, infinity}}] ->
-            {ok, Size, Mtime, ETag, LastMod, GzInfo};
-        [{_, {Size, Mtime, ETag, LastMod, GzInfo, ExpiresAt}}] ->
+        [{_, {Size, Mtime, ETag, LastMod, Siblings, infinity}}] ->
+            {ok, Size, Mtime, ETag, LastMod, Siblings};
+        [{_, {Size, Mtime, ETag, LastMod, Siblings, ExpiresAt}}] ->
             case erlang:monotonic_time(millisecond) of
                 Now when Now =< ExpiresAt ->
-                    {ok, Size, Mtime, ETag, LastMod, GzInfo};
+                    {ok, Size, Mtime, ETag, LastMod, Siblings};
                 _ ->
                     true = ets:delete(?TABLE, FilePath),
                     miss
@@ -51,25 +53,25 @@ lookup(FilePath) ->
     end.
 
 %% Store the size, mtime, derived ETag + Last-Modified strings, and the
-%% gzip-sibling result (`{gz, GzSize}` when a `<file>.gz` is on disk,
-%% `nogz` otherwise) for FilePath with a TTL of TtlMs ms from now, or
-%% forever when TtlMs is infinity. Concurrent stores for the same path
-%% are last-writer-wins (each insert is atomic per key).
+%% precompressed-siblings map (the size of each `<file>.br` / `<file>.gz`
+%% sibling on disk, keyed by encoding) for FilePath with a TTL of TtlMs ms
+%% from now, or forever when TtlMs is infinity. Concurrent stores for the
+%% same path are last-writer-wins (each insert is atomic per key).
 -spec store(
     file:filename_all(),
     non_neg_integer(),
     integer(),
     binary(),
     binary(),
-    {gz, non_neg_integer()} | nogz,
+    roadrunner_static:siblings(),
     pos_integer() | infinity
 ) -> ok.
-store(FilePath, Size, Mtime, ETag, LastMod, GzInfo, infinity) ->
-    true = ets:insert(?TABLE, {FilePath, {Size, Mtime, ETag, LastMod, GzInfo, infinity}}),
+store(FilePath, Size, Mtime, ETag, LastMod, Siblings, infinity) ->
+    true = ets:insert(?TABLE, {FilePath, {Size, Mtime, ETag, LastMod, Siblings, infinity}}),
     ok;
-store(FilePath, Size, Mtime, ETag, LastMod, GzInfo, TtlMs) when is_integer(TtlMs), TtlMs > 0 ->
+store(FilePath, Size, Mtime, ETag, LastMod, Siblings, TtlMs) when is_integer(TtlMs), TtlMs > 0 ->
     ExpiresAt = erlang:monotonic_time(millisecond) + TtlMs,
-    true = ets:insert(?TABLE, {FilePath, {Size, Mtime, ETag, LastMod, GzInfo, ExpiresAt}}),
+    true = ets:insert(?TABLE, {FilePath, {Size, Mtime, ETag, LastMod, Siblings, ExpiresAt}}),
     ok.
 
 %% Drop every cached entry in one call.
