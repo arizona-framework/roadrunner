@@ -4,9 +4,14 @@ Convenience builders for the buffered `{Status, Headers, Body}`
 triple — one of the five shapes a roadrunner handler can return.
 
 Each helper sets `Content-Type` and `Content-Length` so handlers
-don't repeat the boilerplate. Body framing (`Connection: close`,
-`Transfer-Encoding`, etc.) is still the connection layer's job —
-these helpers only fill in what the handler can know.
+don't repeat the boilerplate. The generic `body/3,4` builder backs
+the typed `text`, `html`, `json`, and `ndjson` helpers and is the
+escape hatch for any other media type. Every content builder also
+has a variant that takes a `Headers` list, added after the
+content-type and content-length (which stay authoritative). Body
+framing (`Connection: close`, `Transfer-Encoding`, etc.) is still
+the connection layer's job — these helpers only fill in what the
+handler can know.
 
 These helpers only construct the buffered form
 (`t:buffered_response/0`). Streaming, loop, sendfile, and
@@ -15,11 +20,18 @@ WebSocket-upgrade handlers build their own tuple directly; see
 """.
 
 -export([
+    body/3,
+    body/4,
     text/2,
+    text/3,
     html/2,
+    html/3,
     json/2,
+    json/3,
     ndjson/2,
+    ndjson/3,
     redirect/2,
+    redirect/3,
     add_header/3,
     set_cookie/4,
     no_content/0,
@@ -29,17 +41,66 @@ WebSocket-upgrade handlers build their own tuple directly; see
     not_found/0,
     method_not_allowed/1,
     internal_error/0,
-    status/1
+    status/1,
+    status/2
 ]).
 
 -export_type([buffered_response/0]).
 
 -type buffered_response() :: {roadrunner_http:status(), roadrunner_http:headers(), iodata()}.
 
+-doc """
+Generic buffered response — set `Status`, the `Content-Type` header,
+a `Content-Length` computed from `Body`, plus any caller `Headers`.
+
+The shared builder behind `text/3`, `html/3`, `json/3`, and
+`ndjson/3`, and the escape hatch for any other media type. The
+content-type and content-length come first and stay authoritative;
+`Headers` are additive.
+""".
+-spec body(StatusCode :: roadrunner_http:status(), ContentType :: binary(), Body :: iodata()) ->
+    buffered_response().
+body(Status, ContentType, Body) ->
+    body(Status, ContentType, [], Body).
+
+-doc """
+Generic buffered response with caller-supplied `Headers`.
+
+Like `body/3` with an extra `Headers` list added after the
+content-type and content-length, which stay authoritative.
+""".
+-spec body(
+    StatusCode :: roadrunner_http:status(),
+    ContentType :: binary(),
+    Headers :: roadrunner_http:headers(),
+    Body :: iodata()
+) -> buffered_response().
+body(Status, ContentType, Headers, Body) ->
+    {Status,
+        [
+            {~"content-type", ContentType},
+            {~"content-length", integer_to_binary(iolist_size(Body))}
+            | Headers
+        ],
+        Body}.
+
 -doc "Plain-text response with `text/plain; charset=utf-8`.".
 -spec text(StatusCode :: roadrunner_http:status(), Body :: iodata()) -> buffered_response().
 text(Status, Body) ->
-    with_length(Status, ~"text/plain; charset=utf-8", Body).
+    text(Status, [], Body).
+
+-doc """
+Plain-text response with `text/plain; charset=utf-8` and
+caller-supplied `Headers`, added after the content-type and
+content-length (which stay authoritative).
+""".
+-spec text(
+    StatusCode :: roadrunner_http:status(),
+    Headers :: roadrunner_http:headers(),
+    Body :: iodata()
+) -> buffered_response().
+text(Status, Headers, Body) ->
+    body(Status, ~"text/plain; charset=utf-8", Headers, Body).
 
 -doc """
 HTML response with `text/html; charset=utf-8`.
@@ -60,7 +121,20 @@ roadrunner_resp:add_header(
 """.
 -spec html(StatusCode :: roadrunner_http:status(), Body :: iodata()) -> buffered_response().
 html(Status, Body) ->
-    with_length(Status, ~"text/html; charset=utf-8", Body).
+    html(Status, [], Body).
+
+-doc """
+HTML response with `text/html; charset=utf-8` and caller-supplied
+`Headers`, added after the content-type and content-length (which
+stay authoritative).
+""".
+-spec html(
+    StatusCode :: roadrunner_http:status(),
+    Headers :: roadrunner_http:headers(),
+    Body :: iodata()
+) -> buffered_response().
+html(Status, Headers, Body) ->
+    body(Status, ~"text/html; charset=utf-8", Headers, Body).
 
 -doc """
 JSON response — the term is encoded via the stdlib `json` module
@@ -68,8 +142,19 @@ JSON response — the term is encoded via the stdlib `json` module
 """.
 -spec json(StatusCode :: roadrunner_http:status(), Term :: term()) -> buffered_response().
 json(Status, Term) ->
-    Body = json:encode(Term),
-    with_length(Status, ~"application/json", Body).
+    json(Status, [], Term).
+
+-doc """
+JSON response with caller-supplied `Headers`, added after the
+content-type and content-length (which stay authoritative).
+""".
+-spec json(
+    StatusCode :: roadrunner_http:status(),
+    Headers :: roadrunner_http:headers(),
+    Term :: term()
+) -> buffered_response().
+json(Status, Headers, Term) ->
+    body(Status, ~"application/json", Headers, json:encode(Term)).
 
 -doc """
 NDJSON response — each item in `Items` is framed as one compact JSON
@@ -79,9 +164,21 @@ to a `{stream, ...}` handler that pushes `roadrunner_ndjson:item/1` per
 line; reach for this when the whole list fits in memory.
 """.
 -spec ndjson(StatusCode :: roadrunner_http:status(), Items :: [term()]) -> buffered_response().
-ndjson(Status, Items) when is_list(Items) ->
+ndjson(Status, Items) ->
+    ndjson(Status, [], Items).
+
+-doc """
+NDJSON response with caller-supplied `Headers`, added after the
+content-type and content-length (which stay authoritative).
+""".
+-spec ndjson(
+    StatusCode :: roadrunner_http:status(),
+    Headers :: roadrunner_http:headers(),
+    Items :: [term()]
+) -> buffered_response().
+ndjson(Status, Headers, Items) when is_list(Items) ->
     Body = [roadrunner_ndjson:item(Item) || Item <- Items],
-    with_length(Status, roadrunner_ndjson:content_type(), Body).
+    body(Status, roadrunner_ndjson:content_type(), Headers, Body).
 
 -doc """
 Redirect response — sets the `Location` header and an empty body.
@@ -89,22 +186,26 @@ Use a 3xx status (typically 301, 302, 303, 307, or 308).
 """.
 -spec redirect(StatusCode :: roadrunner_http:redirect_status(), Location :: binary()) ->
     buffered_response().
-redirect(Status, Location) when is_binary(Location) ->
+redirect(Status, Location) ->
+    redirect(Status, [], Location).
+
+-doc """
+Redirect response with caller-supplied `Headers`, added after the
+`Location` and content-length (which stay authoritative).
+""".
+-spec redirect(
+    StatusCode :: roadrunner_http:redirect_status(),
+    Headers :: roadrunner_http:headers(),
+    Location :: binary()
+) -> buffered_response().
+redirect(Status, Headers, Location) when is_binary(Location) ->
     {Status,
         [
             {~"location", Location},
             {~"content-length", ~"0"}
+            | Headers
         ],
         ~""}.
-
--spec with_length(roadrunner_http:status(), binary(), iodata()) -> buffered_response().
-with_length(Status, ContentType, Body) ->
-    {Status,
-        [
-            {~"content-type", ContentType},
-            {~"content-length", integer_to_binary(iolist_size(Body))}
-        ],
-        Body}.
 
 -doc """
 Prepend a header to an existing response triple.
@@ -166,8 +267,19 @@ Empty-body response with an arbitrary status code — handy for
 statuses outside the named shortcut set (e.g., 418, 503).
 """.
 -spec status(roadrunner_http:status()) -> buffered_response().
-status(Code) -> empty_status(Code).
+status(Code) -> status(Code, []).
+
+-doc """
+Empty-body response with an arbitrary status code and caller-supplied
+`Headers`, added after the content-length (which stays authoritative).
+This is the headers path for the fixed-status helpers.
+""".
+-spec status(roadrunner_http:status(), roadrunner_http:headers()) -> buffered_response().
+status(Code, Headers) -> empty_status(Code, Headers).
 
 -spec empty_status(roadrunner_http:status()) -> buffered_response().
-empty_status(Status) ->
-    {Status, [{~"content-length", ~"0"}], ~""}.
+empty_status(Status) -> empty_status(Status, []).
+
+-spec empty_status(roadrunner_http:status(), roadrunner_http:headers()) -> buffered_response().
+empty_status(Status, Headers) ->
+    {Status, [{~"content-length", ~"0"} | Headers], ~""}.
