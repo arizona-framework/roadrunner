@@ -626,16 +626,16 @@ unmask_slice_chunks(<<O:32, Rest/binary>>, MK, Acc) ->
     T = O bxor MK,
     unmask_slice_chunks(Rest, MK, <<Acc/binary, T:32>>);
 unmask_slice_chunks(<<O:24>>, MK, Acc) ->
-    <<MK2:24, _:8>> = <<MK:32>>,
-    T = O bxor MK2,
+    %% Tail of 1-3 bytes: XOR against the high bytes of the 32-bit mask
+    %% (the bytes the cycle lands on next). Shifting the mask down beats
+    %% repacking it into a binary and re-matching the leading bytes.
+    T = O bxor (MK bsr 8),
     <<Acc/binary, T:24>>;
 unmask_slice_chunks(<<O:16>>, MK, Acc) ->
-    <<MK2:16, _:16>> = <<MK:32>>,
-    T = O bxor MK2,
+    T = O bxor (MK bsr 16),
     <<Acc/binary, T:16>>;
 unmask_slice_chunks(<<O:8>>, MK, Acc) ->
-    <<MK2:8, _:24>> = <<MK:32>>,
-    T = O bxor MK2,
+    T = O bxor (MK bsr 24),
     <<Acc/binary, T:8>>;
 unmask_slice_chunks(<<>>, _MK, Acc) ->
     Acc.
