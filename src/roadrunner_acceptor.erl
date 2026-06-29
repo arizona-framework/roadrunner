@@ -5,11 +5,20 @@
 %% and hands each accepted connection off to a `roadrunner_conn` worker.
 %%
 %% Spawn-linked to the owning `roadrunner_listener`: a listener stop closes
-%% the listen socket, the acceptor's `accept/1` returns `{error, _}`,
-%% and the acceptor exits cleanly. Unrelated acceptor crashes propagate
+%% the listen socket, the acceptor's `accept/1` returns `{error, closed}`,
+%% and the acceptor exits cleanly. A transient accept error instead
+%% (`emfile`/`enfile`/`system_limit` descriptor exhaustion when `max_clients`
+%% sits above the OS `ulimit -n`, or a connection aborted before accept
+%% completed) is reported via telemetry and retried after a short back-off,
+%% so the pool never silently drains. Unrelated acceptor crashes propagate
 %% back via the link, taking the listener down for supervisor restart.
 %% Connection workers are spawned **without** a link so that a crash
 %% in one connection does not bring down the acceptor.
+
+%% Back-off between retries after a transient accept error. Bounds the
+%% retry/telemetry rate and gives the box a moment to reclaim descriptors
+%% before the next `accept/1`.
+-define(ACCEPT_ERROR_BACKOFF_MS, 100).
 
 -export([start_link/3]).
 
@@ -37,10 +46,25 @@ loop(LSocket, ProtoOpts) ->
         {ok, Socket} ->
             handle_accepted(Socket, ProtoOpts),
             loop(LSocket, ProtoOpts);
-        {error, _} ->
-            %% Listen socket was closed (or another transport error) —
-            %% terminate cleanly; the linked listener will tear us down.
-            ok
+        {error, closed} ->
+            %% Listen socket was closed — the listener is stopping. Exit
+            %% cleanly; the linked listener tears the rest of the pool down.
+            ok;
+        {error, Reason} ->
+            %% Any other accept error is transient: descriptor exhaustion
+            %% (`emfile`/`enfile`/`system_limit`) when `max_clients` sits
+            %% above the OS `ulimit -n`, or a connection aborted before
+            %% accept completed. Surface it and back off, then keep
+            %% accepting — exiting here would silently drain the pool and
+            %% leave the listener permanently deaf with no diagnostic.
+            ok = roadrunner_telemetry:listener_accept_error(#{
+                listener_name => maps:get(listener_name, ProtoOpts, undefined),
+                reason => Reason
+            }),
+            receive
+            after ?ACCEPT_ERROR_BACKOFF_MS -> ok
+            end,
+            loop(LSocket, ProtoOpts)
     end.
 
 -spec handle_accepted(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> ok.

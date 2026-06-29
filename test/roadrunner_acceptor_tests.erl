@@ -105,6 +105,47 @@ conn_process_carries_listener_name_and_peer_label_test_() ->
             end}
         end}.
 
+acceptor_retries_on_transient_accept_error_test() ->
+    %% Accepting on a connected (non-listen) socket fails with a transient
+    %% error (einval here, standing in for emfile descriptor exhaustion). The
+    %% acceptor must report it via telemetry and keep looping, NOT exit and
+    %% leave the listener silently deaf. Closing the socket then yields
+    %% {error, closed}, which ends the loop cleanly.
+    {ok, LSock} = gen_tcp:listen(0, [binary, {active, false}]),
+    {ok, Port} = inet:port(LSock),
+    {ok, CSock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    {ok, _} = application:ensure_all_started(telemetry),
+    Self = self(),
+    HandlerId = {?MODULE, make_ref()},
+    ok = telemetry:attach(
+        HandlerId,
+        [roadrunner, listener, accept_error],
+        fun(_Event, _Measure, Meta, _Cfg) -> Self ! {accept_error, Meta} end,
+        undefined
+    ),
+    {ok, Pid} = roadrunner_acceptor:start_link(
+        {gen_tcp, CSock}, #{listener_name => acceptor_test_accept_error}, 1
+    ),
+    receive
+        {accept_error, Meta} ->
+            ?assertEqual(acceptor_test_accept_error, maps:get(listener_name, Meta)),
+            ?assertNotEqual(closed, maps:get(reason, Meta))
+    after 2000 ->
+        error(no_accept_error_telemetry)
+    end,
+    %% Survived the transient error.
+    ?assert(is_process_alive(Pid)),
+    %% Closing the socket turns the next accept into {error, closed} → exit.
+    MRef = erlang:monitor(process, Pid),
+    ok = gen_tcp:close(CSock),
+    receive
+        {'DOWN', MRef, process, Pid, normal} -> ok
+    after 2000 ->
+        error(acceptor_did_not_stop)
+    end,
+    ok = telemetry:detach(HandlerId),
+    ok = gen_tcp:close(LSock).
+
 %% --- helpers ---
 
 %% Poll until we see a refined `{roadrunner_conn, Name, Peer}` label or run

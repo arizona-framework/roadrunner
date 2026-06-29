@@ -76,6 +76,16 @@
 %%   - **Measurements:** `system_time`.
 %%   - **Metadata:** `listener_name`, `reason` (`max_clients`).
 %%
+%% - `[roadrunner, listener, accept_error]` — fired when an acceptor's
+%%   `accept/1` returns a transient error: file-descriptor exhaustion
+%%   (`emfile`/`enfile`/`system_limit`, usually `max_clients` above the OS
+%%   `ulimit -n`) or a connection aborted before accept completed. The
+%%   acceptor backs off and keeps accepting instead of exiting, so this is
+%%   the signal that the box is out of descriptors — raise `ulimit -n`.
+%%
+%%   - **Measurements:** `system_time`.
+%%   - **Metadata:** `listener_name`, `reason` (the accept error).
+%%
 %% - `[roadrunner, request, throttled]` — fired before any handler runs when a
 %%   request is refused at a listener limit, for one of two reasons:
 %%     - `max_concurrent_requests`: an HTTP/2 or HTTP/3 stream over the
@@ -169,6 +179,7 @@
     listener_accept/1,
     listener_conn_close/2,
     listener_conn_rejected/1,
+    listener_accept_error/1,
     request_rejected/1,
     request_throttled/1,
     slots_reconciled/1,
@@ -305,6 +316,25 @@ to stay cheap under a connection flood.
 listener_conn_rejected(Metadata) ->
     telemetry:execute(
         [roadrunner, listener, conn_rejected],
+        #{system_time => erlang:system_time()},
+        Metadata
+    ),
+    ok.
+
+-doc """
+Emit `[roadrunner, listener, accept_error]` when an acceptor's `accept/1`
+fails with a transient error — file-descriptor exhaustion
+(`emfile`/`enfile`/`system_limit`, typically `max_clients` sitting above
+the OS `ulimit -n`) or a connection aborted before accept completed. The
+acceptor reports it here, backs off, and keeps accepting rather than
+exiting, so this event is the signal that the box is out of descriptors.
+`Metadata` should include `listener_name` and `reason` (the accept
+error). Carries no `peer`: there is no connection to name.
+""".
+-spec listener_accept_error(map()) -> ok.
+listener_accept_error(Metadata) ->
+    telemetry:execute(
+        [roadrunner, listener, accept_error],
         #{system_time => erlang:system_time()},
         Metadata
     ),
