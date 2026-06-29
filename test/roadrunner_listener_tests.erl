@@ -140,6 +140,25 @@ listener_honors_ip_opt_test() ->
     ok = gen_tcp:close(Sock),
     ok = roadrunner_listener:stop(Name).
 
+listener_honors_recv_buffer_opt_test() ->
+    %% A custom `recv_buffer` must flow into `gen_tcp:listen` as the socket
+    %% `buffer` (the default path is exercised by every other listener test).
+    %% Bind with an explicit buffer and serve one request through the socket
+    %% to prove the listen option was accepted, not just stored.
+    Name = listener_test_recv_buffer,
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        recv_buffer => 16384,
+        routes => roadrunner_hello_handler
+    }),
+    Port = roadrunner_listener:port(Name),
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+    {ok, Reply} = gen_tcp:recv(Sock, 0, 1000),
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+    ok = gen_tcp:close(Sock),
+    ok = roadrunner_listener:stop(Name).
+
 %% =============================================================================
 %% notify_drain/2 (soft drain — broadcast without stopping the listener)
 %% =============================================================================

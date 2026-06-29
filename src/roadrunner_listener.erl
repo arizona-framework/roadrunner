@@ -48,13 +48,16 @@ All duration and interval values in `opts()` are in milliseconds —
 -define(DEFAULT_KEEP_ALIVE_TIMEOUT, 60000).
 -define(DEFAULT_NUM_ACCEPTORS, 10).
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
--define(DEFAULT_MAX_CLIENTS, 150).
+-define(DEFAULT_MAX_CLIENTS, 16384).
 -define(DEFAULT_MAX_CONCURRENT_REQUESTS, infinity).
 -define(DEFAULT_MIN_BYTES_PER_SECOND, 100).
 %% TCP listen backlog (kernel SYN/accept queue depth). OTP defaults to 5,
 %% which a burst of concurrent connects overflows; 1024 matches cowboy.
 %% Linux clamps the effective value at `net.core.somaxconn`.
 -define(DEFAULT_SOCKET_BACKLOG, 1024).
+%% Emulator user-space recv buffer per accepted socket (see the `buffer`
+%% note in `base_listen_opts/1` for the throughput/memory trade-off).
+-define(DEFAULT_RECV_BUFFER, 65536).
 %% Spawn config for every handler-running process (connection process +
 %% HTTP/2/3 stream workers). `fullsweep_after, 0` reclaims the per-connection
 %% heap that grows building a response (e.g. a JSON encoder's transient iolist)
@@ -131,22 +134,33 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `num_acceptors` — size of the acceptor pool. Default 10.
 - `max_keep_alive_requests` — requests served per conn before
   forced close. Default 1000.
-- `max_clients` — concurrent connection cap. Default 150. Connections
-  accepted while already at the cap are closed immediately without a
-  response. The default bounds memory (the recv `buffer` alone is
-  `max_clients × 64 KB`), so high-concurrency deployments should raise
-  it. Rejections are observable: each one emits
-  `[roadrunner, listener, conn_rejected]` and increments the `rejected`
-  count from `info/1`, so a rising `rejected` is the signal that the
-  cap is the binding limit.
+- `max_clients` — concurrent connection cap. Default 16384 (the modern
+  Erlang/Elixir HTTP-server norm). Connections accepted while already at
+  the cap are closed immediately without a response. The effective cap is
+  `min(max_clients, the OS file-descriptor limit)` — raise `ulimit -n`
+  (and the systemd `LimitNOFILE`) for high concurrency, otherwise the
+  acceptors hit `emfile` at the descriptor ceiling and emit
+  `[roadrunner, listener, accept_error]`. Saturation memory scales as
+  `max_clients × recv_buffer`, so memory-constrained deployments lower the
+  cap or `recv_buffer`. Rejections are observable:
+  each one emits `[roadrunner, listener, conn_rejected]` and increments
+  the `rejected` count from `info/1`, so a rising `rejected` is the
+  signal that the cap is the binding limit. For HTTP/2 and HTTP/3 the
+  worst-case live-handler count is `max_clients × max_concurrent_streams`;
+  bound it with `max_concurrent_requests` (default `infinity`) if heavy
+  multiplexing memory is a concern.
 - `max_concurrent_requests` — cap on concurrent in-flight requests
   (live handler processes) across the whole listener, for the
   multiplexed protocols (HTTP/2 and HTTP/3). Default `infinity` (off).
   `max_clients` bounds connections and `max_concurrent_streams` bounds
   streams per connection, but their product (the worst-case live-handler
-  count) is otherwise unbounded; a high `max_clients` set for burst
-  tolerance can let concurrent handler memory grow without limit under
-  heavy multiplexing. This caps the product directly. Over-limit streams
+  count) is otherwise unbounded; at the defaults that product
+  (`16384 × 100` ≈ 1.6M) exceeds the BEAM process limit (`+P`, default
+  262144), so under heavy multiplexing it can exhaust the VM-global
+  process table — failing spawns everywhere, not just this listener — on
+  top of unbounded handler memory. This caps the product directly; set it
+  to a finite value when enabling HTTP/2 or HTTP/3 under a high
+  `max_clients`. Over-limit streams
   are refused with `REFUSED_STREAM` (h2) / `H3_REQUEST_REJECTED` (h3),
   which RFC 9113 §8.7 marks safe to retry; each refusal emits
   `[roadrunner, request, throttled]` and increments the `throttled`
@@ -162,6 +176,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   dev/admin/metrics endpoint that must not be reachable from the LAN.
   Applies to every socket the listener binds: plain TCP, TLS, and the
   HTTP/3 UDP socket.
+- `recv_buffer` — emulator user-space buffer (bytes) for inbound TCP
+  data, per accepted connection. Default 64 KB. Larger values cut the
+  per-body message count on high-MTU paths; smaller values cut
+  per-connection memory at scale. See the `buffer` note in
+  `base_listen_opts/1`.
 - `min_bytes_per_second` — slow-loris guard on the request-read
   phase (0 disables). Default 100.
 - `rate_check_interval` — how often the rate guard re-checks
@@ -222,6 +241,7 @@ ops-tuning rationale.
     %% (`0.0.0.0` / `::`). Set to `{127,0,0,1}` to restrict the
     %% listener to loopback.
     ip => inet:ip_address(),
+    recv_buffer => pos_integer(),
     min_bytes_per_second => non_neg_integer(),
     %% How often `reading_request` re-checks the running
     %% bytes-per-second average against `min_bytes_per_second`.
@@ -1019,11 +1039,12 @@ base_listen_opts(Opts) ->
     %% (1460-byte chunks) this can result in many small messages
     %% per request body, each paying the message-passing tax. 64 KB
     %% is enough to carry 4 default-sized HTTP/2 DATA frames or a
-    %% typical request, comfortably above the per-MTU floor without
-    %% wasting memory at scale (`max_clients × 64KB` ≈ 10 MB at the
-    %% default `max_clients = 150`). See `erlang/otp#9423` and
-    %% `ninenines/cowlib#143` for the upstream context that prompted
-    %% this tuning.
+    %% typical request, comfortably above the per-MTU floor. Saturation
+    %% memory scales as `max_clients × this buffer`, so it is the
+    %% `recv_buffer` listener opt — lower it to trade body-path
+    %% throughput for per-connection memory at a high `max_clients`. See
+    %% `erlang/otp#9423` and `ninenines/cowlib#143` for the upstream
+    %% context that prompted this tuning.
     Base = [
         binary,
         {active, false},
@@ -1031,7 +1052,7 @@ base_listen_opts(Opts) ->
         {packet, raw},
         {nodelay, true},
         {backlog, maps:get(socket_backlog, Opts, ?DEFAULT_SOCKET_BACKLOG)},
-        {buffer, 65536}
+        {buffer, maps:get(recv_buffer, Opts, ?DEFAULT_RECV_BUFFER)}
     ],
     %% Prepend `{ip, IP}` only when the caller set it, so the default
     %% list (and the default all-interfaces bind) is unchanged. Both
