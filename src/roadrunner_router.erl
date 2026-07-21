@@ -112,6 +112,19 @@ Captured route parameters, populated by `match/3`.
 (`#{~"id" => ~"42"}`). `*wildcard` segments produce the list of
 remaining path segments
 (`#{~"rest" => [~"a", ~"b"]}`). Empty for routes with no captures.
+
+Captured values are percent-decoded (`/users/caf%C3%A9` binds
+`<<"café"/utf8>>`), consistent with query params; a segment whose
+percent-escapes are malformed (a `%` not followed by two hex digits)
+is kept raw. Decoding does not validate UTF-8, so `%FF` binds the raw
+`0xFF` byte. There is no `+` -> space translation -- that is a
+query-string convention, so a literal `+` in a path stays a `+`.
+
+Because decoding happens after the path is split on raw `/`, a decoded
+value can contain a `/` (`%2F`), a `..`, or a leading `/` — it is not a
+single clean path component. A handler that builds a filesystem path or
+an outbound URL from a captured value must reject `..` and absolute
+segments itself; see `roadrunner_static` for the reference check.
 """.
 -type bindings() :: #{binary() => binary() | [binary()]}.
 
@@ -257,7 +270,7 @@ match_first(Method, Segments, [{Pattern, Handler, Pipeline, State, Methods} | Re
             match_first(Method, Segments, Rest, Allow);
         Bindings ->
             case method_allowed(Method, Methods) of
-                true -> {ok, Handler, Bindings, Pipeline, State};
+                true -> {ok, Handler, decode_bindings(Bindings), Pipeline, State};
                 false -> match_first(Method, Segments, Rest, maps:merge(Allow, Methods))
             end
     end.
@@ -287,6 +300,41 @@ match_pattern([{wildcard, Name}], Segs, Bindings) ->
     Bindings#{Name => Segs};
 match_pattern(_, _, _) ->
     no_match.
+
+%% Percent-decode the captured bindings of the matched route. `match/3` splits
+%% the path on raw `/`, so a `:param`/`*wildcard` segment arrives still
+%% percent-encoded (`/users/caf%C3%A9` captures `<<"caf%C3%A9">>`); decode each
+%% captured segment so handlers see the real characters, consistent with query
+%% params (`roadrunner_qs`). Decoding runs once, on the winning route only, and
+%% short-circuits the common capture-free route. Done here rather than in
+%% `match_pattern/3` so a partially-matching route that later fails does not pay
+%% to decode captures it then discards.
+-spec decode_bindings(bindings()) -> bindings().
+decode_bindings(Bindings) when map_size(Bindings) =:= 0 ->
+    Bindings;
+decode_bindings(Bindings) ->
+    #{Name => decode_value(Value) || Name := Value <- Bindings}.
+
+%% A `:param` value is a single segment; a `*wildcard` value is the list of
+%% remaining segments -- decode each element.
+-spec decode_value(binary() | [binary()]) -> binary() | [binary()].
+decode_value(Value) when is_binary(Value) ->
+    decode_segment(Value);
+decode_value(Segments) when is_list(Segments) ->
+    [decode_segment(Segment) || Segment <- Segments].
+
+%% Percent-decode one captured segment, keeping it raw on a malformed escape (a
+%% `%` not followed by two hex digits) rather than failing the match on
+%% attacker-controllable input. Decoding does not validate UTF-8, so non-UTF-8
+%% escapes pass through as their raw bytes. No `+` -> space: that is a
+%% query/form-encoding convention, not a path one (a literal `+` is valid,
+%% unencoded path data).
+-spec decode_segment(binary()) -> binary().
+decode_segment(Segment) ->
+    case roadrunner_uri:percent_decode(Segment) of
+        {ok, Decoded} -> Decoded;
+        {error, badarg} -> Segment
+    end.
 
 -spec path_segments(binary()) -> [binary()].
 path_segments(Path) ->
