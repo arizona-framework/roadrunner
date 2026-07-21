@@ -7,7 +7,7 @@
 %% =============================================================================
 
 static_test_() ->
-    {setup, fun setup/0, fun cleanup/1, fun({_Dir, Port}) ->
+    {setup, fun setup/0, fun cleanup/1, fun({Dir, Port}) ->
         [
             {"serves a file with text/html content-type", fun() ->
                 Reply = http_get(Port, ~"/static/hello.html"),
@@ -274,14 +274,49 @@ static_test_() ->
                 [_Head, Body] = binary:split(Reply, ~"\r\n\r\n"),
                 ?assertEqual(<<>>, Body)
             end},
-            {"percent-encoded .. is not normalized — stays a literal segment", fun() ->
-                %% Defense-in-depth pin: the wildcard captures `%2E%2E`
-                %% byte-for-byte, the `..` validator therefore lets it
-                %% through, and `file:read_file_info/1` fails to locate
-                %% a real entry by that name → 404. If we ever start
-                %% percent-decoding wildcard segments, this test forces
-                %% us to re-derive the traversal defense.
+            {"percent-encoded .. decodes to a .. segment and is rejected", fun() ->
+                %% The router now percent-decodes captured segments, so
+                %% `%2E%2E` becomes `..`; here it lands as its own
+                %% segment (there is a raw `/` after it), which the
+                %% `..` validator rejects → 404. (Before decoding this
+                %% 404'd only incidentally, as a literal missing entry.)
                 Reply = http_get(Port, ~"/static/%2E%2E/hello.html"),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
+            end},
+            {"percent-encoded ../ inside one segment cannot escape the docroot", fun() ->
+                %% The dangerous case decoding introduces: `%2e%2e%2f...`
+                %% has no raw `/`, so it is ONE captured segment that
+                %% decodes to `../<docroot>/hello.html` — a real, existing
+                %% file reached by escaping and re-entering the docroot. A
+                %% whole-segment `=:= ".."` check would pass this and serve
+                %% the file; `validate_segments/1` splits the segment and
+                %% rejects the `..` component → 404.
+                Base = list_to_binary(filename:basename(Dir)),
+                Escape = iolist_to_binary([~"/static/%2e%2e%2f", Base, ~"%2fhello.html"]),
+                Reply = http_get(Port, Escape),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
+            end},
+            {"percent-encoded absolute path cannot escape the docroot", fun() ->
+                %% The other case decoding introduces: encoding every `/` as
+                %% `%2f` leaves no raw `/`, so the whole thing is ONE captured
+                %% segment that decodes to an ABSOLUTE path (here hello.html's
+                %% own absolute path — a real, existing file). `filename:join/1`
+                %% drops the docroot the moment a component is absolute, so a
+                %% `..`-only check would serve the file; `validate_segments/1`
+                %% rejects the absolute segment → 404.
+                AbsFile = list_to_binary(filename:join(Dir, "hello.html")),
+                Encoded = binary:replace(AbsFile, ~"/", ~"%2f", [global]),
+                Reply = http_get(Port, <<"/static/", Encoded/binary>>),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
+            end},
+            {"percent-encoded control byte in a segment → 404, no crash", fun() ->
+                %% Decoding now hands the handler attacker-controlled bytes,
+                %% including the control range `%00`-`%1f`. A decoded NUL
+                %% passes the traversal check (relative, no `..`) and reaches
+                %% `file:read_link_info/2`, which returns `{error, badarg}` —
+                %% the catch-all serves 404 rather than letting the badarg
+                %% crash the connection process.
+                Reply = http_get(Port, ~"/static/foo%00bar"),
                 ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
             end},
             {"directory path resolves to a non-regular file → 404", fun() ->

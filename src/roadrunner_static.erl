@@ -625,14 +625,27 @@ range_not_satisfiable(Size, ETag, LastMod) ->
         ],
         ~""}.
 
-%% Reject any segment that's `..` — defense against path traversal.
-%% Empty segments are already stripped by `roadrunner_router:path_segments/1`.
+%% Reject a path-traversal segment. `roadrunner_router` percent-decodes captured
+%% segments, so a single wildcard segment can now carry an embedded `/`, a `..`,
+%% or a leading `/`:
+%%   - `/static/%2e%2e%2fetc` decodes to one `<<"../etc">>` segment, and
+%%   - `/static/%2fetc%2fpasswd` decodes to one absolute `<<"/etc/passwd">>`.
+%% An absolute segment is the more dangerous case: `filename:join/1` drops the
+%% docroot entirely as soon as a later component is absolute, so the join
+%% escapes without ever going through `..`. Reject a segment that is absolute or
+%% that carries a `..` component; a bare `S =:= ~".."` would miss both. Empty
+%% segments are already stripped by `roadrunner_router:path_segments/1`.
 -spec validate_segments([binary()]) -> ok | traversal.
 validate_segments(Segments) ->
-    case lists:any(fun(S) -> S =:= ~".." end, Segments) of
+    case lists:any(fun segment_traverses/1, Segments) of
         true -> traversal;
         false -> ok
     end.
+
+-spec segment_traverses(binary()) -> boolean().
+segment_traverses(Segment) ->
+    filename:pathtype(Segment) =/= relative orelse
+        lists:member(~"..", filename:split(Segment)).
 
 %% Decide whether a symlink leaf may be served under the route's policy.
 -spec symlink_allowed(file:filename_all(), roadrunner_req:request()) -> boolean().

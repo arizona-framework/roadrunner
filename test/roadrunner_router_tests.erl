@@ -123,6 +123,53 @@ match_root_wildcard_test() ->
         match_no_pipeline(~"/", Compiled)
     ).
 
+%% =============================================================================
+%% Percent-decoded captures
+%% =============================================================================
+
+match_param_is_percent_decoded_test() ->
+    Compiled = roadrunner_router:compile([{~"/users/:name", users_handler}], []),
+    ?assertEqual(
+        {ok, users_handler, #{~"name" => <<"café"/utf8>>}, #{}},
+        match_no_pipeline(~"/users/caf%C3%A9", Compiled)
+    ).
+
+match_param_decodes_encoded_slash_within_segment_test() ->
+    %% `%2F` is not a raw `/`, so the router does not split on it — it stays one
+    %% captured segment that decodes to a literal `/` in the value.
+    Compiled = roadrunner_router:compile([{~"/files/:name", files_handler}], []),
+    ?assertEqual(
+        {ok, files_handler, #{~"name" => ~"a/b"}, #{}},
+        match_no_pipeline(~"/files/a%2Fb", Compiled)
+    ).
+
+match_param_malformed_escape_kept_raw_test() ->
+    %% A bad %-escape (non-hex) is left as the raw segment rather than failing
+    %% the match on attacker-controllable input.
+    Compiled = roadrunner_router:compile([{~"/users/:name", users_handler}], []),
+    ?assertEqual(
+        {ok, users_handler, #{~"name" => ~"a%ZZ"}, #{}},
+        match_no_pipeline(~"/users/a%ZZ", Compiled)
+    ).
+
+match_param_literal_plus_preserved_test() ->
+    %% No `+` -> space: that is a query-string convention. A `+` in a path
+    %% segment is literal data.
+    Compiled = roadrunner_router:compile([{~"/tags/:tag", tags_handler}], []),
+    ?assertEqual(
+        {ok, tags_handler, #{~"tag" => ~"a+b"}, #{}},
+        match_no_pipeline(~"/tags/a+b", Compiled)
+    ).
+
+match_wildcard_segments_are_percent_decoded_test() ->
+    %% Each captured wildcard segment decodes independently; an encoded slash
+    %% stays within its segment (the split already happened on raw `/`).
+    Compiled = roadrunner_router:compile([{~"/static/*path", static_handler}], []),
+    ?assertEqual(
+        {ok, static_handler, #{~"path" => [<<"café"/utf8>>, ~"a/b"]}, #{}},
+        match_no_pipeline(~"/static/caf%C3%A9/a%2Fb", Compiled)
+    ).
+
 match_route_with_state_test() ->
     %% 3-tuple route attaches per-handler state. State is baked into
     %% the pipeline closure (verified behaviorally by
@@ -305,11 +352,11 @@ match_empty_path_matches_root_route_test() ->
     ?assertEqual({ok, home_handler, #{}, #{}}, match_no_pipeline(~"", Compiled)).
 
 match_param_captures_percent_encoded_segment_test() ->
-    %% Router does not percent-decode — handlers see the raw segment.
-    %% Documented as "literal segments must match byte-exactly".
+    %% The router percent-decodes captured segments, so `%20` becomes a space
+    %% (consistent with query params).
     Compiled = roadrunner_router:compile([{~"/users/:id", users_handler}], []),
     ?assertEqual(
-        {ok, users_handler, #{~"id" => ~"joe%20bob"}, #{}},
+        {ok, users_handler, #{~"id" => ~"joe bob"}, #{}},
         match_no_pipeline(~"/users/joe%20bob", Compiled)
     ).
 
