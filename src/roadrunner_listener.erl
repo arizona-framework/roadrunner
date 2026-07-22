@@ -139,6 +139,12 @@ Optional middleware and timing knobs (durations in milliseconds):
   depth). Default 1024. Raise it for connection bursts (load tests,
   health-check storms); Linux clamps the effective value at
   `net.core.somaxconn`.
+- `ip` — local interface to bind. Unset (the default) binds all
+  interfaces (`0.0.0.0` / `::`); set a specific address such as
+  `{127,0,0,1}` to restrict the listener to loopback, e.g. a
+  dev/admin/metrics endpoint that must not be reachable from the LAN.
+  Applies to every socket the listener binds: plain TCP, TLS, and the
+  HTTP/3 UDP socket.
 - `min_bytes_per_second` — slow-loris guard on the request-read
   phase (0 disables). Default 100.
 - `rate_check_interval` — how often the rate guard re-checks
@@ -194,6 +200,10 @@ ops-tuning rationale.
     max_clients => pos_integer(),
     max_concurrent_requests => infinity | pos_integer(),
     socket_backlog => pos_integer(),
+    %% Local interface to bind. Unset means all interfaces
+    %% (`0.0.0.0` / `::`). Set to `{127,0,0,1}` to restrict the
+    %% listener to loopback.
+    ip => inet:ip_address(),
     min_bytes_per_second => non_neg_integer(),
     %% How often `reading_request` re-checks the running
     %% bytes-per-second average against `min_bytes_per_second`.
@@ -719,10 +729,10 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
             %% when asked for an ephemeral port, hold a reuseport probe
             %% socket to pin a free port, start the pool on it, then drop
             %% the probe (the pool listeners keep the port via reuseport).
-            {QuicPort, Probe} = resolve_quic_port(Port),
+            {QuicPort, Probe} = resolve_quic_port(Port, Opts),
             Listeners = maps:get(http3_listeners, ProtoOpts, ?DEFAULT_H3_LISTENERS),
             MaxStreamsBidi = maps:get(http3_max_streams_bidi, ProtoOpts, ?H3_MAX_STREAMS_BIDI),
-            Res = start_quic_pool(QuicPort, #{
+            PoolOpts = #{
                 cert => Cert,
                 key => Key,
                 cert_chain => CertChain,
@@ -730,7 +740,15 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
                 max_streams_bidi => MaxStreamsBidi,
                 connection_handler => Handler,
                 pool_size => Listeners - 1
-            }),
+            },
+            %% Bind the QUIC pool to the same interface as the TCP socket
+            %% when `ip` is set, so an h3 listener honors loopback too.
+            PoolOptsIp =
+                case Opts of
+                    #{ip := IP} -> PoolOpts#{ip => IP};
+                    #{} -> PoolOpts
+                end,
+            Res = start_quic_pool(QuicPort, PoolOptsIp),
             ok = close_quic_probe(Probe),
             Res
     end.
@@ -753,13 +771,20 @@ start_quic_pool(Port, PoolOpts) ->
 
 %% Pin a free UDP port with a reuseport probe socket so all pool
 %% listeners bind the same concrete port; a fixed port is used as-is.
--spec resolve_quic_port(inet:port_number()) ->
+%% The probe binds the same interface as the pool (via `ip`) so the
+%% pinned port is genuinely free on that address, not just on `0.0.0.0`.
+-spec resolve_quic_port(inet:port_number(), opts()) ->
     {inet:port_number(), gen_udp:socket() | undefined}.
-resolve_quic_port(0) ->
-    {ok, Probe} = gen_udp:open(0, [{reuseport, true}]),
+resolve_quic_port(0, Opts) ->
+    ProbeOpts =
+        case Opts of
+            #{ip := IP} -> [{reuseport, true}, {ip, IP}];
+            #{} -> [{reuseport, true}]
+        end,
+    {ok, Probe} = gen_udp:open(0, ProbeOpts),
     {ok, ProbePort} = inet:port(Probe),
     {ProbePort, Probe};
-resolve_quic_port(Port) ->
+resolve_quic_port(Port, _Opts) ->
     {Port, undefined}.
 
 -spec close_quic_probe(gen_udp:socket() | undefined) -> ok.
@@ -948,7 +973,7 @@ base_listen_opts(Opts) ->
     %% default `max_clients = 150`). See `erlang/otp#9423` and
     %% `ninenines/cowlib#143` for the upstream context that prompted
     %% this tuning.
-    [
+    Base = [
         binary,
         {active, false},
         {reuseaddr, true},
@@ -956,7 +981,16 @@ base_listen_opts(Opts) ->
         {nodelay, true},
         {backlog, maps:get(socket_backlog, Opts, ?DEFAULT_SOCKET_BACKLOG)},
         {buffer, 65536}
-    ].
+    ],
+    %% Prepend `{ip, IP}` only when the caller set it, so the default
+    %% list (and the default all-interfaces bind) is unchanged. Both
+    %% `gen_tcp:listen/2` and `ssl:listen/2` accept `{ip, _}`, and the
+    %% TLS path builds on this list, so a loopback bind covers HTTP and
+    %% HTTPS alike.
+    case Opts of
+        #{ip := IP} -> [{ip, IP} | Base];
+        #{} -> Base
+    end.
 
 %% Multiple acceptor processes all calling gen_tcp:accept on the same listen
 %% socket — Linux/BSD accept is thread-safe and avoids thundering-herd via

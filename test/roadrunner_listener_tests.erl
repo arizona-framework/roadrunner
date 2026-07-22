@@ -121,6 +121,25 @@ listener_honors_socket_backlog_opt_test() ->
     ok = gen_tcp:close(Sock),
     ok = roadrunner_listener:stop(Name).
 
+listener_honors_ip_opt_test() ->
+    %% A custom `ip` must flow into `gen_tcp:listen` and bind that
+    %% interface. Bind loopback on an ephemeral port and serve one
+    %% request through the socket to prove the listen option was
+    %% accepted, not just stored.
+    Name = listener_test_ip,
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        ip => {127, 0, 0, 1},
+        routes => roadrunner_hello_handler
+    }),
+    Port = roadrunner_listener:port(Name),
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+    {ok, Reply} = gen_tcp:recv(Sock, 0, 1000),
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+    ok = gen_tcp:close(Sock),
+    ok = roadrunner_listener:stop(Name).
+
 %% =============================================================================
 %% notify_drain/2 (soft drain — broadcast without stopping the listener)
 %% =============================================================================
