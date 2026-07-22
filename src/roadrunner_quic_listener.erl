@@ -59,6 +59,9 @@
     transport_params := roadrunner_quic_transport_params:params(),
     connection_handler := fun((pid()) -> {ok, pid()} | {error, term()}),
     reuseport => boolean(),
+    %% Local interface to bind. Unset binds all interfaces; set to a
+    %% specific address (e.g. `{127,0,0,1}`) to bind that one only.
+    ip => inet:ip_address(),
     %% The connection-id routing table. A SO_REUSEPORT pool injects one shared
     %% table (owned by the pool supervisor) so a datagram landing on any pool
     %% socket routes to the owning connection; a standalone listener omits it
@@ -129,7 +132,12 @@ init(
     process_flag(trap_exit, true),
     [Parent | _] = get('$ancestors'),
     ReusePort = maps:get(reuseport, Opts, false),
-    case roadrunner_quic_socket:open(Port, #{active => ?ACTIVE_N, reuseport => ReusePort}) of
+    SocketOpts =
+        case Opts of
+            #{ip := IP} -> #{active => ?ACTIVE_N, reuseport => ReusePort, ip => IP};
+            #{} -> #{active => ?ACTIVE_N, reuseport => ReusePort}
+        end,
+    case roadrunner_quic_socket:open(Port, SocketOpts) of
         {ok, Socket} ->
             {ok, {_Ip, BoundPort}} = roadrunner_quic_socket:sockname(Socket),
             proc_lib:set_label({?MODULE, BoundPort}),

@@ -18,6 +18,7 @@ clause is unit-tested in `roadrunner_quic_socket_tests`.
     recv_timeout/1,
     open_in_use_errors/1,
     open_with_custom_buffers/1,
+    open_binds_to_ip/1,
     reuseport_allows_shared_bind/1,
     active_once_delivers_messages/1,
     active_n_batches_then_passive/1
@@ -34,6 +35,7 @@ all() ->
         recv_timeout,
         open_in_use_errors,
         open_with_custom_buffers,
+        open_binds_to_ip,
         reuseport_allows_shared_bind,
         active_once_delivers_messages,
         active_n_batches_then_passive
@@ -151,6 +153,13 @@ open_in_use_errors(_Config) ->
 open_with_custom_buffers(_Config) ->
     {ok, Socket} = roadrunner_quic_socket:open(0, #{recbuf => 131072, sndbuf => 131072}),
     {ok, {_Ip, _Port}} = roadrunner_quic_socket:sockname(Socket),
+    ok = roadrunner_quic_socket:close(Socket).
+
+%% `ip` binds a single interface: the socket's local address is the one
+%% requested (loopback), not the all-interfaces `0.0.0.0`.
+open_binds_to_ip(_Config) ->
+    {ok, Socket} = roadrunner_quic_socket:open(0, #{ip => ?LOOPBACK}),
+    ?assertMatch({ok, {?LOOPBACK, _Port}}, roadrunner_quic_socket:sockname(Socket)),
     ok = roadrunner_quic_socket:close(Socket).
 
 %% Two sockets share one concrete port when both set reuseport, the

@@ -56,6 +56,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     cert_chain/1,
     quic_start_failure_releases_tcp/1,
     co_listen/1,
+    ip_binds_loopback/1,
     rejects_http3_without_tls/1,
     max_clients_refuse/1,
     max_concurrent_requests_refuse/1,
@@ -128,6 +129,7 @@ all() ->
         cert_chain,
         quic_start_failure_releases_tcp,
         co_listen,
+        ip_binds_loopback,
         rejects_http3_without_tls,
         max_clients_refuse,
         max_concurrent_requests_refuse,
@@ -195,6 +197,7 @@ init_per_testcase(Case, Config) when
     Case =:= cert_chain;
     Case =:= quic_start_failure_releases_tcp;
     Case =:= co_listen;
+    Case =:= ip_binds_loopback;
     Case =:= rejects_http3_without_tls;
     Case =:= max_clients_refuse;
     Case =:= max_concurrent_requests_refuse;
@@ -692,6 +695,20 @@ protocols_tuple_form(_Config) ->
         tls => roadrunner_test_certs:server_opts(),
         routes => roadrunner_h3_test_handler
     }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/")))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+%% `ip` restricts the whole listener, including the HTTP/3 UDP socket, to a
+%% single interface: an h3 listener bound to loopback still serves a request
+%% over loopback, proving `ip` threads through to the QUIC bind, not just TCP.
+ip_binds_loopback(_Config) ->
+    Name = listener_name(ip_binds_loopback),
+    {ok, _} = start_h3(Name, #{ip => {127, 0, 0, 1}}),
     Conn = connect(roadrunner_listener:port(Name)),
     try
         ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/")))

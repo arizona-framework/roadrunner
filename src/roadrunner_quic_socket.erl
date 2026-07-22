@@ -27,7 +27,8 @@
     recbuf => pos_integer(),
     sndbuf => pos_integer(),
     reuseport => boolean(),
-    active => active()
+    active => active(),
+    ip => inet:ip_address()
 }.
 
 %% Larger than the OS default, so a burst of datagrams is not dropped
@@ -57,13 +58,15 @@ per `N` datagrams with `activate/2` instead of once per datagram with
 Set `reuseport` to `true` to enable `SO_REUSEPORT`, which lets a pool of
 sockets share one concrete port with kernel datagram fan-out (the shape the
 listener pool uses); it defaults to `false` for a lone socket.
+
+Set `ip` to a specific local address (e.g. `{127,0,0,1}`) to bind that
+interface only; unset binds all interfaces.
 """.
 -spec open(inet:port_number(), open_opts()) -> {ok, socket()} | {error, term()}.
 open(Port, Opts) ->
-    #{recbuf := RecBuf, sndbuf := SndBuf, reuseport := ReusePort, active := Active} = validate_opts(
-        Opts
-    ),
-    SocketOpts = [
+    Validated = validate_opts(Opts),
+    #{recbuf := RecBuf, sndbuf := SndBuf, reuseport := ReusePort, active := Active} = Validated,
+    BaseOpts = [
         binary,
         {active, Active},
         {reuseaddr, true},
@@ -71,6 +74,13 @@ open(Port, Opts) ->
         {recbuf, RecBuf},
         {sndbuf, SndBuf}
     ],
+    %% Bind a specific interface only when `ip` was set, so the default
+    %% binds all interfaces exactly as before.
+    SocketOpts =
+        case Validated of
+            #{ip := IP} -> [{ip, IP} | BaseOpts];
+            #{} -> BaseOpts
+        end,
     case gen_udp:open(Port, SocketOpts) of
         {ok, Socket} -> {ok, {gen_udp, Socket}};
         {error, _} = Error -> Error
@@ -153,7 +163,8 @@ sockname({gen_udp, Socket}) ->
         recbuf := pos_integer(),
         sndbuf := pos_integer(),
         reuseport := boolean(),
-        active := active()
+        active := active(),
+        ip => inet:ip_address()
     }.
 validate_opts(Opts) ->
     Defaults = #{
@@ -175,5 +186,7 @@ validate_opt(active, Value, Acc) when Value =:= once; Value =:= false ->
     Acc#{active => Value};
 validate_opt(active, Value, Acc) when is_integer(Value), Value > 0 ->
     Acc#{active => Value};
+validate_opt(ip, Value, Acc) when is_tuple(Value) ->
+    Acc#{ip => Value};
 validate_opt(Key, Value, _Acc) ->
     error({invalid_quic_socket_opt, Key, Value}).

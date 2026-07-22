@@ -53,7 +53,8 @@
     alpn := [binary(), ...],
     max_streams_bidi := non_neg_integer(),
     connection_handler := fun((pid()) -> {ok, pid()} | {error, term()}),
-    pool_size := non_neg_integer()
+    pool_size := non_neg_integer(),
+    ip => inet:ip_address()
 }.
 
 %% =============================================================================
@@ -147,7 +148,7 @@ listener_opts(Port, PoolOpts, Registry, ReusePort) ->
         max_streams_bidi := MaxStreamsBidi,
         connection_handler := Handler
     } = PoolOpts,
-    #{
+    Base = #{
         port => Port,
         %% The native listener takes the full chain leaf-first; pool_opts keeps
         %% the leaf and intermediates separate (the dep's split).
@@ -159,7 +160,13 @@ listener_opts(Port, PoolOpts, Registry, ReusePort) ->
         connection_handler => Handler,
         reuseport => ReusePort,
         registry => Registry
-    }.
+    },
+    %% Carry `ip` through to the per-listener bind only when the pool was
+    %% started with it, so an all-interfaces pool is unchanged.
+    case PoolOpts of
+        #{ip := IP} -> Base#{ip => IP};
+        #{} -> Base
+    end.
 
 -spec transport_params(non_neg_integer()) -> roadrunner_quic_transport_params:params().
 transport_params(MaxStreamsBidi) ->
