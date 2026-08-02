@@ -442,6 +442,24 @@ top-level keys add new per-route capabilities without breaking
 existing routes. None of the below is wired up yet; the map shape
 is ready when one of these has a real caller behind it.
 
+### Reuse the dispatch route match for the per-route rate-limit lookup — medium
+
+**What:** The rate guard runs before route resolution so a refused request skips
+routing entirely. To find a per-route `rate_limit` it therefore does its own
+`path_segments/1` split and its own first-match scan, and dispatch then repeats
+both moments later in `match/3`. A listener with any per-route limit pays
+roughly double the router work per request.
+
+**Why deferred:** the duplication only exists when a per-route limit is
+configured (the compiled subset is `undefined` otherwise, and the lookup is
+skipped), and the router match is cheap next to the handler. Collapsing it means
+either routing before the guard (so refused requests pay for routing) or
+threading the matched route from the guard into dispatch, which widens the
+dispatch signature across all three protocol loops.
+
+**Scope:** medium. The win is real but narrow; wants a profile on a
+per-route-limited listener before taking on the plumbing.
+
 ### Per-route `name => atom()` for telemetry / reverse routing — small
 
 **What:** Let a route declare a stable name (e.g. `name =>
@@ -453,19 +471,6 @@ to a path.
 **Why deferred:** no telemetry consumer asking for it today.
 `(listener_name, method, path)` is already enough to identify a
 route in dashboards; named lookup is a niceness, not a need.
-
-### Per-route `methods => [binary()]` allowlist with automatic 405 — small
-
-**What:** `methods => [~"GET", ~"PUT"]` on a route map means the
-framework returns `405 Method Not Allowed` (with the right `Allow`
-header) for any other method on that path. Eliminates the
-boilerplate every handler currently writes to gate on
-`roadrunner_req:method/1`.
-
-**Why deferred:** simple to bolt on once a couple of real handlers
-demonstrate the pattern they want. The single-route equality check
-is the wrong model for catch-all routes (`/api/*path`) that
-multiplex methods downstream.
 
 ### Per-route `max_body => non_neg_integer()` body-size override — medium
 

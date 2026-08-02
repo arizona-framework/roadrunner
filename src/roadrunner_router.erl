@@ -389,6 +389,11 @@ path + method matchers as `match/3`. A path-match whose method is not in the
 route's allowlist keeps scanning, so a per-route limit only applies to the
 methods that route declares; an exhausted scan returns `nomatch` and the caller
 falls back to the listener-global limit.
+
+A matched per-route limit **replaces** the listener-global one for that request,
+it does not stack with it. A route declaring a budget larger than the global
+limit therefore escapes the global limit entirely, which is the point of an
+override but is worth stating: the global limit is a default, not a ceiling.
 """.
 -spec match_rate_limit(binary(), binary(), route_rate_limits()) ->
     {pos_integer(), pos_integer(), pos_integer(), binary()} | nomatch.
