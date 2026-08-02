@@ -72,6 +72,7 @@
     resolve_rate_limit/3,
     resolve_body_limits/1,
     effective_max_body/3,
+    effective_max_body_for/4,
     maybe_put_client_ip/2,
     rate_limited_telemetry/2,
     rate_limit_evict_idle/3,
@@ -528,11 +529,24 @@ resolve_body_limits(_ProtoOpts) ->
 effective_max_body(undefined, _Req, Global) ->
     Global;
 effective_max_body(BodyLimits, Req, Global) ->
-    case
-        roadrunner_router:match_body_limit(
-            roadrunner_req:method(Req), roadrunner_req:path(Req), BodyLimits
-        )
-    of
+    effective_max_body_for(
+        BodyLimits, roadrunner_req:method(Req), roadrunner_req:path(Req), Global
+    ).
+
+%% `effective_max_body/3` keyed on a bare method + path rather than a built
+%% request, for callers that know both before a request map exists. HTTP/2
+%% resolves the cap at END_HEADERS (from the `:method` / `:path` pseudo-headers)
+%% so DATA frames can be capped as they arrive, instead of after the whole body
+%% has accumulated under the global limit. Both entry points funnel through the
+%% same matcher, so the early and late answers cannot disagree.
+-doc false.
+%% Callers gate on a configured subset before reaching here, so there is no
+%% `undefined` clause: the no-per-route-caps case never builds a method + path.
+-spec effective_max_body_for(
+    roadrunner_router:route_body_limits(), binary(), binary(), non_neg_integer()
+) -> non_neg_integer().
+effective_max_body_for(BodyLimits, Method, Path, Global) ->
+    case roadrunner_router:match_body_limit(Method, Path, BodyLimits) of
         nomatch -> Global;
         MaxBody -> MaxBody
     end.

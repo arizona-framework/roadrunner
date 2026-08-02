@@ -167,6 +167,7 @@ to absorb a chunk's payload across multiple length-bounded calls.
     method/1,
     method_is/2,
     path/1,
+    target_path/1,
     qs/1,
     version/1,
     headers/1,
@@ -224,7 +225,15 @@ path(#{path := P}) ->
     P;
 path(#{target := T}) ->
     %% Fallback for h2/h3 and manually-built maps that carry no `path`.
-    case binary:split(T, persistent_term:get(?QMARK_CP_KEY)) of
+    target_path(T).
+
+%% Slice the `?`-free path out of a raw request-target. Shared with `path/1` so
+%% callers holding only a target (HTTP/2 resolves a route before a request map
+%% exists, from the `:path` pseudo-header) derive the path identically.
+-doc false.
+-spec target_path(binary()) -> binary().
+target_path(Target) ->
+    case binary:split(Target, persistent_term:get(?QMARK_CP_KEY)) of
         [P, _Q] -> P;
         [P] -> P
     end.

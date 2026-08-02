@@ -472,24 +472,22 @@ to a path.
 `(listener_name, method, path)` is already enough to identify a
 route in dashboards; named lookup is a niceness, not a need.
 
-### Pre-read body-cap enforcement for per-route `max_body` on h2/h3 — medium
+### Pre-read body-cap enforcement for per-route `max_body` on h3 — medium
 
-**What:** The per-route `max_body` override ships, but h2/h3 enforce it *after*
-the body is accumulated (a 413 at dispatch), not during. H1 already rejects
-before reading (it knows the path right after headers). For h2 the path is known
-at `finalize_headers` (before DATA), so the effective cap could move onto the
-stream entry and reject in `on_data` mid-accumulation. h3 decodes the QPACK
-header block only at dispatch today, so it needs an eager header decode at the
-HEADERS frame to know the path during DATA accumulation.
+**What:** h1 and h2 both bound what a request buffers at the matched route's
+`max_body` (h1 before the read, h2 in `on_data` from a cap resolved at
+END_HEADERS). h3 still enforces it *after* the body is accumulated, as a 413 at
+dispatch, because the QPACK header block stays raw until then — so the route's
+path is unknown while DATA accumulates. Closing the gap needs an eager QPACK
+decode at the HEADERS frame, threaded to dispatch.
 
-**Why deferred:** the global `max_content_length` already bounds what h2/h3
-accumulate, so the post-accumulation check is a correct tighter cap; reading up
-to the global before rejecting is an efficiency gap, not a correctness one, and
-matters only for direct (non-proxied) h2/h3 clients. The reverse-proxy path
-(nginx → h1) already gets pre-read rejection.
+**Why deferred:** the global `max_content_length` still bounds what an h3 stream
+accumulates, so the dispatch check is a correct tighter cap; the gap is that a
+route cap tighter than the global one does not reduce buffering on h3. Wants the
+eager-decode plumbing, which also unblocks h3 manual-mode body reading.
 
-**Scope:** medium. h2 is a stream-field + `on_data` change; h3 additionally
-needs eager QPACK decode at the HEADERS frame, threaded to dispatch.
+**Scope:** medium. Eager QPACK decode at the HEADERS frame plus threading the
+decoded block to dispatch, reusing `roadrunner_conn:effective_max_body_for/4`.
 
 ### Nested route groups with shared prefix + middlewares — medium
 

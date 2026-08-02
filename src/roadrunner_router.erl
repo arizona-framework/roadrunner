@@ -476,6 +476,14 @@ First-match-wins over the compiled subset, reusing the same path + method
 matchers as `match/3`; a path-match whose method is not in the route's allowlist
 keeps scanning. `nomatch` means the caller keeps the listener-global
 `max_content_length`.
+
+Where the cap takes effect differs by protocol. HTTP/1 and HTTP/2 bound what the
+request buffers: h1 caps the body read, h2 resolves the route's cap once the
+header block is decoded and enforces it as DATA frames arrive. HTTP/3 keeps its
+QPACK header block raw until dispatch, so it cannot know the path while the body
+accumulates; there the route cap is applied after accumulation (bounded by the
+listener-global `max_content_length`) and changes the response rather than the
+buffering.
 """.
 -spec match_body_limit(binary(), binary(), route_body_limits()) ->
     non_neg_integer() | nomatch.
