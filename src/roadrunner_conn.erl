@@ -373,9 +373,8 @@ try_acquire_request_slot(Max, Counter) ->
 resolve_rate_limit(
     #{
         rate_limit := #{rate := Rate, burst := Burst, period := Period, table := Table},
-        rate_limited_counter := Counter,
-        real_ip := RealIp
-    },
+        rate_limited_counter := Counter
+    } = ProtoOpts,
     {IP, _Port}
 ) ->
     %% Bake the derived `Cost` (units/request) and `Cap` (bucket capacity) here,
@@ -383,10 +382,14 @@ resolve_rate_limit(
     %% multiplication.
     Cost = Period * 1000,
     Cap = Burst * Cost,
+    %% `real_ip` is read with a default rather than matched in the head on
+    %% purpose: a head match would send proto_opts that omit the key to the
+    %% `undefined` catch-all, silently disabling the guard instead of failing
+    %% loudly. Absent key means the opt is off, which is the common case.
     Key =
-        case RealIp of
-            undefined -> IP;
-            _ -> client_ip
+        case ProtoOpts of
+            #{real_ip := Cfg} when Cfg =/= undefined -> client_ip;
+            #{} -> IP
         end,
     {Rate, Cap, Cost, Table, Counter, Key};
 resolve_rate_limit(_ProtoOpts, _Peer) ->

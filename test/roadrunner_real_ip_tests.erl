@@ -143,6 +143,16 @@ resolve_spoofed_leftmost_ignored_test() ->
         ?M:resolve(cfg(), {{127, 0, 0, 1}, 80}, xff(~"1.2.3.4, 203.0.113.7"))
     ).
 
+resolve_garbage_left_of_the_client_is_never_consulted_test() ->
+    %% Everything left of the proxy's own append is client-supplied. The walk
+    %% stops at the rightmost untrusted hop, so unparseable junk further left
+    %% must not change the result (nor cost a parse).
+    Junk = binary:copy(~"not-an-ip, ", 50),
+    ?assertEqual(
+        {203, 0, 113, 7},
+        ?M:resolve(cfg(), {{127, 0, 0, 1}, 80}, xff(<<Junk/binary, "203.0.113.7">>))
+    ).
+
 resolve_recursive_skips_trusted_chain_test() ->
     %% client -> trusted CDN (10.1.2.3) -> us. Walk past the trusted hop.
     ?assertEqual(

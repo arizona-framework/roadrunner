@@ -71,6 +71,27 @@ resolve_on_with_real_ip_keys_per_request_test() ->
         ?M:resolve_rate_limit(Opts, {?IP, 5000})
     ).
 
+resolve_on_without_real_ip_key_test() ->
+    %% proto_opts that omit `real_ip` entirely must still resolve to an active
+    %% guard keyed on the peer. Matching the key in the function head would send
+    %% this map to the `undefined` catch-all and silently disable rate limiting.
+    Table = new_table(),
+    Counter = atomics:new(1, [{signed, false}]),
+    Opts = #{
+        rate_limit => #{
+            rate => 10,
+            burst => 20,
+            period => 30,
+            idle_ttl => 60000,
+            sweep_interval => 10000,
+            table => Table
+        },
+        rate_limited_counter => Counter
+    },
+    ?assertEqual(
+        {10, 600000, 30000, Table, Counter, ?IP}, ?M:resolve_rate_limit(Opts, {?IP, 5000})
+    ).
+
 %% --- rate_limit_key/2 ---
 
 rate_limit_key_baked_ip_test() ->

@@ -151,22 +151,30 @@ reject_unknown_keys(Opts) ->
 
 %% --- resolution (hot path, only when configured) ---
 
-%% Collect every instance of the forwarded header, in received order, into one
-%% left-to-right parsed chain. RFC 9110 §5.3: repeated field lines are
-%% equivalent to the single comma-joined value, so a proxy that emits the chain
-%% as separate lines is handled the same as one that combines it — and the
-%% right-to-left walk still lands on the nearest untrusted hop.
--spec header_chain(binary(), roadrunner_http:headers()) -> [{ok, inet:ip_address()} | bad].
+%% Collect every instance of the forwarded header, in received order, as one
+%% left-to-right list of raw (unparsed) comma-separated segments. RFC 9110 §5.3:
+%% repeated field lines are equivalent to the single comma-joined value, so a
+%% proxy that emits the chain as separate lines is handled the same as one that
+%% combines it — and the right-to-left walk still lands on the nearest untrusted
+%% hop.
+%%
+%% Segments are deliberately left unparsed here. The walk reads the chain
+%% right-to-left and stops at the first untrusted hop, which is normally the
+%% first or second entry, while everything to the left of the proxy's own append
+%% is supplied by the client. Parsing the whole chain up front would spend an
+%% `inet:parse_address` call (and its list conversion) on every attacker-chosen
+%% entry the walk then never consults.
+-spec header_chain(binary(), roadrunner_http:headers()) -> [binary()].
 header_chain(HeaderName, Headers) ->
-    [Entry || {Name, Value} <- Headers, Name =:= HeaderName, Entry <- parse_chain(Value)].
+    [
+        Part
+     || {Name, Value} <- Headers,
+        Name =:= HeaderName,
+        Part <- binary:split(Value, persistent_term:get(?COMMA_CP_KEY), [global])
+    ].
 
-%% Parse one header value into a left-to-right list of `{ok, IP}` (with v4-mapped
-%% IPv6 unwrapped) or `bad` for unparseable entries, preserving position so the
-%% walk can stop at a malformed hop.
--spec parse_chain(binary()) -> [{ok, inet:ip_address()} | bad].
-parse_chain(Value) ->
-    [parse_entry(P) || P <- binary:split(Value, persistent_term:get(?COMMA_CP_KEY), [global])].
-
+%% Parse one chain segment into `{ok, IP}` (with v4-mapped IPv6 unwrapped) or
+%% `bad` when it is not an address.
 -spec parse_entry(binary()) -> {ok, inet:ip_address()} | bad.
 parse_entry(Part) ->
     case inet:parse_address(binary_to_list(roadrunner_bin:trim_ows(Part))) of
@@ -178,23 +186,27 @@ parse_entry(Part) ->
 %% nearest hop): skip trusted proxies, return the first untrusted address (the
 %% real client). All-trusted yields the leftmost entry; an empty chain or a
 %% malformed nearest hop yields the carried fallback (the trusted hop to its
-%% right, or the peer).
--spec walk([{ok, inet:ip_address()} | bad, ...], [cidr()], inet:ip_address()) ->
-    inet:ip_address().
+%% right, or the peer). Each segment is parsed only when the walk reaches it, so
+%% a long client-supplied chain costs one reversal of sub-binaries plus the few
+%% parses the walk actually consults.
+-spec walk([binary(), ...], [cidr()], inet:ip_address()) -> inet:ip_address().
 walk(Entries, Trusted, PeerIP) ->
     %% `binary:split/3` always yields a non-empty list, so `Entries` has at
     %% least one element; an empty chain can't reach here.
     do_walk(lists:reverse(Entries), PeerIP, Trusted).
 
--spec do_walk([{ok, inet:ip_address()} | bad], inet:ip_address(), [cidr()]) -> inet:ip_address().
+-spec do_walk([binary()], inet:ip_address(), [cidr()]) -> inet:ip_address().
 do_walk([], Fallback, _Trusted) ->
     Fallback;
-do_walk([bad | _], Fallback, _Trusted) ->
-    Fallback;
-do_walk([{ok, IP} | Rest], _Fallback, Trusted) ->
-    case trusted(IP, Trusted) of
-        true -> do_walk(Rest, IP, Trusted);
-        false -> IP
+do_walk([Part | Rest], Fallback, Trusted) ->
+    case parse_entry(Part) of
+        bad ->
+            Fallback;
+        {ok, IP} ->
+            case trusted(IP, Trusted) of
+                true -> do_walk(Rest, IP, Trusted);
+                false -> IP
+            end
     end.
 
 -spec trusted(inet:ip_address(), [cidr()]) -> boolean().
