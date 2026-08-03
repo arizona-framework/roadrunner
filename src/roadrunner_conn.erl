@@ -66,7 +66,9 @@
     send_payload_too_large/1,
     send_rate_limited/2,
     rate_limit_check/6,
-    resolve_rate_limit/2,
+    rate_limit_key/2,
+    resolve_rate_limit/3,
+    maybe_put_client_ip/2,
     rate_limited_telemetry/2,
     rate_limit_evict_idle/3,
     drain_oversized_body/3,
@@ -141,6 +143,12 @@
     %% the request peer is the real client. TCP-only; the listener rejects it on
     %% an HTTP/3-only listener.
     proxy_protocol => boolean(),
+    %% Trusted real-client-IP resolution config, compiled by
+    %% `roadrunner_real_ip:compile/1` from the listener `real_ip` opt
+    %% (`undefined` when unset — the common case). When set, the conn loop
+    %% resolves the client IP per request from the forwarded header and stashes
+    %% it as `client_ip` on the request; see `t:roadrunner_listener:opts/0`.
+    real_ip => undefined | roadrunner_real_ip:config(),
     %% Enabled protocols as a flat atom list in user-supplied (ALPN
     %% preference) order. On plain TCP with `[http2]`,
     %% `roadrunner_conn_loop:awaiting_shoot/3` routes straight to the
@@ -201,10 +209,13 @@
 }.
 
 %% The per-connection rate-limit guard state cached on each conn loop's record:
-%% the `{Rate, Cap, Cost, Table, Counter, IP}` resolved from `proto_opts` + the
-%% peer once at setup (see `resolve_rate_limit/2`) — with `Cap`/`Cost` already
+%% the `{Rate, Cap, Cost, Table, Counter, Key}` resolved from `proto_opts` + the
+%% peer once at setup (see `resolve_rate_limit/3`) — with `Cap`/`Cost` already
 %% derived so the per-request check does no arithmetic — or `undefined` when the
-%% guard is off or the peer IP is unknown. Checked by `rate_limit_check/6`.
+%% guard is off or the peer IP is unknown. `Key` is the baked peer `IP`, or the
+%% `client_ip` marker when the `real_ip` opt is also set, meaning the bucket
+%% keys on the per-request resolved client IP (read via `rate_limit_key/2`).
+%% Checked by `rate_limit_check/6`.
 -type rate_limit_state() ::
     {
         pos_integer(),
@@ -212,7 +223,7 @@
         pos_integer(),
         ets:table(),
         atomics:atomics_ref(),
-        inet:ip_address()
+        inet:ip_address() | client_ip
     }
     | undefined.
 
@@ -348,31 +359,72 @@ try_acquire_request_slot(Max, Counter) ->
             false
     end.
 
-%% Resolve the per-connection rate-limit tuple `{Rate, Burst, Table, Counter,
-%% IP}` from `proto_opts` + the (constant-per-conn) peer once at setup, or
-%% `undefined` when the guard is off, so the per-request check is a single
-%% branch on a cached value. The peer IP is baked in here, so the catch-all
-%% also covers a missing peer (a 2-tuple `{IP, _}` is required) as well as
-%% `rate_limit => undefined` and the hand-built proto_opts in unit tests.
+%% Resolve the per-connection rate-limit tuple `{Rate, Cap, Cost, Table,
+%% Counter, Key}` from `proto_opts` + the (constant-per-conn) peer once at setup,
+%% or `undefined` when the guard is off, so the per-request check is a single
+%% branch on a cached value. `Key` is the baked peer `IP`, or the `client_ip`
+%% marker when `real_ip` is configured (then the bucket keys on the per-request
+%% resolved client IP). The catch-all covers a missing peer (a 2-tuple `{IP, _}`
+%% is required) and `rate_limit => undefined`.
 -doc false.
 -spec resolve_rate_limit(
-    proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
+    proto_opts(),
+    {inet:ip_address(), inet:port_number()} | undefined,
+    roadrunner_real_ip:prepared()
 ) -> rate_limit_state().
 resolve_rate_limit(
     #{
         rate_limit := #{rate := Rate, burst := Burst, period := Period, table := Table},
         rate_limited_counter := Counter
     },
-    {IP, _Port}
+    {IP, _Port},
+    Prepared
 ) ->
     %% Bake the derived `Cost` (units/request) and `Cap` (bucket capacity) here,
     %% once per connection, so the per-request `rate_limit_check/6` does no
     %% multiplication.
     Cost = Period * 1000,
     Cap = Burst * Cost,
-    {Rate, Cap, Cost, Table, Counter, IP};
-resolve_rate_limit(_ProtoOpts, _Peer) ->
+    %% Bake the bucket key too, as far as the config allows. Only a trusted peer
+    %% (`{walk, ...}`) can produce a different client per request and so needs
+    %% the `client_ip` marker; the opt being off or the peer being untrusted
+    %% yields one fixed address for the whole connection, so the per-request
+    %% marker lookup is skipped entirely.
+    Key =
+        case Prepared of
+            {walk, _Trusted, _Header, _PeerIP} -> client_ip;
+            {const, ClientIP} -> ClientIP;
+            undefined -> IP
+        end,
+    {Rate, Cap, Cost, Table, Counter, Key};
+resolve_rate_limit(_ProtoOpts, _Peer, _Prepared) ->
     undefined.
+
+%% Stash the trusted real client IP on `Req` from the connection's prepared
+%% `real_ip` state. The `undefined` clause (the opt is off, or the peer is
+%% unknown) is the common path and returns `Req` untouched — no resolution, no
+%% added field, and `roadrunner_req:client_ip/1` falls back to the peer. The
+%% peer's own trust check already happened once at connection setup
+%% (`roadrunner_real_ip:prepare/2`), so an untrusted peer costs a single field
+%% read here rather than a per-request CIDR scan.
+-doc false.
+-spec maybe_put_client_ip(roadrunner_real_ip:prepared(), roadrunner_req:request()) ->
+    roadrunner_req:request().
+maybe_put_client_ip(undefined, Req) ->
+    Req;
+maybe_put_client_ip(Prepared, #{headers := Headers} = Req) ->
+    Req#{client_ip => roadrunner_real_ip:resolve(Prepared, Headers)}.
+
+%% Resolve a rate-limit-state `Key` to the bucket IP. A baked `IP` keys on
+%% itself; the `client_ip` marker (the `real_ip` opt is set) keys on the
+%% per-request resolved client IP stashed by `maybe_put_client_ip/2` — present
+%% on every request the marker variant sees, since the marker is only emitted
+%% for a known peer.
+-doc false.
+-spec rate_limit_key(inet:ip_address() | client_ip, roadrunner_req:request()) ->
+    inet:ip_address().
+rate_limit_key(client_ip, #{client_ip := IP}) -> IP;
+rate_limit_key(IP, _Req) -> IP.
 
 -doc """
 Per-peer token-bucket check, the per-source sibling of
@@ -392,7 +444,7 @@ deterministically testable).
     allow | {deny, pos_integer()}.
 rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) ->
     %% `Cap` (bucket capacity) and `Cost` (units per request) are resolved once
-    %% per connection (see `resolve_rate_limit/2`), not per request. A
+    %% per connection (see `resolve_rate_limit/3`), not per request. A
     %% never-seen peer starts at a full bucket (`Cap`) and needs no refill; an
     %% existing one is refilled for the elapsed time in place (no intermediate
     %% tuple).

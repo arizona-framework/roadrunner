@@ -248,6 +248,23 @@ ops-tuning rationale.
         idle_ttl => pos_integer(),
         sweep_interval => pos_integer()
     },
+    %% Opt in to trusted real-client-IP resolution behind an HTTP-terminating
+    %% reverse proxy (nginx/caddy/ALB), where the socket peer is the proxy and
+    %% the client travels in a forwarded header. `trusted_proxies` (required) is
+    %% a non-empty list of CIDR binaries (`~"10.0.0.0/8"`, `~"::1/128"`) or bare
+    %% addresses; `header` (default `~"x-forwarded-for"`) names the
+    %% comma-separated bare-IP header to read (`~"x-real-ip"`,
+    %% `~"cf-connecting-ip"`, ...). The immediate peer must itself match
+    %% `trusted_proxies` before the header is honored, then the chain is walked
+    %% right-to-left, skipping trusted proxies, to the first untrusted address —
+    %% so a direct client cannot spoof its IP. The result feeds
+    %% `roadrunner_req:client_ip/1` and, when `rate_limit` is also set, the
+    %% per-peer bucket key. Composes with `proxy_protocol` (the PROXY-reported
+    %% address becomes the immediate hop, which `trusted_proxies` must list).
+    real_ip => #{
+        trusted_proxies := [binary()],
+        header => binary()
+    },
     %% When set, the per-connection process auto-hibernates after
     %% `Ms` milliseconds of idle main-loop time. Most useful for
     %% long-lived keep-alive HTTP/1.1 connections that mostly sit
@@ -1098,6 +1115,7 @@ build_proto_opts(Opts, ListenerName) ->
             proxy_protocol => validate_proxy_protocol(
                 maps:get(proxy_protocol, Opts, false), Protocols
             ),
+            real_ip => roadrunner_real_ip:compile(maps:get(real_ip, Opts, undefined)),
             protocols => Protocols
         }),
         ProtoFlats

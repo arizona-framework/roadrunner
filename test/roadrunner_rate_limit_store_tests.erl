@@ -46,18 +46,79 @@ per_minute_rate_test() ->
 %% --- resolve_rate_limit/2 ---
 
 resolve_off_without_config_test() ->
-    ?assertEqual(undefined, ?M:resolve_rate_limit(proto_opts(undefined), {?IP, 5000})).
+    ?assertEqual(undefined, ?M:resolve_rate_limit(proto_opts(undefined), {?IP, 5000}, undefined)).
 
 resolve_off_without_peer_test() ->
     Table = new_table(),
-    ?assertEqual(undefined, ?M:resolve_rate_limit(proto_opts(Table), undefined)).
+    ?assertEqual(undefined, ?M:resolve_rate_limit(proto_opts(Table), undefined, undefined)).
 
 resolve_on_test() ->
     Table = new_table(),
     {Counter, Opts} = proto_opts_with_counter(Table),
     %% rate 10, burst 20, period 30 → Cost 30000, Cap 600000 baked in.
     ?assertEqual(
-        {10, 600000, 30000, Table, Counter, ?IP}, ?M:resolve_rate_limit(Opts, {?IP, 5000})
+        {10, 600000, 30000, Table, Counter, ?IP},
+        ?M:resolve_rate_limit(Opts, {?IP, 5000}, undefined)
+    ).
+
+resolve_on_with_trusted_peer_keys_per_request_test() ->
+    %% A TRUSTED peer's client can differ per request, so the key stays the
+    %% `client_ip` marker and the bucket follows the resolved client.
+    Table = new_table(),
+    RealIp = roadrunner_real_ip:compile(#{trusted_proxies => [~"127.0.0.1/32"]}),
+    {Counter, Opts} = proto_opts_with_counter(Table, RealIp),
+    Prepared = roadrunner_real_ip:prepare(RealIp, {?IP, 5000}),
+    ?assertEqual(
+        {10, 600000, 30000, Table, Counter, client_ip},
+        ?M:resolve_rate_limit(Opts, {?IP, 5000}, Prepared)
+    ).
+
+resolve_on_with_untrusted_peer_bakes_the_key_test() ->
+    %% An UNTRUSTED peer always resolves to the same client, so the concrete
+    %% address is baked into the key and the per-request marker lookup is
+    %% skipped entirely.
+    Table = new_table(),
+    Peer = {198, 51, 100, 9},
+    RealIp = roadrunner_real_ip:compile(#{trusted_proxies => [~"127.0.0.1/32"]}),
+    {Counter, Opts} = proto_opts_with_counter(Table, RealIp),
+    Prepared = roadrunner_real_ip:prepare(RealIp, {Peer, 5000}),
+    ?assertEqual(
+        {10, 600000, 30000, Table, Counter, Peer},
+        ?M:resolve_rate_limit(Opts, {Peer, 5000}, Prepared)
+    ).
+
+resolve_on_without_optional_keys_test() ->
+    %% proto_opts that omit optional keys entirely must still resolve to an
+    %% active guard keyed on the peer. Matching such a key in the function head
+    %% would send this map to the `undefined` catch-all and silently disable
+    %% rate limiting.
+    Table = new_table(),
+    Counter = atomics:new(1, [{signed, false}]),
+    Opts = #{
+        rate_limit => #{
+            rate => 10,
+            burst => 20,
+            period => 30,
+            idle_ttl => 60000,
+            sweep_interval => 10000,
+            table => Table
+        },
+        rate_limited_counter => Counter
+    },
+    ?assertEqual(
+        {10, 600000, 30000, Table, Counter, ?IP},
+        ?M:resolve_rate_limit(Opts, {?IP, 5000}, undefined)
+    ).
+
+%% --- rate_limit_key/2 ---
+
+rate_limit_key_baked_ip_test() ->
+    ?assertEqual(?IP, ?M:rate_limit_key(?IP, #{headers => []})).
+
+rate_limit_key_marker_reads_client_ip_test() ->
+    ?assertEqual(
+        {203, 0, 113, 7},
+        ?M:rate_limit_key(client_ip, #{client_ip => {203, 0, 113, 7}})
     ).
 
 %% --- rate_limited_telemetry/2 ---
@@ -119,10 +180,14 @@ proto_opts(RateLimit) ->
         end,
     #{
         rate_limit => Cfg,
-        rate_limited_counter => atomics:new(1, [{signed, false}])
+        rate_limited_counter => atomics:new(1, [{signed, false}]),
+        real_ip => undefined
     }.
 
 proto_opts_with_counter(Table) ->
+    proto_opts_with_counter(Table, undefined).
+
+proto_opts_with_counter(Table, RealIp) ->
     Counter = atomics:new(1, [{signed, false}]),
     {Counter, #{
         rate_limit => #{
@@ -133,5 +198,6 @@ proto_opts_with_counter(Table) ->
             sweep_interval => 10000,
             table => Table
         },
-        rate_limited_counter => Counter
+        rate_limited_counter => Counter,
+        real_ip => RealIp
     }}.

@@ -130,7 +130,12 @@
     %% Per-peer rate-limit guard resolved from `proto_opts` + peer once at
     %% `shoot` (`undefined` when off — the common case, a single branch in
     %% `dispatch_phase/2`).
-    rate_limit = undefined :: roadrunner_conn:rate_limit_state()
+    rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
+    %% Compiled `real_ip` config cached from `proto_opts` at `shoot`
+    %% (`undefined` when off — the common case). When set,
+    %% `handle_request_bytes/2` resolves the client IP per request; the
+    %% `undefined` branch adds nothing to the request map.
+    real_ip = undefined :: roadrunner_real_ip:prepared()
 }).
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
@@ -217,6 +222,11 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                 Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered
             );
         false ->
+            %% Decide the peer's proxy-trust once per connection; the peer cannot
+            %% change while it lives, so per-request resolution never repeats it.
+            RealIp = roadrunner_real_ip:prepare(
+                maps:get(real_ip, ProtoOpts, undefined), Peer
+            ),
             #{
                 requests_counter := RequestsCounter,
                 dispatch := Dispatch,
@@ -253,7 +263,8 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                     maps:get(http1_max_header_block, ProtoOpts, 10240),
                     maps:get(http1_max_header_count, ProtoOpts, 100)
                 },
-                rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer)
+                rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer, RealIp),
+                real_ip = RealIp
             },
             read_request_phase(S)
     end.
@@ -577,7 +588,8 @@ handle_request_bytes(
         peer = Peer,
         scheme = Scheme,
         requests_counter = ReqCounter,
-        http1_limits = Http1Limits
+        http1_limits = Http1Limits,
+        real_ip = RealIp
     } = S,
     Deadline
 ) ->
@@ -588,12 +600,15 @@ handle_request_bytes(
             {RequestId, NewBuffer} = roadrunner_conn:generate_request_id(
                 S#loop_state.req_id_buffer
             ),
-            Req = Req0#{
-                peer => Peer,
-                scheme => Scheme,
-                request_id => RequestId,
-                listener_name => ListenerName
-            },
+            Req = roadrunner_conn:maybe_put_client_ip(
+                RealIp,
+                Req0#{
+                    peer => Peer,
+                    scheme => Scheme,
+                    request_id => RequestId,
+                    listener_name => ListenerName
+                }
+            ),
             ok = roadrunner_conn:set_request_logger_metadata(Req),
             ok = roadrunner_conn:maybe_send_continue(Socket, Req, Rest),
             read_body_phase(
@@ -708,7 +723,7 @@ dispatch_phase(
     } = S,
     Req
 ) ->
-    case rate_limit_allows(RateLimit, Socket, ListenerName) of
+    case rate_limit_allows(RateLimit, Socket, ListenerName, Req) of
         true ->
             case roadrunner_conn:resolve_handler(Dispatch, Req) of
                 {ok, Handler, Bindings, Pipeline, _State} ->
@@ -734,11 +749,13 @@ dispatch_phase(
 -spec rate_limit_allows(
     roadrunner_conn:rate_limit_state(),
     roadrunner_transport:socket(),
-    atom()
+    atom(),
+    roadrunner_req:request()
 ) -> boolean().
-rate_limit_allows(undefined, _Socket, _ListenerName) ->
+rate_limit_allows(undefined, _Socket, _ListenerName, _Req) ->
     true;
-rate_limit_allows({Rate, Cap, Cost, Table, Counter, IP}, Socket, ListenerName) ->
+rate_limit_allows({Rate, Cap, Cost, Table, Counter, KeySpec}, Socket, ListenerName, Req) ->
+    IP = roadrunner_conn:rate_limit_key(KeySpec, Req),
     NowMs = erlang:monotonic_time(millisecond),
     case roadrunner_conn:rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) of
         allow ->

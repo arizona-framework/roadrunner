@@ -441,6 +441,19 @@ peer_present_test() ->
 peer_absent_returns_undefined_test() ->
     ?assertEqual(undefined, roadrunner_req:peer(sample_req())).
 
+%% --- client_ip/1 ---
+
+client_ip_resolved_test() ->
+    Req = (sample_req())#{peer => {{127, 0, 0, 1}, 80}, client_ip => {203, 0, 113, 7}},
+    ?assertEqual({203, 0, 113, 7}, roadrunner_req:client_ip(Req)).
+
+client_ip_falls_back_to_peer_test() ->
+    Req = (sample_req())#{peer => {{198, 51, 100, 9}, 4321}},
+    ?assertEqual({198, 51, 100, 9}, roadrunner_req:client_ip(Req)).
+
+client_ip_absent_returns_undefined_test() ->
+    ?assertEqual(undefined, roadrunner_req:client_ip(sample_req())).
+
 %% --- scheme/1 ---
 
 scheme_http_test() ->
