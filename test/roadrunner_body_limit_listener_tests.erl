@@ -1,0 +1,228 @@
+-module(roadrunner_body_limit_listener_tests).
+
+-include_lib("eunit/include/eunit.hrl").
+
+%% RFC 9113 §6.4 frame type.
+-define(RST_STREAM, 3).
+
+%% =============================================================================
+%% Opt validation.
+%% =============================================================================
+
+valid_max_body_starts_test() ->
+    Routes = [#{path => ~"/upload", handler => roadrunner_hello_handler, max_body => 1024}],
+    with_route_listener([http1], Routes, fun(_Port, Name) ->
+        ?assert(is_integer(roadrunner_listener:port(Name)))
+    end).
+
+rejects_bad_max_body_test() ->
+    process_flag(trap_exit, true),
+    Routes = [#{path => ~"/x", handler => roadrunner_hello_handler, max_body => -1}],
+    R = roadrunner_listener:start_link(unique(bl_bad), #{
+        port => 0, protocols => [http1], routes => Routes
+    }),
+    ?assertMatch({error, {{invalid_route_max_body, ~"/x", -1}, _}}, R).
+
+%% =============================================================================
+%% HTTP/1: the route cap is enforced before the body is read (413 / 200).
+%% =============================================================================
+
+h1_over_route_cap_413_test() ->
+    Routes = [#{path => ~"/upload", handler => roadrunner_hello_handler, max_body => 10}],
+    with_route_listener([http1], Routes, fun(Port, _Name) ->
+        %% 20-byte body to a 10-byte-capped route → 413 (rejected before read).
+        ?assertMatch(
+            <<"HTTP/1.1 413", _/binary>>, h1_post(Port, ~"/upload", binary:copy(~"x", 20))
+        ),
+        %% 5-byte body is under the cap → reaches the handler.
+        ?assertMatch(
+            <<"HTTP/1.1 200", _/binary>>, h1_post(Port, ~"/upload", binary:copy(~"x", 5))
+        )
+    end).
+
+h1_uncapped_route_uses_global_test() ->
+    %% A route with no `max_body` rides the (large) global `max_content_length`,
+    %% so a 20-byte body is fine even when a sibling route caps at 10.
+    Routes = [
+        #{path => ~"/upload", handler => roadrunner_hello_handler, max_body => 10},
+        #{path => ~"/open", handler => roadrunner_hello_handler}
+    ],
+    with_route_listener([http1], Routes, fun(Port, _Name) ->
+        ?assertMatch(
+            <<"HTTP/1.1 200", _/binary>>, h1_post(Port, ~"/open", binary:copy(~"x", 20))
+        )
+    end).
+
+%% =============================================================================
+%% HTTP/2 (h2c): the route cap is resolved at END_HEADERS and enforced as DATA
+%% arrives, so an over-cap body is refused without being buffered.
+%% =============================================================================
+
+h2c_over_route_cap_413_test() ->
+    Routes = [#{path => ~"/upload", handler => roadrunner_hello_handler, max_body => 10}],
+    with_route_listener([http2], Routes, fun(Port, _Name) ->
+        {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+        Preface = ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        EmptySettings = <<0:24, 4, 0, 0:32>>,
+        ok = gen_tcp:send(Sock, [Preface, EmptySettings | h2_post_frames(~"/upload", 20)]),
+        Reply = recv_for(Sock, <<>>, 800),
+        ok = gen_tcp:close(Sock),
+        %% The 413 response body is "Payload Too Large" (a DATA frame payload).
+        ?assertMatch({match, _}, re:run(Reply, ~"Payload Too Large"))
+    end).
+
+h2c_over_route_cap_rejects_before_end_stream_test() ->
+    %% The route cap must bound what the stream buffers, not just change the
+    %% status once the whole body has landed. Send HEADERS then a single
+    %% over-cap DATA frame WITHOUT END_STREAM: a post-accumulation check would
+    %% still be waiting for the client to finish, so a 413 here proves the cap
+    %% is enforced as DATA arrives.
+    Routes = [#{path => ~"/upload", handler => roadrunner_hello_handler, max_body => 10}],
+    with_route_listener([http2], Routes, fun(Port, _Name) ->
+        {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+        Preface = ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        EmptySettings = <<0:24, 4, 0, 0:32>>,
+        {Headers, Data} = h2_post_open_frames(~"/upload", 20),
+        ok = gen_tcp:send(Sock, [Preface, EmptySettings, Headers, Data]),
+        Reply = recv_for(Sock, <<>>, 800),
+        ok = gen_tcp:close(Sock),
+        ?assertMatch({match, _}, re:run(Reply, ~"Payload Too Large"))
+    end).
+
+h2c_under_route_cap_still_dispatches_test() ->
+    %% The mirror of the above: a body inside the route cap must reach the
+    %% handler, so the earlier enforcement point cannot reject valid requests.
+    Routes = [#{path => ~"/upload", handler => roadrunner_hello_handler, max_body => 64}],
+    with_route_listener([http2], Routes, fun(Port, _Name) ->
+        {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+        Preface = ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        EmptySettings = <<0:24, 4, 0, 0:32>>,
+        ok = gen_tcp:send(Sock, [Preface, EmptySettings | h2_post_frames(~"/upload", 20)]),
+        Reply = recv_for(Sock, <<>>, 800),
+        ok = gen_tcp:close(Sock),
+        ?assertMatch(nomatch, re:run(Reply, ~"Payload Too Large"))
+    end).
+
+h2c_query_string_still_matches_route_cap_test() ->
+    %% The early resolution reads the `:path` pseudo-header, which carries the
+    %% query string; route matching must run on the `?`-free path.
+    Routes = [#{path => ~"/upload", handler => roadrunner_hello_handler, max_body => 10}],
+    with_route_listener([http2], Routes, fun(Port, _Name) ->
+        {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+        Preface = ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        EmptySettings = <<0:24, 4, 0, 0:32>>,
+        {Headers, Data} = h2_post_open_frames(~"/upload?a=1", 20),
+        ok = gen_tcp:send(Sock, [Preface, EmptySettings, Headers, Data]),
+        Reply = recv_for(Sock, <<>>, 800),
+        ok = gen_tcp:close(Sock),
+        ?assertMatch({match, _}, re:run(Reply, ~"Payload Too Large"))
+    end).
+
+h2c_missing_path_pseudo_header_is_reset_test() ->
+    %% Resolving the route cap at END_HEADERS reads the `:path` pseudo-header.
+    %% A block without one cannot match a route, so the stream keeps the global
+    %% cap and is reset as malformed at dispatch (RFC 9113 §8.3.1).
+    ?assert(lists:member(?RST_STREAM, h2_malformed_reply_frames([{~":method", ~"POST"}]))).
+
+h2c_missing_method_pseudo_header_is_reset_test() ->
+    %% Same for `:method`: no method means no route match, global cap, reset.
+    ?assert(lists:member(?RST_STREAM, h2_malformed_reply_frames([{~":path", ~"/upload"}]))).
+
+%% --- helpers ---
+
+with_route_listener(Protocols, Routes, Fun) ->
+    Name = unique(bl_it),
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0, protocols => Protocols, routes => Routes
+    }),
+    Port = roadrunner_listener:port(Name),
+    try
+        Fun(Port, Name)
+    after
+        ok = roadrunner_listener:stop(Name)
+    end.
+
+unique(Prefix) ->
+    list_to_atom(atom_to_list(Prefix) ++ "_" ++ integer_to_list(erlang:unique_integer([positive]))).
+
+h1_post(Port, Path, Body) ->
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    CL = integer_to_binary(byte_size(Body)),
+    Req = [
+        ~"POST ",
+        Path,
+        ~" HTTP/1.1\r\nHost: x\r\nContent-Length: ",
+        CL,
+        ~"\r\nConnection: close\r\n\r\n",
+        Body
+    ],
+    ok = gen_tcp:send(Sock, Req),
+    Reply = recv_for(Sock, <<>>, 1000),
+    ok = gen_tcp:close(Sock),
+    Reply.
+
+recv_for(Sock, Acc, Timeout) ->
+    case gen_tcp:recv(Sock, 0, Timeout) of
+        {ok, Data} -> recv_for(Sock, <<Acc/binary, Data/binary>>, Timeout);
+        {error, _} -> Acc
+    end.
+
+%% A POST request on stream 1: HEADERS (END_HEADERS, no END_STREAM) then a DATA
+%% frame of `BodyLen` bytes (END_STREAM).
+h2_post_frames(Path, BodyLen) ->
+    {Block, _Enc} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"POST"},
+            {~":scheme", ~"http"},
+            {~":authority", ~"x"},
+            {~":path", Path}
+        ],
+        roadrunner_http2_hpack:new_encoder(4096)
+    ),
+    Headers = roadrunner_http2_frame:encode(
+        {headers, 1, 16#04, undefined, iolist_to_binary(Block)}
+    ),
+    Payload = binary:copy(~"x", BodyLen),
+    Data = <<BodyLen:24, 0:8, 16#01:8, 0:1, 1:31, Payload/binary>>,
+    [Headers, Data].
+
+%% Drive a body-limited h2c listener with a header block missing a pseudo-header,
+%% followed by an over-cap DATA frame, and return the frame types the server
+%% sent back.
+h2_malformed_reply_frames(Pseudo) ->
+    Routes = [#{path => ~"/upload", handler => roadrunner_hello_handler, max_body => 10}],
+    with_route_listener([http2], Routes, fun(Port, _Name) ->
+        {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+        {Block, _Enc} = roadrunner_http2_hpack:encode(
+            [{~":scheme", ~"http"}, {~":authority", ~"x"} | Pseudo],
+            roadrunner_http2_hpack:new_encoder(4096)
+        ),
+        Headers = roadrunner_http2_frame:encode(
+            {headers, 1, 16#04, undefined, iolist_to_binary(Block)}
+        ),
+        Payload = binary:copy(~"x", 20),
+        Data = <<20:24, 0:8, 16#01:8, 0:1, 1:31, Payload/binary>>,
+        Preface = ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        EmptySettings = <<0:24, 4, 0, 0:32>>,
+        ok = gen_tcp:send(Sock, [Preface, EmptySettings, Headers, Data]),
+        Reply = recv_for(Sock, <<>>, 800),
+        ok = gen_tcp:close(Sock),
+        h2_frame_types(Reply)
+    end).
+
+%% Frame types present in a raw h2 byte stream, in order.
+h2_frame_types(<<Len:24, Type:8, _Flags:8, _R:1, _StreamId:31, Rest/binary>>) when
+    byte_size(Rest) >= Len
+->
+    <<_Payload:Len/binary, Tail/binary>> = Rest,
+    [Type | h2_frame_types(Tail)];
+h2_frame_types(_) ->
+    [].
+
+%% Same as `h2_post_frames/2` but the DATA frame carries no END_STREAM, so the
+%% request is still open when the server sees it.
+h2_post_open_frames(Path, BodyLen) ->
+    [Headers, _EndStreamData] = h2_post_frames(Path, BodyLen),
+    Payload = binary:copy(~"x", BodyLen),
+    Data = <<BodyLen:24, 0:8, 0:8, 0:1, 1:31, Payload/binary>>,
+    {Headers, Data}.

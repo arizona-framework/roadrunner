@@ -165,6 +165,11 @@
     %% validate against the request's `content-length` header at
     %% END_STREAM (RFC 9113 §8.1.2.6).
     body_len := non_neg_integer(),
+    %% Effective request-body cap for this stream: the listener-global
+    %% `max_content_length` until END_HEADERS, then the matched route's
+    %% `max_body` override when one applies. `on_data/5` enforces it as DATA
+    %% arrives, so an over-cap body is refused without being buffered first.
+    max_body := non_neg_integer(),
     send_window := integer(),
     recv_window := non_neg_integer(),
     worker_pid := undefined | pid(),
@@ -251,6 +256,11 @@
     %% (`undefined` when off). When set, `dispatch_stream/2` resolves the client
     %% IP per request onto the request map.
     real_ip = undefined :: roadrunner_real_ip:prepared(),
+    %% Per-route `max_body` subset cached from proto_opts at `enter/6`
+    %% (`undefined` when no route declares one). When set, `finalize_headers/2`
+    %% resolves the matched route's cap onto the stream's `max_body` at
+    %% END_HEADERS, and `on_data/5` enforces it as DATA arrives.
+    body_limits = undefined :: roadrunner_router:route_body_limits(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -345,6 +355,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered) ->
         inflight_counter = InflightCounter,
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer, RealIp),
         real_ip = RealIp,
+        body_limits = roadrunner_conn:resolve_body_limits(ProtoOpts),
         handshake_timeout = HandshakeTimeout,
         idle_timeout = IdleTimeout
     },
@@ -789,7 +800,8 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
         EndHeaders,
         EndStream,
         State#loop.peer_initial_window,
-        State#loop.stream_recv_window_peak
+        State#loop.stream_recv_window_peak,
+        State#loop.max_content_length
     ),
     State1 = State#loop{
         streams = (State#loop.streams)#{StreamId => Stream},
@@ -805,7 +817,51 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
         true -> frame_loop(State1)
     end.
 
-new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow) ->
+%% Resolve this stream's effective body cap now that the header block is
+%% decoded. Unlike HTTP/3 (whose QPACK block stays raw until dispatch), h2 has
+%% the `:method` / `:path` pseudo-headers before any DATA frame arrives, so a
+%% per-route `max_body` can bound what the stream buffers rather than only
+%% changing the status after the fact. Falls back to the listener-global cap
+%% when no route declares an override or the pseudo-headers are missing (a
+%% malformed request `roadrunner_http2_request:from_headers/3` rejects at
+%% dispatch anyway).
+-spec stream_max_body(#loop{}, roadrunner_http:headers()) -> non_neg_integer().
+stream_max_body(#loop{body_limits = undefined, max_content_length = Global}, _Headers) ->
+    Global;
+stream_max_body(#loop{body_limits = BodyLimits, max_content_length = Global}, Headers) ->
+    case route_keys(Headers, undefined, undefined) of
+        undefined ->
+            Global;
+        {Method, Target} ->
+            %% Route matching runs on the `?`-free path. Share
+            %% `roadrunner_req:target_path/1` with `roadrunner_req:path/1`
+            %% rather than re-splitting here, so this early answer uses the
+            %% identical derivation dispatch will.
+            roadrunner_conn:effective_max_body_for(
+                BodyLimits, Method, roadrunner_req:target_path(Target), Global
+            )
+    end.
+
+%% Pull `:method` and `:path` out of the decoded block in one pass, stopping as
+%% soon as both are bound. RFC 9113 §8.3 requires pseudo-headers to precede the
+%% regular fields, so the scan normally ends within the first few entries rather
+%% than walking the whole list (twice, as two separate lookups would).
+%% `undefined` when either is absent — a malformed request that cannot match a
+%% route, and that `roadrunner_http2_request:from_headers/3` rejects at dispatch.
+-spec route_keys(roadrunner_http:headers(), binary() | undefined, binary() | undefined) ->
+    {binary(), binary()} | undefined.
+route_keys(_Headers, Method, Path) when Method =/= undefined, Path =/= undefined ->
+    {Method, Path};
+route_keys([], _Method, _Path) ->
+    undefined;
+route_keys([{~":method", Method} | Rest], _Method0, Path) ->
+    route_keys(Rest, Method, Path);
+route_keys([{~":path", Path} | Rest], Method, _Path0) ->
+    route_keys(Rest, Method, Path);
+route_keys([_ | Rest], Method, Path) ->
+    route_keys(Rest, Method, Path).
+
+new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow, MaxBody) ->
     #{
         state => open,
         header_fragment => Fragment,
@@ -815,6 +871,7 @@ new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow) ->
         headers => undefined,
         body => [],
         body_len => 0,
+        max_body => MaxBody,
         send_window => SendWindow,
         recv_window => RecvWindow,
         worker_pid => undefined,
@@ -914,7 +971,11 @@ finalize_headers(
     } = Streams,
     case roadrunner_http2_hpack:decode(iolist_to_binary(Fragment), Dec) of
         {ok, Headers, Dec1} ->
-            Stream1 = Stream#{headers := Headers, header_fragment := <<>>},
+            Stream1 = Stream#{
+                headers := Headers,
+                header_fragment := <<>>,
+                max_body := stream_max_body(State, Headers)
+            },
             %% Commit the mutated HPACK context even if we reject below: the
             %% decode advanced the dynamic table, so dropping it would desync
             %% our decoder from the peer's encoder for every later block.
@@ -966,13 +1027,17 @@ on_data(StreamId, _Flags, _Payload, FlowLen, #loop{streams = Streams} = State) w
     %% discarding them, so the conn window doesn't drift down across resets.
     _ = send_rst_stream(State, StreamId, stream_closed),
     frame_loop(replenish_conn_window(State, FlowLen));
-on_data(
-    StreamId, Flags, Payload, FlowLen, #loop{streams = Streams, max_content_length = MaxCL} = State
-) ->
+on_data(StreamId, Flags, Payload, FlowLen, #loop{streams = Streams} = State) ->
     case Streams of
         #{
             StreamId :=
-                #{state := open, body := Body, body_len := Len, recv_window := RW} = Stream
+                #{
+                    state := open,
+                    body := Body,
+                    body_len := Len,
+                    recv_window := RW,
+                    max_body := MaxCL
+                } = Stream
         } ->
             %% Flow control charges the full on-wire `FlowLen` (RFC 9113
             %% §6.9.1: pad-length byte + padding count). Past the window
@@ -995,12 +1060,14 @@ on_data(
                     PayloadLen = byte_size(Payload),
                     if
                         Len + PayloadLen > MaxCL ->
-                            %% RFC 9113 §8.1: the request body exceeds
-                            %% `max_content_length`. Answer 413 before the
-                            %% full request, then RST_STREAM(NO_ERROR) to ask
-                            %% the client to stop sending the rest, and drop
-                            %% the stream (no worker was dispatched — dispatch
-                            %% is at END_STREAM).
+                            %% RFC 9113 §8.1: the request body exceeds this
+                            %% stream's cap — the matched route's `max_body`
+                            %% once the header block is decoded, else the
+                            %% listener-global `max_content_length`. Answer 413
+                            %% before the full request, then RST_STREAM(NO_ERROR)
+                            %% to ask the client to stop sending the rest, and
+                            %% drop the stream (no worker was dispatched —
+                            %% dispatch is at END_STREAM).
                             Resp = ~"Payload Too Large",
                             State1 = encode_and_send_response_atomic(
                                 State,
@@ -1146,45 +1213,23 @@ dispatch_stream(
             },
             case roadrunner_http2_request:from_headers(Headers, BodyIolist, RequestContext) of
                 {ok, Req0} ->
+                    %% No body-cap check here: `on_data/5` already enforced this
+                    %% stream's effective cap (route override or global) as each
+                    %% DATA frame arrived, so an over-cap body never reaches
+                    %% dispatch.
                     Req = roadrunner_conn:maybe_put_client_ip(RealIp, Req0),
                     StateBuf = State#loop{req_id_buffer = NewBuf},
-                    case rate_limit_refused(StateBuf, StreamId, Req) of
-                        {refused, State1} ->
-                            %% Per-peer rate exceeded: 429 + RST(no_error) sent,
-                            %% no worker spawned. 429 (not REFUSED_STREAM) so the
-                            %% client backs off per Retry-After instead of
-                            %% retrying the stream immediately.
-                            frame_loop(remove_stream(State1, StreamId));
-                        ok ->
-                            case
-                                roadrunner_conn:try_acquire_request_slot(
-                                    MaxConcReq, InflightCounter
-                                )
-                            of
-                                true ->
-                                    {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
-                                        self(), StreamId, Req, ProtoOpts
-                                    ),
-                                    Stream1 = Stream#{
-                                        worker_pid := WorkerPid,
-                                        worker_ref := MonRef,
-                                        state := half_closed_remote,
-                                        body := []
-                                    },
-                                    frame_loop(StateBuf#loop{
-                                        streams = Streams#{StreamId := Stream1},
-                                        worker_refs =
-                                            (StateBuf#loop.worker_refs)#{MonRef => StreamId}
-                                    });
-                                false ->
-                                    %% Listener-wide in-flight ceiling reached —
-                                    %% refuse with retry-safe REFUSED_STREAM, no
-                                    %% worker spawned.
-                                    ok = throttle_stream(StateBuf, ListenerName),
-                                    _ = send_rst_stream(StateBuf, StreamId, refused_stream),
-                                    frame_loop(remove_stream(StateBuf, StreamId))
-                            end
-                    end;
+                    dispatch_allowed_stream(
+                        StateBuf,
+                        StreamId,
+                        Req,
+                        Stream,
+                        Streams,
+                        ProtoOpts,
+                        MaxConcReq,
+                        InflightCounter,
+                        ListenerName
+                    );
                 {error, _Reason} ->
                     _ = send_rst_stream(State, StreamId, protocol_error),
                     frame_loop(remove_stream(State#loop{req_id_buffer = NewBuf}, StreamId))
@@ -1194,6 +1239,55 @@ dispatch_stream(
             %% mismatch is a stream-error PROTOCOL_ERROR.
             _ = send_rst_stream(State, StreamId, protocol_error),
             frame_loop(remove_stream(State, StreamId))
+    end.
+
+%% A request that passed the body-size cap: run the per-peer rate-limit gate,
+%% then acquire the listener-wide in-flight slot and spawn the stream worker, or
+%% refuse (429 on rate, REFUSED_STREAM at the ceiling). No worker is spawned on a
+%% refusal.
+-spec dispatch_allowed_stream(
+    #loop{},
+    stream_id(),
+    roadrunner_req:request(),
+    stream_entry(),
+    #{stream_id() => stream_entry()},
+    roadrunner_conn:proto_opts(),
+    infinity | pos_integer(),
+    counters:counters_ref() | undefined,
+    atom()
+) -> no_return().
+dispatch_allowed_stream(
+    StateBuf, StreamId, Req, Stream, Streams, ProtoOpts, MaxConcReq, InflightCounter, ListenerName
+) ->
+    case rate_limit_refused(StateBuf, StreamId, Req) of
+        {refused, State1} ->
+            %% Per-peer rate exceeded: 429 + RST(no_error) sent, no worker
+            %% spawned. 429 (not REFUSED_STREAM) so the client backs off per
+            %% Retry-After instead of retrying the stream immediately.
+            frame_loop(remove_stream(State1, StreamId));
+        ok ->
+            case roadrunner_conn:try_acquire_request_slot(MaxConcReq, InflightCounter) of
+                true ->
+                    {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
+                        self(), StreamId, Req, ProtoOpts
+                    ),
+                    Stream1 = Stream#{
+                        worker_pid := WorkerPid,
+                        worker_ref := MonRef,
+                        state := half_closed_remote,
+                        body := []
+                    },
+                    frame_loop(StateBuf#loop{
+                        streams = Streams#{StreamId := Stream1},
+                        worker_refs = (StateBuf#loop.worker_refs)#{MonRef => StreamId}
+                    });
+                false ->
+                    %% Listener-wide in-flight ceiling reached — refuse with
+                    %% retry-safe REFUSED_STREAM, no worker spawned.
+                    ok = throttle_stream(StateBuf, ListenerName),
+                    _ = send_rst_stream(StateBuf, StreamId, refused_stream),
+                    frame_loop(remove_stream(StateBuf, StreamId))
+            end
     end.
 
 %% Verify that any client-supplied `content-length` header matches

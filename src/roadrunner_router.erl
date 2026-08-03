@@ -50,9 +50,18 @@ opaque `compiled()` shape is a list of pre-parsed segment patterns;
 swapping to a trie/DAG later is a non-breaking change for callers.
 """.
 
--export([compile/2, match/3, compile_rate_limits/1, match_rate_limit/3]).
+-export([
+    compile/2,
+    match/3,
+    compile_rate_limits/1,
+    match_rate_limit/3,
+    compile_body_limits/1,
+    match_body_limit/3
+]).
 
--export_type([route/0, routes/0, compiled/0, bindings/0, methods/0, route_rate_limits/0]).
+-export_type([
+    route/0, routes/0, compiled/0, bindings/0, methods/0, route_rate_limits/0, route_body_limits/0
+]).
 
 -doc """
 A single route entry. Three shapes are accepted:
@@ -80,7 +89,8 @@ unset → every method.
         state => term(),
         middlewares => roadrunner_middleware:middleware_list(),
         methods => methods(),
-        rate_limit => map()
+        rate_limit => map(),
+        max_body => non_neg_integer()
     }.
 
 -doc """
@@ -149,6 +159,17 @@ path, so this is a plain (non-opaque) type.
 """.
 -type route_rate_limits() ::
     [{[segment()], method_lookup(), {pos_integer(), pos_integer(), pos_integer()}, binary()}]
+    | undefined.
+
+-doc """
+The compiled per-route `max_body` overrides `match_body_limit/3` consumes: a
+path+method-keyed subset of the routes that declare a `max_body`, each with its
+byte cap. `undefined` when no route declares one (so the body path pays
+nothing). A plain (non-opaque) type — the conn loops match `undefined` to take
+the global-limit fast path.
+""".
+-type route_body_limits() ::
+    [{[segment()], method_lookup(), non_neg_integer()}]
     | undefined.
 
 -doc """
@@ -417,6 +438,71 @@ match_rate_limit_1(Method, Segments, [{Pattern, Methods, Units, Key} | Rest]) ->
                     {Rate, Cap, Cost, Key};
                 false ->
                     match_rate_limit_1(Method, Segments, Rest)
+            end
+    end.
+
+-doc """
+Compile the per-route `max_body` overrides out of a route list.
+
+Keeps only the map-form routes that carry a `max_body` key, pairing each route's
+compiled path + method allowlist with its byte cap. Returns `undefined` when no
+route declares one, so the caller can bake an absent subset and keep the global
+limit. Raises `{invalid_route_max_body, Path, Value}` on a non-`non_neg_integer`
+cap, at listener init.
+""".
+-spec compile_body_limits(routes()) -> route_body_limits().
+compile_body_limits(Routes) when is_list(Routes) ->
+    case [compile_body_limit(R) || R <- Routes, is_body_limited(R)] of
+        [] -> undefined;
+        Limits -> Limits
+    end.
+
+-spec is_body_limited(route()) -> boolean().
+is_body_limited(#{max_body := _}) -> true;
+is_body_limited(_) -> false.
+
+-spec compile_body_limit(map()) -> {[segment()], method_lookup(), non_neg_integer()}.
+compile_body_limit(#{path := Path, max_body := MaxBody} = Route) when
+    is_binary(Path), is_integer(MaxBody), MaxBody >= 0
+->
+    {compile_path(Path), compile_methods(maps:get(methods, Route, undefined)), MaxBody};
+compile_body_limit(#{path := Path, max_body := MaxBody}) ->
+    error({invalid_route_max_body, Path, MaxBody}).
+
+-doc """
+Find the per-route `max_body` byte cap for a request method + path, or `nomatch`.
+
+First-match-wins over the compiled subset, reusing the same path + method
+matchers as `match/3`; a path-match whose method is not in the route's allowlist
+keeps scanning. `nomatch` means the caller keeps the listener-global
+`max_content_length`.
+
+Where the cap takes effect differs by protocol. HTTP/1 and HTTP/2 bound what the
+request buffers: h1 caps the body read, h2 resolves the route's cap once the
+header block is decoded and enforces it as DATA frames arrive. HTTP/3 keeps its
+QPACK header block raw until dispatch, so it cannot know the path while the body
+accumulates; there the route cap is applied after accumulation (bounded by the
+listener-global `max_content_length`) and changes the response rather than the
+buffering.
+""".
+-spec match_body_limit(binary(), binary(), route_body_limits()) ->
+    non_neg_integer() | nomatch.
+match_body_limit(_Method, _Path, undefined) ->
+    nomatch;
+match_body_limit(Method, Path, Limits) when is_binary(Method), is_binary(Path) ->
+    match_body_limit_1(Method, path_segments(Path), Limits).
+
+-spec match_body_limit_1(binary(), [binary()], [tuple()]) -> non_neg_integer() | nomatch.
+match_body_limit_1(_Method, _Segments, []) ->
+    nomatch;
+match_body_limit_1(Method, Segments, [{Pattern, Methods, MaxBody} | Rest]) ->
+    case match_pattern(Pattern, Segments, #{}) of
+        no_match ->
+            match_body_limit_1(Method, Segments, Rest);
+        _Bindings ->
+            case method_allowed(Method, Methods) of
+                true -> MaxBody;
+                false -> match_body_limit_1(Method, Segments, Rest)
             end
     end.
 

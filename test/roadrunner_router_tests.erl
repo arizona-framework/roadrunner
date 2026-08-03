@@ -706,3 +706,60 @@ rate_limits_bad_config_raises_test() ->
             #{path => ~"/x", handler => h, rate_limit => #{rate => 0}}
         ])
     ).
+
+%% =============================================================================
+%% compile_body_limits/1 + match_body_limit/3 — per-route body-size overrides
+%% =============================================================================
+
+body_limits_none_is_undefined_test() ->
+    ?assertEqual(
+        undefined,
+        roadrunner_router:compile_body_limits([{~"/", h}, #{path => ~"/x", handler => h}])
+    ).
+
+body_limits_match_hit_test() ->
+    Limits = roadrunner_router:compile_body_limits([
+        #{path => ~"/login", handler => h, max_body => 65536}
+    ]),
+    ?assertEqual(65536, roadrunner_router:match_body_limit(~"POST", ~"/login", Limits)).
+
+body_limits_match_miss_test() ->
+    Limits = roadrunner_router:compile_body_limits([
+        #{path => ~"/login", handler => h, max_body => 65536}
+    ]),
+    ?assertEqual(nomatch, roadrunner_router:match_body_limit(~"GET", ~"/other", Limits)).
+
+body_limits_undefined_subset_is_nomatch_test() ->
+    ?assertEqual(nomatch, roadrunner_router:match_body_limit(~"GET", ~"/login", undefined)).
+
+body_limits_method_specific_test() ->
+    Limits = roadrunner_router:compile_body_limits([
+        #{path => ~"/upload", handler => h, methods => [~"POST"], max_body => 1024}
+    ]),
+    ?assertEqual(1024, roadrunner_router:match_body_limit(~"POST", ~"/upload", Limits)),
+    ?assertEqual(nomatch, roadrunner_router:match_body_limit(~"GET", ~"/upload", Limits)).
+
+body_limits_zero_allowed_test() ->
+    %% max_body => 0 (reject any body) is valid.
+    Limits = roadrunner_router:compile_body_limits([
+        #{path => ~"/nobody", handler => h, max_body => 0}
+    ]),
+    ?assertEqual(0, roadrunner_router:match_body_limit(~"GET", ~"/nobody", Limits)).
+
+body_limits_param_path_test() ->
+    Limits = roadrunner_router:compile_body_limits([
+        #{path => ~"/users/:id", handler => h, max_body => 4096}
+    ]),
+    ?assertEqual(4096, roadrunner_router:match_body_limit(~"PUT", ~"/users/7", Limits)).
+
+body_limits_bad_value_raises_test() ->
+    ?assertError(
+        {invalid_route_max_body, ~"/x", -1},
+        roadrunner_router:compile_body_limits([#{path => ~"/x", handler => h, max_body => -1}])
+    ).
+
+body_limits_non_integer_raises_test() ->
+    ?assertError(
+        {invalid_route_max_body, ~"/x", big},
+        roadrunner_router:compile_body_limits([#{path => ~"/x", handler => h, max_body => big}])
+    ).

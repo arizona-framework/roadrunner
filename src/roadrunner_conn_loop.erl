@@ -135,7 +135,12 @@
     %% (`undefined` when off — the common case). When set,
     %% `handle_request_bytes/2` resolves the client IP per request; the
     %% `undefined` branch adds nothing to the request map.
-    real_ip = undefined :: roadrunner_real_ip:prepared()
+    real_ip = undefined :: roadrunner_real_ip:prepared(),
+    %% Per-route `max_body` subset cached from `proto_opts` at `shoot`
+    %% (`undefined` when no route declares one). When set, `read_body_phase/3`
+    %% caps the body read at the matched route's limit instead of the global
+    %% `max_content_length`.
+    body_limits = undefined :: roadrunner_router:route_body_limits()
 }).
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
@@ -264,7 +269,8 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                     maps:get(http1_max_header_count, ProtoOpts, 100)
                 },
                 rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer, RealIp),
-                real_ip = RealIp
+                real_ip = RealIp,
+                body_limits = roadrunner_conn:resolve_body_limits(ProtoOpts)
             },
             read_request_phase(S)
     end.
@@ -653,7 +659,8 @@ read_body_phase(
         socket = Socket,
         min_rate = MinRate,
         body_buffering = BodyMode,
-        max_content_length = MaxCL,
+        max_content_length = GlobalMaxCL,
+        body_limits = BodyLimits,
         http1_limits = {_ReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}
     } = S,
     Req,
@@ -661,6 +668,9 @@ read_body_phase(
 ) ->
     Recv = roadrunner_conn:make_recv(Socket, Deadline, MinRate),
     Buffered = S#loop_state.buffered,
+    %% Cap the body at the matched route's `max_body` when one is configured,
+    %% else the listener-global `max_content_length` (the common path).
+    MaxCL = roadrunner_conn:effective_max_body(BodyLimits, Req, GlobalMaxCL),
     %% Trailer headers (chunked bodies) obey the same caps as request
     %% headers; the request-line cap doesn't apply to a trailer block.
     TrailerLimits = {MaxHdrLine, MaxHdrBlock, MaxHdrCount},

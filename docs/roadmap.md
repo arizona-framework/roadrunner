@@ -442,23 +442,30 @@ top-level keys add new per-route capabilities without breaking
 existing routes. None of the below is wired up yet; the map shape
 is ready when one of these has a real caller behind it.
 
-### Reuse the dispatch route match for the per-route rate-limit lookup — medium
+### Collapse the per-route override lookups into one route match — medium
 
-**What:** The rate guard runs before route resolution so a refused request skips
-routing entirely. To find a per-route `rate_limit` it therefore does its own
-`path_segments/1` split and its own first-match scan, and dispatch then repeats
-both moments later in `match/3`. A listener with any per-route limit pays
-roughly double the router work per request.
+**What:** The per-route `rate_limit` and `max_body` overrides compile into two
+separate subsets, each looked up independently, and dispatch then matches the
+route a third time in `match/3`. Every lookup repeats the same
+`path_segments/1` split and first-match scan. A listener configuring both
+overrides therefore pays roughly three router matches per request where one
+would do.
 
-**Why deferred:** the duplication only exists when a per-route limit is
-configured (the compiled subset is `undefined` otherwise, and the lookup is
-skipped), and the router match is cheap next to the handler. Collapsing it means
-either routing before the guard (so refused requests pay for routing) or
-threading the matched route from the guard into dispatch, which widens the
-dispatch signature across all three protocol loops.
+They are split because they are consumed at different points: the body cap is
+needed before the body is read, the rate guard runs at dispatch (deliberately
+before route resolution, so a refused request skips routing), and the two were
+built as separate features. Compiling one `route_overrides` subset carrying both
+values, matched once per request and cached on the loop state, collapses all
+three to one.
 
-**Scope:** medium. The win is real but narrow; wants a profile on a
-per-route-limited listener before taking on the plumbing.
+**Why deferred:** each lookup is skipped entirely when its subset is `undefined`
+(the default), so this costs nothing unless per-route overrides are configured,
+and a router match is cheap next to the handler. The fix touches the compile
+step, both persistent_term keys, the loop-state records and the request flow in
+all three protocol loops.
+
+**Scope:** medium. Wants a profile on a listener that configures both overrides
+before taking on the plumbing.
 
 ### Per-route `name => atom()` for telemetry / reverse routing — small
 
@@ -472,25 +479,22 @@ to a path.
 `(listener_name, method, path)` is already enough to identify a
 route in dashboards; named lookup is a niceness, not a need.
 
-### Per-route `max_body => non_neg_integer()` body-size override — medium
+### Pre-read body-cap enforcement for per-route `max_body` on h3 — medium
 
-**What:** A per-route override of the listener-global `max_content_length`, so an
-endpoint can cap its body tighter than the default (e.g. `/login` at 64 KB while
-the listener allows 10 MB). The per-route `rate_limit` override already ships;
-this is its body-size sibling.
+**What:** h1 and h2 both bound what a request buffers at the matched route's
+`max_body` (h1 before the read, h2 in `on_data` from a cap resolved at
+END_HEADERS). h3 still enforces it *after* the body is accumulated, as a 413 at
+dispatch, because the QPACK header block stays raw until then — so the route's
+path is unknown while DATA accumulates. Closing the gap needs an eager QPACK
+decode at the HEADERS frame, threaded to dispatch.
 
-**Why harder than `rate_limit`:** `max_content_length` is enforced *during* body
-read/accumulation in all three protocols, which runs *before* the route is
-resolved today. The path is known right after headers, so the fix is early route
-resolution at headers-complete (gated on any route declaring `max_body`, to keep
-the common path unchanged), caching the matched route to reuse at dispatch: H1
-resolves before the body-read phase and passes the route's limit to the existing
-body reader (reusing the oversized-body drain + 413 path); H2/H3 store the
-effective limit on the stream entry and enforce it in the DATA-accumulation size
-check.
+**Why deferred:** the global `max_content_length` still bounds what an h3 stream
+accumulates, so the dispatch check is a correct tighter cap; the gap is that a
+route cap tighter than the global one does not reduce buffering on h3. Wants the
+eager-decode plumbing, which also unblocks h3 manual-mode body reading.
 
-**Scope:** medium. The early-route-match plumbing is the bulk; the limit
-enforcement reuses the existing oversized-body paths.
+**Scope:** medium. Eager QPACK decode at the HEADERS frame plus threading the
+decoded block to dispatch, reusing `roadrunner_conn:effective_max_body_for/4`.
 
 ### Nested route groups with shared prefix + middlewares — medium
 

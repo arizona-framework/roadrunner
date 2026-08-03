@@ -2285,3 +2285,35 @@ maybe_put_client_ip_unknown_peer_skips_field_test() ->
             roadrunner_real_ip:prepare(Cfg, undefined), Req
         )
     ).
+
+%% --- resolve_body_limits/1 ---
+
+resolve_body_limits_unset_test() ->
+    %% No subset published for this listener → undefined.
+    ?assertEqual(
+        undefined,
+        roadrunner_conn:resolve_body_limits(#{listener_name => body_limits_unset_test})
+    ).
+
+resolve_body_limits_no_listener_name_test() ->
+    ?assertEqual(undefined, roadrunner_conn:resolve_body_limits(#{})).
+
+%% --- effective_max_body/3 ---
+
+effective_max_body_off_returns_global_test() ->
+    Req = #{method => ~"POST", path => ~"/login"},
+    ?assertEqual(1000, roadrunner_conn:effective_max_body(undefined, Req, 1000)).
+
+effective_max_body_route_match_test() ->
+    Limits = roadrunner_router:compile_body_limits([
+        #{path => ~"/login", handler => h, max_body => 64}
+    ]),
+    Req = #{method => ~"POST", path => ~"/login"},
+    ?assertEqual(64, roadrunner_conn:effective_max_body(Limits, Req, 1000)).
+
+effective_max_body_route_miss_returns_global_test() ->
+    Limits = roadrunner_router:compile_body_limits([
+        #{path => ~"/login", handler => h, max_body => 64}
+    ]),
+    Req = #{method => ~"GET", path => ~"/other"},
+    ?assertEqual(1000, roadrunner_conn:effective_max_body(Limits, Req, 1000)).
