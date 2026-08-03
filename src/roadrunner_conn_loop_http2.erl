@@ -1795,22 +1795,20 @@ throttle_stream(#loop{proto_opts = #{throttled_counter := Counter}}, ListenerNam
 rate_limit_refused(#loop{rate_limit = undefined}, _StreamId, _Req) ->
     ok;
 rate_limit_refused(
-    #loop{
-        rate_limit = {Rate, Cap, Cost, Table, Counter, KeySpec},
-        listener_name = ListenerName
-    } = State,
-    StreamId,
-    Req
+    #loop{rate_limit = RateLimit, listener_name = ListenerName} = State, StreamId, Req
 ) ->
-    IP = roadrunner_conn:rate_limit_key(KeySpec, Req),
-    NowMs = erlang:monotonic_time(millisecond),
-    case roadrunner_conn:rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) of
+    case roadrunner_conn:rate_limit_apply(RateLimit, Req) of
         allow ->
             ok;
-        {deny, RetryAfter} ->
+        {deny, RetryAfter, Counter} ->
             ok = roadrunner_conn:rate_limited_telemetry(ListenerName, Counter),
             State1 = encode_and_send_response_atomic(
-                State, StreamId, 429, [{~"retry-after", integer_to_binary(RetryAfter)}], ~"", 0
+                State,
+                StreamId,
+                429,
+                [{~"retry-after", integer_to_binary(RetryAfter)}],
+                ~"",
+                0
             ),
             _ = send_rst_stream(State1, StreamId, no_error),
             {refused, State1}

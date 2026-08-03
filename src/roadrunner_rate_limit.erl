@@ -11,9 +11,52 @@
 %% ETS bucket store in `roadrunner_conn`) derives `Cost` and the cap; this
 %% module is socket- and state-free so the bucket math is exhaustively testable.
 
--export([refill/5, spend/2, retry_after_secs/3]).
+-export([refill/5, spend/2, retry_after_secs/3, units/2, compile_route_config/1]).
 
 -define(MILLI, 1000).
+
+%% Derive the integer-unit pair the bucket check uses from a `Burst`/`Period`:
+%% one request costs `Cost = Period * 1000` units and the bucket holds `Burst`
+%% requests, i.e. `Cap = Burst * Cost` units. The single source of this
+%% derivation, shared by the listener-global path (`roadrunner_conn`) and the
+%% per-route compile path (`compile_route_config/1`).
+-doc false.
+-spec units(pos_integer(), pos_integer()) -> {pos_integer(), pos_integer()}.
+units(Burst, Period) ->
+    Cost = Period * ?MILLI,
+    {Burst * Cost, Cost}.
+
+%% Validate a per-route `rate_limit` config and derive its `{Rate, Cap, Cost}`
+%% triple. Accepts a map with `rate` (required, positive int) and optional
+%% `burst` (default `rate`) / `period` (default 1, so `rate` is per-second).
+%% Any other key is rejected — the table-global `idle_ttl`/`sweep_interval` are
+%% listener policy, not per-bucket. Raises `{invalid_rate_limit, Opts}` on bad
+%% input so a bad route config fails loudly at listener init.
+-doc false.
+-spec compile_route_config(term()) -> {pos_integer(), pos_integer(), pos_integer()}.
+compile_route_config(Opts) when is_map(Opts) ->
+    Resolved = maps:fold(
+        fun(K, V, Acc) ->
+            case
+                (K =:= rate orelse K =:= burst orelse K =:= period) andalso
+                    is_integer(V) andalso V > 0
+            of
+                true -> Acc#{K => V};
+                false -> error({invalid_rate_limit, Opts})
+            end
+        end,
+        #{},
+        Opts
+    ),
+    case Resolved of
+        #{rate := Rate} ->
+            {Cap, Cost} = units(maps:get(burst, Resolved, Rate), maps:get(period, Resolved, 1)),
+            {Rate, Cap, Cost};
+        #{} ->
+            error({invalid_rate_limit, Opts})
+    end;
+compile_route_config(Opts) ->
+    error({invalid_rate_limit, Opts}).
 
 %% Refill a bucket holding `Units`, last touched at `LastMs`, to its level at
 %% `NowMs`: add `Elapsed * Rate` units (the refill rate is `Rate` units/ms),

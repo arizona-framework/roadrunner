@@ -57,3 +57,43 @@ retry_after_partial_deficit_test() ->
 
 retry_after_never_below_one_test() ->
     ?assertEqual(1, ?M:retry_after_secs(999, 1000, 1000)).
+
+%% --- units/2 ---
+
+units_per_second_test() ->
+    %% Period 1 → Cost 1000 units/request; Cap = Burst * Cost.
+    ?assertEqual({5000, 1000}, ?M:units(5, 1)).
+
+units_per_minute_test() ->
+    ?assertEqual({120000, 60000}, ?M:units(2, 60)).
+
+%% --- compile_route_config/1 ---
+
+compile_route_config_rate_only_test() ->
+    %% burst defaults to rate, period to 1: Cost 1000, Cap = rate * 1000.
+    ?assertEqual({10, 10000, 1000}, ?M:compile_route_config(#{rate => 10})).
+
+compile_route_config_full_test() ->
+    ?assertEqual(
+        {1, 60000, 60000}, ?M:compile_route_config(#{rate => 1, burst => 1, period => 60})
+    ).
+
+compile_route_config_burst_test() ->
+    ?assertEqual({2, 5000, 1000}, ?M:compile_route_config(#{rate => 2, burst => 5})).
+
+compile_route_config_missing_rate_test() ->
+    ?assertError({invalid_rate_limit, #{burst := 5}}, ?M:compile_route_config(#{burst => 5})).
+
+compile_route_config_rejects_table_keys_test() ->
+    %% `idle_ttl`/`sweep_interval` are table-global, not per-route.
+    Opts = #{rate => 1, idle_ttl => 1000},
+    ?assertError({invalid_rate_limit, Opts}, ?M:compile_route_config(Opts)).
+
+compile_route_config_non_positive_test() ->
+    ?assertError({invalid_rate_limit, _}, ?M:compile_route_config(#{rate => 0})).
+
+compile_route_config_non_integer_test() ->
+    ?assertError({invalid_rate_limit, _}, ?M:compile_route_config(#{rate => fast})).
+
+compile_route_config_non_map_test() ->
+    ?assertError({invalid_rate_limit, true}, ?M:compile_route_config(true)).

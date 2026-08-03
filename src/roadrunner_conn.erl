@@ -67,6 +67,8 @@
     send_rate_limited/2,
     rate_limit_check/6,
     rate_limit_key/2,
+    rate_limit_lookup/2,
+    rate_limit_apply/2,
     resolve_rate_limit/3,
     maybe_put_client_ip/2,
     rate_limited_telemetry/2,
@@ -194,33 +196,43 @@
     handler_start_timeout => timeout()
 }.
 
-%% Resolved per-peer rate-limit config, built by `roadrunner_listener` when the
-%% `rate_limit` opt is set: `rate` requests per `period` seconds with a `burst`
-%% bucket capacity, and an `idle_ttl`/`sweep_interval` (ms) eviction policy for
-%% the ETS `table` holding each peer's bucket. The cumulative refusal count
-%% lives in the top-level `rate_limited_counter`.
+%% Resolved rate-limit config in `proto_opts`, built by `roadrunner_listener`
+%% when rate limiting is active (a listener-global `rate_limit` opt OR any
+%% per-route override): an `idle_ttl`/`sweep_interval` (ms) eviction policy for
+%% the ETS `table` holding the buckets. `rate`/`burst`/`period` are present only
+%% for a listener-global limit (absent when only per-route limits exist). The
+%% cumulative refusal count lives in the top-level `rate_limited_counter`.
 -type rate_limit() :: #{
-    rate := pos_integer(),
-    burst := pos_integer(),
-    period := pos_integer(),
+    rate => pos_integer(),
+    burst => pos_integer(),
+    period => pos_integer(),
     idle_ttl := pos_integer(),
     sweep_interval := pos_integer(),
     table := ets:table()
 }.
 
-%% The per-connection rate-limit guard state cached on each conn loop's record:
-%% the `{Rate, Cap, Cost, Table, Counter, Key}` resolved from `proto_opts` + the
-%% peer once at setup (see `resolve_rate_limit/3`) — with `Cap`/`Cost` already
-%% derived so the per-request check does no arithmetic — or `undefined` when the
-%% guard is off or the peer IP is unknown. `Key` is the baked peer `IP`, or the
-%% `client_ip` marker when the `real_ip` opt is also set, meaning the bucket
-%% keys on the per-request resolved client IP (read via `rate_limit_key/2`).
-%% Checked by `rate_limit_check/6`.
+%% A bucket key: the client IP for a listener-global limit, or `{RoutePath, IP}`
+%% for a per-route limit (its own namespace in the shared table). The check and
+%% eviction treat it opaquely.
+-type bucket_key() :: inet:ip_address() | {binary(), inet:ip_address()}.
+
+%% The pre-derived `{Rate, Cap, Cost}` unit triple of one limit, baked once so
+%% the per-request check does no arithmetic.
+-type rate_limit_units() :: {pos_integer(), pos_integer(), pos_integer()}.
+
+%% The per-connection rate-limit guard state cached on each conn loop's record,
+%% resolved once at setup (see `resolve_rate_limit/3`), or `undefined` when no
+%% rate limiting is active or the peer IP is unknown. The tuple carries the
+%% listener-global limit (`rate_limit_units()` or `undefined` when per-route
+%% only), the per-route override subset (`roadrunner_router:route_rate_limits()`,
+%% itself `undefined` when none), the shared bucket `Table`, the refusal
+%% `Counter`, and `Key` — the address baked at setup whenever it cannot change,
+%% or the `client_ip` marker only when a trusted proxy makes it vary per request
+%% (see `rate_limit_key/2`). Consulted by `rate_limit_lookup/2`.
 -type rate_limit_state() ::
     {
-        pos_integer(),
-        pos_integer(),
-        pos_integer(),
+        rate_limit_units() | undefined,
+        roadrunner_router:route_rate_limits(),
         ets:table(),
         atomics:atomics_ref(),
         inet:ip_address() | client_ip
@@ -359,13 +371,14 @@ try_acquire_request_slot(Max, Counter) ->
             false
     end.
 
-%% Resolve the per-connection rate-limit tuple `{Rate, Cap, Cost, Table,
-%% Counter, Key}` from `proto_opts` + the (constant-per-conn) peer once at setup,
-%% or `undefined` when the guard is off, so the per-request check is a single
-%% branch on a cached value. `Key` is the baked peer `IP`, or the `client_ip`
-%% marker when `real_ip` is configured (then the bucket keys on the per-request
-%% resolved client IP). The catch-all covers a missing peer (a 2-tuple `{IP, _}`
-%% is required) and `rate_limit => undefined`.
+%% Resolve the per-connection rate-limit state from `proto_opts` + the
+%% (constant-per-conn) peer once at setup, or `undefined` when no rate limiting
+%% is active or the peer is unknown. The global `{Rate,Cap,Cost}` triple is baked
+%% here (so the per-request check does no arithmetic), the per-route override
+%% subset is read once from persistent_term, and `Key` is the baked peer `IP` or
+%% the `client_ip` marker when `real_ip` is set. The first clause matches only
+%% when the bucket `table` exists (rate limiting active); the catch-all covers a
+%% missing peer and `rate_limit => undefined`.
 -doc false.
 -spec resolve_rate_limit(
     proto_opts(),
@@ -374,18 +387,33 @@ try_acquire_request_slot(Max, Counter) ->
 ) -> rate_limit_state().
 resolve_rate_limit(
     #{
-        rate_limit := #{rate := Rate, burst := Burst, period := Period, table := Table},
+        rate_limit := #{table := Table} = RateLimit,
         rate_limited_counter := Counter
-    },
+    } = ProtoOpts,
     {IP, _Port},
     Prepared
 ) ->
-    %% Bake the derived `Cost` (units/request) and `Cap` (bucket capacity) here,
-    %% once per connection, so the per-request `rate_limit_check/6` does no
-    %% multiplication.
-    Cost = Period * 1000,
-    Cap = Burst * Cost,
-    %% Bake the bucket key too, as far as the config allows. Only a trusted peer
+    Global =
+        case RateLimit of
+            #{rate := Rate, burst := Burst, period := Period} ->
+                {Cap, Cost} = roadrunner_rate_limit:units(Burst, Period),
+                {Rate, Cap, Cost};
+            _ ->
+                undefined
+        end,
+    %% `listener_name` is read with a default rather than matched in the head on
+    %% purpose: a head match would send proto_opts that omit it to the
+    %% `undefined` catch-all, silently disabling the whole guard instead of
+    %% failing loudly. Absent, it costs the per-route subset but keeps the
+    %% global limit enforced.
+    RouteLimits =
+        case ProtoOpts of
+            #{listener_name := ListenerName} ->
+                persistent_term:get({roadrunner_rate_limit_routes, ListenerName}, undefined);
+            #{} ->
+                undefined
+        end,
+    %% Bake the bucket key as far as the config allows. Only a trusted peer
     %% (`{walk, ...}`) can produce a different client per request and so needs
     %% the `client_ip` marker; the opt being off or the peer being untrusted
     %% yields one fixed address for the whole connection, so the per-request
@@ -396,7 +424,7 @@ resolve_rate_limit(
             {const, ClientIP} -> ClientIP;
             undefined -> IP
         end,
-    {Rate, Cap, Cost, Table, Counter, Key};
+    {Global, RouteLimits, Table, Counter, Key};
 resolve_rate_limit(_ProtoOpts, _Peer, _Prepared) ->
     undefined.
 
@@ -407,6 +435,68 @@ resolve_rate_limit(_ProtoOpts, _Peer, _Prepared) ->
 %% peer's own trust check already happened once at connection setup
 %% (`roadrunner_real_ip:prepare/2`), so an untrusted peer costs a single field
 %% read here rather than a per-request CIDR scan.
+
+%% Pick the rate-limit bucket for a request: the per-route override when its
+%% method+path matches (keyed `{RoutePath, ClientIP}` in its own namespace),
+%% else the listener-global limit (keyed on the client IP), else `skip`. The
+%% global-only state (`RouteLimits = undefined`) avoids the method/path
+%% extraction entirely. The conn loops gate the off path (`rate_limit_state` is
+%% `undefined`) inline before calling this, so the `undefined` clause here is
+%% only reached by direct callers/tests.
+-doc false.
+-spec rate_limit_lookup(rate_limit_state(), roadrunner_req:request()) ->
+    skip
+    | {check, ets:table(), bucket_key(), pos_integer(), pos_integer(), pos_integer(),
+        atomics:atomics_ref()}.
+rate_limit_lookup(undefined, _Req) ->
+    skip;
+rate_limit_lookup({Global, undefined, Table, Counter, KeySpec}, Req) ->
+    global_bucket(Global, Table, Counter, rate_limit_key(KeySpec, Req));
+rate_limit_lookup({Global, RouteLimits, Table, Counter, KeySpec}, Req) ->
+    IP = rate_limit_key(KeySpec, Req),
+    case
+        roadrunner_router:match_rate_limit(
+            roadrunner_req:method(Req), roadrunner_req:path(Req), RouteLimits
+        )
+    of
+        {Rate, Cap, Cost, RoutePath} ->
+            {check, Table, {RoutePath, IP}, Rate, Cap, Cost, Counter};
+        nomatch ->
+            global_bucket(Global, Table, Counter, IP)
+    end.
+
+-spec global_bucket(
+    rate_limit_units() | undefined, ets:table(), atomics:atomics_ref(), bucket_key()
+) ->
+    skip
+    | {check, ets:table(), bucket_key(), pos_integer(), pos_integer(), pos_integer(),
+        atomics:atomics_ref()}.
+global_bucket(undefined, _Table, _Counter, _IP) ->
+    skip;
+global_bucket({Rate, Cap, Cost}, Table, Counter, IP) ->
+    {check, Table, IP, Rate, Cap, Cost, Counter}.
+
+%% Apply the rate-limit guard to a request: pick the bucket (`rate_limit_lookup/2`)
+%% and spend a token. Returns `allow` (limit not exceeded, or no applicable
+%% limit) or `{deny, RetryAfterSecs, Counter}` so the caller emits the
+%% protocol-appropriate 429 and bumps the refusal `Counter`. Collapsing `skip`
+%% into `allow` keeps the three protocol gates to a single allow/deny branch.
+-doc false.
+-spec rate_limit_apply(rate_limit_state(), roadrunner_req:request()) ->
+    allow | {deny, pos_integer(), atomics:atomics_ref()}.
+rate_limit_apply(State, Req) ->
+    case rate_limit_lookup(State, Req) of
+        skip ->
+            allow;
+        {check, Table, Key, Rate, Cap, Cost, Counter} ->
+            case
+                rate_limit_check(Table, Key, Rate, Cap, Cost, erlang:monotonic_time(millisecond))
+            of
+                allow -> allow;
+                {deny, RetryAfter} -> {deny, RetryAfter, Counter}
+            end
+    end.
+
 -doc false.
 -spec maybe_put_client_ip(roadrunner_real_ip:prepared(), roadrunner_req:request()) ->
     roadrunner_req:request().
@@ -439,7 +529,7 @@ contract `try_acquire_request_slot/2` documents.
 deterministically testable).
 """.
 -spec rate_limit_check(
-    ets:table(), inet:ip_address(), pos_integer(), pos_integer(), pos_integer(), integer()
+    ets:table(), bucket_key(), pos_integer(), pos_integer(), pos_integer(), integer()
 ) ->
     allow | {deny, pos_integer()}.
 rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) ->
