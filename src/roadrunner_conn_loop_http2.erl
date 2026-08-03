@@ -829,10 +829,8 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
 stream_max_body(#loop{body_limits = undefined, max_content_length = Global}, _Headers) ->
     Global;
 stream_max_body(#loop{body_limits = BodyLimits, max_content_length = Global}, Headers) ->
-    case {find_pseudo(~":method", Headers), find_pseudo(~":path", Headers)} of
-        {undefined, _} ->
-            Global;
-        {_, undefined} ->
+    case route_keys(Headers, undefined, undefined) of
+        undefined ->
             Global;
         {Method, Target} ->
             %% Route matching runs on the `?`-free path. Share
@@ -844,10 +842,24 @@ stream_max_body(#loop{body_limits = BodyLimits, max_content_length = Global}, He
             )
     end.
 
--spec find_pseudo(binary(), roadrunner_http:headers()) -> binary() | undefined.
-find_pseudo(_Name, []) -> undefined;
-find_pseudo(Name, [{Name, Value} | _]) -> Value;
-find_pseudo(Name, [_ | Rest]) -> find_pseudo(Name, Rest).
+%% Pull `:method` and `:path` out of the decoded block in one pass, stopping as
+%% soon as both are bound. RFC 9113 §8.3 requires pseudo-headers to precede the
+%% regular fields, so the scan normally ends within the first few entries rather
+%% than walking the whole list (twice, as two separate lookups would).
+%% `undefined` when either is absent — a malformed request that cannot match a
+%% route, and that `roadrunner_http2_request:from_headers/3` rejects at dispatch.
+-spec route_keys(roadrunner_http:headers(), binary() | undefined, binary() | undefined) ->
+    {binary(), binary()} | undefined.
+route_keys(_Headers, Method, Path) when Method =/= undefined, Path =/= undefined ->
+    {Method, Path};
+route_keys([], _Method, _Path) ->
+    undefined;
+route_keys([{~":method", Method} | Rest], _Method0, Path) ->
+    route_keys(Rest, Method, Path);
+route_keys([{~":path", Path} | Rest], Method, _Path0) ->
+    route_keys(Rest, Method, Path);
+route_keys([_ | Rest], Method, Path) ->
+    route_keys(Rest, Method, Path).
 
 new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow, MaxBody) ->
     #{
