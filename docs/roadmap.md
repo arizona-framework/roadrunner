@@ -442,23 +442,30 @@ top-level keys add new per-route capabilities without breaking
 existing routes. None of the below is wired up yet; the map shape
 is ready when one of these has a real caller behind it.
 
-### Reuse the dispatch route match for the per-route rate-limit lookup — medium
+### Collapse the per-route override lookups into one route match — medium
 
-**What:** The rate guard runs before route resolution so a refused request skips
-routing entirely. To find a per-route `rate_limit` it therefore does its own
-`path_segments/1` split and its own first-match scan, and dispatch then repeats
-both moments later in `match/3`. A listener with any per-route limit pays
-roughly double the router work per request.
+**What:** The per-route `rate_limit` and `max_body` overrides compile into two
+separate subsets, each looked up independently, and dispatch then matches the
+route a third time in `match/3`. Every lookup repeats the same
+`path_segments/1` split and first-match scan. A listener configuring both
+overrides therefore pays roughly three router matches per request where one
+would do.
 
-**Why deferred:** the duplication only exists when a per-route limit is
-configured (the compiled subset is `undefined` otherwise, and the lookup is
-skipped), and the router match is cheap next to the handler. Collapsing it means
-either routing before the guard (so refused requests pay for routing) or
-threading the matched route from the guard into dispatch, which widens the
-dispatch signature across all three protocol loops.
+They are split because they are consumed at different points: the body cap is
+needed before the body is read, the rate guard runs at dispatch (deliberately
+before route resolution, so a refused request skips routing), and the two were
+built as separate features. Compiling one `route_overrides` subset carrying both
+values, matched once per request and cached on the loop state, collapses all
+three to one.
 
-**Scope:** medium. The win is real but narrow; wants a profile on a
-per-route-limited listener before taking on the plumbing.
+**Why deferred:** each lookup is skipped entirely when its subset is `undefined`
+(the default), so this costs nothing unless per-route overrides are configured,
+and a router match is cheap next to the handler. The fix touches the compile
+step, both persistent_term keys, the loop-state records and the request flow in
+all three protocol loops.
+
+**Scope:** medium. Wants a profile on a listener that configures both overrides
+before taking on the plumbing.
 
 ### Per-route `name => atom()` for telemetry / reverse routing — small
 
