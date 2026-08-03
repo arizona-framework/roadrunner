@@ -16,8 +16,8 @@
 %% check is a shift + compare); `resolve/3` runs on the request hot path, but
 %% only when the opt is set — the conn loop gates the call on the cached config.
 
--export([compile/1, resolve/3]).
--export_type([config/0]).
+-export([compile/1, prepare/2, resolve/2]).
+-export_type([config/0, prepared/0]).
 
 -on_load(init_patterns/0).
 
@@ -65,30 +65,60 @@ compile(Other) ->
     error({invalid_listener_opt, real_ip, Other}).
 
 -doc """
-Resolve the real client IP for a request, per the module's recursion rules.
+Per-connection resolution state, built once by `prepare/2`.
 
-`Peer` is the immediate transport peer (`{IP, Port}` or `undefined`); `Headers`
-is the request's header list (names already lowercased on every protocol path).
-Returns the resolved `inet:ip_address()`, falling back to the peer's IP when the
-peer is untrusted or the header is absent, and `undefined` when the peer is
-unknown.
+`undefined` when the opt is off or the peer is unknown (no per-request work at
+all). `{const, IP}` when the immediate peer is not a configured proxy: its
+forwarded header is never honored, so every request on the connection resolves
+to the same address and `resolve/2` is a field read. `{walk, ...}` when the peer
+IS a trusted proxy and the answer therefore varies per request with the
+forwarded header.
 """.
--spec resolve(config(), Peer, roadrunner_http:headers()) -> inet:ip_address() | undefined when
+-type prepared() ::
+    undefined
+    | {const, inet:ip_address()}
+    | {walk, [cidr()], binary(), inet:ip_address()}.
+
+-doc """
+Build the per-connection resolution state from the compiled config and the
+connection's peer.
+
+The peer is fixed for the life of a connection, so whether it is a trusted proxy
+(and its v4-mapped-IPv6 normalization) is decided here, once, instead of on
+every request. An untrusted peer collapses to a constant answer; only a trusted
+one needs the per-request header walk.
+""".
+-spec prepare(undefined | config(), Peer) -> prepared() when
     Peer :: {inet:ip_address(), inet:port_number()} | undefined.
-resolve(_Config, undefined, _Headers) ->
+prepare(undefined, _Peer) ->
     undefined;
-resolve(#{trusted := Trusted, header := HeaderName}, {PeerIP0, _Port}, Headers) ->
+prepare(_Config, undefined) ->
+    undefined;
+prepare(#{trusted := Trusted, header := HeaderName}, {PeerIP0, _Port}) ->
     PeerIP = unmap(PeerIP0),
     case trusted(PeerIP, Trusted) of
         false ->
             %% The immediate peer is not a configured proxy: never honor its
             %% forwarded header (it could be a direct client spoofing one).
-            PeerIP;
+            {const, PeerIP};
         true ->
-            case header_chain(HeaderName, Headers) of
-                [] -> PeerIP;
-                Chain -> walk(Chain, Trusted, PeerIP)
-            end
+            {walk, Trusted, HeaderName, PeerIP}
+    end.
+
+-doc """
+Resolve the real client IP for one request against the prepared state.
+
+`Headers` is the request's header list (names already lowercased on every
+protocol path). Falls back to the peer's IP when the forwarded header is absent
+or its nearest hop is malformed.
+""".
+-spec resolve(prepared(), roadrunner_http:headers()) -> inet:ip_address().
+resolve({const, IP}, _Headers) ->
+    IP;
+resolve({walk, Trusted, HeaderName, PeerIP}, Headers) ->
+    case header_chain(HeaderName, Headers) of
+        [] -> PeerIP;
+        Chain -> walk(Chain, Trusted, PeerIP)
     end.
 
 %% --- config compilation (init time) ---

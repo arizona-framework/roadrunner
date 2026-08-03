@@ -2252,21 +2252,36 @@ request_slot_release_many_test() ->
     ?assertEqual(ok, roadrunner_conn:release_request_slots(10, Ref, 4)),
     ?assertEqual(0, counters:get(Ref, 1)).
 
-%% --- maybe_put_client_ip/3 ---
+%% --- maybe_put_client_ip/2 ---
 
 maybe_put_client_ip_off_is_noop_test() ->
     Req = #{headers => [{~"x-forwarded-for", ~"203.0.113.7"}]},
-    ?assertEqual(Req, roadrunner_conn:maybe_put_client_ip(undefined, Req, {{127, 0, 0, 1}, 80})).
+    ?assertEqual(Req, roadrunner_conn:maybe_put_client_ip(undefined, Req)).
 
 maybe_put_client_ip_resolves_test() ->
     Cfg = roadrunner_real_ip:compile(#{trusted_proxies => [~"127.0.0.1/32"]}),
+    Prepared = roadrunner_real_ip:prepare(Cfg, {{127, 0, 0, 1}, 80}),
     Req = #{headers => [{~"x-forwarded-for", ~"203.0.113.7"}]},
-    Result = roadrunner_conn:maybe_put_client_ip(Cfg, Req, {{127, 0, 0, 1}, 80}),
+    Result = roadrunner_conn:maybe_put_client_ip(Prepared, Req),
     ?assertEqual({203, 0, 113, 7}, maps:get(client_ip, Result)).
 
+maybe_put_client_ip_untrusted_peer_uses_the_baked_constant_test() ->
+    %% An untrusted peer's forwarded header is ignored, and the answer was
+    %% already decided at `prepare/2`, so no header is scanned here.
+    Cfg = roadrunner_real_ip:compile(#{trusted_proxies => [~"127.0.0.1/32"]}),
+    Prepared = roadrunner_real_ip:prepare(Cfg, {{198, 51, 100, 9}, 80}),
+    Req = #{headers => [{~"x-forwarded-for", ~"203.0.113.7"}]},
+    Result = roadrunner_conn:maybe_put_client_ip(Prepared, Req),
+    ?assertEqual({198, 51, 100, 9}, maps:get(client_ip, Result)).
+
 maybe_put_client_ip_unknown_peer_skips_field_test() ->
-    %% Peer unknown: resolution yields `undefined`, so no `client_ip` is stored
+    %% Peer unknown: `prepare/2` yields `undefined`, so no `client_ip` is stored
     %% (it stays a concrete IP type) and the request is returned untouched.
     Cfg = roadrunner_real_ip:compile(#{trusted_proxies => [~"127.0.0.1/32"]}),
     Req = #{headers => [{~"x-forwarded-for", ~"203.0.113.7"}]},
-    ?assertEqual(Req, roadrunner_conn:maybe_put_client_ip(Cfg, Req, undefined)).
+    ?assertEqual(
+        Req,
+        roadrunner_conn:maybe_put_client_ip(
+            roadrunner_real_ip:prepare(Cfg, undefined), Req
+        )
+    ).

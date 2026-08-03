@@ -250,7 +250,7 @@
     %% Compiled `real_ip` config cached from proto_opts at `enter/6`
     %% (`undefined` when off). When set, `dispatch_stream/2` resolves the client
     %% IP per request onto the request map.
-    real_ip = undefined :: undefined | roadrunner_real_ip:config(),
+    real_ip = undefined :: roadrunner_real_ip:prepared(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -316,6 +316,9 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered) ->
     InflightCounter = maps:get(inflight_counter, ProtoOpts, undefined),
     HandshakeTimeout = handshake_timeout(),
     IdleTimeout = idle_timeout(),
+    %% Decide the peer's proxy-trust once per connection; the peer cannot
+    %% change while it lives, so per-request resolution never repeats it.
+    RealIp = roadrunner_real_ip:prepare(maps:get(real_ip, ProtoOpts, undefined), Peer),
     State = #loop{
         socket = Socket,
         proto_opts = ProtoOpts,
@@ -340,8 +343,8 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered) ->
         alt_svc = AltSvc,
         max_concurrent_requests = MaxConcReq,
         inflight_counter = InflightCounter,
-        rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
-        real_ip = maps:get(real_ip, ProtoOpts, undefined),
+        rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer, RealIp),
+        real_ip = RealIp,
         handshake_timeout = HandshakeTimeout,
         idle_timeout = IdleTimeout
     },
@@ -1143,7 +1146,7 @@ dispatch_stream(
             },
             case roadrunner_http2_request:from_headers(Headers, BodyIolist, RequestContext) of
                 {ok, Req0} ->
-                    Req = roadrunner_conn:maybe_put_client_ip(RealIp, Req0, Peer),
+                    Req = roadrunner_conn:maybe_put_client_ip(RealIp, Req0),
                     StateBuf = State#loop{req_id_buffer = NewBuf},
                     case rate_limit_refused(StateBuf, StreamId, Req) of
                         {refused, State1} ->

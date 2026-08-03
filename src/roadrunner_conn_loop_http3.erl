@@ -151,7 +151,7 @@
     %% Compiled `real_ip` config cached from proto_opts at conn start
     %% (`undefined` when off). When set, `dispatch_decoded/4` resolves the
     %% client IP per request onto the request map.
-    real_ip = undefined :: undefined | roadrunner_real_ip:config()
+    real_ip = undefined :: roadrunner_real_ip:prepared()
 }).
 
 -doc """
@@ -199,6 +199,9 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
         listener_name => ListenerName, peer => Peer
     }),
     MaxHeaderBlock = maps:get(http3_max_header_block, ProtoOpts, ?MAX_HEADER_BLOCK),
+    %% Decide the peer's proxy-trust once per connection; the peer cannot
+    %% change while it lives, so per-request resolution never repeats it.
+    RealIp = roadrunner_real_ip:prepare(maps:get(real_ip, ProtoOpts, undefined), Peer),
     loop(#h3{
         conn = Conn,
         proto_opts = ProtoOpts,
@@ -214,8 +217,8 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
         ),
         max_concurrent_requests = maps:get(max_concurrent_requests, ProtoOpts, infinity),
         inflight_counter = maps:get(inflight_counter, ProtoOpts, undefined),
-        rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
-        real_ip = maps:get(real_ip, ProtoOpts, undefined)
+        rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer, RealIp),
+        real_ip = RealIp
     }).
 
 -spec loop(#h3{}) -> ok.
@@ -799,7 +802,7 @@ dispatch_decoded(
             %% stream error H3_MESSAGE_ERROR.
             reset_and_drop(State1, StreamId, ?H3_MESSAGE_ERROR);
         {ok, Req0} ->
-            Req = roadrunner_conn:maybe_put_client_ip(RealIp, Req0, Peer),
+            Req = roadrunner_conn:maybe_put_client_ip(RealIp, Req0),
             case rate_limit_refused(State1, StreamId, Req) of
                 {refused, State2} ->
                     %% Per-peer rate exceeded: 429 + Retry-After sent, stream

@@ -135,7 +135,7 @@
     %% (`undefined` when off — the common case). When set,
     %% `handle_request_bytes/2` resolves the client IP per request; the
     %% `undefined` branch adds nothing to the request map.
-    real_ip = undefined :: undefined | roadrunner_real_ip:config()
+    real_ip = undefined :: roadrunner_real_ip:prepared()
 }).
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
@@ -222,6 +222,11 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                 Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered
             );
         false ->
+            %% Decide the peer's proxy-trust once per connection; the peer cannot
+            %% change while it lives, so per-request resolution never repeats it.
+            RealIp = roadrunner_real_ip:prepare(
+                maps:get(real_ip, ProtoOpts, undefined), Peer
+            ),
             #{
                 requests_counter := RequestsCounter,
                 dispatch := Dispatch,
@@ -258,8 +263,8 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                     maps:get(http1_max_header_block, ProtoOpts, 10240),
                     maps:get(http1_max_header_count, ProtoOpts, 100)
                 },
-                rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
-                real_ip = maps:get(real_ip, ProtoOpts, undefined)
+                rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer, RealIp),
+                real_ip = RealIp
             },
             read_request_phase(S)
     end.
@@ -602,8 +607,7 @@ handle_request_bytes(
                     scheme => Scheme,
                     request_id => RequestId,
                     listener_name => ListenerName
-                },
-                Peer
+                }
             ),
             ok = roadrunner_conn:set_request_logger_metadata(Req),
             ok = roadrunner_conn:maybe_send_continue(Socket, Req, Rest),
