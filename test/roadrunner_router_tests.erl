@@ -311,19 +311,18 @@ match_mixed_tuple_and_map_routes_test() ->
         match_no_pipeline(~"/api/users", Compiled)
     ).
 
-match_wildcard_not_last_falls_through_test() ->
-    %% A wildcard mid-pattern doesn't match — extra literal after it never
-    %% reaches a matching clause, and a fallback route still works.
-    Compiled = roadrunner_router:compile(
-        [
-            {~"/foo/*rest/bar", weird_handler},
-            {~"/foo/*rest", normal_handler}
-        ],
-        []
-    ),
-    ?assertEqual(
-        {ok, normal_handler, #{~"rest" => [~"x", ~"y"]}, #{}},
-        match_no_pipeline(~"/foo/x/y", Compiled)
+compile_rejects_wildcard_followed_by_a_literal_test() ->
+    %% A segment after the wildcard is never reached by the match clauses, so
+    %% the route could only ever be dead weight in the table.
+    ?assertError(
+        {invalid_route_path, ~"/foo/*rest/bar", wildcard_not_last},
+        roadrunner_router:compile(
+            [
+                {~"/foo/*rest/bar", weird_handler},
+                {~"/foo/*rest", normal_handler}
+            ],
+            []
+        )
     ).
 
 %% =============================================================================
@@ -416,19 +415,23 @@ match_duplicate_param_names_keep_last_binding_test() ->
         match_no_pipeline(~"/first/second", Compiled)
     ).
 
-match_multiple_wildcards_pattern_does_not_match_test() ->
-    %% Wildcard match clause requires the wildcard segment to be last.
-    %% A pattern with two wildcards therefore can never match — the
-    %% second is treated as a literal. Document so a future change to
-    %% allow nested wildcards is intentional.
-    Compiled = roadrunner_router:compile([{~"/*a/*b", h}], []),
-    ?assertEqual(not_found, match_no_pipeline(~"/x/y/z", Compiled)).
+compile_rejects_multiple_wildcards_test() ->
+    %% The wildcard match clause requires the wildcard segment to be last, so
+    %% the second `*b` could only ever be read as a literal sitting after a
+    %% wildcard. Rejected rather than registered as a route that never matches;
+    %% allowing nested wildcards later stays a deliberate change.
+    ?assertError(
+        {invalid_route_path, ~"/*a/*b", wildcard_not_last},
+        roadrunner_router:compile([{~"/*a/*b", h}], [])
+    ).
 
-match_wildcard_followed_by_literal_does_not_match_test() ->
-    %% Same constraint: anything declared after a wildcard segment is
-    %% unreachable.
-    Compiled = roadrunner_router:compile([{~"/*tail/post", h}], []),
-    ?assertEqual(not_found, match_no_pipeline(~"/a/b/post", Compiled)).
+compile_rejects_root_wildcard_followed_by_a_literal_test() ->
+    %% Same constraint from the root: anything declared after a wildcard
+    %% segment is unreachable.
+    ?assertError(
+        {invalid_route_path, ~"/*tail/post", wildcard_not_last},
+        roadrunner_router:compile([{~"/*tail/post", h}], [])
+    ).
 
 match_nul_byte_in_segment_is_captured_raw_test() ->
     %% NUL is just a byte to the router — the request-line parser
@@ -604,24 +607,259 @@ compile_rejects_non_binary_methods_test() ->
         roadrunner_router:compile([#{path => ~"/x", handler => h, methods => [get, post]}], [])
     ).
 
-match_all_methods_route_shadows_later_specific_test() ->
-    %% Declaration order wins: an all-methods route on a path short-circuits
-    %% before a later same-path method-specific route is considered.
+compile_rejects_method_specific_route_below_an_all_methods_one_test() ->
+    %% An all-methods route short-circuits every method on its path, so a later
+    %% same-path method-specific route never gets a request.
+    ?assertError(
+        {unreachable_route, 2, ~"/x", [{1, ~"/x"}]},
+        roadrunner_router:compile(
+            [
+                #{path => ~"/x", handler => catch_all},
+                #{path => ~"/x", handler => only_post, methods => [~"POST"]}
+            ],
+            []
+        )
+    ).
+
+%% =============================================================================
+%% Route reachability — compile/2 rejects a route the entries above it already
+%% answer in full, so a mis-ordered table fails at boot instead of 404-ing.
+%% =============================================================================
+
+compile_rejects_duplicate_path_test() ->
+    ?assertError(
+        {unreachable_route, 2, ~"/a", [{1, ~"/a"}]},
+        roadrunner_router:compile([{~"/a", first_handler}, {~"/a", second_handler}], [])
+    ).
+
+compile_rejects_duplicate_root_path_test() ->
+    %% Both compile to an empty segment list, so the walk bottoms out on two
+    %% empty patterns and still reports the shadow.
+    ?assertError(
+        {unreachable_route, 2, ~"////", [{1, ~"/"}]},
+        roadrunner_router:compile([{~"/", home_handler}, {~"////", root_handler}], [])
+    ).
+
+compile_rejects_route_swallowed_by_an_earlier_wildcard_test() ->
+    %% The wildcard is often generated rather than typed (a framework expanding
+    %% an asset route to `<Path>/*path`), so someone reordering two lines gets
+    %% no visual cue that the one above carries a catch-all.
+    ?assertError(
+        {unreachable_route, 2, ~"/static/assets/*path", [{1, ~"/static/*path"}]},
+        roadrunner_router:compile(
+            [
+                {~"/static/*path", site_handler},
+                {~"/static/assets/*path", assets_handler}
+            ],
+            []
+        )
+    ).
+
+compile_rejects_route_shadowed_by_a_non_adjacent_earlier_route_test() ->
+    %% The shadower is two lines up with an unrelated route between them, and
+    %% carries state, so the reported positions have to come from the table
+    %% rather than from adjacency.
+    ?assertError(
+        {unreachable_route, 3, ~"/a", [{1, ~"/a"}]},
+        roadrunner_router:compile(
+            [
+                {~"/a", first_handler, #{tier => primary}},
+                {~"/b", second_handler},
+                {~"/a", third_handler}
+            ],
+            []
+        )
+    ).
+
+compile_rejects_trailing_slash_duplicate_test() ->
+    %% `/a` and `/a/` compile to the same segment list, so the second is a
+    %% duplicate rather than a route on a distinct path. The error says so.
+    ?assertError(
+        {unreachable_route, 2, ~"/a/", [{1, ~"/a"}]},
+        roadrunner_router:compile([{~"/a", first_handler}, {~"/a/", second_handler}], [])
+    ).
+
+compile_rejects_method_route_below_a_covering_wildcard_test() ->
+    %% Path coverage and method coverage compose: the wildcard answers every
+    %% path below `/api` for every method, which includes this route's GET.
+    ?assertError(
+        {unreachable_route, 2, ~"/api/users", [{1, ~"/api/*p"}]},
+        roadrunner_router:compile(
+            [
+                {~"/api/*p", api_handler},
+                #{path => ~"/api/users", handler => users_handler, methods => [~"GET"]}
+            ],
+            []
+        )
+    ).
+
+compile_rejects_method_union_across_different_path_shapes_test() ->
+    %% The two routes above cover this one's path in different ways (a literal
+    %% prefix with a capture, then two captures) and take one method each
+    %% between them.
+    ?assertError(
+        {unreachable_route, 3, ~"/x/y", [{1, ~"/x/:id"}, {2, ~"/:a/:b"}]},
+        roadrunner_router:compile(
+            [
+                #{path => ~"/x/:id", handler => get_handler, methods => [~"GET"]},
+                #{path => ~"/:a/:b", handler => post_handler, methods => [~"POST"]},
+                #{path => ~"/x/y", handler => rw_handler, methods => [~"GET", ~"POST"]}
+            ],
+            []
+        )
+    ).
+
+compile_allows_route_a_covering_path_leaves_a_method_open_test() ->
+    %% `/x/:id` covers `/x/y` but only answers GET, so the POST on the deeper
+    %% route keeps it alive.
     Compiled = roadrunner_router:compile(
         [
-            #{path => ~"/x", handler => catch_all},
-            #{path => ~"/x", handler => only_post, methods => [~"POST"]}
+            #{path => ~"/x/:id", handler => get_handler, methods => [~"GET"]},
+            #{path => ~"/x/y", handler => rw_handler, methods => [~"GET", ~"POST"]}
+        ],
+        []
+    ),
+    ?assertEqual({ok, rw_handler, #{}, #{}}, match_no_pipeline(~"POST", ~"/x/y", Compiled)),
+    ?assertEqual(
+        {ok, get_handler, #{~"id" => ~"y"}, #{}}, match_no_pipeline(~"GET", ~"/x/y", Compiled)
+    ).
+
+compile_rejects_literal_below_a_covering_param_test() ->
+    ?assertError(
+        {unreachable_route, 2, ~"/users/me", [{1, ~"/users/:id"}]},
+        roadrunner_router:compile(
+            [{~"/users/:id", users_handler}, {~"/users/me", me_handler}],
+            []
+        )
+    ).
+
+compile_rejects_param_below_a_covering_param_test() ->
+    %% Capture names narrow nothing — `/:a` and `/:b` match the same paths.
+    ?assertError(
+        {unreachable_route, 2, ~"/:b", [{1, ~"/:a"}]},
+        roadrunner_router:compile([{~"/:a", first_handler}, {~"/:b", second_handler}], [])
+    ).
+
+compile_rejects_everything_below_a_root_wildcard_test() ->
+    ?assertError(
+        {unreachable_route, 2, ~"/", [{1, ~"/*all"}]},
+        roadrunner_router:compile([{~"/*all", catchall_handler}, {~"/", home_handler}], [])
+    ).
+
+compile_rejects_wildcard_prefix_below_its_own_wildcard_test() ->
+    %% `/static/*path` matches `/static` itself (empty remainder), so a bare
+    %% `/static` written below it never gets there.
+    ?assertError(
+        {unreachable_route, 2, ~"/static", [{1, ~"/static/*path"}]},
+        roadrunner_router:compile(
+            [{~"/static/*path", static_handler}, {~"/static", index_handler}],
+            []
+        )
+    ).
+
+compile_allows_specific_route_above_a_wildcard_test() ->
+    %% The same two routes in the working order: the specific one is reachable.
+    Compiled = roadrunner_router:compile(
+        [
+            {~"/static/assets/*path", assets_handler},
+            {~"/static/*path", site_handler}
         ],
         []
     ),
     ?assertEqual(
-        {ok, catch_all, #{}, #{}},
-        match_no_pipeline(~"POST", ~"/x", Compiled)
+        {ok, assets_handler, #{~"path" => [~"app.js"]}, #{}},
+        match_no_pipeline(~"/static/assets/app.js", Compiled)
     ),
     ?assertEqual(
-        {ok, catch_all, #{}, #{}},
-        match_no_pipeline(~"GET", ~"/x", Compiled)
+        {ok, site_handler, #{~"path" => [~"logo.png"]}, #{}},
+        match_no_pipeline(~"/static/logo.png", Compiled)
     ).
+
+compile_allows_sibling_literals_test() ->
+    Compiled = roadrunner_router:compile([{~"/a", a_handler}, {~"/b", b_handler}], []),
+    ?assertEqual({ok, b_handler, #{}, #{}}, match_no_pipeline(~"/b", Compiled)).
+
+compile_allows_deeper_route_below_a_shorter_one_test() ->
+    Compiled = roadrunner_router:compile([{~"/a", a_handler}, {~"/a/b", ab_handler}], []),
+    ?assertEqual({ok, ab_handler, #{}, #{}}, match_no_pipeline(~"/a/b", Compiled)).
+
+compile_allows_wildcard_below_a_sibling_param_test() ->
+    %% `/:a` takes exactly one segment; `/*p` also answers `/` and deeper
+    %% paths, so it keeps work of its own.
+    Compiled = roadrunner_router:compile(
+        [{~"/:a", param_handler}, {~"/*p", catchall_handler}],
+        []
+    ),
+    ?assertEqual({ok, param_handler, #{~"a" => ~"x"}, #{}}, match_no_pipeline(~"/x", Compiled)),
+    ?assertEqual(
+        {ok, catchall_handler, #{~"p" => [~"x", ~"y"]}, #{}},
+        match_no_pipeline(~"/x/y", Compiled)
+    ).
+
+compile_allows_same_path_with_disjoint_methods_test() ->
+    %% Same-path method dispatch: neither route can answer the other's method.
+    Compiled = roadrunner_router:compile(
+        [
+            #{path => ~"/x", handler => get_handler, methods => [~"GET"]},
+            #{path => ~"/x", handler => post_handler, methods => [~"POST"]}
+        ],
+        []
+    ),
+    ?assertEqual({ok, get_handler, #{}, #{}}, match_no_pipeline(~"GET", ~"/x", Compiled)),
+    ?assertEqual({ok, post_handler, #{}, #{}}, match_no_pipeline(~"POST", ~"/x", Compiled)).
+
+compile_rejects_same_path_with_a_method_subset_test() ->
+    ?assertError(
+        {unreachable_route, 2, ~"/x", [{1, ~"/x"}]},
+        roadrunner_router:compile(
+            [
+                #{path => ~"/x", handler => rw_handler, methods => [~"GET", ~"POST"]},
+                #{path => ~"/x", handler => ro_handler, methods => [~"GET"]}
+            ],
+            []
+        )
+    ).
+
+compile_rejects_route_whose_methods_earlier_routes_cover_between_them_test() ->
+    %% No single earlier route covers the third one, but the two above it do
+    %% between them, so both are named.
+    ?assertError(
+        {unreachable_route, 3, ~"/x", [{1, ~"/x"}, {2, ~"/x"}]},
+        roadrunner_router:compile(
+            [
+                #{path => ~"/x", handler => get_handler, methods => [~"GET"]},
+                #{path => ~"/x", handler => post_handler, methods => [~"POST"]},
+                #{path => ~"/x", handler => rw_handler, methods => [~"GET", ~"POST"]}
+            ],
+            []
+        )
+    ).
+
+compile_allows_route_with_a_method_earlier_routes_leave_open_test() ->
+    %% Same shape, but the last route also declares PUT — nothing above answers
+    %% it, so it stays reachable.
+    Compiled = roadrunner_router:compile(
+        [
+            #{path => ~"/x", handler => get_handler, methods => [~"GET"]},
+            #{path => ~"/x", handler => post_handler, methods => [~"POST"]},
+            #{path => ~"/x", handler => put_handler, methods => [~"GET", ~"PUT"]}
+        ],
+        []
+    ),
+    ?assertEqual({ok, put_handler, #{}, #{}}, match_no_pipeline(~"PUT", ~"/x", Compiled)).
+
+compile_allows_all_methods_route_below_method_specific_ones_test() ->
+    %% A route with no allowlist answers every method, and no finite set of
+    %% earlier allowlists can exhaust that.
+    Compiled = roadrunner_router:compile(
+        [
+            #{path => ~"/x", handler => get_handler, methods => [~"GET"]},
+            {~"/x", catch_all_handler}
+        ],
+        []
+    ),
+    ?assertEqual({ok, get_handler, #{}, #{}}, match_no_pipeline(~"GET", ~"/x", Compiled)),
+    ?assertEqual({ok, catch_all_handler, #{}, #{}}, match_no_pipeline(~"DELETE", ~"/x", Compiled)).
 
 %% --- helpers ---
 
