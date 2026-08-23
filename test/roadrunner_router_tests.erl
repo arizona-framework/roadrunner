@@ -861,6 +861,82 @@ compile_allows_all_methods_route_below_method_specific_ones_test() ->
     ?assertEqual({ok, get_handler, #{}, #{}}, match_no_pipeline(~"GET", ~"/x", Compiled)),
     ?assertEqual({ok, catch_all_handler, #{}, #{}}, match_no_pipeline(~"DELETE", ~"/x", Compiled)).
 
+%% =============================================================================
+%% validate/1 — the same check as a value, for callers that cannot raise
+%% =============================================================================
+
+validate_accepts_a_workable_table_test() ->
+    ?assertEqual(
+        ok,
+        roadrunner_router:validate([
+            {~"/users/me", me_handler},
+            {~"/users/:id", users_handler},
+            #{path => ~"/x", handler => get_handler, methods => [~"GET"]},
+            #{path => ~"/x", handler => post_handler, methods => [~"POST"]},
+            {~"/static/*path", static_handler}
+        ])
+    ).
+
+validate_accepts_an_explicit_undefined_methods_test() ->
+    %% `methods()` includes `undefined`, so spelling it out is the same as
+    %% leaving the key off: the route answers every method.
+    Routes = [#{path => ~"/x", handler => h, methods => undefined}],
+    ?assertEqual(ok, roadrunner_router:validate(Routes)),
+    Compiled = roadrunner_router:compile(Routes, []),
+    ?assertEqual({ok, h, #{}, #{}}, match_no_pipeline(~"DELETE", ~"/x", Compiled)).
+
+validate_reports_an_unreachable_route_test() ->
+    ?assertEqual(
+        {error, {unreachable_route, 2, ~"/a", [{1, ~"/a"}]}},
+        roadrunner_router:validate([{~"/a", first_handler}, {~"/a", second_handler}])
+    ).
+
+validate_reports_a_misplaced_wildcard_test() ->
+    ?assertEqual(
+        {error, {invalid_route_path, ~"/foo/*rest/bar", wildcard_not_last}},
+        roadrunner_router:validate([{~"/foo/*rest/bar", weird_handler}])
+    ).
+
+validate_reports_bad_methods_test() ->
+    ?assertEqual(
+        {error, {invalid_route_methods, []}},
+        roadrunner_router:validate([#{path => ~"/x", handler => h, methods => []}])
+    ).
+
+validate_reports_a_non_binary_path_test() ->
+    ?assertEqual(
+        {error, {invalid_route, {123, h}}},
+        roadrunner_router:validate([{123, h}])
+    ).
+
+validate_reports_a_non_module_handler_test() ->
+    %% A handler has to be a module atom; anything else could never be called.
+    ?assertEqual(
+        {error, {invalid_route, {~"/x", "handler"}}},
+        roadrunner_router:validate([{~"/x", "handler"}])
+    ).
+
+validate_reports_a_map_entry_missing_its_handler_test() ->
+    ?assertEqual(
+        {error, {invalid_route, #{path => ~"/x"}}},
+        roadrunner_router:validate([#{path => ~"/x"}])
+    ).
+
+validate_stops_at_the_first_bad_entry_test() ->
+    %% Two problems in one table: the earlier entry is the one reported, so the
+    %% caller fixes the table top down rather than chasing a later symptom.
+    ?assertEqual(
+        {error, {invalid_route_path, ~"/a/*x/y", wildcard_not_last}},
+        roadrunner_router:validate([{~"/a/*x/y", h1}, {~"/b", h2}, {~"/b", h3}])
+    ).
+
+compile_raises_what_validate_reports_test() ->
+    %% `compile/2` runs exactly `validate/1` and raises its reason, so the two
+    %% never disagree about which tables are workable.
+    Routes = [{123, h}],
+    ?assertEqual({error, {invalid_route, {123, h}}}, roadrunner_router:validate(Routes)),
+    ?assertError({invalid_route, {123, h}}, roadrunner_router:compile(Routes, [])).
+
 %% --- helpers ---
 
 %% Drop the pipeline (4th element) and state (5th) so the handler

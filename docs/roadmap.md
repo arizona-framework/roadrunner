@@ -434,26 +434,6 @@ Revisit only if a real workload reports false `slow_client` drops.
 
 **Scope:** small.
 
-### Return route-validation failures from `reload_routes/2` — small
-
-**What:** `roadrunner_router:compile/2` raises on a table that cannot work
-(`invalid_route_methods`, `invalid_route_path`, `unreachable_route`).
-`roadrunner_listener:do_reload_routes/2` calls it straight from `handle_call`, so
-a bad table handed to `reload_routes/2` crashes the listener instead of coming
-back as `{error, Reason}`. The supervisor restarts it with the last-known-good
-routes from its own opts, so the table stays correct, but live connections drop
-for what is only a validation failure. Widening the return to
-`ok | {error, no_routes} | {error, term()}` and validating before the
-`persistent_term` swap would reject the table without touching the running one.
-
-**Why deferred:** the crash predates the reachability check (`compile_methods/1`
-already raised the same way) and is loud rather than silent, which is the safer
-default of the two. Boot-time validation is the common path; `reload_routes/2` is
-a deliberate deploy-time call whose input is usually the same table that already
-booted.
-
-**Scope:** small.
-
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>

@@ -61,9 +61,11 @@ patterns; swapping to a trie/DAG later is a non-breaking change for
 callers.
 """.
 
--export([compile/2, match/3]).
+-export([compile/2, validate/1, match/3]).
 
--export_type([route/0, routes/0, compiled/0, bindings/0, methods/0]).
+-export_type([
+    route/0, routes/0, compiled/0, bindings/0, methods/0, validation_error/0
+]).
 
 -doc """
 A single route entry. Three shapes are accepted:
@@ -108,6 +110,27 @@ raises `{invalid_route_methods, _}` on an empty list or non-binary
 entries (both would otherwise silently reject every request).
 """.
 -type methods() :: [binary()] | undefined.
+
+-doc """
+Why a route table was rejected, as returned by `validate/1` and raised by
+`compile/2`.
+
+- `{invalid_route, Route}` — the entry is not one of the accepted shapes, or
+  its path is not a binary / its handler is not a module atom.
+- `{invalid_route_methods, Methods}` — a `methods` key that is not a non-empty
+  list of binaries.
+- `{invalid_route_path, Path, wildcard_not_last}` — a segment after the
+  pattern's `*wildcard`, which no request could ever reach.
+- `{unreachable_route, Position, Path, ShadowedBy}` — the entries above this
+  one already answer its path for every method it declares. `Position` is the
+  1-based index in the table and `ShadowedBy` lists the `{Position, Path}` of
+  every earlier route taking work away from it.
+""".
+-type validation_error() ::
+    {invalid_route, route()}
+    | {invalid_route_methods, term()}
+    | {invalid_route_path, binary(), wildcard_not_last}
+    | {unreachable_route, pos_integer(), binary(), [{pos_integer(), binary()}]}.
 
 %% The compiled form of `methods()`: a set-as-map for O(1) membership,
 %% or `undefined` for a route that answers every method.
@@ -155,14 +178,9 @@ Compile a list of routes into the lookup form `match/3` expects.
 Each path is split on `/` (empty leading/trailing segments dropped),
 and segments starting with `:` are recorded as named captures.
 
-Raises, before any middleware `init/1` runs, when the table cannot
-work as written: `{invalid_route_path, Path, wildcard_not_last}` for
-a pattern carrying a segment after its `*wildcard`, and
-`{unreachable_route, Position, Path, ShadowedBy}` for a route whose
-path and methods the entries above it already answer in full.
-`Position` is the route's 1-based index in `Routes`, and
-`ShadowedBy` lists the `{Position, Path}` of every earlier route
-taking work away from it.
+Raises any `t:validation_error/0` before running a middleware
+`init/1`, so a table that cannot work never has side effects. Call
+`validate/1` first to get the same verdict as a value instead.
 
 Only a route left with nothing to answer is unreachable. Two routes
 on the same path declaring disjoint `methods` both stay reachable,
@@ -178,9 +196,34 @@ when compiling routes outside a listener (typically only in tests).
 """.
 -spec compile(routes(), roadrunner_middleware:middleware_list()) -> compiled().
 compile(Routes, ListenerMws) when is_list(Routes), is_list(ListenerMws) ->
-    ok = check_shadowing(route_specs(Routes, 1)),
-    ResolvedListener = roadrunner_middleware:resolve(ListenerMws),
-    [compile_route(R, ResolvedListener) || R <- Routes].
+    case validate(Routes) of
+        ok ->
+            ResolvedListener = roadrunner_middleware:resolve(ListenerMws),
+            [compile_route(R, ResolvedListener) || R <- Routes];
+        {error, Reason} ->
+            error(Reason)
+    end.
+
+-doc """
+Check a route table without building it, returning the verdict as a value.
+
+`compile/2` runs exactly this and raises on `{error, Reason}`, so a
+table `validate/1` accepts is one `compile/2` will not reject. Use it
+where raising is the wrong answer: `roadrunner_listener:reload_routes/2`
+validates a replacement table this way so a bad one is refused without
+disturbing the table already serving.
+
+Covers everything decidable from the table itself: entry shapes, method
+allowlists, wildcard placement, and whether every route can be reached.
+It does not run middleware `init/1`, so a per-route middleware that
+crashes on init still surfaces at `compile/2` time.
+""".
+-spec validate(routes()) -> ok | {error, validation_error()}.
+validate(Routes) when is_list(Routes) ->
+    maybe
+        {ok, Specs} ?= route_specs(Routes, 1),
+        check_shadowing(Specs)
+    end.
 
 -spec compile_route(route(), [roadrunner_middleware:resolved()]) ->
     {[segment()], module(), roadrunner_middleware:next(), term(), method_lookup()}.
@@ -229,20 +272,28 @@ compile_segment(Lit) -> {literal, Lit}.
 
 %% Compile a route's `methods` allowlist into a set-map for O(1) match-time
 %% membership; `undefined` (no allowlist) passes through to answer every method.
-%% A present `methods` must be a non-empty list of binaries -- an empty list
-%% (a route that answers nothing) or non-binary entries (which could never
-%% match the binary wire method) are config errors, raised loudly rather than
-%% silently 405-ing every request.
+%% `check_methods/1` has already rejected every shape this cannot handle, so
+%% there is nothing left to guard.
 -spec compile_methods(methods()) -> method_lookup().
 compile_methods(undefined) ->
     undefined;
-compile_methods(Methods) when is_list(Methods), Methods =/= [] ->
-    case lists:all(fun is_binary/1, Methods) of
-        true -> maps:from_keys(Methods, true);
-        false -> error({invalid_route_methods, Methods})
-    end;
 compile_methods(Methods) ->
-    error({invalid_route_methods, Methods}).
+    maps:from_keys(Methods, true).
+
+%% A present `methods` must be a non-empty list of binaries -- an empty list
+%% (a route that answers nothing) or non-binary entries (which could never match
+%% the binary wire method) are config errors, reported rather than left to
+%% silently 405 every request.
+-spec check_methods(methods()) -> ok | {error, validation_error()}.
+check_methods(undefined) ->
+    ok;
+check_methods(Methods) when is_list(Methods), Methods =/= [] ->
+    case lists:all(fun is_binary/1, Methods) of
+        true -> ok;
+        false -> {error, {invalid_route_methods, Methods}}
+    end;
+check_methods(Methods) ->
+    {error, {invalid_route_methods, Methods}}.
 
 %% The per-route facts the reachability check works from: the route's 1-based
 %% position in the table (so the error can point at a line), the path as the
@@ -254,45 +305,64 @@ compile_methods(Methods) ->
 %% `any` for a route declaring no allowlist, otherwise the remaining set.
 -type uncovered() :: any | #{binary() => true}.
 
-%% Build the reachability facts for every route, rejecting a misplaced wildcard
-%% on the way past. The pattern and the method set are re-derived here rather
-%% than read back off the compiled routes so the whole table is validated before
-%% `compile/2` resolves any middleware -- a table that cannot work never runs a
-%% middleware `init/1`.
--spec route_specs(routes(), pos_integer()) -> [route_spec()].
+%% Build the reachability facts for every route, checking each entry on the way
+%% past and stopping at the first bad one. The pattern and the method set are
+%% derived here rather than read back off the compiled routes so the whole table
+%% is checked before `compile/2` resolves any middleware -- a table that cannot
+%% work never runs a middleware `init/1`.
+-spec route_specs(routes(), pos_integer()) -> {ok, [route_spec()]} | {error, validation_error()}.
 route_specs([], _Pos) ->
-    [];
+    {ok, []};
 route_specs([Route | Rest], Pos) ->
-    Path = route_path(Route),
-    Pattern = compile_path(Path),
-    ok = check_wildcard_last(Pattern, Path),
-    [{Pos, Path, Pattern, route_methods(Route)} | route_specs(Rest, Pos + 1)].
+    maybe
+        {ok, Spec} ?= route_spec(Route, Pos),
+        {ok, Specs} ?= route_specs(Rest, Pos + 1),
+        {ok, [Spec | Specs]}
+    end.
 
--spec route_path(route()) -> binary().
-route_path({Path, _Handler}) when is_binary(Path) ->
-    Path;
-route_path({Path, _Handler, _State}) when is_binary(Path) ->
-    Path;
-route_path(#{path := Path}) when is_binary(Path) ->
-    Path.
+-spec route_spec(route(), pos_integer()) -> {ok, route_spec()} | {error, validation_error()}.
+route_spec(Route, Pos) ->
+    maybe
+        {ok, Path} ?= route_path(Route),
+        Pattern = compile_path(Path),
+        ok ?= check_wildcard_last(Pattern, Path),
+        {ok, Methods} ?= route_methods(Route),
+        {ok, {Pos, Path, Pattern, Methods}}
+    end.
 
--spec route_methods(route()) -> method_lookup().
+%% The accepted entry shapes, and the only place they are checked. These clauses
+%% mirror `compile_route/2`'s heads exactly: a table this accepts is one the
+%% build pass can destructure without a surprise.
+-spec route_path(route()) -> {ok, binary()} | {error, validation_error()}.
+route_path({Path, Handler}) when is_binary(Path), is_atom(Handler) ->
+    {ok, Path};
+route_path({Path, Handler, _State}) when is_binary(Path), is_atom(Handler) ->
+    {ok, Path};
+route_path(#{path := Path, handler := Handler}) when is_binary(Path), is_atom(Handler) ->
+    {ok, Path};
+route_path(Route) ->
+    {error, {invalid_route, Route}}.
+
+-spec route_methods(route()) -> {ok, method_lookup()} | {error, validation_error()}.
 route_methods(#{methods := Methods}) ->
-    compile_methods(Methods);
+    maybe
+        ok ?= check_methods(Methods),
+        {ok, compile_methods(Methods)}
+    end;
 route_methods(_Route) ->
-    undefined.
+    {ok, undefined}.
 
 %% `match_pattern/3` consumes a wildcard only as a pattern's final segment, so a
 %% route carrying anything after its `*` can never answer a request. That is a
-%% typo in the table rather than a route: raise instead of registering an entry
-%% guaranteed to be dead.
--spec check_wildcard_last([segment()], binary()) -> ok.
+%% typo in the table rather than a route: reject it instead of registering an
+%% entry guaranteed to be dead.
+-spec check_wildcard_last([segment()], binary()) -> ok | {error, validation_error()}.
 check_wildcard_last([], _Path) ->
     ok;
 check_wildcard_last([{wildcard, _Name}], _Path) ->
     ok;
 check_wildcard_last([{wildcard, _Name} | _Rest], Path) ->
-    error({invalid_route_path, Path, wildcard_not_last});
+    {error, {invalid_route_path, Path, wildcard_not_last}};
 check_wildcard_last([_Segment | Rest], Path) ->
     check_wildcard_last(Rest, Path).
 
@@ -302,17 +372,17 @@ check_wildcard_last([_Segment | Rest], Path) ->
 %% at boot to explain it -- and the wildcard doing the swallowing is often one a
 %% framework generated rather than one the author typed. O(n^2) over the table,
 %% once, on a list of a handful of routes.
--spec check_shadowing([route_spec()]) -> ok.
+-spec check_shadowing([route_spec()]) -> ok | {error, validation_error()}.
 check_shadowing(Specs) ->
     check_shadowing(Specs, Specs).
 
--spec check_shadowing([route_spec()], [route_spec()]) -> ok.
+-spec check_shadowing([route_spec()], [route_spec()]) -> ok | {error, validation_error()}.
 check_shadowing([], _All) ->
     ok;
 check_shadowing([{Pos, Path, Pattern, Methods} | Rest], All) ->
     case shadowed_by(All, Pos, Pattern, uncovered(Methods)) of
         reachable -> check_shadowing(Rest, All);
-        {shadowed, By} -> error({unreachable_route, Pos, Path, By})
+        {shadowed, By} -> {error, {unreachable_route, Pos, Path, By}}
     end.
 
 -spec uncovered(method_lookup()) -> uncovered().

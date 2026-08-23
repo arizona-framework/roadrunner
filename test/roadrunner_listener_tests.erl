@@ -961,6 +961,47 @@ reload_routes_swaps_dispatch_table_test_() ->
             end}
         end}.
 
+reload_routes_refuses_an_unworkable_table_test_() ->
+    %% A replacement table that cannot work comes back as a value. Raising here
+    %% would take down a listener (and the caller) that has a perfectly good
+    %% table already published, so the running one is left exactly as it was.
+    {setup,
+        fun() ->
+            ok = ensure_pg_started(),
+            Name = listener_test_reload_reject,
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                routes => [{~"/old", roadrunner_hello_handler, #{}}]
+            }),
+            {Name, roadrunner_listener:port(Name)}
+        end,
+        fun({Name, _Port}) -> ok = roadrunner_listener:stop(Name) end, fun({Name, Port}) ->
+            {"reload_routes/2 rejects a bad table and keeps serving the old one", fun() ->
+                ?assertEqual(
+                    {error, {unreachable_route, 2, ~"/old", [{1, ~"/old"}]}},
+                    roadrunner_listener:reload_routes(Name, [
+                        {~"/old", roadrunner_hello_handler, #{}},
+                        {~"/old", roadrunner_hello_handler, #{}}
+                    ])
+                ),
+                %% Still up, and the table it booted with still answers.
+                ?assertEqual(accepting, roadrunner_listener:status(Name)),
+                ?assertMatch(
+                    <<"HTTP/1.1 200 OK", _/binary>>, http_get_close(Port, ~"/old")
+                ),
+                %% And a workable table still swaps in afterwards.
+                ?assertEqual(
+                    ok,
+                    roadrunner_listener:reload_routes(
+                        Name, [{~"/new", roadrunner_hello_handler, #{}}]
+                    )
+                ),
+                ?assertMatch(
+                    <<"HTTP/1.1 200 OK", _/binary>>, http_get_close(Port, ~"/new")
+                )
+            end}
+        end}.
+
 reload_routes_rebakes_listener_middlewares_test_() ->
     %% reload_routes/2 must re-bake the listener's `middlewares` opt
     %% onto the new route cfg. Regression guard for `do_reload_routes/2`
