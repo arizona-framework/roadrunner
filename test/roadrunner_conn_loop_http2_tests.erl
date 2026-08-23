@@ -64,6 +64,7 @@ all_test_() ->
         fun middleware_chain_runs/0,
         fun rst_stream_cancels_active_stream/0,
         fun router_404_returns_not_found/0,
+        fun router_405_returns_method_not_allowed/0,
         fun data_without_end_stream_continues_loop/0,
         fun continuation_without_end_headers_continues_loop/0,
         fun idle_timeout_emits_goaway/0,
@@ -1307,6 +1308,70 @@ router_404_returns_not_found() ->
         roadrunner_http2_frame:parse(Resp, 16384),
     {ok, RespHeaders, _} = roadrunner_http2_hpack:decode(RespHpack, Dec0),
     ?assertEqual(~"404", proplists:get_value(~":status", RespHeaders)),
+    cleanup(Pid, Ref).
+
+router_405_returns_method_not_allowed() ->
+    %% Path matches but the route's `methods` allowlist rejects the method:
+    %% routing answers 405 with the accepted methods in `Allow`, without
+    %% reaching the handler.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    persistent_term:put(
+        {roadrunner_routes, h2_405_listener},
+        roadrunner_router:compile(
+            [#{path => ~"/only-get", handler => roadrunner_hello_handler, methods => [~"GET"]}],
+            []
+        )
+    ),
+    Self = self(),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
+    ProtoOpts = #{
+        handler_spawn_opts => [{fullsweep_after, 0}],
+        handler_start_timeout => infinity,
+        max_concurrent_requests => infinity,
+        client_counter => Counter,
+        listener_name => h2_405_listener,
+        dispatch => {router, h2_405_listener},
+        middlewares => []
+    },
+    Sock = {fake, Self},
+    Pid = spawn(fun() ->
+        receive
+            ready -> ok
+        end,
+        roadrunner_conn_loop_http2:enter(
+            Sock, ProtoOpts, h2_405_listener, undefined, erlang:monotonic_time(), <<>>
+        )
+    end),
+    Ref = monitor(process, Pid),
+    Pid ! ready,
+    _ = expect_send(),
+    serve_recv(Pid, ?PREFACE),
+    serve_recv(Pid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"POST"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/only-get"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    Hf = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
+    ),
+    serve_recv(Pid, Hf),
+    Resp = expect_send(),
+    Dec0 = roadrunner_http2_hpack:new_decoder(4096),
+    {ok, {headers, 1, _, _, RespHpack}, _} =
+        roadrunner_http2_frame:parse(Resp, 16384),
+    {ok, RespHeaders, _} = roadrunner_http2_hpack:decode(RespHpack, Dec0),
+    ?assertEqual(~"405", proplists:get_value(~":status", RespHeaders)),
+    ?assertEqual(~"GET", proplists:get_value(~"allow", RespHeaders)),
     cleanup(Pid, Ref).
 
 data_without_end_stream_continues_loop() ->

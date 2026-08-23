@@ -474,19 +474,6 @@ to a path.
 `(listener_name, method, path)` is already enough to identify a
 route in dashboards; named lookup is a niceness, not a need.
 
-### Per-route `methods => [binary()]` allowlist with automatic 405 — small
-
-**What:** `methods => [~"GET", ~"PUT"]` on a route map means the
-framework returns `405 Method Not Allowed` (with the right `Allow`
-header) for any other method on that path. Eliminates the
-boilerplate every handler currently writes to gate on
-`roadrunner_req:method/1`.
-
-**Why deferred:** simple to bolt on once a couple of real handlers
-demonstrate the pattern they want. The single-route equality check
-is the wrong model for catch-all routes (`/api/*path`) that
-multiplex methods downstream.
-
 ### Nested route groups with shared prefix + middlewares — medium
 
 **What:** Phoenix-style scope / pipeline:
