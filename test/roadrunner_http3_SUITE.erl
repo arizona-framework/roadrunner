@@ -22,6 +22,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     head_request/1,
     large_post/1,
     not_found/1,
+    method_not_allowed/1,
     crash_500/1,
     interim_response_500/1,
     rate_limited/1,
@@ -95,6 +96,7 @@ all() ->
         head_request,
         large_post,
         not_found,
+        method_not_allowed,
         crash_500,
         interim_response_500,
         rate_limited,
@@ -189,6 +191,7 @@ end_per_suite(_Config) ->
 %% max_clients, no TLS) start their own and skip this one.
 init_per_testcase(Case, Config) when
     Case =:= not_found;
+    Case =:= method_not_allowed;
     Case =:= rate_limited;
     Case =:= oversized_413;
     Case =:= protocols_tuple_form;
@@ -282,6 +285,27 @@ not_found(_Config) ->
     Conn = connect(roadrunner_listener:port(Name)),
     try
         ?assertMatch({404, _}, status_body(get(Conn, ~"/missing")))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+method_not_allowed(_Config) ->
+    %% The path matches but the route's `methods` allowlist does not answer
+    %% POST, so routing decides a 405 and carries the accepted methods in
+    %% `Allow` rather than reaching the handler.
+    Name = listener_name(method_not_allowed),
+    {ok, _} = start_h3(Name, #{
+        routes => [
+            #{path => ~"/only-get", handler => roadrunner_h3_test_handler, methods => [~"GET"]}
+        ]
+    }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        {Status, Headers, _Body} = post(Conn, ~"/only-get", ~""),
+        ?assertEqual(405, Status),
+        ?assertEqual(~"GET", proplists:get_value(~"allow", Headers)),
+        ?assertMatch({200, _}, status_body(get(Conn, ~"/only-get")))
     after
         close(Conn),
         roadrunner_listener:stop(Name)

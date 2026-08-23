@@ -101,6 +101,21 @@ run_handler(ConnPid, StreamId, Req, Dispatch) ->
                 Metadata,
                 ReqStart
             );
+        {method_not_allowed, Allowed} ->
+            %% Path matched but no route on it answers this method: 405 plus the
+            %% `Allow` union, decided before any pipeline runs because the
+            %% method gate is a routing decision rather than handler work.
+            send_buffered(
+                ConnPid,
+                StreamId,
+                405,
+                [
+                    {~"content-type", ~"text/plain"},
+                    {~"allow", roadrunner_conn:allow_header_value(Allowed)}
+                ],
+                ~"Method Not Allowed"
+            ),
+            ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, 405, buffered);
         not_found ->
             send_buffered(
                 ConnPid, StreamId, 404, [{~"content-type", ~"text/plain"}], ~"Not Found"

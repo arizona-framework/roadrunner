@@ -74,6 +74,7 @@
     send_not_found/1,
     send_method_not_allowed/2,
     resolve_handler/2,
+    allow_header_value/1,
     response_status/1,
     response_kind/1,
     head_response/2
@@ -602,6 +603,15 @@ resolve_handler({router, ListenerName}, Req) ->
     %% atomically swap the table without bouncing the listener.
     Compiled = persistent_term:get({roadrunner_routes, ListenerName}),
     roadrunner_router:match(roadrunner_req:method(Req), roadrunner_req:path(Req), Compiled).
+
+%% The `Allow` header value for a `405`, built from the methods
+%% `roadrunner_router:match/3` reports as accepted on the path. Flattened here
+%% because the HPACK and QPACK encoders size header values with `byte_size/1`,
+%% so h2 and h3 need a binary rather than the iodata the HTTP/1 writer takes.
+-doc false.
+-spec allow_header_value([binary()]) -> binary().
+allow_header_value(Allowed) ->
+    iolist_to_binary(lists:join(~", ", Allowed)).
 
 -doc false.
 -spec read_body(
