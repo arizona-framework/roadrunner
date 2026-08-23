@@ -40,14 +40,25 @@ binary on the wire" rule we already use for header names.
 Segments starting with `*` (e.g. `/static/*path`) are wildcard
 captures: they consume all remaining path segments and bind them as
 a list under the given name. A wildcard must be the last segment in
-a pattern; anything after it never matches.
+a pattern; a segment after it could never match, so `compile/2`
+raises `{invalid_route_path, Path, wildcard_not_last}` rather than
+registering a route that can never answer.
 
 Literal segments must match byte-exactly; comparison is
 case-sensitive per RFC 3986.
 
-Routes are tried in declaration order — earlier entries win. The
-opaque `compiled()` shape is a list of pre-parsed segment patterns;
-swapping to a trie/DAG later is a non-breaking change for callers.
+Routes are tried in declaration order, earlier entries win, and
+nothing is reordered by specificity. To keep that rule from failing
+silently, `compile/2` rejects a route the entries above it already
+answer in full: write `/static/*path` above `/static/assets/*path`
+and the second one can never be reached, so compiling raises
+`{unreachable_route, Position, Path, ShadowedBy}` naming both.
+Ordering stays the caller's to choose; getting it wrong stops the
+listener from booting instead of turning into a 404 in production.
+
+The opaque `compiled()` shape is a list of pre-parsed segment
+patterns; swapping to a trie/DAG later is a non-breaking change for
+callers.
 """.
 
 -export([compile/2, match/3]).
@@ -144,6 +155,19 @@ Compile a list of routes into the lookup form `match/3` expects.
 Each path is split on `/` (empty leading/trailing segments dropped),
 and segments starting with `:` are recorded as named captures.
 
+Raises, before any middleware `init/1` runs, when the table cannot
+work as written: `{invalid_route_path, Path, wildcard_not_last}` for
+a pattern carrying a segment after its `*wildcard`, and
+`{unreachable_route, Position, Path, ShadowedBy}` for a route whose
+path and methods the entries above it already answer in full.
+`Position` is the route's 1-based index in `Routes`, and
+`ShadowedBy` lists the `{Position, Path}` of every earlier route
+taking work away from it.
+
+Only a route left with nothing to answer is unreachable. Two routes
+on the same path declaring disjoint `methods` both stay reachable,
+which is how same-path method dispatch works.
+
 `ListenerMws` is the listener-wide middleware list; it is resolved
 **once** (running each module's `init/1` a single time) and reused
 across every route, composed outermost around each route's own
@@ -154,6 +178,7 @@ when compiling routes outside a listener (typically only in tests).
 """.
 -spec compile(routes(), roadrunner_middleware:middleware_list()) -> compiled().
 compile(Routes, ListenerMws) when is_list(Routes), is_list(ListenerMws) ->
+    ok = check_shadowing(route_specs(Routes, 1)),
     ResolvedListener = roadrunner_middleware:resolve(ListenerMws),
     [compile_route(R, ResolvedListener) || R <- Routes].
 
@@ -218,6 +243,146 @@ compile_methods(Methods) when is_list(Methods), Methods =/= [] ->
     end;
 compile_methods(Methods) ->
     error({invalid_route_methods, Methods}).
+
+%% The per-route facts the reachability check works from: the route's 1-based
+%% position in the table (so the error can point at a line), the path as the
+%% caller wrote it, its compiled segment pattern, and its compiled method
+%% allowlist.
+-type route_spec() :: {pos_integer(), binary(), [segment()], method_lookup()}.
+
+%% The methods a route can still answer that no earlier route has taken:
+%% `any` for a route declaring no allowlist, otherwise the remaining set.
+-type uncovered() :: any | #{binary() => true}.
+
+%% Build the reachability facts for every route, rejecting a misplaced wildcard
+%% on the way past. The pattern and the method set are re-derived here rather
+%% than read back off the compiled routes so the whole table is validated before
+%% `compile/2` resolves any middleware -- a table that cannot work never runs a
+%% middleware `init/1`.
+-spec route_specs(routes(), pos_integer()) -> [route_spec()].
+route_specs([], _Pos) ->
+    [];
+route_specs([Route | Rest], Pos) ->
+    Path = route_path(Route),
+    Pattern = compile_path(Path),
+    ok = check_wildcard_last(Pattern, Path),
+    [{Pos, Path, Pattern, route_methods(Route)} | route_specs(Rest, Pos + 1)].
+
+-spec route_path(route()) -> binary().
+route_path({Path, _Handler}) when is_binary(Path) ->
+    Path;
+route_path({Path, _Handler, _State}) when is_binary(Path) ->
+    Path;
+route_path(#{path := Path}) when is_binary(Path) ->
+    Path.
+
+-spec route_methods(route()) -> method_lookup().
+route_methods(#{methods := Methods}) ->
+    compile_methods(Methods);
+route_methods(_Route) ->
+    undefined.
+
+%% `match_pattern/3` consumes a wildcard only as a pattern's final segment, so a
+%% route carrying anything after its `*` can never answer a request. That is a
+%% typo in the table rather than a route: raise instead of registering an entry
+%% guaranteed to be dead.
+-spec check_wildcard_last([segment()], binary()) -> ok.
+check_wildcard_last([], _Path) ->
+    ok;
+check_wildcard_last([{wildcard, _Name}], _Path) ->
+    ok;
+check_wildcard_last([{wildcard, _Name} | _Rest], Path) ->
+    error({invalid_route_path, Path, wildcard_not_last});
+check_wildcard_last([_Segment | Rest], Path) ->
+    check_wildcard_last(Rest, Path).
+
+%% Reject any route the entries above it already answer in full. First-match
+%% wins is the documented rule, so a route the scan can never reach is dead
+%% weight that surfaces at runtime as a 404 (or the wrong handler) with nothing
+%% at boot to explain it -- and the wildcard doing the swallowing is often one a
+%% framework generated rather than one the author typed. O(n^2) over the table,
+%% once, on a list of a handful of routes.
+-spec check_shadowing([route_spec()]) -> ok.
+check_shadowing(Specs) ->
+    check_shadowing(Specs, Specs).
+
+-spec check_shadowing([route_spec()], [route_spec()]) -> ok.
+check_shadowing([], _All) ->
+    ok;
+check_shadowing([{Pos, Path, Pattern, Methods} | Rest], All) ->
+    case shadowed_by(All, Pos, Pattern, uncovered(Methods)) of
+        reachable -> check_shadowing(Rest, All);
+        {shadowed, By} -> error({unreachable_route, Pos, Path, By})
+    end.
+
+-spec uncovered(method_lookup()) -> uncovered().
+uncovered(undefined) ->
+    any;
+uncovered(Methods) ->
+    Methods.
+
+%% Walk the table from the top narrowing the methods the route at `Pos` can
+%% still answer, stopping when the walk reaches that route itself. Returns the
+%% earlier routes that took methods away from it once nothing is left, or
+%% `reachable`. A covering route contributing no method the later one declares
+%% is stepped over, so the error names only the entries actually in the way.
+-spec shadowed_by([route_spec()], pos_integer(), [segment()], uncovered()) ->
+    reachable | {shadowed, [{pos_integer(), binary()}]}.
+shadowed_by([{Pos, _Path, _Pattern, _Methods} | _Rest], Pos, _Later, _Uncovered) ->
+    reachable;
+shadowed_by(
+    [{EarlierPos, EarlierPath, EarlierPattern, EarlierMethods} | Rest], Pos, Later, Uncovered
+) ->
+    case covers(EarlierPattern, Later) of
+        false ->
+            shadowed_by(Rest, Pos, Later, Uncovered);
+        true ->
+            case take_methods(EarlierMethods, Uncovered) of
+                empty ->
+                    {shadowed, [{EarlierPos, EarlierPath}]};
+                Uncovered ->
+                    shadowed_by(Rest, Pos, Later, Uncovered);
+                Narrowed ->
+                    case shadowed_by(Rest, Pos, Later, Narrowed) of
+                        reachable -> reachable;
+                        {shadowed, By} -> {shadowed, [{EarlierPos, EarlierPath} | By]}
+                    end
+            end
+    end.
+
+%% Narrow the methods a later route can still answer by the ones an earlier,
+%% path-covering route takes. An earlier route with no allowlist answers every
+%% method and leaves nothing. A later route with no allowlist (`any`) answers
+%% every method, which no finite set of earlier allowlists can exhaust.
+-spec take_methods(method_lookup(), uncovered()) -> uncovered() | empty.
+take_methods(undefined, _Uncovered) ->
+    empty;
+take_methods(_Methods, any) ->
+    any;
+take_methods(Methods, Uncovered) ->
+    case maps:without(maps:keys(Methods), Uncovered) of
+        Emptied when map_size(Emptied) =:= 0 -> empty;
+        Narrowed -> Narrowed
+    end.
+
+%% Does `Earlier` match every path `Later` matches? Both patterns are
+%% well-formed by here (any wildcard is the final segment), so a positional walk
+%% decides it: an earlier wildcard absorbs whatever remains, a `:param` covers
+%% any single segment a literal or another param could take, and a literal
+%% covers only the same literal.
+-spec covers([segment()], [segment()]) -> boolean().
+covers([{wildcard, _Name}], _Later) ->
+    true;
+covers([{literal, S} | Earlier], [{literal, S} | Later]) ->
+    covers(Earlier, Later);
+covers([{param, _Name} | Earlier], [{literal, _S} | Later]) ->
+    covers(Earlier, Later);
+covers([{param, _Name} | Earlier], [{param, _Other} | Later]) ->
+    covers(Earlier, Later);
+covers([], []) ->
+    true;
+covers(_Earlier, _Later) ->
+    false.
 
 -doc """
 Look up the handler for a given request method + path.

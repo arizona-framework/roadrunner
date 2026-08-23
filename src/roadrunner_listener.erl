@@ -96,7 +96,10 @@ Routing (pick one):
 - `routes => roadrunner_router:routes()` — list of route entries;
   each entry is either a `{Path, Handler}` / `{Path, Handler, State}`
   tuple or a `#{path := Path, handler := Handler, state => ...,
-  middlewares => [...]}` map. First match wins.
+  middlewares => [...]}` map. First match wins, so the specific
+  route goes above the general one; a route the entries above it
+  already answer in full is a config error and raises at listener
+  start rather than turning into a runtime 404.
 
 Optional middleware and timing knobs (durations in milliseconds):
 - `middlewares` — listener-wide pipeline applied to every request.

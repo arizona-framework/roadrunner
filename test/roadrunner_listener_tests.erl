@@ -914,6 +914,26 @@ parse_cl(Head) ->
     ),
     binary_to_integer(Cl).
 
+unreachable_route_stops_the_listener_from_starting_test_() ->
+    %% The reachability check runs in `init/1`, so a table with a dead route
+    %% fails the boot instead of registering a listener that 404s the route.
+    %% Spawned: the linked `init/1` failure sends this process an `'EXIT'` that
+    %% must not bleed into the next test in the module.
+    {spawn, fun() ->
+        process_flag(trap_exit, true),
+        Result = roadrunner_listener:start_link(listener_test_unreachable_route, #{
+            port => 0,
+            routes => [
+                {~"/static/*path", roadrunner_hello_handler, #{}},
+                {~"/static/assets/*path", roadrunner_hello_handler, #{}}
+            ]
+        }),
+        ?assertMatch(
+            {error, {{unreachable_route, 2, ~"/static/assets/*path", [{1, ~"/static/*path"}]}, _}},
+            Result
+        )
+    end}.
+
 reload_routes_swaps_dispatch_table_test_() ->
     {setup,
         fun() ->

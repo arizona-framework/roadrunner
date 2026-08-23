@@ -212,6 +212,12 @@ routes => [
 ]
 ```
 
+Routes are tried top to bottom and the first match wins, so the specific route
+goes above the general one. When a route can never be reached because the
+entries above it already answer its path and its methods, the listener refuses
+to start and names both lines. A mis-ordered table shows up at boot with the
+line to move, instead of as a 404 in production.
+
 Restrict a route to specific HTTP methods with the **map form**'s `methods` key
 (a non-empty list of uppercase method binaries). A request whose path matches a
 route but whose method is not listed gets `405 Method Not Allowed` with an `Allow`
