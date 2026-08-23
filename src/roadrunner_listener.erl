@@ -629,9 +629,16 @@ re-baked) and published to `persistent_term`;
 in-flight conns keep using whatever they read at request-resolve
 time, but every subsequent dispatch sees the new table.
 
-Returns `ok` on success or `{error, no_routes}` if the listener was
+Returns `ok` on success, `{error, no_routes}` if the listener was
 started in single-handler mode (`routes => Module` or no `routes`
-opt) — there's no router table to reload.
+opt) since there's no router table to reload, or
+`{error, Reason}` carrying a `t:roadrunner_router:validation_error/0`
+if the replacement table cannot work. A rejected table is refused
+whole: the listener keeps serving the routes it already had, and
+nothing about the running table changes. That covers everything
+decidable from the table itself; a per-route middleware that crashes
+in its own `init/1` still fails the reload the loud way, the same as
+it would at listener start.
 
 Each call performs one global `persistent_term` swap, which scans every
 process heap to reclaim the old table. That cost is acceptable for a
@@ -639,7 +646,7 @@ whole-table swap at deploy time, but callers should batch route changes
 into a single `reload_routes/2` rather than calling it per route.
 """.
 -spec reload_routes(Name :: atom(), roadrunner_router:routes()) ->
-    ok | {error, no_routes}.
+    ok | {error, no_routes} | {error, roadrunner_router:validation_error()}.
 reload_routes(Name, Routes) ->
     gen_server:call(Name, {reload_routes, Routes}).
 
@@ -1649,16 +1656,25 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
     {reply, Reply, State}.
 
 -spec do_reload_routes(#state{}, roadrunner_router:routes()) ->
-    ok | {error, no_routes}.
+    ok | {error, no_routes} | {error, roadrunner_router:validation_error()}.
 do_reload_routes(
     #state{proto_opts = #{dispatch := {router, Name}, middlewares := ListenerMws}},
     Routes
 ) ->
-    persistent_term:put(
-        {roadrunner_routes, Name},
-        roadrunner_router:compile(Routes, ListenerMws)
-    ),
-    ok;
+    %% Check the replacement before touching anything. `compile/2` raises on a
+    %% table that cannot work, and raising from here would take down a listener
+    %% (and the caller) that has a perfectly good table already published, so
+    %% the verdict comes back as a value and a bad table is simply refused.
+    case roadrunner_router:validate(Routes) of
+        ok ->
+            persistent_term:put(
+                {roadrunner_routes, Name},
+                roadrunner_router:compile(Routes, ListenerMws)
+            ),
+            ok;
+        {error, _Reason} = Error ->
+            Error
+    end;
 do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _, _}}}, _Routes) ->
     {error, no_routes}.
 
