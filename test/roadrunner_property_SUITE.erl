@@ -24,6 +24,7 @@ Add a new property:
     cookie_parse_returns_well_formed_pairs/1,
     http1_parse_request_line_never_crashes/1,
     http1_parse_header_never_crashes/1,
+    http1_parse_header_name_matches_reference/1,
     http1_parse_headers_never_crashes/1,
     http1_parse_request_never_crashes/1,
     http1_parse_chunk_never_crashes/1,
@@ -60,6 +61,7 @@ all() ->
         cookie_parse_returns_well_formed_pairs,
         http1_parse_request_line_never_crashes,
         http1_parse_header_never_crashes,
+        http1_parse_header_name_matches_reference,
         http1_parse_headers_never_crashes,
         http1_parse_request_never_crashes,
         http1_parse_chunk_never_crashes,
@@ -129,6 +131,12 @@ http1_parse_request_line_never_crashes(Config) ->
 http1_parse_header_never_crashes(Config) ->
     ct_property_test:quickcheck(
         roadrunner_http1_props:prop_parse_header_never_crashes(),
+        Config
+    ).
+
+http1_parse_header_name_matches_reference(Config) ->
+    ct_property_test:quickcheck(
+        roadrunner_http1_props:prop_parse_header_name_matches_reference(),
         Config
     ).
 
