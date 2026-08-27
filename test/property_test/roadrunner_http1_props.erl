@@ -89,6 +89,90 @@ feed(Fn, <<C, Rest/binary>>, Buf) ->
     end.
 
 %% =============================================================================
+%% Header-name normalization: the interned literal clauses in
+%% `validate_and_lowercase_name/1` must be indistinguishable from the
+%% general validate-and-lowercase path they short-circuit.
+%% =============================================================================
+
+prop_parse_header_name_matches_reference() ->
+    ?FORALL(
+        Name,
+        header_name_bytes(),
+        roadrunner_http1:parse_header(<<Name/binary, ": v\r\n">>) =:=
+            reference_header_name(Name)
+    ).
+
+%% What the parser must produce, derived independently of how it does
+%% it: a name of one or more tchars lowercases, anything else is
+%% rejected.
+reference_header_name(Name) ->
+    case is_tchar_name(Name) of
+        true -> {ok, roadrunner_bin:ascii_lowercase(Name), ~"v", ~""};
+        false -> {error, bad_header}
+    end.
+
+is_tchar_name(<<>>) -> false;
+is_tchar_name(Bin) -> lists:all(fun is_tchar/1, binary_to_list(Bin)).
+
+is_tchar(C) when C >= $a, C =< $z -> true;
+is_tchar(C) when C >= $A, C =< $Z -> true;
+is_tchar(C) when C >= $0, C =< $9 -> true;
+is_tchar(C) -> lists:member(C, "!#$%&'*+-.^_`|~").
+
+%% Half arbitrary names, half re-casings of names the parser interns, so
+%% the generator lands on the literal clauses and on the near-misses one
+%% flipped byte away from them. `:`, CR and LF are excluded because they
+%% frame the line rather than the name; arbitrary binaries are already
+%% covered by `prop_parse_header_never_crashes/0`.
+header_name_bytes() ->
+    oneof([arbitrary_name(), recased_common_name()]).
+
+arbitrary_name() ->
+    ?LET(Cs, non_empty(list(name_byte())), list_to_binary(Cs)).
+
+name_byte() ->
+    frequency([
+        {60, oneof(lists:seq($a, $z) ++ lists:seq($A, $Z))},
+        {15, $-},
+        {10, oneof(lists:seq($0, $9))},
+        {10, oneof("!#$%&'*+.^_`|~")},
+        {5, oneof("()@,;=\" <>?{}[]\\")}
+    ]).
+
+recased_common_name() ->
+    ?LET(
+        {Name, Flips},
+        {common_name(), list(boolean())},
+        recase(Name, Flips)
+    ).
+
+common_name() ->
+    oneof([
+        ~"Host",
+        ~"TE",
+        ~"Accept-Encoding",
+        ~"Content-Type",
+        ~"User-Agent",
+        ~"Sec-WebSocket-Key",
+        ~"Access-Control-Request-Headers",
+        ~"X-Forwarded-For"
+    ]).
+
+recase(Bin, []) -> Bin;
+recase(<<>>, _) -> <<>>;
+recase(<<C, R/binary>>, [Flip | Fs]) ->
+    Head =
+        case Flip of
+            true -> flip_case(C);
+            false -> C
+        end,
+    <<Head, (recase(R, Fs))/binary>>.
+
+flip_case(C) when C >= $a, C =< $z -> C - 32;
+flip_case(C) when C >= $A, C =< $Z -> C + 32;
+flip_case(C) -> C.
+
+%% =============================================================================
 %% Generators
 %% =============================================================================
 

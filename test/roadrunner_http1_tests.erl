@@ -191,6 +191,109 @@ header_lowercases_name_test() ->
         roadrunner_http1:parse_header(~"Content-Type: text/html\r\n")
     ).
 
+%% Every name interned as a literal clause in
+%% `roadrunner_http1:validate_and_lowercase_name/1`. Driving each one is
+%% what keeps this list and that one in step: a clause added there and
+%% not here leaves that clause uncovered, and the precommit gate
+%% requires full coverage.
+interned_header_names() ->
+    [
+        ~"Accept",
+        ~"Accept-Charset",
+        ~"Accept-Encoding",
+        ~"Accept-Language",
+        ~"Access-Control-Request-Headers",
+        ~"Access-Control-Request-Method",
+        ~"Authorization",
+        ~"Cache-Control",
+        ~"Connection",
+        ~"Content-Disposition",
+        ~"Content-Encoding",
+        ~"Content-Language",
+        ~"Content-Length",
+        ~"Content-Type",
+        ~"Cookie",
+        ~"Date",
+        ~"DNT",
+        ~"Expect",
+        ~"Forwarded",
+        ~"From",
+        ~"Host",
+        ~"If-Match",
+        ~"If-Modified-Since",
+        ~"If-None-Match",
+        ~"If-Range",
+        ~"If-Unmodified-Since",
+        ~"Max-Forwards",
+        ~"Origin",
+        ~"Pragma",
+        ~"Proxy-Authorization",
+        ~"Range",
+        ~"Referer",
+        ~"Sec-Fetch-Dest",
+        ~"Sec-Fetch-Mode",
+        ~"Sec-Fetch-Site",
+        ~"Sec-Fetch-User",
+        ~"Sec-WebSocket-Extensions",
+        ~"Sec-WebSocket-Key",
+        ~"Sec-WebSocket-Protocol",
+        ~"Sec-WebSocket-Version",
+        ~"TE",
+        ~"Trailer",
+        ~"Transfer-Encoding",
+        ~"Upgrade",
+        ~"Upgrade-Insecure-Requests",
+        ~"User-Agent",
+        ~"Via",
+        ~"X-Forwarded-For",
+        ~"X-Forwarded-Host",
+        ~"X-Forwarded-Proto",
+        ~"X-Real-IP",
+        ~"X-Requested-With"
+    ].
+
+%% The interned clause must return exactly what the general
+%% validate-and-lowercase path would have returned for the same name.
+header_interned_names_test_() ->
+    [
+        {
+            binary_to_list(Name),
+            ?_assertEqual(
+                {ok, roadrunner_bin:ascii_lowercase(Name), ~"v", ~""},
+                roadrunner_http1:parse_header(<<Name/binary, ": v\r\n">>)
+            )
+        }
+     || Name <- interned_header_names()
+    ].
+
+%% A near-miss sharing a long prefix with an interned name must still
+%% take the general path rather than the clause it almost matched.
+header_interned_near_miss_test_() ->
+    [
+        ?_assertEqual(
+            {ok, ~"accept-encodinx", ~"v", ~""},
+            roadrunner_http1:parse_header(~"Accept-Encodinx: v\r\n")
+        ),
+        ?_assertEqual(
+            {ok, ~"hos", ~"v", ~""},
+            roadrunner_http1:parse_header(~"Hos: v\r\n")
+        ),
+        ?_assertEqual(
+            {ok, ~"hostx", ~"v", ~""},
+            roadrunner_http1:parse_header(~"Hostx: v\r\n")
+        ),
+        %% Same name, a casing no interned clause covers.
+        ?_assertEqual(
+            {ok, ~"host", ~"v", ~""},
+            roadrunner_http1:parse_header(~"hOST: v\r\n")
+        ),
+        %% An interned name with a non-tchar byte appended is still rejected.
+        ?_assertEqual(
+            {error, bad_header},
+            roadrunner_http1:parse_header(~"Host(: v\r\n")
+        )
+    ].
+
 header_allows_digit_in_name_test() ->
     ?assertEqual(
         {ok, ~"x1-y2", ~"foo", ~""},

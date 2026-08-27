@@ -344,6 +344,123 @@ classify_header(NameRaw, ValueRaw, Rest) ->
 -spec validate_and_lowercase_name(binary()) -> {ok, binary()} | error.
 validate_and_lowercase_name(<<>>) ->
     error;
+%% Interned canonical request-header names. Each clause head compiles
+%% to a `bs_match_string`, and the compiler folds the whole set into a
+%% shared-prefix decision tree, so a hit costs one comparison instead
+%% of the validate walk, the lowercase walk and the `iolist_to_binary`
+%% copy below, and yields a shared literal rather than a fresh binary.
+%% A miss falls through to the general path unchanged.
+%%
+%% Every entry carries an uppercase byte: an already-lowercase name
+%% reaches `{ok, Bin}` via `scan_name_lower/1` without allocating, so
+%% interning one would buy nothing. `roadrunner_http1_tests` drives
+%% each entry, which is also what keeps this list and that one in
+%% step: adding a clause here without adding it there drops coverage
+%% below the 100 % the precommit gate requires.
+validate_and_lowercase_name(~"Accept") ->
+    {ok, ~"accept"};
+validate_and_lowercase_name(~"Accept-Charset") ->
+    {ok, ~"accept-charset"};
+validate_and_lowercase_name(~"Accept-Encoding") ->
+    {ok, ~"accept-encoding"};
+validate_and_lowercase_name(~"Accept-Language") ->
+    {ok, ~"accept-language"};
+validate_and_lowercase_name(~"Access-Control-Request-Headers") ->
+    {ok, ~"access-control-request-headers"};
+validate_and_lowercase_name(~"Access-Control-Request-Method") ->
+    {ok, ~"access-control-request-method"};
+validate_and_lowercase_name(~"Authorization") ->
+    {ok, ~"authorization"};
+validate_and_lowercase_name(~"Cache-Control") ->
+    {ok, ~"cache-control"};
+validate_and_lowercase_name(~"Connection") ->
+    {ok, ~"connection"};
+validate_and_lowercase_name(~"Content-Disposition") ->
+    {ok, ~"content-disposition"};
+validate_and_lowercase_name(~"Content-Encoding") ->
+    {ok, ~"content-encoding"};
+validate_and_lowercase_name(~"Content-Language") ->
+    {ok, ~"content-language"};
+validate_and_lowercase_name(~"Content-Length") ->
+    {ok, ~"content-length"};
+validate_and_lowercase_name(~"Content-Type") ->
+    {ok, ~"content-type"};
+validate_and_lowercase_name(~"Cookie") ->
+    {ok, ~"cookie"};
+validate_and_lowercase_name(~"Date") ->
+    {ok, ~"date"};
+validate_and_lowercase_name(~"DNT") ->
+    {ok, ~"dnt"};
+validate_and_lowercase_name(~"Expect") ->
+    {ok, ~"expect"};
+validate_and_lowercase_name(~"Forwarded") ->
+    {ok, ~"forwarded"};
+validate_and_lowercase_name(~"From") ->
+    {ok, ~"from"};
+validate_and_lowercase_name(~"Host") ->
+    {ok, ~"host"};
+validate_and_lowercase_name(~"If-Match") ->
+    {ok, ~"if-match"};
+validate_and_lowercase_name(~"If-Modified-Since") ->
+    {ok, ~"if-modified-since"};
+validate_and_lowercase_name(~"If-None-Match") ->
+    {ok, ~"if-none-match"};
+validate_and_lowercase_name(~"If-Range") ->
+    {ok, ~"if-range"};
+validate_and_lowercase_name(~"If-Unmodified-Since") ->
+    {ok, ~"if-unmodified-since"};
+validate_and_lowercase_name(~"Max-Forwards") ->
+    {ok, ~"max-forwards"};
+validate_and_lowercase_name(~"Origin") ->
+    {ok, ~"origin"};
+validate_and_lowercase_name(~"Pragma") ->
+    {ok, ~"pragma"};
+validate_and_lowercase_name(~"Proxy-Authorization") ->
+    {ok, ~"proxy-authorization"};
+validate_and_lowercase_name(~"Range") ->
+    {ok, ~"range"};
+validate_and_lowercase_name(~"Referer") ->
+    {ok, ~"referer"};
+validate_and_lowercase_name(~"Sec-Fetch-Dest") ->
+    {ok, ~"sec-fetch-dest"};
+validate_and_lowercase_name(~"Sec-Fetch-Mode") ->
+    {ok, ~"sec-fetch-mode"};
+validate_and_lowercase_name(~"Sec-Fetch-Site") ->
+    {ok, ~"sec-fetch-site"};
+validate_and_lowercase_name(~"Sec-Fetch-User") ->
+    {ok, ~"sec-fetch-user"};
+validate_and_lowercase_name(~"Sec-WebSocket-Extensions") ->
+    {ok, ~"sec-websocket-extensions"};
+validate_and_lowercase_name(~"Sec-WebSocket-Key") ->
+    {ok, ~"sec-websocket-key"};
+validate_and_lowercase_name(~"Sec-WebSocket-Protocol") ->
+    {ok, ~"sec-websocket-protocol"};
+validate_and_lowercase_name(~"Sec-WebSocket-Version") ->
+    {ok, ~"sec-websocket-version"};
+validate_and_lowercase_name(~"TE") ->
+    {ok, ~"te"};
+validate_and_lowercase_name(~"Trailer") ->
+    {ok, ~"trailer"};
+validate_and_lowercase_name(~"Transfer-Encoding") ->
+    {ok, ~"transfer-encoding"};
+validate_and_lowercase_name(~"Upgrade") ->
+    {ok, ~"upgrade"};
+validate_and_lowercase_name(~"Upgrade-Insecure-Requests") ->
+    {ok, ~"upgrade-insecure-requests"};
+validate_and_lowercase_name(~"User-Agent") ->
+    {ok, ~"user-agent"};
+validate_and_lowercase_name(~"Via") ->
+    {ok, ~"via"};
+validate_and_lowercase_name(~"X-Forwarded-For") ->
+    {ok, ~"x-forwarded-for"};
+validate_and_lowercase_name(~"X-Forwarded-Host") ->
+    {ok, ~"x-forwarded-host"};
+validate_and_lowercase_name(~"X-Forwarded-Proto") ->
+    {ok, ~"x-forwarded-proto"};
+validate_and_lowercase_name(~"X-Real-IP") ->
+    {ok, ~"x-real-ip"};
+validate_and_lowercase_name(~"X-Requested-With") ->
+    {ok, ~"x-requested-with"};
 validate_and_lowercase_name(Bin) ->
     case scan_name_lower(Bin) of
         lower -> {ok, Bin};
