@@ -238,7 +238,7 @@ encoding_token(deflate) -> ~"deflate".
 %% effective q > 0.
 -spec negotiate_encoding(roadrunner_req:request()) -> encoding().
 negotiate_encoding(Req) ->
-    case roadrunner_req:header(~"accept-encoding", Req) of
+    case roadrunner_req:header_normalized(~"accept-encoding", Req) of
         undefined ->
             none;
         Value ->

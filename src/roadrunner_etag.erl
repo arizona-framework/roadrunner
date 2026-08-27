@@ -71,7 +71,7 @@ conditional_method(_) -> false.
     roadrunner_handler:response().
 conditional(Req, Headers, Body) ->
     ETag = etag(Headers, Body),
-    case roadrunner_req:header(~"if-none-match", Req) of
+    case roadrunner_req:header_normalized(~"if-none-match", Req) of
         undefined ->
             {200, with_etag(Headers, ETag), Body};
         IfNoneMatch ->

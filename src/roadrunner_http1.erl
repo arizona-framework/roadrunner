@@ -620,6 +620,14 @@ compute_cached_decisions(Headers) ->
     roadrunner_req:cached_decisions().
 compute_cached_decisions_loop([], Acc) ->
     Acc;
+%% Each field's canonical lowercase value gets a literal clause ahead
+%% of that field's general clause. The literal is its own lowercase, so
+%% `ascii_lowercase/1` would walk it only to hand back the same term;
+%% matching the clause head compares it once instead.
+compute_cached_decisions_loop([{~"transfer-encoding", ~"chunked"} | Rest], Acc) ->
+    compute_cached_decisions_loop(Rest, Acc#{
+        has_transfer_encoding := true, is_chunked := true
+    });
 compute_cached_decisions_loop([{~"transfer-encoding", V} | Rest], Acc) ->
     %% Set both keys in a single map update on the chunked path — two
     %% sequential `:=` updates would allocate two map terms.
@@ -629,6 +637,8 @@ compute_cached_decisions_loop([{~"transfer-encoding", V} | Rest], Acc) ->
             _ -> Acc#{has_transfer_encoding := true}
         end,
     compute_cached_decisions_loop(Rest, Acc1);
+compute_cached_decisions_loop([{~"expect", ~"100-continue"} | Rest], Acc) ->
+    compute_cached_decisions_loop(Rest, Acc#{expects_continue := true});
 compute_cached_decisions_loop([{~"expect", V} | Rest], Acc) ->
     Acc1 =
         case roadrunner_bin:ascii_lowercase(V) of
@@ -636,6 +646,10 @@ compute_cached_decisions_loop([{~"expect", V} | Rest], Acc) ->
             _ -> Acc
         end,
     compute_cached_decisions_loop(Rest, Acc1);
+compute_cached_decisions_loop([{~"connection", ~"keep-alive"} | Rest], Acc) ->
+    compute_cached_decisions_loop(Rest, Acc#{connection_lower := ~"keep-alive"});
+compute_cached_decisions_loop([{~"connection", ~"close"} | Rest], Acc) ->
+    compute_cached_decisions_loop(Rest, Acc#{connection_lower := ~"close"});
 compute_cached_decisions_loop([{~"connection", V} | Rest], Acc) ->
     compute_cached_decisions_loop(
         Rest, Acc#{connection_lower := roadrunner_bin:ascii_lowercase(V)}

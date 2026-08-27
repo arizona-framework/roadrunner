@@ -434,6 +434,40 @@ Revisit only if a real workload reports false `slow_client` drops.
 
 **Scope:** small.
 
+### Intern common header names in the h1 name parser
+
+**What:** Give `roadrunner_http1:validate_and_lowercase_name/1` a table of
+literal clause heads for the canonical casing of the common request header
+names (`Host`, `Connection`, `Accept-Encoding`, ...), each returning the
+lowercase literal directly, ahead of the existing `scan_name_lower/1` walk.
+A hit replaces the validate walk plus the lowercase walk plus the
+`iolist_to_binary` copy with a single comparison, and hands back a shared
+literal instead of a freshly allocated sub-binary of the request buffer.
+
+**Why deferred:** it needs a generated table plus a property test asserting
+every entry equals roadrunner_bin:ascii_lowercase/1 of its key, which is
+more machinery than the surrounding hot-path work shipped so far. The
+measurement supports it: paired microbench, median of 15 rounds, shows a
+hit at 9-13 ns against 71 ns (`Host`), 195 ns (`Accept-Encoding`) and 431 ns
+(`Access-Control-Request-Headers`), while a miss costs 9-14 ns and, tested
+at 36 hand-written entries, does not grow with table size. Re-check that
+last point once the table is generated: a larger generated set is a
+different input to the compiler's trie construction than the one measured.
+HTTP/1 clients send Title-Case names, so a typical request is mostly hits.
+
+**Careful:** this is not the validate-plus-lowercase *fusion* that was
+measured and reverted (that one lost 667 ns/call on Title-Case names). The
+two-pass scan stays exactly as it is; the table only sits in front of it.
+
+**Related, smaller:** `roadrunner_bin:has_uppercase/1` walks one byte per
+call. A 32-bit SWAR word-at-a-time scan measured 23-37% faster on
+lowercase inputs and 1.2 ns slower on an early uppercase exit, which would
+speed up every remaining ascii_lowercase/1 caller including the public
+`roadrunner_req:header/2`. Worth it only if the interning work does not
+already remove the calls that matter.
+
+**Scope:** medium.
+
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>
