@@ -166,6 +166,7 @@ to absorb a chunk's payload across multiple length-bounded calls.
     version/1,
     headers/1,
     header/2,
+    header_normalized/2,
     has_header/2,
     parse_qs/1,
     parse_cookies/1,
@@ -255,6 +256,24 @@ before searching.
 header(Name, #{headers := H}) when is_binary(Name) ->
     Lower = roadrunner_bin:ascii_lowercase(Name),
     case lists:keyfind(Lower, 1, H) of
+        {_, Value} -> Value;
+        false -> undefined
+    end.
+
+%% Look up a header by a name that is already lowercase — the form
+%% `roadrunner_http1:parse_header/1` stores and the form every
+%% framework-internal call site passes as a literal. Skips the
+%% case-normalizing scan `header/2` runs per call, which is dead work
+%% on a name that is its own lowercase. Handler code wants `header/2`,
+%% which accepts any casing.
+%%
+%% The lookup is spelled out rather than shared with `header/2`: a
+%% common helper adds a call to both, and `header/2` is hot enough for
+%% handlers that the indirection measured as a ~2 % regression there.
+-doc false.
+-spec header_normalized(binary(), request()) -> binary() | undefined.
+header_normalized(Name, #{headers := H}) when is_binary(Name) ->
+    case lists:keyfind(Name, 1, H) of
         {_, Value} -> Value;
         false -> undefined
     end.

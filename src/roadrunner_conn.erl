@@ -670,7 +670,7 @@ has_continue_expectation(#{cached_decisions := #{expects_continue := EC}}) ->
 has_continue_expectation(Req) ->
     %% Manually-built request maps (tests, middleware) skip the parse-time
     %% precompute — fall back to the lowercase-and-compare path.
-    case roadrunner_req:header(~"expect", Req) of
+    case roadrunner_req:header_normalized(~"expect", Req) of
         undefined -> false;
         Value -> roadrunner_bin:ascii_lowercase(Value) =:= ~"100-continue"
     end.
@@ -718,7 +718,7 @@ body_framing(#{cached_decisions := #{content_length := CL}}) ->
     end;
 body_framing(Req) ->
     %% Manually-built request maps without cached_decisions — full path.
-    case roadrunner_req:header(~"transfer-encoding", Req) of
+    case roadrunner_req:header_normalized(~"transfer-encoding", Req) of
         undefined ->
             case content_length(Req) of
                 none -> none;
@@ -1062,7 +1062,7 @@ fill_iolist(Need, Recv) ->
 -spec content_length(roadrunner_req:request()) ->
     none | {ok, non_neg_integer()} | {error, bad_content_length}.
 content_length(Req) ->
-    case roadrunner_req:header(~"content-length", Req) of
+    case roadrunner_req:header_normalized(~"content-length", Req) of
         undefined ->
             none;
         Bin ->
@@ -1185,7 +1185,7 @@ keep_alive_decision_full(Req, RespHeaders) ->
 req_connection_lower(#{cached_decisions := #{connection_lower := V}}) ->
     V;
 req_connection_lower(Req) ->
-    case roadrunner_req:header(~"connection", Req) of
+    case roadrunner_req:header_normalized(~"connection", Req) of
         undefined -> ~"";
         V -> roadrunner_bin:ascii_lowercase(V)
     end.

@@ -129,7 +129,7 @@ compile_allow_headers(Config) ->
 -spec call(roadrunner_req:request(), roadrunner_middleware:next(), state()) ->
     roadrunner_handler:result().
 call(Req, Next, #cors{} = State) ->
-    case roadrunner_req:header(~"origin", Req) of
+    case roadrunner_req:header_normalized(~"origin", Req) of
         undefined ->
             %% Not a CORS request — nothing to do.
             Next(Req);
@@ -149,7 +149,7 @@ call(Req, Next, #cors{} = State) ->
 -spec is_preflight(roadrunner_req:request()) -> boolean().
 is_preflight(Req) ->
     roadrunner_req:method(Req) =:= ~"OPTIONS" andalso
-        roadrunner_req:header(~"access-control-request-method", Req) =/= undefined.
+        roadrunner_req:header_normalized(~"access-control-request-method", Req) =/= undefined.
 
 %% =============================================================================
 %% Preflight (204)
@@ -183,7 +183,7 @@ preflight_response(#cors{origins = Origins} = State, Origin, Req) ->
 preflight_headers(#cors{reflect_headers = false, preflight_static = Static}, _Req) ->
     Static;
 preflight_headers(#cors{reflect_headers = true, preflight_static = Static}, Req) ->
-    case roadrunner_req:header(~"access-control-request-headers", Req) of
+    case roadrunner_req:header_normalized(~"access-control-request-headers", Req) of
         undefined ->
             Static;
         Requested ->

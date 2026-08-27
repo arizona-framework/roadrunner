@@ -338,7 +338,7 @@ serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Siblings, Req) ->
     roadrunner_req:request()
 ) -> {ok, roadrunner_handler:response()} | none.
 maybe_serve_precompressed(FilePath, ETag, LastMod, Siblings, Req) ->
-    case roadrunner_req:header(~"range", Req) of
+    case roadrunner_req:header_normalized(~"range", Req) of
         undefined ->
             case choose_sibling(FilePath, Siblings, Req) of
                 {Encoding, SiblingPath, SiblingSize} ->
@@ -359,7 +359,7 @@ maybe_serve_precompressed(FilePath, ETag, LastMod, Siblings, Req) ->
 -spec choose_sibling(file:filename_all(), lazy | siblings(), roadrunner_req:request()) ->
     {binary(), binary(), non_neg_integer()} | none.
 choose_sibling(FilePath, Siblings, Req) ->
-    AcceptEnc = roadrunner_req:header(~"accept-encoding", Req),
+    AcceptEnc = roadrunner_req:header_normalized(~"accept-encoding", Req),
     case try_encoding(FilePath, br, ~"br", AcceptEnc, Siblings) of
         none -> try_encoding(FilePath, gz, ~"gzip", AcceptEnc, Siblings);
         Chosen -> Chosen
@@ -451,7 +451,7 @@ is_cached(Req, ETag, Mtime) ->
 
 -spec if_modified_since_satisfied(roadrunner_req:request(), integer()) -> boolean().
 if_modified_since_satisfied(Req, Mtime) ->
-    case roadrunner_req:header(~"if-modified-since", Req) of
+    case roadrunner_req:header_normalized(~"if-modified-since", Req) of
         undefined ->
             false;
         Value ->
@@ -472,7 +472,7 @@ if_modified_since_satisfied(Req, Mtime) ->
     roadrunner_req:request()
 ) -> roadrunner_handler:response().
 serve_with_range(FilePath, Size, ETag, LastMod, Req) ->
-    case parse_range(roadrunner_req:header(~"range", Req), Size) of
+    case parse_range(roadrunner_req:header_normalized(~"range", Req), Size) of
         {range, Start, End} ->
             serve_range(FilePath, Size, ETag, LastMod, Start, End);
         unsatisfiable ->
@@ -512,7 +512,7 @@ etag(Size, Mtime) ->
 
 -spec if_none_match(roadrunner_req:request()) -> binary() | undefined.
 if_none_match(Req) ->
-    roadrunner_req:header(~"if-none-match", Req).
+    roadrunner_req:header_normalized(~"if-none-match", Req).
 
 %% Parse a `Range: bytes=N-M`, `bytes=N-`, or `bytes=-S` header against
 %% the file `Size`. `none` means "ignore Range and serve the full body"
