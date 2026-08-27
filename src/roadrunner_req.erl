@@ -463,6 +463,13 @@ read_form(Req) ->
             dispatch_form(content_type_kind(ContentType), ContentType, Req)
     end.
 
+%% Split the parameters off before lowercasing, never after. Only the
+%% type token is case-insensitive (RFC 9110 §8.3.1); the parameters
+%% carry the multipart boundary, which is case-sensitive and is read
+%% from the untouched `ContentType` by `roadrunner_multipart:boundary/1`.
+%% Lowercasing the whole value first would corrupt that boundary, and
+%% would walk and copy it on the way: `----WebKitFormBoundary...` is
+%% the one long mixed-case run a normal request carries.
 -spec content_type_kind(binary()) -> urlencoded | multipart | unsupported.
 content_type_kind(ContentType) ->
     [Type | _] = binary:split(ContentType, persistent_term:get(?SEMI_CP_KEY)),

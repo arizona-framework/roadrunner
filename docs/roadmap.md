@@ -450,8 +450,10 @@ more machinery than the surrounding hot-path work shipped so far. The
 measurement supports it: paired microbench, median of 15 rounds, shows a
 hit at 9-13 ns against 71 ns (`Host`), 195 ns (`Accept-Encoding`) and 431 ns
 (`Access-Control-Request-Headers`), while a miss costs 9-14 ns and, tested
-at 36 entries, does not grow with table size. HTTP/1 clients send
-Title-Case names, so a typical request is mostly hits.
+at 36 hand-written entries, does not grow with table size. Re-check that
+last point once the table is generated: a larger generated set is a
+different input to the compiler's trie construction than the one measured.
+HTTP/1 clients send Title-Case names, so a typical request is mostly hits.
 
 **Careful:** this is not the validate-plus-lowercase *fusion* that was
 measured and reverted (that one lost 667 ns/call on Title-Case names). The
