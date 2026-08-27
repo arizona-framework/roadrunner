@@ -351,6 +351,12 @@ validate_and_lowercase_name(<<>>) ->
 %% copy below, and yields a shared literal rather than a fresh binary.
 %% A miss falls through to the general path unchanged.
 %%
+%% Deliberately no first-byte uppercase gate in front of the table.
+%% Every entry does start uppercase, so gating looks like it would let
+%% lowercase names skip the lot, but the decision tree already
+%% discriminates from byte 0: adding the gate saved 0.09 ns on a
+%% lowercase miss and cost every hit a redundant test.
+%%
 %% Every entry carries an uppercase byte: an already-lowercase name
 %% reaches `{ok, Bin}` via `scan_name_lower/1` without allocating, so
 %% interning one would buy nothing. `roadrunner_http1_tests` drives
