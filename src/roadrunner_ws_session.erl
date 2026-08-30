@@ -484,7 +484,18 @@ close_zlib(Z) -> zlib:close(Z).
 %% accumulating any handler-requested `hibernate` opt. When the buffer
 %% doesn't hold a full frame, re-arm the socket (hibernating first if a
 %% handler asked) and wait for more bytes.
+%%
+%% The empty-buffer head skips the peek machinery outright: after the
+%% common one-frame-per-delivery dispatch the loop re-enters here with
+%% nothing buffered, and the general clause would build the parse opts
+%% and run the full header peek on zero bytes just to conclude
+%% `{more, _}` — a second whole peek chain per frame. A partially
+%% validated frame always has its bytes in the buffer, so an empty
+%% buffer implies clean per-frame state and re-arming directly is
+%% behavior-identical.
 -spec process_buffer(#data{}, boolean()) -> no_return().
+process_buffer(#data{buffer = <<>>} = Data, HibernateAcc) ->
+    arm_and_recv(Data, HibernateAcc);
 process_buffer(#data{buffer = Buf, pmd_params = Pmd} = Data, HibernateAcc) ->
     Opts =
         case Pmd of
