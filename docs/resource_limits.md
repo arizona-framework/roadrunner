@@ -141,6 +141,17 @@ increments the `throttled` count from `roadrunner_listener:info/1`. HTTP/1
 is unaffected: it serves one request per connection, so `max_clients`
 already bounds it.
 
+When choosing between the two knobs, prefer sizing the advertised
+limits: pick `max_clients` and `max_concurrent_streams` (or
+`max_streams_bidi` for HTTP/3) so their product fits the process budget.
+The stream limit reaches clients in `SETTINGS` (or the QUIC transport
+parameters), so they window themselves and no request is refused. A
+refusal cap sheds load instead: retry-safe per the RFC, but a client
+that does not retry `REFUSED_STREAM` sees every refusal as a failed
+request.
+Reserve `max_concurrent_requests` as the hard backstop against peers
+that ignore the advertised limits, not as the primary bound.
+
 Where `max_clients` and `max_concurrent_requests` bound the listener's
 total load, `rate_limit` (off by default, the only opt-in guard here) caps
 a single **source**, so one peer cannot monopolize the server. It is a
