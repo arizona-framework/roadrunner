@@ -1436,10 +1436,64 @@ sendfile_dispatch_closes_socket_on_error_test() ->
     end,
     Sink ! stop.
 
+websocket_conn_hibernates_forwards_drain_and_closes_test() ->
+    %% Full upgrade through the conn: dispatch spawns the session, the
+    %% conn parks in the hibernated `ws_session_wake/7` wait, forwards a
+    %% `{roadrunner_drain, _}` broadcast to the session, and once the
+    %% session ends (a close frame injected through the fake socket) the
+    %% conn wakes, runs the websocket finishing path, and exits normal.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_ws_sink(Self, Tag, <<
+        "GET /ws HTTP/1.1\r\n"
+        "Host: x\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    >>),
+    Opts = (fake_opts(ws_hib))#{
+        dispatch :=
+            {handler, roadrunner_ws_upgrade_handler, fun roadrunner_ws_upgrade_handler:handle/1,
+                undefined}
+    },
+    {ok, ConnPid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    ConnRef = monitor(process, ConnPid),
+    ConnPid ! shoot,
+    %% The session's first active-once arm tells us the 101 handshake
+    %% completed and hands us the session pid for frame injection.
+    SessPid =
+        receive
+            {Tag, ws_armed, P} -> P
+        after 2000 -> error(no_session_arm)
+        end,
+    ?assertNotEqual(ConnPid, SessPid),
+    %% The conn has dispatched and parked — hibernated, tiny heap.
+    ?assert(is_hibernating(ConnPid, 1000)),
+    %% Drain broadcast to the conn is forwarded to the session (the echo
+    %% handler exports no handle_drain, so the session just keeps going —
+    %% liveness is the observable).
+    ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 30000},
+    ?assert(is_process_alive(SessPid)),
+    %% End the session: inject a masked close frame; the session replies
+    %% with a close frame and exits, waking the conn.
+    SessPid ! {roadrunner_fake_data, undefined, masked_close_frame()},
+    receive
+        {'DOWN', ConnRef, process, ConnPid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"101")),
+    %% Close-frame reply: opcode byte 0x88.
+    ?assertNotEqual(nomatch, binary:match(Sent, <<16#88>>)),
+    Sink ! stop.
+
 websocket_dispatch_invokes_session_run_test() ->
-    %% Without proper ws upgrade headers `ws_session:run/5` writes 400
-    %% and returns. We're covering the dispatch_response websocket
-    %% clause — a full handshake test lives in the WS suite.
+    %% Without proper ws upgrade headers `ws_session:start/6` writes 400
+    %% and returns `rejected`. We're covering the dispatch_response
+    %% websocket clause — a full handshake test lives above and in the
+    %% WS suite.
     ensure_pg(),
     Self = self(),
     Tag = make_ref(),
@@ -1500,6 +1554,11 @@ fake_opts(ListenerName) ->
             {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1, undefined},
         middlewares => [],
         max_content_length => 10485760,
+        %% WS session slice — read on the upgrade path (the listener
+        %% always fills these in production).
+        ws_max_frame_size => 10485760,
+        ws_max_message_size => 10485760,
+        ws_buffer => undefined,
         request_timeout => 5000,
         keep_alive_timeout => 5000,
         max_keep_alive_requests => 100,
@@ -1534,6 +1593,72 @@ sink_loop() ->
 %% calls are accepted but no further data is delivered. Also forwards
 %% `roadrunner_fake_send` to `Logger` tagged with `Tag` so the test
 %% can assert what the conn wrote.
+%% WebSocket-flow sink: delivers the upgrade request bytes on the FIRST
+%% active-once arm (from the conn), then reports every later arm to the
+%% logger as `{Tag, ws_armed, ArmingPid}` — the first of those comes
+%% from the freshly-started session, handing the test its pid so it can
+%% inject frames as `{roadrunner_fake_data, _, Bytes}` messages. Sends
+%% are logged like the other sinks.
+spawn_ws_sink(Logger, Tag, UpgradeBytes) ->
+    spawn(fun() -> ws_sink_loop(Logger, Tag, UpgradeBytes, false) end).
+
+ws_sink_loop(Logger, Tag, UpgradeBytes, Delivered) ->
+    receive
+        stop ->
+            ok;
+        {roadrunner_fake_setopts, ConnPid, _Opts} when not Delivered ->
+            ConnPid ! {roadrunner_fake_data, undefined, UpgradeBytes},
+            ws_sink_loop(Logger, Tag, UpgradeBytes, true);
+        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} when not Delivered ->
+            %% Passive-mode request read (the conn's default path).
+            ConnPid ! {roadrunner_fake_recv_reply, {ok, UpgradeBytes}},
+            ws_sink_loop(Logger, Tag, UpgradeBytes, true);
+        {roadrunner_fake_setopts, ArmingPid, Opts} ->
+            %% Only report active-once arms — the session's `ws.buffer`
+            %% setopts (when configured) would otherwise be mistaken for
+            %% an arm.
+            case lists:member({active, once}, Opts) of
+                true -> Logger ! {Tag, ws_armed, ArmingPid};
+                false -> ok
+            end,
+            ws_sink_loop(Logger, Tag, UpgradeBytes, Delivered);
+        {roadrunner_fake_send, _Pid, Data} ->
+            Logger ! {Tag, sent, Data},
+            ws_sink_loop(Logger, Tag, UpgradeBytes, Delivered);
+        _Other ->
+            ws_sink_loop(Logger, Tag, UpgradeBytes, Delivered)
+    end.
+
+%% A masked client→server close frame (opcode 0x88, code 1000). RFC
+%% 6455 §5.1 requires the mask bit on client frames; key 0 makes the
+%% masked payload equal the payload.
+masked_close_frame() ->
+    <<16#88, (16#80 bor 2), 0, 0, 0, 0, 1000:16>>.
+
+%% A hibernated process is `waiting` with its heap shrunk to the
+%% OTP-configured minimum (+64 words slack) — mirrors the helper in
+%% `roadrunner_ws_session_tests`. Polls until `TimeoutMs` because the
+%% hibernate lands asynchronously after the dispatch.
+is_hibernating(Pid, TimeoutMs) ->
+    {min_heap_size, Min} = erlang:system_info(min_heap_size),
+    is_hibernating_loop(Pid, Min + 64, erlang:monotonic_time(millisecond) + TimeoutMs).
+
+is_hibernating_loop(Pid, Threshold, Deadline) ->
+    case process_info(Pid, [status, total_heap_size, message_queue_len]) of
+        [{status, waiting}, {total_heap_size, H}, {message_queue_len, 0}] when
+            H =< Threshold
+        ->
+            true;
+        _ ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true ->
+                    false;
+                false ->
+                    timer:sleep(10),
+                    is_hibernating_loop(Pid, Threshold, Deadline)
+            end
+    end.
+
 spawn_active_sink_with_send_log(Logger, Tag, Bytes) ->
     spawn(fun() -> active_sink_loop(Logger, Tag, Bytes, false) end).
 

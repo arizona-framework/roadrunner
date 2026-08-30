@@ -52,7 +52,7 @@
 %% Internal entries — invoked via `proc_lib:start/3` and via
 %% `erlang:hibernate/3`. Must stay exported so the runtime can
 %% re-enter them after wake-from-hibernate.
--export([init_loop/3, recv_request_bytes_hib/2]).
+-export([init_loop/3, recv_request_bytes_hib/2, ws_session_wake/7]).
 
 %% Loop-state record carried through every phase. Allocated once on
 %% the transition out of `awaiting_shoot` and pattern-matched (not
@@ -765,14 +765,23 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
             %% server-initiated close (count ceiling) lands on the wire as
             %% `Connection: close` — see `ensure_close_signaled/3`.
             Response = ensure_close_signaled(S2, Req2, Response0),
-            _ = dispatch_response(S2, Handler, Req2, Response),
-            ok = roadrunner_telemetry:request_stop(
-                ReqStart,
-                Metadata,
-                roadrunner_conn:response_status(Response),
-                roadrunner_conn:response_kind(Response)
-            ),
-            finishing_phase(S2, Req2, Response)
+            case dispatch_response(S2, Handler, Req2, Response) of
+                {ws_session, MRef, SessPid} ->
+                    %% A WebSocket session now owns the socket; the conn
+                    %% parks in a hibernated wait until it terminates.
+                    %% `request_stop` fires from the wake continuation so
+                    %% its timing (response writer finished) matches the
+                    %% other writer-owned shapes.
+                    ws_session_wait(S2, Req2, Response, MRef, SessPid, ReqStart, Metadata);
+                ok ->
+                    ok = roadrunner_telemetry:request_stop(
+                        ReqStart,
+                        Metadata,
+                        roadrunner_conn:response_status(Response),
+                        roadrunner_conn:response_kind(Response)
+                    ),
+                    finishing_phase(S2, Req2, Response)
+            end
     catch
         Class:Reason:Stack ->
             ok = roadrunner_telemetry:request_exception(
@@ -835,7 +844,7 @@ with_close_if_last(
     module(),
     roadrunner_req:request(),
     roadrunner_handler:response()
-) -> ok.
+) -> ok | {ws_session, reference(), pid()}.
 dispatch_response(
     #loop_state{socket = Socket, buffered = Buffered, proto_opts = ProtoOpts},
     _Handler,
@@ -844,8 +853,14 @@ dispatch_response(
 ) when
     is_atom(Mod)
 ->
-    ok = roadrunner_ws_session:run(Socket, Req, Mod, State, Buffered, ProtoOpts),
-    ok;
+    %% `start/6` returns right after the 101 + socket handoff; the
+    %% session's lifetime is the caller's to wait out (`ws_session_wait`).
+    %% A rejected upgrade (400/500 already sent, `connection: close`)
+    %% falls through to the normal websocket finishing path.
+    case roadrunner_ws_session:start(Socket, Req, Mod, State, Buffered, ProtoOpts) of
+        {session, MRef, SessPid} -> {ws_session, MRef, SessPid};
+        rejected -> ok
+    end;
 dispatch_response(
     #loop_state{socket = Socket, alt_svc = AltSvc},
     _Handler,
@@ -1019,6 +1034,62 @@ buffered_finish(S, Req, Headers) ->
             %% Drain failure — close. Manual-mode handlers can leave the
             %% body_reader in a broken state if they read past EOF.
             exit_normal(S)
+    end.
+
+%% Park the conn in a hibernated wait while the WebSocket session owns
+%% the socket. The conn's only remaining duties are bookkeeping: hold
+%% the session monitor, forward `{roadrunner_drain, _}` broadcasts to
+%% the session (the conn is already in the listener's drain `pg` group
+%% via `roadrunner_conn:join_drain_group/2`; joining the session too
+%% would double the join rate through the single `pg` scope process and
+%% serialize the upgrade path under load), and fire the request-stop /
+%% conn-close telemetry once the session ends. Hibernating sheds the
+%% heap grown parsing the upgrade request (~5-7 KB per connection
+%% measured under load) for the session's entire lifetime — at high
+%% WebSocket concurrency the parked conns are a real share of resident
+%% memory.
+-spec ws_session_wait(
+    #loop_state{},
+    roadrunner_req:request(),
+    roadrunner_handler:response(),
+    reference(),
+    pid(),
+    integer(),
+    roadrunner_telemetry:metadata()
+) -> no_return().
+ws_session_wait(S, Req, Response, MRef, SessPid, ReqStart, Metadata) ->
+    erlang:hibernate(?MODULE, ws_session_wake, [S, Req, Response, MRef, SessPid, ReqStart, Metadata]).
+
+%% Wake-from-hibernate continuation (exported for `erlang:hibernate/3`).
+%% The selective receive mirrors the pre-hibernate wait this replaces:
+%% strays stay queued. A forwarded drain recurses into the receive
+%% without re-hibernating — the post-wake heap is already minimal and a
+%% drain is a one-shot shutdown event. On the session's `'DOWN'` the
+%% conn runs the request-stop telemetry and the websocket finishing
+%% path (drain any unread manual body, then close), exactly what the
+%% non-hibernated return path would have done.
+-spec ws_session_wake(
+    #loop_state{},
+    roadrunner_req:request(),
+    roadrunner_handler:response(),
+    reference(),
+    pid(),
+    integer(),
+    roadrunner_telemetry:metadata()
+) -> no_return().
+ws_session_wake(S, Req, Response, MRef, SessPid, ReqStart, Metadata) ->
+    receive
+        {'DOWN', MRef, process, SessPid, _Reason} ->
+            ok = roadrunner_telemetry:request_stop(
+                ReqStart,
+                Metadata,
+                roadrunner_conn:response_status(Response),
+                roadrunner_conn:response_kind(Response)
+            ),
+            finishing_phase(S, Req, Response);
+        {roadrunner_drain, _Deadline} = Msg ->
+            SessPid ! Msg,
+            ws_session_wake(S, Req, Response, MRef, SessPid, ReqStart, Metadata)
     end.
 
 %% Manual-mode body_reader owns its post-body leftover (returned by
