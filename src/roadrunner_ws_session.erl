@@ -218,6 +218,7 @@ run_session(
     Buffered,
     #{handler_spawn_opts := SpawnOpts, handler_start_timeout := StartTimeout} = ProtoOpts
 ) ->
+    ok = apply_ws_buffer(Socket, ProtoOpts),
     Ctx = ws_context(Req, Mod),
     %% Start the session **before** writing the 101 to the wire so a
     %% start failure never leaves the upgrade response sent with no
@@ -258,6 +259,21 @@ run_session(
             ),
             ok
     end.
+
+%% Apply the `ws.buffer` listener opt: resize the socket's inet
+%% `buffer` for the session's lifetime, before the 101 goes out. The
+%% conn still owns the socket here. `undefined` (the default) keeps the
+%% listener socket's inherited 64 KB — sized for HTTP request flow;
+%% high-concurrency small-message deployments set it lower because the
+%% emulator holds a live buffer of this size per socket. A setopts
+%% failure means the socket already died; the session discovers that on
+%% its first receive, so the result is ignored rather than special-cased.
+-spec apply_ws_buffer(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> ok.
+apply_ws_buffer(_Socket, #{ws_buffer := undefined}) ->
+    ok;
+apply_ws_buffer(Socket, #{ws_buffer := Buffer}) ->
+    _ = roadrunner_transport:setopts(Socket, [{buffer, Buffer}]),
+    ok.
 
 %% The conn process is already a member of the listener's drain `pg`
 %% group via `roadrunner_conn:join_drain_group/2` (joined at conn

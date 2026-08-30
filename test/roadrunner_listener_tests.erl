@@ -575,8 +575,31 @@ listener_rejects_invalid_ws_opt_test() ->
             }),
             ?assertMatch({error, {{invalid_listener_opt, ws, _}, _Stack}}, R)
         end,
-        [#{frame_size => 1}, #{max_frame_size => -1}, #{max_frame_size => bad}, not_a_map]
+        [
+            #{frame_size => 1},
+            #{max_frame_size => -1},
+            #{max_frame_size => bad},
+            not_a_map,
+            %% `buffer` is an inet buffer size — zero, negative,
+            %% non-integer, and over-range all reject.
+            #{buffer => 0},
+            #{buffer => -1},
+            #{buffer => bad},
+            #{buffer => 16#80000000}
+        ]
     ).
+
+listener_accepts_ws_buffer_opt_test() ->
+    %% A valid `ws.buffer` passes validation and the listener starts;
+    %% the session-side application is covered in
+    %% `roadrunner_ws_session_tests`.
+    {ok, Pid} = roadrunner_listener:start_link(listener_test_ws_buffer_ok, #{
+        port => 0,
+        ws => #{buffer => 2048},
+        routes => roadrunner_hello_handler
+    }),
+    ?assert(is_process_alive(Pid)),
+    ok = roadrunner_listener:stop(listener_test_ws_buffer_ok).
 
 listener_rejects_invalid_handler_spawn_test() ->
     %% `handler_spawn` must be a map; `opts` a list that does not carry the

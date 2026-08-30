@@ -106,10 +106,13 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `max_content_length` — request-body cap across HTTP/1.1, HTTP/2, and
   HTTP/3; an over-cap body answers `413 Payload Too Large` (and resets
   the stream on h2/h3). Default 10 MB.
-- `ws` — WebSocket inbound size caps as a nested map (see
+- `ws` — WebSocket session tunables as a nested map (see
   `t:ws_opts/0`): `max_frame_size` (per-frame payload cap) and
-  `max_message_size` (reassembled + decompressed message cap). Both
-  default to 10 MB; over-cap closes the connection with code 1009.
+  `max_message_size` (reassembled + decompressed message cap), both
+  defaulting to 10 MB with over-cap closing the connection with code
+  1009, plus `buffer` (per-session inet `buffer` override — bounds
+  per-connection memory at high WebSocket concurrency; inherits the
+  listener's 64 KB when unset).
 - `request_timeout` — header-read timeout on a fresh conn.
   Default 30 s.
 - `keep_alive_timeout` — idle timeout between requests on a
@@ -466,7 +469,7 @@ HTTP/3 listener tunables (under `{http3, ThisMap}` in `protocols`).
 }.
 
 -doc """
-WebSocket inbound size caps (under `ws` in the listener opts).
+WebSocket session tunables (under `ws` in the listener opts).
 
 - `max_frame_size` — per-frame payload cap in bytes. An inbound
   frame declaring more than this closes the connection with code
@@ -475,10 +478,25 @@ WebSocket inbound size caps (under `ws` in the listener opts).
   running fragment total, and the decompressed size when
   permessage-deflate is negotiated. Over-cap closes with 1009. Must
   be `>= max_frame_size`. Default 10 MB.
+- `buffer` — inet `buffer` (user-space receive buffer, bytes)
+  applied to the socket when a connection upgrades to a WebSocket
+  session. The emulator keeps a buffer of this size alive per
+  socket, so it bounds how many bytes one `{tcp, _, Data}` delivery
+  carries AND what every connection pays in resident memory. Unset
+  (the default) inherits the listener socket's 64 KB — sized for
+  HTTP request flow, where bodies arrive in bulk. Long-lived
+  WebSocket sessions that exchange small messages should set this
+  lower in production: at high connection counts the inherited
+  64 KB dominates per-connection memory (64 KB × connections),
+  while a few KB is plenty for message-sized deliveries. Large
+  inbound frames are still delivered correctly with a small buffer,
+  just across more deliveries — deployments streaming multi-KB
+  frames client→server should keep it larger.
 """.
 -type ws_opts() :: #{
     max_frame_size => 0..16#7FFFFFFF,
-    max_message_size => 0..16#7FFFFFFF
+    max_message_size => 0..16#7FFFFFFF,
+    buffer => 1..16#7FFFFFFF
 }.
 
 -record(state, {
@@ -1070,7 +1088,7 @@ build_proto_opts(Opts, ListenerName) ->
     %% Public `ws` opts are a nested map; flatten to the `ws_*`
     %% proto_opts keys the hot path reads, mirroring the `{http2, #{}}`
     %% → `http2_*` flattening above.
-    #{max_frame_size := WsFrame, max_message_size := WsMsg} =
+    #{max_frame_size := WsFrame, max_message_size := WsMsg, buffer := WsBuffer} =
         validate_ws_opts(maps:get(ws, Opts, #{})),
     %% Flatten the nested `handler_spawn` opt to top-level proto_opts keys the
     %% spawn sites read directly, mirroring the `ws` / `http2` flattening above.
@@ -1083,6 +1101,7 @@ build_proto_opts(Opts, ListenerName) ->
                 maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
             ws_max_frame_size => WsFrame,
             ws_max_message_size => WsMsg,
+            ws_buffer => WsBuffer,
             request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
             keep_alive_timeout =>
                 maps:get(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT),
@@ -1475,11 +1494,18 @@ flatten_http3_opts(Entries) ->
     end.
 
 -spec ws_defaults() ->
-    #{max_frame_size := non_neg_integer(), max_message_size := non_neg_integer()}.
+    #{
+        max_frame_size := non_neg_integer(),
+        max_message_size := non_neg_integer(),
+        buffer := undefined
+    }.
 ws_defaults() ->
     #{
         max_frame_size => ?DEFAULT_WS_MAX_FRAME_SIZE,
-        max_message_size => ?DEFAULT_WS_MAX_MESSAGE_SIZE
+        max_message_size => ?DEFAULT_WS_MAX_MESSAGE_SIZE,
+        %% `undefined` = no setopts on upgrade; the session keeps the
+        %% listener socket's inherited 64 KB `buffer`.
+        buffer => undefined
     }.
 
 %% Resolve the `ws` opts map against defaults, rejecting unknown keys
@@ -1488,15 +1514,18 @@ ws_defaults() ->
 %% frame is also a whole message: `max_message_size` below
 %% `max_frame_size` is contradictory and rejected at startup.
 -spec validate_ws_opts(term()) ->
-    #{max_frame_size := non_neg_integer(), max_message_size := non_neg_integer()}.
+    #{
+        max_frame_size := non_neg_integer(),
+        max_message_size := non_neg_integer(),
+        buffer := pos_integer() | undefined
+    }.
 validate_ws_opts(Opts) when is_map(Opts) ->
     Defaults = ws_defaults(),
     Resolved = maps:fold(
         fun(K, V, Acc) ->
-            case is_map_key(K, Defaults) of
-                false -> error({invalid_listener_opt, ws, Opts});
-                true when is_integer(V), V >= 0, V =< 16#7FFFFFFF -> Acc#{K => V};
-                true -> error({invalid_listener_opt, ws, Opts})
+            case is_map_key(K, Defaults) andalso valid_ws_opt(K, V) of
+                true -> Acc#{K => V};
+                false -> error({invalid_listener_opt, ws, Opts})
             end
         end,
         Defaults,
@@ -1508,6 +1537,15 @@ validate_ws_opts(Opts) when is_map(Opts) ->
     Resolved;
 validate_ws_opts(Other) ->
     error({invalid_listener_opt, ws, Other}).
+
+%% Per-key range check for the `ws` sub-opts. The size caps allow 0
+%% (reject every frame / message); `buffer` is an inet buffer size, so
+%% zero is meaningless and rejected.
+-spec valid_ws_opt(max_frame_size | max_message_size | buffer, term()) -> boolean().
+valid_ws_opt(buffer, V) ->
+    is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
+valid_ws_opt(_SizeCap, V) ->
+    is_integer(V) andalso V >= 0 andalso V =< 16#7FFFFFFF.
 
 %% Validate the `rate_limit` opt and, when set, create its per-listener ETS
 %% bucket store. `undefined` (the default) skips the guard entirely.
