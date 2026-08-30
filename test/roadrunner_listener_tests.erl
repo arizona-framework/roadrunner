@@ -599,13 +599,13 @@ listener_rejects_invalid_ws_opt_test() ->
             #{max_frame_size => -1},
             #{max_frame_size => bad},
             not_a_map,
-            %% `buffer` is an inet buffer size and `hibernate_after` an
+            %% `recv_buffer` is an inet buffer size and `hibernate_after` an
             %% idle interval — zero, negative, non-integer, and
             %% over-range all reject.
-            #{buffer => 0},
-            #{buffer => -1},
-            #{buffer => bad},
-            #{buffer => 16#80000000},
+            #{recv_buffer => 0},
+            #{recv_buffer => -1},
+            #{recv_buffer => bad},
+            #{recv_buffer => 16#80000000},
             #{hibernate_after => 0},
             #{hibernate_after => -1},
             #{hibernate_after => bad},
@@ -614,12 +614,12 @@ listener_rejects_invalid_ws_opt_test() ->
     ).
 
 listener_accepts_ws_session_opts_test() ->
-    %% Valid `ws.buffer` / `ws.hibernate_after` pass validation and the
+    %% Valid `ws.recv_buffer` / `ws.hibernate_after` pass validation and the
     %% listener starts; the session-side application of each is covered
     %% in `roadrunner_ws_session_tests`.
     {ok, Pid} = roadrunner_listener:start_link(listener_test_ws_session_opts_ok, #{
         port => 0,
-        ws => #{buffer => 2048, hibernate_after => 15000},
+        ws => #{recv_buffer => 2048, hibernate_after => 15000},
         routes => roadrunner_hello_handler
     }),
     ?assert(is_process_alive(Pid)),

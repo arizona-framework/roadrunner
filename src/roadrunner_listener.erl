@@ -118,7 +118,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   `t:ws_opts/0`): `max_frame_size` (per-frame payload cap) and
   `max_message_size` (reassembled + decompressed message cap), both
   defaulting to 10 MB with over-cap closing the connection with code
-  1009, plus `buffer` (per-session inet `buffer` override — bounds
+  1009, plus `recv_buffer` (per-session inet `buffer` override — bounds
   per-connection memory at high WebSocket concurrency; inherits the
   listener's `recv_buffer` when unset) and `hibernate_after` (idle-session
   hibernation timeout in milliseconds; off when unset).
@@ -510,9 +510,10 @@ WebSocket session tunables (under `ws` in the listener opts).
   running fragment total, and the decompressed size when
   permessage-deflate is negotiated. Over-cap closes with 1009. Must
   be `>= max_frame_size`. Default 10 MB.
-- `buffer` — inet `buffer` (user-space receive buffer, bytes)
+- `recv_buffer` — inet `buffer` (user-space receive buffer, bytes)
   applied to the socket when a connection upgrades to a WebSocket
-  session. The emulator keeps a buffer of this size alive per
+  session — the session-level override of the top-level
+  `recv_buffer` listener opt. The emulator keeps a buffer of this size alive per
   socket, so it bounds how many bytes one `{tcp, _, Data}` delivery
   carries AND what every connection pays in resident memory. Unset
   (the default) inherits the listener socket's `recv_buffer` (64 KB
@@ -539,7 +540,7 @@ WebSocket session tunables (under `ws` in the listener opts).
 -type ws_opts() :: #{
     max_frame_size => 0..16#7FFFFFFF,
     max_message_size => 0..16#7FFFFFFF,
-    buffer => 1..16#7FFFFFFF,
+    recv_buffer => 1..16#7FFFFFFF,
     hibernate_after => 1..16#7FFFFFFF
 }.
 
@@ -1136,7 +1137,7 @@ build_proto_opts(Opts, ListenerName) ->
     #{
         max_frame_size := WsFrame,
         max_message_size := WsMsg,
-        buffer := WsBuffer,
+        recv_buffer := WsBuffer,
         hibernate_after := WsHibernateAfter
     } =
         validate_ws_opts(maps:get(ws, Opts, #{})),
@@ -1550,7 +1551,7 @@ flatten_http3_opts(Entries) ->
     #{
         max_frame_size := non_neg_integer(),
         max_message_size := non_neg_integer(),
-        buffer := undefined,
+        recv_buffer := undefined,
         hibernate_after := infinity
     }.
 ws_defaults() ->
@@ -1559,7 +1560,7 @@ ws_defaults() ->
         max_message_size => ?DEFAULT_WS_MAX_MESSAGE_SIZE,
         %% `undefined` = no setopts on upgrade; the session keeps the
         %% listener socket's inherited `recv_buffer`.
-        buffer => undefined,
+        recv_buffer => undefined,
         %% `infinity` = the session's receive never times out into a
         %% hibernate — the `after infinity` clause is dead by the
         %% receive's own semantics, so the default costs nothing.
@@ -1575,7 +1576,7 @@ ws_defaults() ->
     #{
         max_frame_size := non_neg_integer(),
         max_message_size := non_neg_integer(),
-        buffer := pos_integer() | undefined,
+        recv_buffer := pos_integer() | undefined,
         hibernate_after := pos_integer() | infinity
     }.
 validate_ws_opts(Opts) when is_map(Opts) ->
@@ -1598,12 +1599,12 @@ validate_ws_opts(Other) ->
     error({invalid_listener_opt, ws, Other}).
 
 %% Per-key range check for the `ws` sub-opts. The size caps allow 0
-%% (reject every frame / message); `buffer` and `hibernate_after` are
-%% a buffer size and an idle interval, so zero is meaningless and
+%% (reject every frame / message); `recv_buffer` and `hibernate_after`
+%% are a buffer size and an idle interval, so zero is meaningless and
 %% rejected for both.
--spec valid_ws_opt(max_frame_size | max_message_size | buffer | hibernate_after, term()) ->
+-spec valid_ws_opt(max_frame_size | max_message_size | recv_buffer | hibernate_after, term()) ->
     boolean().
-valid_ws_opt(buffer, V) ->
+valid_ws_opt(recv_buffer, V) ->
     is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
 valid_ws_opt(hibernate_after, V) ->
     is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
@@ -1613,7 +1614,7 @@ valid_ws_opt(_SizeCap, V) ->
 %% Validate the `recv_buffer` opt (an inet buffer size — zero is
 %% meaningless) rather than passing a bad value into `gen_tcp:listen/2`,
 %% where it would surface as an opaque `{listen_failed, _}`. Mirrors the
-%% strict `ws.buffer` validation.
+%% strict `ws.recv_buffer` validation.
 -spec validate_recv_buffer(map()) -> pos_integer().
 validate_recv_buffer(Opts) ->
     case maps:get(recv_buffer, Opts, ?DEFAULT_RECV_BUFFER) of

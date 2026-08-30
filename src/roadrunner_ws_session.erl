@@ -296,7 +296,7 @@ start_session(
             rejected
     end.
 
-%% Apply the `ws.buffer` listener opt: resize the socket's inet
+%% Apply the `ws.recv_buffer` listener opt: resize the socket's inet
 %% `buffer` for the session's lifetime, before the 101 goes out. The
 %% conn still owns the socket here. `undefined` (the default) keeps the
 %% listener socket's inherited `recv_buffer` (64 KB default), sized
