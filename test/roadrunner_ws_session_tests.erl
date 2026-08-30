@@ -50,6 +50,65 @@ run_with_bad_handshake_still_returns_400_test() ->
     ?assertNotEqual(nomatch, binary:match(Sent, ~"400")),
     ?assertEqual(nomatch, binary:match(Sent, ~"101")).
 
+ws_buffer_opt_applied_before_101_test() ->
+    %% `ws.buffer` set: the session must resize the socket's inet
+    %% `buffer` while the conn still owns the socket — i.e. the setopts
+    %% must land BEFORE the 101 goes out. The events sink logs setopts
+    %% and sends into one ordered stream; a seeded close frame ends the
+    %% session so `run/6` returns.
+    Tag = make_ref(),
+    Self = self(),
+    Sink = spawn_events_sink(Self, Tag),
+    ok = roadrunner_ws_session:run(
+        {fake, Sink},
+        upgrade_req(),
+        roadrunner_ws_echo_handler,
+        undefined,
+        frame(close, <<1000:16>>),
+        (ws_proto_opts())#{ws_buffer := 4096}
+    ),
+    Events = collect_events(Tag, 100),
+    Sink ! stop,
+    BufferIdx = find_event_index(
+        fun
+            ({setopts, Opts}) -> Opts =:= [{buffer, 4096}];
+            (_) -> false
+        end,
+        Events
+    ),
+    SendIdx = find_event_index(
+        fun
+            ({send, Data}) -> binary:match(iolist_to_binary(Data), ~"101") =/= nomatch;
+            (_) -> false
+        end,
+        Events
+    ),
+    ?assertNotEqual(not_found, BufferIdx),
+    ?assertNotEqual(not_found, SendIdx),
+    ?assert(BufferIdx < SendIdx).
+
+ws_buffer_opt_unset_leaves_socket_buffer_alone_test() ->
+    %% Default (`ws_buffer => undefined`): no `{buffer, _}` setopts may
+    %% reach the socket — the session inherits the listener's buffer.
+    Tag = make_ref(),
+    Self = self(),
+    Sink = spawn_events_sink(Self, Tag),
+    ok = roadrunner_ws_session:run(
+        {fake, Sink},
+        upgrade_req(),
+        roadrunner_ws_echo_handler,
+        undefined,
+        frame(close, <<1000:16>>),
+        ws_proto_opts()
+    ),
+    Events = collect_events(Tag, 100),
+    Sink ! stop,
+    BufferSetopts = [
+        Opts
+     || {setopts, Opts} <- Events, lists:keyfind(buffer, 1, Opts) =/= false
+    ],
+    ?assertEqual([], BufferSetopts).
+
 coalesced_first_frame_seeded_in_buffer_is_processed_test() ->
     %% A client that pipelines its first frame in the same segment as
     %% the upgrade handshake: the conn read it past the request and
@@ -2221,6 +2280,21 @@ ws_ctx() ->
         module => roadrunner_ws_echo_handler
     }.
 
+%% A request map carrying a valid upgrade handshake, for tests driving
+%% the full `run/6` entry.
+upgrade_req() ->
+    #{
+        headers => [
+            {~"upgrade", ~"websocket"},
+            {~"connection", ~"Upgrade"},
+            {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
+            {~"sec-websocket-version", ~"13"}
+        ],
+        peer => undefined,
+        listener_name => undefined,
+        request_id => undefined
+    }.
+
 %% Minimal `proto_opts` slice the session reads in `init/1`. Defaults to
 %% the production 16 MB caps so existing small-frame tests are
 %% unaffected; cap tests call `ws_proto_opts/2` with tight values.
@@ -2231,6 +2305,7 @@ ws_proto_opts(MaxFrame, MaxMsg) ->
     #{
         ws_max_frame_size => MaxFrame,
         ws_max_message_size => MaxMsg,
+        ws_buffer => undefined,
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity
     }.
@@ -2244,7 +2319,8 @@ frame(Opcode, Payload) ->
     OpcodeByte =
         case Opcode of
             text -> 16#81;
-            binary -> 16#82
+            binary -> 16#82;
+            close -> 16#88
         end,
     <<OpcodeByte, (16#80 bor Len), 1, 2, 3, 4, Masked/binary>>.
 
@@ -2434,6 +2510,60 @@ is_hibernating_loop(Pid, Threshold, Deadline) ->
 
 spawn_send_log_sink(Logger, Tag) ->
     spawn(fun() -> sink_loop(Logger, Tag) end).
+
+%% Events sink: like the send-log sink, but logs `setopts` calls too,
+%% into the same ordered stream — for tests that assert on the ORDER
+%% of socket operations (e.g. `ws.buffer` applied before the 101).
+spawn_events_sink(Logger, Tag) ->
+    spawn(fun() -> events_sink_loop(Logger, Tag) end).
+
+events_sink_loop(Logger, Tag) ->
+    receive
+        stop ->
+            ok;
+        {roadrunner_fake_send, _Pid, Data} ->
+            Logger ! {evt, Tag, {send, Data}},
+            events_sink_loop(Logger, Tag);
+        {roadrunner_fake_setopts, _Pid, Opts} ->
+            Logger ! {evt, Tag, {setopts, Opts}},
+            events_sink_loop(Logger, Tag);
+        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
+            ConnPid ! {roadrunner_fake_recv_reply, {error, closed}},
+            events_sink_loop(Logger, Tag);
+        _ ->
+            events_sink_loop(Logger, Tag)
+    end.
+
+%% Same settle discipline as `collect_sends/2`, over `{evt, _, _}`
+%% messages from the events sink.
+collect_events(Tag, Timeout) ->
+    collect_events_loop(Tag, [], Timeout, Timeout).
+
+collect_events_loop(Tag, Acc, _InitialTimeout, SettleMs) when Acc =/= [] ->
+    receive
+        {evt, Tag, Event} -> collect_events_loop(Tag, [Event | Acc], SettleMs, SettleMs)
+    after SettleMs ->
+        lists:reverse(Acc)
+    end;
+collect_events_loop(Tag, [], InitialTimeout, SettleMs) ->
+    receive
+        {evt, Tag, Event} -> collect_events_loop(Tag, [Event], InitialTimeout, SettleMs)
+    after InitialTimeout ->
+        []
+    end.
+
+%% 1-based index of the first event the (total) predicate accepts, or
+%% `not_found`.
+find_event_index(Pred, Events) ->
+    find_event_index(Pred, Events, 1).
+
+find_event_index(_Pred, [], _N) ->
+    not_found;
+find_event_index(Pred, [Event | Rest], N) ->
+    case Pred(Event) of
+        true -> N;
+        false -> find_event_index(Pred, Rest, N + 1)
+    end.
 
 sink_loop(Logger, Tag) ->
     receive

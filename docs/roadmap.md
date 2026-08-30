@@ -246,6 +246,25 @@ own measurement before shipping.
 
 **Scope:** small.
 
+### Hibernate the conn process while a WebSocket session runs
+
+**What:** During a WebSocket session the parent conn process only
+holds a monitor on the session and forwards drain broadcasts
+(`roadrunner_ws_session:wait_for_session/2`), yet it keeps the heap it
+grew parsing the upgrade request (~5-7 KB measured under load) for the
+session's whole lifetime. Hibernating it would drop that to ~1 KB per
+connection — meaningful at high WebSocket concurrency (100K sessions
+hold ~500 MB of idle conn heaps today). Needs restructuring: hibernate
+discards the stack, so the wait must move into a `roadrunner_conn_loop`
+continuation that can still run the post-session drain + `exit_normal`
+path when the session's `'DOWN'` arrives.
+
+**Why deferred:** the `ws.buffer` opt removed the dominant
+per-session memory cost (the 64 KB inherited socket buffer); the conn
+heap is the next block but wants its own measured commit.
+
+**Scope:** small.
+
 ### h2 receive-window defaults
 
 **What:** Bump the listener's default receive-window peaks above the

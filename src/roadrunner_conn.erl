@@ -102,6 +102,9 @@
     %% `roadrunner_listener:build_proto_opts/2` fills defaults.
     ws_max_frame_size := non_neg_integer(),
     ws_max_message_size := non_neg_integer(),
+    %% inet `buffer` applied to the socket on WebSocket upgrade;
+    %% `undefined` inherits the listener socket's 64 KB.
+    ws_buffer := pos_integer() | undefined,
     request_timeout := non_neg_integer(),
     keep_alive_timeout := non_neg_integer(),
     max_keep_alive_requests := pos_integer(),
