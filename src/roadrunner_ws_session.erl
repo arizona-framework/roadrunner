@@ -33,6 +33,18 @@
 %% continuation can take effect. Without active mode we'd be blocked
 %% inside `roadrunner_transport:recv/3` and hibernation would be a no-op.
 %%
+%% ## Outbound coalescing
+%%
+%% Replies are not written as they're dispatched: every outbound frame
+%% (handler replies, auto-pongs, closes) is encoded onto `#data.out`
+%% and the whole accumulation goes out in ONE `send` when the session
+%% parks (`arm_and_recv/2`) or exits with a close. A drain pass over a
+%% delivery carrying many frames — a pipelined client, or active-once
+%% coalescing under load — thus pays one write instead of one per
+%% reply, and the peer receives the batch as one segment. A single
+%% frame per delivery (the idle-session common case) flushes
+%% immediately after its dispatch, so per-message latency is unchanged.
+%%
 %% ## Session hibernation
 %%
 %% Two complementary ways for an idle session's heap to drop to ~1KB
@@ -157,7 +169,12 @@
     %% instead of letting it re-unmask the masked bytes — which on
     %% 1 KB+ text frames was 40% of own time per fprof. Reset
     %% alongside `frame_validated`.
-    unmasked_buf = <<>> :: binary()
+    unmasked_buf = <<>> :: binary(),
+    %% Encoded outbound frames queued during the current buffer-drain
+    %% pass, written in ONE send by `flush_out/1` before every park and
+    %% before a close-frame exit. Order is dispatch order. Always empty
+    %% while the session is idle in `recv_loop/1`.
+    out = [] :: iodata()
 }).
 
 %% Per-message DEFLATE trailer (RFC 7692 §7.2.1). Sender strips it
@@ -342,7 +359,8 @@ init_session(Parent, {Socket, Mod, State, Ctx, Negotiated, Buffered, ProtoOpts})
                 msg_size = 0,
                 utf8_pending = <<>>,
                 frame_validated = 0,
-                unmasked_buf = <<>>
+                unmasked_buf = <<>>,
+                out = []
             },
             proc_lib:init_ack(Parent, {ok, self()}),
             awaiting_socket(Data);
@@ -689,7 +707,10 @@ append_bin(Acc, New) -> <<Acc/binary, New/binary>>.
 %% (a peer-closed socket mid-frame is a normal end-of-session event, not a
 %% crash). Mirrors the conn-loop `arm_and_recv` + `recv_more_hib` pattern.
 -spec arm_and_recv(#data{}, boolean()) -> no_return().
-arm_and_recv(#data{socket = Socket} = Data, Hibernate) ->
+arm_and_recv(#data{socket = Socket} = Data0, Hibernate) ->
+    %% Everything queued during the drain pass that led here goes out
+    %% in one write before the park — see `flush_out/1`.
+    Data = flush_out(Data0),
     case roadrunner_transport:setopts(Socket, [{active, once}]) of
         ok when Hibernate -> erlang:hibernate(?MODULE, recv_loop, [Data]);
         ok -> recv_loop(Data);
@@ -704,11 +725,9 @@ handle_frame(#{opcode := close, payload := P}, Data, _Hibernate) ->
     %% UTF-8 reason, 1-byte payload). Per §7.4.1 the server then
     %% MUST close with 1002 (protocol error) instead of echoing.
     Reply = close_reply(P),
-    ok = send_ws_frame(Data, close, Reply),
-    exit_clean(Data);
+    flush_and_exit(queue_frame(Data, close, Reply));
 handle_frame(#{opcode := ping, payload := P}, Data, Hibernate) ->
-    ok = send_ws_frame(Data, pong, P),
-    process_buffer(Data, Hibernate);
+    process_buffer(queue_frame(Data, pong, P), Hibernate);
 handle_frame(#{opcode := pong}, Data, Hibernate) ->
     %% Server is not pinging clients yet — pong from client is dropped.
     process_buffer(Data, Hibernate);
@@ -1081,8 +1100,7 @@ close_message_too_big() ->
 
 -spec close_with(binary(), #data{}) -> no_return().
 close_with(StatusBin, Data) ->
-    ok = send_ws_frame(Data, close, StatusBin),
-    exit_clean(Data).
+    flush_and_exit(queue_frame(Data, close, StatusBin)).
 
 %% Close with 1009 because an inbound size cap was exceeded, emitting
 %% `[roadrunner, ws, frame_rejected]` first so operators can see the
@@ -1177,12 +1195,10 @@ handle_drain_msg(_Deadline, #data{has_handle_drain = false} = Data, _Hibernate) 
 apply_handler_result(Result, Data, Hibernate, Continue) ->
     case Result of
         {reply, OutFrames, NewState} ->
-            _ = send_ws_frames(Data, OutFrames),
-            Continue(Data#data{mod_state = NewState}, Hibernate);
+            Continue((queue_frames(Data, OutFrames))#data{mod_state = NewState}, Hibernate);
         {reply, OutFrames, NewState, Opts} when is_list(Opts) ->
-            _ = send_ws_frames(Data, OutFrames),
             Continue(
-                Data#data{mod_state = NewState},
+                (queue_frames(Data, OutFrames))#data{mod_state = NewState},
                 Hibernate orelse lists:member(hibernate, Opts)
             );
         {ok, NewState} ->
@@ -1193,11 +1209,9 @@ apply_handler_result(Result, Data, Hibernate, Continue) ->
                 Hibernate orelse lists:member(hibernate, Opts)
             );
         {close, _NewState} ->
-            ok = send_ws_frame(Data, close, ~""),
-            exit_clean(Data);
+            flush_and_exit(queue_frame(Data, close, ~""));
         {close, Code, Reason, _NewState} ->
-            ok = send_ws_frame(Data, close, close_payload(Code, Reason)),
-            exit_clean(Data)
+            flush_and_exit(queue_frame(Data, close, close_payload(Code, Reason)))
     end.
 
 %% Build the wire payload for a handler-driven close. RFC 6455 §5.5.1
@@ -1228,9 +1242,10 @@ ws_context(Req, Mod) ->
 -spec payload_size(roadrunner_ws:frame()) -> non_neg_integer().
 payload_size(#{payload := P}) -> byte_size(P).
 
-%% Single outbound frame — wraps `roadrunner_transport:send/2` with a
-%% `[roadrunner, ws, frame_out]` event so subscribers see every frame the
-%% session writes (auto-pong, close, and unary handler replies).
+%% Queue a single outbound frame on the pending accumulator, emitting
+%% `[roadrunner, ws, frame_out]` at queue time so subscribers see every
+%% frame the session writes (auto-pong, close, and unary handler
+%% replies) in dispatch order.
 %%
 %% When permessage-deflate is active and the opcode is text/binary the
 %% payload is deflated and emitted with RSV1=1. Control frames (close
@@ -1238,24 +1253,39 @@ payload_size(#{payload := P}) -> byte_size(P).
 %% §6.1 forbids compressing control frames; continuations carry no
 %% RSV1 even inside a compressed message (we never emit a
 %% multi-fragment outbound message anyway, so the question is moot).
--spec send_ws_frame(#data{}, roadrunner_ws:opcode(), iodata()) -> ok.
-send_ws_frame(#data{socket = Socket, ctx = Ctx} = Data, Opcode, Payload) ->
+-spec queue_frame(#data{}, roadrunner_ws:opcode(), iodata()) -> #data{}.
+queue_frame(#data{ctx = Ctx, out = Out} = Data, Opcode, Payload) ->
     ok = roadrunner_telemetry:ws_frame_out(
         Ctx#{opcode => Opcode}, iolist_size(Payload)
     ),
-    Encoded = encode_outbound(Data, Opcode, Payload),
-    _ = roadrunner_transport:send(Socket, Encoded),
-    ok.
+    Data#data{out = [Out | encode_outbound(Data, Opcode, Payload)]}.
 
-%% Batched outbound frames from a handler `{reply, [...]}` return —
-%% emit telemetry per frame (so subscribers can count by opcode) and
-%% encode them in one walk, then write the whole batch in a single
-%% TCP send to avoid partial-write fragmentation.
--spec send_ws_frames(#data{}, [{roadrunner_ws:opcode(), iodata()}]) ->
-    ok | {error, term()}.
-send_ws_frames(#data{socket = Socket, ctx = Ctx} = Data, OutFrames) ->
-    Iodata = encode_frames(Data, Ctx, OutFrames),
-    roadrunner_transport:send(Socket, Iodata).
+%% Queue a handler `{reply, [...]}` batch — telemetry per frame (so
+%% subscribers can count by opcode), encoded in one walk.
+-spec queue_frames(#data{}, [{roadrunner_ws:opcode(), iodata()}]) -> #data{}.
+queue_frames(#data{ctx = Ctx, out = Out} = Data, OutFrames) ->
+    Data#data{out = [Out | encode_frames(Data, Ctx, OutFrames)]}.
+
+%% Write everything queued since the last flush in ONE `send` and reset
+%% the accumulator. Called before every park (`arm_and_recv/2`) and
+%% before a close-frame exit, so a buffer-drain pass that dispatched
+%% many frames pays one write instead of one per reply — under bursty
+%% inbound traffic (a pipelined client, a fragmented delivery carrying
+%% several frames) the syscall count drops by the batch factor. A send
+%% failure is discovered on the next receive (closed/error message),
+%% the same as the immediate-send shape it replaces.
+-spec flush_out(#data{}) -> #data{}.
+flush_out(#data{out = []} = Data) ->
+    Data;
+flush_out(#data{socket = Socket, out = Out} = Data) ->
+    _ = roadrunner_transport:send(Socket, Out),
+    Data#data{out = []}.
+
+%% Flush pending frames (typically ending in a just-queued close) and
+%% end the session.
+-spec flush_and_exit(#data{}) -> no_return().
+flush_and_exit(Data) ->
+    exit_clean(flush_out(Data)).
 
 -spec encode_frames(#data{}, map(), [{roadrunner_ws:opcode(), iodata()}]) -> iodata().
 encode_frames(_Data, _Ctx, []) ->
