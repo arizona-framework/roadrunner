@@ -110,6 +110,9 @@
     %% (the default) never hibernates on idle.
     ws_hibernate_after := pos_integer() | infinity,
     request_timeout := non_neg_integer(),
+    %% Bound on the TLS handshake in the accept path; see the
+    %% `tls_handshake_timeout` listener opt.
+    tls_handshake_timeout := pos_integer(),
     keep_alive_timeout := non_neg_integer(),
     max_keep_alive_requests := pos_integer(),
     max_clients := pos_integer(),

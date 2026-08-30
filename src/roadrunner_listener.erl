@@ -40,6 +40,11 @@ All duration and interval values in `opts()` are in milliseconds —
 
 -define(DEFAULT_MAX_CONTENT_LENGTH, 10485760).
 -define(DEFAULT_REQUEST_TIMEOUT, 30000).
+%% Bound on `ssl:handshake/2` in the accept path. Without one, a client
+%% that connects to a TLS listener and never sends a ClientHello parks
+%% an acceptor indefinitely — `num_acceptors` such sockets and the
+%% listener stops accepting. 5 s comfortably covers slow real clients.
+-define(DEFAULT_TLS_HANDSHAKE_TIMEOUT, 5000).
 -define(DEFAULT_KEEP_ALIVE_TIMEOUT, 60000).
 -define(DEFAULT_NUM_ACCEPTORS, 10).
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
@@ -116,6 +121,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   hibernation timeout in milliseconds; off when unset).
 - `request_timeout` — header-read timeout on a fresh conn.
   Default 30 s.
+- `tls_handshake_timeout` — bound on the TLS handshake during accept
+  (TLS listeners only). A handshake that exceeds it fails as a
+  per-connection `{handshake, timeout}` accept error and the acceptor
+  keeps accepting; without a bound, a client that never sends its
+  ClientHello would park an acceptor indefinitely. Default 5 s.
 - `keep_alive_timeout` — idle timeout between requests on a
   keep-alive conn. Default 60 s.
 - `num_acceptors` — size of the acceptor pool. Default 10.
@@ -201,6 +211,7 @@ ops-tuning rationale.
     max_content_length => non_neg_integer(),
     ws => ws_opts(),
     request_timeout => non_neg_integer(),
+    tls_handshake_timeout => pos_integer(),
     keep_alive_timeout => non_neg_integer(),
     num_acceptors => pos_integer(),
     max_keep_alive_requests => pos_integer(),
@@ -1121,6 +1132,8 @@ build_proto_opts(Opts, ListenerName) ->
             ws_buffer => WsBuffer,
             ws_hibernate_after => WsHibernateAfter,
             request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
+            tls_handshake_timeout =>
+                maps:get(tls_handshake_timeout, Opts, ?DEFAULT_TLS_HANDSHAKE_TIMEOUT),
             keep_alive_timeout =>
                 maps:get(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT),
             max_keep_alive_requests =>

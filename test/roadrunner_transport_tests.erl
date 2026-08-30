@@ -149,7 +149,7 @@ accept_handshake_failure_returns_error_test() ->
     {ok, Port} = roadrunner_transport:port(LSocket),
     Self = self(),
     spawn(fun() ->
-        Self ! {accept_result, roadrunner_transport:accept(LSocket)}
+        Self ! {accept_result, roadrunner_transport:accept(LSocket, 5000)}
     end),
     %% Give the server time to enter accept.
     timer:sleep(50),
@@ -168,6 +168,32 @@ accept_handshake_failure_returns_error_test() ->
     ?assertMatch({error, {handshake, _}}, Result),
     roadrunner_transport:close(LSocket),
     gen_tcp:close(Client).
+
+accept_handshake_times_out_on_silent_client_test() ->
+    %% A client that connects and never sends a ClientHello must not
+    %% park the accept: the handshake bound turns it into a tagged
+    %% per-connection `{handshake, timeout}` error.
+    {ok, _} = application:ensure_all_started(ssl),
+    ServerOpts = roadrunner_test_certs:server_opts(),
+    {ok, LSocket} = roadrunner_transport:listen_tls(
+        0, ServerOpts ++ [binary, {active, false}, {reuseaddr, true}]
+    ),
+    {ok, Port} = roadrunner_transport:port(LSocket),
+    Self = self(),
+    spawn(fun() ->
+        Self ! {accept_result, roadrunner_transport:accept(LSocket, 200)}
+    end),
+    {ok, Silent} = gen_tcp:connect(
+        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+    ),
+    Result =
+        receive
+            {accept_result, R} -> R
+        after 5000 -> error(accept_timeout)
+        end,
+    ?assertEqual({error, {handshake, timeout}}, Result),
+    roadrunner_transport:close(LSocket),
+    gen_tcp:close(Silent).
 
 port_on_closed_ssl_socket_returns_error_test() ->
     {ok, _} = application:ensure_all_started(ssl),

@@ -41,18 +41,19 @@ the same opts. The index is used in the `proc_lib` label so
     {ok, pid()}.
 start_link(LSocket, ProtoOpts, Index) ->
     ListenerName = maps:get(listener_name, ProtoOpts, undefined),
+    #{tls_handshake_timeout := HsTimeout} = ProtoOpts,
     Pid = proc_lib:spawn_link(fun() ->
         proc_lib:set_label({roadrunner_acceptor, ListenerName, Index}),
-        loop(LSocket, ProtoOpts)
+        loop(LSocket, ProtoOpts, HsTimeout)
     end),
     {ok, Pid}.
 
--spec loop(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> ok.
-loop(LSocket, ProtoOpts) ->
-    case roadrunner_transport:accept(LSocket) of
+-spec loop(roadrunner_transport:socket(), roadrunner_conn:proto_opts(), timeout()) -> ok.
+loop(LSocket, ProtoOpts, HsTimeout) ->
+    case roadrunner_transport:accept(LSocket, HsTimeout) of
         {ok, Socket} ->
             handle_accepted(Socket, ProtoOpts),
-            loop(LSocket, ProtoOpts);
+            loop(LSocket, ProtoOpts, HsTimeout);
         {error, closed} ->
             %% Listen socket was closed — the listener is stopping. Exit
             %% cleanly; the linked listener tears the rest of the pool down.
@@ -75,7 +76,7 @@ loop(LSocket, ProtoOpts) ->
                         after ?ACCEPT_ERROR_BACKOFF_MS -> ok
                         end
                 end,
-            loop(LSocket, ProtoOpts)
+            loop(LSocket, ProtoOpts, HsTimeout)
     end.
 
 %% Classify a non-`closed` accept error for retry pacing. Exported for

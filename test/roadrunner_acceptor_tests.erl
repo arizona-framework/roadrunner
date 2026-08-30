@@ -124,7 +124,9 @@ acceptor_retries_on_transient_accept_error_test() ->
         undefined
     ),
     {ok, Pid} = roadrunner_acceptor:start_link(
-        {gen_tcp, CSock}, #{listener_name => acceptor_test_accept_error}, 1
+        {gen_tcp, CSock},
+        #{listener_name => acceptor_test_accept_error, tls_handshake_timeout => 5000},
+        1
     ),
     receive
         {accept_error, Meta} ->
@@ -186,7 +188,7 @@ acceptor_survives_failed_tls_handshake_test() ->
         undefined
     ),
     {ok, Pid} = roadrunner_acceptor:start_link(
-        LSock, #{listener_name => acceptor_test_tls_noise}, 1
+        LSock, #{listener_name => acceptor_test_tls_noise, tls_handshake_timeout => 5000}, 1
     ),
     %% Plain-HTTP bytes can't form a TLS hello — the handshake fails.
     {ok, Noise} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
