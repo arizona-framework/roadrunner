@@ -163,7 +163,9 @@ accept_handshake_failure_returns_error_test() ->
             {accept_result, R} -> R
         after 5000 -> error(accept_timeout)
         end,
-    ?assertMatch({error, _}, Result),
+    %% Handshake failures come back tagged, distinguishing this
+    %% per-connection event from the listen socket's own `closed`.
+    ?assertMatch({error, {handshake, _}}, Result),
     roadrunner_transport:close(LSocket),
     gen_tcp:close(Client).
 

@@ -91,7 +91,19 @@ listen_tls(Port, Opts) ->
         {error, _} = Err -> Err
     end.
 
--doc "Accept the next pending connection. For TLS, runs the handshake before returning.".
+-doc """
+Accept the next pending connection. For TLS, runs the handshake before
+returning.
+
+TLS failures are two different events and come back distinguishably:
+a `ssl:transport_accept/1` error is about the LISTEN socket (`closed`
+means the listener is going away), while a failed `ssl:handshake/1` is
+about that one connection — a garbage ClientHello, a TLS alert, or the
+peer disconnecting mid-handshake (which `ssl` also reports as `closed`).
+Handshake failures are wrapped as `{error, {handshake, Reason}}` so an
+acceptor can keep accepting through per-connection noise and reserve
+the bare `{error, closed}` for the listener actually stopping.
+""".
 -spec accept(socket()) -> {ok, socket()} | {error, term()}.
 accept({gen_tcp, LSock}) ->
     case gen_tcp:accept(LSock) of
@@ -101,8 +113,10 @@ accept({gen_tcp, LSock}) ->
 accept({ssl, LSock}) ->
     maybe
         {ok, Pre} ?= ssl:transport_accept(LSock),
-        {ok, S} ?= ssl:handshake(Pre),
-        {ok, {ssl, S}}
+        case ssl:handshake(Pre) of
+            {ok, S} -> {ok, {ssl, S}};
+            {error, HsReason} -> {error, {handshake, HsReason}}
+        end
     end.
 
 -doc "Hand the controlling process for the underlying socket.".

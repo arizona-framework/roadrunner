@@ -218,6 +218,29 @@ lot of them.
 
 ## Other
 
+### Bound and parallelize the TLS handshake in the accept path
+
+**What:** `roadrunner_transport:accept/1` for TLS runs
+`ssl:handshake/1` inside the acceptor with no timeout. Two
+consequences: a client that connects and never sends a ClientHello
+parks that acceptor indefinitely (a trivial slow-loris against the
+accept pool — `num_acceptors` such clients and the listener stops
+accepting), and handshake time serializes across the pool, capping
+TLS connection-establishment throughput at
+`num_acceptors / handshake_time`. The fixes are separable: pass a
+`handshake_timeout` to `ssl:handshake/2` (small), and move the
+handshake out of the acceptor into the connection process —
+`ssl:transport_accept` in the acceptor, handshake after the handoff —
+so slow handshakes cost only their own connection (medium; changes
+the `roadrunner_conn` startup contract, which expects a
+handshake-complete socket at `shoot`).
+
+**Why deferred:** surfaced while auditing the acceptor
+transient-error fix; that fix makes handshake FAILURES harmless but
+doesn't bound handshake TIME.
+
+**Scope:** small (timeout) / medium (handshake in the conn process).
+
 ### Connection-process memory tuning follow-ups
 
 **What:** The `handler_spawn` listener opt already exposes the full
