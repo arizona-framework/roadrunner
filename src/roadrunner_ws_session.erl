@@ -299,8 +299,9 @@ start_session(
 %% Apply the `ws.buffer` listener opt: resize the socket's inet
 %% `buffer` for the session's lifetime, before the 101 goes out. The
 %% conn still owns the socket here. `undefined` (the default) keeps the
-%% listener socket's inherited 64 KB — sized for HTTP request flow;
-%% high-concurrency small-message deployments set it lower because the
+%% listener socket's inherited `recv_buffer` (64 KB default), sized
+%% for HTTP request flow; high-concurrency small-message deployments
+%% set it lower because the
 %% emulator holds a live buffer of this size per socket. A setopts
 %% failure means the socket already died; the session discovers that on
 %% its first receive, so the result is ignored rather than special-cased.

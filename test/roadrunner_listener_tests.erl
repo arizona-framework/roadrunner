@@ -625,6 +625,23 @@ listener_accepts_ws_session_opts_test() ->
     ?assert(is_process_alive(Pid)),
     ok = roadrunner_listener:stop(listener_test_ws_session_opts_ok).
 
+listener_rejects_invalid_recv_buffer_test() ->
+    %% `recv_buffer` is an inet buffer size — zero, negative,
+    %% non-integer, and over-range reject at `init/1` instead of
+    %% surfacing as an opaque `{listen_failed, _}` from `gen_tcp:listen`.
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(listener_test_recv_buffer_invalid, #{
+                port => 0,
+                recv_buffer => Bad,
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, recv_buffer, _}, _Stack}}, R)
+        end,
+        [0, -1, bad, 16#80000000]
+    ).
+
 listener_rejects_invalid_handler_spawn_test() ->
     %% `handler_spawn` must be a map; `opts` a list that does not carry the
     %% roadrunner-owned linkage (`link` / `monitor` / `{monitor, _}`,

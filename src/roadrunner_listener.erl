@@ -120,7 +120,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   defaulting to 10 MB with over-cap closing the connection with code
   1009, plus `buffer` (per-session inet `buffer` override — bounds
   per-connection memory at high WebSocket concurrency; inherits the
-  listener's 64 KB when unset) and `hibernate_after` (idle-session
+  listener's `recv_buffer` when unset) and `hibernate_after` (idle-session
   hibernation timeout in milliseconds; off when unset).
 - `request_timeout` — header-read timeout on a fresh conn.
   Default 30 s.
@@ -515,8 +515,9 @@ WebSocket session tunables (under `ws` in the listener opts).
   session. The emulator keeps a buffer of this size alive per
   socket, so it bounds how many bytes one `{tcp, _, Data}` delivery
   carries AND what every connection pays in resident memory. Unset
-  (the default) inherits the listener socket's 64 KB — sized for
-  HTTP request flow, where bodies arrive in bulk. Long-lived
+  (the default) inherits the listener socket's `recv_buffer` (64 KB
+  default) — sized for HTTP request flow, where bodies arrive in
+  bulk. Long-lived
   WebSocket sessions that exchange small messages should set this
   lower in production: at high connection counts the inherited
   64 KB dominates per-connection memory (64 KB × connections),
@@ -1052,7 +1053,7 @@ base_listen_opts(Opts) ->
         {packet, raw},
         {nodelay, true},
         {backlog, maps:get(socket_backlog, Opts, ?DEFAULT_SOCKET_BACKLOG)},
-        {buffer, maps:get(recv_buffer, Opts, ?DEFAULT_RECV_BUFFER)}
+        {buffer, validate_recv_buffer(Opts)}
     ],
     %% Prepend `{ip, IP}` only when the caller set it, so the default
     %% list (and the default all-interfaces bind) is unchanged. Both
@@ -1557,7 +1558,7 @@ ws_defaults() ->
         max_frame_size => ?DEFAULT_WS_MAX_FRAME_SIZE,
         max_message_size => ?DEFAULT_WS_MAX_MESSAGE_SIZE,
         %% `undefined` = no setopts on upgrade; the session keeps the
-        %% listener socket's inherited 64 KB `buffer`.
+        %% listener socket's inherited `recv_buffer`.
         buffer => undefined,
         %% `infinity` = the session's receive never times out into a
         %% hibernate — the `after infinity` clause is dead by the
@@ -1608,6 +1609,17 @@ valid_ws_opt(hibernate_after, V) ->
     is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
 valid_ws_opt(_SizeCap, V) ->
     is_integer(V) andalso V >= 0 andalso V =< 16#7FFFFFFF.
+
+%% Validate the `recv_buffer` opt (an inet buffer size — zero is
+%% meaningless) rather than passing a bad value into `gen_tcp:listen/2`,
+%% where it would surface as an opaque `{listen_failed, _}`. Mirrors the
+%% strict `ws.buffer` validation.
+-spec validate_recv_buffer(map()) -> pos_integer().
+validate_recv_buffer(Opts) ->
+    case maps:get(recv_buffer, Opts, ?DEFAULT_RECV_BUFFER) of
+        N when is_integer(N), N >= 1, N =< 16#7FFFFFFF -> N;
+        Bad -> error({invalid_listener_opt, recv_buffer, Bad})
+    end.
 
 %% Validate the `rate_limit` opt and, when set, create its per-listener ETS
 %% bucket store. `undefined` (the default) skips the guard entirely.
