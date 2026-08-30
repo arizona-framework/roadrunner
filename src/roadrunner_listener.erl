@@ -112,7 +112,8 @@ Optional middleware and timing knobs (durations in milliseconds):
   defaulting to 10 MB with over-cap closing the connection with code
   1009, plus `buffer` (per-session inet `buffer` override — bounds
   per-connection memory at high WebSocket concurrency; inherits the
-  listener's 64 KB when unset).
+  listener's 64 KB when unset) and `hibernate_after` (idle-session
+  hibernation timeout in milliseconds; off when unset).
 - `request_timeout` — header-read timeout on a fresh conn.
   Default 30 s.
 - `keep_alive_timeout` — idle timeout between requests on a
@@ -492,11 +493,22 @@ WebSocket session tunables (under `ws` in the listener opts).
   inbound frames are still delivered correctly with a small buffer,
   just across more deliveries — deployments streaming multi-KB
   frames client→server should keep it larger.
+- `hibernate_after` — idle milliseconds after which a WebSocket
+  session hibernates (heap shrinks to the minimum until the next
+  inbound event wakes it). The session-side counterpart of the
+  top-level `hibernate_after` conn knob, with the same tradeoff:
+  each wake costs a heap rebuild, so it suits mostly-idle sessions
+  (presence, notifications, low-traffic subscriptions) where the
+  per-connection heap held across long silences dominates. A busy
+  session never pays — the next frame arrives before the timer.
+  Unset (the default) never hibernates on idle; handlers can still
+  opt in per event via the `hibernate` return option.
 """.
 -type ws_opts() :: #{
     max_frame_size => 0..16#7FFFFFFF,
     max_message_size => 0..16#7FFFFFFF,
-    buffer => 1..16#7FFFFFFF
+    buffer => 1..16#7FFFFFFF,
+    hibernate_after => 1..16#7FFFFFFF
 }.
 
 -record(state, {
@@ -1088,7 +1100,12 @@ build_proto_opts(Opts, ListenerName) ->
     %% Public `ws` opts are a nested map; flatten to the `ws_*`
     %% proto_opts keys the hot path reads, mirroring the `{http2, #{}}`
     %% → `http2_*` flattening above.
-    #{max_frame_size := WsFrame, max_message_size := WsMsg, buffer := WsBuffer} =
+    #{
+        max_frame_size := WsFrame,
+        max_message_size := WsMsg,
+        buffer := WsBuffer,
+        hibernate_after := WsHibernateAfter
+    } =
         validate_ws_opts(maps:get(ws, Opts, #{})),
     %% Flatten the nested `handler_spawn` opt to top-level proto_opts keys the
     %% spawn sites read directly, mirroring the `ws` / `http2` flattening above.
@@ -1102,6 +1119,7 @@ build_proto_opts(Opts, ListenerName) ->
             ws_max_frame_size => WsFrame,
             ws_max_message_size => WsMsg,
             ws_buffer => WsBuffer,
+            ws_hibernate_after => WsHibernateAfter,
             request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
             keep_alive_timeout =>
                 maps:get(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT),
@@ -1497,7 +1515,8 @@ flatten_http3_opts(Entries) ->
     #{
         max_frame_size := non_neg_integer(),
         max_message_size := non_neg_integer(),
-        buffer := undefined
+        buffer := undefined,
+        hibernate_after := infinity
     }.
 ws_defaults() ->
     #{
@@ -1505,7 +1524,11 @@ ws_defaults() ->
         max_message_size => ?DEFAULT_WS_MAX_MESSAGE_SIZE,
         %% `undefined` = no setopts on upgrade; the session keeps the
         %% listener socket's inherited 64 KB `buffer`.
-        buffer => undefined
+        buffer => undefined,
+        %% `infinity` = the session's receive never times out into a
+        %% hibernate — the `after infinity` clause is dead by the
+        %% receive's own semantics, so the default costs nothing.
+        hibernate_after => infinity
     }.
 
 %% Resolve the `ws` opts map against defaults, rejecting unknown keys
@@ -1517,7 +1540,8 @@ ws_defaults() ->
     #{
         max_frame_size := non_neg_integer(),
         max_message_size := non_neg_integer(),
-        buffer := pos_integer() | undefined
+        buffer := pos_integer() | undefined,
+        hibernate_after := pos_integer() | infinity
     }.
 validate_ws_opts(Opts) when is_map(Opts) ->
     Defaults = ws_defaults(),
@@ -1539,10 +1563,14 @@ validate_ws_opts(Other) ->
     error({invalid_listener_opt, ws, Other}).
 
 %% Per-key range check for the `ws` sub-opts. The size caps allow 0
-%% (reject every frame / message); `buffer` is an inet buffer size, so
-%% zero is meaningless and rejected.
--spec valid_ws_opt(max_frame_size | max_message_size | buffer, term()) -> boolean().
+%% (reject every frame / message); `buffer` and `hibernate_after` are
+%% a buffer size and an idle interval, so zero is meaningless and
+%% rejected for both.
+-spec valid_ws_opt(max_frame_size | max_message_size | buffer | hibernate_after, term()) ->
+    boolean().
 valid_ws_opt(buffer, V) ->
+    is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
+valid_ws_opt(hibernate_after, V) ->
     is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
 valid_ws_opt(_SizeCap, V) ->
     is_integer(V) andalso V >= 0 andalso V =< 16#7FFFFFFF.

@@ -231,6 +231,41 @@ frame_loop_hibernates_when_handler_returns_hibernate_opt_test() ->
     Sink ! stop,
     ok = stop_ws_session(Pid).
 
+ws_hibernate_after_parks_idle_session_and_wakes_on_frame_test() ->
+    %% `ws.hibernate_after` set: a session with no traffic for the idle
+    %% window hibernates on its own — no handler opt-in (the echo
+    %% handler returns plain 3-tuples). A frame delivered after the
+    %% park wakes the continuation straight into recv_loop, gets
+    %% echoed, and the session parks again once idle. The default
+    %% (`infinity`) is pinned by every other test in this file — none
+    %% hibernate without the handler opt.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            <<>>,
+            (ws_proto_opts())#{ws_hibernate_after := 30}
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    %% Idle past the window — parked without any handler cooperation.
+    ?assert(is_hibernating(Pid, 1000)),
+    Pid ! {roadrunner_fake_data, undefined, frame(text, ~"hi")},
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"hi")),
+    %% ...and it parks again after the next idle window.
+    ?assert(is_hibernating(Pid, 1000)),
+    Sink ! stop,
+    ok = stop_ws_session(Pid).
+
 frame_loop_hibernates_on_ok_opt_variant_test() ->
     %% Binary frame → {ok, _, [hibernate]} → no reply but hibernate.
     Self = self(),
@@ -2293,6 +2328,7 @@ ws_proto_opts(MaxFrame, MaxMsg) ->
         ws_max_frame_size => MaxFrame,
         ws_max_message_size => MaxMsg,
         ws_buffer => undefined,
+        ws_hibernate_after => infinity,
         handler_spawn_opts => [{fullsweep_after, 0}],
         handler_start_timeout => infinity
     }.

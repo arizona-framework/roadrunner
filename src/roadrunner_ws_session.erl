@@ -33,19 +33,27 @@
 %% continuation can take effect. Without active mode we'd be blocked
 %% inside `roadrunner_transport:recv/3` and hibernation would be a no-op.
 %%
-%% ## Handler hibernation opt-in
+%% ## Session hibernation
 %%
-%% The `roadrunner_ws_handler` callback supports an optional 4-tuple
-%% return shape: `{reply, OutFrames, NewState, Opts}` and
-%% `{ok, NewState, Opts}`, where `Opts` is a list that may contain
-%% `hibernate`. When present, the process hibernates after this
-%% event is fully processed — process heap drops to ~1KB until the
-%% next inbound frame wakes it up. For an idle WebSocket session
-%% this is the difference between holding ~5–8KB of process memory
-%% indefinitely vs. ~1KB.
+%% Two complementary ways for an idle session's heap to drop to ~1KB
+%% until the next inbound event wakes it — for an idle WebSocket
+%% session this is the difference between holding ~5–8KB of process
+%% memory indefinitely vs. ~1KB:
 %%
-%% 3-tuple returns (`{reply, OutFrames, NewState}`, `{ok, NewState}`,
-%% `{close, NewState}`) stay valid — the 4-tuple is purely additive.
+%% - **Handler opt-in, per event.** The `roadrunner_ws_handler`
+%%   callback supports an optional 4-tuple return shape:
+%%   `{reply, OutFrames, NewState, Opts}` and `{ok, NewState, Opts}`,
+%%   where `Opts` is a list that may contain `hibernate`. When
+%%   present, the process hibernates after this event is fully
+%%   processed — for handlers that know "this session just went
+%%   quiet" at the moment they return. 3-tuple returns
+%%   (`{reply, OutFrames, NewState}`, `{ok, NewState}`,
+%%   `{close, NewState}`) stay valid — the 4-tuple is purely additive.
+%% - **Idle timeout, per listener.** The `ws.hibernate_after` opt
+%%   hibernates any session after that many milliseconds of
+%%   `recv_loop` silence — no handler code, and a busy session never
+%%   pays because the next frame arrives before the timer. Off
+%%   (`infinity`) by default.
 %%
 %% ## Optional handler callbacks
 %%
@@ -116,6 +124,11 @@
     %% (`finalize_message/3`). Over either cap closes with 1009.
     max_frame_size :: non_neg_integer(),
     max_message_size :: non_neg_integer(),
+    %% Idle hibernation timeout (from the listener's `ws.hibernate_after`
+    %% opt, set once in `init/1`). `infinity` (the default) makes the
+    %% recv_loop's `after` clause dead by the receive's own semantics —
+    %% the timer never arms, so the default costs nothing per message.
+    hibernate_after :: pos_integer() | infinity,
     msg_size = 0 :: non_neg_integer(),
     %% Trailing UTF-8 bytes carried over from a previous fragment that
     %% form the start of a multi-byte sequence whose continuation
@@ -305,7 +318,8 @@ init_session(Parent, {Socket, Mod, State, Ctx, Negotiated, Buffered, ProtoOpts})
             {PmdParams, InflateZ, DeflateZ} = init_pmd(Negotiated),
             #{
                 ws_max_frame_size := MaxFrame,
-                ws_max_message_size := MaxMsg
+                ws_max_message_size := MaxMsg,
+                ws_hibernate_after := HibernateAfter
             } = ProtoOpts,
             Data = #data{
                 socket = Socket,
@@ -321,6 +335,7 @@ init_session(Parent, {Socket, Mod, State, Ctx, Negotiated, Buffered, ProtoOpts})
                 deflate_z = DeflateZ,
                 max_frame_size = MaxFrame,
                 max_message_size = MaxMsg,
+                hibernate_after = HibernateAfter,
                 msg_acc = undefined,
                 msg_opcode = undefined,
                 msg_compressed = false,
@@ -393,7 +408,7 @@ enter_frame_loop(Data, Hibernate) ->
 %% those clauses loop without re-arming. `_Sock` is discarded — one socket
 %% per session, captured in `#data.socket` at init.
 -spec recv_loop(#data{}) -> no_return().
-recv_loop(#data{socket = Socket} = Data) ->
+recv_loop(#data{socket = Socket, hibernate_after = HibernateAfter} = Data) ->
     {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
     receive
         {system, From, Req} ->
@@ -419,6 +434,13 @@ recv_loop(#data{socket = Socket} = Data) ->
             %% otherwise drop. Mirrors handle_frame's reply / hibernate /
             %% close return shapes.
             handle_info_msg(Other, Data, false)
+    after HibernateAfter ->
+        %% `ws.hibernate_after` idle window elapsed — park until the next
+        %% message. The socket stays armed active-once, so an inbound
+        %% frame (or a forwarded drain, or a handler info message) wakes
+        %% the continuation straight back into this receive. With the
+        %% default `infinity` this clause never fires.
+        erlang:hibernate(?MODULE, recv_loop, [Data])
     end.
 
 %% Release the permessage-deflate zlib contexts (was `terminate/3`) and
