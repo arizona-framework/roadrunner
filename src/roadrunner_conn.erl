@@ -54,6 +54,7 @@
     generate_request_id/1,
     set_request_logger_metadata/1,
     maybe_send_continue/3,
+    expects_continue/1,
     refine_conn_label/2,
     scheme/1,
     make_body_reader/5,
@@ -669,6 +670,15 @@ maybe_send_continue(Socket, Req, Buffered) ->
         false ->
             ok
     end.
+
+%% Whether the request carries `Expect: 100-continue` — exported so
+%% `roadrunner_conn_loop` can flush queued pipelined responses before
+%% the interim 100 goes out (its fire condition mirrors
+%% `maybe_send_continue/3`).
+-doc false.
+-spec expects_continue(roadrunner_req:request()) -> boolean().
+expects_continue(Req) ->
+    has_continue_expectation(Req).
 
 -spec has_continue_expectation(roadrunner_req:request()) -> boolean().
 has_continue_expectation(#{cached_decisions := #{expects_continue := EC}}) ->

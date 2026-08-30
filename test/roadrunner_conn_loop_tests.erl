@@ -919,6 +919,95 @@ two_pipelined_requests_in_one_packet_serve_both_test() ->
     ?assertEqual(3, length(binary:split(Sent, ~"HTTP/1.1 ", [global]))),
     Sink ! stop.
 
+pipelined_responses_coalesce_into_one_send_test() ->
+    %% Three pipelined requests in one delivery: their responses queue
+    %% while the loop spins on `buffered` and reach the wire as ONE
+    %% send when the loop is about to block for the next request — the
+    %% coalescing observable is the send COUNT, not just the bytes.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Req = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, <<Req/binary, Req/binary, Req/binary>>
+    ),
+    Opts = (fake_opts(coalesced))#{
+        dispatch :=
+            {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
+                undefined}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sends = collect_sends(Tag, 200),
+    ?assertEqual(1, length(Sends)),
+    Sent = iolist_to_binary(Sends),
+    ?assertEqual(4, length(binary:split(Sent, ~"HTTP/1.1 200", [global]))),
+    Sink ! stop.
+
+manual_mode_bodyless_pipelined_requests_coalesce_test() ->
+    %% Manual body-buffering builds a body_reader for every request —
+    %% for a bodyless one its framing is `none`, so the pre-drain flush
+    %% is skipped and the pipelined batch stays coalesced: both
+    %% responses in one send.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Req = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    Sink = spawn_active_sink_with_send_log(Self, Tag, <<Req/binary, Req/binary>>),
+    Opts = (fake_opts(manual_coalesced))#{
+        body_buffering := manual,
+        dispatch :=
+            {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
+                undefined}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sends = collect_sends(Tag, 200),
+    ?assertEqual(1, length(Sends)),
+    Sent = iolist_to_binary(Sends),
+    ?assertEqual(3, length(binary:split(Sent, ~"HTTP/1.1 200", [global]))),
+    Sink ! stop.
+
+pipelined_response_precedes_error_for_malformed_followup_test() ->
+    %% A valid request pipelined ahead of garbage: the queued 200 must
+    %% flush BEFORE the 400 hits the wire, so the client attributes
+    %% each response to the right request.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self,
+        Tag,
+        ~"GET / HTTP/1.1\r\nHost: x\r\n\r\nNOT-A-VALID-REQUEST-LINE\r\n\r\n"
+    ),
+    Opts = (fake_opts(coalesce_order))#{
+        dispatch :=
+            {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
+                undefined}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    {Pos200, _} = binary:match(Sent, ~"HTTP/1.1 200"),
+    {Pos400, _} = binary:match(Sent, ~"HTTP/1.1 400"),
+    ?assert(Pos200 < Pos400),
+    Sink ! stop.
+
 keep_alive_max_cap_closes_after_max_test() ->
     %% `max_keep_alive_requests := 1` — the single served request hits
     %% the cap and the conn closes (no second iteration even though
@@ -1487,6 +1576,54 @@ websocket_conn_hibernates_forwards_drain_and_closes_test() ->
     ?assertNotEqual(nomatch, binary:match(Sent, ~"101")),
     %% Close-frame reply: opcode byte 0x88.
     ?assertNotEqual(nomatch, binary:match(Sent, <<16#88>>)),
+    Sink ! stop.
+
+pipelined_response_flushes_once_before_ws_upgrade_test() ->
+    %% A GET pipelined ahead of a WS upgrade: the queued 200 must reach
+    %% the wire exactly once, BEFORE the 101 — and never again from a
+    %% stale accumulator when the conn finishes after the session.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_ws_sink(Self, Tag, <<
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /ws HTTP/1.1\r\n"
+        "Host: x\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    >>),
+    Compiled = roadrunner_router:compile(
+        [
+            {~"/", roadrunner_keepalive_handler, undefined},
+            {~"/ws", roadrunner_ws_upgrade_handler, undefined}
+        ],
+        []
+    ),
+    persistent_term:put({roadrunner_routes, ws_after_pipe}, Compiled),
+    Opts = (fake_opts(ws_after_pipe))#{
+        dispatch := {router, ws_after_pipe}
+    },
+    {ok, ConnPid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    ConnRef = monitor(process, ConnPid),
+    ConnPid ! shoot,
+    SessPid =
+        receive
+            {Tag, ws_armed, P} -> P
+        after 2000 -> error(no_session_arm)
+        end,
+    SessPid ! {roadrunner_fake_data, undefined, masked_close_frame()},
+    receive
+        {'DOWN', ConnRef, process, ConnPid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    %% Exactly one 200, before the 101.
+    ?assertEqual(2, length(binary:split(Sent, ~"HTTP/1.1 200", [global]))),
+    {Pos200, _} = binary:match(Sent, ~"HTTP/1.1 200"),
+    {Pos101, _} = binary:match(Sent, ~"HTTP/1.1 101"),
+    ?assert(Pos200 < Pos101),
     Sink ! stop.
 
 websocket_dispatch_invokes_session_run_test() ->
