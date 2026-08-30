@@ -105,6 +105,9 @@
     %% inet `buffer` applied to the socket on WebSocket upgrade;
     %% `undefined` inherits the listener socket's 64 KB.
     ws_buffer := pos_integer() | undefined,
+    %% Idle ms after which a WebSocket session hibernates; `infinity`
+    %% (the default) never hibernates on idle.
+    ws_hibernate_after := pos_integer() | infinity,
     request_timeout := non_neg_integer(),
     keep_alive_timeout := non_neg_integer(),
     max_keep_alive_requests := pos_integer(),

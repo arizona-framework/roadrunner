@@ -1559,6 +1559,7 @@ fake_opts(ListenerName) ->
         ws_max_frame_size => 10485760,
         ws_max_message_size => 10485760,
         ws_buffer => undefined,
+        ws_hibernate_after => infinity,
         request_timeout => 5000,
         keep_alive_timeout => 5000,
         max_keep_alive_requests => 100,
