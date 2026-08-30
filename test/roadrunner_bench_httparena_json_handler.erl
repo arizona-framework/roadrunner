@@ -72,13 +72,27 @@ qs_int(Key, Req, Default) ->
         _ -> Default
     end.
 
-bin_int(<<>>, Default) ->
-    Default;
+%% Parse the leading (optionally signed) digits — the shape
+%% `string:to_integer/1` accepted — without the unicode list
+%% round-trip the string module pays per call. Mirrors the HttpArena
+%% adapter's parser so bench profiles reflect what the adapter runs.
+bin_int(<<$-, Rest/binary>>, Default) ->
+    case leading_digits(Rest, 0, false) of
+        {ok, N} -> -N;
+        error -> Default
+    end;
 bin_int(Bin, Default) ->
-    case string:to_integer(Bin) of
-        {N, _} when is_integer(N) -> N;
-        _ -> Default
+    case leading_digits(Bin, 0, false) of
+        {ok, N} -> N;
+        error -> Default
     end.
+
+leading_digits(<<D, Rest/binary>>, Acc, _Any) when D >= $0, D =< $9 ->
+    leading_digits(Rest, Acc * 10 + (D - $0), true);
+leading_digits(_Rest, _Acc, false) ->
+    error;
+leading_digits(_Rest, Acc, true) ->
+    {ok, Acc}.
 
 -spec init_dataset() -> ok.
 init_dataset() ->
