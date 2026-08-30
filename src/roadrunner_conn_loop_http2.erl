@@ -149,6 +149,12 @@
 
 -type stream_entry() :: #{
     state := stream_state(),
+    %% Whether this stream still counts toward the advertised
+    %% `max_concurrent_streams` (RFC 9113 §5.1.2: open and half-closed
+    %% streams count; a fully closed one does not). Cleared exactly once —
+    %% either when both sides have ended or on teardown — while the map
+    %% entry itself lives until the worker's DOWN for state cleanup.
+    counted := boolean(),
     %% Field block fragments (the HEADERS frame plus any CONTINUATIONs):
     %% a bare binary for a single frame, an iolist once CONTINUATIONs
     %% append, flattened once at finalize (like `body` accumulates DATA).
@@ -213,6 +219,14 @@
     %% Max concurrent client-initiated streams: advertised in our SETTINGS
     %% and enforced in `on_headers/5`. Read from proto_opts at `enter/6`.
     max_concurrent_streams = ?MAX_CONCURRENT_STREAMS :: pos_integer(),
+    %% Streams currently counting toward `max_concurrent_streams` — the
+    %% entries whose `counted` flag is still set. Tracked separately from
+    %% `map_size(streams)` because an entry outlives its RFC stream: it is
+    %% kept until the worker's DOWN for cleanup, and admission must not
+    %% charge a stream whose response already ended on the wire (a compliant
+    %% client that refills the moment it sees our END_STREAM would otherwise
+    %% race that DOWN and eat a spurious REFUSED_STREAM).
+    live_streams = 0 :: non_neg_integer(),
     %% Cumulative HEADERS+CONTINUATION block cap (CONTINUATION-flood guard).
     %% Read from proto_opts at `enter/6`.
     max_header_block = ?MAX_HEADER_BLOCK :: pos_integer(),
@@ -766,9 +780,9 @@ on_headers(
     _Flags,
     _Priority,
     _Fragment,
-    #loop{streams = Streams, max_concurrent_streams = MaxStreams} = State
+    #loop{live_streams = Live, max_concurrent_streams = MaxStreams} = State
 ) when
-    map_size(Streams) >= MaxStreams
+    Live >= MaxStreams
 ->
     %% Over the advertised concurrency limit — refuse the stream.
     _ = send_rst_stream(State, StreamId, refused_stream),
@@ -785,6 +799,7 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
     ),
     State1 = State#loop{
         streams = (State#loop.streams)#{StreamId => Stream},
+        live_streams = State#loop.live_streams + 1,
         last_stream_id = StreamId,
         awaiting_continuation =
             if
@@ -800,6 +815,7 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
 new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow) ->
     #{
         state => open,
+        counted => true,
         header_fragment => Fragment,
         header_len => byte_size(Fragment),
         end_headers => EndHeaders,
@@ -1410,10 +1426,26 @@ encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
     close_stream_send_side(State1, StreamId).
 
 %% Mark the send side closed. Future worker writes on this stream
-%% get `{h2_stream_reset, _}` so they unwind cleanly.
+%% get `{h2_stream_reset, _}` so they unwind cleanly. Every path that
+%% puts the response's final END_STREAM on the wire funnels through
+%% here, so this is also where the stream stops counting toward the
+%% advertised concurrency limit: with the peer's END_STREAM already
+%% seen, the stream is closed on both sides (RFC 9113 §5.1.2), and a
+%% compliant client may open a replacement the instant it reads our
+%% END_STREAM — before the worker's DOWN retires the map entry. If the
+%% peer is still sending (no END_STREAM yet), the stream is
+%% half-closed(local), keeps counting, and is uncounted on teardown.
 close_stream_send_side(#loop{streams = Streams} = State, StreamId) ->
     #{StreamId := Stream} = Streams,
-    State#loop{streams = Streams#{StreamId := Stream#{state := closed}}}.
+    case Stream of
+        #{end_stream_seen := true, counted := true} ->
+            State#loop{
+                streams = Streams#{StreamId := Stream#{state := closed, counted := false}},
+                live_streams = State#loop.live_streams - 1
+            };
+        _ ->
+            State#loop{streams = Streams#{StreamId := Stream#{state := closed}}}
+    end.
 
 %% =============================================================================
 %% DATA send + flow control
@@ -1584,10 +1616,27 @@ drain_pending(State, StreamId, #{pending_sends := Pending} = Stream) ->
 update_stream(#loop{streams = Streams} = State, StreamId, Stream) ->
     State#loop{streams = Streams#{StreamId := Stream}}.
 
+%% Release the stream's concurrency-limit slot if it still holds one.
+%% Idempotent via the `counted` flag; called by every teardown path so
+%% a stream that never reached `close_stream_send_side/2` with both
+%% sides ended (peer RST, worker crash, early response) cannot leak a
+%% slot when its map entry is dropped.
+uncount_stream(#loop{streams = Streams, live_streams = Live} = State, StreamId) ->
+    case Streams of
+        #{StreamId := #{counted := true} = Stream} ->
+            State#loop{
+                streams = Streams#{StreamId := Stream#{counted := false}},
+                live_streams = Live - 1
+            };
+        #{} ->
+            State
+    end.
+
 %% Peer sent RST_STREAM for a stream we have alive. Tell the worker
 %% (if any) to bail, then drop our stream entry. Pending sends get
 %% reset notifications so workers waiting on `h2_send_ack` unwind.
-reset_stream(#loop{streams = Streams, worker_refs = Refs} = State, StreamId) ->
+reset_stream(State0, StreamId) ->
+    #loop{streams = Streams, worker_refs = Refs} = State = uncount_stream(State0, StreamId),
     #{
         StreamId := #{
             pending_sends := Pending,
@@ -1620,7 +1669,8 @@ reset_stream(#loop{streams = Streams, worker_refs = Refs} = State, StreamId) ->
 
 %% Called by `handle_worker_down/3` when a worker dies abnormally.
 %% Send RST_STREAM(error_code) to the peer and drop our state.
-abort_stream(#loop{streams = Streams} = State, StreamId, ErrorCode) ->
+abort_stream(State0, StreamId, ErrorCode) ->
+    #loop{streams = Streams} = State = uncount_stream(State0, StreamId),
     #{StreamId := #{pending_sends := Pending}} = Streams,
     notify_pending_reset(StreamId, Pending),
     _ = send_rst_stream(State, StreamId, ErrorCode),
@@ -1628,7 +1678,8 @@ abort_stream(#loop{streams = Streams} = State, StreamId, ErrorCode) ->
 
 %% Worker exited normally (handler done, all frames already on the
 %% wire). Just drop state.
-remove_stream(#loop{streams = Streams} = State, StreamId) ->
+remove_stream(State0, StreamId) ->
+    #loop{streams = Streams} = State = uncount_stream(State0, StreamId),
     State#loop{streams = maps:remove(StreamId, Streams)}.
 
 notify_pending_reset(StreamId, Pending) ->

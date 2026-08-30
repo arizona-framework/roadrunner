@@ -93,6 +93,8 @@ all_test_() ->
         fun over_max_concurrent_streams_refused/0,
         fun over_inflight_ceiling_refused_and_throttled/0,
         fun reset_stream_releases_inflight_slot/0,
+        fun stream_slot_freed_when_response_ends_before_worker_down/0,
+        fun peer_rst_frees_stream_slot/0,
         fun rst_during_stream_response_unwinds_worker/0,
         fun drain_with_no_streams_exits_immediately/0,
         fun drain_refuses_new_streams/0,
@@ -2136,6 +2138,102 @@ reset_stream_releases_inflight_slot() ->
         serve_recv(ConnPid, complete_get_headers(3, ~"/empty")),
         _ = drain_send(100),
         ?assertEqual(0, atomics:get(Throttled, 1))
+    after
+        cleanup(Pid, Ref)
+    end.
+
+stream_slot_freed_when_response_ends_before_worker_down() ->
+    %% With an advertised limit of 1, a compliant client may open a new
+    %% stream the instant it reads our response's END_STREAM — before the
+    %% worker's DOWN retires the stream entry (RFC 9113 §5.1.2: a stream
+    %% closed on both sides no longer counts). The slot must free on the
+    %% END_STREAM write itself, so park the worker after its final chunk
+    %% (no DOWN can exist yet) and require the next stream to be admitted.
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{
+        http2_max_concurrent_streams => 1,
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined}
+    }),
+    try
+        _ = expect_send(),
+        serve_recv(ConnPid, ?PREFACE),
+        serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        serve_recv(ConnPid, complete_get_headers(1, ~"/stream/fin-then-park")),
+        %% The worker registers only after `Send(_, fin)` returned, i.e.
+        %% after the conn loop put stream 1's END_STREAM on the wire.
+        _ = wait_for_register(roadrunner_h2_fin_park_test, 1000),
+        %% Stream 1's response is exactly two sends: HEADERS, DATA(fin).
+        _ = expect_send(),
+        {ok, {data, 1, 16#01, ~"done", _}, <<>>} =
+            roadrunner_http2_frame:parse(expect_send(), 16384),
+        %% Worker 1 is still alive holding its stream's map entry; the
+        %% follow-up stream must be served, not refused.
+        serve_recv(ConnPid, complete_get_headers(3, ~"/empty")),
+        Resp = expect_send(),
+        ?assertMatch(
+            {ok, {headers, 3, _, _, _}, _},
+            roadrunner_http2_frame:parse(Resp, 16384)
+        )
+    after
+        case whereis(roadrunner_h2_fin_park_test) of
+            undefined -> ok;
+            Parked -> Parked ! stop
+        end,
+        cleanup(Pid, Ref)
+    end.
+
+peer_rst_frees_stream_slot() ->
+    %% A peer RST of a stream that still counts toward the advertised
+    %% limit must release its slot, or the live-stream count leaks and
+    %% later streams are wrongly refused.
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{
+        http2_max_concurrent_streams => 1,
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined}
+    }),
+    try
+        _ = expect_send(),
+        serve_recv(ConnPid, ?PREFACE),
+        serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        %% Stream 1: HEADERS without END_STREAM — open and counted, no
+        %% worker dispatched yet.
+        HpackBin = encode_post_root_headers(),
+        serve_recv(
+            ConnPid,
+            iolist_to_binary(
+                roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+            )
+        ),
+        %% Limit reached: stream 3 is refused.
+        serve_recv(
+            ConnPid,
+            iolist_to_binary(
+                roadrunner_http2_frame:encode({headers, 3, 16#04, undefined, HpackBin})
+            )
+        ),
+        Rst = expect_send(),
+        ?assertMatch(
+            {ok, {rst_stream, 3, refused_stream}, _},
+            roadrunner_http2_frame:parse(Rst, 16384)
+        ),
+        %% Peer cancels stream 1 — its slot must free.
+        serve_recv(
+            ConnPid,
+            iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel}))
+        ),
+        %% Stream 5 is admitted and served.
+        serve_recv(ConnPid, complete_get_headers(5, ~"/empty")),
+        Resp = expect_send(),
+        ?assertMatch(
+            {ok, {headers, 5, _, _, _}, _},
+            roadrunner_http2_frame:parse(Resp, 16384)
+        )
     after
         cleanup(Pid, Ref)
     end.
