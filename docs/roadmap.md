@@ -40,6 +40,37 @@ Autobahn re-run.
 
 **Source:** Arizona handoff R-h2-1.
 
+## HTTP/2 stream admission follow-ups
+
+### Pre-SETTINGS stream leniency — medium effort
+
+**What:** Do not refuse streams a client opened before it could have
+seen our advertised `max_concurrent_streams`. With prior-knowledge h2c
+a client sends its preface and a burst of HEADERS in the same flight;
+until our SETTINGS completes the round trip, RFC 9113 §5.1.2 binds the
+client only to a limit it has received, so the burst is compliant.
+Refusing the excess sheds real requests at every connection setup when
+the client's default concurrency exceeds our advertised value.
+
+**Design question:** admit up to the protocol default (100) until the
+client's SETTINGS ack arrives, or queue the excess and admit as slots
+free. Queueing composes with the entry below.
+
+**Scope:** medium — admission bookkeeping in the h2 conn loop plus
+tests for the ack-timing windows.
+
+### Queue mode for `max_concurrent_requests` — medium effort
+
+**What:** An opt-in mode where a stream over the listener-wide
+in-flight ceiling waits for a free slot instead of being refused with
+`REFUSED_STREAM` / `H3_REQUEST_REJECTED`. Bounds live handler
+processes (and their memory) with no shed requests: latency rises
+under overload instead of the error rate. A client that does not
+retry refusals sees today's refusal mode as hard failures.
+
+**Scope:** medium — a wait queue in the conn loops for both
+multiplexed protocols, flow-control interaction, drain/timeout rules.
+
 ## HTTP/3 follow-ups
 
 h3 shipped experimentally (`protocols => [http3]`, QPACK static-table

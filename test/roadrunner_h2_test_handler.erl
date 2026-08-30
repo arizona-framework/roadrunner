@@ -51,6 +51,27 @@ handle(#{target := ~"/stream/multiframe"} = Req) ->
         end},
         Req
     };
+handle(#{target := ~"/stream/fin-then-park"} = Req) ->
+    %% Finish the response on the wire, then keep the worker alive: by the
+    %% time `Send(_, fin)` returns, the conn loop has written END_STREAM,
+    %% but no `DOWN` exists yet. Lets a test prove the concurrency slot
+    %% frees on END_STREAM, not on the worker's exit. Unregister first in
+    %% case a prior failed test leaked the name (see the `/loop` clause).
+    try
+        unregister(roadrunner_h2_fin_park_test)
+    catch
+        _:_ -> ok
+    end,
+    {
+        {stream, 200, [], fun(Send) ->
+            Send(~"done", fin),
+            true = register(roadrunner_h2_fin_park_test, self()),
+            receive
+                stop -> ok
+            end
+        end},
+        Req
+    };
 handle(#{target := ~"/stream/empty"} = Req) ->
     {{stream, 200, [], fun(_Send) -> ok end}, Req};
 handle(#{target := ~"/stream/empty-fin"} = Req) ->
