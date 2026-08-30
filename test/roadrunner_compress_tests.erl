@@ -84,6 +84,37 @@ higher_qvalue_wins_when_gzip_lower_test() ->
     ?assertEqual(~"deflate", header(~"content-encoding", Headers)),
     ?assertEqual(iolist_to_binary(Body), zlib:uncompress(iolist_to_binary(OutBody))).
 
+qvalue_grammar_edges_test() ->
+    %% RFC 9110 §12.4.2 grammar edges through the negotiation: every
+    %% arm of the binary qvalue parser, including the malformed
+    %% fallbacks (which default to 1.0, the no-q default).
+    Body = big_body(),
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    Winner = fun(AE) ->
+        {{200, Headers, _}, _} =
+            roadrunner_compress:call(req([{~"accept-encoding", AE}]), Next, undefined),
+        header(~"content-encoding", Headers)
+    end,
+    %% `1.` / `1.00` / `1.000` are exactly 1.0 — beat a 0.9.
+    ?assertEqual(~"gzip", Winner(~"gzip;q=1., deflate;q=0.9")),
+    ?assertEqual(~"gzip", Winner(~"gzip;q=1.0, deflate;q=0.9")),
+    ?assertEqual(~"gzip", Winner(~"gzip;q=1.00, deflate;q=0.9")),
+    ?assertEqual(~"gzip", Winner(~"gzip;q=1.000, deflate;q=0.9")),
+    %% Two- and three-digit fractions order correctly.
+    ?assertEqual(~"deflate", Winner(~"gzip;q=0.85, deflate;q=0.9")),
+    ?assertEqual(~"gzip", Winner(~"gzip;q=0.125, deflate;q=0.1")),
+    %% `0.` is an explicit refusal, same as `0`.
+    ?assertEqual(undefined, Winner(~"gzip;q=0.")),
+    %% Malformed values fall back to the default 1.0: a garbage
+    %% suffix, a fraction after `1.` that isn't zeros, out-of-grammar
+    %% integers, and non-digit fractions.
+    ?assertEqual(~"gzip", Winner(~"gzip;q=0.8x, deflate;q=0.9")),
+    ?assertEqual(~"gzip", Winner(~"gzip;q=1.5, deflate;q=0.9")),
+    ?assertEqual(~"gzip", Winner(~"gzip;q=2, deflate;q=0.9")),
+    ?assertEqual(~"gzip", Winner(~"gzip;q=0.x9, deflate;q=0.9")),
+    ?assertEqual(~"gzip", Winner(~"gzip;q=0.9!!, deflate;q=0.9")),
+    ?assertEqual(~"gzip", Winner(~"gzip;q=0.12!, deflate;q=0.9")).
+
 equal_qvalues_tie_break_to_gzip_test() ->
     Req = req([{~"accept-encoding", ~"gzip;q=0.5, deflate;q=0.5"}]),
     Body = big_body(),
