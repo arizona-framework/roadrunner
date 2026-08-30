@@ -140,6 +140,25 @@ listener_honors_ip_opt_test() ->
     ok = gen_tcp:close(Sock),
     ok = roadrunner_listener:stop(Name).
 
+listener_honors_recv_buffer_opt_test() ->
+    %% A custom `recv_buffer` must flow into `gen_tcp:listen` as the socket
+    %% `buffer` (the default path is exercised by every other listener test).
+    %% Bind with an explicit buffer and serve one request through the socket
+    %% to prove the listen option was accepted, not just stored.
+    Name = listener_test_recv_buffer,
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        recv_buffer => 16384,
+        routes => roadrunner_hello_handler
+    }),
+    Port = roadrunner_listener:port(Name),
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+    {ok, Reply} = gen_tcp:recv(Sock, 0, 1000),
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+    ok = gen_tcp:close(Sock),
+    ok = roadrunner_listener:stop(Name).
+
 %% =============================================================================
 %% notify_drain/2 (soft drain — broadcast without stopping the listener)
 %% =============================================================================
@@ -580,13 +599,13 @@ listener_rejects_invalid_ws_opt_test() ->
             #{max_frame_size => -1},
             #{max_frame_size => bad},
             not_a_map,
-            %% `buffer` is an inet buffer size and `hibernate_after` an
+            %% `recv_buffer` is an inet buffer size and `hibernate_after` an
             %% idle interval — zero, negative, non-integer, and
             %% over-range all reject.
-            #{buffer => 0},
-            #{buffer => -1},
-            #{buffer => bad},
-            #{buffer => 16#80000000},
+            #{recv_buffer => 0},
+            #{recv_buffer => -1},
+            #{recv_buffer => bad},
+            #{recv_buffer => 16#80000000},
             #{hibernate_after => 0},
             #{hibernate_after => -1},
             #{hibernate_after => bad},
@@ -595,16 +614,33 @@ listener_rejects_invalid_ws_opt_test() ->
     ).
 
 listener_accepts_ws_session_opts_test() ->
-    %% Valid `ws.buffer` / `ws.hibernate_after` pass validation and the
+    %% Valid `ws.recv_buffer` / `ws.hibernate_after` pass validation and the
     %% listener starts; the session-side application of each is covered
     %% in `roadrunner_ws_session_tests`.
     {ok, Pid} = roadrunner_listener:start_link(listener_test_ws_session_opts_ok, #{
         port => 0,
-        ws => #{buffer => 2048, hibernate_after => 15000},
+        ws => #{recv_buffer => 2048, hibernate_after => 15000},
         routes => roadrunner_hello_handler
     }),
     ?assert(is_process_alive(Pid)),
     ok = roadrunner_listener:stop(listener_test_ws_session_opts_ok).
+
+listener_rejects_invalid_recv_buffer_test() ->
+    %% `recv_buffer` is an inet buffer size — zero, negative,
+    %% non-integer, and over-range reject at `init/1` instead of
+    %% surfacing as an opaque `{listen_failed, _}` from `gen_tcp:listen`.
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(listener_test_recv_buffer_invalid, #{
+                port => 0,
+                recv_buffer => Bad,
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, recv_buffer, _}, _Stack}}, R)
+        end,
+        [0, -1, bad, 16#80000000]
+    ).
 
 listener_rejects_invalid_handler_spawn_test() ->
     %% `handler_spawn` must be a map; `opts` a list that does not carry the

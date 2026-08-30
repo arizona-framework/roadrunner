@@ -104,7 +104,8 @@
     ws_max_frame_size := non_neg_integer(),
     ws_max_message_size := non_neg_integer(),
     %% inet `buffer` applied to the socket on WebSocket upgrade;
-    %% `undefined` inherits the listener socket's 64 KB.
+    %% `undefined` inherits the listener socket's `recv_buffer`
+    %% (64 KB default).
     ws_buffer := pos_integer() | undefined,
     %% Idle ms after which a WebSocket session hibernates; `infinity`
     %% (the default) never hibernates on idle.

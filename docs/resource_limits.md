@@ -108,7 +108,8 @@ so there is no dynamic-table memory to bound yet.
 | Limit | Default | Configurable | Purpose |
 |---|---|---|---|
 | `socket_backlog` | 1024 | yes | TCP listen backlog (kernel SYN/accept queue depth) |
-| `max_clients` | 150 | yes | concurrent connection cap per listener |
+| `recv_buffer` | 64 KB | yes | per-connection inbound TCP buffer (body-path throughput vs memory at scale) |
+| `max_clients` | 16384 | yes | concurrent connection cap per listener |
 | `max_concurrent_requests` | `infinity` | yes | concurrent in-flight request cap per listener (HTTP/2 and HTTP/3) |
 | `request_timeout` | 30 s | yes | header-read timeout on a fresh connection |
 | `keep_alive_timeout` | 60 s | yes | idle timeout between requests |
@@ -116,11 +117,21 @@ so there is no dynamic-table memory to bound yet.
 | `min_bytes_per_second` | 100 | yes (0 disables) | slow-loris guard on the request-read phase |
 | `rate_limit` | off | opt-in | per-peer request-rate cap (`429` + `Retry-After`) |
 
+`max_clients`'s effective cap is `min(max_clients, the OS file-descriptor
+limit)`. With the 16384 default above a stock `ulimit -n` of 1024, the
+acceptors hit `emfile` at the descriptor ceiling — each emits
+`[roadrunner, listener, accept_error]` and keeps accepting after a short
+back-off rather than going silent — so raise `ulimit -n` (and the systemd
+`LimitNOFILE`) for high concurrency. Saturation recv-buffer memory scales
+as `max_clients × recv_buffer`, so lower either for a tighter bound.
+
 `max_clients` bounds connections and the HTTP/2 / HTTP/3
 `max_concurrent_streams` bounds streams per connection, but their product
 (the worst-case number of concurrent handler processes) is otherwise
-unbounded. A high `max_clients`, set for burst tolerance, can let
-concurrent handler memory grow without limit under heavy multiplexing.
+unbounded. At the defaults that product (`16384 × 100` ≈ 1.6M) exceeds the
+BEAM process limit (`+P`, default 262144), so under heavy multiplexing it
+can exhaust the VM-global process table — failing spawns everywhere, not
+just this listener — on top of unbounded handler memory.
 `max_concurrent_requests` caps that product directly: a listener-wide
 ceiling on live handler processes for the multiplexed protocols. Over the
 ceiling, a new HTTP/2 or HTTP/3 stream is refused with `REFUSED_STREAM` /

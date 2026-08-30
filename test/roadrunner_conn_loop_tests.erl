@@ -1752,7 +1752,7 @@ ws_sink_loop(Logger, Tag, UpgradeBytes, Delivered) ->
             ConnPid ! {roadrunner_fake_recv_reply, {ok, UpgradeBytes}},
             ws_sink_loop(Logger, Tag, UpgradeBytes, true);
         {roadrunner_fake_setopts, ArmingPid, Opts} ->
-            %% Only report active-once arms — the session's `ws.buffer`
+            %% Only report active-once arms — the session's `ws.recv_buffer`
             %% setopts (when configured) would otherwise be mistaken for
             %% an arm.
             case lists:member({active, once}, Opts) of

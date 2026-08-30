@@ -46,7 +46,7 @@ start_with_bad_handshake_still_returns_400_test() ->
     ?assertEqual(nomatch, binary:match(Sent, ~"101")).
 
 ws_buffer_opt_applied_before_101_test() ->
-    %% `ws.buffer` set: the session must resize the socket's inet
+    %% `ws.recv_buffer` set: the session must resize the socket's inet
     %% `buffer` while the conn still owns the socket — i.e. the setopts
     %% must land BEFORE the 101 goes out. The events sink logs setopts
     %% and sends into one ordered stream; a seeded close frame ends the
@@ -2536,7 +2536,7 @@ spawn_send_log_sink(Logger, Tag) ->
 
 %% Events sink: like the send-log sink, but logs `setopts` calls too,
 %% into the same ordered stream — for tests that assert on the ORDER
-%% of socket operations (e.g. `ws.buffer` applied before the 101).
+%% of socket operations (e.g. `ws.recv_buffer` applied before the 101).
 spawn_events_sink(Logger, Tag) ->
     spawn(fun() -> events_sink_loop(Logger, Tag) end).
 
