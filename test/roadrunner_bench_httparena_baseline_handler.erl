@@ -27,11 +27,28 @@ handle(Req) ->
 
 qs_int(Key, Req, Default) ->
     case lists:keyfind(Key, 1, roadrunner_req:parse_qs(Req)) of
-        {Key, V} when is_binary(V) ->
-            case string:to_integer(V) of
-                {N, _} when is_integer(N) -> N;
-                _ -> Default
-            end;
-        _ ->
-            Default
+        {Key, V} when is_binary(V) -> bin_int(V, Default);
+        _ -> Default
     end.
+
+%% Parse the leading (optionally signed) digits — the shape
+%% `string:to_integer/1` accepted — without the unicode list
+%% round-trip the string module pays per call. Mirrors the HttpArena
+%% adapter's parser so bench profiles reflect what the adapter runs.
+bin_int(<<$-, Rest/binary>>, Default) ->
+    case leading_digits(Rest, 0, false) of
+        {ok, N} -> -N;
+        error -> Default
+    end;
+bin_int(Bin, Default) ->
+    case leading_digits(Bin, 0, false) of
+        {ok, N} -> N;
+        error -> Default
+    end.
+
+leading_digits(<<D, Rest/binary>>, Acc, _Any) when D >= $0, D =< $9 ->
+    leading_digits(Rest, Acc * 10 + (D - $0), true);
+leading_digits(_Rest, _Acc, false) ->
+    error;
+leading_digits(_Rest, Acc, true) ->
+    {ok, Acc}.
