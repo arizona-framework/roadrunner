@@ -42,7 +42,7 @@
 -export([
     listen/2,
     listen_tls/2,
-    accept/1,
+    accept/2,
     controlling_process/2,
     recv/3,
     send/2,
@@ -81,7 +81,7 @@ the `ssl` application is started (typically `application:ensure_all_started(ssl)
 
 `Opts` is the list passed to `ssl:listen/2` — `cert`, `key`/`keyfile`,
 `cacerts`, etc. Performs the TCP listen + TLS context bind in one call;
-each `accept/1` then runs the per-connection handshake.
+each `accept/2` then runs the per-connection handshake.
 """.
 -spec listen_tls(inet:port_number(), [ssl:tls_server_option() | gen_tcp:listen_option()]) ->
     {ok, socket()} | {error, term()}.
@@ -93,29 +93,46 @@ listen_tls(Port, Opts) ->
 
 -doc """
 Accept the next pending connection. For TLS, runs the handshake before
-returning.
+returning, bounded by `HandshakeTimeout` ms (plain TCP has no
+handshake; the timeout is unused there).
 
 TLS failures are two different events and come back distinguishably:
 a `ssl:transport_accept/1` error is about the LISTEN socket (`closed`
-means the listener is going away), while a failed `ssl:handshake/1` is
-about that one connection — a garbage ClientHello, a TLS alert, or the
-peer disconnecting mid-handshake (which `ssl` also reports as `closed`).
-Handshake failures are wrapped as `{error, {handshake, Reason}}` so an
-acceptor can keep accepting through per-connection noise and reserve
-the bare `{error, closed}` for the listener actually stopping.
+means the listener is going away), while a failed `ssl:handshake/2` is
+about that one connection — a garbage ClientHello, a TLS alert, the
+peer disconnecting mid-handshake (which `ssl` also reports as
+`closed`), or the handshake outrunning the bound (`timeout` — a client
+that connects and never speaks would otherwise park the caller
+forever). Handshake failures are wrapped as
+`{error, {handshake, Reason}}` so an acceptor can keep accepting
+through per-connection noise and reserve the bare `{error, closed}`
+for the listener actually stopping.
 """.
--spec accept(socket()) -> {ok, socket()} | {error, term()}.
-accept({gen_tcp, LSock}) ->
+-spec accept(socket(), timeout()) -> {ok, socket()} | {error, term()}.
+accept({gen_tcp, LSock}, _HandshakeTimeout) ->
     case gen_tcp:accept(LSock) of
         {ok, S} -> {ok, {gen_tcp, S}};
         {error, _} = Err -> Err
     end;
-accept({ssl, LSock}) ->
+accept({ssl, LSock}, HandshakeTimeout) ->
     maybe
         {ok, Pre} ?= ssl:transport_accept(LSock),
-        case ssl:handshake(Pre) of
-            {ok, S} -> {ok, {ssl, S}};
-            {error, HsReason} -> {error, {handshake, HsReason}}
+        case ssl:handshake(Pre, HandshakeTimeout) of
+            {ok, S} ->
+                {ok, {ssl, S}};
+            {error, timeout} ->
+                %% The connection process is still parked mid-handshake
+                %% waiting on the client — close it (measured instant on
+                %% this path) so a silent client can't hold the
+                %% descriptor until it deigns to disconnect.
+                _ = ssl:close(Pre),
+                {error, {handshake, timeout}};
+            {error, HsReason} ->
+                %% `ssl` already tore the connection down on a failed
+                %% handshake; closing again would block for ssl's
+                %% internal close timeout (measured 5 s) on the dead
+                %% connection process.
+                {error, {handshake, HsReason}}
         end
     end.
 
