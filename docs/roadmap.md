@@ -220,9 +220,9 @@ lot of them.
 
 ### Move the TLS handshake out of the acceptor
 
-**What:** `roadrunner_transport:accept/2` for TLS runs the handshake
-inside the acceptor (now bounded by the `tls_handshake_timeout`
-listener opt), so handshake time serializes across the pool, capping
+**What:** the transport's TLS accept runs the handshake inside the
+acceptor (now bounded by the `tls_handshake_timeout` listener opt), so
+handshake time serializes across the pool, capping
 TLS connection-establishment throughput at
 `num_acceptors / handshake_time`. The fix is `ssl:transport_accept`
 in the acceptor with the handshake after the handoff, so a slow
