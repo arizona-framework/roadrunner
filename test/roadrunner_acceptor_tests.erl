@@ -146,6 +146,70 @@ acceptor_retries_on_transient_accept_error_test() ->
     ok = telemetry:detach(HandlerId),
     ok = gen_tcp:close(LSock).
 
+accept_error_class_test() ->
+    %% Per-connection failures retry immediately; resource exhaustion
+    %% and unknowns back off. Exhaustive over the classifier's clauses.
+    ?assertEqual(retry, roadrunner_acceptor:accept_error_class(econnaborted)),
+    ?assertEqual(retry, roadrunner_acceptor:accept_error_class({handshake, closed})),
+    ?assertEqual(
+        retry,
+        roadrunner_acceptor:accept_error_class(
+            {handshake, {tls_alert, {handshake_failure, "reason"}}}
+        )
+    ),
+    ?assertEqual(backoff, roadrunner_acceptor:accept_error_class(emfile)),
+    ?assertEqual(backoff, roadrunner_acceptor:accept_error_class(enfile)),
+    ?assertEqual(backoff, roadrunner_acceptor:accept_error_class(system_limit)),
+    ?assertEqual(backoff, roadrunner_acceptor:accept_error_class(einval)).
+
+acceptor_survives_failed_tls_handshake_test() ->
+    %% A garbage ClientHello on a TLS listener fails `ssl:handshake/1`
+    %% inside `roadrunner_transport:accept/1`. The acceptor must treat
+    %% that as per-connection noise — telemetry with a `{handshake, _}`
+    %% reason, keep accepting — and reserve plain `closed` (the listen
+    %% socket going away) for its clean exit. Before the transport
+    %% tagged handshake errors, a peer disconnecting mid-handshake also
+    %% surfaced as `closed` and silently killed the acceptor.
+    {ok, _} = application:ensure_all_started(ssl),
+    {ok, _} = application:ensure_all_started(telemetry),
+    ServerOpts =
+        roadrunner_test_certs:server_opts() ++
+            [binary, {active, false}, {reuseaddr, true}],
+    {ok, LSock} = roadrunner_transport:listen_tls(0, ServerOpts),
+    {ok, Port} = roadrunner_transport:port(LSock),
+    Self = self(),
+    HandlerId = {?MODULE, make_ref()},
+    ok = telemetry:attach(
+        HandlerId,
+        [roadrunner, listener, accept_error],
+        fun(_Event, _Measure, Meta, _Cfg) -> Self ! {accept_error, Meta} end,
+        undefined
+    ),
+    {ok, Pid} = roadrunner_acceptor:start_link(
+        LSock, #{listener_name => acceptor_test_tls_noise}, 1
+    ),
+    %% Plain-HTTP bytes can't form a TLS hello — the handshake fails.
+    {ok, Noise} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Noise, ~"GET / HTTP/1.1\r\n\r\n"),
+    receive
+        {accept_error, Meta} ->
+            ?assertMatch({handshake, _}, maps:get(reason, Meta))
+    after 5000 ->
+        error(no_handshake_error_telemetry)
+    end,
+    ok = gen_tcp:close(Noise),
+    %% Survived the noise connection.
+    ?assert(is_process_alive(Pid)),
+    %% Closing the listen socket ends the loop cleanly.
+    MRef = erlang:monitor(process, Pid),
+    ok = roadrunner_transport:close(LSock),
+    receive
+        {'DOWN', MRef, process, Pid, normal} -> ok
+    after 2000 ->
+        error(acceptor_did_not_stop)
+    end,
+    ok = telemetry:detach(HandlerId).
+
 %% --- helpers ---
 
 %% Poll until we see a refined `{roadrunner_conn, Name, Peer}` label or run
