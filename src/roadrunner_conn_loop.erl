@@ -130,7 +130,14 @@
     %% Per-peer rate-limit guard resolved from `proto_opts` + peer once at
     %% `shoot` (`undefined` when off — the common case, a single branch in
     %% `dispatch_phase/2`).
-    rate_limit = undefined :: roadrunner_conn:rate_limit_state()
+    rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
+    %% Encoded buffered responses queued while the keep-alive loop spins
+    %% on pipelined requests already sitting in `buffered`, written in
+    %% ONE send by `flush_out/1` the moment the loop is about to touch
+    %% the socket (next-request recv, an interim 100, a body drain, a
+    %% writer-owned response, an error send) or exit. Non-empty only
+    %% between a queued response and that next socket boundary.
+    out = [] :: iodata()
 }).
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
@@ -379,11 +386,16 @@ phase_timeout(#loop_state{phase = keep_alive, keep_alive_timeout = T}) ->
 -define(DRAIN_CHECK_INTERVAL_MS, 100).
 
 -spec recv_request_bytes(#loop_state{}, integer()) -> no_return().
-recv_request_bytes(#loop_state{hibernate_after = Ms} = S, Deadline) when Ms > 0 ->
-    arm_active_once(S),
-    recv_with_hibernate(S, Deadline, Ms);
-recv_request_bytes(S, Deadline) ->
-    recv_passive(S, Deadline).
+recv_request_bytes(S0, Deadline) ->
+    %% About to block on the socket for the next request — everything
+    %% queued during the pipelined drain goes out in one write first.
+    case flush_out(S0) of
+        #loop_state{hibernate_after = Ms} = S when Ms > 0 ->
+            arm_active_once(S),
+            recv_with_hibernate(S, Deadline, Ms);
+        S ->
+            recv_passive(S, Deadline)
+    end.
 
 %% Passive-mode recv path (default — `hibernate_after` unset or 0).
 %% Bypasses `gen_tcp_socket`'s gen_statem dispatch entirely — direct
@@ -595,9 +607,18 @@ handle_request_bytes(
                 listener_name => ListenerName
             },
             ok = roadrunner_conn:set_request_logger_metadata(Req),
+            %% A client gating its body on the interim 100 is WAITING —
+            %% queued pipelined responses must reach it first. Mirrors
+            %% `maybe_send_continue/3`'s own fire condition so the
+            %% pipelined hot path (Rest =/= <<>>) never flushes here.
+            S2 =
+                case Rest =:= ~"" andalso roadrunner_conn:expects_continue(Req) of
+                    true -> flush_out(S);
+                    false -> S
+                end,
             ok = roadrunner_conn:maybe_send_continue(Socket, Req, Rest),
             read_body_phase(
-                S#loop_state{buffered = Rest, req_id_buffer = NewBuffer}, Req, Deadline
+                S2#loop_state{buffered = Rest, req_id_buffer = NewBuffer}, Req, Deadline
             );
         {more, _} ->
             %% Need more bytes to complete the request line/headers.
@@ -621,9 +642,12 @@ handle_request_bytes(
             }),
             %% Size-limit overruns get the RFC-specific status (414 for an
             %% over-long request line, 431 for oversized/too-many headers);
-            %% other malformed input is a generic 400.
+            %% other malformed input is a generic 400. Queued pipelined
+            %% responses go out first so the client attributes the error
+            %% to the right request.
+            S2 = flush_out(S),
             _ = roadrunner_conn:send_status(Socket, roadrunner_conn:parse_error_status(Reason)),
-            exit_normal(S)
+            exit_normal(S2)
     end.
 
 %% --- read_body phase ---
@@ -658,31 +682,35 @@ read_body_phase(
                     %% as pipelined leftover.
                     dispatch_phase(S#loop_state{buffered = Leftover}, Req#{body => Body});
                 {error, content_length_too_large} ->
+                    S2 = flush_out(S),
                     _ = roadrunner_conn:drain_oversized_body(Buffered, Socket, MaxCL),
-                    ok = rejection(S, content_length_too_large),
+                    ok = rejection(S2, content_length_too_large),
                     _ = roadrunner_conn:send_payload_too_large(Socket),
-                    exit_normal(S);
+                    exit_normal(S2);
                 {error, request_timeout} ->
+                    S2 = flush_out(S),
                     _ = roadrunner_conn:send_request_timeout(Socket),
-                    exit_normal(S);
+                    exit_normal(S2);
                 {error, slow_client} ->
                     exit_normal(S);
                 {error, BodyReason} ->
-                    ok = rejection(S, BodyReason),
+                    S2 = flush_out(S),
+                    ok = rejection(S2, BodyReason),
                     %% A chunked body's trailer block obeys the same header
                     %% limits as request headers, so an oversized/too-many
                     %% trailer reason maps to 431 the same way.
                     _ = roadrunner_conn:send_status(
                         Socket, roadrunner_conn:parse_error_status(BodyReason)
                     ),
-                    exit_normal(S)
+                    exit_normal(S2)
             end;
         manual ->
             case roadrunner_conn:body_framing(Req) of
                 {error, FramingReason} ->
-                    ok = rejection(S, FramingReason),
+                    S2 = flush_out(S),
+                    ok = rejection(S2, FramingReason),
                     _ = roadrunner_conn:send_bad_request(Socket),
-                    exit_normal(S);
+                    exit_normal(S2);
                 Framing ->
                     BodyState = roadrunner_conn:make_body_reader(
                         Framing, Buffered, Recv, MaxCL, TrailerLimits
@@ -708,24 +736,35 @@ dispatch_phase(
     } = S,
     Req
 ) ->
+    %% The rate-limit guard sends its 429 from inside the check — when
+    %% the guard is configured (rare), queued pipelined responses go out
+    %% first so a deny can't overtake them. `undefined` (the common
+    %% case) skips the flush entirely.
+    S1 =
+        case RateLimit of
+            undefined -> S;
+            _ -> flush_out(S)
+        end,
     case rate_limit_allows(RateLimit, Socket, ListenerName) of
         true ->
             case roadrunner_conn:resolve_handler(Dispatch, Req) of
                 {ok, Handler, Bindings, Pipeline, _State} ->
-                    run_pipeline(S, Handler, Req#{bindings => Bindings}, Pipeline);
+                    run_pipeline(S1, Handler, Req#{bindings => Bindings}, Pipeline);
                 {method_not_allowed, Allowed} ->
                     %% Path matched but no route answers this method: 405 +
                     %% Allow before any pipeline runs (the method gate is a
                     %% routing decision, ahead of per-route middleware).
+                    S2 = flush_out(S1),
                     _ = roadrunner_conn:send_method_not_allowed(Socket, Allowed),
-                    exit_normal(S);
+                    exit_normal(S2);
                 not_found ->
+                    S2 = flush_out(S1),
                     _ = roadrunner_conn:send_not_found(Socket),
-                    exit_normal(S)
+                    exit_normal(S2)
             end;
         false ->
             %% Rate exceeded: `rate_limit_allows/4` already sent 429 + close.
-            exit_normal(S)
+            exit_normal(S1)
     end.
 
 %% Per-peer rate-limit gate before handler dispatch. `true` to proceed; `false`
@@ -766,21 +805,21 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
             %% `Connection: close` — see `ensure_close_signaled/3`.
             Response = ensure_close_signaled(S2, Req2, Response0),
             case dispatch_response(S2, Handler, Req2, Response) of
-                {ws_session, MRef, SessPid} ->
+                {ws_session, MRef, SessPid, S3} ->
                     %% A WebSocket session now owns the socket; the conn
                     %% parks in a hibernated wait until it terminates.
                     %% `request_stop` fires from the wake continuation so
                     %% its timing (response writer finished) matches the
                     %% other writer-owned shapes.
-                    ws_session_wait(S2, Req2, Response, MRef, SessPid, ReqStart, Metadata);
-                ok ->
+                    ws_session_wait(S3, Req2, Response, MRef, SessPid, ReqStart, Metadata);
+                #loop_state{} = S3 ->
                     ok = roadrunner_telemetry:request_stop(
                         ReqStart,
                         Metadata,
                         roadrunner_conn:response_status(Response),
                         roadrunner_conn:response_kind(Response)
                     ),
-                    finishing_phase(S2, Req2, Response)
+                    finishing_phase(S3, Req2, Response)
             end
     catch
         Class:Reason:Stack ->
@@ -794,8 +833,9 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
                 reason => Reason,
                 stacktrace => Stack
             }),
+            S9 = flush_out(S),
             _ = roadrunner_conn:send_internal_error(Socket),
-            exit_normal(S)
+            exit_normal(S9)
     end.
 
 %% RFC 9112 §9.6: a server that will not reuse the connection MUST signal it on
@@ -835,62 +875,115 @@ with_close_if_last(
         false -> Headers
     end.
 
+%% Queue an encoded buffered response — or write it now. `buffered`
+%% still holding inbound bytes means at least a fragment of the next
+%% pipelined request is already in hand, so the response can wait for
+%% the batch: it reaches the wire in one `flush_out/1` write at the
+%% next socket boundary, and a pipelined burst pays one send instead
+%% of one per response (the client receives the batch as one segment).
+%% An empty `buffered` sends at dispatch — the same send point as the
+%% immediate-send shape this replaces. The first clause is the
+%% non-pipelined common case and touches NO loop-state (a measured
+%% ~3-4% of single-in-flight throughput was two record copies per
+%% request); the second closes out a burst by flushing the batch with
+%% its last response appended.
+-spec queue_response(#loop_state{}, iodata()) -> #loop_state{}.
+queue_response(#loop_state{buffered = <<>>, out = [], socket = Socket} = S, Resp) ->
+    _ = roadrunner_telemetry:response_send(
+        roadrunner_transport:send(Socket, Resp), buffered_response
+    ),
+    S;
+queue_response(#loop_state{buffered = <<>>, out = Out} = S, Resp) ->
+    flush_out(S#loop_state{out = [Out | Resp]});
+queue_response(#loop_state{out = Out} = S, Resp) ->
+    S#loop_state{out = [Out | Resp]}.
+
+%% Write everything queued since the last flush in ONE send and reset
+%% the accumulator. A send failure funnels through the same
+%% `response_send` failure telemetry the per-response sends used, and
+%% is otherwise discovered on the next socket operation — identical to
+%% the immediate-send shape this replaces.
+-spec flush_out(#loop_state{}) -> #loop_state{}.
+flush_out(#loop_state{out = []} = S) ->
+    S;
+flush_out(#loop_state{socket = Socket, out = Out} = S) ->
+    _ = roadrunner_telemetry:response_send(
+        roadrunner_transport:send(Socket, Out), buffered_response
+    ),
+    S#loop_state{out = []}.
+
 %% Dispatches the 5 response shapes that match the
 %% `roadrunner_handler:result/0` type. Stream / loop /
 %% sendfile / websocket force connection close (the underlying
 %% writers manage their own keep-alive semantics — generally none).
+%% Buffered responses (the 3-tuple shapes) are QUEUED, not sent — see
+%% `queue_response/2`; writer-owned shapes flush the queue first so
+%% wire order matches dispatch order. Returns the updated loop state,
+%% or `{ws_session, _, _}` when a WebSocket session took the socket.
 -spec dispatch_response(
     #loop_state{},
     module(),
     roadrunner_req:request(),
     roadrunner_handler:response()
-) -> ok | {ws_session, reference(), pid()}.
+) -> #loop_state{} | {ws_session, reference(), pid(), #loop_state{}}.
 dispatch_response(
-    #loop_state{socket = Socket, buffered = Buffered, proto_opts = ProtoOpts},
+    #loop_state{socket = Socket, buffered = Buffered, proto_opts = ProtoOpts} = S0,
     _Handler,
     Req,
     {websocket, Mod, State}
 ) when
     is_atom(Mod)
 ->
+    %% Queued pipelined responses must precede the 101 (or the 400/500
+    %% reject) on the wire.
+    S = flush_out(S0),
     %% `start/6` returns right after the 101 + socket handoff; the
     %% session's lifetime is the caller's to wait out (`ws_session_wait`).
     %% A rejected upgrade (400/500 already sent, `connection: close`)
     %% falls through to the normal websocket finishing path.
     case roadrunner_ws_session:start(Socket, Req, Mod, State, Buffered, ProtoOpts) of
-        {session, MRef, SessPid} -> {ws_session, MRef, SessPid};
-        rejected -> ok
+        %% The flushed state rides along so the caller never re-flushes
+        %% the already-written batch from a stale pre-flush state.
+        {session, MRef, SessPid} -> {ws_session, MRef, SessPid, S};
+        rejected -> S
     end;
 dispatch_response(
-    #loop_state{socket = Socket, alt_svc = AltSvc},
+    #loop_state{socket = Socket, alt_svc = AltSvc} = S0,
     _Handler,
     _Req,
     {stream, Status, Headers0, Fun}
 ) when
     is_function(Fun, 1)
 ->
+    %% The stream writer owns the wire from here — flush queued
+    %% responses ahead of its first bytes.
+    S = flush_out(S0),
     Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     _ = roadrunner_stream_response:run(Socket, Status, Headers, Fun),
-    ok;
+    S;
 dispatch_response(
-    #loop_state{socket = Socket, alt_svc = AltSvc},
+    #loop_state{socket = Socket, alt_svc = AltSvc} = S0,
     Handler,
     _Req,
     {loop, Status, Headers0, LoopState}
 ) when
     is_integer(Status)
 ->
+    S = flush_out(S0),
     Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     _ = roadrunner_loop_response:run(Socket, Status, Headers, Handler, LoopState),
-    ok;
+    S;
 dispatch_response(
-    #loop_state{socket = Socket, alt_svc = AltSvc},
+    #loop_state{socket = Socket, alt_svc = AltSvc} = S0,
     _Handler,
     Req,
     {sendfile, Status, Headers0, {Filename, Offset, Length}}
 ) when
     is_integer(Status)
 ->
+    %% The body goes out via kernel sendfile, which can't join an
+    %% iodata batch — flush queued responses ahead of the head.
+    S = flush_out(S0),
     Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     Head = roadrunner_http1:response(Status, Headers, ~""),
     _ = roadrunner_telemetry:response_send(
@@ -920,7 +1013,7 @@ dispatch_response(
                         ok
                 end
         end,
-    ok;
+    S;
 %% RFC 9110 §15.2: a 1xx is interim and cannot be a final response. The
 %% single-response handler API cannot express "interim 1xx then final", so
 %% a returned 1xx is always a misuse; answer 500 rather than put an invalid
@@ -928,7 +1021,7 @@ dispatch_response(
 %% `roadrunner_conn:maybe_send_continue/3`, not this path. Placed before the
 %% buffered clauses so it intercepts a 1xx for any method (HEAD included).
 dispatch_response(
-    #loop_state{socket = Socket, alt_svc = AltSvc},
+    #loop_state{alt_svc = AltSvc} = S,
     Handler,
     _Req,
     {Status, _Headers, _Body}
@@ -942,16 +1035,13 @@ dispatch_response(
     }),
     Headers = roadrunner_http:auto_headers([{~"content-type", ~"text/plain"}], AltSvc),
     Resp = roadrunner_http1:response(500, Headers, ~"Internal Server Error"),
-    _ = roadrunner_telemetry:response_send(
-        roadrunner_transport:send(Socket, Resp), buffered_response
-    ),
-    ok;
+    queue_response(S, Resp);
 %% Buffered (3-tuple) response shape. RFC 9110 §9.3.2: HEAD must NOT
 %% include a message body — match on `method := ~"HEAD"` in the
 %% function head and emit the response with an empty body. Free
 %% pattern-match dispatch (no `maps:get(method, _)` per response).
 dispatch_response(
-    #loop_state{socket = Socket, alt_svc = AltSvc},
+    #loop_state{alt_svc = AltSvc} = S,
     _Handler,
     #{method := ~"HEAD"},
     {Status, Headers0, _Body}
@@ -960,12 +1050,9 @@ dispatch_response(
 ->
     Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     Resp = roadrunner_http1:response(Status, Headers, ~""),
-    _ = roadrunner_telemetry:response_send(
-        roadrunner_transport:send(Socket, Resp), buffered_response
-    ),
-    ok;
+    queue_response(S, Resp);
 dispatch_response(
-    #loop_state{socket = Socket, alt_svc = AltSvc},
+    #loop_state{alt_svc = AltSvc} = S,
     _Handler,
     _Req,
     {Status, Headers0, Body}
@@ -974,10 +1061,7 @@ dispatch_response(
 ->
     Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     Resp = roadrunner_http1:response(Status, Headers, Body),
-    _ = roadrunner_telemetry:response_send(
-        roadrunner_transport:send(Socket, Resp), buffered_response
-    ),
-    ok.
+    queue_response(S, Resp).
 
 %% --- finishing phase ---
 %%
@@ -1013,7 +1097,20 @@ finishing_phase(S, Req, _Response) ->
     roadrunner_req:request(),
     roadrunner_http:headers()
 ) -> no_return().
-buffered_finish(S, Req, Headers) ->
+buffered_finish(S0, Req, Headers) ->
+    %% A manual-mode request whose body the handler left (partly) unread
+    %% is about to be drained, and the drain can read the socket — the
+    %% just-queued response goes out first so a client that watches for
+    %% it while still uploading isn't kept waiting on its own upload.
+    %% Bodyless manual requests (`framing := none`, the pipelined-GET
+    %% hot path) and auto mode (body consumed pre-dispatch) skip the
+    %% flush and keep coalescing.
+    S =
+        case Req of
+            #{body_reader := #{framing := none}} -> S0;
+            #{body_reader := _} -> flush_out(S0);
+            _ -> S0
+        end,
     case drain_body_if_manual(Req) of
         {ok, ManualLeftover} ->
             case roadrunner_conn:keep_alive_decision(Req, Headers) of
@@ -1157,14 +1254,15 @@ arm_active_once(#loop_state{socket = Socket} = S) ->
 %% phases fire `listener_conn_close` (accept already fired during
 %% `shoot`).
 -spec exit_normal(#loop_state{}) -> no_return().
-exit_normal(#loop_state{
-    socket = Socket,
-    proto_opts = ProtoOpts,
-    listener_name = ListenerName,
-    start_mono = StartMono,
-    peer = Peer,
-    requests_served = Served
-}) ->
+exit_normal(S) ->
+    #loop_state{
+        socket = Socket,
+        proto_opts = ProtoOpts,
+        listener_name = ListenerName,
+        start_mono = StartMono,
+        peer = Peer,
+        requests_served = Served
+    } = flush_out(S),
     exit_clean(Socket, ProtoOpts, StartMono, Peer, ListenerName, Served, normal).
 
 %% Funnel for every clean exit path. Fires the paired
