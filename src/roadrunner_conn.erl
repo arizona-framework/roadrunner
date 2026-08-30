@@ -261,7 +261,7 @@ process. Reserved for future use cases where a non-conn process needs
 direct drain membership (e.g., a long-lived worker spawned outside
 the conn lifecycle). The WS upgrade path no longer calls this: the
 conn (already in pg) forwards `{roadrunner_drain, _}` to its session
-from `roadrunner_ws_session:wait_for_session/2` instead.
+from `roadrunner_conn_loop:ws_session_wake/7` instead.
 
 Silently no-ops when `Name` is `undefined` (manually constructed
 requests in tests) or when the `pg` scope is absent (listener

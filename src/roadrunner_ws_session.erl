@@ -4,15 +4,17 @@
 %% Per-connection WebSocket session — runs the frame loop in its own
 %% hand-rolled `proc_lib` process (never a gen_statem, mirroring
 %% `roadrunner_conn_loop_http2` / `roadrunner_quic_connection`) after
-%% `roadrunner_conn:upgrade_to_websocket/4` hands the socket off.
+%% the conn's `{websocket, Mod, State}` dispatch hands the socket off.
 %%
-%% The session owns the socket for its lifetime: the parent `roadrunner_conn`
-%% launcher (`run/4`) starts the session, transfers controlling-process,
+%% The session owns the socket for its lifetime: the parent conn calls
+%% `start/6`, which spawns the session, transfers controlling-process,
 %% sends the `socket_ready` startup signal (mirroring the conn's `shoot`
-%% pattern), and waits via a monitor for the session to terminate.
-%% When the session exits — peer close frame, recv error, frame parse
-%% error, or handler-driven `{close, _}` — the launcher returns and the
-%% parent's `[roadrunner, listener, conn_close]` telemetry fires after.
+%% pattern), and hands the session's monitor back so the conn can park
+%% in a hibernated wait (`roadrunner_conn_loop:ws_session_wake/7`)
+%% until the session terminates. When the session exits — peer close
+%% frame, recv error, frame parse error, or handler-driven `{close, _}`
+%% — the conn wakes and its `[roadrunner, listener, conn_close]`
+%% telemetry fires after.
 %%
 %% Phases (plain functions, not gen_statem states):
 %% - `awaiting_socket/1` — a selective `receive socket_ready` that gates
@@ -58,12 +60,12 @@
 %% each is exported is cached in `#data` at session start so the BIF
 %% check doesn't run on every event.
 %%
-%% Telemetry: `[roadrunner, ws, upgrade]` fires from `run/6` once the
+%% Telemetry: `[roadrunner, ws, upgrade]` fires from `start/6` once the
 %% launcher has decided to enter the session; `[roadrunner, ws, frame_in]`
 %% and `[roadrunner, ws, frame_out]` fire from the session process for
 %% every frame.
 
--export([run/6]).
+-export([start/6]).
 -export([init_session/2]).
 -export([recv_loop/1]).
 -export([unmask_slice/3]).
@@ -160,32 +162,36 @@
 -define(WS_FRAGMENT_OVERHEAD, 64).
 
 -doc """
-Run the WebSocket session synchronously: spawn the session process,
-write the 101 upgrade response, transfer socket ownership, and
-await termination. The process is started **before** the 101
-hits the wire so a start failure can fall back to 500 without
-leaving the upgrade response sent with no process owning the
-socket. Returns `ok` once the session has ended (or the
-handshake check fails — in which case 400 has been sent and
-the session is never started).
+Start the WebSocket session: spawn the session process, write the
+101 upgrade response, and transfer socket ownership. The process is
+started **before** the 101 hits the wire so a start failure can
+fall back to 500 without leaving the upgrade response sent with no
+process owning the socket. Returns `{session, MonitorRef, Pid}`
+once the handoff is complete — the caller owns the wait for the
+session's `'DOWN'` and forwards `{roadrunner_drain, _}` broadcasts
+to `Pid` (see `roadrunner_conn_loop:ws_session_wake/7`). Returns
+`rejected` when the handshake check fails (400 sent, no session
+started) or the session couldn't start (500 sent); both responses
+carry `connection: close`, so the caller just runs its normal
+close path.
 
 `Buffered` is any bytes the conn already read past the upgrade request
 (a client that pipelines its first frame in the handshake segment).
 They seed the session buffer so the first frame isn't lost.
 """.
--spec run(
+-spec start(
     roadrunner_transport:socket(),
     roadrunner_req:request(),
     module(),
     term(),
     binary(),
     roadrunner_conn:proto_opts()
-) -> ok.
-run(Socket, Req, Mod, State, Buffered, ProtoOpts) ->
+) -> {session, reference(), pid()} | rejected.
+start(Socket, Req, Mod, State, Buffered, ProtoOpts) ->
     case roadrunner_ws:handshake_response(roadrunner_req:headers(Req)) of
         {ok, Status, RespHeaders, _, Negotiated} ->
             UpgradeResp = roadrunner_http1:response(Status, RespHeaders, ~""),
-            run_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts);
+            start_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts);
         {error, _} ->
             _ = roadrunner_transport:send(
                 Socket,
@@ -195,10 +201,10 @@ run(Socket, Req, Mod, State, Buffered, ProtoOpts) ->
                     ~""
                 )
             ),
-            ok
+            rejected
     end.
 
--spec run_session(
+-spec start_session(
     roadrunner_transport:socket(),
     roadrunner_req:request(),
     module(),
@@ -207,8 +213,8 @@ run(Socket, Req, Mod, State, Buffered, ProtoOpts) ->
     roadrunner_ws:negotiated(),
     binary(),
     roadrunner_conn:proto_opts()
-) -> ok.
-run_session(
+) -> {session, reference(), pid()} | rejected.
+start_session(
     Socket,
     Req,
     Mod,
@@ -245,7 +251,7 @@ run_session(
             Ref = monitor(process, Pid),
             ok = roadrunner_transport:controlling_process(Socket, Pid),
             Pid ! socket_ready,
-            wait_for_session(Ref, Pid);
+            {session, Ref, Pid};
         {error, _Reason} ->
             %% Couldn't start the session — the 101 was never on the
             %% wire, so we can fall back to 500 without a protocol leak.
@@ -257,7 +263,7 @@ run_session(
                     ~""
                 )
             ),
-            ok
+            rejected
     end.
 
 %% Apply the `ws.buffer` listener opt: resize the socket's inet
@@ -275,25 +281,7 @@ apply_ws_buffer(Socket, #{ws_buffer := Buffer}) ->
     _ = roadrunner_transport:setopts(Socket, [{buffer, Buffer}]),
     ok.
 
-%% The conn process is already a member of the listener's drain `pg`
-%% group via `roadrunner_conn:join_drain_group/2` (joined at conn
-%% start). While the conn waits here for the session to terminate,
-%% forward any `{roadrunner_drain, _}` broadcast to the session pid so
-%% the session's `frame_loop` can dispatch `handle_drain/2`. This
-%% avoids a per-session `pg:join` on the WS upgrade hot path: that
-%% per-session join doubled the rate of joins through the single `pg`
-%% scope process and serialized the upgrade hot path under load.
--spec wait_for_session(reference(), pid()) -> ok.
-wait_for_session(Ref, Pid) ->
-    receive
-        {'DOWN', Ref, process, Pid, _Reason} ->
-            ok;
-        {roadrunner_drain, _Deadline} = Msg ->
-            Pid ! Msg,
-            wait_for_session(Ref, Pid)
-    end.
-
-%% proc_lib entry (started via `proc_lib:start/5` from `run_session/8`).
+%% proc_lib entry (started via `proc_lib:start/5` from `start_session/8`).
 %% Validates the handler and `init_ack`s the outcome to the launcher
 %% BEFORE the 101 is written: `{ok, self()}` lets the launcher send the
 %% 101, `{error, {bad_handler, _}}` makes `proc_lib:start` return an
@@ -438,7 +426,8 @@ recv_loop(#data{socket = Socket} = Data) ->
 %% runtime would reclaim the zlib NIF resources on process exit anyway,
 %% but explicit release reclaims their working buffers immediately rather
 %% than waiting on GC. A crash skips this and relies on that GC. The
-%% launcher's monitor sees `{'DOWN', _, _, _, normal}` and returns.
+%% conn's monitor sees `{'DOWN', _, _, _, normal}` and wakes from its
+%% hibernated wait to run the connection's close path.
 -spec exit_clean(#data{}) -> no_return().
 exit_clean(#data{inflate_z = InflateZ, deflate_z = DeflateZ}) ->
     close_zlib(InflateZ),

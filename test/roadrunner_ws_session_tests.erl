@@ -2,37 +2,32 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-%% `roadrunner_ws_session:run/5` must start the gen_statem **before** the
-%% 101 upgrade response is written. If `gen_statem:start/3` fails
-%% (here forced via an unknown handler module — `init/1` rejects it,
-%% turning into `{error, _}` from start), the 101 must never reach
-%% the wire and a 500 fallback must be sent instead.
-run_with_unloadable_handler_sends_500_and_no_101_test() ->
+%% `roadrunner_ws_session:start/6` must spawn the session **before** the
+%% 101 upgrade response is written. If `proc_lib:start/5` fails
+%% (here forced via an unknown handler module — `init_session/2` rejects
+%% it, turning into `{error, _}` from start), the 101 must never reach
+%% the wire and a 500 fallback must be sent instead, with `rejected`
+%% telling the caller no session exists to wait on.
+start_with_unloadable_handler_sends_500_and_no_101_test() ->
     Tag = make_ref(),
     Self = self(),
     Sink = spawn_send_log_sink(Self, Tag),
-    Headers = [
-        {~"upgrade", ~"websocket"},
-        {~"connection", ~"Upgrade"},
-        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
-        {~"sec-websocket-version", ~"13"}
-    ],
-    Req = #{
-        headers => Headers,
-        peer => undefined,
-        listener_name => undefined,
-        request_id => undefined
-    },
-    ok = roadrunner_ws_session:run(
-        {fake, Sink}, Req, this_module_does_not_exist_xyz_42, undefined, <<>>, ws_proto_opts()
+    rejected = roadrunner_ws_session:start(
+        {fake, Sink},
+        upgrade_req(),
+        this_module_does_not_exist_xyz_42,
+        undefined,
+        <<>>,
+        ws_proto_opts()
     ),
     Sent = iolist_to_binary(collect_sends(Tag, 100)),
     Sink ! stop,
     ?assertEqual(nomatch, binary:match(Sent, ~"101")),
     ?assertNotEqual(nomatch, binary:match(Sent, ~"500")).
 
-run_with_bad_handshake_still_returns_400_test() ->
-    %% Regression check: bad handshake path is unchanged.
+start_with_bad_handshake_still_returns_400_test() ->
+    %% Regression check: bad handshake path is unchanged — 400 on the
+    %% wire, `rejected` to the caller, no session spawned.
     Tag = make_ref(),
     Self = self(),
     Sink = spawn_send_log_sink(Self, Tag),
@@ -42,7 +37,7 @@ run_with_bad_handshake_still_returns_400_test() ->
         listener_name => undefined,
         request_id => undefined
     },
-    ok = roadrunner_ws_session:run(
+    rejected = roadrunner_ws_session:start(
         {fake, Sink}, Req, roadrunner_ws_echo_handler, undefined, <<>>, ws_proto_opts()
     ),
     Sent = iolist_to_binary(collect_sends(Tag, 100)),
@@ -59,7 +54,7 @@ ws_buffer_opt_applied_before_101_test() ->
     Tag = make_ref(),
     Self = self(),
     Sink = spawn_events_sink(Self, Tag),
-    ok = roadrunner_ws_session:run(
+    {session, Ref, Pid} = roadrunner_ws_session:start(
         {fake, Sink},
         upgrade_req(),
         roadrunner_ws_echo_handler,
@@ -67,6 +62,7 @@ ws_buffer_opt_applied_before_101_test() ->
         frame(close, <<1000:16>>),
         (ws_proto_opts())#{ws_buffer := 4096}
     ),
+    ok = await_down(Ref, Pid),
     Events = collect_events(Tag, 100),
     Sink ! stop,
     BufferIdx = find_event_index(
@@ -93,7 +89,7 @@ ws_buffer_opt_unset_leaves_socket_buffer_alone_test() ->
     Tag = make_ref(),
     Self = self(),
     Sink = spawn_events_sink(Self, Tag),
-    ok = roadrunner_ws_session:run(
+    {session, Ref, Pid} = roadrunner_ws_session:start(
         {fake, Sink},
         upgrade_req(),
         roadrunner_ws_echo_handler,
@@ -101,6 +97,7 @@ ws_buffer_opt_unset_leaves_socket_buffer_alone_test() ->
         frame(close, <<1000:16>>),
         ws_proto_opts()
     ),
+    ok = await_down(Ref, Pid),
     Events = collect_events(Tag, 100),
     Sink ! stop,
     BufferSetopts = [
@@ -766,56 +763,39 @@ handle_drain_drops_when_handler_does_not_export_test() ->
     Sink ! stop,
     ok = stop_ws_session(Pid).
 
-run_session_forwards_drain_to_session_test() ->
-    %% End-to-end: run/4 → run_session/6 → wait_for_session/2 forwards
-    %% `{roadrunner_drain, _}` sent to the conn (the run/4 caller) onward
-    %% to the session pid, where the existing frame_loop drain dispatch
-    %% calls handle_drain/2. The conn is already a `pg` member via
-    %% `roadrunner_conn:join_drain_group/2` so forwarding replaces the
-    %% per-session pg:join the WS upgrade path used to do.
+start_hands_back_a_session_the_caller_drives_test() ->
+    %% `start/6`'s contract: the 101 is on the wire and the caller holds
+    %% `{session, MonitorRef, Pid}` — it owns the drain forwarding (in
+    %% production `roadrunner_conn_loop:ws_session_wake/7`, covered in
+    %% the conn-loop tests) and the wait for the session's 'DOWN'. Here
+    %% the test plays the caller: a drain sent to the session pid
+    %% dispatches handle_drain/2, whose `{close, _, _, _}` return ends
+    %% the session and fires the monitor.
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink(Self, Tag, []),
-    State = #{sink => Self, on_drain => {close, 1000, ~"draining"}},
-    Headers = [
-        {~"upgrade", ~"websocket"},
-        {~"connection", ~"Upgrade"},
-        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
-        {~"sec-websocket-version", ~"13"}
-    ],
-    Req = #{
-        headers => Headers,
-        peer => undefined,
-        listener_name => undefined,
-        request_id => undefined
-    },
-    Worker = spawn(fun() ->
-        ok = roadrunner_ws_session:run(
-            {fake, Sink}, Req, roadrunner_ws_lifecycle_handler, State, <<>>, ws_proto_opts()
-        ),
-        Self ! {worker_done, self()}
-    end),
-    Wref = monitor(process, Worker),
-    %% Give the gen_statem time to transition awaiting_socket → frame_loop
-    %% so the forwarded drain hits the steady-state drain dispatch and
-    %% not the awaiting_socket postpone path (that path is covered by
-    %% awaiting_socket_postpones_drain_until_frame_loop_test/0 below).
-    timer:sleep(50),
-    Worker ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 30000},
+    State = #{sink => Self, on_init => ok, on_drain => {close, 1000, ~"draining"}},
+    {session, Ref, Pid} = roadrunner_ws_session:start(
+        {fake, Sink},
+        upgrade_req(),
+        roadrunner_ws_lifecycle_handler,
+        State,
+        <<>>,
+        ws_proto_opts()
+    ),
+    %% The lifecycle handler notifies init — the awaiting_socket →
+    %% frame_loop transition is done, so the drain hits the steady-state
+    %% dispatch and not the postpone path (covered separately below).
+    receive
+        {event, init} -> ok
+    after 500 -> ?assert(false)
+    end,
+    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 30000},
     receive
         {event, drain} -> ok
     after 500 -> ?assert(false)
     end,
-    %% on_drain => {close, ...} terminates the session; wait_for_session's
-    %% 'DOWN' clause fires, run/4 returns ok, the worker pid exits normal.
-    receive
-        {worker_done, Worker} -> ok
-    after 500 -> ?assert(false)
-    end,
-    receive
-        {'DOWN', Wref, process, Worker, normal} -> ok
-    after 500 -> ?assert(false)
-    end,
+    ok = await_down(Ref, Pid),
     Sent = iolist_to_binary(collect_sends(Tag, 50)),
     ?assertNotEqual(nomatch, binary:match(Sent, ~"101")),
     %% Close frame opcode 0x88.
@@ -2253,7 +2233,7 @@ loop_sys_handles_system_and_gen_messages_test() ->
 
 %% --- helpers ---
 
-%% Start the session the way the production launcher (`run_session/8`)
+%% Start the session the way the production launcher (`start_session/8`)
 %% does — `proc_lib:start` into `init_session/2`, which validates the
 %% handler and `init_ack`s `{ok, Pid}` | `{error, {bad_handler, _}}`.
 %% Same 3-arity shape as the old `gen_statem:start/3` so call sites are a
@@ -2280,8 +2260,15 @@ ws_ctx() ->
         module => roadrunner_ws_echo_handler
     }.
 
+%% Wait for the session's 'DOWN' the way the conn does after `start/6`.
+await_down(Ref, Pid) ->
+    receive
+        {'DOWN', Ref, process, Pid, _Reason} -> ok
+    after 2000 -> error(session_did_not_exit)
+    end.
+
 %% A request map carrying a valid upgrade handshake, for tests driving
-%% the full `run/6` entry.
+%% the full `start/6` entry.
 upgrade_req() ->
     #{
         headers => [
