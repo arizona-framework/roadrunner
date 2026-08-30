@@ -312,20 +312,45 @@ find_q([Param | Rest], Default) ->
         _ -> find_q(Rest, Default)
     end.
 
-%% Parse the qvalue itself. RFC 9110 §12.4.2 allows 0, 0.NNN, 1, or
-%% 1.000 (max 3 decimals). Anything malformed falls back to the
-%% default.
+%% Parse the qvalue itself. RFC 9110 §12.4.2 grammar:
+%% `("0" ["." 0*3DIGIT]) / ("1" ["." 0*3("0")])`. Matched directly on
+%% the binary — the string-module parsers this replaces round-trip
+%% every qvalue through unicode list conversion, which profiled at a
+%% low-percent share of a keep-alive request's total time whenever the
+%% client sends q-values. Anything outside the grammar falls back to
+%% the default (the previous parser also accepted garbage-suffixed
+%% values like `0.8x`; those are malformed per RFC and now default).
 -spec parse_q(binary(), float()) -> float().
-parse_q(QBin, Default) ->
-    case string:to_float(QBin) of
-        {Float, _} when Float >= 0.0, Float =< 1.0 -> Float;
-        _ ->
-            case string:to_integer(QBin) of
-                {0, _} -> 0.0;
-                {1, _} -> 1.0;
-                _ -> Default
-            end
-    end.
+parse_q(~"1", _Default) -> 1.0;
+parse_q(~"0", _Default) -> 0.0;
+parse_q(<<"1.", Zeros/binary>>, Default) -> one_fraction(Zeros, Default);
+parse_q(<<"0.", Digits/binary>>, Default) -> zero_fraction(Digits, Default);
+parse_q(_QBin, Default) -> Default.
+
+%% `1.`, `1.0`, `1.00`, `1.000` — all exactly 1.0; any other fraction
+%% after `1.` would exceed the qvalue range.
+-spec one_fraction(binary(), float()) -> float().
+one_fraction(~"", _Default) -> 1.0;
+one_fraction(~"0", _Default) -> 1.0;
+one_fraction(~"00", _Default) -> 1.0;
+one_fraction(~"000", _Default) -> 1.0;
+one_fraction(_Zeros, Default) -> Default.
+
+-spec zero_fraction(binary(), float()) -> float().
+zero_fraction(~"", _Default) ->
+    0.0;
+zero_fraction(<<D>>, _Default) when D >= $0, D =< $9 ->
+    (D - $0) / 10;
+zero_fraction(<<D1, D2>>, _Default) when
+    D1 >= $0, D1 =< $9, D2 >= $0, D2 =< $9
+->
+    ((D1 - $0) * 10 + (D2 - $0)) / 100;
+zero_fraction(<<D1, D2, D3>>, _Default) when
+    D1 >= $0, D1 =< $9, D2 >= $0, D2 =< $9, D3 >= $0, D3 =< $9
+->
+    ((D1 - $0) * 100 + (D2 - $0) * 10 + (D3 - $0)) / 1000;
+zero_fraction(_Digits, Default) ->
+    Default.
 
 -spec has_header(binary(), roadrunner_http:headers()) -> boolean().
 has_header(Name, Headers) ->
