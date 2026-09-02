@@ -202,7 +202,9 @@ Optional middleware and timing knobs (durations in milliseconds):
   `[{fullsweep_after, 0}]` so the per-conn response heap is reclaimed
   instead of hoarding it as old-gen garbage across keep-alive
   requests) and `start_timeout` (init-ack deadline, default
-  `infinity`).
+  `infinity`). `opts` merges over the defaults per option key, so
+  setting one option keeps the rest — asking for a heap hint does not
+  silently change the GC policy.
 
   `fullsweep_after, 0` makes every collection a full sweep, which is
   what keeps the heap flat — and it is not free on handlers that
@@ -211,8 +213,12 @@ Optional middleware and timing knobs (durations in milliseconds):
   the same CPU: throughput 51k vs 58k req/s and mean latency 3.25 ms vs
   2.63 ms, for 189 MB vs 361 MB of RSS. Bounded memory is the safer
   default for a server, so that is the trade taken here; a service that
-  would rather spend the memory can pass `opts => []` and get the
-  emulator's generational behaviour back.
+  would rather spend the memory names `fullsweep_after` itself to
+  override it — an empty list will not do, since `opts` merges. Use
+  `[{fullsweep_after, 65535}]` for the emulator's usual value, or
+  `[{fullsweep_after, element(2, erlang:system_info(fullsweep_after))}]`
+  to follow whatever this node is set to, which `ERL_FULLSWEEP_AFTER`
+  can move.
 
   The choice is effectively binary — an intermediate sweep interval buys
   no middle ground. Values of 5, 10 and 20 all measured within noise of
@@ -1236,11 +1242,14 @@ build_proto_opts(Opts, ListenerName) ->
 resolve_handler_spawn(Opts) ->
     case maps:get(handler_spawn, Opts, #{}) of
         HandlerSpawn when is_map(HandlerSpawn) ->
-            SpawnOpts = maps:get(opts, HandlerSpawn, ?DEFAULT_HANDLER_SPAWN_OPTS),
+            UserOpts = maps:get(opts, HandlerSpawn, []),
             Timeout = maps:get(start_timeout, HandlerSpawn, ?DEFAULT_HANDLER_START_TIMEOUT),
-            ok = validate_handler_spawn_opts(SpawnOpts, HandlerSpawn),
+            ok = validate_handler_spawn_opts(UserOpts, HandlerSpawn),
             ok = validate_handler_start_timeout(Timeout, HandlerSpawn),
-            #{opts => SpawnOpts, start_timeout => Timeout};
+            #{
+                opts => merge_spawn_opts(?DEFAULT_HANDLER_SPAWN_OPTS, UserOpts),
+                start_timeout => Timeout
+            };
         Other ->
             error({invalid_listener_opt, handler_spawn, Other})
     end.
@@ -1252,6 +1261,30 @@ validate_handler_spawn_opts(SpawnOpts, Raw) when is_list(SpawnOpts) ->
     end;
 validate_handler_spawn_opts(_SpawnOpts, Raw) ->
     error({invalid_listener_opt, handler_spawn, Raw}).
+
+%% A caller's option wins per key and the rest of the defaults stay.
+%% Replacing the list wholesale would mean setting any one option
+%% silently drops the others — and dropping `fullsweep_after` alone
+%% roughly doubles a listener's memory, with nothing in the config to
+%% suggest why. To get the emulator's generational behaviour, name
+%% `fullsweep_after` explicitly rather than passing an empty list.
+merge_spawn_opts(Defaults, UserOpts) ->
+    lists:foldr(
+        fun(Default, Acc) ->
+            Key = spawn_opt_key(Default),
+            case lists:any(fun(Opt) -> spawn_opt_key(Opt) =:= Key end, UserOpts) of
+                true -> Acc;
+                false -> [Default | Acc]
+            end
+        end,
+        UserOpts,
+        Defaults
+    ).
+
+%% Everything reaching the merge is a `{Key, Value}` pair: `link` is the
+%% only bare-atom spawn option and it is reserved below, rejected before
+%% this runs.
+spawn_opt_key(Opt) -> element(1, Opt).
 
 is_reserved_spawn_opt(link) -> true;
 is_reserved_spawn_opt(monitor) -> true;

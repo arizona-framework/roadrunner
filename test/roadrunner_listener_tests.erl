@@ -360,18 +360,57 @@ listener_threads_handler_spawn_defaults_into_proto_opts_test() ->
 listener_threads_custom_handler_spawn_into_proto_opts_test() ->
     %% A custom `handler_spawn` map is flattened to the two top-level
     %% proto_opts keys the spawn sites read directly (no nested lookup
-    %% on the hot path), mirroring the `ws` / `http2` flattening.
+    %% on the hot path), mirroring the `ws` / `http2` flattening. Options
+    %% the caller sets win over the defaults for the same key.
     Name = listener_test_handler_spawn_custom,
-    SpawnOpts = [{fullsweep_after, 20}, {min_bin_vheap_size, 1024}],
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
-        handler_spawn => #{opts => SpawnOpts, start_timeout => 5000},
+        handler_spawn => #{
+            opts => [{fullsweep_after, 20}, {min_bin_vheap_size, 1024}],
+            start_timeout => 5000
+        },
         routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
-    ?assertEqual(SpawnOpts, maps:get(handler_spawn_opts, ProtoOpts)),
+    ?assertEqual(
+        [{fullsweep_after, 20}, {min_bin_vheap_size, 1024}],
+        lists:sort(maps:get(handler_spawn_opts, ProtoOpts))
+    ),
     ?assertEqual(5000, maps:get(handler_start_timeout, ProtoOpts)),
+    ok = roadrunner_listener:stop(Name).
+
+listener_handler_spawn_opts_keep_unset_defaults_test() ->
+    %% Setting one spawn option must not drop the others. Dropping
+    %% `fullsweep_after` alone roughly doubles a listener's memory, and
+    %% nothing in a config asking for a heap hint would explain it.
+    Name = listener_test_handler_spawn_merge,
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        handler_spawn => #{opts => [{min_bin_vheap_size, 1024}]},
+        routes => roadrunner_hello_handler
+    }),
+    State = sys:get_state(ListenerPid),
+    ProtoOpts = element(4, State),
+    Merged = maps:get(handler_spawn_opts, ProtoOpts),
+    ?assert(lists:member({min_bin_vheap_size, 1024}, Merged)),
+    ?assert(lists:member({fullsweep_after, 0}, Merged)),
+    ok = roadrunner_listener:stop(Name).
+
+listener_handler_spawn_opts_allow_overriding_gc_default_test() ->
+    %% The escape hatch: naming `fullsweep_after` explicitly replaces the
+    %% default rather than merging alongside it, so a service that would
+    %% rather spend memory than sweep can have the emulator's own
+    %% generational behaviour.
+    Name = listener_test_handler_spawn_override,
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        handler_spawn => #{opts => [{fullsweep_after, 65535}]},
+        routes => roadrunner_hello_handler
+    }),
+    State = sys:get_state(ListenerPid),
+    ProtoOpts = element(4, State),
+    ?assertEqual([{fullsweep_after, 65535}], maps:get(handler_spawn_opts, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
 listener_accepts_http1_tuple_form_test() ->
