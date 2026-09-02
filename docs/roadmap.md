@@ -63,8 +63,31 @@ these are not worth re-testing):
   disabling `graceful_drain` entirely — both tied
 - acceptor pool size — 16 and 100 acceptors behave the same
 - garbage collection — `erlang:system_monitor` fires no `long_gc`
+- the synchronous `proc_lib:start` handshake per accepted connection.
+  Instrumenting the accept path shows it *is* where the acceptor's time
+  goes — 870 us of a 875 us total per connection, against 2 us for
+  `controlling_process` and 0.2 us for the `shoot` send — because the
+  acceptor waits for the new process to be scheduled and ack. But
+  spawning asynchronously instead (no init-ack round trip) cuts that to
+  2 us per connection and leaves time-to-first-response unchanged. With
+  a pool of acceptors the blocking is parallel, so it is not the serial
+  constraint; starting and scheduling the conn processes themselves
+  costs the same either way.
 
-**Where to start:** `erlang:system_monitor` attributes the stalls to the
+**Also inconclusive:** spreading accepts over a pool of `SO_REUSEPORT`
+listen sockets (8 vs 1, same total acceptors, isolated from roadrunner
+in a minimal accept-and-reply server) measured tied — one round of three
+suggested the median halved, but finer sampling reversed it. Run-to-run
+variance on a 24-core laptop is larger than the effect being chased
+(p50 ranged 4.6-14.6 ms for an identical configuration), so this needs a
+quiet, larger machine before it means anything either way. Note the h3
+stack already pools listeners this way, so the machinery has precedent
+if it does turn out to help.
+
+**Where to start:** measure somewhere the noise floor is below the
+effect — the numbers above cannot settle it. The remaining suspect is
+the single listen socket's port, through which every accept funnels.
+`erlang:system_monitor` attributes the stalls to the
 `tcp_inet` port being scheduled for up to 20 ms at a stretch during the
 burst, and to conn processes blocked that long inside
 `erlang:port_control/3` (the `{active, once}` re-arm). In steady state
