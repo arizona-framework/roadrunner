@@ -98,23 +98,6 @@ single listen socket's port, is the serializer.
 
 **Scope:** medium — the instrumentation exists, the cause does not.
 
-## Drop the mid-request drain poll — small effort
-
-**What:** `recv_passive/2` still wakes every `?DRAIN_CHECK_INTERVAL_MS`
-(100 ms) to look for a drain message while reading the rest of a request
-whose first byte already arrived. Every other read path has moved past
-needing that: the first-byte wait parks in `receive` (so it sees a drain
-instantly), and the body read blocks for the full remaining deadline
-without checking at all.
-
-**Why:** a graceful drain should not cut an in-flight request short, so
-the poll has no one left to serve — it only costs wakeups on requests
-whose headers span more than one packet. Removing it would make the
-header path consistent with the body path and simplify the function.
-
-**Scope:** small — delete the tick, use the full deadline, keep the
-`{error, timeout}` handling.
-
 ## HTTP/2 stream admission follow-ups
 
 ### Pre-SETTINGS stream leniency — medium effort
@@ -127,9 +110,15 @@ client only to a limit it has received, so the burst is compliant.
 Refusing the excess sheds real requests at every connection setup when
 the client's default concurrency exceeds our advertised value.
 
-**Design question:** admit up to the protocol default (100) until the
-client's SETTINGS ack arrives, or queue the excess and admit as slots
-free. Queueing composes with the entry below.
+**Design question:** admit up to some bound until the client's SETTINGS
+ack arrives, or queue the excess and admit as slots free. Note there is
+no protocol default to fall back on: RFC 9113 §6.5.2 says
+`SETTINGS_MAX_CONCURRENT_STREAMS` is *initially unlimited*, which is
+exactly why a prior-knowledge client opens as many as it likes in its
+first flight. So "admit what the default allows" is not an option, and
+admitting the burst outright is how the multi-GiB blowup that took
+`json-h2c` to zero happened. That leaves queueing, which is the entry
+below — worth treating these as one piece of work rather than two.
 
 **Scope:** medium — admission bookkeeping in the h2 conn loop plus
 tests for the ack-timing windows.
