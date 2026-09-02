@@ -40,6 +40,26 @@ Autobahn re-run.
 
 **Source:** Arizona handoff R-h2-1.
 
+## Tail latency at low load — small effort
+
+**What:** Track down the multi-millisecond stalls that show up in the
+99.9th percentile on an otherwise idle server. `erlang:system_monitor`
+attributes them to the `tcp_inet` port driver being scheduled for up to
+20 ms at a stretch, and to conn processes blocked that long inside
+`erlang:port_control/3` (the `{active, once}` re-arm). No `long_gc`
+events fire, so garbage collection is not the cause.
+
+**Why it matters:** p50 and p99 are already good; it is p99.9 that
+carries these. A stall that rare is invisible in throughput numbers and
+very visible to anyone measuring tail latency.
+
+**Where to start:** whether the stalls track accept bursts (the listen
+socket's port doing a large batch) or steady-state traffic, and whether
+`{active, N}` or spreading accepts over more listen sockets moves them.
+
+**Scope:** small to medium — the instrumentation exists, the fix is
+unknown.
+
 ## HTTP/2 stream admission follow-ups
 
 ### Pre-SETTINGS stream leniency — medium effort

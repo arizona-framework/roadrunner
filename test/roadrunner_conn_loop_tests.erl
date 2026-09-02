@@ -232,10 +232,10 @@ drain_during_read_request_exits_silently_test() ->
     ?assertEqual(<<>>, iolist_to_binary(collect_sends(Tag, 50))),
     Sink ! stop.
 
-tcp_closed_during_passive_recv_exits_silently_test() ->
-    %% Phase A' default path uses passive recv. TCP close is signaled
-    %% by `gen_tcp:recv` returning `{error, closed}` — script the sink
-    %% to reply with that.
+tcp_closed_while_awaiting_request_exits_silently_test() ->
+    %% Peer closes while the conn waits for a request's first byte.
+    %% The scripted close is delivered as the active-mode close event
+    %% the conn is parked on.
     ensure_pg(),
     Self = self(),
     Tag = make_ref(),
@@ -251,9 +251,9 @@ tcp_closed_during_passive_recv_exits_silently_test() ->
     ?assertEqual(<<>>, iolist_to_binary(collect_sends(Tag, 50))),
     Sink ! stop.
 
-tcp_error_during_passive_recv_exits_silently_test() ->
-    %% Phase A' passive path: any non-timeout, non-closed recv error
-    %% (e.g. econnreset) → silent exit.
+tcp_error_while_awaiting_request_exits_silently_test() ->
+    %% Any non-timeout, non-closed transport error (e.g. econnreset)
+    %% while awaiting a request → silent exit.
     ensure_pg(),
     Self = self(),
     Tag = make_ref(),
@@ -264,6 +264,104 @@ tcp_error_during_passive_recv_exits_silently_test() ->
     receive
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 2000 -> error(no_normal_exit)
+    end,
+    ?assertEqual(<<>>, iolist_to_binary(collect_sends(Tag, 50))),
+    Sink ! stop.
+
+%% --- mid-request passive recv -------------------------------------
+%%
+%% The conn reads a request's first byte in active mode and the rest
+%% passively, so these drive a PARTIAL request in first and then fail
+%% the remainder. Sink: deliver `Partial` when the conn arms, then
+%% behave per `Then` on the passive recv that follows.
+
+spawn_partial_then_sink(Logger, Tag, Partial, Then) ->
+    spawn(fun() -> partial_then_loop(Logger, Tag, Partial, Then, false) end).
+
+partial_then_loop(Logger, Tag, Partial, Then, Delivered) ->
+    receive
+        stop ->
+            ok;
+        {roadrunner_fake_setopts, ConnPid, _Opts} when not Delivered ->
+            ConnPid ! {roadrunner_fake_data, undefined, Partial},
+            partial_then_loop(Logger, Tag, Partial, Then, true);
+        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
+            case Then of
+                silent ->
+                    %% No reply: the transport honours the caller's
+                    %% timeout, so recv returns `{error, timeout}`.
+                    ok;
+                {reply, Result} ->
+                    ConnPid ! {roadrunner_fake_recv_reply, Result}
+            end,
+            partial_then_loop(Logger, Tag, Partial, Then, Delivered);
+        {roadrunner_fake_send, _Pid, Data} ->
+            Logger ! {Tag, sent, Data},
+            partial_then_loop(Logger, Tag, Partial, Then, Delivered);
+        _Other ->
+            partial_then_loop(Logger, Tag, Partial, Then, Delivered)
+    end.
+
+%% Request line + one header, no terminating CRLF — parses as `{more, _}`
+%% so the conn goes back for the remainder.
+partial_request() -> ~"GET / HTTP/1.1\r\nHost: x\r\n".
+
+drain_during_body_recv_exits_silently_test() ->
+    %% Drain arriving while the conn is reading the rest of a request:
+    %% picked up by the mailbox check between drain ticks, after a
+    %% stray message ahead of it in the queue is skipped.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_partial_then_sink(Self, Tag, partial_request(), silent),
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, fake_opts(drain_passive)),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    %% Let the conn take the partial request and block on the remainder.
+    timer:sleep(50),
+    Pid ! {junk_from_a_buggy_lib, make_ref()},
+    Pid ! {roadrunner_drain, infinity},
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
+    end,
+    %% Drain bypasses the response — no 408 for the half-sent request.
+    ?assertEqual(<<>>, iolist_to_binary(collect_sends(Tag, 50))),
+    Sink ! stop.
+
+request_timeout_during_body_recv_writes_408_test() ->
+    %% The absolute deadline is enforced across drain ticks: a client
+    %% that sends half a request and stalls gets a 408.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_partial_then_sink(Self, Tag, partial_request(), silent),
+    Opts = (fake_opts(timeout_passive))#{request_timeout := 250},
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 5000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 408", _/binary>>, Sent),
+    Sink ! stop.
+
+tcp_error_during_body_recv_exits_silently_test() ->
+    %% A transport error on the remainder of a request → silent exit.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_partial_then_sink(
+        Self, Tag, partial_request(), {reply, {error, econnreset}}
+    ),
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, fake_opts(err_passive)),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
     end,
     ?assertEqual(<<>>, iolist_to_binary(collect_sends(Tag, 50))),
     Sink ! stop.
@@ -340,9 +438,11 @@ slowloris_during_passive_recv_drops_client_test() ->
     %% the sleep queue up; the held reply lands on whichever recv is
     %% pending when the sink wakes.
     Sink = spawn(fun() ->
+        %% First byte lands on the active-mode wait for the request's
+        %% first byte; the dribble that follows is read passively.
         receive
-            {roadrunner_fake_recv, C1, _, _} ->
-                C1 ! {roadrunner_fake_recv_reply, {ok, ~"G"}}
+            {roadrunner_fake_setopts, C1, _} ->
+                C1 ! {roadrunner_fake_data, undefined, ~"G"}
         after 5000 -> ok
         end,
         timer:sleep(1200),
@@ -597,7 +697,7 @@ interim_buffered_response_writes_500_test() ->
     ensure_pg(),
     Self = self(),
     Tag = make_ref(),
-    Sink = spawn_active_sink_with_send_log(
+    Sink = spawn_active_sink_once(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
     Opts = (fake_opts(interim))#{
@@ -928,7 +1028,7 @@ pipelined_responses_coalesce_into_one_send_test() ->
     Self = self(),
     Tag = make_ref(),
     Req = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
-    Sink = spawn_active_sink_with_send_log(
+    Sink = spawn_active_sink_once(
         Self, Tag, <<Req/binary, Req/binary, Req/binary>>
     ),
     Opts = (fake_opts(coalesced))#{
@@ -958,7 +1058,7 @@ manual_mode_bodyless_pipelined_requests_coalesce_test() ->
     Self = self(),
     Tag = make_ref(),
     Req = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
-    Sink = spawn_active_sink_with_send_log(Self, Tag, <<Req/binary, Req/binary>>),
+    Sink = spawn_active_sink_once(Self, Tag, <<Req/binary, Req/binary>>),
     Opts = (fake_opts(manual_coalesced))#{
         body_buffering := manual,
         dispatch :=
@@ -1499,7 +1599,7 @@ sendfile_dispatch_closes_socket_on_error_test() ->
     ensure_pg(),
     Self = self(),
     Tag = make_ref(),
-    Sink = spawn_active_sink_with_send_log(
+    Sink = spawn_active_sink_once(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
     HandlerFun = fun(Req) ->
@@ -1800,6 +1900,35 @@ is_hibernating_loop(Pid, Threshold, Deadline) ->
 spawn_active_sink_with_send_log(Logger, Tag, Bytes) ->
     spawn(fun() -> active_sink_loop(Logger, Tag, Bytes, false) end).
 
+%% Same, but the peer goes away once `Bytes` have been served: the conn
+%% closes instead of waiting out its keep-alive window. For tests that
+%% assert on what one request wrote and then expect a clean exit.
+spawn_active_sink_once(Logger, Tag, Bytes) ->
+    spawn(fun() -> active_sink_once_loop(Logger, Tag, Bytes, false) end).
+
+active_sink_once_loop(Logger, Tag, Bytes, Delivered) ->
+    receive
+        stop ->
+            ok;
+        {roadrunner_fake_setopts, ConnPid, _Opts} when not Delivered ->
+            ConnPid ! {roadrunner_fake_data, undefined, Bytes},
+            active_sink_once_loop(Logger, Tag, Bytes, true);
+        {roadrunner_fake_setopts, ConnPid, _Opts} ->
+            ConnPid ! {roadrunner_fake_closed, undefined},
+            active_sink_once_loop(Logger, Tag, Bytes, Delivered);
+        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} when not Delivered ->
+            ConnPid ! {roadrunner_fake_recv_reply, {ok, Bytes}},
+            active_sink_once_loop(Logger, Tag, Bytes, true);
+        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
+            ConnPid ! {roadrunner_fake_recv_reply, {error, closed}},
+            active_sink_once_loop(Logger, Tag, Bytes, Delivered);
+        {roadrunner_fake_send, _Pid, Data} ->
+            Logger ! {Tag, sent, Data},
+            active_sink_once_loop(Logger, Tag, Bytes, Delivered);
+        _Other ->
+            active_sink_once_loop(Logger, Tag, Bytes, Delivered)
+    end.
+
 active_sink_loop(Logger, Tag, Bytes, Delivered) ->
     receive
         stop ->
@@ -1896,7 +2025,19 @@ scripted_sink_loop(Logger, Tag, Script) ->
                     ConnPid ! {roadrunner_fake_data, undefined, Bytes},
                     scripted_sink_loop(Logger, Tag, Rest);
                 empty ->
-                    scripted_sink_loop(Logger, Tag, Script)
+                    %% The conn waits for the first byte of a request in
+                    %% active mode and reads the rest passively, so a
+                    %% script describes socket events without knowing
+                    %% which mode the conn is in when each one lands.
+                    %% Deliver a `passive` entry as its active-mode
+                    %% equivalent when the conn armed instead of recv'ing.
+                    case take_passive(Script) of
+                        {ok, Result, Rest} ->
+                            ConnPid ! as_active_message(Result),
+                            scripted_sink_loop(Logger, Tag, Rest);
+                        empty ->
+                            scripted_sink_loop(Logger, Tag, Script)
+                    end
             end;
         {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
             case take_passive(Script) of
@@ -1922,6 +2063,12 @@ take_active([]) -> empty.
 take_passive([{passive, Result} | Rest]) -> {ok, Result, Rest};
 take_passive([_ | Rest]) -> take_passive(Rest);
 take_passive([]) -> empty.
+
+%% The active-mode message a `gen_tcp:recv` result corresponds to, so one
+%% script drives either recv path.
+as_active_message({ok, Bytes}) -> {roadrunner_fake_data, undefined, Bytes};
+as_active_message({error, closed}) -> {roadrunner_fake_closed, undefined};
+as_active_message({error, Reason}) -> {roadrunner_fake_error, undefined, Reason}.
 
 %% Two-chunk active sink — exercises the `{more, _}` parse branch.
 %% First setopts arms → deliver Chunk1. Second setopts arms → deliver
