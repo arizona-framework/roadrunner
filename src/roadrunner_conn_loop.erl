@@ -397,6 +397,18 @@ phase_timeout(#loop_state{phase = keep_alive, keep_alive_timeout = T}) ->
 %% shorter = lower drain latency, more recv NIF calls; longer =
 %% the opposite. 100 ms matches typical ops-tooling expectations
 %% for graceful-drain detection.
+%%
+%% It looks removable now that the idle wait parks in `receive` and sees
+%% a drain immediately, since a drain should not cut an in-flight
+%% request short anyway. It is not. This bounds how long a conn stalled
+%% MID-request takes to notice: a peer that sent half its headers and
+%% went away would otherwise sit here for the whole `request_timeout`,
+%% outlive the drain deadline, and be hard-killed by
+%% `roadrunner_listener:drain/2` instead of exiting cleanly — turning a
+%% graceful drain into a forced one and reporting `{timeout, N}` rather
+%% than `{ok, drained}`. Normal traffic never pays for it: the next
+%% chunk of a request already in flight arrives in microseconds, so the
+%% cap only fires for a client that stopped sending.
 -define(DRAIN_CHECK_INTERVAL_MS, 100).
 
 -spec recv_request_bytes(#loop_state{}, integer()) -> no_return().
