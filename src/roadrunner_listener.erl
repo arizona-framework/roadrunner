@@ -202,7 +202,19 @@ Optional middleware and timing knobs (durations in milliseconds):
   `[{fullsweep_after, 0}]` so the per-conn response heap is reclaimed
   instead of hoarding it as old-gen garbage across keep-alive
   requests) and `start_timeout` (init-ack deadline, default
-  `infinity`). For the lowest *resident* memory you can also add
+  `infinity`).
+
+  `fullsweep_after, 0` makes every collection a full sweep, which is
+  what keeps the heap flat — and it is not free on handlers that
+  allocate heavily. Measured on a JSON route building a large transient
+  iolist per request, against the emulator's generational default at
+  the same CPU: throughput 51k vs 58k req/s and mean latency 3.25 ms vs
+  2.63 ms, for 189 MB vs 361 MB of RSS. Bounded memory is the safer
+  default for a server, so that is the trade taken here; a service that
+  would rather spend the memory can pass `opts => []` and get the
+  emulator's generational behaviour back.
+
+  For the lowest *resident* memory you can also add
   `+MHacul 0 +MBacul 0` to `vm.args` to return freed allocator carriers
   to the OS, but that is a tradeoff, not a free win: it raises
   allocator↔OS traffic and can hurt throughput at high core counts, so

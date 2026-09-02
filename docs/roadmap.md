@@ -40,6 +40,58 @@ Autobahn re-run.
 
 **Source:** Arizona handoff R-h2-1.
 
+## Connection setup under a connect burst — medium effort
+
+**What:** Accepting a burst of connections is about twice as slow as it
+needs to be. Measured against another BEAM server on the same machine,
+1024 simultaneous connects took ~61 ms to reach a first response versus
+~31 ms, while a request on an already-warm connection was identical
+between the two (p50 3.21 ms vs 3.22 ms). So the gap is entirely in
+accept-and-start, not in serving.
+
+**Why it matters:** it lands squarely in the tail. At a paced 10k req/s
+over 20 s with 1024 connections, the connection setups are ~0.5 % of all
+requests — which is exactly the p99.9 band, and it matches the shape of
+the published numbers, where p99 is excellent and p99.9 is 60x worse.
+Connection churn is also a workload in its own right.
+
+**Already ruled out by measurement** (3-round interleaved A/B each, so
+these are not worth re-testing):
+
+- the `pg:join` into the drain group, both by moving it after
+  `proc_lib:init_ack` (off the acceptor's critical path) and by
+  disabling `graceful_drain` entirely — both tied
+- acceptor pool size — 16 and 100 acceptors behave the same
+- garbage collection — `erlang:system_monitor` fires no `long_gc`
+
+**Where to start:** `erlang:system_monitor` attributes the stalls to the
+`tcp_inet` port being scheduled for up to 20 ms at a stretch during the
+burst, and to conn processes blocked that long inside
+`erlang:port_control/3` (the `{active, once}` re-arm). In steady state
+those stalls nearly vanish (max ~5 ms, a handful per 14 s), which is
+what points at accept rather than at serving. Worth testing whether the
+synchronous `proc_lib:start` handshake per accepted connection, or the
+single listen socket's port, is the serializer.
+
+**Scope:** medium — the instrumentation exists, the cause does not.
+
+## Drop the mid-request drain poll — small effort
+
+**What:** `recv_passive/2` still wakes every `?DRAIN_CHECK_INTERVAL_MS`
+(100 ms) to look for a drain message while reading the rest of a request
+whose first byte already arrived. Every other read path has moved past
+needing that: the first-byte wait parks in `receive` (so it sees a drain
+instantly), and the body read blocks for the full remaining deadline
+without checking at all.
+
+**Why:** a graceful drain should not cut an in-flight request short, so
+the poll has no one left to serve — it only costs wakeups on requests
+whose headers span more than one packet. Removing it would make the
+header path consistent with the body path and simplify the function.
+
+**Scope:** small — delete the tick, use the full deadline, keep the
+`{error, timeout}` handling.
+
 ## HTTP/2 stream admission follow-ups
 
 ### Pre-SETTINGS stream leniency — medium effort

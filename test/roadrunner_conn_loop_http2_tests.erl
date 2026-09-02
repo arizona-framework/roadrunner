@@ -552,10 +552,11 @@ plaintext_listener_without_h2c_stays_h1() ->
     %%
     %% - The h2 path proactively sends a SETTINGS frame on the wire
     %%   right after `shoot` (`{roadrunner_fake_send, _, _}`).
-    %% - The h1 path enters passive recv and asks the fake transport
-    %%   for bytes (`{roadrunner_fake_recv, _, _, _}`).
+    %% - The h1 path writes nothing and waits for the request's first
+    %%   byte, which on a fake socket surfaces as an arm
+    %%   (`{roadrunner_fake_setopts, _, _}`) or a recv.
     %%
-    %% Receiving the recv message (and no send) proves we routed to h1.
+    %% Waiting for bytes without writing first proves we routed to h1.
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
     Self = self(),
@@ -588,15 +589,15 @@ plaintext_listener_without_h2c_stays_h1() ->
     {ok, Pid} = roadrunner_conn_loop:start(Sock, ProtoOpts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
-    %% h1 issues a passive recv on the socket; on a fake socket that
-    %% surfaces as a `{roadrunner_fake_recv, ConnPid, Len, Timeout}`
-    %% message to our process. h2 would never do this — it goes
-    %% active-once via setopts and proactively writes SETTINGS first.
+    %% h1 waits for the request before writing anything; on a fake socket
+    %% that surfaces as an arm or a recv. h2 would have written its
+    %% SETTINGS frame first.
     receive
+        {roadrunner_fake_setopts, _, _} -> ok;
         {roadrunner_fake_recv, _, _, _} -> ok;
         {roadrunner_fake_send, _, _} -> error(unexpected_h2_send)
     after 500 ->
-        error(no_recv_call)
+        error(no_read_attempt)
     end,
     ?assert(is_process_alive(Pid)),
     cleanup(Pid, Ref).

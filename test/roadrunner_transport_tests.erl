@@ -566,10 +566,13 @@ fake_conn_drives_handler_without_sockets_test() ->
         {fake, Self}, fake_proto_opts(roadrunner_test_handler)
     ),
     ConnPid ! shoot,
+    %% The conn waits for a request's first byte in active mode, so it
+    %% arms the socket and the request arrives as a data message.
     receive
-        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
-            ConnPid ! {roadrunner_fake_recv_reply, {ok, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}}
-    after 1000 -> error(no_recv_request)
+        {roadrunner_fake_setopts, ConnPid, _Opts} ->
+            ConnPid !
+                {roadrunner_fake_data, undefined, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"}
+    after 1000 -> error(no_arm_for_request)
     end,
     Reply =
         receive

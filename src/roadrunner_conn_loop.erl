@@ -8,20 +8,34 @@
 %% function calls between phase functions. No `gen_statem` dispatch,
 %% no per-request timer arms in the steady state.
 %%
-%% ## Two recv paths
+%% ## Recv paths
 %%
-%% Default is **passive recv** — `gen_tcp:recv(Socket, 0, ChunkTimeout)`
-%% in a loop with mailbox drain checks at `?DRAIN_CHECK_INTERVAL_MS`
-%% (100 ms) granularity. Bypasses `gen_tcp_socket`'s gen_statem dispatch
-%% on every recv (saves ~7 % CPU on the hot path: `gen:do_call/4`,
-%% `recv_data_deliver/4`, `gen_statem:loop/3`, `nif_getopt/3`).
+%% Waiting for the **first byte** of a request (`recv_idle/2`) is
+%% active-mode: `{active, once}` + `receive`, parked until bytes, a close
+%% or a drain arrive. A conn can sit here for the whole keep-alive
+%% window, so it must cost nothing while it does — and a drain is seen
+%% the moment it is sent. The deadline rides the receive's own `after`,
+%% so there is still no `start_timer` / `cancel_timer` per request.
 %%
-%% When the listener sets `hibernate_after => Ms > 0`, the recv path
-%% flips to **active-mode** (`{active, once}` + receive). The receive's
-%% `after Ms` clause has a window to call `erlang:hibernate/3` between
-%% keep-alive iterations so the conn's heap GCs and shrinks — only
-%% `receive` supports hibernation; passive recv blocks the process
-%% inside a NIF.
+%% Reading the **rest of a request already in flight** is **passive
+%% recv** — `gen_tcp:recv(Socket, 0, ChunkTimeout)`, which bypasses
+%% `gen_tcp_socket`'s gen_statem dispatch (saves ~7 % CPU on the hot
+%% path: `gen:do_call/4`, `recv_data_deliver/4`, `gen_statem:loop/3`,
+%% `nif_getopt/3`). Passive recv cannot see the mailbox, so it wakes
+%% every `?DRAIN_CHECK_INTERVAL_MS` (100 ms) to look for a drain; that
+%% only applies mid-request, where the peer is already sending and a
+%% graceful drain would let the request finish regardless.
+%%
+%% Keeping the poll off the idle path matters because its cost scales
+%% with *connections* rather than requests: 1024 idle keep-alive conns
+%% polling at 100 ms burned ~1.2 cores doing nothing, which is invisible
+%% at saturation but dominates a mostly-idle server.
+%%
+%% When the listener sets `hibernate_after => Ms > 0`, the first-byte
+%% wait instead uses `recv_with_hibernate/3`, whose `after Ms` clause has
+%% a window to call `erlang:hibernate/3` between keep-alive iterations so
+%% the conn's heap GCs and shrinks — only `receive` supports hibernation;
+%% passive recv blocks the process inside a NIF.
 %%
 %% ## Phase introspection vs hot-path cost
 %%
@@ -393,13 +407,65 @@ recv_request_bytes(S0, Deadline) ->
         #loop_state{hibernate_after = Ms} = S when Ms > 0 ->
             arm_active_once(S),
             recv_with_hibernate(S, Deadline, Ms);
+        #loop_state{recv_phase_bytes = 0} = S ->
+            %% Waiting for the first byte of a request: the conn may sit
+            %% here for the whole keep-alive window, so block in `receive`
+            %% rather than poll. Passive recv cannot see the mailbox, so
+            %% that path has to wake every `?DRAIN_CHECK_INTERVAL_MS` just
+            %% to look for a drain — a cost per *connection* rather than
+            %% per request, which idle keep-alive connections pay forever.
+            recv_idle(S, Deadline);
         S ->
+            %% Mid-request: the peer is already sending and the remaining
+            %% bytes are in flight, so passive recv blocks briefly. A drain
+            %% must not cut an in-flight request short anyway.
             recv_passive(S, Deadline)
     end.
 
-%% Passive-mode recv path (default — `hibernate_after` unset or 0).
-%% Bypasses `gen_tcp_socket`'s gen_statem dispatch entirely — direct
-%% `gen_tcp:recv` call into the kernel via the prim_socket NIF.
+%% Idle wait for the next request on a keep-alive connection. Armed
+%% active-once and parked in `receive`, so the process costs nothing until
+%% bytes, a close or a drain arrive — and a drain is picked up the instant
+%% it is sent instead of on the next poll tick. The deadline rides the
+%% receive's own `after` clause: no `send_after` / `cancel_timer` pair per
+%% request, which is what kept the passive path cheap.
+-spec recv_idle(#loop_state{}, integer()) -> no_return().
+recv_idle(#loop_state{socket = Socket, buffered = Buf} = S, Deadline) ->
+    arm_active_once(S),
+    {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {DataTag, _Sock, Bytes} ->
+            %% Anchor the anti-slowloris window at this first byte rather
+            %% than at phase entry, so the idle keep-alive gap that just
+            %% ended is not counted as slow transmission. No rate check
+            %% here: the window is zero-length at its own anchor, so the
+            %% first chunk always passes. `recv_passive/2` measures every
+            %% chunk after it.
+            handle_request_bytes(
+                S#loop_state{
+                    buffered = <<Buf/binary, Bytes/binary>>,
+                    recv_phase_bytes = byte_size(Bytes),
+                    recv_phase_start = erlang:monotonic_time(millisecond)
+                },
+                Deadline
+            );
+        {ClosedTag, _Sock} ->
+            exit_normal(S);
+        {ErrorTag, _Sock, _Reason} ->
+            exit_normal(S);
+        {roadrunner_drain, _DrainDeadline} ->
+            exit_normal(S);
+        _Stray ->
+            recv_idle(S, Deadline)
+    after Remaining ->
+        timeout_response(S),
+        exit_normal(S)
+    end.
+
+%% Passive-mode recv path — reads the remainder of a request whose first
+%% byte `recv_idle/2` already took. Bypasses `gen_tcp_socket`'s gen_statem
+%% dispatch entirely — direct `gen_tcp:recv` call into the kernel via the
+%% prim_socket NIF.
 %%
 %% Drain detection: zero-timeout receive before each blocking recv
 %% drains pending `{roadrunner_drain, _}` and stray messages from
@@ -434,24 +500,19 @@ recv_passive(
                     %% the conn if `min_rate` isn't met after the 1 s
                     %% grace. Cheap when `min_rate = 0` because
                     %% `roadrunner_conn:rate_ok/3` short-circuits at
-                    %% `MinRate * Elapsed = 0`. Anchor the window at the
-                    %% first byte of the request (`PhaseBytes =:= 0`), not
-                    %% at phase entry — `recv` never returns `{ok, <<>>}`
-                    %% on a stream socket, so the first chunk always sets
-                    %% the anchor and subsequent chunks measure from there.
-                    PhaseStart1 =
-                        case PhaseBytes of
-                            0 -> Now;
-                            _ -> PhaseStart
-                        end,
+                    %% `MinRate * Elapsed = 0`. The window is already
+                    %% anchored at the request's first byte by
+                    %% `recv_idle/2`, which is the only way into this
+                    %% path, so every chunk measured here is a genuine
+                    %% continuation of a request already in flight.
                     NewBytes = PhaseBytes + byte_size(Bytes),
-                    case roadrunner_conn:rate_ok(Now - PhaseStart1, NewBytes, MinRate) of
+                    case roadrunner_conn:rate_ok(Now - PhaseStart, NewBytes, MinRate) of
                         true ->
                             handle_request_bytes(
                                 S#loop_state{
                                     buffered = <<Buf/binary, Bytes/binary>>,
                                     recv_phase_bytes = NewBytes,
-                                    recv_phase_start = PhaseStart1
+                                    recv_phase_start = PhaseStart
                                 },
                                 Deadline
                             );

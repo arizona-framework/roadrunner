@@ -188,3 +188,32 @@ roadrunner:start_listener(my_api, #{
 
 See `t:roadrunner_listener:opts/0` for the full list and the canonical
 defaults.
+
+## CPU in containers: scheduler busy-wait
+
+The listener options above bound memory. The one emulator flag worth
+setting for CPU is the scheduler busy-wait threshold. By default a
+scheduler that runs out of work spins for a while before sleeping, on
+the bet that more work is about to arrive. That bet pays off on a
+dedicated machine; in a container with a CPU quota it burns quota doing
+nothing, and the spin is charged to your workload.
+
+Add to `vm.args` when running in a container, or anywhere CPU is metered
+or shared:
+
+```
++sbwt none
++sbwtdcpu none
++sbwtdio none
+```
+
+Measured on a mostly-idle server (1024 connections, a paced 10k req/s,
+so schedulers repeatedly run dry — the shape most production services
+actually have): **CPU 265% → 110%** for the same request rate, with p99
+and p99.9 both *improving* and peak throughput unchanged. Run-to-run
+variance also drops sharply, because the spin is what was varying.
+
+The trade is real but small and worth measuring for your workload: a
+scheduler that slept must be woken, which adds latency to the first
+request that arrives after an idle gap. At saturation, where schedulers
+never run dry, these flags do nothing either way.
