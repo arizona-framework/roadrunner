@@ -214,6 +214,13 @@ Optional middleware and timing knobs (durations in milliseconds):
   would rather spend the memory can pass `opts => []` and get the
   emulator's generational behaviour back.
 
+  The choice is effectively binary — an intermediate sweep interval buys
+  no middle ground. Values of 5, 10 and 20 all measured within noise of
+  the generational default on *both* axes (≈60k req/s, ≈340 MB) on that
+  same route, because the refc-binary garbage driving the heap piles up
+  between full sweeps whatever the interval between them is. Sweep every
+  time or effectively never.
+
   For the lowest *resident* memory you can also add
   `+MHacul 0 +MBacul 0` to `vm.args` to return freed allocator carriers
   to the OS, but that is a tradeoff, not a free win: it raises
