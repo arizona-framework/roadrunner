@@ -49,6 +49,7 @@
 %% machinery directly through these functions.
 -export([
     make_recv/3,
+    drain_check_interval_ms/0,
     rate_ok/3,
     body_framing/1,
     generate_request_id/1,
@@ -524,11 +525,16 @@ set_request_logger_metadata(#{
 
 -define(RECV_BYTES_PDKEY, {?MODULE, recv_bytes}).
 
+%% Drain-detection cap when in passive recv. Each recv call is bounded
+%% to at most this many ms so the conn re-checks its mailbox for
+%% `{roadrunner_drain, _}` between blocks. Trade-off: shorter = lower
+%% drain latency, more recv NIF calls; longer = the opposite. 100 ms
+%% matches typical ops-tooling expectations for graceful-drain
+%% detection.
+-define(DRAIN_CHECK_INTERVAL_MS, 100).
+
 %% Build a recv closure with a single overall deadline plus a rolling
-%% rate check. `gen_tcp:recv` with a negative timeout is undefined, so
-%% we cap at 0 — which makes gen_tcp return `{error, timeout}`
-%% immediately when the deadline has passed. Any timeout here is, by
-%% construction, the request_timeout.
+%% rate check.
 %%
 %% Rate enforcement (anti-Slowloris): track total bytes received and
 %% time since the first recv. After a 1-second grace, require the
@@ -537,29 +543,85 @@ set_request_logger_metadata(#{
 %% allocated lazily on the first recv (see `recv_byte_counter/0`), so a
 %% request with no body to read from the socket skips the allocation
 %% entirely. `Start` is captured eagerly here, so the rate window is
-%% anchored at body-phase entry exactly as before.
+%% anchored at body-phase entry.
 -doc false.
 -spec make_recv(roadrunner_transport:socket(), integer(), non_neg_integer()) ->
-    fun(() -> {ok, binary()} | {error, request_timeout | slow_client | term()}).
+    fun(() -> {ok, binary()} | {error, request_timeout | slow_client | drained | term()}).
 make_recv(Socket, Deadline, MinRate) ->
     Start = erlang:monotonic_time(millisecond),
     _ = erase(?RECV_BYTES_PDKEY),
-    fun() ->
-        Now = erlang:monotonic_time(millisecond),
-        Remaining = max(0, Deadline - Now),
-        case roadrunner_transport:recv(Socket, 0, Remaining) of
-            {ok, Data} ->
-                Total = atomics:add_get(recv_byte_counter(), 1, byte_size(Data)),
-                case rate_ok(Now - Start, Total, MinRate) of
-                    true -> {ok, Data};
-                    false -> {error, slow_client}
-                end;
-            {error, timeout} ->
-                {error, request_timeout};
-            {error, _} = E ->
-                E
-        end
+    fun() -> recv_body_chunk(Socket, Deadline, MinRate, Start) end.
+
+%% One drain-aware body read, kept out of the closure so a
+%% chunk-timeout tick can recurse without rebuilding it.
+%%
+%% Each read is bounded by `?DRAIN_CHECK_INTERVAL_MS` rather than by the
+%% whole remaining deadline, so a peer that stalls mid-body still
+%% notices a graceful drain. Passive recv cannot see the mailbox, so
+%% without the cap a half-sent body would park here for the entire
+%% `request_timeout`, outlive the drain deadline and be hard-killed by
+%% `roadrunner_listener:drain/2` — turning a graceful drain into a
+%% forced one and reporting `{timeout, N}` rather than `{ok, drained}`.
+%% This is the same cap the header path takes in
+%% `roadrunner_conn_loop:recv_passive/2`, for the same reason. Normal
+%% traffic never pays for it: the next chunk of a body already in flight
+%% arrives in microseconds, so the cap only fires for a client that
+%% stopped sending.
+%%
+%% `gen_tcp:recv` with a negative timeout is undefined, hence the cap at
+%% 0 — which makes gen_tcp return `{error, timeout}` immediately once
+%% the deadline has passed. A timeout with time still left on the
+%% deadline is a drain-check tick and loops; one without is the
+%% request_timeout itself.
+-spec recv_body_chunk(roadrunner_transport:socket(), integer(), non_neg_integer(), integer()) ->
+    {ok, binary()} | {error, request_timeout | slow_client | drained | term()}.
+recv_body_chunk(Socket, Deadline, MinRate, Start) ->
+    case drain_pending() of
+        drain ->
+            {error, drained};
+        ok ->
+            Now = erlang:monotonic_time(millisecond),
+            Remaining = max(0, Deadline - Now),
+            ChunkTimeout = min(Remaining, ?DRAIN_CHECK_INTERVAL_MS),
+            case roadrunner_transport:recv(Socket, 0, ChunkTimeout) of
+                {ok, Data} ->
+                    Total = atomics:add_get(recv_byte_counter(), 1, byte_size(Data)),
+                    case rate_ok(Now - Start, Total, MinRate) of
+                        true -> {ok, Data};
+                        false -> {error, slow_client}
+                    end;
+                {error, timeout} when Remaining =< ChunkTimeout ->
+                    {error, request_timeout};
+                {error, timeout} ->
+                    recv_body_chunk(Socket, Deadline, MinRate, Start);
+                {error, _} = E ->
+                    E
+            end
     end.
+
+%% Zero-timeout look for a queued drain. Unlike
+%% `roadrunner_conn_loop:drain_mailbox_check/0`, which also discards
+%% every other message it finds, this matches selectively and leaves the
+%% rest of the mailbox untouched: in `manual` body buffering the handler
+%% itself drives these reads, so the conn's mailbox may already hold
+%% messages meant for the handler (a `{loop, ...}` response's pushes,
+%% say). Dropping those would lose user data. The loop's own version
+%% runs before any handler code, where nothing else can be waiting.
+-spec drain_pending() -> drain | ok.
+drain_pending() ->
+    receive
+        {roadrunner_drain, _Deadline} -> drain
+    after 0 ->
+        ok
+    end.
+
+%% Cap on a single passive recv, shared with
+%% `roadrunner_conn_loop:recv_passive/2`. Exposed as a function because
+%% the two paths live in different modules and the value must not drift.
+-doc false.
+-spec drain_check_interval_ms() -> pos_integer().
+drain_check_interval_ms() ->
+    ?DRAIN_CHECK_INTERVAL_MS.
 
 %% Get-or-create the per-request received-byte counter. Allocated lazily
 %% on the first recv so a bodyless or fully-buffered request (whose recv

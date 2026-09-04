@@ -22,9 +22,11 @@
 %% `gen_tcp_socket`'s gen_statem dispatch (saves ~7 % CPU on the hot
 %% path: `gen:do_call/4`, `recv_data_deliver/4`, `gen_statem:loop/3`,
 %% `nif_getopt/3`). Passive recv cannot see the mailbox, so it wakes
-%% every `?DRAIN_CHECK_INTERVAL_MS` (100 ms) to look for a drain; that
-%% only applies mid-request, where the peer is already sending and a
-%% graceful drain would let the request finish regardless.
+%% every `roadrunner_conn:drain_check_interval_ms/0` (100 ms) to look
+%% for a drain; that only applies mid-request, where the peer is already
+%% sending and a graceful drain would let the request finish regardless.
+%% The body read in `roadrunner_conn:recv_body_chunk/4` is the same
+%% shape for the same reason.
 %%
 %% Keeping the poll off the idle path matters because its cost scales
 %% with *connections* rather than requests: 1024 idle keep-alive conns
@@ -391,26 +393,6 @@ phase_timeout(#loop_state{phase = first, request_timeout = T}) ->
 phase_timeout(#loop_state{phase = keep_alive, keep_alive_timeout = T}) ->
     T.
 
-%% Drain-detection cap when in passive recv. Each `gen_tcp:recv` call
-%% is bounded to at most this many ms so the conn re-checks its
-%% mailbox for `{roadrunner_drain, _}` between blocks. Trade-off:
-%% shorter = lower drain latency, more recv NIF calls; longer =
-%% the opposite. 100 ms matches typical ops-tooling expectations
-%% for graceful-drain detection.
-%%
-%% It looks removable now that the idle wait parks in `receive` and sees
-%% a drain immediately, since a drain should not cut an in-flight
-%% request short anyway. It is not. This bounds how long a conn stalled
-%% MID-request takes to notice: a peer that sent half its headers and
-%% went away would otherwise sit here for the whole `request_timeout`,
-%% outlive the drain deadline, and be hard-killed by
-%% `roadrunner_listener:drain/2` instead of exiting cleanly — turning a
-%% graceful drain into a forced one and reporting `{timeout, N}` rather
-%% than `{ok, drained}`. Normal traffic never pays for it: the next
-%% chunk of a request already in flight arrives in microseconds, so the
-%% cap only fires for a client that stopped sending.
--define(DRAIN_CHECK_INTERVAL_MS, 100).
-
 -spec recv_request_bytes(#loop_state{}, integer()) -> no_return().
 recv_request_bytes(S0, Deadline) ->
     %% About to block on the socket for the next request — everything
@@ -480,12 +462,27 @@ recv_idle(#loop_state{socket = Socket, buffered = Buf} = S, Deadline) ->
 %% prim_socket NIF.
 %%
 %% Drain detection: zero-timeout receive before each blocking recv
-%% drains pending `{roadrunner_drain, _}` and stray messages from
-%% the mailbox. Each recv is capped at `?DRAIN_CHECK_INTERVAL_MS` so
-%% drain delivered while we're blocked surfaces within ~100 ms.
+%% drains pending `{roadrunner_drain, _}` and stray messages from the
+%% mailbox. Each recv is capped at
+%% `roadrunner_conn:drain_check_interval_ms/0` so a drain delivered
+%% while we're blocked surfaces within ~100 ms.
+%%
+%% That cap looks removable now that the idle wait parks in `receive`
+%% and sees a drain immediately, since a drain should not cut an
+%% in-flight request short anyway. It is not. It bounds how long a conn
+%% stalled MID-request takes to notice: a peer that sent half its
+%% headers and went away would otherwise sit here for the whole
+%% `request_timeout`, outlive the drain deadline, and be hard-killed by
+%% `roadrunner_listener:drain/2` instead of exiting cleanly — turning a
+%% graceful drain into a forced one and reporting `{timeout, N}` rather
+%% than `{ok, drained}`. The body read takes the same cap, for the same
+%% reason, in `roadrunner_conn:recv_body_chunk/4`. Normal traffic never
+%% pays for it: the next chunk of a request already in flight arrives in
+%% microseconds, so the cap only fires for a client that stopped
+%% sending.
 %%
 %% Request-timeout: tracked via the absolute `Deadline`. `{error,
-%% timeout}` from recv with `Remaining =< chunk_timeout` means the
+%% timeout}` from recv with `Remaining =< ChunkTimeout` means the
 %% request_timeout actually fired; otherwise it's a drain-check tick
 %% and we loop.
 -spec recv_passive(#loop_state{}, integer()) -> no_return().
@@ -505,7 +502,7 @@ recv_passive(
         ok ->
             Now = erlang:monotonic_time(millisecond),
             Remaining = max(0, Deadline - Now),
-            ChunkTimeout = min(Remaining, ?DRAIN_CHECK_INTERVAL_MS),
+            ChunkTimeout = min(Remaining, roadrunner_conn:drain_check_interval_ms()),
             case roadrunner_transport:recv(Socket, 0, ChunkTimeout) of
                 {ok, Bytes} ->
                     %% Anti-slowloris: track running bytes/sec and drop
@@ -551,7 +548,10 @@ recv_passive(
 %% Zero-timeout drain of the mailbox. Returns `drain` if a drain
 %% message was queued, otherwise drops every other message and
 %% returns `ok`. Stray messages don't queue forever — drained on
-%% every recv iteration.
+%% every recv iteration. Safe to discard them here because this runs
+%% before any handler code; the body read's check
+%% (`roadrunner_conn:recv_body_chunk/4`) matches selectively instead,
+%% since by then the mailbox can hold messages meant for the handler.
 -spec drain_mailbox_check() -> drain | ok.
 drain_mailbox_check() ->
     receive
@@ -765,6 +765,11 @@ read_body_phase(
                     _ = roadrunner_conn:send_request_timeout(Socket),
                     exit_normal(S2);
                 {error, slow_client} ->
+                    exit_normal(S);
+                {error, drained} ->
+                    %% Listener draining while the peer was still
+                    %% uploading. No response: the request never
+                    %% completed, and the conn is going away anyway.
                     exit_normal(S);
                 {error, BodyReason} ->
                     S2 = flush_out(S),

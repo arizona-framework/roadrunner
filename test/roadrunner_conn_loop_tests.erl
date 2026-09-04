@@ -18,6 +18,9 @@
 %%     input, sends 408 when the request_timeout fires before any
 %%     bytes arrive, exits cleanly on drain mid-recv, stays alive
 %%     across stray messages, exits silently on TCP close mid-headers.
+%%   - A drain arriving while a message body is being read is picked up
+%%     between drain ticks and closes the conn silently; a tick that
+%%     finds no drain resumes the read instead of ending the request.
 %%   - Slot release on every clean exit path.
 %%   - Telemetry pairing: every `accept` is paired with a `conn_close`.
 %% =============================================================================
@@ -347,6 +350,91 @@ request_timeout_during_body_recv_writes_408_test() ->
     Sent = iolist_to_binary(collect_sends(Tag, 100)),
     ?assertMatch(<<"HTTP/1.1 408", _/binary>>, Sent),
     Sink ! stop.
+
+drain_during_message_body_exits_silently_test() ->
+    %% Drain arriving while the conn is reading a message body — the
+    %% path past the header parse, where the recv closure built by
+    %% `roadrunner_conn:make_recv/3` owns the socket. Each read is
+    %% capped at the drain-check interval, so the tick after the drain
+    %% lands closes the conn cleanly; without the cap the conn would
+    %% hold the full request_timeout, outlive the drain deadline and be
+    %% hard-killed by `roadrunner_listener:drain/2`.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Headers = ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n",
+    Sink = spawn_headers_then_drain_sink(Self, Tag, Headers),
+    Opts = (fake_opts(drain_body))#{
+        dispatch :=
+            {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1,
+                undefined}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    %% Drain bypasses the response — no 408 for the half-sent body.
+    ?assertEqual(<<>>, iolist_to_binary(collect_sends(Tag, 50))),
+    Sink ! stop.
+
+body_read_resumes_after_drain_tick_test() ->
+    %% The counterpart: a drain-check tick that finds no drain must not
+    %% end the request. The peer pauses (one recv timeout) and then sends
+    %% the body, which still completes normally.
+    ensure_pg(),
+    Self = self(),
+    Tag = make_ref(),
+    Headers = ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n",
+    Sink = spawn_scripted_sink(Self, Tag, [
+        {passive, {ok, Headers}},
+        {passive, {error, timeout}},
+        {passive, {ok, ~"hello"}}
+    ]),
+    Opts = (fake_opts(body_tick))#{
+        dispatch :=
+            {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1,
+                undefined}
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 200", _/binary>>, Sent),
+    ?assertMatch({_, _}, binary:match(Sent, ~"hello")),
+    Sink ! stop.
+
+%% Delivers a full header block, then answers every body recv with a
+%% drain-check tick, sending `{roadrunner_drain, _}` to the conn BEFORE
+%% the reply. `roadrunner_transport:recv/3` waits on a selective receive
+%% for its reply, so same-sender ordering puts the drain in the mailbox
+%% before the conn loops back to check it. Deterministic — no sleep.
+spawn_headers_then_drain_sink(Logger, Tag, Headers) ->
+    spawn(fun() -> headers_then_drain_loop(Logger, Tag, Headers, false) end).
+
+headers_then_drain_loop(Logger, Tag, Headers, Delivered) ->
+    receive
+        stop ->
+            ok;
+        {roadrunner_fake_setopts, ConnPid, _Opts} when not Delivered ->
+            ConnPid ! {roadrunner_fake_data, undefined, Headers},
+            headers_then_drain_loop(Logger, Tag, Headers, true);
+        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
+            ConnPid ! {roadrunner_drain, infinity},
+            ConnPid ! {roadrunner_fake_recv_reply, {error, timeout}},
+            headers_then_drain_loop(Logger, Tag, Headers, Delivered);
+        {roadrunner_fake_send, _Pid, Data} ->
+            Logger ! {Tag, sent, Data},
+            headers_then_drain_loop(Logger, Tag, Headers, Delivered);
+        _Other ->
+            headers_then_drain_loop(Logger, Tag, Headers, Delivered)
+    end.
 
 tcp_error_during_body_recv_exits_silently_test() ->
     %% A transport error on the remainder of a request → silent exit.
@@ -782,8 +870,12 @@ oversized_body_writes_413_and_fires_request_rejected_test() ->
     Sink ! stop.
 
 body_recv_timeout_writes_408_test() ->
-    %% Headers say Content-Length: 100 but body recv times out. read_body
-    %% returns {error, request_timeout} → 408 + exit.
+    %% Headers say Content-Length: 100 but the body never arrives. Each
+    %% read is capped at the drain-check interval, so the scripted
+    %% timeout is only a tick; the conn keeps ticking until the absolute
+    %% deadline, and that is what read_body reports as
+    %% {error, request_timeout} → 408 + exit. Hence the short
+    %% request_timeout — otherwise the test waits out the default.
     ensure_pg(),
     Self = self(),
     Tag = make_ref(),
@@ -797,6 +889,7 @@ body_recv_timeout_writes_408_test() ->
         {passive, {error, timeout}}
     ]),
     Opts = (fake_opts(body_to))#{
+        request_timeout := 250,
         dispatch :=
             {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1,
                 undefined}
