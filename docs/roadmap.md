@@ -40,42 +40,29 @@ Autobahn re-run.
 
 **Source:** Arizona handoff R-h2-1.
 
-## HTTP/2 stream admission follow-ups
-
-### Pre-SETTINGS stream leniency — medium effort
+## Pre-SETTINGS stream leniency — small effort
 
 **What:** Do not refuse streams a client opened before it could have
-seen our advertised `max_concurrent_streams`. With prior-knowledge h2c
-a client sends its preface and a burst of HEADERS in the same flight;
-until our SETTINGS completes the round trip, RFC 9113 §5.1.2 binds the
-client only to a limit it has received, so the burst is compliant.
-Refusing the excess sheds real requests at every connection setup when
-the client's default concurrency exceeds our advertised value.
+seen our advertised `max_concurrent_streams`. With prior-knowledge h2c a
+client sends its preface and a burst of HEADERS in the same flight;
+RFC 9113 §6.5.2 makes `SETTINGS_MAX_CONCURRENT_STREAMS` *initially
+unlimited*, so the burst is compliant and refusing it sheds real
+requests at every connection setup.
 
-**Design question:** admit up to some bound until the client's SETTINGS
-ack arrives, or queue the excess and admit as slots free. Note there is
-no protocol default to fall back on: RFC 9113 §6.5.2 says
-`SETTINGS_MAX_CONCURRENT_STREAMS` is *initially unlimited*, which is
-exactly why a prior-knowledge client opens as many as it likes in its
-first flight. So "admit what the default allows" is not an option, and
-admitting the burst outright is how the multi-GiB blowup that took
-`json-h2c` to zero happened. That leaves queueing, which is the entry
-below — worth treating these as one piece of work rather than two.
+**Most of it is already handled.** Admitting the burst outright is how
+the multi-GiB blowup that took `json-h2c` to zero happened, so leniency
+needed somewhere to put the excess. `overload_mode` queueing is that
+somewhere and has shipped: with a listener-wide ceiling in queue mode an
+opening burst waits instead of being refused. What remains is only
+whether to keep admitting past the advertised per-connection limit until
+the client's SETTINGS ack arrives, which is a smaller question than it
+was.
 
-**Scope:** medium — admission bookkeeping in the h2 conn loop plus
-tests for the ack-timing windows.
-
-### Queue mode for `max_concurrent_requests` — medium effort
-
-**What:** An opt-in mode where a stream over the listener-wide
-in-flight ceiling waits for a free slot instead of being refused with
-`REFUSED_STREAM` / `H3_REQUEST_REJECTED`. Bounds live handler
-processes (and their memory) with no shed requests: latency rises
-under overload instead of the error rate. A client that does not
-retry refusals sees today's refusal mode as hard failures.
-
-**Scope:** medium — a wait queue in the conn loops for both
-multiplexed protocols, flow-control interaction, drain/timeout rules.
+**HTTP/3 does not need this.** h3 has no
+`SETTINGS_MAX_CONCURRENT_STREAMS`; stream concurrency is QUIC's, via the
+`initial_max_streams_bidi` transport parameter and `MAX_STREAMS` frames.
+The client learns the limit during the handshake, before it can open a
+stream, so there is no burst to be lenient about.
 
 ## HTTP/3 follow-ups
 
