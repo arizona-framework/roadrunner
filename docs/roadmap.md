@@ -49,6 +49,32 @@ needs to be. Measured against another BEAM server on the same machine,
 between the two (p50 3.21 ms vs 3.22 ms). So the gap is entirely in
 accept-and-start, not in serving.
 
+**Re-measure that warm before acting on it.** Those figures were taken
+against freshly started processes, and on this measurement warm-up is
+worth more than the gap being chased. Repeating one 1024-connection
+burst against a single roadrunner over plain TCP, timing connect to
+first response byte:
+
+| load generator | server | p50 | p90 |
+| --- | --- | --- | --- |
+| cold | cold | 44.9 / 48.6 ms | 46.1 / 58.6 ms |
+| cold | warm | 23.6 / 34.3 ms | 30.1 / 39.7 ms |
+| warm | warm | 7.5 / 9.7 ms | 11.7 / 13.9 ms |
+
+A cold run lands in the same band as the ~61 ms above; warm, the same
+burst is 8 to 14 ms. Note that roughly half of the cold cost belongs to
+the load generator, not to the server.
+
+This does not show the comparison was wrong. One load generator would
+have warmed the same way against both servers, so its share cancels out
+of the difference, and the two ship comparable module counts (81 here
+against 54 plus 18), which rules out the obvious "roadrunner simply has
+more to load" explanation. The gap may well be real and server-side.
+What these numbers do show is that the ones recorded above cannot settle
+it either way. A re-measurement has to warm both sides and average
+several rounds: back-to-back identical runs here came out at 23.6 and
+34.3 ms p50, so a single run carries roughly 40 % noise.
+
 **Serving itself is not the problem.** Per-request service-time
 histograms inside the conn loop, on a TLS workload of 512 connections
 and 10 KB request bodies, put roadrunner well inside budget once

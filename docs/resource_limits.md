@@ -217,3 +217,28 @@ The trade is real but small and worth measuring for your workload: a
 scheduler that slept must be woken, which adds latency to the first
 request that arrives after an idle gap. At saturation, where schedulers
 never run dry, these flags do nothing either way.
+
+## Cold start: the first requests after a deploy
+
+Outside a release the emulator runs in interactive mode, where a module
+is loaded the first time something calls into it. Only a handful of
+roadrunner's modules are resident when a listener starts; the whole
+request path is still on disk. ERTS spells out the consequence in
+"Non-blocking code loading": "The ability to prepare several modules in
+parallel is not currently used as almost all code loading is serialized
+by the code_server process." So traffic arriving at a just-started node
+queues there, and the cost lands on the first requests the deploy
+serves, not on the steady state.
+
+It is worth real time. On a 512-connection TLS workload the p99 of a
+connection's first 7 requests was 83.6 ms against a cold node and
+8.7 ms once warm, with steady-state latency identical. A 1024-connection
+burst measured from connect to first response byte took 45 ms cold and
+8 ms warm.
+
+Deploy as an OTP release and the problem does not arise: the generated
+boot script `primLoad`s every module of every application at start, in
+interactive and embedded mode alike. If you run roadrunner outside a
+release (a plain shell, an escript, a container that boots `erl`
+directly), expect the first requests after each restart to be slower,
+and send some traffic before putting the node into rotation.
