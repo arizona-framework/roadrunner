@@ -1329,6 +1329,35 @@ conn_handler_crash_returns_500_test_() ->
             end}
         end}.
 
+%% --- make_recv/3 — pure unit tests ---
+
+%% A queued drain is reported before the socket is touched, and ONLY the
+%% drain is taken. `manual` body buffering runs these reads from inside
+%% the handler, so anything else in the mailbox belongs to the handler
+%% (a `{loop, ...}` response's pushes, say) and has to survive the check.
+%% Runs in its own process: the test drives its own mailbox.
+make_recv_reports_drain_and_spares_other_messages_test_() ->
+    {spawn, fun() ->
+        Deadline = erlang:monotonic_time(millisecond) + 5000,
+        %% The socket is never read — the drain short-circuits ahead of it.
+        Recv = roadrunner_conn:make_recv({fake, self()}, Deadline, 0),
+        self() ! {push, ~"for the handler"},
+        self() ! {roadrunner_drain, infinity},
+        ?assertEqual({error, drained}, Recv()),
+        Survived =
+            receive
+                {push, Bytes} -> Bytes
+            after 0 -> none
+            end,
+        ?assertEqual(~"for the handler", Survived),
+        Leftover =
+            receive
+                {roadrunner_drain, _} -> drain
+            after 0 -> none
+            end,
+        ?assertEqual(none, Leftover)
+    end}.
+
 %% --- consume_body_reader/2 — pure unit tests ---
 
 consume_state_no_framing_returns_empty_test() ->

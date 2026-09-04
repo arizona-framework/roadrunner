@@ -939,6 +939,50 @@ drain_timeout_kills_unresponsive_conns_test_() ->
             end}
         end}.
 
+drain_closes_conn_stalled_mid_body_test_() ->
+    {setup,
+        fun() ->
+            ok = ensure_pg_started(),
+            Name = listener_test_drain_body,
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                routes => roadrunner_echo_body_handler,
+                %% Fifteen times the drain window below. A body read that
+                %% could not see the drain would park here for the whole
+                %% timeout, outlive the deadline, and be hard-killed,
+                %% turning the assertion into {timeout, 1}.
+                request_timeout => 30000
+            }),
+            {Name, roadrunner_listener:port(Name)}
+        end,
+        fun(_) -> ok end, fun({Name, Port}) ->
+            {"drain closes a conn stalled mid-body instead of hard-killing it", fun() ->
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                %% `Expect: 100-continue` with no body bytes yet: the conn
+                %% writes the interim 100 immediately before it starts
+                %% reading the body, so receiving that line proves the conn
+                %% is parked in the body read rather than still waiting on
+                %% headers. Then the client goes quiet and never sends the
+                %% 100 promised bytes.
+                ok = gen_tcp:send(
+                    Sock,
+                    <<
+                        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n"
+                        "Expect: 100-continue\r\n\r\n"
+                    >>
+                ),
+                ?assertMatch(
+                    {ok, <<"HTTP/1.1 100 Continue", _/binary>>},
+                    gen_tcp:recv(Sock, 0, 2000)
+                ),
+                ?assertEqual({ok, drained}, roadrunner_listener:drain(Name, 2000)),
+                wait_until_unregistered(Name),
+                gen_tcp:close(Sock)
+            end}
+        end}.
+
 drain_closes_keep_alive_conn_after_in_flight_request_test_() ->
     {setup,
         fun() ->

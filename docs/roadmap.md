@@ -40,7 +40,7 @@ Autobahn re-run.
 
 **Source:** Arizona handoff R-h2-1.
 
-## Connection setup under a connect burst — medium effort
+## Connection setup and warm-up cost — medium effort
 
 **What:** Accepting a burst of connections is about twice as slow as it
 needs to be. Measured against another BEAM server on the same machine,
@@ -48,6 +48,20 @@ needs to be. Measured against another BEAM server on the same machine,
 ~31 ms, while a request on an already-warm connection was identical
 between the two (p50 3.21 ms vs 3.22 ms). So the gap is entirely in
 accept-and-start, not in serving.
+
+**Where the tail sits:** per-request service-time histograms inside the
+conn loop, taken on a TLS workload of 512 connections and 10 KB request
+bodies, put roadrunner's own serving well inside budget once a
+connection is warm: p50 54-64 us, p99 152-181 us, max 724 us to 3.4 ms
+across 316,415 requests. Splitting the same run by how many requests a
+connection had already served isolates the cost to the first handful.
+For connections with fewer than 8 requests served, p90 is 13,777 us and
+p99 is 23,170 us. At 512 connections that band is 512 x 7 = 1.1 % of a
+320k-request run, which lands on the p99 boundary, and it is why a
+published p99 can be far worse than the service time behind it.
+Staggering the client's TLS handshakes over 800 ms does not remove it,
+so the cost is warm-up spread across a connection's first requests, not
+accept contention alone.
 
 **Why it matters:** it lands squarely in the tail. At a paced 10k req/s
 over 20 s with 1024 connections, the connection setups are ~0.5 % of all
@@ -73,6 +87,19 @@ these are not worth re-testing):
   a pool of acceptors the blocking is parallel, so it is not the serial
   constraint; starting and scheduling the conn processes themselves
   costs the same either way.
+- the read path. On this workload the conn loop makes zero passive
+  `recv` calls: the whole 10 KB request arrives in one `{active, once}`
+  delivery, and `recv` engages only once a request outgrows the 64 KB
+  listener buffer (measured 0, 1 and 4 calls per request for 10 KB,
+  64 KB and 256 KB bodies). Where it does engage, active-mode reads
+  measured ~2.5 % worse at p50 and unchanged at p99, and `{active, 64}`
+  batching saved ~8 us per request (~3 % of p50) with no p99 movement.
+  The gen_statem cost on TLS is real but sits in `ssl:setopts` and
+  `ssl:send`, about 30 us per request, far too small to explain a
+  p99-to-average ratio of 17.
+- the keep-alive request cap, CPU throttling in the container, VM flag
+  asymmetry, Nagle, and hibernation, each checked and none of them
+  moving the tail.
 
 **Also inconclusive:** spreading accepts over a pool of `SO_REUSEPORT`
 listen sockets (8 vs 1, same total acceptors, isolated from roadrunner
