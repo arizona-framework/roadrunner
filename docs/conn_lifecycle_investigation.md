@@ -336,3 +336,143 @@ boundary — needs its own design pass. Deferred.
 
 Roadrunner currently leads cowboy on this scenario; pursuing more
 WS optimization without a fresh signal is gilding the lily.
+
+## Round 5 — connect burst: null result
+
+The roadmap carried a "medium effort" item claiming a 1024-connection
+burst was "about twice as slow as it needs to be", from a measurement of
+~61 ms to a first response against ~31 ms for another BEAM server. Three
+things turned out to be wrong with that premise.
+
+### The recorded numbers were taken cold
+
+Repeating the burst against one roadrunner over plain TCP, timing
+connect to first response byte, varying only warmth:
+
+| load generator | server | p50 | p90 |
+| --- | --- | --- | --- |
+| cold | cold | 44.9 / 48.6 ms | 46.1 / 58.6 ms |
+| cold | warm | 23.6 / 34.3 ms | 30.1 / 39.7 ms |
+| warm | warm | 7.5 / 9.7 ms | 11.7 / 13.9 ms |
+
+A cold run reproduces the recorded ~61 ms; warm, the same burst is 8 to
+14 ms, and roughly half the cold cost belongs to the load generator
+rather than the server. So the figure characterises warm-up, not the
+accept path. Cold start itself is lazy code loading serialized by the
+code server, which a release boot script avoids entirely; see
+`resource_limits.md`.
+
+### Measured against the floor there is no 2x
+
+A minimal accept-and-reply server with the same listen options and
+acceptor count, doing no HTTP parsing, routing, telemetry or accounting,
+under the same client. Medians of 9 warm rounds each:
+
+| server | p50 | p90 |
+| --- | --- | --- |
+| bare accept-and-reply | 5.3 ms | 7.5 ms |
+| roadrunner | 8.9 ms | 14.5 ms |
+
+roadrunner sits about 3.5 us per connection above a server that does no
+HTTP work at all. That is the entire budget available, not 2x.
+
+### The socket ownership transfer costs nothing
+
+eprof over a warm burst put `erts_internal:port_control/3` at 16.9% with
+9 calls per connection, and the `prim_inet` option-marshalling family at
+another ~16%. Six of those nine round trips come from
+`inet:tcp_controlling_process/2` (setopts, getopts, transfer, setopts),
+which pointed at removing the handoff. It does not help. Four handoff
+shapes of the same bare server, differing only in how the socket reaches
+the process that serves it, medians of 9 warm rounds:
+
+| handoff | p50 | p90 |
+| --- | --- | --- |
+| spawn, no transfer | 5.3 ms | 7.5 ms |
+| spawn + `controlling_process` | 4.6 ms | 5.9 ms |
+| acceptor becomes the conn process, no transfer at all | 5.8 ms | 7.3 ms |
+
+Adding the transfer measured nominally *faster* than omitting it, and
+eliminating it architecturally was no better than keeping it. Its cost
+sits below the noise floor of this measurement.
+
+**Treat `prim_inet` entries in a profile with suspicion.** Round 3 above
+hit the same top-of-profile signature and it was equally misleading
+there. Tracing overhead falls heavily on cheap port operations, so their
+share is inflated; only a controlled A/B settles whether removing them
+buys anything.
+
+### Outcome
+
+There is no single dominant cost in connection setup. The ~3.5 us per
+connection over the floor is spread across work an HTTP server has to
+do: parsing, routing, telemetry, counters, the drain-group join, the
+request id, the date header. Nothing here justifies restructuring the
+accept path, so the roadmap item is closed.
+
+Two costs are real but only bite on connection churn, recorded in case
+they matter later. The `Date` header cache in
+`roadrunner_http:http_date_now/0` is a process-dictionary cache keyed on
+the current second, so a workload serving one request per connection
+recomputes it every time, ~2% of a churn profile; a shared clock would
+need an owner process and an ETS table, and `persistent_term` is the
+wrong tool because a per-second update triggers a global scan.
+`crypto:strong_rand_bytes/1` for the request id is ~1.7%. Both amortise
+to nothing under keep-alive.
+
+### Carried over from the roadmap entry
+
+**Already ruled out by measurement** (3-round interleaved A/B each, so
+these are not worth re-testing):
+
+- the `pg:join` into the drain group, both by moving it after
+  `proc_lib:init_ack` (off the acceptor's critical path) and by
+  disabling `graceful_drain` entirely — both tied
+- acceptor pool size — 16 and 100 acceptors behave the same
+- garbage collection — `erlang:system_monitor` fires no `long_gc`
+- the synchronous `proc_lib:start` handshake per accepted connection.
+  Instrumenting the accept path shows it *is* where the acceptor's time
+  goes — 870 us of a 875 us total per connection, against 2 us for
+  `controlling_process` and 0.2 us for the `shoot` send — because the
+  acceptor waits for the new process to be scheduled and ack. But
+  spawning asynchronously instead (no init-ack round trip) cuts that to
+  2 us per connection and leaves time-to-first-response unchanged. With
+  a pool of acceptors the blocking is parallel, so it is not the serial
+  constraint; starting and scheduling the conn processes themselves
+  costs the same either way.
+- the read path. On this workload the conn loop makes zero passive
+  `recv` calls: the whole 10 KB request arrives in one `{active, once}`
+  delivery, and `recv` engages only once a request outgrows the 64 KB
+  listener buffer (measured 0, 1 and 4 calls per request for 10 KB,
+  64 KB and 256 KB bodies). Where it does engage, active-mode reads
+  measured ~2.5 % worse at p50 and unchanged at p99, and `{active, 64}`
+  batching saved ~8 us per request (~3 % of p50) with no p99 movement.
+  The gen_statem cost on TLS is real but sits in `ssl:setopts` and
+  `ssl:send`, about 30 us per request, far too small to explain a
+  p99-to-average ratio of 17.
+- the keep-alive request cap, CPU throttling in the container, VM flag
+  asymmetry, Nagle, and hibernation, each checked and none of them
+  moving the tail.
+
+**Also inconclusive:** spreading accepts over a pool of `SO_REUSEPORT`
+listen sockets (8 vs 1, same total acceptors, isolated from roadrunner
+in a minimal accept-and-reply server) measured tied — one round of three
+suggested the median halved, but finer sampling reversed it. Run-to-run
+variance on a 24-core laptop is larger than the effect being chased
+(p50 ranged 4.6-14.6 ms for an identical configuration), so this needs a
+quiet, larger machine before it means anything either way. Note the h3
+stack already pools listeners this way, so the machinery has precedent
+if it does turn out to help.
+
+**Stalls seen during the burst:** `erlang:system_monitor` attributed
+them to the `tcp_inet` port being scheduled for up to 20 ms at a stretch,
+and to conn processes blocked that long inside `erlang:port_control/3`
+(the `{active, once}` re-arm). In steady state they nearly vanish (max
+~5 ms, a handful per 14 s). That reading pointed at the accept path and
+at `port_control`, and both suspects are now settled above: the
+`proc_lib:start` handshake and the ownership transfer that drives most
+of those `port_control` calls were each measured directly and cost
+nothing. What remained untested was the single listen socket's port,
+which the `SO_REUSEPORT` experiment above could not resolve on this
+machine. With the whole gap to the floor now measured at ~3.5 us per
+connection, there is not enough left for it to be worth chasing.
