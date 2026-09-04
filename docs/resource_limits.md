@@ -213,7 +213,39 @@ actually have): **CPU 265% → 110%** for the same request rate, with p99
 and p99.9 both *improving* and peak throughput unchanged. Run-to-run
 variance also drops sharply, because the spin is what was varying.
 
-The trade is real but small and worth measuring for your workload: a
-scheduler that slept must be woken, which adds latency to the first
-request that arrives after an idle gap. At saturation, where schedulers
-never run dry, these flags do nothing either way.
+How the trade lands depends on how long the idle gaps are, so measure
+your own workload. Where gaps are long — a paced service at a low rate,
+the case above — a scheduler would sleep through them anyway and these
+flags mostly just stop it burning quota. Where gaps are short, a fast
+request-response or WebSocket echo with microseconds between messages,
+the spin is precisely what keeps a scheduler from sleeping between them,
+and switching it off costs real latency: on a 64-connection WebSocket
+ping-pong, RTT p50 went from 169-181 us to 247-257 us with the busy-wait
+disabled, a 42-46% regression, and throughput fell about 30%. At true
+saturation, where a scheduler always has another process ready to run,
+the spin never triggers and the flags do nothing either way.
+
+## Cold start: the first requests after a deploy
+
+Outside a release the emulator runs in interactive mode, where a module
+is loaded the first time something calls into it. Only a handful of
+roadrunner's modules are resident when a listener starts; the whole
+request path is still on disk. ERTS spells out the consequence in
+"Non-blocking code loading": "The ability to prepare several modules in
+parallel is not currently used as almost all code loading is serialized
+by the code_server process." So traffic arriving at a just-started node
+queues there, and the cost lands on the first requests the deploy
+serves, not on the steady state.
+
+It is worth real time. On a 512-connection TLS workload the p99 of a
+connection's first 7 requests was 83.6 ms against a cold node and
+8.7 ms once warm, with steady-state latency identical. A 1024-connection
+burst measured from connect to first response byte took 45 ms cold and
+8 ms warm.
+
+Deploy as an OTP release and the problem does not arise: the generated
+boot script `primLoad`s every module of every application at start, in
+interactive and embedded mode alike. If you run roadrunner outside a
+release (a plain shell, an escript, a container that boots `erl`
+directly), expect the first requests after each restart to be slower,
+and send some traffic before putting the node into rotation.
