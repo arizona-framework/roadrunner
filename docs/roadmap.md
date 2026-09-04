@@ -40,7 +40,7 @@ Autobahn re-run.
 
 **Source:** Arizona handoff R-h2-1.
 
-## Connection setup and warm-up cost — medium effort
+## Connection setup under a connect burst — medium effort
 
 **What:** Accepting a burst of connections is about twice as slow as it
 needs to be. Measured against another BEAM server on the same machine,
@@ -49,25 +49,49 @@ needs to be. Measured against another BEAM server on the same machine,
 between the two (p50 3.21 ms vs 3.22 ms). So the gap is entirely in
 accept-and-start, not in serving.
 
-**Where the tail sits:** per-request service-time histograms inside the
-conn loop, taken on a TLS workload of 512 connections and 10 KB request
-bodies, put roadrunner's own serving well inside budget once a
-connection is warm: p50 54-64 us, p99 152-181 us, max 724 us to 3.4 ms
-across 316,415 requests. Splitting the same run by how many requests a
-connection had already served isolates the cost to the first handful.
-For connections with fewer than 8 requests served, p90 is 13,777 us and
-p99 is 23,170 us. At 512 connections that band is 512 x 7 = 1.1 % of a
-320k-request run, which lands on the p99 boundary, and it is why a
-published p99 can be far worse than the service time behind it.
-Staggering the client's TLS handshakes over 800 ms does not remove it,
-so the cost is warm-up spread across a connection's first requests, not
-accept contention alone.
+**Serving itself is not the problem.** Per-request service-time
+histograms inside the conn loop, on a TLS workload of 512 connections
+and 10 KB request bodies, put roadrunner well inside budget once
+traffic is flowing: p50 54-64 us, p99 152-181 us, max 724 us to 3.4 ms
+across 316,415 requests.
 
-**Why it matters:** it lands squarely in the tail. At a paced 10k req/s
-over 20 s with 1024 connections, the connection setups are ~0.5 % of all
-requests — which is exactly the p99.9 band, and it matches the shape of
-the published numbers, where p99 is excellent and p99.9 is 60x worse.
-Connection churn is also a workload in its own right.
+**The first requests of a run are slow, and it is cold start.** A run
+that splits requests by how many a connection has already served does
+show a large spike on the first handful. That is not a property of the
+connection. Three within-run comparisons on the same TLS workload, each
+opening a second cohort of connections part way through under identical
+load and timing every request after the handshake, separate the
+candidates:
+
+| cohort | first 7, p99 | own steady, p99 |
+| --- | --- | --- |
+| opened at t=0, nothing warmed | 86,686 us | 6,884 us |
+| opened at t=0, nothing warmed (second run) | 72,515 us | 11,500 us |
+| opened at t=10 s, staggered over 500 ms | 5,335 us | 7,413 us |
+| opened at t=10 s, all 512 at once | 7,275 us | 12,613 us |
+| opened at t=0, after 5 s of discarded traffic | 4,414 us | 6,729 us |
+
+A new connection pays nothing extra, whether it arrives alone or as a
+512-connection burst, so long as the system is warm. Five seconds of
+traffic thrown away before measuring removes the spike outright, and
+the t=0 cohort then matches a late-joining one. So a benchmark that
+opens every connection immediately after the server starts charges VM
+and code warm-up to its own p99, and that band is roughly the first
+1 % of requests. Caveat on these numbers: the load generator shared a
+BEAM with the server, so "cold" covers both sides and the split between
+client-side and server-side warm-up is still open; the absolute
+latencies are laptop numbers and only the within-run comparison
+carries.
+
+**Why it matters:** connection churn is a workload in its own right, and
+anything that reconnects often pays the accept cost every time. It was
+previously argued here that accept-and-start also explained the tail in
+published latency numbers, on the grounds that connection setups are
+~0.5 % of requests at a paced 10k req/s over 20 s with 1024 connections
+and so land in the p99.9 band. That inference no longer holds: cold
+start covers a band of about the same size, and a warm system shows no
+per-connection or per-burst cost at all. The accept gap stands on its
+own direct measurement, not on that reasoning.
 
 **Already ruled out by measurement** (3-round interleaved A/B each, so
 these are not worth re-testing):
