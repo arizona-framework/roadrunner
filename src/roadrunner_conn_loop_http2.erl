@@ -258,6 +258,15 @@
     %% passes them to `roadrunner_conn` directly. See `dispatch_stream/2`.
     max_concurrent_requests = infinity :: infinity | pos_integer(),
     inflight_counter :: counters:counters_ref() | undefined,
+    %% What happens to a stream that arrives over the ceiling: refuse it
+    %% (the default) or park it until a slot frees. Read from proto_opts
+    %% at `enter/6` so the per-stream path never re-reads the map.
+    overload = refuse :: roadrunner_conn:overload(),
+    %% Streams parked waiting for an in-flight slot, holding the request
+    %% already assembled for them. The loop must NOT block waiting: it
+    %% releases slots by processing its own workers' `DOWN` messages, so
+    %% a blocked loop would wait on something only it can deliver.
+    awaiting_slot = #{} :: #{stream_id() => roadrunner_req:request()},
     %% Per-peer rate-limit guard resolved from proto_opts + peer at `enter/6`
     %% (`undefined` when off). Checked in `dispatch_stream/2`.
     rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
@@ -350,6 +359,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered) ->
         alt_svc = AltSvc,
         max_concurrent_requests = MaxConcReq,
         inflight_counter = InflightCounter,
+        overload = maps:get(overload, ProtoOpts, refuse),
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
         handshake_timeout = HandshakeTimeout,
         idle_timeout = IdleTimeout
@@ -517,6 +527,8 @@ recv_more(
             recv_more(handle_send_response(State, From, Ref, StreamId, Status, Headers, Body));
         {'DOWN', MonRef, process, _Pid, Reason} ->
             recv_more(maybe_exit_when_drained(handle_worker_down(State, MonRef, Reason)));
+        {roadrunner_slot, StreamId, Outcome} ->
+            recv_more(handle_slot(State, StreamId, Outcome));
         {roadrunner_drain, _Deadline} ->
             recv_more(maybe_exit_when_drained(start_drain(State)))
     after recv_timeout(State) ->
@@ -1127,7 +1139,8 @@ dispatch_stream(
         scheme = Scheme,
         listener_name = ListenerName,
         max_concurrent_requests = MaxConcReq,
-        inflight_counter = InflightCounter
+        inflight_counter = InflightCounter,
+        overload = Overload
     } = State
 ) ->
     #{
@@ -1163,8 +1176,8 @@ dispatch_stream(
                             frame_loop(remove_stream(State1, StreamId));
                         ok ->
                             case
-                                roadrunner_conn:try_acquire_request_slot(
-                                    MaxConcReq, InflightCounter
+                                roadrunner_conn:acquire_request_slot(
+                                    MaxConcReq, InflightCounter, Overload, StreamId
                                 )
                             of
                                 true ->
@@ -1181,6 +1194,20 @@ dispatch_stream(
                                         streams = Streams#{StreamId := Stream1},
                                         worker_refs =
                                             (StateBuf#loop.worker_refs)#{MonRef => StreamId}
+                                    });
+                                queued ->
+                                    %% Over the ceiling, but this listener
+                                    %% parks rather than sheds. Keep the
+                                    %% assembled request and go back to the
+                                    %% frame loop; the grant arrives as a
+                                    %% message.
+                                    Parked = Stream#{
+                                        state := half_closed_remote, body := []
+                                    },
+                                    Awaiting = StateBuf#loop.awaiting_slot,
+                                    frame_loop(StateBuf#loop{
+                                        streams = Streams#{StreamId := Parked},
+                                        awaiting_slot = Awaiting#{StreamId => Req}
                                     });
                                 false ->
                                     %% Listener-wide in-flight ceiling reached —
@@ -1322,7 +1349,9 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
             %% worker ref so a worker is accounted for by its `DOWN` here or
             %% by the conn's clean exit, never both.
             ok = roadrunner_conn:release_request_slot(
-                State#loop.max_concurrent_requests, State#loop.inflight_counter
+                State#loop.max_concurrent_requests,
+                State#loop.inflight_counter,
+                State#loop.overload
             ),
             State1 = State#loop{worker_refs = maps:remove(MonRef, Refs)},
             case Reason of
@@ -1658,14 +1687,19 @@ reset_stream(State0, StreamId) ->
                 %% place that can release the slot — `handle_worker_down`
                 %% never runs and `exit_clean` no longer sees the ref.
                 ok = roadrunner_conn:release_request_slot(
-                    State#loop.max_concurrent_requests, State#loop.inflight_counter
+                    State#loop.max_concurrent_requests,
+                    State#loop.inflight_counter,
+                    State#loop.overload
                 ),
                 maps:remove(MonRef, Refs)
         end,
-    State#loop{
-        streams = maps:remove(StreamId, Streams),
-        worker_refs = Refs1
-    }.
+    withdraw_parked(
+        State#loop{
+            streams = maps:remove(StreamId, Streams),
+            worker_refs = Refs1
+        },
+        StreamId
+    ).
 
 %% Called by `handle_worker_down/3` when a worker dies abnormally.
 %% Send RST_STREAM(error_code) to the peer and drop our state.
@@ -1674,13 +1708,71 @@ abort_stream(State0, StreamId, ErrorCode) ->
     #{StreamId := #{pending_sends := Pending}} = Streams,
     notify_pending_reset(StreamId, Pending),
     _ = send_rst_stream(State, StreamId, ErrorCode),
-    State#loop{streams = maps:remove(StreamId, Streams)}.
+    withdraw_parked(State#loop{streams = maps:remove(StreamId, Streams)}, StreamId).
 
 %% Worker exited normally (handler done, all frames already on the
 %% wire). Just drop state.
 remove_stream(State0, StreamId) ->
-    #loop{streams = Streams} = State = uncount_stream(State0, StreamId),
+    #loop{streams = Streams} = State = withdraw_parked(uncount_stream(State0, StreamId), StreamId),
     State#loop{streams = maps:remove(StreamId, Streams)}.
+
+%% Withdraw a request parked for a slot. Every path that drops a stream
+%% goes through here, so `awaiting_slot` never outlives its stream entry
+%% and a grant can always find the stream it was granted for. A grant
+%% already in flight still arrives; `handle_slot/3` gives that slot back.
+-spec withdraw_parked(#loop{}, stream_id()) -> #loop{}.
+withdraw_parked(#loop{awaiting_slot = Awaiting, overload = Overload} = State, StreamId) ->
+    case Awaiting of
+        #{StreamId := _} ->
+            ok = roadrunner_conn:cancel_slot_wait(Overload, StreamId),
+            State#loop{awaiting_slot = maps:remove(StreamId, Awaiting)};
+        _ ->
+            State
+    end.
+
+%% A parked stream's admission resolved. `granted` means the queue has
+%% already taken the slot on our behalf, so a stream that has gone away
+%% in the meantime must hand it back rather than drop it.
+-spec handle_slot(#loop{}, stream_id(), granted | timeout | full) -> #loop{}.
+handle_slot(#loop{awaiting_slot = Awaiting} = State, StreamId, granted) ->
+    case Awaiting of
+        #{StreamId := Req} ->
+            spawn_parked(
+                State#loop{awaiting_slot = maps:remove(StreamId, Awaiting)}, StreamId, Req
+            );
+        _ ->
+            give_back_slot(State)
+    end;
+handle_slot(#loop{awaiting_slot = Awaiting, listener_name = ListenerName} = State, StreamId, _) ->
+    case Awaiting of
+        #{StreamId := _} ->
+            State1 = State#loop{awaiting_slot = maps:remove(StreamId, Awaiting)},
+            ok = throttle_stream(State1, ListenerName),
+            _ = send_rst_stream(State1, StreamId, refused_stream),
+            remove_stream(State1, StreamId);
+        _ ->
+            State
+    end.
+
+%% `withdraw_parked/2` keeps `awaiting_slot` and `streams` in step, so a
+%% grant that still has its parked request always has its stream too.
+-spec spawn_parked(#loop{}, stream_id(), roadrunner_req:request()) -> #loop{}.
+spawn_parked(#loop{streams = Streams, proto_opts = ProtoOpts} = State, StreamId, Req) ->
+    #{StreamId := Stream} = Streams,
+    {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(self(), StreamId, Req, ProtoOpts),
+    State#loop{
+        streams = Streams#{StreamId := Stream#{worker_pid := WorkerPid, worker_ref := MonRef}},
+        worker_refs = (State#loop.worker_refs)#{MonRef => StreamId}
+    }.
+
+-spec give_back_slot(#loop{}) -> #loop{}.
+give_back_slot(State) ->
+    ok = roadrunner_conn:release_request_slot(
+        State#loop.max_concurrent_requests,
+        State#loop.inflight_counter,
+        State#loop.overload
+    ),
+    State.
 
 notify_pending_reset(StreamId, Pending) ->
     case queue:out(Pending) of
@@ -1863,7 +1955,8 @@ exit_clean(#loop{
     start_mono = StartMono,
     worker_refs = Refs,
     max_concurrent_requests = MaxConcReq,
-    inflight_counter = InflightCounter
+    inflight_counter = InflightCounter,
+    overload = Overload
 }) ->
     roadrunner_telemetry:listener_conn_close(StartMono, #{
         listener_name => ListenerName,
@@ -1873,7 +1966,9 @@ exit_clean(#loop{
     %% Account for any stream workers still live at teardown (each holds one
     %% in-flight slot). Workers whose `DOWN` already fired were removed from
     %% `worker_refs`, so this releases each remaining worker exactly once.
-    ok = roadrunner_conn:release_request_slots(MaxConcReq, InflightCounter, map_size(Refs)),
+    ok = roadrunner_conn:release_request_slots(
+        MaxConcReq, InflightCounter, map_size(Refs), Overload
+    ),
     ok = roadrunner_conn:release_slot(ProtoOpts),
     ok = roadrunner_transport:close(Socket),
     exit(normal).

@@ -863,6 +863,83 @@ drain(Sock) ->
     end.
 
 %% =============================================================================
+%% overload_mode
+%% =============================================================================
+
+overload_mode_rejects_bad_config_test() ->
+    ok = ensure_pg_started(),
+    Base = #{port => 0, routes => roadrunner_hello_handler, max_concurrent_requests => 4},
+    %% Validation runs in `init/1`, so a bad opt comes back as a start
+    %% error rather than an exception in the caller.
+    Queue = {queue, #{max_queued => 1, timeout => 1}},
+    %% Queue mode with nothing to queue behind is a configuration error,
+    %% not a silent no-op.
+    ?assertMatch(
+        {error, {
+            {invalid_listener_opt, overload_mode, {Queue, requires_max_concurrent_requests}}, _
+        }},
+        roadrunner_listener:start_link(
+            overload_bad_1,
+            maps:remove(max_concurrent_requests, Base#{overload_mode => Queue})
+        )
+    ),
+    ?assertMatch(
+        {error, {{invalid_listener_opt, overload_mode, nonsense}, _}},
+        roadrunner_listener:start_link(overload_bad_2, Base#{overload_mode => nonsense})
+    ),
+    ?assertMatch(
+        {error, {{invalid_listener_opt, overload_mode, {queue, _}}, _}},
+        roadrunner_listener:start_link(overload_bad_3, Base#{
+            overload_mode => {queue, #{max_queued => 0, timeout => 1}}
+        })
+    ),
+    %% A supplied value is still validated even though it has a default.
+    ?assertMatch(
+        {error, {{invalid_listener_opt, overload_mode, {queue, _}}, _}},
+        roadrunner_listener:start_link(overload_bad_4, Base#{
+            overload_mode => {queue, #{timeout => nonsense}}
+        })
+    ).
+
+%% Both knobs are optional: `{queue, #{}}` derives `timeout` from
+%% `request_timeout` and `max_queued` from the ceiling, so the feature is
+%% usable without inventing numbers.
+overload_mode_queue_derives_its_knobs_test() ->
+    ok = ensure_pg_started(),
+    Name = overload_queue_derived,
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        routes => roadrunner_hello_handler,
+        max_concurrent_requests => 4,
+        overload_mode => {queue, #{}}
+    }),
+    Port = roadrunner_listener:port(Name),
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+    {ok, Reply} = gen_tcp:recv(Sock, 0, 2000),
+    ?assertMatch(<<"HTTP/1.1 200", _/binary>>, Reply),
+    ok = gen_tcp:close(Sock),
+    ok = roadrunner_listener:stop(Name).
+
+overload_mode_queue_starts_a_listener_test() ->
+    ok = ensure_pg_started(),
+    Name = overload_queue_ok,
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        routes => roadrunner_hello_handler,
+        max_concurrent_requests => 4,
+        overload_mode => {queue, #{max_queued => 16, timeout => 1000}}
+    }),
+    %% A plain request is unaffected: the ceiling is nowhere near reached.
+    Port = roadrunner_listener:port(Name),
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+    {ok, Reply} = gen_tcp:recv(Sock, 0, 2000),
+    ?assertMatch(<<"HTTP/1.1 200", _/binary>>, Reply),
+    ok = gen_tcp:close(Sock),
+    ok = roadrunner_listener:stop(Name).
+
+%% =============================================================================
 %% Graceful shutdown via drain/2.
 %% =============================================================================
 
