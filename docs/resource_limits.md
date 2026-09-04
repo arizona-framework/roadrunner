@@ -213,10 +213,17 @@ actually have): **CPU 265% → 110%** for the same request rate, with p99
 and p99.9 both *improving* and peak throughput unchanged. Run-to-run
 variance also drops sharply, because the spin is what was varying.
 
-The trade is real but small and worth measuring for your workload: a
-scheduler that slept must be woken, which adds latency to the first
-request that arrives after an idle gap. At saturation, where schedulers
-never run dry, these flags do nothing either way.
+How the trade lands depends on how long the idle gaps are, so measure
+your own workload. Where gaps are long — a paced service at a low rate,
+the case above — a scheduler would sleep through them anyway and these
+flags mostly just stop it burning quota. Where gaps are short, a fast
+request-response or WebSocket echo with microseconds between messages,
+the spin is precisely what keeps a scheduler from sleeping between them,
+and switching it off costs real latency: on a 64-connection WebSocket
+ping-pong, RTT p50 went from 169-181 us to 247-257 us with the busy-wait
+disabled, a 42-46% regression, and throughput fell about 30%. At true
+saturation, where a scheduler always has another process ready to run,
+the spin never triggers and the flags do nothing either way.
 
 ## Cold start: the first requests after a deploy
 
