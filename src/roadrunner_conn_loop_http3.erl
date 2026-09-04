@@ -145,6 +145,15 @@
     %% them to `roadrunner_conn` directly. See `dispatch_decoded/3`.
     max_concurrent_requests = infinity :: infinity | pos_integer(),
     inflight_counter :: counters:counters_ref() | undefined,
+    %% What happens to a request that arrives over the ceiling: refuse it
+    %% (the default) or park it until a slot frees. Read from proto_opts
+    %% alongside the two fields above.
+    overload = refuse :: roadrunner_conn:overload(),
+    %% Requests parked waiting for an in-flight slot, already assembled.
+    %% The loop must NOT block waiting: it releases slots by processing
+    %% its own workers' `DOWN` messages, so a blocked loop would wait on
+    %% something only it can deliver.
+    awaiting_slot = #{} :: #{non_neg_integer() => roadrunner_req:request()},
     %% Per-peer rate-limit guard resolved from proto_opts + peer at conn start
     %% (`undefined` when off). Checked in `dispatch_decoded/4`.
     rate_limit = undefined :: roadrunner_conn:rate_limit_state()
@@ -210,6 +219,7 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
         ),
         max_concurrent_requests = maps:get(max_concurrent_requests, ProtoOpts, infinity),
         inflight_counter = maps:get(inflight_counter, ProtoOpts, undefined),
+        overload = maps:get(overload, ProtoOpts, refuse),
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer)
     }).
 
@@ -245,6 +255,8 @@ recv_loop(#h3{conn = Conn} = State) ->
             terminate(State);
         {'DOWN', MonRef, process, _Pid, Reason} ->
             loop(handle_worker_down(State, MonRef, Reason));
+        {roadrunner_slot, StreamId, Outcome} ->
+            loop(handle_slot(State, StreamId, Outcome));
         {roadrunner_drain, _Deadline} ->
             %% Begin a graceful drain: send GOAWAY, refuse new requests,
             %% let in-flight ones finish (the `loop/1` head closes the
@@ -313,8 +325,16 @@ start_drain(#h3{conn = Conn, control_stream_id = CtrlId, last_request_id = LastI
 -spec is_drained(#h3{}) -> boolean().
 is_drained(#h3{goaway_id = undefined}) ->
     false;
-is_drained(#h3{streams = Streams, worker_refs = WorkerRefs}) ->
-    map_size(Streams) =:= 0 andalso map_size(WorkerRefs) =:= 0.
+is_drained(#h3{streams = Streams, worker_refs = WorkerRefs, awaiting_slot = Awaiting}) ->
+    %% A request parked for an in-flight slot is in neither `streams` (it
+    %% is fully received) nor `worker_refs` (no worker yet), but it has
+    %% been accepted and still owes the client a response. Leaving it out
+    %% here would close the connection under it, silently dropping a
+    %% request the peer sent before the GOAWAY. Its wait is bounded by
+    %% the queue deadline, and the listener force-closes at the drain
+    %% deadline regardless.
+    map_size(Streams) =:= 0 andalso map_size(WorkerRefs) =:= 0 andalso
+        map_size(Awaiting) =:= 0.
 
 %% Track the highest request stream id accepted, for the drain GOAWAY id.
 -spec note_request_id(#h3{}, non_neg_integer()) -> #h3{}.
@@ -459,9 +479,16 @@ handle_stream_reset(#h3{uni = Uni, streams = Streams, worker_pids = WorkerPids} 
                     _ = (WorkerPid ! {roadrunner_stream_reset, StreamId}),
                     State;
                 _ ->
-                    %% Still mid-receive (or already gone) — drop the
-                    %% in-progress frame-accumulation entry.
-                    State#h3{streams = maps:remove(StreamId, Streams)}
+                    %% Still mid-receive, parked for a slot, or already
+                    %% gone. Drop the frame-accumulation entry and
+                    %% withdraw any parked request; a grant already in
+                    %% flight still arrives and `handle_slot/3` gives
+                    %% that slot back.
+                    ok = roadrunner_conn:cancel_slot_wait(State#h3.overload, StreamId),
+                    State#h3{
+                        streams = maps:remove(StreamId, Streams),
+                        awaiting_slot = maps:remove(StreamId, State#h3.awaiting_slot)
+                    }
             end
     end.
 
@@ -801,8 +828,11 @@ dispatch_decoded(State, StreamId, Headers, Body) ->
     handle_result().
 dispatch_with_slot(#h3{streams = Streams} = State1, StreamId, Req) ->
     case
-        roadrunner_conn:try_acquire_request_slot(
-            State1#h3.max_concurrent_requests, State1#h3.inflight_counter
+        roadrunner_conn:acquire_request_slot(
+            State1#h3.max_concurrent_requests,
+            State1#h3.inflight_counter,
+            State1#h3.overload,
+            StreamId
         )
     of
         true ->
@@ -818,6 +848,14 @@ dispatch_with_slot(#h3{streams = Streams} = State1, StreamId, Req) ->
                 worker_refs = (State1#h3.worker_refs)#{MonRef => StreamId},
                 worker_pids = (State1#h3.worker_pids)#{StreamId => WorkerPid}
             };
+        queued ->
+            %% Over the ceiling, but this listener parks rather than
+            %% sheds. Keep the assembled request and return to the loop;
+            %% the grant arrives as a message.
+            State1#h3{
+                streams = maps:remove(StreamId, Streams),
+                awaiting_slot = (State1#h3.awaiting_slot)#{StreamId => Req}
+            };
         false ->
             %% Listener-wide in-flight ceiling reached — refuse the
             %% stream (retry-safe H3_REQUEST_REJECTED) without spawning
@@ -825,6 +863,41 @@ dispatch_with_slot(#h3{streams = Streams} = State1, StreamId, Req) ->
             ok = throttle_stream(State1),
             reset_and_drop(State1, StreamId, ?H3_REQUEST_REJECTED)
     end.
+
+%% A parked request's admission resolved. `granted` means the queue has
+%% already taken the slot on our behalf, so a request that has gone away
+%% in the meantime must hand it back rather than drop it.
+-spec handle_slot(#h3{}, non_neg_integer(), granted | timeout | full) -> #h3{}.
+handle_slot(#h3{awaiting_slot = Awaiting} = State, StreamId, granted) ->
+    case Awaiting of
+        #{StreamId := Req} ->
+            State1 = State#h3{awaiting_slot = maps:remove(StreamId, Awaiting)},
+            {WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
+                State1#h3.conn, StreamId, Req, State1#h3.proto_opts
+            ),
+            State1#h3{
+                worker_refs = (State1#h3.worker_refs)#{MonRef => StreamId},
+                worker_pids = (State1#h3.worker_pids)#{StreamId => WorkerPid}
+            };
+        _ ->
+            give_back_slot(State)
+    end;
+handle_slot(#h3{awaiting_slot = Awaiting} = State, StreamId, _Refused) ->
+    case Awaiting of
+        #{StreamId := _} ->
+            State1 = State#h3{awaiting_slot = maps:remove(StreamId, Awaiting)},
+            ok = throttle_stream(State1),
+            reset_and_drop(State1, StreamId, ?H3_REQUEST_REJECTED);
+        _ ->
+            State
+    end.
+
+-spec give_back_slot(#h3{}) -> #h3{}.
+give_back_slot(State) ->
+    ok = roadrunner_conn:release_request_slot(
+        State#h3.max_concurrent_requests, State#h3.inflight_counter, State#h3.overload
+    ),
+    State.
 
 %% A worker exit: normal means it sent its response with the stream FIN
 %% (drop the stream); abnormal (QPACK decompression, malformed
@@ -839,7 +912,7 @@ handle_worker_down(#h3{worker_refs = WorkerRefs, worker_pids = WorkerPids} = Sta
     %% ref so it is accounted for by this `DOWN` or by the conn's clean
     %% exit, never both.
     ok = roadrunner_conn:release_request_slot(
-        State#h3.max_concurrent_requests, State#h3.inflight_counter
+        State#h3.max_concurrent_requests, State#h3.inflight_counter, State#h3.overload
     ),
     State1 = State#h3{
         worker_refs = WorkerRefs1, worker_pids = maps:remove(StreamId, WorkerPids)
@@ -919,7 +992,8 @@ terminate(#h3{
     start_mono = StartMono,
     worker_refs = Refs,
     max_concurrent_requests = MaxConcReq,
-    inflight_counter = InflightCounter
+    inflight_counter = InflightCounter,
+    overload = Overload
 }) ->
     ok = roadrunner_telemetry:listener_conn_close(StartMono, #{
         listener_name => ListenerName,
@@ -929,5 +1003,7 @@ terminate(#h3{
     %% Account for any stream workers still live at teardown (each holds one
     %% in-flight slot); workers whose `DOWN` already fired were removed from
     %% `worker_refs`, so this releases each remaining worker exactly once.
-    ok = roadrunner_conn:release_request_slots(MaxConcReq, InflightCounter, map_size(Refs)),
+    ok = roadrunner_conn:release_request_slots(
+        MaxConcReq, InflightCounter, map_size(Refs), Overload
+    ),
     ok = roadrunner_conn:release_slot(ProtoOpts).

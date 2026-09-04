@@ -166,6 +166,34 @@ Optional middleware and timing knobs (durations in milliseconds):
   `[roadrunner, request, throttled]` and increments the `throttled`
   count from `info/1`. HTTP/1 is unaffected (one request per connection,
   already bounded by `max_clients`).
+- `overload_mode` — what happens to a request that arrives over
+  `max_concurrent_requests`. Default `refuse`, which is the behavior
+  described above. `{queue, Opts}` instead
+  parks it until a slot frees, so handler memory stays bounded without
+  shedding the request: latency rises under overload rather than the
+  error rate. A request still waiting after `Ms` is refused exactly as
+  `refuse` would, and one arriving when `N` are already parked is
+  refused immediately, so overload still sheds rather than queueing
+  without bound. Requires a finite `max_concurrent_requests` — there is
+  nothing to queue behind otherwise, and asking for it without one is a
+  configuration error.
+
+  `Opts` takes `max_queued` and `timeout`, and both are derived when
+  absent, so `{queue, #{}}` needs no tuning. `timeout` follows
+  `request_timeout`, since a request already carries that deadline and
+  waiting past it only produces a response nobody is left to read.
+  `max_queued` follows the ceiling, so at most as many requests wait as
+  run.
+
+  Worth setting when a per-connection `max_concurrent_streams` is the
+  only thing keeping handler memory down, because that ties concurrency
+  to connection count: 64 connections with a window of 4 can never have
+  more than 256 handlers running, however much budget is left. A
+  listener-wide ceiling spends the budget you configured instead.
+  Measured on 64 h2c connections against a cheap route, moving from a
+  window of 4 to a window of 64 with a queued ceiling of 4096 took
+  252,259 to 397,747 resp/s with no refusals and concurrency still
+  bounded.
 - `socket_backlog` — TCP listen backlog (kernel SYN/accept queue
   depth). Default 1024. Raise it for connection bursts (load tests,
   health-check storms); Linux clamps the effective value at
@@ -261,6 +289,8 @@ ops-tuning rationale.
     max_keep_alive_requests => pos_integer(),
     max_clients => pos_integer(),
     max_concurrent_requests => infinity | pos_integer(),
+    overload_mode =>
+        refuse | {queue, #{max_queued => pos_integer(), timeout => pos_integer()}},
     socket_backlog => pos_integer(),
     %% Local interface to bind. Unset means all interfaces
     %% (`0.0.0.0` / `::`). Set to `{127,0,0,1}` to restrict the
@@ -1112,6 +1142,51 @@ spawn_acceptors_loop(LSocket, ProtoOpts, I, N) ->
 %% feature (an L4 balancer prepends the header before the first byte), so it
 %% conflicts with an HTTP/3-only (UDP) listener; on a mixed `[http1, http3]`
 %% listener the TCP side honors it and h3 ignores it.
+%% Queue mode only means something when there is a ceiling to queue
+%% behind, so asking for it without `max_concurrent_requests` is a
+%% configuration error rather than a silent no-op.
+%%
+%% Both knobs are derived when absent, so `{queue, #{}}` is usable
+%% without inventing numbers. `timeout` follows `request_timeout`,
+%% because a request already carries that deadline and waiting past it
+%% only produces a response nobody is left to read. `max_queued` follows
+%% the ceiling, so at most as many requests wait as run: total requests
+%% in the system stay under twice the ceiling, and the worst-case wait
+%% stays around one service time per queued request.
+-spec validate_overload_mode(term(), infinity | pos_integer(), pos_integer()) ->
+    refuse | {queue, #{max_queued := pos_integer(), timeout := pos_integer()}}.
+validate_overload_mode(refuse, _Max, _RequestTimeout) ->
+    refuse;
+validate_overload_mode({queue, _Queue} = Mode, infinity, _RequestTimeout) ->
+    error({invalid_listener_opt, overload_mode, {Mode, requires_max_concurrent_requests}});
+validate_overload_mode({queue, Queue}, Max, RequestTimeout) when is_map(Queue) ->
+    MaxQueued = maps:get(max_queued, Queue, Max),
+    Timeout = maps:get(timeout, Queue, RequestTimeout),
+    case
+        is_integer(MaxQueued) andalso MaxQueued > 0 andalso is_integer(Timeout) andalso Timeout > 0
+    of
+        true ->
+            {queue, #{max_queued => MaxQueued, timeout => Timeout}};
+        false ->
+            error({invalid_listener_opt, overload_mode, {queue, Queue}})
+    end;
+validate_overload_mode(Other, _Max, _RequestTimeout) ->
+    error({invalid_listener_opt, overload_mode, Other}).
+
+%% `refuse` costs nothing at all on the release path; the queue form
+%% carries the process, the atomic that says whether anyone is parked,
+%% and the wait deadline, so the hot path never reads proto_opts again.
+-spec setup_overload(
+    refuse | {queue, #{max_queued := pos_integer(), timeout := pos_integer()}},
+    infinity | pos_integer(),
+    counters:counters_ref()
+) -> roadrunner_conn:overload().
+setup_overload(refuse, _Max, _Counter) ->
+    refuse;
+setup_overload({queue, #{max_queued := MaxQueued, timeout := Timeout}}, Max, Counter) ->
+    {ok, Pid} = roadrunner_overload_queue:start_link(Max, Counter, MaxQueued),
+    {queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), Timeout}.
+
 -spec validate_proxy_protocol(term(), [http1 | http2 | http3, ...]) -> boolean().
 validate_proxy_protocol(false, _Protocols) ->
     false;
@@ -1156,6 +1231,20 @@ build_proto_opts(Opts, ListenerName) ->
     %% store is created only when `rate_limit` is configured.
     RateLimitedCounter = atomics:new(1, [{signed, false}]),
     RateLimit = build_rate_limit(maps:get(rate_limit, Opts, undefined)),
+    MaxConcurrentRequests =
+        maps:get(max_concurrent_requests, Opts, ?DEFAULT_MAX_CONCURRENT_REQUESTS),
+    %% `overload_mode` decides what happens to a request that arrives over
+    %% the ceiling. Queue mode needs a process to park waiters in; it is
+    %% started here so it is linked to the listener and dies with it.
+    Overload = setup_overload(
+        validate_overload_mode(
+            maps:get(overload_mode, Opts, refuse),
+            MaxConcurrentRequests,
+            maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT)
+        ),
+        MaxConcurrentRequests,
+        InflightCounter
+    ),
     %% Public `ws` opts are a nested map; flatten to the `ws_*`
     %% proto_opts keys the hot path reads, mirroring the `{http2, #{}}`
     %% → `http2_*` flattening above.
@@ -1187,8 +1276,8 @@ build_proto_opts(Opts, ListenerName) ->
             max_keep_alive_requests =>
                 maps:get(max_keep_alive_requests, Opts, ?DEFAULT_MAX_KEEP_ALIVE),
             max_clients => maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
-            max_concurrent_requests =>
-                maps:get(max_concurrent_requests, Opts, ?DEFAULT_MAX_CONCURRENT_REQUESTS),
+            max_concurrent_requests => MaxConcurrentRequests,
+            overload => Overload,
             client_counter => ClientCounter,
             requests_counter => RequestsCounter,
             rejected_counter => RejectedCounter,

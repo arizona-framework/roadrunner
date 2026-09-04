@@ -61,6 +61,10 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     rejects_http3_without_tls/1,
     max_clients_refuse/1,
     max_concurrent_requests_refuse/1,
+    max_concurrent_requests_queue/1,
+    max_concurrent_requests_queue_expires/1,
+    max_concurrent_requests_queue_stale_grant/1,
+    max_concurrent_requests_queue_survives_drain/1,
     stream_cancel/1,
     response_to_cancelled_stream/1,
     badheaders_reset/1,
@@ -135,6 +139,10 @@ all() ->
         rejects_http3_without_tls,
         max_clients_refuse,
         max_concurrent_requests_refuse,
+        max_concurrent_requests_queue,
+        max_concurrent_requests_queue_expires,
+        max_concurrent_requests_queue_stale_grant,
+        max_concurrent_requests_queue_survives_drain,
         stream_cancel,
         response_to_cancelled_stream,
         badheaders_reset,
@@ -204,6 +212,10 @@ init_per_testcase(Case, Config) when
     Case =:= rejects_http3_without_tls;
     Case =:= max_clients_refuse;
     Case =:= max_concurrent_requests_refuse;
+    Case =:= max_concurrent_requests_queue;
+    Case =:= max_concurrent_requests_queue_expires;
+    Case =:= max_concurrent_requests_queue_stale_grant;
+    Case =:= max_concurrent_requests_queue_survives_drain;
     Case =:= extra_data_after_413;
     Case =:= oversized_headers_431;
     Case =:= advertises_max_field_section_size;
@@ -952,6 +964,134 @@ max_concurrent_requests_refuse(_Config) ->
         roadrunner_listener:stop(Name)
     end.
 
+max_concurrent_requests_queue(_Config) ->
+    %% Same ceiling of 1, but the listener queues instead of refusing. The
+    %% second request parks until the loop worker lets go of the slot, and
+    %% is then served rather than rejected. `open_request/2` and
+    %% `collect/2` are separate calls, so the request can be in flight
+    %% while the slot is freed.
+    Name = listener_name(max_concurrent_requests_queue),
+    {ok, _} = start_h3(Name, #{
+        max_concurrent_requests => 1,
+        overload_mode => {queue, #{max_queued => 4, timeout => 5000}}
+    }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        %% An earlier case uses the same registered name, so wait for it to
+        %% be free before claiming it.
+        ok = wait_for_unregister(roadrunner_h3_loop_test, 5000),
+        {ok, _} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/loop")),
+        First = wait_for_register(roadrunner_h3_loop_test, 1000),
+        %% Both requests go to `/loop`, whose handler re-registers the
+        %% name. That makes dispatch observable: while the second is
+        %% parked the name still points at the first worker, and it only
+        %% moves once the parked request is granted a slot. Asserting that
+        %% is what stops this passing without ever exercising the queue.
+        {ok, _} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/loop")),
+        timer:sleep(200),
+        ?assertEqual(First, whereis(roadrunner_h3_loop_test)),
+        FirstRef = monitor(process, First),
+        First ! stop,
+        receive
+            {'DOWN', FirstRef, process, First, _} -> ok
+        after 5000 -> ct:fail(loop_worker_did_not_exit)
+        end,
+        Second = wait_for_new_register(roadrunner_h3_loop_test, First, 5000),
+        ?assertNotEqual(First, Second),
+        Second ! stop
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+max_concurrent_requests_queue_expires(_Config) ->
+    %% Nothing frees a slot before the deadline, so a parked request falls
+    %% back to exactly the refusal `refuse` mode would have produced.
+    Name = listener_name(max_concurrent_requests_queue_expires),
+    {ok, _} = start_h3(Name, #{
+        max_concurrent_requests => 1,
+        overload_mode => {queue, #{max_queued => 4, timeout => 50}}
+    }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        %% An earlier case uses the same route and registered name, so wait
+        %% for it to be free: a stale pid here would mean the slot was
+        %% never actually held and nothing ever parked.
+        ok = wait_for_unregister(roadrunner_h3_loop_test, 5000),
+        {ok, _} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/loop")),
+        Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
+        ?assertEqual(error, try_get(Conn, ~"/")),
+        ?assert(maps:get(throttled, roadrunner_listener:info(Name)) >= 1),
+        Worker ! stop
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+max_concurrent_requests_queue_stale_grant(_Config) ->
+    %% A grant for a request the loop no longer has is the one leak the
+    %% design must handle: the queue took that slot on our behalf, so it
+    %% has to be given back. Injected directly, because the window it
+    %% happens in is a race by nature.
+    Name = listener_name(max_concurrent_requests_queue_stale_grant),
+    {ok, _} = start_h3(Name, #{
+        max_concurrent_requests => 4,
+        overload_mode => {queue, #{max_queued => 4, timeout => 5000}}
+    }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
+        [ConnPid] = pg:get_members({roadrunner_drain, Name}),
+        ConnPid ! {roadrunner_slot, 999, granted},
+        ConnPid ! {roadrunner_slot, 999, timeout},
+        %% The connection carries on serving as if nothing happened.
+        ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
+        ?assert(is_process_alive(ConnPid))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+max_concurrent_requests_queue_survives_drain(_Config) ->
+    %% A parked request is in neither `streams` nor `worker_refs`, so a
+    %% drain-complete check that looks only at those closes the connection
+    %% under it and drops a request the peer already sent. The slot is
+    %% deliberately held by a DIFFERENT connection, so the parked one has
+    %% nothing else keeping it alive.
+    Name = listener_name(max_concurrent_requests_queue_survives_drain),
+    {ok, _} = start_h3(Name, #{
+        max_concurrent_requests => 1,
+        overload_mode => {queue, #{max_queued => 4, timeout => 5000}}
+    }),
+    Port = roadrunner_listener:port(Name),
+    Holder = connect(Port),
+    Parked = connect(Port),
+    try
+        ok = wait_for_unregister(roadrunner_h3_loop_test, 5000),
+        {ok, _} = roadrunner_quic_test_h3:open_request(Holder, headers(~"GET", ~"/loop")),
+        First = wait_for_register(roadrunner_h3_loop_test, 1000),
+        %% Parks: the only slot is held by the other connection.
+        {ok, _} = roadrunner_quic_test_h3:open_request(Parked, headers(~"GET", ~"/loop")),
+        timer:sleep(200),
+        ?assertEqual(First, whereis(roadrunner_h3_loop_test)),
+        %% Drain, then free the slot. The parked request must still be
+        %% dispatched rather than dropped with the connection.
+        Self = self(),
+        _ = spawn(fun() -> Self ! {drained, roadrunner_listener:drain(Name, 5000)} end),
+        timer:sleep(200),
+        First ! stop,
+        Second = wait_for_new_register(roadrunner_h3_loop_test, First, 5000),
+        ?assertNotEqual(First, Second),
+        Second ! stop,
+        receive
+            {drained, _} -> ok
+        after 10000 -> ct:fail(drain_never_returned)
+        end
+    after
+        close(Holder),
+        close(Parked)
+    end.
+
 %% Retry a GET until it succeeds: the in-flight slot is released on the
 %% worker's `DOWN`, which is processed by the conn loop slightly after the
 %% monitor fires here, so the first follow-up request can still race it.
@@ -1352,6 +1492,31 @@ ll_collect_until_end(Conn, StreamId, Acc) ->
 
 %% Spin until a `{loop, _}` handler registers `Name` (it does so from
 %% `handle/1`), so the test can address the worker from outside.
+wait_for_new_register(_Name, _Old, RemainingMs) when RemainingMs =< 0 ->
+    ct:fail(parked_request_never_dispatched);
+wait_for_new_register(Name, Old, RemainingMs) ->
+    case whereis(Name) of
+        undefined ->
+            timer:sleep(10),
+            wait_for_new_register(Name, Old, RemainingMs - 10);
+        Old ->
+            timer:sleep(10),
+            wait_for_new_register(Name, Old, RemainingMs - 10);
+        New ->
+            New
+    end.
+
+wait_for_unregister(_Name, RemainingMs) when RemainingMs =< 0 ->
+    ct:fail(worker_still_registered);
+wait_for_unregister(Name, RemainingMs) ->
+    case whereis(Name) of
+        undefined ->
+            ok;
+        _ ->
+            timer:sleep(10),
+            wait_for_unregister(Name, RemainingMs - 10)
+    end.
+
 wait_for_register(_Name, RemainingMs) when RemainingMs =< 0 ->
     ct:fail(worker_not_registered);
 wait_for_register(Name, RemainingMs) ->

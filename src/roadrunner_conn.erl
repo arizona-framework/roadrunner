@@ -35,8 +35,10 @@
     try_acquire_slot/1,
     release_slot/1,
     try_acquire_request_slot/2,
-    release_request_slot/2,
-    release_request_slots/3,
+    acquire_request_slot/4,
+    cancel_slot_wait/2,
+    release_request_slot/3,
+    release_request_slots/4,
     consume_body_reader/2,
     join_drain_group/2,
     join_drain_group_for/2
@@ -82,11 +84,23 @@
     head_response/2
 ]).
 
--export_type([proto_opts/0, dispatch/0, rate_limit/0, rate_limit_state/0]).
+-export_type([proto_opts/0, dispatch/0, rate_limit/0, rate_limit_state/0, overload/0]).
 
 -on_load(init_patterns/0).
 
 -define(CONN_COMMA_CP_KEY, {?MODULE, conn_comma_cp}).
+
+-doc """
+How a request over the listener-wide `max_concurrent_requests` ceiling
+is handled. `refuse` is the default and today's behavior: reject it
+immediately. The queue form parks it until a slot frees, so handler
+memory stays bounded without shedding the request; it carries the
+listener's queue process, the atomic that says whether anyone is parked
+(read on the release path to avoid a message per request), and the wait
+deadline in milliseconds.
+""".
+-type overload() ::
+    refuse | {queue, pid(), atomics:atomics_ref(), pos_integer()}.
 
 -type dispatch() ::
     {handler, module(), roadrunner_middleware:next(), State :: term()}
@@ -129,6 +143,10 @@
     %% `throttled_counter` is the cumulative count of streams refused at
     %% the ceiling. h1 is bounded by `max_clients` and does not use these.
     max_concurrent_requests := infinity | pos_integer(),
+    %% What happens to a request over that ceiling. Optional so a
+    %% hand-built proto_opts map (tests, embedded callers) defaults to
+    %% today's refuse behavior.
+    overload => overload(),
     inflight_counter := counters:counters_ref(),
     throttled_counter := atomics:atomics_ref(),
     %% Per-peer request-rate guard (off by default). `rate_limit` carries the
@@ -340,7 +358,7 @@ unconfigured listener pays nothing on the hot path.
 Same eventually-consistent overshoot contract as `try_acquire_slot/1`: the
 `counters` ref uses `write_concurrency`, so a brief read slightly above the
 cap is possible before rollbacks reconcile, bounded by in-flight admissions.
-Paired with `release_request_slot/2`, which must run exactly once per
+Paired with `release_request_slot/3`, which must run exactly once per
 successfully-acquired worker (tie it to the worker monitor-ref removal so a
 worker is released by its `DOWN` or by the conn's clean exit, never both).
 
@@ -450,13 +468,75 @@ rate_limit_evict_idle(Table, NowMs, IdleTtl) ->
     Spec = [{{'_', '_', '$1'}, [{'<', '$1', Cutoff}], [true]}],
     ets:select_delete(Table, Spec).
 
--doc "Decrement the in-flight-request counter, paired with `try_acquire_request_slot/2`.".
--spec release_request_slot(infinity | pos_integer(), counters:counters_ref() | undefined) -> ok.
-release_request_slot(infinity, _Counter) ->
+-doc """
+Take an in-flight slot, or park the request when the listener is in
+queue mode. The fast path is `try_acquire_request_slot/2` and nothing
+else, so a listener that never reaches its ceiling pays a single
+`counters` operation.
+
+Returns `true` when the slot is held and the caller may spawn its
+worker, `false` when the caller should refuse the request exactly as it
+does today, and `queued` when the request is parked. A parked caller
+MUST NOT block: it returns to its loop and later receives
+`{roadrunner_slot, Token, granted | timeout | full}`. `granted` means the
+slot is already held on its behalf, so a caller that has since dropped
+the request has to release it rather than ignore it.
+
+`Token` only has to be unique within the calling process; the stream id
+is the natural choice.
+""".
+-spec acquire_request_slot(
+    infinity | pos_integer(), counters:counters_ref() | undefined, overload(), term()
+) -> true | false | queued.
+acquire_request_slot(Max, Counter, Overload, Token) ->
+    case try_acquire_request_slot(Max, Counter) of
+        true -> true;
+        false -> park(Overload, Token)
+    end.
+
+-spec park(overload(), term()) -> false | queued.
+park(refuse, _Token) ->
+    false;
+park({queue, Pid, _Waiters, Timeout}, Token) ->
+    ok = roadrunner_overload_queue:enqueue(Pid, Token, Timeout),
+    queued.
+
+-doc """
+Withdraw a parked request, because its stream was reset or its
+connection is going away. Racing an in-flight grant is expected: the
+caller may still receive `granted` afterwards and must release that slot.
+""".
+-spec cancel_slot_wait(overload(), term()) -> ok.
+cancel_slot_wait(refuse, _Token) ->
     ok;
-release_request_slot(_Max, Counter) ->
+cancel_slot_wait({queue, Pid, _Waiters, _Timeout}, Token) ->
+    roadrunner_overload_queue:cancel(Pid, Token).
+
+-doc """
+Decrement the in-flight-request counter, paired with
+`acquire_request_slot/4`, and wake a parked request if one is waiting.
+
+The wake is guarded by an atomic read rather than sent unconditionally,
+so a listener in queue mode that is not at its ceiling pays one extra
+`atomics:get/2` per request and no message.
+""".
+-spec release_request_slot(
+    infinity | pos_integer(), counters:counters_ref() | undefined, overload()
+) -> ok.
+release_request_slot(infinity, _Counter, _Overload) ->
+    ok;
+release_request_slot(_Max, Counter, Overload) ->
     ok = counters:sub(Counter, 1, 1),
-    ok.
+    notify_release(Overload).
+
+-spec notify_release(overload()) -> ok.
+notify_release(refuse) ->
+    ok;
+notify_release({queue, Pid, Waiters, _Timeout}) ->
+    case roadrunner_overload_queue:waiting(Waiters) of
+        true -> roadrunner_overload_queue:note_release(Pid);
+        false -> ok
+    end.
 
 -doc """
 Release `N` in-flight slots at once. Used by the conn clean-exit path to
@@ -465,15 +545,15 @@ their slots are not leaked until the listener restarts. `N = 0` and
 `infinity` are no-ops.
 """.
 -spec release_request_slots(
-    infinity | pos_integer(), counters:counters_ref() | undefined, non_neg_integer()
+    infinity | pos_integer(), counters:counters_ref() | undefined, non_neg_integer(), overload()
 ) -> ok.
-release_request_slots(_Max, _Counter, 0) ->
+release_request_slots(_Max, _Counter, 0, _Overload) ->
     ok;
-release_request_slots(infinity, _Counter, _N) ->
+release_request_slots(infinity, _Counter, _N, _Overload) ->
     ok;
-release_request_slots(_Max, Counter, N) ->
+release_request_slots(_Max, Counter, N, Overload) ->
     ok = counters:sub(Counter, 1, N),
-    ok.
+    notify_release(Overload).
 
 -doc false.
 -spec refine_conn_label(

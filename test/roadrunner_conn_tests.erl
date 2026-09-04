@@ -1329,6 +1329,108 @@ conn_handler_crash_returns_500_test_() ->
             end}
         end}.
 
+%% --- in-flight slot accounting ---
+
+%% `refuse` is the default shape and must stay a pure counters path: no
+%% queue process, no messages, and the same false the conn loops already
+%% turn into REFUSED_STREAM / H3_REQUEST_REJECTED.
+slot_refuse_mode_is_pure_counters_test() ->
+    Counter = counters:new(1, [write_concurrency]),
+    ?assert(roadrunner_conn:acquire_request_slot(1, Counter, refuse, s1)),
+    ?assertNot(roadrunner_conn:acquire_request_slot(1, Counter, refuse, s2)),
+    ok = roadrunner_conn:cancel_slot_wait(refuse, s2),
+    ok = roadrunner_conn:release_request_slot(1, Counter, refuse),
+    ?assertEqual(0, counters:get(Counter, 1)),
+    %% `infinity` short-circuits both directions.
+    ?assert(roadrunner_conn:acquire_request_slot(infinity, Counter, refuse, s3)),
+    ok = roadrunner_conn:release_request_slot(infinity, Counter, refuse),
+    ?assertEqual(0, counters:get(Counter, 1)).
+
+slot_release_many_test() ->
+    Counter = counters:new(1, [write_concurrency]),
+    true = roadrunner_conn:acquire_request_slot(3, Counter, refuse, a),
+    true = roadrunner_conn:acquire_request_slot(3, Counter, refuse, b),
+    ok = roadrunner_conn:release_request_slots(3, Counter, 0, refuse),
+    ?assertEqual(2, counters:get(Counter, 1)),
+    ok = roadrunner_conn:release_request_slots(infinity, Counter, 2, refuse),
+    ?assertEqual(2, counters:get(Counter, 1)),
+    ok = roadrunner_conn:release_request_slots(3, Counter, 2, refuse),
+    ?assertEqual(0, counters:get(Counter, 1)).
+
+%% In queue mode an over-ceiling acquire parks instead of refusing, and
+%% the release wakes it. `{spawn, _}` because the grant lands in this
+%% process's mailbox.
+slot_queue_mode_parks_and_wakes_test_() ->
+    {spawn, fun() ->
+        Counter = counters:new(1, [write_concurrency]),
+        {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 8),
+        Waiters = roadrunner_overload_queue:waiters_ref(Pid),
+        Overload = {queue, Pid, Waiters, 5000},
+        ?assert(roadrunner_conn:acquire_request_slot(1, Counter, Overload, s1)),
+        ?assertEqual(queued, roadrunner_conn:acquire_request_slot(1, Counter, Overload, s2)),
+        ok = roadrunner_conn:release_request_slot(1, Counter, Overload),
+        Outcome =
+            receive
+                {roadrunner_slot, s2, O} -> O
+            after 2000 -> never_granted
+            end,
+        ?assertEqual(granted, Outcome)
+    end}.
+
+%% A release with nobody parked must not send a message; the atomic guard
+%% is what keeps queue mode off the hot path.
+slot_queue_mode_release_without_waiters_test_() ->
+    {spawn, fun() ->
+        Counter = counters:new(1, [write_concurrency]),
+        {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 8),
+        Overload = {queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), 5000},
+        true = roadrunner_conn:acquire_request_slot(1, Counter, Overload, s1),
+        ok = roadrunner_conn:release_request_slot(1, Counter, Overload),
+        ok = roadrunner_conn:release_request_slots(1, Counter, 0, Overload),
+        ?assertEqual(0, counters:get(Counter, 1)),
+        ?assert(is_process_alive(Pid))
+    end}.
+
+slot_queue_mode_cancel_test_() ->
+    {spawn, fun() ->
+        Counter = counters:new(1, [write_concurrency]),
+        {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 8),
+        Overload = {queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), 5000},
+        Waiters = roadrunner_overload_queue:waiters_ref(Pid),
+        true = roadrunner_conn:acquire_request_slot(1, Counter, Overload, s1),
+        queued = roadrunner_conn:acquire_request_slot(1, Counter, Overload, s2),
+        %% Wait for the park to land before cancelling. A cancel that
+        %% races an in-flight grant is legal and the caller has to give
+        %% that slot back, but this test is about the ordered case.
+        ?assert(until(fun() -> roadrunner_overload_queue:waiting(Waiters) end)),
+        ok = roadrunner_conn:cancel_slot_wait(Overload, s2),
+        ?assert(until(fun() -> not roadrunner_overload_queue:waiting(Waiters) end)),
+        ok = roadrunner_conn:release_request_slot(1, Counter, Overload),
+        %% Withdrawn before the slot freed, so no grant arrives.
+        Got =
+            receive
+                {roadrunner_slot, s2, O} -> O
+            after 200 -> nothing
+            end,
+        ?assertEqual(nothing, Got)
+    end}.
+
+until(Fun) ->
+    until(Fun, 200).
+
+until(_Fun, 0) ->
+    false;
+until(Fun, N) ->
+    case Fun() of
+        true ->
+            true;
+        false ->
+            receive
+            after 5 -> ok
+            end,
+            until(Fun, N - 1)
+    end.
+
 %% --- make_recv/3 — pure unit tests ---
 
 %% A queued drain is reported before the socket is touched, and ONLY the
@@ -2245,6 +2347,7 @@ parse_error_status_other_is_400_test() ->
 
 %% =============================================================================
 %% try_acquire_request_slot/2 + release_request_slot[s] — pure unit tests
+%% (`refuse` is the default overload mode: pure counters, no queue.)
 %% =============================================================================
 
 request_slot_infinity_is_noop_test() ->
@@ -2253,8 +2356,8 @@ request_slot_infinity_is_noop_test() ->
     %% no-op.
     ?assert(roadrunner_conn:try_acquire_request_slot(infinity, undefined)),
     ?assert(roadrunner_conn:try_acquire_request_slot(infinity, undefined)),
-    ?assertEqual(ok, roadrunner_conn:release_request_slot(infinity, undefined)),
-    ?assertEqual(ok, roadrunner_conn:release_request_slots(infinity, undefined, 5)).
+    ?assertEqual(ok, roadrunner_conn:release_request_slot(infinity, undefined, refuse)),
+    ?assertEqual(ok, roadrunner_conn:release_request_slots(infinity, undefined, 5, refuse)).
 
 request_slot_admits_up_to_cap_then_refuses_test() ->
     Ref = counters:new(1, [write_concurrency]),
@@ -2265,7 +2368,7 @@ request_slot_admits_up_to_cap_then_refuses_test() ->
     ?assertNot(roadrunner_conn:try_acquire_request_slot(2, Ref)),
     ?assertEqual(2, counters:get(Ref, 1)),
     %% Releasing one frees a slot; the next acquire succeeds again.
-    ?assertEqual(ok, roadrunner_conn:release_request_slot(2, Ref)),
+    ?assertEqual(ok, roadrunner_conn:release_request_slot(2, Ref, refuse)),
     ?assertEqual(1, counters:get(Ref, 1)),
     ?assert(roadrunner_conn:try_acquire_request_slot(2, Ref)),
     ?assertEqual(2, counters:get(Ref, 1)).
@@ -2276,7 +2379,7 @@ request_slot_release_many_test() ->
     ?assertEqual(4, counters:get(Ref, 1)),
     %% Bulk release (conn teardown with N live workers) drops the gauge by N;
     %% N = 0 is a no-op.
-    ?assertEqual(ok, roadrunner_conn:release_request_slots(10, Ref, 0)),
+    ?assertEqual(ok, roadrunner_conn:release_request_slots(10, Ref, 0, refuse)),
     ?assertEqual(4, counters:get(Ref, 1)),
-    ?assertEqual(ok, roadrunner_conn:release_request_slots(10, Ref, 4)),
+    ?assertEqual(ok, roadrunner_conn:release_request_slots(10, Ref, 4, refuse)),
     ?assertEqual(0, counters:get(Ref, 1)).
