@@ -114,17 +114,15 @@ h2_alpn_negotiates_after_the_header(_Config) ->
 missing_header_closes_without_handshake(_Config) ->
     %% A raw ClientHello-less request on a PROXY listener is a misconfigured
     %% upstream: the connection closes before any TLS is attempted, so the
-    %% peer sees plain EOF and no alert.
+    %% peer sees plain EOF and no alert, and the close is reported with the
+    %% parser's reason.
     Port = start_listener(#{}),
     {ok, Tcp} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
     ok = gen_tcp:send(Tcp, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
     ?assertEqual({error, closed}, gen_tcp:recv(Tcp, 0, 5000)),
     ok = gen_tcp:close(Tcp),
-    ok = wait_for_active_clients(0),
-    receive
-        {accept_error, _} -> error(accept_error_for_missing_header)
-    after 0 -> ok
-    end.
+    ?assertEqual({proxy_protocol, not_proxy_header}, await_accept_error()),
+    ok = wait_for_active_clients(0).
 
 overlong_v1_header_closes(_Config) ->
     %% A v1 line that runs past the spec's 107 bytes without a CRLF.
@@ -132,7 +130,9 @@ overlong_v1_header_closes(_Config) ->
     {ok, Tcp} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
     ok = gen_tcp:send(Tcp, <<"PROXY ", (binary:copy(~"x", 120))/binary>>),
     ?assertEqual({error, closed}, gen_tcp:recv(Tcp, 0, 5000)),
-    ok = gen_tcp:close(Tcp).
+    ok = gen_tcp:close(Tcp),
+    %% `line` packet mode fails the read at the bound with `emsgsize`.
+    ?assertEqual({proxy_protocol, emsgsize}, await_accept_error()).
 
 v1_line_without_cr_closes(_Config) ->
     %% The spec's line ends in CRLF; a bare LF is read as a line but is not a
@@ -141,28 +141,26 @@ v1_line_without_cr_closes(_Config) ->
     {ok, Tcp} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
     ok = gen_tcp:send(Tcp, ~"PROXY UNKNOWN\n"),
     ?assertEqual({error, closed}, gen_tcp:recv(Tcp, 0, 5000)),
-    ok = gen_tcp:close(Tcp).
+    ok = gen_tcp:close(Tcp),
+    ?assertEqual({proxy_protocol, v1_malformed}, await_accept_error()).
 
 silence_before_header_times_out(_Config) ->
     %% The header read shares `tls_handshake_timeout`, so a peer that connects
     %% and sends nothing is cut off on the same schedule as one that never
-    %% sends a ClientHello. A missing header is a setup failure, not a
-    %% handshake failure, so it closes silently.
+    %% sends a ClientHello, and reported with the transport's `timeout`.
     Port = start_listener(#{tls_handshake_timeout => 200}),
     {ok, Tcp} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
     T0 = erlang:monotonic_time(millisecond),
     ?assertEqual({error, closed}, gen_tcp:recv(Tcp, 0, 5000)),
     ?assert(erlang:monotonic_time(millisecond) - T0 < 2000),
     ok = gen_tcp:close(Tcp),
-    ok = wait_for_active_clients(0),
-    receive
-        {accept_error, _} -> error(accept_error_for_missing_header)
-    after 0 -> ok
-    end.
+    ?assertEqual({proxy_protocol, timeout}, await_accept_error()),
+    ok = wait_for_active_clients(0).
 
 peer_gone_mid_header_closes(_Config) ->
     %% The peer disconnects with the header half sent, once inside a v1 line
-    %% and once inside a v2 prefix: both reads fail and the conn closes.
+    %% and once inside a v2 prefix: both reads fail with `closed`, the conn
+    %% closes and reports it.
     Port = start_listener(#{}),
     lists:foreach(
         fun(Partial) ->
@@ -170,7 +168,8 @@ peer_gone_mid_header_closes(_Config) ->
             ok = gen_tcp:send(Tcp, Partial),
             ok = gen_tcp:shutdown(Tcp, write),
             ?assertEqual({error, closed}, gen_tcp:recv(Tcp, 0, 5000)),
-            ok = gen_tcp:close(Tcp)
+            ok = gen_tcp:close(Tcp),
+            ?assertEqual({proxy_protocol, closed}, await_accept_error())
         end,
         [~"PROXY TCP4 192.168", <<?V2_SIG, 16#21>>]
     ),
@@ -216,6 +215,13 @@ silence_after_header_times_out(_Config) ->
     end.
 
 %% --- helpers ---
+
+%% The reason of the next accept_error the per-case telemetry handler forwards.
+await_accept_error() ->
+    receive
+        {accept_error, #{reason := Reason}} -> Reason
+    after 5000 -> error(no_accept_error)
+    end.
 
 start_listener(Extra) ->
     {ok, _} = roadrunner_listener:start_link(

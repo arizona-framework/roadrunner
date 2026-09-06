@@ -79,11 +79,15 @@
 %% - `[roadrunner, listener, accept_error]` — fired when an acceptor's
 %%   `accept/1` returns any error other than the listen socket closing
 %%   (the acceptor keeps accepting instead of exiting), and when a
-%%   connection process fails its TLS handshake. Told apart by
-%%   `reason`: per-connection failures (`econnaborted`, or
+%%   connection process fails its TLS handshake or cannot read the
+%%   PROXY header a `proxy_protocol` listener expects. Told apart by
+%%   `reason`: per-connection failures (`econnaborted`;
 %%   `{handshake, HsReason}` for a failed TLS handshake — routine noise
-%%   on an internet-facing TLS port, reported by the connection that ran
-%%   it) cost nothing beyond that connection; resource errors
+%%   on an internet-facing TLS port; `{proxy_protocol, Reason}` for a
+%%   missing or malformed header, which points at a misconfigured
+%%   balancer or a direct client on a port meant for one; both reported
+%%   by the connection that hit them) cost nothing beyond that
+%%   connection; resource errors
 %%   (`emfile`/`enfile`/`system_limit` descriptor exhaustion, usually
 %%   `max_clients` above the OS `ulimit -n`) make the acceptor retry
 %%   after a short back-off. A sustained stream of descriptor-exhaustion
@@ -333,13 +337,15 @@ fails with anything other than the listen socket closing — a
 per-connection failure (`econnaborted`) or descriptor exhaustion
 (`emfile`/`enfile`/`system_limit`, typically `max_clients` sitting above
 the OS `ulimit -n`) — and when a connection process fails its TLS
-handshake (`{handshake, _}`). The acceptor reports its own failures
-here and keeps accepting rather than exiting (immediately for
+handshake (`{handshake, _}`) or cannot read the PROXY header a
+`proxy_protocol` listener expects (`{proxy_protocol, _}`, with the
+parser's or the transport's reason). The acceptor reports its own
+failures here and keeps accepting rather than exiting (immediately for
 per-connection failures, after a short back-off for resource errors),
 so a sustained stream of descriptor-exhaustion reasons is the signal
 to raise `ulimit -n`. `Metadata` should include `listener_name` and
-`reason` (the accept or handshake error). Carries no `peer`: there is
-no served connection to name.
+`reason` (the accept, handshake or PROXY-header error). Carries no
+`peer`: there is no served connection to name.
 """.
 -spec listener_accept_error(map()) -> ok.
 listener_accept_error(Metadata) ->

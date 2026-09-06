@@ -206,12 +206,18 @@ awaiting_shoot(Socket0, ProtoOpts, ListenerName) ->
                         {error, {handshake, _} = Reason} ->
                             handshake_failed(ProtoOpts, ListenerName, Reason)
                     end;
-                close ->
+                {close, Reason} ->
                     %% Malformed/absent PROXY header on a proxy_protocol
-                    %% listener (a misconfigured upstream). No accept telemetry
+                    %% listener, or a peer gone before sending one: a
+                    %% misconfigured upstream, or a direct client on a port
+                    %% meant for the balancer. Report it the way a failed
+                    %% handshake is reported, so it is visible rather than a
+                    %% silent close, then release the slot. No accept telemetry
                     %% has fired yet (it pairs with the real peer in serve/5),
-                    %% so release the slot and close silently, like the
-                    %% pre-`shoot` drain path below.
+                    %% so no conn_close either.
+                    ok = roadrunner_telemetry:listener_accept_error(#{
+                        listener_name => ListenerName, reason => {proxy_protocol, Reason}
+                    }),
                     exit_clean(Socket0, ProtoOpts, undefined, undefined, ListenerName, 0, normal)
             end;
         {roadrunner_drain, _Deadline} ->
@@ -339,8 +345,9 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
 
 %% Read and strip a PROXY-protocol header when the listener enabled it. Returns
 %% `{ok, Peer, Leftover}` — the real client peer on a PROXY command, the OS peer
-%% on a LOCAL/UNKNOWN one — or `close` on a malformed header or read error. With
-%% the opt off the OS peer passes straight through and no bytes are read.
+%% on a LOCAL/UNKNOWN one — or `{close, Reason}` on a malformed header or read
+%% error, with the parser's or the transport's reason. With the opt off the OS
+%% peer passes straight through and no bytes are read.
 %%
 %% On a TLS listener (`tls_upgrade` set) the header is followed by the
 %% ClientHello, and bytes read past the header cannot be handed back to `ssl`,
@@ -350,7 +357,7 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),
     {inet:ip_address(), inet:port_number()} | undefined
-) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | close.
+) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
 proxy_protocol_stage(_Socket, #{proxy_protocol := false}, OsPeer) ->
     {ok, OsPeer, <<>>};
 proxy_protocol_stage(
@@ -363,7 +370,7 @@ proxy_protocol_stage(
     case read_proxy_header_exact(Socket, Timeout) of
         {ok, Peer, <<>>} -> {ok, Peer, <<>>};
         {local, <<>>} -> {ok, OsPeer, <<>>};
-        {error, _Reason} -> close
+        {error, Reason} -> {close, Reason}
     end;
 proxy_protocol_stage(Socket, #{proxy_protocol := true} = ProtoOpts, OsPeer) ->
     read_proxy_header(Socket, ProtoOpts, OsPeer, <<>>).
@@ -444,7 +451,7 @@ read_proxy_v1_line(Socket, Timeout) ->
     roadrunner_conn:proto_opts(),
     {inet:ip_address(), inet:port_number()} | undefined,
     binary()
-) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | close.
+) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
 read_proxy_header(Socket, #{request_timeout := Timeout} = ProtoOpts, OsPeer, Acc) ->
     case roadrunner_transport:recv(Socket, 0, Timeout) of
         {ok, Bytes} ->
@@ -453,10 +460,10 @@ read_proxy_header(Socket, #{request_timeout := Timeout} = ProtoOpts, OsPeer, Acc
                 {ok, Peer, Rest} -> {ok, Peer, Rest};
                 {local, Rest} -> {ok, OsPeer, Rest};
                 more -> read_proxy_header(Socket, ProtoOpts, OsPeer, Buf);
-                {error, _Reason} -> close
+                {error, Reason} -> {close, Reason}
             end;
-        {error, _} ->
-            close
+        {error, Reason} ->
+            {close, Reason}
     end.
 
 %% True iff the TLS handshake negotiated `h2`. Plain TCP and TLS
