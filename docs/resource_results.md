@@ -70,8 +70,15 @@ for the full per-scenario throughput grid see
 | `headers_heavy` | cowboy | 81 k | 163 MB | 80 MB | 1647 % |
 | `multi_stream_h2` | roadrunner | 325 k | 251 MB | 131 MB | 1382 % |
 | `multi_stream_h2` | cowboy | 297 k | 270 MB | 113 MB | 1439 % |
-| `tls_handshake_throughput` | cowboy | 2.9 k | 198 MB | 84 MB | 1214 % |
-| `tls_handshake_throughput` | roadrunner | 2.4 k | 145 MB | 63 MB | 927 % |
+| `tls_handshake_throughput` | roadrunner | 3.0 k | 132 MB | 61 MB | 774 % |
+| `tls_handshake_throughput` | cowboy | 2.8 k | 125 MB | 59 MB | 769 % |
+
+The two `tls_handshake_throughput` rows were re-measured on 2026-09-06
+(medians of three interleaved runs) after the TLS handshake moved from
+the acceptor into the connection process, with the servers pinned to 16
+threads, so their `cpu%` ceiling is ~1600 % rather than the ~2400 % of
+the rows above. Before that change the same scenario read 2.4 k for
+roadrunner and 2.9 k for cowboy.
 
 ## Patterns observed
 
@@ -87,10 +94,11 @@ for the full per-scenario throughput grid see
   the headline).
 - **`multi_stream_h2`** (h2): 7 % less RSS than cowboy with 9 %
   more throughput. The h2 hot path is more efficient end-to-end.
-- **`tls_handshake_throughput`** (h2): roadrunner uses 27 % less
-  RSS and 24 % less CPU than cowboy on this scenario, **but**
-  cowboy still wins 22 % on throughput — the per-handshake
-  serialization is the bottleneck, not resources.
+- **`tls_handshake_throughput`** (h2): about 5 % more handshakes per
+  second than cowboy at the same CPU and within 7 MB of RSS, now that
+  the acceptor pool no longer serializes handshakes. Before the
+  handshake moved into the connection process, cowboy led this
+  scenario by 22 %.
 
 ### Where roadrunner pays a tax
 
