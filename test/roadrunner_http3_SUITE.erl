@@ -167,29 +167,7 @@ all() ->
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
     {ok, _} = application:ensure_all_started(ssl),
-    %% Start the default `pg` scope standalone (the drain group lives
-    %% there) rather than the whole roadrunner app, so this suite
-    %% coexists with others that started pg in the shared CT node.
-    ok = ensure_pg_started(),
     Config.
-
-ensure_pg_started() ->
-    %% Start the default `pg` scope unlinked so it survives this
-    %% transient `init_per_suite` process (a plain `pg:start_link/0`
-    %% would link it here and it would die before the testcases run,
-    %% leaving the drain group empty).
-    case whereis(pg) of
-        undefined ->
-            case pg:start_link() of
-                {ok, Pid} ->
-                    _ = unlink(Pid),
-                    ok;
-                {error, {already_started, _}} ->
-                    ok
-            end;
-        _ ->
-            ok
-    end.
 
 end_per_suite(_Config) ->
     ok.
@@ -1041,7 +1019,7 @@ max_concurrent_requests_queue_stale_grant(_Config) ->
     Conn = connect(roadrunner_listener:port(Name)),
     try
         ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
-        [ConnPid] = pg:get_members({roadrunner_drain, Name}),
+        [ConnPid] = drain_members(Name),
         ConnPid ! {roadrunner_slot, 999, granted},
         ConnPid ! {roadrunner_slot, 999, timeout},
         %% The connection carries on serving as if nothing happened.
@@ -1318,8 +1296,8 @@ drain(Config) ->
     Name = ?config(listener, Config),
     Conn = connect(?config(port, Config)),
     ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
-    %% The h3 conn loop joined the listener's drain group.
-    ?assertMatch([_ | _], pg:get_members({roadrunner_drain, Name})),
+    %% The h3 conn loop registered in the listener's drain registry.
+    ?assertMatch([_ | _], drain_members(Name)),
     %% With no request in flight, draining sends a GOAWAY and closes the
     %% idle connection cleanly, so the listener drains before the
     %% deadline (exercises the conn-loop drain branch + clean close).
@@ -1341,7 +1319,7 @@ refuse_request_during_drain(Config) ->
     timer:sleep(20),
     %% Drive the conn loop's drain directly — the same message the
     %% listener broadcasts (its synchronous `drain/2` would block here).
-    [LoopPid] = pg:get_members({roadrunner_drain, Name}),
+    [LoopPid] = drain_members(Name),
     LoopPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5000},
     timer:sleep(20),
     %% A request opened after the GOAWAY is rejected.
@@ -1574,3 +1552,9 @@ ll_decode(Bytes) ->
             _ -> <<>>
         end,
     {Status, Body}.
+
+%% Pids registered in the listener's drain registry, read straight out of
+%% the listener state (`#state{proto_opts = #{drain_table := Table}}`).
+drain_members(Name) ->
+    ProtoOpts = element(4, sys:get_state(whereis(Name))),
+    [Pid || {Pid} <- ets:tab2list(maps:get(drain_table, ProtoOpts))].

@@ -410,12 +410,12 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
 
 - **Drain**: `roadrunner_listener:drain/2` does graceful shutdown with a
   timeout: closes the listen socket, broadcasts `{roadrunner_drain, Deadline}`
-  to in-flight conns via `pg`, polls until idle or deadline, then
+  to in-flight conns, polls until idle or deadline, then
   `exit(Pid, shutdown)` for stragglers.
 - **Status**: `roadrunner_listener:status/1` returns `accepting | draining`.
 - **Slot reconciliation**: Optional `slot_reconciliation => #{interval => N}`
   listener opt: a periodic reaper that compares `client_counter` against the
-  conn `pg` group and releases slots orphaned by `kill`-style exits. Off by
+  live registered conns and releases slots orphaned by `kill`-style exits. Off by
   default; enable in production where you can't trust every exit path to run
   `terminate/3` (`kill` signals, OOM kills, supervisor brutal-kill).
 

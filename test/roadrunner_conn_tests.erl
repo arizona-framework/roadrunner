@@ -1694,48 +1694,49 @@ consume_state_next_chunk_bad_chunk_test() ->
         roadrunner_conn:consume_body_reader(State, next_chunk)
     ).
 
-join_drain_group_undefined_listener_test() ->
-    ?assertEqual(ok, roadrunner_conn:join_drain_group(undefined, true)),
-    ?assertEqual(ok, roadrunner_conn:join_drain_group(undefined, false)).
+register_for_drain_registers_self_test() ->
+    Table = ets:new(register_for_drain, [set, public]),
+    ?assertEqual(ok, roadrunner_conn:register_for_drain(#{drain_table => Table})),
+    ?assertEqual([{self()}], ets:tab2list(Table)),
+    ?assertEqual(ok, roadrunner_conn:unregister_for_drain(#{drain_table => Table})),
+    ?assertEqual([], ets:tab2list(Table)).
 
-join_drain_group_disabled_skips_pg_test() ->
-    %% `false` short-circuits without touching pg, even when a real
-    %% listener name is supplied. Verifies the opt-out path callers
-    %% use to skip per-conn pg overhead on short-lived workloads.
-    ?assertEqual(ok, roadrunner_conn:join_drain_group(some_listener, false)).
+register_for_drain_disabled_skips_registry_test() ->
+    %% `graceful_drain => false` short-circuits without touching the
+    %% registry — the opt-out callers use on short-lived workloads.
+    Table = ets:new(register_for_drain_disabled, [set, public]),
+    ?assertEqual(
+        ok, roadrunner_conn:register_for_drain(#{graceful_drain => false, drain_table => Table})
+    ),
+    ?assertEqual([], ets:tab2list(Table)).
 
-join_drain_group_for_undefined_listener_test() ->
-    %% `join_drain_group_for/2` joins on behalf of another pid (used by
-    %% roadrunner_ws_session). `undefined` listener short-circuits.
-    ?assertEqual(ok, roadrunner_conn:join_drain_group_for(self(), undefined)).
+register_for_drain_without_registry_is_noop_test() ->
+    %% Hand-built proto_opts (tests) carry no table: nothing to register or
+    %% unregister.
+    ?assertEqual(ok, roadrunner_conn:register_for_drain(#{})),
+    ?assertEqual(ok, roadrunner_conn:unregister_for_drain(#{})).
 
-join_drain_group_for_without_pg_scope_test() ->
-    %% Without the `pg` scope (test harness skips the supervision
-    %% tree), the join is silently skipped. Caller never crashes.
-    case whereis(pg) of
-        undefined ->
-            ?assertEqual(ok, roadrunner_conn:join_drain_group_for(self(), some_listener));
-        _ ->
-            %% Scope is running — join then leave so the test doesn't
-            %% pollute other suites' membership.
-            ok = roadrunner_conn:join_drain_group_for(self(), some_listener),
-            ok = pg:leave({roadrunner_drain, some_listener}, self())
-    end.
-
-join_drain_group_for_joins_pid_when_pg_scope_running_test() ->
-    %% pg-running branch of `join_drain_group_for/2`: the helper calls
-    %% `pg:join` and the caller's pid lands in the listener's drain
-    %% group. Start pg explicitly so the test is deterministic
-    %% regardless of sibling-test sequencing.
-    _ =
-        case whereis(pg) of
-            undefined -> {ok, _} = pg:start_link();
-            _ -> ok
+unregister_for_drain_after_listener_gone_is_noop_test() ->
+    %% The listener owns the table and `stop/1` does not wait for conns, so
+    %% a conn outliving its listener leaves a table that no longer exists.
+    Self = self(),
+    Owner = spawn(fun() ->
+        Table = ets:new(orphaned_registry, [set, public]),
+        Self ! {table, Table},
+        receive
+            stop -> ok
+        end
+    end),
+    Table =
+        receive
+            {table, T} -> T
         end,
-    Listener = join_drain_group_for_joins_pid_when_pg_scope_running,
-    ok = roadrunner_conn:join_drain_group_for(self(), Listener),
-    ?assert(lists:member(self(), pg:get_members({roadrunner_drain, Listener}))),
-    ok = pg:leave({roadrunner_drain, Listener}, self()).
+    MRef = monitor(process, Owner),
+    Owner ! stop,
+    receive
+        {'DOWN', MRef, process, Owner, _} -> ok
+    end,
+    ?assertEqual(ok, roadrunner_conn:unregister_for_drain(#{drain_table => Table})).
 
 consume_state_next_chunk_for_content_length_drains_fully_test() ->
     %% Non-chunked framing: `next_chunk` drains the full body in one

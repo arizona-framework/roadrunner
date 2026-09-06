@@ -29,6 +29,7 @@ All duration and interval values in `opts()` are in milliseconds —
     stop/1,
     drain/2,
     notify_drain/2,
+    register_for_drain/2,
     port/1,
     info/1,
     status/1,
@@ -222,10 +223,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   `roadrunner_req:read_body/1,2`).
 - `slot_reconciliation` — `disabled` (default) or
   `#{interval := Ms}` to periodically reap slots orphaned by
-  brutal-kill exits.
-- `graceful_drain` — opt out of the per-conn pg drain group
-  (`true` default; `false` trades drain notification for ~10 %
-  lower per-conn overhead on short-lived workloads).
+  brutal-kill exits, and with them the killed conns' rows in the
+  drain registry.
+- `graceful_drain` — opt out of the per-conn drain registry
+  (`true` default; `false` trades drain notification for a little
+  less per-conn work on short-lived workloads).
 - `hibernate_after` — when set, idle conns hibernate after this
   many milliseconds of main-loop idle time.
 - `handler_spawn` — spawn config for every handler-running process (the
@@ -311,7 +313,7 @@ ops-tuning rationale.
     rate_check_interval => pos_integer(),
     body_buffering => auto | manual,
     slot_reconciliation => disabled | #{interval := pos_integer()},
-    %% Opt out of the per-conn `pg` drain group. Default `true`
+    %% Opt out of the per-conn drain registry. Default `true`
     %% (current behavior). Set to `false` for short-lived h1-only
     %% workloads (REST APIs, health-check probes, CLI clients) where
     %% conns finish on their own faster than any drain notification
@@ -611,11 +613,11 @@ WebSocket session tunables (under `ws` in the listener opts).
     proto_opts :: roadrunner_conn:proto_opts(),
     phase = accepting :: accepting | draining | stopped,
     %% Slot reconciliation (off by default). When enabled, a periodic
-    %% timer compares `client_counter` against pg group membership and
-    %% releases slots that have been orphaned by `kill`-style exits
+    %% timer compares `client_counter` against the live registered conns
+    %% and releases slots that have been orphaned by `kill`-style exits
     %% (which bypass `terminate/3`). `prev_diff` tracks the previous
     %% tick's diff to filter out spawn-time races (a freshly-started
-    %% conn has bumped the counter but not yet pg:join'd) — only
+    %% conn has bumped the counter but not yet registered) — only
     %% sustained diffs are reaped.
     reconciliation = disabled ::
         disabled
@@ -671,7 +673,7 @@ drain(Name, Timeout) ->
 
 -doc """
 Broadcast a `{roadrunner_drain, Deadline}` notification to every conn /
-WS session in the listener's `pg` drain group **without** stopping the
+WS session in the listener's drain registry **without** stopping the
 listener or waiting on the counter.
 
 Use for soft-drain workflows — telling long-lived sessions to wind down
@@ -679,14 +681,24 @@ ahead of a deploy, or in test suites that want to observe drain
 behavior without losing the listener for subsequent cases. Unlike
 `drain/2`, the listener keeps accepting new connections.
 
-Requires the `pg` scope to be running (started by `roadrunner_sup`).
+Like every other call into a listener, exits with `noproc` when no
+listener by that name is running.
 """.
 -spec notify_drain(Name :: atom(), Deadline :: integer()) -> ok.
 notify_drain(Name, Deadline) when is_atom(Name), is_integer(Deadline) ->
-    lists:foreach(
-        fun(Pid) -> Pid ! {roadrunner_drain, Deadline} end,
-        pg:get_members({roadrunner_drain, Name})
-    ).
+    gen_server:call(Name, {notify_drain, Deadline}).
+
+-doc """
+Register `Pid` in the listener's drain registry so `drain/2` and
+`notify_drain/2` reach it with `{roadrunner_drain, Deadline}`. The
+connection processes register themselves; this is for a process that
+lives outside the conn lifecycle (a long-lived worker, say) and wants
+the same notification. Exits with `noproc` when no listener by that
+name is running.
+""".
+-spec register_for_drain(Name :: atom(), pid()) -> ok.
+register_for_drain(Name, Pid) when is_atom(Name), is_pid(Pid) ->
+    gen_server:call(Name, {register_for_drain, Pid}).
 
 -doc "Return the actual TCP port the listener is bound to.".
 -spec port(Name :: atom()) -> inet:port_number().
@@ -1222,6 +1234,18 @@ build_proto_opts(Opts, ListenerName) ->
     ClientCounter = counters:new(1, [write_concurrency]),
     RequestsCounter = atomics:new(1, [{signed, false}]),
     RejectedCounter = atomics:new(1, [{signed, false}]),
+    %% Per-listener drain registry: every conn inserts its own pid as it
+    %% starts and deletes it on exit, which is how `drain/2` and
+    %% `notify_drain/2` find the processes to notify. A `write_concurrency`
+    %% set owned by this process (it dies with the listener), so a join is
+    %% a lock-free insert rather than a call into a registry process: 512
+    %% simultaneous connection starts queued 3-4 ms behind the single `pg`
+    %% scope this replaces. The by-name entry points (`notify_drain/2`,
+    %% `register_for_drain/2`) go through this process
+    %% instead of a shared pointer: they are rare, and a call to a stopped
+    %% listener fails as `noproc` rather than reaching a table that died
+    %% with it.
+    DrainTable = ets:new(roadrunner_drain, [set, public, {write_concurrency, true}]),
     %% `inflight_counter` is the live in-flight-request gauge (h2/h3 stream
     %% workers acquire before spawn, release on `DOWN`), same lock-free
     %% `write_concurrency` shape as `client_counter`. `throttled_counter`
@@ -1283,6 +1307,7 @@ build_proto_opts(Opts, ListenerName) ->
             max_concurrent_requests => MaxConcurrentRequests,
             overload => Overload,
             client_counter => ClientCounter,
+            drain_table => DrainTable,
             requests_counter => RequestsCounter,
             rejected_counter => RejectedCounter,
             inflight_counter => InflightCounter,
@@ -1892,6 +1917,13 @@ handle_call({drain, Timeout}, _From, State) ->
 handle_call({reload_routes, Routes}, _From, State) ->
     Reply = do_reload_routes(State, Routes),
     {reply, Reply, State};
+handle_call({notify_drain, Deadline}, _From, #state{proto_opts = #{drain_table := Table}} = State) ->
+    {reply, notify_conns(Table, Deadline), State};
+handle_call(
+    {register_for_drain, Pid}, _From, #state{proto_opts = #{drain_table := Table}} = State
+) ->
+    true = ets:insert(Table, {Pid}),
+    {reply, ok, State};
 handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
     #{
         client_counter := ClientCounter,
@@ -1946,10 +1978,9 @@ do_drain(
     %% existing TCP conns keep their own sockets and drain below.
     ok = close_tcp(LSocket),
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
-    Group = drain_group(ProtoOpts),
-    notify_conns(Group, Deadline),
-    #{client_counter := Counter} = ProtoOpts,
-    Reply = wait_for_drain(Counter, Deadline, Group),
+    #{client_counter := Counter, drain_table := Table} = ProtoOpts,
+    notify_conns(Table, Deadline),
+    Reply = wait_for_drain(Counter, Deadline, Table),
     %% Stop the QUIC listener LAST: `roadrunner_quic_listener:stop/1` kills the
     %% connections it `start_link`ed (and the h3 conn loops linked to
     %% them), so doing it before the notify/wait above would abruptly
@@ -1968,16 +1999,16 @@ do_drain(
 %% handlers can pattern-match on `{roadrunner_drain, Deadline}` in
 %% `handle_info/3`; non-loop conns ignore the message and fall through
 %% to the mailbox check at the next keep-alive boundary.
--spec notify_conns(term(), integer()) -> ok.
-notify_conns(Group, Deadline) ->
-    _ = [Pid ! {roadrunner_drain, Deadline} || Pid <- pg:get_members(Group)],
+-spec notify_conns(ets:table(), integer()) -> ok.
+notify_conns(Table, Deadline) ->
+    _ = [Pid ! {roadrunner_drain, Deadline} || {Pid} <- ets:tab2list(Table)],
     ok.
 
 %% Poll the active-clients counter every 50ms (or whatever remains,
 %% if smaller) until it hits zero or the deadline expires.
--spec wait_for_drain(counters:counters_ref(), integer(), term()) ->
+-spec wait_for_drain(counters:counters_ref(), integer(), ets:table()) ->
     {ok, drained} | {timeout, non_neg_integer()}.
-wait_for_drain(Counter, Deadline, Group) ->
+wait_for_drain(Counter, Deadline, Table) ->
     case counters:get(Counter, 1) of
         0 ->
             {ok, drained};
@@ -1985,17 +2016,13 @@ wait_for_drain(Counter, Deadline, Group) ->
             Remaining = Deadline - erlang:monotonic_time(millisecond),
             case Remaining =< 0 of
                 true ->
-                    _ = [exit(Pid, shutdown) || Pid <- pg:get_members(Group)],
+                    _ = [exit(Pid, shutdown) || {Pid} <- ets:tab2list(Table)],
                     {timeout, N};
                 false ->
                     timer:sleep(min(50, Remaining)),
-                    wait_for_drain(Counter, Deadline, Group)
+                    wait_for_drain(Counter, Deadline, Table)
             end
     end.
-
--spec drain_group(roadrunner_conn:proto_opts()) -> {roadrunner_drain, atom()}.
-drain_group(#{listener_name := Name}) ->
-    {roadrunner_drain, Name}.
 
 -doc false.
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
@@ -2012,26 +2039,20 @@ handle_info(reconcile_slots, #state{reconciliation = disabled} = State) ->
 handle_info(
     reconcile_slots,
     #state{
-        proto_opts = #{client_counter := Counter, listener_name := Name},
+        proto_opts = #{client_counter := Counter, listener_name := Name, drain_table := Table},
         reconciliation = #{interval := Interval, prev_diff := PrevDiff}
     } = State
 ) ->
-    %% pg is supervised by roadrunner_sup so it's always up when the
-    %% reconciler runs (which only fires when explicitly opted into).
-    %%
-    %% We avoid `length/1` on the member list because `max_clients`
-    %% can be configured into the tens of thousands and a full O(N)
-    %% length walk would dominate the tick. We only need to know
-    %% whether `length(members) >= counter` (no orphans) or
-    %% `length(members) < counter` (orphans = counter - length); a
-    %% bounded count short-circuits at the counter so the worst case
-    %% is `min(length(members), counter)` element visits.
+    %% We only need to know whether `live members >= counter` (no
+    %% orphans) or `live members < counter` (orphans = counter - live);
+    %% a bounded count short-circuits at the counter so the alive checks
+    %% per tick are capped at `min(members, counter)`.
     Counter0 = counters:get(Counter, 1),
-    PgCountBounded = count_up_to(pg:get_members({roadrunner_drain, Name}), Counter0),
-    NewDiff = Counter0 - PgCountBounded,
+    LiveBounded = count_live_up_to(Table, Counter0),
+    NewDiff = Counter0 - LiveBounded,
     %% Only release slots that have been orphaned for two consecutive
     %% ticks — filters out the spawn-time race where a fresh conn has
-    %% incremented the counter but hasn't yet pg:join'd.
+    %% incremented the counter but hasn't yet registered.
     Release = min(PrevDiff, NewDiff),
     case Release of
         0 ->
@@ -2043,7 +2064,7 @@ handle_info(
                 listener_name => Name,
                 released => N,
                 counter_was => Counter0,
-                pg_count_bounded => PgCountBounded
+                live_conns_bounded => LiveBounded
             }),
             ok = roadrunner_telemetry:slots_reconciled(#{
                 listener_name => Name,
@@ -2074,18 +2095,30 @@ handle_info(
 handle_info(_Msg, State) ->
     {noreply, State}.
 
-%% Count list elements, short-circuiting at `Cap`. Used by the slot
-%% reconciler so the worst-case walk per tick is bounded by the
-%% `client_counter` (i.e. `max_clients`) rather than the absolute
-%% size of the pg member list.
--spec count_up_to([term()], non_neg_integer()) -> non_neg_integer().
-count_up_to(List, Cap) ->
-    count_up_to(List, Cap, 0).
+%% Count registered conns that are still alive, short-circuiting at
+%% `Cap` (the `client_counter`, i.e. `max_clients`) so the per-tick
+%% alive checks are bounded by the counter rather than by the registry
+%% size. A conn that was `kill`ed never ran its exit path, so its pid is
+%% still registered: it is dropped here, the same reaping this tick does
+%% for its slot.
+-spec count_live_up_to(ets:table(), non_neg_integer()) -> non_neg_integer().
+count_live_up_to(Table, Cap) ->
+    count_live_up_to(ets:tab2list(Table), Table, Cap, 0).
 
--spec count_up_to([term()], non_neg_integer(), non_neg_integer()) -> non_neg_integer().
-count_up_to(_, Cap, N) when N >= Cap -> Cap;
-count_up_to([], _Cap, N) -> N;
-count_up_to([_ | T], Cap, N) -> count_up_to(T, Cap, N + 1).
+-spec count_live_up_to([{pid()}], ets:table(), non_neg_integer(), non_neg_integer()) ->
+    non_neg_integer().
+count_live_up_to(_, _Table, Cap, N) when N >= Cap ->
+    Cap;
+count_live_up_to([], _Table, _Cap, N) ->
+    N;
+count_live_up_to([{Pid} | T], Table, Cap, N) ->
+    case is_process_alive(Pid) of
+        true ->
+            count_live_up_to(T, Table, Cap, N + 1);
+        false ->
+            true = ets:delete(Table, Pid),
+            count_live_up_to(T, Table, Cap, N)
+    end.
 
 -doc false.
 -spec terminate(term(), #state{}) -> ok.

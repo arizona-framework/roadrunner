@@ -56,9 +56,6 @@ all() ->
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
     {ok, _} = application:ensure_all_started(ssl),
-    %% The default `pg` scope hosts a connection owner's drain group; start it
-    %% unlinked so it outlives this transient process.
-    ok = ensure_pg_started(),
     Config.
 
 end_per_suite(_Config) ->
@@ -405,17 +402,3 @@ cert_key() ->
     {cert, CertDer} = lists:keyfind(cert, 1, Opts),
     {key, {KeyType, KeyDer}} = lists:keyfind(key, 1, Opts),
     {[CertDer], public_key:der_decode(KeyType, KeyDer)}.
-
-ensure_pg_started() ->
-    case whereis(pg) of
-        undefined ->
-            case pg:start_link() of
-                {ok, Pid} ->
-                    _ = unlink(Pid),
-                    ok;
-                {error, {already_started, _}} ->
-                    ok
-            end;
-        _ ->
-            ok
-    end.

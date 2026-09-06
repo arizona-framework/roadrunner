@@ -189,8 +189,7 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
     proc_lib:set_label({roadrunner_conn_loop_http3, ListenerName, Conn}),
     %% The `max_clients` slot was acquired by `start/2` (in the listener
     %% process); it is released in `terminate/1`.
-    DrainGroup = maps:get(graceful_drain, ProtoOpts, true),
-    ok = roadrunner_conn:join_drain_group(ListenerName, DrainGroup),
+    ok = roadrunner_conn:register_for_drain(ProtoOpts),
     %% Share fate with the QUIC connection process: if it dies abnormally
     %% (without a `closed` event) the loop dies too, rather than hanging.
     %% The slot then leaks until slot reconciliation reaps it, the same
@@ -1006,4 +1005,5 @@ terminate(#h3{
     ok = roadrunner_conn:release_request_slots(
         MaxConcReq, InflightCounter, map_size(Refs), Overload
     ),
+    ok = roadrunner_conn:unregister_for_drain(ProtoOpts),
     ok = roadrunner_conn:release_slot(ProtoOpts).

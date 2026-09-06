@@ -109,10 +109,6 @@ request_rejected_event_fires_on_bad_request_line_test() ->
     %% `[roadrunner, request, rejected]` with the parser's reason atom so
     %% ops tooling can track protocol-attack-shaped traffic.
     {ok, _} = application:ensure_all_started(telemetry),
-    case whereis(pg) of
-        undefined -> {ok, _} = pg:start_link();
-        _ -> ok
-    end,
     HandlerId = attach([[roadrunner, request, rejected]]),
     try
         Self = self(),

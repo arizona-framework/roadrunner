@@ -1969,6 +1969,7 @@ exit_clean(#loop{
     ok = roadrunner_conn:release_request_slots(
         MaxConcReq, InflightCounter, map_size(Refs), Overload
     ),
+    ok = roadrunner_conn:unregister_for_drain(ProtoOpts),
     ok = roadrunner_conn:release_slot(ProtoOpts),
     ok = roadrunner_transport:close(Socket),
     exit(normal).

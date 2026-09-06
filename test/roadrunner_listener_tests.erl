@@ -163,14 +163,16 @@ listener_honors_recv_buffer_opt_test() ->
 %% notify_drain/2 (soft drain — broadcast without stopping the listener)
 %% =============================================================================
 
-notify_drain_reaches_pg_members_test() ->
-    %% Self-join the drain group so the broadcast reaches this process,
-    %% then call notify_drain and assert the message lands.
-    ok = ensure_pg_started(),
+notify_drain_reaches_registered_members_test() ->
+    %% Register this process in a running listener's drain registry so
+    %% the broadcast reaches it, then call notify_drain and assert the
+    %% message lands.
     Name = listener_test_notify_drain,
-    Group = {roadrunner_drain, Name},
-    ok = pg:join(Group, self()),
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0, routes => roadrunner_hello_handler
+    }),
     try
+        ok = roadrunner_listener:register_for_drain(Name, self()),
         Deadline = erlang:monotonic_time(millisecond) + 30000,
         ok = roadrunner_listener:notify_drain(Name, Deadline),
         receive
@@ -179,18 +181,31 @@ notify_drain_reaches_pg_members_test() ->
             ?assert(false)
         end
     after
-        ok = pg:leave(Group, self())
+        ok = roadrunner_listener:stop(Name)
     end.
 
 notify_drain_with_no_members_is_noop_test() ->
-    %% Empty group — just confirms the call returns ok and doesn't crash.
-    ok = ensure_pg_started(),
+    %% Empty registry — just confirms the call returns ok and doesn't crash.
+    Name = listener_test_notify_drain_empty,
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0, routes => roadrunner_hello_handler
+    }),
     ?assertEqual(
-        ok,
+        ok, roadrunner_listener:notify_drain(Name, erlang:monotonic_time(millisecond) + 30000)
+    ),
+    ok = roadrunner_listener:stop(Name).
+
+notify_drain_on_unknown_listener_exits_test() ->
+    %% Like any call into a listener that is not running.
+    ?assertExit(
+        {noproc, _},
         roadrunner_listener:notify_drain(
-            listener_test_notify_drain_empty,
-            erlang:monotonic_time(millisecond) + 30000
+            listener_test_notify_drain_missing, erlang:monotonic_time(millisecond) + 30000
         )
+    ),
+    ?assertExit(
+        {noproc, _},
+        roadrunner_listener:register_for_drain(listener_test_notify_drain_missing, self())
     ).
 
 %% =============================================================================
@@ -198,12 +213,11 @@ notify_drain_with_no_members_is_noop_test() ->
 %% =============================================================================
 
 slot_reconciliation_releases_sustained_orphan_slots_test() ->
-    %% With reconciliation enabled, an orphaned slot (counter > pg
-    %% members for two consecutive ticks) is reaped — simulates
+    %% With reconciliation enabled, an orphaned slot (counter > live
+    %% registered conns for two consecutive ticks) is reaped — simulates
     %% `kill`-bypasses-`terminate` recovery. Also asserts the
     %% `[roadrunner, listener, slots_reconciled]` telemetry event fires
     %% with the released count.
-    ok = ensure_pg_started(),
     {ok, _} = application:ensure_all_started(telemetry),
     Self = self(),
     HandlerId = make_ref(),
@@ -227,7 +241,7 @@ slot_reconciliation_releases_sustained_orphan_slots_test() ->
         ProtoOpts = element(4, State),
         Counter = maps:get(client_counter, ProtoOpts),
         ?assertEqual(0, counters:get(Counter, 1)),
-        %% Plant 3 orphan slots — bumped without a corresponding pg join.
+        %% Plant 3 orphan slots — bumped without a corresponding registration.
         ok = counters:add(Counter, 1, 3),
         ?assertEqual(3, counters:get(Counter, 1)),
         %% First tick at 30ms records prev_diff=3; second tick at 60ms
@@ -245,10 +259,11 @@ slot_reconciliation_releases_sustained_orphan_slots_test() ->
         telemetry:detach(HandlerId)
     end.
 
-slot_reconciliation_only_reaps_excess_over_pg_members_test() ->
-    %% Counter > pg members → only the diff is orphan; pg members
-    %% themselves represent live conns and must NOT be touched.
-    ok = ensure_pg_started(),
+slot_reconciliation_only_reaps_excess_over_live_members_test() ->
+    %% Counter > live members → only the diff is orphan; registered live
+    %% conns must NOT be touched, and a registered pid that has since
+    %% died counts for nothing (its slot is exactly what the reaper is
+    %% for).
     Name = listener_test_reap_partial,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
@@ -259,26 +274,33 @@ slot_reconciliation_only_reaps_excess_over_pg_members_test() ->
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
     Counter = maps:get(client_counter, ProtoOpts),
-    %% Plant 2 fake "live conn" pids in the drain group + bump
-    %% counter to 5. Diff = 5 - 2 = 3 orphans. After two ticks the
-    %% reaper should release 3, leaving counter at 2 (the live ones).
+    %% Plant 2 fake "live conn" pids in the registry, plus one that is
+    %% registered but already dead, and bump the counter to 5. Live diff
+    %% = 5 - 2 = 3 orphans. After two ticks the reaper should release 3,
+    %% leaving counter at 2 (the live ones), and drop the dead row.
     Stub1 = spawn(fun() ->
-        pg:join({roadrunner_drain, Name}, self()),
         receive
             stop -> ok
         end
     end),
     Stub2 = spawn(fun() ->
-        pg:join({roadrunner_drain, Name}, self()),
         receive
             stop -> ok
         end
     end),
-    %% Wait briefly for both joins to register.
-    timer:sleep(20),
+    ok = roadrunner_listener:register_for_drain(Name, Stub1),
+    ok = roadrunner_listener:register_for_drain(Name, Stub2),
+    Dead = spawn(fun() -> ok end),
+    DeadRef = monitor(process, Dead),
+    receive
+        {'DOWN', DeadRef, process, Dead, _} -> ok
+    end,
+    ok = roadrunner_listener:register_for_drain(Name, Dead),
     ok = counters:add(Counter, 1, 5),
     timer:sleep(200),
     ?assertEqual(2, counters:get(Counter, 1)),
+    Table = maps:get(drain_table, ProtoOpts),
+    ?assertEqual(lists:sort([{Stub1}, {Stub2}]), lists:sort(ets:tab2list(Table))),
     Stub1 ! stop,
     Stub2 ! stop,
     ok = roadrunner_listener:stop(Name).
@@ -733,7 +755,6 @@ listener_drops_unknown_info_message_test() ->
     ok = roadrunner_listener:stop(Name).
 
 slot_reconciliation_disabled_by_default_test() ->
-    ok = ensure_pg_started(),
     Name = listener_test_no_reap,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0, routes => roadrunner_hello_handler
@@ -867,7 +888,6 @@ drain(Sock) ->
 %% =============================================================================
 
 overload_mode_rejects_bad_config_test() ->
-    ok = ensure_pg_started(),
     Base = #{port => 0, routes => roadrunner_hello_handler, max_concurrent_requests => 4},
     %% Validation runs in `init/1`, so a bad opt comes back as a start
     %% error rather than an exception in the caller.
@@ -905,7 +925,6 @@ overload_mode_rejects_bad_config_test() ->
 %% `request_timeout` and `max_queued` from the ceiling, so the feature is
 %% usable without inventing numbers.
 overload_mode_queue_derives_its_knobs_test() ->
-    ok = ensure_pg_started(),
     Name = overload_queue_derived,
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0,
@@ -922,7 +941,6 @@ overload_mode_queue_derives_its_knobs_test() ->
     ok = roadrunner_listener:stop(Name).
 
 overload_mode_queue_starts_a_listener_test() ->
-    ok = ensure_pg_started(),
     Name = overload_queue_ok,
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0,
@@ -946,7 +964,6 @@ overload_mode_queue_starts_a_listener_test() ->
 drain_with_no_active_conns_returns_immediately_test_() ->
     {setup,
         fun() ->
-            ok = ensure_pg_started(),
             Name = listener_test_drain_idle,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0, routes => roadrunner_hello_handler
@@ -964,7 +981,6 @@ drain_with_no_active_conns_returns_immediately_test_() ->
 drain_waits_for_in_flight_loop_to_close_test_() ->
     {setup,
         fun() ->
-            ok = ensure_pg_started(),
             Name = listener_test_drain_loop,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0,
@@ -992,7 +1008,6 @@ drain_waits_for_in_flight_loop_to_close_test_() ->
 drain_timeout_kills_unresponsive_conns_test_() ->
     {setup,
         fun() ->
-            ok = ensure_pg_started(),
             Name = listener_test_drain_kill,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0,
@@ -1019,7 +1034,6 @@ drain_timeout_kills_unresponsive_conns_test_() ->
 drain_closes_conn_stalled_mid_body_test_() ->
     {setup,
         fun() ->
-            ok = ensure_pg_started(),
             Name = listener_test_drain_body,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0,
@@ -1063,7 +1077,6 @@ drain_closes_conn_stalled_mid_body_test_() ->
 drain_closes_keep_alive_conn_after_in_flight_request_test_() ->
     {setup,
         fun() ->
-            ok = ensure_pg_started(),
             Name = listener_test_drain_ka,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0, routes => roadrunner_drain_pause_handler
@@ -1082,12 +1095,12 @@ drain_closes_keep_alive_conn_after_in_flight_request_test_() ->
                 %% message in its mailbox and closes without trying
                 %% to read a second keep-alive request.
                 ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
-                %% Brief warm-up so the conn has joined the `pg` drain
-                %% group before drain queries members. The acceptor
+                %% Brief warm-up so the conn has registered in the drain
+                %% registry before drain queries members. The acceptor
                 %% bumps the live-clients counter before spawning the
                 %% conn; without this sleep, drain can observe
-                %% counter=1 / pg=empty on a slow scheduler and time
-                %% out before the handler's 150ms sleep finishes.
+                %% counter=1 / registry=empty on a slow scheduler and
+                %% time out before the handler's 150ms sleep finishes.
                 timer:sleep(20),
                 Self = self(),
                 spawn_link(fun() ->
@@ -1161,7 +1174,6 @@ unreachable_route_stops_the_listener_from_starting_test_() ->
 reload_routes_swaps_dispatch_table_test_() ->
     {setup,
         fun() ->
-            ok = ensure_pg_started(),
             Name = listener_test_reload,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0,
@@ -1191,7 +1203,6 @@ reload_routes_refuses_an_unworkable_table_test_() ->
     %% table already published, so the running one is left exactly as it was.
     {setup,
         fun() ->
-            ok = ensure_pg_started(),
             Name = listener_test_reload_reject,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0,
@@ -1234,7 +1245,6 @@ reload_routes_rebakes_listener_middlewares_test_() ->
     %% middlewares on reloaded routes.
     {setup,
         fun() ->
-            ok = ensure_pg_started(),
             Name = listener_test_reload_listener_mws,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0,
@@ -1395,7 +1405,6 @@ drain_close(Sock, Acc) ->
 status_returns_phase_test_() ->
     {setup,
         fun() ->
-            ok = ensure_pg_started(),
             Name = listener_test_status,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0, routes => roadrunner_hello_handler
@@ -1413,15 +1422,6 @@ status_returns_phase_test_() ->
                 ?assertEqual(accepting, roadrunner_listener:status(Name))
             end}
         end}.
-
-ensure_pg_started() ->
-    case whereis(pg) of
-        undefined ->
-            {ok, _} = pg:start_link(),
-            ok;
-        _ ->
-            ok
-    end.
 
 %% gen_server replies to `drain/2` *before* `terminate/2` finishes, so
 %% there's a brief window where `whereis/1` still returns the pid even

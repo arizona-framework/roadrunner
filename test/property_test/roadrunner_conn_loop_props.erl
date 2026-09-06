@@ -35,7 +35,6 @@ prop_loop_terminates_normal_on_random_inputs() ->
         },
         begin
             {ok, _} = application:ensure_all_started(telemetry),
-            ensure_pg(),
             Counter = counters:new(1, [write_concurrency]),
             Opts = proto_opts(prop_listener, Counter),
             %% Mirror the acceptor's slot acquisition so the conn's
@@ -91,7 +90,6 @@ prop_request_start_and_stop_share_request_id() ->
         method(),
         begin
             {ok, _} = application:ensure_all_started(telemetry),
-            ensure_pg(),
             Self = self(),
             HandlerId = make_ref(),
             ok = telemetry:attach_many(
@@ -161,15 +159,6 @@ method() ->
 %% =============================================================================
 %% Helpers
 %% =============================================================================
-
-ensure_pg() ->
-    case whereis(pg) of
-        undefined ->
-            {ok, _} = pg:start_link(),
-            ok;
-        _ ->
-            ok
-    end.
 
 proto_opts(ListenerName, Counter) ->
     #{

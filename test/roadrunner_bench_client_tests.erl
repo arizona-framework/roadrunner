@@ -159,23 +159,9 @@ drive_n_alive(N, Conn0) ->
 
 %% --- listener helpers ---
 %%
-%% Other test modules in this project (`roadrunner_listener_tests`,
-%% `roadrunner_telemetry_tests`, …) bypass `application:start(roadrunner)`
-%% because `roadrunner_tests` calls `application:stop(roadrunner)` in
-%% its `{setup, ...}` teardown and pg is left running by other
-%% tests' direct `pg:start_link/0` calls — so a fresh
-%% `application:ensure_all_started(roadrunner)` after that fails
-%% with `{failed_to_start_child, pg, {already_started, _}}`.
-%% Match the project pattern: ensure pg, start the listener directly.
-
-ensure_pg() ->
-    case whereis(pg) of
-        undefined ->
-            {ok, _} = pg:start_link(),
-            ok;
-        _ ->
-            ok
-    end.
+%% Like the other test modules in this project (`roadrunner_listener_tests`,
+%% `roadrunner_telemetry_tests`, …), start the listener directly rather
+%% than through `application:start(roadrunner)`.
 
 stop_listener(Name) ->
     case whereis(Name) of
@@ -192,13 +178,11 @@ stop_listener(Name) ->
     end.
 
 start_h1_listener(Name, Handler) ->
-    ensure_pg(),
     {ok, _} = roadrunner_listener:start_link(Name, #{port => 0, routes => Handler}),
     roadrunner_listener:port(Name).
 
 start_h2_listener(Name, Handler) ->
     {ok, _} = application:ensure_all_started(ssl),
-    ensure_pg(),
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0,
         protocols => [http1, http2],
@@ -209,7 +193,6 @@ start_h2_listener(Name, Handler) ->
 
 start_h3_listener(Name, Handler) ->
     {ok, _} = application:ensure_all_started(ssl),
-    ensure_pg(),
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0,
         protocols => [http3],

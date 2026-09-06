@@ -162,13 +162,13 @@ await_ping_ack(Sock, Buf) ->
     end.
 
 conn_pid(Name) ->
-    [Pid] = pg:get_members({roadrunner_drain, Name}),
+    ProtoOpts = element(4, sys:get_state(whereis(Name))),
+    [{Pid}] = ets:tab2list(maps:get(drain_table, ProtoOpts)),
     Pid.
 
 %% --- harness ---
 
 start_listener(Name, OverloadMode) ->
-    _ = ensure_pg(),
     %% Each test runs in its own process, so the previous one's
     %% registration may still be settling. Take the name rather than
     %% racing for it.
@@ -186,12 +186,6 @@ start_listener(Name, OverloadMode) ->
         overload_mode => OverloadMode
     }),
     {Name, roadrunner_listener:port(Name)}.
-
-ensure_pg() ->
-    case whereis(pg) of
-        undefined -> pg:start_link();
-        Pid -> {ok, Pid}
-    end.
 
 expect_handler() ->
     receive
