@@ -249,3 +249,34 @@ interactive and embedded mode alike. If you run roadrunner outside a
 release (a plain shell, an escript, a container that boots `erl`
 directly), expect the first requests after each restart to be slower,
 and send some traffic before putting the node into rotation.
+
+## TLS alert logging on internet-facing ports
+
+`ssl` logs every alert it raises or receives as a notice-level report,
+"TLS server: In state hello ... generated SERVER ALERT: Fatal - Unexpected
+Message" being the common shape. A TLS port reachable from the internet
+raises one for every scanner and misdirected client that connects and
+sends something other than a ClientHello, so the log fills with them.
+
+Roadrunner reports each failed handshake itself as
+`[roadrunner, listener, accept_error]` with a `{handshake, Reason}` reason
+that carries the alert text, so a deployment that consumes that event
+already has the information and can silence the duplicate through the
+listener's `tls` opts:
+
+```erlang
+roadrunner:start_listener(edge, #{
+    port => 443,
+    tls => [{certfile, Cert}, {keyfile, Key}, {log_level, warning}],
+    routes => Routes
+}).
+```
+
+Roadrunner leaves the level at `ssl`'s default on purpose. The same
+setting also hides alerts raised after the handshake (a bad record from a
+buggy client, a renegotiation attempt), which the connection does not
+report anywhere else yet: it closes, and `conn_close` carries no reason.
+Until it does, `ssl`'s notice is the only trace of those, and a
+deployment that has not attached telemetry handlers would otherwise see
+nothing about TLS trouble at all. Quiet it when you consume the event;
+keep it while the log is what you read.

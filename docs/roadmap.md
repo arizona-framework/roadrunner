@@ -242,6 +242,28 @@ lot of them.
 
 ## Other
 
+### Carry the close reason in `conn_close` telemetry
+
+**What:** `[roadrunner, listener, conn_close]` says that a connection
+ended, not why. The recv paths drop the transport's reason on the way
+to `exit_normal`, so a peer closing, a `request_timeout`, a slow-client
+cut-off, a drain and a TLS alert after the handshake all look the same
+to a telemetry consumer, and for the TLS alert `ssl`'s own notice log is
+the only trace. Thread a `reason` through the exit paths of the h1, h2
+and h3 loops into the event metadata: `normal`, `peer_closed`,
+`request_timeout`, `keep_alive_timeout`, `slow_client`, `drained`, or
+`{transport, Reason}` with the transport's term (`{tls_alert, {Desc,
+Text}}` included). Once it lands, lowering `ssl`'s alert `log_level` by
+default becomes a lossless change and can be revisited.
+
+**Why deferred:** surfaced while deciding whether to quiet `ssl`'s
+alert logging by default; the mute alone would have removed the only
+trace of post-handshake alerts, and the reason belongs in the event on
+its own merits, which is a change across every exit path rather than a
+rider on a log setting.
+
+**Scope:** medium.
+
 ### Connection-process memory tuning follow-ups
 
 **What:** The `handler_spawn` listener opt already exposes the full
