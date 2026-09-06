@@ -2158,6 +2158,10 @@ drain_then_wait(Pid) ->
     end.
 
 attach_telemetry(Tag, EventNames) ->
+    %% Started here rather than assumed: run alone, this module used to fail
+    %% six tests with `noproc` on `telemetry_handler_table` because only an
+    %% earlier module in the run had started the telemetry app.
+    {ok, _} = application:ensure_all_started(telemetry),
     Self = self(),
     [
         telemetry:attach(
