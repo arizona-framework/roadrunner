@@ -2330,6 +2330,7 @@ ws_proto_opts(MaxFrame, MaxMsg) ->
         ws_buffer => undefined,
         ws_hibernate_after => infinity,
         handler_spawn_opts => [{fullsweep_after, 0}],
+        tls_handshake_timeout => 5000,
         handler_start_timeout => infinity
     }.
 

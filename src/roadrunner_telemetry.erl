@@ -77,15 +77,17 @@
 %%   - **Metadata:** `listener_name`, `reason` (`max_clients`).
 %%
 %% - `[roadrunner, listener, accept_error]` — fired when an acceptor's
-%%   `accept/1` returns any error other than the listen socket closing,
-%%   and the acceptor keeps accepting instead of exiting. Two classes
-%%   share the event, told apart by `reason`: per-connection failures
-%%   (`econnaborted`, or `{handshake, HsReason}` for a failed TLS
-%%   handshake — routine noise on an internet-facing TLS port) retry
-%%   immediately; resource errors (`emfile`/`enfile`/`system_limit`
-%%   descriptor exhaustion, usually `max_clients` above the OS
-%%   `ulimit -n`) retry after a short back-off. A sustained stream of
-%%   descriptor-exhaustion reasons is the signal to raise `ulimit -n`.
+%%   `accept/1` returns any error other than the listen socket closing
+%%   (the acceptor keeps accepting instead of exiting), and when a
+%%   connection process fails its TLS handshake. Told apart by
+%%   `reason`: per-connection failures (`econnaborted`, or
+%%   `{handshake, HsReason}` for a failed TLS handshake — routine noise
+%%   on an internet-facing TLS port, reported by the connection that ran
+%%   it) cost nothing beyond that connection; resource errors
+%%   (`emfile`/`enfile`/`system_limit` descriptor exhaustion, usually
+%%   `max_clients` above the OS `ulimit -n`) make the acceptor retry
+%%   after a short back-off. A sustained stream of descriptor-exhaustion
+%%   reasons is the signal to raise `ulimit -n`.
 %%
 %%   - **Measurements:** `system_time`.
 %%   - **Metadata:** `listener_name`, `reason` (the accept error).
@@ -328,15 +330,16 @@ listener_conn_rejected(Metadata) ->
 -doc """
 Emit `[roadrunner, listener, accept_error]` when an acceptor's `accept/1`
 fails with anything other than the listen socket closing — a
-per-connection failure (`econnaborted`, a failed TLS handshake as
-`{handshake, _}`) or descriptor exhaustion
+per-connection failure (`econnaborted`) or descriptor exhaustion
 (`emfile`/`enfile`/`system_limit`, typically `max_clients` sitting above
-the OS `ulimit -n`). The acceptor reports it here and keeps accepting
-rather than exiting (immediately for per-connection failures, after a
-short back-off for resource errors), so a sustained stream of
-descriptor-exhaustion reasons is the signal to raise `ulimit -n`.
-`Metadata` should include `listener_name` and `reason` (the accept
-error). Carries no `peer`: there is no connection to name.
+the OS `ulimit -n`) — and when a connection process fails its TLS
+handshake (`{handshake, _}`). The acceptor reports its own failures
+here and keeps accepting rather than exiting (immediately for
+per-connection failures, after a short back-off for resource errors),
+so a sustained stream of descriptor-exhaustion reasons is the signal
+to raise `ulimit -n`. `Metadata` should include `listener_name` and
+`reason` (the accept or handshake error). Carries no `peer`: there is
+no served connection to name.
 """.
 -spec listener_accept_error(map()) -> ok.
 listener_accept_error(Metadata) ->

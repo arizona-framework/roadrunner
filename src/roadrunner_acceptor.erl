@@ -11,15 +11,24 @@
 %% listener doesn't supervise acceptors — a quiet exit would leave it
 %% permanently down one acceptor). How the retry paces depends on the
 %% error class (`accept_error_class/1`): per-connection failures — an
-%% aborted connection, a failed TLS handshake — retry immediately, since
-%% they arrive at connection rate and sleeping per event would throttle
-%% the whole pool; resource errors (`emfile`/`enfile`/`system_limit`
-%% descriptor exhaustion when `max_clients` sits above the OS
-%% `ulimit -n`, and anything unrecognized) back off briefly first.
-%% Unrelated acceptor crashes propagate back via the link, taking the
-%% listener down for supervisor restart. Connection workers are spawned
-%% **without** a link so that a crash in one connection does not bring
-%% down the acceptor.
+%% aborted connection — retry immediately, since they arrive at
+%% connection rate and sleeping per event would throttle the whole
+%% pool; resource errors (`emfile`/`enfile`/`system_limit` descriptor
+%% exhaustion when `max_clients` sits above the OS `ulimit -n`, and
+%% anything unrecognized) back off briefly first. Unrelated acceptor
+%% crashes propagate back via the link, taking the listener down for
+%% supervisor restart. Connection workers are spawned **without** a
+%% link so that a crash in one connection does not bring down the
+%% acceptor.
+%%
+%% The TLS handshake is NOT run here. `roadrunner_transport:accept/1`
+%% returns the socket pre-handshake and the connection process
+%% completes it at `shoot` (`roadrunner_conn_loop`), so handshake time
+%% — bounded by `tls_handshake_timeout` — is paid by the connection it
+%% belongs to and never parks an acceptor. A failed handshake is
+%% reported by that connection as `[roadrunner, listener,
+%% accept_error]` with a `{handshake, _}` reason, the same event this
+%% pool emits for its own accept failures.
 
 %% Back-off between retries after a resource-class accept error. Bounds
 %% the retry/telemetry rate and gives the box a moment to reclaim
@@ -27,7 +36,7 @@
 -define(ACCEPT_ERROR_BACKOFF_MS, 100).
 
 -export([start_link/3]).
--export([accept_error_class/1]).
+-export([accept_error_class/1, pace_after_error/1]).
 
 -doc """
 Spawn-link an acceptor process bound to `LSocket` with the given
@@ -41,19 +50,18 @@ the same opts. The index is used in the `proc_lib` label so
     {ok, pid()}.
 start_link(LSocket, ProtoOpts, Index) ->
     ListenerName = maps:get(listener_name, ProtoOpts, undefined),
-    #{tls_handshake_timeout := HsTimeout} = ProtoOpts,
     Pid = proc_lib:spawn_link(fun() ->
         proc_lib:set_label({roadrunner_acceptor, ListenerName, Index}),
-        loop(LSocket, ProtoOpts, HsTimeout)
+        loop(LSocket, ProtoOpts)
     end),
     {ok, Pid}.
 
--spec loop(roadrunner_transport:socket(), roadrunner_conn:proto_opts(), timeout()) -> ok.
-loop(LSocket, ProtoOpts, HsTimeout) ->
-    case roadrunner_transport:accept(LSocket, HsTimeout) of
+-spec loop(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> ok.
+loop(LSocket, ProtoOpts) ->
+    case roadrunner_transport:accept(LSocket) of
         {ok, Socket} ->
             handle_accepted(Socket, ProtoOpts),
-            loop(LSocket, ProtoOpts, HsTimeout);
+            loop(LSocket, ProtoOpts);
         {error, closed} ->
             %% Listen socket was closed — the listener is stopping. Exit
             %% cleanly; the linked listener tears the rest of the pool down.
@@ -67,16 +75,8 @@ loop(LSocket, ProtoOpts, HsTimeout) ->
                 listener_name => maps:get(listener_name, ProtoOpts, undefined),
                 reason => Reason
             }),
-            ok =
-                case accept_error_class(Reason) of
-                    retry ->
-                        ok;
-                    backoff ->
-                        receive
-                        after ?ACCEPT_ERROR_BACKOFF_MS -> ok
-                        end
-                end,
-            loop(LSocket, ProtoOpts, HsTimeout)
+            ok = pace_after_error(accept_error_class(Reason)),
+            loop(LSocket, ProtoOpts)
     end.
 
 %% Classify a non-`closed` accept error for retry pacing. Exported for
@@ -84,10 +84,9 @@ loop(LSocket, ProtoOpts, HsTimeout) ->
 %%
 %% `retry` — per-connection events that arrive at connection rate:
 %% `econnaborted` (peer reset between the kernel queue and our accept;
-%% bursts under SYN-flood conditions) and `{handshake, _}` (a garbage or
-%% aborted TLS handshake — routine internet background noise on a TLS
-%% port). Sleeping on these would let plain noise cap the whole accept
-%% pool at `acceptors / backoff` accepts per second.
+%% bursts under SYN-flood conditions). Sleeping on these would let plain
+%% noise cap the whole accept pool at `acceptors / backoff` accepts per
+%% second.
 %%
 %% `backoff` — resource exhaustion (`emfile`/`enfile`/`system_limit`),
 %% where hammering `accept/1` cannot help until the box reclaims
@@ -97,8 +96,19 @@ loop(LSocket, ProtoOpts, HsTimeout) ->
 -doc false.
 -spec accept_error_class(term()) -> retry | backoff.
 accept_error_class(econnaborted) -> retry;
-accept_error_class({handshake, _}) -> retry;
 accept_error_class(_Resource) -> backoff.
+
+%% Wait out the retry pacing for an accept error of the given class
+%% before the next `accept/1`. Exported alongside `accept_error_class/1`
+%% for exhaustive unit coverage; not part of any public API.
+-doc false.
+-spec pace_after_error(retry | backoff) -> ok.
+pace_after_error(retry) ->
+    ok;
+pace_after_error(backoff) ->
+    receive
+    after ?ACCEPT_ERROR_BACKOFF_MS -> ok
+    end.
 
 -spec handle_accepted(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> ok.
 handle_accepted(Socket, ProtoOpts) ->

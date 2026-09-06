@@ -137,6 +137,7 @@ request_rejected_event_fires_on_bad_request_line_test() ->
             proxy_protocol => false,
             listener_name => probe_listener_rej,
             handler_spawn_opts => [{fullsweep_after, 0}],
+            tls_handshake_timeout => 5000,
             handler_start_timeout => infinity
         },
         true = roadrunner_conn:try_acquire_slot(Opts),

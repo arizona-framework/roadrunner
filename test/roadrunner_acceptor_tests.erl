@@ -152,26 +152,27 @@ accept_error_class_test() ->
     %% Per-connection failures retry immediately; resource exhaustion
     %% and unknowns back off. Exhaustive over the classifier's clauses.
     ?assertEqual(retry, roadrunner_acceptor:accept_error_class(econnaborted)),
-    ?assertEqual(retry, roadrunner_acceptor:accept_error_class({handshake, closed})),
-    ?assertEqual(
-        retry,
-        roadrunner_acceptor:accept_error_class(
-            {handshake, {tls_alert, {handshake_failure, "reason"}}}
-        )
-    ),
     ?assertEqual(backoff, roadrunner_acceptor:accept_error_class(emfile)),
     ?assertEqual(backoff, roadrunner_acceptor:accept_error_class(enfile)),
     ?assertEqual(backoff, roadrunner_acceptor:accept_error_class(system_limit)),
     ?assertEqual(backoff, roadrunner_acceptor:accept_error_class(einval)).
 
-acceptor_survives_failed_tls_handshake_test() ->
-    %% A garbage ClientHello on a TLS listener fails `ssl:handshake/1`
-    %% inside `roadrunner_transport:accept/1`. The acceptor must treat
-    %% that as per-connection noise — telemetry with a `{handshake, _}`
-    %% reason, keep accepting — and reserve plain `closed` (the listen
-    %% socket going away) for its clean exit. Before the transport
-    %% tagged handshake errors, a peer disconnecting mid-handshake also
-    %% surfaced as `closed` and silently killed the acceptor.
+pace_after_error_test() ->
+    %% `retry` goes straight back to accept; `backoff` sits out the
+    %% pause first.
+    T0 = erlang:monotonic_time(millisecond),
+    ?assertEqual(ok, roadrunner_acceptor:pace_after_error(retry)),
+    ?assert(erlang:monotonic_time(millisecond) - T0 < 50),
+    ?assertEqual(ok, roadrunner_acceptor:pace_after_error(backoff)),
+    ?assert(erlang:monotonic_time(millisecond) - T0 >= 100).
+
+acceptor_hands_tls_sockets_off_before_the_handshake_test() ->
+    %% The acceptor takes a TLS socket pre-handshake and hands it to a
+    %% conn, which runs the handshake itself. A garbage ClientHello
+    %% therefore never touches the acceptor: the conn reports it as a
+    %% `{handshake, _}` accept_error and gives the slot back, while the
+    %% acceptor keeps accepting and reserves plain `closed` (the listen
+    %% socket going away) for its clean exit.
     {ok, _} = application:ensure_all_started(ssl),
     {ok, _} = application:ensure_all_started(telemetry),
     ServerOpts =
@@ -187,19 +188,33 @@ acceptor_survives_failed_tls_handshake_test() ->
         fun(_Event, _Measure, Meta, _Cfg) -> Self ! {accept_error, Meta} end,
         undefined
     ),
+    Counter = counters:new(1, [write_concurrency]),
     {ok, Pid} = roadrunner_acceptor:start_link(
-        LSock, #{listener_name => acceptor_test_tls_noise, tls_handshake_timeout => 5000}, 1
+        LSock,
+        #{
+            listener_name => acceptor_test_tls_noise,
+            tls_handshake_timeout => 5000,
+            client_counter => Counter,
+            max_clients => 10,
+            graceful_drain => false,
+            handler_spawn_opts => [{fullsweep_after, 0}],
+            handler_start_timeout => infinity
+        },
+        1
     ),
-    %% Plain-HTTP bytes can't form a TLS hello — the handshake fails.
+    %% Plain-HTTP bytes can't form a TLS hello — the conn's handshake fails.
     {ok, Noise} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
     ok = gen_tcp:send(Noise, ~"GET / HTTP/1.1\r\n\r\n"),
     receive
         {accept_error, Meta} ->
+            ?assertEqual(acceptor_test_tls_noise, maps:get(listener_name, Meta)),
             ?assertMatch({handshake, _}, maps:get(reason, Meta))
     after 5000 ->
         error(no_handshake_error_telemetry)
     end,
     ok = gen_tcp:close(Noise),
+    %% The slot taken at accept is released by the failing conn.
+    ok = wait_for_counter(Counter, 0, 200),
     %% Survived the noise connection.
     ?assert(is_process_alive(Pid)),
     %% Closing the listen socket ends the loop cleanly.
@@ -213,6 +228,19 @@ acceptor_survives_failed_tls_handshake_test() ->
     ok = telemetry:detach(HandlerId).
 
 %% --- helpers ---
+
+%% Poll the live-connection counter until it reads `Expected`; the slot
+%% release runs after the accept_error event, so the first read can race it.
+wait_for_counter(_Counter, Expected, 0) ->
+    error({counter_never_reached, Expected});
+wait_for_counter(Counter, Expected, Attempts) ->
+    case counters:get(Counter, 1) of
+        Expected ->
+            ok;
+        _ ->
+            timer:sleep(10),
+            wait_for_counter(Counter, Expected, Attempts - 1)
+    end.
 
 %% Poll until we see a refined `{roadrunner_conn, Name, Peer}` label or run
 %% out of attempts. Avoids a fixed `timer:sleep` race on slow CI.

@@ -40,10 +40,11 @@ All duration and interval values in `opts()` are in milliseconds —
 
 -define(DEFAULT_MAX_CONTENT_LENGTH, 10485760).
 -define(DEFAULT_REQUEST_TIMEOUT, 30000).
-%% Bound on `ssl:handshake/2` in the accept path. Without one, a client
-%% that connects to a TLS listener and never sends a ClientHello parks
-%% an acceptor indefinitely — `num_acceptors` such sockets and the
-%% listener stops accepting. 5 s comfortably covers slow real clients.
+%% Bound on `ssl:handshake/2`, run by the connection process after the
+%% acceptor hands the socket over. Without one, a client that connects
+%% to a TLS listener and never sends a ClientHello holds its
+%% `max_clients` slot and descriptor indefinitely. 5 s comfortably
+%% covers slow real clients.
 -define(DEFAULT_TLS_HANDSHAKE_TIMEOUT, 5000).
 -define(DEFAULT_KEEP_ALIVE_TIMEOUT, 60000).
 -define(DEFAULT_NUM_ACCEPTORS, 10).
@@ -124,19 +125,22 @@ Optional middleware and timing knobs (durations in milliseconds):
   hibernation timeout in milliseconds; off when unset).
 - `request_timeout` — header-read timeout on a fresh conn.
   Default 30 s.
-- `tls_handshake_timeout` — bound on the TLS handshake during accept
-  (TLS listeners only). A handshake that exceeds it fails as a
-  per-connection `{handshake, timeout}` accept error and the acceptor
-  keeps accepting; without a bound, a client that never sends its
-  ClientHello would park an acceptor indefinitely. Default 5 s.
+- `tls_handshake_timeout` — bound on the TLS handshake (TLS listeners
+  only). The handshake runs in the connection process, not the
+  acceptor, so a slow or silent peer never blocks other connections
+  from being accepted; one that exceeds the bound is closed and
+  reported as a per-connection `{handshake, timeout}` accept error,
+  releasing its `max_clients` slot. Default 5 s.
 - `keep_alive_timeout` — idle timeout between requests on a
   keep-alive conn. Default 60 s.
 - `num_acceptors` — size of the acceptor pool. Default 10.
 - `max_keep_alive_requests` — requests served per conn before
   forced close. Default 1000.
 - `max_clients` — concurrent connection cap. Default 16384 (the modern
-  Erlang/Elixir HTTP-server norm). Connections accepted while already at
-  the cap are closed immediately without a response. The effective cap is
+  Erlang/Elixir HTTP-server norm). A connection counts from the moment
+  it is accepted, so on a TLS listener one still in its handshake holds
+  a slot too. Connections accepted while already at the cap are closed
+  immediately without a response. The effective cap is
   `min(max_clients, the OS file-descriptor limit)` — raise `ulimit -n`
   (and the systemd `LimitNOFILE`) for high concurrency, otherwise the
   acceptors hit `emfile` at the descriptor ceiling and emit
