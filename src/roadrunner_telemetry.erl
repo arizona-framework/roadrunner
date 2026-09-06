@@ -394,7 +394,7 @@ request_throttled(Metadata) ->
     ok.
 
 -doc """
-Emit `[roadrunner, listener, slots_reconciled]` when the optional
+Emit `[roadrunner, listener, slots_reconciled]` when the
 `slot_reconciliation` reaper releases orphan slots that the
 `kill`-bypasses-`terminate` path left behind. `Metadata` should
 include `listener_name`, `released` (count), `counter_was` (value

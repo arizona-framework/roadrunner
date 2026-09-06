@@ -48,6 +48,12 @@ All duration and interval values in `opts()` are in milliseconds —
 %% covers slow real clients.
 -define(DEFAULT_TLS_HANDSHAKE_TIMEOUT, 5000).
 -define(DEFAULT_KEEP_ALIVE_TIMEOUT, 60000).
+%% A conn killed outright (`exit(Pid, kill)`, a `max_heap_size` kill) skips
+%% its exit path and leaks a slot and a drain-registry row for the life of
+%% the listener; only the reaper gives them back, so it runs by default.
+%% One tick a minute costs at most one `is_process_alive` per registered
+%% conn, and an orphan is reaped within two ticks.
+-define(DEFAULT_SLOT_RECONCILIATION_INTERVAL, 60000).
 -define(DEFAULT_NUM_ACCEPTORS, 10).
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
 -define(DEFAULT_MAX_CLIENTS, 16384).
@@ -223,10 +229,12 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `body_buffering` — `auto` (default; framework reads the full
   body before invoking the handler) or `manual` (handler calls
   `roadrunner_req:read_body/1,2`).
-- `slot_reconciliation` — `disabled` (default) or
-  `#{interval := Ms}` to periodically reap slots orphaned by
-  brutal-kill exits, and with them the killed conns' rows in the
-  drain registry.
+- `slot_reconciliation` — `#{interval := Ms}` (default 60000) for the
+  periodic reaper that releases slots orphaned by brutal-kill exits,
+  and with them the killed conns' rows in the drain registry, or
+  `disabled` to turn it off. A `graceful_drain => false` listener keeps
+  no registry to compare against, so the reaper is off there; asking
+  for both is a configuration conflict.
 - `graceful_drain` — opt out of the per-conn drain registry
   (`true` default; `false` trades drain notification for a little
   less per-conn work on short-lived workloads).
@@ -620,7 +628,7 @@ WebSocket session tunables (under `ws` in the listener opts).
     port :: inet:port_number(),
     proto_opts :: roadrunner_conn:proto_opts(),
     phase = accepting :: accepting | draining | stopped,
-    %% Slot reconciliation (off by default). When enabled, a periodic
+    %% Slot reconciliation (on by default, every 60 s). A periodic
     %% timer compares `client_counter` against the live registered conns
     %% and releases slots that have been orphaned by `kill`-style exits
     %% (which bypass `terminate/3`). `prev_diff` tracks the previous
@@ -1022,15 +1030,34 @@ first_pem_entry(File) ->
     [{Type, Der, not_encrypted} | _] = public_key:pem_decode(Pem),
     {Type, Der}.
 
+%% `graceful_drain => false` leaves no registry to compare the counter
+%% against: every live conn would look like an orphan and lose its slot. So
+%% the reaper is off on such a listener, and asking for it explicitly there
+%% is a conflict rather than a silent no-op.
 -spec setup_reconciliation(opts()) ->
     disabled | #{interval := pos_integer(), prev_diff := non_neg_integer()}.
+setup_reconciliation(#{graceful_drain := false, slot_reconciliation := Explicit}) when
+    Explicit =/= disabled
+->
+    error({listener_opt_conflict, slot_reconciliation, Explicit, no_drain_registry});
+setup_reconciliation(#{graceful_drain := false}) ->
+    disabled;
+setup_reconciliation(#{slot_reconciliation := disabled}) ->
+    disabled;
 setup_reconciliation(#{slot_reconciliation := #{interval := IntervalMs}}) when
     is_integer(IntervalMs), IntervalMs > 0
 ->
-    erlang:send_after(IntervalMs, self(), reconcile_slots),
-    #{interval => IntervalMs, prev_diff => 0};
+    arm_reconciliation(IntervalMs);
+setup_reconciliation(#{slot_reconciliation := Other}) ->
+    error({invalid_listener_opt, slot_reconciliation, Other});
 setup_reconciliation(_Opts) ->
-    disabled.
+    arm_reconciliation(?DEFAULT_SLOT_RECONCILIATION_INTERVAL).
+
+-spec arm_reconciliation(pos_integer()) ->
+    #{interval := pos_integer(), prev_diff := non_neg_integer()}.
+arm_reconciliation(IntervalMs) ->
+    _ = erlang:send_after(IntervalMs, self(), reconcile_slots),
+    #{interval => IntervalMs, prev_diff => 0}.
 
 %% Arm the periodic per-peer rate-limit bucket sweep when the guard is on. Like
 %% `setup_reconciliation`, the `erlang:send_after` timer auto-cancels when the
