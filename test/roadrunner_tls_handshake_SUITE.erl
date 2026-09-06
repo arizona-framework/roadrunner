@@ -21,8 +21,11 @@ the next.
 -export([
     garbage_hello_reports_accept_error_and_releases_slot/1,
     silent_peer_times_out_without_accept_telemetry/1,
-    parked_handshakes_do_not_block_accepting/1
+    parked_handshakes_do_not_block_accepting/1,
+    alert_logging_follows_the_tls_opts/1
 ]).
+%% `logger` handler callback for `alert_logging_follows_the_tls_opts/1`.
+-export([log/2]).
 
 suite() ->
     [{timetrap, {seconds, 30}}].
@@ -31,7 +34,8 @@ all() ->
     [
         garbage_hello_reports_accept_error_and_releases_slot,
         silent_peer_times_out_without_accept_telemetry,
-        parked_handshakes_do_not_block_accepting
+        parked_handshakes_do_not_block_accepting,
+        alert_logging_follows_the_tls_opts
     ].
 
 init_per_testcase(Case, Config) ->
@@ -109,16 +113,70 @@ parked_handshakes_do_not_block_accepting(_Config) ->
     ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, tls_get(Port, 2000)),
     lists:foreach(fun gen_tcp:close/1, Parked).
 
+alert_logging_follows_the_tls_opts(_Config) ->
+    %% ssl reports every alert it raises at notice level. An internet-facing
+    %% port raises one for every bit of background noise, and the conn
+    %% already reports each as a `{handshake, _}` accept error, so the
+    %% hardened defaults lower ssl's `log_level` to `warning`; a listener that
+    %% wants ssl's own reports back sets `log_level` in its `tls` opts. The
+    %% test profile pins the primary logger level at `critical`, so it is
+    %% raised for this case and the capturing handler is the only one attached.
+    #{level := PrimaryLevel} = logger:get_primary_config(),
+    ok = logger:set_primary_config(level, notice),
+    ok = logger:add_handler(?MODULE, ?MODULE, #{config => self(), level => notice}),
+    try
+        QuietPort = start_listener(#{}),
+        ok = garbage_hello(QuietPort),
+        receive
+            {ssl_notice, Msg} -> error({ssl_alert_logged_by_default, Msg})
+        after 300 -> ok
+        end,
+        ok = roadrunner_listener:stop(?MODULE),
+        LoudPort = start_listener(#{
+            tls => [{log_level, notice} | roadrunner_test_certs:server_opts()]
+        }),
+        ok = garbage_hello(LoudPort),
+        receive
+            {ssl_notice, _} -> ok
+        after 5000 -> error(ssl_alert_not_logged_when_asked_for)
+        end
+    after
+        _ = logger:remove_handler(?MODULE),
+        ok = logger:set_primary_config(level, PrimaryLevel)
+    end.
+
+%% `logger` handler callback: forwards notice-level events to the test.
+log(#{level := notice, msg := Msg}, #{config := Pid}) ->
+    Pid ! {ssl_notice, Msg};
+log(_Event, _Config) ->
+    ok.
+
 %% --- helpers ---
 
+%% Plain HTTP bytes can't form a TLS hello: the conn's handshake fails and
+%% is reported as a `{handshake, _}` accept error.
+garbage_hello(Port) ->
+    {ok, Noise} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Noise, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+    receive
+        {accept_error, #{reason := {handshake, _}}} -> ok
+    after 5000 ->
+        error(no_handshake_accept_error)
+    end,
+    gen_tcp:close(Noise).
+
+%% `Extra` wins over the defaults, so a case can bring its own `tls` opts.
 start_listener(Extra) ->
     {ok, _} = roadrunner_listener:start_link(
         ?MODULE,
-        Extra#{
-            port => 0,
-            tls => roadrunner_test_certs:server_opts(),
-            routes => roadrunner_hello_handler
-        }
+        maps:merge(
+            #{
+                port => 0,
+                tls => roadrunner_test_certs:server_opts(),
+                routes => roadrunner_hello_handler
+            },
+            Extra
+        )
     ),
     roadrunner_listener:port(?MODULE).
 

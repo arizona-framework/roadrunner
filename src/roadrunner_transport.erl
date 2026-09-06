@@ -35,9 +35,13 @@
 %% `honor_cipher_order`, `client_renegotiation` off, AEAD-only
 %% ECDHE-or-1.3 cipher list filtered through `ssl:filter_cipher_suites/2`,
 %% and the OTP-default signature algorithms / supported groups
-%% re-asserted so we don't drift if upstream lowers standards. OCSP
-%% stapling is intentionally absent — `ssl` does not support
-%% server-side stapling at the time of writing.
+%% re-asserted so we don't drift if upstream lowers standards. `ssl`'s
+%% own alert logging is lowered to `log_level` `warning`: it reports
+%% every alert it raises at notice level, an internet-facing port raises
+%% one for every bit of background noise, and the connection already
+%% reports each failed handshake as a `{handshake, _}` accept error, so
+%% the notice only duplicates it. OCSP stapling is intentionally absent
+%% — `ssl` does not support server-side stapling at the time of writing.
 
 -export([
     listen/2,
@@ -427,6 +431,7 @@ default_tls_opts() ->
         {secure_renegotiate, true},
         {early_data, disabled},
         {reuse_sessions, true},
+        {log_level, warning},
         {ciphers, default_ciphers()},
         {signature_algs, default_signature_algs()},
         {supported_groups, ssl:groups(default)},

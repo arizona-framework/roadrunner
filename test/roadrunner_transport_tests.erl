@@ -24,6 +24,7 @@ default_tls_opts_pins_security_keys_test() ->
     ),
     ?assertEqual({early_data, disabled}, lists:keyfind(early_data, 1, Opts)),
     ?assertEqual({reuse_sessions, true}, lists:keyfind(reuse_sessions, 1, Opts)),
+    ?assertEqual({log_level, warning}, lists:keyfind(log_level, 1, Opts)),
     ?assertEqual(
         {alpn_preferred_protocols, [~"http/1.1"]},
         lists:keyfind(alpn_preferred_protocols, 1, Opts)
