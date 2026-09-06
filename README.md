@@ -306,7 +306,8 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
   `keep_alive_timeout`, `min_bytes_per_second`, `max_keep_alive_requests`,
   `rate_limit` (opt-in per-peer request-rate guard)
 - **Real client IP**: `proxy_protocol` (read the PROXY-protocol header an
-  L4 balancer prepends, so `roadrunner_req:peer/1` is the real client)
+  L4 balancer prepends, on plain and TLS listeners alike, so
+  `roadrunner_req:peer/1` is the real client)
 - **Bind address**: `ip` (restrict a listener to a specific local
   interface, e.g. `{127,0,0,1}` for loopback-only; default binds all
   interfaces)

@@ -131,7 +131,9 @@ Optional middleware and timing knobs (durations in milliseconds):
   acceptor, so a slow or silent peer never blocks other connections
   from being accepted; one that exceeds the bound is closed and
   reported as a per-connection `{handshake, timeout}` accept error,
-  releasing its `max_clients` slot. Default 5 s.
+  releasing its `max_clients` slot. On a TLS listener that also reads
+  the PROXY protocol, the same bound covers the header read that
+  precedes the handshake. Default 5 s.
 - `keep_alive_timeout` — idle timeout between requests on a
   keep-alive conn. Default 60 s.
 - `num_acceptors` — size of the acceptor pool. Default 10.
@@ -324,9 +326,12 @@ ops-tuning rationale.
     graceful_drain => boolean(),
     %% Opt in to the PROXY protocol (HAProxy v1 text / v2 binary). When `true`,
     %% the connection reads and strips the header an L4 balancer prepends before
-    %% the first byte, so `roadrunner_req:peer/1` is the real client. TCP-only:
-    %% rejected on an HTTP/3-only listener. Trust it only behind a balancer that
-    %% always prepends the header (otherwise a direct peer can spoof its IP).
+    %% the first byte, so `roadrunner_req:peer/1` is the real client. On a TLS
+    %% listener the header is read from the plain socket before the TLS
+    %% handshake: the listener accepts plain TCP and upgrades each connection
+    %% once the header is in. TCP-only: rejected on an HTTP/3-only listener.
+    %% Trust it only behind a balancer that always prepends the header
+    %% (otherwise a direct peer can spoof its IP).
     proxy_protocol => boolean(),
     %% Opt in to a per-peer request-rate guard keyed on the client IP. A map
     %% `#{rate := pos_integer()}` (requests allowed per `period`, required) with
@@ -1060,6 +1065,12 @@ listener_name() ->
 -spec open_listen_socket(
     inet:port_number(), opts(), [http1 | http2, ...]
 ) -> {ok, roadrunner_transport:socket()} | {error, term()}.
+open_listen_socket(Port, #{tls := _, proxy_protocol := true} = Opts, _Protocols) ->
+    %% TLS behind a PROXY-protocol balancer: the header arrives in plaintext
+    %% before the ClientHello, so the listen socket is plain TCP and the conn
+    %% reads the header off the raw stream, then upgrades the socket with the
+    %% `tls_upgrade` options carried in proto_opts (`maybe_tls_upgrade/3`).
+    roadrunner_transport:listen(Port, base_listen_opts(Opts));
 open_listen_socket(Port, #{tls := UserTlsOpts} = Opts, Protocols) ->
     %% TLS path — caller supplies cert/key. ALPN is derived from the
     %% normalized `protocols` list (`http2` → `~"h2"`, `http1` →
@@ -1154,10 +1165,6 @@ spawn_acceptors_loop(LSocket, ProtoOpts, I, N) ->
     {ok, _Pid} = roadrunner_acceptor:start_link(LSocket, ProtoOpts, I),
     spawn_acceptors_loop(LSocket, ProtoOpts, I + 1, N).
 
-%% Validate the opt-in `proxy_protocol` listener opt. It is a TCP-stream
-%% feature (an L4 balancer prepends the header before the first byte), so it
-%% conflicts with an HTTP/3-only (UDP) listener; on a mixed `[http1, http3]`
-%% listener the TCP side honors it and h3 ignores it.
 %% Queue mode only means something when there is a ceiling to queue
 %% behind, so asking for it without `max_concurrent_requests` is a
 %% configuration error rather than a silent no-op.
@@ -1203,6 +1210,28 @@ setup_overload({queue, #{max_queued := MaxQueued, timeout := Timeout}}, Max, Cou
     {ok, Pid} = roadrunner_overload_queue:start_link(Max, Counter, MaxQueued),
     {queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), Timeout}.
 
+%% A TLS listener that also reads the PROXY protocol cannot hand its
+%% sockets out through `ssl:listen`: the header arrives in plaintext before
+%% the ClientHello and has to come off the raw socket first. Such a
+%% listener accepts plain TCP (`open_listen_socket/3`) and the connection
+%% process upgrades each socket with these options once the header is in
+%% (`roadrunner_conn_loop:awaiting_shoot/3`). Every other listener leaves
+%% the key out, so the `ssl:listen` path is untouched.
+-spec maybe_tls_upgrade(
+    roadrunner_conn:proto_opts(), opts(), [http1 | http2 | http3, ...]
+) -> roadrunner_conn:proto_opts().
+maybe_tls_upgrade(#{proxy_protocol := true} = ProtoOpts, #{tls := UserTlsOpts}, Protocols) ->
+    TcpProtocols = [P || P <- Protocols, P =/= http3],
+    ProtoOpts#{tls_upgrade => roadrunner_transport:build_tls_opts(TcpProtocols, UserTlsOpts)};
+maybe_tls_upgrade(ProtoOpts, _Opts, _Protocols) ->
+    ProtoOpts.
+
+%% Validate the opt-in `proxy_protocol` listener opt. It is a TCP-stream
+%% feature (an L4 balancer prepends the header before the first byte), so it
+%% conflicts with an HTTP/3-only (UDP) listener; on a mixed `[http1, http3]`
+%% listener the TCP side honors it and h3 ignores it. On a TLS listener the
+%% header precedes the ClientHello, which is why such a listener accepts
+%% plain TCP and upgrades per connection (`maybe_tls_upgrade/3`).
 -spec validate_proxy_protocol(term(), [http1 | http2 | http3, ...]) -> boolean().
 validate_proxy_protocol(false, _Protocols) ->
     false;
@@ -1328,6 +1357,7 @@ build_proto_opts(Opts, ListenerName) ->
         }),
         ProtoFlats
     ),
+    WithTlsUpgrade = maybe_tls_upgrade(Base, Opts, Protocols),
     WithHibernate =
         %% Optional `hibernate_after` — `roadrunner_conn_loop` reads it
         %% from proto_opts and routes the recv path through
@@ -1338,9 +1368,9 @@ build_proto_opts(Opts, ListenerName) ->
         %% conns where the heap-shrink win dominates.
         case Opts of
             #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 ->
-                Base#{hibernate_after => Ms};
+                WithTlsUpgrade#{hibernate_after => Ms};
             #{} ->
-                Base
+                WithTlsUpgrade
         end,
     %% Optional `rate_check_interval` — the rate-check timer
     %% interval inside `reading_request`. Default 1000ms; ops can

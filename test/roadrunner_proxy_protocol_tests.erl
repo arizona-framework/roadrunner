@@ -143,6 +143,23 @@ partial_v2_signature_is_more_test() ->
 not_a_proxy_header_test() ->
     ?assertEqual({error, not_proxy_header}, ?M:parse(<<"GET / HTTP/1.1\r\n">>)).
 
+v2_body_length_reads_the_declared_length_test() ->
+    Hdr = v2(2, 1, 1, 1, <<203, 0, 113, 9, 10, 0, 0, 1, 5000:16, 443:16>>),
+    <<Prefix:16/binary, _/binary>> = Hdr,
+    ?assertEqual({ok, 12}, roadrunner_proxy_protocol:v2_body_length(Prefix)),
+    <<Empty:16/binary>> = v2(2, 0, 0, 0, <<>>),
+    ?assertEqual({ok, 0}, roadrunner_proxy_protocol:v2_body_length(Empty)).
+
+v2_body_length_rejects_other_prefixes_test() ->
+    ?assertEqual(
+        {error, not_proxy_header},
+        roadrunner_proxy_protocol:v2_body_length(<<"PROXY TCP4 1.2.3.4 5">>)
+    ),
+    ?assertEqual(
+        {error, not_proxy_header},
+        roadrunner_proxy_protocol:v2_body_length(<<"GET / HTTP/1.1\r\n">>)
+    ).
+
 %% --- end-to-end: a real listener with proxy_protocol => true overrides the
 %% request peer with the address the PROXY header reports ---
 

@@ -187,51 +187,32 @@ init_loop(Parent, Socket, ProtoOpts) ->
 awaiting_shoot(Socket0, ProtoOpts, ListenerName) ->
     receive
         shoot ->
-            %% Socket ownership has just transferred from the acceptor. On a
-            %% TLS listener the socket arrives pre-handshake: the handshake
-            %% runs here, in the connection it belongs to, so a slow or
-            %% silent peer costs only this process and never parks an
-            %% acceptor (see `roadrunner_transport:handshake/2`). Plain TCP
-            %% passes straight through.
-            #{tls_handshake_timeout := HsTimeout} = ProtoOpts,
-            ok = label_handshake(Socket0, ListenerName),
-            case roadrunner_transport:handshake(Socket0, HsTimeout) of
-                {ok, Socket} ->
-                    %% If the listener enabled the PROXY protocol, read and
-                    %% strip the header an L4 balancer prepended so we serve
-                    %% the real client peer; otherwise the OS peer passes
-                    %% through unchanged.
-                    OsPeer = roadrunner_conn:peer(Socket),
-                    case proxy_protocol_stage(Socket, ProtoOpts, OsPeer) of
-                        {ok, Peer, Buffered} ->
+            %% Socket ownership has just transferred from the acceptor. Three
+            %% things happen before the first request is read, in this order.
+            %% If the listener enabled the PROXY protocol, the header an L4
+            %% balancer prepended is read off the raw stream first, because it
+            %% arrives in plaintext before any TLS bytes. Then, on a TLS
+            %% listener, the handshake runs here, in the connection it belongs
+            %% to, so a slow or silent peer costs only this process and never
+            %% parks an acceptor (see `roadrunner_transport:handshake/2,3`);
+            %% plain TCP passes straight through. Then the peer is served.
+            OsPeer = roadrunner_conn:peer(Socket0),
+            case proxy_protocol_stage(Socket0, ProtoOpts, OsPeer) of
+                {ok, Peer, Buffered} ->
+                    ok = label_handshake(Socket0, ProtoOpts, ListenerName),
+                    case tls_handshake(Socket0, ProtoOpts) of
+                        {ok, Socket} ->
                             serve(Socket, ProtoOpts, ListenerName, Peer, Buffered);
-                        close ->
-                            %% Malformed/absent PROXY header on a proxy_protocol
-                            %% listener (a misconfigured upstream). No accept
-                            %% telemetry has fired yet (it pairs with the real
-                            %% peer in serve/5), so release the slot and close
-                            %% silently, like the pre-`shoot` drain path below.
-                            exit_clean(
-                                Socket, ProtoOpts, undefined, undefined, ListenerName, 0, normal
-                            )
+                        {error, {handshake, _} = Reason} ->
+                            handshake_failed(ProtoOpts, ListenerName, Reason)
                     end;
-                {error, {handshake, _} = Reason} ->
-                    %% A garbage ClientHello, a TLS alert, a peer gone
-                    %% mid-handshake, or the `tls_handshake_timeout` bound —
-                    %% routine noise on an internet-facing TLS port. Surface
-                    %% it as the same accept_error event the acceptor pool
-                    %% emits for its own failures, then release the slot. No
-                    %% accept telemetry has fired (it pairs with the peer in
-                    %% serve/5), so no conn_close either. The socket is not
-                    %% closed here: `handshake/2` already closed a timed-out
-                    %% one, and on any other failure `ssl` tore the
-                    %% connection down itself.
-                    ok = roadrunner_telemetry:listener_accept_error(#{
-                        listener_name => ListenerName, reason => Reason
-                    }),
-                    ok = roadrunner_conn:unregister_for_drain(ProtoOpts),
-                    ok = roadrunner_conn:release_slot(ProtoOpts),
-                    exit(normal)
+                close ->
+                    %% Malformed/absent PROXY header on a proxy_protocol
+                    %% listener (a misconfigured upstream). No accept telemetry
+                    %% has fired yet (it pairs with the real peer in serve/5),
+                    %% so release the slot and close silently, like the
+                    %% pre-`shoot` drain path below.
+                    exit_clean(Socket0, ProtoOpts, undefined, undefined, ListenerName, 0, normal)
             end;
         {roadrunner_drain, _Deadline} ->
             %% Drain before `shoot` — no telemetry was fired yet (accept
@@ -245,16 +226,46 @@ awaiting_shoot(Socket0, ProtoOpts, ListenerName) ->
             awaiting_shoot(Socket0, ProtoOpts, ListenerName)
     end.
 
+%% A TLS listener behind a PROXY-protocol balancer accepts plain TCP and
+%% carries the TLS options in `tls_upgrade`; every other TLS listener hands
+%% out a pre-handshake `ssl` socket. Plain TCP passes through unchanged.
+-spec tls_handshake(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
+    {ok, roadrunner_transport:socket()} | {error, {handshake, term()}}.
+tls_handshake(Socket, #{tls_upgrade := TlsOpts, tls_handshake_timeout := HsTimeout}) ->
+    roadrunner_transport:handshake(Socket, TlsOpts, HsTimeout);
+tls_handshake(Socket, #{tls_handshake_timeout := HsTimeout}) ->
+    roadrunner_transport:handshake(Socket, HsTimeout).
+
+-spec handshake_failed(roadrunner_conn:proto_opts(), atom(), {handshake, term()}) -> no_return().
+handshake_failed(ProtoOpts, ListenerName, Reason) ->
+    %% A garbage ClientHello, a TLS alert, a peer gone mid-handshake, or the
+    %% `tls_handshake_timeout` bound — routine noise on an internet-facing
+    %% TLS port. Surface it as the same accept_error event the acceptor pool
+    %% emits for its own failures, then release the slot. No accept
+    %% telemetry has fired (it pairs with the peer in serve/5), so no
+    %% conn_close either. The socket is not closed here: `handshake/2`
+    %% already closed a timed-out one, and on any other failure (every
+    %% failure, for the `handshake/3` upgrade) `ssl` tore the connection
+    %% down itself.
+    ok = roadrunner_telemetry:listener_accept_error(#{
+        listener_name => ListenerName, reason => Reason
+    }),
+    ok = roadrunner_conn:unregister_for_drain(ProtoOpts),
+    ok = roadrunner_conn:release_slot(ProtoOpts),
+    exit(normal).
+
 %% The handshake is the one pre-serve phase that can block for a while (up
 %% to `tls_handshake_timeout` on a silent peer), so a TLS conn is relabelled
 %% for its duration; `refine_conn_label/2` takes over once the peer is being
-%% served. Plain TCP has no handshake and keeps the `awaiting_shoot` label
-%% until then.
--spec label_handshake(roadrunner_transport:socket(), atom()) -> ok.
-label_handshake(Socket, ListenerName) ->
-    case roadrunner_conn:scheme(Socket) of
-        https -> proc_lib:set_label({roadrunner_conn, tls_handshake, ListenerName});
-        http -> ok
+%% served. A TLS conn is either a pre-handshake `ssl` socket or, behind a
+%% PROXY-protocol balancer, a plain socket about to be upgraded. Plain TCP
+%% has no handshake and keeps the `awaiting_shoot` label until then.
+-spec label_handshake(roadrunner_transport:socket(), roadrunner_conn:proto_opts(), atom()) ->
+    ok.
+label_handshake(Socket, ProtoOpts, ListenerName) ->
+    case is_map_key(tls_upgrade, ProtoOpts) orelse roadrunner_conn:scheme(Socket) =:= https of
+        true -> proc_lib:set_label({roadrunner_conn, tls_handshake, ListenerName});
+        false -> ok
     end.
 
 %% Begin serving a connection once the peer is settled (the real client when
@@ -330,22 +341,104 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
 %% `{ok, Peer, Leftover}` — the real client peer on a PROXY command, the OS peer
 %% on a LOCAL/UNKNOWN one — or `close` on a malformed header or read error. With
 %% the opt off the OS peer passes straight through and no bytes are read.
+%%
+%% On a TLS listener (`tls_upgrade` set) the header is followed by the
+%% ClientHello, and bytes read past the header cannot be handed back to `ssl`,
+%% so the header is read exactly and `Leftover` is always empty. On plain TCP
+%% whatever arrived with the header is kept as the start of the first request.
 -spec proxy_protocol_stage(
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),
     {inet:ip_address(), inet:port_number()} | undefined
 ) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | close.
-proxy_protocol_stage(Socket, #{proxy_protocol := ProxyProto} = ProtoOpts, OsPeer) ->
-    case ProxyProto of
-        false -> {ok, OsPeer, <<>>};
-        true -> read_proxy_header(Socket, ProtoOpts, OsPeer, <<>>)
+proxy_protocol_stage(_Socket, #{proxy_protocol := false}, OsPeer) ->
+    {ok, OsPeer, <<>>};
+proxy_protocol_stage(
+    Socket, #{proxy_protocol := true, tls_upgrade := _, tls_handshake_timeout := Timeout}, OsPeer
+) ->
+    %% The header read is connection setup like the handshake that follows
+    %% it, so it shares the handshake bound rather than `request_timeout`:
+    %% a peer that connects and sends nothing holds its slot no longer here
+    %% than on a TLS listener without the PROXY protocol.
+    case read_proxy_header_exact(Socket, Timeout) of
+        {ok, Peer, <<>>} -> {ok, Peer, <<>>};
+        {local, <<>>} -> {ok, OsPeer, <<>>};
+        {error, _Reason} -> close
+    end;
+proxy_protocol_stage(Socket, #{proxy_protocol := true} = ProtoOpts, OsPeer) ->
+    read_proxy_header(Socket, ProtoOpts, OsPeer, <<>>).
+
+%% A v1 header (CRLF included) never exceeds 107 bytes (HAProxy spec §2.1).
+-define(PROXY_V1_MAX, 107).
+
+%% Exact read for the TLS case. Six bytes tell v1 (`PROXY `) from v2 (the
+%% first six bytes of its signature); a v2 prefix then declares the length of
+%% the rest, while a v1 line is read in one call with the socket in `line`
+%% packet mode, bounded at the spec's 107 bytes.
+-spec read_proxy_header_exact(roadrunner_transport:socket(), timeout()) ->
+    {ok, {inet:ip_address(), inet:port_number()}, binary()}
+    | {local, binary()}
+    | more
+    | {error, term()}.
+read_proxy_header_exact(Socket, Timeout) ->
+    maybe
+        {ok, Head} ?= roadrunner_transport:recv(Socket, 6, Timeout),
+        {ok, Header} ?= read_proxy_header_rest(Head, Socket, Timeout),
+        roadrunner_proxy_protocol:parse(Header)
     end.
 
-%% The socket is passive at this phase, so read synchronously, accumulating
-%% until `roadrunner_proxy_protocol:parse/1` decides. The parser bounds the
-%% header size (v1 107 bytes, v2 by its declared length), so `Acc` cannot grow
-%% without bound, and each recv carries the per-request timeout against a
-%% dribbling sender.
+-spec read_proxy_header_rest(binary(), roadrunner_transport:socket(), timeout()) ->
+    {ok, binary()} | {error, term()}.
+read_proxy_header_rest(~"PROXY ", Socket, Timeout) ->
+    read_proxy_v1_line(Socket, Timeout);
+read_proxy_header_rest(Head, Socket, Timeout) ->
+    maybe
+        {ok, Rest} ?= roadrunner_transport:recv(Socket, 10, Timeout),
+        Prefix = <<Head/binary, Rest/binary>>,
+        {ok, Len} ?= roadrunner_proxy_protocol:v2_body_length(Prefix),
+        {ok, Body} ?= recv_exact(Socket, Len, Timeout),
+        {ok, <<Prefix/binary, Body/binary>>}
+    end.
+
+%% `recv(_, 0, _)` would return whatever is buffered, which here could be the
+%% first bytes of the ClientHello; a header with no address block has nothing
+%% more to read.
+-spec recv_exact(roadrunner_transport:socket(), non_neg_integer(), timeout()) ->
+    {ok, binary()} | {error, term()}.
+recv_exact(_Socket, 0, _Timeout) ->
+    {ok, <<>>};
+recv_exact(Socket, Len, Timeout) ->
+    roadrunner_transport:recv(Socket, Len, Timeout).
+
+%% The rest of a v1 line after `PROXY `, up to and including its LF, in one
+%% read: `{packet, line}` makes the driver stop at the newline, so the
+%% ClientHello behind it stays buffered for the upgrade, and `packet_size`
+%% caps the line at the spec's bound (a longer one fails with `emsgsize`).
+%% Raw mode is restored either way; on a failure the conn closes anyway.
+-spec read_proxy_v1_line(roadrunner_transport:socket(), timeout()) ->
+    {ok, binary()} | {error, term()}.
+read_proxy_v1_line(Socket, Timeout) ->
+    ok = roadrunner_transport:setopts(Socket, [{packet, line}, {packet_size, ?PROXY_V1_MAX - 6}]),
+    Result = roadrunner_transport:recv(Socket, 0, Timeout),
+    ok = roadrunner_transport:setopts(Socket, [{packet, raw}, {packet_size, 0}]),
+    case Result of
+        {ok, Line} when
+            byte_size(Line) >= 2, binary_part(Line, byte_size(Line) - 2, 2) =:= ~"\r\n"
+        ->
+            {ok, <<"PROXY ", Line/binary>>};
+        {ok, _LfOnly} ->
+            %% The spec's line ends in CRLF; a bare LF is not a header.
+            {error, v1_malformed};
+        {error, _} = E ->
+            E
+    end.
+
+%% Plain TCP: the socket is passive at this phase, so read synchronously,
+%% accumulating until `roadrunner_proxy_protocol:parse/1` decides. The parser
+%% bounds the header size (v1 107 bytes, v2 by its declared length), so `Acc`
+%% cannot grow without bound, and each recv carries the per-request timeout
+%% against a dribbling sender. Over-reading is fine here: leftover bytes are
+%% the start of the first request and are threaded into its parse.
 -spec read_proxy_header(
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),

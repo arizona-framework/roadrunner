@@ -26,7 +26,7 @@
 %% address-family/transport byte, a 16-bit address-block length, then the
 %% addresses (and optional TLVs, which we skip).
 
--export([parse/1]).
+-export([parse/1, v2_body_length/1]).
 
 -on_load(init_patterns/0).
 
@@ -62,6 +62,18 @@ parse(Bin) ->
         true -> more;
         false -> {error, not_proxy_header}
     end.
+
+-doc """
+Length of the address block a 16-byte v2 header prefix declares, for a
+caller that must not read past the header and so fetches exactly the
+rest (`{ok, 0}` when there is no address block). `{error,
+not_proxy_header}` if the prefix does not open with the v2 signature.
+""".
+-spec v2_body_length(binary()) -> {ok, non_neg_integer()} | {error, not_proxy_header}.
+v2_body_length(<<?V2_SIG, _VerCmd, _FamTrans, Len:16>>) ->
+    {ok, Len};
+v2_body_length(_) ->
+    {error, not_proxy_header}.
 
 %% =============================================================================
 %% v1 (text)
