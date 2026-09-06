@@ -193,9 +193,12 @@ malformed_closes_test() ->
     with_listener(fun(Port) ->
         {ok, S} = connect(Port),
         %% A raw request (no PROXY header) on a proxy_protocol listener is a
-        %% misconfigured upstream — the connection closes with no response.
+        %% misconfigured upstream — the connection closes with no response,
+        %% and the close is reported rather than silent.
+        HandlerId = attach_accept_error(),
         ok = gen_tcp:send(S, <<"GET / HTTP/1.1\r\nHost: x\r\n\r\n">>),
         ?assertEqual(<<>>, recv_response(S, <<>>)),
+        ?assertEqual({proxy_protocol, not_proxy_header}, await_accept_error(HandlerId)),
         gen_tcp:close(S)
     end).
 
@@ -203,13 +206,40 @@ recv_error_closes_test() ->
     with_listener(fun(Port) ->
         {ok, S} = connect(Port),
         %% Half-close (FIN) before sending any PROXY header: the server's first
-        %% recv returns {error, closed}, so the connection closes with no reply.
+        %% recv returns {error, closed}, so the connection closes with no reply
+        %% and the transport's reason is what gets reported.
+        HandlerId = attach_accept_error(),
         ok = gen_tcp:shutdown(S, write),
         ?assertEqual(<<>>, recv_response(S, <<>>)),
+        ?assertEqual({proxy_protocol, closed}, await_accept_error(HandlerId)),
         gen_tcp:close(S)
     end).
 
 %% --- helpers ---
+
+%% Forward `[roadrunner, listener, accept_error]` to the test process.
+attach_accept_error() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    Self = self(),
+    HandlerId = {?MODULE, make_ref()},
+    ok = telemetry:attach(
+        HandlerId,
+        [roadrunner, listener, accept_error],
+        fun(_Event, _Measure, Meta, _Cfg) -> Self ! {accept_error, Meta} end,
+        undefined
+    ),
+    HandlerId.
+
+%% The reason of the next accept_error, detaching the handler either way.
+await_accept_error(HandlerId) ->
+    try
+        receive
+            {accept_error, #{reason := Reason}} -> Reason
+        after 5000 -> error(no_accept_error)
+        end
+    after
+        telemetry:detach(HandlerId)
+    end.
 
 proxy_request(Header, Request) ->
     with_listener(fun(Port) ->

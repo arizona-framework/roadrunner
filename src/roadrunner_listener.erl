@@ -330,8 +330,11 @@ ops-tuning rationale.
     %% listener the header is read from the plain socket before the TLS
     %% handshake: the listener accepts plain TCP and upgrades each connection
     %% once the header is in. TCP-only: rejected on an HTTP/3-only listener.
-    %% Trust it only behind a balancer that always prepends the header
-    %% (otherwise a direct peer can spoof its IP).
+    %% A connection whose header is missing or malformed is closed and
+    %% reported as `[roadrunner, listener, accept_error]` with a
+    %% `{proxy_protocol, Reason}` reason. Trust it only behind a balancer
+    %% that always prepends the header (otherwise a direct peer can spoof its
+    %% IP).
     proxy_protocol => boolean(),
     %% Opt in to a per-peer request-rate guard keyed on the client IP. A map
     %% `#{rate := pos_integer()}` (requests allowed per `period`, required) with
