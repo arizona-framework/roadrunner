@@ -204,8 +204,8 @@ proxy_request(Header, Request) ->
     end).
 
 %% Stand up a real listener directly (no app start/stop, mirroring
-%% roadrunner_compress_tests) so concurrent test modules don't race on the
-%% shared `pg` scope.
+%% roadrunner_compress_tests) so concurrent test modules don't race on
+%% the application's start and stop.
 with_listener(Fun) ->
     Name = list_to_atom("proxy_it_" ++ integer_to_list(erlang:unique_integer([positive]))),
     {ok, _} = roadrunner_listener:start_link(Name, #{

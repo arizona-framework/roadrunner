@@ -3,7 +3,7 @@
 Test fixture — `{loop, ...}` handler that signals "started" by
 pushing a chunk, then waits for `{roadrunner_drain, _}` and stops
 cleanly. Used to verify `roadrunner_listener:drain/2` reaches in-flight
-loops via the per-listener `pg` group.
+loops via the per-listener drain registry.
 """.
 
 -behaviour(roadrunner_handler).

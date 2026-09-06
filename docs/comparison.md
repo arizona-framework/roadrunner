@@ -166,7 +166,7 @@ Requires Docker and a compiled test profile. See
 |--------------------------------|----------------------------------|----------------------------|-------------------------------|
 | Per-conn process model         | tail-recursive `proc_lib` loop   | tail-recursive loop        | gen_server + stream handlers  |
 | Request lifecycle observable   | yes (`proc_lib:get_label/1`)     | no                         | partial                       |
-| Drain / graceful shutdown      | built-in (`pg`-broadcast)        | DIY                        | partial                       |
+| Drain / graceful shutdown      | built-in (registry broadcast)    | DIY                        | partial                       |
 | Telemetry                      | `telemetry` library, 10+ events  | none (handler callbacks)   | `cowboy_metrics_h` opt-in     |
 | Middleware shape               | continuation-passing             | `pre_request`/`post_request` callback | deprecated `(Req, Env)`/stream handlers |
 | Hibernation between requests   | `hibernate_after` works          | no                         | depends on stream handler     |

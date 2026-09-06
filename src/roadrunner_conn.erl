@@ -40,8 +40,8 @@
     release_request_slot/3,
     release_request_slots/4,
     consume_body_reader/2,
-    join_drain_group/2,
-    join_drain_group_for/2
+    register_for_drain/1,
+    unregister_for_drain/1
 ]).
 %% Internal helpers shared with `roadrunner_conn_loop`. Marked `-doc false`
 %% individually so they stay invisible to the public API surface but
@@ -133,6 +133,9 @@ deadline in milliseconds.
     max_keep_alive_requests := pos_integer(),
     max_clients := pos_integer(),
     client_counter := counters:counters_ref(),
+    %% Per-listener drain registry (`{Pid}` rows). Optional so hand-built
+    %% proto_opts in tests can leave it out; the listener always sets it.
+    drain_table => ets:table(),
     requests_counter := atomics:atomics_ref(),
     rejected_counter := atomics:atomics_ref(),
     %% Aggregate in-flight ceiling for the multiplexed protocols (h2/h3):
@@ -160,12 +163,12 @@ deadline in milliseconds.
     min_bytes_per_second := non_neg_integer(),
     body_buffering := auto | manual,
     listener_name => atom(),
-    %% When `false`, conns skip the per-process `pg:join` into
-    %% `{roadrunner_drain, ListenerName}`. The drain group is the
-    %% mechanism `roadrunner_listener:drain/2` uses to broadcast
+    %% When `false`, conns skip registering in the listener's drain
+    %% registry (`drain_table`). The registry is the mechanism
+    %% `roadrunner_listener:drain/2` uses to broadcast
     %% `{roadrunner_drain, Deadline}` to in-flight conns; loop /
     %% SSE / WebSocket handlers depend on it. Short-lived h1
-    %% workloads can opt out for ~10% lower per-conn overhead.
+    %% workloads can opt out to skip the insert and delete per conn.
     graceful_drain => boolean(),
     %% When `true`, `roadrunner_conn_loop:awaiting_shoot/3` reads and strips a
     %% PROXY-protocol header (an L4 balancer prepends it) before serving, and
@@ -260,48 +263,42 @@ start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
     {ok, _Pid} = roadrunner_conn_loop:start(Socket, ProtoOpts).
 
 -doc """
-Join the per-listener `pg` group so `roadrunner_listener:drain/2` can
-broadcast a `{roadrunner_drain, Deadline}` notification to the calling
-process. `pg` removes the caller automatically when the process
-exits. The `pg` scope is started by `roadrunner_sup`; in tests that
-drive `roadrunner_listener:start_link/2` directly without starting the
-application, the scope is absent and the join is silently skipped
-— drain will simply not see those conns.
+Register the calling connection process in its listener's drain
+registry so `roadrunner_listener:drain/2` and `notify_drain/2` can send
+it `{roadrunner_drain, Deadline}`. A lock-free ETS insert, so
+connection starts never queue behind a registry process. Skipped when
+the listener opted out with `graceful_drain => false`, or when the
+proto_opts carry no registry (requests built by hand in tests).
 
-Called by `roadrunner_conn_loop:init_loop/3` after the conn process
-starts but before it accepts any work.
+Called by the connection loops as they start, before they accept any
+work, and paired with `unregister_for_drain/1` on every exit path. A
+process outside the conn lifecycle registers through
+`roadrunner_listener:register_for_drain/2` instead.
 """.
--spec join_drain_group(atom(), boolean()) -> ok.
-join_drain_group(_Name, false) ->
+-spec register_for_drain(proto_opts()) -> ok.
+register_for_drain(#{graceful_drain := false}) ->
     ok;
-join_drain_group(undefined, _) ->
+register_for_drain(#{drain_table := Table}) ->
+    true = ets:insert(Table, {self()}),
     ok;
-join_drain_group(Name, true) ->
-    case whereis(pg) of
-        undefined -> ok;
-        _ -> pg:join({roadrunner_drain, Name}, self())
-    end.
+register_for_drain(#{}) ->
+    ok.
 
 -doc """
-Join `Pid` into the per-listener `pg` drain group on behalf of another
-process. Reserved for future use cases where a non-conn process needs
-direct drain membership (e.g., a long-lived worker spawned outside
-the conn lifecycle). The WS upgrade path no longer calls this: the
-conn (already in pg) forwards `{roadrunner_drain, _}` to its session
-from `roadrunner_conn_loop:ws_session_wake/7` instead.
-
-Silently no-ops when `Name` is `undefined` (manually constructed
-requests in tests) or when the `pg` scope is absent (listener
-started without the supervision tree).
+Remove the calling process from its listener's drain registry, paired
+with `register_for_drain/1`. The listener owns the table, and `stop/1`
+does not wait for in-flight conns, so a conn that outlives its listener
+finds no registry to leave and that is fine.
 """.
--spec join_drain_group_for(pid(), atom()) -> ok.
-join_drain_group_for(_Pid, undefined) ->
-    ok;
-join_drain_group_for(Pid, Name) when is_pid(Pid), is_atom(Name) ->
-    case whereis(pg) of
-        undefined -> ok;
-        _ -> pg:join({roadrunner_drain, Name}, Pid)
-    end.
+-spec unregister_for_drain(proto_opts()) -> ok.
+unregister_for_drain(#{drain_table := Table}) ->
+    try ets:delete(Table, self()) of
+        true -> ok
+    catch
+        error:badarg -> ok
+    end;
+unregister_for_drain(#{}) ->
+    ok.
 
 -doc """
 Try to bump the live-connection counter under `max_clients`. Returns
@@ -327,8 +324,8 @@ skips the cleanup funnel, so the slot is **leaked** for the lifetime
 of the listener process. This is bounded:
 `max_clients` accepted connections each leak at most one slot
 under killing, and the listener restart resets the counter. If
-leaks become a real concern under chaos-test conditions, add a
-periodic reaper that compares `pg:get_members({roadrunner_drain, _})`
+leaks become a real concern under chaos-test conditions, the optional
+`slot_reconciliation` reaper compares the registered conns still alive
 against the live counter and reconciles the difference.
 """.
 -spec try_acquire_slot(proto_opts()) -> boolean().

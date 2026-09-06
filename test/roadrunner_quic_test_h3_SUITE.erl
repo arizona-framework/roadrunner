@@ -17,10 +17,7 @@ all() ->
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
     {ok, _} = application:ensure_all_started(ssl),
-    %% The h3 listener's drain group lives in the default `pg` scope; start it
-    %% unlinked so it outlives this transient process. Neither the native
-    %% server nor the native client needs the `quic` app.
-    ok = ensure_pg_started(),
+    %% Neither the native server nor the native client needs the `quic` app.
     Config.
 
 end_per_suite(_Config) ->
@@ -64,17 +61,3 @@ native_client_post(Config) ->
 %% =============================================================================
 %% Helpers
 %% =============================================================================
-
-ensure_pg_started() ->
-    case whereis(pg) of
-        undefined ->
-            case pg:start_link() of
-                {ok, Pid} ->
-                    _ = unlink(Pid),
-                    ok;
-                {error, {already_started, _}} ->
-                    ok
-            end;
-        _ ->
-            ok
-    end.

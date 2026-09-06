@@ -8,7 +8,7 @@
 %% Asserts:
 %%   - `start/2` returns `{ok, Pid}` shape.
 %%   - `proc_lib:get_label/1` reflects awaiting_shoot before `shoot`.
-%%   - The conn joins the drain pg group.
+%%   - The conn registers in the listener's drain registry.
 %%   - `Pid ! shoot` fires `listener_accept` telemetry.
 %%   - `Pid ! {roadrunner_drain, _}` exits cleanly in awaiting_shoot
 %%     (no telemetry — accept hadn't fired yet).
@@ -26,7 +26,6 @@
 %% =============================================================================
 
 start_returns_ok_pid_test() ->
-    ensure_pg(),
     {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_sink()}, fake_opts(start_ok)),
     ?assert(is_pid(Pid)),
     ?assert(is_process_alive(Pid)),
@@ -37,7 +36,6 @@ start_applies_handler_spawn_opts_to_process_test() ->
     %% just sit in proto_opts: start a conn with a non-default
     %% `fullsweep_after` and read it back from the live process's own
     %% garbage-collection info.
-    ensure_pg(),
     Opts = (fake_opts(gc_flag))#{handler_spawn_opts := [{fullsweep_after, 42}]},
     {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_sink()}, Opts),
     {garbage_collection, GcInfo} = process_info(Pid, garbage_collection),
@@ -45,26 +43,25 @@ start_applies_handler_spawn_opts_to_process_test() ->
     drain_then_wait(Pid).
 
 conn_start_routes_through_loop_test() ->
-    ensure_pg(),
     {ok, Pid} = roadrunner_conn:start({fake, spawn_sink()}, fake_opts(dispatch)),
     ?assertMatch({roadrunner_conn, awaiting_shoot, dispatch}, proc_lib:get_label(Pid)),
     drain_then_wait(Pid).
 
 awaiting_shoot_label_set_test() ->
-    ensure_pg(),
     {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_sink()}, fake_opts(label)),
     ?assertMatch({roadrunner_conn, awaiting_shoot, label}, proc_lib:get_label(Pid)),
     drain_then_wait(Pid).
 
-awaiting_shoot_joins_drain_group_test() ->
-    ensure_pg(),
-    Name = drain_join,
-    {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_sink()}, fake_opts(Name)),
-    ?assertEqual([Pid], pg:get_members({roadrunner_drain, Name})),
-    drain_then_wait(Pid).
+awaiting_shoot_registers_for_drain_test() ->
+    Table = ets:new(drain_join, [set, public]),
+    Opts = (fake_opts(drain_join))#{drain_table => Table},
+    {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_sink()}, Opts),
+    ?assertEqual([{Pid}], ets:tab2list(Table)),
+    drain_then_wait(Pid),
+    %% The exit path takes the row back out.
+    ?assertEqual([], ets:tab2list(Table)).
 
 drain_in_awaiting_shoot_exits_without_telemetry_test() ->
-    ensure_pg(),
     Tag = make_ref(),
     attach_telemetry(Tag, [
         [roadrunner, listener, accept],
@@ -83,7 +80,6 @@ drain_in_awaiting_shoot_exits_without_telemetry_test() ->
     detach_telemetry(Tag).
 
 stray_msg_in_awaiting_shoot_is_ignored_test() ->
-    ensure_pg(),
     {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_sink()}, fake_opts(stray)),
     Pid ! {stray_msg_from_buggy_lib, make_ref()},
     Pid ! 12345,
@@ -94,7 +90,6 @@ stray_msg_in_awaiting_shoot_is_ignored_test() ->
     drain_then_wait(Pid).
 
 slot_released_on_drain_in_awaiting_shoot_test() ->
-    ensure_pg(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     Opts = (fake_opts(slot))#{client_counter := Counter},
@@ -113,7 +108,6 @@ shoot_then_valid_request_dispatches_hello_handler_test() ->
     %% The conn parses the request, dispatches the configured handler
     %% (default `roadrunner_hello_handler`), writes the 200 response,
     %% and exits cleanly.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -131,7 +125,6 @@ shoot_then_valid_request_dispatches_hello_handler_test() ->
     Sink ! stop.
 
 bad_request_writes_400_then_exits_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -152,7 +145,6 @@ oversized_request_line_writes_414_then_exits_test() ->
     %% A request line past the 8192-byte cap is `request_line_too_long`,
     %% which answers 414 URI Too Long (RFC 9110 §15.5.15), not a generic
     %% 400.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     LongTarget = binary:copy(~"a", 9000),
@@ -173,7 +165,6 @@ oversized_request_line_writes_414_then_exits_test() ->
 too_many_headers_writes_431_then_exits_test() ->
     %% More than 100 header lines is `too_many_headers`, which answers
     %% 431 Request Header Fields Too Large (RFC 6585 §5), not a 400.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Headers = iolist_to_binary([
@@ -197,7 +188,6 @@ too_many_headers_writes_431_then_exits_test() ->
 request_timeout_writes_408_then_exits_test() ->
     %% No bytes — the request_timeout `after` clause should fire and
     %% the conn should write 408 before exiting.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_silent_sink_with_send_log(Self, Tag),
@@ -214,7 +204,6 @@ request_timeout_writes_408_then_exits_test() ->
     Sink ! stop.
 
 drain_during_read_request_exits_silently_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_silent_sink_with_send_log(Self, Tag),
@@ -239,7 +228,6 @@ tcp_closed_while_awaiting_request_exits_silently_test() ->
     %% Peer closes while the conn waits for a request's first byte.
     %% The scripted close is delivered as the active-mode close event
     %% the conn is parked on.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_scripted_sink(Self, Tag, [{passive, {error, closed}}]),
@@ -257,7 +245,6 @@ tcp_closed_while_awaiting_request_exits_silently_test() ->
 tcp_error_while_awaiting_request_exits_silently_test() ->
     %% Any non-timeout, non-closed transport error (e.g. econnreset)
     %% while awaiting a request → silent exit.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_scripted_sink(Self, Tag, [{passive, {error, econnreset}}]),
@@ -313,7 +300,6 @@ drain_during_body_recv_exits_silently_test() ->
     %% Drain arriving while the conn is reading the rest of a request:
     %% picked up by the mailbox check between drain ticks, after a
     %% stray message ahead of it in the queue is skipped.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_partial_then_sink(Self, Tag, partial_request(), silent),
@@ -335,7 +321,6 @@ drain_during_body_recv_exits_silently_test() ->
 request_timeout_during_body_recv_writes_408_test() ->
     %% The absolute deadline is enforced across drain ticks: a client
     %% that sends half a request and stalls gets a 408.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_partial_then_sink(Self, Tag, partial_request(), silent),
@@ -359,7 +344,6 @@ drain_during_message_body_exits_silently_test() ->
     %% lands closes the conn cleanly; without the cap the conn would
     %% hold the full request_timeout, outlive the drain deadline and be
     %% hard-killed by `roadrunner_listener:drain/2`.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Headers = ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n",
@@ -384,7 +368,6 @@ body_read_resumes_after_drain_tick_test() ->
     %% The counterpart: a drain-check tick that finds no drain must not
     %% end the request. The peer pauses (one recv timeout) and then sends
     %% the body, which still completes normally.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Headers = ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n",
@@ -438,7 +421,6 @@ headers_then_drain_loop(Logger, Tag, Headers, Delivered) ->
 
 tcp_error_during_body_recv_exits_silently_test() ->
     %% A transport error on the remainder of a request → silent exit.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_partial_then_sink(
@@ -458,7 +440,6 @@ partial_request_then_remainder_parses_test() ->
     %% Drives the `{more, _}` branch — first packet has only the request
     %% line, second packet completes the headers. Both must parse + the
     %% handler dispatches a 200.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_two_chunks_with_log(
@@ -483,7 +464,6 @@ setopts_on_dead_socket_exits_silently_test() ->
     %% Phase A' default path uses passive recv (no setopts call) —
     %% so to exercise this code path the test opts into the
     %% active-mode `recv_with_hibernate` branch via `hibernate_after`.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     DeadSink = spawn(fun() -> ok end),
@@ -518,7 +498,6 @@ slowloris_during_passive_recv_drops_client_test() ->
     %% rate window is anchored at the FIRST byte (not at phase entry), so
     %% the drop is driven by genuine slow transmission. The conn must
     %% close silently.
-    ensure_pg(),
     Self = self(),
     %% Deliver 1 byte immediately (anchors the window), then sleep past
     %% the grace and deliver 1 more byte. Total 2 bytes over ~1.2 s
@@ -564,7 +543,6 @@ slowloris_during_active_mode_recv_drops_client_test() ->
     %% average falls under it. The window is anchored at the first byte.
     %% The conn must close silently (no 408, same as the passive path's
     %% slowloris branch).
-    ensure_pg(),
     Self = self(),
     %% Deliver 1 byte immediately (anchors the window), then sleep past
     %% the grace and deliver 1 more byte. Total 2 bytes over ~1.2 s
@@ -606,7 +584,6 @@ keep_alive_reuse_after_idle_serves_second_request_passive_test() ->
     %% is anchored at the first byte of each request, so the idle gap is
     %% not counted as slow transmission. Under the old phase-entry anchor
     %% the second request was silently dropped (one response on the wire).
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Req = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
@@ -636,7 +613,6 @@ keep_alive_reuse_after_idle_serves_second_request_hibernate_test() ->
     %% Same regression on the active-mode hibernate path: `hibernate_after`
     %% is short enough that the conn hibernates during the idle gap and
     %% wakes via `recv_request_bytes_hib` when the second request arrives.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Req = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
@@ -663,7 +639,6 @@ keep_alive_reuse_after_idle_serves_second_request_hibernate_test() ->
     Sink ! stop.
 
 stray_msg_during_read_request_is_ignored_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_silent_sink_with_send_log(Self, Tag),
@@ -683,7 +658,6 @@ stray_msg_during_read_request_is_ignored_test() ->
     Sink ! stop.
 
 shoot_fires_accept_paired_with_conn_close_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     attach_telemetry(Tag, [
@@ -713,7 +687,6 @@ middleware_pipeline_runs_when_listener_has_middlewares_test() ->
     %% The middleware sets a marker into the request body via a
     %% no-op continuation. Asserts the response still lands and the
     %% middleware ran (echo handler reflects the body).
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Body = ~"mw-marker",
@@ -746,7 +719,6 @@ middleware_pipeline_runs_when_listener_has_middlewares_test() ->
     Sink ! stop.
 
 handler_crash_writes_500_and_fires_request_exception_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     attach_telemetry(Tag, [
@@ -782,7 +754,6 @@ interim_buffered_response_writes_500_test() ->
     %% A handler returning a buffered 1xx status is a misuse (RFC 9110
     %% §15.2): the conn loop rejects it with 500 rather than put an invalid
     %% interim status on the wire as the final response.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_once(
@@ -805,7 +776,6 @@ interim_buffered_response_writes_500_test() ->
     Sink ! stop.
 
 post_body_echoes_via_auto_mode_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Body = ~"hello-body",
@@ -838,7 +808,6 @@ post_body_echoes_via_auto_mode_test() ->
     Sink ! stop.
 
 oversized_body_writes_413_and_fires_request_rejected_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     attach_telemetry(Tag, [[roadrunner, request, rejected]]),
@@ -876,7 +845,6 @@ body_recv_timeout_writes_408_test() ->
     %% deadline, and that is what read_body reports as
     %% {error, request_timeout} → 408 + exit. Hence the short
     %% request_timeout — otherwise the test waits out the default.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Headers = ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n",
@@ -906,7 +874,6 @@ body_recv_timeout_writes_408_test() ->
     Sink ! stop.
 
 body_slow_client_exits_silently_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Headers = ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n",
@@ -933,7 +900,6 @@ body_slow_client_exits_silently_test() ->
 body_recv_error_writes_400_test() ->
     %% Generic recv error mid-body (not timeout, not slow_client) maps
     %% to a 400.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Headers = ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n",
@@ -963,7 +929,6 @@ manual_mode_dispatches_with_body_reader_test() ->
     %% returning 200 ok. Use `Connection: close` so the conn closes
     %% after the single request rather than looping back keep-alive
     %% (which the manual handler doesn't disable on its own).
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Headers = ~"POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 5\r\n\r\n",
@@ -991,7 +956,6 @@ manual_mode_dispatches_with_body_reader_test() ->
 manual_mode_bad_framing_writes_400_test() ->
     %% Non-chunked Transfer-Encoding rejected by `body_framing/1` →
     %% 400 + exit, before the handler is invoked.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Headers = ~"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n",
@@ -1015,7 +979,6 @@ manual_mode_bad_framing_writes_400_test() ->
 
 not_found_writes_404_test() ->
     %% Router dispatch with no matching route → 404.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     %% Publish an empty route table under the listener name so
@@ -1046,7 +1009,6 @@ method_not_allowed_writes_405_test() ->
     %% Router dispatch where the path matches but the method isn't in the
     %% route's allowlist → 405 with a comma-joined, sorted Allow header,
     %% emitted before any pipeline runs.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Listener = mna405,
@@ -1087,7 +1049,6 @@ two_pipelined_requests_in_one_packet_serve_both_test() ->
     %% `Connection: close`) lets keep-alive engage. The second
     %% request closes via the test's `max_keep_alive_requests := 2`
     %% cap so the conn exits cleanly without a third iteration.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Both =
@@ -1117,7 +1078,6 @@ pipelined_responses_coalesce_into_one_send_test() ->
     %% while the loop spins on `buffered` and reach the wire as ONE
     %% send when the loop is about to block for the next request — the
     %% coalescing observable is the send COUNT, not just the bytes.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Req = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
@@ -1147,7 +1107,6 @@ manual_mode_bodyless_pipelined_requests_coalesce_test() ->
     %% for a bodyless one its framing is `none`, so the pre-drain flush
     %% is skipped and the pipelined batch stays coalesced: both
     %% responses in one send.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Req = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
@@ -1175,7 +1134,6 @@ pipelined_response_precedes_error_for_malformed_followup_test() ->
     %% A valid request pipelined ahead of garbage: the queued 200 must
     %% flush BEFORE the 400 hits the wire, so the client attributes
     %% each response to the right request.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -1205,7 +1163,6 @@ keep_alive_max_cap_closes_after_max_test() ->
     %% `max_keep_alive_requests := 1` — the single served request hits
     %% the cap and the conn closes (no second iteration even though
     %% keep-alive is otherwise eligible).
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Both =
@@ -1229,7 +1186,6 @@ manual_mode_drain_failure_closes_cleanly_test() ->
     %% then has to consume the body_reader's unread bytes — when the
     %% recv in that drain returns `{error, closed}`, drain_body returns
     %% `{error, _}` and the conn must exit cleanly without crashing.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Headers = ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n",
@@ -1266,7 +1222,6 @@ manual_mode_pipelined_leftover_uses_manual_drain_test() ->
     %% req has `body_reader` set) and feed ManualLeftover to the next
     %% iteration's read_request_phase. Covers the manual-mode clause
     %% of pipelined_leftover/3.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Req1 = ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
@@ -1301,7 +1256,6 @@ keep_alive_idle_timeout_silently_closes_test() ->
     %% Uses the `roadrunner_keepalive_handler` (no `Connection: close`)
     %% so keep-alive engages — otherwise the hello handler would
     %% close after request 1 and we'd never enter `phase=keep_alive`.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -1332,7 +1286,6 @@ hibernate_after_fires_during_keep_alive_idle_test() ->
     %% enter `process_info(Pid, status) =:= waiting` AND show a
     %% drastically reduced `total_heap_size` after hibernation. We
     %% poll for status=waiting + heap < 5000 words.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -1368,7 +1321,6 @@ hibernate_after_fires_during_keep_alive_idle_test() ->
 
 hibernate_path_handles_close_test() ->
     %% Coverage: the hibernate path's ClosedTag clause.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -1392,7 +1344,6 @@ hibernate_path_handles_close_test() ->
     Sink ! stop.
 
 hibernate_path_handles_tcp_error_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -1419,7 +1370,6 @@ hibernate_path_handles_deadline_fired_test() ->
     %% With short keep_alive_timeout AND hibernate_after, the
     %% deadline timer fires before hibernation does — covers the
     %% `{?MODULE, deadline_fired}` clause.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -1442,7 +1392,6 @@ hibernate_path_handles_deadline_fired_test() ->
     Sink ! stop.
 
 hibernate_path_drops_stray_messages_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -1468,7 +1417,6 @@ hibernate_path_drops_stray_messages_test() ->
     Sink ! stop.
 
 request_start_and_stop_pair_with_shared_request_id_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     attach_telemetry(Tag, [
@@ -1497,7 +1445,6 @@ head_method_buffered_response_omits_body_test() ->
     %% path in conn_loop pattern-matches on `method := ~"HEAD"` and
     %% forces the body to `~""`. Headers (including content-length)
     %% stay as-is so the framing matches what GET would have returned.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -1518,7 +1465,6 @@ head_method_buffered_response_omits_body_test() ->
     Sink ! stop.
 
 stream_response_writes_chunked_body_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -1543,7 +1489,6 @@ stream_response_writes_chunked_body_test() ->
     Sink ! stop.
 
 loop_response_runs_until_stop_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -1574,7 +1519,6 @@ loop_response_runs_until_stop_test() ->
     Sink ! stop.
 
 sendfile_response_writes_head_then_body_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Path = filename:join(["/tmp", "rr_conn_loop_sendfile.txt"]),
@@ -1608,7 +1552,6 @@ sendfile_response_writes_head_then_body_test() ->
 sendfile_response_skips_body_for_head_method_test() ->
     %% RFC 9110 §9.3.2 — HEAD must not include a message body.
     %% Covers the `~"HEAD"` branch of dispatch_response/4's sendfile clause.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Path = filename:join(["/tmp", "rr_conn_loop_sendfile_head.txt"]),
@@ -1646,7 +1589,6 @@ sendfile_at_keep_alive_ceiling_signals_close_test() ->
     %% carry `Connection: close`, even though the client never asked to
     %% close. Mirrors the buffered ceiling case: `ensure_close_signaled/3`
     %% routes both shapes through `with_close_if_last/3`.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Path = filename:join(["/tmp", "rr_conn_loop_sendfile_ceiling.txt"]),
@@ -1689,7 +1631,6 @@ sendfile_dispatch_closes_socket_on_error_test() ->
     %% a missing path: `roadrunner_transport:sendfile/4` returns
     %% `{error, enoent}` from `file:open/2`, exercising the same
     %% close-on-error path a short_write would take in production.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_once(
@@ -1724,7 +1665,6 @@ websocket_conn_hibernates_forwards_drain_and_closes_test() ->
     %% `{roadrunner_drain, _}` broadcast to the session, and once the
     %% session ends (a close frame injected through the fake socket) the
     %% conn wakes, runs the websocket finishing path, and exits normal.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_ws_sink(Self, Tag, <<
@@ -1775,7 +1715,6 @@ pipelined_response_flushes_once_before_ws_upgrade_test() ->
     %% A GET pipelined ahead of a WS upgrade: the queued 200 must reach
     %% the wire exactly once, BEFORE the 101 — and never again from a
     %% stale accumulator when the conn finishes after the session.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_ws_sink(Self, Tag, <<
@@ -1824,7 +1763,6 @@ websocket_dispatch_invokes_session_run_test() ->
     %% and returns `rejected`. We're covering the dispatch_response
     %% websocket clause — a full handshake test lives above and in the
     %% WS suite.
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -1848,7 +1786,6 @@ websocket_dispatch_invokes_session_run_test() ->
     Sink ! stop.
 
 slot_released_after_parse_exit_test() ->
-    ensure_pg(),
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -1868,15 +1805,6 @@ slot_released_after_parse_exit_test() ->
     Sink ! stop.
 
 %% --- helpers ---
-
-ensure_pg() ->
-    case whereis(pg) of
-        undefined ->
-            {ok, _} = pg:start_link(),
-            ok;
-        _ ->
-            ok
-    end.
 
 fake_opts(ListenerName) ->
     #{

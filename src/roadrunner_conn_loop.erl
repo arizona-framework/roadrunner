@@ -60,7 +60,7 @@
 %%
 %% ## Stability features preserved
 %%
-%% Drain via `pg`-broadcast, slot tracking via atomics, full telemetry
+%% Drain via registry broadcast, slot tracking via atomics, full telemetry
 %% pairing (`[roadrunner, request, start | stop | exception]` with
 %% shared `StartMono`), HEAD body suppression, `Expect: 100-continue`,
 %% anti-Slowloris rate-check on the request-read phase, all five
@@ -177,9 +177,8 @@ start(
     no_return().
 init_loop(Parent, Socket, ProtoOpts) ->
     ListenerName = maps:get(listener_name, ProtoOpts, undefined),
-    DrainGroup = maps:get(graceful_drain, ProtoOpts, true),
     proc_lib:set_label({roadrunner_conn, awaiting_shoot, ListenerName}),
-    ok = roadrunner_conn:join_drain_group(ListenerName, DrainGroup),
+    ok = roadrunner_conn:register_for_drain(ProtoOpts),
     proc_lib:init_ack(Parent, {ok, self()}),
     awaiting_shoot(Socket, ProtoOpts, ListenerName).
 
@@ -230,6 +229,7 @@ awaiting_shoot(Socket0, ProtoOpts, ListenerName) ->
                     ok = roadrunner_telemetry:listener_accept_error(#{
                         listener_name => ListenerName, reason => Reason
                     }),
+                    ok = roadrunner_conn:unregister_for_drain(ProtoOpts),
                     ok = roadrunner_conn:release_slot(ProtoOpts),
                     exit(normal)
             end;
@@ -1259,11 +1259,11 @@ buffered_finish(S0, Req, Headers) ->
 %% Park the conn in a hibernated wait while the WebSocket session owns
 %% the socket. The conn's only remaining duties are bookkeeping: hold
 %% the session monitor, forward `{roadrunner_drain, _}` broadcasts to
-%% the session (the conn is already in the listener's drain `pg` group
-%% via `roadrunner_conn:join_drain_group/2`; joining the session too
-%% would double the join rate through the single `pg` scope process and
-%% serialize the upgrade path under load), and fire the request-stop /
-%% conn-close telemetry once the session ends. Hibernating sheds the
+%% the session (the conn is already in the listener's drain registry via
+%% `roadrunner_conn:register_for_drain/1`; registering the session too
+%% would be a second row to keep in step for nothing), and fire the
+%% request-stop / conn-close telemetry once the session ends. Hibernating
+%% sheds the
 %% heap grown parsing the upgrade request (~5-7 KB per connection
 %% measured under load) for the session's entire lifetime — at high
 %% WebSocket concurrency the parked conns are a real share of resident
@@ -1417,6 +1417,7 @@ exit_clean(Socket, ProtoOpts, StartMono, Peer, ListenerName, Served, Reason) ->
                 requests_served => Served
             })
     end,
+    ok = roadrunner_conn:unregister_for_drain(ProtoOpts),
     ok = roadrunner_conn:release_slot(ProtoOpts),
     ok = roadrunner_transport:close(Socket),
     exit(Reason).
