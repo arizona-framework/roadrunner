@@ -406,6 +406,7 @@ start_conn(Handler, Extra) ->
             dispatch => {handler, Handler, fun Handler:handle/1, undefined},
             middlewares => [],
             handler_spawn_opts => [{fullsweep_after, 0}],
+            tls_handshake_timeout => 5000,
             handler_start_timeout => infinity
         },
         Extra

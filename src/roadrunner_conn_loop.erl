@@ -42,17 +42,21 @@
 %% ## Phase introspection vs hot-path cost
 %%
 %% The label set on the conn process via `proc_lib:set_label/1` is
-%% written **at most twice per conn**: once at `init_loop` time
-%% (`{roadrunner_conn, awaiting_shoot, ListenerName}`) and once at the
-%% `shoot` handoff (`refine_conn_label/2` rewrites it to include the
-%% peer). The phases AFTER `awaiting_shoot` (read_request, read_body,
-%% dispatching, finishing) run in microseconds on the happy path — too
-%% fast for an operator's `observer` snapshot to catch a specific phase
-%% anyway. Per-phase label updates measured ~1.2 % CPU on hello (4
-%% writes/req, each touching the process dictionary) and contributed
-%% to run-to-run variance. Stuck conns still surface via the conn-entry
-%% label and the `reading_request` idle window (where hibernation
-%% parks the process).
+%% written **at most twice per conn** on plain TCP, three times on TLS:
+%% once at `init_loop` time (`{roadrunner_conn, awaiting_shoot,
+%% ListenerName}`), once more on a TLS listener when `shoot` starts the
+%% handshake (`{roadrunner_conn, tls_handshake, ListenerName}` — the one
+%% pre-serve phase that can park for up to `tls_handshake_timeout` on a
+%% silent peer, so an `observer` snapshot must tell it apart from a conn
+%% that was never shot), and once in `refine_conn_label/2`, which
+%% rewrites it to include the peer. The phases AFTER that (read_request,
+%% read_body, dispatching, finishing) run in microseconds on the happy
+%% path — too fast for an operator's `observer` snapshot to catch a
+%% specific phase anyway. Per-phase label updates measured ~1.2 % CPU on
+%% hello (4 writes/req, each touching the process dictionary) and
+%% contributed to run-to-run variance. Stuck conns still surface via the
+%% conn-entry label and the `reading_request` idle window (where
+%% hibernation parks the process).
 %%
 %% ## Stability features preserved
 %%
@@ -181,35 +185,76 @@ init_loop(Parent, Socket, ProtoOpts) ->
 
 -spec awaiting_shoot(roadrunner_transport:socket(), roadrunner_conn:proto_opts(), atom()) ->
     no_return().
-awaiting_shoot(Socket, ProtoOpts, ListenerName) ->
+awaiting_shoot(Socket0, ProtoOpts, ListenerName) ->
     receive
         shoot ->
-            %% Socket ownership has just transferred from the acceptor. If the
-            %% listener enabled the PROXY protocol, read and strip the header an
-            %% L4 balancer prepended so we serve the real client peer; otherwise
-            %% the OS peer passes through unchanged.
-            OsPeer = roadrunner_conn:peer(Socket),
-            case proxy_protocol_stage(Socket, ProtoOpts, OsPeer) of
-                {ok, Peer, Buffered} ->
-                    serve(Socket, ProtoOpts, ListenerName, Peer, Buffered);
-                close ->
-                    %% Malformed/absent PROXY header on a proxy_protocol
-                    %% listener (a misconfigured upstream). No accept telemetry
-                    %% has fired yet (it pairs with the real peer in serve/5),
-                    %% so release the slot and close silently, like the
-                    %% pre-`shoot` drain path below.
-                    exit_clean(Socket, ProtoOpts, undefined, undefined, ListenerName, 0, normal)
+            %% Socket ownership has just transferred from the acceptor. On a
+            %% TLS listener the socket arrives pre-handshake: the handshake
+            %% runs here, in the connection it belongs to, so a slow or
+            %% silent peer costs only this process and never parks an
+            %% acceptor (see `roadrunner_transport:handshake/2`). Plain TCP
+            %% passes straight through.
+            #{tls_handshake_timeout := HsTimeout} = ProtoOpts,
+            ok = label_handshake(Socket0, ListenerName),
+            case roadrunner_transport:handshake(Socket0, HsTimeout) of
+                {ok, Socket} ->
+                    %% If the listener enabled the PROXY protocol, read and
+                    %% strip the header an L4 balancer prepended so we serve
+                    %% the real client peer; otherwise the OS peer passes
+                    %% through unchanged.
+                    OsPeer = roadrunner_conn:peer(Socket),
+                    case proxy_protocol_stage(Socket, ProtoOpts, OsPeer) of
+                        {ok, Peer, Buffered} ->
+                            serve(Socket, ProtoOpts, ListenerName, Peer, Buffered);
+                        close ->
+                            %% Malformed/absent PROXY header on a proxy_protocol
+                            %% listener (a misconfigured upstream). No accept
+                            %% telemetry has fired yet (it pairs with the real
+                            %% peer in serve/5), so release the slot and close
+                            %% silently, like the pre-`shoot` drain path below.
+                            exit_clean(
+                                Socket, ProtoOpts, undefined, undefined, ListenerName, 0, normal
+                            )
+                    end;
+                {error, {handshake, _} = Reason} ->
+                    %% A garbage ClientHello, a TLS alert, a peer gone
+                    %% mid-handshake, or the `tls_handshake_timeout` bound —
+                    %% routine noise on an internet-facing TLS port. Surface
+                    %% it as the same accept_error event the acceptor pool
+                    %% emits for its own failures, then release the slot. No
+                    %% accept telemetry has fired (it pairs with the peer in
+                    %% serve/5), so no conn_close either. The socket is not
+                    %% closed here: `handshake/2` already closed a timed-out
+                    %% one, and on any other failure `ssl` tore the
+                    %% connection down itself.
+                    ok = roadrunner_telemetry:listener_accept_error(#{
+                        listener_name => ListenerName, reason => Reason
+                    }),
+                    ok = roadrunner_conn:release_slot(ProtoOpts),
+                    exit(normal)
             end;
         {roadrunner_drain, _Deadline} ->
             %% Drain before `shoot` — no telemetry was fired yet (accept
             %% pairs with `shoot`), so no listener_conn_close either. Just
             %% release the slot and close the socket.
-            exit_clean(Socket, ProtoOpts, undefined, undefined, ListenerName, 0, normal);
+            exit_clean(Socket0, ProtoOpts, undefined, undefined, ListenerName, 0, normal);
         _Stray ->
             %% Stray-msg tolerance — gen_statem drops unmatched info events
             %% silently; we do the same so a buggy library can't crash the
             %% conn with a typo'd message.
-            awaiting_shoot(Socket, ProtoOpts, ListenerName)
+            awaiting_shoot(Socket0, ProtoOpts, ListenerName)
+    end.
+
+%% The handshake is the one pre-serve phase that can block for a while (up
+%% to `tls_handshake_timeout` on a silent peer), so a TLS conn is relabelled
+%% for its duration; `refine_conn_label/2` takes over once the peer is being
+%% served. Plain TCP has no handshake and keeps the `awaiting_shoot` label
+%% until then.
+-spec label_handshake(roadrunner_transport:socket(), atom()) -> ok.
+label_handshake(Socket, ListenerName) ->
+    case roadrunner_conn:scheme(Socket) of
+        https -> proc_lib:set_label({roadrunner_conn, tls_handshake, ListenerName});
+        http -> ok
     end.
 
 %% Begin serving a connection once the peer is settled (the real client when

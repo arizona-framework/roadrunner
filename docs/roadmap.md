@@ -242,23 +242,21 @@ lot of them.
 
 ## Other
 
-### Move the TLS handshake out of the acceptor
+### PROXY protocol on TLS listeners reads the header after the handshake
 
-**What:** the transport's TLS accept runs the handshake inside the
-acceptor (now bounded by the `tls_handshake_timeout` listener opt), so
-handshake time serializes across the pool, capping
-TLS connection-establishment throughput at
-`num_acceptors / handshake_time`. The fix is `ssl:transport_accept`
-in the acceptor with the handshake after the handoff, so a slow
-handshake costs only its own connection — it changes the
-`roadrunner_conn` startup contract, which expects a
-handshake-complete socket at `shoot`.
+**What:** `proxy_protocol => true` is accepted on TLS listeners, but the
+conn reads the PROXY header only after the TLS handshake, from the
+decrypted stream. An L4 balancer prepends that header in plaintext before
+the ClientHello, so on TLS the handshake sees the header instead of a
+hello and fails. The header has to be read from the raw TCP socket
+first. With the handshake now running in the conn process at `shoot`,
+the two stages sit next to each other and can simply be swapped.
 
-**Why deferred:** surfaced while auditing the acceptor
-transient-error fix; the timeout bound shipped, the throughput
-restructure wants its own design pass.
+**Why deferred:** surfaced while auditing the handshake move; no
+listener in the test suite combines the two options, and the swap wants
+a fixture that speaks PROXY-then-TLS.
 
-**Scope:** medium.
+**Scope:** small.
 
 ### Connection-process memory tuning follow-ups
 

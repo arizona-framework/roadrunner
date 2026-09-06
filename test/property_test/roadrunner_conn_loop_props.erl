@@ -189,6 +189,7 @@ proto_opts(ListenerName, Counter) ->
         proxy_protocol => false,
         listener_name => ListenerName,
         handler_spawn_opts => [{fullsweep_after, 0}],
+        tls_handshake_timeout => 5000,
         handler_start_timeout => infinity
     }.
 
