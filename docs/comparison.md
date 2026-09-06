@@ -28,10 +28,9 @@ shift, relative ordering tends to hold.
 
 Roadrunner beats cowboy on most common scenarios by +30–80 % req/s
 with proportionally lower p50 / p99. The exceptions are
-connection-storm-shape scenarios (open-conn / close-conn dominates)
-and the h2 `tls_handshake_throughput` case — those tie or slightly
-lose. Vs elli, roadrunner ties or wins on simple GETs (`hello`,
-`echo`, `json`) within a few percent, with elli still slightly
+connection-storm-shape scenarios (open-conn / close-conn dominates),
+which tie within variance. Vs elli, roadrunner ties or wins on simple
+GETs (`hello`, `echo`, `json`) within a few percent, with elli still slightly
 ahead on bandwidth-bound `large_response`. Roadrunner beats elli
 outright wherever the workload needs a feature elli doesn't ship —
 pipelining, gzip, body streaming, h2, WebSocket, router, native
@@ -82,11 +81,15 @@ needs any of these, elli isn't on the table.
 | `streaming_response`       |        62 k   |        61 k   |
 
 Multi-stream and basic-req h2 line up with the h1 picture — large
-wins on bigger headers/bodies, smaller wins on the simple paths. The
-one documented cowboy-wins case is `tls_handshake_throughput`
-(fresh-TLS-conn-per-request, runnable ad-hoc via
-`./scripts/bench.escript --scenarios tls_handshake_throughput`),
-explained in
+wins on bigger headers/bodies, smaller wins on the simple paths.
+`tls_handshake_throughput` (fresh-TLS-conn-per-request, runnable
+ad-hoc via `./scripts/bench.escript --scenarios
+tls_handshake_throughput`) used to be the one documented cowboy-wins
+case while the handshake ran inside the acceptor pool. With the
+handshake in the connection process it measures 2.9-3.0 k
+handshakes/s to cowboy's 2.7-2.9 k on the same box (three interleaved
+runs, 2026-09-06), 18-21 % above the previous roadrunner figure. The
+history is in
 [`conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md).
 
 ## Latency — p50 / p99 (lower = better)
@@ -134,9 +137,10 @@ Requires Docker and a compiled test profile. See
 ## Reading the numbers honestly
 
 - **vs cowboy: roadrunner wins on most scenarios** by 25–60 % on
-  req/s with proportionally lower p50 / p99. The exception is
-  `tls_handshake_throughput` (h2), where cowboy edges roadrunner
-  on fresh-TLS-conn-per-request workloads (documented in
+  req/s with proportionally lower p50 / p99. `tls_handshake_throughput`
+  (h2) was the exception while the handshake ran inside the acceptor
+  pool; with the handshake in the connection process it lands about
+  5 % ahead of cowboy (the history is in
   [`conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md)).
   Connection-storm-shape scenarios (in the full results) tie
   within variance.
