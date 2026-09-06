@@ -736,7 +736,7 @@ slot_reconciliation_disabled_drops_reconcile_slots_message_test() ->
     %% dropped — gen_server stays alive.
     Name = listener_test_disabled_reap,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
-        port => 0, routes => roadrunner_hello_handler
+        port => 0, slot_reconciliation => disabled, routes => roadrunner_hello_handler
     }),
     ListenerPid ! reconcile_slots,
     %% Process must still answer port/1.
@@ -754,12 +754,24 @@ listener_drops_unknown_info_message_test() ->
     ?assert(roadrunner_listener:port(Name) > 0),
     ok = roadrunner_listener:stop(Name).
 
-slot_reconciliation_disabled_by_default_test() ->
-    Name = listener_test_no_reap,
+slot_reconciliation_on_by_default_test() ->
+    %% Nothing but the reaper gives a killed conn's slot back, so it is armed
+    %% without being asked, at the one-minute default.
+    Name = listener_test_default_reap,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0, routes => roadrunner_hello_handler
     }),
+    %% {state, LSocket, Port, ProtoOpts, Phase, Reconciliation, Quic}
+    ?assertEqual(#{interval => 60000, prev_diff => 0}, element(6, sys:get_state(ListenerPid))),
+    ok = roadrunner_listener:stop(Name).
+
+slot_reconciliation_disabled_keeps_orphans_test() ->
+    Name = listener_test_no_reap,
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0, slot_reconciliation => disabled, routes => roadrunner_hello_handler
+    }),
     State = sys:get_state(ListenerPid),
+    ?assertEqual(disabled, element(6, State)),
     ProtoOpts = element(4, State),
     Counter = maps:get(client_counter, ProtoOpts),
     %% Plant orphan slots; without reconciliation they stay forever.
@@ -767,6 +779,48 @@ slot_reconciliation_disabled_by_default_test() ->
     timer:sleep(100),
     ?assertEqual(3, counters:get(Counter, 1)),
     ok = roadrunner_listener:stop(Name).
+
+graceful_drain_off_disables_slot_reconciliation_test() ->
+    %% Without a drain registry every live conn would read as an orphan, so
+    %% the default reaper stays off on such a listener.
+    Name = listener_test_no_registry_no_reap,
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0, graceful_drain => false, routes => roadrunner_hello_handler
+    }),
+    ?assertEqual(disabled, element(6, sys:get_state(ListenerPid))),
+    ok = roadrunner_listener:stop(Name).
+
+slot_reconciliation_without_registry_is_a_conflict_test() ->
+    %% Asking for the reaper on a listener that keeps no registry would
+    %% release live slots; refuse the combination outright.
+    process_flag(trap_exit, true),
+    R = roadrunner_listener:start_link(listener_test_reap_conflict, #{
+        port => 0,
+        graceful_drain => false,
+        slot_reconciliation => #{interval => 30},
+        routes => roadrunner_hello_handler
+    }),
+    ?assertMatch(
+        {error, {
+            {listener_opt_conflict, slot_reconciliation, #{interval := 30}, no_drain_registry},
+            _Stack
+        }},
+        R
+    ).
+
+listener_rejects_invalid_slot_reconciliation_test() ->
+    %% Anything but `disabled` or `#{interval := PosInt}` is a configuration
+    %% error, not a silent fallback to the default.
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(listener_test_reap_invalid, #{
+                port => 0, slot_reconciliation => Bad, routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, slot_reconciliation, Bad}, _Stack}}, R)
+        end,
+        [#{interval => 0}, #{interval => -5}, #{interval => fast}, enabled, 60000]
+    ).
 
 listener_info_initial_zero_test() ->
     Name = listener_test_info_init,

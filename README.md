@@ -414,11 +414,12 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
   to in-flight conns, polls until idle or deadline, then
   `exit(Pid, shutdown)` for stragglers.
 - **Status**: `roadrunner_listener:status/1` returns `accepting | draining`.
-- **Slot reconciliation**: Optional `slot_reconciliation => #{interval => N}`
-  listener opt: a periodic reaper that compares `client_counter` against the
-  live registered conns and releases slots orphaned by `kill`-style exits. Off by
-  default; enable in production where you can't trust every exit path to run
-  `terminate/3` (`kill` signals, OOM kills, supervisor brutal-kill).
+- **Slot reconciliation**: a periodic reaper that compares `client_counter`
+  against the live registered conns and releases slots orphaned by
+  `kill`-style exits (`kill` signals, OOM kills, supervisor brutal-kill),
+  on by default every 60 s; tune with `slot_reconciliation => #{interval => N}`
+  or turn it off with `slot_reconciliation => disabled`. Off on
+  `graceful_drain => false` listeners, which keep no registry.
 
 ## Documentation
 

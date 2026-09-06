@@ -330,9 +330,9 @@ skips the cleanup funnel, so the slot is **leaked** for the lifetime
 of the listener process. This is bounded:
 `max_clients` accepted connections each leak at most one slot
 under killing, and the listener restart resets the counter. If
-leaks become a real concern under chaos-test conditions, the optional
-`slot_reconciliation` reaper compares the registered conns still alive
-against the live counter and reconciles the difference.
+leaks become a real concern under chaos-test conditions, the
+`slot_reconciliation` reaper (on by default) compares the registered
+conns still alive against the live counter and reconciles the difference.
 """.
 -spec try_acquire_slot(proto_opts()) -> boolean().
 try_acquire_slot(#{client_counter := Ref, max_clients := Max}) ->
