@@ -194,6 +194,7 @@ acceptor_hands_tls_sockets_off_before_the_handshake_test() ->
         #{
             listener_name => acceptor_test_tls_noise,
             tls_handshake_timeout => 5000,
+            proxy_protocol => false,
             client_counter => Counter,
             max_clients => 10,
             graceful_drain => false,

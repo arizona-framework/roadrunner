@@ -242,22 +242,6 @@ lot of them.
 
 ## Other
 
-### PROXY protocol on TLS listeners reads the header after the handshake
-
-**What:** `proxy_protocol => true` is accepted on TLS listeners, but the
-conn reads the PROXY header only after the TLS handshake, from the
-decrypted stream. An L4 balancer prepends that header in plaintext before
-the ClientHello, so on TLS the handshake sees the header instead of a
-hello and fails. The header has to be read from the raw TCP socket
-first. With the handshake now running in the conn process at `shoot`,
-the two stages sit next to each other and can simply be swapped.
-
-**Why deferred:** surfaced while auditing the handshake move; no
-listener in the test suite combines the two options, and the swap wants
-a fixture that speaks PROXY-then-TLS.
-
-**Scope:** small.
-
 ### Connection-process memory tuning follow-ups
 
 **What:** The `handler_spawn` listener opt already exposes the full

@@ -175,6 +175,12 @@ deadline in milliseconds.
     %% the request peer is the real client. TCP-only; the listener rejects it on
     %% an HTTP/3-only listener.
     proxy_protocol => boolean(),
+    %% TLS options for a TLS listener that also reads the PROXY protocol: it
+    %% accepts plain TCP (the header comes before any TLS bytes) and the conn
+    %% upgrades each socket with these once the header is in. Absent on every
+    %% other listener; a TLS listener without the PROXY protocol handshakes
+    %% the socket `ssl:listen` accepted.
+    tls_upgrade => [ssl:tls_server_option()],
     %% Enabled protocols as a flat atom list in user-supplied (ALPN
     %% preference) order. On plain TCP with `[http2]`,
     %% `roadrunner_conn_loop:awaiting_shoot/3` routes straight to the

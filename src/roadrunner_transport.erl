@@ -44,6 +44,7 @@
     listen_tls/2,
     accept/1,
     handshake/2,
+    handshake/3,
     controlling_process/2,
     recv/3,
     send/2,
@@ -82,7 +83,8 @@ the `ssl` application is started (typically `application:ensure_all_started(ssl)
 
 `Opts` is the list passed to `ssl:listen/2` — `cert`, `key`/`keyfile`,
 `cacerts`, etc. Performs the TCP listen + TLS context bind in one call;
-each `accept/2` then runs the per-connection handshake.
+each socket `accept/1` hands out then completes its handshake in its
+connection process via `handshake/2`.
 """.
 -spec listen_tls(inet:port_number(), [ssl:tls_server_option() | gen_tcp:listen_option()]) ->
     {ok, socket()} | {error, term()}.
@@ -147,6 +149,26 @@ handshake({ssl, Pre}, HandshakeTimeout) ->
     end;
 handshake(Socket, _HandshakeTimeout) ->
     {ok, Socket}.
+
+-doc """
+Upgrade a plain TCP socket from `accept/1` to TLS with a server-side
+handshake, bounded by `HandshakeTimeout` ms. This is the path a TLS
+listener with `proxy_protocol => true` takes: it listens on plain TCP so
+the connection process can read the PROXY header off the raw stream
+first, then upgrades with the listener's TLS options (`TlsOpts`, as
+`build_tls_opts/2` produces them).
+
+Failures come back as `{error, {handshake, Reason}}` like `handshake/2`.
+Unlike the pre-accepted form, `ssl` closes the TCP socket itself on
+every failure here, `timeout` included, so nothing is left to close.
+""".
+-spec handshake(socket(), [ssl:tls_server_option()], timeout()) ->
+    {ok, socket()} | {error, {handshake, term()}}.
+handshake({gen_tcp, S}, TlsOpts, HandshakeTimeout) ->
+    case ssl:handshake(S, TlsOpts, HandshakeTimeout) of
+        {ok, Ssl} -> {ok, {ssl, Ssl}};
+        {error, HsReason} -> {error, {handshake, HsReason}}
+    end.
 
 -doc "Hand the controlling process for the underlying socket.".
 -spec controlling_process(socket(), pid()) -> ok | {error, term()}.
