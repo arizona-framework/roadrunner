@@ -862,6 +862,135 @@ compile_allows_all_methods_route_below_method_specific_ones_test() ->
     ?assertEqual({ok, catch_all_handler, #{}, #{}}, match_no_pipeline(~"DELETE", ~"/x", Compiled)).
 
 %% =============================================================================
+%% Lookup tree: declaration order and method checks across branches
+%% =============================================================================
+
+match_earlier_literal_beats_later_param_on_same_path_test() ->
+    %% Both branches match `/users/me`; the literal is declared first.
+    Compiled = roadrunner_router:compile(
+        [{~"/users/me", me_handler}, {~"/users/:id", user_handler}], []
+    ),
+    ?assertEqual({ok, me_handler, #{}, #{}}, match_no_pipeline(~"/users/me", Compiled)),
+    ?assertEqual(
+        {ok, user_handler, #{~"id" => ~"42"}, #{}}, match_no_pipeline(~"/users/42", Compiled)
+    ).
+
+match_earlier_param_beats_later_literal_when_both_answer_test() ->
+    %% The param route answers only POST, so the literal stays reachable for
+    %% other methods; for POST the earlier param route still wins.
+    Compiled = roadrunner_router:compile(
+        [
+            #{path => ~"/users/:id", handler => user_handler, methods => [~"POST"]},
+            {~"/users/me", me_handler}
+        ],
+        []
+    ),
+    ?assertEqual(
+        {ok, user_handler, #{~"id" => ~"me"}, #{}},
+        match_no_pipeline(~"POST", ~"/users/me", Compiled)
+    ),
+    ?assertEqual({ok, me_handler, #{}, #{}}, match_no_pipeline(~"GET", ~"/users/me", Compiled)).
+
+match_falls_through_to_another_branch_on_method_test() ->
+    Compiled = roadrunner_router:compile(
+        [
+            #{path => ~"/users/me", handler => me_handler, methods => [~"GET"]},
+            {~"/users/:id", user_handler}
+        ],
+        []
+    ),
+    ?assertEqual({ok, me_handler, #{}, #{}}, match_no_pipeline(~"GET", ~"/users/me", Compiled)),
+    ?assertEqual(
+        {ok, user_handler, #{~"id" => ~"me"}, #{}},
+        match_no_pipeline(~"DELETE", ~"/users/me", Compiled)
+    ).
+
+match_shared_param_branch_test() ->
+    %% Routes reusing a param name at the same depth share one branch.
+    Compiled = roadrunner_router:compile(
+        [{~"/users/:id", user_handler}, {~"/users/:id/posts", posts_handler}], []
+    ),
+    ?assertEqual(
+        {ok, user_handler, #{~"id" => ~"7"}, #{}}, match_no_pipeline(~"/users/7", Compiled)
+    ),
+    ?assertEqual(
+        {ok, posts_handler, #{~"id" => ~"7"}, #{}}, match_no_pipeline(~"/users/7/posts", Compiled)
+    ).
+
+match_different_param_names_at_same_depth_test() ->
+    Compiled = roadrunner_router:compile(
+        [
+            {~"/users/me", me_handler},
+            {~"/users/:id", user_handler},
+            {~"/users/:name/posts", posts_handler},
+            {~"/users/:slug/posts/:post", post_handler}
+        ],
+        []
+    ),
+    ?assertEqual({ok, me_handler, #{}, #{}}, match_no_pipeline(~"/users/me", Compiled)),
+    ?assertEqual(
+        {ok, user_handler, #{~"id" => ~"7"}, #{}}, match_no_pipeline(~"/users/7", Compiled)
+    ),
+    ?assertEqual(
+        {ok, posts_handler, #{~"name" => ~"bob"}, #{}},
+        match_no_pipeline(~"/users/bob/posts", Compiled)
+    ),
+    ?assertEqual(
+        {ok, post_handler, #{~"slug" => ~"bob", ~"post" => ~"3"}, #{}},
+        match_no_pipeline(~"/users/bob/posts/3", Compiled)
+    ).
+
+match_literal_above_wildcard_at_same_depth_test() ->
+    Compiled = roadrunner_router:compile(
+        [{~"/static/app.js", app_handler}, {~"/static/*path", static_handler}], []
+    ),
+    ?assertEqual({ok, app_handler, #{}, #{}}, match_no_pipeline(~"/static/app.js", Compiled)),
+    ?assertEqual(
+        {ok, static_handler, #{~"path" => [~"css", ~"a.css"]}, #{}},
+        match_no_pipeline(~"/static/css/a.css", Compiled)
+    ).
+
+match_wildcard_method_not_allowed_test() ->
+    Compiled = roadrunner_router:compile(
+        [#{path => ~"/files/*path", handler => files_handler, methods => [~"GET"]}], []
+    ),
+    ?assertEqual(
+        {ok, files_handler, #{~"path" => [~"a"]}, #{}},
+        match_no_pipeline(~"GET", ~"/files/a", Compiled)
+    ),
+    ?assertEqual({method_not_allowed, [~"GET"]}, match_no_pipeline(~"POST", ~"/files/a", Compiled)).
+
+match_405_allow_unions_literal_and_wildcard_routes_test() ->
+    Compiled = roadrunner_router:compile(
+        [
+            #{path => ~"/files/readme", handler => readme_handler, methods => [~"PUT"]},
+            #{path => ~"/files/*path", handler => files_handler, methods => [~"GET"]}
+        ],
+        []
+    ),
+    ?assertEqual(
+        {method_not_allowed, [~"GET", ~"PUT"]},
+        match_no_pipeline(~"DELETE", ~"/files/readme", Compiled)
+    ),
+    ?assertEqual(
+        {ok, files_handler, #{~"path" => [~"readme"]}, #{}},
+        match_no_pipeline(~"GET", ~"/files/readme", Compiled)
+    ).
+
+match_all_methods_route_below_method_routes_on_same_path_test() ->
+    Compiled = roadrunner_router:compile(
+        [
+            #{path => ~"/items", handler => list_handler, methods => [~"GET"]},
+            #{path => ~"/items", handler => create_handler, methods => [~"POST"]},
+            {~"/items", fallback_handler}
+        ],
+        []
+    ),
+    ?assertEqual({ok, list_handler, #{}, #{}}, match_no_pipeline(~"GET", ~"/items", Compiled)),
+    ?assertEqual({ok, create_handler, #{}, #{}}, match_no_pipeline(~"POST", ~"/items", Compiled)),
+    ?assertEqual({ok, fallback_handler, #{}, #{}}, match_no_pipeline(~"PUT", ~"/items", Compiled)).
+
+%% =============================================================================
 %% validate/1 — the same check as a value, for callers that cannot raise
 %% =============================================================================
 

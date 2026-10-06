@@ -56,9 +56,8 @@ and the second one can never be reached, so compiling raises
 Ordering stays the caller's to choose; getting it wrong stops the
 listener from booting instead of turning into a 404 in production.
 
-The opaque `compiled()` shape is a list of pre-parsed segment
-patterns; swapping to a trie/DAG later is a non-breaking change for
-callers.
+The opaque `compiled()` shape is a tree keyed on literal segments, so
+matching costs about the same however many routes the table holds.
 """.
 
 -export([compile/2, validate/1, match/3]).
@@ -168,9 +167,43 @@ segments itself; see `roadrunner_static` for the reference check.
 The compiled-routes representation `match/3` consumes. Treat as
 opaque: the shape is an implementation detail and may change.
 """.
--opaque compiled() :: [
-    {[segment()], module(), roadrunner_middleware:next(), term(), method_lookup()}
-].
+-opaque compiled() :: {route_node(), tuple()}.
+
+%% The compiled table: a lookup tree over every route's segment pattern,
+%% plus a tuple of `{Handler, Pipeline, State, Methods}` indexed by the
+%% route's 1-based position. Each tree node holds the routes whose
+%% pattern ends exactly there (`ends`), a child per literal segment
+%% (`literals`), a child per `:param` name at this depth (`params`; two
+%% routes may name the same position differently), and the routes whose
+%% `*wildcard` sits at this depth (`wildcards`). A walk follows the
+%% request's segments through the literal child and every param child,
+%% so it only ever reaches routes that can match the path, and cost
+%% tracks path depth rather than table size.
+%%
+%% The routes ending at a node share a path, so their method check is
+%% folded into one `end_group()` at compile time: the lowest index that
+%% answers every method, a map from each declared method to the lowest
+%% index declaring it, and the union of declared methods for a `405`.
+%% Same-path method dispatch then costs one map lookup, and a node where
+%% a single any-method route ends, the usual case, stores just its index.
+-record(route_node, {
+    ends = none :: end_group(),
+    literals = #{} :: #{binary() => route_node()},
+    params = [] :: [{binary(), route_node()}],
+    wildcards = [] :: [{pos_integer(), binary(), method_lookup()}]
+}).
+-type route_node() :: #route_node{}.
+-type end_group() ::
+    none
+    | pos_integer()
+    | {
+        Any :: pos_integer() | none,
+        ByMethod :: #{binary() => pos_integer()},
+        Allow :: #{binary() => true}
+    }.
+%% A path match found by the walk: the route index with its bindings when
+%% the route answers the method, or the methods it declares when not.
+-type path_match() :: {pos_integer(), bindings()} | {reject, #{binary() => true}}.
 
 -doc """
 Compile a list of routes into the lookup form `match/3` expects.
@@ -199,7 +232,7 @@ compile(Routes, ListenerMws) when is_list(Routes), is_list(ListenerMws) ->
     case validate(Routes) of
         ok ->
             ResolvedListener = roadrunner_middleware:resolve(ListenerMws),
-            [compile_route(R, ResolvedListener) || R <- Routes];
+            build_table([compile_route(R, ResolvedListener) || R <- Routes]);
         {error, Reason} ->
             error(Reason)
     end.
@@ -260,6 +293,65 @@ compile_route(#{path := Path, handler := Handler} = Route, ResolvedListener) whe
         StateValue,
         Methods
     }.
+
+-spec build_table(
+    [{[segment()], module(), roadrunner_middleware:next(), term(), method_lookup()}]
+) -> compiled().
+build_table(Compiled) ->
+    %% Ascending index order, so the first route to claim a method or
+    %% the any-method slot at a node is also the lowest.
+    Tree = lists:foldl(
+        fun({Index, {Pattern, _Handler, _Pipeline, _State, Methods}}, Node) ->
+            insert(Pattern, Index, Methods, Node)
+        end,
+        #route_node{},
+        lists:enumerate(Compiled)
+    ),
+    Entries = list_to_tuple([
+        {Handler, Pipeline, State, Methods}
+     || {_Pattern, Handler, Pipeline, State, Methods} <- Compiled
+    ]),
+    {Tree, Entries}.
+
+%% Add the route at `Index` to the tree along its pattern. A wildcard is
+%% always the last segment (`check_wildcard_last/2`), so it ends the walk.
+-spec insert([segment()], pos_integer(), method_lookup(), route_node()) -> route_node().
+insert([], Index, Methods, #route_node{ends = Group} = Node) ->
+    Node#route_node{ends = add_end(Index, Methods, Group)};
+insert([{literal, Lit} | Rest], Index, Methods, #route_node{literals = Lits} = Node) ->
+    Child =
+        case Lits of
+            #{Lit := Existing} -> Existing;
+            #{} -> #route_node{}
+        end,
+    Node#route_node{literals = Lits#{Lit => insert(Rest, Index, Methods, Child)}};
+insert([{param, Name} | Rest], Index, Methods, #route_node{params = Params} = Node) ->
+    Child =
+        case lists:keyfind(Name, 1, Params) of
+            {Name, Existing} -> Existing;
+            false -> #route_node{}
+        end,
+    Node#route_node{
+        params = lists:keystore(Name, 1, Params, {Name, insert(Rest, Index, Methods, Child)})
+    };
+insert([{wildcard, Name}], Index, Methods, #route_node{wildcards = Wildcards} = Node) ->
+    Node#route_node{wildcards = [{Index, Name, Methods} | Wildcards]}.
+
+%% Fold one more route into a node's end group. Earlier (lower) indexes
+%% keep their slots: `maps:merge/2` lets its second argument win. Once an
+%% any-method route ends at a node, any later route ending there answers
+%% nothing and `validate/1` has rejected the table as unreachable, so an
+%% any-method slot is only ever filled last and is always the highest
+%% index in its group.
+-spec add_end(pos_integer(), method_lookup(), end_group()) -> end_group().
+add_end(Index, undefined, none) ->
+    Index;
+add_end(Index, Methods, none) ->
+    {none, #{M => Index || M := true <- Methods}, Methods};
+add_end(Index, undefined, {none, ByMethod, Allow}) ->
+    {Index, ByMethod, Allow};
+add_end(Index, Methods, {none, ByMethod, Allow}) ->
+    {none, maps:merge(#{M => Index || M := true <- Methods}, ByMethod), maps:merge(Allow, Methods)}.
 
 -spec compile_path(binary()) -> [segment()].
 compile_path(Path) ->
@@ -483,32 +575,158 @@ all.
     {ok, module(), bindings(), roadrunner_middleware:next(), term()}
     | {method_not_allowed, [binary()]}
     | not_found.
-match(Method, Path, Compiled) when is_binary(Method), is_binary(Path), is_list(Compiled) ->
-    Segments = path_segments(Path),
-    match_first(Method, Segments, Compiled, #{}).
-
-%% `Allow` is a set-map accumulator of the methods declared by every
-%% path-matching-but-method-rejected route; `maps:merge/2` unions and
-%% de-duplicates it. At the end its sorted keys become the `405` Allow
-%% header (sort makes the header deterministic regardless of map order).
--spec match_first(binary(), [binary()], compiled(), #{binary() => true}) ->
-    {ok, module(), bindings(), roadrunner_middleware:next(), term()}
-    | {method_not_allowed, [binary()]}
-    | not_found.
-match_first(_Method, _Segments, [], Allow) when map_size(Allow) =:= 0 ->
-    not_found;
-match_first(_Method, _Segments, [], Allow) ->
-    {method_not_allowed, lists:sort(maps:keys(Allow))};
-match_first(Method, Segments, [{Pattern, Handler, Pipeline, State, Methods} | Rest], Allow) ->
-    case match_pattern(Pattern, Segments, #{}) of
-        no_match ->
-            match_first(Method, Segments, Rest, Allow);
-        Bindings ->
-            case method_allowed(Method, Methods) of
-                true -> {ok, Handler, decode_bindings(Bindings), Pipeline, State};
-                false -> match_first(Method, Segments, Rest, maps:merge(Allow, Methods))
-            end
+match(Method, Path, {Tree, Entries}) when is_binary(Method), is_binary(Path) ->
+    case collect(Tree, path_segments(Path), Method, #{}, []) of
+        [] ->
+            not_found;
+        [{Index, Bindings}] when is_integer(Index) ->
+            %% A single path match that answers the method, the usual case.
+            answer(Index, Bindings, Entries);
+        Matches ->
+            select(Matches, Entries)
     end.
+
+%% Every path match for the segments, in no particular order (see
+%% `path_match()`). Bindings are built as the walk goes and only kept
+%% for a route that matches in full.
+-spec collect(route_node(), [binary()], binary(), bindings(), [path_match()]) ->
+    [path_match()].
+collect(
+    #route_node{literals = Lits, params = [], wildcards = []},
+    [Segment | Rest],
+    Method,
+    Bindings,
+    Acc
+) ->
+    %% Literal-only node, the common shape: skip the param and wildcard passes.
+    case Lits of
+        #{Segment := Child} -> collect(Child, Rest, Method, Bindings, Acc);
+        #{} -> Acc
+    end;
+collect(#route_node{ends = Group, wildcards = []}, [], Method, Bindings, Acc) ->
+    end_match(Group, Method, Bindings, Acc);
+collect(
+    #route_node{literals = Lits, params = [{Name, Child}], wildcards = []},
+    [Segment | Rest],
+    Method,
+    Bindings,
+    Acc
+) ->
+    %% One param child and no wildcard, the usual shape below a literal.
+    Acc1 = collect(Child, Rest, Method, Bindings#{Name => Segment}, Acc),
+    case Lits of
+        #{Segment := LitChild} -> collect(LitChild, Rest, Method, Bindings, Acc1);
+        #{} -> Acc1
+    end;
+collect(
+    #route_node{literals = Lits, params = Params, wildcards = []},
+    [Segment | Rest],
+    Method,
+    Bindings,
+    Acc
+) ->
+    Acc1 = add_params(Params, Segment, Rest, Method, Bindings, Acc),
+    case Lits of
+        #{Segment := Child} -> collect(Child, Rest, Method, Bindings, Acc1);
+        #{} -> Acc1
+    end;
+collect(#route_node{ends = Group, wildcards = Wildcards}, [], Method, Bindings, Acc) ->
+    end_match(Group, Method, Bindings, add_wildcards(Wildcards, [], Method, Bindings, Acc));
+collect(
+    #route_node{literals = Lits, params = Params, wildcards = Wildcards},
+    [Segment | Rest] = Segments,
+    Method,
+    Bindings,
+    Acc0
+) ->
+    Acc1 = add_wildcards(Wildcards, Segments, Method, Bindings, Acc0),
+    Acc2 = add_params(Params, Segment, Rest, Method, Bindings, Acc1),
+    case Lits of
+        #{Segment := Child} -> collect(Child, Rest, Method, Bindings, Acc2);
+        #{} -> Acc2
+    end.
+
+%% The lowest route ending here that answers `Method`: the method's own
+%% slot, else the any-method slot (always the higher index, see
+%% `add_end/3`).
+-spec end_match(end_group(), binary(), bindings(), [path_match()]) -> [path_match()].
+end_match(none, _Method, _Bindings, Acc) ->
+    Acc;
+end_match(Index, _Method, Bindings, Acc) when is_integer(Index) ->
+    [{Index, Bindings} | Acc];
+end_match({Any, ByMethod, Allow}, Method, Bindings, Acc) ->
+    case ByMethod of
+        #{Method := Index} -> [{Index, Bindings} | Acc];
+        #{} when Any =/= none -> [{Any, Bindings} | Acc];
+        #{} -> [{reject, Allow} | Acc]
+    end.
+
+-spec add_wildcards(
+    [{pos_integer(), binary(), method_lookup()}], [binary()], binary(), bindings(), [path_match()]
+) -> [path_match()].
+add_wildcards([{Index, Name, Methods} | More], Segments, Method, Bindings, Acc) ->
+    Match =
+        case method_allowed(Method, Methods) of
+            true -> {Index, Bindings#{Name => Segments}};
+            false -> {reject, Methods}
+        end,
+    add_wildcards(More, Segments, Method, Bindings, [Match | Acc]);
+add_wildcards([], _Segments, _Method, _Bindings, Acc) ->
+    Acc.
+
+-spec add_params(
+    [{binary(), route_node()}], binary(), [binary()], binary(), bindings(), [path_match()]
+) -> [path_match()].
+add_params([{Name, Child} | More], Segment, Rest, Method, Bindings, Acc) ->
+    add_params(
+        More,
+        Segment,
+        Rest,
+        Method,
+        Bindings,
+        collect(Child, Rest, Method, Bindings#{Name => Segment}, Acc)
+    );
+add_params([], _Segment, _Rest, _Method, _Bindings, Acc) ->
+    Acc.
+
+%% Routes are tried in declaration order, so the winner is the lowest
+%% index among the matches that answer the method. When nothing answers,
+%% the `405`
+%% Allow header is the union of the declared methods, de-duplicated by
+%% `maps:merge/2` and sorted so it is deterministic regardless of map
+%% order.
+-spec select([path_match(), ...], tuple()) ->
+    {ok, module(), bindings(), roadrunner_middleware:next(), term()}
+    | {method_not_allowed, [binary()]}.
+select(Matches, Entries) ->
+    case lowest(Matches, none) of
+        {Index, Bindings} -> answer(Index, Bindings, Entries);
+        none -> {method_not_allowed, lists:sort(maps:keys(rejected(Matches, #{})))}
+    end.
+
+-spec answer(pos_integer(), bindings(), tuple()) ->
+    {ok, module(), bindings(), roadrunner_middleware:next(), term()}.
+answer(Index, Bindings, Entries) ->
+    {Handler, Pipeline, State, _Methods} = element(Index, Entries),
+    {ok, Handler, decode_bindings(Bindings), Pipeline, State}.
+
+-spec lowest([path_match()], none | {pos_integer(), bindings()}) ->
+    none | {pos_integer(), bindings()}.
+lowest([{Index, _} = Match | More], none) when is_integer(Index) ->
+    lowest(More, Match);
+lowest([{Index, _} = Match | More], {Best, _}) when is_integer(Index), Index < Best ->
+    lowest(More, Match);
+lowest([_ | More], Best) ->
+    lowest(More, Best);
+lowest([], Best) ->
+    Best.
+
+%% Only called when nothing answered, so every match is a `reject`.
+-spec rejected([path_match()], #{binary() => true}) -> #{binary() => true}.
+rejected([{reject, Methods} | More], Allow) ->
+    rejected(More, maps:merge(Allow, Methods));
+rejected([], Allow) ->
+    Allow.
 
 %% A route with no `methods` allowlist answers every method; otherwise
 %% the request method must be a key in the compiled set-map.
@@ -517,24 +735,6 @@ method_allowed(_Method, undefined) ->
     true;
 method_allowed(Method, MethodsMap) ->
     is_map_key(Method, MethodsMap).
-
-%% Returns the bare bindings map on a match (no `{ok, _}` wrap) so the
-%% caller `match_first/4` can splice it straight into its own
-%% `{ok, Handler, Bindings, _, _}` tuple without paying the intermediate
-%% 2-tuple alloc per matched route. `no_match` is the sentinel for the
-%% miss path — disjoint from any map shape `match_pattern` would produce.
--spec match_pattern([segment()], [binary()], bindings()) ->
-    bindings() | no_match.
-match_pattern([], [], Bindings) ->
-    Bindings;
-match_pattern([{literal, S} | P], [S | Segs], Bindings) ->
-    match_pattern(P, Segs, Bindings);
-match_pattern([{param, Name} | P], [Value | Segs], Bindings) ->
-    match_pattern(P, Segs, Bindings#{Name => Value});
-match_pattern([{wildcard, Name}], Segs, Bindings) ->
-    Bindings#{Name => Segs};
-match_pattern(_, _, _) ->
-    no_match.
 
 %% Percent-decode the captured bindings of the matched route. `match/3` splits
 %% the path on raw `/`, so a `:param`/`*wildcard` segment arrives still
