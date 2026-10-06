@@ -102,6 +102,11 @@ decode_truncated_value_string_test() ->
     ShortValue = <<0, 0, (name_ref_prefix(0))/binary, 16#05, 1, 2>>,
     ?assertEqual({error, {qpack, truncated}}, ?M:decode(ShortValue)).
 
+decode_truncated_huffman_value_test() ->
+    %% Static name ref to `:path` (index 1), then a Huffman value whose
+    %% declared 10 octets are not all there.
+    ?assertEqual({error, {qpack, truncated}}, ?M:decode(<<0, 0, 16#51, 16#8A, 1, 2>>)).
+
 decode_bad_huffman_value_test() ->
     %% Value string H=1, length 1, byte 0xFF: 8 one-bits is invalid Huffman
     %% padding (RFC 7541 §5.2).

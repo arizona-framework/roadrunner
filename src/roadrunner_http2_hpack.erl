@@ -52,7 +52,7 @@
 %% The RFC 7541 §5.1 prefixed-integer codec is byte-identical to QPACK's
 %% RFC 9204 §4.1.1 prefixed integers, so `roadrunner_qpack` reuses these two
 %% rather than duplicating the math. Exported for that cross-module use only.
--export([encode_integer/3, decode_integer/2]).
+-export([encode_integer/3, prefix_integer/3]).
 
 -export_type([context/0, decode_error/0]).
 
@@ -252,7 +252,9 @@ decode_loop(<<B, Rest/binary>>, Ctx, _UpdatesAllowed) ->
 
 %% An integer whose N-bit prefix value is `Prefix` (RFC 7541 §5.1): a
 %% prefix below its all-ones `Max` is the whole value, otherwise the
-%% continuation bytes follow.
+%% continuation bytes follow. Exported for QPACK, which shares the
+%% integer encoding (RFC 9204 §4.1.1).
+-doc false.
 -spec prefix_integer(non_neg_integer(), pos_integer(), binary()) ->
     {ok, non_neg_integer(), binary()} | {error, bad_integer}.
 prefix_integer(Max, Max, Rest) ->
@@ -412,19 +414,8 @@ encode_size_update(N) ->
 %% afterwards if Rest is byte-aligned at start — the integer
 %% codec only emits/consumes whole bytes after the prefix).
 -doc false.
--spec decode_integer(pos_integer(), bitstring()) ->
-    {ok, non_neg_integer(), bitstring()} | {error, bad_integer}.
-decode_integer(N, Bits) ->
-    Max = (1 bsl N) - 1,
-    case Bits of
-        <<I:N, Rest/bitstring>> when I < Max ->
-            {ok, I, Rest};
-        <<_:N, Rest/bitstring>> ->
-            decode_integer_continuation(Rest, Max, 0)
-    end.
-
--spec decode_integer_continuation(bitstring(), non_neg_integer(), non_neg_integer()) ->
-    {ok, non_neg_integer(), bitstring()} | {error, bad_integer}.
+-spec decode_integer_continuation(binary(), non_neg_integer(), non_neg_integer()) ->
+    {ok, non_neg_integer(), binary()} | {error, bad_integer}.
 decode_integer_continuation(<<0:1, Bits:7, Rest/bitstring>>, I, M) ->
     {ok, I + (Bits bsl M), Rest};
 decode_integer_continuation(<<1:1, Bits:7, Rest/bitstring>>, I, M) when M < 56 ->
