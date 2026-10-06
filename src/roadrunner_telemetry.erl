@@ -182,6 +182,7 @@
 %% they will not lose or rename listed keys without a major bump.
 
 -export([
+    request_metadata/1,
     request_start/1,
     request_stop/4,
     request_exception/4,
@@ -210,6 +211,30 @@
     scheme := http | https,
     listener_name := atom()
 }.
+
+-doc """
+The request-event metadata for a parsed request, shared by HTTP/1.1,
+HTTP/2 and HTTP/3. The six keys are always present on a dispatched
+request, so they are destructured in one match rather than a
+`maps:get` each.
+""".
+-spec request_metadata(roadrunner_req:request()) -> metadata().
+request_metadata(#{
+    request_id := RequestId,
+    peer := Peer,
+    method := Method,
+    target := Target,
+    scheme := Scheme,
+    listener_name := ListenerName
+}) ->
+    #{
+        request_id => RequestId,
+        peer => Peer,
+        method => Method,
+        path => Target,
+        scheme => Scheme,
+        listener_name => ListenerName
+    }.
 
 -doc "Emit `[roadrunner, request, start]` and return the start time.".
 -spec request_start(metadata()) -> integer().
