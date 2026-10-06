@@ -145,6 +145,15 @@ content_length_non_integer_test() ->
         from(base() ++ [{~"content-length", ~"banana"}], ~"")
     ).
 
+content_length_signed_test() ->
+    [
+        ?assertEqual(
+            {error, content_length_mismatch},
+            from(base() ++ [{~"content-length", V}], Body)
+        )
+     || {V, Body} <- [{~"+5", ~"abcde"}, {~"-0", ~""}]
+    ].
+
 content_length_multi_valued_test() ->
     ?assertEqual(
         {error, content_length_mismatch},

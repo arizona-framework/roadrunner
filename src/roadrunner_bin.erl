@@ -9,7 +9,7 @@
 %% on bytes, with no protocol semantics. Don't put non-binary helpers
 %% here — give them their own module.
 
--export([ascii_lowercase/1, trim_ows/1, trim_trailing_ows/1]).
+-export([ascii_lowercase/1, digits_to_integer/1, trim_ows/1, trim_trailing_ows/1]).
 
 -doc """
 Fast ASCII-only lowercase. Bytes in `[A-Z]` are mapped to `[a-z]`;
@@ -144,3 +144,24 @@ trim_trailing_ows(B) ->
         _ ->
             B
     end.
+
+-doc """
+Parse a `1*DIGIT` field (RFC 9110 §5.6.1 grammar, as used by
+`Content-Length` and byte ranges) into a non-negative integer.
+
+Rejects a leading `+` or `-`, which `binary_to_integer/1` alone
+accepts: `+5` and `-0` are not valid `Content-Length` values, and a
+server that reads them while an upstream proxy does not is a request
+smuggling risk. A sign can only appear as the first byte, so checking
+that byte is enough; `binary_to_integer/1` rejects every other
+non-digit.
+""".
+-spec digits_to_integer(binary()) -> {ok, non_neg_integer()} | error.
+digits_to_integer(<<C, _/binary>> = Bin) when C >= $0, C =< $9 ->
+    try binary_to_integer(Bin) of
+        N -> {ok, N}
+    catch
+        error:badarg -> error
+    end;
+digits_to_integer(_) ->
+    error.

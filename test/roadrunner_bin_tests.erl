@@ -55,3 +55,21 @@ ascii_lowercase_only_uppercase_test() ->
 
 ascii_lowercase_punctuation_test() ->
     ?assertEqual(~"key=value", roadrunner_bin:ascii_lowercase(~"key=value")).
+
+digits_to_integer_test() ->
+    [
+        ?assertEqual(Expected, roadrunner_bin:digits_to_integer(In))
+     || {In, Expected} <- [
+            {~"0", {ok, 0}},
+            {~"007", {ok, 7}},
+            {~"1048576", {ok, 1048576}},
+            {~"123456789012345678901234", {ok, 123456789012345678901234}},
+            {~"", error},
+            {~"+5", error},
+            {~"-0", error},
+            {~" 5", error},
+            {~"5 ", error},
+            {~"5x", error},
+            {~"abc", error}
+        ]
+    ].
