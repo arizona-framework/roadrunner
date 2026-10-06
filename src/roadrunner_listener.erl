@@ -239,43 +239,33 @@ Optional middleware and timing knobs (durations in milliseconds):
   (`true` default; `false` trades drain notification for a little
   less per-conn work on short-lived workloads).
 - `hibernate_after` — when set, idle conns hibernate after this
-  many milliseconds of main-loop idle time.
+  many milliseconds of main-loop idle time, which sweeps and shrinks
+  the conn's heap. Pairs with `handler_spawn` below for a pool of
+  mostly-idle connections; waking a hibernated conn is charged to the
+  request that wakes it.
 - `handler_spawn` — spawn config for every handler-running process (the
   connection process and HTTP/2/3 stream workers) as a nested map:
   `opts` (`spawn_opt` / `proc_lib` options, default
-  `[{fullsweep_after, 0}]` so the per-conn response heap is reclaimed
-  instead of hoarding it as old-gen garbage across keep-alive
-  requests) and `start_timeout` (init-ack deadline, default
-  `infinity`). `opts` merges over the defaults per option key, so
+  `[{fullsweep_after, 0}]`) and `start_timeout` (init-ack deadline,
+  default `infinity`). `opts` merges over the defaults per option key, so
   setting one option keeps the rest — asking for a heap hint does not
   silently change the GC policy.
 
-  `fullsweep_after, 0` makes every collection a full sweep, which is
-  what keeps the heap flat — and it is not free on handlers that
-  allocate heavily. Measured on a JSON route building a large transient
-  iolist per request, against the emulator's generational default at
-  the same CPU: throughput 51k vs 58k req/s and mean latency 3.25 ms vs
-  2.63 ms, for 189 MB vs 361 MB of RSS. Bounded memory is the safer
-  default for a server, so that is the trade taken here; a service that
-  would rather spend the memory names `fullsweep_after` itself to
-  override it — an empty list will not do, since `opts` merges. Use
-  `[{fullsweep_after, 65535}]` for the emulator's usual value, or
+  The default makes every collection a full sweep, so a connection that
+  served a burst and went quiet holds far less heap than under the
+  emulator's generational policy. That matters most for a pool of
+  mostly-idle keep-alive connections, and it costs some throughput on
+  handlers that allocate heavily. To take the emulator's generational
+  policy instead, name `fullsweep_after` yourself (an empty list will
+  not do, since `opts` merges): `[{fullsweep_after, 65535}]` for the
+  emulator's usual value, or
   `[{fullsweep_after, element(2, erlang:system_info(fullsweep_after))}]`
-  to follow whatever this node is set to, which `ERL_FULLSWEEP_AFTER`
-  can move.
-
-  The choice is effectively binary — an intermediate sweep interval buys
-  no middle ground. Values of 5, 10 and 20 all measured within noise of
-  the generational default on *both* axes (≈60k req/s, ≈340 MB) on that
-  same route, because the refc-binary garbage driving the heap piles up
-  between full sweeps whatever the interval between them is. Sweep every
-  time or effectively never.
-
-  For the lowest *resident* memory you can also add
-  `+MHacul 0 +MBacul 0` to `vm.args` to return freed allocator carriers
-  to the OS, but that is a tradeoff, not a free win: it raises
-  allocator↔OS traffic and can hurt throughput at high core counts, so
-  measure it for your workload rather than enabling it blindly.
+  to follow whatever this node is set to, which `ERL_FULLSWEEP_AFTER` can
+  move. Pair it with `hibernate_after` unless every connection stays
+  busy, since idle connections otherwise keep their grown heaps. The
+  intermediate values measured (5, 10 and 20) bought no middle ground.
+  The measurements behind all of this are in
+  [Resource limits](resource_limits.md).
 - `protocols` — list of `t:protocol_entry/0`. Default `[http1]`.
   On TLS this drives `alpn_preferred_protocols` automatically.
 - `tls` — `[ssl:tls_server_option()]` for HTTPS. Empty / absent
@@ -378,20 +368,16 @@ ops-tuning rationale.
     %% per-connection heap that grows building a response (e.g. a JSON
     %% encoder's transient iolist) instead of hoarding it as old-gen garbage
     %% across keep-alive requests — at high connection counts the difference
-    %% between hundreds of MB and a few GB of resident memory. Free on
-    %% allocation-heavy handlers; ~3-4% on trivial passthrough handlers, so
-    %% pass `{fullsweep_after, 65535}` to restore the BEAM default. Also useful
+    %% between hundreds of MB and a few GB of resident memory. Pass
+    %% `{fullsweep_after, 65535}` to restore the BEAM default, paired with
+    %% `hibernate_after` for pools of mostly-idle conns. Also useful
     %% here: `{max_heap_size, _}` (OOM/DoS cap), `{message_queue_data,
     %% off_heap}`, `{min_bin_vheap_size, _}`. `link`/`monitor` are rejected —
     %% roadrunner owns process linkage. `start_timeout` is the `proc_lib:start`
     %% `Time`: how long to wait for a started process to ack init before
     %% killing it with `{error, timeout}` (default `infinity`); it applies to
     %% the connection process and the WebSocket session (the fire-and-forget
-    %% HTTP/3 conn and stream-worker spawns have no init handshake). For lower
-    %% OS-resident memory `+MHacul 0 +MBacul 0` in `vm.args` returns freed
-    %% allocator carriers to the OS, but it trades throughput for RSS (more
-    %% allocator↔OS traffic, costly at high core counts) — measure it, don't
-    %% enable it blindly.
+    %% HTTP/3 conn and stream-worker spawns have no init handshake).
     handler_spawn => #{
         opts => [proc_lib:start_spawn_option()],
         start_timeout => timeout()

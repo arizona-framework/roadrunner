@@ -272,18 +272,15 @@ handler-running process, defaulting to `[{fullsweep_after, 0}]`.
 Remaining polish:
 - a named convenience opt (e.g. a top-level `max_heap_size`) if the
   raw `opts` passthrough proves clumsy in practice
-- characterize the `+MHacul 0 +MBacul 0` allocator-carrier-release
-  tradeoff before recommending it anywhere: it lowers resident memory
-  but raises allocator↔OS traffic and can hurt throughput at high core
-  counts, so it is workload-dependent, not a blanket win (the
-  `handler_spawn` doc now says as much)
-- revisit whether `fullsweep_after, 0` should stay the default: it is
-  free on allocation-heavy handlers but costs ~3-4% on trivial
-  passthrough, so an adaptive policy (or a different default) may be
-  better once measured on more workloads
 - verify the per-process memory win extends to the HTTP/2 and HTTP/3
   stream-worker processes under load (validated so far on the h1
   connection process)
+- find what costs busy connections 2-7.5% throughput once
+  `hibernate_after` is set on top of the default GC policy (measured
+  with `scripts/idle_pool.escript`, 50 connections flat out, three
+  interleaved rounds); one candidate, not yet confirmed, is the
+  `erlang:send_after` / `cancel_timer` pair the hibernate receive path
+  arms on every recv
 
 **Why deferred:** the passthrough plus default already capture a
 substantial, workload-dependent process-memory reduction on
