@@ -720,11 +720,13 @@ parse_http_date(<<
     " GMT"
 >>) ->
     try
-        Day = list_to_integer([D1, D2]),
-        Year = list_to_integer([Y1, Y2, Y3, Y4]),
-        Hour = list_to_integer([H1, H2]),
-        Minute = list_to_integer([Mi1, Mi2]),
-        Second = list_to_integer([S1, S2]),
+        %% Every field is decimal digits only; a `+` or `-` sign makes
+        %% the date invalid, so the header is ignored (RFC 9110 §13.1.3).
+        {ok, Day} = roadrunner_bin:digits_to_integer(<<D1, D2>>),
+        {ok, Year} = roadrunner_bin:digits_to_integer(<<Y1, Y2, Y3, Y4>>),
+        {ok, Hour} = roadrunner_bin:digits_to_integer(<<H1, H2>>),
+        {ok, Minute} = roadrunner_bin:digits_to_integer(<<Mi1, Mi2>>),
+        {ok, Second} = roadrunner_bin:digits_to_integer(<<S1, S2>>),
         Month = month_number(Mon),
         DateTime = {{Year, Month, Day}, {Hour, Minute, Second}},
         Epoch = calendar:datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}}),

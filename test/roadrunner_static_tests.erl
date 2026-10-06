@@ -207,6 +207,16 @@ static_test_() ->
                 ),
                 ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
             end},
+            {"If-Modified-Since with a signed field is ignored", fun() ->
+                %% `+6` is not a decimal day: the whole date is invalid, so
+                %% the far-future date must not turn the reply into a 304.
+                Reply = http_get_with(
+                    Port,
+                    ~"/static/hello.html",
+                    [{~"If-Modified-Since", ~"Fri, +6 Nov 2099 08:49:37 GMT"}]
+                ),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
+            end},
             {"malformed If-Modified-Since is ignored", fun() ->
                 Reply = http_get_with(
                     Port,
