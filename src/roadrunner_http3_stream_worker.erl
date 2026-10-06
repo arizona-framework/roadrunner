@@ -212,27 +212,22 @@ emit_checked(Conn, StreamId, Headers, Emit) ->
     end.
 
 %% One pass over the response headers running the RFC 9110 §5.5 CR/LF/NUL
-%% field-byte check (the shared compiled pattern, fetched once), returning
+%% field-byte check (`roadrunner_http:is_header_safe/1`), returning
 %% the offending kind (never the raw bytes) on the first unsafe field.
 %% Non-crashing because `emit_checked/4` runs in the `try ... of` body,
 %% whose exceptions the `try` does NOT catch.
 -spec validate_response_headers(roadrunner_http:headers()) ->
     ok | {unsafe, name | value}.
-validate_response_headers(Headers) ->
-    validate_response_headers(Headers, roadrunner_http:unsafe_bytes_pattern()).
-
--spec validate_response_headers(roadrunner_http:headers(), binary:cp()) ->
-    ok | {unsafe, name | value}.
-validate_response_headers([], _UnsafeCp) ->
+validate_response_headers([]) ->
     ok;
-validate_response_headers([{Name, Value} | Rest], UnsafeCp) ->
-    case binary:match(Name, UnsafeCp) of
-        nomatch ->
-            case binary:match(Value, UnsafeCp) of
-                nomatch -> validate_response_headers(Rest, UnsafeCp);
-                _ -> {unsafe, value}
+validate_response_headers([{Name, Value} | Rest]) ->
+    case roadrunner_http:is_header_safe(Name) of
+        true ->
+            case roadrunner_http:is_header_safe(Value) of
+                true -> validate_response_headers(Rest);
+                false -> {unsafe, value}
             end;
-        _ ->
+        false ->
             {unsafe, name}
     end.
 

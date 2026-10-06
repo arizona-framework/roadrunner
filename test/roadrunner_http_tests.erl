@@ -107,3 +107,32 @@ drop_unset_all_false_returns_empty_test() ->
 
 drop_unset_empty_returns_empty_test() ->
     ?assertEqual([], roadrunner_http:drop_unset([])).
+
+check_header_safe_every_byte_at_every_position_test() ->
+    %% Every byte value at every position of a 17-byte value: each SWAR
+    %% lane of both 7-byte words and the tail. Only CR, LF and NUL fail;
+    %% tab and the other low control bytes pass.
+    Fill = binary:copy(~"a", 17),
+    [
+        begin
+            <<Pre:Pos/binary, _, Post/binary>> = Fill,
+            Value = <<Pre/binary, B, Post/binary>>,
+            case B of
+                Unsafe when Unsafe =:= 0; Unsafe =:= $\n; Unsafe =:= $\r ->
+                    ?assertError(
+                        {header_injection, value, Value},
+                        roadrunner_http:check_header_safe(Value, value)
+                    );
+                _ ->
+                    ?assertEqual(ok, roadrunner_http:check_header_safe(Value, value))
+            end
+        end
+     || Pos <- lists:seq(0, 16), B <- lists:seq(0, 255)
+    ].
+
+check_header_safe_low_byte_then_cr_in_same_word_test() ->
+    %% A tab sends the word to the exact check, which must still find the
+    %% CR later in the same word.
+    ?assertError(
+        {header_injection, value, _}, roadrunner_http:check_header_safe(~"a\tbc\rdefghij", value)
+    ).
