@@ -2396,3 +2396,16 @@ request_slot_release_many_test() ->
     ?assertEqual(4, counters:get(Ref, 1)),
     ?assertEqual(ok, roadrunner_conn:release_request_slots(10, Ref, 4, refuse)),
     ?assertEqual(0, counters:get(Ref, 1)).
+
+generate_request_id_matches_lowercase_hex_test() ->
+    %% Every byte value passes through the hex-pair table once.
+    Bytes = <<<<B>> || B <- lists:seq(0, 255)>>,
+    Ids = request_ids(Bytes),
+    ?assertEqual(32, length(Ids)),
+    ?assertEqual(binary:encode_hex(Bytes, lowercase), iolist_to_binary(Ids)).
+
+request_ids(<<>>) ->
+    [];
+request_ids(Buf) ->
+    {Id, Rest} = roadrunner_conn:generate_request_id(Buf),
+    [Id | request_ids(Rest)].
