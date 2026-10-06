@@ -132,7 +132,7 @@ per-request header re-lowercasing on the dispatch hot path.
     expects_continue := boolean(),
     connection_lower := binary(),
     content_length := none | {ok, non_neg_integer()} | {error, bad_content_length},
-    has_host := boolean()
+    has_host := boolean() | multiple
 }.
 
 -doc """

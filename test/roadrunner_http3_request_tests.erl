@@ -154,6 +154,13 @@ content_length_signed_test() ->
      || {V, Body} <- [{~"+5", ~"abcde"}, {~"-0", ~""}]
     ].
 
+repeated_host_is_rejected_test() ->
+    ?assertEqual(
+        {error, duplicate_host},
+        from(base() ++ [{~":authority", ~"a"}, {~"host", ~"a"}, {~"host", ~"evil"}])
+    ),
+    ?assertEqual({error, duplicate_host}, from(base() ++ [{~"host", ~"a"}, {~"host", ~"evil"}])).
+
 content_length_multi_valued_test() ->
     ?assertEqual(
         {error, content_length_mismatch},

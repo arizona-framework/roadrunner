@@ -187,6 +187,22 @@ te_only_trailers_allowed_test() ->
 
 %% --- authority (RFC 9113 §8.3.1) ---
 
+repeated_host_is_rejected_test() ->
+    %% A second `host` could name another entity than the one checked
+    %% against `:authority` and still reach the handler.
+    Build = fun(Extra) ->
+        roadrunner_http2_request:from_headers(
+            [{~":method", ~"GET"}, {~":scheme", ~"https"}, {~":path", ~"/"} | Extra],
+            <<>>,
+            request_context()
+        )
+    end,
+    ?assertEqual(
+        {error, duplicate_host},
+        Build([{~":authority", ~"a"}, {~"host", ~"a"}, {~"host", ~"evil"}])
+    ),
+    ?assertEqual({error, duplicate_host}, Build([{~"host", ~"a"}, {~"host", ~"evil"}])).
+
 authority_rules_test() ->
     %% An https request MUST carry `:authority` or `host`, neither empty,
     %% and both equal when both are present.

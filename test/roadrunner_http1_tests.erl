@@ -653,6 +653,20 @@ request_http10_no_host_accepted_test() ->
         roadrunner_http1:parse_request(~"GET / HTTP/1.0\r\n\r\n")
     ).
 
+request_repeated_host_returns_error_test() ->
+    %% RFC 9112 §3.2: more than one Host field line is a 400, on any
+    %% version, even when the values agree.
+    [
+        ?assertEqual(
+            {error, duplicate_host},
+            roadrunner_http1:parse_request(
+                <<"GET / HTTP/", V/binary, "\r\nHost: a\r\nX: 1\r\nHost: ", Second/binary,
+                    "\r\n\r\n">>
+            )
+        )
+     || V <- [~"1.1", ~"1.0"], Second <- [~"a", ~"evil"]
+    ].
+
 request_http11_missing_host_returns_error_test() ->
     %% RFC 9112 §3.2 / 7230 §5.4: HTTP/1.1 requests MUST include a
     %% Host header. Absent → 400 (request-smuggling mitigation +

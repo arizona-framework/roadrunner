@@ -44,6 +44,7 @@
     | uppercase_field_name
     | content_length_mismatch
     | missing_authority
+    | duplicate_host
     | empty_authority
     | authority_mismatch.
 
