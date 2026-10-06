@@ -109,14 +109,15 @@ parse_request_line_p(<<"\r\n", Rest/binary>>, MaxReqLine) ->
 parse_request_line_p(Bin, MaxReqLine) when is_binary(Bin) ->
     request_line(Bin, MaxReqLine).
 
-%% One pass over the usual request line: a standard method and its
-%% space matched as a literal, the target scanned 7 bytes at a time up
-%% to the space (splitting the path at `?`), then `HTTP/1.x\r\n` matched
-%% directly. That replaces the LF search, the `binary:split/3` on
-%% spaces and the separate method/target/version checks (a 1-header GET
-%% parses in about half the time). Anything else (an extension method,
-%% a partial line, any error, a line over the limit) returns `slow` and
-%% takes `do_parse_request_line/4`, which decides it exactly as before.
+%% One pass over the request line: a standard method and its space
+%% matched as a literal (an extension method walked as uppercase letters
+%% to its space), the target scanned 7 bytes at a time up to the space
+%% (splitting the path at `?`), then `HTTP/1.x\r\n` matched directly.
+%% That replaces the LF search, the `binary:split/3` on spaces and the
+%% separate method/target/version checks (a 1-header GET parses in about
+%% half the time). Anything else (a partial line, any error, a line over
+%% the limit) returns `slow` and takes `do_parse_request_line/4`, which
+%% only tells those apart.
 -spec request_line(binary(), pos_integer()) ->
     {ok, Method :: binary(), Target :: binary(), Path :: binary(), version(), Rest :: binary()}
     | {more, undefined}
@@ -140,10 +141,24 @@ fast_request_line(<<"DELETE ", T/binary>> = Bin, Max) -> fast_path(T, T, ~"DELET
 fast_request_line(<<"PATCH ", T/binary>> = Bin, Max) -> fast_path(T, T, ~"PATCH", Bin, Max);
 fast_request_line(<<"HEAD ", T/binary>> = Bin, Max) -> fast_path(T, T, ~"HEAD", Bin, Max);
 fast_request_line(<<"OPTIONS ", T/binary>> = Bin, Max) -> fast_path(T, T, ~"OPTIONS", Bin, Max);
-fast_request_line(_Bin, _Max) -> slow.
+fast_request_line(Bin, Max) -> fast_method(Bin, Bin, Max).
+
+%% An extension method: uppercase ASCII letters up to the space (see
+%% `validate_method/1` for why not the full token grammar).
+-spec fast_method(binary(), binary(), pos_integer()) ->
+    {ok, binary(), binary(), binary(), version(), binary()} | slow.
+fast_method(<<C, R/binary>>, Bin, Max) when C >= $A, C =< $Z ->
+    fast_method(R, Bin, Max);
+fast_method(<<$\s, T/binary>>, Bin, Max) ->
+    case byte_size(Bin) - byte_size(T) - 1 of
+        0 -> slow;
+        Len -> fast_path(T, T, binary:part(Bin, 0, Len), Bin, Max)
+    end;
+fast_method(_Cur, _Bin, _Max) ->
+    slow.
 
 %% The target's path, 7 bytes per step while a word holds no byte <= 0x20,
-%% no 0x7F and no `?` (the `validate_path/2` test); `T` is the target's
+%% no 0x7F and no `?` (RFC 9110 §5.6.2 target bytes); `T` is the target's
 %% start, `Bin` the line's.
 -spec fast_path(binary(), binary(), binary(), binary(), pos_integer()) ->
     {ok, binary(), binary(), binary(), version(), binary()} | slow.
@@ -212,10 +227,11 @@ fast_version(<<"HTTP/1.0\r\n", Rest/binary>>, Method, Target, Path, Bin, Max) wh
 fast_version(_Cur, _Method, _Target, _Path, _Bin, _Max) ->
     slow.
 
+%% Every complete request line within `MaxReqLine` that is valid takes
+%% `fast_request_line/2`, so what reaches here is a line that is still
+%% incomplete, over the limit, or invalid; this only tells them apart.
 -spec do_parse_request_line(binary(), binary:cp(), binary:cp(), pos_integer()) ->
-    {ok, Method :: binary(), Target :: binary(), Path :: binary(), version(), Rest :: binary()}
-    | {more, undefined}
-    | {error, bad_request_line | bad_version | request_line_too_long}.
+    {more, undefined} | {error, bad_request_line | bad_version | request_line_too_long}.
 do_parse_request_line(Bin, LfCp, SpaceCp, MaxReqLine) ->
     case binary:match(Bin, LfCp) of
         nomatch when byte_size(Bin) > MaxReqLine ->
@@ -225,58 +241,36 @@ do_parse_request_line(Bin, LfCp, SpaceCp, MaxReqLine) ->
         {0, 1} ->
             {error, bad_request_line};
         {LfPos, 1} ->
-            extract_line(Bin, LfPos, SpaceCp, MaxReqLine)
-    end.
-
--spec extract_line(binary(), pos_integer(), binary:cp(), pos_integer()) ->
-    {ok, binary(), binary(), binary(), version(), binary()}
-    | {error, bad_request_line | bad_version | request_line_too_long}.
-extract_line(Bin, LfPos, SpaceCp, MaxReqLine) ->
-    LineLen = LfPos - 1,
-    case Bin of
-        <<Line:LineLen/binary, "\r\n", Rest/binary>> when LineLen =< MaxReqLine ->
-            parse_line(Line, Rest, SpaceCp);
-        <<_:LineLen/binary, "\r\n", _/binary>> ->
-            {error, request_line_too_long};
-        _ ->
-            {error, bad_request_line}
-    end.
-
--spec parse_line(binary(), binary(), binary:cp()) ->
-    {ok, binary(), binary(), binary(), version(), binary()}
-    | {error, bad_request_line | bad_version}.
-parse_line(Line, Rest, SpaceCp) ->
-    case binary:split(Line, SpaceCp, [global]) of
-        [Method, Target, VersionBin] ->
-            classify(Method, Target, VersionBin, Rest);
-        _ ->
-            {error, bad_request_line}
-    end.
-
--spec classify(binary(), binary(), binary(), binary()) ->
-    {ok, binary(), binary(), binary(), version(), binary()}
-    | {error, bad_request_line | bad_version}.
-classify(Method, Target, VersionBin, Rest) ->
-    case validate_method(Method) of
-        ok ->
-            case validate_target(Target) of
-                {ok, Path} ->
-                    case parse_version(VersionBin) of
-                        {ok, V} -> {ok, Method, Target, Path, V, Rest};
-                        error -> {error, bad_version}
-                    end;
-                error ->
+            LineLen = LfPos - 1,
+            case Bin of
+                <<Line:LineLen/binary, "\r\n", _/binary>> when LineLen =< MaxReqLine ->
+                    {error, line_error(Line, SpaceCp)};
+                <<_:LineLen/binary, "\r\n", _/binary>> ->
+                    {error, request_line_too_long};
+                _ ->
                     {error, bad_request_line}
-            end;
-        error ->
-            {error, bad_request_line}
+            end
     end.
 
-%% Standard methods are matched as literals by `fast_request_line/2`, so
-%% this sees extension methods and lines that are invalid anyway. Custom
-%% methods are uppercase ASCII letters only; full RFC 9110 §5.6.2 token
-%% grammar (digits, lowercase, `-`, etc.) is intentionally not accepted
-%% — extension methods like WebDAV's MKCOL or UPnP's M-SEARCH would need it.
+%% A complete, invalid request line. With a valid method and target the
+%% fast path would have taken it, had the version been `HTTP/1.1` or
+%% `HTTP/1.0`, so the version is what is wrong.
+-spec line_error(binary(), binary:cp()) -> bad_request_line | bad_version.
+line_error(Line, SpaceCp) ->
+    case binary:split(Line, SpaceCp, [global]) of
+        [Method, Target, _Version] ->
+            case validate_method(Method) =:= ok andalso valid_target(Target) of
+                true -> bad_version;
+                false -> bad_request_line
+            end;
+        _ ->
+            bad_request_line
+    end.
+
+%% Custom methods are uppercase ASCII letters only; full RFC 9110 §5.6.2
+%% token grammar (digits, lowercase, `-`, etc.) is intentionally not
+%% accepted — extension methods like WebDAV's MKCOL or UPnP's M-SEARCH
+%% would need it.
 -spec validate_method(binary()) -> ok | error.
 validate_method(<<>>) -> error;
 validate_method(M) -> validate_method_chars(M).
@@ -289,82 +283,16 @@ validate_method_chars(<<C, Rest/binary>>) when C >= $A, C =< $Z ->
 validate_method_chars(_) ->
     error.
 
-%% Validate the request-target (RFC 9110 §5.6.2: reject CTLs, SP, DEL) and, in
-%% the SAME byte-walk, slice off the `?query` so the caller gets the `?`-free
-%% path for free. The first `?` switches to query validation (later `?`s are
-%% valid query bytes); the path prefix is derived from a `byte_size` diff (no
-%% per-byte position counter). `Path` shares the target binary when there is no
-%% query, or is a sub-binary slice when there is — neither copies.
--spec validate_target(binary()) -> {ok, Path :: binary()} | error.
-validate_target(<<>>) -> error;
-validate_target(T) -> validate_path(T, T).
+%% A request-target is valid when non-empty with no CTL, SP or DEL (RFC
+%% 9110 §5.6.2); path and query share that byte class.
+-spec valid_target(binary()) -> boolean().
+valid_target(<<>>) -> false;
+valid_target(Target) -> valid_target_bytes(Target).
 
-%% Both walks take 7 bytes per step (see `roadrunner_swar.hrl`) while a
-%% word holds no byte <= 0x20, no 0x7F and (in the path) no `?`. The byte
-%% walk finishes from the first word that flags, which in the
-%% path is almost always the `?` (handing off to the query's fast path)
-%% and in the query an error. Each walk repeats its byte clauses after
-%% the word clause so a short target (`/`) or a < 7 byte tail costs no
-%% extra call: without them `/` measured ~10% slower than before.
--spec validate_path(binary(), binary()) -> {ok, binary()} | error.
-validate_path(<<X:56, R/binary>> = Bin, Target) ->
-    Del = X bxor ?SWAR_BYTES(16#7F),
-    Qm = X bxor ?SWAR_BYTES($?),
-    case ?SWAR_HIGH(?SWAR_BELOW(X, 16#21) bor ?SWAR_ZERO(Del) bor ?SWAR_ZERO(Qm)) of
-        0 -> validate_path(R, Target);
-        _ -> validate_path_byte(Bin, Target)
-    end;
-validate_path(<<>>, Target) ->
-    {ok, Target};
-validate_path(<<$?, Rest/binary>>, Target) ->
-    case validate_query(Rest) of
-        ok -> {ok, binary:part(Target, 0, byte_size(Target) - byte_size(Rest) - 1)};
-        error -> error
-    end;
-validate_path(<<C, Rest/binary>>, Target) when C > 16#20, C =/= 16#7F ->
-    validate_path_byte(Rest, Target);
-validate_path(_, _) ->
-    error.
-
--spec validate_path_byte(binary(), binary()) -> {ok, binary()} | error.
-validate_path_byte(<<>>, Target) ->
-    {ok, Target};
-validate_path_byte(<<$?, Rest/binary>>, Target) ->
-    case validate_query(Rest) of
-        ok -> {ok, binary:part(Target, 0, byte_size(Target) - byte_size(Rest) - 1)};
-        error -> error
-    end;
-validate_path_byte(<<C, Rest/binary>>, Target) when C > 16#20, C =/= 16#7F ->
-    validate_path_byte(Rest, Target);
-validate_path_byte(_, _) ->
-    error.
-
--spec validate_query(binary()) -> ok | error.
-validate_query(<<X:56, R/binary>> = Bin) ->
-    Del = X bxor ?SWAR_BYTES(16#7F),
-    case ?SWAR_HIGH(?SWAR_BELOW(X, 16#21) bor ?SWAR_ZERO(Del)) of
-        0 -> validate_query(R);
-        _ -> validate_query_byte(Bin)
-    end;
-validate_query(<<>>) ->
-    ok;
-validate_query(<<C, Rest/binary>>) when C > 16#20, C =/= 16#7F ->
-    validate_query_byte(Rest);
-validate_query(_) ->
-    error.
-
--spec validate_query_byte(binary()) -> ok | error.
-validate_query_byte(<<>>) ->
-    ok;
-validate_query_byte(<<C, Rest/binary>>) when C > 16#20, C =/= 16#7F ->
-    validate_query_byte(Rest);
-validate_query_byte(_) ->
-    error.
-
--spec parse_version(binary()) -> {ok, version()} | error.
-parse_version(~"HTTP/1.1") -> {ok, {1, 1}};
-parse_version(~"HTTP/1.0") -> {ok, {1, 0}};
-parse_version(_) -> error.
+-spec valid_target_bytes(binary()) -> boolean().
+valid_target_bytes(<<C, Rest/binary>>) when C > 16#20, C =/= 16#7F -> valid_target_bytes(Rest);
+valid_target_bytes(<<>>) -> true;
+valid_target_bytes(_) -> false.
 
 -doc """
 Parse a single HTTP/1.1 header line.
