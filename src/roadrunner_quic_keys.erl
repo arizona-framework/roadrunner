@@ -17,12 +17,13 @@
     initial_client/1,
     initial_server/1,
     traffic_keys/1,
-    update/1
+    update/1,
+    for_connection/1
 ]).
 
 -export_type([keys/0]).
 
--type keys() :: #{key := binary(), iv := binary(), hp := binary()}.
+-type keys() :: #{key := binary(), iv := binary(), hp := roadrunner_quic_aead:hp()}.
 
 %% RFC 9001 §5.2: the QUIC v1 Initial salt,
 %% 0x38762cf7f55934b34d179ae6a4c80cadccbb7f0a.
@@ -83,3 +84,15 @@ update.
 update(Secret) ->
     UpdatedSecret = roadrunner_quic_hkdf:expand_label(Secret, ~"quic ku", <<>>, 32),
     {UpdatedSecret, traffic_keys(UpdatedSecret)}.
+
+-doc """
+Prepare derived keys for the connection process that will use them:
+the header-protection key becomes an initialized AES-128-ECB state, so
+each packet's mask is one `crypto_update/2` instead of a fresh key
+setup (RFC 9001 §5.4.3: ECB has no state between blocks). The state is
+a resource of the calling process, so call this where the keys are
+installed and use them only there.
+""".
+-spec for_connection(keys()) -> keys().
+for_connection(#{hp := HP} = Keys) when is_binary(HP) ->
+    Keys#{hp := crypto:crypto_init(aes_128_ecb, HP, true)}.

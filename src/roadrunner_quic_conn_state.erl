@@ -265,8 +265,16 @@ new(
         peer_scid = PeerSCID,
         peer = Peer,
         tls = Tls,
-        recv_keys = #{initial => roadrunner_quic_keys:initial_client(DCID)},
-        send_keys = #{initial => roadrunner_quic_keys:initial_server(DCID)},
+        recv_keys = #{
+            initial => roadrunner_quic_keys:for_connection(
+                roadrunner_quic_keys:initial_client(DCID)
+            )
+        },
+        send_keys = #{
+            initial => roadrunner_quic_keys:for_connection(
+                roadrunner_quic_keys:initial_server(DCID)
+            )
+        },
         spaces = #{initial => new_space(), handshake => new_space()},
         amp = roadrunner_quic_amp:new(),
         owner = undefined,
@@ -813,9 +821,13 @@ install_keys(Installs, State) ->
 
 -spec install_key(roadrunner_quic_tls_server:install(), t()) -> t().
 install_key({Level, server, Keys}, #state{send_keys = SendKeys} = State) ->
-    ensure_space(Level, State#state{send_keys = SendKeys#{Level => Keys}});
+    ensure_space(Level, State#state{
+        send_keys = SendKeys#{Level => roadrunner_quic_keys:for_connection(Keys)}
+    });
 install_key({Level, client, Keys}, #state{recv_keys = RecvKeys} = State) ->
-    ensure_space(Level, State#state{recv_keys = RecvKeys#{Level => Keys}}).
+    ensure_space(Level, State#state{
+        recv_keys = RecvKeys#{Level => roadrunner_quic_keys:for_connection(Keys)}
+    }).
 
 -spec ensure_space(level(), t()) -> t().
 ensure_space(Level, #state{spaces = Spaces} = State) ->
