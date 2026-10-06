@@ -71,9 +71,16 @@ do_send(ConnPid, StreamId, Data, fin) ->
     put(?FIN_KEY, true),
     ok;
 do_send(ConnPid, StreamId, Data, {fin, Trailers}) ->
+    %% Trailers go out after the status, so an injected one cannot become
+    %% a 500. One pass crashes on the RFC 9110 §5.5 CR/LF/NUL check here in
+    %% the worker (so the conn resets just this stream and the malformed
+    %% bytes never reach the client) and strips the connection-specific
+    %% fields RFC 9113 §8.2.2 forbids. Run it before any of the body goes
+    %% out.
+    WireTrailers = roadrunner_http:strip_connection_specific_fields_safe(Trailers),
     iolist_size(Data) > 0 andalso
         roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, false),
-    ok = sync_send_trailers(ConnPid, StreamId, Trailers),
+    ok = sync_send_trailers(ConnPid, StreamId, WireTrailers),
     put(?FIN_KEY, true),
     ok.
 
