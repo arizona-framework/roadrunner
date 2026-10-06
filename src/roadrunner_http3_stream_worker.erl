@@ -30,6 +30,10 @@
 %% Exported for `roadrunner_conn_loop_http3` to emit a buffered
 %% response (e.g. 413) directly, without spawning a worker.
 -export([send_buffered/5]).
+%% `roadrunner_stream_worker` callback.
+-export([emit_handler_response/4]).
+
+-behaviour(roadrunner_stream_worker).
 %% Exported for eunit branch coverage of the stop-on-send-error path.
 -export([sendfile_loop/3]).
 
@@ -65,83 +69,9 @@ init(Conn, StreamId, Req, Dispatch) ->
     %% middleware/handlers is auto-correlated by `request_id` — the
     %% handler runs in this worker, not on the conn loop.
     ok = roadrunner_conn:set_request_logger_metadata(Req),
-    run_handler(Conn, StreamId, Req, Dispatch),
-    ok.
+    roadrunner_stream_worker:run(?MODULE, h3, Conn, StreamId, Req, Dispatch).
 
--spec run_handler(pid(), non_neg_integer(), roadrunner_req:request(), roadrunner_conn:dispatch()) ->
-    ok.
-run_handler(Conn, StreamId, Req, Dispatch) ->
-    %% `dispatch` is set by listener init and always present; the
-    %% matched route's `Pipeline` is the pre-composed `next()` fun
-    %% built once at compile / `reload_routes/2` time.
-    Metadata = roadrunner_telemetry:request_metadata(Req),
-    ReqStart = roadrunner_telemetry:request_start(Metadata),
-    case roadrunner_conn:resolve_handler(Dispatch, Req) of
-        {ok, Handler, Bindings, Pipeline, _State} ->
-            invoke(
-                Conn, StreamId, Handler, Pipeline, Req#{bindings => Bindings}, Metadata, ReqStart
-            );
-        {method_not_allowed, Allowed} ->
-            %% Path matched but no route on it answers this method: 405 plus the
-            %% `Allow` union, decided before any pipeline runs because the
-            %% method gate is a routing decision rather than handler work.
-            send_buffered(
-                Conn,
-                StreamId,
-                405,
-                [
-                    {~"content-type", ~"text/plain"},
-                    {~"allow", roadrunner_conn:allow_header_value(Allowed)}
-                ],
-                ~"Method Not Allowed"
-            ),
-            ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, 405, buffered);
-        not_found ->
-            send_buffered(Conn, StreamId, 404, [{~"content-type", ~"text/plain"}], ~"Not Found"),
-            ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, 404, buffered)
-    end.
-
--spec invoke(
-    pid(),
-    non_neg_integer(),
-    module(),
-    roadrunner_middleware:next(),
-    roadrunner_req:request(),
-    roadrunner_telemetry:metadata(),
-    integer()
-) -> ok.
-invoke(Conn, StreamId, Handler, Pipeline, #{method := Method} = Req, Metadata, ReqStart) ->
-    try Pipeline(Req) of
-        {Response, _Req2} ->
-            %% `emit_handler_response/4` returns the status actually sent
-            %% (which differs from the handler's when we override a bad
-            %% response with 500 / 501) so telemetry reports the truth.
-            %% It runs in the `of` body, whose exceptions a `try` does
-            %% NOT catch — so it must not raise; it sends the response.
-            %% RFC 9110 §9.3.2: a HEAD response carries no content, so
-            %% emit the body-stripped form; telemetry keeps the handler's
-            %% original shape (`response_kind/1` below).
-            Status = emit_handler_response(
-                Conn, StreamId, Handler, roadrunner_conn:head_response(Response, Method)
-            ),
-            ok = roadrunner_telemetry:request_stop(
-                ReqStart, Metadata, Status, roadrunner_conn:response_kind(Response)
-            )
-    catch
-        Class:Reason:Stack ->
-            ok = roadrunner_telemetry:request_exception(ReqStart, Metadata, Class, Reason),
-            logger:error(#{
-                msg => "roadrunner h3 handler crashed",
-                handler => Handler,
-                class => Class,
-                reason => Reason,
-                stacktrace => Stack
-            }),
-            send_buffered(
-                Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
-            )
-    end.
-
+-doc false.
 -spec emit_handler_response(pid(), non_neg_integer(), module(), roadrunner_handler:response()) ->
     roadrunner_http:status().
 emit_handler_response(Conn, StreamId, _Handler, {Status, Headers, Body}) when
