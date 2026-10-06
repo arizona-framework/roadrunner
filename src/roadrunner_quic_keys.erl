@@ -94,9 +94,9 @@ the one direction it uses them for: `seal` for the server's own packets,
 AES-128-ECB state, so each packet's mask is one `crypto_update/2`
 instead of a fresh key setup (RFC 9001 §5.4.3: ECB has no state between
 blocks). From OTP 28 the packet-protection key likewise becomes an
-AES-128-GCM sealing or opening state. The states are resources of the
-calling process, so call this where the keys are installed and use them
-only there.
+AES-128-GCM sealing or opening state. A state must not be used from two
+processes at once, so call this where the keys are installed and use
+them only in that process.
 """.
 -spec for_connection(keys(), seal | open) -> keys().
 for_connection(#{key := Key, hp := HP} = Keys, Direction) when is_binary(Key), is_binary(HP) ->

@@ -12,7 +12,7 @@
 %% The prefixed-integer codec (RFC 9204 §4.1.1) is byte-identical to HPACK's
 %% (RFC 7541 §5.1) and the string Huffman table is the shared RFC 7541
 %% Appendix B table, so encoding/decoding reuses
-%% `roadrunner_http2_hpack:encode_integer/3`+`decode_integer/2` and
+%% `roadrunner_http2_hpack:encode_integer/3`+`prefix_integer/3` and
 %% `roadrunner_http2_hpack_huffman:encode/1`+`decode/1` rather than
 %% duplicating them. The 99-entry static table (RFC 9204 Appendix A) is
 %% function-clause dispatch, mirroring `roadrunner_http2_hpack`'s static

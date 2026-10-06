@@ -624,7 +624,7 @@ early_validate_text(Data, Buf, Opts) ->
                             {frame, Header, Data#data{
                                 utf8_pending = NewPending,
                                 frame_validated = AlreadyValidated + ToValidate,
-                                unmasked_buf = append_bin(UnmaskedBuf, Unmasked)
+                                unmasked_buf = roadrunner_bin:append(UnmaskedBuf, Unmasked)
                             }};
                         invalid_utf8 ->
                             invalid_utf8
@@ -665,18 +665,7 @@ unmask_slice(Slice, <<MaskKey:32>>, Offset) ->
 
 -spec append_buffer(#data{}, binary()) -> #data{}.
 append_buffer(#data{buffer = Buf} = Data, Bytes) ->
-    Data#data{buffer = append_bin(Buf, Bytes)}.
-
-%% Append `New` onto `Acc`, returning `New` untouched when `Acc` is empty.
-%% The single-chunk hot path (a whole frame in one TCP read, the buffer
-%% and unmasked accumulator drained, no partial UTF-8 carried over) hits
-%% the empty case every time, skipping a full payload-sized copy per
-%% inbound frame. Returning the bare binary also lets the UTF-8 BIF take
-%% its fast binary path, which is measured well ahead of both a pre-concat
-%% copy and an iodata list (the BIF walks a list far slower).
--spec append_bin(binary(), binary()) -> binary().
-append_bin(<<>>, New) -> New;
-append_bin(Acc, New) -> <<Acc/binary, New/binary>>.
+    Data#data{buffer = roadrunner_bin:append(Buf, Bytes)}.
 
 %% Re-arm the active-once socket and receive the next message, hibernating
 %% first when a handler opted in (`Hibernate`). The hibernate continuation
@@ -886,7 +875,10 @@ validate_fin_fragment(binary, _Compressed, _Pending, _Bytes) ->
 validate_fin_fragment(text, true, _Pending, _Bytes) ->
     ok;
 validate_fin_fragment(text, false, Pending, Bytes) ->
-    case unicode:characters_to_binary(append_bin(Pending, Bytes), utf8, utf8) of
+    %% `roadrunner_bin:append/2` hands back the bare binary when nothing
+    %% is pending, which lets the UTF-8 BIF take its fast binary path
+    %% (measured well ahead of a pre-concat copy or an iodata list).
+    case unicode:characters_to_binary(roadrunner_bin:append(Pending, Bytes), utf8, utf8) of
         Bin when is_binary(Bin) -> ok;
         %% Trailing bytes that didn't form a complete sequence are
         %% invalid at FIN time per RFC 6455 §8.1.
@@ -964,7 +956,7 @@ validate_incremental(text, false, Pending, Bytes) ->
     %% Empty `Pending` (the common case) hands the validator the payload
     %% binary as-is — the BIF's fast binary path beats a pre-concat copy
     %% and an iodata list alike.
-    case unicode:characters_to_binary(append_bin(Pending, Bytes), utf8, utf8) of
+    case unicode:characters_to_binary(roadrunner_bin:append(Pending, Bytes), utf8, utf8) of
         Bin when is_binary(Bin) ->
             %% Fully-valid (no trailing incomplete sequence).
             {ok, <<>>};

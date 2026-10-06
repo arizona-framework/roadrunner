@@ -120,7 +120,8 @@
     | bad_integer
     | bad_string
     | bad_header_name
-    | premature_end_of_block.
+    | premature_end_of_block
+    | table_size_update_after_block.
 
 %% =============================================================================
 %% Constructors
@@ -409,11 +410,10 @@ encode_size_update(N) ->
 %% Integer codec (RFC 7541 §5.1)
 %% =============================================================================
 
-%% Decode an N-bit-prefix integer from a bitstring. Returns the
-%% integer plus the rest of the bitstring (which is byte-aligned
-%% afterwards if Rest is byte-aligned at start — the integer
-%% codec only emits/consumes whole bytes after the prefix).
--doc false.
+%% The continuation bytes of a prefixed integer whose prefix was all
+%% ones (`I` so far, `M` the next shift): 7 bits per byte, the high bit
+%% set on every byte but the last. A ninth byte with the high bit set
+%% (past 56 bits of value) is rejected as `bad_integer`.
 -spec decode_integer_continuation(binary(), non_neg_integer(), non_neg_integer()) ->
     {ok, non_neg_integer(), binary()} | {error, bad_integer}.
 decode_integer_continuation(<<0:1, Bits:7, Rest/bitstring>>, I, M) ->

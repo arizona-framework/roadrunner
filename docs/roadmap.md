@@ -173,9 +173,6 @@ changes by profile-share, not headline req/s.
   per-packet work. `stream_data_budget/5` re-encodes the pending ACK frames each
   packet just to size them; caching that size across a burst is a possible
   micro-lever — small
-- QPACK / HPACK-Huffman response-header encode (~10% on small responses): the
-  Huffman encoder is unvalidated, so an interleaved A/B of the encode loop is a
-  possible small-response lever — small-medium
 - TLS handshake is a connection-SETUP lever only, not steady-state: with the
   loadgen sustaining connections the RSA-2048 CertificateVerify is ~0% of
   steady-state time (it read ~10% only on the old stall-and-die loadgen). It
@@ -477,25 +474,6 @@ Revisit only if a real workload reports false `slow_client` drops.
 
 **Scope:** small.
 
-### SWAR scan for has_uppercase
-
-**What:** `roadrunner_bin:has_uppercase/1` walks one byte per call, gating
-every `ascii_lowercase/1`. A 32-bit SWAR word-at-a-time scan (false
-positives are fine, the caller falls through to the correct walk either
-way) measured 23-37% faster on lowercase inputs and 1.2 ns slower on an
-early uppercase exit.
-
-**Why deferred:** interning the h1 header names removed the callers that
-dominated this, so what is left is the public `roadrunner_req:header/2`
-plus the short Connection / Transfer-Encoding / Expect / Upgrade values,
-all of them a handful of bytes where the win is a few ns. 64-bit SWAR is
-not available: an Erlang small integer is 60 bits on a 64-bit VM, so a
-full word forces a bignum and the allocation costs more than the scan
-saves. Wants a real workload showing the remaining calls matter before
-adding bit-twiddling to a function whose current form is obvious.
-
-**Scope:** small.
-
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>
@@ -527,8 +505,8 @@ route in dashboards; named lookup is a niceness, not a need.
  ]}]
 ```
 
-The framework flattens these at compile time into the existing
-linear route list, concatenating the prefix and prepending the
+The framework flattens these at compile time into the plain route
+list `compile/2` takes, concatenating the prefix and prepending the
 group's middlewares to each leaf route.
 
 **Why deferred:** the flat list is fine until the route table has

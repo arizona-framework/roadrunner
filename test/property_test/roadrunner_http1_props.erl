@@ -90,7 +90,7 @@ feed(Fn, <<C, Rest/binary>>, Buf) ->
 
 %% =============================================================================
 %% Header-name normalization: the interned literal clauses in
-%% `validate_and_lowercase_name/1` must be indistinguishable from the
+%% `roadrunner_http1:fast_header/2` must be indistinguishable from the
 %% general validate-and-lowercase path they short-circuit.
 %% =============================================================================
 

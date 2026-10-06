@@ -106,12 +106,6 @@ encode_component(Bin, Pct20Cp) ->
     Encoded = roadrunner_uri:percent_encode(Bin),
     binary:replace(Encoded, Pct20Cp, ~"+", [global]).
 
-%% `-on_load` callback. Compiles the `+`/`%` trigger pattern once
-%% at module load and stashes it in `persistent_term`. The
-%% `decode/1` fast-path scans with a precompiled binary pattern
-%% instead of building one per call. Conventional shape across the
-%% codebase (see `roadrunner_compress`, `roadrunner_http1`,
-%% `roadrunner_ws`).
 %% `true` when `Bin` holds a `+` or `%`. SWAR, 7 bytes per step (see
 %% `roadrunner_swar.hrl`). On short query strings this beats
 %% `binary:match/2` with a compiled `+`/`%` pattern, whose fixed call cost
@@ -133,6 +127,11 @@ has_trigger(<<_, Rest/binary>>) ->
 has_trigger(<<>>) ->
     false.
 
+%% `-on_load` callback. Compiles the `&`, `=`, `+` and `%20` patterns
+%% `parse/1` and `encode/1` split and replace on once at module load and
+%% stashes them in `persistent_term`, instead of building one per call.
+%% Conventional shape across the codebase (see `roadrunner_compress`,
+%% `roadrunner_http1`, `roadrunner_ws`).
 -spec init_patterns() -> ok.
 init_patterns() ->
     persistent_term:put(?AMP_KEY, binary:compile_pattern(~"&")),

@@ -16,8 +16,11 @@
 
 %% Send the handler's response, returning the status actually sent (which
 %% differs from the handler's when the worker overrides a response it
-%% cannot send, e.g. 500 for a returned 1xx). It must not raise: it runs
-%% in the `of` body of the handler's `try`, which does not catch.
+%% cannot send, e.g. 500 for a returned 1xx). It runs in the `of` body of
+%% the handler's `try`, which does not catch: if it raises (a stream fun
+%% that fails, a sendfile that cannot open its file), no
+%% `[roadrunner, request, exception]` is emitted, the worker exits and the
+%% connection resets the stream.
 -callback emit_handler_response(
     pid(), non_neg_integer(), module(), roadrunner_handler:response()
 ) -> roadrunner_http:status().
