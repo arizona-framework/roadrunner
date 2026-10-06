@@ -409,6 +409,29 @@ decode_size_update_evicts_entries_test() ->
     ?assertEqual(0, ctx_size(Ctx2)),
     ?assertEqual([], dyn(Ctx2)).
 
+decode_size_update_evicting_many_entries_keeps_newest_test() ->
+    %% Twelve 34-byte entries, then a Size Update to 68: more evictions
+    %% than the one-at-a-time path takes, so the rest go through the
+    %% rebuild. The two newest entries must survive, newest first.
+    Names = [<<C>> || C <- lists:seq($a, $l)],
+    Push = <<<<16#40, 1, N/binary, 1, "v">> || N <- Names>>,
+    Ctx0 = roadrunner_http2_hpack:new_decoder(4096),
+    {ok, _, Ctx1} = roadrunner_http2_hpack:decode(Push, Ctx0),
+    ?assertEqual(12, length(dyn(Ctx1))),
+    %% 68 does not fit the 5-bit prefix: 31 + continuation byte 37.
+    {ok, [], Ctx2} = roadrunner_http2_hpack:decode(<<16#3F, 37>>, Ctx1),
+    ?assertEqual([{~"l", ~"v"}, {~"k", ~"v"}], dyn(Ctx2)),
+    ?assertEqual(68, ctx_size(Ctx2)).
+
+decode_insert_into_full_table_evicts_eldest_test() ->
+    %% Three 34-byte entries in a 102-byte table; a fourth evicts only
+    %% the eldest.
+    Ctx0 = roadrunner_http2_hpack:new_decoder(102),
+    Push = <<<<16#40, 1, N, 1, "v">> || N <- [$a, $b, $c, $d]>>,
+    {ok, _, Ctx1} = roadrunner_http2_hpack:decode(Push, Ctx0),
+    ?assertEqual([{~"d", ~"v"}, {~"c", ~"v"}, {~"b", ~"v"}], dyn(Ctx1)),
+    ?assertEqual(102, ctx_size(Ctx1)).
+
 decode_size_update_above_limit_is_error_test() ->
     %% Limit is 100; Update for 200 → invalid_table_size.
     Ctx = roadrunner_http2_hpack:new_decoder(100),
