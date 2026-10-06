@@ -18,12 +18,14 @@
     initial_server/1,
     traffic_keys/1,
     update/1,
-    for_connection/1
+    for_connection/2
 ]).
 
 -export_type([keys/0]).
 
--type keys() :: #{key := binary(), iv := binary(), hp := roadrunner_quic_aead:hp()}.
+-type keys() :: #{
+    key := roadrunner_quic_aead:aead_key(), iv := binary(), hp := roadrunner_quic_aead:hp()
+}.
 
 %% RFC 9001 §5.2: the QUIC v1 Initial salt,
 %% 0x38762cf7f55934b34d179ae6a4c80cadccbb7f0a.
@@ -86,13 +88,33 @@ update(Secret) ->
     {UpdatedSecret, traffic_keys(UpdatedSecret)}.
 
 -doc """
-Prepare derived keys for the connection process that will use them:
-the header-protection key becomes an initialized AES-128-ECB state, so
-each packet's mask is one `crypto_update/2` instead of a fresh key
-setup (RFC 9001 §5.4.3: ECB has no state between blocks). The state is
-a resource of the calling process, so call this where the keys are
-installed and use them only there.
+Prepare derived keys for the connection process that will use them, in
+the one direction it uses them for: `seal` for the server's own packets,
+`open` for the peer's. The header-protection key becomes an initialized
+AES-128-ECB state, so each packet's mask is one `crypto_update/2`
+instead of a fresh key setup (RFC 9001 §5.4.3: ECB has no state between
+blocks). From OTP 28 the packet-protection key likewise becomes an
+AES-128-GCM sealing or opening state. The states are resources of the
+calling process, so call this where the keys are installed and use them
+only there.
 """.
--spec for_connection(keys()) -> keys().
-for_connection(#{hp := HP} = Keys) when is_binary(HP) ->
-    Keys#{hp := crypto:crypto_init(aes_128_ecb, HP, true)}.
+-spec for_connection(keys(), seal | open) -> keys().
+for_connection(#{key := Key, hp := HP} = Keys, Direction) when is_binary(Key), is_binary(HP) ->
+    Keys#{
+        key := aead_state(Key, Direction),
+        hp := crypto:crypto_init(aes_128_ecb, HP, true)
+    }.
+
+-if(?OTP_RELEASE >= 28).
+-spec aead_state(binary(), seal | open) -> roadrunner_quic_aead:aead_key().
+aead_state(Key, Direction) ->
+    crypto:crypto_one_time_aead_init(aes_128_gcm, Key, 16, Direction =:= seal).
+-else.
+%% Before OTP 28 there is no AEAD state API: the raw key stays, for
+%% either direction.
+-spec aead_state(binary(), seal | open) -> roadrunner_quic_aead:aead_key().
+aead_state(Key, seal) ->
+    Key;
+aead_state(Key, open) ->
+    Key.
+-endif.
