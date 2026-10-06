@@ -16,13 +16,15 @@ that fail to decode pass through as raw bytes.
 
 -export([parse/1, encode/1]).
 
-%% Trigger bytes that mean `decode/1` actually has to do work.
 %% Pre-compiled at module load (see `init_patterns/0`).
--define(QS_TRIGGERS_KEY, {?MODULE, qs_triggers_cp}).
 -define(AMP_KEY, {?MODULE, amp_cp}).
 -define(EQ_KEY, {?MODULE, eq_cp}).
 -define(PLUS_KEY, {?MODULE, plus_cp}).
 -define(PCT20_KEY, {?MODULE, pct20_cp}).
+
+%% `B` repeated in each byte of a 7-byte (56-bit) word, for the SWAR scan
+%% in `has_trigger/1`. 56 bits stays a small integer on a 64-bit BEAM.
+-define(BYTES(B), (16#01010101010101 * (B))).
 
 -doc """
 Parse a query string into an ordered list of `{Key, Value}` pairs.
@@ -34,33 +36,44 @@ parse(<<>>) ->
     [];
 parse(Bin) when is_binary(Bin) ->
     EqCp = persistent_term:get(?EQ_KEY),
-    TriggersCp = persistent_term:get(?QS_TRIGGERS_KEY),
-    PlusCp = persistent_term:get(?PLUS_KEY),
-    [
-        parse_pair(P, EqCp, TriggersCp, PlusCp)
-     || P <- binary:split(Bin, persistent_term:get(?AMP_KEY), [global]), P =/= <<>>
-    ].
-
--spec parse_pair(binary(), binary:cp(), binary:cp(), binary:cp()) ->
-    {binary(), binary() | true}.
-parse_pair(Pair, EqCp, TriggersCp, PlusCp) ->
-    case binary:split(Pair, EqCp) of
-        [Key] -> {decode(Key, TriggersCp, PlusCp), true};
-        [Key, Value] -> {decode(Key, TriggersCp, PlusCp), decode(Value, TriggersCp, PlusCp)}
+    Pairs = binary:split(Bin, persistent_term:get(?AMP_KEY), [global]),
+    %% One scan of the whole string for `+`/`%`: when there is neither,
+    %% the usual `?id=123&limit=50`, no key or value needs decoding, so
+    %% the pairs skip `decode/2` and its per-key and per-value scans.
+    case has_trigger(Bin) of
+        false ->
+            [split_pair(P, EqCp) || P <- Pairs, P =/= <<>>];
+        true ->
+            PlusCp = persistent_term:get(?PLUS_KEY),
+            [parse_pair(P, EqCp, PlusCp) || P <- Pairs, P =/= <<>>]
     end.
 
--spec decode(binary(), binary:cp(), binary:cp()) -> binary().
-decode(Bin, TriggersCp, PlusCp) ->
+-spec split_pair(binary(), binary:cp()) -> {binary(), binary() | true}.
+split_pair(Pair, EqCp) ->
+    case binary:split(Pair, EqCp) of
+        [Key] -> {Key, true};
+        [Key, Value] -> {Key, Value}
+    end.
+
+-spec parse_pair(binary(), binary:cp(), binary:cp()) ->
+    {binary(), binary() | true}.
+parse_pair(Pair, EqCp, PlusCp) ->
+    case binary:split(Pair, EqCp) of
+        [Key] -> {decode(Key, PlusCp), true};
+        [Key, Value] -> {decode(Key, PlusCp), decode(Value, PlusCp)}
+    end.
+
+-spec decode(binary(), binary:cp()) -> binary().
+decode(Bin, PlusCp) ->
     %% Fast path: when neither `+` nor `%` is present, the body
     %% bytes ARE the decoded bytes — return as-is. Skips both
     %% `binary:replace` and `roadrunner_uri:percent_decode/1`,
     %% which is the dominant cost on form fields with safe ASCII
-    %% (numeric IDs, alpha-only keys, base64 etc.). Single-pass
-    %% match against a precompiled pattern.
-    case binary:match(Bin, TriggersCp) of
-        nomatch ->
+    %% (numeric IDs, alpha-only keys, base64 etc.).
+    case has_trigger(Bin) of
+        false ->
             Bin;
-        _ ->
+        true ->
             Spaced = binary:replace(Bin, PlusCp, ~" ", [global]),
             case roadrunner_uri:percent_decode(Spaced) of
                 {ok, Decoded} -> Decoded;
@@ -101,9 +114,33 @@ encode_component(Bin, Pct20Cp) ->
 %% instead of building one per call. Conventional shape across the
 %% codebase (see `roadrunner_compress`, `roadrunner_http1`,
 %% `roadrunner_ws`).
+%% `true` when `Bin` holds a `+` or `%`. SWAR, 7 bytes per step: with
+%% `Y = X xor B` repeated, `(Y - 0x01) band bnot Y` sets a byte's high
+%% bit when that byte equals `B`, exact for "does any byte match". On
+%% short query strings this beats `binary:match/2` with a compiled
+%% `+`/`%` pattern, whose fixed call cost dominated.
+-spec has_trigger(binary()) -> boolean().
+has_trigger(<<X:56, Rest/binary>>) ->
+    Plus = X bxor ?BYTES($+),
+    Pct = X bxor ?BYTES($%),
+    case
+        ((Plus - ?BYTES(1)) band (Plus bxor ?BYTES(255)) bor
+            ((Pct - ?BYTES(1)) band (Pct bxor ?BYTES(255)))) band ?BYTES(128)
+    of
+        0 -> has_trigger(Rest);
+        _ -> true
+    end;
+has_trigger(<<$+, _/binary>>) ->
+    true;
+has_trigger(<<$%, _/binary>>) ->
+    true;
+has_trigger(<<_, Rest/binary>>) ->
+    has_trigger(Rest);
+has_trigger(<<>>) ->
+    false.
+
 -spec init_patterns() -> ok.
 init_patterns() ->
-    persistent_term:put(?QS_TRIGGERS_KEY, binary:compile_pattern([~"+", ~"%"])),
     persistent_term:put(?AMP_KEY, binary:compile_pattern(~"&")),
     persistent_term:put(?EQ_KEY, binary:compile_pattern(~"=")),
     persistent_term:put(?PLUS_KEY, binary:compile_pattern(~"+")),
