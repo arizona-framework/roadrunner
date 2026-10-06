@@ -100,12 +100,15 @@ invoke(
 ) ->
     try Pipeline(Req) of
         {Response0, _Req2} ->
-            %% A handler-returned 1xx becomes a 500 here, for every shape
-            %% (`roadrunner_conn:final_response/3`). Telemetry reports the
-            %% status actually sent. RFC 9110 §9.3.2: a HEAD response carries
-            %% no content, so emit the body-stripped form; telemetry keeps the
-            %% shape before stripping (`roadrunner_conn:response_kind/1`).
-            Response = roadrunner_conn:final_response(Protocol, Handler, Response0),
+            %% A handler-returned 1xx or unsafe header becomes a 500 here,
+            %% for every shape (`roadrunner_conn:final_response/3`,
+            %% `safe_response/3`). Telemetry reports the status actually
+            %% sent. RFC 9110 §9.3.2: a HEAD response carries no content, so
+            %% emit the body-stripped form; telemetry keeps the shape before
+            %% stripping (`roadrunner_conn:response_kind/1`).
+            Response = safe_response(
+                Protocol, Handler, roadrunner_conn:final_response(Protocol, Handler, Response0)
+            ),
             Status = Worker:emit_handler_response(
                 Conn, StreamId, Handler, roadrunner_conn:head_response(Response, Method)
             ),
@@ -126,6 +129,57 @@ invoke(
                 Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
             )
     end.
+
+%% RFC 9110 §5.5: a response header name or value containing CR, LF or
+%% NUL is a handler bug (usually unvalidated user input echoed into a
+%% header) that would put malformed bytes on the wire, or split at a
+%% downstream h2/h3->h1 reverse proxy. Answer 500 instead, in every
+%% shape, before anything is sent; only the kind is logged, never the
+%% raw bytes. Checking here, in the worker, keeps the bug on its own
+%% stream: the h2 conn process that encodes the headers is shared by
+%% every stream of the connection. Connection-specific fields are not
+%% rejected here, the send paths strip them.
+-spec safe_response(h2 | h3, module(), roadrunner_handler:response()) ->
+    roadrunner_handler:response().
+safe_response(_Protocol, _Handler, {websocket, _, _} = Response) ->
+    Response;
+safe_response(Protocol, Handler, Response) ->
+    case unsafe_header(response_headers(Response)) of
+        none ->
+            Response;
+        Kind ->
+            logger:error(#{
+                msg => unsafe_message(Protocol),
+                handler => Handler,
+                kind => Kind
+            }),
+            {500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"}
+    end.
+
+-spec response_headers(roadrunner_handler:response()) -> roadrunner_http:headers().
+response_headers({stream, _, Headers, _}) -> Headers;
+response_headers({loop, _, Headers, _}) -> Headers;
+response_headers({sendfile, _, Headers, _}) -> Headers;
+response_headers({_, Headers, _}) -> Headers.
+
+%% The kind of the first field with CR/LF/NUL in it, or `none`.
+-spec unsafe_header(roadrunner_http:headers()) -> none | name | value.
+unsafe_header([]) ->
+    none;
+unsafe_header([{Name, Value} | Rest]) ->
+    case roadrunner_http:is_header_safe(Name) of
+        true ->
+            case roadrunner_http:is_header_safe(Value) of
+                true -> unsafe_header(Rest);
+                false -> value
+            end;
+        false ->
+            name
+    end.
+
+-spec unsafe_message(h2 | h3) -> string().
+unsafe_message(h2) -> "roadrunner h2 handler returned a header with CR/LF/NUL";
+unsafe_message(h3) -> "roadrunner h3 handler returned a header with CR/LF/NUL".
 
 -spec crash_message(h2 | h3) -> string().
 crash_message(h2) -> "roadrunner h2 handler crashed";

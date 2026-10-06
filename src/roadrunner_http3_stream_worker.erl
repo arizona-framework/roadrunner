@@ -77,78 +77,19 @@ init(Conn, StreamId, Req, Dispatch) ->
 emit_handler_response(Conn, StreamId, _Handler, {Status, Headers, Body}) when
     is_integer(Status), Status >= 200, Status =< 599
 ->
-    emit_checked(Conn, StreamId, Headers, fun() ->
-        send_buffered(Conn, StreamId, Status, Headers, Body),
-        Status
-    end);
+    send_buffered(Conn, StreamId, Status, Headers, Body),
+    Status;
 emit_handler_response(Conn, StreamId, _Handler, {stream, Status, Headers, Fun}) ->
-    emit_checked(Conn, StreamId, Headers, fun() ->
-        send_stream(Conn, StreamId, Status, Headers, Fun),
-        Status
-    end);
+    send_stream(Conn, StreamId, Status, Headers, Fun),
+    Status;
 emit_handler_response(Conn, StreamId, _Handler, {sendfile, Status, Headers, Spec}) ->
-    emit_checked(Conn, StreamId, Headers, fun() ->
-        send_sendfile(Conn, StreamId, Status, Headers, Spec),
-        Status
-    end);
+    send_sendfile(Conn, StreamId, Status, Headers, Spec),
+    Status;
 emit_handler_response(Conn, StreamId, Handler, {loop, Status, Headers, State}) ->
-    emit_checked(Conn, StreamId, Headers, fun() ->
-        send_loop(Conn, StreamId, Status, Headers, Handler, State),
-        Status
-    end);
+    send_loop(Conn, StreamId, Status, Headers, Handler, State),
+    Status;
 emit_handler_response(Conn, StreamId, _Handler, {websocket, _, _}) ->
     emit_501(Conn, StreamId).
-
-%% Emit a response unless it carries a header with CR/LF/NUL (RFC 9110
-%% §5.5), in which case answer 500. Connection-specific fields (RFC 9114
-%% §4.2) are not rejected here — `header_frame/2` strips them. `Emit`
-%% performs the send and returns the status sent; shared by the buffered
-%% / stream / sendfile paths.
--spec emit_checked(
-    pid(), non_neg_integer(), roadrunner_http:headers(), fun(() -> roadrunner_http:status())
-) -> roadrunner_http:status().
-emit_checked(Conn, StreamId, Headers, Emit) ->
-    case validate_response_headers(Headers) of
-        ok -> Emit();
-        {unsafe, Kind} -> reject_unsafe(Conn, StreamId, Kind)
-    end.
-
-%% One pass over the response headers running the RFC 9110 §5.5 CR/LF/NUL
-%% field-byte check (`roadrunner_http:is_header_safe/1`), returning
-%% the offending kind (never the raw bytes) on the first unsafe field.
-%% Non-crashing because `emit_checked/4` runs in the `try ... of` body,
-%% whose exceptions the `try` does NOT catch.
--spec validate_response_headers(roadrunner_http:headers()) ->
-    ok | {unsafe, name | value}.
-validate_response_headers([]) ->
-    ok;
-validate_response_headers([{Name, Value} | Rest]) ->
-    case roadrunner_http:is_header_safe(Name) of
-        true ->
-            case roadrunner_http:is_header_safe(Value) of
-                true -> validate_response_headers(Rest);
-                false -> {unsafe, value}
-            end;
-        false ->
-            {unsafe, name}
-    end.
-
-%% RFC 9110 §5.5: a response header name or value containing CR, LF, or
-%% NUL is a handler bug (usually unvalidated user input echoed into a
-%% header) that would put malformed bytes on the wire, or split at a
-%% downstream h3->h1 reverse proxy. Answer 500 rather than emit it; only
-%% the kind is logged, never the raw bytes. Shared by every response
-%% shape via `emit_checked/4`.
--spec reject_unsafe(pid(), non_neg_integer(), name | value) -> 500.
-reject_unsafe(Conn, StreamId, Kind) ->
-    logger:error(#{
-        msg => "roadrunner h3 handler returned a header with CR/LF/NUL",
-        kind => Kind
-    }),
-    send_buffered(
-        Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
-    ),
-    500.
 
 %% The `websocket` response shape is not yet wired for HTTP/3 (it needs
 %% Extended CONNECT, RFC 9220); until then it answers 501, mirroring how

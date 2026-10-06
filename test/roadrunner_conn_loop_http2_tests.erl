@@ -61,6 +61,8 @@ all_test_() ->
         fun websocket_response_returns_501/0,
         fun handler_crash_returns_500/0,
         fun interim_buffered_response_returns_500/0,
+        fun unsafe_response_header_returns_500/0,
+        fun unsafe_trailer_resets_stream/0,
         fun middleware_chain_runs/0,
         fun rst_stream_cancels_active_stream/0,
         fun router_404_returns_not_found/0,
@@ -1202,6 +1204,36 @@ interim_buffered_response_returns_500() ->
         end
      || Path <- [~"/interim", ~"/interim-stream"]
     ].
+
+unsafe_response_header_returns_500() ->
+    %% A response header with CR/LF/NUL in its name or value (RFC 9110
+    %% §5.5) is a handler bug: the worker answers 500 in every response
+    %% shape, and the conn, which every other stream shares, survives.
+    [
+        begin
+            {Pid, Ref, Resp} = run_h2_request_with_handler(roadrunner_h2_test_handler, Path),
+            ?assertEqual(~"500", h2_response_status(Resp)),
+            ?assert(is_process_alive(Pid)),
+            cleanup(Pid, Ref)
+        end
+     || Path <- [
+            ~"/inject-value",
+            ~"/inject-name",
+            ~"/inject-stream",
+            ~"/inject-loop",
+            ~"/inject-sendfile"
+        ]
+    ].
+
+unsafe_trailer_resets_stream() ->
+    %% A CR/LF trailer comes after the 200 HEADERS, so it cannot become a
+    %% 500: the stream is reset (RST_STREAM, frame type 3), the bad bytes
+    %% never reach the wire, and the conn survives.
+    {Pid, Ref} = run_stream_request(~"/stream/bad-trailers"),
+    Frames = collect_response_frames(),
+    ?assertMatch([{headers, 1, false}, {other, 3, 1, false}], Frames),
+    ?assert(is_process_alive(Pid)),
+    cleanup(Pid, Ref).
 
 middleware_chain_runs() ->
     %% Listener with a non-empty middleware list — exercises the

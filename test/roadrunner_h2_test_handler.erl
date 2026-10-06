@@ -175,6 +175,31 @@ handle(#{target := ~"/interim"} = Req) ->
     %% A buffered 1xx (interim) status returned as a final response is a
     %% misuse (RFC 9110 §15.2); the worker rejects it with 500.
     {{103, [], ~""}, Req};
+handle(#{target := ~"/inject-value"} = Req) ->
+    %% A response header VALUE with CR/LF (RFC 9110 §5.5 bans CTLs) → 500.
+    {{200, [{~"x-evil", ~"a\r\nb"}], ~"x"}, Req};
+handle(#{target := ~"/inject-name"} = Req) ->
+    %% A response header NAME with CR/LF → 500.
+    {{200, [{~"x-ev\r\nil", ~"v"}], ~"x"}, Req};
+handle(#{target := ~"/inject-stream"} = Req) ->
+    %% Same defect on a streaming response's headers → 500.
+    {{stream, 200, [{~"x-evil", ~"a\r\nb"}], fun(Send) -> Send(~"x", fin) end}, Req};
+handle(#{target := ~"/inject-loop"} = Req) ->
+    %% Same defect on a loop response's headers → 500.
+    {{loop, 200, [{~"x-evil", ~"a\r\nb"}], undefined}, Req};
+handle(#{target := ~"/inject-sendfile"} = Req) ->
+    %% Same defect on a sendfile response's headers → 500 (the file is
+    %% never opened).
+    {{sendfile, 200, [{~"x-evil", ~"a\r\nb"}], {"/tmp/rr_h2_sf_does_not_exist.bin", 0, 1}}, Req};
+handle(#{target := ~"/stream/bad-trailers"} = Req) ->
+    %% CR/LF in a trailer value. The status is already sent, so the
+    %% worker crashes and the conn resets the stream.
+    {
+        {stream, 200, [], fun(Send) ->
+            Send(~"body", {fin, [{~"x-trailer", ~"a\r\nb"}]})
+        end},
+        Req
+    };
 handle(#{target := ~"/crash"} = _Req) ->
     error(boom);
 handle(#{target := ~"/badshape"} = Req) ->

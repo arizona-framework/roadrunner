@@ -228,8 +228,8 @@ check_header_safe(Bin, Kind) ->
 %% that flags, a tab or another low control byte, gets the exact byte
 %% check. 30-65% faster than `binary:match/2` with a
 %% compiled CR/LF/NUL pattern from 3 bytes up. Exported for the callers
-%% that want a boolean (the HTTP/3 response gate answers 500 instead of
-%% crashing); most want `check_header_safe/2`.
+%% that want a boolean (the HTTP/2 and HTTP/3 response gate answers 500
+%% instead of crashing); most want `check_header_safe/2`.
 -doc false.
 -spec is_header_safe(binary()) -> boolean().
 is_header_safe(<<X:56, Rest/binary>> = Bin) ->
@@ -268,13 +268,14 @@ strip_connection_specific_fields(Headers) ->
 
 -doc """
 Single-pass combination of `check_header_safe/2` and
-`strip_connection_specific_fields/1` for the response paths that crash
-on injection (the HTTP/2 conn loop and the HTTP/3 trailer path): in one
-traversal it rejects CR/LF/NUL in any name or value (crashing with
+`strip_connection_specific_fields/1` for the HTTP/2 and HTTP/3 trailer
+paths, which crash on injection because the status is already sent: in
+one traversal it rejects CR/LF/NUL in any name or value (crashing with
 `{header_injection, Kind, Bin}`, like `check_header_safe/2`) and drops
-the connection-specific fields h2/h3 MUST NOT generate. HTTP/3 response
-headers answer 500 on injection instead of crashing, so they run the
-non-crashing check and `strip_connection_specific_fields/1` separately.
+the connection-specific fields h2/h3 MUST NOT generate. HTTP/2 and
+HTTP/3 response headers answer 500 on injection instead of crashing, so
+they run the non-crashing check and `strip_connection_specific_fields/1`
+separately.
 """.
 -spec strip_connection_specific_fields_safe(headers()) -> headers().
 %% One pass: check CR/LF/NUL on every field (including ones about to be
