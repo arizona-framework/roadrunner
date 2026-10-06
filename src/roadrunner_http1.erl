@@ -46,7 +46,6 @@
 %% measured at the same speed as a bound variable.
 -define(LF_KEY, {?MODULE, lf_cp}).
 -define(CRLF_KEY, {?MODULE, crlf_cp}).
--define(COLON_KEY, {?MODULE, colon_cp}).
 -define(SPACE_KEY, {?MODULE, space_cp}).
 -define(SEMICOLON_KEY, {?MODULE, semicolon_cp}).
 
@@ -109,13 +108,119 @@ parse_request_line(Bin, MaxReqLine) ->
     | {more, undefined}
     | {error, bad_request_line | bad_version | request_line_too_long}.
 parse_request_line_p(<<"\r\n", Rest/binary>>, MaxReqLine) ->
-    do_parse_request_line(
-        Rest, persistent_term:get(?LF_KEY), persistent_term:get(?SPACE_KEY), MaxReqLine
-    );
+    request_line(Rest, MaxReqLine);
 parse_request_line_p(Bin, MaxReqLine) when is_binary(Bin) ->
-    do_parse_request_line(
-        Bin, persistent_term:get(?LF_KEY), persistent_term:get(?SPACE_KEY), MaxReqLine
-    ).
+    request_line(Bin, MaxReqLine).
+
+%% One pass over the usual request line: a standard method and its
+%% space matched as a literal, the target scanned 7 bytes at a time up
+%% to the space (splitting the path at `?`), then `HTTP/1.x\r\n` matched
+%% directly. That replaces the LF search, the `binary:split/3` on
+%% spaces and the separate method/target/version checks (a 1-header GET
+%% parses in about half the time). Anything else (an extension method,
+%% a partial line, any error, a line over the limit) returns `slow` and
+%% takes `do_parse_request_line/4`, which decides it exactly as before.
+-spec request_line(binary(), pos_integer()) ->
+    {ok, Method :: binary(), Target :: binary(), Path :: binary(), version(), Rest :: binary()}
+    | {more, undefined}
+    | {error, bad_request_line | bad_version | request_line_too_long}.
+request_line(Bin, MaxReqLine) ->
+    case fast_request_line(Bin, MaxReqLine) of
+        slow ->
+            do_parse_request_line(
+                Bin, persistent_term:get(?LF_KEY), persistent_term:get(?SPACE_KEY), MaxReqLine
+            );
+        Parsed ->
+            Parsed
+    end.
+
+-spec fast_request_line(binary(), pos_integer()) ->
+    {ok, binary(), binary(), binary(), version(), binary()} | slow.
+fast_request_line(<<"GET ", T/binary>> = Bin, Max) -> fast_path(T, T, ~"GET", Bin, Max);
+fast_request_line(<<"POST ", T/binary>> = Bin, Max) -> fast_path(T, T, ~"POST", Bin, Max);
+fast_request_line(<<"PUT ", T/binary>> = Bin, Max) -> fast_path(T, T, ~"PUT", Bin, Max);
+fast_request_line(<<"DELETE ", T/binary>> = Bin, Max) -> fast_path(T, T, ~"DELETE", Bin, Max);
+fast_request_line(<<"PATCH ", T/binary>> = Bin, Max) -> fast_path(T, T, ~"PATCH", Bin, Max);
+fast_request_line(<<"HEAD ", T/binary>> = Bin, Max) -> fast_path(T, T, ~"HEAD", Bin, Max);
+fast_request_line(<<"OPTIONS ", T/binary>> = Bin, Max) -> fast_path(T, T, ~"OPTIONS", Bin, Max);
+fast_request_line(_Bin, _Max) -> slow.
+
+%% The target's path, 7 bytes per step while a word holds no byte <= 0x20,
+%% no 0x7F and no `?` (the `validate_path/2` test); `T` is the target's
+%% start, `Bin` the line's.
+-spec fast_path(binary(), binary(), binary(), binary(), pos_integer()) ->
+    {ok, binary(), binary(), binary(), version(), binary()} | slow.
+fast_path(<<X:56, R/binary>> = Cur, T, Method, Bin, Max) ->
+    Del = X bxor ?BYTES(16#7F),
+    Qm = X bxor ?BYTES($?),
+    case
+        ((X - ?BYTES(16#21)) band (X bxor ?BYTES(255)) bor
+            ((Del - ?BYTES(1)) band (Del bxor ?BYTES(255))) bor
+            ((Qm - ?BYTES(1)) band (Qm bxor ?BYTES(255)))) band ?BYTES(128)
+    of
+        0 -> fast_path(R, T, Method, Bin, Max);
+        _ -> fast_path_byte(Cur, T, Method, Bin, Max)
+    end;
+fast_path(Cur, T, Method, Bin, Max) ->
+    fast_path_byte(Cur, T, Method, Bin, Max).
+
+-spec fast_path_byte(binary(), binary(), binary(), binary(), pos_integer()) ->
+    {ok, binary(), binary(), binary(), version(), binary()} | slow.
+fast_path_byte(<<$\s, R/binary>>, T, Method, Bin, Max) ->
+    case byte_size(T) - byte_size(R) - 1 of
+        0 ->
+            slow;
+        Len ->
+            Target = binary:part(T, 0, Len),
+            fast_version(R, Method, Target, Target, Bin, Max)
+    end;
+fast_path_byte(<<$?, R/binary>>, T, Method, Bin, Max) ->
+    fast_query(R, T, byte_size(T) - byte_size(R) - 1, Method, Bin, Max);
+fast_path_byte(<<C, R/binary>>, T, Method, Bin, Max) when C > 16#20, C =/= 16#7F ->
+    fast_path_byte(R, T, Method, Bin, Max);
+fast_path_byte(_Cur, _T, _Method, _Bin, _Max) ->
+    slow.
+
+%% The query after the first `?` (later `?`s are query bytes), up to the
+%% space; `PathLen` is where the path ended.
+-spec fast_query(binary(), binary(), non_neg_integer(), binary(), binary(), pos_integer()) ->
+    {ok, binary(), binary(), binary(), version(), binary()} | slow.
+fast_query(<<X:56, R/binary>> = Cur, T, PathLen, Method, Bin, Max) ->
+    Del = X bxor ?BYTES(16#7F),
+    case
+        ((X - ?BYTES(16#21)) band (X bxor ?BYTES(255)) bor
+            ((Del - ?BYTES(1)) band (Del bxor ?BYTES(255)))) band ?BYTES(128)
+    of
+        0 -> fast_query(R, T, PathLen, Method, Bin, Max);
+        _ -> fast_query_byte(Cur, T, PathLen, Method, Bin, Max)
+    end;
+fast_query(Cur, T, PathLen, Method, Bin, Max) ->
+    fast_query_byte(Cur, T, PathLen, Method, Bin, Max).
+
+-spec fast_query_byte(binary(), binary(), non_neg_integer(), binary(), binary(), pos_integer()) ->
+    {ok, binary(), binary(), binary(), version(), binary()} | slow.
+fast_query_byte(<<$\s, R/binary>>, T, PathLen, Method, Bin, Max) ->
+    Target = binary:part(T, 0, byte_size(T) - byte_size(R) - 1),
+    fast_version(R, Method, Target, binary:part(T, 0, PathLen), Bin, Max);
+fast_query_byte(<<C, R/binary>>, T, PathLen, Method, Bin, Max) when C > 16#20, C =/= 16#7F ->
+    fast_query_byte(R, T, PathLen, Method, Bin, Max);
+fast_query_byte(_Cur, _T, _PathLen, _Method, _Bin, _Max) ->
+    slow.
+
+%% The version and the CRLF, with the line (without its CRLF) inside
+%% the limit.
+-spec fast_version(binary(), binary(), binary(), binary(), binary(), pos_integer()) ->
+    {ok, binary(), binary(), binary(), version(), binary()} | slow.
+fast_version(<<"HTTP/1.1\r\n", Rest/binary>>, Method, Target, Path, Bin, Max) when
+    byte_size(Bin) - byte_size(Rest) - 2 =< Max
+->
+    {ok, Method, Target, Path, {1, 1}, Rest};
+fast_version(<<"HTTP/1.0\r\n", Rest/binary>>, Method, Target, Path, Bin, Max) when
+    byte_size(Bin) - byte_size(Rest) - 2 =< Max
+->
+    {ok, Method, Target, Path, {1, 0}, Rest};
+fast_version(_Cur, _Method, _Target, _Path, _Bin, _Max) ->
+    slow.
 
 -spec do_parse_request_line(binary(), binary:cp(), binary:cp(), pos_integer()) ->
     {ok, Method :: binary(), Target :: binary(), Path :: binary(), version(), Rest :: binary()}
@@ -177,19 +282,12 @@ classify(Method, Target, VersionBin, Rest) ->
             {error, bad_request_line}
     end.
 
-%% Fast path for standard methods — JIT pattern-table dispatch avoids the
-%% per-byte scan in validate_method_chars/1 on the hot path. Custom methods
-%% (uppercase ASCII letters only) still parse via the fallback; full RFC 9110 §5.6.2
-%% token grammar (digits, lowercase, `-`, etc.) is intentionally not accepted
+%% Standard methods are matched as literals by `fast_request_line/2`, so
+%% this sees extension methods and lines that are invalid anyway. Custom
+%% methods are uppercase ASCII letters only; full RFC 9110 §5.6.2 token
+%% grammar (digits, lowercase, `-`, etc.) is intentionally not accepted
 %% — extension methods like WebDAV's MKCOL or UPnP's M-SEARCH would need it.
 -spec validate_method(binary()) -> ok | error.
-validate_method(~"GET") -> ok;
-validate_method(~"POST") -> ok;
-validate_method(~"PUT") -> ok;
-validate_method(~"DELETE") -> ok;
-validate_method(~"PATCH") -> ok;
-validate_method(~"HEAD") -> ok;
-validate_method(~"OPTIONS") -> ok;
 validate_method(<<>>) -> error;
 validate_method(M) -> validate_method_chars(M).
 
@@ -313,255 +411,198 @@ and lines exceeding 8192 bytes are rejected with `bad_header` /
     | {more, undefined}
     | {error, bad_header | header_too_long}.
 parse_header(Bin) when is_binary(Bin) ->
-    parse_header(Bin, persistent_term:get(?LF_KEY), persistent_term:get(?COLON_KEY)).
+    parse_header(Bin, ?MAX_HEADER_LINE).
 
-%% Internal — accepts the compiled LF + colon patterns so callers in
-%% a loop (e.g. `parse_headers_loop/5`) can fetch them once and pass
-%% them through, instead of paying two `persistent_term:get/1` per
-%% header.
--spec parse_header(binary(), binary:cp(), binary:cp()) ->
+-spec parse_header(binary(), pos_integer()) ->
     {ok, binary(), binary(), binary()}
     | {end_of_headers, binary()}
     | {more, undefined}
     | {error, bad_header | header_too_long}.
-parse_header(Bin, LfCp, ColonCp) ->
-    parse_header(Bin, LfCp, ColonCp, ?MAX_HEADER_LINE).
-
-%% Internal — `MaxLine` caps the per-header-line length.
--spec parse_header(binary(), binary:cp(), binary:cp(), pos_integer()) ->
-    {ok, binary(), binary(), binary()}
-    | {end_of_headers, binary()}
-    | {more, undefined}
-    | {error, bad_header | header_too_long}.
-parse_header(Bin, LfCp, ColonCp, MaxLine) ->
-    case binary:match(Bin, LfCp) of
-        nomatch when byte_size(Bin) > MaxLine ->
-            {error, header_too_long};
-        nomatch ->
-            {more, undefined};
-        {0, 1} ->
-            {error, bad_header};
-        {LfPos, 1} ->
-            extract_header_line(Bin, LfPos, ColonCp, MaxLine)
+parse_header(Bin, MaxLine) ->
+    case fast_header(Bin, MaxLine) of
+        slow -> parse_header_slow(Bin, MaxLine);
+        Parsed -> Parsed
     end.
 
--spec extract_header_line(binary(), pos_integer(), binary:cp(), pos_integer()) ->
-    {ok, binary(), binary(), binary()}
-    | {end_of_headers, binary()}
-    | {error, bad_header | header_too_long}.
-extract_header_line(Bin, LfPos, ColonCp, MaxLine) ->
-    LineLen = LfPos - 1,
-    case Bin of
-        <<Line:LineLen/binary, "\r\n", Rest/binary>> when LineLen =< MaxLine ->
-            case Line of
-                <<>> -> {end_of_headers, Rest};
-                _ -> parse_header_line(Line, Rest, ColonCp)
-            end;
-        <<_:LineLen/binary, "\r\n", _/binary>> ->
-            {error, header_too_long};
-        _ ->
-            {error, bad_header}
-    end.
-
--spec parse_header_line(binary(), binary(), binary:cp()) ->
-    {ok, binary(), binary(), binary()} | {error, bad_header}.
-parse_header_line(<<C, _/binary>>, _Rest, _ColonCp) when C =:= $\s; C =:= $\t ->
-    %% Obs-fold continuation — RFC 9112 §5.2 says servers MUST reject.
-    {error, bad_header};
-parse_header_line(Line, Rest, ColonCp) ->
-    case binary:split(Line, ColonCp) of
-        [NameRaw, ValueRaw] ->
-            classify_header(NameRaw, ValueRaw, Rest);
-        [_] ->
-            {error, bad_header}
-    end.
-
--spec classify_header(binary(), binary(), binary()) ->
-    {ok, binary(), binary(), binary()} | {error, bad_header}.
-classify_header(NameRaw, ValueRaw, Rest) ->
-    case validate_and_lowercase_name(NameRaw) of
-        {ok, Name} ->
-            Value = roadrunner_bin:trim_ows(ValueRaw),
-            case validate_value(Value) of
-                ok -> {ok, Name, Value, Rest};
-                error -> {error, bad_header}
-            end;
-        error ->
-            {error, bad_header}
-    end.
-
-%% Combined RFC 9110 §5.6.2 tchar validation + lowercase, in a single
-%% walk. Returns the original `Bin` unchanged when every byte is a
-%% lowercase tchar (the typical case for already-lowercased wire
-%% data); falls through to `roadrunner_bin:ascii_lowercase/1` only
-%% when an uppercase byte is seen. Halves the per-name work for the
-%% wire format most clients send (Title-Case names).
--spec validate_and_lowercase_name(binary()) -> {ok, binary()} | error.
-validate_and_lowercase_name(<<>>) ->
-    error;
-%% Interned canonical request-header names. Each clause head compiles
-%% to a `bs_match_string`, and the compiler folds the whole set into a
-%% shared-prefix decision tree, so a hit costs one comparison instead
-%% of the validate walk, the lowercase walk and the `iolist_to_binary`
-%% copy below, and yields a shared literal rather than a fresh binary.
-%% A miss falls through to the general path unchanged.
+%% One pass over the usual header line: the name walked to its colon,
+%% the value scanned 7 bytes at a time to its CRLF, OWS trimmed, and the
+%% line length checked, instead of an LF search, a `binary:split/2` on
+%% the colon, a name walk and a value walk (a 13-header browser request
+%% parses in about 40% less time). Anything else (a partial line, any
+%% error, a line over the limit, obs-fold) returns `slow` and takes
+%% `parse_header_slow/4`, which decides it exactly as before.
 %%
-%% Deliberately no first-byte uppercase gate in front of the table.
-%% Every entry does start uppercase, so gating looks like it would let
-%% lowercase names skip the lot, but the decision tree already
-%% discriminates from byte 0: adding the gate saved 0.09 ns on a
-%% lowercase miss and cost every hit a redundant test.
-%%
-%% Every entry carries an uppercase byte: an already-lowercase name
-%% reaches `{ok, Bin}` via `scan_name_lower/1` without allocating, so
-%% interning one would buy nothing. `roadrunner_http1_tests` drives
-%% each entry, which is also what keeps this list and that one in
-%% step: adding a clause here without adding it there drops coverage
-%% below the 100 % the precommit gate requires.
-validate_and_lowercase_name(~"Accept") ->
-    {ok, ~"accept"};
-validate_and_lowercase_name(~"Accept-Charset") ->
-    {ok, ~"accept-charset"};
-validate_and_lowercase_name(~"Accept-Encoding") ->
-    {ok, ~"accept-encoding"};
-validate_and_lowercase_name(~"Accept-Language") ->
-    {ok, ~"accept-language"};
-validate_and_lowercase_name(~"Access-Control-Request-Headers") ->
-    {ok, ~"access-control-request-headers"};
-validate_and_lowercase_name(~"Access-Control-Request-Method") ->
-    {ok, ~"access-control-request-method"};
-validate_and_lowercase_name(~"Authorization") ->
-    {ok, ~"authorization"};
-validate_and_lowercase_name(~"Cache-Control") ->
-    {ok, ~"cache-control"};
-validate_and_lowercase_name(~"Connection") ->
-    {ok, ~"connection"};
-validate_and_lowercase_name(~"Content-Disposition") ->
-    {ok, ~"content-disposition"};
-validate_and_lowercase_name(~"Content-Encoding") ->
-    {ok, ~"content-encoding"};
-validate_and_lowercase_name(~"Content-Language") ->
-    {ok, ~"content-language"};
-validate_and_lowercase_name(~"Content-Length") ->
-    {ok, ~"content-length"};
-validate_and_lowercase_name(~"Content-Type") ->
-    {ok, ~"content-type"};
-validate_and_lowercase_name(~"Cookie") ->
-    {ok, ~"cookie"};
-validate_and_lowercase_name(~"Date") ->
-    {ok, ~"date"};
-validate_and_lowercase_name(~"DNT") ->
-    {ok, ~"dnt"};
-validate_and_lowercase_name(~"Expect") ->
-    {ok, ~"expect"};
-validate_and_lowercase_name(~"Forwarded") ->
-    {ok, ~"forwarded"};
-validate_and_lowercase_name(~"From") ->
-    {ok, ~"from"};
-validate_and_lowercase_name(~"Host") ->
-    {ok, ~"host"};
-validate_and_lowercase_name(~"If-Match") ->
-    {ok, ~"if-match"};
-validate_and_lowercase_name(~"If-Modified-Since") ->
-    {ok, ~"if-modified-since"};
-validate_and_lowercase_name(~"If-None-Match") ->
-    {ok, ~"if-none-match"};
-validate_and_lowercase_name(~"If-Range") ->
-    {ok, ~"if-range"};
-validate_and_lowercase_name(~"If-Unmodified-Since") ->
-    {ok, ~"if-unmodified-since"};
-validate_and_lowercase_name(~"Max-Forwards") ->
-    {ok, ~"max-forwards"};
-validate_and_lowercase_name(~"Origin") ->
-    {ok, ~"origin"};
-validate_and_lowercase_name(~"Pragma") ->
-    {ok, ~"pragma"};
-validate_and_lowercase_name(~"Proxy-Authorization") ->
-    {ok, ~"proxy-authorization"};
-validate_and_lowercase_name(~"Range") ->
-    {ok, ~"range"};
-validate_and_lowercase_name(~"Referer") ->
-    {ok, ~"referer"};
-validate_and_lowercase_name(~"Sec-Fetch-Dest") ->
-    {ok, ~"sec-fetch-dest"};
-validate_and_lowercase_name(~"Sec-Fetch-Mode") ->
-    {ok, ~"sec-fetch-mode"};
-validate_and_lowercase_name(~"Sec-Fetch-Site") ->
-    {ok, ~"sec-fetch-site"};
-validate_and_lowercase_name(~"Sec-Fetch-User") ->
-    {ok, ~"sec-fetch-user"};
-validate_and_lowercase_name(~"Sec-WebSocket-Extensions") ->
-    {ok, ~"sec-websocket-extensions"};
-validate_and_lowercase_name(~"Sec-WebSocket-Key") ->
-    {ok, ~"sec-websocket-key"};
-validate_and_lowercase_name(~"Sec-WebSocket-Protocol") ->
-    {ok, ~"sec-websocket-protocol"};
-validate_and_lowercase_name(~"Sec-WebSocket-Version") ->
-    {ok, ~"sec-websocket-version"};
-validate_and_lowercase_name(~"TE") ->
-    {ok, ~"te"};
-validate_and_lowercase_name(~"Trailer") ->
-    {ok, ~"trailer"};
-validate_and_lowercase_name(~"Transfer-Encoding") ->
-    {ok, ~"transfer-encoding"};
-validate_and_lowercase_name(~"Upgrade") ->
-    {ok, ~"upgrade"};
-validate_and_lowercase_name(~"Upgrade-Insecure-Requests") ->
-    {ok, ~"upgrade-insecure-requests"};
-validate_and_lowercase_name(~"User-Agent") ->
-    {ok, ~"user-agent"};
-validate_and_lowercase_name(~"Via") ->
-    {ok, ~"via"};
-validate_and_lowercase_name(~"X-Forwarded-For") ->
-    {ok, ~"x-forwarded-for"};
-validate_and_lowercase_name(~"X-Forwarded-Host") ->
-    {ok, ~"x-forwarded-host"};
-validate_and_lowercase_name(~"X-Forwarded-Proto") ->
-    {ok, ~"x-forwarded-proto"};
-validate_and_lowercase_name(~"X-Real-IP") ->
-    {ok, ~"x-real-ip"};
-validate_and_lowercase_name(~"X-Requested-With") ->
-    {ok, ~"x-requested-with"};
-validate_and_lowercase_name(Bin) ->
-    case scan_name_lower(Bin) of
-        lower -> {ok, Bin};
-        upper -> {ok, roadrunner_bin:ascii_lowercase(Bin)};
-        error -> error
-    end.
+%% Interned canonical request-header names, matched with their colon.
+%% Each clause head compiles to a `bs_match_string`, and the compiler
+%% folds the whole set into a shared-prefix decision tree, so a hit costs
+%% one comparison instead of the name walk and the lowercase copy, and
+%% yields a shared literal rather than a fresh binary. A miss walks the
+%% name below. Only Title-Case names are listed: an already-lowercase
+%% name comes back from the walk as a sub-binary without allocating, so
+%% interning one would buy nothing. Deliberately no first-byte uppercase
+%% gate in front of the table: the decision tree already discriminates
+%% from byte 0, and a gate cost every hit a redundant test.
+%% `roadrunner_http1_tests` drives each entry, so a clause added here
+%% without a test drops coverage below the 100% the precommit gate
+%% requires.
+-spec fast_header(binary(), pos_integer()) ->
+    {ok, binary(), binary(), binary()} | {end_of_headers, binary()} | slow.
+fast_header(<<"\r\n", Rest/binary>>, _Max) ->
+    {end_of_headers, Rest};
+fast_header(<<"Accept:", V/binary>> = Bin, Max) ->
+    fast_value(~"accept", V, Bin, Max);
+fast_header(<<"Accept-Charset:", V/binary>> = Bin, Max) ->
+    fast_value(~"accept-charset", V, Bin, Max);
+fast_header(<<"Accept-Encoding:", V/binary>> = Bin, Max) ->
+    fast_value(~"accept-encoding", V, Bin, Max);
+fast_header(<<"Accept-Language:", V/binary>> = Bin, Max) ->
+    fast_value(~"accept-language", V, Bin, Max);
+fast_header(<<"Access-Control-Request-Headers:", V/binary>> = Bin, Max) ->
+    fast_value(~"access-control-request-headers", V, Bin, Max);
+fast_header(<<"Access-Control-Request-Method:", V/binary>> = Bin, Max) ->
+    fast_value(~"access-control-request-method", V, Bin, Max);
+fast_header(<<"Authorization:", V/binary>> = Bin, Max) ->
+    fast_value(~"authorization", V, Bin, Max);
+fast_header(<<"Cache-Control:", V/binary>> = Bin, Max) ->
+    fast_value(~"cache-control", V, Bin, Max);
+fast_header(<<"Connection:", V/binary>> = Bin, Max) ->
+    fast_value(~"connection", V, Bin, Max);
+fast_header(<<"Content-Disposition:", V/binary>> = Bin, Max) ->
+    fast_value(~"content-disposition", V, Bin, Max);
+fast_header(<<"Content-Encoding:", V/binary>> = Bin, Max) ->
+    fast_value(~"content-encoding", V, Bin, Max);
+fast_header(<<"Content-Language:", V/binary>> = Bin, Max) ->
+    fast_value(~"content-language", V, Bin, Max);
+fast_header(<<"Content-Length:", V/binary>> = Bin, Max) ->
+    fast_value(~"content-length", V, Bin, Max);
+fast_header(<<"Content-Type:", V/binary>> = Bin, Max) ->
+    fast_value(~"content-type", V, Bin, Max);
+fast_header(<<"Cookie:", V/binary>> = Bin, Max) ->
+    fast_value(~"cookie", V, Bin, Max);
+fast_header(<<"Date:", V/binary>> = Bin, Max) ->
+    fast_value(~"date", V, Bin, Max);
+fast_header(<<"DNT:", V/binary>> = Bin, Max) ->
+    fast_value(~"dnt", V, Bin, Max);
+fast_header(<<"Expect:", V/binary>> = Bin, Max) ->
+    fast_value(~"expect", V, Bin, Max);
+fast_header(<<"Forwarded:", V/binary>> = Bin, Max) ->
+    fast_value(~"forwarded", V, Bin, Max);
+fast_header(<<"From:", V/binary>> = Bin, Max) ->
+    fast_value(~"from", V, Bin, Max);
+fast_header(<<"Host:", V/binary>> = Bin, Max) ->
+    fast_value(~"host", V, Bin, Max);
+fast_header(<<"If-Match:", V/binary>> = Bin, Max) ->
+    fast_value(~"if-match", V, Bin, Max);
+fast_header(<<"If-Modified-Since:", V/binary>> = Bin, Max) ->
+    fast_value(~"if-modified-since", V, Bin, Max);
+fast_header(<<"If-None-Match:", V/binary>> = Bin, Max) ->
+    fast_value(~"if-none-match", V, Bin, Max);
+fast_header(<<"If-Range:", V/binary>> = Bin, Max) ->
+    fast_value(~"if-range", V, Bin, Max);
+fast_header(<<"If-Unmodified-Since:", V/binary>> = Bin, Max) ->
+    fast_value(~"if-unmodified-since", V, Bin, Max);
+fast_header(<<"Max-Forwards:", V/binary>> = Bin, Max) ->
+    fast_value(~"max-forwards", V, Bin, Max);
+fast_header(<<"Origin:", V/binary>> = Bin, Max) ->
+    fast_value(~"origin", V, Bin, Max);
+fast_header(<<"Pragma:", V/binary>> = Bin, Max) ->
+    fast_value(~"pragma", V, Bin, Max);
+fast_header(<<"Proxy-Authorization:", V/binary>> = Bin, Max) ->
+    fast_value(~"proxy-authorization", V, Bin, Max);
+fast_header(<<"Range:", V/binary>> = Bin, Max) ->
+    fast_value(~"range", V, Bin, Max);
+fast_header(<<"Referer:", V/binary>> = Bin, Max) ->
+    fast_value(~"referer", V, Bin, Max);
+fast_header(<<"Sec-Fetch-Dest:", V/binary>> = Bin, Max) ->
+    fast_value(~"sec-fetch-dest", V, Bin, Max);
+fast_header(<<"Sec-Fetch-Mode:", V/binary>> = Bin, Max) ->
+    fast_value(~"sec-fetch-mode", V, Bin, Max);
+fast_header(<<"Sec-Fetch-Site:", V/binary>> = Bin, Max) ->
+    fast_value(~"sec-fetch-site", V, Bin, Max);
+fast_header(<<"Sec-Fetch-User:", V/binary>> = Bin, Max) ->
+    fast_value(~"sec-fetch-user", V, Bin, Max);
+fast_header(<<"Sec-WebSocket-Extensions:", V/binary>> = Bin, Max) ->
+    fast_value(~"sec-websocket-extensions", V, Bin, Max);
+fast_header(<<"Sec-WebSocket-Key:", V/binary>> = Bin, Max) ->
+    fast_value(~"sec-websocket-key", V, Bin, Max);
+fast_header(<<"Sec-WebSocket-Protocol:", V/binary>> = Bin, Max) ->
+    fast_value(~"sec-websocket-protocol", V, Bin, Max);
+fast_header(<<"Sec-WebSocket-Version:", V/binary>> = Bin, Max) ->
+    fast_value(~"sec-websocket-version", V, Bin, Max);
+fast_header(<<"TE:", V/binary>> = Bin, Max) ->
+    fast_value(~"te", V, Bin, Max);
+fast_header(<<"Trailer:", V/binary>> = Bin, Max) ->
+    fast_value(~"trailer", V, Bin, Max);
+fast_header(<<"Transfer-Encoding:", V/binary>> = Bin, Max) ->
+    fast_value(~"transfer-encoding", V, Bin, Max);
+fast_header(<<"Upgrade:", V/binary>> = Bin, Max) ->
+    fast_value(~"upgrade", V, Bin, Max);
+fast_header(<<"Upgrade-Insecure-Requests:", V/binary>> = Bin, Max) ->
+    fast_value(~"upgrade-insecure-requests", V, Bin, Max);
+fast_header(<<"User-Agent:", V/binary>> = Bin, Max) ->
+    fast_value(~"user-agent", V, Bin, Max);
+fast_header(<<"Via:", V/binary>> = Bin, Max) ->
+    fast_value(~"via", V, Bin, Max);
+fast_header(<<"X-Forwarded-For:", V/binary>> = Bin, Max) ->
+    fast_value(~"x-forwarded-for", V, Bin, Max);
+fast_header(<<"X-Forwarded-Host:", V/binary>> = Bin, Max) ->
+    fast_value(~"x-forwarded-host", V, Bin, Max);
+fast_header(<<"X-Forwarded-Proto:", V/binary>> = Bin, Max) ->
+    fast_value(~"x-forwarded-proto", V, Bin, Max);
+fast_header(<<"X-Real-IP:", V/binary>> = Bin, Max) ->
+    fast_value(~"x-real-ip", V, Bin, Max);
+fast_header(<<"X-Requested-With:", V/binary>> = Bin, Max) ->
+    fast_value(~"x-requested-with", V, Bin, Max);
+fast_header(Bin, Max) ->
+    fast_name_lower(Bin, Bin, Max).
 
-%% Walk while every byte is a lowercase tchar; on uppercase, switch
-%% to `scan_name_upper/1`; on invalid, return `error`. The hot-path
-%% clauses (a-z, $-, 0-9) are listed before the catch-all guard so
-%% the BEAM jump table dispatches typical header bytes in one step.
--spec scan_name_lower(binary()) -> lower | upper | error.
-scan_name_lower(<<>>) ->
-    lower;
-scan_name_lower(<<C, R/binary>>) when C >= $a, C =< $z -> scan_name_lower(R);
-scan_name_lower(<<$-, R/binary>>) ->
-    scan_name_lower(R);
-scan_name_lower(<<C, R/binary>>) when C >= $0, C =< $9 -> scan_name_lower(R);
-scan_name_lower(<<C, R/binary>>) when C >= $A, C =< $Z -> scan_name_upper(R);
-scan_name_lower(<<C, R/binary>>) ->
+%% Walk the name to its colon while every byte is a lowercase tchar; on
+%% uppercase switch to `fast_name_upper/3`, which lowercases the name.
+-spec fast_name_lower(binary(), binary(), pos_integer()) ->
+    {ok, binary(), binary(), binary()} | slow.
+fast_name_lower(<<C, R/binary>>, Bin, Max) when C >= $a, C =< $z ->
+    fast_name_lower(R, Bin, Max);
+fast_name_lower(<<$-, R/binary>>, Bin, Max) ->
+    fast_name_lower(R, Bin, Max);
+fast_name_lower(<<$:, R/binary>>, Bin, Max) ->
+    case byte_size(Bin) - byte_size(R) - 1 of
+        0 -> slow;
+        Len -> fast_value(binary:part(Bin, 0, Len), R, Bin, Max)
+    end;
+fast_name_lower(<<C, R/binary>>, Bin, Max) when C >= $0, C =< $9 ->
+    fast_name_lower(R, Bin, Max);
+fast_name_lower(<<C, R/binary>>, Bin, Max) when C >= $A, C =< $Z ->
+    fast_name_upper(R, Bin, Max);
+fast_name_lower(<<C, R/binary>>, Bin, Max) ->
     case is_tchar(C) of
-        true -> scan_name_lower(R);
-        false -> error
-    end.
+        true -> fast_name_lower(R, Bin, Max);
+        false -> slow
+    end;
+fast_name_lower(<<>>, _Bin, _Max) ->
+    slow.
 
--spec scan_name_upper(binary()) -> upper | error.
-scan_name_upper(<<>>) ->
-    upper;
-scan_name_upper(<<C, R/binary>>) when C >= $a, C =< $z -> scan_name_upper(R);
-scan_name_upper(<<$-, R/binary>>) ->
-    scan_name_upper(R);
-scan_name_upper(<<C, R/binary>>) when C >= $0, C =< $9 -> scan_name_upper(R);
-scan_name_upper(<<C, R/binary>>) when C >= $A, C =< $Z -> scan_name_upper(R);
-scan_name_upper(<<C, R/binary>>) ->
+-spec fast_name_upper(binary(), binary(), pos_integer()) ->
+    {ok, binary(), binary(), binary()} | slow.
+fast_name_upper(<<C, R/binary>>, Bin, Max) when C >= $a, C =< $z ->
+    fast_name_upper(R, Bin, Max);
+fast_name_upper(<<$-, R/binary>>, Bin, Max) ->
+    fast_name_upper(R, Bin, Max);
+fast_name_upper(<<$:, R/binary>>, Bin, Max) ->
+    Len = byte_size(Bin) - byte_size(R) - 1,
+    fast_value(roadrunner_bin:ascii_lowercase(binary:part(Bin, 0, Len)), R, Bin, Max);
+fast_name_upper(<<C, R/binary>>, Bin, Max) when C >= $0, C =< $9 ->
+    fast_name_upper(R, Bin, Max);
+fast_name_upper(<<C, R/binary>>, Bin, Max) when C >= $A, C =< $Z ->
+    fast_name_upper(R, Bin, Max);
+fast_name_upper(<<C, R/binary>>, Bin, Max) ->
     case is_tchar(C) of
-        true -> scan_name_upper(R);
-        false -> error
-    end.
+        true -> fast_name_upper(R, Bin, Max);
+        false -> slow
+    end;
+fast_name_upper(<<>>, _Bin, _Max) ->
+    slow.
 
-%% RFC 9110 §5.6.2 tchar mark fallback. The scan-name walkers above
+%% RFC 9110 §5.6.2 tchar mark fallback. The fast name walkers above
 %% handle ALPHA / DIGIT / `-` inline; this only sees the remaining
 %% punctuation marks plus invalid bytes, so the alpha/digit/dash
 %% branches are pruned vs the spec's full tchar grammar.
@@ -587,49 +628,87 @@ is_tchar(C) when
 is_tchar(_) ->
     false.
 
-%% Reject CR, LF, NUL, and other CTL bytes inside header values; HTAB allowed.
-%% Bytes >= 0x80 (non-ASCII) are accepted leniently — same as cowboy.
-%%
-%% SWAR fast path, 7 bytes per step. Per byte, `X - 0x20` sets the high bit for a byte below 0x20 and
-%% `Y - 0x01` (with `Y = X xor 0x7F`) for a byte equal to 0x7F;
-%% ANDing each with its complement drops bytes >= 0x80 and is exact
-%% for "does any byte match". The byte loop finishes the value from
-%% the first word that flags (a tab, or a real error); the byte clauses
-%% repeat after the word clause so a < 7 byte tail costs no extra call.
-%% 1.8-2.7x faster than the byte loop alone from 10 bytes up.
+%% Skip leading OWS, scan the value to its CRLF, check the line length
+%% (without the CRLF) against the limit, and trim trailing OWS.
+-spec fast_value(binary(), binary(), binary(), pos_integer()) ->
+    {ok, binary(), binary(), binary()} | slow.
+fast_value(Name, <<C, R/binary>>, Bin, Max) when C =:= $\s; C =:= $\t ->
+    fast_value(Name, R, Bin, Max);
+fast_value(Name, Value, Bin, Max) ->
+    case scan_value(Value) of
+        slow ->
+            slow;
+        Rest when byte_size(Bin) - byte_size(Rest) - 2 =< Max ->
+            Raw = binary:part(Value, 0, byte_size(Value) - byte_size(Rest) - 2),
+            {ok, Name, trim_trailing_ows(Raw), Rest};
+        _Rest ->
+            slow
+    end.
 
--spec validate_value(binary()) -> ok | error.
-validate_value(<<X:56, R/binary>> = Bin) ->
+%% Scan a header value to its CRLF, rejecting CR, LF, NUL and the other
+%% CTL bytes (HTAB allowed; bytes >= 0x80 accepted leniently, same as
+%% cowboy). SWAR, 7 bytes per step: `X - 0x20` sets a byte's high bit
+%% when it is below 0x20 and `Y - 0x01` (with `Y = X xor 0x7F`) when it
+%% is 0x7F; ANDing each with its complement drops bytes >= 0x80. The
+%% byte loop finishes from the first word that flags (a tab, the CRLF, or
+%% a bad byte). Returns the bytes after the CRLF, or `slow`.
+-spec scan_value(binary()) -> binary() | slow.
+scan_value(<<X:56, R/binary>> = Bin) ->
     Y = X bxor ?BYTES(16#7F),
     case
         ((X - ?BYTES(16#20)) band (X bxor ?BYTES(255)) bor
             ((Y - ?BYTES(1)) band (Y bxor ?BYTES(255)))) band ?BYTES(128)
     of
-        0 -> validate_value(R);
-        _ -> validate_value_byte(Bin)
+        0 -> scan_value(R);
+        _ -> scan_value_byte(Bin)
     end;
-validate_value(<<>>) ->
-    ok;
-validate_value(<<C, R/binary>>) when
-    C =:= 16#09;
-    C >= 16#20, C =< 16#7E;
-    C >= 16#80
-->
-    validate_value_byte(R);
-validate_value(_) ->
-    error.
+scan_value(Bin) ->
+    scan_value_byte(Bin).
 
--spec validate_value_byte(binary()) -> ok | error.
-validate_value_byte(<<>>) ->
-    ok;
-validate_value_byte(<<C, R/binary>>) when
+-spec scan_value_byte(binary()) -> binary() | slow.
+scan_value_byte(<<"\r\n", R/binary>>) ->
+    R;
+scan_value_byte(<<C, R/binary>>) when
     C =:= 16#09;
     C >= 16#20, C =< 16#7E;
     C >= 16#80
 ->
-    validate_value_byte(R);
-validate_value_byte(_) ->
-    error.
+    scan_value_byte(R);
+scan_value_byte(_) ->
+    slow.
+
+-spec trim_trailing_ows(binary()) -> binary().
+trim_trailing_ows(<<>>) ->
+    <<>>;
+trim_trailing_ows(Value) ->
+    Len = byte_size(Value) - 1,
+    case Value of
+        <<Trimmed:Len/binary, C>> when C =:= $\s; C =:= $\t -> trim_trailing_ows(Trimmed);
+        _ -> Value
+    end.
+
+%% Every complete header line within `MaxLine` that is valid takes
+%% `fast_header/2`, so what reaches here is a line that is still
+%% incomplete, over the limit, or invalid; this only tells them apart.
+-spec parse_header_slow(binary(), pos_integer()) ->
+    {more, undefined} | {error, bad_header | header_too_long}.
+parse_header_slow(Bin, MaxLine) ->
+    case binary:match(Bin, persistent_term:get(?LF_KEY)) of
+        nomatch when byte_size(Bin) > MaxLine ->
+            {error, header_too_long};
+        nomatch ->
+            {more, undefined};
+        {0, 1} ->
+            {error, bad_header};
+        {LfPos, 1} ->
+            LineLen = LfPos - 1,
+            case Bin of
+                <<_:LineLen/binary, "\r\n", _/binary>> when LineLen > MaxLine ->
+                    {error, header_too_long};
+                _ ->
+                    {error, bad_header}
+            end
+    end.
 
 -doc """
 Parse the full HTTP/1.1 header block.
@@ -671,13 +750,7 @@ parse_headers(Bin) ->
         | too_many_headers
         | conflicting_framing}.
 parse_headers(Bin, {MaxLine, MaxBlock, MaxCount}) when is_binary(Bin) ->
-    %% Fetch the compiled LF + colon patterns ONCE here and thread
-    %% them through the per-header loop. Saves two
-    %% `persistent_term:get/1` calls per header (was ~12 per parse on
-    %% a typical request; now 2).
-    LfCp = persistent_term:get(?LF_KEY),
-    ColonCp = persistent_term:get(?COLON_KEY),
-    case parse_headers_loop(Bin, 0, 0, LfCp, ColonCp, MaxLine, MaxBlock, MaxCount) of
+    case parse_headers_loop(Bin, 0, 0, MaxLine, MaxBlock, MaxCount) of
         {ok, Headers, Rest} ->
             case check_framing(Headers) of
                 ok -> {ok, Headers, Rest};
@@ -691,8 +764,6 @@ parse_headers(Bin, {MaxLine, MaxBlock, MaxCount}) when is_binary(Bin) ->
     binary(),
     non_neg_integer(),
     non_neg_integer(),
-    binary:cp(),
-    binary:cp(),
     pos_integer(),
     pos_integer(),
     pos_integer()
@@ -704,8 +775,8 @@ parse_headers(Bin, {MaxLine, MaxBlock, MaxCount}) when is_binary(Bin) ->
         | header_too_long
         | header_block_too_long
         | too_many_headers}.
-parse_headers_loop(Bin, Count, Consumed, LfCp, ColonCp, MaxLine, MaxBlock, MaxCount) ->
-    parse_headers_loop(Bin, Count, Consumed, LfCp, ColonCp, MaxLine, MaxBlock, MaxCount, []).
+parse_headers_loop(Bin, Count, Consumed, MaxLine, MaxBlock, MaxCount) ->
+    parse_headers_loop(Bin, Count, Consumed, MaxLine, MaxBlock, MaxCount, []).
 
 %% Tail-recursive: the count, consumed-byte tally, and the parsed pairs
 %% thread forward as arguments (pairs consed in reverse, flipped once at
@@ -715,8 +786,6 @@ parse_headers_loop(Bin, Count, Consumed, LfCp, ColonCp, MaxLine, MaxBlock, MaxCo
     binary(),
     non_neg_integer(),
     non_neg_integer(),
-    binary:cp(),
-    binary:cp(),
     pos_integer(),
     pos_integer(),
     pos_integer(),
@@ -730,27 +799,25 @@ parse_headers_loop(Bin, Count, Consumed, LfCp, ColonCp, MaxLine, MaxBlock, MaxCo
         | header_block_too_long
         | too_many_headers}.
 parse_headers_loop(
-    _Bin, Count, _Consumed, _LfCp, _ColonCp, _MaxLine, _MaxBlock, MaxCount, _Acc
+    _Bin, Count, _Consumed, _MaxLine, _MaxBlock, MaxCount, _Acc
 ) when
     Count > MaxCount
 ->
     {error, too_many_headers};
 parse_headers_loop(
-    _Bin, _Count, Consumed, _LfCp, _ColonCp, _MaxLine, MaxBlock, _MaxCount, _Acc
+    _Bin, _Count, Consumed, _MaxLine, MaxBlock, _MaxCount, _Acc
 ) when
     Consumed > MaxBlock
 ->
     {error, header_block_too_long};
-parse_headers_loop(Bin, Count, Consumed, LfCp, ColonCp, MaxLine, MaxBlock, MaxCount, Acc) ->
-    case parse_header(Bin, LfCp, ColonCp, MaxLine) of
+parse_headers_loop(Bin, Count, Consumed, MaxLine, MaxBlock, MaxCount, Acc) ->
+    case parse_header(Bin, MaxLine) of
         {ok, Name, Value, Rest} ->
             Used = byte_size(Bin) - byte_size(Rest),
             parse_headers_loop(
                 Rest,
                 Count + 1,
                 Consumed + Used,
-                LfCp,
-                ColonCp,
                 MaxLine,
                 MaxBlock,
                 MaxCount,
@@ -1228,7 +1295,6 @@ encode_headers([{Name, Value} | Rest]) ->
 init_patterns() ->
     persistent_term:put(?LF_KEY, binary:compile_pattern(~"\n")),
     persistent_term:put(?CRLF_KEY, binary:compile_pattern(~"\r\n")),
-    persistent_term:put(?COLON_KEY, binary:compile_pattern(~":")),
     persistent_term:put(?SPACE_KEY, binary:compile_pattern(~" ")),
     persistent_term:put(?SEMICOLON_KEY, binary:compile_pattern(~";")),
     ok.
