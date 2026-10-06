@@ -1018,7 +1018,7 @@ rate_limit_allows({Rate, Cap, Cost, Table, Counter, IP}, Socket, ListenerName) -
     roadrunner_middleware:next()
 ) -> no_return().
 run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
-    Metadata = telemetry_metadata(Req),
+    Metadata = roadrunner_telemetry:request_metadata(Req),
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     try Pipeline(Req) of
         {Response0, Req2} when is_map(Req2) ->
@@ -1433,29 +1433,6 @@ drain_body_if_manual(#{body_reader := _} = Req) ->
     roadrunner_conn:drain_body(Req);
 drain_body_if_manual(_Req) ->
     {ok, <<>>}.
-
--spec telemetry_metadata(roadrunner_req:request()) -> roadrunner_telemetry:metadata().
-telemetry_metadata(
-    #{
-        request_id := RequestId,
-        peer := Peer,
-        method := Method,
-        target := Target,
-        scheme := Scheme,
-        listener_name := ListenerName
-    }
-) ->
-    %% Destructure the six always-present keys in one match instead of a
-    %% `maps:get` each (matching the h2/h3 builders). `listener_name` is
-    %% added by `handle_request_bytes/2` before dispatch, so it is present.
-    #{
-        request_id => RequestId,
-        peer => Peer,
-        method => Method,
-        path => Target,
-        scheme => Scheme,
-        listener_name => ListenerName
-    }.
 
 -spec rejection(#loop_state{}, atom()) -> ok.
 rejection(#loop_state{listener_name = ListenerName, peer = Peer}, Reason) ->

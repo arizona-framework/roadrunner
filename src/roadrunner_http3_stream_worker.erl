@@ -74,7 +74,7 @@ run_handler(Conn, StreamId, Req, Dispatch) ->
     %% `dispatch` is set by listener init and always present; the
     %% matched route's `Pipeline` is the pre-composed `next()` fun
     %% built once at compile / `reload_routes/2` time.
-    Metadata = telemetry_metadata(Req),
+    Metadata = roadrunner_telemetry:request_metadata(Req),
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
         {ok, Handler, Bindings, Pipeline, _State} ->
@@ -141,24 +141,6 @@ invoke(Conn, StreamId, Handler, Pipeline, #{method := Method} = Req, Metadata, R
                 Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
             )
     end.
-
--spec telemetry_metadata(roadrunner_req:request()) -> roadrunner_telemetry:metadata().
-telemetry_metadata(#{
-    request_id := RequestId,
-    peer := Peer,
-    method := Method,
-    target := Target,
-    scheme := Scheme,
-    listener_name := ListenerName
-}) ->
-    #{
-        request_id => RequestId,
-        peer => Peer,
-        method => Method,
-        path => Target,
-        scheme => Scheme,
-        listener_name => ListenerName
-    }.
 
 -spec emit_handler_response(pid(), non_neg_integer(), module(), roadrunner_handler:response()) ->
     roadrunner_http:status().

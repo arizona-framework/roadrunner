@@ -88,7 +88,7 @@ run_handler(ConnPid, StreamId, Req, Dispatch) ->
     %% if attached, ending in `fun Handler:handle/1`), built once at
     %% compile / `reload_routes/2` time — we just call it with the
     %% request, no per-request closure allocation.
-    Metadata = telemetry_metadata(Req),
+    Metadata = roadrunner_telemetry:request_metadata(Req),
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
         {ok, Handler, Bindings, Pipeline, _State} ->
@@ -158,27 +158,6 @@ invoke(ConnPid, StreamId, Handler, Pipeline, #{method := Method} = Req, Metadata
                 ~"Internal Server Error"
             )
     end.
-
--spec telemetry_metadata(roadrunner_req:request()) -> roadrunner_telemetry:metadata().
-telemetry_metadata(#{
-    request_id := RequestId,
-    peer := Peer,
-    method := Method,
-    target := Target,
-    scheme := Scheme,
-    listener_name := ListenerName
-}) ->
-    %% All five required keys are populated by
-    %% `roadrunner_http2_request:build/6`; pattern-match destructure
-    %% replaces the prior 6 `maps:get/2,3` calls per request.
-    #{
-        request_id => RequestId,
-        peer => Peer,
-        method => Method,
-        path => Target,
-        scheme => Scheme,
-        listener_name => ListenerName
-    }.
 
 %% Returns the status actually sent.
 -spec emit_handler_response(pid(), pos_integer(), module(), roadrunner_handler:response()) ->
