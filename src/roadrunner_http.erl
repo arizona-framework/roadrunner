@@ -47,9 +47,7 @@ accessors that operate on it.
 
 -define(DATE_CACHE_KEY, {?MODULE, date_cache}).
 
-%% `B` repeated in each byte of a 7-byte (56-bit) word, for the SWAR scan
-%% in `is_header_safe/1`. 56 bits stays a small integer on a 64-bit BEAM.
--define(BYTES(B), (16#01010101010101 * (B))).
+-include("roadrunner_swar.hrl").
 
 -type headers() :: [{Name :: binary(), Value :: binary()}].
 -type status() :: 100..599.
@@ -215,18 +213,17 @@ check_header_safe(Bin, Kind) ->
         false -> error({header_injection, Kind, Bin})
     end.
 
-%% `true` when `Bin` holds no CR, LF or NUL. SWAR, 7 bytes per step: a
-%% word with no byte below 0x0E is safe (`X - 0x0E` sets a byte's high
-%% bit only when it is below 0x0E, and ANDing with `bnot X` drops bytes
-%% >= 0x80). A word that flags, a tab or another low control byte, gets
-%% the exact byte check. 30-65% faster than `binary:match/2` with a
+%% `true` when `Bin` holds no CR, LF or NUL. SWAR, 7 bytes per step (see
+%% `roadrunner_swar.hrl`): a word with no byte below 0x0E is safe; a word
+%% that flags, a tab or another low control byte, gets the exact byte
+%% check. 30-65% faster than `binary:match/2` with a
 %% compiled CR/LF/NUL pattern from 3 bytes up. Exported for the callers
 %% that want a boolean (the HTTP/3 response gate answers 500 instead of
 %% crashing); most want `check_header_safe/2`.
 -doc false.
 -spec is_header_safe(binary()) -> boolean().
 is_header_safe(<<X:56, Rest/binary>> = Bin) ->
-    case (X - ?BYTES(16#0E)) band (X bxor ?BYTES(255)) band ?BYTES(128) of
+    case ?SWAR_HIGH(?SWAR_BELOW(X, 16#0E)) of
         0 ->
             is_header_safe(Rest);
         _ ->

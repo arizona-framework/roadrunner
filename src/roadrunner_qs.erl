@@ -22,9 +22,7 @@ that fail to decode pass through as raw bytes.
 -define(PLUS_KEY, {?MODULE, plus_cp}).
 -define(PCT20_KEY, {?MODULE, pct20_cp}).
 
-%% `B` repeated in each byte of a 7-byte (56-bit) word, for the SWAR scan
-%% in `has_trigger/1`. 56 bits stays a small integer on a 64-bit BEAM.
--define(BYTES(B), (16#01010101010101 * (B))).
+-include("roadrunner_swar.hrl").
 
 -doc """
 Parse a query string into an ordered list of `{Key, Value}` pairs.
@@ -114,19 +112,15 @@ encode_component(Bin, Pct20Cp) ->
 %% instead of building one per call. Conventional shape across the
 %% codebase (see `roadrunner_compress`, `roadrunner_http1`,
 %% `roadrunner_ws`).
-%% `true` when `Bin` holds a `+` or `%`. SWAR, 7 bytes per step: with
-%% `Y = X xor B` repeated, `(Y - 0x01) band bnot Y` sets a byte's high
-%% bit when that byte equals `B`, exact for "does any byte match". On
-%% short query strings this beats `binary:match/2` with a compiled
-%% `+`/`%` pattern, whose fixed call cost dominated.
+%% `true` when `Bin` holds a `+` or `%`. SWAR, 7 bytes per step (see
+%% `roadrunner_swar.hrl`). On short query strings this beats
+%% `binary:match/2` with a compiled `+`/`%` pattern, whose fixed call cost
+%% dominated.
 -spec has_trigger(binary()) -> boolean().
 has_trigger(<<X:56, Rest/binary>>) ->
-    Plus = X bxor ?BYTES($+),
-    Pct = X bxor ?BYTES($%),
-    case
-        ((Plus - ?BYTES(1)) band (Plus bxor ?BYTES(255)) bor
-            ((Pct - ?BYTES(1)) band (Pct bxor ?BYTES(255)))) band ?BYTES(128)
-    of
+    Plus = X bxor ?SWAR_BYTES($+),
+    Pct = X bxor ?SWAR_BYTES($%),
+    case ?SWAR_HIGH(?SWAR_ZERO(Plus) bor ?SWAR_ZERO(Pct)) of
         0 -> has_trigger(Rest);
         _ -> true
     end;
