@@ -89,6 +89,7 @@
 -on_load(init_patterns/0).
 
 -define(CONN_COMMA_CP_KEY, {?MODULE, conn_comma_cp}).
+-define(HEX_PAIRS_KEY, {?MODULE, hex_pairs}).
 
 -doc """
 How a request over the listener-wide `max_concurrent_requests` ceiling
@@ -583,11 +584,28 @@ refine_conn_label(ProtoOpts, Peer) ->
 -doc false.
 -spec generate_request_id(binary()) -> {binary(), binary()}.
 generate_request_id(<<Slice:8/binary, Rest/binary>>) ->
-    {binary:encode_hex(Slice, lowercase), Rest};
+    {hex_id(Slice), Rest};
 generate_request_id(_Empty) ->
     %% Buffer drained (or never initialized) — refill with one NIF call.
     <<Slice:8/binary, Rest/binary>> = crypto:strong_rand_bytes(?REQ_ID_BATCH_BYTES),
-    {binary:encode_hex(Slice, lowercase), Rest}.
+    {hex_id(Slice), Rest}.
+
+%% Lowercase hex of the 8 id bytes through a 256-entry tuple of 16-bit
+%% hex pairs (built at load in `init_patterns/0`): 30 ns against 81 ns
+%% for `binary:encode_hex/2`, and 45 ns for nibble arithmetic.
+-spec hex_id(<<_:64>>) -> <<_:128>>.
+hex_id(<<A, B, C, D, E, F, G, H>>) ->
+    Pairs = persistent_term:get(?HEX_PAIRS_KEY),
+    <<
+        (element(A + 1, Pairs)):16,
+        (element(B + 1, Pairs)):16,
+        (element(C + 1, Pairs)):16,
+        (element(D + 1, Pairs)):16,
+        (element(E + 1, Pairs)):16,
+        (element(F + 1, Pairs)):16,
+        (element(G + 1, Pairs)):16,
+        (element(H + 1, Pairs)):16
+    >>.
 
 %% Replaces (not merges) the conn process's logger metadata so a
 %% keep-alive request never inherits the previous request's correlation.
@@ -1382,6 +1400,13 @@ has_token(Value, Token) ->
 -spec init_patterns() -> ok.
 init_patterns() ->
     persistent_term:put(?CONN_COMMA_CP_KEY, binary:compile_pattern(~",")),
+    persistent_term:put(
+        ?HEX_PAIRS_KEY,
+        list_to_tuple([
+            binary:decode_unsigned(binary:encode_hex(<<Byte>>, lowercase))
+         || Byte <- lists:seq(0, 255)
+        ])
+    ),
     ok.
 
 -spec header_value(binary(), roadrunner_http:headers()) -> binary() | undefined.
