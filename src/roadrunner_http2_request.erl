@@ -70,73 +70,10 @@ from_headers(Headers, Body, RequestContext) ->
         %% discarded — the authoritative scheme comes from the conn
         %% (`RequestContext.scheme`) since clients can lie about the
         %% pseudo-header value.
-        {ok, Method, Path, Authority, Regular} ?=
-            pseudo(Headers, undefined, undefined, undefined, undefined),
+        {ok, Method, Path, Authority, Regular} ?= roadrunner_http:request_pseudo_headers(Headers),
         ok ?= check_banned(Regular),
         {ok, build(Method, Path, Authority, Regular, Body, RequestContext)}
     end.
-
-%% Collect the leading pseudo-headers (names starting with `:`) into
-%% arguments, `undefined` until seen, then check that none follows the
-%% first regular header and hand back that tail of the list as is. No
-%% map and no rebuilt header list (a 6-header HTTP/2 request: 283 ns ->
-%% 108 ns, against partitioning into a map plus a reversed accumulator).
-%% Errors keep their order: a bad,
-%% duplicate or misplaced pseudo-header first, then a missing one or an
-%% empty `:path`, then (in `from_headers/3`) a banned regular header.
--spec pseudo(
-    roadrunner_http:headers(),
-    binary() | undefined,
-    binary() | undefined,
-    binary() | undefined,
-    binary() | undefined
-) ->
-    {ok, binary(), binary(), binary() | undefined, roadrunner_http:headers()}
-    | {error, build_error()}.
-pseudo([{~":method", Value} | Rest], undefined, Scheme, Authority, Path) ->
-    pseudo(Rest, Value, Scheme, Authority, Path);
-pseudo([{~":scheme", Value} | Rest], Method, undefined, Authority, Path) ->
-    pseudo(Rest, Method, Value, Authority, Path);
-pseudo([{~":authority", Value} | Rest], Method, Scheme, undefined, Path) ->
-    pseudo(Rest, Method, Scheme, Value, Path);
-pseudo([{~":path", Value} | Rest], Method, Scheme, Authority, undefined) ->
-    pseudo(Rest, Method, Scheme, Authority, Value);
-pseudo([{Name, _} | _], _Method, _Scheme, _Authority, _Path) when
-    Name =:= ~":method"; Name =:= ~":scheme"; Name =:= ~":authority"; Name =:= ~":path"
-->
-    {error, duplicate_pseudo_header};
-pseudo([{<<":", _/binary>>, _} | _], _Method, _Scheme, _Authority, _Path) ->
-    {error, unknown_pseudo_header};
-pseudo(Regular, Method, Scheme, Authority, Path) ->
-    case no_pseudo(Regular) of
-        ok -> validate_pseudo(Method, Scheme, Authority, Path, Regular);
-        {error, _} = E -> E
-    end.
-
-%% A pseudo-header arriving after a regular header is RFC 9113 §8.1.2.1
-%% PROTOCOL_ERROR.
--spec no_pseudo(roadrunner_http:headers()) -> ok | {error, pseudo_after_regular}.
-no_pseudo([{<<":", _/binary>>, _} | _]) -> {error, pseudo_after_regular};
-no_pseudo([_ | Rest]) -> no_pseudo(Rest);
-no_pseudo([]) -> ok.
-
--spec validate_pseudo(
-    binary() | undefined,
-    binary() | undefined,
-    binary() | undefined,
-    binary() | undefined,
-    roadrunner_http:headers()
-) ->
-    {ok, binary(), binary(), binary() | undefined, roadrunner_http:headers()}
-    | {error, build_error()}.
-validate_pseudo(_Method, _Scheme, _Authority, ~"", _Regular) ->
-    {error, empty_path};
-validate_pseudo(Method, Scheme, Authority, Path, Regular) when
-    Method =/= undefined, Scheme =/= undefined, Path =/= undefined
-->
-    {ok, Method, Path, Authority, Regular};
-validate_pseudo(_Method, _Scheme, _Authority, _Path, _Regular) ->
-    {error, missing_pseudo_header}.
 
 %% Function-clause dispatch over the banned set (RFC 9113 §8.2.2)
 %% keeps the hot path branch-friendly: the BEAM compiles the
