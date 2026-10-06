@@ -225,6 +225,17 @@ body_just_below_threshold_not_compressed_test() ->
     ?assertEqual(~"Accept-Encoding", header(~"vary", Headers)),
     ?assertEqual(Body, iolist_to_binary(OutBody)).
 
+iolist_body_below_threshold_not_compressed_test() ->
+    %% A small binary skips negotiation; an iolist has no free size, so it
+    %% negotiates first and is still left uncompressed below the threshold.
+    Req = req([{~"accept-encoding", ~"gzip"}]),
+    Body = [~"small", [~" iolist", ~" body"]],
+    Next = fun(R) -> {{200, [], Body}, R} end,
+    {{200, Headers, OutBody}, _Req2} = roadrunner_compress:call(Req, Next, undefined),
+    ?assertEqual(undefined, header(~"content-encoding", Headers)),
+    ?assertEqual(~"Accept-Encoding", header(~"vary", Headers)),
+    ?assertEqual(Body, OutBody).
+
 body_at_threshold_compressed_test() ->
     %% Exactly 860 bytes — at the threshold, compression engages.
     Req = req([{~"accept-encoding", ~"gzip"}]),
