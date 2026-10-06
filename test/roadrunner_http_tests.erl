@@ -136,3 +136,22 @@ check_header_safe_low_byte_then_cr_in_same_word_test() ->
     ?assertError(
         {header_injection, value, _}, roadrunner_http:check_header_safe(~"a\tbc\rdefghij", value)
     ).
+
+%% --- check_request_authority/3 ---
+
+authority_compare_normalizes_test() ->
+    %% RFC 9113 §8.3.1 / RFC 3986 §6.2: `:authority` and `host` match when
+    %% they name the same entity, whatever their case or default port.
+    Check = fun(Authority, Host, Scheme) ->
+        roadrunner_http:check_request_authority(Authority, [{~"host", Host}], Scheme)
+    end,
+    ?assertEqual(ok, Check(~"EXAMPLE.com", ~"example.com", https)),
+    ?assertEqual(ok, Check(~"example.com:80", ~"Example.com", http)),
+    ?assertEqual(ok, Check(~"example.com:", ~"example.com:443", https)),
+    ?assertEqual(ok, Check(~"[::1]:443", ~"[::1]", https)),
+    %% Another scheme's default port is a different entity,
+    ?assertEqual({error, authority_mismatch}, Check(~"example.com:443", ~"example.com", http)),
+    ?assertEqual({error, authority_mismatch}, Check(~"example.com:80", ~"example.com", https)),
+    %% and so is a different host, including one shorter than the port.
+    ?assertEqual({error, authority_mismatch}, Check(~"a", ~"b", https)),
+    ?assertEqual({error, authority_mismatch}, Check(~"a.example", ~"b.example:443", https)).

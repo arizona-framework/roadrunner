@@ -205,7 +205,7 @@ repeated_host_is_rejected_test() ->
 
 authority_rules_test() ->
     %% An https request MUST carry `:authority` or `host`, neither empty,
-    %% and both equal when both are present.
+    %% and naming the same entity when both are present.
     Build = fun(Extra) ->
         roadrunner_http2_request:from_headers(
             [{~":method", ~"GET"}, {~":scheme", ~"https"}, {~":path", ~"/"} | Extra],
@@ -220,6 +220,28 @@ authority_rules_test() ->
         {error, authority_mismatch},
         Build([{~":authority", ~"a.example"}, {~"host", ~"b.example"}])
     ).
+
+authority_and_host_naming_one_entity_test() ->
+    %% RFC 9113 §8.3.1 compares the two after RFC 3986 §6.2 normalization:
+    %% the host is case-insensitive and the scheme's default port (or an
+    %% empty one) names the same entity as no port.
+    Build = fun(Authority, Host) ->
+        roadrunner_http2_request:from_headers(
+            [
+                {~":method", ~"GET"},
+                {~":scheme", ~"https"},
+                {~":path", ~"/"},
+                {~":authority", Authority},
+                {~"host", Host}
+            ],
+            <<>>,
+            request_context()
+        )
+    end,
+    ?assertMatch({ok, _}, Build(~"Example.com", ~"example.COM")),
+    ?assertMatch({ok, _}, Build(~"example.com:443", ~"example.com")),
+    ?assertMatch({ok, _}, Build(~"example.com", ~"example.com:")),
+    ?assertEqual({error, authority_mismatch}, Build(~"example.com:80", ~"example.com")).
 
 authority_and_equal_host_leave_one_host_test() ->
     %% A client that sends both gets a single `host`, not a duplicate.

@@ -112,6 +112,17 @@ authority_host_match_test() ->
     {ok, Req} = from(base() ++ [{~":authority", ~"example.com"}, {~"host", ~"example.com"}]),
     ?assertEqual([{~"host", ~"example.com"}], maps:get(headers, Req)).
 
+authority_host_same_entity_test() ->
+    %% Compared after RFC 3986 §6.2 normalization (RFC 9114 §4.3.1 defers
+    %% to RFC 9110 §7.2): case-insensitive host, `:443` is https's default.
+    ?assertMatch(
+        {ok, _}, from(base() ++ [{~":authority", ~"Example.com:443"}, {~"host", ~"example.com"}])
+    ),
+    ?assertEqual(
+        {error, authority_mismatch},
+        from(base() ++ [{~":authority", ~"example.com:8443"}, {~"host", ~"example.com"}])
+    ).
+
 authority_host_mismatch_test() ->
     ?assertEqual(
         {error, authority_mismatch},
