@@ -23,6 +23,7 @@
 
 -export([
     encode_data/1,
+    encode_data/2,
     encode_headers/1,
     encode_settings/1,
     encode_goaway/1,
@@ -84,7 +85,15 @@
 -doc "Encode a DATA frame (RFC 9114 §7.2.1) as an iolist.".
 -spec encode_data(iodata()) -> iolist().
 encode_data(Payload) ->
-    frame_io(?FRAME_DATA, Payload).
+    encode_data(Payload, iolist_size(Payload)).
+
+-doc """
+Like `encode_data/1`, for a caller that already knows the payload size.
+The payload is kept by reference, never flattened.
+""".
+-spec encode_data(iodata(), non_neg_integer()) -> iolist().
+encode_data(Payload, Size) ->
+    [roadrunner_quic_varint:encode(?FRAME_DATA), roadrunner_quic_varint:encode(Size), Payload].
 
 -doc "Encode a HEADERS frame (RFC 9114 §7.2.2) wrapping a QPACK field section.".
 -spec encode_headers(iodata()) -> iolist().
