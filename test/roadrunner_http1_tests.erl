@@ -1255,3 +1255,28 @@ config_defaults_match_parse_request_1_test() ->
         roadrunner_http1:parse_request(Req),
         roadrunner_http1:parse_request(Req, {8192, 8192, 10240, 100})
     ).
+
+%% --- extension methods take the general request-line path ---
+
+extension_method_request_lines_test() ->
+    %% Standard methods are matched as literals by the one-pass parser;
+    %% an extension method goes through the general path, which must
+    %% split the target the same way.
+    [
+        ?assertMatch(
+            {ok, #{method := ~"PURGE", target := Target, path := Path, version := Version}, ~""},
+            roadrunner_http1:parse_request(
+                <<"PURGE ", Target/binary, " ", VersionBin/binary, "\r\nhost: x\r\n\r\n">>
+            )
+        )
+     || {Target, Path, VersionBin, Version} <- [
+            {~"/a?b", ~"/a", ~"HTTP/1.1", {1, 1}},
+            {~"?x", ~"", ~"HTTP/1.1", {1, 1}},
+            {~"/a?", ~"/a", ~"HTTP/1.1", {1, 1}},
+            {~"/a", ~"/a", ~"HTTP/1.0", {1, 0}}
+        ]
+    ].
+
+request_line_cut_inside_short_query_asks_for_more_test() ->
+    %% The buffer ends a few bytes into the query: no space or CRLF yet.
+    ?assertEqual({more, undefined}, roadrunner_http1:parse_request(~"GET /a?b")).
