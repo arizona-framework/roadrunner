@@ -50,6 +50,25 @@ ascii_lowercase_leaves_high_bytes_unchanged_test() ->
     %% bytes pass through unchanged (this is the documented contract).
     ?assertEqual(<<"caf", 195, 137>>, roadrunner_bin:ascii_lowercase(<<"CAF", 195, 137>>)).
 
+ascii_lowercase_every_byte_at_every_position_test() ->
+    %% Every byte value at every position of a 7-byte word, of the
+    %% second word, and of the shorter tail, so each SWAR lane, the
+    %% `@`/`[` range edges, and bytes >= 128 are all exercised.
+    Filler = binary:copy(~"a", 17),
+    [
+        begin
+            <<Pre:Pos/binary, _, Post/binary>> = Filler,
+            In = <<Pre/binary, B, Post/binary>>,
+            Want =
+                case B >= $A andalso B =< $Z of
+                    true -> <<Pre/binary, (B + 32), Post/binary>>;
+                    false -> In
+                end,
+            ?assertEqual(Want, roadrunner_bin:ascii_lowercase(In))
+        end
+     || Pos <- lists:seq(0, 16), B <- lists:seq(0, 255)
+    ].
+
 ascii_lowercase_only_uppercase_test() ->
     ?assertEqual(~"hello", roadrunner_bin:ascii_lowercase(~"HELLO")).
 
