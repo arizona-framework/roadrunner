@@ -538,7 +538,7 @@ parse_single_range(Spec, Size) ->
     case binary:split(Spec, persistent_term:get(?DASH_CP_KEY)) of
         [<<>>, SuffixLen] ->
             %% `bytes=-S` — last S bytes.
-            case bin_to_pos_int(SuffixLen) of
+            case roadrunner_bin:digits_to_integer(SuffixLen) of
                 {ok, S} when S > 0, Size > 0 ->
                     Start = max(0, Size - S),
                     {range, Start, Size - 1};
@@ -547,13 +547,13 @@ parse_single_range(Spec, Size) ->
                     %% or empty file.
                     unsatisfiable;
                 error ->
-                    %% Malformed (non-numeric, negative): per RFC 9110
+                    %% Malformed (non-numeric, signed): per RFC 9110
                     %% §14.2 the server MUST ignore Range.
                     none
             end;
         [StartBin, <<>>] ->
             %% `bytes=N-` — open-ended.
-            case bin_to_pos_int(StartBin) of
+            case roadrunner_bin:digits_to_integer(StartBin) of
                 {ok, Start} when Start < Size ->
                     {range, Start, Size - 1};
                 {ok, _} ->
@@ -562,7 +562,12 @@ parse_single_range(Spec, Size) ->
                     none
             end;
         [StartBin, EndBin] ->
-            case {bin_to_pos_int(StartBin), bin_to_pos_int(EndBin)} of
+            case
+                {
+                    roadrunner_bin:digits_to_integer(StartBin),
+                    roadrunner_bin:digits_to_integer(EndBin)
+                }
+            of
                 {{ok, Start}, {ok, End}} when Start =< End, Start < Size ->
                     {range, Start, min(End, Size - 1)};
                 {{ok, _}, {ok, _}} ->
@@ -572,15 +577,6 @@ parse_single_range(Spec, Size) ->
             end;
         _ ->
             none
-    end.
-
--spec bin_to_pos_int(binary()) -> {ok, non_neg_integer()} | error.
-bin_to_pos_int(Bin) ->
-    try binary_to_integer(Bin) of
-        N when N >= 0 -> {ok, N};
-        _ -> error
-    catch
-        _:_ -> error
     end.
 
 -spec serve_range(

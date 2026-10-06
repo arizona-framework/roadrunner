@@ -164,6 +164,15 @@ static_test_() ->
                 ),
                 ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
             end},
+            {"signed range bounds are malformed and fall through to 200", fun() ->
+                [
+                    ?assertMatch(
+                        <<"HTTP/1.1 200 ", _/binary>>,
+                        http_get_with(Port, ~"/static/hello.html", [{~"Range", V}])
+                    )
+                 || V <- [~"bytes=+0-", ~"bytes=0-+4", ~"bytes=+0-4", ~"bytes=-+4"]
+                ]
+            end},
             {"sets a Last-Modified header in IMF-fixdate format", fun() ->
                 Reply = http_get(Port, ~"/static/hello.html"),
                 {match, _} = re:run(

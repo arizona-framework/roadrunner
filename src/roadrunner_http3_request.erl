@@ -209,11 +209,9 @@ check_content_length(Headers, Body) ->
             {error, content_length_mismatch};
         Value ->
             BodyLen = iolist_size(Body),
-            try binary_to_integer(Value) of
-                BodyLen -> ok;
+            case roadrunner_bin:digits_to_integer(Value) of
+                {ok, BodyLen} -> ok;
                 _ -> {error, content_length_mismatch}
-            catch
-                error:badarg -> {error, content_length_mismatch}
             end
     end.
 

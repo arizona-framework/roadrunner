@@ -787,11 +787,9 @@ compute_cached_decisions_loop([_ | Rest], Acc) ->
 -spec parse_content_length(binary()) ->
     {ok, non_neg_integer()} | {error, bad_content_length}.
 parse_content_length(V) ->
-    try binary_to_integer(V) of
-        N when N >= 0 -> {ok, N};
-        _ -> {error, bad_content_length}
-    catch
-        _:_ -> {error, bad_content_length}
+    case roadrunner_bin:digits_to_integer(V) of
+        {ok, _} = Ok -> Ok;
+        error -> {error, bad_content_length}
     end.
 
 -doc """

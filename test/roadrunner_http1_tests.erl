@@ -723,6 +723,15 @@ cached_decisions_caches_bad_content_length_negative_test() ->
         roadrunner_http1:compute_cached_decisions([{~"content-length", ~"-1"}])
     ).
 
+cached_decisions_caches_bad_content_length_signed_test() ->
+    [
+        ?assertMatch(
+            #{content_length := {error, bad_content_length}},
+            roadrunner_http1:compute_cached_decisions([{~"content-length", V}])
+        )
+     || V <- [~"+5", ~"-0"]
+    ].
+
 cached_decisions_content_length_default_none_test() ->
     ?assertMatch(
         #{content_length := none},

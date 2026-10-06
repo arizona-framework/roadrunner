@@ -131,6 +131,7 @@ all_test_() ->
         fun trailers_with_malformed_hpack_goaway/0,
         fun content_length_match_dispatches/0,
         fun content_length_non_integer_rst_stream/0,
+        fun content_length_signed_rst_stream/0,
         fun hpack_table_size_update_after_block_goaway/0,
         fun headers_for_closed_stream_protocol_error/0,
         fun settings_initial_window_size_shifts_stream_window/0,
@@ -3350,6 +3351,32 @@ content_length_non_integer_rst_stream() ->
         roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, HpackBin})
     ),
     serve_recv(ConnPid, H),
+    Out = expect_send(),
+    ?assertMatch(<<_:24, 3, _/binary>>, Out),
+    cleanup(Pid, Ref).
+
+content_length_signed_rst_stream() ->
+    %% `+5` is not `1*DIGIT`, so it never matches the 5-byte body even
+    %% though `binary_to_integer/1` would read it as 5.
+    {Pid, Ref, ConnPid} = post_handshake_handler(roadrunner_h2_test_handler),
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"POST"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"},
+            {~"content-length", ~"+5"}
+        ],
+        Enc
+    ),
+    HpackBin = iolist_to_binary(Hpack),
+    H = iolist_to_binary(
+        roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
+    ),
+    serve_recv(ConnPid, H),
+    Data = <<5:24, 0, 1, 0:1, 1:31, "abcde">>,
+    serve_recv(ConnPid, Data),
     Out = expect_send(),
     ?assertMatch(<<_:24, 3, _/binary>>, Out),
     cleanup(Pid, Ref).

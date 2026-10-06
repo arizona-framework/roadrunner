@@ -164,6 +164,18 @@ read_body_negative_cl_test() ->
         roadrunner_conn:read_body(Req, ~"", NoRecv, 1000, {8192, 10240, 100})
     ).
 
+read_body_signed_cl_test() ->
+    NoRecv = fun() -> error(should_not_be_called) end,
+    [
+        ?assertEqual(
+            {error, bad_content_length},
+            roadrunner_conn:read_body(
+                req_with_headers([{~"content-length", V}]), ~"", NoRecv, 1000, {8192, 10240, 100}
+            )
+        )
+     || V <- [~"+5", ~"-0"]
+    ].
+
 read_body_recv_error_test() ->
     Req = req_with_headers([{~"content-length", ~"100"}]),
     Recv = fun() -> {error, closed} end,

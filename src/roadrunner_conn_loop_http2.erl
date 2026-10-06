@@ -1245,11 +1245,9 @@ content_length_matches(Headers, BodyLen) ->
         multiple ->
             false;
         V ->
-            try binary_to_integer(V) of
-                BodyLen -> true;
+            case roadrunner_bin:digits_to_integer(V) of
+                {ok, BodyLen} -> true;
                 _ -> false
-            catch
-                error:badarg -> false
             end
     end.
 

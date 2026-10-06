@@ -1231,11 +1231,9 @@ content_length(Req) ->
         undefined ->
             none;
         Bin ->
-            try binary_to_integer(Bin) of
-                N when N >= 0 -> {ok, N};
-                _ -> {error, bad_content_length}
-            catch
-                _:_ -> {error, bad_content_length}
+            case roadrunner_bin:digits_to_integer(Bin) of
+                {ok, _} = Ok -> Ok;
+                error -> {error, bad_content_length}
             end
     end.
 
