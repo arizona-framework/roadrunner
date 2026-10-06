@@ -126,35 +126,21 @@ lower_name(<<_, Rest/binary>>) -> lower_name(Rest).
 %% RFC 9114 §4.1.2 / RFC 9110 §8.6: a `content-length` header whose value does
 %% not equal the bytes received in DATA frames (or a multi-valued or
 %% non-integer value) makes the request malformed; an absent header is always
-%% acceptable. Single-pass walk; the body size is taken only when a value is
-%% actually present. Mirrors roadrunner_conn_loop_http2:content_length_matches/2.
+%% acceptable. The body size is taken only when a value is actually present.
 -spec check_content_length(roadrunner_http:headers(), iodata()) ->
     ok | {error, content_length_mismatch}.
 check_content_length(Headers, Body) ->
-    case find_content_length(Headers, undefined) of
+    case roadrunner_http:request_content_length(Headers) of
         none ->
             ok;
-        multiple ->
-            {error, content_length_mismatch};
-        Value ->
-            BodyLen = iolist_size(Body),
-            case roadrunner_bin:digits_to_integer(Value) of
-                {ok, BodyLen} -> ok;
+        {ok, Length} ->
+            case iolist_size(Body) of
+                Length -> ok;
                 _ -> {error, content_length_mismatch}
-            end
+            end;
+        error ->
+            {error, content_length_mismatch}
     end.
-
--spec find_content_length(roadrunner_http:headers(), binary() | undefined) ->
-    binary() | none | multiple.
-find_content_length([], undefined) ->
-    none;
-find_content_length([], Value) ->
-    Value;
-find_content_length([{~"content-length", _} | _], Value) when Value =/= undefined -> multiple;
-find_content_length([{~"content-length", Value} | Rest], undefined) ->
-    find_content_length(Rest, Value);
-find_content_length([_ | Rest], Value) ->
-    find_content_length(Rest, Value).
 
 -spec build(
     binary(),

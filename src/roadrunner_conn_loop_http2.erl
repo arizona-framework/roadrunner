@@ -1230,32 +1230,16 @@ dispatch_stream(
     end.
 
 %% Verify that any client-supplied `content-length` header matches
-%% the cumulative bytes received in DATA frames. Absent header is
-%% always acceptable; multi-valued or non-integer values are
-%% rejected as mismatches.
-%% Single-pass walk: find the first (and check there isn't a
-%% second) `content-length` header value, then compare against
-%% `BodyLen`. Avoids the per-request list-comprehension allocation
-%% the prior shape paid even when no `content-length` was present.
+%% the cumulative bytes received in DATA frames (RFC 9113 §8.1.1).
+%% Absent header is always acceptable; multi-valued or non-integer
+%% values are rejected as mismatches.
 -spec content_length_matches([{binary(), binary()}], non_neg_integer()) -> boolean().
 content_length_matches(Headers, BodyLen) ->
-    case find_content_length(Headers, undefined) of
-        none ->
-            true;
-        multiple ->
-            false;
-        V ->
-            case roadrunner_bin:digits_to_integer(V) of
-                {ok, BodyLen} -> true;
-                _ -> false
-            end
+    case roadrunner_http:request_content_length(Headers) of
+        none -> true;
+        {ok, BodyLen} -> true;
+        _ -> false
     end.
-
-find_content_length([], undefined) -> none;
-find_content_length([], V) -> V;
-find_content_length([{~"content-length", _} | _], V) when V =/= undefined -> multiple;
-find_content_length([{~"content-length", V} | Rest], undefined) -> find_content_length(Rest, V);
-find_content_length([_ | Rest], V) -> find_content_length(Rest, V).
 
 %% =============================================================================
 %% Worker → conn message handlers
