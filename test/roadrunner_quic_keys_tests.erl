@@ -86,7 +86,7 @@ for_connection_protects_like_the_raw_key_test() ->
     %% 16-byte header-protection key it was built from, packet after
     %% packet (ECB keeps no state between blocks).
     #{hp := Raw} = Keys = roadrunner_quic_keys:initial_server(<<16#8394c8f03e515708:64>>),
-    #{hp := State} = roadrunner_quic_keys:for_connection(Keys),
+    #{hp := State} = roadrunner_quic_keys:for_connection(Keys, seal),
     Header = <<16#c3, 1:32, 8, 0:64, 0, 16#4499:16, 2:32>>,
     [
         ?assertEqual(
@@ -94,4 +94,27 @@ for_connection_protects_like_the_raw_key_test() ->
             roadrunner_quic_aead:protect_header(State, Header, Cipher, byte_size(Header) - 4)
         )
      || Cipher <- [crypto:strong_rand_bytes(32) || _ <- lists:seq(1, 20)]
+    ].
+
+for_connection_seals_and_opens_like_the_raw_key_test() ->
+    %% The connection's sealing state must produce the raw key's bytes,
+    %% and its opening state must open them, packet after packet.
+    Keys = roadrunner_quic_keys:initial_server(<<16#8394c8f03e515708:64>>),
+    #{key := Raw, iv := IV} = Keys,
+    #{key := SealKey} = roadrunner_quic_keys:for_connection(Keys, seal),
+    #{key := OpenKey} = roadrunner_quic_keys:for_connection(Keys, open),
+    [
+        begin
+            Plaintext = crypto:strong_rand_bytes(Size),
+            AAD = crypto:strong_rand_bytes(20),
+            Sealed = roadrunner_quic_aead:seal(Raw, IV, PN, AAD, Plaintext),
+            ?assertEqual(Sealed, roadrunner_quic_aead:seal(SealKey, IV, PN, AAD, Plaintext)),
+            ?assertEqual({ok, Plaintext}, roadrunner_quic_aead:open(OpenKey, IV, PN, AAD, Sealed)),
+            <<Flip, Rest/binary>> = Sealed,
+            ?assertEqual(
+                error,
+                roadrunner_quic_aead:open(OpenKey, IV, PN, AAD, <<(Flip bxor 1), Rest/binary>>)
+            )
+        end
+     || {PN, Size} <- [{0, 1}, {1, 64}, {2, 1200}, {16#FFFF, 300}]
     ].

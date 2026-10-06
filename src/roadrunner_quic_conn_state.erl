@@ -267,12 +267,12 @@ new(
         tls = Tls,
         recv_keys = #{
             initial => roadrunner_quic_keys:for_connection(
-                roadrunner_quic_keys:initial_client(DCID)
+                roadrunner_quic_keys:initial_client(DCID), open
             )
         },
         send_keys = #{
             initial => roadrunner_quic_keys:for_connection(
-                roadrunner_quic_keys:initial_server(DCID)
+                roadrunner_quic_keys:initial_server(DCID), seal
             )
         },
         spaces = #{initial => new_space(), handshake => new_space()},
@@ -822,11 +822,11 @@ install_keys(Installs, State) ->
 -spec install_key(roadrunner_quic_tls_server:install(), t()) -> t().
 install_key({Level, server, Keys}, #state{send_keys = SendKeys} = State) ->
     ensure_space(Level, State#state{
-        send_keys = SendKeys#{Level => roadrunner_quic_keys:for_connection(Keys)}
+        send_keys = SendKeys#{Level => roadrunner_quic_keys:for_connection(Keys, seal)}
     });
 install_key({Level, client, Keys}, #state{recv_keys = RecvKeys} = State) ->
     ensure_space(Level, State#state{
-        recv_keys = RecvKeys#{Level => roadrunner_quic_keys:for_connection(Keys)}
+        recv_keys = RecvKeys#{Level => roadrunner_quic_keys:for_connection(Keys, open)}
     }).
 
 -spec ensure_space(level(), t()) -> t().
