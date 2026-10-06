@@ -41,7 +41,7 @@ accessors that operate on it.
 -export([header_list_size/1]).
 -export([check_header_safe/2, is_header_safe/1]).
 -export([strip_connection_specific_fields/1, strip_connection_specific_fields_safe/1]).
--export([request_pseudo_headers/1, check_request_authority/2]).
+-export([request_pseudo_headers/1, check_request_authority/2, request_content_length/1]).
 
 -export_type([headers/0, status/0, redirect_status/0, version/0]).
 
@@ -393,3 +393,32 @@ check_request_authority(Authority, Regular) ->
 find_host([]) -> undefined;
 find_host([{~"host", Value} | _]) -> Value;
 find_host([_ | Rest]) -> find_host(Rest).
+
+%% The `content-length` of an HTTP/2 or HTTP/3 request, which the caller
+%% compares with the bytes its DATA frames carried (RFC 9113 §8.1.1, RFC
+%% 9114 §4.1.2): `none` without the header, `error` for a repeated or
+%% non-integer one. Single-pass walk: find the first value and check
+%% there isn't a second.
+-doc false.
+-spec request_content_length(headers()) -> none | {ok, non_neg_integer()} | error.
+request_content_length(Headers) ->
+    case find_content_length(Headers, undefined) of
+        none ->
+            none;
+        multiple ->
+            error;
+        Value ->
+            roadrunner_bin:digits_to_integer(Value)
+    end.
+
+-spec find_content_length(headers(), binary() | undefined) -> binary() | none | multiple.
+find_content_length([], undefined) ->
+    none;
+find_content_length([], Value) ->
+    Value;
+find_content_length([{~"content-length", _} | _], Value) when Value =/= undefined ->
+    multiple;
+find_content_length([{~"content-length", Value} | Rest], undefined) ->
+    find_content_length(Rest, Value);
+find_content_length([_ | Rest], Value) ->
+    find_content_length(Rest, Value).
