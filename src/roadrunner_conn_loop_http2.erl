@@ -1909,11 +1909,7 @@ send_rst_stream(State, StreamId, ErrorCode) ->
 %% when a stream is refused at the `max_concurrent_requests` ceiling.
 -spec throttle_stream(#loop{}, atom()) -> ok.
 throttle_stream(#loop{proto_opts = #{throttled_counter := Counter}}, ListenerName) ->
-    ok = atomics:add(Counter, 1, 1),
-    roadrunner_telemetry:request_throttled(#{
-        listener_name => ListenerName,
-        reason => max_concurrent_requests
-    }).
+    roadrunner_conn:throttled_telemetry(ListenerName, Counter, max_concurrent_requests).
 
 %% Per-peer rate-limit gate before spawning a stream worker. `ok` to proceed;
 %% `{refused, State1}` after sending `429` + `Retry-After` and an
@@ -1936,7 +1932,7 @@ rate_limit_refused(
         allow ->
             ok;
         {deny, RetryAfter} ->
-            ok = roadrunner_conn:rate_limited_telemetry(ListenerName, Counter),
+            ok = roadrunner_conn:throttled_telemetry(ListenerName, Counter, rate_limit),
             State1 = encode_and_send_response_atomic(
                 State, StreamId, 429, [{~"retry-after", integer_to_binary(RetryAfter)}], ~"", 0
             ),

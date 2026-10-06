@@ -1006,7 +1006,7 @@ rate_limit_allows({Rate, Cap, Cost, Table, Counter, IP}, Socket, ListenerName) -
         allow ->
             true;
         {deny, RetryAfter} ->
-            ok = roadrunner_conn:rate_limited_telemetry(ListenerName, Counter),
+            ok = roadrunner_conn:throttled_telemetry(ListenerName, Counter, rate_limit),
             _ = roadrunner_conn:send_rate_limited(Socket, RetryAfter),
             false
     end.

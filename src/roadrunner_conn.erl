@@ -71,7 +71,7 @@
     send_rate_limited/2,
     rate_limit_check/6,
     resolve_rate_limit/2,
-    rate_limited_telemetry/2,
+    throttled_telemetry/3,
     rate_limit_evict_idle/3,
     drain_oversized_body/3,
     send_internal_error/1,
@@ -447,13 +447,18 @@ rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) ->
             allow
     end.
 
--doc "Record a rate-limit refusal: bump the cumulative counter and emit telemetry.".
--spec rate_limited_telemetry(atom(), atomics:atomics_ref()) -> ok.
-rate_limited_telemetry(ListenerName, Counter) ->
+-doc """
+Record a throttled request, refused for `Reason` (the per-peer rate limit
+or the listener's concurrent-request ceiling): bump the cumulative
+counter and emit `[roadrunner, request, throttled]`.
+""".
+-spec throttled_telemetry(atom(), atomics:atomics_ref(), rate_limit | max_concurrent_requests) ->
+    ok.
+throttled_telemetry(ListenerName, Counter, Reason) ->
     ok = atomics:add(Counter, 1, 1),
     roadrunner_telemetry:request_throttled(#{
         listener_name => ListenerName,
-        reason => rate_limit
+        reason => Reason
     }).
 
 -doc """

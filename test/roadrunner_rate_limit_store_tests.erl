@@ -60,13 +60,14 @@ resolve_on_test() ->
         {10, 600000, 30000, Table, Counter, ?IP}, ?M:resolve_rate_limit(Opts, {?IP, 5000})
     ).
 
-%% --- rate_limited_telemetry/2 ---
+%% --- throttled_telemetry/3 ---
 
 telemetry_bumps_counter_test() ->
     {ok, _} = application:ensure_all_started(telemetry),
     Counter = atomics:new(1, [{signed, false}]),
-    ok = ?M:rate_limited_telemetry(some_listener, Counter),
-    ?assertEqual(1, atomics:get(Counter, 1)).
+    ok = ?M:throttled_telemetry(some_listener, Counter, rate_limit),
+    ok = ?M:throttled_telemetry(some_listener, Counter, max_concurrent_requests),
+    ?assertEqual(2, atomics:get(Counter, 1)).
 
 %% --- rate_limit_evict_idle/4 ---
 
