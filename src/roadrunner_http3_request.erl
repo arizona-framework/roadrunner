@@ -47,12 +47,7 @@
     | empty_authority
     | authority_mismatch.
 
--type request_context() :: #{
-    peer := {inet:ip_address(), inet:port_number()} | undefined,
-    scheme := http | https,
-    request_id := binary(),
-    listener_name := atom()
-}.
+-type request_context() :: roadrunner_http:request_context().
 
 -doc """
 Build a request map from a QPACK-decoded header list. `RequestContext`
@@ -81,7 +76,10 @@ from_headers(Headers, Body, RequestContext) ->
         ok ?= check_banned(Regular),
         ok ?= check_content_length(Regular, Body),
         ok ?= roadrunner_http:check_request_authority(Authority, Regular),
-        {ok, build(Method, Path, Authority, Regular, Body, RequestContext)}
+        {ok,
+            roadrunner_http:build_request(
+                {3, 0}, Method, Path, Authority, Regular, Body, RequestContext
+            )}
     end.
 
 %% Function-clause dispatch over the banned set (RFC 9114 §4.2) keeps
@@ -141,43 +139,3 @@ check_content_length(Headers, Body) ->
         error ->
             {error, content_length_mismatch}
     end.
-
--spec build(
-    binary(),
-    binary(),
-    binary() | undefined,
-    roadrunner_http:headers(),
-    iodata(),
-    request_context()
-) -> roadrunner_req:request().
-build(Method, Path, Authority, Regular, Body, RequestContext) ->
-    %% Forward `:authority` as a `host` header so existing handler code
-    %% that reads `Host` still works (RFC 9114 §4.3.1 treats `:authority`
-    %% like `Host`). When the client also sent a (validated equal) `host`
-    %% header, drop it first so a single canonical entry survives instead
-    %% of a duplicate.
-    HeadersWithHost =
-        case Authority of
-            undefined -> Regular;
-            _ -> [{~"host", Authority} | lists:keydelete(~"host", 1, Regular)]
-        end,
-    %% The conn loop always builds `RequestContext` with all four
-    %% fields populated, so pattern-matching wins vs. four `maps:get/3`.
-    #{
-        peer := Peer,
-        scheme := Scheme,
-        request_id := RequestId,
-        listener_name := ListenerName
-    } = RequestContext,
-    #{
-        method => Method,
-        target => Path,
-        version => {3, 0},
-        headers => HeadersWithHost,
-        body => Body,
-        bindings => #{},
-        peer => Peer,
-        scheme => Scheme,
-        request_id => RequestId,
-        listener_name => ListenerName
-    }.
