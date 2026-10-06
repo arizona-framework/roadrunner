@@ -2,9 +2,9 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-%% =============================================================================
+%% ======================================================================
 %% parse_loop/2 — pure unit tests with a mock recv fun
-%% =============================================================================
+%% ======================================================================
 
 parse_loop_full_buffer_test() ->
     Buf = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
@@ -31,9 +31,9 @@ parse_loop_parse_error_test() ->
         roadrunner_conn:parse_loop(~"BAD\r\n\r\n", NoRecv)
     ).
 
-%% =============================================================================
+%% ======================================================================
 %% read_body/4 — pure unit tests with a mock recv fun
-%% =============================================================================
+%% ======================================================================
 
 read_body_no_content_length_test() ->
     %% Per RFC 7230 §3.3.3: a request without Content-Length or
@@ -440,9 +440,9 @@ chunked_recv(Chunks) ->
         end
     end.
 
-%% =============================================================================
+%% ======================================================================
 %% resolve_handler/2 — dispatch tag → {ok, Mod, Bindings, Pipeline, State}
-%% =============================================================================
+%% ======================================================================
 
 resolve_handler_passes_pipeline_and_state_through_test() ->
     %% The handler-form dispatch tag just unpacks: the pre-baked
@@ -503,9 +503,9 @@ resolve_handler_router_method_not_allowed_test() ->
 dummy_req() ->
     #{target => ~"/"}.
 
-%% =============================================================================
+%% ======================================================================
 %% End-to-end integration over a real TCP socket
-%% =============================================================================
+%% ======================================================================
 
 conn_serves_200_on_get_test_() ->
     {setup,
@@ -2337,9 +2337,9 @@ recv_response_with_body(Sock, BodyLen) ->
         end,
     <<Head/binary, "\r\n\r\n", Body/binary>>.
 
-%% =============================================================================
+%% ======================================================================
 %% parse_error_status/1 — pure unit tests
-%% =============================================================================
+%% ======================================================================
 
 parse_error_status_request_line_too_long_test() ->
     ?assertEqual(414, roadrunner_conn:parse_error_status(request_line_too_long)).
@@ -2358,10 +2358,10 @@ parse_error_status_other_is_400_test() ->
     ?assertEqual(400, roadrunner_conn:parse_error_status(bad_version)),
     ?assertEqual(400, roadrunner_conn:parse_error_status(missing_host)).
 
-%% =============================================================================
+%% ======================================================================
 %% try_acquire_request_slot/2 + release_request_slot[s] — pure unit tests
 %% (`refuse` is the default overload mode: pure counters, no queue.)
-%% =============================================================================
+%% ======================================================================
 
 request_slot_infinity_is_noop_test() ->
     %% `infinity` short-circuits before touching any counter, so the counter
@@ -2409,3 +2409,15 @@ request_ids(<<>>) ->
 request_ids(Buf) ->
     {Id, Rest} = roadrunner_conn:generate_request_id(Buf),
     [Id | request_ids(Rest)].
+
+keep_alive_decision_cached_keep_alive_request_test() ->
+    %% Parser-cached `Connection: keep-alive` on HTTP/1.1 keeps the
+    %% connection open unless the response asks to close it.
+    Headers = [{~"connection", ~"keep-alive"}],
+    Req = (req_with_headers(Headers))#{
+        cached_decisions => roadrunner_http1:compute_cached_decisions(Headers)
+    },
+    ?assertEqual(keep_alive, roadrunner_conn:keep_alive_decision(Req, [])),
+    ?assertEqual(
+        close, roadrunner_conn:keep_alive_decision(Req, [{~"connection", ~"close"}])
+    ).

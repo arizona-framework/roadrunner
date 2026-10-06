@@ -1312,16 +1312,17 @@ head_response(Response, _Method) ->
 -spec keep_alive_decision(roadrunner_req:request(), roadrunner_http:headers()) ->
     keep_alive | close.
 %% Common-case fast path: HTTP/1.1, parser-cached request `Connection`
-%% empty, response has no `connection` header → `keep_alive` directly.
-%% Skips the lowercase + has_token dance entirely. Most production
-%% hello/echo responses hit this path.
+%% empty or exactly `keep-alive` (what browsers send; on HTTP/1.1 it
+%% carries no `close` token, so it decides the same as empty), response
+%% has no `connection` header → `keep_alive` directly. Skips the
+%% lowercase + has_token dance (~120 ns for `keep-alive`) entirely.
 keep_alive_decision(
     #{
         version := {1, 1},
-        cached_decisions := #{connection_lower := <<>>}
+        cached_decisions := #{connection_lower := ReqConn}
     } = Req,
     RespHeaders
-) when is_list(RespHeaders) ->
+) when is_list(RespHeaders), (ReqConn =:= <<>> orelse ReqConn =:= ~"keep-alive") ->
     case lists:keymember(~"connection", 1, RespHeaders) of
         false -> keep_alive;
         true -> keep_alive_decision_full(Req, RespHeaders)
