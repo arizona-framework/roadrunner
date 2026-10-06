@@ -168,6 +168,9 @@ handle(#{target := ~"/sendfile/large"} = Req) ->
     {{sendfile, 200, [], {"/tmp/rr_h2_sf_large.bin", 0, 100_000}}, Req};
 handle(#{target := ~"/websocket"} = Req) ->
     {{websocket, some_module, state}, Req};
+handle(#{target := ~"/interim-stream"} = Req) ->
+    %% The same misuse in the stream shape: still answered with 500.
+    {{stream, 103, [], fun(Send) -> Send(~"never sent", fin) end}, Req};
 handle(#{target := ~"/interim"} = Req) ->
     %% A buffered 1xx (interim) status returned as a final response is a
     %% misuse (RFC 9110 §15.2); the worker rejects it with 500.
