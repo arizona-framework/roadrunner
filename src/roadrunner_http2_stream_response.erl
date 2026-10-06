@@ -52,7 +52,7 @@ conn (which owns HPACK encoder state and serialises wire writes).
     roadrunner_handler:stream_fun()
 ) -> ok.
 run(ConnPid, StreamId, Status, Headers, Fun) ->
-    sync_send_headers(ConnPid, StreamId, Status, Headers, false),
+    roadrunner_http2_worker_sync:send_headers(ConnPid, StreamId, Status, Headers, false),
     erase(?FIN_KEY),
     Send = fun(Data, FinFlag) -> do_send(ConnPid, StreamId, Data, FinFlag) end,
     _ = Fun(Send),
@@ -63,29 +63,19 @@ do_send(ConnPid, StreamId, Data, nofin) ->
     %% Ship as iodata. The conn fast-paths single-frame sends
     %% without materialising and only flattens when chunking
     %% across window/MAX_FRAME_SIZE boundaries.
-    iolist_size(Data) > 0 andalso sync_send_data(ConnPid, StreamId, Data, false),
+    iolist_size(Data) > 0 andalso
+        roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, false),
     ok;
 do_send(ConnPid, StreamId, Data, fin) ->
-    sync_send_data(ConnPid, StreamId, Data, true),
+    roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, true),
     put(?FIN_KEY, true),
     ok;
 do_send(ConnPid, StreamId, Data, {fin, Trailers}) ->
-    iolist_size(Data) > 0 andalso sync_send_data(ConnPid, StreamId, Data, false),
+    iolist_size(Data) > 0 andalso
+        roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, false),
     sync_send_trailers(ConnPid, StreamId, Trailers),
     put(?FIN_KEY, true),
     ok.
-
-sync_send_headers(ConnPid, StreamId, Status, Headers, EndStream) ->
-    roadrunner_http2_worker_sync:sync(ConnPid, fun(Ref) ->
-        _ = (ConnPid ! {h2_send_headers, self(), Ref, StreamId, Status, Headers, EndStream}),
-        ok
-    end).
-
-sync_send_data(ConnPid, StreamId, Data, EndStream) ->
-    roadrunner_http2_worker_sync:sync(ConnPid, fun(Ref) ->
-        _ = (ConnPid ! {h2_send_data, self(), Ref, StreamId, Data, EndStream}),
-        ok
-    end).
 
 sync_send_trailers(ConnPid, StreamId, Trailers) ->
     roadrunner_http2_worker_sync:sync(ConnPid, fun(Ref) ->
