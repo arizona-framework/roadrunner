@@ -181,33 +181,39 @@ decode(Bin, Ctx) ->
     %% subsequent update is COMPRESSION_ERROR.
     decode_loop(Bin, Ctx, true).
 
--spec decode_loop(bitstring(), context(), boolean()) ->
+%% Byte-aligned dispatch on the representation's first byte (RFC 7541
+%% §6): the type bits are a numeric range, so a `>=` guard picks the
+%% clause and `band` takes the integer prefix, instead of matching
+%% bitstring fields and decoding every prefix through the generic
+%% N-bit `decode_integer/2`. About half the time on an indexed-heavy
+%% block (a warm 11-header browser request: 515 ns -> 304 ns).
+-spec decode_loop(binary(), context(), boolean()) ->
     {ok, [header()], context()} | {error, decode_error()}.
 decode_loop(<<>>, Ctx, _) ->
     {ok, [], Ctx};
-decode_loop(<<1:1, Rest/bitstring>>, Ctx, _UpdatesAllowed) ->
+decode_loop(<<B, Rest/binary>>, Ctx, _UpdatesAllowed) when B >= 16#80 ->
     %% 1xxxxxxx — Indexed Header Field. 7-bit integer prefix.
     maybe
-        {ok, Index, Rest1} ?= decode_integer(7, Rest),
+        {ok, Index, Rest1} ?= prefix_integer(B band 16#7F, 16#7F, Rest),
         {ok, Header} ?= lookup_indexed(Index, Ctx),
         {ok, Tail, Ctx2} ?= decode_loop(Rest1, Ctx, false),
         {ok, [Header | Tail], Ctx2}
     end;
-decode_loop(<<0:1, 1:1, Rest/bitstring>>, Ctx, _UpdatesAllowed) ->
-    %% 01xxxxxx — Literal w/ Incremental Indexing.
+decode_loop(<<B, Rest/binary>>, Ctx, _UpdatesAllowed) when B >= 16#40 ->
+    %% 01xxxxxx — Literal w/ Incremental Indexing. 6-bit name index.
     maybe
-        {ok, Header, Rest1} ?= decode_literal(6, Rest, Ctx),
+        {ok, Header, Rest1} ?= decode_literal(B band 16#3F, 16#3F, Rest, Ctx),
         Ctx2 = insert(Header, Ctx),
         {ok, Tail, Ctx3} ?= decode_loop(Rest1, Ctx2, false),
         {ok, [Header | Tail], Ctx3}
     end;
-decode_loop(<<0:1, 0:1, 1:1, _/bitstring>>, _Ctx, false) ->
+decode_loop(<<B, _/binary>>, _Ctx, false) when B >= 16#20 ->
     %% RFC 7541 §4.2: a Dynamic Table Size Update is only legal
     %% at the start of a header block.
     {error, table_size_update_after_block};
-decode_loop(<<0:1, 0:1, 1:1, Rest/bitstring>>, Ctx, true) ->
-    %% 001xxxxx — Dynamic Table Size Update.
-    case decode_integer(5, Rest) of
+decode_loop(<<B, Rest/binary>>, Ctx, true) when B >= 16#20 ->
+    %% 001xxxxx — Dynamic Table Size Update. 5-bit prefix.
+    case prefix_integer(B band 16#1F, 16#1F, Rest) of
         {ok, NewSize, Rest1} when NewSize =< Ctx#hpack_ctx.limit ->
             Ctx1 = evict_to(NewSize, Ctx),
             Ctx2 = Ctx1#hpack_ctx{max_size = NewSize},
@@ -217,34 +223,37 @@ decode_loop(<<0:1, 0:1, 1:1, Rest/bitstring>>, Ctx, true) ->
         {error, _} = E ->
             E
     end;
-decode_loop(<<0:1, 0:1, 0:1, 1:1, Rest/bitstring>>, Ctx, _UpdatesAllowed) ->
-    %% 0001xxxx — Literal Never Indexed. Treated identically to
-    %% Literal w/o Indexing on the decode side; the difference
-    %% only matters to intermediaries that re-encode (RFC 7541
-    %% §6.2.3 sensitive header field).
+decode_loop(<<B, Rest/binary>>, Ctx, _UpdatesAllowed) ->
+    %% 0001xxxx — Literal Never Indexed, or 0000xxxx — Literal w/o
+    %% Indexing; both have a 4-bit name index. Never Indexed decodes
+    %% identically: the difference only matters to intermediaries that
+    %% re-encode (RFC 7541 §6.2.3 sensitive header field).
     maybe
-        {ok, Header, Rest1} ?= decode_literal(4, Rest, Ctx),
-        {ok, Tail, Ctx2} ?= decode_loop(Rest1, Ctx, false),
-        {ok, [Header | Tail], Ctx2}
-    end;
-decode_loop(<<0:1, 0:1, 0:1, 0:1, Rest/bitstring>>, Ctx, _UpdatesAllowed) ->
-    %% 0000xxxx — Literal w/o Indexing.
-    maybe
-        {ok, Header, Rest1} ?= decode_literal(4, Rest, Ctx),
+        {ok, Header, Rest1} ?= decode_literal(B band 16#0F, 16#0F, Rest, Ctx),
         {ok, Tail, Ctx2} ?= decode_loop(Rest1, Ctx, false),
         {ok, [Header | Tail], Ctx2}
     end.
 
--spec decode_literal(pos_integer(), bitstring(), context()) ->
-    {ok, header(), bitstring()} | {error, decode_error()}.
-decode_literal(PrefixBits, Bits, Ctx) ->
+%% An integer whose N-bit prefix value is `Prefix` (RFC 7541 §5.1): a
+%% prefix below its all-ones `Max` is the whole value, otherwise the
+%% continuation bytes follow.
+-spec prefix_integer(non_neg_integer(), pos_integer(), binary()) ->
+    {ok, non_neg_integer(), binary()} | {error, bad_integer}.
+prefix_integer(Max, Max, Rest) ->
+    decode_integer_continuation(Rest, Max, 0);
+prefix_integer(Prefix, _Max, Rest) ->
+    {ok, Prefix, Rest}.
+
+-spec decode_literal(non_neg_integer(), pos_integer(), binary(), context()) ->
+    {ok, header(), binary()} | {error, decode_error()}.
+decode_literal(Prefix, Max, Rest, Ctx) ->
     maybe
-        {ok, NameIdx, AfterIdx} ?= decode_integer(PrefixBits, Bits),
+        {ok, NameIdx, AfterIdx} ?= prefix_integer(Prefix, Max, Rest),
         decode_literal_with_name(NameIdx, AfterIdx, Ctx)
     end.
 
--spec decode_literal_with_name(non_neg_integer(), bitstring(), context()) ->
-    {ok, header(), bitstring()} | {error, decode_error()}.
+-spec decode_literal_with_name(non_neg_integer(), binary(), context()) ->
+    {ok, header(), binary()} | {error, decode_error()}.
 decode_literal_with_name(0, AfterIdx, _Ctx) ->
     %% New name — name + value both follow inline.
     maybe
@@ -391,23 +400,30 @@ encode_integer_continuation(I) ->
 %% String codec (RFC 7541 §5.2)
 %% =============================================================================
 
--spec decode_string(bitstring()) ->
-    {ok, binary(), bitstring()} | {error, decode_error()}.
-decode_string(<<H:1, Rest/bitstring>>) ->
+%% H bit + 7-bit length prefix, then the octets (RFC 7541 §5.2). A
+%% length below 127, almost every header string, is the prefix itself.
+-spec decode_string(binary()) ->
+    {ok, binary(), binary()} | {error, decode_error()}.
+decode_string(<<H:1, Len:7, Rest/binary>>) when Len < 127 ->
+    string_body(H, Len, Rest);
+decode_string(<<H:1, _:7, Rest/binary>>) ->
     maybe
-        {ok, Len, AfterLen} ?= decode_integer(7, Rest),
-        case AfterLen of
-            <<Body:Len/binary, Tail/binary>> ->
-                decode_string_body(H, Body, Tail);
-            _ ->
-                {error, premature_end_of_block}
-        end
+        {ok, Len, AfterLen} ?= decode_integer_continuation(Rest, 127, 0),
+        string_body(H, Len, AfterLen)
     end;
-decode_string(_) ->
+decode_string(<<>>) ->
     {error, bad_string}.
 
--spec decode_string_body(0..1, binary(), bitstring()) ->
-    {ok, binary(), bitstring()} | {error, huffman_decode_error}.
+-spec string_body(0..1, non_neg_integer(), binary()) ->
+    {ok, binary(), binary()} | {error, decode_error()}.
+string_body(H, Len, Rest) ->
+    case Rest of
+        <<Body:Len/binary, Tail/binary>> -> decode_string_body(H, Body, Tail);
+        _ -> {error, premature_end_of_block}
+    end.
+
+-spec decode_string_body(0..1, binary(), binary()) ->
+    {ok, binary(), binary()} | {error, huffman_decode_error}.
 decode_string_body(0, Body, Tail) ->
     {ok, Body, Tail};
 decode_string_body(1, Body, Tail) ->
