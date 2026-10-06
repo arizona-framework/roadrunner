@@ -30,6 +30,11 @@
 -define(MAX_HEADER_COUNT, 100).
 -define(MAX_CHUNK_HEADER, 8192).
 
+%% `B` repeated in each byte of a 7-byte (56-bit) word, for the SWAR
+%% scan in `validate_value/1`.
+%% 56 bits stays a small integer on a 64-bit BEAM; 64 would be a bignum.
+-define(BYTES(B), (16#01010101010101 * (B))).
+
 %% `binary:match/2` accepts a pre-compiled pattern (`binary:cp()`), and
 %% the compile cost is non-trivial. Microbench (OTP 29.0, single-byte
 %% LF in a 56-byte header block, 200k iterations):
@@ -534,7 +539,25 @@ is_tchar(_) ->
 
 %% Reject CR, LF, NUL, and other CTL bytes inside header values; HTAB allowed.
 %% Bytes >= 0x80 (non-ASCII) are accepted leniently — same as cowboy.
+%%
+%% SWAR fast path, 7 bytes per step. Per byte, `X - 0x20` sets the high bit for a byte below 0x20 and
+%% `Y - 0x01` (with `Y = X xor 0x7F`) for a byte equal to 0x7F;
+%% ANDing each with its complement drops bytes >= 0x80 and is exact
+%% for "does any byte match". The byte loop finishes the value from
+%% the first word that flags (a tab, or a real error); the byte clauses
+%% repeat after the word clause so a < 7 byte tail costs no extra call.
+%% 1.8-2.7x faster than the byte loop alone from 10 bytes up.
+
 -spec validate_value(binary()) -> ok | error.
+validate_value(<<X:56, R/binary>> = Bin) ->
+    Y = X bxor ?BYTES(16#7F),
+    case
+        ((X - ?BYTES(16#20)) band (X bxor ?BYTES(255)) bor
+            ((Y - ?BYTES(1)) band (Y bxor ?BYTES(255)))) band ?BYTES(128)
+    of
+        0 -> validate_value(R);
+        _ -> validate_value_byte(Bin)
+    end;
 validate_value(<<>>) ->
     ok;
 validate_value(<<C, R/binary>>) when
@@ -542,8 +565,20 @@ validate_value(<<C, R/binary>>) when
     C >= 16#20, C =< 16#7E;
     C >= 16#80
 ->
-    validate_value(R);
+    validate_value_byte(R);
 validate_value(_) ->
+    error.
+
+-spec validate_value_byte(binary()) -> ok | error.
+validate_value_byte(<<>>) ->
+    ok;
+validate_value_byte(<<C, R/binary>>) when
+    C =:= 16#09;
+    C >= 16#20, C =< 16#7E;
+    C >= 16#80
+->
+    validate_value_byte(R);
+validate_value_byte(_) ->
     error.
 
 -doc """

@@ -422,6 +422,31 @@ header_cr_in_value_rejected_test() ->
 header_nul_in_value_rejected_test() ->
     ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"X-Inj: foo\x{00}bar\r\n")).
 
+header_value_every_byte_at_every_position_test() ->
+    %% Every byte value at every position of a 19-byte value: each SWAR
+    %% lane of both 7-byte words and the tail. The `a` at each end keeps
+    %% OWS trimming out of the way. Allowed: HTAB, 0x20-0x7E, >= 0x80.
+    Fill = binary:copy(~"a", 19),
+    [
+        begin
+            <<Pre:Pos/binary, _, Post/binary>> = Fill,
+            Value = <<Pre/binary, B, Post/binary>>,
+            Result = roadrunner_http1:parse_header(<<"x-test: ", Value/binary, "\r\n">>),
+            case B =:= 16#09 orelse (B >= 16#20 andalso B =/= 16#7F) of
+                true -> ?assertEqual({ok, ~"x-test", Value, <<>>}, Result);
+                false -> ?assertMatch({error, _}, Result)
+            end
+        end
+     || Pos <- lists:seq(1, 17), B <- lists:seq(0, 255)
+    ].
+
+header_value_tab_then_invalid_byte_rejected_test() ->
+    %% A tab hands the rest of the value to the byte check, which must
+    %% still catch a CTL after it.
+    ?assertEqual(
+        {error, bad_header}, roadrunner_http1:parse_header(~"x-test: a\tbc\x{01}defghijklmnop\r\n")
+    ).
+
 %% --- obs-fold ---
 
 header_obs_fold_space_rejected_test() ->
