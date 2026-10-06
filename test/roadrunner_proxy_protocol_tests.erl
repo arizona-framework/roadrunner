@@ -67,6 +67,16 @@ v1_bad_port_non_numeric_test() ->
         ?M:parse(<<"PROXY TCP4 192.168.0.1 10.0.0.5 abc 443\r\n">>)
     ).
 
+v1_bad_port_signed_test() ->
+    %% The port is a decimal integer: no `+` or `-` sign.
+    [
+        ?assertEqual(
+            {error, v1_bad_port},
+            ?M:parse(<<"PROXY TCP4 192.168.0.1 10.0.0.5 ", Port/binary, " 443\r\n">>)
+        )
+     || Port <- [~"+80", ~"-0"]
+    ].
+
 v1_malformed_field_count_test() ->
     ?assertEqual({error, v1_malformed}, ?M:parse(<<"PROXY TCP4 192.168.0.1\r\n">>)).
 

@@ -297,6 +297,16 @@ negotiate_extensions_bare_server_max_window_bits_skips_offer_test() ->
         ])
     ).
 
+negotiate_extensions_signed_window_bits_skips_offer_test() ->
+    %% RFC 7692 §7.1.2: the value is a decimal integer, so `+10` is not 10.
+    [
+        ?assertEqual(
+            none,
+            roadrunner_ws:negotiate_extensions([{~"permessage-deflate", [{Param, ~"+10"}]}])
+        )
+     || Param <- [~"server_max_window_bits", ~"client_max_window_bits"]
+    ].
+
 negotiate_extensions_window_bits_out_of_range_skips_offer_test() ->
     %% RFC 7692 allows 8..15 only; 7 is invalid → skip the offer
     %% (return none rather than fall back to defaults — matches

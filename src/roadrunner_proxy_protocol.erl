@@ -125,8 +125,9 @@ parse_ip(Bin, Proto) ->
 
 -spec parse_port(binary()) -> {ok, inet:port_number()} | {error, term()}.
 parse_port(Bin) ->
-    case string:to_integer(Bin) of
-        {Port, <<>>} when is_integer(Port), Port >= 0, Port =< 65535 -> {ok, Port};
+    %% The v1 port is a decimal integer in 0..65535, so no sign.
+    case roadrunner_bin:digits_to_integer(Bin) of
+        {ok, Port} when Port =< 65535 -> {ok, Port};
         _ -> {error, v1_bad_port}
     end.
 
