@@ -40,6 +40,7 @@
     | empty_path
     | connection_specific_header
     | missing_authority
+    | duplicate_host
     | empty_authority
     | authority_mismatch.
 

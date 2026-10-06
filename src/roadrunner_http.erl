@@ -386,9 +386,10 @@ validate_pseudo(_Method, _Scheme, _Authority, _Path, _Regular) ->
 %% sides are equally empty.
 -doc false.
 -spec check_request_authority(binary() | undefined, headers()) ->
-    ok | {error, missing_authority | empty_authority | authority_mismatch}.
+    ok | {error, missing_authority | empty_authority | authority_mismatch | duplicate_host}.
 check_request_authority(Authority, Regular) ->
     case {Authority, find_host(Regular)} of
+        {_, multiple} -> {error, duplicate_host};
         {undefined, undefined} -> {error, missing_authority};
         {~"", _} -> {error, empty_authority};
         {_, ~""} -> {error, empty_authority};
@@ -398,11 +399,19 @@ check_request_authority(Authority, Regular) ->
         {_, _} -> {error, authority_mismatch}
     end.
 
-%% The first `host` header value, or `undefined`.
--spec find_host(headers()) -> binary() | undefined.
-find_host([]) -> undefined;
-find_host([{~"host", Value} | _]) -> Value;
-find_host([_ | Rest]) -> find_host(Rest).
+%% The `host` header value, `undefined` without one, or `multiple` when
+%% it appears more than once: a second `host` could otherwise name a
+%% different entity than the one checked and still reach the handler.
+-spec find_host(headers()) -> binary() | undefined | multiple.
+find_host([]) ->
+    undefined;
+find_host([{~"host", Value} | Rest]) ->
+    case lists:keymember(~"host", 1, Rest) of
+        true -> multiple;
+        false -> Value
+    end;
+find_host([_ | Rest]) ->
+    find_host(Rest).
 
 %% The `content-length` of an HTTP/2 or HTTP/3 request, which the caller
 %% compares with the bytes its DATA frames carried (RFC 9113 §8.1.1, RFC
