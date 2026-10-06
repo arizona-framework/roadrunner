@@ -154,22 +154,15 @@ deliver_disconnect(Handler, Push, State, Reason) ->
     _ = Handler:handle_info({roadrunner_disconnect, Reason}, Push, State),
     ok.
 
-%% Push fun handed to the user handler. Same special-case as
-%% `roadrunner_stream_response:stream_frame/2`: zero-length data
-%% would encode as `0\r\n\r\n` — the chunked terminator — which
-%% would end the response mid-loop. Skip empty pushes.
+%% Push fun handed to the user handler. Zero-length data would encode
+%% as `0\r\n\r\n` — the chunked terminator — which would end the
+%% response mid-loop, so an empty push sends nothing
+%% (`roadrunner_stream_response:chunk_or_empty/1`).
 -spec make_push(roadrunner_transport:socket()) -> roadrunner_handler:push_fun().
 make_push(Socket) ->
     fun(Data) ->
-        case iolist_size(Data) of
-            0 ->
-                ok;
-            N ->
-                roadrunner_transport:send(Socket, [
-                    integer_to_binary(N, 16),
-                    ~"\r\n",
-                    Data,
-                    ~"\r\n"
-                ])
+        case roadrunner_stream_response:chunk_or_empty(Data) of
+            [] -> ok;
+            Chunk -> roadrunner_transport:send(Socket, Chunk)
         end
     end.

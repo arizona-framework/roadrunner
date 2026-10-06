@@ -21,6 +21,8 @@
 %% Pure functions, no process spawn — runs in the conn process.
 
 -export([run/4]).
+%% Shared with `roadrunner_loop_response`'s push.
+-export([chunk_or_empty/1]).
 
 -doc """
 Send the chunked-response head, then call the user's stream fun
@@ -62,15 +64,15 @@ run(Socket, Status, UserHeaders, Fun) ->
 %% terminator + trailers.
 -spec stream_frame(iodata(), nofin | fin | {fin, roadrunner_http:headers()}) -> iodata().
 stream_frame(Data, nofin) ->
-    case iolist_size(Data) of
-        0 -> [];
-        N -> [integer_to_binary(N, 16), ~"\r\n", Data, ~"\r\n"]
-    end;
+    chunk_or_empty(Data);
 stream_frame(Data, fin) ->
     [chunk_or_empty(Data), ~"0\r\n\r\n"];
 stream_frame(Data, {fin, Trailers}) ->
     [chunk_or_empty(Data), ~"0\r\n", encode_trailers(Trailers), ~"\r\n"].
 
+%% One chunk of `Data` (RFC 9112 §7.1), or nothing for empty data: a
+%% zero-length chunk would be the terminator and end the response.
+-doc false.
 -spec chunk_or_empty(iodata()) -> iodata().
 chunk_or_empty(Data) ->
     case iolist_size(Data) of
