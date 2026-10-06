@@ -42,7 +42,7 @@ jobs:
   cache-erlang:
     name: Cache Erlang
 
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     outputs:
       build-cache-key: ${{ steps.set-build-key.outputs.key }}
@@ -115,7 +115,7 @@ jobs:
 
     needs: cache-erlang
 
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -137,7 +137,7 @@ jobs:
 
     needs: cache-erlang
 
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -164,7 +164,7 @@ jobs:
 
     needs: cache-erlang
 
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -189,7 +189,7 @@ jobs:
   test-older-otp:
     name: Test (OTP ${{ matrix.otp }})
 
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     strategy:
       fail-fast: false
@@ -219,7 +219,7 @@ jobs:
   h2spec:
     name: h2spec (OTP ${{ matrix.otp }})
 
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     strategy:
       fail-fast: false
@@ -250,7 +250,7 @@ jobs:
   autobahn:
     name: autobahn (OTP ${{ matrix.otp }})
 
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     strategy:
       fail-fast: false
@@ -284,7 +284,7 @@ jobs:
 
     needs: cache-erlang
 
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
