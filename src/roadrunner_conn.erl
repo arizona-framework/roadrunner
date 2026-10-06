@@ -811,7 +811,7 @@ read_body(Req, Buffered, RecvFun, MaxCL, TrailerLimits) ->
             %% can feed them into the next `reading_request` parse.
             {ok, <<>>, Buffered};
         chunked ->
-            read_chunked(Buffered, RecvFun, MaxCL, 0, TrailerLimits);
+            read_chunked(Buffered, RecvFun, MaxCL, <<>>, TrailerLimits);
         {content_length, N} when N > MaxCL ->
             {error, content_length_too_large};
         {content_length, N} ->
@@ -974,33 +974,31 @@ read_body_until_io(N, RecvFun) ->
     binary(),
     fun(() -> {ok, binary()} | {error, term()}),
     non_neg_integer(),
-    non_neg_integer(),
+    binary(),
     {pos_integer(), pos_integer(), pos_integer()}
 ) ->
     {ok, binary(), binary()} | {error, content_length_too_large | term()}.
-read_chunked(Buf, RecvFun, MaxCL, Decoded, TrailerLimits) ->
+read_chunked(Buf, RecvFun, MaxCL, Body, TrailerLimits) ->
     %% `parse_chunk/3` rejects a declared chunk size over the remaining
     %% budget on its size line, so an oversized chunk can't buffer past
     %% the cap before this loop sees it.
-    case roadrunner_http1:parse_chunk(Buf, TrailerLimits, MaxCL - Decoded) of
+    case roadrunner_http1:parse_chunk(Buf, TrailerLimits, MaxCL - byte_size(Body)) of
         {ok, last, _Trailers, Leftover} ->
             %% Bytes after the size-0 last-chunk + trailer block are
             %% pipelined-next-request leftover; thread them up so the
             %% conn can feed them into the next parse.
-            {ok, <<>>, Leftover};
+            {ok, Body, Leftover};
         {ok, Data, Rest} ->
-            NewDecoded = Decoded + byte_size(Data),
-            case read_chunked(Rest, RecvFun, MaxCL, NewDecoded, TrailerLimits) of
-                {ok, More, Leftover} ->
-                    {ok, <<Data/binary, More/binary>>, Leftover};
-                {error, _} = E ->
-                    E
-            end;
+            %% Append each chunk to the body as it is decoded. Rebuilding
+            %% `<<Data/binary, More/binary>>` on the way back up a body
+            %% recursion copied the tail at every level, O(n^2) in the
+            %% chunk count (64 x 1 KB chunks: 85 us against 14 us).
+            read_chunked(Rest, RecvFun, MaxCL, <<Body/binary, Data/binary>>, TrailerLimits);
         {more, _} ->
             case RecvFun() of
                 {ok, More} ->
                     read_chunked(
-                        roadrunner_bin:append(Buf, More), RecvFun, MaxCL, Decoded, TrailerLimits
+                        roadrunner_bin:append(Buf, More), RecvFun, MaxCL, Body, TrailerLimits
                     );
                 {error, _} = E ->
                     E
