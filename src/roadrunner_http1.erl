@@ -1182,24 +1182,16 @@ status_line(503) -> ~"HTTP/1.1 503 Service Unavailable\r\n";
 status_line(Status) -> [~"HTTP/1.1 ", integer_to_binary(Status), ~" \r\n"].
 
 -spec encode_headers(headers()) -> iodata().
-encode_headers(Headers) ->
-    %% Fetch the shared unsafe-bytes pattern ONCE and thread it through
-    %% the fused injection-check + encode pass, so the whole header list
-    %% costs a single `persistent_term:get/1`.
-    UnsafeCp = roadrunner_http:unsafe_bytes_pattern(),
-    encode_headers_loop(Headers, UnsafeCp).
-
--spec encode_headers_loop(headers(), binary:cp()) -> iodata().
-encode_headers_loop([], _UnsafeCp) ->
+encode_headers([]) ->
     [];
-encode_headers_loop([{Name, Value} | Rest], UnsafeCp) ->
+encode_headers([{Name, Value} | Rest]) ->
     %% Reject CR/LF/NUL in a name or value: either would let an attacker
     %% who controls part of it inject a new header or terminate the block
     %% early. Crash hard so a handler echoing unvalidated user input into
     %% a header turns into a 500, not a wire-level vulnerability.
-    ok = roadrunner_http:check_header_safe(Name, name, UnsafeCp),
-    ok = roadrunner_http:check_header_safe(Value, value, UnsafeCp),
-    [Name, ~": ", Value, ~"\r\n" | encode_headers_loop(Rest, UnsafeCp)].
+    ok = roadrunner_http:check_header_safe(Name, name),
+    ok = roadrunner_http:check_header_safe(Value, value),
+    [Name, ~": ", Value, ~"\r\n" | encode_headers(Rest)].
 
 %% `-on_load` callback. Returns `ok` so module load succeeds; if the
 %% compile fails (it shouldn't — the pattern is a literal), the module
