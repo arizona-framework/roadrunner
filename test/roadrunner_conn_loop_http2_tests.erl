@@ -1070,7 +1070,7 @@ loop_response_worker_stops_on_stream_reset() ->
     true = register(roadrunner_h2_loop_observer, self()),
     {Pid, Ref} = run_stream_request(~"/loop"),
     Worker = wait_for_register(roadrunner_h2_loop_test, 1000),
-    %% Drain the 200 HEADERS so the worker is past `sync_send_headers`
+    %% Drain the 200 HEADERS so the worker is past its headers send
     %% and parked in `info_loop` before the reset arrives.
     _ = expect_send(),
     WorkerRef = monitor(process, Worker),
@@ -2657,8 +2657,8 @@ telemetry_request_exception_fires_on_h2_handler_crash() ->
 
 telemetry_request_stop_fires_for_router_404() ->
     %% Router-based dispatch where no route matches → 404 path
-    %% in `run_handler/4` short-circuits past `invoke/7` and still
-    %% fires request_stop with status=404.
+    %% in `roadrunner_stream_worker:run/6` short-circuits past the
+    %% handler invoke and still fires request_stop with status=404.
     HandlerId = attach_telemetry([[roadrunner, request, stop]]),
     try
         {ok, _} = application:ensure_all_started(telemetry),

@@ -52,7 +52,7 @@ conn (which owns HPACK encoder state and serialises wire writes).
     roadrunner_handler:stream_fun()
 ) -> ok.
 run(ConnPid, StreamId, Status, Headers, Fun) ->
-    roadrunner_http2_worker_sync:send_headers(ConnPid, StreamId, Status, Headers, false),
+    ok = roadrunner_http2_worker_sync:send_headers(ConnPid, StreamId, Status, Headers, false),
     erase(?FIN_KEY),
     Send = fun(Data, FinFlag) -> do_send(ConnPid, StreamId, Data, FinFlag) end,
     _ = Fun(Send),
@@ -67,13 +67,13 @@ do_send(ConnPid, StreamId, Data, nofin) ->
         roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, false),
     ok;
 do_send(ConnPid, StreamId, Data, fin) ->
-    roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, true),
+    ok = roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, true),
     put(?FIN_KEY, true),
     ok;
 do_send(ConnPid, StreamId, Data, {fin, Trailers}) ->
     iolist_size(Data) > 0 andalso
         roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, false),
-    sync_send_trailers(ConnPid, StreamId, Trailers),
+    ok = sync_send_trailers(ConnPid, StreamId, Trailers),
     put(?FIN_KEY, true),
     ok.
 

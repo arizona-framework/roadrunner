@@ -27,6 +27,8 @@
 %%   `roadrunner_http2_hpack:decode/2`.
 %% - `Connection`-specific headers MUST NOT appear (RFC 9113
 %%   §8.2.2). Rejected.
+%% - `:authority` or `Host` MUST be present, neither empty, and both
+%%   equal when both appear (RFC 9113 §8.3.1).
 
 -export([from_headers/3]).
 
@@ -64,8 +66,8 @@ handlers requiring a flat binary call `iolist_to_binary/1` themselves.
     {ok, roadrunner_req:request()} | {error, build_error()}.
 from_headers(Headers, Body, RequestContext) ->
     maybe
-        %% The parsed `:scheme` value is validated but deliberately
-        %% discarded — the authoritative scheme comes from the conn
+        %% The `:scheme` pseudo-header must be present, but its value is
+        %% deliberately discarded — the authoritative scheme comes from the conn
         %% (`RequestContext.scheme`) since clients can lie about the
         %% pseudo-header value.
         {ok, Method, Path, Authority, Regular} ?= roadrunner_http:request_pseudo_headers(Headers),

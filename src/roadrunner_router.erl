@@ -57,7 +57,8 @@ Ordering stays the caller's to choose; getting it wrong stops the
 listener from booting instead of turning into a 404 in production.
 
 The opaque `compiled()` shape is a tree keyed on literal segments, so
-matching costs about the same however many routes the table holds.
+matching only walks the branches a request's segments can follow instead
+of trying every route in turn.
 """.
 
 -export([compile/2, validate/1, match/3]).

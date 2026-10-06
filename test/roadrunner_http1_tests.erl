@@ -192,7 +192,7 @@ header_lowercases_name_test() ->
     ).
 
 %% Every name interned as a literal clause in
-%% `roadrunner_http1:validate_and_lowercase_name/1`. Driving each one is
+%% `roadrunner_http1:fast_header/2`. Driving each one is
 %% what keeps this list and that one in step: a clause added there and
 %% not here leaves that clause uncovered, and the precommit gate
 %% requires full coverage.
