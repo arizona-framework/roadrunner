@@ -30,6 +30,11 @@
 -define(MAX_HEADER_COUNT, 100).
 -define(MAX_CHUNK_HEADER, 8192).
 
+%% `B` repeated in each byte of a 7-byte (56-bit) word, for the SWAR
+%% scans in `validate_path/2`, `validate_query/1` and `validate_value/1`.
+%% 56 bits stays a small integer on a 64-bit BEAM; 64 would be a bignum.
+-define(BYTES(B), (16#01010101010101 * (B))).
+
 %% `binary:match/2` accepts a pre-compiled pattern (`binary:cp()`), and
 %% the compile cost is non-trivial. Microbench (OTP 29.0, single-byte
 %% LF in a 56-byte header block, 200k iterations):
@@ -206,7 +211,27 @@ validate_method_chars(_) ->
 validate_target(<<>>) -> error;
 validate_target(T) -> validate_path(T, T).
 
+%% Both walks take 7 bytes per step while a word holds no byte <= 0x20,
+%% no 0x7F and (in the path) no `?`; the same per-byte borrow test as
+%% `validate_value/1`, with `X - 0x21` for the low range and an
+%% equality test (`Y = X xor B`, then `Y - 0x01`) for each single byte.
+%% The byte walk finishes from the first word that flags, which in the
+%% path is almost always the `?` (handing off to the query's fast path)
+%% and in the query an error. Each walk repeats its byte clauses after
+%% the word clause so a short target (`/`) or a < 7 byte tail costs no
+%% extra call: without them `/` measured ~10% slower than before.
 -spec validate_path(binary(), binary()) -> {ok, binary()} | error.
+validate_path(<<X:56, R/binary>> = Bin, Target) ->
+    Del = X bxor ?BYTES(16#7F),
+    Qm = X bxor ?BYTES($?),
+    case
+        ((X - ?BYTES(16#21)) band (X bxor ?BYTES(255)) bor
+            ((Del - ?BYTES(1)) band (Del bxor ?BYTES(255))) bor
+            ((Qm - ?BYTES(1)) band (Qm bxor ?BYTES(255)))) band ?BYTES(128)
+    of
+        0 -> validate_path(R, Target);
+        _ -> validate_path_byte(Bin, Target)
+    end;
 validate_path(<<>>, Target) ->
     {ok, Target};
 validate_path(<<$?, Rest/binary>>, Target) ->
@@ -215,16 +240,46 @@ validate_path(<<$?, Rest/binary>>, Target) ->
         error -> error
     end;
 validate_path(<<C, Rest/binary>>, Target) when C > 16#20, C =/= 16#7F ->
-    validate_path(Rest, Target);
+    validate_path_byte(Rest, Target);
 validate_path(_, _) ->
     error.
 
+-spec validate_path_byte(binary(), binary()) -> {ok, binary()} | error.
+validate_path_byte(<<>>, Target) ->
+    {ok, Target};
+validate_path_byte(<<$?, Rest/binary>>, Target) ->
+    case validate_query(Rest) of
+        ok -> {ok, binary:part(Target, 0, byte_size(Target) - byte_size(Rest) - 1)};
+        error -> error
+    end;
+validate_path_byte(<<C, Rest/binary>>, Target) when C > 16#20, C =/= 16#7F ->
+    validate_path_byte(Rest, Target);
+validate_path_byte(_, _) ->
+    error.
+
 -spec validate_query(binary()) -> ok | error.
+validate_query(<<X:56, R/binary>> = Bin) ->
+    Del = X bxor ?BYTES(16#7F),
+    case
+        ((X - ?BYTES(16#21)) band (X bxor ?BYTES(255)) bor
+            ((Del - ?BYTES(1)) band (Del bxor ?BYTES(255)))) band ?BYTES(128)
+    of
+        0 -> validate_query(R);
+        _ -> validate_query_byte(Bin)
+    end;
 validate_query(<<>>) ->
     ok;
 validate_query(<<C, Rest/binary>>) when C > 16#20, C =/= 16#7F ->
-    validate_query(Rest);
+    validate_query_byte(Rest);
 validate_query(_) ->
+    error.
+
+-spec validate_query_byte(binary()) -> ok | error.
+validate_query_byte(<<>>) ->
+    ok;
+validate_query_byte(<<C, Rest/binary>>) when C > 16#20, C =/= 16#7F ->
+    validate_query_byte(Rest);
+validate_query_byte(_) ->
     error.
 
 -spec parse_version(binary()) -> {ok, version()} | error.
@@ -534,7 +589,25 @@ is_tchar(_) ->
 
 %% Reject CR, LF, NUL, and other CTL bytes inside header values; HTAB allowed.
 %% Bytes >= 0x80 (non-ASCII) are accepted leniently — same as cowboy.
+%%
+%% SWAR fast path, 7 bytes per step. Per byte, `X - 0x20` sets the high bit for a byte below 0x20 and
+%% `Y - 0x01` (with `Y = X xor 0x7F`) for a byte equal to 0x7F;
+%% ANDing each with its complement drops bytes >= 0x80 and is exact
+%% for "does any byte match". The byte loop finishes the value from
+%% the first word that flags (a tab, or a real error); the byte clauses
+%% repeat after the word clause so a < 7 byte tail costs no extra call.
+%% 1.8-2.7x faster than the byte loop alone from 10 bytes up.
+
 -spec validate_value(binary()) -> ok | error.
+validate_value(<<X:56, R/binary>> = Bin) ->
+    Y = X bxor ?BYTES(16#7F),
+    case
+        ((X - ?BYTES(16#20)) band (X bxor ?BYTES(255)) bor
+            ((Y - ?BYTES(1)) band (Y bxor ?BYTES(255)))) band ?BYTES(128)
+    of
+        0 -> validate_value(R);
+        _ -> validate_value_byte(Bin)
+    end;
 validate_value(<<>>) ->
     ok;
 validate_value(<<C, R/binary>>) when
@@ -542,8 +615,20 @@ validate_value(<<C, R/binary>>) when
     C >= 16#20, C =< 16#7E;
     C >= 16#80
 ->
-    validate_value(R);
+    validate_value_byte(R);
 validate_value(_) ->
+    error.
+
+-spec validate_value_byte(binary()) -> ok | error.
+validate_value_byte(<<>>) ->
+    ok;
+validate_value_byte(<<C, R/binary>>) when
+    C =:= 16#09;
+    C >= 16#20, C =< 16#7E;
+    C >= 16#80
+->
+    validate_value_byte(R);
+validate_value_byte(_) ->
     error.
 
 -doc """

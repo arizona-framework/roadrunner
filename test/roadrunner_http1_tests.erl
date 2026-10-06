@@ -422,6 +422,31 @@ header_cr_in_value_rejected_test() ->
 header_nul_in_value_rejected_test() ->
     ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"X-Inj: foo\x{00}bar\r\n")).
 
+header_value_every_byte_at_every_position_test() ->
+    %% Every byte value at every position of a 19-byte value: each SWAR
+    %% lane of both 7-byte words and the tail. The `a` at each end keeps
+    %% OWS trimming out of the way. Allowed: HTAB, 0x20-0x7E, >= 0x80.
+    Fill = binary:copy(~"a", 19),
+    [
+        begin
+            <<Pre:Pos/binary, _, Post/binary>> = Fill,
+            Value = <<Pre/binary, B, Post/binary>>,
+            Result = roadrunner_http1:parse_header(<<"x-test: ", Value/binary, "\r\n">>),
+            case B =:= 16#09 orelse (B >= 16#20 andalso B =/= 16#7F) of
+                true -> ?assertEqual({ok, ~"x-test", Value, <<>>}, Result);
+                false -> ?assertMatch({error, _}, Result)
+            end
+        end
+     || Pos <- lists:seq(1, 17), B <- lists:seq(0, 255)
+    ].
+
+header_value_tab_then_invalid_byte_rejected_test() ->
+    %% A tab hands the rest of the value to the byte check, which must
+    %% still catch a CTL after it.
+    ?assertEqual(
+        {error, bad_header}, roadrunner_http1:parse_header(~"x-test: a\tbc\x{01}defghijklmnop\r\n")
+    ).
+
 %% --- obs-fold ---
 
 header_obs_fold_space_rejected_test() ->
@@ -650,6 +675,48 @@ request_empty_query_keeps_path_test() ->
     ?assertMatch(
         {ok, #{target := ~"/foo?", path := ~"/foo"}, ~""},
         roadrunner_http1:parse_request(~"GET /foo? HTTP/1.1\r\nHost: x\r\n\r\n")
+    ).
+
+target_every_byte_at_every_position_test() ->
+    %% Every byte value at every position of a 19-byte path and of a
+    %% 19-byte query: each SWAR lane of both 7-byte words and the tail,
+    %% in both walks. Allowed: > 0x20 except 0x7F. A `?` in the path
+    %% starts the query; a `?` in the query is a plain query byte. SP,
+    %% CR and LF never reach the check (they split the request line),
+    %% so only the error is asserted for them.
+    Fill = binary:copy(~"a", 18),
+    Valid = fun(B) -> B > 16#20 andalso B =/= 16#7F end,
+    Parse = fun(Target) ->
+        roadrunner_http1:parse_request(<<"GET ", Target/binary, " HTTP/1.1\r\nhost: x\r\n\r\n">>)
+    end,
+    [
+        begin
+            <<Pre:Pos/binary, _, Post/binary>> = Fill,
+            PathTarget = <<"/", Pre/binary, B, Post/binary>>,
+            QueryTarget = <<"/q?", Pre/binary, B, Post/binary>>,
+            case Valid(B) of
+                true ->
+                    WantPath =
+                        case B of
+                            $? -> <<"/", Pre/binary>>;
+                            _ -> PathTarget
+                        end,
+                    ?assertMatch({ok, #{path := WantPath}, _}, Parse(PathTarget)),
+                    ?assertMatch({ok, #{path := ~"/q"}, _}, Parse(QueryTarget));
+                false ->
+                    ?assertMatch({error, _}, Parse(PathTarget)),
+                    ?assertMatch({error, _}, Parse(QueryTarget))
+            end
+        end
+     || Pos <- lists:seq(0, 17), B <- lists:seq(0, 255)
+    ].
+
+control_char_in_query_after_clean_word_rejected_test() ->
+    %% `/abcdef` fills one clean SWAR word, so the `?` is met by the
+    %% word walk's own byte clauses rather than the byte loop.
+    ?assertEqual(
+        {error, bad_request_line},
+        roadrunner_http1:parse_request(~"GET /abcdef?\x{01} HTTP/1.1\r\nhost: x\r\n\r\n")
     ).
 
 control_char_in_query_rejected_test() ->
