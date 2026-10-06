@@ -751,13 +751,16 @@ handler_crash_writes_500_and_fires_request_exception_test() ->
     Sink ! stop.
 
 interim_buffered_response_writes_500_test() ->
-    %% A handler returning a buffered 1xx status is a misuse (RFC 9110
-    %% §15.2): the conn loop rejects it with 500 rather than put an invalid
-    %% interim status on the wire as the final response.
+    %% A handler returning a 1xx status is a misuse (RFC 9110 §15.2), in
+    %% any response shape: the conn loop answers 500 rather than put an
+    %% invalid interim status on the wire as the final response.
+    [interim_response_writes_500(Path) || Path <- [~"/", ~"/stream", ~"/loop", ~"/sendfile"]].
+
+interim_response_writes_500(Path) ->
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_once(
-        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+        Self, Tag, <<"GET ", Path/binary, " HTTP/1.1\r\nHost: x\r\n\r\n">>
     ),
     Opts = (fake_opts(interim))#{
         dispatch :=

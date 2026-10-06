@@ -1026,7 +1026,11 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
             %% Decide keep-alive-vs-close BEFORE the response is sent so a
             %% server-initiated close (count ceiling) lands on the wire as
             %% `Connection: close` — see `ensure_close_signaled/3`.
-            Response = ensure_close_signaled(S2, Req2, Response0),
+            %% A handler-returned 1xx becomes a 500 first, so the close
+            %% signal, the response sent and telemetry all see the 500.
+            Response = ensure_close_signaled(
+                S2, Req2, roadrunner_conn:final_response(h1, Handler, Response0)
+            ),
             case dispatch_response(S2, Handler, Req2, Response) of
                 {ws_session, MRef, SessPid, S3} ->
                     %% A WebSocket session now owns the socket; the conn
@@ -1237,28 +1241,6 @@ dispatch_response(
                 end
         end,
     S;
-%% RFC 9110 §15.2: a 1xx is interim and cannot be a final response. The
-%% single-response handler API cannot express "interim 1xx then final", so
-%% a returned 1xx is always a misuse; answer 500 rather than put an invalid
-%% final 1xx on the wire. Legitimate interim 100-continue is handled by
-%% `roadrunner_conn:maybe_send_continue/3`, not this path. Placed before the
-%% buffered clauses so it intercepts a 1xx for any method (HEAD included).
-dispatch_response(
-    #loop_state{alt_svc = AltSvc} = S,
-    Handler,
-    _Req,
-    {Status, _Headers, _Body}
-) when
-    is_integer(Status), Status >= 100, Status =< 199
-->
-    logger:error(#{
-        msg => "roadrunner h1 handler returned an interim 1xx status as a final response",
-        handler => Handler,
-        status => Status
-    }),
-    Headers = roadrunner_http:auto_headers([{~"content-type", ~"text/plain"}], AltSvc),
-    Resp = roadrunner_http1:response(500, Headers, ~"Internal Server Error"),
-    queue_response(S, Resp);
 %% Buffered (3-tuple) response shape. RFC 9110 §9.3.2: HEAD must NOT
 %% include a message body — match on `method := ~"HEAD"` in the
 %% function head and emit the response with an empty body. Free

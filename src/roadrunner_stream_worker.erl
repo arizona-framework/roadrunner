@@ -96,11 +96,13 @@ invoke(
     ReqStart
 ) ->
     try Pipeline(Req) of
-        {Response, _Req2} ->
-            %% Telemetry reports the status actually sent. RFC 9110 §9.3.2:
-            %% a HEAD response carries no content, so emit the body-stripped
-            %% form; telemetry keeps the handler's original shape
-            %% (`response_kind/1` below).
+        {Response0, _Req2} ->
+            %% A handler-returned 1xx becomes a 500 here, for every shape
+            %% (`roadrunner_conn:final_response/3`). Telemetry reports the
+            %% status actually sent. RFC 9110 §9.3.2: a HEAD response carries
+            %% no content, so emit the body-stripped form; telemetry keeps the
+            %% shape before stripping (`roadrunner_conn:response_kind/1`).
+            Response = roadrunner_conn:final_response(Protocol, Handler, Response0),
             Status = Worker:emit_handler_response(
                 Conn, StreamId, Handler, roadrunner_conn:head_response(Response, Method)
             ),

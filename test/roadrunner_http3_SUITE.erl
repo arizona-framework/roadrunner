@@ -312,6 +312,8 @@ interim_response_500(Config) ->
     %% interim status as the final response.
     Conn = connect(?config(port, Config)),
     ?assertMatch({500, _}, status_body(get(Conn, ~"/interim"))),
+    %% The stream shape too.
+    ?assertMatch({500, _}, status_body(get(Conn, ~"/interim-stream"))),
     close(Conn).
 
 rate_limited(_Config) ->

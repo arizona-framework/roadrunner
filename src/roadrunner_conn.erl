@@ -80,6 +80,7 @@
     resolve_handler/2,
     allow_header_value/1,
     response_status/1,
+    final_response/3,
     response_kind/1,
     head_response/2
 ]).
@@ -1273,6 +1274,40 @@ parse_loop(Buf, RecvFun) ->
         {error, _} = E ->
             E
     end.
+
+%% RFC 9110 §15.2: a 1xx is interim and cannot be a final response. The
+%% single-response handler API cannot express "interim 1xx then final", so
+%% a returned 1xx is always a misuse, whatever the response shape; replace
+%% it with a buffered 500 rather than put an invalid final 1xx on the wire.
+%% Every protocol runs this before sending, so the response it sends,
+%% reports to telemetry and decides keep-alive on is the 500. Legitimate
+%% interim 100-continue is sent by `maybe_send_continue/3`, not this path;
+%% a `{websocket, _, _}` upgrade (status 101) is not a handler 1xx.
+-doc false.
+-spec final_response(h1 | h2 | h3, module(), roadrunner_handler:response()) ->
+    roadrunner_handler:response().
+final_response(_Protocol, _Handler, {websocket, _, _} = Response) ->
+    Response;
+final_response(Protocol, Handler, Response) ->
+    case response_status(Response) of
+        Status when Status >= 100, Status =< 199 ->
+            logger:error(#{
+                msg => interim_message(Protocol),
+                handler => Handler,
+                status => Status
+            }),
+            {500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"};
+        _ ->
+            Response
+    end.
+
+-spec interim_message(h1 | h2 | h3) -> string().
+interim_message(h1) ->
+    "roadrunner h1 handler returned an interim 1xx status as a final response";
+interim_message(h2) ->
+    "roadrunner h2 handler returned an interim 1xx status as a final response";
+interim_message(h3) ->
+    "roadrunner h3 handler returned an interim 1xx status as a final response".
 
 %% Order matters — `{websocket, _, _}` is a 3-tuple too, so the
 %% atom-tagged variants must precede the buffered catch-all.

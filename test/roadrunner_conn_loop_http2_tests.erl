@@ -1192,11 +1192,16 @@ handler_crash_returns_500() ->
     cleanup(Pid, Ref).
 
 interim_buffered_response_returns_500() ->
-    %% A handler returning a buffered 1xx status is a misuse (RFC 9110
-    %% §15.2): the worker rejects it with 500 and the conn survives.
-    {Pid, Ref, Resp} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/interim"),
-    ?assertEqual(~"500", h2_response_status(Resp)),
-    cleanup(Pid, Ref).
+    %% A handler returning a 1xx status is a misuse (RFC 9110 §15.2),
+    %% buffered or streamed: the worker answers 500 and the conn survives.
+    [
+        begin
+            {Pid, Ref, Resp} = run_h2_request_with_handler(roadrunner_h2_test_handler, Path),
+            ?assertEqual(~"500", h2_response_status(Resp)),
+            cleanup(Pid, Ref)
+        end
+     || Path <- [~"/interim", ~"/interim-stream"]
+    ].
 
 middleware_chain_runs() ->
     %% Listener with a non-empty middleware list — exercises the
@@ -2633,7 +2638,7 @@ telemetry_request_stop_reports_the_status_sent() ->
                 end,
                 cleanup(Pid, Ref)
             end
-         || {Path, Sent} <- [{~"/interim", 500}, {~"/websocket", 501}]
+         || {Path, Sent} <- [{~"/interim", 500}, {~"/interim-stream", 500}, {~"/websocket", 501}]
         ]
     after
         detach_telemetry(HandlerId)
