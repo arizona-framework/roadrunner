@@ -80,3 +80,18 @@ a1_dcid() -> hex(~"8394c8f03e515708").
 %% Uppercase before decoding so the literals are portable across OTP
 %% versions regardless of `binary:decode_hex/1`'s lowercase handling.
 hex(Hex) -> binary:decode_hex(string:uppercase(Hex)).
+
+for_connection_protects_like_the_raw_key_test() ->
+    %% The connection's cipher state must mask exactly like the raw
+    %% 16-byte header-protection key it was built from, packet after
+    %% packet (ECB keeps no state between blocks).
+    #{hp := Raw} = Keys = roadrunner_quic_keys:initial_server(<<16#8394c8f03e515708:64>>),
+    #{hp := State} = roadrunner_quic_keys:for_connection(Keys),
+    Header = <<16#c3, 1:32, 8, 0:64, 0, 16#4499:16, 2:32>>,
+    [
+        ?assertEqual(
+            roadrunner_quic_aead:protect_header(Raw, Header, Cipher, byte_size(Header) - 4),
+            roadrunner_quic_aead:protect_header(State, Header, Cipher, byte_size(Header) - 4)
+        )
+     || Cipher <- [crypto:strong_rand_bytes(32) || _ <- lists:seq(1, 20)]
+    ].
