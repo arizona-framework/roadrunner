@@ -677,6 +677,48 @@ request_empty_query_keeps_path_test() ->
         roadrunner_http1:parse_request(~"GET /foo? HTTP/1.1\r\nHost: x\r\n\r\n")
     ).
 
+target_every_byte_at_every_position_test() ->
+    %% Every byte value at every position of a 19-byte path and of a
+    %% 19-byte query: each SWAR lane of both 7-byte words and the tail,
+    %% in both walks. Allowed: > 0x20 except 0x7F. A `?` in the path
+    %% starts the query; a `?` in the query is a plain query byte. SP,
+    %% CR and LF never reach the check (they split the request line),
+    %% so only the error is asserted for them.
+    Fill = binary:copy(~"a", 18),
+    Valid = fun(B) -> B > 16#20 andalso B =/= 16#7F end,
+    Parse = fun(Target) ->
+        roadrunner_http1:parse_request(<<"GET ", Target/binary, " HTTP/1.1\r\nhost: x\r\n\r\n">>)
+    end,
+    [
+        begin
+            <<Pre:Pos/binary, _, Post/binary>> = Fill,
+            PathTarget = <<"/", Pre/binary, B, Post/binary>>,
+            QueryTarget = <<"/q?", Pre/binary, B, Post/binary>>,
+            case Valid(B) of
+                true ->
+                    WantPath =
+                        case B of
+                            $? -> <<"/", Pre/binary>>;
+                            _ -> PathTarget
+                        end,
+                    ?assertMatch({ok, #{path := WantPath}, _}, Parse(PathTarget)),
+                    ?assertMatch({ok, #{path := ~"/q"}, _}, Parse(QueryTarget));
+                false ->
+                    ?assertMatch({error, _}, Parse(PathTarget)),
+                    ?assertMatch({error, _}, Parse(QueryTarget))
+            end
+        end
+     || Pos <- lists:seq(0, 17), B <- lists:seq(0, 255)
+    ].
+
+control_char_in_query_after_clean_word_rejected_test() ->
+    %% `/abcdef` fills one clean SWAR word, so the `?` is met by the
+    %% word walk's own byte clauses rather than the byte loop.
+    ?assertEqual(
+        {error, bad_request_line},
+        roadrunner_http1:parse_request(~"GET /abcdef?\x{01} HTTP/1.1\r\nhost: x\r\n\r\n")
+    ).
+
 control_char_in_query_rejected_test() ->
     %% Query bytes obey the same target char rules: a control char after the
     %% `?` is still a malformed request-line.
