@@ -26,7 +26,8 @@
 %% - Connection-specific headers MUST NOT appear (RFC 9114 §4.2).
 %% - The request MUST carry an `:authority` pseudo-header or a `host` header
 %%   (https has a mandatory authority component); if present neither is empty,
-%%   and if both appear they MUST match (RFC 9114 §4.3.1).
+%%   and if both appear they MUST name the same entity, compared after
+%%   case and default-port normalization (RFC 9114 §4.3.1).
 %% - A `content-length` header MUST equal the received body length and MUST NOT
 %%   be repeated (RFC 9114 §4.1.2, RFC 9110 §8.6).
 
@@ -67,7 +68,7 @@ handlers needing a flat binary call `iolist_to_binary/1`.
 """.
 -spec from_headers(roadrunner_http:headers(), iodata(), request_context()) ->
     {ok, roadrunner_req:request()} | {error, build_error()}.
-from_headers(Headers, Body, RequestContext) ->
+from_headers(Headers, Body, #{scheme := Scheme} = RequestContext) ->
     maybe
         %% The parsed `:scheme` value is validated but deliberately
         %% discarded — the authoritative scheme comes from the conn
@@ -76,7 +77,7 @@ from_headers(Headers, Body, RequestContext) ->
         {ok, Method, Path, Authority, Regular} ?= roadrunner_http:request_pseudo_headers(Headers),
         ok ?= check_banned(Regular),
         ok ?= check_content_length(Regular, Body),
-        ok ?= roadrunner_http:check_request_authority(Authority, Regular),
+        ok ?= roadrunner_http:check_request_authority(Authority, Regular, Scheme),
         {ok,
             roadrunner_http:build_request(
                 {3, 0}, Method, Path, Authority, Regular, Body, RequestContext

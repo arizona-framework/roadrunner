@@ -42,7 +42,7 @@ accessors that operate on it.
 -export([check_header_safe/2, is_header_safe/1]).
 -export([strip_connection_specific_fields/1, strip_connection_specific_fields_safe/1]).
 -export([
-    request_pseudo_headers/1, check_request_authority/2, request_content_length/1, build_request/7
+    request_pseudo_headers/1, check_request_authority/3, request_content_length/1, build_request/7
 ]).
 
 -export_type([headers/0, status/0, redirect_status/0, version/0, request_context/0]).
@@ -382,22 +382,57 @@ validate_pseudo(_Method, _Scheme, _Authority, _Path, _Regular) ->
 %% mandatory authority component (QUIC is always `https`, and an HTTP/2
 %% request's scheme is the connection's), so the request MUST carry an
 %% `:authority` pseudo-header or a `host` header; if present neither is
-%% empty, and if both appear they MUST match. The empty-value clauses
-%% precede the equality clause so an empty value loses even when both
-%% sides are equally empty.
+%% empty, and if both appear they MUST name the same entity. The
+%% empty-value clauses precede the equality clause so an empty value
+%% loses even when both sides are equally empty. Byte-equal values, what
+%% every real client sends, match without normalizing.
 -doc false.
--spec check_request_authority(binary() | undefined, headers()) ->
+-spec check_request_authority(binary() | undefined, headers(), http | https) ->
     ok | {error, missing_authority | empty_authority | authority_mismatch | duplicate_host}.
-check_request_authority(Authority, Regular) ->
+check_request_authority(Authority, Regular, Scheme) ->
     case {Authority, find_host(Regular)} of
-        {_, multiple} -> {error, duplicate_host};
-        {undefined, undefined} -> {error, missing_authority};
-        {~"", _} -> {error, empty_authority};
-        {_, ~""} -> {error, empty_authority};
-        {Same, Same} -> ok;
-        {_, undefined} -> ok;
-        {undefined, _} -> ok;
-        {_, _} -> {error, authority_mismatch}
+        {_, multiple} ->
+            {error, duplicate_host};
+        {undefined, undefined} ->
+            {error, missing_authority};
+        {~"", _} ->
+            {error, empty_authority};
+        {_, ~""} ->
+            {error, empty_authority};
+        {Same, Same} ->
+            ok;
+        {_, undefined} ->
+            ok;
+        {undefined, _} ->
+            ok;
+        {_, Host} ->
+            case normalize_authority(Authority, Scheme) =:= normalize_authority(Host, Scheme) of
+                true -> ok;
+                false -> {error, authority_mismatch}
+            end
+    end.
+
+%% RFC 3986 §6.2 normalization of an `http`/`https` authority, which RFC
+%% 9113 §8.3.1 asks for before comparing `:authority` with `host`: the
+%% host is case-insensitive (§6.2.2.1; an http authority carries no
+%% userinfo and the port is digits, so the whole value is lowercased),
+%% and the scheme's default port or an empty port is the same as no port
+%% (§6.2.3). Percent-encoded reg-names are left as sent.
+-spec normalize_authority(binary(), http | https) -> binary().
+normalize_authority(Authority, Scheme) ->
+    drop_default_port(roadrunner_bin:ascii_lowercase(Authority), default_port(Scheme)).
+
+-spec default_port(http | https) -> binary().
+default_port(http) -> ~":80";
+default_port(https) -> ~":443".
+
+-spec drop_default_port(binary(), binary()) -> binary().
+drop_default_port(Authority, Port) ->
+    HostSize = byte_size(Authority) - byte_size(Port),
+    case Authority of
+        <<Host:HostSize/binary, Port/binary>> -> Host;
+        <<Host:(byte_size(Authority) - 1)/binary, ":">> -> Host;
+        _ -> Authority
     end.
 
 %% The `host` header value, `undefined` without one, or `multiple` when

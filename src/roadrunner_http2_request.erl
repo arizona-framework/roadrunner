@@ -28,7 +28,8 @@
 %% - `Connection`-specific headers MUST NOT appear (RFC 9113
 %%   §8.2.2). Rejected.
 %% - `:authority` or `Host` MUST be present, neither empty, and both
-%%   equal when both appear (RFC 9113 §8.3.1).
+%%   naming the same entity when both appear, compared after case and
+%%   default-port normalization (RFC 9113 §8.3.1).
 
 -export([from_headers/3]).
 
@@ -65,7 +66,7 @@ handlers requiring a flat binary call `iolist_to_binary/1` themselves.
 """.
 -spec from_headers(roadrunner_http:headers(), iodata(), request_context()) ->
     {ok, roadrunner_req:request()} | {error, build_error()}.
-from_headers(Headers, Body, RequestContext) ->
+from_headers(Headers, Body, #{scheme := Scheme} = RequestContext) ->
     maybe
         %% The `:scheme` pseudo-header must be present, but its value is
         %% deliberately discarded — the authoritative scheme comes from the conn
@@ -73,7 +74,7 @@ from_headers(Headers, Body, RequestContext) ->
         %% pseudo-header value.
         {ok, Method, Path, Authority, Regular} ?= roadrunner_http:request_pseudo_headers(Headers),
         ok ?= check_banned(Regular),
-        ok ?= roadrunner_http:check_request_authority(Authority, Regular),
+        ok ?= roadrunner_http:check_request_authority(Authority, Regular, Scheme),
         {ok,
             roadrunner_http:build_request(
                 {2, 0}, Method, Path, Authority, Regular, Body, RequestContext
