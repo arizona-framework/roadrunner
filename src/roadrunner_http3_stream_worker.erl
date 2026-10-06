@@ -33,12 +33,6 @@
 %% Exported for eunit branch coverage of the stop-on-send-error path.
 -export([sendfile_loop/3]).
 
-%% RFC 9114 §7.2.1: the DATA frame type is 0x00. We frame the body by
-%% hand (type + length varints, then the body by reference) instead of
-%% `roadrunner_quic_h3_frame:encode_data/1` so a large body is never flattened
-%% into one binary on the response path.
--define(H3_FRAME_DATA, 16#00).
-
 %% Worker process-dict flag: set once a `{stream, ...}` `Send` observed
 %% a fin variant, so `send_stream/5` knows whether to auto-close. Lives
 %% in this per-stream worker's dict, so stream isolation is automatic.
@@ -293,7 +287,7 @@ send_buffered(Conn, StreamId, Status, Headers, Body) ->
     Frames =
         case iolist_size(Body) of
             0 -> HeadersFrame;
-            BodyLen -> [HeadersFrame, data_frame(Body, BodyLen)]
+            BodyLen -> [HeadersFrame, roadrunner_quic_h3_frame:encode_data(Body, BodyLen)]
         end,
     %% Fire-and-forget: if the peer closed between its request and our
     %% response, the connection is draining and the send returns an error.
@@ -333,12 +327,18 @@ send_stream(Conn, StreamId, Status, Headers, Fun) ->
 ) -> ok | {error, term()}.
 stream_send(Conn, StreamId, Data, nofin) ->
     case iolist_size(Data) of
-        0 -> ok;
-        Len -> roadrunner_quic:send_data(Conn, StreamId, data_frame(Data, Len), false)
+        0 ->
+            ok;
+        Len ->
+            roadrunner_quic:send_data(
+                Conn, StreamId, roadrunner_quic_h3_frame:encode_data(Data, Len), false
+            )
     end;
 stream_send(Conn, StreamId, Data, fin) ->
     put(?FIN_KEY, true),
-    roadrunner_quic:send_data(Conn, StreamId, data_frame(Data, iolist_size(Data)), true);
+    roadrunner_quic:send_data(
+        Conn, StreamId, roadrunner_quic_h3_frame:encode_data(Data, iolist_size(Data)), true
+    );
 stream_send(Conn, StreamId, Data, {fin, Trailers}) ->
     %% Trailers go out after the status + body, so an injected one cannot
     %% become a 500. One pass crashes on the RFC 9110 §5.5 check (so the conn
@@ -350,7 +350,10 @@ stream_send(Conn, StreamId, Data, {fin, Trailers}) ->
     put(?FIN_KEY, true),
     TrailersFrame = roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(Stripped)),
     roadrunner_quic:send_data(
-        Conn, StreamId, [data_frame(Data, iolist_size(Data)), TrailersFrame], true
+        Conn,
+        StreamId,
+        [roadrunner_quic_h3_frame:encode_data(Data, iolist_size(Data)), TrailersFrame],
+        true
     ).
 
 %% `{sendfile, ...}` response. There is no kernel sendfile over QUIC
@@ -458,7 +461,9 @@ info_loop(Conn, StreamId, Handler, Push, State) ->
                     info_loop(Conn, StreamId, Handler, Push, NewState);
                 {stop, _NewState} ->
                     %% Close the stream with an empty DATA frame + FIN.
-                    _ = roadrunner_quic:send_data(Conn, StreamId, data_frame(<<>>, 0), true),
+                    _ = roadrunner_quic:send_data(
+                        Conn, StreamId, roadrunner_quic_h3_frame:encode_data(<<>>, 0), true
+                    ),
                     ok
             end
     end.
@@ -476,8 +481,12 @@ deliver_disconnect(Handler, Push, State, Reason) ->
 -spec loop_push(pid(), non_neg_integer(), iodata()) -> ok | {error, term()}.
 loop_push(Conn, StreamId, Data) ->
     case iolist_size(Data) of
-        0 -> ok;
-        Len -> roadrunner_quic:send_data(Conn, StreamId, data_frame(Data, Len), false)
+        0 ->
+            ok;
+        Len ->
+            roadrunner_quic:send_data(
+                Conn, StreamId, roadrunner_quic_h3_frame:encode_data(Data, Len), false
+            )
     end.
 
 %% HEADERS frame: QPACK-encoded `:status` + the handler's headers, with
@@ -488,10 +497,3 @@ header_frame(Status, Headers) ->
     Stripped = roadrunner_http:strip_connection_specific_fields(Headers),
     HeaderList = [{~":status", integer_to_binary(Status)} | roadrunner_http:with_date(Stripped)],
     roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(HeaderList)).
-
-%% DATA frame as an iolist (type + length varints, then the body by
-%% reference) so a large body is never flattened. `Len` is the caller's
-%% already-computed `iolist_size(Body)`.
--spec data_frame(iodata(), non_neg_integer()) -> iolist().
-data_frame(Body, Len) ->
-    [roadrunner_quic_varint:encode(?H3_FRAME_DATA), roadrunner_quic_varint:encode(Len), Body].
