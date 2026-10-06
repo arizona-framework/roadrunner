@@ -80,7 +80,7 @@ from_headers(Headers, Body, RequestContext) ->
         {ok, Method, Path, Authority, Regular} ?= roadrunner_http:request_pseudo_headers(Headers),
         ok ?= check_banned(Regular),
         ok ?= check_content_length(Regular, Body),
-        ok ?= check_authority(Authority, Regular),
+        ok ?= roadrunner_http:check_request_authority(Authority, Regular),
         {ok, build(Method, Path, Authority, Regular, Body, RequestContext)}
     end.
 
@@ -155,30 +155,6 @@ find_content_length([{~"content-length", Value} | Rest], undefined) ->
     find_content_length(Rest, Value);
 find_content_length([_ | Rest], Value) ->
     find_content_length(Rest, Value).
-
-%% RFC 9114 §4.3.1: over QUIC the scheme is always https (a mandatory authority
-%% component), so the request MUST carry an `:authority` pseudo-header or a
-%% `host` header; if present neither is empty, and if both appear they MUST
-%% match. The empty-value clauses precede the equality clause so an empty value
-%% loses even when both sides are equally empty.
--spec check_authority(binary() | undefined, roadrunner_http:headers()) ->
-    ok | {error, missing_authority | empty_authority | authority_mismatch}.
-check_authority(Authority, Regular) ->
-    case {Authority, find_host(Regular)} of
-        {undefined, undefined} -> {error, missing_authority};
-        {~"", _} -> {error, empty_authority};
-        {_, ~""} -> {error, empty_authority};
-        {Same, Same} -> ok;
-        {_, undefined} -> ok;
-        {undefined, _} -> ok;
-        {_, _} -> {error, authority_mismatch}
-    end.
-
-%% The first `host` header value, or `undefined`.
--spec find_host(roadrunner_http:headers()) -> binary() | undefined.
-find_host([]) -> undefined;
-find_host([{~"host", Value} | _]) -> Value;
-find_host([_ | Rest]) -> find_host(Rest).
 
 -spec build(
     binary(),

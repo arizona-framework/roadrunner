@@ -23,6 +23,7 @@ post_with_body_test() ->
     Headers = [
         {~":method", ~"POST"},
         {~":scheme", ~"https"},
+        {~":authority", ~"example.com"},
         {~":path", ~"/api"},
         {~"content-type", ~"application/json"}
     ],
@@ -41,13 +42,14 @@ regular_headers_preserved_in_order_test() ->
         {~":scheme", ~"https"},
         {~":path", ~"/"},
         {~"x-1", ~"a"},
-        {~"x-2", ~"b"},
+        {~"host", ~"example.com"},
         {~"x-3", ~"c"}
     ],
     {ok, Req} = roadrunner_http2_request:from_headers(Headers, <<>>, request_context()),
-    %% No `:authority` so no synthesised `host` header is prepended.
+    %% No `:authority`: the client's `host` carries the authority, and
+    %% nothing is synthesised in front of the headers.
     ?assertEqual(
-        [{~"x-1", ~"a"}, {~"x-2", ~"b"}, {~"x-3", ~"c"}],
+        [{~"x-1", ~"a"}, {~"host", ~"example.com"}, {~"x-3", ~"c"}],
         maps:get(headers, Req)
     ).
 
@@ -165,6 +167,7 @@ te_only_trailers_allowed_test() ->
     GoodHeaders = [
         {~":method", ~"GET"},
         {~":scheme", ~"https"},
+        {~":authority", ~"example.com"},
         {~":path", ~"/"},
         {~"te", ~"trailers"}
     ],
@@ -180,6 +183,44 @@ te_only_trailers_allowed_test() ->
     ?assertEqual(
         {error, connection_specific_header},
         roadrunner_http2_request:from_headers(BadHeaders, <<>>, request_context())
+    ).
+
+%% --- authority (RFC 9113 §8.3.1) ---
+
+authority_rules_test() ->
+    %% An https request MUST carry `:authority` or `host`, neither empty,
+    %% and both equal when both are present.
+    Build = fun(Extra) ->
+        roadrunner_http2_request:from_headers(
+            [{~":method", ~"GET"}, {~":scheme", ~"https"}, {~":path", ~"/"} | Extra],
+            <<>>,
+            request_context()
+        )
+    end,
+    ?assertEqual({error, missing_authority}, Build([])),
+    ?assertEqual({error, empty_authority}, Build([{~":authority", ~""}])),
+    ?assertEqual({error, empty_authority}, Build([{~"host", ~""}])),
+    ?assertEqual(
+        {error, authority_mismatch},
+        Build([{~":authority", ~"a.example"}, {~"host", ~"b.example"}])
+    ).
+
+authority_and_equal_host_leave_one_host_test() ->
+    %% A client that sends both gets a single `host`, not a duplicate.
+    {ok, Req} = roadrunner_http2_request:from_headers(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"example.com"},
+            {~":path", ~"/"},
+            {~"accept", ~"*/*"},
+            {~"host", ~"example.com"}
+        ],
+        <<>>,
+        request_context()
+    ),
+    ?assertEqual(
+        [{~"host", ~"example.com"}, {~"accept", ~"*/*"}], maps:get(headers, Req)
     ).
 
 %% --- helpers ---

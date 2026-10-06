@@ -41,7 +41,7 @@ accessors that operate on it.
 -export([header_list_size/1]).
 -export([check_header_safe/2, is_header_safe/1]).
 -export([strip_connection_specific_fields/1, strip_connection_specific_fields_safe/1]).
--export([request_pseudo_headers/1]).
+-export([request_pseudo_headers/1, check_request_authority/2]).
 
 -export_type([headers/0, status/0, redirect_status/0, version/0]).
 
@@ -365,3 +365,31 @@ validate_pseudo(Method, Scheme, Authority, Path, Regular) when
     {ok, Method, Path, Authority, Regular};
 validate_pseudo(_Method, _Scheme, _Authority, _Path, _Regular) ->
     {error, missing_pseudo_header}.
+
+%% The request authority rule shared by HTTP/2 and HTTP/3 (RFC 9113 §8.3.1,
+%% RFC 9114 §4.3.1). Roadrunner only serves `http` and `https`, both with a
+%% mandatory authority component (QUIC is always `https`, and an HTTP/2
+%% request's scheme is the connection's), so the request MUST carry an
+%% `:authority` pseudo-header or a `host` header; if present neither is
+%% empty, and if both appear they MUST match. The empty-value clauses
+%% precede the equality clause so an empty value loses even when both
+%% sides are equally empty.
+-doc false.
+-spec check_request_authority(binary() | undefined, headers()) ->
+    ok | {error, missing_authority | empty_authority | authority_mismatch}.
+check_request_authority(Authority, Regular) ->
+    case {Authority, find_host(Regular)} of
+        {undefined, undefined} -> {error, missing_authority};
+        {~"", _} -> {error, empty_authority};
+        {_, ~""} -> {error, empty_authority};
+        {Same, Same} -> ok;
+        {_, undefined} -> ok;
+        {undefined, _} -> ok;
+        {_, _} -> {error, authority_mismatch}
+    end.
+
+%% The first `host` header value, or `undefined`.
+-spec find_host(headers()) -> binary() | undefined.
+find_host([]) -> undefined;
+find_host([{~"host", Value} | _]) -> Value;
+find_host([_ | Rest]) -> find_host(Rest).
