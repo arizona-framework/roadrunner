@@ -464,7 +464,7 @@ handshake_recv(
     _ = roadrunner_transport:setopts(Sock, [{active, once}]),
     receive
         {MData, _, Bytes} ->
-            Cont(State#loop{buffer = <<Buf/binary, Bytes/binary>>});
+            Cont(State#loop{buffer = roadrunner_bin:append(Buf, Bytes)});
         {MClosed, _} ->
             exit_clean(State);
         {MError, _, _} ->
@@ -511,7 +511,7 @@ recv_more(
 ) ->
     receive
         {MData, _, Bytes} ->
-            frame_loop(State#loop{buffer = <<Buf/binary, Bytes/binary>>});
+            frame_loop(State#loop{buffer = roadrunner_bin:append(Buf, Bytes)});
         {MClosed, _} ->
             exit_clean(State);
         {MError, _, _} ->

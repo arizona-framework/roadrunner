@@ -92,3 +92,10 @@ digits_to_integer_test() ->
             {~"abc", error}
         ]
     ].
+
+append_to_empty_buffer_returns_bytes_test() ->
+    Bytes = ~"GET / HTTP/1.1\r\n",
+    ?assert(erts_debug:same(Bytes, roadrunner_bin:append(<<>>, Bytes))).
+
+append_to_partial_buffer_concatenates_test() ->
+    ?assertEqual(~"GET / HTTP/1.1\r\n", roadrunner_bin:append(~"GET / ", ~"HTTP/1.1\r\n")).

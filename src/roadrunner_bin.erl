@@ -9,7 +9,7 @@
 %% on bytes, with no protocol semantics. Don't put non-binary helpers
 %% here — give them their own module.
 
--export([ascii_lowercase/1, digits_to_integer/1, trim_ows/1, trim_trailing_ows/1]).
+-export([append/2, ascii_lowercase/1, digits_to_integer/1, trim_ows/1, trim_trailing_ows/1]).
 
 -doc """
 Fast ASCII-only lowercase. Bytes in `[A-Z]` are mapped to `[a-z]`;
@@ -190,3 +190,18 @@ digits_to_integer(<<C, _/binary>> = Bin) when C >= $0, C =< $9 ->
     end;
 digits_to_integer(_) ->
     error.
+
+-doc """
+Append freshly received bytes to a receive buffer.
+
+An empty buffer hands `Bytes` back as is: `<<Buf/binary, Bytes/binary>>`
+copies `Bytes` into a new writable binary even when `Buf` is `<<>>`,
+which costs 70-300 ns per packet (40 B to 16 KB) on the common path
+where the previous request left nothing behind. A non-empty buffer is
+appended as before.
+""".
+-spec append(binary(), binary()) -> binary().
+append(<<>>, Bytes) ->
+    Bytes;
+append(Buf, Bytes) ->
+    <<Buf/binary, Bytes/binary>>.

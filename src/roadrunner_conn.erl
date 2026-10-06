@@ -982,7 +982,7 @@ read_chunked(Buf, RecvFun, MaxCL, Decoded, TrailerLimits) ->
             case RecvFun() of
                 {ok, More} ->
                     read_chunked(
-                        <<Buf/binary, More/binary>>, RecvFun, MaxCL, Decoded, TrailerLimits
+                        roadrunner_bin:append(Buf, More), RecvFun, MaxCL, Decoded, TrailerLimits
                     );
                 {error, _} = E ->
                     E
@@ -1134,7 +1134,7 @@ chunked_collect(
         {more, _} ->
             case Recv() of
                 {ok, More} ->
-                    chunked_collect(BS#{buffered := <<Buf/binary, More/binary>>}, Want);
+                    chunked_collect(BS#{buffered := roadrunner_bin:append(Buf, More)}, Want);
                 {error, _} = E ->
                     E
             end;
@@ -1172,7 +1172,7 @@ next_chunk(
         {more, _} ->
             case Recv() of
                 {ok, More} ->
-                    next_chunk(BS#{buffered := <<Buf/binary, More/binary>>});
+                    next_chunk(BS#{buffered := roadrunner_bin:append(Buf, More)});
                 {error, _} = E ->
                     E
             end;
@@ -1246,7 +1246,7 @@ parse_loop(Buf, RecvFun) ->
             {ok, Req, Rest};
         {more, _} ->
             case RecvFun() of
-                {ok, Data} -> parse_loop(<<Buf/binary, Data/binary>>, RecvFun);
+                {ok, Data} -> parse_loop(roadrunner_bin:append(Buf, Data), RecvFun);
                 {error, _} = E -> E
             end;
         {error, _} = E ->

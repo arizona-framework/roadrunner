@@ -582,7 +582,7 @@ recv_idle(#loop_state{socket = Socket, buffered = Buf} = S, Deadline) ->
             %% chunk after it.
             handle_request_bytes(
                 S#loop_state{
-                    buffered = <<Buf/binary, Bytes/binary>>,
+                    buffered = roadrunner_bin:append(Buf, Bytes),
                     recv_phase_bytes = byte_size(Bytes),
                     recv_phase_start = erlang:monotonic_time(millisecond)
                 },
@@ -664,7 +664,7 @@ recv_passive(
                         true ->
                             handle_request_bytes(
                                 S#loop_state{
-                                    buffered = <<Buf/binary, Bytes/binary>>,
+                                    buffered = roadrunner_bin:append(Buf, Bytes),
                                     recv_phase_bytes = NewBytes,
                                     recv_phase_start = PhaseStart
                                 },
@@ -744,7 +744,7 @@ recv_with_hibernate(
                 true ->
                     handle_request_bytes(
                         S#loop_state{
-                            buffered = <<Buf/binary, Bytes/binary>>,
+                            buffered = roadrunner_bin:append(Buf, Bytes),
                             recv_phase_bytes = NewBytes,
                             recv_phase_start = PhaseStart1
                         },
