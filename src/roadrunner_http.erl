@@ -41,9 +41,11 @@ accessors that operate on it.
 -export([header_list_size/1]).
 -export([check_header_safe/2, is_header_safe/1]).
 -export([strip_connection_specific_fields/1, strip_connection_specific_fields_safe/1]).
--export([request_pseudo_headers/1, check_request_authority/2, request_content_length/1]).
+-export([
+    request_pseudo_headers/1, check_request_authority/2, request_content_length/1, build_request/7
+]).
 
--export_type([headers/0, status/0, redirect_status/0, version/0]).
+-export_type([headers/0, status/0, redirect_status/0, version/0, request_context/0]).
 
 -define(DATE_CACHE_KEY, {?MODULE, date_cache}).
 
@@ -53,6 +55,14 @@ accessors that operate on it.
 -type status() :: 100..599.
 -type redirect_status() :: 300..399.
 -type version() :: {1, 0} | {1, 1} | {2, 0} | {3, 0}.
+%% The per-connection fields an HTTP/2 or HTTP/3 connection passes to
+%% build a request.
+-type request_context() :: #{
+    peer := {inet:ip_address(), inet:port_number()} | undefined,
+    scheme := http | https,
+    request_id := binary(),
+    listener_name := atom()
+}.
 %% Why `request_pseudo_headers/1` rejects an HTTP/2 or HTTP/3 request's
 %% pseudo-header section.
 -type pseudo_error() ::
@@ -422,3 +432,46 @@ find_content_length([{~"content-length", Value} | Rest], undefined) ->
     find_content_length(Rest, Value);
 find_content_length([_ | Rest], Value) ->
     find_content_length(Rest, Value).
+
+%% Build the request map for a validated HTTP/2 or HTTP/3 request. The
+%% `:authority` pseudo-header is forwarded as a `host` header so handler
+%% code that reads `Host` still works (RFC 9113 §8.3.1 and RFC 9114
+%% §4.3.1 treat `:authority` like `Host`); a client-sent `host`, already
+%% checked equal by `check_request_authority/2`, is dropped first so a
+%% single canonical entry survives instead of a duplicate. The connection
+%% loop always builds `RequestContext` with all four fields, so it is
+%% destructured in one match rather than four `maps:get/3` calls.
+-doc false.
+-spec build_request(
+    version(),
+    binary(),
+    binary(),
+    binary() | undefined,
+    headers(),
+    iodata(),
+    request_context()
+) -> roadrunner_req:request().
+build_request(Version, Method, Path, Authority, Regular, Body, RequestContext) ->
+    HeadersWithHost =
+        case Authority of
+            undefined -> Regular;
+            _ -> [{~"host", Authority} | lists:keydelete(~"host", 1, Regular)]
+        end,
+    #{
+        peer := Peer,
+        scheme := Scheme,
+        request_id := RequestId,
+        listener_name := ListenerName
+    } = RequestContext,
+    #{
+        method => Method,
+        target => Path,
+        version => Version,
+        headers => HeadersWithHost,
+        body => Body,
+        bindings => #{},
+        peer => Peer,
+        scheme => Scheme,
+        request_id => RequestId,
+        listener_name => ListenerName
+    }.
