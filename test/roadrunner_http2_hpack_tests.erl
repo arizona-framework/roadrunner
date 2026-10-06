@@ -845,6 +845,88 @@ decode_string_with_empty_input_after_indicator_test() ->
 %% Helpers — pull internals out of the opaque record for assertions.
 %% =============================================================================
 
+%% =============================================================================
+%% Encoder lookup index (tables past 32 entries)
+%% =============================================================================
+
+%% Encode `Headers` one block each, decode every block back, and return
+%% the last block's bytes with the encoder.
+encode_blocks(Headers, Enc0) ->
+    lists:foldl(
+        fun(H, {_, Enc, Dec}) ->
+            {Iodata, Enc1} = roadrunner_http2_hpack:encode([H], Enc),
+            Bin = iolist_to_binary(Iodata),
+            {ok, [H], Dec1} = roadrunner_http2_hpack:decode(Bin, Dec),
+            {Bin, Enc1, Dec1}
+        end,
+        {<<>>, Enc0, roadrunner_http2_hpack:new_decoder(4096)},
+        Headers
+    ).
+
+%% `x-01`/`v01` .. : every entry is 4 + 3 + 32 = 39 bytes.
+numbered(N) ->
+    [
+        {
+            iolist_to_binary(io_lib:format("x-~2..0B", [I])),
+            iolist_to_binary(io_lib:format("v~2..0B", [I]))
+        }
+     || I <- lists:seq(1, N)
+    ].
+
+encoder_index_lookups_match_table_positions_test() ->
+    %% 40 entries fit a 4096-byte table; the index is built on the next
+    %% encode and must give the same indices as a scan.
+    {_, Enc, _} = encode_blocks(numbered(40), roadrunner_http2_hpack:new_encoder(4096)),
+    Encode = fun(H) -> iolist_to_binary(element(1, roadrunner_http2_hpack:encode([H], Enc))) end,
+    %% Newest entry at dynamic position 1 = index 62.
+    ?assertEqual(<<(16#80 bor 62)>>, Encode({~"x-40", ~"v40"})),
+    %% Eldest at position 40 = index 101.
+    ?assertEqual(<<(16#80 bor 101)>>, Encode({~"x-01", ~"v01"})),
+    %% Name-only hit on `x-05` (position 36, index 97): 6-bit prefix 63
+    %% plus continuation 34, then the new value.
+    ?assertEqual(<<16#7F, 34, 3, "new">>, Encode({~"x-05", ~"new"})),
+    %% Miss: literal with a new name.
+    ?assertEqual(<<16#40, 5, "brand", 3, "new">>, Encode({~"brand", ~"new"})).
+
+encoder_index_forgets_evicted_entries_test() ->
+    %% 35 entries fill a 35 * 39 byte table, so every insert evicts.
+    {_, Enc0, _} = encode_blocks(numbered(35), roadrunner_http2_hpack:new_encoder(35 * 39)),
+    %% The index is built on this encode; the new `x-02` (37 bytes) evicts
+    %% `x-01`, the eldest, whose name nothing newer has taken.
+    {_, Enc1} = roadrunner_http2_hpack:encode([{~"x-02", ~"w"}], Enc0),
+    %% `y` (35 bytes) evicts the old `x-02`, whose name the newer `x-02`
+    %% has taken over by now.
+    {_, Enc} = roadrunner_http2_hpack:encode([{~"y", ~"zz"}], Enc1),
+    Entries = dyn(Enc),
+    ?assertNot(lists:member({~"x-01", ~"v01"}, Entries)),
+    ?assertNot(lists:member({~"x-02", ~"v02"}, Entries)),
+    Encode = fun(H) -> iolist_to_binary(element(1, roadrunner_http2_hpack:encode([H], Enc))) end,
+    %% `x-01` is gone altogether: a literal with a new name.
+    ?assertEqual(<<16#40, 4, "x-01", 3, "v01">>, Encode({~"x-01", ~"v01"})),
+    %% `x-02` still names the newer entry, at position 2 (index 63).
+    ?assertEqual(<<16#7F, 0, 3, "v02">>, Encode({~"x-02", ~"v02"})).
+
+encoder_index_survives_table_shrink_test() ->
+    %% Shrinking the table evicts more entries than the one-at-a-time
+    %% path takes, so the index is rebuilt from the kept entries.
+    {_, Enc0, _} = encode_blocks(numbered(40), roadrunner_http2_hpack:new_encoder(4096)),
+    {_, Enc1} = roadrunner_http2_hpack:encode([{~"x-40", ~"v40"}], Enc0),
+    Enc2 = roadrunner_http2_hpack:set_max_table_size(2 * 39, Enc1),
+    ?assertEqual([{~"x-40", ~"v40"}, {~"x-39", ~"v39"}], dyn(Enc2)),
+    {Iodata, _} = roadrunner_http2_hpack:encode([{~"x-39", ~"v39"}], Enc2),
+    %% Size Update to 78 first (5-bit prefix 31 + 47), then the indexed
+    %% field at position 2 (index 63).
+    ?assertEqual(<<16#3F, 47, (16#80 bor 63)>>, iolist_to_binary(Iodata)).
+
+encoder_index_cleared_by_oversized_entry_test() ->
+    %% An entry larger than the table empties it, index included.
+    {_, Enc0, _} = encode_blocks(numbered(40), roadrunner_http2_hpack:new_encoder(4096)),
+    {_, Enc1} = roadrunner_http2_hpack:encode([{~"x-40", ~"v40"}], Enc0),
+    {_, Enc2} = roadrunner_http2_hpack:encode([{~"big", binary:copy(~"b", 5000)}], Enc1),
+    ?assertEqual([], dyn(Enc2)),
+    {Iodata, _} = roadrunner_http2_hpack:encode([{~"x-40", ~"v40"}], Enc2),
+    ?assertMatch(<<16#40, _/binary>>, iolist_to_binary(Iodata)).
+
 dyn(Ctx) ->
     %% The opaque type makes us peek via element/2 — index 2 of the
     %% record tuple is the dynamic-table tuple (newest first). Convert

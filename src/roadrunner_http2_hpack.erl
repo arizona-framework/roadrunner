@@ -59,6 +59,11 @@
 %% RFC 7541 Appendix A — 61 static-table entries. Defined up here
 %% so it expands in every later guard / arithmetic site below.
 -define(STATIC_TABLE_LEN, 61).
+%% Table size past which an encoder indexes its dynamic table (see the
+%% `index` field). Maps up to 32 keys are flat sorted arrays searched
+%% linearly, barely faster than the tuple scan; from 33 they are hash
+%% tries, where a lookup is ~12 ns against ~640 ns to scan 64 entries.
+-define(INDEX_MIN, 32).
 
 -record(hpack_ctx, {
     %% Dynamic-table entries, newest at element 1 (lowest dynamic
@@ -91,7 +96,18 @@
     %% Encoder-only: when the cap is lowered, the encoder MUST
     %% emit a Size Update before any other representation on the
     %% next `encode/2` call.
-    pending_update = false :: boolean()
+    pending_update = false :: boolean(),
+    %% Encoder-only, counted once `index` exists (starting from the
+    %% entry count at that moment): the entry at table position `I` has
+    %% sequence number `inserted - I + 1`, which stays put while newer
+    %% entries push the entry's position up.
+    inserted = 0 :: non_neg_integer(),
+    %% Encoder-only lookup index, built once the table outgrows
+    %% `?INDEX_MIN` entries and kept in step from then on:
+    %% `{Name, Value}` and `Name` to the sequence number of their newest
+    %% entry, which is what the linear scan from position 1 finds. The
+    %% decoder never matches on content, so it never builds one.
+    index = none :: none | {#{header() => pos_integer()}, #{binary() => pos_integer()}}
 }).
 
 -opaque context() :: #hpack_ctx{}.
@@ -290,7 +306,7 @@ phase).
 """.
 -spec encode([header()], context()) -> {iodata(), context()}.
 encode(Headers, Ctx0) ->
-    {SizeUpdate, Ctx1} = take_pending_update(Ctx0),
+    {SizeUpdate, Ctx1} = take_pending_update(ensure_index(Ctx0)),
     {Body, Ctx2} = encode_each(Headers, Ctx1),
     {[SizeUpdate, Body], Ctx2}.
 
@@ -330,6 +346,46 @@ encode_each([{Name, Value} = H | Rest], Ctx, Acc) ->
                 {encode_indexed(Idx), Ctx}
         end,
     encode_each(Rest, Ctx1, [Bytes | Acc]).
+
+%% Build the encoder's lookup index on the first `encode/2` that finds
+%% its table holding more than `?INDEX_MIN` entries. Sequence numbers
+%% start from the entry count, so the eldest entry is number 1.
+-spec ensure_index(context()) -> context().
+ensure_index(#hpack_ctx{index = none, count = Count} = Ctx) when Count > ?INDEX_MIN ->
+    Ctx#hpack_ctx{inserted = Count, index = build_index(Ctx#hpack_ctx.table, Count, Count)};
+ensure_index(Ctx) ->
+    Ctx.
+
+%% Index every entry from the eldest (position `I = Count`) to the
+%% newest, so a newer duplicate overwrites an older one.
+-spec build_index(tuple(), non_neg_integer(), non_neg_integer()) ->
+    {#{header() => pos_integer()}, #{binary() => pos_integer()}}.
+build_index(Table, Count, Inserted) ->
+    lists:foldl(
+        fun(I, Index) -> index_put(element(I, Table), Inserted - I + 1, Index) end,
+        {#{}, #{}},
+        lists:seq(Count, 1, -1)
+    ).
+
+-spec index_put(header(), pos_integer(), {map(), map()}) -> {map(), map()}.
+index_put({Name, _} = Header, Seq, {Full, Names}) ->
+    {Full#{Header => Seq}, Names#{Name => Seq}}.
+
+%% Drop an evicted entry's keys. Its `{Name, Value}` key is always its
+%% own: the encoder never inserts an entry it could have indexed, so the
+%% table holds no duplicates. Its `Name` key may have been taken over by
+%% a newer entry with the same name, which stays.
+-spec index_drop(header(), pos_integer(), none | {map(), map()}) -> none | {map(), map()}.
+index_drop(_Header, _Seq, none) ->
+    none;
+index_drop({Name, _} = Header, Seq, {Full, Names}) ->
+    {
+        maps:remove(Header, Full),
+        case Names of
+            #{Name := Seq} -> maps:remove(Name, Names);
+            #{} -> Names
+        end
+    }.
 
 -spec encode_indexed(pos_integer()) -> iodata().
 encode_indexed(Idx) ->
@@ -487,48 +543,81 @@ insert({Name, Value} = H, #hpack_ctx{max_size = Max} = Ctx) ->
             %% RFC 7541 §4.4: an entry larger than the table is
             %% silently dropped, evicting the entire current table
             %% in the process.
-            Ctx#hpack_ctx{table = {}, size = 0, count = 0};
+            Ctx#hpack_ctx{
+                table = {}, size = 0, count = 0, index = empty_index(Ctx#hpack_ctx.index)
+            };
         false ->
             Evicted = evict_to(Max - EntrySize, Ctx),
-            Evicted#hpack_ctx{
+            Added = Evicted#hpack_ctx{
                 table = erlang:insert_element(1, Evicted#hpack_ctx.table, H),
                 size = Evicted#hpack_ctx.size + EntrySize,
                 count = Evicted#hpack_ctx.count + 1
-            }
+            },
+            case Added of
+                #hpack_ctx{index = none} ->
+                    Added;
+                #hpack_ctx{inserted = Last, index = Index} ->
+                    Added#hpack_ctx{inserted = Last + 1, index = index_put(H, Last + 1, Index)}
+            end
     end.
+
+-spec empty_index(none | {map(), map()}) -> none | {map(), map()}.
+empty_index(none) -> none;
+empty_index(_Index) -> {#{}, #{}}.
 
 -spec evict_to(non_neg_integer(), context()) -> context().
 evict_to(Target, #hpack_ctx{size = Size} = Ctx) when Size =< Target ->
     Ctx;
-evict_to(Target, #hpack_ctx{table = Table, count = Count, size = Size} = Ctx) ->
-    {KeptTable, NewSize} = evict_eldest(Target, Table, Count, Size, 8),
-    Ctx#hpack_ctx{table = KeptTable, size = NewSize, count = tuple_size(KeptTable)}.
+evict_to(
+    Target,
+    #hpack_ctx{table = Table, count = Count, size = Size, inserted = Inserted, index = Index} = Ctx
+) ->
+    {KeptTable, NewSize, NewIndex} = evict_eldest(Target, Table, Count, Size, Inserted, Index, 8),
+    Ctx#hpack_ctx{
+        table = KeptTable, size = NewSize, count = tuple_size(KeptTable), index = NewIndex
+    }.
 
 %% Eldest is at the END. An insert into a full table usually evicts one
 %% or two entries, so drop them one at a time with `delete_element/2`
 %% (one tuple copy each, 600 ns -> 40 ns for a single eviction on a
 %% full 4 KB table). Past `Left` drops, a rebuild that walks only the
 %% kept entries is cheaper, so hand the rest to `keep_within/2`, which
-%% walks from the newest end with the remaining budget.
+%% walks from the newest end with the remaining budget, and rebuild an
+%% encoder's index from what is kept.
 -spec evict_eldest(
-    non_neg_integer(), tuple(), non_neg_integer(), non_neg_integer(), non_neg_integer()
+    non_neg_integer(),
+    tuple(),
+    non_neg_integer(),
+    non_neg_integer(),
+    non_neg_integer(),
+    none | {map(), map()},
+    non_neg_integer()
 ) ->
-    {tuple(), non_neg_integer()}.
-evict_eldest(Target, Table, _Count, Size, _Left) when Size =< Target ->
-    {Table, Size};
-evict_eldest(Target, Table, _Count, _Size, 0) ->
+    {tuple(), non_neg_integer(), none | {map(), map()}}.
+evict_eldest(Target, Table, _Count, Size, _Inserted, Index, _Left) when Size =< Target ->
+    {Table, Size, Index};
+evict_eldest(Target, Table, _Count, _Size, Inserted, Index, 0) ->
     {Kept, NewSize} = keep_within(tuple_to_list(Table), Target),
-    {list_to_tuple(Kept), NewSize};
-evict_eldest(Target, Table, Count, Size, Left) ->
+    KeptTable = list_to_tuple(Kept),
+    NewIndex =
+        case Index of
+            none -> none;
+            _ -> build_index(KeptTable, tuple_size(KeptTable), Inserted)
+        end,
+    {KeptTable, NewSize, NewIndex};
+evict_eldest(Target, Table, Count, Size, Inserted, Index, Left) ->
+    Eldest = element(Count, Table),
     evict_eldest(
         Target,
         erlang:delete_element(Count, Table),
         Count - 1,
-        Size - entry_size(element(Count, Table)),
+        Size - entry_size(Eldest),
+        Inserted,
+        index_drop(Eldest, Inserted - Count + 1, Index),
         Left - 1
     ).
 
-%% `evict_eldest/5` only calls this while the current size exceeds the
+%% `evict_eldest/7` only calls this while the current size exceeds the
 %% target, so this never sees an empty table — the trim point is
 %% always reached strictly before the list runs out. A bare
 %% function-clause crash on `[]` is the desired "trust the invariant"
@@ -560,21 +649,41 @@ entry_size({Name, Value}) ->
 %% =============================================================================
 
 -spec full_match(binary(), binary(), context()) -> pos_integer() | none.
-full_match(Name, Value, #hpack_ctx{table = Dyn, count = Count}) ->
+full_match(Name, Value, Ctx) ->
     %% Static lookup is a function-clause dispatch (BEAM JIT turns
     %% the 60-clause `static_full_match/2` into a hash/select jump
     %% table); we still indirect through the wrapper so a hit
     %% returns directly without scanning the dynamic table.
     case static_full_match(Name, Value) of
-        none -> dyn_full_match(Name, Value, Dyn, 1, Count);
+        none -> dyn_full_match(Name, Value, Ctx);
         Idx -> Idx
     end.
 
 -spec name_match(binary(), context()) -> pos_integer() | none.
-name_match(Name, #hpack_ctx{table = Dyn, count = Count}) ->
+name_match(Name, Ctx) ->
     case static_name_match(Name) of
-        none -> dyn_name_match(Name, Dyn, 1, Count);
+        none -> dyn_name_match(Name, Ctx);
         Idx -> Idx
+    end.
+
+%% The newest dynamic entry matching, through the index when the
+%% encoder has built one, else by scanning.
+-spec dyn_full_match(binary(), binary(), context()) -> pos_integer() | none.
+dyn_full_match(Name, Value, #hpack_ctx{index = none, table = Dyn, count = Count}) ->
+    dyn_full_match(Name, Value, Dyn, 1, Count);
+dyn_full_match(Name, Value, #hpack_ctx{index = {Full, _}, inserted = Inserted}) ->
+    case Full of
+        #{{Name, Value} := Seq} -> ?STATIC_TABLE_LEN + Inserted - Seq + 1;
+        #{} -> none
+    end.
+
+-spec dyn_name_match(binary(), context()) -> pos_integer() | none.
+dyn_name_match(Name, #hpack_ctx{index = none, table = Dyn, count = Count}) ->
+    dyn_name_match(Name, Dyn, 1, Count);
+dyn_name_match(Name, #hpack_ctx{index = {_, Names}, inserted = Inserted}) ->
+    case Names of
+        #{Name := Seq} -> ?STATIC_TABLE_LEN + Inserted - Seq + 1;
+        #{} -> none
     end.
 
 %% Scan the dynamic-table tuple (newest at index 1) with `element/2`
