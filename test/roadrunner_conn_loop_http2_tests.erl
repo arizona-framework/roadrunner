@@ -102,6 +102,7 @@ all_test_() ->
         fun drain_message_is_idempotent/0,
         fun drain_then_peer_rst_exits_via_frame_loop/0,
         fun telemetry_request_start_stop_fires_for_h2/0,
+        fun telemetry_request_stop_reports_the_status_sent/0,
         fun telemetry_request_exception_fires_on_h2_handler_crash/0,
         fun telemetry_request_stop_fires_for_router_404/0,
         fun compress_middleware_gzips_buffered_h2_response/0,
@@ -2612,6 +2613,28 @@ telemetry_request_start_stop_fires_for_h2() ->
         ?assertEqual(200, maps:get(status, StopMd)),
         ?assertEqual(buffered, maps:get(response_kind, StopMd)),
         cleanup(Pid, Ref)
+    after
+        detach_telemetry(HandlerId)
+    end.
+
+telemetry_request_stop_reports_the_status_sent() ->
+    %% When the worker overrides the handler's response, telemetry
+    %% reports what went on the wire: 500 for a returned 1xx, 501 for a
+    %% websocket upgrade h2 cannot carry.
+    HandlerId = attach_telemetry([[roadrunner, request, stop]]),
+    try
+        [
+            begin
+                {Pid, Ref, _} = run_h2_request_with_handler(roadrunner_h2_test_handler, Path),
+                receive
+                    {telemetry_event, [roadrunner, request, stop], _, Md} ->
+                        ?assertEqual(Sent, maps:get(status, Md))
+                after 500 -> error({no_stop_event, Path})
+                end,
+                cleanup(Pid, Ref)
+            end
+         || {Path, Sent} <- [{~"/interim", 500}, {~"/websocket", 501}]
+        ]
     after
         detach_telemetry(HandlerId)
     end.

@@ -126,17 +126,17 @@ run_handler(ConnPid, StreamId, Req, Dispatch) ->
 invoke(ConnPid, StreamId, Handler, Pipeline, #{method := Method} = Req, Metadata, ReqStart) ->
     try Pipeline(Req) of
         {Response, _Req2} ->
-            %% RFC 9110 §9.3.2: a HEAD response carries no content; emit
-            %% the body-stripped form but report the handler's original
-            %% shape / status to telemetry.
-            emit_handler_response(
+            %% `emit_handler_response/4` returns the status actually sent
+            %% (which differs from the handler's when we override a bad
+            %% response with 500 / 501) so telemetry reports the truth.
+            %% RFC 9110 §9.3.2: a HEAD response carries no content, so
+            %% emit the body-stripped form; telemetry keeps the handler's
+            %% original shape (`response_kind/1` below).
+            Status = emit_handler_response(
                 ConnPid, StreamId, Handler, roadrunner_conn:head_response(Response, Method)
             ),
             ok = roadrunner_telemetry:request_stop(
-                ReqStart,
-                Metadata,
-                roadrunner_conn:response_status(Response),
-                roadrunner_conn:response_kind(Response)
+                ReqStart, Metadata, Status, roadrunner_conn:response_kind(Response)
             )
     catch
         Class:Reason:Stack ->
@@ -180,10 +180,14 @@ telemetry_metadata(#{
         listener_name => ListenerName
     }.
 
+%% Returns the status actually sent.
+-spec emit_handler_response(pid(), pos_integer(), module(), roadrunner_handler:response()) ->
+    roadrunner_http:status().
 emit_handler_response(ConnPid, StreamId, _Handler, {Status, Headers, Body}) when
     is_integer(Status), Status >= 200, Status =< 599
 ->
-    send_buffered(ConnPid, StreamId, Status, Headers, Body);
+    ok = send_buffered(ConnPid, StreamId, Status, Headers, Body),
+    Status;
 emit_handler_response(ConnPid, StreamId, Handler, {Status, _Headers, _Body}) when
     is_integer(Status), Status >= 100, Status =< 199
 ->
@@ -191,7 +195,8 @@ emit_handler_response(ConnPid, StreamId, Handler, {Status, _Headers, _Body}) whe
 emit_handler_response(ConnPid, StreamId, _Handler, {stream, Status, Headers, Fun}) when
     is_integer(Status), Status >= 100, Status =< 599, is_function(Fun, 1)
 ->
-    roadrunner_http2_stream_response:run(ConnPid, StreamId, Status, Headers, Fun);
+    ok = roadrunner_http2_stream_response:run(ConnPid, StreamId, Status, Headers, Fun),
+    Status;
 emit_handler_response(ConnPid, StreamId, Handler, {loop, Status, Headers, State}) when
     is_integer(Status), Status >= 100, Status =< 599
 ->
@@ -200,9 +205,10 @@ emit_handler_response(ConnPid, StreamId, Handler, {loop, Status, Headers, State}
     %% non-OTP message through `Handler:handle_info/3`, emit DATA
     %% frames via Push. On `{stop, _}` the worker emits an empty
     %% DATA + END_STREAM and exits.
-    roadrunner_http2_loop_response:run(
+    ok = roadrunner_http2_loop_response:run(
         ConnPid, StreamId, Status, Headers, {Handler, State}
-    );
+    ),
+    Status;
 emit_handler_response(
     ConnPid, StreamId, _Handler, {sendfile, Status, Headers, {File, Offset, Length}}
 ) when is_integer(Status), Status >= 100, Status =< 599 ->
@@ -220,9 +226,11 @@ emit_handler_response(
             _ = file:close(IoDev)
         end
     end,
-    roadrunner_http2_stream_response:run(ConnPid, StreamId, Status, Headers, Fun);
+    ok = roadrunner_http2_stream_response:run(ConnPid, StreamId, Status, Headers, Fun),
+    Status;
 emit_handler_response(ConnPid, StreamId, _Handler, {websocket, _, _}) ->
-    emit_501(ConnPid, StreamId).
+    ok = emit_501(ConnPid, StreamId),
+    501.
 
 %% File-read block per worker->conn round-trip. Decoupled from the
 %% wire frame size: the conn (`send_data_chunks/8`) splits each block
@@ -268,9 +276,10 @@ reject_interim(ConnPid, StreamId, Handler, Status) ->
         handler => Handler,
         status => Status
     }),
-    send_buffered(
+    ok = send_buffered(
         ConnPid, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
-    ).
+    ),
+    500.
 
 %% Buffered response: a single conn-side message that emits
 %% HEADERS + (optional) DATA in one `ssl:send/2` for the common
