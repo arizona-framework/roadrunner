@@ -435,8 +435,9 @@ parse_pmd_params([{_Other, _} | Rest], Acc) ->
 window_bits(true) ->
     invalid;
 window_bits(Bin) when is_binary(Bin) ->
-    case string:to_integer(Bin) of
-        {N, <<>>} when N >= 8, N =< 15 -> {ok, N};
+    %% RFC 7692 §7.1.2: the value is a decimal integer, so no sign.
+    case roadrunner_bin:digits_to_integer(Bin) of
+        {ok, N} when N >= 8, N =< 15 -> {ok, N};
         _ -> invalid
     end.
 
