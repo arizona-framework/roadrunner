@@ -792,3 +792,17 @@ do_mask([], _MaskKey, _I) ->
     [];
 do_mask([B | Rest], MaskKey, I) ->
     [B bxor binary:at(MaskKey, I rem 4) | do_mask(Rest, MaskKey, I + 1)].
+
+unmask_words_matches_exor_at_every_size_test() ->
+    %% Every size from 0 to 300 bytes: the direct build up to 64 bytes,
+    %% the chunk loop above it, and every 1-3 byte tail on both sides.
+    _ = rand:seed(exsss, {1, 2, 3}),
+    [
+        begin
+            Payload = rand:bytes(Size),
+            MK = rand:uniform(1 bsl 32) - 1,
+            Mask = binary:part(binary:copy(<<MK:32>>, Size div 4 + 1), 0, Size),
+            ?assertEqual(crypto:exor(Payload, Mask), roadrunner_ws:unmask_words(Payload, MK))
+        end
+     || Size <- lists:seq(0, 300)
+    ].

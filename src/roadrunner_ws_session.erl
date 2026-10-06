@@ -652,9 +652,8 @@ early_validate_text(Data, Buf, Opts) ->
 unmask_slice(Slice, <<MaskKey:32>>, Offset) ->
     %% Rotate the 32-bit mask so its byte at the slice's logical
     %% start lines up with bit position 0 — same trick as cowlib's
-    %% `cow_ws:unmask/3`. After rotation we XOR 4 bytes at a time,
-    %% 64 per recursion (16 × 32-bit words), which beats both the
-    %% byte-at-a-time iolist version and a narrower 4-word pass.
+    %% `cow_ws:unmask/3`. After rotation the slice unmasks exactly like a
+    %% whole payload, through `roadrunner_ws:unmask_words/2`.
     Left = (Offset rem 4) * 8,
     Right = 32 - Left,
     Rotated = (MaskKey bsl Left) + (MaskKey bsr Right),
@@ -662,40 +661,7 @@ unmask_slice(Slice, <<MaskKey:32>>, Offset) ->
     %% back to 32 bits so the bxor in the loop preserves the byte
     %% alignment invariant.
     Rotated32 = Rotated band 16#FFFFFFFF,
-    unmask_slice_chunks(Slice, Rotated32, <<>>).
-
--spec unmask_slice_chunks(binary(), non_neg_integer(), binary()) -> binary().
-unmask_slice_chunks(
-    <<O1:32, O2:32, O3:32, O4:32, O5:32, O6:32, O7:32, O8:32, O9:32, O10:32, O11:32, O12:32, O13:32,
-        O14:32, O15:32, O16:32, Rest/binary>>,
-    MK,
-    Acc
-) ->
-    unmask_slice_chunks(
-        Rest,
-        MK,
-        <<Acc/binary, (O1 bxor MK):32, (O2 bxor MK):32, (O3 bxor MK):32, (O4 bxor MK):32,
-            (O5 bxor MK):32, (O6 bxor MK):32, (O7 bxor MK):32, (O8 bxor MK):32, (O9 bxor MK):32,
-            (O10 bxor MK):32, (O11 bxor MK):32, (O12 bxor MK):32, (O13 bxor MK):32,
-            (O14 bxor MK):32, (O15 bxor MK):32, (O16 bxor MK):32>>
-    );
-unmask_slice_chunks(<<O:32, Rest/binary>>, MK, Acc) ->
-    T = O bxor MK,
-    unmask_slice_chunks(Rest, MK, <<Acc/binary, T:32>>);
-unmask_slice_chunks(<<O:24>>, MK, Acc) ->
-    %% Tail of 1-3 bytes: XOR against the high bytes of the 32-bit mask
-    %% (the bytes the cycle lands on next). Shifting the mask down beats
-    %% repacking it into a binary and re-matching the leading bytes.
-    T = O bxor (MK bsr 8),
-    <<Acc/binary, T:24>>;
-unmask_slice_chunks(<<O:16>>, MK, Acc) ->
-    T = O bxor (MK bsr 16),
-    <<Acc/binary, T:16>>;
-unmask_slice_chunks(<<O:8>>, MK, Acc) ->
-    T = O bxor (MK bsr 24),
-    <<Acc/binary, T:8>>;
-unmask_slice_chunks(<<>>, _MK, Acc) ->
-    Acc.
+    roadrunner_ws:unmask_words(Slice, Rotated32).
 
 -spec append_buffer(#data{}, binary()) -> #data{}.
 append_buffer(#data{buffer = Buf} = Data, Bytes) ->
