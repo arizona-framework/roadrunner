@@ -189,6 +189,98 @@ roadrunner:start_listener(my_api, #{
 See `t:roadrunner_listener:opts/0` for the full list and the canonical
 defaults.
 
+## Connection-process memory: the GC policy
+
+Every handler-running process is spawned with `[{fullsweep_after, 0}]`,
+which makes each garbage collection a full sweep and keeps the
+per-connection heap flat. It is the `handler_spawn` listener option, so a
+deployment can swap in the emulator's generational default instead.
+Which way that trade goes depends on whether your connections are busy
+or idle, so both halves are worth knowing before you set it.
+
+While connections are busy, the generational policy is faster on a
+handler that allocates heavily. On a route that builds about 27 KB of
+transient iolist per request (3 interleaved runs per side):
+
+| policy | req/s | rss |
+| --- | --- | --- |
+| `fullsweep_after, 0` | 98.5k | 146 MB |
+| generational | 114.8k | 185 MB |
+
+On a route serving a precomputed body, the two policies measured the
+same throughput within noise, and the default still held less resident
+memory (143 MB against 162 MB). In an earlier run, on a JSON route that
+builds a large transient iolist per request, values of 5, 10 and 20
+measured within noise of the generational policy on both axes, because
+the refc-binary garbage driving the heap piles up between full sweeps
+whatever the interval between them is. Sweep every time or effectively
+never.
+
+Once connections go idle still holding the heap their last request grew,
+the generational policy is much more expensive. With 2000 keep-alive
+connections open, each having served a burst, and only 50 of them still
+working:
+
+| policy | process memory | live blocks | rss |
+| --- | --- | --- | --- |
+| `fullsweep_after, 0` | 32 MB | 211-247 MB | 406 MB |
+| generational | 464 MB | not measured | 1136 MB |
+| generational + `hibernate_after` | 36 MB | 134-143 MB | 645 MB |
+
+The generational row comes from an earlier batch of runs, in which the
+default measured the same 32 MB of process memory and 449-469 MB of rss.
+That idle case is what the default is for: 14.5x the process memory.
+
+Adding `hibernate_after` to the default policy is not a further win.
+In a separate batch of three interleaved rounds, a 1000 ms
+`hibernate_after` cut the emulator's total memory from 252-253 MB to
+193-194 MB and the binary allocator's blocks from 166-184 MB to
+73-99 MB, but the resident set came out 12-22 MB higher and the 50 busy
+connections served 2-7.5% fewer requests.
+
+The last row is the configuration worth reaching for if you want the
+throughput anyway. It was measured with these settings:
+
+```erlang
+roadrunner:start_listener(my_api, #{
+    port => 8080,
+    routes => my_handler,
+    handler_spawn => #{opts => [{fullsweep_after, 65535}]},
+    hibernate_after => 1000
+}).
+```
+
+Hibernation sweeps and shrinks an idle connection's heap, so its process
+memory lands close to the default's, and its live blocks (the memory the
+emulator is actually using) come out below the default's.
+
+Two things to weigh before setting it. First, the resident set stays
+well above the default even though less memory is in use, because the
+heap allocator holds on to carriers its blocks no longer fill: in these
+runs `eheap_alloc` held 125-145 MB of carriers for 16-20 MB of blocks.
+Switching off the segment cache with `+MMmcs 0` in `vm.args` recovers
+roughly half of the gap (645 MB to 535 MB, two rounds each), with
+throughput within 3%. Carrier abandonment (`+M<S>acul`) did not help
+in either direction. It is already enabled: on OTP 29 the per-scheduler
+allocator instances default to 45 for `eheap_alloc` and 60 for
+`binary_alloc`. Turning it off (`+MHacul 0 +MBacul 0`) raised the
+resident set in all three rounds of an earlier batch (medians 829-938 MB
+against 610-712 MB). Raising `eheap_alloc` to 60 on top of `+MMmcs 0`
+did not lower it: over two rounds its median went up in one and down in
+the other, and its peak rose in both.
+
+Second, waking a hibernated connection is charged to the request that
+wakes it. With connections idling 1500 ms between requests, just past a
+1000 ms `hibernate_after`, mean request latency went from 2.1-2.4 ms to
+about 3.0 ms. In that run every active connection started its idle gap
+at the same moment, so they woke at about the same time; staggered
+wakes were not measured.
+
+Reproduce the idle-connection numbers in this section with
+`scripts/idle_pool.escript`, which opens a pool of mostly-idle
+connections and samples the server's memory. A closed-loop benchmark
+cannot show them, since there every connection stays busy.
+
 ## CPU in containers: scheduler busy-wait
 
 The listener options above bound memory. The one emulator flag worth
