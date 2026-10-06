@@ -73,86 +73,15 @@ handlers needing a flat binary call `iolist_to_binary/1`.
     {ok, roadrunner_req:request()} | {error, build_error()}.
 from_headers(Headers, Body, RequestContext) ->
     maybe
-        {ok, Pseudo, Regular} ?= partition(Headers),
-        %% `validate_pseudo` returns the parsed `:scheme` value but we
-        %% deliberately discard it — the authoritative scheme comes
-        %% from the conn (`RequestContext.scheme`, always `https` over
-        %% QUIC) since clients can lie about the pseudo-header value.
-        {ok, Method, _Scheme, Path, Authority} ?= validate_pseudo(Pseudo),
+        %% The parsed `:scheme` value is validated but deliberately
+        %% discarded — the authoritative scheme comes from the conn
+        %% (`RequestContext.scheme`, always `https` over QUIC) since
+        %% clients can lie about the pseudo-header value.
+        {ok, Method, Path, Authority, Regular} ?= roadrunner_http:request_pseudo_headers(Headers),
         ok ?= check_banned(Regular),
         ok ?= check_content_length(Regular, Body),
         ok ?= check_authority(Authority, Regular),
         {ok, build(Method, Path, Authority, Regular, Body, RequestContext)}
-    end.
-
-%% Walk pseudo-headers (names starting with `:`) into a map until the
-%% first regular header, then hand off to `partition_regular/1` which
-%% body-recurses the rest. Splitting the two phases avoids the prior
-%% shape's double recursion (cons-forward AND cons-back on every
-%% regular header).
--spec partition(roadrunner_http:headers()) ->
-    {ok, map(), roadrunner_http:headers()} | {error, build_error()}.
-partition(Headers) ->
-    partition(Headers, #{}).
-
--spec partition(roadrunner_http:headers(), map()) ->
-    {ok, map(), roadrunner_http:headers()} | {error, build_error()}.
-partition([], Pseudo) ->
-    {ok, Pseudo, []};
-partition([{<<":", _/binary>> = Name, Value} | Rest], Pseudo) ->
-    case Pseudo of
-        #{Name := _} ->
-            {error, duplicate_pseudo_header};
-        _ when
-            Name =:= ~":method";
-            Name =:= ~":scheme";
-            Name =:= ~":authority";
-            Name =:= ~":path"
-        ->
-            partition(Rest, Pseudo#{Name => Value});
-        _ ->
-            {error, unknown_pseudo_header}
-    end;
-partition([H | Rest], Pseudo) ->
-    case partition_regular(Rest) of
-        {ok, Tail} -> {ok, Pseudo, [H | Tail]};
-        {error, _} = E -> E
-    end.
-
-%% A pseudo-header arriving in the regular-header tail is
-%% RFC 9114 §4.3.1 malformed (pseudo after regular). Tail-recursive: the
-%% validated headers cons into an accumulator (flipped once at the end)
-%% rather than rebuilding the `{ok, _}` result tuple on every frame.
--spec partition_regular(roadrunner_http:headers()) ->
-    {ok, roadrunner_http:headers()} | {error, build_error()}.
-partition_regular(Headers) ->
-    partition_regular(Headers, []).
-
--spec partition_regular(roadrunner_http:headers(), roadrunner_http:headers()) ->
-    {ok, roadrunner_http:headers()} | {error, build_error()}.
-partition_regular([], Acc) ->
-    {ok, lists:reverse(Acc)};
-partition_regular([{<<":", _/binary>>, _} | _], _Acc) ->
-    {error, pseudo_after_regular};
-partition_regular([H | Rest], Acc) ->
-    partition_regular(Rest, [H | Acc]).
-
--spec validate_pseudo(map()) ->
-    {ok, binary(), binary(), binary(), binary() | undefined}
-    | {error, build_error()}.
-validate_pseudo(Pseudo) ->
-    case Pseudo of
-        #{
-            ~":method" := Method,
-            ~":scheme" := Scheme,
-            ~":path" := Path
-        } when Path =/= ~"" ->
-            Authority = maps:get(~":authority", Pseudo, undefined),
-            {ok, Method, Scheme, Path, Authority};
-        #{~":path" := ~""} ->
-            {error, empty_path};
-        _ ->
-            {error, missing_pseudo_header}
     end.
 
 %% Function-clause dispatch over the banned set (RFC 9114 §4.2) keeps
