@@ -198,3 +198,23 @@ encode_parse_roundtrip_test_() ->
         )
      || Pairs <- Cases
     ].
+
+parse_trigger_byte_at_every_position_test() ->
+    %% A `+` or `%2B` at every position of a 17-byte value: each SWAR
+    %% lane of both 7-byte words and the tail must send the string down
+    %% the decoding path.
+    Fill = binary:copy(~"a", 17),
+    [
+        begin
+            <<Pre:Pos/binary, _, Post/binary>> = Fill,
+            ?assertEqual(
+                [{~"k", <<Pre/binary, " ", Post/binary>>}],
+                roadrunner_qs:parse(<<"k=", Pre/binary, "+", Post/binary>>)
+            ),
+            ?assertEqual(
+                [{~"k", <<Pre/binary, "+", Post/binary>>}],
+                roadrunner_qs:parse(<<"k=", Pre/binary, "%2B", Post/binary>>)
+            )
+        end
+     || Pos <- lists:seq(0, 16)
+    ].
