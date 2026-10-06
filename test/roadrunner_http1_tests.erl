@@ -942,6 +942,27 @@ chunk_uppercase_hex_size_test() ->
         roadrunner_http1:parse_chunk(~"A\r\nhelloworld\r\n")
     ).
 
+chunk_hex_letter_sizes_with_extension_test() ->
+    %% An extension or trailing whitespace takes the general size-line
+    %% path, which must read hex letters the same way as the fast path.
+    ?assertEqual(
+        {ok, ~"helloworld", ~""}, roadrunner_http1:parse_chunk(~"a;name=v\r\nhelloworld\r\n")
+    ),
+    ?assertEqual(
+        {ok, ~"helloworld", ~""}, roadrunner_http1:parse_chunk(~"A \r\nhelloworld\r\n")
+    ).
+
+chunk_size_with_sixteen_digits_test() ->
+    %% Past 15 digits the fast path gives way to the general one.
+    ?assertEqual(
+        {ok, ~"hello", ~""}, roadrunner_http1:parse_chunk(~"0000000000000005\r\nhello\r\n")
+    ).
+
+chunk_size_line_split_across_reads_test() ->
+    %% A size line without its CRLF yet asks for more bytes.
+    ?assertEqual({more, undefined}, roadrunner_http1:parse_chunk(~"5")),
+    ?assertEqual({more, undefined}, roadrunner_http1:parse_chunk(~"5\r")).
+
 chunk_multi_digit_size_test() ->
     %% 0x10 = 16
     Data = binary:copy(~"x", 16),
