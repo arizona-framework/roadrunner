@@ -22,6 +22,7 @@ frames.
 -export([peek_frame_header/2]).
 -export([encode_frame/3, encode_frame/4]).
 -export([parse_extensions/1, negotiate_extensions/1]).
+-export([unmask_words/2]).
 
 -export_type([
     opcode/0,
@@ -762,7 +763,80 @@ parse_payload(Len, 1, Bin, Fin, Rsv1, Op, Pre) ->
 %% 64-bit words would spill to heap bignums and lose.
 -spec unmask(binary(), binary()) -> binary().
 unmask(Payload, <<MaskKey:32>>) ->
-    unmask_chunks(Payload, MaskKey, <<>>).
+    unmask_words(Payload, MaskKey).
+
+%% XOR `Payload` against the 32-bit mask repeated from its first byte.
+%% Shared with `roadrunner_ws_session:unmask_slice/3`, which rotates the
+%% mask to the slice's offset first. A payload of up to 64 bytes, the
+%% usual message, is built directly (`unmask_small/2`): growing an
+%% accumulator from `<<>>` allocates a writable binary on the first
+%% append, and that alone cost 2-6x on 1-64 byte payloads. Longer ones
+%% take the accumulator loop, 64 bytes per step.
+-doc false.
+-spec unmask_words(binary(), 0..16#FFFFFFFF) -> binary().
+unmask_words(Payload, MK) when byte_size(Payload) =< 64 ->
+    unmask_small(Payload, MK);
+unmask_words(Payload, MK) ->
+    unmask_chunks(Payload, MK, <<>>).
+
+%% Body-recursive, stepping down 16/8/4/2/1 words so at most five
+%% binaries are built, then the 1-3 byte tail.
+-spec unmask_small(binary(), 0..16#FFFFFFFF) -> binary().
+unmask_small(
+    <<O1:32, O2:32, O3:32, O4:32, O5:32, O6:32, O7:32, O8:32, O9:32, O10:32, O11:32, O12:32, O13:32,
+        O14:32, O15:32, O16:32>>,
+    MK
+) ->
+    <<
+        (O1 bxor MK):32,
+        (O2 bxor MK):32,
+        (O3 bxor MK):32,
+        (O4 bxor MK):32,
+        (O5 bxor MK):32,
+        (O6 bxor MK):32,
+        (O7 bxor MK):32,
+        (O8 bxor MK):32,
+        (O9 bxor MK):32,
+        (O10 bxor MK):32,
+        (O11 bxor MK):32,
+        (O12 bxor MK):32,
+        (O13 bxor MK):32,
+        (O14 bxor MK):32,
+        (O15 bxor MK):32,
+        (O16 bxor MK):32
+    >>;
+unmask_small(<<O1:32, O2:32, O3:32, O4:32, O5:32, O6:32, O7:32, O8:32, Rest/binary>>, MK) ->
+    <<
+        (O1 bxor MK):32,
+        (O2 bxor MK):32,
+        (O3 bxor MK):32,
+        (O4 bxor MK):32,
+        (O5 bxor MK):32,
+        (O6 bxor MK):32,
+        (O7 bxor MK):32,
+        (O8 bxor MK):32,
+        (unmask_small(Rest, MK))/binary
+    >>;
+unmask_small(<<O1:32, O2:32, O3:32, O4:32, Rest/binary>>, MK) ->
+    <<
+        (O1 bxor MK):32,
+        (O2 bxor MK):32,
+        (O3 bxor MK):32,
+        (O4 bxor MK):32,
+        (unmask_small(Rest, MK))/binary
+    >>;
+unmask_small(<<O1:32, O2:32, Rest/binary>>, MK) ->
+    <<(O1 bxor MK):32, (O2 bxor MK):32, (unmask_small(Rest, MK))/binary>>;
+unmask_small(<<O:32, Rest/binary>>, MK) ->
+    <<(O bxor MK):32, (unmask_small(Rest, MK))/binary>>;
+unmask_small(<<O:24>>, MK) ->
+    <<(O bxor (MK bsr 8)):24>>;
+unmask_small(<<O:16>>, MK) ->
+    <<(O bxor (MK bsr 16)):16>>;
+unmask_small(<<O:8>>, MK) ->
+    <<(O bxor (MK bsr 24)):8>>;
+unmask_small(<<>>, _MK) ->
+    <<>>.
 
 -spec unmask_chunks(binary(), non_neg_integer(), binary()) -> binary().
 unmask_chunks(
