@@ -30,10 +30,7 @@
 -define(MAX_HEADER_COUNT, 100).
 -define(MAX_CHUNK_HEADER, 8192).
 
-%% `B` repeated in each byte of a 7-byte (56-bit) word, for the SWAR
-%% scans in `validate_path/2`, `validate_query/1` and `validate_value/1`.
-%% 56 bits stays a small integer on a 64-bit BEAM; 64 would be a bignum.
--define(BYTES(B), (16#01010101010101 * (B))).
+-include("roadrunner_swar.hrl").
 
 %% `binary:match/2` accepts a pre-compiled pattern (`binary:cp()`), and
 %% the compile cost is non-trivial. Microbench (OTP 29.0, single-byte
@@ -151,13 +148,9 @@ fast_request_line(_Bin, _Max) -> slow.
 -spec fast_path(binary(), binary(), binary(), binary(), pos_integer()) ->
     {ok, binary(), binary(), binary(), version(), binary()} | slow.
 fast_path(<<X:56, R/binary>> = Cur, T, Method, Bin, Max) ->
-    Del = X bxor ?BYTES(16#7F),
-    Qm = X bxor ?BYTES($?),
-    case
-        ((X - ?BYTES(16#21)) band (X bxor ?BYTES(255)) bor
-            ((Del - ?BYTES(1)) band (Del bxor ?BYTES(255))) bor
-            ((Qm - ?BYTES(1)) band (Qm bxor ?BYTES(255)))) band ?BYTES(128)
-    of
+    Del = X bxor ?SWAR_BYTES(16#7F),
+    Qm = X bxor ?SWAR_BYTES($?),
+    case ?SWAR_HIGH(?SWAR_BELOW(X, 16#21) bor ?SWAR_ZERO(Del) bor ?SWAR_ZERO(Qm)) of
         0 -> fast_path(R, T, Method, Bin, Max);
         _ -> fast_path_byte(Cur, T, Method, Bin, Max)
     end;
@@ -186,11 +179,8 @@ fast_path_byte(_Cur, _T, _Method, _Bin, _Max) ->
 -spec fast_query(binary(), binary(), non_neg_integer(), binary(), binary(), pos_integer()) ->
     {ok, binary(), binary(), binary(), version(), binary()} | slow.
 fast_query(<<X:56, R/binary>> = Cur, T, PathLen, Method, Bin, Max) ->
-    Del = X bxor ?BYTES(16#7F),
-    case
-        ((X - ?BYTES(16#21)) band (X bxor ?BYTES(255)) bor
-            ((Del - ?BYTES(1)) band (Del bxor ?BYTES(255)))) band ?BYTES(128)
-    of
+    Del = X bxor ?SWAR_BYTES(16#7F),
+    case ?SWAR_HIGH(?SWAR_BELOW(X, 16#21) bor ?SWAR_ZERO(Del)) of
         0 -> fast_query(R, T, PathLen, Method, Bin, Max);
         _ -> fast_query_byte(Cur, T, PathLen, Method, Bin, Max)
     end;
@@ -309,24 +299,18 @@ validate_method_chars(_) ->
 validate_target(<<>>) -> error;
 validate_target(T) -> validate_path(T, T).
 
-%% Both walks take 7 bytes per step while a word holds no byte <= 0x20,
-%% no 0x7F and (in the path) no `?`; the same per-byte borrow test as
-%% `validate_value/1`, with `X - 0x21` for the low range and an
-%% equality test (`Y = X xor B`, then `Y - 0x01`) for each single byte.
-%% The byte walk finishes from the first word that flags, which in the
+%% Both walks take 7 bytes per step (see `roadrunner_swar.hrl`) while a
+%% word holds no byte <= 0x20, no 0x7F and (in the path) no `?`. The byte
+%% walk finishes from the first word that flags, which in the
 %% path is almost always the `?` (handing off to the query's fast path)
 %% and in the query an error. Each walk repeats its byte clauses after
 %% the word clause so a short target (`/`) or a < 7 byte tail costs no
 %% extra call: without them `/` measured ~10% slower than before.
 -spec validate_path(binary(), binary()) -> {ok, binary()} | error.
 validate_path(<<X:56, R/binary>> = Bin, Target) ->
-    Del = X bxor ?BYTES(16#7F),
-    Qm = X bxor ?BYTES($?),
-    case
-        ((X - ?BYTES(16#21)) band (X bxor ?BYTES(255)) bor
-            ((Del - ?BYTES(1)) band (Del bxor ?BYTES(255))) bor
-            ((Qm - ?BYTES(1)) band (Qm bxor ?BYTES(255)))) band ?BYTES(128)
-    of
+    Del = X bxor ?SWAR_BYTES(16#7F),
+    Qm = X bxor ?SWAR_BYTES($?),
+    case ?SWAR_HIGH(?SWAR_BELOW(X, 16#21) bor ?SWAR_ZERO(Del) bor ?SWAR_ZERO(Qm)) of
         0 -> validate_path(R, Target);
         _ -> validate_path_byte(Bin, Target)
     end;
@@ -357,11 +341,8 @@ validate_path_byte(_, _) ->
 
 -spec validate_query(binary()) -> ok | error.
 validate_query(<<X:56, R/binary>> = Bin) ->
-    Del = X bxor ?BYTES(16#7F),
-    case
-        ((X - ?BYTES(16#21)) band (X bxor ?BYTES(255)) bor
-            ((Del - ?BYTES(1)) band (Del bxor ?BYTES(255)))) band ?BYTES(128)
-    of
+    Del = X bxor ?SWAR_BYTES(16#7F),
+    case ?SWAR_HIGH(?SWAR_BELOW(X, 16#21) bor ?SWAR_ZERO(Del)) of
         0 -> validate_query(R);
         _ -> validate_query_byte(Bin)
     end;
@@ -647,18 +628,14 @@ fast_value(Name, Value, Bin, Max) ->
 
 %% Scan a header value to its CRLF, rejecting CR, LF, NUL and the other
 %% CTL bytes (HTAB allowed; bytes >= 0x80 accepted leniently, same as
-%% cowboy). SWAR, 7 bytes per step: `X - 0x20` sets a byte's high bit
-%% when it is below 0x20 and `Y - 0x01` (with `Y = X xor 0x7F`) when it
-%% is 0x7F; ANDing each with its complement drops bytes >= 0x80. The
-%% byte loop finishes from the first word that flags (a tab, the CRLF, or
-%% a bad byte). Returns the bytes after the CRLF, or `slow`.
+%% cowboy). SWAR, 7 bytes per step (see `roadrunner_swar.hrl`): a word
+%% flags on a byte below 0x20 or a 0x7F. The byte loop finishes from the
+%% first word that flags (a tab, the CRLF, or a bad byte). Returns the
+%% bytes after the CRLF, or `slow`.
 -spec scan_value(binary()) -> binary() | slow.
 scan_value(<<X:56, R/binary>> = Bin) ->
-    Y = X bxor ?BYTES(16#7F),
-    case
-        ((X - ?BYTES(16#20)) band (X bxor ?BYTES(255)) bor
-            ((Y - ?BYTES(1)) band (Y bxor ?BYTES(255)))) band ?BYTES(128)
-    of
+    Y = X bxor ?SWAR_BYTES(16#7F),
+    case ?SWAR_HIGH(?SWAR_BELOW(X, 16#20) bor ?SWAR_ZERO(Y)) of
         0 -> scan_value(R);
         _ -> scan_value_byte(Bin)
     end;

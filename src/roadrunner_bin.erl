@@ -11,6 +11,8 @@
 
 -export([append/2, ascii_lowercase/1, digits_to_integer/1, trim_ows/1, trim_trailing_ows/1]).
 
+-include("roadrunner_swar.hrl").
+
 -doc """
 Fast ASCII-only lowercase. Bytes in `[A-Z]` are mapped to `[a-z]`;
 everything else (including high-bit / non-ASCII bytes) passes
@@ -59,24 +61,22 @@ ascii_lowercase(Bin) when is_binary(Bin) ->
         true -> iolist_to_binary(ascii_lowercase_walk(Bin))
     end.
 
-%% SWAR scan, 7 bytes per step: 56 bits stays a small integer on a
-%% 64-bit BEAM, where a 64-bit word would be a heap bignum. This is
+%% SWAR scan, 7 bytes per step (see `roadrunner_swar.hrl`). This is
 %% `hasbetween(X, $A - 1, $Z + 1)` from Bit Twiddling Hacks: per byte,
-%% `Low` is the byte without its high bit, `?BYTES(127 + $Z + 1) - Low`
+%% `Low` is the byte without its high bit, `?SWAR_BYTES(127 + $Z + 1) - Low`
 %% has its high bit set when the byte is below `$Z + 1`, and
-%% `Low + ?BYTES(127 - ($A - 1))` has it set when the byte is above
+%% `Low + ?SWAR_BYTES(127 - ($A - 1))` has it set when the byte is above
 %% `$A - 1`. ANDing with the complement of `X` drops bytes >= 128.
 %% Neither sum borrows or carries across bytes, so each high bit
 %% answers for its own byte. 1.8-3.7x faster than the byte loop from
 %% 10 bytes up; the byte loop finishes the < 7 byte tail.
--define(BYTES(B), (16#01010101010101 * (B))).
 
 -spec has_uppercase(binary()) -> boolean().
 has_uppercase(<<X:56, R/binary>>) ->
-    Low = X band ?BYTES(127),
+    Low = X band ?SWAR_BYTES(127),
     case
-        (?BYTES(127 + $Z + 1) - Low) band (X bxor ?BYTES(255)) band
-            (Low + ?BYTES(127 - ($A - 1))) band ?BYTES(128)
+        (?SWAR_BYTES(127 + $Z + 1) - Low) band (X bxor ?SWAR_BYTES(255)) band
+            (Low + ?SWAR_BYTES(127 - ($A - 1))) band ?SWAR_BYTES(128)
     of
         0 -> has_uppercase(R);
         _ -> true
