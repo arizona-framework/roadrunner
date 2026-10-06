@@ -132,8 +132,9 @@ spawn_loop_with_state(State) ->
 
 %% Block until the worker has sent its headers and is idle in
 %% `info_loop`. `sys:get_state/1` is answered only from the loop, so it
-%% returns only after the worker is past `sync_send_headers` — without
-%% this a disconnect message could be intercepted by the sync receive.
+%% returns only after the worker is past its headers
+%% (`roadrunner_http2_worker_sync:send_headers/5`) — without this a
+%% disconnect message could be intercepted by the sync receive.
 wait_until_looping(Worker) ->
     _ = sys:get_state(Worker, 1000),
     ok.

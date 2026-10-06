@@ -40,7 +40,7 @@ Returns when the handler's `handle_info/3` returns `{stop, _}`.
     {module(), term()}
 ) -> ok.
 run(ConnPid, StreamId, Status, Headers, {Handler, State}) ->
-    sync_send_headers(ConnPid, StreamId, Status, Headers, false),
+    roadrunner_http2_worker_sync:send_headers(ConnPid, StreamId, Status, Headers, false),
     %% The worker already monitors the conn (see
     %% `roadrunner_http2_stream_worker:init/4`), so an idle `info_loop`
     %% blocked waiting for a message wakes on the conn's `DOWN` instead
@@ -75,7 +75,7 @@ info_loop(ConnPid, StreamId, Handler, Push, State) ->
                 {ok, NewState} ->
                     info_loop(ConnPid, StreamId, Handler, Push, NewState);
                 {stop, _NewState} ->
-                    sync_send_data(ConnPid, StreamId, <<>>, true),
+                    roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, <<>>, true),
                     ok
             end
     end.
@@ -102,34 +102,10 @@ make_push(ConnPid, StreamId) ->
             0 ->
                 ok;
             _ ->
-                sync_send_data(ConnPid, StreamId, Data, false),
+                roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, false),
                 ok
         end
     end.
 
 %% Sync helpers: send a frame request to the conn and block on its ack
 %% via the shared `roadrunner_http2_worker_sync`.
-
--spec sync_send_headers(
-    pid(),
-    pos_integer(),
-    roadrunner_http:status(),
-    roadrunner_http:headers(),
-    boolean()
-) -> ok.
-sync_send_headers(ConnPid, StreamId, Status, Headers, EndStream) ->
-    roadrunner_http2_worker_sync:sync(ConnPid, fun(Ref) ->
-        _ =
-            (ConnPid !
-                {h2_send_headers, self(), Ref, StreamId, Status, Headers, EndStream}),
-        ok
-    end).
-
--spec sync_send_data(pid(), pos_integer(), iodata(), boolean()) -> ok.
-sync_send_data(ConnPid, StreamId, Data, EndStream) ->
-    roadrunner_http2_worker_sync:sync(ConnPid, fun(Ref) ->
-        _ =
-            (ConnPid !
-                {h2_send_data, self(), Ref, StreamId, Data, EndStream}),
-        ok
-    end).
