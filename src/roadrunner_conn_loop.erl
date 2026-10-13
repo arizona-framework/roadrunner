@@ -911,16 +911,52 @@ read_body_phase(#loop_state{body_buffering = BodyMode, dispatch = Dispatch} = S,
             exit_normal(S2);
         {manual, Framing} ->
             MaxCL = roadrunner_conn:body_cap(Resolved, S#loop_state.max_content_length),
-            {_Waiting, S1} = continue(S, Req, Framing, MaxCL),
             BodyState = roadrunner_conn:make_body_reader(
                 Framing,
-                S1#loop_state.buffered,
-                body_recv(S1, Deadline),
+                S#loop_state.buffered,
+                body_recv(S, Deadline),
                 MaxCL,
-                trailer_limits(S1)
+                trailer_limits(S)
             ),
-            dispatch_phase(S1, Req#{body_reader => BodyState}, Resolved)
+            {S1, BodyState1} = defer_continue(S, Req, Framing, MaxCL, BodyState, Deadline),
+            dispatch_phase(S1, Req#{body_reader => BodyState1}, Resolved)
     end.
+
+%% RFC 9110 §10.1.1 in manual mode: the middlewares and the handler decide
+%% from the request's headers whether its body is wanted, so a client holding
+%% its body back for `Expect: 100-continue` is asked for it only when the
+%% handler first reads it (`roadrunner_conn:consume_body_reader/2` sends it,
+%% from the body reader's `continue`). A handler that answers without
+%% reading never asks: the client sends nothing, and the connection closes
+%% after the response, as the client may still send the body once it stops
+%% waiting. The 100 is owed under `continue/4`'s conditions, and queued
+%% pipelined responses go out first, as there, so it cannot overtake them.
+%% The read's slow-client rate window starts with the 100, when the client
+%% can start sending, so `continue` carries what the read's recv is made of.
+-spec defer_continue(
+    #loop_state{},
+    roadrunner_req:request(),
+    chunked | {content_length, non_neg_integer()},
+    non_neg_integer(),
+    roadrunner_req:body_reader(),
+    integer()
+) -> {#loop_state{}, roadrunner_req:body_reader()}.
+defer_continue(
+    #loop_state{buffered = ~"", socket = Socket, min_rate = MinRate} = S,
+    Req,
+    Framing,
+    MaxCL,
+    BodyState,
+    Deadline
+) ->
+    case roadrunner_conn:expects_continue(Req) andalso body_to_read(Framing, MaxCL) of
+        true ->
+            {flush_out(S), BodyState#{continue => {Socket, Deadline, MinRate}}};
+        false ->
+            {S, BodyState}
+    end;
+defer_continue(S, _Req, _Framing, _MaxCL, BodyState, _Deadline) ->
+    {S, BodyState}.
 
 %% RFC 9110 §10.1.1: a client gating its body on `Expect: 100-continue` is
 %% WAITING for the interim 100, unless body bytes already arrived with the
@@ -1186,25 +1222,39 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
     #loop_state{}, roadrunner_req:request(), roadrunner_handler:response()
 ) -> roadrunner_handler:response().
 ensure_close_signaled(S, Req, {Status, Headers, Body}) when is_integer(Status) ->
-    {Status, with_close_if_last(S, Req, Headers), Body};
+    {Status, with_close_if_closing(S, Req, Headers), Body};
 ensure_close_signaled(S, Req, {sendfile, Status, Headers, Spec}) when is_integer(Status) ->
-    {sendfile, Status, with_close_if_last(S, Req, Headers), Spec};
+    {sendfile, Status, with_close_if_closing(S, Req, Headers), Spec};
 ensure_close_signaled(_S, _Req, Response) ->
     Response.
 
-%% Prepend `Connection: close` exactly when this request trips the keep-alive
-%% ceiling AND the connection would otherwise be reused. In the common case the
+%% Prepend `Connection: close` exactly when the server closes a connection
+%% that would otherwise be reused: this request trips the keep-alive ceiling,
+%% or the handler answered without asking for a body the client holds back
+%% for a 100 Continue (`defer_continue/6`; RFC 9110 §10.1.1 asks a server
+%% answering before the body to say whether it closes). In the common case the
 %% response has no `connection` header, so the prepend is the only token; if a
 %% handler set one explicitly, `close` is the first token on the wire and takes
 %% precedence (RFC 9112 §9.6). Every other case is left byte-for-byte unchanged.
--spec with_close_if_last(#loop_state{}, roadrunner_req:request(), roadrunner_http:headers()) ->
+-spec with_close_if_closing(#loop_state{}, roadrunner_req:request(), roadrunner_http:headers()) ->
     roadrunner_http:headers().
-with_close_if_last(
-    #loop_state{requests_served = Served, max_keep_alive_requests = Max}, Req, Headers
+with_close_if_closing(
+    #loop_state{body_buffering = manual}, #{body_reader := #{continue := _}} = Req, Headers
 ) ->
-    case Served >= Max andalso roadrunner_conn:keep_alive_decision(Req, Headers) =:= keep_alive of
-        true -> [{~"connection", ~"close"} | Headers];
-        false -> Headers
+    with_close(Req, Headers);
+with_close_if_closing(
+    #loop_state{requests_served = Served, max_keep_alive_requests = Max}, Req, Headers
+) when Served >= Max ->
+    with_close(Req, Headers);
+with_close_if_closing(_S, _Req, Headers) ->
+    Headers.
+
+-spec with_close(roadrunner_req:request(), roadrunner_http:headers()) ->
+    roadrunner_http:headers().
+with_close(Req, Headers) ->
+    case roadrunner_conn:keep_alive_decision(Req, Headers) of
+        keep_alive -> [{~"connection", ~"close"} | Headers];
+        close -> Headers
     end.
 
 %% Queue an encoded buffered response — or write it now. `buffered`
@@ -1523,6 +1573,11 @@ pipelined_leftover(_Req, #loop_state{buffered = Buf}, _ManualLeftover) ->
 %% `drain_body/1` which consumes the body_reader.
 -spec drain_body_if_manual(roadrunner_req:request()) ->
     {ok, binary()} | {error, term()}.
+drain_body_if_manual(#{body_reader := #{continue := _}}) ->
+    %% The handler answered without asking for the body (`defer_continue/6`):
+    %% no 100 went out and the client is holding the body back, so there is
+    %% nothing to drain, and the connection closes.
+    {error, body_not_requested};
 drain_body_if_manual(#{body_reader := _} = Req) ->
     roadrunner_conn:drain_body(Req);
 drain_body_if_manual(_Req) ->

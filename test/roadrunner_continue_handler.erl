@@ -1,0 +1,26 @@
+-module(roadrunner_continue_handler).
+-moduledoc """
+Test fixture for manual body mode and `Expect: 100-continue`: `/reject`
+answers 401 without reading the body, `/slow-read` spends 1.1 s (past the
+slow-client rate grace) before reading it, and any other path reads it and
+answers with its size.
+""".
+
+-behaviour(roadrunner_handler).
+
+-export([handle/1]).
+
+-spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
+handle(#{target := ~"/reject"} = Req) ->
+    {roadrunner_resp:text(401, ~"no"), Req};
+handle(#{target := ~"/slow-read"} = Req) ->
+    receive
+    after 1100 -> ok
+    end,
+    read(Req);
+handle(Req) ->
+    read(Req).
+
+read(Req) ->
+    {ok, Body, Req2} = roadrunner_req:read_body(Req),
+    {roadrunner_resp:text(200, integer_to_binary(iolist_size(Body))), Req2}.

@@ -474,8 +474,9 @@ Surfaced by the post-merge HTTP/3 review.
 closure creation (`read_body_phase/3`), so in manual body-buffering mode a handler
 that delays before calling `roadrunner_req:read_body/1,2` has its think-time counted
 toward the body's minimum-byte-rate average. Auto mode has no gap (it reads the
-body synchronously right after the closure is built), and the request-read phase
-already anchors at the first byte.
+body synchronously right after the closure is built), the request-read phase
+already anchors at the first byte, and a manual-mode request expecting
+`100-continue` anchors at the 100, which its first read sends.
 
 **Why deferred:** bounded today by the request_timeout `Deadline` threaded into the
 same closure (it fires first), and the residual is a narrow self-inflicted case

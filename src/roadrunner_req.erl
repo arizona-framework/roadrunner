@@ -162,7 +162,11 @@ to absorb a chunk's payload across multiple length-bounded calls.
     max := non_neg_integer(),
     %% Trailer-header limits `{max_header_line, max_header_block,
     %% max_header_count}` threaded to `roadrunner_http1:parse_chunk/2`.
-    trailer_limits := {pos_integer(), pos_integer(), pos_integer()}
+    trailer_limits := {pos_integer(), pos_integer(), pos_integer()},
+    %% Present while a 100 Continue is owed to a client holding its body
+    %% back: the socket the first read sends it on, and the request deadline
+    %% and minimum byte rate of the recv that read then starts.
+    continue => {roadrunner_transport:socket(), integer(), non_neg_integer()}
 }.
 
 -export([
@@ -385,9 +389,12 @@ body-buffering modes:
 - **manual**: the conn parked the body on the socket. This drains it
   and returns the bytes. The returned `Req2` carries the updated
   body-read state — to enable keep-alive on the same connection in
-  manual mode, hand `Req2` back via the 4-tuple handler return shape
-  `{Status, Headers, Body, Req2}` so the conn can drain whatever the
-  handler skipped.
+  manual mode, hand `Req2` back as the second element of the handler's
+  `{Response, Req2}` return so the conn can drain whatever the handler
+  skipped. A client that sent `Expect: 100-continue` is asked for its
+  body here, on the first read: a middleware or handler that answers
+  without reading (a `401` for a bad API key, say) never has it upload
+  the body, and the connection closes after that response.
 """.
 -spec read_body(request()) ->
     {ok, iodata(), request()} | {error, term()}.

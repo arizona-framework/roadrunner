@@ -1098,6 +1098,14 @@ full read).
     {ok, iodata(), roadrunner_req:body_reader()}
     | {more, iodata(), roadrunner_req:body_reader()}
     | {error, term()}.
+consume_body_reader(#{continue := {Socket, Deadline, MinRate}} = BS, Mode) ->
+    %% The client is holding its body back for a 100 Continue the conn left
+    %% to this first read (`roadrunner_conn_loop:defer_continue/6`): send it,
+    %% then read with a recv whose slow-client rate window starts now, as the
+    %% client can only start sending now.
+    ok = send_continue(Socket),
+    Recv = make_recv(Socket, Deadline, MinRate),
+    consume_body_reader(maps:remove(continue, BS#{recv := Recv}), Mode);
 consume_body_reader(#{framing := none} = BS, _Mode) ->
     %% Per RFC 9112 §6.3: no framing means the body is empty.
     %% Any `buffered` bytes are pipelined-next-request leftovers —
