@@ -49,6 +49,7 @@
     recv/3,
     send/2,
     close/1,
+    shutdown/2,
     peername/1,
     port/1,
     sendfile/4,
@@ -236,6 +237,22 @@ close({ssl, S}) ->
     ok;
 close({fake, Pid}) ->
     Pid ! {roadrunner_fake_close, self()},
+    ok.
+
+-doc """
+Shut the socket down for writing, reading, or both, as `gen_tcp:shutdown/2`
+and `ssl:shutdown/2` do; a socket shut for writing can still be read.
+
+For `{fake, Pid}`: forwards `{roadrunner_fake_shutdown, ConnPid, How}` to
+`Pid`.
+""".
+-spec shutdown(socket(), read | write | read_write) -> ok | {error, term()}.
+shutdown({gen_tcp, S}, How) ->
+    gen_tcp:shutdown(S, How);
+shutdown({ssl, S}, How) ->
+    ssl:shutdown(S, How);
+shutdown({fake, Pid}, How) ->
+    Pid ! {roadrunner_fake_shutdown, self(), How},
     ok.
 
 -doc """

@@ -471,26 +471,6 @@ Revisit only if a real workload reports false `slow_client` drops.
 
 **Scope:** small.
 
-### Lingering close after an early HTTP/1.1 response — small-medium
-
-**What:** when an HTTP/1.1 response goes out before the request body is read
-(a 413 over the body cap, or a manual-mode handler that answers without
-reading), the connection closes while the client may still be uploading.
-Closing a socket with unread bytes makes the kernel send a reset, which can
-erase the response from the client's receive buffer before it is read (RFC
-9112 §9.6). The 413 path drains at most twice the cap first, which covers
-small bodies, but a 4 MB upload over a small cap lost its response in 14 of
-20 local runs, in auto and manual mode alike. A lingering close (shut down the
-write side, then read and discard until the client closes or a short time and
-byte budget runs out) would let the response through.
-
-**Why deferred:** it changes how every early-close path ends, and needs a
-bound a hostile client cannot stretch, since it holds the connection's process
-and slot a little longer.
-
-**Scope:** small-medium: one shared close step for the HTTP/1.1 early-response
-paths.
-
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>

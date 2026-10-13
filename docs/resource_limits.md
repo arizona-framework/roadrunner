@@ -30,7 +30,10 @@ The body cap is enforced across all three protocols. For HTTP/1.1 it
 covers both `Content-Length` and `Transfer-Encoding: chunked` requests:
 the cap is checked as the body is read (a chunked body on its declared
 size line), so an oversized body is rejected without buffering the whole
-thing. HTTP/2 and HTTP/3 accumulate DATA frames against the same cap; an
+thing. The 413 goes out first and the connection then closes, reading and
+dropping what the client still sends for up to the `http1` `linger_timeout`
+(1 s by default) or until it closes, so the client reads the 413 rather than
+losing it to a reset. HTTP/2 and HTTP/3 accumulate DATA frames against the same cap; an
 over-cap body answers `413 Payload Too Large` and resets the stream
 (`RST_STREAM(NO_ERROR)` on h2, `STOP_SENDING` on h3) so the client stops
 sending.

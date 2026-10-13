@@ -79,7 +79,7 @@
     rate_limit_spend/7,
     throttled_telemetry/3,
     rate_limit_evict_full/4,
-    drain_oversized_body/4,
+    linger/2,
     send_internal_error/1,
     send_not_found/1,
     send_method_not_allowed/2,
@@ -231,11 +231,13 @@ deadline in milliseconds.
     %% HTTP/3 tuning, flattened from `{http3, #{...}}` when http3 is enabled.
     http3_listeners => 1..1024,
     http3_max_header_block => 1..16#7FFFFFFF,
-    %% HTTP/1 inbound size limits, flattened from `{http1, #{...}}`.
+    %% HTTP/1 inbound size limits and close linger, flattened from
+    %% `{http1, #{...}}`.
     http1_max_request_line => 1..16#7FFFFFFF,
     http1_max_header_line => 1..16#7FFFFFFF,
     http1_max_header_block => 1..16#7FFFFFFF,
     http1_max_header_count => 1..16#7FFFFFFF,
+    http1_linger_timeout => 0..16#7FFFFFFF,
     %% Optional fields the listener injects only when the user
     %% supplies them — see `roadrunner_listener:build_proto_opts/2`.
     %% Declared here so dialyzer accepts pattern matches like
@@ -1777,36 +1779,30 @@ parse_error_status(header_block_too_long) -> 431;
 parse_error_status(too_many_headers) -> 431;
 parse_error_status(_) -> 400.
 
-%% Drain the rest of an oversized body from the socket (counting the
-%% already-buffered bytes), discarding it. Used to flush an
-%% oversized in-flight body off the wire so the peer can read the
-%% 413 we're about to send before we close. A declared body ends at
-%% its length, so the drain stops there rather than waiting on a
-%% client with nothing left to send. Bounded by `2 * MaxCL` (memory)
-%% and a 1-second per-recv timeout (wall-clock) so a slow peer can't
-%% pin us indefinitely.
+%% Close gently after a response sent while the client may still be sending
+%% its request (RFC 9112 §9.6): closing a socket with unread input makes the
+%% kernel send a reset, which can wipe the response from the client before it
+%% reads it. So the write side is shut first, telling the client the response
+%% is complete, and what still comes is read and dropped until the client
+%% closes or `Timeout` ms pass, a bound a client sending on cannot stretch.
+%% `0` skips it, for the close to follow at once.
 -doc false.
--spec drain_oversized_body(
-    binary(),
-    roadrunner_transport:socket(),
-    chunked | {content_length, non_neg_integer()},
-    non_neg_integer()
-) -> ok.
-drain_oversized_body(Buffered, Socket, {content_length, N}, MaxCL) ->
-    drain_oversized_loop(Socket, byte_size(Buffered), min(N, 2 * MaxCL));
-drain_oversized_body(Buffered, Socket, chunked, MaxCL) ->
-    drain_oversized_loop(Socket, byte_size(Buffered), 2 * MaxCL).
-
--spec drain_oversized_loop(
-    roadrunner_transport:socket(), non_neg_integer(), non_neg_integer()
-) -> ok.
-drain_oversized_loop(_Socket, Read, Cap) when Read >= Cap ->
+-spec linger(roadrunner_transport:socket(), non_neg_integer()) -> ok.
+linger(_Socket, 0) ->
     ok;
-drain_oversized_loop(Socket, Read, Cap) ->
-    case roadrunner_transport:recv(Socket, 0, 1000) of
-        {ok, Data} ->
-            drain_oversized_loop(Socket, Read + byte_size(Data), Cap);
-        {error, _} ->
+linger(Socket, Timeout) ->
+    _ = roadrunner_transport:shutdown(Socket, write),
+    linger_until(Socket, erlang:monotonic_time(millisecond) + Timeout).
+
+-spec linger_until(roadrunner_transport:socket(), integer()) -> ok.
+linger_until(Socket, Deadline) ->
+    case Deadline - erlang:monotonic_time(millisecond) of
+        Left when Left > 0 ->
+            case roadrunner_transport:recv(Socket, 0, Left) of
+                {ok, _Dropped} -> linger_until(Socket, Deadline);
+                {error, _} -> ok
+            end;
+        _ ->
             ok
     end.
 

@@ -865,7 +865,7 @@ handle_request_bytes(
             %% to the right request.
             S2 = flush_out(S),
             _ = roadrunner_conn:send_status(Socket, roadrunner_conn:parse_error_status(Reason)),
-            exit_normal(S2)
+            exit_lingering(S2)
     end.
 
 %% --- read_body phase ---
@@ -896,7 +896,7 @@ read_body_phase(#loop_state{body_buffering = BodyMode, dispatch = Dispatch} = S,
             S2 = flush_out(S),
             ok = rejection(S2, FramingReason),
             _ = roadrunner_conn:send_bad_request(S2#loop_state.socket),
-            exit_normal(S2);
+            exit_lingering(S2);
         {_, Framing} ->
             MaxCL = roadrunner_conn:body_cap(Resolved, S#loop_state.max_content_length),
             case expect_answer(S, Req, Framing, MaxCL) of
@@ -1009,9 +1009,7 @@ read_auto_body(
             %% as pipelined leftover.
             dispatch_phase(S#loop_state{buffered = Leftover}, Req#{body => Body}, Resolved);
         {error, content_length_too_large} ->
-            S2 = flush_out(S),
-            ok = roadrunner_conn:drain_oversized_body(Buffered, Socket, Framing, MaxCL),
-            refuse_too_large(S2);
+            refuse_too_large(S);
         {error, request_timeout} ->
             S2 = flush_out(S),
             _ = roadrunner_conn:send_request_timeout(Socket),
@@ -1032,7 +1030,7 @@ read_auto_body(
             _ = roadrunner_conn:send_status(
                 Socket, roadrunner_conn:parse_error_status(BodyReason)
             ),
-            exit_normal(S2)
+            exit_lingering(S2)
     end.
 
 %% The body's recv closure: passive reads bounded by the request
@@ -1077,18 +1075,18 @@ dispatch_phase(
                     %% routing decision, ahead of per-route middleware).
                     S1 = flush_out(S),
                     _ = roadrunner_conn:send_method_not_allowed(Socket, Allowed),
-                    exit_normal(S1);
+                    exit_unread(S1, Req);
                 not_found ->
                     S1 = flush_out(S),
                     _ = roadrunner_conn:send_not_found(Socket),
-                    exit_normal(S1)
+                    exit_unread(S1, Req)
             end;
         {deny, RetryAfter} ->
             %% Rate exceeded: queued pipelined responses go out first so the
             %% 429 + close can't overtake them.
             S1 = flush_out(S),
             _ = roadrunner_conn:send_rate_limited(Socket, RetryAfter),
-            exit_normal(S1)
+            exit_unread(S1, Req)
     end.
 
 -spec run_pipeline(
@@ -1142,7 +1140,7 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
             }),
             S9 = flush_out(S),
             _ = roadrunner_conn:send_internal_error(Socket),
-            exit_normal(S9)
+            exit_unread(S9, Req)
     end.
 
 %% RFC 9112 §9.6: a server that will not reuse the connection MUST signal it on
@@ -1401,9 +1399,11 @@ finishing_phase(S, Req, {sendfile, Status, Headers, _}) when is_integer(Status) 
 finishing_phase(S, Req, _Response) ->
     %% Stream / loop / websocket: writer owns the wire. In auto-mode
     %% the body is already fully read; manual-mode may have leftover
-    %% that needs draining.
-    _ = drain_body_if_manual(Req),
-    exit_normal(S).
+    %% that needs draining, or, when it cannot be, lingering over.
+    case drain_body_if_manual(Req) of
+        {ok, _Leftover} -> exit_normal(S);
+        {error, _} -> exit_lingering(S)
+    end.
 
 -spec buffered_finish(
     #loop_state{},
@@ -1441,9 +1441,10 @@ buffered_finish(S0, Req, Headers) ->
                     })
             end;
         {error, _} ->
-            %% Drain failure — close. Manual-mode handlers can leave the
-            %% body_reader in a broken state if they read past EOF.
-            exit_normal(S)
+            %% Drain failure (a body over its cap, never asked for, or
+            %% broken) — close, lingering over what the client may still
+            %% be sending.
+            exit_lingering(S)
     end.
 
 %% Park the conn in a hibernated wait while the WebSocket session owns
@@ -1531,13 +1532,31 @@ drain_body_if_manual(_Req) ->
     {ok, <<>>}.
 
 %% 413 + close for a body over its cap, after any queued pipelined
-%% responses.
+%% responses, lingering over the body the client may be sending.
 -spec refuse_too_large(#loop_state{}) -> no_return().
 refuse_too_large(S) ->
     S1 = flush_out(S),
     ok = rejection(S1, content_length_too_large),
     _ = roadrunner_conn:send_payload_too_large(S1#loop_state.socket),
+    exit_lingering(S1).
+
+%% Close after a response sent before the request was read to its end,
+%% lingering over what the client may still be sending
+%% (`roadrunner_conn:linger/2`) for the listener's `http1` `linger_timeout`.
+-spec exit_lingering(#loop_state{}) -> no_return().
+exit_lingering(#loop_state{socket = Socket, proto_opts = ProtoOpts} = S) ->
+    S1 = flush_out(S),
+    ok = roadrunner_conn:linger(Socket, maps:get(http1_linger_timeout, ProtoOpts, 1000)),
     exit_normal(S1).
+
+%% Close after a response sent ahead of the handler, or for its crash: a
+%% manual-mode body the request frames may still be on its way, so the
+%% close lingers. An auto-mode body was read before dispatch.
+-spec exit_unread(#loop_state{}, roadrunner_req:request()) -> no_return().
+exit_unread(S, #{body_reader := #{framing := Framing}}) when Framing =/= none ->
+    exit_lingering(S);
+exit_unread(S, _Req) ->
+    exit_normal(S).
 
 -spec rejection(#loop_state{}, atom()) -> ok.
 rejection(#loop_state{listener_name = ListenerName, peer = Peer}, Reason) ->

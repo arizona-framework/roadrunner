@@ -83,48 +83,42 @@ read_body_cl_too_large_test() ->
         read_body(Req, ~"", NoRecv, 1000, {8192, 10240, 100})
     ).
 
-drain_oversized_body_caps_at_2x_max_test() ->
-    %% A `{fake, Pid}` socket whose recv replies a 30-byte chunk. Drain
-    %% must read AT MOST 2 * MaxCL bytes — bounded against memory
-    %% exhaustion.
+linger_zero_closes_at_once_test() ->
+    %% No shutdown, no read: the close follows at once.
     Self = self(),
-    Sink = spawn(fun() -> drain_sink_loop(Self, [{recv, binary:copy(<<"a">>, 30)}]) end),
-    ok = roadrunner_conn:drain_oversized_body(<<>>, {fake, Sink}, chunked, 10),
-    %% MaxCL=10 → cap=20. First recv returns 30 bytes (Read=30 >= 20)
-    %% so the loop exits after exactly one call.
+    Sink = spawn(fun() -> script_sink(Self, []) end),
+    ok = roadrunner_conn:linger({fake, Sink}, 0),
     Sink ! stop,
-    ?assertEqual(1, drain_recv_calls(0)).
+    ?assertEqual(0, recv_calls(0)),
+    receive
+        {roadrunner_fake_shutdown, _, _} -> ?assert(false)
+    after 0 -> ok
+    end.
 
-drain_oversized_body_stops_on_recv_error_test() ->
-    %% Closed peer mid-drain → loop returns ok cleanly without
-    %% propagating the error.
-    Sink = spawn(fun() -> drain_sink_loop(undefined, [{error, closed}]) end),
-    ?assertEqual(ok, roadrunner_conn:drain_oversized_body(<<>>, {fake, Sink}, chunked, 10)),
+linger_reads_until_the_peer_closes_test() ->
+    %% The write side is shut, then what the peer sends is read and dropped
+    %% until it closes.
+    Self = self(),
+    Script = [{recv, ~"rest of"}, {recv, ~" the body"}, {error, closed}],
+    Sink = spawn(fun() -> shutdown_sink(Self, Script) end),
+    ok = roadrunner_conn:linger({fake, Sink}, 5000),
+    Sink ! stop,
+    ?assertEqual(
+        write,
+        receive
+            {sink_shutdown, How} -> How
+        after 1000 -> none
+        end
+    ),
+    ?assertEqual(3, recv_calls(0)).
+
+linger_ends_at_its_deadline_test() ->
+    %% A peer that never stops sending is cut off by the deadline.
+    Sink = spawn(fun() -> endless_sink() end),
+    ?assertEqual(ok, roadrunner_conn:linger({fake, Sink}, 20)),
     Sink ! stop.
 
-drain_oversized_body_counts_buffered_bytes_test() ->
-    %% Already-buffered bytes count toward the cap — if the buffered
-    %% body alone exceeds 2 * MaxCL, no recv call is needed.
-    Self = self(),
-    Sink = spawn(fun() -> drain_sink_loop(Self, []) end),
-    ok = roadrunner_conn:drain_oversized_body(
-        binary:copy(<<"a">>, 50), {fake, Sink}, {content_length, 100}, 10
-    ),
-    Sink ! stop,
-    ?assertEqual(0, drain_recv_calls(0)).
-
-drain_oversized_body_stops_at_the_declared_length_test() ->
-    %% A body declared 9 bytes long, over a cap of 8, ends at 9: once its
-    %% last bytes are in, there is no recv left to wait on.
-    Self = self(),
-    Sink = spawn(fun() -> drain_sink_loop(Self, [{recv, binary:copy(<<"a">>, 4)}]) end),
-    ok = roadrunner_conn:drain_oversized_body(
-        binary:copy(<<"a">>, 5), {fake, Sink}, {content_length, 9}, 8
-    ),
-    Sink ! stop,
-    ?assertEqual(1, drain_recv_calls(0)).
-
-drain_sink_loop(Reporter, Script) ->
+script_sink(Reporter, Script) ->
     receive
         stop ->
             ok;
@@ -136,21 +130,40 @@ drain_sink_loop(Reporter, Script) ->
             case Script of
                 [] ->
                     ConnPid ! {roadrunner_fake_recv_reply, {error, closed}},
-                    drain_sink_loop(Reporter, []);
+                    script_sink(Reporter, []);
                 [{error, _} = Err | Rest] ->
                     ConnPid ! {roadrunner_fake_recv_reply, Err},
-                    drain_sink_loop(Reporter, Rest);
+                    script_sink(Reporter, Rest);
                 [{recv, Bytes} | Rest] ->
                     ConnPid ! {roadrunner_fake_recv_reply, {ok, Bytes}},
-                    drain_sink_loop(Reporter, Rest)
+                    script_sink(Reporter, Rest)
             end;
         _ ->
-            drain_sink_loop(Reporter, Script)
+            script_sink(Reporter, Script)
     end.
 
-drain_recv_calls(Acc) ->
+%% A `script_sink/2` that reports the shutdown it is sent first.
+shutdown_sink(Reporter, Script) ->
     receive
-        recv_called -> drain_recv_calls(Acc + 1)
+        {roadrunner_fake_shutdown, _ConnPid, How} -> Reporter ! {sink_shutdown, How}
+    end,
+    script_sink(Reporter, Script).
+
+%% A peer that answers every read with more bytes.
+endless_sink() ->
+    receive
+        stop ->
+            ok;
+        {roadrunner_fake_recv, ConnPid, _Len, _Timeout} ->
+            ConnPid ! {roadrunner_fake_recv_reply, {ok, ~"x"}},
+            endless_sink();
+        _ ->
+            endless_sink()
+    end.
+
+recv_calls(Acc) ->
+    receive
+        recv_called -> recv_calls(Acc + 1)
     after 0 -> Acc
     end.
 
