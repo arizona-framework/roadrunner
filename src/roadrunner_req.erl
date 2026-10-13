@@ -582,8 +582,9 @@ every other case it is the peer's address (`peer/1`), which on a
 Returns `undefined` when the request has no peer.
 
 This is the address to use for per-client decisions: rate limiting, access
-logs, geolocation. Unlike `forwarded_for/1` it never trusts a header a
-client could write.
+logs, geolocation. Unlike `forwarded_for/1`, it reads only the hops the
+listener's trusted proxies added. With `trusted_hops`, that holds only
+while the listener is reachable through the proxies alone.
 """.
 -spec client_ip(request()) -> inet:ip_address() | undefined.
 client_ip(#{client_ip := IP}) -> IP;

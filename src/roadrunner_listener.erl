@@ -350,10 +350,13 @@ ops-tuning rationale.
     %% `forwarded` (RFC 7239). Starting from the socket peer, the chain is read
     %% right to left, trusted hops are skipped, and the first untrusted
     %% address is the client: `roadrunner_req:client_ip/1`, the `rate_limit`
-    %% key, and `client_ip` in logger and telemetry metadata. A peer that is
-    %% not a trusted proxy is itself the client, so a client that bypasses the
-    %% proxies cannot spoof its address. With `proxy_protocol`, the address the
-    %% PROXY header reports is the first hop.
+    %% key, and `client_ip` in logger and telemetry metadata. With
+    %% `trusted_proxies`, a peer outside them is itself the client, so a
+    %% client that bypasses the proxies cannot spoof its address.
+    %% `trusted_hops` trusts every peer, so use it only when the listener is
+    %% reachable through the proxies alone: a client connecting directly would
+    %% choose its own address. With `proxy_protocol`, the address the PROXY
+    %% header reports is the first hop.
     real_ip => #{
         trusted_proxies => [binary()],
         trusted_hops => pos_integer(),
