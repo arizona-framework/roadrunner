@@ -1010,7 +1010,7 @@ read_auto_body(
             dispatch_phase(S#loop_state{buffered = Leftover}, Req#{body => Body}, Resolved);
         {error, content_length_too_large} ->
             S2 = flush_out(S),
-            ok = roadrunner_conn:drain_oversized_body(Buffered, Socket, MaxCL),
+            ok = roadrunner_conn:drain_oversized_body(Buffered, Socket, Framing, MaxCL),
             refuse_too_large(S2);
         {error, request_timeout} ->
             S2 = flush_out(S),

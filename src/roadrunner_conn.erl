@@ -79,7 +79,7 @@
     rate_limit_spend/7,
     throttled_telemetry/3,
     rate_limit_evict_full/4,
-    drain_oversized_body/3,
+    drain_oversized_body/4,
     send_internal_error/1,
     send_not_found/1,
     send_method_not_allowed/2,
@@ -1777,17 +1777,25 @@ parse_error_status(header_block_too_long) -> 431;
 parse_error_status(too_many_headers) -> 431;
 parse_error_status(_) -> 400.
 
-%% Drain up to `2 * MaxCL` bytes from the socket (counting the
-%% already-buffered bytes), discarding them. Used to flush an
+%% Drain the rest of an oversized body from the socket (counting the
+%% already-buffered bytes), discarding it. Used to flush an
 %% oversized in-flight body off the wire so the peer can read the
-%% 413 we're about to send before we close. Bounded by `2 * MaxCL`
-%% (memory) and a 1-second per-recv timeout (wall-clock) so a slow
-%% peer can't pin us indefinitely.
+%% 413 we're about to send before we close. A declared body ends at
+%% its length, so the drain stops there rather than waiting on a
+%% client with nothing left to send. Bounded by `2 * MaxCL` (memory)
+%% and a 1-second per-recv timeout (wall-clock) so a slow peer can't
+%% pin us indefinitely.
 -doc false.
--spec drain_oversized_body(binary(), roadrunner_transport:socket(), non_neg_integer()) -> ok.
-drain_oversized_body(Buffered, Socket, MaxCL) ->
-    Cap = 2 * MaxCL,
-    drain_oversized_loop(Socket, byte_size(Buffered), Cap).
+-spec drain_oversized_body(
+    binary(),
+    roadrunner_transport:socket(),
+    chunked | {content_length, non_neg_integer()},
+    non_neg_integer()
+) -> ok.
+drain_oversized_body(Buffered, Socket, {content_length, N}, MaxCL) ->
+    drain_oversized_loop(Socket, byte_size(Buffered), min(N, 2 * MaxCL));
+drain_oversized_body(Buffered, Socket, chunked, MaxCL) ->
+    drain_oversized_loop(Socket, byte_size(Buffered), 2 * MaxCL).
 
 -spec drain_oversized_loop(
     roadrunner_transport:socket(), non_neg_integer(), non_neg_integer()
