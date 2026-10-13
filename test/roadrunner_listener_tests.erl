@@ -1085,6 +1085,68 @@ drain_timeout_kills_unresponsive_conns_test_() ->
             end}
         end}.
 
+%% RFC 9110 §10.1.1: the interim 100 goes out once the framing says a body
+%% this conn will read is coming. A request without a body gets its
+%% response straight away, and a declared length over the cap gets its 413
+%% at once, before the client sends any of it, with no wait to drain a
+%% body the client is still holding back.
+expect_continue_follows_the_body_framing_test_() ->
+    {setup,
+        fun() ->
+            Name = listener_test_expect,
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                routes => roadrunner_echo_body_handler,
+                max_content_length => 8
+            }),
+            {Name, roadrunner_listener:port(Name)}
+        end,
+        fun({Name, _Port}) -> ok = roadrunner_listener:stop(Name) end, fun({_Name, Port}) ->
+            [
+                {"a body within the cap gets the interim 100", fun() ->
+                    Sock = expect_request(Port, ~"POST", ~"Content-Length: 3\r\n"),
+                    ?assertEqual(
+                        {ok, ~"HTTP/1.1 100 Continue\r\n\r\n"}, gen_tcp:recv(Sock, 0, 2000)
+                    ),
+                    ok = gen_tcp:send(Sock, ~"abc"),
+                    {ok, Resp} = gen_tcp:recv(Sock, 0, 2000),
+                    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Resp),
+                    gen_tcp:close(Sock)
+                end},
+                {"a chunked body gets the interim 100", fun() ->
+                    Sock = expect_request(Port, ~"POST", ~"Transfer-Encoding: chunked\r\n"),
+                    ?assertEqual(
+                        {ok, ~"HTTP/1.1 100 Continue\r\n\r\n"}, gen_tcp:recv(Sock, 0, 2000)
+                    ),
+                    ok = gen_tcp:send(Sock, ~"3\r\nabc\r\n0\r\n\r\n"),
+                    {ok, Resp} = gen_tcp:recv(Sock, 0, 2000),
+                    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Resp),
+                    gen_tcp:close(Sock)
+                end},
+                {"a request without a body gets no 100", fun() ->
+                    Sock = expect_request(Port, ~"GET", ~""),
+                    {ok, Resp} = gen_tcp:recv(Sock, 0, 2000),
+                    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Resp),
+                    gen_tcp:close(Sock)
+                end},
+                {"a declared length over the cap gets an immediate 413", fun() ->
+                    Sock = expect_request(Port, ~"POST", ~"Content-Length: 100\r\n"),
+                    %% Well under the drain's 1 s recv timeout.
+                    {ok, Resp} = gen_tcp:recv(Sock, 0, 900),
+                    ?assertMatch(<<"HTTP/1.1 413 ", _/binary>>, Resp),
+                    gen_tcp:close(Sock)
+                end}
+            ]
+        end}.
+
+expect_request(Port, Method, Framing) ->
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(
+        Sock,
+        [Method, ~" / HTTP/1.1\r\nHost: x\r\n", Framing, ~"Expect: 100-continue\r\n\r\n"]
+    ),
+    Sock.
+
 drain_closes_conn_stalled_mid_body_test_() ->
     {setup,
         fun() ->

@@ -827,23 +827,8 @@ handle_request_bytes(
                 listener_name => ListenerName
             },
             ok = roadrunner_conn:set_request_logger_metadata(Req),
-            %% RFC 9110 §10.1.1: a client gating its body on `Expect:
-            %% 100-continue` is WAITING for the interim 100, so send it
-            %% unless body bytes already arrived with the headers (then
-            %% the client didn't wait). Queued pipelined responses must
-            %% reach it first. The pipelined hot path (Rest =/= <<>>)
-            %% never flushes here.
-            S2 =
-                case Rest =:= ~"" andalso roadrunner_conn:expects_continue(Req) of
-                    true ->
-                        S1 = flush_out(S),
-                        ok = roadrunner_conn:send_continue(Socket),
-                        S1;
-                    false ->
-                        S
-                end,
             read_body_phase(
-                S2#loop_state{buffered = Rest, req_id_buffer = NewBuffer}, Req, Deadline
+                S#loop_state{buffered = Rest, req_id_buffer = NewBuffer}, Req, Deadline
             );
         {more, _} ->
             %% Need more bytes to complete the request line/headers.
@@ -894,37 +879,88 @@ read_body_phase(#loop_state{body_buffering = BodyMode} = S, Req, Deadline) ->
         {auto, none} ->
             dispatch_phase(S, Req#{body => <<>>});
         {auto, Framing} ->
-            read_auto_body(S, Req, Framing, Deadline);
+            {Waiting, S1} = continue(S, Req, Framing),
+            read_auto_body(S1, Req, Framing, Waiting, Deadline);
         {manual, {error, FramingReason}} ->
             S2 = flush_out(S),
             ok = rejection(S2, FramingReason),
             _ = roadrunner_conn:send_bad_request(S2#loop_state.socket),
             exit_normal(S2);
         {manual, Framing} ->
+            {_Waiting, S1} = continue(S, Req, Framing),
             BodyState = roadrunner_conn:make_body_reader(
                 Framing,
-                S#loop_state.buffered,
-                body_recv(S, Deadline),
-                S#loop_state.max_content_length,
-                trailer_limits(S)
+                S1#loop_state.buffered,
+                body_recv(S1, Deadline),
+                S1#loop_state.max_content_length,
+                trailer_limits(S1)
             ),
-            dispatch_phase(S, Req#{body_reader => BodyState})
+            dispatch_phase(S1, Req#{body_reader => BodyState})
     end.
 
+%% RFC 9110 §10.1.1: a client gating its body on `Expect: 100-continue` is
+%% WAITING for the interim 100, unless body bytes already arrived with the
+%% headers (then it didn't wait). Send it once the framing says a body we
+%% will read is coming: not for a request without one, nor for a declared
+%% length over `max_content_length`, whose 413 then goes out before the
+%% client sends a byte of it. Queued pipelined responses reach the client
+%% first. Returns whether the client is still holding its body back.
+-spec continue(
+    #loop_state{},
+    roadrunner_req:request(),
+    none
+    | chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding}
+) -> {boolean(), #loop_state{}}.
+continue(
+    #loop_state{buffered = ~"", socket = Socket, max_content_length = MaxCL} = S, Req, Framing
+) ->
+    case roadrunner_conn:expects_continue(Req) of
+        true ->
+            case body_to_read(Framing, MaxCL) of
+                true ->
+                    S1 = flush_out(S),
+                    ok = roadrunner_conn:send_continue(Socket),
+                    {false, S1};
+                false ->
+                    {true, S}
+            end;
+        false ->
+            {false, S}
+    end;
+continue(S, _Req, _Framing) ->
+    {false, S}.
+
+%% Whether the framing promises a body this conn will read.
+-spec body_to_read(
+    none
+    | chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding},
+    non_neg_integer()
+) -> boolean().
+body_to_read(chunked, _MaxCL) -> true;
+body_to_read({content_length, N}, MaxCL) when N > 0, N =< MaxCL -> true;
+body_to_read(_Framing, _MaxCL) -> false.
+
 %% Auto mode with a body (or a framing error the read reports): read it
-%% all before dispatch.
+%% all before dispatch. `Waiting` is whether the client is still holding
+%% its body back for a 100 it did not get (`continue/3`).
 -spec read_auto_body(
     #loop_state{},
     roadrunner_req:request(),
     chunked
     | {content_length, non_neg_integer()}
     | {error, bad_content_length | bad_transfer_encoding},
+    boolean(),
     integer()
 ) -> no_return().
 read_auto_body(
     #loop_state{socket = Socket, buffered = Buffered, max_content_length = MaxCL} = S,
     Req,
     Framing,
+    Waiting,
     Deadline
 ) ->
     Recv = body_recv(S, Deadline),
@@ -936,7 +972,9 @@ read_auto_body(
             dispatch_phase(S#loop_state{buffered = Leftover}, Req#{body => Body});
         {error, content_length_too_large} ->
             S2 = flush_out(S),
-            _ = roadrunner_conn:drain_oversized_body(Buffered, Socket, MaxCL),
+            %% A client still waiting for a 100 sends no body, so there is
+            %% none to drain ahead of the 413.
+            _ = Waiting orelse roadrunner_conn:drain_oversized_body(Buffered, Socket, MaxCL),
             ok = rejection(S2, content_length_too_large),
             _ = roadrunner_conn:send_payload_too_large(Socket),
             exit_normal(S2);
