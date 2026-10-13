@@ -22,6 +22,7 @@ picks what it does with the body.
     body_over_the_cap_fails_the_read/1,
     credit_waits_for_the_reader/1,
     credit_comes_back_as_the_reader_reads/1,
+    credit_counts_the_headers/1,
     content_length_overrun_resets/1,
     malformed_content_length_resets/1,
     reset_while_reading/1,
@@ -54,6 +55,7 @@ all() ->
         body_over_the_cap_fails_the_read,
         credit_waits_for_the_reader,
         credit_comes_back_as_the_reader_reads,
+        credit_counts_the_headers,
         content_length_overrun_resets,
         malformed_content_length_resets,
         reset_while_reading,
@@ -223,6 +225,30 @@ credit_comes_back_as_the_reader_reads(Config) ->
     ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, binary:copy(~"y", 200000), true),
     ?assertMatch({200, _, ~"400000"}, roadrunner_quic_test_h3:collect(Conn, StreamId)).
 
+credit_counts_the_headers(Config) ->
+    %% The credit given back covers every byte of the stream, its HEADERS
+    %% frame too, so a reader never shrinks its own window.
+    Conn = ?config(conn, Config),
+    1 = erlang:trace_pattern({roadrunner_quic, consumed, 3}, true, [global]),
+    _ = erlang:trace(all, true, [call]),
+    try
+        StreamId = open(Conn, ~"/gated", []),
+        ok = go(),
+        Body = binary:copy(~"x", 1000),
+        ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, Body, false),
+        Sent =
+            iolist_size(
+                roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(headers(~"/gated")))
+            ) +
+                iolist_size(roadrunner_quic_h3_frame:encode_data(Body)),
+        ?assertEqual(Sent, given_back(StreamId, Sent, 0)),
+        ok = roadrunner_quic_test_conn:send(Conn, StreamId, <<>>, true),
+        ?assertMatch({200, _, ~"1000"}, roadrunner_quic_test_h3:collect(Conn, StreamId))
+    after
+        _ = erlang:trace(all, false, [call]),
+        _ = erlang:trace_pattern({roadrunner_quic, consumed, 3}, false, [global])
+    end.
+
 content_length_overrun_resets(Config) ->
     Conn = ?config(conn, Config),
     StreamId = open(Conn, ~"/read", [{~"content-length", ~"3"}]),
@@ -327,6 +353,17 @@ read_result() ->
     receive
         {read_result, Result} -> Result
     after 5000 -> ct:fail(no_read_result)
+    end.
+
+%% The bytes given back on `StreamId` (traced `roadrunner_quic:consumed/3`
+%% calls), summed until they reach `Want` or a second passes with no more.
+given_back(_StreamId, Want, Total) when Total >= Want ->
+    Total;
+given_back(StreamId, Want, Total) ->
+    receive
+        {trace, _Pid, call, {roadrunner_quic, consumed, [_Conn, StreamId, Bytes]}} ->
+            given_back(StreamId, Want, Total + Bytes)
+    after 1000 -> Total
     end.
 
 wait_gated() ->
