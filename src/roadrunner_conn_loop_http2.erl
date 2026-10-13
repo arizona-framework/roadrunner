@@ -909,10 +909,20 @@ reset_refused(StreamId, Fragment, Code, #loop{hpack_dec = Dec} = State) ->
             State1 = State#loop{hpack_dec = Dec1},
             _ = send_rst_stream(State1, StreamId, Code),
             frame_loop(reset_stream(State1, StreamId));
-        {error, _} ->
-            _ = send_goaway(State, protocol_error),
+        {error, Reason} ->
+            _ = send_goaway(State, decode_error_code(Reason)),
             exit_clean(State)
     end.
+
+%% The GOAWAY code for a field block that did not decode. RFC 9113 §4.3:
+%% a decoding error is a connection error of type COMPRESSION_ERROR. An
+%% uppercase field name decodes but makes the message malformed (§8.2.1),
+%% a PROTOCOL_ERROR; the decoder stops there, without the rest of the
+%% block, so the connection cannot go on either.
+-spec decode_error_code(roadrunner_http2_hpack:decode_error()) ->
+    roadrunner_http2_frame:error_code().
+decode_error_code(bad_header_name) -> protocol_error;
+decode_error_code(_) -> compression_error.
 
 new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow) ->
     #{
@@ -1009,8 +1019,8 @@ finalize_trailers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) -
                 streams = Streams#{StreamId := Stream1}
             },
             dispatch_stream(StreamId, State1);
-        {error, _} ->
-            _ = send_goaway(State, protocol_error),
+        {error, Reason} ->
+            _ = send_goaway(State, decode_error_code(Reason)),
             exit_clean(State)
     end.
 
@@ -1060,8 +1070,8 @@ finalize_headers(
                         false -> frame_loop(State1)
                     end
             end;
-        {error, _} ->
-            _ = send_goaway(State, protocol_error),
+        {error, Reason} ->
+            _ = send_goaway(State, decode_error_code(Reason)),
             exit_clean(State)
     end.
 
