@@ -205,8 +205,8 @@
     %% Highest stream id we've processed — for the LAST_STREAM_ID
     %% in GOAWAY.
     last_stream_id = 0 :: non_neg_integer(),
-    %% Pre-generated CSPRNG bytes for `request_id`, sliced 8 bytes
-    %% at a time. Refilled by `roadrunner_conn:generate_request_id/1`
+    %% Pre-generated `request_id`s (hex), sliced 16 characters at a
+    %% time. Refilled by `roadrunner_conn:generate_request_id/1`
     %% in 256-byte batches so h2 conns amortize the crypto cost
     %% across ~32 requests instead of paying it per dispatch.
     req_id_buffer = <<>> :: binary(),

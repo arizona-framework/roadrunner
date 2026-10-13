@@ -105,8 +105,8 @@
     listener_name :: atom(),
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
     start_mono :: integer(),
-    %% Pre-generated CSPRNG bytes for `request_id`, sliced 8 at a time
-    %% and refilled by `roadrunner_conn:generate_request_id/1`.
+    %% Pre-generated `request_id`s (hex), sliced 16 characters at a
+    %% time and refilled by `roadrunner_conn:generate_request_id/1`.
     req_id_buffer = <<>> :: binary(),
     %% StreamId => in-progress request stream (see `new_request_stream/0`).
     streams = #{} :: #{non_neg_integer() => map()},

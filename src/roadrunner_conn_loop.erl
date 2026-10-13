@@ -101,9 +101,9 @@
     %% AND on the keep-alive loop-back when a prior request's body
     %% drain leaves post-body bytes (RFC 9112 §9.3.2 pipelining).
     buffered = <<>> :: binary(),
-    %% Pre-generated CSPRNG bytes for `request_id`. Filled lazily
-    %% (on first request) by `roadrunner_conn:generate_request_id/1`
-    %% — 256 bytes batched, 8 bytes sliced per request. Empty
+    %% Pre-generated `request_id`s. Filled lazily (on first request)
+    %% by `roadrunner_conn:generate_request_id/1` — 256 random bytes
+    %% hex-encoded per batch, 16 characters sliced per request. Empty
     %% buffer triggers a refill. Threaded via the loop_state to
     %% avoid process-dictionary writes.
     req_id_buffer = <<>> :: binary(),
