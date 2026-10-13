@@ -407,13 +407,14 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
                 )
             of
                 {ok, Stream1} ->
-                    State1 = State#h3{
-                        streams = Streams#{StreamId => unreleased(Stream1, Data, State)}
-                    },
-                    case {Stream1, Fin} of
+                    %% The stream with this chunk counted, which `await_body/4`
+                    %% stores again once it decodes the headers.
+                    Stream2 = unreleased(Stream1, Data, State),
+                    State1 = State#h3{streams = Streams#{StreamId => Stream2}},
+                    case {Stream2, Fin} of
                         {#{reader := _}, _} -> body_in(State1, StreamId, Fin);
                         {_, true} -> dispatch_request(State1, StreamId);
-                        {_, false} -> await_body(State1, StreamId, Stream0, Stream1)
+                        {_, false} -> await_body(State1, StreamId, Stream0, Stream2)
                     end;
                 too_large when is_map_key(reader, Stream0) ->
                     body_over_cap(State, StreamId, Stream0, Fin);
