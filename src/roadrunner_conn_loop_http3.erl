@@ -387,30 +387,10 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
                     State1 = State#h3{streams = Streams#{StreamId => Stream1}},
                     case Fin of
                         true -> dispatch_request(State1, StreamId);
-                        false -> State1
+                        false -> await_body(State1, StreamId, Stream0, Stream1)
                     end;
                 too_large ->
-                    ok = roadrunner_http3_stream_worker:send_buffered(
-                        State#h3.conn,
-                        StreamId,
-                        413,
-                        [{~"content-type", ~"text/plain"}],
-                        ~"Payload Too Large"
-                    ),
-                    %% Ask the client to stop and mark the stream
-                    %% `discarding` so residual body is dropped rather
-                    %% than mistaken for a new request.
-                    _ = roadrunner_quic:stop_sending(State#h3.conn, StreamId, ?H3_NO_ERROR),
-                    State#h3{
-                        streams = Streams#{
-                            StreamId => Stream0#{
-                                frame_state := discarding,
-                                buf := <<>>,
-                                body := [],
-                                body_len := 0
-                            }
-                        }
-                    };
+                    refuse_too_large(State, StreamId, Stream0);
                 headers_too_large ->
                     ok = roadrunner_http3_stream_worker:send_buffered(
                         State#h3.conn,
@@ -434,6 +414,76 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
                     ConnError
             end
     end.
+
+%% A request whose body is still to come. When its HEADERS frame has just
+%% arrived, the field section is decoded now rather than at dispatch, so a
+%% request expecting `100-continue` gets the immediate answer RFC 9110
+%% §10.1.1 requires (HTTP/3 being "HTTP/1.1 or later") instead of leaving
+%% the client to time out its wait. It is decoded once either way: the
+%% stream keeps the headers for dispatch.
+-spec await_body(#h3{}, non_neg_integer(), map(), map()) -> handle_result().
+await_body(
+    State, StreamId, #{header_block := undefined} = Stream0, #{header_block := Block} = Stream1
+) when
+    is_binary(Block)
+->
+    case roadrunner_qpack:decode(Block) of
+        {error, _} ->
+            qpack_decompression_failed();
+        {ok, Headers} ->
+            Streams = State#h3.streams,
+            State1 = State#h3{streams = Streams#{StreamId := Stream1#{headers := Headers}}},
+            answer_expectation(State1, StreamId, Stream0, Headers)
+    end;
+await_body(State, _StreamId, _Stream0, _Stream1) ->
+    State.
+
+%% RFC 9110 §10.1.1: a 413 when the declared `content-length` is already
+%% over `max_content_length`, the status the body would earn anyway, else
+%% the interim 100 (a HEADERS frame with `:status` alone, no FIN) that asks
+%% for the body. A request expecting nothing waits for its body as before.
+-spec answer_expectation(#h3{}, non_neg_integer(), map(), roadrunner_http:headers()) -> #h3{}.
+answer_expectation(#h3{max_content_length = MaxLen} = State, StreamId, Stream0, Headers) ->
+    case lists:keyfind(~"expect", 1, Headers) of
+        {_, Expect} ->
+            case
+                roadrunner_bin:ascii_lowercase(Expect) =:= ~"100-continue" andalso
+                    roadrunner_http:request_content_length(Headers)
+            of
+                {ok, Declared} when Declared > MaxLen ->
+                    refuse_too_large(State, StreamId, Stream0);
+                false ->
+                    State;
+                _ ->
+                    Continue = roadrunner_quic_h3_frame:encode_headers(
+                        roadrunner_qpack:encode([{~":status", ~"100"}])
+                    ),
+                    _ = roadrunner_quic:send_data(State#h3.conn, StreamId, Continue, false),
+                    State
+            end;
+        false ->
+            State
+    end.
+
+%% Answer 413 to a request over `max_content_length`, ask the client to
+%% stop sending, and mark the stream `discarding` so residual body is
+%% dropped rather than mistaken for a new request.
+-spec refuse_too_large(#h3{}, non_neg_integer(), map()) -> #h3{}.
+refuse_too_large(#h3{conn = Conn, streams = Streams} = State, StreamId, Stream0) ->
+    ok = roadrunner_http3_stream_worker:send_buffered(
+        Conn, StreamId, 413, [{~"content-type", ~"text/plain"}], ~"Payload Too Large"
+    ),
+    _ = roadrunner_quic:stop_sending(Conn, StreamId, ?H3_NO_ERROR),
+    State#h3{
+        streams = Streams#{
+            StreamId => Stream0#{
+                frame_state := discarding,
+                buf := <<>>,
+                body := [],
+                body_len := 0
+            }
+        }
+    }.
 
 %% Advance a peer-initiated unidirectional stream by one chunk. The
 %% per-stream and connection-wide critical-role state lives in the `#h3`
@@ -502,6 +552,10 @@ new_request_stream() ->
     #{
         buf => <<>>,
         header_block => undefined,
+        %% The decoded field section, once decoded: as the HEADERS frame
+        %% arrives for a request with a body to come (`await_body/4`), else
+        %% at dispatch.
+        headers => undefined,
         body => [],
         body_len => 0,
         %% RFC 9114 §4.1 request frame sequence: HEADERS, then DATA, then
@@ -751,30 +805,36 @@ dispatch_request(#h3{streams = Streams} = State, StreamId) ->
             %% Stream ended with no HEADERS frame — a malformed message
             %% (RFC 9114 §4.1): stream error H3_MESSAGE_ERROR.
             reset_and_drop(State, StreamId, ?H3_MESSAGE_ERROR);
-        #{header_block := Block} = Stream ->
+        #{headers := undefined, header_block := Block} = Stream ->
             %% QPACK decode happens here (not in the worker) because a
             %% decompression failure is a CONNECTION error per RFC 9204
             %% §2.2 — the dynamic-table state is unrecoverable — whereas
             %% a malformed message is a per-stream error.
             case roadrunner_qpack:decode(Block) of
-                {error, _} ->
-                    {conn_error, ?H3_QPACK_DECOMPRESSION_FAILED, ~"QPACK decompression failed"};
-                {ok, Headers} ->
-                    case
-                        roadrunner_http:header_list_size(Headers) >
-                            State#h3.max_field_section_size
-                    of
-                        true ->
-                            %% RFC 9114 §4.2.2: the decoded field section
-                            %% exceeds the MAX_FIELD_SECTION_SIZE we advertised.
-                            %% QPACK is static-only here, so there's no decoder
-                            %% state to desync — answer 431 and drop the stream.
-                            respond_field_section_too_large(State, StreamId);
-                        false ->
-                            #{body := Body} = Stream,
-                            dispatch_decoded(State, StreamId, Headers, Body)
-                    end
-            end
+                {error, _} -> qpack_decompression_failed();
+                {ok, Headers} -> dispatch_headers(State, StreamId, Stream, Headers)
+            end;
+        #{headers := Headers} = Stream ->
+            dispatch_headers(State, StreamId, Stream, Headers)
+    end.
+
+-spec qpack_decompression_failed() -> {conn_error, non_neg_integer(), binary()}.
+qpack_decompression_failed() ->
+    {conn_error, ?H3_QPACK_DECOMPRESSION_FAILED, ~"QPACK decompression failed"}.
+
+-spec dispatch_headers(#h3{}, non_neg_integer(), map(), roadrunner_http:headers()) ->
+    handle_result().
+dispatch_headers(State, StreamId, Stream, Headers) ->
+    case roadrunner_http:header_list_size(Headers) > State#h3.max_field_section_size of
+        true ->
+            %% RFC 9114 §4.2.2: the decoded field section exceeds the
+            %% MAX_FIELD_SECTION_SIZE we advertised. QPACK is static-only
+            %% here, so there's no decoder state to desync — answer 431 and
+            %% drop the stream.
+            respond_field_section_too_large(State, StreamId);
+        false ->
+            #{body := Body} = Stream,
+            dispatch_decoded(State, StreamId, Headers, Body)
     end.
 
 %% RFC 9114 §4.2.2: a request whose decoded field section exceeds the

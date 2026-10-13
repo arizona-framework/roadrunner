@@ -48,6 +48,9 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     sendfile_large/1,
     head_sendfile/1,
     oversized_413/1,
+    expect_continue_gets_interim_100/1,
+    expect_continue_over_the_cap_gets_413/1,
+    other_expectation_gets_no_interim/1,
     oversized_headers_431/1,
     advertises_max_field_section_size/1,
     advertises_grease_setting/1,
@@ -76,6 +79,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     malformed_frame/1,
     oversized_frame/1,
     qpack_decompression_failed/1,
+    qpack_decompression_failed_before_body/1,
     extra_data_after_413/1,
     stop_sending_ignored/1,
     peer_push_stream_closes_conn/1,
@@ -127,6 +131,9 @@ all() ->
         sendfile_large,
         head_sendfile,
         oversized_413,
+        expect_continue_gets_interim_100,
+        expect_continue_over_the_cap_gets_413,
+        other_expectation_gets_no_interim,
         oversized_headers_431,
         advertises_max_field_section_size,
         advertises_grease_setting,
@@ -155,6 +162,7 @@ all() ->
         malformed_frame,
         oversized_frame,
         qpack_decompression_failed,
+        qpack_decompression_failed_before_body,
         extra_data_after_413,
         stop_sending_ignored,
         peer_push_stream_closes_conn,
@@ -182,6 +190,7 @@ init_per_testcase(Case, Config) when
     Case =:= method_not_allowed;
     Case =:= rate_limited;
     Case =:= oversized_413;
+    Case =:= expect_continue_over_the_cap_gets_413;
     Case =:= protocols_tuple_form;
     Case =:= certfile_keyfile;
     Case =:= certs_keys_form;
@@ -619,6 +628,82 @@ unfinished_stream_on_normal_exit_resets(Config) ->
     after
         ll_close(Conn)
     end.
+
+expect_continue_gets_interim_100(Config) ->
+    %% RFC 9110 §10.1.1: a request expecting `100-continue` with a body to
+    %% follow gets the interim 100 right away (a HEADERS frame with
+    %% `:status` alone, no FIN), then its final response once the body is in.
+    Conn = ll_connect(?config(port, Config)),
+    try
+        StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+        ok = roadrunner_quic_test_conn:send(
+            Conn, StreamId, expect_headers(~"3", ~"100-continue"), false
+        ),
+        receive
+            {quic_test_stream, Conn, StreamId, Interim, false} ->
+                {ok, {headers, Block}, <<>>} = roadrunner_quic_h3_frame:decode(Interim),
+                ?assertEqual({ok, [{~":status", ~"100"}]}, roadrunner_qpack:decode(Block))
+        after 5000 -> ct:fail(no_interim_response)
+        end,
+        ok = roadrunner_quic_test_conn:send(
+            Conn, StreamId, roadrunner_quic_h3_frame:encode_data(~"abc", 3), true
+        ),
+        {fin, Bytes} = ll_collect_until_end(Conn, StreamId, <<>>),
+        {ok, {headers, Final}, _} = roadrunner_quic_h3_frame:decode(Bytes),
+        ?assertMatch({ok, [{~":status", ~"200"} | _]}, roadrunner_qpack:decode(Final))
+    after
+        ll_close(Conn)
+    end.
+
+expect_continue_over_the_cap_gets_413(_Config) ->
+    %% A declared `content-length` already over `max_content_length` is the
+    %% final status the headers settle: 413 at once, not a 100 that would
+    %% have the client send a body we refuse.
+    Name = listener_name(expect_continue_over_the_cap_gets_413),
+    {ok, _} = start_h3(Name, #{max_content_length => 2}),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        {ok, StreamId} = roadrunner_quic_test_h3:open_request(
+            Conn,
+            headers(~"POST", ~"/echo") ++
+                [{~"content-length", ~"3"}, {~"expect", ~"100-Continue"}],
+            false
+        ),
+        ?assertMatch({413, _, _}, collect(Conn, StreamId))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+other_expectation_gets_no_interim(Config) ->
+    %% Only `100-continue` asks for the interim response.
+    Conn = ll_connect(?config(port, Config)),
+    try
+        StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+        ok = roadrunner_quic_test_conn:send(
+            Conn, StreamId, expect_headers(~"3", ~"something-else"), false
+        ),
+        receive
+            {quic_test_stream, Conn, StreamId, _, _} -> ct:fail(unexpected_interim)
+        after 300 -> ok
+        end,
+        ok = roadrunner_quic_test_conn:send(
+            Conn, StreamId, roadrunner_quic_h3_frame:encode_data(~"abc", 3), true
+        ),
+        ?assertMatch({fin, _}, ll_collect_until_end(Conn, StreamId, <<>>))
+    after
+        ll_close(Conn)
+    end.
+
+%% A POST HEADERS frame, its body to follow, with a declared
+%% `content-length` and an `expect` field.
+expect_headers(ContentLength, Expect) ->
+    roadrunner_quic_h3_frame:encode_headers(
+        roadrunner_qpack:encode(
+            headers(~"POST", ~"/echo") ++
+                [{~"content-length", ContentLength}, {~"expect", Expect}]
+        )
+    ).
 
 oversized_413(_Config) ->
     Name = listener_name(oversized_413),
@@ -1229,6 +1314,16 @@ qpack_decompression_failed(Config) ->
     StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
     ok = roadrunner_quic_test_conn:send(
         Conn, StreamId, roadrunner_quic_h3_frame:encode_headers(<<>>), true
+    ),
+    ll_await_closed(Conn).
+
+qpack_decompression_failed_before_body(Config) ->
+    %% The same when the field block arrives ahead of a body still to
+    %% come, where it is decoded as it arrives rather than at dispatch.
+    Conn = ll_connect(?config(port, Config)),
+    StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(
+        Conn, StreamId, roadrunner_quic_h3_frame:encode_headers(<<>>), false
     ),
     ll_await_closed(Conn).
 
