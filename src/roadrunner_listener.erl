@@ -233,7 +233,9 @@ Optional middleware and timing knobs (durations in milliseconds):
   (ms). Default 1000.
 - `body_buffering` — `auto` (default; framework reads the full
   body before invoking the handler) or `manual` (handler calls
-  `roadrunner_req:read_body/1,2`).
+  `roadrunner_req:read_body/1,2`; a client sending
+  `Expect: 100-continue` is asked for its body only when the handler
+  first reads it).
 - `slot_reconciliation` — `#{interval := Ms}` (default 60000) for the
   periodic reaper that releases slots orphaned by brutal-kill exits,
   and with them the killed conns' rows in the drain registry, or
