@@ -2413,8 +2413,11 @@ generate_request_id_slices_a_hex_batch_test() ->
     ?assertEqual(32, length(Ids)),
     ?assertEqual(32, length(lists:usort(Ids))),
     [?assertMatch({match, _}, re:run(I, "^[0-9a-f]{16}$")) || I <- Ids],
-    %% Each id is its own 16-byte copy, not a view that keeps the batch alive.
-    ?assertEqual(16, binary:referenced_byte_size(Id)).
+    %% Each id is its own copy, not a view that keeps the batch alive like
+    %% `Rest`. The copy's size depends on the OTP version: `binary:copy/1`
+    %% returns a 16-byte heap binary on OTP 28+, a 128-byte off-heap one on
+    %% OTP 27.
+    ?assert(binary:referenced_byte_size(Id) < binary:referenced_byte_size(Rest)).
 
 request_ids(<<>>) ->
     [];
