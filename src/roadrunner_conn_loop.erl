@@ -1073,17 +1073,8 @@ dispatch_phase(
     case rate_limit_allows(RateLimit, Req, Socket, ListenerName) of
         true ->
             case Resolved of
-                {ok, Handler, Bindings, Pipeline, _State, Limits} ->
-                    case roadrunner_conn:route_rate_limit(Limits, Req) of
-                        allow ->
-                            run_pipeline(S1, Handler, Req#{bindings => Bindings}, Pipeline);
-                        {deny, RetryAfter} ->
-                            %% Over the route's own rate: 429 + close, after
-                            %% any queued pipelined responses.
-                            S2 = flush_out(S1),
-                            _ = roadrunner_conn:send_rate_limited(Socket, RetryAfter),
-                            exit_normal(S2)
-                    end;
+                {ok, Handler, Bindings, Pipeline, _State, _Limits} ->
+                    run_pipeline(S1, Handler, Req#{bindings => Bindings}, Pipeline);
                 {method_not_allowed, Allowed} ->
                     %% Path matched but no route answers this method: 405 +
                     %% Allow before any pipeline runs (the method gate is a

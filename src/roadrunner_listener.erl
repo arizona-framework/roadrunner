@@ -1127,7 +1127,7 @@ route_rate_limited(Routes) ->
 
 %% Create the bucket store of the route rate limits and publish it, with
 %% the counter its refusals add to, under the name the conns look it up by
-%% (`roadrunner_conn:route_rate_limit/2`). It is published before the routes
+%% (`roadrunner_route_rate_limit`). It is published before the routes
 %% that use it, so no request matches such a route without it. Like the
 %% listener's own store, the table is owned by this gen_server and dies with
 %% it, and the sweep timer cancels itself.
@@ -2226,7 +2226,7 @@ handle_info(
 handle_info(route_rate_limit_sweep, #state{route_buckets = Table} = State) ->
     %% Drop the route buckets that are full again, then reschedule. Keeps the
     %% store bounded by the clients still inside their routes' windows.
-    _ = roadrunner_conn:route_rate_limit_evict(Table, erlang:monotonic_time(millisecond)),
+    _ = roadrunner_route_rate_limit:evict_full(Table, erlang:monotonic_time(millisecond)),
     _ = erlang:send_after(?ROUTE_RATE_LIMIT_SWEEP_INTERVAL, self(), route_rate_limit_sweep),
     {noreply, State};
 handle_info(_Msg, State) ->

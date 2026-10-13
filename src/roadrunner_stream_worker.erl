@@ -43,8 +43,8 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
         {ok, Handler, Bindings, Pipeline, _State, Limits} ->
-            case route_refusal(Limits, Req) of
-                none ->
+            case over_route_cap(Limits, Req) of
+                false ->
                     invoke(
                         Worker,
                         Protocol,
@@ -56,9 +56,15 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
                         Metadata,
                         ReqStart
                     );
-                {Status, Headers, Body} ->
-                    ok = Worker:send_buffered(Conn, StreamId, Status, Headers, Body),
-                    ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, Status, buffered)
+                true ->
+                    ok = Worker:send_buffered(
+                        Conn,
+                        StreamId,
+                        413,
+                        [{~"content-type", ~"text/plain"}],
+                        ~"Payload Too Large"
+                    ),
+                    ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, 413, buffered)
             end;
         {method_not_allowed, Allowed} ->
             %% Path matched but no route on it answers this method: 405 plus
@@ -82,27 +88,10 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
             ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, 404, buffered)
     end.
 
-%% The response refusing a request its route's own limits do not admit,
-%% checked once the request is routed, or `none`: a body over the route's
-%% `max_content_length` (413), then a client over its `rate_limit` (429).
--spec route_refusal(roadrunner_router:limits(), roadrunner_req:request()) ->
-    none | {roadrunner_http:status(), roadrunner_http:headers(), binary()}.
-route_refusal(undefined, _Req) ->
-    none;
-route_refusal(Limits, Req) ->
-    maybe
-        false ?= over_route_cap(Limits, Req),
-        allow ?= roadrunner_conn:route_rate_limit(Limits, Req),
-        none
-    else
-        true -> {413, [{~"content-type", ~"text/plain"}], ~"Payload Too Large"};
-        {deny, RetryAfter} -> {429, [{~"retry-after", integer_to_binary(RetryAfter)}], ~""}
-    end.
-
 %% Whether the body is over its route's own `max_content_length`. The
 %% connection holds a body to the listener's cap, raised to the route's
 %% when a body outgrows it, so only a route cap tighter than the
-%% listener's is left to check here.
+%% listener's is left to check here, once the request is routed.
 -spec over_route_cap(roadrunner_router:limits(), roadrunner_req:request()) -> boolean().
 over_route_cap(#{max_content_length := Max}, #{body := Body}) ->
     iolist_size(Body) > Max;

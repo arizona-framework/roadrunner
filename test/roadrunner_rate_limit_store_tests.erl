@@ -60,63 +60,6 @@ resolve_on_test() ->
         {10, 600000, 30000, Table, Counter, ?IP}, ?M:resolve_rate_limit(Opts, {?IP, 5000})
     ).
 
-%% --- route_rate_limit_check/6, route_rate_limit_evict/2 ---
-
--define(ROUTE_KEY, {{~"/login", undefined, 1, 1, 1}, ?IP}).
-
-route_check_spends_and_refills_test() ->
-    Table = new_table(),
-    %% 1 per second, burst 1: the second request waits for the refill.
-    ?assertEqual(allow, ?M:route_rate_limit_check(Table, ?ROUTE_KEY, 1, cap(1, 1), cost(1), 1000)),
-    ?assertEqual(
-        {deny, 1}, ?M:route_rate_limit_check(Table, ?ROUTE_KEY, 1, cap(1, 1), cost(1), 1500)
-    ),
-    ?assertEqual(allow, ?M:route_rate_limit_check(Table, ?ROUTE_KEY, 1, cap(1, 1), cost(1), 2000)).
-
-route_check_records_when_full_test() ->
-    Table = new_table(),
-    %% A spent request is back 1000ms later (1000 units at 1 unit/ms); a
-    %% denied one leaves the bucket as refilled, full at the same time.
-    allow = ?M:route_rate_limit_check(Table, ?ROUTE_KEY, 1, cap(1, 1), cost(1), 1000),
-    ?assertMatch([{_, 0, 1000, 2000}], ets:lookup(Table, ?ROUTE_KEY)),
-    {deny, 1} = ?M:route_rate_limit_check(Table, ?ROUTE_KEY, 1, cap(1, 1), cost(1), 1400),
-    ?assertMatch([{_, 400, 1400, 2000}], ets:lookup(Table, ?ROUTE_KEY)).
-
-route_evict_drops_only_full_buckets_test() ->
-    Table = new_table(),
-    Other = {{~"/login", undefined, 1, 1, 1}, {10, 0, 0, 9}},
-    allow = ?M:route_rate_limit_check(Table, ?ROUTE_KEY, 1, cap(1, 1), cost(1), 1000),
-    allow = ?M:route_rate_limit_check(Table, Other, 1, cap(1, 1), cost(1), 1500),
-    %% Full at 2000 and 2500: at 2000 only the first is full again.
-    ?assertEqual(0, ?M:route_rate_limit_evict(Table, 1999)),
-    ?assertEqual(1, ?M:route_rate_limit_evict(Table, 2000)),
-    ?assertEqual([], ets:lookup(Table, ?ROUTE_KEY)),
-    ?assertMatch([_], ets:lookup(Table, Other)).
-
-%% --- route_rate_limit/2 ---
-
-route_rate_limit_test() ->
-    {ok, _} = application:ensure_all_started(telemetry),
-    Table = new_table(),
-    Counter = atomics:new(1, [{signed, false}]),
-    persistent_term:put({roadrunner_route_rate_limit, route_rl_test}, {Table, Counter}),
-    Limits = #{rate_limit => {1, cap(1, 60), cost(60), {~"/login", undefined, 1, 60, 1}}},
-    Req = #{listener_name => route_rl_test, peer => {?IP, 5000}},
-    try
-        ?assertEqual(allow, ?M:route_rate_limit(Limits, Req)),
-        ?assertEqual({deny, 60}, ?M:route_rate_limit(Limits, Req)),
-        ?assertEqual(1, atomics:get(Counter, 1)),
-        %% The bucket is the client's: one `real_ip` resolved has its own.
-        ?assertEqual(allow, ?M:route_rate_limit(Limits, Req#{client_ip => {10, 0, 0, 9}})),
-        %% No client address, no limit (as for the listener's).
-        ?assertEqual(allow, ?M:route_rate_limit(Limits, maps:remove(peer, Req))),
-        %% A route without a rate limit.
-        ?assertEqual(allow, ?M:route_rate_limit(#{max_content_length => 8}, Req)),
-        ?assertEqual(allow, ?M:route_rate_limit(undefined, Req))
-    after
-        persistent_term:erase({roadrunner_route_rate_limit, route_rl_test})
-    end.
-
 %% --- throttled_telemetry/3 ---
 
 telemetry_bumps_counter_test() ->
