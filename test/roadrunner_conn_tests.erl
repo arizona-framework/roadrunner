@@ -89,7 +89,7 @@ drain_oversized_body_caps_at_2x_max_test() ->
     %% exhaustion.
     Self = self(),
     Sink = spawn(fun() -> drain_sink_loop(Self, [{recv, binary:copy(<<"a">>, 30)}]) end),
-    ok = roadrunner_conn:drain_oversized_body(<<>>, {fake, Sink}, 10),
+    ok = roadrunner_conn:drain_oversized_body(<<>>, {fake, Sink}, chunked, 10),
     %% MaxCL=10 → cap=20. First recv returns 30 bytes (Read=30 >= 20)
     %% so the loop exits after exactly one call.
     Sink ! stop,
@@ -99,7 +99,7 @@ drain_oversized_body_stops_on_recv_error_test() ->
     %% Closed peer mid-drain → loop returns ok cleanly without
     %% propagating the error.
     Sink = spawn(fun() -> drain_sink_loop(undefined, [{error, closed}]) end),
-    ?assertEqual(ok, roadrunner_conn:drain_oversized_body(<<>>, {fake, Sink}, 10)),
+    ?assertEqual(ok, roadrunner_conn:drain_oversized_body(<<>>, {fake, Sink}, chunked, 10)),
     Sink ! stop.
 
 drain_oversized_body_counts_buffered_bytes_test() ->
@@ -107,9 +107,22 @@ drain_oversized_body_counts_buffered_bytes_test() ->
     %% body alone exceeds 2 * MaxCL, no recv call is needed.
     Self = self(),
     Sink = spawn(fun() -> drain_sink_loop(Self, []) end),
-    ok = roadrunner_conn:drain_oversized_body(binary:copy(<<"a">>, 50), {fake, Sink}, 10),
+    ok = roadrunner_conn:drain_oversized_body(
+        binary:copy(<<"a">>, 50), {fake, Sink}, {content_length, 100}, 10
+    ),
     Sink ! stop,
     ?assertEqual(0, drain_recv_calls(0)).
+
+drain_oversized_body_stops_at_the_declared_length_test() ->
+    %% A body declared 9 bytes long, over a cap of 8, ends at 9: once its
+    %% last bytes are in, there is no recv left to wait on.
+    Self = self(),
+    Sink = spawn(fun() -> drain_sink_loop(Self, [{recv, binary:copy(<<"a">>, 4)}]) end),
+    ok = roadrunner_conn:drain_oversized_body(
+        binary:copy(<<"a">>, 5), {fake, Sink}, {content_length, 9}, 8
+    ),
+    Sink ! stop,
+    ?assertEqual(1, drain_recv_calls(0)).
 
 drain_sink_loop(Reporter, Script) ->
     receive
