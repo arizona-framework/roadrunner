@@ -224,14 +224,7 @@ start(Socket, Req, Mod, State, ExtraHeaders, Buffered, ProtoOpts) ->
             UpgradeResp = roadrunner_http1:response(Status, RespHeaders, ~""),
             start_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts);
         {error, _} ->
-            _ = roadrunner_transport:send(
-                Socket,
-                roadrunner_http1:response(
-                    400,
-                    [{~"content-length", ~"0"}, {~"connection", ~"close"}],
-                    ~""
-                )
-            ),
+            _ = roadrunner_conn:send_bad_request(Socket),
             rejected
     end.
 
@@ -286,14 +279,7 @@ start_session(
         {error, _Reason} ->
             %% Couldn't start the session — the 101 was never on the
             %% wire, so we can fall back to 500 without a protocol leak.
-            _ = roadrunner_transport:send(
-                Socket,
-                roadrunner_http1:response(
-                    500,
-                    [{~"content-length", ~"0"}, {~"connection", ~"close"}],
-                    ~""
-                )
-            ),
+            _ = roadrunner_conn:send_internal_error(Socket),
             rejected
     end.
 

@@ -1425,7 +1425,9 @@ send_bad_request(Socket) ->
     send_status(Socket, 400).
 
 %% Send a bare status line (empty body, `Connection: close`) for a request
-%% rejected before any handler runs.
+%% rejected before any handler runs. Like every framework-built final
+%% response below, it carries `Date` (RFC 9110 §6.6.1: MUST on 2xx-4xx),
+%% through `roadrunner_http1:response/4` with no `Alt-Svc`.
 -doc false.
 -spec send_status(roadrunner_transport:socket(), roadrunner_http:status()) ->
     ok | {error, term()}.
@@ -1433,7 +1435,8 @@ send_status(Socket, Status) ->
     Resp = roadrunner_http1:response(
         Status,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
-        ~""
+        ~"",
+        undefined
     ),
     roadrunner_transport:send(Socket, Resp).
 
@@ -1479,7 +1482,8 @@ send_payload_too_large(Socket) ->
     Resp = roadrunner_http1:response(
         413,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
-        ~""
+        ~"",
+        undefined
     ),
     roadrunner_transport:send(Socket, Resp).
 
@@ -1492,7 +1496,8 @@ send_rate_limited(Socket, RetryAfterSecs) ->
             {~"connection", ~"close"},
             {~"retry-after", integer_to_binary(RetryAfterSecs)}
         ],
-        ~""
+        ~"",
+        undefined
     ),
     roadrunner_transport:send(Socket, Resp).
 
@@ -1502,7 +1507,8 @@ send_not_found(Socket) ->
     Resp = roadrunner_http1:response(
         404,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
-        ~""
+        ~"",
+        undefined
     ),
     roadrunner_transport:send(Socket, Resp).
 
@@ -1516,7 +1522,8 @@ send_method_not_allowed(Socket, Allowed) ->
             {~"content-length", ~"0"},
             {~"connection", ~"close"}
         ],
-        ~""
+        ~"",
+        undefined
     ),
     roadrunner_transport:send(Socket, Resp).
 
@@ -1526,7 +1533,8 @@ send_request_timeout(Socket) ->
     Resp = roadrunner_http1:response(
         408,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
-        ~""
+        ~"",
+        undefined
     ),
     roadrunner_transport:send(Socket, Resp).
 
@@ -1536,6 +1544,7 @@ send_internal_error(Socket) ->
     Resp = roadrunner_http1:response(
         500,
         [{~"content-length", ~"0"}, {~"connection", ~"close"}],
-        ~""
+        ~"",
+        undefined
     ),
     roadrunner_transport:send(Socket, Resp).

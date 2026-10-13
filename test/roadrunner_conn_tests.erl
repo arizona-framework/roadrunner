@@ -340,6 +340,39 @@ send_continue_writes_interim_response_test() ->
         ?assert(false)
     end.
 
+%% RFC 9110 §6.6.1: an origin server with a clock MUST send `Date` on
+%% 2xx-4xx responses. Every framework-built final response carries exactly
+%% one, like a handler's.
+framework_responses_carry_date_test_() ->
+    {spawn, fun() ->
+        Self = self(),
+        Sink = spawn(fun() -> continue_sink_loop(Self) end),
+        Socket = {fake, Sink},
+        Senders = [
+            fun() -> roadrunner_conn:send_bad_request(Socket) end,
+            fun() -> roadrunner_conn:send_status(Socket, 431) end,
+            fun() -> roadrunner_conn:send_payload_too_large(Socket) end,
+            fun() -> roadrunner_conn:send_rate_limited(Socket, 1) end,
+            fun() -> roadrunner_conn:send_not_found(Socket) end,
+            fun() -> roadrunner_conn:send_method_not_allowed(Socket, [~"GET"]) end,
+            fun() -> roadrunner_conn:send_request_timeout(Socket) end,
+            fun() -> roadrunner_conn:send_internal_error(Socket) end
+        ],
+        lists:foreach(
+            fun(Send) ->
+                ok = Send(),
+                receive
+                    {sent, Bytes} ->
+                        Lines = binary:split(iolist_to_binary(Bytes), ~"\r\n", [global]),
+                        ?assertEqual(1, length([L || <<"date: ", _/binary>> = L <- Lines]))
+                after 1000 -> error(no_send)
+                end
+            end,
+            Senders
+        ),
+        Sink ! stop
+    end}.
+
 continue_sink_loop(Reporter) ->
     receive
         stop ->
