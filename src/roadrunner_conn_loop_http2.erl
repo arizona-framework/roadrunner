@@ -2358,23 +2358,13 @@ throttle_stream(#loop{proto_opts = #{throttled_counter := Counter}}, ListenerNam
 %% missing peer IP proceeds.
 -spec rate_limit_refused(#loop{}, stream_id(), roadrunner_req:request()) ->
     ok | {refused, #loop{}}.
-rate_limit_refused(#loop{rate_limit = undefined}, _StreamId, _Req) ->
-    ok;
 rate_limit_refused(
-    #loop{
-        rate_limit = {Rate, Cap, Cost, Table, Counter, PeerIP},
-        listener_name = ListenerName
-    } = State,
-    StreamId,
-    Req
+    #loop{rate_limit = RateLimit, listener_name = ListenerName} = State, StreamId, Req
 ) ->
-    NowMs = erlang:monotonic_time(millisecond),
-    IP = roadrunner_conn:rate_limit_key(Req, PeerIP),
-    case roadrunner_conn:rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) of
+    case roadrunner_conn:rate_limit(RateLimit, Req, ListenerName) of
         allow ->
             ok;
         {deny, RetryAfter} ->
-            ok = roadrunner_conn:throttled_telemetry(ListenerName, Counter, rate_limit),
             State1 = encode_and_send_response_atomic(
                 State, StreamId, 429, [{~"retry-after", integer_to_binary(RetryAfter)}], ~"", 0
             ),

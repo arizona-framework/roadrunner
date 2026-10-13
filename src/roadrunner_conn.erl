@@ -75,7 +75,7 @@
     send_rate_limited/2,
     rate_limit_check/6,
     resolve_rate_limit/2,
-    rate_limit_key/2,
+    rate_limit/3,
     throttled_telemetry/3,
     rate_limit_evict_full/4,
     drain_oversized_body/3,
@@ -430,11 +430,29 @@ resolve_rate_limit(
 resolve_rate_limit(_ProtoOpts, _Peer) ->
     undefined.
 
-%% The rate-limit bucket key of one request: its resolved client IP's key
-%% (`roadrunner_rate_limit:client_key/1`) when the listener resolves one behind
-%% a trusted proxy (`real_ip`), else the peer's, baked into the connection's
-%% rate-limit state.
+%% The per-peer rate-limit gate every protocol runs before it dispatches a
+%% request: `allow`, or `{deny, RetryAfterSecs}` once the throttle is counted
+%% and its telemetry emitted, leaving the protocol to send its own 429. The
+%% guard being off (`undefined`, which also covers a connection with no peer
+%% IP) always allows. The bucket is the request's resolved client IP behind a
+%% trusted proxy (`real_ip`), else the peer's, baked into the state.
 -doc false.
+-spec rate_limit(rate_limit_state(), roadrunner_req:request(), atom()) ->
+    allow | {deny, pos_integer()}.
+rate_limit(undefined, _Req, _ListenerName) ->
+    allow;
+rate_limit({Rate, Cap, Cost, Table, Counter, PeerKey}, Req, ListenerName) ->
+    NowMs = erlang:monotonic_time(millisecond),
+    maybe
+        {deny, _} =
+            Deny ?=
+                rate_limit_check(Table, rate_limit_key(Req, PeerKey), Rate, Cap, Cost, NowMs),
+        ok = throttled_telemetry(ListenerName, Counter, rate_limit),
+        Deny
+    end.
+
+%% The bucket key of one request: its resolved client IP's key
+%% (`roadrunner_rate_limit:client_key/1`), else the peer's.
 -spec rate_limit_key(roadrunner_req:request(), inet:ip_address()) -> inet:ip_address().
 rate_limit_key(#{client_ip := IP}, _PeerKey) -> roadrunner_rate_limit:client_key(IP);
 rate_limit_key(_Req, PeerKey) -> PeerKey.
