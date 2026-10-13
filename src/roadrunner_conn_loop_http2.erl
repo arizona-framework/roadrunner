@@ -1359,20 +1359,28 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
             State
     end.
 
-%% A worker exited normally, so its response is complete: every frame is
-%% on the wire, unless flow control still holds part of a buffered body,
-%% which the worker hands over without waiting (`handle_send_response/6`).
-%% Then the stream stays, its worker fields cleared, until a window update
-%% drains the queue and `retire_drained/2` drops it. The stream is always
-%% still there: every path that drops a stream under a live worker
-%% demonitors that worker first (`reset_stream/2`).
+%% A worker exited normally. Its response is complete once our END_STREAM
+%% is on the wire (the send side is `closed`, see
+%% `close_stream_send_side/2`), or when flow control still holds part of a
+%% buffered body, which the worker hands over without waiting
+%% (`handle_send_response/6`): then the stream stays, its worker fields
+%% cleared, until a window update drains the queue and `retire_drained/2`
+%% drops it. Anything else is a response the worker left unfinished
+%% without crashing (a stream fun or loop handler calling `exit(normal)`,
+%% a loop worker stopped by `sys:terminate/2`), so the stream is reset
+%% with INTERNAL_ERROR, as for a crash, instead of left open with the
+%% client waiting for an end that never comes. The stream is always still
+%% there: every path that drops a stream under a live worker demonitors
+%% that worker first (`reset_stream/2`).
 -spec finish_stream(#loop{}, stream_id()) -> #loop{}.
 finish_stream(#loop{streams = Streams} = State, StreamId) ->
     #{StreamId := #{pending_sends := Pending} = Stream} = Streams,
-    case queue:is_empty(Pending) of
-        true ->
+    case {queue:is_empty(Pending), Stream} of
+        {true, #{state := closed}} ->
             remove_stream(State, StreamId);
-        false ->
+        {true, _} ->
+            abort_stream(State, StreamId, internal_error);
+        {false, _} ->
             update_stream(State, StreamId, Stream#{
                 worker_pid := undefined, worker_ref := undefined
             })

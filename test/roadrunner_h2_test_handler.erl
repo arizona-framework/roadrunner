@@ -209,6 +209,15 @@ handle(#{target := ~"/bad-body"} = Req) ->
 handle(#{target := ~"/stream/bad-fin"} = Req) ->
     %% The same for a stream's final chunk, after the 200 HEADERS.
     {{stream, 200, [], fun(Send) -> Send(not_iodata, fin) end}, Req};
+handle(#{target := ~"/stream/exit-normal"} = Req) ->
+    %% The stream fun leaves the response unfinished without crashing.
+    {
+        {stream, 200, [], fun(Send) ->
+            ok = Send(~"part", nofin),
+            exit(normal)
+        end},
+        Req
+    };
 handle(#{target := ~"/crash"} = _Req) ->
     error(boom);
 handle(#{target := ~"/badshape"} = Req) ->

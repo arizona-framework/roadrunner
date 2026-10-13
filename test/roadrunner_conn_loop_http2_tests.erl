@@ -64,6 +64,7 @@ all_test_() ->
         fun unsafe_response_header_returns_500/0,
         fun unsafe_trailer_resets_stream/0,
         fun non_iodata_body_resets_only_its_stream/0,
+        fun unfinished_response_on_normal_exit_resets_stream/0,
         fun middleware_chain_runs/0,
         fun rst_stream_cancels_active_stream/0,
         fun router_404_returns_not_found/0,
@@ -1254,6 +1255,18 @@ non_iodata_body_resets_only_its_stream() ->
     ?assertMatch([{headers, 1, false}, {other, 3, 1, false}], collect_response_frames()),
     ?assert(is_process_alive(Pid2)),
     cleanup(Pid2, Ref2).
+unfinished_response_on_normal_exit_resets_stream() ->
+    %% A worker that exits normally before its END_STREAM (here a stream
+    %% fun calling `exit(normal)` after one chunk) left the response
+    %% unfinished: the conn resets the stream (RST_STREAM, frame type 3)
+    %% rather than leave the client waiting on it, and survives.
+    {Pid, Ref} = run_stream_request(~"/stream/exit-normal"),
+    ?assertMatch(
+        [{headers, 1, false}, {data, 1, false, ~"part"}, {other, 3, 1, false}],
+        collect_response_frames()
+    ),
+    ?assert(is_process_alive(Pid)),
+    cleanup(Pid, Ref).
 
 middleware_chain_runs() ->
     %% Listener with a non-empty middleware list — exercises the
