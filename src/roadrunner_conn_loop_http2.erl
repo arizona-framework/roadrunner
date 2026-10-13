@@ -1144,7 +1144,12 @@ on_data(
             %% Flow control charges the full on-wire `FlowLen` (RFC 9113
             %% §6.9.1: pad-length byte + padding count). Past the window
             %% gates, the body cap and buffering use the stripped `Payload`
-            %% the handler will see, so its length is only needed there.
+            %% the handler will see, so its length is only needed there. A
+            %% frame we reject instead of buffering still counted against the
+            %% peer's connection window (§6.9), so its `FlowLen` goes straight
+            %% back, as for DATA on a closed stream; left uncounted on our side
+            %% it would never trigger a refill, and each rejection would shrink
+            %% the window the peer can send in for the life of the connection.
             ConnWindow = State#loop.conn_recv_window,
             if
                 FlowLen > ConnWindow ->
@@ -1157,12 +1162,12 @@ on_data(
                     %% More DATA than the stream-level window permits is a
                     %% stream-level FLOW_CONTROL_ERROR.
                     _ = send_rst_stream(State, StreamId, flow_control_error),
-                    frame_loop(reset_stream(State, StreamId));
+                    frame_loop(replenish_conn_window(reset_stream(State, StreamId), FlowLen));
                 true ->
                     PayloadLen = byte_size(Payload),
                     if
                         Len + PayloadLen > MaxCL ->
-                            reject_too_large(State, StreamId);
+                            reject_too_large(replenish_conn_window(State, FlowLen), StreamId);
                         true ->
                             EndStream = (Flags band 16#01) =/= 0,
                             Stream1 = Stream#{

@@ -134,6 +134,7 @@ all_test_() ->
         fun initial_window_size_change_overflows_flow_control_error/0,
         fun content_length_mismatch_rst_stream/0,
         fun oversized_body_413_then_rst/0,
+        fun stream_window_overflow_returns_conn_window/0,
         fun request_trailers_dispatched/0,
         fun request_trailers_via_continuation/0,
         fun awaiting_continuation_blocks_other_frames/0,
@@ -3441,6 +3442,29 @@ content_length_mismatch_rst_stream() ->
     ?assertMatch(<<_:24, 3, _/binary>>, Out),
     cleanup(Pid, Ref).
 
+stream_window_overflow_returns_conn_window() ->
+    %% DATA past the stream's receive window is a stream error (RFC 9113
+    %% §6.9.1), but the frame still counted against the connection window,
+    %% so its bytes go back with the RST_STREAM.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{http2_stream_window => 100}),
+    {H1, _} = indexed_get_headers(1, [], 16#04, roadrunner_http2_hpack:new_encoder(4096)),
+    serve_recv(ConnPid, H1),
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(roadrunner_http2_frame:encode({data, 1, 0, binary:copy(~"x", 101)}))
+    ),
+    Out = expect_send(),
+    {ok, {rst_stream, 1, flow_control_error}, Rest} = roadrunner_http2_frame:parse(Out, 16384),
+    WindowUpdate =
+        case Rest of
+            <<>> -> expect_send();
+            _ -> Rest
+        end,
+    ?assertMatch(
+        {ok, {window_update, 0, 101}, _}, roadrunner_http2_frame:parse(WindowUpdate, 16384)
+    ),
+    cleanup(Pid, Ref).
+
 oversized_body_413_then_rst() ->
     %% RFC 9113 §8.1: a request body over `max_content_length` is
     %% answered with a 413 from the conn before END_STREAM, then
@@ -3475,7 +3499,12 @@ oversized_body_413_then_rst() ->
         roadrunner_http2_frame:encode({data, 1, 0, ~"helloworld"})
     ),
     serve_recv(ConnPid, DataF),
-    %% Conn answers HEADERS+DATA (the 413), then RST_STREAM(no_error).
+    %% The rejected frame's 10 bytes go back to the connection window
+    %% (RFC 9113 §6.9) before the 413, so repeated rejections cannot starve
+    %% the connection. Then HEADERS+DATA (the 413) and RST_STREAM(no_error).
+    ?assertMatch(
+        {ok, {window_update, 0, 10}, <<>>}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
     Resp1 = expect_send(),
     Resp2 = drain_send(50),
     AllResponse =
