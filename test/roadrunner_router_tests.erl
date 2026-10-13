@@ -338,6 +338,22 @@ match_double_slash_collapses_to_single_test() ->
         match_no_pipeline(~"/users//42", Compiled)
     ).
 
+match_short_and_long_paths_split_alike_test() ->
+    %% Paths up to 32 bytes are split by a byte walk, longer ones by
+    %% `binary:split/3`; both drop the empty segments of `//` and a trailing
+    %% `/` the same way, on either side of the boundary.
+    Compiled = roadrunner_router:compile([{~"/a/:b/c/:d", h}], []),
+    X = binary:copy(~"x", 9),
+    Y = binary:copy(~"y", 9),
+    Short = <<"//a/", X/binary, "//c/", Y/binary, "/">>,
+    Exact = <<"//a/", X/binary, "//c/", Y/binary, "//////">>,
+    Long = <<Exact/binary, "/">>,
+    ?assertEqual({27, 32, 33}, {byte_size(Short), byte_size(Exact), byte_size(Long)}),
+    [
+        ?assertEqual({ok, h, #{~"b" => X, ~"d" => Y}, #{}}, match_no_pipeline(P, Compiled))
+     || P <- [Short, Exact, Long]
+    ].
+
 match_trailing_slash_treated_as_no_slash_test() ->
     Compiled = roadrunner_router:compile([{~"/about", about_handler}], []),
     ?assertEqual(
