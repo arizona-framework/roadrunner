@@ -152,6 +152,10 @@
     %% flight across all spaces by the congestion window, grown on ACK and halved
     %% on loss.
     cc :: roadrunner_quic_cc_newreno:t(),
+    %% Probe datagrams a probe timeout queued that the send pass after it lets
+    %% past the congestion window (RFC 9002 §7.5: probes MUST NOT be blocked
+    %% by the congestion controller); zero outside that pass.
+    probes = 0 :: non_neg_integer(),
     %% The client's advertised transport parameters, captured from the
     %% ClientHello. The send windows (connection and per-stream) are seeded from
     %% these so the server never sends past what the peer granted (RFC 9000 §4.1);
@@ -1421,15 +1425,16 @@ drain_send(Now, Levels, State, Acc) ->
         none ->
             {State, Acc};
         {Entries, Built} ->
-            #state{peer_scid = DCID, scid = SCID, amp = Amp, cc = Cc} = State,
+            #state{peer_scid = DCID, scid = SCID, amp = Amp, cc = Cc, probes = Probes} = State,
             {Datagram, Sent} = roadrunner_quic_send:datagram(Entries, DCID, SCID),
             %% Gate ack-eliciting datagrams on the congestion window (RFC 9002
             %% §7); ACK-only datagrams are not congestion-controlled and always
-            %% pass. On a block, return the pre-build State so the consumed ACK /
-            %% stream slice stays pending for the next pass.
+            %% pass, and so do the probes a probe timeout queued (§7.5). On a
+            %% block, return the pre-build State so the consumed ACK / stream
+            %% slice stays pending for the next pass.
             AckEliciting = lists:any(fun(#{ack_eliciting := Elicit}) -> Elicit end, Sent),
             CcOk =
-                not AckEliciting orelse
+                not AckEliciting orelse Probes > 0 orelse
                     roadrunner_quic_cc_newreno:can_send(total_bytes_in_flight(State), Cc),
             case roadrunner_quic_amp:can_send(byte_size(Datagram), Amp) andalso CcOk of
                 false ->
@@ -1437,7 +1442,17 @@ drain_send(Now, Levels, State, Acc) ->
                 true ->
                     Recorded = record_sent(Now, Sent, Built),
                     Amp1 = roadrunner_quic_amp:sent(byte_size(Datagram), Amp),
-                    drain_send(Now, Levels, Recorded#state{amp = Amp1}, [{send, Datagram} | Acc])
+                    Probes1 =
+                        case AckEliciting of
+                            true -> max(0, Probes - 1);
+                            false -> Probes
+                        end,
+                    drain_send(
+                        Now,
+                        Levels,
+                        Recorded#state{amp = Amp1, probes = Probes1},
+                        [{send, Datagram} | Acc]
+                    )
             end
     end.
 
@@ -1630,14 +1645,16 @@ record_one_sent(
 Handle a fired timer. A probe timeout (`pto`) re-runs loss detection on every
 space (queueing any lost frames to retransmit), backs off the probe timeout
 (so a probe that detects no loss re-arms strictly later, guaranteeing forward
-progress), then runs a send pass. An idle timeout (`idle`) silently closes the
-connection (RFC 9000 §10.1, no CONNECTION_CLOSE) and surfaces the terminal
-`{closed, _}` event to the owner.
+progress), queues a probe in every space with packets in flight, then runs a
+send pass that lets the probes past the congestion window. An idle timeout
+(`idle`) silently closes the connection (RFC 9000 §10.1, no CONNECTION_CLOSE)
+and surfaces the terminal `{closed, _}` event to the owner.
 """.
 -spec handle_timeout(integer(), atom(), t()) -> {t(), [effect()]}.
 handle_timeout(Now, pto, State) ->
     State1 = lists:foldl(fun(Level, S) -> on_pto(Now, Level, S) end, State, present_levels(State)),
-    send_pass(Now, State1);
+    {State2, Effects} = send_pass(Now, State1),
+    {State2#state{probes = 0}, Effects};
 handle_timeout(_Now, idle, State) ->
     %% Release any parked send reply before the shell tears down, so a parked
     %% worker unblocks and runs its disconnect path cleanly rather than only
@@ -1654,19 +1671,25 @@ handle_timeout(_Now, drain, State) ->
 
 %% On a probe timeout: queue any time-threshold losses to retransmit and
 %% increment the space's probe-timeout backoff (RFC 9002 §6.2.1), so the
-%% next deadline is strictly later. Sending an explicit probe when nothing
-%% is detected as lost is deferred with congestion control (it needs the
-%% loss layer to surface the oldest unacknowledged frames).
+%% next deadline is strictly later. A space with packets in flight then MUST
+%% send an ack-eliciting probe (RFC 9002 §6.2.4): loss detection only counts
+%% a packet older than one the peer acknowledged, so the last packets of a
+%% flight, if lost, are found only through the ACK a probe draws. The probe
+%% is what was just found lost, else a PING.
 -spec on_pto(integer(), level(), t()) -> t().
-on_pto(Now, Level, State) ->
+on_pto(Now, Level, #state{probes = Probes} = State) ->
     #space{loss = Loss0, pending = Pending} = Space = space(Level, State),
     {Loss1, Lost} = roadrunner_quic_loss:detect_lost(Now, Loss0),
     Loss2 = roadrunner_quic_loss:on_pto_expired(Loss1),
-    put_space(
-        Level,
-        Space#space{loss = Loss2, pending = lists:reverse(retransmittable(Lost), Pending)},
-        State
-    ).
+    Space1 = Space#space{loss = Loss2, pending = lists:reverse(retransmittable(Lost), Pending)},
+    case roadrunner_quic_loss:bytes_in_flight(Loss0) of
+        0 -> put_space(Level, Space1, State);
+        _ -> put_space(Level, probe(Space1), State#state{probes = Probes + 1})
+    end.
+
+-spec probe(#space{}) -> #space{}.
+probe(#space{pending = []} = Space) -> Space#space{pending = [ping]};
+probe(Space) -> Space.
 
 %% Arm ONE timer at the nearest deadline: the earliest per-space probe timeout
 %% (across spaces with ack-eliciting bytes in flight) or the always-present

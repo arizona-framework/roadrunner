@@ -344,6 +344,60 @@ pto_backoff_advances_deadline_test() ->
     {_State3, Effects2} = ?M:handle_timeout(?NOW, pto, State2),
     ?assert(arm_deadline(Effects2) > arm_deadline(Effects1)).
 
+pto_sends_a_probe_test() ->
+    %% RFC 9002 §6.2.4: a probe timeout sends an ack-eliciting probe. Loss
+    %% detection only counts a packet older than one the peer acknowledged, so
+    %% with nothing acknowledged it finds no loss to resend, and only a probe
+    %% gets the flight acknowledged.
+    {State, _ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, _} = ?M:handle_send(self(), make_ref(), 0, ~"tail", true, ?NOW, State),
+    {_State2, Effects} = ?M:handle_timeout(?NOW + 5000, pto, State1),
+    ?assert(
+        lists:any(
+            fun roadrunner_quic_send:is_ack_eliciting/1, sent_app_frames(Effects, ServerApSecret)
+        )
+    ).
+
+pto_probe_passes_a_full_congestion_window_test() ->
+    %% Probes MUST NOT be blocked by the congestion controller (RFC 9002
+    %% §7.5): with the window full of unacknowledged data, the probe still
+    %% goes out.
+    {State, _ClientApSecret, ServerApSecret} = connect_owned(),
+    Payload = binary:copy(~"x", 100000),
+    {State1, _} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
+    {_State2, Effects} = ?M:handle_timeout(?NOW + 5000, pto, State1),
+    ?assertNotEqual([], sends(Effects)),
+    ?assert(
+        lists:any(
+            fun roadrunner_quic_send:is_ack_eliciting/1, sent_app_frames(Effects, ServerApSecret)
+        )
+    ).
+
+pto_probe_resends_what_it_finds_lost_test() ->
+    %% With a later packet acknowledged, the probe timeout finds the older one
+    %% lost on time: the resent data is the probe, with no PING added.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Payload = binary:copy(~"x", 2000),
+    {State1, Sent} = ?M:handle_send(self(), make_ref(), 0, Payload, true, ?NOW, State),
+    Largest = largest_app_pn(Sent, ServerApSecret),
+    Ack = app_datagram([{ack, Largest, 0, 0, [], undefined}], 0, ClientApSecret),
+    {State2, _} = ?M:handle_datagram(?NOW, Ack, State1),
+    {_State3, Effects} = ?M:handle_timeout(?NOW + 5000, pto, State2),
+    Frames = sent_app_frames(Effects, ServerApSecret),
+    ?assertMatch([{stream, 0, 0, _, false} | _], [F || {stream, _, _, _, _} = F <- Frames]),
+    ?assertNot(lists:member(ping, Frames)).
+
+pto_probe_ack_recovers_a_lost_tail_test() ->
+    %% The last packet of a response is lost. The probe draws an ACK of the
+    %% probe alone, which shows the older packet lost, and it is sent again.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, _} = ?M:handle_send(self(), make_ref(), 0, ~"tail", true, ?NOW, State),
+    {State2, Probe} = ?M:handle_timeout(?NOW + 5000, pto, State1),
+    ProbePN = largest_app_pn(Probe, ServerApSecret),
+    Ack = app_datagram([{ack, ProbePN, 0, 0, [], undefined}], 0, ClientApSecret),
+    {_State3, Effects} = ?M:handle_datagram(?NOW + 5010, Ack, State2),
+    ?assertEqual([{stream, 0, 0, ~"tail", true}], sent_stream_frames(Effects, ServerApSecret)).
+
 amplification_limit_caps_first_flight_test() ->
     %% A large certificate chain makes the server flight exceed 3x the
     %% client's 1200-byte Initial, so the send pass stops before sending it
