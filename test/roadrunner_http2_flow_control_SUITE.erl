@@ -39,7 +39,8 @@ reuse / scheduling races.
     blocked_send_recv_error_exits_clean/1,
     blocked_send_garbage_frame_triggers_goaway/1,
     blocked_send_peer_closes_exits_clean/1,
-    blocked_send_idle_timeout_emits_goaway/1
+    blocked_send_idle_timeout_emits_goaway/1,
+    stream_window_update_overflow_with_live_worker_keeps_conn/1
 ]).
 
 -define(PREFACE, ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
@@ -69,7 +70,8 @@ all() ->
         blocked_send_recv_error_exits_clean,
         blocked_send_garbage_frame_triggers_goaway,
         blocked_send_peer_closes_exits_clean,
-        blocked_send_idle_timeout_emits_goaway
+        blocked_send_idle_timeout_emits_goaway,
+        stream_window_update_overflow_with_live_worker_keeps_conn
     ].
 
 init_per_testcase(_Case, Config) ->
@@ -383,6 +385,40 @@ blocked_send_idle_timeout_emits_goaway(_Config) ->
         persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
     end.
 
+stream_window_update_overflow_with_live_worker_keeps_conn(_Config) ->
+    %% A stream-level WINDOW_UPDATE overflow resets one stream (RFC 9113
+    %% §6.9.1) while its streaming worker is between sends. The worker is
+    %% told the stream is gone and unwinds; the conn and its other
+    %% streams carry on, and the worker's in-flight slot comes back once.
+    Inflight = counters:new(1, []),
+    {Pid, Ref, ConnPid} = start_conn(roadrunner_h2_test_handler, #{
+        max_concurrent_requests => 10, inflight_counter => Inflight
+    }),
+    handshake(ConnPid),
+    HpackBin = encode_request_headers(~"GET", ~"/stream/slow"),
+    serve_recv(ConnPid, encode_frame({headers, 1, 16#04 bor 16#01, undefined, HpackBin})),
+    %% HEADERS, then the first chunk: the worker is now sleeping before
+    %% its second send.
+    expect_send_type(1),
+    expect_send_type(0),
+    [Worker] = [
+        P
+     || P <- processes(),
+        proc_lib:get_label(P) =:= {roadrunner_http2_stream_worker, 1},
+        monitors(P, ConnPid)
+    ],
+    WorkerRef = monitor(process, Worker),
+    serve_recv(ConnPid, encode_frame({window_update, 1, 16#7FFFFFFF})),
+    expect_send_type(3),
+    receive
+        {'DOWN', WorkerRef, process, Worker, stream_reset} -> ok
+    after 1000 -> ct:fail(worker_not_reset)
+    end,
+    serve_recv(ConnPid, encode_frame({ping, 0, <<1:64>>})),
+    expect_send_ack(6),
+    0 = counters:get(Inflight, 1),
+    cleanup(Pid, Ref).
+
 %% =============================================================================
 %% Helpers
 %% =============================================================================
@@ -536,4 +572,12 @@ drain_setopts() ->
     receive
         {roadrunner_fake_setopts, _, _} -> drain_setopts()
     after 0 -> ok
+    end.
+
+%% Whether `Pid` (if still alive) monitors `Target`; tells this case's
+%% stream worker apart from a worker another case left behind.
+monitors(Pid, Target) ->
+    case process_info(Pid, monitors) of
+        {monitors, Monitors} -> lists:member({process, Target}, Monitors);
+        undefined -> false
     end.
