@@ -623,6 +623,48 @@ compile_rejects_non_binary_methods_test() ->
         roadrunner_router:compile([#{path => ~"/x", handler => h, methods => [get, post]}], [])
     ).
 
+compile_rejects_invalid_max_content_length_test_() ->
+    %% A route's body cap is a byte count, like the listener's.
+    [
+        ?_assertError(
+            {invalid_route_max_content_length, Bad},
+            roadrunner_router:compile(
+                [#{path => ~"/x", handler => h, max_content_length => Bad}], []
+            )
+        )
+     || Bad <- [-1, 1.5, ~"10", infinity]
+    ].
+
+resolve_carries_the_route_limits_test() ->
+    %% `resolve/3` is `match/3` plus the matched route's limits: what it sets,
+    %% or `undefined` for every route form that sets none.
+    Compiled = roadrunner_router:compile(
+        [
+            #{path => ~"/upload", handler => up, max_content_length => 0},
+            #{path => ~"/map", handler => map_h},
+            {~"/pair", pair_h},
+            {~"/triple", triple_h, st}
+        ],
+        []
+    ),
+    ?assertMatch(
+        {ok, up, #{}, _, _, #{max_content_length := 0}},
+        roadrunner_router:resolve(~"POST", ~"/upload", Compiled)
+    ),
+    ?assertMatch(
+        {ok, map_h, #{}, _, _, undefined}, roadrunner_router:resolve(~"GET", ~"/map", Compiled)
+    ),
+    ?assertMatch(
+        {ok, pair_h, #{}, _, _, undefined}, roadrunner_router:resolve(~"GET", ~"/pair", Compiled)
+    ),
+    ?assertMatch(
+        {ok, triple_h, #{}, _, st, undefined},
+        roadrunner_router:resolve(~"GET", ~"/triple", Compiled)
+    ),
+    ?assertEqual(not_found, roadrunner_router:resolve(~"GET", ~"/none", Compiled)),
+    %% `match/3` keeps its shape: no limits.
+    ?assertMatch({ok, up, #{}, _, _}, roadrunner_router:match(~"POST", ~"/upload", Compiled)).
+
 compile_rejects_method_specific_route_below_an_all_methods_one_test() ->
     %% An all-methods route short-circuits every method on its path, so a later
     %% same-path method-specific route never gets a request.
@@ -1046,6 +1088,12 @@ validate_reports_bad_methods_test() ->
     ?assertEqual(
         {error, {invalid_route_methods, []}},
         roadrunner_router:validate([#{path => ~"/x", handler => h, methods => []}])
+    ).
+
+validate_reports_a_bad_max_content_length_test() ->
+    ?assertEqual(
+        {error, {invalid_route_max_content_length, -1}},
+        roadrunner_router:validate([#{path => ~"/x", handler => h, max_content_length => -1}])
     ).
 
 validate_reports_a_non_binary_path_test() ->

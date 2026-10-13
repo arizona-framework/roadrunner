@@ -183,6 +183,9 @@
     %% validate against the request's `content-length` header at
     %% END_STREAM (RFC 9113 §8.1.2.6).
     body_len := non_neg_integer(),
+    %% The body cap: the listener's `max_content_length` until a body
+    %% outgrows it and its route raises it (`stream_body_cap/4`).
+    body_cap := non_neg_integer(),
     send_window := integer(),
     recv_window := non_neg_integer(),
     worker_pid := undefined | pid(),
@@ -851,7 +854,8 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
         EndHeaders,
         EndStream,
         State#loop.peer_initial_window,
-        State#loop.stream_recv_window_peak
+        State#loop.stream_recv_window_peak,
+        State#loop.max_content_length
     ),
     State1 = State#loop{
         streams = (State#loop.streams)#{StreamId => Stream},
@@ -886,7 +890,8 @@ refuse_new_stream(StreamId, Flags, Fragment, Code, State) ->
         EndHeaders,
         (Flags band 16#01) =/= 0,
         State#loop.peer_initial_window,
-        State#loop.stream_recv_window_peak
+        State#loop.stream_recv_window_peak,
+        State#loop.max_content_length
     ),
     State1 = State#loop{
         streams = (State#loop.streams)#{StreamId => Stream#{counted := false, refused => Code}},
@@ -929,7 +934,7 @@ reset_refused(StreamId, Fragment, Code, #loop{hpack_dec = Dec} = State) ->
 decode_error_code(bad_header_name) -> protocol_error;
 decode_error_code(_) -> compression_error.
 
-new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow) ->
+new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow, BodyCap) ->
     #{
         state => open,
         counted => true,
@@ -940,6 +945,7 @@ new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow) ->
         headers => undefined,
         body => [],
         body_len => 0,
+        body_cap => BodyCap,
         send_window => SendWindow,
         recv_window => RecvWindow,
         worker_pid => undefined,
@@ -1084,7 +1090,7 @@ finalize_headers(
 %% §10.1.1: one that expects `100-continue` (HTTP/2 being "HTTP/1.1 or
 %% later") gets an immediate answer instead of leaving the client to time
 %% out its wait: a 413 when its declared `content-length` is already over
-%% `max_content_length`, the status its body would earn anyway, else the
+%% its route's body cap, the status its body would earn anyway, else the
 %% interim 100 that asks for the body.
 -spec await_body(stream_id(), roadrunner_http:headers(), #loop{}) -> no_return().
 await_body(StreamId, Headers, #loop{max_content_length = MaxCL} = State) ->
@@ -1094,9 +1100,16 @@ await_body(StreamId, Headers, #loop{max_content_length = MaxCL} = State) ->
                 roadrunner_bin:ascii_lowercase(Expect) =:= ~"100-continue" andalso
                     roadrunner_http:request_content_length(Headers)
             of
-                {ok, Declared} when Declared > MaxCL -> reject_too_large(State, StreamId);
-                false -> frame_loop(State);
-                _ -> frame_loop(send_continue(State, StreamId))
+                {ok, Declared} ->
+                    #loop{proto_opts = #{dispatch := Dispatch}} = State,
+                    case Declared > roadrunner_conn:route_body_cap(Dispatch, Headers, MaxCL) of
+                        true -> reject_too_large(State, StreamId);
+                        false -> frame_loop(send_continue(State, StreamId))
+                    end;
+                false ->
+                    frame_loop(State);
+                _ ->
+                    frame_loop(send_continue(State, StreamId))
             end;
         false ->
             frame_loop(State)
@@ -1110,7 +1123,7 @@ send_continue(#loop{hpack_enc = Enc} = State, StreamId) ->
     _ = send(State, roadrunner_http2_frame:encode({headers, StreamId, 16#04, undefined, Block})),
     State#loop{hpack_enc = Enc1}.
 
-%% RFC 9113 §8.1: the request body is over `max_content_length`. Answer 413
+%% RFC 9113 §8.1: the request body is over its cap. Answer 413
 %% before the full request, then RST_STREAM(NO_ERROR) to ask the client to
 %% stop sending the rest, and drop the stream (no worker was dispatched,
 %% dispatch is at END_STREAM).
@@ -1138,13 +1151,17 @@ on_data(StreamId, _Flags, _Payload, FlowLen, #loop{streams = Streams} = State) w
     %% discarding them, so the conn window doesn't drift down across resets.
     _ = send_rst_stream(State, StreamId, stream_closed),
     frame_loop(replenish_conn_window(State, FlowLen));
-on_data(
-    StreamId, Flags, Payload, FlowLen, #loop{streams = Streams, max_content_length = MaxCL} = State
-) ->
+on_data(StreamId, Flags, Payload, FlowLen, #loop{streams = Streams} = State) ->
     case Streams of
         #{
             StreamId :=
-                #{state := open, body := Body, body_len := Len, recv_window := RW} = Stream
+                #{
+                    state := open,
+                    body := Body,
+                    body_len := Len,
+                    body_cap := Cap,
+                    recv_window := RW
+                } = Stream
         } ->
             %% Flow control charges the full on-wire `FlowLen` (RFC 9113
             %% §6.9.1: pad-length byte + padding count). Past the window
@@ -1169,15 +1186,16 @@ on_data(
                     _ = send_rst_stream(State, StreamId, flow_control_error),
                     frame_loop(replenish_conn_window(reset_stream(State, StreamId), FlowLen));
                 true ->
-                    PayloadLen = byte_size(Payload),
-                    if
-                        Len + PayloadLen > MaxCL ->
+                    NewLen = Len + byte_size(Payload),
+                    case stream_body_cap(NewLen, Cap, Stream, State) of
+                        BodyCap when NewLen > BodyCap ->
                             reject_too_large(replenish_conn_window(State, FlowLen), StreamId);
-                        true ->
+                        BodyCap ->
                             EndStream = (Flags band 16#01) =/= 0,
                             Stream1 = Stream#{
                                 body := [Body, Payload],
-                                body_len := Len + PayloadLen,
+                                body_len := NewLen,
+                                body_cap := BodyCap,
                                 end_stream_seen := EndStream,
                                 recv_window := RW - FlowLen
                             },
@@ -1203,6 +1221,22 @@ on_data(
             _ = send_rst_stream(State, StreamId, stream_closed),
             frame_loop(replenish_conn_window(reset_stream(State, StreamId), FlowLen))
     end.
+
+%% The cap a DATA frame that takes the body to `NewLen` bytes is held to:
+%% the stream's own `Cap` while the body fits in it, else its route's,
+%% looked up only once a body outgrows the cap it has (the listener's, at
+%% first) and kept on the stream from then on.
+-spec stream_body_cap(non_neg_integer(), non_neg_integer(), map(), #loop{}) ->
+    non_neg_integer().
+stream_body_cap(NewLen, Cap, _Stream, _State) when NewLen =< Cap ->
+    Cap;
+stream_body_cap(
+    _NewLen,
+    _Cap,
+    #{headers := Headers},
+    #loop{proto_opts = #{dispatch := Dispatch}, max_content_length = MaxCL}
+) ->
+    roadrunner_conn:route_body_cap(Dispatch, Headers, MaxCL).
 
 %% Return `N` bytes of connection-level receive window to the peer after
 %% discarding a DATA payload on a closed / reset stream (RFC 9113

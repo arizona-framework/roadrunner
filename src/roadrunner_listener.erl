@@ -121,7 +121,8 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `middlewares` — listener-wide pipeline applied to every request.
 - `max_content_length` — request-body cap across HTTP/1.1, HTTP/2, and
   HTTP/3; an over-cap body answers `413 Payload Too Large` (and resets
-  the stream on h2/h3). Default 10 MB.
+  the stream on h2/h3). Default 10 MB. A route can set its own, larger or
+  smaller (`t:roadrunner_router:route/0`).
 - `ws` — WebSocket session tunables as a nested map (see
   `t:ws_opts/0`): `max_frame_size` (per-frame payload cap) and
   `max_message_size` (reassembled + decompressed message cap), both

@@ -9,14 +9,17 @@ The connection-error codes asserted here are RFC 9114 §8.1 values:
 """.
 -include_lib("eunit/include/eunit.hrl").
 
-new() ->
-    roadrunner_conn_loop_http3:new_request_stream().
+%% A single-handler listener: no route can raise a stream's body cap.
+-define(HANDLER, #{dispatch => {handler, some_mod, fun some_mod:handle/1, undefined}}).
+
+new(MaxLen) ->
+    roadrunner_conn_loop_http3:new_request_stream(MaxLen).
 
 decode(Buf, MaxLen) ->
-    roadrunner_conn_loop_http3:decode_request_frames(Buf, new(), MaxLen).
+    roadrunner_conn_loop_http3:decode_request_frames(Buf, new(MaxLen), ?HANDLER).
 
 decode(Buf, MaxLen, MaxHdrBlock) ->
-    roadrunner_conn_loop_http3:decode_request_frames(Buf, new(), MaxLen, MaxHdrBlock).
+    roadrunner_conn_loop_http3:decode_request_frames(Buf, new(MaxLen), ?HANDLER, MaxHdrBlock).
 
 %% A HEADERS frame wrapping an arbitrary field block (the block is only
 %% QPACK-decoded later, in the conn loop's dispatch, not here). The native
@@ -33,9 +36,10 @@ new_request_stream_test() ->
             headers => undefined,
             body => [],
             body_len => 0,
+            body_cap => 8,
             frame_state => expecting_headers
         },
-        new()
+        new(8)
     ).
 
 headers_first_test() ->
@@ -123,3 +127,87 @@ configured_max_header_block_dribbled_test() ->
     Frame = hf(binary:copy(<<"x">>, 1000)),
     Partial = binary:part(Frame, 0, 400),
     ?assertEqual(headers_too_large, decode(Partial, 1000000, 200)).
+
+%% --- a route's own body cap ---
+
+%% A body past the listener's cap (8 here) asks its route, which may set a
+%% larger one; `/up` sets 64, `/plain` none.
+route_cap_test_() ->
+    {setup,
+        fun() ->
+            persistent_term:put(
+                {roadrunner_routes, h3_route_cap},
+                roadrunner_router:compile(
+                    [
+                        #{path => ~"/up", handler => up, max_content_length => 64},
+                        {~"/plain", plain}
+                    ],
+                    []
+                )
+            )
+        end,
+        fun(_) -> persistent_term:erase({roadrunner_routes, h3_route_cap}) end, [
+            fun raises_to_route_cap/0,
+            fun route_cap_still_too_small/0,
+            fun route_without_cap/0,
+            fun undecodable_block_on_raise/0,
+            fun raises_with_decoded_headers/0
+        ]}.
+
+-define(ROUTER, #{dispatch => {router, h3_route_cap}}).
+
+req_block(Path) ->
+    iolist_to_binary(
+        roadrunner_qpack:encode([
+            {~":method", ~"POST"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", Path}
+        ])
+    ).
+
+raises_to_route_cap() ->
+    %% HEADERS and the over-cap DATA in one chunk: the field section is
+    %% decoded for the route and kept for dispatch.
+    Buf = <<(hf(req_block(~"/up")))/binary, (df(binary:copy(~"x", 20)))/binary>>,
+    {ok, Stream} = roadrunner_conn_loop_http3:decode_request_frames(Buf, new(8), ?ROUTER),
+    ?assertMatch(#{body_len := 20, body_cap := 64, headers := [_ | _]}, Stream).
+
+route_cap_still_too_small() ->
+    Buf = <<(hf(req_block(~"/up")))/binary, (df(binary:copy(~"x", 65)))/binary>>,
+    ?assertEqual(
+        too_large, roadrunner_conn_loop_http3:decode_request_frames(Buf, new(8), ?ROUTER)
+    ).
+
+route_without_cap() ->
+    Buf = <<(hf(req_block(~"/plain")))/binary, (df(binary:copy(~"x", 9)))/binary>>,
+    ?assertEqual(
+        too_large, roadrunner_conn_loop_http3:decode_request_frames(Buf, new(8), ?ROUTER)
+    ).
+
+undecodable_block_on_raise() ->
+    %% The field section has to decode to be routed; one that does not is
+    %% the connection error it would be at dispatch (H3_QPACK_DECOMPRESSION_FAILED).
+    Buf = <<(hf(~"blk"))/binary, (df(binary:copy(~"x", 9)))/binary>>,
+    ?assertMatch(
+        {conn_error, 16#0200, _},
+        roadrunner_conn_loop_http3:decode_request_frames(Buf, new(8), ?ROUTER)
+    ).
+
+raises_with_decoded_headers() ->
+    %% Headers decoded earlier (on their own chunk) are used as they are: the
+    %% raw block is not decoded again. Past the raised cap, the route is asked
+    %% again and the body refused.
+    Decoded = (new(8))#{
+        header_block := ~"not qpack",
+        headers := [{~":method", ~"POST"}, {~":path", ~"/up"}],
+        frame_state := expecting_data
+    },
+    {ok, Raised} = roadrunner_conn_loop_http3:decode_request_frames(
+        df(binary:copy(~"x", 60)), Decoded, ?ROUTER
+    ),
+    ?assertMatch(#{body_len := 60, body_cap := 64}, Raised),
+    ?assertEqual(
+        too_large,
+        roadrunner_conn_loop_http3:decode_request_frames(df(~"12345"), Raised, ?ROUTER)
+    ).

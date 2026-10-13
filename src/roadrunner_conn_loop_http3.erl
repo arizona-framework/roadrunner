@@ -54,7 +54,7 @@
 %% and the pure peer-uni-stream state machine; not part of any public
 %% surface.
 -export([
-    decode_request_frames/3, decode_request_frames/4, new_request_stream/0, uni_event/4, uni_reset/1
+    decode_request_frames/3, decode_request_frames/4, new_request_stream/1, uni_event/4, uni_reset/1
 ]).
 
 %% RFC 9114 §8.1 / RFC 9204 §8.3 error codes.
@@ -369,9 +369,13 @@ handle_request_stream(#h3{goaway_id = GoawayId} = State, StreamId, _Data, _Fin) 
     %% will not be processed — reject it with H3_REQUEST_REJECTED.
     reset_and_drop(State, StreamId, ?H3_REQUEST_REJECTED);
 handle_request_stream(State0, StreamId, Data, Fin) ->
-    #h3{streams = Streams, max_content_length = MaxLen, max_header_block = MaxHdrBlock} =
+    #h3{streams = Streams, proto_opts = ProtoOpts, max_header_block = MaxHdrBlock} =
         State = note_request_id(State0, StreamId),
-    Stream0 = maps:get(StreamId, Streams, new_request_stream()),
+    Stream0 =
+        case Streams of
+            #{StreamId := Stream} -> Stream;
+            _ -> new_request_stream(State#h3.max_content_length)
+        end,
     case Stream0 of
         #{frame_state := discarding} ->
             %% The stream was already answered (413). Residual in-flight
@@ -386,7 +390,9 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
             end;
         #{buf := Buf0} ->
             case
-                decode_request_frames(<<Buf0/binary, Data/binary>>, Stream0, MaxLen, MaxHdrBlock)
+                decode_request_frames(
+                    <<Buf0/binary, Data/binary>>, Stream0, ProtoOpts, MaxHdrBlock
+                )
             of
                 {ok, Stream1} ->
                     State1 = State#h3{streams = Streams#{StreamId => Stream1}},
@@ -425,10 +431,15 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
 %% request expecting `100-continue` gets the immediate answer RFC 9110
 %% §10.1.1 requires (HTTP/3 being "HTTP/1.1 or later") instead of leaving
 %% the client to time out its wait. It is decoded once either way: the
-%% stream keeps the headers for dispatch.
+%% stream keeps the headers for dispatch. A body that already outgrew the
+%% listener's cap in the same chunk had them decoded for its route
+%% (`raise_body_cap/4`).
 -spec await_body(#h3{}, non_neg_integer(), map(), map()) -> handle_result().
 await_body(
-    State, StreamId, #{header_block := undefined} = Stream0, #{header_block := Block} = Stream1
+    State,
+    StreamId,
+    #{header_block := undefined} = Stream0,
+    #{header_block := Block, headers := undefined} = Stream1
 ) when
     is_binary(Block)
 ->
@@ -440,37 +451,51 @@ await_body(
             State1 = State#h3{streams = Streams#{StreamId := Stream1#{headers := Headers}}},
             answer_expectation(State1, StreamId, Stream0, Headers)
     end;
+await_body(State, StreamId, #{header_block := undefined} = Stream0, #{headers := Headers}) when
+    is_list(Headers)
+->
+    answer_expectation(State, StreamId, Stream0, Headers);
 await_body(State, _StreamId, _Stream0, _Stream1) ->
     State.
 
 %% RFC 9110 §10.1.1: a 413 when the declared `content-length` is already
-%% over `max_content_length`, the status the body would earn anyway, else
+%% over its route's body cap, the status the body would earn anyway, else
 %% the interim 100 (a HEADERS frame with `:status` alone, no FIN) that asks
 %% for the body. A request expecting nothing waits for its body as before.
 -spec answer_expectation(#h3{}, non_neg_integer(), map(), roadrunner_http:headers()) -> #h3{}.
-answer_expectation(#h3{max_content_length = MaxLen} = State, StreamId, Stream0, Headers) ->
+answer_expectation(State, StreamId, Stream0, Headers) ->
     case lists:keyfind(~"expect", 1, Headers) of
         {_, Expect} ->
             case
                 roadrunner_bin:ascii_lowercase(Expect) =:= ~"100-continue" andalso
                     roadrunner_http:request_content_length(Headers)
             of
-                {ok, Declared} when Declared > MaxLen ->
-                    refuse_too_large(State, StreamId, Stream0);
+                {ok, Declared} ->
+                    #h3{proto_opts = #{dispatch := Dispatch}, max_content_length = MaxLen} = State,
+                    case Declared > roadrunner_conn:route_body_cap(Dispatch, Headers, MaxLen) of
+                        true -> refuse_too_large(State, StreamId, Stream0);
+                        false -> send_continue(State, StreamId)
+                    end;
                 false ->
                     State;
                 _ ->
-                    Continue = roadrunner_quic_h3_frame:encode_headers(
-                        roadrunner_qpack:encode([{~":status", ~"100"}])
-                    ),
-                    _ = roadrunner_quic:send_data(State#h3.conn, StreamId, Continue, false),
-                    State
+                    send_continue(State, StreamId)
             end;
         false ->
             State
     end.
 
-%% Answer 413 to a request over `max_content_length`, ask the client to
+%% The interim `100 (Continue)`: a HEADERS frame with `:status` alone and
+%% no FIN, the final response following on the same stream.
+-spec send_continue(#h3{}, non_neg_integer()) -> #h3{}.
+send_continue(State, StreamId) ->
+    Continue = roadrunner_quic_h3_frame:encode_headers(
+        roadrunner_qpack:encode([{~":status", ~"100"}])
+    ),
+    _ = roadrunner_quic:send_data(State#h3.conn, StreamId, Continue, false),
+    State.
+
+%% Answer 413 to a request over its body cap, ask the client to
 %% stop sending, and mark the stream `discarding` so residual body is
 %% dropped rather than mistaken for a new request.
 -spec refuse_too_large(#h3{}, non_neg_integer(), map()) -> #h3{}.
@@ -552,8 +577,8 @@ handle_stream_reset(#h3{uni = Uni, streams = Streams, worker_pids = WorkerPids} 
 frame_error_code({h2_reserved_frame, _}) -> ?H3_FRAME_UNEXPECTED;
 frame_error_code(_) -> ?H3_FRAME_ERROR.
 
--spec new_request_stream() -> map().
-new_request_stream() ->
+-spec new_request_stream(non_neg_integer()) -> map().
+new_request_stream(BodyCap) ->
     #{
         buf => <<>>,
         header_block => undefined,
@@ -563,6 +588,9 @@ new_request_stream() ->
         headers => undefined,
         body => [],
         body_len => 0,
+        %% The listener's `max_content_length` until a body outgrows it and
+        %% its route raises it (`raise_body_cap/4`).
+        body_cap => BodyCap,
         %% RFC 9114 §4.1 request frame sequence: HEADERS, then DATA, then
         %% optional trailing HEADERS, then nothing.
         frame_state => expecting_headers
@@ -575,16 +603,17 @@ new_request_stream() ->
 %% the request frame-sequence rules and folding payloads into the
 %% accumulated request. The undecoded remainder is stashed in `buf` for
 %% the next `stream_data` message.
--spec decode_request_frames(binary(), map(), non_neg_integer()) -> decode_result().
-decode_request_frames(Buf, Stream, MaxLen) ->
-    decode_request_frames(Buf, Stream, MaxLen, ?MAX_HEADER_BLOCK).
+-spec decode_request_frames(binary(), map(), roadrunner_conn:proto_opts()) -> decode_result().
+decode_request_frames(Buf, Stream, ProtoOpts) ->
+    decode_request_frames(Buf, Stream, ProtoOpts, ?MAX_HEADER_BLOCK).
 
--spec decode_request_frames(binary(), map(), non_neg_integer(), pos_integer()) -> decode_result().
-decode_request_frames(Buf, Stream, MaxLen, MaxHdrBlock) ->
+-spec decode_request_frames(binary(), map(), roadrunner_conn:proto_opts(), pos_integer()) ->
+    decode_result().
+decode_request_frames(Buf, Stream, ProtoOpts, MaxHdrBlock) ->
     case roadrunner_quic_h3_frame:decode(Buf) of
         {ok, Frame, Rest} ->
-            case apply_frame(Frame, Stream, MaxLen, MaxHdrBlock) of
-                {ok, Stream1} -> decode_request_frames(Rest, Stream1, MaxLen, MaxHdrBlock);
+            case apply_frame(Frame, Stream, ProtoOpts, MaxHdrBlock) of
+                {ok, Stream1} -> decode_request_frames(Rest, Stream1, ProtoOpts, MaxHdrBlock);
                 Other -> Other
             end;
         {more, _} ->
@@ -610,30 +639,60 @@ decode_request_frames(Buf, Stream, MaxLen, MaxHdrBlock) ->
 %% H3_FRAME_UNEXPECTED (§4.1, §7.2.4); unknown/reserved frames are
 %% ignored (§9). Trailers (a HEADERS after the body) are accepted but
 %% not surfaced by the buffered path.
--spec apply_frame(roadrunner_quic_h3_frame:frame(), map(), non_neg_integer(), pos_integer()) ->
+-spec apply_frame(
+    roadrunner_quic_h3_frame:frame(), map(), roadrunner_conn:proto_opts(), pos_integer()
+) ->
     {ok, map()} | too_large | headers_too_large | {conn_error, non_neg_integer(), binary()}.
-apply_frame({headers, Block}, #{frame_state := expecting_headers}, _MaxLen, MaxHdrBlock) when
+apply_frame({headers, Block}, #{frame_state := expecting_headers}, _ProtoOpts, MaxHdrBlock) when
     byte_size(Block) > MaxHdrBlock
 ->
     headers_too_large;
-apply_frame({headers, Block}, #{frame_state := expecting_headers} = Stream, _MaxLen, _MaxHdrBlock) ->
+apply_frame({headers, Block}, #{frame_state := expecting_headers} = Stream, _ProtoOpts, _MaxHdr) ->
     {ok, Stream#{header_block := Block, frame_state := expecting_data}};
-apply_frame({headers, _Trailers}, #{frame_state := expecting_data} = Stream, _MaxLen, _MaxHdrBlock) ->
+apply_frame({headers, _Trailers}, #{frame_state := expecting_data} = Stream, _ProtoOpts, _MaxHdr) ->
     {ok, Stream#{frame_state := expecting_done}};
-apply_frame({data, Payload}, #{frame_state := expecting_data} = Stream, MaxLen, _MaxHdrBlock) ->
-    #{body := Body, body_len := Len} = Stream,
+apply_frame({data, Payload}, #{frame_state := expecting_data} = Stream, ProtoOpts, _MaxHdrBlock) ->
+    #{body := Body, body_len := Len, body_cap := Cap} = Stream,
     NewLen = Len + byte_size(Payload),
-    case NewLen > MaxLen of
-        true -> too_large;
+    case NewLen > Cap of
+        true -> raise_body_cap(Stream, Payload, NewLen, ProtoOpts);
         false -> {ok, Stream#{body := [Body, Payload], body_len := NewLen}}
     end;
-apply_frame({unknown, _Type, _Payload}, Stream, _MaxLen, _MaxHdrBlock) ->
+apply_frame({unknown, _Type, _Payload}, Stream, _ProtoOpts, _MaxHdrBlock) ->
     {ok, Stream};
-apply_frame(_Frame, _Stream, _MaxLen, _MaxHdrBlock) ->
+apply_frame(_Frame, _Stream, _ProtoOpts, _MaxHdrBlock) ->
     %% DATA before HEADERS, a frame after trailers, or a control-stream
     %% frame (SETTINGS / GOAWAY / MAX_PUSH_ID / CANCEL_PUSH / PUSH_PROMISE)
     %% on a request stream — RFC 9114 §4.1 / §7.2: H3_FRAME_UNEXPECTED.
     {conn_error, ?H3_FRAME_UNEXPECTED, ~"unexpected frame on request stream"}.
+
+%% A DATA payload that takes the body to `NewLen` bytes, past the stream's
+%% cap (the listener's `max_content_length`, at first): the request's route
+%% may set a larger one. Looked up only here, once per raise, and kept on
+%% the stream after. The field section is decoded first when its HEADERS
+%% frame came in this same chunk, and kept for dispatch. A listener with a
+%% single handler has no route to look up.
+-spec raise_body_cap(map(), binary(), non_neg_integer(), roadrunner_conn:proto_opts()) ->
+    {ok, map()} | too_large | {conn_error, non_neg_integer(), binary()}.
+raise_body_cap(_Stream, _Payload, _NewLen, #{dispatch := {handler, _Mod, _Pipeline, _State}}) ->
+    too_large;
+raise_body_cap(#{headers := undefined, header_block := Block} = Stream, Payload, NewLen, ProtoOpts) ->
+    case roadrunner_qpack:decode(Block) of
+        {ok, Headers} -> raise_body_cap(Stream#{headers := Headers}, Payload, NewLen, ProtoOpts);
+        {error, _} -> qpack_decompression_failed()
+    end;
+raise_body_cap(
+    #{headers := Headers, body := Body, body_cap := Cap} = Stream,
+    Payload,
+    NewLen,
+    #{dispatch := Dispatch}
+) ->
+    case roadrunner_conn:route_body_cap(Dispatch, Headers, Cap) of
+        RouteCap when NewLen =< RouteCap ->
+            {ok, Stream#{body := [Body, Payload], body_len := NewLen, body_cap := RouteCap}};
+        _ ->
+            too_large
+    end.
 
 -type uni_result() ::
     {uni_state() | drop, critical_set()} | {conn_error, non_neg_integer(), binary()}.
