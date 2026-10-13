@@ -173,8 +173,9 @@ of `B` (default `N`). A peer over its rate gets `429 Too Many Requests` +
 not the retry-safe `REFUSED_STREAM` / `H3_REQUEST_REJECTED`, so clients
 back off instead of retrying at once), emitting `[roadrunner, request,
 throttled]` with `reason => rate_limit` and incrementing the
-`rate_limited` count from `roadrunner_listener:info/1`. Idle per-peer
-buckets are swept on a timer (`idle_ttl` / `sweep_interval`). It keys on
+`rate_limited` count from `roadrunner_listener:info/1`. A bucket is
+dropped once it is full again (checked every `sweep_interval`), which a
+peer cannot tell from no bucket, so waiting never resets a limit. It keys on
 the client IP, so behind a balancer set `proxy_protocol` (an L4 balancer)
 or `real_ip` (HTTP proxies passing `X-Forwarded-For` or `Forwarded`);
 otherwise every client behind the proxy shares one bucket.
@@ -184,11 +185,10 @@ in the same shape (`rate`, `period`, `burst`). It is a second bucket per
 client, kept on top of the listener's: a request to the route spends from
 both, and either one can refuse it with the same 429, telemetry event and
 `rate_limited` count. It is checked once the request is routed, and
-needs no listener `rate_limit` to work. A bucket is dropped once it is full
-again, which a client cannot tell from no bucket, so there is no
-`idle_ttl` to set. `reload_routes/2` keeps the buckets of a route whose
-path, methods and limit stay the same, and starts new ones when they
-change.
+needs no listener `rate_limit` to work. Its buckets are dropped like the
+listener's, once full again. `reload_routes/2` keeps the buckets of a
+route whose path, methods and limit stay the same, and starts new ones
+when they change.
 
 ## Configuring
 

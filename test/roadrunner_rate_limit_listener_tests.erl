@@ -12,7 +12,7 @@ valid_rate_limit_starts_test() ->
     end).
 
 valid_full_rate_limit_starts_test() ->
-    Cfg = #{rate => 5, period => 60, burst => 10, idle_ttl => 1000, sweep_interval => 500},
+    Cfg = #{rate => 5, period => 60, burst => 10, sweep_interval => 500},
     with_listener([http1], Cfg, fun(_Port, Name) ->
         ?assert(is_integer(roadrunner_listener:port(Name)))
     end).
@@ -64,7 +64,7 @@ sweep_tick_runs_test() ->
     {ok, Pid} = roadrunner_listener:start_link(Name, #{
         port => 0,
         protocols => [http1],
-        rate_limit => #{rate => 5, sweep_interval => 50, idle_ttl => 1},
+        rate_limit => #{rate => 5, sweep_interval => 50},
         routes => roadrunner_hello_handler
     }),
     try
