@@ -187,7 +187,11 @@
     recv_window := non_neg_integer(),
     worker_pid := undefined | pid(),
     worker_ref := undefined | reference(),
-    pending_sends := queue:queue(pending_send())
+    pending_sends := queue:queue(pending_send()),
+    %% Set on a stream we are resetting with this code until its field
+    %% block, possibly still arriving in CONTINUATION frames, is complete
+    %% and decoded for its HPACK side effects (`reset_refused/4`).
+    refused => roadrunner_http2_frame:error_code()
 }.
 
 -record(loop, {
@@ -209,6 +213,11 @@
     %% Highest stream id we've processed — for the LAST_STREAM_ID
     %% in GOAWAY.
     last_stream_id = 0 :: non_neg_integer(),
+    %% Highest stream id the peer has opened, refused streams included
+    %% (RFC 9113 §5.1.1: using an id closes every lower idle one). The
+    %% idle-stream checks read this one; `last_stream_id` only counts the
+    %% streams we accepted, since a later GOAWAY must never raise it (§6.8).
+    peer_stream_id = 0 :: non_neg_integer(),
     %% Pre-generated `request_id`s (hex), sliced 16 characters at a
     %% time. Refilled by `roadrunner_conn:generate_request_id/1`
     %% in 256-byte batches so h2 conns amortize the crypto cost
@@ -690,8 +699,8 @@ handle_frame({window_update, StreamId, Inc}, #loop{streams = Streams} = State) -
         #{} ->
             %% RFC 9113 §5.1: WINDOW_UPDATE on an idle stream is
             %% PROTOCOL_ERROR. A closed-stream WU (id <=
-            %% last_stream_id) is silently ignored per §6.9.
-            case StreamId > State#loop.last_stream_id of
+            %% peer_stream_id) is silently ignored per §6.9.
+            case StreamId > State#loop.peer_stream_id of
                 true ->
                     _ = send_goaway(State, protocol_error),
                     exit_clean(State);
@@ -699,11 +708,18 @@ handle_frame({window_update, StreamId, Inc}, #loop{streams = Streams} = State) -
                     frame_loop(State)
             end
     end;
-handle_frame({priority, StreamId, #{stream_dependency := StreamId}}, State) ->
+handle_frame(
+    {priority, StreamId, #{stream_dependency := StreamId}}, #loop{streams = Streams} = State
+) ->
     %% RFC 9113 §5.3.1: a stream cannot depend on itself —
-    %% stream-error PROTOCOL_ERROR.
+    %% stream-error PROTOCOL_ERROR. A stream we hold is torn down the way
+    %% a peer reset does (its worker told and demonitored, its slot
+    %% released), so no frame of ours follows the RST_STREAM.
     _ = send_rst_stream(State, StreamId, protocol_error),
-    frame_loop(State);
+    case Streams of
+        #{StreamId := _} -> frame_loop(reset_stream(State, StreamId));
+        #{} -> frame_loop(State)
+    end;
 handle_frame({priority, _, _}, State) ->
     frame_loop(State);
 handle_frame({rst_stream, StreamId, _}, #loop{streams = Streams} = State) ->
@@ -713,10 +729,10 @@ handle_frame({rst_stream, StreamId, _}, #loop{streams = Streams} = State) ->
         #{} ->
             %% RFC 9113 §5.1: RST_STREAM on an idle stream is
             %% PROTOCOL_ERROR (we never opened it). On a closed
-            %% stream (id <= last_stream_id) the receipt is a no-op
+            %% stream (id <= peer_stream_id) the receipt is a no-op
             %% per §5.4 — it's the peer telling us about the
             %% already-closed lifecycle.
-            case StreamId > State#loop.last_stream_id of
+            case StreamId > State#loop.peer_stream_id of
                 true ->
                     _ = send_goaway(State, protocol_error),
                     exit_clean(State);
@@ -745,17 +761,11 @@ handle_frame({unknown, _Type, _StreamId}, State) ->
 
 %% --- HEADERS / CONTINUATION ---
 
-on_headers(StreamId, _Flags, #{stream_dependency := StreamId}, _Fragment, State) ->
-    %% RFC 9113 §5.3.1: a stream cannot depend on itself —
-    %% stream-error PROTOCOL_ERROR. We never enter the stream into
-    %% the streams map since we're rejecting it.
-    _ = send_rst_stream(State, StreamId, protocol_error),
-    frame_loop(State);
 on_headers(StreamId, _Flags, _Priority, _Fragment, State) when StreamId rem 2 =:= 0 ->
     %% RFC 9113 §5.1.1: client-initiated stream IDs are odd.
     _ = send_goaway(State, protocol_error),
     exit_clean(State);
-on_headers(StreamId, Flags, _Priority, Fragment, #loop{streams = Streams} = State) when
+on_headers(StreamId, Flags, Priority, Fragment, #loop{streams = Streams} = State) when
     is_map_key(StreamId, Streams)
 ->
     %% HEADERS for an already-open stream — only valid as a
@@ -773,22 +783,31 @@ on_headers(StreamId, Flags, _Priority, Fragment, #loop{streams = Streams} = Stat
                 end_headers := EndHeaders,
                 end_stream_seen := true
             },
-            State1 = update_stream(State, StreamId, Stream1),
-            State2 =
-                case EndHeaders of
-                    true -> State1;
-                    false -> State1#loop{awaiting_continuation = StreamId}
-                end,
-            case EndHeaders of
-                true -> finalize_trailers(StreamId, State2);
-                false -> frame_loop(State2)
+            case Priority of
+                #{stream_dependency := StreamId} ->
+                    %% RFC 9113 §5.3.1: a stream cannot depend on itself —
+                    %% stream-error PROTOCOL_ERROR, its trailer block still
+                    %% decoded (`refuse_block/5`).
+                    State1 = update_stream(State, StreamId, Stream1#{refused => protocol_error}),
+                    refuse_block(StreamId, EndHeaders, Fragment, protocol_error, State1);
+                _ ->
+                    State1 = update_stream(State, StreamId, Stream1),
+                    State2 =
+                        case EndHeaders of
+                            true -> State1;
+                            false -> State1#loop{awaiting_continuation = StreamId}
+                        end,
+                    case EndHeaders of
+                        true -> finalize_trailers(StreamId, State2);
+                        false -> frame_loop(State2)
+                    end
             end;
         false ->
             _ = send_goaway(State, protocol_error),
             exit_clean(State)
     end;
 on_headers(StreamId, _Flags, _Priority, _Fragment, State) when
-    StreamId =< State#loop.last_stream_id
+    StreamId =< State#loop.peer_stream_id
 ->
     %% RFC 9113 §5.1.1: stream IDs MUST monotonically increase.
     %% Receiving a HEADERS for a stream id we've already advanced
@@ -799,24 +818,26 @@ on_headers(StreamId, _Flags, _Priority, _Fragment, State) when
     %% connection error.
     _ = send_goaway(State, protocol_error),
     exit_clean(State);
-on_headers(StreamId, _Flags, _Priority, _Fragment, #loop{draining = true} = State) ->
+on_headers(StreamId, Flags, #{stream_dependency := StreamId}, Fragment, State) ->
+    %% RFC 9113 §5.3.1: a stream cannot depend on itself —
+    %% stream-error PROTOCOL_ERROR.
+    refuse_new_stream(StreamId, Flags, Fragment, protocol_error, State);
+on_headers(StreamId, Flags, _Priority, Fragment, #loop{draining = true} = State) ->
     %% In drain mode — refuse all new streams. The peer already
     %% saw GOAWAY(NO_ERROR); it knows new requests on this conn
     %% won't be served.
-    _ = send_rst_stream(State, StreamId, refused_stream),
-    frame_loop(State);
+    refuse_new_stream(StreamId, Flags, Fragment, refused_stream, State);
 on_headers(
     StreamId,
-    _Flags,
+    Flags,
     _Priority,
-    _Fragment,
+    Fragment,
     #loop{live_streams = Live, max_concurrent_streams = MaxStreams} = State
 ) when
     Live >= MaxStreams
 ->
     %% Over the advertised concurrency limit — refuse the stream.
-    _ = send_rst_stream(State, StreamId, refused_stream),
-    frame_loop(State);
+    refuse_new_stream(StreamId, Flags, Fragment, refused_stream, State);
 on_headers(StreamId, Flags, _Priority, Fragment, State) ->
     EndHeaders = (Flags band 16#04) =/= 0,
     EndStream = (Flags band 16#01) =/= 0,
@@ -831,6 +852,7 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
         streams = (State#loop.streams)#{StreamId => Stream},
         live_streams = State#loop.live_streams + 1,
         last_stream_id = StreamId,
+        peer_stream_id = StreamId,
         awaiting_continuation =
             if
                 EndHeaders -> undefined;
@@ -840,6 +862,56 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
     if
         EndHeaders -> finalize_headers(StreamId, State1);
         true -> frame_loop(State1)
+    end.
+
+%% RFC 9113 §4.3, §6.8: a field block updates the connection's HPACK
+%% state even when we refuse its stream, so the block is decoded (once its
+%% CONTINUATION frames are in) before the stream is reset; skipping it
+%% would desync our decoder from the peer's encoder for every later block.
+%% The refused stream still uses its id (§5.1.1), so DATA the peer already
+%% sent on it lands on a closed stream, not an idle one, and it never
+%% counts toward `max_concurrent_streams`.
+-spec refuse_new_stream(
+    stream_id(), non_neg_integer(), binary(), roadrunner_http2_frame:error_code(), #loop{}
+) -> no_return().
+refuse_new_stream(StreamId, Flags, Fragment, Code, State) ->
+    EndHeaders = (Flags band 16#04) =/= 0,
+    Stream = new_stream(
+        Fragment,
+        EndHeaders,
+        (Flags band 16#01) =/= 0,
+        State#loop.peer_initial_window,
+        State#loop.stream_recv_window_peak
+    ),
+    State1 = State#loop{
+        streams = (State#loop.streams)#{StreamId => Stream#{counted := false, refused => Code}},
+        peer_stream_id = StreamId
+    },
+    refuse_block(StreamId, EndHeaders, Fragment, Code, State1).
+
+%% A refused stream's field block: decode it now when complete, or wait
+%% for its CONTINUATION frames (`on_continuation/4` finishes it).
+-spec refuse_block(
+    stream_id(), boolean(), binary(), roadrunner_http2_frame:error_code(), #loop{}
+) -> no_return().
+refuse_block(StreamId, true, Fragment, Code, State) ->
+    reset_refused(StreamId, Fragment, Code, State);
+refuse_block(StreamId, false, _Fragment, _Code, State) ->
+    frame_loop(State#loop{awaiting_continuation = StreamId}).
+
+%% Decode a refused stream's complete field block for its HPACK side
+%% effects only, then reset the stream with `Code`.
+-spec reset_refused(stream_id(), iodata(), roadrunner_http2_frame:error_code(), #loop{}) ->
+    no_return().
+reset_refused(StreamId, Fragment, Code, #loop{hpack_dec = Dec} = State) ->
+    case roadrunner_http2_hpack:decode(iolist_to_binary(Fragment), Dec) of
+        {ok, _Headers, Dec1} ->
+            State1 = State#loop{hpack_dec = Dec1},
+            _ = send_rst_stream(State1, StreamId, Code),
+            frame_loop(reset_stream(State1, StreamId));
+        {error, _} ->
+            _ = send_goaway(State, protocol_error),
+            exit_clean(State)
     end.
 
 new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow) ->
@@ -907,9 +979,13 @@ on_continuation(
                             State1 = State#loop{
                                 streams = Streams1, awaiting_continuation = undefined
                             },
-                            case PriorHeaders of
-                                undefined -> finalize_headers(StreamId, State1);
-                                _ -> finalize_trailers(StreamId, State1)
+                            case {Stream1, PriorHeaders} of
+                                {#{refused := Code}, _} ->
+                                    reset_refused(StreamId, [Frags, Fragment], Code, State1);
+                                {_, undefined} ->
+                                    finalize_headers(StreamId, State1);
+                                {_, _} ->
+                                    finalize_trailers(StreamId, State1)
                             end
                     end
             end;
@@ -991,7 +1067,7 @@ finalize_headers(
 
 %% --- DATA ---
 
-on_data(StreamId, _Flags, _Payload, _FlowLen, State) when StreamId > State#loop.last_stream_id ->
+on_data(StreamId, _Flags, _Payload, _FlowLen, State) when StreamId > State#loop.peer_stream_id ->
     %% RFC 9113 §5.1: DATA on an idle stream is PROTOCOL_ERROR.
     _ = send_goaway(State, protocol_error),
     exit_clean(State);

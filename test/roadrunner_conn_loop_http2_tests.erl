@@ -117,6 +117,12 @@ all_test_() ->
         fun data_after_end_stream_on_half_closed_remote_rst/0,
         fun headers_self_dependency_rst_stream/0,
         fun priority_self_dependency_rst_stream/0,
+        fun refused_stream_keeps_hpack_in_sync/0,
+        fun drain_refused_stream_keeps_hpack_in_sync/0,
+        fun self_dependent_headers_across_continuation_keep_hpack_in_sync/0,
+        fun priority_self_dependency_resets_a_live_stream/0,
+        fun self_dependent_trailers_reset_the_stream/0,
+        fun refused_stream_with_undecodable_block_closes_conn/0,
         fun enable_push_invalid_value_protocol_error/0,
         fun initial_window_size_too_large_flow_control_error/0,
         fun max_frame_size_too_small_protocol_error/0,
@@ -3033,6 +3039,197 @@ priority_self_dependency_rst_stream() ->
     Out = expect_send(),
     ?assertMatch(<<_:24, 3, _/binary>>, Out),
     cleanup(Pid, Ref).
+
+refused_stream_keeps_hpack_in_sync() ->
+    %% RFC 9113 §4.3: a refused stream's field block still updates the
+    %% connection's HPACK state. The block of a stream refused over the
+    %% concurrency limit indexes `x-refused`; the client's next request
+    %% references that entry and must decode instead of desyncing.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{http2_max_concurrent_streams => 1}),
+    Enc0 = roadrunner_http2_hpack:new_encoder(4096),
+    %% Stream 1 stays open (no END_STREAM): the one stream allowed.
+    {H1, Enc1} = indexed_get_headers(1, [], 16#04, Enc0),
+    serve_recv(ConnPid, H1),
+    {H3, Enc2} = indexed_get_headers(3, [{~"x-refused", ~"r3"}], 16#04, Enc1),
+    serve_recv(ConnPid, H3),
+    ?assertMatch(
+        {ok, {rst_stream, 3, refused_stream}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    %% DATA the client already sent on the refused stream lands on a
+    %% closed stream (RFC 9113 §5.1.1), not an idle one: a stream error,
+    %% not GOAWAY.
+    serve_recv(
+        ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({data, 3, 16#01, ~"x"}))
+    ),
+    ?assertMatch(
+        {ok, {rst_stream, 3, stream_closed}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    %% Free the slot, then reuse the indexed entry.
+    serve_recv(ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel}))),
+    {H5, _} = indexed_get_headers(5, [{~"x-refused", ~"r3"}], 16#04 bor 16#01, Enc2),
+    serve_recv(ConnPid, H5),
+    ok = expect_response_headers(5, <<>>),
+    cleanup(Pid, Ref).
+
+drain_refused_stream_keeps_hpack_in_sync() ->
+    %% RFC 9113 §6.8: HEADERS after our GOAWAY are refused but still
+    %% decoded. Stream 1's trailers reference the two entries the refused
+    %% stream's block indexed; a decoder that skipped that block has one
+    %% entry fewer, so the deeper reference fails instead of quietly
+    %% decoding the wrong field.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    Enc0 = roadrunner_http2_hpack:new_encoder(4096),
+    {H1, Enc1} = indexed_get_headers(1, [], 16#04, Enc0),
+    serve_recv(ConnPid, H1),
+    ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    ?assertMatch(
+        {ok, {goaway, 1, no_error, _}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    Refused = [{~"x-refused", ~"r3"}, {~"x-refused-too", ~"r3"}],
+    {H3, Enc2} = indexed_get_headers(3, Refused, 16#04 bor 16#01, Enc1),
+    serve_recv(ConnPid, H3),
+    ?assertMatch(
+        {ok, {rst_stream, 3, refused_stream}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    {Trailers, _} = roadrunner_http2_hpack:encode(Refused, Enc2),
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(
+            roadrunner_http2_frame:encode(
+                {headers, 1, 16#04 bor 16#01, undefined, iolist_to_binary(Trailers)}
+            )
+        )
+    ),
+    ?assertMatch(
+        {ok, {headers, 1, _, _, _}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    cleanup(Pid, Ref).
+
+self_dependent_headers_across_continuation_keep_hpack_in_sync() ->
+    %% RFC 9113 §5.3.1 + §4.3: a HEADERS that depends on itself is a
+    %% stream error, and its field block, here split into a CONTINUATION,
+    %% is still decoded before the RST_STREAM.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    Enc0 = roadrunner_http2_hpack:new_encoder(4096),
+    {Block, Enc1} = roadrunner_http2_hpack:encode(
+        get_headers(~"/") ++ [{~"x-refused", ~"r1"}], Enc0
+    ),
+    <<Frag1:4/binary, Frag2/binary>> = iolist_to_binary(Block),
+    %% PRIORITY-payload prefix (E:1, Dep:31, Weight:8) naming stream 1;
+    %% flags PRIORITY (0x20), no END_HEADERS.
+    Payload = <<0:1, 1:31, 0, Frag1/binary>>,
+    serve_recv(ConnPid, <<(byte_size(Payload)):24, 1, 16#20, 0:1, 1:31, Payload/binary>>),
+    serve_recv(
+        ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({continuation, 1, 16#04, Frag2}))
+    ),
+    ?assertMatch(
+        {ok, {rst_stream, 1, protocol_error}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    {H3, _} = indexed_get_headers(3, [{~"x-refused", ~"r1"}], 16#04 bor 16#01, Enc1),
+    serve_recv(ConnPid, H3),
+    ?assertMatch(
+        {ok, {headers, 3, _, _, _}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    cleanup(Pid, Ref).
+
+priority_self_dependency_resets_a_live_stream() ->
+    %% A PRIORITY making an open stream depend on itself resets that
+    %% stream the way a peer RST does: its worker is told and exits, and
+    %% no frame of ours follows the RST_STREAM.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined}
+    }),
+    serve_recv(ConnPid, complete_get_headers(1, ~"/loop")),
+    Worker = wait_for_register(roadrunner_h2_loop_test, 1000),
+    WorkerRef = monitor(process, Worker),
+    _ = drain_send(50),
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(
+            roadrunner_http2_frame:encode(
+                {priority, 1, #{exclusive => false, stream_dependency => 1, weight => 0}}
+            )
+        )
+    ),
+    ?assertMatch(
+        {ok, {rst_stream, 1, protocol_error}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    receive
+        {'DOWN', WorkerRef, process, Worker, _} -> ok
+    after 1000 -> error(worker_not_reset)
+    end,
+    ?assertEqual(undefined, drain_send(100)),
+    cleanup(Pid, Ref).
+
+self_dependent_trailers_reset_the_stream() ->
+    %% Trailers on an open stream whose PRIORITY names the stream itself:
+    %% a stream error, the trailer block still decoded first, so the next
+    %% request's reference to the entry it indexed decodes.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    Enc0 = roadrunner_http2_hpack:new_encoder(4096),
+    {H1, Enc1} = indexed_get_headers(1, [], 16#04, Enc0),
+    serve_recv(ConnPid, H1),
+    {Block, Enc2} = roadrunner_http2_hpack:encode([{~"x-refused", ~"t1"}], Enc1),
+    %% PRIORITY prefix naming stream 1; END_STREAM | END_HEADERS | PRIORITY.
+    Payload = <<0:1, 1:31, 0, (iolist_to_binary(Block))/binary>>,
+    serve_recv(ConnPid, <<(byte_size(Payload)):24, 1, 16#25, 0:1, 1:31, Payload/binary>>),
+    ?assertMatch(
+        {ok, {rst_stream, 1, protocol_error}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    {H3, _} = indexed_get_headers(3, [{~"x-refused", ~"t1"}], 16#04 bor 16#01, Enc2),
+    serve_recv(ConnPid, H3),
+    ok = expect_response_headers(3, <<>>),
+    cleanup(Pid, Ref).
+
+refused_stream_with_undecodable_block_closes_conn() ->
+    %% A refused stream's field block is still decoded, so one that cannot
+    %% be decoded is the same connection error as on an accepted stream.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{http2_max_concurrent_streams => 1}),
+    {H1, _} = indexed_get_headers(1, [], 16#04, roadrunner_http2_hpack:new_encoder(4096)),
+    serve_recv(ConnPid, H1),
+    %% An indexed field naming index 254, past both tables.
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(
+            roadrunner_http2_frame:encode({headers, 3, 16#04, undefined, <<16#FF, 16#7F>>})
+        )
+    ),
+    ?assertMatch({ok, {goaway, _, _, _}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)),
+    receive
+        {'DOWN', Ref, process, Pid, _} -> ok
+    after 1000 -> error(conn_did_not_exit)
+    end.
+
+%% Read the conn's frames until the response HEADERS for `StreamId`,
+%% skipping others (the WINDOW_UPDATE that returns discarded DATA); a
+%% GOAWAY means the request never decoded.
+expect_response_headers(StreamId, Buf) ->
+    case roadrunner_http2_frame:parse(Buf, 16384) of
+        {ok, {headers, StreamId, _, _, _}, _} -> ok;
+        {ok, {goaway, _, _, _} = Goaway, _} -> error({unexpected, Goaway});
+        {ok, _, Rest} -> expect_response_headers(StreamId, Rest);
+        {more, _} -> expect_response_headers(StreamId, <<Buf/binary, (expect_send())/binary>>)
+    end.
+
+%% A GET HEADERS frame encoded with `Enc`, carried across requests the way
+%% a real client's encoder is (so repeated fields go out as indexed
+%% references), with `Extra` fields after the pseudo-headers.
+indexed_get_headers(StreamId, Extra, Flags, Enc) ->
+    {Block, Enc1} = roadrunner_http2_hpack:encode(get_headers(~"/") ++ Extra, Enc),
+    Frame = roadrunner_http2_frame:encode(
+        {headers, StreamId, Flags, undefined, iolist_to_binary(Block)}
+    ),
+    {iolist_to_binary(Frame), Enc1}.
+
+get_headers(Path) ->
+    [
+        {~":method", ~"GET"},
+        {~":scheme", ~"https"},
+        {~":authority", ~"x"},
+        {~":path", Path}
+    ].
 
 enable_push_invalid_value_protocol_error() ->
     {Pid, Ref, ConnPid} = post_handshake_conn(),
