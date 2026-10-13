@@ -144,6 +144,43 @@ queue_mode_hands_back_a_stale_grant_test_() ->
             end
         end}}.
 
+%% A draining connection exits once its last stream is gone. When that
+%% last stream is a parked request the queue then refuses, the refusal
+%% must end the connection too, not leave it open until its idle timeout.
+queue_mode_draining_conn_exits_after_its_park_is_refused_test_() ->
+    {timeout, 30,
+        {spawn, fun() ->
+            {Name, Port} = start_listener(
+                queue_drain, {queue, #{max_queued => 4, timeout => 1000}}
+            ),
+            try
+                %% Another connection's handler holds the only slot.
+                Holder = h2_connect(Port),
+                ok = send_request(Holder, 1),
+                First = expect_handler(),
+                Sock = h2_connect(Port),
+                ok = send_request(Sock, 1),
+                %% The PING ack proves the request has parked.
+                ok = await_ping_ack(Sock),
+                ok = roadrunner_listener:notify_drain(
+                    Name, erlang:monotonic_time(millisecond) + 30000
+                ),
+                %% The park times out after 1 s: the stream is refused and
+                %% the drained connection closes.
+                ?assertEqual(closed, read_until_closed(Sock, 5000)),
+                First ! release,
+                ok = gen_tcp:close(Holder)
+            after
+                ok = roadrunner_listener:stop(Name)
+            end
+        end}}.
+
+read_until_closed(Sock, Timeout) ->
+    case gen_tcp:recv(Sock, 0, Timeout) of
+        {ok, _} -> read_until_closed(Sock, Timeout);
+        {error, Reason} -> Reason
+    end.
+
 await_ping_ack(Sock) ->
     ok = gen_tcp:send(
         Sock, roadrunner_http2_frame:encode({ping, 0, <<1, 2, 3, 4, 5, 6, 7, 8>>})

@@ -540,7 +540,9 @@ recv_more(
         {'DOWN', MonRef, process, _Pid, Reason} ->
             recv_more(maybe_exit_when_drained(handle_worker_down(State, MonRef, Reason)));
         {roadrunner_slot, StreamId, Outcome} ->
-            recv_more(handle_slot(State, StreamId, Outcome));
+            %% A refused park drops its stream, which may be the last one
+            %% a draining conn was waiting on.
+            recv_more(maybe_exit_when_drained(handle_slot(State, StreamId, Outcome)));
         {roadrunner_drain, _Deadline} ->
             recv_more(maybe_exit_when_drained(start_drain(State)))
     after recv_timeout(State) ->
