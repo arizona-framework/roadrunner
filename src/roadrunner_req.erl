@@ -50,7 +50,7 @@ care which protocol delivered the bytes.
     headers := headers(),
     %% H1-parser internal optimization — handlers should ignore.
     %% Hot-path conn helpers (`body_framing/1`,
-    %% `keep_alive_decision/2`, `has_continue_expectation/1`) read
+    %% `keep_alive_decision/2`, `expects_continue/1`) read
     %% this directly to skip per-request header re-lowercasing.
     %% Absent on h2 requests and on manually-built request maps.
     cached_decisions => cached_decisions(),
