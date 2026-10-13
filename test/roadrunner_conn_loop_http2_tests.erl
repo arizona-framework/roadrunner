@@ -94,6 +94,9 @@ all_test_() ->
         fun handler_returning_invalid_shape_resets_stream/0,
         fun unrelated_down_ignored/0,
         fun over_max_concurrent_streams_refused/0,
+        fun expect_continue_gets_interim_100/0,
+        fun expect_continue_over_the_cap_gets_413/0,
+        fun other_expectation_gets_no_interim/0,
         fun over_inflight_ceiling_refused_and_throttled/0,
         fun reset_stream_releases_inflight_slot/0,
         fun stream_slot_freed_when_response_ends_before_worker_down/0,
@@ -2069,6 +2072,66 @@ unrelated_down_ignored() ->
     PingAck = expect_send(),
     ?assertMatch(<<_:24, 6, 1, _/binary>>, PingAck),
     cleanup(Pid, Ref).
+
+expect_continue_gets_interim_100() ->
+    %% RFC 9110 §10.1.1: a request expecting `100-continue` with a body to
+    %% follow gets the interim 100 right away (`:status` alone, no
+    %% END_STREAM), then its final response once the body is in.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    serve_recv(ConnPid, post_headers(1, ~"3", ~"100-continue")),
+    Dec0 = roadrunner_http2_hpack:new_decoder(4096),
+    {ok, {headers, 1, Flags, _, Block}, _} = roadrunner_http2_frame:parse(expect_send(), 16384),
+    ?assertEqual(0, Flags band 16#01),
+    {ok, [{~":status", ~"100"}], Dec1} = roadrunner_http2_hpack:decode(Block, Dec0),
+    serve_recv(ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({data, 1, 16#01, ~"abc"}))),
+    {ok, {headers, 1, _, _, Final}, _} = roadrunner_http2_frame:parse(expect_send(), 16384),
+    {ok, [{~":status", ~"200"} | _], _} = roadrunner_http2_hpack:decode(Final, Dec1),
+    cleanup(Pid, Ref).
+
+expect_continue_over_the_cap_gets_413() ->
+    %% A declared `content-length` already over `max_content_length` is
+    %% the final status the headers settle: 413 at once, not a 100 that
+    %% would have the client send a body we refuse.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{max_content_length => 2}),
+    serve_recv(ConnPid, post_headers(1, ~"3", ~"100-Continue")),
+    {ok, {headers, 1, _, _, Block}, Rest} = roadrunner_http2_frame:parse(expect_send(), 16384),
+    {ok, [{~":status", ~"413"} | _], _} = roadrunner_http2_hpack:decode(
+        Block, roadrunner_http2_hpack:new_decoder(4096)
+    ),
+    Rst =
+        case roadrunner_http2_frame:parse(Rest, 16384) of
+            {ok, {data, 1, _, _, _}, <<>>} -> expect_send();
+            {ok, {data, 1, _, _, _}, More} -> More
+        end,
+    ?assertMatch({ok, {rst_stream, 1, no_error}, _}, roadrunner_http2_frame:parse(Rst, 16384)),
+    cleanup(Pid, Ref).
+
+other_expectation_gets_no_interim() ->
+    %% Only `100-continue` asks for the interim response.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    serve_recv(ConnPid, post_headers(1, ~"3", ~"something-else")),
+    ?assertEqual(undefined, drain_send(100)),
+    cleanup(Pid, Ref).
+
+%% POST HEADERS (no END_STREAM, the body to follow) with a declared
+%% `content-length` and an `expect` field.
+post_headers(StreamId, ContentLength, Expect) ->
+    {Block, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"POST"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"},
+            {~"content-length", ContentLength},
+            {~"expect", Expect}
+        ],
+        roadrunner_http2_hpack:new_encoder(4096)
+    ),
+    iolist_to_binary(
+        roadrunner_http2_frame:encode(
+            {headers, StreamId, 16#04, undefined, iolist_to_binary(Block)}
+        )
+    ).
 
 over_max_concurrent_streams_refused() ->
     %% Open 100 streams without END_STREAM (no body, just keep
