@@ -27,6 +27,7 @@ HTTP/3 cases live in `roadrunner_http3_SUITE`.
     chunked_body_within_raised_cap/1,
     expect_continue_within_raised_cap/1,
     expect_continue_over_lowered_cap/1,
+    manual_over_cap_answer_says_close/1,
     h2_body_within_raised_cap/1,
     h2_body_over_raised_cap/1,
     h2_body_over_lowered_cap/1,
@@ -56,7 +57,7 @@ groups() ->
     ],
     [
         {http1, [], [unmatched_path_keeps_listener_cap | Http1]},
-        {http1_manual, [], Http1},
+        {http1_manual, [], [manual_over_cap_answer_says_close | Http1]},
         {http2, [], [
             h2_body_within_raised_cap,
             h2_body_over_raised_cap,
@@ -155,6 +156,15 @@ expect_continue_over_lowered_cap(Config) ->
     {ok, Sock} = h1_connect(Config),
     ok = gen_tcp:send(Sock, expect_head(~"/small", 3)),
     ?assertMatch({413, _}, status_body(recv_until_closed(Sock, <<>>))).
+
+manual_over_cap_answer_says_close(Config) ->
+    %% A manual-mode body declared over its cap is never read, so the
+    %% connection closes after the handler's answer, which says so.
+    {ok, Sock} = h1_connect(Config),
+    ok = gen_tcp:send(Sock, ~"POST /small HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc"),
+    Reply = recv_until_closed(Sock, <<>>),
+    ?assertMatch({413, _}, status_body(Reply)),
+    {match, _} = re:run(Reply, "(?i)\r\nconnection: close\r\n").
 
 %% =============================================================================
 %% HTTP/2 (h2c)

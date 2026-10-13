@@ -1169,9 +1169,11 @@ ensure_close_signaled(_S, _Req, Response) ->
 
 %% Prepend `Connection: close` exactly when the server closes a connection
 %% that would otherwise be reused: this request trips the keep-alive ceiling,
-%% or the handler answered without asking for a body the client holds back
+%% the handler answered without asking for a body the client holds back
 %% for a 100 Continue (`read_body/8`; RFC 9110 §10.1.1 asks a server
-%% answering before the body to say whether it closes). In the common case the
+%% answering before the body to say whether it closes), or the request
+%% declared a manual-mode body over its cap, which is never read, so the
+%% connection cannot go on past it. In the common case the
 %% response has no `connection` header, so the prepend is the only token; if a
 %% handler set one explicitly, `close` is the first token on the wire and takes
 %% precedence (RFC 9112 §9.6). Every other case is left byte-for-byte unchanged.
@@ -1180,6 +1182,12 @@ ensure_close_signaled(_S, _Req, Response) ->
 with_close_if_closing(
     #loop_state{body_buffering = manual}, #{body_reader := #{continue := _}} = Req, Headers
 ) ->
+    with_close(Req, Headers);
+with_close_if_closing(
+    #loop_state{body_buffering = manual},
+    #{body_reader := #{framing := {content_length, N}, max := Max}} = Req,
+    Headers
+) when N > Max ->
     with_close(Req, Headers);
 with_close_if_closing(
     #loop_state{requests_served = Served, max_keep_alive_requests = Max}, Req, Headers
