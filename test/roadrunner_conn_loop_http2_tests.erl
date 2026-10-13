@@ -63,6 +63,7 @@ all_test_() ->
         fun interim_buffered_response_returns_500/0,
         fun unsafe_response_header_returns_500/0,
         fun unsafe_trailer_resets_stream/0,
+        fun non_iodata_body_resets_only_its_stream/0,
         fun middleware_chain_runs/0,
         fun rst_stream_cancels_active_stream/0,
         fun router_404_returns_not_found/0,
@@ -1239,6 +1240,21 @@ unsafe_trailer_resets_stream() ->
     ?assert(is_process_alive(Pid)),
     cleanup(Pid, Ref).
 
+non_iodata_body_resets_only_its_stream() ->
+    %% A body that is not iodata is a handler bug. The worker sizes every
+    %% body before handing it over, so it crashes there and the conn
+    %% resets just that stream (RST_STREAM, frame type 3), buffered or at
+    %% a stream's final chunk, instead of crashing on it with every stream
+    %% it carries.
+    {Pid1, Ref1} = run_stream_request(~"/bad-body"),
+    ?assertMatch([{other, 3, 1, false}], collect_response_frames()),
+    ?assert(is_process_alive(Pid1)),
+    cleanup(Pid1, Ref1),
+    {Pid2, Ref2} = run_stream_request(~"/stream/bad-fin"),
+    ?assertMatch([{headers, 1, false}, {other, 3, 1, false}], collect_response_frames()),
+    ?assert(is_process_alive(Pid2)),
+    cleanup(Pid2, Ref2).
+
 middleware_chain_runs() ->
     %% Listener with a non-empty middleware list — exercises the
     %% `compose/2` branch in invoke/4.
@@ -1872,7 +1888,7 @@ headers_for_already_open_stream_without_end_stream_protocol_error() ->
 synthetic_send_data_after_reset() ->
     %% Open a stream, then RST it. Stream is removed from the
     %% map. Sending a synthetic `h2_send_data` for that stream id
-    %% takes the not_open branch in `handle_send_data/6` and
+    %% takes the not_open branch in `handle_send_data/7` and
     %% returns `{h2_stream_reset, _}` to the would-be worker.
     {ok, _} = application:ensure_all_started(telemetry),
     drain_mailbox(),
@@ -1889,7 +1905,7 @@ synthetic_send_data_after_reset() ->
     Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
     serve_recv(ConnPid, Rst),
     DRef = make_ref(),
-    ConnPid ! {h2_send_data, self(), DRef, 1, ~"x", false},
+    ConnPid ! {h2_send_data, self(), DRef, 1, ~"x", 1, false},
     receive
         {h2_stream_reset, 1} -> ok
     after 500 -> error(no_reset)
@@ -1938,7 +1954,7 @@ synthetic_send_response_after_reset() ->
     serve_recv(ConnPid, H),
     Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
     serve_recv(ConnPid, Rst),
-    ConnPid ! {h2_send_response, 1, 200, [], ~"hi"},
+    ConnPid ! {h2_send_response, 1, 200, [], ~"hi", 2},
     Ping = iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>})),
     serve_recv(ConnPid, Ping),
     ?assertMatch(<<_:24, 6, 1, _/binary>>, expect_send()),
@@ -1990,14 +2006,14 @@ synthetic_send_data_to_closed_stream() ->
     serve_recv(ConnPid, H),
     %% Empty fin closes the send side; ack confirms it.
     DRef1 = make_ref(),
-    ConnPid ! {h2_send_data, self(), DRef1, 1, <<>>, true},
+    ConnPid ! {h2_send_data, self(), DRef1, 1, <<>>, 0, true},
     receive
         {h2_send_ack, DRef1} -> ok
     after 500 -> error(no_ack)
     end,
     %% Stream is in state := closed. Send another DATA → reset.
     DRef2 = make_ref(),
-    ConnPid ! {h2_send_data, self(), DRef2, 1, ~"x", false},
+    ConnPid ! {h2_send_data, self(), DRef2, 1, ~"x", 1, false},
     receive
         {h2_stream_reset, 1} -> ok
     after 500 -> error(no_reset)

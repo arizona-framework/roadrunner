@@ -202,6 +202,13 @@ handle(#{target := ~"/stream/bad-trailers"} = Req) ->
         end},
         Req
     };
+handle(#{target := ~"/bad-body"} = Req) ->
+    %% A buffered body that is not iodata: the worker crashes sizing it,
+    %% before anything reaches the conn.
+    {{200, [], not_iodata}, Req};
+handle(#{target := ~"/stream/bad-fin"} = Req) ->
+    %% The same for a stream's final chunk, after the 200 HEADERS.
+    {{stream, 200, [], fun(Send) -> Send(not_iodata, fin) end}, Req};
 handle(#{target := ~"/crash"} = _Req) ->
     error(boom);
 handle(#{target := ~"/badshape"} = Req) ->

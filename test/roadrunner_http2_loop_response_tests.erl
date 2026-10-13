@@ -178,14 +178,14 @@ fake_conn_loop(Reporter, Sends, ResetStreamId) ->
                 [{send_headers, StreamId, Status, Headers, EndStream} | Sends],
                 ResetStreamId
             );
-        {h2_send_data, From, _Ref, StreamId, _Bin, _EndStream} when
+        {h2_send_data, From, _Ref, StreamId, _Bin, _Size, _EndStream} when
             StreamId =:= ResetStreamId
         ->
             From ! {h2_stream_reset, StreamId},
             %% Worker exits via sync/1; revert to normal mode in case
             %% more messages arrive (they should not).
             fake_conn_loop(Reporter, Sends, undefined);
-        {h2_send_data, From, Ref, StreamId, Bin, EndStream} ->
+        {h2_send_data, From, Ref, StreamId, Bin, _Size, EndStream} ->
             From ! {h2_send_ack, Ref},
             fake_conn_loop(
                 Reporter, [{send_data, StreamId, Bin, EndStream} | Sends], ResetStreamId

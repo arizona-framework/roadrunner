@@ -18,7 +18,7 @@
 %% monitored (not linked) by the conn, so on a conn crash it is
 %% otherwise orphaned with no signal of its own.
 
--export([monitor_conn/1, sync/2, send_headers/5, send_data/4]).
+-export([monitor_conn/1, sync/2, send_headers/5, send_data/5]).
 
 -doc false.
 -spec monitor_conn(pid()) -> reference().
@@ -47,11 +47,15 @@ send_headers(ConnPid, StreamId, Status, Headers, EndStream) ->
         ok
     end).
 
-%% Send DATA for `StreamId` and wait for the conn's ack.
+%% Send DATA for `StreamId` and wait for the conn's ack. `Size` is
+%% `iolist_size(Data)`, taken by the caller in this worker: a handler's
+%% non-iodata `Data` crashes the worker there, so the conn resets just
+%% this stream instead of crashing on it with every stream it carries,
+%% and the conn reads the size instead of walking the data again.
 -doc false.
--spec send_data(pid(), pos_integer(), iodata(), boolean()) -> ok.
-send_data(ConnPid, StreamId, Data, EndStream) ->
+-spec send_data(pid(), pos_integer(), iodata(), non_neg_integer(), boolean()) -> ok.
+send_data(ConnPid, StreamId, Data, Size, EndStream) ->
     sync(ConnPid, fun(Ref) ->
-        _ = (ConnPid ! {h2_send_data, self(), Ref, StreamId, Data, EndStream}),
+        _ = (ConnPid ! {h2_send_data, self(), Ref, StreamId, Data, Size, EndStream}),
         ok
     end).

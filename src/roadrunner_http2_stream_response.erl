@@ -66,11 +66,9 @@ do_send(ConnPid, StreamId, Data, nofin) ->
     %% Ship as iodata. The conn fast-paths single-frame sends
     %% without materialising and only flattens when chunking
     %% across window/MAX_FRAME_SIZE boundaries.
-    iolist_size(Data) > 0 andalso
-        roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, false),
-    ok;
+    send_nonempty(ConnPid, StreamId, Data);
 do_send(ConnPid, StreamId, Data, fin) ->
-    ok = roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, true),
+    ok = roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, iolist_size(Data), true),
     put(?FIN_KEY, true),
     ok;
 do_send(ConnPid, StreamId, Data, {fin, Trailers}) ->
@@ -81,11 +79,17 @@ do_send(ConnPid, StreamId, Data, {fin, Trailers}) ->
     %% fields RFC 9113 §8.2.2 forbids. Run it before any of the body goes
     %% out.
     WireTrailers = roadrunner_http:strip_connection_specific_fields_safe(Trailers),
-    iolist_size(Data) > 0 andalso
-        roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, false),
+    ok = send_nonempty(ConnPid, StreamId, Data),
     ok = sync_send_trailers(ConnPid, StreamId, WireTrailers),
     put(?FIN_KEY, true),
     ok.
+
+%% DATA without END_STREAM, skipped when empty (no zero-length frame).
+send_nonempty(ConnPid, StreamId, Data) ->
+    case iolist_size(Data) of
+        0 -> ok;
+        Size -> roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, Size, false)
+    end.
 
 sync_send_trailers(ConnPid, StreamId, Trailers) ->
     roadrunner_http2_worker_sync:sync(ConnPid, fun(Ref) ->
