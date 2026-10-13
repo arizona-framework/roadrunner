@@ -434,6 +434,25 @@ handshake_drops_handler_copies_of_handshake_headers_test() ->
         RespHeaders
     ).
 
+handshake_drops_handler_framing_headers_test() ->
+    %% RFC 9110 §8.6, RFC 9112 §6.1: a 1xx response carries no
+    %% `content-length` or `transfer-encoding`.
+    Headers = [
+        {~"upgrade", ~"websocket"},
+        {~"connection", ~"Upgrade"},
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
+        {~"sec-websocket-version", ~"13"}
+    ],
+    Extra = [
+        {~"content-length", ~"0"},
+        {~"x-kept", ~"1"},
+        {~"transfer-encoding", ~"chunked"}
+    ],
+    {ok, 101, RespHeaders, ~"", none} = roadrunner_ws:handshake_response(Headers, Extra),
+    ?assertEqual(undefined, proplists:get_value(~"content-length", RespHeaders)),
+    ?assertEqual(undefined, proplists:get_value(~"transfer-encoding", RespHeaders)),
+    ?assertEqual(~"1", proplists:get_value(~"x-kept", RespHeaders)).
+
 %% =============================================================================
 %% parse_frame/1
 %% =============================================================================
