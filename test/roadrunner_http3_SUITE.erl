@@ -87,6 +87,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     qpack_decompression_failed/1,
     qpack_decompression_failed_before_body/1,
     extra_data_after_413/1,
+    refused_request_with_fin_is_dropped/1,
     stop_sending_ignored/1,
     peer_push_stream_closes_conn/1,
     peer_control_stream_closed/1,
@@ -176,6 +177,7 @@ all() ->
         qpack_decompression_failed,
         qpack_decompression_failed_before_body,
         extra_data_after_413,
+        refused_request_with_fin_is_dropped,
         stop_sending_ignored,
         peer_push_stream_closes_conn,
         peer_control_stream_closed,
@@ -223,6 +225,7 @@ init_per_testcase(Case, Config) when
     Case =:= max_concurrent_requests_queue_stale_grant;
     Case =:= max_concurrent_requests_queue_survives_drain;
     Case =:= extra_data_after_413;
+    Case =:= refused_request_with_fin_is_dropped;
     Case =:= oversized_headers_431;
     Case =:= advertises_max_field_section_size;
     Case =:= field_section_too_large_431
@@ -1565,6 +1568,47 @@ extra_data_after_413(_Config) ->
     after
         ll_close(Conn),
         roadrunner_listener:stop(Name)
+    end.
+
+refused_request_with_fin_is_dropped(_Config) ->
+    %% A request refused (413, 431) in the chunk that also carries its FIN
+    %% leaves nothing behind: no more data or reset comes for that stream, so
+    %% an entry kept for it would never be freed and would hold a graceful
+    %% drain open until its deadline.
+    Name = listener_name(refused_request_with_fin_is_dropped),
+    {ok, _} = start_h3(Name, #{
+        max_content_length => 8, protocols => [{http3, #{max_header_block => 100}}]
+    }),
+    Conn = ll_connect(roadrunner_listener:port(Name)),
+    try
+        TooLarge = roadrunner_quic_test_conn:open_bidi(Conn),
+        ok = roadrunner_quic_test_conn:send(
+            Conn,
+            TooLarge,
+            [
+                roadrunner_quic_h3_frame:encode_headers(
+                    roadrunner_qpack:encode(headers(~"POST", ~"/echo"))
+                ),
+                roadrunner_quic_h3_frame:encode_data(binary:copy(~"x", 32))
+            ],
+            true
+        ),
+        ?assertMatch({fin, _}, ll_collect_until_end(Conn, TooLarge, <<>>)),
+        BigHeaders = roadrunner_quic_test_conn:open_bidi(Conn),
+        ok = roadrunner_quic_test_conn:send(
+            Conn,
+            BigHeaders,
+            roadrunner_quic_h3_frame:encode_headers(
+                roadrunner_qpack:encode(
+                    headers(~"GET", ~"/") ++ [{~"x-big", binary:copy(~"v", 300)}]
+                )
+            ),
+            true
+        ),
+        ?assertMatch({fin, _}, ll_collect_until_end(Conn, BigHeaders, <<>>)),
+        ?assertEqual({ok, drained}, roadrunner_listener:drain(Name, 2000))
+    after
+        ll_close(Conn)
     end.
 
 stop_sending_ignored(Config) ->
