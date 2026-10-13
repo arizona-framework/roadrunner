@@ -54,8 +54,9 @@ absent. Unlike `roadrunner_compress`, this middleware adds no `Vary` (its
 output conditions on no request header; HSTS keys off the connection scheme,
 not a header). It decorates every response shape that carries headers
 (buffered, stream, sendfile, and loop), so a file served via `sendfile` gets
-`nosniff` too; only a `{websocket, _, _}` upgrade, which has no response
-headers, passes through.
+`nosniff` too. A `{websocket, ...}` upgrade passes through: its 101 carries
+only the handshake headers plus any the handler set, and these defaults do not
+belong on a protocol switch.
 """.
 
 -behaviour(roadrunner_middleware).
@@ -118,8 +119,9 @@ call(Req, Next, #sec{} = State) ->
     {Response, Req2} = Next(Req),
     {transform(Req, State, Response), Req2}.
 
-%% Decorate every header-bearing response shape; pass a `{websocket, _, _}`
-%% upgrade (no response headers) through. The `is_integer(Status)` guard on
+%% Decorate every HTTP response shape; pass a `{websocket, ...}` upgrade
+%% through (its 101 keeps only the handshake headers plus any the handler
+%% set). The `is_integer(Status)` guard on
 %% the buffered clause is load-bearing: it rejects the `{websocket, Mod, State}`
 %% triple, which shares the 3-tuple shape but carries an atom where the status
 %% would be.

@@ -338,7 +338,8 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
 - **Loop / SSE**: `{loop, Status, Headers, State}` plus an optional
   `handle_info/3` callback for message-driven push.
 - **WebSocket**: `{websocket, Module, State}` upgrade with a
-  `roadrunner_ws_handler` callback.
+  `roadrunner_ws_handler` callback; `{websocket, Module, State, Headers}`
+  adds headers to the 101 (a `set-cookie`, a chosen `sec-websocket-protocol`).
 - **Sendfile**: `{sendfile, Status, Headers, {Filename, Offset, Length}}`,
   zero-copy file body via `file:sendfile/5` (TCP) or chunked `ssl:send`
   fallback (TLS).

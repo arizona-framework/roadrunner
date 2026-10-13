@@ -7,7 +7,7 @@
 %% the conn's `{websocket, Mod, State}` dispatch hands the socket off.
 %%
 %% The session owns the socket for its lifetime: the parent conn calls
-%% `start/6`, which spawns the session, transfers controlling-process,
+%% `start/7`, which spawns the session, transfers controlling-process,
 %% sends the `socket_ready` startup signal (mirroring the conn's `shoot`
 %% pattern), and hands the session's monitor back so the conn can park
 %% in a hibernated wait (`roadrunner_conn_loop:ws_session_wake/7`)
@@ -80,12 +80,12 @@
 %% each is exported is cached in `#data` at session start so the BIF
 %% check doesn't run on every event.
 %%
-%% Telemetry: `[roadrunner, ws, upgrade]` fires from `start/6` once the
+%% Telemetry: `[roadrunner, ws, upgrade]` fires from `start/7` once the
 %% launcher has decided to enter the session; `[roadrunner, ws, frame_in]`
 %% and `[roadrunner, ws, frame_out]` fire from the session process for
 %% every frame.
 
--export([start/6]).
+-export([start/7]).
 -export([init_session/2]).
 -export([recv_loop/1]).
 -export([unmask_slice/3]).
@@ -214,11 +214,12 @@ They seed the session buffer so the first frame isn't lost.
     roadrunner_req:request(),
     module(),
     term(),
+    roadrunner_http:headers(),
     binary(),
     roadrunner_conn:proto_opts()
 ) -> {session, reference(), pid()} | rejected.
-start(Socket, Req, Mod, State, Buffered, ProtoOpts) ->
-    case roadrunner_ws:handshake_response(roadrunner_req:headers(Req)) of
+start(Socket, Req, Mod, State, ExtraHeaders, Buffered, ProtoOpts) ->
+    case roadrunner_ws:handshake_response(roadrunner_req:headers(Req), ExtraHeaders) of
         {ok, Status, RespHeaders, _, Negotiated} ->
             UpgradeResp = roadrunner_http1:response(Status, RespHeaders, ~""),
             start_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts);

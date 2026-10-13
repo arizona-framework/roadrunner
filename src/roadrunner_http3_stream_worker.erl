@@ -89,6 +89,8 @@ emit_handler_response(Conn, StreamId, Handler, {loop, Status, Headers, State}) -
     send_loop(Conn, StreamId, Status, Headers, Handler, State),
     Status;
 emit_handler_response(Conn, StreamId, _Handler, {websocket, _, _}) ->
+    emit_501(Conn, StreamId);
+emit_handler_response(Conn, StreamId, _Handler, {websocket, _, _, _}) ->
     emit_501(Conn, StreamId).
 
 %% The `websocket` response shape is not yet wired for HTTP/3 (it needs

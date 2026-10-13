@@ -38,6 +38,11 @@ threading `Req` through the entire request lifecycle.
   and closes. Useful for SSE/long-poll endpoints that subscribe to a
   pubsub topic in `handle/1` and forward messages to the wire.
 - `{websocket, Module, State}` — upgrade to a `roadrunner_ws_handler`.
+- `{websocket, Module, State, Headers}` — the same upgrade, with `Headers`
+  added to the `101 Switching Protocols` response (e.g. a `set-cookie`).
+  The handshake's own headers (`upgrade`, `connection`,
+  `sec-websocket-accept`, `sec-websocket-extensions`) win: an entry
+  naming one of them is dropped.
 
 If the handler did not call `roadrunner_req:read_body/1,2`, just thread
 the original `Req` back. Idiomatic shape:
@@ -109,7 +114,8 @@ lowercase names; handler-supplied tuples must follow suit.
     | {stream, StatusCode :: roadrunner_http:status(), roadrunner_http:headers(), stream_fun()}
     | {loop, StatusCode :: roadrunner_http:status(), roadrunner_http:headers(), State :: term()}
     | {sendfile, StatusCode :: roadrunner_http:status(), roadrunner_http:headers(), sendfile_spec()}
-    | {websocket, Module :: module(), State :: term()}.
+    | {websocket, Module :: module(), State :: term()}
+    | {websocket, Module :: module(), State :: term(), roadrunner_http:headers()}.
 
 -doc """
 What `handle/1` returns: a pair of the handler's `t:response/0` and

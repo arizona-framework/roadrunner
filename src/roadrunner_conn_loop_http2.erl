@@ -50,7 +50,7 @@
 %% | `{stream, _, _, Fun}` | yes |
 %% | `{loop, _}` | yes (worker enters handle_info loop) |
 %% | `{sendfile, _}` | yes (chunked DATA via the stream-response engine) |
-%% | `{websocket, _, _}` | 501 (Phase H13) |
+%% | `{websocket, ...}` (with or without headers) | 501 (Phase H13) |
 
 -export([enter/6]).
 

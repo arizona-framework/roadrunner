@@ -3,7 +3,8 @@
 Behaviour for WebSocket handlers.
 
 After a successful upgrade — signaled by a regular `roadrunner_handler`
-returning `{websocket, Module, State}` — the connection process
+returning `{websocket, Module, State}` (or `{websocket, Module, State,
+Headers}` to add headers to the 101) — the connection process
 drives a frame loop that calls `handle_frame/2` for each non-control
 frame received from the client.
 
@@ -94,7 +95,7 @@ Unified return shape for all `roadrunner_ws_handler` callbacks.
 -doc """
 Optional. Runs once in the session process after the 101 has been
 written to the wire and before the first frame is read, with the
-state from the upgrade tuple `{websocket, Module, State}`. Use it
+state from the upgrade tuple `{websocket, Module, State[, Headers]}`. Use it
 to register pubsub subscriptions, start linked workers, or push
 priming frames at connect-time. Returns the same shape as
 `handle_frame/2`. Handlers that don't export this callback skip

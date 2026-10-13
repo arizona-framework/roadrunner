@@ -16,7 +16,7 @@ frames.
 
 -on_load(init_patterns/0).
 
--export([accept_key/1, handshake_response/1]).
+-export([accept_key/1, handshake_response/2]).
 -export([parse_frame/1, parse_frame/2]).
 -export([parse_frame_known/3]).
 -export([peek_frame_header/2]).
@@ -159,41 +159,62 @@ accept_key(Key) when is_binary(Key) ->
 %% `{permessage_deflate, Params, _}` when RFC 7692 was negotiated.
 %% The session uses this to set up zlib state. The agreed extension's
 %% response header is already in `Headers`.
+%%
+%% `Extra` are the handler's own 101 headers (the
+%% `{websocket, Module, State, Headers}` shape). They become the tail of
+%% the response list, so the common no-extra case allocates nothing more.
+%% Handshake names are dropped from them: the server computes those, and
+%% only the server can negotiate an extension, so a handler-set
+%% `sec-websocket-extensions` would desync the frame stream.
 -doc false.
--spec handshake_response(roadrunner_http:headers()) ->
+-spec handshake_response(roadrunner_http:headers(), roadrunner_http:headers()) ->
     {ok, roadrunner_http:status(), roadrunner_http:headers(), iodata(), negotiated()}
     | {error,
         missing_websocket_upgrade
         | missing_connection_upgrade
         | missing_websocket_key
         | unsupported_websocket_version}.
-handshake_response(Headers) when is_list(Headers) ->
+handshake_response(Headers, Extra) when is_list(Headers) ->
     case validate_upgrade(Headers) of
         {ok, Key} ->
             Accept = accept_key(Key),
             Negotiated = negotiate_extensions(
                 parse_extensions(header_lookup(~"sec-websocket-extensions", Headers))
             ),
-            RespHeaders = build_handshake_headers(Accept, Negotiated),
+            RespHeaders = build_handshake_headers(Accept, Negotiated, handler_headers(Extra)),
             {ok, 101, RespHeaders, ~"", Negotiated};
         {error, _} = Err ->
             Err
     end.
 
--spec build_handshake_headers(binary(), negotiated()) -> roadrunner_http:headers().
-build_handshake_headers(Accept, none) ->
+-spec build_handshake_headers(binary(), negotiated(), roadrunner_http:headers()) ->
+    roadrunner_http:headers().
+build_handshake_headers(Accept, none, Tail) ->
     [
         {~"upgrade", ~"websocket"},
         {~"connection", ~"upgrade"},
         {~"sec-websocket-accept", Accept}
+        | Tail
     ];
-build_handshake_headers(Accept, {permessage_deflate, _, ResponseValue}) ->
+build_handshake_headers(Accept, {permessage_deflate, _, ResponseValue}, Tail) ->
     [
         {~"upgrade", ~"websocket"},
         {~"connection", ~"upgrade"},
         {~"sec-websocket-accept", Accept},
         {~"sec-websocket-extensions", ResponseValue}
+        | Tail
     ].
+
+%% The handler's 101 headers minus the handshake's own names (see
+%% `handshake_response/2`). Literal clause heads, so the compiler matches
+%% each name in one decision tree instead of a list scan per header.
+-spec handler_headers(roadrunner_http:headers()) -> roadrunner_http:headers().
+handler_headers([]) -> [];
+handler_headers([{~"upgrade", _} | T]) -> handler_headers(T);
+handler_headers([{~"connection", _} | T]) -> handler_headers(T);
+handler_headers([{~"sec-websocket-accept", _} | T]) -> handler_headers(T);
+handler_headers([{~"sec-websocket-extensions", _} | T]) -> handler_headers(T);
+handler_headers([H | T]) -> [H | handler_headers(T)].
 
 -spec validate_upgrade(roadrunner_http:headers()) ->
     {ok, binary()}

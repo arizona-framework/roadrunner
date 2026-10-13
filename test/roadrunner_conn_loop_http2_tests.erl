@@ -1184,9 +1184,14 @@ sendfile_missing_file_resets_stream() ->
     cleanup(Pid, Ref).
 
 websocket_response_returns_501() ->
-    {Pid, Ref, Resp} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/websocket"),
-    ?assertEqual(~"501", h2_response_status(Resp)),
-    cleanup(Pid, Ref).
+    lists:foreach(
+        fun(Path) ->
+            {Pid, Ref, Resp} = run_h2_request_with_handler(roadrunner_h2_test_handler, Path),
+            ?assertEqual(~"501", h2_response_status(Resp)),
+            cleanup(Pid, Ref)
+        end,
+        [~"/websocket", ~"/websocket-headers"]
+    ).
 
 handler_crash_returns_500() ->
     {Pid, Ref, Resp} = run_h2_request_with_handler(roadrunner_h2_test_handler, ~"/crash"),
@@ -2670,7 +2675,12 @@ telemetry_request_stop_reports_the_status_sent() ->
                 end,
                 cleanup(Pid, Ref)
             end
-         || {Path, Sent} <- [{~"/interim", 500}, {~"/interim-stream", 500}, {~"/websocket", 501}]
+         || {Path, Sent} <- [
+                {~"/interim", 500},
+                {~"/interim-stream", 500},
+                {~"/websocket", 501},
+                {~"/websocket-headers", 501}
+            ]
         ]
     after
         detach_telemetry(HandlerId)
