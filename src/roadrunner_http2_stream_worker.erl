@@ -83,12 +83,9 @@ init(ConnPid, StreamId, Req, Dispatch) ->
     %% `request_id`. The conn process can't do this for us — the
     %% handler runs in this worker, not on the conn.
     ok = roadrunner_conn:set_request_logger_metadata(Req),
-    %% Monitor the conn once for the worker's whole life so any sync
-    %% round-trip (stream or loop mode; a buffered response goes one
-    %% way) wakes if the conn dies, instead of blocking on an ack that
-    %% never comes until TCP teardown reaps the worker. A loop response
-    %% also watches it for the conn's `DOWN` while it waits for messages.
-    _ = roadrunner_http2_worker_sync:monitor_conn(ConnPid),
+    %% No conn monitor here: a buffered response goes one way and never
+    %% waits on the conn, so only the stream / loop emitters, which do,
+    %% set one up (`roadrunner_http2_worker_sync:monitor_conn/1`).
     ok = roadrunner_stream_worker:run(?MODULE, h2, ConnPid, StreamId, Req, Dispatch),
     %% No explicit completion message: the worker is spawn_monitored by
     %% the conn, which finalises the stream on the worker's `DOWN`

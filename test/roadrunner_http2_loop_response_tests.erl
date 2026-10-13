@@ -96,6 +96,17 @@ loop_delivers_disconnect_on_conn_down_test_() ->
         FakeConn ! stop
     end}.
 
+%% `run/5` monitors the conn itself (the worker does not), so the conn
+%% really dying, not just a `'DOWN'` message, reaches the idle loop.
+loop_monitors_the_conn_test_() ->
+    {spawn, fun() ->
+        {FakeConn, Worker} = spawn_loop_with_state(self()),
+        ok = wait_until_looping(Worker),
+        exit(FakeConn, kill),
+        ok = wait_for_exit(Worker, 1000),
+        ?assertEqual(conn_down, recv_disconnect())
+    end}.
+
 %% --- OTP messages are answered, not delivered to the handler ---
 
 loop_answers_otp_messages_test() ->

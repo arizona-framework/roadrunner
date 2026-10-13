@@ -52,6 +52,9 @@ conn (which owns HPACK encoder state and serialises wire writes).
     roadrunner_handler:stream_fun()
 ) -> ok.
 run(ConnPid, StreamId, Status, Headers, Fun) ->
+    %% Every frame below waits on the conn's ack: monitor it so a dead conn
+    %% wakes the worker instead of leaving it blocked.
+    _ = roadrunner_http2_worker_sync:monitor_conn(ConnPid),
     ok = roadrunner_http2_worker_sync:send_headers(ConnPid, StreamId, Status, Headers, false),
     erase(?FIN_KEY),
     Send = fun(Data, FinFlag) -> do_send(ConnPid, StreamId, Data, FinFlag) end,
