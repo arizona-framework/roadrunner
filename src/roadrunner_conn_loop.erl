@@ -874,73 +874,100 @@ handle_request_bytes(
 %% closure (passive `gen_tcp:recv` with the request_timeout deadline).
 %% Manual buffering builds a body_reader the handler will pull from
 %% via `roadrunner_req:read_body/1,2`.
+%%
+%% The framing is decided once, up front. An auto-mode request without
+%% `Content-Length` or `Transfer-Encoding` has no body (RFC 9112 §6.3),
+%% so it skips the recv closure entirely: the bodyless GET is the
+%% common request, and nothing about it reads the socket. Any bytes
+%% already buffered are the next pipelined request and stay in
+%% `buffered`.
 -spec read_body_phase(#loop_state{}, roadrunner_req:request(), integer()) -> no_return().
-read_body_phase(
-    #loop_state{
-        socket = Socket,
-        min_rate = MinRate,
-        body_buffering = BodyMode,
-        max_content_length = MaxCL,
-        http1_limits = {_ReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}
-    } = S,
+read_body_phase(#loop_state{body_buffering = BodyMode} = S, Req, Deadline) ->
+    case {BodyMode, roadrunner_conn:body_framing(Req)} of
+        {auto, none} ->
+            dispatch_phase(S, Req#{body => <<>>});
+        {auto, Framing} ->
+            read_auto_body(S, Req, Framing, Deadline);
+        {manual, {error, FramingReason}} ->
+            S2 = flush_out(S),
+            ok = rejection(S2, FramingReason),
+            _ = roadrunner_conn:send_bad_request(S2#loop_state.socket),
+            exit_normal(S2);
+        {manual, Framing} ->
+            BodyState = roadrunner_conn:make_body_reader(
+                Framing,
+                S#loop_state.buffered,
+                body_recv(S, Deadline),
+                S#loop_state.max_content_length,
+                trailer_limits(S)
+            ),
+            dispatch_phase(S, Req#{body_reader => BodyState})
+    end.
+
+%% Auto mode with a body (or a framing error the read reports): read it
+%% all before dispatch.
+-spec read_auto_body(
+    #loop_state{},
+    roadrunner_req:request(),
+    chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding},
+    integer()
+) -> no_return().
+read_auto_body(
+    #loop_state{socket = Socket, buffered = Buffered, max_content_length = MaxCL} = S,
     Req,
+    Framing,
     Deadline
 ) ->
-    Recv = roadrunner_conn:make_recv(Socket, Deadline, MinRate),
-    Buffered = S#loop_state.buffered,
-    %% Trailer headers (chunked bodies) obey the same caps as request
-    %% headers; the request-line cap doesn't apply to a trailer block.
-    TrailerLimits = {MaxHdrLine, MaxHdrBlock, MaxHdrCount},
-    case BodyMode of
-        auto ->
-            case roadrunner_conn:read_body(Req, Buffered, Recv, MaxCL, TrailerLimits) of
-                {ok, Body, Leftover} ->
-                    %% Leftover is bytes past the body — feed it
-                    %% back to the next read_request_phase iteration
-                    %% as pipelined leftover.
-                    dispatch_phase(S#loop_state{buffered = Leftover}, Req#{body => Body});
-                {error, content_length_too_large} ->
-                    S2 = flush_out(S),
-                    _ = roadrunner_conn:drain_oversized_body(Buffered, Socket, MaxCL),
-                    ok = rejection(S2, content_length_too_large),
-                    _ = roadrunner_conn:send_payload_too_large(Socket),
-                    exit_normal(S2);
-                {error, request_timeout} ->
-                    S2 = flush_out(S),
-                    _ = roadrunner_conn:send_request_timeout(Socket),
-                    exit_normal(S2);
-                {error, slow_client} ->
-                    exit_normal(S);
-                {error, drained} ->
-                    %% Listener draining while the peer was still
-                    %% uploading. No response: the request never
-                    %% completed, and the conn is going away anyway.
-                    exit_normal(S);
-                {error, BodyReason} ->
-                    S2 = flush_out(S),
-                    ok = rejection(S2, BodyReason),
-                    %% A chunked body's trailer block obeys the same header
-                    %% limits as request headers, so an oversized/too-many
-                    %% trailer reason maps to 431 the same way.
-                    _ = roadrunner_conn:send_status(
-                        Socket, roadrunner_conn:parse_error_status(BodyReason)
-                    ),
-                    exit_normal(S2)
-            end;
-        manual ->
-            case roadrunner_conn:body_framing(Req) of
-                {error, FramingReason} ->
-                    S2 = flush_out(S),
-                    ok = rejection(S2, FramingReason),
-                    _ = roadrunner_conn:send_bad_request(Socket),
-                    exit_normal(S2);
-                Framing ->
-                    BodyState = roadrunner_conn:make_body_reader(
-                        Framing, Buffered, Recv, MaxCL, TrailerLimits
-                    ),
-                    dispatch_phase(S, Req#{body_reader => BodyState})
-            end
+    Recv = body_recv(S, Deadline),
+    case roadrunner_conn:read_body(Framing, Buffered, Recv, MaxCL, trailer_limits(S)) of
+        {ok, Body, Leftover} ->
+            %% Leftover is bytes past the body — feed it
+            %% back to the next read_request_phase iteration
+            %% as pipelined leftover.
+            dispatch_phase(S#loop_state{buffered = Leftover}, Req#{body => Body});
+        {error, content_length_too_large} ->
+            S2 = flush_out(S),
+            _ = roadrunner_conn:drain_oversized_body(Buffered, Socket, MaxCL),
+            ok = rejection(S2, content_length_too_large),
+            _ = roadrunner_conn:send_payload_too_large(Socket),
+            exit_normal(S2);
+        {error, request_timeout} ->
+            S2 = flush_out(S),
+            _ = roadrunner_conn:send_request_timeout(Socket),
+            exit_normal(S2);
+        {error, slow_client} ->
+            exit_normal(S);
+        {error, drained} ->
+            %% Listener draining while the peer was still
+            %% uploading. No response: the request never
+            %% completed, and the conn is going away anyway.
+            exit_normal(S);
+        {error, BodyReason} ->
+            S2 = flush_out(S),
+            ok = rejection(S2, BodyReason),
+            %% A chunked body's trailer block obeys the same header
+            %% limits as request headers, so an oversized/too-many
+            %% trailer reason maps to 431 the same way.
+            _ = roadrunner_conn:send_status(
+                Socket, roadrunner_conn:parse_error_status(BodyReason)
+            ),
+            exit_normal(S2)
     end.
+
+%% The body's recv closure: passive reads bounded by the request
+%% deadline, with the anti-slowloris rate anchored at this call.
+-spec body_recv(#loop_state{}, integer()) ->
+    fun(() -> {ok, binary()} | {error, term()}).
+body_recv(#loop_state{socket = Socket, min_rate = MinRate}, Deadline) ->
+    roadrunner_conn:make_recv(Socket, Deadline, MinRate).
+
+%% Trailer headers (chunked bodies) obey the same caps as request
+%% headers; the request-line cap doesn't apply to a trailer block.
+-spec trailer_limits(#loop_state{}) -> {pos_integer(), pos_integer(), pos_integer()}.
+trailer_limits(#loop_state{http1_limits = {_ReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}}) ->
+    {MaxHdrLine, MaxHdrBlock, MaxHdrCount}.
 
 %% --- dispatch phase ---
 %%
@@ -1396,7 +1423,8 @@ ws_session_wake(S, Req, Response, MRef, SessPid, ReqStart, Metadata) ->
 
 %% Manual-mode body_reader owns its post-body leftover (returned by
 %% `drain_body/1`). Auto-mode stashes the leftover in the loop state's
-%% `buffered` field — set by `read_body_phase` on `read_body/4` return.
+%% `buffered` field — set by `read_auto_body/4` from the body read, or
+%% left as is by `read_body_phase/3` for a request with no body.
 -spec pipelined_leftover(roadrunner_req:request(), #loop_state{}, binary()) -> binary().
 pipelined_leftover(Req, _S, ManualLeftover) when is_map_key(body_reader, Req) ->
     ManualLeftover;

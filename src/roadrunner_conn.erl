@@ -793,9 +793,14 @@ resolve_handler({router, ListenerName}, Req) ->
 allow_header_value(Allowed) ->
     iolist_to_binary(lists:join(~", ", Allowed)).
 
+%% Read a whole body framed by `Framing` (from `body_framing/1`). A
+%% request without one (`none`) has no body to read, so the conn loop
+%% answers it without coming here.
 -doc false.
 -spec read_body(
-    roadrunner_req:request(),
+    chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding},
     binary(),
     fun(() -> {ok, binary()} | {error, term()}),
     non_neg_integer(),
@@ -807,24 +812,14 @@ allow_header_value(Allowed) ->
         | bad_content_length
         | bad_transfer_encoding
         | term()}.
-read_body(Req, Buffered, RecvFun, MaxCL, TrailerLimits) ->
-    case body_framing(Req) of
-        none ->
-            %% Per RFC 9112 §6.3: a request without `Content-Length`
-            %% or `Transfer-Encoding` has a zero-length message body.
-            %% Any leftover bytes in `Buffered` belong to a pipelined
-            %% next request — preserve them as `Leftover` so the conn
-            %% can feed them into the next `reading_request` parse.
-            {ok, <<>>, Buffered};
-        chunked ->
-            read_chunked(Buffered, RecvFun, MaxCL, <<>>, TrailerLimits);
-        {content_length, N} when N > MaxCL ->
-            {error, content_length_too_large};
-        {content_length, N} ->
-            read_body_until(N, Buffered, RecvFun);
-        {error, _} = Err ->
-            Err
-    end.
+read_body(chunked, Buffered, RecvFun, MaxCL, TrailerLimits) ->
+    read_chunked(Buffered, RecvFun, MaxCL, <<>>, TrailerLimits);
+read_body({content_length, N}, _Buffered, _RecvFun, MaxCL, _TrailerLimits) when N > MaxCL ->
+    {error, content_length_too_large};
+read_body({content_length, N}, Buffered, RecvFun, _MaxCL, _TrailerLimits) ->
+    read_body_until(N, Buffered, RecvFun);
+read_body({error, _} = Err, _Buffered, _RecvFun, _MaxCL, _TrailerLimits) ->
+    Err.
 
 %% RFC 9110 §10.1.1: when a request carries `Expect: 100-continue` and
 %% we're about to read a body, send `HTTP/1.1 100 Continue` so clients
