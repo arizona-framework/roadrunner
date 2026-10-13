@@ -661,9 +661,13 @@ handle_frame({window_update, StreamId, Inc}, #loop{streams = Streams} = State) -
             case SW + Inc of
                 New when New > ?MAX_WINDOW ->
                     %% RFC 9113 §6.9.1: stream-level overflow is a
-                    %% stream error, not a connection error.
+                    %% stream error, not a connection error. The stream's
+                    %% worker may still be running, so tear the stream
+                    %% down the way a peer reset does: the worker is told
+                    %% and demonitored (its exit must not find the stream
+                    %% gone and take the conn down) and its slot released.
                     _ = send_rst_stream(State, StreamId, flow_control_error),
-                    frame_loop(remove_stream(State, StreamId));
+                    frame_loop(reset_stream(State, StreamId));
                 New ->
                     Stream1 = Stream#{send_window := New},
                     State1 = State#loop{streams = Streams#{StreamId := Stream1}},
@@ -1641,9 +1645,10 @@ uncount_stream(#loop{streams = Streams, live_streams = Live} = State, StreamId) 
             State
     end.
 
-%% Peer sent RST_STREAM for a stream we have alive. Tell the worker
-%% (if any) to bail, then drop our stream entry. Pending sends get
-%% reset notifications so workers waiting on `h2_send_ack` unwind.
+%% Reset a stream we have alive: the peer sent RST_STREAM, or we sent
+%% one for a stream-level flow-control error. Tell the worker (if any)
+%% to bail, then drop our stream entry. Pending sends get reset
+%% notifications so workers waiting on `h2_send_ack` unwind.
 reset_stream(State0, StreamId) ->
     #loop{streams = Streams, worker_refs = Refs} = State = uncount_stream(State0, StreamId),
     #{
