@@ -491,24 +491,6 @@ and slot a little longer.
 **Scope:** small-medium: one shared close step for the HTTP/1.1 early-response
 paths.
 
-### Clean up a listener stopped by `roadrunner:stop_listener/1` — small
-
-**What:** `roadrunner:stop_listener/1` stops a listener with
-`supervisor:terminate_child/2`. The listener does not trap exits, so the
-shutdown kills it without running `terminate/2`, and the `persistent_term`
-entries it publishes (`{roadrunner_routes, Name}` and
-`{roadrunner_route_rate_limit, Name}`) stay behind, holding the compiled
-routes and the route store's counter until a listener of the same name
-replaces them. `roadrunner_listener:stop/1` (`gen_server:stop/1`) does run
-`terminate/2`.
-
-**Why deferred:** trapping exits turns the exit of every process linked to the
-listener (the QUIC pool shares its fate today) into a message to handle, so
-each link needs its own decision. The leak is bounded by the number of distinct
-listener names stopped.
-
-**Scope:** small.
-
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>

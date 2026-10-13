@@ -834,6 +834,11 @@ reload_routes(Name, Routes) ->
 -doc false.
 -spec init(opts()) -> {ok, #state{}} | {stop, term()}.
 init(#{port := Port} = Opts) ->
+    %% Trap exits so a supervisor shutdown runs `terminate/2`, which erases
+    %% what `publish_routes/3` puts in `persistent_term`. A linked process
+    %% (acceptor, overload queue, QUIC pool) exiting abnormally still takes
+    %% the listener down with it (`handle_info/2`).
+    _ = process_flag(trap_exit, true),
     ListenerName = listener_name(),
     ProtoOpts = build_proto_opts(Opts, ListenerName),
     RouteBuckets = publish_routes(ListenerName, Opts, ProtoOpts),
@@ -861,9 +866,12 @@ init(#{port := Port} = Opts) ->
                     %% TCP bound but QUIC failed — release the TCP port
                     %% so the failed start doesn't leave it held.
                     ok = close_tcp(LSocket),
+                    ok = erase_routes(ProtoOpts),
                     {stop, {listen_failed, Reason}}
             end;
         {error, Reason} ->
+            %% A failed start never reaches `terminate/2`.
+            ok = erase_routes(ProtoOpts),
             {stop, {listen_failed, Reason}}
     end.
 
@@ -953,19 +961,12 @@ stream_credit(_ProtoOpts) -> on_receipt.
 
 %% The pool is a supervisor, so it can only be `start_link`ed - which
 %% makes this gen_server its parent (the pool then lives as long as the
-%% listener, and they share fate). Trap exits only across the start so a
-%% bind failure surfaces as `{error, _}` rather than the supervisor's
-%% startup EXIT killing this otherwise non-trapping process. Trap is
-%% restored immediately; any stray trapped EXIT left in the mailbox is
-%% harmlessly dropped by the catch-all `handle_info/2`.
+%% listener, and they share fate). The listener traps exits (`init/1`), so
+%% a bind failure surfaces as `{error, _}` rather than the supervisor's
+%% startup EXIT killing it, and `init/1` then stops.
 -spec start_quic_pool(inet:port_number(), map()) -> {ok, pid()} | {error, term()}.
 start_quic_pool(Port, PoolOpts) ->
-    OldTrap = process_flag(trap_exit, true),
-    try
-        roadrunner_quic_listener_sup:start_link(Port, PoolOpts)
-    after
-        _ = process_flag(trap_exit, OldTrap)
-    end.
+    roadrunner_quic_listener_sup:start_link(Port, PoolOpts).
 
 %% Pin a free UDP port with a reuseport probe socket so all pool
 %% listeners bind the same concrete port; a fixed port is used as-is.
@@ -2216,6 +2217,14 @@ handle_info(route_rate_limit_sweep, #state{route_buckets = Table} = State) ->
     _ = roadrunner_route_rate_limit:evict_full(Table, erlang:monotonic_time(millisecond)),
     _ = erlang:send_after(?ROUTE_RATE_LIMIT_SWEEP_INTERVAL, self(), route_rate_limit_sweep),
     {noreply, State};
+handle_info({'EXIT', _Pid, normal}, State) ->
+    %% An acceptor ends normally once the listen socket is closed.
+    {noreply, State};
+handle_info({'EXIT', _Pid, Reason}, State) ->
+    %% A linked acceptor, overload queue or QUIC pool died: the listener
+    %% goes down with it, as it would without trapping exits, but through
+    %% `terminate/2`, and its supervisor restarts it.
+    {stop, Reason, State};
 handle_info(_Msg, State) ->
     {noreply, State}.
 
