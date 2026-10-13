@@ -979,7 +979,8 @@ read_body(manual, Answer, S, Req, Framing, MaxCL, Resolved, Deadline) ->
     case Answer of
         continue ->
             #loop_state{socket = Socket, min_rate = MinRate} = S,
-            Reader = BodyState#{continue => {Socket, Deadline, MinRate}},
+            Owed = atomics:new(1, []),
+            Reader = BodyState#{continue => {Socket, Deadline, MinRate, Owed}},
             dispatch_phase(flush_out(S), Req#{body_reader => Reader}, Resolved);
         none ->
             dispatch_phase(S, Req#{body_reader => BodyState}, Resolved)
@@ -1262,26 +1263,29 @@ dispatch_response(S0, _Handler, Req, {websocket, Mod, State, Headers}) when
 dispatch_response(
     #loop_state{socket = Socket, alt_svc = AltSvc} = S0,
     _Handler,
-    _Req,
+    Req,
     {stream, Status, Headers0, Fun}
 ) when
     is_function(Fun, 1)
 ->
     %% The stream writer owns the wire from here — flush queued
-    %% responses ahead of its first bytes.
+    %% responses ahead of its first bytes, and the 100 a client may still
+    %% hold its body back for ahead of the head.
     S = flush_out(S0),
+    ok = roadrunner_conn:continue_before_stream(Req),
     Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     _ = roadrunner_stream_response:run(Socket, Status, Headers, Fun),
     S;
 dispatch_response(
     #loop_state{socket = Socket, alt_svc = AltSvc} = S0,
     Handler,
-    _Req,
+    Req,
     {loop, Status, Headers0, LoopState}
 ) when
     is_integer(Status)
 ->
     S = flush_out(S0),
+    ok = roadrunner_conn:continue_before_stream(Req),
     Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     _ = roadrunner_loop_response:run(Socket, Status, Headers, Handler, LoopState),
     S;
