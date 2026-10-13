@@ -40,11 +40,11 @@ Returns when the handler's `handle_info/3` returns `{stop, _}`.
     {module(), term()}
 ) -> ok.
 run(ConnPid, StreamId, Status, Headers, {Handler, State}) ->
+    %% Monitor the conn before the first ack wait, so both the sync sends
+    %% and an idle `info_loop` blocked waiting for a message wake on the
+    %% conn's `DOWN` instead of leaking once the conn is gone.
+    _ = roadrunner_http2_worker_sync:monitor_conn(ConnPid),
     ok = roadrunner_http2_worker_sync:send_headers(ConnPid, StreamId, Status, Headers, false),
-    %% The worker already monitors the conn (see
-    %% `roadrunner_http2_stream_worker:init/4`), so an idle `info_loop`
-    %% blocked waiting for a message wakes on the conn's `DOWN` instead
-    %% of leaking once the conn is gone.
     Push = make_push(ConnPid, StreamId),
     info_loop(ConnPid, StreamId, Handler, Push, State).
 

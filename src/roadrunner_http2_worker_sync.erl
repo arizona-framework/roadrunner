@@ -8,8 +8,10 @@
 %% for the conn's `{h2_send_ack, Ref}`; a conn-side stream reset
 %% (`{h2_stream_reset, _}`) exits the worker with `stream_reset`.
 %%
-%% `monitor_conn/1` is called once per worker, before the first sync, so
-%% a `sync/2` blocked on an ack also wakes if the conn process dies. The
+%% `monitor_conn/1` is called once per worker by the stream / loop
+%% emitters, before their first sync (a buffered response never waits on
+%% the conn, so it skips the monitor), so a `sync/2` blocked on an ack also
+%% wakes if the conn process dies. The
 %% ack never arrives once the conn is gone, so without the monitor the
 %% worker would block until the conn's TCP teardown reaped it; the
 %% monitor turns that into a prompt `conn_down` exit. The worker is
