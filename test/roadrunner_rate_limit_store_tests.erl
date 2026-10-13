@@ -126,29 +126,46 @@ telemetry_bumps_counter_test() ->
     ok = ?M:throttled_telemetry(some_listener, Counter, max_concurrent_requests),
     ?assertEqual(2, atomics:get(Counter, 1)).
 
-%% --- rate_limit_evict_idle/4 ---
+%% --- rate_limit_evict_full/4 ---
 
-evicts_only_idle_rows_test() ->
+evicts_only_full_rows_test() ->
     Table = new_table(),
-    true = ets:insert(Table, {{1, 1, 1, 1}, 5000, 0}),
-    true = ets:insert(Table, {{2, 2, 2, 2}, 5000, 1000}),
-    %% Now=2000, ttl=1500 → cutoff 500. Only the row last touched at 0 is idle.
-    ?assertEqual(1, ?M:rate_limit_evict_idle(Table, 2000, 1500)),
-    ?assertEqual([], ets:lookup(Table, {1, 1, 1, 1})),
-    ?assertMatch([{{2, 2, 2, 2}, _, _}], ets:lookup(Table, {2, 2, 2, 2})).
+    %% Rate 2 units/ms, Cap 2000: an empty bucket at 0 is full at 1000, a
+    %% half one at 500 full at 1000 too, one spent at 900 full at 1900.
+    true = ets:insert(Table, {{1, 1, 1, 1}, 0, 0}),
+    true = ets:insert(Table, {{2, 2, 2, 2}, 1000, 500}),
+    true = ets:insert(Table, {{3, 3, 3, 3}, 0, 900}),
+    ?assertEqual(0, ?M:rate_limit_evict_full(Table, 999, 2, 2000)),
+    ?assertEqual(2, ?M:rate_limit_evict_full(Table, 1000, 2, 2000)),
+    ?assertMatch([{{3, 3, 3, 3}, _, _}], ets:tab2list(Table)).
 
 evict_empty_table_test() ->
     Table = new_table(),
-    ?assertEqual(0, ?M:rate_limit_evict_idle(Table, 2000, 1500)).
+    ?assertEqual(0, ?M:rate_limit_evict_full(Table, 2000, 2, 2000)).
 
-evict_clears_all_idle_in_one_pass_test() ->
+evict_clears_all_full_in_one_pass_test() ->
     Table = new_table(),
     true = ets:insert(Table, {{1, 1, 1, 1}, 0, 0}),
     true = ets:insert(Table, {{2, 2, 2, 2}, 0, 0}),
     true = ets:insert(Table, {{3, 3, 3, 3}, 0, 0}),
-    %% All three idle rows are evicted in a single pass (no per-tick budget).
-    ?assertEqual(3, ?M:rate_limit_evict_idle(Table, 1000000, 1)),
+    %% All three full rows are evicted in a single pass (no per-tick budget).
+    ?assertEqual(3, ?M:rate_limit_evict_full(Table, 1000000, 1, cap(1, 1))),
     ?assertEqual(0, ets:info(Table, size)).
+
+idle_bucket_keeps_its_limit_test() ->
+    %% 100 requests an hour: a peer that spends them all and waits 70s is
+    %% still about 98 requests short. The sweep must not hand it a fresh
+    %% bucket, so it gets one more request and then waits for the refill.
+    Table = new_table(),
+    Rate = 100,
+    Cap = cap(100, 3600),
+    Cost = cost(3600),
+    [allow = ?M:rate_limit_check(Table, ?IP, Rate, Cap, Cost, 0) || _ <- lists:seq(1, 100)],
+    ?assertEqual(0, ?M:rate_limit_evict_full(Table, 70000, Rate, Cap)),
+    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, Rate, Cap, Cost, 70000)),
+    ?assertMatch({deny, _}, ?M:rate_limit_check(Table, ?IP, Rate, Cap, Cost, 70000)),
+    %% Full again an hour after the burst was spent: dropped.
+    ?assertEqual(1, ?M:rate_limit_evict_full(Table, 3600000 + 72000, Rate, Cap)).
 
 %% --- helpers ---
 
@@ -170,7 +187,6 @@ proto_opts(RateLimit) ->
                     rate => 10,
                     burst => 20,
                     period => 30,
-                    idle_ttl => 60000,
                     sweep_interval => 10000,
                     table => Table
                 }
@@ -187,7 +203,6 @@ proto_opts_with_counter(Table) ->
             rate => 10,
             burst => 20,
             period => 30,
-            idle_ttl => 60000,
             sweep_interval => 10000,
             table => Table
         },

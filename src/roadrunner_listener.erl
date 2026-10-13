@@ -363,20 +363,20 @@ ops-tuning rationale.
     %% `#{rate := pos_integer()}` (requests allowed per `period`, required) with
     %% optional `period` (window in seconds, default 1, so `rate` is per-second
     %% unless set), `burst` (bucket capacity in requests, default = `rate`),
-    %% `idle_ttl` (ms a peer's bucket survives without traffic before eviction,
-    %% default 60000), and `sweep_interval` (ms between eviction passes, default
-    %% 10000). A peer exceeding the rate gets `429 Too Many Requests` +
-    %% `Retry-After` before the handler runs. Keyed on the real client IP, so
-    %% accurate behind a balancer when `proxy_protocol` is set. The per-IP
-    %% bucket is lock-free (last-write-wins), so concurrent connections from one
-    %% IP can momentarily admit up to that many requests past `burst`; it bounds
-    %% the sustained per-source rate, not exact simultaneity. A route can add a
-    %% rate of its own on top (`roadrunner_router:rate_limit()`).
+    %% and `sweep_interval` (ms between passes that drop the buckets full
+    %% again, default 10000; a bucket still refilling is kept, so a peer cannot
+    %% reset its limit by waiting). A peer exceeding the rate gets `429 Too
+    %% Many Requests` + `Retry-After` before the handler runs. Keyed on the real
+    %% client IP, so accurate behind a balancer when `proxy_protocol` is set.
+    %% The per-IP bucket is lock-free (last-write-wins), so concurrent
+    %% connections from one IP can momentarily admit up to that many requests
+    %% past `burst`; it bounds the sustained per-source rate, not exact
+    %% simultaneity. A route can add a rate of its own on top
+    %% (`roadrunner_router:rate_limit()`).
     rate_limit => #{
         rate := pos_integer(),
         period => pos_integer(),
         burst => pos_integer(),
-        idle_ttl => pos_integer(),
         sweep_interval => pos_integer()
     },
     %% When set, the per-connection process auto-hibernates after
@@ -1936,7 +1936,6 @@ build_rate_limit(RawOpt) ->
         rate := pos_integer(),
         burst := pos_integer(),
         period := pos_integer(),
-        idle_ttl := pos_integer(),
         sweep_interval := pos_integer()
     }.
 validate_rate_limit(undefined) ->
@@ -1946,7 +1945,7 @@ validate_rate_limit(Opts) when is_map(Opts) ->
     Resolved = maps:fold(
         fun(K, V, Acc) ->
             case
-                lists:member(K, [rate, burst, period, idle_ttl, sweep_interval]) andalso
+                lists:member(K, [rate, burst, period, sweep_interval]) andalso
                     is_integer(V) andalso V > 0
             of
                 true -> Acc#{K => V};
@@ -1962,7 +1961,6 @@ validate_rate_limit(Opts) when is_map(Opts) ->
                 rate => Rate,
                 burst => maps:get(burst, Resolved, Rate),
                 period => maps:get(period, Resolved, 1),
-                idle_ttl => maps:get(idle_ttl, Resolved, 60000),
                 sweep_interval => maps:get(sweep_interval, Resolved, 10000)
             };
         #{} ->
@@ -2207,15 +2205,19 @@ handle_info(
     #state{
         proto_opts = #{
             rate_limit := #{
-                table := Table, idle_ttl := IdleTtl, sweep_interval := Interval
+                table := Table,
+                rate := Rate,
+                burst := Burst,
+                period := Period,
+                sweep_interval := Interval
             }
         }
     } = State
 ) ->
-    %% Evict per-peer buckets idle past `idle_ttl` (bounded per tick), then
-    %% reschedule. Keeps the store bounded by the active-peer working set.
+    %% Evict the per-peer buckets full again, then reschedule. Keeps the store
+    %% bounded by the peers inside their refill window.
     NowMs = erlang:monotonic_time(millisecond),
-    _ = roadrunner_conn:rate_limit_evict_idle(Table, NowMs, IdleTtl),
+    _ = roadrunner_conn:rate_limit_evict_full(Table, NowMs, Rate, Burst * Period * 1000),
     _ = erlang:send_after(Interval, self(), rate_limit_sweep),
     {noreply, State};
 handle_info(route_rate_limit_sweep, #state{route_buckets = Table} = State) ->

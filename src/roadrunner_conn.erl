@@ -76,7 +76,7 @@
     route_rate_limit_check/6,
     route_rate_limit_evict/2,
     throttled_telemetry/3,
-    rate_limit_evict_idle/3,
+    rate_limit_evict_full/4,
     drain_oversized_body/3,
     send_internal_error/1,
     send_not_found/1,
@@ -248,14 +248,13 @@ deadline in milliseconds.
 
 %% Resolved per-peer rate-limit config, built by `roadrunner_listener` when the
 %% `rate_limit` opt is set: `rate` requests per `period` seconds with a `burst`
-%% bucket capacity, and an `idle_ttl`/`sweep_interval` (ms) eviction policy for
-%% the ETS `table` holding each peer's bucket. The cumulative refusal count
-%% lives in the top-level `rate_limited_counter`.
+%% bucket capacity, the ETS `table` holding each peer's bucket, and the
+%% `sweep_interval` (ms) between passes that drop the buckets full again. The
+%% cumulative refusal count lives in the top-level `rate_limited_counter`.
 -type rate_limit() :: #{
     rate := pos_integer(),
     burst := pos_integer(),
     period := pos_integer(),
-    idle_ttl := pos_integer(),
     sweep_interval := pos_integer(),
     table := ets:table()
 }.
@@ -559,19 +558,26 @@ throttled_telemetry(ListenerName, Counter, Reason) ->
     }).
 
 -doc """
-Evict every per-peer bucket idle since before `NowMs - IdleTtl`, in one
-`select_delete` pass, returning the number evicted. A single pass (rather than a
-per-tick row budget) is what actually bounds the store to the active-peer set: a
-budget would cap eviction below the rate new buckets are created under a
-high-cardinality scan, letting the table grow without limit. The pass runs on
-the listener gen_server (control plane, off the request path), so a full
-traversal every sweep tick is cheap.
+Evict every per-peer bucket that has refilled to its capacity `Cap` by `NowMs`
+(refilling `Rate` units a millisecond), in one `select_delete` pass, returning
+the number evicted. A full bucket is the same as none (a never-seen peer starts
+full), so dropping it hands no peer anything back, while a bucket still
+refilling stays however long its peer is idle: a peer cannot reset its limit by
+waiting. A single pass (rather than a per-tick row budget) is what actually
+bounds the store to the peers inside their refill window: a budget would cap
+eviction below the rate new buckets are created under a high-cardinality scan,
+letting the table grow without limit. The pass runs on the listener gen_server
+(control plane, off the request path), so a full traversal every sweep tick is
+cheap.
 """.
--spec rate_limit_evict_idle(ets:table(), integer(), pos_integer()) -> non_neg_integer().
-rate_limit_evict_idle(Table, NowMs, IdleTtl) ->
-    Cutoff = NowMs - IdleTtl,
-    %% Row is `{IP, Units, LastMs}`; delete those last touched before `Cutoff`.
-    Spec = [{{'_', '_', '$1'}, [{'<', '$1', Cutoff}], [true]}],
+-spec rate_limit_evict_full(ets:table(), integer(), pos_integer(), pos_integer()) ->
+    non_neg_integer().
+rate_limit_evict_full(Table, NowMs, Rate, Cap) ->
+    %% Row is `{IP, Units, LastMs}`; it is full once `Units` plus the refill
+    %% since `LastMs` reaches `Cap` (`roadrunner_rate_limit:refill/5`).
+    Spec = [
+        {{'_', '$1', '$2'}, [{'>=', {'+', '$1', {'*', {'-', NowMs, '$2'}, Rate}}, Cap}], [true]}
+    ],
     ets:select_delete(Table, Spec).
 
 -doc """
