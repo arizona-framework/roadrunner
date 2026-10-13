@@ -31,7 +31,7 @@
 %% - A `content-length` header MUST equal the received body length and MUST NOT
 %%   be repeated (RFC 9114 §4.1.2, RFC 9110 §8.6).
 
--export([from_headers/3]).
+-export([from_headers/3, from_headers_reading/2]).
 
 -export_type([build_error/0, request_context/0]).
 
@@ -68,7 +68,23 @@ handlers needing a flat binary call `iolist_to_binary/1`.
 """.
 -spec from_headers(roadrunner_http:headers(), iodata(), request_context()) ->
     {ok, roadrunner_req:request()} | {error, build_error()}.
-from_headers(Headers, Body, #{scheme := Scheme} = RequestContext) ->
+from_headers(Headers, Body, RequestContext) ->
+    build(Headers, Body, RequestContext, true).
+
+-doc """
+`from_headers/3` for a manual-mode request whose body is still to come: its
+declared `content-length` is checked against the DATA as it arrives, not
+here, and the request map carries an empty `body` for the conn to swap for
+a body reader.
+""".
+-spec from_headers_reading(roadrunner_http:headers(), request_context()) ->
+    {ok, roadrunner_req:request()} | {error, build_error()}.
+from_headers_reading(Headers, RequestContext) ->
+    build(Headers, <<>>, RequestContext, false).
+
+-spec build(roadrunner_http:headers(), iodata(), request_context(), boolean()) ->
+    {ok, roadrunner_req:request()} | {error, build_error()}.
+build(Headers, Body, #{scheme := Scheme} = RequestContext, CheckLength) ->
     maybe
         %% The parsed `:scheme` value is validated but deliberately
         %% discarded — the authoritative scheme comes from the conn
@@ -76,7 +92,7 @@ from_headers(Headers, Body, #{scheme := Scheme} = RequestContext) ->
         %% clients can lie about the pseudo-header value.
         {ok, Method, Path, Authority, Regular} ?= roadrunner_http:request_pseudo_headers(Headers),
         ok ?= check_banned(Regular),
-        ok ?= check_content_length(Regular, Body),
+        ok ?= check_content_length(Regular, Body, CheckLength),
         ok ?= roadrunner_http:check_request_authority(Authority, Regular, Scheme),
         {ok,
             roadrunner_http:build_request(
@@ -127,17 +143,18 @@ lower_name(<<_, Rest/binary>>) -> lower_name(Rest).
 %% not equal the bytes received in DATA frames (or a multi-valued or
 %% non-integer value) makes the request malformed; an absent header is always
 %% acceptable. The body size is taken only when a value is actually present.
--spec check_content_length(roadrunner_http:headers(), iodata()) ->
+%% A body still to come is not checked here (`from_headers_reading/2`).
+-spec check_content_length(roadrunner_http:headers(), iodata(), boolean()) ->
     ok | {error, content_length_mismatch}.
-check_content_length(Headers, Body) ->
+check_content_length(_Headers, _Body, false) ->
+    ok;
+check_content_length(Headers, Body, true) ->
     case roadrunner_http:request_content_length(Headers) of
         none ->
             ok;
-        {ok, Length} ->
-            case iolist_size(Body) of
-                Length -> ok;
-                _ -> {error, content_length_mismatch}
-            end;
-        error ->
-            {error, content_length_mismatch}
+        Declared ->
+            case roadrunner_http:body_length_fits(Declared, iolist_size(Body), true) of
+                true -> ok;
+                false -> {error, content_length_mismatch}
+            end
     end.

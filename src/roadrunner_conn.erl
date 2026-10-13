@@ -62,6 +62,9 @@
     scheme/1,
     make_body_reader/5,
     stream_body_reader/5,
+    with_body_reader/4,
+    send_body/4,
+    send_body_error/3,
     drain_body/1,
     keep_alive_decision/2,
     send_request_timeout/1,
@@ -1007,6 +1010,38 @@ stream_body_reader(Conn, StreamId, Deadline, Max, Done) ->
         recv => stream_recv(Conn, StreamId, Deadline),
         max => Max
     }.
+
+%% A request whose handler reads its body as it arrives (HTTP/2 and HTTP/3
+%% in manual mode): its buffered `body` gives way to a stream body reader
+%% pulling from this connection process, until `Timeout` ms from now and
+%% held to `Max` bytes.
+-doc false.
+-spec with_body_reader(
+    roadrunner_req:request(), pos_integer(), non_neg_integer(), non_neg_integer()
+) ->
+    roadrunner_req:request().
+with_body_reader(Req, StreamId, Timeout, Max) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    Reader = stream_body_reader(self(), StreamId, Deadline, Max, false),
+    (maps:remove(body, Req))#{body_reader => Reader}.
+
+%% The connection's answer to a stream body reader's demand (`stream_recv/3`
+%% receives it): DATA, `Fin` marking the body's end.
+-doc false.
+-spec send_body(pid(), pos_integer(), iodata(), boolean()) -> ok.
+send_body(Reader, StreamId, Data, Fin) ->
+    _ = Reader ! {roadrunner_body, StreamId, Data, Fin},
+    ok.
+
+%% The read failing with `Reason`, for a reader waiting on it (`undefined`:
+%% none is).
+-doc false.
+-spec send_body_error(pid() | undefined, pos_integer(), atom()) -> ok.
+send_body_error(undefined, _StreamId, _Reason) ->
+    ok;
+send_body_error(Reader, StreamId, Reason) ->
+    _ = Reader ! {roadrunner_body_error, StreamId, Reason},
+    ok.
 
 %% The recv of a stream body reader, run in the worker that reads the body:
 %% ask the connection for the stream's next DATA and wait for it, until the

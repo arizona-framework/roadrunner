@@ -150,6 +150,14 @@ content_length_mismatch_test() ->
         from(base() ++ [{~"content-length", ~"5"}], ~"abc")
     ).
 
+content_length_read_later_test() ->
+    %% A body read as it arrives is checked against its declared length then,
+    %% so the request builds without one, and its `body` is empty.
+    {ok, Req} = roadrunner_http3_request:from_headers_reading(
+        base() ++ [{~"host", ~"h"}, {~"content-length", ~"5"}], ctx()
+    ),
+    ?assertEqual(<<>>, maps:get(body, Req)).
+
 content_length_non_integer_test() ->
     ?assertEqual(
         {error, content_length_mismatch},

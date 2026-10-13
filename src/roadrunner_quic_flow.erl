@@ -22,6 +22,8 @@
     on_max_data_received/2,
     send_blocked/1,
     on_data_received/2,
+    hold/1,
+    on_data_consumed/2,
     should_send_max_data/1,
     grant_max_data/1,
     send_window/1,
@@ -49,6 +51,11 @@
     %% Receive side: our advertised limit on the peer.
     bytes_received = 0 :: non_neg_integer(),
     recv_max :: non_neg_integer(),
+    %% A held window grants new credit from the bytes its owner has consumed
+    %% (`on_data_consumed/2`) rather than the bytes received, so a reader that
+    %% falls behind holds the peer to one window past what it has read.
+    held = false :: boolean(),
+    bytes_consumed = 0 :: non_neg_integer(),
     %% The window size granted each refill.
     initial_max :: non_neg_integer()
 }).
@@ -122,19 +129,38 @@ on_data_received(Size, #flow{bytes_received = Received, recv_max = Max} = Flow) 
         false -> {ok, Flow#flow{bytes_received = NewReceived}}
     end.
 
+-doc """
+Grant this window's credit from the bytes its owner consumes
+(`on_data_consumed/2`) instead of the bytes received.
+""".
+-spec hold(t()) -> t().
+hold(Flow) ->
+    Flow#flow{held = true}.
+
+-doc "Record `Size` bytes the owner consumed from a held window.".
+-spec on_data_consumed(non_neg_integer(), t()) -> t().
+on_data_consumed(Size, #flow{bytes_consumed = Consumed} = Flow) ->
+    Flow#flow{bytes_consumed = Consumed + Size}.
+
 -doc "Whether enough of the window has been consumed to grant a new limit (RFC 9000 §4.1).".
 -spec should_send_max_data(t()) -> boolean().
-should_send_max_data(#flow{bytes_received = Received, recv_max = Max, initial_max = Initial}) ->
-    Received > Max - Initial * ?REFILL_NUM div ?REFILL_DEN.
+should_send_max_data(#flow{recv_max = Max, initial_max = Initial} = Flow) ->
+    credit_base(Flow) > Max - Initial * ?REFILL_NUM div ?REFILL_DEN.
 
 -doc """
 Grant a fresh receive limit: the bytes consumed so far plus a full window.
 Returns the new limit (to send in a MAX_DATA frame) and the updated state.
 """.
 -spec grant_max_data(t()) -> {non_neg_integer(), t()}.
-grant_max_data(#flow{bytes_received = Received, initial_max = Initial} = Flow) ->
-    NewMax = Received + Initial,
+grant_max_data(#flow{initial_max = Initial} = Flow) ->
+    NewMax = credit_base(Flow) + Initial,
     {NewMax, Flow#flow{recv_max = NewMax}}.
+
+%% The bytes the window's credit is counted from: received, or, held,
+%% consumed by its owner.
+-spec credit_base(t()) -> non_neg_integer().
+credit_base(#flow{held = true, bytes_consumed = Consumed}) -> Consumed;
+credit_base(#flow{bytes_received = Received}) -> Received.
 
 %% =============================================================================
 %% Queries

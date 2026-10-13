@@ -69,10 +69,6 @@ stream, so there is no burst to be lenient about.
 h3 shipped experimentally (`protocols => [http3]`, QPACK static-table
 only). Remaining work:
 
-- h3 manual-mode body reading (parity with HTTP/1.1 and HTTP/2): the
-  worker side is shared (the stream body reader in roadrunner_conn); the QUIC
-  layer grants a stream's receive credit as data arrives, so it first needs
-  to grant it as the worker reads
 - WebSocket over h3 (`websocket` shape, still `501`) — RFC 9220
   Extended CONNECT; do WebSocket over h2 (RFC 8441) first, since it's
   the more common transport and h2 has no WebSocket either

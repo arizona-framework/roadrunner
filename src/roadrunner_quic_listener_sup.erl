@@ -54,7 +54,11 @@
     max_streams_bidi := non_neg_integer(),
     connection_handler := fun((pid()) -> {ok, pid()} | {error, term()}),
     pool_size := non_neg_integer(),
-    ip => inet:ip_address()
+    ip => inet:ip_address(),
+    %% When a request stream's receive credit is granted back: as its data
+    %% arrives (the default), or as its owner consumes it
+    %% (`roadrunner_quic:consumed/3`), for a reader that pulls the body.
+    stream_credit => on_receipt | on_read
 }.
 
 %% =============================================================================
@@ -161,12 +165,9 @@ listener_opts(Port, PoolOpts, Registry, ReusePort) ->
         reuseport => ReusePort,
         registry => Registry
     },
-    %% Carry `ip` through to the per-listener bind only when the pool was
-    %% started with it, so an all-interfaces pool is unchanged.
-    case PoolOpts of
-        #{ip := IP} -> Base#{ip => IP};
-        #{} -> Base
-    end.
+    %% Carry `ip` (the per-listener bind) and `stream_credit` through only
+    %% when the pool was started with them, so a default pool is unchanged.
+    maps:merge(Base, maps:with([ip, stream_credit], PoolOpts)).
 
 -spec transport_params(non_neg_integer()) -> roadrunner_quic_transport_params:params().
 transport_params(MaxStreamsBidi) ->

@@ -23,6 +23,7 @@
     send_data/4,
     reset_stream/3,
     stop_sending/3,
+    consumed/3,
     close/2,
     close/3
 ]).
@@ -58,6 +59,17 @@ reset_stream(Conn, StreamId, ErrorCode) ->
 -spec stop_sending(pid(), non_neg_integer(), non_neg_integer()) -> ok.
 stop_sending(Conn, StreamId, ErrorCode) ->
     call(Conn, {stop_sending, StreamId, ErrorCode}).
+
+-doc """
+Report `Bytes` of a request stream consumed, on a connection whose request
+streams grant their credit as it is read (`stream_credit => on_read`): the
+connection grants the peer more once enough of the stream's window is read.
+Asynchronous, so the reader never waits on it.
+""".
+-spec consumed(pid(), non_neg_integer(), non_neg_integer()) -> ok.
+consumed(Conn, StreamId, Bytes) ->
+    _ = Conn ! {quic_consumed, StreamId, Bytes},
+    ok.
 
 -doc "Close the connection with an h3 error code (an application CONNECTION_CLOSE, no reason phrase).".
 -spec close(pid(), non_neg_integer()) -> ok.

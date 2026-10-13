@@ -36,6 +36,7 @@ new_request_stream_test() ->
             headers => undefined,
             body => [],
             body_len => 0,
+            unreleased => 0,
             body_cap => 8,
             frame_state => expecting_headers
         },

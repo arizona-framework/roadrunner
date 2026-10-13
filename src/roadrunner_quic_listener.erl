@@ -66,7 +66,10 @@
     %% table (owned by the pool supervisor) so a datagram landing on any pool
     %% socket routes to the owning connection; a standalone listener omits it
     %% and creates (and owns) its own.
-    registry => roadrunner_quic_cid_registry:t()
+    registry => roadrunner_quic_cid_registry:t(),
+    %% When a request stream's receive credit is granted back
+    %% (`roadrunner_quic_conn_state:config()`); `on_receipt` by default.
+    stream_credit => on_receipt | on_read
 }.
 
 -record(listener, {
@@ -82,7 +85,8 @@
     %% The base transport parameters (flow/stream/idle limits); the per-
     %% connection original/initial connection ids are filled in at spawn.
     transport_params :: roadrunner_quic_transport_params:params(),
-    handler :: fun((pid()) -> {ok, pid()} | {error, term()})
+    handler :: fun((pid()) -> {ok, pid()} | {error, term()}),
+    stream_credit = on_receipt :: on_receipt | on_read
 }).
 
 %% =============================================================================
@@ -155,7 +159,8 @@ init(
                 priv_key = PrivKey,
                 alpn = Alpn,
                 transport_params = TransportParams,
-                handler = Handler
+                handler = Handler,
+                stream_credit = maps:get(stream_credit, Opts, on_receipt)
             });
         {error, Reason} ->
             proc_lib:init_ack({error, Reason}),
@@ -385,7 +390,11 @@ set_owner_sync(ConnPid, Owner) ->
 ) ->
     roadrunner_quic_conn_state:config().
 conn_config(ClientDCID, ClientSCID, ServerSCID, Peer, #listener{
-    cert_chain = CertChain, priv_key = PrivKey, alpn = Alpn, transport_params = TransportParams
+    cert_chain = CertChain,
+    priv_key = PrivKey,
+    alpn = Alpn,
+    transport_params = TransportParams,
+    stream_credit = StreamCredit
 }) ->
     {EphPub, EphPriv} = crypto:generate_key(ecdh, x25519),
     #{
@@ -402,5 +411,6 @@ conn_config(ClientDCID, ClientSCID, ServerSCID, Peer, #listener{
         },
         eph_pub => EphPub,
         eph_priv => EphPriv,
-        server_random => crypto:strong_rand_bytes(32)
+        server_random => crypto:strong_rand_bytes(32),
+        stream_credit => StreamCredit
     }.
