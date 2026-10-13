@@ -892,133 +892,114 @@ read_body_phase(#loop_state{body_buffering = BodyMode, dispatch = Dispatch} = S,
     case {BodyMode, roadrunner_conn:body_framing(Req)} of
         {auto, none} ->
             dispatch_phase(S, Req#{body => <<>>}, Resolved);
-        {auto, Framing} ->
-            MaxCL = roadrunner_conn:body_cap(Resolved, S#loop_state.max_content_length),
-            {Waiting, S1} = continue(S, Req, Framing, MaxCL),
-            read_auto_body(S1, Req, Framing, Waiting, MaxCL, Resolved, Deadline);
         {manual, {error, FramingReason}} ->
             S2 = flush_out(S),
             ok = rejection(S2, FramingReason),
             _ = roadrunner_conn:send_bad_request(S2#loop_state.socket),
             exit_normal(S2);
-        {manual, Framing} ->
+        {_, Framing} ->
             MaxCL = roadrunner_conn:body_cap(Resolved, S#loop_state.max_content_length),
-            BodyState = roadrunner_conn:make_body_reader(
-                Framing,
-                S#loop_state.buffered,
-                body_recv(S, Deadline),
-                MaxCL,
-                trailer_limits(S)
-            ),
-            {S1, BodyState1} = defer_continue(S, Req, Framing, MaxCL, BodyState, Deadline),
-            dispatch_phase(S1, Req#{body_reader => BodyState1}, Resolved)
+            case expect_answer(S, Req, Framing, MaxCL) of
+                too_large ->
+                    %% The client holds back a body over its cap for a 100:
+                    %% the 413 goes out before it sends a byte of it, so
+                    %% there is nothing to drain.
+                    refuse_too_large(S);
+                Answer ->
+                    read_body(BodyMode, Answer, S, Req, Framing, MaxCL, Resolved, Deadline)
+            end
     end.
 
-%% RFC 9110 §10.1.1 in manual mode: the middlewares and the handler decide
-%% from the request's headers whether its body is wanted, so a client holding
-%% its body back for `Expect: 100-continue` is asked for it only when the
+%% RFC 9110 §10.1.1: how a request is answered for its `Expect` field before
+%% its body is read. A client holding its body back for `Expect:
+%% 100-continue` (no body bytes came with the headers, so it did wait) is
+%% sent `too_large`, the 413 its body would earn, when its declared length is
+%% over the body cap `MaxCL`, or else `continue`, the 100 that asks for it,
+%% when the framing promises a body. `none` for everything else.
+-spec expect_answer(
+    #loop_state{},
+    roadrunner_req:request(),
+    none
+    | chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding},
+    non_neg_integer()
+) -> continue | too_large | none.
+expect_answer(#loop_state{buffered = ~""}, Req, Framing, MaxCL) ->
+    case roadrunner_conn:expects_continue(Req) of
+        true ->
+            case Framing of
+                chunked -> continue;
+                {content_length, N} when N > MaxCL -> too_large;
+                {content_length, N} when N > 0 -> continue;
+                _ -> none
+            end;
+        false ->
+            none
+    end;
+expect_answer(_S, _Req, _Framing, _MaxCL) ->
+    none.
+
+%% Read the body (auto mode) or hand the handler its reader (manual mode),
+%% with the request's `Expect` answered. Auto mode asks for the body now.
+%% Manual mode lets the middlewares and the handler decide from the
+%% request's headers whether its body is wanted: the 100 goes out when the
 %% handler first reads it (`roadrunner_conn:consume_body_reader/2` sends it,
 %% from the body reader's `continue`). A handler that answers without
 %% reading never asks: the client sends nothing, and the connection closes
 %% after the response, as the client may still send the body once it stops
-%% waiting. The 100 is owed under `continue/4`'s conditions, and queued
-%% pipelined responses go out first, as there, so it cannot overtake them.
-%% The read's slow-client rate window starts with the 100, when the client
-%% can start sending, so `continue` carries what the read's recv is made of.
--spec defer_continue(
+%% waiting. Queued pipelined responses go out ahead of the 100 either way.
+%% The manual read's slow-client rate window starts with the 100, when the
+%% client can start sending, so `continue` carries what its recv is made of.
+-spec read_body(
+    auto | manual,
+    continue | none,
     #loop_state{},
     roadrunner_req:request(),
-    chunked | {content_length, non_neg_integer()},
+    none
+    | chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding},
     non_neg_integer(),
-    roadrunner_req:body_reader(),
+    roadrunner_conn:resolved(),
     integer()
-) -> {#loop_state{}, roadrunner_req:body_reader()}.
-defer_continue(
-    #loop_state{buffered = ~"", socket = Socket, min_rate = MinRate} = S,
-    Req,
-    Framing,
-    MaxCL,
-    BodyState,
-    Deadline
+) -> no_return().
+read_body(
+    auto, continue, #loop_state{socket = Socket} = S, Req, Framing, MaxCL, Resolved, Deadline
 ) ->
-    case roadrunner_conn:expects_continue(Req) andalso body_to_read(Framing, MaxCL) of
-        true ->
-            {flush_out(S), BodyState#{continue => {Socket, Deadline, MinRate}}};
-        false ->
-            {S, BodyState}
-    end;
-defer_continue(S, _Req, _Framing, _MaxCL, BodyState, _Deadline) ->
-    {S, BodyState}.
-
-%% RFC 9110 §10.1.1: a client gating its body on `Expect: 100-continue` is
-%% WAITING for the interim 100, unless body bytes already arrived with the
-%% headers (then it didn't wait). Send it once the framing says a body we
-%% will read is coming: not for a request without one, nor for a declared
-%% length over the request's body cap `MaxCL`, whose 413 then goes out
-%% before the client sends a byte of it. Queued pipelined responses reach
-%% the client first. Returns whether the client is still holding its body
-%% back.
--spec continue(
-    #loop_state{},
-    roadrunner_req:request(),
-    none
-    | chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding},
-    non_neg_integer()
-) -> {boolean(), #loop_state{}}.
-continue(#loop_state{buffered = ~"", socket = Socket} = S, Req, Framing, MaxCL) ->
-    case roadrunner_conn:expects_continue(Req) of
-        true ->
-            case body_to_read(Framing, MaxCL) of
-                true ->
-                    S1 = flush_out(S),
-                    ok = roadrunner_conn:send_continue(Socket),
-                    {false, S1};
-                false ->
-                    {true, S}
-            end;
-        false ->
-            {false, S}
-    end;
-continue(S, _Req, _Framing, _MaxCL) ->
-    {false, S}.
-
-%% Whether the framing promises a body this conn will read.
--spec body_to_read(
-    none
-    | chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding},
-    non_neg_integer()
-) -> boolean().
-body_to_read(chunked, _MaxCL) -> true;
-body_to_read({content_length, N}, MaxCL) when N > 0, N =< MaxCL -> true;
-body_to_read(_Framing, _MaxCL) -> false.
+    S1 = flush_out(S),
+    ok = roadrunner_conn:send_continue(Socket),
+    read_auto_body(S1, Req, Framing, MaxCL, Resolved, Deadline);
+read_body(auto, none, S, Req, Framing, MaxCL, Resolved, Deadline) ->
+    read_auto_body(S, Req, Framing, MaxCL, Resolved, Deadline);
+read_body(manual, Answer, S, Req, Framing, MaxCL, Resolved, Deadline) ->
+    BodyState = roadrunner_conn:make_body_reader(
+        Framing, S#loop_state.buffered, body_recv(S, Deadline), MaxCL, trailer_limits(S)
+    ),
+    case Answer of
+        continue ->
+            #loop_state{socket = Socket, min_rate = MinRate} = S,
+            Reader = BodyState#{continue => {Socket, Deadline, MinRate}},
+            dispatch_phase(flush_out(S), Req#{body_reader => Reader}, Resolved);
+        none ->
+            dispatch_phase(S, Req#{body_reader => BodyState}, Resolved)
+    end.
 
 %% Auto mode with a body (or a framing error the read reports): read it
-%% all before dispatch, under the request's body cap `MaxCL`. `Waiting` is
-%% whether the client is still holding its body back for a 100 it did not
-%% get (`continue/4`); `Resolved` is the request's routing, for dispatch.
+%% all before dispatch, under the request's body cap `MaxCL`; `Resolved` is
+%% the request's routing, for dispatch.
 -spec read_auto_body(
     #loop_state{},
     roadrunner_req:request(),
     chunked
     | {content_length, non_neg_integer()}
     | {error, bad_content_length | bad_transfer_encoding},
-    boolean(),
     non_neg_integer(),
     roadrunner_conn:resolved(),
     integer()
 ) -> no_return().
 read_auto_body(
-    #loop_state{socket = Socket, buffered = Buffered} = S,
-    Req,
-    Framing,
-    Waiting,
-    MaxCL,
-    Resolved,
-    Deadline
+    #loop_state{socket = Socket, buffered = Buffered} = S, Req, Framing, MaxCL, Resolved, Deadline
 ) ->
     Recv = body_recv(S, Deadline),
     case roadrunner_conn:read_body(Framing, Buffered, Recv, MaxCL, trailer_limits(S)) of
@@ -1029,12 +1010,8 @@ read_auto_body(
             dispatch_phase(S#loop_state{buffered = Leftover}, Req#{body => Body}, Resolved);
         {error, content_length_too_large} ->
             S2 = flush_out(S),
-            %% A client still waiting for a 100 sends no body, so there is
-            %% none to drain ahead of the 413.
-            _ = Waiting orelse roadrunner_conn:drain_oversized_body(Buffered, Socket, MaxCL),
-            ok = rejection(S2, content_length_too_large),
-            _ = roadrunner_conn:send_payload_too_large(Socket),
-            exit_normal(S2);
+            ok = roadrunner_conn:drain_oversized_body(Buffered, Socket, MaxCL),
+            refuse_too_large(S2);
         {error, request_timeout} ->
             S2 = flush_out(S),
             _ = roadrunner_conn:send_request_timeout(Socket),
@@ -1193,7 +1170,7 @@ ensure_close_signaled(_S, _Req, Response) ->
 %% Prepend `Connection: close` exactly when the server closes a connection
 %% that would otherwise be reused: this request trips the keep-alive ceiling,
 %% or the handler answered without asking for a body the client holds back
-%% for a 100 Continue (`defer_continue/6`; RFC 9110 §10.1.1 asks a server
+%% for a 100 Continue (`read_body/8`; RFC 9110 §10.1.1 asks a server
 %% answering before the body to say whether it closes). In the common case the
 %% response has no `connection` header, so the prepend is the only token; if a
 %% handler set one explicitly, `close` is the first token on the wire and takes
@@ -1536,7 +1513,7 @@ pipelined_leftover(_Req, #loop_state{buffered = Buf}, _ManualLeftover) ->
 -spec drain_body_if_manual(roadrunner_req:request()) ->
     {ok, binary()} | {error, term()}.
 drain_body_if_manual(#{body_reader := #{continue := _}}) ->
-    %% The handler answered without asking for the body (`defer_continue/6`):
+    %% The handler answered without asking for the body (`read_body/8`):
     %% no 100 went out and the client is holding the body back, so there is
     %% nothing to drain, and the connection closes.
     {error, body_not_requested};
@@ -1544,6 +1521,15 @@ drain_body_if_manual(#{body_reader := _} = Req) ->
     roadrunner_conn:drain_body(Req);
 drain_body_if_manual(_Req) ->
     {ok, <<>>}.
+
+%% 413 + close for a body over its cap, after any queued pipelined
+%% responses.
+-spec refuse_too_large(#loop_state{}) -> no_return().
+refuse_too_large(S) ->
+    S1 = flush_out(S),
+    ok = rejection(S1, content_length_too_large),
+    _ = roadrunner_conn:send_payload_too_large(S1#loop_state.socket),
+    exit_normal(S1).
 
 -spec rejection(#loop_state{}, atom()) -> ok.
 rejection(#loop_state{listener_name = ListenerName, peer = Peer}, Reason) ->

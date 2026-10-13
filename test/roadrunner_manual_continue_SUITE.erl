@@ -11,6 +11,8 @@ from the headers alone never has the client upload it.
 -export([suite/0, all/0, init_per_testcase/2, end_per_testcase/2]).
 -export([
     handler_answering_without_reading_gets_no_body/1,
+    body_over_the_cap_refused_from_the_headers/1,
+    empty_body_is_not_asked_for/1,
     handler_reading_asks_for_the_body/1,
     chunked_body_is_asked_for_on_read/1,
     earlier_response_goes_before_the_100/1,
@@ -23,6 +25,8 @@ suite() ->
 all() ->
     [
         handler_answering_without_reading_gets_no_body,
+        body_over_the_cap_refused_from_the_headers,
+        empty_body_is_not_asked_for,
         handler_reading_asks_for_the_body,
         chunked_body_is_asked_for_on_read,
         earlier_response_goes_before_the_100,
@@ -56,6 +60,19 @@ handler_answering_without_reading_gets_no_body(Config) ->
     Reply = recv_until_closed(Sock, <<>>),
     ?assertMatch(<<"HTTP/1.1 401 ", _/binary>>, Reply),
     {match, _} = re:run(Reply, "(?i)\r\nconnection: close\r\n").
+
+body_over_the_cap_refused_from_the_headers(Config) ->
+    %% A declared body over the cap gets its 413 from the headers alone,
+    %% before the handler (which would answer 401) runs, as auto mode does.
+    Sock = ?config(sock, Config),
+    ok = gen_tcp:send(Sock, expect_head(~"/reject", ~"content-length: 100000000")),
+    ?assertMatch(<<"HTTP/1.1 413 ", _/binary>>, recv_until_closed(Sock, <<>>)).
+
+empty_body_is_not_asked_for(Config) ->
+    %% No body to send, so no 100 asks for one: the response comes first.
+    Sock = ?config(sock, Config),
+    ok = gen_tcp:send(Sock, expect_head(~"/read", ~"content-length: 0")),
+    ?assertEqual({200, ~"0"}, recv_response(Sock)).
 
 handler_reading_asks_for_the_body(Config) ->
     Sock = ?config(sock, Config),
