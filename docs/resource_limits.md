@@ -184,11 +184,14 @@ A route can have its own rate with the `rate_limit` key of its map form,
 in the same shape (`rate`, `period`, `burst`). It is a second bucket per
 client, kept on top of the listener's: a request to the route spends from
 both, and either one can refuse it with the same 429, telemetry event and
-`rate_limited` count. It is checked once the request is routed, and
-needs no listener `rate_limit` to work. Its buckets are dropped like the
-listener's, once full again. `reload_routes/2` keeps the buckets of a
-route whose path, methods and limit stay the same, and starts new ones
-when they change.
+`rate_limited` count. It needs no listener `rate_limit` to work. The check
+is the first of the route's own middlewares, after the listener's, so a
+route without a limit pays nothing for it, and the 429 is a response from
+the route like any other: the listener's middlewares see it, it is
+reported as a request, and the connection stays open. Its buckets are
+dropped like the listener's, once full again. `reload_routes/2` keeps the
+buckets of a route whose path, methods and limit stay the same, and
+starts new ones when they change.
 
 ## Configuring
 

@@ -23,6 +23,8 @@ HTTP/3 case lives in `roadrunner_http3_SUITE`.
     buckets_are_per_client/1,
     stacks_on_the_listener_limit/1,
     refusals_are_counted/1,
+    refusal_is_reported_as_a_request/1,
+    refusal_keeps_the_connection/1,
     reload_keeps_unchanged_buckets/1,
     reload_adds_the_first_route_limit/1,
     stale_bucket_store_is_not_reused/1,
@@ -40,12 +42,14 @@ groups() ->
         refuses_past_the_burst,
         buckets_are_per_client,
         stacks_on_the_listener_limit,
-        refusals_are_counted
+        refusals_are_counted,
+        refusal_is_reported_as_a_request
     ],
     [
         {http1, [],
             Shared ++
                 [
+                    refusal_keeps_the_connection,
                     reload_keeps_unchanged_buckets,
                     reload_adds_the_first_route_limit,
                     stale_bucket_store_is_not_reused,
@@ -104,6 +108,38 @@ refusals_are_counted(Config) ->
     _ = [request(Config, Port, ~"/login") || _ <- [1, 2, 3]],
     ?assertMatch(#{rate_limited := 2}, roadrunner_listener:info(?MODULE)).
 
+refusal_is_reported_as_a_request(Config) ->
+    %% The refusal is the route's response, so it is a request like any other
+    %% on every protocol: `[roadrunner, request, stop]` with its 429.
+    Self = self(),
+    HandlerId = {?MODULE, refusal_is_reported_as_a_request},
+    ok = telemetry:attach(
+        HandlerId,
+        [roadrunner, request, stop],
+        fun(_Event, _Measurements, #{listener_name := ?MODULE, status := Status}, _) ->
+            Self ! {request_stop, Status}
+        end,
+        undefined
+    ),
+    try
+        Port = start(Config, #{}, routes()),
+        ?assertMatch({200, _}, request(Config, Port, ~"/login")),
+        ?assertEqual({429, ~"60"}, request(Config, Port, ~"/login")),
+        ?assertEqual([200, 429], [receive_stop() || _ <- [1, 2]])
+    after
+        telemetry:detach(HandlerId)
+    end.
+
+refusal_keeps_the_connection(Config) ->
+    %% A route's refusal ends only that request: the client can go on using
+    %% the connection, for another route or after its wait.
+    Port = start(Config, #{}, routes()),
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 5000),
+    ?assertEqual(200, keep_alive_get(Sock, ~"/login")),
+    ?assertEqual(429, keep_alive_get(Sock, ~"/login")),
+    ?assertEqual(200, keep_alive_get(Sock, ~"/open")),
+    ok = gen_tcp:close(Sock).
+
 reload_keeps_unchanged_buckets(Config) ->
     Port = start(Config, #{}, routes()),
     ?assertMatch({200, _}, request(Config, Port, ~"/login")),
@@ -149,7 +185,7 @@ sweep_drops_only_full_buckets(Config) ->
     {Table, _Counter} = persistent_term:get({roadrunner_route_rate_limit, ?MODULE}),
     ?assertEqual(2, ets:info(Table, size)),
     ok = sweep_until(Table, 1, erlang:monotonic_time(millisecond) + 5000),
-    ?assertMatch([{{{~"/login", _, _, _, _}, _}, _, _, _}], ets:tab2list(Table)).
+    ?assertMatch([{{{~"/login", _, _, _, _}, _}, _, _}], ets:tab2list(Table)).
 
 %% =============================================================================
 %% Helpers
@@ -191,6 +227,39 @@ sweep_until(Table, Size, Deadline) ->
 
 request(Config, Port, Path) ->
     request(Config, Port, Path, undefined).
+
+receive_stop() ->
+    receive
+        {request_stop, Status} -> Status
+    after 5000 -> ct:fail(no_request_stop)
+    end.
+
+%% One GET on a kept-alive HTTP/1.1 connection; its status. Reads exactly the
+%% response's `content-length` bytes of body, so the next one starts clean.
+keep_alive_get(Sock, Path) ->
+    ok = gen_tcp:send(Sock, [~"GET ", Path, ~" HTTP/1.1\r\nHost: x\r\n\r\n"]),
+    {Head, Rest} = recv_head(Sock, <<>>),
+    <<"HTTP/1.1 ", Code:3/binary, _/binary>> = Head,
+    {match, [Length]} = re:run(
+        Head, "(?i)\r\ncontent-length: ([0-9]+)", [{capture, all_but_first, binary}]
+    ),
+    ok = recv_exactly(Sock, binary_to_integer(Length) - byte_size(Rest)),
+    binary_to_integer(Code).
+
+recv_head(Sock, Acc) ->
+    case binary:split(Acc, ~"\r\n\r\n") of
+        [Head, Rest] ->
+            {Head, Rest};
+        [_] ->
+            {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+            recv_head(Sock, <<Acc/binary, Data/binary>>)
+    end.
+
+recv_exactly(_Sock, 0) ->
+    ok;
+recv_exactly(Sock, N) ->
+    {ok, _} = gen_tcp:recv(Sock, N, 5000),
+    ok.
 
 %% One GET on its own connection: `{200, ClientIp}` or `{429, RetryAfter}`.
 request(Config, Port, Path, Forwarded) ->

@@ -15,4 +15,4 @@ handle(Req) ->
             undefined -> ~"undefined";
             IP -> list_to_binary(inet:ntoa(IP))
         end,
-    {{200, [{~"content-type", ~"text/plain"}], Body}, Req}.
+    {roadrunner_resp:text(200, Body), Req}.

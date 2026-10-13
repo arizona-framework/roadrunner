@@ -653,40 +653,59 @@ compile_rejects_invalid_rate_limit_test_() ->
         ]
     ].
 
-resolve_carries_the_compiled_rate_limit_test() ->
-    %% Compiled to `{Rate, Cap, Cost, BucketKey}`: one request costs
-    %% `Period * 1000` units, the bucket holds `Burst` of them. The key is
-    %% the route's path, its methods in one order, and the settings.
+rate_limit_is_a_pipeline_stage_test() ->
+    %% A route's `rate_limit` is not among the limits the connection reads: it
+    %% leads the route's own middlewares, after the listener's, so a refusal is
+    %% decorated by the listener's middlewares and never reaches the route's.
+    {ok, _} = application:ensure_all_started(telemetry),
+    Table = ets:new(router_rl, [public]),
+    persistent_term:put({roadrunner_route_rate_limit, router_rl}, {Table, atomics:new(1, [])}),
+    Tag = fun(Name) ->
+        fun(Req, Next, _State) ->
+            {{Status, Headers, Body}, Req2} = Next(Req),
+            {{Status, [{Name, ~"1"} | Headers], Body}, Req2}
+        end
+    end,
     Compiled = roadrunner_router:compile(
         [
             #{
                 path => ~"/login",
-                handler => login,
+                handler => roadrunner_client_ip_handler,
                 methods => [~"POST", ~"GET"],
-                rate_limit => #{rate => 5, period => 60}
+                middlewares => [Tag(~"x-route")],
+                rate_limit => #{rate => 1, period => 60}
             },
             #{
                 path => ~"/upload",
-                handler => up,
+                handler => roadrunner_client_ip_handler,
                 max_content_length => 64,
-                rate_limit => #{rate => 2, burst => 4}
+                rate_limit => #{rate => 1}
             }
         ],
-        []
+        [Tag(~"x-listener")]
     ),
-    ?assertMatch(
-        {ok, login, #{}, _, _, #{
-            rate_limit := {5, 300000, 60000, {~"/login", [~"GET", ~"POST"], 5, 60, 5}}
-        }},
-        roadrunner_router:resolve(~"POST", ~"/login", Compiled)
-    ),
-    ?assertMatch(
-        {ok, up, #{}, _, _, #{
-            max_content_length := 64,
-            rate_limit := {2, 4000, 1000, {~"/upload", undefined, 2, 1, 4}}
-        }},
-        roadrunner_router:resolve(~"POST", ~"/upload", Compiled)
-    ).
+    Req = #{listener_name => router_rl, peer => {{127, 0, 0, 1}, 5000}},
+    try
+        {ok, _, _, Pipeline, _, undefined} = roadrunner_router:resolve(~"GET", ~"/login", Compiled),
+        ?assertMatch(
+            {ok, _, _, _, _, #{max_content_length := 64}},
+            roadrunner_router:resolve(~"POST", ~"/upload", Compiled)
+        ),
+        {{200, Served, _}, _} = Pipeline(Req),
+        ?assertEqual({~"x-route", ~"1"}, lists:keyfind(~"x-route", 1, Served)),
+        {{429, Refused, ~""}, _} = Pipeline(Req),
+        ?assertEqual({~"retry-after", ~"60"}, lists:keyfind(~"retry-after", 1, Refused)),
+        ?assertEqual({~"x-listener", ~"1"}, lists:keyfind(~"x-listener", 1, Refused)),
+        ?assertEqual(false, lists:keyfind(~"x-route", 1, Refused)),
+        %% The bucket key: the route's path, its methods in one order, and the
+        %% settings.
+        ?assertMatch(
+            [{{{~"/login", [~"GET", ~"POST"], 1, 60, 1}, {127, 0, 0, 1}}, _, _}],
+            ets:tab2list(Table)
+        )
+    after
+        persistent_term:erase({roadrunner_route_rate_limit, router_rl})
+    end.
 
 validate_reports_a_bad_rate_limit_test() ->
     ?assertEqual(
