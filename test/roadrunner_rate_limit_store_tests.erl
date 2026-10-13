@@ -43,6 +43,23 @@ per_minute_rate_test() ->
     ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 1, cap(1, 60), cost(60), 1000)),
     ?assertEqual({deny, 60}, ?M:rate_limit_check(Table, ?IP, 1, cap(1, 60), cost(60), 1000)).
 
+deny_leaves_the_bucket_test() ->
+    %% A denied request spends nothing, so its bucket is left as it was.
+    Table = new_table(),
+    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 1, cap(1, 1), cost(1), 1000)),
+    Row = ets:lookup(Table, ?IP),
+    ?assertEqual({deny, 1}, ?M:rate_limit_check(Table, ?IP, 1, cap(1, 1), cost(1), 1500)),
+    ?assertEqual(Row, ets:lookup(Table, ?IP)).
+
+late_deny_refills_nothing_test() ->
+    %% A deny that read the clock before another connection's request was
+    %% stored (`NowMs` older than the bucket's time) must not set the
+    %% bucket's time back, which would refill it for time that never passed.
+    Table = new_table(),
+    ?assertEqual(allow, ?M:rate_limit_check(Table, ?IP, 1, cap(1, 1), cost(1), 2000)),
+    ?assertEqual({deny, 1}, ?M:rate_limit_check(Table, ?IP, 1, cap(1, 1), cost(1), 1500)),
+    ?assertMatch({deny, _}, ?M:rate_limit_check(Table, ?IP, 1, cap(1, 1), cost(1), 2500)).
+
 %% --- resolve_rate_limit/2 ---
 
 resolve_off_without_config_test() ->

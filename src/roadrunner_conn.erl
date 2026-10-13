@@ -494,7 +494,9 @@ rate_limit_check(Table, Key, Rate, Cap, Cost, NowMs) ->
         end,
     case roadrunner_rate_limit:spend(Refilled, Cost) of
         denied ->
-            true = ets:insert(Table, {Key, Refilled, NowMs}),
+            %% Nothing spent, so the bucket stays as it is: a refill from its
+            %% stored level and time reaches the same level later, and a key
+            %% is only denied once it has a row (a new one starts full).
             {deny, roadrunner_rate_limit:retry_after_secs(Refilled, Rate, Cost)};
         Remaining ->
             true = ets:insert(Table, {Key, Remaining, NowMs}),
