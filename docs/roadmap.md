@@ -519,25 +519,6 @@ concerns composable at the listener or per-route level. Each is
 boilerplate every public service rewrites today; shipping configurable,
 default-safe versions removes it.
 
-### Rate-guard pre-body rejection — small, with a hazard
-
-**What:** The per-peer `rate_limit` check sits at handler dispatch (after the
-request body is read), matching the `max_concurrent_requests` sibling. Rejecting
-right after the request headers on HTTP/1 would avoid reading a rate-limited
-request's body.
-
-**Why deferred:** the expensive handler work is already skipped at the dispatch
-point, so this only saves the (already `max_content_length`-bounded) body read,
-on h1 only. And it carries a real hazard: closing the connection on a 429 while
-the client is still sending its body triggers a TCP reset that can discard the
-429 before the client reads it. The post-body placement drains the body first
-and delivers the response cleanly (the reason nginx/Apache drain before
-erroring); a correct pre-body version needs a read-some-then-drain strategy that
-undercuts the saving. Wants a real large-body-flood driver before taking it on.
-
-**Scope:** small code, but the RST-delivery hazard makes the current post-body
-placement the safer default.
-
 ### Graceful load-shedding — small-medium
 
 **What:** Turn the hard `max_clients` / `max_concurrent_requests` caps

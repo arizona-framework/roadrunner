@@ -18,6 +18,7 @@ the reset a close with unread input sends.
     not_found_lingers_over_the_upload/1,
     streamed_answer_lingers_over_the_upload/1,
     oversized_header_gets_its_431/1,
+    rate_limited_request_answered_before_its_body/1,
     linger_ends_when_the_client_closes/1,
     linger_ends_at_its_timeout/1
 ]).
@@ -41,6 +42,7 @@ all() ->
         not_found_lingers_over_the_upload,
         streamed_answer_lingers_over_the_upload,
         oversized_header_gets_its_431,
+        rate_limited_request_answered_before_its_body,
         linger_ends_when_the_client_closes,
         linger_ends_at_its_timeout
     ].
@@ -76,6 +78,8 @@ opts(Case) when
     Case =:= streamed_answer_lingers_over_the_upload
 ->
     #{body_buffering => manual, protocols => [{http1, #{linger_timeout => 60000}}]};
+opts(rate_limited_request_answered_before_its_body) ->
+    #{rate_limit => #{rate => 1, burst => 1, period => 60}};
 opts(linger_ends_when_the_client_closes) ->
     #{protocols => [{http1, #{linger_timeout => 60000}}]};
 opts(linger_ends_at_its_timeout) ->
@@ -106,6 +110,19 @@ oversized_header_gets_its_431(Config) ->
     %% still sending it.
     Request = [~"GET /r HTTP/1.1\r\nHost: x\r\nX-Big: ", binary:copy(~"a", ?UPLOAD), ~"\r\n\r\n"],
     [?assertEqual(~"431", exchange(gen_tcp, Config, Request)) || _ <- lists:seq(1, ?RUNS)].
+
+rate_limited_request_answered_before_its_body(Config) ->
+    %% Over its rate, a request is answered 429 from its headers alone: the
+    %% client holding back its body is not waited on.
+    ?assertEqual(
+        ~"401",
+        exchange(gen_tcp, Config, ~"GET /r HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    ),
+    {ok, Sock} = connect(gen_tcp, Config),
+    ok = gen_tcp:send(Sock, head(500)),
+    {ok, Reply} = gen_tcp:recv(Sock, 0, 2000),
+    ?assertMatch(<<"HTTP/1.1 429 ", _/binary>>, Reply),
+    ok = gen_tcp:close(Sock).
 
 linger_ends_when_the_client_closes(Config) ->
     %% A 60 s linger: the connection still ends at once when the client,

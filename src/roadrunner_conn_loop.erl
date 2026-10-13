@@ -882,12 +882,42 @@ handle_request_bytes(
 %% already buffered are the next pipelined request and stay in
 %% `buffered`.
 %%
-%% The request is routed here, once, before any of its body is read: the
-%% match is the one dispatch uses, and a matched route's own
-%% `max_content_length` caps the body in place of the listener's, for the
-%% read itself, the `100 Continue` decision and the early 413 alike.
+%% The per-peer rate limit is checked first, from the headers alone, so a
+%% request over its rate is answered 429 before any of its body is read.
+%% The request is then routed, once, before its body is read: the match is
+%% the one dispatch uses, and a matched route's own `max_content_length`
+%% caps the body in place of the listener's, for the read itself, the
+%% `100 Continue` decision and the early 413 alike.
 -spec read_body_phase(#loop_state{}, roadrunner_req:request(), integer()) -> no_return().
-read_body_phase(#loop_state{body_buffering = BodyMode, dispatch = Dispatch} = S, Req, Deadline) ->
+read_body_phase(
+    #loop_state{rate_limit = RateLimit, listener_name = ListenerName} = S, Req, Deadline
+) ->
+    case roadrunner_conn:rate_limit(RateLimit, Req, ListenerName) of
+        allow -> route_and_read(S, Req, Deadline);
+        {deny, RetryAfter} -> refuse_rate_limited(S, RetryAfter, roadrunner_conn:body_framing(Req))
+    end.
+
+%% Over its rate: queued pipelined responses go out first so the 429 + close
+%% cannot overtake them, and the close lingers over a body the client may be
+%% sending.
+-spec refuse_rate_limited(
+    #loop_state{},
+    pos_integer(),
+    none
+    | chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding}
+) -> no_return().
+refuse_rate_limited(#loop_state{socket = Socket} = S, RetryAfter, Framing) ->
+    S1 = flush_out(S),
+    _ = roadrunner_conn:send_rate_limited(Socket, RetryAfter),
+    case Framing of
+        none -> exit_normal(S1);
+        _ -> exit_lingering(S1)
+    end.
+
+-spec route_and_read(#loop_state{}, roadrunner_req:request(), integer()) -> no_return().
+route_and_read(#loop_state{body_buffering = BodyMode, dispatch = Dispatch} = S, Req, Deadline) ->
     Resolved = roadrunner_conn:resolve_handler(Dispatch, Req),
     case {BodyMode, roadrunner_conn:body_framing(Req)} of
         {auto, none} ->
@@ -1056,37 +1086,20 @@ trailer_limits(#loop_state{http1_limits = {_ReqLine, MaxHdrLine, MaxHdrBlock, Ma
 %% writers via `dispatch_response/4`.
 -spec dispatch_phase(#loop_state{}, roadrunner_req:request(), roadrunner_conn:resolved()) ->
     no_return().
-dispatch_phase(
-    #loop_state{
-        socket = Socket,
-        listener_name = ListenerName,
-        rate_limit = RateLimit
-    } = S,
-    Req,
-    Resolved
-) ->
-    case roadrunner_conn:rate_limit(RateLimit, Req, ListenerName) of
-        allow ->
-            case Resolved of
-                {ok, Handler, Bindings, Pipeline, _State, _Limits} ->
-                    run_pipeline(S, Handler, Req#{bindings => Bindings}, Pipeline);
-                {method_not_allowed, Allowed} ->
-                    %% Path matched but no route answers this method: 405 +
-                    %% Allow before any pipeline runs (the method gate is a
-                    %% routing decision, ahead of per-route middleware).
-                    S1 = flush_out(S),
-                    _ = roadrunner_conn:send_method_not_allowed(Socket, Allowed),
-                    exit_unread(S1, Req);
-                not_found ->
-                    S1 = flush_out(S),
-                    _ = roadrunner_conn:send_not_found(Socket),
-                    exit_unread(S1, Req)
-            end;
-        {deny, RetryAfter} ->
-            %% Rate exceeded: queued pipelined responses go out first so the
-            %% 429 + close can't overtake them.
+dispatch_phase(#loop_state{socket = Socket} = S, Req, Resolved) ->
+    case Resolved of
+        {ok, Handler, Bindings, Pipeline, _State, _Limits} ->
+            run_pipeline(S, Handler, Req#{bindings => Bindings}, Pipeline);
+        {method_not_allowed, Allowed} ->
+            %% Path matched but no route answers this method: 405 + Allow
+            %% before any pipeline runs (the method gate is a routing
+            %% decision, ahead of per-route middleware).
             S1 = flush_out(S),
-            _ = roadrunner_conn:send_rate_limited(Socket, RetryAfter),
+            _ = roadrunner_conn:send_method_not_allowed(Socket, Allowed),
+            exit_unread(S1, Req);
+        not_found ->
+            S1 = flush_out(S),
+            _ = roadrunner_conn:send_not_found(Socket),
             exit_unread(S1, Req)
     end.
 

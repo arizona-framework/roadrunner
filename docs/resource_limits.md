@@ -172,7 +172,8 @@ a single **source**, so one peer cannot monopolize the server. It is a
 token bucket keyed on the client IP: `#{rate := N, period => Secs, burst
 => B}` allows `N` requests per `period` seconds (default 1) with a burst
 of `B` (default `N`). A peer over its rate gets `429 Too Many Requests` +
-`Retry-After` before any handler runs (a real 429 on HTTP/2 and HTTP/3,
+`Retry-After` before any handler runs, on HTTP/1.1 from the request's
+headers alone, before any of its body is read (a real 429 on HTTP/2 and HTTP/3,
 not the retry-safe `REFUSED_STREAM` / `H3_REQUEST_REJECTED`, so clients
 back off instead of retrying at once), emitting `[roadrunner, request,
 throttled]` with `reason => rate_limit` and incrementing the
