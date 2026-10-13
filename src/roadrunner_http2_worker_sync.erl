@@ -1,8 +1,9 @@
 -module(roadrunner_http2_worker_sync).
 -moduledoc false.
 
-%% Worker -> conn synchronous frame round-trip, shared by the h2 stream
-%% worker (buffered responses) and the stream / loop response emitters.
+%% Worker -> conn synchronous frame round-trip, shared by the h2 stream /
+%% loop response emitters (a buffered response goes one way, see
+%% `roadrunner_http2_stream_worker:send_buffered/5`).
 %% `sync/2` sends a frame request to the conn (via `SendFun`) and blocks
 %% for the conn's `{h2_send_ack, Ref}`; a conn-side stream reset
 %% (`{h2_stream_reset, _}`) exits the worker with `stream_reset`.
