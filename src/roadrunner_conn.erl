@@ -79,6 +79,8 @@
     send_not_found/1,
     send_method_not_allowed/2,
     resolve_handler/2,
+    body_cap/2,
+    route_body_cap/3,
     allow_header_value/1,
     response_status/1,
     final_response/3,
@@ -86,7 +88,17 @@
     head_response/2
 ]).
 
--export_type([proto_opts/0, dispatch/0, rate_limit/0, rate_limit_state/0, overload/0]).
+-export_type([
+    proto_opts/0, dispatch/0, rate_limit/0, rate_limit_state/0, overload/0, resolved/0
+]).
+
+%% A request's routing outcome (`resolve_handler/2`): the handler, its
+%% bindings, pipeline and state, and the matched route's limits.
+-type resolved() ::
+    {ok, module(), roadrunner_router:bindings(), roadrunner_middleware:next(), term(),
+        roadrunner_router:limits()}
+    | {method_not_allowed, [binary()]}
+    | not_found.
 
 -on_load(init_patterns/0).
 
@@ -786,18 +798,48 @@ scheme({ssl, _}) -> https;
 scheme({fake, _}) -> http.
 
 -doc false.
--spec resolve_handler(dispatch(), roadrunner_req:request()) ->
-    {ok, module(), roadrunner_router:bindings(), roadrunner_middleware:next(), term()}
-    | {method_not_allowed, [binary()]}
-    | not_found.
+-spec resolve_handler(dispatch(), roadrunner_req:request()) -> resolved().
 resolve_handler({handler, Mod, Pipeline, State}, _Req) ->
-    {ok, Mod, #{}, Pipeline, State};
+    {ok, Mod, #{}, Pipeline, State, undefined};
 resolve_handler({router, ListenerName}, Req) ->
     %% Routes are stored in `persistent_term` by `roadrunner_listener` so
     %% the lookup is O(1) and `roadrunner_listener:reload_routes/2` can
     %% atomically swap the table without bouncing the listener.
     Compiled = persistent_term:get({roadrunner_routes, ListenerName}),
-    roadrunner_router:match(roadrunner_req:method(Req), roadrunner_req:path(Req), Compiled).
+    roadrunner_router:resolve(roadrunner_req:method(Req), roadrunner_req:path(Req), Compiled).
+
+%% The body cap of a resolved request: its route's `max_content_length` when
+%% the route sets one, else the listener's `Default`.
+-doc false.
+-spec body_cap(resolved(), non_neg_integer()) -> non_neg_integer().
+body_cap({ok, _Handler, _Bindings, _Pipeline, _State, #{max_content_length := Max}}, _Default) ->
+    Max;
+body_cap(_Resolved, Default) ->
+    Default.
+
+%% The body cap of an HTTP/2 or HTTP/3 request from its decoded field
+%% section: the `max_content_length` of the route its `:method` and `:path`
+%% resolve to, else the listener's `Default` (no such route setting one, a
+%% listener without routes, or a section missing either field, which
+%% dispatch then rejects). Those connections otherwise leave routing to the
+%% stream worker, so this runs only when a body would outgrow `Default` or
+%% an `Expect: 100-continue` request needs its answer now.
+-doc false.
+-spec route_body_cap(dispatch(), roadrunner_http:headers(), non_neg_integer()) ->
+    non_neg_integer().
+route_body_cap({router, ListenerName}, Headers, Default) ->
+    case {lists:keyfind(~":method", 1, Headers), lists:keyfind(~":path", 1, Headers)} of
+        {{_, Method}, {_, Target}} ->
+            Compiled = persistent_term:get({roadrunner_routes, ListenerName}),
+            body_cap(
+                roadrunner_router:resolve(Method, roadrunner_req:target_path(Target), Compiled),
+                Default
+            );
+        _ ->
+            Default
+    end;
+route_body_cap({handler, _Mod, _Pipeline, _State}, _Headers, Default) ->
+    Default.
 
 %% The `Allow` header value for a `405`, built from the methods
 %% `roadrunner_router:match/3` reports as accepted on the path. Flattened here

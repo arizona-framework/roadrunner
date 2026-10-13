@@ -50,7 +50,11 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     oversized_413/1,
     real_ip_resolves_client_behind_trusted_proxy/1,
     expect_continue_gets_interim_100/1,
+    expect_continue_without_length_gets_interim_100/1,
     expect_continue_over_the_cap_gets_413/1,
+    route_body_cap_raises/1,
+    route_body_cap_lowers/1,
+    route_body_cap_expect_continue/1,
     other_expectation_gets_no_interim/1,
     oversized_headers_431/1,
     advertises_max_field_section_size/1,
@@ -134,7 +138,11 @@ all() ->
         oversized_413,
         real_ip_resolves_client_behind_trusted_proxy,
         expect_continue_gets_interim_100,
+        expect_continue_without_length_gets_interim_100,
         expect_continue_over_the_cap_gets_413,
+        route_body_cap_raises,
+        route_body_cap_lowers,
+        route_body_cap_expect_continue,
         other_expectation_gets_no_interim,
         oversized_headers_431,
         advertises_max_field_section_size,
@@ -194,6 +202,9 @@ init_per_testcase(Case, Config) when
     Case =:= oversized_413;
     Case =:= real_ip_resolves_client_behind_trusted_proxy;
     Case =:= expect_continue_over_the_cap_gets_413;
+    Case =:= route_body_cap_raises;
+    Case =:= route_body_cap_lowers;
+    Case =:= route_body_cap_expect_continue;
     Case =:= protocols_tuple_form;
     Case =:= certfile_keyfile;
     Case =:= certs_keys_form;
@@ -658,6 +669,38 @@ expect_continue_gets_interim_100(Config) ->
         ll_close(Conn)
     end.
 
+expect_continue_without_length_gets_interim_100(Config) ->
+    %% No declared length to hold against the cap: the client is asked for
+    %% its body, and the cap applies as it arrives.
+    Conn = ll_connect(?config(port, Config)),
+    try
+        StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+        ok = roadrunner_quic_test_conn:send(
+            Conn,
+            StreamId,
+            roadrunner_quic_h3_frame:encode_headers(
+                roadrunner_qpack:encode(
+                    headers(~"POST", ~"/echo") ++ [{~"expect", ~"100-continue"}]
+                )
+            ),
+            false
+        ),
+        receive
+            {quic_test_stream, Conn, StreamId, Interim, false} ->
+                {ok, {headers, Block}, <<>>} = roadrunner_quic_h3_frame:decode(Interim),
+                ?assertEqual({ok, [{~":status", ~"100"}]}, roadrunner_qpack:decode(Block))
+        after 5000 -> ct:fail(no_interim_response)
+        end,
+        ok = roadrunner_quic_test_conn:send(
+            Conn, StreamId, roadrunner_quic_h3_frame:encode_data(~"abc", 3), true
+        ),
+        {fin, Bytes} = ll_collect_until_end(Conn, StreamId, <<>>),
+        {ok, {headers, Final}, _} = roadrunner_quic_h3_frame:decode(Bytes),
+        ?assertMatch({ok, [{~":status", ~"200"} | _]}, roadrunner_qpack:decode(Final))
+    after
+        ll_close(Conn)
+    end.
+
 expect_continue_over_the_cap_gets_413(_Config) ->
     %% A declared `content-length` already over `max_content_length` is the
     %% final status the headers settle: 413 at once, not a 100 that would
@@ -677,6 +720,118 @@ expect_continue_over_the_cap_gets_413(_Config) ->
         close(Conn),
         roadrunner_listener:stop(Name)
     end.
+
+route_body_cap_raises(_Config) ->
+    %% `/up` raises the 8-byte listener cap to 64: a body past the listener's
+    %% cap asks its route once, and is then held to the route's.
+    Name = listener_name(route_body_cap_raises),
+    {ok, _} = start_h3(Name, route_cap_opts()),
+    Port = roadrunner_listener:port(Name),
+    Conn = connect(Port),
+    try
+        ?assertEqual({200, ~"20"}, status_body(post(Conn, ~"/up", binary:copy(~"x", 20)))),
+        ?assertMatch({413, _, _}, post(Conn, ~"/up", binary:copy(~"x", 65))),
+        ?assertMatch({413, _, _}, post(Conn, ~"/plain", binary:copy(~"x", 9))),
+        %% HEADERS and an over-cap DATA frame in one chunk: the field section
+        %% is decoded to route the body, and kept for dispatch.
+        Raw = ll_connect(Port),
+        try
+            StreamId = roadrunner_quic_test_conn:open_bidi(Raw),
+            ok = roadrunner_quic_test_conn:send(
+                Raw,
+                StreamId,
+                [
+                    roadrunner_quic_h3_frame:encode_headers(
+                        roadrunner_qpack:encode(headers(~"POST", ~"/up"))
+                    ),
+                    roadrunner_quic_h3_frame:encode_data(binary:copy(~"x", 20), 20)
+                ],
+                false
+            ),
+            ok = roadrunner_quic_test_conn:send(
+                Raw, StreamId, roadrunner_quic_h3_frame:encode_data(~"12345", 5), true
+            ),
+            {fin, Bytes} = ll_collect_until_end(Raw, StreamId, <<>>),
+            {ok, {headers, Final}, Rest} = roadrunner_quic_h3_frame:decode(Bytes),
+            ?assertMatch({ok, [{~":status", ~"200"} | _]}, roadrunner_qpack:decode(Final)),
+            ?assertMatch({ok, {data, ~"25"}, _}, roadrunner_quic_h3_frame:decode(Rest))
+        after
+            ll_close(Raw)
+        end
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+route_body_cap_lowers(_Config) ->
+    %% `/small` lowers the cap to 2: the connection holds the body to the
+    %% listener's cap, and the route's smaller one applies once routed.
+    Name = listener_name(route_body_cap_lowers),
+    {ok, _} = start_h3(Name, route_cap_opts()),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        ?assertMatch({413, _, _}, post(Conn, ~"/small", ~"abc")),
+        ?assertEqual({200, ~"2"}, status_body(post(Conn, ~"/small", ~"ab")))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+route_body_cap_expect_continue(_Config) ->
+    %% The interim 100 and the early 413 follow the route's cap.
+    Name = listener_name(route_body_cap_expect_continue),
+    {ok, _} = start_h3(Name, route_cap_opts()),
+    Conn = ll_connect(roadrunner_listener:port(Name)),
+    try
+        Within = roadrunner_quic_test_conn:open_bidi(Conn),
+        ok = roadrunner_quic_test_conn:send(
+            Conn, Within, route_expect_headers(~"/up", ~"20"), false
+        ),
+        receive
+            {quic_test_stream, Conn, Within, Interim, false} ->
+                {ok, {headers, Block}, <<>>} = roadrunner_quic_h3_frame:decode(Interim),
+                ?assertEqual({ok, [{~":status", ~"100"}]}, roadrunner_qpack:decode(Block))
+        after 5000 -> ct:fail(no_interim_response)
+        end,
+        ok = roadrunner_quic_test_conn:send(
+            Conn, Within, roadrunner_quic_h3_frame:encode_data(binary:copy(~"x", 20), 20), true
+        ),
+        {fin, Bytes} = ll_collect_until_end(Conn, Within, <<>>),
+        {ok, {headers, Final}, _} = roadrunner_quic_h3_frame:decode(Bytes),
+        ?assertMatch({ok, [{~":status", ~"200"} | _]}, roadrunner_qpack:decode(Final)),
+        Over = roadrunner_quic_test_conn:open_bidi(Conn),
+        ok = roadrunner_quic_test_conn:send(
+            Conn, Over, route_expect_headers(~"/small", ~"3"), false
+        ),
+        {fin, Refused} = ll_collect_until_end(Conn, Over, <<>>),
+        {ok, {headers, Refusal}, _} = roadrunner_quic_h3_frame:decode(Refused),
+        ?assertMatch({ok, [{~":status", ~"413"} | _]}, roadrunner_qpack:decode(Refusal))
+    after
+        ll_close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+%% An 8-byte listener cap and routes that raise it (`/up`), lower it
+%% (`/small`) or keep it (`/plain`).
+route_cap_opts() ->
+    #{
+        max_content_length => 8,
+        routes => [
+            #{path => ~"/up", handler => roadrunner_body_size_handler, max_content_length => 64},
+            #{path => ~"/small", handler => roadrunner_body_size_handler, max_content_length => 2},
+            {~"/plain", roadrunner_body_size_handler}
+        ]
+    }.
+
+%% A POST HEADERS frame to `Path`, its body to follow, with a declared
+%% `content-length` and `expect: 100-continue`.
+route_expect_headers(Path, ContentLength) ->
+    roadrunner_quic_h3_frame:encode_headers(
+        roadrunner_qpack:encode(
+            headers(~"POST", Path) ++
+                [{~"content-length", ContentLength}, {~"expect", ~"100-continue"}]
+        )
+    ).
 
 other_expectation_gets_no_interim(Config) ->
     %% Only `100-continue` asks for the interim response.

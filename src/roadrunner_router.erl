@@ -61,10 +61,10 @@ matching only walks the branches a request's segments can follow instead
 of trying every route in turn.
 """.
 
--export([compile/2, validate/1, match/3]).
+-export([compile/2, validate/1, match/3, resolve/3]).
 
 -export_type([
-    route/0, routes/0, compiled/0, bindings/0, methods/0, validation_error/0
+    route/0, routes/0, compiled/0, bindings/0, methods/0, validation_error/0, limits/0
 ]).
 
 -doc """
@@ -73,16 +73,19 @@ A single route entry. Three shapes are accepted:
 - `{Path, Handler}` — shorthand: no state, no middlewares.
 - `{Path, Handler, State}` — shorthand with state only.
 - `#{path := Path, handler := Handler, state => State,
-   middlewares => Mws, methods => [~"GET", ...]}` — map form; use this
-  to attach per-route middlewares, an HTTP-method allowlist, or future
-  per-route framework knobs.
+   middlewares => Mws, methods => [~"GET", ...],
+   max_content_length => Bytes}` — map form; use this to attach
+  per-route middlewares, an HTTP-method allowlist, or a request-body cap.
+
 
 `Path` is a binary pattern (literal segments, `:param` captures, or
 `*wildcard` catch-all). `Handler` is the module implementing
 `roadrunner_handler`. `State` is opaque per-route data threaded back
 to the handler via `roadrunner_req:state/1`; unset → `undefined`.
 `methods` is a list of uppercase method binaries the route answers;
-unset → every method.
+unset → every method. `max_content_length` is the route's own request-body
+cap in bytes, in place of the listener's (larger or smaller) for the
+requests the route answers; unset → the listener's.
 """.
 -type route() ::
     {Path :: binary(), Handler :: module()}
@@ -92,7 +95,8 @@ unset → every method.
         handler := module(),
         state => term(),
         middlewares => roadrunner_middleware:middleware_list(),
-        methods => methods()
+        methods => methods(),
+        max_content_length => non_neg_integer()
     }.
 
 -doc """
@@ -119,6 +123,8 @@ Why a route table was rejected, as returned by `validate/1` and raised by
   its path is not a binary / its handler is not a module atom.
 - `{invalid_route_methods, Methods}` — a `methods` key that is not a non-empty
   list of binaries.
+- `{invalid_route_max_content_length, Value}` — a `max_content_length` key that
+  is not a non-negative integer.
 - `{invalid_route_path, Path, wildcard_not_last}` — a segment after the
   pattern's `*wildcard`, which no request could ever reach.
 - `{unreachable_route, Position, Path, ShadowedBy}` — the entries above this
@@ -129,12 +135,20 @@ Why a route table was rejected, as returned by `validate/1` and raised by
 -type validation_error() ::
     {invalid_route, route()}
     | {invalid_route_methods, term()}
+    | {invalid_route_max_content_length, term()}
     | {invalid_route_path, binary(), wildcard_not_last}
     | {unreachable_route, pos_integer(), binary(), [{pos_integer(), binary()}]}.
 
 %% The compiled form of `methods()`: a set-as-map for O(1) membership,
 %% or `undefined` for a route that answers every method.
 -type method_lookup() :: #{binary() => true} | undefined.
+
+-doc """
+A route's request limits, carried in its compiled entry so the one dispatch
+match yields them: `undefined` for a route that sets none, else the overrides
+it declares.
+""".
+-type limits() :: undefined | #{max_content_length => non_neg_integer()}.
 
 -doc "An ordered list of routes; matched first-to-last.".
 -type routes() :: [route()].
@@ -171,7 +185,7 @@ opaque: the shape is an implementation detail and may change.
 -opaque compiled() :: {route_node(), tuple()}.
 
 %% The compiled table: a lookup tree over every route's segment pattern,
-%% plus a tuple of `{Handler, Pipeline, State, Methods}` indexed by the
+%% plus a tuple of `{Handler, Pipeline, State, Methods, Limits}` indexed by the
 %% route's 1-based position. Each tree node holds the routes whose
 %% pattern ends exactly there (`ends`), a child per literal segment
 %% (`literals`), a child per `:param` name at this depth (`params`; two
@@ -260,12 +274,13 @@ validate(Routes) when is_list(Routes) ->
     end.
 
 -spec compile_route(route(), [roadrunner_middleware:resolved()]) ->
-    {[segment()], module(), roadrunner_middleware:next(), term(), method_lookup()}.
+    {[segment()], module(), roadrunner_middleware:next(), term(), method_lookup(), limits()}.
 compile_route({Path, Handler}, ResolvedListener) when is_binary(Path), is_atom(Handler) ->
     {
         compile_path(Path),
         Handler,
         roadrunner_middleware:compile_pipeline(ResolvedListener, [], Handler, no_state),
+        undefined,
         undefined,
         undefined
     };
@@ -275,6 +290,7 @@ compile_route({Path, Handler, State}, ResolvedListener) when is_binary(Path), is
         Handler,
         roadrunner_middleware:compile_pipeline(ResolvedListener, [], Handler, {state, State}),
         State,
+        undefined,
         undefined
     };
 compile_route(#{path := Path, handler := Handler} = Route, ResolvedListener) when
@@ -292,25 +308,30 @@ compile_route(#{path := Path, handler := Handler} = Route, ResolvedListener) whe
         Handler,
         roadrunner_middleware:compile_pipeline(ResolvedListener, RouteMws, Handler, StateArg),
         StateValue,
-        Methods
+        Methods,
+        route_limits(Route)
     }.
 
+-spec route_limits(map()) -> limits().
+route_limits(#{max_content_length := Max}) -> #{max_content_length => Max};
+route_limits(_Route) -> undefined.
+
 -spec build_table(
-    [{[segment()], module(), roadrunner_middleware:next(), term(), method_lookup()}]
+    [{[segment()], module(), roadrunner_middleware:next(), term(), method_lookup(), limits()}]
 ) -> compiled().
 build_table(Compiled) ->
     %% Ascending index order, so the first route to claim a method or
     %% the any-method slot at a node is also the lowest.
     Tree = lists:foldl(
-        fun({Index, {Pattern, _Handler, _Pipeline, _State, Methods}}, Node) ->
+        fun({Index, {Pattern, _Handler, _Pipeline, _State, Methods, _Limits}}, Node) ->
             insert(Pattern, Index, Methods, Node)
         end,
         #route_node{},
         lists:enumerate(Compiled)
     ),
     Entries = list_to_tuple([
-        {Handler, Pipeline, State, Methods}
-     || {_Pattern, Handler, Pipeline, State, Methods} <- Compiled
+        {Handler, Pipeline, State, Methods, Limits}
+     || {_Pattern, Handler, Pipeline, State, Methods, Limits} <- Compiled
     ]),
     {Tree, Entries}.
 
@@ -420,6 +441,7 @@ route_spec(Route, Pos) ->
         Pattern = compile_path(Path),
         ok ?= check_wildcard_last(Pattern, Path),
         {ok, Methods} ?= route_methods(Route),
+        ok ?= check_max_content_length(Route),
         {ok, {Pos, Path, Pattern, Methods}}
     end.
 
@@ -444,6 +466,14 @@ route_methods(#{methods := Methods}) ->
     end;
 route_methods(_Route) ->
     {ok, undefined}.
+
+-spec check_max_content_length(route()) -> ok | {error, validation_error()}.
+check_max_content_length(#{max_content_length := Max}) when is_integer(Max), Max >= 0 ->
+    ok;
+check_max_content_length(#{max_content_length := Max}) ->
+    {error, {invalid_route_max_content_length, Max}};
+check_max_content_length(_Route) ->
+    ok.
 
 %% `match_pattern/3` consumes a wildcard only as a pattern's final segment, so a
 %% route carrying anything after its `*` can never answer a request. That is a
@@ -576,7 +606,22 @@ all.
     {ok, module(), bindings(), roadrunner_middleware:next(), term()}
     | {method_not_allowed, [binary()]}
     | not_found.
-match(Method, Path, {Tree, Entries}) when is_binary(Method), is_binary(Path) ->
+match(Method, Path, Compiled) ->
+    case resolve(Method, Path, Compiled) of
+        {ok, Handler, Bindings, Pipeline, State, _Limits} ->
+            {ok, Handler, Bindings, Pipeline, State};
+        Other ->
+            Other
+    end.
+
+%% `match/3` plus the matched route's `limits()`, for the connection loops:
+%% the one dispatch match also yields the route's request limits.
+-doc false.
+-spec resolve(Method :: binary(), Path :: binary(), compiled()) ->
+    {ok, module(), bindings(), roadrunner_middleware:next(), term(), limits()}
+    | {method_not_allowed, [binary()]}
+    | not_found.
+resolve(Method, Path, {Tree, Entries}) when is_binary(Method), is_binary(Path) ->
     case collect(Tree, path_segments(Path), Method, #{}, []) of
         [] ->
             not_found;
@@ -697,7 +742,7 @@ add_params([], _Segment, _Rest, _Method, _Bindings, Acc) ->
 %% `maps:merge/2` and sorted so it is deterministic regardless of map
 %% order.
 -spec select([path_match(), ...], tuple()) ->
-    {ok, module(), bindings(), roadrunner_middleware:next(), term()}
+    {ok, module(), bindings(), roadrunner_middleware:next(), term(), limits()}
     | {method_not_allowed, [binary()]}.
 select(Matches, Entries) ->
     case lowest(Matches, none) of
@@ -706,10 +751,10 @@ select(Matches, Entries) ->
     end.
 
 -spec answer(pos_integer(), bindings(), tuple()) ->
-    {ok, module(), bindings(), roadrunner_middleware:next(), term()}.
+    {ok, module(), bindings(), roadrunner_middleware:next(), term(), limits()}.
 answer(Index, Bindings, Entries) ->
-    {Handler, Pipeline, State, _Methods} = element(Index, Entries),
-    {ok, Handler, decode_bindings(Bindings), Pipeline, State}.
+    {Handler, Pipeline, State, _Methods, Limits} = element(Index, Entries),
+    {ok, Handler, decode_bindings(Bindings), Pipeline, State, Limits}.
 
 -spec lowest([path_match()], none | {pos_integer(), bindings()}) ->
     none | {pos_integer(), bindings()}.

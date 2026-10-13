@@ -42,18 +42,30 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
     Metadata = roadrunner_telemetry:request_metadata(Req),
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
-        {ok, Handler, Bindings, Pipeline, _State} ->
-            invoke(
-                Worker,
-                Protocol,
-                Conn,
-                StreamId,
-                Handler,
-                Pipeline,
-                Req#{bindings => Bindings},
-                Metadata,
-                ReqStart
-            );
+        {ok, Handler, Bindings, Pipeline, _State, Limits} ->
+            case over_route_cap(Limits, Req) of
+                false ->
+                    invoke(
+                        Worker,
+                        Protocol,
+                        Conn,
+                        StreamId,
+                        Handler,
+                        Pipeline,
+                        Req#{bindings => Bindings},
+                        Metadata,
+                        ReqStart
+                    );
+                true ->
+                    ok = Worker:send_buffered(
+                        Conn,
+                        StreamId,
+                        413,
+                        [{~"content-type", ~"text/plain"}],
+                        ~"Payload Too Large"
+                    ),
+                    ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, 413, buffered)
+            end;
         {method_not_allowed, Allowed} ->
             %% Path matched but no route on it answers this method: 405 plus
             %% the `Allow` union, decided before any pipeline runs because the
@@ -75,6 +87,16 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
             ),
             ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, 404, buffered)
     end.
+
+%% Whether the body is over its route's own `max_content_length`. The
+%% connection holds a body to the listener's cap, raised to the route's
+%% when a body outgrows it, so only a route cap tighter than the
+%% listener's is left to check here, once the request is routed.
+-spec over_route_cap(roadrunner_router:limits(), roadrunner_req:request()) -> boolean().
+over_route_cap(#{max_content_length := Max}, #{body := Body}) ->
+    iolist_size(Body) > Max;
+over_route_cap(_Limits, _Req) ->
+    false.
 
 -spec invoke(
     module(),

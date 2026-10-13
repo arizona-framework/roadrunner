@@ -480,18 +480,18 @@ chunked_recv(Chunks) ->
     end.
 
 %% ======================================================================
-%% resolve_handler/2 — dispatch tag → {ok, Mod, Bindings, Pipeline, State}
+%% resolve_handler/2 — dispatch tag → {ok, Mod, Bindings, Pipeline, State, Limits}
 %% ======================================================================
 
 resolve_handler_passes_pipeline_and_state_through_test() ->
     %% The handler-form dispatch tag just unpacks: the pre-baked
     %% pipeline fun comes back as the 4th element and the user's
-    %% attached state as the 5th. Bindings is empty (no router
-    %% involved).
+    %% attached state as the 5th. Bindings is empty and there are no
+    %% route limits (no router involved).
     Pipeline = fun some_mod:handle/1,
     State = #{role => admin},
     ?assertEqual(
-        {ok, some_mod, #{}, Pipeline, State},
+        {ok, some_mod, #{}, Pipeline, State, undefined},
         roadrunner_conn:resolve_handler(
             {handler, some_mod, Pipeline, State}, dummy_req()
         )
@@ -500,7 +500,7 @@ resolve_handler_passes_pipeline_and_state_through_test() ->
 resolve_handler_returns_undefined_state_for_stateless_handler_test() ->
     Pipeline = fun some_mod:handle/1,
     ?assertEqual(
-        {ok, some_mod, #{}, Pipeline, undefined},
+        {ok, some_mod, #{}, Pipeline, undefined, undefined},
         roadrunner_conn:resolve_handler(
             {handler, some_mod, Pipeline, undefined}, dummy_req()
         )
@@ -538,6 +538,57 @@ resolve_handler_router_method_not_allowed_test() ->
     after
         persistent_term:erase({roadrunner_routes, Name})
     end.
+
+%% ======================================================================
+%% body_cap/2, route_body_cap/3 — a route's own max_content_length
+%% ======================================================================
+
+body_cap_test() ->
+    %% A route's own cap replaces the listener's, larger or smaller; a
+    %% route without one, a 404 / 405 and a single handler keep the
+    %% listener's.
+    ?assertEqual(64, roadrunner_conn:body_cap({ok, m, #{}, p, s, #{max_content_length => 64}}, 8)),
+    ?assertEqual(2, roadrunner_conn:body_cap({ok, m, #{}, p, s, #{max_content_length => 2}}, 8)),
+    ?assertEqual(8, roadrunner_conn:body_cap({ok, m, #{}, p, s, undefined}, 8)),
+    ?assertEqual(8, roadrunner_conn:body_cap(not_found, 8)),
+    ?assertEqual(8, roadrunner_conn:body_cap({method_not_allowed, [~"GET"]}, 8)).
+
+route_body_cap_test() ->
+    Name = route_body_cap,
+    persistent_term:put(
+        {roadrunner_routes, Name},
+        roadrunner_router:compile(
+            [
+                #{path => ~"/up", handler => up, methods => [~"POST"], max_content_length => 64},
+                {~"/plain", plain}
+            ],
+            []
+        )
+    ),
+    Cap = fun(Headers) -> roadrunner_conn:route_body_cap({router, Name}, Headers, 8) end,
+    try
+        %% The route of `:method` and `:path` (query stripped) sets the cap.
+        ?assertEqual(64, Cap([{~":method", ~"POST"}, {~":path", ~"/up?x=1"}])),
+        %% No cap on the route, another method, no route, or a field
+        %% section without `:method` / `:path` (malformed; dispatch rejects
+        %% it): the listener's.
+        ?assertEqual(8, Cap([{~":method", ~"POST"}, {~":path", ~"/plain"}])),
+        ?assertEqual(8, Cap([{~":method", ~"PUT"}, {~":path", ~"/up"}])),
+        ?assertEqual(8, Cap([{~":method", ~"POST"}, {~":path", ~"/missing"}])),
+        ?assertEqual(8, Cap([{~":path", ~"/up"}])),
+        ?assertEqual(8, Cap([{~":method", ~"POST"}]))
+    after
+        persistent_term:erase({roadrunner_routes, Name})
+    end,
+    %% A single-handler listener has no routes.
+    ?assertEqual(
+        8,
+        roadrunner_conn:route_body_cap(
+            {handler, some_mod, fun some_mod:handle/1, undefined},
+            [{~":method", ~"POST"}, {~":path", ~"/up"}],
+            8
+        )
+    ).
 
 dummy_req() ->
     #{target => ~"/"}.

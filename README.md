@@ -232,6 +232,19 @@ routes => [
 ]
 ```
 
+Give a route its own request-body cap with the map form's `max_content_length`
+key, in bytes. It takes the place of the listener's `max_content_length` for the
+requests that route answers, so an upload endpoint can accept large bodies while
+the rest of the API keeps a small cap:
+
+```erlang
+max_content_length => 1_048_576,
+routes => [
+    #{path => ~"/upload", handler => upload_handler, max_content_length => 104_857_600},
+    {~"/users/:id", user_handler}
+]
+```
+
 The request accessors (`method/1`, `path/1`, `header/2`, `parse_qs/1`,
 `bindings/1`, `peer/1`, `read_body/1`) all live in `roadrunner_req`.
 

@@ -35,6 +35,17 @@ over-cap body answers `413 Payload Too Large` and resets the stream
 (`RST_STREAM(NO_ERROR)` on h2, `STOP_SENDING` on h3) so the client stops
 sending.
 
+A route can set its own cap with the `max_content_length` key of its map
+form, larger or smaller than the listener's; it applies to the requests
+that route answers, and requests no route answers keep the listener's.
+HTTP/1.1 routes each request before reading its body, so the route's cap
+governs the read, the `100 Continue` answer and the early 413. HTTP/2 and
+HTTP/3 hold a body to the listener's cap and ask its route when the body
+grows past it, so a larger route cap lets it continue. A smaller route
+cap is checked once the request is routed, after its body is in; a
+request that sends `Expect: 100-continue` gets the 413 from its headers
+alone.
+
 ## WebSocket limits
 
 A WebSocket message is the WS analog of a request body, so its caps

@@ -151,7 +151,7 @@
     recv_phase_bytes = 0 :: non_neg_integer(),
     %% Per-peer rate-limit guard resolved from `proto_opts` + peer once at
     %% `shoot` (`undefined` when off — the common case, a single branch in
-    %% `dispatch_phase/2`).
+    %% `dispatch_phase/3`).
     rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
     %% The `real_ip` trust config when the peer is a trusted proxy, decided
     %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
@@ -889,49 +889,57 @@ handle_request_bytes(
 %% common request, and nothing about it reads the socket. Any bytes
 %% already buffered are the next pipelined request and stay in
 %% `buffered`.
+%%
+%% The request is routed here, once, before any of its body is read: the
+%% match is the one dispatch uses, and a matched route's own
+%% `max_content_length` caps the body in place of the listener's, for the
+%% read itself, the `100 Continue` decision and the early 413 alike.
 -spec read_body_phase(#loop_state{}, roadrunner_req:request(), integer()) -> no_return().
-read_body_phase(#loop_state{body_buffering = BodyMode} = S, Req, Deadline) ->
+read_body_phase(#loop_state{body_buffering = BodyMode, dispatch = Dispatch} = S, Req, Deadline) ->
+    Resolved = roadrunner_conn:resolve_handler(Dispatch, Req),
     case {BodyMode, roadrunner_conn:body_framing(Req)} of
         {auto, none} ->
-            dispatch_phase(S, Req#{body => <<>>});
+            dispatch_phase(S, Req#{body => <<>>}, Resolved);
         {auto, Framing} ->
-            {Waiting, S1} = continue(S, Req, Framing),
-            read_auto_body(S1, Req, Framing, Waiting, Deadline);
+            MaxCL = roadrunner_conn:body_cap(Resolved, S#loop_state.max_content_length),
+            {Waiting, S1} = continue(S, Req, Framing, MaxCL),
+            read_auto_body(S1, Req, Framing, Waiting, MaxCL, Resolved, Deadline);
         {manual, {error, FramingReason}} ->
             S2 = flush_out(S),
             ok = rejection(S2, FramingReason),
             _ = roadrunner_conn:send_bad_request(S2#loop_state.socket),
             exit_normal(S2);
         {manual, Framing} ->
-            {_Waiting, S1} = continue(S, Req, Framing),
+            MaxCL = roadrunner_conn:body_cap(Resolved, S#loop_state.max_content_length),
+            {_Waiting, S1} = continue(S, Req, Framing, MaxCL),
             BodyState = roadrunner_conn:make_body_reader(
                 Framing,
                 S1#loop_state.buffered,
                 body_recv(S1, Deadline),
-                S1#loop_state.max_content_length,
+                MaxCL,
                 trailer_limits(S1)
             ),
-            dispatch_phase(S1, Req#{body_reader => BodyState})
+            dispatch_phase(S1, Req#{body_reader => BodyState}, Resolved)
     end.
 
 %% RFC 9110 §10.1.1: a client gating its body on `Expect: 100-continue` is
 %% WAITING for the interim 100, unless body bytes already arrived with the
 %% headers (then it didn't wait). Send it once the framing says a body we
 %% will read is coming: not for a request without one, nor for a declared
-%% length over `max_content_length`, whose 413 then goes out before the
-%% client sends a byte of it. Queued pipelined responses reach the client
-%% first. Returns whether the client is still holding its body back.
+%% length over the request's body cap `MaxCL`, whose 413 then goes out
+%% before the client sends a byte of it. Queued pipelined responses reach
+%% the client first. Returns whether the client is still holding its body
+%% back.
 -spec continue(
     #loop_state{},
     roadrunner_req:request(),
     none
     | chunked
     | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding}
+    | {error, bad_content_length | bad_transfer_encoding},
+    non_neg_integer()
 ) -> {boolean(), #loop_state{}}.
-continue(
-    #loop_state{buffered = ~"", socket = Socket, max_content_length = MaxCL} = S, Req, Framing
-) ->
+continue(#loop_state{buffered = ~"", socket = Socket} = S, Req, Framing, MaxCL) ->
     case roadrunner_conn:expects_continue(Req) of
         true ->
             case body_to_read(Framing, MaxCL) of
@@ -945,7 +953,7 @@ continue(
         false ->
             {false, S}
     end;
-continue(S, _Req, _Framing) ->
+continue(S, _Req, _Framing, _MaxCL) ->
     {false, S}.
 
 %% Whether the framing promises a body this conn will read.
@@ -961,8 +969,9 @@ body_to_read({content_length, N}, MaxCL) when N > 0, N =< MaxCL -> true;
 body_to_read(_Framing, _MaxCL) -> false.
 
 %% Auto mode with a body (or a framing error the read reports): read it
-%% all before dispatch. `Waiting` is whether the client is still holding
-%% its body back for a 100 it did not get (`continue/3`).
+%% all before dispatch, under the request's body cap `MaxCL`. `Waiting` is
+%% whether the client is still holding its body back for a 100 it did not
+%% get (`continue/4`); `Resolved` is the request's routing, for dispatch.
 -spec read_auto_body(
     #loop_state{},
     roadrunner_req:request(),
@@ -970,13 +979,17 @@ body_to_read(_Framing, _MaxCL) -> false.
     | {content_length, non_neg_integer()}
     | {error, bad_content_length | bad_transfer_encoding},
     boolean(),
+    non_neg_integer(),
+    roadrunner_conn:resolved(),
     integer()
 ) -> no_return().
 read_auto_body(
-    #loop_state{socket = Socket, buffered = Buffered, max_content_length = MaxCL} = S,
+    #loop_state{socket = Socket, buffered = Buffered} = S,
     Req,
     Framing,
     Waiting,
+    MaxCL,
+    Resolved,
     Deadline
 ) ->
     Recv = body_recv(S, Deadline),
@@ -985,7 +998,7 @@ read_auto_body(
             %% Leftover is bytes past the body — feed it
             %% back to the next read_request_phase iteration
             %% as pipelined leftover.
-            dispatch_phase(S#loop_state{buffered = Leftover}, Req#{body => Body});
+            dispatch_phase(S#loop_state{buffered = Leftover}, Req#{body => Body}, Resolved);
         {error, content_length_too_large} ->
             S2 = flush_out(S),
             %% A client still waiting for a 100 sends no body, so there is
@@ -1032,20 +1045,21 @@ trailer_limits(#loop_state{http1_limits = {_ReqLine, MaxHdrLine, MaxHdrBlock, Ma
 
 %% --- dispatch phase ---
 %%
-%% Resolve handler (single-handler or routed), build the middleware
-%% pipeline, run it bracketed by request_start / request_stop |
+%% Take the request's resolved handler (routed in `read_body_phase/3`),
+%% run its middleware pipeline bracketed by request_start / request_stop |
 %% request_exception telemetry. The 5 response shapes (buffered,
 %% stream, loop, sendfile, websocket) dispatch to their respective
 %% writers via `dispatch_response/4`.
--spec dispatch_phase(#loop_state{}, roadrunner_req:request()) -> no_return().
+-spec dispatch_phase(#loop_state{}, roadrunner_req:request(), roadrunner_conn:resolved()) ->
+    no_return().
 dispatch_phase(
     #loop_state{
         socket = Socket,
-        dispatch = Dispatch,
         listener_name = ListenerName,
         rate_limit = RateLimit
     } = S,
-    Req
+    Req,
+    Resolved
 ) ->
     %% The rate-limit guard sends its 429 from inside the check — when
     %% the guard is configured (rare), queued pipelined responses go out
@@ -1058,8 +1072,8 @@ dispatch_phase(
         end,
     case rate_limit_allows(RateLimit, Req, Socket, ListenerName) of
         true ->
-            case roadrunner_conn:resolve_handler(Dispatch, Req) of
-                {ok, Handler, Bindings, Pipeline, _State} ->
+            case Resolved of
+                {ok, Handler, Bindings, Pipeline, _State, _Limits} ->
                     run_pipeline(S1, Handler, Req#{bindings => Bindings}, Pipeline);
                 {method_not_allowed, Allowed} ->
                     %% Path matched but no route answers this method: 405 +
