@@ -56,6 +56,11 @@ same_second_pair() ->
         _ -> same_second_pair()
     end.
 
+with_date_keeps_handler_date_test() ->
+    %% A handler-set Date wins: `with_date/1` leaves the list untouched.
+    Headers = [{~"date", ~"Sun, 06 Nov 1994 08:49:37 GMT"}],
+    ?assertEqual(Headers, roadrunner_http:with_date(Headers)).
+
 format_http_date_pads_single_digits_test() ->
     %% Pick a timestamp whose calendar fields all need two-digit padding
     %% (1970-01-01 00:00:00 UTC = Posix 0) so the `pad2/1` single-digit

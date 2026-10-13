@@ -127,7 +127,9 @@
     %% When > 0, `recv_request_bytes/2` takes the active+hibernate path.
     hibernate_after = 0 :: non_neg_integer(),
     %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
-    %% Prepended to every response by `roadrunner_http:auto_headers/2`.
+    %% Prepended to every response, by `roadrunner_http1:response/4` for
+    %% the keep-alive shapes and `roadrunner_http:auto_headers/2` for
+    %% stream / loop.
     alt_svc = undefined :: binary() | undefined,
     %% HTTP/1 inbound size limits as the
     %% `{max_request_line, max_header_line, max_header_block, max_header_count}`
@@ -1211,8 +1213,7 @@ dispatch_response(
     %% The body goes out via kernel sendfile, which can't join an
     %% iodata batch — flush queued responses ahead of the head.
     S = flush_out(S0),
-    Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
-    Head = roadrunner_http1:response(Status, Headers, ~""),
+    Head = roadrunner_http1:response(Status, Headers0, ~"", AltSvc),
     _ = roadrunner_telemetry:response_send(
         roadrunner_transport:send(Socket, Head), sendfile_response_head
     ),
@@ -1253,8 +1254,7 @@ dispatch_response(
 ) when
     is_integer(Status)
 ->
-    Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
-    Resp = roadrunner_http1:response(Status, Headers, ~""),
+    Resp = roadrunner_http1:response(Status, Headers0, ~"", AltSvc),
     queue_response(S, Resp);
 dispatch_response(
     #loop_state{alt_svc = AltSvc} = S,
@@ -1264,8 +1264,7 @@ dispatch_response(
 ) when
     is_integer(Status)
 ->
-    Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
-    Resp = roadrunner_http1:response(Status, Headers, Body),
+    Resp = roadrunner_http1:response(Status, Headers0, Body, AltSvc),
     queue_response(S, Resp).
 
 %% --- finishing phase ---
