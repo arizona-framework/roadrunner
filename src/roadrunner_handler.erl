@@ -42,7 +42,8 @@ threading `Req` through the entire request lifecycle.
   added to the `101 Switching Protocols` response (e.g. a `set-cookie`).
   The handshake's own headers (`upgrade`, `connection`,
   `sec-websocket-accept`, `sec-websocket-extensions`) win: an entry
-  naming one of them is dropped.
+  naming one of them is dropped, as is a `content-length` or
+  `transfer-encoding`, which a 1xx response must not carry.
 
 If the handler did not call `roadrunner_req:read_body/1,2`, just thread
 the original `Req` back. Idiomatic shape:

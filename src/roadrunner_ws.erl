@@ -165,7 +165,9 @@ accept_key(Key) when is_binary(Key) ->
 %% the response list, so the common no-extra case allocates nothing more.
 %% Handshake names are dropped from them: the server computes those, and
 %% only the server can negotiate an extension, so a handler-set
-%% `sec-websocket-extensions` would desync the frame stream.
+%% `sec-websocket-extensions` would desync the frame stream. So are
+%% `content-length` and `transfer-encoding`, which a server MUST NOT send
+%% in a 1xx response (RFC 9110 §8.6, RFC 9112 §6.1).
 -doc false.
 -spec handshake_response(roadrunner_http:headers(), roadrunner_http:headers()) ->
     {ok, roadrunner_http:status(), roadrunner_http:headers(), iodata(), negotiated()}
@@ -206,7 +208,8 @@ build_handshake_headers(Accept, {permessage_deflate, _, ResponseValue}, Tail) ->
     ].
 
 %% The handler's 101 headers minus the handshake's own names (see
-%% `handshake_response/2`). Literal clause heads, so the compiler matches
+%% `handshake_response/2`) and the framing fields a 1xx response must not
+%% carry (RFC 9110 §8.6, RFC 9112 §6.1). Literal clause heads, so the compiler matches
 %% each name in one decision tree instead of a list scan per header.
 -spec handler_headers(roadrunner_http:headers()) -> roadrunner_http:headers().
 handler_headers([]) -> [];
@@ -214,6 +217,8 @@ handler_headers([{~"upgrade", _} | T]) -> handler_headers(T);
 handler_headers([{~"connection", _} | T]) -> handler_headers(T);
 handler_headers([{~"sec-websocket-accept", _} | T]) -> handler_headers(T);
 handler_headers([{~"sec-websocket-extensions", _} | T]) -> handler_headers(T);
+handler_headers([{~"content-length", _} | T]) -> handler_headers(T);
+handler_headers([{~"transfer-encoding", _} | T]) -> handler_headers(T);
 handler_headers([H | T]) -> [H | handler_headers(T)].
 
 -spec validate_upgrade(roadrunner_http:headers()) ->
