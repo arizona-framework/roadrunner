@@ -14,11 +14,12 @@ re-exported alongside it (`headers/0`, `version/0`, `status/0`,
 
 -on_load(init_patterns/0).
 
--define(QMARK_CP_KEY, {?MODULE, qmark_cp}).
 -define(SEMI_CP_KEY, {?MODULE, semi_cp}).
 -define(COMMA_CP_KEY, {?MODULE, comma_cp}).
 -define(EQ_CP_KEY, {?MODULE, eq_cp}).
 -define(QUOTE_CP_KEY, {?MODULE, quote_cp}).
+
+-include("roadrunner_swar.hrl").
 
 -export_type([request/0, body_reader/0, cached_decisions/0, private/0]).
 
@@ -42,9 +43,10 @@ care which protocol delivered the bytes.
     method := binary(),
     target := binary(),
     %% The request target with any `?query` removed, sliced for free by the
-    %% h1 parser during target validation so `path/1` is an O(1) field read.
-    %% Absent on h2/h3 requests and on manually-built request maps, where
-    %% `path/1` falls back to splitting `target` on `?`.
+    %% h1 parser during target validation, and set once by the h2/h3
+    %% request builders, so `path/1` is an O(1) field read. Absent on
+    %% manually-built request maps, where `path/1` falls back to splitting
+    %% `target` on `?`.
     path => binary(),
     version := version(),
     headers := headers(),
@@ -163,6 +165,7 @@ to absorb a chunk's payload across multiple length-bounded calls.
     method_is/2,
     path/1,
     qs/1,
+    target_path/1,
     version/1,
     headers/1,
     header/2,
@@ -215,14 +218,12 @@ router's job.
 """.
 -spec path(request()) -> binary().
 path(#{path := P}) ->
-    %% Fast path: the h1 parser sliced the `?`-free path at validation time.
+    %% Fast path: the h1 parser and the h2/h3 request builders set the
+    %% `?`-free path once.
     P;
 path(#{target := T}) ->
-    %% Fallback for h2/h3 and manually-built maps that carry no `path`.
-    case binary:split(T, persistent_term:get(?QMARK_CP_KEY)) of
-        [P, _Q] -> P;
-        [P] -> P
-    end.
+    %% Fallback for manually-built maps that carry no `path`.
+    target_path(T).
 
 -doc """
 Return the raw query string portion of the request-target, without the
@@ -232,10 +233,38 @@ For decoded `{Key, Value}` pairs, pipe through `roadrunner_qs:parse/1`.
 """.
 -spec qs(request()) -> binary().
 qs(#{target := T}) ->
-    case binary:split(T, persistent_term:get(?QMARK_CP_KEY)) of
-        [_P, Q] -> Q;
-        [_P] -> <<>>
+    PathLen = path_len(T, 0),
+    case T of
+        <<_:PathLen/binary, $?, Q/binary>> -> Q;
+        _ -> <<>>
     end.
+
+%% The path of a request-target: the bytes before its first `?`. Exported
+%% for the HTTP/2 and HTTP/3 request builders, which set `path` once the
+%% way the HTTP/1.1 parser does, so `path/1` takes its fast clause.
+-doc false.
+-spec target_path(binary()) -> binary().
+target_path(T) ->
+    PathLen = path_len(T, 0),
+    <<P:PathLen/binary, _/binary>> = T,
+    P.
+
+%% Bytes before the first `?`, 7 per step while a word holds none (SWAR,
+%% see `roadrunner_swar.hrl`): 15-47 ns on typical targets against 45-73 ns
+%% for `binary:split/2`.
+-spec path_len(binary(), non_neg_integer()) -> non_neg_integer().
+path_len(<<X:56, Rest/binary>> = Cur, Len) ->
+    case ?SWAR_HIGH(?SWAR_ZERO(X bxor ?SWAR_BYTES($?))) of
+        0 -> path_len(Rest, Len + 7);
+        _ -> path_len_bytes(Cur, Len)
+    end;
+path_len(Cur, Len) ->
+    path_len_bytes(Cur, Len).
+
+-spec path_len_bytes(binary(), non_neg_integer()) -> non_neg_integer().
+path_len_bytes(<<$?, _/binary>>, Len) -> Len;
+path_len_bytes(<<_, Rest/binary>>, Len) -> path_len_bytes(Rest, Len + 1);
+path_len_bytes(<<>>, Len) -> Len.
 
 -doc "Return the HTTP version tuple ({1,0} or {1,1}).".
 -spec version(request()) -> version().
@@ -731,7 +760,6 @@ listener_name(_) -> undefined.
 %% `persistent_term` so the hot path reads a constant, not a recompile.
 -spec init_patterns() -> ok.
 init_patterns() ->
-    persistent_term:put(?QMARK_CP_KEY, binary:compile_pattern(~"?")),
     persistent_term:put(?SEMI_CP_KEY, binary:compile_pattern(~";")),
     persistent_term:put(?COMMA_CP_KEY, binary:compile_pattern(~",")),
     persistent_term:put(?EQ_CP_KEY, binary:compile_pattern(~"=")),
