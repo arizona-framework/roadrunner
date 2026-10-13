@@ -179,6 +179,17 @@ the client IP, so behind a balancer set `proxy_protocol` (an L4 balancer)
 or `real_ip` (HTTP proxies passing `X-Forwarded-For` or `Forwarded`);
 otherwise every client behind the proxy shares one bucket.
 
+A route can have its own rate with the `rate_limit` key of its map form,
+in the same shape (`rate`, `period`, `burst`). It is a second bucket per
+client, kept on top of the listener's: a request to the route spends from
+both, and either one can refuse it with the same 429, telemetry event and
+`rate_limited` count. It is checked once the request is routed, and
+needs no listener `rate_limit` to work. A bucket is dropped once it is full
+again, which a client cannot tell from no bucket, so there is no
+`idle_ttl` to set. `reload_routes/2` keeps the buckets of a route whose
+path, methods and limit stay the same, and starts new ones when they
+change.
+
 ## Configuring
 
 Pass any configurable limit in the listener options map:

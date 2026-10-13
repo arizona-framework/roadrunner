@@ -635,6 +635,65 @@ compile_rejects_invalid_max_content_length_test_() ->
      || Bad <- [-1, 1.5, ~"10", infinity]
     ].
 
+compile_rejects_invalid_rate_limit_test_() ->
+    %% A map of positive integers with `rate` set, and no other keys.
+    [
+        ?_assertError(
+            {invalid_route_rate_limit, Bad},
+            roadrunner_router:compile([#{path => ~"/x", handler => h, rate_limit => Bad}], [])
+        )
+     || Bad <- [
+            5,
+            #{},
+            #{period => 1},
+            #{rate => 0},
+            #{rate => 1, period => -1},
+            #{rate => 1, burst => 1.5},
+            #{rate => 1, idle_ttl => 1000}
+        ]
+    ].
+
+resolve_carries_the_compiled_rate_limit_test() ->
+    %% Compiled to `{Rate, Cap, Cost, BucketKey}`: one request costs
+    %% `Period * 1000` units, the bucket holds `Burst` of them. The key is
+    %% the route's path, its methods in one order, and the settings.
+    Compiled = roadrunner_router:compile(
+        [
+            #{
+                path => ~"/login",
+                handler => login,
+                methods => [~"POST", ~"GET"],
+                rate_limit => #{rate => 5, period => 60}
+            },
+            #{
+                path => ~"/upload",
+                handler => up,
+                max_content_length => 64,
+                rate_limit => #{rate => 2, burst => 4}
+            }
+        ],
+        []
+    ),
+    ?assertMatch(
+        {ok, login, #{}, _, _, #{
+            rate_limit := {5, 300000, 60000, {~"/login", [~"GET", ~"POST"], 5, 60, 5}}
+        }},
+        roadrunner_router:resolve(~"POST", ~"/login", Compiled)
+    ),
+    ?assertMatch(
+        {ok, up, #{}, _, _, #{
+            max_content_length := 64,
+            rate_limit := {2, 4000, 1000, {~"/upload", undefined, 2, 1, 4}}
+        }},
+        roadrunner_router:resolve(~"POST", ~"/upload", Compiled)
+    ).
+
+validate_reports_a_bad_rate_limit_test() ->
+    ?assertEqual(
+        {error, {invalid_route_rate_limit, #{rate => 0}}},
+        roadrunner_router:validate([#{path => ~"/x", handler => h, rate_limit => #{rate => 0}}])
+    ).
+
 resolve_carries_the_route_limits_test() ->
     %% `resolve/3` is `match/3` plus the matched route's limits: what it sets,
     %% or `undefined` for every route form that sets none.

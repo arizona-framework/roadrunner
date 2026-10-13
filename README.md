@@ -245,6 +245,18 @@ routes => [
 ]
 ```
 
+A route can also have its own per-client request rate with the `rate_limit` key,
+in the shape of the listener's `rate_limit` (`rate`, `period` in seconds, `burst`).
+It is kept on top of the listener's limit, so a login endpoint can allow a few
+attempts a minute while the rest of the API keeps its usual rate:
+
+```erlang
+routes => [
+    #{path => ~"/login", handler => login_handler, rate_limit => #{rate => 5, period => 60}},
+    {~"/users/:id", user_handler}
+]
+```
+
 The request accessors (`method/1`, `path/1`, `header/2`, `parse_qs/1`,
 `bindings/1`, `peer/1`, `read_body/1`) all live in `roadrunner_req`.
 

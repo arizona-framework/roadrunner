@@ -55,6 +55,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     route_body_cap_raises/1,
     route_body_cap_lowers/1,
     route_body_cap_expect_continue/1,
+    route_rate_limit_refuses/1,
     other_expectation_gets_no_interim/1,
     oversized_headers_431/1,
     advertises_max_field_section_size/1,
@@ -143,6 +144,7 @@ all() ->
         route_body_cap_raises,
         route_body_cap_lowers,
         route_body_cap_expect_continue,
+        route_rate_limit_refuses,
         other_expectation_gets_no_interim,
         oversized_headers_431,
         advertises_max_field_section_size,
@@ -205,6 +207,7 @@ init_per_testcase(Case, Config) when
     Case =:= route_body_cap_raises;
     Case =:= route_body_cap_lowers;
     Case =:= route_body_cap_expect_continue;
+    Case =:= route_rate_limit_refuses;
     Case =:= protocols_tuple_form;
     Case =:= certfile_keyfile;
     Case =:= certs_keys_form;
@@ -808,6 +811,31 @@ route_body_cap_expect_continue(_Config) ->
         ?assertMatch({ok, [{~":status", ~"413"} | _]}, roadrunner_qpack:decode(Refusal))
     after
         ll_close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+route_rate_limit_refuses(_Config) ->
+    %% `/login` allows one request a minute per client, checked by the stream
+    %% worker once the request is routed; `/open` sets no limit.
+    Name = listener_name(route_rate_limit_refuses),
+    {ok, _} = start_h3(Name, #{
+        routes => [
+            #{
+                path => ~"/login",
+                handler => roadrunner_client_ip_handler,
+                rate_limit => #{rate => 1, period => 60}
+            },
+            {~"/open", roadrunner_client_ip_handler}
+        ]
+    }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        ?assertMatch({200, _, _}, get(Conn, ~"/login")),
+        {429, Headers, _} = get(Conn, ~"/login"),
+        ?assertEqual({~"retry-after", ~"60"}, lists:keyfind(~"retry-after", 1, Headers)),
+        ?assertMatch({200, _, _}, get(Conn, ~"/open"))
+    after
+        close(Conn),
         roadrunner_listener:stop(Name)
     end.
 

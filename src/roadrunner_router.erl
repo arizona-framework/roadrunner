@@ -64,7 +64,14 @@ of trying every route in turn.
 -export([compile/2, validate/1, match/3, resolve/3]).
 
 -export_type([
-    route/0, routes/0, compiled/0, bindings/0, methods/0, validation_error/0, limits/0
+    route/0,
+    routes/0,
+    compiled/0,
+    bindings/0,
+    methods/0,
+    rate_limit/0,
+    validation_error/0,
+    limits/0
 ]).
 
 -doc """
@@ -74,8 +81,9 @@ A single route entry. Three shapes are accepted:
 - `{Path, Handler, State}` — shorthand with state only.
 - `#{path := Path, handler := Handler, state => State,
    middlewares => Mws, methods => [~"GET", ...],
-   max_content_length => Bytes}` — map form; use this to attach
-  per-route middlewares, an HTTP-method allowlist, or a request-body cap.
+   max_content_length => Bytes, rate_limit => RateLimit}` — map form; use
+  this to attach per-route middlewares, an HTTP-method allowlist, a
+  request-body cap or a request-rate limit.
 
 
 `Path` is a binary pattern (literal segments, `:param` captures, or
@@ -85,7 +93,9 @@ to the handler via `roadrunner_req:state/1`; unset → `undefined`.
 `methods` is a list of uppercase method binaries the route answers;
 unset → every method. `max_content_length` is the route's own request-body
 cap in bytes, in place of the listener's (larger or smaller) for the
-requests the route answers; unset → the listener's.
+requests the route answers; unset → the listener's. `rate_limit` is the
+route's own per-client request rate (`t:rate_limit/0`), on top of the
+listener's `rate_limit`; unset → only the listener's.
 """.
 -type route() ::
     {Path :: binary(), Handler :: module()}
@@ -96,8 +106,24 @@ requests the route answers; unset → the listener's.
         state => term(),
         middlewares => roadrunner_middleware:middleware_list(),
         methods => methods(),
-        max_content_length => non_neg_integer()
+        max_content_length => non_neg_integer(),
+        rate_limit => rate_limit()
     }.
+
+-doc """
+A route's own per-client request rate: `rate` requests per `period` seconds
+(default 1), with a `burst` bucket capacity in requests (default `rate`). It is
+a bucket of its own, kept on top of the listener's `rate_limit`, so a request
+to the route spends from both and either one can refuse it: a client over the
+route's rate gets `429 Too Many Requests` with `Retry-After` before the
+handler runs. The client is the peer, or the address `real_ip` resolves
+behind a trusted proxy, as for the listener's limit.
+""".
+-type rate_limit() :: #{
+    rate := pos_integer(),
+    period => pos_integer(),
+    burst => pos_integer()
+}.
 
 -doc """
 An HTTP-method allowlist for a route: a list of **uppercase** method
@@ -125,6 +151,8 @@ Why a route table was rejected, as returned by `validate/1` and raised by
   list of binaries.
 - `{invalid_route_max_content_length, Value}` — a `max_content_length` key that
   is not a non-negative integer.
+- `{invalid_route_rate_limit, Value}` — a `rate_limit` key that is not a
+  `t:rate_limit/0` map of positive integers with `rate` set.
 - `{invalid_route_path, Path, wildcard_not_last}` — a segment after the
   pattern's `*wildcard`, which no request could ever reach.
 - `{unreachable_route, Position, Path, ShadowedBy}` — the entries above this
@@ -136,6 +164,7 @@ Why a route table was rejected, as returned by `validate/1` and raised by
     {invalid_route, route()}
     | {invalid_route_methods, term()}
     | {invalid_route_max_content_length, term()}
+    | {invalid_route_rate_limit, term()}
     | {invalid_route_path, binary(), wildcard_not_last}
     | {unreachable_route, pos_integer(), binary(), [{pos_integer(), binary()}]}.
 
@@ -145,10 +174,25 @@ Why a route table was rejected, as returned by `validate/1` and raised by
 
 -doc """
 A route's request limits, carried in its compiled entry so the one dispatch
-match yields them: `undefined` for a route that sets none, else the overrides
-it declares.
+match yields them: `undefined` for a route that sets none, else the ones it
+declares. A `rate_limit` is compiled to its token-bucket terms (rate, bucket
+capacity and cost of one request, in the units of `roadrunner_rate_limit`) and
+the key of its buckets.
 """.
--type limits() :: undefined | #{max_content_length => non_neg_integer()}.
+-type limits() ::
+    undefined
+    | #{
+        max_content_length => non_neg_integer(),
+        rate_limit => {pos_integer(), pos_integer(), pos_integer(), rate_limit_key()}
+    }.
+
+%% What the buckets of a route rate limit are keyed on, with the client
+%% address: the route path and methods (two routes a request could reach
+%% never share both) and the rate settings, so reloading the routes keeps
+%% the buckets of a route whose limit is unchanged and starts new ones when
+%% it changes.
+-type rate_limit_key() ::
+    {binary(), [binary()] | undefined, pos_integer(), pos_integer(), pos_integer()}.
 
 -doc "An ordered list of routes; matched first-to-last.".
 -type routes() :: [route()].
@@ -313,8 +357,41 @@ compile_route(#{path := Path, handler := Handler} = Route, ResolvedListener) whe
     }.
 
 -spec route_limits(map()) -> limits().
-route_limits(#{max_content_length := Max}) -> #{max_content_length => Max};
-route_limits(_Route) -> undefined.
+route_limits(Route) ->
+    Limits0 =
+        case Route of
+            #{max_content_length := Max} -> #{max_content_length => Max};
+            _ -> #{}
+        end,
+    Limits =
+        case Route of
+            #{rate_limit := RateLimit} ->
+                Limits0#{rate_limit => compile_rate_limit(RateLimit, Route)};
+            _ ->
+                Limits0
+        end,
+    case map_size(Limits) of
+        0 -> undefined;
+        _ -> Limits
+    end.
+
+%% The token-bucket terms of a route's `rate_limit`, as the listener's are
+%% resolved (`roadrunner_conn:resolve_rate_limit/2`): one request costs
+%% `Period * 1000` units, the bucket holds `Burst` requests' worth and refills
+%% `Rate` units a millisecond. Derived here, once, so the per-request check
+%% does no arithmetic.
+-spec compile_rate_limit(rate_limit(), map()) ->
+    {pos_integer(), pos_integer(), pos_integer(), rate_limit_key()}.
+compile_rate_limit(#{rate := Rate} = RateLimit, #{path := Path} = Route) ->
+    Period = maps:get(period, RateLimit, 1),
+    Burst = maps:get(burst, RateLimit, Rate),
+    Cost = Period * 1000,
+    Methods =
+        case Route of
+            #{methods := RouteMethods} -> lists:usort(RouteMethods);
+            _ -> undefined
+        end,
+    {Rate, Burst * Cost, Cost, {Path, Methods, Rate, Period, Burst}}.
 
 -spec build_table(
     [{[segment()], module(), roadrunner_middleware:next(), term(), method_lookup(), limits()}]
@@ -442,6 +519,7 @@ route_spec(Route, Pos) ->
         ok ?= check_wildcard_last(Pattern, Path),
         {ok, Methods} ?= route_methods(Route),
         ok ?= check_max_content_length(Route),
+        ok ?= check_rate_limit(Route),
         {ok, {Pos, Path, Pattern, Methods}}
     end.
 
@@ -473,6 +551,26 @@ check_max_content_length(#{max_content_length := Max}) when is_integer(Max), Max
 check_max_content_length(#{max_content_length := Max}) ->
     {error, {invalid_route_max_content_length, Max}};
 check_max_content_length(_Route) ->
+    ok.
+
+-spec check_rate_limit(route()) -> ok | {error, validation_error()}.
+check_rate_limit(#{rate_limit := RateLimit}) ->
+    %% A map with `rate` set, and only `rate`, `period` and `burst`, each a
+    %% positive integer.
+    case
+        is_map(RateLimit) andalso is_map_key(rate, RateLimit) andalso
+            lists:all(
+                fun({Key, Value}) ->
+                    lists:member(Key, [rate, period, burst]) andalso is_integer(Value) andalso
+                        Value > 0
+                end,
+                maps:to_list(RateLimit)
+            )
+    of
+        true -> ok;
+        false -> {error, {invalid_route_rate_limit, RateLimit}}
+    end;
+check_rate_limit(_Route) ->
     ok.
 
 %% `match_pattern/3` consumes a wildcard only as a pattern's final segment, so a

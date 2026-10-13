@@ -54,6 +54,10 @@ All duration and interval values in `opts()` are in milliseconds —
 %% One tick a minute costs at most one `is_process_alive` per registered
 %% conn, and an orphan is reaped within two ticks.
 -define(DEFAULT_SLOT_RECONCILIATION_INTERVAL, 60000).
+%% How often the route rate-limit buckets that are full again are dropped.
+%% Only full ones go, which a client cannot tell from none, so this bounds
+%% how long idle buckets hold memory, not how the limits behave.
+-define(ROUTE_RATE_LIMIT_SWEEP_INTERVAL, 10000).
 -define(DEFAULT_NUM_ACCEPTORS, 10).
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
 -define(DEFAULT_MAX_CLIENTS, 16384).
@@ -366,7 +370,8 @@ ops-tuning rationale.
     %% accurate behind a balancer when `proxy_protocol` is set. The per-IP
     %% bucket is lock-free (last-write-wins), so concurrent connections from one
     %% IP can momentarily admit up to that many requests past `burst`; it bounds
-    %% the sustained per-source rate, not exact simultaneity.
+    %% the sustained per-source rate, not exact simultaneity. A route can add a
+    %% rate of its own on top (`roadrunner_router:rate_limit()`).
     rate_limit => #{
         rate := pos_integer(),
         period => pos_integer(),
@@ -653,9 +658,13 @@ WebSocket session tunables (under `ws` in the listener opts).
     %% `init/1`, stopped in `terminate/1` / `do_drain/2`); the pooled
     %% reuseport listeners drive the UDP sockets while roadrunner owns
     %% the h3 conn loop.
-    %% Kept last so the record's existing field positions are unchanged
+    %% Kept after the fields above so their positions are unchanged
     %% (some tests read `proto_opts` positionally via `element/2`).
-    quic_listener = undefined :: pid() | undefined
+    quic_listener = undefined :: pid() | undefined,
+    %% The bucket store of the routes with their own `rate_limit`, created
+    %% when the route table first has one (at start or on `reload_routes/2`)
+    %% and kept for the life of the listener; `undefined` until then.
+    route_buckets = undefined :: ets:table() | undefined
 }).
 
 -doc """
@@ -812,8 +821,8 @@ reload_routes(Name, Routes) ->
 -spec init(opts()) -> {ok, #state{}} | {stop, term()}.
 init(#{port := Port} = Opts) ->
     ListenerName = listener_name(),
-    publish_routes(ListenerName, Opts),
     ProtoOpts = build_proto_opts(Opts, ListenerName),
+    RouteBuckets = publish_routes(ListenerName, Opts, ProtoOpts),
     proc_lib:set_label({roadrunner_listener, ListenerName, Port}),
     #{protocols := Protocols} = ProtoOpts,
     %% TCP (`http1`/`http2`) and QUIC (`http3`) are independent
@@ -831,7 +840,8 @@ init(#{port := Port} = Opts) ->
                         quic_listener = QuicListener,
                         port = bound_port(LSocket, QuicListener),
                         proto_opts = ProtoOpts,
-                        reconciliation = Reconciliation
+                        reconciliation = Reconciliation,
+                        route_buckets = RouteBuckets
                     }};
                 {error, Reason} ->
                     %% TCP bound but QUIC failed — release the TCP port
@@ -1080,16 +1090,50 @@ setup_rate_limit_sweep(_ProtoOpts) ->
 %% Compile + publish to `persistent_term` once, at listener start. The
 %% conn reads via `persistent_term:get/1` on every request, so the
 %% lookup is O(1) and the table is shared across all conns of this
-%% listener without copying.
--spec publish_routes(atom(), opts()) -> ok.
-publish_routes(ListenerName, #{routes := Routes} = Opts) when is_list(Routes) ->
-    ListenerMws = maps:get(middlewares, Opts, []),
-    persistent_term:put(
-        {roadrunner_routes, ListenerName},
-        roadrunner_router:compile(Routes, ListenerMws)
-    );
-publish_routes(_ListenerName, _Opts) ->
-    ok.
+%% listener without copying. A table with a route `rate_limit` gets its
+%% bucket store first (`new_route_buckets/2`), returned for the state. A
+%% store an earlier listener of this name left behind (one whose start
+%% failed ends without `terminate/2`) is dropped rather than reused: its
+%% table died with that listener.
+-spec publish_routes(atom(), opts(), roadrunner_conn:proto_opts()) -> ets:table() | undefined.
+publish_routes(ListenerName, #{routes := Routes} = Opts, ProtoOpts) when is_list(Routes) ->
+    Compiled = roadrunner_router:compile(Routes, maps:get(middlewares, Opts, [])),
+    RouteBuckets =
+        case route_rate_limited(Routes) of
+            true ->
+                new_route_buckets(ListenerName, ProtoOpts);
+            false ->
+                _ = persistent_term:erase({roadrunner_route_rate_limit, ListenerName}),
+                undefined
+        end,
+    persistent_term:put({roadrunner_routes, ListenerName}, Compiled),
+    RouteBuckets;
+publish_routes(_ListenerName, _Opts, _ProtoOpts) ->
+    undefined.
+
+%% Whether any route sets its own `rate_limit`.
+-spec route_rate_limited(roadrunner_router:routes()) -> boolean().
+route_rate_limited(Routes) ->
+    lists:any(
+        fun
+            (#{rate_limit := _}) -> true;
+            (_Route) -> false
+        end,
+        Routes
+    ).
+
+%% Create the bucket store of the route rate limits and publish it, with
+%% the counter its refusals add to, under the name the conns look it up by
+%% (`roadrunner_conn:route_rate_limit/2`). It is published before the routes
+%% that use it, so no request matches such a route without it. Like the
+%% listener's own store, the table is owned by this gen_server and dies with
+%% it, and the sweep timer cancels itself.
+-spec new_route_buckets(atom(), roadrunner_conn:proto_opts()) -> ets:table().
+new_route_buckets(ListenerName, #{rate_limited_counter := Counter}) ->
+    Table = ets:new(roadrunner_route_rate_limit, [set, public, {write_concurrency, auto}]),
+    persistent_term:put({roadrunner_route_rate_limit, ListenerName}, {Table, Counter}),
+    _ = erlang:send_after(?ROUTE_RATE_LIMIT_SWEEP_INTERVAL, self(), route_rate_limit_sweep),
+    Table.
 
 %% Recover the registered name we were started with. `start_link/2` always
 %% calls `gen_server:start_link({local, Name}, ...)` so the name is set
@@ -1524,7 +1568,7 @@ alt_svc_value(Port) ->
 %% that need to introspect outside the request flow. A list of route
 %% entries uses the router. When `routes` is omitted, fall back to
 %% the default hello-world handler. List-form routes are published
-%% to `persistent_term` by `publish_routes/2` — the dispatch tag
+%% to `persistent_term` by `publish_routes/3` — the dispatch tag
 %% carries the listener name so the conn can look the table up.
 -spec build_dispatch(opts(), atom()) -> roadrunner_conn:dispatch().
 %% Validate + normalize the `protocols` opt. Returns a 2-tuple:
@@ -1989,8 +2033,8 @@ handle_call({drain, Timeout}, _From, State) ->
     {Reply, NewState} = do_drain(State, Timeout),
     {stop, normal, Reply, NewState};
 handle_call({reload_routes, Routes}, _From, State) ->
-    Reply = do_reload_routes(State, Routes),
-    {reply, Reply, State};
+    {Reply, State1} = do_reload_routes(State, Routes),
+    {reply, Reply, State1};
 handle_call({notify_drain, Deadline}, _From, #state{proto_opts = #{drain_table := Table}} = State) ->
     {reply, notify_conns(Table, Deadline), State};
 handle_call(
@@ -2020,9 +2064,12 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
     {reply, Reply, State}.
 
 -spec do_reload_routes(#state{}, roadrunner_router:routes()) ->
-    ok | {error, no_routes} | {error, roadrunner_router:validation_error()}.
+    {ok | {error, no_routes} | {error, roadrunner_router:validation_error()}, #state{}}.
 do_reload_routes(
-    #state{proto_opts = #{dispatch := {router, Name}, middlewares := ListenerMws}},
+    #state{
+        proto_opts = #{dispatch := {router, Name}, middlewares := ListenerMws} = ProtoOpts,
+        route_buckets = RouteBuckets
+    } = State,
     Routes
 ) ->
     %% Check the replacement before touching anything. `compile/2` raises on a
@@ -2031,16 +2078,21 @@ do_reload_routes(
     %% the verdict comes back as a value and a bad table is simply refused.
     case roadrunner_router:validate(Routes) of
         ok ->
-            persistent_term:put(
-                {roadrunner_routes, Name},
-                roadrunner_router:compile(Routes, ListenerMws)
-            ),
-            ok;
+            Compiled = roadrunner_router:compile(Routes, ListenerMws),
+            %% The first table with a route `rate_limit` gets the bucket
+            %% store, published before the routes that use it.
+            RouteBuckets1 =
+                case RouteBuckets =:= undefined andalso route_rate_limited(Routes) of
+                    true -> new_route_buckets(Name, ProtoOpts);
+                    false -> RouteBuckets
+                end,
+            persistent_term:put({roadrunner_routes, Name}, Compiled),
+            {ok, State#state{route_buckets = RouteBuckets1}};
         {error, _Reason} = Error ->
-            Error
+            {Error, State}
     end;
-do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _, _}}}, _Routes) ->
-    {error, no_routes}.
+do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _, _}}} = State, _Routes) ->
+    {{error, no_routes}, State}.
 
 -spec do_drain(#state{}, non_neg_integer()) ->
     {{ok, drained} | {timeout, non_neg_integer()}, #state{}}.
@@ -2166,6 +2218,12 @@ handle_info(
     _ = roadrunner_conn:rate_limit_evict_idle(Table, NowMs, IdleTtl),
     _ = erlang:send_after(Interval, self(), rate_limit_sweep),
     {noreply, State};
+handle_info(route_rate_limit_sweep, #state{route_buckets = Table} = State) ->
+    %% Drop the route buckets that are full again, then reschedule. Keeps the
+    %% store bounded by the clients still inside their routes' windows.
+    _ = roadrunner_conn:route_rate_limit_evict(Table, erlang:monotonic_time(millisecond)),
+    _ = erlang:send_after(?ROUTE_RATE_LIMIT_SWEEP_INTERVAL, self(), route_rate_limit_sweep),
+    {noreply, State};
 handle_info(_Msg, State) ->
     {noreply, State}.
 
@@ -2217,6 +2275,7 @@ stop_quic(QuicPool) ->
 -spec erase_routes(roadrunner_conn:proto_opts()) -> ok.
 erase_routes(#{dispatch := {router, Name}}) ->
     _ = persistent_term:erase({roadrunner_routes, Name}),
+    _ = persistent_term:erase({roadrunner_route_rate_limit, Name}),
     ok;
 erase_routes(_) ->
     ok.
