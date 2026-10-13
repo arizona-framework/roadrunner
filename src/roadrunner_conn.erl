@@ -885,7 +885,7 @@ route_body_cap({handler, _Mod, _Pipeline, _State}, _Headers, Default) ->
 %% earn anyway (the route looked up only then); `continue` when it otherwise
 %% expects `100-continue`, the 100
 %% that asks for the body; `none` when it expects nothing. HTTP/1.1 decides
-%% from the request's framing instead (`roadrunner_conn_loop:continue/4`).
+%% from the request's framing instead (`roadrunner_conn_loop:expect_answer/4`).
 -doc false.
 -spec expect_answer(proto_opts(), roadrunner_http:headers(), non_neg_integer()) ->
     none | continue | too_large.
@@ -1245,7 +1245,7 @@ full read).
     | {error, term()}.
 consume_body_reader(#{continue := {Socket, Deadline, MinRate}} = BS, Mode) ->
     %% The client is holding its body back for a 100 Continue the conn left
-    %% to this first read (`roadrunner_conn_loop:defer_continue/6`): send it,
+    %% to this first read (`roadrunner_conn_loop:read_body/8`): send it,
     %% then read with a recv whose slow-client rate window starts now, as the
     %% client can only start sending now.
     ok = send_continue(Socket),

@@ -235,7 +235,8 @@ Optional middleware and timing knobs (durations in milliseconds):
   body before invoking the handler) or `manual` (handler calls
   `roadrunner_req:read_body/1,2`; a client sending
   `Expect: 100-continue` is asked for its body only when the handler
-  first reads it). In manual mode an HTTP/2 or HTTP/3 handler runs as
+  first reads it, and one declaring a body over the cap gets its 413
+  at once). In manual mode an HTTP/2 or HTTP/3 handler runs as
   soon as the headers are in, and a stream holds at most one
   flow-control window of body it has not read (its window, or its QUIC
   stream credit, is given back only as the handler reads); a handler that
