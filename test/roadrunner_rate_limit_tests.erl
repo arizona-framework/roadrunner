@@ -57,3 +57,23 @@ retry_after_partial_deficit_test() ->
 
 retry_after_never_below_one_test() ->
     ?assertEqual(1, ?M:retry_after_secs(999, 1000, 1000)).
+
+%% --- client_key/1 ---
+
+client_key_ipv4_is_itself_test() ->
+    ?assertEqual({203, 0, 113, 7}, ?M:client_key({203, 0, 113, 7})).
+
+client_key_ipv6_is_its_64_test() ->
+    %% Every address of a /64 shares one key; another /64 has its own.
+    Key = {16#2001, 16#DB8, 0, 0, 0, 0, 0, 0},
+    ?assertEqual(Key, ?M:client_key({16#2001, 16#DB8, 0, 0, 0, 0, 0, 1})),
+    ?assertEqual(Key, ?M:client_key({16#2001, 16#DB8, 0, 0, 16#ABCD, 1, 2, 3})),
+    ?assertEqual(
+        {16#2001, 16#DB8, 0, 1, 0, 0, 0, 0}, ?M:client_key({16#2001, 16#DB8, 0, 1, 0, 0, 0, 1})
+    ).
+
+client_key_ipv4_carried_in_ipv6_test() ->
+    %% IPv4-mapped (a dual-stack listener's IPv4 peer) and NAT64
+    %% (`64:ff9b::/96`) addresses are keyed as the IPv4 client they carry.
+    ?assertEqual({203, 0, 113, 7}, ?M:client_key({0, 0, 0, 0, 0, 16#FFFF, 16#CB00, 16#7107})),
+    ?assertEqual({203, 0, 113, 7}, ?M:client_key({16#64, 16#FF9B, 0, 0, 0, 0, 16#CB00, 16#7107})).

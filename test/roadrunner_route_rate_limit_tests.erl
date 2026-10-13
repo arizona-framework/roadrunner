@@ -61,6 +61,18 @@ call_test() ->
         ?assertMatch(
             {{200, _, _}, _}, ?M:call(Req#{client_ip => {10, 0, 0, 9}}, Next, State)
         ),
+        %% IPv6 clients share their /64's bucket: another address in the
+        %% resolved client's /64 is refused, one in a different /64 is not.
+        V6 = Req#{client_ip => {16#2001, 16#DB8, 0, 0, 0, 0, 0, 1}},
+        ?assertMatch({{200, _, _}, _}, ?M:call(V6, Next, State)),
+        ?assertMatch(
+            {{429, _, _}, _},
+            ?M:call(V6#{client_ip := {16#2001, 16#DB8, 0, 0, 0, 0, 0, 2}}, Next, State)
+        ),
+        ?assertMatch(
+            {{200, _, _}, _},
+            ?M:call(V6#{client_ip := {16#2001, 16#DB8, 0, 1, 0, 0, 0, 1}}, Next, State)
+        ),
         %% No client address, no limit (as for the listener's).
         ?assertMatch({{200, _, _}, _}, ?M:call(maps:remove(peer, Req), Next, State))
     after
