@@ -72,6 +72,24 @@ handle(#{target := ~"/stream-bad-trailers"} = Req) ->
         {stream, 200, [], fun(Send) -> ok = Send(~"body", {fin, [{~"x-trailer", ~"a\r\nb"}]}) end},
         Req
     };
+handle(#{target := ~"/stream-exit-normal"} = Req) ->
+    %% The stream fun ends the worker normally before the stream's FIN.
+    {
+        {stream, 200, [], fun(Send) ->
+            ok = Send(~"part", nofin),
+            exit(normal)
+        end},
+        Req
+    };
+handle(#{target := ~"/stream-fin-exit-normal"} = Req) ->
+    %% The same after the FIN: the response is complete.
+    {
+        {stream, 200, [], fun(Send) ->
+            ok = Send(~"done", fin),
+            exit(normal)
+        end},
+        Req
+    };
 handle(#{target := ~"/stream-noend"} = Req) ->
     %% Returns without a `fin` — the framework auto-closes the stream.
     {{stream, 200, [], fun(Send) -> ok = Send(~"data", nofin) end}, Req};

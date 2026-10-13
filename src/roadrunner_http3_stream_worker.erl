@@ -149,9 +149,29 @@ send_stream(Conn, StreamId, Status, Headers, Fun) ->
     _ = roadrunner_quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
     erase(?FIN_KEY),
     Send = fun(Data, FinFlag) -> stream_send(Conn, StreamId, Data, FinFlag) end,
-    _ = Fun(Send),
+    _ = handler_code(fun() -> Fun(Send) end),
     erase(?FIN_KEY) =:= true orelse stream_send(Conn, StreamId, <<>>, fin),
     ok.
+
+%% Run handler code that writes to the stream after its HEADERS. A stream
+%% fun or loop handler can end the worker with `exit(normal)` (a loop
+%% worker stopped by `sys:terminate/2` does too) before the stream's FIN,
+%% and the conn loop drops a stream whose worker exits normally without
+%% resetting it, which would leave the client waiting on a stream that
+%% never ends. Such an exit becomes an abnormal one, so the conn loop
+%% resets the stream (H3_INTERNAL_ERROR); once the FIN is out the response
+%% is complete and the exit stays normal.
+-spec handler_code(fun(() -> T)) -> T.
+handler_code(Fun) ->
+    try
+        Fun()
+    catch
+        exit:normal ->
+            case get(?FIN_KEY) of
+                true -> exit(normal);
+                _ -> exit(unfinished_response)
+            end
+    end.
 
 %% One `Send/2` emission. Empty `nofin` data is a no-op (matches the
 %% h1/h2 contract); `fin` / `{fin, Trailers}` carry the stream FIN, the
@@ -260,7 +280,7 @@ send_loop(Conn, StreamId, Status, Headers, Handler, State) ->
     %% close).
     _ = monitor(process, Conn),
     Push = fun(Data) -> loop_push(Conn, StreamId, Data) end,
-    info_loop(Conn, StreamId, Handler, Push, State).
+    handler_code(fun() -> info_loop(Conn, StreamId, Handler, Push, State) end).
 
 %% The conn's `'DOWN'` and a peer `{roadrunner_stream_reset, _}` (routed
 %% by the conn loop on RESET_STREAM) each deliver one final

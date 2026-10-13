@@ -42,6 +42,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     stream_forbidden_trailer_stripped/1,
     stream_unsafe_header_500/1,
     stream_trailer_injection_aborts/1,
+    unfinished_stream_on_normal_exit_resets/1,
     sendfile_empty/1,
     sendfile_small/1,
     sendfile_large/1,
@@ -120,6 +121,7 @@ all() ->
         stream_forbidden_trailer_stripped,
         stream_unsafe_header_500,
         stream_trailer_injection_aborts,
+        unfinished_stream_on_normal_exit_resets,
         sendfile_empty,
         sendfile_small,
         sendfile_large,
@@ -584,6 +586,36 @@ stream_trailer_injection_aborts(Config) ->
         {reset, _ErrorCode, Bytes} = Result,
         %% and the malformed trailer value never appears on the wire.
         ?assertEqual(nomatch, binary:match(Bytes, <<$a, $\r, $\n, $b>>))
+    after
+        ll_close(Conn)
+    end.
+
+unfinished_stream_on_normal_exit_resets(Config) ->
+    %% A stream fun that ends its worker with `exit(normal)` before the FIN
+    %% gets the stream reset (H3_INTERNAL_ERROR), not left open; after the
+    %% FIN the same exit leaves the complete response alone.
+    Conn = ll_connect(?config(port, Config)),
+    try
+        Unfinished = roadrunner_quic_test_conn:open_bidi(Conn),
+        ok = roadrunner_quic_test_conn:send(
+            Conn,
+            Unfinished,
+            roadrunner_quic_h3_frame:encode_headers(
+                roadrunner_qpack:encode(headers(~"GET", ~"/stream-exit-normal"))
+            ),
+            true
+        ),
+        ?assertMatch({reset, 16#0102, _}, ll_collect_until_end(Conn, Unfinished, <<>>)),
+        Finished = roadrunner_quic_test_conn:open_bidi(Conn),
+        ok = roadrunner_quic_test_conn:send(
+            Conn,
+            Finished,
+            roadrunner_quic_h3_frame:encode_headers(
+                roadrunner_qpack:encode(headers(~"GET", ~"/stream-fin-exit-normal"))
+            ),
+            true
+        ),
+        ?assertMatch({fin, _}, ll_collect_until_end(Conn, Finished, <<>>))
     after
         ll_close(Conn)
     end.
