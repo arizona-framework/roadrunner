@@ -1288,6 +1288,8 @@ parse_loop(Buf, RecvFun) ->
     roadrunner_handler:response().
 final_response(_Protocol, _Handler, {websocket, _, _} = Response) ->
     Response;
+final_response(_Protocol, _Handler, {websocket, _, _, _} = Response) ->
+    Response;
 final_response(Protocol, Handler, Response) ->
     case response_status(Response) of
         Status when Status >= 100, Status =< 199 ->
@@ -1313,6 +1315,7 @@ interim_message(h3) ->
 %% atom-tagged variants must precede the buffered catch-all.
 -doc false.
 -spec response_status(roadrunner_handler:response()) -> roadrunner_http:status().
+response_status({websocket, _, _, _}) -> 101;
 response_status({stream, Status, _, _}) -> Status;
 response_status({loop, Status, _, _}) -> Status;
 response_status({sendfile, Status, _, _}) -> Status;
@@ -1322,6 +1325,7 @@ response_status({Status, _, _}) when is_integer(Status) -> Status.
 -doc false.
 -spec response_kind(roadrunner_handler:response()) ->
     buffered | stream | loop | sendfile | websocket.
+response_kind({websocket, _, _, _}) -> websocket;
 response_kind({stream, _, _, _}) -> stream;
 response_kind({loop, _, _, _}) -> loop;
 response_kind({sendfile, _, _, _}) -> sendfile;

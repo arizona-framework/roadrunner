@@ -52,7 +52,7 @@
 %% ## What this does NOT cover
 %%
 %% - **`{loop, ...}` and `{websocket, ...}` returns** — passed through;
-%%   these aren't HTTP body responses.
+%%   neither carries a buffered or streamed HTTP body to encode.
 %% - **Brotli (`br`) Content-Encoding** — would require a NIF dep
 %%   (`brotli`); deferred until there's user pull.
 %% - **Qvalue-aware Accept-Encoding parsing** — current implementation

@@ -29,7 +29,7 @@
 %%
 %% Scope: only a buffered `200` for a `GET` / `HEAD` is handled; every other
 %% status, method, and response shape (`{stream, _}`, `{loop, _}`,
-%% `{sendfile, _}`, `{websocket, _}`) passes through untouched. Deriving the
+%% `{sendfile, _}`, `{websocket, ...}`) passes through untouched. Deriving the
 %% digest walks the whole body once per response, so this is opt-in: reach
 %% for it on read-heavy endpoints where saving the body on revalidation
 %% outweighs the hash.

@@ -108,6 +108,8 @@ handle(#{target := ~"/sendfile-large"} = Req) ->
     {{sendfile, 200, [{~"content-length", ~"100000"}], {"/dev/zero", 0, 100_000}}, Req};
 handle(#{target := ~"/websocket"} = Req) ->
     {{websocket, some_module, state}, Req};
+handle(#{target := ~"/websocket-headers"} = Req) ->
+    {{websocket, some_module, state, [{~"set-cookie", ~"a=b"}]}, Req};
 handle(Req) ->
     {{200, [{~"content-type", ~"text/plain"}], ~"ok"}, Req}.
 

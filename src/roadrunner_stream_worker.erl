@@ -143,6 +143,8 @@ invoke(
     roadrunner_handler:response().
 safe_response(_Protocol, _Handler, {websocket, _, _} = Response) ->
     Response;
+safe_response(_Protocol, _Handler, {websocket, _, _, _} = Response) ->
+    Response;
 safe_response(Protocol, Handler, Response) ->
     case unsafe_header(response_headers(Response)) of
         none ->

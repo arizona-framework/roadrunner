@@ -359,7 +359,7 @@ unsupported_shapes_501(Config) ->
         fun(Path) ->
             ?assertMatch({501, _}, status_body(get(Conn, Path)))
         end,
-        [~"/websocket"]
+        [~"/websocket", ~"/websocket-headers"]
     ),
     close(Conn).
 

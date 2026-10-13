@@ -132,6 +132,9 @@ emit_handler_response(
     Status;
 emit_handler_response(ConnPid, StreamId, _Handler, {websocket, _, _}) ->
     ok = emit_501(ConnPid, StreamId),
+    501;
+emit_handler_response(ConnPid, StreamId, _Handler, {websocket, _, _, _}) ->
+    ok = emit_501(ConnPid, StreamId),
     501.
 
 %% File-read block per worker->conn round-trip. Decoupled from the

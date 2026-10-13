@@ -202,9 +202,10 @@ max_age_value(Config) ->
 %% Simple / actual request
 %% =============================================================================
 
-%% Decorate every header-bearing response shape; a `{websocket, _, _}` upgrade
-%% (no response headers) passes through. The `is_integer(Status)` guard on the
-%% buffered clause keeps the websocket triple out of it.
+%% Decorate every HTTP response shape; a `{websocket, ...}` upgrade passes
+%% through (its 101 keeps only the handshake headers plus any the handler set).
+%% The `is_integer(Status)` guard on the buffered clause keeps the websocket
+%% triple out of it.
 -spec add_actual_headers(roadrunner_handler:response(), state(), binary()) ->
     roadrunner_handler:response().
 add_actual_headers({Status, Headers, Body}, State, Origin) when

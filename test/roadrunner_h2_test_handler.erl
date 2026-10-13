@@ -168,6 +168,8 @@ handle(#{target := ~"/sendfile/large"} = Req) ->
     {{sendfile, 200, [], {"/tmp/rr_h2_sf_large.bin", 0, 100_000}}, Req};
 handle(#{target := ~"/websocket"} = Req) ->
     {{websocket, some_module, state}, Req};
+handle(#{target := ~"/websocket-headers"} = Req) ->
+    {{websocket, some_module, state, [{~"set-cookie", ~"a=b"}]}, Req};
 handle(#{target := ~"/interim-stream"} = Req) ->
     %% The same misuse in the stream shape: still answered with 500.
     {{stream, 103, [], fun(Send) -> Send(~"never sent", fin) end}, Req};

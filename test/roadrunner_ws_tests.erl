@@ -15,7 +15,7 @@ accept_key_rfc_example_test() ->
     ).
 
 %% =============================================================================
-%% handshake_response/1
+%% handshake_response/2
 %% =============================================================================
 
 handshake_valid_test() ->
@@ -26,7 +26,7 @@ handshake_valid_test() ->
         {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
         {~"sec-websocket-version", ~"13"}
     ],
-    {ok, 101, RespHeaders, ~"", none} = roadrunner_ws:handshake_response(Headers),
+    {ok, 101, RespHeaders, ~"", none} = roadrunner_ws:handshake_response(Headers, []),
     ?assertEqual(~"websocket", proplists:get_value(~"upgrade", RespHeaders)),
     ?assertEqual(~"upgrade", proplists:get_value(~"connection", RespHeaders)),
     ?assertEqual(
@@ -45,13 +45,13 @@ handshake_connection_with_keep_alive_test() ->
         {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
         {~"sec-websocket-version", ~"13"}
     ],
-    ?assertMatch({ok, 101, _, _, _}, roadrunner_ws:handshake_response(Headers)).
+    ?assertMatch({ok, 101, _, _, _}, roadrunner_ws:handshake_response(Headers, [])).
 
 handshake_missing_upgrade_header_test() ->
     Headers = [{~"host", ~"x"}],
     ?assertEqual(
         {error, missing_websocket_upgrade},
-        roadrunner_ws:handshake_response(Headers)
+        roadrunner_ws:handshake_response(Headers, [])
     ).
 
 handshake_wrong_upgrade_value_test() ->
@@ -62,7 +62,7 @@ handshake_wrong_upgrade_value_test() ->
     ],
     ?assertEqual(
         {error, missing_websocket_upgrade},
-        roadrunner_ws:handshake_response(Headers)
+        roadrunner_ws:handshake_response(Headers, [])
     ).
 
 handshake_missing_connection_test() ->
@@ -72,7 +72,7 @@ handshake_missing_connection_test() ->
     ],
     ?assertEqual(
         {error, missing_connection_upgrade},
-        roadrunner_ws:handshake_response(Headers)
+        roadrunner_ws:handshake_response(Headers, [])
     ).
 
 handshake_connection_without_upgrade_test() ->
@@ -83,7 +83,7 @@ handshake_connection_without_upgrade_test() ->
     ],
     ?assertEqual(
         {error, missing_connection_upgrade},
-        roadrunner_ws:handshake_response(Headers)
+        roadrunner_ws:handshake_response(Headers, [])
     ).
 
 handshake_missing_key_test() ->
@@ -94,7 +94,7 @@ handshake_missing_key_test() ->
     ],
     ?assertEqual(
         {error, missing_websocket_key},
-        roadrunner_ws:handshake_response(Headers)
+        roadrunner_ws:handshake_response(Headers, [])
     ).
 
 handshake_missing_websocket_version_test() ->
@@ -107,7 +107,7 @@ handshake_missing_websocket_version_test() ->
     ],
     ?assertEqual(
         {error, unsupported_websocket_version},
-        roadrunner_ws:handshake_response(Headers)
+        roadrunner_ws:handshake_response(Headers, [])
     ).
 
 handshake_wrong_websocket_version_test() ->
@@ -121,7 +121,7 @@ handshake_wrong_websocket_version_test() ->
     ],
     ?assertEqual(
         {error, unsupported_websocket_version},
-        roadrunner_ws:handshake_response(Headers)
+        roadrunner_ws:handshake_response(Headers, [])
     ).
 
 %% =============================================================================
@@ -346,7 +346,7 @@ negotiate_extensions_picks_first_acceptable_in_order_test() ->
         ])
     ).
 
-%% Integration: full handshake_response/1 with extension negotiation.
+%% Integration: full handshake_response/2 with extension negotiation.
 
 handshake_with_permessage_deflate_offer_includes_response_header_test() ->
     Headers = [
@@ -356,7 +356,7 @@ handshake_with_permessage_deflate_offer_includes_response_header_test() ->
         {~"sec-websocket-version", ~"13"},
         {~"sec-websocket-extensions", ~"permessage-deflate"}
     ],
-    {ok, 101, RespHeaders, ~"", Negotiated} = roadrunner_ws:handshake_response(Headers),
+    {ok, 101, RespHeaders, ~"", Negotiated} = roadrunner_ws:handshake_response(Headers, []),
     ?assertMatch({permessage_deflate, _, _}, Negotiated),
     ?assertEqual(
         ~"permessage-deflate",
@@ -370,8 +370,69 @@ handshake_without_extensions_returns_none_negotiated_test() ->
         {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
         {~"sec-websocket-version", ~"13"}
     ],
-    {ok, 101, _RespHeaders, ~"", Negotiated} = roadrunner_ws:handshake_response(Headers),
+    {ok, 101, _RespHeaders, ~"", Negotiated} = roadrunner_ws:handshake_response(Headers, []),
     ?assertEqual(none, Negotiated).
+
+handshake_appends_handler_headers_after_handshake_test() ->
+    Headers = [
+        {~"upgrade", ~"websocket"},
+        {~"connection", ~"Upgrade"},
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
+        {~"sec-websocket-version", ~"13"}
+    ],
+    Extra = [{~"set-cookie", ~"sid=1"}, {~"sec-websocket-protocol", ~"chat"}],
+    {ok, 101, RespHeaders, ~"", none} = roadrunner_ws:handshake_response(Headers, Extra),
+    ?assertEqual(
+        [
+            {~"upgrade", ~"websocket"},
+            {~"connection", ~"upgrade"},
+            {~"sec-websocket-accept", ~"s3pPLMBiTxaQ9kYGzzhZRbK+xOo="},
+            {~"set-cookie", ~"sid=1"},
+            {~"sec-websocket-protocol", ~"chat"}
+        ],
+        RespHeaders
+    ).
+
+handshake_drops_handler_extensions_when_none_negotiated_test() ->
+    %% Only the server negotiates an extension. With none offered, a handler's
+    %% `sec-websocket-extensions` would make the client expect compressed
+    %% frames the session never produces.
+    Headers = [
+        {~"upgrade", ~"websocket"},
+        {~"connection", ~"Upgrade"},
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
+        {~"sec-websocket-version", ~"13"}
+    ],
+    Extra = [{~"sec-websocket-extensions", ~"permessage-deflate"}, {~"x-kept", ~"1"}],
+    {ok, 101, RespHeaders, ~"", none} = roadrunner_ws:handshake_response(Headers, Extra),
+    ?assertEqual(undefined, proplists:get_value(~"sec-websocket-extensions", RespHeaders)),
+    ?assertEqual(~"1", proplists:get_value(~"x-kept", RespHeaders)).
+
+handshake_drops_handler_copies_of_handshake_headers_test() ->
+    Headers = [
+        {~"upgrade", ~"websocket"},
+        {~"connection", ~"Upgrade"},
+        {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
+        {~"sec-websocket-version", ~"13"},
+        {~"sec-websocket-extensions", ~"permessage-deflate"}
+    ],
+    Extra = [
+        {~"upgrade", ~"h2c"},
+        {~"connection", ~"close"},
+        {~"sec-websocket-accept", ~"forged"},
+        {~"sec-websocket-extensions", ~"x-other"}
+    ],
+    {ok, 101, RespHeaders, ~"", {permessage_deflate, _, _}} =
+        roadrunner_ws:handshake_response(Headers, Extra),
+    ?assertEqual(
+        [
+            {~"upgrade", ~"websocket"},
+            {~"connection", ~"upgrade"},
+            {~"sec-websocket-accept", ~"s3pPLMBiTxaQ9kYGzzhZRbK+xOo="},
+            {~"sec-websocket-extensions", ~"permessage-deflate"}
+        ],
+        RespHeaders
+    ).
 
 %% =============================================================================
 %% parse_frame/1
@@ -723,7 +784,7 @@ handshake_accepts_uppercase_websocket_test() ->
         {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
         {~"sec-websocket-version", ~"13"}
     ],
-    ?assertMatch({ok, 101, _, _, _}, roadrunner_ws:handshake_response(Headers)).
+    ?assertMatch({ok, 101, _, _, _}, roadrunner_ws:handshake_response(Headers, [])).
 
 handshake_accepts_mixed_case_websocket_test() ->
     Headers = [
@@ -732,7 +793,7 @@ handshake_accepts_mixed_case_websocket_test() ->
         {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="},
         {~"sec-websocket-version", ~"13"}
     ],
-    ?assertMatch({ok, 101, _, _, _}, roadrunner_ws:handshake_response(Headers)).
+    ?assertMatch({ok, 101, _, _, _}, roadrunner_ws:handshake_response(Headers, [])).
 
 %% =============================================================================
 %% parse_frame_known/3 — the session's fast path reuses the peeked header

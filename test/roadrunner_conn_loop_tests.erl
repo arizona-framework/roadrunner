@@ -1714,6 +1714,54 @@ websocket_conn_hibernates_forwards_drain_and_closes_test() ->
     ?assertNotEqual(nomatch, binary:match(Sent, <<16#88>>)),
     Sink ! stop.
 
+websocket_upgrade_headers_reach_the_101_test() ->
+    %% `{websocket, Mod, State, Headers}`: the handler's headers ride the
+    %% 101 after the handshake's, and an entry naming a handshake header is
+    %% dropped (the computed value wins, never sent twice).
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_ws_sink(Self, Tag, <<
+        "GET /ws HTTP/1.1\r\n"
+        "Host: x\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    >>),
+    Handle = fun(Req) ->
+        Headers = [{~"set-cookie", ~"sid=abc; Path=/"}, {~"upgrade", ~"not-websocket"}],
+        {{websocket, roadrunner_ws_echo_handler, no_state, Headers}, Req}
+    end,
+    Opts = (fake_opts(ws_upgrade_headers))#{
+        dispatch := {handler, roadrunner_ws_upgrade_handler, Handle, undefined}
+    },
+    {ok, ConnPid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    ConnRef = monitor(process, ConnPid),
+    ConnPid ! shoot,
+    SessPid =
+        receive
+            {Tag, ws_armed, P} -> P
+        after 2000 -> error(no_session_arm)
+        end,
+    SessPid ! {roadrunner_fake_data, undefined, masked_close_frame()},
+    receive
+        {'DOWN', ConnRef, process, ConnPid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    Sink ! stop,
+    [Head | _] = binary:split(Sent, ~"\r\n\r\n"),
+    [<<"HTTP/1.1 101", _/binary>> | Lines] = binary:split(Head, ~"\r\n", [global]),
+    ?assertEqual(
+        [
+            {~"upgrade", ~"websocket"},
+            {~"connection", ~"upgrade"},
+            {~"sec-websocket-accept", ~"s3pPLMBiTxaQ9kYGzzhZRbK+xOo="},
+            {~"set-cookie", ~"sid=abc; Path=/"}
+        ],
+        [list_to_tuple(binary:split(L, ~": ")) || L <- Lines]
+    ).
+
 pipelined_response_flushes_once_before_ws_upgrade_test() ->
     %% A GET pipelined ahead of a WS upgrade: the queued 200 must reach
     %% the wire exactly once, BEFORE the 101 — and never again from a
@@ -1762,7 +1810,7 @@ pipelined_response_flushes_once_before_ws_upgrade_test() ->
     Sink ! stop.
 
 websocket_dispatch_invokes_session_run_test() ->
-    %% Without proper ws upgrade headers `ws_session:start/6` writes 400
+    %% Without proper ws upgrade headers `ws_session:start/7` writes 400
     %% and returns `rejected`. We're covering the dispatch_response
     %% websocket clause — a full handshake test lives above and in the
     %% WS suite.

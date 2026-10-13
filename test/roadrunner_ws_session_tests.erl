@@ -2,7 +2,7 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-%% `roadrunner_ws_session:start/6` must spawn the session **before** the
+%% `roadrunner_ws_session:start/7` must spawn the session **before** the
 %% 101 upgrade response is written. If `proc_lib:start/5` fails
 %% (here forced via an unknown handler module — `init_session/2` rejects
 %% it, turning into `{error, _}` from start), the 101 must never reach
@@ -17,6 +17,7 @@ start_with_unloadable_handler_sends_500_and_no_101_test() ->
         upgrade_req(),
         this_module_does_not_exist_xyz_42,
         undefined,
+        [],
         <<>>,
         ws_proto_opts()
     ),
@@ -38,7 +39,7 @@ start_with_bad_handshake_still_returns_400_test() ->
         request_id => undefined
     },
     rejected = roadrunner_ws_session:start(
-        {fake, Sink}, Req, roadrunner_ws_echo_handler, undefined, <<>>, ws_proto_opts()
+        {fake, Sink}, Req, roadrunner_ws_echo_handler, undefined, [], <<>>, ws_proto_opts()
     ),
     Sent = iolist_to_binary(collect_sends(Tag, 100)),
     Sink ! stop,
@@ -59,6 +60,7 @@ ws_buffer_opt_applied_before_101_test() ->
         upgrade_req(),
         roadrunner_ws_echo_handler,
         undefined,
+        [],
         frame(close, <<1000:16>>),
         (ws_proto_opts())#{ws_buffer := 4096}
     ),
@@ -94,6 +96,7 @@ ws_buffer_opt_unset_leaves_socket_buffer_alone_test() ->
         upgrade_req(),
         roadrunner_ws_echo_handler,
         undefined,
+        [],
         frame(close, <<1000:16>>),
         ws_proto_opts()
     ),
@@ -799,7 +802,7 @@ handle_drain_drops_when_handler_does_not_export_test() ->
     ok = stop_ws_session(Pid).
 
 start_hands_back_a_session_the_caller_drives_test() ->
-    %% `start/6`'s contract: the 101 is on the wire and the caller holds
+    %% `start/7`'s contract: the 101 is on the wire and the caller holds
     %% `{session, MonitorRef, Pid}` — it owns the drain forwarding (in
     %% production `roadrunner_conn_loop:ws_session_wake/7`, covered in
     %% the conn-loop tests) and the wait for the session's 'DOWN'. Here
@@ -815,6 +818,7 @@ start_hands_back_a_session_the_caller_drives_test() ->
         upgrade_req(),
         roadrunner_ws_lifecycle_handler,
         State,
+        [],
         <<>>,
         ws_proto_opts()
     ),
@@ -2295,7 +2299,7 @@ ws_ctx() ->
         module => roadrunner_ws_echo_handler
     }.
 
-%% Wait for the session's 'DOWN' the way the conn does after `start/6`.
+%% Wait for the session's 'DOWN' the way the conn does after `start/7`.
 await_down(Ref, Pid) ->
     receive
         {'DOWN', Ref, process, Pid, _Reason} -> ok
@@ -2303,7 +2307,7 @@ await_down(Ref, Pid) ->
     end.
 
 %% A request map carrying a valid upgrade handshake, for tests driving
-%% the full `start/6` entry.
+%% the full `start/7` entry.
 upgrade_req() ->
     #{
         headers => [

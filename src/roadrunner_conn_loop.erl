@@ -1153,27 +1153,12 @@ flush_out(#loop_state{socket = Socket, out = Out} = S) ->
     roadrunner_req:request(),
     roadrunner_handler:response()
 ) -> #loop_state{} | {ws_session, reference(), pid(), #loop_state{}}.
-dispatch_response(
-    #loop_state{socket = Socket, buffered = Buffered, proto_opts = ProtoOpts} = S0,
-    _Handler,
-    Req,
-    {websocket, Mod, State}
-) when
-    is_atom(Mod)
+dispatch_response(S0, _Handler, Req, {websocket, Mod, State}) when is_atom(Mod) ->
+    dispatch_websocket(S0, Req, Mod, State, []);
+dispatch_response(S0, _Handler, Req, {websocket, Mod, State, Headers}) when
+    is_atom(Mod), is_list(Headers)
 ->
-    %% Queued pipelined responses must precede the 101 (or the 400/500
-    %% reject) on the wire.
-    S = flush_out(S0),
-    %% `start/6` returns right after the 101 + socket handoff; the
-    %% session's lifetime is the caller's to wait out (`ws_session_wait`).
-    %% A rejected upgrade (400/500 already sent, `connection: close`)
-    %% falls through to the normal websocket finishing path.
-    case roadrunner_ws_session:start(Socket, Req, Mod, State, Buffered, ProtoOpts) of
-        %% The flushed state rides along so the caller never re-flushes
-        %% the already-written batch from a stale pre-flush state.
-        {session, MRef, SessPid} -> {ws_session, MRef, SessPid, S};
-        rejected -> S
-    end;
+    dispatch_websocket(S0, Req, Mod, State, Headers);
 dispatch_response(
     #loop_state{socket = Socket, alt_svc = AltSvc} = S0,
     _Handler,
@@ -1267,6 +1252,30 @@ dispatch_response(
     Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     Resp = roadrunner_http1:response(Status, Headers, Body),
     queue_response(S, Resp).
+
+-spec dispatch_websocket(
+    #loop_state{}, roadrunner_req:request(), module(), term(), roadrunner_http:headers()
+) -> #loop_state{} | {ws_session, reference(), pid(), #loop_state{}}.
+dispatch_websocket(
+    #loop_state{socket = Socket, buffered = Buffered, proto_opts = ProtoOpts} = S0,
+    Req,
+    Mod,
+    State,
+    Headers
+) ->
+    %% Queued pipelined responses must precede the 101 (or the 400/500
+    %% reject) on the wire.
+    S = flush_out(S0),
+    %% `start/7` returns right after the 101 + socket handoff; the
+    %% session's lifetime is the caller's to wait out (`ws_session_wait`).
+    %% A rejected upgrade (400/500 already sent, `connection: close`)
+    %% falls through to the normal websocket finishing path.
+    case roadrunner_ws_session:start(Socket, Req, Mod, State, Headers, Buffered, ProtoOpts) of
+        %% The flushed state rides along so the caller never re-flushes
+        %% the already-written batch from a stale pre-flush state.
+        {session, MRef, SessPid} -> {ws_session, MRef, SessPid, S};
+        rejected -> S
+    end.
 
 %% --- finishing phase ---
 %%
