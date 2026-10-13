@@ -843,7 +843,7 @@ quic_start_failure_releases_tcp(_Config) ->
 
 co_listen(_Config) ->
     Name = listener_name(co_listen),
-    Port = free_udp_port(),
+    Port = free_tcp_and_udp_port(),
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => Port,
         protocols => [http1, http3],
@@ -1354,10 +1354,12 @@ start_h3(Name, Extra) ->
         )
     ).
 
-free_udp_port() ->
-    {ok, S} = gen_udp:open(0, [{reuseaddr, true}]),
-    {ok, Port} = inet:port(S),
-    ok = gen_udp:close(S),
+%% A port free for both UDP and TCP, for a listener that co-serves h1 and
+%% h3 on it. A port checked only for UDP can still be taken for TCP, and the
+%% listener binds TCP first, so it would fail with `eaddrinuse`.
+free_tcp_and_udp_port() ->
+    {Occupier, Port} = udp_occupied_tcp_free_port(),
+    ok = gen_udp:close(Occupier),
     Port.
 
 %% Return an open UDP socket plus its port, having confirmed that port is
