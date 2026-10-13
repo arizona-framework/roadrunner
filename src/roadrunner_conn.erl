@@ -71,6 +71,7 @@
     send_rate_limited/2,
     rate_limit_check/6,
     resolve_rate_limit/2,
+    rate_limit_key/2,
     throttled_telemetry/3,
     rate_limit_evict_idle/3,
     drain_oversized_body/3,
@@ -176,6 +177,9 @@ deadline in milliseconds.
     %% the request peer is the real client. TCP-only; the listener rejects it on
     %% an HTTP/3-only listener.
     proxy_protocol => boolean(),
+    %% The compiled `real_ip` listener option (`roadrunner_real_ip:compile/1`).
+    %% Absent when the option is off.
+    real_ip => roadrunner_real_ip:config(),
     %% TLS options for a TLS listener that also reads the PROXY protocol: it
     %% accepts plain TCP (the header comes before any TLS bytes) and the conn
     %% upgrades each socket with these once the header is in. Absent on every
@@ -409,6 +413,14 @@ resolve_rate_limit(
 resolve_rate_limit(_ProtoOpts, _Peer) ->
     undefined.
 
+%% The rate-limit bucket key of one request: its resolved client IP when the
+%% listener resolves one behind a trusted proxy (`real_ip`), else the peer IP
+%% baked into the connection's rate-limit state.
+-doc false.
+-spec rate_limit_key(roadrunner_req:request(), inet:ip_address()) -> inet:ip_address().
+rate_limit_key(#{client_ip := IP}, _PeerIP) -> IP;
+rate_limit_key(_Req, PeerIP) -> PeerIP.
+
 -doc """
 Per-peer token-bucket check, the per-source sibling of
 `try_acquire_request_slot/2`. Reads the peer `IP`'s bucket from the listener's
@@ -602,8 +614,24 @@ generate_request_id(_Empty) ->
 
 %% Replaces (not merges) the conn process's logger metadata so a
 %% keep-alive request never inherits the previous request's correlation.
+%% A request resolved behind a trusted proxy (`real_ip`) also carries its
+%% `client_ip`.
 -doc false.
 -spec set_request_logger_metadata(roadrunner_req:request()) -> ok.
+set_request_logger_metadata(#{
+    request_id := RequestId,
+    method := Method,
+    target := Target,
+    peer := Peer,
+    client_ip := ClientIP
+}) ->
+    logger:set_process_metadata(#{
+        request_id => RequestId,
+        method => Method,
+        path => Target,
+        peer => Peer,
+        client_ip => ClientIP
+    });
 set_request_logger_metadata(#{
     request_id := RequestId,
     method := Method,

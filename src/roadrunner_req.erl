@@ -73,6 +73,11 @@ care which protocol delivered the bytes.
     %% `inet:peername/1`. `undefined` when the OS call fails (rare;
     %% usually socket teardown).
     peer => {inet:ip_address(), inet:port_number()} | undefined,
+    %% The client address behind trusted reverse proxies, resolved per
+    %% request from the forwarding header on a listener with `real_ip`
+    %% whose peer is a trusted proxy. Absent otherwise; read it through
+    %% `client_ip/1`, which falls back to the peer.
+    client_ip => inet:ip_address(),
     %% Connection scheme — `http` for plain TCP, `https` for TLS.
     %% Set once per connection by `roadrunner_conn` from the
     %% transport tag.
@@ -181,6 +186,7 @@ to absorb a chunk's payload across multiple length-bounded calls.
     read_form/1,
     bindings/1,
     peer/1,
+    client_ip/1,
     forwarded_for/1,
     scheme/1,
     state/1,
@@ -565,6 +571,26 @@ peer(#{peer := P}) -> P;
 peer(_) -> undefined.
 
 -doc """
+Return the client's IP address.
+
+On a listener with the `real_ip` option, when the request came through a
+trusted reverse proxy, this is the address resolved from the forwarding
+header: the chain is read right to left, skipping trusted proxies, and the
+first untrusted hop is the client (see `t:roadrunner_listener:opts/0`). In
+every other case it is the peer's address (`peer/1`), which on a
+`proxy_protocol` listener is already the client the balancer reported.
+Returns `undefined` when the request has no peer.
+
+This is the address to use for per-client decisions: rate limiting, access
+logs, geolocation. Unlike `forwarded_for/1` it never trusts a header a
+client could write.
+""".
+-spec client_ip(request()) -> inet:ip_address() | undefined.
+client_ip(#{client_ip := IP}) -> IP;
+client_ip(#{peer := {IP, _Port}}) -> IP;
+client_ip(_) -> undefined.
+
+-doc """
 Return the leftmost client identifier from the `Forwarded` header
 (RFC 7239) or, if absent, from `X-Forwarded-For`. Returns `undefined`
 when neither header is set or the `Forwarded` header has no `for=`
@@ -577,7 +603,9 @@ conventionally just the IP. The caller decides how to parse it.
 
 **No trust list is enforced.** Anyone who can speak to the listener
 directly can spoof these headers — only call this when the deploy
-sits behind a trusted reverse proxy that strips/overwrites them.
+sits behind a trusted reverse proxy that strips/overwrites them. For a
+client address that is safe to act on, set the listener's `real_ip`
+option and use `client_ip/1`.
 """.
 -spec forwarded_for(request()) -> binary() | undefined.
 forwarded_for(Req) ->

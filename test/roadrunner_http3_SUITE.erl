@@ -48,6 +48,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     sendfile_large/1,
     head_sendfile/1,
     oversized_413/1,
+    real_ip_resolves_client_behind_trusted_proxy/1,
     expect_continue_gets_interim_100/1,
     expect_continue_over_the_cap_gets_413/1,
     other_expectation_gets_no_interim/1,
@@ -131,6 +132,7 @@ all() ->
         sendfile_large,
         head_sendfile,
         oversized_413,
+        real_ip_resolves_client_behind_trusted_proxy,
         expect_continue_gets_interim_100,
         expect_continue_over_the_cap_gets_413,
         other_expectation_gets_no_interim,
@@ -190,6 +192,7 @@ init_per_testcase(Case, Config) when
     Case =:= method_not_allowed;
     Case =:= rate_limited;
     Case =:= oversized_413;
+    Case =:= real_ip_resolves_client_behind_trusted_proxy;
     Case =:= expect_continue_over_the_cap_gets_413;
     Case =:= protocols_tuple_form;
     Case =:= certfile_keyfile;
@@ -704,6 +707,25 @@ expect_headers(ContentLength, Expect) ->
                 [{~"content-length", ContentLength}, {~"expect", Expect}]
         )
     ).
+
+real_ip_resolves_client_behind_trusted_proxy(_Config) ->
+    %% The loopback peer is a trusted proxy here, so the client address
+    %% comes from its `X-Forwarded-For`.
+    Name = listener_name(real_ip_resolves_client_behind_trusted_proxy),
+    {ok, _} = start_h3(Name, #{
+        real_ip => #{trusted_proxies => [~"127.0.0.1"]},
+        routes => roadrunner_client_ip_handler
+    }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        {ok, StreamId} = roadrunner_quic_test_h3:open_request(
+            Conn, headers(~"GET", ~"/") ++ [{~"x-forwarded-for", ~"203.0.113.7, 127.0.0.1"}]
+        ),
+        ?assertEqual({200, ~"203.0.113.7"}, status_body(collect(Conn, StreamId)))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
 
 oversized_413(_Config) ->
     Name = listener_name(oversized_413),

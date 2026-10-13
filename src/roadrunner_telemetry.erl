@@ -14,7 +14,8 @@
 %%
 %%   - **Measurements:** `system_time` (`erlang:system_time/0`).
 %%   - **Metadata:** `request_id`, `peer`, `method`, `path`, `scheme`,
-%%     `listener_name`.
+%%     `listener_name`, plus `client_ip` when the listener resolved one
+%%     behind a trusted proxy (`real_ip`).
 %%
 %% - `[roadrunner, request, stop]` — fired after the handler's response is
 %%   written to the wire, or queued for the connection to write (an h1
@@ -211,7 +212,8 @@
     method := binary(),
     path := binary(),
     scheme := http | https,
-    listener_name := atom()
+    listener_name := atom(),
+    client_ip => inet:ip_address()
 }.
 
 -doc """
@@ -221,6 +223,25 @@ request, so they are destructured in one match rather than a
 `maps:get` each.
 """.
 -spec request_metadata(roadrunner_req:request()) -> metadata().
+request_metadata(#{
+    request_id := RequestId,
+    peer := Peer,
+    method := Method,
+    target := Target,
+    scheme := Scheme,
+    listener_name := ListenerName,
+    client_ip := ClientIP
+}) ->
+    %% Resolved behind a trusted proxy (`real_ip`).
+    #{
+        request_id => RequestId,
+        peer => Peer,
+        method => Method,
+        path => Target,
+        scheme => Scheme,
+        listener_name => ListenerName,
+        client_ip => ClientIP
+    };
 request_metadata(#{
     request_id := RequestId,
     peer := Peer,
