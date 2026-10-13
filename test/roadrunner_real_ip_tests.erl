@@ -27,6 +27,8 @@ compile_rejects_test_() ->
             %% `/0` would trust hops a client writes.
             #{trusted_proxies => [~"0.0.0.0/0"]},
             #{trusted_proxies => [~"::/0"]},
+            %% A mapped `/96` is all of IPv4, as `0.0.0.0/0` is.
+            #{trusted_proxies => [~"::ffff:0.0.0.0/96"]},
             %% Loose forms that `inet:parse_address/1` would accept.
             #{trusted_proxies => [~"010.0.0.0/8"]},
             #{trusted_proxies => [~"10/8"]},
@@ -55,10 +57,11 @@ compile_accepts_test() ->
         {cidrs, x_forwarded_for, {[_, _], []}},
         ?M:compile(#{trusted_proxies => [~"::ffff:10.0.0.1", ~"::ffff:192.168.0.0/112"]})
     ),
-    %% A shorter mapped prefix stays an IPv6 range.
+    %% A shorter mapped prefix reaches past the mapped range, so it stays an
+    %% IPv6 range.
     ?assertMatch(
         {cidrs, x_forwarded_for, {[], [_]}},
-        ?M:compile(#{trusted_proxies => [~"::ffff:0.0.0.0/96"]})
+        ?M:compile(#{trusted_proxies => [~"::ffff:0.0.0.0/95"]})
     ).
 
 %% A bare IPv6 address is one host; a prefix ending inside a 16-bit word
