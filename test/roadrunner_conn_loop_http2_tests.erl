@@ -123,6 +123,7 @@ all_test_() ->
         fun priority_self_dependency_resets_a_live_stream/0,
         fun self_dependent_trailers_reset_the_stream/0,
         fun refused_stream_with_undecodable_block_closes_conn/0,
+        fun uppercase_header_name_is_protocol_error/0,
         fun enable_push_invalid_value_protocol_error/0,
         fun initial_window_size_too_large_flow_control_error/0,
         fun max_frame_size_too_small_protocol_error/0,
@@ -880,7 +881,11 @@ malformed_hpack_block_triggers_goaway() ->
         roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, BadHpack})
     ),
     serve_recv(ConnPid, Hf),
-    _ = expect_send(),
+    %% RFC 9113 §4.3: a decoding error is COMPRESSION_ERROR.
+    ?assertMatch(
+        {ok, {goaway, _, compression_error, _}, _},
+        roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
     expect_close(),
     receive
         {'DOWN', Ref, process, Pid, normal} -> ok
@@ -3196,7 +3201,33 @@ refused_stream_with_undecodable_block_closes_conn() ->
             roadrunner_http2_frame:encode({headers, 3, 16#04, undefined, <<16#FF, 16#7F>>})
         )
     ),
-    ?assertMatch({ok, {goaway, _, _, _}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)),
+    ?assertMatch(
+        {ok, {goaway, _, compression_error, _}, _},
+        roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    receive
+        {'DOWN', Ref, process, Pid, _} -> ok
+    after 1000 -> error(conn_did_not_exit)
+    end.
+
+uppercase_header_name_is_protocol_error() ->
+    %% RFC 9113 §8.2.1: an uppercase field name makes the request
+    %% malformed, a PROTOCOL_ERROR rather than a COMPRESSION_ERROR.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    {Block, _} = roadrunner_http2_hpack:encode(
+        get_headers(~"/"), roadrunner_http2_hpack:new_encoder(4096)
+    ),
+    %% A literal field without indexing, new name `X-Up`, value `v`.
+    Bad = <<(iolist_to_binary(Block))/binary, 0, 4, "X-Up", 1, "v">>,
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(
+            roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, Bad})
+        )
+    ),
+    ?assertMatch(
+        {ok, {goaway, _, protocol_error, _}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
     receive
         {'DOWN', Ref, process, Pid, _} -> ok
     after 1000 -> error(conn_did_not_exit)
@@ -3556,7 +3587,7 @@ unsolicited_continuation_protocol_error() ->
 
 trailers_with_malformed_hpack_goaway() ->
     %% Trailer block fails to decode → connection error
-    %% (PROTOCOL_ERROR via finalize_trailers).
+    %% (COMPRESSION_ERROR via finalize_trailers, RFC 9113 §4.3).
     {Pid, Ref, ConnPid} = post_handshake_conn(),
     HpackBin = encode_post_root_headers(),
     H1 = iolist_to_binary(
@@ -3570,8 +3601,10 @@ trailers_with_malformed_hpack_goaway() ->
         )
     ),
     serve_recv(ConnPid, H2),
-    Goaway = expect_send(),
-    ?assertMatch(<<0, 0, 8, 7, _/binary>>, Goaway),
+    ?assertMatch(
+        {ok, {goaway, _, compression_error, _}, _},
+        roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
     expect_close(),
     receive
         {'DOWN', Ref, process, Pid, normal} -> ok
