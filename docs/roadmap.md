@@ -89,6 +89,11 @@ only). Remaining work:
 - Full RFC 9000 connection-ID rotation: issuing spare server CIDs and
   registering them so packets using them route; currently unimplemented
   in the native stack
+- Send the buffered response to the QUIC connection one way, as the h2
+  worker does: the h3 worker still waits for the connection's send reply
+  on its final send, a message and a worker wake-up per request. Needs a
+  reply-less send in the QUIC connection; validate by profile share,
+  since the h3 bench is loadgen-bound
 
 ## Native QUIC transport follow-ups
 

@@ -12,8 +12,9 @@
 %%    `{stream, _, _, Fun}`) into messages back to the conn process,
 %%    which is the single owner of HPACK encoder state and frame I/O.
 %%
-%% Worker → conn protocol (synchronous round-trip per write so the
-%% worker doesn't outpace flow control or the wire):
+%% Worker → conn protocol. A streamed response takes a synchronous
+%% round-trip per write so the worker doesn't outpace flow control or
+%% the wire:
 %%
 %% ```
 %% Worker → Conn: {h2_send_headers, Worker, Ref, StreamId, Status, Headers, EndStream}
@@ -28,8 +29,16 @@
 %% Conn   → Worker: {h2_send_ack, Ref}
 %% ```
 %%
+%% A buffered response is the worker's last word on its stream, so it
+%% goes one way, with no ack to wait for:
+%%
+%% ```
+%% Worker → Conn: {h2_send_response, StreamId, Status, Headers, Body}
+%% ```
+%%
 %% The worker has no explicit "done" message: it is spawn_monitored, so
-%% the conn finalises the stream on the worker's `DOWN`.
+%% the conn finalises the stream on the worker's `DOWN`, or, when flow
+%% control still holds part of a buffered body, once that body drains.
 %%
 %% If the peer cancels the stream (`RST_STREAM` or worker-level error
 %% on the conn side), the conn sends `{h2_stream_reset, StreamId}` —
@@ -75,14 +84,16 @@ init(ConnPid, StreamId, Req, Dispatch) ->
     %% handler runs in this worker, not on the conn.
     ok = roadrunner_conn:set_request_logger_metadata(Req),
     %% Monitor the conn once for the worker's whole life so any sync
-    %% round-trip (buffered, stream, or loop mode) wakes if the conn
-    %% dies, instead of blocking on an ack that never comes until TCP
-    %% teardown reaps the worker.
+    %% round-trip (stream or loop mode; a buffered response goes one
+    %% way) wakes if the conn dies, instead of blocking on an ack that
+    %% never comes until TCP teardown reaps the worker. A loop response
+    %% also watches it for the conn's `DOWN` while it waits for messages.
     _ = roadrunner_http2_worker_sync:monitor_conn(ConnPid),
     ok = roadrunner_stream_worker:run(?MODULE, h2, ConnPid, StreamId, Req, Dispatch),
     %% No explicit completion message: the worker is spawn_monitored by
     %% the conn, which finalises the stream on the worker's `DOWN`
-    %% (`normal` -> clean removal, anything else -> RST_STREAM).
+    %% (`normal` -> clean removal, or once a buffered body still queued
+    %% behind flow control drains; anything else -> RST_STREAM).
     ok.
 
 %% Returns the status actually sent.
@@ -175,14 +186,18 @@ emit_501(ConnPid, StreamId) ->
 %% case where the body fits in a single DATA frame AND the
 %% stream's flow-control window. Conn-side handler falls back to
 %% the two-step (HEADERS, then queued DATA) path for large bodies
-%% or constrained windows; the worker still sees a single sync
-%% round-trip in either case.
+%% or constrained windows.
+%%
+%% Every caller sends this as the stream's final response and then
+%% exits, so there is nothing left to back-pressure: the message goes
+%% one way and the worker does not wait for the frames to be written.
+%% That saves the ack and the worker wake-up per request; the conn owns
+%% the response from here, including any body still queued behind flow
+%% control after the worker is gone.
 -doc false.
 -spec send_buffered(
     pid(), non_neg_integer(), roadrunner_http:status(), roadrunner_http:headers(), iodata()
 ) -> ok.
 send_buffered(ConnPid, StreamId, Status, Headers, Body) ->
-    roadrunner_http2_worker_sync:sync(ConnPid, fun(Ref) ->
-        _ = (ConnPid ! {h2_send_response, self(), Ref, StreamId, Status, Headers, Body}),
-        ok
-    end).
+    _ = (ConnPid ! {h2_send_response, StreamId, Status, Headers, Body}),
+    ok.

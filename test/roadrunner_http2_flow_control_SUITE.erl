@@ -40,7 +40,11 @@ reuse / scheduling races.
     blocked_send_garbage_frame_triggers_goaway/1,
     blocked_send_peer_closes_exits_clean/1,
     blocked_send_idle_timeout_emits_goaway/1,
-    stream_window_update_overflow_with_live_worker_keeps_conn/1
+    stream_window_update_overflow_with_live_worker_keeps_conn/1,
+    buffered_body_outlives_worker_and_drains/1,
+    reset_drops_buffered_body_that_outlived_worker/1,
+    buffered_response_for_reset_stream_is_discarded/1,
+    rst_stream_during_blocked_stream_send_wakes_worker/1
 ]).
 
 -define(PREFACE, ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
@@ -71,7 +75,11 @@ all() ->
         blocked_send_garbage_frame_triggers_goaway,
         blocked_send_peer_closes_exits_clean,
         blocked_send_idle_timeout_emits_goaway,
-        stream_window_update_overflow_with_live_worker_keeps_conn
+        stream_window_update_overflow_with_live_worker_keeps_conn,
+        buffered_body_outlives_worker_and_drains,
+        reset_drops_buffered_body_that_outlived_worker,
+        buffered_response_for_reset_stream_is_discarded,
+        rst_stream_during_blocked_stream_send_wakes_worker
     ].
 
 init_per_testcase(_Case, Config) ->
@@ -419,6 +427,106 @@ stream_window_update_overflow_with_live_worker_keeps_conn(_Config) ->
     0 = counters:get(Inflight, 1),
     cleanup(Pid, Ref).
 
+buffered_body_outlives_worker_and_drains(_Config) ->
+    %% A buffered response goes to the conn one way, so its worker exits
+    %% while flow control still holds the end of a 100 KB body. The conn
+    %% keeps the stream, sends the rest once the windows open, then retires
+    %% it; on a draining listener that retirement lets the conn exit.
+    Inflight = counters:new(1, []),
+    {Pid, Ref, ConnPid} = start_conn(roadrunner_h2_test_handler, #{
+        max_concurrent_requests => 10, inflight_counter => Inflight
+    }),
+    handshake(ConnPid),
+    HpackBin = encode_request_headers(~"GET", ~"/large100k"),
+    serve_recv(ConnPid, encode_frame({headers, 1, 16#04 bor 16#01, undefined, HpackBin})),
+    drain_until_n_bytes(60_000),
+    %% The slot comes back on the worker's exit: from here the stream's
+    %% remaining 34465 bytes belong to the conn alone.
+    ok = wait_inflight(Inflight, 0),
+    ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    expect_send_type(7),
+    %% Opening only the conn window moves nothing (the stream window is
+    %% still 0): the next send is the PING ACK.
+    serve_recv(ConnPid, encode_frame({window_update, 0, 200_000})),
+    serve_recv(ConnPid, encode_frame({ping, 0, <<1:64>>})),
+    expect_send_ack(6),
+    serve_recv(ConnPid, encode_frame({window_update, 1, 200_000})),
+    {34465, true} = data_summary(expect_send()),
+    expect_close(),
+    wait_down(Pid, Ref).
+
+reset_drops_buffered_body_that_outlived_worker(_Config) ->
+    %% RST_STREAM on a stream whose worker already exited with its body
+    %% queued drops the body without notifying anyone, and does not
+    %% release the in-flight slot a second time.
+    Inflight = counters:new(1, []),
+    {Pid, Ref, ConnPid} = start_conn(roadrunner_h2_test_handler, #{
+        max_concurrent_requests => 10, inflight_counter => Inflight
+    }),
+    handshake(ConnPid),
+    HpackBin = encode_request_headers(~"GET", ~"/large100k"),
+    serve_recv(ConnPid, encode_frame({headers, 1, 16#04 bor 16#01, undefined, HpackBin})),
+    drain_until_n_bytes(60_000),
+    ok = wait_inflight(Inflight, 0),
+    serve_recv(ConnPid, encode_frame({rst_stream, 1, cancel})),
+    serve_recv(ConnPid, encode_frame({window_update, 0, 200_000})),
+    serve_recv(ConnPid, encode_frame({ping, 0, <<1:64>>})),
+    expect_send_ack(6),
+    0 = counters:get(Inflight, 1),
+    cleanup(Pid, Ref).
+
+buffered_response_for_reset_stream_is_discarded(_Config) ->
+    %% The conn resets a stream (stream-level window overflow) while its
+    %% worker is still in the handler. The worker's buffered response then
+    %% finds no stream, so nothing is written, and the in-flight slot the
+    %% reset released is not released again.
+    Inflight = counters:new(1, []),
+    {Pid, Ref, ConnPid} = start_conn(roadrunner_h2_test_handler, #{
+        max_concurrent_requests => 10, inflight_counter => Inflight
+    }),
+    handshake(ConnPid),
+    HpackBin = encode_request_headers(~"GET", ~"/block"),
+    serve_recv(ConnPid, encode_frame({headers, 1, 16#04 bor 16#01, undefined, HpackBin})),
+    Worker = wait_for_register(roadrunner_h2_block_test),
+    WorkerRef = monitor(process, Worker),
+    serve_recv(ConnPid, encode_frame({window_update, 1, 16#7FFFFFFF})),
+    expect_send_type(3),
+    Worker ! release,
+    receive
+        {'DOWN', WorkerRef, process, Worker, normal} -> ok
+    after 1000 -> ct:fail(worker_did_not_finish)
+    end,
+    serve_recv(ConnPid, encode_frame({ping, 0, <<1:64>>})),
+    expect_send_ack(6),
+    0 = counters:get(Inflight, 1),
+    cleanup(Pid, Ref).
+
+rst_stream_during_blocked_stream_send_wakes_worker(_Config) ->
+    %% A streamed body blocked on flow control leaves its worker waiting
+    %% for the ack. RST_STREAM tells that worker the stream is gone, so it
+    %% unwinds instead of waiting for the conn to die.
+    {Pid, Ref, ConnPid} = start_conn(roadrunner_h2_test_handler),
+    handshake(ConnPid),
+    HpackBin = encode_request_headers(~"GET", ~"/stream/large"),
+    serve_recv(ConnPid, encode_frame({headers, 1, 16#04 bor 16#01, undefined, HpackBin})),
+    %% 60000 bytes, then the first 5535 of the 40000-byte second send:
+    %% the window is spent and the rest is queued under the worker's ack.
+    drain_until_n_bytes(65_000),
+    [Worker] = [
+        P
+     || P <- processes(),
+        proc_lib:get_label(P) =:= {roadrunner_http2_stream_worker, 1},
+        monitors(P, ConnPid)
+    ],
+    WorkerRef = monitor(process, Worker),
+    serve_recv(ConnPid, encode_frame({rst_stream, 1, cancel})),
+    receive
+        {'DOWN', WorkerRef, process, Worker, stream_reset} -> ok
+    after 1000 -> ct:fail(worker_not_reset)
+    end,
+    true = is_process_alive(Pid),
+    cleanup(Pid, Ref).
+
 %% =============================================================================
 %% Helpers
 %% =============================================================================
@@ -573,6 +681,55 @@ drain_setopts() ->
         {roadrunner_fake_setopts, _, _} -> drain_setopts()
     after 0 -> ok
     end.
+
+%% Poll the in-flight gauge until it reads `N`. The conn releases a
+%% worker's slot while handling its `DOWN`, so this is the point from
+%% which the conn has seen the worker exit.
+wait_inflight(Counter, N) ->
+    wait_inflight(Counter, N, erlang:monotonic_time(millisecond) + 1000).
+
+wait_inflight(Counter, N, Deadline) ->
+    case counters:get(Counter, 1) of
+        N ->
+            ok;
+        Other ->
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true ->
+                    erlang:yield(),
+                    wait_inflight(Counter, N, Deadline);
+                false ->
+                    ct:fail({inflight, Other, expected, N})
+            end
+    end.
+
+%% Poll until a blocking test handler has registered `Name`.
+wait_for_register(Name) ->
+    wait_for_register(Name, erlang:monotonic_time(millisecond) + 1000).
+
+wait_for_register(Name, Deadline) ->
+    case whereis(Name) of
+        undefined ->
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true ->
+                    erlang:yield(),
+                    wait_for_register(Name, Deadline);
+                false ->
+                    ct:fail({not_registered, Name})
+            end;
+        Pid ->
+            Pid
+    end.
+
+%% Total DATA payload bytes in one send, and whether its last frame
+%% carries END_STREAM.
+data_summary(Bin) ->
+    data_summary(Bin, 0, false).
+
+data_summary(<<>>, Bytes, EndStream) ->
+    {Bytes, EndStream};
+data_summary(Bin, Bytes, _EndStream) ->
+    {ok, {data, _StreamId, Flags, Payload, _Len}, Rest} = roadrunner_http2_frame:parse(Bin, 16384),
+    data_summary(Rest, Bytes + iolist_size(Payload), (Flags band 16#01) =/= 0).
 
 %% Whether `Pid` (if still alive) monitors `Target`; tells this case's
 %% stream worker apart from a worker another case left behind.

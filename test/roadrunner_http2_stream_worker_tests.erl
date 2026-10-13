@@ -7,7 +7,7 @@
 %% call, an h2 handler's logs are uncorrelated.
 %%
 %% Drives the worker directly: the test process plays the conn,
-%% receives the worker's `{h2_send_response, ...}`, acks it, and
+%% receives the worker's one-way `{h2_send_response, ...}`, and
 %% decodes the probe handler's body to inspect the logger metadata
 %% the worker installed.
 logger_metadata_set_in_h2_worker_test_() ->
@@ -50,8 +50,7 @@ logger_metadata_set_in_h2_worker_test_() ->
 
 recv_response_body(StreamId) ->
     receive
-        {h2_send_response, From, Ref, StreamId, _Status, _Headers, Bin} ->
-            From ! {h2_send_ack, Ref},
+        {h2_send_response, StreamId, _Status, _Headers, Bin} ->
             Bin
     after 1000 ->
         error(no_h2_send_response)

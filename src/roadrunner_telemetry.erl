@@ -17,8 +17,10 @@
 %%     `listener_name`.
 %%
 %% - `[roadrunner, request, stop]` — fired after the handler's response is
-%%   written to the wire (or, for `stream`/`loop`/`websocket`, after the
-%%   initial dispatch returns).
+%%   written to the wire, or queued for the connection to write (an h1
+%%   response behind a pipelined burst, an h2 buffered response handed to
+%%   the conn process); for `stream`/`loop`/`websocket`, after the
+%%   initial dispatch returns.
 %%
 %%   - **Measurements:** `duration` in `native` time units. Convert
 %%     with `erlang:convert_time_unit(Duration, native, microsecond)`.
