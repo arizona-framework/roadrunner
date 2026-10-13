@@ -19,7 +19,7 @@ Typical handler shape:
 handle(Req) ->
     {ok, Body, Req2} = roadrunner_req:read_body(Req),
     {ok, Boundary} = roadrunner_multipart:boundary(
-        roadrunner_req:header(~"content-type", Req2)
+        roadrunner_req:header_normalized(~"content-type", Req2)
     ),
     {ok, Parts} = roadrunner_multipart:parse(Body, Boundary),
     %% Parts is a list of #{headers := [...], body := <<...>>}.
