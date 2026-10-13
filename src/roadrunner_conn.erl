@@ -56,7 +56,7 @@
     body_framing/1,
     generate_request_id/1,
     set_request_logger_metadata/1,
-    maybe_send_continue/3,
+    send_continue/1,
     expects_continue/1,
     refine_conn_label/2,
     scheme/1,
@@ -826,37 +826,22 @@ read_body(Req, Buffered, RecvFun, MaxCL, TrailerLimits) ->
             Err
     end.
 
-%% RFC 9110 §10.1.1: when a request carries `Expect: 100-continue` and
-%% we're about to read a body, send `HTTP/1.1 100 Continue` so clients
-%% that gate body transmission on this signal don't stall. We only do
-%% this if no body bytes have already arrived in the buffer — once we
-%% see body data the client clearly didn't wait, and the 100 line is
-%% redundant.
+%% RFC 9110 §10.1.1: send the interim `HTTP/1.1 100 Continue` to a
+%% client that gates its body on it. The conn loop decides when
+%% (`Expect: 100-continue` and no body bytes in hand yet, see
+%% `expects_continue/1`).
 -doc false.
--spec maybe_send_continue(roadrunner_transport:socket(), roadrunner_req:request(), binary()) ->
+-spec send_continue(roadrunner_transport:socket()) -> ok.
+send_continue(Socket) ->
+    _ = roadrunner_transport:send(Socket, ~"HTTP/1.1 100 Continue\r\n\r\n"),
     ok.
-maybe_send_continue(Socket, Req, Buffered) ->
-    case Buffered =:= ~"" andalso has_continue_expectation(Req) of
-        true ->
-            _ = roadrunner_transport:send(Socket, ~"HTTP/1.1 100 Continue\r\n\r\n"),
-            ok;
-        false ->
-            ok
-    end.
 
-%% Whether the request carries `Expect: 100-continue` — exported so
-%% `roadrunner_conn_loop` can flush queued pipelined responses before
-%% the interim 100 goes out (its fire condition mirrors
-%% `maybe_send_continue/3`).
+%% Whether the request carries `Expect: 100-continue`.
 -doc false.
 -spec expects_continue(roadrunner_req:request()) -> boolean().
-expects_continue(Req) ->
-    has_continue_expectation(Req).
-
--spec has_continue_expectation(roadrunner_req:request()) -> boolean().
-has_continue_expectation(#{cached_decisions := #{expects_continue := EC}}) ->
+expects_continue(#{cached_decisions := #{expects_continue := EC}}) ->
     EC;
-has_continue_expectation(Req) ->
+expects_continue(Req) ->
     %% Manually-built request maps (tests, middleware) skip the parse-time
     %% precompute — fall back to the lowercase-and-compare path.
     case roadrunner_req:header_normalized(~"expect", Req) of
@@ -1281,7 +1266,7 @@ parse_loop(Buf, RecvFun) ->
 %% it with a buffered 500 rather than put an invalid final 1xx on the wire.
 %% Every protocol runs this before sending, so the response it sends,
 %% reports to telemetry and decides keep-alive on is the 500. Legitimate
-%% interim 100-continue is sent by `maybe_send_continue/3`, not this path;
+%% interim 100-continue is sent by `send_continue/1`, not this path;
 %% a `{websocket, _, _}` upgrade (status 101) is not a handler 1xx.
 -doc false.
 -spec final_response(h1 | h2 | h3, module(), roadrunner_handler:response()) ->

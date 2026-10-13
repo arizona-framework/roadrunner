@@ -825,16 +825,21 @@ handle_request_bytes(
                 listener_name => ListenerName
             },
             ok = roadrunner_conn:set_request_logger_metadata(Req),
-            %% A client gating its body on the interim 100 is WAITING —
-            %% queued pipelined responses must reach it first. Mirrors
-            %% `maybe_send_continue/3`'s own fire condition so the
-            %% pipelined hot path (Rest =/= <<>>) never flushes here.
+            %% RFC 9110 §10.1.1: a client gating its body on `Expect:
+            %% 100-continue` is WAITING for the interim 100, so send it
+            %% unless body bytes already arrived with the headers (then
+            %% the client didn't wait). Queued pipelined responses must
+            %% reach it first. The pipelined hot path (Rest =/= <<>>)
+            %% never flushes here.
             S2 =
                 case Rest =:= ~"" andalso roadrunner_conn:expects_continue(Req) of
-                    true -> flush_out(S);
-                    false -> S
+                    true ->
+                        S1 = flush_out(S),
+                        ok = roadrunner_conn:send_continue(Socket),
+                        S1;
+                    false ->
+                        S
                 end,
-            ok = roadrunner_conn:maybe_send_continue(Socket, Req, Rest),
             read_body_phase(
                 S2#loop_state{buffered = Rest, req_id_buffer = NewBuffer}, Req, Deadline
             );

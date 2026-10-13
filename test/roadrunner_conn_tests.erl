@@ -320,20 +320,25 @@ read_body_chunked_case_insensitive_test() ->
      || V <- [~"chunked", ~"Chunked", ~"CHUNKED", ~"ChUnKeD"]
     ].
 
-%% --- has_continue_expectation / keep_alive_decision fallbacks ---
+%% --- expects_continue / keep_alive_decision fallbacks ---
 
 %% These two helpers have a fast path for parser-built request maps
 %% (which carry `cached_decisions`) and a fallback for manually-built
 %% maps (which don't). Cover the fallback explicitly.
 
-maybe_send_continue_without_cached_decisions_uses_header_test() ->
-    %% Manually-built Req, no `cached_decisions`. With Expect: 100-Continue
-    %% present, the helper must send the 100. Use a fake socket that
-    %% records send calls.
+expects_continue_without_cached_decisions_uses_header_test() ->
+    %% Manually-built Req, no `cached_decisions`: the header is read and
+    %% matched case-insensitively.
+    ?assert(roadrunner_conn:expects_continue(req_with_headers([{~"expect", ~"100-Continue"}]))).
+
+expects_continue_without_cached_decisions_no_expect_test() ->
+    ?assertNot(roadrunner_conn:expects_continue(req_with_headers([]))).
+
+send_continue_writes_interim_response_test() ->
+    %% A fake socket that records send calls.
     Self = self(),
     Sink = spawn(fun() -> continue_sink_loop(Self) end),
-    Req = req_with_headers([{~"expect", ~"100-Continue"}]),
-    ok = roadrunner_conn:maybe_send_continue({fake, Sink}, Req, ~""),
+    ok = roadrunner_conn:send_continue({fake, Sink}),
     Sink ! stop,
     receive
         {sent, Bytes} ->
@@ -342,26 +347,12 @@ maybe_send_continue_without_cached_decisions_uses_header_test() ->
         ?assert(false)
     end.
 
-maybe_send_continue_without_cached_decisions_no_expect_skips_test() ->
-    %% Same path but no Expect header → no 100 sent.
-    Sink = spawn(fun() -> continue_sink_loop(undefined) end),
-    Req = req_with_headers([]),
-    ok = roadrunner_conn:maybe_send_continue({fake, Sink}, Req, ~""),
-    Sink ! stop,
-    receive
-        {sent, _} -> ?assert(false)
-    after 50 -> ok
-    end.
-
 continue_sink_loop(Reporter) ->
     receive
         stop ->
             ok;
         {roadrunner_fake_send, ConnPid, Data} ->
-            case Reporter of
-                undefined -> ok;
-                _ -> Reporter ! {sent, Data}
-            end,
+            Reporter ! {sent, Data},
             ConnPid ! {roadrunner_fake_send_reply, ok},
             continue_sink_loop(Reporter);
         _ ->
@@ -2229,6 +2220,24 @@ conn_sends_100_continue_before_reading_body_test_() ->
                     ?assertEqual(~"HTTP/1.1 100 Continue\r\n\r\n", Continue),
                     %% Now ship the body and read the final response.
                     ok = gen_tcp:send(Sock, ~"hello"),
+                    Reply = recv_until_closed(Sock),
+                    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
+                    {match, _} = re:run(Reply, ~"hello"),
+                    ok = gen_tcp:close(Sock)
+                end},
+                {"Expect: 100-continue with the body already sent → no 100 line", fun() ->
+                    %% The client didn't wait: the body arrived with the
+                    %% headers, so the interim 100 would be redundant.
+                    {ok, Sock} = gen_tcp:connect(
+                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                    ),
+                    ok = gen_tcp:send(
+                        Sock,
+                        <<
+                            "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+                            "Expect: 100-continue\r\n\r\nhello"
+                        >>
+                    ),
                     Reply = recv_until_closed(Sock),
                     ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, Reply),
                     {match, _} = re:run(Reply, ~"hello"),

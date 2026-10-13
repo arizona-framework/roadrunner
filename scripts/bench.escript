@@ -689,7 +689,7 @@ cli() ->
                                     `HTTP/1.1 100 Continue` interim
                                     response, sends the body, then
                                     awaits the final 200. Tests
-                                    `roadrunner_conn:maybe_send_continue/3`
+                                    `roadrunner_conn:send_continue/1`
                                     + the conn-state machine that
                                     ferries the interim response.
                                     elli filtered out (no
@@ -1759,7 +1759,7 @@ scenario_roadrunner_opts(server_sent_events, BaseOpts) ->
 scenario_roadrunner_opts(expect_100_continue, BaseOpts) ->
     %% Reuse the existing echo handler — same body shape, the
     %% protocol-level interim 100 is handled automatically by
-    %% `roadrunner_conn:maybe_send_continue/3`.
+    %% `roadrunner_conn:send_continue/1`.
     BaseOpts#{routes => [{~"/echo", roadrunner_bench_echo_handler, undefined}]};
 scenario_roadrunner_opts(large_keepalive_session, BaseOpts) ->
     %% Override the bench's default max_keep_alive_requests => 1M
@@ -2655,7 +2655,7 @@ large_keepalive_inner(Sock, Req, BodyLen, Deadline, Acc) ->
 %% interim `HTTP/1.1 100 Continue` response; then send the body;
 %% then read the final `HTTP/1.1 200 OK` response. Two recv-then-
 %% send phases per request — distinct from any other scenario,
-%% exercises `roadrunner_conn:maybe_send_continue/3`.
+%% exercises `roadrunner_conn:send_continue/1`.
 -define(EXPECT_100_BODY_SIZE, 256).
 
 expect_100_headers() ->
