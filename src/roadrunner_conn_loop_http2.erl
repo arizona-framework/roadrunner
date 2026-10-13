@@ -1067,13 +1067,56 @@ finalize_headers(
                 false ->
                     case EndStreamSeen of
                         true -> dispatch_stream(StreamId, State1);
-                        false -> frame_loop(State1)
+                        false -> await_body(StreamId, Headers, State1)
                     end
             end;
         {error, Reason} ->
             _ = send_goaway(State, decode_error_code(Reason)),
             exit_clean(State)
     end.
+
+%% A request whose body is still to come waits for its DATA. RFC 9110
+%% §10.1.1: one that expects `100-continue` (HTTP/2 being "HTTP/1.1 or
+%% later") gets an immediate answer instead of leaving the client to time
+%% out its wait: a 413 when its declared `content-length` is already over
+%% `max_content_length`, the status its body would earn anyway, else the
+%% interim 100 that asks for the body.
+-spec await_body(stream_id(), roadrunner_http:headers(), #loop{}) -> no_return().
+await_body(StreamId, Headers, #loop{max_content_length = MaxCL} = State) ->
+    case lists:keyfind(~"expect", 1, Headers) of
+        {_, Expect} ->
+            case
+                roadrunner_bin:ascii_lowercase(Expect) =:= ~"100-continue" andalso
+                    roadrunner_http:request_content_length(Headers)
+            of
+                {ok, Declared} when Declared > MaxCL -> reject_too_large(State, StreamId);
+                false -> frame_loop(State);
+                _ -> frame_loop(send_continue(State, StreamId))
+            end;
+        false ->
+            frame_loop(State)
+    end.
+
+%% The interim `100 (Continue)`: a HEADERS frame with `:status` alone and
+%% no END_STREAM, the final response following on the same stream.
+-spec send_continue(#loop{}, stream_id()) -> #loop{}.
+send_continue(#loop{hpack_enc = Enc} = State, StreamId) ->
+    {Block, Enc1} = roadrunner_http2_hpack:encode([{~":status", ~"100"}], Enc),
+    _ = send(State, roadrunner_http2_frame:encode({headers, StreamId, 16#04, undefined, Block})),
+    State#loop{hpack_enc = Enc1}.
+
+%% RFC 9113 §8.1: the request body is over `max_content_length`. Answer 413
+%% before the full request, then RST_STREAM(NO_ERROR) to ask the client to
+%% stop sending the rest, and drop the stream (no worker was dispatched,
+%% dispatch is at END_STREAM).
+-spec reject_too_large(#loop{}, stream_id()) -> no_return().
+reject_too_large(State, StreamId) ->
+    Resp = ~"Payload Too Large",
+    State1 = encode_and_send_response_atomic(
+        State, StreamId, 413, [{~"content-type", ~"text/plain"}], Resp, byte_size(Resp)
+    ),
+    _ = send_rst_stream(State1, StreamId, no_error),
+    frame_loop(remove_stream(State1, StreamId)).
 
 %% --- DATA ---
 
@@ -1119,23 +1162,7 @@ on_data(
                     PayloadLen = byte_size(Payload),
                     if
                         Len + PayloadLen > MaxCL ->
-                            %% RFC 9113 §8.1: the request body exceeds
-                            %% `max_content_length`. Answer 413 before the
-                            %% full request, then RST_STREAM(NO_ERROR) to ask
-                            %% the client to stop sending the rest, and drop
-                            %% the stream (no worker was dispatched — dispatch
-                            %% is at END_STREAM).
-                            Resp = ~"Payload Too Large",
-                            State1 = encode_and_send_response_atomic(
-                                State,
-                                StreamId,
-                                413,
-                                [{~"content-type", ~"text/plain"}],
-                                Resp,
-                                byte_size(Resp)
-                            ),
-                            _ = send_rst_stream(State1, StreamId, no_error),
-                            frame_loop(remove_stream(State1, StreamId));
+                            reject_too_large(State, StreamId);
                         true ->
                             EndStream = (Flags band 16#01) =/= 0,
                             Stream1 = Stream#{
