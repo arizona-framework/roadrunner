@@ -62,14 +62,34 @@ resolve_keys_the_peer_once_test() ->
         ?M:resolve_rate_limit(Opts, {{0, 0, 0, 0, 0, 16#FFFF, 16#7F00, 1}, 5000})
     ).
 
-rate_limit_key_test() ->
-    %% A client `real_ip` resolved is keyed like a peer; otherwise the peer's
-    %% baked key stands.
+%% --- rate_limit/3 ---
+
+rate_limit_off_allows_test() ->
+    ?assertEqual(allow, ?M:rate_limit(undefined, #{}, some_listener)).
+
+rate_limit_deny_counts_the_throttle_test() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    Table = new_table(),
+    Counter = atomics:new(1, [{signed, false}]),
+    State = {1, cap(1, 1), cost(1), Table, Counter, ?IP},
+    ?assertEqual(allow, ?M:rate_limit(State, #{}, some_listener)),
+    ?assertEqual(0, atomics:get(Counter, 1)),
+    ?assertEqual({deny, 1}, ?M:rate_limit(State, #{}, some_listener)),
+    ?assertEqual(1, atomics:get(Counter, 1)).
+
+rate_limit_keys_on_client_ip_test() ->
+    %% A client `real_ip` resolved is keyed like a peer (an IPv6 one by its
+    %% /64); otherwise the peer's baked key stands.
+    Table = new_table(),
+    Counter = atomics:new(1, [{signed, false}]),
+    State = {1, cap(1, 1), cost(1), Table, Counter, ?IP},
+    Client = #{client_ip => {16#2001, 16#DB8, 0, 0, 0, 0, 0, 7}},
+    ?assertEqual(allow, ?M:rate_limit(State, Client, some_listener)),
+    ?assertEqual(allow, ?M:rate_limit(State, #{}, some_listener)),
     ?assertEqual(
-        {16#2001, 16#DB8, 0, 0, 0, 0, 0, 0},
-        ?M:rate_limit_key(#{client_ip => {16#2001, 16#DB8, 0, 0, 0, 0, 0, 7}}, ?IP)
-    ),
-    ?assertEqual(?IP, ?M:rate_limit_key(#{}, ?IP)).
+        [?IP, {16#2001, 16#DB8, 0, 0, 0, 0, 0, 0}],
+        lists:sort([K || {K, _, _} <- ets:tab2list(Table)])
+    ).
 
 resolve_off_without_peer_test() ->
     Table = new_table(),

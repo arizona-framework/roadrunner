@@ -1262,24 +1262,13 @@ throttle_stream(#h3{proto_opts = #{throttled_counter := Counter}, listener_name 
 %% IP proceeds.
 -spec rate_limit_refused(#h3{}, non_neg_integer(), roadrunner_req:request()) ->
     ok | {refused, #h3{}}.
-rate_limit_refused(#h3{rate_limit = undefined}, _StreamId, _Req) ->
-    ok;
 rate_limit_refused(
-    #h3{
-        rate_limit = {Rate, Cap, Cost, Table, Counter, PeerIP},
-        conn = Conn,
-        listener_name = ListenerName
-    } = State,
-    StreamId,
-    Req
+    #h3{rate_limit = RateLimit, conn = Conn, listener_name = ListenerName} = State, StreamId, Req
 ) ->
-    NowMs = erlang:monotonic_time(millisecond),
-    IP = roadrunner_conn:rate_limit_key(Req, PeerIP),
-    case roadrunner_conn:rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) of
+    case roadrunner_conn:rate_limit(RateLimit, Req, ListenerName) of
         allow ->
             ok;
         {deny, RetryAfter} ->
-            ok = roadrunner_conn:throttled_telemetry(ListenerName, Counter, rate_limit),
             ok = roadrunner_http3_stream_worker:send_buffered(
                 Conn, StreamId, 429, [{~"retry-after", integer_to_binary(RetryAfter)}], ~""
             ),

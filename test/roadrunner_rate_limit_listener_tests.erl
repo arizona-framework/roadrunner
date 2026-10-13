@@ -99,6 +99,21 @@ h1_period_sets_longer_retry_after_test() ->
         {match, _} = re:run(R2, ~"retry-after: 60", [caseless])
     end).
 
+h1_pipelined_deny_follows_queued_response_test() ->
+    %% Two pipelined requests in one write: the first (full bucket) is answered,
+    %% the second refused. The queued 200 goes out before the 429.
+    %% A keep-alive handler, so the second request is read at all.
+    Routes = roadrunner_bench_echo_handler,
+    with_listener([http1], #{rate => 1, burst => 1}, Routes, fun(Port, _Name) ->
+        {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+        Req = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        ok = gen_tcp:send(Sock, [Req, Req]),
+        Reply = recv_for(Sock, <<>>, 1000),
+        ok = gen_tcp:close(Sock),
+        ?assertMatch(<<"HTTP/1.1 200", _/binary>>, Reply),
+        {match, _} = re:run(Reply, ~"HTTP/1.1 429 Too Many Requests")
+    end).
+
 %% =============================================================================
 %% End-to-end 429 over HTTP/2 (h2c) — proves the multiplexed deny path emits a
 %% 429 response (not REFUSED_STREAM).
@@ -130,12 +145,15 @@ start(Name, Protocols, RateLimit) ->
     }).
 
 with_listener(Protocols, RateLimit, Fun) ->
+    with_listener(Protocols, RateLimit, roadrunner_hello_handler, Fun).
+
+with_listener(Protocols, RateLimit, Routes, Fun) ->
     Name = unique(rl_it),
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0,
         protocols => Protocols,
         rate_limit => RateLimit,
-        routes => roadrunner_hello_handler
+        routes => Routes
     }),
     Port = roadrunner_listener:port(Name),
     try

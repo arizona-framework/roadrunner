@@ -1089,59 +1089,29 @@ dispatch_phase(
     Req,
     Resolved
 ) ->
-    %% The rate-limit guard sends its 429 from inside the check — when
-    %% the guard is configured (rare), queued pipelined responses go out
-    %% first so a deny can't overtake them. `undefined` (the common
-    %% case) skips the flush entirely.
-    S1 =
-        case RateLimit of
-            undefined -> S;
-            _ -> flush_out(S)
-        end,
-    case rate_limit_allows(RateLimit, Req, Socket, ListenerName) of
-        true ->
+    case roadrunner_conn:rate_limit(RateLimit, Req, ListenerName) of
+        allow ->
             case Resolved of
                 {ok, Handler, Bindings, Pipeline, _State, _Limits} ->
-                    run_pipeline(S1, Handler, Req#{bindings => Bindings}, Pipeline);
+                    run_pipeline(S, Handler, Req#{bindings => Bindings}, Pipeline);
                 {method_not_allowed, Allowed} ->
                     %% Path matched but no route answers this method: 405 +
                     %% Allow before any pipeline runs (the method gate is a
                     %% routing decision, ahead of per-route middleware).
-                    S2 = flush_out(S1),
+                    S1 = flush_out(S),
                     _ = roadrunner_conn:send_method_not_allowed(Socket, Allowed),
-                    exit_normal(S2);
+                    exit_normal(S1);
                 not_found ->
-                    S2 = flush_out(S1),
+                    S1 = flush_out(S),
                     _ = roadrunner_conn:send_not_found(Socket),
-                    exit_normal(S2)
+                    exit_normal(S1)
             end;
-        false ->
-            %% Rate exceeded: `rate_limit_allows/4` already sent 429 + close.
-            exit_normal(S1)
-    end.
-
-%% Per-peer rate-limit gate before handler dispatch. `true` to proceed; `false`
-%% after a 429 + `Retry-After` was sent. The guard being off (`undefined`, which
-%% also covers a connection with no peer IP) always proceeds. The bucket is the
-%% request's resolved client IP behind a trusted proxy, else the peer's.
--spec rate_limit_allows(
-    roadrunner_conn:rate_limit_state(),
-    roadrunner_req:request(),
-    roadrunner_transport:socket(),
-    atom()
-) -> boolean().
-rate_limit_allows(undefined, _Req, _Socket, _ListenerName) ->
-    true;
-rate_limit_allows({Rate, Cap, Cost, Table, Counter, PeerIP}, Req, Socket, ListenerName) ->
-    NowMs = erlang:monotonic_time(millisecond),
-    IP = roadrunner_conn:rate_limit_key(Req, PeerIP),
-    case roadrunner_conn:rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) of
-        allow ->
-            true;
         {deny, RetryAfter} ->
-            ok = roadrunner_conn:throttled_telemetry(ListenerName, Counter, rate_limit),
+            %% Rate exceeded: queued pipelined responses go out first so the
+            %% 429 + close can't overtake them.
+            S1 = flush_out(S),
             _ = roadrunner_conn:send_rate_limited(Socket, RetryAfter),
-            false
+            exit_normal(S1)
     end.
 
 -spec run_pipeline(
