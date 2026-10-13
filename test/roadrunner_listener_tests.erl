@@ -461,7 +461,8 @@ listener_threads_http1_limits_into_proto_opts_test() ->
                 max_request_line => 16384,
                 max_header_line => 16384,
                 max_header_block => 65536,
-                max_header_count => 250
+                max_header_count => 250,
+                linger_timeout => 0
             }}
         ],
         routes => roadrunner_hello_handler
@@ -472,6 +473,8 @@ listener_threads_http1_limits_into_proto_opts_test() ->
     ?assertEqual(16384, maps:get(http1_max_header_line, ProtoOpts)),
     ?assertEqual(65536, maps:get(http1_max_header_block, ProtoOpts)),
     ?assertEqual(250, maps:get(http1_max_header_count, ProtoOpts)),
+    %% `0` turns lingering off, unlike the size caps' floor of 1.
+    ?assertEqual(0, maps:get(http1_linger_timeout, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
 listener_http2_max_header_list_size_threads_into_proto_opts_test() ->
@@ -510,6 +513,7 @@ listener_http1_defaults_thread_into_proto_opts_test() ->
     ProtoOpts = element(4, State),
     ?assertEqual(8192, maps:get(http1_max_request_line, ProtoOpts)),
     ?assertEqual(100, maps:get(http1_max_header_count, ProtoOpts)),
+    ?assertEqual(1000, maps:get(http1_linger_timeout, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
 listener_rejects_invalid_http1_opt_test() ->
@@ -529,7 +533,9 @@ listener_rejects_invalid_http1_opt_test() ->
             #{bogus_key => 1},
             #{max_header_count => 0},
             #{max_header_count => -1},
-            #{max_request_line => not_an_integer}
+            #{max_request_line => not_an_integer},
+            #{linger_timeout => -1},
+            #{linger_timeout => soon}
         ]
     ).
 

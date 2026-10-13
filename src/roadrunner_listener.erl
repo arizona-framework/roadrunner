@@ -504,10 +504,10 @@ same port. The QUIC handshake advertises the `h3` ALPN itself, so
 -doc """
 HTTP/1.1 listener tunables (under `{http1, ThisMap}` in `protocols`).
 
-All four cap inbound request sizes; oversized input is rejected before
-the handler runs (414 for the request line, 431 for headers). Raise them
-for clients that send large headers (long JWTs / cookies / tracing
-metadata); lower them to tighten the attack surface.
+The four `max_*` keys cap inbound request sizes; oversized input is
+rejected before the handler runs (414 for the request line, 431 for
+headers). Raise them for clients that send large headers (long JWTs /
+cookies / tracing metadata); lower them to tighten the attack surface.
 
 - `max_request_line` — request-line byte cap (method + target +
   version). Over-cap → `414 URI Too Long`. Default `8192`.
@@ -517,12 +517,21 @@ metadata); lower them to tighten the attack surface.
   `431`. Default `10240`.
 - `max_header_count` — maximum number of header lines. Over-cap →
   `431`. Default `100`.
+- `linger_timeout` — after a response that closes the connection before
+  the request was read to its end (a 413 over the body cap, a 431, a
+  handler answering without reading its body), how long in milliseconds
+  the connection keeps reading and dropping what the client still sends
+  before it closes. Closing with unread input makes the kernel reset the
+  connection, which can wipe the response before the client reads it
+  (RFC 9112 §9.6); lingering lets it through. It ends as soon as the
+  client closes. `0` closes at once. Default `1000`.
 """.
 -type http1_opts() :: #{
     max_request_line => 1..16#7FFFFFFF,
     max_header_line => 1..16#7FFFFFFF,
     max_header_block => 1..16#7FFFFFFF,
-    max_header_count => 1..16#7FFFFFFF
+    max_header_count => 1..16#7FFFFFFF,
+    linger_timeout => 0..16#7FFFFFFF
 }.
 
 -doc """
@@ -1684,7 +1693,8 @@ http1_defaults() ->
         max_request_line => 8192,
         max_header_line => 8192,
         max_header_block => 10240,
-        max_header_count => 100
+        max_header_count => 100,
+        linger_timeout => 1000
     }.
 
 -spec validate_http1_opts(map(), term()) -> http1_opts().
@@ -1694,6 +1704,7 @@ validate_http1_opts(Opts, Raw) ->
         fun(K, V, Acc) ->
             case is_map_key(K, Defaults) of
                 false -> error({invalid_listener_opt, protocols, Raw});
+                true when K =:= linger_timeout, V =:= 0 -> Acc#{K => V};
                 true when is_integer(V), V >= 1, V =< 16#7FFFFFFF -> Acc#{K => V};
                 true -> error({invalid_listener_opt, protocols, Raw})
             end
@@ -1714,13 +1725,15 @@ flatten_http1_opts(Entries) ->
             max_request_line := ReqLine,
             max_header_line := HdrLine,
             max_header_block := HdrBlock,
-            max_header_count := HdrCount
+            max_header_count := HdrCount,
+            linger_timeout := Linger
         }} ->
             #{
                 http1_max_request_line => ReqLine,
                 http1_max_header_line => HdrLine,
                 http1_max_header_block => HdrBlock,
-                http1_max_header_count => HdrCount
+                http1_max_header_count => HdrCount,
+                http1_linger_timeout => Linger
             }
     end.
 
