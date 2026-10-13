@@ -415,22 +415,23 @@ resolve_rate_limit(
     },
     {IP, _Port}
 ) ->
-    %% Bake the derived `Cost` (units/request) and `Cap` (bucket capacity) here,
-    %% once per connection, so the per-request `rate_limit_check/6` does no
-    %% multiplication.
+    %% Bake the derived `Cost` (units/request) and `Cap` (bucket capacity),
+    %% and the peer's bucket key, here, once per connection, so the
+    %% per-request `rate_limit_check/6` does no arithmetic.
     Cost = Period * 1000,
     Cap = Burst * Cost,
-    {Rate, Cap, Cost, Table, Counter, IP};
+    {Rate, Cap, Cost, Table, Counter, roadrunner_rate_limit:client_key(IP)};
 resolve_rate_limit(_ProtoOpts, _Peer) ->
     undefined.
 
-%% The rate-limit bucket key of one request: its resolved client IP when the
-%% listener resolves one behind a trusted proxy (`real_ip`), else the peer IP
-%% baked into the connection's rate-limit state.
+%% The rate-limit bucket key of one request: its resolved client IP's key
+%% (`roadrunner_rate_limit:client_key/1`) when the listener resolves one behind
+%% a trusted proxy (`real_ip`), else the peer's, baked into the connection's
+%% rate-limit state.
 -doc false.
 -spec rate_limit_key(roadrunner_req:request(), inet:ip_address()) -> inet:ip_address().
-rate_limit_key(#{client_ip := IP}, _PeerIP) -> IP;
-rate_limit_key(_Req, PeerIP) -> PeerIP.
+rate_limit_key(#{client_ip := IP}, _PeerKey) -> roadrunner_rate_limit:client_key(IP);
+rate_limit_key(_Req, PeerKey) -> PeerKey.
 
 -doc """
 Per-peer token-bucket check, the per-source sibling of

@@ -173,10 +173,14 @@ of `B` (default `N`). A peer over its rate gets `429 Too Many Requests` +
 not the retry-safe `REFUSED_STREAM` / `H3_REQUEST_REJECTED`, so clients
 back off instead of retrying at once), emitting `[roadrunner, request,
 throttled]` with `reason => rate_limit` and incrementing the
-`rate_limited` count from `roadrunner_listener:info/1`. A bucket is
-dropped once it is full again (checked every `sweep_interval`), which a
-peer cannot tell from no bucket, so waiting never resets a limit. It keys on
-the client IP, so behind a balancer set `proxy_protocol` (an L4 balancer)
+`rate_limited` count from `roadrunner_listener:info/1`. An IPv6 client is
+keyed by its /64, the network a host is given: the host can use any
+address in it, so a bucket per address would let it lift its own limit
+(an IPv4 client carried in IPv6, IPv4-mapped or under the NAT64 prefix
+`64:ff9b::/96`, keeps its IPv4 key). A bucket is dropped once it is full
+again (checked every `sweep_interval`), which a peer cannot tell from no
+bucket, so waiting never resets a limit. It keys on the client IP, so
+behind a balancer set `proxy_protocol` (an L4 balancer)
 or `real_ip` (HTTP proxies passing `X-Forwarded-For` or `Forwarded`);
 otherwise every client behind the proxy shares one bucket.
 

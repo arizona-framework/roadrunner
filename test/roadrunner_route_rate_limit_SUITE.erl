@@ -21,6 +21,7 @@ HTTP/3 case lives in `roadrunner_http3_SUITE`.
 -export([
     refuses_past_the_burst/1,
     buckets_are_per_client/1,
+    ipv6_clients_share_their_64/1,
     stacks_on_the_listener_limit/1,
     refusals_are_counted/1,
     refusal_is_reported_as_a_request/1,
@@ -41,6 +42,7 @@ groups() ->
     Shared = [
         refuses_past_the_burst,
         buckets_are_per_client,
+        ipv6_clients_share_their_64,
         stacks_on_the_listener_limit,
         refusals_are_counted,
         refusal_is_reported_as_a_request
@@ -91,6 +93,23 @@ buckets_are_per_client(Config) ->
     ?assertEqual({200, ~"1.1.1.1"}, request(Config, Port, ~"/login", ~"1.1.1.1")),
     ?assertEqual({200, ~"2.2.2.2"}, request(Config, Port, ~"/login", ~"2.2.2.2")),
     ?assertEqual({429, ~"60"}, request(Config, Port, ~"/login", ~"1.1.1.1")).
+
+ipv6_clients_share_their_64(Config) ->
+    %% An IPv6 client is limited by its /64, as any host can use many addresses
+    %% in its own: a bucket per address would lift the limit. Both limits key
+    %% the same way: the listener allows 2 a minute, `/login` 1.
+    Listener = #{
+        real_ip => #{trusted_proxies => [~"127.0.0.1"]},
+        rate_limit => #{rate => 1, burst => 2, period => 60}
+    },
+    Port = start(Config, Listener, routes()),
+    ?assertEqual({200, ~"2001:db8::1"}, request(Config, Port, ~"/login", ~"2001:db8::1")),
+    %% Another address in the /64: the route's bucket is spent.
+    ?assertEqual({429, ~"60"}, request(Config, Port, ~"/login", ~"2001:db8::2")),
+    %% Another /64 has buckets of its own.
+    ?assertMatch({200, _}, request(Config, Port, ~"/login", ~"2001:db8:0:1::1")),
+    %% And the first /64 has spent its 2 on the listener's.
+    ?assertEqual({429, ~"60"}, request(Config, Port, ~"/open", ~"2001:db8::3")).
 
 stacks_on_the_listener_limit(Config) ->
     %% The listener allows 3 requests a minute: the route's refusal still

@@ -48,6 +48,29 @@ per_minute_rate_test() ->
 resolve_off_without_config_test() ->
     ?assertEqual(undefined, ?M:resolve_rate_limit(proto_opts(undefined), {?IP, 5000})).
 
+resolve_keys_the_peer_once_test() ->
+    %% The peer's bucket key is baked in with the rest, once per connection:
+    %% an IPv6 peer's /64, an IPv4-mapped peer's IPv4 address.
+    Table = new_table(),
+    Opts = proto_opts(Table),
+    ?assertMatch(
+        {_, _, _, _, _, {16#2001, 16#DB8, 0, 0, 0, 0, 0, 0}},
+        ?M:resolve_rate_limit(Opts, {{16#2001, 16#DB8, 0, 0, 0, 0, 0, 9}, 5000})
+    ),
+    ?assertMatch(
+        {_, _, _, _, _, ?IP},
+        ?M:resolve_rate_limit(Opts, {{0, 0, 0, 0, 0, 16#FFFF, 16#7F00, 1}, 5000})
+    ).
+
+rate_limit_key_test() ->
+    %% A client `real_ip` resolved is keyed like a peer; otherwise the peer's
+    %% baked key stands.
+    ?assertEqual(
+        {16#2001, 16#DB8, 0, 0, 0, 0, 0, 0},
+        ?M:rate_limit_key(#{client_ip => {16#2001, 16#DB8, 0, 0, 0, 0, 0, 7}}, ?IP)
+    ),
+    ?assertEqual(?IP, ?M:rate_limit_key(#{}, ?IP)).
+
 resolve_off_without_peer_test() ->
     Table = new_table(),
     ?assertEqual(undefined, ?M:resolve_rate_limit(proto_opts(Table), undefined)).

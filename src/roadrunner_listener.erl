@@ -370,7 +370,9 @@ ops-tuning rationale.
     %% again, default 10000; a bucket still refilling is kept, so a peer cannot
     %% reset its limit by waiting). A peer exceeding the rate gets `429 Too
     %% Many Requests` + `Retry-After` before the handler runs. Keyed on the real
-    %% client IP, so accurate behind a balancer when `proxy_protocol` is set.
+    %% client IP, so accurate behind a balancer when `proxy_protocol` is set;
+    %% an IPv6 client is keyed by its /64, as a host can use any address in
+    %% the /64 it is given.
     %% The per-IP bucket is lock-free (last-write-wins), so concurrent
     %% connections from one IP can momentarily admit up to that many requests
     %% past `burst`; it bounds the sustained per-source rate, not exact

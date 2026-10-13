@@ -49,7 +49,8 @@ init(#{rate_limit := #{rate := Rate} = RateLimit, path := Path, methods := Metho
 %% buffered response, it carries its own `content-length: 0`, so an HTTP/1.1
 %% connection can go on after it. The
 %% client is `roadrunner_req:client_ip/1` (the peer unless `real_ip` resolved
-%% one); a request without one is not limited, as with the listener's limit.
+%% one), keyed as the listener's are (`roadrunner_rate_limit:client_key/1`); a
+%% request without one is not limited, as with the listener's limit.
 -doc false.
 -spec call(roadrunner_req:request(), roadrunner_middleware:next(), state()) ->
     roadrunner_handler:result().
@@ -68,7 +69,7 @@ check(undefined, _Name, _State) ->
 check(IP, Name, {Rate, Cap, Cost, RouteKey}) ->
     {Table, Counter} = persistent_term:get({roadrunner_route_rate_limit, Name}),
     NowMs = erlang:monotonic_time(millisecond),
-    Key = {RouteKey, IP},
+    Key = {RouteKey, roadrunner_rate_limit:client_key(IP)},
     maybe
         {deny, _} = Deny ?= roadrunner_conn:rate_limit_check(Table, Key, Rate, Cap, Cost, NowMs),
         ok = roadrunner_conn:throttled_telemetry(Name, Counter, rate_limit),
