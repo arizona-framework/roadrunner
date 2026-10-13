@@ -7,13 +7,41 @@
 %% `Cost = Period * 1000` units, and the bucket accrues `Rate` units per
 %% millisecond, so a limit of `Rate` requests per `Period` seconds refills
 %% exactly one request's worth of units every `Period / Rate` seconds. Capacity
-%% is `Burst` requests, i.e. `Burst * Cost` units. The caller (the per-listener
-%% ETS bucket store in `roadrunner_conn`) derives `Cost` and the cap; this
-%% module is socket- and state-free so the bucket math is exhaustively testable.
+%% is `Burst` requests, i.e. `Burst * Cost` units, both derived by `bucket/1`
+%% for the listener's limit and a route's alike. The buckets themselves live
+%% in ETS stores (`roadrunner_conn`); this module is socket- and state-free so
+%% the bucket math is exhaustively testable.
 
--export([refill/5, spend/2, retry_after_secs/3, client_key/1]).
+-export([valid/2, bucket/1, refill/5, spend/2, retry_after_secs/3, full_guard/3, client_key/1]).
 
 -define(MILLI, 1000).
+
+%% Whether `Opts` is a rate limit taking `Keys`: a map with `rate` set and
+%% no key outside `Keys`, each a positive integer. The listener's
+%% `rate_limit` and a route's are checked by it, each with its own keys.
+-doc false.
+-spec valid(term(), [atom()]) -> boolean().
+valid(#{rate := _} = Opts, Keys) ->
+    lists:all(
+        fun({Key, Value}) ->
+            lists:member(Key, Keys) andalso is_integer(Value) andalso Value > 0
+        end,
+        maps:to_list(Opts)
+    );
+valid(_Opts, _Keys) ->
+    false.
+
+%% The bucket of a rate limit: its `Rate`, the bucket capacity `Cap` and the
+%% `Cost` of one request, in units, with `period` 1 and `burst` `rate`
+%% unless set. Derived once, so the per-request check does no arithmetic.
+-doc false.
+-spec bucket(#{
+    rate := pos_integer(), period => pos_integer(), burst => pos_integer(), atom() => term()
+}) ->
+    {pos_integer(), pos_integer(), pos_integer()}.
+bucket(#{rate := Rate} = Opts) ->
+    Cost = maps:get(period, Opts, 1) * ?MILLI,
+    {Rate, maps:get(burst, Opts, Rate) * Cost, Cost}.
 
 %% Refill a bucket holding `Units`, last touched at `LastMs`, to its level at
 %% `NowMs`: add `Elapsed * Rate` units (the refill rate is `Rate` units/ms),
@@ -41,6 +69,15 @@ spend(_Units, _Cost) -> denied.
 retry_after_secs(Units, Rate, Cost) ->
     DeficitMs = ceil_div(Cost - Units, Rate),
     max(1, ceil_div(DeficitMs, ?MILLI)).
+
+%% The match-spec guard of a bucket row whose units and last time are `'$1'`
+%% and `'$2'`: full again by `NowMs`, its units plus the refill since then
+%% reaching `Cap` (`refill/5`). `Rate` and `Cap` are numbers, or match
+%% variables when each row carries its own.
+-doc false.
+-spec full_guard(integer(), pos_integer() | atom(), pos_integer() | atom()) -> tuple().
+full_guard(NowMs, Rate, Cap) ->
+    {'>=', {'+', '$1', {'*', {'-', NowMs, '$2'}, Rate}}, Cap}.
 
 %% The address a client's bucket is keyed on. An IPv6 client is keyed by its
 %% /64, the smallest network a host is given (SLAAC needs one): a host can

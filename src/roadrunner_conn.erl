@@ -76,6 +76,7 @@
     rate_limit_check/6,
     resolve_rate_limit/2,
     rate_limit/3,
+    rate_limit_spend/7,
     throttled_telemetry/3,
     rate_limit_evict_full/4,
     drain_oversized_body/3,
@@ -251,13 +252,14 @@ deadline in milliseconds.
 
 %% Resolved per-peer rate-limit config, built by `roadrunner_listener` when the
 %% `rate_limit` opt is set: `rate` requests per `period` seconds with a `burst`
-%% bucket capacity, the ETS `table` holding each peer's bucket, and the
-%% `sweep_interval` (ms) between passes that drop the buckets full again. The
-%% cumulative refusal count lives in the top-level `rate_limited_counter`.
+%% bucket capacity (`roadrunner_rate_limit:bucket/1`), the ETS `table` holding
+%% each peer's bucket, and the `sweep_interval` (ms) between passes that drop
+%% the buckets full again. The cumulative refusal count lives in the top-level
+%% `rate_limited_counter`.
 -type rate_limit() :: #{
     rate := pos_integer(),
-    burst := pos_integer(),
-    period := pos_integer(),
+    burst => pos_integer(),
+    period => pos_integer(),
     sweep_interval := pos_integer(),
     table := ets:table()
 }.
@@ -415,17 +417,13 @@ try_acquire_request_slot(Max, Counter) ->
     proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
 ) -> rate_limit_state().
 resolve_rate_limit(
-    #{
-        rate_limit := #{rate := Rate, burst := Burst, period := Period, table := Table},
-        rate_limited_counter := Counter
-    },
+    #{rate_limit := #{table := Table} = RateLimit, rate_limited_counter := Counter},
     {IP, _Port}
 ) ->
     %% Bake the derived `Cost` (units/request) and `Cap` (bucket capacity),
     %% and the peer's bucket key, here, once per connection, so the
     %% per-request `rate_limit_check/6` does no arithmetic.
-    Cost = Period * 1000,
-    Cap = Burst * Cost,
+    {Rate, Cap, Cost} = roadrunner_rate_limit:bucket(RateLimit),
     {Rate, Cap, Cost, Table, Counter, roadrunner_rate_limit:client_key(IP)};
 resolve_rate_limit(_ProtoOpts, _Peer) ->
     undefined.
@@ -442,20 +440,36 @@ resolve_rate_limit(_ProtoOpts, _Peer) ->
 rate_limit(undefined, _Req, _ListenerName) ->
     allow;
 rate_limit({Rate, Cap, Cost, Table, Counter, PeerKey}, Req, ListenerName) ->
-    NowMs = erlang:monotonic_time(millisecond),
-    maybe
-        {deny, _} =
-            Deny ?=
-                rate_limit_check(Table, rate_limit_key(Req, PeerKey), Rate, Cap, Cost, NowMs),
-        ok = throttled_telemetry(ListenerName, Counter, rate_limit),
-        Deny
-    end.
+    rate_limit_spend(Table, rate_limit_key(Req, PeerKey), Rate, Cap, Cost, Counter, ListenerName).
 
 %% The bucket key of one request: its resolved client IP's key
 %% (`roadrunner_rate_limit:client_key/1`), else the peer's.
 -spec rate_limit_key(roadrunner_req:request(), inet:ip_address()) -> inet:ip_address().
 rate_limit_key(#{client_ip := IP}, _PeerKey) -> roadrunner_rate_limit:client_key(IP);
 rate_limit_key(_Req, PeerKey) -> PeerKey.
+
+%% Spend one request from the bucket under `Key` in `Table` now: `allow`, or
+%% `{deny, RetryAfterSecs}` once the throttle is counted in `Counter` and its
+%% telemetry emitted. The listener's per-peer limit (`rate_limit/3`) and a
+%% route's own (`roadrunner_route_rate_limit`) both spend through it, each
+%% from its own store.
+-doc false.
+-spec rate_limit_spend(
+    ets:table(),
+    inet:ip_address() | {term(), inet:ip_address()},
+    pos_integer(),
+    pos_integer(),
+    pos_integer(),
+    atomics:atomics_ref(),
+    atom()
+) -> allow | {deny, pos_integer()}.
+rate_limit_spend(Table, Key, Rate, Cap, Cost, Counter, ListenerName) ->
+    NowMs = erlang:monotonic_time(millisecond),
+    maybe
+        {deny, _} = Deny ?= rate_limit_check(Table, Key, Rate, Cap, Cost, NowMs),
+        ok = throttled_telemetry(ListenerName, Counter, rate_limit),
+        Deny
+    end.
 
 -doc """
 Per-peer token-bucket check, the per-source sibling of
@@ -533,11 +547,8 @@ cheap.
 -spec rate_limit_evict_full(ets:table(), integer(), pos_integer(), pos_integer()) ->
     non_neg_integer().
 rate_limit_evict_full(Table, NowMs, Rate, Cap) ->
-    %% Row is `{IP, Units, LastMs}`; it is full once `Units` plus the refill
-    %% since `LastMs` reaches `Cap` (`roadrunner_rate_limit:refill/5`).
-    Spec = [
-        {{'_', '$1', '$2'}, [{'>=', {'+', '$1', {'*', {'-', NowMs, '$2'}, Rate}}, Cap}], [true]}
-    ],
+    %% Row is `{IP, Units, LastMs}`.
+    Spec = [{{'_', '$1', '$2'}, [roadrunner_rate_limit:full_guard(NowMs, Rate, Cap)], [true]}],
     ets:select_delete(Table, Spec).
 
 -doc """

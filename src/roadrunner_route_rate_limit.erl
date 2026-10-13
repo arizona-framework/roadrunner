@@ -7,42 +7,34 @@
 %% at all, and a refusal is a response from the route like any other, on every
 %% protocol. Its buckets live in the listener's route bucket store, published
 %% under `{roadrunner_route_rate_limit, ListenerName}` before any route that
-%% uses it, with the same rows and token-bucket check as the listener's own
-%% `rate_limit` (`roadrunner_conn:rate_limit_check/6`), keyed on the route and
+%% uses it, with the same rows and token-bucket spend as the listener's own
+%% `rate_limit` (`roadrunner_conn:rate_limit_spend/7`), keyed on the route and
 %% the client.
 
 -behaviour(roadrunner_middleware).
 
 -export([init/1, call/3, evict_full/2]).
 
-%% Rate, bucket capacity and cost of one request, in token-bucket units, and
-%% the key of the route buckets.
+%% The key of the route buckets: path, sorted methods, and the rate, bucket
+%% capacity and cost of one request, in token-bucket units.
 -type state() ::
-    {pos_integer(), pos_integer(), pos_integer(), route_key()}.
+    {binary(), [binary()] | undefined, {pos_integer(), pos_integer(), pos_integer()}}.
 
-%% Path, sorted methods, rate, period and burst of the route.
--type route_key() ::
-    {binary(), [binary()] | undefined, pos_integer(), pos_integer(), pos_integer()}.
-
-%% The route's bucket terms, as the listener's are resolved
-%% (`roadrunner_conn:resolve_rate_limit/2`): one request costs `Period * 1000`
-%% units, the bucket holds `Burst` requests' worth and refills `Rate` units a
-%% millisecond. Derived once, so the per-request check does no arithmetic.
-%% The bucket key holds the route's path and methods (two routes a request
-%% could reach never share both) and its settings, so `reload_routes/2` keeps
-%% the buckets of a route whose limit is unchanged and starts new ones when it
-%% changes; `evict_full/2` reads the rate and capacity back from it.
+%% The route's bucket key, its terms derived as the listener's are
+%% (`roadrunner_rate_limit:bucket/1`), once, so the per-request check does no
+%% arithmetic. The key holds the route's path and methods (two routes a
+%% request could reach never share both) and its bucket terms, so
+%% `reload_routes/2` keeps the buckets of a route whose limit is unchanged
+%% and starts new ones when it changes; `evict_full/2` reads the rate and
+%% capacity back from it.
 -doc false.
 -spec init(#{
     rate_limit := roadrunner_router:rate_limit(),
     path := binary(),
     methods := [binary()] | undefined
 }) -> state().
-init(#{rate_limit := #{rate := Rate} = RateLimit, path := Path, methods := Methods}) ->
-    Period = maps:get(period, RateLimit, 1),
-    Burst = maps:get(burst, RateLimit, Rate),
-    Cost = Period * 1000,
-    {Rate, Burst * Cost, Cost, {Path, Methods, Rate, Period, Burst}}.
+init(#{rate_limit := RateLimit, path := Path, methods := Methods}) ->
+    {Path, Methods, roadrunner_rate_limit:bucket(RateLimit)}.
 
 %% A client over the route's rate gets `429 Too Many Requests` with
 %% `Retry-After`, counted and reported like the listener's refusals. Being a
@@ -66,15 +58,10 @@ call(#{listener_name := Name} = Req, Next, State) ->
 -spec check(inet:ip_address() | undefined, atom(), state()) -> allow | {deny, pos_integer()}.
 check(undefined, _Name, _State) ->
     allow;
-check(IP, Name, {Rate, Cap, Cost, RouteKey}) ->
+check(IP, Name, {_Path, _Methods, {Rate, Cap, Cost}} = RouteKey) ->
     {Table, Counter} = persistent_term:get({roadrunner_route_rate_limit, Name}),
-    NowMs = erlang:monotonic_time(millisecond),
     Key = {RouteKey, roadrunner_rate_limit:client_key(IP)},
-    maybe
-        {deny, _} = Deny ?= roadrunner_conn:rate_limit_check(Table, Key, Rate, Cap, Cost, NowMs),
-        ok = roadrunner_conn:throttled_telemetry(Name, Counter, rate_limit),
-        Deny
-    end.
+    roadrunner_conn:rate_limit_spend(Table, Key, Rate, Cap, Cost, Counter, Name).
 
 %% Drop every route bucket full again by `NowMs`, in one `select_delete`
 %% pass, returning the number dropped, as the listener's own store is swept
@@ -84,13 +71,11 @@ check(IP, Name, {Rate, Cap, Cost, RouteKey}) ->
 -doc false.
 -spec evict_full(ets:table(), integer()) -> non_neg_integer().
 evict_full(Table, NowMs) ->
-    %% Row is `{{{Path, Methods, Rate, Period, Burst}, IP}, Units, LastMs}`; it
-    %% is full once `Units` plus the refill since `LastMs` reaches
-    %% `Burst * Period * 1000`.
+    %% Row is `{{{Path, Methods, {Rate, Cap, Cost}}, IP}, Units, LastMs}`.
     Spec = [
         {
-            {{{'_', '_', '$3', '$4', '$5'}, '_'}, '$1', '$2'},
-            [{'>=', {'+', '$1', {'*', {'-', NowMs, '$2'}, '$3'}}, {'*', {'*', '$5', '$4'}, 1000}}],
+            {{{'_', '_', {'$3', '$4', '_'}}, '_'}, '$1', '$2'},
+            [roadrunner_rate_limit:full_guard(NowMs, '$3', '$4')],
             [true]
         }
     ],

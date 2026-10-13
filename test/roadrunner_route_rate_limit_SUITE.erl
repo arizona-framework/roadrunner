@@ -204,7 +204,7 @@ sweep_drops_only_full_buckets(Config) ->
     {Table, _Counter} = persistent_term:get({roadrunner_route_rate_limit, ?MODULE}),
     ?assertEqual(2, ets:info(Table, size)),
     ok = sweep_until(Table, 1, erlang:monotonic_time(millisecond) + 5000),
-    ?assertMatch([{{{~"/login", _, _, _, _}, _}, _, _}], ets:tab2list(Table)).
+    ?assertMatch([{{{~"/login", _, _}, _}, _, _}], ets:tab2list(Table)).
 
 %% =============================================================================
 %% Helpers

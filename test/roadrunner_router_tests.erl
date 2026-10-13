@@ -697,10 +697,10 @@ rate_limit_is_a_pipeline_stage_test() ->
         ?assertEqual({~"retry-after", ~"60"}, lists:keyfind(~"retry-after", 1, Refused)),
         ?assertEqual({~"x-listener", ~"1"}, lists:keyfind(~"x-listener", 1, Refused)),
         ?assertEqual(false, lists:keyfind(~"x-route", 1, Refused)),
-        %% The bucket key: the route's path, its methods in one order, and the
-        %% settings.
+        %% The bucket key: the route's path, its methods in one order, and its
+        %% bucket terms (rate, capacity, cost).
         ?assertMatch(
-            [{{{~"/login", [~"GET", ~"POST"], 1, 60, 1}, {127, 0, 0, 1}}, _, _}],
+            [{{{~"/login", [~"GET", ~"POST"], {1, 60000, 60000}}, {127, 0, 0, 1}}, _, _}],
             ets:tab2list(Table)
         )
     after

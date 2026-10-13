@@ -524,18 +524,7 @@ check_max_content_length(_Route) ->
 
 -spec check_rate_limit(route()) -> ok | {error, validation_error()}.
 check_rate_limit(#{rate_limit := RateLimit}) ->
-    %% A map with `rate` set, and only `rate`, `period` and `burst`, each a
-    %% positive integer.
-    case
-        is_map(RateLimit) andalso is_map_key(rate, RateLimit) andalso
-            lists:all(
-                fun({Key, Value}) ->
-                    lists:member(Key, [rate, period, burst]) andalso is_integer(Value) andalso
-                        Value > 0
-                end,
-                maps:to_list(RateLimit)
-            )
-    of
+    case roadrunner_rate_limit:valid(RateLimit, [rate, period, burst]) of
         true -> ok;
         false -> {error, {invalid_route_rate_limit, RateLimit}}
     end;
