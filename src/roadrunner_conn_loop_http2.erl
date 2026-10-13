@@ -27,10 +27,14 @@
 %%
 %% ```
 %% {h2_send_headers, Worker, Ref, StreamId, Status, Headers, EndStream}
-%% {h2_send_data,    Worker, Ref, StreamId, Data,   EndStream}
+%% {h2_send_data,    Worker, Ref, StreamId, Data, Size, EndStream}
 %% {h2_send_trailers, Worker, Ref, StreamId, Trailers}
-%% {h2_send_response, StreamId, Status, Headers, Body}
+%% {h2_send_response, StreamId, Status, Headers, Body, BodyLen}
 %% ```
+%%
+%% The worker sizes `Data` / `Body` itself (`Size` / `BodyLen` are their
+%% `iolist_size/1`), so a handler's non-iodata body crashes that worker
+%% alone rather than this process, which every stream shares.
 %%
 %% The conn replies `{h2_send_ack, Ref}` once the corresponding
 %% frame(s) are on the wire — so workers are synchronously
@@ -527,12 +531,12 @@ recv_more(
             exit_clean(State);
         {h2_send_headers, From, Ref, StreamId, Status, Headers, EndStream} ->
             recv_more(handle_send_headers(State, From, Ref, StreamId, Status, Headers, EndStream));
-        {h2_send_data, From, Ref, StreamId, Data, EndStream} ->
-            recv_more(handle_send_data(State, From, Ref, StreamId, Data, EndStream));
+        {h2_send_data, From, Ref, StreamId, Data, Size, EndStream} ->
+            recv_more(handle_send_data(State, From, Ref, StreamId, Data, Size, EndStream));
         {h2_send_trailers, From, Ref, StreamId, Trailers} ->
             recv_more(handle_send_trailers(State, From, Ref, StreamId, Trailers));
-        {h2_send_response, StreamId, Status, Headers, Body} ->
-            recv_more(handle_send_response(State, StreamId, Status, Headers, Body));
+        {h2_send_response, StreamId, Status, Headers, Body, BodyLen} ->
+            recv_more(handle_send_response(State, StreamId, Status, Headers, Body, BodyLen));
         {'DOWN', MonRef, process, _Pid, Reason} ->
             recv_more(maybe_exit_when_drained(handle_worker_down(State, MonRef, Reason)));
         {roadrunner_slot, StreamId, Outcome} ->
@@ -1268,17 +1272,17 @@ content_length_matches(Headers, BodyLen) ->
 %% holds is queued with no one to wake (`finish_stream/2` keeps the
 %% stream until it drains), and a response for a stream already reset
 %% or closed is dropped, its worker being gone or about to be.
-handle_send_response(State, StreamId, Status, Headers, Body) ->
+handle_send_response(State, StreamId, Status, Headers, Body, BodyLen) ->
     case stream_open(State, StreamId) of
         not_open ->
             State;
         Stream ->
-            case iolist_size(Body) of
+            case BodyLen of
                 0 ->
                     %% Empty body — single HEADERS frame with END_STREAM,
                     %% same wire shape as `handle_send_headers/_, true)`.
                     encode_and_send_headers(State, StreamId, Status, Headers, true);
-                BodyLen ->
+                _ ->
                     %% Short-circuit: skip the `window_budget/2` lookup
                     %% when the body already won't fit in one frame.
                     case
@@ -1298,7 +1302,7 @@ handle_send_response(State, StreamId, Status, Headers, Body) ->
                             ),
                             #{StreamId := Stream1} = State1#loop.streams,
                             try_send_data(
-                                State1, Stream1, StreamId, undefined, undefined, Body, true
+                                State1, Stream1, StreamId, undefined, undefined, Body, BodyLen, true
                             )
                     end
             end
@@ -1315,13 +1319,13 @@ handle_send_headers(State, From, Ref, StreamId, Status, Headers, EndStream) ->
             State1
     end.
 
-handle_send_data(State, From, Ref, StreamId, Data, EndStream) ->
+handle_send_data(State, From, Ref, StreamId, Data, Size, EndStream) ->
     case stream_open(State, StreamId) of
         not_open ->
             _ = (From ! {h2_stream_reset, StreamId}),
             State;
         Stream ->
-            try_send_data(State, Stream, StreamId, From, Ref, Data, EndStream)
+            try_send_data(State, Stream, StreamId, From, Ref, Data, Size, EndStream)
     end.
 
 handle_send_trailers(State, From, Ref, StreamId, Trailers) ->
@@ -1357,7 +1361,7 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
 
 %% A worker exited normally, so its response is complete: every frame is
 %% on the wire, unless flow control still holds part of a buffered body,
-%% which the worker hands over without waiting (`handle_send_response/5`).
+%% which the worker hands over without waiting (`handle_send_response/6`).
 %% Then the stream stays, its worker fields cleared, until a window update
 %% drains the queue and `retire_drained/2` drops it. The stream is always
 %% still there: every path that drops a stream under a live worker
@@ -1494,6 +1498,9 @@ close_stream_send_side(#loop{streams = Streams} = State, StreamId) ->
 %% everything and ack. If a partial chunk fits, send what we can
 %% and queue the rest. If nothing fits, queue the whole thing.
 %%
+%% `Size` is `iolist_size(Data)`: taken by the worker for a fresh send,
+%% recomputed for a queued remainder (`drain_pending/3`).
+%%
 %% `Data` is iodata. The single-frame branch in `send_data_chunks`
 %% passes it straight to the frame encoder (which accepts iodata)
 %% and the transport `writev()`s it, so the common streaming case
@@ -1503,8 +1510,8 @@ close_stream_send_side(#loop{streams = Streams} = State, StreamId) ->
 %% short-circuit empty `nofin` sends — the empty-body case here
 %% doesn't consume any window bytes, so it bypasses the window
 %% check entirely.
-try_send_data(State, Stream, StreamId, From, Ref, Data, EndStream) ->
-    case iolist_size(Data) of
+try_send_data(State, Stream, StreamId, From, Ref, Data, Size, EndStream) ->
+    case Size of
         0 when EndStream ->
             %% Final empty DATA frame closes the stream.
             Frame = roadrunner_http2_frame:encode({data, StreamId, 16#01, <<>>}),
@@ -1608,7 +1615,7 @@ enqueue_pending(#{pending_sends := Pending} = Stream, Entry) ->
     Stream#{pending_sends := queue:in(Entry, Pending)}.
 
 %% Wake the worker blocked on a send once its data is on the wire. A
-%% buffered response's body has no worker waiting (`handle_send_response/5`).
+%% buffered response's body has no worker waiting (`handle_send_response/6`).
 -spec ack(pid() | undefined, reference() | undefined) -> ok.
 ack(undefined, _Ref) ->
     ok;
@@ -1663,7 +1670,9 @@ drain_pending(State, StreamId, #{pending_sends := Pending} = Stream) ->
             {data, Ref, From, Bin, EndStream} = Entry,
             Stream1 = Stream#{pending_sends := Rest},
             State1 = update_stream(State, StreamId, Stream1),
-            State2 = try_send_data(State1, Stream1, StreamId, From, Ref, Bin, EndStream),
+            State2 = try_send_data(
+                State1, Stream1, StreamId, From, Ref, Bin, iolist_size(Bin), EndStream
+            ),
             #{StreamId := #{pending_sends := Pending2} = Stream2} = State2#loop.streams,
             case queue:peek(Pending2) of
                 {value, Entry} ->

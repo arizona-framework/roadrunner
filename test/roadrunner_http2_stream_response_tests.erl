@@ -35,7 +35,7 @@ hold_first_data(Reporter) ->
             From ! {h2_send_ack, Ref}
     end,
     receive
-        {h2_send_data, Worker, _, _, _, _} ->
+        {h2_send_data, Worker, _, _, _, _, _} ->
             Reporter ! {data_held, Worker}
     end,
     receive

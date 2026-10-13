@@ -33,7 +33,7 @@
 %% goes one way, with no ack to wait for:
 %%
 %% ```
-%% Worker → Conn: {h2_send_response, StreamId, Status, Headers, Body}
+%% Worker → Conn: {h2_send_response, StreamId, Status, Headers, Body, BodyLen}
 %% ```
 %%
 %% The worker has no explicit "done" message: it is spawn_monitored, so
@@ -196,5 +196,9 @@ emit_501(ConnPid, StreamId) ->
     pid(), non_neg_integer(), roadrunner_http:status(), roadrunner_http:headers(), iodata()
 ) -> ok.
 send_buffered(ConnPid, StreamId, Status, Headers, Body) ->
-    _ = (ConnPid ! {h2_send_response, StreamId, Status, Headers, Body}),
+    %% Sized here, in the worker: a handler's non-iodata body crashes this
+    %% worker, so the conn resets just its stream instead of crashing on it
+    %% with every stream it carries, and the conn reads the size instead of
+    %% walking the body again.
+    _ = (ConnPid ! {h2_send_response, StreamId, Status, Headers, Body, iolist_size(Body)}),
     ok.

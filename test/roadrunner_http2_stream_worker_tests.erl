@@ -50,7 +50,7 @@ logger_metadata_set_in_h2_worker_test_() ->
 
 recv_response_body(StreamId) ->
     receive
-        {h2_send_response, StreamId, _Status, _Headers, Bin} ->
+        {h2_send_response, StreamId, _Status, _Headers, Bin, _BodyLen} ->
             Bin
     after 1000 ->
         error(no_h2_send_response)

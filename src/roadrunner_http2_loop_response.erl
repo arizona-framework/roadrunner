@@ -75,7 +75,7 @@ info_loop(ConnPid, StreamId, Handler, Push, State) ->
                 {ok, NewState} ->
                     info_loop(ConnPid, StreamId, Handler, Push, NewState);
                 {stop, _NewState} ->
-                    roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, <<>>, true)
+                    roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, <<>>, 0, true)
             end
     end.
 
@@ -100,7 +100,7 @@ make_push(ConnPid, StreamId) ->
         case iolist_size(Data) of
             0 ->
                 ok;
-            _ ->
-                roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, false)
+            Size ->
+                roadrunner_http2_worker_sync:send_data(ConnPid, StreamId, Data, Size, false)
         end
     end.
