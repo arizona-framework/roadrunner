@@ -8,14 +8,14 @@
 %% --- init/1 ---
 
 init_compiles_bucket_terms_test() ->
-    %% One request costs `Period * 1000` units, the bucket holds `Burst` of
-    %% them (default `rate`), and the key carries the route and its settings.
+    %% The key carries the route and its bucket terms: the rate, a capacity
+    %% of `Burst` requests (default `rate`) and the cost of one, in units.
     ?assertEqual(
-        {5, 300000, 60000, {~"/login", undefined, 5, 60, 5}},
+        {~"/login", undefined, {5, 300000, 60000}},
         ?M:init(#{rate_limit => #{rate => 5, period => 60}, path => ~"/login", methods => undefined})
     ),
     ?assertEqual(
-        {2, 4000, 1000, {~"/up", [~"POST"], 2, 1, 4}},
+        {~"/up", [~"POST"], {2, 4000, 1000}},
         ?M:init(#{rate_limit => #{rate => 2, burst => 4}, path => ~"/up", methods => [~"POST"]})
     ).
 
@@ -25,8 +25,8 @@ evicts_each_route_bucket_once_full_test() ->
     %% Two routes with their own rates share the store: each bucket is dropped
     %% when full again at its own route's rate, read from its key.
     Table = ets:new(route_rl_test, [public]),
-    {SlowRate, SlowCap, SlowCost, SlowKey} = ?M:init(stage(~"/slow", 1, 60)),
-    {FastRate, FastCap, FastCost, FastKey} = ?M:init(stage(~"/fast", 1, 1)),
+    {_, _, {SlowRate, SlowCap, SlowCost}} = SlowKey = ?M:init(stage(~"/slow", 1, 60)),
+    {_, _, {FastRate, FastCap, FastCost}} = FastKey = ?M:init(stage(~"/fast", 1, 1)),
     allow = roadrunner_conn:rate_limit_check(
         Table, {SlowKey, ?IP}, SlowRate, SlowCap, SlowCost, 0
     ),

@@ -1953,41 +1953,17 @@ build_rate_limit(RawOpt) ->
     undefined
     | #{
         rate := pos_integer(),
-        burst := pos_integer(),
-        period := pos_integer(),
+        burst => pos_integer(),
+        period => pos_integer(),
         sweep_interval := pos_integer()
     }.
 validate_rate_limit(undefined) ->
     undefined;
-validate_rate_limit(Opts) when is_map(Opts) ->
-    %% Every supplied key must be a known positive integer.
-    Resolved = maps:fold(
-        fun(K, V, Acc) ->
-            case
-                lists:member(K, [rate, burst, period, sweep_interval]) andalso
-                    is_integer(V) andalso V > 0
-            of
-                true -> Acc#{K => V};
-                false -> error({invalid_listener_opt, rate_limit, Opts})
-            end
-        end,
-        #{},
-        Opts
-    ),
-    case Resolved of
-        #{rate := Rate} ->
-            #{
-                rate => Rate,
-                burst => maps:get(burst, Resolved, Rate),
-                period => maps:get(period, Resolved, 1),
-                sweep_interval => maps:get(sweep_interval, Resolved, 10000)
-            };
-        #{} ->
-            %% `rate` is required.
-            error({invalid_listener_opt, rate_limit, Opts})
-    end;
-validate_rate_limit(Other) ->
-    error({invalid_listener_opt, rate_limit, Other}).
+validate_rate_limit(Opts) ->
+    case roadrunner_rate_limit:valid(Opts, [rate, burst, period, sweep_interval]) of
+        true -> maps:merge(#{sweep_interval => 10000}, Opts);
+        false -> error({invalid_listener_opt, rate_limit, Opts})
+    end.
 
 build_dispatch(#{routes := Module} = Opts, _ListenerName) when is_atom(Module) ->
     bake_dispatch(Module, Opts, [], no_state);
@@ -2222,21 +2198,14 @@ handle_info(
 handle_info(
     rate_limit_sweep,
     #state{
-        proto_opts = #{
-            rate_limit := #{
-                table := Table,
-                rate := Rate,
-                burst := Burst,
-                period := Period,
-                sweep_interval := Interval
-            }
-        }
+        proto_opts = #{rate_limit := #{table := Table, sweep_interval := Interval} = RateLimit}
     } = State
 ) ->
     %% Evict the per-peer buckets full again, then reschedule. Keeps the store
     %% bounded by the peers inside their refill window.
     NowMs = erlang:monotonic_time(millisecond),
-    _ = roadrunner_conn:rate_limit_evict_full(Table, NowMs, Rate, Burst * Period * 1000),
+    {Rate, Cap, _Cost} = roadrunner_rate_limit:bucket(RateLimit),
+    _ = roadrunner_conn:rate_limit_evict_full(Table, NowMs, Rate, Cap),
     _ = erlang:send_after(Interval, self(), rate_limit_sweep),
     {noreply, State};
 handle_info(route_rate_limit_sweep, #state{route_buckets = Table} = State) ->

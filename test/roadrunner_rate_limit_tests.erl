@@ -9,6 +9,26 @@
 
 %% --- refill/5 ---
 
+valid_test() ->
+    Keys = [rate, period, burst],
+    ?assert(?M:valid(#{rate => 1}, Keys)),
+    ?assert(?M:valid(#{rate => 5, period => 60, burst => 10}, Keys)),
+    %% `rate` is required, every key known, every value a positive integer.
+    ?assertNot(?M:valid(#{period => 1}, Keys)),
+    ?assertNot(?M:valid(#{rate => 1, sweep_interval => 1}, Keys)),
+    ?assert(?M:valid(#{rate => 1, sweep_interval => 1}, [sweep_interval | Keys])),
+    ?assertNot(?M:valid(#{rate => 0}, Keys)),
+    ?assertNot(?M:valid(#{rate => 1, burst => 1.5}, Keys)),
+    ?assertNot(?M:valid([{rate, 1}], Keys)).
+
+bucket_test() ->
+    %% One request costs `Period * 1000` units and the bucket holds `Burst`
+    %% of them, `period` 1 and `burst` `rate` unless set.
+    ?assertEqual({5, 5000, 1000}, ?M:bucket(#{rate => 5})),
+    ?assertEqual({5, 600000, 60000}, ?M:bucket(#{rate => 5, period => 60, burst => 10})),
+    %% Other keys (the listener's `table`, `sweep_interval`) are ignored.
+    ?assertEqual({2, 2000, 1000}, ?M:bucket(#{rate => 2, sweep_interval => 10, table => t})).
+
 refill_from_empty_accrues_test() ->
     %% 100ms at Rate 10 units/ms = 1000 units = one request, under a 5-request cap.
     ?assertEqual(1000, ?M:refill(0, 0, 100, 10, 5000)).
