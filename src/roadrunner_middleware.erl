@@ -133,7 +133,7 @@ never has an `init/1` (there's no module to host the callback).
 %% Stateless auth check — halt with 401 when missing. Wire it as a
 %% bare `fun ?MODULE:auth/3`.
 auth(Req, Next, _State) ->
-    case roadrunner_req:header(~"authorization", Req) of
+    case roadrunner_req:header_normalized(~"authorization", Req) of
         undefined -> {roadrunner_resp:unauthorized(), Req};
         _ -> Next(Req)
     end.

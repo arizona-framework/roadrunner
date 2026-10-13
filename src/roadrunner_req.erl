@@ -335,7 +335,7 @@ Returns `[]` when the request carries no `Cookie` header.
 """.
 -spec parse_cookies(request()) -> [{binary(), binary()}].
 parse_cookies(Req) ->
-    case header(~"cookie", Req) of
+    case header_normalized(~"cookie", Req) of
         undefined -> [];
         Value -> roadrunner_cookie:parse(Value)
     end.
@@ -485,7 +485,7 @@ get drained on keep-alive.
     | {ok, multipart, [roadrunner_multipart:part()], request()}
     | {error, no_content_type | unsupported_content_type | no_boundary | term()}.
 read_form(Req) ->
-    case header(~"content-type", Req) of
+    case header_normalized(~"content-type", Req) of
         undefined ->
             {error, no_content_type};
         ContentType ->
@@ -581,7 +581,7 @@ sits behind a trusted reverse proxy that strips/overwrites them.
 """.
 -spec forwarded_for(request()) -> binary() | undefined.
 forwarded_for(Req) ->
-    case header(~"forwarded", Req) of
+    case header_normalized(~"forwarded", Req) of
         undefined ->
             x_forwarded_for(Req);
         Value ->
@@ -606,7 +606,7 @@ empty_to_undefined(Other) -> Other.
 
 -spec x_forwarded_for(request()) -> binary() | undefined.
 x_forwarded_for(Req) ->
-    case header(~"x-forwarded-for", Req) of
+    case header_normalized(~"x-forwarded-for", Req) of
         undefined ->
             undefined;
         Value ->
