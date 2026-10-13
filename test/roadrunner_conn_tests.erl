@@ -2405,12 +2405,16 @@ request_slot_release_many_test() ->
     ?assertEqual(ok, roadrunner_conn:release_request_slots(10, Ref, 4, refuse)),
     ?assertEqual(0, counters:get(Ref, 1)).
 
-generate_request_id_matches_lowercase_hex_test() ->
-    %% Every byte value passes through the hex-pair table once.
-    Bytes = <<<<B>> || B <- lists:seq(0, 255)>>,
-    Ids = request_ids(Bytes),
+generate_request_id_slices_a_hex_batch_test() ->
+    %% A refill hex-encodes one random batch into 32 ids of 16 lowercase hex
+    %% characters, handed out one per call.
+    {Id, Rest} = roadrunner_conn:generate_request_id(<<>>),
+    Ids = [Id | request_ids(Rest)],
     ?assertEqual(32, length(Ids)),
-    ?assertEqual(binary:encode_hex(Bytes, lowercase), iolist_to_binary(Ids)).
+    ?assertEqual(32, length(lists:usort(Ids))),
+    [?assertMatch({match, _}, re:run(I, "^[0-9a-f]{16}$")) || I <- Ids],
+    %% Each id is its own 16-byte copy, not a view that keeps the batch alive.
+    ?assertEqual(16, binary:referenced_byte_size(Id)).
 
 request_ids(<<>>) ->
     [];
