@@ -1268,14 +1268,12 @@ consume_body_reader(
     #{framing := {content_length, N}, bytes_read := Read} = BS, _Mode
 ) when Read >= N ->
     {ok, <<>>, BS};
+consume_body_reader(#{framing := {content_length, N}, max := Max}, _Mode) when N > Max ->
+    %% A declared length over the cap fails every read, one of a piece as
+    %% much as one of the whole body, before any of it is read.
+    {error, content_length_too_large};
 consume_body_reader(
-    #{
-        framing := {content_length, N},
-        bytes_read := Read,
-        buffered := Buf,
-        recv := Recv,
-        max := Max
-    } = BS,
+    #{framing := {content_length, N}, bytes_read := Read, buffered := Buf, recv := Recv} = BS,
     Mode
 ) ->
     Remaining = N - Read,
@@ -1285,21 +1283,16 @@ consume_body_reader(
             next_chunk -> Remaining;
             {length, L} -> min(Remaining, L)
         end,
-    case Want > Max of
-        true ->
-            {error, content_length_too_large};
-        false ->
-            case fill_n(Want, Buf, Recv) of
-                {ok, Bytes, NewBuf} ->
-                    NewRead = Read + iolist_size(Bytes),
-                    NewState = BS#{buffered := NewBuf, bytes_read := NewRead},
-                    case NewRead >= N of
-                        true -> {ok, Bytes, NewState};
-                        false -> {more, Bytes, NewState}
-                    end;
-                {error, _} = E ->
-                    E
-            end
+    case fill_n(Want, Buf, Recv) of
+        {ok, Bytes, NewBuf} ->
+            NewRead = Read + iolist_size(Bytes),
+            NewState = BS#{buffered := NewBuf, bytes_read := NewRead},
+            case NewRead >= N of
+                true -> {ok, Bytes, NewState};
+                false -> {more, Bytes, NewState}
+            end;
+        {error, _} = E ->
+            E
     end;
 consume_body_reader(#{framing := chunked} = BS, all) ->
     %% Drain everything left: any pending decoded bytes plus all

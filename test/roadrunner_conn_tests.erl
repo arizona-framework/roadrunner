@@ -1686,6 +1686,22 @@ consume_state_request_too_large_test() ->
         roadrunner_conn:consume_body_reader(State, all)
     ).
 
+consume_state_request_too_large_in_pieces_test() ->
+    %% Each piece is under the cap, but the declared body is not: the first
+    %% read already fails, with the whole body in hand.
+    State = #{
+        framing => {content_length, 100},
+        buffered => binary:copy(~"x", 100),
+        bytes_read => 0,
+        recv => fun() -> error(unused) end,
+        max => 10,
+        trailer_limits => {8192, 10240, 100}
+    },
+    ?assertEqual(
+        {error, content_length_too_large},
+        roadrunner_conn:consume_body_reader(State, {length, 4})
+    ).
+
 consume_state_chunked_full_drain_test() ->
     State = chunked_state(~"5\r\nhello\r\n0\r\n\r\n", fun() -> error(unused) end),
     {ok, Bytes, _} = roadrunner_conn:consume_body_reader(State, all),
