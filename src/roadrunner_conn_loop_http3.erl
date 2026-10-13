@@ -448,30 +448,13 @@ await_body(State, _StreamId, _Stream0, _Stream1) ->
 %% the interim 100 (a HEADERS frame with `:status` alone, no FIN) that asks
 %% for the body. A request expecting nothing waits for its body as before.
 -spec answer_expectation(#h3{}, non_neg_integer(), map(), roadrunner_http:headers()) -> #h3{}.
-answer_expectation(State, StreamId, Stream0, Headers) ->
-    case lists:keyfind(~"expect", 1, Headers) of
-        {_, Expect} ->
-            case
-                roadrunner_bin:ascii_lowercase(Expect) =:= ~"100-continue" andalso
-                    roadrunner_http:request_content_length(Headers)
-            of
-                {ok, Declared} ->
-                    #h3{proto_opts = #{dispatch := Dispatch}, max_content_length = MaxLen} = State,
-                    case Declared > roadrunner_conn:route_body_cap(Dispatch, Headers, MaxLen) of
-                        true ->
-                            refuse_request(
-                                State, StreamId, Stream0, false, 413, ~"Payload Too Large"
-                            );
-                        false ->
-                            send_continue(State, StreamId)
-                    end;
-                false ->
-                    State;
-                _ ->
-                    send_continue(State, StreamId)
-            end;
-        false ->
-            State
+answer_expectation(
+    #h3{proto_opts = ProtoOpts, max_content_length = MaxLen} = State, StreamId, Stream0, Headers
+) ->
+    case roadrunner_conn:expect_answer(ProtoOpts, Headers, MaxLen) of
+        too_large -> refuse_request(State, StreamId, Stream0, false, 413, ~"Payload Too Large");
+        continue -> send_continue(State, StreamId);
+        none -> State
     end.
 
 %% The interim `100 (Continue)`: a HEADERS frame with `:status` alone and
@@ -934,14 +917,7 @@ dispatch_decoded(State, StreamId, Headers, Body) ->
             %% stream error H3_MESSAGE_ERROR.
             reset_and_drop(State1, StreamId, ?H3_MESSAGE_ERROR);
         {ok, Req0} ->
-            Req =
-                case State#h3.real_ip of
-                    undefined ->
-                        Req0;
-                    RealIp ->
-                        {PeerIP, _Port} = State#h3.peer,
-                        Req0#{client_ip => roadrunner_real_ip:resolve(RealIp, PeerIP, Headers)}
-                end,
+            Req = roadrunner_conn:with_client_ip(Req0, State#h3.real_ip, State#h3.peer),
             case rate_limit_refused(State1, StreamId, Req) of
                 {refused, State2} ->
                     %% Per-peer rate exceeded: 429 + Retry-After sent, stream

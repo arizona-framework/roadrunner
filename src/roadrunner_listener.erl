@@ -235,7 +235,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   body before invoking the handler) or `manual` (handler calls
   `roadrunner_req:read_body/1,2`; a client sending
   `Expect: 100-continue` is asked for its body only when the handler
-  first reads it).
+  first reads it). In manual mode an HTTP/2 handler runs as soon as the
+  headers are in, and a stream holds at most one flow-control window of
+  body it has not read; a handler that answers without reading the body
+  ends the client's upload with `RST_STREAM(NO_ERROR)`. HTTP/3 bodies are
+  buffered in either mode.
 - `slot_reconciliation` — `#{interval := Ms}` (default 60000) for the
   periodic reaper that releases slots orphaned by brutal-kill exits,
   and with them the killed conns' rows in the drain registry, or

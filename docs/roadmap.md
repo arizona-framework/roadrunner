@@ -69,9 +69,10 @@ stream, so there is no burst to be lenient about.
 h3 shipped experimentally (`protocols => [http3]`, QPACK static-table
 only). Remaining work:
 
-- h3 manual-mode body reading (parity with the deferred h2 item) —
-  needs the same conn-loop→worker inbound routing WebSocket would, so
-  do it alongside that work, not standalone
+- h3 manual-mode body reading (parity with HTTP/1.1 and HTTP/2): the
+  worker side is shared (the stream body reader in roadrunner_conn); the QUIC
+  layer grants a stream's receive credit as data arrives, so it first needs
+  to grant it as the worker reads
 - WebSocket over h3 (`websocket` shape, still `501`) — RFC 9220
   Extended CONNECT; do WebSocket over h2 (RFC 8441) first, since it's
   the more common transport and h2 has no WebSocket either
@@ -421,19 +422,6 @@ are the remaining gaps.
 
 **Scope:** small for `large_response` (loadgen per-stream credit grant),
 small-medium for the POST scenarios (dep body-receive wiring).
-
-### h2 manual-mode body reading
-
-**What:** Parity with the h1 manual-mode body reader for h2 streams
-(streaming an arbitrarily large body without buffering it in memory
-on the worker process before the handler sees it).
-
-**Why deferred:** the h2 stream-worker today buffers the full body
-before dispatching the handler (h2 framing already chunks the wire
-bytes; we just don't expose that to the handler yet). Auto-mode is
-the only mode on h2.
-
-**Scope:** small-medium when needed. No present caller is blocked.
 
 ### Strict grammars for Set-Cookie attributes
 

@@ -42,7 +42,11 @@ accessors that operate on it.
 -export([check_header_safe/2, is_header_safe/1]).
 -export([strip_connection_specific_fields/1, strip_connection_specific_fields_safe/1]).
 -export([
-    request_pseudo_headers/1, check_request_authority/3, request_content_length/1, build_request/7
+    request_pseudo_headers/1,
+    check_request_authority/3,
+    request_content_length/1,
+    body_length_fits/3,
+    build_request/7
 ]).
 
 -export_type([headers/0, status/0, redirect_status/0, version/0, request_context/0]).
@@ -459,6 +463,18 @@ find_host([{~"host", Value} | Rest]) ->
     end;
 find_host([_ | Rest]) ->
     find_host(Rest).
+
+%% Whether `Len` request body bytes agree with the request's declared
+%% `content-length` (`request_content_length/1`): never past it, and exactly
+%% it once the body has `Ended`. No header always agrees; a malformed one
+%% never does (RFC 9113 §8.1.1, RFC 9114 §4.1.2).
+-doc false.
+-spec body_length_fits(none | {ok, non_neg_integer()} | error, non_neg_integer(), boolean()) ->
+    boolean().
+body_length_fits(none, _Len, _Ended) -> true;
+body_length_fits({ok, Declared}, Len, false) -> Len =< Declared;
+body_length_fits({ok, Declared}, Len, true) -> Len =:= Declared;
+body_length_fits(error, _Len, _Ended) -> false.
 
 %% The `content-length` of an HTTP/2 or HTTP/3 request, which the caller
 %% compares with the bytes its DATA frames carried (RFC 9113 §8.1.1, RFC

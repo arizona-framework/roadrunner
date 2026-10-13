@@ -833,15 +833,7 @@ handle_request_bytes(
                 request_id => RequestId,
                 listener_name => ListenerName
             },
-            Req =
-                case S#loop_state.real_ip of
-                    undefined ->
-                        Req1;
-                    RealIp ->
-                        {PeerIP, _Port} = Peer,
-                        #{headers := Headers} = Req0,
-                        Req1#{client_ip => roadrunner_real_ip:resolve(RealIp, PeerIP, Headers)}
-                end,
+            Req = roadrunner_conn:with_client_ip(Req1, S#loop_state.real_ip, Peer),
             ok = roadrunner_conn:set_request_logger_metadata(Req),
             read_body_phase(
                 S#loop_state{buffered = Rest, req_id_buffer = NewBuffer}, Req, Deadline
