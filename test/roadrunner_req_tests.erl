@@ -40,6 +40,26 @@ path_uses_stored_field_test() ->
         roadrunner_req:path(#{target => ~"/foo?a=1&b=2", path => ~"/foo"})
     ).
 
+path_and_qs_split_at_first_qmark_test() ->
+    %% The split scans 7 bytes at a time, then byte by byte: put the `?`
+    %% (or none) at every offset across a few words and check against
+    %% splitting on the first `?`. Later `?`s belong to the query.
+    lists:foreach(
+        fun(Target) ->
+            {Path, Qs} =
+                case binary:split(Target, ~"?") of
+                    [P, Q] -> {P, Q};
+                    [P] -> {P, ~""}
+                end,
+            Req = sample_req_target(Target),
+            ?assertEqual(Path, roadrunner_req:path(Req)),
+            ?assertEqual(Qs, roadrunner_req:qs(Req)),
+            ?assertEqual(Path, roadrunner_req:target_path(Target))
+        end,
+        [binary:copy(~"a", N) || N <- lists:seq(0, 20)] ++
+            [<<(binary:copy(~"a", N))/binary, "?x=1?y">> || N <- lists:seq(0, 20)]
+    ).
+
 qs_no_query_test() ->
     ?assertEqual(~"", roadrunner_req:qs(sample_req_target(~"/foo"))).
 

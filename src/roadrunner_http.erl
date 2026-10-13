@@ -511,6 +511,7 @@ build_request(Version, Method, Path, Authority, Regular, Body, RequestContext) -
     #{
         method => Method,
         target => Path,
+        path => roadrunner_req:target_path(Path),
         version => Version,
         headers => HeadersWithHost,
         body => Body,
