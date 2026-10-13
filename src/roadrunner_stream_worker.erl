@@ -43,8 +43,8 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
     ReqStart = roadrunner_telemetry:request_start(Metadata),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
         {ok, Handler, Bindings, Pipeline, _State, Limits} ->
-            case over_route_cap(Limits, Req) of
-                false ->
+            case route_body(Limits, Req) of
+                #{} = Req1 ->
                     invoke(
                         Worker,
                         Protocol,
@@ -52,11 +52,11 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
                         StreamId,
                         Handler,
                         Pipeline,
-                        Req#{bindings => Bindings},
+                        Req1#{bindings => Bindings},
                         Metadata,
                         ReqStart
                     );
-                true ->
+                too_large ->
                     ok = Worker:send_buffered(
                         Conn,
                         StreamId,
@@ -88,15 +88,22 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
             ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, 404, buffered)
     end.
 
-%% Whether the body is over its route's own `max_content_length`. The
-%% connection holds a body to the listener's cap, raised to the route's
-%% when a body outgrows it, so only a route cap tighter than the
-%% listener's is left to check here, once the request is routed.
--spec over_route_cap(roadrunner_router:limits(), roadrunner_req:request()) -> boolean().
-over_route_cap(#{max_content_length := Max}, #{body := Body}) ->
-    iolist_size(Body) > Max;
-over_route_cap(_Limits, _Req) ->
-    false.
+%% The request held to its route's own `max_content_length`, or `too_large`.
+%% The connection holds a buffered body to the listener's cap, raised to the
+%% route's when a body outgrows it, so only a route cap tighter than the
+%% listener's is left to check on one here, once the request is routed. A
+%% body read in manual mode is held to the route's cap as it is read.
+-spec route_body(roadrunner_router:limits(), roadrunner_req:request()) ->
+    roadrunner_req:request() | too_large.
+route_body(#{max_content_length := Max}, #{body := Body} = Req) ->
+    case iolist_size(Body) > Max of
+        true -> too_large;
+        false -> Req
+    end;
+route_body(#{max_content_length := Max}, #{body_reader := Reader} = Req) ->
+    Req#{body_reader := Reader#{max := Max}};
+route_body(_Limits, Req) ->
+    Req.
 
 -spec invoke(
     module(),

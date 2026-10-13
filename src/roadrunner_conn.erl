@@ -61,6 +61,7 @@
     refine_conn_label/2,
     scheme/1,
     make_body_reader/5,
+    stream_body_reader/5,
     drain_body/1,
     keep_alive_decision/2,
     send_request_timeout/1,
@@ -81,6 +82,8 @@
     resolve_handler/2,
     body_cap/2,
     route_body_cap/3,
+    expect_answer/3,
+    with_client_ip/3,
     allow_header_value/1,
     response_status/1,
     final_response/3,
@@ -854,6 +857,54 @@ route_body_cap({router, ListenerName}, Headers, Default) ->
 route_body_cap({handler, _Mod, _Pipeline, _State}, _Headers, Default) ->
     Default.
 
+%% How an HTTP/2 or HTTP/3 request whose body is still to come is answered
+%% for its `Expect` field (RFC 9110 §10.1.1, HTTP/2 and HTTP/3 being "HTTP/1.1
+%% or later"): `too_large` when it expects `100-continue` with a declared
+%% `content-length` already over its route's body cap, the 413 its body would
+%% earn anyway (the route looked up only then); `continue` when it otherwise
+%% expects `100-continue`, the 100
+%% that asks for the body; `none` when it expects nothing. HTTP/1.1 decides
+%% from the request's framing instead (`roadrunner_conn_loop:continue/4`).
+-doc false.
+-spec expect_answer(proto_opts(), roadrunner_http:headers(), non_neg_integer()) ->
+    none | continue | too_large.
+expect_answer(ProtoOpts, Headers, MaxCL) ->
+    case lists:keyfind(~"expect", 1, Headers) of
+        {_, Expect} ->
+            case
+                roadrunner_bin:ascii_lowercase(Expect) =:= ~"100-continue" andalso
+                    roadrunner_http:request_content_length(Headers)
+            of
+                {ok, Declared} ->
+                    #{dispatch := Dispatch} = ProtoOpts,
+                    case Declared > route_body_cap(Dispatch, Headers, MaxCL) of
+                        true -> too_large;
+                        false -> continue
+                    end;
+                false ->
+                    none;
+                _ ->
+                    continue
+            end;
+        false ->
+            none
+    end.
+
+%% A request with its client's address (`client_ip`) when its connection is
+%% from a trusted proxy (`RealIp`, `roadrunner_real_ip:peer_trust/2`),
+%% resolved from the request's forwarding header; `undefined` trust, the
+%% common case, leaves the request as it is.
+-doc false.
+-spec with_client_ip(
+    roadrunner_req:request(),
+    undefined | roadrunner_real_ip:config(),
+    {inet:ip_address(), inet:port_number()} | undefined
+) -> roadrunner_req:request().
+with_client_ip(Req, undefined, _Peer) ->
+    Req;
+with_client_ip(#{headers := Headers} = Req, RealIp, {PeerIP, _Port}) ->
+    Req#{client_ip => roadrunner_real_ip:resolve(RealIp, PeerIP, Headers)}.
+
 %% The `Allow` header value for a `405`, built from the methods
 %% `roadrunner_router:match/3` reports as accepted on the path. Flattened here
 %% because the HPACK and QPACK encoders size header values with `byte_size/1`,
@@ -938,6 +989,47 @@ make_body_reader(Framing, Buffered, Recv, Max, TrailerLimits) ->
         max => Max,
         trailer_limits => TrailerLimits
     }.
+
+%% The body reader of an HTTP/2 request in manual body mode: its DATA is
+%% delimited by the stream, so the reader pulls what the connection has
+%% received through `recv` (`stream_recv/3`) until the stream's end, held to
+%% `Max` bytes. A request whose stream already ended with its headers has no
+%% body to pull (`Done`).
+-doc false.
+-spec stream_body_reader(pid(), pos_integer(), integer(), non_neg_integer(), boolean()) ->
+    roadrunner_req:body_reader().
+stream_body_reader(Conn, StreamId, Deadline, Max, Done) ->
+    #{
+        framing => stream,
+        buffered => <<>>,
+        bytes_read => 0,
+        done => Done,
+        recv => stream_recv(Conn, StreamId, Deadline),
+        max => Max
+    }.
+
+%% The recv of a stream body reader, run in the worker that reads the body:
+%% ask the connection for the stream's next DATA and wait for it, until the
+%% request's `Deadline`. The connection answers with what it holds, or with
+%% the next DATA to arrive, and `Fin` once the stream has ended; a stream it
+%% no longer has, or a connection that goes away, ends the read.
+-spec stream_recv(pid(), pos_integer(), integer()) ->
+    fun(() -> {ok, iodata(), boolean()} | {error, term()}).
+stream_recv(Conn, StreamId, Deadline) ->
+    fun() ->
+        MRef = monitor(process, Conn),
+        Conn ! {roadrunner_body_demand, self(), StreamId},
+        Timeout = max(0, Deadline - erlang:monotonic_time(millisecond)),
+        Result =
+            receive
+                {roadrunner_body, StreamId, Data, Fin} -> {ok, Data, Fin};
+                {roadrunner_body_error, StreamId, Reason} -> {error, Reason};
+                {'DOWN', MRef, process, Conn, _} -> {error, closed}
+            after Timeout -> {error, request_timeout}
+            end,
+        true = demonitor(MRef, [flush]),
+        Result
+    end.
 
 -doc false.
 -spec body_framing(roadrunner_req:request()) ->
@@ -1106,6 +1198,12 @@ consume_body_reader(#{continue := {Socket, Deadline, MinRate}} = BS, Mode) ->
     ok = send_continue(Socket),
     Recv = make_recv(Socket, Deadline, MinRate),
     consume_body_reader(maps:remove(continue, BS#{recv := Recv}), Mode);
+consume_body_reader(#{framing := stream} = BS, all) ->
+    stream_collect(BS, infinity, [], 0);
+consume_body_reader(#{framing := stream} = BS, {length, N}) ->
+    stream_collect(BS, N, [], 0);
+consume_body_reader(#{framing := stream} = BS, next_chunk) ->
+    stream_next(BS);
 consume_body_reader(#{framing := none} = BS, _Mode) ->
     %% Per RFC 9112 §6.3: no framing means the body is empty.
     %% Any `buffered` bytes are pipelined-next-request leftovers —
@@ -1163,6 +1261,78 @@ consume_body_reader(#{framing := chunked} = BS, next_chunk) ->
 %% Non-chunked framing (none, content_length) is handled by the
 %% earlier clauses above — `next_chunk` is treated as a full drain
 %% inside those, since there are no chunk boundaries to honor.
+
+%% Gather up to `Want` bytes of a stream body (`infinity`: all of them),
+%% the bytes an earlier length-bounded read left in `buffered` first, then
+%% more from the connection. `Acc` holds what is gathered, `Got` its size.
+%% The result is `ok` once the body has ended with nothing left over, else
+%% `more`.
+-spec stream_collect(
+    roadrunner_req:body_reader(), infinity | non_neg_integer(), iodata(), non_neg_integer()
+) ->
+    {ok, iodata(), roadrunner_req:body_reader()}
+    | {more, iodata(), roadrunner_req:body_reader()}
+    | {error, term()}.
+stream_collect(#{buffered := Buf, done := Done} = BS, Want, Acc, Got) ->
+    Size = iolist_size(Buf),
+    case Want of
+        infinity when Done ->
+            {ok, [Acc, Buf], BS#{buffered := <<>>}};
+        _ when is_integer(Want), Got + Size >= Want ->
+            Take = Want - Got,
+            <<Head:Take/binary, Rest/binary>> = iolist_to_binary(Buf),
+            Status =
+                case Done andalso Rest =:= <<>> of
+                    true -> ok;
+                    false -> more
+                end,
+            {Status, [Acc, Head], BS#{buffered := Rest}};
+        _ when Done ->
+            {ok, [Acc, Buf], BS#{buffered := <<>>}};
+        _ ->
+            case stream_pull(BS) of
+                {ok, BS1} -> stream_collect(BS1, Want, [Acc, Buf], Got + Size);
+                {error, _} = E -> E
+            end
+    end.
+
+%% The next piece of a stream body: what an earlier read left over, else the
+%% next DATA the connection hands over.
+-spec stream_next(roadrunner_req:body_reader()) ->
+    {ok, iodata(), roadrunner_req:body_reader()}
+    | {more, iodata(), roadrunner_req:body_reader()}
+    | {error, term()}.
+stream_next(#{buffered := Buf, done := Done} = BS) ->
+    case iolist_size(Buf) of
+        0 when Done ->
+            {ok, <<>>, BS};
+        0 ->
+            case stream_pull(BS#{buffered := <<>>}) of
+                {ok, BS1} -> stream_next(BS1);
+                {error, _} = E -> E
+            end;
+        _ when Done ->
+            {ok, Buf, BS#{buffered := <<>>}};
+        _ ->
+            {more, Buf, BS#{buffered := <<>>}}
+    end.
+
+%% One round with the connection: its DATA becomes `buffered` (empty
+%% before), held to the reader's `max`.
+-spec stream_pull(roadrunner_req:body_reader()) ->
+    {ok, roadrunner_req:body_reader()} | {error, term()}.
+stream_pull(#{recv := Recv, bytes_read := Read, max := Max} = BS) ->
+    case Recv() of
+        {ok, Data, Fin} ->
+            case Read + iolist_size(Data) of
+                Total when Total > Max ->
+                    {error, content_length_too_large};
+                Total ->
+                    {ok, BS#{buffered := Data, bytes_read := Total, done := Fin}}
+            end;
+        {error, _} = E ->
+            E
+    end.
 
 %% Pull decoded chunked-body bytes out of `BS` until either `Want`
 %% bytes are collected or the body is fully drained. `Want` is either

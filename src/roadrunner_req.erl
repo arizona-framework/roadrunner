@@ -147,12 +147,29 @@ Body-read envelope attached to the request in `body_buffering =>
 manual` mode. `read_body/1,2` consumes from it; the conn owns the
 recv closure and tracks how much remains.
 
+On HTTP/1.1 the reader parses the body's framing off the socket.
 `pending` holds decoded body bytes that have been parsed off the
 wire but not yet handed to the caller — used for chunked framing
 to absorb a chunk's payload across multiple length-bounded calls.
 `done` flips true once the size-0 last chunk is parsed.
+
+On HTTP/2 (`framing => stream`) the request's DATA is delimited by the
+stream itself: the recv closure asks the connection for what has arrived,
+`buffered` keeps what a length-bounded read left over, and `done` flips
+true with the stream's end.
 """.
--type body_reader() :: #{
+-type body_reader() :: h1_body_reader() | stream_body_reader().
+
+-type stream_body_reader() :: #{
+    framing := stream,
+    buffered := iodata(),
+    bytes_read := non_neg_integer(),
+    done := boolean(),
+    recv := fun(() -> {ok, iodata(), boolean()} | {error, term()}),
+    max := non_neg_integer()
+}.
+
+-type h1_body_reader() :: #{
     framing := none | chunked | {content_length, non_neg_integer()},
     buffered := binary(),
     bytes_read := non_neg_integer(),
@@ -164,9 +181,10 @@ to absorb a chunk's payload across multiple length-bounded calls.
     %% max_header_count}` threaded to `roadrunner_http1:parse_chunk/2`.
     trailer_limits := {pos_integer(), pos_integer(), pos_integer()},
     %% Present while a 100 Continue is owed to a client holding its body
-    %% back: the socket the first read sends it on, and the request deadline
-    %% and minimum byte rate of the recv that read then starts.
-    continue => {roadrunner_transport:socket(), integer(), non_neg_integer()}
+    %% back: the transport socket the first read sends it on, and the
+    %% request deadline and minimum byte rate of the recv that read then
+    %% starts.
+    continue => {term(), integer(), non_neg_integer()}
 }.
 
 -export([
@@ -386,8 +404,9 @@ body-buffering modes:
 - **auto** (default): the conn already buffered the body before
   invoking the handler — this returns the buffered bytes unchanged.
   `Req` is returned as-is.
-- **manual**: the conn parked the body on the socket. This drains it
-  and returns the bytes. The returned `Req2` carries the updated
+- **manual**: the conn parked the body on the socket (on HTTP/2, the
+  stream holds what has arrived, its flow-control window refilled only
+  as the handler reads). This drains it and returns the bytes. The returned `Req2` carries the updated
   body-read state — to enable keep-alive on the same connection in
   manual mode, hand `Req2` back as the second element of the handler's
   `{Response, Req2}` return so the conn can drain whatever the handler
