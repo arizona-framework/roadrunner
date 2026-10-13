@@ -103,7 +103,8 @@ cidrs([Cidr | Rest], V4, V6) ->
 %% A `/0` prefix is refused: it would trust every hop, including the ones a
 %% client writes itself, which is what `trusted_hops` is for. An IPv4-mapped
 %% IPv6 range covers the IPv4 range it maps, since peers and hops are
-%% unmapped before matching.
+%% unmapped before matching, so a mapped `/96`, all of IPv4, is refused as
+%% `0.0.0.0/0` is.
 -spec cidr(term()) -> {v4, cidr4()} | {v6, cidr6()} | error.
 cidr(Cidr) when is_binary(Cidr) ->
     {Addr, Len} =
@@ -115,7 +116,7 @@ cidr(Cidr) when is_binary(Cidr) ->
         {ok, {_, _, _, _} = IP} ->
             cidr4(IP, Len);
         {ok, {0, 0, 0, 0, 0, 16#FFFF, _, _} = IP} when Len =:= host -> cidr4(unmap(IP), host);
-        {ok, {0, 0, 0, 0, 0, 16#FFFF, _, _} = IP} when is_integer(Len), Len > 96 ->
+        {ok, {0, 0, 0, 0, 0, 16#FFFF, _, _} = IP} when is_integer(Len), Len >= 96 ->
             cidr4(unmap(IP), Len - 96);
         {ok, IP} ->
             cidr6(IP, Len);

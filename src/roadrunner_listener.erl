@@ -351,8 +351,9 @@ ops-tuning rationale.
     %% balancers, CDNs, ingress controllers) that pass it in a forwarding
     %% header. Exactly one trust mode: `trusted_proxies` lists the proxies'
     %% addresses as CIDR binaries (`~"10.0.0.0/8"`, `~"2001:db8::/32"`, or a
-    %% bare address for one host; `/0` is refused, as it would trust hops a
-    %% client writes), or `trusted_hops => N` trusts the `N` nearest hops
+    %% bare address for one host; `/0`, or `::ffff:0.0.0.0/96` for all of
+    %% IPv4, is refused, as it would trust hops a client writes), or
+    %% `trusted_hops => N` trusts the `N` nearest hops
     %% whatever their address, for platforms that don't publish their proxy
     %% addresses. `header` reads `x_forwarded_for` (the default) or
     %% `forwarded` (RFC 7239). Starting from the socket peer, the chain is read
