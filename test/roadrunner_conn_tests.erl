@@ -327,6 +327,22 @@ expects_continue_without_cached_decisions_uses_header_test() ->
 expects_continue_without_cached_decisions_no_expect_test() ->
     ?assertNot(roadrunner_conn:expects_continue(req_with_headers([]))).
 
+expects_continue_ignores_http10_test() ->
+    %% RFC 9110 §10.1.1, §15.2: an HTTP/1.0 client's expectation is
+    %% ignored and it never gets a 1xx, whether or not the parser cached
+    %% the decision.
+    Req = req_v10([{~"expect", ~"100-continue"}]),
+    ?assertNot(roadrunner_conn:expects_continue(Req)),
+    ?assertNot(
+        roadrunner_conn:expects_continue(Req#{cached_decisions => #{expects_continue => true}})
+    ).
+
+expects_continue_from_cached_decisions_test() ->
+    Req = req_with_headers([]),
+    ?assert(
+        roadrunner_conn:expects_continue(Req#{cached_decisions => #{expects_continue => true}})
+    ).
+
 send_continue_writes_interim_response_test() ->
     %% A fake socket that records send calls.
     Self = self(),

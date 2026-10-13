@@ -818,9 +818,14 @@ send_continue(Socket) ->
     _ = roadrunner_transport:send(Socket, ~"HTTP/1.1 100 Continue\r\n\r\n"),
     ok.
 
-%% Whether the request carries `Expect: 100-continue`.
+%% Whether the request carries an `Expect: 100-continue` the server
+%% answers with the interim 100. Never for HTTP/1.0: RFC 9110 §10.1.1
+%% ignores an HTTP/1.0 client's expectation, and §15.2 forbids sending it
+%% a 1xx response.
 -doc false.
 -spec expects_continue(roadrunner_req:request()) -> boolean().
+expects_continue(#{version := {1, 0}}) ->
+    false;
 expects_continue(#{cached_decisions := #{expects_continue := EC}}) ->
     EC;
 expects_continue(Req) ->
