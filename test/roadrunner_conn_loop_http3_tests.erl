@@ -30,6 +30,7 @@ new_request_stream_test() ->
         #{
             buf => <<>>,
             header_block => undefined,
+            headers => undefined,
             body => [],
             body_len => 0,
             frame_state => expecting_headers
