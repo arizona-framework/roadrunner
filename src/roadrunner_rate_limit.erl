@@ -11,7 +11,7 @@
 %% ETS bucket store in `roadrunner_conn`) derives `Cost` and the cap; this
 %% module is socket- and state-free so the bucket math is exhaustively testable.
 
--export([refill/5, spend/2, retry_after_secs/3]).
+-export([refill/5, spend/2, retry_after_secs/3, full_at/4]).
 
 -define(MILLI, 1000).
 
@@ -41,6 +41,15 @@ spend(_Units, _Cost) -> denied.
 retry_after_secs(Units, Rate, Cost) ->
     DeficitMs = ceil_div(Cost - Units, Rate),
     max(1, ceil_div(DeficitMs, ?MILLI)).
+
+%% When a bucket holding `Units` at `NowMs` is full again, refilling `Rate`
+%% units a millisecond up to `Cap`, rounded up. A full bucket is the same as
+%% none (a never-seen client starts full), so from then on it can be dropped
+%% without giving its client anything back.
+-doc false.
+-spec full_at(integer(), integer(), pos_integer(), pos_integer()) -> integer().
+full_at(Units, NowMs, Rate, Cap) ->
+    NowMs + ceil_div(Cap - Units, Rate).
 
 %% Integer ceiling division (non-negative numerator, positive divisor).
 -spec ceil_div(non_neg_integer(), pos_integer()) -> non_neg_integer().

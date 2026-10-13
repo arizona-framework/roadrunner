@@ -57,3 +57,16 @@ retry_after_partial_deficit_test() ->
 
 retry_after_never_below_one_test() ->
     ?assertEqual(1, ?M:retry_after_secs(999, 1000, 1000)).
+
+%% --- full_at/4 ---
+
+full_at_full_bucket_is_now_test() ->
+    ?assertEqual(1000, ?M:full_at(2000, 1000, 2, 2000)).
+
+full_at_refill_time_test() ->
+    %% 2000 units short at 2 units/ms: full 1000ms later.
+    ?assertEqual(2000, ?M:full_at(0, 1000, 2, 2000)).
+
+full_at_rounds_up_test() ->
+    %% 1 unit short at 2 units/ms is half a millisecond: never early.
+    ?assertEqual(1001, ?M:full_at(1999, 1000, 2, 2000)).

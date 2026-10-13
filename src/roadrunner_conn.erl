@@ -72,6 +72,9 @@
     rate_limit_check/6,
     resolve_rate_limit/2,
     rate_limit_key/2,
+    route_rate_limit/2,
+    route_rate_limit_check/6,
+    route_rate_limit_evict/2,
     throttled_telemetry/3,
     rate_limit_evict_idle/3,
     drain_oversized_body/3,
@@ -470,6 +473,76 @@ rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) ->
             true = ets:insert(Table, {IP, Remaining, NowMs}),
             allow
     end.
+
+%% A request to a route with its own `rate_limit`: `allow`, or
+%% `{deny, RetryAfterSecs}` with the refusal counted and reported like the
+%% listener's. Its client (`roadrunner_req:client_ip/1`, the peer unless
+%% `real_ip` resolved one) has a bucket per route in the listener's route
+%% bucket store, which the listener publishes before any route that needs it.
+%% A request without a client address is not limited, as with the listener's.
+-doc false.
+-spec route_rate_limit(roadrunner_router:limits(), roadrunner_req:request()) ->
+    allow | {deny, pos_integer()}.
+route_rate_limit(#{rate_limit := RateLimit}, #{listener_name := Name} = Req) ->
+    route_rate_limit(RateLimit, Name, roadrunner_req:client_ip(Req));
+route_rate_limit(_Limits, _Req) ->
+    allow.
+
+-spec route_rate_limit(
+    {pos_integer(), pos_integer(), pos_integer(), term()},
+    atom(),
+    inet:ip_address() | undefined
+) -> allow | {deny, pos_integer()}.
+route_rate_limit(_RateLimit, _Name, undefined) ->
+    allow;
+route_rate_limit({Rate, Cap, Cost, RouteKey}, Name, IP) ->
+    {Table, Counter} = persistent_term:get({roadrunner_route_rate_limit, Name}),
+    NowMs = erlang:monotonic_time(millisecond),
+    maybe
+        {deny, _} = Deny ?= route_rate_limit_check(Table, {RouteKey, IP}, Rate, Cap, Cost, NowMs),
+        ok = throttled_telemetry(Name, Counter, rate_limit),
+        Deny
+    end.
+
+-doc """
+The token-bucket check of `rate_limit_check/6` for one route bucket, keyed
+on `Key` (the route and the client address). Each row also keeps when the
+bucket is full again (`roadrunner_rate_limit:full_at/4`), so
+`route_rate_limit_evict/2` drops only buckets that are full, which a client
+cannot tell from no bucket at all, whatever the route's rate.
+""".
+-spec route_rate_limit_check(
+    ets:table(), term(), pos_integer(), pos_integer(), pos_integer(), integer()
+) ->
+    allow | {deny, pos_integer()}.
+route_rate_limit_check(Table, Key, Rate, Cap, Cost, NowMs) ->
+    Refilled =
+        case ets:lookup(Table, Key) of
+            [{Key, Units, LastMs, _FullMs}] ->
+                roadrunner_rate_limit:refill(Units, LastMs, NowMs, Rate, Cap);
+            [] ->
+                Cap
+        end,
+    case roadrunner_rate_limit:spend(Refilled, Cost) of
+        denied ->
+            FullMs = roadrunner_rate_limit:full_at(Refilled, NowMs, Rate, Cap),
+            true = ets:insert(Table, {Key, Refilled, NowMs, FullMs}),
+            {deny, roadrunner_rate_limit:retry_after_secs(Refilled, Rate, Cost)};
+        Remaining ->
+            FullMs = roadrunner_rate_limit:full_at(Remaining, NowMs, Rate, Cap),
+            true = ets:insert(Table, {Key, Remaining, NowMs, FullMs}),
+            allow
+    end.
+
+-doc """
+Drop every route bucket that is full again by `NowMs`, in one
+`select_delete` pass, returning the number dropped. Run by the listener on a
+timer, off the request path.
+""".
+-spec route_rate_limit_evict(ets:table(), integer()) -> non_neg_integer().
+route_rate_limit_evict(Table, NowMs) ->
+    %% Row is `{Key, Units, LastMs, FullMs}`.
+    ets:select_delete(Table, [{{'_', '_', '_', '$1'}, [{'=<', '$1', NowMs}], [true]}]).
 
 -doc """
 Record a throttled request, refused for `Reason` (the per-peer rate limit
