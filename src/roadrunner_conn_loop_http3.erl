@@ -401,26 +401,11 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
                         false -> await_body(State1, StreamId, Stream0, Stream1)
                     end;
                 too_large ->
-                    refuse_too_large(State, StreamId, Stream0);
+                    refuse_request(State, StreamId, Stream0, Fin, 413, ~"Payload Too Large");
                 headers_too_large ->
-                    ok = roadrunner_http3_stream_worker:send_buffered(
-                        State#h3.conn,
-                        StreamId,
-                        431,
-                        [{~"content-type", ~"text/plain"}],
-                        ~"Request Header Fields Too Large"
-                    ),
-                    _ = roadrunner_quic:stop_sending(State#h3.conn, StreamId, ?H3_NO_ERROR),
-                    State#h3{
-                        streams = Streams#{
-                            StreamId => Stream0#{
-                                frame_state := discarding,
-                                buf := <<>>,
-                                body := [],
-                                body_len := 0
-                            }
-                        }
-                    };
+                    refuse_request(
+                        State, StreamId, Stream0, Fin, 431, ~"Request Header Fields Too Large"
+                    );
                 {conn_error, _, _} = ConnError ->
                     ConnError
             end
@@ -473,8 +458,12 @@ answer_expectation(State, StreamId, Stream0, Headers) ->
                 {ok, Declared} ->
                     #h3{proto_opts = #{dispatch := Dispatch}, max_content_length = MaxLen} = State,
                     case Declared > roadrunner_conn:route_body_cap(Dispatch, Headers, MaxLen) of
-                        true -> refuse_too_large(State, StreamId, Stream0);
-                        false -> send_continue(State, StreamId)
+                        true ->
+                            refuse_request(
+                                State, StreamId, Stream0, false, 413, ~"Payload Too Large"
+                            );
+                        false ->
+                            send_continue(State, StreamId)
                     end;
                 false ->
                     State;
@@ -495,25 +484,36 @@ send_continue(State, StreamId) ->
     _ = roadrunner_quic:send_data(State#h3.conn, StreamId, Continue, false),
     State.
 
-%% Answer 413 to a request over its body cap, ask the client to
-%% stop sending, and mark the stream `discarding` so residual body is
-%% dropped rather than mistaken for a new request.
--spec refuse_too_large(#h3{}, non_neg_integer(), map()) -> #h3{}.
-refuse_too_large(#h3{conn = Conn, streams = Streams} = State, StreamId, Stream0) ->
+%% Answer a request refused before dispatch: 413 for a body over its cap,
+%% 431 for an oversized field section. A client still sending (no FIN yet)
+%% is asked to stop, and the stream is marked `discarding` so residual body
+%% is dropped rather than mistaken for a new request; its FIN or reset frees
+%% the marker. When the FIN came with this chunk, nothing more arrives on
+%% the stream, so it is dropped now: a marker would never be freed, and
+%% would hold a graceful drain open until its deadline.
+-spec refuse_request(
+    #h3{}, non_neg_integer(), map(), boolean(), roadrunner_http:status(), binary()
+) -> #h3{}.
+refuse_request(#h3{conn = Conn, streams = Streams} = State, StreamId, Stream0, Fin, Status, Body) ->
     ok = roadrunner_http3_stream_worker:send_buffered(
-        Conn, StreamId, 413, [{~"content-type", ~"text/plain"}], ~"Payload Too Large"
+        Conn, StreamId, Status, [{~"content-type", ~"text/plain"}], Body
     ),
-    _ = roadrunner_quic:stop_sending(Conn, StreamId, ?H3_NO_ERROR),
-    State#h3{
-        streams = Streams#{
-            StreamId => Stream0#{
-                frame_state := discarding,
-                buf := <<>>,
-                body := [],
-                body_len := 0
+    case Fin of
+        true ->
+            drop_stream(State, StreamId);
+        false ->
+            _ = roadrunner_quic:stop_sending(Conn, StreamId, ?H3_NO_ERROR),
+            State#h3{
+                streams = Streams#{
+                    StreamId => Stream0#{
+                        frame_state := discarding,
+                        buf := <<>>,
+                        body := [],
+                        body_len := 0
+                    }
+                }
             }
-        }
-    }.
+    end.
 
 %% Advance a peer-initiated unidirectional stream by one chunk. The
 %% per-stream and connection-wide critical-role state lives in the `#h3`
