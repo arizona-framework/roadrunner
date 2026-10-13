@@ -36,7 +36,14 @@
 %% / sent times / the oldest unacknowledged frames, a separate follow-up.
 
 -export([
-    new/2, handle_datagram/3, handle_timeout/3, handle_call/5, handle_send/7, peername/1, phase/1
+    new/2,
+    handle_datagram/3,
+    handle_timeout/3,
+    handle_call/5,
+    handle_send/7,
+    handle_consumed/4,
+    peername/1,
+    phase/1
 ]).
 %% Exported for direct eunit branch coverage of the idle-timeout negotiation.
 -export([negotiated_idle_timeout/2]).
@@ -134,6 +141,13 @@
     uni_opened = 0 :: non_neg_integer(),
     %% Connection-level flow control (RFC 9000 §4).
     conn_flow :: roadrunner_quic_flow:t(),
+    %% When a request stream's receive credit is granted back: as its data
+    %% arrives (`on_receipt`), or as the owner consumes it (`on_read`,
+    %% `handle_consumed/4`), so a request body is held to one window past
+    %% what its reader has read. Connection-level credit is always granted on
+    %% receipt, so one slow reader never stalls the connection's other
+    %% streams.
+    stream_credit = on_receipt :: on_receipt | on_read,
     %% Connection-wide congestion control (RFC 9002 §7): bounds the bytes in
     %% flight across all spaces by the congestion window, grown on ACK and halved
     %% on loss.
@@ -178,7 +192,8 @@
     transport_params := roadrunner_quic_transport_params:params(),
     eph_pub := binary(),
     eph_priv := binary(),
-    server_random := binary()
+    server_random := binary(),
+    stream_credit => on_receipt | on_read
 }.
 
 %% A monotonic-clock millisecond, the same epoch `erlang:monotonic_time/1`
@@ -235,7 +250,7 @@ new(
         eph_pub := EphPub,
         eph_priv := EphPriv,
         server_random := ServerRandom
-    },
+    } = Config,
     Now
 ) ->
     Tls = roadrunner_quic_tls_server:new(#{
@@ -282,6 +297,7 @@ new(
         max_streams_bidi = MaxStreamsBidi,
         max_streams_uni = MaxStreamsUni,
         conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ConnMaxData}),
+        stream_credit = maps:get(stream_credit, Config, on_receipt),
         cc = roadrunner_quic_cc_newreno:new(),
         idle_timeout = IdleTimeout,
         idle_deadline = Now + IdleTimeout
@@ -459,6 +475,23 @@ handle_call(From, Ref, {close, ErrorCode}, Now, State) ->
 handle_call(From, Ref, {close, ErrorCode, Reason}, Now, State) ->
     {State1, CloseEffects} = owner_close(ErrorCode, Reason, Now, State),
     {State1, [{reply, From, Ref, ok} | CloseEffects]}.
+
+-doc """
+The owner consumed `Bytes` of a request stream whose credit it holds
+(`stream_credit => on_read`): count them, and once enough of the stream's
+window is consumed grant the peer a fresh MAX_STREAM_DATA and flush it. A
+stream already gone (ended, pruned, reset) has no credit left to grant.
+""".
+-spec handle_consumed(non_neg_integer(), non_neg_integer(), integer(), t()) -> {t(), [effect()]}.
+handle_consumed(Sid, Bytes, Now, #state{streams = Streams} = State) ->
+    case Streams of
+        #{Sid := {Stream, Flow}} ->
+            Consumed = roadrunner_quic_flow:on_data_consumed(Bytes, Flow),
+            {Flow1, State1} = grant_stream_credit(Sid, Consumed, State),
+            send_pass(Now, put_stream(Sid, Stream, Flow1, State1));
+        #{} ->
+            {State, []}
+    end.
 
 %% The owner closes the connection (RFC 9000 §10.2.2): send one application
 %% CONNECTION_CLOSE (0x1d, carrying the h3 error code and reason phrase) at the
@@ -1165,13 +1198,27 @@ opened_before(Sid, #state{uni_opened = Opened}) ->
 %% and announce it with {stream_opened, Sid}.
 -spec open_stream(non_neg_integer(), t()) ->
     {ok, roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()}.
-open_stream(Sid, #state{info = #{transport_params := TP}, peer_params = PeerParams} = State) ->
+open_stream(
+    Sid,
+    #state{info = #{transport_params := TP}, peer_params = PeerParams, stream_credit = Credit} =
+        State
+) ->
     Stream = roadrunner_quic_stream:new(),
     Flow = roadrunner_quic_flow:new(#{
         initial_max_data => stream_recv_window(Sid, TP),
         peer_initial_max_data => peer_stream_send_window(Sid, PeerParams)
     }),
-    {ok, Stream, Flow, emit({stream_opened, Sid}, bump_opened(Sid, State))}.
+    {ok, Stream, request_flow(Sid, Credit, Flow),
+        emit({stream_opened, Sid}, bump_opened(Sid, State))}.
+
+%% A client request stream (bidirectional) under `stream_credit => on_read`
+%% grants its credit as the owner consumes its data.
+-spec request_flow(non_neg_integer(), on_receipt | on_read, roadrunner_quic_flow:t()) ->
+    roadrunner_quic_flow:t().
+request_flow(Sid, on_read, Flow) when Sid rem 4 =:= 0 ->
+    roadrunner_quic_flow:hold(Flow);
+request_flow(_Sid, _Credit, Flow) ->
+    Flow.
 
 %% The send window for a stream the server writes to: the limit the client
 %% advertised for that stream type (RFC 9000 §18.2; absent -> 0). A

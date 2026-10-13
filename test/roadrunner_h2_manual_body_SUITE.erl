@@ -2,7 +2,7 @@
 -moduledoc """
 Manual body mode over HTTP/2 (h2c): the worker starts at the end of the
 headers and reads the body as DATA arrives, the stream's receive window
-refilled only as it reads. The handler is `roadrunner_h2_manual_handler`;
+refilled only as it reads. The handler is `roadrunner_manual_body_handler`;
 each route's state picks what it does with the body.
 """.
 
@@ -33,7 +33,7 @@ each route's state picks what it does with the body.
     body_after_the_answer_is_dropped/1
 ]).
 
--define(H, roadrunner_h2_manual_handler).
+-define(H, roadrunner_manual_body_handler).
 -define(GATED, roadrunner_h2_manual_gated).
 
 suite() ->

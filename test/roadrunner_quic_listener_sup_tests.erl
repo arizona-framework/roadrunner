@@ -91,3 +91,10 @@ pool_opts(PoolSize) ->
         connection_handler => fun(_ConnPid) -> {ok, self()} end,
         pool_size => PoolSize
     }.
+
+%% `stream_credit` reaches the listener only when the pool was given one.
+listener_opts_stream_credit_test() ->
+    Registry = ?REG:new(),
+    ?assertNot(maps:is_key(stream_credit, ?M:listener_opts(0, pool_opts(0), Registry, false))),
+    Opts = ?M:listener_opts(0, (pool_opts(0))#{stream_credit => on_read}, Registry, false),
+    ?assertEqual(on_read, maps:get(stream_credit, Opts)).

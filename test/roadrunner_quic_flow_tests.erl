@@ -70,3 +70,18 @@ grant_extends_window_test() ->
     ?assertEqual(1300, NewMax),
     ?assertEqual(1000, ?M:recv_window(Flow2)),
     ?assertNot(?M:should_send_max_data(Flow2)).
+
+%% =============================================================================
+%% Held receive side: credit follows what the owner consumed.
+%% =============================================================================
+
+held_window_grants_on_consumption_test() ->
+    %% Received bytes alone grant nothing; consumed ones count instead.
+    Flow = ?M:hold(?M:new(#{initial_max_data => 1000})),
+    {ok, Received} = ?M:on_data_received(600, Flow),
+    ?assertNot(?M:should_send_max_data(Received)),
+    Consumed = ?M:on_data_consumed(300, Received),
+    ?assert(?M:should_send_max_data(Consumed)),
+    {NewMax, Granted} = ?M:grant_max_data(Consumed),
+    ?assertEqual(1300, NewMax),
+    ?assertNot(?M:should_send_max_data(Granted)).

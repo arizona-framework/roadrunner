@@ -86,6 +86,12 @@ loop(State) ->
                 From, Ref, Sid, IoData, Fin, Now, State#shell.conn
             ),
             continue(perform(Effects, Now, State#shell{conn = Conn}));
+        {quic_consumed, Sid, Bytes} ->
+            Now = erlang:monotonic_time(millisecond),
+            {Conn, Effects} = roadrunner_quic_conn_state:handle_consumed(
+                Sid, Bytes, Now, State#shell.conn
+            ),
+            continue(perform(Effects, Now, State#shell{conn = Conn}));
         {quic_datagram, _Peer, Datagram} ->
             Now = erlang:monotonic_time(millisecond),
             {Conn, Effects} = roadrunner_quic_conn_state:handle_datagram(

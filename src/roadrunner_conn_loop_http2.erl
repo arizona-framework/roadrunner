@@ -1269,7 +1269,7 @@ on_data(StreamId, Flags, Payload, FlowLen, #loop{streams = Streams} = State) ->
 body_over_cap(
     StreamId, #{reader := Reader, recv_window := RW} = Stream, NewLen, EndStream, FlowLen, State
 ) ->
-    ok = tell_reader(Reader, {roadrunner_body_error, StreamId, content_length_too_large}),
+    ok = roadrunner_conn:send_body_error(Reader, StreamId, content_length_too_large),
     Stream1 = Stream#{
         body := [],
         body_len := NewLen,
@@ -1314,7 +1314,7 @@ body_in(
 %% worker stays within one window, however slowly the worker reads.
 -spec deliver(#loop{}, stream_id(), map()) -> #loop{}.
 deliver(State, StreamId, #{reader := Reader, body := Body, end_stream_seen := Ended} = Stream) ->
-    _ = Reader ! {roadrunner_body, StreamId, Body, Ended},
+    ok = roadrunner_conn:send_body(Reader, StreamId, Body, Ended),
     State1 = update_stream(State, StreamId, Stream#{body := [], reader := undefined}),
     case Ended of
         true ->
@@ -1342,13 +1342,6 @@ ended_after_answer(#loop{streams = Streams} = State, StreamId) ->
             State
     end.
 
--spec tell_reader(pid() | undefined, term()) -> ok.
-tell_reader(undefined, _Msg) ->
-    ok;
-tell_reader(Reader, Msg) ->
-    _ = Reader ! Msg,
-    ok.
-
 %% The worker of a manual-mode stream asks for the body's next DATA
 %% (`roadrunner_conn:stream_body_reader/5`). The first ask sends a 100
 %% Continue the client is holding its body back for. It gets what has
@@ -1374,10 +1367,10 @@ handle_body_demand(#loop{streams = Streams} = State, Worker, StreamId) ->
                 false -> update_stream(State1, StreamId, Stream1#{reader := Worker})
             end;
         #{StreamId := #{reader := _, body_error := Reason}} when Reason =/= undefined ->
-            _ = Worker ! {roadrunner_body_error, StreamId, Reason},
+            ok = roadrunner_conn:send_body_error(Worker, StreamId, Reason),
             State;
         _ ->
-            _ = Worker ! {roadrunner_body_error, StreamId, closed},
+            ok = roadrunner_conn:send_body_error(Worker, StreamId, closed),
             State
     end.
 
@@ -1629,9 +1622,7 @@ request_body(_StreamId, {body, _Body}, Req, _State) ->
 request_body(
     StreamId, reader, Req, #loop{request_timeout = Timeout, max_content_length = MaxCL}
 ) ->
-    Deadline = erlang:monotonic_time(millisecond) + Timeout,
-    Reader = roadrunner_conn:stream_body_reader(self(), StreamId, Deadline, MaxCL, false),
-    (maps:remove(body, Req))#{body_reader => Reader}.
+    roadrunner_conn:with_body_reader(Req, StreamId, Timeout, MaxCL).
 
 %% =============================================================================
 %% Worker → conn message handlers
@@ -2113,7 +2104,7 @@ reset_stream(State0, StreamId) ->
     notify_pending_reset(StreamId, Pending),
     ok =
         case Stream of
-            #{reader := Reader} -> tell_reader(Reader, {roadrunner_body_error, StreamId, closed});
+            #{reader := Reader} -> roadrunner_conn:send_body_error(Reader, StreamId, closed);
             _ -> ok
         end,
     Refs1 =

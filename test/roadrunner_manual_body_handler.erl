@@ -1,7 +1,7 @@
--module(roadrunner_h2_manual_handler).
+-module(roadrunner_manual_body_handler).
 -moduledoc """
-Test fixture for manual body mode over HTTP/2. The route's state picks what
-the handler does with the body:
+Test fixture for manual body mode over HTTP/2 and HTTP/3. The route's state
+picks what the handler does with the body:
 
 - `read`: read it all and answer with its size (413 with the reason when
   the read fails)
@@ -11,6 +11,9 @@ the handler does with the body:
 - `{gated, Name}`: register as `Name`, wait for `go`, then `read`
 - `{report, Pid}`: read it and send `Pid` the outcome, `{read_result, _}`
 - `{gated_report, Name, Pid}`: `{gated, Name}`, then `{report, Pid}`
+- `{gated_pieces, Name, Pid}`: register as `Name`, wait for `go`, read
+  100000 bytes and send `Pid` `first_piece`, then read the rest and answer
+  with the total
 - `{answer_first, Name, Pid}`: stream a complete response, then try to read
   the body and send `Pid` the outcome, `{read_after_answer, _}`, then
   register as `Name` and wait for `go`
@@ -55,6 +58,16 @@ behave({gated_report, Name, Pid}, Req) ->
         go -> ok
     end,
     behave({report, Pid}, Req);
+behave({gated_pieces, Name, Pid}, Req) ->
+    true = register(Name, self()),
+    receive
+        go -> ok
+    end,
+    {more, First, Req1} = roadrunner_req:read_body(Req, #{length => 100000}),
+    Pid ! first_piece,
+    {ok, Rest, Req2} = roadrunner_req:read_body(Req1),
+    Total = iolist_size(First) + iolist_size(Rest),
+    {roadrunner_resp:text(200, integer_to_binary(Total)), Req2};
 behave({answer_first, Name, Pid}, Req) ->
     Fun = fun(Send) ->
         _ = Send(~"done", fin),

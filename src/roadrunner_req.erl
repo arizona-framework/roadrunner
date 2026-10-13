@@ -153,10 +153,10 @@ wire but not yet handed to the caller — used for chunked framing
 to absorb a chunk's payload across multiple length-bounded calls.
 `done` flips true once the size-0 last chunk is parsed.
 
-On HTTP/2 (`framing => stream`) the request's DATA is delimited by the
-stream itself: the recv closure asks the connection for what has arrived,
-`buffered` keeps what a length-bounded read left over, and `done` flips
-true with the stream's end.
+On HTTP/2 and HTTP/3 (`framing => stream`) the request's DATA is
+delimited by the stream itself: the recv closure asks the connection for
+what has arrived, `buffered` keeps what a length-bounded read left over,
+and `done` flips true with the stream's end.
 """.
 -type body_reader() :: h1_body_reader() | stream_body_reader().
 
@@ -404,9 +404,9 @@ body-buffering modes:
 - **auto** (default): the conn already buffered the body before
   invoking the handler — this returns the buffered bytes unchanged.
   `Req` is returned as-is.
-- **manual**: the conn parked the body on the socket (on HTTP/2, the
-  stream holds what has arrived, its flow-control window refilled only
-  as the handler reads). This drains it and returns the bytes. The returned `Req2` carries the updated
+- **manual**: the conn parked the body on the socket (on HTTP/2 and
+  HTTP/3, the stream holds what has arrived, its flow-control credit
+  given back only as the handler reads). This drains it and returns the bytes. The returned `Req2` carries the updated
   body-read state — to enable keep-alive on the same connection in
   manual mode, hand `Req2` back as the second element of the handler's
   `{Response, Req2}` return so the conn can drain whatever the handler

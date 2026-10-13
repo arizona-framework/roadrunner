@@ -235,11 +235,12 @@ Optional middleware and timing knobs (durations in milliseconds):
   body before invoking the handler) or `manual` (handler calls
   `roadrunner_req:read_body/1,2`; a client sending
   `Expect: 100-continue` is asked for its body only when the handler
-  first reads it). In manual mode an HTTP/2 handler runs as soon as the
-  headers are in, and a stream holds at most one flow-control window of
-  body it has not read; a handler that answers without reading the body
-  ends the client's upload with `RST_STREAM(NO_ERROR)`. HTTP/3 bodies are
-  buffered in either mode.
+  first reads it). In manual mode an HTTP/2 or HTTP/3 handler runs as
+  soon as the headers are in, and a stream holds at most one
+  flow-control window of body it has not read (its window, or its QUIC
+  stream credit, is given back only as the handler reads); a handler that
+  answers without reading the body ends the client's upload
+  (`RST_STREAM(NO_ERROR)` on HTTP/2, `STOP_SENDING` on HTTP/3).
 - `slot_reconciliation` — `#{interval := Ms}` (default 60000) for the
   periodic reaper that releases slots orphaned by brutal-kill exits,
   and with them the killed conns' rows in the drain registry, or
@@ -927,7 +928,10 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
                 alpn => [~"h3"],
                 max_streams_bidi => MaxStreamsBidi,
                 connection_handler => Handler,
-                pool_size => Listeners - 1
+                pool_size => Listeners - 1,
+                %% In manual body mode a request stream's credit is granted
+                %% as its handler reads the body, not as the body arrives.
+                stream_credit => stream_credit(ProtoOpts)
             },
             %% Bind the QUIC pool to the same interface as the TCP socket
             %% when `ip` is set, so an h3 listener honors loopback too.
@@ -940,6 +944,10 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
             ok = close_quic_probe(Probe),
             Res
     end.
+
+-spec stream_credit(roadrunner_conn:proto_opts()) -> on_receipt | on_read.
+stream_credit(#{body_buffering := manual}) -> on_read;
+stream_credit(_ProtoOpts) -> on_receipt.
 
 %% The pool is a supervisor, so it can only be `start_link`ed - which
 %% makes this gen_server its parent (the pool then lives as long as the

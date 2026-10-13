@@ -130,6 +130,10 @@
     %% or beyond it are refused. `undefined` means not draining.
     goaway_id = undefined :: non_neg_integer() | undefined,
     max_content_length :: non_neg_integer(),
+    %% `auto` buffers a request's body and dispatches at the stream's FIN;
+    %% `manual` dispatches at the end of the headers and hands the worker
+    %% the body as it reads (`dispatch_reading/4`). Read from proto_opts.
+    body_buffering = auto :: auto | manual,
     %% Cap on the encoded request field section (HEADERS block). Read from
     %% proto_opts at conn start; defaults to `?MAX_HEADER_BLOCK`.
     max_header_block = ?MAX_HEADER_BLOCK :: pos_integer(),
@@ -214,6 +218,7 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
         peer = Peer,
         start_mono = StartMono,
         max_content_length = MaxContentLength,
+        body_buffering = maps:get(body_buffering, ProtoOpts, auto),
         max_header_block = MaxHeaderBlock,
         %% Decoded-section cap defaults to 2x the (possibly overridden) encoded
         %% cap, so raising `max_header_block` lifts both gates together.
@@ -259,6 +264,8 @@ recv_loop(#h3{conn = Conn} = State) ->
             terminate(State);
         {'DOWN', MonRef, process, _Pid, Reason} ->
             loop(handle_worker_down(State, MonRef, Reason));
+        {roadrunner_body_demand, Worker, StreamId} ->
+            loop(handle_body_demand(State, Worker, StreamId));
         {roadrunner_slot, StreamId, Outcome} ->
             loop(handle_slot(State, StreamId, Outcome));
         {roadrunner_drain, _Deadline} ->
@@ -385,9 +392,14 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
             %% marker is freed when the client finishes (FIN) or resets
             %% the stream, so it never outlives the stream.
             case Fin of
-                true -> drop_stream(State, StreamId);
+                true -> State#h3{streams = maps:remove(StreamId, Streams)};
                 false -> State
             end;
+        #{reader := _, body_error := Error} when Error =/= undefined ->
+            %% A manual-mode body that cannot be read (over its cap): what
+            %% still comes is dropped, its credit kept, so the client soon
+            %% stops; the worker answers, and its exit ends the stream.
+            State#h3{streams = Streams#{StreamId := Stream0#{fin := Fin}}};
         #{buf := Buf0} ->
             case
                 decode_request_frames(
@@ -395,11 +407,16 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
                 )
             of
                 {ok, Stream1} ->
-                    State1 = State#h3{streams = Streams#{StreamId => Stream1}},
-                    case Fin of
-                        true -> dispatch_request(State1, StreamId);
-                        false -> await_body(State1, StreamId, Stream0, Stream1)
+                    State1 = State#h3{
+                        streams = Streams#{StreamId => unreleased(Stream1, Data, State)}
+                    },
+                    case {Stream1, Fin} of
+                        {#{reader := _}, _} -> body_in(State1, StreamId, Fin);
+                        {_, true} -> dispatch_request(State1, StreamId);
+                        {_, false} -> await_body(State1, StreamId, Stream0, Stream1)
                     end;
+                too_large when is_map_key(reader, Stream0) ->
+                    body_over_cap(State, StreamId, Stream0, Fin);
                 too_large ->
                     refuse_request(State, StreamId, Stream0, Fin, 413, ~"Payload Too Large");
                 headers_too_large ->
@@ -447,14 +464,25 @@ await_body(State, _StreamId, _Stream0, _Stream1) ->
 %% over its route's body cap, the status the body would earn anyway, else
 %% the interim 100 (a HEADERS frame with `:status` alone, no FIN) that asks
 %% for the body. A request expecting nothing waits for its body as before.
--spec answer_expectation(#h3{}, non_neg_integer(), map(), roadrunner_http:headers()) -> #h3{}.
+%% In manual mode the request is dispatched now instead, its worker reading
+%% the body, and the 100 goes out on its first read.
+-spec answer_expectation(#h3{}, non_neg_integer(), map(), roadrunner_http:headers()) ->
+    handle_result().
 answer_expectation(
-    #h3{proto_opts = ProtoOpts, max_content_length = MaxLen} = State, StreamId, Stream0, Headers
+    #h3{proto_opts = ProtoOpts, max_content_length = MaxLen, body_buffering = Mode} = State,
+    StreamId,
+    Stream0,
+    Headers
 ) ->
-    case roadrunner_conn:expect_answer(ProtoOpts, Headers, MaxLen) of
-        too_large -> refuse_request(State, StreamId, Stream0, false, 413, ~"Payload Too Large");
-        continue -> send_continue(State, StreamId);
-        none -> State
+    case {roadrunner_conn:expect_answer(ProtoOpts, Headers, MaxLen), Mode} of
+        {too_large, _} ->
+            refuse_request(State, StreamId, Stream0, false, 413, ~"Payload Too Large");
+        {continue, auto} ->
+            send_continue(State, StreamId);
+        {none, auto} ->
+            State;
+        {Answer, manual} ->
+            dispatch_reading(State, StreamId, Headers, Answer =:= continue)
     end.
 
 %% The interim `100 (Continue)`: a HEADERS frame with `:status` alone and
@@ -498,6 +526,145 @@ refuse_request(#h3{conn = Conn, streams = Streams} = State, StreamId, Stream0, F
             }
     end.
 
+%% Dispatch a manual-mode request whose body is still to come: its worker
+%% starts now and reads the body as it asks (`handle_body_demand/3`), the
+%% stream's QUIC credit given back with each delivery (`deliver/3`), so a
+%% stream holds at most one window of body its worker has not read. A 100
+%% Continue the client holds its body back for (`ContinueOwed`) goes out on
+%% the first ask. A malformed `content-length` is a malformed request.
+-spec dispatch_reading(#h3{}, non_neg_integer(), roadrunner_http:headers(), boolean()) ->
+    handle_result().
+dispatch_reading(#h3{streams = Streams} = State, StreamId, Headers, ContinueOwed) ->
+    #{StreamId := Stream} = Streams,
+    Declared = roadrunner_http:request_content_length(Headers),
+    Reading = Stream#{
+        reader => undefined,
+        continue_owed => ContinueOwed,
+        body_error => undefined,
+        declared => Declared,
+        fin => false
+    },
+    State1 = State#h3{streams = Streams#{StreamId := Reading}},
+    case Declared of
+        error -> reset_and_drop(State1, StreamId, ?H3_MESSAGE_ERROR);
+        _ -> dispatch_headers(State1, StreamId, Reading, Headers)
+    end.
+
+%% Count a chunk's raw bytes toward what a manual-mode stream hands back to
+%% QUIC flow control once its worker reads them (`deliver/3`).
+-spec unreleased(map(), binary(), #h3{}) -> map().
+unreleased(#{unreleased := Unreleased} = Stream, Data, #h3{body_buffering = manual}) ->
+    Stream#{unreleased := Unreleased + byte_size(Data)};
+unreleased(Stream, _Data, _State) ->
+    Stream.
+
+%% DATA, or the FIN ending it, for a dispatched manual-mode stream, `body`
+%% already holding it. A body that outruns its declared `content-length`, or
+%% ends short of it, is malformed (RFC 9114 §4.1.2): the read fails and the
+%% stream is reset. Otherwise the worker waiting for DATA gets it now, or it
+%% waits for the worker's next ask.
+-spec body_in(#h3{}, non_neg_integer(), boolean()) -> #h3{}.
+body_in(#h3{streams = Streams} = State, StreamId, Fin) ->
+    #{StreamId := #{body_len := Len, declared := Declared, reader := Reader} = Stream} = Streams,
+    Stream1 = Stream#{fin := Fin},
+    case roadrunner_http:body_length_fits(Declared, Len, Fin) of
+        false ->
+            ok = roadrunner_conn:send_body_error(Reader, StreamId, closed),
+            Ended = Stream1#{reader := undefined},
+            reset_and_drop(
+                State#h3{streams = Streams#{StreamId := Ended}}, StreamId, ?H3_MESSAGE_ERROR
+            );
+        true when is_pid(Reader) ->
+            deliver(State, StreamId, Stream1);
+        true ->
+            State#h3{streams = Streams#{StreamId := Stream1}}
+    end.
+
+%% Hand a manual-mode stream's received DATA to its waiting worker, `Fin`
+%% marking the body's end, and give the stream's QUIC credit back for every
+%% raw byte received so far, now that all of it has left the connection.
+-spec deliver(#h3{}, non_neg_integer(), map()) -> #h3{}.
+deliver(
+    #h3{conn = Conn, streams = Streams} = State,
+    StreamId,
+    #{reader := Reader, body := Body, fin := Fin, unreleased := Unreleased} = Stream
+) ->
+    %% The credit goes back first, so it is already queued at the QUIC
+    %% connection by the time the worker, and whatever it tells the client,
+    %% sees the DATA.
+    ok =
+        case Fin orelse Unreleased =:= 0 of
+            true -> ok;
+            false -> roadrunner_quic:consumed(Conn, StreamId, Unreleased)
+        end,
+    ok = roadrunner_conn:send_body(Reader, StreamId, Body, Fin),
+    Delivered = Stream#{body := [], reader := undefined, unreleased := 0},
+    State#h3{streams = Streams#{StreamId := Delivered}}.
+
+%% A manual-mode body past its cap: the worker's read fails with
+%% `content_length_too_large`, as on HTTP/1.1 and HTTP/2, for the handler to
+%% answer. Its bytes, and the rest of the body, are dropped and their credit
+%% kept, so the client soon stops sending.
+-spec body_over_cap(#h3{}, non_neg_integer(), map(), boolean()) -> #h3{}.
+body_over_cap(#h3{streams = Streams} = State, StreamId, #{reader := Reader} = Stream0, Fin) ->
+    ok = roadrunner_conn:send_body_error(Reader, StreamId, content_length_too_large),
+    Refused = Stream0#{
+        buf := <<>>,
+        body := [],
+        reader := undefined,
+        body_error := content_length_too_large,
+        fin := Fin
+    },
+    State#h3{streams = Streams#{StreamId := Refused}}.
+
+%% The worker of a manual-mode stream asks for its body's next DATA
+%% (`roadrunner_conn:stream_body_reader/5`). The first ask sends a 100
+%% Continue the client is holding its body back for. It gets what has
+%% arrived, the body's end once it came, or, with nothing yet, the next
+%% DATA as it arrives (`body_in/3`). A body that cannot be read fails the
+%% read, and a stream that is gone or being discarded ends it.
+-spec handle_body_demand(#h3{}, pid(), non_neg_integer()) -> #h3{}.
+handle_body_demand(#h3{streams = Streams} = State, Worker, StreamId) ->
+    case Streams of
+        #{StreamId := #{frame_state := discarding}} ->
+            ok = roadrunner_conn:send_body_error(Worker, StreamId, closed),
+            State;
+        #{StreamId := #{reader := _, body_error := undefined} = Stream} ->
+            State1 =
+                case Stream of
+                    #{continue_owed := true} -> send_continue(State, StreamId);
+                    _ -> State
+                end,
+            Asked = Stream#{reader := Worker, continue_owed := false},
+            #{body := Body, fin := Fin} = Asked,
+            case Fin orelse iolist_size(Body) > 0 of
+                true -> deliver(State1, StreamId, Asked);
+                false -> State1#h3{streams = Streams#{StreamId := Asked}}
+            end;
+        #{StreamId := #{reader := _, body_error := Reason}} ->
+            ok = roadrunner_conn:send_body_error(Worker, StreamId, Reason),
+            State;
+        _ ->
+            ok = roadrunner_conn:send_body_error(Worker, StreamId, closed),
+            State
+    end.
+
+%% A peer reset of a dispatched manual-mode stream ends its body: a waiting
+%% read fails, as does any later one, and a `discarding` marker has nothing
+%% left to wait for.
+-spec reading_reset(#h3{}, non_neg_integer()) -> #h3{}.
+reading_reset(#h3{streams = Streams} = State, StreamId) ->
+    case Streams of
+        #{StreamId := #{frame_state := discarding}} ->
+            State#h3{streams = maps:remove(StreamId, Streams)};
+        #{StreamId := #{reader := Reader} = Stream} ->
+            ok = roadrunner_conn:send_body_error(Reader, StreamId, closed),
+            Ended = Stream#{reader := undefined, body_error := closed, fin := true},
+            State#h3{streams = Streams#{StreamId := Ended}};
+        _ ->
+            State
+    end.
+
 %% Advance a peer-initiated unidirectional stream by one chunk. The
 %% per-stream and connection-wide critical-role state lives in the `#h3`
 %% record; the decision logic is the pure `uni_event/4` (unit-tested),
@@ -539,7 +706,7 @@ handle_stream_reset(#h3{uni = Uni, streams = Streams, worker_pids = WorkerPids} 
                     %% drops the stream via `handle_worker_down/3` (no RST
                     %% back — the peer already reset it).
                     _ = (WorkerPid ! {roadrunner_stream_reset, StreamId}),
-                    State;
+                    reading_reset(State, StreamId);
                 _ ->
                     %% Still mid-receive, parked for a slot, or already
                     %% gone. Drop the frame-accumulation entry and
@@ -571,6 +738,10 @@ new_request_stream(BodyCap) ->
         headers => undefined,
         body => [],
         body_len => 0,
+        %% Raw stream bytes received and not yet handed back to QUIC flow
+        %% control. Only manual mode counts them: its request streams' credit
+        %% is granted as the worker reads (`deliver/3`).
+        unreleased => 0,
         %% The listener's `max_content_length` until a body outgrows it and
         %% its route raises it (`raise_body_cap/4`).
         body_cap => BodyCap,
@@ -880,9 +1051,14 @@ dispatch_headers(State, StreamId, Stream, Headers) ->
             %% drop the stream.
             respond_field_section_too_large(State, StreamId);
         false ->
-            #{body := Body} = Stream,
-            dispatch_decoded(State, StreamId, Headers, Body)
+            dispatch_decoded(State, StreamId, Headers, request_body(Stream))
     end.
+
+%% The body a request is dispatched with: the one buffered, or, for a
+%% manual-mode stream still receiving it, `reading` (a body reader).
+-spec request_body(map()) -> iodata() | reading.
+request_body(#{reader := _}) -> reading;
+request_body(#{body := Body}) -> Body.
 
 %% RFC 9114 §4.2.2: a request whose decoded field section exceeds the
 %% advertised MAX_FIELD_SECTION_SIZE gets 431. The request stream has
@@ -899,7 +1075,7 @@ respond_field_section_too_large(#h3{conn = Conn} = State, StreamId) ->
     ),
     drop_stream(State, StreamId).
 
--spec dispatch_decoded(#h3{}, non_neg_integer(), roadrunner_http:headers(), iodata()) ->
+-spec dispatch_decoded(#h3{}, non_neg_integer(), roadrunner_http:headers(), iodata() | reading) ->
     handle_result().
 dispatch_decoded(State, StreamId, Headers, Body) ->
     {ReqId, NewBuf} = roadrunner_conn:generate_request_id(State#h3.req_id_buffer),
@@ -910,14 +1086,19 @@ dispatch_decoded(State, StreamId, Headers, Body) ->
         request_id => ReqId
     },
     State1 = State#h3{req_id_buffer = NewBuf},
-    case roadrunner_http3_request:from_headers(Headers, Body, RequestContext) of
+    case build_request(Headers, Body, RequestContext) of
         {error, _} ->
             %% Malformed request (bad/missing pseudo-headers, a
             %% connection-specific header) — RFC 9114 §4.1.2 / §4.2:
             %% stream error H3_MESSAGE_ERROR.
             reset_and_drop(State1, StreamId, ?H3_MESSAGE_ERROR);
         {ok, Req0} ->
-            Req = roadrunner_conn:with_client_ip(Req0, State#h3.real_ip, State#h3.peer),
+            Req = with_body(
+                roadrunner_conn:with_client_ip(Req0, State#h3.real_ip, State#h3.peer),
+                Body,
+                StreamId,
+                State
+            ),
             case rate_limit_refused(State1, StreamId, Req) of
                 {refused, State2} ->
                     %% Per-peer rate exceeded: 429 + Retry-After sent, stream
@@ -928,6 +1109,24 @@ dispatch_decoded(State, StreamId, Headers, Body) ->
                     dispatch_with_slot(State1, StreamId, Req)
             end
     end.
+
+-spec build_request(roadrunner_http:headers(), iodata() | reading, map()) ->
+    {ok, roadrunner_req:request()} | {error, roadrunner_http3_request:build_error()}.
+build_request(Headers, reading, RequestContext) ->
+    roadrunner_http3_request:from_headers_reading(Headers, RequestContext);
+build_request(Headers, Body, RequestContext) ->
+    roadrunner_http3_request:from_headers(Headers, Body, RequestContext).
+
+%% A manual-mode request reads its body through a reader instead of the
+%% buffered `body`, within the listener's `request_timeout`.
+-spec with_body(roadrunner_req:request(), iodata() | reading, non_neg_integer(), #h3{}) ->
+    roadrunner_req:request().
+with_body(Req, reading, StreamId, #h3{
+    proto_opts = #{request_timeout := Timeout}, max_content_length = MaxLen
+}) ->
+    roadrunner_conn:with_body_reader(Req, StreamId, Timeout, MaxLen);
+with_body(Req, _Body, _StreamId, _State) ->
+    Req.
 
 %% Acquire the listener-wide in-flight slot and spawn the stream worker, or
 %% refuse with retry-safe H3_REQUEST_REJECTED at the ceiling.
@@ -951,7 +1150,7 @@ dispatch_with_slot(#h3{streams = Streams} = State1, StreamId, Req) ->
             %% so the streams map only ever holds in-progress requests.
             %% Record the pid too so a peer reset can reach the worker.
             State1#h3{
-                streams = maps:remove(StreamId, Streams),
+                streams = dispatched(Streams, StreamId),
                 worker_refs = (State1#h3.worker_refs)#{MonRef => StreamId},
                 worker_pids = (State1#h3.worker_pids)#{StreamId => WorkerPid}
             };
@@ -960,7 +1159,7 @@ dispatch_with_slot(#h3{streams = Streams} = State1, StreamId, Req) ->
             %% sheds. Keep the assembled request and return to the loop;
             %% the grant arrives as a message.
             State1#h3{
-                streams = maps:remove(StreamId, Streams),
+                streams = dispatched(Streams, StreamId),
                 awaiting_slot = (State1#h3.awaiting_slot)#{StreamId => Req}
             };
         false ->
@@ -969,6 +1168,17 @@ dispatch_with_slot(#h3{streams = Streams} = State1, StreamId, Req) ->
             %% a worker.
             ok = throttle_stream(State1),
             reset_and_drop(State1, StreamId, ?H3_REQUEST_REJECTED)
+    end.
+
+%% A dispatched request leaves the streams map, which only holds requests
+%% still being received; a manual-mode one is still receiving its body for
+%% the worker, so it stays.
+-spec dispatched(#{non_neg_integer() => map()}, non_neg_integer()) ->
+    #{non_neg_integer() => map()}.
+dispatched(Streams, StreamId) ->
+    case Streams of
+        #{StreamId := #{reader := _}} -> Streams;
+        _ -> maps:remove(StreamId, Streams)
     end.
 
 %% A parked request's admission resolved. `granted` means the queue has
@@ -1086,9 +1296,27 @@ close_connection(#h3{conn = Conn} = State, ErrorCode, Reason) ->
     _ = roadrunner_quic:close(Conn, ErrorCode, Reason),
     terminate(State).
 
+%% Forget a request stream, unless its client is still sending on it. A
+%% manual-mode stream whose client has not finished (no FIN yet) is
+%% stopped instead: the client is asked to stop sending (STOP_SENDING
+%% H3_NO_ERROR), and a `discarding` marker drops what is already in flight
+%% rather than reading it as a new request. A marker stays until the
+%% client's FIN or reset frees it (`handle_request_stream/4`,
+%% `handle_stream_reset/2`), even once the stream's worker is gone.
 -spec drop_stream(#h3{}, non_neg_integer()) -> #h3{}.
-drop_stream(#h3{streams = Streams} = State, StreamId) ->
-    State#h3{streams = maps:remove(StreamId, Streams)}.
+drop_stream(#h3{conn = Conn, streams = Streams} = State, StreamId) ->
+    case Streams of
+        #{StreamId := #{frame_state := discarding}} ->
+            State;
+        #{StreamId := #{fin := false} = Stream} ->
+            _ = roadrunner_quic:stop_sending(Conn, StreamId, ?H3_NO_ERROR),
+            Discarding = Stream#{
+                frame_state := discarding, buf := <<>>, body := [], reader := undefined
+            },
+            State#h3{streams = Streams#{StreamId := Discarding}};
+        _ ->
+            State#h3{streams = maps:remove(StreamId, Streams)}
+    end.
 
 -spec terminate(#h3{}) -> ok.
 terminate(#h3{

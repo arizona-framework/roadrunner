@@ -662,6 +662,29 @@ recv_window_refilled_with_max_data_and_max_stream_data_test() ->
     ?assert(lists:member({max_data, 600 + ?CONN_RECV_WINDOW}, Frames)),
     ?assert(lists:member({max_stream_data, 0, 600 + ?STREAM_RECV_WINDOW}, Frames)).
 
+%% With `stream_credit => on_read` a request stream's credit waits for its
+%% owner to consume the data (`handle_consumed/4`): the connection's MAX_DATA
+%% still goes out on receipt, MAX_STREAM_DATA only once 600 bytes are read.
+held_stream_credit_granted_on_consumption_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(#{stream_credit => on_read}),
+    Upload = app_datagram([{stream, 0, 0, binary:copy(~"u", 600), false}], 0, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Upload, State),
+    Frames = sent_app_frames(Effects, ServerApSecret),
+    ?assert(lists:member({max_data, 600 + ?CONN_RECV_WINDOW}, Frames)),
+    ?assertEqual([], [F || {max_stream_data, _, _} = F <- Frames]),
+    {_State2, Granted} = ?M:handle_consumed(0, 600, ?NOW, State1),
+    ?assert(
+        lists:member(
+            {max_stream_data, 0, 600 + ?STREAM_RECV_WINDOW},
+            sent_app_frames(Granted, ServerApSecret)
+        )
+    ).
+
+%% Bytes consumed on a stream already gone grant nothing.
+consumed_on_unknown_stream_test() ->
+    {State, _ServerApSecret} = connected_for_send(),
+    ?assertEqual({State, []}, ?M:handle_consumed(4, 100, ?NOW, State)).
+
 stream_retransmit_does_not_re_consume_flow_test() ->
     %% Flow control is charged by the increase in the highest received offset,
     %% so resending bytes already received does not re-consume the receive
@@ -1365,7 +1388,10 @@ send_on_draining_connection_is_rejected_test() ->
 %% Run a full RSA handshake against a fresh connection and return every
 %% intermediate the assertions need.
 connect() ->
-    {State0, Ctx} = new_conn([~"leaf-cert-der"]),
+    connect(#{}).
+
+connect(Extra) ->
+    {State0, Ctx} = new_conn([~"leaf-cert-der"], Extra),
     #{client_priv := ClientPriv, server_pub := ServerPub} = Ctx,
 
     %% Client Initial carrying the ClientHello.
@@ -1444,12 +1470,16 @@ connect() ->
 
 %% A fresh server connection plus the client material the driver reuses.
 new_conn(CertChain) ->
+    new_conn(CertChain, #{}).
+
+%% `Extra` adds optional config keys (`stream_credit`).
+new_conn(CertChain, Extra) ->
     {Scheme, PrivKey} = ?TC:key_material(),
     {ClientPub, ClientPriv} = ?TC:gen_keypair(),
     {ServerPub, ServerPriv} = ?TC:gen_keypair(),
     TransportParams = transport_params(),
     State = ?M:new(
-        #{
+        Extra#{
             dcid => ?DCID,
             scid => ?SCID,
             peer_scid => ?CLIENT_SCID,
@@ -1512,13 +1542,16 @@ with_owner(State) ->
 %% secrets: the client secret seals peer 1-RTT packets (receive-side tests),
 %% the server secret decodes the connection's own 1-RTT (send-side tests).
 connect_owned() ->
+    connect_owned(#{}).
+
+connect_owned(Extra) ->
     #{
         state1 := State1,
         client_hs_secret := ClientHsSecret,
         cf_framed := ClientFinished,
         client_ap_secret := ClientApSecret,
         server_ap_secret := ServerApSecret
-    } = connect(),
+    } = connect(Extra),
     {State1b, _} = ?M:handle_call(self(), make_ref(), {set_owner, self()}, 0, State1),
     Finished = ?TC:seal(
         handshake,
