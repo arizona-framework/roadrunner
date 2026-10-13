@@ -19,6 +19,7 @@
     parse_chunk/2,
     parse_chunk/3,
     response/3,
+    response/4,
     compute_cached_decisions/1
 ]).
 
@@ -45,6 +46,7 @@
 -define(CRLF_KEY, {?MODULE, crlf_cp}).
 -define(SPACE_KEY, {?MODULE, space_cp}).
 -define(SEMICOLON_KEY, {?MODULE, semicolon_cp}).
+-define(DATE_LINE_KEY, {?MODULE, date_line}).
 
 %% Module-local aliases for the shared HTTP primitives so this
 %% module's specs stay readable. The canonical, exported type lives
@@ -1159,6 +1161,49 @@ codes get an empty reason (RFC 9112 §4.1 makes the phrase optional).
 -spec response(StatusCode :: status(), headers(), iodata()) -> iodata().
 response(Status, Headers, Body) when is_integer(Status), Status >= 100, Status =< 599 ->
     [status_line(Status), encode_headers(Headers), ~"\r\n", Body].
+
+%% `response/3` with the framework's automatic headers in front, in the
+%% order `roadrunner_http:auto_headers/2` prepends them: `Alt-Svc` when
+%% the listener co-serves h3 (`AltSvc`, `undefined` otherwise), then
+%% `Date` unless the handler set one. The wire bytes match `response/3`
+%% over `auto_headers/2`'s list. Both values are server-built (the
+%% listener's port, the cached clock), so their lines skip the CR/LF/NUL
+%% check handler headers take, and the `Date` line is encoded once a
+%% second instead of per response. The conn loop's keep-alive responses
+%% (buffered, HEAD, the sendfile head) go through here.
+-doc false.
+-spec response(status(), headers(), iodata(), binary() | undefined) -> iodata().
+response(Status, Headers, Body, AltSvc) when is_integer(Status), Status >= 100, Status =< 599 ->
+    [status_line(Status), auto_lines(Headers, AltSvc), encode_headers(Headers), ~"\r\n", Body].
+
+-spec auto_lines(headers(), binary() | undefined) -> iodata().
+auto_lines(Headers, undefined) ->
+    date_line(Headers);
+auto_lines(Headers, AltSvc) ->
+    [~"alt-svc: ", AltSvc, ~"\r\n", date_line(Headers)].
+
+-spec date_line(headers()) -> iodata().
+date_line(Headers) ->
+    case lists:keymember(~"date", 1, Headers) of
+        true -> [];
+        false -> cached_date_line()
+    end.
+
+%% The encoded `date: <IMF-fixdate>\r\n` line, cached per process and
+%% keyed by the current Posix second like `roadrunner_http:http_date_now/0`
+%% caches the bare value: an HTTP/1 connection reformats it at most once a
+%% second.
+-spec cached_date_line() -> binary().
+cached_date_line() ->
+    Now = erlang:system_time(second),
+    case get(?DATE_LINE_KEY) of
+        {Now, Line} ->
+            Line;
+        _ ->
+            Line = <<"date: ", (roadrunner_http:format_http_date(Now))/binary, "\r\n">>,
+            _ = put(?DATE_LINE_KEY, {Now, Line}),
+            Line
+    end.
 
 %% Common status codes get a precomputed `HTTP/1.1 NNN Reason\r\n`
 %% binary — one binary literal vs the five-element iolist build

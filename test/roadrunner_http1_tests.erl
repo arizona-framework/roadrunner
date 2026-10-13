@@ -1183,6 +1183,71 @@ response_unknown_status_has_empty_reason_test() ->
 
 %% --- header injection / response splitting defenses ---
 
+response_with_auto_headers_matches_auto_headers_list_test() ->
+    %% `response/4` puts the same bytes on the wire as `response/3` over
+    %% `roadrunner_http:auto_headers/2`'s list: Alt-Svc, then Date, then
+    %% the handler's headers. Same-second pair so both read one clock.
+    Headers = [{~"content-type", ~"text/plain"}],
+    lists:foreach(
+        fun(AltSvc) ->
+            {Fast, Reference} = same_second(fun() ->
+                {
+                    iolist_to_binary(roadrunner_http1:response(200, Headers, ~"hi", AltSvc)),
+                    iolist_to_binary(
+                        roadrunner_http1:response(
+                            200, roadrunner_http:auto_headers(Headers, AltSvc), ~"hi"
+                        )
+                    )
+                }
+            end),
+            ?assertEqual(Reference, Fast)
+        end,
+        [undefined, ~"h3=\":8443\"; ma=86400"]
+    ).
+
+response_with_auto_headers_keeps_handler_date_test() ->
+    %% A handler-set Date wins: no second Date line.
+    Resp = iolist_to_binary(
+        roadrunner_http1:response(
+            200, [{~"date", ~"Sun, 06 Nov 1994 08:49:37 GMT"}], ~"", undefined
+        )
+    ),
+    ?assertEqual(
+        ~"HTTP/1.1 200 OK\r\ndate: Sun, 06 Nov 1994 08:49:37 GMT\r\n\r\n",
+        Resp
+    ).
+
+response_with_auto_headers_still_checks_handler_headers_test() ->
+    ?assertError(
+        {header_injection, value, _},
+        roadrunner_http1:response(200, [{~"x-foo", ~"line1\nline2"}], ~"", undefined)
+    ).
+
+response_date_line_caches_per_process_test_() ->
+    %% Fresh process so the dictionary starts empty: the first response
+    %% formats the line (miss branch), a same-second second one reuses it
+    %% (hit branch).
+    {spawn, fun() ->
+        {A, B} = same_second(fun() ->
+            {
+                iolist_to_binary(roadrunner_http1:response(204, [], ~"", undefined)),
+                iolist_to_binary(roadrunner_http1:response(204, [], ~"", undefined))
+            }
+        end),
+        ?assertEqual(A, B),
+        ?assertMatch(<<"HTTP/1.1 204 No Content\r\ndate: ", _:29/binary, "\r\n\r\n">>, A)
+    end}.
+
+%% Run `Fun` until it starts and ends in the same Posix second, so its
+%% results read one value of the cached clock.
+same_second(Fun) ->
+    S0 = erlang:system_time(second),
+    Result = Fun(),
+    case erlang:system_time(second) of
+        S0 -> Result;
+        _ -> same_second(Fun)
+    end.
+
 response_rejects_cr_in_header_value_test() ->
     %% Classic HTTP response splitting: CRLF in a header value would
     %% let the attacker inject arbitrary headers (or a whole second
