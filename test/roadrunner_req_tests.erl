@@ -596,3 +596,13 @@ sample_req_target(Target) ->
 with_cookie(CookieValue) ->
     Req = sample_req(),
     Req#{headers := [{~"cookie", CookieValue} | maps:get(headers, Req)]}.
+
+client_ip_test() ->
+    %% The resolved client behind a trusted proxy, else the peer's address.
+    ?assertEqual(
+        {203, 0, 113, 7},
+        roadrunner_req:client_ip(#{client_ip => {203, 0, 113, 7}, peer => {{10, 0, 0, 5}, 1}})
+    ),
+    ?assertEqual({10, 0, 0, 5}, roadrunner_req:client_ip(#{peer => {{10, 0, 0, 5}, 1}})),
+    ?assertEqual(undefined, roadrunner_req:client_ip(#{peer => undefined})),
+    ?assertEqual(undefined, roadrunner_req:client_ip(#{})).

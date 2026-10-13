@@ -291,6 +291,10 @@
     %% Per-peer rate-limit guard resolved from proto_opts + peer at `enter/6`
     %% (`undefined` when off). Checked in `dispatch_stream/2`.
     rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
+    %% The `real_ip` trust config when the peer is a trusted proxy, decided
+    %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
+    %% otherwise, the common case, so the request path resolves nothing.
+    real_ip = undefined :: undefined | roadrunner_real_ip:config(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
@@ -382,6 +386,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered) ->
         inflight_counter = InflightCounter,
         overload = maps:get(overload, ProtoOpts, refuse),
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
+        real_ip = roadrunner_real_ip:peer_trust(maps:get(real_ip, ProtoOpts, undefined), Peer),
         handshake_timeout = HandshakeTimeout,
         idle_timeout = IdleTimeout
     },
@@ -1301,9 +1306,19 @@ dispatch_stream(
                 request_id => RequestId
             },
             case roadrunner_http2_request:from_headers(Headers, BodyIolist, RequestContext) of
-                {ok, Req} ->
+                {ok, Req0} ->
+                    Req =
+                        case State#loop.real_ip of
+                            undefined ->
+                                Req0;
+                            RealIp ->
+                                {PeerIP, _Port} = Peer,
+                                Req0#{
+                                    client_ip => roadrunner_real_ip:resolve(RealIp, PeerIP, Headers)
+                                }
+                        end,
                     StateBuf = State#loop{req_id_buffer = NewBuf},
-                    case rate_limit_refused(StateBuf, StreamId) of
+                    case rate_limit_refused(StateBuf, StreamId, Req) of
                         {refused, State1} ->
                             %% Per-peer rate exceeded: 429 + RST(no_error) sent,
                             %% no worker spawned. 429 (not REFUSED_STREAM) so the
@@ -2097,17 +2112,20 @@ throttle_stream(#loop{proto_opts = #{throttled_counter := Counter}}, ListenerNam
 %% (not `REFUSED_STREAM`) so the client honors `Retry-After` instead of
 %% retrying the stream immediately. The guard being off (`undefined`) or a
 %% missing peer IP proceeds.
--spec rate_limit_refused(#loop{}, stream_id()) -> ok | {refused, #loop{}}.
-rate_limit_refused(#loop{rate_limit = undefined}, _StreamId) ->
+-spec rate_limit_refused(#loop{}, stream_id(), roadrunner_req:request()) ->
+    ok | {refused, #loop{}}.
+rate_limit_refused(#loop{rate_limit = undefined}, _StreamId, _Req) ->
     ok;
 rate_limit_refused(
     #loop{
-        rate_limit = {Rate, Cap, Cost, Table, Counter, IP},
+        rate_limit = {Rate, Cap, Cost, Table, Counter, PeerIP},
         listener_name = ListenerName
     } = State,
-    StreamId
+    StreamId,
+    Req
 ) ->
     NowMs = erlang:monotonic_time(millisecond),
+    IP = roadrunner_conn:rate_limit_key(Req, PeerIP),
     case roadrunner_conn:rate_limit_check(Table, IP, Rate, Cap, Cost, NowMs) of
         allow ->
             ok;

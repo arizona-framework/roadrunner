@@ -164,8 +164,9 @@ back off instead of retrying at once), emitting `[roadrunner, request,
 throttled]` with `reason => rate_limit` and incrementing the
 `rate_limited` count from `roadrunner_listener:info/1`. Idle per-peer
 buckets are swept on a timer (`idle_ttl` / `sweep_interval`). It keys on
-the real client IP, so set `proxy_protocol` behind an L4 balancer for
-accurate per-client limiting.
+the client IP, so behind a balancer set `proxy_protocol` (an L4 balancer)
+or `real_ip` (HTTP proxies passing `X-Forwarded-For` or `Forwarded`);
+otherwise every client behind the proxy shares one bucket.
 
 ## Configuring
 

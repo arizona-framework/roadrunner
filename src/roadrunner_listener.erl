@@ -334,6 +334,26 @@ ops-tuning rationale.
     %% that always prepends the header (otherwise a direct peer can spoof its
     %% IP).
     proxy_protocol => boolean(),
+    %% Opt in to the real client IP behind HTTP reverse proxies (load
+    %% balancers, CDNs, ingress controllers) that pass it in a forwarding
+    %% header. Exactly one trust mode: `trusted_proxies` lists the proxies'
+    %% addresses as CIDR binaries (`~"10.0.0.0/8"`, `~"2001:db8::/32"`, or a
+    %% bare address for one host; `/0` is refused, as it would trust hops a
+    %% client writes), or `trusted_hops => N` trusts the `N` nearest hops
+    %% whatever their address, for platforms that don't publish their proxy
+    %% addresses. `header` reads `x_forwarded_for` (the default) or
+    %% `forwarded` (RFC 7239). Starting from the socket peer, the chain is read
+    %% right to left, trusted hops are skipped, and the first untrusted
+    %% address is the client: `roadrunner_req:client_ip/1`, the `rate_limit`
+    %% key, and `client_ip` in logger and telemetry metadata. A peer that is
+    %% not a trusted proxy is itself the client, so a client that bypasses the
+    %% proxies cannot spoof its address. With `proxy_protocol`, the address the
+    %% PROXY header reports is the first hop.
+    real_ip => #{
+        trusted_proxies => [binary()],
+        trusted_hops => pos_integer(),
+        header => x_forwarded_for | forwarded
+    },
     %% Opt in to a per-peer request-rate guard keyed on the client IP. A map
     %% `#{rate := pos_integer()}` (requests allowed per `period`, required) with
     %% optional `period` (window in seconds, default 1, so `rate` is per-second
@@ -1391,11 +1411,18 @@ build_proto_opts(Opts, ListenerName) ->
     %% Optional `rate_check_interval` — the rate-check timer
     %% interval inside `reading_request`. Default 1000ms; ops can
     %% override.
-    case Opts of
-        #{rate_check_interval := IntervalMs} when is_integer(IntervalMs), IntervalMs > 0 ->
-            WithHibernate#{rate_check_interval => IntervalMs};
-        #{} ->
-            WithHibernate
+    WithRateCheck =
+        case Opts of
+            #{rate_check_interval := IntervalMs} when is_integer(IntervalMs), IntervalMs > 0 ->
+                WithHibernate#{rate_check_interval => IntervalMs};
+            #{} ->
+                WithHibernate
+        end,
+    %% Optional `real_ip`, compiled (and validated) here so a bad config fails
+    %% the listener start; absent when off, the default.
+    case roadrunner_real_ip:compile(maps:get(real_ip, Opts, undefined)) of
+        undefined -> WithRateCheck;
+        RealIp -> WithRateCheck#{real_ip => RealIp}
     end.
 
 %% Resolve the public `handler_spawn` opt into the proto_opts shape the spawn
