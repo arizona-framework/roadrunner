@@ -14,6 +14,8 @@ from the headers alone never has the client upload it.
     body_over_the_cap_refused_from_the_headers/1,
     empty_body_is_not_asked_for/1,
     handler_reading_asks_for_the_body/1,
+    streamed_answer_asks_for_the_body_first/1,
+    read_then_streamed_answer_gets_one_100/1,
     chunked_body_is_asked_for_on_read/1,
     earlier_response_goes_before_the_100/1,
     rate_window_starts_with_the_100/1
@@ -28,6 +30,8 @@ all() ->
         body_over_the_cap_refused_from_the_headers,
         empty_body_is_not_asked_for,
         handler_reading_asks_for_the_body,
+        streamed_answer_asks_for_the_body_first,
+        read_then_streamed_answer_gets_one_100,
         chunked_body_is_asked_for_on_read,
         earlier_response_goes_before_the_100,
         rate_window_starts_with_the_100
@@ -83,6 +87,30 @@ handler_reading_asks_for_the_body(Config) ->
     %% The body was read, so the connection is kept.
     ok = gen_tcp:send(Sock, ~"GET /read HTTP/1.1\r\nHost: x\r\n\r\n"),
     ?assertEqual({200, ~"0"}, recv_response(Sock)).
+
+streamed_answer_asks_for_the_body_first(Config) ->
+    %% The handler starts a streamed answer before it reads the body: the 100
+    %% goes out ahead of the 200, and none lands inside it.
+    Sock = ?config(sock, Config),
+    ok = gen_tcp:send(Sock, expect_head(~"/stream-echo", ~"content-length: 5")),
+    First = recv_exactly(Sock, <<>>, 25),
+    ?assertMatch(<<"HTTP/1.1 100 Continue\r\n\r\n", _/binary>>, First),
+    ok = gen_tcp:send(Sock, ~"hello"),
+    <<_:25/binary, Answer/binary>> = recv_until_closed(Sock, First),
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Answer),
+    ?assertEqual(nomatch, binary:match(Answer, ~"100 Continue")),
+    {match, _} = re:run(Answer, "\r\n5\r\nhello\r\n0\r\n\r\n$").
+
+read_then_streamed_answer_gets_one_100(Config) ->
+    %% The read asks for the body; the streamed answer after it sends no
+    %% second 100.
+    Sock = ?config(sock, Config),
+    ok = gen_tcp:send(Sock, expect_head(~"/read-then-stream", ~"content-length: 5")),
+    ?assertEqual(~"HTTP/1.1 100 Continue\r\n\r\n", recv_exactly(Sock, <<>>, 25)),
+    ok = gen_tcp:send(Sock, ~"hello"),
+    Answer = recv_until_closed(Sock, <<>>),
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Answer),
+    ?assertEqual(nomatch, binary:match(Answer, ~"100 Continue")).
 
 chunked_body_is_asked_for_on_read(Config) ->
     Sock = ?config(sock, Config),

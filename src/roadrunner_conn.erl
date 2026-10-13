@@ -62,7 +62,8 @@
     scheme/1,
     make_body_reader/5,
     stream_body_reader/5,
-    with_body_reader/4,
+    with_body_reader/5,
+    continue_before_stream/1,
     send_body/4,
     send_body_error/3,
     drain_body/1,
@@ -1047,16 +1048,57 @@ stream_body_reader(Conn, StreamId, Deadline, Max, Done) ->
 %% A request whose handler reads its body as it arrives (HTTP/2 and HTTP/3
 %% in manual mode): its buffered `body` gives way to a stream body reader
 %% pulling from this connection process, until `Timeout` ms from now and
-%% held to `Max` bytes.
+%% held to `Max` bytes. `ContinueOwed` marks a client holding its body back
+%% for a 100 Continue, which a streaming response asks this connection for
+%% before it starts (`continue_before_stream/1`).
 -doc false.
 -spec with_body_reader(
-    roadrunner_req:request(), pos_integer(), non_neg_integer(), non_neg_integer()
+    roadrunner_req:request(), pos_integer(), non_neg_integer(), non_neg_integer(), boolean()
 ) ->
     roadrunner_req:request().
-with_body_reader(Req, StreamId, Timeout, Max) ->
+with_body_reader(Req, StreamId, Timeout, Max, ContinueOwed) ->
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
-    Reader = stream_body_reader(self(), StreamId, Deadline, Max, false),
+    Reader0 = stream_body_reader(self(), StreamId, Deadline, Max, false),
+    Reader =
+        case ContinueOwed of
+            true -> Reader0#{continue => {self(), StreamId}};
+            false -> Reader0
+        end,
     (maps:remove(body, Req))#{body_reader => Reader}.
+
+%% RFC 9110 §10.1.1, for a response about to stream (`stream`, `loop`) while
+%% its client still holds the body back for the 100 Continue left to the
+%% first read: the 100 goes out first, so a handler that reads the body as it
+%% streams gets it, and no 100 lands after the final response. On HTTP/1.1
+%% this process sends it; on HTTP/2 and HTTP/3 the connection does, ahead of
+%% the response the worker sends next, and answers once it has. A complete
+%% response (buffered, `sendfile`) does not ask: the client is answered, and
+%% a body no handler reads is never asked for.
+-doc false.
+-spec continue_before_stream(roadrunner_req:request()) -> ok.
+continue_before_stream(#{body_reader := #{continue := {Socket, _Deadline, _MinRate, Owed}}}) ->
+    send_continue_once(Owed, Socket);
+continue_before_stream(#{body_reader := #{continue := {Conn, StreamId}}}) ->
+    MRef = monitor(process, Conn),
+    Conn ! {roadrunner_continue, self(), StreamId},
+    receive
+        {roadrunner_continued, StreamId} -> ok;
+        {'DOWN', MRef, process, Conn, _} -> ok
+    end,
+    true = demonitor(MRef, [flush]),
+    ok;
+continue_before_stream(_Req) ->
+    ok.
+
+%% The HTTP/1.1 100 Continue a body reader owes, asked for by its first read
+%% and by a response that streams first (`continue_before_stream/1`), from
+%% any copy of the request: sent once, by whichever asks first.
+-spec send_continue_once(atomics:atomics_ref(), roadrunner_transport:socket()) -> ok.
+send_continue_once(Owed, Socket) ->
+    case atomics:exchange(Owed, 1, 1) of
+        0 -> send_continue(Socket);
+        1 -> ok
+    end.
 
 %% The connection's answer to a stream body reader's demand (`stream_recv/3`
 %% receives it): DATA, `Fin` marking the body's end.
@@ -1258,12 +1300,12 @@ full read).
     {ok, iodata(), roadrunner_req:body_reader()}
     | {more, iodata(), roadrunner_req:body_reader()}
     | {error, term()}.
-consume_body_reader(#{continue := {Socket, Deadline, MinRate}} = BS, Mode) ->
+consume_body_reader(#{continue := {Socket, Deadline, MinRate, Owed}} = BS, Mode) ->
     %% The client is holding its body back for a 100 Continue the conn left
     %% to this first read (`roadrunner_conn_loop:read_body/8`): send it,
     %% then read with a recv whose slow-client rate window starts now, as the
     %% client can only start sending now.
-    ok = send_continue(Socket),
+    ok = send_continue_once(Owed, Socket),
     Recv = make_recv(Socket, Deadline, MinRate),
     consume_body_reader(maps:remove(continue, BS#{recv := Recv}), Mode);
 consume_body_reader(#{framing := stream} = BS, all) ->

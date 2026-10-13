@@ -19,6 +19,8 @@ each route's state picks what it does with the body.
     trailers_end_the_body/1,
     answers_before_the_body/1,
     expect_continue_asks_on_the_first_read/1,
+    streamed_answer_asks_for_the_body_first/1,
+    read_then_streamed_answer_gets_one_100/1,
     expect_continue_rejected_on_the_headers/1,
     expect_continue_over_the_cap/1,
     body_over_the_cap_fails_the_read/1,
@@ -49,6 +51,8 @@ all() ->
         trailers_end_the_body,
         answers_before_the_body,
         expect_continue_asks_on_the_first_read,
+        streamed_answer_asks_for_the_body_first,
+        read_then_streamed_answer_gets_one_100,
         expect_continue_rejected_on_the_headers,
         expect_continue_over_the_cap,
         body_over_the_cap_fails_the_read,
@@ -100,6 +104,8 @@ routes(TestPid) ->
         {~"/report", ?H, {report, TestPid}},
         {~"/gated-report", ?H, {gated_report, ?GATED, TestPid}},
         {~"/answer-first", ?H, {answer_first, ?GATED, TestPid}},
+        {~"/stream-echo", ?H, stream_echo},
+        {~"/read-then-stream", ?H, read_then_stream},
         #{path => ~"/small", handler => ?H, state => read, max_content_length => 2}
     ].
 
@@ -158,6 +164,22 @@ expect_continue_asks_on_the_first_read(Config) ->
     {[100], <<>>, interim, C1} = response(C0, 1),
     C2 = send_data(C1, 1, ~"hello", true),
     ?assertMatch({[200], ~"5", end_stream, _}, response(C2, 1)).
+
+streamed_answer_asks_for_the_body_first(Config) ->
+    %% The handler starts a streamed answer before it reads the body: the 100
+    %% comes first, not after the 200.
+    C0 = send_headers(open(Config), 1, ~"/stream-echo", [{~"expect", ~"100-continue"}], false),
+    {[100], <<>>, interim, C1} = response(C0, 1),
+    C2 = send_data(C1, 1, ~"hello", true),
+    ?assertMatch({[200], ~"hello", end_stream, _}, response(C2, 1)).
+
+read_then_streamed_answer_gets_one_100(Config) ->
+    %% The read asks for the body; the streamed answer after it sends no
+    %% second 100.
+    C0 = send_headers(open(Config), 1, ~"/read-then-stream", [{~"expect", ~"100-continue"}], false),
+    {[100], <<>>, interim, C1} = response(C0, 1),
+    C2 = send_data(C1, 1, ~"hello", true),
+    ?assertMatch({[200], ~"hello", end_stream, _}, response(C2, 1)).
 
 expect_continue_rejected_on_the_headers(Config) ->
     %% No 100: the 401 is the first answer, and the body is never asked for.

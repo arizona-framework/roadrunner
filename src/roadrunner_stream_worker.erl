@@ -128,7 +128,7 @@ invoke(
     ReqStart
 ) ->
     try Pipeline(Req) of
-        {Response0, _Req2} ->
+        {Response0, Req2} ->
             %% A handler-returned 1xx or unsafe header becomes a 500 here,
             %% for every shape (`roadrunner_conn:final_response/3`,
             %% `safe_response/3`). Telemetry reports the status actually
@@ -138,9 +138,9 @@ invoke(
             Response = safe_response(
                 Protocol, Handler, roadrunner_conn:final_response(Protocol, Handler, Response0)
             ),
-            Status = Worker:emit_handler_response(
-                Conn, StreamId, Handler, roadrunner_conn:head_response(Response, Method)
-            ),
+            Final = roadrunner_conn:head_response(Response, Method),
+            ok = continue_before(Final, Req2),
+            Status = Worker:emit_handler_response(Conn, StreamId, Handler, Final),
             ok = roadrunner_telemetry:request_stop(
                 ReqStart, Metadata, Status, roadrunner_conn:response_kind(Response)
             )
@@ -211,6 +211,17 @@ unsafe_header([{Name, Value} | Rest]) ->
 -spec unsafe_message(h2 | h3) -> string().
 unsafe_message(h2) -> "roadrunner h2 handler returned a header with CR/LF/NUL";
 unsafe_message(h3) -> "roadrunner h3 handler returned a header with CR/LF/NUL".
+
+%% A response that streams may read the body as it goes: the 100 Continue
+%% its client may still be waiting on goes out first
+%% (`roadrunner_conn:continue_before_stream/1`).
+-spec continue_before(roadrunner_handler:response(), roadrunner_req:request()) -> ok.
+continue_before({stream, _Status, _Headers, _Fun}, Req) ->
+    roadrunner_conn:continue_before_stream(Req);
+continue_before({loop, _Status, _Headers, _State}, Req) ->
+    roadrunner_conn:continue_before_stream(Req);
+continue_before(_Response, _Req) ->
+    ok.
 
 -spec crash_message(h2 | h3) -> string().
 crash_message(h2) -> "roadrunner h2 handler crashed";

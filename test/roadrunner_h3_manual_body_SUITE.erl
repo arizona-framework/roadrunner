@@ -18,6 +18,8 @@ picks what it does with the body.
     trailers_end_the_body/1,
     answers_before_the_body/1,
     expect_continue_asks_on_the_first_read/1,
+    streamed_answer_asks_for_the_body_first/1,
+    read_then_streamed_answer_gets_one_100/1,
     expect_continue_rejected_on_the_headers/1,
     body_over_the_cap_fails_the_read/1,
     credit_waits_for_the_reader/1,
@@ -51,6 +53,8 @@ all() ->
         trailers_end_the_body,
         answers_before_the_body,
         expect_continue_asks_on_the_first_read,
+        streamed_answer_asks_for_the_body_first,
+        read_then_streamed_answer_gets_one_100,
         expect_continue_rejected_on_the_headers,
         body_over_the_cap_fails_the_read,
         credit_waits_for_the_reader,
@@ -119,7 +123,9 @@ routes(TestPid) ->
             state => {gated_pieces, ?GATED, TestPid},
             max_content_length => 500000
         },
-        {~"/report", ?H, {report, TestPid}}
+        {~"/report", ?H, {report, TestPid}},
+        {~"/stream-echo", ?H, stream_echo},
+        {~"/read-then-stream", ?H, read_then_stream}
     ].
 
 %% =============================================================================
@@ -175,6 +181,23 @@ expect_continue_asks_on_the_first_read(Config) ->
     ok = interim_100(Conn, StreamId),
     ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, ~"hello", true),
     ?assertMatch({200, _, ~"5"}, roadrunner_quic_test_h3:collect(Conn, StreamId)).
+
+streamed_answer_asks_for_the_body_first(Config) ->
+    %% The handler starts a streamed answer before it reads the body: the 100
+    %% comes first, not after the 200.
+    Conn = ?config(conn, Config),
+    StreamId = open(Conn, ~"/stream-echo", [{~"expect", ~"100-continue"}]),
+    ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, ~"hello", true),
+    ?assertEqual({[100, 200], ~"hello"}, statuses_and_body(Conn, StreamId)).
+
+read_then_streamed_answer_gets_one_100(Config) ->
+    %% The read asks for the body; the streamed answer after it sends no
+    %% second 100.
+    Conn = ?config(conn, Config),
+    StreamId = open(Conn, ~"/read-then-stream", [{~"expect", ~"100-continue"}]),
+    ok = interim_100(Conn, StreamId),
+    ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, ~"hello", true),
+    ?assertEqual({[200], ~"hello"}, statuses_and_body(Conn, StreamId)).
 
 expect_continue_rejected_on_the_headers(Config) ->
     %% No 100: the 401 is the first answer, and the body is never asked for.
@@ -341,6 +364,32 @@ interim_100(Conn, StreamId) ->
             {ok, [{~":status", ~"100"}]} = roadrunner_qpack:decode(Block),
             ok
     after 5000 -> ct:fail(no_interim_100)
+    end.
+
+%% Every status `StreamId` answers with, in order, and its body, read until
+%% the stream ends.
+statuses_and_body(Conn, StreamId) ->
+    frames(stream_bytes(Conn, StreamId, <<>>), [], <<>>).
+
+stream_bytes(Conn, StreamId, Acc) ->
+    receive
+        {quic_test_stream, Conn, StreamId, Bytes, false} ->
+            stream_bytes(Conn, StreamId, <<Acc/binary, Bytes/binary>>);
+        {quic_test_stream, Conn, StreamId, Bytes, true} ->
+            <<Acc/binary, Bytes/binary>>
+    after 5000 -> ct:fail(stream_not_ended)
+    end.
+
+frames(<<>>, Statuses, Body) ->
+    {lists:reverse(Statuses), Body};
+frames(Bytes, Statuses, Body) ->
+    case roadrunner_quic_h3_frame:decode(Bytes) of
+        {ok, {headers, Block}, Rest} ->
+            {ok, Fields} = roadrunner_qpack:decode(Block),
+            {_, Status} = lists:keyfind(~":status", 1, Fields),
+            frames(Rest, [binary_to_integer(Status) | Statuses], Body);
+        {ok, {data, Data}, Rest} ->
+            frames(Rest, Statuses, <<Body/binary, Data/binary>>)
     end.
 
 reset_code(Conn, StreamId) ->

@@ -17,6 +17,9 @@ picks what the handler does with the body:
 - `{answer_first, Name, Pid}`: stream a complete response, then try to read
   the body and send `Pid` the outcome, `{read_after_answer, _}`, then
   register as `Name` and wait for `go`
+- `stream_echo`: start a streamed answer, then read the body and stream it
+  back
+- `read_then_stream`: read the body, then stream it back
 """.
 
 -behaviour(roadrunner_handler).
@@ -34,6 +37,20 @@ behave(read, Req) ->
     end;
 behave(reject, Req) ->
     {roadrunner_resp:text(401, ~"no"), Req};
+behave(stream_echo, Req) ->
+    Fun = fun(Send) ->
+        {ok, Body, _} = roadrunner_req:read_body(Req),
+        _ = Send(Body, fin),
+        ok
+    end,
+    {{stream, 200, [{~"content-type", ~"text/plain"}], Fun}, Req};
+behave(read_then_stream, Req) ->
+    {ok, Body, _} = roadrunner_req:read_body(Req),
+    Fun = fun(Send) ->
+        _ = Send(Body, fin),
+        ok
+    end,
+    {{stream, 200, [{~"content-type", ~"text/plain"}], Fun}, Req};
 behave(pieces, Req) ->
     count(Req, fun(R) -> roadrunner_req:read_body(R, #{length => 4}) end, 0, 0);
 behave(chunks, Req) ->

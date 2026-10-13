@@ -266,6 +266,8 @@ recv_loop(#h3{conn = Conn} = State) ->
             loop(handle_worker_down(State, MonRef, Reason));
         {roadrunner_body_demand, Worker, StreamId} ->
             loop(handle_body_demand(State, Worker, StreamId));
+        {roadrunner_continue, Worker, StreamId} ->
+            loop(handle_continue(State, Worker, StreamId));
         {roadrunner_slot, StreamId, Outcome} ->
             loop(handle_slot(State, StreamId, Outcome));
         {roadrunner_drain, _Deadline} ->
@@ -649,6 +651,26 @@ handle_body_demand(#h3{streams = Streams} = State, Worker, StreamId) ->
             ok = roadrunner_conn:send_body_error(Worker, StreamId, closed),
             State
     end.
+
+%% A worker about to stream its response while the 100 Continue is still
+%% owed (`roadrunner_conn:continue_before_stream/1`): it goes out now, before
+%% this answer lets the worker send its response, and no later read sends
+%% another. The worker waits for the answer either way.
+-spec handle_continue(#h3{}, pid(), non_neg_integer()) -> #h3{}.
+handle_continue(#h3{streams = Streams} = State, Worker, StreamId) ->
+    State1 =
+        case Streams of
+            #{
+                StreamId := #{continue_owed := true, frame_state := Frames, body_error := undefined} =
+                    Stream
+            } when Frames =/= discarding ->
+                Sent = send_continue(State, StreamId),
+                Sent#h3{streams = Streams#{StreamId := Stream#{continue_owed := false}}};
+            _ ->
+                State
+        end,
+    _ = Worker ! {roadrunner_continued, StreamId},
+    State1.
 
 %% A peer reset of a dispatched manual-mode stream ends its body: a waiting
 %% read fails, as does any later one, and a `discarding` marker has nothing
@@ -1123,9 +1145,10 @@ build_request(Headers, Body, RequestContext) ->
 -spec with_body(roadrunner_req:request(), iodata() | reading, non_neg_integer(), #h3{}) ->
     roadrunner_req:request().
 with_body(Req, reading, StreamId, #h3{
-    proto_opts = #{request_timeout := Timeout}, max_content_length = MaxLen
+    proto_opts = #{request_timeout := Timeout}, max_content_length = MaxLen, streams = Streams
 }) ->
-    roadrunner_conn:with_body_reader(Req, StreamId, Timeout, MaxLen);
+    #{StreamId := #{continue_owed := ContinueOwed}} = Streams,
+    roadrunner_conn:with_body_reader(Req, StreamId, Timeout, MaxLen, ContinueOwed);
 with_body(Req, _Body, _StreamId, _State) ->
     Req.
 

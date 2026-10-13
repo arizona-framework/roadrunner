@@ -166,7 +166,11 @@ and `done` flips true with the stream's end.
     bytes_read := non_neg_integer(),
     done := boolean(),
     recv := fun(() -> {ok, iodata(), boolean()} | {error, term()}),
-    max := non_neg_integer()
+    max := non_neg_integer(),
+    %% Present while a 100 Continue is owed to a client holding its body
+    %% back: the connection process and stream a streaming response asks
+    %% for it before it starts.
+    continue => {pid(), pos_integer()}
 }.
 
 -type h1_body_reader() :: #{
@@ -181,10 +185,11 @@ and `done` flips true with the stream's end.
     %% max_header_count}` threaded to `roadrunner_http1:parse_chunk/2`.
     trailer_limits := {pos_integer(), pos_integer(), pos_integer()},
     %% Present while a 100 Continue is owed to a client holding its body
-    %% back: the transport socket the first read sends it on, and the
-    %% request deadline and minimum byte rate of the recv that read then
-    %% starts.
-    continue => {term(), integer(), non_neg_integer()}
+    %% back: the transport socket the first read sends it on, the request
+    %% deadline and minimum byte rate of the recv that read then starts, and
+    %% the flag that has it sent once, by that read or by a streaming
+    %% response starting first.
+    continue => {term(), integer(), non_neg_integer(), atomics:atomics_ref()}
 }.
 
 -export([

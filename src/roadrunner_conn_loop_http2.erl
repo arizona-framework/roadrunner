@@ -576,6 +576,8 @@ recv_more(
             recv_more(handle_send_response(State, StreamId, Status, Headers, Body, BodyLen));
         {roadrunner_body_demand, Worker, StreamId} ->
             recv_more(handle_body_demand(State, Worker, StreamId));
+        {roadrunner_continue, Worker, StreamId} ->
+            recv_more(handle_continue(State, Worker, StreamId));
         {'DOWN', MonRef, process, _Pid, Reason} ->
             recv_more(maybe_exit_when_drained(handle_worker_down(State, MonRef, Reason)));
         {roadrunner_slot, StreamId, Outcome} ->
@@ -1374,6 +1376,29 @@ handle_body_demand(#loop{streams = Streams} = State, Worker, StreamId) ->
             State
     end.
 
+%% A worker about to stream its response while the 100 Continue is still
+%% owed (`roadrunner_conn:continue_before_stream/1`): it goes out now, ahead
+%% of the response HEADERS the worker sends next, and no later read sends
+%% another. The worker waits for the answer either way.
+-spec handle_continue(#loop{}, pid(), stream_id()) -> #loop{}.
+handle_continue(#loop{streams = Streams} = State, Worker, StreamId) ->
+    State1 =
+        case Streams of
+            #{
+                StreamId := #{continue_owed := true, state := Side, body_error := undefined} =
+                    Stream
+            } when
+                Side =/= closed
+            ->
+                update_stream(
+                    send_continue(State, StreamId), StreamId, Stream#{continue_owed := false}
+                );
+            _ ->
+                State
+        end,
+    _ = Worker ! {roadrunner_continued, StreamId},
+    State1.
+
 -spec refill_conn_window(#loop{}) -> #loop{}.
 refill_conn_window(State) ->
     case build_conn_refill(State) of
@@ -1554,6 +1579,7 @@ dispatch_request(
         {ok, Req0} ->
             Req = request_body(
                 StreamId,
+                Stream,
                 Body,
                 roadrunner_conn:with_client_ip(Req0, State#loop.real_ip, Peer),
                 State
@@ -1615,14 +1641,20 @@ buffered_body(reader) -> <<>>.
 
 %% A manual-mode request reads its body through a reader instead of the
 %% buffered `body`.
--spec request_body(stream_id(), {body, iodata()} | reader, roadrunner_req:request(), #loop{}) ->
+-spec request_body(
+    stream_id(), map(), {body, iodata()} | reader, roadrunner_req:request(), #loop{}
+) ->
     roadrunner_req:request().
-request_body(_StreamId, {body, _Body}, Req, _State) ->
+request_body(_StreamId, _Stream, {body, _Body}, Req, _State) ->
     Req;
 request_body(
-    StreamId, reader, Req, #loop{request_timeout = Timeout, max_content_length = MaxCL}
+    StreamId,
+    #{continue_owed := ContinueOwed},
+    reader,
+    Req,
+    #loop{request_timeout = Timeout, max_content_length = MaxCL}
 ) ->
-    roadrunner_conn:with_body_reader(Req, StreamId, Timeout, MaxCL).
+    roadrunner_conn:with_body_reader(Req, StreamId, Timeout, MaxCL, ContinueOwed).
 
 %% =============================================================================
 %% Worker → conn message handlers

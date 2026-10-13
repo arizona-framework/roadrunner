@@ -141,3 +141,12 @@ serve([Next | Rest]) ->
                 end,
             serve(Rest)
     end.
+
+continue_before_stream_when_the_conn_is_gone_test() ->
+    %% The connection that owes the 100 is gone: nothing to wait for.
+    {Dead, MRef} = spawn_monitor(fun() -> ok end),
+    receive
+        {'DOWN', MRef, process, Dead, _} -> ok
+    end,
+    Req = #{body_reader => #{continue => {Dead, 1}}},
+    ?assertEqual(ok, roadrunner_conn:continue_before_stream(Req)).
