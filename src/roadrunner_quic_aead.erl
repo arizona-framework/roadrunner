@@ -117,11 +117,11 @@ protect_header(HPKey, Header, Ciphertext, PNOffset) ->
     PNLen = pn_len(FirstByte),
     %% The sample is at PNOffset + 4 in the packet; the ciphertext begins
     %% at PNOffset + PNLen, so within it the sample starts here.
-    Sample = binary:part(Ciphertext, ?SAMPLE_OFFSET - PNLen, ?SAMPLE_LEN),
-    <<M0, _/binary>> = Mask = hp_mask(HPKey, Sample),
+    SkipLen = ?SAMPLE_OFFSET - PNLen,
+    <<_:SkipLen/binary, Sample:?SAMPLE_LEN/binary, _/binary>> = Ciphertext,
+    <<M0, MaskPN:PNLen/binary, _/binary>> = hp_mask(HPKey, Sample),
     MiddleLen = PNOffset - 1,
     <<_FB, Middle:MiddleLen/binary, PN:PNLen/binary>> = Header,
-    MaskPN = binary:part(Mask, 1, PNLen),
     <<
         (FirstByte bxor first_byte_mask(FirstByte, M0)),
         Middle/binary,
@@ -143,13 +143,14 @@ unprotect_header(HPKey, Packet, PNOffset) ->
         <<Header:PNOffset/binary, AfterHeader/binary>> when
             byte_size(AfterHeader) >= ?SAMPLE_OFFSET + ?SAMPLE_LEN
         ->
-            Sample = binary:part(AfterHeader, ?SAMPLE_OFFSET, ?SAMPLE_LEN),
-            <<M0, _/binary>> = Mask = hp_mask(HPKey, Sample),
+            <<_:?SAMPLE_OFFSET/binary, Sample:?SAMPLE_LEN/binary, _/binary>> = AfterHeader,
+            <<M0, MaskRest/binary>> = hp_mask(HPKey, Sample),
             <<ProtFirstByte, Middle/binary>> = Header,
             FirstByte = ProtFirstByte bxor first_byte_mask(ProtFirstByte, M0),
             PNLen = pn_len(FirstByte),
             <<ProtPN:PNLen/binary, Ciphertext/binary>> = AfterHeader,
-            PN = xor_bytes(ProtPN, binary:part(Mask, 1, PNLen)),
+            <<MaskPN:PNLen/binary, _/binary>> = MaskRest,
+            PN = xor_bytes(ProtPN, MaskPN),
             {ok, <<FirstByte, Middle/binary, PN/binary>>, PNLen, binary:decode_unsigned(PN),
                 Ciphertext};
         _ ->
