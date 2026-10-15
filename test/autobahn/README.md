@@ -32,17 +32,19 @@ Boots a roadrunner WS listener on `localhost:9001` with
 the pass/fail summary, and exits non-zero on any case that is not
 strictly OK.
 
-The suite runs in batches, a fresh client container each: 9.x, 12.x,
-and 13.x alone, then every other case. The client keeps all its results
-in memory until it writes the report, and the whole suite in one
-container grows past what a CI runner allows.
+The suite runs in batches, a fresh client container each: 9.x alone,
+each 12.x and 13.x subsection alone, then every other case. The client
+keeps data from every case until it writes its report, and one whole
+compression section in one container grows past what a CI runner
+allows.
 
 Requires Docker. The image (`crossbario/autobahn-testsuite`) is
 pulled on first run.
 
 Each batch writes an HTML report to
-`test/autobahn/reports/batch-<name>/index.html` (`rest`, `9`, `12`,
-`13`). Open one in a browser for case-by-case detail.
+`test/autobahn/reports/batch-<name>/index.html` (`rest`, `9`, `12.1`
+through `12.5`, `13.1` through `13.7`). Open one in a browser for
+case-by-case detail.
 
 ## Adding cases
 

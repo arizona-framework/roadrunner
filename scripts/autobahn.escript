@@ -29,16 +29,25 @@
 -define(EXIT_STATUS_MARK, "autobahn container exit status: ").
 
 %% The suite runs in batches, a fresh client container each. The client
-%% keeps every case's results in memory until it writes its report, which
-%% grows to several GB over the whole suite (the 16 MB messages of 9.* and
-%% the compression cases of 12.* and 13.* weigh most) and gets the
-%% container killed on a CI runner. The heavy sections run alone, and a
-%% final "rest" batch takes every case they don't, so a category added
-%% upstream still runs.
+%% keeps data from every case until it writes its report: on a CI runner
+%% one compression section (12.* or 13.*) alone took it past 15 GB and the
+%% kernel killed it. So the heavy parts run alone, down to each compression
+%% subsection, and a final "rest" batch takes every case they don't, so a
+%% category added upstream still runs.
 -define(BATCHES, [
     {~"9", [~"9.*"]},
-    {~"12", [~"12.*"]},
-    {~"13", [~"13.*"]}
+    {~"12.1", [~"12.1.*"]},
+    {~"12.2", [~"12.2.*"]},
+    {~"12.3", [~"12.3.*"]},
+    {~"12.4", [~"12.4.*"]},
+    {~"12.5", [~"12.5.*"]},
+    {~"13.1", [~"13.1.*"]},
+    {~"13.2", [~"13.2.*"]},
+    {~"13.3", [~"13.3.*"]},
+    {~"13.4", [~"13.4.*"]},
+    {~"13.5", [~"13.5.*"]},
+    {~"13.6", [~"13.6.*"]},
+    {~"13.7", [~"13.7.*"]}
 ]).
 
 main(Args) ->
@@ -150,8 +159,10 @@ run_batches([{Name, Cases, Exclude} | Rest], Base, Reports) ->
     ok = file:write_file(filename:join(Reports, SpecFile), json:encode(Spec)),
     %% Memory before each batch, so a container killed for memory shows
     %% what else was holding it (this BEAM, or the host).
-    io:format("batch ~s: beam ~B MB, host:~n~s", [
-        Name, erlang:memory(total) div (1024 * 1024), os:cmd("free -m")
+    io:format("batch ~s: beam ~B MB, host available ~s", [
+        Name,
+        erlang:memory(total) div (1024 * 1024),
+        os:cmd("free -m | awk '/Mem:/ {print $7 \" MB\"}'")
     ]),
     case run_container(Reports, SpecFile) of
         ok -> run_batches(Rest, Base, Reports);
