@@ -218,3 +218,20 @@ parse_trigger_byte_at_every_position_test() ->
         end
      || Pos <- lists:seq(0, 16)
     ].
+
+parse_decodes_a_trigger_at_every_position_test() ->
+    %% A `+` or `%20` anywhere in a key of length 1 to 30 is decoded: each
+    %% lane of a word pair, a lone word and every tail size of the scan
+    %% that decides whether a key needs decoding at all.
+    [
+        begin
+            Pre = binary:copy(~"a", Pos),
+            Post = binary:copy(~"a", Len - Pos - 1),
+            ?assertEqual(
+                [{<<Pre/binary, " ", Post/binary>>, true}],
+                roadrunner_qs:parse(<<Pre/binary, Trigger/binary, Post/binary>>),
+                {Len, Pos, Trigger}
+            )
+        end
+     || Len <- lists:seq(1, 30), Pos <- lists:seq(0, Len - 1), Trigger <- [~"+", ~"%20"]
+    ].

@@ -51,13 +51,12 @@ ascii_lowercase_leaves_high_bytes_unchanged_test() ->
     ?assertEqual(<<"caf", 195, 137>>, roadrunner_bin:ascii_lowercase(<<"CAF", 195, 137>>)).
 
 ascii_lowercase_every_byte_at_every_position_test() ->
-    %% Every byte value at every position of a 7-byte word, of the
-    %% second word, and of the shorter tail, so each SWAR lane, the
-    %% `@`/`[` range edges, and bytes >= 128 are all exercised.
-    Filler = binary:copy(~"a", 17),
+    %% Every byte value at every position of lengths 1 to 30, so each lane
+    %% of a word pair, a lone word and every tail size of the SWAR scan,
+    %% the `@`/`[` range edges, and bytes >= 128 are all exercised.
     [
         begin
-            <<Pre:Pos/binary, _, Post/binary>> = Filler,
+            <<Pre:Pos/binary, _, Post/binary>> = binary:copy(~"a", Len),
             In = <<Pre/binary, B, Post/binary>>,
             Want =
                 case B >= $A andalso B =< $Z of
@@ -66,7 +65,7 @@ ascii_lowercase_every_byte_at_every_position_test() ->
                 end,
             ?assertEqual(Want, roadrunner_bin:ascii_lowercase(In))
         end
-     || Pos <- lists:seq(0, 16), B <- lists:seq(0, 255)
+     || Len <- lists:seq(1, 30), Pos <- lists:seq(0, Len - 1), B <- lists:seq(0, 255)
     ].
 
 ascii_lowercase_only_uppercase_test() ->
