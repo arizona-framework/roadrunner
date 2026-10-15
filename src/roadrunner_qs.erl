@@ -110,22 +110,58 @@ encode_component(Bin, Pct20Cp) ->
 %% `roadrunner_swar.hrl`). On short query strings this beats
 %% `binary:match/2` with a compiled `+`/`%` pattern, whose fixed call cost
 %% dominated.
+%% Two words per step, then at most one more word, then the last 0 to 6
+%% bytes as a single integer with the lane constants cut to its size, so
+%% no byte is tested on its own.
 -spec has_trigger(binary()) -> boolean().
-has_trigger(<<X:56, Rest/binary>>) ->
-    Plus = X bxor ?SWAR_BYTES($+),
-    Pct = X bxor ?SWAR_BYTES($%),
-    case ?SWAR_HIGH(?SWAR_ZERO(Plus) bor ?SWAR_ZERO(Pct)) of
+has_trigger(<<X:56, Y:56, Rest/binary>>) ->
+    case
+        ?SWAR_HIGH(
+            ?SWAR_ZERO(X bxor ?SWAR_BYTES($+)) bor ?SWAR_ZERO(X bxor ?SWAR_BYTES($%)) bor
+                ?SWAR_ZERO(Y bxor ?SWAR_BYTES($+)) bor ?SWAR_ZERO(Y bxor ?SWAR_BYTES($%))
+        )
+    of
         0 -> has_trigger(Rest);
         _ -> true
     end;
-has_trigger(<<$+, _/binary>>) ->
-    true;
-has_trigger(<<$%, _/binary>>) ->
-    true;
-has_trigger(<<_, Rest/binary>>) ->
-    has_trigger(Rest);
-has_trigger(<<>>) ->
+has_trigger(<<X:56, Rest/binary>>) ->
+    case ?SWAR_HIGH(?SWAR_ZERO(X bxor ?SWAR_BYTES($+)) bor ?SWAR_ZERO(X bxor ?SWAR_BYTES($%))) of
+        0 -> has_trigger_tail(Rest);
+        _ -> true
+    end;
+has_trigger(Tail) ->
+    has_trigger_tail(Tail).
+
+%% The last 0 to 6 bytes: `?SWAR_ZERO/1` of the `+` and `%` lanes over N
+%% lanes, one clause per size so the constants stay literal.
+-spec has_trigger_tail(binary()) -> boolean().
+has_trigger_tail(<<X:48>>) ->
+    trigger_lanes(
+        X bxor 16#2B2B2B2B2B2B,
+        X bxor 16#252525252525,
+        16#10101010101,
+        16#FFFFFFFFFFFF,
+        16#808080808080
+    );
+has_trigger_tail(<<X:40>>) ->
+    trigger_lanes(
+        X bxor 16#2B2B2B2B2B, X bxor 16#2525252525, 16#101010101, 16#FFFFFFFFFF, 16#8080808080
+    );
+has_trigger_tail(<<X:32>>) ->
+    trigger_lanes(X bxor 16#2B2B2B2B, X bxor 16#25252525, 16#1010101, 16#FFFFFFFF, 16#80808080);
+has_trigger_tail(<<X:24>>) ->
+    trigger_lanes(X bxor 16#2B2B2B, X bxor 16#252525, 16#10101, 16#FFFFFF, 16#808080);
+has_trigger_tail(<<X:16>>) ->
+    trigger_lanes(X bxor 16#2B2B, X bxor 16#2525, 16#101, 16#FFFF, 16#8080);
+has_trigger_tail(<<X:8>>) ->
+    trigger_lanes(X bxor 16#2B, X bxor 16#25, 16#1, 16#FF, 16#80);
+has_trigger_tail(<<>>) ->
     false.
+
+-spec trigger_lanes(integer(), integer(), pos_integer(), pos_integer(), pos_integer()) ->
+    boolean().
+trigger_lanes(Plus, Pct, Ones, All, High) ->
+    ((Plus - Ones) band (Plus bxor All) bor (Pct - Ones) band (Pct bxor All)) band High =/= 0.
 
 %% `-on_load` callback. Compiles the `&`, `=`, `+` and `%20` patterns
 %% `parse/1` and `encode/1` split and replace on once at module load and

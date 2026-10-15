@@ -72,22 +72,57 @@ ascii_lowercase(Bin) when is_binary(Bin) ->
 %% 10 bytes up; the byte loop finishes the < 7 byte tail.
 
 -spec has_uppercase(binary()) -> boolean().
-has_uppercase(<<X:56, R/binary>>) ->
-    Low = X band ?SWAR_BYTES(127),
-    case
-        (?SWAR_BYTES(127 + $Z + 1) - Low) band (X bxor ?SWAR_BYTES(255)) band
-            (Low + ?SWAR_BYTES(127 - ($A - 1))) band ?SWAR_BYTES(128)
-    of
+has_uppercase(<<X:56, Y:56, R/binary>>) ->
+    case upper_word(X) bor upper_word(Y) of
         0 -> has_uppercase(R);
+        _ -> true
+    end;
+has_uppercase(<<X:56, R/binary>>) ->
+    case upper_word(X) of
+        0 -> has_uppercase_tail(R);
         _ -> true
     end;
 has_uppercase(Tail) ->
     has_uppercase_tail(Tail).
 
+-spec upper_word(non_neg_integer()) -> non_neg_integer().
+upper_word(X) ->
+    Low = X band ?SWAR_BYTES(127),
+    (?SWAR_BYTES(127 + $Z + 1) - Low) band (X bxor ?SWAR_BYTES(255)) band
+        (Low + ?SWAR_BYTES(127 - ($A - 1))) band ?SWAR_BYTES(128).
+
+%% The last 0 to 6 bytes as one integer: the same `hasbetween` test over
+%% N lanes, one clause per size so the constants stay literal.
 -spec has_uppercase_tail(binary()) -> boolean().
-has_uppercase_tail(<<C, _/binary>>) when C >= $A, C =< $Z -> true;
-has_uppercase_tail(<<_, R/binary>>) -> has_uppercase_tail(R);
-has_uppercase_tail(<<>>) -> false.
+has_uppercase_tail(<<X:48>>) ->
+    upper_lanes(
+        X,
+        X band 16#7F7F7F7F7F7F,
+        16#DADADADADADA,
+        16#3F3F3F3F3F3F,
+        16#FFFFFFFFFFFF,
+        16#808080808080
+    );
+has_uppercase_tail(<<X:40>>) ->
+    upper_lanes(
+        X, X band 16#7F7F7F7F7F, 16#DADADADADA, 16#3F3F3F3F3F, 16#FFFFFFFFFF, 16#8080808080
+    );
+has_uppercase_tail(<<X:32>>) ->
+    upper_lanes(X, X band 16#7F7F7F7F, 16#DADADADA, 16#3F3F3F3F, 16#FFFFFFFF, 16#80808080);
+has_uppercase_tail(<<X:24>>) ->
+    upper_lanes(X, X band 16#7F7F7F, 16#DADADA, 16#3F3F3F, 16#FFFFFF, 16#808080);
+has_uppercase_tail(<<X:16>>) ->
+    upper_lanes(X, X band 16#7F7F, 16#DADA, 16#3F3F, 16#FFFF, 16#8080);
+has_uppercase_tail(<<X:8>>) ->
+    upper_lanes(X, X band 16#7F, 16#DA, 16#3F, 16#FF, 16#80);
+has_uppercase_tail(<<>>) ->
+    false.
+
+-spec upper_lanes(
+    non_neg_integer(), non_neg_integer(), pos_integer(), pos_integer(), pos_integer(), pos_integer()
+) -> boolean().
+upper_lanes(X, Low, Below, Above, All, High) ->
+    (Below - Low) band (X bxor All) band (Low + Above) band High =/= 0.
 
 %% 26 explicit head clauses + literal lowercase byte instead of
 %% `when C >= $A, C =< $Z -> [C + 32 | ...]`. The compiler converts
