@@ -1350,11 +1350,11 @@ dispatch_response(
     #loop_state{alt_svc = AltSvc} = S,
     _Handler,
     #{method := ~"HEAD"},
-    {Status, Headers0, _Body}
+    {Status, Headers0, Body}
 ) when
     is_integer(Status)
 ->
-    Resp = roadrunner_http1:response(Status, Headers0, ~"", AltSvc),
+    Resp = roadrunner_http1:response(Status, framed(Status, Headers0, Body), ~"", AltSvc),
     queue_response(S, Resp);
 dispatch_response(
     #loop_state{alt_svc = AltSvc} = S,
@@ -1364,8 +1364,30 @@ dispatch_response(
 ) when
     is_integer(Status)
 ->
-    Resp = roadrunner_http1:response(Status, Headers0, Body, AltSvc),
+    Resp = roadrunner_http1:response(Status, framed(Status, Headers0, Body), Body, AltSvc),
     queue_response(S, Resp).
+
+%% A buffered response with neither `content-length` nor
+%% `transfer-encoding` has no end an HTTP/1.1 client can find on a
+%% kept-alive connection (RFC 9112 §6.3), so it gets a `content-length`
+%% from its body. For HEAD that is the length the GET would send (RFC
+%% 9110 §8.6). 1xx, 204, and 304 carry no body and are left as they are
+%% (RFC 9110 §8.6 forbids `content-length` on a 204).
+-spec framed(roadrunner_http:status(), roadrunner_http:headers(), iodata()) ->
+    roadrunner_http:headers().
+framed(Status, Headers, _Body) when Status < 200; Status =:= 204; Status =:= 304 ->
+    Headers;
+framed(_Status, Headers, Body) ->
+    case has_framing(Headers) of
+        true -> Headers;
+        false -> [{~"content-length", integer_to_binary(iolist_size(Body))} | Headers]
+    end.
+
+-spec has_framing(roadrunner_http:headers()) -> boolean().
+has_framing([{~"content-length", _} | _]) -> true;
+has_framing([{~"transfer-encoding", _} | _]) -> true;
+has_framing([_ | Rest]) -> has_framing(Rest);
+has_framing([]) -> false.
 
 -spec dispatch_websocket(
     #loop_state{}, roadrunner_req:request(), module(), term(), roadrunner_http:headers()

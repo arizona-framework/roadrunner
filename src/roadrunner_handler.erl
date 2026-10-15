@@ -13,7 +13,9 @@ threading `Req` through the entire request lifecycle.
 `Response` is one of:
 
 - `{StatusCode, Headers, Body}` — buffered response, encoded and sent
-  in one shot.
+  in one shot. Without a `content-length` or `transfer-encoding`
+  header, HTTP/1.1 adds `content-length` from the body (HTTP/2 and
+  HTTP/3 frame the body themselves).
 - `{stream, StatusCode, Headers, StreamFun}` — chunked streaming. The
   connection emits status + headers (with `Transfer-Encoding: chunked`
   auto-prepended) and calls `StreamFun(Send)` where
