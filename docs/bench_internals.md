@@ -3,9 +3,9 @@
 This doc explains the internals of the two load drivers that ship in
 `scripts/`: the in-tree closed-loop one (`bench.escript`) and the
 external open-loop one (`wrk2_bench.sh`). Read it if you need to
-know what the numbers in [`bench_results.md`](bench_results.md) and
-[`wrk2_results.md`](wrk2_results.md) actually measure, or if you're
-trying to decide which driver to trust for a given question.
+know what the numbers from `bench_matrix.sh` and `wrk2_bench.sh`
+actually measure, or if you're trying to decide which driver to
+trust for a given question.
 
 ## TL;DR
 
@@ -111,8 +111,8 @@ pct(Sorted, N, Q) ->
 
 So `p99` is `Sorted[round(0.99 * N)]`, etc. For a 5-second h1 hello
 run at 50 workers, the sample count is well over 1 M (roughly the
-per-second peak in `bench_results.md` × 5), so the index hits the
-right percentile to within 1 sample.
+per-second peak × 5), so the index hits the right percentile to
+within 1 sample.
 
 ### Can the loader be the bottleneck?
 
@@ -125,10 +125,9 @@ Content-Length bytes + nanosecond timestamp + cons + recursion);
 the remaining ~137 µs is the worker blocked on the response
 (kernel + server time). The Erlang CPU portion is what competes
 with the server for cores: 50 workers × 30 µs × 6 k cycles per
-second is ~9 cores of total loadgen CPU. On the 24-thread machine
-in `bench_results.md`'s header, that fits comfortably below
-saturation; on smaller boxes the loadgen and the server can
-genuinely contend.
+second is ~9 cores of total loadgen CPU. On a 24-thread machine
+that fits comfortably below saturation; on smaller boxes the
+loadgen and the server can genuinely contend.
 
 Symptoms of loader saturation:
 
@@ -142,10 +141,10 @@ If you suspect this, drop to fewer clients (`--clients 25`) and
 compare against the default. If RPS doesn't drop proportionally,
 you were CPU-bound on the loadgen.
 
-For the canonical comparison numbers in `bench_results.md` we run
-50 clients on a 24-thread machine which leaves the loadgen
-comfortably below saturation for everything except the very top
-throughput cells (`hello`, `pipelined_h1`).
+For our own local runs we use 50 clients on a 24-thread machine,
+which leaves the loadgen comfortably below saturation for
+everything except the very top throughput cells (`hello`,
+`pipelined_h1`).
 
 ## `wrk2_bench.sh` — open-loop, via Docker wrk2
 
@@ -190,14 +189,15 @@ The driver script (`scripts/wrk2_bench.sh`):
    reported, for direct comparison).
 5. The script kills the standalone listener, repeats for each
    (server, scenario, rate) combination, and writes the matrix
-   to `docs/wrk2_results.md`.
+   to `/tmp/wrk2_results.md` (or the `--out` path).
 
 ### Rate selection
 
 For each (scenario, server) pair, the script sweeps four rates:
 50 %, 75 %, 90 %, 95 % of the peak measured by `bench.escript`
-(read from `bench_results.md`). The 90 % point usually sits
-around the elbow; 95 % usually saturates. The achieved-rate
+(the script's `PEAK` table, taken from a `bench_matrix.sh` run).
+The 90 % point usually sits around the elbow; 95 % usually
+saturates. The achieved-rate
 column in the report flags rows where actual / target < 0.99.
 
 ### Latency aggregation — HdrHistogram with CO correction
@@ -239,10 +239,9 @@ finding regressions. The open-loop bench answers **"what tail
 latency does every issued request see at rate R?"** — useful for
 SLA sizing and exposing tail-hiding effects.
 
-`bench_results.md` and `wrk2_results.md` are complementary, not
-substitutes. The peak in `bench_results.md` feeds the rate sweep in
-`wrk2_results.md`; the tail in `wrk2_results.md` tells you how
-close to that peak you can actually run in production.
+The two outputs are complementary, not substitutes. The
+closed-loop peak feeds the wrk2 rate sweep; the wrk2 tail tells
+you how close to that peak you can actually run in production.
 
 ## HttpArena-shape workloads
 
@@ -279,6 +278,4 @@ alongside throughput:
 ```
 
 For hot-path analysis, add `--profile --profile-tool eprof` (or
-`fprof`); the workflow established in
-[`conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md)
-applies directly.
+`fprof`).

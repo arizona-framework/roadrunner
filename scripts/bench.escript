@@ -138,8 +138,8 @@
     ?PROTOCOL_AGNOSTIC_SCENARIOS ++ ?H1_ONLY_SCENARIOS ++ ?H2_ONLY_SCENARIOS
 ).
 
-%% Curated headline set rendered in `docs/bench_results.md` and
-%% `docs/wrk2_results.md`. Every member is also in
+%% Curated headline set driven by `scripts/bench_matrix.sh` and
+%% `scripts/wrk2_bench.sh`. Every member is also in
 %% `?KNOWN_SCENARIOS`; the macro is orthogonal to the
 %% protocol-compat partition above, so a main scenario carries
 %% whatever protocols its `?PROTOCOL_AGNOSTIC_*` / `?H?_ONLY_*`

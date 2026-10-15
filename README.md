@@ -13,18 +13,17 @@ Pure-Erlang HTTP/1.1 + HTTP/2 + HTTP/3 + WebSocket server for Erlang/OTP.
 Roadrunner is the HTTP backbone of the
 [arizona-framework](https://github.com/arizona-framework/arizona), and works
 standalone too. The API is small: a handler behaviour, request and response
-accessors, listener controls, and opt-in helpers (cookies, query strings,
-multipart, SSE, NDJSON, WebSocket).
+accessors, listener controls, and opt-in helpers.
 
 ## Why Roadrunner?
 
 A small, fast HTTP core you can trust on the hot path.
 
 - **Fast where it counts**: Tuned for low p50 and p99 under sustained load. See
-  [Performance at a glance](#performance-at-a-glance).
+  [Performance](#performance).
 - **Correct and hostile-input-safe**: Strict RFC 9110 / 9112 / 9113 parsing,
-  100% h2spec and 100% Autobahn (no exclusions), and stress-tested against
-  request-smuggling corpora. See [Conformance](#conformance).
+  100% h2spec and 100% Autobahn (no exclusions), and tested against
+  request-smuggling cases. See [Conformance](#conformance).
 - **Every HTTP version, one server**: HTTP/1.1, HTTP/2, HTTP/3 (experimental),
   and WebSocket served from one listener; browsers upgrade to h3 over the same
   port via `Alt-Svc`.
@@ -46,102 +45,6 @@ Requires **OTP 27+**.
 Roadrunner is in `0.x`. The core is functional and covered by tests,
 but the API may change between minor versions. Pin an exact version
 in your deps if you need stability across upgrades.
-
-## Conformance
-
-Strict 100% h2spec (HTTP/2) and Autobahn fuzzingclient across the full
-WebSocket matrix (no exclusions). HTTP/1.1 parsers stress-tested against
-the [llhttp](https://github.com/nodejs/llhttp) test corpus and the
-canonical [PortSwigger](https://portswigger.net/web-security/request-smuggling)
-request-smuggling vectors.
-
-Standards conformance:
-
-- **HTTP/1.1**: RFC 9110 (semantics) + RFC 9112 (syntax).
-- **HTTP/2**: RFC 9113 (frames + multiplexing) + RFC 7541 (HPACK).
-  Opt-in per listener via `protocols => [http1, http2]` (or
-  `[http2]` for h2c prior-knowledge on plain TCP). Conformance
-  harness: [`scripts/h2spec.sh`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/h2spec.sh) (drives
-  [h2spec](https://github.com/summerwind/h2spec)).
-- **HTTP/3 (experimental)**: RFC 9114 over QUIC with QPACK (RFC 9204)
-  static-table compression. Enable per listener via
-  `protocols => [http3]` (requires `tls`; QUIC mandates TLS 1.3); it
-  co-serves with h1/h2 on the same port number (TCP for h1/h2, UDP for
-  h3) and advertises `Alt-Svc` so browsers upgrade. Roadrunner ships its
-  own pure-Erlang QUIC transport; treat HTTP/3 as experimental.
-- **Content-Encoding (RFC 9110 §8.4.1)**: gzip + deflate with
-  qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3),
-  works unchanged over HTTP/2.
-- **WebSocket**: RFC 6455. Conformance harness:
-  [`scripts/autobahn.escript`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/autobahn.escript) (drives the
-  [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
-  fuzzingclient).
-- **WebSocket compression**: RFC 7692 `permessage-deflate`,
-  including `*_max_window_bits` and `*_no_context_takeover`.
-
-## Performance at a glance
-
-Median req/s over HTTP/1.1 on a 12th-gen i9-12900HX, 50 clients,
-2 s warmup + 5 s measure, loopback. HTTP/2 numbers, p50 / p99
-percentiles, and memory shape sit in
-[`docs/bench_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/bench_results.md)
-and [`docs/comparison.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/comparison.md).
-
-| scenario                  | roadrunner    | cowboy        | elli          |
-|---------------------------|--------------:|--------------:|--------------:|
-| `hello`                   |   **307 k**   |       201 k   |       299 k   |
-| `json`                    |       299 k   |       189 k   |   **304 k**   |
-| `echo`                    |   **304 k**   |       162 k   |       282 k   |
-| `headers_heavy`           |   **257 k**   |       141 k   |       253 k   |
-| `large_response`          |   **124 k**   |        98 k   |       123 k   |
-| `multi_request_body`      |       262 k   |       125 k   |   **274 k**   |
-| `varied_paths_router`     |   **290 k**   |       175 k   |          —    |
-| `post_4kb_form`           |   **193 k**   |        98 k   |          —    |
-| `large_post_streaming`    |    **20 k**   |       6.9 k   |          —    |
-| `pipelined_h1`            |   **580 k**   |       371 k   |       4.8 k   |
-| `websocket_msg_throughput`|   **232 k**   |       179 k   |          —    |
-| `gzip_response`           |   **138 k**   |       111 k   |          —    |
-
-Bold = fastest in row. `—` means that workload has no elli fixture. On
-simple GETs and small POSTs Roadrunner and elli sit within the bench's
-~15% variance band on those rows; the comparison doc has the full
-methodology.
-
-### Tail latency at sustained load
-
-Open-loop, Coordinated-Omission-corrected (wrk2, `hello`, 8 threads,
-50 connections, 3-run median): Roadrunner sustains **291 k req/s**
-at p50 1.07 ms, p99 2.31 ms, p99.99 4.70 ms. Full per-scenario
-matrix with all four rate-points per server in
-[`docs/wrk2_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/wrk2_results.md).
-
-The throughput numbers above are from `scripts/bench.escript`
-(closed-loop); the comparison doc has the full methodology
-breakdown.
-
-## Comparison
-
-If your workload needs a feature, the server has to ship it. `—`
-means achievable in user code but no helper / option built in; `✗`
-means out of scope for that server.
-
-| feature                                   | roadrunner | cowboy | elli |
-|-------------------------------------------|:----------:|:------:|:----:|
-| HTTP/1.1                                  |     ✓      |   ✓    |  ✓   |
-| HTTP/2 + HPACK                            |     ✓      |   ✓    |  ✗   |
-| HTTP/3 (QUIC, experimental)               |     ✓      |   ✗    |  ✗   |
-| WebSocket (RFC 6455)                      |     ✓      |   ✓    |  —   |
-| permessage-deflate (RFC 7692)             |     ✓      |   ✓    |  ✗   |
-| Native router                             |     ✓      |   ✓    |  ✗   |
-| gzip / deflate response negotiation       |     ✓      |   ✓    |  —   |
-| Streaming request bodies                  |     ✓      |   ✓    |  —   |
-| Native qs / cookie / multipart            |     ✓      |   ✓    |  —   |
-| Server-Sent Events helper                 |     ✓      |   —    |  —   |
-| NDJSON streaming helper                   |     ✓      |   —    |  —   |
-| Sendfile                                  |     ✓      |   ✓    |  ✓   |
-| Static handler (ETag / Range / IMS)       |     ✓      |   ✓    |  —   |
-| Graceful drain with deadline + broadcast  |     ✓      |   —    |  ✗   |
-| Per-request `request_id` in logger meta   |     ✓      |   —    |  ✗   |
 
 ## Quickstart
 
@@ -178,300 +81,387 @@ roadrunner:start_listener(my_listener, #{
 ```
 
 ```
-$ curl -i localhost:8080
-HTTP/1.1 200 OK
-content-type: text/plain; charset=utf-8
-content-length: 18
-
+$ curl localhost:8080
 hello, roadrunner!
 ```
 
-A handler is a module with `handle/1`. To read path parameters from a `:param`
-route (`roadrunner_req:bindings/1`), read the body (`read_body/1` returns
-`iodata` and threads `Req2` back), and reply with JSON
-(`roadrunner_resp:json/2` encodes the term):
+## Documentation
 
-```erlang
--module(users_handler).
--behaviour(roadrunner_handler).
--export([handle/1]).
+| Topic | Description |
+|---|---|
+| [API reference](https://hexdocs.pm/roadrunner/) | Every public module, type, and function |
+| [Listener options](https://hexdocs.pm/roadrunner/roadrunner_listener.html#t:opts/0) | Every listener option |
+| [Handlers](https://hexdocs.pm/roadrunner/roadrunner_handler.html) | Response shapes: buffered, stream, loop, sendfile, WebSocket |
+| [Middleware](https://hexdocs.pm/roadrunner/roadrunner_middleware.html) | Writing and ordering middleware |
+| [Resource limits](https://github.com/arizona-framework/roadrunner/blob/main/docs/resource_limits.md) | Per-connection and per-peer limits, defaults, and over-limit behavior |
+| [Roadmap](https://github.com/arizona-framework/roadrunner/blob/main/docs/roadmap.md) | Planned work |
+| [Changelog](https://github.com/arizona-framework/roadrunner/blob/main/CHANGELOG.md) | Release notes |
 
-handle(Req) ->
-    #{~"id" := Id} = roadrunner_req:bindings(Req),
-    {ok, Body, Req2} = roadrunner_req:read_body(Req),
-    Reply = #{id => Id, received => byte_size(iolist_to_binary(Body))},
-    {roadrunner_resp:json(200, Reply), Req2}.
-```
+## Features
 
-Mix literal and `:param` routes:
+### Routing
+
+Routes are tried top to bottom and the first match wins. `:param` binds one
+segment and `*wildcard` binds the rest of the path as a list:
 
 ```erlang
 routes => [
     {~"/", hello_handler, #{greeting => ~"hello"}},
-    {~"/users/:id", users_handler, undefined}
+    {~"/users/:id", user_handler},
+    {~"/files/*path", files_handler}
 ]
 ```
 
-Routes are tried top to bottom and the first match wins, so the specific route
-goes above the general one. When a route can never be reached because the
-entries above it already answer its path and its methods, the listener refuses
-to start and names both lines. A mis-ordered table shows up at boot with the
-line to move, instead of as a 404 in production.
-
-Restrict a route to specific HTTP methods with the **map form**'s `methods` key
-(a non-empty list of uppercase method binaries). A request whose path matches a
-route but whose method is not listed gets `405 Method Not Allowed` with an `Allow`
-header; two routes may share a path with disjoint methods for REST-style dispatch.
-A route with no `methods` answers every method. Matching is literal -- a `[~"GET"]`
-route does not implicitly answer `HEAD`, so list every method the route accepts:
-
 ```erlang
-routes => [
-    #{path => ~"/users", handler => users_index,  methods => [~"GET"]},
-    #{path => ~"/users", handler => users_create, methods => [~"POST"]}
-]
+#{~"id" := Id} = roadrunner_req:bindings(Req).
 ```
 
-Give a route its own request-body cap with the map form's `max_content_length`
-key, in bytes. It takes the place of the listener's `max_content_length` for the
-requests that route answers, so an upload endpoint can accept large bodies while
-the rest of the API keeps a small cap:
+A route that can never match, because the routes above it already answer its
+path and methods, stops the listener from starting and names both routes. A
+mis-ordered table shows up at boot instead of as a 404 in production.
+
+The map form adds per-route options: allowed `methods` (others get `405` with an
+`Allow` header), a body cap, a request rate, and route middleware:
 
 ```erlang
-max_content_length => 1_048_576,
 routes => [
+    #{path => ~"/users", handler => users_index, methods => [~"GET"]},
+    #{path => ~"/users", handler => users_create, methods => [~"POST"]},
     #{path => ~"/upload", handler => upload_handler, max_content_length => 104_857_600},
-    {~"/users/:id", user_handler}
+    #{path => ~"/login", handler => login_handler, rate_limit => #{rate => 5, period => 60}}
 ]
 ```
 
-A route can also have its own per-client request rate with the `rate_limit` key,
-in the shape of the listener's `rate_limit` (`rate`, `period` in seconds, `burst`).
-It is kept on top of the listener's limit, so a login endpoint can allow a few
-attempts a minute while the rest of the API keeps its usual rate:
+Method matching is literal, so a `[~"GET"]` route does not answer `HEAD`. Swap
+the table on a running listener with `roadrunner_listener:reload_routes/2`. For
+a listener with a single handler, pass `routes => Mod` (or `{Mod, State}`) to
+skip the router.
+
+### Requests
+
+`roadrunner_req` reads everything from the request value. Functions that
+consume the body return a new `Req`:
 
 ```erlang
-routes => [
-    #{path => ~"/login", handler => login_handler, rate_limit => #{rate => 5, period => 60}},
-    {~"/users/:id", user_handler}
+handle(Req) ->
+    Method = roadrunner_req:method(Req),
+    Agent = roadrunner_req:header(~"user-agent", Req),
+    Query = roadrunner_req:parse_qs(Req),
+    Cookies = roadrunner_req:parse_cookies(Req),
+    {ok, Body, Req2} = roadrunner_req:read_body(Req),
+    ...
+```
+
+`read_form/1` decodes both urlencoded and `multipart/form-data` bodies. With
+`body_buffering => manual`, `read_body/2` reads the body in chunks.
+
+### Responses
+
+`roadrunner_resp` builds buffered responses, and you can also return a plain
+`{Status, Headers, Body}` tuple:
+
+```erlang
+%% Each line is a possible return from handle/1
+{roadrunner_resp:json(200, #{id => 42}), Req}
+{roadrunner_resp:redirect(302, ~"/login"), Req}
+{roadrunner_resp:not_found(), Req}
+{{200, [{~"content-type", ~"text/plain"}, {~"content-length", ~"2"}], ~"hi"}, Req}
+```
+
+The builders set `content-length` for you. A plain tuple is sent as written,
+so set it yourself.
+
+Set a cookie on any buffered response:
+
+```erlang
+Resp = roadrunner_resp:text(200, ~"welcome"),
+{roadrunner_resp:set_cookie(Resp, ~"session", Token, #{http_only => true, secure => true}), Req}
+```
+
+### Streaming
+
+Return `{stream, Status, Headers, Fun}` and call `Send` as data is ready.
+On HTTP/1.1 the body goes out chunked, and `{fin, Trailers}` sends trailer
+headers:
+
+```erlang
+handle(Req) ->
+    Fun = fun(Send) ->
+        ok = Send(~"first part\n", nofin),
+        ok = Send(~"last part\n", fin)
+    end,
+    {{stream, 200, [{~"content-type", ~"text/plain"}], Fun}, Req}.
+```
+
+### Server-Sent Events
+
+A `{loop, ...}` response keeps the connection open and calls `handle_info/3`
+for each message the process receives. `roadrunner_sse` frames the events:
+
+```erlang
+handle(Req) ->
+    ok = my_pubsub:subscribe(self(), notifications),
+    Headers = [{~"content-type", ~"text/event-stream"}, {~"cache-control", ~"no-cache"}],
+    {{loop, 200, Headers, undefined}, Req}.
+
+handle_info({notification, Body}, Push, State) ->
+    _ = Push(roadrunner_sse:event(~"notify", Body)),
+    {ok, State};
+handle_info(_Other, _Push, State) ->
+    {ok, State}.
+```
+
+Keep a catch-all clause: Roadrunner also sends the handler
+`{roadrunner_disconnect, Reason}` when the client goes away and
+`{roadrunner_drain, Deadline}` when the listener drains.
+
+### NDJSON
+
+```erlang
+{roadrunner_resp:ndjson(200, Rows), Req}
+```
+
+To stream rows instead, send `roadrunner_ndjson:item(Row)` from a `{stream, ...}`
+response.
+
+### WebSocket
+
+Upgrade from any handler over HTTP/1.1, then handle frames in a
+`roadrunner_ws_handler`:
+
+```erlang
+handle(Req) ->
+    {{websocket, echo_ws, #{}}, Req}.
+```
+
+```erlang
+-module(echo_ws).
+-behaviour(roadrunner_ws_handler).
+-export([handle_frame/2]).
+
+handle_frame(#{opcode := text, payload := Msg}, State) ->
+    {reply, [{text, Msg}], State};
+handle_frame(_Frame, State) ->
+    {ok, State}.
+```
+
+Fragmented messages arrive reassembled, and ping, pong, and close are handled
+for you. `permessage-deflate` is negotiated automatically when the client asks
+for it. Optional `init/1`, `handle_info/2`, and `handle_drain/2` callbacks
+cover setup, process messages, and drain.
+
+### Static files
+
+```erlang
+{~"/static/*path", roadrunner_static, #{
+    dir => ~"/var/www",
+    cache_control => ~"public, max-age=31536000, immutable"
+}}
+```
+
+Supports `ETag`, `Last-Modified`, `Range`, and precompressed `.br` / `.gz`
+files, and by default refuses a symlinked file that points outside `dir`.
+Handlers can also send a file directly with
+`{sendfile, Status, Headers, {Filename, Offset, Length}}` (zero-copy for
+HTTP/1.1 over plain TCP).
+
+### Middleware
+
+A middleware wraps the handler. It gets the request and a `Next` function,
+and the first entry in the list runs outermost:
+
+```erlang
+auth(Req, Next, _State) ->
+    case roadrunner_req:header(~"authorization", Req) of
+        undefined -> {roadrunner_resp:unauthorized(), Req};
+        _ -> Next(Req)
+    end.
+```
+
+Built-in middleware:
+
+```erlang
+middlewares => [
+    roadrunner_compress,
+    roadrunner_etag,
+    roadrunner_security_headers,
+    {roadrunner_cors, #{origins => [~"https://app.example.com"], credentials => true}},
+    {fun ?MODULE:auth/3, undefined}
 ]
 ```
 
-The request accessors (`method/1`, `path/1`, `header/2`, `parse_qs/1`,
-`bindings/1`, `peer/1`, `read_body/1`) all live in `roadrunner_req`.
+- **`roadrunner_compress`**: gzip / deflate negotiated on `Accept-Encoding`
+- **`roadrunner_etag`**: weak `ETag` on buffered `200` responses to `GET` /
+  `HEAD`, and `304 Not Modified` on a match
+- **`roadrunner_security_headers`**: safe default headers, with opt-in HSTS
+  (`hsts => true`) and CSP
+- **`roadrunner_cors`**: CORS with preflight handling and deny-by-default origins
 
-To wrap every response, register a middleware. An entry is a `Callable` or a
-`{Callable, State}` pair, and the first in the list runs outermost:
+### HTTP/2 and HTTP/3
 
-```erlang
--module(server_header_mw).
--behaviour(roadrunner_middleware).
--export([call/3]).
-
-call(Req, Next, _State) ->
-    {{Status, Headers, Body}, Req2} = Next(Req),
-    {{Status, [{~"server", ~"roadrunner"} | Headers], Body}, Req2}.
-```
-
-```erlang
-roadrunner:start_listener(api, #{
-    port => 8080,
-    middlewares => [server_header_mw],
-    routes => [{~"/", hello_handler, #{greeting => ~"hello"}}]
-}).
-```
-
-For HTTP/2 over TLS, add a cert and list both protocols. ALPN is
-derived from `protocols` automatically:
+Add a certificate and list the protocols. ALPN is set up from `protocols`:
 
 ```erlang
 roadrunner:start_listener(my_tls_listener, #{
     port => 8443,
-    protocols => [http1, http2],
-    tls => [
-        {certfile, "cert.pem"},
-        {keyfile, "key.pem"}
-    ],
+    protocols => [http1, http2, http3],
+    tls => [{certfile, "cert.pem"}, {keyfile, "key.pem"}],
     routes => [{~"/", hello_handler, #{greeting => ~"hello"}}]
 }).
 ```
 
-ALPN routes `h2` clients to the HTTP/2 path and `http/1.1` clients (or
-no-ALPN) to the HTTP/1.1 path on the same listener. Drop `http2` from
-the list to disable HTTP/2. For HTTP/2 on plain TCP (h2c
-prior-knowledge per RFC 7540 §3.4), use `protocols => [http2]` without
-the `tls` opt.
+HTTP/1.1 and HTTP/2 share the TCP port. HTTP/3 (experimental) serves over UDP
+on the same port number and advertises `Alt-Svc` so browsers upgrade. For
+HTTP/2 over plain TCP (prior knowledge), use `protocols => [http2]` without
+`tls`. Without `tls`, a listener serves either HTTP/1.1 or HTTP/2, not both.
 
-For HTTP/3 (experimental), add `http3` to a TLS listener's `protocols`
-(e.g. `protocols => [http1, http2, http3]`). It serves h3 over UDP on the
-same port number and advertises `Alt-Svc` so browsers upgrade from TCP;
-the QUIC transport starts on demand, so h1/h2-only listeners never open a
-UDP socket.
-
-For listeners that don't need routing, `routes => Mod` (or
-`{Mod, State}` to seed handler state) skips the router entirely and
-dispatches every request to `Mod:handle/1`:
+### Behind a proxy
 
 ```erlang
-roadrunner:start_listener(my_listener, #{
-    port => 8080,
-    routes => {hello_handler, #{greeting => ~"hello"}}
-}).
+%% L4 balancer that prepends a PROXY protocol header
+proxy_protocol => true,
+
+%% HTTP proxies that set X-Forwarded-For
+real_ip => #{trusted_proxies => [~"10.0.0.0/8"]}
 ```
+
+`roadrunner_req:client_ip/1` returns the real client, and rate limits and
+telemetry use it too.
+
+### Limits and hardening
+
+```erlang
+max_clients => 10_000,
+max_content_length => 1_048_576,
+request_timeout => 30_000,
+rate_limit => #{rate => 100, period => 1}
+```
+
+- Strict RFC 9110 / 9112 parsing that rejects request smuggling shapes
+  (CL + TE, conflicting `Content-Length`) and CR / LF injection in headers
+- TLS 1.2 / 1.3 only with AEAD ciphers, and post-quantum hybrid key exchange
+  first on HTTP/1.1 and HTTP/2 when your OTP and OpenSSL support it
+- Bounds on connections, concurrent HTTP/2 and HTTP/3 requests, body size,
+  slow clients, and header size, all listed in [Configuration](#configuration)
+
+### Observability
+
+Roadrunner emits [`telemetry`](https://hex.pm/packages/telemetry) events for
+requests, connections, and WebSocket frames:
+
+```erlang
+telemetry:attach(log_requests, [roadrunner, request, stop],
+    fun(_Event, #{duration := D}, #{method := M, path := P, status := S}, _) ->
+        Us = erlang:convert_time_unit(D, native, microsecond),
+        logger:info("~s ~s -> ~p (~p us)", [M, P, S, Us])
+    end, undefined).
+```
+
+Each request also sets a `request_id` in the `logger` process metadata, so
+logs from your handlers line up with it. `roadrunner_listener:info/1` returns
+live counters such as `active_clients` and `requests_served`.
+
+### Graceful drain
+
+```erlang
+case roadrunner_listener:drain(my_listener, 30_000) of
+    {ok, drained} -> ok;
+    {timeout, Killed} -> logger:warning("closed ~p connections at the deadline", [Killed])
+end.
+```
+
+Drain stops accepting new connections, tells open connections and long-lived
+handlers (loop and WebSocket) to finish, waits up to the deadline, closes what
+is left, and then stops the listener.
 
 ## Configuration
 
 All listener options live in the
 [`roadrunner_listener:opts/0`](https://hexdocs.pm/roadrunner/roadrunner_listener.html#t:opts/0)
-type, with per-key defaults and tuning rationale. Beyond `port`,
-`protocols`, `tls`, and `routes` from the Quickstart, the type covers:
+type. Beyond `port`,
+`protocols`, `tls`, and `routes`, the type covers:
 
-- **DoS bounds**: `max_clients`, `max_concurrent_requests`,
-  `socket_backlog`, `max_content_length`, `request_timeout`,
-  `keep_alive_timeout`, `min_bytes_per_second`, `max_keep_alive_requests`,
-  `rate_limit` (opt-in per-peer request-rate guard)
-- **Real client IP**: `proxy_protocol` (read the PROXY-protocol header an
-  L4 balancer prepends, on plain and TLS listeners alike, so
-  `roadrunner_req:peer/1` is the real client) and `real_ip` (behind HTTP
-  proxies, read the client from `X-Forwarded-For` or `Forwarded`, trusting
-  only the proxies you list or the hop count you set; get it with
-  `roadrunner_req:client_ip/1`)
-- **Bind address**: `ip` (restrict a listener to a specific local
-  interface, e.g. `{127,0,0,1}` for loopback-only; default binds all
-  interfaces)
+- **Limits and timeouts**: `max_clients`, `max_concurrent_requests`,
+  `overload_mode` (refuse or queue requests over the limit),
+  `max_content_length`, `max_keep_alive_requests`, `request_timeout`,
+  `keep_alive_timeout`, `tls_handshake_timeout`, `min_bytes_per_second`,
+  `rate_check_interval`, `rate_limit`
+- **Real client IP**: `proxy_protocol`, `real_ip` (see
+  [Behind a proxy](#behind-a-proxy))
+- **Sockets**: `ip` (bind address, all interfaces by default),
+  `num_acceptors`, `socket_backlog`, `recv_buffer`
 - **Middleware**: `middlewares`
 - **Body buffering**: `body_buffering`
 - **Graceful drain**: `graceful_drain`, `slot_reconciliation`
 - **Per-conn hibernation**: `hibernate_after`
 - **Handler spawn opts**: `handler_spawn`
+- **WebSocket**: `ws`: `max_frame_size`, `max_message_size`, `recv_buffer`,
+  `hibernate_after`
 - **HTTP/1 tunables**: Under the `{http1, Opts}` entry in `protocols`:
   `max_request_line`, `max_header_line`, `max_header_block`,
-  `max_header_count`
+  `max_header_count`, `linger_timeout`
 - **HTTP/2 tunables**: Under the `{http2, Opts}` entry in `protocols`:
   `conn_window`, `stream_window`, `window_refill_threshold`,
-  `max_concurrent_streams`, `max_header_block`
+  `max_concurrent_streams`, `max_header_block`, `max_header_list_size`
 - **HTTP/3 tunables**: Under the `{http3, Opts}` entry in `protocols`:
-  `listeners` (reuseport pool size), `max_header_block`
+  `listeners` (reuseport pool size), `max_header_block`, `max_streams_bidi`,
+  `max_field_section_size`
 
-## Features
+## Modules
 
-### Handlers
+| Module | Purpose |
+|---|---|
+| `roadrunner` | Start, stop, and list listeners |
+| `roadrunner_listener` | Listener options, drain, info, and route reload |
+| `roadrunner_handler` | Handler behaviour and response shapes |
+| `roadrunner_req` | Request accessors and body reading |
+| `roadrunner_resp` | Response builders |
+| `roadrunner_router` | Route syntax and matching |
+| `roadrunner_middleware` | Middleware behaviour |
+| `roadrunner_ws_handler` | WebSocket handler behaviour |
+| `roadrunner_static` | Static file handler |
+| `roadrunner_sse` | Server-Sent Events framing |
+| `roadrunner_ndjson` | NDJSON framing |
+| `roadrunner_multipart` | `multipart/form-data` parser |
+| `roadrunner_cookie` | Cookie parsing and serialization |
+| `roadrunner_qs` | Query string codec |
+| `roadrunner_uri` | Percent-encoding helpers |
+| `roadrunner_http` | Shared HTTP types and date formatting |
+| `roadrunner_cors` | CORS middleware |
+| `roadrunner_security_headers` | Security headers middleware |
 
-- **Buffered responses**: `{Status, Headers, Body}` via `roadrunner_resp:text/2`,
-  `:html/2`, `:json/2`, `:ndjson/2`, `:redirect/2`, plus empty-status shortcuts.
-- **Streaming**: `{stream, Status, Headers, Fun}`, chunked transfer with a
-  `Send/2` callback; supports trailer headers per RFC 9112 §7.1.2.
-  `roadrunner_ndjson:item/1` frames newline-delimited JSON lines for a
-  streamed or buffered response.
-- **Loop / SSE**: `{loop, Status, Headers, State}` plus an optional
-  `handle_info/3` callback for message-driven push.
-- **WebSocket**: `{websocket, Module, State}` upgrade with a
-  `roadrunner_ws_handler` callback; `{websocket, Module, State, Headers}`
-  adds headers to the 101 (a `set-cookie`, a chosen `sec-websocket-protocol`).
-- **Sendfile**: `{sendfile, Status, Headers, {Filename, Offset, Length}}`,
-  zero-copy file body via `file:sendfile/5` (TCP) or chunked `ssl:send`
-  fallback (TLS).
+## Conformance
 
-### Routing
+Strict 100% h2spec (HTTP/2) and Autobahn fuzzingclient across the full
+WebSocket matrix (no exclusions). The HTTP/1.1 parser is tested against
+malformed-request cases taken from the [llhttp](https://github.com/nodejs/llhttp)
+test corpus and [PortSwigger](https://portswigger.net/web-security/request-smuggling)
+request-smuggling patterns.
 
-- **Router**: `roadrunner_router` with literal / `:param` / `*wildcard` segments.
-- **Hot reload**: Routes published to `persistent_term` for O(1) lookup;
-  `roadrunner_listener:reload_routes/2` swaps the table without restart.
+Standards conformance:
 
-### Middleware
+- **HTTP/1.1**: RFC 9110 (semantics) + RFC 9112 (syntax).
+- **HTTP/2**: RFC 9113 (frames + multiplexing) + RFC 7541 (HPACK).
+  Conformance harness: [`scripts/h2spec.sh`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/h2spec.sh) (drives
+  [h2spec](https://github.com/summerwind/h2spec)).
+- **HTTP/3 (experimental)**: RFC 9114 over QUIC with QPACK (RFC 9204)
+  static-table compression, over Roadrunner's own pure-Erlang QUIC
+  transport (TLS 1.3 required).
+- **Content-Encoding (RFC 9110 §8.4.1)**: gzip + deflate with
+  qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3),
+  works unchanged over HTTP/2.
+- **WebSocket**: RFC 6455. Conformance harness:
+  [`scripts/autobahn.escript`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/autobahn.escript) (drives the
+  [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
+  fuzzingclient).
+- **WebSocket compression**: RFC 7692 `permessage-deflate`,
+  including `*_max_window_bits` and `*_no_context_takeover`.
 
-- **Continuation-style**: Each entry is a `Callable` or a
-  `{Callable, State}` pair, where `Callable` is a module (`call/3`) or a
-  `fun((Req, Next, State) -> {Response, Req2})`. Listener-level + per-route,
-  first-in-list = outermost.
+## Performance
 
-### Built-in middleware
-
-- **`roadrunner_compress`**: gzip / deflate response compression negotiated
-  on `Accept-Encoding`, with `Vary: Accept-Encoding`.
-- **`roadrunner_security_headers`**: a default-safe response header set
-  (`x-content-type-options`, `x-frame-options`, `referrer-policy`), with
-  opt-in HSTS and CSP; a header the handler already set wins.
-- **`roadrunner_cors`**: configurable CORS with an `OPTIONS` preflight
-  short-circuit, deny-by-default origins, and a cache-correct `Vary: Origin`.
-- **`roadrunner_etag`**: conditional requests for dynamic `GET` / `HEAD`
-  responses; derives a weak `ETag` from the body (or honors one the handler
-  set) and answers a matching `If-None-Match` with `304 Not Modified`.
-
-### Built-in handlers
-
-- **`roadrunner_static`**: File serving with ETag, `If-None-Match`, `Range`,
-  `Last-Modified`, `If-Modified-Since`, and configurable symlink policy
-  (`refuse_escapes` default).
-
-### Hardening
-
-- **Strict parsing**: RFC 9110 / 9112, with defenses grouped by subsystem:
-    - **Request smuggling / framing**: CL+TE conflict, multiple-CL,
-      chunk-size leading-whitespace rejection.
-    - **Header / control-frame injection**: Header CRLF / NUL rejection,
-      SSE event-line CRLF rejection, trailer-header CRLF rejection,
-      RFC 6455 §5.5 control-frame limits, RFC 6265 cookie OWS handling.
-    - **Sendfile path safety**: Path traversal + symlink escape defenses.
-- **TLS defaults**: TLS 1.2 / 1.3 only, AEAD-only cipher filter,
-  client renegotiation off, post-quantum hybrid `x25519mlkem768` first
-  when the OpenSSL build supports it. Full settings list in the
-  `roadrunner_listener` module docs.
-- **DoS bounds**: `max_clients`, `max_concurrent_requests`,
-  `socket_backlog`, `max_content_length`, `min_bytes_per_second`,
-  `request_timeout`, `keep_alive_timeout`, `max_keep_alive_requests`.
-
-### Observability
-
-- **Telemetry**: `telemetry` events covering request, response, listener
-  accept / close, slot reconciliation, ws upgrade and frames, and
-  drain ack (opt-in via `roadrunner:acknowledge_drain/1`). Full event
-  list with measurements / metadata in the `roadrunner_telemetry`
-  module docs.
-- **Log correlation**: Per-request `request_id` attached to
-  `logger:set_process_metadata/1` so any `?LOG_*` from
-  middleware/handlers is auto-correlated.
-- **Pull metrics**: `roadrunner_listener:info/1` for `active_clients` /
-  `requests_served`.
-- **Process labels**: `proc_lib:set_label/1` per-listener / per-acceptor /
-  per-conn for legible `observer` process trees.
-
-### Lifecycle
-
-- **Drain**: `roadrunner_listener:drain/2` does graceful shutdown with a
-  timeout: closes the listen socket, broadcasts `{roadrunner_drain, Deadline}`
-  to in-flight conns, polls until idle or deadline, then
-  `exit(Pid, shutdown)` for stragglers.
-- **Status**: `roadrunner_listener:status/1` returns `accepting | draining`.
-- **Slot reconciliation**: a periodic reaper that compares `client_counter`
-  against the live registered conns and releases slots orphaned by
-  `kill`-style exits (`kill` signals, OOM kills, supervisor brutal-kill),
-  on by default every 60 s; tune with `slot_reconciliation => #{interval => N}`
-  or turn it off with `slot_reconciliation => disabled`. Off on
-  `graceful_drain => false` listeners, which keep no registry.
-
-## Documentation
-
-- [`docs/comparison.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/comparison.md): full side-by-side
-  benchmarks vs cowboy and elli (throughput, latency, architectural
-  trade-offs, reproduction commands).
-- [`docs/bench_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/bench_results.md): full per-protocol
-  matrix with p50 / p99 across every scenario.
-- [`docs/bench_internals.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/bench_internals.md): loadgen worker
-  model, latency aggregation, when the loader becomes the bottleneck.
-- [`docs/wrk2_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/wrk2_results.md): open-loop,
-  Coordinated-Omission-corrected tail-latency tables (full per-scenario,
-  all rate-points per server).
-- [`docs/resource_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/resource_results.md): memory + CPU
-  shape per scenario.
-- [`docs/resource_limits.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/resource_limits.md): the
-  per-connection and per-peer memory / CPU limits, with defaults and
-  over-limit behavior (operator reference).
-- [`docs/conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md):
-  the connection-process model trade-offs and the one h2 case
-  cowboy still wins.
-- [`docs/roadmap.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/roadmap.md): deferred items, with rough
-  effort estimates for each.
+Roadrunner runs on [HttpArena](https://http-arena.com/), an open
+benchmark that tests HTTP servers and frameworks on the same hardware
+under the same rules. See the leaderboard for current numbers.
 
 ## Sponsors
 

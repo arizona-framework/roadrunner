@@ -7,8 +7,8 @@
 # Omission. Complements `scripts/bench.escript`'s closed-loop matrix.
 #
 # Per-(scenario, server), the script sweeps FOUR rates set at 50%,
-# 75%, 90%, and 95% of each server's measured peak from
-# `docs/bench_results.md` (the PEAK_ESTIMATE table below). 90 % is
+# 75%, 90%, and 95% of each server's measured peak from a
+# `scripts/bench_matrix.sh` run (the PEAK table below). 90 % is
 # where the elbow usually sits; 95 % typically saturates. The
 # achieved rate is reported next to the target — when achieved/
 # target < 0.99 the row is tagged `(saturated)`. Median across N
@@ -60,7 +60,7 @@ RUNS=3
 DURATION_S=60
 THREADS=8
 CONNS=50
-OUT="docs/wrk2_results.md"
+OUT="/tmp/wrk2_results.md"
 WRK2_IMAGE="${WRK2_IMAGE:-cylab/wrk2:latest}"
 
 # Parse args.
@@ -142,32 +142,32 @@ declare -A EXTRA_HEADERS=(
     [httparena_json]="Accept: application/json"
 )
 
-# Per-(server, scenario) PEAK ESTIMATE in req/s. Pulled from
-# `docs/bench_results.md` (h1 section). The script sweeps at 50%,
-# 75%, 95% of these. Estimates can drift with code changes; the
+# Per-(server, scenario) PEAK ESTIMATE in req/s. Headline rows come
+# from the 2026-10-14 `scripts/bench_matrix.sh` run (h1 section). The
+# script sweeps at 50%, 75%, 90%, 95% of these. Estimates can drift with code changes; the
 # achieved-rate column makes the gap visible.
 declare -A PEAK=(
-    [roadrunner.hello]=307000           [cowboy.hello]=201000           [elli.hello]=299000
-    [roadrunner.json]=299000            [cowboy.json]=189000            [elli.json]=304000
-    [roadrunner.echo]=304000            [cowboy.echo]=162000            [elli.echo]=282000
-    [roadrunner.headers_heavy]=257000   [cowboy.headers_heavy]=141000   [elli.headers_heavy]=253000
-    [roadrunner.large_response]=124000  [cowboy.large_response]=98000   [elli.large_response]=123000
+    [roadrunner.hello]=484000           [cowboy.hello]=236000           [elli.hello]=447000
+    [roadrunner.json]=462000            [cowboy.json]=212000            [elli.json]=440000
+    [roadrunner.echo]=433000            [cowboy.echo]=156000            [elli.echo]=417000
+    [roadrunner.headers_heavy]=382000   [cowboy.headers_heavy]=147000   [elli.headers_heavy]=322000
+    [roadrunner.large_response]=140000  [cowboy.large_response]=112000  [elli.large_response]=134000
     [roadrunner.url_with_qs]=247000     [cowboy.url_with_qs]=167000
     [roadrunner.path_with_unicode]=235000 [cowboy.path_with_unicode]=167000
     [roadrunner.cors_preflight]=242000  [cowboy.cors_preflight]=162000
     [roadrunner.redirect_response]=258000 [cowboy.redirect_response]=176000
     [roadrunner.head_method]=251000     [cowboy.head_method]=176000
-    [roadrunner.post_4kb_form]=193000   [cowboy.post_4kb_form]=98000
+    [roadrunner.post_4kb_form]=260000   [cowboy.post_4kb_form]=80000
     [roadrunner.chunked_request_body]=266000 [cowboy.chunked_request_body]=137000
     [roadrunner.compressed_request_body]=289000 [cowboy.compressed_request_body]=154000 [elli.compressed_request_body]=298000
-    [roadrunner.multi_request_body]=262000 [cowboy.multi_request_body]=125000 [elli.multi_request_body]=274000
-    [roadrunner.large_post_streaming]=20000 [cowboy.large_post_streaming]=6900
+    [roadrunner.multi_request_body]=394000 [cowboy.multi_request_body]=138000 [elli.multi_request_body]=376000
+    [roadrunner.large_post_streaming]=23000 [cowboy.large_post_streaming]=7900
     [roadrunner.cookies_heavy]=287000   [cowboy.cookies_heavy]=163000
     [roadrunner.etag_304]=234000        [cowboy.etag_304]=169000
     [roadrunner.large_keepalive_session]=227000 [cowboy.large_keepalive_session]=175000 [elli.large_keepalive_session]=279000
-    [roadrunner.gzip_response]=138000   [cowboy.gzip_response]=111000
+    [roadrunner.gzip_response]=138000   [cowboy.gzip_response]=87000
     [roadrunner.backpressure_sustained]=249000 [cowboy.backpressure_sustained]=182000
-    [roadrunner.varied_paths_router]=239000 [cowboy.varied_paths_router]=168000
+    [roadrunner.varied_paths_router]=472000 [cowboy.varied_paths_router]=173000
     # roadrunner-only HttpArena-shape scenarios. The upload scenarios
     # are intentionally absent: at 50 concurrent 20 MB POSTs they
     # don't fit the matrix's memory budget; profile them via
@@ -558,8 +558,8 @@ Closed-loop tools (wrk, ab, vegeta, our own \`bench.escript\`) hide
 the tail because the client backs off when the server stalls.
 
 For each scenario, each server is driven at four rates: 50 %, 75 %,
-90 %, and 95 % of its measured peak from
-[\`bench_results.md\`](bench_results.md). The 90 % point typically
+90 %, and 95 % of its measured peak from a
+\`scripts/bench_matrix.sh\` run. The 90 % point typically
 sits around the elbow; 95 % usually saturates. The \`achieved\`
 column is the actual rate wrk2 sustained; when achieved / target
 < 0.99 the row is tagged \`(saturated)\`.
@@ -577,7 +577,7 @@ Time"). Two tables per scenario:
   signal even if achieved is at target.
 
 $(if [ "$RUNS" -eq 1 ]; then
-    echo "Each row is a **single run at ${DURATION_S}s** (no medianing — this is a preliminary capture; re-run with \`--runs 3\` on a quiet machine for the canonical artifact),"
+    echo "Each row is a **single run at ${DURATION_S}s** (no medianing — this is a preliminary capture; re-run with \`--runs 3\` on a quiet machine for stable numbers),"
 else
     echo "Each row is the median of **${RUNS} runs at ${DURATION_S}s each**,"
 fi)

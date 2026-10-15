@@ -94,7 +94,7 @@ Start an `fprof` trace seeded with the same roadrunner-pid set as
 `start/0`. fprof produces a richer call-tree (per-MFA OWN and ACC
 time, callers/callees) than eprof and tolerates higher trace volumes
 without blocking. Use it for the connection-lifecycle survey where
-eprof times out (see `docs/conn_lifecycle_investigation.md`).
+eprof times out.
 
 `TraceFile` is the binary trace output; pass it to
 `stop_fprof_and_dump/2` along with the desired analysis output path.
