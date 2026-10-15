@@ -167,11 +167,31 @@ oversized_no_crlf_rejected_test() ->
     ).
 
 oversized_with_crlf_rejected_test() ->
-    Line = binary:copy(~"a", 8193),
+    Line = <<"GET /", (binary:copy(~"a", 8193))/binary, " HTTP/1.1">>,
     ?assertEqual(
         {error, request_line_too_long},
         roadrunner_http1:parse_request_line(<<Line/binary, "\r\n">>)
     ).
+
+oversized_method_not_implemented_test() ->
+    %% RFC 9112 §3: a method longer than any the server implements gets
+    %% 501, not the 414 meant for a long target; that the method alone
+    %% fills the limit is what tells the two apart, with or without the
+    %% line's end in the buffer.
+    Method = binary:copy(~"A", 8200),
+    [
+        ?assertEqual({error, not_implemented}, roadrunner_http1:parse_request_line(Line))
+     || Line <- [Method, <<Method/binary, " / HTTP/1.1\r\n">>]
+    ].
+
+oversized_line_without_method_rejected_test() ->
+    %% With no space in the limit and bytes no method may hold, the line
+    %% is malformed rather than long.
+    Junk = binary:copy(~"a", 8200),
+    [
+        ?assertEqual({error, bad_request_line}, roadrunner_http1:parse_request_line(Line))
+     || Line <- [Junk, <<Junk/binary, "\r\n">>]
+    ].
 
 %% =============================================================================
 %% parse_header/1
@@ -716,12 +736,13 @@ request_empty_query_keeps_path_test() ->
 target_every_byte_at_every_position_test() ->
     %% Every byte value at every position of a 19-byte path and of a
     %% 19-byte query: each SWAR lane of both 7-byte words and the tail,
-    %% in both walks. Allowed: > 0x20 except 0x7F. A `?` in the path
+    %% in both walks. Allowed: 0x21 to 0x7E (US-ASCII without CTL, SP and
+    %% DEL). A `?` in the path
     %% starts the query; a `?` in the query is a plain query byte. SP,
     %% CR and LF never reach the check (they split the request line),
     %% so only the error is asserted for them.
     Fill = binary:copy(~"a", 18),
-    Valid = fun(B) -> B > 16#20 andalso B =/= 16#7F end,
+    Valid = fun(B) -> B > 16#20 andalso B < 16#7F end,
     Parse = fun(Target) ->
         roadrunner_http1:parse_request(<<"GET ", Target/binary, " HTTP/1.1\r\nhost: x\r\n\r\n">>)
     end,
@@ -1248,7 +1269,13 @@ response_status_reason_phrases_test_() ->
         {401, ~"Unauthorized"},
         {403, ~"Forbidden"},
         {404, ~"Not Found"},
+        {405, ~"Method Not Allowed"},
+        {408, ~"Request Timeout"},
+        {413, ~"Content Too Large"},
+        {414, ~"URI Too Long"},
+        {431, ~"Request Header Fields Too Large"},
         {500, ~"Internal Server Error"},
+        {501, ~"Not Implemented"},
         {503, ~"Service Unavailable"}
     ],
     [
@@ -1456,11 +1483,80 @@ extension_method_request_lines_test() ->
         )
      || {Target, Path, VersionBin, Version} <- [
             {~"/a?b", ~"/a", ~"HTTP/1.1", {1, 1}},
-            {~"?x", ~"", ~"HTTP/1.1", {1, 1}},
+            {~"/?x", ~"/", ~"HTTP/1.1", {1, 1}},
             {~"/a?", ~"/a", ~"HTTP/1.1", {1, 1}},
             {~"/a", ~"/a", ~"HTTP/1.0", {1, 0}}
         ]
     ].
+
+request_line_non_ascii_target_rejected_test() ->
+    %% A request-target is US-ASCII (RFC 3986 §2): raw UTF-8 or other
+    %% high bytes are a bad request line (RFC 9112 §3.2), in the path or
+    %% the query, whether the 7-byte word scan or the byte walk meets them.
+    [
+        ?assertEqual(
+            {error, bad_request_line},
+            roadrunner_http1:parse_request_line(<<"GET ", Target/binary, " HTTP/1.1\r\n">>),
+            Target
+        )
+     || Target <- [
+            <<"/caf", 16#C3, 16#A9>>,
+            <<"/", 16#C0, 16#AF>>,
+            <<"/long/path/caf", 16#C3, 16#A9, "/more/path">>,
+            <<"/p?q=caf", 16#C3, 16#A9>>,
+            <<"/p?long=query&caf", 16#C3, 16#A9, "=more">>,
+            <<"/", 16#80>>,
+            <<"/", 16#FF>>
+        ]
+    ].
+
+request_line_target_form_follows_method_test() ->
+    %% RFC 9112 §3.2: origin-form for any method, absolute-form accepted,
+    %% asterisk-form only for OPTIONS (§3.2.4), authority-form only for
+    %% CONNECT (§3.2.3).
+    Parse = fun(Method, Target) ->
+        roadrunner_http1:parse_request_line(
+            <<Method/binary, " ", Target/binary, " HTTP/1.1\r\n">>
+        )
+    end,
+    ?assertMatch({ok, ~"OPTIONS", ~"*", {1, 1}, ~""}, Parse(~"OPTIONS", ~"*")),
+    ?assertMatch(
+        {ok, ~"GET", ~"http://example.com/a", _, _}, Parse(~"GET", ~"http://example.com/a")
+    ),
+    ?assertMatch({ok, ~"GET", ~"http://example.com", _, _}, Parse(~"GET", ~"http://example.com")),
+    ?assertMatch({ok, ~"GET", ~"urn:example:a", _, _}, Parse(~"GET", ~"urn:example:a")),
+    ?assertMatch({ok, ~"PURGE", ~"/a", _, _}, Parse(~"PURGE", ~"/a")),
+    [
+        ?assertEqual({error, bad_request_line}, Parse(Method, Target), {Method, Target})
+     || {Method, Target} <- [
+            {~"GET", ~"*"},
+            {~"POST", ~"*"},
+            {~"OPTIONS", ~"*x"},
+            {~"GET", ~"example.com:443"},
+            {~"GET", ~"localhost:"},
+            {~"GET", ~"a"},
+            {~"GET", ~"1http://example.com/"},
+            {~"GET", ~"ht~tp://example.com/"},
+            {~"GET", ~"?q"}
+        ]
+    ].
+
+request_line_connect_not_implemented_test() ->
+    %% RFC 9110 §9.3.6: CONNECT asks for a tunnel, which roadrunner doesn't
+    %% open, so it is a 501 whatever its target.
+    [
+        ?assertEqual(
+            {error, not_implemented},
+            roadrunner_http1:parse_request_line(<<"CONNECT ", Target/binary, " HTTP/1.1\r\n">>)
+        )
+     || Target <- [~"example.com:443", ~"/"]
+    ],
+    ?assertEqual(
+        {error, not_implemented},
+        roadrunner_http1:parse_request(
+            ~"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+        )
+    ).
 
 request_line_cut_inside_short_query_asks_for_more_test() ->
     %% The buffer ends a few bytes into the query: no space or CRLF yet.

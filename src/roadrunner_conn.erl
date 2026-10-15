@@ -1812,10 +1812,12 @@ send_status(Socket, Status) ->
 %% Map an `roadrunner_http1:parse_request/2` error reason to its HTTP
 %% status. Size-limit overruns get the RFC-specific codes (414 URI Too
 %% Long per RFC 9110 §15.5.15, 431 Request Header Fields Too Large per
-%% RFC 6585 §5); every other malformed-input reason is a generic 400.
+%% RFC 6585 §5), a method the server doesn't implement gets 501 (RFC 9110
+%% §15.6.2), and every other malformed-input reason is a generic 400.
 -doc false.
 -spec parse_error_status(atom()) -> roadrunner_http:status().
 parse_error_status(request_line_too_long) -> 414;
+parse_error_status(not_implemented) -> 501;
 parse_error_status(header_too_long) -> 431;
 parse_error_status(header_block_too_long) -> 431;
 parse_error_status(too_many_headers) -> 431;

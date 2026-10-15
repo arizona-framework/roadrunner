@@ -2494,6 +2494,10 @@ recv_response_with_body(Sock, BodyLen) ->
 parse_error_status_request_line_too_long_test() ->
     ?assertEqual(414, roadrunner_conn:parse_error_status(request_line_too_long)).
 
+parse_error_status_not_implemented_test() ->
+    %% RFC 9110 §15.6.2: a method the server doesn't implement is a 501.
+    ?assertEqual(501, roadrunner_conn:parse_error_status(not_implemented)).
+
 parse_error_status_header_too_long_test() ->
     ?assertEqual(431, roadrunner_conn:parse_error_status(header_too_long)).
 
