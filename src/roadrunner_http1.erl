@@ -67,6 +67,11 @@ oversized lines are rejected with `request_line_too_long` so the
 connection layer can answer `414 URI Too Long`.
 
 Bare LF terminators are rejected as `bad_request_line` per RFC 9112 §2.2.
+So are a target with bytes outside US-ASCII, an asterisk-form (`*`)
+target on any method but OPTIONS, and an authority-form (`host:port`)
+target (RFC 9112 §3.2). A CONNECT request returns `not_implemented`:
+roadrunner doesn't open tunnels, so the connection layer answers
+`501 Not Implemented`.
 """.
 %% The {more, undefined} return is a deliberate narrowing of the broader
 %% {more, undefined | pos_integer()} shape used elsewhere — we do not yet
@@ -74,7 +79,7 @@ Bare LF terminators are rejected as `bad_request_line` per RFC 9112 §2.2.
 -spec parse_request_line(binary()) ->
     {ok, Method :: binary(), Target :: binary(), version(), Rest :: binary()}
     | {more, undefined}
-    | {error, bad_request_line | bad_version | request_line_too_long}.
+    | {error, bad_request_line | bad_version | request_line_too_long | not_implemented}.
 %% RFC 9112 §2.2 robustness allowance: a server SHOULD ignore at least
 %% one empty line received prior to the request-line. We strip one
 %% optional leading `\r\n` and then parse normally. Two consecutive
@@ -89,7 +94,7 @@ parse_request_line(Bin) ->
 -spec parse_request_line(binary(), pos_integer()) ->
     {ok, Method :: binary(), Target :: binary(), version(), Rest :: binary()}
     | {more, undefined}
-    | {error, bad_request_line | bad_version | request_line_too_long}.
+    | {error, bad_request_line | bad_version | request_line_too_long | not_implemented}.
 parse_request_line(Bin, MaxReqLine) ->
     %% The internal variant also returns `Path` (the target with any `?query`
     %% sliced off, captured for free during target validation). The public
@@ -105,7 +110,7 @@ parse_request_line(Bin, MaxReqLine) ->
 -spec parse_request_line_p(binary(), pos_integer()) ->
     {ok, Method :: binary(), Target :: binary(), Path :: binary(), version(), Rest :: binary()}
     | {more, undefined}
-    | {error, bad_request_line | bad_version | request_line_too_long}.
+    | {error, bad_request_line | bad_version | request_line_too_long | not_implemented}.
 parse_request_line_p(<<"\r\n", Rest/binary>>, MaxReqLine) ->
     request_line(Rest, MaxReqLine);
 parse_request_line_p(Bin, MaxReqLine) when is_binary(Bin) ->
@@ -123,16 +128,68 @@ parse_request_line_p(Bin, MaxReqLine) when is_binary(Bin) ->
 -spec request_line(binary(), pos_integer()) ->
     {ok, Method :: binary(), Target :: binary(), Path :: binary(), version(), Rest :: binary()}
     | {more, undefined}
-    | {error, bad_request_line | bad_version | request_line_too_long}.
+    | {error, bad_request_line | bad_version | request_line_too_long | not_implemented}.
 request_line(Bin, MaxReqLine) ->
     case fast_request_line(Bin, MaxReqLine) of
         slow ->
             do_parse_request_line(
                 Bin, persistent_term:get(?LF_KEY), persistent_term:get(?SPACE_KEY), MaxReqLine
             );
-        Parsed ->
-            Parsed
+        {ok, Method, Target, _Path, _Version, _Rest} = Parsed ->
+            case target_form(Method, Target) of
+                ok -> Parsed;
+                {error, _} = Error -> Error
+            end
     end.
+
+%% RFC 9112 §3.2: which request-target form goes with which method. The
+%% origin-form (`/path`) is what nearly every request carries; the
+%% absolute-form is accepted as it is today. The asterisk-form is only
+%% for a server-wide OPTIONS (§3.2.4), so `GET *` is a bad request line.
+%% CONNECT asks for a tunnel, which roadrunner doesn't open, so it is not
+%% implemented (RFC 9110 §9.3.6, §15.6.2) whatever its target; and the
+%% authority-form (`host:port`) belongs to CONNECT alone (§3.2.3), so
+%% with any other method it is a bad request line too.
+-spec target_form(binary(), binary()) -> ok | {error, bad_request_line | not_implemented}.
+target_form(~"CONNECT", _Target) -> {error, not_implemented};
+target_form(_Method, <<$/, _/binary>>) -> ok;
+target_form(~"OPTIONS", ~"*") -> ok;
+target_form(_Method, Target) -> absolute_form(Target).
+
+%% `absolute-URI = scheme ":" hier-part [ "?" query ]` (RFC 3986 §4.3),
+%% with `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`: the
+%% scheme and its colon are enough to tell it from an authority-form,
+%% whose host can't start with `scheme:` followed by more than digits.
+-spec absolute_form(binary()) -> ok | {error, bad_request_line}.
+absolute_form(<<C, Rest/binary>>) when C >= $a, C =< $z; C >= $A, C =< $Z ->
+    scheme(Rest);
+absolute_form(_Target) ->
+    {error, bad_request_line}.
+
+-spec scheme(binary()) -> ok | {error, bad_request_line}.
+scheme(<<C, Rest/binary>>) when
+    C >= $a, C =< $z; C >= $A, C =< $Z; C >= $0, C =< $9; C =:= $+; C =:= $-; C =:= $.
+->
+    scheme(Rest);
+scheme(<<$:, Rest/binary>>) ->
+    hier_part(Rest);
+scheme(_Rest) ->
+    {error, bad_request_line}.
+
+%% What follows the scheme's colon. An authority-form's port is all
+%% digits (`example.com:443`), so a scheme-looking host followed by a
+%% port is not an absolute-form; anything else after the colon is.
+-spec hier_part(binary()) -> ok | {error, bad_request_line}.
+hier_part(Rest) ->
+    case port_only(Rest) of
+        true -> {error, bad_request_line};
+        false -> ok
+    end.
+
+-spec port_only(binary()) -> boolean().
+port_only(<<C, Rest/binary>>) when C >= $0, C =< $9 -> port_only(Rest);
+port_only(<<>>) -> true;
+port_only(_) -> false.
 
 -spec fast_request_line(binary(), pos_integer()) ->
     {ok, binary(), binary(), binary(), version(), binary()} | slow.
@@ -163,14 +220,15 @@ fast_method(_Cur, _Bin, _Max) ->
     slow.
 
 %% The target's path, 7 bytes per step while a word holds no byte <= 0x20,
-%% no 0x7F and no `?` (RFC 9110 §5.6.2 target bytes); `T` is the target's
+%% no byte >= 0x7F and no `?` (a request-target is US-ASCII, RFC 3986 §2,
+%% with no CTL, SP or DEL); `T` is the target's
 %% start, `Bin` the line's.
 -spec fast_path(binary(), binary(), binary(), binary(), pos_integer()) ->
     {ok, binary(), binary(), binary(), version(), binary()} | slow.
 fast_path(<<X:56, R/binary>> = Cur, T, Method, Bin, Max) ->
     Del = X bxor ?SWAR_BYTES(16#7F),
     Qm = X bxor ?SWAR_BYTES($?),
-    case ?SWAR_HIGH(?SWAR_BELOW(X, 16#21) bor ?SWAR_ZERO(Del) bor ?SWAR_ZERO(Qm)) of
+    case ?SWAR_HIGH(X bor ?SWAR_BELOW(X, 16#21) bor ?SWAR_ZERO(Del) bor ?SWAR_ZERO(Qm)) of
         0 -> fast_path(R, T, Method, Bin, Max);
         _ -> fast_path_byte(Cur, T, Method, Bin, Max)
     end;
@@ -189,7 +247,7 @@ fast_path_byte(<<$\s, R/binary>>, T, Method, Bin, Max) ->
     end;
 fast_path_byte(<<$?, R/binary>>, T, Method, Bin, Max) ->
     fast_query(R, T, byte_size(T) - byte_size(R) - 1, Method, Bin, Max);
-fast_path_byte(<<C, R/binary>>, T, Method, Bin, Max) when C > 16#20, C =/= 16#7F ->
+fast_path_byte(<<C, R/binary>>, T, Method, Bin, Max) when C > 16#20, C < 16#7F ->
     fast_path_byte(R, T, Method, Bin, Max);
 fast_path_byte(_Cur, _T, _Method, _Bin, _Max) ->
     slow.
@@ -200,7 +258,7 @@ fast_path_byte(_Cur, _T, _Method, _Bin, _Max) ->
     {ok, binary(), binary(), binary(), version(), binary()} | slow.
 fast_query(<<X:56, R/binary>> = Cur, T, PathLen, Method, Bin, Max) ->
     Del = X bxor ?SWAR_BYTES(16#7F),
-    case ?SWAR_HIGH(?SWAR_BELOW(X, 16#21) bor ?SWAR_ZERO(Del)) of
+    case ?SWAR_HIGH(X bor ?SWAR_BELOW(X, 16#21) bor ?SWAR_ZERO(Del)) of
         0 -> fast_query(R, T, PathLen, Method, Bin, Max);
         _ -> fast_query_byte(Cur, T, PathLen, Method, Bin, Max)
     end;
@@ -214,7 +272,7 @@ fast_query_byte(<<$\s, R/binary>>, T, PathLen, Method, Bin, Max) ->
     <<Target:TargetLen/binary, _/binary>> = T,
     <<Path:PathLen/binary, _/binary>> = Target,
     fast_version(R, Method, Target, Path, Bin, Max);
-fast_query_byte(<<C, R/binary>>, T, PathLen, Method, Bin, Max) when C > 16#20, C =/= 16#7F ->
+fast_query_byte(<<C, R/binary>>, T, PathLen, Method, Bin, Max) when C > 16#20, C < 16#7F ->
     fast_query_byte(R, T, PathLen, Method, Bin, Max);
 fast_query_byte(_Cur, _T, _PathLen, _Method, _Bin, _Max) ->
     slow.
@@ -290,14 +348,15 @@ validate_method_chars(<<C, Rest/binary>>) when C >= $A, C =< $Z ->
 validate_method_chars(_) ->
     error.
 
-%% A request-target is valid when non-empty with no CTL, SP or DEL (RFC
-%% 9110 §5.6.2); path and query share that byte class.
+%% A request-target is valid when non-empty, US-ASCII (RFC 3986 §2; raw
+%% UTF-8 or other high bytes must be percent-encoded) and free of CTL, SP
+%% and DEL; path and query share that byte class.
 -spec valid_target(binary()) -> boolean().
 valid_target(<<>>) -> false;
 valid_target(Target) -> valid_target_bytes(Target).
 
 -spec valid_target_bytes(binary()) -> boolean().
-valid_target_bytes(<<C, Rest/binary>>) when C > 16#20, C =/= 16#7F -> valid_target_bytes(Rest);
+valid_target_bytes(<<C, Rest/binary>>) when C > 16#20, C < 16#7F -> valid_target_bytes(Rest);
 valid_target_bytes(<<>>) -> true;
 valid_target_bytes(_) -> false.
 
@@ -888,6 +947,7 @@ a record, so callers don't need to include a header file.
         bad_request_line
         | bad_version
         | request_line_too_long
+        | not_implemented
         | bad_header
         | header_too_long
         | header_block_too_long
@@ -915,6 +975,7 @@ The conn loop passes the listener's configured `http1_*` limits;
         bad_request_line
         | bad_version
         | request_line_too_long
+        | not_implemented
         | bad_header
         | header_too_long
         | header_block_too_long
