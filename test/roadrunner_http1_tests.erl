@@ -957,13 +957,13 @@ chunk_uppercase_hex_size_test() ->
     ).
 
 chunk_hex_letter_sizes_with_extension_test() ->
-    %% An extension or trailing whitespace takes the general size-line
-    %% path, which must read hex letters the same way as the fast path.
+    %% An extension takes the general size-line path, which must read hex
+    %% letters the same way as the fast path.
     ?assertEqual(
         {ok, ~"helloworld", ~""}, roadrunner_http1:parse_chunk(~"a;name=v\r\nhelloworld\r\n")
     ),
     ?assertEqual(
-        {ok, ~"helloworld", ~""}, roadrunner_http1:parse_chunk(~"A \r\nhelloworld\r\n")
+        {ok, ~"helloworld", ~""}, roadrunner_http1:parse_chunk(~"A ;name\r\nhelloworld\r\n")
     ).
 
 chunk_size_with_sixteen_digits_test() ->
@@ -1003,6 +1003,69 @@ chunk_size_with_bws_before_ext_test() ->
     ?assertEqual(
         {ok, ~"hello", ~""},
         roadrunner_http1:parse_chunk(~"5 ;ext=value\r\nhello\r\n")
+    ).
+
+chunk_extensions_valid_forms_test() ->
+    %% RFC 9112 §7.1.1: any number of extensions, a name alone or with a
+    %% token or quoted-string value, BWS around `;` and `=`.
+    [
+        ?assertEqual(
+            {ok, ~"hello", ~""}, roadrunner_http1:parse_chunk(<<Line/binary, "\r\nhello\r\n">>)
+        )
+     || Line <- [
+            ~"5;name",
+            ~"5;a=1;b;c=x",
+            ~"5 ; a = 1 ;\tb",
+            ~"5;sig=\"a b;c=d\"",
+            ~"5;q=\"esc \\\" quote \\\\ \"",
+            ~"5;q=\"\";next=v",
+            <<"5;q=\"", 16#80, "\"">>,
+            ~"5;!#$%&'*+-.^_`|~0aZ"
+        ]
+    ].
+
+chunk_size_line_malformed_rejected_test() ->
+    %% A size line outside the grammar is rejected rather than read past:
+    %% trailing whitespace with no `;`, an empty extension, bytes no
+    %% token allows, a bare CR or LF (which another parser could take as
+    %% the end of the line), and broken quoted-strings.
+    [
+        ?assertEqual(
+            {error, bad_chunk_size},
+            roadrunner_http1:parse_chunk(<<Line/binary, "\r\nhello\r\n">>),
+            Line
+        )
+     || Line <- [
+            ~"5 ",
+            ~"5\t",
+            ~"5;",
+            ~"5; ",
+            ~"5;;a",
+            ~"5;a;",
+            ~"5;a ",
+            ~"5;bad[=x",
+            ~"5;a=",
+            ~"5;a=b c",
+            ~"5;a=[b",
+            ~"5x",
+            <<"5;", 0, "ext">>,
+            ~"5;a\rX",
+            ~"5;\nhello",
+            ~"5;q=\"open",
+            ~"5;q=\"bad \\",
+            <<"5;q=\"", 16#7F, "\"">>,
+            <<"5;q=\"\\", 16#7F, "\"">>,
+            ~"5;q=\"v\"x"
+        ]
+    ].
+
+chunk_size_line_bare_lf_is_not_a_line_end_test() ->
+    %% The size line ends at CRLF only. `5;\nhello\r\n` used to read
+    %% `\nhello` as an extension and then wait for 5 data bytes that the
+    %% sender meant as the next chunk.
+    ?assertEqual(
+        {error, bad_chunk_size},
+        roadrunner_http1:parse_chunk(~"5;\nhello\r\n0\r\n\r\n")
     ).
 
 chunk_size_with_leading_space_rejected_test() ->
