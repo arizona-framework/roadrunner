@@ -269,7 +269,16 @@ jobs:
         run: rebar3 as test compile
 
       - name: Run Autobahn fuzzingclient
-        run: ./scripts/autobahn.escript
+        run: |
+          # Sample memory through the run, for a container killed with 137.
+          (while true; do echo "$(date +%T) $(free -m | awk '/Mem:/ {print "used=" $3 "MB available=" $7 "MB"}')"; sleep 5; done) > /tmp/autobahn-mem.log &
+          ./scripts/autobahn.escript
+
+      - name: Show memory and kernel kill log
+        if: failure()
+        run: |
+          tail -40 /tmp/autobahn-mem.log || true
+          sudo dmesg -T | grep -iE "oom|killed process" | tail -20 || true
 
   # wrk2 smoke — verifies the open-loop bench pipeline (Docker
   # cylab/wrk2 + bench.escript --standalone + HdrHistogram parsing

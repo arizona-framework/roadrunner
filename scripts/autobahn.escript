@@ -165,7 +165,7 @@ run_container(Reports, SpecFile) ->
     %% only resolves where the host's /etc/hosts maps it, which CI
     %% runners don't.
     Cmd = io_lib:format(
-        "docker run --rm --network host"
+        "docker run --rm --network host -e PYTHONUNBUFFERED=1"
         " -v ~s:/reports"
         " ~s wstest -m fuzzingclient -s /reports/~s"
         " 2>&1; echo \"~s$?\"",
