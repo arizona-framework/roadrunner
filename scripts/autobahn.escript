@@ -25,6 +25,9 @@
 %% conformance run so those cases aren't failed by our own guard.
 -define(AUTOBAHN_MAX_MESSAGE_SIZE, 32 * 1024 * 1024).
 
+%% Prefixes the container's exit status at the end of the command output.
+-define(EXIT_STATUS_MARK, "autobahn container exit status: ").
+
 main(Args) ->
     Opts = parse_args(Args),
     ProjectDir = project_dir(),
@@ -49,7 +52,7 @@ main(Args) ->
     case Result of
         ok ->
             {Summary, Verdict} = summary(ProjectDir),
-            io:format("~n~s~n", [Summary]),
+            io:format("~n~ts~n", [Summary]),
             case Verdict of
                 pass -> halt(0);
                 fail -> halt(1)
@@ -115,19 +118,34 @@ run_fuzzingclient(ProjectDir, _Port) ->
         "docker run --rm --network host"
         " -v ~s:/config"
         " -v ~s:/reports"
-        " ~s wstest -m fuzzingclient -s /config/fuzzingclient.json",
+        " ~s wstest -m fuzzingclient -s /config/fuzzingclient.json"
+        " 2>&1; echo \"~s$?\"",
         [
             filename:dirname(Config),
             Reports,
-            ?DOCKER_IMAGE
+            ?DOCKER_IMAGE,
+            ?EXIT_STATUS_MARK
         ]
     ),
     io:format("running: ~s~n", [Cmd]),
     Output = os:cmd(Cmd),
-    io:format("~s~n", [Output]),
-    case string:find(Output, "Error") of
-        nomatch -> ok;
-        _ -> {error, fuzzingclient_error}
+    io:format("~ts~n", [Output]),
+    container_result(Output).
+
+%% The command ends by echoing the container's exit status, which `os:cmd/1`
+%% would otherwise drop. A client that dies mid-run (a killed or out-of-memory
+%% container) writes no report, and the status says why.
+container_result(Output) ->
+    case string:split(string:trim(Output, trailing), ?EXIT_STATUS_MARK, trailing) of
+        [Log, "0"] ->
+            case string:find(Log, "Error") of
+                nomatch -> ok;
+                _ -> {error, fuzzingclient_error}
+            end;
+        [_Log, Status] ->
+            {error, {container_exit_status, Status}};
+        [_Log] ->
+            {error, no_container_exit_status}
     end.
 
 summary(ProjectDir) ->
@@ -138,7 +156,7 @@ summary(ProjectDir) ->
         {ok, Json} ->
             summarize_json(Json, Path);
         {error, _} ->
-            {io_lib:format("(report not found at ~s — fuzzingclient may have failed)", [Path]),
+            {io_lib:format("(report not found at ~s; fuzzingclient may have failed)", [Path]),
                 fail}
     end.
 
