@@ -95,7 +95,9 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     peer_control_stream_reset/1,
     noncritical_uni_stream_reset/1,
     drain/1,
-    refuse_request_during_drain/1
+    refuse_request_during_drain/1,
+    drain_refuses_new_connections/1,
+    drain_closes_a_mid_handshake_connection/1
 ]).
 
 suite() ->
@@ -185,7 +187,9 @@ all() ->
         peer_control_stream_reset,
         noncritical_uni_stream_reset,
         drain,
-        refuse_request_during_drain
+        refuse_request_during_drain,
+        drain_refuses_new_connections,
+        drain_closes_a_mid_handshake_connection
     ].
 
 init_per_suite(Config) ->
@@ -1711,6 +1715,64 @@ refuse_request_during_drain(Config) ->
     ?assertEqual({200, ~"slow"}, ll_collect(Conn, SlowId, <<>>)),
     ll_close(Conn).
 
+drain_refuses_new_connections(Config) ->
+    %% Once draining, the listener drops a new client's Initial, so no
+    %% connection starts that would miss the drain broadcast and hold the
+    %% drain to its deadline. The open connection still finishes its
+    %% in-flight request.
+    Name = ?config(listener, Config),
+    Port = ?config(port, Config),
+    Conn = connect(Port),
+    try
+        ok = wait_for_unregister(roadrunner_h3_loop_test, 5000),
+        {ok, LoopId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/loop")),
+        Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
+        Self = self(),
+        _ = spawn(fun() -> Self ! {drained, roadrunner_listener:drain(Name, 10000)} end),
+        %% The GOAWAY goes out after the accept gate closed, so the new
+        %% connection below is attempted while draining.
+        ?assertEqual({goaway, LoopId + 4}, await_goaway(Conn)),
+        ?assertMatch({error, _}, try_connect(Port)),
+        Worker ! stop,
+        ?assertMatch({200, _, _}, roadrunner_quic_test_h3:collect(Conn, LoopId)),
+        receive
+            {drained, Drained} -> ?assertEqual({ok, drained}, Drained)
+        after 10000 -> ct:fail(drain_never_returned)
+        end
+    after
+        close(Conn)
+    end.
+
+drain_closes_a_mid_handshake_connection(Config) ->
+    %% A connection still handshaking when the drain arrives has no control
+    %% stream for a GOAWAY, so it is closed outright and frees its slot,
+    %% and the drain finishes well before its deadline. A relay forwards
+    %% the client's packets to the listener but drops the replies, so the
+    %% server's handshake can never complete.
+    Name = ?config(listener, Config),
+    Port = ?config(port, Config),
+    {ok, Relay} = gen_udp:open(0, [binary, {ip, {127, 0, 0, 1}}, {active, true}]),
+    {ok, RelayPort} = inet:port(Relay),
+    Self = self(),
+    Client = spawn(fun() -> Self ! {client, try_connect(RelayPort)} end),
+    try
+        receive
+            {udp, Relay, _, ClientPort, Initial} when ClientPort =/= Port ->
+                ok = gen_udp:send(Relay, {127, 0, 0, 1}, Port, Initial)
+        after 5000 -> ct:fail(no_client_initial)
+        end,
+        %% The server answers once it holds a connection for the Initial.
+        receive
+            {udp, Relay, _, Port, _ServerReply} -> ok
+        after 5000 -> ct:fail(no_server_reply)
+        end,
+        ?assertMatch([_], drain_members(Name)),
+        ?assertEqual({ok, drained}, roadrunner_listener:drain(Name, 5000))
+    after
+        exit(Client, kill),
+        ok = gen_udp:close(Relay)
+    end.
+
 %% --- listener helpers ---
 
 listener_name(Case) ->
@@ -1932,6 +1994,30 @@ ll_decode(Bytes) ->
             _ -> <<>>
         end,
     {Status, Body}.
+
+%% Read the server's control stream until its GOAWAY frame, skipping the
+%% SETTINGS that precede it. Frames may arrive split across messages.
+await_goaway(Conn) ->
+    await_goaway(Conn, <<>>).
+
+await_goaway(Conn, Acc) ->
+    receive
+        {quic_test_stream, Conn, StreamId, Data, _Fin} when StreamId rem 4 =:= 3 ->
+            Buf = <<Acc/binary, Data/binary>>,
+            {ok, control, Frames} = roadrunner_quic_h3_frame:decode_stream_type(Buf),
+            case find_goaway(Frames) of
+                {ok, Id} -> {goaway, Id};
+                more -> await_goaway(Conn, Buf)
+            end
+    after 5000 -> ct:fail(no_goaway)
+    end.
+
+find_goaway(Frames) ->
+    case roadrunner_quic_h3_frame:decode(Frames) of
+        {ok, {goaway, Id}, _Rest} -> {ok, Id};
+        {ok, _Frame, Rest} -> find_goaway(Rest);
+        {more, _Need} -> more
+    end.
 
 %% Pids registered in the listener's drain registry, read straight out of
 %% the listener state (`#state{proto_opts = #{drain_table := Table}}`).

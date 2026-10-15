@@ -21,10 +21,10 @@
 %% Each listener registers + monitors only the connections it spawns, so the
 %% per-listener cleanup stays correct over the shared table.
 %%
-%% Connections are owned (and linked) by the `roadrunner_conn_loop_http3` owner
-%% the `connection_handler` returns, not by the listeners, so `stop/1` brings
-%% the pool (and its sockets/port) down without abruptly killing in-flight
-%% connections; those drain through the owner protocol or idle out. The Version
+%% Each listener links the connections it spawns, so `stop/1` takes them down
+%% with the pool. A graceful drain therefore closes the pool's accept gate
+%% first (`accept_gate` in pool_opts) so no new connection starts, lets the
+%% open ones finish through the h3 owner, and only then stops the pool. The Version
 %% Negotiation trigger, anti-amplification, and the handshake all live in the
 %% listener and connection; this module is only the pool wiring.
 
@@ -58,7 +58,10 @@
     %% When a request stream's receive credit is granted back: as its data
     %% arrives (the default), or as its owner consumes it
     %% (`roadrunner_quic:consumed/3`), for a reader that pulls the body.
-    stream_credit => on_receipt | on_read
+    stream_credit => on_receipt | on_read,
+    %% Shared by every listener in the pool (see
+    %% `roadrunner_quic_listener:accept_gate()`).
+    accept_gate => roadrunner_quic_listener:accept_gate()
 }.
 
 %% =============================================================================
@@ -165,9 +168,10 @@ listener_opts(Port, PoolOpts, Registry, ReusePort) ->
         reuseport => ReusePort,
         registry => Registry
     },
-    %% Carry `ip` (the per-listener bind) and `stream_credit` through only
-    %% when the pool was started with them, so a default pool is unchanged.
-    maps:merge(Base, maps:with([ip, stream_credit], PoolOpts)).
+    %% Carry `ip` (the per-listener bind), `stream_credit`, and `accept_gate`
+    %% through only when the pool was started with them, so a default pool is
+    %% unchanged.
+    maps:merge(Base, maps:with([ip, stream_credit, accept_gate], PoolOpts)).
 
 -spec transport_params(non_neg_integer()) -> roadrunner_quic_transport_params:params().
 transport_params(MaxStreamsBidi) ->

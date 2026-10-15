@@ -28,11 +28,12 @@
 %% runs a SO_REUSEPORT pool of these listeners sharing one injected registry.
 
 -export([start_link/1, get_port/1, stop/1]).
+-export([new_accept_gate/0, close_accept_gate/1]).
 -export([init/1]).
 %% Exported for exhaustive eunit branch coverage of the pure routing decision.
 -export([classify/2]).
 
--export_type([opts/0]).
+-export_type([opts/0, accept_gate/0]).
 
 %% Must match roadrunner_quic_conn_state's ?SCID_LEN: the server issues SCIDs
 %% of this length so short-header packets demux by slicing it.
@@ -50,6 +51,12 @@
 %% per-batch `{active, N}` setopts is a small fraction of the per-datagram work,
 %% small enough that the listener mailbox between re-arms stays bounded.
 -define(ACTIVE_N, 100).
+
+%% Whether a listener takes new connections. Shared by a whole pool, so one
+%% write stops every listener in it (and a restarted listener keeps it, as
+%% the gate rides in its child spec). Closing it only refuses new clients:
+%% datagrams for connections already registered still route.
+-opaque accept_gate() :: atomics:atomics_ref().
 
 -type opts() :: #{
     port := inet:port_number(),
@@ -69,7 +76,11 @@
     registry => roadrunner_quic_cid_registry:t(),
     %% When a request stream's receive credit is granted back
     %% (`roadrunner_quic_conn_state:config()`); `on_receipt` by default.
-    stream_credit => on_receipt | on_read
+    stream_credit => on_receipt | on_read,
+    %% When set and closed, a datagram that would start a new connection is
+    %% dropped (RFC 9000 lets a server ignore an Initial). Unset, the
+    %% listener always accepts.
+    accept_gate => accept_gate()
 }.
 
 -record(listener, {
@@ -86,7 +97,8 @@
     %% connection original/initial connection ids are filled in at spawn.
     transport_params :: roadrunner_quic_transport_params:params(),
     handler :: fun((pid()) -> {ok, pid()} | {error, term()}),
-    stream_credit = on_receipt :: on_receipt | on_read
+    stream_credit = on_receipt :: on_receipt | on_read,
+    accept_gate :: accept_gate() | undefined
 }).
 
 %% =============================================================================
@@ -111,6 +123,16 @@ get_port(Pid) ->
 -spec stop(pid()) -> ok.
 stop(Pid) ->
     gen_server:call(Pid, stop).
+
+-doc "A new, open accept gate, to pass as the `accept_gate` opt.".
+-spec new_accept_gate() -> accept_gate().
+new_accept_gate() ->
+    atomics:new(1, [{signed, false}]).
+
+-doc "Close the gate: every listener holding it stops taking new connections.".
+-spec close_accept_gate(accept_gate()) -> ok.
+close_accept_gate(Gate) ->
+    atomics:put(Gate, 1, 1).
 
 %% =============================================================================
 %% Loop
@@ -160,7 +182,8 @@ init(
                 alpn = Alpn,
                 transport_params = TransportParams,
                 handler = Handler,
-                stream_credit = maps:get(stream_credit, Opts, on_receipt)
+                stream_credit = maps:get(stream_credit, Opts, on_receipt),
+                accept_gate = maps:get(accept_gate, Opts, undefined)
             });
         {error, Reason} ->
             proc_lib:init_ack({error, Reason}),
@@ -228,12 +251,21 @@ route(Datagram, Peer, #listener{registry = Registry} = State) ->
             _ = ConnPid ! {quic_datagram, Peer, Datagram},
             State;
         {spawn, ClientDCID, ClientSCID} ->
-            spawn_connection(Datagram, Peer, ClientDCID, ClientSCID, State);
+            case accepting(State) of
+                true -> spawn_connection(Datagram, Peer, ClientDCID, ClientSCID, State);
+                false -> State
+            end;
         {version_negotiation, ClientDCID, ClientSCID} ->
             send_version_negotiation(ClientDCID, ClientSCID, Peer, State);
         drop ->
             State
     end.
+
+-spec accepting(#listener{}) -> boolean().
+accepting(#listener{accept_gate = undefined}) ->
+    true;
+accepting(#listener{accept_gate = Gate}) ->
+    atomics:get(Gate, 1) =:= 0.
 
 %% RFC 9000 §17.2.1: a Version Negotiation packet lists the versions the server
 %% supports and echoes the client's connection ids swapped (our destination id
