@@ -1199,8 +1199,7 @@ open_listen_socket(Port, Opts, _Protocols) ->
     %% short-lived connections. fprof on `connection_storm` shows the
     %% `socket` backend's `prim_socket:is_supported_option` + the
     %% `maps:fold_1` walking it costs ~46% of per-conn own time
-    %% (~106 lookups per connection). See
-    %% `docs/conn_lifecycle_investigation.md`. The new backend's
+    %% (~106 lookups per connection). The new backend's
     %% async I/O wins are real for long-lived connections; revisit
     %% if/when the workload mix shifts there.
     roadrunner_transport:listen(Port, base_listen_opts(Opts)).

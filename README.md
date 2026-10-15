@@ -21,7 +21,7 @@ multipart, SSE, NDJSON, WebSocket).
 A small, fast HTTP core you can trust on the hot path.
 
 - **Fast where it counts**: Tuned for low p50 and p99 under sustained load. See
-  [Performance at a glance](#performance-at-a-glance).
+  [Performance](#performance).
 - **Correct and hostile-input-safe**: Strict RFC 9110 / 9112 / 9113 parsing,
   100% h2spec and 100% Autobahn (no exclusions), and stress-tested against
   request-smuggling corpora. See [Conformance](#conformance).
@@ -79,69 +79,11 @@ Standards conformance:
 - **WebSocket compression**: RFC 7692 `permessage-deflate`,
   including `*_max_window_bits` and `*_no_context_takeover`.
 
-## Performance at a glance
+## Performance
 
-Median req/s over HTTP/1.1 on a 12th-gen i9-12900HX, 50 clients,
-2 s warmup + 5 s measure, loopback. HTTP/2 numbers, p50 / p99
-percentiles, and memory shape sit in
-[`docs/bench_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/bench_results.md)
-and [`docs/comparison.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/comparison.md).
-
-| scenario                  | roadrunner    | cowboy        | elli          |
-|---------------------------|--------------:|--------------:|--------------:|
-| `hello`                   |   **307 k**   |       201 k   |       299 k   |
-| `json`                    |       299 k   |       189 k   |   **304 k**   |
-| `echo`                    |   **304 k**   |       162 k   |       282 k   |
-| `headers_heavy`           |   **257 k**   |       141 k   |       253 k   |
-| `large_response`          |   **124 k**   |        98 k   |       123 k   |
-| `multi_request_body`      |       262 k   |       125 k   |   **274 k**   |
-| `varied_paths_router`     |   **290 k**   |       175 k   |          —    |
-| `post_4kb_form`           |   **193 k**   |        98 k   |          —    |
-| `large_post_streaming`    |    **20 k**   |       6.9 k   |          —    |
-| `pipelined_h1`            |   **580 k**   |       371 k   |       4.8 k   |
-| `websocket_msg_throughput`|   **232 k**   |       179 k   |          —    |
-| `gzip_response`           |   **138 k**   |       111 k   |          —    |
-
-Bold = fastest in row. `—` means that workload has no elli fixture. On
-simple GETs and small POSTs Roadrunner and elli sit within the bench's
-~15% variance band on those rows; the comparison doc has the full
-methodology.
-
-### Tail latency at sustained load
-
-Open-loop, Coordinated-Omission-corrected (wrk2, `hello`, 8 threads,
-50 connections, 3-run median): Roadrunner sustains **291 k req/s**
-at p50 1.07 ms, p99 2.31 ms, p99.99 4.70 ms. Full per-scenario
-matrix with all four rate-points per server in
-[`docs/wrk2_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/wrk2_results.md).
-
-The throughput numbers above are from `scripts/bench.escript`
-(closed-loop); the comparison doc has the full methodology
-breakdown.
-
-## Comparison
-
-If your workload needs a feature, the server has to ship it. `—`
-means achievable in user code but no helper / option built in; `✗`
-means out of scope for that server.
-
-| feature                                   | roadrunner | cowboy | elli |
-|-------------------------------------------|:----------:|:------:|:----:|
-| HTTP/1.1                                  |     ✓      |   ✓    |  ✓   |
-| HTTP/2 + HPACK                            |     ✓      |   ✓    |  ✗   |
-| HTTP/3 (QUIC, experimental)               |     ✓      |   ✗    |  ✗   |
-| WebSocket (RFC 6455)                      |     ✓      |   ✓    |  —   |
-| permessage-deflate (RFC 7692)             |     ✓      |   ✓    |  ✗   |
-| Native router                             |     ✓      |   ✓    |  ✗   |
-| gzip / deflate response negotiation       |     ✓      |   ✓    |  —   |
-| Streaming request bodies                  |     ✓      |   ✓    |  —   |
-| Native qs / cookie / multipart            |     ✓      |   ✓    |  —   |
-| Server-Sent Events helper                 |     ✓      |   —    |  —   |
-| NDJSON streaming helper                   |     ✓      |   —    |  —   |
-| Sendfile                                  |     ✓      |   ✓    |  ✓   |
-| Static handler (ETag / Range / IMS)       |     ✓      |   ✓    |  —   |
-| Graceful drain with deadline + broadcast  |     ✓      |   —    |  ✗   |
-| Per-request `request_id` in logger meta   |     ✓      |   —    |  ✗   |
+Roadrunner runs on [HttpArena](https://http-arena.com/), an open
+benchmark that tests HTTP servers and frameworks on the same hardware
+under the same rules. See the leaderboard for current numbers.
 
 ## Quickstart
 
@@ -452,24 +394,13 @@ type, with per-key defaults and tuning rationale. Beyond `port`,
 
 ## Documentation
 
-- [`docs/comparison.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/comparison.md): full side-by-side
-  benchmarks vs cowboy and elli (throughput, latency, architectural
-  trade-offs, reproduction commands).
-- [`docs/bench_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/bench_results.md): full per-protocol
-  matrix with p50 / p99 across every scenario.
 - [`docs/bench_internals.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/bench_internals.md): loadgen worker
   model, latency aggregation, when the loader becomes the bottleneck.
-- [`docs/wrk2_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/wrk2_results.md): open-loop,
-  Coordinated-Omission-corrected tail-latency tables (full per-scenario,
-  all rate-points per server).
-- [`docs/resource_results.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/resource_results.md): memory + CPU
-  shape per scenario.
 - [`docs/resource_limits.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/resource_limits.md): the
   per-connection and per-peer memory / CPU limits, with defaults and
   over-limit behavior (operator reference).
 - [`docs/conn_lifecycle_investigation.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/conn_lifecycle_investigation.md):
-  the connection-process model trade-offs and the one h2 case
-  cowboy still wins.
+  the connection-process model and its trade-offs.
 - [`docs/roadmap.md`](https://github.com/arizona-framework/roadrunner/blob/main/docs/roadmap.md): deferred items, with rough
   effort estimates for each.
 

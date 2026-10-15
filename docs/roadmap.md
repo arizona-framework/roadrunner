@@ -347,40 +347,6 @@ only parse the peer's value and bound inbound via the encoded
 `max_header_block` cap. The ~50 handshake fixtures that drain the server
 SETTINGS need to tolerate the extra entry.
 
-### Refresh resource_results.md against the current headline scenarios
-
-**What:** `docs/resource_results.md` still carries its own scenario
-pick (captured 2026-05-06) predating the curated `?MAIN_SCENARIOS` in
-`scripts/bench.escript`: it is missing `multi_request_body`,
-`post_4kb_form`, `large_post_streaming`, `streaming_response` and still
-lists the dropped `cookies_heavy` / `tls_handshake_throughput`.
-`comparison.md` was resynced to `?MAIN_SCENARIOS`; the README quick-look
-table and the bench-script-driven docs (`bench_results.md`,
-`wrk2_results.md`) were already current.
-
-**Why deferred:** the resource doc's memory / CPU numbers are a
-single-run snapshot that can only be refreshed by re-running
-`scripts/bench.escript --with-resources` against the current 14
-scenarios, not edited by hand. Fold it into the next matrix run rather
-than re-running the bench just for this.
-
-**Scope:** small (one `--with-resources` matrix pass + re-render the
-three tables and trim the dropped-scenario notes).
-
-### Automate `docs/resource_results.md` regeneration
-
-**What:** Extend `scripts/bench_matrix.sh` so it can pass
-`--with-resources` to every cell and emit a refreshed
-`docs/resource_results.md` alongside `bench_results.md`. Today the
-resource doc is hand-curated from a one-off survey.
-
-**Why deferred:** doable but ~80–120 LOC of awk/bash for the
-parser + emitter; the doc is checked-in snapshot-style and rarely
-needs full regeneration. Automating earns its keep once we're
-chasing a regression that needs frequent refresh.
-
-**Scope:** small.
-
 ### CI bench-vs-baseline comparison
 
 **What:** The `Bench` workflow (`.github/workflows/bench.yml`) writes its

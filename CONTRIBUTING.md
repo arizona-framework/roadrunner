@@ -83,14 +83,15 @@ Two complementary load drivers ship in this repo:
   request, waits for the response, sends the next. Reports
   throughput + p50/p99 from per-request timing. Easy to set up,
   no external dependency, but tail latency under load is
-  deflated by Coordinated Omission. Used for the per-scenario
-  matrix in [`docs/bench_results.md`](docs/bench_results.md).
+  deflated by Coordinated Omission. `scripts/bench_matrix.sh`
+  drives it across the headline scenarios and writes the table to
+  `/tmp/bench_results.md`.
 - **`scripts/wrk2_bench.sh`** — open-loop, via
   [wrk2](https://github.com/giltene/wrk2) running in Docker
   (`cylab/wrk2:latest`). Issues requests at a fixed rate
   regardless of server response and reports
   Coordinated-Omission-corrected HdrHistogram percentiles.
-  Output: [`docs/wrk2_results.md`](docs/wrk2_results.md). Needs
+  Output: `/tmp/wrk2_results.md` (override with `--out`). Needs
   `docker` on PATH and `rebar3 as test compile` already done;
   the script pulls the image automatically.
 

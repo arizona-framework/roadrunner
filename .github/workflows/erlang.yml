@@ -4,8 +4,8 @@
 # 100 % line-coverage) is split here into parallel, independently-named jobs
 # so each signal lands as its own check on the PR dashboard and the wall time
 # is the slowest single job instead of the serial sum. External conformance
-# harnesses (h2spec, Autobahn) and the wrk2 smoke back the README's Status
-# claims.
+# harnesses (h2spec, Autobahn) back the README's Conformance claims; the wrk2
+# smoke checks that the bench pipeline still runs.
 #
 # Job dependency structure (all fan out from cache-erlang, run in parallel):
 # - cache-erlang: sets up Erlang, computes cache keys, compiles + caches
@@ -275,8 +275,8 @@ jobs:
   # cylab/wrk2 + bench.escript --standalone + HdrHistogram parsing
   # + Lua POST scripts) still works end-to-end. Catches breakage,
   # NOT regression: CI runner numbers are too noisy for tail-latency
-  # claims, so the canonical `docs/wrk2_results.md` always comes
-  # from a quiet local box. Two scenarios: `hello` (GET path) and
+  # claims, so tail-latency numbers always come from a quiet
+  # local box. Two scenarios: `hello` (GET path) and
   # `echo` (POST path via Lua) so a broken Lua script also fails
   # the smoke. Runs on every push + PR; ~2 min total.
   wrk2-smoke:

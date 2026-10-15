@@ -2,14 +2,14 @@
 #
 # bench_matrix.sh — run scripts/bench.escript across every
 # (scenario, protocol) pair, take the median of N runs per cell,
-# and emit docs/bench_results.md (per-protocol tables).
+# and emit /tmp/bench_results.md (per-protocol tables).
 #
 # bench.escript runs ONE scenario at a time (single peer BEAM,
 # isolated per side). This wrapper drives the full matrix and
-# writes the consolidated table that ships under docs/.
+# writes the consolidated table to /tmp.
 #
-# Intermediate medians land in /tmp/bench_results.csv — useful for
-# diffing across runs but not committed (the MD is the deliverable).
+# Intermediate medians land in /tmp/bench_results.csv, useful for
+# diffing across runs.
 #
 # Requires bash 4+ (associative arrays + BASH_REMATCH `match[]`).
 # macOS ships /bin/bash 3.2 — install bash via brew and run
@@ -30,7 +30,7 @@
 #
 # Drift note: the PROTOS / SCENARIOS arrays below mirror
 # `?MAIN_SCENARIOS` in scripts/bench.escript (the curated headline
-# set rendered in docs/bench_results.md). The PROTOS map for each
+# set rendered in /tmp/bench_results.md). The PROTOS map for each
 # scenario reflects the `?PROTOCOL_AGNOSTIC_*` / `?H?_ONLY_*` slot
 # the scenario already lives in. Adding to / removing from
 # `?MAIN_SCENARIOS` requires updating both arrays here and
@@ -48,7 +48,7 @@ SKIP_BENCH=${SKIP_BENCH:-0}
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOG=/tmp/bench_matrix.log
 CSV=/tmp/bench_results.csv
-MD="$REPO_ROOT/docs/bench_results.md"
+MD=/tmp/bench_results.md
 PER_RUN_TSV=/tmp/bench_per_run.tsv
 
 # ---- Scenario × protocol matrix ---------------------------------
@@ -99,7 +99,7 @@ declare -A PROTOS=(
 )
 
 # Iteration order — the curated headline set rendered in
-# docs/bench_results.md. Mirrors `?MAIN_SCENARIOS` in
+# /tmp/bench_results.md. Mirrors `?MAIN_SCENARIOS` in
 # scripts/bench.escript; reshuffle there first, then here.
 SCENARIOS=(
   hello json echo headers_heavy large_response
