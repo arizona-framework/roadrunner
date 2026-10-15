@@ -46,6 +46,9 @@ accessors that operate on it.
     check_request_authority/3,
     valid_host/1,
     valid_target_bytes/1,
+    check_fields/1,
+    valid_field_name/1,
+    valid_field_value/1,
     request_content_length/1,
     body_length_fits/3,
     build_request/7
@@ -435,6 +438,66 @@ valid_path(_Method, _Path) -> false.
 valid_target_bytes(<<C, Rest/binary>>) when C > 16#20, C < 16#7F -> valid_target_bytes(Rest);
 valid_target_bytes(<<>>) -> true;
 valid_target_bytes(_) -> false.
+
+%% Field validity shared by HTTP/2 and HTTP/3 (RFC 9113 §8.2.1, RFC 9114
+%% §4.2). HTTP/2 applies the two predicates as HPACK decodes each literal
+%% field, so a field the dynamic table repeats is checked once per
+%% connection; HTTP/3 (whose QPACK keeps no dynamic table) runs
+%% `check_fields/1` over each request's fields. A request breaking them
+%% is malformed, so a CR or LF never reaches a handler that copies a
+%% value into something line-based.
+-doc false.
+-spec check_fields(headers()) -> ok | {error, bad_field_name | bad_field_value}.
+check_fields([{Name, Value} | Rest]) ->
+    case valid_field_name(Name) of
+        true ->
+            case valid_field_value(Value) of
+                true -> check_fields(Rest);
+                false -> {error, bad_field_value}
+            end;
+        false ->
+            {error, bad_field_name}
+    end;
+check_fields([]) ->
+    ok.
+
+%% A field name is visible US-ASCII without uppercase letters or `:`,
+%% after a pseudo-header's leading colon (which pseudo-headers are known
+%% is `request_pseudo_headers/1`'s call).
+-doc false.
+-spec valid_field_name(binary()) -> boolean().
+valid_field_name(<<$:, Name/binary>>) -> field_name(Name);
+valid_field_name(Name) -> field_name(Name).
+
+-spec field_name(binary()) -> boolean().
+field_name(<<>>) -> false;
+field_name(Name) -> field_name_bytes(Name).
+
+-spec field_name_bytes(binary()) -> boolean().
+field_name_bytes(<<C, Rest/binary>>) when C >= $a, C =< $z; C =:= $- ->
+    field_name_bytes(Rest);
+field_name_bytes(<<C, _/binary>>) when C >= $A, C =< $Z; C =:= $: ->
+    false;
+field_name_bytes(<<C, Rest/binary>>) when C > 16#20, C < 16#7F ->
+    field_name_bytes(Rest);
+field_name_bytes(<<>>) ->
+    true;
+field_name_bytes(_) ->
+    false.
+
+%% A field value holds no NUL, CR or LF, and neither starts nor ends with
+%% SP or HTAB.
+-doc false.
+-spec valid_field_value(binary()) -> boolean().
+valid_field_value(<<>>) ->
+    true;
+valid_field_value(<<C, _/binary>>) when C =:= $\s; C =:= $\t ->
+    false;
+valid_field_value(Value) ->
+    case binary:last(Value) of
+        C when C =:= $\s; C =:= $\t -> false;
+        _ -> is_header_safe(Value)
+    end.
 
 %% The request authority rule shared by HTTP/2 and HTTP/3 (RFC 9113 §8.3.1,
 %% RFC 9114 §4.3.1). Roadrunner only serves `http` and `https`, both with a

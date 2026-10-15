@@ -144,7 +144,11 @@ authority_host_mismatch_test() ->
 uppercase_field_name_test() ->
     %% RFC 9114 §4.2: an uppercase field name makes the request malformed (the
     %% banned-header scan catches it before the authority check).
-    ?assertEqual({error, uppercase_field_name}, from(base() ++ [{~"X-Custom", ~"v"}])).
+    ?assertEqual({error, bad_field_name}, from(base() ++ [{~"X-Custom", ~"v"}])).
+
+field_value_with_crlf_test() ->
+    %% RFC 9114 §4.2: a value with CR or LF makes the request malformed.
+    ?assertEqual({error, bad_field_value}, from(base() ++ [{~"x-a", ~"1\r\nx-b: 2"}])).
 
 mixedcase_value_allowed_test() ->
     %% Only field NAMES are case-checked; an uppercase VALUE is fine.

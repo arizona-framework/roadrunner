@@ -129,6 +129,7 @@ all_test_() ->
         fun self_dependent_trailers_reset_the_stream/0,
         fun refused_stream_with_undecodable_block_closes_conn/0,
         fun uppercase_header_name_is_protocol_error/0,
+        fun header_value_with_crlf_is_protocol_error/0,
         fun enable_push_invalid_value_protocol_error/0,
         fun initial_window_size_too_large_flow_control_error/0,
         fun max_frame_size_too_small_protocol_error/0,
@@ -3351,6 +3352,30 @@ uppercase_header_name_is_protocol_error() ->
     ),
     %% A literal field without indexing, new name `X-Up`, value `v`.
     Bad = <<(iolist_to_binary(Block))/binary, 0, 4, "X-Up", 1, "v">>,
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(
+            roadrunner_http2_frame:encode({headers, 1, 16#04 bor 16#01, undefined, Bad})
+        )
+    ),
+    ?assertMatch(
+        {ok, {goaway, _, protocol_error, _}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    receive
+        {'DOWN', Ref, process, Pid, _} -> ok
+    after 1000 -> error(conn_did_not_exit)
+    end.
+
+header_value_with_crlf_is_protocol_error() ->
+    %% RFC 9113 §8.2.1: a field value with CR or LF makes the request
+    %% malformed; caught as HPACK decodes the literal, so the connection
+    %% closes with PROTOCOL_ERROR (§5.4.1).
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    {Block, _} = roadrunner_http2_hpack:encode(
+        get_headers(~"/"), roadrunner_http2_hpack:new_encoder(4096)
+    ),
+    %% A literal field without indexing, new name `x-a`, value `1\r\nx-b: 2`.
+    Bad = <<(iolist_to_binary(Block))/binary, 0, 3, "x-a", 9, "1\r\nx-b: 2">>,
     serve_recv(
         ConnPid,
         iolist_to_binary(
