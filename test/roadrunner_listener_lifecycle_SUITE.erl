@@ -95,12 +95,11 @@ drained_listener_stays_down(_Config) ->
     ?assertEqual({error, not_found}, roadrunner:stop_listener(lifecycle_drain)).
 
 drained_listener_starts_again(_Config) ->
+    %% `drain/2` returns once the listener is gone, so restarting it right
+    %% away needs no wait.
     {ok, Pid} = roadrunner:start_listener(lifecycle_redrain, opts(0)),
-    Mon = monitor(process, Pid),
     ?assertEqual({ok, drained}, roadrunner_listener:drain(lifecycle_redrain, 1000)),
-    receive
-        {'DOWN', Mon, process, Pid, _} -> ok
-    end,
+    ?assertNot(is_process_alive(Pid)),
     {ok, Again} = roadrunner:start_listener(lifecycle_redrain, opts(0)),
     ?assertNotEqual(Pid, Again),
     ?assertEqual(Again, whereis(lifecycle_redrain)),
