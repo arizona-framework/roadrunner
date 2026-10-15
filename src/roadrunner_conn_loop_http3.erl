@@ -271,11 +271,7 @@ recv_loop(#h3{conn = Conn} = State) ->
         {roadrunner_slot, StreamId, Outcome} ->
             loop(handle_slot(State, StreamId, Outcome));
         {roadrunner_drain, _Deadline} ->
-            %% Begin a graceful drain: send GOAWAY, refuse new requests,
-            %% let in-flight ones finish (the `loop/1` head closes the
-            %% connection once they do). The listener force-exits us at
-            %% the deadline if a request is still running then.
-            loop(start_drain(State))
+            drain(State)
         %% No catch-all: like the h2 connection loop, the owner uses a
         %% selective receive. The native transport only ever sends it the
         %% `{quic, Conn, Event}` notifications matched above, so an unmatched
@@ -314,15 +310,27 @@ send_control_stream(#h3{conn = Conn, max_field_section_size = MaxFieldSection} =
     _ = roadrunner_quic:send_data(Conn, CtrlStreamId, [Prefix, Settings], false),
     State#h3{control_stream_id = CtrlStreamId}.
 
+%% The listener is draining. A connection still mid-handshake has no
+%% control stream for a GOAWAY and no request yet, so it is closed outright
+%% (silently: QUIC sends nothing before the handshake keys exist), which
+%% frees its slot at once. An established connection drains gracefully:
+%% GOAWAY, refuse new requests, let in-flight ones finish (the `loop/1`
+%% head closes the connection once they do). The listener force-exits us
+%% at the deadline if a request is still running then.
+-spec drain(#h3{}) -> ok.
+drain(#h3{control_stream_id = undefined} = State) ->
+    close_connection(State, ?H3_NO_ERROR, ~"graceful shutdown");
+drain(State) ->
+    loop(start_drain(State)).
+
 %% Begin a graceful drain (RFC 9114 §5.2): send a GOAWAY on the control
 %% stream naming the first request-stream id we will not process
 %% (`last_request_id + 4`, the next client-initiated bidirectional id),
 %% and mark the connection draining so later request streams are
 %% refused. Re-sending the same id on a repeated drain is harmless and
 %% RFC-compliant (the id never increases — refused streams are not
-%% counted). The control stream always exists here: `connected` (which
-%% opens it) is delivered before any request, and a drain only follows
-%% an established connection.
+%% counted). The control stream exists here: `drain/1` closes a
+%% connection that has not reached `connected` (which opens it).
 -spec start_drain(#h3{}) -> #h3{}.
 start_drain(#h3{conn = Conn, control_stream_id = CtrlId, last_request_id = LastId} = State) when
     is_integer(CtrlId)

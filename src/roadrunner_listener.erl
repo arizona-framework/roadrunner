@@ -707,7 +707,11 @@ WebSocket session tunables (under `ws` in the listener opts).
     %% The bucket store of the routes with their own `rate_limit`, created
     %% when the route table first has one (at start or on `reload_routes/2`)
     %% and kept for the life of the listener; `undefined` until then.
-    route_buckets = undefined :: ets:table() | undefined
+    route_buckets = undefined :: ets:table() | undefined,
+    %% Shared by the QUIC pool's listeners; `do_drain/2` closes it so no new
+    %% h3 connection starts while the open ones finish. Unused (and
+    %% harmless to close) on a listener without `http3`.
+    quic_accept_gate :: roadrunner_quic_listener:accept_gate()
 }).
 
 -doc """
@@ -877,9 +881,10 @@ init(#{port := Port} = Opts) ->
     %% transports that co-listen on the same port number. Bring up
     %% whichever the `protocols` list selects; an `http3`-only listener
     %% has no TCP socket (`none`), and a TCP-only listener no QUIC pid.
+    QuicAcceptGate = roadrunner_quic_listener:new_accept_gate(),
     case start_tcp(Port, Opts, Protocols, ProtoOpts) of
         {ok, LSocket} ->
-            case start_quic(Port, Opts, Protocols, ProtoOpts) of
+            case start_quic(Port, Opts, Protocols, ProtoOpts, QuicAcceptGate) of
                 {ok, QuicListener} ->
                     Reconciliation = setup_reconciliation(Opts),
                     ok = setup_rate_limit_sweep(ProtoOpts),
@@ -889,7 +894,8 @@ init(#{port := Port} = Opts) ->
                         port = bound_port(LSocket, QuicListener),
                         proto_opts = ProtoOpts,
                         reconciliation = Reconciliation,
-                        route_buckets = RouteBuckets
+                        route_buckets = RouteBuckets,
+                        quic_accept_gate = QuicAcceptGate
                     }};
                 {error, Reason} ->
                     %% TCP bound but QUIC failed — release the TCP port
@@ -934,9 +940,13 @@ start_tcp(Port, Opts, Protocols, ProtoOpts) ->
 %% listener then transfers ownership to the returned pid. `http3` having been
 %% validated to require `tls`, the `tls` opt is always present here.
 -spec start_quic(
-    inet:port_number(), opts(), [http1 | http2 | http3, ...], roadrunner_conn:proto_opts()
+    inet:port_number(),
+    opts(),
+    [http1 | http2 | http3, ...],
+    roadrunner_conn:proto_opts(),
+    roadrunner_quic_listener:accept_gate()
 ) -> {ok, pid() | undefined} | {error, term()}.
-start_quic(Port, Opts, Protocols, ProtoOpts) ->
+start_quic(Port, Opts, Protocols, ProtoOpts, AcceptGate) ->
     case lists:member(http3, Protocols) of
         false ->
             {ok, undefined};
@@ -970,7 +980,8 @@ start_quic(Port, Opts, Protocols, ProtoOpts) ->
                 pool_size => Listeners - 1,
                 %% In manual body mode a request stream's credit is granted
                 %% as its handler reads the body, not as the body arrives.
-                stream_credit => stream_credit(ProtoOpts)
+                stream_credit => stream_credit(ProtoOpts),
+                accept_gate => AcceptGate
             },
             %% Bind the QUIC pool to the same interface as the TCP socket
             %% when `ip` is set, so an h3 listener honors loopback too.
@@ -2125,24 +2136,30 @@ do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _, _}}} = State,
 -spec do_drain(#state{}, non_neg_integer()) ->
     {{ok, drained} | {timeout, non_neg_integer()}, #state{}}.
 do_drain(
-    #state{listen_socket = LSocket, quic_listener = QuicListener, proto_opts = ProtoOpts} = State,
+    #state{
+        listen_socket = LSocket,
+        quic_listener = QuicListener,
+        quic_accept_gate = QuicAcceptGate,
+        proto_opts = ProtoOpts
+    } = State,
     Timeout
 ) ->
-    %% Close the TCP listen socket so accept fails and acceptors exit;
-    %% existing TCP conns keep their own sockets and drain below.
+    %% Stop taking new connections on both transports first. Close the TCP
+    %% listen socket so accept fails and acceptors exit, and close the QUIC
+    %% accept gate so a new client's Initial is dropped. Existing TCP conns
+    %% keep their own sockets, and existing h3 conns keep routing, so both
+    %% drain below. A connection started after the broadcast would never
+    %% hear it and would hold the drain to its deadline.
     ok = close_tcp(LSocket),
+    ok = roadrunner_quic_listener:close_accept_gate(QuicAcceptGate),
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     #{client_counter := Counter, drain_table := Table} = ProtoOpts,
     notify_conns(Table, Deadline),
     Reply = wait_for_drain(Counter, Deadline, Table),
-    %% Stop the QUIC listener LAST: `roadrunner_quic_listener:stop/1` kills the
-    %% connections it `start_link`ed (and the h3 conn loops linked to
-    %% them), so doing it before the notify/wait above would abruptly
-    %% kill in-flight h3 conns instead of letting them drain. (New h3
-    %% conns can still arrive during the window — the QUIC listener has
-    %% no "stop accepting but keep existing" mode; they're force-closed
-    %% at the deadline like any other. A GOAWAY-based graceful h3 drain
-    %% is a roadmap follow-up.)
+    %% Stop the QUIC pool LAST: its listeners link the connections they
+    %% spawned, so stopping it before the notify/wait above would kill
+    %% in-flight h3 conns instead of letting them drain (each sends
+    %% GOAWAY and closes once its requests finish).
     ok = stop_quic(QuicListener),
     %% `phase = draining` was never observable here (the gen_server is
     %% blocked in wait_for_drain and the local state isn't committed),
