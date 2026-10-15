@@ -121,9 +121,11 @@ transform_buffered(Req, Status, Headers, Body) ->
                             %% walk over the body entirely.
                             {Status, HeadersWithVary, Body};
                         Encoding ->
-                            case iolist_size(Body) >= ?THRESHOLD of
-                                true -> compress(Status, HeadersWithVary, Body, Encoding);
-                                false -> {Status, HeadersWithVary, Body}
+                            case iolist_size(Body) of
+                                Size when Size >= ?THRESHOLD ->
+                                    compress(Status, HeadersWithVary, Body, Size, Encoding);
+                                _ ->
+                                    {Status, HeadersWithVary, Body}
                             end
                     end
             end
@@ -195,10 +197,11 @@ wrap_stream(Status, Headers, Fun, Encoding) ->
     roadrunner_http:status(),
     roadrunner_http:headers(),
     iodata(),
+    pos_integer(),
     gzip | deflate
 ) -> roadrunner_handler:response().
-compress(Status, Headers, Body, Encoding) ->
-    Compressed = compress_body(Body, Encoding),
+compress(Status, Headers, Body, Size, Encoding) ->
+    Compressed = compress_body(Body, Size, Encoding),
     NewLength = integer_to_binary(byte_size(Compressed)),
     %% Replace any existing Content-Length, then prepend
     %% Content-Encoding. Vary is already on `Headers` — added by
@@ -207,22 +210,47 @@ compress(Status, Headers, Body, Encoding) ->
     Headers2 = [{~"content-encoding", encoding_token(Encoding)} | Headers1],
     {Status, Headers2, Compressed}.
 
-%% RFC 9110 §8.4.1.3: "deflate" = zlib data format (RFC 1950) — i.e.
-%% the 2-byte zlib header + raw deflate stream + Adler-32 checksum.
-%% `zlib:compress/1` produces exactly that. NOT `zlib:zip/1`, which
-%% emits a header-less raw deflate stream (RFC 1951) — non-conformant
-%% to RFC 9110 even though some servers historically shipped it.
--spec compress_body(iodata(), gzip | deflate) -> binary().
-compress_body(Body, gzip) -> zlib:gzip(Body);
-compress_body(Body, deflate) -> zlib:compress(Body).
+%% A whole buffered body in one deflate call, with the window sized to the
+%% body: deflate never looks further back than the bytes it has, so a
+%% window covering the body plus deflate's 262-byte lookahead
+%% (`MIN_LOOKAHEAD`) produces the same compressed data as the full 32 KB
+%% one, while the context zlib allocates shrinks with the body (a 4 KB
+%% body takes 160 KB instead of 256 KB), for every request compressing at
+%% the same time. `gzip` is the RFC 1952 wrapper (`windowBits + 16`);
+%% `deflate` is the zlib wrapper RFC 9110 §8.4.1.3 specifies (RFC 1950),
+%% whose header records the window.
+-spec compress_body(iodata(), pos_integer(), gzip | deflate) -> binary().
+compress_body(Body, Size, Encoding) ->
+    Z = zlib:open(),
+    try
+        ok = zlib:deflateInit(Z, default, deflated, window_bits(Encoding, Size), 8, default),
+        iolist_to_binary(zlib:deflate(Z, Body, finish))
+    after
+        zlib:close(Z)
+    end.
+
+%% `windowBits` 11 to 15 (2 KB to 32 KB), the smallest that covers `Size`
+%% bytes plus the lookahead; a body under the 860-byte threshold is never
+%% compressed, so 2 KB is the least any body needs.
+-spec body_window_bits(pos_integer()) -> 11..15.
+body_window_bits(Size) when Size + 262 =< 1 bsl 11 -> 11;
+body_window_bits(Size) when Size + 262 =< 1 bsl 12 -> 12;
+body_window_bits(Size) when Size + 262 =< 1 bsl 13 -> 13;
+body_window_bits(Size) when Size + 262 =< 1 bsl 14 -> 14;
+body_window_bits(_Size) -> 15.
 
 %% `windowBits` selects the zlib stream wrapper:
 %%   16 + 15 → gzip (RFC 1952 header)
 %%        15 → zlib-wrapped (RFC 1950 header) — what RFC 9110 §8.4.1.3
 %%             specifies for `Content-Encoding: deflate`.
+%% A stream's length isn't known up front, so it takes the full window.
 -spec window_bits(gzip | deflate) -> integer().
 window_bits(gzip) -> 16 + 15;
 window_bits(deflate) -> 15.
+
+-spec window_bits(gzip | deflate, pos_integer()) -> integer().
+window_bits(gzip, Size) -> 16 + body_window_bits(Size);
+window_bits(deflate, Size) -> body_window_bits(Size).
 
 -spec encoding_token(gzip | deflate) -> binary().
 encoding_token(gzip) -> ~"gzip";
