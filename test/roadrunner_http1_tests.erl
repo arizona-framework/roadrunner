@@ -667,6 +667,28 @@ request_repeated_host_returns_error_test() ->
      || V <- [~"1.1", ~"1.0"], Second <- [~"a", ~"evil"]
     ].
 
+request_invalid_host_returns_error_test() ->
+    %% RFC 9112 §3.2: a Host field with an invalid value is a 400 like a
+    %% missing one, on any version: userinfo, a path, a second host after
+    %% a comma, and an empty value (an http URI with an empty host is
+    %% invalid, RFC 9110 §4.2.1).
+    [
+        ?assertEqual(
+            {error, bad_host},
+            roadrunner_http1:parse_request(
+                <<"GET / HTTP/", V/binary, "\r\nHost: ", Host/binary, "\r\n\r\n">>
+            ),
+            Host
+        )
+     || V <- [~"1.1", ~"1.0"],
+        Host <- [
+            ~"user@localhost:8080",
+            ~"localhost:8080/path",
+            ~"localhost:8080, other.example.com",
+            ~""
+        ]
+    ].
+
 request_http11_missing_host_returns_error_test() ->
     %% RFC 9112 §3.2 / 7230 §5.4: HTTP/1.1 requests MUST include a
     %% Host header. Absent → 400 (request-smuggling mitigation +

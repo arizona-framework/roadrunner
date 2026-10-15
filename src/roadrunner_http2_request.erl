@@ -27,9 +27,10 @@
 %%   `roadrunner_http2_hpack:decode/2`.
 %% - `Connection`-specific headers MUST NOT appear (RFC 9113
 %%   §8.2.2). Rejected.
-%% - `:authority` or `Host` MUST be present, neither empty, and both
-%%   naming the same entity when both appear, compared after case and
-%%   default-port normalization (RFC 9113 §8.3.1).
+%% - `:authority` or `Host` MUST be present, neither empty, each a
+%%   `uri-host [":" port]` with no userinfo, and both naming the same
+%%   entity when both appear, compared after case and default-port
+%%   normalization (RFC 9113 §8.3.1).
 
 -export([from_headers/3]).
 
@@ -45,6 +46,7 @@
     | missing_authority
     | duplicate_host
     | empty_authority
+    | bad_authority
     | authority_mismatch.
 
 -type request_context() :: roadrunner_http:request_context().

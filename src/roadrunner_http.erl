@@ -44,6 +44,7 @@ accessors that operate on it.
 -export([
     request_pseudo_headers/1,
     check_request_authority/3,
+    valid_host/1,
     request_content_length/1,
     body_length_fits/3,
     build_request/7
@@ -397,13 +398,20 @@ validate_pseudo(_Method, _Scheme, _Authority, _Path, _Regular) ->
 %% mandatory authority component (QUIC is always `https`, and an HTTP/2
 %% request's scheme is the connection's), so the request MUST carry an
 %% `:authority` pseudo-header or a `host` header; if present neither is
-%% empty, and if both appear they MUST name the same entity. The
-%% empty-value clauses precede the equality clause so an empty value
-%% loses even when both sides are equally empty. Byte-equal values, what
-%% every real client sends, match without normalizing.
+%% empty, each is a `uri-host [":" port]` (`valid_host/1`, which also
+%% refuses the userinfo RFC 9113 §8.3.1 forbids), and if both appear they
+%% MUST name the same entity. The empty-value clauses come first so an
+%% empty value keeps its own reason. Byte-equal values, what every real
+%% client sends, match without normalizing.
 -doc false.
 -spec check_request_authority(binary() | undefined, headers(), http | https) ->
-    ok | {error, missing_authority | empty_authority | authority_mismatch | duplicate_host}.
+    ok
+    | {error,
+        missing_authority
+        | empty_authority
+        | bad_authority
+        | authority_mismatch
+        | duplicate_host}.
 check_request_authority(Authority, Regular, Scheme) ->
     case {Authority, find_host(Regular)} of
         {_, multiple} ->
@@ -414,18 +422,111 @@ check_request_authority(Authority, Regular, Scheme) ->
             {error, empty_authority};
         {_, ~""} ->
             {error, empty_authority};
-        {Same, Same} ->
-            ok;
-        {_, undefined} ->
-            ok;
-        {undefined, _} ->
-            ok;
         {_, Host} ->
-            case normalize_authority(Authority, Scheme) =:= normalize_authority(Host, Scheme) of
-                true -> ok;
-                false -> {error, authority_mismatch}
+            case valid_present_host(Authority) andalso valid_present_host(Host) of
+                true -> same_authority(Authority, Host, Scheme);
+                false -> {error, bad_authority}
             end
     end.
+
+-spec valid_present_host(binary() | undefined) -> boolean().
+valid_present_host(undefined) -> true;
+valid_present_host(Value) -> valid_host(Value).
+
+-spec same_authority(binary() | undefined, binary() | undefined, http | https) ->
+    ok | {error, authority_mismatch}.
+same_authority(Same, Same, _Scheme) ->
+    ok;
+same_authority(_Authority, undefined, _Scheme) ->
+    ok;
+same_authority(undefined, _Host, _Scheme) ->
+    ok;
+same_authority(Authority, Host, Scheme) ->
+    case normalize_authority(Authority, Scheme) =:= normalize_authority(Host, Scheme) of
+        true -> ok;
+        false -> {error, authority_mismatch}
+    end.
+
+%% Whether a Host field value (or an HTTP/2 or HTTP/3 `:authority`) is a
+%% `uri-host [":" port]` with a non-empty host (RFC 9110 §7.2 and §4.2.1,
+%% RFC 3986 §3.2.2): a bracketed IP literal or a reg-name (which also
+%% covers IPv4), then an optional `:` and digits. A userinfo `@`, a path,
+%% whitespace or a second host after a comma all fall outside it, and RFC
+%% 9112 §3.2 answers such a Host with 400. The host stays as sent; this
+%% only decides whether it is well formed.
+-doc false.
+-spec valid_host(binary()) -> boolean().
+valid_host(<<$[, Rest/binary>>) -> ip_literal(Rest, false);
+valid_host(Value) -> reg_name(Value, false).
+
+-spec reg_name(binary(), boolean()) -> boolean().
+reg_name(<<C, Rest/binary>>, _Any) when
+    C >= $a, C =< $z; C >= $A, C =< $Z; C >= $0, C =< $9
+->
+    reg_name(Rest, true);
+reg_name(<<$%, H1, H2, Rest/binary>>, _Any) ->
+    is_hex_digit(H1) andalso is_hex_digit(H2) andalso reg_name(Rest, true);
+reg_name(<<$:, Port/binary>>, true) ->
+    port_digits(Port);
+reg_name(<<C, Rest/binary>>, _Any) ->
+    is_host_mark(C) andalso reg_name(Rest, true);
+reg_name(<<>>, Any) ->
+    Any.
+
+%% RFC 3986 §3.2.2: `"[" ( IPv6address / IPvFuture ) "]"`. The bracket
+%% content is held to the bytes those two forms use (hex digits, `:`,
+%% `.`, and IPvFuture's unreserved and sub-delims), not parsed as an
+%% address: what matters here is that nothing outside the authority
+%% grammar gets in.
+-spec ip_literal(binary(), boolean()) -> boolean().
+ip_literal(<<$], Rest/binary>>, true) ->
+    case Rest of
+        <<>> -> true;
+        <<$:, Port/binary>> -> port_digits(Port);
+        _ -> false
+    end;
+ip_literal(<<C, Rest/binary>>, _Any) when
+    C >= $a, C =< $z; C >= $A, C =< $Z; C >= $0, C =< $9; C =:= $:
+->
+    ip_literal(Rest, true);
+ip_literal(<<C, Rest/binary>>, _Any) ->
+    is_host_mark(C) andalso ip_literal(Rest, true);
+ip_literal(<<>>, _Any) ->
+    false.
+
+%% `port = *DIGIT` (RFC 3986 §3.2.3); an empty port is allowed.
+-spec port_digits(binary()) -> boolean().
+port_digits(<<C, Rest/binary>>) when C >= $0, C =< $9 -> port_digits(Rest);
+port_digits(<<>>) -> true;
+port_digits(_) -> false.
+
+%% The non-alphanumeric unreserved and sub-delims bytes (RFC 3986 §2.2,
+%% §2.3), which a reg-name and an IPvFuture literal may hold.
+-spec is_host_mark(byte()) -> boolean().
+is_host_mark(C) when
+    C =:= $-;
+    C =:= $.;
+    C =:= $_;
+    C =:= $~;
+    C =:= $!;
+    C =:= $$;
+    C =:= $&;
+    C =:= $';
+    C =:= $(;
+    C =:= $);
+    C =:= $*;
+    C =:= $+;
+    C =:= $,;
+    C =:= $;;
+    C =:= $=
+->
+    true;
+is_host_mark(_) ->
+    false.
+
+-spec is_hex_digit(byte()) -> boolean().
+is_hex_digit(C) when C >= $0, C =< $9; C >= $a, C =< $f; C >= $A, C =< $F -> true;
+is_hex_digit(_) -> false.
 
 %% RFC 3986 §6.2 normalization of an `http`/`https` authority, which RFC
 %% 9113 §8.3.1 asks for before comparing `:authority` with `host`: the
