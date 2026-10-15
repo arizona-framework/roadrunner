@@ -254,15 +254,22 @@ fast_method(_Cur, _Bin, _Max) ->
     slow.
 
 %% The target's path, 7 bytes per step while a word holds no byte <= 0x20,
-%% no byte >= 0x7F and no `?` (a request-target is US-ASCII, RFC 3986 §2,
-%% with no CTL, SP or DEL); `T` is the target's
-%% start, `Bin` the line's.
+%% no byte >= 0x7F, no `#` or `\\` and no `?` (the target bytes of
+%% `roadrunner_http:valid_target_bytes/1`); `T` is the target's start,
+%% `Bin` the line's.
 -spec fast_path(binary(), binary(), binary(), binary(), pos_integer()) ->
     {ok, binary(), binary(), binary(), version(), binary()} | slow.
 fast_path(<<X:56, R/binary>> = Cur, T, Method, Bin, Max) ->
     Del = X bxor ?SWAR_BYTES(16#7F),
     Qm = X bxor ?SWAR_BYTES($?),
-    case ?SWAR_HIGH(X bor ?SWAR_BELOW(X, 16#21) bor ?SWAR_ZERO(Del) bor ?SWAR_ZERO(Qm)) of
+    Hash = X bxor ?SWAR_BYTES($#),
+    Bsl = X bxor ?SWAR_BYTES($\\),
+    case
+        ?SWAR_HIGH(
+            X bor ?SWAR_BELOW(X, 16#21) bor ?SWAR_ZERO(Del) bor ?SWAR_ZERO(Qm) bor
+                ?SWAR_ZERO(Hash) bor ?SWAR_ZERO(Bsl)
+        )
+    of
         0 -> fast_path(R, T, Method, Bin, Max);
         _ -> fast_path_byte(Cur, T, Method, Bin, Max)
     end;
@@ -281,7 +288,9 @@ fast_path_byte(<<$\s, R/binary>>, T, Method, Bin, Max) ->
     end;
 fast_path_byte(<<$?, R/binary>>, T, Method, Bin, Max) ->
     fast_query(R, T, byte_size(T) - byte_size(R) - 1, Method, Bin, Max);
-fast_path_byte(<<C, R/binary>>, T, Method, Bin, Max) when C > 16#20, C < 16#7F ->
+fast_path_byte(<<C, R/binary>>, T, Method, Bin, Max) when
+    C > 16#20, C < 16#7F, C =/= $#, C =/= $\\
+->
     fast_path_byte(R, T, Method, Bin, Max);
 fast_path_byte(_Cur, _T, _Method, _Bin, _Max) ->
     slow.
@@ -292,7 +301,14 @@ fast_path_byte(_Cur, _T, _Method, _Bin, _Max) ->
     {ok, binary(), binary(), binary(), version(), binary()} | slow.
 fast_query(<<X:56, R/binary>> = Cur, T, PathLen, Method, Bin, Max) ->
     Del = X bxor ?SWAR_BYTES(16#7F),
-    case ?SWAR_HIGH(X bor ?SWAR_BELOW(X, 16#21) bor ?SWAR_ZERO(Del)) of
+    Hash = X bxor ?SWAR_BYTES($#),
+    Bsl = X bxor ?SWAR_BYTES($\\),
+    case
+        ?SWAR_HIGH(
+            X bor ?SWAR_BELOW(X, 16#21) bor ?SWAR_ZERO(Del) bor ?SWAR_ZERO(Hash) bor
+                ?SWAR_ZERO(Bsl)
+        )
+    of
         0 -> fast_query(R, T, PathLen, Method, Bin, Max);
         _ -> fast_query_byte(Cur, T, PathLen, Method, Bin, Max)
     end;
@@ -306,7 +322,9 @@ fast_query_byte(<<$\s, R/binary>>, T, PathLen, Method, Bin, Max) ->
     <<Target:TargetLen/binary, _/binary>> = T,
     <<Path:PathLen/binary, _/binary>> = Target,
     fast_version(R, Method, Target, Path, Bin, Max);
-fast_query_byte(<<C, R/binary>>, T, PathLen, Method, Bin, Max) when C > 16#20, C < 16#7F ->
+fast_query_byte(<<C, R/binary>>, T, PathLen, Method, Bin, Max) when
+    C > 16#20, C < 16#7F, C =/= $#, C =/= $\\
+->
     fast_query_byte(R, T, PathLen, Method, Bin, Max);
 fast_query_byte(_Cur, _T, _PathLen, _Method, _Bin, _Max) ->
     slow.
