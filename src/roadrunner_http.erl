@@ -432,12 +432,22 @@ valid_path(_Method, _Path) -> false.
 
 %% Request-target bytes, shared by the HTTP/1.1 request line and the
 %% HTTP/2 and HTTP/3 `:path`: US-ASCII (RFC 3986 §2; raw UTF-8 or other
-%% high bytes must be percent-encoded) without CTL, SP or DEL.
+%% high bytes must be percent-encoded) without CTL, SP or DEL, and
+%% without `#` or `\\`. A fragment is never part of a request-target (RFC
+%% 9112 §3.2) and browsers don't send one; a backslash is no URI byte, and
+%% browsers turn it into `/` for http(s), so a raw one only comes from a
+%% client that another server could normalize differently. The other
+%% bytes RFC 3986 leaves out (`{` `}` `|` `^` `` ` `` and `"` `<` `>`)
+%% stay accepted: browsers send several of them unencoded, per the WHATWG
+%% URL standard's percent-encode sets.
 -doc false.
 -spec valid_target_bytes(binary()) -> boolean().
-valid_target_bytes(<<C, Rest/binary>>) when C > 16#20, C < 16#7F -> valid_target_bytes(Rest);
-valid_target_bytes(<<>>) -> true;
-valid_target_bytes(_) -> false.
+valid_target_bytes(<<C, Rest/binary>>) when C > 16#20, C < 16#7F, C =/= $#, C =/= $\\ ->
+    valid_target_bytes(Rest);
+valid_target_bytes(<<>>) ->
+    true;
+valid_target_bytes(_) ->
+    false.
 
 %% Field validity shared by HTTP/2 and HTTP/3 (RFC 9113 §8.2.1, RFC 9114
 %% §4.2). HTTP/2 applies the two predicates as HPACK decodes each literal

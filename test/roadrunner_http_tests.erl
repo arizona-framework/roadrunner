@@ -164,7 +164,9 @@ pseudo_path_follows_the_target_rules_test() ->
             {~"GET", <<"/caf", 16#C3, 16#A9>>},
             {~"GET", ~"/a b"},
             {~"GET", <<"/a", 1, "b">>},
-            {~"GET", <<"/a", 16#7F>>}
+            {~"GET", <<"/a", 16#7F>>},
+            {~"GET", ~"/a#b"},
+            {~"GET", ~"/a\\b"}
         ]
     ].
 

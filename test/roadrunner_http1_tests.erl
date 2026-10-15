@@ -737,12 +737,12 @@ target_every_byte_at_every_position_test() ->
     %% Every byte value at every position of a 19-byte path and of a
     %% 19-byte query: each SWAR lane of both 7-byte words and the tail,
     %% in both walks. Allowed: 0x21 to 0x7E (US-ASCII without CTL, SP and
-    %% DEL). A `?` in the path
+    %% DEL) except `#` and `\\`. A `?` in the path
     %% starts the query; a `?` in the query is a plain query byte. SP,
     %% CR and LF never reach the check (they split the request line),
     %% so only the error is asserted for them.
     Fill = binary:copy(~"a", 18),
-    Valid = fun(B) -> B > 16#20 andalso B < 16#7F end,
+    Valid = fun(B) -> B > 16#20 andalso B < 16#7F andalso B =/= $# andalso B =/= $\\ end,
     Parse = fun(Target) ->
         roadrunner_http1:parse_request(<<"GET ", Target/binary, " HTTP/1.1\r\nhost: x\r\n\r\n">>)
     end,
@@ -1550,6 +1550,23 @@ request_line_non_ascii_target_rejected_test() ->
             <<"/", 16#80>>,
             <<"/", 16#FF>>
         ]
+    ].
+
+request_line_fragment_and_backslash_rejected_test() ->
+    %% A fragment is never part of a request-target (RFC 9112 §3.2) and a
+    %% backslash is no URI byte: both are a bad request line, in the path
+    %% or the query. Bytes browsers send raw (`{` `}` `|` `^` `` ` ``) stay
+    %% accepted.
+    Parse = fun(Target) ->
+        roadrunner_http1:parse_request_line(<<"GET ", Target/binary, " HTTP/1.1\r\n">>)
+    end,
+    [
+        ?assertEqual({error, bad_request_line}, Parse(T), T)
+     || T <- [~"/path#frag", ~"/a?b#c", ~"/path\\file", ~"/a?b=c\\d", ~"/long/path/here#x"]
+    ],
+    [
+        ?assertMatch({ok, ~"GET", T, {1, 1}, ~""}, Parse(T), T)
+     || T <- [~"/a|b^c", ~"/q?f={\"a\":1}&x=a|b^c`d"]
     ].
 
 request_line_target_form_follows_method_test() ->
