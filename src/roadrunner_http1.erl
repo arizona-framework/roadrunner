@@ -43,7 +43,16 @@
 %% `persistent_term` so each call reads a constant — `persistent_term:get/1`
 %% measured at the same speed as a bound variable.
 -define(LF_KEY, {?MODULE, lf_cp}).
--define(CRLF_KEY, {?MODULE, crlf_cp}).
+
+%% RFC 9110 §5.6.2 tchar as a guard: ALPHA, DIGIT and the marks
+%% `!#$%&'*+-.^_`|~`.
+-define(IS_TOKEN_CHAR(C),
+    ((C >= $a andalso C =< $z) orelse (C >= $A andalso C =< $Z) orelse
+        (C >= $0 andalso C =< $9) orelse C =:= $! orelse C =:= $# orelse C =:= $$ orelse
+        C =:= $% orelse C =:= $& orelse C =:= $' orelse C =:= $* orelse C =:= $+ orelse
+        C =:= $- orelse C =:= $. orelse C =:= $^ orelse C =:= $_ orelse C =:= $` orelse
+        C =:= $| orelse C =:= $~)
+).
 -define(SPACE_KEY, {?MODULE, space_cp}).
 -define(DATE_LINE_KEY, {?MODULE, date_line}).
 
@@ -1200,114 +1209,99 @@ chunk_size_fast(_Bin, _Size, _Digits) ->
     | {more, undefined}
     | {error, bad_chunk_size | bad_chunk}.
 parse_chunk_size_line_slow(Bin) ->
-    case binary:match(Bin, persistent_term:get(?CRLF_KEY)) of
-        nomatch when byte_size(Bin) > ?MAX_CHUNK_HEADER ->
+    case chunk_size(Bin, 0, false) of
+        {ok, _Size, Rest} when byte_size(Bin) - byte_size(Rest) - 2 > ?MAX_CHUNK_HEADER ->
             {error, bad_chunk};
-        nomatch ->
+        {ok, _Size, _Rest} = Ok ->
+            Ok;
+        more when byte_size(Bin) > ?MAX_CHUNK_HEADER ->
+            {error, bad_chunk};
+        more ->
             {more, undefined};
-        {Pos, 2} when Pos > ?MAX_CHUNK_HEADER ->
-            {error, bad_chunk};
-        {Pos, 2} ->
-            <<Line:Pos/binary, "\r\n", Rest/binary>> = Bin,
-            parse_size_line(Line, Rest)
+        error ->
+            {error, bad_chunk_size}
     end.
 
 %% RFC 9112 §7.1: `chunk-size [ chunk-ext ] CRLF`, with chunk-size =
-%% 1*HEXDIG. Whitespace is allowed only as the BWS in front of a `;`, so
-%% ` 5` and a bare `5 ` are malformed while `5 ;ext` is fine. The
-%% extensions are checked against their grammar and then discarded: a
-%% CR, LF, NUL or other byte the grammar has no place for makes the line
-%% invalid (RFC 9112 §2.2 says a bare CR MUST be), so two parsers can't
-%% disagree on where the size line ends.
--spec parse_size_line(binary(), binary()) ->
-    {ok, non_neg_integer(), binary()} | {error, bad_chunk_size}.
-parse_size_line(Line, Rest) ->
-    maybe
-        {ok, Size, Ext} ?= chunk_size(Line, 0, false),
-        true ?= chunk_ext(Ext),
-        {ok, Size, Rest}
-    else
-        _ -> {error, bad_chunk_size}
-    end.
-
+%% 1*HEXDIG, read in one pass that ends at the CRLF: the digits, then the
+%% extensions, checked against their grammar and discarded. Whitespace is
+%% allowed only as the BWS in front of a `;`, so ` 5` and a bare `5 ` are
+%% malformed while `5 ;ext` is fine. A CR, LF, NUL or other byte the
+%% grammar has no place for makes the line invalid (RFC 9112 §2.2 says a
+%% bare CR MUST be), so two parsers can't disagree on where the size line
+%% ends. Running out of bytes before the CRLF is `more`; the caller caps
+%% the line's length either way.
 -spec chunk_size(binary(), non_neg_integer(), boolean()) ->
-    {ok, non_neg_integer(), binary()} | error.
+    {ok, non_neg_integer(), binary()} | more | error.
 chunk_size(<<C, R/binary>>, Acc, _Any) when C >= $0, C =< $9 ->
     chunk_size(R, Acc * 16 + (C - $0), true);
 chunk_size(<<C, R/binary>>, Acc, _Any) when C >= $a, C =< $f ->
     chunk_size(R, Acc * 16 + (C - $a + 10), true);
 chunk_size(<<C, R/binary>>, Acc, _Any) when C >= $A, C =< $F ->
     chunk_size(R, Acc * 16 + (C - $A + 10), true);
+chunk_size(<<>>, _Acc, _Any) ->
+    more;
 chunk_size(_Ext, _Acc, false) ->
     error;
 chunk_size(Ext, Acc, true) ->
-    {ok, Acc, Ext}.
+    case chunk_ext(Ext) of
+        {ok, Rest} -> {ok, Acc, Rest};
+        Other -> Other
+    end.
 
 %% `chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`
-%% (RFC 9112 §7.1.1), walked to the end of the line.
--spec chunk_ext(binary()) -> boolean().
-chunk_ext(<<>>) ->
-    true;
+%% (RFC 9112 §7.1.1), up to the CRLF; returns what follows it.
+-spec chunk_ext(binary()) -> {ok, binary()} | more | error.
+chunk_ext(<<"\r\n", Rest/binary>>) ->
+    {ok, Rest};
+chunk_ext(<<"\r">>) ->
+    more;
 chunk_ext(Bin) ->
     case skip_bws(Bin) of
         <<$;, R/binary>> -> chunk_ext_name(skip_bws(R));
-        _ -> false
+        <<>> -> more;
+        _ -> error
     end.
 
-%% chunk-ext-name = token, then an optional `BWS "=" BWS chunk-ext-val`.
--spec chunk_ext_name(binary()) -> boolean().
-chunk_ext_name(Bin) ->
-    case token(Bin) of
-        {ok, R} -> chunk_ext_value(R, skip_bws(R));
-        error -> false
-    end.
+%% chunk-ext-name = token (1*tchar, RFC 9110 §5.6.2), then an optional
+%% `BWS "=" BWS chunk-ext-val`. Each token byte is one clause match on
+%% `?IS_TOKEN_CHAR/1`, with no call or tuple per byte.
+-spec chunk_ext_name(binary()) -> {ok, binary()} | more | error.
+chunk_ext_name(<<C, R/binary>>) when ?IS_TOKEN_CHAR(C) -> chunk_ext_name_rest(R);
+chunk_ext_name(<<>>) -> more;
+chunk_ext_name(_Bin) -> error.
+
+-spec chunk_ext_name_rest(binary()) -> {ok, binary()} | more | error.
+chunk_ext_name_rest(<<C, R/binary>>) when ?IS_TOKEN_CHAR(C) -> chunk_ext_name_rest(R);
+chunk_ext_name_rest(R) -> chunk_ext_value(R, skip_bws(R)).
 
 %% `R` is what follows the name; `Bws` is `R` with its BWS skipped. With
-%% no `=`, the next extension starts at `R`, so its own BWS check sees
-%% any whitespace there.
--spec chunk_ext_value(binary(), binary()) -> boolean().
+%% no `=`, the next extension (or the CRLF) starts at `R`, so its own BWS
+%% check sees any whitespace there. Whitespace up to the end of the bytes
+%% so far could still turn out to precede a `=`, so it asks for more.
+-spec chunk_ext_value(binary(), binary()) -> {ok, binary()} | more | error.
 chunk_ext_value(_R, <<$=, V/binary>>) ->
-    case skip_bws(V) of
-        <<$", Q/binary>> -> quoted_string(Q);
-        V1 -> token_then_ext(V1)
-    end;
+    chunk_ext_val(skip_bws(V));
+chunk_ext_value(_R, <<>>) ->
+    more;
 chunk_ext_value(R, _Bws) ->
     chunk_ext(R).
 
--spec token_then_ext(binary()) -> boolean().
-token_then_ext(Bin) ->
-    case token(Bin) of
-        {ok, R} -> chunk_ext(R);
-        error -> false
-    end.
+%% chunk-ext-val = token / quoted-string.
+-spec chunk_ext_val(binary()) -> {ok, binary()} | more | error.
+chunk_ext_val(<<$", Q/binary>>) -> quoted_string(Q);
+chunk_ext_val(<<C, R/binary>>) when ?IS_TOKEN_CHAR(C) -> chunk_ext_val_rest(R);
+chunk_ext_val(<<>>) -> more;
+chunk_ext_val(_Bin) -> error.
 
-%% 1*tchar (RFC 9110 §5.6.2); returns what follows the token.
--spec token(binary()) -> {ok, binary()} | error.
-token(<<C, R/binary>>) ->
-    case is_token_char(C) of
-        true -> {ok, token_rest(R)};
-        false -> error
-    end;
-token(<<>>) ->
-    error.
-
--spec token_rest(binary()) -> binary().
-token_rest(<<C, R/binary>> = Bin) ->
-    case is_token_char(C) of
-        true -> token_rest(R);
-        false -> Bin
-    end;
-token_rest(<<>>) ->
-    <<>>.
-
--spec is_token_char(byte()) -> boolean().
-is_token_char(C) when C >= $a, C =< $z; C >= $A, C =< $Z; C >= $0, C =< $9 -> true;
-is_token_char(C) -> is_tchar(C).
+-spec chunk_ext_val_rest(binary()) -> {ok, binary()} | more | error.
+chunk_ext_val_rest(<<C, R/binary>>) when ?IS_TOKEN_CHAR(C) -> chunk_ext_val_rest(R);
+chunk_ext_val_rest(R) -> chunk_ext(R).
 
 %% The body of a quoted-string after its opening DQUOTE (RFC 9110
 %% §5.6.4): qdtext or a quoted-pair up to the closing DQUOTE, then the
 %% rest of the extension list.
--spec quoted_string(binary()) -> boolean().
+-spec quoted_string(binary()) -> {ok, binary()} | more | error.
 quoted_string(<<$", R/binary>>) ->
     chunk_ext(R);
 quoted_string(<<$\\, C, R/binary>>) when C =:= $\t; C >= 16#20, C =/= 16#7F ->
@@ -1316,8 +1310,12 @@ quoted_string(<<C, R/binary>>) when
     C =:= $\t; C =:= $\s; C =:= 16#21; C >= 16#23, C =< 16#5B; C >= 16#5D, C =/= 16#7F
 ->
     quoted_string(R);
+quoted_string(<<>>) ->
+    more;
+quoted_string(<<$\\>>) ->
+    more;
 quoted_string(_) ->
-    false.
+    error.
 
 -spec skip_bws(binary()) -> binary().
 skip_bws(<<C, R/binary>>) when C =:= $\s; C =:= $\t -> skip_bws(R);
@@ -1431,6 +1429,5 @@ encode_headers([{Name, Value} | Rest]) ->
 -spec init_patterns() -> ok.
 init_patterns() ->
     persistent_term:put(?LF_KEY, binary:compile_pattern(~"\n")),
-    persistent_term:put(?CRLF_KEY, binary:compile_pattern(~"\r\n")),
     persistent_term:put(?SPACE_KEY, binary:compile_pattern(~" ")),
     ok.
