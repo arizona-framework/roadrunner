@@ -916,7 +916,8 @@ compute_cached_decisions(Headers) ->
         expects_continue => false,
         connection_lower => ~"",
         content_length => none,
-        has_host => false
+        has_host => false,
+        has_content_type => false
     }).
 
 -spec compute_cached_decisions_loop(headers(), roadrunner_req:cached_decisions()) ->
@@ -959,6 +960,12 @@ compute_cached_decisions_loop([{~"connection", V} | Rest], Acc) ->
     );
 compute_cached_decisions_loop([{~"content-length", V} | Rest], Acc) ->
     compute_cached_decisions_loop(Rest, Acc#{content_length := parse_content_length(V)});
+compute_cached_decisions_loop([{~"content-type", _} | Rest], #{has_content_type := false} = Acc) ->
+    compute_cached_decisions_loop(Rest, Acc#{has_content_type := true});
+compute_cached_decisions_loop([{~"content-type", _} | Rest], Acc) ->
+    %% Content-Type is a singleton field (RFC 9110 §5.3, §8.3): a second
+    %% line leaves the body's media type ambiguous.
+    compute_cached_decisions_loop(Rest, Acc#{has_content_type := multiple});
 compute_cached_decisions_loop([{~"host", V} | Rest], #{has_host := false} = Acc) ->
     Host =
         case roadrunner_http:valid_host(V) of
@@ -1009,7 +1016,8 @@ a record, so callers don't need to include a header file.
         | conflicting_framing
         | missing_host
         | duplicate_host
-        | bad_host}.
+        | bad_host
+        | duplicate_content_type}.
 parse_request(Bin) ->
     parse_request(
         Bin, {?MAX_REQUEST_LINE, ?MAX_HEADER_LINE, ?MAX_HEADER_BLOCK, ?MAX_HEADER_COUNT}
@@ -1038,13 +1046,15 @@ The conn loop passes the listener's configured `http1_*` limits;
         | conflicting_framing
         | missing_host
         | duplicate_host
-        | bad_host}.
+        | bad_host
+        | duplicate_content_type}.
 parse_request(Bin, {MaxReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}) when is_binary(Bin) ->
     maybe
         {ok, Method, RawTarget, RawPath, Version, Rest} ?= parse_request_line_p(Bin, MaxReqLine),
         {ok, RawHeaders, Rest2} ?= parse_headers(Rest, {MaxHdrLine, MaxHdrBlock, MaxHdrCount}),
         Decisions = compute_cached_decisions(RawHeaders),
         ok ?= validate_host(Version, Decisions),
+        ok ?= validate_content_type(Decisions),
         {Target, Path, Headers} = origin_form(RawTarget, RawPath, RawHeaders),
         Req = #{
             method => Method,
@@ -1073,6 +1083,14 @@ origin_form(Target, _Path, Headers) ->
     {ok, Authority, Origin} = absolute_target(Target),
     {Origin, roadrunner_req:target_path(Origin),
         lists:keystore(~"host", 1, Headers, {~"host", Authority})}.
+
+%% More than one Content-Type field line is a 400: the field is a
+%% singleton (RFC 9110 §5.3, §8.3), and two values, equal or not, leave
+%% the body's media type to whichever line a reader picks.
+-spec validate_content_type(roadrunner_req:cached_decisions()) ->
+    ok | {error, duplicate_content_type}.
+validate_content_type(#{has_content_type := multiple}) -> {error, duplicate_content_type};
+validate_content_type(_Decisions) -> ok.
 
 %% RFC 9112 §3.2 / 7230 §5.4: HTTP/1.1 requests MUST include a Host
 %% header. Absence is a 400 Bad Request, also a request-smuggling

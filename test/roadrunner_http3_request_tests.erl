@@ -75,6 +75,15 @@ connect_not_implemented_test() ->
         from([{~":method", ~"CONNECT"}, {~":authority", ~"example.com:443"}])
     ).
 
+duplicate_content_type_test() ->
+    ?assertEqual(
+        {error, duplicate_content_type},
+        from(base() ++ [{~"content-type", ~"a/b"}, {~"content-type", ~"a/b"}])
+    ),
+    ?assertMatch(
+        {ok, _}, from(base() ++ [{~":authority", ~"x"}, {~"content-type", ~"a/b"}])
+    ).
+
 empty_path_test() ->
     ?assertEqual(
         {error, empty_path},
