@@ -12,7 +12,7 @@
 %%%   ./scripts/autobahn.escript [--port N]
 %%%
 %%% Output: pass/fail counts per case category, plus the HTML report
-%%% path. Exit 0 on full pass, 1 on any failure.
+%%% path. Exit 0 when every case is OK or INFORMATIONAL, 1 otherwise.
 
 -mode(compile).
 
@@ -20,11 +20,10 @@
 -define(LISTENER, autobahn_listener).
 -define(DOCKER_IMAGE, "crossbario/autobahn-testsuite:latest").
 
-%% Most listeners ship a 10 MB content-length cap by default; the
-%% Autobahn 9.* category drives messages up to 16 MB. Bump for the
-%% conformance run so those cases aren't artificially failed by our
-%% own framework guard.
--define(AUTOBAHN_MAX_CONTENT_LENGTH, 32 * 1024 * 1024).
+%% The default WebSocket limits cap a frame and a message at 10 MB; the
+%% Autobahn 9.* category drives messages up to 16 MB. Raise them for the
+%% conformance run so those cases aren't failed by our own guard.
+-define(AUTOBAHN_MAX_MESSAGE_SIZE, 32 * 1024 * 1024).
 
 main(Args) ->
     Opts = parse_args(Args),
@@ -35,7 +34,10 @@ main(Args) ->
     {ok, _} = roadrunner:start_listener(?LISTENER, #{
         port => Port,
         routes => roadrunner_autobahn_handler,
-        max_content_length => ?AUTOBAHN_MAX_CONTENT_LENGTH
+        ws => #{
+            max_frame_size => ?AUTOBAHN_MAX_MESSAGE_SIZE,
+            max_message_size => ?AUTOBAHN_MAX_MESSAGE_SIZE
+        }
     }),
     BoundPort = roadrunner_listener:port(?LISTENER),
     io:format("autobahn|testsuite — roadrunner WS conformance~n"),
@@ -46,8 +48,12 @@ main(Args) ->
     ok = roadrunner:stop_listener(?LISTENER),
     case Result of
         ok ->
-            io:format("~n~s~n", [fmt_summary(ProjectDir)]),
-            halt(0);
+            {Summary, Verdict} = summary(ProjectDir),
+            io:format("~n~s~n", [Summary]),
+            case Verdict of
+                pass -> halt(0);
+                fail -> halt(1)
+            end;
         {error, Reason} ->
             io:format("~nautobahn run failed: ~p~n", [Reason]),
             halt(1)
@@ -123,7 +129,7 @@ run_fuzzingclient(ProjectDir, _Port) ->
         _ -> {error, fuzzingclient_error}
     end.
 
-fmt_summary(ProjectDir) ->
+summary(ProjectDir) ->
     %% The fuzzingclient writes `index.json` in the reports dir; parse
     %% it for the per-case results.
     Path = filename:join([reports_dir(ProjectDir), "clients", "index.json"]),
@@ -131,13 +137,15 @@ fmt_summary(ProjectDir) ->
         {ok, Json} ->
             summarize_json(Json, Path);
         {error, _} ->
-            io_lib:format("(report not found at ~s — fuzzingclient may have failed)", [Path])
+            {io_lib:format("(report not found at ~s — fuzzingclient may have failed)", [Path]),
+                fail}
     end.
 
 summarize_json(Json, Path) ->
     %% Parse the fuzzingclient index. JSON shape:
     %%   {"roadrunner": {"1.1.1": {"behavior": "OK"}, ...}}
     %% behaviors: OK, NON-STRICT, INFORMATIONAL, FAILED, UNIMPLEMENTED.
+    %% Strict conformance means every case is OK or INFORMATIONAL.
     case json:decode(Json) of
         #{~"roadrunner" := Cases} ->
             Buckets = lists:foldl(
@@ -147,21 +155,40 @@ summarize_json(Json, Path) ->
                 #{},
                 maps:to_list(Cases)
             ),
-            io_lib:format(
+            NotStrict = lists:sort([
+                Id
+             || {Id, #{~"behavior" := B}} <- maps:to_list(Cases),
+                B =/= ~"OK",
+                B =/= ~"INFORMATIONAL"
+            ]),
+            Text = io_lib:format(
                 "summary~n"
-                "  total      : ~B~n"
-                "  OK         : ~B~n"
-                "  NON-STRICT : ~B~n"
-                "  FAILED     : ~B~n"
-                "  report     : ~s~n",
+                "  total         : ~B~n"
+                "  OK            : ~B~n"
+                "  INFORMATIONAL : ~B~n"
+                "  NON-STRICT    : ~B~n"
+                "  UNIMPLEMENTED : ~B~n"
+                "  FAILED        : ~B~n"
+                "  not strict    : ~s~n"
+                "  report        : ~s~n",
                 [
                     map_size(Cases),
                     maps:get(~"OK", Buckets, 0),
+                    maps:get(~"INFORMATIONAL", Buckets, 0),
                     maps:get(~"NON-STRICT", Buckets, 0),
+                    maps:get(~"UNIMPLEMENTED", Buckets, 0),
                     maps:get(~"FAILED", Buckets, 0),
+                    case NotStrict of
+                        [] -> ~"none";
+                        [_ | _] -> lists:join(~" ", NotStrict)
+                    end,
                     Path
                 ]
-            );
+            ),
+            case NotStrict of
+                [] -> {Text, pass};
+                [_ | _] -> {Text, fail}
+            end;
         _ ->
-            io_lib:format("(unexpected report shape at ~s)", [Path])
+            {io_lib:format("(unexpected report shape at ~s)", [Path]), fail}
     end.
