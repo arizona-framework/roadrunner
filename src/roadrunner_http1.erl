@@ -45,7 +45,6 @@
 -define(LF_KEY, {?MODULE, lf_cp}).
 -define(CRLF_KEY, {?MODULE, crlf_cp}).
 -define(SPACE_KEY, {?MODULE, space_cp}).
--define(SEMICOLON_KEY, {?MODULE, semicolon_cp}).
 -define(DATE_LINE_KEY, {?MODULE, date_line}).
 
 %% Module-local aliases for the shared HTTP primitives so this
@@ -961,13 +960,14 @@ Returns one of:
   whatever follows the empty line that closes it (typically the start
   of the next pipelined message).
 - `{more, undefined}` when more bytes are needed.
-- `{error, bad_chunk_size}` when the size field cannot be parsed (bad
-  hex, empty, etc.).
+- `{error, bad_chunk_size}` when the size line doesn't match its
+  grammar (bad or missing hex, whitespace not followed by `;`, a
+  malformed chunk extension).
 - `{error, bad_chunk}` for any other structural failure (oversized
   chunk header, missing CRLF after data).
 
-Chunk extensions are parsed and discarded per RFC 9112 §7.1. The chunk
-header line is capped at 8192 bytes.
+Chunk extensions are checked against the RFC 9112 §7.1.1 grammar and
+then discarded. The chunk header line is capped at 8192 bytes.
 """.
 -spec parse_chunk(binary()) ->
     {ok, Data :: binary(), Rest :: binary()}
@@ -1036,14 +1036,7 @@ heap up before the cap fires.
         | conflicting_framing
         | content_length_too_large}.
 parse_chunk(Bin, Limits, Budget) when is_binary(Bin) ->
-    %% Fetch the compiled CRLF + semicolon patterns ONCE here and
-    %% thread them into `parse_chunk_size_line/3` (and onward to
-    %% `parse_size_line/3`) so the chunked-decode loop in
-    %% `roadrunner_conn:read_chunked/5` doesn't pay two
-    %% `persistent_term:get/1` per chunk through this entry.
-    CrlfCp = persistent_term:get(?CRLF_KEY),
-    SemiCp = persistent_term:get(?SEMICOLON_KEY),
-    case parse_chunk_size_line(Bin, CrlfCp, SemiCp) of
+    case parse_chunk_size_line(Bin) of
         {ok, 0, AfterSize} ->
             parse_last_chunk(AfterSize, Limits);
         {ok, Size, _AfterSize} when is_integer(Budget), Size > Budget ->
@@ -1082,14 +1075,14 @@ parse_chunk_data(Size, AfterSize) ->
             {error, bad_chunk}
     end.
 
--spec parse_chunk_size_line(binary(), binary:cp(), binary:cp()) ->
+-spec parse_chunk_size_line(binary()) ->
     {ok, non_neg_integer(), binary()}
     | {more, undefined}
     | {error, bad_chunk_size | bad_chunk}.
-parse_chunk_size_line(Bin, CrlfCp, SemiCp) ->
+parse_chunk_size_line(Bin) ->
     case chunk_size_fast(Bin, 0, 0) of
         {ok, _Size, _Rest} = Ok -> Ok;
-        slow -> parse_chunk_size_line_slow(Bin, CrlfCp, SemiCp)
+        slow -> parse_chunk_size_line_slow(Bin)
     end.
 
 %% The usual size line is bare hex digits then CRLF (`400\r\n`): read it
@@ -1110,12 +1103,12 @@ chunk_size_fast(<<"\r\n", Rest/binary>>, Size, Digits) when Digits > 0 ->
 chunk_size_fast(_Bin, _Size, _Digits) ->
     slow.
 
--spec parse_chunk_size_line_slow(binary(), binary:cp(), binary:cp()) ->
+-spec parse_chunk_size_line_slow(binary()) ->
     {ok, non_neg_integer(), binary()}
     | {more, undefined}
     | {error, bad_chunk_size | bad_chunk}.
-parse_chunk_size_line_slow(Bin, CrlfCp, SemiCp) ->
-    case binary:match(Bin, CrlfCp) of
+parse_chunk_size_line_slow(Bin) ->
+    case binary:match(Bin, persistent_term:get(?CRLF_KEY)) of
         nomatch when byte_size(Bin) > ?MAX_CHUNK_HEADER ->
             {error, bad_chunk};
         nomatch ->
@@ -1124,41 +1117,119 @@ parse_chunk_size_line_slow(Bin, CrlfCp, SemiCp) ->
             {error, bad_chunk};
         {Pos, 2} ->
             <<Line:Pos/binary, "\r\n", Rest/binary>> = Bin,
-            parse_size_line(Line, Rest, SemiCp)
+            parse_size_line(Line, Rest)
     end.
 
--spec parse_size_line(binary(), binary(), binary:cp()) ->
+%% RFC 9112 §7.1: `chunk-size [ chunk-ext ] CRLF`, with chunk-size =
+%% 1*HEXDIG. Whitespace is allowed only as the BWS in front of a `;`, so
+%% ` 5` and a bare `5 ` are malformed while `5 ;ext` is fine. The
+%% extensions are checked against their grammar and then discarded: a
+%% CR, LF, NUL or other byte the grammar has no place for makes the line
+%% invalid (RFC 9112 §2.2 says a bare CR MUST be), so two parsers can't
+%% disagree on where the size line ends.
+-spec parse_size_line(binary(), binary()) ->
     {ok, non_neg_integer(), binary()} | {error, bad_chunk_size}.
-parse_size_line(Line, Rest, SemiCp) ->
-    SizePart =
-        case binary:split(Line, SemiCp) of
-            [S] -> S;
-            [S, _Ext] -> S
-        end,
-    %% Per RFC 9112 §7.1: chunk-size = 1*HEXDIG. BWS is allowed before
-    %% `;` (chunk-ext separator) but NOT before the chunk-size itself —
-    %% so trim only trailing OWS, never leading. ` 5\r\n` is malformed;
-    %% `5 ;ext\r\n` is fine.
-    case parse_hex(roadrunner_bin:trim_trailing_ows(SizePart)) of
-        {ok, N} -> {ok, N, Rest};
-        error -> {error, bad_chunk_size}
+parse_size_line(Line, Rest) ->
+    maybe
+        {ok, Size, Ext} ?= chunk_size(Line, 0, false),
+        true ?= chunk_ext(Ext),
+        {ok, Size, Rest}
+    else
+        _ -> {error, bad_chunk_size}
     end.
 
--spec parse_hex(binary()) -> {ok, non_neg_integer()} | error.
-parse_hex(<<>>) -> error;
-parse_hex(B) -> parse_hex_chars(B, 0).
+-spec chunk_size(binary(), non_neg_integer(), boolean()) ->
+    {ok, non_neg_integer(), binary()} | error.
+chunk_size(<<C, R/binary>>, Acc, _Any) when C >= $0, C =< $9 ->
+    chunk_size(R, Acc * 16 + (C - $0), true);
+chunk_size(<<C, R/binary>>, Acc, _Any) when C >= $a, C =< $f ->
+    chunk_size(R, Acc * 16 + (C - $a + 10), true);
+chunk_size(<<C, R/binary>>, Acc, _Any) when C >= $A, C =< $F ->
+    chunk_size(R, Acc * 16 + (C - $A + 10), true);
+chunk_size(_Ext, _Acc, false) ->
+    error;
+chunk_size(Ext, Acc, true) ->
+    {ok, Acc, Ext}.
 
--spec parse_hex_chars(binary(), non_neg_integer()) -> {ok, non_neg_integer()} | error.
-parse_hex_chars(<<>>, Acc) ->
-    {ok, Acc};
-parse_hex_chars(<<C, R/binary>>, Acc) when C >= $0, C =< $9 ->
-    parse_hex_chars(R, Acc * 16 + (C - $0));
-parse_hex_chars(<<C, R/binary>>, Acc) when C >= $a, C =< $f ->
-    parse_hex_chars(R, Acc * 16 + (C - $a + 10));
-parse_hex_chars(<<C, R/binary>>, Acc) when C >= $A, C =< $F ->
-    parse_hex_chars(R, Acc * 16 + (C - $A + 10));
-parse_hex_chars(_, _) ->
+%% `chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`
+%% (RFC 9112 §7.1.1), walked to the end of the line.
+-spec chunk_ext(binary()) -> boolean().
+chunk_ext(<<>>) ->
+    true;
+chunk_ext(Bin) ->
+    case skip_bws(Bin) of
+        <<$;, R/binary>> -> chunk_ext_name(skip_bws(R));
+        _ -> false
+    end.
+
+%% chunk-ext-name = token, then an optional `BWS "=" BWS chunk-ext-val`.
+-spec chunk_ext_name(binary()) -> boolean().
+chunk_ext_name(Bin) ->
+    case token(Bin) of
+        {ok, R} -> chunk_ext_value(R, skip_bws(R));
+        error -> false
+    end.
+
+%% `R` is what follows the name; `Bws` is `R` with its BWS skipped. With
+%% no `=`, the next extension starts at `R`, so its own BWS check sees
+%% any whitespace there.
+-spec chunk_ext_value(binary(), binary()) -> boolean().
+chunk_ext_value(_R, <<$=, V/binary>>) ->
+    case skip_bws(V) of
+        <<$", Q/binary>> -> quoted_string(Q);
+        V1 -> token_then_ext(V1)
+    end;
+chunk_ext_value(R, _Bws) ->
+    chunk_ext(R).
+
+-spec token_then_ext(binary()) -> boolean().
+token_then_ext(Bin) ->
+    case token(Bin) of
+        {ok, R} -> chunk_ext(R);
+        error -> false
+    end.
+
+%% 1*tchar (RFC 9110 §5.6.2); returns what follows the token.
+-spec token(binary()) -> {ok, binary()} | error.
+token(<<C, R/binary>>) ->
+    case is_token_char(C) of
+        true -> {ok, token_rest(R)};
+        false -> error
+    end;
+token(<<>>) ->
     error.
+
+-spec token_rest(binary()) -> binary().
+token_rest(<<C, R/binary>> = Bin) ->
+    case is_token_char(C) of
+        true -> token_rest(R);
+        false -> Bin
+    end;
+token_rest(<<>>) ->
+    <<>>.
+
+-spec is_token_char(byte()) -> boolean().
+is_token_char(C) when C >= $a, C =< $z; C >= $A, C =< $Z; C >= $0, C =< $9 -> true;
+is_token_char(C) -> is_tchar(C).
+
+%% The body of a quoted-string after its opening DQUOTE (RFC 9110
+%% §5.6.4): qdtext or a quoted-pair up to the closing DQUOTE, then the
+%% rest of the extension list.
+-spec quoted_string(binary()) -> boolean().
+quoted_string(<<$", R/binary>>) ->
+    chunk_ext(R);
+quoted_string(<<$\\, C, R/binary>>) when C =:= $\t; C >= 16#20, C =/= 16#7F ->
+    quoted_string(R);
+quoted_string(<<C, R/binary>>) when
+    C =:= $\t; C =:= $\s; C =:= 16#21; C >= 16#23, C =< 16#5B; C >= 16#5D, C =/= 16#7F
+->
+    quoted_string(R);
+quoted_string(_) ->
+    false.
+
+-spec skip_bws(binary()) -> binary().
+skip_bws(<<C, R/binary>>) when C =:= $\s; C =:= $\t -> skip_bws(R);
+skip_bws(Bin) -> Bin.
 
 -doc """
 Build a complete HTTP/1.1 response message.
@@ -1266,5 +1337,4 @@ init_patterns() ->
     persistent_term:put(?LF_KEY, binary:compile_pattern(~"\n")),
     persistent_term:put(?CRLF_KEY, binary:compile_pattern(~"\r\n")),
     persistent_term:put(?SPACE_KEY, binary:compile_pattern(~" ")),
-    persistent_term:put(?SEMICOLON_KEY, binary:compile_pattern(~";")),
     ok.
