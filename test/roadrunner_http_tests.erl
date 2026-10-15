@@ -160,3 +160,73 @@ authority_compare_normalizes_test() ->
     %% and so is a different host, including one shorter than the port.
     ?assertEqual({error, authority_mismatch}, Check(~"a", ~"b", https)),
     ?assertEqual({error, authority_mismatch}, Check(~"a.example", ~"b.example:443", https)).
+
+authority_rejects_malformed_values_test() ->
+    %% RFC 9113 §8.3.1 / RFC 9114 §4.3.1: the authority is a
+    %% `uri-host [":" port]` with no userinfo, whether it arrives as
+    %% `:authority`, as `host`, or as both.
+    Check = fun(Authority, Regular) ->
+        roadrunner_http:check_request_authority(Authority, Regular, https)
+    end,
+    [
+        begin
+            ?assertEqual({error, bad_authority}, Check(Bad, []), Bad),
+            ?assertEqual({error, bad_authority}, Check(undefined, [{~"host", Bad}]), Bad),
+            ?assertEqual({error, bad_authority}, Check(~"example.com", [{~"host", Bad}]), Bad),
+            ?assertEqual({error, bad_authority}, Check(Bad, [{~"host", ~"example.com"}]), Bad)
+        end
+     || Bad <- [~"user@example.com", ~"example.com/path", ~"example.com:443, other.example"]
+    ],
+    ?assertEqual(ok, Check(~"example.com:443", [])),
+    ?assertEqual(ok, Check(undefined, [{~"host", ~"[::1]:8443"}])).
+
+%% --- valid_host/1 ---
+
+valid_host_accepts_uri_host_and_port_test() ->
+    %% RFC 9110 §7.2: `Host = uri-host [ ":" port ]`, with uri-host a
+    %% reg-name (IPv4 included), an IPv6 or IPvFuture literal, and port
+    %% `*DIGIT` (RFC 3986 §3.2.2, §3.2.3).
+    [
+        ?assert(roadrunner_http:valid_host(Host), Host)
+     || Host <- [
+            ~"example.com",
+            ~"EXAMPLE.com:8080",
+            ~"localhost:",
+            ~"127.0.0.1:80",
+            ~"a-b_c~d.e",
+            ~"!$&'()*+,;=",
+            ~"caf%C3%A9.example",
+            ~"[::1]",
+            ~"[2001:db8::7]:443",
+            ~"[::ffff:192.0.2.1]",
+            ~"[v1.fe80::a+en1]:80"
+        ]
+    ].
+
+valid_host_rejects_values_outside_the_grammar_test() ->
+    %% Empty hosts (RFC 9110 §4.2.1: an http URI with an empty host is
+    %% invalid), userinfo, paths, whitespace, a second host after a comma,
+    %% non-digit ports, broken percent-escapes, unclosed or empty IP
+    %% literals, and anything after the literal but a port.
+    [
+        ?assertNot(roadrunner_http:valid_host(Host), Host)
+     || Host <- [
+            ~"",
+            ~":8080",
+            ~"user@localhost:8080",
+            ~"localhost:8080/path",
+            ~"localhost:8080, other.example.com",
+            ~"local host",
+            ~"localhost:80a",
+            ~"localhost:8080:80",
+            ~"bad%2",
+            ~"bad%zz",
+            ~"[]",
+            ~"[::1",
+            ~"[::1]x",
+            ~"[::1]:x",
+            ~"[::1/64]",
+            <<"caf", 16#C3, 16#A9>>,
+            <<"a", 0>>
+        ]
+    ].

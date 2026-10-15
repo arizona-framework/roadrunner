@@ -851,8 +851,13 @@ compute_cached_decisions_loop([{~"connection", V} | Rest], Acc) ->
     );
 compute_cached_decisions_loop([{~"content-length", V} | Rest], Acc) ->
     compute_cached_decisions_loop(Rest, Acc#{content_length := parse_content_length(V)});
-compute_cached_decisions_loop([{~"host", _} | Rest], #{has_host := false} = Acc) ->
-    compute_cached_decisions_loop(Rest, Acc#{has_host := true});
+compute_cached_decisions_loop([{~"host", V} | Rest], #{has_host := false} = Acc) ->
+    Host =
+        case roadrunner_http:valid_host(V) of
+            true -> true;
+            false -> invalid
+        end,
+    compute_cached_decisions_loop(Rest, Acc#{has_host := Host});
 compute_cached_decisions_loop([{~"host", _} | Rest], Acc) ->
     %% RFC 9112 §3.2: more than one Host field line is a 400.
     compute_cached_decisions_loop(Rest, Acc#{has_host := multiple});
@@ -894,7 +899,8 @@ a record, so callers don't need to include a header file.
         | too_many_headers
         | conflicting_framing
         | missing_host
-        | duplicate_host}.
+        | duplicate_host
+        | bad_host}.
 parse_request(Bin) ->
     parse_request(
         Bin, {?MAX_REQUEST_LINE, ?MAX_HEADER_LINE, ?MAX_HEADER_BLOCK, ?MAX_HEADER_COUNT}
@@ -921,7 +927,8 @@ The conn loop passes the listener's configured `http1_*` limits;
         | too_many_headers
         | conflicting_framing
         | missing_host
-        | duplicate_host}.
+        | duplicate_host
+        | bad_host}.
 parse_request(Bin, {MaxReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}) when is_binary(Bin) ->
     maybe
         {ok, Method, Target, Path, Version, Rest} ?= parse_request_line_p(Bin, MaxReqLine),
@@ -942,10 +949,14 @@ parse_request(Bin, {MaxReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}) when is_b
 %% RFC 9112 §3.2 / 7230 §5.4: HTTP/1.1 requests MUST include a Host
 %% header. Absence is a 400 Bad Request, also a request-smuggling
 %% mitigation when proxies forward to backends that disagree on the
-%% target host. HTTP/1.0 didn't require it.
+%% target host. HTTP/1.0 didn't require it. Whatever the version, a Host
+%% that is present must be a valid `uri-host [":" port]` with a non-empty
+%% host (`roadrunner_http:valid_host/1`, the check HTTP/2 and HTTP/3 apply
+%% to the authority): RFC 9112 §3.2 answers an invalid one with 400 too.
 -spec validate_host(version(), roadrunner_req:cached_decisions()) ->
-    ok | {error, missing_host | duplicate_host}.
+    ok | {error, missing_host | duplicate_host | bad_host}.
 validate_host(_Version, #{has_host := multiple}) -> {error, duplicate_host};
+validate_host(_Version, #{has_host := invalid}) -> {error, bad_host};
 validate_host({1, 1}, #{has_host := true}) -> ok;
 validate_host({1, 1}, #{has_host := false}) -> {error, missing_host};
 validate_host({1, 0}, _Decisions) -> ok.

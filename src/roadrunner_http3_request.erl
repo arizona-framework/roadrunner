@@ -26,8 +26,9 @@
 %% - Connection-specific headers MUST NOT appear (RFC 9114 §4.2).
 %% - The request MUST carry an `:authority` pseudo-header or a `host` header
 %%   (https has a mandatory authority component); if present neither is empty,
-%%   and if both appear they MUST name the same entity, compared after
-%%   case and default-port normalization (RFC 9114 §4.3.1).
+%%   each is a `uri-host [":" port]` with no userinfo, and if both appear
+%%   they MUST name the same entity, compared after case and default-port
+%%   normalization (RFC 9114 §4.3.1).
 %% - A `content-length` header MUST equal the received body length and MUST NOT
 %%   be repeated (RFC 9114 §4.1.2, RFC 9110 §8.6).
 
@@ -47,6 +48,7 @@
     | missing_authority
     | duplicate_host
     | empty_authority
+    | bad_authority
     | authority_mismatch.
 
 -type request_context() :: roadrunner_http:request_context().
