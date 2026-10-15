@@ -1299,13 +1299,11 @@ cached_date_line() ->
             Line
     end.
 
-%% Common status codes get a precomputed `HTTP/1.1 NNN Reason\r\n`
-%% binary — one binary literal vs the five-element iolist build
-%% (`integer_to_binary(Status)` + `reason/1` + spacers) the slow
-%% path allocates per response. Wire bytes match the slow-path
-%% output exactly: only codes covered by `reason/1` appear here,
-%% with their reason phrase verbatim. Less common codes fall
-%% through to the original construction.
+%% Common status codes, and the ones roadrunner sends on its own when
+%% it refuses a request (405, 408, 413, 414, 431, 501), get a
+%% precomputed `HTTP/1.1 NNN Reason\r\n` binary with the RFC 9110 §15
+%% reason phrase. Other codes fall through to the empty-phrase line
+%% below.
 -spec status_line(status()) -> binary() | iodata().
 status_line(200) -> ~"HTTP/1.1 200 OK\r\n";
 status_line(201) -> ~"HTTP/1.1 201 Created\r\n";
@@ -1317,8 +1315,14 @@ status_line(400) -> ~"HTTP/1.1 400 Bad Request\r\n";
 status_line(401) -> ~"HTTP/1.1 401 Unauthorized\r\n";
 status_line(403) -> ~"HTTP/1.1 403 Forbidden\r\n";
 status_line(404) -> ~"HTTP/1.1 404 Not Found\r\n";
+status_line(405) -> ~"HTTP/1.1 405 Method Not Allowed\r\n";
+status_line(408) -> ~"HTTP/1.1 408 Request Timeout\r\n";
+status_line(413) -> ~"HTTP/1.1 413 Content Too Large\r\n";
+status_line(414) -> ~"HTTP/1.1 414 URI Too Long\r\n";
 status_line(429) -> ~"HTTP/1.1 429 Too Many Requests\r\n";
+status_line(431) -> ~"HTTP/1.1 431 Request Header Fields Too Large\r\n";
 status_line(500) -> ~"HTTP/1.1 500 Internal Server Error\r\n";
+status_line(501) -> ~"HTTP/1.1 501 Not Implemented\r\n";
 status_line(503) -> ~"HTTP/1.1 503 Service Unavailable\r\n";
 %% Uncommon status codes — emit `HTTP/1.1 NNN \r\n` with an empty
 %% reason phrase. RFC 9112 §4.1 explicitly allows the phrase to be
