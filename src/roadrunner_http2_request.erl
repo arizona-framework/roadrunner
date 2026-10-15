@@ -48,6 +48,7 @@
     | bad_connect
     | not_implemented
     | connection_specific_header
+    | duplicate_content_type
     | missing_authority
     | duplicate_host
     | empty_authority
@@ -93,13 +94,29 @@ from_headers(Headers, Body, #{scheme := Scheme} = RequestContext) ->
 %% literal-binary clauses to a hash/select, no `lists:member`
 %% function call per header.
 -spec check_banned(roadrunner_http:headers()) ->
-    ok | {error, connection_specific_header}.
-check_banned([]) -> ok;
-check_banned([{~"connection", _} | _]) -> {error, connection_specific_header};
-check_banned([{~"keep-alive", _} | _]) -> {error, connection_specific_header};
-check_banned([{~"proxy-connection", _} | _]) -> {error, connection_specific_header};
-check_banned([{~"transfer-encoding", _} | _]) -> {error, connection_specific_header};
-check_banned([{~"upgrade", _} | _]) -> {error, connection_specific_header};
-check_banned([{~"te", ~"trailers"} | Rest]) -> check_banned(Rest);
-check_banned([{~"te", _} | _]) -> {error, connection_specific_header};
-check_banned([_ | Rest]) -> check_banned(Rest).
+    ok | {error, connection_specific_header | duplicate_content_type}.
+check_banned([]) ->
+    ok;
+check_banned([{~"connection", _} | _]) ->
+    {error, connection_specific_header};
+check_banned([{~"keep-alive", _} | _]) ->
+    {error, connection_specific_header};
+check_banned([{~"proxy-connection", _} | _]) ->
+    {error, connection_specific_header};
+check_banned([{~"transfer-encoding", _} | _]) ->
+    {error, connection_specific_header};
+check_banned([{~"upgrade", _} | _]) ->
+    {error, connection_specific_header};
+check_banned([{~"te", ~"trailers"} | Rest]) ->
+    check_banned(Rest);
+check_banned([{~"te", _} | _]) ->
+    {error, connection_specific_header};
+check_banned([{~"content-type", _} | Rest]) ->
+    %% Content-Type is a singleton field (RFC 9110 §5.3, §8.3): a second
+    %% one leaves the body's media type ambiguous.
+    case lists:keymember(~"content-type", 1, Rest) of
+        true -> {error, duplicate_content_type};
+        false -> check_banned(Rest)
+    end;
+check_banned([_ | Rest]) ->
+    check_banned(Rest).

@@ -633,7 +633,8 @@ request_full_test() ->
                     expects_continue => false,
                     connection_lower => ~"",
                     content_length => none,
-                    has_host => true
+                    has_host => true,
+                    has_content_type => false
                 }
             },
             ~"body"},
@@ -666,7 +667,8 @@ request_http10_no_host_accepted_test() ->
                     expects_continue => false,
                     connection_lower => ~"",
                     content_length => none,
-                    has_host => false
+                    has_host => false,
+                    has_content_type => false
                 }
             },
             ~""},
@@ -708,6 +710,26 @@ request_invalid_host_returns_error_test() ->
             ~""
         ]
     ].
+
+request_repeated_content_type_returns_error_test() ->
+    %% Content-Type is a singleton field (RFC 9110 §5.3, §8.3): a second
+    %% line, whatever its value, is a 400.
+    [
+        ?assertEqual(
+            {error, duplicate_content_type},
+            roadrunner_http1:parse_request(
+                <<"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\n",
+                    "Content-Length: 0\r\nContent-Type: ", Second/binary, "\r\n\r\n">>
+            )
+        )
+     || Second <- [~"text/plain", ~"application/json"]
+    ],
+    ?assertMatch(
+        {ok, #{cached_decisions := #{has_content_type := true}}, ~""},
+        roadrunner_http1:parse_request(
+            ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\n\r\n"
+        )
+    ).
 
 request_http11_missing_host_returns_error_test() ->
     %% RFC 9112 §3.2 / 7230 §5.4: HTTP/1.1 requests MUST include a
@@ -792,7 +814,8 @@ cached_decisions_empty_for_empty_headers_test() ->
             expects_continue => false,
             connection_lower => ~"",
             content_length => none,
-            has_host => false
+            has_host => false,
+            has_content_type => false
         },
         roadrunner_http1:compute_cached_decisions([])
     ).
@@ -900,7 +923,8 @@ cached_decisions_ignores_unrelated_headers_test() ->
             expects_continue => false,
             connection_lower => ~"",
             content_length => none,
-            has_host => true
+            has_host => true,
+            has_content_type => true
         },
         roadrunner_http1:compute_cached_decisions([
             {~"host", ~"x"}, {~"content-type", ~"text/plain"}

@@ -103,6 +103,21 @@ connect_is_not_implemented_test() ->
         roadrunner_http2_request:from_headers(Headers, <<>>, request_context())
     ).
 
+duplicate_content_type_is_error_test() ->
+    Headers = [
+        {~":method", ~"POST"},
+        {~":scheme", ~"https"},
+        {~":authority", ~"example.com"},
+        {~":path", ~"/"},
+        {~"content-type", ~"text/plain"},
+        {~"x-a", ~"1"},
+        {~"content-type", ~"application/json"}
+    ],
+    ?assertEqual(
+        {error, duplicate_content_type},
+        roadrunner_http2_request:from_headers(Headers, <<>>, request_context())
+    ).
+
 duplicate_pseudo_is_error_test() ->
     Headers = [
         {~":method", ~"GET"},

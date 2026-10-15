@@ -50,6 +50,7 @@
     | connection_specific_header
     | bad_field_name
     | bad_field_value
+    | duplicate_content_type
     | content_length_mismatch
     | missing_authority
     | duplicate_host
@@ -113,7 +114,7 @@ build(Headers, Body, #{scheme := Scheme} = RequestContext, CheckLength) ->
 %% the hot path branch-friendly: the BEAM compiles the literal-binary
 %% clauses to a hash/select, no `lists:member` call per header.
 -spec check_banned(roadrunner_http:headers()) ->
-    ok | {error, connection_specific_header}.
+    ok | {error, connection_specific_header | duplicate_content_type}.
 check_banned([]) ->
     ok;
 check_banned([{~"connection", _} | _]) ->
@@ -130,6 +131,13 @@ check_banned([{~"te", ~"trailers"} | Rest]) ->
     check_banned(Rest);
 check_banned([{~"te", _} | _]) ->
     {error, connection_specific_header};
+check_banned([{~"content-type", _} | Rest]) ->
+    %% Content-Type is a singleton field (RFC 9110 §5.3, §8.3): a second
+    %% one leaves the body's media type ambiguous.
+    case lists:keymember(~"content-type", 1, Rest) of
+        true -> {error, duplicate_content_type};
+        false -> check_banned(Rest)
+    end;
 check_banned([_ | Rest]) ->
     check_banned(Rest).
 
