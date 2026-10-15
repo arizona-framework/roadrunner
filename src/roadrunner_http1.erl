@@ -67,8 +67,11 @@ connection layer can answer `414 URI Too Long`.
 
 Bare LF terminators are rejected as `bad_request_line` per RFC 9112 §2.2.
 So are a target with bytes outside US-ASCII, an asterisk-form (`*`)
-target on any method but OPTIONS, and an authority-form (`host:port`)
-target (RFC 9112 §3.2). A CONNECT request returns `not_implemented`:
+target on any method but OPTIONS, an authority-form (`host:port`)
+target, and an absolute-form target that isn't an `http` or `https` URI
+with a valid host (RFC 9112 §3.2). An accepted absolute-form target is
+returned as sent; `parse_request/2` turns it into its origin-form and
+takes the Host from it. A CONNECT request returns `not_implemented`:
 roadrunner doesn't open tunnels, so the connection layer answers
 `501 Not Implemented`.
 """.
@@ -142,53 +145,76 @@ request_line(Bin, MaxReqLine) ->
     end.
 
 %% RFC 9112 §3.2: which request-target form goes with which method. The
-%% origin-form (`/path`) is what nearly every request carries; the
-%% absolute-form is accepted as it is today. The asterisk-form is only
-%% for a server-wide OPTIONS (§3.2.4), so `GET *` is a bad request line.
-%% CONNECT asks for a tunnel, which roadrunner doesn't open, so it is not
-%% implemented (RFC 9110 §9.3.6, §15.6.2) whatever its target; and the
-%% authority-form (`host:port`) belongs to CONNECT alone (§3.2.3), so
-%% with any other method it is a bad request line too.
+%% origin-form (`/path`) is what nearly every request carries. The
+%% absolute-form (`http://host/path`) MUST be accepted too (§3.2.2), for
+%% an `http` or `https` URI whose authority is a valid host
+%% (`absolute_target/1`); `parse_request/2` then routes on its path. The
+%% asterisk-form is only for a server-wide OPTIONS (§3.2.4), so `GET *`
+%% is a bad request line. CONNECT asks for a tunnel, which roadrunner
+%% doesn't open, so it is not implemented (RFC 9110 §9.3.6, §15.6.2)
+%% whatever its target; and the authority-form (`host:port`) belongs to
+%% CONNECT alone (§3.2.3), so with any other method it is a bad request
+%% line too.
 -spec target_form(binary(), binary()) -> ok | {error, bad_request_line | not_implemented}.
-target_form(~"CONNECT", _Target) -> {error, not_implemented};
-target_form(_Method, <<$/, _/binary>>) -> ok;
-target_form(~"OPTIONS", ~"*") -> ok;
-target_form(_Method, Target) -> absolute_form(Target).
-
-%% `absolute-URI = scheme ":" hier-part [ "?" query ]` (RFC 3986 §4.3),
-%% with `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`: the
-%% scheme and its colon are enough to tell it from an authority-form,
-%% whose host can't start with `scheme:` followed by more than digits.
--spec absolute_form(binary()) -> ok | {error, bad_request_line}.
-absolute_form(<<C, Rest/binary>>) when C >= $a, C =< $z; C >= $A, C =< $Z ->
-    scheme(Rest);
-absolute_form(_Target) ->
-    {error, bad_request_line}.
-
--spec scheme(binary()) -> ok | {error, bad_request_line}.
-scheme(<<C, Rest/binary>>) when
-    C >= $a, C =< $z; C >= $A, C =< $Z; C >= $0, C =< $9; C =:= $+; C =:= $-; C =:= $.
-->
-    scheme(Rest);
-scheme(<<$:, Rest/binary>>) ->
-    hier_part(Rest);
-scheme(_Rest) ->
-    {error, bad_request_line}.
-
-%% What follows the scheme's colon. An authority-form's port is all
-%% digits (`example.com:443`), so a scheme-looking host followed by a
-%% port is not an absolute-form; anything else after the colon is.
--spec hier_part(binary()) -> ok | {error, bad_request_line}.
-hier_part(Rest) ->
-    case port_only(Rest) of
-        true -> {error, bad_request_line};
-        false -> ok
+target_form(~"CONNECT", _Target) ->
+    {error, not_implemented};
+target_form(_Method, <<$/, _/binary>>) ->
+    ok;
+target_form(~"OPTIONS", ~"*") ->
+    ok;
+target_form(_Method, Target) ->
+    case absolute_target(Target) of
+        {ok, _Authority, _Origin} -> ok;
+        error -> {error, bad_request_line}
     end.
 
--spec port_only(binary()) -> boolean().
-port_only(<<C, Rest/binary>>) when C >= $0, C =< $9 -> port_only(Rest);
-port_only(<<>>) -> true;
-port_only(_) -> false.
+%% An absolute-form target `http://authority[/path][?query]` (or `https`,
+%% the scheme case-insensitive, RFC 3986 §3.1), split into its authority
+%% and its origin-form: the path and query with an empty path read as
+%% `/` (RFC 9110 §4.2.3). The authority must pass `valid_host/1`, which
+%% also refuses the userinfo an http URI no longer carries (RFC 9110
+%% §4.2.4) and an empty host (§4.2.1). Any other scheme names nothing an
+%% origin server can serve.
+-spec absolute_target(binary()) -> {ok, binary(), binary()} | error.
+absolute_target(<<H, T1, T2, P, "://", Rest/binary>>) when
+    H bor 16#20 =:= $h, T1 bor 16#20 =:= $t, T2 bor 16#20 =:= $t, P bor 16#20 =:= $p
+->
+    authority(Rest, 0);
+absolute_target(<<H, T1, T2, P, S, "://", Rest/binary>>) when
+    H bor 16#20 =:= $h,
+    T1 bor 16#20 =:= $t,
+    T2 bor 16#20 =:= $t,
+    P bor 16#20 =:= $p,
+    S bor 16#20 =:= $s
+->
+    authority(Rest, 0);
+absolute_target(_Target) ->
+    error.
+
+%% The authority runs to the first `/` or `?`.
+-spec authority(binary(), non_neg_integer()) -> {ok, binary(), binary()} | error.
+authority(Rest, Len) ->
+    case Rest of
+        <<Authority:Len/binary, $/, _/binary>> -> checked_authority(Rest, Authority, Len);
+        <<Authority:Len/binary, $?, _/binary>> -> checked_authority(Rest, Authority, Len);
+        <<Authority:Len/binary>> -> checked_authority(Rest, Authority, Len);
+        _ -> authority(Rest, Len + 1)
+    end.
+
+-spec checked_authority(binary(), binary(), non_neg_integer()) ->
+    {ok, binary(), binary()} | error.
+checked_authority(Rest, Authority, Len) ->
+    case roadrunner_http:valid_host(Authority) of
+        true ->
+            <<_:Len/binary, Origin/binary>> = Rest,
+            {ok, Authority, origin(Origin)};
+        false ->
+            error
+    end.
+
+-spec origin(binary()) -> binary().
+origin(<<$/, _/binary>> = Origin) -> Origin;
+origin(Origin) -> <<$/, Origin/binary>>.
 
 -spec fast_request_line(binary(), pos_integer()) ->
     {ok, binary(), binary(), binary(), version(), binary()} | slow.
@@ -1011,10 +1037,11 @@ The conn loop passes the listener's configured `http1_*` limits;
         | bad_host}.
 parse_request(Bin, {MaxReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}) when is_binary(Bin) ->
     maybe
-        {ok, Method, Target, Path, Version, Rest} ?= parse_request_line_p(Bin, MaxReqLine),
-        {ok, Headers, Rest2} ?= parse_headers(Rest, {MaxHdrLine, MaxHdrBlock, MaxHdrCount}),
-        Decisions = compute_cached_decisions(Headers),
+        {ok, Method, RawTarget, RawPath, Version, Rest} ?= parse_request_line_p(Bin, MaxReqLine),
+        {ok, RawHeaders, Rest2} ?= parse_headers(Rest, {MaxHdrLine, MaxHdrBlock, MaxHdrCount}),
+        Decisions = compute_cached_decisions(RawHeaders),
         ok ?= validate_host(Version, Decisions),
+        {Target, Path, Headers} = origin_form(RawTarget, RawPath, RawHeaders),
         Req = #{
             method => Method,
             target => Target,
@@ -1025,6 +1052,23 @@ parse_request(Bin, {MaxReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}) when is_b
         },
         {ok, Req, Rest2}
     end.
+
+%% The request as the router and the handler see it. An origin-form or
+%% asterisk-form target is kept as sent. An absolute-form one (already
+%% checked by `target_form/2`) is replaced by its origin-form, so the
+%% route and `roadrunner_req:qs/1` see `/path?query`, and its authority
+%% becomes the Host: RFC 9112 §3.2.2 has the server ignore the received
+%% Host for the target's own host (added when an HTTP/1.0 request sent
+%% none).
+-spec origin_form(binary(), binary(), headers()) -> {binary(), binary(), headers()}.
+origin_form(<<$/, _/binary>> = Target, Path, Headers) ->
+    {Target, Path, Headers};
+origin_form(~"*" = Target, Path, Headers) ->
+    {Target, Path, Headers};
+origin_form(Target, _Path, Headers) ->
+    {ok, Authority, Origin} = absolute_target(Target),
+    {Origin, roadrunner_req:target_path(Origin),
+        lists:keystore(~"host", 1, Headers, {~"host", Authority})}.
 
 %% RFC 9112 §3.2 / 7230 §5.4: HTTP/1.1 requests MUST include a Host
 %% header. Absence is a 400 Bad Request, also a request-smuggling

@@ -1511,9 +1511,9 @@ request_line_non_ascii_target_rejected_test() ->
     ].
 
 request_line_target_form_follows_method_test() ->
-    %% RFC 9112 §3.2: origin-form for any method, absolute-form accepted,
-    %% asterisk-form only for OPTIONS (§3.2.4), authority-form only for
-    %% CONNECT (§3.2.3).
+    %% RFC 9112 §3.2: origin-form for any method, absolute-form for an
+    %% `http` or `https` URI with a valid host (§3.2.2), asterisk-form only
+    %% for OPTIONS (§3.2.4), authority-form only for CONNECT (§3.2.3).
     Parse = fun(Method, Target) ->
         roadrunner_http1:parse_request_line(
             <<Method/binary, " ", Target/binary, " HTTP/1.1\r\n">>
@@ -1524,7 +1524,10 @@ request_line_target_form_follows_method_test() ->
         {ok, ~"GET", ~"http://example.com/a", _, _}, Parse(~"GET", ~"http://example.com/a")
     ),
     ?assertMatch({ok, ~"GET", ~"http://example.com", _, _}, Parse(~"GET", ~"http://example.com")),
-    ?assertMatch({ok, ~"GET", ~"urn:example:a", _, _}, Parse(~"GET", ~"urn:example:a")),
+    ?assertMatch(
+        {ok, ~"GET", ~"HTTPS://Example.com:8443?q", _, _},
+        Parse(~"GET", ~"HTTPS://Example.com:8443?q")
+    ),
     ?assertMatch({ok, ~"PURGE", ~"/a", _, _}, Parse(~"PURGE", ~"/a")),
     [
         ?assertEqual({error, bad_request_line}, Parse(Method, Target), {Method, Target})
@@ -1537,9 +1540,73 @@ request_line_target_form_follows_method_test() ->
             {~"GET", ~"a"},
             {~"GET", ~"1http://example.com/"},
             {~"GET", ~"ht~tp://example.com/"},
-            {~"GET", ~"?q"}
+            {~"GET", ~"?q"},
+            {~"GET", ~"urn:example:a"},
+            {~"GET", ~"ftp://example.com/"},
+            {~"GET", ~"httpx://example.com/"},
+            {~"GET", ~"http:/example.com/"},
+            {~"GET", ~"http://"},
+            {~"GET", ~"http:///a"},
+            {~"GET", ~"http://user@example.com/"},
+            {~"GET", ~"https://exa mple.com/"}
         ]
     ].
+
+request_absolute_form_routes_on_its_origin_form_test() ->
+    %% RFC 9112 §3.2.2: an origin server MUST accept the absolute-form,
+    %% and uses the target's host instead of the Host field. The request
+    %% then reads like its origin-form: the path and query (an empty path
+    %% read as `/`) for routing and `qs/1`, and the URI's authority as the
+    %% Host, added when an HTTP/1.0 request sent none.
+    Parse = fun(Target, Version, HostLines) ->
+        {ok, Req, ~""} = roadrunner_http1:parse_request(
+            <<"GET ", Target/binary, " HTTP/", Version/binary, "\r\n", HostLines/binary, "\r\n">>
+        ),
+        {
+            roadrunner_req:path(Req),
+            roadrunner_req:qs(Req),
+            roadrunner_req:header(~"host", Req),
+            [V || {~"host", V} <- roadrunner_req:headers(Req)]
+        }
+    end,
+    ?assertEqual(
+        {~"/a/b", ~"x=1", ~"example.com", [~"example.com"]},
+        Parse(~"http://example.com/a/b?x=1", ~"1.1", ~"Host: other.example\r\n")
+    ),
+    ?assertEqual(
+        {~"/", ~"", ~"Example.com:8080", [~"Example.com:8080"]},
+        Parse(~"HTTP://Example.com:8080", ~"1.1", ~"Host: Example.com:8080\r\n")
+    ),
+    ?assertEqual(
+        {~"/", ~"q", ~"[::1]:8443", [~"[::1]:8443"]},
+        Parse(~"https://[::1]:8443?q", ~"1.1", ~"Host: x\r\n")
+    ),
+    ?assertEqual(
+        {~"/a", ~"", ~"example.com", [~"example.com"]},
+        Parse(~"http://example.com/a", ~"1.0", ~"")
+    ).
+
+request_asterisk_form_kept_as_sent_test() ->
+    %% A server-wide `OPTIONS *` keeps its target and its Host.
+    ?assertMatch(
+        {ok, #{target := ~"*", path := ~"*", headers := [{~"host", ~"x"}]}, ~""},
+        roadrunner_http1:parse_request(~"OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n")
+    ).
+
+request_absolute_form_still_needs_a_valid_host_field_test() ->
+    %% The target's host wins, but the Host field rules still hold: an
+    %% HTTP/1.1 request without one, or with an invalid one, is a 400
+    %% (RFC 9112 §3.2).
+    ?assertEqual(
+        {error, missing_host},
+        roadrunner_http1:parse_request(~"GET http://example.com/ HTTP/1.1\r\n\r\n")
+    ),
+    ?assertEqual(
+        {error, bad_host},
+        roadrunner_http1:parse_request(
+            ~"GET http://example.com/ HTTP/1.1\r\nHost: a b\r\n\r\n"
+        )
+    ).
 
 request_line_connect_not_implemented_test() ->
     %% RFC 9110 §9.3.6: CONNECT asks for a tunnel, which roadrunner doesn't
