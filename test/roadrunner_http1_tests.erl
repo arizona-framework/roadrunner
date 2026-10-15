@@ -1102,6 +1102,48 @@ chunk_size_line_malformed_rejected_test() ->
         ]
     ].
 
+chunk_size_line_every_prefix_asks_for_more_test() ->
+    %% A size line split across reads: every prefix of a valid line, cut
+    %% anywhere before its CRLF (including between CR and LF, inside a
+    %% name, a value, BWS, or a quoted-string and its escape), asks for
+    %% more rather than deciding early.
+    [
+        ?assertEqual(
+            {more, undefined},
+            roadrunner_http1:parse_chunk(binary:part(Line, 0, Cut)),
+            {Line, Cut}
+        )
+     || Line <- [
+            ~"5;name\r\n",
+            ~"5 ; a = 1 ;\tb\r\n",
+            ~"5;q=\"esc \\\" x\"\r\n",
+            ~"0000000000000000005;a=b\r\n"
+        ],
+        Cut <- lists:seq(1, byte_size(Line) - 1)
+    ].
+
+chunk_size_line_over_the_cap_rejected_test() ->
+    %% The size line, extensions included, is capped at 8192 bytes: a
+    %% complete line over it and a partial one already past it are both
+    %% refused, while one exactly at the cap is read.
+    Name = fun(N) -> binary:copy(~"a", N) end,
+    ?assertEqual(
+        {ok, ~"hello", ~""},
+        roadrunner_http1:parse_chunk(<<"5;", (Name(8190))/binary, "\r\nhello\r\n">>)
+    ),
+    ?assertEqual(
+        {error, bad_chunk},
+        roadrunner_http1:parse_chunk(<<"5;", (Name(8191))/binary, "\r\nhello\r\n">>)
+    ),
+    ?assertEqual(
+        {error, bad_chunk},
+        roadrunner_http1:parse_chunk(<<"5;", (Name(8191))/binary>>)
+    ),
+    ?assertEqual(
+        {error, bad_chunk},
+        roadrunner_http1:parse_chunk(binary:copy(~"0", 8193))
+    ).
+
 chunk_size_line_bare_lf_is_not_a_line_end_test() ->
     %% The size line ends at CRLF only. `5;\nhello\r\n` used to read
     %% `\nhello` as an extension and then wait for 5 data bytes that the
