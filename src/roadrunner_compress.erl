@@ -19,8 +19,8 @@
 %%
 %% A response is compressed when **all** of these are true:
 %%
-%% - The client's `Accept-Encoding` header includes `gzip` or `deflate`
-%%   (substring match per token; qvalue ranking is a follow-up).
+%% - The client's `Accept-Encoding` header accepts `gzip` or `deflate`
+%%   with a qvalue above 0 (RFC 9110 §12.5.3; see `negotiate_encoding/1`).
 %% - The handler's response does not already carry a `Content-Encoding`
 %%   header (i.e. it isn't already compressed).
 %% - The body is at least `?THRESHOLD` bytes (default 860 — same as
@@ -55,9 +55,6 @@
 %%   neither carries a buffered or streamed HTTP body to encode.
 %% - **Brotli (`br`) Content-Encoding** — would require a NIF dep
 %%   (`brotli`); deferred until there's user pull.
-%% - **Qvalue-aware Accept-Encoding parsing** — current implementation
-%%   is substring-match per token; treats `gzip;q=0` as "accepts gzip"
-%%   (a real conformance bug). Tracked separately.
 
 -behaviour(roadrunner_middleware).
 

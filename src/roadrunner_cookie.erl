@@ -21,7 +21,9 @@ Optional attributes for the `Set-Cookie` header per RFC 6265 §4.1.
 - `domain` — explicit `Domain` attribute. Default is the response
   host (no `Domain` attribute emitted), which limits the cookie
   to that exact host.
-- `path` — explicit `Path` attribute. Default is `/`.
+- `path` — explicit `Path` attribute. Default is no `Path` attribute,
+  so the browser scopes the cookie to the request path's directory
+  (RFC 6265 §5.1.4). Set `path => ~"/"` for a site-wide cookie.
 - `max_age` — seconds until the cookie expires. `0` deletes the
   cookie. Browsers prefer `Max-Age` over `Expires` when both are
   present (RFC 6265 §5.3 step 3).

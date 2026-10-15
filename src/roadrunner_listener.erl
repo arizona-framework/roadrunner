@@ -251,6 +251,26 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `graceful_drain` — opt out of the per-conn drain registry
   (`true` default; `false` trades drain notification for a little
   less per-conn work on short-lived workloads).
+- `proxy_protocol` — `true` reads and strips the PROXY protocol header
+  (HAProxy v1 / v2) an L4 balancer prepends, so `roadrunner_req:peer/1`
+  is the real client. On TLS listeners the header is read before the
+  handshake. TCP only. Default `false`. Enable it only behind a balancer
+  that always sends the header, or a direct peer can spoof its address.
+- `real_ip` — the real client IP behind HTTP reverse proxies, read from
+  `X-Forwarded-For` (default) or `Forwarded` (`header => forwarded`).
+  Set exactly one trust mode: `trusted_proxies => [CIDR]` (for example
+  `[~"10.0.0.0/8"]`; `/0` is refused) or `trusted_hops => N`. The
+  resolved address feeds `roadrunner_req:client_ip/1`, the `rate_limit`
+  key, and `client_ip` in logger and telemetry metadata. Use
+  `trusted_hops` only when clients can reach the listener through the
+  proxies alone.
+- `rate_limit` — per-client request-rate guard:
+  `#{rate := N, period => Seconds, burst => N, sweep_interval => Ms}`
+  (`period` default 1, `burst` default `rate`, `sweep_interval` default
+  10000). A client over the rate gets `429 Too Many Requests` with
+  `Retry-After` before the handler runs. Keyed on the real client IP;
+  an IPv6 client is keyed by its /64. A route can add its own rate on
+  top (`roadrunner_router:rate_limit()`).
 - `hibernate_after` — when set, idle conns hibernate after this
   many milliseconds of main-loop idle time, which sweeps and shrinks
   the conn's heap. Pairs with `handler_spawn` below for a pool of
