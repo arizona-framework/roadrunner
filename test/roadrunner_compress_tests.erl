@@ -27,6 +27,57 @@ compresses_when_client_accepts_gzip_test() ->
     %% Round-trip via zlib:gunzip.
     ?assertEqual(iolist_to_binary(Body), zlib:gunzip(iolist_to_binary(OutBody))).
 
+deflate_window_follows_body_size_test() ->
+    %% A buffered body is compressed with the smallest window covering it
+    %% plus deflate's 262-byte lookahead, which the zlib header's CINFO
+    %% records (`(windowBits - 8) bsl 4 bor 8`): the threshold's 860 bytes
+    %% take 2 KB, then each step to 32 KB, a byte either side. The data
+    %% still inflates whole.
+    Deflate = fun(Size) ->
+        Body = binary:copy(~"a", Size),
+        {{200, _, Out}, _} = roadrunner_compress:call(
+            req([{~"accept-encoding", ~"deflate"}]), fun(R) -> {{200, [], Body}, R} end, undefined
+        ),
+        ?assertEqual(Body, zlib:uncompress(Out), Size),
+        <<Cmf, _/binary>> = Out,
+        Cmf bsr 4 + 8
+    end,
+    [
+        ?assertEqual(Want, Deflate(Size), Size)
+     || {Size, Want} <- [
+            {860, 11},
+            {(1 bsl 11) - 262, 11},
+            {(1 bsl 11) - 261, 12},
+            {(1 bsl 12) - 262, 12},
+            {(1 bsl 12) - 261, 13},
+            {(1 bsl 14) - 262, 14},
+            {(1 bsl 14) - 261, 15},
+            {100000, 15}
+        ]
+    ].
+
+gzip_output_matches_the_full_window_test() ->
+    %% A window covering the body plus the lookahead finds every match the
+    %% full 32 KB window would, so gzip output is byte for byte what
+    %% `zlib:gzip/1` gives, on either side of each window step.
+    rand:seed(exsss, {11, 12, 13}),
+    Words = [~"\"id\":", ~"\"name\":\"Item ", ~"\",\"price\":", ~"},{", ~"lorem ipsum "],
+    [
+        begin
+            Text = iolist_to_binary(
+                [lists:nth(rand:uniform(length(Words)), Words) || _ <- lists:seq(1, Size)]
+            ),
+            Body = binary:part(Text, 0, Size),
+            {{200, _, Out}, _} = roadrunner_compress:call(
+                req([{~"accept-encoding", ~"gzip"}]), fun(R) -> {{200, [], Body}, R} end, undefined
+            ),
+            ?assertEqual(zlib:gzip(Body), Out, Size)
+        end
+     || Step <- [10, 11, 12, 13, 14, 15],
+        Size <- [(1 bsl Step) - 263, (1 bsl Step) - 261],
+        Size >= 860
+    ].
+
 compresses_when_gzip_listed_among_others_test() ->
     Req = req([{~"accept-encoding", ~"deflate, gzip, br"}]),
     Body = big_body(),
