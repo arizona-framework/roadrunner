@@ -29,22 +29,34 @@ strict with zero exclusions.
 
 Boots a roadrunner WS listener on `localhost:9001` with
 `roadrunner_autobahn_handler`, runs the Docker fuzzingclient, prints
-the pass/fail summary, and exits non-zero on any failure.
+the pass/fail summary, and exits non-zero on any case that is not
+strictly OK.
+
+The suite runs in batches, a fresh client container each: 9.x alone,
+each 12.x and 13.x subsection alone, then every other case. The client
+keeps data from every case until it writes its report, and one whole
+compression section in one container grows past what a CI runner
+allows.
 
 Requires Docker. The image (`crossbario/autobahn-testsuite`) is
 pulled on first run.
 
-The HTML report lands at `test/autobahn/reports/clients/index.html`.
-Open in a browser for case-by-case detail.
+Each batch writes an HTML report to
+`test/autobahn/reports/batch-<name>/index.html` (`rest`, `9`, `12.1`
+through `12.5`, `13.1` through `13.7`). Open one in a browser for
+case-by-case detail.
 
 ## Adding cases
 
-Edit `fuzzingclient.json`. The `cases` field accepts wildcards
-(`"5.*"`) and exact case IDs (`"5.19"`). `exclude-cases` overrides
-inclusions. See the [autobahn fuzzingclient docs](https://github.com/crossbario/autobahn-testsuite#fuzzingclient).
+Every case runs by default. The batches live in `?BATCHES` in
+`scripts/autobahn.escript`; a new upstream category lands in the `rest`
+batch on its own. To skip a case, add it to `exclude-cases` in
+`fuzzingclient.json` (wildcards like `"5.*"` and exact IDs like
+`"5.19"` both work); it applies to every batch. See the
+[autobahn fuzzingclient docs](https://github.com/crossbario/autobahn-testsuite#fuzzingclient).
 
 ## Why not in `precommit`
 
-The fuzzingclient takes ~30s to run every test case and requires
-Docker. The `precommit` gate stays fast + dependency-free; Autobahn
-runs on demand and on the release branch.
+The full suite takes several minutes and requires Docker. The
+`precommit` gate stays fast and dependency-free; Autobahn runs on
+demand and in CI on every push and pull request.

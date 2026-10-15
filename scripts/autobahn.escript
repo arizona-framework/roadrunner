@@ -28,6 +28,28 @@
 %% Prefixes the container's exit status at the end of the command output.
 -define(EXIT_STATUS_MARK, "autobahn container exit status: ").
 
+%% The suite runs in batches, a fresh client container each. The client
+%% keeps data from every case until it writes its report: on a CI runner
+%% one compression section (12.* or 13.*) alone took it past 15 GB and the
+%% kernel killed it. So the heavy parts run alone, down to each compression
+%% subsection, and a final "rest" batch takes every case they don't, so a
+%% category added upstream still runs.
+-define(BATCHES, [
+    {~"9", [~"9.*"]},
+    {~"12.1", [~"12.1.*"]},
+    {~"12.2", [~"12.2.*"]},
+    {~"12.3", [~"12.3.*"]},
+    {~"12.4", [~"12.4.*"]},
+    {~"12.5", [~"12.5.*"]},
+    {~"13.1", [~"13.1.*"]},
+    {~"13.2", [~"13.2.*"]},
+    {~"13.3", [~"13.3.*"]},
+    {~"13.4", [~"13.4.*"]},
+    {~"13.5", [~"13.5.*"]},
+    {~"13.6", [~"13.6.*"]},
+    {~"13.7", [~"13.7.*"]}
+]).
+
 main(Args) ->
     Opts = parse_args(Args),
     ProjectDir = project_dir(),
@@ -47,7 +69,7 @@ main(Args) ->
     io:format("  listener  : 127.0.0.1:~B~n", [BoundPort]),
     io:format("  config    : ~s~n", [config_path(ProjectDir)]),
     io:format("  reports   : ~s~n", [reports_dir(ProjectDir)]),
-    Result = run_fuzzingclient(ProjectDir, BoundPort),
+    Result = run_fuzzingclient(ProjectDir),
     ok = roadrunner:stop_listener(?LISTENER),
     case Result of
         ok ->
@@ -105,27 +127,60 @@ setup_code_paths(ProjectDir) ->
     [code:add_pathz(P) || P <- Ebins ++ Tests],
     ok.
 
-run_fuzzingclient(ProjectDir, _Port) ->
+run_fuzzingclient(ProjectDir) ->
+    Reports = reports_dir(ProjectDir),
+    ok = filelib:ensure_dir(filename:join(Reports, "x")),
+    {ok, Json} = file:read_file(config_path(ProjectDir)),
+    Base = json:decode(Json),
+    run_batches(batches(Base), Base, Reports).
+
+%% Each batch as `{Name, Cases, ExcludeCases}`: the "rest" batch first (the
+%% quick core cases, so a basic break fails fast), then the heavy sections.
+%% The config's own `exclude-cases` apply to every batch.
+batches(#{~"exclude-cases" := Exclude}) ->
+    Heavy = lists:append([Cases || {_Name, Cases} <- ?BATCHES]),
+    [{~"rest", [~"*"], Exclude ++ Heavy} | [{Name, Cases, Exclude} || {Name, Cases} <- ?BATCHES]].
+
+batch_names() ->
+    [~"rest" | [Name || {Name, _Cases} <- ?BATCHES]].
+
+batch_dir(Name) ->
+    binary_to_list(<<"batch-", Name/binary>>).
+
+run_batches([], _Base, _Reports) ->
+    ok;
+run_batches([{Name, Cases, Exclude} | Rest], Base, Reports) ->
+    Spec = Base#{
+        ~"cases" => Cases,
+        ~"exclude-cases" => Exclude,
+        ~"outdir" => iolist_to_binary(["./reports/", batch_dir(Name)])
+    },
+    SpecFile = binary_to_list(<<"spec-", Name/binary, ".json">>),
+    ok = file:write_file(filename:join(Reports, SpecFile), json:encode(Spec)),
+    %% Memory before each batch, so a container killed for memory shows
+    %% what else was holding it (this BEAM, or the host).
+    io:format("batch ~s: beam ~B MB, host available ~s", [
+        Name,
+        erlang:memory(total) div (1024 * 1024),
+        os:cmd("free -m | awk '/Mem:/ {print $7 \" MB\"}'")
+    ]),
+    case run_container(Reports, SpecFile) of
+        ok -> run_batches(Rest, Base, Reports);
+        {error, _} = Error -> Error
+    end.
+
+run_container(Reports, SpecFile) ->
     %% `--network host` shares the host's network, so the container
     %% reaches the listener at the `ws://127.0.0.1:9001` URL in
     %% fuzzingclient.json. Don't use `host.docker.internal` there: it
     %% only resolves where the host's /etc/hosts maps it, which CI
     %% runners don't.
-    Reports = reports_dir(ProjectDir),
-    Config = config_path(ProjectDir),
-    ok = filelib:ensure_dir(filename:join(Reports, "x")),
     Cmd = io_lib:format(
-        "docker run --rm --network host"
-        " -v ~s:/config"
+        "docker run --rm --network host -e PYTHONUNBUFFERED=1"
         " -v ~s:/reports"
-        " ~s wstest -m fuzzingclient -s /config/fuzzingclient.json"
+        " ~s wstest -m fuzzingclient -s /reports/~s"
         " 2>&1; echo \"~s$?\"",
-        [
-            filename:dirname(Config),
-            Reports,
-            ?DOCKER_IMAGE,
-            ?EXIT_STATUS_MARK
-        ]
+        [Reports, ?DOCKER_IMAGE, SpecFile, ?EXIT_STATUS_MARK]
     ),
     io:format("running: ~s~n", [Cmd]),
     Output = os:cmd(Cmd),
@@ -149,65 +204,71 @@ container_result(Output) ->
     end.
 
 summary(ProjectDir) ->
-    %% The fuzzingclient writes `index.json` in the reports dir; parse
-    %% it for the per-case results.
-    Path = filename:join([reports_dir(ProjectDir), "clients", "index.json"]),
-    case file:read_file(Path) of
-        {ok, Json} ->
-            summarize_json(Json, Path);
-        {error, _} ->
-            {io_lib:format("(report not found at ~s; fuzzingclient may have failed)", [Path]),
-                fail}
+    %% Each batch writes its own `index.json`; merge their per-case results.
+    Reports = reports_dir(ProjectDir),
+    case batch_cases(batch_names(), Reports, #{}) of
+        {ok, Cases} -> summarize(Cases, filename:join(Reports, "batch-*"));
+        {error, Text} -> {Text, fail}
     end.
 
-summarize_json(Json, Path) ->
-    %% Parse the fuzzingclient index. JSON shape:
-    %%   {"roadrunner": {"1.1.1": {"behavior": "OK"}, ...}}
+batch_cases([], _Reports, Acc) ->
+    {ok, Acc};
+batch_cases([Name | Rest], Reports, Acc) ->
+    %% JSON shape: {"roadrunner": {"1.1.1": {"behavior": "OK"}, ...}}
+    Path = filename:join([Reports, batch_dir(Name), "index.json"]),
+    case file:read_file(Path) of
+        {ok, Json} ->
+            case json:decode(Json) of
+                #{~"roadrunner" := Cases} ->
+                    batch_cases(Rest, Reports, maps:merge(Acc, Cases));
+                _ ->
+                    {error, io_lib:format("(unexpected report shape at ~s)", [Path])}
+            end;
+        {error, _} ->
+            {error, io_lib:format("(report not found at ~s; fuzzingclient may have failed)", [Path])}
+    end.
+
+summarize(Cases, ReportGlob) ->
     %% behaviors: OK, NON-STRICT, INFORMATIONAL, FAILED, UNIMPLEMENTED.
     %% Strict conformance means every case is OK or INFORMATIONAL.
-    case json:decode(Json) of
-        #{~"roadrunner" := Cases} ->
-            Buckets = lists:foldl(
-                fun({_Id, #{~"behavior" := B}}, Acc) ->
-                    maps:update_with(B, fun(N) -> N + 1 end, 1, Acc)
-                end,
-                #{},
-                maps:to_list(Cases)
-            ),
-            NotStrict = lists:sort([
-                Id
-             || {Id, #{~"behavior" := B}} <- maps:to_list(Cases),
-                B =/= ~"OK",
-                B =/= ~"INFORMATIONAL"
-            ]),
-            Text = io_lib:format(
-                "summary~n"
-                "  total         : ~B~n"
-                "  OK            : ~B~n"
-                "  INFORMATIONAL : ~B~n"
-                "  NON-STRICT    : ~B~n"
-                "  UNIMPLEMENTED : ~B~n"
-                "  FAILED        : ~B~n"
-                "  not strict    : ~s~n"
-                "  report        : ~s~n",
-                [
-                    map_size(Cases),
-                    maps:get(~"OK", Buckets, 0),
-                    maps:get(~"INFORMATIONAL", Buckets, 0),
-                    maps:get(~"NON-STRICT", Buckets, 0),
-                    maps:get(~"UNIMPLEMENTED", Buckets, 0),
-                    maps:get(~"FAILED", Buckets, 0),
-                    case NotStrict of
-                        [] -> ~"none";
-                        [_ | _] -> lists:join(~" ", NotStrict)
-                    end,
-                    Path
-                ]
-            ),
+    Buckets = lists:foldl(
+        fun({_Id, #{~"behavior" := B}}, Acc) ->
+            maps:update_with(B, fun(N) -> N + 1 end, 1, Acc)
+        end,
+        #{},
+        maps:to_list(Cases)
+    ),
+    NotStrict = lists:sort([
+        Id
+     || {Id, #{~"behavior" := B}} <- maps:to_list(Cases),
+        B =/= ~"OK",
+        B =/= ~"INFORMATIONAL"
+    ]),
+    Text = io_lib:format(
+        "summary~n"
+        "  total         : ~B~n"
+        "  OK            : ~B~n"
+        "  INFORMATIONAL : ~B~n"
+        "  NON-STRICT    : ~B~n"
+        "  UNIMPLEMENTED : ~B~n"
+        "  FAILED        : ~B~n"
+        "  not strict    : ~s~n"
+        "  reports       : ~s~n",
+        [
+            map_size(Cases),
+            maps:get(~"OK", Buckets, 0),
+            maps:get(~"INFORMATIONAL", Buckets, 0),
+            maps:get(~"NON-STRICT", Buckets, 0),
+            maps:get(~"UNIMPLEMENTED", Buckets, 0),
+            maps:get(~"FAILED", Buckets, 0),
             case NotStrict of
-                [] -> {Text, pass};
-                [_ | _] -> {Text, fail}
-            end;
-        _ ->
-            {io_lib:format("(unexpected report shape at ~s)", [Path]), fail}
+                [] -> ~"none";
+                [_ | _] -> lists:join(~" ", NotStrict)
+            end,
+            ReportGlob
+        ]
+    ),
+    case NotStrict of
+        [] -> {Text, pass};
+        [_ | _] -> {Text, fail}
     end.
