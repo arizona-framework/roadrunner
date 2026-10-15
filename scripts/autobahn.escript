@@ -148,6 +148,11 @@ run_batches([{Name, Cases, Exclude} | Rest], Base, Reports) ->
     },
     SpecFile = binary_to_list(<<"spec-", Name/binary, ".json">>),
     ok = file:write_file(filename:join(Reports, SpecFile), json:encode(Spec)),
+    %% Memory before each batch, so a container killed for memory shows
+    %% what else was holding it (this BEAM, or the host).
+    io:format("batch ~s: beam ~B MB, host:~n~s", [
+        Name, erlang:memory(total) div (1024 * 1024), os:cmd("free -m")
+    ]),
     case run_container(Reports, SpecFile) of
         ok -> run_batches(Rest, Base, Reports);
         {error, _} = Error -> Error
