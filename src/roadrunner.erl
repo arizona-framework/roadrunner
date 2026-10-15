@@ -25,6 +25,10 @@ cannot be opened.
 
 `Opts` is a `t:roadrunner_listener:opts/0` map — see that type for
 the full set of keys, per-key defaults, and tuning rationale.
+
+The supervisor restarts a listener that crashes. A listener stopped by
+`roadrunner_listener:drain/2` stays down; calling `start_listener/2`
+again with the same name starts it fresh.
 """.
 -spec start_listener(Name :: atom(), roadrunner_listener:opts()) ->
     {ok, pid()} | {error, term()}.
@@ -32,14 +36,21 @@ start_listener(Name, Opts) when is_atom(Name), is_map(Opts) ->
     ChildSpec = #{
         id => Name,
         start => {roadrunner_listener, start_link, [Name, Opts]},
-        restart => permanent,
+        restart => transient,
         shutdown => 5000,
         type => worker,
         modules => [roadrunner_listener]
     },
     case supervisor:start_child(roadrunner_sup, ChildSpec) of
-        {ok, _Pid} = Ok -> Ok;
-        {error, _} = Err -> Err
+        {ok, _Pid} = Ok ->
+            Ok;
+        {error, already_present} ->
+            %% A drained listener exits normally and stays behind as a
+            %% stopped child; replace it.
+            ok = supervisor:delete_child(roadrunner_sup, Name),
+            start_listener(Name, Opts);
+        {error, _} = Err ->
+            Err
     end.
 
 -doc """
@@ -58,7 +69,8 @@ stop_listener(Name) when is_atom(Name) ->
     end.
 
 -doc """
-Return the list of currently registered listener names.
+Return the names of the running listeners. A listener stopped by
+`roadrunner_listener:drain/2` is not included.
 
 Order matches `supervisor:which_children/1` — typically reverse
 start-order. The roadrunner application must be running.
@@ -67,7 +79,8 @@ start-order. The roadrunner application must be running.
 listeners() ->
     [
         Name
-     || {Name, _Pid, _Type, Mods} <- supervisor:which_children(roadrunner_sup),
+     || {Name, Pid, _Type, Mods} <- supervisor:which_children(roadrunner_sup),
+        is_pid(Pid),
         Mods =:= [roadrunner_listener]
     ].
 
