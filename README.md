@@ -165,11 +165,10 @@ handle(Req) ->
 {roadrunner_resp:json(200, #{id => 42}), Req}
 {roadrunner_resp:redirect(302, ~"/login"), Req}
 {roadrunner_resp:not_found(), Req}
-{{200, [{~"content-type", ~"text/plain"}, {~"content-length", ~"2"}], ~"hi"}, Req}
+{{200, [{~"content-type", ~"text/plain"}], ~"hi"}, Req}
 ```
 
-The builders set `content-length` for you. A plain tuple is sent as written,
-so set it yourself.
+A plain tuple without `content-length` gets one from its body.
 
 Set a cookie on any buffered response:
 
