@@ -203,6 +203,31 @@ valid_host_accepts_uri_host_and_port_test() ->
         ]
     ].
 
+valid_host_every_byte_at_every_position_test() ->
+    %% Every byte value at every position of reg-names that span two 7-byte
+    %% words and a tail, with and without a port, against a regex of the
+    %% RFC 3986 reg-name grammar. Covers each lane of the word scan,
+    %% including the bytes its 0x20 case fold could disguise (controls that
+    %% fold to `-`, `.` or a digit, and `@`, `[`, `` ` `` that fold to
+    %% letters' neighbours).
+    {ok, Re} = re:compile(
+        ~"^(?:[A-Za-z0-9\\-._~!$&'()*+,;=]|%[0-9A-Fa-f]{2})+(?::[0-9]*)?$",
+        %% Without it, `$` would also match before a final LF.
+        [dollar_endonly]
+    ),
+    Oracle = fun(V) -> re:run(V, Re, [{capture, none}]) =:= match end,
+    [
+        begin
+            <<Pre:Pos/binary, _, Post/binary>> = Base,
+            V = <<Pre/binary, B, Post/binary, Port/binary>>,
+            ?assertEqual(Oracle(V), roadrunner_http:valid_host(V), V)
+        end
+     || Base <- [~"Abc-def.GHI-jk9.z0", ~"0123456789.-ab-CD"],
+        Port <- [~"", ~":8080"],
+        Pos <- lists:seq(0, byte_size(Base) - 1),
+        B <- lists:seq(0, 255)
+    ].
+
 valid_host_rejects_values_outside_the_grammar_test() ->
     %% Empty hosts (RFC 9110 §4.2.1: an http URI with an empty host is
     %% invalid), userinfo, paths, whitespace, a second host after a comma,

@@ -56,6 +56,14 @@ accessors that operate on it.
 
 -include("roadrunner_swar.hrl").
 
+%% Lanes holding a byte of at least `N` (`N` =< 0x80), exactly: each
+%% lane's high bit is set before the subtraction, so no borrow crosses
+%% into the next lane and no lane is flagged by its neighbour. Only
+%% meaningful for lanes below 0x80; the caller rules the others out.
+-define(SWAR_AT_LEAST(X, N),
+    ((((X) bor ?SWAR_BYTES(128)) - ?SWAR_BYTES(N)) band ?SWAR_BYTES(128))
+).
+
 -type headers() :: [{Name :: binary(), Value :: binary()}].
 -type status() :: 100..599.
 -type redirect_status() :: 300..399.
@@ -457,7 +465,30 @@ same_authority(Authority, Host, Scheme) ->
 -doc false.
 -spec valid_host(binary()) -> boolean().
 valid_host(<<$[, Rest/binary>>) -> ip_literal(Rest, false);
-valid_host(Value) -> reg_name(Value, false).
+valid_host(Value) -> reg_name_words(Value, false).
+
+%% A host name is mostly letters, digits, `.` and `-`: take it 7 bytes at
+%% a time while every byte is one of those, then let `reg_name/2` walk the
+%% rest (the port, any other reg-name byte, or what makes it invalid)
+%% byte by byte, which stays the authority on the grammar. Folding with
+%% 0x20 lowercases letters; a control byte that the fold would turn into
+%% `-`, `.` or a digit is still refused by the `>= 0x2D` test on the
+%% unfolded byte, and a byte >= 0x80 by its own high bit.
+-spec reg_name_words(binary(), boolean()) -> boolean().
+reg_name_words(<<X:56, Rest/binary>> = Bin, Any) ->
+    L = X bor ?SWAR_BYTES(16#20),
+    High = ?SWAR_BYTES(128),
+    Plain =
+        ?SWAR_AT_LEAST(X, 16#2D) band (High bxor (X band High)) band
+            ((?SWAR_AT_LEAST(L, 16#2D) band (?SWAR_AT_LEAST(L, 16#2F) bxor High)) bor
+                (?SWAR_AT_LEAST(L, 16#30) band (?SWAR_AT_LEAST(L, 16#3A) bxor High)) bor
+                (?SWAR_AT_LEAST(L, 16#61) band (?SWAR_AT_LEAST(L, 16#7B) bxor High))),
+    case Plain of
+        High -> reg_name_words(Rest, true);
+        _ -> reg_name(Bin, Any)
+    end;
+reg_name_words(Bin, Any) ->
+    reg_name(Bin, Any).
 
 -spec reg_name(binary(), boolean()) -> boolean().
 reg_name(<<C, Rest/binary>>, _Any) when
