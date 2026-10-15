@@ -1,38 +1,44 @@
 -module(roadrunner_etag).
--moduledoc false.
+-moduledoc """
+Conditional request middleware for dynamic responses (RFC 9110 §13.1.2).
 
-%% Conditional-request middleware for dynamic responses (RFC 7232, RFC 9110
-%% §13.1.2). For a `GET` or `HEAD` answered with a buffered `200`, it derives
-%% a weak `ETag` from the response body (or honours one the handler already
-%% set) and turns a matching `If-None-Match` into a bodyless `304 Not
-%% Modified`, saving the body bytes on a cache revalidation.
-%%
-%% Add it to a listener's `middlewares` opt (or a map-shape route's
-%% `middlewares` key):
-%%
-%% ```erlang
-%% roadrunner_listener:start_link(my_api, #{
-%%     port => 8080,
-%%     routes => Routes,
-%%     middlewares => [roadrunner_etag]
-%% }).
-%% ```
-%%
-%% The ETag is WEAK (`W/"..."`). A weak validator is the correct kind here:
-%% a downstream transform may re-encode the body (e.g. `roadrunner_compress`
-%% gzipping it), so the strong-validator contract — byte-for-byte identity of
-%% the transferred representation — would no longer hold. `If-None-Match` is
-%% matched with the RFC 7232 §2.3.2 weak comparison: the opaque-tags are
-%% compared and the `W/` prefix is ignored on either side, so a client that
-%% echoes a strong or weak form of the tag still revalidates. `*` matches any
-%% current representation.
-%%
-%% Scope: only a buffered `200` for a `GET` / `HEAD` is handled; every other
-%% status, method, and response shape (`{stream, _}`, `{loop, _}`,
-%% `{sendfile, _}`, `{websocket, ...}`) passes through untouched. Deriving the
-%% digest walks the whole body once per response, so this is opt-in: reach
-%% for it on read-heavy endpoints where saving the body on revalidation
-%% outweighs the hash.
+For a `GET` or `HEAD` answered with a buffered `200`, it derives a weak
+`ETag` from the response body (or keeps one the handler already set) and
+answers a matching `If-None-Match` with a bodyless `304 Not Modified`, so a
+client that revalidates doesn't download the body again.
+
+Add it to a listener's `middlewares` (or a map-form route's
+`middlewares`). It takes no config:
+
+```erlang
+roadrunner:start_listener(my_api, #{
+    port => 8080,
+    routes => Routes,
+    middlewares => [roadrunner_compress, roadrunner_etag]
+}).
+```
+
+List it after `roadrunner_compress`, as above. The first entry runs
+outermost, so `roadrunner_etag` then sees the uncompressed body, and a
+`304` skips the compression work.
+
+## Weak validators
+
+The ETag is weak (`W/"..."`) because a later step may re-encode the body,
+for example `roadrunner_compress` gzipping it, so the bytes on the wire are
+not guaranteed to stay identical. `If-None-Match` uses weak comparison
+(RFC 9110 §8.8.3.2): the `W/` prefix is ignored on either side, so a client
+that echoes the tag in either form still revalidates. `*` matches any
+current representation.
+
+## Scope
+
+Only a buffered `200` for `GET` or `HEAD` is handled. Other statuses and
+methods, and `{stream, ...}`, `{loop, ...}`, `{sendfile, ...}`, and
+`{websocket, ...}` responses, pass through unchanged. Computing the ETag
+reads the whole body once per response, so use it on read-heavy endpoints
+where skipping the body on revalidation is worth the hash.
+""".
 
 -behaviour(roadrunner_middleware).
 
