@@ -738,13 +738,20 @@ deadline, or `{timeout, Remaining}` with the count that was still
 alive when the timeout fired (those processes are torn down before
 returning).
 
-After `drain/2` returns the listener exits — call `start_link/2`
-again to bring it back up.
+The listener then exits, and `drain/2` returns only once it is gone, so
+the name is free and a `roadrunner:start_listener/2` or `start_link/2`
+right after it starts a fresh listener.
 """.
 -spec drain(Name :: atom(), Timeout :: non_neg_integer()) ->
     {ok, drained} | {timeout, non_neg_integer()}.
 drain(Name, Timeout) ->
-    gen_server:call(Name, {drain, Timeout}, Timeout + 5000).
+    %% The listener replies, then stops. Wait for it to be gone so a
+    %% caller that restarts it right away doesn't race its exit.
+    Mon = monitor(process, Name),
+    Reply = gen_server:call(Name, {drain, Timeout}, Timeout + 5000),
+    receive
+        {'DOWN', Mon, process, _, _} -> Reply
+    end.
 
 -doc """
 Broadcast a `{roadrunner_drain, Deadline}` notification to every conn /
