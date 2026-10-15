@@ -3,7 +3,7 @@
    "servers": [
       {
          "agent": "roadrunner",
-         "url": "ws://host.docker.internal:9001",
+         "url": "ws://127.0.0.1:9001",
          "options": {"version": 18}
       }
    ],

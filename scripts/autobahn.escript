@@ -103,10 +103,11 @@ setup_code_paths(ProjectDir) ->
     ok.
 
 run_fuzzingclient(ProjectDir, _Port) ->
-    %% `--network host` lets the container reach the host's
-    %% 127.0.0.1:9001 directly (matches the "host.docker.internal"
-    %% URL in fuzzingclient.json on Linux too — the Docker daemon
-    %% maps it).
+    %% `--network host` shares the host's network, so the container
+    %% reaches the listener at the `ws://127.0.0.1:9001` URL in
+    %% fuzzingclient.json. Don't use `host.docker.internal` there: it
+    %% only resolves where the host's /etc/hosts maps it, which CI
+    %% runners don't.
     Reports = reports_dir(ProjectDir),
     Config = config_path(ProjectDir),
     ok = filelib:ensure_dir(filename:join(Reports, "x")),
