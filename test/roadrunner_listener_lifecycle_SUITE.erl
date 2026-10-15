@@ -1,8 +1,9 @@
 -module(roadrunner_listener_lifecycle_SUITE).
 -moduledoc """
-How a listener under `roadrunner_sup` ends: stopped, failing to start, or
-taken down by a linked process. Each way leaves nothing published behind,
-and an abnormal exit of a linked process still restarts the listener.
+How a listener under `roadrunner_sup` ends: stopped, drained, failing to
+start, or taken down by a linked process. Each way leaves nothing published
+behind, an abnormal exit of a linked process still restarts the listener,
+and a drained listener stays down until started again.
 """.
 
 -include_lib("common_test/include/ct.hrl").
@@ -13,7 +14,9 @@ and an abnormal exit of a linked process still restarts the listener.
     stop_listener_erases_published_terms/1,
     failed_start_erases_published_terms/1,
     crashed_acceptor_restarts_the_listener/1,
-    normal_exit_of_a_linked_process_is_ignored/1
+    normal_exit_of_a_linked_process_is_ignored/1,
+    drained_listener_stays_down/1,
+    drained_listener_starts_again/1
 ]).
 
 suite() ->
@@ -24,7 +27,9 @@ all() ->
         stop_listener_erases_published_terms,
         failed_start_erases_published_terms,
         crashed_acceptor_restarts_the_listener,
-        normal_exit_of_a_linked_process_is_ignored
+        normal_exit_of_a_linked_process_is_ignored,
+        drained_listener_stays_down,
+        drained_listener_starts_again
     ].
 
 init_per_suite(Config) ->
@@ -71,6 +76,36 @@ normal_exit_of_a_linked_process_is_ignored(_Config) ->
     ?assertEqual(Pid, whereis(lifecycle_normal)),
     ?assert(is_integer(roadrunner_listener:port(lifecycle_normal))),
     ok = roadrunner:stop_listener(lifecycle_normal).
+
+drained_listener_stays_down(_Config) ->
+    %% Drain ends the listener normally, so its supervisor leaves it down.
+    {ok, Pid} = roadrunner:start_listener(lifecycle_drain, opts(0)),
+    Mon = monitor(process, Pid),
+    ?assertEqual({ok, drained}, roadrunner_listener:drain(lifecycle_drain, 1000)),
+    receive
+        {'DOWN', Mon, process, Pid, Reason} -> ?assertEqual(normal, Reason)
+    end,
+    ?assertMatch(
+        [undefined], [P || {lifecycle_drain, P, _, _} <- supervisor:which_children(roadrunner_sup)]
+    ),
+    ?assertEqual(undefined, whereis(lifecycle_drain)),
+    ?assertNot(lists:member(lifecycle_drain, roadrunner:listeners())),
+    ?assertEqual([], published(lifecycle_drain)),
+    ok = roadrunner:stop_listener(lifecycle_drain),
+    ?assertEqual({error, not_found}, roadrunner:stop_listener(lifecycle_drain)).
+
+drained_listener_starts_again(_Config) ->
+    {ok, Pid} = roadrunner:start_listener(lifecycle_redrain, opts(0)),
+    Mon = monitor(process, Pid),
+    ?assertEqual({ok, drained}, roadrunner_listener:drain(lifecycle_redrain, 1000)),
+    receive
+        {'DOWN', Mon, process, Pid, _} -> ok
+    end,
+    {ok, Again} = roadrunner:start_listener(lifecycle_redrain, opts(0)),
+    ?assertNotEqual(Pid, Again),
+    ?assertEqual(Again, whereis(lifecycle_redrain)),
+    ?assert(lists:member(lifecycle_redrain, roadrunner:listeners())),
+    ok = roadrunner:stop_listener(lifecycle_redrain).
 
 %% --- helpers ---
 
