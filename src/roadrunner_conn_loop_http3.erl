@@ -1118,6 +1118,13 @@ dispatch_decoded(State, StreamId, Headers, Body) ->
     },
     State1 = State#h3{req_id_buffer = NewBuf},
     case build_request(Headers, Body, RequestContext) of
+        {error, not_implemented} ->
+            %% A well-formed CONNECT: roadrunner opens no tunnels, so 501
+            %% (as on HTTP/1.1), then drop the stream.
+            ok = roadrunner_http3_stream_worker:send_buffered(
+                State1#h3.conn, StreamId, 501, [], ~""
+            ),
+            drop_stream(State1, StreamId);
         {error, _} ->
             %% Malformed request (bad/missing pseudo-headers, a
             %% connection-specific header) — RFC 9114 §4.1.2 / §4.2:

@@ -407,12 +407,7 @@ validate_method_chars(_) ->
 %% and DEL; path and query share that byte class.
 -spec valid_target(binary()) -> boolean().
 valid_target(<<>>) -> false;
-valid_target(Target) -> valid_target_bytes(Target).
-
--spec valid_target_bytes(binary()) -> boolean().
-valid_target_bytes(<<C, Rest/binary>>) when C > 16#20, C < 16#7F -> valid_target_bytes(Rest);
-valid_target_bytes(<<>>) -> true;
-valid_target_bytes(_) -> false.
+valid_target(Target) -> roadrunner_http:valid_target_bytes(Target).
 
 -doc """
 Parse a single HTTP/1.1 header line.

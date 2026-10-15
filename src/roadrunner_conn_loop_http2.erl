@@ -1630,6 +1630,12 @@ dispatch_request(
                             frame_loop(remove_stream(StateBuf, StreamId))
                     end
             end;
+        {error, not_implemented} ->
+            %% A well-formed CONNECT: roadrunner opens no tunnels, so 501
+            %% (as on HTTP/1.1), then close the stream.
+            State1 = encode_and_send_response_atomic(State, StreamId, 501, [], ~"", 0),
+            _ = send_rst_stream(State1, StreamId, no_error),
+            frame_loop(remove_stream(State1#loop{req_id_buffer = NewBuf}, StreamId));
         {error, _Reason} ->
             _ = send_rst_stream(State, StreamId, protocol_error),
             frame_loop(remove_stream(State#loop{req_id_buffer = NewBuf}, StreamId))

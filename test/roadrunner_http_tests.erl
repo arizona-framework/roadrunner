@@ -142,6 +142,51 @@ check_header_safe_low_byte_then_cr_in_same_word_test() ->
         {header_injection, value, _}, roadrunner_http:check_header_safe(~"a\tbc\rdefghij", value)
     ).
 
+%% --- request_pseudo_headers/1: :path and CONNECT ---
+
+pseudo_path_follows_the_target_rules_test() ->
+    %% RFC 9113 §8.3.1 / RFC 9114 §4.3.1: `:path` is an origin-form
+    %% (`/`, then US-ASCII without CTL, SP or DEL), or `*` for OPTIONS.
+    Pseudo = fun(Method, Path) ->
+        roadrunner_http:request_pseudo_headers([
+            {~":method", Method}, {~":scheme", ~"https"}, {~":path", Path}
+        ])
+    end,
+    ?assertMatch({ok, ~"GET", ~"/a?b=1&c", _, []}, Pseudo(~"GET", ~"/a?b=1&c")),
+    ?assertMatch({ok, ~"OPTIONS", ~"*", _, []}, Pseudo(~"OPTIONS", ~"*")),
+    [
+        ?assertEqual({error, bad_path}, Pseudo(Method, Path), {Method, Path})
+     || {Method, Path} <- [
+            {~"GET", ~"*"},
+            {~"OPTIONS", ~"*x"},
+            {~"GET", ~"abc"},
+            {~"GET", ~"http://example.com/x"},
+            {~"GET", <<"/caf", 16#C3, 16#A9>>},
+            {~"GET", ~"/a b"},
+            {~"GET", <<"/a", 1, "b">>},
+            {~"GET", <<"/a", 16#7F>>}
+        ]
+    ].
+
+pseudo_connect_test() ->
+    %% RFC 9113 §8.5 / RFC 9114 §4.4: a CONNECT carries `:method` and
+    %% `:authority` only. Roadrunner opens no tunnels, so a well-formed one
+    %% is not implemented; one with `:scheme` or `:path`, or without
+    %% `:authority`, is malformed.
+    Pseudo = fun(Fields) ->
+        roadrunner_http:request_pseudo_headers([{~":method", ~"CONNECT"} | Fields])
+    end,
+    ?assertEqual({error, not_implemented}, Pseudo([{~":authority", ~"example.com:443"}])),
+    [
+        ?assertEqual({error, bad_connect}, Pseudo(Fields), Fields)
+     || Fields <- [
+            [],
+            [{~":authority", ~"example.com:443"}, {~":path", ~"/"}],
+            [{~":scheme", ~"https"}, {~":authority", ~"example.com:443"}],
+            [{~":scheme", ~"https"}, {~":path", ~"/"}]
+        ]
+    ].
+
 %% --- check_request_authority/3 ---
 
 authority_compare_normalizes_test() ->

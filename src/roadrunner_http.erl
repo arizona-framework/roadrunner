@@ -45,6 +45,7 @@ accessors that operate on it.
     request_pseudo_headers/1,
     check_request_authority/3,
     valid_host/1,
+    valid_target_bytes/1,
     request_content_length/1,
     body_length_fits/3,
     build_request/7
@@ -83,7 +84,10 @@ accessors that operate on it.
     | duplicate_pseudo_header
     | unknown_pseudo_header
     | pseudo_after_regular
-    | empty_path.
+    | empty_path
+    | bad_path
+    | bad_connect
+    | not_implemented.
 
 -define(DAY_NAMES, {~"Mon", ~"Tue", ~"Wed", ~"Thu", ~"Fri", ~"Sat", ~"Sun"}).
 -define(MONTH_NAMES, {
@@ -392,14 +396,45 @@ no_pseudo([]) -> ok.
 ) ->
     {ok, binary(), binary(), binary() | undefined, headers()}
     | {error, pseudo_error()}.
+%% CONNECT carries only `:method` and `:authority` (RFC 9113 §8.5, RFC 9114
+%% §4.4); roadrunner doesn't open tunnels, so a well-formed one is not
+%% implemented (a 501, as on HTTP/1.1) and one with a `:scheme` or a
+%% `:path` is malformed (no extended CONNECT is advertised). Any other
+%% request needs `:method`, `:scheme` and a `:path` holding an
+%% origin-form (`/` then US-ASCII without CTL, SP or DEL), or `*` for a
+%% server-wide OPTIONS (RFC 9113 §8.3.1, RFC 9114 §4.3.1): the same
+%% target rules HTTP/1.1 applies.
+validate_pseudo(~"CONNECT", undefined, Authority, undefined, _Regular) when
+    Authority =/= undefined
+->
+    {error, not_implemented};
+validate_pseudo(~"CONNECT", _Scheme, _Authority, _Path, _Regular) ->
+    {error, bad_connect};
 validate_pseudo(_Method, _Scheme, _Authority, ~"", _Regular) ->
     {error, empty_path};
 validate_pseudo(Method, Scheme, Authority, Path, Regular) when
     Method =/= undefined, Scheme =/= undefined, Path =/= undefined
 ->
-    {ok, Method, Path, Authority, Regular};
+    case valid_path(Method, Path) of
+        true -> {ok, Method, Path, Authority, Regular};
+        false -> {error, bad_path}
+    end;
 validate_pseudo(_Method, _Scheme, _Authority, _Path, _Regular) ->
     {error, missing_pseudo_header}.
+
+-spec valid_path(binary(), binary()) -> boolean().
+valid_path(_Method, <<$/, _/binary>> = Path) -> valid_target_bytes(Path);
+valid_path(~"OPTIONS", ~"*") -> true;
+valid_path(_Method, _Path) -> false.
+
+%% Request-target bytes, shared by the HTTP/1.1 request line and the
+%% HTTP/2 and HTTP/3 `:path`: US-ASCII (RFC 3986 §2; raw UTF-8 or other
+%% high bytes must be percent-encoded) without CTL, SP or DEL.
+-doc false.
+-spec valid_target_bytes(binary()) -> boolean().
+valid_target_bytes(<<C, Rest/binary>>) when C > 16#20, C < 16#7F -> valid_target_bytes(Rest);
+valid_target_bytes(<<>>) -> true;
+valid_target_bytes(_) -> false.
 
 %% The request authority rule shared by HTTP/2 and HTTP/3 (RFC 9113 §8.3.1,
 %% RFC 9114 §4.3.1). Roadrunner only serves `http` and `https`, both with a
