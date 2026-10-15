@@ -251,17 +251,54 @@ check_header_safe(Bin, Kind) ->
 %% that want a boolean (the HTTP/2 and HTTP/3 response gate answers 500
 %% instead of crashing); most want `check_header_safe/2`.
 -doc false.
+%% Two 7-byte words per step, then at most one more word, then the last 0
+%% to 6 bytes as a single integer (`header_safe_tail/1`), so no clean byte
+%% is walked one at a time (a 97-byte User-Agent 67 -> 47 ns, a 4-byte
+%% value 26 -> 17 ns). A flagged word or tail is checked byte by byte.
 -spec is_header_safe(binary()) -> boolean().
-is_header_safe(<<X:56, Rest/binary>> = Bin) ->
-    case ?SWAR_HIGH(?SWAR_BELOW(X, 16#0E)) of
+is_header_safe(<<X:56, Y:56, Rest/binary>> = Bin) ->
+    case ?SWAR_HIGH(?SWAR_BELOW(X, 16#0E) bor ?SWAR_BELOW(Y, 16#0E)) of
         0 ->
             is_header_safe(Rest);
         _ ->
-            <<Word:7/binary, _/binary>> = Bin,
-            is_header_safe_bytes(Word) andalso is_header_safe(Rest)
+            <<Words:14/binary, _/binary>> = Bin,
+            is_header_safe_bytes(Words) andalso is_header_safe(Rest)
+    end;
+is_header_safe(<<X:56, Rest/binary>> = Bin) ->
+    case ?SWAR_HIGH(?SWAR_BELOW(X, 16#0E)) of
+        0 -> header_safe_tail(Rest);
+        _ -> is_header_safe_bytes(Bin)
     end;
 is_header_safe(Tail) ->
-    is_header_safe_bytes(Tail).
+    header_safe_tail(Tail).
+
+%% The last 0 to 6 bytes as one integer, tested like a word with the lane
+%% constants cut to its size (`?SWAR_BELOW(X, 16#0E)` and `?SWAR_HIGH/1`
+%% over N lanes): one clause per size keeps the constants literal.
+-spec header_safe_tail(binary()) -> boolean().
+header_safe_tail(<<X:48>> = Tail) ->
+    header_safe_lanes(X, 16#0E0E0E0E0E0E, 16#FFFFFFFFFFFF, 16#808080808080, Tail);
+header_safe_tail(<<X:40>> = Tail) ->
+    header_safe_lanes(X, 16#0E0E0E0E0E, 16#FFFFFFFFFF, 16#8080808080, Tail);
+header_safe_tail(<<X:32>> = Tail) ->
+    header_safe_lanes(X, 16#0E0E0E0E, 16#FFFFFFFF, 16#80808080, Tail);
+header_safe_tail(<<X:24>> = Tail) ->
+    header_safe_lanes(X, 16#0E0E0E, 16#FFFFFF, 16#808080, Tail);
+header_safe_tail(<<X:16>> = Tail) ->
+    header_safe_lanes(X, 16#0E0E, 16#FFFF, 16#8080, Tail);
+header_safe_tail(<<X:8>> = Tail) ->
+    header_safe_lanes(X, 16#0E, 16#FF, 16#80, Tail);
+header_safe_tail(<<>>) ->
+    true.
+
+-spec header_safe_lanes(
+    non_neg_integer(), pos_integer(), pos_integer(), pos_integer(), binary()
+) -> boolean().
+header_safe_lanes(X, Below, All, High, Tail) ->
+    case ((X - Below) band (X bxor All)) band High of
+        0 -> true;
+        _ -> is_header_safe_bytes(Tail)
+    end.
 
 -spec is_header_safe_bytes(binary()) -> boolean().
 is_header_safe_bytes(<<0, _/binary>>) -> false;

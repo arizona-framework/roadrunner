@@ -114,12 +114,15 @@ drop_unset_empty_returns_empty_test() ->
     ?assertEqual([], roadrunner_http:drop_unset([])).
 
 check_header_safe_every_byte_at_every_position_test() ->
-    %% Every byte value at every position of a 17-byte value: each SWAR
-    %% lane of both 7-byte words and the tail. Only CR, LF and NUL fail;
-    %% tab and the other low control bytes pass.
-    Fill = binary:copy(~"a", 17),
+    %% Every byte value at every position of values that end in each way
+    %% the scan can: a word pair then a tail (17), a pair then one word
+    %% (21), two pairs then a tail (30), one word alone (7), a tail alone of
+    %% each size (1 to 6), and a word or a pair then a 6-byte tail (13, 20).
+    %% Covers each lane of a pair, a lone word and every tail size. Only
+    %% CR, LF and NUL fail; tab and the other low control bytes pass.
     [
         begin
+            Fill = binary:copy(~"a", Len),
             <<Pre:Pos/binary, _, Post/binary>> = Fill,
             Value = <<Pre/binary, B, Post/binary>>,
             case B of
@@ -132,7 +135,9 @@ check_header_safe_every_byte_at_every_position_test() ->
                     ?assertEqual(ok, roadrunner_http:check_header_safe(Value, value))
             end
         end
-     || Pos <- lists:seq(0, 16), B <- lists:seq(0, 255)
+     || Len <- [17, 21, 30, 7, 1, 2, 3, 4, 5, 6, 13, 20],
+        Pos <- lists:seq(0, Len - 1),
+        B <- lists:seq(0, 255)
     ].
 
 check_header_safe_low_byte_then_cr_in_same_word_test() ->
@@ -141,6 +146,18 @@ check_header_safe_low_byte_then_cr_in_same_word_test() ->
     ?assertError(
         {header_injection, value, _}, roadrunner_http:check_header_safe(~"a\tbc\rdefghij", value)
     ).
+
+check_header_safe_low_byte_then_cr_in_the_next_word_test() ->
+    %% A tab in the first word of a pair sends both words to the exact
+    %% check, which must find the CR in the second one.
+    ?assertError(
+        {header_injection, value, _},
+        roadrunner_http:check_header_safe(~"a\tbcdefghi\rjklmn", value)
+    ).
+
+check_header_safe_low_byte_then_cr_in_the_tail_test() ->
+    %% A tab flags the short tail, whose exact check must find the CR.
+    ?assertError({header_injection, value, _}, roadrunner_http:check_header_safe(~"a\t\rb", value)).
 
 %% --- request_pseudo_headers/1: :path and CONNECT ---
 
