@@ -310,9 +310,11 @@ roadrunner:start_listener(my_tls_listener, #{
 ```
 
 HTTP/1.1 and HTTP/2 share the TCP port. HTTP/3 (experimental) serves over UDP
-on the same port number and advertises `Alt-Svc` so browsers upgrade. For
-HTTP/2 over plain TCP (prior knowledge), use `protocols => [http2]` without
-`tls`. Without `tls`, a listener serves either HTTP/1.1 or HTTP/2, not both.
+on the same port number. When the listener also serves HTTP/1.1 or HTTP/2 on a
+fixed port (not `port => 0`), their responses advertise HTTP/3 in `Alt-Svc` so
+browsers upgrade. For HTTP/2 over plain TCP (prior knowledge), use
+`protocols => [http2]` without `tls`. Without `tls`, a listener serves either
+HTTP/1.1 or HTTP/2, not both.
 
 ### Behind a proxy
 
