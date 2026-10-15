@@ -80,6 +80,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     badheaders_reset/1,
     fin_without_headers/1,
     malformed_request/1,
+    connect_not_implemented/1,
     data_before_headers/1,
     request_with_trailers/1,
     malformed_frame/1,
@@ -172,6 +173,7 @@ all() ->
         badheaders_reset,
         fin_without_headers,
         malformed_request,
+        connect_not_implemented,
         data_before_headers,
         request_with_trailers,
         malformed_frame,
@@ -1471,6 +1473,17 @@ malformed_request(Config) ->
     timer:sleep(100),
     ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
     ll_close(Conn).
+
+connect_not_implemented(Config) ->
+    %% A well-formed CONNECT (RFC 9114 §4.4): roadrunner opens no tunnels,
+    %% so the stream gets a 501, as on HTTP/1.1, and the connection lives.
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(
+        Conn, [{~":method", ~"CONNECT"}, {~":authority", ~"localhost:443"}]
+    ),
+    ?assertMatch({501, _, _}, collect(Conn, StreamId)),
+    ?assertMatch({200, _, _}, get(Conn, ~"/")),
+    close(Conn).
 
 data_before_headers(Config) ->
     %% A DATA frame before any HEADERS is an invalid frame sequence

@@ -84,6 +84,25 @@ empty_path_is_error_test() ->
         roadrunner_http2_request:from_headers(Headers, <<>>, request_context())
     ).
 
+bad_path_is_error_test() ->
+    Headers = [
+        {~":method", ~"GET"},
+        {~":scheme", ~"https"},
+        {~":authority", ~"example.com"},
+        {~":path", ~"*"}
+    ],
+    ?assertEqual(
+        {error, bad_path},
+        roadrunner_http2_request:from_headers(Headers, <<>>, request_context())
+    ).
+
+connect_is_not_implemented_test() ->
+    Headers = [{~":method", ~"CONNECT"}, {~":authority", ~"example.com:443"}],
+    ?assertEqual(
+        {error, not_implemented},
+        roadrunner_http2_request:from_headers(Headers, <<>>, request_context())
+    ).
+
 duplicate_pseudo_is_error_test() ->
     Headers = [
         {~":method", ~"GET"},

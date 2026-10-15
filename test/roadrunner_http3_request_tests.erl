@@ -63,6 +63,18 @@ pseudo_after_regular_test() ->
         from(base() ++ [{~"x-a", ~"1"}, {~"x-b", ~"2"}, {~":authority", ~"h"}])
     ).
 
+bad_path_test() ->
+    ?assertEqual(
+        {error, bad_path},
+        from([{~":method", ~"GET"}, {~":scheme", ~"https"}, {~":path", <<"/caf", 16#C3, 16#A9>>}])
+    ).
+
+connect_not_implemented_test() ->
+    ?assertEqual(
+        {error, not_implemented},
+        from([{~":method", ~"CONNECT"}, {~":authority", ~"example.com:443"}])
+    ).
+
 empty_path_test() ->
     ?assertEqual(
         {error, empty_path},

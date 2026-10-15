@@ -41,6 +41,8 @@ all_test_() ->
         fun data_on_unknown_stream_triggers_goaway/0,
         fun malformed_hpack_block_triggers_goaway/0,
         fun missing_pseudo_header_rst_stream/0,
+        fun connect_answered_501/0,
+        fun bad_path_rst_stream/0,
         fun empty_body_response_omits_data_frame/0,
         fun stream_response_emits_data/0,
         fun stream_response_multi_frame_nofin_chunk/0,
@@ -917,6 +919,72 @@ missing_pseudo_header_rst_stream() ->
     Out = expect_send(),
     ?assertMatch(<<_:24, 3, _/binary>>, Out),
     %% Conn stays alive (RST_STREAM doesn't close the connection).
+    ?assert(is_process_alive(Pid)),
+    cleanup(Pid, Ref).
+
+connect_answered_501() ->
+    %% A well-formed CONNECT (RFC 9113 §8.5): roadrunner opens no tunnels,
+    %% so the stream gets a 501, as on HTTP/1.1, then RST_STREAM(NO_ERROR).
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [{~":method", ~"CONNECT"}, {~":authority", ~"example.com:443"}],
+        roadrunner_http2_hpack:new_encoder(4096)
+    ),
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(
+            roadrunner_http2_frame:encode(
+                {headers, 1, 16#04 bor 16#01, undefined, iolist_to_binary(Hpack)}
+            )
+        )
+    ),
+    <<Len:24, 1, _Flags, _:1, 1:31, Block:Len/binary, After/binary>> =
+        iolist_to_binary(expect_send()),
+    {ok, Decoded, _} = roadrunner_http2_hpack:decode(
+        Block, roadrunner_http2_hpack:new_decoder(4096)
+    ),
+    ?assertEqual(~"501", proplists:get_value(~":status", Decoded)),
+    %% The empty body closes the stream with an END_STREAM DATA frame (as
+    %% the 429 for a rate-limited stream does), then RST_STREAM(NO_ERROR).
+    ?assertEqual(<<0:24, 0, 1, 0:1, 1:31>>, After),
+    ?assertMatch(<<4:24, 3, 0, _:1, 1:31, 0:32>>, iolist_to_binary(expect_send())),
+    ?assert(is_process_alive(Pid)),
+    cleanup(Pid, Ref).
+
+bad_path_rst_stream() ->
+    %% A `:path` outside the target rules is malformed (RFC 9113 §8.3.1):
+    %% RST_STREAM(PROTOCOL_ERROR), connection kept.
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"example.com"},
+            {~":path", ~"http://example.com/x"}
+        ],
+        roadrunner_http2_hpack:new_encoder(4096)
+    ),
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(
+            roadrunner_http2_frame:encode(
+                {headers, 1, 16#04 bor 16#01, undefined, iolist_to_binary(Hpack)}
+            )
+        )
+    ),
+    ?assertMatch(<<4:24, 3, 0, _:1, 1:31, 1:32>>, iolist_to_binary(expect_send())),
     ?assert(is_process_alive(Pid)),
     cleanup(Pid, Ref).
 

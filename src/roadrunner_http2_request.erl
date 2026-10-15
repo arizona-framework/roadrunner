@@ -42,6 +42,9 @@
     | unknown_pseudo_header
     | pseudo_after_regular
     | empty_path
+    | bad_path
+    | bad_connect
+    | not_implemented
     | connection_specific_header
     | missing_authority
     | duplicate_host
