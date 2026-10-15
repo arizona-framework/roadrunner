@@ -296,11 +296,12 @@ fast_version(_Cur, _Method, _Target, _Path, _Bin, _Max) ->
 %% `fast_request_line/2`, so what reaches here is a line that is still
 %% incomplete, over the limit, or invalid; this only tells them apart.
 -spec do_parse_request_line(binary(), binary:cp(), binary:cp(), pos_integer()) ->
-    {more, undefined} | {error, bad_request_line | bad_version | request_line_too_long}.
+    {more, undefined}
+    | {error, bad_request_line | bad_version | request_line_too_long | not_implemented}.
 do_parse_request_line(Bin, LfCp, SpaceCp, MaxReqLine) ->
     case binary:match(Bin, LfCp) of
         nomatch when byte_size(Bin) > MaxReqLine ->
-            {error, request_line_too_long};
+            {error, too_long(Bin, SpaceCp, MaxReqLine)};
         nomatch ->
             {more, undefined};
         {0, 1} ->
@@ -311,10 +312,29 @@ do_parse_request_line(Bin, LfCp, SpaceCp, MaxReqLine) ->
                 <<Line:LineLen/binary, "\r\n", _/binary>> when LineLen =< MaxReqLine ->
                     {error, line_error(Line, SpaceCp)};
                 <<_:LineLen/binary, "\r\n", _/binary>> ->
-                    {error, request_line_too_long};
+                    {error, too_long(Bin, SpaceCp, MaxReqLine)};
                 _ ->
                     {error, bad_request_line}
             end
+    end.
+
+%% A request line over the limit. With a space inside the limit, the
+%% method ended and the target is what ran long: 414 (RFC 9112 §3). With
+%% none, the method alone outgrew the limit, and RFC 9112 §3 answers a
+%% method longer than any the server implements with 501; bytes no
+%% method may hold make it a bad request line instead.
+-spec too_long(binary(), binary:cp(), pos_integer()) ->
+    request_line_too_long | not_implemented | bad_request_line.
+too_long(Bin, SpaceCp, MaxReqLine) ->
+    case binary:match(Bin, SpaceCp, [{scope, {0, MaxReqLine}}]) of
+        nomatch ->
+            <<Method:MaxReqLine/binary, _/binary>> = Bin,
+            case validate_method(Method) of
+                ok -> not_implemented;
+                error -> bad_request_line
+            end;
+        _ ->
+            request_line_too_long
     end.
 
 %% A complete, invalid request line. With a valid method and target the

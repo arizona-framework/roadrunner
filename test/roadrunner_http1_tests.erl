@@ -167,11 +167,31 @@ oversized_no_crlf_rejected_test() ->
     ).
 
 oversized_with_crlf_rejected_test() ->
-    Line = binary:copy(~"a", 8193),
+    Line = <<"GET /", (binary:copy(~"a", 8193))/binary, " HTTP/1.1">>,
     ?assertEqual(
         {error, request_line_too_long},
         roadrunner_http1:parse_request_line(<<Line/binary, "\r\n">>)
     ).
+
+oversized_method_not_implemented_test() ->
+    %% RFC 9112 §3: a method longer than any the server implements gets
+    %% 501, not the 414 meant for a long target; that the method alone
+    %% fills the limit is what tells the two apart, with or without the
+    %% line's end in the buffer.
+    Method = binary:copy(~"A", 8200),
+    [
+        ?assertEqual({error, not_implemented}, roadrunner_http1:parse_request_line(Line))
+     || Line <- [Method, <<Method/binary, " / HTTP/1.1\r\n">>]
+    ].
+
+oversized_line_without_method_rejected_test() ->
+    %% With no space in the limit and bytes no method may hold, the line
+    %% is malformed rather than long.
+    Junk = binary:copy(~"a", 8200),
+    [
+        ?assertEqual({error, bad_request_line}, roadrunner_http1:parse_request_line(Line))
+     || Line <- [Junk, <<Junk/binary, "\r\n">>]
+    ].
 
 %% =============================================================================
 %% parse_header/1
