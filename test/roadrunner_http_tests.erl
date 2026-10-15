@@ -187,6 +187,65 @@ pseudo_connect_test() ->
         ]
     ].
 
+%% --- check_fields/1 ---
+
+check_fields_name_every_byte_test() ->
+    %% RFC 9113 §8.2.1: a field name holds no byte in 0x00-0x20, 0x41-0x5A
+    %% or 0x7F-0xFF, and no `:` outside a pseudo-header's leading colon.
+    %% Every byte value at the start, middle and end of a name.
+    Allowed = fun(B) ->
+        B > 16#20 andalso B < 16#7F andalso not (B >= $A andalso B =< $Z) andalso B =/= $:
+    end,
+    [
+        ?assertEqual(
+            case Allowed(B) of
+                true -> ok;
+                false -> {error, bad_field_name}
+            end,
+            roadrunner_http:check_fields([{Name, ~"v"}]),
+            Name
+        )
+     || B <- lists:seq(0, 255),
+        %% A leading `:` marks a pseudo-header, whose name
+        %% `request_pseudo_headers/1` judges, so it is left out here.
+        Name <- [<<B, "ab">> || B =/= $:] ++ [<<"a", B, "b">>, <<"ab", B>>]
+    ],
+    ?assertEqual({error, bad_field_name}, roadrunner_http:check_fields([{~"", ~"v"}])).
+
+check_fields_value_every_byte_test() ->
+    %% A field value holds no NUL, CR or LF anywhere, and neither starts
+    %% nor ends with SP or HTAB; every other byte, obs-text included, is
+    %% left to the field's own grammar. Every byte value at the start, the
+    %% middle and the end, in a value long enough to fill 7-byte words.
+    [
+        ?assertEqual(
+            case {B, Pos} of
+                {_, _} when B =:= 0; B =:= $\r; B =:= $\n -> {error, bad_field_value};
+                {_, middle} -> ok;
+                {_, _} when B =:= $\s; B =:= $\t -> {error, bad_field_value};
+                _ -> ok
+            end,
+            roadrunner_http:check_fields([{~"x-a", Value}]),
+            {B, Pos}
+        )
+     || B <- lists:seq(0, 255),
+        {Pos, Value} <- [
+            {first, <<B, "abcdefghijklmnop">>},
+            {middle, <<"abcdefgh", B, "ijklmnop">>},
+            {last, <<"abcdefghijklmnop", B>>}
+        ]
+    ],
+    ?assertEqual(ok, roadrunner_http:check_fields([{~"x-a", ~""}])).
+
+check_fields_pseudo_values_test() ->
+    %% Pseudo-headers keep their leading colon, but their values follow
+    %% the same value rule.
+    ?assertEqual(ok, roadrunner_http:check_fields([{~":method", ~"GET"}, {~"a", ~"b"}])),
+    ?assertEqual(
+        {error, bad_field_value}, roadrunner_http:check_fields([{~":method", ~"GE\r\nT"}])
+    ),
+    ?assertEqual({error, bad_field_value}, roadrunner_http:check_fields([{~":path", ~"/ "}])).
+
 %% --- check_request_authority/3 ---
 
 authority_compare_normalizes_test() ->

@@ -20,9 +20,11 @@
 %% - Pseudo-headers MUST appear before regular headers; mixing is a
 %%   malformed request.
 %% - Pseudo-headers other than the four defined are rejected.
-%% - `:path` MUST NOT be empty.
-%% - Regular field names MUST be lowercase; an uppercase character makes the
-%%   request malformed (RFC 9114 §4.2).
+%% - `:path` is an origin-form (`/`, then US-ASCII without CTL, SP or DEL),
+%%   or `*` for OPTIONS; a well-formed CONNECT is a 501.
+%% - Field names are visible US-ASCII without uppercase or `:`, and values
+%%   hold no NUL, CR or LF and no leading or trailing SP or HTAB (RFC 9114
+%%   §4.2, `roadrunner_http:check_fields/1`).
 %% - Connection-specific headers MUST NOT appear (RFC 9114 §4.2).
 %% - The request MUST carry an `:authority` pseudo-header or a `host` header
 %%   (https has a mandatory authority component); if present neither is empty,
@@ -46,7 +48,8 @@
     | bad_connect
     | not_implemented
     | connection_specific_header
-    | uppercase_field_name
+    | bad_field_name
+    | bad_field_value
     | content_length_mismatch
     | missing_authority
     | duplicate_host
@@ -95,6 +98,7 @@ build(Headers, Body, #{scheme := Scheme} = RequestContext, CheckLength) ->
         %% discarded — the authoritative scheme comes from the conn
         %% (`RequestContext.scheme`, always `https` over QUIC) since
         %% clients can lie about the pseudo-header value.
+        ok ?= roadrunner_http:check_fields(Headers),
         {ok, Method, Path, Authority, Regular} ?= roadrunner_http:request_pseudo_headers(Headers),
         ok ?= check_banned(Regular),
         ok ?= check_content_length(Regular, Body, CheckLength),
@@ -109,7 +113,7 @@ build(Headers, Body, #{scheme := Scheme} = RequestContext, CheckLength) ->
 %% the hot path branch-friendly: the BEAM compiles the literal-binary
 %% clauses to a hash/select, no `lists:member` call per header.
 -spec check_banned(roadrunner_http:headers()) ->
-    ok | {error, connection_specific_header | uppercase_field_name}.
+    ok | {error, connection_specific_header}.
 check_banned([]) ->
     ok;
 check_banned([{~"connection", _} | _]) ->
@@ -126,23 +130,8 @@ check_banned([{~"te", ~"trailers"} | Rest]) ->
     check_banned(Rest);
 check_banned([{~"te", _} | _]) ->
     {error, connection_specific_header};
-check_banned([{Name, _} | Rest]) ->
-    %% Any other name is not connection-specific, but RFC 9114 §4.2 makes a
-    %% request with an uppercase field name malformed; the banned literals
-    %% above are already lowercase, so only these unrecognised names need the
-    %% scan. Folding it here keeps one pass over the regular headers.
-    case lower_name(Name) of
-        ok -> check_banned(Rest);
-        {error, _} = Error -> Error
-    end.
-
-%% Reject any uppercase ASCII letter in a regular field name (RFC 9114 §4.2:
-%% uppercase field names MUST be treated as malformed). Mirrors
-%% roadrunner_http2_hpack:validate_lower/1.
--spec lower_name(binary()) -> ok | {error, uppercase_field_name}.
-lower_name(<<>>) -> ok;
-lower_name(<<C, _/binary>>) when C >= $A, C =< $Z -> {error, uppercase_field_name};
-lower_name(<<_, Rest/binary>>) -> lower_name(Rest).
+check_banned([_ | Rest]) ->
+    check_banned(Rest).
 
 %% RFC 9114 §4.1.2 / RFC 9110 §8.6: a `content-length` header whose value does
 %% not equal the bytes received in DATA frames (or a multi-valued or

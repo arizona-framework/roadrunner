@@ -22,9 +22,14 @@
 %%   emit a Dynamic Table Size Update on the next `encode/2`
 %%   call.
 %%
-%% Header names are returned as **lowercase binaries** per RFC 9113
-%% §8.2 case-folding requirement; the decoder rejects any uppercase
-%% character in a literal name field with `bad_header_name`.
+%% Each literal field is checked as it is decoded against RFC 9113
+%% §8.2.1 (`roadrunner_http:valid_field_name/1` and
+%% `valid_field_value/1`): a name outside visible lowercase US-ASCII, or
+%% with a `:` past a pseudo-header's leading one, is `bad_header_name`; a
+%% value with NUL, CR or LF, or leading or trailing SP or HTAB, is
+%% `bad_header_value`. Fields from the static table are valid, and a
+%% dynamic-table field was checked when its literal arrived, so a field
+%% the table repeats costs nothing more.
 %%
 %% ## Representations (RFC 7541 §6)
 %%
@@ -120,6 +125,7 @@
     | bad_integer
     | bad_string
     | bad_header_name
+    | bad_header_value
     | premature_end_of_block
     | table_size_update_after_block.
 
@@ -277,8 +283,9 @@ decode_literal_with_name(0, AfterIdx, _Ctx) ->
     %% New name — name + value both follow inline.
     maybe
         {ok, Name, AfterName} ?= decode_string(AfterIdx),
-        ok ?= validate_lower(Name),
+        ok ?= validate_name(Name),
         {ok, Value, Rest} ?= decode_string(AfterName),
+        ok ?= validate_value(Value),
         {ok, {Name, Value}, Rest}
     end;
 decode_literal_with_name(NameIdx, AfterIdx, Ctx) ->
@@ -286,6 +293,7 @@ decode_literal_with_name(NameIdx, AfterIdx, Ctx) ->
     maybe
         {ok, {Name, _}} ?= lookup(NameIdx, Ctx),
         {ok, Value, Rest} ?= decode_string(AfterIdx),
+        ok ?= validate_value(Value),
         {ok, {Name, Value}, Rest}
     end.
 
@@ -491,13 +499,19 @@ encode_string(Bin) ->
 %% Header name validation (RFC 9113 §8.2)
 %% =============================================================================
 
-%% Lowercase ASCII letter check on every byte. Pseudo-headers
-%% start with `:` (0x3A) which is below 'A' so it doesn't trigger
-%% the uppercase test; everything else must already be lowercase.
--spec validate_lower(binary()) -> ok | {error, bad_header_name}.
-validate_lower(<<>>) -> ok;
-validate_lower(<<C, _Rest/binary>>) when C >= $A, C =< $Z -> {error, bad_header_name};
-validate_lower(<<_, Rest/binary>>) -> validate_lower(Rest).
+-spec validate_name(binary()) -> ok | {error, bad_header_name}.
+validate_name(Name) ->
+    case roadrunner_http:valid_field_name(Name) of
+        true -> ok;
+        false -> {error, bad_header_name}
+    end.
+
+-spec validate_value(binary()) -> ok | {error, bad_header_value}.
+validate_value(Value) ->
+    case roadrunner_http:valid_field_value(Value) of
+        true -> ok;
+        false -> {error, bad_header_value}
+    end.
 
 %% =============================================================================
 %% Index lookup + table mutation

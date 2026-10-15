@@ -458,6 +458,30 @@ decode_oversize_entry_evicts_table_test() ->
 %% Header name validation (RFC 9113 §8.2).
 %% =============================================================================
 
+decode_invalid_literal_fields_are_rejected_test() ->
+    %% RFC 9113 §8.2.1, checked as each literal decodes: a name with SP or
+    %% a `:` past the pseudo-header colon, a value with CR, LF or NUL, or a
+    %% value that starts or ends with SP or HTAB. Literal without indexing
+    %% (0x00, new name) and with an indexed name (0x04: static `:path`).
+    Decode = fun(Bin) ->
+        roadrunner_http2_hpack:decode(Bin, roadrunner_http2_hpack:new_decoder(4096))
+    end,
+    [
+        ?assertEqual({error, bad_header_name}, Decode(<<0, (byte_size(N)), N/binary, 1, "v">>), N)
+     || N <- [~"x a", ~"x:a", ~":pa:th", <<"x", 0>>, <<"x", 16#80>>, ~""]
+    ],
+    [
+        ?assertEqual(
+            {error, bad_header_value}, Decode(<<0, 3, "x-a", (byte_size(V)), V/binary>>), V
+        )
+     || V <- [~"1\r\n2", ~"a\nb", <<"a", 0, "b">>, ~" a", ~"a ", ~"\ta", ~"a\t"]
+    ],
+    ?assertEqual({error, bad_header_value}, Decode(<<16#04, 4, "/a\r\n">>)),
+    ?assertMatch(
+        {ok, [{~":path", ~"/a b"}, {~"x-a", ~"in side"}], _},
+        Decode(<<16#04, 4, "/a b", 0, 3, "x-a", 7, "in side">>)
+    ).
+
 decode_uppercase_literal_name_is_rejected_test() ->
     %% Capital letters in literal-name fields are an HTTP/2 protocol
     %% error.

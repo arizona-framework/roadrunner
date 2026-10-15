@@ -21,10 +21,12 @@
 %% - Pseudo-headers MUST appear before regular headers; mixing is
 %%   a `protocol_error`.
 %% - Pseudo-headers other than the four defined are rejected.
-%% - `:path` MUST NOT be empty (an h2 client should send `/` for
-%%   the origin form).
-%% - Header field names MUST be lowercase — already enforced by
-%%   `roadrunner_http2_hpack:decode/2`.
+%% - `:path` is an origin-form (`/`, then US-ASCII without CTL, SP or
+%%   DEL), or `*` for OPTIONS; a well-formed CONNECT is a 501.
+%% - Field names are visible US-ASCII without uppercase or `:`, and values
+%%   hold no NUL, CR or LF and no leading or trailing SP or HTAB (RFC 9113
+%%   §8.2.1): enforced by `roadrunner_http2_hpack:decode/2` as it decodes
+%%   each literal field.
 %% - `Connection`-specific headers MUST NOT appear (RFC 9113
 %%   §8.2.2). Rejected.
 %% - `:authority` or `Host` MUST be present, neither empty, each a
