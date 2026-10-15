@@ -330,7 +330,10 @@ fast_query_byte(_Cur, _T, _PathLen, _Method, _Bin, _Max) ->
     slow.
 
 %% The version and the CRLF, with the line (without its CRLF) inside
-%% the limit.
+%% the limit. A higher HTTP/1 minor version (`HTTP/1.2` to `HTTP/1.9`) is
+%% served as HTTP/1.1, the highest minor version roadrunner implements, as
+%% RFC 9112 §2.3 asks of a recipient; HTTP-version is `DIGIT "." DIGIT`, so
+%% a longer minor stays a bad version.
 -spec fast_version(binary(), binary(), binary(), binary(), binary(), pos_integer()) ->
     {ok, binary(), binary(), binary(), version(), binary()} | slow.
 fast_version(<<"HTTP/1.1\r\n", Rest/binary>>, Method, Target, Path, Bin, Max) when
@@ -341,6 +344,10 @@ fast_version(<<"HTTP/1.0\r\n", Rest/binary>>, Method, Target, Path, Bin, Max) wh
     byte_size(Bin) - byte_size(Rest) - 2 =< Max
 ->
     {ok, Method, Target, Path, {1, 0}, Rest};
+fast_version(<<"HTTP/1.", Minor, "\r\n", Rest/binary>>, Method, Target, Path, Bin, Max) when
+    Minor >= $2, Minor =< $9, byte_size(Bin) - byte_size(Rest) - 2 =< Max
+->
+    {ok, Method, Target, Path, {1, 1}, Rest};
 fast_version(_Cur, _Method, _Target, _Path, _Bin, _Max) ->
     slow.
 

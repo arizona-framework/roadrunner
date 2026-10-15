@@ -107,6 +107,26 @@ http_11_no_dot_rejected_test() ->
         roadrunner_http1:parse_request_line(~"GET / HTTP/11\r\n")
     ).
 
+higher_http1_minor_served_as_http11_test() ->
+    %% RFC 9112 §2.3: a higher minor version within a major version the
+    %% server implements is processed as its highest one, HTTP/1.1; a
+    %% two-digit or non-digit minor is outside `DIGIT "." DIGIT`.
+    [
+        ?assertEqual(
+            {ok, ~"GET", ~"/", {1, 1}, ~"Host: x\r\n"},
+            roadrunner_http1:parse_request_line(<<"GET / HTTP/1.", M, "\r\nHost: x\r\n">>)
+        )
+     || M <- lists:seq($2, $9)
+    ],
+    [
+        ?assertEqual({error, bad_version}, roadrunner_http1:parse_request_line(Line), Line)
+     || Line <- [~"GET / HTTP/1.10\r\n", ~"GET / HTTP/1.a\r\n", ~"GET / HTTP/1.\r\n"]
+    ],
+    ?assertMatch(
+        {ok, #{version := {1, 1}}, ~""},
+        roadrunner_http1:parse_request(~"GET / HTTP/1.2\r\nHost: x\r\n\r\n")
+    ).
+
 %% --- bad request line ---
 
 empty_method_rejected_test() ->
