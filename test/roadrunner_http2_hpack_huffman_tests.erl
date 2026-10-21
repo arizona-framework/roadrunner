@@ -66,6 +66,20 @@ round_trip_byte_pairs_test() ->
         B <- lists:seq(0, 255, 17)
     ].
 
+round_trip_every_length_test() ->
+    %% Decoded bytes go out in chunks of 6 or 7, so every output length
+    %% ends at a different point in a chunk. A run of `0`s (5-bit code)
+    %% has input bytes that finish two symbols each.
+    [
+        ?assertEqual(
+            {ok, Bin},
+            roadrunner_http2_hpack_huffman:decode(roadrunner_http2_hpack_huffman:encode(Bin))
+        )
+     || Source <- [binary:copy(~"0", 40), binary:copy(~"Mozilla/5.0 (X11; Linux)", 2)],
+        Len <- lists:seq(0, 40),
+        Bin <- [binary:part(Source, 0, Len)]
+    ].
+
 round_trip_long_string_test() ->
     %% Stress test: 1024-byte random binary round-trips cleanly.
     Bin = crypto:strong_rand_bytes(1024),
