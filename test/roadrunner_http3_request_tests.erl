@@ -75,6 +75,14 @@ connect_not_implemented_test() ->
         from([{~":method", ~"CONNECT"}, {~":authority", ~"example.com:443"}])
     ).
 
+unknown_expectation_test() ->
+    %% RFC 9110 §10.1.1: an expectation other than `100-continue` gets 417.
+    ?assertEqual(
+        {error, unsupported_expectation},
+        from(base() ++ [{~"expect", ~"200-ok"}])
+    ),
+    ?assertMatch({ok, _}, from(base() ++ [{~":authority", ~"x"}, {~"expect", ~"100-continue"}])).
+
 duplicate_content_type_test() ->
     ?assertEqual(
         {error, duplicate_content_type},

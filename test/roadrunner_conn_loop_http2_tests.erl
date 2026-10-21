@@ -42,6 +42,7 @@ all_test_() ->
         fun malformed_hpack_block_triggers_goaway/0,
         fun missing_pseudo_header_rst_stream/0,
         fun connect_answered_501/0,
+        fun unknown_expectation_answered_417/0,
         fun bad_path_rst_stream/0,
         fun empty_body_response_omits_data_frame/0,
         fun stream_response_emits_data/0,
@@ -920,6 +921,44 @@ missing_pseudo_header_rst_stream() ->
     Out = expect_send(),
     ?assertMatch(<<_:24, 3, _/binary>>, Out),
     %% Conn stays alive (RST_STREAM doesn't close the connection).
+    ?assert(is_process_alive(Pid)),
+    cleanup(Pid, Ref).
+
+unknown_expectation_answered_417() ->
+    %% RFC 9110 §10.1.1: an expectation other than `100-continue` gets a
+    %% 417, as on HTTP/1.1, then RST_STREAM(NO_ERROR).
+    {ok, _} = application:ensure_all_started(telemetry),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"example.com"},
+            {~":path", ~"/"},
+            {~"expect", ~"200-ok"}
+        ],
+        roadrunner_http2_hpack:new_encoder(4096)
+    ),
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(
+            roadrunner_http2_frame:encode(
+                {headers, 1, 16#04 bor 16#01, undefined, iolist_to_binary(Hpack)}
+            )
+        )
+    ),
+    <<Len:24, 1, _Flags, _:1, 1:31, Block:Len/binary, _After/binary>> =
+        iolist_to_binary(expect_send()),
+    {ok, Decoded, _} = roadrunner_http2_hpack:decode(
+        Block, roadrunner_http2_hpack:new_decoder(4096)
+    ),
+    ?assertEqual(~"417", proplists:get_value(~":status", Decoded)),
+    ?assertMatch(<<4:24, 3, 0, _:1, 1:31, 0:32>>, iolist_to_binary(expect_send())),
     ?assert(is_process_alive(Pid)),
     cleanup(Pid, Ref).
 

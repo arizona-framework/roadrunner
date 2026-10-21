@@ -81,6 +81,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     fin_without_headers/1,
     malformed_request/1,
     connect_not_implemented/1,
+    unknown_expectation_417/1,
     data_before_headers/1,
     request_with_trailers/1,
     malformed_frame/1,
@@ -174,6 +175,7 @@ all() ->
         fin_without_headers,
         malformed_request,
         connect_not_implemented,
+        unknown_expectation_417,
         data_before_headers,
         request_with_trailers,
         malformed_frame,
@@ -1482,6 +1484,24 @@ connect_not_implemented(Config) ->
         Conn, [{~":method", ~"CONNECT"}, {~":authority", ~"localhost:443"}]
     ),
     ?assertMatch({501, _, _}, collect(Conn, StreamId)),
+    ?assertMatch({200, _, _}, get(Conn, ~"/")),
+    close(Conn).
+
+unknown_expectation_417(Config) ->
+    %% RFC 9110 §10.1.1: an expectation other than `100-continue` gets a
+    %% 417, as on HTTP/1.1, and the connection lives.
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(
+        Conn,
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"localhost"},
+            {~":path", ~"/"},
+            {~"expect", ~"200-ok"}
+        ]
+    ),
+    ?assertMatch({417, _, _}, collect(Conn, StreamId)),
     ?assertMatch({200, _, _}, get(Conn, ~"/")),
     close(Conn).
 

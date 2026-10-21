@@ -305,6 +305,28 @@ authority_rejects_malformed_values_test() ->
 
 %% --- valid_host/1 ---
 
+expectation_test_() ->
+    %% RFC 9110 §10.1.1: `100-continue` is the only expectation; members
+    %% are comma-separated, case-insensitive, OWS-padded, and may be empty.
+    [
+        ?_assertEqual(Want, roadrunner_http:expectation(Value))
+     || {Value, Want} <- [
+            {~"100-continue", continue},
+            {~"100-Continue", continue},
+            {~" 100-continue\t", continue},
+            {~"100-continue,", continue},
+            {~", 100-continue , ", continue},
+            {~"100-continue, 100-continue", continue},
+            {~"", none},
+            {~" , ,", none},
+            {~"200-ok", unsupported},
+            {~"100-continue, foo", unsupported},
+            {~"foo, 100-continue", unsupported},
+            {~"100-continue;x=1", unsupported},
+            {~"100-continuee", unsupported}
+        ]
+    ].
+
 valid_host_accepts_uri_host_and_port_test() ->
     %% RFC 9110 §7.2: `Host = uri-host [ ":" port ]`, with uri-host a
     %% reg-name (IPv4 included), an IPv6 or IPvFuture literal, and port

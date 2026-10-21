@@ -50,6 +50,7 @@ accessors that operate on it.
     valid_field_name/1,
     valid_field_value/1,
     request_content_length/1,
+    expectation/1,
     body_length_fits/3,
     build_request/7
 ]).
@@ -752,6 +753,37 @@ body_length_fits(none, _Len, _Ended) -> true;
 body_length_fits({ok, Declared}, Len, false) -> Len =< Declared;
 body_length_fits({ok, Declared}, Len, true) -> Len =:= Declared;
 body_length_fits(error, _Len, _Ended) -> false.
+
+%% What a request's `Expect` field value asks of the server (RFC 9110
+%% §10.1.1): `continue` for `100-continue`, the only expectation HTTP
+%% defines, `unsupported` when any member is something else (the server
+%% then answers 417), and `none` for an empty list. Members are
+%% comma-separated and compared case-insensitively.
+-doc false.
+-spec expectation(binary()) -> none | continue | unsupported.
+expectation(~"100-continue") -> continue;
+expectation(Value) -> expectation_members(Value, <<>>, none).
+
+-spec expectation_members(binary(), binary(), none | continue | unsupported) ->
+    none | continue | unsupported.
+expectation_members(<<$,, Rest/binary>>, Member, Acc) ->
+    case expectation_member(Member, Acc) of
+        unsupported -> unsupported;
+        Acc1 -> expectation_members(Rest, <<>>, Acc1)
+    end;
+expectation_members(<<C, Rest/binary>>, Member, Acc) ->
+    expectation_members(Rest, <<Member/binary, C>>, Acc);
+expectation_members(<<>>, Member, Acc) ->
+    expectation_member(Member, Acc).
+
+%% An empty member is allowed and ignored (RFC 9110 §5.6.1).
+-spec expectation_member(binary(), none | continue) -> none | continue | unsupported.
+expectation_member(Member, Acc) ->
+    case roadrunner_bin:ascii_lowercase(roadrunner_bin:trim_ows(Member)) of
+        <<>> -> Acc;
+        ~"100-continue" -> continue;
+        _ -> unsupported
+    end.
 
 %% The `content-length` of an HTTP/2 or HTTP/3 request, which the caller
 %% compares with the bytes its DATA frames carried (RFC 9113 §8.1.1, RFC

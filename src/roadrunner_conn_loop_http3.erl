@@ -1118,11 +1118,12 @@ dispatch_decoded(State, StreamId, Headers, Body) ->
     },
     State1 = State#h3{req_id_buffer = NewBuf},
     case build_request(Headers, Body, RequestContext) of
-        {error, not_implemented} ->
-            %% A well-formed CONNECT: roadrunner opens no tunnels, so 501
-            %% (as on HTTP/1.1), then drop the stream.
+        {error, Reason} when Reason =:= not_implemented; Reason =:= unsupported_expectation ->
+            %% A well-formed request roadrunner can't serve, answered as on
+            %% HTTP/1.1, then the stream dropped: 501 for a CONNECT (no
+            %% tunnels), 417 for an expectation other than `100-continue`.
             ok = roadrunner_http3_stream_worker:send_buffered(
-                State1#h3.conn, StreamId, 501, [], ~""
+                State1#h3.conn, StreamId, roadrunner_conn:parse_error_status(Reason), [], ~""
             ),
             drop_stream(State1, StreamId);
         {error, _} ->

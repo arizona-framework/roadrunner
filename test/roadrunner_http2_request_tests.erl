@@ -103,6 +103,29 @@ connect_is_not_implemented_test() ->
         roadrunner_http2_request:from_headers(Headers, <<>>, request_context())
     ).
 
+unknown_expectation_is_error_test_() ->
+    %% RFC 9110 §10.1.1: an expectation other than `100-continue` gets 417.
+    Base = [
+        {~":method", ~"POST"},
+        {~":scheme", ~"https"},
+        {~":authority", ~"example.com"},
+        {~":path", ~"/"}
+    ],
+    [
+        ?_assertEqual(
+            {error, unsupported_expectation},
+            roadrunner_http2_request:from_headers(
+                Base ++ [{~"expect", ~"200-ok"}], <<>>, request_context()
+            )
+        ),
+        ?_assertMatch(
+            {ok, _},
+            roadrunner_http2_request:from_headers(
+                Base ++ [{~"expect", ~"100-Continue"}], <<>>, request_context()
+            )
+        )
+    ].
+
 duplicate_content_type_is_error_test() ->
     Headers = [
         {~":method", ~"POST"},
