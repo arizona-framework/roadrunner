@@ -98,15 +98,15 @@ handshake_missing_key_test() ->
     ).
 
 handshake_missing_websocket_version_test() ->
-    %% RFC 6455 §4.2: server requires `Sec-WebSocket-Version: 13`.
-    %% Absent → reject (browsers always send it).
+    %% RFC 6455 §4.2.1: the handshake MUST carry `Sec-WebSocket-Version`.
+    %% Absent is a malformed handshake, not a version mismatch.
     Headers = [
         {~"upgrade", ~"websocket"},
         {~"connection", ~"Upgrade"},
         {~"sec-websocket-key", ~"dGhlIHNhbXBsZSBub25jZQ=="}
     ],
     ?assertEqual(
-        {error, unsupported_websocket_version},
+        {error, missing_websocket_version},
         roadrunner_ws:handshake_response(Headers, [])
     ).
 

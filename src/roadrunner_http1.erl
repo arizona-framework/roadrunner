@@ -1462,7 +1462,7 @@ cached_date_line() ->
     end.
 
 %% Common status codes, and the ones roadrunner sends on its own when
-%% it refuses a request (405, 408, 413, 414, 431, 501), get a
+%% it refuses a request (405, 408, 413, 414, 426, 431, 501), get a
 %% precomputed `HTTP/1.1 NNN Reason\r\n` binary with the RFC 9110 §15
 %% reason phrase. Other codes fall through to the empty-phrase line
 %% below.
@@ -1481,6 +1481,7 @@ status_line(405) -> ~"HTTP/1.1 405 Method Not Allowed\r\n";
 status_line(408) -> ~"HTTP/1.1 408 Request Timeout\r\n";
 status_line(413) -> ~"HTTP/1.1 413 Content Too Large\r\n";
 status_line(414) -> ~"HTTP/1.1 414 URI Too Long\r\n";
+status_line(426) -> ~"HTTP/1.1 426 Upgrade Required\r\n";
 status_line(429) -> ~"HTTP/1.1 429 Too Many Requests\r\n";
 status_line(431) -> ~"HTTP/1.1 431 Request Header Fields Too Large\r\n";
 status_line(500) -> ~"HTTP/1.1 500 Internal Server Error\r\n";

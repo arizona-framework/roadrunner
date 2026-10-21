@@ -200,9 +200,10 @@ process owning the socket. Returns `{session, MonitorRef, Pid}`
 once the handoff is complete — the caller owns the wait for the
 session's `'DOWN'` and forwards `{roadrunner_drain, _}` broadcasts
 to `Pid` (see `roadrunner_conn_loop:ws_session_wake/7`). Returns
-`rejected` when the handshake check fails (400 sent, no session
-started) or the session couldn't start (500 sent); both responses
-carry `connection: close`, so the caller just runs its normal
+`rejected` when the handshake check fails (no session started: 426
+for a `Sec-WebSocket-Version` other than 13, 400 otherwise) or the
+session couldn't start (500 sent); every one of these responses
+carries `connection: close`, so the caller just runs its normal
 close path.
 
 `Buffered` is any bytes the conn already read past the upgrade request
@@ -223,10 +224,33 @@ start(Socket, Req, Mod, State, ExtraHeaders, Buffered, ProtoOpts) ->
         {ok, Status, RespHeaders, _, Negotiated} ->
             UpgradeResp = roadrunner_http1:response(Status, RespHeaders, ~""),
             start_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts);
+        {error, unsupported_websocket_version} ->
+            _ = send_upgrade_required(Socket),
+            rejected;
         {error, _} ->
             _ = roadrunner_conn:send_bad_request(Socket),
             rejected
     end.
+
+%% RFC 6455 §4.4: a handshake asking for a version the server doesn't
+%% speak gets an error status and a `Sec-WebSocket-Version` listing the
+%% versions it does. A 426 MUST carry `Upgrade` (RFC 9110 §15.5.22), and
+%% a sender of `Upgrade` MUST list the `upgrade` connection option
+%% (RFC 9110 §7.8).
+-spec send_upgrade_required(roadrunner_transport:socket()) -> ok | {error, term()}.
+send_upgrade_required(Socket) ->
+    Resp = roadrunner_http1:response(
+        426,
+        [
+            {~"upgrade", ~"websocket"},
+            {~"sec-websocket-version", ~"13"},
+            {~"content-length", ~"0"},
+            {~"connection", ~"upgrade, close"}
+        ],
+        ~"",
+        undefined
+    ),
+    roadrunner_transport:send(Socket, Resp).
 
 -spec start_session(
     roadrunner_transport:socket(),
