@@ -22,18 +22,27 @@
 %%
 %% ## Decoding
 %%
-%% `decode(Bin)` uses a 4-bit-nibble state machine. Each state has
-%% 16 transitions; a transition either emits 0/1 bytes and lands in a
-%% new state, or rejects with `eos_in_string` (EOS symbol seen
+%% `decode(Bin)` uses a byte-wide state machine. Each state has 256
+%% transitions; a transition either emits 0, 1 or 2 bytes and lands in
+%% a new state, or rejects with `eos_in_string` (EOS symbol seen
 %% mid-string).
 %%
-%% The transitions live in one flat tuple of 16 integers per state
+%% The transitions live in one flat tuple of 256 integers per state
 %% (state 0 is the root of the prefix tree), read with
-%% `element(State * 16 + Nibble + 1, ...)`: `-1` is EOS, otherwise
-%% `Next bsl 9`, with `256 bor Byte` added when the step emits a byte.
-%% Integers instead of nested `{Next, {emit, B}}` tuples make a step
-%% one `element/2` and no allocation, 1.8-2.9x faster per string. A
-%% second tuple holds, per state, whether input may end there: pad
+%% `element(State * 256 + Byte + 1, ...)`: `-1` is EOS, otherwise
+%% `Next bsl 18 bor Count bsl 16 bor Emitted`, the `Count` emitted
+%% bytes in the low 16 bits, first byte highest. Integers instead of
+%% nested tuples make a step one `element/2` and no allocation. The
+%% table is 65536 entries (512 KB), built once at load from the 4-bit
+%% transitions of the prefix tree.
+%%
+%% Emitted bytes gather in a small integer and go out 6 or 7 at a time
+%% as one binary chunk into a nested iolist, flattened once at the
+%% end. Appending each byte to a binary cost more than walking the
+%% table; together with the byte table this is ~30% faster than a
+%% 4-bit table with a per-byte append on browser request headers.
+%%
+%% A second tuple holds, per state, whether input may end there: pad
 %% bits (all `1`s) from this point lie on the EOS path and fewer than
 %% 8 bits have been consumed since the last emitted byte.
 %%
@@ -100,41 +109,32 @@ RFC 7541 §5.2:
 """.
 -spec decode(binary()) -> {ok, binary()} | {error, decode_error()}.
 decode(Bin) ->
-    decode_loop(Bin, persistent_term:get(?DECODE_KEY), 0, <<>>).
+    decode_loop(Bin, persistent_term:get(?DECODE_KEY), 0, 0, 0, []).
 
+%% `Acc` holds the `N` bytes emitted since the last chunk, below 6, so
+%% it stays a small integer after the next step's at most 2 more.
 %% RFC 7541's Huffman codes are Kraft-equal (sum of 2^-len = 1) so
-%% the constructed tree is complete — no path through 4 nibble bits
-%% lands on an `undefined` slot. We trust that invariant and don't
-%% emit an `invalid` branch here. Similarly, no two codes are short
-%% enough to fit in a single 4-bit nibble (the shortest code is
-%% 5 bits), so a transition emits at most one byte.
--spec decode_loop(binary(), tuple(), non_neg_integer(), binary()) ->
+%% the constructed tree is complete: every byte from every state lands
+%% on a state or a leaf, and the table has no `invalid` entry.
+-spec decode_loop(binary(), tuple(), non_neg_integer(), non_neg_integer(), 0..5, iodata()) ->
     {ok, binary()} | {error, decode_error()}.
-decode_loop(<<Byte, Rest/binary>>, Table, State, Out) ->
-    case element((State bsl 4) + (Byte bsr 4) + 1, Table) of
+decode_loop(<<Byte, Rest/binary>>, Table, State, Acc, N, Out) ->
+    case element((State bsl 8) + Byte + 1, Table) of
         -1 ->
             {error, eos_in_string};
-        Hi ->
-            Out1 =
-                case Hi band 256 of
-                    0 -> Out;
-                    _ -> <<Out/binary, Hi:8>>
-                end,
-            case element(((Hi bsr 9) bsl 4) + (Byte band 16#0F) + 1, Table) of
-                -1 ->
-                    {error, eos_in_string};
-                Lo ->
-                    Out2 =
-                        case Lo band 256 of
-                            0 -> Out1;
-                            _ -> <<Out1/binary, Lo:8>>
-                        end,
-                    decode_loop(Rest, Table, Lo bsr 9, Out2)
+        Step ->
+            Count = (Step bsr 16) band 3,
+            Acc1 = (Acc bsl (Count * 8)) bor (Step band 16#FFFF),
+            case N + Count of
+                N1 when N1 >= 6 ->
+                    decode_loop(Rest, Table, Step bsr 18, 0, 0, [Out, <<Acc1:(N1 * 8)>>]);
+                N1 ->
+                    decode_loop(Rest, Table, Step bsr 18, Acc1, N1, Out)
             end
     end;
-decode_loop(<<>>, _Table, State, Out) ->
+decode_loop(<<>>, _Table, State, Acc, N, Out) ->
     case element(State + 1, persistent_term:get(?DECODE_END_KEY)) of
-        true -> {ok, Out};
+        true -> {ok, iolist_to_binary([Out, <<Acc:(N * 8)>>])};
         false -> {error, invalid_padding}
     end.
 
@@ -148,23 +148,40 @@ init_tables() ->
     Encode = build_encode_table(Codes),
     States = build_decode_table(Codes),
     persistent_term:put(?ENCODE_KEY, Encode),
-    persistent_term:put(?DECODE_KEY, flat_transitions(States)),
+    persistent_term:put(?DECODE_KEY, byte_transitions(States)),
     persistent_term:put(?DECODE_END_KEY, end_flags(States)),
     ok.
 
-%% One integer per (state, nibble); see the module comment for the
-%% encoding.
--spec flat_transitions(tuple()) -> tuple().
-flat_transitions(States) ->
+%% One integer per (state, byte), each byte being its high nibble's
+%% transition then its low nibble's; see the module comment for the
+%% encoding. No code fits in a nibble (the shortest is 5 bits), so a
+%% nibble emits at most one byte and a byte at most two.
+-spec byte_transitions(tuple()) -> tuple().
+byte_transitions(States) ->
     list_to_tuple([
-        encode_transition(element(N + 1, Trans))
-     || {Trans, _Accept, _Depth} <- tuple_to_list(States), N <- lists:seq(0, 15)
+        byte_transition(Trans, B, States)
+     || {Trans, _Accept, _Depth} <- tuple_to_list(States), B <- lists:seq(0, 255)
     ]).
 
--spec encode_transition({non_neg_integer(), none | {emit, byte()}} | eos) -> integer().
-encode_transition(eos) -> -1;
-encode_transition({Next, none}) -> Next bsl 9;
-encode_transition({Next, {emit, B}}) -> (Next bsl 9) bor 256 bor B.
+-spec byte_transition(tuple(), byte(), tuple()) -> integer().
+byte_transition(Trans, B, States) ->
+    case element((B bsr 4) + 1, Trans) of
+        eos ->
+            -1;
+        {Mid, HiEmit} ->
+            {LoTrans, _, _} = element(Mid + 1, States),
+            case element((B band 16#0F) + 1, LoTrans) of
+                eos -> -1;
+                {Next, LoEmit} -> (Next bsl 18) bor emitted(HiEmit, LoEmit)
+            end
+    end.
+
+%% `Count bsl 16 bor Emitted` for a byte's emits, first byte highest.
+-spec emitted(none | {emit, byte()}, none | {emit, byte()}) -> non_neg_integer().
+emitted({emit, A}, {emit, C}) -> (2 bsl 16) bor (A bsl 8) bor C;
+emitted({emit, A}, none) -> (1 bsl 16) bor A;
+emitted(none, {emit, C}) -> (1 bsl 16) bor C;
+emitted(none, none) -> 0.
 
 %% RFC 7541 §5.2: input may end in a state only when it is accepting
 %% (pad bits along the EOS path) and its depth, the bits consumed since
