@@ -43,6 +43,11 @@ static_index_2_is_age_test() ->
     ?assertEqual({ok, [{~"age", ~"0"}]}, ?M:decode(indexed_section(2))),
     ?assertEqual(indexed_section(2), enc([{~"age", ~"0"}])).
 
+%% RFC 9204 §4.5.4: a Literal with Name Reference may set N (never index,
+%% `01N1xxxx`); it decodes the same as with N clear.
+name_reference_never_indexed_test() ->
+    ?assertEqual({ok, [{~":path", ~"/ab"}]}, ?M:decode(<<0, 0, 16#71, 3, "/ab">>)).
+
 %% A name absent from the table encodes as a Literal with Literal Name.
 literal_literal_name_test() ->
     H = [{~"x-totally-unknown", ~"value"}],

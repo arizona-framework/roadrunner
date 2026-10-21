@@ -155,8 +155,9 @@ decode_field_line(<<B, Rest/binary>>) when B >= 2#11000000 ->
         {ok, Entry} ?= static_indexed(Index),
         {ok, Entry, Rest1}
     end;
-decode_field_line(<<B, Rest/binary>>) when B band 2#11110000 =:= 2#01010000 ->
-    %% 0101xxxx — Literal Field Line with Name Reference, static. 4-bit index.
+decode_field_line(<<B, Rest/binary>>) when B band 2#11010000 =:= 2#01010000 ->
+    %% 01N1xxxx — Literal Field Line with Name Reference, static. 4-bit
+    %% index. N (never index) only matters to intermediaries.
     maybe
         {ok, Index, AfterIndex} ?= integer(B band 16#0F, 16#0F, Rest),
         {ok, Name} ?= static_name(Index),
