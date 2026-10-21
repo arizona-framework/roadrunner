@@ -125,6 +125,63 @@ decode_second_field_line_error_propagates_test() ->
     ?assertEqual({error, {qpack, dynamic_field_line, 16#80}}, ?M:decode(Section)).
 
 %% =============================================================================
+%% Field lines matched in the clause heads vs through decode_field_line/1.
+%% =============================================================================
+
+%% Integers within their prefix or one continuation byte take the inline
+%% clauses; longer ones take `decode_field_line/1`. Every line form decodes
+%% the same either way, with N set or clear, plain or Huffman.
+field_line_lengths_agree_test() ->
+    [
+        begin
+            Name = binary:copy(~"n", NameLen),
+            Value = binary:copy(~"v", ValueLen),
+            NameRef = <<(name_ref_prefix(1, N))/binary, (str(H, Value))/binary>>,
+            ?assertEqual({ok, [{~":path", Value}]}, ?M:decode(<<0, 0, NameRef/binary>>)),
+            LitName = <<(literal_name(N, H, Name))/binary, (str(H, Value))/binary>>,
+            ?assertEqual({ok, [{Name, Value}]}, ?M:decode(<<0, 0, LitName/binary>>))
+        end
+     || N <- [0, 1],
+        H <- [0, 1],
+        NameLen <- [1, 6, 7, 30, 134, 135, 300],
+        ValueLen <- [0, 126, 127, 300]
+    ],
+    %% Static indexes past the 6-bit prefix (one continuation byte).
+    ?assertEqual({ok, [{~"x-frame-options", ~"sameorigin"}]}, ?M:decode(indexed_section(98))).
+
+inline_field_line_errors_test() ->
+    BadHuff = <<2#10000001, 16#FF>>,
+    ?assertEqual(
+        {error, {qpack, invalid_static_index, 100}}, ?M:decode(indexed_section(100))
+    ),
+    ?assertEqual(
+        {error, {qpack, invalid_static_index, 100}},
+        ?M:decode(<<0, 0, (name_ref_prefix(100))/binary, 1, "x">>)
+    ),
+    ?assertEqual(
+        {error, {qpack, huffman}}, ?M:decode(<<0, 0, (name_ref_prefix(1))/binary, BadHuff/binary>>)
+    ),
+    ?assertEqual(
+        {error, {qpack, huffman}}, ?M:decode(<<0, 0, 2#00101001, 16#FF, 1, "x">>)
+    ),
+    ?assertEqual(
+        {error, {qpack, huffman}}, ?M:decode(<<0, 0, 2#00100001, "x", BadHuff/binary>>)
+    ),
+    %% A good line, then a dynamic one: the error from the tail surfaces.
+    [
+        ?assertEqual(
+            {error, {qpack, dynamic_field_line, 16#80}}, ?M:decode(<<0, 0, Line/binary, 16#80>>)
+        )
+     || Line <- [
+            indexed_prefix_bin(98),
+            <<(name_ref_prefix(1))/binary, 1, "x">>,
+            <<(name_ref_prefix(1))/binary, (str(0, binary:copy(~"v", 200)))/binary>>,
+            <<2#00100001, "x", 1, "y">>,
+            <<(literal_name(0, 0, binary:copy(~"n", 300)))/binary, 1, "y">>
+        ]
+    ].
+
+%% =============================================================================
 %% Helpers
 %% =============================================================================
 
@@ -144,4 +201,30 @@ indexed_prefix(Index) ->
 
 %% The leading bytes of a Literal Field Line with Name Reference (static).
 name_ref_prefix(Index) ->
-    iolist_to_binary(roadrunner_http2_hpack:encode_integer(4, 2#01010000, Index)).
+    name_ref_prefix(Index, 0).
+
+name_ref_prefix(Index, N) ->
+    iolist_to_binary(roadrunner_http2_hpack:encode_integer(4, 2#01010000 bor (N bsl 5), Index)).
+
+indexed_prefix_bin(Index) ->
+    iolist_to_binary(indexed_prefix(Index)).
+
+%% Literal with Literal Name: `001NH` + 3-bit name length, then the name.
+literal_name(N, H, Name) ->
+    Body = string_body(H, Name),
+    Prefix = 2#00100000 bor (N bsl 4) bor (H bsl 3),
+    <<
+        (iolist_to_binary(roadrunner_http2_hpack:encode_integer(3, Prefix, byte_size(Body))))/binary,
+        Body/binary
+    >>.
+
+%% A string: H bit + 7-bit-prefix length, then the octets.
+str(H, Value) ->
+    Body = string_body(H, Value),
+    <<
+        (iolist_to_binary(roadrunner_http2_hpack:encode_integer(7, H bsl 7, byte_size(Body))))/binary,
+        Body/binary
+    >>.
+
+string_body(0, Bin) -> Bin;
+string_body(1, Bin) -> roadrunner_http2_hpack_huffman:encode(Bin).
