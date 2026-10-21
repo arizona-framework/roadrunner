@@ -842,6 +842,63 @@ decode_indexed_name_then_truncated_value_test() ->
         roadrunner_http2_hpack:decode(Bin, Ctx)
     ).
 
+decode_literal_inline_and_prefixed_lengths_agree_test() ->
+    %% Every literal form, with lengths that fit the 7-bit prefix (decoded
+    %% in the clause head) and lengths that need a continuation byte
+    %% (decoded through the generic clauses), plain and Huffman. Only the
+    %% incremental-indexing forms (0x40) add the field to the table.
+    Str = fun
+        (V, plain) -> encode_string(0, V);
+        (V, huffman) -> encode_string(1, iolist_to_binary(roadrunner_http2_hpack_huffman:encode(V)))
+    end,
+    [
+        begin
+            Value = binary:copy(~"v", ValueLen),
+            Name = binary:copy(~"n", NameLen),
+            IndexedName = <<(First bor 4), (Str(Value, Mode))/binary>>,
+            NewName = <<First, (Str(Name, Mode))/binary, (Str(Value, Mode))/binary>>,
+            Added = 1 - (First bsr 6),
+            {ok, [{~":path", Value}], Ctx1} = decode(IndexedName),
+            {ok, [{Name, Value}], Ctx2} = decode(NewName),
+            ?assertEqual({1 - Added, 1 - Added}, {length(dyn(Ctx1)), length(dyn(Ctx2))}, First)
+        end
+     || First <- [16#40, 16#00, 16#10],
+        Mode <- [plain, huffman],
+        {NameLen, ValueLen} <- [{3, 5}, {3, 200}, {200, 5}]
+    ].
+
+decode_literal_with_dynamic_name_index_past_prefix_test() ->
+    %% Name index 63 (dynamic entry 2) is past the 6-bit prefix, so it
+    %% takes the generic clause; 0x0F + 48 does the same for a literal
+    %% without indexing.
+    Push = <<16#40, 1, "a", 1, "1", 16#40, 1, "b", 1, "2">>,
+    {ok, _, Ctx} = decode(Push),
+    ?assertMatch(
+        {ok, [{~"a", ~"x"}], _}, roadrunner_http2_hpack:decode(<<16#7F, 0, 1, "x">>, Ctx)
+    ),
+    ?assertMatch(
+        {ok, [{~"a", ~"y"}], _}, roadrunner_http2_hpack:decode(<<16#0F, 48, 1, "y">>, Ctx)
+    ).
+
+decode_inline_literal_errors_test() ->
+    %% The errors of the inline literal clauses, in the generic clauses'
+    %% order: index, then Huffman, then the field checks.
+    BadHuff = <<16#18, 16#FF, 16#FF, 16#FF, 16#FF>>,
+    Huff = <<(16#80 bor byte_size(BadHuff)), BadHuff/binary>>,
+    ?assertEqual({error, invalid_index}, decode(<<16#7E, 1, "x">>)),
+    ?assertEqual({error, huffman_decode_error}, decode(<<16#44, Huff/binary>>)),
+    ?assertEqual({error, huffman_decode_error}, decode(<<16#04, Huff/binary>>)),
+    ?assertEqual({error, huffman_decode_error}, decode(<<16#40, Huff/binary, 1, "x">>)),
+    ?assertEqual({error, huffman_decode_error}, decode(<<16#00, 1, "x", Huff/binary>>)),
+    ?assertEqual({error, bad_header_value}, decode(<<16#44, 2, "a\n">>)),
+    ?assertEqual({error, bad_header_name}, decode(<<16#40, 1, "X", 1, "x">>)),
+    ?assertEqual({error, bad_header_value}, decode(<<16#10, 1, "x", 2, "a\n">>)),
+    %% A literal followed by a malformed one surfaces the second error.
+    ?assertEqual({error, invalid_index}, decode(<<16#44, 1, "/", 16#80>>)),
+    ?assertEqual({error, invalid_index}, decode(<<16#40, 1, "x", 1, "y", 16#80>>)),
+    ?assertEqual({error, invalid_index}, decode(<<16#04, 1, "/", 16#80>>)),
+    ?assertEqual({error, invalid_index}, decode(<<16#00, 1, "x", 1, "y", 16#80>>)).
+
 decode_string_with_overflow_length_is_error_test() ->
     %% String length integer overflows (9 cont bytes with high bit
     %% set). Bubbles up via `decode_string`'s integer error branch.
@@ -959,3 +1016,13 @@ dyn(Ctx) ->
 
 ctx_size(Ctx) ->
     element(3, Ctx).
+
+decode(Bin) ->
+    roadrunner_http2_hpack:decode(Bin, roadrunner_http2_hpack:new_decoder(4096)).
+
+%% A string with its H bit and length, the length past the 7-bit prefix
+%% as a continuation byte (lengths here stay below 255).
+encode_string(H, Bin) when byte_size(Bin) < 127 ->
+    <<H:1, (byte_size(Bin)):7, Bin/binary>>;
+encode_string(H, Bin) ->
+    <<H:1, 127:7, (byte_size(Bin) - 127), Bin/binary>>.
