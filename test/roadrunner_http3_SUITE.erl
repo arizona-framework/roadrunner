@@ -52,6 +52,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     expect_continue_gets_interim_100/1,
     expect_continue_without_length_gets_interim_100/1,
     expect_continue_over_the_cap_gets_413/1,
+    expect_continue_unrepresentable_length_resets/1,
     route_body_cap_raises/1,
     route_body_cap_lowers/1,
     route_body_cap_expect_continue/1,
@@ -146,6 +147,7 @@ all() ->
         expect_continue_gets_interim_100,
         expect_continue_without_length_gets_interim_100,
         expect_continue_over_the_cap_gets_413,
+        expect_continue_unrepresentable_length_resets,
         route_body_cap_raises,
         route_body_cap_lowers,
         route_body_cap_expect_continue,
@@ -734,6 +736,20 @@ expect_continue_over_the_cap_gets_413(_Config) ->
         close(Conn),
         roadrunner_listener:stop(Name)
     end.
+
+expect_continue_unrepresentable_length_resets(Config) ->
+    %% A `content-length` past 2^63 - 1 is malformed (RFC 9114 §4.1.2): the
+    %% stream is reset with H3_MESSAGE_ERROR, and no 100 asks for its body.
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(
+        Conn,
+        headers(~"POST", ~"/echo") ++
+            [{~"content-length", ~"99999999999999999999"}, {~"expect", ~"100-continue"}],
+        false
+    ),
+    ?assertEqual({error, {stream_reset, 16#10e}}, collect(Conn, StreamId)),
+    ?assertMatch({200, _, _}, get(Conn, ~"/")),
+    close(Conn).
 
 route_body_cap_raises(_Config) ->
     %% `/up` raises the 8-byte listener cap to 64: a body past the listener's

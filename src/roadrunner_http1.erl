@@ -32,6 +32,7 @@
 -define(MAX_CHUNK_HEADER, 8192).
 
 -include("roadrunner_swar.hrl").
+-include("roadrunner_length.hrl").
 
 %% `binary:match/2` accepts a pre-compiled pattern (`binary:cp()`), and
 %% the compile cost is non-trivial. Microbench (OTP 29.0, single-byte
@@ -1327,6 +1328,9 @@ parse_chunk_size_line_slow(Bin) ->
 %% the line's length either way.
 -spec chunk_size(binary(), non_neg_integer(), boolean()) ->
     {ok, non_neg_integer(), binary()} | more | error.
+chunk_size(_Bin, Acc, _Any) when Acc > ?MAX_DECLARED_LENGTH ->
+    %% No chunk can be that large: malformed (400), not over the cap (413).
+    error;
 chunk_size(<<C, R/binary>>, Acc, _Any) when C >= $0, C =< $9 ->
     chunk_size(R, Acc * 16 + (C - $0), true);
 chunk_size(<<C, R/binary>>, Acc, _Any) when C >= $a, C =< $f ->

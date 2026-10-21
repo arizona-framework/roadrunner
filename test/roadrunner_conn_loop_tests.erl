@@ -141,6 +141,31 @@ bad_request_writes_400_then_exits_test() ->
     ?assertMatch(<<"HTTP/1.1 400", _/binary>>, Sent),
     Sink ! stop.
 
+unrepresentable_length_writes_400_then_exits_test_() ->
+    %% A Content-Length or chunk size past 2^63 - 1 is malformed framing:
+    %% 400, not the 413 a real body over the cap gets.
+    [
+        {spawn, fun() ->
+            Self = self(),
+            Tag = make_ref(),
+            Sink = spawn_active_sink_with_send_log(Self, Tag, Bin),
+            {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, fake_opts(huge_len_400)),
+            Ref = monitor(process, Pid),
+            Pid ! shoot,
+            receive
+                {'DOWN', Ref, process, Pid, normal} -> ok
+            after 2000 -> error(no_normal_exit)
+            end,
+            Sent = iolist_to_binary(collect_sends(Tag, 100)),
+            ?assertMatch(<<"HTTP/1.1 400", _/binary>>, Sent),
+            Sink ! stop
+        end}
+     || Bin <- [
+            ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999999999999\r\n\r\n",
+            ~"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF0\r\nhello\r\n0\r\n\r\n"
+        ]
+    ].
+
 oversized_request_line_writes_414_then_exits_test() ->
     %% A request line past the 8192-byte cap is `request_line_too_long`,
     %% which answers 414 URI Too Long (RFC 9110 §15.5.15), not a generic

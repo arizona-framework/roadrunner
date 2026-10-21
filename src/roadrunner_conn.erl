@@ -900,11 +900,14 @@ route_body_cap({handler, _Mod, _Pipeline, _State}, _Headers, Default) ->
 %% `content-length` already over its route's body cap, the 413 its body would
 %% earn anyway (the route looked up only then); `continue` when it otherwise
 %% expects `100-continue`, the 100
-%% that asks for the body; `none` when it expects nothing. HTTP/1.1 decides
+%% that asks for the body; `malformed` when it expects `100-continue` with a
+%% `content-length` that isn't one valid length (repeated, not digits, or
+%% past 2^63 - 1), a malformed request (RFC 9113 §8.1.1, RFC 9114 §4.1.2)
+%% that gets no 100; `none` when it expects nothing. HTTP/1.1 decides
 %% from the request's framing instead (`roadrunner_conn_loop:expect_answer/4`).
 -doc false.
 -spec expect_answer(proto_opts(), roadrunner_http:headers(), non_neg_integer()) ->
-    none | continue | too_large.
+    none | continue | too_large | malformed.
 expect_answer(ProtoOpts, Headers, MaxCL) ->
     case lists:keyfind(~"expect", 1, Headers) of
         {_, Expect} ->
@@ -920,8 +923,10 @@ expect_answer(ProtoOpts, Headers, MaxCL) ->
                     end;
                 false ->
                     none;
-                _ ->
-                    continue
+                none ->
+                    continue;
+                error ->
+                    malformed
             end;
         false ->
             none

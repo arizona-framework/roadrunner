@@ -99,6 +99,7 @@ all_test_() ->
         fun over_max_concurrent_streams_refused/0,
         fun expect_continue_gets_interim_100/0,
         fun expect_continue_over_the_cap_gets_413/0,
+        fun expect_continue_unrepresentable_length_resets/0,
         fun other_expectation_gets_no_interim/0,
         fun over_inflight_ceiling_refused_and_throttled/0,
         fun reset_stream_releases_inflight_slot/0,
@@ -2213,6 +2214,17 @@ expect_continue_over_the_cap_gets_413() ->
             {ok, {data, 1, _, _, _}, More} -> More
         end,
     ?assertMatch({ok, {rst_stream, 1, no_error}, _}, roadrunner_http2_frame:parse(Rst, 16384)),
+    cleanup(Pid, Ref).
+
+expect_continue_unrepresentable_length_resets() ->
+    %% A `content-length` past 2^63 - 1 is malformed (RFC 9113 §8.1.1): the
+    %% stream is reset with PROTOCOL_ERROR, and no 100 asks for its body.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    serve_recv(ConnPid, post_headers(1, ~"99999999999999999999", ~"100-continue")),
+    ?assertMatch(
+        {ok, {rst_stream, 1, protocol_error}, _},
+        roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
     cleanup(Pid, Ref).
 
 other_expectation_gets_no_interim() ->
