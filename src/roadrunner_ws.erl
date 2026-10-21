@@ -175,6 +175,7 @@ accept_key(Key) when is_binary(Key) ->
         missing_websocket_upgrade
         | missing_connection_upgrade
         | missing_websocket_key
+        | missing_websocket_version
         | unsupported_websocket_version}.
 handshake_response(Headers, Extra) when is_list(Headers) ->
     case validate_upgrade(Headers) of
@@ -227,6 +228,7 @@ handler_headers([H | T]) -> [H | handler_headers(T)].
         missing_websocket_upgrade
         | missing_connection_upgrade
         | missing_websocket_key
+        | missing_websocket_version
         | unsupported_websocket_version}.
 validate_upgrade(Headers) ->
     %% RFC 9110 §7.8 — upgrade tokens are case-insensitive. Browsers
@@ -276,13 +278,14 @@ collect_upgrade_headers([{~"sec-websocket-key", V} | Rest]) ->
 collect_upgrade_headers([_ | Rest]) ->
     collect_upgrade_headers(Rest).
 
-%% RFC 6455 §4.1 / §4.2.2: server MUST accept only `Sec-WebSocket-
-%% Version: 13`. Other versions (or missing) → 400. Older drafts
-%% (e.g. version 8 / hybi-08) need a different handshake; we don't
-%% implement them.
+%% RFC 6455 §4.1 / §4.2.2: version 13 is the only one RFC 6455 defines;
+%% older drafts (e.g. version 8 / hybi-08) need a different handshake,
+%% which we don't implement. A missing header is a malformed handshake
+%% (400, §4.2.1); any other version gets the §4.4 version-mismatch answer.
 -spec validate_version(binary() | undefined) ->
-    ok | {error, unsupported_websocket_version}.
+    ok | {error, missing_websocket_version | unsupported_websocket_version}.
 validate_version(~"13") -> ok;
+validate_version(undefined) -> {error, missing_websocket_version};
 validate_version(_) -> {error, unsupported_websocket_version}.
 
 -spec is_websocket_upgrade(binary() | undefined) -> boolean().

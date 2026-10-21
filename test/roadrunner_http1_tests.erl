@@ -1359,6 +1359,7 @@ response_status_reason_phrases_test_() ->
         {408, ~"Request Timeout"},
         {413, ~"Content Too Large"},
         {414, ~"URI Too Long"},
+        {426, ~"Upgrade Required"},
         {431, ~"Request Header Fields Too Large"},
         {500, ~"Internal Server Error"},
         {501, ~"Not Implemented"},

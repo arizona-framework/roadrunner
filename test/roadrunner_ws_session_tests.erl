@@ -46,6 +46,31 @@ start_with_bad_handshake_still_returns_400_test() ->
     ?assertNotEqual(nomatch, binary:match(Sent, ~"400")),
     ?assertEqual(nomatch, binary:match(Sent, ~"101")).
 
+start_with_unsupported_version_sends_426_test() ->
+    %% RFC 6455 §4.4: an unsupported `Sec-WebSocket-Version` aborts the
+    %% handshake with an error status and a `Sec-WebSocket-Version`
+    %% header naming the versions the server speaks; a 426 also MUST
+    %% carry `Upgrade` (RFC 9110 §15.5.22).
+    Tag = make_ref(),
+    Self = self(),
+    Sink = spawn_send_log_sink(Self, Tag),
+    #{headers := Headers} = Req0 = upgrade_req(),
+    Req = Req0#{
+        headers := lists:keystore(
+            ~"sec-websocket-version", 1, Headers, {~"sec-websocket-version", ~"8"}
+        )
+    },
+    rejected = roadrunner_ws_session:start(
+        {fake, Sink}, Req, roadrunner_ws_echo_handler, undefined, [], <<>>, ws_proto_opts()
+    ),
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    Sink ! stop,
+    ?assertMatch(<<"HTTP/1.1 426 Upgrade Required\r\n", _/binary>>, Sent),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"\r\nsec-websocket-version: 13\r\n")),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"\r\nupgrade: websocket\r\n")),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"\r\nconnection: upgrade, close\r\n")),
+    ?assertEqual(nomatch, binary:match(Sent, ~"101")).
+
 ws_buffer_opt_applied_before_101_test() ->
     %% `ws.recv_buffer` set: the session must resize the socket's inet
     %% `buffer` while the conn still owns the socket — i.e. the setopts
