@@ -1127,9 +1127,15 @@ finalize_headers(
 -spec await_body(stream_id(), roadrunner_http:headers(), #loop{}) -> no_return().
 await_body(StreamId, Headers, #loop{proto_opts = ProtoOpts, max_content_length = MaxCL} = State) ->
     case roadrunner_conn:expect_answer(ProtoOpts, Headers, MaxCL) of
-        too_large -> reject_too_large(State, StreamId);
-        continue -> body_wanted(StreamId, State);
-        none -> body_follows(StreamId, State)
+        too_large ->
+            reject_too_large(State, StreamId);
+        malformed ->
+            _ = send_rst_stream(State, StreamId, protocol_error),
+            frame_loop(remove_stream(State, StreamId));
+        continue ->
+            body_wanted(StreamId, State);
+        none ->
+            body_follows(StreamId, State)
     end.
 
 %% A body expected with `100-continue`, to be asked for.

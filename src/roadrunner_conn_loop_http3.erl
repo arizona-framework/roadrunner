@@ -488,6 +488,8 @@ answer_expectation(
     case {roadrunner_conn:expect_answer(ProtoOpts, Headers, MaxLen), Mode} of
         {too_large, _} ->
             refuse_request(State, StreamId, Stream0, false, 413, ~"Payload Too Large");
+        {malformed, _} ->
+            reset_and_drop(State, StreamId, ?H3_MESSAGE_ERROR);
         {continue, auto} ->
             send_continue(State, StreamId);
         {none, auto} ->

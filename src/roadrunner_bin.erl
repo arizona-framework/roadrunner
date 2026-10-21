@@ -12,6 +12,7 @@
 -export([append/2, ascii_lowercase/1, digits_to_integer/1, trim_ows/1, trim_trailing_ows/1]).
 
 -include("roadrunner_swar.hrl").
+-include("roadrunner_length.hrl").
 
 -doc """
 Fast ASCII-only lowercase. Bytes in `[A-Z]` are mapped to `[a-z]`;
@@ -224,11 +225,15 @@ server that reads them while an upstream proxy does not is a request
 smuggling risk. A sign can only appear as the first byte, so checking
 that byte is enough; `binary_to_integer/1` rejects every other
 non-digit.
+
+A value past 2^63 - 1 is rejected too: no length or count a peer sends
+can be that large, so it is malformed rather than merely over a cap.
 """.
 -spec digits_to_integer(binary()) -> {ok, non_neg_integer()} | error.
 digits_to_integer(<<C, _/binary>> = Bin) when C >= $0, C =< $9 ->
     try binary_to_integer(Bin) of
-        N -> {ok, N}
+        N when N =< ?MAX_DECLARED_LENGTH -> {ok, N};
+        _ -> error
     catch
         error:badarg -> error
     end;

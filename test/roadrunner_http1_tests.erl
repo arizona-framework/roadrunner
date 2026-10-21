@@ -1061,6 +1061,29 @@ chunk_single_test() ->
         roadrunner_http1:parse_chunk(~"5\r\nhello\r\n")
     ).
 
+chunk_size_past_largest_length_rejected_test_() ->
+    %% A chunk size past 2^63 - 1 can't describe a chunk anyone sends: it is
+    %% malformed (400), not a body over the cap (413). Leading zeros past the
+    %% fast path's 15 digits still parse.
+    [
+        ?_assertEqual(
+            {error, bad_chunk_size},
+            roadrunner_http1:parse_chunk(~"FFFFFFFFFFFFFFFF0\r\nhello\r\n0\r\n\r\n")
+        ),
+        ?_assertEqual(
+            {error, bad_chunk_size},
+            roadrunner_http1:parse_chunk(~"8000000000000000\r\nhello\r\n")
+        ),
+        ?_assertEqual(
+            {ok, ~"hello", ~""},
+            roadrunner_http1:parse_chunk(~"00000000000000005\r\nhello\r\n")
+        ),
+        ?_assertMatch(
+            {more, _},
+            roadrunner_http1:parse_chunk(~"7FFFFFFFFFFFFFFF\r\nhello")
+        )
+    ].
+
 chunk_lowercase_hex_size_test() ->
     %% 0xa = 10
     ?assertEqual(
@@ -1307,12 +1330,14 @@ chunk_size_with_only_ext_rejected_test() ->
         roadrunner_http1:parse_chunk(~";ext=value\r\nhello\r\n")
     ).
 
+%% The size line's length cap, reached through a long extension: a long
+%% run of digits is refused sooner, as a size past 2^63 - 1.
 chunk_oversized_header_no_crlf_rejected_test() ->
-    Big = binary:copy(~"a", 8200),
+    Big = <<"5;", (binary:copy(~"a", 8200))/binary>>,
     ?assertEqual({error, bad_chunk}, roadrunner_http1:parse_chunk(Big)).
 
 chunk_oversized_header_with_crlf_rejected_test() ->
-    Big = <<(binary:copy(~"a", 8193))/binary, "\r\n">>,
+    Big = <<"5;", (binary:copy(~"a", 8193))/binary, "\r\n">>,
     ?assertEqual({error, bad_chunk}, roadrunner_http1:parse_chunk(Big)).
 
 chunk_missing_crlf_after_data_rejected_test() ->
