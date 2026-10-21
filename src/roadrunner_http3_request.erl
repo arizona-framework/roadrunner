@@ -51,6 +51,7 @@
     | bad_field_name
     | bad_field_value
     | duplicate_content_type
+    | unsupported_expectation
     | content_length_mismatch
     | missing_authority
     | duplicate_host
@@ -114,7 +115,7 @@ build(Headers, Body, #{scheme := Scheme} = RequestContext, CheckLength) ->
 %% the hot path branch-friendly: the BEAM compiles the literal-binary
 %% clauses to a hash/select, no `lists:member` call per header.
 -spec check_banned(roadrunner_http:headers()) ->
-    ok | {error, connection_specific_header | duplicate_content_type}.
+    ok | {error, connection_specific_header | duplicate_content_type | unsupported_expectation}.
 check_banned([]) ->
     ok;
 check_banned([{~"connection", _} | _]) ->
@@ -137,6 +138,12 @@ check_banned([{~"content-type", _} | Rest]) ->
     case lists:keymember(~"content-type", 1, Rest) of
         true -> {error, duplicate_content_type};
         false -> check_banned(Rest)
+    end;
+check_banned([{~"expect", Expect} | Rest]) ->
+    %% An expectation other than `100-continue` is a 417 (RFC 9110 §10.1.1).
+    case roadrunner_http:expectation(Expect) of
+        unsupported -> {error, unsupported_expectation};
+        _ -> check_banned(Rest)
     end;
 check_banned([_ | Rest]) ->
     check_banned(Rest).

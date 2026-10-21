@@ -928,7 +928,7 @@ check_cls_consistent(_, _) -> error.
 %% Header names are already lowercased by `parse_header/1`; this pass
 %% also lowercases the value of `Connection` (whose tokens are
 %% case-insensitive per RFC 9110) and computes booleans for
-%% `Transfer-Encoding: chunked` and `Expect: 100-continue`.
+%% `Transfer-Encoding: chunked` and what `Expect` asks for.
 %%
 %% Reusing the cached values avoids ~3 lowercase scans per request on
 %% the hot path measured via `scripts/stress.escript --profile`.
@@ -938,7 +938,7 @@ compute_cached_decisions(Headers) ->
     compute_cached_decisions_loop(Headers, #{
         is_chunked => false,
         has_transfer_encoding => false,
-        expects_continue => false,
+        expectation => none,
         connection_lower => ~"",
         content_length => none,
         has_host => false,
@@ -966,15 +966,16 @@ compute_cached_decisions_loop([{~"transfer-encoding", V} | Rest], Acc) ->
             _ -> Acc#{has_transfer_encoding := true}
         end,
     compute_cached_decisions_loop(Rest, Acc1);
-compute_cached_decisions_loop([{~"expect", ~"100-continue"} | Rest], Acc) ->
-    compute_cached_decisions_loop(Rest, Acc#{expects_continue := true});
-compute_cached_decisions_loop([{~"expect", V} | Rest], Acc) ->
-    Acc1 =
-        case roadrunner_bin:ascii_lowercase(V) of
-            ~"100-continue" -> Acc#{expects_continue := true};
-            _ -> Acc
+compute_cached_decisions_loop([{~"expect", V} | Rest], #{expectation := Was} = Acc) ->
+    %% Every `Expect` line counts: one unsupported member anywhere makes
+    %% the whole request's expectation unsupported.
+    Expectation =
+        case {Was, roadrunner_http:expectation(V)} of
+            {unsupported, _} -> unsupported;
+            {continue, none} -> continue;
+            {_, This} -> This
         end,
-    compute_cached_decisions_loop(Rest, Acc1);
+    compute_cached_decisions_loop(Rest, Acc#{expectation := Expectation});
 compute_cached_decisions_loop([{~"connection", ~"keep-alive"} | Rest], Acc) ->
     compute_cached_decisions_loop(Rest, Acc#{connection_lower := ~"keep-alive"});
 compute_cached_decisions_loop([{~"connection", ~"close"} | Rest], Acc) ->
@@ -1042,7 +1043,8 @@ a record, so callers don't need to include a header file.
         | missing_host
         | duplicate_host
         | bad_host
-        | duplicate_content_type}.
+        | duplicate_content_type
+        | unsupported_expectation}.
 parse_request(Bin) ->
     parse_request(
         Bin, {?MAX_REQUEST_LINE, ?MAX_HEADER_LINE, ?MAX_HEADER_BLOCK, ?MAX_HEADER_COUNT}
@@ -1072,7 +1074,8 @@ The conn loop passes the listener's configured `http1_*` limits;
         | missing_host
         | duplicate_host
         | bad_host
-        | duplicate_content_type}.
+        | duplicate_content_type
+        | unsupported_expectation}.
 parse_request(Bin, {MaxReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}) when is_binary(Bin) ->
     maybe
         {ok, Method, RawTarget, RawPath, Version, Rest} ?= parse_request_line_p(Bin, MaxReqLine),
@@ -1080,6 +1083,7 @@ parse_request(Bin, {MaxReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}) when is_b
         Decisions = compute_cached_decisions(RawHeaders),
         ok ?= validate_host(Version, Decisions),
         ok ?= validate_content_type(Decisions),
+        ok ?= validate_expectation(Decisions),
         {Target, Path, Headers} = origin_form(RawTarget, RawPath, RawHeaders),
         Req = #{
             method => Method,
@@ -1116,6 +1120,14 @@ origin_form(Target, _Path, Headers) ->
     ok | {error, duplicate_content_type}.
 validate_content_type(#{has_content_type := multiple}) -> {error, duplicate_content_type};
 validate_content_type(_Decisions) -> ok.
+
+%% An `Expect` asking for anything but `100-continue` is a 417 (RFC 9110
+%% §10.1.1): the server can't meet it, and going on would leave the client
+%% thinking it was met.
+-spec validate_expectation(roadrunner_req:cached_decisions()) ->
+    ok | {error, unsupported_expectation}.
+validate_expectation(#{expectation := unsupported}) -> {error, unsupported_expectation};
+validate_expectation(_Decisions) -> ok.
 
 %% RFC 9112 §3.2 / 7230 §5.4: HTTP/1.1 requests MUST include a Host
 %% header. Absence is a 400 Bad Request, also a request-smuggling
@@ -1481,6 +1493,7 @@ status_line(405) -> ~"HTTP/1.1 405 Method Not Allowed\r\n";
 status_line(408) -> ~"HTTP/1.1 408 Request Timeout\r\n";
 status_line(413) -> ~"HTTP/1.1 413 Content Too Large\r\n";
 status_line(414) -> ~"HTTP/1.1 414 URI Too Long\r\n";
+status_line(417) -> ~"HTTP/1.1 417 Expectation Failed\r\n";
 status_line(426) -> ~"HTTP/1.1 426 Upgrade Required\r\n";
 status_line(429) -> ~"HTTP/1.1 429 Too Many Requests\r\n";
 status_line(431) -> ~"HTTP/1.1 431 Request Header Fields Too Large\r\n";

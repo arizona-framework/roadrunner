@@ -1632,10 +1632,12 @@ dispatch_request(
                             frame_loop(remove_stream(StateBuf, StreamId))
                     end
             end;
-        {error, not_implemented} ->
-            %% A well-formed CONNECT: roadrunner opens no tunnels, so 501
-            %% (as on HTTP/1.1), then close the stream.
-            State1 = encode_and_send_response_atomic(State, StreamId, 501, [], ~"", 0),
+        {error, Reason} when Reason =:= not_implemented; Reason =:= unsupported_expectation ->
+            %% A well-formed request roadrunner can't serve, answered as on
+            %% HTTP/1.1, then the stream closed: 501 for a CONNECT (no
+            %% tunnels), 417 for an expectation other than `100-continue`.
+            Status = roadrunner_conn:parse_error_status(Reason),
+            State1 = encode_and_send_response_atomic(State, StreamId, Status, [], ~"", 0),
             _ = send_rst_stream(State1, StreamId, no_error),
             frame_loop(remove_stream(State1#loop{req_id_buffer = NewBuf}, StreamId));
         {error, _Reason} ->

@@ -360,13 +360,13 @@ expects_continue_ignores_http10_test() ->
     Req = req_v10([{~"expect", ~"100-continue"}]),
     ?assertNot(roadrunner_conn:expects_continue(Req)),
     ?assertNot(
-        roadrunner_conn:expects_continue(Req#{cached_decisions => #{expects_continue => true}})
+        roadrunner_conn:expects_continue(Req#{cached_decisions => #{expectation => continue}})
     ).
 
 expects_continue_from_cached_decisions_test() ->
     Req = req_with_headers([]),
     ?assert(
-        roadrunner_conn:expects_continue(Req#{cached_decisions => #{expects_continue => true}})
+        roadrunner_conn:expects_continue(Req#{cached_decisions => #{expectation => continue}})
     ).
 
 send_continue_writes_interim_response_test() ->

@@ -909,7 +909,7 @@ expect_answer(ProtoOpts, Headers, MaxCL) ->
     case lists:keyfind(~"expect", 1, Headers) of
         {_, Expect} ->
             case
-                roadrunner_bin:ascii_lowercase(Expect) =:= ~"100-continue" andalso
+                roadrunner_http:expectation(Expect) =:= continue andalso
                     roadrunner_http:request_content_length(Headers)
             of
                 {ok, Declared} ->
@@ -997,14 +997,14 @@ send_continue(Socket) ->
 -spec expects_continue(roadrunner_req:request()) -> boolean().
 expects_continue(#{version := {1, 0}}) ->
     false;
-expects_continue(#{cached_decisions := #{expects_continue := EC}}) ->
-    EC;
+expects_continue(#{cached_decisions := #{expectation := Expectation}}) ->
+    Expectation =:= continue;
 expects_continue(Req) ->
     %% Manually-built request maps (tests, middleware) skip the parse-time
-    %% precompute — fall back to the lowercase-and-compare path.
+    %% precompute — fall back to parsing the header.
     case roadrunner_req:header_normalized(~"expect", Req) of
         undefined -> false;
-        Value -> roadrunner_bin:ascii_lowercase(Value) =:= ~"100-continue"
+        Value -> roadrunner_http:expectation(Value) =:= continue
     end.
 
 -doc false.
@@ -1813,11 +1813,14 @@ send_status(Socket, Status) ->
 %% status. Size-limit overruns get the RFC-specific codes (414 URI Too
 %% Long per RFC 9110 §15.5.15, 431 Request Header Fields Too Large per
 %% RFC 6585 §5), a method the server doesn't implement gets 501 (RFC 9110
-%% §15.6.2), and every other malformed-input reason is a generic 400.
+%% §15.6.2), an expectation it can't meet gets 417 (RFC 9110 §10.1.1), and
+%% every other malformed-input reason is a generic 400. HTTP/2 and HTTP/3
+%% answer their requests' 501 and 417 from here too.
 -doc false.
 -spec parse_error_status(atom()) -> roadrunner_http:status().
 parse_error_status(request_line_too_long) -> 414;
 parse_error_status(not_implemented) -> 501;
+parse_error_status(unsupported_expectation) -> 417;
 parse_error_status(header_too_long) -> 431;
 parse_error_status(header_block_too_long) -> 431;
 parse_error_status(too_many_headers) -> 431;

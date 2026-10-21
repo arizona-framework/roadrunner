@@ -650,7 +650,7 @@ request_full_test() ->
                 cached_decisions => #{
                     is_chunked => false,
                     has_transfer_encoding => false,
-                    expects_continue => false,
+                    expectation => none,
                     connection_lower => ~"",
                     content_length => none,
                     has_host => true,
@@ -684,7 +684,7 @@ request_http10_no_host_accepted_test() ->
                 cached_decisions => #{
                     is_chunked => false,
                     has_transfer_encoding => false,
-                    expects_continue => false,
+                    expectation => none,
                     connection_lower => ~"",
                     content_length => none,
                     has_host => false,
@@ -831,7 +831,7 @@ cached_decisions_empty_for_empty_headers_test() ->
         #{
             is_chunked => false,
             has_transfer_encoding => false,
-            expects_continue => false,
+            expectation => none,
             connection_lower => ~"",
             content_length => none,
             has_host => false,
@@ -905,23 +905,54 @@ cached_decisions_content_length_default_none_test() ->
         roadrunner_http1:compute_cached_decisions([])
     ).
 
-cached_decisions_expects_continue_lowercased_match_test() ->
+cached_decisions_expect_continue_any_case_test() ->
     [
         ?assertMatch(
-            #{expects_continue := true},
+            #{expectation := continue},
             roadrunner_http1:compute_cached_decisions([{~"expect", V}])
         )
      || V <- [~"100-continue", ~"100-Continue", ~"100-CONTINUE"]
     ].
 
-cached_decisions_unknown_expect_does_not_set_flag_test() ->
-    %% Servers MAY return 417 for unknown expectations (RFC 9110 §10.1.1)
-    %% but at the parse layer we just leave the flag false. The connection
-    %% layer never sends a 100 for these.
+cached_decisions_unknown_expect_is_unsupported_test() ->
     ?assertMatch(
-        #{expects_continue := false},
+        #{expectation := unsupported},
         roadrunner_http1:compute_cached_decisions([{~"expect", ~"the-spanish-inquisition"}])
     ).
+
+cached_decisions_expect_lines_combine_test_() ->
+    %% Every `Expect` line counts: an unsupported member on any line makes
+    %% the request's expectation unsupported, an empty line changes nothing.
+    [
+        ?_assertMatch(
+            #{expectation := Want},
+            roadrunner_http1:compute_cached_decisions([{~"expect", V} || V <- Lines])
+        )
+     || {Lines, Want} <- [
+            {[~"100-continue", ~""], continue},
+            {[~"", ~"100-continue"], continue},
+            {[~"100-continue", ~"100-continue"], continue},
+            {[~"100-continue", ~"foo"], unsupported},
+            {[~"foo", ~"100-continue"], unsupported},
+            {[~"", ~""], none}
+        ]
+    ].
+
+parse_request_unknown_expectation_rejected_test_() ->
+    %% RFC 9110 §10.1.1: a server MAY answer an expectation it can't meet
+    %% with 417; roadrunner does, on HTTP/1.0 as on HTTP/1.1.
+    [
+        ?_assertEqual(
+            {error, unsupported_expectation},
+            roadrunner_http1:parse_request(Bin)
+        )
+     || Bin <- [
+            ~"GET / HTTP/1.1\r\nHost: x\r\nExpect: 200-ok\r\n\r\n",
+            ~"GET / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue, foo\r\n\r\n",
+            ~"GET / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nExpect: foo\r\n\r\n",
+            ~"GET / HTTP/1.0\r\nExpect: 200-ok\r\n\r\n"
+        ]
+    ].
 
 cached_decisions_connection_lowercased_test() ->
     ?assertMatch(
@@ -940,7 +971,7 @@ cached_decisions_ignores_unrelated_headers_test() ->
         #{
             is_chunked => false,
             has_transfer_encoding => false,
-            expects_continue => false,
+            expectation => none,
             connection_lower => ~"",
             content_length => none,
             has_host => true,
@@ -956,7 +987,7 @@ parse_request_attaches_cached_decisions_for_chunked_request_test() ->
     ?assertMatch(
         {ok,
             #{
-                cached_decisions := #{is_chunked := true, expects_continue := false}
+                cached_decisions := #{is_chunked := true, expectation := none}
             },
             _},
         roadrunner_http1:parse_request(Bin)
@@ -965,7 +996,7 @@ parse_request_attaches_cached_decisions_for_chunked_request_test() ->
 parse_request_attaches_cached_decisions_for_expect_continue_test() ->
     Bin = ~"PUT /u HTTP/1.1\r\nHost: x\r\nExpect: 100-Continue\r\nContent-Length: 0\r\n\r\n",
     ?assertMatch(
-        {ok, #{cached_decisions := #{expects_continue := true}}, _},
+        {ok, #{cached_decisions := #{expectation := continue}}, _},
         roadrunner_http1:parse_request(Bin)
     ).
 
@@ -1359,6 +1390,7 @@ response_status_reason_phrases_test_() ->
         {408, ~"Request Timeout"},
         {413, ~"Content Too Large"},
         {414, ~"URI Too Long"},
+        {417, ~"Expectation Failed"},
         {426, ~"Upgrade Required"},
         {431, ~"Request Header Fields Too Large"},
         {500, ~"Internal Server Error"},

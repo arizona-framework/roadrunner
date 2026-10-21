@@ -162,6 +162,25 @@ oversized_request_line_writes_414_then_exits_test() ->
     ?assertMatch(<<"HTTP/1.1 414", _/binary>>, Sent),
     Sink ! stop.
 
+unknown_expectation_writes_417_then_exits_test() ->
+    %% RFC 9110 §10.1.1: an expectation other than `100-continue` is
+    %% answered 417 Expectation Failed before any handler runs.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\nExpect: 200-ok\r\n\r\n"
+    ),
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, fake_opts(expect_417)),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 417 Expectation Failed\r\n", _/binary>>, Sent),
+    Sink ! stop.
+
 too_many_headers_writes_431_then_exits_test() ->
     %% More than 100 header lines is `too_many_headers`, which answers
     %% 431 Request Header Fields Too Large (RFC 6585 §5), not a 400.
