@@ -132,8 +132,37 @@ decode_prefix(_) ->
     {error, {qpack, truncated}}.
 
 -spec decode_field_lines(binary()) -> {ok, headers()} | {error, decode_error()}.
+%% A field line whose integers fit their prefix plus at most one
+%% continuation byte (every static index, and names and values below 135
+%% bytes) is matched here and in the helpers below, so the rest of the
+%% section stays a match context; `decode_field_line/1` returns each line
+%% as an `{ok, Header, Rest}` tuple and takes the others.
 decode_field_lines(<<>>) ->
     {ok, []};
+decode_field_lines(<<B, Rest/binary>>) when B >= 2#11000000, B =/= 16#FF ->
+    maybe
+        {ok, Entry} ?= static_indexed(B band 16#3F),
+        {ok, Tail} ?= decode_field_lines(Rest),
+        {ok, [Entry | Tail]}
+    end;
+decode_field_lines(<<16#FF, C, Rest/binary>>) when C < 128 ->
+    maybe
+        {ok, Entry} ?= static_indexed(16#3F + C),
+        {ok, Tail} ?= decode_field_lines(Rest),
+        {ok, [Entry | Tail]}
+    end;
+decode_field_lines(<<B, Rest/binary>>) when
+    B band 2#11010000 =:= 2#01010000, B band 16#0F =/= 16#0F
+->
+    name_ref_line(B band 16#0F, Rest);
+decode_field_lines(<<B, C, Rest/binary>>) when B band 2#11010000 =:= 2#01010000, C < 128 ->
+    name_ref_line(16#0F + C, Rest);
+decode_field_lines(<<B, Rest/binary>>) when
+    B band 2#11100000 =:= 2#00100000, B band 2#111 =/= 2#111
+->
+    literal_name_line((B bsr 3) band 1, B band 2#111, Rest);
+decode_field_lines(<<B, C, Rest/binary>>) when B band 2#11100000 =:= 2#00100000, C < 128 ->
+    literal_name_line((B bsr 3) band 1, 2#111 + C, Rest);
 decode_field_lines(Data) ->
     maybe
         {ok, Header, Rest} ?= decode_field_line(Data),
@@ -141,28 +170,64 @@ decode_field_lines(Data) ->
         {ok, [Header | Tail]}
     end.
 
-%% Byte-aligned dispatch on the field line's first byte (RFC 9204 §4.5):
-%% the pattern bits are tested with `band` and the integer prefix taken
-%% the same way, instead of matching bitstring fields and decoding every
-%% prefix through a generic N-bit integer decoder (a curl request:
-%% 1150 ns -> 890 ns).
+%% The value's length within its 7-bit prefix, else `decode_string/1`.
+-spec name_ref_line(non_neg_integer(), binary()) -> {ok, headers()} | {error, decode_error()}.
+name_ref_line(Index, <<H:1, Len:7, Body:Len/binary, Rest/binary>>) when Len < 127 ->
+    maybe
+        {ok, Name} ?= static_name(Index),
+        {ok, Value} ?= string_value(H, Body),
+        {ok, Tail} ?= decode_field_lines(Rest),
+        {ok, [{Name, Value} | Tail]}
+    end;
+name_ref_line(Index, Data) ->
+    maybe
+        {ok, Name} ?= static_name(Index),
+        {ok, Value, Rest} ?= decode_string(Data),
+        {ok, Tail} ?= decode_field_lines(Rest),
+        {ok, [{Name, Value} | Tail]}
+    end.
+
+-spec literal_name_line(0..1, non_neg_integer(), binary()) ->
+    {ok, headers()} | {error, decode_error()}.
+literal_name_line(NH, NameLen, Data) ->
+    case Data of
+        <<NBody:NameLen/binary, VH:1, VLen:7, VBody:VLen/binary, Rest/binary>> when VLen < 127 ->
+            maybe
+                {ok, Name} ?= string_value(NH, NBody),
+                {ok, Value} ?= string_value(VH, VBody),
+                {ok, Tail} ?= decode_field_lines(Rest),
+                {ok, [{Name, Value} | Tail]}
+            end;
+        _ ->
+            maybe
+                {ok, Name, AfterName} ?= take_string(NH, NameLen, Data),
+                {ok, Value, Rest} ?= decode_string(AfterName),
+                {ok, Tail} ?= decode_field_lines(Rest),
+                {ok, [{Name, Value} | Tail]}
+            end
+    end.
+
+%% The field lines `decode_field_lines/1` does not match inline: an integer
+%% past one continuation byte, a line cut short, or a dynamic-table
+%% reference (RFC 9204 §4.5). The pattern bits are tested with `band`, as
+%% there.
 -spec decode_field_line(binary()) ->
     {ok, header(), binary()} | {error, decode_error()}.
 decode_field_line(<<B, Rest/binary>>) when B >= 2#11000000 ->
-    %% 11xxxxxx — Indexed Field Line, static. 6-bit index.
+    %% 11xxxxxx — Indexed Field Line, static, 6-bit index. One that gets
+    %% here takes two or more continuation bytes (at least 191), past the
+    %% 99-entry static table, or is cut short.
     maybe
-        {ok, Index, Rest1} ?= integer(B band 16#3F, 16#3F, Rest),
-        {ok, Entry} ?= static_indexed(Index),
-        {ok, Entry, Rest1}
+        {ok, Index, _} ?= integer(B band 16#3F, 16#3F, Rest),
+        {error, {qpack, invalid_static_index, Index}}
     end;
 decode_field_line(<<B, Rest/binary>>) when B band 2#11010000 =:= 2#01010000 ->
-    %% 01N1xxxx — Literal Field Line with Name Reference, static. 4-bit
-    %% index. N (never index) only matters to intermediaries.
+    %% 01N1xxxx — Literal Field Line with Name Reference, static, 4-bit
+    %% index; N (never index) only matters to intermediaries. As above, an
+    %% index that gets here (at least 143) is past the table.
     maybe
-        {ok, Index, AfterIndex} ?= integer(B band 16#0F, 16#0F, Rest),
-        {ok, Name} ?= static_name(Index),
-        {ok, Value, Rest1} ?= decode_string(AfterIndex),
-        {ok, {Name, Value}, Rest1}
+        {ok, Index, _} ?= integer(B band 16#0F, 16#0F, Rest),
+        {error, {qpack, invalid_static_index, Index}}
     end;
 decode_field_line(<<B, Rest/binary>>) when B band 2#11100000 =:= 2#00100000 ->
     %% 001NHxxx — Literal Field Line with Literal Name. 3-bit name length.
@@ -192,20 +257,25 @@ decode_string(<<>>) ->
 %% Take `Len` octets from the buffer, Huffman-decoding when H=1.
 -spec take_string(0..1, non_neg_integer(), binary()) ->
     {ok, binary(), binary()} | {error, decode_error()}.
-take_string(0, Len, Bin) ->
+take_string(H, Len, Bin) ->
     case Bin of
-        <<Str:Len/binary, Rest/binary>> -> {ok, Str, Rest};
-        _ -> {error, {qpack, truncated}}
-    end;
-take_string(1, Len, Bin) ->
-    case Bin of
-        <<Encoded:Len/binary, Rest/binary>> ->
-            case roadrunner_http2_hpack_huffman:decode(Encoded) of
-                {ok, Decoded} -> {ok, Decoded, Rest};
-                {error, _} -> {error, {qpack, huffman}}
+        <<Str:Len/binary, Rest/binary>> ->
+            maybe
+                {ok, Value} ?= string_value(H, Str),
+                {ok, Value, Rest}
             end;
         _ ->
             {error, {qpack, truncated}}
+    end.
+
+%% A string's octets as sent (H = 0) or Huffman-decoded (H = 1).
+-spec string_value(0..1, binary()) -> {ok, binary()} | {error, decode_error()}.
+string_value(0, Str) ->
+    {ok, Str};
+string_value(1, Encoded) ->
+    case roadrunner_http2_hpack_huffman:decode(Encoded) of
+        {ok, _} = Ok -> Ok;
+        {error, _} -> {error, {qpack, huffman}}
     end.
 
 %% Reuse HPACK's prefixed-integer decoder (the encoding is shared, RFC
