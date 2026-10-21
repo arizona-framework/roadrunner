@@ -401,23 +401,6 @@ grammar enforcement is callers-write-bugs ergonomics, not security.
 
 **Scope:** small per attribute. Add when a real caller hits the gap.
 
-### Cap outbound response header size — small
-
-**What:** h1/h2/h3 all cap INBOUND headers (the security-relevant direction,
-against untrusted clients: h3 answers 431, h1/h2 their own limits) but none
-bounds an OUTBOUND response header block, so a handler emitting a
-pathologically large header set produces an unbounded HEADERS frame. A
-self-cap (e.g. at the listener's `max_header_block`) answering 500 on overflow
-would bound it.
-
-**Why deferred:** outbound headers come from trusted handler code, not an
-untrusted peer, so the memory/abuse risk is low and the inbound caps already
-cover the attack surface. This is distinct from honoring the peer's advertised
-`SETTINGS_MAX_FIELD_SECTION_SIZE` (a separate SHOULD in the protocol sections).
-Surfaced by the post-merge HTTP/3 review.
-
-**Scope:** small, cross-protocol (the same response paths as the 1xx item).
-
 ### Anchor the manual-mode body rate window at the first body byte — small
 
 **What:** `make_recv/3` (`roadrunner_conn.erl`) captures its rate-window start at
