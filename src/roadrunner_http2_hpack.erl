@@ -222,6 +222,34 @@ decode_loop(<<B, Rest/binary>>, Ctx, _UpdatesAllowed) when B >= 16#80 ->
         {ok, Tail, Ctx2} ?= decode_loop(Rest1, Ctx, false),
         {ok, [Header | Tail], Ctx2}
     end;
+decode_loop(<<B, H:1, Len:7, Body:Len/binary, Rest/binary>>, Ctx, _UpdatesAllowed) when
+    B > 16#40, B < 16#7F, Len < 127
+->
+    %% 01xxxxxx — Literal w/ Incremental Indexing, indexed name, the
+    %% name index and value length each within their prefix (almost
+    %% every literal). Matched in the clause head, so the rest stays a
+    %% match context instead of coming back through `{ok, X, Rest}`
+    %% tuples from the generic clause below.
+    maybe
+        {ok, {Name, _}} ?= lookup(B band 16#3F, Ctx),
+        {ok, Value} ?= string_value(H, Body),
+        ok ?= validate_value(Value),
+        Header = {Name, Value},
+        {ok, Tail, Ctx2} ?= decode_loop(Rest, insert(Header, Ctx), false),
+        {ok, [Header | Tail], Ctx2}
+    end;
+decode_loop(
+    <<16#40, NH:1, NLen:7, NBody:NLen/binary, VH:1, VLen:7, VBody:VLen/binary, Rest/binary>>,
+    Ctx,
+    _UpdatesAllowed
+) when NLen < 127, VLen < 127 ->
+    %% Literal w/ Incremental Indexing, new name, both lengths within
+    %% their prefix.
+    maybe
+        {ok, Header} ?= new_name_literal(NH, NBody, VH, VBody),
+        {ok, Tail, Ctx2} ?= decode_loop(Rest, insert(Header, Ctx), false),
+        {ok, [Header | Tail], Ctx2}
+    end;
 decode_loop(<<B, Rest/binary>>, Ctx, _UpdatesAllowed) when B >= 16#40 ->
     %% 01xxxxxx — Literal w/ Incremental Indexing. 6-bit name index.
     maybe
@@ -245,6 +273,31 @@ decode_loop(<<B, Rest/binary>>, Ctx, true) when B >= 16#20 ->
             {error, invalid_table_size};
         {error, _} = E ->
             E
+    end;
+decode_loop(<<B, H:1, Len:7, Body:Len/binary, Rest/binary>>, Ctx, _UpdatesAllowed) when
+    B band 16#0F =/= 0, B band 16#0F =/= 16#0F, Len < 127
+->
+    %% 0001xxxx / 0000xxxx with an indexed name, the inline shape of
+    %% the first literal clause above; the table is left as it is.
+    maybe
+        {ok, {Name, _}} ?= lookup(B band 16#0F, Ctx),
+        {ok, Value} ?= string_value(H, Body),
+        ok ?= validate_value(Value),
+        Header = {Name, Value},
+        {ok, Tail, Ctx2} ?= decode_loop(Rest, Ctx, false),
+        {ok, [Header | Tail], Ctx2}
+    end;
+decode_loop(
+    <<B, NH:1, NLen:7, NBody:NLen/binary, VH:1, VLen:7, VBody:VLen/binary, Rest/binary>>,
+    Ctx,
+    _UpdatesAllowed
+) when B band 16#0F =:= 0, NLen < 127, VLen < 127 ->
+    %% 0001xxxx / 0000xxxx with a new name, both lengths within their
+    %% prefix.
+    maybe
+        {ok, Header} ?= new_name_literal(NH, NBody, VH, VBody),
+        {ok, Tail, Ctx2} ?= decode_loop(Rest, Ctx, false),
+        {ok, [Header | Tail], Ctx2}
     end;
 decode_loop(<<B, Rest/binary>>, Ctx, _UpdatesAllowed) ->
     %% 0001xxxx — Literal Never Indexed, or 0000xxxx — Literal w/o
@@ -479,12 +532,33 @@ string_body(H, Len, Rest) ->
 
 -spec decode_string_body(0..1, binary(), binary()) ->
     {ok, binary(), binary()} | {error, huffman_decode_error}.
-decode_string_body(0, Body, Tail) ->
-    {ok, Body, Tail};
-decode_string_body(1, Body, Tail) ->
+decode_string_body(H, Body, Tail) ->
+    maybe
+        {ok, Value} ?= string_value(H, Body),
+        {ok, Value, Tail}
+    end.
+
+%% A string's octets as sent (H = 0) or Huffman-decoded (H = 1).
+-spec string_value(0..1, binary()) -> {ok, binary()} | {error, huffman_decode_error}.
+string_value(0, Body) ->
+    {ok, Body};
+string_value(1, Body) ->
     case roadrunner_http2_hpack_huffman:decode(Body) of
-        {ok, Decoded} -> {ok, Decoded, Tail};
+        {ok, _} = Ok -> Ok;
         {error, _} -> {error, huffman_decode_error}
+    end.
+
+%% A literal's new name and its value, checked in the order the generic
+%% path checks them.
+-spec new_name_literal(0..1, binary(), 0..1, binary()) ->
+    {ok, header()} | {error, decode_error()}.
+new_name_literal(NH, NBody, VH, VBody) ->
+    maybe
+        {ok, Name} ?= string_value(NH, NBody),
+        ok ?= validate_name(Name),
+        {ok, Value} ?= string_value(VH, VBody),
+        ok ?= validate_value(Value),
+        {ok, {Name, Value}}
     end.
 
 %% Plain (non-Huffman) string emission. The encoder picks Huffman
