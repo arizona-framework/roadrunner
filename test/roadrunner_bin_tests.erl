@@ -68,6 +68,26 @@ ascii_lowercase_every_byte_at_every_position_test() ->
      || Len <- lists:seq(1, 30), Pos <- lists:seq(0, Len - 1), B <- lists:seq(0, 255)
     ].
 
+ascii_lowercase_mixed_words_test() ->
+    %% Several uppercase and edge bytes in the same 7-byte word, against a
+    %% byte-at-a-time reference.
+    rand:seed(exsss, {7, 7, 7}),
+    Chars = <<"@AMZ[`amz{09-", 127, 128, 192, 218, 255>>,
+    Lower = fun
+        (C) when C >= $A, C =< $Z -> C + 32;
+        (C) -> C
+    end,
+    [
+        begin
+            In = <<
+                <<(binary:at(Chars, rand:uniform(byte_size(Chars)) - 1))>>
+             || _ <- lists:seq(1, Len)
+            >>,
+            ?assertEqual(<<<<(Lower(C))>> || <<C>> <= In>>, roadrunner_bin:ascii_lowercase(In))
+        end
+     || Len <- lists:seq(1, 40), _ <- lists:seq(1, 50)
+    ].
+
 ascii_lowercase_only_uppercase_test() ->
     ?assertEqual(~"hello", roadrunner_bin:ascii_lowercase(~"HELLO")).
 
