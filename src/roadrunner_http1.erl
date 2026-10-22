@@ -936,75 +936,99 @@ check_cls_consistent(_, _) -> error.
 -doc false.
 -spec compute_cached_decisions(headers()) -> roadrunner_req:cached_decisions().
 compute_cached_decisions(Headers) ->
-    compute_cached_decisions_loop(Headers, #{
-        is_chunked => false,
-        has_transfer_encoding => false,
-        expectation => none,
-        connection_lower => ~"",
-        content_length => none,
-        has_host => false,
-        has_content_type => false
-    }).
+    compute_cached_decisions_loop(Headers, false, false, none, ~"", none, false, false).
 
--spec compute_cached_decisions_loop(headers(), roadrunner_req:cached_decisions()) ->
-    roadrunner_req:cached_decisions().
-compute_cached_decisions_loop([], Acc) ->
-    Acc;
+%% The seven decisions travel as arguments and become the map once, at the
+%% end: updating a 7-key map per relevant header copies it each time, which
+%% cost a POST with Host, Content-Type, Content-Length and Connection about
+%% 50 ns more.
+-spec compute_cached_decisions_loop(
+    headers(),
+    IsChunked :: boolean(),
+    HasTransferEncoding :: boolean(),
+    Expectation :: none | continue | unsupported,
+    ConnectionLower :: binary(),
+    ContentLength :: none | {ok, non_neg_integer()} | {error, bad_content_length},
+    HasHost :: boolean() | multiple | invalid,
+    HasContentType :: boolean() | multiple
+) -> roadrunner_req:cached_decisions().
+compute_cached_decisions_loop([], Chunked, TE, Expect, Conn, CL, Host, CT) ->
+    #{
+        is_chunked => Chunked,
+        has_transfer_encoding => TE,
+        expectation => Expect,
+        connection_lower => Conn,
+        content_length => CL,
+        has_host => Host,
+        has_content_type => CT
+    };
 %% Each field's canonical lowercase value gets a literal clause ahead
 %% of that field's general clause. The literal is its own lowercase, so
 %% `ascii_lowercase/1` would walk it only to hand back the same term;
 %% matching the clause head compares it once instead.
-compute_cached_decisions_loop([{~"transfer-encoding", ~"chunked"} | Rest], Acc) ->
-    compute_cached_decisions_loop(Rest, Acc#{
-        has_transfer_encoding := true, is_chunked := true
-    });
-compute_cached_decisions_loop([{~"transfer-encoding", V} | Rest], Acc) ->
-    %% Set both keys in a single map update on the chunked path — two
-    %% sequential `:=` updates would allocate two map terms.
-    Acc1 =
-        case roadrunner_bin:ascii_lowercase(V) of
-            ~"chunked" -> Acc#{has_transfer_encoding := true, is_chunked := true};
-            _ -> Acc#{has_transfer_encoding := true}
-        end,
-    compute_cached_decisions_loop(Rest, Acc1);
-compute_cached_decisions_loop([{~"expect", V} | Rest], #{expectation := Was} = Acc) ->
+compute_cached_decisions_loop(
+    [{~"transfer-encoding", ~"chunked"} | Rest], _Chunked, _TE, Expect, Conn, CL, Host, CT
+) ->
+    compute_cached_decisions_loop(Rest, true, true, Expect, Conn, CL, Host, CT);
+compute_cached_decisions_loop(
+    [{~"transfer-encoding", V} | Rest], Chunked, _TE, Expect, Conn, CL, Host, CT
+) ->
+    case roadrunner_bin:ascii_lowercase(V) of
+        ~"chunked" -> compute_cached_decisions_loop(Rest, true, true, Expect, Conn, CL, Host, CT);
+        _ -> compute_cached_decisions_loop(Rest, Chunked, true, Expect, Conn, CL, Host, CT)
+    end;
+compute_cached_decisions_loop([{~"expect", V} | Rest], Chunked, TE, Was, Conn, CL, Host, CT) ->
     %% Every `Expect` line counts: one unsupported member anywhere makes
     %% the whole request's expectation unsupported.
-    Expectation =
+    Expect =
         case {Was, roadrunner_http:expectation(V)} of
             {unsupported, _} -> unsupported;
             {continue, none} -> continue;
             {_, This} -> This
         end,
-    compute_cached_decisions_loop(Rest, Acc#{expectation := Expectation});
-compute_cached_decisions_loop([{~"connection", ~"keep-alive"} | Rest], Acc) ->
-    compute_cached_decisions_loop(Rest, Acc#{connection_lower := ~"keep-alive"});
-compute_cached_decisions_loop([{~"connection", ~"close"} | Rest], Acc) ->
-    compute_cached_decisions_loop(Rest, Acc#{connection_lower := ~"close"});
-compute_cached_decisions_loop([{~"connection", V} | Rest], Acc) ->
+    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, Host, CT);
+compute_cached_decisions_loop(
+    [{~"connection", ~"keep-alive"} | Rest], Chunked, TE, Expect, _Conn, CL, Host, CT
+) ->
+    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, ~"keep-alive", CL, Host, CT);
+compute_cached_decisions_loop(
+    [{~"connection", ~"close"} | Rest], Chunked, TE, Expect, _Conn, CL, Host, CT
+) ->
+    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, ~"close", CL, Host, CT);
+compute_cached_decisions_loop(
+    [{~"connection", V} | Rest], Chunked, TE, Expect, _Conn, CL, Host, CT
+) ->
     compute_cached_decisions_loop(
-        Rest, Acc#{connection_lower := roadrunner_bin:ascii_lowercase(V)}
+        Rest, Chunked, TE, Expect, roadrunner_bin:ascii_lowercase(V), CL, Host, CT
     );
-compute_cached_decisions_loop([{~"content-length", V} | Rest], Acc) ->
-    compute_cached_decisions_loop(Rest, Acc#{content_length := parse_content_length(V)});
-compute_cached_decisions_loop([{~"content-type", _} | Rest], #{has_content_type := false} = Acc) ->
-    compute_cached_decisions_loop(Rest, Acc#{has_content_type := true});
-compute_cached_decisions_loop([{~"content-type", _} | Rest], Acc) ->
+compute_cached_decisions_loop(
+    [{~"content-length", V} | Rest], Chunked, TE, Expect, Conn, _CL, Host, CT
+) ->
+    compute_cached_decisions_loop(
+        Rest, Chunked, TE, Expect, Conn, parse_content_length(V), Host, CT
+    );
+compute_cached_decisions_loop(
+    [{~"content-type", _} | Rest], Chunked, TE, Expect, Conn, CL, Host, false
+) ->
+    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, Host, true);
+compute_cached_decisions_loop(
+    [{~"content-type", _} | Rest], Chunked, TE, Expect, Conn, CL, Host, _CT
+) ->
     %% Content-Type is a singleton field (RFC 9110 §5.3, §8.3): a second
     %% line leaves the body's media type ambiguous.
-    compute_cached_decisions_loop(Rest, Acc#{has_content_type := multiple});
-compute_cached_decisions_loop([{~"host", V} | Rest], #{has_host := false} = Acc) ->
+    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, Host, multiple);
+compute_cached_decisions_loop([{~"host", V} | Rest], Chunked, TE, Expect, Conn, CL, false, CT) ->
     Host =
         case roadrunner_http:valid_host(V) of
             true -> true;
             false -> invalid
         end,
-    compute_cached_decisions_loop(Rest, Acc#{has_host := Host});
-compute_cached_decisions_loop([{~"host", _} | Rest], Acc) ->
+    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, Host, CT);
+compute_cached_decisions_loop([{~"host", _} | Rest], Chunked, TE, Expect, Conn, CL, _Host, CT) ->
     %% RFC 9112 §3.2: more than one Host field line is a 400.
-    compute_cached_decisions_loop(Rest, Acc#{has_host := multiple});
-compute_cached_decisions_loop([_ | Rest], Acc) ->
-    compute_cached_decisions_loop(Rest, Acc).
+    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, multiple, CT);
+compute_cached_decisions_loop([_ | Rest], Chunked, TE, Expect, Conn, CL, Host, CT) ->
+    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, Host, CT).
 
 -spec parse_content_length(binary()) ->
     {ok, non_neg_integer()} | {error, bad_content_length}.
