@@ -962,6 +962,66 @@ cached_decisions_connection_lowercased_test() ->
         )
     ).
 
+cached_decisions_full_map_test_() ->
+    %% Every field and its repeats, checked against the whole decisions map so
+    %% each one lands in its own key and leaves the others at their defaults.
+    Default = #{
+        is_chunked => false,
+        has_transfer_encoding => false,
+        expectation => none,
+        connection_lower => ~"",
+        content_length => none,
+        has_host => false,
+        has_content_type => false
+    },
+    [
+        ?_assertEqual(
+            maps:merge(Default, Want), roadrunner_http1:compute_cached_decisions(Headers)
+        )
+     || {Headers, Want} <- [
+            {[], #{}},
+            {[{~"x-other", ~"v"}], #{}},
+            {[{~"transfer-encoding", ~"chunked"}], #{
+                is_chunked => true, has_transfer_encoding => true
+            }},
+            {[{~"transfer-encoding", ~"Chunked"}], #{
+                is_chunked => true, has_transfer_encoding => true
+            }},
+            {[{~"transfer-encoding", ~"gzip"}], #{has_transfer_encoding => true}},
+            {[{~"transfer-encoding", ~"chunked"}, {~"transfer-encoding", ~"gzip"}], #{
+                is_chunked => true, has_transfer_encoding => true
+            }},
+            {[{~"expect", ~"100-continue"}], #{expectation => continue}},
+            {[{~"expect", ~"100-continue"}, {~"expect", ~"foo"}], #{expectation => unsupported}},
+            {[{~"connection", ~"keep-alive"}], #{connection_lower => ~"keep-alive"}},
+            {[{~"connection", ~"close"}], #{connection_lower => ~"close"}},
+            {[{~"connection", ~"Upgrade"}], #{connection_lower => ~"upgrade"}},
+            {[{~"content-length", ~"42"}], #{content_length => {ok, 42}}},
+            {[{~"content-length", ~"x"}], #{content_length => {error, bad_content_length}}},
+            {[{~"content-type", ~"a/b"}], #{has_content_type => true}},
+            {[{~"content-type", ~"a/b"}, {~"content-type", ~"a/b"}], #{has_content_type => multiple}},
+            {[{~"host", ~"example.com"}], #{has_host => true}},
+            {[{~"host", ~"bad host"}], #{has_host => invalid}},
+            {[{~"host", ~"a"}, {~"host", ~"b"}], #{has_host => multiple}},
+            {
+                [
+                    {~"host", ~"x"},
+                    {~"content-type", ~"text/plain"},
+                    {~"content-length", ~"5"},
+                    {~"connection", ~"keep-alive"},
+                    {~"expect", ~"100-continue"}
+                ],
+                #{
+                    has_host => true,
+                    has_content_type => true,
+                    content_length => {ok, 5},
+                    connection_lower => ~"keep-alive",
+                    expectation => continue
+                }
+            }
+        ]
+    ].
+
 cached_decisions_ignores_unrelated_headers_test() ->
     %% Only cached headers feed the cache; everything else
     %% (Content-Type, X-*, etc.) leaves defaults intact. `Host` is
