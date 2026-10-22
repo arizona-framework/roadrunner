@@ -60,11 +60,16 @@ handle_event(listener_accept, {ListenerName, Peer}) ->
         listener_name => ListenerName, peer => Peer
     }),
     {StartMono, ListenerName, Peer};
-handle_event(listener_conn_close, {{StartMono, ListenerName, Peer}, RequestsServed}) ->
+handle_event(listener_conn_close, {{StartMono, ListenerName, Peer}, RequestsServed, Reason}) ->
     telemetry:execute(
         [roadrunner, listener, conn_close],
         #{duration => erlang:monotonic_time() - StartMono},
-        #{listener_name => ListenerName, peer => Peer, requests_served => RequestsServed}
+        #{
+            listener_name => ListenerName,
+            peer => Peer,
+            requests_served => RequestsServed,
+            reason => Reason
+        }
     );
 handle_event(listener_conn_rejected, {ListenerName, Reason}) ->
     now_event([roadrunner, listener, conn_rejected], #{

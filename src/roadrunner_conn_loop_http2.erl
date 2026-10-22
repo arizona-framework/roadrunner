@@ -475,7 +475,7 @@ idle_timeout() ->
 handshake_phase_preface(#loop{buffer = <<?PREFACE, Rest/binary>>} = State) ->
     handshake_phase_settings(State#loop{buffer = Rest});
 handshake_phase_preface(#loop{buffer = <<_:?PREFACE_LEN/binary, _/binary>>} = State) ->
-    exit_clean(State);
+    exit_clean(State, {protocol_error, protocol_error});
 handshake_phase_preface(State) ->
     handshake_recv(State, fun handshake_phase_preface/1).
 
@@ -492,13 +492,11 @@ handshake_phase_settings(#loop{buffer = Buf} = State) ->
             %% (or stalling clients that never send one) on large responses.
             handle_frame({settings, 0, Params}, State#loop{buffer = Rest});
         {ok, _, _} ->
-            _ = send_goaway(State, protocol_error),
-            exit_clean(State);
+            goaway_exit(State, protocol_error);
         {more, _Need} ->
             handshake_recv(State, fun handshake_phase_settings/1);
         {error, _} ->
-            _ = send_goaway(State, protocol_error),
-            exit_clean(State)
+            goaway_exit(State, protocol_error)
     end.
 
 -spec handshake_recv(#loop{}, fun((#loop{}) -> no_return())) -> no_return().
@@ -517,11 +515,11 @@ handshake_recv(
         {MData, _, Bytes} ->
             Cont(State#loop{buffer = roadrunner_bin:append(Buf, Bytes)});
         {MClosed, _} ->
-            exit_clean(State);
-        {MError, _, _} ->
-            exit_clean(State)
+            exit_clean(State, peer_closed);
+        {MError, _, Reason} ->
+            exit_clean(State, {transport, Reason})
     after State#loop.handshake_timeout ->
-        exit_clean(State)
+        exit_clean(State, request_timeout)
     end.
 
 %% =============================================================================
@@ -532,7 +530,7 @@ handshake_recv(
 frame_loop(#loop{draining = true, streams = Streams} = State) when map_size(Streams) =:= 0 ->
     %% Drain done — the last in-flight stream finished or peer
     %% RST'd it, nothing more to do.
-    exit_clean(State);
+    exit_clean(State, drained);
 frame_loop(#loop{buffer = Buf} = State) ->
     case roadrunner_http2_frame:parse(Buf, ?MAX_FRAME_SIZE) of
         {ok, Frame, Rest} ->
@@ -540,8 +538,7 @@ frame_loop(#loop{buffer = Buf} = State) ->
         {more, _Need} ->
             arm_and_recv(State);
         {error, _} ->
-            _ = send_goaway(State, protocol_error),
-            exit_clean(State)
+            goaway_exit(State, protocol_error)
     end.
 
 -spec arm_and_recv(#loop{}) -> no_return().
@@ -564,10 +561,10 @@ recv_more(
         {MData, _, Bytes} ->
             frame_loop(State#loop{buffer = roadrunner_bin:append(Buf, Bytes)});
         {MClosed, _} ->
-            exit_clean(State);
-        {MError, _, _} ->
+            exit_clean(State, peer_closed);
+        {MError, _, Reason} ->
             _ = send_goaway(State, protocol_error),
-            exit_clean(State);
+            exit_clean(State, {transport, Reason});
         {h2_send_headers, From, Ref, StreamId, Status, Headers, EndStream} ->
             recv_more(handle_send_headers(State, From, Ref, StreamId, Status, Headers, EndStream));
         {h2_send_data, From, Ref, StreamId, Data, Size, EndStream} ->
@@ -623,7 +620,7 @@ recv_idle_expired(State) ->
 -spec idle_goaway(#loop{}) -> no_return().
 idle_goaway(State) ->
     _ = send_goaway(State, protocol_error),
-    exit_clean(State).
+    exit_clean(State, keep_alive_timeout).
 
 %% Hibernate re-entry (see `recv_idle_expired/1`). Resumes the unified
 %% mailbox loop after an idle conn wakes from `erlang:hibernate/3`.
@@ -652,7 +649,7 @@ start_drain(#loop{} = State) ->
 maybe_exit_when_drained(#loop{draining = true, streams = Streams} = State) when
     map_size(Streams) =:= 0
 ->
-    exit_clean(State);
+    exit_clean(State, drained);
 maybe_exit_when_drained(State) ->
     State.
 
@@ -671,8 +668,7 @@ handle_frame(Frame, #loop{awaiting_continuation = Awaiting} = State) when
         {continuation, Awaiting, Flags, Fragment} ->
             on_continuation(Awaiting, Flags, Fragment, State);
         _ ->
-            _ = send_goaway(State, protocol_error),
-            exit_clean(State)
+            goaway_exit(State, protocol_error)
     end;
 handle_frame({settings, 1, _}, State) ->
     frame_loop(State);
@@ -688,15 +684,12 @@ handle_frame({settings, 0, Params}, State) ->
                     _ = send(State2, roadrunner_http2_frame:encode({settings, 1, []})),
                     frame_loop(flush_all_pending_data(State2));
                 {error, flow_control_error} ->
-                    _ = send_goaway(State, flow_control_error),
-                    exit_clean(State)
+                    goaway_exit(State, flow_control_error)
             end;
         {error, {protocol_error, _}} ->
-            _ = send_goaway(State, protocol_error),
-            exit_clean(State);
+            goaway_exit(State, protocol_error);
         {error, {flow_control_error, _}} ->
-            _ = send_goaway(State, flow_control_error),
-            exit_clean(State)
+            goaway_exit(State, flow_control_error)
     end;
 handle_frame({ping, 1, _Data}, State) ->
     frame_loop(State);
@@ -706,8 +699,7 @@ handle_frame({ping, 0, Opaque}, State) ->
 handle_frame({window_update, 0, Inc}, State) ->
     case State#loop.conn_send_window + Inc of
         New when New > ?MAX_WINDOW ->
-            _ = send_goaway(State, flow_control_error),
-            exit_clean(State);
+            goaway_exit(State, flow_control_error);
         New ->
             State1 = State#loop{conn_send_window = New},
             frame_loop(flush_all_pending_data(State1))
@@ -736,8 +728,7 @@ handle_frame({window_update, StreamId, Inc}, #loop{streams = Streams} = State) -
             %% peer_stream_id) is silently ignored per §6.9.
             case StreamId > State#loop.peer_stream_id of
                 true ->
-                    _ = send_goaway(State, protocol_error),
-                    exit_clean(State);
+                    goaway_exit(State, protocol_error);
                 false ->
                     frame_loop(State)
             end
@@ -768,15 +759,14 @@ handle_frame({rst_stream, StreamId, _}, #loop{streams = Streams} = State) ->
             %% already-closed lifecycle.
             case StreamId > State#loop.peer_stream_id of
                 true ->
-                    _ = send_goaway(State, protocol_error),
-                    exit_clean(State);
+                    goaway_exit(State, protocol_error);
                 false ->
                     frame_loop(State)
             end
     end;
 handle_frame({goaway, _, _, _}, State) ->
     %% Client is shutting down.
-    exit_clean(State);
+    exit_clean(State, peer_closed);
 handle_frame({headers, StreamId, Flags, Priority, Fragment}, State) ->
     on_headers(StreamId, Flags, Priority, Fragment, State);
 handle_frame({continuation, StreamId, Flags, Fragment}, State) ->
@@ -785,8 +775,7 @@ handle_frame({data, StreamId, Flags, Payload, FlowLen}, State) ->
     on_data(StreamId, Flags, Payload, FlowLen, State);
 handle_frame({push_promise, _, _, _, _}, State) ->
     %% Servers MUST NOT receive PUSH_PROMISE — RFC 9113 §6.6.
-    _ = send_goaway(State, protocol_error),
-    exit_clean(State);
+    goaway_exit(State, protocol_error);
 handle_frame({unknown, _Type, _StreamId}, State) ->
     %% RFC 9113 §4.1: unknown frame types MUST be ignored. The
     %% awaiting_continuation guard above already rejected the
@@ -797,8 +786,7 @@ handle_frame({unknown, _Type, _StreamId}, State) ->
 
 on_headers(StreamId, _Flags, _Priority, _Fragment, State) when StreamId rem 2 =:= 0 ->
     %% RFC 9113 §5.1.1: client-initiated stream IDs are odd.
-    _ = send_goaway(State, protocol_error),
-    exit_clean(State);
+    goaway_exit(State, protocol_error);
 on_headers(StreamId, Flags, Priority, Fragment, #loop{streams = Streams} = State) when
     is_map_key(StreamId, Streams)
 ->
@@ -837,8 +825,7 @@ on_headers(StreamId, Flags, Priority, Fragment, #loop{streams = Streams} = State
                     end
             end;
         false ->
-            _ = send_goaway(State, protocol_error),
-            exit_clean(State)
+            goaway_exit(State, protocol_error)
     end;
 on_headers(StreamId, _Flags, _Priority, _Fragment, State) when
     StreamId =< State#loop.peer_stream_id
@@ -850,8 +837,7 @@ on_headers(StreamId, _Flags, _Priority, _Fragment, State) when
     %% nominal stream error, but with an unknown stream we have
     %% no per-stream context to RST against, so treat as a
     %% connection error.
-    _ = send_goaway(State, protocol_error),
-    exit_clean(State);
+    goaway_exit(State, protocol_error);
 on_headers(StreamId, Flags, #{stream_dependency := StreamId}, Fragment, State) ->
     %% RFC 9113 §5.3.1: a stream cannot depend on itself —
     %% stream-error PROTOCOL_ERROR.
@@ -946,8 +932,7 @@ reset_refused(StreamId, Fragment, Code, #loop{hpack_dec = Dec} = State) ->
             _ = send_rst_stream(State1, StreamId, Code),
             frame_loop(reset_stream(State1, StreamId));
         {error, Reason} ->
-            _ = send_goaway(State, decode_error_code(Reason)),
-            exit_clean(State)
+            goaway_exit(State, decode_error_code(Reason))
     end.
 
 %% The GOAWAY code for a field block that did not decode. RFC 9113 §4.3:
@@ -1009,8 +994,7 @@ on_continuation(
             %% ENHANCE_YOUR_CALM is the RFC 9113 §6.5.2 resource-limit code.
             case NewLen > MaxHeaderBlock orelse (FragLen =:= 0 andalso not EndHeaders) of
                 true ->
-                    _ = send_goaway(State, enhance_your_calm),
-                    exit_clean(State);
+                    goaway_exit(State, enhance_your_calm);
                 false ->
                     Stream1 = Stream#{
                         header_fragment := [Frags, Fragment],
@@ -1039,8 +1023,7 @@ on_continuation(
                     end
             end;
         _ ->
-            _ = send_goaway(State, protocol_error),
-            exit_clean(State)
+            goaway_exit(State, protocol_error)
     end.
 
 %% Decode an inbound trailer HPACK block. We currently drop the
@@ -1062,8 +1045,7 @@ finalize_trailers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) -
                 manual -> body_in(StreamId, Stream1, State1)
             end;
         {error, Reason} ->
-            _ = send_goaway(State, decode_error_code(Reason)),
-            exit_clean(State)
+            goaway_exit(State, decode_error_code(Reason))
     end.
 
 %% Decode the accumulated HPACK fragment, store decoded headers on
@@ -1113,8 +1095,7 @@ finalize_headers(
                     end
             end;
         {error, Reason} ->
-            _ = send_goaway(State, decode_error_code(Reason)),
-            exit_clean(State)
+            goaway_exit(State, decode_error_code(Reason))
     end.
 
 %% A request whose body is still to come waits for its DATA, or, in manual
@@ -1179,8 +1160,7 @@ reject_too_large(State, StreamId) ->
 
 on_data(StreamId, _Flags, _Payload, _FlowLen, State) when StreamId > State#loop.peer_stream_id ->
     %% RFC 9113 §5.1: DATA on an idle stream is PROTOCOL_ERROR.
-    _ = send_goaway(State, protocol_error),
-    exit_clean(State);
+    goaway_exit(State, protocol_error);
 on_data(StreamId, _Flags, _Payload, FlowLen, #loop{streams = Streams} = State) when
     not is_map_key(StreamId, Streams)
 ->
@@ -1217,8 +1197,7 @@ on_data(StreamId, Flags, Payload, FlowLen, #loop{streams = Streams} = State) ->
                     %% RFC 9113 §6.9.1: more DATA than the connection-level
                     %% receive window permits is a connection-level
                     %% FLOW_CONTROL_ERROR.
-                    _ = send_goaway(State, flow_control_error),
-                    exit_clean(State);
+                    goaway_exit(State, flow_control_error);
                 FlowLen > RW ->
                     %% More DATA than the stream-level window permits is a
                     %% stream-level FLOW_CONTROL_ERROR.
@@ -2422,17 +2401,27 @@ rate_limit_refused(
             {refused, State1}
     end.
 
--spec exit_clean(#loop{}) -> no_return().
-exit_clean(#loop{
-    socket = Socket,
-    proto_opts = ProtoOpts,
-    conn_span = ConnSpan,
-    worker_refs = Refs,
-    max_concurrent_requests = MaxConcReq,
-    inflight_counter = InflightCounter,
-    overload = Overload
-}) ->
-    ok = roadrunner_event:listener_conn_close(ConnSpan, 0),
+%% A connection error (RFC 9113 §5.4.1): tell the peer with a GOAWAY
+%% carrying `ErrorCode`, then tear down with it as the close reason.
+-spec goaway_exit(#loop{}, roadrunner_http2_frame:error_code()) -> no_return().
+goaway_exit(State, ErrorCode) ->
+    _ = send_goaway(State, ErrorCode),
+    exit_clean(State, {protocol_error, ErrorCode}).
+
+-spec exit_clean(#loop{}, roadrunner_event_handler:close_reason()) -> no_return().
+exit_clean(
+    #loop{
+        socket = Socket,
+        proto_opts = ProtoOpts,
+        conn_span = ConnSpan,
+        worker_refs = Refs,
+        max_concurrent_requests = MaxConcReq,
+        inflight_counter = InflightCounter,
+        overload = Overload
+    },
+    Reason
+) ->
+    ok = roadrunner_event:listener_conn_close(ConnSpan, 0, Reason),
     %% Account for any stream workers still live at teardown (each holds one
     %% in-flight slot). Workers whose `DOWN` already fired were removed from
     %% `worker_refs`, so this releases each remaining worker exactly once.

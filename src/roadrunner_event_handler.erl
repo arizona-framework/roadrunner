@@ -103,9 +103,10 @@ tell listeners apart, match on the listener name the events carry.
   calling process.
 - `listener_accept`, `{ListenerName, Peer}`: a connection's peer is
   known and it is about to be served. Returns the connection span.
-- `listener_conn_close`, `{Span, RequestsServed}`: the connection
-  process is about to exit. `RequestsServed` counts the requests
-  parsed on it (`0` on HTTP/2 and HTTP/3).
+- `listener_conn_close`, `{Span, RequestsServed, Reason}`: the
+  connection process is about to exit. `RequestsServed` counts the
+  requests parsed on it (`0` on HTTP/2 and HTTP/3). `Reason` says why
+  it ended, see `t:close_reason/0`.
 - `listener_conn_rejected`, `{ListenerName, Reason}`: a freshly
   accepted connection was dropped at the `max_clients` cap. `Reason`
   is `max_clients`. There is no peer: the reject path is the floodable
@@ -182,7 +183,7 @@ handle_event(_Event, _Args) ->
 ```
 """.
 
--export_type([event/0, span/0, peer/0, response_kind/0]).
+-export_type([event/0, span/0, peer/0, response_kind/0, close_reason/0]).
 
 -doc "The name of an event handed to `handle_event/2`.".
 -type event() ::
@@ -216,6 +217,41 @@ What a handler returns from `request_start`, `listener_accept`, or
 -type response_kind() :: buffered | stream | loop | sendfile | websocket.
 
 -doc """
+Why a connection ended, as carried by `listener_conn_close`.
+
+- `normal`: roadrunner closed it after a response: `Connection: close`,
+  `max_keep_alive_requests` reached, a `stream`, `loop`, `sendfile`
+  body or WebSocket session that owns the connection finished, or a
+  `404`, `405` or `500` that closes it
+- `peer_closed`: the client closed it (on HTTP/2, also a client
+  `GOAWAY`)
+- `request_timeout`: no complete request within `request_timeout`
+  (on HTTP/2, the client preface and `SETTINGS` did not arrive in time)
+- `keep_alive_timeout`: idle between requests past `keep_alive_timeout`
+  (on HTTP/2 and HTTP/3, the connection's idle timeout)
+- `slow_client`: the client sent slower than `min_bytes_per_second`
+- `drained`: closed by `roadrunner_listener:drain/2`
+- `rejected`: an HTTP/1.1 request was refused before its handler ran
+  (malformed, over a size limit, or over its `rate_limit`) and the
+  connection closed with the error response
+- `{protocol_error, Code}`: an HTTP/2 or HTTP/3 connection error,
+  closed with `Code` (the `GOAWAY` error atom on HTTP/2, the HTTP/3
+  error code integer)
+- `{transport, Reason}`: the socket failed, with the transport's own
+  reason (a TLS alert, a reset, a QUIC close)
+""".
+-type close_reason() ::
+    normal
+    | peer_closed
+    | request_timeout
+    | keep_alive_timeout
+    | slow_client
+    | drained
+    | rejected
+    | {protocol_error, atom() | non_neg_integer()}
+    | {transport, term()}.
+
+-doc """
 Handle one event. The return value is the span for `request_start`,
 `listener_accept`, and `ws_upgrade`, and is ignored for every other
 event. See the module documentation for each event's arguments.
@@ -228,7 +264,7 @@ event. See the module documentation for each event's arguments.
     (request_throttled, {atom(), max_concurrent_requests | rate_limit}) -> term();
     (response_send_failed, {atom(), term()}) -> term();
     (listener_accept, {atom(), peer()}) -> span();
-    (listener_conn_close, {span(), non_neg_integer()}) -> term();
+    (listener_conn_close, {span(), non_neg_integer(), close_reason()}) -> term();
     (listener_conn_rejected, {atom(), max_clients}) -> term();
     (listener_accept_error, {atom(), term()}) -> term();
     (
