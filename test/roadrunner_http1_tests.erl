@@ -17,7 +17,7 @@ parses_post_with_target_and_leftover_test() ->
     ).
 
 stops_at_first_crlf_test() ->
-    %% Property the next parser (parse_header/1) relies on: anything after
+    %% Property the next parser (parse_headers/1) relies on: anything after
     %% the first CRLF must come back unchanged in Rest.
     ?assertEqual(
         {ok, ~"GET", ~"/", {1, 1}, ~"Host: x\r\nAccept: */*\r\n\r\n"},
@@ -214,25 +214,34 @@ oversized_line_without_method_rejected_test() ->
     ].
 
 %% =============================================================================
-%% parse_header/1
+%% Header lines (parse_headers/1)
 %% =============================================================================
 
 %% --- happy path ---
 
+%% One header line through `parse_headers/1`, with the blank line that
+%% ends the block appended, reported as that line's own result: the
+%% parsed name and value with what follows the block, or the error.
+header_line(Line) ->
+    case roadrunner_http1:parse_headers(<<Line/binary, "\r\n">>) of
+        {ok, [{Name, Value}], Rest} -> {ok, Name, Value, Rest};
+        Other -> Other
+    end.
+
 header_parses_simple_test() ->
     ?assertEqual(
         {ok, ~"host", ~"example.com", ~""},
-        roadrunner_http1:parse_header(~"Host: example.com\r\n")
+        header_line(~"Host: example.com\r\n")
     ).
 
 header_lowercases_name_test() ->
     ?assertEqual(
         {ok, ~"content-type", ~"text/html", ~""},
-        roadrunner_http1:parse_header(~"Content-Type: text/html\r\n")
+        header_line(~"Content-Type: text/html\r\n")
     ).
 
 %% Every name interned as a literal clause in
-%% `roadrunner_http1:fast_header/2`. Driving each one is
+%% `roadrunner_http1:fast_header/6`. Driving each one is
 %% what keeps this list and that one in step: a clause added there and
 %% not here leaves that clause uncovered, and the precommit gate
 %% requires full coverage.
@@ -300,7 +309,7 @@ header_interned_names_test_() ->
             binary_to_list(Name),
             ?_assertEqual(
                 {ok, roadrunner_bin:ascii_lowercase(Name), ~"v", ~""},
-                roadrunner_http1:parse_header(<<Name/binary, ": v\r\n">>)
+                header_line(<<Name/binary, ": v\r\n">>)
             )
         }
      || Name <- interned_header_names()
@@ -312,155 +321,155 @@ header_interned_near_miss_test_() ->
     [
         ?_assertEqual(
             {ok, ~"accept-encodinx", ~"v", ~""},
-            roadrunner_http1:parse_header(~"Accept-Encodinx: v\r\n")
+            header_line(~"Accept-Encodinx: v\r\n")
         ),
         ?_assertEqual(
             {ok, ~"hos", ~"v", ~""},
-            roadrunner_http1:parse_header(~"Hos: v\r\n")
+            header_line(~"Hos: v\r\n")
         ),
         ?_assertEqual(
             {ok, ~"hostx", ~"v", ~""},
-            roadrunner_http1:parse_header(~"Hostx: v\r\n")
+            header_line(~"Hostx: v\r\n")
         ),
         %% Same name, a casing no interned clause covers.
         ?_assertEqual(
             {ok, ~"host", ~"v", ~""},
-            roadrunner_http1:parse_header(~"hOST: v\r\n")
+            header_line(~"hOST: v\r\n")
         ),
         %% An interned name with a non-tchar byte appended is still rejected.
         ?_assertEqual(
             {error, bad_header},
-            roadrunner_http1:parse_header(~"Host(: v\r\n")
+            header_line(~"Host(: v\r\n")
         )
     ].
 
 header_allows_digit_in_name_test() ->
     ?assertEqual(
         {ok, ~"x1-y2", ~"foo", ~""},
-        roadrunner_http1:parse_header(~"X1-Y2: foo\r\n")
+        header_line(~"X1-Y2: foo\r\n")
     ).
 
 header_trims_ows_test() ->
     %% SP and HTAB on both sides are trimmed; internal whitespace preserved.
     ?assertEqual(
         {ok, ~"x-y", ~"a b", ~""},
-        roadrunner_http1:parse_header(~"X-Y: \t a b \t\r\n")
+        header_line(~"X-Y: \t a b \t\r\n")
     ).
 
 header_allows_htab_in_value_test() ->
     ?assertEqual(
         {ok, ~"x-foo", ~"a\tb", ~""},
-        roadrunner_http1:parse_header(~"X-Foo: a\tb\r\n")
+        header_line(~"X-Foo: a\tb\r\n")
     ).
 
 header_accepts_non_ascii_value_test() ->
     %% Bytes >= 0x80 are accepted in values (lenient — same as cowboy).
     ?assertEqual(
         {ok, ~"x-y", ~"café", ~""},
-        roadrunner_http1:parse_header(~"X-Y: café\r\n")
+        header_line(~"X-Y: café\r\n")
     ).
 
 header_empty_value_accepted_test() ->
     ?assertEqual(
         {ok, ~"x-empty", ~"", ~""},
-        roadrunner_http1:parse_header(~"X-Empty:\r\n")
+        header_line(~"X-Empty:\r\n")
     ).
 
 header_all_ows_value_trims_to_empty_test() ->
     ?assertEqual(
         {ok, ~"x-y", ~"", ~""},
-        roadrunner_http1:parse_header(~"X-Y:    \r\n")
+        header_line(~"X-Y:    \r\n")
     ).
 
-header_passes_rest_test() ->
+header_consecutive_lines_test() ->
     ?assertEqual(
-        {ok, ~"host", ~"x", ~"Accept: y\r\n"},
-        roadrunner_http1:parse_header(~"Host: x\r\nAccept: y\r\n")
+        {ok, [{~"host", ~"x"}, {~"accept", ~"y"}], ~"body"},
+        roadrunner_http1:parse_headers(~"Host: x\r\nAccept: y\r\n\r\nbody")
     ).
 
 %% --- end of headers ---
 
 header_end_of_headers_test() ->
     ?assertEqual(
-        {end_of_headers, ~""},
-        roadrunner_http1:parse_header(~"\r\n")
+        {ok, [], ~""},
+        roadrunner_http1:parse_headers(~"\r\n")
     ).
 
 header_end_of_headers_with_body_test() ->
     ?assertEqual(
-        {end_of_headers, ~"hello body"},
-        roadrunner_http1:parse_header(~"\r\nhello body")
+        {ok, [], ~"hello body"},
+        roadrunner_http1:parse_headers(~"\r\nhello body")
     ).
 
 %% --- incremental ---
 
 header_empty_input_returns_more_test() ->
-    ?assertMatch({more, _}, roadrunner_http1:parse_header(~"")).
+    ?assertMatch({more, _}, roadrunner_http1:parse_headers(~"")).
 
 header_partial_name_returns_more_test() ->
-    ?assertMatch({more, _}, roadrunner_http1:parse_header(~"Host")).
+    ?assertMatch({more, _}, roadrunner_http1:parse_headers(~"Host")).
 
 header_partial_after_colon_returns_more_test() ->
-    ?assertMatch({more, _}, roadrunner_http1:parse_header(~"Host:")).
+    ?assertMatch({more, _}, roadrunner_http1:parse_headers(~"Host:")).
 
 header_partial_value_returns_more_test() ->
-    ?assertMatch({more, _}, roadrunner_http1:parse_header(~"Host: example.com")).
+    ?assertMatch({more, _}, roadrunner_http1:parse_headers(~"Host: example.com")).
 
 header_partial_cr_returns_more_test() ->
-    ?assertMatch({more, _}, roadrunner_http1:parse_header(~"Host: example.com\r")).
+    ?assertMatch({more, _}, roadrunner_http1:parse_headers(~"Host: example.com\r")).
 
 %% --- bare LF ---
 
 header_bare_lf_at_start_rejected_test() ->
-    ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"\n")).
+    ?assertEqual({error, bad_header}, header_line(~"\n")).
 
 header_bare_lf_mid_buffer_rejected_test() ->
-    ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"Host\nfoo")).
+    ?assertEqual({error, bad_header}, header_line(~"Host\nfoo")).
 
 %% --- bad header ---
 
 header_empty_name_rejected_test() ->
-    ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~": value\r\n")).
+    ?assertEqual({error, bad_header}, header_line(~": value\r\n")).
 
 header_name_with_space_rejected_test() ->
-    ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"Ho st: x\r\n")).
+    ?assertEqual({error, bad_header}, header_line(~"Ho st: x\r\n")).
 
 header_name_with_control_char_rejected_test() ->
-    ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"Ho\x{01}st: x\r\n")).
+    ?assertEqual({error, bad_header}, header_line(~"Ho\x{01}st: x\r\n")).
 
 %% Hits the lowercase-only scan path's digit + mark + invalid clauses.
 header_lowercase_name_with_digit_test() ->
     ?assertEqual(
         {ok, ~"x-rate-1", ~"y", ~""},
-        roadrunner_http1:parse_header(~"x-rate-1: y\r\n")
+        header_line(~"x-rate-1: y\r\n")
     ).
 
 header_lowercase_name_with_mark_test() ->
     ?assertEqual(
         {ok, ~"x.foo!", ~"y", ~""},
-        roadrunner_http1:parse_header(~"x.foo!: y\r\n")
+        header_line(~"x.foo!: y\r\n")
     ).
 
 header_lowercase_name_with_invalid_byte_rejected_test() ->
-    ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"x bad: y\r\n")).
+    ?assertEqual({error, bad_header}, header_line(~"x bad: y\r\n")).
 
 %% Hits the mixed-case scan path's digit + mark clauses.
 header_mixed_case_name_with_mark_test() ->
     ?assertEqual(
         {ok, ~"x.foo!", ~"y", ~""},
-        roadrunner_http1:parse_header(~"X.foo!: y\r\n")
+        header_line(~"X.foo!: y\r\n")
     ).
 
 header_missing_colon_rejected_test() ->
-    ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"Host example.com\r\n")).
+    ?assertEqual({error, bad_header}, header_line(~"Host example.com\r\n")).
 
 %% --- header injection ---
 
 header_cr_in_value_rejected_test() ->
-    ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"X-Inj: foo\rbar\r\n")).
+    ?assertEqual({error, bad_header}, header_line(~"X-Inj: foo\rbar\r\n")).
 
 header_nul_in_value_rejected_test() ->
-    ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"X-Inj: foo\x{00}bar\r\n")).
+    ?assertEqual({error, bad_header}, header_line(~"X-Inj: foo\x{00}bar\r\n")).
 
 header_value_every_byte_at_every_position_test() ->
     %% Every byte value at every position of a 19-byte value: each SWAR
@@ -471,7 +480,7 @@ header_value_every_byte_at_every_position_test() ->
         begin
             <<Pre:Pos/binary, _, Post/binary>> = Fill,
             Value = <<Pre/binary, B, Post/binary>>,
-            Result = roadrunner_http1:parse_header(<<"x-test: ", Value/binary, "\r\n">>),
+            Result = header_line(<<"x-test: ", Value/binary, "\r\n">>),
             case B =:= 16#09 orelse (B >= 16#20 andalso B =/= 16#7F) of
                 true -> ?assertEqual({ok, ~"x-test", Value, <<>>}, Result);
                 false -> ?assertMatch({error, _}, Result)
@@ -484,26 +493,26 @@ header_value_tab_then_invalid_byte_rejected_test() ->
     %% A tab hands the rest of the value to the byte check, which must
     %% still catch a CTL after it.
     ?assertEqual(
-        {error, bad_header}, roadrunner_http1:parse_header(~"x-test: a\tbc\x{01}defghijklmnop\r\n")
+        {error, bad_header}, header_line(~"x-test: a\tbc\x{01}defghijklmnop\r\n")
     ).
 
 %% --- obs-fold ---
 
 header_obs_fold_space_rejected_test() ->
-    ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"  continuation\r\n")).
+    ?assertEqual({error, bad_header}, header_line(~"  continuation\r\n")).
 
 header_obs_fold_tab_rejected_test() ->
-    ?assertEqual({error, bad_header}, roadrunner_http1:parse_header(~"\tcontinuation\r\n")).
+    ?assertEqual({error, bad_header}, header_line(~"\tcontinuation\r\n")).
 
 %% --- limits ---
 
 header_oversized_no_crlf_rejected_test() ->
     Big = <<"X: ", (binary:copy(~"a", 8200))/binary>>,
-    ?assertEqual({error, header_too_long}, roadrunner_http1:parse_header(Big)).
+    ?assertEqual({error, header_too_long}, header_line(Big)).
 
 header_oversized_with_crlf_rejected_test() ->
     Big = <<(binary:copy(~"a", 8193))/binary, "\r\n">>,
-    ?assertEqual({error, header_too_long}, roadrunner_http1:parse_header(Big)).
+    ?assertEqual({error, header_too_long}, header_line(Big)).
 
 %% =============================================================================
 %% parse_headers/1
@@ -667,7 +676,7 @@ header_name_with_trailing_space_rejected_test() ->
     %% and a known request-smuggling vector with proxies.
     ?assertEqual(
         {error, bad_header},
-        roadrunner_http1:parse_header(~"Host : example.com\r\n")
+        header_line(~"Host : example.com\r\n")
     ).
 
 request_http10_no_host_accepted_test() ->

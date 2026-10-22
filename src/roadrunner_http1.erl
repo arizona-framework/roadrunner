@@ -11,7 +11,6 @@
 
 -export([
     parse_request_line/1,
-    parse_header/1,
     parse_headers/1,
     parse_request/1,
     parse_request/2,
@@ -63,6 +62,12 @@
 %% should reference it from.
 -type version() :: roadrunner_http:version().
 -type headers() :: roadrunner_http:headers().
+%% `{MaxBlock, MaxCount}`: the header block's byte and line caps.
+-type header_limits() :: {pos_integer(), pos_integer()}.
+-type headers_result() ::
+    {ok, headers(), binary()}
+    | {more, undefined}
+    | {error, bad_header | header_too_long | header_block_too_long | too_many_headers}.
 -type status() :: roadrunner_http:status().
 
 -doc """
@@ -435,52 +440,16 @@ validate_method_chars(_) ->
 valid_target(<<>>) -> false;
 valid_target(Target) -> roadrunner_http:valid_target_bytes(Target).
 
--doc """
-Parse a single HTTP/1.1 header line.
-
-The argument is the unconsumed buffer after the request line (or a
-previous header). On success returns `{ok, Name, Value, Rest}` with the
-name lowercased and the value trimmed of leading/trailing OWS; the
-`Rest` is the remaining buffer for the next call.
-
-When the input begins with the empty line that terminates the header
-block, returns `{end_of_headers, Rest}` so the caller can switch to
-body framing without re-scanning bytes.
-
-Header injection (CR or NUL inside a value), obsolete line folding
-(continuation lines starting with whitespace, RFC 9112 §5.2 obs-fold),
-and lines exceeding 8192 bytes are rejected with `bad_header` /
-`header_too_long`. Header names follow the RFC 9110 §5.6.2 token grammar.
-""".
-%% Spec deviates from the original plan: we return `{end_of_headers, Rest}`
-%% (a tuple) rather than the bare atom `end_of_headers`, so the caller does
-%% not lose track of the body bytes that follow the empty line.
--spec parse_header(binary()) ->
-    {ok, Name :: binary(), Value :: binary(), Rest :: binary()}
-    | {end_of_headers, Rest :: binary()}
-    | {more, undefined}
-    | {error, bad_header | header_too_long}.
-parse_header(Bin) when is_binary(Bin) ->
-    parse_header(Bin, ?MAX_HEADER_LINE).
-
--spec parse_header(binary(), pos_integer()) ->
-    {ok, binary(), binary(), binary()}
-    | {end_of_headers, binary()}
-    | {more, undefined}
-    | {error, bad_header | header_too_long}.
-parse_header(Bin, MaxLine) ->
-    case fast_header(Bin, MaxLine) of
-        slow -> parse_header_slow(Bin, MaxLine);
-        Parsed -> Parsed
-    end.
-
 %% One pass over the usual header line: the name walked to its colon,
 %% the value scanned 7 bytes at a time to its CRLF, OWS trimmed, and the
 %% line length checked, instead of an LF search, a `binary:split/2` on
 %% the colon, a name walk and a value walk (a 13-header browser request
 %% parses in about 40% less time). Anything else (a partial line, any
-%% error, a line over the limit, obs-fold) returns `slow` and takes
-%% `parse_header_slow/4`, which decides it exactly as before. Names, values
+%% error, a line over the limit, obs-fold) takes `parse_header_slow/2` for
+%% that line, which decides it exactly as before. A parsed line goes
+%% straight on to the next (`header_lines/6`), with the count, consumed
+%% bytes and headers so far as arguments: handing each header back in a
+%% tuple for a loop to unpack cost about 20 ns per header. Names, values
 %% and the request line's parts are sliced with bit-syntax matches, which
 %% compile to inline match instructions, rather than `binary:part/3` calls:
 %% 6-30% less CPU per parsed request.
@@ -498,166 +467,185 @@ parse_header(Bin, MaxLine) ->
 %% `roadrunner_http1_tests` drives each entry, so a clause added here
 %% without a test drops coverage below the 100% the precommit gate
 %% requires.
--spec fast_header(binary(), pos_integer()) ->
-    {ok, binary(), binary(), binary()} | {end_of_headers, binary()} | slow.
-fast_header(<<"\r\n", Rest/binary>>, _Max) ->
-    {end_of_headers, Rest};
-fast_header(<<"Accept:", V/binary>> = Bin, Max) ->
-    fast_value(~"accept", V, Bin, Max);
-fast_header(<<"Accept-Charset:", V/binary>> = Bin, Max) ->
-    fast_value(~"accept-charset", V, Bin, Max);
-fast_header(<<"Accept-Encoding:", V/binary>> = Bin, Max) ->
-    fast_value(~"accept-encoding", V, Bin, Max);
-fast_header(<<"Accept-Language:", V/binary>> = Bin, Max) ->
-    fast_value(~"accept-language", V, Bin, Max);
-fast_header(<<"Access-Control-Request-Headers:", V/binary>> = Bin, Max) ->
-    fast_value(~"access-control-request-headers", V, Bin, Max);
-fast_header(<<"Access-Control-Request-Method:", V/binary>> = Bin, Max) ->
-    fast_value(~"access-control-request-method", V, Bin, Max);
-fast_header(<<"Authorization:", V/binary>> = Bin, Max) ->
-    fast_value(~"authorization", V, Bin, Max);
-fast_header(<<"Cache-Control:", V/binary>> = Bin, Max) ->
-    fast_value(~"cache-control", V, Bin, Max);
-fast_header(<<"Connection:", V/binary>> = Bin, Max) ->
-    fast_value(~"connection", V, Bin, Max);
-fast_header(<<"Content-Disposition:", V/binary>> = Bin, Max) ->
-    fast_value(~"content-disposition", V, Bin, Max);
-fast_header(<<"Content-Encoding:", V/binary>> = Bin, Max) ->
-    fast_value(~"content-encoding", V, Bin, Max);
-fast_header(<<"Content-Language:", V/binary>> = Bin, Max) ->
-    fast_value(~"content-language", V, Bin, Max);
-fast_header(<<"Content-Length:", V/binary>> = Bin, Max) ->
-    fast_value(~"content-length", V, Bin, Max);
-fast_header(<<"Content-Type:", V/binary>> = Bin, Max) ->
-    fast_value(~"content-type", V, Bin, Max);
-fast_header(<<"Cookie:", V/binary>> = Bin, Max) ->
-    fast_value(~"cookie", V, Bin, Max);
-fast_header(<<"Date:", V/binary>> = Bin, Max) ->
-    fast_value(~"date", V, Bin, Max);
-fast_header(<<"DNT:", V/binary>> = Bin, Max) ->
-    fast_value(~"dnt", V, Bin, Max);
-fast_header(<<"Expect:", V/binary>> = Bin, Max) ->
-    fast_value(~"expect", V, Bin, Max);
-fast_header(<<"Forwarded:", V/binary>> = Bin, Max) ->
-    fast_value(~"forwarded", V, Bin, Max);
-fast_header(<<"From:", V/binary>> = Bin, Max) ->
-    fast_value(~"from", V, Bin, Max);
-fast_header(<<"Host:", V/binary>> = Bin, Max) ->
-    fast_value(~"host", V, Bin, Max);
-fast_header(<<"If-Match:", V/binary>> = Bin, Max) ->
-    fast_value(~"if-match", V, Bin, Max);
-fast_header(<<"If-Modified-Since:", V/binary>> = Bin, Max) ->
-    fast_value(~"if-modified-since", V, Bin, Max);
-fast_header(<<"If-None-Match:", V/binary>> = Bin, Max) ->
-    fast_value(~"if-none-match", V, Bin, Max);
-fast_header(<<"If-Range:", V/binary>> = Bin, Max) ->
-    fast_value(~"if-range", V, Bin, Max);
-fast_header(<<"If-Unmodified-Since:", V/binary>> = Bin, Max) ->
-    fast_value(~"if-unmodified-since", V, Bin, Max);
-fast_header(<<"Max-Forwards:", V/binary>> = Bin, Max) ->
-    fast_value(~"max-forwards", V, Bin, Max);
-fast_header(<<"Origin:", V/binary>> = Bin, Max) ->
-    fast_value(~"origin", V, Bin, Max);
-fast_header(<<"Pragma:", V/binary>> = Bin, Max) ->
-    fast_value(~"pragma", V, Bin, Max);
-fast_header(<<"Proxy-Authorization:", V/binary>> = Bin, Max) ->
-    fast_value(~"proxy-authorization", V, Bin, Max);
-fast_header(<<"Range:", V/binary>> = Bin, Max) ->
-    fast_value(~"range", V, Bin, Max);
-fast_header(<<"Referer:", V/binary>> = Bin, Max) ->
-    fast_value(~"referer", V, Bin, Max);
-fast_header(<<"Sec-Fetch-Dest:", V/binary>> = Bin, Max) ->
-    fast_value(~"sec-fetch-dest", V, Bin, Max);
-fast_header(<<"Sec-Fetch-Mode:", V/binary>> = Bin, Max) ->
-    fast_value(~"sec-fetch-mode", V, Bin, Max);
-fast_header(<<"Sec-Fetch-Site:", V/binary>> = Bin, Max) ->
-    fast_value(~"sec-fetch-site", V, Bin, Max);
-fast_header(<<"Sec-Fetch-User:", V/binary>> = Bin, Max) ->
-    fast_value(~"sec-fetch-user", V, Bin, Max);
-fast_header(<<"Sec-WebSocket-Extensions:", V/binary>> = Bin, Max) ->
-    fast_value(~"sec-websocket-extensions", V, Bin, Max);
-fast_header(<<"Sec-WebSocket-Key:", V/binary>> = Bin, Max) ->
-    fast_value(~"sec-websocket-key", V, Bin, Max);
-fast_header(<<"Sec-WebSocket-Protocol:", V/binary>> = Bin, Max) ->
-    fast_value(~"sec-websocket-protocol", V, Bin, Max);
-fast_header(<<"Sec-WebSocket-Version:", V/binary>> = Bin, Max) ->
-    fast_value(~"sec-websocket-version", V, Bin, Max);
-fast_header(<<"TE:", V/binary>> = Bin, Max) ->
-    fast_value(~"te", V, Bin, Max);
-fast_header(<<"Trailer:", V/binary>> = Bin, Max) ->
-    fast_value(~"trailer", V, Bin, Max);
-fast_header(<<"Transfer-Encoding:", V/binary>> = Bin, Max) ->
-    fast_value(~"transfer-encoding", V, Bin, Max);
-fast_header(<<"Upgrade:", V/binary>> = Bin, Max) ->
-    fast_value(~"upgrade", V, Bin, Max);
-fast_header(<<"Upgrade-Insecure-Requests:", V/binary>> = Bin, Max) ->
-    fast_value(~"upgrade-insecure-requests", V, Bin, Max);
-fast_header(<<"User-Agent:", V/binary>> = Bin, Max) ->
-    fast_value(~"user-agent", V, Bin, Max);
-fast_header(<<"Via:", V/binary>> = Bin, Max) ->
-    fast_value(~"via", V, Bin, Max);
-fast_header(<<"X-Forwarded-For:", V/binary>> = Bin, Max) ->
-    fast_value(~"x-forwarded-for", V, Bin, Max);
-fast_header(<<"X-Forwarded-Host:", V/binary>> = Bin, Max) ->
-    fast_value(~"x-forwarded-host", V, Bin, Max);
-fast_header(<<"X-Forwarded-Proto:", V/binary>> = Bin, Max) ->
-    fast_value(~"x-forwarded-proto", V, Bin, Max);
-fast_header(<<"X-Real-IP:", V/binary>> = Bin, Max) ->
-    fast_value(~"x-real-ip", V, Bin, Max);
-fast_header(<<"X-Requested-With:", V/binary>> = Bin, Max) ->
-    fast_value(~"x-requested-with", V, Bin, Max);
-fast_header(Bin, Max) ->
-    fast_name_lower(Bin, Bin, Max).
+-spec fast_header(
+    binary(), pos_integer(), non_neg_integer(), non_neg_integer(), headers(), header_limits()
+) -> headers_result().
+fast_header(<<"\r\n", Rest/binary>>, _Max, _Count, _Consumed, Acc, _Limits) ->
+    {ok, lists:reverse(Acc), Rest};
+fast_header(<<"Accept:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"accept", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Accept-Charset:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"accept-charset", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Accept-Encoding:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"accept-encoding", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Accept-Language:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"accept-language", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(
+    <<"Access-Control-Request-Headers:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits
+) ->
+    fast_value(~"access-control-request-headers", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(
+    <<"Access-Control-Request-Method:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits
+) ->
+    fast_value(~"access-control-request-method", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Authorization:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"authorization", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Cache-Control:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"cache-control", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Connection:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"connection", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Content-Disposition:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"content-disposition", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Content-Encoding:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"content-encoding", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Content-Language:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"content-language", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Content-Length:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"content-length", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Content-Type:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"content-type", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Cookie:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"cookie", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Date:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"date", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"DNT:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"dnt", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Expect:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"expect", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Forwarded:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"forwarded", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"From:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"from", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Host:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"host", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"If-Match:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"if-match", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"If-Modified-Since:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"if-modified-since", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"If-None-Match:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"if-none-match", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"If-Range:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"if-range", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"If-Unmodified-Since:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"if-unmodified-since", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Max-Forwards:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"max-forwards", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Origin:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"origin", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Pragma:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"pragma", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Proxy-Authorization:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"proxy-authorization", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Range:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"range", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Referer:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"referer", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Sec-Fetch-Dest:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"sec-fetch-dest", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Sec-Fetch-Mode:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"sec-fetch-mode", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Sec-Fetch-Site:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"sec-fetch-site", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Sec-Fetch-User:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"sec-fetch-user", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Sec-WebSocket-Extensions:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"sec-websocket-extensions", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Sec-WebSocket-Key:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"sec-websocket-key", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Sec-WebSocket-Protocol:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"sec-websocket-protocol", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Sec-WebSocket-Version:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"sec-websocket-version", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"TE:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"te", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Trailer:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"trailer", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Transfer-Encoding:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"transfer-encoding", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Upgrade:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"upgrade", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Upgrade-Insecure-Requests:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"upgrade-insecure-requests", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"User-Agent:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"user-agent", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"Via:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"via", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"X-Forwarded-For:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"x-forwarded-for", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"X-Forwarded-Host:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"x-forwarded-host", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"X-Forwarded-Proto:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"x-forwarded-proto", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"X-Real-IP:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"x-real-ip", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(<<"X-Requested-With:", V/binary>> = Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_value(~"x-requested-with", V, Bin, Max, Count, Consumed, Acc, Limits);
+fast_header(Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_name_lower(Bin, Bin, Max, Count, Consumed, Acc, Limits).
 
 %% Walk the name to its colon while every byte is a lowercase tchar; on
 %% uppercase switch to `fast_name_upper/3`, which lowercases the name.
--spec fast_name_lower(binary(), binary(), pos_integer()) ->
-    {ok, binary(), binary(), binary()} | slow.
-fast_name_lower(<<C, R/binary>>, Bin, Max) when C >= $a, C =< $z ->
-    fast_name_lower(R, Bin, Max);
-fast_name_lower(<<$-, R/binary>>, Bin, Max) ->
-    fast_name_lower(R, Bin, Max);
-fast_name_lower(<<$:, R/binary>>, Bin, Max) ->
+-spec fast_name_lower(
+    binary(),
+    binary(),
+    pos_integer(),
+    non_neg_integer(),
+    non_neg_integer(),
+    headers(),
+    header_limits()
+) -> headers_result().
+fast_name_lower(<<C, R/binary>>, Bin, Max, Count, Consumed, Acc, Limits) when C >= $a, C =< $z ->
+    fast_name_lower(R, Bin, Max, Count, Consumed, Acc, Limits);
+fast_name_lower(<<$-, R/binary>>, Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_name_lower(R, Bin, Max, Count, Consumed, Acc, Limits);
+fast_name_lower(<<$:, R/binary>>, Bin, Max, Count, Consumed, Acc, Limits) ->
     case byte_size(Bin) - byte_size(R) - 1 of
         0 ->
-            slow;
+            parse_header_slow(Bin, Max);
         Len ->
             <<Name:Len/binary, _/binary>> = Bin,
-            fast_value(Name, R, Bin, Max)
+            fast_value(Name, R, Bin, Max, Count, Consumed, Acc, Limits)
     end;
-fast_name_lower(<<C, R/binary>>, Bin, Max) when C >= $0, C =< $9 ->
-    fast_name_lower(R, Bin, Max);
-fast_name_lower(<<C, R/binary>>, Bin, Max) when C >= $A, C =< $Z ->
-    fast_name_upper(R, Bin, Max);
-fast_name_lower(<<C, R/binary>>, Bin, Max) ->
+fast_name_lower(<<C, R/binary>>, Bin, Max, Count, Consumed, Acc, Limits) when C >= $0, C =< $9 ->
+    fast_name_lower(R, Bin, Max, Count, Consumed, Acc, Limits);
+fast_name_lower(<<C, R/binary>>, Bin, Max, Count, Consumed, Acc, Limits) when C >= $A, C =< $Z ->
+    fast_name_upper(R, Bin, Max, Count, Consumed, Acc, Limits);
+fast_name_lower(<<C, R/binary>>, Bin, Max, Count, Consumed, Acc, Limits) ->
     case is_tchar(C) of
-        true -> fast_name_lower(R, Bin, Max);
-        false -> slow
+        true -> fast_name_lower(R, Bin, Max, Count, Consumed, Acc, Limits);
+        false -> parse_header_slow(Bin, Max)
     end;
-fast_name_lower(<<>>, _Bin, _Max) ->
-    slow.
+fast_name_lower(<<>>, Bin, Max, _Count, _Consumed, _Acc, _Limits) ->
+    parse_header_slow(Bin, Max).
 
--spec fast_name_upper(binary(), binary(), pos_integer()) ->
-    {ok, binary(), binary(), binary()} | slow.
-fast_name_upper(<<C, R/binary>>, Bin, Max) when C >= $a, C =< $z ->
-    fast_name_upper(R, Bin, Max);
-fast_name_upper(<<$-, R/binary>>, Bin, Max) ->
-    fast_name_upper(R, Bin, Max);
-fast_name_upper(<<$:, R/binary>>, Bin, Max) ->
+-spec fast_name_upper(
+    binary(),
+    binary(),
+    pos_integer(),
+    non_neg_integer(),
+    non_neg_integer(),
+    headers(),
+    header_limits()
+) -> headers_result().
+fast_name_upper(<<C, R/binary>>, Bin, Max, Count, Consumed, Acc, Limits) when C >= $a, C =< $z ->
+    fast_name_upper(R, Bin, Max, Count, Consumed, Acc, Limits);
+fast_name_upper(<<$-, R/binary>>, Bin, Max, Count, Consumed, Acc, Limits) ->
+    fast_name_upper(R, Bin, Max, Count, Consumed, Acc, Limits);
+fast_name_upper(<<$:, R/binary>>, Bin, Max, Count, Consumed, Acc, Limits) ->
     Len = byte_size(Bin) - byte_size(R) - 1,
     <<Name:Len/binary, _/binary>> = Bin,
-    fast_value(roadrunner_bin:ascii_lowercase(Name), R, Bin, Max);
-fast_name_upper(<<C, R/binary>>, Bin, Max) when C >= $0, C =< $9 ->
-    fast_name_upper(R, Bin, Max);
-fast_name_upper(<<C, R/binary>>, Bin, Max) when C >= $A, C =< $Z ->
-    fast_name_upper(R, Bin, Max);
-fast_name_upper(<<C, R/binary>>, Bin, Max) ->
+    fast_value(roadrunner_bin:ascii_lowercase(Name), R, Bin, Max, Count, Consumed, Acc, Limits);
+fast_name_upper(<<C, R/binary>>, Bin, Max, Count, Consumed, Acc, Limits) when C >= $0, C =< $9 ->
+    fast_name_upper(R, Bin, Max, Count, Consumed, Acc, Limits);
+fast_name_upper(<<C, R/binary>>, Bin, Max, Count, Consumed, Acc, Limits) when C >= $A, C =< $Z ->
+    fast_name_upper(R, Bin, Max, Count, Consumed, Acc, Limits);
+fast_name_upper(<<C, R/binary>>, Bin, Max, Count, Consumed, Acc, Limits) ->
     case is_tchar(C) of
-        true -> fast_name_upper(R, Bin, Max);
-        false -> slow
+        true -> fast_name_upper(R, Bin, Max, Count, Consumed, Acc, Limits);
+        false -> parse_header_slow(Bin, Max)
     end;
-fast_name_upper(<<>>, _Bin, _Max) ->
-    slow.
+fast_name_upper(<<>>, Bin, Max, _Count, _Consumed, _Acc, _Limits) ->
+    parse_header_slow(Bin, Max).
 
 %% RFC 9110 §5.6.2 tchar mark fallback. The fast name walkers above
 %% handle ALPHA / DIGIT / `-` inline; this only sees the remaining
@@ -686,21 +674,39 @@ is_tchar(_) ->
     false.
 
 %% Skip leading OWS, scan the value to its CRLF, check the line length
-%% (without the CRLF) against the limit, and trim trailing OWS.
--spec fast_value(binary(), binary(), binary(), pos_integer()) ->
-    {ok, binary(), binary(), binary()} | slow.
-fast_value(Name, <<C, R/binary>>, Bin, Max) when C =:= $\s; C =:= $\t ->
-    fast_value(Name, R, Bin, Max);
-fast_value(Name, Value, Bin, Max) ->
+%% (without the CRLF) against the limit, and trim trailing OWS; then go on
+%% to the next line.
+-spec fast_value(
+    binary(),
+    binary(),
+    binary(),
+    pos_integer(),
+    non_neg_integer(),
+    non_neg_integer(),
+    headers(),
+    header_limits()
+) -> headers_result().
+fast_value(Name, <<C, R/binary>>, Bin, Max, Count, Consumed, Acc, Limits) when
+    C =:= $\s; C =:= $\t
+->
+    fast_value(Name, R, Bin, Max, Count, Consumed, Acc, Limits);
+fast_value(Name, Value, Bin, Max, Count, Consumed, Acc, Limits) ->
     case scan_value(Value) of
         slow ->
-            slow;
+            parse_header_slow(Bin, Max);
         Rest when byte_size(Bin) - byte_size(Rest) - 2 =< Max ->
             RawLen = byte_size(Value) - byte_size(Rest) - 2,
             <<Raw:RawLen/binary, _/binary>> = Value,
-            {ok, Name, trim_trailing_ows(Raw), Rest};
+            header_lines(
+                Rest,
+                Count + 1,
+                Consumed + byte_size(Bin) - byte_size(Rest),
+                Max,
+                Limits,
+                [{Name, trim_trailing_ows(Raw)} | Acc]
+            );
         _Rest ->
-            slow
+            parse_header_slow(Bin, Max)
     end.
 
 %% Scan a header value to its CRLF, rejecting CR, LF, NUL and the other
@@ -742,7 +748,7 @@ trim_trailing_ows(Value) ->
     end.
 
 %% Every complete header line within `MaxLine` that is valid takes
-%% `fast_header/2`, so what reaches here is a line that is still
+%% `fast_header/6`, so what reaches here is a line that is still
 %% incomplete, over the limit, or invalid; this only tells them apart.
 -spec parse_header_slow(binary(), pos_integer()) ->
     {more, undefined} | {error, bad_header | header_too_long}.
@@ -767,7 +773,7 @@ parse_header_slow(Bin, MaxLine) ->
 -doc """
 Parse the full HTTP/1.1 header block.
 
-Loops `parse_header/1` until the empty line that ends the block,
+Parses header lines until the empty line that ends the block,
 returning the accumulated headers in wire order (repeated headers
 preserved as separate entries — important for `Set-Cookie`).
 
@@ -804,7 +810,7 @@ parse_headers(Bin) ->
         | too_many_headers
         | conflicting_framing}.
 parse_headers(Bin, {MaxLine, MaxBlock, MaxCount}) when is_binary(Bin) ->
-    case parse_headers_loop(Bin, 0, 0, MaxLine, MaxBlock, MaxCount) of
+    case header_lines(Bin, 0, 0, MaxLine, {MaxBlock, MaxCount}, []) of
         {ok, Headers, Rest} ->
             case check_framing(Headers) of
                 ok -> {ok, Headers, Rest};
@@ -814,76 +820,24 @@ parse_headers(Bin, {MaxLine, MaxBlock, MaxCount}) when is_binary(Bin) ->
             Other
     end.
 
--spec parse_headers_loop(
-    binary(),
-    non_neg_integer(),
-    non_neg_integer(),
-    pos_integer(),
-    pos_integer(),
-    pos_integer()
-) ->
-    {ok, headers(), binary()}
-    | {more, undefined}
-    | {error,
-        bad_header
-        | header_too_long
-        | header_block_too_long
-        | too_many_headers}.
-parse_headers_loop(Bin, Count, Consumed, MaxLine, MaxBlock, MaxCount) ->
-    parse_headers_loop(Bin, Count, Consumed, MaxLine, MaxBlock, MaxCount, []).
-
-%% Tail-recursive: the count, consumed-byte tally, and the parsed pairs
-%% thread forward as arguments (pairs consed in reverse, flipped once at
-%% the terminating blank line), rather than unpacking and repacking the
-%% `{ok, headers(), binary()}` tuple on every header as body recursion does.
--spec parse_headers_loop(
-    binary(),
-    non_neg_integer(),
-    non_neg_integer(),
-    pos_integer(),
-    pos_integer(),
-    pos_integer(),
-    headers()
-) ->
-    {ok, headers(), binary()}
-    | {more, undefined}
-    | {error,
-        bad_header
-        | header_too_long
-        | header_block_too_long
-        | too_many_headers}.
-parse_headers_loop(
-    _Bin, Count, _Consumed, _MaxLine, _MaxBlock, MaxCount, _Acc
-) when
+%% Tail-recursive over the header lines: the count, consumed-byte tally
+%% and the parsed pairs thread forward as arguments (pairs consed in
+%% reverse, flipped once at the terminating blank line), through the fast
+%% path (`fast_header/6`). A line it doesn't take ends the walk in
+%% `parse_header_slow/2`, which tells an incomplete line from a bad one.
+-spec header_lines(
+    binary(), non_neg_integer(), non_neg_integer(), pos_integer(), header_limits(), headers()
+) -> headers_result().
+header_lines(_Bin, Count, _Consumed, _MaxLine, {_MaxBlock, MaxCount}, _Acc) when
     Count > MaxCount
 ->
     {error, too_many_headers};
-parse_headers_loop(
-    _Bin, _Count, Consumed, _MaxLine, MaxBlock, _MaxCount, _Acc
-) when
+header_lines(_Bin, _Count, Consumed, _MaxLine, {MaxBlock, _MaxCount}, _Acc) when
     Consumed > MaxBlock
 ->
     {error, header_block_too_long};
-parse_headers_loop(Bin, Count, Consumed, MaxLine, MaxBlock, MaxCount, Acc) ->
-    case parse_header(Bin, MaxLine) of
-        {ok, Name, Value, Rest} ->
-            Used = byte_size(Bin) - byte_size(Rest),
-            parse_headers_loop(
-                Rest,
-                Count + 1,
-                Consumed + Used,
-                MaxLine,
-                MaxBlock,
-                MaxCount,
-                [{Name, Value} | Acc]
-            );
-        {end_of_headers, Rest} ->
-            {ok, lists:reverse(Acc), Rest};
-        {more, _} = More ->
-            More;
-        {error, _} = Err ->
-            Err
-    end.
+header_lines(Bin, Count, Consumed, MaxLine, Limits, Acc) ->
+    fast_header(Bin, MaxLine, Count, Consumed, Acc, Limits).
 
 %% Reject the two classic smuggling shapes:
 %% 1. Transfer-Encoding present alongside any Content-Length.
@@ -926,7 +880,7 @@ check_cls_consistent(_, _) -> error.
 %% result is stashed on the request map's `cached_decisions` field
 %% for `roadrunner_conn` to read; handlers should ignore it.
 %%
-%% Header names are already lowercased by `parse_header/1`; this pass
+%% Header names are already lowercased by `parse_headers/1`; this pass
 %% also lowercases the value of `Connection` (whose tokens are
 %% case-insensitive per RFC 9110) and computes booleans for
 %% `Transfer-Encoding: chunked` and what `Expect` asks for.

@@ -24,9 +24,6 @@ return one of its documented shapes (`{ok, _}`, `{more, _}`, or
 prop_parse_request_line_never_crashes() ->
     ?FORALL(B, binary(), is_documented_shape(roadrunner_http1:parse_request_line(B))).
 
-prop_parse_header_never_crashes() ->
-    ?FORALL(B, binary(), is_documented_shape(roadrunner_http1:parse_header(B))).
-
 prop_parse_headers_never_crashes() ->
     ?FORALL(B, binary(), is_documented_shape(roadrunner_http1:parse_headers(B))).
 
@@ -90,7 +87,7 @@ feed(Fn, <<C, Rest/binary>>, Buf) ->
 
 %% =============================================================================
 %% Header-name normalization: the interned literal clauses in
-%% `roadrunner_http1:fast_header/2` must be indistinguishable from the
+%% `roadrunner_http1:fast_header/6` must be indistinguishable from the
 %% general validate-and-lowercase path they short-circuit.
 %% =============================================================================
 
@@ -98,7 +95,7 @@ prop_parse_header_name_matches_reference() ->
     ?FORALL(
         Name,
         header_name_bytes(),
-        roadrunner_http1:parse_header(<<Name/binary, ": v\r\n">>) =:=
+        roadrunner_http1:parse_headers(<<Name/binary, ": v\r\n\r\n">>) =:=
             reference_header_name(Name)
     ).
 
@@ -107,7 +104,7 @@ prop_parse_header_name_matches_reference() ->
 %% rejected.
 reference_header_name(Name) ->
     case is_tchar_name(Name) of
-        true -> {ok, roadrunner_bin:ascii_lowercase(Name), ~"v", ~""};
+        true -> {ok, [{roadrunner_bin:ascii_lowercase(Name), ~"v"}], ~""};
         false -> {error, bad_header}
     end.
 
@@ -123,7 +120,7 @@ is_tchar(C) -> lists:member(C, "!#$%&'*+-.^_`|~").
 %% the generator lands on the literal clauses and on the near-misses one
 %% flipped byte away from them. `:`, CR and LF are excluded because they
 %% frame the line rather than the name; arbitrary binaries are already
-%% covered by `prop_parse_header_never_crashes/0`.
+%% covered by `prop_parse_headers_never_crashes/0`.
 header_name_bytes() ->
     oneof([arbitrary_name(), recased_common_name()]).
 

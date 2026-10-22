@@ -324,7 +324,7 @@ header(Name, #{headers := H}) when is_binary(Name) ->
     end.
 
 %% Look up a header by a name that is already lowercase — the form
-%% `roadrunner_http1:parse_header/1` stores and the form every
+%% `roadrunner_http1:parse_headers/1` stores and the form every
 %% framework-internal call site passes as a literal. Skips the
 %% case-normalizing scan `header/2` runs per call, which is dead work
 %% on a name that is its own lowercase. Handler code wants `header/2`,
