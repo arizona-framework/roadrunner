@@ -1,0 +1,79 @@
+---
+# Composite action: `erlef/setup-beam`, retried. setup-beam resolves the
+# requested OTP / rebar3 version against a release list it fetches from the
+# GitHub REST API, and a failed or empty response fails the step with
+# "version not found in version list". That is a transient API fault, not a
+# bad version, so try up to three times with a pause between attempts.
+#
+# Same inputs and outputs as setup-beam for what this repo uses, so callers
+# only swap the `uses:` line. The caller must run `actions/checkout` first.
+name: Setup BEAM (retried)
+description: Run erlef/setup-beam, retrying a transient version-list failure.
+
+inputs:
+  otp-version:
+    description: OTP version (setup-beam `otp-version`).
+    default: ""
+  rebar3-version:
+    description: rebar3 version (setup-beam `rebar3-version`).
+    default: ""
+  version-type:
+    description: setup-beam `version-type`, `loose` or `strict`.
+    default: loose
+  version-file:
+    description: setup-beam `version-file`, e.g. `.tool-versions`.
+    default: ""
+
+outputs:
+  otp-version:
+    description: The OTP version installed.
+    value: >-
+      ${{ steps.attempt-1.outputs.otp-version
+        || steps.attempt-2.outputs.otp-version
+        || steps.attempt-3.outputs.otp-version }}
+  rebar3-version:
+    description: The rebar3 version installed.
+    value: >-
+      ${{ steps.attempt-1.outputs.rebar3-version
+        || steps.attempt-2.outputs.rebar3-version
+        || steps.attempt-3.outputs.rebar3-version }}
+
+runs:
+  using: composite
+  steps:
+    - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24
+      id: attempt-1
+      continue-on-error: true
+      with:
+        otp-version: ${{ inputs.otp-version }}
+        rebar3-version: ${{ inputs.rebar3-version }}
+        version-type: ${{ inputs.version-type }}
+        version-file: ${{ inputs.version-file }}
+
+    - if: steps.attempt-1.outcome == 'failure'
+      shell: bash
+      run: sleep 15
+
+    - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24
+      if: steps.attempt-1.outcome == 'failure'
+      id: attempt-2
+      continue-on-error: true
+      with:
+        otp-version: ${{ inputs.otp-version }}
+        rebar3-version: ${{ inputs.rebar3-version }}
+        version-type: ${{ inputs.version-type }}
+        version-file: ${{ inputs.version-file }}
+
+    - if: steps.attempt-2.outcome == 'failure'
+      shell: bash
+      run: sleep 30
+
+    # Last attempt: no `continue-on-error`, so a lasting failure fails the job.
+    - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24
+      if: steps.attempt-2.outcome == 'failure'
+      id: attempt-3
+      with:
+        otp-version: ${{ inputs.otp-version }}
+        rebar3-version: ${{ inputs.rebar3-version }}
+        version-type: ${{ inputs.version-type }}
+        version-file: ${{ inputs.version-file }}
