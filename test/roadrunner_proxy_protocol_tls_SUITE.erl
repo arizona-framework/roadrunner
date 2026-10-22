@@ -54,7 +54,7 @@ all() ->
 
 init_per_testcase(Case, Config) ->
     {ok, _} = application:ensure_all_started(ssl),
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Self = self(),
     HandlerId = {?MODULE, Case},
     ok = telemetry:attach_many(

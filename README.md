@@ -28,14 +28,14 @@ A small, fast HTTP core you can trust on the hot path.
 - **Every HTTP version, one server**: HTTP/1.1, HTTP/2, HTTP/3 (experimental),
   and WebSocket served from one listener; browsers upgrade to h3 over the same
   port via `Alt-Svc`.
-- **Pure Erlang, almost no dependencies**: One runtime dep (`telemetry`),
+- **Pure Erlang, no dependencies**: No runtime deps,
   no C NIFs, and Roadrunner owns its own h1/h2/h3 codecs and its own QUIC
   transport: easy to read and audit.
 - **Pleasant to build on**: Plain-Erlang request and response values, composable
   middleware, and opt-in helpers for cookies, query strings, multipart, SSE,
   NDJSON, and WebSocket.
-- **Production lifecycle in the box**: Graceful drain with a deadline, telemetry
-  events, per-request `request_id` log correlation, and configurable DoS bounds.
+- **Production lifecycle in the box**: Graceful drain with a deadline, request
+  and connection events, per-request `request_id` log correlation, and configurable DoS bounds.
 
 ## Requirements
 
@@ -328,7 +328,7 @@ real_ip => #{trusted_proxies => [~"10.0.0.0/8"]}
 ```
 
 `roadrunner_req:client_ip/1` returns the real client, and rate limits and
-telemetry use it too.
+events use it too.
 
 ### Limits and hardening
 
@@ -348,16 +348,32 @@ rate_limit => #{rate => 100, period => 1}
 
 ### Observability
 
-Roadrunner emits [`telemetry`](https://hex.pm/packages/telemetry) events for
-requests, connections, and WebSocket frames:
+Roadrunner hands events for requests, connections, and WebSocket frames to
+one event handler: a module with a `handle_event/2` callback. By default
+they are dropped, and no telemetry library is needed. To send them to
+`telemetry`, Prometheus, OpenTelemetry, or your logs, set a handler:
 
 ```erlang
-telemetry:attach(log_requests, [roadrunner, request, stop],
-    fun(_Event, #{duration := D}, #{method := M, path := P, status := S}, _) ->
-        Us = erlang:convert_time_unit(D, native, microsecond),
-        logger:info("~s ~s -> ~p (~p us)", [M, P, S, Us])
-    end, undefined).
+%% sys.config
+[{roadrunner, [{event_handler, log_requests}]}].
 ```
+
+```erlang
+-module(log_requests).
+-behaviour(roadrunner_event_handler).
+-export([handle_event/2]).
+
+handle_event(request_start, Req) ->
+    {erlang:monotonic_time(), roadrunner_req:method(Req), roadrunner_req:path(Req)};
+handle_event(request_stop, {{Start, Method, Path}, Status, _Kind}) ->
+    Us = erlang:convert_time_unit(erlang:monotonic_time() - Start, native, microsecond),
+    logger:info("~s ~s -> ~p (~p us)", [Method, Path, Status, Us]);
+handle_event(_Event, _Args) ->
+    ok.
+```
+
+Each event passes the raw values it has, so a handler builds only what it
+uses. See `roadrunner_event_handler` for the full list of events.
 
 Each request also sets a `request_id` in the `logger` process metadata, so
 logs from your handlers line up with it. `roadrunner_listener:info/1` returns
@@ -421,6 +437,8 @@ type. Beyond `port`,
 | `roadrunner_router` | Route syntax and matching |
 | `roadrunner_middleware` | Middleware behaviour |
 | `roadrunner_ws_handler` | WebSocket handler behaviour |
+| `roadrunner_event_handler` | Event handler behaviour for observability |
+| `roadrunner_event_noop` | Default event handler, drops every event |
 | `roadrunner_static` | Static file handler |
 | `roadrunner_sse` | Server-Sent Events framing |
 | `roadrunner_ndjson` | NDJSON framing |

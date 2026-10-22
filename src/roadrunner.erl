@@ -85,41 +85,32 @@ listeners() ->
     ].
 
 -doc """
-Emit `[roadrunner, drain, acknowledged]` for the current request, signalling
-to subscribers that a long-running handler (`{loop, ...}` or WebSocket)
-has observed and is honoring an in-flight `roadrunner_listener:drain/2`
-broadcast. Handlers should call this from their `handle_info/3` (loop)
+Emit the `drain_acknowledged` event for the current request, signalling
+to the `roadrunner_event_handler` that a long-running handler
+(`{loop, ...}` or WebSocket) has observed and is honoring an in-flight
+`roadrunner_listener:drain/2` broadcast. Handlers should call this from their `handle_info/3` (loop)
 or `handle_frame/2` (websocket) when they pattern-match on
 `{roadrunner_drain, _}` and decide to wind down.
 
 `Req` is the request map the handler received. Returns `ok`. Calling
-this when no drain is in flight is harmless — subscribers see a stray
-event and ignore it — but the documented usage is post-drain-receipt.
+this when no drain is in flight is harmless (the event handler sees a
+stray event), but the documented usage is post-drain-receipt.
 
 For SREs computing "how much grace did the handler use," see
 `acknowledge_drain/2` which threads the `Deadline` from the
-`{roadrunner_drain, Deadline}` message into the event metadata.
+`{roadrunner_drain, Deadline}` message into the event.
 """.
 -spec acknowledge_drain(roadrunner_req:request()) -> ok.
 acknowledge_drain(Req) when is_map(Req) ->
-    roadrunner_telemetry:drain_acknowledged(drain_metadata(Req, undefined)).
+    roadrunner_event:drain_acknowledged(Req, undefined).
 
 -doc """
 Same as `acknowledge_drain/1` but threads the drain `Deadline`
 (in milliseconds, the second element of the `{roadrunner_drain, Deadline}`
-message a handler received) into the telemetry metadata so subscribers
+message a handler received) into the event so the event handler
 can compute `Deadline - erlang:monotonic_time(millisecond)` for the
 remaining grace period.
 """.
 -spec acknowledge_drain(roadrunner_req:request(), integer()) -> ok.
 acknowledge_drain(Req, Deadline) when is_map(Req), is_integer(Deadline) ->
-    roadrunner_telemetry:drain_acknowledged(drain_metadata(Req, Deadline)).
-
--spec drain_metadata(roadrunner_req:request(), integer() | undefined) -> map().
-drain_metadata(Req, Deadline) ->
-    #{
-        listener_name => maps:get(listener_name, Req, undefined),
-        peer => maps:get(peer, Req, undefined),
-        request_id => maps:get(request_id, Req, undefined),
-        deadline => Deadline
-    }.
+    roadrunner_event:drain_acknowledged(Req, Deadline).

@@ -114,7 +114,7 @@ acceptor_retries_on_transient_accept_error_test() ->
     {ok, LSock} = gen_tcp:listen(0, [binary, {active, false}]),
     {ok, Port} = inet:port(LSock),
     {ok, CSock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Self = self(),
     HandlerId = {?MODULE, make_ref()},
     ok = telemetry:attach(
@@ -174,7 +174,7 @@ acceptor_hands_tls_sockets_off_before_the_handshake_test() ->
     %% acceptor keeps accepting and reserves plain `closed` (the listen
     %% socket going away) for its clean exit.
     {ok, _} = application:ensure_all_started(ssl),
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     ServerOpts =
         roadrunner_test_certs:server_opts() ++
             [binary, {active, false}, {reuseaddr, true}],

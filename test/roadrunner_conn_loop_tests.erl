@@ -1708,7 +1708,7 @@ sendfile_dispatch_closes_socket_on_error_test() ->
 
 websocket_conn_hibernates_forwards_drain_and_closes_test() ->
     %% Full upgrade through the conn: dispatch spawns the session, the
-    %% conn parks in the hibernated `ws_session_wake/7` wait, forwards a
+    %% conn parks in the hibernated `ws_session_wake/6` wait, forwards a
     %% `{roadrunner_drain, _}` broadcast to the session, and once the
     %% session ends (a close frame injected through the fake socket) the
     %% conn wakes, runs the websocket finishing path, and exits normal.
@@ -2256,7 +2256,7 @@ attach_telemetry(Tag, EventNames) ->
     %% Started here rather than assumed: run alone, this module used to fail
     %% six tests with `noproc` on `telemetry_handler_table` because only an
     %% earlier module in the run had started the telemetry app.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Self = self(),
     [
         telemetry:attach(

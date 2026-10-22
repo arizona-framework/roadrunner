@@ -657,7 +657,7 @@ rate_limit_is_a_pipeline_stage_test() ->
     %% A route's `rate_limit` is not among the limits the connection reads: it
     %% leads the route's own middlewares, after the listener's, so a refusal is
     %% decorated by the listener's middlewares and never reaches the route's.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Table = ets:new(router_rl, [public]),
     persistent_term:put({roadrunner_route_rate_limit, router_rl}, {Table, atomics:new(1, [])}),
     Tag = fun(Name) ->

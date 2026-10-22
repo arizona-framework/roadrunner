@@ -829,7 +829,7 @@ handle_drain_drops_when_handler_does_not_export_test() ->
 start_hands_back_a_session_the_caller_drives_test() ->
     %% `start/7`'s contract: the 101 is on the wire and the caller holds
     %% `{session, MonitorRef, Pid}` — it owns the drain forwarding (in
-    %% production `roadrunner_conn_loop:ws_session_wake/7`, covered in
+    %% production `roadrunner_conn_loop:ws_session_wake/6`, covered in
     %% the conn-loop tests) and the wait for the session's 'DOWN'. Here
     %% the test plays the caller: a drain sent to the session pid
     %% dispatches handle_drain/2, whose `{close, _, _, _}` return ends
@@ -1555,7 +1555,7 @@ size_cap_rejection_emits_frame_rejected_telemetry_test() ->
     %% A cap rejection emits [roadrunner, ws, frame_rejected] with the
     %% reason and offending size before the 1009 close. Here a 50-byte
     %% frame trips a 10-byte frame cap.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Self = self(),
     HandlerId = make_ref(),
     ok = telemetry:attach(
@@ -2317,12 +2317,7 @@ stop_ws_session(Pid) ->
     end.
 
 ws_ctx() ->
-    #{
-        listener_name => probe_ws,
-        peer => undefined,
-        request_id => undefined,
-        module => roadrunner_ws_echo_handler
-    }.
+    {probe_ws, undefined, undefined}.
 
 %% Wait for the session's 'DOWN' the way the conn does after `start/7`.
 await_down(Ref, Pid) ->

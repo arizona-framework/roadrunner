@@ -7,10 +7,11 @@
         kernel,
         stdlib,
         crypto,
-        ssl,
-        telemetry
+        ssl
     ]},
-    {env, []},
+    {env, [
+        {event_handler, roadrunner_event_noop}
+    ]},
     {modules, []},
     {licenses, ["Apache-2.0"]},
     {links, [

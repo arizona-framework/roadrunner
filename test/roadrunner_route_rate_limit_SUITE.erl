@@ -67,7 +67,7 @@ end_per_group(_Group, _Config) ->
     ok.
 
 init_per_testcase(_Case, Config) ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Config.
 
 end_per_testcase(_Case, _Config) ->

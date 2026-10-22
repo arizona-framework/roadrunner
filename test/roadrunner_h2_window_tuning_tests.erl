@@ -236,7 +236,7 @@ start_conn(H2Opts) ->
     %% `H2Opts` is the user-facing sub-opts map (keys: `conn_window`,
     %% `stream_window`, `window_refill_threshold`). Translate to the
     %% flat `http2_` prefix the conn loop reads via single `maps:get/2`.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
@@ -262,7 +262,12 @@ start_conn(H2Opts) ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_window_test, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_window_test,
+            undefined,
+            {erlang:monotonic_time(), h2_window_test, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),

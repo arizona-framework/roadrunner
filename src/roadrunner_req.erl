@@ -100,8 +100,8 @@ care which protocol delivered the bytes.
     request_id => binary(),
     %% Registered name of the owning `roadrunner_listener`. Set
     %% once per conn from `proto_opts.listener_name`. Surfaced in
-    %% `roadrunner_telemetry` event metadata so subscribers can
-    %% filter by listener in multi-listener deployments.
+    %% the events handed to the `roadrunner_event_handler` so a
+    %% handler can filter by listener in multi-listener deployments.
     listener_name => atom(),
     %% Framework/middleware scratchpad — a bag of custom data threaded
     %% through the pipeline to the handler. roadrunner core never reads

@@ -218,7 +218,7 @@ slot_reconciliation_releases_sustained_orphan_slots_test() ->
     %% `kill`-bypasses-`terminate` recovery. Also asserts the
     %% `[roadrunner, listener, slots_reconciled]` telemetry event fires
     %% with the released count.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Self = self(),
     HandlerId = make_ref(),
     ok = telemetry:attach(
@@ -859,7 +859,7 @@ over_cap_connection_rejected_fires_event_and_counts_test() ->
     %% That used to be silent; assert it now bumps `info/1`'s `rejected`
     %% and emits `[roadrunner, listener, conn_rejected]` with
     %% `reason => max_clients`.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Self = self(),
     HandlerId = make_ref(),
     ok = telemetry:attach(

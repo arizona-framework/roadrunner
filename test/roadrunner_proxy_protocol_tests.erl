@@ -229,7 +229,7 @@ recv_error_closes_test() ->
 
 %% Forward `[roadrunner, listener, accept_error]` to the test process.
 attach_accept_error() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Self = self(),
     HandlerId = {?MODULE, make_ref()},
     ok = telemetry:attach(

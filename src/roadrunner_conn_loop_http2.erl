@@ -214,7 +214,9 @@
     proto_opts :: roadrunner_conn:proto_opts(),
     listener_name :: atom(),
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
-    start_mono :: integer(),
+    %% The event handler's span from `listener_accept`, fired by the
+    %% HTTP/1.1 fork before `enter/6`.
+    conn_span :: roadrunner_event_handler:span(),
     scheme :: http | https,
     %% Active-mode message tags for this transport.
     msg_data :: atom(),
@@ -341,7 +343,7 @@
 -doc """
 Top-level entry from the HTTP/1.1 dispatch fork. Owns the socket
 from this point on; takes responsibility for releasing the listener
-slot and firing `[roadrunner, listener, conn_close]` telemetry.
+slot and firing the `listener_conn_close` event for `ConnSpan`.
 
 `Buffered` seeds the connection's initial read buffer — the bytes a
 coalesced TCP segment carried after a stripped PROXY-protocol header
@@ -352,10 +354,10 @@ coalesced TCP segment carried after a stripped PROXY-protocol header
     roadrunner_conn:proto_opts(),
     atom(),
     {inet:ip_address(), inet:port_number()} | undefined,
-    integer(),
+    roadrunner_event_handler:span(),
     binary()
 ) -> no_return().
-enter(Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered) ->
+enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
     proc_lib:set_label({roadrunner_conn_loop_http2, ListenerName, Peer}),
     Scheme = roadrunner_conn:scheme(Socket),
     {Data, Closed, Error} = roadrunner_transport:messages(Socket),
@@ -386,7 +388,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered) ->
         proto_opts = ProtoOpts,
         listener_name = ListenerName,
         peer = Peer,
-        start_mono = StartMono,
+        conn_span = ConnSpan,
         scheme = Scheme,
         msg_data = Data,
         msg_closed = Closed,
@@ -2424,19 +2426,13 @@ rate_limit_refused(
 exit_clean(#loop{
     socket = Socket,
     proto_opts = ProtoOpts,
-    listener_name = ListenerName,
-    peer = Peer,
-    start_mono = StartMono,
+    conn_span = ConnSpan,
     worker_refs = Refs,
     max_concurrent_requests = MaxConcReq,
     inflight_counter = InflightCounter,
     overload = Overload
 }) ->
-    roadrunner_telemetry:listener_conn_close(StartMono, #{
-        listener_name => ListenerName,
-        peer => Peer,
-        requests_served => 0
-    }),
+    ok = roadrunner_event:listener_conn_close(ConnSpan, 0),
     %% Account for any stream workers still live at teardown (each holds one
     %% in-flight slot). Workers whose `DOWN` already fired were removed from
     %% `worker_refs`, so this releases each remaining worker exactly once.

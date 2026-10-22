@@ -102,7 +102,7 @@ only). Remaining work:
 ## Native QUIC transport follow-ups
 
 The HTTP/3 path runs on the native `roadrunner_quic_*` stack end to end, with no
-`quic` dependency in production or test (production deps are just `telemetry`,
+`quic` dependency in production or test (roadrunner has no production deps,
 and the test profile drives the server with a native QUIC client); the `quic`
 dep is kept in the bench profile only, as an HTTP/3 comparison server. The RFC
 MUSTs a browser depends on are implemented; the items below are conformance
@@ -248,15 +248,15 @@ lot of them.
 
 ## Other
 
-### Carry the close reason in `conn_close` telemetry
+### Carry the close reason in the `listener_conn_close` event
 
-**What:** `[roadrunner, listener, conn_close]` says that a connection
+**What:** `listener_conn_close` says that a connection
 ended, not why. The recv paths drop the transport's reason on the way
 to `exit_normal`, so a peer closing, a `request_timeout`, a slow-client
 cut-off, a drain and a TLS alert after the handshake all look the same
-to a telemetry consumer, and for the TLS alert `ssl`'s own notice log is
+to an event handler, and for the TLS alert `ssl`'s own notice log is
 the only trace. Thread a `reason` through the exit paths of the h1, h2
-and h3 loops into the event metadata: `normal`, `peer_closed`,
+and h3 loops into the event's args: `normal`, `peer_closed`,
 `request_timeout`, `keep_alive_timeout`, `slow_client`, `drained`, or
 `{transport, Reason}` with the transport's term (`{tls_alert, {Desc,
 Text}}` included). Once it lands, lowering `ssl`'s alert `log_level` by
@@ -428,15 +428,15 @@ top-level keys add new per-route capabilities without breaking
 existing routes. None of the below is wired up yet; the map shape
 is ready when one of these has a real caller behind it.
 
-### Per-route `name => atom()` for telemetry / reverse routing — small
+### Per-route `name => atom()` for events / reverse routing — small
 
 **What:** Let a route declare a stable name (e.g. `name =>
-users_show`) and surface it in telemetry metadata (`[roadrunner,
-request, start | stop | exception]`) plus expose a
+users_show`) and surface it to the event handler on `request_start`
+plus expose a
 `roadrunner_router:url_for/2,3` for reverse-resolving the name back
 to a path.
 
-**Why deferred:** no telemetry consumer asking for it today.
+**Why deferred:** no event handler asking for it today.
 `(listener_name, method, path)` is already enough to identify a
 route in dashboards; named lookup is a niceness, not a need.
 
@@ -489,7 +489,8 @@ whatever application, framework, or library runs on top of roadrunner.
 That could be a framework (Arizona is one), a third-party library, or the
 service's own code. Roadrunner deliberately stops at the HTTP layer and
 hands these up. It supplies the mechanism, an ordered middleware slot,
-immutable request and response values, and `telemetry` events; the layer
+immutable request and response values, and events through a
+`roadrunner_event_handler`; the layer
 above supplies the policy and the ergonomics. Listed so the boundary is
 explicit.
 
@@ -508,10 +509,11 @@ explicit.
 - **Outbound requests.** A client (pooling, retries, circuit breaking,
   load balancing) is not a server concern; it belongs with the
   application's integrations.
-- **Observability backends.** Roadrunner emits `telemetry` events with
-  zero overhead when nothing is subscribed; exporting them as traces and
-  metrics to a chosen backend (OpenTelemetry, Prometheus, and the like)
-  is an integration the layer above wires up.
+- **Observability backends.** Roadrunner hands its events to one
+  configured `roadrunner_event_handler` and drops them by default;
+  turning them into `telemetry` events, traces, or metrics for a chosen
+  backend (OpenTelemetry, Prometheus, and the like) is a handler the
+  layer above provides.
 - **Per-identity quotas and policy.** The application half of rate
   limiting: who gets how much, keyed by authenticated identity.
   Roadrunner keeps the connection-level abuse guard; the layer above owns

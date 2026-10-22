@@ -43,7 +43,7 @@ evicts_each_route_bucket_once_full_test() ->
 %% --- call/3 ---
 
 call_test() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Table = ets:new(route_rl_test, [public]),
     Counter = atomics:new(1, [{signed, false}]),
     persistent_term:put({roadrunner_route_rate_limit, route_rl_call}, {Table, Counter}),

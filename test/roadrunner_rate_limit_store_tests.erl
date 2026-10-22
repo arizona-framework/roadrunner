@@ -85,7 +85,7 @@ rate_limit_off_allows_test() ->
     ?assertEqual(allow, ?M:rate_limit(undefined, #{}, some_listener)).
 
 rate_limit_deny_counts_the_throttle_test() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Table = new_table(),
     Counter = atomics:new(1, [{signed, false}]),
     State = {1, cap(1, 1), cost(1), Table, Counter, ?IP},
@@ -123,7 +123,7 @@ resolve_on_test() ->
 %% --- throttled_telemetry/3 ---
 
 telemetry_bumps_counter_test() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Counter = atomics:new(1, [{signed, false}]),
     ok = ?M:throttled_telemetry(some_listener, Counter, rate_limit),
     ok = ?M:throttled_telemetry(some_listener, Counter, max_concurrent_requests),

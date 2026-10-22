@@ -1,4 +1,4 @@
--module(roadrunner_telemetry_tests).
+-module(roadrunner_event_tests).
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -44,7 +44,7 @@ request_start_and_stop_fire_with_metadata_test_() ->
     end}.
 
 response_send_failed_event_fires_on_error_test() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     HandlerId = attach([[roadrunner, response, send_failed]]),
     try
         ok = logger:set_process_metadata(#{
@@ -53,7 +53,7 @@ response_send_failed_event_fires_on_error_test() ->
             path => ~"/probe",
             peer => {{127, 0, 0, 1}, 4242}
         }),
-        Result = roadrunner_telemetry:response_send({error, closed}, buffered_response),
+        Result = roadrunner_event:response_send({error, closed}, buffered_response),
         ?assertEqual({error, closed}, Result),
         receive
             {telemetry_event, [roadrunner, response, send_failed], M, Md} ->
@@ -71,10 +71,10 @@ response_send_failed_event_fires_on_error_test() ->
     end.
 
 response_send_ok_does_not_emit_event_test() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     HandlerId = attach([[roadrunner, response, send_failed]]),
     try
-        ?assertEqual(ok, roadrunner_telemetry:response_send(ok, buffered_response)),
+        ?assertEqual(ok, roadrunner_event:response_send(ok, buffered_response)),
         receive
             {telemetry_event, [roadrunner, response, send_failed], _, _} ->
                 error(unexpected_event)
@@ -85,12 +85,12 @@ response_send_ok_does_not_emit_event_test() ->
     end.
 
 response_send_failed_works_without_logger_metadata_test() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     %% Ensure no metadata is set on this process.
     logger:unset_process_metadata(),
     HandlerId = attach([[roadrunner, response, send_failed]]),
     try
-        _ = roadrunner_telemetry:response_send({error, closed}, buffered_response),
+        _ = roadrunner_event:response_send({error, closed}, buffered_response),
         receive
             {telemetry_event, [roadrunner, response, send_failed], _, Md} ->
                 %% Only `phase` and `reason` populated when there's no
@@ -106,9 +106,9 @@ response_send_failed_works_without_logger_metadata_test() ->
 
 request_rejected_event_fires_on_bad_request_line_test() ->
     %% Malformed request line is dropped at the parser layer; emit
-    %% `[roadrunner, request, rejected]` with the parser's reason atom so
+    %% `request_rejected` with the parser's reason atom so
     %% ops tooling can track protocol-attack-shaped traffic.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     HandlerId = attach([[roadrunner, request, rejected]]),
     try
         Self = self(),
@@ -150,6 +150,13 @@ request_rejected_event_fires_on_bad_request_line_test() ->
                 ?assertEqual(bad_request_line, maps:get(reason, Md))
         after 1000 -> error(no_request_rejected_event)
         end,
+        %% Take the 400 the conn wrote so it doesn't linger in the shared
+        %% eunit mailbox for a later module's receive to pick up.
+        receive
+            {sent, Tag, Sent} ->
+                ?assertMatch(<<"HTTP/1.1 400 ", _/binary>>, iolist_to_binary(Sent))
+        after 1000 -> error(no_400_sent)
+        end,
         Sink ! stop
     after
         detach(HandlerId)
@@ -187,7 +194,7 @@ drain_recv_sink(Tag, Logger, Script) ->
     end.
 
 drain_acknowledged_event_fires_with_request_metadata_test() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     HandlerId = attach([[roadrunner, drain, acknowledged]]),
     try
         Req = #{
@@ -217,7 +224,7 @@ drain_acknowledged_with_deadline_threads_metadata_test() ->
     %% `acknowledge_drain/2` threads the `Deadline` from the
     %% `{roadrunner_drain, Deadline}` message into the event metadata so
     %% subscribers can compute remaining grace.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     HandlerId = attach([[roadrunner, drain, acknowledged]]),
     try
         Req = #{
@@ -325,7 +332,7 @@ request_exception_fires_on_handler_crash_test_() ->
 ws_telemetry_fires_around_upgrade_and_each_frame_test_() ->
     {setup,
         fun() ->
-            {ok, _} = application:ensure_all_started(telemetry),
+            {ok, _} = roadrunner_test_event_handler:start(),
             Name = telemetry_test_ws,
             {ok, _} = roadrunner_listener:start_link(Name, #{
                 port => 0,
@@ -412,10 +419,79 @@ mask(<<B, Rest/binary>>, Mask, Acc, I) ->
     M = binary:at(Mask, I rem 4),
     mask(Rest, Mask, <<Acc/binary, (B bxor M)>>, I + 1).
 
+%% =============================================================================
+%% Event handler selection.
+%% =============================================================================
+
+noop_handler_drops_every_event_test() ->
+    ?assertEqual(ok, roadrunner_event_noop:handle_event(request_start, #{})),
+    ?assertEqual(ok, roadrunner_event_noop:handle_event(an_event_added_later, {})).
+
+put_handler_routes_events_to_the_new_handler_test() ->
+    ok = roadrunner_event:put_handler(roadrunner_event_noop),
+    try
+        %% The no-op handler's span is its `ok`, handed back unchanged.
+        ?assertEqual(ok, roadrunner_event:request_start(#{})),
+        ?assertEqual(ok, roadrunner_event:request_stop(ok, 200, buffered))
+    after
+        {ok, _} = roadrunner_test_event_handler:start()
+    end.
+
+crashing_handler_is_contained_and_replaced_by_noop_test() ->
+    ok = roadrunner_event:put_handler(roadrunner_crashing_event_handler),
+    try
+        %% The raise stays inside the emitter: the caller gets the no-op
+        %% `ok` span back and keeps running.
+        ?assertEqual(ok, roadrunner_event:request_start(#{})),
+        ?assertEqual(ok, receive_called(request_start)),
+        %% The crashed handler was swapped out, so later events no longer
+        %% reach it.
+        ok = roadrunner_event:listener_conn_rejected(probe, max_clients),
+        ?assertEqual(not_called, receive_called(listener_conn_rejected))
+    after
+        {ok, _} = roadrunner_test_event_handler:start()
+    end.
+
+crash_after_handler_already_replaced_stays_quiet_test() ->
+    %% The handler is swapped by someone else before its raise lands here
+    %% (another connection crashed it first): the emitter leaves the
+    %% replacement in place.
+    ok = roadrunner_event:put_handler(roadrunner_crashing_event_handler),
+    try
+        ?assertEqual(ok, roadrunner_event:request_stop(ok, 200, buffered)),
+        ?assertEqual(ok, receive_called(request_stop)),
+        ?assertEqual(ok, roadrunner_event:request_start(#{})),
+        ?assertEqual(not_called, receive_called(request_start))
+    after
+        {ok, _} = roadrunner_test_event_handler:start()
+    end.
+
+receive_called(Event) ->
+    receive
+        {crashing_handler_called, Event} -> ok
+    after 0 -> not_called
+    end.
+
+put_handler_rejects_a_module_without_handle_event_test() ->
+    ?assertError({invalid_event_handler, lists}, roadrunner_event:put_handler(lists)),
+    ?assertError(
+        {invalid_event_handler, roadrunner_no_such_module},
+        roadrunner_event:put_handler(roadrunner_no_such_module)
+    ).
+
+app_start_refuses_an_invalid_event_handler_test() ->
+    {ok, Handler} = application:get_env(roadrunner, event_handler),
+    ok = application:set_env(roadrunner, event_handler, lists),
+    try
+        ?assertError({invalid_event_handler, lists}, roadrunner_app:start(normal, []))
+    after
+        ok = application:set_env(roadrunner, event_handler, Handler)
+    end.
+
 %% --- helpers ---
 
 setup_listener() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Name = telemetry_test_listener,
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0, routes => roadrunner_hello_handler
@@ -423,7 +499,7 @@ setup_listener() ->
     {Name, roadrunner_listener:port(Name)}.
 
 setup_crashing_listener() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Name = telemetry_test_crashing,
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0, routes => roadrunner_crashing_handler
