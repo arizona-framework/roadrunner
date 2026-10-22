@@ -21,7 +21,7 @@
     request_exception/3,
     response_send/2,
     listener_accept/2,
-    listener_conn_close/2,
+    listener_conn_close/3,
     listener_conn_rejected/2,
     listener_accept_error/2,
     request_rejected/3,
@@ -137,9 +137,11 @@ listener_accept(ListenerName, Peer) ->
     dispatch(listener_accept, {ListenerName, Peer}).
 
 -doc "Emit `listener_conn_close` for the span `listener_accept/2` returned.".
--spec listener_conn_close(roadrunner_event_handler:span(), non_neg_integer()) -> ok.
-listener_conn_close(Span, RequestsServed) ->
-    _ = dispatch(listener_conn_close, {Span, RequestsServed}),
+-spec listener_conn_close(
+    roadrunner_event_handler:span(), non_neg_integer(), roadrunner_event_handler:close_reason()
+) -> ok.
+listener_conn_close(Span, RequestsServed, Reason) ->
+    _ = dispatch(listener_conn_close, {Span, RequestsServed, Reason}),
     ok.
 
 -doc "Emit `listener_conn_rejected` for a connection dropped at `max_clients`.".

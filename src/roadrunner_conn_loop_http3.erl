@@ -50,11 +50,16 @@
 
 -export([start/2]).
 -export([init/2]).
-%% Exported for unit testing of the pure request-stream frame folding
-%% and the pure peer-uni-stream state machine; not part of any public
-%% surface.
+%% Exported for unit testing of the pure request-stream frame folding,
+%% the pure peer-uni-stream state machine, and the QUIC close-reason
+%% mapping; not part of any public surface.
 -export([
-    decode_request_frames/3, decode_request_frames/4, new_request_stream/1, uni_event/4, uni_reset/1
+    decode_request_frames/3,
+    decode_request_frames/4,
+    new_request_stream/1,
+    uni_event/4,
+    uni_reset/1,
+    closed_reason/1
 ]).
 
 %% RFC 9114 §8.1 / RFC 9204 §8.3 error codes.
@@ -237,7 +242,7 @@ loop(State) ->
         true ->
             %% Graceful drain complete (RFC 9114 §5.2): GOAWAY was sent
             %% and no request remains in flight — close cleanly.
-            close_connection(State, ?H3_NO_ERROR, ~"graceful shutdown");
+            close_connection(State, ?H3_NO_ERROR, ~"graceful shutdown", drained);
         false ->
             recv_loop(State)
     end.
@@ -251,16 +256,16 @@ recv_loop(#h3{conn = Conn} = State) ->
             loop(State);
         {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
             case handle_stream_data(State, StreamId, Data, Fin) of
-                {conn_error, Code, Reason} -> close_connection(State, Code, Reason);
+                {conn_error, Code, Reason} -> conn_error(State, Code, Reason);
                 State1 -> loop(State1)
             end;
         {quic, Conn, {stream_reset, StreamId, _ErrorCode}} ->
             case handle_stream_reset(State, StreamId) of
-                {conn_error, Code, Reason} -> close_connection(State, Code, Reason);
+                {conn_error, Code, Reason} -> conn_error(State, Code, Reason);
                 State1 -> loop(State1)
             end;
-        {quic, Conn, {closed, _Reason}} ->
-            terminate(State);
+        {quic, Conn, {closed, Reason}} ->
+            terminate(State, closed_reason(Reason));
         {'DOWN', MonRef, process, _Pid, Reason} ->
             loop(handle_worker_down(State, MonRef, Reason));
         {roadrunner_body_demand, Worker, StreamId} ->
@@ -318,7 +323,7 @@ send_control_stream(#h3{conn = Conn, max_field_section_size = MaxFieldSection} =
 %% at the deadline if a request is still running then.
 -spec drain(#h3{}) -> ok.
 drain(#h3{control_stream_id = undefined} = State) ->
-    close_connection(State, ?H3_NO_ERROR, ~"graceful shutdown");
+    close_connection(State, ?H3_NO_ERROR, ~"graceful shutdown", drained);
 drain(State) ->
     loop(start_drain(State)).
 
@@ -1321,10 +1326,24 @@ rate_limit_refused(
 %% CONNECTION_CLOSE; the linked conn process stopping ends this loop too,
 %% but we tear down explicitly so the slot is released and telemetry
 %% fires regardless.
--spec close_connection(#h3{}, non_neg_integer(), binary()) -> ok.
-close_connection(#h3{conn = Conn} = State, ErrorCode, Reason) ->
+-spec close_connection(
+    #h3{}, non_neg_integer(), binary(), roadrunner_event_handler:close_reason()
+) -> ok.
+close_connection(#h3{conn = Conn} = State, ErrorCode, Reason, CloseReason) ->
     _ = roadrunner_quic:close(Conn, ErrorCode, Reason),
-    terminate(State).
+    terminate(State, CloseReason).
+
+-spec conn_error(#h3{}, non_neg_integer(), binary()) -> ok.
+conn_error(State, ErrorCode, Reason) ->
+    close_connection(State, ErrorCode, Reason, {protocol_error, ErrorCode}).
+
+%% The QUIC connection's own close: the peer's CONNECTION_CLOSE, the
+%% idle timeout, or a local transport failure.
+-spec closed_reason({peer, non_neg_integer()} | {local, atom()}) ->
+    roadrunner_event_handler:close_reason().
+closed_reason({peer, _ErrorCode}) -> peer_closed;
+closed_reason({local, idle_timeout}) -> keep_alive_timeout;
+closed_reason(Reason) -> {transport, Reason}.
 
 %% Forget a request stream, unless its client is still sending on it. A
 %% manual-mode stream whose client has not finished (no FIN yet) is
@@ -1348,16 +1367,19 @@ drop_stream(#h3{conn = Conn, streams = Streams} = State, StreamId) ->
             State#h3{streams = maps:remove(StreamId, Streams)}
     end.
 
--spec terminate(#h3{}) -> ok.
-terminate(#h3{
-    proto_opts = ProtoOpts,
-    conn_span = ConnSpan,
-    worker_refs = Refs,
-    max_concurrent_requests = MaxConcReq,
-    inflight_counter = InflightCounter,
-    overload = Overload
-}) ->
-    ok = roadrunner_event:listener_conn_close(ConnSpan, 0),
+-spec terminate(#h3{}, roadrunner_event_handler:close_reason()) -> ok.
+terminate(
+    #h3{
+        proto_opts = ProtoOpts,
+        conn_span = ConnSpan,
+        worker_refs = Refs,
+        max_concurrent_requests = MaxConcReq,
+        inflight_counter = InflightCounter,
+        overload = Overload
+    },
+    Reason
+) ->
+    ok = roadrunner_event:listener_conn_close(ConnSpan, 0, Reason),
     %% Account for any stream workers still live at teardown (each holds one
     %% in-flight slot); workers whose `DOWN` already fired were removed from
     %% `worker_refs`, so this releases each remaining worker exactly once.

@@ -54,6 +54,16 @@ headers_then_data_test() ->
     ?assertEqual(~"hello", iolist_to_binary(maps:get(body, Stream))),
     ?assertEqual(5, maps:get(body_len, Stream)).
 
+closed_reason_maps_each_quic_close_test() ->
+    ?assertEqual(peer_closed, roadrunner_conn_loop_http3:closed_reason({peer, 0})),
+    ?assertEqual(
+        keep_alive_timeout, roadrunner_conn_loop_http3:closed_reason({local, idle_timeout})
+    ),
+    ?assertEqual(
+        {transport, {local, protocol_violation}},
+        roadrunner_conn_loop_http3:closed_reason({local, protocol_violation})
+    ).
+
 data_before_headers_test() ->
     %% RFC 9114 §4.1: a DATA frame before any HEADERS → H3_FRAME_UNEXPECTED.
     ?assertMatch({conn_error, 16#0105, _}, decode(df(~"x"), 1000)).

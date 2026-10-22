@@ -84,7 +84,7 @@
     listener_name :: atom(),
     %% The event handler's span from `roadrunner_event:listener_accept/2`,
     %% fired once the peer is settled. Paired with `listener_conn_close`
-    %% in `exit_clean/4`.
+    %% in `exit_clean/5`.
     conn_span :: roadrunner_event_handler:span(),
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
     scheme = http :: http | https,
@@ -595,16 +595,16 @@ recv_idle(#loop_state{socket = Socket, buffered = Buf} = S, Deadline) ->
                 Deadline
             );
         {ClosedTag, _Sock} ->
-            exit_normal(S);
-        {ErrorTag, _Sock, _Reason} ->
-            exit_normal(S);
+            exit_normal(S, peer_closed);
+        {ErrorTag, _Sock, Reason} ->
+            exit_normal(S, {transport, Reason});
         {roadrunner_drain, _DrainDeadline} ->
-            exit_normal(S);
+            exit_normal(S, drained);
         _Stray ->
             recv_idle(S, Deadline)
     after Remaining ->
         timeout_response(S),
-        exit_normal(S)
+        exit_normal(S, timeout_reason(S))
     end.
 
 %% Passive-mode recv path — reads the remainder of a request whose first
@@ -649,7 +649,7 @@ recv_passive(
 ) ->
     case drain_mailbox_check() of
         drain ->
-            exit_normal(S);
+            exit_normal(S, drained);
         ok ->
             Now = erlang:monotonic_time(millisecond),
             Remaining = max(0, Deadline - Now),
@@ -679,20 +679,20 @@ recv_passive(
                         false ->
                             %% Slowloris — silent close. No 408; the peer
                             %% wasn't going to read it anyway.
-                            exit_normal(S)
+                            exit_normal(S, slow_client)
                     end;
                 {error, timeout} when Remaining =< ChunkTimeout ->
                     %% True request/keep-alive timeout — the deadline
                     %% has elapsed.
                     timeout_response(S),
-                    exit_normal(S);
+                    exit_normal(S, timeout_reason(S));
                 {error, timeout} ->
                     %% Drain-check tick. Loop back to the mailbox
                     %% drain + recv.
                     recv_passive(S, Deadline);
-                {error, _} ->
+                {error, Reason} ->
                     %% Peer close, kernel error, etc. Silent exit.
-                    exit_normal(S)
+                    exit_normal(S, transport_reason(Reason))
             end
     end.
 
@@ -757,20 +757,20 @@ recv_with_hibernate(
                         Deadline
                     );
                 false ->
-                    exit_normal(S)
+                    exit_normal(S, slow_client)
             end;
         {ClosedTag, _Sock} ->
             _ = erlang:cancel_timer(DeadlineRef),
-            exit_normal(S);
-        {ErrorTag, _Sock, _Reason} ->
+            exit_normal(S, peer_closed);
+        {ErrorTag, _Sock, Reason} ->
             _ = erlang:cancel_timer(DeadlineRef),
-            exit_normal(S);
+            exit_normal(S, {transport, Reason});
         {roadrunner_drain, _Deadline} ->
             _ = erlang:cancel_timer(DeadlineRef),
-            exit_normal(S);
+            exit_normal(S, drained);
         {?MODULE, deadline_fired} ->
             timeout_response(S),
-            exit_normal(S);
+            exit_normal(S, timeout_reason(S));
         _Stray ->
             _ = erlang:cancel_timer(DeadlineRef),
             arm_active_once(S),
@@ -858,7 +858,7 @@ handle_request_bytes(
             %% to the right request.
             S2 = flush_out(S),
             _ = roadrunner_conn:send_status(Socket, roadrunner_conn:parse_error_status(Reason)),
-            exit_lingering(S2)
+            exit_lingering(S2, rejected)
     end.
 
 %% --- read_body phase ---
@@ -905,8 +905,8 @@ refuse_rate_limited(#loop_state{socket = Socket} = S, RetryAfter, Framing) ->
     S1 = flush_out(S),
     _ = roadrunner_conn:send_rate_limited(Socket, RetryAfter),
     case Framing of
-        none -> exit_normal(S1);
-        _ -> exit_lingering(S1)
+        none -> exit_normal(S1, rejected);
+        _ -> exit_lingering(S1, rejected)
     end.
 
 -spec route_and_read(#loop_state{}, roadrunner_req:request(), integer()) -> no_return().
@@ -919,7 +919,7 @@ route_and_read(#loop_state{body_buffering = BodyMode, dispatch = Dispatch} = S, 
             S2 = flush_out(S),
             ok = rejection(S2, FramingReason),
             _ = roadrunner_conn:send_bad_request(S2#loop_state.socket),
-            exit_lingering(S2);
+            exit_lingering(S2, rejected);
         {_, Framing} ->
             MaxCL = roadrunner_conn:body_cap(Resolved, S#loop_state.max_content_length),
             case expect_answer(S, Req, Framing, MaxCL) of
@@ -1037,14 +1037,14 @@ read_auto_body(
         {error, request_timeout} ->
             S2 = flush_out(S),
             _ = roadrunner_conn:send_request_timeout(Socket),
-            exit_normal(S2);
+            exit_normal(S2, request_timeout);
         {error, slow_client} ->
-            exit_normal(S);
+            exit_normal(S, slow_client);
         {error, drained} ->
             %% Listener draining while the peer was still
             %% uploading. No response: the request never
             %% completed, and the conn is going away anyway.
-            exit_normal(S);
+            exit_normal(S, drained);
         {error, BodyReason} ->
             S2 = flush_out(S),
             ok = rejection(S2, BodyReason),
@@ -1054,7 +1054,7 @@ read_auto_body(
             _ = roadrunner_conn:send_status(
                 Socket, roadrunner_conn:parse_error_status(BodyReason)
             ),
-            exit_lingering(S2)
+            exit_lingering(S2, rejected)
     end.
 
 %% The body's recv closure: passive reads bounded by the request
@@ -1429,8 +1429,8 @@ finishing_phase(S, Req, _Response) ->
     %% the body is already fully read; manual-mode may have leftover
     %% that needs draining, or, when it cannot be, lingering over.
     case drain_body_if_manual(Req) of
-        {ok, _Leftover} -> exit_normal(S);
-        {error, _} -> exit_lingering(S)
+        {ok, _Leftover} -> exit_normal(S, normal);
+        {error, _} -> exit_lingering(S, normal)
     end.
 
 -spec buffered_finish(
@@ -1460,7 +1460,7 @@ buffered_finish(S0, Req, Headers) ->
                     %% `ensure_close_signaled/3` added `Connection: close`
                     %% because this request tripped `max_keep_alive_requests`
                     %% — both land here, and both close the connection.
-                    exit_normal(S);
+                    exit_normal(S, normal);
                 keep_alive ->
                     Leftover = pipelined_leftover(Req, S, ManualLeftover),
                     read_request_phase(S#loop_state{
@@ -1472,7 +1472,7 @@ buffered_finish(S0, Req, Headers) ->
             %% Drain failure (a body over its cap, never asked for, or
             %% broken) — close, lingering over what the client may still
             %% be sending.
-            exit_lingering(S)
+            exit_lingering(S, normal)
     end.
 
 %% Park the conn in a hibernated wait while the WebSocket session owns
@@ -1563,25 +1563,25 @@ refuse_too_large(S) ->
     S1 = flush_out(S),
     ok = rejection(S1, content_length_too_large),
     _ = roadrunner_conn:send_payload_too_large(S1#loop_state.socket),
-    exit_lingering(S1).
+    exit_lingering(S1, rejected).
 
 %% Close after a response sent before the request was read to its end,
 %% lingering over what the client may still be sending
 %% (`roadrunner_conn:linger/2`) for the listener's `http1` `linger_timeout`.
--spec exit_lingering(#loop_state{}) -> no_return().
-exit_lingering(#loop_state{socket = Socket, proto_opts = ProtoOpts} = S) ->
+-spec exit_lingering(#loop_state{}, roadrunner_event_handler:close_reason()) -> no_return().
+exit_lingering(#loop_state{socket = Socket, proto_opts = ProtoOpts} = S, Reason) ->
     S1 = flush_out(S),
     ok = roadrunner_conn:linger(Socket, maps:get(http1_linger_timeout, ProtoOpts, 1000)),
-    exit_normal(S1).
+    exit_normal(S1, Reason).
 
 %% Close after a response sent ahead of the handler, or for its crash: a
 %% manual-mode body the request frames may still be on its way, so the
 %% close lingers. An auto-mode body was read before dispatch.
 -spec exit_unread(#loop_state{}, roadrunner_req:request()) -> no_return().
 exit_unread(S, #{body_reader := #{framing := Framing}}) when Framing =/= none ->
-    exit_lingering(S);
+    exit_lingering(S, normal);
 exit_unread(S, _Req) ->
-    exit_normal(S).
+    exit_normal(S, normal).
 
 -spec rejection(#loop_state{}, atom()) -> ok.
 rejection(#loop_state{listener_name = ListenerName, peer = Peer}, Reason) ->
@@ -1593,22 +1593,32 @@ arm_active_once(#loop_state{socket = Socket} = S) ->
     %% we can't `setopts` — exit cleanly instead of crashing.
     case roadrunner_transport:setopts(Socket, [{active, once}]) of
         ok -> ok;
-        {error, _} -> exit_normal(S)
+        {error, Reason} -> exit_normal(S, transport_reason(Reason))
     end.
 
-%% Convenience wrapper around `exit_clean/4` that pulls fields off
+%% A timed-out read waited for the connection's first request, or
+%% idled between requests on a kept-alive one.
+-spec timeout_reason(#loop_state{}) -> request_timeout | keep_alive_timeout.
+timeout_reason(#loop_state{phase = first}) -> request_timeout;
+timeout_reason(#loop_state{phase = keep_alive}) -> keep_alive_timeout.
+
+-spec transport_reason(term()) -> roadrunner_event_handler:close_reason().
+transport_reason(closed) -> peer_closed;
+transport_reason(Reason) -> {transport, Reason}.
+
+%% Convenience wrapper around `exit_clean/5` that pulls fields off
 %% the loop state. Most exit paths in the read/dispatch/finishing
 %% phases fire `listener_conn_close` (accept already fired during
-%% `shoot`).
--spec exit_normal(#loop_state{}) -> no_return().
-exit_normal(S) ->
+%% `shoot`), carrying why the connection ended.
+-spec exit_normal(#loop_state{}, roadrunner_event_handler:close_reason()) -> no_return().
+exit_normal(S, Reason) ->
     #loop_state{
         socket = Socket,
         proto_opts = ProtoOpts,
         conn_span = ConnSpan,
         requests_served = Served
     } = flush_out(S),
-    exit_clean(Socket, ProtoOpts, ConnSpan, Served).
+    exit_clean(Socket, ProtoOpts, ConnSpan, Served, Reason).
 
 %% Funnel for every clean exit path once the connection was accepted.
 %% Fires the paired `listener_conn_close` event, then releases the
@@ -1622,10 +1632,11 @@ exit_normal(S) ->
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),
     roadrunner_event_handler:span(),
-    non_neg_integer()
+    non_neg_integer(),
+    roadrunner_event_handler:close_reason()
 ) -> no_return().
-exit_clean(Socket, ProtoOpts, ConnSpan, Served) ->
-    ok = roadrunner_event:listener_conn_close(ConnSpan, Served),
+exit_clean(Socket, ProtoOpts, ConnSpan, Served, Reason) ->
+    ok = roadrunner_event:listener_conn_close(ConnSpan, Served, Reason),
     exit_unaccepted(Socket, ProtoOpts).
 
 %% Exit before `listener_accept` fired (a drain or a bad PROXY header

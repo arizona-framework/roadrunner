@@ -401,9 +401,8 @@ roadrunner:start_listener(edge, #{
 
 Roadrunner leaves the level at `ssl`'s default on purpose. The same
 setting also hides alerts raised after the handshake (a bad record from a
-buggy client, a renegotiation attempt), which the connection does not
-report anywhere else yet: it closes, and `conn_close` carries no reason.
-Until it does, `ssl`'s notice is the only trace of those, and a
-deployment without an event handler would otherwise see
-nothing about TLS trouble at all. Quiet it when you consume the event;
-keep it while the log is what you read.
+buggy client, a renegotiation attempt). Those close the connection, and
+`listener_conn_close` reports them as `{transport, {tls_alert, _}}`, but
+the default event handler drops events, so a deployment without one
+would otherwise see nothing about TLS trouble at all. Quiet it when you
+consume the events; keep it while the log is what you read.

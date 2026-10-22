@@ -270,7 +270,9 @@ listener_accept_and_conn_close_fire_around_a_keep_alive_conn_test_() ->
                 ?assert(maps:get(duration, CloseM) > 0),
                 ?assertEqual(Name, maps:get(listener_name, CloseMd)),
                 ?assertMatch({{127, 0, 0, 1}, _}, maps:get(peer, CloseMd)),
-                ?assertEqual(1, maps:get(requests_served, CloseMd))
+                ?assertEqual(1, maps:get(requests_served, CloseMd)),
+                %% The request asked for `Connection: close`.
+                ?assertEqual(normal, maps:get(reason, CloseMd))
             after
                 detach(HandlerId)
             end
@@ -292,7 +294,29 @@ listener_conn_close_requests_served_does_not_count_parse_errors_test_() ->
                 ok = gen_tcp:close(Sock),
                 receive
                     {telemetry_event, [roadrunner, listener, conn_close], _, Md} ->
-                        ?assertEqual(0, maps:get(requests_served, Md))
+                        ?assertEqual(0, maps:get(requests_served, Md)),
+                        ?assertEqual(rejected, maps:get(reason, Md))
+                after 2000 -> error(no_conn_close_event)
+                end
+            after
+                detach(HandlerId)
+            end
+        end}
+    end}.
+
+listener_conn_close_reports_a_peer_close_test_() ->
+    {setup, fun setup_listener/0, fun cleanup_listener/1, fun({_Name, Port}) ->
+        {"a client closing before its first request reports peer_closed", fun() ->
+            HandlerId = attach([[roadrunner, listener, conn_close]]),
+            try
+                {ok, Sock} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ok = gen_tcp:close(Sock),
+                receive
+                    {telemetry_event, [roadrunner, listener, conn_close], _, Md} ->
+                        ?assertEqual(0, maps:get(requests_served, Md)),
+                        ?assertEqual(peer_closed, maps:get(reason, Md))
                 after 2000 -> error(no_conn_close_event)
                 end
             after
