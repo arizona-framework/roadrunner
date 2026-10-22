@@ -75,9 +75,10 @@ Notes:
   `max_message_size`, so a small high-ratio frame cannot expand into
   gigabytes before the cap fires
 
-When a cap closes a connection, roadrunner emits
-`[roadrunner, ws, frame_rejected]` (metadata `reason`, measurement
-`size`) so oversize and flood attempts are visible to subscribers.
+When a cap closes a connection, roadrunner emits the
+`ws_frame_rejected` event (with the cap's `reason` and the offending
+`size`) so oversize and flood attempts are visible to your event
+handler.
 
 ## HTTP/2 framing limits
 
@@ -134,7 +135,7 @@ so there is no dynamic-table memory to bound yet.
 `max_clients`'s effective cap is `min(max_clients, the OS file-descriptor
 limit)`. With the 16384 default above a stock `ulimit -n` of 1024, the
 acceptors hit `emfile` at the descriptor ceiling — each emits
-`[roadrunner, listener, accept_error]` and keeps accepting after a short
+`listener_accept_error` and keeps accepting after a short
 back-off rather than going silent — so raise `ulimit -n` (and the systemd
 `LimitNOFILE`) for high concurrency. Saturation recv-buffer memory scales
 as `max_clients × recv_buffer`, so lower either for a tighter bound.
@@ -150,7 +151,7 @@ just this listener — on top of unbounded handler memory.
 ceiling on live handler processes for the multiplexed protocols. Over the
 ceiling, a new HTTP/2 or HTTP/3 stream is refused with `REFUSED_STREAM` /
 `H3_REQUEST_REJECTED` (both retry-safe per RFC 9113 §8.7) before any
-handler runs, and the refusal emits `[roadrunner, request, throttled]` and
+handler runs, and the refusal emits `request_throttled` and
 increments the `throttled` count from `roadrunner_listener:info/1`. HTTP/1
 is unaffected: it serves one request per connection, so `max_clients`
 already bounds it.
@@ -175,8 +176,8 @@ of `B` (default `N`). A peer over its rate gets `429 Too Many Requests` +
 `Retry-After` before any handler runs, on HTTP/1.1 from the request's
 headers alone, before any of its body is read (a real 429 on HTTP/2 and HTTP/3,
 not the retry-safe `REFUSED_STREAM` / `H3_REQUEST_REJECTED`, so clients
-back off instead of retrying at once), emitting `[roadrunner, request,
-throttled]` with `reason => rate_limit` and incrementing the
+back off instead of retrying at once), emitting the `request_throttled` event with
+reason `rate_limit` and incrementing the
 `rate_limited` count from `roadrunner_listener:info/1`. An IPv6 client is
 keyed by its /64, the network a host is given: the host can use any
 address in it, so a bucket per address would let it lift its own limit
@@ -385,7 +386,7 @@ raises one for every scanner and misdirected client that connects and
 sends something other than a ClientHello, so the log fills with them.
 
 Roadrunner reports each failed handshake itself as
-`[roadrunner, listener, accept_error]` with a `{handshake, Reason}` reason
+`listener_accept_error` with a `{handshake, Reason}` reason
 that carries the alert text, so a deployment that consumes that event
 already has the information and can silence the duplicate through the
 listener's `tls` opts:
@@ -403,6 +404,6 @@ setting also hides alerts raised after the handshake (a bad record from a
 buggy client, a renegotiation attempt), which the connection does not
 report anywhere else yet: it closes, and `conn_close` carries no reason.
 Until it does, `ssl`'s notice is the only trace of those, and a
-deployment that has not attached telemetry handlers would otherwise see
+deployment without an event handler would otherwise see
 nothing about TLS trouble at all. Quiet it when you consume the event;
 keep it while the log is what you read.

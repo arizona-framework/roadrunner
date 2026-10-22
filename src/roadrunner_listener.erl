@@ -158,10 +158,10 @@ Optional middleware and timing knobs (durations in milliseconds):
   `min(max_clients, the OS file-descriptor limit)` — raise `ulimit -n`
   (and the systemd `LimitNOFILE`) for high concurrency, otherwise the
   acceptors hit `emfile` at the descriptor ceiling and emit
-  `[roadrunner, listener, accept_error]`. Saturation memory scales as
+  `listener_accept_error`. Saturation memory scales as
   `max_clients × recv_buffer`, so memory-constrained deployments lower the
   cap or `recv_buffer`. Rejections are observable:
-  each one emits `[roadrunner, listener, conn_rejected]` and increments
+  each one emits `listener_conn_rejected` and increments
   the `rejected` count from `info/1`, so a rising `rejected` is the
   signal that the cap is the binding limit. For HTTP/2 and HTTP/3 the
   worst-case live-handler count is `max_clients × max_concurrent_streams`;
@@ -181,7 +181,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   `max_clients`. Over-limit streams
   are refused with `REFUSED_STREAM` (h2) / `H3_REQUEST_REJECTED` (h3),
   which RFC 9113 §8.7 marks safe to retry; each refusal emits
-  `[roadrunner, request, throttled]` and increments the `throttled`
+  `request_throttled` and increments the `throttled`
   count from `info/1`. HTTP/1 is unaffected (one request per connection,
   already bounded by `max_clients`).
 - `overload_mode` — what happens to a request that arrives over
@@ -362,7 +362,7 @@ ops-tuning rationale.
     %% handshake: the listener accepts plain TCP and upgrades each connection
     %% once the header is in. TCP-only: rejected on an HTTP/3-only listener.
     %% A connection whose header is missing or malformed is closed and
-    %% reported as `[roadrunner, listener, accept_error]` with a
+    %% reported as `listener_accept_error` with a
     %% `{proxy_protocol, Reason}` reason. Trust it only behind a balancer
     %% that always prepends the header (otherwise a direct peer can spoof its
     %% IP).
@@ -804,13 +804,13 @@ Return runtime introspection for a listener:
 - `rejected` — cumulative count of connections dropped because the
   listener was at its `max_clients` cap when they arrived. A rising
   `rejected` means the cap is the binding limit and should be raised.
-  Also emitted in real time as `[roadrunner, listener, conn_rejected]`.
+  Also emitted in real time as `listener_conn_rejected`.
 - `max_concurrent_requests` — the configured in-flight ceiling
   (`infinity` when off).
 - `throttled` — cumulative count of streams refused because the listener
   was at its `max_concurrent_requests` ceiling. A rising `throttled`
   means the in-flight cap is binding. Also emitted in real time as
-  `[roadrunner, request, throttled]`.
+  `request_throttled`.
 
 Useful for ops dashboards / health endpoints.
 """.
@@ -2244,11 +2244,7 @@ handle_info(
                 counter_was => Counter0,
                 live_conns_bounded => LiveBounded
             }),
-            ok = roadrunner_telemetry:slots_reconciled(#{
-                listener_name => Name,
-                released => N,
-                counter_was => Counter0
-            })
+            ok = roadrunner_event:slots_reconciled(Name, N, Counter0, LiveBounded)
     end,
     erlang:send_after(Interval, self(), reconcile_slots),
     {noreply, State#state{

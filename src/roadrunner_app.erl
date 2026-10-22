@@ -7,6 +7,8 @@
 
 -spec start(application:start_type(), term()) -> supervisor:startlink_ret().
 start(_StartType, _StartArgs) ->
+    {ok, Handler} = application:get_env(roadrunner, event_handler),
+    ok = roadrunner_event:put_handler(Handler),
     roadrunner_sup:start_link().
 
 -spec stop(term()) -> ok.

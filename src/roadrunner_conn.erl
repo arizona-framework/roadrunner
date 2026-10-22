@@ -523,16 +523,13 @@ rate_limit_check(Table, Key, Rate, Cap, Cost, NowMs) ->
 -doc """
 Record a throttled request, refused for `Reason` (the per-peer rate limit
 or the listener's concurrent-request ceiling): bump the cumulative
-counter and emit `[roadrunner, request, throttled]`.
+counter and emit `request_throttled`.
 """.
 -spec throttled_telemetry(atom(), atomics:atomics_ref(), rate_limit | max_concurrent_requests) ->
     ok.
 throttled_telemetry(ListenerName, Counter, Reason) ->
     ok = atomics:add(Counter, 1, 1),
-    roadrunner_telemetry:request_throttled(#{
-        listener_name => ListenerName,
-        reason => Reason
-    }).
+    roadrunner_event:request_throttled(ListenerName, Reason).
 
 -doc """
 Evict every per-peer bucket that has refilled to its capacity `Cap` by `NowMs`

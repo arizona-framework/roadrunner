@@ -19,7 +19,7 @@
 %% cannot send, e.g. 500 for a returned 1xx). It runs in the `of` body of
 %% the handler's `try`, which does not catch: if it raises (a stream fun
 %% that fails, a sendfile that cannot open its file), no
-%% `[roadrunner, request, exception]` is emitted, the worker exits and the
+%% `request_exception` is emitted, the worker exits and the
 %% connection resets the stream.
 -callback emit_handler_response(
     pid(), non_neg_integer(), module(), roadrunner_handler:response()
@@ -39,8 +39,7 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
     %% per-route mws, with `state` injected up front if attached, ending in
     %% `fun Handler:handle/1`), built once at compile / `reload_routes/2`
     %% time — we just call it with the request, no per-request closure.
-    Metadata = roadrunner_telemetry:request_metadata(Req),
-    ReqStart = roadrunner_telemetry:request_start(Metadata),
+    Span = roadrunner_event:request_start(Req),
     case roadrunner_conn:resolve_handler(Dispatch, Req) of
         {ok, Handler, Bindings, Pipeline, _State, Limits} ->
             case route_body(Limits, Req) of
@@ -53,8 +52,7 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
                         Handler,
                         Pipeline,
                         Req1#{bindings => Bindings},
-                        Metadata,
-                        ReqStart
+                        Span
                     );
                 too_large ->
                     ok = Worker:send_buffered(
@@ -64,7 +62,7 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
                         [{~"content-type", ~"text/plain"}],
                         ~"Payload Too Large"
                     ),
-                    ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, 413, buffered)
+                    ok = roadrunner_event:request_stop(Span, 413, buffered)
             end;
         {method_not_allowed, Allowed} ->
             %% Path matched but no route on it answers this method: 405 plus
@@ -80,12 +78,12 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
                 ],
                 ~"Method Not Allowed"
             ),
-            ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, 405, buffered);
+            ok = roadrunner_event:request_stop(Span, 405, buffered);
         not_found ->
             ok = Worker:send_buffered(
                 Conn, StreamId, 404, [{~"content-type", ~"text/plain"}], ~"Not Found"
             ),
-            ok = roadrunner_telemetry:request_stop(ReqStart, Metadata, 404, buffered)
+            ok = roadrunner_event:request_stop(Span, 404, buffered)
     end.
 
 %% The request held to its route's own `max_content_length`, or `too_large`.
@@ -113,8 +111,7 @@ route_body(_Limits, Req) ->
     module(),
     roadrunner_middleware:next(),
     roadrunner_req:request(),
-    roadrunner_telemetry:metadata(),
-    integer()
+    roadrunner_event_handler:span()
 ) -> ok.
 invoke(
     Worker,
@@ -124,8 +121,7 @@ invoke(
     Handler,
     Pipeline,
     #{method := Method} = Req,
-    Metadata,
-    ReqStart
+    Span
 ) ->
     try Pipeline(Req) of
         {Response0, Req2} ->
@@ -141,12 +137,12 @@ invoke(
             Final = roadrunner_conn:head_response(Response, Method),
             ok = continue_before(Final, Req2),
             Status = Worker:emit_handler_response(Conn, StreamId, Handler, Final),
-            ok = roadrunner_telemetry:request_stop(
-                ReqStart, Metadata, Status, roadrunner_conn:response_kind(Response)
+            ok = roadrunner_event:request_stop(
+                Span, Status, roadrunner_conn:response_kind(Response)
             )
     catch
         Class:Reason:Stack ->
-            ok = roadrunner_telemetry:request_exception(ReqStart, Metadata, Class, Reason),
+            ok = roadrunner_event:request_exception(Span, Class, Reason),
             logger:error(#{
                 msg => crash_message(Protocol),
                 handler => Handler,

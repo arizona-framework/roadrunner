@@ -34,7 +34,7 @@ prop_loop_terminates_normal_on_random_inputs() ->
             list(stray_msg())
         },
         begin
-            {ok, _} = application:ensure_all_started(telemetry),
+            {ok, _} = roadrunner_test_event_handler:start(),
             Counter = counters:new(1, [write_concurrency]),
             Opts = proto_opts(prop_listener, Counter),
             %% Mirror the acceptor's slot acquisition so the conn's
@@ -89,7 +89,7 @@ prop_request_start_and_stop_share_request_id() ->
         Method,
         method(),
         begin
-            {ok, _} = application:ensure_all_started(telemetry),
+            {ok, _} = roadrunner_test_event_handler:start(),
             Self = self(),
             HandlerId = make_ref(),
             ok = telemetry:attach_many(

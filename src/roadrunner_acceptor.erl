@@ -26,8 +26,8 @@
 %% completes it at `shoot` (`roadrunner_conn_loop`), so handshake time
 %% — bounded by `tls_handshake_timeout` — is paid by the connection it
 %% belongs to and never parks an acceptor. A failed handshake is
-%% reported by that connection as `[roadrunner, listener,
-%% accept_error]` with a `{handshake, _}` reason, the same event this
+%% reported by that connection as `listener_accept_error` with a
+%% `{handshake, _}` reason, the same event this
 %% pool emits for its own accept failures.
 
 %% Back-off between retries after a resource-class accept error. Bounds
@@ -71,10 +71,9 @@ loop(LSocket, ProtoOpts) ->
             %% exiting here would silently drain the pool and leave the
             %% listener permanently deaf with no diagnostic. Pacing is
             %% per error class; see `accept_error_class/1`.
-            ok = roadrunner_telemetry:listener_accept_error(#{
-                listener_name => maps:get(listener_name, ProtoOpts, undefined),
-                reason => Reason
-            }),
+            ok = roadrunner_event:listener_accept_error(
+                maps:get(listener_name, ProtoOpts, undefined), Reason
+            ),
             ok = pace_after_error(accept_error_class(Reason)),
             loop(LSocket, ProtoOpts)
     end.
@@ -122,14 +121,13 @@ handle_accepted(Socket, ProtoOpts) ->
             %% Over max_clients — drop the new connection on the floor, but
             %% make the drop observable: bump the cumulative reject counter
             %% (surfaced via `roadrunner_listener:info/1`) and emit
-            %% `[roadrunner, listener, conn_rejected]`. No `peername` lookup
+            %% `listener_conn_rejected`. No `peername` lookup
             %% here — this is the floodable path, so it stays cheap.
             #{rejected_counter := RejectedCounter} = ProtoOpts,
             ok = atomics:add(RejectedCounter, 1, 1),
-            ok = roadrunner_telemetry:listener_conn_rejected(#{
-                listener_name => maps:get(listener_name, ProtoOpts, undefined),
-                reason => max_clients
-            }),
+            ok = roadrunner_event:listener_conn_rejected(
+                maps:get(listener_name, ProtoOpts, undefined), max_clients
+            ),
             _ = roadrunner_transport:close(Socket),
             ok
     end.

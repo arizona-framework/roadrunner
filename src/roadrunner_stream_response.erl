@@ -44,7 +44,7 @@ run(Socket, Status, UserHeaders, Fun) ->
     %% and can race a request onto a socket we are about to drop.
     Headers = [{~"transfer-encoding", ~"chunked"}, {~"connection", ~"close"} | UserHeaders],
     Head = roadrunner_http1:response(Status, Headers, ~""),
-    _ = roadrunner_telemetry:response_send(
+    _ = roadrunner_event:response_send(
         roadrunner_transport:send(Socket, Head), stream_response_head
     ),
     Send = fun(Data, FinFlag) ->

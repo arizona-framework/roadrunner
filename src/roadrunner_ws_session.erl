@@ -10,11 +10,11 @@
 %% `start/7`, which spawns the session, transfers controlling-process,
 %% sends the `socket_ready` startup signal (mirroring the conn's `shoot`
 %% pattern), and hands the session's monitor back so the conn can park
-%% in a hibernated wait (`roadrunner_conn_loop:ws_session_wake/7`)
+%% in a hibernated wait (`roadrunner_conn_loop:ws_session_wake/6`)
 %% until the session terminates. When the session exits — peer close
 %% frame, recv error, frame parse error, or handler-driven `{close, _}`
-%% — the conn wakes and its `[roadrunner, listener, conn_close]`
-%% telemetry fires after.
+%% — the conn wakes and its `listener_conn_close` event fires
+%% after.
 %%
 %% Phases (plain functions, not gen_statem states):
 %% - `awaiting_socket/1` — a selective `receive socket_ready` that gates
@@ -80,22 +80,27 @@
 %% each is exported is cached in `#data` at session start so the BIF
 %% check doesn't run on every event.
 %%
-%% Telemetry: `[roadrunner, ws, upgrade]` fires from `start/7` once the
-%% launcher has decided to enter the session; `[roadrunner, ws, frame_in]`
-%% and `[roadrunner, ws, frame_out]` fire from the session process for
-%% every frame.
+%% Events: `ws_upgrade` fires from the session process once its
+%% handler is validated, just before the launcher writes the 101; its
+%% span then rides along on the `ws_frame_in` / `ws_frame_out` /
+%% `ws_frame_rejected` events the session fires for every frame.
 
 -export([start/7]).
 -export([init_session/2]).
 -export([recv_loop/1]).
 -export([unmask_slice/3]).
 
+-type ws_context() :: {
+    atom(), roadrunner_event_handler:peer(), binary() | undefined
+}.
+
 -record(data, {
     socket :: roadrunner_transport:socket(),
     buffer :: binary(),
     mod :: module(),
     mod_state :: term(),
-    ctx :: map(),
+    %% The event handler's WebSocket span, from `ws_upgrade`.
+    span :: roadrunner_event_handler:span(),
     %% Cached results of `erlang:function_exported/3` for the optional
     %% callbacks. Computed once in `init/1` and read on every event so
     %% the BIF call doesn't run on the hot path (handle_info can fire
@@ -199,7 +204,7 @@ fall back to 500 without leaving the upgrade response sent with no
 process owning the socket. Returns `{session, MonitorRef, Pid}`
 once the handoff is complete — the caller owns the wait for the
 session's `'DOWN'` and forwards `{roadrunner_drain, _}` broadcasts
-to `Pid` (see `roadrunner_conn_loop:ws_session_wake/7`). Returns
+to `Pid` (see `roadrunner_conn_loop:ws_session_wake/6`). Returns
 `rejected` when the handshake check fails (no session started: 426
 for a `Sec-WebSocket-Version` other than 13, 400 otherwise) or the
 session couldn't start (500 sent); every one of these responses
@@ -273,7 +278,7 @@ start_session(
     #{handler_spawn_opts := SpawnOpts, handler_start_timeout := StartTimeout} = ProtoOpts
 ) ->
     ok = apply_ws_buffer(Socket, ProtoOpts),
-    Ctx = ws_context(Req, Mod),
+    Ctx = ws_context(Req),
     %% Start the session **before** writing the 101 to the wire so a
     %% start failure never leaves the upgrade response sent with no
     %% process owning the socket. `proc_lib:start` (not `start_link`) —
@@ -292,8 +297,7 @@ start_session(
         )
     of
         {ok, Pid} ->
-            ok = roadrunner_telemetry:ws_upgrade(Ctx),
-            _ = roadrunner_telemetry:response_send(
+            _ = roadrunner_event:response_send(
                 roadrunner_transport:send(Socket, UpgradeResp), websocket_upgrade_response
             ),
             Ref = monitor(process, Pid),
@@ -332,13 +336,16 @@ apply_ws_buffer(Socket, #{ws_buffer := Buffer}) ->
     roadrunner_transport:socket(),
     module(),
     term(),
-    map(),
+    ws_context(),
     roadrunner_ws:negotiated(),
     binary(),
     roadrunner_conn:proto_opts()
 }) -> ok | no_return().
-init_session(Parent, {Socket, Mod, State, Ctx, Negotiated, Buffered, ProtoOpts}) ->
-    proc_lib:set_label({?MODULE, maps:get(listener_name, Ctx, undefined)}),
+init_session(
+    Parent,
+    {Socket, Mod, State, {ListenerName, Peer, RequestId}, Negotiated, Buffered, ProtoOpts}
+) ->
+    proc_lib:set_label({?MODULE, ListenerName}),
     case
         code:ensure_loaded(Mod) =:= {module, Mod} andalso
             erlang:function_exported(Mod, handle_frame, 2)
@@ -355,7 +362,10 @@ init_session(Parent, {Socket, Mod, State, Ctx, Negotiated, Buffered, ProtoOpts})
                 buffer = Buffered,
                 mod = Mod,
                 mod_state = State,
-                ctx = Ctx,
+                %% The handler is valid and the 101 goes out once the
+                %% launcher has the ack, so the upgrade fires here: the
+                %% session owns the span its frame events carry.
+                span = roadrunner_event:ws_upgrade(ListenerName, Peer, RequestId, Mod),
                 has_init = erlang:function_exported(Mod, init, 1),
                 has_handle_info = erlang:function_exported(Mod, handle_info, 2),
                 has_handle_drain = erlang:function_exported(Mod, handle_drain, 2),
@@ -547,9 +557,8 @@ process_parsed_frame(Data1, Buf, Header, HibernateAcc) ->
     %% were already surfaced upstream, so there's no `{error, _}` here.
     case roadrunner_ws:parse_frame_known(Buf, Header, pre_unmasked(Data1, Header)) of
         {ok, #{opcode := Opcode} = Frame, NewBuffer} ->
-            ok = roadrunner_telemetry:ws_frame_in(
-                (Data1#data.ctx)#{opcode => Opcode},
-                payload_size(Frame)
+            ok = roadrunner_event:ws_frame_in(
+                Data1#data.span, Opcode, payload_size(Frame)
             ),
             %% Frame parsed. Carry `frame_validated` into handle_frame
             %% so accumulate_fragment can skip redundant per-fragment
@@ -1084,13 +1093,13 @@ close_with(StatusBin, Data) ->
     flush_and_exit(queue_frame(Data, close, StatusBin)).
 
 %% Close with 1009 because an inbound size cap was exceeded, emitting
-%% `[roadrunner, ws, frame_rejected]` first so operators can see the
+%% `ws_frame_rejected` first so operators can see the
 %% rejection (and its reason + offending size) — a plain close frame
 %% doesn't distinguish a cap rejection from a normal close.
 -spec close_oversize(max_frame_size | max_message_size, non_neg_integer(), #data{}) ->
     no_return().
-close_oversize(Reason, Size, #data{ctx = Ctx} = Data) ->
-    ok = roadrunner_telemetry:ws_frame_rejected(Ctx#{reason => Reason}, Size),
+close_oversize(Reason, Size, #data{span = Span} = Data) ->
+    ok = roadrunner_event:ws_frame_rejected(Span, Reason, Size),
     close_with(close_message_too_big(), reset_msg(Data)).
 
 %% Build the payload for the close-handshake reply. RFC 6455 §5.5.1
@@ -1211,20 +1220,21 @@ close_payload(Code, Reason) ->
 
 %% --- helpers ---
 
--spec ws_context(roadrunner_req:request(), module()) -> map().
-ws_context(Req, Mod) ->
-    #{
-        listener_name => maps:get(listener_name, Req, undefined),
-        peer => maps:get(peer, Req, undefined),
-        request_id => maps:get(request_id, Req, undefined),
-        module => Mod
+%% The request fields the session's `ws_upgrade` event carries, taken
+%% in the conn so the session is not handed the whole request.
+-spec ws_context(roadrunner_req:request()) -> ws_context().
+ws_context(Req) ->
+    {
+        maps:get(listener_name, Req, undefined),
+        maps:get(peer, Req, undefined),
+        maps:get(request_id, Req, undefined)
     }.
 
 -spec payload_size(roadrunner_ws:frame()) -> non_neg_integer().
 payload_size(#{payload := P}) -> byte_size(P).
 
 %% Queue a single outbound frame on the pending accumulator, emitting
-%% `[roadrunner, ws, frame_out]` at queue time so subscribers see every
+%% `ws_frame_out` at queue time so the event handler sees every
 %% frame the session writes (auto-pong, close, and unary handler
 %% replies) in dispatch order.
 %%
@@ -1235,17 +1245,15 @@ payload_size(#{payload := P}) -> byte_size(P).
 %% RSV1 even inside a compressed message (we never emit a
 %% multi-fragment outbound message anyway, so the question is moot).
 -spec queue_frame(#data{}, roadrunner_ws:opcode(), iodata()) -> #data{}.
-queue_frame(#data{ctx = Ctx, out = Out} = Data, Opcode, Payload) ->
-    ok = roadrunner_telemetry:ws_frame_out(
-        Ctx#{opcode => Opcode}, iolist_size(Payload)
-    ),
+queue_frame(#data{span = Span, out = Out} = Data, Opcode, Payload) ->
+    ok = roadrunner_event:ws_frame_out(Span, Opcode, iolist_size(Payload)),
     Data#data{out = [Out | encode_outbound(Data, Opcode, Payload)]}.
 
-%% Queue a handler `{reply, [...]}` batch — telemetry per frame (so
-%% subscribers can count by opcode), encoded in one walk.
+%% Queue a handler `{reply, [...]}` batch — one event per frame (so
+%% the event handler can count by opcode), encoded in one walk.
 -spec queue_frames(#data{}, [{roadrunner_ws:opcode(), iodata()}]) -> #data{}.
-queue_frames(#data{ctx = Ctx, out = Out} = Data, OutFrames) ->
-    Data#data{out = [Out | encode_frames(Data, Ctx, OutFrames)]}.
+queue_frames(#data{span = Span, out = Out} = Data, OutFrames) ->
+    Data#data{out = [Out | encode_frames(Data, Span, OutFrames)]}.
 
 %% Write everything queued since the last flush in ONE `send` and reset
 %% the accumulator. Called before every park (`arm_and_recv/2`) and
@@ -1268,12 +1276,14 @@ flush_out(#data{socket = Socket, out = Out} = Data) ->
 flush_and_exit(Data) ->
     exit_clean(flush_out(Data)).
 
--spec encode_frames(#data{}, map(), [{roadrunner_ws:opcode(), iodata()}]) -> iodata().
-encode_frames(_Data, _Ctx, []) ->
+-spec encode_frames(
+    #data{}, roadrunner_event_handler:span(), [{roadrunner_ws:opcode(), iodata()}]
+) -> iodata().
+encode_frames(_Data, _Span, []) ->
     [];
-encode_frames(Data, Ctx, [{Op, Payload} | Rest]) ->
-    ok = roadrunner_telemetry:ws_frame_out(Ctx#{opcode => Op}, iolist_size(Payload)),
-    [encode_outbound(Data, Op, Payload) | encode_frames(Data, Ctx, Rest)].
+encode_frames(Data, Span, [{Op, Payload} | Rest]) ->
+    ok = roadrunner_event:ws_frame_out(Span, Op, iolist_size(Payload)),
+    [encode_outbound(Data, Op, Payload) | encode_frames(Data, Span, Rest)].
 
 -spec encode_outbound(#data{}, roadrunner_ws:opcode(), iodata()) -> iodata().
 encode_outbound(#data{pmd_params = undefined}, Opcode, Payload) ->

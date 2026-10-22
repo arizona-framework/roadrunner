@@ -104,7 +104,8 @@
     proto_opts :: roadrunner_conn:proto_opts(),
     listener_name :: atom(),
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
-    start_mono :: integer(),
+    %% The event handler's span from `listener_accept`.
+    conn_span :: roadrunner_event_handler:span(),
     %% Pre-generated `request_id`s (hex), sliced 16 characters at a
     %% time and refilled by `roadrunner_conn:generate_request_id/1`.
     req_id_buffer = <<>> :: binary(),
@@ -207,16 +208,14 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
     %% `remote_addr` is set at connection creation, so peername is
     %% available from the start (idle / handshaking states).
     {ok, Peer} = roadrunner_quic:peername(Conn),
-    StartMono = roadrunner_telemetry:listener_accept(#{
-        listener_name => ListenerName, peer => Peer
-    }),
+    ConnSpan = roadrunner_event:listener_accept(ListenerName, Peer),
     MaxHeaderBlock = maps:get(http3_max_header_block, ProtoOpts, ?MAX_HEADER_BLOCK),
     loop(#h3{
         conn = Conn,
         proto_opts = ProtoOpts,
         listener_name = ListenerName,
         peer = Peer,
-        start_mono = StartMono,
+        conn_span = ConnSpan,
         max_content_length = MaxContentLength,
         body_buffering = maps:get(body_buffering, ProtoOpts, auto),
         max_header_block = MaxHeaderBlock,
@@ -1352,19 +1351,13 @@ drop_stream(#h3{conn = Conn, streams = Streams} = State, StreamId) ->
 -spec terminate(#h3{}) -> ok.
 terminate(#h3{
     proto_opts = ProtoOpts,
-    listener_name = ListenerName,
-    peer = Peer,
-    start_mono = StartMono,
+    conn_span = ConnSpan,
     worker_refs = Refs,
     max_concurrent_requests = MaxConcReq,
     inflight_counter = InflightCounter,
     overload = Overload
 }) ->
-    ok = roadrunner_telemetry:listener_conn_close(StartMono, #{
-        listener_name => ListenerName,
-        peer => Peer,
-        requests_served => 0
-    }),
+    ok = roadrunner_event:listener_conn_close(ConnSpan, 0),
     %% Account for any stream workers still live at teardown (each holds one
     %% in-flight slot); workers whose `DOWN` already fired were removed from
     %% `worker_refs`, so this releases each remaining worker exactly once.

@@ -80,7 +80,7 @@ end_per_group(_Group, _Config) ->
     ok.
 
 init_per_testcase(_Case, Config) ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     {ok, _} = roadrunner_listener:start_link(
         ?MODULE,
         maps:merge(

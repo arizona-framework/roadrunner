@@ -83,7 +83,7 @@ all() ->
     ].
 
 init_per_testcase(_Case, Config) ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Config.
 
 end_per_testcase(_Case, _Config) ->
@@ -561,7 +561,12 @@ start_conn(Handler, Extra) ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_flow_test, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_flow_test,
+            undefined,
+            {erlang:monotonic_time(), h2_flow_test, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),

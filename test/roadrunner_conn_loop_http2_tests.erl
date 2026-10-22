@@ -190,7 +190,7 @@ handshake_succeeds_and_loops() ->
     %% SETTINGS, ACKs, then idles in the frame loop. We don't drive
     %% any further frames — the test verifies the handshake sequence
     %% completes without the conn closing.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     %% Server SETTINGS — frame type 4, flags 0, stream id 0,
@@ -207,7 +207,7 @@ handshake_succeeds_and_loops() ->
     cleanup(Pid, Ref).
 
 bad_preface_closes_connection() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -220,7 +220,7 @@ bad_preface_closes_connection() ->
     end.
 
 non_settings_first_frame_triggers_goaway() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -239,7 +239,7 @@ full_get_request_returns_response() ->
     %% Drive the entire H5 round-trip via the fake socket: handshake,
     %% then HEADERS(END_STREAM) for `GET /`, expect HEADERS+DATA back
     %% from the hello handler.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _InitialSettings = expect_send(),
@@ -291,7 +291,7 @@ buffered_response_strips_connection_specific_fields() ->
     %% RFC 9113 §8.2.2: h2 MUST NOT generate connection-specific fields.
     %% The hello handler sets `connection: close` (idiomatic on h1); it is
     %% stripped from the buffered (HEADERS + DATA atomic) response.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _InitialSettings = expect_send(),
@@ -352,7 +352,7 @@ streaming_response_strips_connection_specific_fields() ->
 head_request_omits_body() ->
     %% RFC 9110 §9.3.2: a HEAD response is HEADERS with END_STREAM and
     %% no DATA frame, even though the handler returns a body for `/`.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _InitialSettings = expect_send(),
@@ -394,7 +394,7 @@ all_frame_types_handled() ->
     %% Walk through PING/WINDOW_UPDATE/PRIORITY/SETTINGS-after-handshake
     %% in sequence, exercising the no-op / ACK paths in the frame
     %% loop. Each frame keeps the connection alive.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -436,7 +436,7 @@ all_frame_types_handled() ->
     cleanup(Pid, Ref).
 
 goaway_received_closes_connection() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -457,7 +457,7 @@ concurrent_streams_both_dispatch() ->
     %% worker processes. Open stream 1 and stream 3 with a full
     %% request each (END_HEADERS + END_STREAM) and confirm both
     %% workers reply by parsing the HEADERS frames they emit.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
@@ -480,7 +480,12 @@ concurrent_streams_both_dispatch() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_concurrent_test, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_concurrent_test,
+            undefined,
+            {erlang:monotonic_time(), h2_concurrent_test, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -523,7 +528,7 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
     %% SETTINGS right after `shoot`. Receiving an h2 SETTINGS frame
     %% here proves the new dispatch (`http2_negotiated/1 orelse
     %% h2c_only/1`) routed to the h2 loop.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
@@ -580,7 +585,7 @@ plaintext_listener_without_h2c_stays_h1() ->
     %%   (`{roadrunner_fake_setopts, _, _}`) or a recv.
     %%
     %% Waiting for bytes without writing first proves we routed to h1.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
@@ -629,7 +634,7 @@ plaintext_listener_without_h2c_stays_h1() ->
 post_with_body_via_data_frame() ->
     %% HEADERS without END_STREAM, then DATA with END_STREAM —
     %% exercises the on_data / DATA-accumulation path.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -666,7 +671,7 @@ post_with_body_via_data_frame() ->
 continuation_assembles_header_block() ->
     %% HEADERS without END_HEADERS, then CONTINUATION with
     %% END_HEADERS+END_STREAM. Tests the CONTINUATION path.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -712,7 +717,7 @@ continuation_assembles_header_block() ->
     cleanup(Pid, Ref).
 
 push_promise_from_client_triggers_goaway() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -730,7 +735,7 @@ push_promise_from_client_triggers_goaway() ->
     end.
 
 even_stream_id_triggers_goaway() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -755,7 +760,7 @@ even_stream_id_triggers_goaway() ->
     end.
 
 continuation_without_pending_triggers_goaway() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -777,7 +782,7 @@ continuation_flood_triggers_goaway() ->
     %% MAX_FRAME_SIZE but the cumulative block is not (the HTTP/2
     %% CONTINUATION Flood), so the conn is torn down with
     %% GOAWAY(ENHANCE_YOUR_CALM). The fragments are never HPACK-decoded.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -808,7 +813,7 @@ configured_max_header_block_triggers_goaway() ->
     %% (well UNDER the default 16384) must still trip the flood guard and
     %% close with GOAWAY(ENHANCE_YOUR_CALM) — proving the configured cap,
     %% not the macro default, is what's enforced.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(#{http2_max_header_block => 200}),
     _ = expect_send(),
@@ -837,7 +842,7 @@ continuation_empty_frame_flood_triggers_goaway() ->
     %% size cap alone would never catch an endless stream of them. Treated
     %% as a flood: GOAWAY(ENHANCE_YOUR_CALM). An empty CONTINUATION that
     %% carries END_HEADERS, the only sane empty case, is still accepted.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -859,7 +864,7 @@ continuation_empty_frame_flood_triggers_goaway() ->
     end.
 
 data_on_unknown_stream_triggers_goaway() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -876,7 +881,7 @@ data_on_unknown_stream_triggers_goaway() ->
     end.
 
 malformed_hpack_block_triggers_goaway() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -902,7 +907,7 @@ malformed_hpack_block_triggers_goaway() ->
     end.
 
 missing_pseudo_header_rst_stream() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -928,7 +933,7 @@ missing_pseudo_header_rst_stream() ->
 unknown_expectation_answered_417() ->
     %% RFC 9110 §10.1.1: an expectation other than `100-continue` gets a
     %% 417, as on HTTP/1.1, then RST_STREAM(NO_ERROR).
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -966,7 +971,7 @@ unknown_expectation_answered_417() ->
 connect_answered_501() ->
     %% A well-formed CONNECT (RFC 9113 §8.5): roadrunner opens no tunnels,
     %% so the stream gets a 501, as on HTTP/1.1, then RST_STREAM(NO_ERROR).
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -1001,7 +1006,7 @@ connect_answered_501() ->
 bad_path_rst_stream() ->
     %% A `:path` outside the target rules is malformed (RFC 9113 §8.3.1):
     %% RST_STREAM(PROTOCOL_ERROR), connection kept.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -1395,7 +1400,7 @@ unfinished_response_on_normal_exit_resets_stream() ->
 middleware_chain_runs() ->
     %% Listener with a non-empty middleware list — exercises the
     %% `compose/2` branch in invoke/4.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Mw = fun(Req, Next) -> Next(Req) end,
     Counter = counters:new(1, [write_concurrency]),
@@ -1418,7 +1423,12 @@ middleware_chain_runs() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_mw_test, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_mw_test,
+            undefined,
+            {erlang:monotonic_time(), h2_mw_test, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -1429,7 +1439,7 @@ middleware_chain_runs() ->
 rst_stream_cancels_active_stream() ->
     %% Open stream 1 (HEADERS without END_STREAM), then RST_STREAM
     %% it. Server should drop the stream state and continue idling.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -1459,7 +1469,7 @@ rst_stream_cancels_active_stream() ->
 router_404_returns_not_found() ->
     %% Need a router-based dispatch with empty routes so the
     %% lookup returns `not_found`.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     %% Publish empty routes for a fake listener.
     persistent_term:put({roadrunner_routes, h2_404_listener}, roadrunner_router:compile([], [])),
@@ -1482,7 +1492,12 @@ router_404_returns_not_found() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_404_listener, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_404_listener,
+            undefined,
+            {erlang:monotonic_time(), h2_404_listener, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -1518,7 +1533,7 @@ router_405_returns_method_not_allowed() ->
     %% Path matches but the route's `methods` allowlist rejects the method:
     %% routing answers 405 with the accepted methods in `Allow`, without
     %% reaching the handler.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     persistent_term:put(
         {roadrunner_routes, h2_405_listener},
@@ -1546,7 +1561,12 @@ router_405_returns_method_not_allowed() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_405_listener, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_405_listener,
+            undefined,
+            {erlang:monotonic_time(), h2_405_listener, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -1583,7 +1603,7 @@ data_without_end_stream_continues_loop() ->
     %% HEADERS without END_STREAM, then DATA without END_STREAM,
     %% then DATA with END_STREAM. Tests `on_data` END_STREAM=false
     %% branch.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -1616,7 +1636,7 @@ continuation_without_end_headers_continues_loop() ->
     %% HEADERS without END_HEADERS, CONTINUATION without END_HEADERS,
     %% CONTINUATION with END_HEADERS. Tests `on_continuation`
     %% END_HEADERS=false branch.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -1652,7 +1672,7 @@ settings_ack_first_frame_triggers_goaway() ->
     %% non-ACK SETTINGS. A SETTINGS-ACK (the right type but wrong
     %% flags) parses cleanly — exercises the `{ok, _, _}` branch
     %% in `handshake_phase_settings/1`.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -1669,7 +1689,7 @@ settings_ack_first_frame_triggers_goaway() ->
 
 handshake_closed_during_partial_preface() ->
     %% Peer half-closes mid-preface (only 12 bytes delivered).
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -1683,7 +1703,7 @@ handshake_closed_during_partial_preface() ->
     end.
 
 handshake_error_during_partial_preface() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -1700,7 +1720,7 @@ handshake_timeout_during_partial_preface() ->
     %% Slowloris: 12 preface bytes then nothing. Override the
     %% 10s default with a 100 ms test deadline so the `after`
     %% branch in `handshake_recv/2` fires fast.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     persistent_term:put({roadrunner_conn_loop_http2, handshake_timeout}, 100),
     try
@@ -1722,7 +1742,7 @@ handshake_succeeds_with_fragmented_preface() ->
     %% the conn mid-preface: `handshake_phase_preface/1` waits for the
     %% full PREFACE_LEN bytes before deciding. (Guards against a
     %% partial-buffer clause that exits before the preface completes.)
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -1753,7 +1773,7 @@ handshake_succeeds_with_fragmented_preface() ->
 frame_loop_parse_error_triggers_goaway() ->
     %% Garbage frame bytes after a clean handshake — the buffer
     %% parses to `{error, _}`, server emits GOAWAY and exits.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -1775,7 +1795,7 @@ frame_loop_parse_error_triggers_goaway() ->
 runtime_idle_timeout_emits_goaway() ->
     %% Override the 30-s idle timeout with a 100-ms test deadline
     %% so the `after` branch in `recv_more/1` fires fast.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 100),
     try
@@ -1801,7 +1821,7 @@ hibernate_after_fires_when_idle() ->
     %% process stays alive, and the next request wakes it cleanly.
     %% idle_timeout is set well above hibernate_after so the GOAWAY
     %% path would lose the race if hibernation weren't wired in.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 5000),
     try
@@ -1839,7 +1859,7 @@ idle_timeout_with_open_stream_emits_goaway() ->
     %% the streams map non-empty, so the idle timeout takes the
     %% non-empty branch of `recv_idle_expired/1` — GOAWAY, never
     %% hibernate, even though `hibernate_after` is set.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 100),
     try
@@ -1898,7 +1918,7 @@ rst_stream_active_stream_synced() ->
     %% Active-mode receive added enough async slack between
     %% `serve_recv/2` and conn dispatch that `is_process_alive/1`
     %% alone wasn't a sufficient barrier for cover instrumentation.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -1933,7 +1953,7 @@ stream_window_update_grows_window_synced() ->
     %% it, sync via PING-ACK. Covers the success path of
     %% `handle_frame({window_update, StreamId, Inc}, _)` for the
     %% active stream.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -1969,7 +1989,7 @@ rst_stream_unknown_stream_ignored() ->
     %% dropped per RFC 9113 §5.4 / §6.4. Idle (id > last_stream_id)
     %% is a different case — covered by
     %% `rst_stream_on_idle_stream_protocol_error/0`.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -1998,7 +2018,7 @@ headers_for_already_open_stream_without_end_stream_protocol_error() ->
     %% either: the first opens the stream, the second is invalid
     %% (only a trailer HEADERS with END_STREAM is allowed after
     %% the body). Per RFC 9113 §8.1 → PROTOCOL_ERROR.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -2027,7 +2047,7 @@ synthetic_send_data_after_reset() ->
     %% map. Sending a synthetic `h2_send_data` for that stream id
     %% takes the not_open branch in `handle_send_data/7` and
     %% returns `{h2_stream_reset, _}` to the would-be worker.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -2050,7 +2070,7 @@ synthetic_send_data_after_reset() ->
     cleanup(Pid, Ref).
 
 synthetic_send_headers_after_reset() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -2077,7 +2097,7 @@ synthetic_send_response_after_reset() ->
     %% one way (its worker exits without waiting), so the conn drops it:
     %% no frame goes out and nothing is sent back. The PING ACK is the next
     %% send.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -2102,7 +2122,7 @@ synthetic_send_response_after_reset() ->
     cleanup(Pid, Ref).
 
 synthetic_send_trailers_after_reset() ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -2129,7 +2149,7 @@ synthetic_send_data_to_closed_stream() ->
     %% worker yet), inject a synthetic empty-fin DATA send (closes
     %% the send side, state := closed), then inject another DATA
     %% send. The second one hits `stream_open/2`'s closed clause.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -2169,7 +2189,7 @@ unrelated_down_ignored() ->
     %% A `'DOWN'` message with a ref the conn doesn't know about
     %% (some stray monitor) is silently dropped — the conn keeps
     %% serving. PING-ACK sync proves it.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -2258,7 +2278,7 @@ over_max_concurrent_streams_refused() ->
     %% Open 100 streams without END_STREAM (no body, just keep
     %% them alive in the map), then HEADERS for the 101st gets
     %% RST_STREAM(REFUSED_STREAM).
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -2295,7 +2315,7 @@ over_inflight_ceiling_refused_and_throttled() ->
     %% the second complete request is refused with RST_STREAM(refused_stream),
     %% bumps the `throttled_counter`, and emits `[roadrunner, request,
     %% throttled]`. Releasing the worker frees the slot again.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
     HandlerId = make_ref(),
@@ -2357,7 +2377,7 @@ reset_stream_releases_inflight_slot() ->
     %% `DOWN` fires) and drops the worker ref, so without an explicit release
     %% on that path the slot leaks: the gauge would never return to 0 and a
     %% later request would be wrongly refused.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Inflight = counters:new(1, [write_concurrency]),
     Throttled = atomics:new(1, [{signed, false}]),
@@ -2528,7 +2548,7 @@ rst_during_stream_response_unwinds_worker() ->
     %% `handle_worker_down/3` observes the non-normal exit and
     %% emits `RST_STREAM(internal_error)` (no-op for the peer
     %% since they already cancelled, but exercises that branch).
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
@@ -2551,7 +2571,12 @@ rst_during_stream_response_unwinds_worker() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_rst_during_stream, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_rst_during_stream,
+            undefined,
+            {erlang:monotonic_time(), h2_rst_during_stream, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -2589,7 +2614,7 @@ rst_during_stream_response_unwinds_worker() ->
 drain_with_no_streams_exits_immediately() ->
     %% Drain message arrives on an idle conn. Server emits
     %% GOAWAY(NO_ERROR) and exits cleanly.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -2610,7 +2635,7 @@ drain_refuses_new_streams() ->
     %% After drain, HEADERS for a fresh stream gets
     %% RST_STREAM(REFUSED_STREAM) — peer should already know to
     %% retry on a different conn after the GOAWAY, but defensive.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
@@ -2633,7 +2658,12 @@ drain_refuses_new_streams() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_drain_test, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_drain_test,
+            undefined,
+            {erlang:monotonic_time(), h2_drain_test, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -2667,7 +2697,7 @@ drain_with_in_flight_stream_waits() ->
     %% Drain while a stream is in-flight: server sends GOAWAY but
     %% keeps serving until the in-flight stream's worker finishes,
     %% then exits cleanly.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
@@ -2690,7 +2720,12 @@ drain_with_in_flight_stream_waits() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_drain_inflight_test, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_drain_inflight_test,
+            undefined,
+            {erlang:monotonic_time(), h2_drain_inflight_test, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -2731,7 +2766,7 @@ drain_message_is_idempotent() ->
     %% A second `{roadrunner_drain, _}` after the first is a no-op
     %% — no extra GOAWAY emitted. PING-ACK proves the conn
     %% processed the duplicate without misbehaving.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
@@ -2754,7 +2789,12 @@ drain_message_is_idempotent() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_drain_dup_test, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_drain_dup_test,
+            undefined,
+            {erlang:monotonic_time(), h2_drain_dup_test, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -2785,7 +2825,7 @@ drain_then_peer_rst_exits_via_frame_loop() ->
     %% in-flight stream — `handle_frame({rst_stream, ...})` tail-calls
     %% `frame_loop/1` which observes `draining = true` and an empty
     %% streams map, and exits cleanly.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
@@ -2808,7 +2848,12 @@ drain_then_peer_rst_exits_via_frame_loop() ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_drain_rst_test, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_drain_rst_test,
+            undefined,
+            {erlang:monotonic_time(), h2_drain_rst_test, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -2908,7 +2953,7 @@ telemetry_request_stop_fires_for_router_404() ->
     %% handler invoke and still fires request_stop with status=404.
     HandlerId = attach_telemetry([[roadrunner, request, stop]]),
     try
-        {ok, _} = application:ensure_all_started(telemetry),
+        {ok, _} = roadrunner_test_event_handler:start(),
         drain_mailbox(),
         persistent_term:put({roadrunner_routes, h2_telem_404}, roadrunner_router:compile([], [])),
         Self = self(),
@@ -2930,7 +2975,12 @@ telemetry_request_stop_fires_for_router_404() ->
                 ready -> ok
             end,
             roadrunner_conn_loop_http2:enter(
-                Sock, ProtoOpts, h2_telem_404, undefined, erlang:monotonic_time(), <<>>
+                Sock,
+                ProtoOpts,
+                h2_telem_404,
+                undefined,
+                {erlang:monotonic_time(), h2_telem_404, undefined},
+                <<>>
             )
         end),
         Ref = monitor(process, Pid),
@@ -2994,7 +3044,7 @@ compress_middleware_passthrough_when_no_accept_encoding() ->
     cleanup(Pid, Ref).
 
 run_h2_with_compress_middleware(Path, ExtraHeaders) ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
@@ -3020,7 +3070,12 @@ run_h2_with_compress_middleware(Path, ExtraHeaders) ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_compress_test, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_compress_test,
+            undefined,
+            {erlang:monotonic_time(), h2_compress_test, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -3153,7 +3208,7 @@ data_after_end_stream_on_half_closed_remote_rst() ->
     %% exercises the state-guarded `on_data` path. Without the guard the
     %% DATA was silently appended (no reset) and the handler's response
     %% raced the violation, the h2spec §5.1 / §6.1 flake.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(#{
         dispatch =>
@@ -3615,7 +3670,7 @@ oversized_body_413_then_rst() ->
     %% RST_STREAM(NO_ERROR) to stop the upload; the connection stays
     %% usable. The worker is never dispatched (dispatch is at
     %% END_STREAM), so the conn emits the 413 directly, mirroring h3.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(#{max_content_length => 8}),
     _ = expect_send(),
@@ -4056,7 +4111,7 @@ settings_header_table_size_above_default_emits_no_update() ->
 settings_advertises_max_header_list_size() ->
     %% RFC 9113 §6.5.2: the server's initial SETTINGS advertises
     %% SETTINGS_MAX_HEADER_LIST_SIZE (id 6) with the configured value.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, _ConnPid} = start_http2_conn(#{http2_max_header_list_size => 12345}),
     InitialSettings = expect_send(),
@@ -4260,7 +4315,7 @@ post_handshake_conn() ->
     post_handshake_conn(#{}).
 
 post_handshake_conn(Extra) ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(Extra),
     _ = expect_send(),
@@ -4270,7 +4325,7 @@ post_handshake_conn(Extra) ->
     {Pid, Ref, ConnPid}.
 
 post_handshake_handler(Handler) ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
@@ -4291,7 +4346,12 @@ post_handshake_handler(Handler) ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_strict_test, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_strict_test,
+            undefined,
+            {erlang:monotonic_time(), h2_strict_test, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -4353,7 +4413,7 @@ encode_post_root_headers() ->
 runtime_transport_error_triggers_goaway() ->
     %% Transport error AFTER handshake — exercises the `{MError, _, _}`
     %% arm of `recv_more/1`.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -4377,7 +4437,7 @@ idle_timeout_emits_goaway() ->
     %% waiting for frames. Delivering a `roadrunner_fake_closed`
     %% message simulates the peer going away — the conn should exit
     %% cleanly.
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
     _ = expect_send(),
@@ -4428,7 +4488,12 @@ start_http2_conn(Extra) ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, http2_test, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            http2_test,
+            undefined,
+            {erlang:monotonic_time(), http2_test, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -4530,7 +4595,7 @@ drain_until(Sentinel) ->
 %% sends a HEADERS frame (decode it via `h2_response_status/1`); a crash /
 %% malformed-shape path resets the stream instead.
 run_h2_request_with_handler(Handler, Path) ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
@@ -4551,7 +4616,12 @@ run_h2_request_with_handler(Handler, Path) ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_handler_test, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_handler_test,
+            undefined,
+            {erlang:monotonic_time(), h2_handler_test, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),
@@ -4595,7 +4665,7 @@ run_stream_request(Path) ->
     run_stream_request(Path, ?EMPTY_SETTINGS_FRAME).
 
 run_stream_request(Path, PrefaceSettings) ->
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
@@ -4618,7 +4688,12 @@ run_stream_request(Path, PrefaceSettings) ->
             ready -> ok
         end,
         roadrunner_conn_loop_http2:enter(
-            Sock, ProtoOpts, h2_stream_test, undefined, erlang:monotonic_time(), <<>>
+            Sock,
+            ProtoOpts,
+            h2_stream_test,
+            undefined,
+            {erlang:monotonic_time(), h2_stream_test, undefined},
+            <<>>
         )
     end),
     Ref = monitor(process, Pid),

@@ -44,13 +44,13 @@ escape hatch equivalent to cowboy's mid-flight `cowboy_req:reply/4`.
 This is a feature, not a limitation. Bytes only hit the wire from
 one place — the conn process — which means:
 
-- `[roadrunner, request, stop]` telemetry fires for every request,
-  with consistent duration and status metadata.
+- the `request_stop` event fires for every request, with the status
+  actually sent.
 - gzip wrapping, response transforms, and `Content-Length` framing
   are applied uniformly regardless of which middleware produced
   the response.
-- Send errors are handled in one place (`[roadrunner, response,
-  send_failed]` telemetry, drain bookkeeping, slot release).
+- Send errors are handled in one place (the `response_send_failed`
+  event, drain bookkeeping, slot release).
 - The "halt" pattern is structurally simple: don't call `Next`, just
   return a response. There's no second halt protocol to maintain
   (compare: an arizona cowboy adapter has to support BOTH stashed

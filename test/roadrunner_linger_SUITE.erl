@@ -49,7 +49,7 @@ all() ->
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(ssl),
-    {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = roadrunner_test_event_handler:start(),
     Config.
 
 end_per_suite(_Config) ->

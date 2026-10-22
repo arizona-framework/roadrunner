@@ -60,9 +60,9 @@
 %%
 %% ## Stability features preserved
 %%
-%% Drain via registry broadcast, slot tracking via atomics, full telemetry
-%% pairing (`[roadrunner, request, start | stop | exception]` with
-%% shared `StartMono`), HEAD body suppression, `Expect: 100-continue`,
+%% Drain via registry broadcast, slot tracking via atomics, full event
+%% pairing (`request_start` then `request_stop | request_exception` on
+%% one span), HEAD body suppression, `Expect: 100-continue`,
 %% anti-Slowloris rate-check on the request-read phase, all five
 %% response shapes (buffered, `{stream, ...}`, `{loop, ...}`,
 %% `{sendfile, ...}`, `{websocket, ...}`).
@@ -72,7 +72,7 @@
 %% Internal entries — invoked via `proc_lib:start/3` and via
 %% `erlang:hibernate/3`. Must stay exported so the runtime can
 %% re-enter them after wake-from-hibernate.
--export([init_loop/3, recv_request_bytes_hib/2, ws_session_wake/7]).
+-export([init_loop/3, recv_request_bytes_hib/2, ws_session_wake/6]).
 
 %% Loop-state record carried through every phase. Allocated once on
 %% the transition out of `awaiting_shoot` and pattern-matched (not
@@ -82,9 +82,10 @@
     socket :: roadrunner_transport:socket(),
     proto_opts :: roadrunner_conn:proto_opts(),
     listener_name :: atom(),
-    %% Captured at `shoot` from `roadrunner_telemetry:listener_accept/1`.
-    %% Paired with `listener_conn_close` in `exit_clean/2`.
-    start_mono :: integer(),
+    %% The event handler's span from `roadrunner_event:listener_accept/2`,
+    %% fired once the peer is settled. Paired with `listener_conn_close`
+    %% in `exit_clean/4`.
+    conn_span :: roadrunner_event_handler:span(),
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
     scheme = http :: http | https,
     %% `first` for the first request on a fresh conn; `keep_alive` for
@@ -221,16 +222,16 @@ awaiting_shoot(Socket0, ProtoOpts, ListenerName) ->
                     %% silent close, then release the slot. No accept telemetry
                     %% has fired yet (it pairs with the real peer in serve/5),
                     %% so no conn_close either.
-                    ok = roadrunner_telemetry:listener_accept_error(#{
-                        listener_name => ListenerName, reason => {proxy_protocol, Reason}
-                    }),
-                    exit_clean(Socket0, ProtoOpts, undefined, undefined, ListenerName, 0, normal)
+                    ok = roadrunner_event:listener_accept_error(
+                        ListenerName, {proxy_protocol, Reason}
+                    ),
+                    exit_unaccepted(Socket0, ProtoOpts)
             end;
         {roadrunner_drain, _Deadline} ->
             %% Drain before `shoot` — no telemetry was fired yet (accept
             %% pairs with `shoot`), so no listener_conn_close either. Just
             %% release the slot and close the socket.
-            exit_clean(Socket0, ProtoOpts, undefined, undefined, ListenerName, 0, normal);
+            exit_unaccepted(Socket0, ProtoOpts);
         _Stray ->
             %% Stray-msg tolerance — gen_statem drops unmatched info events
             %% silently; we do the same so a buggy library can't crash the
@@ -259,9 +260,7 @@ handshake_failed(ProtoOpts, ListenerName, Reason) ->
     %% already closed a timed-out one, and on any other failure (every
     %% failure, for the `handshake/3` upgrade) `ssl` tore the connection
     %% down itself.
-    ok = roadrunner_telemetry:listener_accept_error(#{
-        listener_name => ListenerName, reason => Reason
-    }),
+    ok = roadrunner_event:listener_accept_error(ListenerName, Reason),
     ok = roadrunner_conn:unregister_for_drain(ProtoOpts),
     ok = roadrunner_conn:release_slot(ProtoOpts),
     exit(normal).
@@ -295,9 +294,7 @@ label_handshake(Socket, ProtoOpts, ListenerName) ->
 serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
     ok = roadrunner_conn:refine_conn_label(ProtoOpts, Peer),
     Scheme = roadrunner_conn:scheme(Socket),
-    StartMono = roadrunner_telemetry:listener_accept(#{
-        listener_name => ListenerName, peer => Peer
-    }),
+    ConnSpan = roadrunner_event:listener_accept(ListenerName, Peer),
     case http2_negotiated(Socket) orelse h2c_only(ProtoOpts) of
         true ->
             %% Either ALPN landed on `h2` (TLS listener) or the listener is in
@@ -305,7 +302,7 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
             %% The HTTP/2 path takes over; slot release and `listener_conn_close`
             %% happen inside the h2 module.
             roadrunner_conn_loop_http2:enter(
-                Socket, ProtoOpts, ListenerName, Peer, StartMono, Buffered
+                Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered
             );
         false ->
             #{
@@ -323,7 +320,7 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                 socket = Socket,
                 proto_opts = ProtoOpts,
                 listener_name = ListenerName,
-                start_mono = StartMono,
+                conn_span = ConnSpan,
                 peer = Peer,
                 scheme = Scheme,
                 buffered = Buffered,
@@ -853,11 +850,7 @@ handle_request_bytes(
                 listener_name => ListenerName,
                 reason => Reason
             }),
-            ok = roadrunner_telemetry:request_rejected(#{
-                listener_name => ListenerName,
-                peer => Peer,
-                reason => Reason
-            }),
+            ok = roadrunner_event:request_rejected(ListenerName, Peer, Reason),
             %% Size-limit overruns get the RFC-specific status (414 for an
             %% over-long request line, 431 for oversized/too-many headers);
             %% other malformed input is a generic 400. Queued pipelined
@@ -1110,8 +1103,7 @@ dispatch_phase(#loop_state{socket = Socket} = S, Req, Resolved) ->
     roadrunner_middleware:next()
 ) -> no_return().
 run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
-    Metadata = roadrunner_telemetry:request_metadata(Req),
-    ReqStart = roadrunner_telemetry:request_start(Metadata),
+    Span = roadrunner_event:request_start(Req),
     try Pipeline(Req) of
         {Response0, Req2} when is_map(Req2) ->
             S2 = S#loop_state{requests_served = S#loop_state.requests_served + 1},
@@ -1130,11 +1122,10 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
                     %% `request_stop` fires from the wake continuation so
                     %% its timing (response writer finished) matches the
                     %% other writer-owned shapes.
-                    ws_session_wait(S3, Req2, Response, MRef, SessPid, ReqStart, Metadata);
+                    ws_session_wait(S3, Req2, Response, MRef, SessPid, Span);
                 #loop_state{} = S3 ->
-                    ok = roadrunner_telemetry:request_stop(
-                        ReqStart,
-                        Metadata,
+                    ok = roadrunner_event:request_stop(
+                        Span,
                         roadrunner_conn:response_status(Response),
                         roadrunner_conn:response_kind(Response)
                     ),
@@ -1142,9 +1133,7 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
             end
     catch
         Class:Reason:Stack ->
-            ok = roadrunner_telemetry:request_exception(
-                ReqStart, Metadata, Class, Reason
-            ),
+            ok = roadrunner_event:request_exception(Span, Class, Reason),
             logger:error(#{
                 msg => "roadrunner handler crashed",
                 handler => Handler,
@@ -1230,7 +1219,7 @@ with_close(Req, Headers) ->
 %% its last response appended.
 -spec queue_response(#loop_state{}, iodata()) -> #loop_state{}.
 queue_response(#loop_state{buffered = <<>>, out = [], socket = Socket} = S, Resp) ->
-    _ = roadrunner_telemetry:response_send(
+    _ = roadrunner_event:response_send(
         roadrunner_transport:send(Socket, Resp), buffered_response
     ),
     S;
@@ -1248,7 +1237,7 @@ queue_response(#loop_state{out = Out} = S, Resp) ->
 flush_out(#loop_state{out = []} = S) ->
     S;
 flush_out(#loop_state{socket = Socket, out = Out} = S) ->
-    _ = roadrunner_telemetry:response_send(
+    _ = roadrunner_event:response_send(
         roadrunner_transport:send(Socket, Out), buffered_response
     ),
     S#loop_state{out = []}.
@@ -1314,7 +1303,7 @@ dispatch_response(
     %% iodata batch — flush queued responses ahead of the head.
     S = flush_out(S0),
     Head = roadrunner_http1:response(Status, Headers0, ~"", AltSvc),
-    _ = roadrunner_telemetry:response_send(
+    _ = roadrunner_event:response_send(
         roadrunner_transport:send(Socket, Head), sendfile_response_head
     ),
     ok =
@@ -1325,7 +1314,7 @@ dispatch_response(
                 SendResult = roadrunner_transport:sendfile(
                     Socket, Filename, Offset, Length
                 ),
-                _ = roadrunner_telemetry:response_send(SendResult, sendfile_body),
+                _ = roadrunner_event:response_send(SendResult, sendfile_body),
                 %% A `{error, _}` here means the wire is mid-framing
                 %% (short write, socket error, etc.). With keep-alive
                 %% enabled on sendfile responses, the client would
@@ -1504,11 +1493,10 @@ buffered_finish(S0, Req, Headers) ->
     roadrunner_handler:response(),
     reference(),
     pid(),
-    integer(),
-    roadrunner_telemetry:metadata()
+    roadrunner_event_handler:span()
 ) -> no_return().
-ws_session_wait(S, Req, Response, MRef, SessPid, ReqStart, Metadata) ->
-    erlang:hibernate(?MODULE, ws_session_wake, [S, Req, Response, MRef, SessPid, ReqStart, Metadata]).
+ws_session_wait(S, Req, Response, MRef, SessPid, Span) ->
+    erlang:hibernate(?MODULE, ws_session_wake, [S, Req, Response, MRef, SessPid, Span]).
 
 %% Wake-from-hibernate continuation (exported for `erlang:hibernate/3`).
 %% The selective receive mirrors the pre-hibernate wait this replaces:
@@ -1524,22 +1512,20 @@ ws_session_wait(S, Req, Response, MRef, SessPid, ReqStart, Metadata) ->
     roadrunner_handler:response(),
     reference(),
     pid(),
-    integer(),
-    roadrunner_telemetry:metadata()
+    roadrunner_event_handler:span()
 ) -> no_return().
-ws_session_wake(S, Req, Response, MRef, SessPid, ReqStart, Metadata) ->
+ws_session_wake(S, Req, Response, MRef, SessPid, Span) ->
     receive
         {'DOWN', MRef, process, SessPid, _Reason} ->
-            ok = roadrunner_telemetry:request_stop(
-                ReqStart,
-                Metadata,
+            ok = roadrunner_event:request_stop(
+                Span,
                 roadrunner_conn:response_status(Response),
                 roadrunner_conn:response_kind(Response)
             ),
             finishing_phase(S, Req, Response);
         {roadrunner_drain, _Deadline} = Msg ->
             SessPid ! Msg,
-            ws_session_wake(S, Req, Response, MRef, SessPid, ReqStart, Metadata)
+            ws_session_wake(S, Req, Response, MRef, SessPid, Span)
     end.
 
 %% Manual-mode body_reader owns its post-body leftover (returned by
@@ -1599,9 +1585,7 @@ exit_unread(S, _Req) ->
 
 -spec rejection(#loop_state{}, atom()) -> ok.
 rejection(#loop_state{listener_name = ListenerName, peer = Peer}, Reason) ->
-    roadrunner_telemetry:request_rejected(#{
-        listener_name => ListenerName, peer => Peer, reason => Reason
-    }).
+    roadrunner_event:request_rejected(ListenerName, Peer, Reason).
 
 -spec arm_active_once(#loop_state{}) -> ok.
 arm_active_once(#loop_state{socket = Socket} = S) ->
@@ -1612,7 +1596,7 @@ arm_active_once(#loop_state{socket = Socket} = S) ->
         {error, _} -> exit_normal(S)
     end.
 
-%% Convenience wrapper around `exit_clean/7` that pulls fields off
+%% Convenience wrapper around `exit_clean/4` that pulls fields off
 %% the loop state. Most exit paths in the read/dispatch/finishing
 %% phases fire `listener_conn_close` (accept already fired during
 %% `shoot`).
@@ -1621,17 +1605,14 @@ exit_normal(S) ->
     #loop_state{
         socket = Socket,
         proto_opts = ProtoOpts,
-        listener_name = ListenerName,
-        start_mono = StartMono,
-        peer = Peer,
+        conn_span = ConnSpan,
         requests_served = Served
     } = flush_out(S),
-    exit_clean(Socket, ProtoOpts, StartMono, Peer, ListenerName, Served, normal).
+    exit_clean(Socket, ProtoOpts, ConnSpan, Served).
 
-%% Funnel for every clean exit path. Fires the paired
-%% listener_conn_close telemetry (only if accept already fired),
-%% releases the listener slot, closes the socket, and exits with the
-%% supplied Reason.
+%% Funnel for every clean exit path once the connection was accepted.
+%% Fires the paired `listener_conn_close` event, then releases the
+%% listener slot, closes the socket, and exits normally.
 %%
 %% **Limitation**: under `exit(Pid, kill)` this funnel is skipped — the
 %% runtime tears the process down without giving it a chance to run
@@ -1640,24 +1621,20 @@ exit_normal(S) ->
 -spec exit_clean(
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),
-    integer() | undefined,
-    {inet:ip_address(), inet:port_number()} | undefined,
-    atom(),
-    non_neg_integer(),
-    term()
+    roadrunner_event_handler:span(),
+    non_neg_integer()
 ) -> no_return().
-exit_clean(Socket, ProtoOpts, StartMono, Peer, ListenerName, Served, Reason) ->
-    case StartMono of
-        undefined ->
-            ok;
-        _ ->
-            roadrunner_telemetry:listener_conn_close(StartMono, #{
-                listener_name => ListenerName,
-                peer => Peer,
-                requests_served => Served
-            })
-    end,
+exit_clean(Socket, ProtoOpts, ConnSpan, Served) ->
+    ok = roadrunner_event:listener_conn_close(ConnSpan, Served),
+    exit_unaccepted(Socket, ProtoOpts).
+
+%% Exit before `listener_accept` fired (a drain or a bad PROXY header
+%% ahead of `serve/5`), so no `listener_conn_close` pairs with it:
+%% release the listener slot, close the socket, and exit normally.
+-spec exit_unaccepted(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
+    no_return().
+exit_unaccepted(Socket, ProtoOpts) ->
     ok = roadrunner_conn:unregister_for_drain(ProtoOpts),
     ok = roadrunner_conn:release_slot(ProtoOpts),
     ok = roadrunner_transport:close(Socket),
-    exit(Reason).
+    exit(normal).

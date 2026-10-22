@@ -160,7 +160,7 @@ drive_n_alive(N, Conn0) ->
 %% --- listener helpers ---
 %%
 %% Like the other test modules in this project (`roadrunner_listener_tests`,
-%% `roadrunner_telemetry_tests`, …), start the listener directly rather
+%% `roadrunner_event_tests`, …), start the listener directly rather
 %% than through `application:start(roadrunner)`.
 
 stop_listener(Name) ->
