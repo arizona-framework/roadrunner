@@ -22,8 +22,9 @@ A small, fast HTTP core you can trust on the hot path.
 - **Fast where it counts**: Tuned for low p50 and p99 under sustained load. See
   [Performance](#performance).
 - **Correct and hostile-input-safe**: Strict RFC 9110 / 9112 / 9113 parsing,
-  100% h2spec and 100% Autobahn (no exclusions), and tested against
-  request-smuggling cases. See [Conformance](#conformance).
+  100% h2spec and 100% Autobahn (no exclusions), tested against
+  request-smuggling cases, and listed on Http11Probe. See
+  [Conformance](#conformance).
 - **Every HTTP version, one server**: HTTP/1.1, HTTP/2, HTTP/3 (experimental),
   and WebSocket served from one listener; browsers upgrade to h3 over the same
   port via `Alt-Svc`.
@@ -438,6 +439,11 @@ WebSocket matrix (no exclusions). The HTTP/1.1 parser is tested against
 malformed-request cases taken from the [llhttp](https://github.com/nodejs/llhttp)
 test corpus and [PortSwigger](https://portswigger.net/web-security/request-smuggling)
 request-smuggling patterns.
+
+Roadrunner is also listed on [Http11Probe](https://www.http-probe.com/servers/roadrunner.html),
+an open suite that sends the same malformed and ambiguous HTTP/1.1 requests
+to many servers and checks each answer against RFC 9110 and RFC 9112. See its
+results page for the current score.
 
 Standards conformance:
 
