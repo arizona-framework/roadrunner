@@ -897,6 +897,7 @@ init(#{port := Port} = Opts) ->
                 {ok, QuicListener} ->
                     Reconciliation = setup_reconciliation(Opts),
                     ok = setup_rate_limit_sweep(ProtoOpts),
+                    ok = preload_request_path(ListenerName, Protocols, Opts),
                     {ok, #state{
                         listen_socket = LSocket,
                         quic_listener = QuicListener,
@@ -918,6 +919,114 @@ init(#{port := Port} = Opts) ->
             ok = erase_routes(ProtoOpts),
             {stop, {listen_failed, Reason}}
     end.
+
+%% Load what serving a request runs, in the background, once the listener is
+%% up. A module loads on its first call in interactive mode, so otherwise the
+%% first burst of connections queues on the code server one module at a time
+%% and its first responses wait behind it. The listener doesn't wait for this:
+%% it is ready as soon as its sockets are. Middleware modules are already
+%% loaded (building the pipeline ran their `init/1`). This only helps in
+%% interactive mode (a shell, an escript, a node started without a release):
+%% a relx release boots in embedded mode by default, which loads every module
+%% before anything starts, so there this finds nothing to do. One module at a
+%% time: loading them in parallel races a request's own loads of the same
+%% modules and slowed a lone first response.
+-spec preload_request_path(atom(), [http1 | http2 | http3, ...], opts()) -> ok.
+preload_request_path(ListenerName, Protocols, Opts) ->
+    Modules = lists:usort(
+        lists:append([handler_modules(Opts) | [protocol_modules(P) || P <- Protocols]])
+    ),
+    _ = proc_lib:spawn(fun() ->
+        proc_lib:set_label({roadrunner_preload, ListenerName}),
+        lists:foreach(fun code:ensure_loaded/1, Modules)
+    end),
+    ok.
+
+%% The modules every request over `Protocol` runs, `crypto` included for the
+%% request id. `roadrunner_preload_SUITE` checks no request loads one more.
+-spec protocol_modules(http1 | http2 | http3) -> [module()].
+protocol_modules(http1) ->
+    [
+        crypto,
+        roadrunner_bin,
+        roadrunner_conn,
+        roadrunner_conn_loop,
+        roadrunner_http,
+        roadrunner_http1,
+        roadrunner_req
+    ];
+protocol_modules(http2) ->
+    [
+        crypto,
+        roadrunner_bin,
+        roadrunner_conn,
+        roadrunner_conn_loop,
+        roadrunner_conn_loop_http2,
+        roadrunner_http,
+        roadrunner_http2_frame,
+        roadrunner_http2_hpack,
+        roadrunner_http2_hpack_huffman,
+        roadrunner_http2_request,
+        roadrunner_http2_stream_worker,
+        roadrunner_req,
+        roadrunner_stream_worker
+    ];
+protocol_modules(http3) ->
+    [
+        crypto,
+        roadrunner_conn,
+        roadrunner_conn_loop_http3,
+        roadrunner_http,
+        roadrunner_http2_hpack,
+        roadrunner_http2_hpack_huffman,
+        roadrunner_http3_request,
+        roadrunner_http3_stream_worker,
+        roadrunner_qpack,
+        roadrunner_quic,
+        roadrunner_quic_ack,
+        roadrunner_quic_aead,
+        roadrunner_quic_amp,
+        roadrunner_quic_cc_newreno,
+        roadrunner_quic_conn_state,
+        roadrunner_quic_connection,
+        roadrunner_quic_flow,
+        roadrunner_quic_frame,
+        roadrunner_quic_h3_frame,
+        roadrunner_quic_hkdf,
+        roadrunner_quic_keys,
+        roadrunner_quic_loss,
+        roadrunner_quic_packet,
+        roadrunner_quic_recv,
+        roadrunner_quic_send,
+        roadrunner_quic_stream,
+        roadrunner_quic_tls_auth,
+        roadrunner_quic_tls_crypto,
+        roadrunner_quic_tls_handshake,
+        roadrunner_quic_tls_hello,
+        roadrunner_quic_tls_server,
+        roadrunner_quic_transport_params,
+        roadrunner_quic_varint,
+        roadrunner_req,
+        roadrunner_stream_worker
+    ].
+
+%% The handler modules `routes` dispatches to.
+-spec handler_modules(opts()) -> [module()].
+handler_modules(#{routes := Routes}) when is_list(Routes) ->
+    [route_handler(Route) || Route <- Routes];
+handler_modules(#{routes := #{handler := Handler}}) ->
+    [Handler];
+handler_modules(#{routes := {Handler, _State}}) ->
+    [Handler];
+handler_modules(#{routes := Handler}) ->
+    [Handler];
+handler_modules(#{}) ->
+    [roadrunner_default_handler].
+
+-spec route_handler(roadrunner_router:route()) -> module().
+route_handler({_Path, Handler}) -> Handler;
+route_handler({_Path, Handler, _State}) -> Handler;
+route_handler(#{handler := Handler}) -> Handler.
 
 %% `ssl` is not one of roadrunner's start-up applications: a plain-HTTP node
 %% would load its modules for nothing, and code loading is most of the time
