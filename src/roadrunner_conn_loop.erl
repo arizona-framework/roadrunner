@@ -342,9 +342,7 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                     maps:get(http1_max_header_count, ProtoOpts, 100)
                 },
                 rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
-                real_ip = roadrunner_real_ip:peer_trust(
-                    maps:get(real_ip, ProtoOpts, undefined), Peer
-                )
+                real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer)
             },
             read_request_phase(S)
     end.

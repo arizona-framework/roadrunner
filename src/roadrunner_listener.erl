@@ -301,8 +301,9 @@ Optional middleware and timing knobs (durations in milliseconds):
   [Resource limits](resource_limits.md).
 - `protocols` — list of `t:protocol_entry/0`. Default `[http1]`.
   On TLS this drives `alpn_preferred_protocols` automatically.
-- `tls` — `[ssl:tls_server_option()]` for HTTPS. Empty / absent
-  for plain HTTP.
+- `tls` — `[ssl:tls_server_option()]` for HTTPS. Absent for plain
+  HTTP. The listener starts the `ssl` application when it is set, so
+  a release that serves TLS must include `ssl`.
 
 The inline source comments next to each field carry the deeper
 ops-tuning rationale.
@@ -709,9 +710,9 @@ WebSocket session tunables (under `ws` in the listener opts).
     %% and kept for the life of the listener; `undefined` until then.
     route_buckets = undefined :: ets:table() | undefined,
     %% Shared by the QUIC pool's listeners; `do_drain/2` closes it so no new
-    %% h3 connection starts while the open ones finish. Unused (and
-    %% harmless to close) on a listener without `http3`.
-    quic_accept_gate :: roadrunner_quic_listener:accept_gate()
+    %% h3 connection starts while the open ones finish. `undefined` on a
+    %% listener without `http3`.
+    quic_accept_gate :: roadrunner_quic_listener:accept_gate() | undefined
 }).
 
 -doc """
@@ -879,6 +880,7 @@ init(#{port := Port} = Opts) ->
     %% (acceptor, overload queue, QUIC pool) exiting abnormally still takes
     %% the listener down with it (`handle_info/2`).
     _ = process_flag(trap_exit, true),
+    ok = ensure_ssl_started(Opts),
     ListenerName = listener_name(),
     ProtoOpts = build_proto_opts(Opts, ListenerName),
     RouteBuckets = publish_routes(ListenerName, Opts, ProtoOpts),
@@ -888,7 +890,7 @@ init(#{port := Port} = Opts) ->
     %% transports that co-listen on the same port number. Bring up
     %% whichever the `protocols` list selects; an `http3`-only listener
     %% has no TCP socket (`none`), and a TCP-only listener no QUIC pid.
-    QuicAcceptGate = roadrunner_quic_listener:new_accept_gate(),
+    QuicAcceptGate = new_quic_accept_gate(Protocols),
     case start_tcp(Port, Opts, Protocols, ProtoOpts) of
         {ok, LSocket} ->
             case start_quic(Port, Opts, Protocols, ProtoOpts, QuicAcceptGate) of
@@ -916,6 +918,17 @@ init(#{port := Port} = Opts) ->
             ok = erase_routes(ProtoOpts),
             {stop, {listen_failed, Reason}}
     end.
+
+%% `ssl` is not one of roadrunner's start-up applications: a plain-HTTP node
+%% would load its modules for nothing, and code loading is most of the time
+%% to a first response. A listener with `tls` (every `http3` one has it)
+%% starts it here instead, so a release serving TLS must include `ssl`.
+-spec ensure_ssl_started(opts()) -> ok.
+ensure_ssl_started(#{tls := _}) ->
+    {ok, _} = application:ensure_all_started(ssl),
+    ok;
+ensure_ssl_started(#{}) ->
+    ok.
 
 %% Open the TCP listen socket + acceptor pool when the listener serves
 %% any TCP protocol (`http1`/`http2`). An HTTP/3-only listener skips
@@ -1047,6 +1060,21 @@ bound_port(none, QuicPool) ->
 bound_port(LSocket, _QuicListener) ->
     {ok, BoundPort} = roadrunner_transport:port(LSocket),
     BoundPort.
+
+%% Only an `http3` listener has a QUIC accept gate, so a TCP-only listener
+%% never loads `roadrunner_quic_listener`: startup time is dominated by
+%% code loading.
+-spec new_quic_accept_gate([http1 | http2 | http3, ...]) ->
+    roadrunner_quic_listener:accept_gate() | undefined.
+new_quic_accept_gate(Protocols) ->
+    case lists:member(http3, Protocols) of
+        true -> roadrunner_quic_listener:new_accept_gate();
+        false -> undefined
+    end.
+
+-spec close_quic_accept_gate(roadrunner_quic_listener:accept_gate() | undefined) -> ok.
+close_quic_accept_gate(undefined) -> ok;
+close_quic_accept_gate(Gate) -> roadrunner_quic_listener:close_accept_gate(Gate).
 
 -spec close_tcp(roadrunner_transport:socket() | none | closed) -> ok.
 close_tcp(none) -> ok;
@@ -1532,10 +1560,13 @@ build_proto_opts(Opts, ListenerName) ->
                 WithHibernate
         end,
     %% Optional `real_ip`, compiled (and validated) here so a bad config fails
-    %% the listener start; absent when off, the default.
-    case roadrunner_real_ip:compile(maps:get(real_ip, Opts, undefined)) of
-        undefined -> WithRateCheck;
-        RealIp -> WithRateCheck#{real_ip => RealIp}
+    %% the listener start; absent when off, the default, so a listener
+    %% without it never loads `roadrunner_real_ip`.
+    case Opts of
+        #{real_ip := RealIpOpts} when RealIpOpts =/= undefined ->
+            WithRateCheck#{real_ip => roadrunner_real_ip:compile(RealIpOpts)};
+        #{} ->
+            WithRateCheck
     end.
 
 %% Resolve the public `handler_spawn` opt into the proto_opts shape the spawn
@@ -2158,7 +2189,7 @@ do_drain(
     %% drain below. A connection started after the broadcast would never
     %% hear it and would hold the drain to its deadline.
     ok = close_tcp(LSocket),
-    ok = roadrunner_quic_listener:close_accept_gate(QuicAcceptGate),
+    ok = close_quic_accept_gate(QuicAcceptGate),
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     #{client_counter := Counter, drain_table := Table} = ProtoOpts,
     notify_conns(Table, Deadline),

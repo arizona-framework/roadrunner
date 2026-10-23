@@ -212,17 +212,45 @@ explicit timestamp — used by the static file handler to emit the
 """.
 -spec format_http_date(integer()) -> binary().
 format_http_date(Posix) ->
-    {{Y, M, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(Posix, second),
-    DayName = element(calendar:day_of_the_week(Y, M, D), ?DAY_NAMES),
+    Days = floor_div(Posix, 86400),
+    SecOfDay = Posix - Days * 86400,
+    {Y, M, D} = civil_from_days(Days),
+    %% 1970-01-01 was a Thursday, index 3 in the Monday-first table.
+    DayName = element(floor_mod(Days + 3, 7) + 1, ?DAY_NAMES),
     MonthName = element(M, ?MONTH_NAMES),
     <<DayName/binary, ", ", (pad2(D))/binary, " ", MonthName/binary, " ",
-        (integer_to_binary(Y))/binary, " ", (pad2(H))/binary, ":", (pad2(Mi))/binary, ":",
-        (pad2(S))/binary, " GMT">>.
+        (integer_to_binary(Y))/binary, " ", (pad2(SecOfDay div 3600))/binary, ":",
+        (pad2(SecOfDay rem 3600 div 60))/binary, ":", (pad2(SecOfDay rem 60))/binary, " GMT">>.
+
+%% Proleptic Gregorian date for a count of days since 1970-01-01, after
+%% Howard Hinnant's `civil_from_days`. Done here rather than through
+%% `calendar` so the first response doesn't pay for loading that module:
+%% startup time is dominated by code loading.
+-spec civil_from_days(integer()) -> {integer(), 1..12, 1..31}.
+civil_from_days(Days) ->
+    Z = Days + 719468,
+    Era = floor_div(Z, 146097),
+    DayOfEra = Z - Era * 146097,
+    YearOfEra = (DayOfEra - DayOfEra div 1460 + DayOfEra div 36524 - DayOfEra div 146096) div 365,
+    DayOfYear = DayOfEra - (365 * YearOfEra + YearOfEra div 4 - YearOfEra div 100),
+    MarchMonth = (5 * DayOfYear + 2) div 153,
+    D = DayOfYear - (153 * MarchMonth + 2) div 5 + 1,
+    case MarchMonth < 10 of
+        true -> {YearOfEra + Era * 400, MarchMonth + 3, D};
+        false -> {YearOfEra + Era * 400 + 1, MarchMonth - 9, D}
+    end.
+
+-spec floor_div(integer(), pos_integer()) -> integer().
+floor_div(N, Div) when N >= 0 -> N div Div;
+floor_div(N, Div) -> -((Div - 1 - N) div Div).
+
+-spec floor_mod(integer(), pos_integer()) -> non_neg_integer().
+floor_mod(N, Div) -> N - floor_div(N, Div) * Div.
 
 %% Two-digit zero-padded integer for the IMF-fixdate fields. Year is
-%% 4-digit (always — calendar guarantees positive 4-digit years for
-%% modern timestamps), so `integer_to_binary/1` suffices there; only
-%% the day/hour/minute/second need the leading-zero pad when < 10.
+%% 4-digit for modern timestamps, so `integer_to_binary/1` suffices
+%% there; only the day/hour/minute/second need the leading-zero pad
+%% when < 10.
 -spec pad2(0..99) -> binary().
 pad2(N) when N < 10 -> <<$0, ($0 + N)>>;
 pad2(N) -> integer_to_binary(N).

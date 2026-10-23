@@ -7,7 +7,8 @@ complete a handshake, and checks the three things that follow from
 where the handshake runs: a failed handshake is reported as an
 `accept_error` and frees its `max_clients` slot, a silent peer is cut
 off by `tls_handshake_timeout` without ever firing `accept`, and
-parked peers do not stop other connections from being accepted.
+parked peers do not stop other connections from being accepted. Also
+checks that only a TLS listener starts the `ssl` application.
 
 Lives as a CT suite so every case gets its own process and its own
 listener, and a parked connection left by one case cannot leak into
@@ -21,7 +22,9 @@ the next.
 -export([
     garbage_hello_reports_accept_error_and_releases_slot/1,
     silent_peer_times_out_without_accept_telemetry/1,
-    parked_handshakes_do_not_block_accepting/1
+    parked_handshakes_do_not_block_accepting/1,
+    tls_listener_starts_ssl/1,
+    plain_listener_leaves_ssl_stopped/1
 ]).
 
 suite() ->
@@ -31,7 +34,9 @@ all() ->
     [
         garbage_hello_reports_accept_error_and_releases_slot,
         silent_peer_times_out_without_accept_telemetry,
-        parked_handshakes_do_not_block_accepting
+        parked_handshakes_do_not_block_accepting,
+        tls_listener_starts_ssl,
+        plain_listener_leaves_ssl_stopped
     ].
 
 init_per_testcase(Case, Config) ->
@@ -108,6 +113,21 @@ parked_handshakes_do_not_block_accepting(_Config) ->
     ok = wait_for_labels({roadrunner_conn, tls_handshake, ?MODULE}, 3),
     ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, tls_get(Port, 2000)),
     lists:foreach(fun gen_tcp:close/1, Parked).
+
+tls_listener_starts_ssl(_Config) ->
+    %% `ssl` is not a start-up application of roadrunner's: a TLS listener
+    %% brings it up itself.
+    ok = application:stop(ssl),
+    Port = start_listener(#{}),
+    ?assert(lists:keymember(ssl, 1, application:which_applications())),
+    ?assertMatch(<<"HTTP/1.1 200 OK", _/binary>>, tls_get(Port, 5000)).
+
+plain_listener_leaves_ssl_stopped(_Config) ->
+    ok = application:stop(ssl),
+    {ok, _} = roadrunner_listener:start_link(
+        ?MODULE, #{port => 0, routes => roadrunner_hello_handler}
+    ),
+    ?assertNot(lists:keymember(ssl, 1, application:which_applications())).
 
 %% --- helpers ---
 

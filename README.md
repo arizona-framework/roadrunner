@@ -317,6 +317,10 @@ browsers upgrade. For HTTP/2 over plain TCP (prior knowledge), use
 `protocols => [http2]` without `tls`. Without `tls`, a listener serves either
 HTTP/1.1 or HTTP/2, not both.
 
+A listener with `tls` starts the `ssl` application itself, so plain HTTP nodes
+never load it. If you build a release that serves TLS, add `ssl` to your
+application's `applications` list so the release includes it.
+
 ### Behind a proxy
 
 ```erlang

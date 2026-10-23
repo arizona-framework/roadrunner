@@ -411,7 +411,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         inflight_counter = InflightCounter,
         overload = maps:get(overload, ProtoOpts, refuse),
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
-        real_ip = roadrunner_real_ip:peer_trust(maps:get(real_ip, ProtoOpts, undefined), Peer),
+        real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer),
         handshake_timeout = HandshakeTimeout,
         idle_timeout = IdleTimeout
     },

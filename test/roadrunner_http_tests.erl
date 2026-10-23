@@ -68,6 +68,34 @@ format_http_date_pads_single_digits_test() ->
     Date = roadrunner_http:format_http_date(0),
     ?assertEqual(~"Thu, 01 Jan 1970 00:00:00 GMT", Date).
 
+format_http_date_matches_calendar_test() ->
+    %% Leap days, century rules, the Jan/Feb end of the March-based year,
+    %% and timestamps before the epoch.
+    Posixes = [
+        -1,
+        -86401,
+        -2208988800,
+        951782400,
+        951868800,
+        1709164800,
+        1735689599,
+        4102444800,
+        253402300799
+    ],
+    [?assertEqual(calendar_http_date(P), roadrunner_http:format_http_date(P)) || P <- Posixes].
+
+calendar_http_date(Posix) ->
+    {{Y, M, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(Posix, second),
+    Day = element(calendar:day_of_the_week(Y, M, D), {
+        "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"
+    }),
+    Month = element(M, {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    }),
+    iolist_to_binary(
+        io_lib:format("~s, ~2..0B ~s ~B ~2..0B:~2..0B:~2..0B GMT", [Day, D, Month, Y, H, Mi, S])
+    ).
+
 header_list_size_sums_fields_with_overhead_test() ->
     %% RFC 7541 §4.1: each field contributes name + value + 32 bytes.
     ?assertEqual(0, roadrunner_http:header_list_size([])),

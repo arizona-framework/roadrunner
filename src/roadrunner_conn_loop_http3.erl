@@ -233,7 +233,7 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
         inflight_counter = maps:get(inflight_counter, ProtoOpts, undefined),
         overload = maps:get(overload, ProtoOpts, refuse),
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
-        real_ip = roadrunner_real_ip:peer_trust(maps:get(real_ip, ProtoOpts, undefined), Peer)
+        real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer)
     }).
 
 -spec loop(#h3{}) -> ok.
