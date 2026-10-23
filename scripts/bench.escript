@@ -1443,7 +1443,9 @@ maybe_stop_profile(Peer, Side, #{profile := true, profile_min_ms := MinMs}) ->
     %% Read the log written inside the peer's BEAM and print to the
     %% bench's own stdout. Files are visible to both because they
     %% share the host filesystem.
-    io:format("~nprofile (eprof, ~s, total time, rows >= ~.2f ms)~n", [Side, MinMs]),
+    %% argparse's `float` type passes `--profile-min-ms 20` through as the
+    %% integer 20, which `~f` rejects.
+    io:format("~nprofile (eprof, ~s, total time, rows >= ~.2f ms)~n", [Side, float(MinMs)]),
     case file:read_file(Path) of
         {ok, Bin} -> io:put_chars(Bin), io:nl();
         {error, Reason} -> io:format("  could not read ~s: ~p~n", [Path, Reason])
