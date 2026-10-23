@@ -465,6 +465,16 @@ check_methods(Methods) ->
 %% `any` for a route declaring no allowlist, otherwise the remaining set.
 -type uncovered() :: any | #{binary() => true}.
 
+%% The routes already checked, by pattern, for `check_shadowing/2` to find the
+%% ones covering the next route without scanning them all.
+-record(shadow_node, {
+    ends = [] :: [route_spec()],
+    literals = #{} :: #{binary() => shadow_node()},
+    param :: shadow_node() | undefined,
+    wildcards = [] :: [route_spec()]
+}).
+-type shadow_node() :: #shadow_node{}.
+
 %% Build the reachability facts for every route, checking each entry on the way
 %% past and stopping at the first bad one. The pattern and the method set are
 %% derived here rather than read back off the compiled routes so the whole table
@@ -549,18 +559,20 @@ check_wildcard_last([_Segment | Rest], Path) ->
 %% wins is the documented rule, so a route the scan can never reach is dead
 %% weight that surfaces at runtime as a 404 (or the wrong handler) with nothing
 %% at boot to explain it -- and the wildcard doing the swallowing is often one a
-%% framework generated rather than one the author typed. O(n^2) over the table,
-%% once, on a list of a handful of routes.
+%% framework generated rather than one the author typed. Each route is checked
+%% against a tree of the routes above it, which hands back only the earlier
+%% routes whose path covers it, so a large table does not compare every pair.
 -spec check_shadowing([route_spec()]) -> ok | {error, validation_error()}.
 check_shadowing(Specs) ->
-    check_shadowing(Specs, Specs).
+    check_shadowing(Specs, #shadow_node{}).
 
--spec check_shadowing([route_spec()], [route_spec()]) -> ok | {error, validation_error()}.
-check_shadowing([], _All) ->
+-spec check_shadowing([route_spec()], shadow_node()) -> ok | {error, validation_error()}.
+check_shadowing([], _Earlier) ->
     ok;
-check_shadowing([{Pos, Path, Pattern, Methods} | Rest], All) ->
-    case shadowed_by(All, Pos, Pattern, uncovered(Methods)) of
-        reachable -> check_shadowing(Rest, All);
+check_shadowing([{Pos, Path, Pattern, Methods} = Spec | Rest], Earlier) ->
+    Covering = lists:sort(covering(Pattern, Earlier, [])),
+    case shadowed_by(Covering, uncovered(Methods)) of
+        reachable -> check_shadowing(Rest, add_spec(Pattern, Spec, Earlier));
         {shadowed, By} -> {error, {unreachable_route, Pos, Path, By}}
     end.
 
@@ -570,32 +582,25 @@ uncovered(undefined) ->
 uncovered(Methods) ->
     Methods.
 
-%% Walk the table from the top narrowing the methods the route at `Pos` can
-%% still answer, stopping when the walk reaches that route itself. Returns the
-%% earlier routes that took methods away from it once nothing is left, or
-%% `reachable`. A covering route contributing no method the later one declares
-%% is stepped over, so the error names only the entries actually in the way.
--spec shadowed_by([route_spec()], pos_integer(), [segment()], uncovered()) ->
+%% Walk the earlier routes covering this one in table order, narrowing the
+%% methods it can still answer. Returns the routes that took methods away from
+%% it once nothing is left, or `reachable`. A covering route contributing no
+%% method the later one declares is stepped over, so the error names only the
+%% entries actually in the way.
+-spec shadowed_by([route_spec()], uncovered()) ->
     reachable | {shadowed, [{pos_integer(), binary()}]}.
-shadowed_by([{Pos, _Path, _Pattern, _Methods} | _Rest], Pos, _Later, _Uncovered) ->
+shadowed_by([], _Uncovered) ->
     reachable;
-shadowed_by(
-    [{EarlierPos, EarlierPath, EarlierPattern, EarlierMethods} | Rest], Pos, Later, Uncovered
-) ->
-    case covers(EarlierPattern, Later) of
-        false ->
-            shadowed_by(Rest, Pos, Later, Uncovered);
-        true ->
-            case take_methods(EarlierMethods, Uncovered) of
-                empty ->
-                    {shadowed, [{EarlierPos, EarlierPath}]};
-                Uncovered ->
-                    shadowed_by(Rest, Pos, Later, Uncovered);
-                Narrowed ->
-                    case shadowed_by(Rest, Pos, Later, Narrowed) of
-                        reachable -> reachable;
-                        {shadowed, By} -> {shadowed, [{EarlierPos, EarlierPath} | By]}
-                    end
+shadowed_by([{EarlierPos, EarlierPath, _Pattern, EarlierMethods} | Rest], Uncovered) ->
+    case take_methods(EarlierMethods, Uncovered) of
+        empty ->
+            {shadowed, [{EarlierPos, EarlierPath}]};
+        Uncovered ->
+            shadowed_by(Rest, Uncovered);
+        Narrowed ->
+            case shadowed_by(Rest, Narrowed) of
+                reachable -> reachable;
+                {shadowed, By} -> {shadowed, [{EarlierPos, EarlierPath} | By]}
             end
     end.
 
@@ -614,24 +619,57 @@ take_methods(Methods, Uncovered) ->
         Narrowed -> Narrowed
     end.
 
-%% Does `Earlier` match every path `Later` matches? Both patterns are
-%% well-formed by here (any wildcard is the final segment), so a positional walk
-%% decides it: an earlier wildcard absorbs whatever remains, a `:param` covers
-%% any single segment a literal or another param could take, and a literal
-%% covers only the same literal.
--spec covers([segment()], [segment()]) -> boolean().
-covers([{wildcard, _Name}], _Later) ->
-    true;
-covers([{literal, S} | Earlier], [{literal, S} | Later]) ->
-    covers(Earlier, Later);
-covers([{param, _Name} | Earlier], [{literal, _S} | Later]) ->
-    covers(Earlier, Later);
-covers([{param, _Name} | Earlier], [{param, _Other} | Later]) ->
-    covers(Earlier, Later);
-covers([], []) ->
-    true;
-covers(_Earlier, _Later) ->
-    false.
+%% The earlier routes whose pattern matches every path `Later` matches, added
+%% to `Acc` in no particular order. Patterns are well-formed by here (any
+%% wildcard is the final segment), so a positional walk decides it: an earlier
+%% wildcard absorbs whatever remains, a `:param` covers any single segment a
+%% literal or another param could take, and a literal covers only the same
+%% literal.
+-spec covering([segment()], shadow_node(), [route_spec()]) -> [route_spec()].
+covering(Later, #shadow_node{wildcards = Wildcards} = Node, Acc) ->
+    covering_next(Later, Node, lists:reverse(Wildcards, Acc)).
+
+-spec covering_next([segment()], shadow_node(), [route_spec()]) -> [route_spec()].
+covering_next([], #shadow_node{ends = Ends}, Acc) ->
+    lists:reverse(Ends, Acc);
+covering_next([{literal, Lit} | Rest], #shadow_node{literals = Lits, param = Param}, Acc) ->
+    WithParam = covering_param(Rest, Param, Acc),
+    case Lits of
+        #{Lit := Child} -> covering(Rest, Child, WithParam);
+        #{} -> WithParam
+    end;
+covering_next([{param, _Name} | Rest], #shadow_node{param = Param}, Acc) ->
+    covering_param(Rest, Param, Acc);
+covering_next([{wildcard, _Name}], _Node, Acc) ->
+    Acc.
+
+-spec covering_param([segment()], shadow_node() | undefined, [route_spec()]) -> [route_spec()].
+covering_param(_Later, undefined, Acc) ->
+    Acc;
+covering_param(Later, Child, Acc) ->
+    covering(Later, Child, Acc).
+
+%% Add a reachable route to the tree the routes below it are checked against.
+%% Param names don't matter to coverage, so every `:param` shares one branch.
+-spec add_spec([segment()], route_spec(), shadow_node()) -> shadow_node().
+add_spec([], Spec, #shadow_node{ends = Ends} = Node) ->
+    Node#shadow_node{ends = [Spec | Ends]};
+add_spec([{literal, Lit} | Rest], Spec, #shadow_node{literals = Lits} = Node) ->
+    Child =
+        case Lits of
+            #{Lit := Existing} -> Existing;
+            #{} -> #shadow_node{}
+        end,
+    Node#shadow_node{literals = Lits#{Lit => add_spec(Rest, Spec, Child)}};
+add_spec([{param, _Name} | Rest], Spec, #shadow_node{param = Param} = Node) ->
+    Child =
+        case Param of
+            undefined -> #shadow_node{};
+            Existing -> Existing
+        end,
+    Node#shadow_node{param = add_spec(Rest, Spec, Child)};
+add_spec([{wildcard, _Name}], Spec, #shadow_node{wildcards = Wildcards} = Node) ->
+    Node#shadow_node{wildcards = [Spec | Wildcards]}.
 
 -doc """
 Look up the handler for a given request method + path.
