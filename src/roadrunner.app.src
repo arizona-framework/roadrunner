@@ -6,8 +6,7 @@
     {applications, [
         kernel,
         stdlib,
-        crypto,
-        ssl
+        crypto
     ]},
     {env, [
         {event_handler, roadrunner_event_noop}

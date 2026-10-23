@@ -301,8 +301,9 @@ Optional middleware and timing knobs (durations in milliseconds):
   [Resource limits](resource_limits.md).
 - `protocols` — list of `t:protocol_entry/0`. Default `[http1]`.
   On TLS this drives `alpn_preferred_protocols` automatically.
-- `tls` — `[ssl:tls_server_option()]` for HTTPS. Empty / absent
-  for plain HTTP.
+- `tls` — `[ssl:tls_server_option()]` for HTTPS. Absent for plain
+  HTTP. The listener starts the `ssl` application when it is set, so
+  a release that serves TLS must include `ssl`.
 
 The inline source comments next to each field carry the deeper
 ops-tuning rationale.
@@ -879,6 +880,7 @@ init(#{port := Port} = Opts) ->
     %% (acceptor, overload queue, QUIC pool) exiting abnormally still takes
     %% the listener down with it (`handle_info/2`).
     _ = process_flag(trap_exit, true),
+    ok = ensure_ssl_started(Opts),
     ListenerName = listener_name(),
     ProtoOpts = build_proto_opts(Opts, ListenerName),
     RouteBuckets = publish_routes(ListenerName, Opts, ProtoOpts),
@@ -916,6 +918,17 @@ init(#{port := Port} = Opts) ->
             ok = erase_routes(ProtoOpts),
             {stop, {listen_failed, Reason}}
     end.
+
+%% `ssl` is not one of roadrunner's start-up applications: a plain-HTTP node
+%% would load its modules for nothing, and code loading is most of the time
+%% to a first response. A listener with `tls` (every `http3` one has it)
+%% starts it here instead, so a release serving TLS must include `ssl`.
+-spec ensure_ssl_started(opts()) -> ok.
+ensure_ssl_started(#{tls := _}) ->
+    {ok, _} = application:ensure_all_started(ssl),
+    ok;
+ensure_ssl_started(#{}) ->
+    ok.
 
 %% Open the TCP listen socket + acceptor pool when the listener serves
 %% any TCP protocol (`http1`/`http2`). An HTTP/3-only listener skips
