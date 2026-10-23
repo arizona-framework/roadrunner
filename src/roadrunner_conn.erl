@@ -76,6 +76,7 @@
     send_rate_limited/2,
     rate_limit_check/6,
     resolve_rate_limit/2,
+    resolve_real_ip/2,
     rate_limit/3,
     rate_limit_spend/7,
     throttled_telemetry/3,
@@ -429,6 +430,19 @@ resolve_rate_limit(
     {Rate, Cap, Cost} = roadrunner_rate_limit:bucket(RateLimit),
     {Rate, Cap, Cost, Table, Counter, roadrunner_rate_limit:client_key(IP)};
 resolve_rate_limit(_ProtoOpts, _Peer) ->
+    undefined.
+
+%% The connection's `real_ip` trust (`roadrunner_real_ip:peer_trust/2`),
+%% resolved once at setup. A listener without `real_ip`, the default, skips
+%% the call so its connections never load `roadrunner_real_ip`: startup time
+%% is dominated by code loading.
+-doc false.
+-spec resolve_real_ip(
+    proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
+) -> undefined | roadrunner_real_ip:config().
+resolve_real_ip(#{real_ip := RealIp}, Peer) ->
+    roadrunner_real_ip:peer_trust(RealIp, Peer);
+resolve_real_ip(_ProtoOpts, _Peer) ->
     undefined.
 
 %% The per-peer rate-limit gate every protocol runs before it dispatches a

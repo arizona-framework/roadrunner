@@ -709,9 +709,9 @@ WebSocket session tunables (under `ws` in the listener opts).
     %% and kept for the life of the listener; `undefined` until then.
     route_buckets = undefined :: ets:table() | undefined,
     %% Shared by the QUIC pool's listeners; `do_drain/2` closes it so no new
-    %% h3 connection starts while the open ones finish. Unused (and
-    %% harmless to close) on a listener without `http3`.
-    quic_accept_gate :: roadrunner_quic_listener:accept_gate()
+    %% h3 connection starts while the open ones finish. `undefined` on a
+    %% listener without `http3`.
+    quic_accept_gate :: roadrunner_quic_listener:accept_gate() | undefined
 }).
 
 -doc """
@@ -888,7 +888,7 @@ init(#{port := Port} = Opts) ->
     %% transports that co-listen on the same port number. Bring up
     %% whichever the `protocols` list selects; an `http3`-only listener
     %% has no TCP socket (`none`), and a TCP-only listener no QUIC pid.
-    QuicAcceptGate = roadrunner_quic_listener:new_accept_gate(),
+    QuicAcceptGate = new_quic_accept_gate(Protocols),
     case start_tcp(Port, Opts, Protocols, ProtoOpts) of
         {ok, LSocket} ->
             case start_quic(Port, Opts, Protocols, ProtoOpts, QuicAcceptGate) of
@@ -1047,6 +1047,21 @@ bound_port(none, QuicPool) ->
 bound_port(LSocket, _QuicListener) ->
     {ok, BoundPort} = roadrunner_transport:port(LSocket),
     BoundPort.
+
+%% Only an `http3` listener has a QUIC accept gate, so a TCP-only listener
+%% never loads `roadrunner_quic_listener`: startup time is dominated by
+%% code loading.
+-spec new_quic_accept_gate([http1 | http2 | http3, ...]) ->
+    roadrunner_quic_listener:accept_gate() | undefined.
+new_quic_accept_gate(Protocols) ->
+    case lists:member(http3, Protocols) of
+        true -> roadrunner_quic_listener:new_accept_gate();
+        false -> undefined
+    end.
+
+-spec close_quic_accept_gate(roadrunner_quic_listener:accept_gate() | undefined) -> ok.
+close_quic_accept_gate(undefined) -> ok;
+close_quic_accept_gate(Gate) -> roadrunner_quic_listener:close_accept_gate(Gate).
 
 -spec close_tcp(roadrunner_transport:socket() | none | closed) -> ok.
 close_tcp(none) -> ok;
@@ -1532,10 +1547,13 @@ build_proto_opts(Opts, ListenerName) ->
                 WithHibernate
         end,
     %% Optional `real_ip`, compiled (and validated) here so a bad config fails
-    %% the listener start; absent when off, the default.
-    case roadrunner_real_ip:compile(maps:get(real_ip, Opts, undefined)) of
-        undefined -> WithRateCheck;
-        RealIp -> WithRateCheck#{real_ip => RealIp}
+    %% the listener start; absent when off, the default, so a listener
+    %% without it never loads `roadrunner_real_ip`.
+    case Opts of
+        #{real_ip := RealIpOpts} when RealIpOpts =/= undefined ->
+            WithRateCheck#{real_ip => roadrunner_real_ip:compile(RealIpOpts)};
+        #{} ->
+            WithRateCheck
     end.
 
 %% Resolve the public `handler_spawn` opt into the proto_opts shape the spawn
@@ -2158,7 +2176,7 @@ do_drain(
     %% drain below. A connection started after the broadcast would never
     %% hear it and would hold the drain to its deadline.
     ok = close_tcp(LSocket),
-    ok = roadrunner_quic_listener:close_accept_gate(QuicAcceptGate),
+    ok = close_quic_accept_gate(QuicAcceptGate),
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     #{client_counter := Counter, drain_table := Table} = ProtoOpts,
     notify_conns(Table, Deadline),
