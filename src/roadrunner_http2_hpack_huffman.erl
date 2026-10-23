@@ -33,8 +33,8 @@
 %% `Next bsl 18 bor Count bsl 16 bor Emitted`, the `Count` emitted
 %% bytes in the low 16 bits, first byte highest. Integers instead of
 %% nested tuples make a step one `element/2` and no allocation. The
-%% table is 65536 entries (512 KB), built once at load from the 4-bit
-%% transitions of the prefix tree.
+%% table is 65536 entries (512 KB), derived from the 4-bit transitions
+%% of the prefix tree.
 %%
 %% Emitted bytes gather in a small integer and go out 6 or 7 at a time
 %% as one binary chunk into a nested iolist, flattened once at the
@@ -46,12 +46,16 @@
 %% bits (all `1`s) from this point lie on the EOS path and fewer than
 %% 8 bits have been consumed since the last emitted byte.
 %%
-%% All tables are constructed at module-load time and stashed in
-%% `persistent_term` so the hot path does no allocation.
-
--on_load(init_tables/0).
+%% The tables are literals in `roadrunner_http2_hpack_huffman_table`,
+%% so the hot path reads them without a copy or an allocation. They are
+%% generated from `tables/0` by `scripts/gen_hpack_huffman_table.escript`
+%% rather than built when this module loads: building them took about
+%% 16 ms, which an embedded release paid on every boot (it loads every
+%% module up front), against about 1.5 ms to load the literals. A test
+%% checks the generated module still matches `tables/0`.
 
 -export([encode/1, decode/1]).
+-export([tables/0]).
 
 %% Internal-only: HPACK's `decode_error/0` union (the public surface)
 %% folds these two Huffman-specific variants into the single
@@ -60,10 +64,6 @@
 -type decode_error() ::
     invalid_padding
     | eos_in_string.
-
--define(ENCODE_KEY, {?MODULE, encode_table}).
--define(DECODE_KEY, {?MODULE, decode_table}).
--define(DECODE_END_KEY, {?MODULE, decode_end_table}).
 
 %% =============================================================================
 %% encode/1
@@ -76,7 +76,7 @@ bits; an empty input produces an empty output.
 """.
 -spec encode(binary()) -> binary().
 encode(Bin) ->
-    Out = encode_loop(Bin, persistent_term:get(?ENCODE_KEY), <<>>),
+    Out = encode_loop(Bin, roadrunner_http2_hpack_huffman_table:encode(), <<>>),
     case bit_size(Out) rem 8 of
         0 ->
             Out;
@@ -109,7 +109,7 @@ RFC 7541 §5.2:
 """.
 -spec decode(binary()) -> {ok, binary()} | {error, decode_error()}.
 decode(Bin) ->
-    decode_loop(Bin, persistent_term:get(?DECODE_KEY), 0, 0, 0, []).
+    decode_loop(Bin, roadrunner_http2_hpack_huffman_table:decode(), 0, 0, 0, []).
 
 %% `Acc` holds the `N` bytes emitted since the last chunk, below 6, so
 %% it stays a small integer after the next step's at most 2 more.
@@ -133,24 +133,25 @@ decode_loop(<<Byte, Rest/binary>>, Table, State, Acc, N, Out) ->
             end
     end;
 decode_loop(<<>>, _Table, State, Acc, N, Out) ->
-    case element(State + 1, persistent_term:get(?DECODE_END_KEY)) of
+    case element(State + 1, roadrunner_http2_hpack_huffman_table:decode_end()) of
         true -> {ok, iolist_to_binary([Out, <<Acc:(N * 8)>>])};
         false -> {error, invalid_padding}
     end.
 
 %% =============================================================================
-%% Table construction (-on_load)
+%% Table construction
 %% =============================================================================
 
--spec init_tables() -> ok.
-init_tables() ->
+%% The encode, decode and decode-end tables, built from the RFC 7541
+%% code table. Only `scripts/gen_hpack_huffman_table.escript` and the
+%% test that checks the generated module call this; the codec reads the
+%% generated literals.
+-doc false.
+-spec tables() -> {Encode :: tuple(), Decode :: tuple(), DecodeEnd :: tuple()}.
+tables() ->
     Codes = code_table(),
-    Encode = build_encode_table(Codes),
     States = build_decode_table(Codes),
-    persistent_term:put(?ENCODE_KEY, Encode),
-    persistent_term:put(?DECODE_KEY, byte_transitions(States)),
-    persistent_term:put(?DECODE_END_KEY, end_flags(States)),
-    ok.
+    {build_encode_table(Codes), byte_transitions(States), end_flags(States)}.
 
 %% One integer per (state, byte), each byte being its high nibble's
 %% transition then its low nibble's; see the module comment for the

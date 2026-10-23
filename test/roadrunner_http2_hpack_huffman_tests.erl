@@ -135,3 +135,12 @@ decode_eos_triggered_in_second_nibble_test() ->
     %% bit 4 of byte 5's Lo nibble.
     Bin = <<16#18, 16#FF, 16#FF, 16#FF, 16#FF>>,
     ?assertEqual({error, eos_in_string}, roadrunner_http2_hpack_huffman:decode(Bin)).
+
+generated_tables_match_builder_test() ->
+    %% The codec reads literals from a generated module. Regenerate it
+    %% with `scripts/gen_hpack_huffman_table.escript` after changing how
+    %% `tables/0` builds them.
+    {Encode, Decode, DecodeEnd} = roadrunner_http2_hpack_huffman:tables(),
+    ?assertEqual(Encode, roadrunner_http2_hpack_huffman_table:encode()),
+    ?assertEqual(Decode, roadrunner_http2_hpack_huffman_table:decode()),
+    ?assertEqual(DecodeEnd, roadrunner_http2_hpack_huffman_table:decode_end()).
