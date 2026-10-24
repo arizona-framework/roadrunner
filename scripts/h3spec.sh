@@ -54,9 +54,6 @@ KNOWN_FAILURES=(
     "MUST send PROTOCOL_VIOLATION if HANDSHAKE_DONE is received"
     "MUST send unexpected_message TLS alert if KeyUpdate in Handshake is received"
     "MUST send unexpected_message TLS alert if EndOfEarlyData is received"
-    "MUST send H3_FRAME_ERROR if a SETTINGS frame stops mid-parameter"
-    "MUST send H3_FRAME_UNEXPECTED if CANCEL_PUSH is received in a request stream"
-    "MUST NOT buffer a frame longer than SETTINGS_MAX_FIELD_SECTION_SIZE"
 )
 
 case "$(uname -s)-$(uname -m)" in

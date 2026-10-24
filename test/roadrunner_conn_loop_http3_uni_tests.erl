@@ -7,6 +7,7 @@ QUIC wiring is covered end-to-end by `roadrunner_http3_SUITE`.
 Connection-error codes asserted here are RFC 9114 §8.1 values:
 `16#0103` = H3_STREAM_CREATION_ERROR, `16#0104` = H3_CLOSED_CRITICAL_STREAM,
 `16#0105` = H3_FRAME_UNEXPECTED, `16#0106` = H3_FRAME_ERROR,
+`16#0107` = H3_EXCESSIVE_LOAD, `16#0109` = H3_SETTINGS_ERROR,
 `16#010A` = H3_MISSING_SETTINGS; and RFC 9204 §8.3 values: `16#0201` =
 QPACK_ENCODER_STREAM_ERROR, `16#0202` = QPACK_DECODER_STREAM_ERROR.
 """.
@@ -135,7 +136,24 @@ control_oversized_frame_test() ->
     Oversized = iolist_to_binary([
         roadrunner_quic_varint:encode(0), roadrunner_quic_varint:encode(16#FFFFFFFF)
     ]),
-    ?assertMatch({conn_error, 16#0106, _}, ev({control, <<>>, true}, #{}, Oversized, false)).
+    ?assertMatch({conn_error, 16#0107, _}, ev({control, <<>>, true}, #{}, Oversized, false)).
+
+control_truncated_settings_test() ->
+    %% RFC 9114 §7.1: a SETTINGS payload ending inside a pair (an
+    %% identifier with no value) is H3_FRAME_ERROR, not H3_SETTINGS_ERROR.
+    ?assertMatch({conn_error, 16#0106, _}, ev({control, <<>>, false}, #{}, <<16#04, 1, 1>>, false)).
+
+control_malformed_goaway_test() ->
+    %% A GOAWAY (0x07) with a byte past its id is malformed (§7.1):
+    %% H3_FRAME_ERROR.
+    ?assertMatch(
+        {conn_error, 16#0106, _}, ev({control, <<>>, true}, #{}, <<16#07, 2, 0, 0>>, false)
+    ).
+
+control_malformed_push_promise_test() ->
+    %% PUSH_PROMISE (0x05) never belongs on the control stream, so even an
+    %% empty (malformed) one is H3_FRAME_UNEXPECTED.
+    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, true}, #{}, <<16#05, 0>>, false)).
 
 control_forbidden_setting_test() ->
     %% An HTTP/2-only setting (MAX_CONCURRENT_STREAMS = 0x03) is

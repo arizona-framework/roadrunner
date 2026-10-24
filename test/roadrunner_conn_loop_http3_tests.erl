@@ -5,7 +5,8 @@ state machine in `roadrunner_conn_loop_http3` (the live connection
 paths are covered end-to-end by `roadrunner_http3_SUITE`).
 
 The connection-error codes asserted here are RFC 9114 §8.1 values:
-`16#0105` = H3_FRAME_UNEXPECTED, `16#0106` = H3_FRAME_ERROR.
+`16#0105` = H3_FRAME_UNEXPECTED, `16#0106` = H3_FRAME_ERROR,
+`16#0107` = H3_EXCESSIVE_LOAD.
 """.
 -include_lib("eunit/include/eunit.hrl").
 
@@ -106,11 +107,19 @@ h2_reserved_frame_test() ->
     ?assertMatch({conn_error, 16#0105, _}, decode(<<2, 0>>, 1000)).
 
 oversized_frame_test() ->
-    %% A frame declaring a length above the cap → H3_FRAME_ERROR (§7.1).
+    %% A frame declaring a length above the size we buffer → our own limit,
+    %% H3_EXCESSIVE_LOAD (§10.5).
     Oversized = iolist_to_binary([
         roadrunner_quic_varint:encode(0), roadrunner_quic_varint:encode(16#FFFFFFFF)
     ]),
-    ?assertMatch({conn_error, 16#0106, _}, decode(Oversized, 1000)).
+    ?assertMatch({conn_error, 16#0107, _}, decode(Oversized, 1000)).
+
+malformed_control_frame_test() ->
+    %% A control-stream frame type on a request stream is H3_FRAME_UNEXPECTED
+    %% (§7.2.3 - §7.2.7) even when its payload is malformed too: an empty
+    %% CANCEL_PUSH (0x03), and a GOAWAY (0x07) with a byte past its id.
+    ?assertMatch({conn_error, 16#0105, _}, decode(<<16#03, 0>>, 1000)),
+    ?assertMatch({conn_error, 16#0105, _}, decode(<<16#07, 2, 0, 0>>, 1000)).
 
 oversized_header_block_test() ->
     %% A complete HEADERS frame whose field section exceeds MAX_HEADER_BLOCK
