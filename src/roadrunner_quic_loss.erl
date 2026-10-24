@@ -27,6 +27,7 @@
     detect_lost/2,
     loss_time/1,
     update_rtt/3,
+    reset_rtt/2,
     get_pto/1,
     pto_deadline/1,
     on_pto_expired/1,
@@ -82,6 +83,7 @@
     %% higher-numbered in-flight packets stay as the shared remaining queue.
     sent = queue:new() :: queue:queue(#sent{}),
     %% RTT estimation (RFC 9002 §5).
+    initial_rtt :: non_neg_integer(),
     latest_rtt = 0 :: non_neg_integer(),
     smoothed_rtt :: non_neg_integer(),
     rtt_var :: non_neg_integer(),
@@ -91,6 +93,10 @@
     %% first_rtt_sample): only packets sent after it count toward persistent
     %% congestion (§7.6.2).
     first_rtt_sample_at = undefined :: non_neg_integer() | undefined,
+    %% When the estimate last restarted for a new path (RFC 9000 §9.4): a
+    %% packet sent at or before it was sent on the old path and gives no RTT
+    %% sample. `undefined` while the path never changed.
+    rtt_reset_at = undefined :: non_neg_integer() | undefined,
     %% Loss detection.
     largest_acked = undefined :: non_neg_integer() | undefined,
     %% Probe timeout (RFC 9002 §6.2).
@@ -137,6 +143,7 @@ the first sample (RFC 9002 §6.2.2, default 333ms); `max_ack_delay` and
 new(Opts) ->
     InitialRtt = maps:get(initial_rtt, Opts, ?DEFAULT_INITIAL_RTT),
     #loss{
+        initial_rtt = InitialRtt,
         smoothed_rtt = InitialRtt,
         rtt_var = InitialRtt div 2,
         max_ack_delay = maps:get(max_ack_delay, Opts, ?DEFAULT_MAX_ACK_DELAY),
@@ -331,6 +338,24 @@ update_rtt(
         min_rtt = NewMinRtt,
         rtt_var = (3 * RttVar + abs(SRtt - Adjusted)) div 4,
         smoothed_rtt = (7 * SRtt + Adjusted) div 8
+    }.
+
+-doc """
+Restart the RTT estimate for a new network path (RFC 9000 §9.4): every
+estimate returns to its initial value (RFC 9002 §6.2.2, Appendix A.3), and
+the packets sent until `Now`, on the old path, give the new path no sample
+(nor its first-sample time, so persistent congestion waits for one, §7.6.2).
+""".
+-spec reset_rtt(non_neg_integer(), t()) -> t().
+reset_rtt(Now, #loss{initial_rtt = InitialRtt} = Loss) ->
+    Loss#loss{
+        latest_rtt = 0,
+        smoothed_rtt = InitialRtt,
+        rtt_var = InitialRtt div 2,
+        min_rtt = infinity,
+        has_sample = false,
+        first_rtt_sample_at = undefined,
+        rtt_reset_at = Now
     }.
 
 %% =============================================================================
@@ -529,12 +554,19 @@ loss_delay(#loss{latest_rtt = Latest, smoothed_rtt = SRtt}) ->
     max(?TIME_THRESHOLD_NUM * Rtt div ?TIME_THRESHOLD_DEN, ?GRANULARITY).
 
 %% Update the RTT from the largest acknowledged packet when it is
-%% ack-eliciting (RFC 9002 §5.1); ignore the ACK otherwise. The ACK Delay
-%% field is decoded from its 2^exponent-microsecond units to milliseconds
-%% (RFC 9000 §19.3) before it reaches the millisecond RTT estimator.
-maybe_update_rtt(#loss{ack_delay_exponent = Exp} = Loss, LargestAcked, Acked, AckDelay, Now) ->
+%% ack-eliciting (RFC 9002 §5.1) and was sent on the current path (RFC 9000
+%% §9.4); ignore the ACK otherwise. The ACK Delay field is decoded from its
+%% 2^exponent-microsecond units to milliseconds (RFC 9000 §19.3) before it
+%% reaches the millisecond RTT estimator.
+maybe_update_rtt(
+    #loss{ack_delay_exponent = Exp, rtt_reset_at = ResetAt} = Loss,
+    LargestAcked,
+    Acked,
+    AckDelay,
+    Now
+) ->
     case lists:keyfind(LargestAcked, #sent.pn, Acked) of
-        #sent{ack_eliciting = true, time_sent = Sent} ->
+        #sent{ack_eliciting = true, time_sent = Sent} when ResetAt =:= undefined; Sent > ResetAt ->
             Sampled = update_rtt(Now - Sent, (AckDelay bsl Exp) div 1000, Loss),
             Sampled#loss{first_rtt_sample_at = first_rtt_sample_at(Now, Loss)};
         _ ->

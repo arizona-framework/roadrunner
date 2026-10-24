@@ -40,7 +40,12 @@
     send/4,
     reset_stream/3,
     stop_sending/3,
-    grant_stream_credit/3
+    grant_stream_credit/3,
+    server_cids/1,
+    use_server_cid/2,
+    retire_connection_id/2,
+    new_connection_id/1,
+    rebind/1
 ]).
 
 %% v1 connection-id length and signature scheme (the test cert is RSA).
@@ -100,7 +105,17 @@
     %% Ack-eliciting packets received since the last ACK; an ACK goes out on the
     %% second one, or after ?MAX_ACK_DELAY if a lone packet is left (RFC 9000
     %% §13.2.1), halving the client's per-packet crypto versus acking every one.
-    unacked = 0 :: non_neg_integer()
+    unacked = 0 :: non_neg_integer(),
+    %% The server's connection ids by sequence number (RFC 9000 §5.1.1): its
+    %% handshake SCID is 0, the rest arrive in NEW_CONNECTION_ID frames.
+    %% `server_scid` is the one the client addresses.
+    server_cids = #{} :: #{non_neg_integer() => binary()},
+    %% Whether the owner is told of each new server connection id, as
+    %% `{quic_test_new_cid, Conn, Seq, CID}` (the `cid_events` connect option).
+    cid_events = false :: boolean(),
+    %% The sequence number of the next connection id the client issues to the
+    %% server (its handshake SCID is 0, RFC 9000 §5.1.1).
+    next_cid_seq = 1 :: pos_integer()
 }).
 
 %% =============================================================================
@@ -126,7 +141,8 @@ the RFC 9114 §6.2 minimum). `cipher_suites => [Codepoint]` sets the offered
 TLS cipher suites (default TLS_AES_128_GCM_SHA256 only), so a test can
 drive the server onto another suite's packet protection. `group => x25519 |
 secp256r1` is the one key exchange group offered, with its key share
-(default x25519).
+(default x25519). `cid_events => true` tells the owner of each connection
+id the server issues, as `{quic_test_new_cid, Conn, Seq, CID}`.
 """.
 -spec connect(inet:ip_address() | inet:hostname(), inet:port_number(), map()) ->
     {ok, pid()} | {error, term()}.
@@ -204,6 +220,46 @@ per-stream window resumes sending.
 grant_stream_credit(Pid, StreamId, MaxStreamData) ->
     cast_frame(Pid, {max_stream_data, StreamId, MaxStreamData}).
 
+-doc """
+The server's connection ids the client knows, by sequence number (RFC 9000
+§5.1.1): the handshake SCID as 0 and every id a NEW_CONNECTION_ID carried.
+""".
+-spec server_cids(pid()) -> #{non_neg_integer() => binary()}.
+server_cids(Pid) ->
+    call(Pid, server_cids).
+
+-doc """
+Address the client's packets from now on to the server connection id `CID`
+(RFC 9000 §5.1.2: an endpoint may switch to another of its peer's ids at any
+time).
+""".
+-spec use_server_cid(pid(), binary()) -> ok.
+use_server_cid(Pid, CID) ->
+    call(Pid, {use_server_cid, CID}).
+
+-doc "Retire the server connection id numbered `Seq` (RFC 9000 §19.16).".
+-spec retire_connection_id(pid(), non_neg_integer()) -> ok.
+retire_connection_id(Pid, Seq) ->
+    cast_frame(Pid, {retire_connection_id, Seq}).
+
+-doc """
+Give the server a spare client connection id with NEW_CONNECTION_ID (RFC 9000
+§5.1.1), so it has a fresh one to address the client with on a new path
+(§9.5). The client accepts packets addressed to any of its ids.
+""".
+-spec new_connection_id(pid()) -> ok.
+new_connection_id(Pid) ->
+    call(Pid, new_connection_id).
+
+-doc """
+Move the client to a new local port, as a NAT rebinding does (RFC 9000 §9):
+the old socket closes, and every later packet goes out from, and is read on,
+a fresh one. The client answers the server's PATH_CHALLENGE on it.
+""".
+-spec rebind(pid()) -> ok.
+rebind(Pid) ->
+    call(Pid, rebind).
+
 cast_frame(Pid, Frame) ->
     Ref = make_ref(),
     Pid ! {frame, self(), Ref, Frame},
@@ -266,7 +322,8 @@ init(Parent, Ref, Host, Port, Opts) ->
         owner = Parent,
         server_initial_keys = roadrunner_quic_keys:initial_server(Dcid0),
         conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ?CONN_MAX_DATA}),
-        ack = roadrunner_quic_ack:new()
+        ack = roadrunner_quic_ack:new(),
+        cid_events = maps:get(cid_events, Opts, false)
     },
     case handshake(Conn) of
         {ok, Conn1} ->
@@ -275,7 +332,7 @@ init(Parent, Ref, Host, Port, Opts) ->
             %% socket recv would starve owner calls while the peer is idle.
             ok = roadrunner_quic_socket:activate(Socket),
             Parent ! {Ref, connected},
-            connected_loop(Conn1);
+            connected_loop(handshake_cids(Conn1));
         {error, Reason} ->
             _ = roadrunner_quic_socket:close(Socket),
             Parent ! {Ref, {error, Reason}},
@@ -438,6 +495,23 @@ send_handshake(
     ok = roadrunner_quic_socket:send(Socket, Host, Port, Datagram),
     Conn#conn{hs_pn = Pn + 1}.
 
+%% The server's connection ids once connected: its handshake SCID (sequence
+%% number 0) and the spare ids its 1-RTT packets of the handshake flight
+%% carried in NEW_CONNECTION_ID frames, which ride with HANDSHAKE_DONE.
+-spec handshake_cids(#conn{}) -> #conn{}.
+handshake_cids(
+    #conn{datagrams = Datagrams, app_server_keys = AppKeys, scid = Scid, server_scid = ServerScid} =
+        Conn
+) ->
+    Frames = roadrunner_quic_test_client:frames(
+        Datagrams, application, #{application => AppKeys}, byte_size(Scid)
+    ),
+    lists:foldl(
+        fun handle_app_frame/2,
+        Conn#conn{server_cids = #{0 => ServerScid}},
+        [F || {new_connection_id, _, _, _, _} = F <- Frames]
+    ).
+
 %% Whether the server's 1-RTT packets carry HANDSHAKE_DONE (RFC 9001 §4.1.2).
 %% Short-header packets are addressed to the client's source CID.
 -spec handshake_done_received(#conn{}) -> boolean().
@@ -486,6 +560,26 @@ connected_loop(#conn{socket = Socket, unacked = Unacked} = Conn) ->
             Id = Conn#conn.next_uni,
             From ! {Ref, Id},
             connected_loop(Conn#conn{next_uni = Id + 4});
+        {server_cids, From, Ref} ->
+            From ! {Ref, Conn#conn.server_cids},
+            connected_loop(Conn);
+        {{use_server_cid, CID}, From, Ref} ->
+            From ! {Ref, ok},
+            connected_loop(Conn#conn{server_scid = CID});
+        {new_connection_id, From, Ref} ->
+            Seq = Conn#conn.next_cid_seq,
+            New =
+                {new_connection_id, Seq, 0, crypto:strong_rand_bytes(?CID_LEN),
+                    crypto:strong_rand_bytes(16)},
+            Conn1 = send_wire_frame(Conn, New),
+            From ! {Ref, ok},
+            connected_loop(Conn1#conn{next_cid_seq = Seq + 1});
+        {rebind, From, Ref} ->
+            {ok, NewSocket} = roadrunner_quic_socket:open(0),
+            ok = roadrunner_quic_socket:activate(NewSocket),
+            ok = roadrunner_quic_socket:close(Socket),
+            From ! {Ref, ok},
+            connected_loop(Conn#conn{socket = NewSocket});
         {send, From, Ref, StreamId, Data, Fin} ->
             Conn1 = send_stream(Conn, StreamId, Data, Fin),
             From ! {Ref, ok},
@@ -568,7 +662,13 @@ send_frame(Conn, Frame) ->
     send_wire_frame(Conn, Frame).
 
 -spec send_wire_frame(#conn{}, roadrunner_quic_frame:frame()) -> #conn{}.
-send_wire_frame(
+send_wire_frame(Conn, Frame) ->
+    send_packet(Conn, #{frames => [Frame]}).
+
+%% Send one 1-RTT packet of `Entry`'s frames (and its `pad_to`, if any)
+%% addressed to the server's CID, taking the next 1-RTT packet number.
+-spec send_packet(#conn{}, map()) -> #conn{}.
+send_packet(
     #conn{
         socket = Socket,
         host = Host,
@@ -578,10 +678,10 @@ send_wire_frame(
         app_client_keys = Keys,
         send_pn = Pn
     } = Conn,
-    Frame
+    Entry
 ) ->
     {Datagram, _Sent} = roadrunner_quic_send:datagram(
-        #{application => #{frames => [Frame], keys => Keys, pn => Pn}}, ServerScid, Scid
+        #{application => Entry#{keys => Keys, pn => Pn}}, ServerScid, Scid
     ),
     _ = roadrunner_quic_socket:send(Socket, Host, Port, Datagram),
     Conn#conn{send_pn = Pn + 1}.
@@ -642,6 +742,20 @@ handle_app_frame({reset_stream, StreamId, ErrorCode, _FinalSize}, #conn{owner = 
 handle_app_frame({connection_close, _Domain, ErrorCode, _FrameType, _Reason}, Conn) ->
     _ = Conn#conn.owner ! {quic_test_closed, self(), ErrorCode},
     Conn;
+handle_app_frame({path_challenge, Data}, Conn) ->
+    %% RFC 9000 §8.2.2: answer on the path the challenge came on (the
+    %% client has one socket) in a datagram expanded to 1200 bytes.
+    send_packet(Conn, #{frames => [{path_response, Data}], pad_to => 1200});
+handle_app_frame(
+    {new_connection_id, Seq, _Prior, CID, _Token},
+    #conn{server_cids = Cids, cid_events = Events, owner = Owner} = Conn
+) ->
+    _ =
+        case Events of
+            true -> Owner ! {quic_test_new_cid, self(), Seq, CID};
+            false -> ok
+        end,
+    Conn#conn{server_cids = Cids#{Seq => CID}};
 handle_app_frame(_Other, Conn) ->
     Conn.
 

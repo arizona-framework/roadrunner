@@ -17,9 +17,11 @@
 shell_test_() ->
     {foreach, fun setup/0, fun cleanup/1, [
         fun handshake_completes/1,
+        fun issued_connection_id_routes_to_shell/1,
         fun send_data_round_trip/1,
         fun peer_close_terminates_shell/1,
         fun peername_round_trip/1,
+        fun migration_follows_new_address/1,
         fun set_owner_emits_connected/1,
         fun system_message_handled/1,
         fun unsupported_call_replies/1,
@@ -37,9 +39,16 @@ setup() ->
     {ok, ClientSocket} = roadrunner_quic_socket:open(0),
     {ok, {_Ip, ClientPort}} = roadrunner_quic_socket:sockname(ClientSocket),
     Peer = {{127, 0, 0, 1}, ClientPort},
-    {Config, Ctx} = config(Peer),
+    {#{registry := Registry} = Config, Ctx} = config(Peer),
     {ok, Shell} = ?CONN:start(ServerSocket, Config),
-    #{shell => Shell, peer => Peer, client => ClientSocket, server => ServerSocket, ctx => Ctx}.
+    #{
+        shell => Shell,
+        peer => Peer,
+        client => ClientSocket,
+        server => ServerSocket,
+        ctx => Ctx,
+        registry => Registry
+    }.
 
 cleanup(#{shell := Shell, client := ClientSocket, server := ServerSocket}) ->
     exit(Shell, kill),
@@ -60,6 +69,37 @@ handshake_completes(#{shell := Shell, peer := Peer, client := ClientSocket, ctx 
             byte_size(?DCID)
         ),
         ?assert(lists:member(handshake_done, AppFrames))
+    end.
+
+%% The spare connection id the core issues on confirmation routes to the shell
+%% in the registry (RFC 9000 §5.1.1), and stops routing once the client
+%% retires it (§19.16), while its replacement takes over.
+issued_connection_id_routes_to_shell(#{
+    shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx, registry := Registry
+}) ->
+    fun() ->
+        {ClientApSecret, ServerApSecret} = do_handshake(Shell, Peer, ClientSocket, Ctx),
+        ServerKeys = #{
+            application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)
+        },
+        [{new_connection_id, 1, 0, CID1, _}] = new_cids(
+            ?TC:frames(recv_all(ClientSocket), application, ServerKeys, byte_size(?DCID))
+        ),
+        ?assertEqual({ok, Shell}, roadrunner_quic_cid_registry:lookup(Registry, CID1)),
+        Retire = ?TC:seal(
+            application,
+            0,
+            roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientApSecret),
+            [{retire_connection_id, 1}],
+            ?DCID,
+            ?SCID
+        ),
+        Shell ! {quic_datagram, Peer, Retire},
+        [{new_connection_id, 2, 0, CID2, _}] = new_cids(
+            ?TC:frames(recv_all(ClientSocket), application, ServerKeys, byte_size(?DCID))
+        ),
+        ?assertEqual(error, roadrunner_quic_cid_registry:lookup(Registry, CID1)),
+        ?assertEqual({ok, Shell}, roadrunner_quic_cid_registry:lookup(Registry, CID2))
     end.
 
 %% A stream write round-trips through the shell: {quic_send, ...} is answered
@@ -88,9 +128,18 @@ send_data_round_trip(#{shell := Shell, peer := Peer, client := ClientSocket, ctx
 %% normal proc_lib exit, not a crash). The close also acks the server's
 %% HANDSHAKE_DONE so a real RTT sample collapses the drain to tens of ms, the way
 %% an established connection that exchanged data drains.
-peer_close_terminates_shell(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
+peer_close_terminates_shell(#{
+    shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx, registry := Registry
+}) ->
     {timeout, 10, fun() ->
-        {ClientApSecret, _ServerApSecret} = do_handshake(Shell, Peer, ClientSocket, Ctx),
+        {ClientApSecret, ServerApSecret} = do_handshake(Shell, Peer, ClientSocket, Ctx),
+        ServerKeys = #{
+            application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)
+        },
+        [{new_connection_id, 1, 0, CID1, _}] = new_cids(
+            ?TC:frames(recv_all(ClientSocket), application, ServerKeys, byte_size(?DCID))
+        ),
+        ?assertEqual({ok, Shell}, roadrunner_quic_cid_registry:lookup(Registry, CID1)),
         %% Install self as owner (handshake already done, so {connected, _}
         %% comes back immediately) to receive the {closed, _} event.
         Ref = make_ref(),
@@ -119,7 +168,9 @@ peer_close_terminates_shell(#{shell := Shell, peer := Peer, client := ClientSock
         after 1000 ->
             erlang:error(no_closed_event)
         end,
-        wait_dead(Shell, 150)
+        wait_dead(Shell, 150),
+        %% The closed shell removed its own routing rows on the way out.
+        ?assertEqual(error, roadrunner_quic_cid_registry:lookup(Registry, CID1))
     end}.
 
 %% A synchronous peername control call round-trips through the shell.
@@ -132,6 +183,45 @@ peername_round_trip(#{shell := Shell, peer := Peer}) ->
         after 1000 ->
             erlang:error(no_reply)
         end
+    end.
+
+%% RFC 9000 §9.3: a non-probing packet from a new address moves the shell's
+%% sends there ({migrate, _}), while the old path gets its own challenge as a
+%% probing packet sent to it ({send_to, _, _}, §9.3.3).
+migration_follows_new_address(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
+    fun() ->
+        {ClientApSecret, ServerApSecret} = do_handshake(Shell, Peer, ClientSocket, Ctx),
+        _HandshakeDone = recv_all(ClientSocket),
+        {ok, NewSocket} = roadrunner_quic_socket:open(0),
+        {ok, {_Ip, NewPort}} = roadrunner_quic_socket:sockname(NewSocket),
+        NewPeer = {{127, 0, 0, 1}, NewPort},
+        %% The client still addresses the server's handshake id, as after a
+        %% NAT rebinding.
+        Ping = ?TC:seal(
+            application,
+            0,
+            roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientApSecret),
+            [ping],
+            ?SCID,
+            ?SCID
+        ),
+        Shell ! {quic_datagram, NewPeer, Ping},
+        ServerKeys = #{
+            application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)
+        },
+        Challenges = fun(Socket) ->
+            [D || {path_challenge, D} <- ?TC:frames(recv_all(Socket), application, ServerKeys, 8)]
+        end,
+        ?assertMatch([_], Challenges(NewSocket)),
+        ?assertMatch([_], Challenges(ClientSocket)),
+        Ref = make_ref(),
+        Shell ! {quic_call, self(), Ref, peername},
+        receive
+            {quic_reply, Ref, Result} -> ?assertEqual({ok, NewPeer}, Result)
+        after 1000 ->
+            erlang:error(no_reply)
+        end,
+        ok = roadrunner_quic_socket:close(NewSocket)
     end.
 
 %% Installing this process as owner on a connected shell emits the once-only
@@ -279,6 +369,8 @@ config(Peer) ->
         scid => ?SCID,
         peer_scid => ?SCID,
         peer => Peer,
+        registry => roadrunner_quic_cid_registry:new(),
+        reset_key => crypto:strong_rand_bytes(32),
         cert_chain => [~"leaf-cert-der"],
         priv_key => PrivKey,
         alpn => ~"h3",
@@ -370,6 +462,9 @@ recv_all(Socket) ->
         {ok, _Peer, Data} -> [Data | recv_all(Socket)];
         {error, timeout} -> []
     end.
+
+new_cids(Frames) ->
+    [F || {new_connection_id, _, _, _, _} = F <- Frames].
 
 %% A synchronous round-trip after an async message proves the loop consumed
 %% that message (mailbox order) and is still looping.

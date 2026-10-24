@@ -5,16 +5,25 @@
 %% decision core (a hand-rolled receive loop, never a gen_statem, mirroring
 %% `roadrunner_conn_loop_http2`). The core owns the whole connection state
 %% and every decision; this shell owns only the irreducible I/O: the shared
-%% UDP socket handle (for sending), the peer address, the conn_state value,
-%% and the single loss/PTO timer.
+%% UDP socket handle (for sending), the peer address, the listener's
+%% connection-id registry, the conn_state value, and the single loss/PTO
+%% timer.
 %%
 %% The QUIC socket is passive and shared across connections (SO_REUSEPORT),
 %% so the shell never reads it. The listener reads the socket and routes
 %% each datagram to the owning connection as a `{quic_datagram, Peer,
 %% Bytes}` message; the shell only sends on the socket. Every message drives
 %% one conn_state entry point, and the returned effects are performed here:
-%% `{send, Datagram}` goes out the socket to the peer, and `{arm_timer,
-%% Kind, AtMs}` sets the one deadline the core wants. The shell re-arms its
+%% `{send, Datagram}` goes out the socket to the peer, `{arm_timer, Kind,
+%% AtMs}` sets the one deadline the core wants, and `{register_cid, CID}` /
+%% `{unregister_cid, CID}` route a connection id the core issued to this
+%% process in the registry, or stop routing one the peer retired (RFC 9000
+%% §5.1). A closing connection removes its own rows as it exits; the
+%% listener reaps those of one that crashes. The datagram's source address
+%% goes to the core with it: when the client moves (RFC 9000 §9), `{migrate,
+%% Peer}` points every later `{send, _}` at the new address, and `{send_to,
+%% Peer, Datagram}` sends a probing packet to an address the connection is
+%% not on. The shell re-arms its
 %% timer lazily: a later deadline leaves an earlier armed timer running, and
 %% when that one fires ahead of the deadline it is just re-armed, so a
 %% deadline that keeps moving later (a PTO pushed back by each ACK) costs no
@@ -40,7 +49,10 @@
     %% The armed timer and the time it fires at, never after `deadline`.
     timer :: {reference(), integer()} | undefined,
     %% The core's current deadline: the timer kind to run, and when.
-    deadline :: {atom(), integer()} | undefined
+    deadline :: {atom(), integer()} | undefined,
+    %% The listener's connection-id routing table, where the ids the core
+    %% issues are routed to this process.
+    registry :: roadrunner_quic_cid_registry:t()
 }).
 
 %% =============================================================================
@@ -59,14 +71,15 @@ start(Socket, Config) ->
 -doc false.
 -spec init(roadrunner_quic_socket:socket(), roadrunner_quic_conn_state:config()) ->
     ok | no_return().
-init(Socket, #{peer := Peer} = Config) ->
+init(Socket, #{peer := Peer, registry := Registry} = Config) ->
     proc_lib:set_label({?MODULE, Peer}),
     loop(#shell{
         socket = Socket,
         peer = Peer,
         conn = roadrunner_quic_conn_state:new(Config, erlang:monotonic_time(millisecond)),
         timer = undefined,
-        deadline = undefined
+        deadline = undefined,
+        registry = Registry
     }).
 
 %% =============================================================================
@@ -101,10 +114,10 @@ loop(State) ->
                 Sid, Bytes, Now, State#shell.conn
             ),
             continue(perform(Effects, Now, State#shell{conn = Conn}));
-        {quic_datagram, _Peer, Datagram} ->
+        {quic_datagram, Peer, Datagram} ->
             Now = erlang:monotonic_time(millisecond),
             {Conn, Effects} = roadrunner_quic_conn_state:handle_datagram(
-                Now, Datagram, State#shell.conn
+                Now, Peer, Datagram, State#shell.conn
             ),
             continue(perform(Effects, Now, State#shell{conn = Conn}));
         {timeout, TRef, ?MODULE} ->
@@ -115,13 +128,18 @@ loop(State) ->
 
 %% Resume the loop, or exit normally once the pure core has moved to the
 %% `closed` phase. proc_lib treats a normal return as a clean process exit,
-%% and the owner already learned of the close via the {closed, _} emit, so
-%% there is no further teardown to do here.
+%% and the owner already learned of the close via the {closed, _} emit. The
+%% only teardown left is the connection's routing rows: it removes its own,
+%% so the listener reaps a normal exit without scanning the registry.
 -spec continue(#shell{}) -> ok | no_return().
-continue(#shell{conn = Conn} = State) ->
+continue(#shell{conn = Conn, registry = Registry} = State) ->
     case roadrunner_quic_conn_state:phase(Conn) of
-        closed -> ok;
-        _ -> loop(State)
+        closed ->
+            roadrunner_quic_cid_registry:remove_all(
+                Registry, roadrunner_quic_conn_state:routes(Conn), self()
+            );
+        _ ->
+            loop(State)
     end.
 
 %% Act on a fired timer only when it is still the armed one; a stale fire
@@ -172,6 +190,18 @@ perform_effect({emit, Owner, Event}, _Now, State) ->
 perform_effect({reply, To, Ref, Result}, _Now, State) ->
     _ = To ! {quic_reply, Ref, Result},
     State;
+perform_effect({register_cid, CID}, _Now, #shell{registry = Registry} = State) ->
+    ok = roadrunner_quic_cid_registry:add(Registry, CID, self()),
+    State;
+perform_effect({unregister_cid, CID}, _Now, #shell{registry = Registry} = State) ->
+    ok = roadrunner_quic_cid_registry:remove(Registry, CID, self()),
+    State;
+perform_effect({send_to, {Ip, Port}, Datagram}, _Now, #shell{socket = Socket} = State) ->
+    %% A send error is a lost datagram, as for the batched sends.
+    _ = roadrunner_quic_socket:send(Socket, Ip, Port, Datagram),
+    State;
+perform_effect({migrate, Peer}, _Now, State) ->
+    State#shell{peer = Peer};
 perform_effect({arm_timer, Kind, AtMs}, Now, #shell{timer = Timer} = State0) ->
     State = State0#shell{deadline = {Kind, AtMs}},
     case Timer of

@@ -27,7 +27,10 @@
 %% (`roadrunner_quic_recv` stops at them). The trailing pad is valid only
 %% when the datagram's last packet is long-header, so coalescing an Initial
 %% with a 1-RTT (short-header) packet is rejected: a server never holds
-%% 1-RTT keys while still sending Initials, so it never arises.
+%% 1-RTT keys while still sending Initials, so it never arises. A 1-RTT
+%% packet that must fill its datagram (one carrying PATH_CHALLENGE or
+%% PATH_RESPONSE, RFC 9000 §8.2) is instead expanded inside its plaintext
+%% with PADDING frames, to the size its entry's `pad_to` asks for.
 %%
 %% A sent-record's `length` is the bare per-packet wire size; the §14.1
 %% trailing pad belongs to the datagram, not any packet, so the loop
@@ -64,7 +67,10 @@
     keys := roadrunner_quic_keys:keys(),
     pn := non_neg_integer(),
     %% 1-RTT key phase (application level only); defaults to 0.
-    key_phase => 0 | 1
+    key_phase => 0 | 1,
+    %% The size to expand a 1-RTT packet to with PADDING frames (application
+    %% level only); a packet already as large stays as it is.
+    pad_to => non_neg_integer()
 }.
 
 -type sent() :: #{
@@ -114,8 +120,11 @@ build_levels([Level | Rest], Entries, DCID, SCID) ->
 -spec build_packet(level(), entry(), binary(), binary()) -> {binary(), sent()}.
 build_packet(Level, #{frames := Frames, keys := Keys, pn := PN} = Entry, DCID, SCID) ->
     #{key := Key, iv := IV, hp := HP} = Keys,
-    Plaintext = pad_plaintext(iolist_to_binary([roadrunner_quic_frame:encode(F) || F <- Frames])),
     PNLen = roadrunner_quic_packet:pn_length(PN),
+    Plaintext = pad_plaintext(
+        iolist_to_binary([roadrunner_quic_frame:encode(F) || F <- Frames]),
+        plaintext_floor(Level, Entry, DCID, PNLen)
+    ),
     Header = header(Level, DCID, SCID, PN, byte_size(Plaintext) + ?TAG_LEN, key_phase(Entry)),
     Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
     Protected = roadrunner_quic_aead:protect_header(HP, Header, Sealed, byte_size(Header) - PNLen),
@@ -149,13 +158,23 @@ header(Level, DCID, SCID, PN, SealedSize, _KeyPhase) ->
     }),
     Header.
 
-%% Pad a packet's plaintext to the header-protection-sample minimum with
-%% PADDING frames (zero bytes) before it is sealed (RFC 9001 §5.4.2).
--spec pad_plaintext(binary()) -> binary().
-pad_plaintext(Plaintext) when byte_size(Plaintext) >= ?MIN_SAMPLE_PLAINTEXT ->
+%% The plaintext size a packet must reach: the header-protection-sample
+%% minimum (RFC 9001 §5.4.2), or, for a 1-RTT packet with a `pad_to`, the
+%% size that makes the whole packet (short header, plaintext and AEAD tag)
+%% that long.
+-spec plaintext_floor(level(), entry(), binary(), 1..4) -> non_neg_integer().
+plaintext_floor(application, #{pad_to := PadTo}, DCID, PNLen) ->
+    max(?MIN_SAMPLE_PLAINTEXT, PadTo - (1 + byte_size(DCID) + PNLen) - ?TAG_LEN);
+plaintext_floor(_Level, _Entry, _DCID, _PNLen) ->
+    ?MIN_SAMPLE_PLAINTEXT.
+
+%% Pad a packet's plaintext to `Floor` bytes with PADDING frames (zero
+%% bytes) before it is sealed.
+-spec pad_plaintext(binary(), non_neg_integer()) -> binary().
+pad_plaintext(Plaintext, Floor) when byte_size(Plaintext) >= Floor ->
     Plaintext;
-pad_plaintext(Plaintext) ->
-    <<Plaintext/binary, 0:((?MIN_SAMPLE_PLAINTEXT - byte_size(Plaintext)) * 8)>>.
+pad_plaintext(Plaintext, Floor) ->
+    <<Plaintext/binary, 0:((Floor - byte_size(Plaintext)) * 8)>>.
 
 %% Pad a datagram that carries an Initial packet to the RFC 9000 §14.1
 %% minimum with trailing zero bytes. Coalescing an Initial with a 1-RTT

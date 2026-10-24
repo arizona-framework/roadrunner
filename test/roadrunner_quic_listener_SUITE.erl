@@ -16,6 +16,7 @@ an outer guard. The pure routing decision (`classify/2`) is unit-tested in
 -export([suite/0, all/0, init_per_suite/1, end_per_suite/1]).
 -export([
     native_client_handshakes_through_listener/1,
+    issued_connection_id_routes_through_listener/1,
     bind_failure_is_reported/1,
     stop_closes_listener/1,
     unsupported_gen_call_replies_error/1,
@@ -39,6 +40,7 @@ suite() ->
 all() ->
     [
         native_client_handshakes_through_listener,
+        issued_connection_id_routes_through_listener,
         bind_failure_is_reported,
         stop_closes_listener,
         unsupported_gen_call_replies_error,
@@ -97,6 +99,61 @@ native_client_handshakes_through_listener(_Config) ->
     end,
     ok = roadrunner_quic_listener:stop(Listener),
     ?assertEqual(ok, Result).
+
+%% RFC 9000 §5.1.1 / §19.16 end to end: the spare connection id the server
+%% issues on confirmation routes through the listener's registry, so the
+%% client can move to it; retiring the handshake id then stops that one
+%% routing and draws a replacement, and data the client addresses to the
+%% spare id reaches the connection's owner.
+issued_connection_id_routes_through_listener(_Config) ->
+    Test = self(),
+    Registry = roadrunner_quic_cid_registry:new(),
+    Handler = fun(_ConnPid) ->
+        Owner = spawn(fun() -> forward(Test) end),
+        Test ! {owner, Owner},
+        {ok, Owner}
+    end,
+    {ok, Listener} = roadrunner_quic_listener:start_link(
+        (listener_opts(0, Handler))#{registry => Registry}
+    ),
+    Port = roadrunner_quic_listener:get_port(Listener),
+    {ok, Conn} = roadrunner_quic_test_conn:connect(?LOOPBACK, Port, #{cid_events => true}),
+    #{0 := SCID, 1 := CID1} = roadrunner_quic_test_conn:server_cids(Conn),
+    {ok, ServerConn} = roadrunner_quic_cid_registry:lookup(Registry, SCID),
+    ?assertEqual({ok, ServerConn}, roadrunner_quic_cid_registry:lookup(Registry, CID1)),
+
+    ok = roadrunner_quic_test_conn:use_server_cid(Conn, CID1),
+    ok = roadrunner_quic_test_conn:retire_connection_id(Conn, 0),
+    CID2 =
+        receive
+            {quic_test_new_cid, Conn, 2, NewCID} -> NewCID
+        after 5000 -> ct:fail(no_replacement_connection_id)
+        end,
+    ?assertEqual(error, roadrunner_quic_cid_registry:lookup(Registry, SCID)),
+    ?assertEqual({ok, ServerConn}, roadrunner_quic_cid_registry:lookup(Registry, CID2)),
+
+    Sid = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(Conn, Sid, ~"via a spare id", true),
+    receive
+        {forwarded, {quic, ServerConn, {stream_data, Sid, ~"via a spare id", true}}} -> ok
+    after 5000 -> ct:fail(stream_data_not_routed)
+    end,
+
+    %% Once the connection closes it has removed its own routing rows: the
+    %% listener reaps a normal exit without scanning the registry.
+    Mon = monitor(process, ServerConn),
+    ok = roadrunner_quic_test_conn:close(Conn),
+    receive
+        {'DOWN', Mon, process, ServerConn, normal} -> ok
+    after 5000 -> ct:fail(connection_did_not_close)
+    end,
+    ?assertEqual(error, roadrunner_quic_cid_registry:lookup(Registry, CID1)),
+    ?assertEqual(error, roadrunner_quic_cid_registry:lookup(Registry, CID2)),
+    receive
+        {owner, Owner} -> exit(Owner, kill)
+    after 0 -> ok
+    end,
+    ok = roadrunner_quic_listener:stop(Listener).
 
 %% A bind onto a port already held without reuseport surfaces synchronously as
 %% {error, _} from start_link (init's error clause): a plain gen_udp blocker
@@ -384,6 +441,14 @@ drain_handler() ->
 drain() ->
     receive
         _ -> drain()
+    end.
+
+%% An owner that hands every connection event on to the test process.
+forward(Test) ->
+    receive
+        Message ->
+            Test ! {forwarded, Message},
+            forward(Test)
     end.
 
 %% A long-header QUIC v1 Initial (first byte 0xC0 = long+fixed+type 00) with a

@@ -19,6 +19,8 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     post_echo/1,
     empty_204/1,
     large_body/1,
+    nat_rebinding_follows_client/1,
+    active_migration_follows_client/1,
     head_request/1,
     large_post/1,
     not_found/1,
@@ -115,6 +117,8 @@ all() ->
         post_echo,
         empty_204,
         large_body,
+        nat_rebinding_follows_client,
+        active_migration_follows_client,
         head_request,
         large_post,
         not_found,
@@ -293,6 +297,34 @@ empty_204(Config) ->
 
 large_body(Config) ->
     Conn = connect(?config(port, Config)),
+    {200, _Headers, Body} = get(Conn, ~"/big"),
+    ?assertEqual(100_000, byte_size(Body)),
+    close(Conn).
+
+nat_rebinding_follows_client(Config) ->
+    %% RFC 9000 §9.3: the client's port changes mid-connection while it keeps
+    %% its connection ids, as in a NAT rebinding. The server validates the
+    %% new address with a PATH_CHALLENGE the client answers there, and keeps
+    %% serving on it, past the anti-amplification limit once validated.
+    Conn = connect(?config(port, Config)),
+    ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
+    ok = roadrunner_quic_test_conn:rebind(Conn),
+    {200, _Headers, Body} = get(Conn, ~"/big"),
+    ?assertEqual(100_000, byte_size(Body)),
+    close(Conn).
+
+active_migration_follows_client(Config) ->
+    %% RFC 9000 §9.2 / §9.5: the client gives the server a spare id of its
+    %% own, then moves to a spare id of the server's and to a new port at
+    %% once. The server follows it there, addressing the client's fresh id.
+    %% The request after NEW_CONNECTION_ID makes sure the server holds the
+    %% spare before the move.
+    Conn = connect(?config(port, Config)),
+    ok = roadrunner_quic_test_conn:new_connection_id(Conn),
+    ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
+    #{1 := Spare} = roadrunner_quic_test_conn:server_cids(Conn),
+    ok = roadrunner_quic_test_conn:use_server_cid(Conn, Spare),
+    ok = roadrunner_quic_test_conn:rebind(Conn),
     {200, _Headers, Body} = get(Conn, ~"/big"),
     ?assertEqual(100_000, byte_size(Body)),
     close(Conn).

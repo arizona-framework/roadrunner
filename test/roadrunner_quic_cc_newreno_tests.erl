@@ -83,3 +83,13 @@ persistent_congestion_collapses_window_test() ->
     ?assertEqual(6600, ?M:ssthresh(Cc)),
     ?assert(?M:in_slow_start(Cc)),
     ?assertEqual(3600, ?M:cwnd(?M:on_packets_acked(1200, 50, Cc))).
+
+%% RFC 9000 §9.4: a new path's controller starts from the initial window,
+%% and the packets sent on the old path, before the reset, neither grow it
+%% when acknowledged nor shrink it when lost; a later packet's do.
+new_path_test() ->
+    Cc = ?M:new_path(100),
+    ?assertEqual(12000, ?M:cwnd(Cc)),
+    ?assertEqual(Cc, ?M:on_packets_acked(1200, 90, Cc)),
+    ?assertEqual(Cc, ?M:on_congestion_event(100, 150, Cc)),
+    ?assertEqual(13200, ?M:cwnd(?M:on_packets_acked(1200, 110, Cc))).

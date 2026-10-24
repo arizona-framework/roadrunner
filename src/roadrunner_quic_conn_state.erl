@@ -13,8 +13,13 @@
 %%
 %% Effects: `{send, Datagram}` (hand to the socket), `{arm_timer, Kind,
 %% AtMs}` ((re)arm a timer), `{emit, Owner, Event}` (async owner
-%% notification, e.g. `{connected, Info}`), and `{reply, To, Ref, Result}`
-%% (answer a synchronous control call).
+%% notification, e.g. `{connected, Info}`), `{reply, To, Ref, Result}`
+%% (answer a synchronous control call), `{register_cid, CID}` /
+%% `{unregister_cid, CID}` (route a connection id to this connection in the
+%% listener's registry, or stop routing it), `{send_to, Peer, Datagram}` (a
+%% probing packet for an address other than the peer's), and `{migrate,
+%% Peer}` (the peer moved: every later `{send, _}` goes to `Peer`; it always
+%% leads the effects that follow it).
 %%
 %% A connection keeps up to three packet-number spaces (Initial, Handshake,
 %% Application). The server reads with the peer's keys and writes with its
@@ -47,6 +52,33 @@
 %% held unopened (a few at most) and opened once it does, including one
 %% coalesced behind that Finished in the same datagram.
 %%
+%% Each endpoint addresses its peer with connection ids the peer chose (RFC
+%% 9000 §5.1). Once the handshake is confirmed the server issues spare ids
+%% with NEW_CONNECTION_ID, as many as the client accepts (its
+%% active_connection_id_limit, capped here), each with a stateless reset
+%% token derived from it under the listener's reset key (§10.3.2); every
+%% issued id routes to this connection until the client retires it, and a
+%% retired one is replaced so the client keeps a spare (§5.1.2). The
+%% client's own spare ids are kept by sequence number, and the ones its
+%% Retire Prior To asks for are retired; the server keeps addressing the id
+%% it uses unless that one is retired.
+%%
+%% The client may move to a new address (RFC 9000 §9). Once the handshake is
+%% confirmed, the highest-numbered non-probing packet from a new address moves
+%% the connection there: later packets go to it, addressed with a client id
+%% never used toward another address (§9.5), limited to three times what the
+%% address sent until a PATH_CHALLENGE answered from it validates it (§8.2,
+%% §9.3.1), and the path left behind is challenged too (§9.3.3). Validation
+%% that times out returns the connection to the last validated path
+%% (§9.3.2). On validation the congestion controller and RTT estimate start
+%% over for the new path, unless only the port changed, the usual sign of a
+%% NAT rebinding (§9.4). A 1-RTT packet held across the handshake never moves
+%% it: only one from the handshake's address is held, and it is processed as
+%% received there. A probing packet from another address moves nothing:
+%% its PATH_CHALLENGE is answered there (§8.2.2, §9.1). Every packet carrying
+%% PATH_CHALLENGE or PATH_RESPONSE fills a 1200-byte datagram where the
+%% anti-amplification limit allows (§8.2.1, §8.2.2).
+%%
 %% Congestion control and probe transmission are deferred: the connection
 %% sends within the anti-amplification and flow limits (the MUSTs) and a
 %% probe timeout only re-checks for losses and backs off. Wiring NewReno and
@@ -55,13 +87,14 @@
 
 -export([
     new/2,
-    handle_datagram/3,
+    handle_datagram/4,
     handle_timeout/3,
     handle_call/5,
     handle_send/7,
     handle_consumed/4,
     peername/1,
-    phase/1
+    phase/1,
+    routes/1
 ]).
 %% Exported for direct eunit branch coverage of the idle-timeout negotiation.
 -export([negotiated_idle_timeout/2]).
@@ -83,6 +116,17 @@
 
 %% RFC 9000 §17.2: the server uses a fixed-length SCID so short headers demux.
 -define(SCID_LEN, 8).
+%% RFC 9000 §18.2: the active_connection_id_limit when a side does not send
+%% one (and the smallest value it may send).
+-define(DEFAULT_ACTIVE_CID_LIMIT, 2).
+%% The most connection ids the server keeps active per connection, however
+%% many the client accepts (RFC 9000 §5.1.1 lets an endpoint limit them):
+%% enough for the client to migrate and probe a path more, while every one is
+%% a routing row in the listener's registry.
+-define(ACTIVE_CID_LIMIT, 4).
+%% RFC 9000 §8.2.1 / §8.2.2: a datagram carrying PATH_CHALLENGE or
+%% PATH_RESPONSE is expanded to the smallest allowed maximum datagram size.
+-define(MIN_PATH_DATAGRAM, 1200).
 %% A CRYPTO slice budget that leaves room for the packet header, an ACK
 %% frame, and the AEAD tag within the 1200-byte datagram (RFC 9000 §14).
 -define(CRYPTO_BUDGET, 1000).
@@ -124,6 +168,24 @@
 
 -type level() :: initial | handshake | application.
 -type phase() :: handshaking | connected | draining | closed.
+-type address() :: {inet:ip_address(), inet:port_number()}.
+%% A path a probing packet goes out on: the current one, one the client
+%% probes from, or a validated address (the last validated path while the
+%% current one is validated) with the client id used toward it.
+-type path() :: current | probe | {validated, address(), binary()}.
+
+%% The validation of the current path (RFC 9000 §8.2): each PATH_CHALLENGE
+%% sent and whether its datagram reached 1200 bytes, the stage (the address
+%% until a response proves it, then the path MTU until a response to an
+%% expanded challenge does, §8.2.1), when to challenge again, and when to
+%% give up (§8.2.4).
+-record(validation, {
+    sent = [] :: [{binary(), boolean()}],
+    stage = address :: address | mtu,
+    next_at :: integer(),
+    abandon_at :: integer(),
+    interval :: pos_integer()
+}).
 
 -record(space, {
     ack :: roadrunner_quic_ack:t(),
@@ -142,10 +204,61 @@
     %% and echoes as original_destination_connection_id. NOT the reply wire DCID.
     dcid :: binary(),
     scid :: binary(),
-    %% The client's Source Connection ID, which every server reply addresses as
-    %% its Destination Connection ID (RFC 9000 §7.2/§17.2).
+    %% The client's connection id every server packet addresses as its
+    %% Destination Connection ID: its Source Connection ID from the handshake
+    %% (RFC 9000 §7.2/§17.2), until the client retires that one and another of
+    %% its ids takes over (§5.1.2).
     peer_scid :: binary(),
-    peer :: {inet:ip_address(), inet:port_number()},
+    %% The connection ids we issued that the client has not retired (RFC 9000
+    %% §5.1.1), by sequence number; `scid` is sequence number 0. Each routes
+    %% to this connection in the listener's registry.
+    cids :: #{non_neg_integer() => binary()},
+    %% The sequence number the next issued connection id takes (§5.1.1: each
+    %% one increases by 1).
+    next_cid_seq = 1 :: pos_integer(),
+    %% The key the stateless reset token of each issued id derives from
+    %% (`roadrunner_quic_cid_registry:reset_token/2`, RFC 9000 §10.3.2).
+    reset_key :: binary(),
+    %% The client's connection ids we may address (RFC 9000 §5.1.2), by
+    %% sequence number: its handshake Source Connection ID is 0, the rest came
+    %% in NEW_CONNECTION_ID frames. `peer_cid_seq` is the one `peer_scid`
+    %% holds, and `peer_retire_prior` the largest Retire Prior To received.
+    peer_cids :: #{non_neg_integer() => binary()},
+    peer_cid_seq = 0 :: non_neg_integer(),
+    peer_retire_prior = 0 :: non_neg_integer(),
+    %% Client ids we retired on our own (RFC 9000 §5.1.2), numbered at or
+    %% above `peer_retire_prior`: a repeated NEW_CONNECTION_ID for one of them
+    %% must not bring it back.
+    peer_cids_retired = [] :: [non_neg_integer()],
+    %% The Destination Connection ID, source address and size of the datagram
+    %% being processed: a RETIRE_CONNECTION_ID must not retire that id (RFC
+    %% 9000 §19.16), and the address is the path the datagram arrived on.
+    rx_dcid = <<>> :: binary(),
+    rx_peer :: address(),
+    rx_size = 0 :: non_neg_integer(),
+    %% The address non-probing packets go to: the client's handshake address
+    %% until it migrates (RFC 9000 §9.3).
+    peer :: address(),
+    %% Our connection id the client addressed when the current path began: a
+    %% datagram from a new address still sent to it may be a NAT rebinding
+    %% rather than a move of the client's own (RFC 9000 §9.5).
+    path_dcid :: binary(),
+    %% While the current path is validated: the last validated one to return
+    %% to should validation fail (RFC 9000 §9.3.2), with the client id used
+    %% on it and its `path_dcid`.
+    prev_path = undefined :: undefined | {address(), non_neg_integer(), binary()},
+    %% An address the client probes from without having moved to it (RFC
+    %% 9000 §9.1): the client id our answers there carry (§9.5) and its
+    %% anti-amplification account (§8.1).
+    probe_path = undefined ::
+        undefined | {address(), non_neg_integer(), roadrunner_quic_amp:t()},
+    %% The validation of the current path in progress, or `undefined` once
+    %% the path is validated.
+    validation = undefined :: undefined | #validation{},
+    %% Probing packets the next send pass sends ahead of everything else,
+    %% newest-first: frames for a path, or `challenge`, a fresh PATH_CHALLENGE
+    %% validating the current path.
+    path_out = [] :: [challenge | {path(), [roadrunner_quic_frame:frame()]}],
     phase = handshaking :: phase(),
     tls :: roadrunner_quic_tls_server:t(),
     %% Keys to decrypt incoming packets (the peer's), by level. The 1-RTT
@@ -277,8 +390,9 @@
     %% these so the server never sends past what the peer granted (RFC 9000 §4.1);
     %% empty until the handshake delivers them.
     peer_params = #{} :: roadrunner_quic_transport_params:params(),
-    %% Owner events accumulated while folding a datagram's frames, drained in
-    %% order at the end of handle_datagram (newest-first, reversed on drain).
+    %% Owner events and connection-id routing changes accumulated while
+    %% folding a datagram's frames, drained in order at the end of
+    %% handle_datagram (newest-first, reversed on drain), ahead of the sends.
     emits = [] :: [effect()],
     %% A locally-detected error to signal: {Level, WireErrorCode} for the one
     %% CONNECTION_CLOSE to transmit at that encryption level. `undefined` for a
@@ -311,6 +425,10 @@
     scid := binary(),
     peer_scid := binary(),
     peer := {inet:ip_address(), inet:port_number()},
+    reset_key := binary(),
+    %% The listener's registry, for the shell to route the ids the core
+    %% issues; the core itself never reads it.
+    registry => roadrunner_quic_cid_registry:t(),
     cert_chain := [binary()],
     priv_key := public_key:private_key(),
     alpn := binary(),
@@ -328,7 +446,11 @@
     {send, binary()}
     | {arm_timer, atom(), integer()}
     | {emit, pid(), event()}
-    | {reply, pid(), reference(), term()}.
+    | {reply, pid(), reference(), term()}
+    | {register_cid, binary()}
+    | {unregister_cid, binary()}
+    | {send_to, address(), binary()}
+    | {migrate, address()}.
 
 %% Async owner notifications (conn -> owner). `stream_data` carries the
 %% FIN-only end-of-stream as `{stream_data, Sid, <<>>, true}`. `closed` is the
@@ -366,6 +488,7 @@ new(
         scid := SCID,
         peer_scid := PeerSCID,
         peer := Peer,
+        reset_key := ResetKey,
         cert_chain := CertChain,
         priv_key := PrivKey,
         alpn := Alpn,
@@ -397,7 +520,12 @@ new(
         dcid = DCID,
         scid = SCID,
         peer_scid = PeerSCID,
+        cids = #{0 => SCID},
+        reset_key = ResetKey,
+        peer_cids = #{0 => PeerSCID},
+        rx_peer = Peer,
         peer = Peer,
+        path_dcid = SCID,
         tls = Tls,
         recv_keys = #{
             initial => roadrunner_quic_keys:for_connection(
@@ -440,6 +568,15 @@ peername(#state{peer = Peer}) ->
 phase(#state{phase = Phase}) ->
     Phase.
 
+-doc """
+The connection ids that route datagrams to this connection: the client's
+original Destination Connection ID and every id we issued that the client
+has not retired (RFC 9000 §5.1).
+""".
+-spec routes(t()) -> [binary()].
+routes(#state{dcid = DCID, cids = Cids}) ->
+    [DCID | maps:values(Cids)].
+
 %% The congestion window in bytes (RFC 9002 §7), for tests to observe its
 %% slow-start growth and on-loss backoff.
 -doc false.
@@ -452,24 +589,53 @@ cwnd(#state{cc = Cc}) ->
 %% =============================================================================
 
 -doc """
-Process one received UDP datagram: account it against the anti-
-amplification budget, decode and decrypt its packets, fold each packet's
-frames into the connection state, then run a send pass. Returns the new
-state and the effects to perform.
+Process one UDP datagram received from `Peer`: account it against the
+anti-amplification budget of the path it came on, decode and decrypt its
+packets, fold each packet's frames into the connection state, then run a
+send pass. Returns the new state and the effects to perform, led by
+`{migrate, NewPeer}` when the datagram moved the connection to a new path.
 """.
--spec handle_datagram(integer(), binary(), t()) -> {t(), [effect()]}.
-handle_datagram(Now, Datagram, State0) ->
-    #state{amp = Amp, recv_keys = RecvKeys, phase = Before, idle_timeout = IdleTimeout} =
-        State = expire_previous_keys(Now, State0),
-    State1 = State#state{
-        amp = roadrunner_quic_amp:received(byte_size(Datagram), Amp),
-        idle_deadline = Now + IdleTimeout
-    },
+-spec handle_datagram(integer(), address(), binary(), t()) -> {t(), [effect()]}.
+handle_datagram(Now, Peer, Datagram, State0) ->
+    #state{
+        amp = Amp,
+        recv_keys = RecvKeys,
+        phase = Before,
+        idle_timeout = IdleTimeout,
+        peer = Current,
+        probe_path = Probe
+    } = State = expire_previous_keys(Now, State0),
+    Size = byte_size(Datagram),
+    DCID = datagram_dcid(Datagram),
+    Deadline = Now + IdleTimeout,
+    %% Only bytes from an address count toward what may be sent to it (RFC
+    %% 9000 §8.1): a datagram from elsewhere leaves the current path's
+    %% budget alone.
+    State1 =
+        case Peer of
+            Current ->
+                State#state{
+                    amp = roadrunner_quic_amp:received(Size, Amp),
+                    idle_deadline = Deadline,
+                    rx_dcid = DCID,
+                    rx_peer = Peer,
+                    rx_size = Size
+                };
+            _ ->
+                State#state{
+                    probe_path = probe_received(Peer, Size, Probe),
+                    idle_deadline = Deadline,
+                    rx_dcid = DCID,
+                    rx_peer = Peer,
+                    rx_size = Size
+                }
+        end,
     Outcomes = roadrunner_quic_recv:datagram(
         Datagram, ?SCID_LEN, open_keys(Before, RecvKeys), largest_map(State1)
     ),
     State2 = lists:foldl(fun(O, S) -> process_outcome(Now, O, S) end, State1, Outcomes),
-    finish_datagram(Now, Before, release_held(Now, State2)).
+    {State3, Effects} = finish_datagram(Now, Before, release_held(Now, State2)),
+    {State3, peer_effects(Current, State3, Effects)}.
 
 %% The receive keys a datagram is opened with. Before the handshake completes
 %% the 1-RTT keys are withheld (RFC 9001 §5.7: a server MUST NOT process, nor
@@ -485,15 +651,36 @@ open_keys(_Phase, RecvKeys) -> RecvKeys.
 %% used once the handshake is complete), oldest first. Each opens against the
 %% receive state as it then stands, so its packet number is reconstructed
 %% from what was received before it, and a failed authentication counts
-%% toward the integrity limit only now (§6.6).
+%% toward the integrity limit only now (§6.6). Every held packet came from
+%% the handshake's address (process_outcome keeps no other), still the
+%% connection's, as nothing moves it before the handshake is confirmed; each
+%% is processed as received there, whatever address the datagram that
+%% released it came from, so none can move the connection (RFC 9000 §9: a
+%% client MUST NOT migrate before the handshake is confirmed, and these were
+%% sent before it was). The datagram's own receive context is put back after.
 -spec release_held(integer(), t()) -> t().
-release_held(Now, #state{phase = connected, held = [_ | _] = Held} = State) ->
-    lists:foldr(fun(Packet, S) -> open_held(Now, Packet, S) end, State#state{held = []}, Held);
+release_held(
+    Now,
+    #state{
+        phase = connected, held = [_ | _] = Held, peer = Peer, rx_peer = RxPeer, rx_dcid = RxDCID
+    } =
+        State
+) ->
+    Released = lists:foldr(
+        fun(Packet, S) -> open_held(Now, Packet, S) end,
+        State#state{held = [], rx_peer = Peer},
+        Held
+    ),
+    Released#state{rx_peer = RxPeer, rx_dcid = RxDCID};
 release_held(_Now, State) ->
     State.
 
+%% A held packet is processed as received with its own Destination
+%% Connection ID, which a RETIRE_CONNECTION_ID in it must not retire (RFC
+%% 9000 §19.16).
 -spec open_held(integer(), binary(), t()) -> t().
-open_held(Now, Packet, #state{recv_keys = RecvKeys} = State) ->
+open_held(Now, Packet, #state{recv_keys = RecvKeys} = State0) ->
+    State = State0#state{rx_dcid = datagram_dcid(Packet)},
     Outcomes = roadrunner_quic_recv:datagram(Packet, ?SCID_LEN, RecvKeys, largest_map(State)),
     lists:foldl(fun(O, S) -> held_outcome(Now, O, S) end, State, Outcomes).
 
@@ -507,6 +694,39 @@ held_outcome(_Now, {ok, #{generation := next}}, #state{phase = connected} = Stat
     connection_fatal(application, key_update_error, State);
 held_outcome(Now, Outcome, State) ->
     process_outcome(Now, Outcome, State).
+
+%% Count a datagram from the address the client probes from toward what may
+%% be sent there (RFC 9000 §8.1).
+-spec probe_received(
+    address(),
+    non_neg_integer(),
+    undefined | {address(), non_neg_integer(), roadrunner_quic_amp:t()}
+) -> undefined | {address(), non_neg_integer(), roadrunner_quic_amp:t()}.
+probe_received(Addr, Size, {Addr, Seq, Amp}) ->
+    {Addr, Seq, roadrunner_quic_amp:received(Size, Amp)};
+probe_received(_Addr, _Size, Probe) ->
+    Probe.
+
+%% Lead the effects with `{migrate, Peer}` when the call moved the
+%% connection to another address, so the shell sends every `{send, _}` of
+%% the call there.
+-spec peer_effects(address(), t(), [effect()]) -> [effect()].
+peer_effects(Peer, #state{peer = Peer}, Effects) ->
+    Effects;
+peer_effects(_Old, #state{peer = Peer}, Effects) ->
+    [{migrate, Peer} | Effects].
+
+%% The Destination Connection ID a datagram was sent to: that of its first
+%% packet, which every packet coalesced with it shares (RFC 9000 §12.2). A
+%% short header carries the server's fixed-length id; a header too short to
+%% hold one decodes to no packet at all.
+-spec datagram_dcid(binary()) -> binary().
+datagram_dcid(<<0:1, _:7, DCID:?SCID_LEN/binary, _/binary>>) ->
+    DCID;
+datagram_dcid(<<1:1, _:7, _Version:32, Len, DCID:Len/binary, _/binary>>) ->
+    DCID;
+datagram_dcid(_Datagram) ->
+    <<>>.
 
 %% After folding a datagram's frames: if a close fired during the fold,
 %% transmit our CONNECTION_CLOSE for a locally-detected error (RFC 9000
@@ -588,6 +808,12 @@ emit(_Event, #state{owner = undefined} = State) ->
     State;
 emit(Event, #state{owner = Owner, emits = Emits} = State) ->
     State#state{emits = [{emit, Owner, Event} | Emits]}.
+
+%% Queue a shell effect for the current datagram alongside the owner events:
+%% a connection-id routing change, performed ahead of the datagram's sends.
+-spec queue_effect(effect(), t()) -> t().
+queue_effect(Effect, #state{emits = Emits} = State) ->
+    State#state{emits = [Effect | Emits]}.
 
 %% Emit `{connected, Info}` exactly when this datagram drove the
 %% handshaking -> connected transition AND an owner is installed. With no
@@ -875,21 +1101,27 @@ process_outcome(_Now, {auth_failed, Level}, #state{auth_failures = Failures} = S
     auth_failed(Level, Failures + 1, State);
 process_outcome(_Now, {drop, _Reason}, State) ->
     State;
-process_outcome(Now, {held, Packet}, #state{phase = connected, held = Held} = State) ->
+process_outcome(
+    Now, {held, Packet}, #state{phase = connected, held = Held, rx_peer = Peer, peer = Peer} = State
+) ->
     %% A 1-RTT packet coalesced behind the Handshake packet whose Finished,
     %% earlier in this datagram, just completed the handshake (RFC 9001 §5.7
     %% suggests a client coalesce them so the server can process the 1-RTT
     %% packet at once): process it now, after any held from before.
     release_held(Now, State#state{held = [Packet | Held]});
-process_outcome(_Now, {held, Packet}, #state{held = Held} = State) when
+process_outcome(_Now, {held, Packet}, #state{held = Held, rx_peer = Peer, peer = Peer} = State) when
     length(Held) < ?HELD_LIMIT
 ->
     %% A 1-RTT packet ahead of the client Finished (RFC 9001 §5.7): keep it,
     %% unprocessed and unacknowledged, until the handshake completes.
     State#state{held = [Packet | Held]};
 process_outcome(_Now, {held, _Packet}, State) ->
-    %% The hold is full: drop it, as §5.7 also allows; the client resends
-    %% its frames once our acknowledgments show the packet lost.
+    %% The hold is full, or the packet came from an address other than the
+    %% handshake's: drop it, as §5.7 also allows. A 1-RTT packet held across
+    %% the handshake was sent before the client could confirm it, when a
+    %% client MUST NOT migrate (RFC 9000 §9), so one from elsewhere neither
+    %% moves the connection nor is answered there. The client resends its
+    %% frames once our acknowledgments show the packet lost.
     State;
 process_outcome(_Now, {frame_error, Level, protocol_violation}, State) ->
     %% A protocol violation the recv pipeline flagged after the packet
@@ -907,7 +1139,7 @@ process_outcome(_Now, {frame_error, Level, _Reason}, State) ->
 process_packet(Now, #{level := Level, pn := PN, frames := Frames}, #state{spaces = Spaces} = State) ->
     case Spaces of
         #{Level := _} ->
-            State1 = validate_on_handshake(Level, State),
+            State1 = on_path(Now, Level, PN, Frames, validate_on_handshake(Level, State)),
             State2 = lists:foldl(
                 fun(Frame, S) -> process_frame(Now, Level, Frame, S) end, State1, Frames
             ),
@@ -1175,10 +1407,10 @@ process_frame(
     %% open (RFC 9000 §19.11). One that does not raise it falls through to the
     %% catch-all below: limits only grow, so it MUST be ignored.
     State#state{peer_max_streams_uni = Max};
-process_frame(_Now, application, {retire_connection_id, Seq}, State) when Seq > 0 ->
-    %% RFC 9000 §19.16: the server never issues a connection ID past the
-    %% handshake's (sequence number 0), so a higher one was never sent.
-    connection_fatal(application, protocol_violation, State);
+process_frame(_Now, application, {retire_connection_id, Seq}, State) ->
+    retire_cid(Seq, State);
+process_frame(_Now, application, {new_connection_id, Seq, Prior, CID, _Token}, State) ->
+    new_peer_cid(Seq, Prior, CID, State);
 process_frame(_Now, _Level, padding, State) ->
     State;
 process_frame(_Now, _Level, ping, State) ->
@@ -1190,13 +1422,14 @@ process_frame(_Now, Level, {new_token, _Token}, State) ->
     %% Only a server sends NEW_TOKEN (RFC 9000 §19.7).
     connection_fatal(Level, protocol_violation, State);
 process_frame(_Now, application, {path_challenge, Data}, State) ->
-    %% RFC 9000 §8.2.2: answer with a PATH_RESPONSE echoing the challenge.
-    queue_frame(application, {path_response, Data}, State);
+    answer_challenge(Data, State);
+process_frame(Now, application, {path_response, Data}, State) ->
+    path_response(Now, Data, State);
 process_frame(_Now, application, _Frame, State) ->
     %% The other 1-RTT frames are accepted but not acted on: a MAX_STREAMS
     %% (bidi), since the server opens no bidirectional streams (RFC 9114 §6.1),
-    %% or (uni) that does not raise the limit (RFC 9000 §19.11), the BLOCKED
-    %% signals, the connection-id frames and PATH_RESPONSE.
+    %% or (uni) that does not raise the limit (RFC 9000 §19.11), and the
+    %% BLOCKED signals.
     State;
 process_frame(_Now, Level, _Frame, State) ->
     %% RFC 9000 §12.4 / §12.5: Initial and Handshake packets carry only
@@ -1229,6 +1462,562 @@ on_max_stream_data(Sid, Max, #state{streams = Streams} = State) ->
         #{} ->
             State
     end.
+
+%% =============================================================================
+%% Connection ids (RFC 9000 §5.1)
+%% =============================================================================
+
+%% Keep the client supplied with spare connection ids (RFC 9000 §5.1.1):
+%% issue fresh ones until as many are active as it accepts, its
+%% active_connection_id_limit (2 when absent, §18.2; the handshake's id
+%% counts), capped at ?ACTIVE_CID_LIMIT. Only a confirmed connection gets
+%% here: the handshake's confirmation issues the first spares, and a
+%% RETIRE_CONNECTION_ID, a 1-RTT frame, is held unprocessed until then (RFC
+%% 9001 §5.7).
+-spec issue_cids(t()) -> t().
+issue_cids(#state{cids = Cids, peer_params = PeerParams} = State) ->
+    Limit = maps:get(active_connection_id_limit, PeerParams, ?DEFAULT_ACTIVE_CID_LIMIT),
+    issue_cids(min(Limit, ?ACTIVE_CID_LIMIT) - map_size(Cids), State).
+
+-spec issue_cids(integer(), t()) -> t().
+issue_cids(Count, State) when Count > 0 ->
+    issue_cids(Count - 1, issue_cid(State));
+issue_cids(_Count, State) ->
+    State.
+
+%% Issue one connection id: a fresh random one of the fixed length (so short
+%% headers still demux, RFC 9000 §5.1, and nothing links it to the others)
+%% with the next sequence number, announced in a NEW_CONNECTION_ID that
+%% retires nothing, carrying its stateless reset token (§10.3.2). The
+%% register_cid effect rides ahead of the datagram's sends, so the id routes
+%% here before the client can learn it.
+-spec issue_cid(t()) -> t().
+issue_cid(#state{cids = Cids, next_cid_seq = Seq, reset_key = Key} = State) ->
+    CID = crypto:strong_rand_bytes(?SCID_LEN),
+    Token = roadrunner_quic_cid_registry:reset_token(Key, CID),
+    State1 = queue_effect(
+        {register_cid, CID}, State#state{cids = Cids#{Seq => CID}, next_cid_seq = Seq + 1}
+    ),
+    queue_frame(application, {new_connection_id, Seq, 0, CID, Token}, State1).
+
+%% The client retires one of our connection ids (RFC 9000 §19.16). A
+%% sequence number we never issued is a PROTOCOL_VIOLATION (a MUST). So is
+%% retiring the id the datagram itself was sent to, which the client MUST
+%% NOT do; §19.16 lets us treat it as one, and we do, since a client that
+%% retires the id it is using is left addressing an id it gave up. An id
+%% already retired (a retransmitted frame) changes nothing. Otherwise the id
+%% stops routing here and a replacement keeps the client supplied (§5.1.1).
+-spec retire_cid(non_neg_integer(), t()) -> t().
+retire_cid(Seq, #state{next_cid_seq = Next} = State) when Seq >= Next ->
+    connection_fatal(application, protocol_violation, State);
+retire_cid(Seq, #state{cids = Cids, rx_dcid = RxDCID} = State) ->
+    case Cids of
+        #{Seq := RxDCID} ->
+            connection_fatal(application, protocol_violation, State);
+        #{Seq := CID} ->
+            issue_cids(
+                queue_effect({unregister_cid, CID}, State#state{cids = maps:remove(Seq, Cids)})
+            );
+        #{} ->
+            State
+    end.
+
+%% A NEW_CONNECTION_ID from the client (RFC 9000 §19.15). A client that chose
+%% a zero-length connection id MUST NOT send one, so that is a
+%% PROTOCOL_VIOLATION. A repeat of a frame already processed changes nothing
+%% (§19.15 MUST NOT treat it as an error), while a sequence number reused for
+%% another id may be treated as a PROTOCOL_VIOLATION, and is. An id numbered
+%% below the largest Retire Prior To is retired at once (§19.15 MUST); a
+%% repeat of such a frame draws the RETIRE_CONNECTION_ID again, which the
+%% client ignores, rather than holding every such number. An id we retired
+%% on our own stays retired. Any other id joins the ids we may address, and
+%% then the ids below its Retire Prior To are retired (§5.1.2). More active
+%% ids than we advertised in active_connection_id_limit is a
+%% CONNECTION_ID_LIMIT_ERROR (§5.1.1 MUST).
+-spec new_peer_cid(non_neg_integer(), non_neg_integer(), binary(), t()) -> t().
+new_peer_cid(_Seq, _Prior, _CID, #state{peer_scid = <<>>} = State) ->
+    connection_fatal(application, protocol_violation, State);
+new_peer_cid(
+    Seq,
+    Prior,
+    CID,
+    #state{peer_cids = PeerCids, peer_retire_prior = Retired, peer_cids_retired = Dropped} = State
+) ->
+    case PeerCids of
+        #{Seq := CID} ->
+            State;
+        #{Seq := _Other} ->
+            connection_fatal(application, protocol_violation, State);
+        #{} when Seq < Retired ->
+            queue_frame(application, {retire_connection_id, Seq}, State);
+        #{} ->
+            case lists:member(Seq, Dropped) of
+                true -> State;
+                false -> add_peer_cid(Seq, Prior, CID, State)
+            end
+    end.
+
+-spec add_peer_cid(non_neg_integer(), non_neg_integer(), binary(), t()) -> t().
+add_peer_cid(Seq, Prior, CID, #state{peer_cids = PeerCids} = State) ->
+    State1 = retire_prior(Prior, State#state{peer_cids = PeerCids#{Seq => CID}}),
+    #state{peer_cids = Active, info = #{transport_params := OurParams}} = State1,
+    case maps:get(active_connection_id_limit, OurParams, ?DEFAULT_ACTIVE_CID_LIMIT) of
+        Limit when map_size(Active) > Limit ->
+            connection_fatal(application, connection_id_limit_error, State1);
+        _Limit ->
+            State1
+    end.
+
+%% Honour an increased Retire Prior To (RFC 9000 §5.1.2): stop using every
+%% client id numbered below it and retire each with a RETIRE_CONNECTION_ID.
+%% A path whose id goes stops being one we can return to or answer on. When
+%% the id we address is among them, the lowest-numbered id left that no
+%% other path uses takes over; the frame that raised the value carries one
+%% numbered at or above it, so one is always left. A Retire Prior To that
+%% does not increase the largest received is ignored (§19.15 MUST).
+-spec retire_prior(non_neg_integer(), t()) -> t().
+retire_prior(Prior, #state{peer_retire_prior = Retired} = State) when Prior =< Retired ->
+    State;
+retire_prior(
+    Prior,
+    #state{
+        peer_cids = PeerCids,
+        peer_cid_seq = Current,
+        peer_cids_retired = Dropped,
+        prev_path = Prev,
+        probe_path = Probe
+    } = State
+) ->
+    {Gone, Kept} = maps:fold(
+        fun
+            (Seq, _CID, {G, K}) when Seq < Prior -> {[Seq | G], K};
+            (Seq, CID, {G, K}) -> {G, K#{Seq => CID}}
+        end,
+        {[], #{}},
+        PeerCids
+    ),
+    State1 = lists:foldl(
+        fun(Seq, S) -> queue_frame(application, {retire_connection_id, Seq}, S) end,
+        State#state{
+            peer_cids = Kept,
+            peer_retire_prior = Prior,
+            peer_cids_retired = [Seq || Seq <- Dropped, Seq >= Prior],
+            prev_path = unless_retired(Prior, Prev),
+            probe_path = unless_retired(Prior, Probe)
+        },
+        Gone
+    ),
+    case Kept of
+        #{Current := _} -> State1;
+        #{} -> use_peer_cid(unused_peer_cid(State1), State1)
+    end.
+
+%% A path binding whose client id a Retire Prior To leaves alone.
+-spec unless_retired(non_neg_integer(), Path) -> Path | undefined when
+    Path :: undefined | tuple().
+unless_retired(Prior, {_Addr, Seq, _} = Path) when Seq >= Prior ->
+    Path;
+unless_retired(_Prior, _Path) ->
+    undefined.
+
+%% Address the current path with the client id numbered `Seq`.
+-spec use_peer_cid(non_neg_integer(), t()) -> t().
+use_peer_cid(Seq, #state{peer_cids = PeerCids} = State) ->
+    #{Seq := CID} = PeerCids,
+    State#state{peer_cid_seq = Seq, peer_scid = CID}.
+
+%% The lowest-numbered client id no path uses (RFC 9000 §9.5: an id is
+%% never used toward more than one address), or `none`.
+-spec unused_peer_cid(t()) -> non_neg_integer() | none.
+unused_peer_cid(#state{peer_cids = PeerCids} = State) ->
+    case [Seq || Seq <- lists:sort(maps:keys(PeerCids)), not peer_cid_bound(Seq, State)] of
+        [Seq | _] -> Seq;
+        [] -> none
+    end.
+
+%% Whether a path uses the client id numbered `Seq`.
+-spec peer_cid_bound(non_neg_integer(), t()) -> boolean().
+peer_cid_bound(Seq, #state{peer_cid_seq = Seq}) -> true;
+peer_cid_bound(Seq, #state{prev_path = {_Addr, Seq, _PathDcid}}) -> true;
+peer_cid_bound(Seq, #state{probe_path = {_Addr, Seq, _Amp}}) -> true;
+peer_cid_bound(_Seq, #state{}) -> false.
+
+%% Retire a client id no path uses any more (RFC 9000 §5.1.2: an endpoint
+%% SHOULD retire an id once it no longer uses the address it was used
+%% toward), which also asks the client for a replacement. An id another path
+%% still uses stays.
+-spec release_peer_cid(non_neg_integer(), t()) -> t().
+release_peer_cid(Seq, #state{peer_cids = PeerCids, peer_cids_retired = Dropped} = State) ->
+    case peer_cid_bound(Seq, State) of
+        true ->
+            State;
+        false ->
+            queue_frame(
+                application,
+                {retire_connection_id, Seq},
+                State#state{
+                    peer_cids = maps:remove(Seq, PeerCids), peer_cids_retired = [Seq | Dropped]
+                }
+            )
+    end.
+
+%% =============================================================================
+%% Paths and connection migration (RFC 9000 §8.2, §9)
+%% =============================================================================
+
+%% Follow the client to the address an authenticated 1-RTT packet came from
+%% (RFC 9000 §9.3). A packet from the current address, sent to the id the
+%% client uses there, changes nothing, which costs the common case two
+%% comparisons; one sent to another of our ids (the client may switch at any
+%% time, §5.1.2) makes that the id the current path uses. Only a confirmed
+%% connection moves (§9: a client MUST NOT migrate before), only on a
+%% non-probing packet (§9.1, §9.2), and only on the highest-numbered one
+%% received, so a reordered older packet never moves it back (§9.3).
+-spec on_path(integer(), level(), non_neg_integer(), [roadrunner_quic_frame:frame()], t()) -> t().
+on_path(
+    _Now,
+    _Level,
+    _PN,
+    _Frames,
+    #state{rx_peer = Peer, peer = Peer, rx_dcid = DCID, path_dcid = DCID} = State
+) ->
+    State;
+on_path(
+    _Now, application, PN, _Frames, #state{rx_peer = Peer, peer = Peer, rx_dcid = DCID} = State
+) ->
+    case highest_received(PN, State) of
+        true -> State#state{path_dcid = DCID};
+        false -> State
+    end;
+on_path(_Now, _Level, _PN, _Frames, #state{rx_peer = Peer, peer = Peer} = State) ->
+    State;
+on_path(Now, application, PN, Frames, #state{phase = connected} = State) ->
+    case lists:all(fun is_probing/1, Frames) orelse not highest_received(PN, State) of
+        true -> State;
+        false -> migrate(Now, State)
+    end;
+on_path(_Now, _Level, _PN, _Frames, State) ->
+    State.
+
+%% RFC 9000 §9.1: the probing frames; a packet of nothing else is a probing
+%% packet.
+-spec is_probing(roadrunner_quic_frame:frame()) -> boolean().
+is_probing({path_challenge, _Data}) -> true;
+is_probing({path_response, _Data}) -> true;
+is_probing({new_connection_id, _Seq, _Prior, _CID, _Token}) -> true;
+is_probing(padding) -> true;
+is_probing(_Frame) -> false.
+
+%% Whether a 1-RTT packet numbered `PN` is the highest-numbered received.
+-spec highest_received(non_neg_integer(), t()) -> boolean().
+highest_received(PN, State) ->
+    #space{ack = Ack} = space(application, State),
+    case roadrunner_quic_ack:largest(Ack) of
+        undefined -> true;
+        Largest -> PN > Largest
+    end.
+
+%% Move to the datagram's source address. Back on the last validated path,
+%% validation is skipped (RFC 9000 §9.3: an address validated before may
+%% be); a new address needs a client id never used toward another (§9.5),
+%% and with none to spare the connection stays where it is until the client
+%% provides one (§9.3).
+-spec migrate(integer(), t()) -> t().
+migrate(_Now, #state{rx_peer = Addr, prev_path = {Addr, _Seq, _PathDcid}} = State) ->
+    return_to_prev(State);
+migrate(Now, State) ->
+    case path_cid(State) of
+        none -> State;
+        Seq -> move_to(Now, Seq, State)
+    end.
+
+%% The client id to address the datagram's source address with: the one our
+%% answers to its probes there already carry, else one no path uses, else,
+%% when the client still addresses the id it used on the current path, the
+%% current one (RFC 9000 §9.5 MAY: an address change the client did not
+%% make, such as a NAT rebinding). A client that chose a zero-length id has
+%% only that one for every path. `none` when the address has no id to use.
+-spec path_cid(t()) -> non_neg_integer() | none.
+path_cid(#state{peer_scid = <<>>, peer_cid_seq = Seq}) ->
+    Seq;
+path_cid(#state{rx_peer = Addr, probe_path = {Addr, Seq, _Amp}}) ->
+    Seq;
+path_cid(#state{rx_dcid = RxDCID, path_dcid = RxDCID, peer_cid_seq = Current} = State) ->
+    case unused_peer_cid(State) of
+        none -> Current;
+        Seq -> Seq
+    end;
+path_cid(State) ->
+    unused_peer_cid(State).
+
+%% Move the connection to the datagram's source address, addressed with the
+%% client id numbered `Seq` (RFC 9000 §9.3 MUST: later packets go there),
+%% and start validating it (§9.3 MUST). Until then it may be sent three
+%% times what it sent (§9.3.1, §8.1), counting what it sent while probing.
+%% Leaving a validated path makes it the one to return to (§9.3.2) and
+%% challenges it too (§9.3.3 MUST), which draws a non-probing packet from a
+%% client still there, moving the connection back. Leaving a path still
+%% being validated abandons that validation (§9.3), keeps the last validated
+%% path as the one to return to, and retires the abandoned path's client id
+%% unless another path still uses it.
+-spec move_to(integer(), non_neg_integer(), t()) -> t().
+move_to(
+    Now,
+    Seq,
+    #state{
+        rx_peer = Addr,
+        rx_size = Size,
+        rx_dcid = RxDCID,
+        peer = Old,
+        peer_scid = OldDCID,
+        peer_cid_seq = OldSeq,
+        path_dcid = OldPathDcid,
+        validation = Validation,
+        probe_path = Probe
+    } = State
+) ->
+    {Amp, Probe1} =
+        case Probe of
+            {Addr, _Seq, ProbeAmp} -> {ProbeAmp, undefined};
+            _ -> {roadrunner_quic_amp:received(Size, roadrunner_quic_amp:new()), Probe}
+        end,
+    Moved = use_peer_cid(Seq, State#state{
+        peer = Addr, path_dcid = RxDCID, amp = Amp, probe_path = Probe1
+    }),
+    State1 =
+        case Validation of
+            undefined ->
+                queue_path(
+                    {validated, Old, OldDCID},
+                    [{path_challenge, crypto:strong_rand_bytes(8)}],
+                    Moved#state{prev_path = {Old, OldSeq, OldPathDcid}}
+                );
+            #validation{} ->
+                release_peer_cid(OldSeq, Moved)
+        end,
+    start_validation(Now, address, State1).
+
+%% Back to the last validated path, as it was (RFC 9000 §9.3.2, §9.3): the
+%% address, the client id and the lifted anti-amplification limit; the
+%% congestion controller and RTT estimate were never reset for the path
+%% left, which is abandoned and its client id retired unless another path
+%% uses it.
+-spec return_to_prev(t()) -> t().
+return_to_prev(#state{prev_path = {Addr, Seq, PathDcid}, peer_cid_seq = Left} = State) ->
+    Returned = use_peer_cid(Seq, State#state{
+        peer = Addr,
+        path_dcid = PathDcid,
+        amp = roadrunner_quic_amp:validate(roadrunner_quic_amp:new()),
+        validation = undefined,
+        prev_path = undefined
+    }),
+    release_peer_cid(Left, Returned).
+
+%% Start (or restart, for the path MTU) the validation of the current path
+%% with a fresh PATH_CHALLENGE (RFC 9000 §8.2.1). A challenge goes out again
+%% every interval, no more often than a probe timeout would allow (§9.4
+%% MUST NOT be more aggressive, §8.2.1 SHOULD NOT exceed the Initial
+%% cadence), and the validation is abandoned after three intervals: three
+%% times the larger of the current probe timeout and one from the initial
+%% RTT (§8.2.4).
+-spec start_validation(integer(), address | mtu, t()) -> t().
+start_validation(Now, Stage, State) ->
+    #space{loss = Loss} = space(application, State),
+    Interval = max(
+        roadrunner_quic_loss:get_pto(Loss),
+        roadrunner_quic_loss:get_pto(roadrunner_quic_loss:new(#{}))
+    ),
+    queue_challenge(State#state{
+        validation = #validation{
+            stage = Stage,
+            next_at = Now + Interval,
+            abandon_at = Now + 3 * Interval,
+            interval = Interval
+        }
+    }).
+
+-spec queue_challenge(t()) -> t().
+queue_challenge(#state{path_out = Out} = State) ->
+    State#state{path_out = [challenge | Out]}.
+
+-spec queue_path(path(), [roadrunner_quic_frame:frame()], t()) -> t().
+queue_path(Path, Frames, #state{path_out = Out} = State) ->
+    State#state{path_out = [{Path, Frames} | Out]}.
+
+%% RFC 9000 §8.2.2: answer a PATH_CHALLENGE with a PATH_RESPONSE echoing
+%% it, on the path it arrived on (MUST). From an address the connection is
+%% not on, the answer is a probing packet there (§9.1), addressed with a
+%% client id kept for that address (§9.5), and dropped when the client left
+%% none for it.
+-spec answer_challenge(binary(), t()) -> t().
+answer_challenge(Data, #state{rx_peer = Peer, peer = Peer} = State) ->
+    queue_path(current, [{path_response, Data}], State);
+answer_challenge(
+    Data, #state{rx_peer = Addr, prev_path = {Addr, Seq, _PathDcid}, peer_cids = PeerCids} = State
+) ->
+    #{Seq := DCID} = PeerCids,
+    queue_path({validated, Addr, DCID}, [{path_response, Data}], State);
+answer_challenge(Data, State) ->
+    case probe_path(State) of
+        none -> State;
+        State1 -> queue_path(probe, [{path_response, Data}], State1)
+    end.
+
+%% Keep a client id for the address the client probes from (RFC 9000 §9.5),
+%% with an anti-amplification account of its own (§8.1) that this datagram
+%% opens. A new probing address takes over from the last one, whose id is
+%% retired unless another path uses it.
+-spec probe_path(t()) -> t() | none.
+probe_path(#state{rx_peer = Addr, probe_path = {Addr, _Seq, _Amp}} = State) ->
+    State;
+probe_path(#state{rx_peer = Addr, rx_size = Size, probe_path = Old} = State) ->
+    case path_cid(State) of
+        none ->
+            none;
+        Seq ->
+            Amp = roadrunner_quic_amp:received(Size, roadrunner_quic_amp:new()),
+            Bound = State#state{probe_path = {Addr, Seq, Amp}},
+            case Old of
+                {_OldAddr, OldSeq, _OldAmp} -> release_peer_cid(OldSeq, Bound);
+                undefined -> Bound
+            end
+    end.
+
+%% A PATH_RESPONSE echoing a challenge the current path's validation sent
+%% validates it (RFC 9000 §8.2.3), whatever path it arrives on. One answering
+%% a challenge whose datagram reached 1200 bytes validates the path MTU too;
+%% one answering a smaller challenge validates only the address, and a
+%% second validation with an expanded datagram follows (§8.2.1 MUST). Any
+%% other response, such as one to a challenge of an abandoned validation, is
+%% ignored rather than closing the connection (§19.18 MAY).
+-spec path_response(integer(), binary(), t()) -> t().
+path_response(Now, Data, #state{validation = #validation{sent = Sent, stage = Stage}} = State) ->
+    case lists:keyfind(Data, 1, Sent) of
+        {Data, true} ->
+            path_validated(Now, Stage, State);
+        {Data, false} when Stage =:= address ->
+            start_validation(Now, mtu, confirm_address(Now, State));
+        _ ->
+            State
+    end;
+path_response(_Now, _Data, State) ->
+    State.
+
+%% The current path is validated: the last validated path is no longer the
+%% one to return to, and its client id is retired unless a path uses it.
+-spec path_validated(integer(), address | mtu, t()) -> t().
+path_validated(Now, address, State) ->
+    path_validated(Now, mtu, confirm_address(Now, State));
+path_validated(_Now, mtu, #state{prev_path = Prev} = State) ->
+    Validated = State#state{validation = undefined, prev_path = undefined},
+    case Prev of
+        {_Addr, Seq, _PathDcid} -> release_peer_cid(Seq, Validated);
+        undefined -> Validated
+    end.
+
+%% The client owns its new address: lift the anti-amplification limit
+%% (RFC 9000 §8.1), and start the congestion controller and RTT estimate
+%% over for the new path (§9.4 MUST), unless only the port changed, which a
+%% NAT rebinding usually causes and §9.4 lets the path keep both for.
+-spec confirm_address(integer(), t()) -> t().
+confirm_address(Now, #state{amp = Amp, peer = {Ip, _Port}, prev_path = Prev} = State) ->
+    Confirmed = State#state{amp = roadrunner_quic_amp:validate(Amp)},
+    case Prev of
+        {{Ip, _PrevPort}, _Seq, _PathDcid} ->
+            Confirmed;
+        _ ->
+            #space{loss = Loss} = Space = space(application, Confirmed),
+            put_space(
+                application,
+                Space#space{loss = roadrunner_quic_loss:reset_rtt(Now, Loss)},
+                Confirmed#state{cc = roadrunner_quic_cc_newreno:new_path(Now)}
+            )
+    end.
+
+%% Send one queued probing packet ahead of the send pass's other packets. A
+%% `challenge` is a fresh PATH_CHALLENGE (RFC 9000 §8.2.1 MUST: unpredictable
+%% data, a different payload each time, §13.3) on the current path, recorded
+%% so its response validates the path.
+-spec send_path(integer(), challenge | {path(), [roadrunner_quic_frame:frame()]}, t(), [effect()]) ->
+    {t(), [effect()]}.
+send_path(Now, challenge, #state{validation = #validation{sent = Sent} = V} = State, Acc) ->
+    Data = crypto:strong_rand_bytes(8),
+    case path_packet(Now, current, [{path_challenge, Data}], State) of
+        {Datagram, State1} ->
+            Expanded = byte_size(Datagram) >= ?MIN_PATH_DATAGRAM,
+            {State1#state{validation = V#validation{sent = [{Data, Expanded} | Sent]}}, [
+                {send, Datagram} | Acc
+            ]};
+        none ->
+            {State, Acc}
+    end;
+send_path(Now, {Path, Frames}, State, Acc) ->
+    case path_packet(Now, Path, Frames, State) of
+        {Datagram, State1} -> {State1, [path_send(Path, Datagram, State1) | Acc]};
+        none -> {State, Acc}
+    end.
+
+-spec path_send(path(), binary(), t()) -> effect().
+path_send(current, Datagram, _State) ->
+    {send, Datagram};
+path_send({validated, Addr, _DCID}, Datagram, _State) ->
+    {send_to, Addr, Datagram};
+path_send(probe, Datagram, #state{probe_path = {Addr, _Seq, _Amp}}) ->
+    {send_to, Addr, Datagram}.
+
+%% Build a probing packet for a path: one 1-RTT packet of its frames,
+%% expanded to fill a 1200-byte datagram (RFC 9000 §8.2.1, §8.2.2) as far as
+%% the path's anti-amplification limit allows (MUST NOT exceed it), and
+%% dropped if even the bare packet would exceed it. On the current path it
+%% counts like any packet; on another it is kept out of the bytes in flight,
+%% so its loss neither shrinks the current path's congestion window nor
+%% arms a probe timeout there (§9.4 lets probe packets be excepted). `none`
+%% when the probing address has lost its client id since the packet was
+%% queued (a Retire Prior To in the same packet).
+-spec path_packet(integer(), path(), [roadrunner_quic_frame:frame()], t()) ->
+    {binary(), t()} | none.
+path_packet(Now, Path, Frames, #state{scid = SCID, sealed = Sealed} = State) ->
+    case path_target(Path, State) of
+        none ->
+            none;
+        {DCID, Budget} ->
+            #space{next_pn = PN} = Space = space(application, State),
+            Entry = (entry(application, Frames, PN, State))#{
+                pad_to => min(?MIN_PATH_DATAGRAM, Budget)
+            },
+            {Datagram, [Sent]} = roadrunner_quic_send:datagram(#{application => Entry}, DCID, SCID),
+            case byte_size(Datagram) =< Budget of
+                true ->
+                    State1 = put_space(
+                        application, Space#space{next_pn = PN + 1}, State#state{sealed = Sealed + 1}
+                    ),
+                    {Datagram, path_sent(Now, Path, Sent, byte_size(Datagram), State1)};
+                false ->
+                    none
+            end
+    end.
+
+%% The client id and anti-amplification budget for a path's probing packet.
+-spec path_target(path(), t()) -> {binary(), non_neg_integer() | infinity} | none.
+path_target(current, #state{peer_scid = DCID, amp = Amp}) ->
+    {DCID, roadrunner_quic_amp:budget(Amp)};
+path_target({validated, _Addr, DCID}, #state{}) ->
+    {DCID, infinity};
+path_target(probe, #state{probe_path = {_Addr, Seq, Amp}, peer_cids = PeerCids}) ->
+    #{Seq := DCID} = PeerCids,
+    {DCID, roadrunner_quic_amp:budget(Amp)};
+path_target(_Path, #state{}) ->
+    none.
+
+-spec path_sent(integer(), path(), roadrunner_quic_send:sent(), non_neg_integer(), t()) -> t().
+path_sent(Now, current, Sent, Size, #state{amp = Amp} = State) ->
+    record_one_sent(Now, Sent, State#state{amp = roadrunner_quic_amp:sent(Size, Amp)});
+path_sent(Now, {validated, _Addr, _DCID}, Sent, _Size, State) ->
+    record_one_sent(Now, Sent#{ack_eliciting := false}, State);
+path_sent(Now, probe, Sent, Size, #state{probe_path = {Addr, Seq, Amp}} = State) ->
+    record_one_sent(Now, Sent#{ack_eliciting := false}, State#state{
+        probe_path = {Addr, Seq, roadrunner_quic_amp:sent(Size, Amp)}
+    }).
 
 %% Reassemble CRYPTO, deframe complete handshake messages, and drive the
 %% TLS sequencer. A frame reaching more than ?CRYPTO_BUFFER_LIMIT bytes past
@@ -1328,9 +2117,10 @@ process_handshake(handshake, {?FINISHED, Body}, #state{tls = Tls} = State) ->
         ok ->
             %% Handshake confirmed: discard the Handshake space (RFC 9001
             %% §4.9.2), become connected, and send HANDSHAKE_DONE at the
-            %% application level.
+            %% application level, with the spare connection ids the client
+            %% may move to (RFC 9000 §5.1.1).
             State1 = discard_space(handshake, State#state{phase = connected}),
-            queue_frame(application, handshake_done, State1);
+            queue_frame(application, handshake_done, issue_cids(State1));
         {error, Reason} ->
             connection_fatal(handshake, Reason, State)
     end;
@@ -1437,7 +2227,8 @@ apply_ack(Now, Level, Ack, Space, #state{cc = Cc} = State) ->
             put_space(
                 Level,
                 Space#space{
-                    loss = Loss, pending = lists:reverse(retransmittable(Lost), Space#space.pending)
+                    loss = Loss,
+                    pending = lists:reverse(retransmittable(Lost, State), Space#space.pending)
                 },
                 State#state{cc = Cc1}
             )
@@ -1674,7 +2465,8 @@ close_code(Reason) when
     Reason =:= frame_encoding_error;
     Reason =:= transport_parameter_error;
     Reason =:= key_update_error;
-    Reason =:= aead_limit_reached
+    Reason =:= aead_limit_reached;
+    Reason =:= connection_id_limit_error
 ->
     roadrunner_quic_error:code_int(Reason);
 close_code(unexpected_message) ->
@@ -2014,6 +2806,12 @@ drain_send(Now, Levels, #state{sealed = Sealed, phase = Phase} = State0, Acc) ->
     end.
 
 -spec drain_built(integer(), [level()], t(), [effect()]) -> {t(), [effect()]}.
+drain_built(Now, Levels, #state{path_out = [Path | Rest]} = State, Acc) ->
+    %% A queued probing packet goes first, through the same key-limit check
+    %% as every packet; it bypasses the congestion window, like a probe
+    %% (RFC 9002 §7.5), so a path validation never waits on it.
+    {State1, Acc1} = send_path(Now, Path, State#state{path_out = Rest}, Acc),
+    drain_send(Now, Levels, State1, Acc1);
 drain_built(Now, Levels, State, Acc) ->
     case build_first(Levels, Now, State) of
         none ->
@@ -2376,7 +3174,11 @@ space (queueing any lost frames to retransmit), backs off the probe timeout
 progress), queues a probe in every space with packets in flight, then runs a
 send pass that lets the probes past the congestion window. An idle timeout
 (`idle`) silently closes the connection (RFC 9000 §10.1, no CONNECTION_CLOSE)
-and surfaces the terminal `{closed, _}` event to the owner.
+and surfaces the terminal `{closed, _}` event to the owner. A path timeout
+(`path`) sends the validation of the current path another PATH_CHALLENGE,
+or gives the validation up (RFC 9000 §8.2.4), returning to the last
+validated path (§9.3.2, led by `{migrate, Peer}`) or, with none, closing
+silently.
 """.
 -spec handle_timeout(integer(), atom(), t()) -> {t(), [effect()]}.
 handle_timeout(Now, pto, State) ->
@@ -2384,19 +3186,16 @@ handle_timeout(Now, pto, State) ->
     {State2, Effects} = send_pass(Now, State1),
     {State2#state{probes = 0}, Effects};
 handle_timeout(_Now, idle, State) ->
-    %% Release any parked send reply before the shell tears down, so a parked
-    %% worker unblocks and runs its disconnect path cleanly rather than only
-    %% crashing on the conn-process exit its monitor sees.
-    {State1, Releases} = release_all({error, closed}, State),
-    {State2, EmitEffects} = drain_emits(
-        emit({closed, {local, idle_timeout}}, State1#state{phase = closed})
-    ),
-    {State2, Releases ++ EmitEffects};
-handle_timeout(_Now, ack, #state{phase = Phase} = State) when
-    Phase =:= closed; Phase =:= draining
+    close_silently(idle_timeout, State);
+handle_timeout(_Now, Kind, #state{phase = Phase} = State) when
+    Kind =:= ack orelse Kind =:= path, Phase =:= closed orelse Phase =:= draining
 ->
-    %% A closing connection sends nothing more, a delayed ACK included.
+    %% A closing connection sends nothing more, a delayed ACK or a path
+    %% challenge included.
     {State, []};
+handle_timeout(Now, path, #state{peer = Peer} = State) ->
+    {State1, Effects} = path_timeout(Now, State),
+    {State1, peer_effects(Peer, State1, Effects)};
 handle_timeout(Now, ack, State) ->
     %% A delayed ACK's wait ran out with no packet to carry it: send it now.
     send_pass(Now, State);
@@ -2404,6 +3203,44 @@ handle_timeout(_Now, drain, State) ->
     %% The drain window elapsed (RFC 9000 §10.2): become closed so the shell
     %% tears the connection down. The owner already learned of the close on entry.
     {State#state{phase = closed}, []}.
+
+%% Close without a CONNECTION_CLOSE and surface the terminal `{closed, _}`
+%% event to the owner. Any parked send reply is released before the shell
+%% tears down, so a parked worker unblocks and runs its disconnect path
+%% cleanly rather than only crashing on the conn-process exit its monitor
+%% sees.
+-spec close_silently(atom(), t()) -> {t(), [effect()]}.
+close_silently(Reason, State) ->
+    {State1, Releases} = release_all({error, closed}, State),
+    {State2, EmitEffects} = drain_emits(
+        emit({closed, {local, Reason}}, State1#state{phase = closed})
+    ),
+    {State2, Releases ++ EmitEffects}.
+
+%% The current path's validation timer (RFC 9000 §8.2.4). Past the abandon
+%% time the validation fails: back to the last validated path (§9.3.2 MUST),
+%% or, with no such path left, a silent close (§9.3.2 MUST). Before it,
+%% another PATH_CHALLENGE goes out. A timer that outlived the validation
+%% only re-arms.
+-spec path_timeout(integer(), t()) -> {t(), [effect()]}.
+path_timeout(Now, #state{validation = #validation{abandon_at = At}, prev_path = Prev} = State) when
+    Now >= At
+->
+    case Prev of
+        {_Addr, _Seq, _PathDcid} -> send_pass(Now, return_to_prev(State));
+        undefined -> close_silently(no_viable_path, State)
+    end;
+path_timeout(
+    Now,
+    #state{validation = #validation{next_at = Next, abandon_at = At, interval = Interval} = V} =
+        State
+) when Now >= Next ->
+    send_pass(
+        Now,
+        queue_challenge(State#state{validation = V#validation{next_at = min(Now + Interval, At)}})
+    );
+path_timeout(Now, State) ->
+    send_pass(Now, State).
 
 %% On a probe timeout: queue any time-threshold losses to retransmit, feed
 %% them to congestion control as a congestion event the same as ACK-detected
@@ -2420,11 +3257,13 @@ on_pto(Now, Level, #state{probes = Probes, cc = Cc} = State) ->
     #space{loss = Loss0, pending = Pending} = Space = space(Level, State),
     {Loss1, Lost} = roadrunner_quic_loss:detect_lost(Now, Loss0),
     Loss2 = roadrunner_quic_loss:on_pto_expired(Loss1),
-    Space1 = Space#space{loss = Loss2, pending = lists:reverse(retransmittable(Lost), Pending)},
+    Space1 = Space#space{
+        loss = Loss2, pending = lists:reverse(retransmittable(Lost, State), Pending)
+    },
     State1 = State#state{cc = apply_cc_signal(roadrunner_quic_loss:cc_signal(Loss1), Now, Cc)},
     case roadrunner_quic_loss:bytes_in_flight(Loss0) of
         0 -> put_space(Level, Space1, State1);
-        _ -> put_space(Level, probe(Space1), State1#state{probes = Probes + 1})
+        _ -> put_space(Level, probe(Space1, State1), State1#state{probes = Probes + 1})
     end.
 
 %% With nothing found lost, probe with the oldest unacknowledged data rather
@@ -2432,13 +3271,13 @@ on_pto(Now, Level, #state{probes = Probes, cc = Cc} = State) ->
 %% carries what the peer is missing, instead of only drawing the ACK that
 %% shows it lost and costing a round trip more. A PING only when no such data
 %% is in flight.
--spec probe(#space{}) -> #space{}.
-probe(#space{pending = [], loss = Loss} = Space) ->
-    case retransmittable(roadrunner_quic_loss:oldest_ack_eliciting(Loss)) of
+-spec probe(#space{}, t()) -> #space{}.
+probe(#space{pending = [], loss = Loss} = Space, State) ->
+    case retransmittable(roadrunner_quic_loss:oldest_ack_eliciting(Loss), State) of
         [] -> Space#space{pending = [ping]};
         Resend -> Space#space{pending = Resend}
     end;
-probe(Space) ->
+probe(Space, _State) ->
     Space.
 
 %% Arm ONE timer at the nearest deadline: the earliest per-space probe timeout
@@ -2451,13 +3290,22 @@ timer_effects(State) ->
     {Kind, AtMs} = earliest_deadline(State),
     [{arm_timer, Kind, AtMs}].
 
--spec earliest_deadline(t()) -> {pto | idle | ack, integer()}.
-earliest_deadline(#state{idle_deadline = Idle} = State) ->
-    Nearest =
+-spec earliest_deadline(t()) -> {pto | idle | ack | path, integer()}.
+earliest_deadline(#state{idle_deadline = Idle, validation = Validation} = State) ->
+    Timed =
         case earliest_pto(State) of
             undefined -> {idle, Idle};
             PtoAt when PtoAt =< Idle -> {pto, PtoAt};
             _PtoAt -> {idle, Idle}
+        end,
+    %% A path validation in progress challenges again on its own timer, which
+    %% wins a tie: the probe timeout due with it re-arms at once after it.
+    Nearest =
+        case {Validation, Timed} of
+            {#validation{next_at = PathAt}, {_TimedKind, TimedAt}} when PathAt =< TimedAt ->
+                {path, PathAt};
+            _ ->
+                Timed
         end,
     case {ack_deadline(State), Nearest} of
         {AckAt, {_Kind, At}} when is_integer(AckAt), AckAt < At -> {ack, AckAt};
@@ -2535,17 +3383,25 @@ min_defined(A, B) -> min(A, B).
 
 %% Flatten the per-packet frame lists a loss returns and keep only the
 %% frames worth resending: ACK / PADDING / CONNECTION_CLOSE are regenerated
-%% fresh or terminal, never replayed (RFC 9002 §13.3), and a PATH_RESPONSE
+%% fresh or terminal, never replayed (RFC 9002 §13.3), a PATH_RESPONSE
 %% answers one PATH_CHALLENGE once, on the path it arrived on (RFC 9000
-%% §13.3).
+%% §13.3), a PATH_CHALLENGE goes out again from the validation timer with
+%% new data (§13.3), and a NEW_CONNECTION_ID is resent with the same
+%% sequence number only while the client has not retired that id (§13.3).
 %% `roadrunner_quic_send:ack_eliciting/1` is the single source of truth for
 %% which frames are ack-eliciting. Callers fold the result onto the existing
 %% pending list with `lists:reverse/2` (order within the flushed packet is
 %% irrelevant), so no list append is needed.
--spec retransmittable([[roadrunner_quic_frame:frame()]]) -> [roadrunner_quic_frame:frame()].
-retransmittable(Lost) ->
-    [Frame || Frame <- lists:append(Lost), is_retransmittable(Frame)].
+-spec retransmittable([[roadrunner_quic_frame:frame()]], t()) -> [roadrunner_quic_frame:frame()].
+retransmittable(Lost, State) ->
+    [Frame || Frame <- lists:append(Lost), is_retransmittable(Frame, State)].
 
--spec is_retransmittable(roadrunner_quic_frame:frame()) -> boolean().
-is_retransmittable({path_response, _Data}) -> false;
-is_retransmittable(Frame) -> roadrunner_quic_send:is_ack_eliciting(Frame).
+-spec is_retransmittable(roadrunner_quic_frame:frame(), t()) -> boolean().
+is_retransmittable({path_response, _Data}, _State) ->
+    false;
+is_retransmittable({path_challenge, _Data}, _State) ->
+    false;
+is_retransmittable({new_connection_id, Seq, _Prior, _CID, _Token}, #state{cids = Cids}) ->
+    is_map_key(Seq, Cids);
+is_retransmittable(Frame, _State) ->
+    roadrunner_quic_send:is_ack_eliciting(Frame).

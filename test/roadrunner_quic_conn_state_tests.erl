@@ -21,7 +21,19 @@
 -define(SCID, <<8, 7, 6, 5, 4, 3, 2, 1>>).
 -define(CLIENT_SCID, <<11, 12, 13, 14, 15, 16, 17, 18>>).
 -define(PEER, {{127, 0, 0, 1}, 12345}).
+%% Addresses a client moves to: the same IP on another port (a NAT
+%% rebinding's usual change), and another IP.
+-define(PEER2, {{127, 0, 0, 1}, 23456}).
+-define(PEER3, {{10, 0, 0, 2}, 34567}).
+%% A spare connection id the client gives the server.
+-define(CLIENT_SPARE, <<21:64>>).
+%% A path validation started at ?NOW challenges again each interval (the
+%% probe timeout from the initial RTT, 1022 ms) and gives up after three.
+-define(RECHALLENGE_AT, ?NOW + 1100).
+-define(ABANDON_AT, ?NOW + 10000).
 -define(NOW, 1000).
+%% The stateless reset key the issued connection ids' tokens derive from.
+-define(RESET_KEY, <<7:256>>).
 %% Must match roadrunner_quic_conn_state's ?IDLE_TIMEOUT default.
 -define(IDLE_TIMEOUT, 30000).
 %% Advertised receive windows (RFC 9000 §4.1), deliberately small and distinct
@@ -162,7 +174,9 @@ assert_hello_retry_request_reaches_connected(Suite, Hash) ->
         client_scid => ?CLIENT_SCID,
         cipher_suites => [Suite]
     }),
-    {State1, Effects1} = ?M:handle_datagram(?NOW, initial_datagram(0, 0, ClientHello1), State0),
+    {State1, Effects1} = ?M:handle_datagram(
+        ?NOW, ?PEER, initial_datagram(0, 0, ClientHello1), State0
+    ),
     ?assertEqual(handshaking, ?M:phase(State1)),
     InitialKeys = #{initial => roadrunner_quic_keys:initial_server(?DCID)},
     [{crypto, 0, HelloRetryRequest}] =
@@ -183,7 +197,7 @@ assert_hello_retry_request_reaches_connected(Suite, Hash) ->
         cipher_suites => [Suite]
     }),
     Datagram2 = initial_datagram(1, byte_size(ClientHello1), ClientHello2),
-    {State2, Effects2} = ?M:handle_datagram(?NOW, Datagram2, State1),
+    {State2, Effects2} = ?M:handle_datagram(?NOW, ?PEER, Datagram2, State1),
     [{crypto, ServerHelloOffset, _}] =
         [
             F
@@ -206,7 +220,7 @@ assert_hello_retry_request_reaches_connected(Suite, Hash) ->
 client_hello_after_flight_closes_test() ->
     #{state1 := State1, ch_framed := ClientHello} = connect(),
     Datagram = initial_datagram(1, byte_size(ClientHello), ClientHello),
-    {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State1)),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State1)),
     ?assertEqual(closed, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, unexpected_message}}}], emits(Effects)),
     ?assertMatch([{connection_close, transport, 16#010a, 0, <<>>}], initial_close_frames(Effects)).
@@ -254,7 +268,7 @@ client_ack_processed_test() ->
         ?DCID,
         ?SCID
     ),
-    {State2, _Effects} = ?M:handle_datagram(?NOW, Datagram, State1),
+    {State2, _Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State1),
     ?assertEqual(handshaking, ?M:phase(State2)).
 
 ack_for_unsent_packet_closes_test() ->
@@ -269,7 +283,7 @@ ack_for_unsent_packet_closes_test() ->
         ?DCID,
         ?SCID
     ),
-    {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State1)),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State1)),
     ?assertEqual(closed, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
 
@@ -285,7 +299,7 @@ negative_ack_range_closes_test() ->
         ?DCID,
         ?SCID
     ),
-    {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State1)),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State1)),
     ?assertEqual(closed, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, frame_encoding_error}}}], emits(Effects)).
 
@@ -296,7 +310,7 @@ ping_and_padding_frames_handled_test() ->
     Datagram = ?TC:seal(
         initial, 1, roadrunner_quic_keys:initial_client(?DCID), [ping], ?DCID, ?SCID
     ),
-    {State2, _Effects} = ?M:handle_datagram(?NOW, Datagram, State1),
+    {State2, _Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State1),
     ?assertEqual(handshaking, ?M:phase(State2)).
 
 %% =============================================================================
@@ -309,7 +323,15 @@ undecryptable_packet_dropped_test() ->
     {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
     WrongKeys = #{key => {aes_128_gcm, <<0:128>>}, iv => <<0:96>>, hp => {aes_128_ecb, <<0:128>>}},
     Datagram = ?TC:seal(initial, 0, WrongKeys, [{crypto, 0, ~"hello"}], ?DCID, ?SCID),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, State0),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State0),
+    ?assertEqual(handshaking, ?M:phase(State1)),
+    ?assertEqual([], sends(Effects)).
+
+truncated_datagram_dropped_test() ->
+    %% A short header too short to hold the server's connection id carries
+    %% no packet; the connection neither advances nor replies.
+    {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, <<16#40, 1, 2, 3>>, State0),
     ?assertEqual(handshaking, ?M:phase(State1)),
     ?assertEqual([], sends(Effects)).
 
@@ -326,7 +348,7 @@ malformed_frame_closes_test() ->
         ?DCID,
         ?SCID
     ),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State0)),
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, frame_encoding_error}}}], emits(Effects)).
 
@@ -345,7 +367,7 @@ reserved_bits_close_with_protocol_violation_test() ->
         ?DCID,
         ?SCID
     ),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State0)),
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)),
     Frames = ?TC:frames(
@@ -365,7 +387,9 @@ packet_for_discarded_space_ignored_test() ->
     HsKeys = roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientHsSecret),
     Finished = ?TC:seal(handshake, 0, HsKeys, [{crypto, 0, ClientFinished}], ?DCID, ?SCID),
     Trailing = ?TC:seal(handshake, 1, HsKeys, [ping], ?DCID, ?SCID),
-    {State2, _Effects} = ?M:handle_datagram(?NOW, <<Finished/binary, Trailing/binary>>, State1),
+    {State2, _Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, <<Finished/binary, Trailing/binary>>, State1
+    ),
     ?assertEqual(connected, ?M:phase(State2)).
 
 tampered_client_finished_closes_test() ->
@@ -376,7 +400,7 @@ tampered_client_finished_closes_test() ->
     Tampered = <<Type, Len:24, (First bxor 1), Rest/binary>>,
     HsKeys = roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientHsSecret),
     Datagram = ?TC:seal(handshake, 0, HsKeys, [{crypto, 0, Tampered}], ?DCID, ?SCID),
-    {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State1)),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State1)),
     ?assertEqual(closed, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, handshake_failure}}}], emits(Effects)).
 
@@ -387,7 +411,7 @@ malformed_client_hello_closes_test() ->
     Datagram = ?TC:seal(
         initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Garbage}], ?DCID, ?SCID
     ),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State0)),
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, malformed_client_hello}}}], emits(Effects)),
     %% The CONNECTION_CLOSE is transmitted at the Initial level (a TLS error
@@ -409,7 +433,7 @@ initial_scid_mismatch_closes_test() ->
     Datagram = ?TC:seal(
         initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
     ),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State0)),
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, transport_parameter_error}}}], emits(Effects)),
     Frames = ?TC:frames(
@@ -430,7 +454,7 @@ missing_transport_params_closes_test() ->
     Datagram = ?TC:seal(
         initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
     ),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State0)),
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, missing_transport_params}}}], emits(Effects)),
     Frames = ?TC:frames(
@@ -474,7 +498,7 @@ invalid_key_share_closes_test() ->
 assert_client_hello_closes(HelloOpts, Reason, Code) ->
     {State0, Ctx} = new_conn([~"leaf-cert-der"]),
     {Datagram, _Framed} = client_hello_datagram(Ctx, HelloOpts),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State0)),
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, Reason}}}], emits(Effects)),
     ?assertMatch([{connection_close, transport, Code, 0, <<>>}], initial_close_frames(Effects)).
@@ -491,7 +515,7 @@ unexpected_handshake_message_closes_test() ->
         ?DCID,
         ?SCID
     ),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State0)),
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, unexpected_message}}}], emits(Effects)),
     %% RFC 9001 §4.8 / §6: the TLS unexpected_message alert (10), 0x010a.
@@ -535,7 +559,7 @@ assert_handshake_crypto_closes(Wrap, CloseLevel) ->
         ?DCID,
         ?SCID
     ),
-    {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, State1b),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State1b),
     ?assertMatch({emit, _, {closed, {local, unexpected_message}}}, lists:last(emits(Effects))),
     ?assertNotEqual(connected, ?M:phase(State2)),
     Secrets = #{handshake => ServerHsSecret, application => ServerApSecret},
@@ -563,7 +587,7 @@ crypto_beyond_buffer_limit_closes_test() ->
         ?DCID,
         ?SCID
     ),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State0)),
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, crypto_buffer_exceeded}}}], emits(Effects)),
     ExpectedCode = roadrunner_quic_error:code_int(crypto_buffer_exceeded),
@@ -582,7 +606,7 @@ crypto_within_buffer_limit_held_test() ->
         ?DCID,
         ?SCID
     ),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State0)),
     ?assertEqual(handshaking, ?M:phase(State1)),
     ?assertEqual([], emits(Effects)).
 
@@ -599,7 +623,7 @@ application_close_at_initial_level_closes_test() ->
         ?DCID,
         ?SCID
     ),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State0)),
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
 
@@ -615,7 +639,7 @@ stream_frame_at_initial_level_closes_test() ->
         ?DCID,
         ?SCID
     ),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State0)),
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
 
@@ -640,7 +664,7 @@ assert_handshake_frame_closes(Frame) ->
         ?DCID,
         ?SCID
     ),
-    {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State1)),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, with_owner(State1)),
     ?assertEqual(closed, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
 
@@ -655,16 +679,7 @@ server_only_frame_from_client_closes_test_() ->
 
 assert_1rtt_frame_closes(Frame) ->
     {State, ApSecret} = connected_with_owner(),
-    {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram([Frame], 0, ApSecret), State),
-    ?assertEqual(draining, ?M:phase(State1)),
-    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
-
-retire_unissued_connection_id_closes_test() ->
-    %% RFC 9000 §19.16: the server only ever issued sequence number 0, so
-    %% retiring a higher one is a PROTOCOL_VIOLATION.
-    {State, ApSecret} = connected_with_owner(),
-    Retire = app_datagram([{retire_connection_id, 1}], 0, ApSecret),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Retire, State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([Frame], 0, ApSecret), State),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
 
@@ -675,19 +690,272 @@ unhandled_1rtt_frames_accepted_test() ->
     Frames = [
         {data_blocked, 0},
         {path_challenge, <<0:64>>},
-        {max_streams, bidi, 10},
-        {retire_connection_id, 0}
+        {max_streams, bidi, 10}
     ],
-    {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram(Frames, 0, ApSecret), State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, app_datagram(Frames, 0, ApSecret), State),
     ?assertEqual(connected, ?M:phase(State1)),
     ?assertEqual([], emits(Effects)).
+
+%% =============================================================================
+%% Connection ids (RFC 9000 §5.1)
+%% =============================================================================
+
+spare_connection_id_issued_on_confirmation_test() ->
+    %% RFC 9000 §5.1.1: once the handshake is confirmed the server issues a
+    %% spare connection id, up to the client's active_connection_id_limit (2
+    %% when absent, the handshake's id counting): one NEW_CONNECTION_ID with
+    %% sequence number 1, a fresh id of the server's fixed length, and the
+    %% reset token derived from it (§10.3.2). The id routes to the connection
+    %% before the datagram announcing it goes out.
+    #{effects2 := Effects, server_ap_secret := ServerApSecret} = connect(),
+    [{new_connection_id, 1, 0, CID, Token}] = new_cids(Effects, ServerApSecret),
+    ?assertEqual(8, byte_size(CID)),
+    ?assertNotEqual(?SCID, CID),
+    ?assertEqual(roadrunner_quic_cid_registry:reset_token(?RESET_KEY, CID), Token),
+    ?assertEqual([{register_cid, CID}], registers(Effects)),
+    ?assert(index_of({register_cid, CID}, Effects) < index_of(first_send(Effects), Effects)).
+
+routes_follow_issued_ids_test() ->
+    %% The ids routing to the connection: the client's original destination
+    %% id and every issued id the client has not retired.
+    {State, ClientApSecret, _ServerApSecret, CID1} = connected_with_spare(),
+    ?assertEqual(lists:sort([?DCID, ?SCID, CID1]), lists:sort(?M:routes(State))),
+    Retire = app_datagram_to(CID1, [{retire_connection_id, 0}], 0, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Retire, State),
+    [{unregister_cid, ?SCID}, {register_cid, CID2}] = registers(Effects),
+    ?assertEqual(lists:sort([?DCID, CID1, CID2]), lists:sort(?M:routes(State1))).
+
+issued_up_to_client_limit_test() ->
+    %% A client accepting three ids gets two spares (sequence numbers 1 and
+    %% 2), each a different id with its own token.
+    #{effects2 := Effects, server_ap_secret := ServerApSecret} = connect(
+        #{}, #{transport_params => #{active_connection_id_limit => 3}}
+    ),
+    [{new_connection_id, 1, 0, CID1, Token1}, {new_connection_id, 2, 0, CID2, Token2}] =
+        lists:sort(new_cids(Effects, ServerApSecret)),
+    ?assertNotEqual(CID1, CID2),
+    ?assertNotEqual(Token1, Token2).
+
+issued_ids_capped_test() ->
+    %% However many ids the client accepts, the server keeps at most four
+    %% active (RFC 9000 §5.1.1 lets it limit them): three spares.
+    #{effects2 := Effects, server_ap_secret := ServerApSecret} = connect(
+        #{}, #{transport_params => #{active_connection_id_limit => 10}}
+    ),
+    ?assertEqual(
+        [1, 2, 3],
+        lists:sort([Seq || {new_connection_id, Seq, _, _, _} <- new_cids(Effects, ServerApSecret)])
+    ).
+
+retire_issued_connection_id_test() ->
+    %% RFC 9000 §19.16 / §5.1.2: retiring an issued id stops it routing to the
+    %% connection, and a replacement (the next sequence number) keeps the
+    %% client supplied.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_spare(),
+    Retire = app_datagram([{retire_connection_id, 1}], 0, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Retire, State),
+    ?assertEqual(connected, ?M:phase(State1)),
+    [{new_connection_id, 2, 0, CID2, _Token}] = new_cids(Effects, ServerApSecret),
+    ?assertEqual([{unregister_cid, CID1}, {register_cid, CID2}], registers(Effects)),
+    %% A repeated RETIRE_CONNECTION_ID for the same id changes nothing.
+    Again = app_datagram([{retire_connection_id, 1}], 1, ClientApSecret),
+    {State2, Effects2} = ?M:handle_datagram(?NOW, ?PEER, Again, State1),
+    ?assertEqual(connected, ?M:phase(State2)),
+    ?assertEqual([], registers(Effects2)),
+    ?assertEqual([], new_cids(Effects2, ServerApSecret)).
+
+retire_handshake_connection_id_test() ->
+    %% The handshake's id (sequence number 0) can be retired too, from a
+    %% packet sent to another of the server's ids.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_spare(),
+    Retire = app_datagram_to(CID1, [{retire_connection_id, 0}], 0, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Retire, State),
+    ?assertEqual(connected, ?M:phase(State1)),
+    [{new_connection_id, 2, 0, CID2, _Token}] = new_cids(Effects, ServerApSecret),
+    ?assertEqual([{unregister_cid, ?SCID}, {register_cid, CID2}], registers(Effects)).
+
+retire_own_destination_id_closes_test() ->
+    %% RFC 9000 §19.16: the frame MUST NOT retire the id its own packet was
+    %% sent to, and the server treats that as a PROTOCOL_VIOLATION.
+    {State, ClientApSecret, _ServerApSecret, _CID1} = connected_with_spare(),
+    Retire = app_datagram_to(?SCID, [{retire_connection_id, 0}], 0, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Retire, State),
+    ?assertEqual(draining, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
+
+retire_unissued_connection_id_closes_test() ->
+    %% RFC 9000 §19.16: retiring a sequence number never issued (the server
+    %% issued 0 and 1) is a PROTOCOL_VIOLATION.
+    {State, ApSecret} = connected_with_owner(),
+    Retire = app_datagram([{retire_connection_id, 2}], 0, ApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Retire, State),
+    ?assertEqual(draining, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
+
+retire_held_until_confirmation_test() ->
+    %% A RETIRE_CONNECTION_ID sent before the handshake completes is held
+    %% unprocessed with its packet (RFC 9001 §5.7). Confirmation issues the
+    %% first spare, then the held retirement (of the handshake's id, from a
+    %% packet sent to the client's original id) stops that id routing and
+    %% draws a replacement.
+    #{
+        state1 := State1,
+        client_ap_secret := ClientApSecret,
+        client_hs_secret := ClientHsSecret,
+        cf_framed := ClientFinished,
+        aead := Aead,
+        server_ap_secret := ServerApSecret
+    } = connect(),
+    Retire = app_datagram([{retire_connection_id, 0}], 0, ClientApSecret),
+    {State2, Effects2} = ?M:handle_datagram(?NOW, ?PEER, Retire, State1),
+    ?assertEqual(handshaking, ?M:phase(State2)),
+    ?assertEqual([], registers(Effects2)),
+    Finished = ?TC:seal(
+        handshake,
+        0,
+        roadrunner_quic_keys:traffic_keys(Aead, ClientHsSecret),
+        [{crypto, 0, ClientFinished}],
+        ?DCID,
+        ?SCID
+    ),
+    {State3, Effects3} = ?M:handle_datagram(?NOW, ?PEER, Finished, State2),
+    ?assertEqual(connected, ?M:phase(State3)),
+    [{new_connection_id, 1, 0, CID1, _}, {new_connection_id, 2, 0, CID2, _}] = lists:sort(
+        new_cids(Effects3, ServerApSecret)
+    ),
+    ?assertEqual(
+        [{register_cid, CID1}, {unregister_cid, ?SCID}, {register_cid, CID2}], registers(Effects3)
+    ).
+
+lost_new_connection_id_resent_test() ->
+    %% RFC 9000 §13.3: a lost NEW_CONNECTION_ID is resent with the same
+    %% sequence number while the id is still active.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_spare(),
+    Frames = lose_first_app_packet(State, ClientApSecret, ServerApSecret),
+    ?assertMatch([{new_connection_id, 1, 0, CID1, _}], [
+        F
+     || {new_connection_id, _, _, _, _} = F <- Frames
+    ]).
+
+lost_new_connection_id_for_retired_id_not_resent_test() ->
+    %% Once the client retired the id, a lost announcement of it is not resent.
+    {State, ClientApSecret, ServerApSecret, _CID1} = connected_with_spare(),
+    Retire = app_datagram([{retire_connection_id, 1}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Retire, State),
+    Frames = lose_first_app_packet(State1, ClientApSecret, ServerApSecret),
+    ?assert(lists:member(handshake_done, Frames)),
+    ?assertEqual([], [Seq || {new_connection_id, Seq, _, _, _} <- Frames, Seq =:= 1]).
+
+client_connection_id_kept_test() ->
+    %% RFC 9000 §5.1.2: a client's spare id is stored, while the server keeps
+    %% addressing the id it uses. A repeat of the frame is no error (§19.15).
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    New = {new_connection_id, 1, 0, <<21:64>>, <<0:128>>},
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([New], 0, ClientApSecret), State),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([New], 1, ClientApSecret), State1),
+    ?assertEqual(connected, ?M:phase(State2)),
+    {_State3, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"x", true, ?NOW, State2),
+    ?assertEqual([?CLIENT_SCID], short_header_dcids(Sent)),
+    ?assertNotEqual([], sent_stream_frames(Sent, ServerApSecret)).
+
+retire_prior_to_moves_to_new_client_id_test() ->
+    %% RFC 9000 §5.1.2: a Retire Prior To covering the id the server
+    %% addresses makes it retire that id and address the new one.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    New = {new_connection_id, 1, 1, <<21:64>>, <<0:128>>},
+    {State1, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram([New], 0, ClientApSecret), State
+    ),
+    ?assertEqual(connected, ?M:phase(State1)),
+    ?assert(lists:member({retire_connection_id, 0}, sent_app_frames(Effects, ServerApSecret))),
+    ?assertEqual([<<21:64>>], lists:usort(short_header_dcids(Effects))),
+    %% A Retire Prior To that does not increase the largest received is
+    %% ignored (§19.15): the id stays in use.
+    Stale = {new_connection_id, 2, 0, <<22:64>>, <<1:128>>},
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([Stale], 1, ClientApSecret), State1),
+    {_State3, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"x", true, ?NOW, State2),
+    ?assertEqual([<<21:64>>], short_header_dcids(Sent)).
+
+retire_prior_to_keeps_the_id_in_use_test() ->
+    %% A Retire Prior To at or below the id the server addresses retires only
+    %% the ids under it. Sequence 5 (Retire Prior To 3) takes over from 0,
+    %% a late 4 joins it, and then 6 (Retire Prior To 5) retires 4 alone.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Frames = [
+        {new_connection_id, 5, 3, <<25:64>>, <<5:128>>},
+        {new_connection_id, 4, 0, <<24:64>>, <<4:128>>},
+        {new_connection_id, 6, 5, <<26:64>>, <<6:128>>}
+    ],
+    {State1, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram(Frames, 0, ClientApSecret), State
+    ),
+    ?assertEqual(connected, ?M:phase(State1)),
+    Retired = [Seq || {retire_connection_id, Seq} <- sent_app_frames(Effects, ServerApSecret)],
+    ?assertEqual([0, 4], lists:sort(Retired)),
+    ?assertEqual([<<25:64>>], lists:usort(short_header_dcids(Effects))).
+
+late_client_id_below_retire_prior_to_is_retired_test() ->
+    %% RFC 9000 §19.15: an id numbered below the largest Retire Prior To
+    %% received is retired at once, never used.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Newer = {new_connection_id, 2, 2, <<22:64>>, <<2:128>>},
+    Late = {new_connection_id, 1, 0, <<21:64>>, <<1:128>>},
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([Newer], 0, ClientApSecret), State),
+    {State2, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram([Late], 1, ClientApSecret), State1
+    ),
+    ?assertEqual(connected, ?M:phase(State2)),
+    ?assert(lists:member({retire_connection_id, 1}, sent_app_frames(Effects, ServerApSecret))),
+    {_State3, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"x", true, ?NOW, State2),
+    ?assertEqual([<<22:64>>], short_header_dcids(Sent)).
+
+client_connection_id_errors_test_() ->
+    %% RFC 9000 §19.15: a sequence number reused for another id may be a
+    %% PROTOCOL_VIOLATION, and is here (the handshake's id is sequence 0).
+    %% §5.1.1: more active ids than the active_connection_id_limit the server
+    %% advertised (2 by default) is a CONNECTION_ID_LIMIT_ERROR.
+    [
+        ?_test(
+            assert_client_cids_close(
+                [{new_connection_id, 0, 0, <<21:64>>, <<0:128>>}], protocol_violation
+            )
+        ),
+        ?_test(
+            assert_client_cids_close(
+                [
+                    {new_connection_id, 1, 0, <<21:64>>, <<1:128>>},
+                    {new_connection_id, 2, 0, <<22:64>>, <<2:128>>}
+                ],
+                connection_id_limit_error
+            )
+        )
+    ].
+
+assert_client_cids_close(Frames, Reason) ->
+    {State, ApSecret} = connected_with_owner(),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, app_datagram(Frames, 0, ApSecret), State),
+    ?assertEqual(draining, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, Reason}}}], emits(Effects)).
+
+zero_length_client_id_new_connection_id_closes_test() ->
+    %% RFC 9000 §19.15: a client that chose a zero-length connection id MUST
+    %% NOT send NEW_CONNECTION_ID, and receiving one is a PROTOCOL_VIOLATION.
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(
+        #{peer_scid => <<>>}, #{client_scid => <<>>}
+    ),
+    New = {new_connection_id, 1, 0, <<21:64>>, <<0:128>>},
+    {State1, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram([New], 0, ClientApSecret), State
+    ),
+    ?assertEqual(draining, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
 
 application_close_at_1rtt_closes_test() ->
     %% An application-variant CONNECTION_CLOSE (0x1d) is legal at 1-RTT (an h3
     %% client's graceful close) and surfaces {closed, {peer, ErrorCode}}.
     {State, ApSecret} = connected_with_owner(),
     Close = app_datagram([{connection_close, application, 9, undefined, <<>>}], 0, ApSecret),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Close, State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Close, State),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {peer, 9}}}], emits(Effects)).
 
@@ -742,7 +1010,7 @@ pto_probe_resends_what_it_finds_lost_test() ->
     {State1, Sent} = ?M:handle_send(self(), make_ref(), 0, Payload, true, ?NOW, State),
     Largest = largest_app_pn(Sent, ServerApSecret),
     Ack = app_datagram([{ack, Largest, 0, 0, [], undefined}], 0, ClientApSecret),
-    {State2, _} = ?M:handle_datagram(?NOW, Ack, State1),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, Ack, State1),
     {_State3, Effects} = ?M:handle_timeout(?NOW + 5000, pto, State2),
     Frames = sent_app_frames(Effects, ServerApSecret),
     ?assertMatch([{stream, 0, 0, _, false} | _], [F || {stream, _, _, _, _} = F <- Frames]),
@@ -759,7 +1027,7 @@ pto_detected_loss_reduces_congestion_window_test() ->
     ?assertEqual(?M:cwnd(State1), ?M:cwnd(NothingLost)),
     Largest = largest_app_pn(Sent, ServerApSecret),
     Ack = app_datagram([{ack, Largest, 0, 0, [], undefined}], 0, ClientApSecret),
-    {State2, _} = ?M:handle_datagram(?NOW, Ack, State1),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, Ack, State1),
     {State3, _} = ?M:handle_timeout(?NOW + 5000, pto, State2),
     ?assertEqual(?M:cwnd(State2) div 2, ?M:cwnd(State3)).
 
@@ -780,7 +1048,7 @@ cwnd_after_spread_losses(Spread) ->
     {State1, Sent1} = ?M:handle_send(self(), make_ref(), 0, ~"first", false, ?NOW, State),
     Largest1 = largest_app_pn(Sent1, ServerApSecret),
     Ack1 = app_datagram([{ack, Largest1, 0, Largest1, [], undefined}], 0, ClientApSecret),
-    {State2, _} = ?M:handle_datagram(?NOW + 10, Ack1, State1),
+    {State2, _} = ?M:handle_datagram(?NOW + 10, ?PEER, Ack1, State1),
     {State3, _} = ?M:handle_send(self(), make_ref(), 0, ~"second", false, ?NOW + 20, State2),
     Burst = binary:copy(~"x", 5000),
     {State4, Sent4} = ?M:handle_send(
@@ -788,16 +1056,18 @@ cwnd_after_spread_losses(Spread) ->
     ),
     Largest4 = largest_app_pn(Sent4, ServerApSecret),
     Ack4 = app_datagram([{ack, Largest4, 0, 0, [], undefined}], 1, ClientApSecret),
-    {State5, _} = ?M:handle_datagram(?NOW + 30 + Spread, Ack4, State4),
+    {State5, _} = ?M:handle_datagram(?NOW + 30 + Spread, ?PEER, Ack4, State4),
     ?M:cwnd(State5).
 
 path_challenge_answered_test() ->
     %% RFC 9000 §8.2.2: a PATH_CHALLENGE gets a PATH_RESPONSE echoing its data.
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     Challenge = app_datagram([{path_challenge, ~"8 bytes!"}], 0, ClientApSecret),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Challenge, State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Challenge, State),
     ?assertEqual(connected, ?M:phase(State1)),
-    ?assert(lists:member({path_response, ~"8 bytes!"}, sent_app_frames(Effects, ServerApSecret))).
+    ?assert(lists:member({path_response, ~"8 bytes!"}, sent_app_frames(Effects, ServerApSecret))),
+    %% The datagram carrying it fills 1200 bytes (§8.2.2 MUST).
+    ?assertEqual([1200], [byte_size(D) || D <- path_datagrams(sends(Effects), ServerApSecret)]).
 
 lost_path_response_not_resent_test() ->
     %% RFC 9000 §13.3: a PATH_RESPONSE is sent once. With a later packet
@@ -805,15 +1075,525 @@ lost_path_response_not_resent_test() ->
     %% resends the rest of it, never the response.
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     Challenge = app_datagram([{path_challenge, ~"8 bytes!"}], 0, ClientApSecret),
-    {State1, _} = ?M:handle_datagram(?NOW, Challenge, State),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Challenge, State),
     {State2, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"later", true, ?NOW, State1),
     Largest = largest_app_pn(Sent, ServerApSecret),
     Ack = app_datagram([{ack, Largest, 0, 0, [], undefined}], 1, ClientApSecret),
-    {State3, _} = ?M:handle_datagram(?NOW, Ack, State2),
+    {State3, _} = ?M:handle_datagram(?NOW, ?PEER, Ack, State2),
     {_State4, Effects} = ?M:handle_timeout(?NOW + 5000, pto, State3),
     Frames = sent_app_frames(Effects, ServerApSecret),
     ?assertNotEqual([], Frames),
     ?assertEqual([], [F || {path_response, _} = F <- Frames]).
+
+%% =============================================================================
+%% Connection migration (RFC 9000 §9)
+%% =============================================================================
+
+nat_rebinding_moves_to_new_address_test() ->
+    %% RFC 9000 §9.3: a non-probing packet from a new address moves the
+    %% connection there: the effects lead with {migrate, NewPeer}. The
+    %% client still addresses the server's handshake id, so the server keeps
+    %% addressing the client's (§9.5 MAY). The new address is challenged
+    %% within three times what it sent (§8.2.1, §9.3.1), and the old path is
+    %% challenged too, in a datagram filling 1200 bytes (§9.3.3, §8.2.1).
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Ping = to_scid([ping], 0, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Ping, State),
+    ?assertMatch([{migrate, ?PEER2} | _], Effects),
+    ?assertEqual({ok, ?PEER2}, ?M:peername(State1)),
+    [NewPath] = path_datagrams(sends(Effects), ServerApSecret),
+    ?assertEqual(3 * byte_size(Ping), byte_size(NewPath)),
+    ?assertEqual([?CLIENT_SCID], short_header_dcids([{send, NewPath}])),
+    ?assertMatch([{path_challenge, _}], path_frames([NewPath], ServerApSecret)),
+    [OldPath] = sends_to(?PEER, Effects),
+    ?assertEqual(1200, byte_size(OldPath)),
+    ?assertEqual([?CLIENT_SCID], short_header_dcids([{send, OldPath}])),
+    ?assertMatch([{path_challenge, _}], path_frames([OldPath], ServerApSecret)),
+    %% Until the address is validated nothing more fits its budget.
+    {_State2, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"data", true, ?NOW, State1),
+    ?assertEqual([], sent_stream_frames(Sent, ServerApSecret)).
+
+address_then_mtu_validated_test() ->
+    %% RFC 9000 §8.2.1: a response to a challenge whose datagram stayed under
+    %% 1200 bytes validates only the address: the anti-amplification limit
+    %% lifts, and a second challenge, expanded to 1200 bytes, validates the
+    %% path MTU. A late response to the first one then changes nothing.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER2, to_scid([ping], 0, ClientApSecret), State
+    ),
+    [Data] = challenge_data(sends(Effects), ServerApSecret),
+    Response = to_scid([{path_response, Data}], 1, ClientApSecret),
+    {State2, Effects2} = ?M:handle_datagram(?NOW, ?PEER2, Response, State1),
+    [Mtu] = path_datagrams(sends(Effects2), ServerApSecret),
+    ?assertEqual(1200, byte_size(Mtu)),
+    [MtuData] = challenge_data([Mtu], ServerApSecret),
+    {State3, Effects3} = ?M:handle_datagram(
+        ?NOW, ?PEER2, to_scid([{path_response, Data}], 2, ClientApSecret), State2
+    ),
+    ?assertEqual([], path_datagrams(sends(Effects3), ServerApSecret)),
+    {State4, _} = ?M:handle_datagram(
+        ?NOW, ?PEER2, to_scid([{path_response, MtuData}], 3, ClientApSecret), State3
+    ),
+    {_State5, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"data", true, ?NOW, State4),
+    ?assertNotEqual([], sent_stream_frames(Sent, ServerApSecret)),
+    ?assertEqual([?CLIENT_SCID], lists:usort(short_header_dcids(Sent))).
+
+expanded_challenge_validates_address_and_mtu_test() ->
+    %% Moved by a full-size datagram, the server can expand its first
+    %% challenge to 1200 bytes, so one response validates the path.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER2, padded_ping(0, ClientApSecret), State),
+    [Challenge] = path_datagrams(sends(Effects), ServerApSecret),
+    ?assertEqual(1200, byte_size(Challenge)),
+    [Data] = challenge_data([Challenge], ServerApSecret),
+    {State2, Effects2} = ?M:handle_datagram(
+        ?NOW, ?PEER2, to_scid([{path_response, Data}], 1, ClientApSecret), State1
+    ),
+    ?assertEqual([], path_datagrams(sends(Effects2), ServerApSecret)),
+    ?assertEqual([], [T || {arm_timer, path, _} = T <- Effects2]),
+    ?assertEqual({ok, ?PEER2}, ?M:peername(State2)).
+
+port_only_change_keeps_congestion_state_test() ->
+    %% RFC 9000 §9.4: a change of port alone, the usual NAT rebinding, may
+    %% keep the congestion controller and RTT estimate.
+    {State, ClientApSecret, ServerApSecret} = grown_window(),
+    Grown = ?M:cwnd(State),
+    State1 = validated_move(?PEER2, State, ClientApSecret, ServerApSecret),
+    ?assertEqual(Grown, ?M:cwnd(State1)).
+
+address_change_resets_congestion_state_test() ->
+    %% RFC 9000 §9.4 MUST: once a new IP address is validated, the
+    %% congestion controller starts over from the initial window.
+    {State, ClientApSecret, ServerApSecret} = grown_window(),
+    ?assert(?M:cwnd(State) > 12000),
+    State1 = validated_move(?PEER3, State, ClientApSecret, ServerApSecret),
+    ?assertEqual(12000, ?M:cwnd(State1)).
+
+probing_packet_answered_on_its_path_test() ->
+    %% RFC 9000 §9.1 / §8.2.2: a probing packet from a new address moves
+    %% nothing, and its PATH_CHALLENGE is answered on that path, in a
+    %% datagram expanded to 1200 bytes, addressed with a client id never used
+    %% toward another address (§9.5).
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
+    Probe = app_datagram_to(
+        CID1, [{path_challenge, ~"probe-01"} | padding(1100)], 2, ClientApSecret
+    ),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Probe, State),
+    ?assertEqual({ok, ?PEER}, ?M:peername(State1)),
+    ?assertEqual([], [M || {migrate, _} = M <- Effects]),
+    [Answer] = sends_to(?PEER2, Effects),
+    ?assertEqual(1200, byte_size(Answer)),
+    ?assertEqual([?CLIENT_SPARE], short_header_dcids([{send, Answer}])),
+    ?assertEqual([{path_response, ~"probe-01"}], path_frames([Answer], ServerApSecret)),
+    %% A second probe from the same address is answered with the same id.
+    Probe2 = app_datagram_to(
+        CID1, [{path_challenge, ~"probe-02"} | padding(1100)], 3, ClientApSecret
+    ),
+    {_State2, Effects2} = ?M:handle_datagram(?NOW, ?PEER2, Probe2, State1),
+    [Answer2] = sends_to(?PEER2, Effects2),
+    ?assertEqual([?CLIENT_SPARE], short_header_dcids([{send, Answer2}])).
+
+probe_answer_within_amplification_limit_test() ->
+    %% RFC 9000 §8.2.2: the answer to a small probe is expanded only as far
+    %% as three times what the address sent.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
+    Probe = app_datagram_to(CID1, [{path_challenge, ~"probe-01"}], 2, ClientApSecret),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Probe, State),
+    [Answer] = sends_to(?PEER2, Effects),
+    ?assertEqual(3 * byte_size(Probe), byte_size(Answer)),
+    ?assertEqual([{path_response, ~"probe-01"}], path_frames([Answer], ServerApSecret)).
+
+probe_without_client_id_dropped_test() ->
+    %% RFC 9000 §9.5: a probe on another of the server's ids, with no spare
+    %% client id to answer it with, is not answered.
+    {State, ClientApSecret, _ServerApSecret, CID1} = connected_with_spare(),
+    Probe = app_datagram_to(
+        CID1, [{path_challenge, ~"probe-01"} | padding(1100)], 0, ClientApSecret
+    ),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Probe, State),
+    ?assertEqual([], sends_to(?PEER2, Effects)).
+
+probe_on_same_server_id_reuses_client_id_test() ->
+    %% RFC 9000 §9.5 MAY: a probe still sent to the id the client used on the
+    %% current path is answered with the current client id.
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    Probe = to_scid([{path_challenge, ~"probe-01"} | padding(1100)], 0, ClientApSecret),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Probe, State),
+    [Answer] = sends_to(?PEER2, Effects),
+    ?assertEqual([?CLIENT_SCID], short_header_dcids([{send, Answer}])).
+
+active_migration_uses_fresh_client_id_test() ->
+    %% RFC 9000 §9.5: a client that moves to another of the server's ids is
+    %% followed with another of its own, never the one used on the old path;
+    %% once the new path is validated the old id is retired (§5.1.2).
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
+    Move = app_datagram_to(CID1, [ping | padding(1100)], 2, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Move, State),
+    ?assertMatch([{migrate, ?PEER2} | _], Effects),
+    [Challenge] = path_datagrams(sends(Effects), ServerApSecret),
+    ?assertEqual([?CLIENT_SPARE], short_header_dcids([{send, Challenge}])),
+    [OldPath] = sends_to(?PEER, Effects),
+    ?assertEqual([?CLIENT_SCID], short_header_dcids([{send, OldPath}])),
+    [Data] = challenge_data([Challenge], ServerApSecret),
+    Response = app_datagram_to(CID1, [{path_response, Data}], 3, ClientApSecret),
+    {_State2, Effects2} = ?M:handle_datagram(?NOW, ?PEER2, Response, State1),
+    ?assert(lists:member({retire_connection_id, 0}, sent_app_frames(Effects2, ServerApSecret))),
+    ?assertEqual([?CLIENT_SPARE], lists:usort(short_header_dcids(Effects2))).
+
+zero_length_client_id_migrates_test() ->
+    %% A client that chose a zero-length id has only that one for every path.
+    {State, Effects0, ClientApSecret, _ServerApSecret} = connect_owned_effects(
+        #{peer_scid => <<>>}, #{client_scid => <<>>}
+    ),
+    [{register_cid, CID1}] = registers(Effects0),
+    Move = app_datagram_to(CID1, [ping], 0, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Move, State),
+    ?assertMatch([{migrate, ?PEER2} | _], Effects),
+    ?assertEqual({ok, ?PEER2}, ?M:peername(State1)).
+
+reordered_packet_does_not_migrate_test() ->
+    %% RFC 9000 §9.3: only the highest-numbered non-probing packet moves the
+    %% connection, so a reordered older one from another address does not.
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, to_scid([ping], 5, ClientApSecret), State),
+    {State2, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER2, to_scid([ping], 3, ClientApSecret), State1
+    ),
+    ?assertEqual([], [M || {migrate, _} = M <- Effects]),
+    ?assertEqual({ok, ?PEER}, ?M:peername(State2)).
+
+no_migration_before_confirmation_test() ->
+    %% RFC 9000 §9: a client MUST NOT migrate before the handshake is
+    %% confirmed, and a 1-RTT packet from another address then moves nothing.
+    #{state1 := State1, client_ap_secret := ClientApSecret} = connect(),
+    {State2, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER2, to_scid([ping], 0, ClientApSecret), State1
+    ),
+    ?assertEqual([], [M || {migrate, _} = M <- Effects]),
+    ?assertEqual({ok, ?PEER}, ?M:peername(State2)).
+
+held_packet_from_another_address_dropped_test() ->
+    %% A 1-RTT packet held across the handshake (RFC 9001 §5.7) was sent
+    %% before the client could confirm it, when it MUST NOT migrate (RFC 9000
+    %% §9): one from another address is dropped rather than held, so the
+    %% handshake's completion neither processes it nor moves the connection.
+    {State1, Finished, ClientApSecret, _ServerApSecret} = handshaking_owned(),
+    Early = to_scid([{stream, 0, 0, ~"hello", true}], 0, ClientApSecret),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER2, Early, State1),
+    {State3, Effects} = ?M:handle_datagram(?NOW, ?PEER, Finished, State2),
+    ?assertEqual(connected, ?M:phase(State3)),
+    ?assertEqual([{emit, self(), {connected, expected_info()}}], emits(Effects)),
+    ?assertEqual([], [M || {migrate, _} = M <- Effects]).
+
+released_held_packet_does_not_migrate_test() ->
+    %% A held packet came from the handshake's address and is processed as
+    %% received there, even when the datagram completing the handshake comes
+    %% from elsewhere, so its release never moves the connection.
+    {State1, Finished, ClientApSecret, _ServerApSecret} = handshaking_owned(),
+    Early = to_scid([{stream, 0, 0, ~"hello", true}], 0, ClientApSecret),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, Early, State1),
+    {State3, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Finished, State2),
+    ?assertEqual(connected, ?M:phase(State3)),
+    ?assertMatch(
+        [
+            {emit, _, {connected, _}},
+            {emit, _, {stream_opened, 0}},
+            {emit, _, {stream_data, 0, _, _}}
+        ],
+        emits(Effects)
+    ),
+    ?assertEqual([], [M || {migrate, _} = M <- Effects]),
+    ?assertEqual({ok, ?PEER}, ?M:peername(State3)).
+
+coalesced_packet_from_another_address_dropped_test() ->
+    %% So is a 1-RTT packet coalesced behind the Finished from another
+    %% address: the client sent it before seeing HANDSHAKE_DONE.
+    {State1, Finished, ClientApSecret, _ServerApSecret} = handshaking_owned(),
+    App = to_scid([{stream, 0, 0, ~"hello", true}], 0, ClientApSecret),
+    {State2, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER2, <<Finished/binary, App/binary>>, State1
+    ),
+    ?assertEqual(connected, ?M:phase(State2)),
+    ?assertEqual([{emit, self(), {connected, expected_info()}}], emits(Effects)),
+    ?assertEqual({ok, ?PEER}, ?M:peername(State2)).
+
+failed_validation_returns_to_old_path_test() ->
+    %% RFC 9000 §8.2.4 / §9.3.2: the new path is challenged again each
+    %% interval with fresh data, and when the validation gives up the
+    %% connection returns to the last validated path, retiring the client id
+    %% it used toward the failed one.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
+    Move = app_datagram_to(CID1, [ping | padding(1100)], 2, ClientApSecret),
+    {State1, Effects1} = ?M:handle_datagram(?NOW, ?PEER2, Move, State),
+    [First] = challenge_data(sends(Effects1), ServerApSecret),
+    {State2, Effects2} = ?M:handle_timeout(?RECHALLENGE_AT, path, State1),
+    [Second] = challenge_data(sends(Effects2), ServerApSecret),
+    ?assertNotEqual(First, Second),
+    {Reverted, Effects} = ?M:handle_timeout(?ABANDON_AT, path, State2),
+    ?assertMatch([{migrate, ?PEER} | _], Effects),
+    ?assertEqual({ok, ?PEER}, ?M:peername(Reverted)),
+    ?assert(lists:member({retire_connection_id, 1}, sent_app_frames(Effects, ServerApSecret))),
+    ?assertEqual([?CLIENT_SCID], lists:usort(short_header_dcids(Effects))),
+    %% The client repeating the retired id's NEW_CONNECTION_ID does not bring
+    %% it back: a further id stays within the limit of two.
+    Repeat = {new_connection_id, 1, 0, ?CLIENT_SPARE, <<1:128>>},
+    Next = {new_connection_id, 2, 0, <<22:64>>, <<2:128>>},
+    {State3, _} = ?M:handle_datagram(
+        ?NOW, ?PEER, to_scid([Repeat, Next], 3, ClientApSecret), Reverted
+    ),
+    ?assertEqual(connected, ?M:phase(State3)),
+    %% Nor does it after a Retire Prior To that leaves its number standing
+    %% (one at it, here), which retires the id in use and moves to the next.
+    Later = {new_connection_id, 3, 1, <<23:64>>, <<3:128>>},
+    {State4, Effects4} = ?M:handle_datagram(
+        ?NOW, ?PEER, to_scid([Later, Repeat], 4, ClientApSecret), State3
+    ),
+    ?assertEqual(connected, ?M:phase(State4)),
+    ?assertEqual([<<22:64>>], lists:usort(short_header_dcids(Effects4))).
+
+return_to_validated_path_skips_validation_test() ->
+    %% RFC 9000 §9.3: back on the last validated path the connection skips
+    %% validation, sending at once without an anti-amplification limit.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER2, to_scid([ping], 0, ClientApSecret), State),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, to_scid([ping], 1, ClientApSecret), State1),
+    ?assertMatch([{migrate, ?PEER} | _], Effects),
+    ?assertEqual([], challenge_data(sends(Effects), ServerApSecret)),
+    {_State3, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"data", true, ?NOW, State2),
+    ?assertNotEqual([], sent_stream_frames(Sent, ServerApSecret)).
+
+failed_validation_without_validated_path_closes_test() ->
+    %% RFC 9000 §9.3.2 MUST: with no validated path left to return to (the
+    %% client retired the id used on the old one), a failed validation
+    %% closes the connection silently.
+    {State, ClientApSecret, _ServerApSecret, CID1} = connected_with_client_spare(),
+    Move = app_datagram_to(CID1, [ping], 2, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER2, Move, State),
+    Retire = app_datagram_to(
+        CID1, [{new_connection_id, 2, 1, <<22:64>>, <<2:128>>}], 3, ClientApSecret
+    ),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER2, Retire, State1),
+    {Closed, Effects} = ?M:handle_timeout(?ABANDON_AT, path, State2),
+    ?assertEqual(closed, ?M:phase(Closed)),
+    ?assertEqual([], sends(Effects) ++ [S || {send_to, _, _} = S <- Effects]),
+    ?assertEqual([{emit, self(), {closed, {local, no_viable_path}}}], emits(Effects)).
+
+move_on_from_unvalidated_path_test() ->
+    %% Moving on while a path is still being validated abandons that
+    %% validation; the last validated path stays the one to return to.
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER2, to_scid([ping], 0, ClientApSecret), State),
+    {State2, Effects2} = ?M:handle_datagram(
+        ?NOW, ?PEER3, to_scid([ping], 1, ClientApSecret), State1
+    ),
+    ?assertMatch([{migrate, ?PEER3} | _], Effects2),
+    ?assertEqual([], sends_to(?PEER, Effects2)),
+    {Reverted, Effects} = ?M:handle_timeout(?ABANDON_AT, path, State2),
+    ?assertMatch([{migrate, ?PEER} | _], Effects),
+    ?assertEqual({ok, ?PEER}, ?M:peername(Reverted)).
+
+challenge_from_old_path_answered_there_test() ->
+    %% RFC 9000 §8.2.2: while the new path is validated, a PATH_CHALLENGE
+    %% from the old one is answered on the old one, with the client id used
+    %% there.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
+    {State1, _} = ?M:handle_datagram(
+        ?NOW, ?PEER2, app_datagram_to(CID1, [ping | padding(1100)], 2, ClientApSecret), State
+    ),
+    Probe = to_scid([{path_challenge, ~"old-path"} | padding(1100)], 3, ClientApSecret),
+    {_State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Probe, State1),
+    [Answer] = sends_to(?PEER, Effects),
+    ?assertEqual([?CLIENT_SCID], short_header_dcids([{send, Answer}])),
+    ?assertEqual([{path_response, ~"old-path"}], path_frames([Answer], ServerApSecret)).
+
+unknown_path_response_ignored_test() ->
+    %% RFC 9000 §19.18 MAY close on a PATH_RESPONSE matching no challenge;
+    %% the server ignores it, during a validation or without one.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Stray = {path_response, ~"unknown!"},
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, to_scid([Stray], 0, ClientApSecret), State),
+    ?assertEqual(connected, ?M:phase(State1)),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER2, to_scid([ping], 1, ClientApSecret), State1),
+    {State3, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER2, to_scid([Stray], 2, ClientApSecret), State2
+    ),
+    ?assertEqual(connected, ?M:phase(State3)),
+    ?assertEqual([], path_datagrams(sends(Effects), ServerApSecret)).
+
+client_retire_prior_to_while_probing_test() ->
+    %% A Retire Prior To covering the id the server addresses moves it to an
+    %% id no other path uses: the one kept for a probing address is skipped.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
+    Probe = app_datagram_to(
+        CID1, [{path_challenge, ~"probe-01"} | padding(1100)], 2, ClientApSecret
+    ),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER2, Probe, State),
+    New = {new_connection_id, 2, 1, <<22:64>>, <<2:128>>},
+    {_State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, to_scid([New], 3, ClientApSecret), State1),
+    ?assert(lists:member({retire_connection_id, 0}, sent_app_frames(Effects, ServerApSecret))),
+    ?assertEqual([<<22:64>>], lists:usort(short_header_dcids(Effects))).
+
+client_retires_probing_id_test() ->
+    %% A probing address whose client id the client retires in the same
+    %% packet is no longer answered (RFC 9000 §5.1.2: the id MUST NOT be
+    %% used again).
+    {State, ClientApSecret, _ServerApSecret, CID1} = connected_with_client_spare(),
+    Frames = [
+        {path_challenge, ~"probe-01"},
+        {new_connection_id, 2, 2, <<22:64>>, <<2:128>>}
+        | padding(1100)
+    ],
+    {State1, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER2, app_datagram_to(CID1, Frames, 2, ClientApSecret), State
+    ),
+    ?assertEqual(connected, ?M:phase(State1)),
+    ?assertEqual([], sends_to(?PEER2, Effects)).
+
+challenge_retransmit_blocked_by_amplification_limit_test() ->
+    %% A challenge that would exceed what the unvalidated address allows is
+    %% not sent, and the validation carries on: a response to the first
+    %% challenge still validates the address.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, Effects1} = ?M:handle_datagram(
+        ?NOW, ?PEER2, to_scid([ping], 0, ClientApSecret), State
+    ),
+    [Data] = challenge_data(sends(Effects1), ServerApSecret),
+    {State2, Effects2} = ?M:handle_timeout(?RECHALLENGE_AT, path, State1),
+    ?assertEqual([], challenge_data(sends(Effects2), ServerApSecret)),
+    Response = to_scid([{path_response, Data}], 1, ClientApSecret),
+    {_State3, Effects3} = ?M:handle_datagram(?RECHALLENGE_AT, ?PEER2, Response, State2),
+    ?assertEqual([1200], [byte_size(D) || D <- path_datagrams(sends(Effects3), ServerApSecret)]).
+
+switched_server_id_then_rebinding_test() ->
+    %% The client may switch to another of the server's ids on its current
+    %% path (RFC 9000 §5.1.2); a rebinding still sent to that id is then the
+    %% NAT kind, followed with the current client id (§9.5 MAY). A reordered
+    %% older packet on the old id does not switch the path's id back.
+    {State, ClientApSecret, _ServerApSecret, CID1} = connected_with_spare(),
+    {State1, _} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram_to(CID1, [ping], 5, ClientApSecret), State
+    ),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, to_scid([ping], 3, ClientApSecret), State1),
+    Move = app_datagram_to(CID1, [ping], 6, ClientApSecret),
+    {State3, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Move, State2),
+    ?assertMatch([{migrate, ?PEER2} | _], Effects),
+    ?assertEqual({ok, ?PEER2}, ?M:peername(State3)),
+    ?assertEqual([?CLIENT_SCID], lists:usort(short_header_dcids(Effects))).
+
+no_client_id_for_new_server_id_stays_test() ->
+    %% RFC 9000 §9.3 / §9.5: a client that moves to another of the server's
+    %% ids without giving the server a spare id of its own cannot be
+    %% followed; the connection stays where it is.
+    {State, ClientApSecret, _ServerApSecret, CID1} = connected_with_spare(),
+    Move = app_datagram_to(CID1, [ping], 0, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Move, State),
+    ?assertEqual([], [M || {migrate, _} = M <- Effects]),
+    ?assertEqual({ok, ?PEER}, ?M:peername(State1)).
+
+nat_rebinding_prefers_fresh_client_id_test() ->
+    %% With a spare client id at hand, the server addresses a rebound client
+    %% with it rather than reuse the old path's (RFC 9000 §9.5).
+    {State, ClientApSecret, ServerApSecret, _CID1} = connected_with_client_spare(),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, ?PEER2, padded_ping(2, ClientApSecret), State),
+    [Challenge] = path_datagrams(sends(Effects), ServerApSecret),
+    ?assertEqual([?CLIENT_SPARE], short_header_dcids([{send, Challenge}])).
+
+move_to_probed_address_test() ->
+    %% A client that probed an address and then moves there is addressed
+    %% with the id its probes were answered with, and what it sent while
+    %% probing counts toward what may be sent there (RFC 9000 §8.1).
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
+    Probe = app_datagram_to(
+        CID1, [{path_challenge, ~"probe-01"} | padding(1100)], 2, ClientApSecret
+    ),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER2, Probe, State),
+    Move = app_datagram_to(CID1, [ping], 3, ClientApSecret),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Move, State1),
+    ?assertMatch([{migrate, ?PEER2} | _], Effects),
+    ?assertEqual({ok, ?PEER2}, ?M:peername(State2)),
+    [Challenge] = path_datagrams(sends(Effects), ServerApSecret),
+    ?assertEqual([?CLIENT_SPARE], short_header_dcids([{send, Challenge}])),
+    ?assertEqual(1200, byte_size(Challenge)).
+
+new_probing_address_takes_over_test() ->
+    %% A probe from yet another address takes over from the last probing
+    %% one, whose client id is retired (RFC 9000 §5.1.2).
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
+    Probe = app_datagram_to(
+        CID1, [{path_challenge, ~"probe-01"} | padding(1100)], 2, ClientApSecret
+    ),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER2, Probe, State),
+    Probe3 = to_scid([{path_challenge, ~"probe-03"} | padding(1100)], 3, ClientApSecret),
+    {_State2, Effects} = ?M:handle_datagram(?NOW, ?PEER3, Probe3, State1),
+    [Answer] = sends_to(?PEER3, Effects),
+    ?assertEqual([?CLIENT_SCID], short_header_dcids([{send, Answer}])),
+    ?assert(lists:member({retire_connection_id, 1}, sent_app_frames(Effects, ServerApSecret))).
+
+probe_during_validation_without_client_id_dropped_test() ->
+    %% While the new path is validated, the ids in use toward the new and the
+    %% old path are both taken, so a probe from a third address on another
+    %% server id than the new path's has no id to be answered with.
+    {State, ClientApSecret, _ServerApSecret, CID1} = connected_with_client_spare(),
+    {State1, _} = ?M:handle_datagram(
+        ?NOW, ?PEER2, app_datagram_to(CID1, [ping | padding(1100)], 2, ClientApSecret), State
+    ),
+    Probe = to_scid([{path_challenge, ~"probe-03"} | padding(1100)], 3, ClientApSecret),
+    {_State2, Effects} = ?M:handle_datagram(?NOW, ?PEER3, Probe, State1),
+    ?assertEqual([], sends_to(?PEER3, Effects)).
+
+response_on_old_path_validates_new_one_test() ->
+    %% RFC 9000 §8.2.3: a PATH_RESPONSE received on any path validates the
+    %% path its challenge was sent on; one from the old path is a probing
+    %% packet there and moves nothing.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, Effects1} = ?M:handle_datagram(?NOW, ?PEER2, padded_ping(0, ClientApSecret), State),
+    [Data] = challenge_data(sends(Effects1), ServerApSecret),
+    {State2, Effects2} = ?M:handle_datagram(
+        ?NOW, ?PEER, to_scid([{path_response, Data}], 1, ClientApSecret), State1
+    ),
+    ?assertEqual([], [M || {migrate, _} = M <- Effects2]),
+    ?assertEqual({ok, ?PEER2}, ?M:peername(State2)),
+    ?assertEqual([], [T || {arm_timer, path, _} = T <- Effects2]).
+
+validated_after_old_path_id_retired_test() ->
+    %% A validation that completes after the client retired the old path's
+    %% id has no old path left to release.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
+    {State1, Effects1} = ?M:handle_datagram(
+        ?NOW, ?PEER2, app_datagram_to(CID1, [ping | padding(1100)], 2, ClientApSecret), State
+    ),
+    [Data] = challenge_data(sends(Effects1), ServerApSecret),
+    Frames = [{new_connection_id, 2, 1, <<22:64>>, <<2:128>>}, {path_response, Data}],
+    {State2, Effects2} = ?M:handle_datagram(
+        ?NOW, ?PEER2, app_datagram_to(CID1, Frames, 3, ClientApSecret), State1
+    ),
+    ?assertEqual(connected, ?M:phase(State2)),
+    ?assertEqual([], [T || {arm_timer, path, _} = T <- Effects2]),
+    ?assertEqual([?CLIENT_SPARE], lists:usort(short_header_dcids(Effects2))).
+
+lost_path_challenge_not_resent_test() ->
+    %% RFC 9000 §13.3: a lost PATH_CHALLENGE is not resent as it was; the
+    %% validation timer sends a new one.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER2, padded_ping(0, ClientApSecret), State),
+    {State2, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"later", true, ?NOW, State1),
+    Largest = largest_app_pn(Sent, ServerApSecret),
+    Ack = to_scid([{ack, Largest, 0, 0, [], undefined}], 1, ClientApSecret),
+    {State3, AckEffects} = ?M:handle_datagram(?NOW, ?PEER2, Ack, State2),
+    {_State4, PtoEffects} = ?M:handle_timeout(?NOW + 5000, pto, State3),
+    ?assertEqual([], challenge_data(sends(AckEffects) ++ sends(PtoEffects), ServerApSecret)).
+
+path_timer_without_validation_test() ->
+    %% A path timer that outlived its validation only re-arms the timer; on
+    %% a closing connection it does nothing.
+    {State, ClientApSecret} = connected_with_owner(),
+    {State1, Effects} = ?M:handle_timeout(?NOW, path, State),
+    ?assertEqual(connected, ?M:phase(State1)),
+    ?assertMatch([{arm_timer, _, _}], [T || {arm_timer, _, _} = T <- Effects]),
+    Close = app_datagram([{connection_close, transport, 0, 0, <<>>}], 0, ClientApSecret),
+    {Draining, _} = ?M:handle_datagram(?NOW, ?PEER, Close, State1),
+    ?assertEqual({Draining, []}, ?M:handle_timeout(?NOW, path, Draining)).
 
 retransmit_of_several_lost_packets_fits_datagrams_test() ->
     %% RFC 9000 §14: every datagram stays within 1200 bytes. Losing several
@@ -825,7 +1605,7 @@ retransmit_of_several_lost_packets_fits_datagrams_test() ->
     {State1, Sent} = ?M:handle_send(self(), make_ref(), 0, Payload, true, ?NOW, State),
     Largest = largest_app_pn(Sent, ServerApSecret),
     Ack = app_datagram([{ack, Largest, 0, 0, [], undefined}], 0, ClientApSecret),
-    {State2, AckEffects} = ?M:handle_datagram(?NOW, Ack, State1),
+    {State2, AckEffects} = ?M:handle_datagram(?NOW, ?PEER, Ack, State1),
     {_State3, PtoEffects} = ?M:handle_timeout(?NOW + 5000, pto, State2),
     Resent = sends(AckEffects) ++ sends(PtoEffects),
     ?assertEqual([], [byte_size(D) || D <- Resent, byte_size(D) > 1200]),
@@ -867,9 +1647,11 @@ pto_deadline_not_pushed_back_by_peer_packets_test() ->
     {State, ClientApSecret, _ServerApSecret} = connect_owned(),
     {State1, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"data", false, ?NOW, State),
     [{arm_timer, pto, Deadline}] = [T || {arm_timer, _, _} = T <- Sent],
-    {State2, _} = ?M:handle_datagram(?NOW + 100, app_datagram([ping], 0, ClientApSecret), State1),
+    {State2, _} = ?M:handle_datagram(
+        ?NOW + 100, ?PEER, app_datagram([ping], 0, ClientApSecret), State1
+    ),
     {_State3, Effects} = ?M:handle_datagram(
-        ?NOW + 100, app_datagram([ping], 1, ClientApSecret), State2
+        ?NOW + 100, ?PEER, app_datagram([ping], 1, ClientApSecret), State2
     ),
     ?assertEqual([{arm_timer, pto, Deadline}], [T || {arm_timer, _, _} = T <- Effects]).
 
@@ -879,7 +1661,7 @@ pto_deadline_not_pushed_back_by_peer_packets_test() ->
 pto_probe_carries_unacked_tail_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     AckDone = app_datagram([{ack, 0, 0, 0, [], undefined}], 0, ClientApSecret),
-    {State1, _} = ?M:handle_datagram(?NOW, AckDone, State),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, AckDone, State),
     {State2, _} = ?M:handle_send(self(), make_ref(), 0, ~"tail", true, ?NOW, State1),
     {_State3, Effects} = ?M:handle_timeout(?NOW + 5000, pto, State2),
     Frames = sent_app_frames(Effects, ServerApSecret),
@@ -891,9 +1673,9 @@ pto_probe_carries_unacked_tail_test() ->
 pto_probe_pings_when_nothing_to_resend_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     AckDone = app_datagram([{ack, 0, 0, 0, [], undefined}], 0, ClientApSecret),
-    {State1, _} = ?M:handle_datagram(?NOW, AckDone, State),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, AckDone, State),
     Challenge = app_datagram([{path_challenge, ~"8 bytes!"}], 1, ClientApSecret),
-    {State2, _} = ?M:handle_datagram(?NOW, Challenge, State1),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, Challenge, State1),
     {_State3, Effects} = ?M:handle_timeout(?NOW + 5000, pto, State2),
     Frames = sent_app_frames(Effects, ServerApSecret),
     ?assert(lists:member(ping, Frames)),
@@ -907,7 +1689,7 @@ pto_probe_ack_recovers_a_lost_tail_test() ->
     {State2, Probe} = ?M:handle_timeout(?NOW + 5000, pto, State1),
     ProbePN = largest_app_pn(Probe, ServerApSecret),
     Ack = app_datagram([{ack, ProbePN, 0, 0, [], undefined}], 0, ClientApSecret),
-    {_State3, Effects} = ?M:handle_datagram(?NOW + 5010, Ack, State2),
+    {_State3, Effects} = ?M:handle_datagram(?NOW + 5010, ?PEER, Ack, State2),
     ?assertEqual([{stream, 0, 0, ~"tail", true}], sent_stream_frames(Effects, ServerApSecret)).
 
 amplification_limit_caps_first_flight_test() ->
@@ -917,7 +1699,7 @@ amplification_limit_caps_first_flight_test() ->
     %% the limit).
     {State0, Ctx} = new_conn([binary:copy(<<0>>, 6000)]),
     {Datagram, _CHFramed} = client_hello_datagram(Ctx),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, State0),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State0),
     ?assertEqual(handshaking, ?M:phase(State1)),
     ?assert(lists:sum([byte_size(D) || D <- sends(Effects)]) =< 3 * 1200).
 
@@ -936,7 +1718,7 @@ idle_timer_armed_when_nothing_in_flight_test() ->
     %% nearest, and only, timer armed.
     {State, ApSecret} = connected_with_owner(),
     Ack = app_datagram([{ack, 0, 0, 0, [], undefined}], 0, ApSecret),
-    {_State1, Effects} = ?M:handle_datagram(?NOW, Ack, State),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Ack, State),
     ?assertEqual([?NOW + ?IDLE_TIMEOUT], [At || {arm_timer, idle, At} <- Effects]).
 
 idle_deadline_reset_on_receive_test() ->
@@ -946,7 +1728,7 @@ idle_deadline_reset_on_receive_test() ->
     {State, ApSecret} = connected_with_owner(),
     Later = ?NOW + 5000,
     Ack = app_datagram([{ack, 0, 0, 0, [], undefined}], 0, ApSecret),
-    {_State1, Effects} = ?M:handle_datagram(Later, Ack, State),
+    {_State1, Effects} = ?M:handle_datagram(Later, ?PEER, Ack, State),
     ?assertEqual([Later + ?IDLE_TIMEOUT], [At || {arm_timer, idle, At} <- Effects]).
 
 idle_timer_armed_after_pto_backoff_test() ->
@@ -1010,7 +1792,7 @@ owner_set_in_handshaking_gets_connected_on_completion_test() ->
         ?DCID,
         ?SCID
     ),
-    {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, State1b),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State1b),
     ?assertEqual(connected, ?M:phase(State2)),
     ?assertEqual([{emit, Owner, {connected, expected_info()}}], emits(Effects)).
 
@@ -1044,7 +1826,7 @@ connected_not_re_emitted_on_later_datagram_test() ->
         ?DCID,
         ?SCID
     ),
-    {State2, FirstEffects} = ?M:handle_datagram(?NOW, Finished, State1b),
+    {State2, FirstEffects} = ?M:handle_datagram(?NOW, ?PEER, Finished, State1b),
     ?assertEqual([{emit, Owner, {connected, expected_info()}}], emits(FirstEffects)),
     %% A processed 1-RTT packet once connected: still exactly zero re-emits.
     AppPing = ?TC:seal(
@@ -1055,7 +1837,7 @@ connected_not_re_emitted_on_later_datagram_test() ->
         ?DCID,
         ?SCID
     ),
-    {_State3, LaterEffects} = ?M:handle_datagram(?NOW, AppPing, State2),
+    {_State3, LaterEffects} = ?M:handle_datagram(?NOW, ?PEER, AppPing, State2),
     ?assertEqual([], emits(LaterEffects)).
 
 %% =============================================================================
@@ -1065,7 +1847,7 @@ connected_not_re_emitted_on_later_datagram_test() ->
 stream_data_emitted_test() ->
     {State, ApSecret} = connected_with_owner(),
     Datagram = app_datagram([{stream, 0, 0, ~"hello", true}], 0, ApSecret),
-    {_State1, Effects} = ?M:handle_datagram(?NOW, Datagram, State),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State),
     ?assertEqual(
         [{emit, self(), {stream_opened, 0}}, {emit, self(), {stream_data, 0, ~"hello", true}}],
         emits(Effects)
@@ -1076,24 +1858,24 @@ stream_fin_only_emitted_test() ->
     %% the {<<>>, true} end-of-stream the h3 layer dispatches on.
     {State, ApSecret} = connected_with_owner(),
     {State1, E1} = ?M:handle_datagram(
-        ?NOW, app_datagram([{stream, 0, 0, ~"hi", false}], 0, ApSecret), State
+        ?NOW, ?PEER, app_datagram([{stream, 0, 0, ~"hi", false}], 0, ApSecret), State
     ),
     ?assertEqual(
         [{emit, self(), {stream_opened, 0}}, {emit, self(), {stream_data, 0, ~"hi", false}}],
         emits(E1)
     ),
     {_State2, E2} = ?M:handle_datagram(
-        ?NOW, app_datagram([{stream, 0, 2, <<>>, true}], 1, ApSecret), State1
+        ?NOW, ?PEER, app_datagram([{stream, 0, 2, <<>>, true}], 1, ApSecret), State1
     ),
     ?assertEqual([{emit, self(), {stream_data, 0, <<>>, true}}], emits(E2)).
 
 stream_reset_emitted_test() ->
     {State, ApSecret} = connected_with_owner(),
     {State1, _} = ?M:handle_datagram(
-        ?NOW, app_datagram([{stream, 0, 0, ~"hi", false}], 0, ApSecret), State
+        ?NOW, ?PEER, app_datagram([{stream, 0, 0, ~"hi", false}], 0, ApSecret), State
     ),
     {_State2, Effects} = ?M:handle_datagram(
-        ?NOW, app_datagram([{reset_stream, 0, 7, 2}], 1, ApSecret), State1
+        ?NOW, ?PEER, app_datagram([{reset_stream, 0, 7, 2}], 1, ApSecret), State1
     ),
     ?assertEqual([{emit, self(), {stream_reset, 0, 7}}], emits(Effects)).
 
@@ -1102,7 +1884,7 @@ out_of_order_stream_not_delivered_test() ->
     %% delivering, so only stream_opened is emitted.
     {State, ApSecret} = connected_with_owner(),
     Datagram = app_datagram([{stream, 0, 5, ~"x", false}], 0, ApSecret),
-    {_State1, Effects} = ?M:handle_datagram(?NOW, Datagram, State),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State),
     ?assertEqual([{emit, self(), {stream_opened, 0}}], emits(Effects)).
 
 stream_on_server_initiated_id_closes_test() ->
@@ -1111,7 +1893,7 @@ stream_on_server_initiated_id_closes_test() ->
     %% closes rather than delivering the data.
     {State, ApSecret} = connected_with_owner(),
     Bad = app_datagram([{stream, 3, 0, ~"x", true}], 0, ApSecret),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Bad, State),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, stream_state_error}}}], emits(Effects)).
 
@@ -1120,7 +1902,7 @@ reset_stream_on_server_initiated_id_closes_test() ->
     %% RFC 9000 §19.4 STREAM_STATE_ERROR.
     {State, ApSecret} = connected_with_owner(),
     Bad = app_datagram([{reset_stream, 1, 7, 0}], 0, ApSecret),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Bad, State),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, stream_state_error}}}], emits(Effects)).
 
@@ -1131,7 +1913,7 @@ stream_over_advertised_bidi_count_closes_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     OverLimit = ?MAX_STREAMS_BIDI * 4,
     Bad = app_datagram([{stream, OverLimit, 0, ~"x", true}], 0, ClientApSecret),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Bad, State),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, stream_limit_error}}}], emits(Effects)),
     ExpectedCode = roadrunner_quic_error:code_int(stream_limit_error),
@@ -1148,7 +1930,7 @@ stream_over_advertised_uni_count_closes_test() ->
     {State, ApSecret} = connected_with_owner(),
     OverLimit = ?MAX_STREAMS_UNI * 4 + 2,
     Bad = app_datagram([{stream, OverLimit, 0, ~"x", true}], 0, ApSecret),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Bad, State),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, stream_limit_error}}}], emits(Effects)).
 
@@ -1157,7 +1939,7 @@ reset_over_advertised_bidi_count_closes_test() ->
     {State, ApSecret} = connected_with_owner(),
     OverLimit = ?MAX_STREAMS_BIDI * 4,
     Bad = app_datagram([{reset_stream, OverLimit, 7, 0}], 0, ApSecret),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Bad, State),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, stream_limit_error}}}], emits(Effects)).
 
@@ -1166,7 +1948,7 @@ reset_over_advertised_uni_count_closes_test() ->
     {State, ApSecret} = connected_with_owner(),
     OverLimit = ?MAX_STREAMS_UNI * 4 + 2,
     Bad = app_datagram([{reset_stream, OverLimit, 7, 0}], 0, ApSecret),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Bad, State),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, stream_limit_error}}}], emits(Effects)).
 
@@ -1175,10 +1957,10 @@ stream_final_size_violation_closes_test() ->
     %% RFC 9000 §4.5 connection error.
     {State, ApSecret} = connected_with_owner(),
     {State1, _} = ?M:handle_datagram(
-        ?NOW, app_datagram([{stream, 0, 0, ~"hello", false}], 0, ApSecret), State
+        ?NOW, ?PEER, app_datagram([{stream, 0, 0, ~"hello", false}], 0, ApSecret), State
     ),
     Bad = app_datagram([{stream, 0, 0, <<>>, true}], 1, ApSecret),
-    {State2, Effects} = ?M:handle_datagram(?NOW, Bad, State1),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Bad, State1),
     ?assertEqual(draining, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, final_size_error}}}], emits(Effects)).
 
@@ -1187,10 +1969,10 @@ reset_final_size_violation_closes_test() ->
     %% an RFC 9000 §4.5 connection error.
     {State, ApSecret} = connected_with_owner(),
     {State1, _} = ?M:handle_datagram(
-        ?NOW, app_datagram([{stream, 0, 0, ~"hello", false}], 0, ApSecret), State
+        ?NOW, ?PEER, app_datagram([{stream, 0, 0, ~"hello", false}], 0, ApSecret), State
     ),
     Bad = app_datagram([{reset_stream, 0, 7, 2}], 1, ApSecret),
-    {State2, Effects} = ?M:handle_datagram(?NOW, Bad, State1),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Bad, State1),
     ?assertEqual(draining, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, final_size_error}}}], emits(Effects)).
 
@@ -1203,7 +1985,7 @@ stream_over_advertised_stream_flow_limit_closes_test() ->
     {State, ApSecret} = connected_with_owner(),
     Oversized = binary:copy(~"x", ?STREAM_RECV_WINDOW + 1),
     Bad = app_datagram([{stream, 0, 0, Oversized, false}], 0, ApSecret),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Bad, State),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, flow_control_error}}}], emits(Effects)).
 
@@ -1217,7 +1999,7 @@ data_over_advertised_connection_flow_limit_closes_test() ->
     {State, ApSecret} = connected_with_owner(),
     Oversized = binary:copy(~"x", ?CONN_RECV_WINDOW + 1),
     Bad = app_datagram([{stream, 0, 0, Oversized, false}], 0, ApSecret),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Bad, State),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, flow_control_error}}}], emits(Effects)).
 
@@ -1228,7 +2010,7 @@ data_over_advertised_connection_flow_limit_closes_test() ->
 recv_window_refilled_with_max_data_and_max_stream_data_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     Upload = app_datagram([{stream, 0, 0, binary:copy(~"u", 600), false}], 0, ClientApSecret),
-    {_State1, Effects} = ?M:handle_datagram(?NOW, Upload, State),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Upload, State),
     Frames = sent_app_frames(Effects, ServerApSecret),
     ?assert(lists:member({max_data, 600 + ?CONN_RECV_WINDOW}, Frames)),
     ?assert(lists:member({max_stream_data, 0, 600 + ?STREAM_RECV_WINDOW}, Frames)).
@@ -1239,7 +2021,7 @@ recv_window_refilled_with_max_data_and_max_stream_data_test() ->
 held_stream_credit_granted_on_consumption_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(#{stream_credit => on_read}),
     Upload = app_datagram([{stream, 0, 0, binary:copy(~"u", 600), false}], 0, ClientApSecret),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Upload, State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Upload, State),
     Frames = sent_app_frames(Effects, ServerApSecret),
     ?assert(lists:member({max_data, 600 + ?CONN_RECV_WINDOW}, Frames)),
     ?assertEqual([], [F || {max_stream_data, _, _} = F <- Frames]),
@@ -1264,10 +2046,10 @@ stream_retransmit_does_not_re_consume_flow_test() ->
     {State, ApSecret} = connected_with_owner(),
     Chunk = binary:copy(~"x", ?STREAM_RECV_WINDOW - 200),
     {State1, _} = ?M:handle_datagram(
-        ?NOW, app_datagram([{stream, 0, 0, Chunk, false}], 0, ApSecret), State
+        ?NOW, ?PEER, app_datagram([{stream, 0, 0, Chunk, false}], 0, ApSecret), State
     ),
     {State2, Effects} = ?M:handle_datagram(
-        ?NOW, app_datagram([{stream, 0, 0, Chunk, false}], 1, ApSecret), State1
+        ?NOW, ?PEER, app_datagram([{stream, 0, 0, Chunk, false}], 1, ApSecret), State1
     ),
     ?assertEqual(connected, ?M:phase(State2)),
     ?assertEqual([], emits(Effects)).
@@ -1293,7 +2075,9 @@ connected_precedes_stream_events_in_coalesced_datagram_test() ->
         ?SCID
     ),
     Request = app_datagram([{stream, 0, 0, ~"hi", true}], 0, ClientApSecret),
-    {_State2, Effects} = ?M:handle_datagram(?NOW, <<Finished/binary, Request/binary>>, State1b),
+    {_State2, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, <<Finished/binary, Request/binary>>, State1b
+    ),
     ?assertEqual(
         [
             {emit, Owner, {connected, expected_info()}},
@@ -1308,7 +2092,7 @@ stream_without_owner_not_emitted_test() ->
     %% stream events rather than crashing.
     #{state2 := State, client_ap_secret := ApSecret} = connect(),
     Datagram = app_datagram([{stream, 0, 0, ~"hi", true}], 0, ApSecret),
-    {_State1, Effects} = ?M:handle_datagram(?NOW, Datagram, State),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State),
     ?assertEqual([], emits(Effects)).
 
 %% =============================================================================
@@ -1361,7 +2145,7 @@ max_streams_uni_raises_server_limit_test() ->
         #{}, #{transport_params => #{initial_max_streams_uni => 0}}
     ),
     Frames = [{max_streams, uni, 2}, {max_streams, uni, 1}],
-    {State1, _} = ?M:handle_datagram(?NOW, app_datagram(Frames, 0, ClientApSecret), State),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram(Frames, 0, ClientApSecret), State),
     Ref1 = make_ref(),
     {State2, Effects1} = ?M:handle_call(self(), Ref1, open_uni, ?NOW, State1),
     ?assertEqual([{reply, self(), Ref1, {ok, 3}}], Effects1),
@@ -1379,7 +2163,7 @@ max_streams_bidi_ignored_test() ->
         #{}, #{transport_params => #{initial_max_streams_uni => 0}}
     ),
     Datagram = app_datagram([{max_streams, bidi, 10}], 0, ClientApSecret),
-    {State1, _} = ?M:handle_datagram(?NOW, Datagram, State),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State),
     ?assertEqual(connected, ?M:phase(State1)),
     Ref = make_ref(),
     {_State2, Effects} = ?M:handle_call(self(), Ref, open_uni, ?NOW, State1),
@@ -1510,7 +2294,7 @@ send_resumes_after_max_data_and_max_stream_data_test() ->
     Grant = app_datagram(
         [{max_data, Window * 2}, {max_stream_data, 0, Window * 2}], AckPN, ClientApSecret
     ),
-    {State3, E3} = ?M:handle_datagram(?NOW, Grant, State2),
+    {State3, E3} = ?M:handle_datagram(?NOW, ?PEER, Grant, State2),
     {Sent2, _State4, _} = flush_with_acks(State3, E3, ServerApSecret, ClientApSecret, AckPN + 1),
     ?assert(byte_size(Sent2) > 0),
     ?assertEqual(byte_size(Payload), byte_size(Sent1) + byte_size(Sent2)).
@@ -1553,11 +2337,11 @@ ack_grows_congestion_window_test() ->
     {State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
     Largest = largest_app_pn(Effects, ServerApSecret),
     Ack = app_datagram([{ack, Largest, 0, Largest, [], undefined}], 0, ClientApSecret),
-    {State2, _E2} = ?M:handle_datagram(?NOW, Ack, State1),
+    {State2, _E2} = ?M:handle_datagram(?NOW, ?PEER, Ack, State1),
     Grown = ?M:cwnd(State2),
     ?assert(Grown > ?M:cwnd(State1)),
     Dup = app_datagram([{ack, Largest, 0, Largest, [], undefined}], 1, ClientApSecret),
-    {State3, _E3} = ?M:handle_datagram(?NOW, Dup, State2),
+    {State3, _E3} = ?M:handle_datagram(?NOW, ?PEER, Dup, State2),
     ?assertEqual(Grown, ?M:cwnd(State3)).
 
 loss_halves_congestion_window_test() ->
@@ -1569,7 +2353,7 @@ loss_halves_congestion_window_test() ->
     {State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
     Largest = largest_app_pn(Effects, ServerApSecret),
     Gap = app_datagram([{ack, Largest, 0, 0, [], undefined}], 0, ClientApSecret),
-    {State2, _E2} = ?M:handle_datagram(?NOW, Gap, State1),
+    {State2, _E2} = ?M:handle_datagram(?NOW, ?PEER, Gap, State1),
     ?assert(?M:cwnd(State2) < ?M:cwnd(State1)).
 
 ack_only_datagram_not_congestion_controlled_test() ->
@@ -1579,8 +2363,10 @@ ack_only_datagram_not_congestion_controlled_test() ->
     %% PINGs with no server data to send make the ACK due at once, in exactly
     %% such an ACK-only datagram.
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
-    {State1, _} = ?M:handle_datagram(?NOW, app_datagram([ping], 0, ClientApSecret), State),
-    {_State2, Effects} = ?M:handle_datagram(?NOW, app_datagram([ping], 1, ClientApSecret), State1),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([ping], 0, ClientApSecret), State),
+    {_State2, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram([ping], 1, ClientApSecret), State1
+    ),
     ?assert(lists:any(fun is_ack/1, sent_app_frames(Effects, ServerApSecret))).
 
 %% RFC 9000 §13.2.1: a 1-RTT ACK may wait for data to ride with. One PING
@@ -1589,7 +2375,9 @@ ack_only_datagram_not_congestion_controlled_test() ->
 %% ack_delay_exponent of 3).
 delayed_ack_waits_then_goes_out_on_timer_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
-    {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram([ping], 0, ClientApSecret), State),
+    {State1, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram([ping], 0, ClientApSecret), State
+    ),
     ?assertEqual([], sends(Effects)),
     ?assertEqual([?NOW + 20], [At || {arm_timer, ack, At} <- Effects]),
     {_State2, Fired} = ?M:handle_timeout(?NOW + 20, ack, State1),
@@ -1602,13 +2390,17 @@ delayed_ack_waits_then_goes_out_on_timer_test() ->
 %% the peer learns of the loss without waiting (RFC 9000 §13.2.1).
 out_of_order_packet_acked_at_once_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
-    {_State1, Effects} = ?M:handle_datagram(?NOW, app_datagram([ping], 3, ClientApSecret), State),
+    {_State1, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram([ping], 3, ClientApSecret), State
+    ),
     ?assert(lists:any(fun is_ack/1, sent_app_frames(Effects, ServerApSecret))).
 
 %% A waiting ACK rides in the next packet that carries data.
 delayed_ack_rides_with_data_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
-    {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram([ping], 0, ClientApSecret), State),
+    {State1, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram([ping], 0, ClientApSecret), State
+    ),
     ?assertEqual([], sends(Effects)),
     {_State2, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"reply", true, ?NOW + 1, State1),
     Frames = sent_app_frames(Sent, ServerApSecret),
@@ -1618,9 +2410,9 @@ delayed_ack_rides_with_data_test() ->
 %% An ACK timer that fires once the connection is closing sends nothing.
 ack_timeout_while_draining_sends_nothing_test() ->
     {State, ClientApSecret, _ServerApSecret} = connect_owned(),
-    {State1, _} = ?M:handle_datagram(?NOW, app_datagram([ping], 0, ClientApSecret), State),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([ping], 0, ClientApSecret), State),
     Close = app_datagram([{connection_close, application, 0, undefined, <<>>}], 1, ClientApSecret),
-    {State2, _} = ?M:handle_datagram(?NOW, Close, State1),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, Close, State1),
     ?assertEqual(draining, ?M:phase(State2)),
     ?assertEqual({State2, []}, ?M:handle_timeout(?NOW + 20, ack, State2)).
 
@@ -1633,8 +2425,10 @@ ack_goes_out_alone_when_window_blocks_data_test() ->
     {State1, _} = ?M:handle_send(
         self(), make_ref(), 0, binary:copy(~"x", 100000), false, ?NOW, State
     ),
-    {State2, _} = ?M:handle_datagram(?NOW, app_datagram([ping], 0, ClientApSecret), State1),
-    {_State3, Effects} = ?M:handle_datagram(?NOW, app_datagram([ping], 1, ClientApSecret), State2),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([ping], 0, ClientApSecret), State1),
+    {_State3, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram([ping], 1, ClientApSecret), State2
+    ),
     Frames = sent_app_frames(Effects, ServerApSecret),
     ?assert(lists:any(fun is_ack/1, Frames)),
     ?assertEqual([], [F || {stream, _, _, _, _} = F <- Frames]).
@@ -1644,7 +2438,7 @@ max_stream_data_for_untracked_stream_ignored_test() ->
     %% (on_max_stream_data's unknown-id branch); the connection survives.
     {State, ClientApSecret, _ServerApSecret} = connect_owned(),
     Grant = app_datagram([{max_stream_data, 4, 1000000}], 0, ClientApSecret),
-    {State1, _Effects} = ?M:handle_datagram(?NOW, Grant, State),
+    {State1, _Effects} = ?M:handle_datagram(?NOW, ?PEER, Grant, State),
     ?assertEqual(connected, ?M:phase(State1)).
 
 %% A request stream finishes both ways (client FIN received, server response +
@@ -1655,10 +2449,10 @@ max_stream_data_for_untracked_stream_ignored_test() ->
 terminal_stream_is_pruned_and_late_frame_ignored_test() ->
     {State0, ClientApSecret, _ServerApSecret} = connect_owned(),
     Req = app_datagram([{stream, 0, 0, ~"req", true}], 0, ClientApSecret),
-    {State1, _} = ?M:handle_datagram(?NOW, Req, State0),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Req, State0),
     {State2, _} = ?M:handle_send(self(), make_ref(), 0, ~"resp", true, ?NOW, State1),
     Late = app_datagram([{stream, 0, 100, ~"late", false}], 1, ClientApSecret),
-    {State3, _} = ?M:handle_datagram(?NOW, Late, State2),
+    {State3, _} = ?M:handle_datagram(?NOW, ?PEER, Late, State2),
     ?assertEqual(connected, ?M:phase(State3)).
 
 %% After a stream is pruned, a genuinely new request on a higher id (above the
@@ -1666,10 +2460,10 @@ terminal_stream_is_pruned_and_late_frame_ignored_test() ->
 new_stream_after_prune_opens_test() ->
     {State0, ClientApSecret, _ServerApSecret} = connect_owned(),
     Req0 = app_datagram([{stream, 0, 0, ~"a", true}], 0, ClientApSecret),
-    {State1, _} = ?M:handle_datagram(?NOW, Req0, State0),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Req0, State0),
     {State2, _} = ?M:handle_send(self(), make_ref(), 0, ~"r", true, ?NOW, State1),
     Req4 = app_datagram([{stream, 4, 0, ~"b", true}], 1, ClientApSecret),
-    {_State3, Effects} = ?M:handle_datagram(?NOW, Req4, State2),
+    {_State3, Effects} = ?M:handle_datagram(?NOW, ?PEER, Req4, State2),
     ?assert(lists:member({stream_opened, 4}, [E || {emit, _Owner, E} <- Effects])).
 
 %% RFC 9000 §3.2: opening a stream opens every lower one of its type, so a
@@ -1679,14 +2473,14 @@ new_stream_after_prune_opens_test() ->
 reordered_lower_stream_opens_test() ->
     {State0, ClientApSecret, _ServerApSecret} = connect_owned(),
     Req8 = app_datagram([{stream, 8, 0, ~"c", true}], 0, ClientApSecret),
-    {State1, _} = ?M:handle_datagram(?NOW, Req8, State0),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Req8, State0),
     Req0 = app_datagram([{stream, 0, 0, ~"a", true}], 1, ClientApSecret),
-    {State2, Effects0} = ?M:handle_datagram(?NOW, Req0, State1),
+    {State2, Effects0} = ?M:handle_datagram(?NOW, ?PEER, Req0, State1),
     ?assertEqual(
         [{stream_opened, 0}, {stream_data, 0, ~"a", true}], [E || {emit, _, E} <- Effects0]
     ),
     Req4 = app_datagram([{stream, 4, 0, ~"b", true}], 2, ClientApSecret),
-    {_State3, Effects4} = ?M:handle_datagram(?NOW, Req4, State2),
+    {_State3, Effects4} = ?M:handle_datagram(?NOW, ?PEER, Req4, State2),
     ?assertEqual(
         [{stream_opened, 4}, {stream_data, 4, ~"b", true}], [E || {emit, _, E} <- Effects4]
     ).
@@ -1696,10 +2490,10 @@ reordered_lower_stream_opens_test() ->
 reset_for_pruned_stream_ignored_test() ->
     {State0, ClientApSecret, _ServerApSecret} = connect_owned(),
     Req = app_datagram([{stream, 0, 0, ~"req", true}], 0, ClientApSecret),
-    {State1, _} = ?M:handle_datagram(?NOW, Req, State0),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Req, State0),
     {State2, _} = ?M:handle_send(self(), make_ref(), 0, ~"resp", true, ?NOW, State1),
     Rst = app_datagram([{reset_stream, 0, 7, 3}], 1, ClientApSecret),
-    {State3, _} = ?M:handle_datagram(?NOW, Rst, State2),
+    {State3, _} = ?M:handle_datagram(?NOW, ?PEER, Rst, State2),
     ?assertEqual(connected, ?M:phase(State3)).
 
 %% --- deferred-ack backpressure (W3): park on a stalled stream, release on
@@ -1745,7 +2539,7 @@ parked_reply_released_on_ack_credit_test() ->
     ?assertEqual([], replies_for(E1, Ref)),
     Largest = largest_app_pn(E1, ServerApSecret),
     Ack = app_datagram([{ack, Largest, 0, Largest, [], undefined}], 0, ClientApSecret),
-    {_State2, E2} = ?M:handle_datagram(?NOW, Ack, State1),
+    {_State2, E2} = ?M:handle_datagram(?NOW, ?PEER, Ack, State1),
     ?assertEqual([ok], replies_for(E2, Ref)).
 
 %% A peer RESET_STREAM while parked releases the reply with {error, closed} (not
@@ -1757,7 +2551,7 @@ parked_reply_released_on_peer_reset_test() ->
     {State1, E1} = ?M:handle_send(self(), Ref, 0, Payload, false, ?NOW, State),
     ?assertEqual([], replies_for(E1, Ref)),
     Reset = app_datagram([{reset_stream, 0, 7, 0}], 0, ClientApSecret),
-    {_State2, E2} = ?M:handle_datagram(?NOW, Reset, State1),
+    {_State2, E2} = ?M:handle_datagram(?NOW, ?PEER, Reset, State1),
     ?assertEqual([{error, closed}], replies_for(E2, Ref)).
 
 %% A peer STOP_SENDING while parked clears our send side and releases with
@@ -1770,7 +2564,7 @@ parked_reply_released_on_peer_stop_sending_test() ->
     {State1, E1} = ?M:handle_send(self(), Ref, 0, Payload, false, ?NOW, State),
     ?assertEqual([], replies_for(E1, Ref)),
     Stop = app_datagram([{stop_sending, 0, 7}], 0, ClientApSecret),
-    {_State2, E2} = ?M:handle_datagram(?NOW, Stop, State1),
+    {_State2, E2} = ?M:handle_datagram(?NOW, ?PEER, Stop, State1),
     ?assertEqual([{error, closed}], replies_for(E2, Ref)),
     ?assert(lists:member({stream_reset, 0, 7}, [Ev || {emit, _Owner, Ev} <- E2])).
 
@@ -1798,7 +2592,7 @@ parked_reply_released_on_draining_test() ->
     Close = app_datagram(
         [{connection_close, application, 9, undefined, <<>>}], 0, ClientApSecret
     ),
-    {State2, E2} = ?M:handle_datagram(?NOW, Close, State1),
+    {State2, E2} = ?M:handle_datagram(?NOW, ?PEER, Close, State1),
     ?assertEqual(draining, ?M:phase(State2)),
     ?assertEqual([{error, closed}], replies_for(E2, Ref)).
 
@@ -1834,7 +2628,7 @@ parked_reply_kept_while_still_draining_test() ->
     ?assertEqual([], replies_for(E1, Ref)),
     Largest = largest_app_pn(E1, ServerApSecret),
     Ack = app_datagram([{ack, Largest, 0, Largest, [], undefined}], 0, ClientApSecret),
-    {_State2, E2} = ?M:handle_datagram(?NOW, Ack, State1),
+    {_State2, E2} = ?M:handle_datagram(?NOW, ?PEER, Ack, State1),
     %% One ACK grows the window by far less than the 100000-byte payload, so the
     %% reply is still withheld.
     ?assertEqual([], replies_for(E2, Ref)).
@@ -1843,7 +2637,7 @@ parked_reply_kept_while_still_draining_test() ->
 stop_sending_for_untracked_stream_ignored_test() ->
     {State, ClientApSecret, _ServerApSecret} = connect_owned(),
     Stop = app_datagram([{stop_sending, 8, 7}], 0, ClientApSecret),
-    {State1, _Effects} = ?M:handle_datagram(?NOW, Stop, State),
+    {State1, _Effects} = ?M:handle_datagram(?NOW, ?PEER, Stop, State),
     ?assertEqual(connected, ?M:phase(State1)).
 
 %% RFC 9000 §19.5 / §19.10: STOP_SENDING or MAX_STREAM_DATA naming a stream
@@ -1865,7 +2659,9 @@ unsendable_stream_frame_closes_test_() ->
 
 assert_stream_state_error(Frame) ->
     {State, ClientApSecret, _ServerApSecret} = connect_owned(),
-    {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram([Frame], 0, ClientApSecret), State),
+    {State1, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram([Frame], 0, ClientApSecret), State
+    ),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, stream_state_error}}}], emits(Effects)).
 
@@ -1875,7 +2671,9 @@ opened_server_uni_stream_frames_accepted_test() ->
     {State, ClientApSecret, _ServerApSecret} = connect_owned(),
     {State1, _} = ?M:handle_call(self(), make_ref(), open_uni, ?NOW, State),
     Frames = [{max_stream_data, 3, 1000}, {stop_sending, 3, 7}],
-    {State2, _Effects} = ?M:handle_datagram(?NOW, app_datagram(Frames, 0, ClientApSecret), State1),
+    {State2, _Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram(Frames, 0, ClientApSecret), State1
+    ),
     ?assertEqual(connected, ?M:phase(State2)).
 
 %% The final FIN-carrying push parks under the congestion window, then releases
@@ -1889,7 +2687,7 @@ parked_fin_push_released_on_drain_test() ->
     ?assertEqual([], replies_for(E1, Ref)),
     Largest = largest_app_pn(E1, ServerApSecret),
     Ack = app_datagram([{ack, Largest, 0, Largest, [], undefined}], 0, ClientApSecret),
-    {_State2, E2} = ?M:handle_datagram(?NOW, Ack, State1),
+    {_State2, E2} = ?M:handle_datagram(?NOW, ?PEER, Ack, State1),
     ?assertEqual([ok], replies_for(E2, Ref)),
     ?assert(
         lists:any(
@@ -1910,11 +2708,11 @@ peer_reset_does_not_resend_test() ->
     {State1, E1} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
     Largest = largest_app_pn(E1, ServerApSecret),
     Reset = app_datagram([{reset_stream, 0, 7, 0}], 0, ClientApSecret),
-    {State2, _E2} = ?M:handle_datagram(?NOW, Reset, State1),
+    {State2, _E2} = ?M:handle_datagram(?NOW, ?PEER, Reset, State1),
     %% An ACK grows cwnd and frees the in-flight bytes; a non-aborted stream
     %% would re-send here, but the aborted stream must stay silent.
     Ack = app_datagram([{ack, Largest, 0, Largest, [], undefined}], 1, ClientApSecret),
-    {_State3, E3} = ?M:handle_datagram(?NOW, Ack, State2),
+    {_State3, E3} = ?M:handle_datagram(?NOW, ?PEER, Ack, State2),
     ?assertEqual([], sent_stream_frames(E3, ServerApSecret)).
 
 %% A send on an already-aborted stream replies {error, closed} at once (it does
@@ -1923,7 +2721,7 @@ send_on_aborted_stream_replies_error_test() ->
     {State, ClientApSecret, _ServerApSecret} = connect_owned(),
     {State1, _E1} = ?M:handle_send(self(), make_ref(), 0, ~"hi", false, ?NOW, State),
     Reset = app_datagram([{reset_stream, 0, 7, 0}], 0, ClientApSecret),
-    {State2, _E2} = ?M:handle_datagram(?NOW, Reset, State1),
+    {State2, _E2} = ?M:handle_datagram(?NOW, ?PEER, Reset, State1),
     Ref = make_ref(),
     {_State3, E3} = ?M:handle_send(self(), Ref, 0, ~"more", false, ?NOW, State2),
     ?assertEqual([{error, closed}], replies_for(E3, Ref)).
@@ -1937,10 +2735,10 @@ parked_reply_not_double_released_test() ->
     {State1, E1} = ?M:handle_send(self(), Ref, 0, Payload, false, ?NOW, State),
     ?assertEqual([], replies_for(E1, Ref)),
     Reset = app_datagram([{reset_stream, 0, 7, 0}], 0, ClientApSecret),
-    {State2, E2} = ?M:handle_datagram(?NOW, Reset, State1),
+    {State2, E2} = ?M:handle_datagram(?NOW, ?PEER, Reset, State1),
     ?assertEqual([{error, closed}], replies_for(E2, Ref)),
     Ack = app_datagram([{ack, 0, 0, 0, [], undefined}], 1, ClientApSecret),
-    {_State3, E3} = ?M:handle_datagram(?NOW, Ack, State2),
+    {_State3, E3} = ?M:handle_datagram(?NOW, ?PEER, Ack, State2),
     ?assertEqual([], replies_for(E3, Ref)).
 
 %% As the peer opens bidi streams toward the advertised limit (test TP = 3), the
@@ -1950,10 +2748,10 @@ parked_reply_not_double_released_test() ->
 max_streams_granted_as_bidi_credit_consumed_test() ->
     {State0, ClientApSecret, ServerApSecret} = connect_owned(),
     Open0 = app_datagram([{stream, 0, 0, ~"a", true}], 0, ClientApSecret),
-    {State1, E0} = ?M:handle_datagram(?NOW, Open0, State0),
+    {State1, E0} = ?M:handle_datagram(?NOW, ?PEER, Open0, State0),
     ?assertEqual([], max_streams_frames(E0, ServerApSecret)),
     Open4 = app_datagram([{stream, 4, 0, ~"b", true}], 1, ClientApSecret),
-    {_State2, E4} = ?M:handle_datagram(?NOW, Open4, State1),
+    {_State2, E4} = ?M:handle_datagram(?NOW, ?PEER, Open4, State1),
     ?assertEqual([{max_streams, bidi, 5}], max_streams_frames(E4, ServerApSecret)).
 
 max_streams_frames(Effects, ServerApSecret) ->
@@ -1975,7 +2773,7 @@ fully_sent_stream_is_skipped_on_later_pass_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     {State1, _} = ?M:handle_send(self(), make_ref(), 0, ~"done", true, ?NOW, State),
     Ping = app_datagram([ping], 0, ClientApSecret),
-    {_State2, Effects} = ?M:handle_datagram(?NOW, Ping, State1),
+    {_State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Ping, State1),
     ?assertEqual([], sent_stream_frames(Effects, ServerApSecret)).
 
 %% =============================================================================
@@ -1988,7 +2786,7 @@ peer_connection_close_emits_closed_and_sends_nothing_test() ->
     %% owner, and sends nothing back (RFC 9000 §10.2).
     {State, ApSecret} = connected_with_owner(),
     Close = app_datagram([{connection_close, transport, 0, 0, <<>>}], 0, ApSecret),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Close, State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Close, State),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {peer, 0}}}], emits(Effects)),
     ?assertEqual([], sends(Effects)),
@@ -2002,7 +2800,7 @@ frames_after_connection_close_are_ignored_test() ->
     Close = app_datagram(
         [{connection_close, transport, 7, 0, <<>>}, {stream, 0, 0, ~"x", true}], 0, ApSecret
     ),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Close, State),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Close, State),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {peer, 7}}}], emits(Effects)).
 
@@ -2018,7 +2816,7 @@ peer_handshake_level_close_test() ->
         ?DCID,
         ?SCID
     ),
-    {State2, Effects} = ?M:handle_datagram(?NOW, Close, with_owner(State1)),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Close, with_owner(State1)),
     ?assertEqual(closed, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {peer, 2}}}], emits(Effects)).
 
@@ -2028,7 +2826,7 @@ local_error_transmits_connection_close_test() ->
     %% error code; a peer-initiated close, by contrast, sends nothing back.
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     Bad = app_datagram([{stream, 3, 0, ~"x", true}], 0, ClientApSecret),
-    {_State1, Effects} = ?M:handle_datagram(?NOW, Bad, State),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Bad, State),
     Frames = ?TC:frames(
         sends(Effects),
         application,
@@ -2055,7 +2853,7 @@ undersized_initial_close_is_suppressed_test() ->
     Tiny = ?TC:seal_raw(
         initial, 0, roadrunner_quic_keys:initial_client(?DCID), CloseFrame, ?DCID, ?SCID
     ),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Tiny, with_owner(State0)),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Tiny, with_owner(State0)),
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)),
     ?assertEqual([], sends(Effects)).
@@ -2081,7 +2879,7 @@ coalesced_initial_error_then_handshake_does_not_crash_test() ->
         ?SCID
     ),
     {State2, Effects} = ?M:handle_datagram(
-        ?NOW, <<BadInitial/binary, HandshakePing/binary>>, with_owner(State1)
+        ?NOW, ?PEER, <<BadInitial/binary, HandshakePing/binary>>, with_owner(State1)
     ),
     ?assertEqual(closed, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
@@ -2093,9 +2891,9 @@ late_packet_during_draining_is_absorbed_test() ->
     %% running.
     {State, ApSecret} = connected_with_owner(),
     Close = app_datagram([{connection_close, transport, 0, 0, <<>>}], 0, ApSecret),
-    {Draining, _} = ?M:handle_datagram(?NOW, Close, State),
+    {Draining, _} = ?M:handle_datagram(?NOW, ?PEER, Close, State),
     Late = app_datagram([{stream, 0, 0, ~"x", true}], 1, ApSecret),
-    {Draining1, Effects} = ?M:handle_datagram(?NOW + 10, Late, Draining),
+    {Draining1, Effects} = ?M:handle_datagram(?NOW + 10, ?PEER, Late, Draining),
     ?assertEqual(draining, ?M:phase(Draining1)),
     ?assertEqual([], sends(Effects)),
     ?assertEqual([], emits(Effects)),
@@ -2106,11 +2904,13 @@ late_packet_during_draining_is_absorbed_test() ->
 %% counts 1, 2, 4, 8, ... so the answers stay rate-limited.
 late_packet_after_local_close_resends_close_test() ->
     {State, ApSecret} = connected_with_owner(),
-    Bad = app_datagram([{retire_connection_id, 1}], 0, ApSecret),
-    {Closing, CloseEffects} = ?M:handle_datagram(?NOW, Bad, State),
+    Bad = app_datagram([{retire_connection_id, 9}], 0, ApSecret),
+    {Closing, CloseEffects} = ?M:handle_datagram(?NOW, ?PEER, Bad, State),
     ?assertEqual(draining, ?M:phase(Closing)),
     [CloseDatagram] = sends(CloseEffects),
-    Late = fun(PN, S) -> ?M:handle_datagram(?NOW + PN, app_datagram([ping], PN, ApSecret), S) end,
+    Late = fun(PN, S) ->
+        ?M:handle_datagram(?NOW + PN, ?PEER, app_datagram([ping], PN, ApSecret), S)
+    end,
     {S1, E1} = Late(1, Closing),
     {S2, E2} = Late(2, S1),
     {S3, E3} = Late(3, S2),
@@ -2127,7 +2927,7 @@ drain_timeout_closes_test() ->
     %% timeout emits nothing.
     {State, ApSecret} = connected_with_owner(),
     Close = app_datagram([{connection_close, transport, 0, 0, <<>>}], 0, ApSecret),
-    {Draining, _} = ?M:handle_datagram(?NOW, Close, State),
+    {Draining, _} = ?M:handle_datagram(?NOW, ?PEER, Close, State),
     {Closed, Effects} = ?M:handle_timeout(?NOW + 999999, drain, Draining),
     ?assertEqual(closed, ?M:phase(Closed)),
     ?assertEqual([], Effects).
@@ -2137,7 +2937,7 @@ send_on_draining_connection_is_rejected_test() ->
     %% write is answered {error, closed} and nothing goes out.
     {State, ApSecret} = connected_with_owner(),
     Close = app_datagram([{connection_close, transport, 0, 0, <<>>}], 0, ApSecret),
-    {Draining, _} = ?M:handle_datagram(?NOW, Close, State),
+    {Draining, _} = ?M:handle_datagram(?NOW, ?PEER, Close, State),
     Ref = make_ref(),
     {Draining1, Effects} = ?M:handle_send(self(), Ref, 0, ~"data", true, ?NOW, Draining),
     ?assertEqual(draining, ?M:phase(Draining1)),
@@ -2155,7 +2955,7 @@ send_on_draining_connection_is_rejected_test() ->
 peer_key_update_switches_both_directions_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     Update = phase_datagram([ping], 0, generation_keys(ClientApSecret, 1), 1),
-    {State1, Effects1} = ?M:handle_datagram(?NOW, Update, State),
+    {State1, Effects1} = ?M:handle_datagram(?NOW, ?PEER, Update, State),
     ?assertEqual(connected, ?M:phase(State1)),
     ?assertEqual([], sends(Effects1)),
     {_State2, Effects2} = ?M:handle_timeout(?NOW + 20, ack, State1),
@@ -2174,13 +2974,13 @@ peer_key_update_switches_both_directions_test() ->
 forged_key_phase_changes_nothing_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     Forged = phase_datagram([ping], 0, generation_keys(ClientApSecret, 0), 1),
-    {State1, Effects1} = ?M:handle_datagram(?NOW, Forged, State),
+    {State1, Effects1} = ?M:handle_datagram(?NOW, ?PEER, Forged, State),
     ?assertEqual([], sends(Effects1)),
     Data = phase_datagram(
         [{stream, 0, 0, ~"hello", true}], 1, generation_keys(ClientApSecret, 0), 0
     ),
     %% Packet 1 follows a gap (the dropped packet 0), so its ACK goes out at once.
-    {_State2, Effects2} = ?M:handle_datagram(?NOW, Data, State1),
+    {_State2, Effects2} = ?M:handle_datagram(?NOW, ?PEER, Data, State1),
     ?assert(lists:member({emit, self(), {stream_data, 0, ~"hello", true}}, emits(Effects2))),
     ?assertMatch(
         [{ok, #{key_phase := 0, frames := [{ack, 1, _, 0, [], undefined} | _]}}],
@@ -2195,7 +2995,7 @@ reordered_old_phase_packet_opens_with_previous_keys_test() ->
     Late = phase_datagram(
         [{stream, 0, 0, ~"late", true}], 1, generation_keys(ClientApSecret, 0), 0
     ),
-    {_State2, Effects} = ?M:handle_datagram(?NOW + 1, Late, State1),
+    {_State2, Effects} = ?M:handle_datagram(?NOW + 1, ?PEER, Late, State1),
     ?assert(lists:member({emit, self(), {stream_data, 0, ~"late", true}}, emits(Effects))).
 
 %% RFC 9001 §6.5: the previous keys are discarded three PTOs after the update,
@@ -2206,7 +3006,7 @@ previous_keys_discarded_after_three_ptos_test() ->
     Late = phase_datagram(
         [{stream, 0, 0, ~"late", true}], 1, generation_keys(ClientApSecret, 0), 0
     ),
-    {State2, Effects} = ?M:handle_datagram(?NOW + 10000, Late, State1),
+    {State2, Effects} = ?M:handle_datagram(?NOW + 10000, ?PEER, Late, State1),
     ?assertEqual(connected, ?M:phase(State2)),
     ?assertEqual([], emits(Effects)).
 
@@ -2219,7 +3019,7 @@ old_phase_packet_above_new_phase_is_dropped_test() ->
     Stale = phase_datagram(
         [{stream, 0, 0, ~"stale", true}], 3, generation_keys(ClientApSecret, 0), 0
     ),
-    {State2, Effects} = ?M:handle_datagram(?NOW + 1, Stale, State1),
+    {State2, Effects} = ?M:handle_datagram(?NOW + 1, ?PEER, Stale, State1),
     ?assertEqual(connected, ?M:phase(State2)),
     ?assertEqual([], emits(Effects)).
 
@@ -2230,16 +3030,16 @@ reordered_new_phase_packet_lowers_previous_bound_test() ->
     {State, ClientApSecret, _ServerApSecret} = connect_owned(),
     State1 = updated_at(5, ClientApSecret, State),
     Reordered = phase_datagram([ping], 3, generation_keys(ClientApSecret, 1), 1),
-    {State2, _} = ?M:handle_datagram(?NOW + 1, Reordered, State1),
+    {State2, _} = ?M:handle_datagram(?NOW + 1, ?PEER, Reordered, State1),
     Between = phase_datagram(
         [{stream, 0, 0, ~"between", true}], 4, generation_keys(ClientApSecret, 0), 0
     ),
-    {State3, Effects3} = ?M:handle_datagram(?NOW + 1, Between, State2),
+    {State3, Effects3} = ?M:handle_datagram(?NOW + 1, ?PEER, Between, State2),
     ?assertEqual([], emits(Effects3)),
     Below = phase_datagram(
         [{stream, 0, 0, ~"below", true}], 2, generation_keys(ClientApSecret, 0), 0
     ),
-    {_State4, Effects4} = ?M:handle_datagram(?NOW + 1, Below, State3),
+    {_State4, Effects4} = ?M:handle_datagram(?NOW + 1, ?PEER, Below, State3),
     ?assert(lists:member({emit, self(), {stream_data, 0, ~"below", true}}, emits(Effects4))).
 
 %% RFC 9001 §6.2: a second update before the server has acknowledged a packet
@@ -2248,9 +3048,9 @@ reordered_new_phase_packet_lowers_previous_bound_test() ->
 second_update_before_ack_closes_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     Update = phase_datagram([ping], 0, generation_keys(ClientApSecret, 1), 1),
-    {State1, _} = ?M:handle_datagram(?NOW, Update, State),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Update, State),
     Again = phase_datagram([ping], 1, generation_keys(ClientApSecret, 2), 0),
-    {State2, Effects} = ?M:handle_datagram(?NOW, Again, State1),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Again, State1),
     ?assertEqual(draining, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, key_update_error}}}], emits(Effects)),
     ?assertMatch(
@@ -2263,10 +3063,10 @@ second_update_before_ack_closes_test() ->
 second_update_after_ack_commits_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     Update = phase_datagram([ping], 0, generation_keys(ClientApSecret, 1), 1),
-    {State1, _} = ?M:handle_datagram(?NOW, Update, State),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Update, State),
     {State2, _} = ?M:handle_timeout(?NOW + 20, ack, State1),
     Again = phase_datagram([ping], 1, generation_keys(ClientApSecret, 2), 0),
-    {State3, _} = ?M:handle_datagram(?NOW + 30, Again, State2),
+    {State3, _} = ?M:handle_datagram(?NOW + 30, ?PEER, Again, State2),
     ?assertEqual(connected, ?M:phase(State3)),
     {_State4, Effects} = ?M:handle_timeout(?NOW + 50, ack, State3),
     ?assertMatch(
@@ -2287,7 +3087,7 @@ chacha20_peer_key_update_test() ->
     Update = phase_datagram(
         [ping], 0, generation_keys(chacha20_poly1305, ClientApSecret, 1), 1
     ),
-    {State1, _} = ?M:handle_datagram(?NOW, Update, State),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Update, State),
     ?assertEqual(connected, ?M:phase(State1)),
     {State2, Effects2} = ?M:handle_timeout(?NOW + 20, ack, State1),
     ?assertMatch(
@@ -2300,7 +3100,7 @@ chacha20_peer_key_update_test() ->
     Again = phase_datagram(
         [ping], 1, generation_keys(chacha20_poly1305, ClientApSecret, 2), 0
     ),
-    {State3, _} = ?M:handle_datagram(?NOW + 30, Again, State2),
+    {State3, _} = ?M:handle_datagram(?NOW + 30, ?PEER, Again, State2),
     ?assertEqual(connected, ?M:phase(State3)),
     {_State4, Effects4} = ?M:handle_timeout(?NOW + 50, ack, State3),
     ?assertMatch(
@@ -2317,7 +3117,7 @@ aes_256_gcm_peer_key_update_test() ->
     {Updated, _} = roadrunner_quic_keys:update(aes_256_gcm, ClientApSecret),
     ?assertEqual(48, byte_size(Updated)),
     Update = phase_datagram([ping], 0, generation_keys(aes_256_gcm, ClientApSecret, 1), 1),
-    {State1, _} = ?M:handle_datagram(?NOW, Update, State),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Update, State),
     ?assertEqual(connected, ?M:phase(State1)),
     {State2, Effects2} = ?M:handle_timeout(?NOW + 20, ack, State1),
     ?assertMatch(
@@ -2328,7 +3128,7 @@ aes_256_gcm_peer_key_update_test() ->
         [{auth_failed, application}], app_packets(Effects2, generation_keys(ServerApSecret, 1))
     ),
     Again = phase_datagram([ping], 1, generation_keys(aes_256_gcm, ClientApSecret, 2), 0),
-    {State3, _} = ?M:handle_datagram(?NOW + 30, Again, State2),
+    {State3, _} = ?M:handle_datagram(?NOW + 30, ?PEER, Again, State2),
     ?assertEqual(connected, ?M:phase(State3)),
     {_State4, Effects4} = ?M:handle_timeout(?NOW + 50, ack, State3),
     ?assertMatch(
@@ -2343,10 +3143,10 @@ aes_256_gcm_peer_key_update_test() ->
 key_update_before_handshake_completes_closes_test() ->
     {State1, Finished, ClientApSecret, _ServerApSecret} = handshaking_owned(),
     Update = phase_datagram([ping], 0, generation_keys(ClientApSecret, 1), 1),
-    {State2, Effects2} = ?M:handle_datagram(?NOW, Update, State1),
+    {State2, Effects2} = ?M:handle_datagram(?NOW, ?PEER, Update, State1),
     ?assertEqual(handshaking, ?M:phase(State2)),
     ?assertEqual([], emits(Effects2)),
-    {State3, Effects3} = ?M:handle_datagram(?NOW, Finished, State2),
+    {State3, Effects3} = ?M:handle_datagram(?NOW, ?PEER, Finished, State2),
     ?assertEqual(draining, ?M:phase(State3)),
     ?assertEqual([{emit, self(), {closed, {local, key_update_error}}}], emits(Effects3)).
 
@@ -2355,7 +3155,7 @@ key_update_before_handshake_completes_closes_test() ->
 key_update_coalesced_with_finished_closes_test() ->
     {State1, Finished, ClientApSecret, _ServerApSecret} = handshaking_owned(),
     Update = phase_datagram([ping], 0, generation_keys(ClientApSecret, 1), 1),
-    {State2, Effects} = ?M:handle_datagram(?NOW, <<Finished/binary, Update/binary>>, State1),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, <<Finished/binary, Update/binary>>, State1),
     ?assertEqual(draining, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, key_update_error}}}], emits(Effects)).
 
@@ -2370,11 +3170,11 @@ key_update_coalesced_with_finished_closes_test() ->
 early_1rtt_held_until_handshake_completes_test() ->
     {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(),
     Early = app_datagram([{stream, 0, 0, ~"hello", true}], 0, ClientApSecret),
-    {State2, Effects2} = ?M:handle_datagram(?NOW, Early, State1),
+    {State2, Effects2} = ?M:handle_datagram(?NOW, ?PEER, Early, State1),
     ?assertEqual(handshaking, ?M:phase(State2)),
     ?assertEqual([], emits(Effects2)),
     ?assertEqual([], app_acks(Effects2, ServerApSecret)),
-    {State3, Effects3} = ?M:handle_datagram(?NOW, Finished, State2),
+    {State3, Effects3} = ?M:handle_datagram(?NOW, ?PEER, Finished, State2),
     ?assertEqual(connected, ?M:phase(State3)),
     ?assertEqual(
         [
@@ -2393,7 +3193,7 @@ early_1rtt_held_until_handshake_completes_test() ->
 coalesced_1rtt_after_finished_processed_test() ->
     {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(),
     App = app_datagram([{stream, 0, 0, ~"hello", true}], 0, ClientApSecret),
-    {State2, Effects} = ?M:handle_datagram(?NOW, <<Finished/binary, App/binary>>, State1),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, <<Finished/binary, App/binary>>, State1),
     ?assertEqual(connected, ?M:phase(State2)),
     ?assertEqual(
         [
@@ -2410,9 +3210,9 @@ coalesced_1rtt_after_finished_processed_test() ->
 held_1rtt_processed_before_coalesced_test() ->
     {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(),
     Early = app_datagram([{stream, 0, 0, ~"hel", false}], 0, ClientApSecret),
-    {State2, _} = ?M:handle_datagram(?NOW, Early, State1),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, Early, State1),
     App = app_datagram([{stream, 0, 3, ~"lo", true}], 1, ClientApSecret),
-    {_State3, Effects} = ?M:handle_datagram(?NOW, <<Finished/binary, App/binary>>, State2),
+    {_State3, Effects} = ?M:handle_datagram(?NOW, ?PEER, <<Finished/binary, App/binary>>, State2),
     ?assertEqual(
         [
             {emit, self(), {connected, expected_info()}},
@@ -2430,13 +3230,13 @@ held_1rtt_bounded_test() ->
     {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(),
     State2 = lists:foldl(
         fun(PN, S) ->
-            {S1, _} = ?M:handle_datagram(?NOW, app_datagram([ping], PN, ClientApSecret), S),
+            {S1, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([ping], PN, ClientApSecret), S),
             S1
         end,
         State1,
         lists:seq(0, 9)
     ),
-    {_State3, Effects} = ?M:handle_datagram(?NOW, Finished, State2),
+    {_State3, Effects} = ?M:handle_datagram(?NOW, ?PEER, Finished, State2),
     ?assertMatch([{ack, 7, _, 7, [], undefined}], app_acks(Effects, ServerApSecret)).
 
 %% A held packet that fails authentication once opened is dropped like any
@@ -2444,10 +3244,10 @@ held_1rtt_bounded_test() ->
 held_1rtt_failing_authentication_dropped_test() ->
     {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(),
     Forged = phase_datagram([ping], 0, generation_keys(ServerApSecret, 0), 0),
-    {State2, _} = ?M:handle_datagram(?NOW, Forged, State1),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, Forged, State1),
     Early = app_datagram([ping], 1, ClientApSecret),
-    {State3, _} = ?M:handle_datagram(?NOW, Early, State2),
-    {State4, Effects} = ?M:handle_datagram(?NOW, Finished, State3),
+    {State3, _} = ?M:handle_datagram(?NOW, ?PEER, Early, State2),
+    {State4, Effects} = ?M:handle_datagram(?NOW, ?PEER, Finished, State3),
     ?assertEqual(connected, ?M:phase(State4)),
     ?assertMatch([{ack, 1, _, 0, [], undefined}], app_acks(Effects, ServerApSecret)).
 
@@ -2461,7 +3261,7 @@ aead_integrity_limit_closes_test() ->
     Over = ?M:auth_failed(application, (1 bsl 52) + 1, State),
     ?assertEqual(draining, ?M:phase(Over)),
     Data = app_datagram([{stream, 0, 0, ~"x", true}], 0, ClientApSecret),
-    {_Over1, Effects} = ?M:handle_datagram(?NOW, Data, Over),
+    {_Over1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Data, Over),
     ?assertEqual([{emit, self(), {closed, {local, aead_limit_reached}}}], emits(Effects)).
 
 %% The integrity limit is the negotiated AEAD's (RFC 9001 §6.6): 2^36 for
@@ -2497,7 +3297,7 @@ own_key_update_then_peer_update_test() ->
         app_packets(Effects2, generation_keys(ServerApSecret, 1))
     ),
     Response = phase_datagram([ping], 1, generation_keys(ClientApSecret, 1), 1),
-    {State3, _} = ?M:handle_datagram(Later, Response, State2),
+    {State3, _} = ?M:handle_datagram(Later, ?PEER, Response, State2),
     ?assertEqual(connected, ?M:phase(State3)),
     {State4, Effects4} = ?M:handle_timeout(Later + 20, ack, State3),
     ?assertMatch(
@@ -2505,7 +3305,7 @@ own_key_update_then_peer_update_test() ->
         app_packets(Effects4, generation_keys(ServerApSecret, 1))
     ),
     Again = phase_datagram([ping], 2, generation_keys(ClientApSecret, 2), 0),
-    {State5, _} = ?M:handle_datagram(Later + 30, Again, State4),
+    {State5, _} = ?M:handle_datagram(Later + 30, ?PEER, Again, State4),
     ?assertEqual(connected, ?M:phase(State5)),
     {_State6, Effects6} = ?M:handle_timeout(Later + 50, ack, State5),
     ?assertMatch(
@@ -2525,7 +3325,7 @@ own_key_update_waits_for_peer_response_test() ->
     OldPhase = app_datagram(
         [{ack, 1, 0, 1, [], undefined}, {stream, 0, 0, ~"old", false}], 1, ClientApSecret
     ),
-    {State3, Effects3} = ?M:handle_datagram(Later, OldPhase, State2),
+    {State3, Effects3} = ?M:handle_datagram(Later, ?PEER, OldPhase, State2),
     ?assert(lists:member({emit, self(), {stream_data, 0, ~"old", false}}, emits(Effects3))),
     Much = Later + 60000,
     State4 = ?M:key_limit(1 bsl 22, Much, State3),
@@ -2639,7 +3439,7 @@ connect(Extra, HelloOpts) ->
 
     %% Client Initial carrying the ClientHello.
     {InitialDatagram, ClientHelloFramed} = client_hello_datagram(Ctx, HelloOpts),
-    {State1, Effects1} = ?M:handle_datagram(?NOW, InitialDatagram, State0),
+    {State1, Effects1} = ?M:handle_datagram(?NOW, ?PEER, InitialDatagram, State0),
     Handshake = finish_handshake(State1, Effects1, ClientHelloFramed, ClientPriv),
     Handshake#{state0 => State0, ch_framed => ClientHelloFramed, ctx => Ctx}.
 
@@ -2697,7 +3497,7 @@ finish_handshake(State1, Effects1, Transcript, ClientPriv) ->
         ?DCID,
         ?SCID
     ),
-    {State2, Effects2} = ?M:handle_datagram(?NOW, HandshakeDatagram, State1),
+    {State2, Effects2} = ?M:handle_datagram(?NOW, ?PEER, HandshakeDatagram, State1),
 
     %% Application keys, for reading the HANDSHAKE_DONE and sealing a
     %% post-connected client 1-RTT packet.
@@ -2738,23 +3538,28 @@ curve(?GROUP_SECP256R1) -> secp256r1.
 new_conn(CertChain) ->
     new_conn(CertChain, #{}).
 
-%% `Extra` adds optional config keys (`stream_credit`).
+%% `Extra` adds optional config keys (`stream_credit`) or overrides the
+%% defaults (`peer_scid`, `transport_params`).
 new_conn(CertChain, Extra) ->
     {Scheme, PrivKey} = ?TC:key_material(),
     {ClientPub, ClientPriv} = ?TC:gen_keypair(),
     TransportParams = transport_params(),
     State = ?M:new(
-        Extra#{
-            dcid => ?DCID,
-            scid => ?SCID,
-            peer_scid => ?CLIENT_SCID,
-            peer => ?PEER,
-            cert_chain => CertChain,
-            priv_key => PrivKey,
-            alpn => ~"h3",
-            transport_params => TransportParams,
-            server_random => crypto:strong_rand_bytes(32)
-        },
+        maps:merge(
+            #{
+                dcid => ?DCID,
+                scid => ?SCID,
+                peer_scid => ?CLIENT_SCID,
+                peer => ?PEER,
+                reset_key => ?RESET_KEY,
+                cert_chain => CertChain,
+                priv_key => PrivKey,
+                alpn => ~"h3",
+                transport_params => TransportParams,
+                server_random => crypto:strong_rand_bytes(32)
+            },
+            Extra
+        ),
         ?NOW
     ),
     {State, #{
@@ -2832,9 +3637,15 @@ connect_owned(Extra) ->
 
 %% `HelloOpts` as for connect/2.
 connect_owned(Extra, HelloOpts) ->
-    {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(Extra, HelloOpts),
-    {State2, _Effects} = ?M:handle_datagram(?NOW, Finished, State1),
+    {State2, _Effects, ClientApSecret, ServerApSecret} = connect_owned_effects(Extra, HelloOpts),
     {State2, ClientApSecret, ServerApSecret}.
+
+%% As connect_owned/2, with the effects of the datagram that confirmed the
+%% handshake.
+connect_owned_effects(Extra, HelloOpts) ->
+    {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(Extra, HelloOpts),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Finished, State1),
+    {State2, Effects, ClientApSecret, ServerApSecret}.
 
 %% Still handshaking (after the ClientHello) with this process installed as
 %% owner, plus the client's Handshake datagram carrying its Finished, not yet
@@ -2861,6 +3672,42 @@ handshaking_owned(Extra, HelloOpts) ->
     ),
     {with_owner(State1), Finished, ClientApSecret, ServerApSecret}.
 
+%% Connected with this process as owner, plus the spare connection id
+%% (sequence number 1) the server issued on confirmation.
+connected_with_spare() ->
+    {State, Effects, ClientApSecret, ServerApSecret} = connect_owned_effects(#{}, #{}),
+    [{new_connection_id, 1, 0, CID1, _Token}] = new_cids(Effects, ServerApSecret),
+    {State, ClientApSecret, ServerApSecret, CID1}.
+
+%% The NEW_CONNECTION_ID frames the server sent.
+new_cids(Effects, ServerApSecret) ->
+    [F || {new_connection_id, _, _, _, _} = F <- sent_app_frames(Effects, ServerApSecret)].
+
+%% The connection-id routing effects, in order.
+registers(Effects) ->
+    [E || E <- Effects, element(1, E) =:= register_cid orelse element(1, E) =:= unregister_cid].
+
+index_of(Elem, List) ->
+    length(lists:takewhile(fun(E) -> E =/= Elem end, List)) + 1.
+
+first_send(Effects) ->
+    hd([E || {send, _} = E <- Effects]).
+
+%% The Destination Connection ID of each 1-RTT datagram the server sent.
+short_header_dcids(Effects) ->
+    [DCID || {send, <<0:1, _:7, DCID:8/binary, _/binary>>} <- Effects].
+
+%% Lose the server's first 1-RTT packet (its HANDSHAKE_DONE flight): send a
+%% later packet, acknowledge only that, and let the probe timeout declare the
+%% first lost. Returns every 1-RTT frame the server sent again.
+lose_first_app_packet(State, ClientApSecret, ServerApSecret) ->
+    {State1, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"later", true, ?NOW, State),
+    Largest = largest_app_pn(Sent, ServerApSecret),
+    Ack = app_datagram([{ack, Largest, 0, 0, [], undefined}], 9, ClientApSecret),
+    {State2, AckEffects} = ?M:handle_datagram(?NOW, ?PEER, Ack, State1),
+    {_State3, PtoEffects} = ?M:handle_timeout(?NOW + 5000, pto, State2),
+    sent_app_frames(AckEffects, ServerApSecret) ++ sent_app_frames(PtoEffects, ServerApSecret).
+
 %% Connected, owner installed, with the client secret for sealing peer 1-RTT.
 connected_with_owner() ->
     {State2, ClientApSecret, _ServerApSecret} = connect_owned(),
@@ -2874,14 +3721,87 @@ connected_for_send() ->
 
 %% Seal a peer 1-RTT (application) datagram carrying the given frames.
 app_datagram(Frames, PN, ClientApSecret) ->
+    app_datagram_to(?DCID, Frames, PN, ClientApSecret).
+
+%% As app_datagram/3, addressed to the server connection id `DCID`.
+app_datagram_to(DCID, Frames, PN, ClientApSecret) ->
     ?TC:seal(
         application,
         PN,
         roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientApSecret),
         Frames,
-        ?DCID,
+        DCID,
         ?SCID
     ).
+
+%% A client 1-RTT datagram to the server's handshake id (sequence number 0),
+%% the id the client uses once it has learnt it.
+to_scid(Frames, PN, ClientApSecret) ->
+    app_datagram_to(?SCID, Frames, PN, ClientApSecret).
+
+%% `N` PADDING frames, to expand a datagram as a client does for a probe.
+padding(N) ->
+    lists:duplicate(N, padding).
+
+%% A non-probing client datagram expanded to 1200 bytes.
+padded_ping(PN, ClientApSecret) ->
+    to_scid([ping | padding(1100)], PN, ClientApSecret).
+
+%% The server's 1-RTT datagrams that carry a PATH_CHALLENGE or PATH_RESPONSE.
+path_datagrams(Datagrams, ServerApSecret) ->
+    [D || D <- Datagrams, path_frames([D], ServerApSecret) =/= []].
+
+%% The PATH_CHALLENGE and PATH_RESPONSE frames of the server's datagrams.
+path_frames(Datagrams, ServerApSecret) ->
+    [
+        F
+     || F <- ?TC:frames(
+            Datagrams,
+            application,
+            #{application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)},
+            byte_size(?DCID)
+        ),
+        element(1, F) =:= path_challenge orelse element(1, F) =:= path_response
+    ].
+
+%% The data of every PATH_CHALLENGE the server's datagrams carry.
+challenge_data(Datagrams, ServerApSecret) ->
+    [Data || {path_challenge, Data} <- path_frames(Datagrams, ServerApSecret)].
+
+%% The datagrams the server sent to an address other than the peer's.
+sends_to(Addr, Effects) ->
+    [D || {send_to, A, D} <- Effects, A =:= Addr].
+
+%% Connected with a spare id from each side: the server's (sequence number
+%% 1, returned) and the client's (?CLIENT_SPARE, sequence number 1).
+connected_with_client_spare() ->
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_spare(),
+    New = {new_connection_id, 1, 0, ?CLIENT_SPARE, <<1:128>>},
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, to_scid([New], 1, ClientApSecret), State),
+    {State1, ClientApSecret, ServerApSecret, CID1}.
+
+%% Connected, with the congestion window grown past its initial size by an
+%% acknowledged burst.
+grown_window() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Payload = binary:copy(~"x", 100000),
+    {State1, Effects} = ?M:handle_send(self(), make_ref(), 0, Payload, false, ?NOW, State),
+    Largest = largest_app_pn(Effects, ServerApSecret),
+    Ack = to_scid([{ack, Largest, 0, Largest, [], undefined}], 0, ClientApSecret),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, Ack, State1),
+    {State2, ClientApSecret, ServerApSecret}.
+
+%% Move to `Peer` with a full-size datagram and answer the server's
+%% challenge, validating the new path in one step.
+validated_move(Peer, State, ClientApSecret, ServerApSecret) ->
+    {State1, Effects} = ?M:handle_datagram(
+        ?NOW, Peer, padded_ping(10, ClientApSecret), State
+    ),
+    [Data] = challenge_data(sends(Effects), ServerApSecret),
+    Response = to_scid([{path_response, Data}], 11, ClientApSecret),
+    {State2, _} = ?M:handle_datagram(?NOW, Peer, Response, State1),
+    {ok, Peer} = ?M:peername(State2),
+    State2.
 
 %% Seal a peer 1-RTT datagram with the given keys and Key Phase bit.
 phase_datagram(Frames, PN, Keys, KeyPhase) ->
@@ -2909,9 +3829,9 @@ packet_keys(Aead, Secret, N) ->
 %% phase 0, then a PING numbered `PN` in key phase 1 under the next keys.
 updated_at(PN, ClientApSecret, State) ->
     Old = phase_datagram([ping], 0, generation_keys(ClientApSecret, 0), 0),
-    {State1, _} = ?M:handle_datagram(?NOW, Old, State),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Old, State),
     New = phase_datagram([ping], PN, generation_keys(ClientApSecret, 1), 1),
-    {State2, _} = ?M:handle_datagram(?NOW, New, State1),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, New, State1),
     State2.
 
 %% The client acknowledges the server's first 1-RTT packet (its
@@ -2920,7 +3840,7 @@ updated_at(PN, ClientApSecret, State) ->
 %% the client's AES-128-GCM first generation unless given.
 send_phase_acked(State, #{} = Keys) ->
     Ack = phase_datagram([{ack, 0, 0, 0, [], undefined}], 0, Keys, 0),
-    {State1, _} = ?M:handle_datagram(?NOW, Ack, State),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Ack, State),
     State1;
 send_phase_acked(State, ClientApSecret) ->
     send_phase_acked(State, generation_keys(ClientApSecret, 0)).
@@ -3009,7 +3929,7 @@ flush_with_acks(State, Effects, ServerApSecret, ClientApSecret, AckPN) ->
         _ ->
             Largest = largest_app_pn(Effects, ServerApSecret),
             Ack = app_datagram([{ack, Largest, 0, Largest, [], undefined}], AckPN, ClientApSecret),
-            {State1, Effects1} = ?M:handle_datagram(?NOW, Ack, State),
+            {State1, Effects1} = ?M:handle_datagram(?NOW, ?PEER, Ack, State),
             {Rest, Final, FinalAckPN} = flush_with_acks(
                 State1, Effects1, ServerApSecret, ClientApSecret, AckPN + 1
             ),
@@ -3032,7 +3952,7 @@ flush_app_frames(State, Effects, ServerApSecret, ClientApSecret, AckPN, Acc) ->
         _ ->
             Largest = largest_app_pn(Effects, ServerApSecret),
             Ack = app_datagram([{ack, Largest, 0, Largest, [], undefined}], AckPN, ClientApSecret),
-            {State1, Effects1} = ?M:handle_datagram(?NOW, Ack, State),
+            {State1, Effects1} = ?M:handle_datagram(?NOW, ?PEER, Ack, State),
             flush_app_frames(State1, Effects1, ServerApSecret, ClientApSecret, AckPN + 1, Acc1)
     end.
 

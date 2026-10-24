@@ -101,6 +101,23 @@ application_round_trip_test() ->
     ).
 
 %% Key phase defaults to 0 when omitted.
+%% RFC 9000 §8.2: a 1-RTT packet with `pad_to` is expanded with PADDING
+%% frames to exactly that size, and still decodes to its frames; one already
+%% larger stays as it is.
+application_pad_to_test() ->
+    Frames = [{path_response, ~"8 bytes!"}],
+    Entry = #{frames => Frames, keys => application_keys(), pn => 3, pad_to => 1200},
+    {Datagram, [#{length := 1200}]} = ?M:datagram(#{application => Entry}, ?DCID, ?SCID),
+    ?assertEqual(1200, byte_size(Datagram)),
+    ?assertMatch(
+        [{ok, #{level := application, pn := 3, frames := [{path_response, ~"8 bytes!"}, padding]}}],
+        recv(Datagram, #{application => application_keys()})
+    ),
+    Small = Entry#{pad_to => 10},
+    {Bare, _} = ?M:datagram(#{application => Small}, ?DCID, ?SCID),
+    {Unpadded, _} = ?M:datagram(#{application => maps:remove(pad_to, Entry)}, ?DCID, ?SCID),
+    ?assertEqual(byte_size(Unpadded), byte_size(Bare)).
+
 application_default_key_phase_test() ->
     Frames = [{stream, 0, 0, <<"more-body-data">>, false}],
     Entries = #{application => #{frames => Frames, keys => application_keys(), pn => 1}},

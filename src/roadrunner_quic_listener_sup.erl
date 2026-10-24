@@ -41,6 +41,8 @@
 %% bidi is carried in pool_opts today (from the listener's http3 opts); the rest
 %% are fixed defaults pending the flow-control opt wiring. They mirror the conn
 %% layer's own limits (the 30s idle matches the connection idle timeout).
+%% disable_active_migration is deliberately absent: the connection follows a
+%% client to a new address (RFC 9000 §9), so clients may migrate.
 -define(DEFAULT_INITIAL_MAX_DATA, 1048576).
 -define(DEFAULT_INITIAL_MAX_STREAM_DATA, 262144).
 -define(DEFAULT_INITIAL_MAX_STREAMS_UNI, 100).

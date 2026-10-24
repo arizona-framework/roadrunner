@@ -345,3 +345,24 @@ send_run(First, Last, Loss) ->
         Loss,
         lists:seq(First, Last)
     ).
+
+%% RFC 9000 §9.4: on a new path every RTT estimate starts over from the
+%% initial value, and a packet sent before the reset (on the old path) gives
+%% no sample, while one sent after it does.
+reset_rtt_test() ->
+    Opts = #{initial_rtt => 100},
+    L0 = ?M:on_packet_sent(0, 100, true, d0, 0, ?M:new(Opts)),
+    {L1, _, _} = ?M:on_ack_received({ack, 0, 0, 0, []}, 40, L0),
+    ?assertEqual(40, ?M:smoothed_rtt(L1)),
+    L2 = ?M:on_packet_sent(1, 100, true, d1, 50, L1),
+    Reset = ?M:reset_rtt(60, L2),
+    ?assertEqual(100, ?M:smoothed_rtt(Reset)),
+    ?assertEqual(50, ?M:rtt_var(Reset)),
+    ?assertEqual(infinity, ?M:min_rtt(Reset)),
+    ?assertEqual(0, ?M:latest_rtt(Reset)),
+    ?assertNot(?M:has_rtt_sample(Reset)),
+    {L3, [d1], []} = ?M:on_ack_received({ack, 1, 0, 0, []}, 90, Reset),
+    ?assertNot(?M:has_rtt_sample(L3)),
+    L4 = ?M:on_packet_sent(2, 100, true, d2, 100, L3),
+    {L5, [d2], []} = ?M:on_ack_received({ack, 2, 0, 0, []}, 130, L4),
+    ?assertEqual(30, ?M:smoothed_rtt(L5)).
