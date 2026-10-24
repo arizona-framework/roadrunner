@@ -38,7 +38,7 @@ One command covers day-to-day development:
 
 - `make compile` / `make doc` / `make fmt`
 - `make eunit` / `make ct` / `make dialyzer` / `make xref` / `make hank` (individual stages)
-- `make bench-quick` / `make wrk2-quick` / `make h2spec` / `make h3spec` / `make autobahn`
+- `make bench-quick` / `make wrk2-quick` / `make h2spec` / `make h3spec` / `make h3interop` / `make autobahn`
 - `make clean` / `make distclean`
 
 You can also invoke `rebar3 <task>` directly (the Makefile is just a
@@ -46,7 +46,7 @@ thin wrapper over the same targets). See `rebar.config` for the full
 alias list.
 
 Diagnostic / conformance scripts under `scripts/` (`bench.escript`,
-`h2spec.sh`, `h3spec.sh`, `autobahn.escript`, `redbot.escript`, `wrk2_bench.sh`)
+`h2spec.sh`, `h3spec.sh`, `h3interop.sh`, `autobahn.escript`, `redbot.escript`, `wrk2_bench.sh`)
 are run directly; each script's header documents its requirements.
 
 ### Test surface

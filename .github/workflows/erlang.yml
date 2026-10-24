@@ -4,8 +4,8 @@
 # 100 % line-coverage) is split here into parallel, independently-named jobs
 # so each signal lands as its own check on the PR dashboard and the wall time
 # is the slowest single job instead of the serial sum. External conformance
-# harnesses (h2spec, h3spec, Autobahn) back the README's Conformance claims;
-# the wrk2 smoke checks that the bench pipeline still runs.
+# harnesses (h2spec, h3spec, h3interop, Autobahn) back the README's
+# Conformance claims; the wrk2 smoke checks that the bench pipeline still runs.
 #
 # Job dependency structure (all fan out from cache-erlang, run in parallel):
 # - cache-erlang: sets up Erlang, computes cache keys, compiles + caches
@@ -15,7 +15,8 @@
 # - Test:      eunit + ct (both with cover), then the aggregated 100 %
 #              coverage gate — kept in one job because the gate sums the
 #              eunit + ct coverdata, which must share a workspace.
-# - h2spec / h3spec / autobahn / wrk2-smoke: conformance + smoke harnesses.
+# - h2spec / h3spec / h3interop / autobahn / wrk2-smoke: conformance + smoke
+#   harnesses.
 #
 # The shared checkout + setup-beam + cache-restore boilerplate lives in the
 # `./.github/actions/setup-erlang` composite action.
@@ -268,6 +269,39 @@ jobs:
 
       - name: Run h3spec
         run: ./scripts/h3spec.sh
+
+  # HTTP/3 interop with independent QUIC clients (quiche and ngtcp2, pinned
+  # Docker images): the CT suites use roadrunner's own QUIC client, which
+  # shares the server's codecs and TLS, so a bug both sides share passes
+  # them. `h3interop.sh` checks every byte the real clients get back, once on
+  # a clean loopback and once with packet loss (netem on `lo`, via the
+  # runner's passwordless sudo) to drive loss recovery against them.
+  h3interop:
+    name: h3interop (OTP ${{ matrix.otp }})
+
+    runs-on: ubuntu-26.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ["27", "28", "29"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24
+        with:
+          otp-version: ${{ matrix.otp }}
+          rebar3-version: "3"
+
+      - name: Compile test profile
+        run: rebar3 as test compile
+
+      - name: Run h3interop
+        run: ./scripts/h3interop.sh
+
+      - name: Run h3interop with 5% packet loss
+        run: H3INTEROP_LOSS=5 ./scripts/h3interop.sh
 
   # WebSocket conformance — backs the README "Autobahn fuzzingclient
   # strict 100 %" claim, on every supported OTP. Slow (~5 min/version) but

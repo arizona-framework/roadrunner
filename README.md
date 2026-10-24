@@ -477,7 +477,12 @@ Standards conformance:
   static-table compression, over Roadrunner's own pure-Erlang QUIC
   transport (TLS 1.3 required). Conformance harness:
   [`scripts/h3spec.sh`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/h3spec.sh) (drives
-  [h3spec](https://github.com/kazu-yamamoto/h3spec)).
+  [h3spec](https://github.com/kazu-yamamoto/h3spec)). Interop harness:
+  [`scripts/h3interop.sh`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/h3interop.sh)
+  (downloads, uploads and multiplexed requests from the
+  [quiche](https://github.com/cloudflare/quiche) and
+  [ngtcp2](https://github.com/ngtcp2/ngtcp2) clients, with and without
+  packet loss).
 - **Content-Encoding (RFC 9110 §8.4.1)**: gzip + deflate with
   qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3),
   works unchanged over HTTP/2.
