@@ -1247,26 +1247,41 @@ apply_ack(Now, Level, Ack, Space, #state{cc = Cc} = State) ->
             )
     end.
 
-%% Feed the loss layer's per-ACK congestion signal to NewReno: grow the window
-%% for the acknowledged bytes first, then react to any loss (RFC 9002 §7.3, ack
-%% before loss). A defined largest-acked send time means the largest acked was
-%% ack-eliciting, so the acked bytes are positive; `undefined` (nothing newly
-%% acked, or a non-ack-eliciting largest) skips the growth.
+%% Feed the loss layer's congestion signal to NewReno in the RFC 9002 Appendix
+%% A.7 order: react to any loss first (a congestion event, Appendix B.8, then
+%% the collapse to the minimum window on persistent congestion, §7.6.2), then
+%% grow the window for the acknowledged bytes. Loss first means an ACK that both
+%% acknowledges and reveals loss holds the window for the packets sent before
+%% the new recovery period, while persistent congestion ends recovery so the
+%% same ACK grows the collapsed window in slow start. A defined largest-acked
+%% send time means the largest acked was ack-eliciting, so the acked bytes are
+%% positive; `undefined` (nothing newly acked, a non-ack-eliciting largest, or
+%% a timer pass) skips the growth.
 -spec apply_cc_signal(roadrunner_quic_loss:cc_signal(), integer(), roadrunner_quic_cc_newreno:t()) ->
     roadrunner_quic_cc_newreno:t().
 apply_cc_signal(
-    #{acked_bytes := AckedBytes, largest_acked_time := AckedTime, largest_lost_time := LostTime},
+    #{
+        acked_bytes := AckedBytes,
+        largest_acked_time := AckedTime,
+        largest_lost_time := LostTime,
+        persistent_congestion := Persistent
+    },
     Now,
     Cc
 ) ->
-    Grown =
-        case AckedTime of
+    Reduced =
+        case LostTime of
             undefined -> Cc;
-            _ -> roadrunner_quic_cc_newreno:on_packets_acked(AckedBytes, AckedTime, Cc)
+            _ -> roadrunner_quic_cc_newreno:on_congestion_event(LostTime, Now, Cc)
         end,
-    case LostTime of
-        undefined -> Grown;
-        _ -> roadrunner_quic_cc_newreno:on_congestion_event(LostTime, Now, Grown)
+    Collapsed =
+        case Persistent of
+            true -> roadrunner_quic_cc_newreno:on_persistent_congestion(Reduced);
+            false -> Reduced
+        end,
+    case AckedTime of
+        undefined -> Collapsed;
+        _ -> roadrunner_quic_cc_newreno:on_packets_acked(AckedBytes, AckedTime, Collapsed)
     end.
 
 %% =============================================================================

@@ -16,7 +16,8 @@
 %% The RTT is updated from the largest acknowledged ack-eliciting packet (RFC
 %% 9002 §5) and loss is judged by the packet and time thresholds (§6.1). The
 %% caller retransmits the data carried by the returned lost packets and feeds
-%% the acknowledged/lost byte counts to congestion control.
+%% the acknowledged/lost byte counts to congestion control, along with whether
+%% the ACK established persistent congestion (§7.6).
 
 -export([
     new/1,
@@ -57,9 +58,14 @@
 %% RFC 9000 §18.2 default ack_delay_exponent: a peer's ACK Delay field is
 %% carried in units of 2^exponent microseconds.
 -define(DEFAULT_ACK_DELAY_EXPONENT, 3).
+%% RFC 9002 §7.6.1 kPersistentCongestionThreshold.
+-define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 %% A congestion-control signal with nothing acknowledged or lost.
 -define(NO_CC_SIGNAL, #{
-    acked_bytes => 0, largest_acked_time => undefined, largest_lost_time => undefined
+    acked_bytes => 0,
+    largest_acked_time => undefined,
+    largest_lost_time => undefined,
+    persistent_congestion => false
 }).
 
 -record(sent, {
@@ -81,6 +87,10 @@
     rtt_var :: non_neg_integer(),
     min_rtt = infinity :: non_neg_integer() | infinity,
     has_sample = false :: boolean(),
+    %% When the first RTT sample was taken (RFC 9002 Appendix A.7
+    %% first_rtt_sample): only packets sent after it count toward persistent
+    %% congestion (§7.6.2).
+    first_rtt_sample_at = undefined :: non_neg_integer() | undefined,
     %% Loss detection.
     largest_acked = undefined :: non_neg_integer() | undefined,
     %% Probe timeout (RFC 9002 §6.2).
@@ -103,7 +113,8 @@
 -type cc_signal() :: #{
     acked_bytes := non_neg_integer(),
     largest_acked_time := non_neg_integer() | undefined,
-    largest_lost_time := non_neg_integer() | undefined
+    largest_lost_time := non_neg_integer() | undefined,
+    persistent_congestion := boolean()
 }.
 
 -type opts() :: #{
@@ -201,7 +212,8 @@ on_ack_received(Ack, Now, Loss) ->
                 cc_signal = #{
                     acked_bytes => AckedBytes,
                     largest_acked_time => largest_acked_time(NewLargest, Acked),
-                    largest_lost_time => largest_lost_time(Lost)
+                    largest_lost_time => largest_lost_time(Lost),
+                    persistent_congestion => persistent_congestion(Lost, Loss1)
                 }
             },
             {Loss2, datas(Acked), datas(Lost)}
@@ -211,7 +223,8 @@ on_ack_received(Ack, Now, Loss) ->
 The congestion-control signal from the most recent `on_ack_received/3` or
 `detect_lost/2`: a map with the acknowledged bytes and the send times of the
 largest acknowledged and latest lost ack-eliciting packets (`undefined` when
-none), for the connection's congestion controller. A `detect_lost/2` pass
+none), and whether the losses establish persistent congestion (RFC 9002
+§7.6.2), for the connection's congestion controller. A `detect_lost/2` pass
 acknowledges nothing, so its signal carries only the lost time. Read it
 immediately after the call that set it.
 """.
@@ -261,10 +274,13 @@ detect_lost(Now, #loss{sent = Sent, largest_acked = LargestAcked} = Loss) ->
     Loss1 = Loss#loss{
         sent = Survivors,
         bytes_in_flight = max(0, Loss#loss.bytes_in_flight - in_flight_bytes(Lost)),
+        %% Persistent congestion is established only on receipt of an ACK
+        %% (RFC 9002 §7.6.2), so a timer pass never declares it.
         cc_signal = #{
             acked_bytes => 0,
             largest_acked_time => undefined,
-            largest_lost_time => largest_lost_time(Lost)
+            largest_lost_time => largest_lost_time(Lost),
+            persistent_congestion => false
         }
     },
     {Loss1, datas(Lost)}.
@@ -326,9 +342,14 @@ The probe timeout: `smoothed_rtt + max(4 * rtt_var, granularity) +
 max_ack_delay`, doubled per consecutive PTO (RFC 9002 §6.2.1).
 """.
 -spec get_pto(t()) -> non_neg_integer().
-get_pto(#loss{smoothed_rtt = SRtt, rtt_var = RttVar, max_ack_delay = MaxAckDelay, pto_count = Count}) ->
-    Pto = SRtt + max(4 * RttVar, ?GRANULARITY) + MaxAckDelay,
-    Pto bsl Count.
+get_pto(#loss{pto_count = Count} = Loss) ->
+    pto_period(Loss) bsl Count.
+
+%% The probe timeout before backoff (RFC 9002 §6.2.1), also the base of the
+%% persistent congestion duration (§7.6.1).
+-spec pto_period(t()) -> non_neg_integer().
+pto_period(#loss{smoothed_rtt = SRtt, rtt_var = RttVar, max_ack_delay = MaxAckDelay}) ->
+    SRtt + max(4 * RttVar, ?GRANULARITY) + MaxAckDelay.
 
 -doc """
 When the probe timeout fires (RFC 9002 §6.2.1): the probe timeout after the
@@ -514,10 +535,61 @@ loss_delay(#loss{latest_rtt = Latest, smoothed_rtt = SRtt}) ->
 maybe_update_rtt(#loss{ack_delay_exponent = Exp} = Loss, LargestAcked, Acked, AckDelay, Now) ->
     case lists:keyfind(LargestAcked, #sent.pn, Acked) of
         #sent{ack_eliciting = true, time_sent = Sent} ->
-            update_rtt(Now - Sent, (AckDelay bsl Exp) div 1000, Loss);
+            Sampled = update_rtt(Now - Sent, (AckDelay bsl Exp) div 1000, Loss),
+            Sampled#loss{first_rtt_sample_at = first_rtt_sample_at(Now, Loss)};
         _ ->
             Loss
     end.
+
+%% RFC 9002 Appendix A.7: the first RTT sample's time, kept once set.
+-spec first_rtt_sample_at(non_neg_integer(), t()) -> non_neg_integer().
+first_rtt_sample_at(Now, #loss{first_rtt_sample_at = undefined}) -> Now;
+first_rtt_sample_at(_Now, #loss{first_rtt_sample_at = At}) -> At.
+
+%% Whether the packets an ACK declared lost establish persistent congestion
+%% (RFC 9002 §7.6.2): two lost ack-eliciting packets, both sent after the first
+%% RTT sample (Appendix B.8), sent more than the persistent congestion duration
+%% apart (§7.6.1), with no packet sent between them acknowledged. Only this
+%% space's packets are considered, which §7.6.2 allows. `Lost` is newest-first.
+-spec persistent_congestion([#sent{}], t()) -> boolean().
+persistent_congestion(_Lost, #loss{first_rtt_sample_at = undefined}) ->
+    false;
+persistent_congestion(Lost, #loss{first_rtt_sample_at = FirstSampleAt} = Loss) ->
+    Duration = pto_period(Loss) * ?PERSISTENT_CONGESTION_THRESHOLD,
+    congested_run(Lost, FirstSampleAt, Duration, none).
+
+%% Walk the lost packets newest-first, tracking the current run of
+%% consecutive packet numbers as `{PrevPN, NewestSent}`: the run's lowest
+%% packet number so far and the send time of its newest eligible packet. Every
+%% packet of the space stays tracked until it is acknowledged or lost, so a gap
+%% in the numbers means a packet between was acknowledged (or lost earlier,
+%% which only makes this stricter) and the run restarts. Packets that cannot
+%% be an endpoint (not ack-eliciting, or sent before the first RTT sample)
+%% still continue a run, since they were not acknowledged.
+-spec congested_run(
+    [#sent{}],
+    non_neg_integer(),
+    non_neg_integer(),
+    none | {non_neg_integer(), non_neg_integer()}
+) -> boolean().
+congested_run([], _FirstSampleAt, _Duration, _Run) ->
+    false;
+congested_run([#sent{pn = PN} | _] = Lost, FirstSampleAt, Duration, {PrevPN, _Newest}) when
+    PN + 1 =/= PrevPN
+->
+    congested_run(Lost, FirstSampleAt, Duration, none);
+congested_run(
+    [#sent{pn = PN, ack_eliciting = true, time_sent = Sent} | Rest], FirstSampleAt, Duration, Run
+) when Sent > FirstSampleAt ->
+    case Run of
+        none -> congested_run(Rest, FirstSampleAt, Duration, {PN, Sent});
+        {_PrevPN, Newest} when Newest - Sent > Duration -> true;
+        {_PrevPN, Newest} -> congested_run(Rest, FirstSampleAt, Duration, {PN, Newest})
+    end;
+congested_run([#sent{} | Rest], FirstSampleAt, Duration, none) ->
+    congested_run(Rest, FirstSampleAt, Duration, none);
+congested_run([#sent{pn = PN} | Rest], FirstSampleAt, Duration, {_PrevPN, Newest}) ->
+    congested_run(Rest, FirstSampleAt, Duration, {PN, Newest}).
 
 -spec in_flight_bytes([#sent{}]) -> non_neg_integer().
 in_flight_bytes(Packets) ->

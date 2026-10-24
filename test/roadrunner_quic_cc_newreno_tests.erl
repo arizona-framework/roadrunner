@@ -67,3 +67,19 @@ minimum_window_floor_test() ->
     Cc3 = ?M:on_congestion_event(30, 30, Cc2),
     ?assertEqual(1500, ?M:ssthresh(Cc3)),
     ?assertEqual(2400, ?M:cwnd(Cc3)).
+
+%% =============================================================================
+%% Persistent congestion (RFC 9002 §7.6).
+%% =============================================================================
+
+%% Persistent congestion collapses the window to the minimum and ends the
+%% recovery period (Appendix B.8): the threshold from the congestion event
+%% stays, and the next acknowledgement grows the window in slow start even
+%% for a packet sent before the event.
+persistent_congestion_collapses_window_test() ->
+    Lost = ?M:on_congestion_event(5, 100, ?M:on_packets_acked(1200, 0, ?M:new())),
+    Cc = ?M:on_persistent_congestion(Lost),
+    ?assertEqual(2400, ?M:cwnd(Cc)),
+    ?assertEqual(6600, ?M:ssthresh(Cc)),
+    ?assert(?M:in_slow_start(Cc)),
+    ?assertEqual(3600, ?M:cwnd(?M:on_packets_acked(1200, 50, Cc))).

@@ -726,6 +726,34 @@ pto_detected_loss_reduces_congestion_window_test() ->
     {State3, _} = ?M:handle_timeout(?NOW + 5000, pto, State2),
     ?assertEqual(?M:cwnd(State2) div 2, ?M:cwnd(State3)).
 
+persistent_congestion_collapses_congestion_window_test() ->
+    %% RFC 9002 §7.6.2: after a first RTT sample (10ms), losses spanning far
+    %% more than the persistent congestion duration ((10 + 12 + 25) * 3 = 141ms
+    %% with the default max_ack_delay) collapse the window to the minimum
+    %% (2400); the same ACK then grows it in slow start by at most the one
+    %% datagram it acknowledges. The same losses spanning 80ms only halve it.
+    ?assert(cwnd_after_spread_losses(380) =< 2400 + 1200),
+    ?assert(cwnd_after_spread_losses(80) >= 6000).
+
+%% Send, acknowledge everything 10ms later (the first RTT sample), send one
+%% packet at +20 and a burst at +20+Spread, then acknowledge only the burst's
+%% largest packet, declaring the +20 packet and the older burst packets lost.
+cwnd_after_spread_losses(Spread) ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, Sent1} = ?M:handle_send(self(), make_ref(), 0, ~"first", false, ?NOW, State),
+    Largest1 = largest_app_pn(Sent1, ServerApSecret),
+    Ack1 = app_datagram([{ack, Largest1, 0, Largest1, [], undefined}], 0, ClientApSecret),
+    {State2, _} = ?M:handle_datagram(?NOW + 10, Ack1, State1),
+    {State3, _} = ?M:handle_send(self(), make_ref(), 0, ~"second", false, ?NOW + 20, State2),
+    Burst = binary:copy(~"x", 5000),
+    {State4, Sent4} = ?M:handle_send(
+        self(), make_ref(), 0, Burst, false, ?NOW + 20 + Spread, State3
+    ),
+    Largest4 = largest_app_pn(Sent4, ServerApSecret),
+    Ack4 = app_datagram([{ack, Largest4, 0, 0, [], undefined}], 1, ClientApSecret),
+    {State5, _} = ?M:handle_datagram(?NOW + 30 + Spread, Ack4, State4),
+    ?M:cwnd(State5).
+
 path_challenge_answered_test() ->
     %% RFC 9000 §8.2.2: a PATH_CHALLENGE gets a PATH_RESPONSE echoing its data.
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
