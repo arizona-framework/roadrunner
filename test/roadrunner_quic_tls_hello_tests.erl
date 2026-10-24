@@ -129,11 +129,12 @@ parse_key_share_skips_to_x25519_test() ->
     ?assertEqual(X25519, maps:get(key_share, Parsed)).
 
 parse_rejects_bad_transport_params_test() ->
-    %% A server-only transport parameter from a client is rejected by C4.
+    %% A server-only transport parameter from a client is rejected by C4,
+    %% surfaced as TRANSPORT_PARAMETER_ERROR (RFC 9000 §18.2).
     Bad = <<16#00, 16#01, 16#aa>>,
     Exts = [ext(16#0039, Bad)],
     ?assertEqual(
-        {error, server_only_transport_parameter},
+        {error, transport_parameter_error},
         ?M:parse_client_hello(ch_body(<<>>, [16#1301], Exts))
     ).
 
