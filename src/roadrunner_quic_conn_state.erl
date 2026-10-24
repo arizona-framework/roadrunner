@@ -47,6 +47,10 @@
 ]).
 %% Exported for direct eunit branch coverage of the idle-timeout negotiation.
 -export([negotiated_idle_timeout/2]).
+%% Exported for direct eunit branch coverage of retransmit packing: a CRYPTO
+%% split and an unsplittable frame need a lost multi-packet handshake flight
+%% to reach through a connection.
+-export([fit_frames/2]).
 %% Exported so tests can observe the congestion window's growth and backoff.
 -export([cwnd/1]).
 
@@ -1579,14 +1583,68 @@ build_level(Level, State) ->
     case Space#space.pending of
         [_ | _] = Pending ->
             %% Retransmits travel in their own packet (no fresh CRYPTO or
-            %% STREAM slice), so a replayed frame plus a new slice can never
-            %% overflow the datagram.
+            %% STREAM slice). The frames of several lost packets, or one frame
+            %% under a fresh ACK and a longer packet number, can outgrow a
+            %% datagram, so the packet takes what fits and leaves the rest
+            %% pending for the next one.
+            #state{peer_scid = DCID, scid = SCID} = State,
+            Room =
+                roadrunner_quic_send:max_payload(Level, DCID, SCID, Space#space.next_pn) -
+                    frames_size(AckFrames),
+            {Frames, Rest} = fit_frames(Pending, Room),
             build_entry(
-                Level, prepend_ack(AckFrames, Pending), Space#space{ack = Ack, pending = []}, State
+                Level, prepend_ack(AckFrames, Frames), Space#space{ack = Ack, pending = Rest}, State
             );
         [] ->
             build_data(Level, AckFrames, Space#space{ack = Ack}, State)
     end.
+
+%% Take frames in order while they fit `Room` bytes. A STREAM or CRYPTO frame
+%% that does not fit is split at a byte offset so the packet fills up, the
+%% rest staying pending; any other frame waits whole for the next packet.
+-spec fit_frames([roadrunner_quic_frame:frame()], integer()) ->
+    {[roadrunner_quic_frame:frame()], [roadrunner_quic_frame:frame()]}.
+fit_frames([Frame | Rest] = Frames, Room) ->
+    case frames_size([Frame]) of
+        Size when Size =< Room ->
+            {Taken, Left} = fit_frames(Rest, Room - Size),
+            {[Frame | Taken], Left};
+        _ ->
+            case split_frame(Frame, Room) of
+                {Head, Tail} -> {[Head], [Tail | Rest]};
+                none -> {[], Frames}
+            end
+    end;
+fit_frames([], _Room) ->
+    {[], []}.
+
+%% Split a STREAM or CRYPTO frame so its head fills `Room` bytes, or `none`
+%% when no data byte fits or the frame cannot be split. The head's Length is
+%% sized as a 2-byte varint; a shorter one only leaves the head a byte under.
+-spec split_frame(roadrunner_quic_frame:frame(), integer()) ->
+    {roadrunner_quic_frame:frame(), roadrunner_quic_frame:frame()} | none.
+split_frame({stream, Sid, Offset, Data, Fin}, Room) ->
+    HeadLen = Room - frames_size([{stream, Sid, Offset, <<>>, false}]) - 1,
+    case Data of
+        <<Head:HeadLen/binary, Tail/binary>> when HeadLen > 0 ->
+            {{stream, Sid, Offset, Head, false}, {stream, Sid, Offset + HeadLen, Tail, Fin}};
+        _ ->
+            none
+    end;
+split_frame({crypto, Offset, Data}, Room) ->
+    HeadLen = Room - frames_size([{crypto, Offset, <<>>}]) - 1,
+    case Data of
+        <<Head:HeadLen/binary, Tail/binary>> when HeadLen > 0 ->
+            {{crypto, Offset, Head}, {crypto, Offset + HeadLen, Tail}};
+        _ ->
+            none
+    end;
+split_frame(_Frame, _Room) ->
+    none.
+
+-spec frames_size([roadrunner_quic_frame:frame()]) -> non_neg_integer().
+frames_size(Frames) ->
+    iolist_size([roadrunner_quic_frame:encode(Frame) || Frame <- Frames]).
 
 %% With nothing pending to retransmit, fill the packet after any ACK with
 %% fresh data: CRYPTO at the handshake levels, application STREAM frames at
