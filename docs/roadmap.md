@@ -31,12 +31,34 @@ frames over h2 DATA frames. Implementation needs:
   `permessage-deflate` matrix (RFC 7692)
 - Re-running the Autobahn fuzzingclient under h2
 
-**Practical impact today:** zero in browsers — they default to h1
-for `WebSocket()` even on h2-capable origins. Only matters if the
-client explicitly speaks h2 WS.
+**Practical impact today:** small. Chrome and Firefox open a WebSocket
+inside an existing h2 connection when the server advertises
+`SETTINGS_ENABLE_CONNECT_PROTOCOL`; without it they open a separate h1
+connection, which works everywhere. What h2 WebSocket saves is that
+connection's TCP and TLS handshake (one or two round trips on mount or
+reconnect) and one socket per user on the server. Behind a reverse proxy
+or CDN the browser's h2 connection ends at the proxy, which usually
+speaks h1 to the backend for WebSockets, so roadrunner sees no change
+there. Per message it is likely slower than the dedicated h1 socket:
+frames share one TCP connection with the page's other traffic (head of
+line blocking behind a large download) and go through h2 framing, flow
+control and the connection process. Worth doing when Arizona apps
+commonly face browsers directly with many connected users.
 
-**Scope:** large — adds a whole protocol-layer feature plus full
-Autobahn re-run.
+**Validation:** no RFC 8441 conformance suite exists. Run the Autobahn
+fuzzingclient through an h1-to-h2 bridge (Envoy can upgrade an h1
+WebSocket to Extended CONNECT upstream), add headless Chrome to check a
+real browser negotiates and uses it, and cover the RFC 8441 rules
+(SETTINGS, `:protocol` without the setting, pseudo-headers, 200 not 101,
+RST_STREAM and END_STREAM mapped to close) in CT.
+
+**Scope:** large. The biggest part is giving `roadrunner_ws_session` a
+second I/O backend: it owns a raw socket today (controlling-process
+handoff, active-once reads, direct sends), while over h2 it reads stream
+DATA from the connection process and sends within the stream and
+connection flow-control windows. The frame codec (`roadrunner_ws`) and
+the handler API carry over unchanged. The h1 WebSocket path must stay as
+fast as it is, checked by an A/B on the WS bench.
 
 **Source:** Arizona handoff R-h2-1.
 
@@ -70,8 +92,8 @@ h3 shipped experimentally (`protocols => [http3]`, QPACK static-table
 only). Remaining work:
 
 - WebSocket over h3 (`websocket` shape, still `501`) — RFC 9220
-  Extended CONNECT; do WebSocket over h2 (RFC 8441) first, since it's
-  the more common transport and h2 has no WebSocket either
+  Extended CONNECT; it reuses the stream I/O backend WebSocket over h2
+  (RFC 8441) needs, so it follows that item, and shares its trade-offs
 - QPACK dynamic table (non-zero capacity) — static-table compression ships
   today; the work is wiring encoder/decoder streams + section acks +
   blocked-stream buffering into the owned conn loop
