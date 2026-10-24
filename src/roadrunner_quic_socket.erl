@@ -12,14 +12,35 @@
 %% a datagram are all per-connection concerns owned by the connection
 %% send/receive pipeline, not the shared socket. The socket delivers each
 %% UDP datagram whole, with its source address.
+%%
+%% On Linux the socket also enables UDP generic segmentation offload
+%% (UDP_SEGMENT, kernel 4.18+) with a 1200-byte segment, so `send_batch/4`
+%% hands a run of datagrams to the kernel in one call and the kernel splits
+%% it back into the same datagrams. That needs every datagram sent on the
+%% socket to be at most the segment size, which holds since the QUIC stack
+%% never builds a datagram larger than 1200 bytes. Where the option is not
+%% available the socket sends one datagram per call, as `send/4` does.
 
 -export([
-    open/1, open/2, send/4, recv/2, activate/1, activate/2, from_message/2, close/1, sockname/1
+    open/1,
+    open/2,
+    send/4,
+    send_batch/4,
+    recv/2,
+    activate/1,
+    activate/2,
+    from_message/2,
+    close/1,
+    sockname/1
 ]).
+%% Exported for direct unit coverage of the non-Linux and refused-option
+%% branches, which the Linux test host cannot reach through open/2.
+-export([gso_segment/3]).
 
 -export_type([socket/0, open_opts/0]).
 
--opaque socket() :: {gen_udp, gen_udp:socket()}.
+%% The gen_udp socket and its GSO segment size, or `none` without GSO.
+-opaque socket() :: {gen_udp, gen_udp:socket(), pos_integer() | none}.
 
 -type active() :: once | false | pos_integer().
 
@@ -28,13 +49,24 @@
     sndbuf => pos_integer(),
     reuseport => boolean(),
     active => active(),
-    ip => inet:ip_address()
+    ip => inet:ip_address(),
+    gso => boolean()
 }.
 
 %% Larger than the OS default, so a burst of datagrams is not dropped
 %% before the receiver drains them. Raise via `open/2` for a busy server.
 -define(DEFAULT_RECBUF, 1048576).
 -define(DEFAULT_SNDBUF, 1048576).
+
+%% Linux UDP_SEGMENT (SOL_UDP 17, option 103): the GSO segment size, the
+%% largest datagram the QUIC stack builds (RFC 9000 §14).
+-define(SOL_UDP, 17).
+-define(UDP_SEGMENT, 103).
+-define(GSO_SEGMENT, 1200).
+%% Datagrams per GSO send: within the 64 segments every UDP_SEGMENT kernel
+%% accepts and the 65507-byte UDP payload limit (64 x 1200 = 76800 would
+%% exceed it, so the byte limit caps a run of full datagrams at 54).
+-define(GSO_MAX_SEGMENTS, 54).
 
 -doc "Open a UDP socket on `Port` with the default buffer sizes.".
 -spec open(inet:port_number()) -> {ok, socket()} | {error, term()}.
@@ -82,14 +114,73 @@ open(Port, Opts) ->
             #{} -> BaseOpts
         end,
     case gen_udp:open(Port, SocketOpts) of
-        {ok, Socket} -> {ok, {gen_udp, Socket}};
+        {ok, Socket} -> {ok, {gen_udp, Socket, gso_segment(Socket, Validated, os:type())}};
         {error, _} = Error -> Error
     end.
 
+%% Enable GSO on Linux unless the caller turned it off; a kernel without
+%% UDP_SEGMENT rejects the option, and the socket then sends one datagram
+%% per call.
+-spec gso_segment(gen_udp:socket(), #{gso := boolean(), _ => _}, {atom(), atom()}) ->
+    pos_integer() | none.
+gso_segment(Socket, #{gso := true}, {unix, linux}) ->
+    Opt = {raw, ?SOL_UDP, ?UDP_SEGMENT, <<?GSO_SEGMENT:32/native>>},
+    case inet:setopts(Socket, [Opt]) of
+        ok -> ?GSO_SEGMENT;
+        {error, _} -> none
+    end;
+gso_segment(_Socket, _Opts, _OsType) ->
+    none.
+
 -doc "Send `Data` as one UDP datagram to `Ip`/`Port`.".
 -spec send(socket(), inet:ip_address(), inet:port_number(), iodata()) -> ok | {error, term()}.
-send({gen_udp, Socket}, Ip, Port, Data) ->
+send({gen_udp, Socket, _Segment}, Ip, Port, Data) ->
     gen_udp:send(Socket, Ip, Port, Data).
+
+-doc """
+Send each of `Datagrams` as its own UDP datagram to `Ip`/`Port`, in order.
+With GSO, a run of full-size datagrams (the last one may be shorter) goes out
+in one call; a run the kernel refuses is resent a datagram at a time. Send
+errors are not reported, as for a lost datagram.
+""".
+-spec send_batch(socket(), inet:ip_address(), inet:port_number(), [binary()]) -> ok.
+send_batch({gen_udp, Socket, none}, Ip, Port, Datagrams) ->
+    send_each(Socket, Ip, Port, Datagrams);
+send_batch({gen_udp, Socket, Segment}, Ip, Port, Datagrams) ->
+    send_runs(Socket, Ip, Port, Segment, Datagrams).
+
+-spec send_runs(gen_udp:socket(), inet:ip_address(), inet:port_number(), pos_integer(), [binary()]) ->
+    ok.
+send_runs(_Socket, _Ip, _Port, _Segment, []) ->
+    ok;
+send_runs(Socket, Ip, Port, Segment, [Datagram]) ->
+    _ = gen_udp:send(Socket, Ip, Port, Datagram),
+    send_runs(Socket, Ip, Port, Segment, []);
+send_runs(Socket, Ip, Port, Segment, Datagrams) ->
+    {Run, Rest} = take_run(Datagrams, Segment, ?GSO_MAX_SEGMENTS),
+    case gen_udp:send(Socket, Ip, Port, Run) of
+        ok -> ok;
+        {error, _} -> send_each(Socket, Ip, Port, Run)
+    end,
+    send_runs(Socket, Ip, Port, Segment, Rest).
+
+%% The next GSO run: full-size datagrams, ended by a shorter one (which the
+%% kernel takes as the last segment) or by the segment cap.
+-spec take_run([binary()], pos_integer(), non_neg_integer()) -> {[binary()], [binary()]}.
+take_run([Datagram | Rest], Segment, Left) when Left > 1, byte_size(Datagram) =:= Segment ->
+    {Run, Tail} = take_run(Rest, Segment, Left - 1),
+    {[Datagram | Run], Tail};
+take_run([Datagram | Rest], _Segment, _Left) ->
+    {[Datagram], Rest};
+take_run([], _Segment, _Left) ->
+    {[], []}.
+
+-spec send_each(gen_udp:socket(), inet:ip_address(), inet:port_number(), [binary()]) -> ok.
+send_each(Socket, Ip, Port, [Datagram | Rest]) ->
+    _ = gen_udp:send(Socket, Ip, Port, Datagram),
+    send_each(Socket, Ip, Port, Rest);
+send_each(_Socket, _Ip, _Port, []) ->
+    ok.
 
 -doc """
 Receive the next whole datagram, blocking up to `Timeout` milliseconds.
@@ -98,7 +189,7 @@ when none arrives in time.
 """.
 -spec recv(socket(), timeout()) ->
     {ok, {inet:ip_address(), inet:port_number()}, binary()} | {error, term()}.
-recv({gen_udp, Socket}, Timeout) ->
+recv({gen_udp, Socket, _Segment}, Timeout) ->
     %% The 3-tuple shape assumes no ancillary-data options (pktinfo,
     %% recvtos, ...) are enabled; gen_udp returns a 4-tuple with an
     %% AncData element when they are, and open/2 enables none.
@@ -122,7 +213,7 @@ positive integer `N` to deliver up to `N` datagrams before the next
 re-arm syscall is paid once per `N` datagrams, not once per datagram.
 """.
 -spec activate(socket(), once | pos_integer()) -> ok | {error, term()}.
-activate({gen_udp, Socket}, Active) ->
+activate({gen_udp, Socket, _Segment}, Active) ->
     inet:setopts(Socket, [{active, Active}]).
 
 -doc """
@@ -135,21 +226,21 @@ itself.
 """.
 -spec from_message(socket(), term()) ->
     {ok, {inet:ip_address(), inet:port_number()}, binary()} | passive | ignore.
-from_message({gen_udp, Socket}, {udp, Socket, Ip, Port, Data}) ->
+from_message({gen_udp, Socket, _Segment}, {udp, Socket, Ip, Port, Data}) ->
     {ok, {Ip, Port}, Data};
-from_message({gen_udp, Socket}, {udp_passive, Socket}) ->
+from_message({gen_udp, Socket, _Segment}, {udp_passive, Socket}) ->
     passive;
 from_message(_Socket, _Message) ->
     ignore.
 
 -doc "Close the socket.".
 -spec close(socket()) -> ok.
-close({gen_udp, Socket}) ->
+close({gen_udp, Socket, _Segment}) ->
     gen_udp:close(Socket).
 
 -doc "The socket's local address and port.".
 -spec sockname(socket()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
-sockname({gen_udp, Socket}) ->
+sockname({gen_udp, Socket, _Segment}) ->
     inet:sockname(Socket).
 
 %% =============================================================================
@@ -164,14 +255,16 @@ sockname({gen_udp, Socket}) ->
         sndbuf := pos_integer(),
         reuseport := boolean(),
         active := active(),
-        ip => inet:ip_address()
+        ip => inet:ip_address(),
+        gso := boolean()
     }.
 validate_opts(Opts) ->
     Defaults = #{
         recbuf => ?DEFAULT_RECBUF,
         sndbuf => ?DEFAULT_SNDBUF,
         reuseport => false,
-        active => false
+        active => false,
+        gso => true
     },
     maps:fold(fun validate_opt/3, Defaults, Opts).
 
@@ -188,5 +281,7 @@ validate_opt(active, Value, Acc) when is_integer(Value), Value > 0 ->
     Acc#{active => Value};
 validate_opt(ip, Value, Acc) when is_tuple(Value) ->
     Acc#{ip => Value};
+validate_opt(gso, Value, Acc) when is_boolean(Value) ->
+    Acc#{gso => Value};
 validate_opt(Key, Value, _Acc) ->
     error({invalid_quic_socket_opt, Key, Value}).

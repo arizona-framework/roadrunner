@@ -21,7 +21,12 @@ clause is unit-tested in `roadrunner_quic_socket_tests`.
     open_binds_to_ip/1,
     reuseport_allows_shared_bind/1,
     active_once_delivers_messages/1,
-    active_n_batches_then_passive/1
+    active_n_batches_then_passive/1,
+    send_batch_delivers_each_datagram/1,
+    send_batch_splits_runs_at_short_datagrams/1,
+    send_batch_past_segment_cap/1,
+    send_batch_without_gso/1,
+    send_batch_failed_run_falls_back/1
 ]).
 
 -define(LOOPBACK, {127, 0, 0, 1}).
@@ -38,7 +43,12 @@ all() ->
         open_binds_to_ip,
         reuseport_allows_shared_bind,
         active_once_delivers_messages,
-        active_n_batches_then_passive
+        active_n_batches_then_passive,
+        send_batch_delivers_each_datagram,
+        send_batch_splits_runs_at_short_datagrams,
+        send_batch_past_segment_cap,
+        send_batch_without_gso,
+        send_batch_failed_run_falls_back
     ].
 
 %% An `active => once` socket delivers each datagram as one mailbox message,
@@ -171,3 +181,60 @@ reuseport_allows_shared_bind(_Config) ->
     {ok, Second} = roadrunner_quic_socket:open(Port, #{reuseport => true}),
     ok = roadrunner_quic_socket:close(First),
     ok = roadrunner_quic_socket:close(Second).
+
+%% =============================================================================
+%% send_batch/4: with GSO a run of full-size datagrams goes to the kernel in
+%% one call and must still arrive as the same separate datagrams.
+%% =============================================================================
+
+send_batch_delivers_each_datagram(_Config) ->
+    %% Three full 1200-byte datagrams and a shorter last one: one GSO run.
+    assert_batch_delivered(#{}, [
+        datagram(1, 1200), datagram(2, 1200), datagram(3, 1200), datagram(4, 100)
+    ]).
+
+send_batch_splits_runs_at_short_datagrams(_Config) ->
+    %% A short datagram mid-batch ends a run (only a run's last segment may
+    %% be shorter), and a lone datagram goes out by itself.
+    assert_batch_delivered(#{}, [
+        datagram(1, 1200), datagram(2, 40), datagram(3, 1200), datagram(4, 1200), datagram(5, 1200)
+    ]).
+
+send_batch_past_segment_cap(_Config) ->
+    %% More full datagrams than one GSO send may carry go out as several runs.
+    assert_batch_delivered(#{}, [datagram(N, 1200) || N <- lists:seq(1, 60)]).
+
+send_batch_without_gso(_Config) ->
+    %% A socket opened without GSO sends the batch one datagram at a time.
+    assert_batch_delivered(#{gso => false}, [datagram(1, 1200), datagram(2, 1200), datagram(3, 7)]).
+
+send_batch_failed_run_falls_back(_Config) ->
+    %% A run the kernel refuses (here every send fails: port 0 is not a
+    %% destination) is retried a datagram at a time; errors are not raised.
+    {ok, Client} = roadrunner_quic_socket:open(0),
+    ok = roadrunner_quic_socket:send_batch(Client, ?LOOPBACK, 0, [
+        datagram(1, 1200), datagram(2, 1200), datagram(3, 10)
+    ]),
+    ok = roadrunner_quic_socket:close(Client).
+
+assert_batch_delivered(ClientOpts, Datagrams) ->
+    {ok, Server} = roadrunner_quic_socket:open(0, #{recbuf => 4194304}),
+    {ok, Client} = roadrunner_quic_socket:open(0, ClientOpts),
+    {ok, {_, ServerPort}} = roadrunner_quic_socket:sockname(Server),
+    ok = roadrunner_quic_socket:send_batch(Client, ?LOOPBACK, ServerPort, Datagrams),
+    Received = [
+        begin
+            {ok, _From, Data} = roadrunner_quic_socket:recv(Server, 1000),
+            Data
+        end
+     || _ <- Datagrams
+    ],
+    ?assertEqual(Datagrams, Received),
+    ?assertEqual({error, timeout}, roadrunner_quic_socket:recv(Server, 50)),
+    ok = roadrunner_quic_socket:close(Server),
+    ok = roadrunner_quic_socket:close(Client).
+
+%% A datagram of `Size` bytes whose first byte tags it, so a reordered or
+%% merged delivery fails the comparison.
+datagram(Tag, Size) ->
+    <<Tag, (binary:copy(<<"x">>, Size - 1))/binary>>.
