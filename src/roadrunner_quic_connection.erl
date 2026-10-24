@@ -14,8 +14,13 @@
 %% Bytes}` message; the shell only sends on the socket. Every message drives
 %% one conn_state entry point, and the returned effects are performed here:
 %% `{send, Datagram}` goes out the socket to the peer, and `{arm_timer,
-%% Kind, AtMs}` (re)arms a self-tagged timer whose stale fires (from a timer
-%% that was re-armed before firing) are dropped by a reference match.
+%% Kind, AtMs}` sets the one deadline the core wants. The shell re-arms its
+%% timer lazily: a later deadline leaves an earlier armed timer running, and
+%% when that one fires ahead of the deadline it is just re-armed, so a
+%% deadline that keeps moving later (a PTO pushed back by each ACK) costs no
+%% timer work per datagram. Only an earlier deadline cancels and re-arms. A
+%% stale fire (from a timer cancelled after its message was queued) is
+%% dropped by a timer-reference match.
 %%
 %% Synchronous control calls from the owner or listener arrive as
 %% `{quic_call, From, Ref, Request}` and stream writes as `{quic_send, From,
@@ -32,7 +37,10 @@
     socket :: roadrunner_quic_socket:socket(),
     peer :: {inet:ip_address(), inet:port_number()},
     conn :: roadrunner_quic_conn_state:t(),
-    timer :: reference() | undefined
+    %% The armed timer and the time it fires at, never after `deadline`.
+    timer :: {reference(), integer()} | undefined,
+    %% The core's current deadline: the timer kind to run, and when.
+    deadline :: {atom(), integer()} | undefined
 }).
 
 %% =============================================================================
@@ -57,7 +65,8 @@ init(Socket, #{peer := Peer} = Config) ->
         socket = Socket,
         peer = Peer,
         conn = roadrunner_quic_conn_state:new(Config, erlang:monotonic_time(millisecond)),
-        timer = undefined
+        timer = undefined,
+        deadline = undefined
     }).
 
 %% =============================================================================
@@ -98,8 +107,8 @@ loop(State) ->
                 Now, Datagram, State#shell.conn
             ),
             continue(perform(Effects, Now, State#shell{conn = Conn}));
-        {?MODULE, timer, Kind, Ref} ->
-            continue(fire_timer(Ref, Kind, State));
+        {timeout, TRef, ?MODULE} ->
+            continue(fire_timer(TRef, State));
         _Other ->
             loop(State)
     end.
@@ -115,14 +124,21 @@ continue(#shell{conn = Conn} = State) ->
         _ -> loop(State)
     end.
 
-%% Run a fired timer only when its ref is still the armed one; a stale fire
-%% (the timer was re-armed before this message was delivered) is dropped.
--spec fire_timer(reference(), atom(), #shell{}) -> #shell{}.
-fire_timer(Ref, Kind, #shell{timer = Ref, conn = Conn} = State) ->
+%% Act on a fired timer only when it is still the armed one; a stale fire
+%% (the timer was cancelled after this message was queued) is dropped. A
+%% timer armed for an earlier deadline than the current one is re-armed for
+%% the rest of the wait; once the deadline is reached the core runs it.
+-spec fire_timer(reference(), #shell{}) -> #shell{}.
+fire_timer(TRef, #shell{timer = {TRef, _}, deadline = {Kind, AtMs}, conn = Conn} = State) ->
     Now = erlang:monotonic_time(millisecond),
-    {Conn1, Effects} = roadrunner_quic_conn_state:handle_timeout(Now, Kind, Conn),
-    perform(Effects, Now, State#shell{conn = Conn1, timer = undefined});
-fire_timer(_Ref, _Kind, State) ->
+    case AtMs =< Now of
+        true ->
+            {Conn1, Effects} = roadrunner_quic_conn_state:handle_timeout(Now, Kind, Conn),
+            perform(Effects, Now, State#shell{conn = Conn1, timer = undefined, deadline = undefined});
+        false ->
+            arm(AtMs, Now, State)
+    end;
+fire_timer(_TRef, State) ->
     State.
 
 %% =============================================================================
@@ -143,15 +159,20 @@ perform_effect({emit, Owner, Event}, _Now, State) ->
 perform_effect({reply, To, Ref, Result}, _Now, State) ->
     _ = To ! {quic_reply, Ref, Result},
     State;
-perform_effect({arm_timer, Kind, AtMs}, Now, #shell{timer = Prev} = State) ->
-    _ = cancel(Prev),
-    Ref = make_ref(),
-    _ = erlang:send_after(max(0, AtMs - Now), self(), {?MODULE, timer, Kind, Ref}),
-    State#shell{timer = Ref}.
+perform_effect({arm_timer, Kind, AtMs}, Now, #shell{timer = Timer} = State0) ->
+    State = State0#shell{deadline = {Kind, AtMs}},
+    case Timer of
+        {_TRef, ArmedAt} when ArmedAt =< AtMs ->
+            %% The armed timer fires first; fire_timer/2 re-arms from there.
+            State;
+        {TRef, _ArmedAt} ->
+            _ = erlang:cancel_timer(TRef),
+            arm(AtMs, Now, State);
+        undefined ->
+            arm(AtMs, Now, State)
+    end.
 
--spec cancel(reference() | undefined) -> ok.
-cancel(undefined) ->
-    ok;
-cancel(Ref) ->
-    _ = erlang:cancel_timer(Ref),
-    ok.
+-spec arm(integer(), integer(), #shell{}) -> #shell{}.
+arm(AtMs, Now, State) ->
+    TRef = erlang:start_timer(max(0, AtMs - Now), self(), ?MODULE),
+    State#shell{timer = {TRef, AtMs}}.
