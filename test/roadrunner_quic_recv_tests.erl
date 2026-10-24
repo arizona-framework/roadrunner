@@ -18,9 +18,9 @@
 rfc9001_a3_server_initial_test() ->
     Keys = #{
         initial => #{
-            key => hex(~"cf3a5331653c364c88f0f379b6067e37"),
+            key => {aes_128_gcm, hex(~"cf3a5331653c364c88f0f379b6067e37")},
             iv => hex(~"0ac1493ca1905853b0bba03e"),
-            hp => hex(~"c206b8d9b9f0f37644430b490eeaa314")
+            hp => {aes_128_ecb, hex(~"c206b8d9b9f0f37644430b490eeaa314")}
         }
     },
     Packet = hex(
@@ -280,14 +280,17 @@ enc(Iolist) -> iolist_to_binary(Iolist).
 hex(H) -> binary:decode_hex(string:uppercase(H)).
 
 %% Distinct per-level keys; any valid AES-128 material round-trips.
-initial_keys() -> #{key => <<31:128>>, iv => <<32:96>>, hp => <<33:128>>}.
-handshake_keys() -> #{key => <<11:128>>, iv => <<12:96>>, hp => <<13:128>>}.
-application_keys() -> #{key => <<21:128>>, iv => <<22:96>>, hp => <<23:128>>}.
+initial_keys() ->
+    #{key => {aes_128_gcm, <<31:128>>}, iv => <<32:96>>, hp => {aes_128_ecb, <<33:128>>}}.
+handshake_keys() ->
+    #{key => {aes_128_gcm, <<11:128>>}, iv => <<12:96>>, hp => {aes_128_ecb, <<13:128>>}}.
+application_keys() ->
+    #{key => {aes_128_gcm, <<21:128>>}, iv => <<22:96>>, hp => {aes_128_ecb, <<23:128>>}}.
 
 %% Key update generations around `application_keys/0`, all sharing its
 %% header-protection key.
-next_packet_keys() -> #{key => <<41:128>>, iv => <<42:96>>}.
-prev_packet_keys() -> #{key => <<51:128>>, iv => <<52:96>>}.
+next_packet_keys() -> #{key => {aes_128_gcm, <<41:128>>}, iv => <<42:96>>}.
+prev_packet_keys() -> #{key => {aes_128_gcm, <<51:128>>}, iv => <<52:96>>}.
 
 update_keys() ->
     (application_keys())#{

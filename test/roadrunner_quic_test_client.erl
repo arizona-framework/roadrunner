@@ -13,7 +13,7 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -export([key_material/0, gen_keypair/0]).
--export([client_hello_framed/3, client_hello_framed/4]).
+-export([client_hello_framed/1, client_hello_framed/3, client_hello_framed/4]).
 -export([seal/6, seal_raw/6, seal_raw_reserved/6]).
 -export([crypto_bytes/4, frames/4]).
 -export([server_hello_key_share/1, deframe_all/1]).
@@ -32,10 +32,12 @@
 
 %% ClientHello wire constants (RFC 8446 §4.1.2).
 -define(LEGACY_VERSION, 16#0303).
+-define(TLS_1_3, 16#0304).
 -define(CIPHER_AES_128_GCM_SHA256, 16#1301).
 -define(GROUP_X25519, 16#001D).
 -define(EXT_SIGNATURE_ALGORITHMS, 16#000D).
 -define(EXT_ALPN, 16#0010).
+-define(EXT_SUPPORTED_VERSIONS, 16#002B).
 -define(EXT_KEY_SHARE, 16#0033).
 -define(EXT_QUIC_TRANSPORT_PARAMS, 16#0039).
 
@@ -68,13 +70,13 @@ gen_keypair() ->
 
 -doc """
 A framed ClientHello (handshake-message bytes, RFC 8446 §4.1.2) offering
-the given signature scheme, the x25519 key share, the `h3` ALPN, and a
-quic_transport_parameters extension carrying `ClientSCID` as the
-`initial_source_connection_id` (the server checks it against the client's
-Initial SCID, RFC 9000 §7.3, and requires the extension's presence, RFC 9001
-§8.2). `ClientSCID = none` omits the extension entirely, to exercise the §8.2
-missing-extension path. These bytes are both the CRYPTO-frame payload and the
-first transcript element.
+TLS 1.3, TLS_AES_128_GCM_SHA256, the given signature scheme, the x25519 key
+share, the `h3` ALPN, and a quic_transport_parameters extension carrying
+`ClientSCID` as the `initial_source_connection_id` (the server checks it
+against the client's Initial SCID, RFC 9000 §7.3, and requires the
+extension's presence, RFC 9001 §8.2). `ClientSCID = none` omits the
+extension entirely, to exercise the §8.2 missing-extension path. These bytes
+are both the CRYPTO-frame payload and the first transcript element.
 """.
 -spec client_hello_framed(
     Scheme :: non_neg_integer(), ClientPub :: binary(), ClientSCID :: binary() | none
@@ -95,18 +97,48 @@ small `initial_max_streams_uni` to limit the server's own streams.
     Overrides :: roadrunner_quic_transport_params:params()
 ) -> binary().
 client_hello_framed(Scheme, ClientPub, ClientSCID, Overrides) ->
+    client_hello_framed(#{
+        scheme => Scheme,
+        key_share => ClientPub,
+        client_scid => ClientSCID,
+        transport_params => Overrides
+    }).
+
+-doc """
+As `client_hello_framed/4`, from a map: `scheme`, `key_share` (the x25519
+public key) and `client_scid` are required; `transport_params` (the
+overrides of `client_hello_framed/4`, default none), `cipher_suites` (the
+offered suite codepoints, default TLS_AES_128_GCM_SHA256 only) and
+`versions` (the supported_versions list, default TLS 1.3 only) are
+optional, so a test can steer the server's cipher suite and version
+negotiation.
+""".
+-spec client_hello_framed(#{
+    scheme := non_neg_integer(),
+    key_share := binary(),
+    client_scid := binary() | none,
+    transport_params => roadrunner_quic_transport_params:params(),
+    cipher_suites => [non_neg_integer()],
+    versions => [non_neg_integer()]
+}) -> binary().
+client_hello_framed(#{scheme := Scheme, key_share := ClientPub, client_scid := ClientSCID} = Opts) ->
     Random = crypto:strong_rand_bytes(32),
     Extensions = iolist_to_binary([
+        supported_versions_ext(maps:get(versions, Opts, [?TLS_1_3])),
         signature_algorithms_ext([Scheme]),
         alpn_ext(~"h3"),
         key_share_ext(ClientPub),
-        transport_params_ext(ClientSCID, Overrides)
+        transport_params_ext(ClientSCID, maps:get(transport_params, Opts, #{}))
     ]),
-    CipherSuites = <<?CIPHER_AES_128_GCM_SHA256:16>>,
+    CipherSuites = <<<<C:16>> || C <- maps:get(cipher_suites, Opts, [?CIPHER_AES_128_GCM_SHA256])>>,
     Body =
         <<?LEGACY_VERSION:16, Random/binary, 0:8, (byte_size(CipherSuites)):16, CipherSuites/binary,
             1:8, 0:8, (byte_size(Extensions)):16, Extensions/binary>>,
     iolist_to_binary(roadrunner_quic_tls_handshake:encode(?CLIENT_HELLO, Body)).
+
+supported_versions_ext(Versions) ->
+    List = <<<<V:16>> || V <- Versions>>,
+    extension(?EXT_SUPPORTED_VERSIONS, <<(byte_size(List)):8, List/binary>>).
 
 signature_algorithms_ext(Schemes) ->
     List = <<<<S:16>> || S <- Schemes>>,

@@ -9,9 +9,11 @@
 %% as the server does, verifies the server's CertificateVerify and Finished,
 %% and produces the client's Finished. Pure: no process, no socket; the
 %% connection loop reassembles the CRYPTO bytes, installs keys from the
-%% returned traffic secrets, and emits the client Finished. The transcript is threaded across the four
-%% hash boundaries (RFC 8446 §7.1) using the re-framed received messages,
-%% byte-identical to the wire bytes.
+%% returned traffic secrets, and emits the client Finished. The transcript
+%% is threaded across the four hash boundaries (RFC 8446 §7.1) using the
+%% re-framed received messages, byte-identical to the wire bytes. The
+%% packet keys use the AEAD of the cipher suite the ServerHello selected
+%% (RFC 9001 §5.3), which each install carries.
 %%
 %% `handshake_keys/2` derives just the handshake-level packet keys from the
 %% ServerHello, so the connection loop can decrypt the Handshake-level
@@ -29,7 +31,8 @@
 -define(CERTIFICATE_VERIFY, 15).
 -define(FINISHED, 20).
 
--type install() :: {handshake | application, server | client, Secret :: binary()}.
+-type install() ::
+    {handshake | application, server | client, roadrunner_quic_aead:cipher(), Secret :: binary()}.
 
 -type config() :: #{
     eph_priv := binary(),
@@ -52,6 +55,7 @@
 %% process_server_flight/2: the transcript through ServerHello and the
 %% handshake traffic secrets both ends derive from it.
 -type context() :: #{
+    aead := roadrunner_quic_aead:cipher(),
     handshake_secret := binary(),
     client_hs_secret := binary(),
     server_hs_secret := binary(),
@@ -68,11 +72,11 @@ decrypt the Handshake-level packets carrying the rest of the flight.
 -spec handshake_keys(config(), iodata()) ->
     #{server := roadrunner_quic_keys:keys(), client := roadrunner_quic_keys:keys()}.
 handshake_keys(Config, ServerHelloFramed) ->
-    #{client_hs_secret := ClientHsSecret, server_hs_secret := ServerHsSecret} =
+    #{aead := Aead, client_hs_secret := ClientHsSecret, server_hs_secret := ServerHsSecret} =
         through_server_hello(Config, ServerHelloFramed),
     #{
-        server => roadrunner_quic_keys:traffic_keys(ServerHsSecret),
-        client => roadrunner_quic_keys:traffic_keys(ClientHsSecret)
+        server => roadrunner_quic_keys:traffic_keys(Aead, ServerHsSecret),
+        client => roadrunner_quic_keys:traffic_keys(Aead, ClientHsSecret)
     }.
 
 -doc """
@@ -92,6 +96,7 @@ process_server_flight(
     #{initial := InitialBytes, handshake := HandshakeBytes}
 ) ->
     #{
+        aead := Aead,
         handshake_secret := HandshakeSecret,
         client_hs_secret := ClientHsSecret,
         server_hs_secret := ServerHsSecret,
@@ -143,10 +148,10 @@ process_server_flight(
         ),
         ClientFinished = roadrunner_quic_tls_auth:build_finished(ClientHsSecret, FinishedHash),
         Installs = [
-            {handshake, server, ServerHsSecret},
-            {handshake, client, ClientHsSecret},
-            {application, server, ServerApSecret},
-            {application, client, ClientApSecret}
+            {handshake, server, Aead, ServerHsSecret},
+            {handshake, client, Aead, ClientHsSecret},
+            {application, server, Aead, ServerApSecret},
+            {application, client, Aead, ClientApSecret}
         ],
         {ok, #{
             installs => Installs,
@@ -170,7 +175,8 @@ through_server_hello(
     #{eph_priv := EphPriv, client_hello_framed := ClientHelloFramed}, InitialBytes
 ) ->
     [{?SERVER_HELLO, ShBody}] = roadrunner_quic_test_client:deframe_all(InitialBytes),
-    #{key_share := ServerKeyShare} = roadrunner_quic_test_client:parse_server_hello(ShBody),
+    #{cipher := Cipher, key_share := ServerKeyShare} =
+        roadrunner_quic_test_client:parse_server_hello(ShBody),
     ServerHelloFramed = roadrunner_quic_tls_handshake:encode(?SERVER_HELLO, ShBody),
     ThroughServerHello = [ClientHelloFramed, ServerHelloFramed],
     SharedSecret = crypto:compute_key(ecdh, ServerKeyShare, EphPriv, x25519),
@@ -179,6 +185,7 @@ through_server_hello(
     ),
     HelloHash = roadrunner_quic_tls_crypto:transcript_hash(ThroughServerHello),
     #{
+        aead => aead(Cipher),
         handshake_secret => HandshakeSecret,
         client_hs_secret => roadrunner_quic_tls_crypto:traffic_secret(
             client, handshake, HandshakeSecret, HelloHash
@@ -188,6 +195,11 @@ through_server_hello(
         ),
         through_server_hello => ThroughServerHello
     }.
+
+%% The packet-protection AEAD of a cipher suite (RFC 9001 §5.3).
+-spec aead(non_neg_integer()) -> roadrunner_quic_aead:cipher().
+aead(16#1301) -> aes_128_gcm;
+aead(16#1303) -> chacha20_poly1305.
 
 %% The server Finished verify_data is HMAC(finished_key(ServerHsSecret),
 %% TranscriptHash); check it in constant time (RFC 8446 §4.4.4).

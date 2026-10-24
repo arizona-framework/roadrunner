@@ -56,7 +56,7 @@ handshake_completes(#{shell := Shell, peer := Peer, client := ClientSocket, ctx 
         AppFrames = ?TC:frames(
             recv_all(ClientSocket),
             application,
-            #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+            #{application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)},
             byte_size(?DCID)
         ),
         ?assert(lists:member(handshake_done, AppFrames))
@@ -77,7 +77,7 @@ send_data_round_trip(#{shell := Shell, peer := Peer, client := ClientSocket, ctx
         Frames = ?TC:frames(
             recv_all(ClientSocket),
             application,
-            #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+            #{application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)},
             byte_size(?DCID)
         ),
         ?assert(lists:member({stream, 0, 0, ~"hello", true}, Frames))
@@ -108,7 +108,7 @@ peer_close_terminates_shell(#{shell := Shell, peer := Peer, client := ClientSock
         Close = ?TC:seal(
             application,
             0,
-            roadrunner_quic_keys:traffic_keys(ClientApSecret),
+            roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientApSecret),
             [{ack, 0, 0, 0, [], undefined}, {connection_close, transport, 0, 0, <<>>}],
             ?DCID,
             ?SCID
@@ -337,7 +337,7 @@ do_handshake(Shell, Peer, ClientSocket, Ctx) ->
     Flight = ?TC:crypto_bytes(
         Flight1,
         handshake,
-        #{handshake => roadrunner_quic_keys:traffic_keys(ServerHsSecret)},
+        #{handshake => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerHsSecret)},
         byte_size(?DCID)
     ),
     FinishedHash = roadrunner_quic_tls_crypto:transcript_hash([
@@ -352,7 +352,7 @@ do_handshake(Shell, Peer, ClientSocket, Ctx) ->
     FinishedDatagram = ?TC:seal(
         handshake,
         0,
-        roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+        roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientHsSecret),
         [{crypto, 0, ClientFinishedFramed}],
         ?DCID,
         ?SCID

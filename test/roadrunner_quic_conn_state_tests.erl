@@ -70,6 +70,25 @@ handshake_reaches_connected_test() ->
     ?assertEqual(handshaking, ?M:phase(State1)),
     ?assertEqual(connected, ?M:phase(State2)).
 
+%% A client offering only TLS_CHACHA20_POLY1305_SHA256 completes the handshake
+%% on ChaCha20-Poly1305 packet protection with ChaCha20 header protection (RFC
+%% 9001 §5.3, §5.4.4): the driver reads the server's Handshake flight with
+%% ChaCha20 keys, the server opens the ChaCha20-sealed client Finished, and its
+%% HANDSHAKE_DONE opens under the ChaCha20 1-RTT keys. The Initial packets stay
+%% AES-128-GCM (§5.2).
+chacha20_handshake_reaches_connected_test() ->
+    #{state2 := State2, effects2 := Effects2, server_ap_secret := ServerApSecret, aead := Aead} =
+        connect(#{}, #{cipher_suites => [16#1303]}),
+    ?assertEqual(chacha20_poly1305, Aead),
+    ?assertEqual(connected, ?M:phase(State2)),
+    Frames = ?TC:frames(
+        sends(Effects2),
+        application,
+        #{application => roadrunner_quic_keys:traffic_keys(chacha20_poly1305, ServerApSecret)},
+        byte_size(?DCID)
+    ),
+    ?assert(lists:member(handshake_done, Frames)).
+
 server_hello_carries_server_key_share_test() ->
     #{sh_framed := ServerHello, ctx := #{server_pub := ServerPub}} = connect(),
     ?assertEqual(ServerPub, ?TC:server_hello_key_share(ServerHello)).
@@ -96,7 +115,7 @@ handshake_done_emitted_when_connected_test() ->
     Frames = ?TC:frames(
         sends(Effects2),
         application,
-        #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+        #{application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)},
         byte_size(?DCID)
     ),
     ?assert(lists:member(handshake_done, Frames)).
@@ -170,7 +189,7 @@ undecryptable_packet_dropped_test() ->
     %% A packet sealed with the wrong keys is silently dropped (RFC 9001
     %% §5.4.2); the connection neither advances nor replies.
     {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
-    WrongKeys = #{key => <<0:128>>, iv => <<0:96>>, hp => <<0:128>>},
+    WrongKeys = #{key => {aes_128_gcm, <<0:128>>}, iv => <<0:96>>, hp => {aes_128_ecb, <<0:128>>}},
     Datagram = ?TC:seal(initial, 0, WrongKeys, [{crypto, 0, ~"hello"}], ?DCID, ?SCID),
     {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, State0),
     ?assertEqual(handshaking, ?M:phase(State1)),
@@ -225,7 +244,7 @@ packet_for_discarded_space_ignored_test() ->
     %% handshake and discards the Handshake space) with a trailing handshake
     %% packet that then lands on the now-absent space.
     #{state1 := State1, client_hs_secret := ClientHsSecret, cf_framed := ClientFinished} = connect(),
-    HsKeys = roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+    HsKeys = roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientHsSecret),
     Finished = ?TC:seal(handshake, 0, HsKeys, [{crypto, 0, ClientFinished}], ?DCID, ?SCID),
     Trailing = ?TC:seal(handshake, 1, HsKeys, [ping], ?DCID, ?SCID),
     {State2, _Effects} = ?M:handle_datagram(?NOW, <<Finished/binary, Trailing/binary>>, State1),
@@ -237,7 +256,7 @@ tampered_client_finished_closes_test() ->
     #{state1 := State1, client_hs_secret := ClientHsSecret, cf_framed := ClientFinished} = connect(),
     <<Type, Len:24, First, Rest/binary>> = ClientFinished,
     Tampered = <<Type, Len:24, (First bxor 1), Rest/binary>>,
-    HsKeys = roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+    HsKeys = roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientHsSecret),
     Datagram = ?TC:seal(handshake, 0, HsKeys, [{crypto, 0, Tampered}], ?DCID, ?SCID),
     {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State1)),
     ?assertEqual(closed, ?M:phase(State2)),
@@ -305,6 +324,25 @@ missing_transport_params_closes_test() ->
     ExpectedCode = roadrunner_quic_error:code_int({crypto_error, 109}),
     ?assertMatch([{connection_close, transport, ExpectedCode, 0, <<>>}], Frames).
 
+%% A ClientHello whose supported_versions lacks TLS 1.3 closes with the TLS
+%% protocol_version alert (70), 0x0146, at the Initial level (RFC 8446 §4.2.1,
+%% RFC 9001 §4.8).
+no_tls_1_3_closes_with_protocol_version_test() ->
+    assert_client_hello_closes(#{versions => [16#0303]}, protocol_version, 16#0146).
+
+%% No cipher suite in common is a handshake_failure (40), 0x0128 (RFC 8446
+%% §4.1.1, RFC 9001 §4.8).
+no_common_cipher_suite_closes_test() ->
+    assert_client_hello_closes(#{cipher_suites => [16#1302]}, no_common_cipher_suite, 16#0128).
+
+assert_client_hello_closes(HelloOpts, Reason, Code) ->
+    {State0, Ctx} = new_conn([~"leaf-cert-der"]),
+    {Datagram, _Framed} = client_hello_datagram(Ctx, HelloOpts),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, Reason}}}], emits(Effects)),
+    ?assertMatch([{connection_close, transport, Code, 0, <<>>}], initial_close_frames(Effects)).
+
 unexpected_handshake_message_closes_test() ->
     %% An out-of-sequence handshake message type closes the connection.
     {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
@@ -356,7 +394,7 @@ assert_handshake_crypto_closes(Wrap, CloseLevel) ->
     Datagram = ?TC:seal(
         handshake,
         0,
-        roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+        roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientHsSecret),
         [{crypto, 0, Wrap(ClientFinished)}],
         ?DCID,
         ?SCID
@@ -368,7 +406,11 @@ assert_handshake_crypto_closes(Wrap, CloseLevel) ->
     Frames = ?TC:frames(
         sends(Effects),
         CloseLevel,
-        #{CloseLevel => roadrunner_quic_keys:traffic_keys(maps:get(CloseLevel, Secrets))},
+        #{
+            CloseLevel => roadrunner_quic_keys:traffic_keys(
+                aes_128_gcm, maps:get(CloseLevel, Secrets)
+            )
+        },
         byte_size(?DCID)
     ),
     ?assert(lists:member({connection_close, transport, 16#010a, 0, <<>>}, Frames)).
@@ -455,7 +497,12 @@ handshake_level_frame_placement_test_() ->
 assert_handshake_frame_closes(Frame) ->
     #{state1 := State1, client_hs_secret := ClientHsSecret} = connect(),
     Datagram = ?TC:seal(
-        handshake, 1, roadrunner_quic_keys:traffic_keys(ClientHsSecret), [Frame], ?DCID, ?SCID
+        handshake,
+        1,
+        roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientHsSecret),
+        [Frame],
+        ?DCID,
+        ?SCID
     ),
     {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State1)),
     ?assertEqual(closed, ?M:phase(State2)),
@@ -779,7 +826,7 @@ owner_set_in_handshaking_gets_connected_on_completion_test() ->
     Datagram = ?TC:seal(
         handshake,
         0,
-        roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+        roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientHsSecret),
         [{crypto, 0, ClientFinished}],
         ?DCID,
         ?SCID
@@ -813,7 +860,7 @@ connected_not_re_emitted_on_later_datagram_test() ->
     Finished = ?TC:seal(
         handshake,
         0,
-        roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+        roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientHsSecret),
         [{crypto, 0, ClientFinished}],
         ?DCID,
         ?SCID
@@ -822,7 +869,12 @@ connected_not_re_emitted_on_later_datagram_test() ->
     ?assertEqual([{emit, Owner, {connected, expected_info()}}], emits(FirstEffects)),
     %% A processed 1-RTT packet once connected: still exactly zero re-emits.
     AppPing = ?TC:seal(
-        application, 0, roadrunner_quic_keys:traffic_keys(ClientApSecret), [ping], ?DCID, ?SCID
+        application,
+        0,
+        roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientApSecret),
+        [ping],
+        ?DCID,
+        ?SCID
     ),
     {_State3, LaterEffects} = ?M:handle_datagram(?NOW, AppPing, State2),
     ?assertEqual([], emits(LaterEffects)).
@@ -1056,7 +1108,7 @@ connected_precedes_stream_events_in_coalesced_datagram_test() ->
     Finished = ?TC:seal(
         handshake,
         0,
-        roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+        roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientHsSecret),
         [{crypto, 0, ClientFinished}],
         ?DCID,
         ?SCID
@@ -1100,7 +1152,9 @@ open_uni_allocates_server_uni_ids_test() ->
 %% the open is refused and a STREAMS_BLOCKED carrying the limit goes out
 %% (§19.14).
 open_uni_refused_past_peer_limit_test() ->
-    {State, _ClientApSecret, ServerApSecret} = connect_owned(#{}, #{initial_max_streams_uni => 1}),
+    {State, _ClientApSecret, ServerApSecret} = connect_owned(
+        #{}, #{transport_params => #{initial_max_streams_uni => 1}}
+    ),
     {State1, _} = ?M:handle_call(self(), make_ref(), open_uni, ?NOW, State),
     Ref = make_ref(),
     {_State2, Effects} = ?M:handle_call(self(), Ref, open_uni, ?NOW, State1),
@@ -1114,7 +1168,7 @@ open_uni_refused_past_peer_limit_test() ->
 %% 0, RFC 9000 §18.2), so even the first open is refused.
 open_uni_refused_without_peer_param_test() ->
     {State, _ClientApSecret, _ServerApSecret} = connect_owned(
-        #{}, #{initial_max_streams_uni => 0}
+        #{}, #{transport_params => #{initial_max_streams_uni => 0}}
     ),
     Ref = make_ref(),
     {_State1, Effects} = ?M:handle_call(self(), Ref, open_uni, ?NOW, State),
@@ -1125,7 +1179,7 @@ open_uni_refused_without_peer_param_test() ->
 %% raised limit still holds.
 max_streams_uni_raises_server_limit_test() ->
     {State, ClientApSecret, _ServerApSecret} = connect_owned(
-        #{}, #{initial_max_streams_uni => 0}
+        #{}, #{transport_params => #{initial_max_streams_uni => 0}}
     ),
     Frames = [{max_streams, uni, 2}, {max_streams, uni, 1}],
     {State1, _} = ?M:handle_datagram(?NOW, app_datagram(Frames, 0, ClientApSecret), State),
@@ -1143,7 +1197,7 @@ max_streams_uni_raises_server_limit_test() ->
 %% bidirectional streams (RFC 9114 §6.1), and it does not touch the uni limit.
 max_streams_bidi_ignored_test() ->
     {State, ClientApSecret, _ServerApSecret} = connect_owned(
-        #{}, #{initial_max_streams_uni => 0}
+        #{}, #{transport_params => #{initial_max_streams_uni => 0}}
     ),
     Datagram = app_datagram([{max_streams, bidi, 10}], 0, ClientApSecret),
     {State1, _} = ?M:handle_datagram(?NOW, Datagram, State),
@@ -1780,7 +1834,7 @@ peer_handshake_level_close_test() ->
     Close = ?TC:seal(
         handshake,
         0,
-        roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+        roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientHsSecret),
         [{connection_close, transport, 2, 0, <<>>}],
         ?DCID,
         ?SCID
@@ -1799,7 +1853,7 @@ local_error_transmits_connection_close_test() ->
     Frames = ?TC:frames(
         sends(Effects),
         application,
-        #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+        #{application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)},
         byte_size(?DCID)
     ),
     ?assertEqual(
@@ -1840,7 +1894,12 @@ coalesced_initial_error_then_handshake_does_not_crash_test() ->
         initial, 0, roadrunner_quic_keys:initial_client(?DCID), CloseFrame, ?DCID, ?SCID
     ),
     HandshakePing = ?TC:seal(
-        handshake, 1, roadrunner_quic_keys:traffic_keys(ClientHsSecret), [ping], ?DCID, ?SCID
+        handshake,
+        1,
+        roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientHsSecret),
+        [ping],
+        ?DCID,
+        ?SCID
     ),
     {State2, Effects} = ?M:handle_datagram(
         ?NOW, <<BadInitial/binary, HandshakePing/binary>>, with_owner(State1)
@@ -2036,6 +2095,40 @@ second_update_after_ack_commits_test() ->
         app_packets(Effects, generation_keys(ServerApSecret, 2))
     ).
 
+%% A key update never changes the cipher suite (RFC 9001 §6.1): on a
+%% ChaCha20-Poly1305 connection every generation is a ChaCha20-Poly1305 key
+%% with the ChaCha20 header-protection key of the first. The server commits
+%% the peer's first update and answers in key phase 1 with its own next
+%% ChaCha20 generation, then, after that ACK, commits a second update and
+%% answers in key phase 0 with the generation after; the AES-128-GCM keys of
+%% the same secrets open nothing.
+chacha20_peer_key_update_test() ->
+    {State, ClientApSecret, ServerApSecret} =
+        connect_owned(#{}, #{cipher_suites => [16#1303]}),
+    Update = phase_datagram(
+        [ping], 0, generation_keys(chacha20_poly1305, ClientApSecret, 1), 1
+    ),
+    {State1, _} = ?M:handle_datagram(?NOW, Update, State),
+    ?assertEqual(connected, ?M:phase(State1)),
+    {State2, Effects2} = ?M:handle_timeout(?NOW + 20, ack, State1),
+    ?assertMatch(
+        [{ok, #{key_phase := 1, frames := [{ack, 0, _, 0, [], undefined} | _]}}],
+        app_packets(Effects2, generation_keys(chacha20_poly1305, ServerApSecret, 1))
+    ),
+    ?assertEqual(
+        [{auth_failed, application}], app_packets(Effects2, generation_keys(ServerApSecret, 1))
+    ),
+    Again = phase_datagram(
+        [ping], 1, generation_keys(chacha20_poly1305, ClientApSecret, 2), 0
+    ),
+    {State3, _} = ?M:handle_datagram(?NOW + 30, Again, State2),
+    ?assertEqual(connected, ?M:phase(State3)),
+    {_State4, Effects4} = ?M:handle_timeout(?NOW + 50, ack, State3),
+    ?assertMatch(
+        [{ok, #{key_phase := 0, frames := [{ack, 1, _, 1, [], undefined} | _]}}],
+        app_packets(Effects4, generation_keys(chacha20_poly1305, ServerApSecret, 2))
+    ).
+
 %% RFC 9001 §6.1: a key update before the handshake is confirmed (at the
 %% server, before it completes) is a KEY_UPDATE_ERROR.
 key_update_before_handshake_completes_closes_test() ->
@@ -2058,6 +2151,14 @@ aead_integrity_limit_closes_test() ->
     {_Over1, Effects} = ?M:handle_datagram(?NOW, Data, Over),
     ?assertEqual([{emit, self(), {closed, {local, aead_limit_reached}}}], emits(Effects)).
 
+%% The integrity limit is the negotiated AEAD's (RFC 9001 §6.6): 2^36 for
+%% AEAD_CHACHA20_POLY1305.
+chacha20_aead_integrity_limit_closes_test() ->
+    {State, _ClientApSecret, _ServerApSecret} =
+        connect_owned(#{}, #{cipher_suites => [16#1303]}),
+    ?assertEqual(connected, ?M:phase(?M:auth_failed(application, 1 bsl 36, State))),
+    ?assertEqual(draining, ?M:phase(?M:auth_failed(application, (1 bsl 36) + 1, State))).
+
 %% =============================================================================
 %% Handshake driver (plays the QUIC client with the shared test client)
 %% =============================================================================
@@ -2070,13 +2171,16 @@ connect() ->
 connect(Extra) ->
     connect(Extra, #{}).
 
-%% `ClientParams` override the client's advertised transport parameters.
-connect(Extra, ClientParams) ->
+%% `HelloOpts` adds ClientHello options (`?TC:client_hello_framed/1`, such as
+%% `transport_params` overriding the client's advertised transport
+%% parameters); the packet keys follow the cipher suite the ServerHello
+%% selected.
+connect(Extra, HelloOpts) ->
     {State0, Ctx} = new_conn([~"leaf-cert-der"], Extra),
     #{client_priv := ClientPriv, server_pub := ServerPub} = Ctx,
 
     %% Client Initial carrying the ClientHello.
-    {InitialDatagram, ClientHelloFramed} = client_hello_datagram(Ctx, ClientParams),
+    {InitialDatagram, ClientHelloFramed} = client_hello_datagram(Ctx, HelloOpts),
     {State1, Effects1} = ?M:handle_datagram(?NOW, InitialDatagram, State0),
     Server1 = sends(Effects1),
 
@@ -2084,6 +2188,8 @@ connect(Extra, ClientParams) ->
     ServerHello = ?TC:crypto_bytes(
         Server1, initial, #{initial => roadrunner_quic_keys:initial_server(?DCID)}, byte_size(?DCID)
     ),
+    [{2, ServerHelloBody}] = ?TC:deframe_all(ServerHello),
+    Aead = aead(maps:get(cipher, ?TC:parse_server_hello(ServerHelloBody))),
     Shared = crypto:compute_key(ecdh, ServerPub, ClientPriv, x25519),
     HandshakeSecret = roadrunner_quic_tls_crypto:handshake_secret(
         roadrunner_quic_tls_crypto:early_secret(), Shared
@@ -2100,7 +2206,7 @@ connect(Extra, ClientParams) ->
     Flight = ?TC:crypto_bytes(
         Server1,
         handshake,
-        #{handshake => roadrunner_quic_keys:traffic_keys(ServerHsSecret)},
+        #{handshake => roadrunner_quic_keys:traffic_keys(Aead, ServerHsSecret)},
         byte_size(?DCID)
     ),
     FinishedHash = roadrunner_quic_tls_crypto:transcript_hash([
@@ -2117,7 +2223,7 @@ connect(Extra, ClientParams) ->
     HandshakeDatagram = ?TC:seal(
         handshake,
         0,
-        roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+        roadrunner_quic_keys:traffic_keys(Aead, ClientHsSecret),
         [{crypto, 0, ClientFinishedFramed}],
         ?DCID,
         ?SCID
@@ -2147,8 +2253,13 @@ connect(Extra, ClientParams) ->
         server_hs_secret => ServerHsSecret,
         server_ap_secret => ServerApSecret,
         client_ap_secret => ClientApSecret,
+        aead => Aead,
         ctx => Ctx
     }.
+
+%% The packet-protection AEAD of a cipher suite (RFC 9001 §5.3).
+aead(16#1301) -> aes_128_gcm;
+aead(16#1303) -> chacha20_poly1305.
 
 %% A fresh server connection plus the client material the driver reuses.
 new_conn(CertChain) ->
@@ -2188,8 +2299,10 @@ new_conn(CertChain, Extra) ->
 client_hello_datagram(Ctx) ->
     client_hello_datagram(Ctx, #{}).
 
-client_hello_datagram(#{scheme := Scheme, client_pub := ClientPub}, ClientParams) ->
-    Framed = ?TC:client_hello_framed(Scheme, ClientPub, ?CLIENT_SCID, ClientParams),
+client_hello_datagram(#{scheme := Scheme, client_pub := ClientPub}, HelloOpts) ->
+    Framed = ?TC:client_hello_framed(HelloOpts#{
+        scheme => Scheme, key_share => ClientPub, client_scid => ?CLIENT_SCID
+    }),
     Datagram = ?TC:seal(
         initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
     ),
@@ -2232,19 +2345,21 @@ connect_owned() ->
 connect_owned(Extra) ->
     connect_owned(Extra, #{}).
 
-connect_owned(Extra, ClientParams) ->
+%% `HelloOpts` as for connect/2.
+connect_owned(Extra, HelloOpts) ->
     #{
         state1 := State1,
         client_hs_secret := ClientHsSecret,
         cf_framed := ClientFinished,
         client_ap_secret := ClientApSecret,
-        server_ap_secret := ServerApSecret
-    } = connect(Extra, ClientParams),
+        server_ap_secret := ServerApSecret,
+        aead := Aead
+    } = connect(Extra, HelloOpts),
     {State1b, _} = ?M:handle_call(self(), make_ref(), {set_owner, self()}, 0, State1),
     Finished = ?TC:seal(
         handshake,
         0,
-        roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+        roadrunner_quic_keys:traffic_keys(Aead, ClientHsSecret),
         [{crypto, 0, ClientFinished}],
         ?DCID,
         ?SCID
@@ -2266,7 +2381,12 @@ connected_for_send() ->
 %% Seal a peer 1-RTT (application) datagram carrying the given frames.
 app_datagram(Frames, PN, ClientApSecret) ->
     ?TC:seal(
-        application, PN, roadrunner_quic_keys:traffic_keys(ClientApSecret), Frames, ?DCID, ?SCID
+        application,
+        PN,
+        roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientApSecret),
+        Frames,
+        ?DCID,
+        ?SCID
     ).
 
 %% Seal a peer 1-RTT datagram with the given keys and Key Phase bit.
@@ -2277,15 +2397,19 @@ phase_datagram(Frames, PN, Keys, KeyPhase) ->
 
 %% A side's 1-RTT keys after `N` key updates (RFC 9001 §6.1): the AEAD key
 %% and IV of the Nth "quic ku" generation, with the header-protection key of
-%% the first, which never changes.
+%% the first, which never changes. Every generation is for the same AEAD
+%% (AES-128-GCM unless given).
 generation_keys(Secret, N) ->
-    maps:merge(roadrunner_quic_keys:traffic_keys(Secret), packet_keys(Secret, N)).
+    generation_keys(aes_128_gcm, Secret, N).
 
-packet_keys(Secret, 0) ->
-    maps:with([key, iv], roadrunner_quic_keys:traffic_keys(Secret));
-packet_keys(Secret, N) ->
-    {Updated, _PacketKeys} = roadrunner_quic_keys:update(Secret),
-    packet_keys(Updated, N - 1).
+generation_keys(Aead, Secret, N) ->
+    maps:merge(roadrunner_quic_keys:traffic_keys(Aead, Secret), packet_keys(Aead, Secret, N)).
+
+packet_keys(Aead, Secret, 0) ->
+    maps:with([key, iv], roadrunner_quic_keys:traffic_keys(Aead, Secret));
+packet_keys(Aead, Secret, N) ->
+    {Updated, _PacketKeys} = roadrunner_quic_keys:update(Aead, Secret),
+    packet_keys(Aead, Updated, N - 1).
 
 %% Drive a peer key update on a connected state: a PING numbered 0 in key
 %% phase 0, then a PING numbered `PN` in key phase 1 under the next keys.
@@ -2312,7 +2436,7 @@ sent_stream_frames(Effects, ServerApSecret) ->
     Frames = ?TC:frames(
         sends(Effects),
         application,
-        #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+        #{application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)},
         byte_size(?DCID)
     ),
     [Frame || {stream, _Sid, _Off, _Data, _Fin} = Frame <- Frames].
@@ -2323,7 +2447,7 @@ sent_app_frames(Effects, ServerApSecret) ->
     ?TC:frames(
         sends(Effects),
         application,
-        #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+        #{application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)},
         byte_size(?DCID)
     ).
 
@@ -2347,7 +2471,7 @@ replies_for(Effects, Ref) ->
 %% The largest 1-RTT packet number among the server's sent datagrams, decoded
 %% with the server's application keys; used to acknowledge what is in flight.
 largest_app_pn(Effects, ServerApSecret) ->
-    Keys = #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+    Keys = #{application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)},
     PNs = [
         PN
      || Datagram <- sends(Effects),

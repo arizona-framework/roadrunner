@@ -114,9 +114,8 @@ need.
 A conformant browser / quiche / ngtcp2 never trips these; they tighten the
 advisory or malformed cases the server currently tolerates or omits.
 
-- Intersect the client's offered cipher / TLS version (`supported_versions`) /
-  group (`supported_groups`) against the hardcoded `TLS_AES_128_GCM_SHA256` /
-  TLS 1.3 / x25519, aborting on no overlap (RFC 8446 §4.1.1) — medium
+- Intersect the client's offered group (`supported_groups`) against the
+  hardcoded x25519, aborting on no overlap (RFC 8446 §4.1.1) — medium
 - Honor the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` when sizing response
   headers (RFC 9114 §4.2.2) — small-medium
 

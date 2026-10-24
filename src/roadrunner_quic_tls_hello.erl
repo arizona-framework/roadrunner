@@ -3,8 +3,9 @@
 
 %% TLS 1.3 hello exchange (RFC 8446 §4.1.2/§4.1.3/§4.3.1) for a server-only
 %% QUIC v1 endpoint: parse the client's ClientHello, and build the server's
-%% ServerHello and EncryptedExtensions. v1 negotiates x25519
-%% (NamedGroup 0x001d) and TLS_AES_128_GCM_SHA256 (0x1301) only.
+%% ServerHello and EncryptedExtensions. The ServerHello carries the cipher
+%% suite the caller selected; v1 negotiates the x25519 group (NamedGroup
+%% 0x001d) only.
 %%
 %% This module owns the message bodies; `roadrunner_quic_tls_handshake`
 %% frames them (1-byte type + 24-bit length), and
@@ -42,8 +43,6 @@
 -define(LEGACY_VERSION, 16#0303).
 -define(TLS_1_3, 16#0304).
 -define(GROUP_X25519, 16#001D).
-%% v1 cipher suite (the only suite the server offers).
--define(CIPHER_AES_128_GCM_SHA256, 16#1301).
 %% SNI name_type 0 = host_name (RFC 6066 §3).
 -define(SNI_HOST_NAME, 16#00).
 
@@ -51,6 +50,7 @@
     random := binary(),
     session_id := binary(),
     cipher_suites := [non_neg_integer()],
+    supported_versions := [non_neg_integer()],
     alpn_protocols := [binary()],
     signature_algorithms := [non_neg_integer()],
     key_share => binary(),
@@ -66,11 +66,12 @@
 Parse a ClientHello body (RFC 8446 §4.1.2), as handed up by
 `roadrunner_quic_tls_handshake:decode/1`. Returns the fields a server
 needs as a map: the random and legacy session id (echoed in the
-ServerHello), the offered cipher suites, the client's x25519 key share,
-the offered ALPN protocols and signature schemes, and (when present) the
-SNI host name and decoded QUIC transport parameters. Absent extensions
-are simply left out of the map. Returns `{error, Reason}` on a malformed
-buffer.
+ServerHello), the offered cipher suites and TLS versions
+(supported_versions, RFC 8446 §4.2.1), the client's x25519 key share, the
+offered ALPN protocols and signature schemes, and (when present) the SNI
+host name and decoded QUIC transport parameters. Absent list extensions
+read as empty lists; the other absent extensions are simply left out of
+the map. Returns `{error, Reason}` on a malformed buffer.
 """.
 -spec parse_client_hello(binary()) -> {ok, client_hello()} | {error, atom()}.
 parse_client_hello(<<?LEGACY_VERSION:16, Random:32/binary, AfterRandom/binary>>) ->
@@ -92,15 +93,20 @@ parse_client_hello(_) ->
 -doc """
 Build a ServerHello (RFC 8446 §4.1.3), framed, as an iolist. Inputs:
 `random` (32 bytes), `session_id` (the client's legacy session id, echoed
-verbatim), and `key_share` (the server's 32-byte x25519 public key). The
-cipher suite is fixed to TLS_AES_128_GCM_SHA256 and the group to x25519.
-The two server extensions are key_share then supported_versions
-(selecting TLS 1.3).
+verbatim), `cipher_suite` (the selected suite's codepoint), and
+`key_share` (the server's 32-byte x25519 public key). The group is fixed
+to x25519. The two server extensions are key_share then
+supported_versions (selecting TLS 1.3).
 """.
 -spec build_server_hello(#{
-    random := binary(), session_id := binary(), key_share := binary()
+    random := binary(),
+    session_id := binary(),
+    cipher_suite := non_neg_integer(),
+    key_share := binary()
 }) -> iolist().
-build_server_hello(#{random := Random, session_id := SessionId, key_share := PubKey}) ->
+build_server_hello(#{
+    random := Random, session_id := SessionId, cipher_suite := CipherSuite, key_share := PubKey
+}) ->
     Extensions = [
         encode_extension(?EXT_KEY_SHARE, server_key_share(PubKey)),
         encode_extension(?EXT_SUPPORTED_VERSIONS, <<?TLS_1_3:16>>)
@@ -108,7 +114,7 @@ build_server_hello(#{random := Random, session_id := SessionId, key_share := Pub
     Body = [
         <<?LEGACY_VERSION:16, Random:32/binary, (byte_size(SessionId)):8>>,
         SessionId,
-        <<?CIPHER_AES_128_GCM_SHA256:16, 0:8, (iolist_size(Extensions)):16>>,
+        <<CipherSuite:16, 0:8, (iolist_size(Extensions)):16>>,
         Extensions
     ],
     roadrunner_quic_tls_handshake:encode(?SERVER_HELLO, Body).
@@ -148,6 +154,7 @@ finalize_client_hello(Random, SessionId, Ciphers, Extensions) ->
         random => Random,
         session_id => SessionId,
         cipher_suites => Ciphers,
+        supported_versions => extract_supported_versions(Extensions),
         alpn_protocols => extract_alpn(Extensions),
         signature_algorithms => extract_signature_algorithms(Extensions)
     },
@@ -181,6 +188,17 @@ find_x25519_entry(<<_Group:16, KeyLen:16, _Key:KeyLen/binary, Rest/binary>>) ->
     find_x25519_entry(Rest);
 find_x25519_entry(_) ->
     undefined.
+
+%% The offered TLS versions (RFC 8446 §4.2.1: a one-byte-length list of
+%% 16-bit versions), [] if absent or malformed.
+-spec extract_supported_versions(#{non_neg_integer() => binary()}) -> [non_neg_integer()].
+extract_supported_versions(#{?EXT_SUPPORTED_VERSIONS := Data}) ->
+    case take_u8_vector(Data) of
+        {ok, List, _Rest} -> parse_u16_list(List);
+        {error, _} -> []
+    end;
+extract_supported_versions(#{}) ->
+    [].
 
 %% The ALPN protocol list (RFC 7301), [] if absent or malformed.
 -spec extract_alpn(#{non_neg_integer() => binary()}) -> [binary()].

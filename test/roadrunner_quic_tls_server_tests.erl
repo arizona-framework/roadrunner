@@ -14,22 +14,28 @@
 
 %% ClientHello wire constants.
 -define(LEGACY_VERSION, 16#0303).
+-define(TLS_1_2, 16#0303).
+-define(TLS_1_3, 16#0304).
 -define(CIPHER_AES_128_GCM_SHA256, 16#1301).
+-define(CIPHER_AES_256_GCM_SHA384, 16#1302).
+-define(CIPHER_CHACHA20_POLY1305_SHA256, 16#1303).
 -define(GROUP_X25519, 16#001D).
 -define(EXT_SIGNATURE_ALGORITHMS, 16#000D).
 -define(EXT_ALPN, 16#0010).
+-define(EXT_SUPPORTED_VERSIONS, 16#002B).
 -define(EXT_KEY_SHARE, 16#0033).
 -define(EXT_QUIC_TRANSPORT_PARAMS, 16#0039).
 
 -define(CERT_VERIFY_CONTEXT, ~"TLS 1.3, server CertificateVerify").
 
 %% =============================================================================
-%% Full-handshake integration, one per cert key type. Each drives the
-%% sequencer with a fixed server ephemeral + a hand-built ClientHello, then
-%% re-derives every boundary independently from the OUTPUT flight messages
-%% (not from the production state) and checks the flight grouping, the key
-%% installs, the CertificateVerify signature, the server Finished
-%% verify_data, and the client Finished round-trip.
+%% Full-handshake integration, one per cert key type and one per cipher
+%% suite. Each drives the sequencer with a fixed server ephemeral + a
+%% hand-built ClientHello, then re-derives every boundary independently from
+%% the OUTPUT flight messages (not from the production state) and checks the
+%% flight grouping, the selected cipher suite, the key installs, the
+%% CertificateVerify signature, the server Finished verify_data, and the
+%% client Finished round-trip.
 %% =============================================================================
 
 rsa_handshake_test() ->
@@ -41,7 +47,19 @@ ecdsa_handshake_test() ->
 ed25519_handshake_test() ->
     assert_full_handshake(ed25519).
 
+%% A client offering only TLS_CHACHA20_POLY1305_SHA256 gets it, and the
+%% Handshake and 1-RTT keys are ChaCha20-Poly1305 keys (RFC 9001 §5.3).
+chacha20_handshake_test() ->
+    assert_full_handshake(
+        rsa, [?CIPHER_CHACHA20_POLY1305_SHA256], ?CIPHER_CHACHA20_POLY1305_SHA256, chacha20_poly1305
+    ).
+
 assert_full_handshake(KeyType) ->
+    assert_full_handshake(
+        KeyType, [?CIPHER_AES_128_GCM_SHA256], ?CIPHER_AES_128_GCM_SHA256, aes_128_gcm
+    ).
+
+assert_full_handshake(KeyType, OfferedSuites, Suite, Aead) ->
     {Scheme, PrivKey, VerifyKey, {SigAlg, HashAlg, SigOpts}} = key_material(KeyType),
     {ClientPub, ClientPriv} = crypto:generate_key(ecdh, x25519),
     {ServerPub, ServerPriv} = crypto:generate_key(ecdh, x25519),
@@ -58,6 +76,7 @@ assert_full_handshake(KeyType) ->
         sig_algs => [Scheme],
         alpn => ~"h3",
         session_id => <<>>,
+        cipher_suites => OfferedSuites,
         transport_params => #{initial_source_connection_id => ClientSCID}
     }),
     State = ?M:new(#{
@@ -88,6 +107,7 @@ assert_full_handshake(KeyType) ->
     %% carries the configured DER chain. Without these, a wrong-pubkey or
     %% dropped-config flight would still pass the transcript checks.
     ?assertEqual(ServerPub, server_hello_key_share(InitialGroup)),
+    ?assertEqual(Suite, server_hello_cipher_suite(InitialGroup)),
     {AlpnProtocol, TransportParamsExt} = encrypted_extensions(Ee),
     ?assertEqual(~"h3", AlpnProtocol),
     ?assertEqual(
@@ -128,10 +148,10 @@ assert_full_handshake(KeyType) ->
     %% client.
     ?assertEqual(
         [
-            {handshake, server, ServerHsSecret},
-            {handshake, client, ClientHsSecret},
-            {application, server, ServerApSecret},
-            {application, client, ClientApSecret}
+            {handshake, server, Aead, ServerHsSecret},
+            {handshake, client, Aead, ClientHsSecret},
+            {application, server, Aead, ServerApSecret},
+            {application, client, Aead, ClientApSecret}
         ],
         Installs
     ),
@@ -163,6 +183,51 @@ assert_full_handshake(KeyType) ->
     <<First, Rest/binary>> = ClientFinishedBody,
     Tampered = <<(First bxor 1), Rest/binary>>,
     ?assertEqual({error, handshake_failure}, ?M:process_client_finished(Tampered, State1)).
+
+%% =============================================================================
+%% Cipher suite and version negotiation (RFC 8446 §4.1.1, §4.2.1)
+%% =============================================================================
+
+%% Both supported suites on offer, ChaCha20 first: the server's preference
+%% (AES-128-GCM) wins.
+prefers_aes_128_gcm_test() ->
+    ?assertEqual(
+        ?CIPHER_AES_128_GCM_SHA256,
+        negotiated_cipher_suite([?CIPHER_CHACHA20_POLY1305_SHA256, ?CIPHER_AES_128_GCM_SHA256])
+    ).
+
+%% An offered suite the server does not support (TLS_AES_256_GCM_SHA384, and
+%% an unassigned value) is ignored, not rejected (RFC 8446 §4.1.2, RFC 9001
+%% §5.3).
+ignores_unsupported_cipher_suites_test() ->
+    ?assertEqual(
+        ?CIPHER_CHACHA20_POLY1305_SHA256,
+        negotiated_cipher_suite([
+            16#7A7A, ?CIPHER_AES_256_GCM_SHA384, ?CIPHER_CHACHA20_POLY1305_SHA256
+        ])
+    ).
+
+no_common_cipher_suite_rejected_test() ->
+    ?assertEqual(
+        {error, no_common_cipher_suite},
+        process_offering(#{cipher_suites => [?CIPHER_AES_256_GCM_SHA384]})
+    ).
+
+%% supported_versions offering only TLS 1.2, or absent altogether (a TLS 1.2
+%% ClientHello): no TLS 1.3 to negotiate (RFC 8446 §4.2.1, Appendix D.2).
+tls_1_2_only_rejected_test() ->
+    ?assertEqual({error, protocol_version}, process_offering(#{versions => [?TLS_1_2]})).
+
+missing_supported_versions_rejected_test() ->
+    ?assertEqual({error, protocol_version}, process_offering(#{versions => none})).
+
+%% The version check runs first: a ClientHello with no TLS 1.3 and no common
+%% suite reports the version.
+version_checked_before_cipher_suite_test() ->
+    ?assertEqual(
+        {error, protocol_version},
+        process_offering(#{versions => [?TLS_1_2], cipher_suites => [?CIPHER_AES_256_GCM_SHA384]})
+    ).
 
 %% =============================================================================
 %% Error paths
@@ -295,22 +360,31 @@ key_material(ed25519) ->
     {16#0807, PrivKey, [Pub, ed25519], {eddsa, none, []}}.
 
 %% Build a ClientHello body (RFC 8446 §4.1.2) carrying the requested
-%% extensions; the x25519 key_share is omitted when no key is given.
+%% extensions; the x25519 key_share is omitted when no key is given. It
+%% offers TLS 1.3 and TLS_AES_128_GCM_SHA256 unless `versions` (`none` omits
+%% the supported_versions extension) or `cipher_suites` say otherwise.
 client_hello_body(Opts) ->
     Random = maps:get(random, Opts, crypto:strong_rand_bytes(32)),
     SessionId = maps:get(session_id, Opts, <<>>),
     SigAlgs = maps:get(sig_algs, Opts, [16#0804]),
     Alpn = maps:get(alpn, Opts, ~"h3"),
     Extensions = iolist_to_binary([
+        supported_versions_ext(maps:get(versions, Opts, [?TLS_1_3])),
         signature_algorithms_ext(SigAlgs),
         alpn_ext(Alpn),
         key_share_ext(maps:get(key_share, Opts, undefined)),
         transport_params_ext(maps:get(transport_params, Opts, undefined))
     ]),
-    CipherSuites = <<?CIPHER_AES_128_GCM_SHA256:16>>,
+    CipherSuites = <<<<C:16>> || C <- maps:get(cipher_suites, Opts, [?CIPHER_AES_128_GCM_SHA256])>>,
     <<?LEGACY_VERSION:16, Random/binary, (byte_size(SessionId)):8, SessionId/binary,
         (byte_size(CipherSuites)):16, CipherSuites/binary, 1:8, 0:8, (byte_size(Extensions)):16,
         Extensions/binary>>.
+
+supported_versions_ext(none) ->
+    <<>>;
+supported_versions_ext(Versions) ->
+    List = <<<<V:16>> || V <- Versions>>,
+    extension(?EXT_SUPPORTED_VERSIONS, <<(byte_size(List)):8, List/binary>>).
 
 signature_algorithms_ext(Schemes) ->
     List = <<<<S:16>> || S <- Schemes>>,
@@ -348,6 +422,13 @@ server_hello_key_share(ServerHello) ->
     <<?GROUP_X25519:16, KeyLen:16, PubKey:KeyLen/binary>> =
         extract_extension(?EXT_KEY_SHARE, Extensions),
     PubKey.
+
+%% The cipher suite a ServerHello selected.
+server_hello_cipher_suite(ServerHello) ->
+    {?SERVER_HELLO, Body, <<>>} = deframe(ServerHello),
+    <<_LegacyVersion:16, _Random:32/binary, SessionLen:8, _Session:SessionLen/binary, Cipher:16,
+        _/binary>> = Body,
+    Cipher.
 
 %% The selected ALPN protocol and the raw transport-params extension body
 %% from an EncryptedExtensions message.
@@ -388,6 +469,24 @@ deframe_all_bin(<<>>) ->
 deframe_all_bin(Bin) ->
     {ok, {Type, Body}, Rest} = roadrunner_quic_tls_handshake:decode(Bin),
     [{Type, Body} | deframe_all_bin(Rest)].
+
+%% Process an otherwise valid ClientHello (x25519 share, the RSA scheme, h3,
+%% a matching initial_source_connection_id) carrying `Opts` against
+%% rsa_state().
+process_offering(Opts) ->
+    {ClientPub, _} = crypto:generate_key(ecdh, x25519),
+    Body = client_hello_body(Opts#{
+        key_share => ClientPub,
+        sig_algs => [16#0804],
+        transport_params => #{initial_source_connection_id => <<1, 2, 3, 4>>}
+    }),
+    ?M:process_client_hello(Body, rsa_state()).
+
+%% The cipher suite the server selects from `Offered`.
+negotiated_cipher_suite(Offered) ->
+    {ok, #{initial := ServerHello}, _Installs, _PeerParams, _State} =
+        process_offering(#{cipher_suites => Offered}),
+    server_hello_cipher_suite(ServerHello).
 
 process_with_params(TransportParams) ->
     {ClientPub, _} = crypto:generate_key(ecdh, x25519),

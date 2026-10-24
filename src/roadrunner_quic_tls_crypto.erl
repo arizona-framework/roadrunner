@@ -7,8 +7,10 @@
 %% Secret (no pre-shared key in v1), the Handshake Secret (from the
 %% (EC)DHE shared secret), and the Master Secret. `derive_secret/3` is the
 %% TLS 1.3 Derive-Secret over `roadrunner_quic_hkdf`, and
-%% `transcript_hash/1` hashes the running handshake transcript. v1
-%% negotiates `TLS_AES_128_GCM_SHA256`, so the hash is SHA-256 throughout.
+%% `transcript_hash/1` hashes the running handshake transcript. Both cipher
+%% suites v1 negotiates (`TLS_AES_128_GCM_SHA256` and
+%% `TLS_CHACHA20_POLY1305_SHA256`) hash with SHA-256, so the hash is SHA-256
+%% throughout.
 %%
 %% Derive-Secret takes the already-computed transcript hash rather than
 %% the raw messages, so the caller is explicit about what is hashed (use

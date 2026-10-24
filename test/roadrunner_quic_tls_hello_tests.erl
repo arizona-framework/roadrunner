@@ -19,6 +19,7 @@ rfc8448_client_hello_parse_test() ->
     ),
     ?assertEqual(<<>>, maps:get(session_id, Parsed)),
     ?assertEqual([16#1301, 16#1303, 16#1302], maps:get(cipher_suites, Parsed)),
+    ?assertEqual([16#0304], maps:get(supported_versions, Parsed)),
     ?assertEqual(
         hex("99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c"),
         maps:get(key_share, Parsed)
@@ -53,6 +54,7 @@ rfc8448_server_hello_build_test() ->
         ?M:build_server_hello(#{
             random => hex("a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e26928"),
             session_id => <<>>,
+            cipher_suite => 16#1301,
             key_share => hex("c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f")
         })
     ),
@@ -138,10 +140,19 @@ parse_rejects_bad_transport_params_test() ->
         ?M:parse_client_hello(ch_body(<<>>, [16#1301], Exts))
     ).
 
+parse_supported_versions_test() ->
+    %% A one-byte-length list of 16-bit versions (RFC 8446 §4.2.1), kept in
+    %% the client's order, unknown values included.
+    Exts = [ext(16#002B, <<6:8, 16#7A7A:16, 16#0304:16, 16#0303:16>>)],
+    {ok, Parsed} = ?M:parse_client_hello(ch_body(<<>>, [16#1301], Exts)),
+    ?assertEqual([16#7A7A, 16#0304, 16#0303], maps:get(supported_versions, Parsed)).
+
 parse_empty_extensions_test() ->
     {ok, Parsed} = ?M:parse_client_hello(ch_body(<<1, 2, 3>>, [16#1301, 16#1302], [])),
     ?assertEqual(<<1, 2, 3>>, maps:get(session_id, Parsed)),
     ?assertEqual([16#1301, 16#1302], maps:get(cipher_suites, Parsed)),
+    %% No supported_versions: a TLS 1.2-style ClientHello offers no TLS 1.3.
+    ?assertEqual([], maps:get(supported_versions, Parsed)),
     ?assertNot(maps:is_key(key_share, Parsed)),
     ?assertNot(maps:is_key(server_name, Parsed)).
 
@@ -154,10 +165,12 @@ parse_lenient_on_malformed_extension_data_test() ->
         ext(16#0033, <<16#FF:16, 1, 2>>),
         ext(16#0010, <<16#FF:16>>),
         ext(16#000D, <<16#FF:16>>),
-        ext(16#0000, <<16#FF:16>>)
+        ext(16#0000, <<16#FF:16>>),
+        ext(16#002B, <<16#FF:8>>)
     ],
     {ok, Parsed} = ?M:parse_client_hello(ch_body(<<>>, [16#1301], Exts)),
     ?assertNot(maps:is_key(key_share, Parsed)),
+    ?assertEqual([], maps:get(supported_versions, Parsed)),
     ?assertEqual([], maps:get(alpn_protocols, Parsed)),
     ?assertEqual([], maps:get(signature_algorithms, Parsed)),
     ?assertNot(maps:is_key(server_name, Parsed)).

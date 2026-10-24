@@ -24,19 +24,24 @@
 %% client Finished it must check) from the transcript through the server
 %% Finished.
 %%
-%% Negotiation that the codec layer leaves out is done here: the x25519
-%% shared secret (ECDHE over the client's key_share), the CertificateVerify
-%% signature scheme (the cert key's scheme intersected with the client's
-%% offer), and the ALPN protocol (the client must offer the configured one,
-%% RFC 7301 §3.2). The mandatory quic_transport_parameters extension
-%% (RFC 9001 §8.2) and the client's initial_source_connection_id binding
-%% (RFC 9000 §7.3, against the Initial Source Connection ID passed in as
-%% `peer_scid`) are also enforced here. Attacker-controlled inputs fail with a
-%% flat `{error, atom()}` (a malformed ClientHello, a missing x25519 key_share,
-%% no common signature scheme, no offered ALPN match, a missing transport-
-%% parameters extension, a connection-id mismatch, a client Finished mismatch);
-%% a cert/key whose type is unsupported is server config and legitimately
-%% crashes.
+%% Negotiation that the codec layer leaves out is done here: the TLS version
+%% (the client must offer TLS 1.3 in supported_versions, RFC 8446 §4.2.1), the
+%% cipher suite (TLS_AES_128_GCM_SHA256 or TLS_CHACHA20_POLY1305_SHA256, picked
+%% from the client's offer, RFC 8446 §4.1.1), the x25519 shared secret (ECDHE
+%% over the client's key_share), the CertificateVerify signature scheme (the
+%% cert key's scheme intersected with the client's offer), and the ALPN
+%% protocol (the client must offer the configured one, RFC 7301 §3.2). The
+%% mandatory quic_transport_parameters extension (RFC 9001 §8.2) and the
+%% client's initial_source_connection_id binding (RFC 9000 §7.3, against the
+%% Initial Source Connection ID passed in as `peer_scid`) are also enforced
+%% here. Both cipher suites hash with SHA-256, so the key schedule is the same
+%% for either; the suite picks the AEAD of the Handshake and 1-RTT packet keys
+%% (RFC 9001 §5.3). Attacker-controlled inputs fail with a flat `{error,
+%% atom()}` (a malformed ClientHello, no TLS 1.3 on offer, no common cipher
+%% suite, a missing x25519 key_share, no common signature scheme, no offered
+%% ALPN match, a missing transport-parameters extension, a connection-id
+%% mismatch, a client Finished mismatch); a cert/key whose type is unsupported
+%% is server config and legitimately crashes.
 %%
 %% The server's x25519 ephemeral key pair and ServerHello random are
 %% inputs (the connection loop generates them per connection), which keeps
@@ -51,6 +56,13 @@
 %% ClientHello handshake type (RFC 8446 §4), for re-framing the body into
 %% the transcript; the server messages are framed by their builders.
 -define(CLIENT_HELLO, 1).
+
+%% The one TLS version the server speaks (RFC 8446 §4.2.1, RFC 9001 §4.2).
+-define(TLS_1_3, 16#0304).
+
+%% Cipher suites (RFC 8446 Appendix B.4) supported in v1.
+-define(TLS_AES_128_GCM_SHA256, 16#1301).
+-define(TLS_CHACHA20_POLY1305_SHA256, 16#1303).
 
 %% Signature schemes (RFC 8446 §4.2.3) supported in v1, one per key type.
 -define(SIG_RSA_PSS_RSAE_SHA256, 16#0804).
@@ -89,8 +101,11 @@
 
 -type flight() :: #{initial := iolist(), handshake := iolist()}.
 
-%% A traffic secret for one level and direction (RFC 8446 §7.1).
--type install() :: {handshake | application, server | client, Secret :: binary()}.
+%% A traffic secret for one level and direction (RFC 8446 §7.1), with the
+%% AEAD of the negotiated cipher suite that the packet keys derived from it
+%% use (RFC 9001 §5.3).
+-type install() ::
+    {handshake | application, server | client, roadrunner_quic_aead:cipher(), Secret :: binary()}.
 
 -doc """
 Build the handshake state from the per-connection config: the server's DER
@@ -134,15 +149,18 @@ handshake messages by QUIC encryption level (`initial` carries the
 ServerHello; `handshake` carries EncryptedExtensions, Certificate,
 CertificateVerify, and the server Finished) and `Installs` is the ordered
 list of traffic secrets the loop derives its packet-protection keys from
-(RFC 9001 §5.1): the handshake secrets (so it can read the client's
-encrypted Finished) before the application secrets. The loop keeps the
-application secrets to derive later key generations from (§6.1).
+(RFC 9001 §5.1), each with the negotiated suite's AEAD (§5.3): the
+handshake secrets (so it can read the client's encrypted Finished) before
+the application secrets. The loop keeps the application secrets to derive
+later key generations from, for the same AEAD (§6.1).
 The returned `State` carries what `process_client_finished/2` needs.
 
-Fails with `{error, Reason}` on a malformed ClientHello, a missing x25519
-key_share (`missing_key_share`), no signature scheme shared between the
-cert key and the client's offer (`no_common_sig_alg`), a client that did
-not offer the configured ALPN protocol (`no_application_protocol`), a
+Fails with `{error, Reason}` on a malformed ClientHello, a
+supported_versions that does not offer TLS 1.3 (`protocol_version`), no
+cipher suite shared with the client's offer (`no_common_cipher_suite`), a
+missing x25519 key_share (`missing_key_share`), no signature scheme shared
+between the cert key and the client's offer (`no_common_sig_alg`), a client
+that did not offer the configured ALPN protocol (`no_application_protocol`), a
 ClientHello without the quic_transport_parameters extension
 (`missing_transport_params`, RFC 9001 §8.2), or a client
 `initial_source_connection_id` that does not equal (or is absent for) the
@@ -158,17 +176,21 @@ process_client_hello(
         {ok,
             #{
                 session_id := SessionId,
+                supported_versions := Versions,
+                cipher_suites := CipherSuites,
                 signature_algorithms := SigAlgs,
                 alpn_protocols := ClientAlpns
             } = ClientHello} ?=
             roadrunner_quic_tls_hello:parse_client_hello(ClientHelloBody),
+        ok ?= check_version(Versions),
+        {ok, CipherSuite} ?= select_cipher_suite(CipherSuites),
         {ok, ClientKeyShare} ?= client_key_share(ClientHello),
         {ok, Scheme} ?= negotiate_scheme(PrivKey, SigAlgs),
         ok ?= check_alpn(Alpn, ClientAlpns),
         ok ?= check_transport_params(ClientHello),
         ok ?= check_initial_scid(ClientHello, PeerSCID),
         {ok, Flight, Installs, State1} =
-            build_flight(ClientHelloBody, SessionId, ClientKeyShare, Scheme, State),
+            build_flight(ClientHelloBody, SessionId, CipherSuite, ClientKeyShare, Scheme, State),
         %% Surface the client's advertised transport params (presence already
         %% checked) so the loop can seed its send windows from them.
         {ok, Flight, Installs, maps:get(transport_params, ClientHello), State1}
@@ -196,6 +218,37 @@ process_client_finished(ClientFinishedBody, #server{
 %% =============================================================================
 %% Internal
 %% =============================================================================
+
+%% RFC 8446 §4.2.1: the server negotiates TLS 1.3 only (as QUIC requires, RFC
+%% 9001 §4.2), so the client's supported_versions must list 0x0304. Without it
+%% there is no version both ends speak: a ClientHello offering only older
+%% versions, or carrying no supported_versions at all (a TLS 1.2 ClientHello,
+%% RFC 8446 Appendix D.2, which the codec reads as an empty list), is a
+%% protocol_version alert.
+-spec check_version([non_neg_integer()]) -> ok | {error, protocol_version}.
+check_version(Versions) ->
+    case lists:member(?TLS_1_3, Versions) of
+        true -> ok;
+        false -> {error, protocol_version}
+    end.
+
+%% The cipher suite and its packet-protection AEAD (RFC 9001 §5.3), in server
+%% preference order: TLS_AES_128_GCM_SHA256 (mandatory to implement, RFC 8446
+%% §9.1, and the Initial packets' AEAD) before TLS_CHACHA20_POLY1305_SHA256.
+%% The first one the client offered wins. Offered suites the server does not
+%% support are ignored (RFC 8446 §4.1.2, RFC 9001 §5.3); no overlap at all is a
+%% handshake_failure (RFC 8446 §4.1.1).
+-spec select_cipher_suite([non_neg_integer()]) ->
+    {ok, {non_neg_integer(), roadrunner_quic_aead:cipher()}} | {error, no_common_cipher_suite}.
+select_cipher_suite(Offered) ->
+    Supported = [
+        {?TLS_AES_128_GCM_SHA256, aes_128_gcm},
+        {?TLS_CHACHA20_POLY1305_SHA256, chacha20_poly1305}
+    ],
+    case [Suite || {Codepoint, _Aead} = Suite <- Supported, lists:member(Codepoint, Offered)] of
+        [Suite | _] -> {ok, Suite};
+        [] -> {error, no_common_cipher_suite}
+    end.
 
 %% The client's x25519 public key, or an error when it offered none (v1
 %% requires an x25519 key_share; HelloRetryRequest is not implemented).
@@ -259,12 +312,14 @@ scheme_for_key(#'ECPrivateKey'{parameters = {namedCurve, ?'secp256r1'}}) ->
     ?SIG_ECDSA_SECP256R1_SHA256.
 
 %% Build the full server flight, threading the transcript across the four
-%% hash boundaries and deriving the handshake then application keys. The
+%% hash boundaries and deriving the handshake then application traffic
+%% secrets, whose packet keys protect with the selected suite's AEAD. The
 %% transcript is an iolist of framed messages; `transcript_hash/1` accepts
 %% iodata, so it is never flattened here.
 -spec build_flight(
     binary(),
     binary(),
+    {non_neg_integer(), roadrunner_quic_aead:cipher()},
     binary(),
     non_neg_integer(),
     t()
@@ -272,6 +327,7 @@ scheme_for_key(#'ECPrivateKey'{parameters = {namedCurve, ?'secp256r1'}}) ->
 build_flight(
     ClientHelloBody,
     SessionId,
+    {CipherSuite, Aead},
     ClientKeyShare,
     Scheme,
     #server{
@@ -288,7 +344,10 @@ build_flight(
     %% re-framed ClientHello (byte-identical to the wire message).
     ClientHelloFramed = roadrunner_quic_tls_handshake:encode(?CLIENT_HELLO, ClientHelloBody),
     ServerHello = roadrunner_quic_tls_hello:build_server_hello(#{
-        random => ServerRandom, session_id => SessionId, key_share => EphPub
+        random => ServerRandom,
+        session_id => SessionId,
+        cipher_suite => CipherSuite,
+        key_share => EphPub
     }),
     ThroughServerHello = [ClientHelloFramed, ServerHello],
 
@@ -341,10 +400,10 @@ build_flight(
         handshake => [EncryptedExtensions, Certificate, CertificateVerify, Finished]
     },
     Installs = [
-        {handshake, server, ServerHsSecret},
-        {handshake, client, ClientHsSecret},
-        {application, server, ServerApSecret},
-        {application, client, ClientApSecret}
+        {handshake, server, Aead, ServerHsSecret},
+        {handshake, client, Aead, ClientHsSecret},
+        {application, server, Aead, ServerApSecret},
+        {application, client, Aead, ClientApSecret}
     ],
     State1 = State#server{client_hs_secret = ClientHsSecret, client_finished_hash = FinishedHash},
     {ok, Flight, Installs, State1}.

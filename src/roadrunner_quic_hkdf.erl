@@ -5,9 +5,10 @@
 %% wrapper (RFC 8446 §7.1), the key-derivation primitive QUIC packet
 %% protection is built on (RFC 9001 §5).
 %%
-%% QUIC v1 negotiates `TLS_AES_128_GCM_SHA256` only, so the hash is fixed
-%% to SHA-256 (a 32-byte output); a wider cipher suite would carry the
-%% hash as a parameter. The Extract/Expand pair is kept RFC-complete (the
+%% Both cipher suites QUIC v1 negotiates (`TLS_AES_128_GCM_SHA256` and
+%% `TLS_CHACHA20_POLY1305_SHA256`) hash with SHA-256, so the hash is fixed
+%% to SHA-256 (a 32-byte output); a SHA-384 suite would carry the hash as a
+%% parameter. The Extract/Expand pair is kept RFC-complete (the
 %% multi-block expansion and the absent-salt default) so the RFC 5869
 %% vectors validate it, even though QUIC itself only ever expands to at
 %% most 32 bytes.

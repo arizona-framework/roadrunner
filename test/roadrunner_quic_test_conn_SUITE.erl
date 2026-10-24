@@ -5,13 +5,13 @@
 -include_lib("stdlib/include/assert.hrl").
 
 -export([suite/0, all/0, init_per_suite/1, end_per_suite/1]).
--export([native_client_completes_handshake/1]).
+-export([native_client_completes_handshake/1, native_client_completes_chacha20_handshake/1]).
 
 suite() ->
     [{timetrap, {seconds, 30}}].
 
 all() ->
-    [native_client_completes_handshake].
+    [native_client_completes_handshake, native_client_completes_chacha20_handshake].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
@@ -27,6 +27,15 @@ end_per_suite(_Config) ->
 %% =============================================================================
 
 native_client_completes_handshake(_Config) ->
+    assert_native_handshake(#{}).
+
+%% The same over TLS_CHACHA20_POLY1305_SHA256, the only suite the client
+%% offers: the Handshake and 1-RTT packets go out and come back under
+%% ChaCha20-Poly1305 with ChaCha20 header protection (RFC 9001 §5.3, §5.4.4).
+native_client_completes_chacha20_handshake(_Config) ->
+    assert_native_handshake(#{cipher_suites => [16#1303]}).
+
+assert_native_handshake(Opts) ->
     %% A minimal in-test listener: the pump owns one UDP socket, reads it, and
     %% routes each datagram to a per-peer native shell that replies on the same
     %% socket (the same harness the dep-client interop suite uses).
@@ -45,7 +54,7 @@ native_client_completes_handshake(_Config) ->
         end,
 
     Result =
-        case roadrunner_quic_test_conn:connect({127, 0, 0, 1}, Port) of
+        case roadrunner_quic_test_conn:connect({127, 0, 0, 1}, Port, Opts) of
             {ok, Conn} ->
                 ok = roadrunner_quic_test_conn:close(Conn),
                 ok;

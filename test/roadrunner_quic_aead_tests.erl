@@ -14,9 +14,9 @@
 %% =============================================================================
 
 rfc9001_a3_server_initial_test() ->
-    Key = hex(~"cf3a5331653c364c88f0f379b6067e37"),
+    Key = {aes_128_gcm, hex(~"cf3a5331653c364c88f0f379b6067e37")},
     IV = hex(~"0ac1493ca1905853b0bba03e"),
-    HP = hex(~"c206b8d9b9f0f37644430b490eeaa314"),
+    HP = {aes_128_ecb, hex(~"c206b8d9b9f0f37644430b490eeaa314")},
     PN = 1,
     PNOffset = 18,
     Header = hex(~"c1000000010008f067a5502a4262b50040750001"),
@@ -36,26 +36,65 @@ rfc9001_a3_server_initial_test() ->
     ?assertEqual({ok, Header, 2, PN, Ciphertext}, ?M:unprotect_header(HP, Packet, PNOffset)).
 
 %% =============================================================================
+%% RFC 9001 Appendix A.5 (ChaCha20-Poly1305 Short Header Packet), the
+%% authority for the ChaCha20-Poly1305 AEAD and the ChaCha20 header
+%% protection (§5.4.4).
+%%
+%% A minimal 1-RTT packet with an empty Destination Connection ID, a single
+%% PING frame, and the 3-byte packet number 654360564 (49140 on the wire),
+%% so the packet number starts at offset 1 and the sample skips one
+%% ciphertext byte.
+%% =============================================================================
+
+rfc9001_a5_chacha20_short_header_test() ->
+    Key =
+        {chacha20_poly1305,
+            hex(~"c6d98ff3441c3fe1b2182094f69caa2ed4b716b65488960a7a984979fb23e1c8")},
+    IV = hex(~"e0459b3474bdd0e44a41c144"),
+    HP = {chacha20, hex(~"25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4")},
+    PN = 654360564,
+    PNOffset = 1,
+    Header = hex(~"4200bff4"),
+    Plaintext = <<16#01>>,
+    Ciphertext = hex(~"655e5cd55c41f69080575d7999c25a5bfb"),
+    Packet = hex(~"4cfe4189655e5cd55c41f69080575d7999c25a5bfb"),
+    ?assertEqual(Ciphertext, ?M:seal(Key, IV, PN, Header, Plaintext)),
+    ?assertEqual({ok, Plaintext}, ?M:open(Key, IV, PN, Header, Ciphertext)),
+    Protected = ?M:protect_header(HP, Header, Ciphertext, PNOffset),
+    ?assertEqual(Packet, <<Protected/binary, Ciphertext/binary>>),
+    %% The receive side recovers the 3-byte truncated packet number (49140).
+    ?assertEqual(
+        {ok, Header, 3, 49140, Ciphertext}, ?M:unprotect_header(HP, Packet, PNOffset)
+    ).
+
+%% =============================================================================
 %% Failure paths: open and unprotect never crash on bad input.
 %% =============================================================================
 
-open_rejects_tampered_payload_test() ->
-    Key = hex(~"000102030405060708090a0b0c0d0e0f"),
+open_rejects_tampered_payload_test_() ->
     IV = hex(~"0a0b0c0d0e0f000102030405"),
-    CT = ?M:seal(Key, IV, 7, ~"aad", ~"secret payload over the tag"),
-    Size = byte_size(CT),
-    <<Body:(Size - 1)/binary, Last>> = CT,
-    Tampered = <<Body/binary, (Last bxor 1)>>,
-    ?assertEqual(error, ?M:open(Key, IV, 7, ~"aad", Tampered)).
+    [
+        ?_test(begin
+            CT = ?M:seal(Key, IV, 7, ~"aad", ~"secret payload over the tag"),
+            Size = byte_size(CT),
+            <<Body:(Size - 1)/binary, Last>> = CT,
+            Tampered = <<Body/binary, (Last bxor 1)>>,
+            ?assertEqual(error, ?M:open(Key, IV, 7, ~"aad", Tampered))
+        end)
+     || Key <- [
+            {aes_128_gcm, hex(~"000102030405060708090a0b0c0d0e0f")},
+            {chacha20_poly1305, binary:copy(<<16#2a>>, 32)}
+        ]
+    ].
 
 open_rejects_short_input_test() ->
-    Key = hex(~"000102030405060708090a0b0c0d0e0f"),
+    Key = {aes_128_gcm, hex(~"000102030405060708090a0b0c0d0e0f")},
     IV = hex(~"0a0b0c0d0e0f000102030405"),
     %% Fewer than the 16 tag bytes: cannot hold a tag.
     ?assertEqual(error, ?M:open(Key, IV, 0, <<>>, <<1, 2, 3>>)).
 
 unprotect_header_rejects_short_packet_test() ->
-    HP = hex(~"33333333333333333333333333333333"),
+    HP = {aes_128_ecb, hex(~"33333333333333333333333333333333")},
     %% Header present but the payload is too short to sample.
     ?assertEqual({error, sample_too_short}, ?M:unprotect_header(HP, <<16#40, 1, 2, 3>>, 1)),
     %% Packet shorter than the packet-number offset itself.
