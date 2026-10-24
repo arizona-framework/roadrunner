@@ -632,6 +632,21 @@ fit_frames_keeps_what_does_not_fit_test() ->
         {[], [{stream, 0, 0, ~"abc", true}]}, ?M:fit_frames([{stream, 0, 0, ~"abc", true}], 3)
     ).
 
+pto_deadline_not_pushed_back_by_peer_packets_test() ->
+    %% RFC 9002 §6.2.1: the probe timeout counts from the last ack-eliciting
+    %% packet sent. Peer PINGs arriving later (no RTT sample, nothing acked)
+    %% re-arm the timer at the same deadline rather than one counted from
+    %% their arrival. Two of them make the ACK due at once, so no delayed-ACK
+    %% deadline comes before the probe.
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    {State1, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"data", false, ?NOW, State),
+    [{arm_timer, pto, Deadline}] = [T || {arm_timer, _, _} = T <- Sent],
+    {State2, _} = ?M:handle_datagram(?NOW + 100, app_datagram([ping], 0, ClientApSecret), State1),
+    {_State3, Effects} = ?M:handle_datagram(
+        ?NOW + 100, app_datagram([ping], 1, ClientApSecret), State2
+    ),
+    ?assertEqual([{arm_timer, pto, Deadline}], [T || {arm_timer, _, _} = T <- Effects]).
+
 pto_probe_ack_recovers_a_lost_tail_test() ->
     %% The last packet of a response is lost. The probe draws an ACK of the
     %% probe alone, which shows the older packet lost, and it is sent again.

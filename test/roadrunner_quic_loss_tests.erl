@@ -220,6 +220,19 @@ loss_time_test() ->
 
 %% Send packets PN First..Last, each 100 bytes ack-eliciting, sent at
 %% time = PN, carrying their own number as the retransmit data.
+%% RFC 9002 §6.2.1: the probe timeout runs from the last ack-eliciting packet
+%% sent, so a later non-ack-eliciting send does not move it, and with nothing
+%% ack-eliciting in flight there is none.
+pto_deadline_counts_from_last_ack_eliciting_send_test() ->
+    ?assertEqual(undefined, ?M:pto_deadline(?M:new(#{}))),
+    Sent = ?M:on_packet_sent(0, 100, true, d0, 1000, ?M:new(#{})),
+    Deadline = 1000 + ?M:get_pto(Sent),
+    ?assertEqual(Deadline, ?M:pto_deadline(Sent)),
+    ?assertEqual(Deadline, ?M:pto_deadline(?M:on_packet_sent(1, 40, false, d1, 1500, Sent))),
+    Later = ?M:on_packet_sent(1, 100, true, d1, 1500, Sent),
+    ?assertEqual(1500 + ?M:get_pto(Later), ?M:pto_deadline(Later)),
+    ?assertEqual(undefined, ?M:pto_deadline(?M:on_packet_sent(0, 40, false, d0, 0, ?M:new(#{})))).
+
 send_run(First, Last, Loss) ->
     lists:foldl(
         fun(PN, Acc) -> ?M:on_packet_sent(PN, 100, true, PN, PN, Acc) end,

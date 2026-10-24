@@ -1466,7 +1466,7 @@ send_pass(Now, State) ->
     %% `drain_send` returns the send effects newest-first; reverse them into
     %% order and fold the releases + the (single) timer effect onto the end in
     %% the same pass, rather than a second traversal to append them.
-    {State2, lists:reverse(RevSends, Releases ++ timer_effects(Now, State2))}.
+    {State2, lists:reverse(RevSends, Releases ++ timer_effects(State2))}.
 
 %% Release each parked reply whose stream can no longer make progress toward
 %% draining: the stream is gone (pruned after its FIN flushed -> `ok`), its
@@ -1886,15 +1886,15 @@ probe(Space) -> Space.
 %% idle deadline, whichever is sooner. A single nearest-deadline timer keeps
 %% the per-datagram re-arm to one timer operation; the loser is re-derived
 %% after the winner fires (RFC 9000 §10.1, RFC 9002 §6.2).
--spec timer_effects(integer(), t()) -> [effect()].
-timer_effects(Now, State) ->
-    {Kind, AtMs} = earliest_deadline(Now, State),
+-spec timer_effects(t()) -> [effect()].
+timer_effects(State) ->
+    {Kind, AtMs} = earliest_deadline(State),
     [{arm_timer, Kind, AtMs}].
 
--spec earliest_deadline(integer(), t()) -> {pto | idle | ack, integer()}.
-earliest_deadline(Now, #state{idle_deadline = Idle} = State) ->
+-spec earliest_deadline(t()) -> {pto | idle | ack, integer()}.
+earliest_deadline(#state{idle_deadline = Idle} = State) ->
     Nearest =
-        case earliest_pto(Now, State) of
+        case earliest_pto(State) of
             undefined -> {idle, Idle};
             PtoAt when PtoAt =< Idle -> {pto, PtoAt};
             _PtoAt -> {idle, Idle}
@@ -1924,23 +1924,19 @@ total_bytes_in_flight(#state{spaces = Spaces}) ->
         Spaces
     ).
 
--spec earliest_pto(integer(), t()) -> integer() | undefined.
-earliest_pto(Now, #state{spaces = Spaces}) ->
-    %% The earliest PTO across all spaces; fold the map directly (order is
-    %% irrelevant to a min) rather than rebuilding the level list and looking
-    %% each space up again.
+-spec earliest_pto(t()) -> integer() | undefined.
+earliest_pto(#state{spaces = Spaces}) ->
+    %% The earliest PTO across all spaces, each counted from its last
+    %% ack-eliciting send (RFC 9002 §6.2.1), not from now: a peer that keeps
+    %% sending must not keep pushing the probe back. The map is folded
+    %% directly (order is irrelevant to a min).
     maps:fold(
-        fun(_Level, Space, Earliest) -> min_defined(Earliest, space_pto(Now, Space)) end,
+        fun(_Level, #space{loss = Loss}, Earliest) ->
+            min_defined(Earliest, roadrunner_quic_loss:pto_deadline(Loss))
+        end,
         undefined,
         Spaces
     ).
-
--spec space_pto(integer(), #space{}) -> integer() | undefined.
-space_pto(Now, #space{loss = Loss}) ->
-    case roadrunner_quic_loss:bytes_in_flight(Loss) of
-        0 -> undefined;
-        _ -> Now + roadrunner_quic_loss:get_pto(Loss)
-    end.
 
 %% =============================================================================
 %% Internal

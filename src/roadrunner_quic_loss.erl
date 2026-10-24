@@ -27,6 +27,7 @@
     loss_time/1,
     update_rtt/3,
     get_pto/1,
+    pto_deadline/1,
     on_pto_expired/1,
     smoothed_rtt/1,
     rtt_var/1,
@@ -83,6 +84,8 @@
     largest_acked = undefined :: non_neg_integer() | undefined,
     %% Probe timeout (RFC 9002 §6.2).
     pto_count = 0 :: non_neg_integer(),
+    %% When the last ack-eliciting packet was sent, the PTO's start (§6.2.1).
+    last_ack_eliciting_at = undefined :: non_neg_integer() | undefined,
     %% Congestion-controlled bytes outstanding.
     bytes_in_flight = 0 :: non_neg_integer(),
     %% The congestion-control signal from the most recent on_ack_received: the
@@ -150,8 +153,13 @@ on_packet_sent(
     },
     Loss#loss{
         sent = queue:in(Packet, Sent),
-        bytes_in_flight = InFlight + ack_eliciting_bytes(AckEliciting, Size)
+        bytes_in_flight = InFlight + ack_eliciting_bytes(AckEliciting, Size),
+        last_ack_eliciting_at = last_ack_eliciting_at(AckEliciting, Now, Loss)
     }.
+
+-spec last_ack_eliciting_at(boolean(), non_neg_integer(), t()) -> non_neg_integer() | undefined.
+last_ack_eliciting_at(true, Now, _Loss) -> Now;
+last_ack_eliciting_at(false, _Now, #loss{last_ack_eliciting_at = At}) -> At.
 
 %% =============================================================================
 %% ACK processing
@@ -311,6 +319,17 @@ max_ack_delay`, doubled per consecutive PTO (RFC 9002 §6.2.1).
 get_pto(#loss{smoothed_rtt = SRtt, rtt_var = RttVar, max_ack_delay = MaxAckDelay, pto_count = Count}) ->
     Pto = SRtt + max(4 * RttVar, ?GRANULARITY) + MaxAckDelay,
     Pto bsl Count.
+
+-doc """
+When the probe timeout fires (RFC 9002 §6.2.1): the probe timeout after the
+last ack-eliciting packet was sent, or `undefined` with no ack-eliciting
+bytes in flight.
+""".
+-spec pto_deadline(t()) -> non_neg_integer() | undefined.
+pto_deadline(#loss{bytes_in_flight = 0}) ->
+    undefined;
+pto_deadline(#loss{last_ack_eliciting_at = At} = Loss) ->
+    At + get_pto(Loss).
 
 -doc "Record a PTO expiry, which doubles the next probe timeout.".
 -spec on_pto_expired(t()) -> t().
