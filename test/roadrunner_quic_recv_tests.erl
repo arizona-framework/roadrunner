@@ -157,6 +157,16 @@ frame_error_reported_test() ->
         ?M:datagram(Wire, ?DCID_LEN, #{handshake => handshake_keys()}, #{})
     ).
 
+%% RFC 9000 §12.4: an authenticated packet with no frames is a
+%% PROTOCOL_VIOLATION. A 4-byte packet number leaves room for the
+%% header-protection sample in the AEAD tag alone.
+no_frames_protocol_violation_test() ->
+    Wire = seal_long(handshake, 16#1000000, handshake_keys(), <<>>),
+    ?assertEqual(
+        [{frame_error, handshake, protocol_violation}],
+        ?M:datagram(Wire, ?DCID_LEN, #{handshake => handshake_keys()}, #{})
+    ).
+
 %% RFC 9000 §17.3.1: a 1-RTT packet whose reserved bits are non-zero (after
 %% header protection is removed and the packet authenticates) is a
 %% PROTOCOL_VIOLATION, kept distinct from a silent drop.

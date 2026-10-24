@@ -55,9 +55,6 @@
 %% RFC 9000 §18.2 default ack_delay_exponent: a peer's ACK Delay field is
 %% carried in units of 2^exponent microseconds.
 -define(DEFAULT_ACK_DELAY_EXPONENT, 3).
-%% Bound the packet numbers expanded from one received ACK frame, so a
-%% peer cannot make us materialise an enormous range (RFC 9000 §13.2.3).
--define(MAX_ACK_RANGE, 65536).
 %% A congestion-control signal with nothing acknowledged or lost.
 -define(NO_CC_SIGNAL, #{
     acked_bytes => 0, largest_acked_time => undefined, largest_lost_time => undefined
@@ -165,11 +162,11 @@ Process a received ACK frame (RFC 9002 §5-§6). Classifies the tracked
 packets, updates the RTT from the largest acknowledged ack-eliciting
 packet, detects losses among the rest, and returns the new state with the
 acknowledged and lost packets' caller data (the lost data is what to
-retransmit). `{error, ack_range_too_large}` rejects an ACK whose ranges
-would expand past a sane bound.
+retransmit). `{error, negative_ack_range}` rejects an ACK whose ranges
+reach below packet number 0 (RFC 9000 §19.3.1).
 """.
 -spec on_ack_received(tuple(), non_neg_integer(), t()) ->
-    {t(), Acked :: [term()], Lost :: [term()]} | {error, ack_range_too_large}.
+    {t(), Acked :: [term()], Lost :: [term()]} | {error, negative_ack_range}.
 on_ack_received(Ack, Now, Loss) ->
     {LargestAcked, AckDelay, FirstRange, AckRanges} = ack_fields(Ack),
     case ack_to_ranges(LargestAcked, FirstRange, AckRanges) of
@@ -489,29 +486,30 @@ datas(Packets) ->
 
 %% Expand an ACK frame's largest/first-range/gap-range fields into the
 %% acknowledged {Start, End} ranges (RFC 9000 §19.3), rejecting a range
-%% that would materialise more than ?MAX_ACK_RANGE packet numbers.
+%% that reaches below packet number 0 (§19.3.1). A range stays a pair of
+%% bounds, never a list of packet numbers, so its size costs nothing.
 -spec ack_to_ranges(non_neg_integer(), non_neg_integer(), [{non_neg_integer(), non_neg_integer()}]) ->
-    [{non_neg_integer(), non_neg_integer()}] | {error, ack_range_too_large}.
-ack_to_ranges(LargestAcked, FirstRange, AckRanges) when FirstRange =< ?MAX_ACK_RANGE ->
+    [{non_neg_integer(), non_neg_integer()}] | {error, negative_ack_range}.
+ack_to_ranges(LargestAcked, FirstRange, _AckRanges) when FirstRange > LargestAcked ->
+    {error, negative_ack_range};
+ack_to_ranges(LargestAcked, FirstRange, AckRanges) ->
     Start = LargestAcked - FirstRange,
     case gap_ranges(Start, AckRanges) of
         {error, _} = Error -> Error;
         Rest -> [{Start, LargestAcked} | Rest]
-    end;
-ack_to_ranges(_LargestAcked, _FirstRange, _AckRanges) ->
-    {error, ack_range_too_large}.
+    end.
 
 gap_ranges(_PrevStart, []) ->
     [];
-gap_ranges(PrevStart, [{Gap, Range} | Rest]) when Range =< ?MAX_ACK_RANGE ->
+gap_ranges(PrevStart, [{Gap, Range} | _Rest]) when Gap + Range + 2 > PrevStart ->
+    {error, negative_ack_range};
+gap_ranges(PrevStart, [{Gap, Range} | Rest]) ->
     End = PrevStart - Gap - 2,
     Start = End - Range,
     case gap_ranges(Start, Rest) of
         {error, _} = Error -> Error;
         Tail -> [{Start, End} | Tail]
-    end;
-gap_ranges(_PrevStart, _Ranges) ->
-    {error, ack_range_too_large}.
+    end.
 
 pn_in_ranges(_PN, []) ->
     false;

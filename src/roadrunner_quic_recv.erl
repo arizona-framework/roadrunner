@@ -25,8 +25,9 @@
 %% `{drop, Reason}` for an undecryptable or unsupported packet (silently
 %% dropped, never the whole datagram, RFC 9001 §5.4.2), or
 %% `{frame_error, Level, Reason}` when an authenticated packet holds a
-%% malformed frame, or sets the header reserved bits (RFC 9000
-%% §17.2/§17.3.1, `Reason = protocol_violation`) — a connection error the
+%% malformed frame, carries no frames (RFC 9000 §12.4), or sets the header
+%% reserved bits (§17.2/§17.3.1); those last two have `Reason =
+%% protocol_violation`. Each is a connection error the
 %% loop must act on, kept distinct from a drop. A decrypt failure drops
 %% only that packet and the loop continues with the rest of the datagram.
 
@@ -163,6 +164,8 @@ open(Key, IV, PN, AAD, Sealed) ->
     {ok, decoded()} | {frame_error, level(), term()}.
 decode_frames(Level, PN, Header, Plaintext) ->
     case roadrunner_quic_frame:decode_all(Plaintext) of
+        %% RFC 9000 §12.4: a packet with no frames is a PROTOCOL_VIOLATION.
+        {ok, []} -> {frame_error, Level, protocol_violation};
         {ok, Frames} -> {ok, decoded(Level, PN, Header, Frames)};
         {error, Reason} -> {frame_error, Level, Reason}
     end.

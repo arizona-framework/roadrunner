@@ -120,20 +120,37 @@ client_ack_processed_test() ->
     {State2, _Effects} = ?M:handle_datagram(?NOW, Datagram, State1),
     ?assertEqual(handshaking, ?M:phase(State2)).
 
-oversized_ack_range_ignored_test() ->
-    %% An ACK claiming more packets than the loss layer accepts is dropped
-    %% without disturbing the connection.
+ack_for_unsent_packet_closes_test() ->
+    %% RFC 9000 §13.1: an ACK for a packet the server never sent in that space
+    %% is a PROTOCOL_VIOLATION.
     #{state1 := State1} = connect(),
     Datagram = ?TC:seal(
         initial,
         1,
         roadrunner_quic_keys:initial_client(?DCID),
-        [{ack, 70000, 0, 70000, [], undefined}],
+        [{ack, 70000, 0, 0, [], undefined}],
         ?DCID,
         ?SCID
     ),
-    {State2, _Effects} = ?M:handle_datagram(?NOW, Datagram, State1),
-    ?assertEqual(handshaking, ?M:phase(State2)).
+    {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State1)),
+    ?assertEqual(closed, ?M:phase(State2)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
+
+negative_ack_range_closes_test() ->
+    %% RFC 9000 §19.3.1: an ACK range reaching below packet number 0 is a
+    %% FRAME_ENCODING_ERROR.
+    #{state1 := State1} = connect(),
+    Datagram = ?TC:seal(
+        initial,
+        1,
+        roadrunner_quic_keys:initial_client(?DCID),
+        [{ack, 0, 0, 1, [], undefined}],
+        ?DCID,
+        ?SCID
+    ),
+    {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State1)),
+    ?assertEqual(closed, ?M:phase(State2)),
+    ?assertEqual([{emit, self(), {closed, {local, frame_encoding_error}}}], emits(Effects)).
 
 ping_and_padding_frames_handled_test() ->
     %% A PING (ack-eliciting) padded for the header-protection sample
@@ -159,10 +176,10 @@ undecryptable_packet_dropped_test() ->
     ?assertEqual(handshaking, ?M:phase(State1)),
     ?assertEqual([], sends(Effects)).
 
-malformed_frame_ignored_test() ->
-    %% An authenticated payload that decodes to a malformed frame is a
-    %% connection error the decision core absorbs (a CRYPTO frame claiming
-    %% eight bytes but carrying three).
+malformed_frame_closes_test() ->
+    %% RFC 9000 §12.4: an authenticated payload that decodes to a malformed
+    %% frame (a CRYPTO frame claiming eight bytes but carrying three) is a
+    %% FRAME_ENCODING_ERROR.
     {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
     Datagram = ?TC:seal_raw(
         initial,
@@ -172,9 +189,9 @@ malformed_frame_ignored_test() ->
         ?DCID,
         ?SCID
     ),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, State0),
-    ?assertEqual(handshaking, ?M:phase(State1)),
-    ?assertEqual([], sends(Effects)).
+    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, frame_encoding_error}}}], emits(Effects)).
 
 reserved_bits_close_with_protocol_violation_test() ->
     %% RFC 9000 §17.2: a long-header packet whose reserved bits are non-zero
@@ -372,11 +389,25 @@ assert_1rtt_frame_closes(Frame) ->
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
 
+retire_unissued_connection_id_closes_test() ->
+    %% RFC 9000 §19.16: the server only ever issued sequence number 0, so
+    %% retiring a higher one is a PROTOCOL_VIOLATION.
+    {State, ApSecret} = connected_with_owner(),
+    Retire = app_datagram([{retire_connection_id, 1}], 0, ApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Retire, State),
+    ?assertEqual(draining, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
+
 unhandled_1rtt_frames_accepted_test() ->
     %% The 1-RTT frames the server does not act on yet are still legal there
     %% and leave the connection open.
     {State, ApSecret} = connected_with_owner(),
-    Frames = [{data_blocked, 0}, {path_challenge, <<0:64>>}, {max_streams, bidi, 10}],
+    Frames = [
+        {data_blocked, 0},
+        {path_challenge, <<0:64>>},
+        {max_streams, bidi, 10},
+        {retire_connection_id, 0}
+    ],
     {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram(Frames, 0, ApSecret), State),
     ?assertEqual(connected, ?M:phase(State1)),
     ?assertEqual([], emits(Effects)).

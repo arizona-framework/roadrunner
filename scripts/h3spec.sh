@@ -34,19 +34,10 @@ H3SPEC_VERSION="v0.1.14"
 # the run gates every other case; a PR that fixes one deletes its line.
 # Matched as substrings of h3spec's case descriptions.
 KNOWN_FAILURES=(
-    "MUST send FRAME_ENCODING_ERROR if an ACK range reaches below zero"
-    "SHOULD send PROTOCOL_VIOLATION on an ACK for a packet never sent"
-    "MUST send FRAME_ENCODING_ERROR if a frame of unknown type is received"
-    "MUST send PROTOCOL_VIOLATION on no frames"
     "MUST send CRYPTO_BUFFER_EXCEEDED if CRYPTO data is buffered beyond the limit"
-    "MUST send PROTOCOL_VIOLATION if RETIRE_CONNECTION_ID for a sequence number never issued"
     "MUST send STREAM_STATE_ERROR if STOP_SENDING is received for a non-existing stream"
     "MUST send STREAM_STATE_ERROR if MAX_STREAM_DATA is received for a stream that has not yet been created"
     "MUST send STREAM_STATE_ERROR if MAX_STREAM_DATA is received for a receive-only stream"
-    "MUST send FRAME_ENCODING_ERROR if invalid MAX_STREAMS is received"
-    "MUST send STREAM_LIMIT_ERROR or FRAME_ENCODING_ERROR if invalid STREAMS_BLOCKED is received"
-    "MUST send FRAME_ENCODING_ERROR if NEW_CONNECTION_ID with invalid Retire_Prior_To is received"
-    "MUST send FRAME_ENCODING_ERROR if NEW_CONNECTION_ID with 0-byte CID is received"
     "MUST send unexpected_message TLS alert if KeyUpdate in Handshake is received"
     "MUST send unexpected_message TLS alert if EndOfEarlyData is received"
 )

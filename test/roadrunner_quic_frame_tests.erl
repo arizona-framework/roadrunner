@@ -136,6 +136,26 @@ decode_new_cid_errors_test() ->
             (roadrunner_quic_varint:encode(0))/binary, 4, 1, 2, 3, 4, 0, 0>>,
     ?assertEqual({error, truncated}, ?M:decode(ShortToken)).
 
+decode_stream_count_over_limit_test() ->
+    %% RFC 9000 §19.11 / §19.14: a stream count above 2^60 is a
+    %% FRAME_ENCODING_ERROR; 2^60 itself is the largest valid one.
+    Over = roadrunner_quic_varint:encode((1 bsl 60) + 1),
+    Max = roadrunner_quic_varint:encode(1 bsl 60),
+    [
+        ?assertEqual({error, frame_encoding_error}, ?M:decode(<<Type, Over/binary>>))
+     || Type <- [16#12, 16#13, 16#16, 16#17]
+    ],
+    ?assertEqual({ok, {max_streams, bidi, 1 bsl 60}, <<>>}, ?M:decode(<<16#12, Max/binary>>)),
+    ?assertEqual({error, truncated}, ?M:decode(<<16#16, 16#40>>)).
+
+decode_new_cid_retire_prior_to_over_seq_test() ->
+    %% RFC 9000 §19.15: Retire Prior To above the Sequence Number is a
+    %% FRAME_ENCODING_ERROR.
+    Frame =
+        <<16#18, (roadrunner_quic_varint:encode(1))/binary,
+            (roadrunner_quic_varint:encode(2))/binary, 4, 1, 2, 3, 4, 0:128>>,
+    ?assertEqual({error, frame_encoding_error}, ?M:decode(Frame)).
+
 decode_connection_close_truncated_test() ->
     %% Transport CONNECTION_CLOSE whose reason is shorter than its length.
     Bin =

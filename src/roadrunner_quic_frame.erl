@@ -248,9 +248,9 @@ decode(<<?MAX_STREAM_DATA, Rest/binary>>) ->
         {ok, {max_stream_data, StreamId, Max}, R2}
     end;
 decode(<<?MAX_STREAMS_BIDI, Rest/binary>>) ->
-    decode_one_varint(Rest, fun(Max) -> {max_streams, bidi, Max} end);
+    decode_stream_count(Rest, fun(Max) -> {max_streams, bidi, Max} end);
 decode(<<?MAX_STREAMS_UNI, Rest/binary>>) ->
-    decode_one_varint(Rest, fun(Max) -> {max_streams, uni, Max} end);
+    decode_stream_count(Rest, fun(Max) -> {max_streams, uni, Max} end);
 decode(<<?DATA_BLOCKED, Rest/binary>>) ->
     decode_one_varint(Rest, fun(Limit) -> {data_blocked, Limit} end);
 decode(<<?STREAM_DATA_BLOCKED, Rest/binary>>) ->
@@ -260,9 +260,9 @@ decode(<<?STREAM_DATA_BLOCKED, Rest/binary>>) ->
         {ok, {stream_data_blocked, StreamId, Limit}, R2}
     end;
 decode(<<?STREAMS_BLOCKED_BIDI, Rest/binary>>) ->
-    decode_one_varint(Rest, fun(Limit) -> {streams_blocked, bidi, Limit} end);
+    decode_stream_count(Rest, fun(Limit) -> {streams_blocked, bidi, Limit} end);
 decode(<<?STREAMS_BLOCKED_UNI, Rest/binary>>) ->
-    decode_one_varint(Rest, fun(Limit) -> {streams_blocked, uni, Limit} end);
+    decode_stream_count(Rest, fun(Limit) -> {streams_blocked, uni, Limit} end);
 decode(<<?NEW_CONNECTION_ID, Rest/binary>>) ->
     maybe
         {ok, Seq, R1} ?= take_varint(Rest),
@@ -311,6 +311,18 @@ decode_one_varint(Bin, Build) ->
         {ok, Build(Value), Rest}
     end.
 
+%% A MAX_STREAMS / STREAMS_BLOCKED body: one stream count, which cannot
+%% exceed 2^60 since a stream id has 62 bits and 2 of them name the type
+%% (RFC 9000 §19.11, §19.14).
+-spec decode_stream_count(binary(), fun((non_neg_integer()) -> frame())) ->
+    {ok, frame(), binary()} | {error, term()}.
+decode_stream_count(Bin, Build) ->
+    case take_varint(Bin) of
+        {ok, Count, Rest} when Count =< 1 bsl 60 -> {ok, Build(Count), Rest};
+        {ok, _Count, _Rest} -> {error, frame_encoding_error};
+        {error, _} = Error -> Error
+    end.
+
 -spec decode_stream(byte(), binary()) -> {ok, frame(), binary()} | {error, term()}.
 decode_stream(Type, Rest) ->
     HasOff = (Type band ?STREAM_OFF) =/= 0,
@@ -341,6 +353,9 @@ decode_stream_data(StreamId, Offset, Fin, false, Bin) ->
 
 -spec decode_new_cid(non_neg_integer(), non_neg_integer(), binary()) ->
     {ok, frame(), binary()} | {error, term()}.
+decode_new_cid(Seq, RetirePrior, _Bin) when RetirePrior > Seq ->
+    %% RFC 9000 §19.15: Retire Prior To cannot exceed the Sequence Number.
+    {error, frame_encoding_error};
 decode_new_cid(Seq, RetirePrior, <<CIDLen, Rest/binary>>) when CIDLen >= 1, CIDLen =< 20 ->
     case Rest of
         <<CID:CIDLen/binary, Token:16/binary, R/binary>> ->
