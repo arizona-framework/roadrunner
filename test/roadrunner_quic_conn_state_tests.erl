@@ -319,7 +319,94 @@ unexpected_handshake_message_closes_test() ->
     ),
     {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
     ?assertEqual(closed, ?M:phase(State1)),
-    ?assertEqual([{emit, self(), {closed, {local, unexpected_message}}}], emits(Effects)).
+    ?assertEqual([{emit, self(), {closed, {local, unexpected_message}}}], emits(Effects)),
+    %% RFC 9001 §4.8 / §6: the TLS unexpected_message alert (10), 0x010a.
+    ?assertMatch([{connection_close, transport, 16#010a, 0, <<>>}], initial_close_frames(Effects)).
+
+handshake_level_tls_message_closes_test_() ->
+    %% RFC 9001 §6 / §8.3: a KeyUpdate after the client Finished, or an
+    %% EndOfEarlyData before it, is a TLS unexpected_message (0x010a). The
+    %% EndOfEarlyData stops the fold before the Finished confirms the
+    %% handshake, so its close goes at the Handshake level; the KeyUpdate
+    %% follows the Finished, so its close goes at 1-RTT (RFC 9000 §10.2.3).
+    EndOfEarlyData = <<5, 0, 0, 0>>,
+    KeyUpdate = <<16#18, 0, 0, 1, 1>>,
+    [
+        ?_test(
+            assert_handshake_crypto_closes(
+                fun(Fin) -> <<EndOfEarlyData/binary, Fin/binary>> end, handshake
+            )
+        ),
+        ?_test(
+            assert_handshake_crypto_closes(
+                fun(Fin) -> <<Fin/binary, KeyUpdate/binary>> end, application
+            )
+        )
+    ].
+
+assert_handshake_crypto_closes(Wrap, CloseLevel) ->
+    #{
+        state1 := State1,
+        client_hs_secret := ClientHsSecret,
+        server_hs_secret := ServerHsSecret,
+        server_ap_secret := ServerApSecret,
+        cf_framed := ClientFinished
+    } = connect(),
+    {State1b, _} = ?M:handle_call(self(), make_ref(), {set_owner, self()}, 0, State1),
+    Datagram = ?TC:seal(
+        handshake,
+        0,
+        roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+        [{crypto, 0, Wrap(ClientFinished)}],
+        ?DCID,
+        ?SCID
+    ),
+    {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, State1b),
+    ?assertMatch({emit, _, {closed, {local, unexpected_message}}}, lists:last(emits(Effects))),
+    ?assertNotEqual(connected, ?M:phase(State2)),
+    Secrets = #{handshake => ServerHsSecret, application => ServerApSecret},
+    Frames = ?TC:frames(
+        sends(Effects),
+        CloseLevel,
+        #{CloseLevel => roadrunner_quic_keys:traffic_keys(maps:get(CloseLevel, Secrets))},
+        byte_size(?DCID)
+    ),
+    ?assert(lists:member({connection_close, transport, 16#010a, 0, <<>>}, Frames)).
+
+crypto_beyond_buffer_limit_closes_test() ->
+    %% RFC 9000 §7.5: a CRYPTO frame reaching past what the server buffers
+    %% ahead of the TLS layer closes with CRYPTO_BUFFER_EXCEEDED.
+    {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
+    Datagram = ?TC:seal(
+        initial,
+        0,
+        roadrunner_quic_keys:initial_client(?DCID),
+        [{crypto, 100000000, ~"x"}],
+        ?DCID,
+        ?SCID
+    ),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, crypto_buffer_exceeded}}}], emits(Effects)),
+    ExpectedCode = roadrunner_quic_error:code_int(crypto_buffer_exceeded),
+    ?assertMatch(
+        [{connection_close, transport, ExpectedCode, 0, <<>>}], initial_close_frames(Effects)
+    ).
+
+crypto_within_buffer_limit_held_test() ->
+    %% An out-of-order CRYPTO frame ending exactly at the limit is held.
+    {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
+    Datagram = ?TC:seal(
+        initial,
+        0,
+        roadrunner_quic_keys:initial_client(?DCID),
+        [{crypto, 65535, ~"x"}],
+        ?DCID,
+        ?SCID
+    ),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    ?assertEqual(handshaking, ?M:phase(State1)),
+    ?assertEqual([], emits(Effects)).
 
 application_close_at_initial_level_closes_test() ->
     %% An application-variant CONNECTION_CLOSE (0x1d) decoded from an Initial
@@ -1664,6 +1751,7 @@ connect(Extra) ->
         flight => Flight,
         cf_framed => ClientFinishedFramed,
         client_hs_secret => ClientHsSecret,
+        server_hs_secret => ServerHsSecret,
         server_ap_secret => ServerApSecret,
         client_ap_secret => ClientApSecret,
         ctx => Ctx
@@ -1800,6 +1888,15 @@ sent_app_frames(Effects, ServerApSecret) ->
         sends(Effects),
         application,
         #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+        byte_size(?DCID)
+    ).
+
+%% The frames of the server's Initial-level reply (a handshake-phase close).
+initial_close_frames(Effects) ->
+    ?TC:frames(
+        sends(Effects),
+        initial,
+        #{initial => roadrunner_quic_keys:initial_server(?DCID)},
         byte_size(?DCID)
     ).
 

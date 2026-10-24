@@ -57,6 +57,10 @@
 %% A CRYPTO slice budget that leaves room for the packet header, an ACK
 %% frame, and the AEAD tag within the 1200-byte datagram (RFC 9000 §14).
 -define(CRYPTO_BUDGET, 1000).
+%% CRYPTO bytes held per level ahead of what TLS has consumed. RFC 9000 §7.5
+%% asks for at least 4096; a client's handshake messages (its ClientHello
+%% and Finished) fit far inside this.
+-define(CRYPTO_BUFFER_LIMIT, 65536).
 %% Idle-timeout fallback (RFC 9000 §10.1): used only when neither endpoint
 %% advertises a max_idle_timeout, so a dead peer cannot pin the connection. The
 %% live value is the negotiated minimum of the two advertised limits.
@@ -819,17 +823,43 @@ on_max_stream_data(Sid, Max, #state{streams = Streams} = State) ->
     end.
 
 %% Reassemble CRYPTO, deframe complete handshake messages, and drive the
-%% TLS sequencer.
+%% TLS sequencer. A frame reaching more than ?CRYPTO_BUFFER_LIMIT bytes past
+%% what TLS has consumed (the delivered prefix less the bytes still waiting
+%% to deframe) would make us hold that much, out of order or as one
+%% unfinished message: close with CRYPTO_BUFFER_EXCEEDED (RFC 9000 §7.5).
 -spec process_crypto(level(), non_neg_integer(), binary(), t()) -> t().
 process_crypto(Level, Offset, Data, State) ->
-    Space = space(Level, State),
+    #space{crypto = Crypto0, crypto_in = CryptoIn} = Space = space(Level, State),
+    Consumed = roadrunner_quic_stream:recv_offset(Crypto0) - byte_size(CryptoIn),
+    case Offset + byte_size(Data) - Consumed of
+        Held when Held > ?CRYPTO_BUFFER_LIMIT ->
+            connection_fatal(Level, crypto_buffer_exceeded, State);
+        _ ->
+            reassemble_crypto(Level, Offset, Data, Space, State)
+    end.
+
+-spec reassemble_crypto(level(), non_neg_integer(), binary(), #space{}, t()) -> t().
+reassemble_crypto(Level, Offset, Data, Space, State) ->
     {ok, NewBytes, _Fin, Crypto} = roadrunner_quic_stream:receive_data(
         Offset, Data, false, Space#space.crypto
     ),
     Buffer = <<(Space#space.crypto_in)/binary, NewBytes/binary>>,
     {Messages, Rest} = deframe(Buffer),
     State1 = put_space(Level, Space#space{crypto = Crypto, crypto_in = Rest}, State),
-    lists:foldl(fun(Message, S) -> process_handshake(Level, Message, S) end, State1, Messages).
+    lists:foldl(
+        fun(Message, S) -> process_handshake_message(Level, Message, S) end, State1, Messages
+    ).
+
+%% A handshake message that closed the connection ends the fold: the messages
+%% after it in the same CRYPTO data are not processed (RFC 9000 §10.2), so a
+%% Finished behind a fatal message cannot confirm the handshake.
+-spec process_handshake_message(level(), {byte(), binary()}, t()) -> t().
+process_handshake_message(_Level, _Message, #state{phase = Phase} = State) when
+    Phase =:= closed; Phase =:= draining
+->
+    State;
+process_handshake_message(Level, Message, State) ->
+    process_handshake(Level, Message, State).
 
 %% Decode every complete handshake message, leaving trailing partial bytes.
 -spec deframe(binary()) -> {[{byte(), binary()}], binary()}.
@@ -1137,9 +1167,17 @@ process_close(ErrorCode, State) ->
 -spec connection_fatal(level(), atom(), t()) -> t().
 connection_fatal(Level, Reason, State) ->
     State1 = State#state{
-        phase = closing_phase(State), pending_close = {Level, close_code(Reason)}
+        phase = closing_phase(State),
+        pending_close = {close_level(Level, State), close_code(Reason)}
     },
     emit({closed, {local, Reason}}, State1).
+
+%% The level to send a CONNECTION_CLOSE at: the triggering packet's, except
+%% once the handshake is confirmed, when it MUST be 1-RTT (RFC 9000 §10.2.3);
+%% the Handshake keys are gone by then.
+-spec close_level(level(), t()) -> level().
+close_level(_Level, #state{phase = connected}) -> application;
+close_level(Level, _State) -> Level.
 
 %% The terminal phase a close moves to (RFC 9000 §10.2): an established
 %% connection lingers in `draining` for 3x PTO so the peer's reordered 1-RTT
@@ -1174,10 +1212,16 @@ close_code(Reason) when
     Reason =:= stream_state_error;
     Reason =:= stream_limit_error;
     Reason =:= protocol_violation;
+    Reason =:= crypto_buffer_exceeded;
     Reason =:= frame_encoding_error;
     Reason =:= transport_parameter_error
 ->
     roadrunner_quic_error:code_int(Reason);
+close_code(unexpected_message) ->
+    %% A handshake message TLS does not expect where it arrived, such as a
+    %% KeyUpdate (RFC 9001 §6: 0x010a) or an EndOfEarlyData, which QUIC
+    %% removes (§8.3): the TLS unexpected_message alert (10).
+    roadrunner_quic_error:code_int({crypto_error, 10});
 close_code(missing_transport_params) ->
     %% RFC 9001 §8.2: a ClientHello without the quic_transport_parameters
     %% extension MUST close with 0x016d, a CRYPTO_ERROR carrying the TLS
