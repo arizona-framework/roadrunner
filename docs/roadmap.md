@@ -147,9 +147,6 @@ advisory or malformed cases the server currently tolerates or omits.
   ACK-detected losses back off the window today), and persistent congestion (§7.6,
   resetting the window to the minimum when a PTO spans all in-flight packets) —
   medium
-- Probe with data (RFC 9002 §6.2.4 SHOULD): a probe timeout that finds no
-  loss sends a PING, whose ACK then shows a lost tail lost; probing with the
-  oldest unacknowledged data instead would save that round trip — small
 
 ### Throughput levers identified by profiling
 

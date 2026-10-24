@@ -647,6 +647,32 @@ pto_deadline_not_pushed_back_by_peer_packets_test() ->
     ),
     ?assertEqual([{arm_timer, pto, Deadline}], [T || {arm_timer, _, _} = T <- Effects]).
 
+%% RFC 9002 §6.2.4: a probe timeout that finds nothing lost probes with the
+%% oldest unacknowledged data rather than a PING, so a lost tail is already
+%% on its way again instead of waiting for the ACK a PING would draw.
+pto_probe_carries_unacked_tail_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    AckDone = app_datagram([{ack, 0, 0, 0, [], undefined}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, AckDone, State),
+    {State2, _} = ?M:handle_send(self(), make_ref(), 0, ~"tail", true, ?NOW, State1),
+    {_State3, Effects} = ?M:handle_timeout(?NOW + 5000, pto, State2),
+    Frames = sent_app_frames(Effects, ServerApSecret),
+    ?assert(lists:member({stream, 0, 0, ~"tail", true}, Frames)),
+    ?assertNot(lists:member(ping, Frames)).
+
+%% With only data that must not be resent in flight (a PATH_RESPONSE, sent
+%% once, RFC 9000 §13.3), the probe falls back to a PING.
+pto_probe_pings_when_nothing_to_resend_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    AckDone = app_datagram([{ack, 0, 0, 0, [], undefined}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, AckDone, State),
+    Challenge = app_datagram([{path_challenge, ~"8 bytes!"}], 1, ClientApSecret),
+    {State2, _} = ?M:handle_datagram(?NOW, Challenge, State1),
+    {_State3, Effects} = ?M:handle_timeout(?NOW + 5000, pto, State2),
+    Frames = sent_app_frames(Effects, ServerApSecret),
+    ?assert(lists:member(ping, Frames)),
+    ?assertEqual([], [F || {path_response, _} = F <- Frames]).
+
 pto_probe_ack_recovers_a_lost_tail_test() ->
     %% The last packet of a response is lost. The probe draws an ACK of the
     %% probe alone, which shows the older packet lost, and it is sent again.
