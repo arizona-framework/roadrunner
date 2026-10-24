@@ -2272,13 +2272,119 @@ chacha20_peer_key_update_test() ->
     ).
 
 %% RFC 9001 §6.1: a key update before the handshake is confirmed (at the
-%% server, before it completes) is a KEY_UPDATE_ERROR.
+%% server, before it completes) is a KEY_UPDATE_ERROR. The packet is held
+%% unopened during the handshake (§5.7), so the update is found, and the
+%% connection closed, once the client Finished completes it.
 key_update_before_handshake_completes_closes_test() ->
-    #{state1 := State1, client_ap_secret := ClientApSecret} = connect(),
+    {State1, Finished, ClientApSecret, _ServerApSecret} = handshaking_owned(),
     Update = phase_datagram([ping], 0, generation_keys(ClientApSecret, 1), 1),
-    {State2, Effects} = ?M:handle_datagram(?NOW, Update, with_owner(State1)),
-    ?assertEqual(closed, ?M:phase(State2)),
+    {State2, Effects2} = ?M:handle_datagram(?NOW, Update, State1),
+    ?assertEqual(handshaking, ?M:phase(State2)),
+    ?assertEqual([], emits(Effects2)),
+    {State3, Effects3} = ?M:handle_datagram(?NOW, Finished, State2),
+    ?assertEqual(draining, ?M:phase(State3)),
+    ?assertEqual([{emit, self(), {closed, {local, key_update_error}}}], emits(Effects3)).
+
+%% A key update coalesced behind the client Finished is just as premature:
+%% the client sent it before our HANDSHAKE_DONE (§6.1).
+key_update_coalesced_with_finished_closes_test() ->
+    {State1, Finished, ClientApSecret, _ServerApSecret} = handshaking_owned(),
+    Update = phase_datagram([ping], 0, generation_keys(ClientApSecret, 1), 1),
+    {State2, Effects} = ?M:handle_datagram(?NOW, <<Finished/binary, Update/binary>>, State1),
+    ?assertEqual(draining, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, key_update_error}}}], emits(Effects)).
+
+%% =============================================================================
+%% 1-RTT packets ahead of the handshake's completion (RFC 9001 §5.7)
+%% =============================================================================
+
+%% A 1-RTT packet that arrives before the client Finished is neither
+%% processed nor acknowledged: its stream data does not reach the owner and
+%% no 1-RTT ACK goes out. Once the Finished completes the handshake the held
+%% packet is opened and processed, and acknowledged with the HANDSHAKE_DONE.
+early_1rtt_held_until_handshake_completes_test() ->
+    {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(),
+    Early = app_datagram([{stream, 0, 0, ~"hello", true}], 0, ClientApSecret),
+    {State2, Effects2} = ?M:handle_datagram(?NOW, Early, State1),
+    ?assertEqual(handshaking, ?M:phase(State2)),
+    ?assertEqual([], emits(Effects2)),
+    ?assertEqual([], app_acks(Effects2, ServerApSecret)),
+    {State3, Effects3} = ?M:handle_datagram(?NOW, Finished, State2),
+    ?assertEqual(connected, ?M:phase(State3)),
+    ?assertEqual(
+        [
+            {emit, self(), {connected, expected_info()}},
+            {emit, self(), {stream_opened, 0}},
+            {emit, self(), {stream_data, 0, ~"hello", true}}
+        ],
+        emits(Effects3)
+    ),
+    ?assertMatch([{ack, 0, _, 0, [], undefined}], app_acks(Effects3, ServerApSecret)).
+
+%% The common case: the client coalesces a 1-RTT packet behind the Handshake
+%% packet carrying its Finished. The datagram opens with the keys of the
+%% handshake, so the 1-RTT packet is held at first, then processed as soon as
+%% the Finished before it in the same datagram completes the handshake.
+coalesced_1rtt_after_finished_processed_test() ->
+    {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(),
+    App = app_datagram([{stream, 0, 0, ~"hello", true}], 0, ClientApSecret),
+    {State2, Effects} = ?M:handle_datagram(?NOW, <<Finished/binary, App/binary>>, State1),
+    ?assertEqual(connected, ?M:phase(State2)),
+    ?assertEqual(
+        [
+            {emit, self(), {connected, expected_info()}},
+            {emit, self(), {stream_opened, 0}},
+            {emit, self(), {stream_data, 0, ~"hello", true}}
+        ],
+        emits(Effects)
+    ),
+    ?assertMatch([{ack, 0, _, 0, [], undefined}], app_acks(Effects, ServerApSecret)).
+
+%% Packets held earlier are processed ahead of the one coalesced behind the
+%% Finished, in the order they arrived.
+held_1rtt_processed_before_coalesced_test() ->
+    {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(),
+    Early = app_datagram([{stream, 0, 0, ~"hel", false}], 0, ClientApSecret),
+    {State2, _} = ?M:handle_datagram(?NOW, Early, State1),
+    App = app_datagram([{stream, 0, 3, ~"lo", true}], 1, ClientApSecret),
+    {_State3, Effects} = ?M:handle_datagram(?NOW, <<Finished/binary, App/binary>>, State2),
+    ?assertEqual(
+        [
+            {emit, self(), {connected, expected_info()}},
+            {emit, self(), {stream_opened, 0}},
+            {emit, self(), {stream_data, 0, ~"hel", false}},
+            {emit, self(), {stream_data, 0, ~"lo", true}}
+        ],
+        emits(Effects)
+    ),
+    ?assertMatch([{ack, 1, _, 1, [], undefined}], app_acks(Effects, ServerApSecret)).
+
+%% The hold is bounded: past 8 packets the rest are dropped, so only the
+%% first 8 are processed and acknowledged once the handshake completes.
+held_1rtt_bounded_test() ->
+    {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(),
+    State2 = lists:foldl(
+        fun(PN, S) ->
+            {S1, _} = ?M:handle_datagram(?NOW, app_datagram([ping], PN, ClientApSecret), S),
+            S1
+        end,
+        State1,
+        lists:seq(0, 9)
+    ),
+    {_State3, Effects} = ?M:handle_datagram(?NOW, Finished, State2),
+    ?assertMatch([{ack, 7, _, 7, [], undefined}], app_acks(Effects, ServerApSecret)).
+
+%% A held packet that fails authentication once opened is dropped like any
+%% other (RFC 9001 §5.4.2); the packets around it are still processed.
+held_1rtt_failing_authentication_dropped_test() ->
+    {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(),
+    Forged = phase_datagram([ping], 0, generation_keys(ServerApSecret, 0), 0),
+    {State2, _} = ?M:handle_datagram(?NOW, Forged, State1),
+    Early = app_datagram([ping], 1, ClientApSecret),
+    {State3, _} = ?M:handle_datagram(?NOW, Early, State2),
+    {State4, Effects} = ?M:handle_datagram(?NOW, Finished, State3),
+    ?assertEqual(connected, ?M:phase(State4)),
+    ?assertMatch([{ack, 1, _, 0, [], undefined}], app_acks(Effects, ServerApSecret)).
 
 %% RFC 9001 §6.6: past the AEAD_AES_128_GCM integrity limit of 2^52 packets
 %% failing authentication, the connection closes with AEAD_LIMIT_REACHED and
@@ -2632,6 +2738,17 @@ connect_owned(Extra) ->
 
 %% `HelloOpts` as for connect/2.
 connect_owned(Extra, HelloOpts) ->
+    {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(Extra, HelloOpts),
+    {State2, _Effects} = ?M:handle_datagram(?NOW, Finished, State1),
+    {State2, ClientApSecret, ServerApSecret}.
+
+%% Still handshaking (after the ClientHello) with this process installed as
+%% owner, plus the client's Handshake datagram carrying its Finished, not yet
+%% sent, and both application secrets.
+handshaking_owned() ->
+    handshaking_owned(#{}, #{}).
+
+handshaking_owned(Extra, HelloOpts) ->
     #{
         state1 := State1,
         client_hs_secret := ClientHsSecret,
@@ -2640,7 +2757,6 @@ connect_owned(Extra, HelloOpts) ->
         server_ap_secret := ServerApSecret,
         aead := Aead
     } = connect(Extra, HelloOpts),
-    {State1b, _} = ?M:handle_call(self(), make_ref(), {set_owner, self()}, 0, State1),
     Finished = ?TC:seal(
         handshake,
         0,
@@ -2649,8 +2765,7 @@ connect_owned(Extra, HelloOpts) ->
         ?DCID,
         ?SCID
     ),
-    {State2, _Effects} = ?M:handle_datagram(?NOW, Finished, State1b),
-    {State2, ClientApSecret, ServerApSecret}.
+    {with_owner(State1), Finished, ClientApSecret, ServerApSecret}.
 
 %% Connected, owner installed, with the client secret for sealing peer 1-RTT.
 connected_with_owner() ->
@@ -2715,6 +2830,15 @@ send_phase_acked(State, #{} = Keys) ->
     State1;
 send_phase_acked(State, ClientApSecret) ->
     send_phase_acked(State, generation_keys(ClientApSecret, 0)).
+
+%% The ACK frames in the server's 1-RTT packets.
+app_acks(Effects, ServerApSecret) ->
+    [
+        Frame
+     || {ok, #{frames := Frames}} <- app_packets(Effects, generation_keys(ServerApSecret, 0)),
+        Frame <- Frames,
+        is_ack(Frame)
+    ].
 
 %% Every 1-RTT packet outcome of the server's datagrams, decoded with `Keys`.
 app_packets(Effects, Keys) ->

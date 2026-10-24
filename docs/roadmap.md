@@ -127,12 +127,6 @@ advisory or malformed cases the server currently tolerates or omits.
   transfer that fills a non-zero window — already emits the frame on the
   flow's blocked transition; this remainder is the never-sent-a-byte case a
   conformant peer never produces — small
-- Hold back 1-RTT packets until the handshake completes (RFC 9001 §5.7): the
-  client's 1-RTT keys are installed with the server's first flight, so a
-  1-RTT packet that arrives ahead of the client Finished is decrypted,
-  processed and acknowledged today. Drop or buffer it until the Finished
-  verifies, without losing the 1-RTT packet a client coalesces behind its
-  Finished in the same datagram — small-medium
 
 ### Throughput levers identified by profiling
 

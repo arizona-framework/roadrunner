@@ -269,8 +269,8 @@ seal_raw_reserved(Level, PN, #{key := Key, iv := IV, hp := HP}, Plaintext, DCID,
 -doc """
 Contiguous CRYPTO bytes for a level across the server's datagrams. The
 per-level keys map filters out the other levels' packets (they decode to
-`{drop, no_keys}`); with no in-test loss a sorted concat reassembles the
-flight.
+`{drop, no_keys}`, or `{held, _}` for 1-RTT); with no in-test loss a sorted
+concat reassembles the flight.
 """.
 -spec crypto_bytes(
     [binary()],

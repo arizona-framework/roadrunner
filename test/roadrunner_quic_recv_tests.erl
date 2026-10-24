@@ -129,6 +129,13 @@ no_keys_dropped_test() ->
     Wire = seal_long(handshake, 5, handshake_keys(), Plaintext),
     ?assertEqual([{drop, no_keys}], ?M:datagram(Wire, ?DCID_LEN, #{}, #{})).
 
+%% A 1-RTT packet with no 1-RTT keys given comes back still protected, for
+%% the loop to hold until the handshake completes (RFC 9001 §5.7).
+no_application_keys_held_test() ->
+    {Plaintext, _} = frames_for([{stream, 0, 0, <<"application-body">>, true}]),
+    Wire = seal_short(7, application_keys(), 1, Plaintext),
+    ?assertEqual([{held, Wire}], ?M:datagram(Wire, ?DCID_LEN, #{}, #{})).
+
 %% A tampered tag fails authentication and drops only that packet, reported
 %% with its level so the loop can count it (RFC 9001 §6.6).
 decrypt_failure_dropped_test() ->

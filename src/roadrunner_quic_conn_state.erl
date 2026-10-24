@@ -41,6 +41,12 @@
 %% update allowed, the connection closes with AEAD_LIMIT_REACHED rather than
 %% overuse the keys.
 %%
+%% The client's 1-RTT keys arrive with the server's first flight, but a
+%% server MUST NOT process 1-RTT packets before the handshake completes
+%% (RFC 9001 §5.7). Until the client Finished verifies, each 1-RTT packet is
+%% held unopened (a few at most) and opened once it does, including one
+%% coalesced behind that Finished in the same datagram.
+%%
 %% Congestion control and probe transmission are deferred: the connection
 %% sends within the anti-amplification and flow limits (the MUSTs) and a
 %% probe timeout only re-checks for losses and backs off. Wiring NewReno and
@@ -105,6 +111,11 @@
 %% are, so no connection reaches it and it is kept as that bound.
 -define(AES_128_GCM_CONFIDENTIALITY_LIMIT, (1 bsl 23)).
 -define(CHACHA20_POLY1305_CONFIDENTIALITY_LIMIT, (1 bsl 62)).
+
+%% 1-RTT packets kept, still protected, while the handshake is in progress
+%% (RFC 9001 §5.7). A client sends only a few before it sees our
+%% HANDSHAKE_DONE; past this the rest are dropped and it retransmits them.
+-define(HELD_LIMIT, 8).
 %% TLS handshake message types carried in CRYPTO (RFC 8446 §4).
 -define(CLIENT_HELLO, 1).
 -define(FINISHED, 20).
@@ -178,6 +189,11 @@
     %% Received packets that failed authentication, across all keys and
     %% levels, for the AEAD integrity limit (§6.6).
     auth_failures = 0 :: non_neg_integer(),
+    %% 1-RTT packets received before the client Finished verified, newest
+    %% first and still protected (RFC 9001 §5.7): a server MUST NOT process
+    %% them before the handshake completes, so they are neither decrypted
+    %% nor acknowledged until then. At most ?HELD_LIMIT.
+    held = [] :: [binary()],
     spaces :: #{level() => #space{}},
     amp :: roadrunner_quic_amp:t(),
     %% Cleared once a Handshake packet decrypts (address validated, §8.1).
@@ -448,10 +464,47 @@ handle_datagram(Now, Datagram, State0) ->
         idle_deadline = Now + IdleTimeout
     },
     Outcomes = roadrunner_quic_recv:datagram(
-        Datagram, ?SCID_LEN, RecvKeys, largest_map(State1)
+        Datagram, ?SCID_LEN, open_keys(Before, RecvKeys), largest_map(State1)
     ),
     State2 = lists:foldl(fun(O, S) -> process_outcome(Now, O, S) end, State1, Outcomes),
-    finish_datagram(Now, Before, State2).
+    finish_datagram(Now, Before, release_held(Now, State2)).
+
+%% The receive keys a datagram is opened with. Before the handshake completes
+%% the 1-RTT keys are withheld (RFC 9001 §5.7: a server MUST NOT process, nor
+%% even decrypt, 1-RTT packets until then), so the recv pipeline hands each
+%% 1-RTT packet back still protected for process_outcome to hold.
+-spec open_keys(phase(), #{level() => roadrunner_quic_recv:keys()}) ->
+    #{level() => roadrunner_quic_recv:keys()}.
+open_keys(handshaking, RecvKeys) -> maps:remove(application, RecvKeys);
+open_keys(_Phase, RecvKeys) -> RecvKeys.
+
+%% Once the handshake has completed, decrypt and process the 1-RTT packets
+%% held back while it was in progress (RFC 9001 §5.7: they MAY be stored and
+%% used once the handshake is complete), oldest first. Each opens against the
+%% receive state as it then stands, so its packet number is reconstructed
+%% from what was received before it, and a failed authentication counts
+%% toward the integrity limit only now (§6.6).
+-spec release_held(integer(), t()) -> t().
+release_held(Now, #state{phase = connected, held = [_ | _] = Held} = State) ->
+    lists:foldr(fun(Packet, S) -> open_held(Now, Packet, S) end, State#state{held = []}, Held);
+release_held(_Now, State) ->
+    State.
+
+-spec open_held(integer(), binary(), t()) -> t().
+open_held(Now, Packet, #state{recv_keys = RecvKeys} = State) ->
+    Outcomes = roadrunner_quic_recv:datagram(Packet, ?SCID_LEN, RecvKeys, largest_map(State)),
+    lists:foldl(fun(O, S) -> held_outcome(Now, O, S) end, State, Outcomes).
+
+%% A held packet that opened with the next 1-RTT keys is a key update the
+%% client began before it could have confirmed the handshake (RFC 9001 §6.1):
+%% it was sent before our HANDSHAKE_DONE, and no 1-RTT packet of the client's
+%% had been acknowledged (§4.1.2). That is a KEY_UPDATE_ERROR, as it was when
+%% one arrived during the handshake, never a committed update.
+-spec held_outcome(integer(), roadrunner_quic_recv:outcome(), t()) -> t().
+held_outcome(_Now, {ok, #{generation := next}}, #state{phase = connected} = State) ->
+    connection_fatal(application, key_update_error, State);
+held_outcome(Now, Outcome, State) ->
+    process_outcome(Now, Outcome, State).
 
 %% After folding a datagram's frames: if a close fired during the fold,
 %% transmit our CONNECTION_CLOSE for a locally-detected error (RFC 9000
@@ -819,6 +872,22 @@ process_outcome(Now, {ok, Decoded}, State) ->
 process_outcome(_Now, {auth_failed, Level}, #state{auth_failures = Failures} = State) ->
     auth_failed(Level, Failures + 1, State);
 process_outcome(_Now, {drop, _Reason}, State) ->
+    State;
+process_outcome(Now, {held, Packet}, #state{phase = connected, held = Held} = State) ->
+    %% A 1-RTT packet coalesced behind the Handshake packet whose Finished,
+    %% earlier in this datagram, just completed the handshake (RFC 9001 §5.7
+    %% suggests a client coalesce them so the server can process the 1-RTT
+    %% packet at once): process it now, after any held from before.
+    release_held(Now, State#state{held = [Packet | Held]});
+process_outcome(_Now, {held, Packet}, #state{held = Held} = State) when
+    length(Held) < ?HELD_LIMIT
+->
+    %% A 1-RTT packet ahead of the client Finished (RFC 9001 §5.7): keep it,
+    %% unprocessed and unacknowledged, until the handshake completes.
+    State#state{held = [Packet | Held]};
+process_outcome(_Now, {held, _Packet}, State) ->
+    %% The hold is full: drop it, as §5.7 also allows; the client resends
+    %% its frames once our acknowledgments show the packet lost.
     State;
 process_outcome(_Now, {frame_error, Level, protocol_violation}, State) ->
     %% A protocol violation the recv pipeline flagged after the packet
