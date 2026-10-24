@@ -121,11 +121,14 @@ advisory or malformed cases the server currently tolerates or omits.
   TLS 1.3 / x25519, aborting on no overlap (RFC 8446 §4.1.1) — medium
 - Honor the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` when sizing response
   headers (RFC 9114 §4.2.2) — small-medium
-- Close on a malformed authenticated frame instead of absorbing it: the recv
-  pipeline already reports `{frame_error, _, Reason}`, but the loop only acts
-  on the packet-header reserved-bits case (PROTOCOL_VIOLATION); map a frame
-  decode reason to FRAME_ENCODING_ERROR / the frame-specific code (RFC 9000
-  §12.4) and close — small
+- Pass the h3spec cases listed as known failures in `scripts/h3spec.sh`:
+  frames that are malformed, in the wrong packet type, or forbidden from a
+  client are absorbed instead of closing the connection (RFC 9000 §12.4,
+  §19), a bad transport parameter closes with a TLS alert instead of
+  TRANSPORT_PARAMETER_ERROR (§18.2), there is no CRYPTO buffer limit (§7.5),
+  and a few HTTP/3 and QPACK errors use the wrong code. Check each case
+  against the RFC before fixing, and drop its line from the list in the
+  same PR — medium
 
 ### Transport completeness — bites large transfers / advanced cases
 

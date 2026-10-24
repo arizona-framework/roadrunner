@@ -4,7 +4,7 @@ SHELL := /bin/bash
 
 .PHONY: all help compile test precommit doc fmt fmt-check \
 	xref hank dialyzer eunit ct cover lint \
-	bench bench-quick wrk2 wrk2-quick h2spec autobahn redbot \
+	bench bench-quick wrk2 wrk2-quick h2spec h3spec autobahn redbot \
 	clean clean-doc clean-build distclean
 
 all: precommit
@@ -26,6 +26,7 @@ help:
 	@echo "  wrk2          scripts/wrk2_bench.sh (open-loop matrix, ~2-10h)"
 	@echo "  wrk2-quick    scripts/wrk2_bench.sh --quick --scenarios hello"
 	@echo "  h2spec        scripts/h2spec.sh"
+	@echo "  h3spec        scripts/h3spec.sh"
 	@echo "  autobahn      scripts/autobahn.escript"
 	@echo "  redbot        scripts/redbot.escript"
 	@echo ""
@@ -86,6 +87,9 @@ wrk2-quick:
 
 h2spec:
 	./scripts/h2spec.sh
+
+h3spec:
+	./scripts/h3spec.sh
 
 autobahn:
 	./scripts/autobahn.escript
