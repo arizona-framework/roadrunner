@@ -150,10 +150,16 @@
     max_streams_uni :: non_neg_integer(),
     %% Per-type count of peer-initiated stream ordinals opened so far (1 + the
     %% highest ordinal seen). A peer frame for an ordinal below this that is no
-    %% longer in `streams` is a late/reordered frame for a pruned stream
-    %% (RFC 9000 §3): it is ignored, not recreated as a fresh stream.
+    %% longer in `streams`, and not in `skipped`, is a late/reordered frame for
+    %% a pruned stream (RFC 9000 §3): it is ignored, not recreated as a fresh
+    %% stream.
     bidi_opened = 0 :: non_neg_integer(),
     uni_opened = 0 :: non_neg_integer(),
+    %% Peer stream ids below the high-water that no frame has opened yet:
+    %% opening a stream opens every lower one of its type (RFC 9000 §3.2), so
+    %% a stream whose first frame arrives after a higher one's is still new.
+    %% Bounded by the stream limit, which is checked before a stream opens.
+    skipped = #{} :: #{non_neg_integer() => true},
     %% Connection-level flow control (RFC 9000 §4).
     conn_flow :: roadrunner_quic_flow:t(),
     %% When a request stream's receive credit is granted back: as its data
@@ -1289,10 +1295,12 @@ send_close(
 %% §3). Server-initiated ids never reach here (rejected upstream).
 -spec ensure_stream(non_neg_integer(), t()) ->
     {ok, roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()} | closed.
-ensure_stream(Sid, #state{streams = Streams} = State) ->
+ensure_stream(Sid, #state{streams = Streams, skipped = Skipped} = State) ->
     case Streams of
         #{Sid := {Stream, Flow}} ->
             {ok, Stream, Flow, State};
+        #{} when is_map_key(Sid, Skipped) ->
+            open_stream(Sid, State#state{skipped = maps:remove(Sid, Skipped)});
         #{} ->
             case opened_before(Sid, State) of
                 true -> closed;
@@ -1366,13 +1374,26 @@ negotiated_idle_timeout(OurParams, PeerParams) ->
         {O, P} -> min(O, P)
     end.
 
-%% Advance the per-type high-water past `Sid`'s ordinal. Opening a bidi stream
-%% also tops up the peer's bidi-stream credit.
+%% Advance the per-type high-water past `Sid`'s ordinal, recording any ids it
+%% jumps over as skipped (still to open). Opening a bidi stream also tops up
+%% the peer's bidi-stream credit.
 -spec bump_opened(non_neg_integer(), t()) -> t().
 bump_opened(Sid, #state{bidi_opened = Opened} = State) when Sid rem 4 =:= 0 ->
-    grant_max_streams_bidi(State#state{bidi_opened = max(Opened, Sid div 4 + 1)});
+    grant_max_streams_bidi(
+        skip_below(Sid, Opened, State#state{bidi_opened = max(Opened, Sid div 4 + 1)})
+    );
 bump_opened(Sid, #state{uni_opened = Opened} = State) ->
-    State#state{uni_opened = max(Opened, Sid div 4 + 1)}.
+    skip_below(Sid, Opened, State#state{uni_opened = max(Opened, Sid div 4 + 1)}).
+
+%% Record the ids of `Sid`'s type from ordinal `Opened` up to (not including)
+%% `Sid`'s own as skipped. A stream at or below the high-water (the next one,
+%% or a skipped one opening late) leaves no gap.
+-spec skip_below(non_neg_integer(), non_neg_integer(), t()) -> t().
+skip_below(Sid, Opened, #state{skipped = Skipped} = State) when Sid div 4 > Opened ->
+    Gap = [Ordinal * 4 + Sid rem 4 || Ordinal <- lists:seq(Opened, Sid div 4 - 1)],
+    State#state{skipped = maps:merge(Skipped, maps:from_keys(Gap, true))};
+skip_below(_Sid, _Opened, State) ->
+    State.
 
 %% Keep the peer in bidi-stream credit (RFC 9000 §4.6): once the opened count is
 %% within a quarter-window of the advertised limit, raise the limit to a fresh
