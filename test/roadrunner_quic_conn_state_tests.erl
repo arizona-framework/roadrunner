@@ -321,6 +321,66 @@ application_close_at_initial_level_closes_test() ->
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
 
+stream_frame_at_initial_level_closes_test() ->
+    %% RFC 9000 §12.4 / §12.5: STREAM is 0-RTT/1-RTT only; one in an Initial
+    %% packet is a protocol violation.
+    {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
+    Datagram = ?TC:seal(
+        initial,
+        0,
+        roadrunner_quic_keys:initial_client(?DCID),
+        [{stream, 0, 0, ~"x", false}],
+        ?DCID,
+        ?SCID
+    ),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State0)),
+    ?assertEqual(closed, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
+
+handshake_level_frame_placement_test_() ->
+    %% RFC 9000 §12.4 / §12.5: PATH_CHALLENGE, DATA_BLOCKED and
+    %% STREAM_DATA_BLOCKED are 0-RTT/1-RTT only; one in a Handshake packet is
+    %% a protocol violation.
+    [
+        ?_test(assert_handshake_frame_closes(Frame))
+     || Frame <- [
+            {path_challenge, <<0:64>>}, {data_blocked, 0}, {stream_data_blocked, 0, 0}
+        ]
+    ].
+
+assert_handshake_frame_closes(Frame) ->
+    #{state1 := State1, client_hs_secret := ClientHsSecret} = connect(),
+    Datagram = ?TC:seal(
+        handshake, 1, roadrunner_quic_keys:traffic_keys(ClientHsSecret), [Frame], ?DCID, ?SCID
+    ),
+    {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State1)),
+    ?assertEqual(closed, ?M:phase(State2)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
+
+server_only_frame_from_client_closes_test_() ->
+    %% RFC 9000 §19.7 / §19.20: only a server sends NEW_TOKEN and
+    %% HANDSHAKE_DONE; a server receiving either closes with
+    %% PROTOCOL_VIOLATION, even at 1-RTT where both may appear.
+    [
+        ?_test(assert_1rtt_frame_closes(Frame))
+     || Frame <- [{new_token, ~"token"}, handshake_done]
+    ].
+
+assert_1rtt_frame_closes(Frame) ->
+    {State, ApSecret} = connected_with_owner(),
+    {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram([Frame], 0, ApSecret), State),
+    ?assertEqual(draining, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
+
+unhandled_1rtt_frames_accepted_test() ->
+    %% The 1-RTT frames the server does not act on yet are still legal there
+    %% and leave the connection open.
+    {State, ApSecret} = connected_with_owner(),
+    Frames = [{data_blocked, 0}, {path_challenge, <<0:64>>}, {max_streams, bidi, 10}],
+    {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram(Frames, 0, ApSecret), State),
+    ?assertEqual(connected, ?M:phase(State1)),
+    ?assertEqual([], emits(Effects)).
+
 application_close_at_1rtt_closes_test() ->
     %% An application-variant CONNECTION_CLOSE (0x1d) is legal at 1-RTT (an h3
     %% client's graceful close) and surfaces {closed, {peer, ErrorCode}}.

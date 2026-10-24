@@ -758,10 +758,26 @@ process_frame(_Now, application, {max_stream_data, Sid, Max}, State) ->
     on_max_stream_data(Sid, Max, State);
 process_frame(_Now, application, {stop_sending, Sid, ErrorCode}, State) ->
     process_stop_sending(Sid, ErrorCode, State);
-process_frame(_Now, _Level, _Frame, State) ->
-    %% ping / padding are no-ops. MAX_STREAMS is accepted but not yet acted on
-    %% (the server never opens enough streams to need the raised limit).
-    State.
+process_frame(_Now, _Level, padding, State) ->
+    State;
+process_frame(_Now, _Level, ping, State) ->
+    State;
+process_frame(_Now, Level, handshake_done, State) ->
+    %% Only a server sends HANDSHAKE_DONE (RFC 9000 §19.20).
+    connection_fatal(Level, protocol_violation, State);
+process_frame(_Now, Level, {new_token, _Token}, State) ->
+    %% Only a server sends NEW_TOKEN (RFC 9000 §19.7).
+    connection_fatal(Level, protocol_violation, State);
+process_frame(_Now, application, _Frame, State) ->
+    %% The other 1-RTT frames are accepted but not acted on yet: MAX_STREAMS
+    %% (the server never opens enough streams to need the raised limit), the
+    %% BLOCKED signals, and the connection-id and path frames.
+    State;
+process_frame(_Now, Level, _Frame, State) ->
+    %% RFC 9000 §12.4 / §12.5: Initial and Handshake packets carry only
+    %% PADDING, PING, ACK, CRYPTO and a transport CONNECTION_CLOSE, all
+    %% handled above; any other frame there is a PROTOCOL_VIOLATION.
+    connection_fatal(Level, protocol_violation, State).
 
 %% Raise a stream's send limit from a received MAX_STREAM_DATA (RFC 9000 §4.1).
 %% Only a tracked stream can have unsent data to unblock; a grant for an unknown
