@@ -270,8 +270,8 @@ jobs:
       - name: Run h3spec
         run: ./scripts/h3spec.sh
 
-  # HTTP/3 interop with independent QUIC clients (quiche and ngtcp2, pinned
-  # Docker images): the CT suites use roadrunner's own QUIC client, which
+  # HTTP/3 interop with independent QUIC clients (quiche, ngtcp2 and headless
+  # Chrome, pinned Docker images): the CT suites use roadrunner's own QUIC client, which
   # shares the server's codecs and TLS, so a bug both sides share passes
   # them. `h3interop.sh` checks every byte the real clients get back, once on
   # a clean loopback and once with packet loss (netem on `lo`, via the
