@@ -125,7 +125,8 @@ so there is no dynamic-table memory to bound yet.
 | `socket_backlog` | 1024 | yes | TCP listen backlog (kernel SYN/accept queue depth) |
 | `recv_buffer` | 64 KB | yes | per-connection inbound TCP buffer (body-path throughput vs memory at scale) |
 | `max_clients` | 16384 | yes | concurrent connection cap per listener |
-| `max_concurrent_requests` | `infinity` | yes | concurrent in-flight request cap per listener (HTTP/2 and HTTP/3) |
+| `max_concurrent_requests` | `infinity` | yes | concurrent in-flight request cap per listener (HTTP/2 and HTTP/3, every protocol in `shed` mode) |
+| `overload_mode` | `refuse` | yes | what a request over `max_concurrent_requests` gets: refused, queued, or shed with `503` |
 | `request_timeout` | 30 s | yes | header-read timeout on a fresh connection |
 | `keep_alive_timeout` | 60 s | yes | idle timeout between requests |
 | `max_keep_alive_requests` | 1000 | yes | requests served per connection before close |
@@ -155,6 +156,24 @@ handler runs, and the refusal emits `request_throttled` and
 increments the `throttled` count from `roadrunner_listener:info/1`. HTTP/1
 is unaffected: it serves one request per connection, so `max_clients`
 already bounds it.
+
+`overload_mode` picks what a request over the ceiling gets. `refuse`, the
+default, is the refusal above. `{queue, #{max_queued => N, timeout =>
+Ms}}` parks it until a slot frees, refusing it only when the wait runs
+out or the queue is full. `{shed, #{retry_after => Secs}}` answers it
+`503 Service Unavailable` with `Retry-After` (default 1 second, RFC 9110
+§15.6.4) and no body, before any handler runs: clients wait and come
+back instead of retrying at once, which suits clients that talk to the
+server directly, while the retry-safe refusal suits a proxy that can try
+another backend. In shed mode HTTP/1 requests count against the ceiling
+too, so it is one in-flight budget across every protocol; an HTTP/1
+request over it gets the 503 with `connection: close` before any of its
+body is read. A shed request emits `request_throttled` and increments
+`throttled`, like a refused one. Connections over `max_clients` are
+still closed without a response: answering them would cost a process,
+and on TLS a handshake, for clients the server is turning away. Setting
+`max_concurrent_requests` below what `max_clients` allows makes the
+ceiling the soft limit that sheds and `max_clients` the hard one.
 
 When choosing between the two knobs, prefer sizing the advertised
 limits: pick `max_clients` and `max_concurrent_streams` (or

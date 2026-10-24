@@ -404,7 +404,8 @@ type. Beyond `port`,
 `protocols`, `tls`, and `routes`, the type covers:
 
 - **Limits and timeouts**: `max_clients`, `max_concurrent_requests`,
-  `overload_mode` (refuse or queue requests over the limit),
+  `overload_mode` (refuse, queue, or answer `503` to requests over the
+  limit),
   `max_content_length`, `max_keep_alive_requests`, `request_timeout`,
   `keep_alive_timeout`, `tls_handshake_timeout`, `min_bytes_per_second`,
   `rate_check_interval`, `rate_limit`

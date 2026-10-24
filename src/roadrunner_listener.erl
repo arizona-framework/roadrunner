@@ -62,6 +62,8 @@ All duration and interval values in `opts()` are in milliseconds —
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
 -define(DEFAULT_MAX_CLIENTS, 16384).
 -define(DEFAULT_MAX_CONCURRENT_REQUESTS, infinity).
+%% `Retry-After` seconds on a request shed at the in-flight ceiling.
+-define(DEFAULT_SHED_RETRY_AFTER, 1).
 -define(DEFAULT_MIN_BYTES_PER_SECOND, 100).
 %% TCP listen backlog (kernel SYN/accept queue depth). OTP defaults to 5,
 %% which a burst of concurrent connects overflows; 1024 matches cowboy.
@@ -186,7 +188,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   which RFC 9113 §8.7 marks safe to retry; each refusal emits
   `request_throttled` and increments the `throttled`
   count from `info/1`. HTTP/1 is unaffected (one request per connection,
-  already bounded by `max_clients`).
+  already bounded by `max_clients`), except in `shed` mode below.
 - `overload_mode` — what happens to a request that arrives over
   `max_concurrent_requests`. Default `refuse`, which is the behavior
   described above. `{queue, Opts}` instead
@@ -215,6 +217,32 @@ Optional middleware and timing knobs (durations in milliseconds):
   window of 4 to a window of 64 with a queued ceiling of 4096 took
   252,259 to 397,747 resp/s with no refusals and concurrency still
   bounded.
+
+  `{shed, Opts}` answers a request over the ceiling with `503 Service
+  Unavailable` and a `Retry-After` header (RFC 9110 §15.6.4, §10.2.3)
+  instead of refusing its stream, so clients wait and come back rather
+  than retrying at once. `REFUSED_STREAM` and `H3_REQUEST_REJECTED`
+  invite an immediate retry (RFC 9113 §8.7), which suits a proxy that
+  can send the request to another backend; a 503 with `Retry-After`
+  is the signal for clients talking to this server directly. `Opts`
+  takes `retry_after`, the seconds to send, default `1`. The 503 goes
+  out before any handler runs and carries no body. In this mode HTTP/1
+  requests count against the ceiling too, so it is one in-flight budget
+  across every protocol: an HTTP/1 request over it gets the 503 with
+  `connection: close`, before any of its body is read (the close lingers
+  over a body the client may still be sending). A shed request is
+  counted like a refused one: it emits `request_throttled` and
+  increments the `throttled` count from `info/1`. A long-lived response
+  (WebSocket, loop, stream) holds its slot until it ends, on every
+  protocol. Requires a finite `max_concurrent_requests`.
+
+  Shedding applies to the request ceiling only. A connection over
+  `max_clients` is still closed without a response: answering it would
+  mean a process, and on TLS a full handshake, for a client the server is
+  turning away, which is the work the cap is there to stop. Set
+  `max_concurrent_requests` below what `max_clients` allows, and the
+  ceiling becomes the soft limit that sheds while `max_clients` stays the
+  hard one.
 - `socket_backlog` — TCP listen backlog (kernel SYN/accept queue
   depth). Default 1024. Raise it for connection bursts (load tests,
   health-check storms); Linux clamps the effective value at
@@ -333,7 +361,9 @@ ops-tuning rationale.
     max_clients => pos_integer(),
     max_concurrent_requests => infinity | pos_integer(),
     overload_mode =>
-        refuse | {queue, #{max_queued => pos_integer(), timeout => pos_integer()}},
+        refuse
+        | {queue, #{max_queued => pos_integer(), timeout => pos_integer()}}
+        | {shed, #{retry_after => pos_integer()}},
     socket_backlog => pos_integer(),
     %% Local interface to bind. Unset means all interfaces
     %% (`0.0.0.0` / `::`). Set to `{127,0,0,1}` to restrict the
@@ -835,8 +865,9 @@ Return runtime introspection for a listener:
   Also emitted in real time as `listener_conn_rejected`.
 - `max_concurrent_requests` — the configured in-flight ceiling
   (`infinity` when off).
-- `throttled` — cumulative count of streams refused because the listener
-  was at its `max_concurrent_requests` ceiling. A rising `throttled`
+- `throttled` — cumulative count of requests refused (or, in `shed`
+  mode, answered 503) because the listener was at its
+  `max_concurrent_requests` ceiling. A rising `throttled`
   means the in-flight cap is binding. Also emitted in real time as
   `request_throttled`.
 
@@ -1383,9 +1414,10 @@ spawn_acceptors_loop(LSocket, ProtoOpts, I, N) ->
     {ok, _Pid} = roadrunner_acceptor:start_link(LSocket, ProtoOpts, I),
     spawn_acceptors_loop(LSocket, ProtoOpts, I + 1, N).
 
-%% Queue mode only means something when there is a ceiling to queue
-%% behind, so asking for it without `max_concurrent_requests` is a
-%% configuration error rather than a silent no-op.
+%% Queue and shed modes only mean something when there is a ceiling to
+%% queue behind or shed at, so asking for either without
+%% `max_concurrent_requests` is a configuration error rather than a
+%% silent no-op.
 %%
 %% Both knobs are derived when absent, so `{queue, #{}}` is usable
 %% without inventing numbers. `timeout` follows `request_timeout`,
@@ -1394,11 +1426,19 @@ spawn_acceptors_loop(LSocket, ProtoOpts, I, N) ->
 %% the ceiling, so at most as many requests wait as run: total requests
 %% in the system stay under twice the ceiling, and the worst-case wait
 %% stays around one service time per queued request.
+%%
+%% Shed mode's `retry_after` defaults to one second: a slot frees as soon
+%% as one in-flight request ends, so the shortest wait `Retry-After` can
+%% express (RFC 9110 §10.2.3, whole seconds) is the one that fits.
 -spec validate_overload_mode(term(), infinity | pos_integer(), pos_integer()) ->
-    refuse | {queue, #{max_queued := pos_integer(), timeout := pos_integer()}}.
+    refuse
+    | {queue, #{max_queued := pos_integer(), timeout := pos_integer()}}
+    | {shed, #{retry_after := pos_integer()}}.
 validate_overload_mode(refuse, _Max, _RequestTimeout) ->
     refuse;
-validate_overload_mode({queue, _Queue} = Mode, infinity, _RequestTimeout) ->
+validate_overload_mode({Kind, _Opts} = Mode, infinity, _RequestTimeout) when
+    Kind =:= queue; Kind =:= shed
+->
     error({invalid_listener_opt, overload_mode, {Mode, requires_max_concurrent_requests}});
 validate_overload_mode({queue, Queue}, Max, RequestTimeout) when is_map(Queue) ->
     MaxQueued = maps:get(max_queued, Queue, Max),
@@ -1411,14 +1451,25 @@ validate_overload_mode({queue, Queue}, Max, RequestTimeout) when is_map(Queue) -
         false ->
             error({invalid_listener_opt, overload_mode, {queue, Queue}})
     end;
+validate_overload_mode({shed, Shed}, _Max, _RequestTimeout) when is_map(Shed) ->
+    case maps:get(retry_after, Shed, ?DEFAULT_SHED_RETRY_AFTER) of
+        RetryAfter when is_integer(RetryAfter), RetryAfter > 0 ->
+            {shed, #{retry_after => RetryAfter}};
+        _ ->
+            error({invalid_listener_opt, overload_mode, {shed, Shed}})
+    end;
 validate_overload_mode(Other, _Max, _RequestTimeout) ->
     error({invalid_listener_opt, overload_mode, Other}).
 
 %% `refuse` costs nothing at all on the release path; the queue form
 %% carries the process, the atomic that says whether anyone is parked,
 %% and the wait deadline, so the hot path never reads proto_opts again.
+%% The shed form carries only its `Retry-After`, and like `refuse` has
+%% nothing to wake on release.
 -spec setup_overload(
-    refuse | {queue, #{max_queued := pos_integer(), timeout := pos_integer()}},
+    refuse
+    | {queue, #{max_queued := pos_integer(), timeout := pos_integer()}}
+    | {shed, #{retry_after := pos_integer()}},
     infinity | pos_integer(),
     counters:counters_ref()
 ) -> roadrunner_conn:overload().
@@ -1426,7 +1477,9 @@ setup_overload(refuse, _Max, _Counter) ->
     refuse;
 setup_overload({queue, #{max_queued := MaxQueued, timeout := Timeout}}, Max, Counter) ->
     {ok, Pid} = roadrunner_overload_queue:start_link(Max, Counter, MaxQueued),
-    {queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), Timeout}.
+    {queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), Timeout};
+setup_overload({shed, #{retry_after := RetryAfter}}, _Max, _Counter) ->
+    {shed, RetryAfter}.
 
 %% A TLS listener that also reads the PROXY protocol cannot hand its
 %% sockets out through `ssl:listen`: the header arrives in plaintext before

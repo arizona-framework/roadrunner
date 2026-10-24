@@ -75,6 +75,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     max_clients_refuse/1,
     single_listener_ephemeral_port/1,
     max_concurrent_requests_refuse/1,
+    max_concurrent_requests_shed/1,
     max_concurrent_requests_queue/1,
     max_concurrent_requests_queue_expires/1,
     max_concurrent_requests_queue_stale_grant/1,
@@ -174,6 +175,7 @@ all() ->
         max_clients_refuse,
         single_listener_ephemeral_port,
         max_concurrent_requests_refuse,
+        max_concurrent_requests_shed,
         max_concurrent_requests_queue,
         max_concurrent_requests_queue_expires,
         max_concurrent_requests_queue_stale_grant,
@@ -239,6 +241,7 @@ init_per_testcase(Case, Config) when
     Case =:= max_clients_refuse;
     Case =:= single_listener_ephemeral_port;
     Case =:= max_concurrent_requests_refuse;
+    Case =:= max_concurrent_requests_shed;
     Case =:= max_concurrent_requests_queue;
     Case =:= max_concurrent_requests_queue_expires;
     Case =:= max_concurrent_requests_queue_stale_grant;
@@ -1334,6 +1337,39 @@ max_concurrent_requests_refuse(_Config) ->
         ?assert(maps:get(throttled, roadrunner_listener:info(Name)) >= 1),
         %% Releasing the worker frees the slot; a fresh request succeeds once
         %% the worker's `DOWN` has run (the slot release is async, so retry).
+        WorkerRef = monitor(process, Worker),
+        Worker ! stop,
+        receive
+            {'DOWN', WorkerRef, process, Worker, _} -> ok
+        after 5000 -> ct:fail(loop_worker_did_not_exit)
+        end,
+        ?assertEqual({200, ~"ok"}, status_body(retry_get(Conn, ~"/", 50)))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+max_concurrent_requests_shed(_Config) ->
+    %% The same ceiling of 1 on a shed listener: the request over it is
+    %% answered 503 with the configured Retry-After instead of being reset
+    %% with H3_REQUEST_REJECTED, no handler runs for it, and it is counted
+    %% as throttled. The connection carries on once the slot frees.
+    Name = listener_name(max_concurrent_requests_shed),
+    {ok, _} = start_h3(Name, #{
+        max_concurrent_requests => 1, overload_mode => {shed, #{retry_after => 7}}
+    }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        ok = wait_for_unregister(roadrunner_h3_loop_test, 5000),
+        {ok, _StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/loop")),
+        Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
+        {503, Headers, Body} = get(Conn, ~"/loop"),
+        ?assertEqual(~"7", proplists:get_value(~"retry-after", Headers)),
+        ?assertEqual(~"", iolist_to_binary(Body)),
+        %% A handler run for the shed request would have re-registered
+        %% the name.
+        ?assertEqual(Worker, whereis(roadrunner_h3_loop_test)),
+        ?assertMatch(#{throttled := 1}, roadrunner_listener:info(Name)),
         WorkerRef = monitor(process, Worker),
         Worker ! stop,
         receive

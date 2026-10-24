@@ -73,7 +73,7 @@
     send_status/2,
     parse_error_status/1,
     send_payload_too_large/1,
-    send_rate_limited/2,
+    send_retry_later/3,
     rate_limit_check/6,
     resolve_rate_limit/2,
     resolve_real_ip/2,
@@ -120,10 +120,11 @@ immediately. The queue form parks it until a slot frees, so handler
 memory stays bounded without shedding the request; it carries the
 listener's queue process, the atomic that says whether anyone is parked
 (read on the release path to avoid a message per request), and the wait
-deadline in milliseconds.
+deadline in milliseconds. The shed form answers it `503` with the
+`Retry-After` seconds it carries.
 """.
 -type overload() ::
-    refuse | {queue, pid(), atomics:atomics_ref(), pos_integer()}.
+    refuse | {queue, pid(), atomics:atomics_ref(), pos_integer()} | {shed, pos_integer()}.
 
 -type dispatch() ::
     {handler, module(), roadrunner_middleware:next(), State :: term()}
@@ -167,7 +168,8 @@ deadline in milliseconds.
     %% `infinity` (default) disables it. `inflight_counter` is the live
     %% gauge (acquired before a worker spawns, released on its `DOWN`);
     %% `throttled_counter` is the cumulative count of streams refused at
-    %% the ceiling. h1 is bounded by `max_clients` and does not use these.
+    %% the ceiling. h1 is bounded by `max_clients` and uses these only in
+    %% shed mode, where the ceiling is one budget across every protocol.
     max_concurrent_requests := infinity | pos_integer(),
     %% What happens to a request over that ceiling. Optional so a
     %% hand-built proto_opts map (tests, embedded callers) defaults to
@@ -573,7 +575,9 @@ else, so a listener that never reaches its ceiling pays a single
 
 Returns `true` when the slot is held and the caller may spawn its
 worker, `false` when the caller should refuse the request exactly as it
-does today, and `queued` when the request is parked. A parked caller
+does today, `{shed, RetryAfterSecs}` when the listener sheds instead and
+the caller answers `503` with that `Retry-After`, and `queued` when the
+request is parked. A parked caller
 MUST NOT block: it returns to its loop and later receives
 `{roadrunner_slot, Token, granted | timeout | full}`. `granted` means the
 slot is already held on its behalf, so a caller that has since dropped
@@ -584,19 +588,21 @@ is the natural choice.
 """.
 -spec acquire_request_slot(
     infinity | pos_integer(), counters:counters_ref() | undefined, overload(), term()
-) -> true | false | queued.
+) -> true | false | queued | {shed, pos_integer()}.
 acquire_request_slot(Max, Counter, Overload, Token) ->
     case try_acquire_request_slot(Max, Counter) of
         true -> true;
         false -> park(Overload, Token)
     end.
 
--spec park(overload(), term()) -> false | queued.
+-spec park(overload(), term()) -> false | queued | {shed, pos_integer()}.
 park(refuse, _Token) ->
     false;
 park({queue, Pid, _Waiters, Timeout}, Token) ->
     ok = roadrunner_overload_queue:enqueue(Pid, Token, Timeout),
-    queued.
+    queued;
+park({shed, _RetryAfter} = Shed, _Token) ->
+    Shed.
 
 -doc """
 Withdraw a parked request, because its stream was reset or its
@@ -604,10 +610,10 @@ connection is going away. Racing an in-flight grant is expected: the
 caller may still receive `granted` afterwards and must release that slot.
 """.
 -spec cancel_slot_wait(overload(), term()) -> ok.
-cancel_slot_wait(refuse, _Token) ->
-    ok;
 cancel_slot_wait({queue, Pid, _Waiters, _Timeout}, Token) ->
-    roadrunner_overload_queue:cancel(Pid, Token).
+    roadrunner_overload_queue:cancel(Pid, Token);
+cancel_slot_wait(_NeverParks, _Token) ->
+    ok.
 
 -doc """
 Decrement the in-flight-request counter, paired with
@@ -627,13 +633,13 @@ release_request_slot(_Max, Counter, Overload) ->
     notify_release(Overload).
 
 -spec notify_release(overload()) -> ok.
-notify_release(refuse) ->
-    ok;
 notify_release({queue, Pid, Waiters, _Timeout}) ->
     case roadrunner_overload_queue:waiting(Waiters) of
         true -> roadrunner_overload_queue:note_release(Pid);
         false -> ok
-    end.
+    end;
+notify_release(_NeverParks) ->
+    ok.
 
 -doc """
 Release `N` in-flight slots at once. Used by the conn clean-exit path to
@@ -1879,10 +1885,13 @@ send_payload_too_large(Socket) ->
     ),
     roadrunner_transport:send(Socket, Resp).
 
--spec send_rate_limited(roadrunner_transport:socket(), pos_integer()) -> ok | {error, term()}.
-send_rate_limited(Socket, RetryAfterSecs) ->
+%% A `429` (over the per-peer rate) or `503` (shed at the in-flight
+%% ceiling) that tells the client when to come back, then closes.
+-spec send_retry_later(roadrunner_transport:socket(), 429 | 503, pos_integer()) ->
+    ok | {error, term()}.
+send_retry_later(Socket, Status, RetryAfterSecs) ->
     Resp = roadrunner_http1:response(
-        429,
+        Status,
         [
             {~"content-length", ~"0"},
             {~"connection", ~"close"},

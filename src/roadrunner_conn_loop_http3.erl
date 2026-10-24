@@ -1316,7 +1316,8 @@ with_body(Req, _Body, _StreamId, _State) ->
     Req.
 
 %% Acquire the listener-wide in-flight slot and spawn the stream worker, or
-%% refuse with retry-safe H3_REQUEST_REJECTED at the ceiling.
+%% refuse with retry-safe H3_REQUEST_REJECTED at the ceiling (a `503` with
+%% `Retry-After` on a shed listener).
 -spec dispatch_with_slot(#h3{}, non_neg_integer(), roadrunner_req:request()) ->
     handle_result().
 dispatch_with_slot(#h3{streams = Streams} = State1, StreamId, Req) ->
@@ -1354,7 +1355,12 @@ dispatch_with_slot(#h3{streams = Streams} = State1, StreamId, Req) ->
             %% stream (retry-safe H3_REQUEST_REJECTED) without spawning
             %% a worker.
             ok = throttle_stream(State1),
-            reset_and_drop(State1, StreamId, ?H3_REQUEST_REJECTED)
+            reset_and_drop(State1, StreamId, ?H3_REQUEST_REJECTED);
+        {shed, RetryAfter} ->
+            %% Over the ceiling on a shed listener: 503 + Retry-After, no
+            %% worker spawned, so the client waits instead of retrying.
+            ok = throttle_stream(State1),
+            retry_later(State1, StreamId, 503, RetryAfter)
     end.
 
 %% A dispatched request leaves the streams map, which only holds requests
@@ -1450,17 +1456,24 @@ throttle_stream(#h3{proto_opts = #{throttled_counter := Counter}, listener_name 
 -spec rate_limit_refused(#h3{}, non_neg_integer(), roadrunner_req:request()) ->
     ok | {refused, #h3{}}.
 rate_limit_refused(
-    #h3{rate_limit = RateLimit, conn = Conn, listener_name = ListenerName} = State, StreamId, Req
+    #h3{rate_limit = RateLimit, listener_name = ListenerName} = State, StreamId, Req
 ) ->
     case roadrunner_conn:rate_limit(RateLimit, Req, ListenerName) of
         allow ->
             ok;
         {deny, RetryAfter} ->
-            ok = roadrunner_http3_stream_worker:send_buffered(
-                Conn, StreamId, 429, [{~"retry-after", integer_to_binary(RetryAfter)}], ~""
-            ),
-            {refused, drop_stream(State, StreamId)}
+            {refused, retry_later(State, StreamId, 429, RetryAfter)}
     end.
+
+%% A bodyless `429` (over the per-peer rate) or `503` (shed at the
+%% in-flight ceiling) with `Retry-After` as a buffered response, then the
+%% stream dropped.
+-spec retry_later(#h3{}, non_neg_integer(), 429 | 503, pos_integer()) -> #h3{}.
+retry_later(#h3{conn = Conn} = State, StreamId, Status, RetryAfter) ->
+    ok = roadrunner_http3_stream_worker:send_buffered(
+        Conn, StreamId, Status, [{~"retry-after", integer_to_binary(RetryAfter)}], ~""
+    ),
+    drop_stream(State, StreamId).
 
 %% A connection error (RFC 9114 §8): close the QUIC connection with the
 %% h3 error code + reason, then run the normal teardown. The peer sees
