@@ -127,11 +127,6 @@ advisory or malformed cases the server currently tolerates or omits.
   transfer that fills a non-zero window — already emits the frame on the
   flow's blocked transition; this remainder is the never-sent-a-byte case a
   conformant peer never produces — small
-- Start a key update of our own before the AEAD confidentiality limit (RFC
-  9001 §6.6: 2^23 packets per AES-128-GCM key, about 10 GB of full packets on
-  one connection): count the packets sealed with each send key and update
-  before the limit, within the §6.1 rules (handshake confirmed, previous
-  update acknowledged) and §6.5's three-PTO wait — medium
 - Hold back 1-RTT packets until the handshake completes (RFC 9001 §5.7): the
   client's 1-RTT keys are installed with the server's first flight, so a
   1-RTT packet that arrives ahead of the client Finished is decrypted,
