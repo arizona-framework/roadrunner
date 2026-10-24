@@ -106,20 +106,23 @@
 %% each stream.
 -define(INITIAL_WINDOW, 65535).
 
-%% Default refill threshold + recv-window peaks. RFC 9113 doesn't
-%% mandate any of these — they're policy. The defaults match the
-%% RFC 9113 §6.9.2 baseline (65535 for both windows; the threshold
-%% is half of that, the original heuristic).
-%% `roadrunner_listener:opts()` carries the override knobs as nested
-%% `http2` sub-opts (`conn_window`, `stream_window`,
-%% `window_refill_threshold`) — bumping the windows is the standard
-%% tuning for non-LAN RTTs (window/RTT bounds per-stream
-%% throughput). Defaults here mirror those baselines for static
-%% record initialization; runtime values come from the proto_opts
+%% Default recv-window peaks. RFC 9113 doesn't mandate them; they're
+%% policy. A stream's upload rate is bounded by its window over the round
+%% trip, so the RFC 9113 §6.9.2 baseline of 65535 caps one upload at about
+%% 0.6 MB/s over a 100 ms RTT; 1 MB per stream keeps pace with HTTP/1.1
+%% there, and 4 MB per connection lets a few uploads run at that rate side
+%% by side. Credit for a buffered (auto-mode) body is returned as it
+%% arrives, so these bound the rate, not the memory a body takes, which
+%% `max_content_length` bounds; in manual mode a stream holds at most its
+%% window until its worker reads. Each window is refilled once it drops
+%% below half its peak, unless `window_refill_threshold` sets one
+%% threshold for both. `roadrunner_listener:opts()` carries the override
+%% knobs as nested `http2` sub-opts (`conn_window`, `stream_window`,
+%% `window_refill_threshold`). Defaults here mirror the listener's for
+%% static record initialization; runtime values come from the proto_opts
 %% map populated by `roadrunner_listener:normalize_protocols/1`.
--define(DEFAULT_CONN_RECV_WINDOW, 65535).
--define(DEFAULT_STREAM_RECV_WINDOW, 65535).
--define(DEFAULT_WINDOW_REFILL_THRESHOLD, 32_768).
+-define(DEFAULT_CONN_RECV_WINDOW, 4_194_304).
+-define(DEFAULT_STREAM_RECV_WINDOW, 1_048_576).
 
 %% Hard upper bound on a flow-control window per RFC 9113 §6.9.1
 %% (signed 31-bit). Increments that would push past this are a
@@ -245,15 +248,17 @@
     %% starts at 65535 (RFC default) and is bumped to
     %% `recv_window_peak` via an early `WINDOW_UPDATE(0, _)` in
     %% `handshake/1` when the peak is greater. Refilled to the peak
-    %% whenever it drops below `recv_window_threshold`.
+    %% whenever it drops below `recv_window_threshold`; a stream's to
+    %% its peak below `stream_recv_window_threshold`.
     conn_send_window = 65535 :: integer(),
     conn_recv_window = 65535 :: non_neg_integer(),
-    %% Configured peaks + refill threshold. Read from proto_opts at
+    %% Configured peaks + refill thresholds. Read from proto_opts at
     %% `enter/6`. See the `?DEFAULT_*` macros above for the policy
     %% baseline + the listener moduledoc for the override knobs.
     recv_window_peak = ?DEFAULT_CONN_RECV_WINDOW :: pos_integer(),
     stream_recv_window_peak = ?DEFAULT_STREAM_RECV_WINDOW :: pos_integer(),
-    recv_window_threshold = ?DEFAULT_WINDOW_REFILL_THRESHOLD :: pos_integer(),
+    recv_window_threshold = ?DEFAULT_CONN_RECV_WINDOW div 2 :: pos_integer(),
+    stream_recv_window_threshold = ?DEFAULT_STREAM_RECV_WINDOW div 2 :: pos_integer(),
     %% Max concurrent client-initiated streams: advertised in our SETTINGS
     %% and enforced in `on_headers/5`. Read from proto_opts at `enter/6`.
     max_concurrent_streams = ?MAX_CONCURRENT_STREAMS :: pos_integer(),
@@ -368,9 +373,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
     %% directly stay short.
     ConnPeak = maps:get(http2_conn_window, ProtoOpts, ?DEFAULT_CONN_RECV_WINDOW),
     StreamPeak = maps:get(http2_stream_window, ProtoOpts, ?DEFAULT_STREAM_RECV_WINDOW),
-    Threshold = maps:get(
-        http2_window_refill_threshold, ProtoOpts, ?DEFAULT_WINDOW_REFILL_THRESHOLD
-    ),
+    {ConnThreshold, StreamThreshold} = refill_thresholds(ProtoOpts, ConnPeak, StreamPeak),
     MaxStreams = maps:get(http2_max_concurrent_streams, ProtoOpts, ?MAX_CONCURRENT_STREAMS),
     MaxHeaderBlock = maps:get(http2_max_header_block, ProtoOpts, ?MAX_HEADER_BLOCK),
     %% Decoded-list cap defaults to 2x the (possibly overridden) encoded cap,
@@ -398,7 +401,8 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         buffer = Buffered,
         recv_window_peak = ConnPeak,
         stream_recv_window_peak = StreamPeak,
-        recv_window_threshold = Threshold,
+        recv_window_threshold = ConnThreshold,
+        stream_recv_window_threshold = StreamThreshold,
         max_concurrent_streams = MaxStreams,
         max_header_block = MaxHeaderBlock,
         max_header_list_size = MaxHeaderListSize,
@@ -416,6 +420,16 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         idle_timeout = IdleTimeout
     },
     handshake(State).
+
+%% The connection and stream refill thresholds: the configured
+%% `window_refill_threshold` for both, else half of each window's peak
+%% (at least 1, so a window of 1 byte still refills once spent).
+-spec refill_thresholds(roadrunner_conn:proto_opts(), pos_integer(), pos_integer()) ->
+    {pos_integer(), pos_integer()}.
+refill_thresholds(#{http2_window_refill_threshold := Threshold}, _ConnPeak, _StreamPeak) ->
+    {Threshold, Threshold};
+refill_thresholds(_ProtoOpts, ConnPeak, StreamPeak) ->
+    {max(1, ConnPeak div 2), max(1, StreamPeak div 2)}.
 
 %% =============================================================================
 %% Handshake — RFC 9113 §3.4
@@ -1462,7 +1476,7 @@ build_stream_refill(
     #loop{
         streams = Streams,
         stream_recv_window_peak = Peak,
-        recv_window_threshold = Threshold
+        stream_recv_window_threshold = Threshold
     } = State,
     StreamId
 ) ->

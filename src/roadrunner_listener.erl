@@ -471,21 +471,18 @@ ops-tuning rationale.
     %% HTTP/2 tunables live under the `http2` tuple's opts map:
     %%
     %% - `conn_window` — connection-level receive window peak (bytes,
-    %%   `1..2^31-1`). RFC 9113 default `65535`; values above the RFC
-    %%   default emit an early `WINDOW_UPDATE(0, peak - 65535)` after
-    %%   the server SETTINGS. Useful for upload-heavy workloads on
-    %%   non-LAN RTTs. Reference points: gun 8 MB, Go net/http2 1 GB,
-    %%   h2o 16 MB+, Mint 16 MB. Worst-case memory is
-    %%   `max_clients × peak`.
+    %%   `1..2^31-1`). Default `4194304` (4 MB), sent as an early
+    %%   `WINDOW_UPDATE(0, peak - 65535)` after the server SETTINGS
+    %%   (RFC 9113 §6.9.2 starts it at `65535`).
     %% - `stream_window` — stream-level receive window peak (bytes,
     %%   `1..2^31-1`). Advertised via `SETTINGS_INITIAL_WINDOW_SIZE`.
-    %%   Default `65535`. Setting above `conn_window` is allowed but
+    %%   Default `1048576` (1 MB). An upload runs at most one window
+    %%   per round trip. Setting above `conn_window` is allowed but
     %%   not useful — the conn-level peak is the binding constraint.
     %% - `window_refill_threshold` — refill trigger (bytes,
-    %%   `pos_integer`). When the remaining window drops below this,
-    %%   the conn refills back to the peak. Lower threshold = fewer
-    %%   `WINDOW_UPDATE` frames per byte consumed but a smaller live
-    %%   window between refills. Default `32768`.
+    %%   `pos_integer`). When a window drops below this, the conn
+    %%   refills it back to its peak. Unset (the default), each window
+    %%   refills below half its own peak.
     %% - `max_concurrent_streams` — cap on concurrent client-initiated
     %%   streams per connection (`pos_integer`), advertised in our
     %%   SETTINGS; HEADERS that would exceed it get
@@ -562,19 +559,24 @@ cookies / tracing metadata); lower them to tighten the attack surface.
 HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
 
 - `conn_window` — connection-level receive window peak in bytes
-  (`1..2^31-1`). RFC 9113 default `65535`; values above the
-  default emit an early `WINDOW_UPDATE(0, peak - 65535)` after
-  the server SETTINGS. Worst-case memory is
-  `max_clients × peak`.
+  (`1..2^31-1`). Default `4194304` (4 MB), sent as an early
+  `WINDOW_UPDATE(0, peak - 65535)` after the server SETTINGS
+  (RFC 9113 §6.9.2 starts it at `65535`).
 - `stream_window` — stream-level receive window peak in bytes
   (`1..2^31-1`). Advertised via `SETTINGS_INITIAL_WINDOW_SIZE`.
-  Default `65535`. Setting above `conn_window` is allowed but
-  not useful — the conn-level peak is the binding constraint.
-- `window_refill_threshold` — refill trigger in bytes. When the
-  remaining window drops below this, the conn refills back to
-  the peak. Lower threshold = fewer `WINDOW_UPDATE` frames per
-  byte consumed but a smaller live window between refills.
-  Default `32768`.
+  Default `1048576` (1 MB). An upload sends at most one window per
+  round trip, so this bounds its rate: 1 MB keeps pace with
+  HTTP/1.1 over a 100 ms round trip, where the RFC's `65535`
+  allows about 0.6 MB/s. A buffered body's credit is returned as
+  it arrives, so the windows bound the rate, not the memory a body
+  takes (`max_content_length` does); with manual body reading a
+  stream holds at most its window until the handler reads it.
+  Setting above `conn_window` is allowed but not useful — the
+  conn-level peak is the binding constraint.
+- `window_refill_threshold` — refill trigger in bytes. When a
+  window drops below this, the conn refills it back to its peak.
+  Unset (the default), each window refills once it drops below
+  half its own peak.
 - `max_concurrent_streams` — cap on concurrent client-initiated
   streams per connection, advertised via
   `SETTINGS_MAX_CONCURRENT_STREAMS`. HEADERS that would exceed it
@@ -1841,9 +1843,8 @@ flatten_http1_opts(Entries) ->
 -spec http2_defaults() -> http2_opts().
 http2_defaults() ->
     #{
-        conn_window => 65535,
-        stream_window => 65535,
-        window_refill_threshold => 32768,
+        conn_window => 4194304,
+        stream_window => 1048576,
         max_concurrent_streams => 100,
         max_header_block => 16384,
         %% Placeholder: resolved to `2 * max_header_block` when not set
@@ -1856,7 +1857,9 @@ validate_http2_opts(Opts, Raw) ->
     Defaults = http2_defaults(),
     Merged = maps:fold(
         fun(K, V, Acc) ->
-            case is_map_key(K, Defaults) of
+            %% `window_refill_threshold` has no default entry: unset,
+            %% each window refills at half its own peak.
+            case K =:= window_refill_threshold orelse is_map_key(K, Defaults) of
                 false -> error({invalid_listener_opt, protocols, Raw});
                 true when is_integer(V), V >= 1, V =< 16#7FFFFFFF -> Acc#{K => V};
                 true -> error({invalid_listener_opt, protocols, Raw})
@@ -1884,22 +1887,27 @@ flatten_http2_opts(Entries) ->
     case lists:keyfind(http2, 1, Entries) of
         false ->
             #{};
-        {http2, #{
-            conn_window := Conn,
-            stream_window := Stream,
-            window_refill_threshold := Threshold,
-            max_concurrent_streams := MaxStreams,
-            max_header_block := MaxHeaderBlock,
-            max_header_list_size := MaxHeaderListSize
-        }} ->
+        {http2,
             #{
+                conn_window := Conn,
+                stream_window := Stream,
+                max_concurrent_streams := MaxStreams,
+                max_header_block := MaxHeaderBlock,
+                max_header_list_size := MaxHeaderListSize
+            } = Http2} ->
+            Flat = #{
                 http2_conn_window => Conn,
                 http2_stream_window => Stream,
-                http2_window_refill_threshold => Threshold,
                 http2_max_concurrent_streams => MaxStreams,
                 http2_max_header_block => MaxHeaderBlock,
                 http2_max_header_list_size => MaxHeaderListSize
-            }
+            },
+            case Http2 of
+                #{window_refill_threshold := Threshold} ->
+                    Flat#{http2_window_refill_threshold => Threshold};
+                #{} ->
+                    Flat
+            end
     end.
 
 -spec http3_defaults() -> http3_opts().
