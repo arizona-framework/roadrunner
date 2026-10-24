@@ -1546,10 +1546,15 @@ drain_send(Now, Levels, State, Acc) ->
             CcOk =
                 not AckEliciting orelse Probes > 0 orelse
                     roadrunner_quic_cc_newreno:can_send(total_bytes_in_flight(State), Cc),
-            case roadrunner_quic_amp:can_send(byte_size(Datagram), Amp) andalso CcOk of
-                false ->
+            case {roadrunner_quic_amp:can_send(byte_size(Datagram), Amp), CcOk} of
+                {false, _} ->
                     {State, Acc};
-                true ->
+                {true, false} ->
+                    %% The window holds the data back, but not an ACK riding
+                    %% with it: send that alone, or a peer waiting on it and a
+                    %% probe timeout waiting behind its deadline both stall.
+                    send_ack_only(Now, Levels, State, Acc);
+                {true, true} ->
                     Recorded = record_sent(Now, Sent, Built),
                     Amp1 = roadrunner_quic_amp:sent(byte_size(Datagram), Amp),
                     Probes1 =
@@ -1564,6 +1569,36 @@ drain_send(Now, Levels, State, Acc) ->
                         [{send, Datagram} | Acc]
                     )
             end
+    end.
+
+%% The ACK-only packet for the first level with an ACK due, sent while the
+%% congestion window holds back the data it would have carried (RFC 9002 §7:
+%% ACK-only packets are not congestion controlled).
+-spec send_ack_only(integer(), [level()], t(), [effect()]) -> {t(), [effect()]}.
+send_ack_only(Now, Levels, State, Acc) ->
+    case build_ack_only(Levels, Now, State) of
+        none ->
+            {State, Acc};
+        {Entries, Built} ->
+            #state{peer_scid = DCID, scid = SCID, amp = Amp} = State,
+            {Datagram, Sent} = roadrunner_quic_send:datagram(Entries, DCID, SCID),
+            Recorded = record_sent(Now, Sent, Built),
+            Amp1 = roadrunner_quic_amp:sent(byte_size(Datagram), Amp),
+            {Recorded#state{amp = Amp1}, [{send, Datagram} | Acc]}
+    end.
+
+-spec build_ack_only([level()], integer(), t()) -> none | {#{level() => map()}, t()}.
+build_ack_only([], _Now, _State) ->
+    none;
+build_ack_only([Level | Rest], Now, State) ->
+    #space{ack = Ack0} = Space = space(Level, State),
+    case roadrunner_quic_ack:needs_ack(Ack0) andalso ack_due(Level, Now, Space) of
+        true ->
+            {AckFrames, Ack} = take_ack(Ack0, Now),
+            {Entry, Built} = build_entry(Level, AckFrames, Space#space{ack = Ack}, State),
+            {#{Level => Entry}, Built};
+        false ->
+            build_ack_only(Rest, Now, State)
     end.
 
 %% Build ONE packet for the highest-priority present level that has
