@@ -1827,6 +1827,23 @@ return_to_prev(#state{prev_path = {Addr, Seq, PathDcid}, peer_cid_seq = Left} = 
     }),
     release_peer_cid(Left, Returned).
 
+%% Keep the path a failed validation leaves as the address the client
+%% probes from, with its client id and anti-amplification account (RFC 9000
+%% §8.1, §9.5), instead of retiring the id. A client that really moved
+%% there, whose challenges or responses were lost, keeps sending from it,
+%% and its next non-probing packet moves the connection back with that id.
+%% Retiring it would be sent on the old path, which such a client no longer
+%% reads, so no replacement would come and the connection could never move
+%% again. It takes over from any earlier probing address, whose id is
+%% retired unless another path uses it.
+-spec keep_as_probe(t()) -> t().
+keep_as_probe(#state{peer = Addr, peer_cid_seq = Seq, amp = Amp, probe_path = Old} = State) ->
+    Kept = State#state{probe_path = {Addr, Seq, Amp}},
+    case Old of
+        {_OldAddr, OldSeq, _OldAmp} -> release_peer_cid(OldSeq, Kept);
+        undefined -> Kept
+    end.
+
 %% Start (or restart, for the path MTU) the validation of the current path
 %% with a fresh PATH_CHALLENGE (RFC 9000 §8.2.1). A challenge goes out again
 %% every interval, no more often than a probe timeout would allow (§9.4
@@ -2844,7 +2861,15 @@ drain_built(Now, Levels, State, Acc) ->
                     roadrunner_quic_cc_newreno:can_send(total_bytes_in_flight(State), Cc),
             case {roadrunner_quic_amp:can_send(byte_size(Datagram), Amp), CcOk} of
                 {false, _} ->
-                    {State, Acc};
+                    %% The anti-amplification limit holds the datagram back
+                    %% until the client sends more (RFC 9000 §8.1). An ACK it
+                    %% carried still goes alone if that fits: a due ACK left
+                    %% unsent keeps its deadline in the past, which would
+                    %% re-arm the timer at once and starve the path
+                    %% validation's own timer behind it.
+                    send_ack_only(
+                        Now, Levels, State#state{amp = roadrunner_quic_amp:block(Amp)}, Acc
+                    );
                 {true, false} ->
                     %% The window holds the data back, but not an ACK riding
                     %% with it: send that alone, or a peer waiting on it and a
@@ -2868,8 +2893,9 @@ drain_built(Now, Levels, State, Acc) ->
     end.
 
 %% The ACK-only packet for the first level with an ACK due, sent while the
-%% congestion window holds back the data it would have carried (RFC 9002 §7:
-%% ACK-only packets are not congestion controlled).
+%% congestion window (RFC 9002 §7: ACK-only packets are not congestion
+%% controlled) or the anti-amplification limit holds back the data it would
+%% have carried. The limit still bounds the ACK alone (RFC 9000 §8.1 MUST).
 -spec send_ack_only(integer(), [level()], t(), [effect()]) -> {t(), [effect()]}.
 send_ack_only(Now, Levels, State, Acc) ->
     case build_ack_only(Levels, Now, State) of
@@ -2878,9 +2904,14 @@ send_ack_only(Now, Levels, State, Acc) ->
         {Entries, Built} ->
             #state{peer_scid = DCID, scid = SCID, amp = Amp} = State,
             {Datagram, Sent} = roadrunner_quic_send:datagram(Entries, DCID, SCID),
-            Recorded = record_sent(Now, Sent, Built),
-            Amp1 = roadrunner_quic_amp:sent(byte_size(Datagram), Amp),
-            {Recorded#state{amp = Amp1}, [{send, Datagram} | Acc]}
+            case roadrunner_quic_amp:can_send(byte_size(Datagram), Amp) of
+                true ->
+                    Recorded = record_sent(Now, Sent, Built),
+                    Amp1 = roadrunner_quic_amp:sent(byte_size(Datagram), Amp),
+                    {Recorded#state{amp = Amp1}, [{send, Datagram} | Acc]};
+                false ->
+                    {State, Acc}
+            end
     end.
 
 -spec build_ack_only([level()], integer(), t()) -> none | {#{level() => map()}, t()}.
@@ -3241,7 +3272,7 @@ path_timeout(Now, #state{validation = #validation{abandon_at = At}, prev_path = 
     Now >= At
 ->
     case Prev of
-        {_Addr, _Seq, _PathDcid} -> send_pass(Now, return_to_prev(State));
+        {_Addr, _Seq, _PathDcid} -> send_pass(Now, return_to_prev(keep_as_probe(State)));
         undefined -> close_silently(no_viable_path, State)
     end;
 path_timeout(
@@ -3304,27 +3335,39 @@ timer_effects(State) ->
     {Kind, AtMs} = earliest_deadline(State),
     [{arm_timer, Kind, AtMs}].
 
+%% While the anti-amplification limit holds a datagram back, neither a
+%% probe timeout nor a delayed ACK is armed: nothing more can be sent until
+%% the client sends again (RFC 9002 §6.2.2.1 MUST NOT arm the PTO), and that
+%% datagram runs a send pass of its own. A deadline already past would
+%% otherwise fire at once, again and again.
 -spec earliest_deadline(t()) -> {pto | idle | ack | path, integer()}.
-earliest_deadline(#state{idle_deadline = Idle, validation = Validation} = State) ->
+earliest_deadline(#state{amp = Amp} = State) ->
+    earliest_deadline(roadrunner_quic_amp:blocked(Amp), State).
+
+-spec earliest_deadline(boolean(), t()) -> {pto | idle | ack | path, integer()}.
+earliest_deadline(true, #state{idle_deadline = Idle, validation = Validation}) ->
+    path_or(Validation, {idle, Idle});
+earliest_deadline(false, #state{idle_deadline = Idle, validation = Validation} = State) ->
     Timed =
         case earliest_pto(State) of
             undefined -> {idle, Idle};
             PtoAt when PtoAt =< Idle -> {pto, PtoAt};
             _PtoAt -> {idle, Idle}
         end,
-    %% A path validation in progress challenges again on its own timer, which
-    %% wins a tie: the probe timeout due with it re-arms at once after it.
-    Nearest =
-        case {Validation, Timed} of
-            {#validation{next_at = PathAt}, {_TimedKind, TimedAt}} when PathAt =< TimedAt ->
-                {path, PathAt};
-            _ ->
-                Timed
-        end,
+    Nearest = path_or(Validation, Timed),
     case {ack_deadline(State), Nearest} of
         {AckAt, {_Kind, At}} when is_integer(AckAt), AckAt < At -> {ack, AckAt};
         _ -> Nearest
     end.
+
+%% A path validation in progress challenges again on its own timer, which
+%% wins a tie: the probe timeout due with it re-arms at once after it.
+-spec path_or(undefined | #validation{}, {pto | idle, integer()}) ->
+    {pto | idle | path, integer()}.
+path_or(#validation{next_at = PathAt}, {_TimedKind, TimedAt}) when PathAt =< TimedAt ->
+    {path, PathAt};
+path_or(_Validation, Timed) ->
+    Timed.
 
 %% When a delayed 1-RTT ACK must go out, or `undefined` with none waiting.
 -spec ack_deadline(t()) -> integer() | undefined.
