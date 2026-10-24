@@ -34,8 +34,12 @@
 %% authenticated, so a forged packet with a flipped Key Phase bit changes
 %% nothing; the commit moves both directions to the next generation and
 %% flips the Key Phase bit our packets carry, and the previous receive keys
-%% stay for three PTOs for reordered packets. The server does not start a
-%% key update of its own.
+%% stay for three PTOs for reordered packets. The server starts a key update
+%% of its own well before its send keys reach the AEAD confidentiality limit
+%% (§6.6): only its send keys move then, and the receive keys follow when
+%% the peer's response arrives in the new phase. If the limit comes with no
+%% update allowed, the connection closes with AEAD_LIMIT_REACHED rather than
+%% overuse the keys.
 %%
 %% Congestion control and probe transmission are deferred: the connection
 %% sends within the anti-amplification and flow limits (the MUSTs) and a
@@ -64,6 +68,10 @@
 %% Exported for direct eunit branch coverage of the AEAD integrity limit
 %% (RFC 9001 §6.6): no test can forge the 2^52 packets that reach it.
 -export([auth_failed/3]).
+%% Exported for direct eunit branch coverage of the AEAD confidentiality limit
+%% (RFC 9001 §6.6): no test can seal the 2^22 packets that start a key update
+%% of our own, nor the 2^23 that close the connection.
+-export([key_limit/3]).
 
 -export_type([t/0, config/0, effect/0, event/0, info/0]).
 
@@ -92,6 +100,11 @@
 %% AEAD_AES_128_GCM and AEAD_CHACHA20_POLY1305.
 -define(AES_128_GCM_INTEGRITY_LIMIT, (1 bsl 52)).
 -define(CHACHA20_POLY1305_INTEGRITY_LIMIT, (1 bsl 36)).
+%% The AEAD confidentiality limits (RFC 9001 §6.6): packets one key may
+%% protect. AEAD_CHACHA20_POLY1305's is above the 2^62 packet numbers there
+%% are, so no connection reaches it and it is kept as that bound.
+-define(AES_128_GCM_CONFIDENTIALITY_LIMIT, (1 bsl 23)).
+-define(CHACHA20_POLY1305_CONFIDENTIALITY_LIMIT, (1 bsl 62)).
 %% TLS handshake message types carried in CRYPTO (RFC 8446 §4).
 -define(CLIENT_HELLO, 1).
 -define(FINISHED, 20).
@@ -128,8 +141,10 @@
     recv_keys :: #{level() => roadrunner_quic_recv:keys()},
     %% Keys to protect outgoing packets (the server's), by level.
     send_keys :: #{level() => roadrunner_quic_keys:keys()},
-    %% The 1-RTT Key Phase bit (RFC 9001 §6): the one the peer's current
-    %% keys use and our packets carry. A peer-initiated key update flips it.
+    %% The 1-RTT Key Phase bit our packets carry (RFC 9001 §6): that of the
+    %% current send keys. Any key update flips it. The receive keys hold the
+    %% peer's phase (`phase` in `recv_keys`); the two differ only while a key
+    %% update of ours waits for the peer's response.
     key_phase = 0 :: 0 | 1,
     %% The 1-RTT secrets each key update advances with "quic ku" (§6.1): the
     %% client's for the next receive generation (the `next` keys in
@@ -150,6 +165,16 @@
     %% When the previous 1-RTT receive generation is discarded (§6.5), or
     %% `undefined` with none kept.
     prev_keys_until = undefined :: integer() | undefined,
+    %% 1-RTT packets protected with the current send keys, for the AEAD
+    %% confidentiality limit (§6.6).
+    sealed = 0 :: non_neg_integer(),
+    %% The first 1-RTT packet number sent with the current send keys: an ACK
+    %% of it or a later packet shows the peer has them (§6.1).
+    send_phase_pn = 0 :: non_neg_integer(),
+    %% When we may start a key update of our own: three PTOs after the first
+    %% ACK of a packet sent with the current keys (§6.1, §6.5), `undefined`
+    %% until that ACK arrives.
+    own_update_at = undefined :: integer() | undefined,
     %% Received packets that failed authentication, across all keys and
     %% levels, for the AEAD integrity limit (§6.6).
     auth_failures = 0 :: non_neg_integer(),
@@ -760,6 +785,15 @@ process_outcome(_Now, _Outcome, #state{phase = Phase} = State) when
     %% nor discard (via validate_on_handshake) the space and keys a pending local
     %% close still needs to send its frame.
     State;
+process_outcome(
+    Now,
+    {ok, #{generation := next, pn := PN} = Decoded},
+    #state{key_phase = Phase, recv_keys = #{application := #{phase := RecvPhase}}} = State
+) when Phase =/= RecvPhase ->
+    %% Our send keys are a generation ahead: this is the peer's response to
+    %% our own key update (RFC 9001 §6.2), its send keys now the ones ours
+    %% moved to. Only the receive keys move; the update is not a new one.
+    process_packet(Now, Decoded, promote_recv_keys(Now, PN, State));
 process_outcome(Now, {ok, #{generation := next, pn := PN} = Decoded}, State) ->
     %% The packet authenticated with the next 1-RTT keys, so the peer has
     %% updated its keys (RFC 9001 §6.2). Only now, after that trial decryption
@@ -823,37 +857,39 @@ key_update_permitted(#state{phase = connected, update_acked = true}) -> true;
 key_update_permitted(#state{}) -> false.
 
 %% Commit a peer key update (RFC 9001 §6.2) once a packet has authenticated
-%% with the next keys. They become the current receive keys; the current
-%% ones stay as the previous generation for packets reordered from before
-%% the update, until three PTOs from now (§6.5), with the packet that began
-%% the phase as the bound below which they apply. The generation after the
-%% new one is derived now, so it is ready before the peer's next update and
-%% no later packet's timing depends on deriving keys (§6.3, §9.5). The send
-%% keys move to the next generation in the same step, before any ACK of this
-%% packet can go out (§6.2), and the Key Phase bit flips. The header-
-%% protection keys stay (§6.1).
+%% with the next keys: the receive keys move to the next generation, and the
+%% send keys follow in the same step, before any ACK of this packet can go
+%% out (§6.2).
 -spec commit_key_update(integer(), non_neg_integer(), t()) -> t().
-commit_key_update(
+commit_key_update(Now, PN, State) ->
+    advance_send_keys(promote_recv_keys(Now, PN, State)).
+
+%% Move the receive keys to the next generation once a packet from the peer
+%% authenticates with them, on its own update or on its response to ours. The
+%% next keys become the current ones; the current ones stay as the previous
+%% generation for packets reordered from before the update, until three PTOs
+%% from now (RFC 9001 §6.5), with the packet that began the phase as the
+%% bound below which they apply. The generation after the new one is derived
+%% now, so it is ready before the peer's next update and no later packet's
+%% timing depends on deriving keys (§6.3, §9.5). The peer may update again
+%% only once our ACK of this new phase goes out (§6.1), so that is awaited
+%% afresh. The header-protection keys stay (§6.1).
+-spec promote_recv_keys(integer(), non_neg_integer(), t()) -> t().
+promote_recv_keys(
     Now,
     PN,
     #state{
         recv_keys = #{application := Recv} = RecvKeys,
-        send_keys = #{application := Send} = SendKeys,
         recv_secret = RecvSecret,
-        send_secret = SendSecret,
-        aead = Aead,
-        key_phase = Phase
+        aead = Aead
     } = State
 ) ->
-    #{key := Key, iv := IV, next := #{key := NextKey, iv := NextIV}} = Recv,
+    #{key := Key, iv := IV, phase := Phase, next := #{key := NextKey, iv := NextIV}} = Recv,
     {RecvSecret1, AfterNext} = roadrunner_quic_keys:update(Aead, RecvSecret),
-    {SendSecret1, SendNext} = roadrunner_quic_keys:update(Aead, SendSecret),
-    #{key := SendKey, iv := SendIV} = roadrunner_quic_keys:for_connection(SendNext, seal),
-    NewPhase = 1 - Phase,
     Recv1 = Recv#{
         key := NextKey,
         iv := NextIV,
-        phase := NewPhase,
+        phase := 1 - Phase,
         next := roadrunner_quic_keys:for_connection(AfterNext, open),
         prev => #{key => Key, iv => IV},
         prev_below => PN
@@ -861,13 +897,100 @@ commit_key_update(
     #space{loss = Loss} = space(application, State),
     State#state{
         recv_keys = RecvKeys#{application := Recv1},
-        send_keys = SendKeys#{application := Send#{key := SendKey, iv := SendIV}},
         recv_secret = RecvSecret1,
-        send_secret = SendSecret1,
-        key_phase = NewPhase,
         update_acked = false,
         prev_keys_until = Now + 3 * roadrunner_quic_loss:get_pto(Loss)
     }.
+
+%% Move the send keys to the next generation (RFC 9001 §6.1) and flip the
+%% Key Phase bit our packets carry: every later packet is protected with the
+%% new keys (§6.4). The count toward the confidentiality limit starts over
+%% for them (§6.6), and the next packet number is the first of the new phase,
+%% which the peer must acknowledge before we may update again (§6.1).
+-spec advance_send_keys(t()) -> t().
+advance_send_keys(
+    #state{
+        send_keys = #{application := Send} = SendKeys,
+        send_secret = SendSecret,
+        aead = Aead,
+        key_phase = Phase
+    } = State
+) ->
+    {SendSecret1, SendNext} = roadrunner_quic_keys:update(Aead, SendSecret),
+    #{key := SendKey, iv := SendIV} = roadrunner_quic_keys:for_connection(SendNext, seal),
+    #space{next_pn = NextPN} = space(application, State),
+    State#state{
+        send_keys = SendKeys#{application := Send#{key := SendKey, iv := SendIV}},
+        send_secret = SendSecret1,
+        key_phase = 1 - Phase,
+        sealed = 0,
+        send_phase_pn = NextPN,
+        own_update_at = undefined
+    }.
+
+%% Before each packet goes out, hold the current send keys to the AEAD
+%% confidentiality limit (RFC 9001 §6.6), given `Sealed` packets already
+%% protected with them (the state's own count; the tests pass a larger one).
+%% Halfway to the limit we start a key update of our own as soon as §6.1 and
+%% §6.5 allow one: that leaves the other half of the keys' budget, millions
+%% of packets, for the peer's ACK of the current phase and the three-PTO
+%% wait after it. If the limit comes first, the connection closes with
+%% AEAD_LIMIT_REACHED while one packet is left for the CONNECTION_CLOSE, so
+%% the keys never protect more than the limit (§6.6 RECOMMENDS closing before
+%% an update becomes impossible).
+-doc false.
+-spec key_limit(non_neg_integer(), integer(), t()) -> t().
+key_limit(Sealed, Now, #state{aead = Aead} = State) ->
+    case confidentiality_limit(Aead) of
+        Limit when Sealed < Limit bsr 1 ->
+            State;
+        Limit ->
+            case own_update_permitted(Now, State) of
+                true -> advance_send_keys(State);
+                false when Sealed < Limit - 1 -> State#state{sealed = Sealed};
+                false -> connection_fatal(application, aead_limit_reached, State)
+            end
+    end.
+
+-spec confidentiality_limit(roadrunner_quic_aead:cipher()) -> pos_integer().
+confidentiality_limit(aes_128_gcm) -> ?AES_128_GCM_CONFIDENTIALITY_LIMIT;
+confidentiality_limit(chacha20_poly1305) -> ?CHACHA20_POLY1305_CONFIDENTIALITY_LIMIT.
+
+%% RFC 9001 §6.1: we may start a key update only once the handshake is
+%% confirmed and the peer has acknowledged a packet sent with the current
+%% keys, and §6.5 asks for three PTOs after that ACK (`own_update_at`). The
+%% peer must also have answered our last update (its phase is ours again), or
+%% a second update would put our keys two generations ahead of what it can
+%% open.
+-spec own_update_permitted(integer(), t()) -> boolean().
+own_update_permitted(
+    Now,
+    #state{
+        phase = connected,
+        own_update_at = At,
+        key_phase = Phase,
+        recv_keys = #{application := #{phase := Phase}}
+    }
+) when is_integer(At), Now >= At ->
+    true;
+own_update_permitted(_Now, #state{}) ->
+    false.
+
+%% The first ACK of a 1-RTT packet sent with the current keys shows the peer
+%% has them (RFC 9001 §6.1); a key update of ours may follow three PTOs later
+%% (§6.5). The largest acknowledged packet is always among those the ACK
+%% acknowledges.
+-spec ack_of_send_phase(integer(), level(), non_neg_integer(), t()) -> t().
+ack_of_send_phase(
+    Now,
+    application,
+    Largest,
+    #state{phase = connected, own_update_at = undefined, send_phase_pn = First} = State
+) when Largest >= First ->
+    #space{loss = Loss} = space(application, State),
+    State#state{own_update_at = Now + 3 * roadrunner_quic_loss:get_pto(Loss)};
+ack_of_send_phase(_Now, _Level, _Largest, State) ->
+    State.
 
 %% Drop the previous 1-RTT receive keys once their three PTOs have passed
 %% (RFC 9001 §6.5): by then the peer has declared any packet from before the
@@ -1227,7 +1350,7 @@ process_ack(Now, Level, {ack, Largest, _, _, _, _} = Ack, State) ->
             %% RFC 9000 §13.1: an ACK for a packet never sent in this space.
             connection_fatal(Level, protocol_violation, State);
         Space ->
-            apply_ack(Now, Level, Ack, Space, State)
+            ack_of_send_phase(Now, Level, Largest, apply_ack(Now, Level, Ack, Space, State))
     end.
 
 -spec apply_ack(integer(), level(), tuple(), #space{}, t()) -> t().
@@ -1723,20 +1846,31 @@ deliver_stream(_Sid, _Deliverable, _FinReached, State) ->
 %% =============================================================================
 
 -spec send_pass(integer(), t()) -> {t(), [effect()]}.
-send_pass(Now, State) ->
-    {State1, RevSends} = drain_send(Now, State, []),
-    %% Release any parked send reply whose stream drained (or was aborted)
-    %% this pass. The release effects ride AFTER the reversed sends so the
-    %% bytes are on the wire before the worker is told it may send more
-    %% (`perform/3` folds effects left-to-right). This is the single choke
-    %% point: every flow / congestion relief (MAX_STREAM_DATA, MAX_DATA, an
-    %% ACK growing cwnd) runs in the datagram fold before `finish_datagram`
-    %% calls `send_pass`, so the scan here catches them all.
-    {State2, Releases} = release_drained(State1),
-    %% `drain_send` returns the send effects newest-first; reverse them into
-    %% order and fold the releases + the (single) timer effect onto the end in
-    %% the same pass, rather than a second traversal to append them.
-    {State2, lists:reverse(RevSends, Releases ++ timer_effects(State2))}.
+send_pass(Now, #state{phase = Before} = State) ->
+    case drain_send(Now, State, []) of
+        {#state{phase = Before} = State1, RevSends} ->
+            %% Release any parked send reply whose stream drained (or was
+            %% aborted) this pass. The release effects ride AFTER the reversed
+            %% sends so the bytes are on the wire before the worker is told it
+            %% may send more (`perform/3` folds effects left-to-right). This is
+            %% the single choke point: every flow / congestion relief
+            %% (MAX_STREAM_DATA, MAX_DATA, an ACK growing cwnd) runs in the
+            %% datagram fold before `finish_datagram` calls `send_pass`, so the
+            %% scan here catches them all.
+            {State2, Releases} = release_drained(State1),
+            %% `drain_send` returns the send effects newest-first; reverse them
+            %% into order and fold the releases + the (single) timer effect
+            %% onto the end in the same pass, rather than a second traversal
+            %% to append them.
+            {State2, lists:reverse(RevSends, Releases ++ timer_effects(State2))};
+        {State1, RevSends} ->
+            %% The send keys reached the confidentiality limit with no key
+            %% update allowed (`key_limit/3`): the connection closed mid-pass.
+            %% The close goes out after what the pass already sent, as it
+            %% would for a close found while folding a datagram.
+            {State2, Effects} = finish_datagram(Now, Before, State1),
+            {State2, lists:reverse(RevSends, Effects)}
+    end.
 
 %% Release each parked reply whose stream can no longer make progress toward
 %% draining: the stream is gone (pruned after its FIN flushed -> `ok`), its
@@ -1800,7 +1934,14 @@ drain_send(Now, State, Acc) ->
     drain_send(Now, present_levels(State), State, Acc).
 
 -spec drain_send(integer(), [level()], t(), [effect()]) -> {t(), [effect()]}.
-drain_send(Now, Levels, State, Acc) ->
+drain_send(Now, Levels, #state{sealed = Sealed, phase = Phase} = State0, Acc) ->
+    case key_limit(Sealed, Now, State0) of
+        #state{phase = Phase} = State -> drain_built(Now, Levels, State, Acc);
+        Closed -> {Closed, Acc}
+    end.
+
+-spec drain_built(integer(), [level()], t(), [effect()]) -> {t(), [effect()]}.
+drain_built(Now, Levels, State, Acc) ->
     case build_first(Levels, Now, State) of
         none ->
             {State, Acc};
@@ -2077,7 +2218,14 @@ stream_blocked_frame(Sid, blocked, StreamFlow) ->
 stream_blocked_frame(_Sid, ok, _StreamFlow) ->
     [].
 
+%% A 1-RTT packet counts toward its send keys' confidentiality limit (RFC
+%% 9001 §6.6); a datagram that does not go out returns the state from before
+%% it, so only packets sent are counted.
 -spec build_entry(level(), [roadrunner_quic_frame:frame()], #space{}, t()) -> {map(), t()}.
+build_entry(application, Frames, #space{next_pn = PN} = Space, #state{sealed = Sealed} = State) ->
+    Entry = entry(application, Frames, PN, State),
+    State1 = ack_in_phase(application, Frames, State#state{sealed = Sealed + 1}),
+    {Entry, put_space(application, Space#space{next_pn = PN + 1}, State1)};
 build_entry(Level, Frames, #space{next_pn = PN} = Space, State) ->
     Entry = entry(Level, Frames, PN, State),
     {Entry, put_space(Level, Space#space{next_pn = PN + 1}, ack_in_phase(Level, Frames, State))}.

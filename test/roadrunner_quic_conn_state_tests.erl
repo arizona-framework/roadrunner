@@ -2301,6 +2301,125 @@ chacha20_aead_integrity_limit_closes_test() ->
     ?assertEqual(connected, ?M:phase(?M:auth_failed(application, 1 bsl 36, State))),
     ?assertEqual(draining, ?M:phase(?M:auth_failed(application, (1 bsl 36) + 1, State))).
 
+%% RFC 9001 §6.6: halfway to the AES-128-GCM confidentiality limit of 2^23
+%% packets, once the peer has acknowledged a packet of the current phase and
+%% three PTOs have passed (§6.1, §6.5), the server starts a key update of its
+%% own: its packets go out under the next generation with the Key Phase bit
+%% flipped. The peer's response in the new phase moves only the receive keys,
+%% so the server's ACK of it stays on the generation it moved to rather than
+%% one further, and a later peer-initiated update still commits as usual.
+own_key_update_then_peer_update_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Later = ?NOW + 60000,
+    State1 = ?M:key_limit(1 bsl 22, Later, send_phase_acked(State, ClientApSecret)),
+    {State2, Effects2} = ?M:handle_send(self(), make_ref(), 0, ~"hello", true, Later, State1),
+    ?assertMatch(
+        [{ok, #{key_phase := 1, frames := [{stream, 0, 0, ~"hello", true}]}}],
+        app_packets(Effects2, generation_keys(ServerApSecret, 1))
+    ),
+    Response = phase_datagram([ping], 1, generation_keys(ClientApSecret, 1), 1),
+    {State3, _} = ?M:handle_datagram(Later, Response, State2),
+    ?assertEqual(connected, ?M:phase(State3)),
+    {State4, Effects4} = ?M:handle_timeout(Later + 20, ack, State3),
+    ?assertMatch(
+        [{ok, #{key_phase := 1, frames := [{ack, 1, _, 1, [], undefined}]}}],
+        app_packets(Effects4, generation_keys(ServerApSecret, 1))
+    ),
+    Again = phase_datagram([ping], 2, generation_keys(ClientApSecret, 2), 0),
+    {State5, _} = ?M:handle_datagram(Later + 30, Again, State4),
+    ?assertEqual(connected, ?M:phase(State5)),
+    {_State6, Effects6} = ?M:handle_timeout(Later + 50, ack, State5),
+    ?assertMatch(
+        [{ok, #{key_phase := 0, frames := [{ack, 2, _, 2, [], undefined}]}}],
+        app_packets(Effects6, generation_keys(ServerApSecret, 2))
+    ).
+
+%% Until the peer answers our key update in the new phase, its packets in the
+%% old phase still open, and no second update starts even with the new phase
+%% acknowledged and three PTOs gone: our keys would be two generations ahead
+%% of what the peer can open (RFC 9001 §6.1).
+own_key_update_waits_for_peer_response_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Later = ?NOW + 60000,
+    State1 = ?M:key_limit(1 bsl 22, Later, send_phase_acked(State, ClientApSecret)),
+    {State2, _} = ?M:handle_send(self(), make_ref(), 0, ~"a", false, Later, State1),
+    OldPhase = app_datagram(
+        [{ack, 1, 0, 1, [], undefined}, {stream, 0, 0, ~"old", false}], 1, ClientApSecret
+    ),
+    {State3, Effects3} = ?M:handle_datagram(Later, OldPhase, State2),
+    ?assert(lists:member({emit, self(), {stream_data, 0, ~"old", false}}, emits(Effects3))),
+    Much = Later + 60000,
+    State4 = ?M:key_limit(1 bsl 22, Much, State3),
+    {_State5, Effects5} = ?M:handle_send(self(), make_ref(), 0, ~"b", true, Much, State4),
+    [{ok, #{key_phase := 1, frames := Frames}}] =
+        app_packets(Effects5, generation_keys(ServerApSecret, 1)),
+    ?assert(lists:member({stream, 0, 1, ~"b", true}, Frames)).
+
+%% RFC 9001 §6.1 and §6.5: no key update of our own before the peer has
+%% acknowledged a packet sent with the current keys, nor within three PTOs of
+%% that ACK, nor before the handshake is confirmed. The packets stay in key
+%% phase 0 under the first keys.
+own_key_update_needs_acknowledged_phase_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Unacked = ?M:key_limit(1 bsl 22, ?NOW + 60000, State),
+    {_, Effects1} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, ?NOW + 60000, Unacked),
+    ?assertMatch(
+        [{ok, #{key_phase := 0}}], app_packets(Effects1, generation_keys(ServerApSecret, 0))
+    ),
+    TooSoon = ?M:key_limit(1 bsl 22, ?NOW + 1, send_phase_acked(State, ClientApSecret)),
+    {_, Effects2} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, ?NOW + 1, TooSoon),
+    ?assertMatch(
+        [{ok, #{key_phase := 0}}], app_packets(Effects2, generation_keys(ServerApSecret, 0))
+    ),
+    #{state1 := Handshaking} = connect(),
+    ?assertEqual(
+        closed, ?M:phase(?M:key_limit((1 bsl 23) - 1, ?NOW, with_owner(Handshaking)))
+    ).
+
+%% RFC 9001 §6.6: with no key update allowed, the keys protect at most the
+%% 2^23 packets of the limit. The packet that reaches one short of it goes
+%% out, then the connection closes with AEAD_LIMIT_REACHED, the close being
+%% the last packet the keys protect, and drains.
+confidentiality_limit_closes_without_update_test() ->
+    {State, _ClientApSecret, ServerApSecret} = connect_owned(),
+    Near = ?M:key_limit((1 bsl 23) - 2, ?NOW, State),
+    ?assertEqual(connected, ?M:phase(Near)),
+    {Closed, Effects} = ?M:handle_send(self(), make_ref(), 0, ~"last", true, ?NOW, Near),
+    ?assertEqual(draining, ?M:phase(Closed)),
+    ?assertMatch(
+        [
+            {ok, #{frames := [{stream, 0, 0, ~"last", true}]}},
+            {ok, #{frames := [{connection_close, transport, 16#0f, 0, <<>>}]}}
+        ],
+        app_packets(Effects, generation_keys(ServerApSecret, 0))
+    ),
+    ?assert(lists:member({emit, self(), {closed, {local, aead_limit_reached}}}, emits(Effects))),
+    ?assertMatch([_], [At || {arm_timer, drain, At} <- Effects]),
+    ?assertEqual(draining, ?M:phase(?M:key_limit((1 bsl 23) - 1, ?NOW, State))).
+
+%% The confidentiality limit is the negotiated AEAD's (RFC 9001 §6.6):
+%% AEAD_CHACHA20_POLY1305's is beyond the 2^62 packet numbers, so 2^23
+%% packets start no update; halfway to 2^62 one would.
+chacha20_confidentiality_limit_test() ->
+    {State, ClientApSecret, ServerApSecret} =
+        connect_owned(#{}, #{cipher_suites => [16#1303]}),
+    Later = ?NOW + 60000,
+    Acked = send_phase_acked(
+        State, generation_keys(chacha20_poly1305, ClientApSecret, 0)
+    ),
+    Gcm = ?M:key_limit(1 bsl 23, Later, Acked),
+    {_, Effects1} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, Later, Gcm),
+    ?assertMatch(
+        [{ok, #{key_phase := 0}}],
+        app_packets(Effects1, generation_keys(chacha20_poly1305, ServerApSecret, 0))
+    ),
+    Half = ?M:key_limit(1 bsl 61, Later, Acked),
+    {_, Effects2} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, Later, Half),
+    ?assertMatch(
+        [{ok, #{key_phase := 1}}],
+        app_packets(Effects2, generation_keys(chacha20_poly1305, ServerApSecret, 1))
+    ).
+
 %% =============================================================================
 %% Handshake driver (plays the QUIC client with the shared test client)
 %% =============================================================================
@@ -2585,6 +2704,17 @@ updated_at(PN, ClientApSecret, State) ->
     New = phase_datagram([ping], PN, generation_keys(ClientApSecret, 1), 1),
     {State2, _} = ?M:handle_datagram(?NOW, New, State1),
     State2.
+
+%% The client acknowledges the server's first 1-RTT packet (its
+%% HANDSHAKE_DONE) at `?NOW`, from its own first 1-RTT packet: a packet of the
+%% server's current key phase is acknowledged (RFC 9001 §6.1). `Keys` seal it,
+%% the client's AES-128-GCM first generation unless given.
+send_phase_acked(State, #{} = Keys) ->
+    Ack = phase_datagram([{ack, 0, 0, 0, [], undefined}], 0, Keys, 0),
+    {State1, _} = ?M:handle_datagram(?NOW, Ack, State),
+    State1;
+send_phase_acked(State, ClientApSecret) ->
+    send_phase_acked(State, generation_keys(ClientApSecret, 0)).
 
 %% Every 1-RTT packet outcome of the server's datagrams, decoded with `Keys`.
 app_packets(Effects, Keys) ->

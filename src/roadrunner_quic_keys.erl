@@ -14,7 +14,8 @@
 %% tagged with its algorithm for `roadrunner_quic_aead`. `update/2` derives
 %% the next generation's secret and packet-protection key and IV, for the
 %% same AEAD, so the server can answer a peer-initiated key update (§6.1),
-%% which a v1 endpoint MUST support.
+%% which a v1 endpoint MUST support, and start one of its own before the
+%% AEAD confidentiality limit (§6.6).
 
 -export([
     initial_secret/1,
