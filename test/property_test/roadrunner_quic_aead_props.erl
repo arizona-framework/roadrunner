@@ -2,11 +2,12 @@
 -moduledoc """
 Property-based tests for `roadrunner_quic_aead`.
 
-Round-trip invariants over random inputs: opening a sealed payload
-recovers the plaintext, and header protection applied to a real
-short-header packet is removed exactly, recovering the header, the
-packet-number length, the wire packet number, and the trailing
-ciphertext.
+Round-trip invariants over random inputs, for both packet-protection
+AEADs (AES-128-GCM and ChaCha20-Poly1305) with their header protection:
+opening a sealed payload recovers the plaintext, and header protection
+applied to a real short-header packet is removed exactly, recovering the
+header, the packet-number length, the wire packet number, and the
+trailing ciphertext.
 """.
 
 -compile(export_all).
@@ -19,8 +20,8 @@ ciphertext.
 
 prop_round_trips() ->
     ?FORALL(
-        {Key, IV, HP, PN, DCID, Plaintext},
-        {binary(16), binary(12), binary(16), pn(), dcid(), payload()},
+        {{Key, HP}, IV, PN, DCID, Plaintext},
+        {keys(), binary(12), pn(), dcid(), payload()},
         begin
             %% A short-header packet's header depends only on DCID + PN, so
             %% it can be built before sealing and used as the AEAD AAD.
@@ -40,6 +41,14 @@ prop_round_trips() ->
                     {ok, Header, PNLen, WirePN, Ciphertext}
         end
     ).
+
+%% A packet-protection key and its header-protection key, for either AEAD
+%% (RFC 9001 §5.3, §5.4.3, §5.4.4).
+keys() ->
+    oneof([
+        ?LET({K, H}, {binary(16), binary(16)}, {{aes_128_gcm, K}, {aes_128_ecb, H}}),
+        ?LET({K, H}, {binary(32), binary(32)}, {{chacha20_poly1305, K}, {chacha20, H}})
+    ]).
 
 %% A packet number, one band per wire width (1-4 bytes) plus a band above
 %% 2^32 for the AEAD nonce's high bits. Banding by lower bound forces every

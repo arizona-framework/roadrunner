@@ -87,9 +87,11 @@
 %% advertises a max_idle_timeout, so a dead peer cannot pin the connection. The
 %% live value is the negotiated minimum of the two advertised limits.
 -define(IDLE_TIMEOUT, 30000).
-%% The AEAD_AES_128_GCM integrity limit (RFC 9001 §6.6): received packets
-%% that may fail authentication within a connection before it MUST close.
--define(AEAD_INTEGRITY_LIMIT, (1 bsl 52)).
+%% The AEAD integrity limits (RFC 9001 §6.6): received packets that may fail
+%% authentication within a connection before it MUST close, for
+%% AEAD_AES_128_GCM and AEAD_CHACHA20_POLY1305.
+-define(AES_128_GCM_INTEGRITY_LIMIT, (1 bsl 52)).
+-define(CHACHA20_POLY1305_INTEGRITY_LIMIT, (1 bsl 36)).
 %% TLS handshake message types carried in CRYPTO (RFC 8446 §4).
 -define(CLIENT_HELLO, 1).
 -define(FINISHED, 20).
@@ -134,6 +136,12 @@
     %% `recv_keys`), and the server's for the current send generation.
     recv_secret = <<>> :: binary(),
     send_secret = <<>> :: binary(),
+    %% The packet-protection AEAD of the negotiated cipher suite (§5.3), set
+    %% with the 1-RTT keys: every key update derives keys for it, as an update
+    %% never changes the suite (§6.1), and its integrity limit applies
+    %% (§6.6). Until then only the Initial packets' AES-128-GCM is in use
+    %% (§5.2).
+    aead = aes_128_gcm :: roadrunner_quic_aead:cipher(),
     %% Whether a 1-RTT ACK has gone out since the last key update. The peer
     %% may update again only once it has an acknowledgment of a packet it
     %% sent in the current phase (§6.1), and only our ACKs sent after the
@@ -264,8 +272,6 @@
     priv_key := public_key:private_key(),
     alpn := binary(),
     transport_params := roadrunner_quic_transport_params:params(),
-    eph_pub := binary(),
-    eph_priv := binary(),
     server_random := binary(),
     stream_credit => on_receipt | on_read
 }.
@@ -321,8 +327,6 @@ new(
         priv_key := PrivKey,
         alpn := Alpn,
         transport_params := TransportParams,
-        eph_pub := EphPub,
-        eph_priv := EphPriv,
         server_random := ServerRandom
     } = Config,
     Now
@@ -332,8 +336,6 @@ new(
         priv_key => PrivKey,
         alpn => Alpn,
         transport_params => TransportParams,
-        eph_pub => EphPub,
-        eph_priv => EphPriv,
         server_random => ServerRandom,
         peer_scid => PeerSCID
     }),
@@ -839,12 +841,13 @@ commit_key_update(
         send_keys = #{application := Send} = SendKeys,
         recv_secret = RecvSecret,
         send_secret = SendSecret,
+        aead = Aead,
         key_phase = Phase
     } = State
 ) ->
     #{key := Key, iv := IV, next := #{key := NextKey, iv := NextIV}} = Recv,
-    {RecvSecret1, AfterNext} = roadrunner_quic_keys:update(RecvSecret),
-    {SendSecret1, SendNext} = roadrunner_quic_keys:update(SendSecret),
+    {RecvSecret1, AfterNext} = roadrunner_quic_keys:update(Aead, RecvSecret),
+    {SendSecret1, SendNext} = roadrunner_quic_keys:update(Aead, SendSecret),
     #{key := SendKey, iv := SendIV} = roadrunner_quic_keys:for_connection(SendNext, seal),
     NewPhase = 1 - Phase,
     Recv1 = Recv#{
@@ -882,14 +885,20 @@ expire_previous_keys(_Now, State) ->
     State.
 
 %% Count a received packet that failed authentication (RFC 9001 §6.6). Past
-%% the AEAD integrity limit, counted across all keys, the connection MUST
-%% close at once with AEAD_LIMIT_REACHED and process no more packets.
+%% the integrity limit of the negotiated AEAD, counted across all keys, the
+%% connection MUST close at once with AEAD_LIMIT_REACHED and process no more
+%% packets.
 -doc false.
 -spec auth_failed(level(), non_neg_integer(), t()) -> t().
-auth_failed(Level, Failures, State) when Failures > ?AEAD_INTEGRITY_LIMIT ->
-    connection_fatal(Level, aead_limit_reached, State);
-auth_failed(_Level, Failures, State) ->
-    State#state{auth_failures = Failures}.
+auth_failed(Level, Failures, #state{aead = Aead} = State) ->
+    case integrity_limit(Aead) of
+        Limit when Failures > Limit -> connection_fatal(Level, aead_limit_reached, State);
+        _Limit -> State#state{auth_failures = Failures}
+    end.
+
+-spec integrity_limit(roadrunner_quic_aead:cipher()) -> pos_integer().
+integrity_limit(aes_128_gcm) -> ?AES_128_GCM_INTEGRITY_LIMIT;
+integrity_limit(chacha20_poly1305) -> ?CHACHA20_POLY1305_INTEGRITY_LIMIT.
 
 %% A decrypted Handshake packet proves the client received the server's
 %% Initial: lift the 3x anti-amplification limit (RFC 9000 §8.1) and
@@ -1109,6 +1118,12 @@ process_handshake(
             ),
             State2 = queue_crypto(initial, InitialFlight, State1),
             queue_crypto(handshake, HandshakeFlight, State2);
+        {retry, HelloRetryRequest, Tls1} ->
+            %% No usable key share: ask for one (RFC 8446 §4.1.4). The
+            %% HelloRetryRequest goes out in Initial CRYPTO like a ServerHello
+            %% (RFC 9001 §4.7), and the client's second ClientHello follows in
+            %% the same Initial CRYPTO stream, landing back here.
+            queue_crypto(initial, HelloRetryRequest, State#state{tls = Tls1});
         {error, Reason} ->
             connection_fatal(initial, Reason, State)
     end;
@@ -1129,38 +1144,47 @@ process_handshake(Level, {_Type, _Body}, State) ->
     connection_fatal(Level, unexpected_message, State).
 
 %% Arm the keys derived from the traffic secrets the TLS flight produced
-%% (RFC 9001 §5.1): server secrets protect outgoing packets, client secrets
-%% decrypt incoming ones; the Application space appears with its keys. The
-%% 1-RTT secrets are kept for key updates (§6.1), and the receive side gets
-%% the next generation's keys at once (§6.3): they are ready before the
-%% peer's first update, in key phase 0.
+%% (RFC 9001 §5.1), for the negotiated suite's AEAD (§5.3): server secrets
+%% protect outgoing packets, client secrets decrypt incoming ones; the
+%% Application space appears with its keys. The 1-RTT secrets and the AEAD
+%% are kept for key updates (§6.1), and the receive side gets the next
+%% generation's keys at once (§6.3): they are ready before the peer's first
+%% update, in key phase 0.
 -spec install_keys([roadrunner_quic_tls_server:install()], t()) -> t().
 install_keys(Installs, State) ->
     lists:foldl(fun install_key/2, State, Installs).
 
 -spec install_key(roadrunner_quic_tls_server:install(), t()) -> t().
-install_key({application, server, Secret}, State) ->
-    install_send_keys(application, Secret, State#state{send_secret = Secret});
-install_key({Level, server, Secret}, State) ->
-    install_send_keys(Level, Secret, State);
-install_key({application, client, Secret}, #state{recv_keys = RecvKeys} = State) ->
-    Keys = connection_keys(Secret, open),
-    {NextSecret, Next} = roadrunner_quic_keys:update(Secret),
+install_key({application, server, Aead, Secret}, State) ->
+    install_send_keys(application, Aead, Secret, State#state{send_secret = Secret});
+install_key({Level, server, Aead, Secret}, State) ->
+    install_send_keys(Level, Aead, Secret, State);
+install_key({application, client, Aead, Secret}, #state{recv_keys = RecvKeys} = State) ->
+    Keys = connection_keys(Aead, Secret, open),
+    {NextSecret, Next} = roadrunner_quic_keys:update(Aead, Secret),
     AppKeys = Keys#{phase => 0, next => roadrunner_quic_keys:for_connection(Next, open)},
     ensure_space(application, State#state{
-        recv_keys = RecvKeys#{application => AppKeys}, recv_secret = NextSecret
+        recv_keys = RecvKeys#{application => AppKeys}, recv_secret = NextSecret, aead = Aead
     });
-install_key({Level, client, Secret}, #state{recv_keys = RecvKeys} = State) ->
-    ensure_space(Level, State#state{recv_keys = RecvKeys#{Level => connection_keys(Secret, open)}}).
+install_key({Level, client, Aead, Secret}, #state{recv_keys = RecvKeys} = State) ->
+    ensure_space(Level, State#state{
+        recv_keys = RecvKeys#{Level => connection_keys(Aead, Secret, open)}
+    }).
 
--spec install_send_keys(level(), binary(), t()) -> t().
-install_send_keys(Level, Secret, #state{send_keys = SendKeys} = State) ->
-    ensure_space(Level, State#state{send_keys = SendKeys#{Level => connection_keys(Secret, seal)}}).
+-spec install_send_keys(level(), roadrunner_quic_aead:cipher(), binary(), t()) -> t().
+install_send_keys(Level, Aead, Secret, #state{send_keys = SendKeys} = State) ->
+    ensure_space(Level, State#state{
+        send_keys = SendKeys#{Level => connection_keys(Aead, Secret, seal)}
+    }).
 
-%% A traffic secret's packet-protection keys, prepared for this process.
--spec connection_keys(binary(), seal | open) -> roadrunner_quic_keys:keys().
-connection_keys(Secret, Direction) ->
-    roadrunner_quic_keys:for_connection(roadrunner_quic_keys:traffic_keys(Secret), Direction).
+%% A traffic secret's packet-protection keys for an AEAD, prepared for this
+%% process.
+-spec connection_keys(roadrunner_quic_aead:cipher(), binary(), seal | open) ->
+    roadrunner_quic_keys:keys().
+connection_keys(Aead, Secret, Direction) ->
+    roadrunner_quic_keys:for_connection(
+        roadrunner_quic_keys:traffic_keys(Aead, Secret), Direction
+    ).
 
 -spec ensure_space(level(), t()) -> t().
 ensure_space(Level, #state{spaces = Spaces} = State) ->
@@ -1447,11 +1471,21 @@ close_code(unexpected_message) ->
     %% KeyUpdate (RFC 9001 §6: 0x010a) or an EndOfEarlyData, which QUIC
     %% removes (§8.3): the TLS unexpected_message alert (10).
     roadrunner_quic_error:code_int({crypto_error, 10});
-close_code(missing_transport_params) ->
+close_code(Reason) when Reason =:= missing_transport_params; Reason =:= missing_extension ->
     %% RFC 9001 §8.2: a ClientHello without the quic_transport_parameters
     %% extension MUST close with 0x016d, a CRYPTO_ERROR carrying the TLS
-    %% missing_extension alert (109).
+    %% missing_extension alert (109); so does one without supported_groups or
+    %% key_share (RFC 8446 §9.2).
     roadrunner_quic_error:code_int({crypto_error, 109});
+close_code(illegal_parameter) ->
+    %% A key share that is not a valid public value for its group (RFC 8446
+    %% §4.2.8.2), or a second ClientHello that does not answer the
+    %% HelloRetryRequest (§4.1.2): the TLS illegal_parameter alert (47).
+    roadrunner_quic_error:code_int({crypto_error, 47});
+close_code(protocol_version) ->
+    %% A ClientHello that does not offer TLS 1.3 (RFC 8446 §4.2.1, RFC 9001
+    %% §4.2): the TLS protocol_version alert (70).
+    roadrunner_quic_error:code_int({crypto_error, 70});
 close_code(_TlsReason) ->
     %% Every other connection_fatal reason is a TLS handshake failure (a
     %% malformed or rejected ClientHello, a bad Finished, or an unexpected

@@ -14,14 +14,34 @@ server_hello_round_trip_test() ->
     SessionId = crypto:strong_rand_bytes(8),
     {Pub, _Priv} = ?C:gen_keypair(),
     Framed = roadrunner_quic_tls_hello:build_server_hello(#{
-        random => Random, session_id => SessionId, key_share => Pub
+        random => Random,
+        session_id => SessionId,
+        cipher_suite => 16#1303,
+        key_share => {16#001D, Pub}
     }),
     [{2, Body}] = ?C:deframe_all(Framed),
     Parsed = ?C:parse_server_hello(Body),
     ?assertEqual(Random, maps:get(random, Parsed)),
     ?assertEqual(SessionId, maps:get(session_id, Parsed)),
-    ?assertEqual(16#1301, maps:get(cipher, Parsed)),
+    ?assertEqual(16#1303, maps:get(cipher, Parsed)),
+    ?assertEqual(16#001D, maps:get(group, Parsed)),
     ?assertEqual(Pub, maps:get(key_share, Parsed)).
+
+hello_retry_request_round_trip_test() ->
+    %% A HelloRetryRequest names the group only, so it parses without a key.
+    Framed = roadrunner_quic_tls_hello:build_hello_retry_request(#{
+        session_id => <<>>, cipher_suite => 16#1301, group => 16#0017
+    }),
+    [{2, Body}] = ?C:deframe_all(Framed),
+    ?assertEqual(
+        #{
+            random => crypto:hash(sha256, ~"HelloRetryRequest"),
+            session_id => <<>>,
+            cipher => 16#1301,
+            group => 16#0017
+        },
+        ?C:parse_server_hello(Body)
+    ).
 
 encrypted_extensions_round_trip_test() ->
     Params = #{initial_max_data => 65536},

@@ -1,10 +1,11 @@
 -module(roadrunner_quic_tls_hello).
 -moduledoc false.
 
-%% TLS 1.3 hello exchange (RFC 8446 §4.1.2/§4.1.3/§4.3.1) for a server-only
-%% QUIC v1 endpoint: parse the client's ClientHello, and build the server's
-%% ServerHello and EncryptedExtensions. v1 negotiates x25519
-%% (NamedGroup 0x001d) and TLS_AES_128_GCM_SHA256 (0x1301) only.
+%% TLS 1.3 hello exchange (RFC 8446 §4.1.2/§4.1.3/§4.1.4/§4.3.1) for a
+%% server-only QUIC v1 endpoint: parse the client's ClientHello, and build
+%% the server's ServerHello, HelloRetryRequest and EncryptedExtensions. The
+%% ServerHello and HelloRetryRequest carry the cipher suite and key exchange
+%% group the caller selected.
 %%
 %% This module owns the message bodies; `roadrunner_quic_tls_handshake`
 %% frames them (1-byte type + 24-bit length), and
@@ -20,9 +21,14 @@
 %% mandatory-extension presence) - that is the connection layer's job, so
 %% `parse_client_hello/1` extracts what is present and leaves absent
 %% extensions out of the map. The server build does not generate keys: the
-%% caller owns the x25519 key pair and passes the public key in.
+%% caller owns the ephemeral key pair and passes the public key in.
 
--export([parse_client_hello/1, build_server_hello/1, build_encrypted_extensions/1]).
+-export([
+    parse_client_hello/1,
+    build_server_hello/1,
+    build_hello_retry_request/1,
+    build_encrypted_extensions/1
+]).
 
 -export_type([client_hello/0]).
 
@@ -32,6 +38,7 @@
 
 %% Extension codepoints (RFC 8446 §4.2 + RFC 9001 §8.2).
 -define(EXT_SERVER_NAME, 16#0000).
+-define(EXT_SUPPORTED_GROUPS, 16#000A).
 -define(EXT_SIGNATURE_ALGORITHMS, 16#000D).
 -define(EXT_ALPN, 16#0010).
 -define(EXT_SUPPORTED_VERSIONS, 16#002B).
@@ -41,9 +48,13 @@
 %% Wire constants.
 -define(LEGACY_VERSION, 16#0303).
 -define(TLS_1_3, 16#0304).
--define(GROUP_X25519, 16#001D).
-%% v1 cipher suite (the only suite the server offers).
--define(CIPHER_AES_128_GCM_SHA256, 16#1301).
+%% The HelloRetryRequest's Random: SHA-256 of "HelloRetryRequest" (RFC 8446
+%% §4.1.3), which marks a ServerHello-shaped message as a HelloRetryRequest.
+-define(HELLO_RETRY_RANDOM,
+    <<16#CF, 16#21, 16#AD, 16#74, 16#E5, 16#9A, 16#61, 16#11, 16#BE, 16#1D, 16#8C, 16#02, 16#1E,
+        16#65, 16#B8, 16#91, 16#C2, 16#A2, 16#11, 16#16, 16#7A, 16#BB, 16#8C, 16#5E, 16#07, 16#9E,
+        16#09, 16#E2, 16#C8, 16#A8, 16#33, 16#9C>>
+).
 %% SNI name_type 0 = host_name (RFC 6066 §3).
 -define(SNI_HOST_NAME, 16#00).
 
@@ -51,9 +62,11 @@
     random := binary(),
     session_id := binary(),
     cipher_suites := [non_neg_integer()],
+    supported_versions := [non_neg_integer()],
     alpn_protocols := [binary()],
     signature_algorithms := [non_neg_integer()],
-    key_share => binary(),
+    supported_groups => [non_neg_integer()],
+    key_shares => [{non_neg_integer(), binary()}],
     server_name => binary(),
     transport_params => roadrunner_quic_transport_params:params()
 }.
@@ -66,11 +79,16 @@
 Parse a ClientHello body (RFC 8446 §4.1.2), as handed up by
 `roadrunner_quic_tls_handshake:decode/1`. Returns the fields a server
 needs as a map: the random and legacy session id (echoed in the
-ServerHello), the offered cipher suites, the client's x25519 key share,
-the offered ALPN protocols and signature schemes, and (when present) the
-SNI host name and decoded QUIC transport parameters. Absent extensions
-are simply left out of the map. Returns `{error, Reason}` on a malformed
-buffer.
+ServerHello), the offered cipher suites and TLS versions
+(supported_versions, RFC 8446 §4.2.1), the offered ALPN protocols and
+signature schemes, and (when present) the offered groups
+(supported_groups, §4.2.7), the client's key shares as `{Group,
+KeyExchange}` pairs in its order (key_share, §4.2.8), the SNI host name,
+and the decoded QUIC transport parameters. The version, ALPN and signature
+lists read as empty when their extension is absent; the other absent
+extensions are simply left out of the map, so a caller can tell an absent
+supported_groups or key_share (RFC 8446 §9.2) from an empty one. Returns
+`{error, Reason}` on a malformed buffer.
 """.
 -spec parse_client_hello(binary()) -> {ok, client_hello()} | {error, atom()}.
 parse_client_hello(<<?LEGACY_VERSION:16, Random:32/binary, AfterRandom/binary>>) ->
@@ -92,26 +110,44 @@ parse_client_hello(_) ->
 -doc """
 Build a ServerHello (RFC 8446 §4.1.3), framed, as an iolist. Inputs:
 `random` (32 bytes), `session_id` (the client's legacy session id, echoed
-verbatim), and `key_share` (the server's 32-byte x25519 public key). The
-cipher suite is fixed to TLS_AES_128_GCM_SHA256 and the group to x25519.
-The two server extensions are key_share then supported_versions
-(selecting TLS 1.3).
+verbatim), `cipher_suite` (the selected suite's codepoint), and
+`key_share`, the server's `{Group, PublicKey}` for the selected group (a
+KeyShareEntry, RFC 8446 §4.2.8). The two server extensions are key_share
+then supported_versions (selecting TLS 1.3).
 """.
 -spec build_server_hello(#{
-    random := binary(), session_id := binary(), key_share := binary()
+    random := binary(),
+    session_id := binary(),
+    cipher_suite := non_neg_integer(),
+    key_share := {non_neg_integer(), binary()}
 }) -> iolist().
-build_server_hello(#{random := Random, session_id := SessionId, key_share := PubKey}) ->
-    Extensions = [
-        encode_extension(?EXT_KEY_SHARE, server_key_share(PubKey)),
-        encode_extension(?EXT_SUPPORTED_VERSIONS, <<?TLS_1_3:16>>)
-    ],
-    Body = [
-        <<?LEGACY_VERSION:16, Random:32/binary, (byte_size(SessionId)):8>>,
-        SessionId,
-        <<?CIPHER_AES_128_GCM_SHA256:16, 0:8, (iolist_size(Extensions)):16>>,
-        Extensions
-    ],
-    roadrunner_quic_tls_handshake:encode(?SERVER_HELLO, Body).
+build_server_hello(#{
+    random := Random,
+    session_id := SessionId,
+    cipher_suite := CipherSuite,
+    key_share := {Group, PubKey}
+}) ->
+    KeyShareEntry = [<<Group:16, (byte_size(PubKey)):16>>, PubKey],
+    server_hello(Random, SessionId, CipherSuite, KeyShareEntry).
+
+%% =============================================================================
+%% build_hello_retry_request/1
+%% =============================================================================
+
+-doc """
+Build a HelloRetryRequest (RFC 8446 §4.1.4), framed, as an iolist: a
+ServerHello whose Random is the fixed HelloRetryRequest value (§4.1.3),
+asking the client for a key share in the selected `group`. Inputs:
+`session_id` (echoed verbatim) and `cipher_suite`, as for a ServerHello.
+The two extensions are key_share, carrying just the selected group
+(KeyShareHelloRetryRequest, §4.2.8), then supported_versions (selecting
+TLS 1.3); no cookie is sent.
+""".
+-spec build_hello_retry_request(#{
+    session_id := binary(), cipher_suite := non_neg_integer(), group := non_neg_integer()
+}) -> iolist().
+build_hello_retry_request(#{session_id := SessionId, cipher_suite := CipherSuite, group := Group}) ->
+    server_hello(?HELLO_RETRY_RANDOM, SessionId, CipherSuite, <<Group:16>>).
 
 %% =============================================================================
 %% build_encrypted_extensions/1
@@ -148,11 +184,13 @@ finalize_client_hello(Random, SessionId, Ciphers, Extensions) ->
         random => Random,
         session_id => SessionId,
         cipher_suites => Ciphers,
+        supported_versions => extract_supported_versions(Extensions),
         alpn_protocols => extract_alpn(Extensions),
         signature_algorithms => extract_signature_algorithms(Extensions)
     },
-    WithKeyShare = maybe_put(key_share, extract_x25519_key_share(Extensions), Base),
-    WithName = maybe_put(server_name, extract_server_name(Extensions), WithKeyShare),
+    WithGroups = maybe_put(supported_groups, extract_supported_groups(Extensions), Base),
+    WithKeyShares = maybe_put(key_shares, extract_key_shares(Extensions), WithGroups),
+    WithName = maybe_put(server_name, extract_server_name(Extensions), WithKeyShares),
     case extract_transport_params(Extensions) of
         none -> {ok, WithName};
         {ok, Params} -> {ok, WithName#{transport_params => Params}};
@@ -163,24 +201,50 @@ finalize_client_hello(Random, SessionId, Ciphers, Extensions) ->
 maybe_put(_Key, undefined, Map) -> Map;
 maybe_put(Key, Value, Map) -> Map#{Key => Value}.
 
-%% The x25519 public key from the client's key_share list (RFC 8446
-%% §4.2.8), or undefined if the client offered no x25519 entry.
--spec extract_x25519_key_share(#{non_neg_integer() => binary()}) -> binary() | undefined.
-extract_x25519_key_share(#{?EXT_KEY_SHARE := Data}) ->
+%% The offered groups (RFC 8446 §4.2.7: a two-byte-length list of 16-bit
+%% NamedGroups) in the client's order, or undefined if the extension is
+%% absent or malformed.
+-spec extract_supported_groups(#{non_neg_integer() => binary()}) ->
+    [non_neg_integer()] | undefined.
+extract_supported_groups(#{?EXT_SUPPORTED_GROUPS := Data}) ->
     case take_u16_vector(Data) of
-        {ok, Entries, _Rest} -> find_x25519_entry(Entries);
+        {ok, List, _Rest} -> parse_u16_list(List);
         {error, _} -> undefined
     end;
-extract_x25519_key_share(#{}) ->
+extract_supported_groups(#{}) ->
     undefined.
 
--spec find_x25519_entry(binary()) -> binary() | undefined.
-find_x25519_entry(<<?GROUP_X25519:16, KeyLen:16, Key:KeyLen/binary, _Rest/binary>>) ->
-    Key;
-find_x25519_entry(<<_Group:16, KeyLen:16, _Key:KeyLen/binary, Rest/binary>>) ->
-    find_x25519_entry(Rest);
-find_x25519_entry(_) ->
+%% The client's key shares (RFC 8446 §4.2.8: a two-byte-length list of
+%% KeyShareEntry) as `{Group, KeyExchange}` pairs in its order, or undefined
+%% if the extension is absent or malformed. An empty list is a valid offer
+%% (the client asks the server to pick a group, §4.2.8).
+-spec extract_key_shares(#{non_neg_integer() => binary()}) ->
+    [{non_neg_integer(), binary()}] | undefined.
+extract_key_shares(#{?EXT_KEY_SHARE := Data}) ->
+    case take_u16_vector(Data) of
+        {ok, Entries, _Rest} -> parse_key_share_entries(Entries);
+        {error, _} -> undefined
+    end;
+extract_key_shares(#{}) ->
     undefined.
+
+%% A packed KeyShareEntry list; a trailing partial entry is dropped.
+-spec parse_key_share_entries(binary()) -> [{non_neg_integer(), binary()}].
+parse_key_share_entries(<<Group:16, KeyLen:16, Key:KeyLen/binary, Rest/binary>>) ->
+    [{Group, Key} | parse_key_share_entries(Rest)];
+parse_key_share_entries(_) ->
+    [].
+
+%% The offered TLS versions (RFC 8446 §4.2.1: a one-byte-length list of
+%% 16-bit versions), [] if absent or malformed.
+-spec extract_supported_versions(#{non_neg_integer() => binary()}) -> [non_neg_integer()].
+extract_supported_versions(#{?EXT_SUPPORTED_VERSIONS := Data}) ->
+    case take_u8_vector(Data) of
+        {ok, List, _Rest} -> parse_u16_list(List);
+        {error, _} -> []
+    end;
+extract_supported_versions(#{}) ->
+    [].
 
 %% The ALPN protocol list (RFC 7301), [] if absent or malformed.
 -spec extract_alpn(#{non_neg_integer() => binary()}) -> [binary()].
@@ -272,11 +336,23 @@ parse_extensions(_, _) ->
 encode_extension(Type, Data) ->
     [<<Type:16, (iolist_size(Data)):16>>, Data].
 
-%% A ServerHello key_share extension body: a single bare KeyShareEntry
-%% (RFC 8446 §4.2.8), no list-length prefix.
--spec server_key_share(binary()) -> iolist().
-server_key_share(PubKey) ->
-    [<<?GROUP_X25519:16, (byte_size(PubKey)):16>>, PubKey].
+%% The ServerHello structure (RFC 8446 §4.1.3), shared by the ServerHello and
+%% the HelloRetryRequest (§4.1.4), framed. `KeyShare` is the key_share
+%% extension body, with no list-length prefix: a bare KeyShareEntry in a
+%% ServerHello, the bare selected group in a HelloRetryRequest (§4.2.8).
+-spec server_hello(binary(), binary(), non_neg_integer(), iodata()) -> iolist().
+server_hello(Random, SessionId, CipherSuite, KeyShare) ->
+    Extensions = [
+        encode_extension(?EXT_KEY_SHARE, KeyShare),
+        encode_extension(?EXT_SUPPORTED_VERSIONS, <<?TLS_1_3:16>>)
+    ],
+    Body = [
+        <<?LEGACY_VERSION:16, Random:32/binary, (byte_size(SessionId)):8>>,
+        SessionId,
+        <<CipherSuite:16, 0:8, (iolist_size(Extensions)):16>>,
+        Extensions
+    ],
+    roadrunner_quic_tls_handshake:encode(?SERVER_HELLO, Body).
 
 %% The EncryptedExtensions ALPN extension carrying the single selected
 %% protocol (RFC 7301 §3.1), or [] when no protocol was selected. An empty

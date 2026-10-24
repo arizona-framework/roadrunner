@@ -19,12 +19,20 @@
 #   multiplex  50 GETs of different sizes on one connection
 #   upload     POST 1 MB and get it echoed back
 #
-# The ngtcp2 client also runs one more case (quiche-client cannot update
-# its keys on demand):
+# The ngtcp2 client also runs cases quiche-client has no options for:
+# updating its keys on demand, and steering the handshake with its TLS
+# options.
 #
-#   keyupdate  GET 5 MB while the client updates its 1-RTT keys early in
-#              the transfer (RFC 9001 §6); it passes only if the server's
-#              packets switch to the new key phase too
+#   keyupdate    GET 5 MB while the client updates its 1-RTT keys early in
+#                the transfer (RFC 9001 §6); it passes only if the server's
+#                packets switch to the new key phase too
+#   chacha20     GET 100 bytes offering only TLS_CHACHA20_POLY1305_SHA256
+#   chacha20-ku  keyupdate offering only TLS_CHACHA20_POLY1305_SHA256, so
+#                the updated keys are ChaCha20-Poly1305 keys too
+#   p256         GET 100 bytes offering only the secp256r1 (P-256) group
+#   hrr          GET 100 bytes sending a key share only for X25519MLKEM768,
+#                which the server does not support, so the server asks for
+#                an x25519 share with a HelloRetryRequest
 #
 # Requirements:
 #   - docker (the client images are pulled on first run)
@@ -148,21 +156,22 @@ fi
 case_urls() {
     case "$1" in
         small) echo "$BASE/files/100" ;;
-        large | keyupdate) echo "$BASE/files/5000000" ;;
+        large | keyupdate | chacha20-ku) echo "$BASE/files/5000000" ;;
         multiplex) for n in $MULTIPLEX_SIZES; do echo "$BASE/files/$n"; done ;;
         upload) echo "$BASE/echo" ;;
+        chacha20 | p256 | hrr) echo "$BASE/files/100" ;;
     esac
 }
 
 # Check a case's downloads in `$2`; both clients name each response file
-# after the last segment of its URL path. The keyupdate case also needs a
+# after the last segment of its URL path. The key update cases also need a
 # server packet in key phase 1 in the client's packet log (`$2.log`).
 check_case() {
     local name=$1 dir=$2
     case "$name" in
-        small) cmp -s "$WWW/100" "$dir/100" ;;
+        small | chacha20 | p256 | hrr) cmp -s "$WWW/100" "$dir/100" ;;
         large) cmp -s "$WWW/5000000" "$dir/5000000" ;;
-        keyupdate)
+        keyupdate | chacha20-ku)
             cmp -s "$WWW/5000000" "$dir/5000000" &&
                 grep -q "pkt rx .* type=1RTT k=1" "$dir.log"
             ;;
@@ -196,6 +205,10 @@ run_ngtcp2() {
         # under way, and log every packet so check_case can see the key
         # phase the server answers in.
         keyupdate) opts="--key-update=1ms" ;;
+        chacha20) opts="-q --ciphers=TLS_CHACHA20_POLY1305_SHA256" ;;
+        chacha20-ku) opts="--ciphers=TLS_CHACHA20_POLY1305_SHA256 --key-update=1ms" ;;
+        p256) opts="-q --groups=P-256" ;;
+        hrr) opts="-q --groups=X25519MLKEM768:X25519" ;;
     esac
     # The client fails its handshake when run as a non-root user, so it runs
     # as root and hands the downloads back afterwards.
@@ -209,12 +222,18 @@ run_ngtcp2() {
             exit \$rc"
 }
 
+# The cases each client runs.
+client_cases() {
+    case "$1" in
+        quiche) echo small large multiplex upload ;;
+        ngtcp2) echo small large multiplex upload keyupdate chacha20 chacha20-ku p256 hrr ;;
+    esac
+}
+
 FAILED=0
-printf '%-8s %-10s %s\n' client case result
+printf '%-8s %-12s %s\n' client case result
 for client in quiche ngtcp2; do
-    cases="small large multiplex upload"
-    [ "$client" = ngtcp2 ] && cases="$cases keyupdate"
-    for name in $cases; do
+    for name in $(client_cases "$client"); do
         dir="$WORK_DIR/$client/$name"
         mkdir -p "$dir"
         log="$dir.log"
@@ -224,7 +243,7 @@ for client in quiche ngtcp2; do
             result=FAIL
             FAILED=1
         fi
-        printf '%-8s %-10s %s\n' "$client" "$name" "$result"
+        printf '%-8s %-12s %s\n' "$client" "$name" "$result"
         if [ "$result" = FAIL ]; then
             echo "---- $client $name output (last 20 lines)" >&2
             tail -20 "$log" >&2

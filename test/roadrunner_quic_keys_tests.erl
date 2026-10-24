@@ -17,12 +17,14 @@ rfc9001_a1_initial_secret_test() ->
         ?M:initial_secret(a1_dcid())
     ).
 
+%% Initial keys are always AES-128-GCM with AES header protection
+%% (RFC 9001 §5.2, §5.4.3).
 rfc9001_a1_server_keys_test() ->
     ?assertEqual(
         #{
-            key => hex(~"cf3a5331653c364c88f0f379b6067e37"),
+            key => {aes_128_gcm, hex(~"cf3a5331653c364c88f0f379b6067e37")},
             iv => hex(~"0ac1493ca1905853b0bba03e"),
-            hp => hex(~"c206b8d9b9f0f37644430b490eeaa314")
+            hp => {aes_128_ecb, hex(~"c206b8d9b9f0f37644430b490eeaa314")}
         },
         ?M:initial_server(a1_dcid())
     ).
@@ -30,66 +32,94 @@ rfc9001_a1_server_keys_test() ->
 rfc9001_a1_client_keys_test() ->
     ?assertEqual(
         #{
-            key => hex(~"1f369613dd76d5467730efcbe3b1a22d"),
+            key => {aes_128_gcm, hex(~"1f369613dd76d5467730efcbe3b1a22d")},
             iv => hex(~"fa044b2f42a3fd3b46fb255c"),
-            hp => hex(~"9f50449e04a0e810283a1e9933adedd2")
+            hp => {aes_128_ecb, hex(~"9f50449e04a0e810283a1e9933adedd2")}
         },
         ?M:initial_client(a1_dcid())
     ).
 
 %% The server Initial keys derive straight from the server Initial secret
-%% (RFC 9001 A.1), so `traffic_keys/1` over that secret reproduces them.
+%% (RFC 9001 A.1), so `traffic_keys/2` for AES-128-GCM over that secret
+%% reproduces them.
 traffic_keys_test() ->
     ServerSecret = hex(~"3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b"),
     ?assertEqual(
         #{
-            key => hex(~"cf3a5331653c364c88f0f379b6067e37"),
+            key => {aes_128_gcm, hex(~"cf3a5331653c364c88f0f379b6067e37")},
             iv => hex(~"0ac1493ca1905853b0bba03e"),
-            hp => hex(~"c206b8d9b9f0f37644430b490eeaa314")
+            hp => {aes_128_ecb, hex(~"c206b8d9b9f0f37644430b490eeaa314")}
         },
-        ?M:traffic_keys(ServerSecret)
+        ?M:traffic_keys(aes_128_gcm, ServerSecret)
+    ).
+
+%% RFC 9001 Appendix A.5: ChaCha20-Poly1305 keys from an application
+%% secret, a 32-byte AEAD key and a 32-byte ChaCha20 header-protection key.
+rfc9001_a5_chacha20_traffic_keys_test() ->
+    ?assertEqual(
+        #{
+            key =>
+                {chacha20_poly1305,
+                    hex(~"c6d98ff3441c3fe1b2182094f69caa2ed4b716b65488960a7a984979fb23e1c8")},
+            iv => hex(~"e0459b3474bdd0e44a41c144"),
+            hp =>
+                {chacha20, hex(~"25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4")}
+        },
+        ?M:traffic_keys(chacha20_poly1305, a5_secret())
     ).
 
 %% =============================================================================
 %% Key update (RFC 9001 §6.1): the next secret is
-%% Expand-Label(current, "quic ku", "", 32), and the AEAD key and IV follow
-%% from it; the header-protection key is not updated.
+%% Expand-Label(current, "quic ku", "", 32), and the AEAD key and IV for the
+%% connection's AEAD follow from it; the header-protection key is not
+%% updated.
 %% =============================================================================
 
 %% RFC 9001 Appendix A.5 publishes the "quic ku" secret for its 1-RTT
-%% secret. The vector's AEAD is ChaCha20-Poly1305, but the update secret
-%% depends only on the secret and SHA-256, which AES-128-GCM shares.
-rfc9001_a5_key_update_secret_test() ->
-    Secret = hex(~"9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b"),
-    {UpdatedSecret, _PacketKeys} = ?M:update(Secret),
-    ?assertEqual(
-        hex(~"1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9"),
-        UpdatedSecret
-    ).
+%% secret; the update secret depends only on the secret and SHA-256, which
+%% both AEADs share.
+rfc9001_a5_key_update_secret_test_() ->
+    UpdatedSecret = hex(~"1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9"),
+    [
+        ?_assertMatch({UpdatedSecret, _PacketKeys}, ?M:update(Cipher, a5_secret()))
+     || Cipher <- [aes_128_gcm, chacha20_poly1305]
+    ].
 
 %% The updated generation's AEAD key and IV are the "quic key" and
 %% "quic iv" expansions of the updated secret, and nothing else.
 key_update_derives_packet_keys_test() ->
     Secret = binary:copy(<<16#2a>>, 32),
-    {UpdatedSecret, PacketKeys} = ?M:update(Secret),
+    {UpdatedSecret, PacketKeys} = ?M:update(aes_128_gcm, Secret),
     ?assertEqual(
         hex(~"c8dd004d0adc90d90ef286b8debce48f65a3ea342932fc5f4891207e96f8e862"),
         UpdatedSecret
     ),
     ?assertEqual(
         #{
-            key => hex(~"d77beffa17a12a7697276ab00c5faa0b"),
+            key => {aes_128_gcm, hex(~"d77beffa17a12a7697276ab00c5faa0b")},
             iv => hex(~"535303b03a85a983f4311f64")
         },
         PacketKeys
     ),
-    ?assertEqual(maps:with([key, iv], ?M:traffic_keys(UpdatedSecret)), PacketKeys).
+    ?assertEqual(maps:with([key, iv], ?M:traffic_keys(aes_128_gcm, UpdatedSecret)), PacketKeys).
+
+%% A key update keeps the AEAD (§6.1): a ChaCha20-Poly1305 connection's next
+%% generation is a 32-byte ChaCha20-Poly1305 key, here RFC 9001 A.5's
+%% secret updated once.
+chacha20_key_update_test() ->
+    {UpdatedSecret, PacketKeys} = ?M:update(chacha20_poly1305, a5_secret()),
+    ?assertMatch(#{key := {chacha20_poly1305, <<_:32/binary>>}, iv := <<_:12/binary>>}, PacketKeys),
+    ?assertEqual(
+        maps:with([key, iv], ?M:traffic_keys(chacha20_poly1305, UpdatedSecret)), PacketKeys
+    ).
 
 %% =============================================================================
 %% Helpers
 %% =============================================================================
 
 a1_dcid() -> hex(~"8394c8f03e515708").
+
+a5_secret() -> hex(~"9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b").
 
 %% Uppercase before decoding so the literals are portable across OTP
 %% versions regardless of `binary:decode_hex/1`'s lowercase handling.
@@ -110,10 +140,25 @@ for_connection_protects_like_the_raw_key_test() ->
      || Cipher <- [crypto:strong_rand_bytes(32) || _ <- lists:seq(1, 20)]
     ].
 
-for_connection_seals_and_opens_like_the_raw_key_test() ->
+for_connection_keeps_the_chacha20_hp_key_test() ->
+    %% A ChaCha20 mask runs under a new IV per sample (RFC 9001 §5.4.4), so
+    %% the header-protection key stays the raw tagged key.
+    #{hp := Raw} = Keys = roadrunner_quic_keys:traffic_keys(chacha20_poly1305, a5_secret()),
+    ?assertMatch(#{hp := Raw}, roadrunner_quic_keys:for_connection(Keys, seal)).
+
+for_connection_seals_and_opens_like_the_raw_key_test_() ->
     %% The connection's sealing state must produce the raw key's bytes,
-    %% and its opening state must open them, packet after packet.
-    Keys = roadrunner_quic_keys:initial_server(<<16#8394c8f03e515708:64>>),
+    %% and its opening state must open them, packet after packet, for
+    %% either AEAD.
+    [
+        ?_test(assert_seals_and_opens_like_the_raw_key(Keys))
+     || Keys <- [
+            roadrunner_quic_keys:initial_server(<<16#8394c8f03e515708:64>>),
+            roadrunner_quic_keys:traffic_keys(chacha20_poly1305, a5_secret())
+        ]
+    ].
+
+assert_seals_and_opens_like_the_raw_key(Keys) ->
     #{key := Raw, iv := IV} = Keys,
     #{key := SealKey} = roadrunner_quic_keys:for_connection(Keys, seal),
     #{key := OpenKey} = roadrunner_quic_keys:for_connection(Keys, open),
@@ -133,13 +178,22 @@ for_connection_seals_and_opens_like_the_raw_key_test() ->
      || {PN, Size} <- [{0, 1}, {1, 64}, {2, 1200}, {16#FFFF, 300}]
     ].
 
-for_connection_prepares_update_packet_keys_test() ->
+for_connection_prepares_update_packet_keys_test_() ->
     %% A key update's packet keys carry no header-protection key; only the
-    %% AEAD key is prepared, and it seals and opens like the raw key.
-    {_UpdatedSecret, #{key := Raw, iv := IV} = PacketKeys} = ?M:update(binary:copy(<<7>>, 32)),
-    #{key := SealKey, iv := IV} = Sealing = ?M:for_connection(PacketKeys, seal),
-    #{key := OpenKey} = ?M:for_connection(PacketKeys, open),
-    ?assertEqual([iv, key], lists:sort(maps:keys(Sealing))),
-    Sealed = roadrunner_quic_aead:seal(Raw, IV, 5, ~"aad", ~"payload"),
-    ?assertEqual(Sealed, roadrunner_quic_aead:seal(SealKey, IV, 5, ~"aad", ~"payload")),
-    ?assertEqual({ok, ~"payload"}, roadrunner_quic_aead:open(OpenKey, IV, 5, ~"aad", Sealed)).
+    %% AEAD key is prepared, and it seals and opens like the raw key, for
+    %% either AEAD.
+    [
+        ?_test(begin
+            {_UpdatedSecret, #{key := Raw, iv := IV} = PacketKeys} =
+                ?M:update(Cipher, binary:copy(<<7>>, 32)),
+            #{key := SealKey, iv := IV} = Sealing = ?M:for_connection(PacketKeys, seal),
+            #{key := OpenKey} = ?M:for_connection(PacketKeys, open),
+            ?assertEqual([iv, key], lists:sort(maps:keys(Sealing))),
+            Sealed = roadrunner_quic_aead:seal(Raw, IV, 5, ~"aad", ~"payload"),
+            ?assertEqual(Sealed, roadrunner_quic_aead:seal(SealKey, IV, 5, ~"aad", ~"payload")),
+            ?assertEqual(
+                {ok, ~"payload"}, roadrunner_quic_aead:open(OpenKey, IV, 5, ~"aad", Sealed)
+            )
+        end)
+     || Cipher <- [aes_128_gcm, chacha20_poly1305]
+    ].

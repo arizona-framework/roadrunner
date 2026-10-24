@@ -56,7 +56,7 @@ handshake_completes(#{shell := Shell, peer := Peer, client := ClientSocket, ctx 
         AppFrames = ?TC:frames(
             recv_all(ClientSocket),
             application,
-            #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+            #{application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)},
             byte_size(?DCID)
         ),
         ?assert(lists:member(handshake_done, AppFrames))
@@ -77,7 +77,7 @@ send_data_round_trip(#{shell := Shell, peer := Peer, client := ClientSocket, ctx
         Frames = ?TC:frames(
             recv_all(ClientSocket),
             application,
-            #{application => roadrunner_quic_keys:traffic_keys(ServerApSecret)},
+            #{application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)},
             byte_size(?DCID)
         ),
         ?assert(lists:member({stream, 0, 0, ~"hello", true}, Frames))
@@ -108,7 +108,7 @@ peer_close_terminates_shell(#{shell := Shell, peer := Peer, client := ClientSock
         Close = ?TC:seal(
             application,
             0,
-            roadrunner_quic_keys:traffic_keys(ClientApSecret),
+            roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientApSecret),
             [{ack, 0, 0, 0, [], undefined}, {connection_close, transport, 0, 0, <<>>}],
             ?DCID,
             ?SCID
@@ -274,7 +274,6 @@ loss_timer_fires(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := 
 config(Peer) ->
     {Scheme, PrivKey} = ?TC:key_material(),
     {ClientPub, ClientPriv} = ?TC:gen_keypair(),
-    {ServerPub, ServerPriv} = ?TC:gen_keypair(),
     Config = #{
         dcid => ?DCID,
         scid => ?SCID,
@@ -292,15 +291,12 @@ config(Peer) ->
             initial_max_streams_bidi => 100,
             initial_max_streams_uni => 100
         },
-        eph_pub => ServerPub,
-        eph_priv => ServerPriv,
         server_random => crypto:strong_rand_bytes(32)
     },
     {Config, #{
         scheme => Scheme,
         client_pub => ClientPub,
-        client_priv => ClientPriv,
-        server_pub => ServerPub
+        client_priv => ClientPriv
     }}.
 
 client_hello(#{scheme := Scheme, client_pub := ClientPub}) ->
@@ -315,7 +311,7 @@ client_hello(#{scheme := Scheme, client_pub := ClientPub}) ->
 %% HANDSHAKE_DONE (left on the socket for the caller). Returns the server
 %% application secret for decoding the 1-RTT reply.
 do_handshake(Shell, Peer, ClientSocket, Ctx) ->
-    #{client_priv := ClientPriv, server_pub := ServerPub} = Ctx,
+    #{client_priv := ClientPriv} = Ctx,
     {InitialDatagram, ClientHelloFramed} = client_hello(Ctx),
     Shell ! {quic_datagram, Peer, InitialDatagram},
     Flight1 = recv_all(ClientSocket),
@@ -323,7 +319,7 @@ do_handshake(Shell, Peer, ClientSocket, Ctx) ->
         Flight1, initial, #{initial => roadrunner_quic_keys:initial_server(?DCID)}, byte_size(?DCID)
     ),
     ?assertNotEqual(<<>>, ServerHello),
-    Shared = crypto:compute_key(ecdh, ServerPub, ClientPriv, x25519),
+    Shared = crypto:compute_key(ecdh, ?TC:server_hello_key_share(ServerHello), ClientPriv, x25519),
     HandshakeSecret = roadrunner_quic_tls_crypto:handshake_secret(
         roadrunner_quic_tls_crypto:early_secret(), Shared
     ),
@@ -337,7 +333,7 @@ do_handshake(Shell, Peer, ClientSocket, Ctx) ->
     Flight = ?TC:crypto_bytes(
         Flight1,
         handshake,
-        #{handshake => roadrunner_quic_keys:traffic_keys(ServerHsSecret)},
+        #{handshake => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerHsSecret)},
         byte_size(?DCID)
     ),
     FinishedHash = roadrunner_quic_tls_crypto:transcript_hash([
@@ -352,7 +348,7 @@ do_handshake(Shell, Peer, ClientSocket, Ctx) ->
     FinishedDatagram = ?TC:seal(
         handshake,
         0,
-        roadrunner_quic_keys:traffic_keys(ClientHsSecret),
+        roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientHsSecret),
         [{crypto, 0, ClientFinishedFramed}],
         ?DCID,
         ?SCID

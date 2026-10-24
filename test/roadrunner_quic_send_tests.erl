@@ -209,6 +209,9 @@ budget_datagram_size(DCID, PN, AckFrames, Sid, Offset) ->
 recv(Datagram, Keys) ->
     roadrunner_quic_recv:datagram(Datagram, byte_size(?DCID), Keys, #{}).
 
-initial_keys() -> #{key => <<31:128>>, iv => <<32:96>>, hp => <<33:128>>}.
-handshake_keys() -> #{key => <<11:128>>, iv => <<12:96>>, hp => <<13:128>>}.
-application_keys() -> #{key => <<21:128>>, iv => <<22:96>>, hp => <<23:128>>}.
+initial_keys() ->
+    #{key => {aes_128_gcm, <<31:128>>}, iv => <<32:96>>, hp => {aes_128_ecb, <<33:128>>}}.
+handshake_keys() ->
+    #{key => {aes_128_gcm, <<11:128>>}, iv => <<12:96>>, hp => {aes_128_ecb, <<13:128>>}}.
+application_keys() ->
+    #{key => {aes_128_gcm, <<21:128>>}, iv => <<22:96>>, hp => {aes_128_ecb, <<23:128>>}}.

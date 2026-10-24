@@ -122,7 +122,11 @@ As `connect/2` but with `Opts`. `stream_window => N` advertises a small
 per-stream flow-control window so a test can exercise stream-level
 backpressure on the server (default 800000). `max_streams_uni => N`
 advertises how many unidirectional streams the server may open (default 3,
-the RFC 9114 §6.2 minimum).
+the RFC 9114 §6.2 minimum). `cipher_suites => [Codepoint]` sets the offered
+TLS cipher suites (default TLS_AES_128_GCM_SHA256 only), so a test can
+drive the server onto another suite's packet protection. `group => x25519 |
+secp256r1` is the one key exchange group offered, with its key share
+(default x25519).
 """.
 -spec connect(inet:ip_address() | inet:hostname(), inet:port_number(), map()) ->
     {ok, pid()} | {error, term()}.
@@ -228,13 +232,24 @@ init(Parent, Ref, Host, Port, Opts) ->
     {ok, Socket} = roadrunner_quic_socket:open(0),
     Dcid0 = crypto:strong_rand_bytes(?CID_LEN),
     Scid = crypto:strong_rand_bytes(?CID_LEN),
-    {EphPub, EphPriv} = crypto:generate_key(ecdh, x25519),
+    Curve = maps:get(group, Opts, x25519),
+    {EphPub, EphPriv} = crypto:generate_key(ecdh, Curve),
     StreamWindow = maps:get(stream_window, Opts, 800000),
-    ChFramed = roadrunner_quic_test_client:client_hello_framed(?SIG_SCHEME, EphPub, Scid, #{
-        initial_max_stream_data_bidi_local => StreamWindow,
-        initial_max_stream_data_uni => StreamWindow,
-        initial_max_streams_uni => maps:get(max_streams_uni, Opts, 3)
-    }),
+    ChFramed = roadrunner_quic_test_client:client_hello_framed(
+        maps:merge(
+            #{
+                scheme => ?SIG_SCHEME,
+                key_shares => [{group_codepoint(Curve), EphPub}],
+                client_scid => Scid,
+                transport_params => #{
+                    initial_max_stream_data_bidi_local => StreamWindow,
+                    initial_max_stream_data_uni => StreamWindow,
+                    initial_max_streams_uni => maps:get(max_streams_uni, Opts, 3)
+                }
+            },
+            maps:with([cipher_suites], Opts)
+        )
+    ),
     %% Send the Initial carrying the ClientHello (padded to 1200 by seal/6).
     ClientInitialKeys = roadrunner_quic_keys:initial_client(Dcid0),
     Initial = roadrunner_quic_test_client:seal(
@@ -266,6 +281,11 @@ init(Parent, Ref, Host, Port, Opts) ->
             Parent ! {Ref, {error, Reason}},
             ok
     end.
+
+%% The NamedGroup codepoint of a `crypto` curve (RFC 8446 §4.2.7).
+-spec group_codepoint(x25519 | secp256r1) -> non_neg_integer().
+group_codepoint(x25519) -> 16#001D;
+group_codepoint(secp256r1) -> 16#0017.
 
 %% Read one datagram, buffer it, and drive the handshake as far as the
 %% buffered datagrams allow, until connected or a timeout.
@@ -685,5 +705,5 @@ deframe_complete(Bytes, Acc) ->
     [roadrunner_quic_test_handshake:install()]
 ) -> roadrunner_quic_keys:keys().
 keys_for(Level, Role, Installs) ->
-    [Secret] = [S || {L, R, S} <- Installs, L =:= Level, R =:= Role],
-    roadrunner_quic_keys:traffic_keys(Secret).
+    [{Aead, Secret}] = [{A, S} || {L, R, A, S} <- Installs, L =:= Level, R =:= Role],
+    roadrunner_quic_keys:traffic_keys(Aead, Secret).
