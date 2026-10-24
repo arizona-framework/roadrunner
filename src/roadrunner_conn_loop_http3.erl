@@ -32,10 +32,12 @@
 %% (`rem 4 =:= 2`) are demultiplexed by stream type (RFC 9114 §6.2):
 %% the peer control stream is validated (exactly one, SETTINGS as its
 %% first frame, no request frames), the QPACK encoder/decoder streams
-%% are accepted and drained (zero table capacity means no instructions
-%% are expected), a client-initiated push stream is refused, and
+%% are checked against the zero table capacity we advertise (only the
+%% instructions valid without a dynamic table are accepted), a
+%% client-initiated push stream is refused, and
 %% unknown stream types are ignored. A violation on any of these closes
-%% the connection with the matching RFC 9114 §8.1 error code.
+%% the connection with the matching RFC 9114 §8.1 / RFC 9204 §6 error
+%% code.
 %%
 %% On a graceful drain (a `{roadrunner_drain, _}` message from the
 %% listener) it sends a GOAWAY on its control stream (RFC 9114 §5.2),
@@ -74,6 +76,13 @@
 -define(H3_REQUEST_REJECTED, 16#010B).
 -define(H3_MESSAGE_ERROR, 16#010E).
 -define(H3_QPACK_DECOMPRESSION_FAILED, 16#0200).
+-define(H3_QPACK_ENCODER_STREAM_ERROR, 16#0201).
+-define(H3_QPACK_DECODER_STREAM_ERROR, 16#0202).
+
+%% Longest prefixed-integer continuation a QPACK stream instruction may
+%% carry: a value is at most 62 bits, which 5 or 6 prefix bits plus 9
+%% continuation bytes of 7 bits each cover.
+-define(MAX_QPACK_INT_CONTINUATION, 9).
 
 %% Default cap on the encoded request field section (the HEADERS block).
 %% The body is bounded by `max_content_length`; this bounds header memory
@@ -97,12 +106,17 @@
 %% Per peer-uni-stream state: `pending` while the leading stream-type
 %% varint is still arriving, `control` once it is known to be the peer
 %% control stream (buffering frames + tracking whether SETTINGS was
-%% seen), `drain` for streams whose bytes we read and discard (QPACK
-%% encoder/decoder = `critical`, unknown types = `noncritical`).
+%% seen), `qpack_encoder` / `qpack_decoder` for the QPACK streams (each
+%% tracking how many continuation bytes of an instruction's integer it is
+%% inside, `none` between instructions), and `drain` for an unknown stream
+%% type whose bytes we read and discard.
 -type uni_state() ::
     {pending, binary()}
     | {control, binary(), SettingsReceived :: boolean()}
-    | {drain, critical | noncritical}.
+    | {qpack_encoder | qpack_decoder, qpack_continuation()}
+    | drain.
+
+-type qpack_continuation() :: none | 0..?MAX_QPACK_INT_CONTINUATION.
 
 -record(h3, {
     conn :: pid(),
@@ -900,8 +914,12 @@ uni_event({pending, Buf}, Critical, Data, Fin) ->
     uni_classify(<<Buf/binary, Data/binary>>, Critical, Fin);
 uni_event({control, Buf, SettingsReceived}, Critical, Data, Fin) ->
     uni_control(<<Buf/binary, Data/binary>>, SettingsReceived, Critical, Fin);
-uni_event({drain, Criticality}, Critical, _Data, Fin) ->
-    uni_drain(Criticality, Critical, Fin).
+uni_event({qpack_encoder, Continuation}, Critical, Data, Fin) ->
+    uni_qpack_encoder(Data, Continuation, Critical, Fin);
+uni_event({qpack_decoder, Continuation}, Critical, Data, Fin) ->
+    uni_qpack_decoder(Data, Continuation, Critical, Fin);
+uni_event(drain, Critical, _Data, Fin) ->
+    uni_drain(Critical, Fin).
 
 %% Read the leading stream-type varint and dispatch on it.
 -spec uni_classify(binary(), critical_set(), boolean()) -> uni_result().
@@ -916,15 +934,17 @@ uni_classify(Buf, Critical, Fin) ->
                 {ok, Critical1} ->
                     uni_control(Rest, false, Critical1, Fin)
             end;
-        {ok, qpack_encoder, _Rest} ->
-            uni_qpack(Critical, qpack_encoder, Fin);
-        {ok, qpack_decoder, _Rest} ->
-            uni_qpack(Critical, qpack_decoder, Fin);
+        {ok, qpack_encoder, Rest} ->
+            uni_qpack(Critical, qpack_encoder, Rest, Fin);
+        {ok, qpack_decoder, Rest} ->
+            uni_qpack(Critical, qpack_decoder, Rest, Fin);
         {ok, push, _Rest} ->
             %% RFC 9114 §6.2.2 / §7.2.5: only servers open push streams.
             {conn_error, ?H3_STREAM_CREATION_ERROR, ~"client-initiated push stream"};
         {ok, {unknown, _Type}, _Rest} ->
-            uni_unknown(Critical, Fin)
+            %% RFC 9114 §6.2.3: an unknown stream type carries no
+            %% obligation; read and discard it.
+            uni_drain(Critical, Fin)
     end.
 
 %% The stream-type varint has not fully arrived yet. If the peer also
@@ -935,28 +955,83 @@ uni_more(_Buf, Critical, true) ->
 uni_more(Buf, Critical, false) ->
     {{pending, Buf}, Critical}.
 
-%% RFC 9114 §6.2.3: an unknown unidirectional stream type carries no
-%% obligation; read and discard it (dropping a closed one).
--spec uni_unknown(critical_set(), boolean()) -> uni_result().
-uni_unknown(Critical, true) ->
-    {drop, Critical};
-uni_unknown(Critical, false) ->
-    {{drain, noncritical}, Critical}.
-
-%% A QPACK encoder / decoder stream (RFC 9204 §4.2). One of each only; a
-%% peer closing it is H3_CLOSED_CRITICAL_STREAM. We advertised table
-%% capacity 0, so no instructions are expected — keep it open and drain.
--spec uni_qpack(critical_set(), qpack_encoder | qpack_decoder, boolean()) -> uni_result().
-uni_qpack(Critical, Role, Fin) ->
+%% A QPACK encoder / decoder stream (RFC 9204 §4.2). One of each only; its
+%% instructions are checked from the first byte after the stream type.
+-spec uni_qpack(critical_set(), qpack_encoder | qpack_decoder, binary(), boolean()) ->
+    uni_result().
+uni_qpack(Critical, Role, Rest, Fin) ->
     case claim(Critical, Role) of
         {error, dup} ->
             {conn_error, ?H3_STREAM_CREATION_ERROR, ~"duplicate QPACK stream"};
         {ok, Critical1} ->
-            case Fin of
-                true -> {conn_error, ?H3_CLOSED_CRITICAL_STREAM, ~"peer closed a QPACK stream"};
-                false -> {{drain, critical}, Critical1}
-            end
+            uni_qpack_instructions(Role, Rest, Critical1, Fin)
     end.
+
+-spec uni_qpack_instructions(qpack_encoder | qpack_decoder, binary(), critical_set(), boolean()) ->
+    uni_result().
+uni_qpack_instructions(qpack_encoder, Data, Critical, Fin) ->
+    uni_qpack_encoder(Data, none, Critical, Fin);
+uni_qpack_instructions(qpack_decoder, Data, Critical, Fin) ->
+    uni_qpack_decoder(Data, none, Critical, Fin).
+
+%% The peer's encoder stream. We advertised a dynamic table capacity of 0,
+%% so the one valid instruction is Set Dynamic Table Capacity to 0 (the
+%% single byte 0x20). A larger capacity exceeds our limit (RFC 9204
+%% §4.3.1), an insert cannot fit a zero-capacity table (§3.2.2), and a
+%% Duplicate names an entry that cannot exist (§4.3.4): each is
+%% QPACK_ENCODER_STREAM_ERROR. A capacity past the 5-bit prefix (0x3F) is
+%% rejected once its integer ends, so a stream that closes inside it is a
+%% closed critical stream instead (§4.2); `Continuation` counts the bytes
+%% of that integer read so far.
+-spec uni_qpack_encoder(binary(), qpack_continuation(), critical_set(), boolean()) ->
+    uni_result().
+uni_qpack_encoder(<<16#20, Rest/binary>>, none, Critical, Fin) ->
+    uni_qpack_encoder(Rest, none, Critical, Fin);
+uni_qpack_encoder(<<16#3F, Rest/binary>>, none, Critical, Fin) ->
+    uni_qpack_encoder(Rest, 0, Critical, Fin);
+uni_qpack_encoder(<<_, _/binary>>, none, _Critical, _Fin) ->
+    {conn_error, ?H3_QPACK_ENCODER_STREAM_ERROR, ~"invalid QPACK encoder instruction"};
+uni_qpack_encoder(<<1:1, _:7, Rest/binary>>, Count, Critical, Fin) when
+    Count < ?MAX_QPACK_INT_CONTINUATION
+->
+    uni_qpack_encoder(Rest, Count + 1, Critical, Fin);
+uni_qpack_encoder(<<_, _/binary>>, _Count, _Critical, _Fin) ->
+    {conn_error, ?H3_QPACK_ENCODER_STREAM_ERROR, ~"QPACK table capacity over the limit"};
+uni_qpack_encoder(<<>>, Continuation, Critical, Fin) ->
+    qpack_stream_open({qpack_encoder, Continuation}, Critical, Fin).
+
+%% The peer's decoder stream. Our encoder never uses the dynamic table, so
+%% every field section we send has a Required Insert Count of 0: a Section
+%% Acknowledgment (RFC 9204 §4.4.1) or an Insert Count Increment (§4.4.3)
+%% is QPACK_DECODER_STREAM_ERROR. A Stream Cancellation (01xxxxxx, a 6-bit
+%% prefixed stream id, §4.4.2) is valid and skipped; `Continuation` counts
+%% the bytes of its integer's continuation read so far.
+-spec uni_qpack_decoder(binary(), qpack_continuation(), critical_set(), boolean()) ->
+    uni_result().
+uni_qpack_decoder(<<2#01:2, Prefix:6, Rest/binary>>, none, Critical, Fin) when Prefix < 16#3F ->
+    uni_qpack_decoder(Rest, none, Critical, Fin);
+uni_qpack_decoder(<<2#01:2, _:6, Rest/binary>>, none, Critical, Fin) ->
+    uni_qpack_decoder(Rest, 0, Critical, Fin);
+uni_qpack_decoder(<<_, _/binary>>, none, _Critical, _Fin) ->
+    {conn_error, ?H3_QPACK_DECODER_STREAM_ERROR, ~"invalid QPACK decoder instruction"};
+uni_qpack_decoder(<<0:1, _:7, Rest/binary>>, _Count, Critical, Fin) ->
+    uni_qpack_decoder(Rest, none, Critical, Fin);
+uni_qpack_decoder(<<1:1, _:7, Rest/binary>>, Count, Critical, Fin) when
+    Count < ?MAX_QPACK_INT_CONTINUATION
+->
+    uni_qpack_decoder(Rest, Count + 1, Critical, Fin);
+uni_qpack_decoder(<<_, _/binary>>, _Count, _Critical, _Fin) ->
+    {conn_error, ?H3_QPACK_DECODER_STREAM_ERROR, ~"QPACK decoder integer too long"};
+uni_qpack_decoder(<<>>, Continuation, Critical, Fin) ->
+    qpack_stream_open({qpack_decoder, Continuation}, Critical, Fin).
+
+%% A QPACK stream's bytes so far are valid; the peer closing it is
+%% H3_CLOSED_CRITICAL_STREAM (RFC 9204 §4.2).
+-spec qpack_stream_open(uni_state(), critical_set(), boolean()) -> uni_result().
+qpack_stream_open(_UniState, _Critical, true) ->
+    {conn_error, ?H3_CLOSED_CRITICAL_STREAM, ~"peer closed a QPACK stream"};
+qpack_stream_open(UniState, Critical, false) ->
+    {UniState, Critical}.
 
 %% Validate buffered bytes of the peer control stream against the
 %% control-frame sequence rules, then (if not closed) keep the leftover
@@ -977,15 +1052,13 @@ uni_control(Buf, SettingsReceived, Critical, Fin) ->
             end
     end.
 
-%% Bytes on a stream we only drain. A closed critical stream (QPACK) is
-%% an error; a closed non-critical stream (unknown type) is dropped.
--spec uni_drain(critical | noncritical, critical_set(), boolean()) -> uni_result().
-uni_drain(critical, _Critical, true) ->
-    {conn_error, ?H3_CLOSED_CRITICAL_STREAM, ~"peer closed a critical stream"};
-uni_drain(noncritical, Critical, true) ->
+%% Bytes on an unknown stream type, which we only drain; once closed it
+%% needs no further tracking.
+-spec uni_drain(critical_set(), boolean()) -> uni_result().
+uni_drain(Critical, true) ->
     {drop, Critical};
-uni_drain(Criticality, Critical, false) ->
-    {{drain, Criticality}, Critical}.
+uni_drain(Critical, false) ->
+    {drain, Critical}.
 
 %% Claim a critical stream role, rejecting a second of the same kind.
 -spec claim(critical_set(), critical_role()) -> {ok, critical_set()} | {error, dup}.
@@ -1050,7 +1123,8 @@ is_control_allowed(_Frame) -> true.
 %% stream (so it must close the connection).
 -spec uni_reset(uni_state()) -> critical | noncritical.
 uni_reset({control, _, _}) -> critical;
-uni_reset({drain, critical}) -> critical;
+uni_reset({qpack_encoder, _}) -> critical;
+uni_reset({qpack_decoder, _}) -> critical;
 uni_reset(_UniState) -> noncritical.
 
 -spec dispatch_request(#h3{}, non_neg_integer()) -> handle_result().
