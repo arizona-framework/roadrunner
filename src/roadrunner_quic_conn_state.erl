@@ -189,6 +189,11 @@
     %% CONNECTION_CLOSE to transmit at that encryption level. `undefined` for a
     %% live connection or a peer-initiated close (which sends nothing back).
     pending_close = undefined :: undefined | {level(), non_neg_integer()},
+    %% After our own CONNECTION_CLOSE from an established connection: the
+    %% datagram that carried it, the packets received since, and the count at
+    %% which to send it again (RFC 9000 §10.2.1).
+    close_resend = undefined ::
+        undefined | {Datagram :: binary(), Received :: non_neg_integer(), NextAt :: pos_integer()},
     %% The negotiated idle timeout in ms (RFC 9000 §10.1): the minimum of our
     %% advertised max_idle_timeout and the peer's, set from our value at birth and
     %% lowered to the negotiated minimum once the ClientHello delivers the peer's.
@@ -386,11 +391,25 @@ handle_datagram(
 %% with {connected, _} ordered ahead of any stream events from the same
 %% datagram so the owner opens its control stream before the first request.
 -spec finish_datagram(integer(), phase(), t()) -> {t(), [effect()]}.
-finish_datagram(_Now, draining, #state{phase = draining} = State) ->
-    %% A packet arrived during an established connection's drain window: absorb it
+finish_datagram(_Now, draining, #state{phase = draining, close_resend = undefined} = State) ->
+    %% A packet arrived during the drain window after the peer closed: absorb it
     %% silently (RFC 9000 §10.2.2). Send nothing and arm no timer, so the drain
     %% timer set on entry keeps running in the shell.
     drain_emits(State);
+finish_datagram(_Now, draining, #state{phase = draining, close_resend = Resend} = State) ->
+    %% A packet arrived after our own close: the peer may not have seen it, so
+    %% answer with the same CONNECTION_CLOSE again (RFC 9000 §10.2.1), but only
+    %% at exponentially spaced packet counts so the answers stay far fewer than
+    %% the packets that draw them. No timer: the drain timer keeps running.
+    {State1, Emits} = drain_emits(State),
+    case Resend of
+        {Datagram, Received, NextAt} when Received + 1 >= NextAt ->
+            {State1#state{close_resend = {Datagram, Received + 1, NextAt * 2}}, [
+                {send, Datagram} | Emits
+            ]};
+        {Datagram, Received, NextAt} ->
+            {State1#state{close_resend = {Datagram, Received + 1, NextAt}}, Emits}
+    end;
 finish_datagram(Now, _Before, #state{phase = draining, pending_close = undefined} = State) ->
     %% Just entered draining via a peer CONNECTION_CLOSE: release any parked
     %% send replies (the send pass is skipped here, so a parked worker would
@@ -405,9 +424,9 @@ finish_datagram(Now, _Before, #state{phase = draining} = State) ->
     %% and arm the drain timer. An established connection's address is
     %% validated, so the close always fits the §8.1 budget (send_close emits
     %% exactly one datagram).
-    {State1, [Close]} = send_close(State),
+    {State1, [{send, Datagram} = Close]} = send_close(State),
     {State2, Releases} = release_all({error, closed}, State1),
-    {State3, EmitEffects} = drain_emits(State2),
+    {State3, EmitEffects} = drain_emits(State2#state{close_resend = {Datagram, 0, 1}}),
     {State3, [Close, {arm_timer, drain, drain_deadline(Now, State3)} | Releases ++ EmitEffects]};
 finish_datagram(_Now, _Before, #state{phase = closed, pending_close = undefined} = State) ->
     drain_emits(State);
