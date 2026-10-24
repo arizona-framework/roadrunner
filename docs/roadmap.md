@@ -178,13 +178,16 @@ changes by profile-share, not headline req/s.
 
 ### External interop check
 
-The native test client runs the same codecs as the native server, so a
-symmetric codec bug round-trips cleanly and survives. The RFC published vectors
-cover the codecs and crypto as external truth, but an independent implementation
-is a stronger guard.
+`scripts/h3interop.sh` already gates every PR on the quiche and ngtcp2 clients
+(downloads, uploads, multiplexing, with and without packet loss). Remaining:
 
-- Drive the native server from a real QUIC stack (quiche / ngtcp2 / headless
-  Chrome) in CI as an end-to-end interop gate — medium
+- Run the QUIC Interop Runner (quic-interop-runner) on a schedule: a server
+  image following its endpoint contract, so every client stack runs its test
+  cases (handshake, transfer, retry, resumption, zerortt, chacha20, keyupdate,
+  ecn, v2, connection migration) and the unsupported ones show as named gaps
+  — medium
+- Add headless Chrome to the interop harness, the client most deployments
+  serve — small-medium
 
 ## HttpArena profile gaps
 
