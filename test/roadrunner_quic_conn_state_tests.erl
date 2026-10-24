@@ -502,6 +502,49 @@ lost_path_response_not_resent_test() ->
     ?assertNotEqual([], Frames),
     ?assertEqual([], [F || {path_response, _} = F <- Frames]).
 
+retransmit_of_several_lost_packets_fits_datagrams_test() ->
+    %% RFC 9000 §14: every datagram stays within 1200 bytes. Losing several
+    %% full packets queues all their STREAM frames for retransmission; they go
+    %% out over as many datagrams as they need, never one oversized one, and
+    %% every lost byte is sent again.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Payload = binary:copy(~"x", 5000),
+    {State1, Sent} = ?M:handle_send(self(), make_ref(), 0, Payload, true, ?NOW, State),
+    Largest = largest_app_pn(Sent, ServerApSecret),
+    Ack = app_datagram([{ack, Largest, 0, 0, [], undefined}], 0, ClientApSecret),
+    {State2, AckEffects} = ?M:handle_datagram(?NOW, Ack, State1),
+    {_State3, PtoEffects} = ?M:handle_timeout(?NOW + 5000, pto, State2),
+    Resent = sends(AckEffects) ++ sends(PtoEffects),
+    ?assertEqual([], [byte_size(D) || D <- Resent, byte_size(D) > 1200]),
+    LastFrames = sent_stream_frames(Sent, ServerApSecret),
+    LostBytes = lists:sum([byte_size(Data) || {stream, 0, _, Data, _} <- lists:droplast(LastFrames)]),
+    ResentFrames =
+        sent_stream_frames(AckEffects, ServerApSecret) ++
+            sent_stream_frames(PtoEffects, ServerApSecret),
+    ?assertEqual(
+        LostBytes, lists:sum([byte_size(Data) || {stream, 0, _, Data, _} <- ResentFrames])
+    ).
+
+fit_frames_splits_crypto_test() ->
+    %% A CRYPTO frame past the room splits at an offset: the head fills the
+    %% room exactly and the tail carries on from where it stops.
+    Data = binary:copy(~"c", 500),
+    {[{crypto, 100, Head}], [{crypto, Next, Tail}]} = ?M:fit_frames([{crypto, 100, Data}], 200),
+    ?assertEqual(200, iolist_size(roadrunner_quic_frame:encode({crypto, 100, Head}))),
+    ?assertEqual(100 + byte_size(Head), Next),
+    ?assertEqual(Data, <<Head/binary, Tail/binary>>).
+
+fit_frames_keeps_what_does_not_fit_test() ->
+    %% A frame that cannot be split, or a STREAM / CRYPTO frame with no room
+    %% for a data byte, waits whole for the next packet, as does all after it.
+    Token = {new_token, binary:copy(~"t", 50)},
+    Ping = ping,
+    ?assertEqual({[Ping], [Token, Ping]}, ?M:fit_frames([Ping, Token, Ping], 20)),
+    ?assertEqual({[], [{crypto, 0, ~"abc"}]}, ?M:fit_frames([{crypto, 0, ~"abc"}], 3)),
+    ?assertEqual(
+        {[], [{stream, 0, 0, ~"abc", true}]}, ?M:fit_frames([{stream, 0, 0, ~"abc", true}], 3)
+    ).
+
 pto_probe_ack_recovers_a_lost_tail_test() ->
     %% The last packet of a response is lost. The probe draws an ACK of the
     %% probe alone, which shows the older packet lost, and it is sent again.

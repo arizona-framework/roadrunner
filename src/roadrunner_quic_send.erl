@@ -35,7 +35,7 @@
 %% the returned datagram's size. The record also carries the packet's
 %% frames so the loop can retransmit them if it is later declared lost.
 
--export([datagram/3, stream_data_budget/5]).
+-export([datagram/3, stream_data_budget/5, max_payload/4]).
 %% Exported for the connection loop's ack-tracking and loss-retransmit
 %% decisions: the single source of truth for which frames are ack-eliciting.
 -export([ack_eliciting/1, is_ack_eliciting/1]).
@@ -199,6 +199,17 @@ stream_data_budget(DCID, PN, AckFrames, Sid, Offset) ->
     StreamHeader = 1 + roadrunner_quic_varint:encoded_size(Sid) + OffsetBytes + 2,
     Overhead = ShortHeader + AckBytes + StreamHeader + ?TAG_LEN,
     max(0, ?MAX_1RTT_DATAGRAM - Overhead).
+
+-doc """
+The frame bytes one packet at `Level` with packet number `PN` can carry and
+still fit a 1200-byte datagram (RFC 9000 §14): the datagram limit less the
+packet header (a long header's Length field sized for a 2-byte varint, which
+holds up to 16383 bytes) and the AEAD tag.
+""".
+-spec max_payload(level(), binary(), binary(), non_neg_integer()) -> non_neg_integer().
+max_payload(Level, DCID, SCID, PN) ->
+    Header = header(Level, DCID, SCID, PN, ?MAX_1RTT_DATAGRAM, 0),
+    ?MAX_1RTT_DATAGRAM - byte_size(Header) - ?TAG_LEN.
 
 %% A packet is ack-eliciting if it carries any frame other than PADDING,
 %% ACK, or CONNECTION_CLOSE (RFC 9002 §2).
