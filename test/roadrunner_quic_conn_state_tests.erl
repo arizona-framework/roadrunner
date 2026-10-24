@@ -447,6 +447,30 @@ pto_probe_resends_what_it_finds_lost_test() ->
     ?assertMatch([{stream, 0, 0, _, false} | _], [F || {stream, _, _, _, _} = F <- Frames]),
     ?assertNot(lists:member(ping, Frames)).
 
+path_challenge_answered_test() ->
+    %% RFC 9000 §8.2.2: a PATH_CHALLENGE gets a PATH_RESPONSE echoing its data.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Challenge = app_datagram([{path_challenge, ~"8 bytes!"}], 0, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Challenge, State),
+    ?assertEqual(connected, ?M:phase(State1)),
+    ?assert(lists:member({path_response, ~"8 bytes!"}, sent_app_frames(Effects, ServerApSecret))).
+
+lost_path_response_not_resent_test() ->
+    %% RFC 9000 §13.3: a PATH_RESPONSE is sent once. With a later packet
+    %% acknowledged, the probe timeout finds the response's packet lost and
+    %% resends the rest of it, never the response.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Challenge = app_datagram([{path_challenge, ~"8 bytes!"}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, Challenge, State),
+    {State2, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"later", true, ?NOW, State1),
+    Largest = largest_app_pn(Sent, ServerApSecret),
+    Ack = app_datagram([{ack, Largest, 0, 0, [], undefined}], 1, ClientApSecret),
+    {State3, _} = ?M:handle_datagram(?NOW, Ack, State2),
+    {_State4, Effects} = ?M:handle_timeout(?NOW + 5000, pto, State3),
+    Frames = sent_app_frames(Effects, ServerApSecret),
+    ?assertNotEqual([], Frames),
+    ?assertEqual([], [F || {path_response, _} = F <- Frames]).
+
 pto_probe_ack_recovers_a_lost_tail_test() ->
     %% The last packet of a response is lost. The probe draws an ACK of the
     %% probe alone, which shows the older packet lost, and it is sent again.

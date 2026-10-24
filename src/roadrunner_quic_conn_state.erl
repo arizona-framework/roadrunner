@@ -768,10 +768,13 @@ process_frame(_Now, Level, handshake_done, State) ->
 process_frame(_Now, Level, {new_token, _Token}, State) ->
     %% Only a server sends NEW_TOKEN (RFC 9000 §19.7).
     connection_fatal(Level, protocol_violation, State);
+process_frame(_Now, application, {path_challenge, Data}, State) ->
+    %% RFC 9000 §8.2.2: answer with a PATH_RESPONSE echoing the challenge.
+    queue_frame(application, {path_response, Data}, State);
 process_frame(_Now, application, _Frame, State) ->
     %% The other 1-RTT frames are accepted but not acted on yet: MAX_STREAMS
     %% (the server never opens enough streams to need the raised limit), the
-    %% BLOCKED signals, and the connection-id and path frames.
+    %% BLOCKED signals, the connection-id frames and PATH_RESPONSE.
     State;
 process_frame(_Now, Level, _Frame, State) ->
     %% RFC 9000 §12.4 / §12.5: Initial and Handshake packets carry only
@@ -1793,11 +1796,17 @@ min_defined(A, B) -> min(A, B).
 
 %% Flatten the per-packet frame lists a loss returns and keep only the
 %% frames worth resending: ACK / PADDING / CONNECTION_CLOSE are regenerated
-%% fresh or terminal, never replayed (RFC 9002 §13.3).
+%% fresh or terminal, never replayed (RFC 9002 §13.3), and a PATH_RESPONSE
+%% answers one PATH_CHALLENGE once, on the path it arrived on (RFC 9000
+%% §13.3).
 %% `roadrunner_quic_send:ack_eliciting/1` is the single source of truth for
 %% which frames are ack-eliciting. Callers fold the result onto the existing
 %% pending list with `lists:reverse/2` (order within the flushed packet is
 %% irrelevant), so no list append is needed.
 -spec retransmittable([[roadrunner_quic_frame:frame()]]) -> [roadrunner_quic_frame:frame()].
 retransmittable(Lost) ->
-    [Frame || Frame <- lists:append(Lost), roadrunner_quic_send:is_ack_eliciting(Frame)].
+    [Frame || Frame <- lists:append(Lost), is_retransmittable(Frame)].
+
+-spec is_retransmittable(roadrunner_quic_frame:frame()) -> boolean().
+is_retransmittable({path_response, _Data}) -> false;
+is_retransmittable(Frame) -> roadrunner_quic_send:is_ack_eliciting(Frame).
