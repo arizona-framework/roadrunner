@@ -57,8 +57,6 @@ KNOWN_FAILURES=(
     "MUST send H3_FRAME_ERROR if a SETTINGS frame stops mid-parameter"
     "MUST send H3_FRAME_UNEXPECTED if CANCEL_PUSH is received in a request stream"
     "MUST NOT buffer a frame longer than SETTINGS_MAX_FIELD_SECTION_SIZE"
-    "MUST send QPACK_ENCODER_STREAM_ERROR if a new dynamic table capacity value exceeds the limit"
-    "MUST send QPACK_DECODER_STREAM_ERROR if Insert Count Increment is 0"
 )
 
 case "$(uname -s)-$(uname -m)" in
