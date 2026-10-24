@@ -162,14 +162,6 @@ replenishes its receive window with MAX_DATA, so a connection sustains a downloa
 Erlang process per connection, serial per-datagram decrypt), so validate server
 changes by profile-share, not headline req/s.
 
-- Batch UDP sends — the #1 steady-state download cost (~18%): each datagram is
-  one `gen_udp:send`, i.e. one `port_command` syscall, ~56 per 64 KB response.
-  Coalescing them into one `socket:sendmsg` with a `UDP_SEGMENT` cmsg (GSO) cuts
-  it, but `gen_udp` has no batched-send primitive, so it needs the OTP `socket`
-  API (or a NIF) plus per-path sizing; Linux-only with a per-datagram fallback.
-  Helps multi-datagram downloads only (a 1-datagram small response can't batch).
-  `drain_send` already accumulates a pass's datagrams into one list, so the core
-  can emit one `{send_batch, [Datagram]}` effect — large
 - Per-packet AEAD + header protection (~10%) and packet assembly
   (`build_packet/4` + `stream_data_budget/5`, ~13% together): mostly inherent
   per-packet work. `stream_data_budget/5` re-encodes the pending ACK frames each

@@ -145,14 +145,27 @@ fire_timer(_TRef, State) ->
 %% Effects
 %% =============================================================================
 
+%% Perform the effects in order. A run of consecutive sends goes to the
+%% socket in one call, so it can hand them to the kernel together (GSO).
 -spec perform([roadrunner_quic_conn_state:effect()], integer(), #shell{}) -> #shell{}.
-perform(Effects, Now, State) ->
-    lists:foldl(fun(Effect, Acc) -> perform_effect(Effect, Now, Acc) end, State, Effects).
+perform([{send, _} | _] = Effects, Now, #shell{socket = Socket, peer = {Ip, Port}} = State) ->
+    {Datagrams, Rest} = take_sends(Effects),
+    ok = roadrunner_quic_socket:send_batch(Socket, Ip, Port, Datagrams),
+    perform(Rest, Now, State);
+perform([Effect | Rest], Now, State) ->
+    perform(Rest, Now, perform_effect(Effect, Now, State));
+perform([], _Now, State) ->
+    State.
+
+-spec take_sends([roadrunner_quic_conn_state:effect()]) ->
+    {[binary()], [roadrunner_quic_conn_state:effect()]}.
+take_sends([{send, Datagram} | Rest]) ->
+    {Datagrams, Tail} = take_sends(Rest),
+    {[Datagram | Datagrams], Tail};
+take_sends(Effects) ->
+    {[], Effects}.
 
 -spec perform_effect(roadrunner_quic_conn_state:effect(), integer(), #shell{}) -> #shell{}.
-perform_effect({send, Datagram}, _Now, #shell{socket = Socket, peer = {Ip, Port}} = State) ->
-    _ = roadrunner_quic_socket:send(Socket, Ip, Port, Datagram),
-    State;
 perform_effect({emit, Owner, Event}, _Now, State) ->
     _ = Owner ! {quic, self(), Event},
     State;

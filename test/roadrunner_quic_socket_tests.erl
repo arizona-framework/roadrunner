@@ -36,3 +36,25 @@ from_message_ignores_foreign_message_test() ->
     ),
     ?assertEqual(ignore, ?M:from_message(Socket, {'DOWN', ref, process, self(), normal})),
     ok = ?M:close(Socket).
+
+open_rejects_non_boolean_gso_test() ->
+    ?assertError({invalid_quic_socket_opt, gso, yes}, ?M:open(0, #{gso => yes})).
+
+%% GSO is enabled only on Linux and only when the kernel takes the option;
+%% the Linux test host reaches neither fallback through open/2.
+gso_segment_off_outside_linux_test() ->
+    {ok, Socket} = gen_udp:open(0),
+    ?assertEqual(none, ?M:gso_segment(Socket, #{gso => true}, {unix, darwin})),
+    ?assertEqual(none, ?M:gso_segment(Socket, #{gso => true}, {win32, nt})),
+    ok = gen_udp:close(Socket).
+
+gso_segment_off_when_option_refused_test() ->
+    %% A closed socket refuses every option, like a kernel without UDP_SEGMENT.
+    {ok, Socket} = gen_udp:open(0),
+    ok = gen_udp:close(Socket),
+    ?assertEqual(none, ?M:gso_segment(Socket, #{gso => true}, {unix, linux})).
+
+gso_segment_off_when_disabled_test() ->
+    {ok, Socket} = gen_udp:open(0),
+    ?assertEqual(none, ?M:gso_segment(Socket, #{gso => false}, {unix, linux})),
+    ok = gen_udp:close(Socket).
