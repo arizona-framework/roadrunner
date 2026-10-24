@@ -74,7 +74,15 @@ init_per_testcase(Case, Config) ->
         maps:merge(
             #{
                 port => 0,
-                protocols => [http2],
+                %% The RFC 9113 §6.9.2 baseline windows the window cases
+                %% count from.
+                protocols => [
+                    {http2, #{
+                        conn_window => 65535,
+                        stream_window => 65535,
+                        window_refill_threshold => 32768
+                    }}
+                ],
                 body_buffering => manual,
                 max_content_length => 64,
                 routes => routes(self())
