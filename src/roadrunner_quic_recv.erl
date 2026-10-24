@@ -23,6 +23,9 @@
 %%
 %% Per packet it yields `{ok, Decoded}` (decrypted, frames decoded),
 %% `{drop, Reason}` for an unsupported packet or one with no keys,
+%% `{held, Packet}` for a 1-RTT packet when no 1-RTT keys are given (the
+%% packet still protected, so the loop can keep it and decrypt it once the
+%% handshake completes, RFC 9001 §5.7),
 %% `{auth_failed, Level}` for a packet that fails authentication (both
 %% silently dropped, never the whole datagram, RFC 9001 §5.4.2; the
 %% failure is reported apart so the loop can count it toward the AEAD
@@ -91,6 +94,7 @@
 -type outcome() ::
     {ok, decoded()}
     | {drop, atom()}
+    | {held, binary()}
     | {auth_failed, level()}
     | {frame_error, level(), term()}.
 
@@ -125,7 +129,7 @@ datagram(Datagram, DCIDLen, Keys, Largest) ->
 packet(Packet, DCIDLen, Keys, Largest) ->
     maybe
         {ok, Level} ?= classify(Packet),
-        {ok, #{hp := HP} = LevelKeys} ?= level_keys(Level, Keys),
+        {ok, #{hp := HP} = LevelKeys} ?= level_keys(Level, Packet, Keys),
         {ok, PNOffset} ?= roadrunner_quic_packet:pn_offset(Packet, DCIDLen),
         {ok, Header, PNLen, TruncPN, Ciphertext} ?=
             roadrunner_quic_aead:unprotect_header(HP, Packet, PNOffset),
@@ -142,6 +146,7 @@ packet(Packet, DCIDLen, Keys, Largest) ->
         end
     else
         {drop, _} = Drop -> Drop;
+        {held, _} = Held -> Held;
         {auth_failed, _} = Failed -> Failed;
         {error, Reason} -> {drop, Reason}
     end.
@@ -156,11 +161,16 @@ classify(<<1:1, 1:1, 2:2, _:4, _/binary>>) -> {ok, handshake};
 classify(<<0:1, 1:1, _:6, _/binary>>) -> {ok, application};
 classify(_) -> {drop, unsupported_packet}.
 
--spec level_keys(level(), #{level() => keys()}) -> {ok, keys()} | {drop, no_keys}.
-level_keys(Level, Keys) ->
-    case Keys of
-        #{Level := LevelKeys} -> {ok, LevelKeys};
-        #{} -> {drop, no_keys}
+%% A level's keys. A 1-RTT packet with none is handed back still protected
+%% rather than dropped: the loop withholds the 1-RTT keys until the
+%% handshake completes (RFC 9001 §5.7) and keeps such a packet until then.
+-spec level_keys(level(), binary(), #{level() => keys()}) ->
+    {ok, keys()} | {held, binary()} | {drop, no_keys}.
+level_keys(Level, Packet, Keys) ->
+    case {Level, Keys} of
+        {_, #{Level := LevelKeys}} -> {ok, LevelKeys};
+        {application, #{}} -> {held, Packet};
+        {_, #{}} -> {drop, no_keys}
     end.
 
 -spec level_largest(level(), #{level() => non_neg_integer()}) -> non_neg_integer() | undefined.
