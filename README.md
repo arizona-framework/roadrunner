@@ -475,7 +475,9 @@ Standards conformance:
   [h2spec](https://github.com/summerwind/h2spec)).
 - **HTTP/3 (experimental)**: RFC 9114 over QUIC with QPACK (RFC 9204)
   static-table compression, over Roadrunner's own pure-Erlang QUIC
-  transport (TLS 1.3 required).
+  transport (TLS 1.3 required). Error-case harness:
+  [`scripts/h3spec.sh`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/h3spec.sh) (drives
+  [h3spec](https://github.com/kazu-yamamoto/h3spec)).
 - **Content-Encoding (RFC 9110 §8.4.1)**: gzip + deflate with
   qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3),
   works unchanged over HTTP/2.
