@@ -115,6 +115,10 @@ start_shell(Socket, Peer, FirstDatagram) ->
         scid => ServerSCID,
         peer_scid => ClientSCID,
         peer => Peer,
+        %% The pump routes by peer address, so the ids the connection issues
+        %% are registered in a table nothing reads.
+        registry => roadrunner_quic_cid_registry:new(),
+        reset_key => crypto:strong_rand_bytes(32),
         cert_chain => CertChain,
         priv_key => PrivKey,
         alpn => ~"h3",

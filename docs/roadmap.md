@@ -83,9 +83,6 @@ only). Remaining work:
 - A scheduler-scaled default for the reuseport pool size
   (`{http3, #{listeners => N}}`, validated `1..1024`, default 8,
   `1` = no pooling); currently unmeasured
-- Full RFC 9000 connection-ID rotation: issuing spare server CIDs and
-  registering them so packets using them route; currently unimplemented
-  in the native stack
 - Send the buffered response to the QUIC connection one way, as the h2
   worker does: the h3 worker still waits for the connection's send reply
   on its final send, a message and a worker wake-up per request. Not a
@@ -125,6 +122,15 @@ advisory or malformed cases the server currently tolerates or omits.
   transfer that fills a non-zero window — already emits the frame on the
   flow's blocked transition; this remainder is the never-sent-a-byte case a
   conformant peer never produces — small
+- Send a stateless reset (RFC 9000 §10.3) for a short-header datagram that
+  routes to no connection, so a client the server has forgotten stops at
+  once instead of waiting out its idle timeout. Every issued connection id
+  already carries a valid token (`reset_token/2` in
+  `roadrunner_quic_cid_registry`); the rest is the listener's send with the
+  §10.3 size floor and loop limits, the handshake id's token in the
+  `stateless_reset_token` transport parameter, and a reset key that
+  outlives a restart (it is random per listener pool today, so only ids the
+  running pool issued can be reset). Small-medium
 
 ### Throughput levers identified by profiling
 

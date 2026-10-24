@@ -22,6 +22,8 @@
 -define(CLIENT_SCID, <<11, 12, 13, 14, 15, 16, 17, 18>>).
 -define(PEER, {{127, 0, 0, 1}, 12345}).
 -define(NOW, 1000).
+%% The stateless reset key the issued connection ids' tokens derive from.
+-define(RESET_KEY, <<7:256>>).
 %% Must match roadrunner_quic_conn_state's ?IDLE_TIMEOUT default.
 -define(IDLE_TIMEOUT, 30000).
 %% Advertised receive windows (RFC 9000 §4.1), deliberately small and distinct
@@ -310,6 +312,14 @@ undecryptable_packet_dropped_test() ->
     WrongKeys = #{key => {aes_128_gcm, <<0:128>>}, iv => <<0:96>>, hp => {aes_128_ecb, <<0:128>>}},
     Datagram = ?TC:seal(initial, 0, WrongKeys, [{crypto, 0, ~"hello"}], ?DCID, ?SCID),
     {State1, Effects} = ?M:handle_datagram(?NOW, Datagram, State0),
+    ?assertEqual(handshaking, ?M:phase(State1)),
+    ?assertEqual([], sends(Effects)).
+
+truncated_datagram_dropped_test() ->
+    %% A short header too short to hold the server's connection id carries
+    %% no packet; the connection neither advances nor replies.
+    {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
+    {State1, Effects} = ?M:handle_datagram(?NOW, <<16#40, 1, 2, 3>>, State0),
     ?assertEqual(handshaking, ?M:phase(State1)),
     ?assertEqual([], sends(Effects)).
 
@@ -659,15 +669,6 @@ assert_1rtt_frame_closes(Frame) ->
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
 
-retire_unissued_connection_id_closes_test() ->
-    %% RFC 9000 §19.16: the server only ever issued sequence number 0, so
-    %% retiring a higher one is a PROTOCOL_VIOLATION.
-    {State, ApSecret} = connected_with_owner(),
-    Retire = app_datagram([{retire_connection_id, 1}], 0, ApSecret),
-    {State1, Effects} = ?M:handle_datagram(?NOW, Retire, State),
-    ?assertEqual(draining, ?M:phase(State1)),
-    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
-
 unhandled_1rtt_frames_accepted_test() ->
     %% The 1-RTT frames the server does not act on yet are still legal there
     %% and leave the connection open.
@@ -675,12 +676,247 @@ unhandled_1rtt_frames_accepted_test() ->
     Frames = [
         {data_blocked, 0},
         {path_challenge, <<0:64>>},
-        {max_streams, bidi, 10},
-        {retire_connection_id, 0}
+        {max_streams, bidi, 10}
     ],
     {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram(Frames, 0, ApSecret), State),
     ?assertEqual(connected, ?M:phase(State1)),
     ?assertEqual([], emits(Effects)).
+
+%% =============================================================================
+%% Connection ids (RFC 9000 §5.1)
+%% =============================================================================
+
+spare_connection_id_issued_on_confirmation_test() ->
+    %% RFC 9000 §5.1.1: once the handshake is confirmed the server issues a
+    %% spare connection id, up to the client's active_connection_id_limit (2
+    %% when absent, the handshake's id counting): one NEW_CONNECTION_ID with
+    %% sequence number 1, a fresh id of the server's fixed length, and the
+    %% reset token derived from it (§10.3.2). The id routes to the connection
+    %% before the datagram announcing it goes out.
+    #{effects2 := Effects, server_ap_secret := ServerApSecret} = connect(),
+    [{new_connection_id, 1, 0, CID, Token}] = new_cids(Effects, ServerApSecret),
+    ?assertEqual(8, byte_size(CID)),
+    ?assertNotEqual(?SCID, CID),
+    ?assertEqual(roadrunner_quic_cid_registry:reset_token(?RESET_KEY, CID), Token),
+    ?assertEqual([{register_cid, CID}], registers(Effects)),
+    ?assert(index_of({register_cid, CID}, Effects) < index_of(first_send(Effects), Effects)).
+
+issued_up_to_client_limit_test() ->
+    %% A client accepting three ids gets two spares (sequence numbers 1 and
+    %% 2), each a different id with its own token.
+    #{effects2 := Effects, server_ap_secret := ServerApSecret} = connect(
+        #{}, #{transport_params => #{active_connection_id_limit => 3}}
+    ),
+    [{new_connection_id, 1, 0, CID1, Token1}, {new_connection_id, 2, 0, CID2, Token2}] =
+        lists:sort(new_cids(Effects, ServerApSecret)),
+    ?assertNotEqual(CID1, CID2),
+    ?assertNotEqual(Token1, Token2).
+
+issued_ids_capped_test() ->
+    %% However many ids the client accepts, the server keeps at most four
+    %% active (RFC 9000 §5.1.1 lets it limit them): three spares.
+    #{effects2 := Effects, server_ap_secret := ServerApSecret} = connect(
+        #{}, #{transport_params => #{active_connection_id_limit => 10}}
+    ),
+    ?assertEqual(
+        [1, 2, 3],
+        lists:sort([Seq || {new_connection_id, Seq, _, _, _} <- new_cids(Effects, ServerApSecret)])
+    ).
+
+retire_issued_connection_id_test() ->
+    %% RFC 9000 §19.16 / §5.1.2: retiring an issued id stops it routing to the
+    %% connection, and a replacement (the next sequence number) keeps the
+    %% client supplied.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_spare(),
+    Retire = app_datagram([{retire_connection_id, 1}], 0, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Retire, State),
+    ?assertEqual(connected, ?M:phase(State1)),
+    [{new_connection_id, 2, 0, CID2, _Token}] = new_cids(Effects, ServerApSecret),
+    ?assertEqual([{unregister_cid, CID1}, {register_cid, CID2}], registers(Effects)),
+    %% A repeated RETIRE_CONNECTION_ID for the same id changes nothing.
+    Again = app_datagram([{retire_connection_id, 1}], 1, ClientApSecret),
+    {State2, Effects2} = ?M:handle_datagram(?NOW, Again, State1),
+    ?assertEqual(connected, ?M:phase(State2)),
+    ?assertEqual([], registers(Effects2)),
+    ?assertEqual([], new_cids(Effects2, ServerApSecret)).
+
+retire_handshake_connection_id_test() ->
+    %% The handshake's id (sequence number 0) can be retired too, from a
+    %% packet sent to another of the server's ids.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_spare(),
+    Retire = app_datagram_to(CID1, [{retire_connection_id, 0}], 0, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Retire, State),
+    ?assertEqual(connected, ?M:phase(State1)),
+    [{new_connection_id, 2, 0, CID2, _Token}] = new_cids(Effects, ServerApSecret),
+    ?assertEqual([{unregister_cid, ?SCID}, {register_cid, CID2}], registers(Effects)).
+
+retire_own_destination_id_closes_test() ->
+    %% RFC 9000 §19.16: the frame MUST NOT retire the id its own packet was
+    %% sent to, and the server treats that as a PROTOCOL_VIOLATION.
+    {State, ClientApSecret, _ServerApSecret, _CID1} = connected_with_spare(),
+    Retire = app_datagram_to(?SCID, [{retire_connection_id, 0}], 0, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Retire, State),
+    ?assertEqual(draining, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
+
+retire_unissued_connection_id_closes_test() ->
+    %% RFC 9000 §19.16: retiring a sequence number never issued (the server
+    %% issued 0 and 1) is a PROTOCOL_VIOLATION.
+    {State, ApSecret} = connected_with_owner(),
+    Retire = app_datagram([{retire_connection_id, 2}], 0, ApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, Retire, State),
+    ?assertEqual(draining, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
+
+retire_held_until_confirmation_test() ->
+    %% A RETIRE_CONNECTION_ID sent before the handshake completes is held
+    %% unprocessed with its packet (RFC 9001 §5.7). Confirmation issues the
+    %% first spare, then the held retirement (of the handshake's id, from a
+    %% packet sent to the client's original id) stops that id routing and
+    %% draws a replacement.
+    #{
+        state1 := State1,
+        client_ap_secret := ClientApSecret,
+        client_hs_secret := ClientHsSecret,
+        cf_framed := ClientFinished,
+        aead := Aead,
+        server_ap_secret := ServerApSecret
+    } = connect(),
+    Retire = app_datagram([{retire_connection_id, 0}], 0, ClientApSecret),
+    {State2, Effects2} = ?M:handle_datagram(?NOW, Retire, State1),
+    ?assertEqual(handshaking, ?M:phase(State2)),
+    ?assertEqual([], registers(Effects2)),
+    Finished = ?TC:seal(
+        handshake,
+        0,
+        roadrunner_quic_keys:traffic_keys(Aead, ClientHsSecret),
+        [{crypto, 0, ClientFinished}],
+        ?DCID,
+        ?SCID
+    ),
+    {State3, Effects3} = ?M:handle_datagram(?NOW, Finished, State2),
+    ?assertEqual(connected, ?M:phase(State3)),
+    [{new_connection_id, 1, 0, CID1, _}, {new_connection_id, 2, 0, CID2, _}] = lists:sort(
+        new_cids(Effects3, ServerApSecret)
+    ),
+    ?assertEqual(
+        [{register_cid, CID1}, {unregister_cid, ?SCID}, {register_cid, CID2}], registers(Effects3)
+    ).
+
+lost_new_connection_id_resent_test() ->
+    %% RFC 9000 §13.3: a lost NEW_CONNECTION_ID is resent with the same
+    %% sequence number while the id is still active.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_spare(),
+    Frames = lose_first_app_packet(State, ClientApSecret, ServerApSecret),
+    ?assertMatch([{new_connection_id, 1, 0, CID1, _}], [
+        F
+     || {new_connection_id, _, _, _, _} = F <- Frames
+    ]).
+
+lost_new_connection_id_for_retired_id_not_resent_test() ->
+    %% Once the client retired the id, a lost announcement of it is not resent.
+    {State, ClientApSecret, ServerApSecret, _CID1} = connected_with_spare(),
+    Retire = app_datagram([{retire_connection_id, 1}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, Retire, State),
+    Frames = lose_first_app_packet(State1, ClientApSecret, ServerApSecret),
+    ?assert(lists:member(handshake_done, Frames)),
+    ?assertEqual([], [Seq || {new_connection_id, Seq, _, _, _} <- Frames, Seq =:= 1]).
+
+client_connection_id_kept_test() ->
+    %% RFC 9000 §5.1.2: a client's spare id is stored, while the server keeps
+    %% addressing the id it uses. A repeat of the frame is no error (§19.15).
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    New = {new_connection_id, 1, 0, <<21:64>>, <<0:128>>},
+    {State1, _} = ?M:handle_datagram(?NOW, app_datagram([New], 0, ClientApSecret), State),
+    {State2, _} = ?M:handle_datagram(?NOW, app_datagram([New], 1, ClientApSecret), State1),
+    ?assertEqual(connected, ?M:phase(State2)),
+    {_State3, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"x", true, ?NOW, State2),
+    ?assertEqual([?CLIENT_SCID], short_header_dcids(Sent)),
+    ?assertNotEqual([], sent_stream_frames(Sent, ServerApSecret)).
+
+retire_prior_to_moves_to_new_client_id_test() ->
+    %% RFC 9000 §5.1.2: a Retire Prior To covering the id the server
+    %% addresses makes it retire that id and address the new one.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    New = {new_connection_id, 1, 1, <<21:64>>, <<0:128>>},
+    {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram([New], 0, ClientApSecret), State),
+    ?assertEqual(connected, ?M:phase(State1)),
+    ?assert(lists:member({retire_connection_id, 0}, sent_app_frames(Effects, ServerApSecret))),
+    ?assertEqual([<<21:64>>], lists:usort(short_header_dcids(Effects))),
+    %% A Retire Prior To that does not increase the largest received is
+    %% ignored (§19.15): the id stays in use.
+    Stale = {new_connection_id, 2, 0, <<22:64>>, <<1:128>>},
+    {State2, _} = ?M:handle_datagram(?NOW, app_datagram([Stale], 1, ClientApSecret), State1),
+    {_State3, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"x", true, ?NOW, State2),
+    ?assertEqual([<<21:64>>], short_header_dcids(Sent)).
+
+retire_prior_to_keeps_the_id_in_use_test() ->
+    %% A Retire Prior To at or below the id the server addresses retires only
+    %% the ids under it. Sequence 5 (Retire Prior To 3) takes over from 0,
+    %% a late 4 joins it, and then 6 (Retire Prior To 5) retires 4 alone.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Frames = [
+        {new_connection_id, 5, 3, <<25:64>>, <<5:128>>},
+        {new_connection_id, 4, 0, <<24:64>>, <<4:128>>},
+        {new_connection_id, 6, 5, <<26:64>>, <<6:128>>}
+    ],
+    {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram(Frames, 0, ClientApSecret), State),
+    ?assertEqual(connected, ?M:phase(State1)),
+    Retired = [Seq || {retire_connection_id, Seq} <- sent_app_frames(Effects, ServerApSecret)],
+    ?assertEqual([0, 4], lists:sort(Retired)),
+    ?assertEqual([<<25:64>>], lists:usort(short_header_dcids(Effects))).
+
+late_client_id_below_retire_prior_to_is_retired_test() ->
+    %% RFC 9000 §19.15: an id numbered below the largest Retire Prior To
+    %% received is retired at once, never used.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Newer = {new_connection_id, 2, 2, <<22:64>>, <<2:128>>},
+    Late = {new_connection_id, 1, 0, <<21:64>>, <<1:128>>},
+    {State1, _} = ?M:handle_datagram(?NOW, app_datagram([Newer], 0, ClientApSecret), State),
+    {State2, Effects} = ?M:handle_datagram(?NOW, app_datagram([Late], 1, ClientApSecret), State1),
+    ?assertEqual(connected, ?M:phase(State2)),
+    ?assert(lists:member({retire_connection_id, 1}, sent_app_frames(Effects, ServerApSecret))),
+    {_State3, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"x", true, ?NOW, State2),
+    ?assertEqual([<<22:64>>], short_header_dcids(Sent)).
+
+client_connection_id_errors_test_() ->
+    %% RFC 9000 §19.15: a sequence number reused for another id may be a
+    %% PROTOCOL_VIOLATION, and is here (the handshake's id is sequence 0).
+    %% §5.1.1: more active ids than the active_connection_id_limit the server
+    %% advertised (2 by default) is a CONNECTION_ID_LIMIT_ERROR.
+    [
+        ?_test(
+            assert_client_cids_close(
+                [{new_connection_id, 0, 0, <<21:64>>, <<0:128>>}], protocol_violation
+            )
+        ),
+        ?_test(
+            assert_client_cids_close(
+                [
+                    {new_connection_id, 1, 0, <<21:64>>, <<1:128>>},
+                    {new_connection_id, 2, 0, <<22:64>>, <<2:128>>}
+                ],
+                connection_id_limit_error
+            )
+        )
+    ].
+
+assert_client_cids_close(Frames, Reason) ->
+    {State, ApSecret} = connected_with_owner(),
+    {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram(Frames, 0, ApSecret), State),
+    ?assertEqual(draining, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, Reason}}}], emits(Effects)).
+
+zero_length_client_id_new_connection_id_closes_test() ->
+    %% RFC 9000 §19.15: a client that chose a zero-length connection id MUST
+    %% NOT send NEW_CONNECTION_ID, and receiving one is a PROTOCOL_VIOLATION.
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(
+        #{peer_scid => <<>>}, #{client_scid => <<>>}
+    ),
+    New = {new_connection_id, 1, 0, <<21:64>>, <<0:128>>},
+    {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram([New], 0, ClientApSecret), State),
+    ?assertEqual(draining, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
 
 application_close_at_1rtt_closes_test() ->
     %% An application-variant CONNECTION_CLOSE (0x1d) is legal at 1-RTT (an h3
@@ -2106,7 +2342,7 @@ late_packet_during_draining_is_absorbed_test() ->
 %% counts 1, 2, 4, 8, ... so the answers stay rate-limited.
 late_packet_after_local_close_resends_close_test() ->
     {State, ApSecret} = connected_with_owner(),
-    Bad = app_datagram([{retire_connection_id, 1}], 0, ApSecret),
+    Bad = app_datagram([{retire_connection_id, 9}], 0, ApSecret),
     {Closing, CloseEffects} = ?M:handle_datagram(?NOW, Bad, State),
     ?assertEqual(draining, ?M:phase(Closing)),
     [CloseDatagram] = sends(CloseEffects),
@@ -2738,23 +2974,28 @@ curve(?GROUP_SECP256R1) -> secp256r1.
 new_conn(CertChain) ->
     new_conn(CertChain, #{}).
 
-%% `Extra` adds optional config keys (`stream_credit`).
+%% `Extra` adds optional config keys (`stream_credit`) or overrides the
+%% defaults (`peer_scid`, `transport_params`).
 new_conn(CertChain, Extra) ->
     {Scheme, PrivKey} = ?TC:key_material(),
     {ClientPub, ClientPriv} = ?TC:gen_keypair(),
     TransportParams = transport_params(),
     State = ?M:new(
-        Extra#{
-            dcid => ?DCID,
-            scid => ?SCID,
-            peer_scid => ?CLIENT_SCID,
-            peer => ?PEER,
-            cert_chain => CertChain,
-            priv_key => PrivKey,
-            alpn => ~"h3",
-            transport_params => TransportParams,
-            server_random => crypto:strong_rand_bytes(32)
-        },
+        maps:merge(
+            #{
+                dcid => ?DCID,
+                scid => ?SCID,
+                peer_scid => ?CLIENT_SCID,
+                peer => ?PEER,
+                reset_key => ?RESET_KEY,
+                cert_chain => CertChain,
+                priv_key => PrivKey,
+                alpn => ~"h3",
+                transport_params => TransportParams,
+                server_random => crypto:strong_rand_bytes(32)
+            },
+            Extra
+        ),
         ?NOW
     ),
     {State, #{
@@ -2832,9 +3073,15 @@ connect_owned(Extra) ->
 
 %% `HelloOpts` as for connect/2.
 connect_owned(Extra, HelloOpts) ->
-    {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(Extra, HelloOpts),
-    {State2, _Effects} = ?M:handle_datagram(?NOW, Finished, State1),
+    {State2, _Effects, ClientApSecret, ServerApSecret} = connect_owned_effects(Extra, HelloOpts),
     {State2, ClientApSecret, ServerApSecret}.
+
+%% As connect_owned/2, with the effects of the datagram that confirmed the
+%% handshake.
+connect_owned_effects(Extra, HelloOpts) ->
+    {State1, Finished, ClientApSecret, ServerApSecret} = handshaking_owned(Extra, HelloOpts),
+    {State2, Effects} = ?M:handle_datagram(?NOW, Finished, State1),
+    {State2, Effects, ClientApSecret, ServerApSecret}.
 
 %% Still handshaking (after the ClientHello) with this process installed as
 %% owner, plus the client's Handshake datagram carrying its Finished, not yet
@@ -2861,6 +3108,42 @@ handshaking_owned(Extra, HelloOpts) ->
     ),
     {with_owner(State1), Finished, ClientApSecret, ServerApSecret}.
 
+%% Connected with this process as owner, plus the spare connection id
+%% (sequence number 1) the server issued on confirmation.
+connected_with_spare() ->
+    {State, Effects, ClientApSecret, ServerApSecret} = connect_owned_effects(#{}, #{}),
+    [{new_connection_id, 1, 0, CID1, _Token}] = new_cids(Effects, ServerApSecret),
+    {State, ClientApSecret, ServerApSecret, CID1}.
+
+%% The NEW_CONNECTION_ID frames the server sent.
+new_cids(Effects, ServerApSecret) ->
+    [F || {new_connection_id, _, _, _, _} = F <- sent_app_frames(Effects, ServerApSecret)].
+
+%% The connection-id routing effects, in order.
+registers(Effects) ->
+    [E || E <- Effects, element(1, E) =:= register_cid orelse element(1, E) =:= unregister_cid].
+
+index_of(Elem, List) ->
+    length(lists:takewhile(fun(E) -> E =/= Elem end, List)) + 1.
+
+first_send(Effects) ->
+    hd([E || {send, _} = E <- Effects]).
+
+%% The Destination Connection ID of each 1-RTT datagram the server sent.
+short_header_dcids(Effects) ->
+    [DCID || {send, <<0:1, _:7, DCID:8/binary, _/binary>>} <- Effects].
+
+%% Lose the server's first 1-RTT packet (its HANDSHAKE_DONE flight): send a
+%% later packet, acknowledge only that, and let the probe timeout declare the
+%% first lost. Returns every 1-RTT frame the server sent again.
+lose_first_app_packet(State, ClientApSecret, ServerApSecret) ->
+    {State1, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"later", true, ?NOW, State),
+    Largest = largest_app_pn(Sent, ServerApSecret),
+    Ack = app_datagram([{ack, Largest, 0, 0, [], undefined}], 9, ClientApSecret),
+    {State2, AckEffects} = ?M:handle_datagram(?NOW, Ack, State1),
+    {_State3, PtoEffects} = ?M:handle_timeout(?NOW + 5000, pto, State2),
+    sent_app_frames(AckEffects, ServerApSecret) ++ sent_app_frames(PtoEffects, ServerApSecret).
+
 %% Connected, owner installed, with the client secret for sealing peer 1-RTT.
 connected_with_owner() ->
     {State2, ClientApSecret, _ServerApSecret} = connect_owned(),
@@ -2874,12 +3157,16 @@ connected_for_send() ->
 
 %% Seal a peer 1-RTT (application) datagram carrying the given frames.
 app_datagram(Frames, PN, ClientApSecret) ->
+    app_datagram_to(?DCID, Frames, PN, ClientApSecret).
+
+%% As app_datagram/3, addressed to the server connection id `DCID`.
+app_datagram_to(DCID, Frames, PN, ClientApSecret) ->
     ?TC:seal(
         application,
         PN,
         roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientApSecret),
         Frames,
-        ?DCID,
+        DCID,
         ?SCID
     ).
 

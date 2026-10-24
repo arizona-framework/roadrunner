@@ -17,6 +17,7 @@
 shell_test_() ->
     {foreach, fun setup/0, fun cleanup/1, [
         fun handshake_completes/1,
+        fun issued_connection_id_routes_to_shell/1,
         fun send_data_round_trip/1,
         fun peer_close_terminates_shell/1,
         fun peername_round_trip/1,
@@ -37,9 +38,16 @@ setup() ->
     {ok, ClientSocket} = roadrunner_quic_socket:open(0),
     {ok, {_Ip, ClientPort}} = roadrunner_quic_socket:sockname(ClientSocket),
     Peer = {{127, 0, 0, 1}, ClientPort},
-    {Config, Ctx} = config(Peer),
+    {#{registry := Registry} = Config, Ctx} = config(Peer),
     {ok, Shell} = ?CONN:start(ServerSocket, Config),
-    #{shell => Shell, peer => Peer, client => ClientSocket, server => ServerSocket, ctx => Ctx}.
+    #{
+        shell => Shell,
+        peer => Peer,
+        client => ClientSocket,
+        server => ServerSocket,
+        ctx => Ctx,
+        registry => Registry
+    }.
 
 cleanup(#{shell := Shell, client := ClientSocket, server := ServerSocket}) ->
     exit(Shell, kill),
@@ -60,6 +68,37 @@ handshake_completes(#{shell := Shell, peer := Peer, client := ClientSocket, ctx 
             byte_size(?DCID)
         ),
         ?assert(lists:member(handshake_done, AppFrames))
+    end.
+
+%% The spare connection id the core issues on confirmation routes to the shell
+%% in the registry (RFC 9000 §5.1.1), and stops routing once the client
+%% retires it (§19.16), while its replacement takes over.
+issued_connection_id_routes_to_shell(#{
+    shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx, registry := Registry
+}) ->
+    fun() ->
+        {ClientApSecret, ServerApSecret} = do_handshake(Shell, Peer, ClientSocket, Ctx),
+        ServerKeys = #{
+            application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)
+        },
+        [{new_connection_id, 1, 0, CID1, _}] = new_cids(
+            ?TC:frames(recv_all(ClientSocket), application, ServerKeys, byte_size(?DCID))
+        ),
+        ?assertEqual({ok, Shell}, roadrunner_quic_cid_registry:lookup(Registry, CID1)),
+        Retire = ?TC:seal(
+            application,
+            0,
+            roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientApSecret),
+            [{retire_connection_id, 1}],
+            ?DCID,
+            ?SCID
+        ),
+        Shell ! {quic_datagram, Peer, Retire},
+        [{new_connection_id, 2, 0, CID2, _}] = new_cids(
+            ?TC:frames(recv_all(ClientSocket), application, ServerKeys, byte_size(?DCID))
+        ),
+        ?assertEqual(error, roadrunner_quic_cid_registry:lookup(Registry, CID1)),
+        ?assertEqual({ok, Shell}, roadrunner_quic_cid_registry:lookup(Registry, CID2))
     end.
 
 %% A stream write round-trips through the shell: {quic_send, ...} is answered
@@ -279,6 +318,8 @@ config(Peer) ->
         scid => ?SCID,
         peer_scid => ?SCID,
         peer => Peer,
+        registry => roadrunner_quic_cid_registry:new(),
+        reset_key => crypto:strong_rand_bytes(32),
         cert_chain => [~"leaf-cert-der"],
         priv_key => PrivKey,
         alpn => ~"h3",
@@ -370,6 +411,9 @@ recv_all(Socket) ->
         {ok, _Peer, Data} -> [Data | recv_all(Socket)];
         {error, timeout} -> []
     end.
+
+new_cids(Frames) ->
+    [F || {new_connection_id, _, _, _, _} = F <- Frames].
 
 %% A synchronous round-trip after an async message proves the loop consumed
 %% that message (mailbox order) and is still looping.

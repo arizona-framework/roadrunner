@@ -5,16 +5,21 @@
 %% decision core (a hand-rolled receive loop, never a gen_statem, mirroring
 %% `roadrunner_conn_loop_http2`). The core owns the whole connection state
 %% and every decision; this shell owns only the irreducible I/O: the shared
-%% UDP socket handle (for sending), the peer address, the conn_state value,
-%% and the single loss/PTO timer.
+%% UDP socket handle (for sending), the peer address, the listener's
+%% connection-id registry, the conn_state value, and the single loss/PTO
+%% timer.
 %%
 %% The QUIC socket is passive and shared across connections (SO_REUSEPORT),
 %% so the shell never reads it. The listener reads the socket and routes
 %% each datagram to the owning connection as a `{quic_datagram, Peer,
 %% Bytes}` message; the shell only sends on the socket. Every message drives
 %% one conn_state entry point, and the returned effects are performed here:
-%% `{send, Datagram}` goes out the socket to the peer, and `{arm_timer,
-%% Kind, AtMs}` sets the one deadline the core wants. The shell re-arms its
+%% `{send, Datagram}` goes out the socket to the peer, `{arm_timer, Kind,
+%% AtMs}` sets the one deadline the core wants, and `{register_cid, CID}` /
+%% `{unregister_cid, CID}` route a connection id the core issued to this
+%% process in the registry, or stop routing one the peer retired (RFC 9000
+%% §5.1). The listener reaps every row on the process's exit, so a closing
+%% connection leaves none behind. The shell re-arms its
 %% timer lazily: a later deadline leaves an earlier armed timer running, and
 %% when that one fires ahead of the deadline it is just re-armed, so a
 %% deadline that keeps moving later (a PTO pushed back by each ACK) costs no
@@ -40,7 +45,10 @@
     %% The armed timer and the time it fires at, never after `deadline`.
     timer :: {reference(), integer()} | undefined,
     %% The core's current deadline: the timer kind to run, and when.
-    deadline :: {atom(), integer()} | undefined
+    deadline :: {atom(), integer()} | undefined,
+    %% The listener's connection-id routing table, where the ids the core
+    %% issues are routed to this process.
+    registry :: roadrunner_quic_cid_registry:t()
 }).
 
 %% =============================================================================
@@ -59,14 +67,15 @@ start(Socket, Config) ->
 -doc false.
 -spec init(roadrunner_quic_socket:socket(), roadrunner_quic_conn_state:config()) ->
     ok | no_return().
-init(Socket, #{peer := Peer} = Config) ->
+init(Socket, #{peer := Peer, registry := Registry} = Config) ->
     proc_lib:set_label({?MODULE, Peer}),
     loop(#shell{
         socket = Socket,
         peer = Peer,
         conn = roadrunner_quic_conn_state:new(Config, erlang:monotonic_time(millisecond)),
         timer = undefined,
-        deadline = undefined
+        deadline = undefined,
+        registry = Registry
     }).
 
 %% =============================================================================
@@ -171,6 +180,12 @@ perform_effect({emit, Owner, Event}, _Now, State) ->
     State;
 perform_effect({reply, To, Ref, Result}, _Now, State) ->
     _ = To ! {quic_reply, Ref, Result},
+    State;
+perform_effect({register_cid, CID}, _Now, #shell{registry = Registry} = State) ->
+    ok = roadrunner_quic_cid_registry:add(Registry, CID, self()),
+    State;
+perform_effect({unregister_cid, CID}, _Now, #shell{registry = Registry} = State) ->
+    ok = roadrunner_quic_cid_registry:remove(Registry, CID, self()),
     State;
 perform_effect({arm_timer, Kind, AtMs}, Now, #shell{timer = Timer} = State0) ->
     State = State0#shell{deadline = {Kind, AtMs}},

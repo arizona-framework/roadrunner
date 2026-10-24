@@ -24,8 +24,11 @@
 %%
 %% A new server Source Connection ID is generated per connection at a fixed
 %% length, so short-header 1-RTT packets (which carry no CID-length field)
-%% demux by slicing that many leading bytes. `roadrunner_quic_listener_sup`
-%% runs a SO_REUSEPORT pool of these listeners sharing one injected registry.
+%% demux by slicing that many leading bytes. The spare ids a connection issues
+%% once connected (RFC 9000 §5.1.1) have the same length, and the connection
+%% routes them itself through the same registry; the listener's cleanup on its
+%% exit reaps them with the rest. `roadrunner_quic_listener_sup` runs a
+%% SO_REUSEPORT pool of these listeners sharing one injected registry.
 
 -export([start_link/1, get_port/1, stop/1]).
 -export([new_accept_gate/0, close_accept_gate/1]).
@@ -422,6 +425,7 @@ set_owner_sync(ConnPid, Owner) ->
 ) ->
     roadrunner_quic_conn_state:config().
 conn_config(ClientDCID, ClientSCID, ServerSCID, Peer, #listener{
+    registry = Registry,
     cert_chain = CertChain,
     priv_key = PrivKey,
     alpn = Alpn,
@@ -433,6 +437,10 @@ conn_config(ClientDCID, ClientSCID, ServerSCID, Peer, #listener{
         scid => ServerSCID,
         peer_scid => ClientSCID,
         peer => Peer,
+        %% The connection routes the spare ids it issues through the shared
+        %% registry, each with a reset token under the registry's key.
+        registry => Registry,
+        reset_key => roadrunner_quic_cid_registry:reset_key(Registry),
         cert_chain => CertChain,
         priv_key => PrivKey,
         alpn => Alpn,
