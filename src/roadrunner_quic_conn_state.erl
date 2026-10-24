@@ -65,6 +65,13 @@
 %% asks for at least 4096; a client's handshake messages (its ClientHello
 %% and Finished) fit far inside this.
 -define(CRYPTO_BUFFER_LIMIT, 65536).
+%% How long a 1-RTT ACK may wait for a packet to ride in (RFC 9000 §13.2.1),
+%% in milliseconds: inside the 25 ms max_ack_delay a peer assumes when, as
+%% here, none is advertised (§18.2), with room for timer lateness.
+-define(ACK_DELAY, 20).
+%% The ACK Delay field's scale: microseconds shifted right by the default
+%% ack_delay_exponent of 3, since none is advertised (RFC 9000 §18.2).
+-define(ACK_DELAY_EXPONENT, 3).
 %% Idle-timeout fallback (RFC 9000 §10.1): used only when neither endpoint
 %% advertises a max_idle_timeout, so a dead peer cannot pin the connection. The
 %% live value is the negotiated minimum of the two advertised limits.
@@ -684,7 +691,7 @@ process_outcome(
             State2 = lists:foldl(
                 fun(Frame, S) -> process_frame(Now, Level, Frame, S) end, State1, Frames
             ),
-            record_received(Level, PN, Frames, State2);
+            record_received(Now, Level, PN, Frames, State2);
         #{} ->
             %% A packet for a discarded space (e.g. a late Initial); ignore.
             State
@@ -710,12 +717,13 @@ validate_on_handshake(handshake, #state{validated = false, amp = Amp} = State) -
 validate_on_handshake(_Level, State) ->
     State.
 
--spec record_received(level(), non_neg_integer(), [roadrunner_quic_frame:frame()], t()) -> t().
-record_received(Level, PN, Frames, #state{spaces = Spaces} = State) ->
+-spec record_received(integer(), level(), non_neg_integer(), [roadrunner_quic_frame:frame()], t()) ->
+    t().
+record_received(Now, Level, PN, Frames, #state{spaces = Spaces} = State) ->
     case Spaces of
         #{Level := Space} ->
             Ack = roadrunner_quic_ack:record(
-                PN, roadrunner_quic_send:ack_eliciting(Frames), Space#space.ack
+                PN, roadrunner_quic_send:ack_eliciting(Frames), Now, Space#space.ack
             ),
             put_space(Level, Space#space{ack = Ack}, State);
         #{} ->
@@ -1523,7 +1531,7 @@ drain_send(Now, State, Acc) ->
 
 -spec drain_send(integer(), [level()], t(), [effect()]) -> {t(), [effect()]}.
 drain_send(Now, Levels, State, Acc) ->
-    case build_first(Levels, State) of
+    case build_first(Levels, Now, State) of
         none ->
             {State, Acc};
         {Entries, Built} ->
@@ -1567,19 +1575,19 @@ drain_send(Now, Levels, State, Acc) ->
 %% flight would overflow. It also makes the forbidden Initial+1-RTT
 %% coalescing structurally impossible. Coalescing Initial+Handshake is a
 %% deferred optimization. Returns `none` when nothing is pending anywhere.
--spec build_first([level()], t()) -> none | {#{level() => map()}, t()}.
-build_first([], _State) ->
+-spec build_first([level()], integer(), t()) -> none | {#{level() => map()}, t()}.
+build_first([], _Now, _State) ->
     none;
-build_first([Level | Rest], State) ->
-    case build_level(Level, State) of
-        none -> build_first(Rest, State);
+build_first([Level | Rest], Now, State) ->
+    case build_level(Level, Now, State) of
+        none -> build_first(Rest, Now, State);
         {Entry, Built} -> {#{Level => Entry}, Built}
     end.
 
--spec build_level(level(), t()) -> none | {map(), t()}.
-build_level(Level, State) ->
+-spec build_level(level(), integer(), t()) -> none | {map(), t()}.
+build_level(Level, Now, State) ->
     Space = space(Level, State),
-    {AckFrames, Ack} = take_ack(Space#space.ack),
+    {AckFrames, Ack} = take_ack(Space#space.ack, Now),
     case Space#space.pending of
         [_ | _] = Pending ->
             %% Retransmits travel in their own packet (no fresh CRYPTO or
@@ -1596,7 +1604,7 @@ build_level(Level, State) ->
                 Level, prepend_ack(AckFrames, Frames), Space#space{ack = Ack, pending = Rest}, State
             );
         [] ->
-            build_data(Level, AckFrames, Space#space{ack = Ack}, State)
+            build_data(Level, AckFrames, ack_due(Level, Now, Space), Space#space{ack = Ack}, State)
     end.
 
 %% Take frames in order while they fit `Room` bytes. A STREAM or CRYPTO frame
@@ -1646,17 +1654,32 @@ split_frame(_Frame, _Room) ->
 frames_size(Frames) ->
     iolist_size([roadrunner_quic_frame:encode(Frame) || Frame <- Frames]).
 
+%% Whether a packet may go out carrying nothing but the ACK. Initial and
+%% Handshake packets are acknowledged at once (RFC 9000 §13.2.1); a 1-RTT ACK
+%% waits for data to ride with until `roadrunner_quic_ack:ack_due/3` says it
+%% may not.
+-spec ack_due(level(), integer(), #space{}) -> boolean().
+ack_due(application, Now, #space{ack = Ack}) ->
+    roadrunner_quic_ack:ack_due(Ack, Now, ?ACK_DELAY);
+ack_due(_Level, _Now, _Space) ->
+    true.
+
 %% With nothing pending to retransmit, fill the packet after any ACK with
 %% fresh data: CRYPTO at the handshake levels, application STREAM frames at
 %% the application level (which never carries CRYPTO).
--spec build_data(level(), [roadrunner_quic_frame:frame()], #space{}, t()) -> none | {map(), t()}.
-build_data(application, AckFrames, #space{next_pn = PN} = Space, State) ->
+-spec build_data(level(), [roadrunner_quic_frame:frame()], boolean(), #space{}, t()) ->
+    none | {map(), t()}.
+build_data(application, AckFrames, AckDue, #space{next_pn = PN} = Space, State) ->
     {StreamFrames, State1} = take_stream(AckFrames, PN, State),
-    case prepend_ack(AckFrames, StreamFrames) of
-        [] -> none;
-        Frames -> build_entry(application, Frames, Space, State1)
+    case {StreamFrames, AckDue} of
+        {[], false} ->
+            %% No data, and no ACK, or one that may still wait: send nothing.
+            none;
+        _ ->
+            %% Data, or an ACK that is due (so `AckFrames` holds it).
+            build_entry(application, prepend_ack(AckFrames, StreamFrames), Space, State1)
     end;
-build_data(Level, AckFrames, Space, State) ->
+build_data(Level, AckFrames, _AckDue, Space, State) ->
     {CryptoFrames, Crypto} = take_crypto(Space#space.crypto),
     case prepend_ack(AckFrames, CryptoFrames) of
         [] -> none;
@@ -1755,16 +1778,19 @@ build_entry(Level, Frames, #space{next_pn = PN} = Space, #state{send_keys = Send
     Entry = #{frames => Frames, keys => Keys, pn => PN},
     {Entry, put_space(Level, Space#space{next_pn = PN + 1}, State)}.
 
--spec take_ack(roadrunner_quic_ack:t()) ->
+%% The ACK frame for a space with an ack-eliciting packet awaiting one, with
+%% the ACK Delay the largest packet has waited (RFC 9000 §13.2.5, §19.3).
+-spec take_ack(roadrunner_quic_ack:t(), integer()) ->
     {[roadrunner_quic_frame:frame()], roadrunner_quic_ack:t()}.
-take_ack(Ack) ->
+take_ack(Ack, Now) ->
     case roadrunner_quic_ack:needs_ack(Ack) of
         false ->
             {[], Ack};
         true ->
             {Largest, FirstRange, Ranges} = roadrunner_quic_ack:to_ack(Ack),
+            Delay = (roadrunner_quic_ack:ack_delay(Ack, Now) * 1000) bsr ?ACK_DELAY_EXPONENT,
             {
-                [{ack, Largest, 0, FirstRange, Ranges, undefined}],
+                [{ack, Largest, Delay, FirstRange, Ranges, undefined}],
                 roadrunner_quic_ack:mark_ack_sent(Ack)
             }
     end.
@@ -1820,6 +1846,14 @@ handle_timeout(_Now, idle, State) ->
         emit({closed, {local, idle_timeout}}, State1#state{phase = closed})
     ),
     {State2, Releases ++ EmitEffects};
+handle_timeout(_Now, ack, #state{phase = Phase} = State) when
+    Phase =:= closed; Phase =:= draining
+->
+    %% A closing connection sends nothing more, a delayed ACK included.
+    {State, []};
+handle_timeout(Now, ack, State) ->
+    %% A delayed ACK's wait ran out with no packet to carry it: send it now.
+    send_pass(Now, State);
 handle_timeout(_Now, drain, State) ->
     %% The drain window elapsed (RFC 9000 §10.2): become closed so the shell
     %% tears the connection down. The owner already learned of the close on entry.
@@ -1857,13 +1891,25 @@ timer_effects(Now, State) ->
     {Kind, AtMs} = earliest_deadline(Now, State),
     [{arm_timer, Kind, AtMs}].
 
--spec earliest_deadline(integer(), t()) -> {pto | idle, integer()}.
+-spec earliest_deadline(integer(), t()) -> {pto | idle | ack, integer()}.
 earliest_deadline(Now, #state{idle_deadline = Idle} = State) ->
-    case earliest_pto(Now, State) of
-        undefined -> {idle, Idle};
-        PtoAt when PtoAt =< Idle -> {pto, PtoAt};
-        _PtoAt -> {idle, Idle}
+    Nearest =
+        case earliest_pto(Now, State) of
+            undefined -> {idle, Idle};
+            PtoAt when PtoAt =< Idle -> {pto, PtoAt};
+            _PtoAt -> {idle, Idle}
+        end,
+    case {ack_deadline(State), Nearest} of
+        {AckAt, {_Kind, At}} when is_integer(AckAt), AckAt < At -> {ack, AckAt};
+        _ -> Nearest
     end.
+
+%% When a delayed 1-RTT ACK must go out, or `undefined` with none waiting.
+-spec ack_deadline(t()) -> integer() | undefined.
+ack_deadline(#state{spaces = #{application := #space{ack = Ack}}}) ->
+    roadrunner_quic_ack:ack_deadline(Ack, ?ACK_DELAY);
+ack_deadline(#state{}) ->
+    undefined.
 
 %% The congestion-controlled bytes in flight across every space, the value the
 %% congestion window bounds (RFC 9002 §B.2 keeps one count per connection). A

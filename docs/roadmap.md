@@ -114,8 +114,6 @@ need.
 A conformant browser / quiche / ngtcp2 never trips these; they tighten the
 advisory or malformed cases the server currently tolerates or omits.
 
-- Report a real ACK Delay (always 0 today) and advertise `ack_delay_exponent`
-  / `max_ack_delay` (RFC 9000 §13.2.5) — small-medium
 - Intersect the client's offered cipher / TLS version (`supported_versions`) /
   group (`supported_groups`) against the hardcoded `TLS_AES_128_GCM_SHA256` /
   TLS 1.3 / x25519, aborting on no overlap (RFC 8446 §4.1.1) — medium

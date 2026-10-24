@@ -23,7 +23,7 @@ prop_range_invariants() ->
         list(integer(0, 30)),
         begin
             Ack = lists:foldl(
-                fun(PN, Acc) -> roadrunner_quic_ack:record(PN, true, Acc) end,
+                fun(PN, Acc) -> roadrunner_quic_ack:record(PN, true, 0, Acc) end,
                 roadrunner_quic_ack:new(),
                 PNs
             ),
