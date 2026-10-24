@@ -10,8 +10,9 @@
 #   quiche   Cloudflare's quiche-client (Rust, BoringSSL)
 #   ngtcp2   ngtcp2's client on nghttp3 and wolfSSL (C)
 #
-# Each client runs these cases against a transient listener serving
-# `roadrunner_h3_interop_handler`:
+# Each client runs these cases against a transient listener that serves
+# files the script writes (`roadrunner_static`) and echoes request bodies
+# (`roadrunner_h3_test_handler`):
 #
 #   small      GET 100 bytes
 #   large      GET 5 MB (flow control, congestion control, batched sends)
@@ -66,6 +67,19 @@ if [ ! -d "_build/test/lib/roadrunner/ebin" ]; then
     exit 2
 fi
 
+# The files the clients download, random bytes so a misplaced or repeated
+# chunk cannot match.
+WWW="$WORK_DIR/www"
+mkdir -p "$WWW"
+MULTIPLEX_SIZES=$(seq 20001 20050)
+head -c 100 /dev/urandom >"$WWW/100"
+head -c 5000000 /dev/urandom >"$WWW/5000000"
+for n in $MULTIPLEX_SIZES; do
+    head -c "$n" /dev/urandom >"$WWW/$n"
+done
+UPLOAD="$WORK_DIR/upload.bin"
+head -c 1000000 /dev/urandom >"$UPLOAD"
+
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
     -keyout "$WORK_DIR/key.pem" \
     -out    "$WORK_DIR/cert.pem" \
@@ -90,7 +104,10 @@ erl -noshell "${PA_DIRS[@]}" -eval "
             {certfile, \"$WORK_DIR/cert.pem\"},
             {keyfile, \"$WORK_DIR/key.pem\"}
         ],
-        routes => roadrunner_h3_interop_handler
+        routes => [
+            {~\"/files/*path\", roadrunner_static, #{dir => <<\"$WWW\">>}},
+            {~\"/echo\", roadrunner_h3_test_handler, undefined}
+        ]
     }),
     Port = roadrunner_listener:port(h3interop_listener),
     file:write_file(\"$PORT_FILE\", integer_to_binary(Port)),
@@ -121,20 +138,11 @@ if [ -n "$LOSS" ]; then
     echo "loopback packet loss: ${LOSS}%" >&2
 fi
 
-UPLOAD="$WORK_DIR/upload.bin"
-head -c 1000000 /dev/urandom >"$UPLOAD"
-MULTIPLEX_SIZES=$(seq 20001 20050)
-
-# The body `/bytes/N` serves: N bytes of the repeating pattern.
-pattern() {
-    head -c "$1" < <(yes 0123456789abcdef | tr -d '\n')
-}
-
 case_urls() {
     case "$1" in
-        small) echo "$BASE/bytes/100" ;;
-        large) echo "$BASE/bytes/5000000" ;;
-        multiplex) for n in $MULTIPLEX_SIZES; do echo "$BASE/bytes/$n"; done ;;
+        small) echo "$BASE/files/100" ;;
+        large) echo "$BASE/files/5000000" ;;
+        multiplex) for n in $MULTIPLEX_SIZES; do echo "$BASE/files/$n"; done ;;
         upload) echo "$BASE/echo" ;;
     esac
 }
@@ -144,11 +152,11 @@ case_urls() {
 check_case() {
     local name=$1 dir=$2
     case "$name" in
-        small) pattern 100 | cmp -s - "$dir/100" ;;
-        large) pattern 5000000 | cmp -s - "$dir/5000000" ;;
+        small) cmp -s "$WWW/100" "$dir/100" ;;
+        large) cmp -s "$WWW/5000000" "$dir/5000000" ;;
         multiplex)
             for n in $MULTIPLEX_SIZES; do
-                pattern "$n" | cmp -s - "$dir/$n" || return 1
+                cmp -s "$WWW/$n" "$dir/$n" || return 1
             done
             ;;
         upload) cmp -s "$UPLOAD" "$dir/echo" ;;
