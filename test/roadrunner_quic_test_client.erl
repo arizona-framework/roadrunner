@@ -80,26 +80,27 @@ first transcript element.
     Scheme :: non_neg_integer(), ClientPub :: binary(), ClientSCID :: binary() | none
 ) -> binary().
 client_hello_framed(Scheme, ClientPub, ClientSCID) ->
-    client_hello_framed(Scheme, ClientPub, ClientSCID, 800000).
+    client_hello_framed(Scheme, ClientPub, ClientSCID, #{}).
 
 -doc """
-As `client_hello_framed/3` but advertising `StreamWindow` as the per-stream
-flow-control limit (initial_max_stream_data_*), so a test can pin a small
-per-stream send window on the server to exercise stream-level backpressure.
+As `client_hello_framed/3` but with `Overrides` merged over the default
+transport parameters, so a test can pin a small per-stream send window
+(`initial_max_stream_data_*`) to exercise stream-level backpressure, or a
+small `initial_max_streams_uni` to limit the server's own streams.
 """.
 -spec client_hello_framed(
     Scheme :: non_neg_integer(),
     ClientPub :: binary(),
     ClientSCID :: binary() | none,
-    StreamWindow :: non_neg_integer()
+    Overrides :: roadrunner_quic_transport_params:params()
 ) -> binary().
-client_hello_framed(Scheme, ClientPub, ClientSCID, StreamWindow) ->
+client_hello_framed(Scheme, ClientPub, ClientSCID, Overrides) ->
     Random = crypto:strong_rand_bytes(32),
     Extensions = iolist_to_binary([
         signature_algorithms_ext([Scheme]),
         alpn_ext(~"h3"),
         key_share_ext(ClientPub),
-        transport_params_ext(ClientSCID, StreamWindow)
+        transport_params_ext(ClientSCID, Overrides)
     ]),
     CipherSuites = <<?CIPHER_AES_128_GCM_SHA256:16>>,
     Body =
@@ -120,24 +121,26 @@ key_share_ext(PubKey) ->
     extension(?EXT_KEY_SHARE, <<(byte_size(Entry)):16, Entry/binary>>).
 
 %% A quic_transport_parameters extension carrying the client's
-%% initial_source_connection_id plus flow-control limits, encoded with the
-%% production codec so the wire bytes stay authoritative. The 800000-byte
-%% windows are what the server seeds its send windows from (deliberately
-%% distinct from roadrunner_quic_flow's 786432 default, so a send test proves
-%% the window is the client's advertised value, not a hardcoded fallback).
-%% `none` emits no extension at all. `StreamWindow` is the advertised
-%% per-stream limit (default 800000); a test pins a small value to make the
-%% server's per-stream send window the binding constraint.
-transport_params_ext(none, _StreamWindow) ->
+%% initial_source_connection_id plus flow-control and stream limits, encoded
+%% with the production codec so the wire bytes stay authoritative. The
+%% 800000-byte windows are what the server seeds its send windows from
+%% (deliberately distinct from roadrunner_quic_flow's 786432 default, so a
+%% send test proves the window is the client's advertised value, not a
+%% hardcoded fallback). The 3 unidirectional streams are the RFC 9114 §6.2
+%% minimum an HTTP/3 client must allow the server. `none` emits no extension
+%% at all; `Overrides` replace any of the defaults.
+transport_params_ext(none, _Overrides) ->
     <<>>;
-transport_params_ext(ClientSCID, StreamWindow) ->
+transport_params_ext(ClientSCID, Overrides) ->
+    Defaults = #{
+        initial_source_connection_id => ClientSCID,
+        initial_max_data => 800000,
+        initial_max_stream_data_bidi_local => 800000,
+        initial_max_stream_data_uni => 800000,
+        initial_max_streams_uni => 3
+    },
     Body = iolist_to_binary(
-        roadrunner_quic_transport_params:encode(#{
-            initial_source_connection_id => ClientSCID,
-            initial_max_data => 800000,
-            initial_max_stream_data_bidi_local => StreamWindow,
-            initial_max_stream_data_uni => StreamWindow
-        })
+        roadrunner_quic_transport_params:encode(maps:merge(Defaults, Overrides))
     ),
     extension(?EXT_QUIC_TRANSPORT_PARAMS, Body).
 

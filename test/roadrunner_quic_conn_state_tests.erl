@@ -1069,6 +1069,63 @@ open_uni_allocates_server_uni_ids_test() ->
     {_State2, Effects2} = ?M:handle_call(self(), Ref2, open_uni, 0, State1),
     ?assertEqual([{reply, self(), Ref2, {ok, 7}}], Effects2).
 
+%% The server opens no more unidirectional streams than the client's
+%% initial_max_streams_uni allows (RFC 9000 §4.6): with the limit of 1 used up,
+%% the open is refused and a STREAMS_BLOCKED carrying the limit goes out
+%% (§19.14).
+open_uni_refused_past_peer_limit_test() ->
+    {State, _ClientApSecret, ServerApSecret} = connect_owned(#{}, #{initial_max_streams_uni => 1}),
+    {State1, _} = ?M:handle_call(self(), make_ref(), open_uni, ?NOW, State),
+    Ref = make_ref(),
+    {_State2, Effects} = ?M:handle_call(self(), Ref, open_uni, ?NOW, State1),
+    ?assertEqual({reply, self(), Ref, {error, stream_limit}}, hd(Effects)),
+    ?assertEqual(
+        [{streams_blocked, uni, 1}],
+        [F || {streams_blocked, _, _} = F <- sent_app_frames(Effects, ServerApSecret)]
+    ).
+
+%% A client that advertises no initial_max_streams_uni allows none (absent ->
+%% 0, RFC 9000 §18.2), so even the first open is refused.
+open_uni_refused_without_peer_param_test() ->
+    {State, _ClientApSecret, _ServerApSecret} = connect_owned(
+        #{}, #{initial_max_streams_uni => 0}
+    ),
+    Ref = make_ref(),
+    {_State1, Effects} = ?M:handle_call(self(), Ref, open_uni, ?NOW, State),
+    ?assertEqual({reply, self(), Ref, {error, stream_limit}}, hd(Effects)).
+
+%% A MAX_STREAMS (uni) raises the limit, so a refused open then succeeds
+%% (RFC 9000 §19.11); a later one that would lower it is ignored, so the
+%% raised limit still holds.
+max_streams_uni_raises_server_limit_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(
+        #{}, #{initial_max_streams_uni => 0}
+    ),
+    Frames = [{max_streams, uni, 2}, {max_streams, uni, 1}],
+    {State1, _} = ?M:handle_datagram(?NOW, app_datagram(Frames, 0, ClientApSecret), State),
+    Ref1 = make_ref(),
+    {State2, Effects1} = ?M:handle_call(self(), Ref1, open_uni, ?NOW, State1),
+    ?assertEqual([{reply, self(), Ref1, {ok, 3}}], Effects1),
+    Ref2 = make_ref(),
+    {State3, Effects2} = ?M:handle_call(self(), Ref2, open_uni, ?NOW, State2),
+    ?assertEqual([{reply, self(), Ref2, {ok, 7}}], Effects2),
+    Ref3 = make_ref(),
+    {_State4, Effects3} = ?M:handle_call(self(), Ref3, open_uni, ?NOW, State3),
+    ?assertEqual({reply, self(), Ref3, {error, stream_limit}}, hd(Effects3)).
+
+%% A MAX_STREAMS (bidi) is accepted and ignored: the server opens no
+%% bidirectional streams (RFC 9114 §6.1), and it does not touch the uni limit.
+max_streams_bidi_ignored_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(
+        #{}, #{initial_max_streams_uni => 0}
+    ),
+    Datagram = app_datagram([{max_streams, bidi, 10}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, Datagram, State),
+    ?assertEqual(connected, ?M:phase(State1)),
+    Ref = make_ref(),
+    {_State2, Effects} = ?M:handle_call(self(), Ref, open_uni, ?NOW, State1),
+    ?assertEqual({reply, self(), Ref, {error, stream_limit}}, hd(Effects)).
+
 send_data_emits_stream_frame_with_fin_test() ->
     %% A finished send becomes a single STREAM frame carrying the data and FIN,
     %% and the call is acknowledged with ok.
@@ -1813,11 +1870,15 @@ connect() ->
     connect(#{}).
 
 connect(Extra) ->
+    connect(Extra, #{}).
+
+%% `ClientParams` override the client's advertised transport parameters.
+connect(Extra, ClientParams) ->
     {State0, Ctx} = new_conn([~"leaf-cert-der"], Extra),
     #{client_priv := ClientPriv, server_pub := ServerPub} = Ctx,
 
     %% Client Initial carrying the ClientHello.
-    {InitialDatagram, ClientHelloFramed} = client_hello_datagram(Ctx),
+    {InitialDatagram, ClientHelloFramed} = client_hello_datagram(Ctx, ClientParams),
     {State1, Effects1} = ?M:handle_datagram(?NOW, InitialDatagram, State0),
     Server1 = sends(Effects1),
 
@@ -1926,8 +1987,11 @@ new_conn(CertChain, Extra) ->
 
 %% The client Initial datagram and the framed ClientHello it carries (the
 %% first transcript element).
-client_hello_datagram(#{scheme := Scheme, client_pub := ClientPub}) ->
-    Framed = ?TC:client_hello_framed(Scheme, ClientPub, ?CLIENT_SCID),
+client_hello_datagram(Ctx) ->
+    client_hello_datagram(Ctx, #{}).
+
+client_hello_datagram(#{scheme := Scheme, client_pub := ClientPub}, ClientParams) ->
+    Framed = ?TC:client_hello_framed(Scheme, ClientPub, ?CLIENT_SCID, ClientParams),
     Datagram = ?TC:seal(
         initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
     ),
@@ -1968,13 +2032,16 @@ connect_owned() ->
     connect_owned(#{}).
 
 connect_owned(Extra) ->
+    connect_owned(Extra, #{}).
+
+connect_owned(Extra, ClientParams) ->
     #{
         state1 := State1,
         client_hs_secret := ClientHsSecret,
         cf_framed := ClientFinished,
         client_ap_secret := ClientApSecret,
         server_ap_secret := ServerApSecret
-    } = connect(Extra),
+    } = connect(Extra, ClientParams),
     {State1b, _} = ?M:handle_call(self(), make_ref(), {set_owner, self()}, 0, State1),
     Finished = ?TC:seal(
         handshake,

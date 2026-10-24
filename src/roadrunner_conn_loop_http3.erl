@@ -66,6 +66,7 @@
 
 %% RFC 9114 §8.1 / RFC 9204 §8.3 error codes.
 -define(H3_NO_ERROR, 16#0100).
+-define(H3_GENERAL_PROTOCOL_ERROR, 16#0101).
 -define(H3_INTERNAL_ERROR, 16#0102).
 -define(H3_STREAM_CREATION_ERROR, 16#0103).
 -define(H3_CLOSED_CRITICAL_STREAM, 16#0104).
@@ -266,7 +267,10 @@ loop(State) ->
 recv_loop(#h3{conn = Conn} = State) ->
     receive
         {quic, Conn, {connected, _Info}} ->
-            loop(send_control_stream(State));
+            case send_control_stream(State) of
+                {conn_error, Code, Reason} -> conn_error(State, Code, Reason);
+                State1 -> loop(State1)
+            end;
         {quic, Conn, {stream_opened, _StreamId}} ->
             loop(State);
         {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
@@ -308,12 +312,31 @@ recv_loop(#h3{conn = Conn} = State) ->
 %% section) leaves the connection draining, so the send returns
 %% `{error, {invalid_state, draining}}`. That is an expected race, not a
 %% fault — the queued `{closed, _}` event terminates the loop cleanly, so
-%% there is nothing to recover and no reason to crash on it. The open
-%% runs the instant the handshake completes, before any peer close can
-%% arrive, so it stays strictly matched.
--spec send_control_stream(#h3{}) -> #h3{}.
-send_control_stream(#h3{conn = Conn, max_field_section_size = MaxFieldSection} = State) ->
-    {ok, CtrlStreamId} = roadrunner_quic:open_unidirectional_stream(Conn),
+%% there is nothing to recover and no reason to crash on it.
+%%
+%% The open itself fails only on the peer's stream limit (RFC 9000 §4.6).
+%% RFC 9114 §6.2 says a peer's transport parameters MUST allow at least
+%% three unidirectional streams, and the control stream is the first (and,
+%% with no dynamic QPACK table, the only, RFC 9204 §4.2) one this server
+%% opens, so a refused open means the peer broke that rule: close with
+%% H3_GENERAL_PROTOCOL_ERROR (§8.1, no more specific code fits). Waiting
+%% for a MAX_STREAMS instead could wait forever, and §6.2 does not oblige
+%% the peer to send one. A peer allowing one or two streams is also out of
+%% spec, but it leaves room for everything this server opens, so it is
+%% served rather than refused.
+-spec send_control_stream(#h3{}) -> handle_result().
+send_control_stream(#h3{conn = Conn} = State) ->
+    case roadrunner_quic:open_unidirectional_stream(Conn) of
+        {ok, CtrlStreamId} ->
+            send_settings(State, CtrlStreamId);
+        {error, stream_limit} ->
+            {conn_error, ?H3_GENERAL_PROTOCOL_ERROR, ~"peer allows no unidirectional stream"}
+    end.
+
+%% Send the stream-type prefix and SETTINGS on the freshly opened control
+%% stream.
+-spec send_settings(#h3{}, non_neg_integer()) -> #h3{}.
+send_settings(#h3{conn = Conn, max_field_section_size = MaxFieldSection} = State, CtrlStreamId) ->
     Prefix = roadrunner_quic_h3_frame:encode_stream_type(control),
     Settings = roadrunner_quic_h3_frame:encode_settings(#{
         qpack_max_table_capacity => 0,

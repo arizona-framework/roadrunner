@@ -128,10 +128,6 @@ advisory or malformed cases the server currently tolerates or omits.
   transfer that fills a non-zero window — already emits the frame on the
   flow's blocked transition; this remainder is the never-sent-a-byte case a
   conformant peer never produces — small
-- Stream-count self-limiting (RFC 9000 §4.6): honor an inbound `MAX_STREAMS`, and
-  check the peer's `initial_max_streams_uni` before opening the server's own
-  control / QPACK uni streams (it opens ~3, always within a sane client's limit).
-  Sending `MAX_STREAMS` to raise the peer's limit is done — small
 - Respond to a peer-initiated key update (RFC 9001 §6). Security-sensitive:
   trial-decrypt the next-phase keys and commit ONLY on success (not
   commit-then-decrypt, which a single forged flipped-bit datagram desyncs),

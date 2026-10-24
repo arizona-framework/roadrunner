@@ -120,7 +120,9 @@ connect(Host, Port) ->
 -doc """
 As `connect/2` but with `Opts`. `stream_window => N` advertises a small
 per-stream flow-control window so a test can exercise stream-level
-backpressure on the server (default 800000).
+backpressure on the server (default 800000). `max_streams_uni => N`
+advertises how many unidirectional streams the server may open (default 3,
+the RFC 9114 §6.2 minimum).
 """.
 -spec connect(inet:ip_address() | inet:hostname(), inet:port_number(), map()) ->
     {ok, pid()} | {error, term()}.
@@ -228,9 +230,11 @@ init(Parent, Ref, Host, Port, Opts) ->
     Scid = crypto:strong_rand_bytes(?CID_LEN),
     {EphPub, EphPriv} = crypto:generate_key(ecdh, x25519),
     StreamWindow = maps:get(stream_window, Opts, 800000),
-    ChFramed = roadrunner_quic_test_client:client_hello_framed(
-        ?SIG_SCHEME, EphPub, Scid, StreamWindow
-    ),
+    ChFramed = roadrunner_quic_test_client:client_hello_framed(?SIG_SCHEME, EphPub, Scid, #{
+        initial_max_stream_data_bidi_local => StreamWindow,
+        initial_max_stream_data_uni => StreamWindow,
+        initial_max_streams_uni => maps:get(max_streams_uni, Opts, 3)
+    }),
     %% Send the Initial carrying the ClientHello (padded to 1200 by seal/6).
     ClientInitialKeys = roadrunner_quic_keys:initial_client(Dcid0),
     Initial = roadrunner_quic_test_client:seal(

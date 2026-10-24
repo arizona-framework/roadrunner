@@ -93,6 +93,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     refused_request_with_fin_is_dropped/1,
     stop_sending_ignored/1,
     peer_push_stream_closes_conn/1,
+    peer_allows_no_uni_stream_closes_conn/1,
     peer_control_stream_closed/1,
     unknown_uni_stream_ignored/1,
     peer_control_stream_reset/1,
@@ -188,6 +189,7 @@ all() ->
         refused_request_with_fin_is_dropped,
         stop_sending_ignored,
         peer_push_stream_closes_conn,
+        peer_allows_no_uni_stream_closes_conn,
         peer_control_stream_closed,
         unknown_uni_stream_ignored,
         peer_control_stream_reset,
@@ -1682,6 +1684,20 @@ peer_push_stream_closes_conn(Config) ->
     Conn = ll_connect(?config(port, Config)),
     _ = ll_open_uni(Conn, roadrunner_quic_h3_frame:encode_stream_type(push), false),
     ll_await_closed(Conn).
+
+peer_allows_no_uni_stream_closes_conn(Config) ->
+    %% RFC 9114 §6.2: a client MUST allow the server at least three
+    %% unidirectional streams. One allowing none leaves no room for the
+    %% server's control stream (RFC 9000 §4.6), so the server closes the
+    %% connection with H3_GENERAL_PROTOCOL_ERROR.
+    {ok, Conn} = roadrunner_quic_test_conn:connect(
+        {127, 0, 0, 1}, ?config(port, Config), #{max_streams_uni => 0}
+    ),
+    receive
+        {quic_test_closed, Conn, ErrorCode} -> ?assertEqual(16#0101, ErrorCode)
+    after 5000 ->
+        ct:fail(connection_not_closed)
+    end.
 
 peer_control_stream_closed(Config) ->
     %% RFC 9114 §6.2.1: the control stream is critical; the peer closing

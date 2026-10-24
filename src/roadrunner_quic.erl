@@ -33,8 +33,12 @@
 peername(Conn) ->
     call(Conn, peername).
 
--doc "Allocate a server-initiated unidirectional stream id (the h3 control/encoder/decoder streams).".
--spec open_unidirectional_stream(pid()) -> {ok, non_neg_integer()}.
+-doc """
+Allocate a server-initiated unidirectional stream id (the h3 control/encoder/decoder
+streams). `{error, stream_limit}` when the peer's stream limit allows no more
+(RFC 9000 §4.6); the connection then signals STREAMS_BLOCKED to the peer.
+""".
+-spec open_unidirectional_stream(pid()) -> {ok, non_neg_integer()} | {error, stream_limit}.
 open_unidirectional_stream(Conn) ->
     call(Conn, open_uni).
 

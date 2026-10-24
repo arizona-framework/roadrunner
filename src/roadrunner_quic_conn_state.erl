@@ -142,6 +142,15 @@
     %% §2.1: server uni ids are 3, 7, 11, ...); the owner opens its h3
     %% control stream this way.
     next_uni = 3 :: non_neg_integer(),
+    %% The peer's limit on the unidirectional streams the server may open
+    %% (RFC 9000 §4.6), the counterpart of `max_streams_uni` below: seeded
+    %% from the client's initial_max_streams_uni (absent -> 0, §18.2) and
+    %% raised by a MAX_STREAMS (uni) frame (§19.11). `open_uni` refuses an id
+    %% whose ordinal (id div 4) reaches it. No bidirectional counterpart is
+    %% kept: HTTP/3 uses no server-initiated bidirectional streams (RFC 9114
+    %% §6.1), so this server never opens one and a MAX_STREAMS (bidi) has
+    %% nothing to unblock.
+    peer_max_streams_uni = 0 :: non_neg_integer(),
     %% The stream counts we advertised the peer may open
     %% (initial_max_streams_bidi/uni, RFC 9000 §4.6): a client-initiated stream
     %% whose ordinal (id div 4) is >= the limit for its type is a
@@ -483,11 +492,21 @@ handle_call(From, Ref, peername, _Now, #state{peer = Peer} = State) ->
 handle_call(From, Ref, {set_owner, Owner}, _Now, State) ->
     {State1, EmitEffects} = install_owner(Owner, State),
     {State1, [{reply, From, Ref, ok} | EmitEffects]};
-handle_call(From, Ref, open_uni, _Now, #state{next_uni = Id} = State) ->
-    %% Allocate the next server-initiated unidirectional stream id. The stream
-    %% itself is created lazily on the first send_data; the h3 layer writes the
-    %% stream-type byte + SETTINGS, never this layer.
-    {State#state{next_uni = Id + 4}, [{reply, From, Ref, {ok, Id}}]};
+handle_call(From, Ref, open_uni, Now, #state{next_uni = Id, peer_max_streams_uni = Max} = State) ->
+    case Id div 4 of
+        Ordinal when Ordinal < Max ->
+            %% Allocate the next server-initiated unidirectional stream id. The
+            %% stream itself is created lazily on the first send_data; the h3
+            %% layer writes the stream-type byte + SETTINGS, never this layer.
+            {State#state{next_uni = Id + 4}, [{reply, From, Ref, {ok, Id}}]};
+        _ ->
+            %% The peer's limit is reached (RFC 9000 §4.6: an endpoint MUST
+            %% NOT exceed it): refuse the open, and tell the peer with a
+            %% STREAMS_BLOCKED carrying the limit (§4.6 / §19.14 SHOULD).
+            State1 = queue_frame(application, {streams_blocked, uni, Max}, State),
+            {State2, SendEffects} = send_pass(Now, State1),
+            {State2, [{reply, From, Ref, {error, stream_limit}} | SendEffects]}
+    end;
 handle_call(From, Ref, {reset_stream, Sid, ErrorCode}, Now, State) ->
     {State1, SendEffects} = do_reset_stream(Sid, ErrorCode, Now, State),
     {State1, [{reply, From, Ref, ok} | SendEffects]};
@@ -786,6 +805,13 @@ process_frame(_Now, application, {stop_sending, Sid, ErrorCode}, State) ->
         true -> process_stop_sending(Sid, ErrorCode, State);
         false -> connection_fatal(application, stream_state_error, State)
     end;
+process_frame(
+    _Now, application, {max_streams, uni, Max}, #state{peer_max_streams_uni = Current} = State
+) when Max > Current ->
+    %% The peer raised the limit on the unidirectional streams the server may
+    %% open (RFC 9000 §19.11). One that does not raise it falls through to the
+    %% catch-all below: limits only grow, so it MUST be ignored.
+    State#state{peer_max_streams_uni = Max};
 process_frame(_Now, application, {retire_connection_id, Seq}, State) when Seq > 0 ->
     %% RFC 9000 §19.16: the server never issues a connection ID past the
     %% handshake's (sequence number 0), so a higher one was never sent.
@@ -804,9 +830,10 @@ process_frame(_Now, application, {path_challenge, Data}, State) ->
     %% RFC 9000 §8.2.2: answer with a PATH_RESPONSE echoing the challenge.
     queue_frame(application, {path_response, Data}, State);
 process_frame(_Now, application, _Frame, State) ->
-    %% The other 1-RTT frames are accepted but not acted on yet: MAX_STREAMS
-    %% (the server never opens enough streams to need the raised limit), the
-    %% BLOCKED signals, the connection-id frames and PATH_RESPONSE.
+    %% The other 1-RTT frames are accepted but not acted on: a MAX_STREAMS
+    %% (bidi), since the server opens no bidirectional streams (RFC 9114 §6.1),
+    %% or (uni) that does not raise the limit (RFC 9000 §19.11), the BLOCKED
+    %% signals, the connection-id frames and PATH_RESPONSE.
     State;
 process_frame(_Now, Level, _Frame, State) ->
     %% RFC 9000 §12.4 / §12.5: Initial and Handshake packets carry only
@@ -915,6 +942,9 @@ process_handshake(
                 State#state{
                     tls = Tls1,
                     peer_params = PeerParams,
+                    %% The limit on the server's own unidirectional streams
+                    %% (absent -> 0, RFC 9000 §18.2).
+                    peer_max_streams_uni = maps:get(initial_max_streams_uni, PeerParams, 0),
                     conn_flow = ConnFlow,
                     idle_timeout = IdleTimeout
                 }
