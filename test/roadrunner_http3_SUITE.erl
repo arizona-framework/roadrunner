@@ -107,6 +107,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     drain_refuses_new_connections/1,
     drain_closes_a_mid_handshake_connection/1,
     drain_waits_for_a_response_flow_control_holds/1,
+    drain_resends_a_lost_response_before_closing/1,
     drain_released_by_peer_stop_sending/1,
     drain_released_by_peer_reset/1,
     crashed_worker_frees_its_slot/1
@@ -211,6 +212,7 @@ all() ->
         drain_refuses_new_connections,
         drain_closes_a_mid_handshake_connection,
         drain_waits_for_a_response_flow_control_holds,
+        drain_resends_a_lost_response_before_closing,
         drain_released_by_peer_stop_sending,
         drain_released_by_peer_reset,
         crashed_worker_frees_its_slot
@@ -1883,6 +1885,19 @@ drain_waits_for_a_response_flow_control_holds(Config) ->
     %% then must keep the connection open until the rest goes out with the
     %% FIN, and close it (H3_NO_ERROR) right after.
     {Conn, StreamId} = drain_with_held_response(Config),
+    ok = roadrunner_quic_test_conn:grant_stream_credit(Conn, StreamId, 200_000),
+    {fin, Bytes} = ll_collect_until_end(Conn, StreamId, <<>>),
+    ?assertEqual({200, binary:copy(~"x", 100_000)}, ll_decode(Bytes)),
+    ?assertEqual(16#100, ll_await_close_code(Conn)).
+
+drain_resends_a_lost_response_before_closing(Config) ->
+    %% The datagram carrying the response's FIN is lost. The drain's close
+    %% waits for the client to acknowledge every byte, so the server finds
+    %% the loss and resends it before closing: a CONNECTION_CLOSE right after
+    %% the FIN would end retransmission (RFC 9000 §10.2) and leave the body
+    %% short.
+    {Conn, StreamId} = drain_with_held_response(Config),
+    ok = roadrunner_quic_test_conn:drop_fin(Conn, StreamId),
     ok = roadrunner_quic_test_conn:grant_stream_credit(Conn, StreamId, 200_000),
     {fin, Bytes} = ll_collect_until_end(Conn, StreamId, <<>>),
     ?assertEqual({200, binary:copy(~"x", 100_000)}, ll_decode(Bytes)),

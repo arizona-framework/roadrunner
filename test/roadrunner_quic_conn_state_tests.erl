@@ -2920,10 +2920,17 @@ send_final_dropped_while_draining_test() ->
 %% With nothing owed, a graceful close goes out at once, and the owner hears
 %% {closed, drained} since it did not close the connection itself.
 close_when_done_closes_at_once_when_idle_test() ->
-    {State, _ClientApSecret, ServerApSecret} = connect_owned(),
+    %% Idle: no response owed and the peer has acknowledged everything sent
+    %% (an ACK up to the newest packet covers the handshake's HANDSHAKE_DONE
+    %% too).
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {StateSent, Sent} = ?M:handle_send(self(), make_ref(), 3, ~"settings", false, ?NOW, State),
+    {StateAcked, _} = ?M:handle_datagram(
+        ?NOW, ?PEER, ack_through(largest_app_pn(Sent, ServerApSecret), 0, ClientApSecret), StateSent
+    ),
     Ref = make_ref(),
     {State1, Effects} = ?M:handle_call(
-        self(), Ref, {close_when_done, 16#0100, ~"bye"}, ?NOW, State
+        self(), Ref, {close_when_done, 16#0100, ~"bye"}, ?NOW, StateAcked
     ),
     ?assertEqual([ok], replies_for(Effects, Ref)),
     ?assertEqual(draining, ?M:phase(State1)),
@@ -2934,8 +2941,10 @@ close_when_done_closes_at_once_when_idle_test() ->
     ?assertEqual([{closed, drained}], [Ev || {emit, _, Ev} <- Effects]).
 
 %% A request the peer sent is owed its response: the close waits for it, and
-%% goes out in the same pass as the response's FIN. The control stream, idle
-%% once its bytes are out, holds nothing.
+%% then for the peer to acknowledge it, since a CONNECTION_CLOSE ends
+%% retransmission (RFC 9000 §10.2) and a lost last packet would cut the
+%% response short. The control stream, idle once its bytes are out, holds
+%% nothing.
 close_when_done_waits_for_the_response_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     {State1, _} = ?M:handle_send(self(), make_ref(), 3, ~"settings", false, ?NOW, State),
@@ -2947,18 +2956,57 @@ close_when_done_waits_for_the_response_test() ->
     ?assertEqual(connected, ?M:phase(State3)),
     ?assertEqual([], close_frames(E3, ServerApSecret)),
     {State4, E4} = ?M:handle_send_final(0, ~"resp", ?NOW, State3),
-    ?assertEqual(draining, ?M:phase(State4)),
     ?assertMatch([{stream, 0, 0, ~"resp", true}], sent_stream_frames(E4, ServerApSecret)),
+    ?assertEqual(connected, ?M:phase(State4)),
+    ?assertEqual([], close_frames(E4, ServerApSecret)),
+    Ack = ack_through(largest_app_pn(E4, ServerApSecret), 1, ClientApSecret),
+    {State5, E5} = ?M:handle_datagram(?NOW, ?PEER, Ack, State4),
+    ?assertEqual(draining, ?M:phase(State5)),
     ?assertMatch(
-        [{connection_close, application, 16#0100, _, _}], close_frames(E4, ServerApSecret)
+        [{connection_close, application, 16#0100, _, _}], close_frames(E5, ServerApSecret)
     ),
-    ?assertEqual([{closed, drained}], [Ev || {emit, _, Ev} <- E4]).
+    ?assertEqual([{closed, drained}], [Ev || {emit, _, Ev} <- E5]).
+
+%% A response packet found lost while the close waits goes out again, and
+%% the close waits for that copy to be acknowledged.
+close_when_done_resends_a_lost_response_test() ->
+    %% Everything before the response is acknowledged, so the response is
+    %% the only packet in flight (the oldest one, which a probe resends).
+    {State0, ClientApSecret, ServerApSecret} = connect_owned(),
+    {StateSent, Sent} = ?M:handle_send(self(), make_ref(), 3, ~"settings", false, ?NOW, State0),
+    Request = app_datagram(
+        [ack_frame_through(largest_app_pn(Sent, ServerApSecret)), {stream, 0, 0, ~"req", true}],
+        0,
+        ClientApSecret
+    ),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Request, StateSent),
+    {State2, _} = ?M:handle_call(
+        self(), make_ref(), {close_when_done, 16#0100, ~""}, ?NOW, State1
+    ),
+    {State3, E3} = ?M:handle_send_final(0, ~"resp", ?NOW, State2),
+    Lost = largest_app_pn(E3, ServerApSecret),
+    %% The probe timeout finds nothing acknowledged and resends the
+    %% response, still holding the close.
+    {State4, E4} = ?M:handle_timeout(?NOW + 5000, pto, State3),
+    ?assertMatch([{stream, 0, 0, ~"resp", true} | _], sent_stream_frames(E4, ServerApSecret)),
+    ?assertEqual([], close_frames(E4, ServerApSecret)),
+    Resent = largest_app_pn(E4, ServerApSecret),
+    ?assert(Resent > Lost),
+    {State5, E5} = ?M:handle_datagram(
+        ?NOW + 5000, ?PEER, ack_through(Resent, 1, ClientApSecret), State4
+    ),
+    ?assertEqual(draining, ?M:phase(State5)),
+    ?assertMatch(
+        [{connection_close, application, 16#0100, _, _}], close_frames(E5, ServerApSecret)
+    ).
 
 %% A response flow control holds back holds the close until the peer resets
 %% the stream: STOP_SENDING abandons the bytes, so nothing is owed any more.
 close_when_done_released_by_stop_sending_test() ->
-    {State, ClientApSecret, ServerApSecret} = held_response_closing(),
-    Stop = app_datagram([{stop_sending, 0, 7}], 1, ClientApSecret),
+    {State, ClientApSecret, ServerApSecret, Largest} = held_response_closing(),
+    Stop = app_datagram(
+        [ack_frame_through(Largest), {stop_sending, 0, 7}], 1, ClientApSecret
+    ),
     {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Stop, State),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertMatch(
@@ -2968,8 +3016,10 @@ close_when_done_released_by_stop_sending_test() ->
 
 %% The same for a peer RESET_STREAM on the held response's stream.
 close_when_done_released_by_peer_reset_test() ->
-    {State, ClientApSecret, ServerApSecret} = held_response_closing(),
-    Reset = app_datagram([{reset_stream, 0, 7, 3}], 1, ClientApSecret),
+    {State, ClientApSecret, ServerApSecret, Largest} = held_response_closing(),
+    Reset = app_datagram(
+        [ack_frame_through(Largest), {reset_stream, 0, 7, 3}], 1, ClientApSecret
+    ),
     {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Reset, State),
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertMatch(
@@ -4265,13 +4315,21 @@ held_response_closing() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     Request = app_datagram([{stream, 0, 0, ~"req", true}], 0, ClientApSecret),
     {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Request, State),
-    {State2, _} = ?M:handle_send_final(0, binary:copy(~"x", 100000), ?NOW, State1),
+    {State2, Sent} = ?M:handle_send_final(0, binary:copy(~"x", 100000), ?NOW, State1),
     {State3, Effects} = ?M:handle_call(
         self(), make_ref(), {close_when_done, 16#0100, ~""}, ?NOW, State2
     ),
     ?assertEqual(connected, ?M:phase(State3)),
     ?assertEqual([], close_frames(Effects, ServerApSecret)),
-    {State3, ClientApSecret, ServerApSecret}.
+    {State3, ClientApSecret, ServerApSecret, largest_app_pn(Sent, ServerApSecret)}.
+
+%% An ACK of every 1-RTT packet up to `Largest`, in a client datagram
+%% numbered `PN`.
+ack_through(Largest, PN, ClientApSecret) ->
+    app_datagram([ack_frame_through(Largest)], PN, ClientApSecret).
+
+ack_frame_through(Largest) ->
+    {ack, Largest, 0, Largest, [], undefined}.
 
 %% The reply results addressed to a given send Ref (a parked send emits none
 %% until released; a released one emits exactly one).

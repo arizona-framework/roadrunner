@@ -49,6 +49,7 @@
     reset_stream/3,
     stop_sending/3,
     grant_stream_credit/3,
+    drop_fin/2,
     server_cids/1,
     reset_tokens/1,
     new_tokens/1,
@@ -131,7 +132,10 @@
     reset_tokens = [] :: [binary()],
     %% The address validation tokens the server sent, newest first (RFC 9000
     %% §19.7).
-    new_tokens = [] :: [binary()]
+    new_tokens = [] :: [binary()],
+    %% The stream whose FIN-carrying datagram to discard unread, as a lossy
+    %% network would (`drop_fin/2`), or `undefined`.
+    drop_fin = undefined :: non_neg_integer() | undefined
 }).
 
 %% =============================================================================
@@ -236,6 +240,15 @@ per-stream window resumes sending.
 -spec grant_stream_credit(pid(), non_neg_integer(), non_neg_integer()) -> ok.
 grant_stream_credit(Pid, StreamId, MaxStreamData) ->
     cast_frame(Pid, {max_stream_data, StreamId, MaxStreamData}).
+
+-doc """
+Discard, unread and unacknowledged, the first datagram from the server
+carrying the FIN of `StreamId`, as if the network lost it, so a test can
+make the server detect the loss of a response's last packet and resend.
+""".
+-spec drop_fin(pid(), non_neg_integer()) -> ok.
+drop_fin(Pid, StreamId) ->
+    call(Pid, {drop_fin, StreamId}).
 
 -doc """
 The server's connection ids the client knows, by sequence number (RFC 9000
@@ -656,6 +669,9 @@ connected_loop(#conn{socket = Socket, unacked = Unacked} = Conn) ->
         {sockname, From, Ref} ->
             From ! {Ref, roadrunner_quic_socket:sockname(Socket)},
             connected_loop(Conn);
+        {{drop_fin, StreamId}, From, Ref} ->
+            From ! {Ref, ok},
+            connected_loop(Conn#conn{drop_fin = StreamId});
         {send, From, Ref, StreamId, Data, Fin} ->
             Conn1 = send_stream(Conn, StreamId, Data, Fin),
             From ! {Ref, ok},
@@ -677,7 +693,10 @@ connected_loop(#conn{socket = Socket, unacked = Unacked} = Conn) ->
                     %% Re-arm before processing so the next datagram is already
                     %% queued while we work (1-RTT packets keep arriving).
                     ok = roadrunner_quic_socket:activate(Socket),
-                    connected_loop(handle_app_datagram(Conn, Datagram));
+                    case carries_dropped_fin(Conn, Datagram) of
+                        true -> connected_loop(Conn#conn{drop_fin = undefined});
+                        false -> connected_loop(handle_app_datagram(Conn, Datagram))
+                    end;
                 ignore ->
                     connected_loop(Conn)
             end
@@ -771,6 +790,30 @@ handle_app_datagram(#conn{app_server_keys = Keys, scid = Scid} = Conn, Datagram)
     ),
     ok = maybe_stateless_reset(Outcomes, Datagram, Conn),
     maybe_send_ack(lists:foldl(fun handle_app_packet/2, Conn, Outcomes)).
+
+%% Whether `Datagram` carries the FIN of the stream `drop_fin/2` named.
+-spec carries_dropped_fin(#conn{}, binary()) -> boolean().
+carries_dropped_fin(#conn{drop_fin = undefined}, _Datagram) ->
+    false;
+carries_dropped_fin(#conn{drop_fin = StreamId, app_server_keys = Keys, scid = Scid}, Datagram) ->
+    Outcomes = roadrunner_quic_recv:datagram(
+        Datagram, byte_size(Scid), #{application => Keys}, #{}
+    ),
+    lists:any(
+        fun
+            ({ok, #{frames := Frames}}) ->
+                lists:any(
+                    fun
+                        ({stream, Id, _Offset, _Data, true}) -> Id =:= StreamId;
+                        (_Frame) -> false
+                    end,
+                    Frames
+                );
+            (_Outcome) ->
+                false
+        end,
+        Outcomes
+    ).
 
 %% RFC 9000 §10.3.1: a datagram none of whose packets decrypted, ending in
 %% one of the server's stateless reset tokens, is a stateless reset.

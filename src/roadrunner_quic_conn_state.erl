@@ -2962,18 +2962,31 @@ pass_tail(Now, #state{close_when_done = {ErrorCode, Reason}, owner = Owner} = St
             {State, timer_effects(State)}
     end.
 
-%% Every response is out: no stream holds unsent bytes or an unsent FIN (the
-%% `sendable` set, so bytes flow control holds back keep the connection open,
-%% the owner's own control-stream GOAWAY among them), and no client request
+%% Every response is delivered: no stream holds unsent bytes or an unsent FIN
+%% (the `sendable` set, so bytes flow control holds back keep the connection
+%% open, the owner's own control-stream GOAWAY among them), no client request
 %% stream (RFC 9000 §2.1: `Sid rem 4 =:= 0`) the peer started still waits on
-%% our FIN. A response whose final write is still on its way to this
+%% our FIN, and the peer has acknowledged everything sent, with nothing lost
+%% left to resend. A CONNECTION_CLOSE ends retransmission (RFC 9000 §10.2),
+%% so closing once the last FIN is only sent would cut short a response whose
+%% last packet is lost; a graceful shutdown lets requests complete (RFC 9114
+%% §5.2). A response whose final write is still on its way to this
 %% connection leaves its stream waiting, so a close never overtakes it. A
-%% stream reset by either side waits on nothing (`send_owed/1`).
+%% stream reset by either side waits on nothing (`send_owed/1`). A peer that
+%% never acknowledges is bounded by the listener's drain deadline.
 -spec responses_done(t()) -> boolean().
-responses_done(#state{sendable = [], streams = Streams}) ->
-    no_response_owed(maps:next(maps:iterator(Streams)));
+responses_done(#state{sendable = [], streams = Streams} = State) ->
+    all_acknowledged(space(application, State)) andalso
+        no_response_owed(maps:next(maps:iterator(Streams)));
 responses_done(#state{}) ->
     false.
+
+%% Nothing ack-eliciting the peer has yet to acknowledge, and nothing found
+%% lost waiting to go out again (after a send pass, only the
+%% anti-amplification limit of a path being validated can hold it back).
+-spec all_acknowledged(#space{}) -> boolean().
+all_acknowledged(#space{pending = Pending, loss = Loss}) ->
+    Pending =:= [] andalso roadrunner_quic_loss:bytes_in_flight(Loss) =:= 0.
 
 -spec no_response_owed(none | {non_neg_integer(), stream(), maps:iterator()}) -> boolean().
 no_response_owed(none) ->
