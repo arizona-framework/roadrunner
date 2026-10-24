@@ -1244,12 +1244,54 @@ loss_halves_congestion_window_test() ->
 ack_only_datagram_not_congestion_controlled_test() ->
     %% A datagram carrying only an ACK is not ack-eliciting, so the congestion
     %% window never gates it (RFC 9002 §7): the gate short-circuits on
-    %% not-ack-eliciting before consulting the window, full or not. A peer PING
-    %% with no server data to send produces exactly such an ACK-only datagram.
+    %% not-ack-eliciting before consulting the window, full or not. Two peer
+    %% PINGs with no server data to send make the ACK due at once, in exactly
+    %% such an ACK-only datagram.
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
-    Ping = app_datagram([ping], 0, ClientApSecret),
-    {_State1, Effects} = ?M:handle_datagram(?NOW, Ping, State),
+    {State1, _} = ?M:handle_datagram(?NOW, app_datagram([ping], 0, ClientApSecret), State),
+    {_State2, Effects} = ?M:handle_datagram(?NOW, app_datagram([ping], 1, ClientApSecret), State1),
     ?assert(lists:any(fun is_ack/1, sent_app_frames(Effects, ServerApSecret))).
+
+%% RFC 9000 §13.2.1: a 1-RTT ACK may wait for data to ride with. One PING
+%% sends nothing and arms the ACK timer; when it fires the ACK goes out alone,
+%% reporting how long the PING waited (20 ms in 8 µs units, the default
+%% ack_delay_exponent of 3).
+delayed_ack_waits_then_goes_out_on_timer_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram([ping], 0, ClientApSecret), State),
+    ?assertEqual([], sends(Effects)),
+    ?assertEqual([?NOW + 20], [At || {arm_timer, ack, At} <- Effects]),
+    {_State2, Fired} = ?M:handle_timeout(?NOW + 20, ack, State1),
+    ?assertMatch(
+        [{ack, 0, 2500, 0, [], undefined}],
+        [F || {ack, _, _, _, _, _} = F <- sent_app_frames(Fired, ServerApSecret)]
+    ).
+
+%% A packet past a gap (a lost packet before it) is acknowledged at once, so
+%% the peer learns of the loss without waiting (RFC 9000 §13.2.1).
+out_of_order_packet_acked_at_once_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, app_datagram([ping], 3, ClientApSecret), State),
+    ?assert(lists:any(fun is_ack/1, sent_app_frames(Effects, ServerApSecret))).
+
+%% A waiting ACK rides in the next packet that carries data.
+delayed_ack_rides_with_data_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram([ping], 0, ClientApSecret), State),
+    ?assertEqual([], sends(Effects)),
+    {_State2, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"reply", true, ?NOW + 1, State1),
+    Frames = sent_app_frames(Sent, ServerApSecret),
+    ?assert(lists:any(fun is_ack/1, Frames)),
+    ?assert(lists:any(fun(F) -> element(1, F) =:= stream end, Frames)).
+
+%% An ACK timer that fires once the connection is closing sends nothing.
+ack_timeout_while_draining_sends_nothing_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    {State1, _} = ?M:handle_datagram(?NOW, app_datagram([ping], 0, ClientApSecret), State),
+    Close = app_datagram([{connection_close, application, 0, undefined, <<>>}], 1, ClientApSecret),
+    {State2, _} = ?M:handle_datagram(?NOW, Close, State1),
+    ?assertEqual(draining, ?M:phase(State2)),
+    ?assertEqual({State2, []}, ?M:handle_timeout(?NOW + 20, ack, State2)).
 
 max_stream_data_for_untracked_stream_ignored_test() ->
     %% A MAX_STREAM_DATA grant for a stream the server is not tracking is ignored

@@ -576,7 +576,7 @@ handle_app_datagram(#conn{app_server_keys = Keys, scid = Scid} = Conn, Datagram)
 -spec handle_app_packet(roadrunner_quic_recv:outcome(), #conn{}) -> #conn{}.
 handle_app_packet({ok, #{level := application, pn := PN, frames := Frames}}, Conn) ->
     Elicit = roadrunner_quic_send:ack_eliciting(Frames),
-    Ack = roadrunner_quic_ack:record(PN, Elicit, Conn#conn.ack),
+    Ack = roadrunner_quic_ack:record(PN, Elicit, 0, Conn#conn.ack),
     Unacked = Conn#conn.unacked + ack_eliciting_count(Elicit),
     lists:foldl(fun handle_app_frame/2, Conn#conn{ack = Ack, unacked = Unacked}, Frames);
 handle_app_packet(_Outcome, Conn) ->

@@ -12,8 +12,15 @@
 %% the connection adds the ACK delay (from its own clock) and any ECN
 %% counts to assemble the frame. `needs_ack/1` reports whether an
 %% ack-eliciting packet is still awaiting acknowledgement.
+%%
+%% An ACK may wait (RFC 9000 §13.2.1): `ack_due/3` says when it no longer
+%% may, after a second ack-eliciting packet (§13.2.2), a packet out of order,
+%% or the delay running out since the first unacknowledged one arrived, and
+%% `ack_deadline/2` when that delay runs out. `ack_delay/2` is how long the
+%% largest packet has waited, for the ACK frame's ACK Delay field.
 
--export([new/0, record/3, largest/1, ranges/1, needs_ack/1, mark_ack_sent/1, to_ack/1]).
+-export([new/0, record/4, largest/1, ranges/1, needs_ack/1, mark_ack_sent/1, to_ack/1]).
+-export([ack_due/3, ack_deadline/2, ack_delay/2]).
 
 -export_type([t/0, range/0]).
 
@@ -21,7 +28,16 @@
 
 -record(ack, {
     ranges = [] :: [range()],
-    pending = false :: boolean()
+    pending = false :: boolean(),
+    %% Ack-eliciting packets received since the last ACK was sent.
+    eliciting = 0 :: non_neg_integer(),
+    %% When the first of those arrived.
+    first_at = undefined :: integer() | undefined,
+    %% Whether one of those arrived out of order: below the largest received,
+    %% or past a gap above it.
+    reordered = false :: boolean(),
+    %% When the largest packet number arrived.
+    largest_at = undefined :: integer() | undefined
 }).
 
 -opaque t() :: #ack{}.
@@ -32,13 +48,46 @@ new() ->
     #ack{}.
 
 -doc """
-Record a received packet number. `AckEliciting` says whether the packet
-carried an ack-eliciting frame, which is what later makes `needs_ack/1`
-true.
+Record a packet number received at `Now` (milliseconds). `AckEliciting`
+says whether the packet carried an ack-eliciting frame, which is what later
+makes `needs_ack/1` true.
 """.
--spec record(non_neg_integer(), boolean(), t()) -> t().
-record(PN, AckEliciting, #ack{ranges = Ranges, pending = Pending} = Ack) ->
-    Ack#ack{ranges = add(PN, Ranges), pending = Pending orelse AckEliciting}.
+-spec record(non_neg_integer(), boolean(), integer(), t()) -> t().
+record(PN, AckEliciting, Now, #ack{ranges = Ranges} = Ack) ->
+    Largest = largest(Ack),
+    Ack1 = Ack#ack{ranges = add(PN, Ranges), largest_at = largest_at(PN, Largest, Now, Ack)},
+    case AckEliciting of
+        true -> eliciting(PN, Largest, Now, Ack1);
+        false -> Ack1
+    end.
+
+-spec largest_at(non_neg_integer(), non_neg_integer() | undefined, integer(), t()) ->
+    integer() | undefined.
+largest_at(PN, Largest, Now, _Ack) when Largest =:= undefined; PN > Largest ->
+    Now;
+largest_at(_PN, _Largest, _Now, #ack{largest_at = At}) ->
+    At.
+
+-spec eliciting(non_neg_integer(), non_neg_integer() | undefined, integer(), t()) -> t().
+eliciting(
+    PN, Largest, Now, #ack{eliciting = Count, first_at = FirstAt, reordered = Reordered} = Ack
+) ->
+    Ack#ack{
+        pending = true,
+        eliciting = Count + 1,
+        first_at =
+            case FirstAt of
+                undefined -> Now;
+                _ -> FirstAt
+            end,
+        reordered = Reordered orelse out_of_order(PN, Largest)
+    }.
+
+%% A packet below the largest received, or one leaving a gap above it. Packet
+%% numbers start at 0, so a first packet past 0 leaves a gap too.
+-spec out_of_order(non_neg_integer(), non_neg_integer() | undefined) -> boolean().
+out_of_order(PN, undefined) -> PN > 0;
+out_of_order(PN, Largest) -> PN < Largest orelse PN > Largest + 1.
 
 -doc "The largest packet number received, or `undefined` if none.".
 -spec largest(t()) -> non_neg_integer() | undefined.
@@ -55,10 +104,39 @@ ranges(#ack{ranges = Ranges}) ->
 needs_ack(#ack{pending = Pending}) ->
     Pending.
 
--doc "Clear the pending flag once an ACK covering the received packets has been sent.".
+-doc "Clear the pending state once an ACK covering the received packets has been sent.".
 -spec mark_ack_sent(t()) -> t().
 mark_ack_sent(Ack) ->
-    Ack#ack{pending = false}.
+    Ack#ack{pending = false, eliciting = 0, first_at = undefined, reordered = false}.
+
+-doc """
+Whether a pending ACK must go out at `Now` rather than wait for a packet
+to ride in: once two ack-eliciting packets are unacknowledged (RFC 9000
+§13.2.2), once one arrived out of order (§13.2.1), or once the first
+unacknowledged one has waited `MaxDelay` milliseconds.
+""".
+-spec ack_due(t(), integer(), non_neg_integer()) -> boolean().
+ack_due(#ack{pending = false}, _Now, _MaxDelay) ->
+    false;
+ack_due(#ack{eliciting = Count, reordered = Reordered, first_at = FirstAt}, Now, MaxDelay) ->
+    Count >= 2 orelse Reordered orelse Now >= FirstAt + MaxDelay.
+
+-doc "When a pending ACK may wait no longer, or `undefined` with none pending.".
+-spec ack_deadline(t(), non_neg_integer()) -> integer() | undefined.
+ack_deadline(#ack{pending = true, first_at = FirstAt}, MaxDelay) ->
+    FirstAt + MaxDelay;
+ack_deadline(#ack{pending = false}, _MaxDelay) ->
+    undefined.
+
+-doc """
+How long, in milliseconds, the largest received packet has waited at `Now`:
+the ACK Delay an ACK frame reports (RFC 9000 §19.3). 0 with nothing received.
+""".
+-spec ack_delay(t(), integer()) -> non_neg_integer().
+ack_delay(#ack{largest_at = undefined}, _Now) ->
+    0;
+ack_delay(#ack{largest_at = At}, Now) ->
+    max(0, Now - At).
 
 -doc """
 The ACK frame range fields for the current state, or `none` if nothing
