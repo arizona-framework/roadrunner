@@ -22,7 +22,7 @@ A small, fast HTTP core you can trust on the hot path.
 - **Fast where it counts**: Tuned for low p50 and p99 under sustained load. See
   [Performance](#performance).
 - **Correct and hostile-input-safe**: Strict RFC 9110 / 9112 / 9113 parsing,
-  100% h2spec and 100% Autobahn (no exclusions), tested against
+  100% h2spec, 100% h3spec and 100% Autobahn (no exclusions), tested against
   request-smuggling cases, and listed on Http11Probe. See
   [Conformance](#conformance).
 - **Every HTTP version, one server**: HTTP/1.1, HTTP/2, HTTP/3 (experimental),
@@ -456,8 +456,8 @@ type. Beyond `port`,
 
 ## Conformance
 
-Strict 100% h2spec (HTTP/2) and Autobahn fuzzingclient across the full
-WebSocket matrix (no exclusions). The HTTP/1.1 parser is tested against
+Strict 100% h2spec (HTTP/2), 100% h3spec (QUIC and HTTP/3 error handling)
+and Autobahn fuzzingclient across the full WebSocket matrix (no exclusions). The HTTP/1.1 parser is tested against
 malformed-request cases taken from the [llhttp](https://github.com/nodejs/llhttp)
 test corpus and [PortSwigger](https://portswigger.net/web-security/request-smuggling)
 request-smuggling patterns.
@@ -475,7 +475,7 @@ Standards conformance:
   [h2spec](https://github.com/summerwind/h2spec)).
 - **HTTP/3 (experimental)**: RFC 9114 over QUIC with QPACK (RFC 9204)
   static-table compression, over Roadrunner's own pure-Erlang QUIC
-  transport (TLS 1.3 required). Error-case harness:
+  transport (TLS 1.3 required). Conformance harness:
   [`scripts/h3spec.sh`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/h3spec.sh) (drives
   [h3spec](https://github.com/kazu-yamamoto/h3spec)).
 - **Content-Encoding (RFC 9110 §8.4.1)**: gzip + deflate with

@@ -30,14 +30,11 @@ cd "$PROJECT_DIR"
 
 H3SPEC_VERSION="v0.1.14"
 
-# Cases the server fails today. Each one is a conformance gap, skipped so
-# the run gates every other case; a PR that fixes one deletes its line.
-# Matched as substrings of h3spec's case descriptions.
-KNOWN_FAILURES=(
-    "MUST send CRYPTO_BUFFER_EXCEEDED if CRYPTO data is buffered beyond the limit"
-    "MUST send unexpected_message TLS alert if KeyUpdate in Handshake is received"
-    "MUST send unexpected_message TLS alert if EndOfEarlyData is received"
-)
+# Cases the server fails, empty when it passes them all. Each one is a
+# conformance gap, skipped so the run still gates every other case; list a
+# case here only while a fix for it is pending, and delete its line in the
+# PR that fixes it. Matched as substrings of h3spec's case descriptions.
+KNOWN_FAILURES=()
 
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64)

@@ -39,6 +39,7 @@
     send_pending/1,
     send_abandoned/1,
     send_offset/1,
+    recv_offset/1,
     is_terminal/1
 ]).
 
@@ -236,6 +237,13 @@ is abandoned.
 """.
 -spec send_offset(t()) -> non_neg_integer().
 send_offset(#stream{send_offset = Offset}) -> Offset.
+
+-doc """
+The receive offset: the length of the contiguous prefix already delivered, so
+every buffered out-of-order byte lies above it.
+""".
+-spec recv_offset(t()) -> non_neg_integer().
+recv_offset(#stream{offset = Offset}) -> Offset.
 
 %% =============================================================================
 %% Internal
