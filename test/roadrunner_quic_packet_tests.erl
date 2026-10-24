@@ -305,3 +305,21 @@ version_negotiation_structure_test() ->
     ?assertEqual(?DCID, D),
     ?assertEqual(?SCID, S),
     ?assertEqual([V || <<V:32>> <= VBytes], Versions).
+
+%% =============================================================================
+%% Stateless Reset (RFC 9000 §10.3): the short-header form and fixed bits,
+%% random bits, and the token last, at the asked size; two differ.
+%% =============================================================================
+
+stateless_reset_layout_test() ->
+    Token = <<16#ab:128>>,
+    lists:foreach(
+        fun(Size) ->
+            Reset = ?M:encode_stateless_reset(Token, Size),
+            ?assertEqual(Size, byte_size(Reset)),
+            Skip = Size - 16,
+            ?assertMatch(<<0:1, 1:1, _:6, _:(Skip - 1)/binary, Token:16/binary>>, Reset)
+        end,
+        [21, 43, 64]
+    ),
+    ?assertNotEqual(?M:encode_stateless_reset(Token, 43), ?M:encode_stateless_reset(Token, 43)).

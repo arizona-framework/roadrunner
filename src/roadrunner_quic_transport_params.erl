@@ -11,8 +11,8 @@
 %% `param_key/0`), mirroring `roadrunner_quic_h3_frame`'s `{settings,
 %% map()}` and the dep's own representation. Values are typed by
 %% parameter: an integer for the varint parameters, a `binary()` for the
-%% connection-id parameters, and `true` for the zero-length
-%% `disable_active_migration` flag.
+%% connection-id parameters and the 16-byte `stateless_reset_token`, and
+%% `true` for the zero-length `disable_active_migration` flag.
 %%
 %% `encode/1` emits every parameter in the map as an iolist (in
 %% map-iteration order; RFC 9000 §18 permits any order); choosing which
@@ -40,7 +40,8 @@
     | max_ack_delay
     | disable_active_migration
     | active_connection_id_limit
-    | initial_source_connection_id.
+    | initial_source_connection_id
+    | stateless_reset_token.
 
 -type params() :: #{
     original_destination_connection_id => binary(),
@@ -56,7 +57,10 @@
     max_ack_delay => non_neg_integer(),
     disable_active_migration => true,
     active_connection_id_limit => non_neg_integer(),
-    initial_source_connection_id => binary()
+    initial_source_connection_id => binary(),
+    %% Server-only (RFC 9000 §18.2): the stateless reset token of the
+    %% connection id the server chose in the handshake.
+    stateless_reset_token => <<_:128>>
 }.
 
 %% Ids already seen while decoding a set, for the RFC 9000 §7.4 duplicate
@@ -143,15 +147,17 @@ decode(Data) ->
 %% =============================================================================
 
 %% One parameter as a `varint(Id), varint(Length), Value` iolist. The
-%% connection-id parameters carry raw bytes, the flag carries an empty
-%% value, the rest carry a varint value. A parameter this server does not
-%% send (e.g. stateless_reset_token) has no clause and raises, rather than
-%% emitting an out-of-scope parameter.
+%% connection-id parameters and the reset token carry raw bytes, the flag
+%% carries an empty value, the rest carry a varint value. A parameter this
+%% server does not send (e.g. preferred_address) has no clause and raises,
+%% rather than emitting an out-of-scope parameter.
 -spec encode_param(param_key(), non_neg_integer() | binary() | true) -> iolist().
 encode_param(original_destination_connection_id, Cid) ->
     tlv(?TP_ORIGINAL_DESTINATION_CONNECTION_ID, Cid);
 encode_param(initial_source_connection_id, Cid) ->
     tlv(?TP_INITIAL_SOURCE_CONNECTION_ID, Cid);
+encode_param(stateless_reset_token, <<_:128>> = Token) ->
+    tlv(?TP_STATELESS_RESET_TOKEN, Token);
 encode_param(disable_active_migration, true) ->
     tlv(?TP_DISABLE_ACTIVE_MIGRATION, <<>>);
 encode_param(max_idle_timeout, V) ->

@@ -122,15 +122,6 @@ advisory or malformed cases the server currently tolerates or omits.
   transfer that fills a non-zero window — already emits the frame on the
   flow's blocked transition; this remainder is the never-sent-a-byte case a
   conformant peer never produces — small
-- Send a stateless reset (RFC 9000 §10.3) for a short-header datagram that
-  routes to no connection, so a client the server has forgotten stops at
-  once instead of waiting out its idle timeout. Every issued connection id
-  already carries a valid token (`reset_token/2` in
-  `roadrunner_quic_cid_registry`); the rest is the listener's send with the
-  §10.3 size floor and loop limits, the handshake id's token in the
-  `stateless_reset_token` transport parameter, and a reset key that
-  outlives a restart (it is random per listener pool today, so only ids the
-  running pool issued can be reset). Small-medium
 - Address validation tokens (RFC 9000 §8.1.3): send NEW_TOKEN so a returning
   client's address counts as validated, and accept the token in its
   Initial, sparing it the three-times anti-amplification limit on its first

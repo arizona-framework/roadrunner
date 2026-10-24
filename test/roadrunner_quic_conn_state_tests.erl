@@ -950,6 +950,105 @@ zero_length_client_id_new_connection_id_closes_test() ->
     ?assertEqual(draining, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, protocol_violation}}}], emits(Effects)).
 
+%% =============================================================================
+%% Client stateless resets (RFC 9000 §10.3, §10.3.1)
+%% =============================================================================
+
+client_reset_tokens_routed_test() ->
+    %% Each client id's stateless reset token routes to the connection while
+    %% the id is active, and stops routing once it is retired (§10.3: a
+    %% token is invalidated with its id).
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    New = {new_connection_id, 1, 0, <<21:64>>, <<1:128>>},
+    {State1, Effects1} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram([New], 0, ClientApSecret), State
+    ),
+    ?assert(lists:member({register_reset, <<1:128>>}, Effects1)),
+    ?assertEqual([<<1:128>>], ?M:reset_routes(State1)),
+    Next = {new_connection_id, 2, 2, <<22:64>>, <<2:128>>},
+    {State2, Effects2} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram([Next], 1, ClientApSecret), State1
+    ),
+    ?assert(lists:member({register_reset, <<2:128>>}, Effects2)),
+    ?assert(lists:member({unregister_reset, <<1:128>>}, Effects2)),
+    ?assertEqual([<<2:128>>], ?M:reset_routes(State2)).
+
+client_stateless_reset_drains_test() ->
+    %% A datagram from the client's address that does not decrypt and ends
+    %% in the token of the client id the server addresses there is a
+    %% stateless reset: the connection drains (§10.3.1 MUST), telling the
+    %% owner, and sends nothing more. The same holds for one too short to
+    %% sample (dropped unopened) and one with no packet in it at all.
+    Token = <<5:128>>,
+    lists:foreach(
+        fun(Reset) ->
+            State = addressing_client_spare(Token),
+            {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Reset, State),
+            ?assertEqual(draining, ?M:phase(State1)),
+            ?assertEqual([{emit, self(), {closed, {peer, stateless_reset}}}], emits(Effects)),
+            ?assertEqual([], sends(Effects)),
+            ?assertMatch([_], [At || {arm_timer, drain, At} <- Effects]),
+            {_State2, Later} = ?M:handle_datagram(?NOW, ?PEER, Reset, State1),
+            ?assertEqual([], sends(Later))
+        end,
+        [
+            <<16#40, (crypto:strong_rand_bytes(30))/binary, Token/binary>>,
+            <<16#40, (crypto:strong_rand_bytes(5))/binary, Token/binary>>,
+            <<16#00, (crypto:strong_rand_bytes(30))/binary, Token/binary>>
+        ]
+    ).
+
+not_a_client_stateless_reset_test_() ->
+    %% Not a reset (§10.3.1): another token, the token from an address the id
+    %% is not used toward, a datagram too small to be a reset (21 bytes, §10.3),
+    %% and the token of a client id the server has not used.
+    Token = <<5:128>>,
+    Unused =
+        fun() ->
+            {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+            New = {new_connection_id, 1, 0, <<21:64>>, Token},
+            {State1, _} = ?M:handle_datagram(
+                ?NOW, ?PEER, app_datagram([New], 0, ClientApSecret), State
+            ),
+            State1
+        end,
+    Used = fun() -> addressing_client_spare(Token) end,
+    [
+        ?_test(assert_not_reset(Used, ?PEER, <<16#40, 0:240, 6:128>>)),
+        ?_test(assert_not_reset(Used, ?PEER3, <<16#40, 0:240, Token/binary>>)),
+        ?_test(assert_not_reset(Used, ?PEER, <<16#40, 0:24, Token/binary>>)),
+        ?_test(assert_not_reset(Unused, ?PEER, <<16#40, 0:240, Token/binary>>))
+    ].
+
+client_stateless_reset_on_probed_path_test() ->
+    %% The client id the server answers a probing address with counts there
+    %% (§10.3.1: tokens by the remote address), and not on the client's
+    %% current address, where the server still addresses its handshake id.
+    {State, ClientApSecret, _ServerApSecret, CID1} = connected_with_client_spare(),
+    Probe = app_datagram_to(
+        CID1, [{path_challenge, ~"probe-01"} | padding(1100)], 2, ClientApSecret
+    ),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER2, Probe, State),
+    Reset = <<16#40, 0:240, 1:128>>,
+    {Current, _} = ?M:handle_datagram(?NOW, ?PEER, Reset, State1),
+    ?assertEqual(connected, ?M:phase(Current)),
+    {Probed, _} = ?M:handle_datagram(?NOW, ?PEER2, Reset, State1),
+    ?assertEqual(draining, ?M:phase(Probed)).
+
+%% Connected, with the server addressing the client's spare id (sequence
+%% number 1, carrying `Token`), its Retire Prior To having retired the
+%% handshake's.
+addressing_client_spare(Token) ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    New = {new_connection_id, 1, 1, <<21:64>>, Token},
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([New], 0, ClientApSecret), State),
+    State1.
+
+assert_not_reset(Setup, Peer, Datagram) ->
+    {State1, Effects} = ?M:handle_datagram(?NOW, Peer, Datagram, Setup()),
+    ?assertEqual(connected, ?M:phase(State1)),
+    ?assertEqual([], emits(Effects)).
+
 application_close_at_1rtt_closes_test() ->
     %% An application-variant CONNECTION_CLOSE (0x1d) is legal at 1-RTT (an h3
     %% client's graceful close) and surfaces {closed, {peer, ErrorCode}}.

@@ -35,14 +35,58 @@ classify_spawns_for_v1_initial_to_unknown_cid_test() ->
 classify_drops_malformed_datagram_test() ->
     ?assertEqual(drop, ?M:classify(<<>>, ?REG:new())).
 
+%% A short header to an unknown id too small to hold a Stateless Reset (21
+%% bytes, RFC 9000 §10.3) is no valid packet: dropped, unanswered. So is one
+%% of exactly 21 bytes, since a reset answering it would have to be smaller
+%% (§10.3.3).
 classify_drops_short_header_to_unknown_cid_test() ->
-    ?assertEqual(drop, ?M:classify(short_header(?DCID), ?REG:new())).
+    ?assertEqual(drop, ?M:classify(short_header(?DCID), ?REG:new())),
+    ?assertEqual(drop, ?M:classify(short_header_of(21), ?REG:new())).
 
-%% A short-header packet at the floor to an unknown id is dropped through the
-%% long-header check (a short header never negotiates a version), distinct from
-%% the sub-floor drop above.
-classify_drops_large_short_header_to_unknown_cid_test() ->
-    ?assertEqual(drop, ?M:classify(pad(short_header(?DCID)), ?REG:new())).
+%% RFC 9000 §10.3: a larger short header to an unknown id draws a Stateless
+%% Reset for its destination id, at any size up to the 1200-byte floor.
+classify_resets_short_header_to_unknown_cid_test() ->
+    ?assertEqual({stateless_reset, ?DCID}, ?M:classify(short_header_of(22), ?REG:new())),
+    ?assertEqual({stateless_reset, ?DCID}, ?M:classify(pad(short_header(?DCID)), ?REG:new())).
+
+%% RFC 9000 §10.3.1: a short header to an unknown id ending in a client's
+%% stateless reset token goes to the connection holding the token, which
+%% decides whether it is a reset, rather than drawing one of ours.
+classify_forwards_client_reset_token_to_its_connection_test() ->
+    Registry = ?REG:new(),
+    Token = <<16#77:128>>,
+    ok = ?REG:add_reset(Registry, Token, self()),
+    Reset = <<16#40, (crypto:strong_rand_bytes(20))/binary, Token/binary>>,
+    ?assertEqual({forward, self()}, ?M:classify(Reset, Registry)),
+    ?assertMatch({stateless_reset, _}, ?M:classify(Reset, ?REG:new())).
+
+%% RFC 9000 §10.3, §10.3.3: a reset answering a packet of up to 43 bytes is
+%% one byte shorter; one answering a larger packet is 43 to 64 bytes, never
+%% as large as the packet.
+reset_size_test() ->
+    ?assertEqual(21, ?M:reset_size(22)),
+    ?assertEqual(42, ?M:reset_size(43)),
+    ?assertEqual(43, ?M:reset_size(44)),
+    Sizes = [?M:reset_size(Trigger) || Trigger <- lists:seq(44, 1500), _ <- [1, 2]],
+    ?assert(lists:all(fun(Size) -> Size >= 43 andalso Size =< 64 end, Sizes)),
+    ?assert(lists:member(64, Sizes)).
+
+%% RFC 9000 §10.3.3: at most 100 resets go out in one second; the count
+%% starts over in the next.
+reset_budget_test() ->
+    {ok, First} = ?M:reset_budget(7, undefined),
+    ?assertEqual({7, 1}, First),
+    Full = lists:foldl(
+        fun(_, Acc) ->
+            {ok, Next} = ?M:reset_budget(7, Acc),
+            Next
+        end,
+        First,
+        lists:seq(2, 100)
+    ),
+    ?assertEqual({7, 100}, Full),
+    ?assertEqual(exhausted, ?M:reset_budget(7, Full)),
+    ?assertEqual({ok, {8, 1}}, ?M:reset_budget(8, Full)).
 
 %% RFC 9000 §5.2.2: a server MUST drop an unsupported-version packet below the
 %% 1200-byte floor rather than answer it with Version Negotiation.
@@ -111,6 +155,10 @@ unsupported_version(DCID, SCID) ->
 %% the fixed server SCID length (8 bytes).
 short_header(DCID) ->
     <<16#40, DCID/binary, 0>>.
+
+%% A short-header packet to ?DCID of exactly `Size` bytes.
+short_header_of(Size) ->
+    <<16#40, ?DCID/binary, 0:((Size - 9) * 8)>>.
 
 %% Pad a datagram up to the RFC 9000 §14.1 1200-byte floor.
 pad(Datagram) ->

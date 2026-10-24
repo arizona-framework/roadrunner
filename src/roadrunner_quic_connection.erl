@@ -18,7 +18,9 @@
 %% AtMs}` sets the one deadline the core wants, and `{register_cid, CID}` /
 %% `{unregister_cid, CID}` route a connection id the core issued to this
 %% process in the registry, or stop routing one the peer retired (RFC 9000
-%% §5.1). A closing connection removes its own rows as it exits; the
+%% §5.1), and `{register_reset, Token}` / `{unregister_reset, Token}` do the
+%% same for a client stateless reset token (§10.3.1). A closing connection
+%% removes its own rows as it exits; the
 %% listener reaps those of one that crashes. The datagram's source address
 %% goes to the core with it: when the client moves (RFC 9000 §9), `{migrate,
 %% Peer}` points every later `{send, _}` at the new address, and `{send_to,
@@ -135,8 +137,11 @@ loop(State) ->
 continue(#shell{conn = Conn, registry = Registry} = State) ->
     case roadrunner_quic_conn_state:phase(Conn) of
         closed ->
-            roadrunner_quic_cid_registry:remove_all(
+            ok = roadrunner_quic_cid_registry:remove_all(
                 Registry, roadrunner_quic_conn_state:routes(Conn), self()
+            ),
+            roadrunner_quic_cid_registry:remove_resets(
+                Registry, roadrunner_quic_conn_state:reset_routes(Conn), self()
             );
         _ ->
             loop(State)
@@ -195,6 +200,12 @@ perform_effect({register_cid, CID}, _Now, #shell{registry = Registry} = State) -
     State;
 perform_effect({unregister_cid, CID}, _Now, #shell{registry = Registry} = State) ->
     ok = roadrunner_quic_cid_registry:remove(Registry, CID, self()),
+    State;
+perform_effect({register_reset, Token}, _Now, #shell{registry = Registry} = State) ->
+    ok = roadrunner_quic_cid_registry:add_reset(Registry, Token, self()),
+    State;
+perform_effect({unregister_reset, Token}, _Now, #shell{registry = Registry} = State) ->
+    ok = roadrunner_quic_cid_registry:remove_resets(Registry, [Token], self()),
     State;
 perform_effect({send_to, {Ip, Port}, Datagram}, _Now, #shell{socket = Socket} = State) ->
     %% A send error is a lost datagram, as for the batched sends.

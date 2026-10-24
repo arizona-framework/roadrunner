@@ -26,6 +26,8 @@ an outer guard. The pure routing decision (`classify/2`) is unit-tested in
     malformed_datagram_is_dropped/1,
     rearms_after_active_batch/1,
     sends_version_negotiation_for_unsupported_version/1,
+    sends_stateless_reset_for_unknown_connection/1,
+    restarted_listener_resets_forgotten_connection/1,
     uses_injected_registry/1,
     conn_death_before_set_owner_does_not_wedge/1,
     conn_down_is_cleaned_up/1
@@ -50,6 +52,8 @@ all() ->
         malformed_datagram_is_dropped,
         rearms_after_active_batch,
         sends_version_negotiation_for_unsupported_version,
+        sends_stateless_reset_for_unknown_connection,
+        restarted_listener_resets_forgotten_connection,
         uses_injected_registry,
         conn_death_before_set_owner_does_not_wedge,
         conn_down_is_cleaned_up
@@ -292,6 +296,79 @@ sends_version_negotiation_for_unsupported_version(_Config) ->
     ok = roadrunner_quic_socket:close(Client),
     ok = roadrunner_quic_listener:stop(Listener).
 
+%% RFC 9000 §10.3: a short-header packet for a connection the listener does
+%% not have draws a Stateless Reset: smaller than the packet (§10.3.3), in
+%% the short-header form, ending in the token of the packet's destination
+%% id under the registry's reset key. One too small to answer (21 bytes)
+%% draws nothing, which the next reply, answering a later packet, shows.
+sends_stateless_reset_for_unknown_connection(_Config) ->
+    Registry = roadrunner_quic_cid_registry:new(<<1:256>>),
+    {ok, Listener} = roadrunner_quic_listener:start_link(
+        (listener_opts(0, drain_handler()))#{registry => Registry}
+    ),
+    Port = roadrunner_quic_listener:get_port(Listener),
+    {ok, Client} = roadrunner_quic_socket:open(0),
+    DCID = crypto:strong_rand_bytes(8),
+    Token = roadrunner_quic_cid_registry:reset_token(
+        roadrunner_quic_cid_registry:reset_key(Registry), DCID
+    ),
+    Short = fun(Size) -> <<16#40, DCID/binary, 0:((Size - 9) * 8)>> end,
+    ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, Port, Short(1200)),
+    Reset = receive_datagram(Client),
+    ?assert(byte_size(Reset) >= 43 andalso byte_size(Reset) =< 64),
+    Skip = byte_size(Reset) - 16,
+    ?assertMatch(<<0:1, 1:1, _:6, _:(Skip - 1)/binary, Token:16/binary>>, Reset),
+    ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, Port, Short(21)),
+    ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, Port, Short(30)),
+    Reply = receive_datagram(Client),
+    ?assertEqual(29, byte_size(Reply)),
+    %% RFC 9000 §10.3.3: at most 100 resets a second. However the burst
+    %% falls across a second boundary, 250 packets draw at most 200.
+    _ = [
+        ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, Port, Short(30))
+     || _ <- lists:seq(1, 250)
+    ],
+    ?assert(flight_count(Client) =< 200),
+    ok = roadrunner_quic_socket:close(Client),
+    ok = roadrunner_quic_listener:stop(Listener).
+
+%% RFC 9000 §10.3, §10.3.2: the handshake id's token rides in the server's
+%% transport parameters, and a listener restarted with the same secret has
+%% forgotten the connection but derives the same token, so the client's
+%% next packet draws a Stateless Reset the client recognises at once.
+restarted_listener_resets_forgotten_connection(_Config) ->
+    Secret = crypto:strong_rand_bytes(32),
+    Registry = roadrunner_quic_cid_registry:new(Secret),
+    {ok, First} = roadrunner_quic_listener:start_link(
+        (listener_opts(0, drain_handler()))#{registry => Registry}
+    ),
+    Port = roadrunner_quic_listener:get_port(First),
+    {ok, Conn} = roadrunner_quic_test_conn:connect(?LOOPBACK, Port),
+    #{0 := SCID} = roadrunner_quic_test_conn:server_cids(Conn),
+    Key = roadrunner_quic_cid_registry:reset_key(Registry),
+    ?assert(
+        lists:member(
+            roadrunner_quic_cid_registry:reset_token(Key, SCID),
+            roadrunner_quic_test_conn:reset_tokens(Conn)
+        )
+    ),
+    {ok, ServerConn} = roadrunner_quic_cid_registry:lookup(Registry, SCID),
+    ok = roadrunner_quic_listener:stop(First),
+    exit(ServerConn, kill),
+    {ok, Second} = roadrunner_quic_listener:start_link(
+        (listener_opts(Port, drain_handler()))#{
+            registry => roadrunner_quic_cid_registry:new(Secret)
+        }
+    ),
+    Sid = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(Conn, Sid, ~"anyone there?", false),
+    receive
+        {quic_test_stateless_reset, Conn} -> ok
+    after 5000 -> ct:fail(no_stateless_reset)
+    end,
+    ok = roadrunner_quic_test_conn:close(Conn),
+    ok = roadrunner_quic_listener:stop(Second).
+
 %% When a spawned connection dies, the listener's monitor fires and the CID
 %% registry row is dropped (delete_pid). This is proven, not merely
 %% line-covered: an Initial with the dead connection's DCID is forwarded to it
@@ -390,6 +467,20 @@ start_listener(Handler) ->
     {ok, Listener} = roadrunner_quic_listener:start_link(listener_opts(0, Handler)),
     Port = roadrunner_quic_listener:get_port(Listener),
     {Listener, Port}.
+
+%% The next datagram the client socket reads.
+receive_datagram(Socket) ->
+    case roadrunner_quic_socket:recv(Socket, 2000) of
+        {ok, _Peer, Datagram} -> Datagram;
+        Other -> ct:fail({no_datagram, Other})
+    end.
+
+%% The datagrams the socket reads until the sender falls quiet.
+flight_count(Socket) ->
+    case roadrunner_quic_socket:recv(Socket, 300) of
+        {ok, _Peer, _Datagram} -> 1 + flight_count(Socket);
+        {error, timeout} -> 0
+    end.
 
 %% The connection pid reported by a spawn-signalling connection_handler.
 receive_server_conn() ->

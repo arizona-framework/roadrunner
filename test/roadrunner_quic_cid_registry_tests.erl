@@ -91,3 +91,38 @@ remove_all_drops_a_closing_connections_ids_test() ->
     ?assertEqual(error, ?M:lookup(Table, ~"spare-cid")),
     ?assertEqual({ok, Other}, ?M:lookup(Table, ~"taken-cid")),
     ?assertEqual({ok, Other}, ?M:lookup(Table, ~"other-cid")).
+
+secret_derives_the_reset_key_test() ->
+    %% A namespace made from a secret derives the same reset key from it
+    %% every time (so a restart, or another server given the secret, issues
+    %% the same tokens), never the secret itself, and another secret gives
+    %% another key. A random namespace gets a key of its own.
+    Secret = <<42:256>>,
+    Key = ?M:reset_key(?M:new(Secret)),
+    ?assertEqual(Key, ?M:reset_key(?M:new(Secret))),
+    ?assertEqual(32, byte_size(Key)),
+    ?assertNotEqual(Secret, Key),
+    ?assertNotEqual(Key, ?M:reset_key(?M:new(<<43:256>>))),
+    ?assertNotEqual(Key, ?M:reset_key(?M:new())),
+    %% A secret shorter than 32 bytes is refused.
+    ?assertError(function_clause, ?M:new(<<1:248>>)).
+
+client_reset_tokens_route_to_their_connection_test() ->
+    %% A client's stateless reset token routes to the connection holding it
+    %% until removed; a row since taken over by another connection keeps its
+    %% route, and the tokens never route as connection ids.
+    Table = ?M:new(),
+    Pid = self(),
+    Other = spawn(fun() -> ok end),
+    ok = ?M:add_reset(Table, <<1:128>>, Pid),
+    ok = ?M:add_reset(Table, <<2:128>>, Pid),
+    ?assertEqual({ok, Pid}, ?M:lookup_reset(Table, <<1:128>>)),
+    ?assertEqual(error, ?M:lookup(Table, <<1:128>>)),
+    ?assertEqual(error, ?M:lookup_reset(Table, <<3:128>>)),
+    ok = ?M:add_reset(Table, <<2:128>>, Other),
+    ok = ?M:remove_resets(Table, [<<1:128>>, <<2:128>>], Pid),
+    ?assertEqual(error, ?M:lookup_reset(Table, <<1:128>>)),
+    ?assertEqual({ok, Other}, ?M:lookup_reset(Table, <<2:128>>)),
+    %% The listener's cleanup of a crashed connection reaps its tokens too.
+    ok = ?M:delete_pid(Table, Other),
+    ?assertEqual(error, ?M:lookup_reset(Table, <<2:128>>)).

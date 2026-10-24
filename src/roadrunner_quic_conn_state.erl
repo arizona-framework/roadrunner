@@ -16,7 +16,9 @@
 %% notification, e.g. `{connected, Info}`), `{reply, To, Ref, Result}`
 %% (answer a synchronous control call), `{register_cid, CID}` /
 %% `{unregister_cid, CID}` (route a connection id to this connection in the
-%% listener's registry, or stop routing it), `{send_to, Peer, Datagram}` (a
+%% listener's registry, or stop routing it), `{register_reset, Token}` /
+%% `{unregister_reset, Token}` (the same for a client stateless reset
+%% token), `{send_to, Peer, Datagram}` (a
 %% probing packet for an address other than the peer's), and `{migrate,
 %% Peer}` (the peer moved: every later `{send, _}` goes to `Peer`; it always
 %% leads the effects that follow it).
@@ -63,6 +65,14 @@
 %% Retire Prior To asks for are retired; the server keeps addressing the id
 %% it uses unless that one is retired.
 %%
+%% The client's spare ids each come with a stateless reset token (RFC 9000
+%% §10.3), which the listener routes here, since a reset from a client that
+%% has lost its state routes by no connection id. A datagram whose first
+%% packet does not decrypt (or that holds none) is compared with the tokens
+%% of the client ids in use toward the address it came from (§10.3.1 MUST),
+%% in constant time; one ending in such a token moves the connection to the
+%% draining period, sending nothing more.
+%%
 %% The client may move to a new address (RFC 9000 §9). Once the handshake is
 %% confirmed, the highest-numbered non-probing packet from a new address moves
 %% the connection there: later packets go to it, addressed with a client id
@@ -95,7 +105,8 @@
     handle_consumed/4,
     peername/1,
     phase/1,
-    routes/1
+    routes/1,
+    reset_routes/1
 ]).
 %% Exported for direct eunit branch coverage of the idle-timeout negotiation.
 -export([negotiated_idle_timeout/2]).
@@ -225,6 +236,10 @@
     %% in NEW_CONNECTION_ID frames. `peer_cid_seq` is the one `peer_scid`
     %% holds, and `peer_retire_prior` the largest Retire Prior To received.
     peer_cids :: #{non_neg_integer() => binary()},
+    %% The stateless reset tokens of the client's ids in `peer_cids` that
+    %% came with one (all but the handshake's, RFC 9000 §10.3), by sequence
+    %% number.
+    peer_reset_tokens = #{} :: #{non_neg_integer() => <<_:128>>},
     peer_cid_seq = 0 :: non_neg_integer(),
     peer_retire_prior = 0 :: non_neg_integer(),
     %% Client ids we retired on our own (RFC 9000 §5.1.2), numbered at or
@@ -450,6 +465,8 @@
     | {reply, pid(), reference(), term()}
     | {register_cid, binary()}
     | {unregister_cid, binary()}
+    | {register_reset, <<_:128>>}
+    | {unregister_reset, <<_:128>>}
     | {send_to, address(), binary()}
     | {migrate, address()}.
 
@@ -457,7 +474,8 @@
 %% FIN-only end-of-stream as `{stream_data, Sid, <<>>, true}`.
 %% `peer_changed` names the address the connection moved to (RFC 9000 §9).
 %% `closed` is the terminal event: `{peer, ErrorCode}` is a peer
-%% CONNECTION_CLOSE, `{local, Reason}` a connection error we detected
+%% CONNECTION_CLOSE, `{peer, stateless_reset}` a client's stateless reset
+%% (RFC 9000 §10.3), `{local, Reason}` a connection error we detected
 %% (idle-timeout joins them later).
 -type event() ::
     {connected, info()}
@@ -465,7 +483,7 @@
     | {stream_data, non_neg_integer(), binary(), boolean()}
     | {stream_reset, non_neg_integer(), non_neg_integer()}
     | {peer_changed, address()}
-    | {closed, {peer, non_neg_integer()} | {local, atom()}}.
+    | {closed, {peer, non_neg_integer() | stateless_reset} | {local, atom()}}.
 
 %% The `connected` payload. The h3 owner ignores it; it carries the
 %% negotiated ALPN and the advertised transport params for forward-compat.
@@ -581,6 +599,14 @@ has not retired (RFC 9000 §5.1).
 routes(#state{dcid = DCID, cids = Cids}) ->
     [DCID | maps:values(Cids)].
 
+-doc """
+The client stateless reset tokens that route datagrams to this connection:
+those of the client's ids not retired (RFC 9000 §10.3.1).
+""".
+-spec reset_routes(t()) -> [<<_:128>>].
+reset_routes(#state{peer_reset_tokens = Tokens}) ->
+    maps:values(Tokens).
+
 %% The congestion window in bytes (RFC 9002 §7), for tests to observe its
 %% slow-start growth and on-loss backoff.
 -doc false.
@@ -637,9 +663,63 @@ handle_datagram(Now, Peer, Datagram, State0) ->
     Outcomes = roadrunner_quic_recv:datagram(
         Datagram, ?SCID_LEN, open_keys(Before, RecvKeys), largest_map(State1)
     ),
-    State2 = lists:foldl(fun(O, S) -> process_outcome(Now, O, S) end, State1, Outcomes),
+    State2 =
+        case undecrypted(Outcomes) andalso is_stateless_reset(Datagram, State1) of
+            true -> process_stateless_reset(State1);
+            false -> lists:foldl(fun(O, S) -> process_outcome(Now, O, S) end, State1, Outcomes)
+        end,
     {State3, Effects} = finish_datagram(Now, Before, release_held(Now, State2)),
     {State3, peer_effects(Current, State3, Effects)}.
+
+%% Whether a datagram's first packet failed to decrypt, or it held none: the
+%% case in which a datagram MUST be checked for a stateless reset (RFC 9000
+%% §10.3.1). One whose first packet decrypted, or was held unopened during
+%% the handshake (no client token exists before it is confirmed), is not.
+-spec undecrypted([roadrunner_quic_recv:outcome()]) -> boolean().
+undecrypted([]) -> true;
+undecrypted([{auth_failed, _Level} | _]) -> true;
+undecrypted([{drop, _Reason} | _]) -> true;
+undecrypted([_Outcome | _]) -> false.
+
+%% RFC 9000 §10.3.1: a datagram of at least 21 bytes (a smaller one is no
+%% Stateless Reset, §10.3) whose last 16 bytes are the stateless reset token
+%% of a client id we use toward the address it came from. Tokens of ids
+%% unused or retired MUST NOT count, and the comparison MUST NOT leak the
+%% token through its timing, so each runs in constant time.
+-spec is_stateless_reset(binary(), t()) -> boolean().
+is_stateless_reset(Datagram, #state{phase = connected, rx_peer = Addr} = State) when
+    byte_size(Datagram) >= 21
+->
+    #state{peer_reset_tokens = Tokens} = State,
+    Skip = byte_size(Datagram) - 16,
+    <<_:Skip/binary, Tail/binary>> = Datagram,
+    lists:any(
+        fun
+            ({A, Seq}) when A =:= Addr ->
+                case Tokens of
+                    #{Seq := Token} -> crypto:hash_equals(Token, Tail);
+                    #{} -> false
+                end;
+            (_Binding) ->
+                false
+        end,
+        path_bindings(State)
+    );
+is_stateless_reset(_Datagram, _State) ->
+    false.
+
+%% Each path's address with the client id we use toward it: the current
+%% path, the last validated one, and one the client probes from.
+-spec path_bindings(t()) -> [{address(), non_neg_integer()}].
+path_bindings(#state{peer = Peer, peer_cid_seq = Seq, prev_path = Prev, probe_path = Probe}) ->
+    [{Peer, Seq} | [{Addr, S} || {Addr, S, _} <- [Prev, Probe]]].
+
+%% A stateless reset from the client (RFC 9000 §10.3.1): it has lost the
+%% connection, so this one MUST enter the draining period and send nothing
+%% more, as on a CONNECTION_CLOSE from it.
+-spec process_stateless_reset(t()) -> t().
+process_stateless_reset(State) ->
+    emit({closed, {peer, stateless_reset}}, State#state{phase = draining}).
 
 %% The receive keys a datagram is opened with. Before the handshake completes
 %% the 1-RTT keys are withheld (RFC 9001 §5.7: a server MUST NOT process, nor
@@ -1423,8 +1503,8 @@ process_frame(
     State#state{peer_max_streams_uni = Max};
 process_frame(_Now, application, {retire_connection_id, Seq}, State) ->
     retire_cid(Seq, State);
-process_frame(_Now, application, {new_connection_id, Seq, Prior, CID, _Token}, State) ->
-    new_peer_cid(Seq, Prior, CID, State);
+process_frame(_Now, application, {new_connection_id, Seq, Prior, CID, Token}, State) ->
+    new_peer_cid(Seq, Prior, CID, Token, State);
 process_frame(_Now, _Level, padding, State) ->
     State;
 process_frame(_Now, _Level, ping, State) ->
@@ -1544,17 +1624,19 @@ retire_cid(Seq, #state{cids = Cids, rx_dcid = RxDCID} = State) ->
 %% below the largest Retire Prior To is retired at once (§19.15 MUST); a
 %% repeat of such a frame draws the RETIRE_CONNECTION_ID again, which the
 %% client ignores, rather than holding every such number. An id we retired
-%% on our own stays retired. Any other id joins the ids we may address, and
-%% then the ids below its Retire Prior To are retired (§5.1.2). More active
-%% ids than we advertised in active_connection_id_limit is a
-%% CONNECTION_ID_LIMIT_ERROR (§5.1.1 MUST).
--spec new_peer_cid(non_neg_integer(), non_neg_integer(), binary(), t()) -> t().
-new_peer_cid(_Seq, _Prior, _CID, #state{peer_scid = <<>>} = State) ->
+%% on our own stays retired. Any other id joins the ids we may address, with
+%% its stateless reset token routed here (§10.3.1), and then the ids below
+%% its Retire Prior To are retired (§5.1.2). More active ids than we
+%% advertised in active_connection_id_limit is a CONNECTION_ID_LIMIT_ERROR
+%% (§5.1.1 MUST).
+-spec new_peer_cid(non_neg_integer(), non_neg_integer(), binary(), <<_:128>>, t()) -> t().
+new_peer_cid(_Seq, _Prior, _CID, _Token, #state{peer_scid = <<>>} = State) ->
     connection_fatal(application, protocol_violation, State);
 new_peer_cid(
     Seq,
     Prior,
     CID,
+    Token,
     #state{peer_cids = PeerCids, peer_retire_prior = Retired, peer_cids_retired = Dropped} = State
 ) ->
     case PeerCids of
@@ -1567,13 +1649,18 @@ new_peer_cid(
         #{} ->
             case lists:member(Seq, Dropped) of
                 true -> State;
-                false -> add_peer_cid(Seq, Prior, CID, State)
+                false -> add_peer_cid(Seq, Prior, CID, Token, State)
             end
     end.
 
--spec add_peer_cid(non_neg_integer(), non_neg_integer(), binary(), t()) -> t().
-add_peer_cid(Seq, Prior, CID, #state{peer_cids = PeerCids} = State) ->
-    State1 = retire_prior(Prior, State#state{peer_cids = PeerCids#{Seq => CID}}),
+-spec add_peer_cid(non_neg_integer(), non_neg_integer(), binary(), <<_:128>>, t()) -> t().
+add_peer_cid(
+    Seq, Prior, CID, Token, #state{peer_cids = PeerCids, peer_reset_tokens = Tokens} = State
+) ->
+    Added = queue_effect({register_reset, Token}, State#state{
+        peer_cids = PeerCids#{Seq => CID}, peer_reset_tokens = Tokens#{Seq => Token}
+    }),
+    State1 = retire_prior(Prior, Added),
     #state{peer_cids = Active, info = #{transport_params := OurParams}} = State1,
     case maps:get(active_connection_id_limit, OurParams, ?DEFAULT_ACTIVE_CID_LIMIT) of
         Limit when map_size(Active) > Limit ->
@@ -1611,7 +1698,9 @@ retire_prior(
         PeerCids
     ),
     State1 = lists:foldl(
-        fun(Seq, S) -> queue_frame(application, {retire_connection_id, Seq}, S) end,
+        fun(Seq, S) ->
+            queue_frame(application, {retire_connection_id, Seq}, forget_reset_token(Seq, S))
+        end,
         State#state{
             peer_cids = Kept,
             peer_retire_prior = Prior,
@@ -1669,10 +1758,23 @@ release_peer_cid(Seq, #state{peer_cids = PeerCids, peer_cids_retired = Dropped} 
             queue_frame(
                 application,
                 {retire_connection_id, Seq},
-                State#state{
+                forget_reset_token(Seq, State#state{
                     peer_cids = maps:remove(Seq, PeerCids), peer_cids_retired = [Seq | Dropped]
-                }
+                })
             )
+    end.
+
+%% A retired client id's stateless reset token stops routing here and no
+%% longer counts (RFC 9000 §10.3: a token is invalidated with its id).
+-spec forget_reset_token(non_neg_integer(), t()) -> t().
+forget_reset_token(Seq, #state{peer_reset_tokens = Tokens} = State) ->
+    case Tokens of
+        #{Seq := Token} ->
+            queue_effect({unregister_reset, Token}, State#state{
+                peer_reset_tokens = maps:remove(Seq, Tokens)
+            });
+        #{} ->
+            State
     end.
 
 %% =============================================================================

@@ -63,7 +63,12 @@
     stream_credit => on_receipt | on_read,
     %% Shared by every listener in the pool (see
     %% `roadrunner_quic_listener:accept_gate()`).
-    accept_gate => roadrunner_quic_listener:accept_gate()
+    accept_gate => roadrunner_quic_listener:accept_gate(),
+    %% The secret the pool's stateless reset keys derive from (at least 32
+    %% bytes, `roadrunner_quic_cid_registry:new/1`). Unset, a random one is
+    %% drawn per pool, so a restarted pool cannot reset the connections of
+    %% the one before it.
+    secret => binary()
 }.
 
 %% =============================================================================
@@ -112,8 +117,12 @@ stop(Sup) ->
 init({Port, #{pool_size := PoolSize} = PoolOpts}) ->
     %% The shared registry is created (and owned) here so it survives a listener
     %% crash. A restarted listener gets the same child spec, hence the same
-    %% table.
-    Registry = roadrunner_quic_cid_registry:new(),
+    %% table and keys.
+    Registry =
+        case PoolOpts of
+            #{secret := Secret} -> roadrunner_quic_cid_registry:new(Secret);
+            #{} -> roadrunner_quic_cid_registry:new()
+        end,
     Count = PoolSize + 1,
     ReusePort = Count > 1,
     Specs = [listener_spec(N, Port, PoolOpts, Registry, ReusePort) || N <- lists:seq(1, Count)],

@@ -29,6 +29,7 @@
     encode_short/4,
     encode_short/5,
     encode_version_negotiation/3,
+    encode_stateless_reset/2,
     decode/2,
     dcid/2,
     long_header_info/1,
@@ -139,6 +140,17 @@ encode_version_negotiation(DCID, SCID, Versions) ->
         >>
         | [<<V:32>> || V <- Versions]
     ].
+
+-doc """
+Build a `Size`-byte Stateless Reset (RFC 9000 §10.3) ending in `Token`: the
+short-header form and fixed bits (`01`), then random bits up to the token,
+so it looks like any 1-RTT packet to all but the peer holding the token. A
+Stateless Reset is at least 21 bytes (5 bytes before the token, §10.3).
+""".
+-spec encode_stateless_reset(<<_:128>>, 21..1200) -> binary().
+encode_stateless_reset(Token, Size) when Size >= 21 ->
+    <<First, Unpredictable/binary>> = crypto:strong_rand_bytes(Size - 16),
+    <<0:1, 1:1, First:6, Unpredictable/binary, Token/binary>>.
 
 %% =============================================================================
 %% Receive-side helpers (header-protection independent)
