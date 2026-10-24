@@ -1006,8 +1006,8 @@ start_quic(Port, Opts, Protocols, ProtoOpts, AcceptGate) ->
             %% when asked for an ephemeral port, hold a reuseport probe
             %% socket to pin a free port, start the pool on it, then drop
             %% the probe (the pool listeners keep the port via reuseport).
-            {QuicPort, Probe} = resolve_quic_port(Port, Opts),
             Listeners = maps:get(http3_listeners, ProtoOpts, ?DEFAULT_H3_LISTENERS),
+            {QuicPort, Probe} = resolve_quic_port(Port, Listeners, Opts),
             MaxStreamsBidi = maps:get(http3_max_streams_bidi, ProtoOpts, ?H3_MAX_STREAMS_BIDI),
             PoolOpts = #{
                 cert => Cert,
@@ -1062,9 +1062,12 @@ start_quic_pool(Port, PoolOpts) ->
 %% listeners bind the same concrete port; a fixed port is used as-is.
 %% The probe binds the same interface as the pool (via `ip`) so the
 %% pinned port is genuinely free on that address, not just on `0.0.0.0`.
--spec resolve_quic_port(inet:port_number(), opts()) ->
+%% A single listener binds without reuseport, so the probe would hold the
+%% port against it: it binds port 0 itself instead, and the port is read
+%% back from it.
+-spec resolve_quic_port(inet:port_number(), pos_integer(), opts()) ->
     {inet:port_number(), gen_udp:socket() | undefined}.
-resolve_quic_port(0, Opts) ->
+resolve_quic_port(0, Listeners, Opts) when Listeners > 1 ->
     ProbeOpts =
         case Opts of
             #{ip := IP} -> [{reuseport, true}, {ip, IP}];
@@ -1073,7 +1076,7 @@ resolve_quic_port(0, Opts) ->
     {ok, Probe} = gen_udp:open(0, ProbeOpts),
     {ok, ProbePort} = inet:port(Probe),
     {ProbePort, Probe};
-resolve_quic_port(Port, _Opts) ->
+resolve_quic_port(Port, _Listeners, _Opts) ->
     {Port, undefined}.
 
 -spec close_quic_probe(gen_udp:socket() | undefined) -> ok.

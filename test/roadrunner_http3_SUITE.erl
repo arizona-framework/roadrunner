@@ -73,6 +73,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     ip_binds_loopback/1,
     rejects_http3_without_tls/1,
     max_clients_refuse/1,
+    single_listener_ephemeral_port/1,
     max_concurrent_requests_refuse/1,
     max_concurrent_requests_queue/1,
     max_concurrent_requests_queue_expires/1,
@@ -171,6 +172,7 @@ all() ->
         ip_binds_loopback,
         rejects_http3_without_tls,
         max_clients_refuse,
+        single_listener_ephemeral_port,
         max_concurrent_requests_refuse,
         max_concurrent_requests_queue,
         max_concurrent_requests_queue_expires,
@@ -235,6 +237,7 @@ init_per_testcase(Case, Config) when
     Case =:= ip_binds_loopback;
     Case =:= rejects_http3_without_tls;
     Case =:= max_clients_refuse;
+    Case =:= single_listener_ephemeral_port;
     Case =:= max_concurrent_requests_refuse;
     Case =:= max_concurrent_requests_queue;
     Case =:= max_concurrent_requests_queue_expires;
@@ -1297,6 +1300,19 @@ max_clients_refuse(_Config) ->
         end
     after
         close(Conn1),
+        roadrunner_listener:stop(Name)
+    end.
+
+single_listener_ephemeral_port(_Config) ->
+    %% A pool of one binds without reuseport, so it takes the ephemeral port
+    %% itself rather than one a reuseport probe holds.
+    Name = listener_name(single_listener_ephemeral_port),
+    {ok, _} = start_h3(Name, #{protocols => [{http3, #{listeners => 1}}]}),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/")))
+    after
+        close(Conn),
         roadrunner_listener:stop(Name)
     end.
 
