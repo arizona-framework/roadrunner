@@ -51,13 +51,27 @@ traffic_keys_test() ->
     ).
 
 %% =============================================================================
-%% Key update (RFC 9001 §6.1), AES-128-GCM: the next secret is
-%% Expand-Label(current, "quic ku", "", 32), and the keys follow from it.
+%% Key update (RFC 9001 §6.1): the next secret is
+%% Expand-Label(current, "quic ku", "", 32), and the AEAD key and IV follow
+%% from it; the header-protection key is not updated.
 %% =============================================================================
 
-key_update_test() ->
+%% RFC 9001 Appendix A.5 publishes the "quic ku" secret for its 1-RTT
+%% secret. The vector's AEAD is ChaCha20-Poly1305, but the update secret
+%% depends only on the secret and SHA-256, which AES-128-GCM shares.
+rfc9001_a5_key_update_secret_test() ->
+    Secret = hex(~"9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b"),
+    {UpdatedSecret, _PacketKeys} = ?M:update(Secret),
+    ?assertEqual(
+        hex(~"1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9"),
+        UpdatedSecret
+    ).
+
+%% The updated generation's AEAD key and IV are the "quic key" and
+%% "quic iv" expansions of the updated secret, and nothing else.
+key_update_derives_packet_keys_test() ->
     Secret = binary:copy(<<16#2a>>, 32),
-    {UpdatedSecret, Keys} = ?M:update(Secret),
+    {UpdatedSecret, PacketKeys} = ?M:update(Secret),
     ?assertEqual(
         hex(~"c8dd004d0adc90d90ef286b8debce48f65a3ea342932fc5f4891207e96f8e862"),
         UpdatedSecret
@@ -65,11 +79,11 @@ key_update_test() ->
     ?assertEqual(
         #{
             key => hex(~"d77beffa17a12a7697276ab00c5faa0b"),
-            iv => hex(~"535303b03a85a983f4311f64"),
-            hp => hex(~"c77ac07f35beb8c618d0956b341206b5")
+            iv => hex(~"535303b03a85a983f4311f64")
         },
-        Keys
-    ).
+        PacketKeys
+    ),
+    ?assertEqual(maps:with([key, iv], ?M:traffic_keys(UpdatedSecret)), PacketKeys).
 
 %% =============================================================================
 %% Helpers
@@ -118,3 +132,14 @@ for_connection_seals_and_opens_like_the_raw_key_test() ->
         end
      || {PN, Size} <- [{0, 1}, {1, 64}, {2, 1200}, {16#FFFF, 300}]
     ].
+
+for_connection_prepares_update_packet_keys_test() ->
+    %% A key update's packet keys carry no header-protection key; only the
+    %% AEAD key is prepared, and it seals and opens like the raw key.
+    {_UpdatedSecret, #{key := Raw, iv := IV} = PacketKeys} = ?M:update(binary:copy(<<7>>, 32)),
+    #{key := SealKey, iv := IV} = Sealing = ?M:for_connection(PacketKeys, seal),
+    #{key := OpenKey} = ?M:for_connection(PacketKeys, open),
+    ?assertEqual([iv, key], lists:sort(maps:keys(Sealing))),
+    Sealed = roadrunner_quic_aead:seal(Raw, IV, 5, ~"aad", ~"payload"),
+    ?assertEqual(Sealed, roadrunner_quic_aead:seal(SealKey, IV, 5, ~"aad", ~"payload")),
+    ?assertEqual({ok, ~"payload"}, roadrunner_quic_aead:open(OpenKey, IV, 5, ~"aad", Sealed)).

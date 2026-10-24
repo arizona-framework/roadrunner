@@ -50,12 +50,20 @@ handshake_round_trip_test() ->
     ).
 
 %% A 1-RTT short-header packet decodes at the application level and surfaces
-%% the key-phase bit.
+%% the key-phase bit. Keys without a key phase open it whatever the bit.
 application_round_trip_test() ->
     {Plaintext, Frames} = frames_for([{stream, 0, 0, <<"application-body">>, true}]),
     Wire = seal_short(7, application_keys(), 1, Plaintext),
     ?assertEqual(
-        [{ok, #{level => application, pn => 7, frames => Frames, key_phase => 1}}],
+        [
+            {ok, #{
+                level => application,
+                pn => 7,
+                frames => Frames,
+                key_phase => 1,
+                generation => current
+            }}
+        ],
         ?M:datagram(Wire, ?DCID_LEN, #{application => application_keys()}, #{})
     ).
 
@@ -68,7 +76,15 @@ reconstructed_pn_round_trip_test() ->
     FullPN = 16#10005,
     Wire = seal_short_pn(FullPN, 1, application_keys(), 0, Plaintext),
     ?assertEqual(
-        [{ok, #{level => application, pn => FullPN, frames => Frames, key_phase => 0}}],
+        [
+            {ok, #{
+                level => application,
+                pn => FullPN,
+                frames => Frames,
+                key_phase => 0,
+                generation => current
+            }}
+        ],
         ?M:datagram(Wire, ?DCID_LEN, #{application => application_keys()}, #{
             application => 16#10004
         })
@@ -113,7 +129,8 @@ no_keys_dropped_test() ->
     Wire = seal_long(handshake, 5, handshake_keys(), Plaintext),
     ?assertEqual([{drop, no_keys}], ?M:datagram(Wire, ?DCID_LEN, #{}, #{})).
 
-%% A tampered tag fails authentication and drops only that packet.
+%% A tampered tag fails authentication and drops only that packet, reported
+%% with its level so the loop can count it (RFC 9001 §6.6).
 decrypt_failure_dropped_test() ->
     {Plaintext, _} = frames_for([{crypto, 0, <<"handshake-crypto-data">>}]),
     Wire0 = seal_long(handshake, 5, handshake_keys(), Plaintext),
@@ -121,8 +138,64 @@ decrypt_failure_dropped_test() ->
     <<Head:Len/binary, Last>> = Wire0,
     Tampered = <<Head/binary, (Last bxor 1)>>,
     ?assertEqual(
-        [{drop, decrypt_failed}],
+        [{auth_failed, handshake}],
         ?M:datagram(Tampered, ?DCID_LEN, #{handshake => handshake_keys()}, #{})
+    ).
+
+%% =============================================================================
+%% Key update generations (RFC 9001 §6). The 1-RTT keys carry the current
+%% generation in key phase 0, the next generation, and the previous one for
+%% packets numbered below 10. Every generation shares the header-protection
+%% key (§6.1).
+%% =============================================================================
+
+%% The current Key Phase bit opens with the current keys.
+current_phase_opens_with_current_keys_test() ->
+    {Plaintext, Frames} = frames_for([{stream, 0, 0, ~"key-update-body", false}]),
+    Wire = seal_short(12, application_keys(), 0, Plaintext),
+    ?assertMatch(
+        [{ok, #{pn := 12, frames := Frames, key_phase := 0, generation := current}}],
+        ?M:datagram(Wire, ?DCID_LEN, #{application => update_keys()}, #{application => 11})
+    ).
+
+%% A flipped bit on a packet above the previous phase opens with the next
+%% keys: the peer has updated.
+flipped_phase_opens_with_next_keys_test() ->
+    {Plaintext, Frames} = frames_for([{stream, 0, 0, ~"key-update-body", false}]),
+    Wire = seal_short(12, generation(next_packet_keys()), 1, Plaintext),
+    ?assertMatch(
+        [{ok, #{pn := 12, frames := Frames, key_phase := 1, generation := next}}],
+        ?M:datagram(Wire, ?DCID_LEN, #{application => update_keys()}, #{application => 11})
+    ).
+
+%% A flipped bit on a packet numbered below the current phase is a reordered
+%% packet from before the update: it opens with the previous keys (§6.5).
+flipped_phase_below_current_opens_with_previous_keys_test() ->
+    {Plaintext, Frames} = frames_for([{stream, 0, 0, ~"key-update-body", false}]),
+    Wire = seal_short(9, generation(prev_packet_keys()), 1, Plaintext),
+    ?assertMatch(
+        [{ok, #{pn := 9, frames := Frames, key_phase := 1, generation := previous}}],
+        ?M:datagram(Wire, ?DCID_LEN, #{application => update_keys()}, #{application => 11})
+    ).
+
+%% Above the current phase's first packet a flipped bit takes the next keys
+%% even when the previous ones are kept, so an old-key packet numbered there
+%% does not authenticate (§6.4).
+old_keys_above_current_phase_fail_test() ->
+    {Plaintext, _} = frames_for([{stream, 0, 0, ~"key-update-body", false}]),
+    Wire = seal_short(12, generation(prev_packet_keys()), 1, Plaintext),
+    ?assertEqual(
+        [{auth_failed, application}],
+        ?M:datagram(Wire, ?DCID_LEN, #{application => update_keys()}, #{application => 11})
+    ).
+
+%% A forged flipped bit fails the next keys like any other forgery.
+forged_flipped_phase_fails_test() ->
+    {Plaintext, _} = frames_for([{stream, 0, 0, ~"key-update-body", false}]),
+    Wire = seal_short(12, application_keys(), 1, Plaintext),
+    ?assertEqual(
+        [{auth_failed, application}],
+        ?M:datagram(Wire, ?DCID_LEN, #{application => update_keys()}, #{application => 11})
     ).
 
 %% A packet too small to hold the 16-byte header-protection sample.
@@ -210,6 +283,24 @@ hex(H) -> binary:decode_hex(string:uppercase(H)).
 initial_keys() -> #{key => <<31:128>>, iv => <<32:96>>, hp => <<33:128>>}.
 handshake_keys() -> #{key => <<11:128>>, iv => <<12:96>>, hp => <<13:128>>}.
 application_keys() -> #{key => <<21:128>>, iv => <<22:96>>, hp => <<23:128>>}.
+
+%% Key update generations around `application_keys/0`, all sharing its
+%% header-protection key.
+next_packet_keys() -> #{key => <<41:128>>, iv => <<42:96>>}.
+prev_packet_keys() -> #{key => <<51:128>>, iv => <<52:96>>}.
+
+update_keys() ->
+    (application_keys())#{
+        phase => 0,
+        next => next_packet_keys(),
+        prev => prev_packet_keys(),
+        prev_below => 10
+    }.
+
+%% A generation's full keys: its AEAD key and IV with the shared
+%% header-protection key.
+generation(PacketKeys) ->
+    maps:merge(application_keys(), PacketKeys).
 
 %% Encode a frame list to a payload and the frames it decodes back to.
 frames_for(FrameList) ->

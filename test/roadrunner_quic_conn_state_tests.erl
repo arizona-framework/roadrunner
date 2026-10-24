@@ -1907,6 +1907,158 @@ send_on_draining_connection_is_rejected_test() ->
     ?assertEqual([], sends(Effects)).
 
 %% =============================================================================
+%% Key update (RFC 9001 §6)
+%% =============================================================================
+
+%% RFC 9001 §6.2: a packet in the other key phase that authenticates with the
+%% next keys is a peer key update. The server updates its send keys too, so the
+%% ACK of that packet goes out protected with the next generation and carrying
+%% the flipped Key Phase bit; the old send keys no longer open anything.
+peer_key_update_switches_both_directions_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Update = phase_datagram([ping], 0, generation_keys(ClientApSecret, 1), 1),
+    {State1, Effects1} = ?M:handle_datagram(?NOW, Update, State),
+    ?assertEqual(connected, ?M:phase(State1)),
+    ?assertEqual([], sends(Effects1)),
+    {_State2, Effects2} = ?M:handle_timeout(?NOW + 20, ack, State1),
+    ?assertMatch(
+        [{ok, #{key_phase := 1, frames := [{ack, 0, _, 0, [], undefined} | _]}}],
+        app_packets(Effects2, generation_keys(ServerApSecret, 1))
+    ),
+    ?assertEqual(
+        [{auth_failed, application}], app_packets(Effects2, generation_keys(ServerApSecret, 0))
+    ).
+
+%% A flipped Key Phase bit on a packet that does not authenticate with the next
+%% keys (forged, or sealed with the current ones) is dropped and changes
+%% nothing: the next packet in the current phase is processed, and the server
+%% still answers in key phase 0 with its current keys.
+forged_key_phase_changes_nothing_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Forged = phase_datagram([ping], 0, generation_keys(ClientApSecret, 0), 1),
+    {State1, Effects1} = ?M:handle_datagram(?NOW, Forged, State),
+    ?assertEqual([], sends(Effects1)),
+    Data = phase_datagram(
+        [{stream, 0, 0, ~"hello", true}], 1, generation_keys(ClientApSecret, 0), 0
+    ),
+    %% Packet 1 follows a gap (the dropped packet 0), so its ACK goes out at once.
+    {_State2, Effects2} = ?M:handle_datagram(?NOW, Data, State1),
+    ?assert(lists:member({emit, self(), {stream_data, 0, ~"hello", true}}, emits(Effects2))),
+    ?assertMatch(
+        [{ok, #{key_phase := 0, frames := [{ack, 1, _, 0, [], undefined} | _]}}],
+        app_packets(Effects2, generation_keys(ServerApSecret, 0))
+    ).
+
+%% RFC 9001 §6.5: a packet from before the update, reordered behind the one
+%% that began the new phase, still opens with the previous keys.
+reordered_old_phase_packet_opens_with_previous_keys_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    State1 = updated_at(2, ClientApSecret, State),
+    Late = phase_datagram(
+        [{stream, 0, 0, ~"late", true}], 1, generation_keys(ClientApSecret, 0), 0
+    ),
+    {_State2, Effects} = ?M:handle_datagram(?NOW + 1, Late, State1),
+    ?assert(lists:member({emit, self(), {stream_data, 0, ~"late", true}}, emits(Effects))).
+
+%% RFC 9001 §6.5: the previous keys are discarded three PTOs after the update,
+%% so an old-phase packet arriving later is dropped.
+previous_keys_discarded_after_three_ptos_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    State1 = updated_at(2, ClientApSecret, State),
+    Late = phase_datagram(
+        [{stream, 0, 0, ~"late", true}], 1, generation_keys(ClientApSecret, 0), 0
+    ),
+    {State2, Effects} = ?M:handle_datagram(?NOW + 10000, Late, State1),
+    ?assertEqual(connected, ?M:phase(State2)),
+    ?assertEqual([], emits(Effects)).
+
+%% RFC 9001 §6.4: packets numbered above the start of the new phase use the new
+%% keys or newer, so an old-phase packet numbered there is not opened with the
+%% previous keys: it is dropped.
+old_phase_packet_above_new_phase_is_dropped_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    State1 = updated_at(2, ClientApSecret, State),
+    Stale = phase_datagram(
+        [{stream, 0, 0, ~"stale", true}], 3, generation_keys(ClientApSecret, 0), 0
+    ),
+    {State2, Effects} = ?M:handle_datagram(?NOW + 1, Stale, State1),
+    ?assertEqual(connected, ?M:phase(State2)),
+    ?assertEqual([], emits(Effects)).
+
+%% A new-phase packet reordered below the one that began the phase lowers the
+%% bound the previous keys apply under (RFC 9001 §6.5): an old-phase packet
+%% between the two is then dropped (§6.4), one below both still opens.
+reordered_new_phase_packet_lowers_previous_bound_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    State1 = updated_at(5, ClientApSecret, State),
+    Reordered = phase_datagram([ping], 3, generation_keys(ClientApSecret, 1), 1),
+    {State2, _} = ?M:handle_datagram(?NOW + 1, Reordered, State1),
+    Between = phase_datagram(
+        [{stream, 0, 0, ~"between", true}], 4, generation_keys(ClientApSecret, 0), 0
+    ),
+    {State3, Effects3} = ?M:handle_datagram(?NOW + 1, Between, State2),
+    ?assertEqual([], emits(Effects3)),
+    Below = phase_datagram(
+        [{stream, 0, 0, ~"below", true}], 2, generation_keys(ClientApSecret, 0), 0
+    ),
+    {_State4, Effects4} = ?M:handle_datagram(?NOW + 1, Below, State3),
+    ?assert(lists:member({emit, self(), {stream_data, 0, ~"below", true}}, emits(Effects4))).
+
+%% RFC 9001 §6.2: a second update before the server has acknowledged a packet
+%% of the current phase is a KEY_UPDATE_ERROR. The CONNECTION_CLOSE goes out
+%% under the keys of the update that did complete.
+second_update_before_ack_closes_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Update = phase_datagram([ping], 0, generation_keys(ClientApSecret, 1), 1),
+    {State1, _} = ?M:handle_datagram(?NOW, Update, State),
+    Again = phase_datagram([ping], 1, generation_keys(ClientApSecret, 2), 0),
+    {State2, Effects} = ?M:handle_datagram(?NOW, Again, State1),
+    ?assertEqual(draining, ?M:phase(State2)),
+    ?assertEqual([{emit, self(), {closed, {local, key_update_error}}}], emits(Effects)),
+    ?assertMatch(
+        [{ok, #{key_phase := 1, frames := [{connection_close, transport, 16#0e, 0, <<>>}]}}],
+        app_packets(Effects, generation_keys(ServerApSecret, 1))
+    ).
+
+%% Once the server's ACK of the new phase has gone out, the peer may update
+%% again (RFC 9001 §6.1): the third generation takes over in key phase 0.
+second_update_after_ack_commits_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Update = phase_datagram([ping], 0, generation_keys(ClientApSecret, 1), 1),
+    {State1, _} = ?M:handle_datagram(?NOW, Update, State),
+    {State2, _} = ?M:handle_timeout(?NOW + 20, ack, State1),
+    Again = phase_datagram([ping], 1, generation_keys(ClientApSecret, 2), 0),
+    {State3, _} = ?M:handle_datagram(?NOW + 30, Again, State2),
+    ?assertEqual(connected, ?M:phase(State3)),
+    {_State4, Effects} = ?M:handle_timeout(?NOW + 50, ack, State3),
+    ?assertMatch(
+        [{ok, #{key_phase := 0, frames := [{ack, 1, _, 1, [], undefined} | _]}}],
+        app_packets(Effects, generation_keys(ServerApSecret, 2))
+    ).
+
+%% RFC 9001 §6.1: a key update before the handshake is confirmed (at the
+%% server, before it completes) is a KEY_UPDATE_ERROR.
+key_update_before_handshake_completes_closes_test() ->
+    #{state1 := State1, client_ap_secret := ClientApSecret} = connect(),
+    Update = phase_datagram([ping], 0, generation_keys(ClientApSecret, 1), 1),
+    {State2, Effects} = ?M:handle_datagram(?NOW, Update, with_owner(State1)),
+    ?assertEqual(closed, ?M:phase(State2)),
+    ?assertEqual([{emit, self(), {closed, {local, key_update_error}}}], emits(Effects)).
+
+%% RFC 9001 §6.6: past the AEAD_AES_128_GCM integrity limit of 2^52 packets
+%% failing authentication, the connection closes with AEAD_LIMIT_REACHED and
+%% processes no more packets. Up to the limit it carries on.
+aead_integrity_limit_closes_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    AtLimit = ?M:auth_failed(application, 1 bsl 52, State),
+    ?assertEqual(connected, ?M:phase(AtLimit)),
+    Over = ?M:auth_failed(application, (1 bsl 52) + 1, State),
+    ?assertEqual(draining, ?M:phase(Over)),
+    Data = app_datagram([{stream, 0, 0, ~"x", true}], 0, ClientApSecret),
+    {_Over1, Effects} = ?M:handle_datagram(?NOW, Data, Over),
+    ?assertEqual([{emit, self(), {closed, {local, aead_limit_reached}}}], emits(Effects)).
+
+%% =============================================================================
 %% Handshake driver (plays the QUIC client with the shared test client)
 %% =============================================================================
 
@@ -2116,6 +2268,43 @@ app_datagram(Frames, PN, ClientApSecret) ->
     ?TC:seal(
         application, PN, roadrunner_quic_keys:traffic_keys(ClientApSecret), Frames, ?DCID, ?SCID
     ).
+
+%% Seal a peer 1-RTT datagram with the given keys and Key Phase bit.
+phase_datagram(Frames, PN, Keys, KeyPhase) ->
+    Entry = #{frames => Frames, keys => Keys, pn => PN, key_phase => KeyPhase},
+    {Datagram, _Sent} = roadrunner_quic_send:datagram(#{application => Entry}, ?DCID, ?SCID),
+    Datagram.
+
+%% A side's 1-RTT keys after `N` key updates (RFC 9001 §6.1): the AEAD key
+%% and IV of the Nth "quic ku" generation, with the header-protection key of
+%% the first, which never changes.
+generation_keys(Secret, N) ->
+    maps:merge(roadrunner_quic_keys:traffic_keys(Secret), packet_keys(Secret, N)).
+
+packet_keys(Secret, 0) ->
+    maps:with([key, iv], roadrunner_quic_keys:traffic_keys(Secret));
+packet_keys(Secret, N) ->
+    {Updated, _PacketKeys} = roadrunner_quic_keys:update(Secret),
+    packet_keys(Updated, N - 1).
+
+%% Drive a peer key update on a connected state: a PING numbered 0 in key
+%% phase 0, then a PING numbered `PN` in key phase 1 under the next keys.
+updated_at(PN, ClientApSecret, State) ->
+    Old = phase_datagram([ping], 0, generation_keys(ClientApSecret, 0), 0),
+    {State1, _} = ?M:handle_datagram(?NOW, Old, State),
+    New = phase_datagram([ping], PN, generation_keys(ClientApSecret, 1), 1),
+    {State2, _} = ?M:handle_datagram(?NOW, New, State1),
+    State2.
+
+%% Every 1-RTT packet outcome of the server's datagrams, decoded with `Keys`.
+app_packets(Effects, Keys) ->
+    [
+        Outcome
+     || Datagram <- sends(Effects),
+        Outcome <- roadrunner_quic_recv:datagram(
+            Datagram, byte_size(?DCID), #{application => Keys}, #{}
+        )
+    ].
 
 %% Decode the application (1-RTT) frames the connection sent, then keep just
 %% the STREAM frames.

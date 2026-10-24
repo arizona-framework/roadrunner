@@ -8,8 +8,8 @@
 %% key_share, derives the handshake and application traffic secrets exactly
 %% as the server does, verifies the server's CertificateVerify and Finished,
 %% and produces the client's Finished. Pure: no process, no socket; the
-%% connection loop reassembles the CRYPTO bytes, installs the returned keys,
-%% and emits the client Finished. The transcript is threaded across the four
+%% connection loop reassembles the CRYPTO bytes, installs keys from the
+%% returned traffic secrets, and emits the client Finished. The transcript is threaded across the four
 %% hash boundaries (RFC 8446 §7.1) using the re-framed received messages,
 %% byte-identical to the wire bytes.
 %%
@@ -29,8 +29,7 @@
 -define(CERTIFICATE_VERIFY, 15).
 -define(FINISHED, 20).
 
--type install() ::
-    {handshake | application, server | client, roadrunner_quic_keys:keys()}.
+-type install() :: {handshake | application, server | client, Secret :: binary()}.
 
 -type config() :: #{
     eph_priv := binary(),
@@ -81,8 +80,8 @@ Drive the client through the server's flight. `Config` carries the client's
 x25519 ephemeral private key, the framed ClientHello it sent (the transcript
 head), and the server's public key (to verify CertificateVerify). `Flight`
 is the server's `#{initial := ServerHello, handshake := EE++Cert++CertVerify++Finished}`
-CRYPTO bytes. Returns the ordered key installs (handshake before application,
-server then client), the framed client Finished, and the negotiated ALPN
+CRYPTO bytes. Returns the ordered traffic-secret installs (handshake before
+application, server then client), the framed client Finished, and the negotiated ALPN
 protocol and the server's transport parameters. Fails with
 `{error, handshake_verification_failed}` if the server CertificateVerify or
 Finished does not check out.
@@ -144,10 +143,10 @@ process_server_flight(
         ),
         ClientFinished = roadrunner_quic_tls_auth:build_finished(ClientHsSecret, FinishedHash),
         Installs = [
-            {handshake, server, roadrunner_quic_keys:traffic_keys(ServerHsSecret)},
-            {handshake, client, roadrunner_quic_keys:traffic_keys(ClientHsSecret)},
-            {application, server, roadrunner_quic_keys:traffic_keys(ServerApSecret)},
-            {application, client, roadrunner_quic_keys:traffic_keys(ClientApSecret)}
+            {handshake, server, ServerHsSecret},
+            {handshake, client, ClientHsSecret},
+            {application, server, ServerApSecret},
+            {application, client, ClientApSecret}
         ],
         {ok, #{
             installs => Installs,

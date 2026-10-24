@@ -29,6 +29,14 @@
 %% anti-amplification budget, and records each sent packet for loss
 %% recovery.
 %%
+%% The peer may update the 1-RTT keys (RFC 9001 §6). A packet that opens
+%% with the next generation's keys commits the update only once it has
+%% authenticated, so a forged packet with a flipped Key Phase bit changes
+%% nothing; the commit moves both directions to the next generation and
+%% flips the Key Phase bit our packets carry, and the previous receive keys
+%% stay for three PTOs for reordered packets. The server does not start a
+%% key update of its own.
+%%
 %% Congestion control and probe transmission are deferred: the connection
 %% sends within the anti-amplification and flow limits (the MUSTs) and a
 %% probe timeout only re-checks for losses and backs off. Wiring NewReno and
@@ -53,6 +61,9 @@
 -export([fit_frames/2]).
 %% Exported so tests can observe the congestion window's growth and backoff.
 -export([cwnd/1]).
+%% Exported for direct eunit branch coverage of the AEAD integrity limit
+%% (RFC 9001 §6.6): no test can forge the 2^52 packets that reach it.
+-export([auth_failed/3]).
 
 -export_type([t/0, config/0, effect/0, event/0, info/0]).
 
@@ -76,6 +87,9 @@
 %% advertises a max_idle_timeout, so a dead peer cannot pin the connection. The
 %% live value is the negotiated minimum of the two advertised limits.
 -define(IDLE_TIMEOUT, 30000).
+%% The AEAD_AES_128_GCM integrity limit (RFC 9001 §6.6): received packets
+%% that may fail authentication within a connection before it MUST close.
+-define(AEAD_INTEGRITY_LIMIT, (1 bsl 52)).
 %% TLS handshake message types carried in CRYPTO (RFC 8446 §4).
 -define(CLIENT_HELLO, 1).
 -define(FINISHED, 20).
@@ -106,10 +120,31 @@
     peer :: {inet:ip_address(), inet:port_number()},
     phase = handshaking :: phase(),
     tls :: roadrunner_quic_tls_server:t(),
-    %% Keys to decrypt incoming packets (the peer's), by level.
-    recv_keys :: #{level() => roadrunner_quic_keys:keys()},
+    %% Keys to decrypt incoming packets (the peer's), by level. The 1-RTT
+    %% keys also carry the key-update generations `roadrunner_quic_recv`
+    %% chooses between (RFC 9001 §6).
+    recv_keys :: #{level() => roadrunner_quic_recv:keys()},
     %% Keys to protect outgoing packets (the server's), by level.
     send_keys :: #{level() => roadrunner_quic_keys:keys()},
+    %% The 1-RTT Key Phase bit (RFC 9001 §6): the one the peer's current
+    %% keys use and our packets carry. A peer-initiated key update flips it.
+    key_phase = 0 :: 0 | 1,
+    %% The 1-RTT secrets each key update advances with "quic ku" (§6.1): the
+    %% client's for the next receive generation (the `next` keys in
+    %% `recv_keys`), and the server's for the current send generation.
+    recv_secret = <<>> :: binary(),
+    send_secret = <<>> :: binary(),
+    %% Whether a 1-RTT ACK has gone out since the last key update. The peer
+    %% may update again only once it has an acknowledgment of a packet it
+    %% sent in the current phase (§6.1), and only our ACKs sent after the
+    %% update can carry one.
+    update_acked = true :: boolean(),
+    %% When the previous 1-RTT receive generation is discarded (§6.5), or
+    %% `undefined` with none kept.
+    prev_keys_until = undefined :: integer() | undefined,
+    %% Received packets that failed authentication, across all keys and
+    %% levels, for the AEAD integrity limit (§6.6).
+    auth_failures = 0 :: non_neg_integer(),
     spaces :: #{level() => #space{}},
     amp :: roadrunner_quic_amp:t(),
     %% Cleared once a Handshake packet decrypts (address validated, §8.1).
@@ -378,12 +413,10 @@ frames into the connection state, then run a send pass. Returns the new
 state and the effects to perform.
 """.
 -spec handle_datagram(integer(), binary(), t()) -> {t(), [effect()]}.
-handle_datagram(
-    Now,
-    Datagram,
-    #state{amp = Amp, recv_keys = RecvKeys, phase = Before, idle_timeout = IdleTimeout} = State0
-) ->
-    State1 = State0#state{
+handle_datagram(Now, Datagram, State0) ->
+    #state{amp = Amp, recv_keys = RecvKeys, phase = Before, idle_timeout = IdleTimeout} =
+        State = expire_previous_keys(Now, State0),
+    State1 = State#state{
         amp = roadrunner_quic_amp:received(byte_size(Datagram), Amp),
         idle_deadline = Now + IdleTimeout
     },
@@ -568,8 +601,8 @@ handle_consumed(Sid, Bytes, Now, #state{streams = Streams} = State) ->
 -spec owner_close(non_neg_integer(), binary(), integer(), t()) -> {t(), [effect()]}.
 owner_close(ErrorCode, Reason, Now, #state{send_keys = SendKeys} = State) ->
     case SendKeys of
-        #{application := Keys} ->
-            send_owner_close(ErrorCode, Reason, Keys, Now, State);
+        #{application := _} ->
+            send_owner_close(ErrorCode, Reason, Now, State);
         #{} ->
             %% The owner closed before the handshake completed (e.g. the
             %% connection_handler refusing on max_clients): there are no 1-RTT
@@ -578,13 +611,12 @@ owner_close(ErrorCode, Reason, Now, #state{send_keys = SendKeys} = State) ->
             {State#state{phase = closed}, []}
     end.
 
--spec send_owner_close(non_neg_integer(), binary(), roadrunner_quic_keys:keys(), integer(), t()) ->
-    {t(), [effect()]}.
-send_owner_close(ErrorCode, Reason, Keys, Now, #state{peer_scid = DCID, scid = SCID} = State) ->
+-spec send_owner_close(non_neg_integer(), binary(), integer(), t()) -> {t(), [effect()]}.
+send_owner_close(ErrorCode, Reason, Now, #state{peer_scid = DCID, scid = SCID} = State) ->
     Space = space(application, State),
     PN = Space#space.next_pn,
     Frame = {connection_close, application, ErrorCode, undefined, Reason},
-    Entry = #{application => #{frames => [Frame], keys => Keys, pn => PN}},
+    Entry = #{application => entry(application, [Frame], PN, State)},
     {Datagram, _Sent} = roadrunner_quic_send:datagram(Entry, DCID, SCID),
     State1 = put_space(
         application, Space#space{next_pn = PN + 1}, State#state{phase = draining}
@@ -726,20 +758,30 @@ process_outcome(_Now, _Outcome, #state{phase = Phase} = State) when
     %% nor discard (via validate_on_handshake) the space and keys a pending local
     %% close still needs to send its frame.
     State;
-process_outcome(
-    Now, {ok, #{level := Level, pn := PN, frames := Frames}}, #state{spaces = Spaces} = State
-) ->
-    case Spaces of
-        #{Level := _} ->
-            State1 = validate_on_handshake(Level, State),
-            State2 = lists:foldl(
-                fun(Frame, S) -> process_frame(Now, Level, Frame, S) end, State1, Frames
-            ),
-            record_received(Now, Level, PN, Frames, State2);
-        #{} ->
-            %% A packet for a discarded space (e.g. a late Initial); ignore.
-            State
+process_outcome(Now, {ok, #{generation := next, pn := PN} = Decoded}, State) ->
+    %% The packet authenticated with the next 1-RTT keys, so the peer has
+    %% updated its keys (RFC 9001 §6.2). Only now, after that trial decryption
+    %% succeeded, is the update committed: a forged packet with a flipped Key
+    %% Phase bit fails it and changes nothing.
+    case key_update_permitted(State) of
+        true -> process_packet(Now, Decoded, commit_key_update(Now, PN, State));
+        false -> connection_fatal(application, key_update_error, State)
     end;
+process_outcome(
+    Now,
+    {ok, #{generation := current, pn := PN} = Decoded},
+    #state{recv_keys = #{application := #{prev_below := Below} = Keys} = RecvKeys} = State
+) when PN < Below ->
+    %% A current-phase packet reordered ahead of the one that began the phase:
+    %% only packets numbered below it can be from the previous phase (§6.5), so
+    %% the previous keys never open a packet numbered above one the newer keys
+    %% opened (§6.4).
+    Keys1 = Keys#{prev_below := PN},
+    process_packet(Now, Decoded, State#state{recv_keys = RecvKeys#{application := Keys1}});
+process_outcome(Now, {ok, Decoded}, State) ->
+    process_packet(Now, Decoded, State);
+process_outcome(_Now, {auth_failed, Level}, #state{auth_failures = Failures} = State) ->
+    auth_failed(Level, Failures + 1, State);
 process_outcome(_Now, {drop, _Reason}, State) ->
     State;
 process_outcome(_Now, {frame_error, Level, protocol_violation}, State) ->
@@ -751,6 +793,103 @@ process_outcome(_Now, {frame_error, Level, _Reason}, State) ->
     %% A malformed authenticated frame: truncated, of an unknown type, or with
     %% a field outside its range (RFC 9000 §12.4, §19).
     connection_fatal(Level, frame_encoding_error, State).
+
+%% Fold a decrypted packet's frames into the connection and record it for
+%% acknowledgment.
+-spec process_packet(integer(), roadrunner_quic_recv:decoded(), t()) -> t().
+process_packet(Now, #{level := Level, pn := PN, frames := Frames}, #state{spaces = Spaces} = State) ->
+    case Spaces of
+        #{Level := _} ->
+            State1 = validate_on_handshake(Level, State),
+            State2 = lists:foldl(
+                fun(Frame, S) -> process_frame(Now, Level, Frame, S) end, State1, Frames
+            ),
+            record_received(Now, Level, PN, Frames, State2);
+        #{} ->
+            %% A packet for a discarded space (e.g. a late Initial); ignore.
+            State
+    end.
+
+%% RFC 9001 §6.1: the peer MUST NOT update its keys before the handshake is
+%% confirmed (at the server, once it completes, §4.1.2), nor update again
+%% before it has an acknowledgment of a packet it sent in the current phase,
+%% which only an ACK of ours sent since the last update can be. §6.2 lets an
+%% endpoint treat a second update that comes too soon as a KEY_UPDATE_ERROR,
+%% and §6.7 names that code for key-update errors, so both close with it.
+-spec key_update_permitted(t()) -> boolean().
+key_update_permitted(#state{phase = connected, update_acked = true}) -> true;
+key_update_permitted(#state{}) -> false.
+
+%% Commit a peer key update (RFC 9001 §6.2) once a packet has authenticated
+%% with the next keys. They become the current receive keys; the current
+%% ones stay as the previous generation for packets reordered from before
+%% the update, until three PTOs from now (§6.5), with the packet that began
+%% the phase as the bound below which they apply. The generation after the
+%% new one is derived now, so it is ready before the peer's next update and
+%% no later packet's timing depends on deriving keys (§6.3, §9.5). The send
+%% keys move to the next generation in the same step, before any ACK of this
+%% packet can go out (§6.2), and the Key Phase bit flips. The header-
+%% protection keys stay (§6.1).
+-spec commit_key_update(integer(), non_neg_integer(), t()) -> t().
+commit_key_update(
+    Now,
+    PN,
+    #state{
+        recv_keys = #{application := Recv} = RecvKeys,
+        send_keys = #{application := Send} = SendKeys,
+        recv_secret = RecvSecret,
+        send_secret = SendSecret,
+        key_phase = Phase
+    } = State
+) ->
+    #{key := Key, iv := IV, next := #{key := NextKey, iv := NextIV}} = Recv,
+    {RecvSecret1, AfterNext} = roadrunner_quic_keys:update(RecvSecret),
+    {SendSecret1, SendNext} = roadrunner_quic_keys:update(SendSecret),
+    #{key := SendKey, iv := SendIV} = roadrunner_quic_keys:for_connection(SendNext, seal),
+    NewPhase = 1 - Phase,
+    Recv1 = Recv#{
+        key := NextKey,
+        iv := NextIV,
+        phase := NewPhase,
+        next := roadrunner_quic_keys:for_connection(AfterNext, open),
+        prev => #{key => Key, iv => IV},
+        prev_below => PN
+    },
+    #space{loss = Loss} = space(application, State),
+    State#state{
+        recv_keys = RecvKeys#{application := Recv1},
+        send_keys = SendKeys#{application := Send#{key := SendKey, iv := SendIV}},
+        recv_secret = RecvSecret1,
+        send_secret = SendSecret1,
+        key_phase = NewPhase,
+        update_acked = false,
+        prev_keys_until = Now + 3 * roadrunner_quic_loss:get_pto(Loss)
+    }.
+
+%% Drop the previous 1-RTT receive keys once their three PTOs have passed
+%% (RFC 9001 §6.5): by then the peer has declared any packet from before the
+%% update lost. Checked as each datagram arrives, so no packet opens with
+%% them later; their secret was never kept.
+-spec expire_previous_keys(integer(), t()) -> t().
+expire_previous_keys(
+    Now, #state{prev_keys_until = Until, recv_keys = #{application := Keys} = RecvKeys} = State
+) when is_integer(Until), Now >= Until ->
+    State#state{
+        prev_keys_until = undefined,
+        recv_keys = RecvKeys#{application := maps:without([prev, prev_below], Keys)}
+    };
+expire_previous_keys(_Now, State) ->
+    State.
+
+%% Count a received packet that failed authentication (RFC 9001 §6.6). Past
+%% the AEAD integrity limit, counted across all keys, the connection MUST
+%% close at once with AEAD_LIMIT_REACHED and process no more packets.
+-doc false.
+-spec auth_failed(level(), non_neg_integer(), t()) -> t().
+auth_failed(Level, Failures, State) when Failures > ?AEAD_INTEGRITY_LIMIT ->
+    connection_fatal(Level, aead_limit_reached, State);
+auth_failed(_Level, Failures, State) ->
+    State#state{auth_failures = Failures}.
 
 %% A decrypted Handshake packet proves the client received the server's
 %% Initial: lift the 3x anti-amplification limit (RFC 9000 §8.1) and
@@ -989,22 +1128,39 @@ process_handshake(Level, {_Type, _Body}, State) ->
     %% message); connection-fatal like the other handshake failures.
     connection_fatal(Level, unexpected_message, State).
 
-%% Arm the keys the TLS flight produced: server installs protect outgoing
-%% packets, client installs decrypt incoming ones; the Application space
-%% appears with its keys.
+%% Arm the keys derived from the traffic secrets the TLS flight produced
+%% (RFC 9001 §5.1): server secrets protect outgoing packets, client secrets
+%% decrypt incoming ones; the Application space appears with its keys. The
+%% 1-RTT secrets are kept for key updates (§6.1), and the receive side gets
+%% the next generation's keys at once (§6.3): they are ready before the
+%% peer's first update, in key phase 0.
 -spec install_keys([roadrunner_quic_tls_server:install()], t()) -> t().
 install_keys(Installs, State) ->
     lists:foldl(fun install_key/2, State, Installs).
 
 -spec install_key(roadrunner_quic_tls_server:install(), t()) -> t().
-install_key({Level, server, Keys}, #state{send_keys = SendKeys} = State) ->
-    ensure_space(Level, State#state{
-        send_keys = SendKeys#{Level => roadrunner_quic_keys:for_connection(Keys, seal)}
+install_key({application, server, Secret}, State) ->
+    install_send_keys(application, Secret, State#state{send_secret = Secret});
+install_key({Level, server, Secret}, State) ->
+    install_send_keys(Level, Secret, State);
+install_key({application, client, Secret}, #state{recv_keys = RecvKeys} = State) ->
+    Keys = connection_keys(Secret, open),
+    {NextSecret, Next} = roadrunner_quic_keys:update(Secret),
+    AppKeys = Keys#{phase => 0, next => roadrunner_quic_keys:for_connection(Next, open)},
+    ensure_space(application, State#state{
+        recv_keys = RecvKeys#{application => AppKeys}, recv_secret = NextSecret
     });
-install_key({Level, client, Keys}, #state{recv_keys = RecvKeys} = State) ->
-    ensure_space(Level, State#state{
-        recv_keys = RecvKeys#{Level => roadrunner_quic_keys:for_connection(Keys, open)}
-    }).
+install_key({Level, client, Secret}, #state{recv_keys = RecvKeys} = State) ->
+    ensure_space(Level, State#state{recv_keys = RecvKeys#{Level => connection_keys(Secret, open)}}).
+
+-spec install_send_keys(level(), binary(), t()) -> t().
+install_send_keys(Level, Secret, #state{send_keys = SendKeys} = State) ->
+    ensure_space(Level, State#state{send_keys = SendKeys#{Level => connection_keys(Secret, seal)}}).
+
+%% A traffic secret's packet-protection keys, prepared for this process.
+-spec connection_keys(binary(), seal | open) -> roadrunner_quic_keys:keys().
+connection_keys(Secret, Direction) ->
+    roadrunner_quic_keys:for_connection(roadrunner_quic_keys:traffic_keys(Secret), Direction).
 
 -spec ensure_space(level(), t()) -> t().
 ensure_space(Level, #state{spaces = Spaces} = State) ->
@@ -1281,7 +1437,9 @@ close_code(Reason) when
     Reason =:= protocol_violation;
     Reason =:= crypto_buffer_exceeded;
     Reason =:= frame_encoding_error;
-    Reason =:= transport_parameter_error
+    Reason =:= transport_parameter_error;
+    Reason =:= key_update_error;
+    Reason =:= aead_limit_reached
 ->
     roadrunner_quic_error:code_int(Reason);
 close_code(unexpected_message) ->
@@ -1308,19 +1466,12 @@ close_code(_TlsReason) ->
 %% received packet, so 3x bytes-received covers a <=1200-byte close.
 -spec send_close(t()) -> {t(), [effect()]}.
 send_close(
-    #state{
-        pending_close = {Level, ErrorCode},
-        peer_scid = DCID,
-        scid = SCID,
-        send_keys = SendKeys,
-        amp = Amp
-    } = State
+    #state{pending_close = {Level, ErrorCode}, peer_scid = DCID, scid = SCID, amp = Amp} = State
 ) ->
-    #{Level := Keys} = SendKeys,
     Space = space(Level, State),
     PN = Space#space.next_pn,
     Frame = {connection_close, transport, ErrorCode, 0, <<>>},
-    Entry = #{Level => #{frames => [Frame], keys => Keys, pn => PN}},
+    Entry = #{Level => entry(Level, [Frame], PN, State)},
     {Datagram, _Sent} = roadrunner_quic_send:datagram(Entry, DCID, SCID),
     case roadrunner_quic_amp:can_send(byte_size(Datagram), Amp) of
         false ->
@@ -1878,10 +2029,30 @@ stream_blocked_frame(_Sid, ok, _StreamFlow) ->
     [].
 
 -spec build_entry(level(), [roadrunner_quic_frame:frame()], #space{}, t()) -> {map(), t()}.
-build_entry(Level, Frames, #space{next_pn = PN} = Space, #state{send_keys = SendKeys} = State) ->
+build_entry(Level, Frames, #space{next_pn = PN} = Space, State) ->
+    Entry = entry(Level, Frames, PN, State),
+    {Entry, put_space(Level, Space#space{next_pn = PN + 1}, ack_in_phase(Level, Frames, State))}.
+
+%% One packet's send entry. A 1-RTT packet carries the current Key Phase bit
+%% (RFC 9001 §6.1) and is protected with the current send keys; after a key
+%% update both are the new generation's (§6.4: never the old keys).
+-spec entry(level(), [roadrunner_quic_frame:frame()], non_neg_integer(), t()) ->
+    roadrunner_quic_send:entry().
+entry(application, Frames, PN, #state{send_keys = #{application := Keys}, key_phase = Phase}) ->
+    #{frames => Frames, keys => Keys, pn => PN, key_phase => Phase};
+entry(Level, Frames, PN, #state{send_keys = SendKeys}) ->
     #{Level := Keys} = SendKeys,
-    Entry = #{frames => Frames, keys => Keys, pn => PN},
-    {Entry, put_space(Level, Space#space{next_pn = PN + 1}, State)}.
+    #{frames => Frames, keys => Keys, pn => PN}.
+
+%% A 1-RTT packet carrying an ACK, the first since a key update, completes
+%% the update (RFC 9001 §6.2): it acknowledges a packet of the new phase, so
+%% the peer may update again once it arrives. The ACK, when present, leads
+%% the frames (`prepend_ack/2`).
+-spec ack_in_phase(level(), [roadrunner_quic_frame:frame()], t()) -> t().
+ack_in_phase(application, [{ack, _, _, _, _, _} | _], #state{update_acked = false} = State) ->
+    State#state{update_acked = true};
+ack_in_phase(_Level, _Frames, State) ->
+    State.
 
 %% The ACK frame for a space with an ack-eliciting packet awaiting one, with
 %% the ACK Delay the largest packet has waited (RFC 9000 §13.2.5, §19.3).

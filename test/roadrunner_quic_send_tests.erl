@@ -95,8 +95,8 @@ application_round_trip_test() ->
     },
     {Datagram, _Sent} = ?M:datagram(Entries, ?DCID, ?SCID),
     ?assert(byte_size(Datagram) < 1200),
-    ?assertEqual(
-        [{ok, #{level => application, pn => 9, frames => Frames, key_phase => 1}}],
+    ?assertMatch(
+        [{ok, #{level := application, pn := 9, frames := Frames, key_phase := 1}}],
         recv(Datagram, #{application => application_keys()})
     ).
 
@@ -105,8 +105,8 @@ application_default_key_phase_test() ->
     Frames = [{stream, 0, 0, <<"more-body-data">>, false}],
     Entries = #{application => #{frames => Frames, keys => application_keys(), pn => 1}},
     {Datagram, _} = ?M:datagram(Entries, ?DCID, ?SCID),
-    ?assertEqual(
-        [{ok, #{level => application, pn => 1, frames => Frames, key_phase => 0}}],
+    ?assertMatch(
+        [{ok, #{level := application, pn := 1, frames := Frames, key_phase := 0}}],
         recv(Datagram, #{application => application_keys()})
     ).
 

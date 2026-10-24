@@ -4,12 +4,12 @@
 %% TLS 1.3 server-handshake sequencer (RFC 8446 §4, RFC 9001 §4-5) for a
 %% server-only QUIC v1 endpoint: the pure decision core that drives the
 %% handshake forward over the message-layer modules
-%% (`roadrunner_quic_tls_hello`, `_auth`, `_crypto`, `_transport_params`,
-%% `roadrunner_quic_keys`). It is not a process and touches no socket; the
-%% connection loop reassembles CRYPTO frames, calls these functions with
-%% the deframed handshake-message bodies, emits the returned flight at the
-%% named encryption levels, and installs the returned packet-protection
-%% keys.
+%% (`roadrunner_quic_tls_hello`, `_auth`, `_crypto`, `_transport_params`).
+%% It is not a process and touches no socket; the connection loop
+%% reassembles CRYPTO frames, calls these functions with the deframed
+%% handshake-message bodies, emits the returned flight at the named
+%% encryption levels, and installs packet-protection keys derived from the
+%% returned traffic secrets.
 %%
 %% `process_client_hello/2` consumes the ClientHello body and produces the
 %% whole server flight grouped by QUIC encryption level (ServerHello at
@@ -89,8 +89,8 @@
 
 -type flight() :: #{initial := iolist(), handshake := iolist()}.
 
--type install() ::
-    {handshake | application, server | client, roadrunner_quic_keys:keys()}.
+%% A traffic secret for one level and direction (RFC 8446 §7.1).
+-type install() :: {handshake | application, server | client, Secret :: binary()}.
 
 -doc """
 Build the handshake state from the per-connection config: the server's DER
@@ -133,8 +133,10 @@ Returns `{ok, Flight, Installs, State}` where `Flight` groups the framed
 handshake messages by QUIC encryption level (`initial` carries the
 ServerHello; `handshake` carries EncryptedExtensions, Certificate,
 CertificateVerify, and the server Finished) and `Installs` is the ordered
-list of packet-protection keys the loop must arm: the handshake keys (so
-it can read the client's encrypted Finished) before the application keys.
+list of traffic secrets the loop derives its packet-protection keys from
+(RFC 9001 §5.1): the handshake secrets (so it can read the client's
+encrypted Finished) before the application secrets. The loop keeps the
+application secrets to derive later key generations from (§6.1).
 The returned `State` carries what `process_client_finished/2` needs.
 
 Fails with `{error, Reason}` on a malformed ClientHello, a missing x25519
@@ -339,10 +341,10 @@ build_flight(
         handshake => [EncryptedExtensions, Certificate, CertificateVerify, Finished]
     },
     Installs = [
-        {handshake, server, roadrunner_quic_keys:traffic_keys(ServerHsSecret)},
-        {handshake, client, roadrunner_quic_keys:traffic_keys(ClientHsSecret)},
-        {application, server, roadrunner_quic_keys:traffic_keys(ServerApSecret)},
-        {application, client, roadrunner_quic_keys:traffic_keys(ClientApSecret)}
+        {handshake, server, ServerHsSecret},
+        {handshake, client, ClientHsSecret},
+        {application, server, ServerApSecret},
+        {application, client, ClientApSecret}
     ],
     State1 = State#server{client_hs_secret = ClientHsSecret, client_finished_hash = FinishedHash},
     {ok, Flight, Installs, State1}.

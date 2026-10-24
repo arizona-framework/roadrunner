@@ -124,13 +124,14 @@ assert_full_handshake(KeyType) ->
         server, application, MasterSecret, FinishedHash
     ),
 
-    %% Installs: handshake keys before application keys, server then client.
+    %% Installs: handshake secrets before application secrets, server then
+    %% client.
     ?assertEqual(
         [
-            {handshake, server, roadrunner_quic_keys:traffic_keys(ServerHsSecret)},
-            {handshake, client, roadrunner_quic_keys:traffic_keys(ClientHsSecret)},
-            {application, server, roadrunner_quic_keys:traffic_keys(ServerApSecret)},
-            {application, client, roadrunner_quic_keys:traffic_keys(ClientApSecret)}
+            {handshake, server, ServerHsSecret},
+            {handshake, client, ClientHsSecret},
+            {application, server, ServerApSecret},
+            {application, client, ClientApSecret}
         ],
         Installs
     ),
