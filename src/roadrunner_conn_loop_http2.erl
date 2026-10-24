@@ -1616,7 +1616,14 @@ dispatch_request(
                             %% worker spawned.
                             ok = throttle_stream(StateBuf, ListenerName),
                             _ = send_rst_stream(StateBuf, StreamId, refused_stream),
-                            frame_loop(remove_stream(StateBuf, StreamId))
+                            frame_loop(remove_stream(StateBuf, StreamId));
+                        {shed, RetryAfter} ->
+                            %% Over the ceiling on a shed listener: 503 +
+                            %% Retry-After, no worker spawned, so the client
+                            %% waits instead of retrying the stream at once.
+                            ok = throttle_stream(StateBuf, ListenerName),
+                            State1 = retry_later(StateBuf, StreamId, 503, RetryAfter),
+                            frame_loop(remove_stream(State1, StreamId))
                     end
             end;
         {error, Reason} when Reason =:= not_implemented; Reason =:= unsupported_expectation ->
@@ -2394,12 +2401,20 @@ rate_limit_refused(
         allow ->
             ok;
         {deny, RetryAfter} ->
-            State1 = encode_and_send_response_atomic(
-                State, StreamId, 429, [{~"retry-after", integer_to_binary(RetryAfter)}], ~"", 0
-            ),
-            _ = send_rst_stream(State1, StreamId, no_error),
-            {refused, State1}
+            {refused, retry_later(State, StreamId, 429, RetryAfter)}
     end.
+
+%% A bodyless `429` (over the per-peer rate) or `503` (shed at the
+%% in-flight ceiling) with `Retry-After`, then `RST_STREAM(NO_ERROR)`: the
+%% response is complete, so any request body still on its way is not
+%% wanted (RFC 9113 §8.1).
+-spec retry_later(#loop{}, stream_id(), 429 | 503, pos_integer()) -> #loop{}.
+retry_later(State, StreamId, Status, RetryAfter) ->
+    State1 = encode_and_send_response_atomic(
+        State, StreamId, Status, [{~"retry-after", integer_to_binary(RetryAfter)}], ~"", 0
+    ),
+    _ = send_rst_stream(State1, StreamId, no_error),
+    State1.
 
 %% A connection error (RFC 9113 §5.4.1): tell the peer with a GOAWAY
 %% carrying `ErrorCode`, then tear down with it as the close reason.

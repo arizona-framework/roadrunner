@@ -979,6 +979,48 @@ overload_mode_rejects_bad_config_test() ->
         roadrunner_listener:start_link(overload_bad_4, Base#{
             overload_mode => {queue, #{timeout => nonsense}}
         })
+    ),
+    %% Shed mode with no ceiling to shed at is the same configuration error.
+    Shed = {shed, #{}},
+    ?assertMatch(
+        {error, {
+            {invalid_listener_opt, overload_mode, {Shed, requires_max_concurrent_requests}}, _
+        }},
+        roadrunner_listener:start_link(
+            overload_bad_5,
+            maps:remove(max_concurrent_requests, Base#{overload_mode => Shed})
+        )
+    ),
+    ?assertMatch(
+        {error, {{invalid_listener_opt, overload_mode, {shed, _}}, _}},
+        roadrunner_listener:start_link(overload_bad_6, Base#{
+            overload_mode => {shed, #{retry_after => 0}}
+        })
+    ),
+    ?assertMatch(
+        {error, {{invalid_listener_opt, overload_mode, {shed, nonsense}}, _}},
+        roadrunner_listener:start_link(overload_bad_7, Base#{
+            overload_mode => {shed, nonsense}
+        })
+    ).
+
+%% `{shed, #{}}` sends a one-second `Retry-After`; a supplied one is kept.
+overload_mode_shed_resolves_its_retry_after_test() ->
+    lists:foreach(
+        fun({Name, Mode, Want}) ->
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                routes => roadrunner_hello_handler,
+                max_concurrent_requests => 4,
+                overload_mode => Mode
+            }),
+            ?assertMatch(#{overload := Want}, element(4, sys:get_state(whereis(Name)))),
+            ok = roadrunner_listener:stop(Name)
+        end,
+        [
+            {overload_shed_default, {shed, #{}}, {shed, 1}},
+            {overload_shed_set, {shed, #{retry_after => 30}}, {shed, 30}}
+        ]
     ).
 
 %% Both knobs are optional: `{queue, #{}}` derives `timeout` from

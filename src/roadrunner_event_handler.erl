@@ -90,8 +90,9 @@ tell listeners apart, match on the listener name the events carry.
   error.
 - `request_throttled`, `{ListenerName, Reason}`: a request was
   refused at a listener limit before any handler ran. `Reason` is
-  `max_concurrent_requests` (an HTTP/2 or HTTP/3 stream over the
-  in-flight ceiling, reset as retry-safe) or `rate_limit` (a peer over
+  `max_concurrent_requests` (a request over the in-flight ceiling: an
+  HTTP/2 or HTTP/3 stream reset as retry-safe, or answered `503` on any
+  protocol when `overload_mode` is `shed`) or `rate_limit` (a peer over
   its `rate_limit`, answered `429`).
 - `response_send_failed`, `{Phase, Reason}`: a response write failed
   after the status line was already going out, so the connection is

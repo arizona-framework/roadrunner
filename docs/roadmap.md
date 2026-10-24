@@ -397,28 +397,6 @@ shared per-section middlewares (auth, rate limit, body-limit
 overrides) duplicated across many entries. Add when a real codebase
 shows that duplication.
 
-## Built-in edge middleware
-
-The continuation-middleware model (`call(Req, Next, State)`, configured
-per entry via `{Module, State}`) makes browser-facing and abuse-control
-concerns composable at the listener or per-route level. Each is
-boilerplate every public service rewrites today; shipping configurable,
-default-safe versions removes it.
-
-### Graceful load-shedding — small-medium
-
-**What:** Turn the hard `max_clients` / `max_concurrent_requests` caps
-into a graceful shed: over a soft threshold, answer `503 Service
-Unavailable` with `Retry-After` instead of refusing the connection, so
-clients back off cleanly rather than hammering a closed port.
-
-**Why deferred:** the hard caps already protect the server from overload;
-graceful shedding is a client-experience refinement, useful once a
-deployment reports clients retry-storming a refused port.
-
-**Scope:** small-medium. Reuses the existing slot counters; the work is
-the soft-threshold check and the 503 path on the conn loop.
-
 ## Deferred to the application layer
 
 Capabilities that are real, but sit above the HTTP server core: in

@@ -394,7 +394,8 @@ framework_responses_carry_date_test_() ->
             fun() -> roadrunner_conn:send_bad_request(Socket) end,
             fun() -> roadrunner_conn:send_status(Socket, 431) end,
             fun() -> roadrunner_conn:send_payload_too_large(Socket) end,
-            fun() -> roadrunner_conn:send_rate_limited(Socket, 1) end,
+            fun() -> roadrunner_conn:send_retry_later(Socket, 429, 1) end,
+            fun() -> roadrunner_conn:send_retry_later(Socket, 503, 1) end,
             fun() -> roadrunner_conn:send_not_found(Socket) end,
             fun() -> roadrunner_conn:send_method_not_allowed(Socket, [~"GET"]) end,
             fun() -> roadrunner_conn:send_request_timeout(Socket) end,
@@ -1472,6 +1473,19 @@ slot_refuse_mode_is_pure_counters_test() ->
     %% `infinity` short-circuits both directions.
     ?assert(roadrunner_conn:acquire_request_slot(infinity, Counter, refuse, s3)),
     ok = roadrunner_conn:release_request_slot(infinity, Counter, refuse),
+    ?assertEqual(0, counters:get(Counter, 1)).
+
+%% `shed` is the same counters path with a different answer at the
+%% ceiling: the `Retry-After` seconds the caller sends with its 503. Nothing
+%% parks, so withdrawing and releasing never message anyone.
+slot_shed_mode_answers_with_its_retry_after_test() ->
+    Counter = counters:new(1, [write_concurrency]),
+    Shed = {shed, 7},
+    ?assert(roadrunner_conn:acquire_request_slot(1, Counter, Shed, s1)),
+    ?assertEqual({shed, 7}, roadrunner_conn:acquire_request_slot(1, Counter, Shed, s2)),
+    ?assertEqual(1, counters:get(Counter, 1)),
+    ok = roadrunner_conn:cancel_slot_wait(Shed, s2),
+    ok = roadrunner_conn:release_request_slot(1, Counter, Shed),
     ?assertEqual(0, counters:get(Counter, 1)).
 
 slot_release_many_test() ->

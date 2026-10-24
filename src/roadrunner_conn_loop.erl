@@ -154,6 +154,14 @@
     %% `shoot` (`undefined` when off — the common case, a single branch in
     %% `dispatch_phase/3`).
     rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
+    %% The listener's in-flight ceiling, which an HTTP/1 request joins only
+    %% in `shed` overload mode (`undefined` otherwise, the common case, a
+    %% single branch per request). `idle` between requests, `held` from the
+    %% slot's acquire in `admit/3` until the request ends, so an exit path
+    %% knows whether it has a slot to hand back.
+    request_slot = undefined ::
+        undefined
+        | {idle | held, pos_integer(), counters:counters_ref(), roadrunner_conn:overload()},
     %% The `real_ip` trust config when the peer is a trusted proxy, decided
     %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
     %% otherwise, the common case, so the request path resolves nothing.
@@ -342,10 +350,27 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                     maps:get(http1_max_header_count, ProtoOpts, 100)
                 },
                 rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
-                real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer)
+                real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer),
+                request_slot = request_slot(ProtoOpts)
             },
             read_request_phase(S)
     end.
+
+%% HTTP/1 requests count against `max_concurrent_requests` only when the
+%% listener sheds over it: in `refuse` and `queue` modes the ceiling bounds
+%% the multiplexed protocols' handler processes, which `max_clients`
+%% already does for HTTP/1, while a shed budget that HTTP/1 traffic could
+%% run past would shed nothing.
+-spec request_slot(roadrunner_conn:proto_opts()) ->
+    undefined | {idle, pos_integer(), counters:counters_ref(), roadrunner_conn:overload()}.
+request_slot(#{
+    overload := {shed, _} = Overload,
+    max_concurrent_requests := Max,
+    inflight_counter := Counter
+}) ->
+    {idle, Max, Counter, Overload};
+request_slot(_ProtoOpts) ->
+    undefined.
 
 %% Read and strip a PROXY-protocol header when the listener enabled it. Returns
 %% `{ok, Peer, Leftover}` — the real client peer on a PROXY command, the OS peer
@@ -875,6 +900,8 @@ handle_request_bytes(
 %%
 %% The per-peer rate limit is checked first, from the headers alone, so a
 %% request over its rate is answered 429 before any of its body is read.
+%% A shed listener's in-flight ceiling comes next, the same way: a request
+%% over it is answered 503 before its body is read or a handler runs.
 %% The request is then routed, once, before its body is read: the match is
 %% the one dispatch uses, and a matched route's own `max_content_length`
 %% caps the body in place of the listener's, for the read itself, the
@@ -884,24 +911,54 @@ read_body_phase(
     #loop_state{rate_limit = RateLimit, listener_name = ListenerName} = S, Req, Deadline
 ) ->
     case roadrunner_conn:rate_limit(RateLimit, Req, ListenerName) of
-        allow -> route_and_read(S, Req, Deadline);
-        {deny, RetryAfter} -> refuse_rate_limited(S, RetryAfter, roadrunner_conn:body_framing(Req))
+        allow ->
+            admit(S, Req, Deadline);
+        {deny, RetryAfter} ->
+            refuse_retry_later(S, 429, RetryAfter, roadrunner_conn:body_framing(Req))
     end.
 
-%% Over its rate: queued pipelined responses go out first so the 429 + close
-%% cannot overtake them, and the close lingers over a body the client may be
-%% sending.
--spec refuse_rate_limited(
+%% Take the request's in-flight slot when HTTP/1 is under the ceiling
+%% (shed mode), or shed it: 503 + `Retry-After`, counted and reported as a
+%% throttled request, as the multiplexed protocols do.
+-spec admit(#loop_state{}, roadrunner_req:request(), integer()) -> no_return().
+admit(#loop_state{request_slot = undefined} = S, Req, Deadline) ->
+    route_and_read(S, Req, Deadline);
+admit(#loop_state{request_slot = {idle, Max, Counter, Overload}} = S, Req, Deadline) ->
+    case roadrunner_conn:acquire_request_slot(Max, Counter, Overload, h1) of
+        true ->
+            route_and_read(
+                S#loop_state{request_slot = {held, Max, Counter, Overload}}, Req, Deadline
+            );
+        {shed, RetryAfter} ->
+            #loop_state{proto_opts = #{throttled_counter := Throttled}, listener_name = Name} = S,
+            ok = roadrunner_conn:throttled_telemetry(Name, Throttled, max_concurrent_requests),
+            refuse_retry_later(S, 503, RetryAfter, roadrunner_conn:body_framing(Req))
+    end.
+
+%% Hand the request's in-flight slot back once it has ended: before the
+%% next request on a kept-alive connection, or on the way out.
+-spec release_request_slot(#loop_state{}) -> #loop_state{}.
+release_request_slot(#loop_state{request_slot = {held, Max, Counter, Overload}} = S) ->
+    ok = roadrunner_conn:release_request_slot(Max, Counter, Overload),
+    S#loop_state{request_slot = {idle, Max, Counter, Overload}};
+release_request_slot(S) ->
+    S.
+
+%% Over its rate (429) or shed (503): queued pipelined responses go out
+%% first so the response + close cannot overtake them, and the close
+%% lingers over a body the client may be sending.
+-spec refuse_retry_later(
     #loop_state{},
+    429 | 503,
     pos_integer(),
     none
     | chunked
     | {content_length, non_neg_integer()}
     | {error, bad_content_length | bad_transfer_encoding}
 ) -> no_return().
-refuse_rate_limited(#loop_state{socket = Socket} = S, RetryAfter, Framing) ->
+refuse_retry_later(#loop_state{socket = Socket} = S, Status, RetryAfter, Framing) ->
     S1 = flush_out(S),
-    _ = roadrunner_conn:send_rate_limited(Socket, RetryAfter),
+    _ = roadrunner_conn:send_retry_later(Socket, Status, RetryAfter),
     case Framing of
         none -> exit_normal(S1, rejected);
         _ -> exit_lingering(S1, rejected)
@@ -1461,7 +1518,8 @@ buffered_finish(S0, Req, Headers) ->
                     exit_normal(S, normal);
                 keep_alive ->
                     Leftover = pipelined_leftover(Req, S, ManualLeftover),
-                    read_request_phase(S#loop_state{
+                    S1 = release_request_slot(S),
+                    read_request_phase(S1#loop_state{
                         phase = keep_alive,
                         buffered = Leftover
                     })
@@ -1568,7 +1626,8 @@ refuse_too_large(S) ->
 %% (`roadrunner_conn:linger/2`) for the listener's `http1` `linger_timeout`.
 -spec exit_lingering(#loop_state{}, roadrunner_event_handler:close_reason()) -> no_return().
 exit_lingering(#loop_state{socket = Socket, proto_opts = ProtoOpts} = S, Reason) ->
-    S1 = flush_out(S),
+    %% The request is over; its slot is not held through the linger.
+    S1 = flush_out(release_request_slot(S)),
     ok = roadrunner_conn:linger(Socket, maps:get(http1_linger_timeout, ProtoOpts, 1000)),
     exit_normal(S1, Reason).
 
@@ -1615,7 +1674,7 @@ exit_normal(S, Reason) ->
         proto_opts = ProtoOpts,
         conn_span = ConnSpan,
         requests_served = Served
-    } = flush_out(S),
+    } = flush_out(release_request_slot(S)),
     exit_clean(Socket, ProtoOpts, ConnSpan, Served, Reason).
 
 %% Funnel for every clean exit path once the connection was accepted.
