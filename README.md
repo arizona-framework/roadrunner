@@ -481,8 +481,9 @@ Standards conformance:
   [`scripts/h3interop.sh`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/h3interop.sh)
   (downloads, uploads and multiplexed requests from the
   [quiche](https://github.com/cloudflare/quiche) and
-  [ngtcp2](https://github.com/ngtcp2/ngtcp2) clients, plus a key update
-  in the middle of an ngtcp2 download, with and without packet loss).
+  [ngtcp2](https://github.com/ngtcp2/ngtcp2) clients and headless
+  Chrome, plus a key update in the middle of an ngtcp2 download, with
+  and without packet loss).
 - **Content-Encoding (RFC 9110 §8.4.1)**: gzip + deflate with
   qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3),
   works unchanged over HTTP/2.

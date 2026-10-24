@@ -154,16 +154,14 @@ changes by profile-share, not headline req/s.
 ### External interop check
 
 `scripts/h3interop.sh` already gates every PR on the quiche and ngtcp2 clients
-(downloads, uploads, multiplexing, an ngtcp2 key update, with and without packet
-loss). Remaining:
+and headless Chrome (downloads, uploads, multiplexing, an ngtcp2 key update,
+with and without packet loss). Remaining:
 
 - Run the QUIC Interop Runner (quic-interop-runner) on a schedule: a server
   image following its endpoint contract, so every client stack runs its test
   cases (handshake, transfer, retry, resumption, zerortt, chacha20, keyupdate,
   ecn, v2, connection migration) and the unsupported ones show as named gaps
   — medium
-- Add headless Chrome to the interop harness, the client most deployments
-  serve — small-medium
 
 ## HttpArena profile gaps
 
