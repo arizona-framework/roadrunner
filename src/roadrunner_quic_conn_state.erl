@@ -684,14 +684,14 @@ process_outcome(
 process_outcome(_Now, {drop, _Reason}, State) ->
     State;
 process_outcome(_Now, {frame_error, Level, protocol_violation}, State) ->
-    %% A packet-header protocol violation the recv pipeline flagged after the
-    %% packet authenticated (non-zero reserved bits, RFC 9000 §17.2/§17.3.1):
-    %% close with PROTOCOL_VIOLATION.
+    %% A protocol violation the recv pipeline flagged after the packet
+    %% authenticated (non-zero reserved bits, RFC 9000 §17.2/§17.3.1, or no
+    %% frames, §12.4): close with PROTOCOL_VIOLATION.
     connection_fatal(Level, protocol_violation, State);
-process_outcome(_Now, {frame_error, _Level, _Reason}, State) ->
-    %% Other recv-flagged frame errors (a malformed authenticated frame) are
-    %% absorbed for now rather than closing — see docs/roadmap.md.
-    State.
+process_outcome(_Now, {frame_error, Level, _Reason}, State) ->
+    %% A malformed authenticated frame: truncated, of an unknown type, or with
+    %% a field outside its range (RFC 9000 §12.4, §19).
+    connection_fatal(Level, frame_encoding_error, State).
 
 %% A decrypted Handshake packet proves the client received the server's
 %% Initial: lift the 3x anti-amplification limit (RFC 9000 §8.1) and
@@ -758,6 +758,10 @@ process_frame(_Now, application, {max_stream_data, Sid, Max}, State) ->
     on_max_stream_data(Sid, Max, State);
 process_frame(_Now, application, {stop_sending, Sid, ErrorCode}, State) ->
     process_stop_sending(Sid, ErrorCode, State);
+process_frame(_Now, application, {retire_connection_id, Seq}, State) when Seq > 0 ->
+    %% RFC 9000 §19.16: the server never issues a connection ID past the
+    %% handshake's (sequence number 0), so a higher one was never sent.
+    connection_fatal(application, protocol_violation, State);
 process_frame(_Now, _Level, padding, State) ->
     State;
 process_frame(_Now, _Level, ping, State) ->
@@ -920,11 +924,21 @@ queue_frame(Level, Frame, State) ->
     put_space(Level, Space#space{pending = [Frame | Space#space.pending]}, State).
 
 -spec process_ack(integer(), level(), tuple(), t()) -> t().
-process_ack(Now, Level, Ack, #state{cc = Cc} = State) ->
-    Space = space(Level, State),
+process_ack(Now, Level, {ack, Largest, _, _, _, _} = Ack, State) ->
+    case space(Level, State) of
+        #space{next_pn = NextPN} when Largest >= NextPN ->
+            %% RFC 9000 §13.1: an ACK for a packet never sent in this space.
+            connection_fatal(Level, protocol_violation, State);
+        Space ->
+            apply_ack(Now, Level, Ack, Space, State)
+    end.
+
+-spec apply_ack(integer(), level(), tuple(), #space{}, t()) -> t().
+apply_ack(Now, Level, Ack, Space, #state{cc = Cc} = State) ->
     case roadrunner_quic_loss:on_ack_received(Ack, Now, Space#space.loss) of
-        {error, _} ->
-            State;
+        {error, negative_ack_range} ->
+            %% RFC 9000 §19.3.1: a range reaching below packet number 0.
+            connection_fatal(Level, frame_encoding_error, State);
         {Loss, _Acked, Lost} ->
             Cc1 = apply_cc_signal(roadrunner_quic_loss:cc_signal(Loss), Now, Cc),
             put_space(
@@ -1140,6 +1154,7 @@ close_code(Reason) when
     Reason =:= stream_state_error;
     Reason =:= stream_limit_error;
     Reason =:= protocol_violation;
+    Reason =:= frame_encoding_error;
     Reason =:= transport_parameter_error
 ->
     roadrunner_quic_error:code_int(Reason);

@@ -166,24 +166,27 @@ largest_acked_is_monotonic_test() ->
     {Loss2, _, _} = ?M:on_ack_received({ack, 3, 0, 0, []}, 21, Loss1),
     ?assertEqual(5, ?M:largest_acked(Loss2)).
 
-%% A malicious ACK whose ranges would expand hugely is rejected.
-on_ack_received_rejects_oversized_range_test() ->
+%% RFC 9000 §19.3.1: an ACK whose ranges reach below packet number 0 is
+%% rejected, through the first range, a gap range, and a gap range deeper in
+%% the list (which propagates the error back up through the expansion).
+on_ack_received_rejects_negative_range_test() ->
     Loss = send_run(0, 9, ?M:new(#{})),
-    %% Oversized first range; an oversized first gap range; and an
-    %% oversized gap range deeper in the list (which propagates the error
-    %% back up through the range expansion).
+    ?assertEqual({error, negative_ack_range}, ?M:on_ack_received({ack, 9, 0, 10, []}, 20, Loss)),
     ?assertEqual(
-        {error, ack_range_too_large},
-        ?M:on_ack_received({ack, 9, 0, 16#FFFFFFFF, []}, 20, Loss)
+        {error, negative_ack_range}, ?M:on_ack_received({ack, 9, 0, 0, [{7, 1}]}, 20, Loss)
     ),
     ?assertEqual(
-        {error, ack_range_too_large},
-        ?M:on_ack_received({ack, 9, 0, 0, [{0, 16#FFFFFFFF}]}, 20, Loss)
-    ),
-    ?assertEqual(
-        {error, ack_range_too_large},
-        ?M:on_ack_received({ack, 9, 0, 0, [{0, 0}, {0, 16#FFFFFFFF}]}, 20, Loss)
+        {error, negative_ack_range},
+        ?M:on_ack_received({ack, 9, 0, 0, [{0, 0}, {6, 0}]}, 20, Loss)
     ).
+
+%% A range down to exactly packet number 0 is valid, however long.
+on_ack_received_accepts_range_to_zero_test() ->
+    Loss = send_run(0, 9, ?M:new(#{})),
+    {_, Acked, []} = ?M:on_ack_received({ack, 9, 0, 0, [{0, 7}]}, 20, Loss),
+    ?assertEqual(9, length(Acked)),
+    {_, Acked2, []} = ?M:on_ack_received({ack, 100000, 0, 100000, []}, 20, Loss),
+    ?assertEqual(10, length(Acked2)).
 
 %% =============================================================================
 %% Timer-driven loss detection + the loss timer.
