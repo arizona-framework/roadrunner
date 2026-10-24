@@ -1951,7 +1951,8 @@ handle_timeout(_Now, drain, State) ->
 %% send an ack-eliciting probe (RFC 9002 §6.2.4): loss detection only counts
 %% a packet older than one the peer acknowledged, so the last packets of a
 %% flight, if lost, are found only through the ACK a probe draws. The probe
-%% is what was just found lost, else a PING.
+%% is what was just found lost, else the oldest data still unacknowledged,
+%% else a PING.
 -spec on_pto(integer(), level(), t()) -> t().
 on_pto(Now, Level, #state{probes = Probes} = State) ->
     #space{loss = Loss0, pending = Pending} = Space = space(Level, State),
@@ -1963,9 +1964,19 @@ on_pto(Now, Level, #state{probes = Probes} = State) ->
         _ -> put_space(Level, probe(Space1), State#state{probes = Probes + 1})
     end.
 
+%% With nothing found lost, probe with the oldest unacknowledged data rather
+%% than a PING (RFC 9002 §6.2.4): if that packet was lost, the probe already
+%% carries what the peer is missing, instead of only drawing the ACK that
+%% shows it lost and costing a round trip more. A PING only when no such data
+%% is in flight.
 -spec probe(#space{}) -> #space{}.
-probe(#space{pending = []} = Space) -> Space#space{pending = [ping]};
-probe(Space) -> Space.
+probe(#space{pending = [], loss = Loss} = Space) ->
+    case retransmittable(roadrunner_quic_loss:oldest_ack_eliciting(Loss)) of
+        [] -> Space#space{pending = [ping]};
+        Resend -> Space#space{pending = Resend}
+    end;
+probe(Space) ->
+    Space.
 
 %% Arm ONE timer at the nearest deadline: the earliest per-space probe timeout
 %% (across spaces with ack-eliciting bytes in flight) or the always-present

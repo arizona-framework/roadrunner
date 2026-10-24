@@ -233,6 +233,15 @@ pto_deadline_counts_from_last_ack_eliciting_send_test() ->
     ?assertEqual(1500 + ?M:get_pto(Later), ?M:pto_deadline(Later)),
     ?assertEqual(undefined, ?M:pto_deadline(?M:on_packet_sent(0, 40, false, d0, 0, ?M:new(#{})))).
 
+%% RFC 9002 §6.2.4: the data a probe can carry again is the oldest
+%% unacknowledged ack-eliciting packet's, skipping ACK-only packets.
+oldest_ack_eliciting_test() ->
+    ?assertEqual([], ?M:oldest_ack_eliciting(?M:new(#{}))),
+    AckOnly = ?M:on_packet_sent(0, 40, false, d0, 0, ?M:new(#{})),
+    ?assertEqual([], ?M:oldest_ack_eliciting(AckOnly)),
+    Mixed = ?M:on_packet_sent(2, 100, true, d2, 2, ?M:on_packet_sent(1, 100, true, d1, 1, AckOnly)),
+    ?assertEqual([d1], ?M:oldest_ack_eliciting(Mixed)).
+
 send_run(First, Last, Loss) ->
     lists:foldl(
         fun(PN, Acc) -> ?M:on_packet_sent(PN, 100, true, PN, PN, Acc) end,

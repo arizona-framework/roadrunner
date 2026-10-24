@@ -29,6 +29,7 @@
     get_pto/1,
     pto_deadline/1,
     on_pto_expired/1,
+    oldest_ack_eliciting/1,
     smoothed_rtt/1,
     rtt_var/1,
     latest_rtt/1,
@@ -330,6 +331,21 @@ pto_deadline(#loss{bytes_in_flight = 0}) ->
     undefined;
 pto_deadline(#loss{last_ack_eliciting_at = At} = Loss) ->
     At + get_pto(Loss).
+
+-doc """
+The caller data of the oldest unacknowledged ack-eliciting packet, which a
+probe can carry again (RFC 9002 §6.2.4): a one-element list, or `[]` if no
+such packet is in flight (the same shape as the lost data `detect_lost/2`
+returns).
+""".
+-spec oldest_ack_eliciting(t()) -> [term()].
+oldest_ack_eliciting(#loss{sent = Sent}) ->
+    case
+        lists:search(fun(#sent{ack_eliciting = Eliciting}) -> Eliciting end, queue:to_list(Sent))
+    of
+        {value, #sent{data = Data}} -> [Data];
+        false -> []
+    end.
 
 -doc "Record a PTO expiry, which doubles the next probe timeout.".
 -spec on_pto_expired(t()) -> t().
