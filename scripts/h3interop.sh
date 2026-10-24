@@ -399,11 +399,16 @@ run_ngtcp2() {
             exit \$rc"
 }
 
-# Kill the listener's node outright, so no connection says goodbye, once a
-# client has had time to connect, and start another on the same port with the
-# same secret.
+# Kill the listener's node outright, so no connection says goodbye, once the
+# client logged in `$1` has completed its handshake (waiting a fixed time
+# raced a slow container start, killing the node before the client had
+# connected at all), and start another on the same port with the same
+# secret. The client holds its request back long enough for the restart.
 restart_listener() {
-    sleep 1
+    for _ in $(seq 1 200); do
+        grep -q "QUIC handshake has completed" "$1" 2>/dev/null && break
+        sleep 0.1
+    done
     kill -9 "$SHELL_PID"
     wait "$SHELL_PID" 2>/dev/null || true
     start_listener "$PORT"
@@ -460,7 +465,7 @@ for client in quiche ngtcp2 chrome; do
             # counts.
             "run_$client" "$name" "$dir" >"$log" 2>&1 &
             run_pid=$!
-            restart_listener
+            restart_listener "$log"
             wait "$run_pid" || true
             ran=true
         elif "run_$client" "$name" "$dir" >"$log" 2>&1; then
