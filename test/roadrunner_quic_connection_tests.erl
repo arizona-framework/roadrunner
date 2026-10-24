@@ -26,6 +26,9 @@ shell_test_() ->
         fun cast_ignored/1,
         fun stray_message_ignored/1,
         fun stale_timer_fire_ignored/1,
+        fun later_deadline_keeps_armed_timer/1,
+        fun earlier_deadline_rearms_timer/1,
+        fun early_fire_rearms_for_deadline/1,
         fun loss_timer_fires/1
     ]}.
 
@@ -189,8 +192,63 @@ stray_message_ignored(#{shell := Shell}) ->
 stale_timer_fire_ignored(#{shell := Shell}) ->
     fun() ->
         %% A timer fire whose ref is not the armed one is dropped.
-        Shell ! {?CONN, timer, pto, make_ref()},
+        Shell ! {timeout, make_ref(), ?CONN},
         ?assert(still_running(Shell))
+    end.
+
+%% The shell's timer fields, read through sys (#shell{timer, deadline}).
+timer_state(Shell) ->
+    State = sys:get_state(Shell),
+    {element(5, State), element(6, State)}.
+
+%% Feed the ClientHello so the shell sends its flight and arms a PTO.
+start_handshake(Shell, Peer, ClientSocket, Ctx) ->
+    {InitialDatagram, _ClientHelloFramed} = client_hello(Ctx),
+    Shell ! {quic_datagram, Peer, InitialDatagram},
+    _Flight = recv_all(ClientSocket),
+    InitialDatagram.
+
+later_deadline_keeps_armed_timer(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
+    fun() ->
+        %% A deadline at or after the armed time leaves the timer running: a
+        %% duplicate Initial moves the PTO deadline no earlier, and the armed
+        %% timer and its time stay the same.
+        InitialDatagram = start_handshake(Shell, Peer, ClientSocket, Ctx),
+        {{TRef, ArmedAt}, {pto, _}} = timer_state(Shell),
+        Shell ! {quic_datagram, Peer, InitialDatagram},
+        {Timer, {pto, AtMs}} = timer_state(Shell),
+        ?assertEqual({TRef, ArmedAt}, Timer),
+        ?assert(AtMs >= ArmedAt)
+    end.
+
+earlier_deadline_rearms_timer(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
+    fun() ->
+        %% With the timer armed far in the future, a nearer deadline cancels
+        %% it and arms a new one at the deadline.
+        InitialDatagram = start_handshake(Shell, Peer, ClientSocket, Ctx),
+        {{TRef, _ArmedAt}, _} = timer_state(Shell),
+        Far = erlang:monotonic_time(millisecond) + 3600000,
+        _ = sys:replace_state(Shell, fun(State) -> setelement(5, State, {TRef, Far}) end),
+        Shell ! {quic_datagram, Peer, InitialDatagram},
+        {{TRef1, ArmedAt1}, {pto, AtMs}} = timer_state(Shell),
+        ?assertNotEqual(TRef, TRef1),
+        ?assertEqual(AtMs, ArmedAt1),
+        ?assertEqual(false, erlang:read_timer(TRef))
+    end.
+
+early_fire_rearms_for_deadline(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
+    fun() ->
+        %% A timer that fires before the current deadline does not run the
+        %% core; it is re-armed for the deadline.
+        _ = start_handshake(Shell, Peer, ClientSocket, Ctx),
+        {{TRef, _ArmedAt}, {pto, _}} = timer_state(Shell),
+        Later = erlang:monotonic_time(millisecond) + 3600000,
+        _ = sys:replace_state(Shell, fun(State) -> setelement(6, State, {pto, Later}) end),
+        Shell ! {timeout, TRef, ?CONN},
+        {{TRef1, ArmedAt1}, Deadline} = timer_state(Shell),
+        ?assertNotEqual(TRef, TRef1),
+        ?assertEqual(Later, ArmedAt1),
+        ?assertEqual({pto, Later}, Deadline)
     end.
 
 loss_timer_fires(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
