@@ -1309,6 +1309,38 @@ stop_sending_for_untracked_stream_ignored_test() ->
     {State1, _Effects} = ?M:handle_datagram(?NOW, Stop, State),
     ?assertEqual(connected, ?M:phase(State1)).
 
+%% RFC 9000 §19.5 / §19.10: STOP_SENDING or MAX_STREAM_DATA naming a stream
+%% the server cannot send on is a STREAM_STATE_ERROR: a client unidirectional
+%% stream (receive-only, id 2), a server bidirectional stream (never opened,
+%% id 1), or a server unidirectional stream not opened yet (id 3).
+unsendable_stream_frame_closes_test_() ->
+    [
+        ?_test(assert_stream_state_error(Frame))
+     || Frame <- [
+            {stop_sending, 2, 7},
+            {max_stream_data, 2, 1000},
+            {stop_sending, 1, 7},
+            {max_stream_data, 1, 1000},
+            {stop_sending, 3, 7},
+            {max_stream_data, 3, 1000}
+        ]
+    ].
+
+assert_stream_state_error(Frame) ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    {State1, Effects} = ?M:handle_datagram(?NOW, app_datagram([Frame], 0, ClientApSecret), State),
+    ?assertEqual(draining, ?M:phase(State1)),
+    ?assertEqual([{emit, self(), {closed, {local, stream_state_error}}}], emits(Effects)).
+
+%% Once the server has opened its unidirectional stream 3, both frames may
+%% name it.
+opened_server_uni_stream_frames_accepted_test() ->
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    {State1, _} = ?M:handle_call(self(), make_ref(), open_uni, ?NOW, State),
+    Frames = [{max_stream_data, 3, 1000}, {stop_sending, 3, 7}],
+    {State2, _Effects} = ?M:handle_datagram(?NOW, app_datagram(Frames, 0, ClientApSecret), State1),
+    ?assertEqual(connected, ?M:phase(State2)).
+
 %% The final FIN-carrying push parks under the congestion window, then releases
 %% ok once the window opens; the FIN reaches the wire (loop termination does not
 %% deadlock).

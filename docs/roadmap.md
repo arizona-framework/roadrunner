@@ -122,12 +122,10 @@ advisory or malformed cases the server currently tolerates or omits.
 - Honor the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` when sizing response
   headers (RFC 9114 §4.2.2) — small-medium
 - Pass the h3spec cases listed as known failures in `scripts/h3spec.sh`:
-  STOP_SENDING and MAX_STREAM_DATA naming a stream in the wrong state are
-  absorbed instead of closing the connection (RFC 9000 §19.5, §19.10), there
-  is no CRYPTO buffer limit (§7.5), and a KeyUpdate or
+  there is no CRYPTO buffer limit (RFC 9000 §7.5), and a KeyUpdate or
   EndOfEarlyData during the handshake gets no `unexpected_message` alert
   (RFC 9001 §6, §8.3). Check each case against the RFC before fixing, and
-  drop its line from the list in the same PR — medium
+  drop its line from the list in the same PR — small
 
 ### Transport completeness — bites large transfers / advanced cases
 
