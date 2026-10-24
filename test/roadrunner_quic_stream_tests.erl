@@ -240,6 +240,25 @@ is_terminal_test() ->
     {ok, ResetDone} = ?M:reset(0, SendDone),
     ?assert(?M:is_terminal(ResetDone)).
 
+%% A stream owes a send once the peer started it (delivered bytes, a buffered
+%% gap above the cursor, or a final size alone), until our FIN is on the wire
+%% or either side abandons the stream.
+send_owed_test() ->
+    ?assertNot(?M:send_owed(?M:new())),
+    {ok, _, false, Delivered} = ?M:receive_data(0, ~"req", false, ?M:new()),
+    ?assert(?M:send_owed(Delivered)),
+    {ok, <<>>, false, Gap} = ?M:receive_data(5, ~"later", false, ?M:new()),
+    ?assert(?M:send_owed(Gap)),
+    {ok, <<>>, true, FinOnly} = ?M:receive_data(0, <<>>, true, ?M:new()),
+    ?assert(?M:send_owed(FinOnly)),
+    %% A FIN queued but not yet sent still owes.
+    ?assert(?M:send_owed(?M:finish(?M:enqueue(~"resp", Delivered)))),
+    {_, _, true, Answered} = ?M:next_frame(100, ?M:finish(?M:enqueue(~"resp", Delivered))),
+    ?assertNot(?M:send_owed(Answered)),
+    {ok, Reset} = ?M:reset(3, Delivered),
+    ?assertNot(?M:send_owed(Reset)),
+    ?assertNot(?M:send_owed(?M:stop_sending(Delivered))).
+
 %% A response enqueued + finished on a sender drains into small slices that
 %% reassemble, in order, to the original bytes with the FIN on the receiver.
 send_recv_round_trip_test() ->

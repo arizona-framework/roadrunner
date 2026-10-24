@@ -110,6 +110,7 @@
     handle_timeout/3,
     handle_call/5,
     handle_send/7,
+    handle_send_final/4,
     handle_consumed/4,
     peername/1,
     phase/1,
@@ -364,6 +365,12 @@
     %% second `send_data` outstanding. Released by `release_drained/1` (drain
     %% or abort) and `release_all/2` (connection teardown).
     parked = #{} :: #{non_neg_integer() => {pid(), reference()}},
+    %% The owner's graceful close (`{close_when_done, Code, Reason}`): the
+    %% application CONNECTION_CLOSE to send once every response is out, that
+    %% is once no stream holds unsent bytes and no client request stream
+    %% still waits on its response (`responses_done/1`). Checked at the end
+    %% of each send pass while set; `undefined` otherwise.
+    close_when_done = undefined :: {non_neg_integer(), binary()} | undefined,
     %% Next server-initiated unidirectional stream id to hand out (RFC 9000
     %% §2.1: server uni ids are 3, 7, 11, ...); the owner opens its h3
     %% control stream this way.
@@ -492,14 +499,15 @@
 %% `closed` is the terminal event: `{peer, ErrorCode}` is a peer
 %% CONNECTION_CLOSE, `{peer, stateless_reset}` a client's stateless reset
 %% (RFC 9000 §10.3), `{local, Reason}` a connection error we detected
-%% (idle-timeout joins them later).
+%% (idle-timeout joins them later), and `drained` the owner's graceful close
+%% going out once every response was sent.
 -type event() ::
     {connected, info()}
     | {stream_opened, non_neg_integer()}
     | {stream_data, non_neg_integer(), binary(), boolean()}
     | {stream_reset, non_neg_integer(), non_neg_integer()}
     | {peer_changed, address()}
-    | {closed, {peer, non_neg_integer() | stateless_reset} | {local, atom()}}.
+    | {closed, {peer, non_neg_integer() | stateless_reset} | {local, atom()} | drained}.
 
 %% The `connected` payload. The h3 owner ignores it; it carries the
 %% negotiated ALPN and the advertised transport params for forward-compat.
@@ -966,7 +974,8 @@ with async `{emit, _, _}` effects, so it never blocks on the owner.
         | {reset_stream, non_neg_integer(), non_neg_integer()}
         | {stop_sending, non_neg_integer(), non_neg_integer()}
         | {close, non_neg_integer()}
-        | {close, non_neg_integer(), binary()}.
+        | {close, non_neg_integer(), binary()}
+        | {close_when_done, non_neg_integer(), binary()}.
 handle_call(From, Ref, peername, _Now, #state{peer = Peer} = State) ->
     {State, [{reply, From, Ref, {ok, Peer}}]};
 handle_call(From, Ref, {set_owner, Owner}, _Now, State) ->
@@ -998,7 +1007,19 @@ handle_call(From, Ref, {close, ErrorCode}, Now, State) ->
     {State1, [{reply, From, Ref, ok} | CloseEffects]};
 handle_call(From, Ref, {close, ErrorCode, Reason}, Now, State) ->
     {State1, CloseEffects} = owner_close(ErrorCode, Reason, Now, State),
-    {State1, [{reply, From, Ref, ok} | CloseEffects]}.
+    {State1, [{reply, From, Ref, ok} | CloseEffects]};
+handle_call(
+    From, Ref, {close_when_done, ErrorCode, Reason}, Now, #state{phase = connected} = State
+) ->
+    %% A graceful close (RFC 9114 §5.2): the owner sent its GOAWAY and closes
+    %% once the requests it accepted are answered. The answers are on this
+    %% connection's streams, so it is this side that sees the last one go:
+    %% the send pass closes as soon as none is left, here when none is.
+    {State1, Effects} = send_pass(Now, State#state{close_when_done = {ErrorCode, Reason}}),
+    {State1, [{reply, From, Ref, ok} | Effects]};
+handle_call(From, Ref, {close_when_done, _ErrorCode, _Reason}, _Now, State) ->
+    %% Already closing: the owner hears that close's own {closed, _}.
+    {State, [{reply, From, Ref, ok}]}.
 
 -doc """
 The owner consumed `Bytes` of a request stream whose credit it holds
@@ -1110,6 +1131,20 @@ handle_send(From, Ref, Sid, IoData, Fin, Now, State) ->
         {reply, Result} ->
             {State2, [{reply, From, Ref, Result} | SendEffects]}
     end.
+
+-doc """
+Buffer a stream's final write, with its FIN, and run a send pass: the shell
+forwards `{quic_send_final, Sid, IoData}` here. Unlike `handle_send/7` it is
+never answered, so it never parks: the writer (a stream worker's buffered
+response) has nothing left to send, and the connection owns the bytes from
+here, including any that flow control holds back. Dropped on a draining
+connection, which sends no application data (RFC 9000 §10.2.2).
+""".
+-spec handle_send_final(non_neg_integer(), iodata(), integer(), t()) -> {t(), [effect()]}.
+handle_send_final(_Sid, _IoData, _Now, #state{phase = draining} = State) ->
+    {State, []};
+handle_send_final(Sid, IoData, Now, State) ->
+    send_pass(Now, enqueue_send(Sid, IoData, true, State)).
 
 %% Decide a send's reply: park (withhold) it iff this is a client-initiated
 %% bidi request stream (`Sid rem 4 =:= 0`, where response workers write) that
@@ -2895,9 +2930,10 @@ send_pass(Now, #state{phase = Before} = State) ->
             {State2, Releases} = release_drained(State1),
             %% `drain_send` returns the send effects newest-first; reverse them
             %% into order and fold the releases + the (single) timer effect
-            %% onto the end in the same pass, rather than a second traversal
-            %% to append them.
-            {State2, lists:reverse(RevSends, Releases ++ timer_effects(State2))};
+            %% (or a graceful close) onto the end in the same pass, rather than
+            %% a second traversal to append them.
+            {State3, Tail} = pass_tail(Now, State2),
+            {State3, lists:reverse(RevSends, Releases ++ Tail)};
         {State1, RevSends} ->
             %% The send keys reached the confidentiality limit with no key
             %% update allowed (`key_limit/3`): the connection closed mid-pass.
@@ -2905,6 +2941,60 @@ send_pass(Now, #state{phase = Before} = State) ->
             %% would for a close found while folding a datagram.
             {State2, Effects} = finish_datagram(Now, Before, State1),
             {State2, lists:reverse(RevSends, Effects)}
+    end.
+
+%% What follows a send pass's sends: the (single) timer effect, or, when the
+%% owner asked for a graceful close and the last response just went out, the
+%% CONNECTION_CLOSE with its drain timer and the `{closed, drained}` that
+%% tells the owner the close happened. The parked replies are all released
+%% by then: a parked stream holds unsent bytes, so it holds the close too.
+-spec pass_tail(integer(), t()) -> {t(), [effect()]}.
+pass_tail(_Now, #state{close_when_done = undefined} = State) ->
+    {State, timer_effects(State)};
+pass_tail(Now, #state{close_when_done = {ErrorCode, Reason}, owner = Owner} = State) ->
+    case responses_done(State) of
+        true ->
+            {State1, CloseEffects} = send_owner_close(
+                ErrorCode, Reason, Now, State#state{close_when_done = undefined}
+            ),
+            {State1, CloseEffects ++ [{emit, Owner, {closed, drained}}]};
+        false ->
+            {State, timer_effects(State)}
+    end.
+
+%% Every response is delivered: no stream holds unsent bytes or an unsent FIN
+%% (the `sendable` set, so bytes flow control holds back keep the connection
+%% open, the owner's own control-stream GOAWAY among them), no client request
+%% stream (RFC 9000 §2.1: `Sid rem 4 =:= 0`) the peer started still waits on
+%% our FIN, and the peer has acknowledged everything sent, with nothing lost
+%% left to resend. A CONNECTION_CLOSE ends retransmission (RFC 9000 §10.2),
+%% so closing once the last FIN is only sent would cut short a response whose
+%% last packet is lost; a graceful shutdown lets requests complete (RFC 9114
+%% §5.2). A response whose final write is still on its way to this
+%% connection leaves its stream waiting, so a close never overtakes it. A
+%% stream reset by either side waits on nothing (`send_owed/1`). A peer that
+%% never acknowledges is bounded by the listener's drain deadline.
+-spec responses_done(t()) -> boolean().
+responses_done(#state{sendable = [], streams = Streams} = State) ->
+    all_acknowledged(space(application, State)) andalso
+        no_response_owed(maps:next(maps:iterator(Streams)));
+responses_done(#state{}) ->
+    false.
+
+%% Nothing ack-eliciting the peer has yet to acknowledge, and nothing found
+%% lost waiting to go out again (after a send pass, only the
+%% anti-amplification limit of a path being validated can hold it back).
+-spec all_acknowledged(#space{}) -> boolean().
+all_acknowledged(#space{pending = Pending, loss = Loss}) ->
+    Pending =:= [] andalso roadrunner_quic_loss:bytes_in_flight(Loss) =:= 0.
+
+-spec no_response_owed(none | {non_neg_integer(), stream(), maps:iterator()}) -> boolean().
+no_response_owed(none) ->
+    true;
+no_response_owed({Sid, {Stream, _Flow}, Iter}) ->
+    case Sid rem 4 =:= 0 andalso roadrunner_quic_stream:send_owed(Stream) of
+        true -> false;
+        false -> no_response_owed(maps:next(Iter))
     end.
 
 %% Release each parked reply whose stream can no longer make progress toward

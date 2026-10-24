@@ -9,9 +9,11 @@
 %% tagged round-trip with a temporary monitor. A control request goes as
 %% `{quic_call, self(), Ref, Request}` and a stream write as `{quic_send,
 %% self(), Ref, Sid, IoData, Fin}`; both are answered by the connection with
-%% `{quic_reply, Ref, Result}`. The connection only ever sends to its owner
-%% asynchronously (`{quic, Conn, Event}`), so these synchronous calls never
-%% deadlock: the call tree is one-directional (owner/worker -> connection).
+%% `{quic_reply, Ref, Result}`. A stream's final write can go one way instead
+%% (`{quic_send_final, Sid, IoData}`, never answered). The connection only
+%% ever sends to its owner asynchronously (`{quic, Conn, Event}`), so these
+%% synchronous calls never deadlock: the call tree is one-directional
+%% (owner/worker -> connection).
 %%
 %% A connection that dies before replying exits the caller with
 %% `{quic_conn_down, Reason}`, the same shape `gen_statem:call` gives for a
@@ -21,11 +23,13 @@
     peername/1,
     open_unidirectional_stream/1,
     send_data/4,
+    send_final/3,
     reset_stream/3,
     stop_sending/3,
     consumed/3,
     close/2,
-    close/3
+    close/3,
+    close_when_done/3
 ]).
 
 -doc "The connection's peer address. Answers in the handshaking phase, before connected.".
@@ -53,6 +57,18 @@ send_data(Conn, StreamId, IoData, Fin) ->
     Mon = monitor(process, Conn),
     _ = Conn ! {quic_send, self(), Ref, StreamId, IoData, Fin},
     await(Conn, Ref, Mon).
+
+-doc """
+Write a stream's last data (an iolist of h3 frames) and finish it, one way:
+nothing is answered, so the writer neither waits for the connection nor
+gets back-pressure. For a writer with nothing left to send on the stream
+(a buffered response); the connection sends the bytes as flow control
+allows. A graceful close waits for them (`close_when_done/3`).
+""".
+-spec send_final(pid(), non_neg_integer(), iodata()) -> ok.
+send_final(Conn, StreamId, IoData) ->
+    _ = Conn ! {quic_send_final, StreamId, IoData},
+    ok.
 
 -doc "Abort the send side of a stream with a RESET_STREAM carrying the h3 error code.".
 -spec reset_stream(pid(), non_neg_integer(), non_neg_integer()) -> ok.
@@ -84,6 +100,17 @@ close(Conn, ErrorCode) ->
 -spec close(pid(), non_neg_integer(), binary()) -> ok.
 close(Conn, ErrorCode, Reason) ->
     call(Conn, {close, ErrorCode, Reason}).
+
+-doc """
+Close the connection gracefully with an h3 error code and a reason phrase:
+the CONNECTION_CLOSE goes out once every response is sent, that is once no
+stream holds unsent bytes and every client request stream the peer started
+has its FIN on the wire or was reset. The owner then gets `{closed,
+drained}`. A connection already closing just answers `ok`.
+""".
+-spec close_when_done(pid(), non_neg_integer(), binary()) -> ok.
+close_when_done(Conn, ErrorCode, Reason) ->
+    call(Conn, {close_when_done, ErrorCode, Reason}).
 
 %% =============================================================================
 %% Internal

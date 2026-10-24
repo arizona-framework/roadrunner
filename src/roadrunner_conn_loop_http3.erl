@@ -43,9 +43,14 @@
 %% On a graceful drain (a `{roadrunner_drain, _}` message from the
 %% listener) it sends a GOAWAY on its control stream (RFC 9114 §5.2),
 %% refuses request streams opened at or beyond the GOAWAY id with
-%% H3_REQUEST_REJECTED, lets in-flight requests finish, and then closes
-%% the connection; the listener force-exits it at the deadline if a
-%% request is still running.
+%% H3_REQUEST_REJECTED, lets in-flight requests finish, and asks the QUIC
+%% connection to close once it has sent every response
+%% (`roadrunner_quic:close_when_done/3`); the listener force-exits it at
+%% the deadline if a request is still running. The QUIC connection, not
+%% this loop, decides when the last response is out: a worker's buffered
+%% response goes to it one way, so the worker's exit (which releases the
+%% request's in-flight slot here) can come before the connection has the
+%% bytes, and flow control can hold them after.
 %%
 %% All response shapes are supported (buffered, `stream`, `loop`,
 %% `sendfile`). WebSocket over h3 (RFC 9220 Extended CONNECT) is not
@@ -254,18 +259,7 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
     }).
 
 -spec loop(#h3{}) -> ok.
-loop(State) ->
-    case is_drained(State) of
-        true ->
-            %% Graceful drain complete (RFC 9114 §5.2): GOAWAY was sent
-            %% and no request remains in flight — close cleanly.
-            close_connection(State, ?H3_NO_ERROR, ~"graceful shutdown", drained);
-        false ->
-            recv_loop(State)
-    end.
-
--spec recv_loop(#h3{}) -> ok.
-recv_loop(#h3{conn = Conn} = State) ->
+loop(#h3{conn = Conn} = State) ->
     receive
         {quic, Conn, {connected, _Info}} ->
             case send_control_stream(State) of
@@ -374,9 +368,10 @@ send_settings(#h3{conn = Conn, max_field_section_size = MaxFieldSection} = State
 %% control stream for a GOAWAY and no request yet, so it is closed outright
 %% (silently: QUIC sends nothing before the handshake keys exist), which
 %% frees its slot at once. An established connection drains gracefully:
-%% GOAWAY, refuse new requests, let in-flight ones finish (the `loop/1`
-%% head closes the connection once they do). The listener force-exits us
-%% at the deadline if a request is still running then.
+%% GOAWAY, refuse new requests, let in-flight ones finish, and the QUIC
+%% connection closes once their responses are out, ending this loop with
+%% `{closed, drained}`. The listener force-exits us at the deadline if a
+%% request is still running then.
 -spec drain(#h3{}) -> ok.
 drain(#h3{control_stream_id = undefined} = State) ->
     close_connection(State, ?H3_NO_ERROR, ~"graceful shutdown", drained);
@@ -386,11 +381,22 @@ drain(State) ->
 %% Begin a graceful drain (RFC 9114 §5.2): send a GOAWAY on the control
 %% stream naming the first request-stream id we will not process
 %% (`last_request_id + 4`, the next client-initiated bidirectional id),
-%% and mark the connection draining so later request streams are
-%% refused. Re-sending the same id on a repeated drain is harmless and
-%% RFC-compliant (the id never increases — refused streams are not
-%% counted). The control stream exists here: `drain/1` closes a
-%% connection that has not reached `connected` (which opens it).
+%% mark the connection draining so later request streams are refused, and
+%% have the QUIC connection close once every response is sent. Re-sending
+%% the same id on a repeated drain is harmless and RFC-compliant (the id
+%% never increases — refused streams are not counted). The control stream
+%% exists here: `drain/1` closes a connection that has not reached
+%% `connected` (which opens it).
+%%
+%% The close waits on the QUIC connection's streams rather than on this
+%% loop's workers: every request accepted below the GOAWAY id still owes a
+%% response on its stream until its FIN is sent or the stream is reset,
+%% whether its worker is running, gone with its bytes held by flow control,
+%% or gone with its final write still on the way (that write and the
+%% worker's `'DOWN'` go to different processes, so either can come first).
+%% A request parked for an in-flight slot, or still being received, owes
+%% one too. A request at or beyond the GOAWAY id is reset when it arrives,
+%% so it holds nothing open.
 -spec start_drain(#h3{}) -> #h3{}.
 start_drain(#h3{conn = Conn, control_stream_id = CtrlId, last_request_id = LastId} = State) when
     is_integer(CtrlId)
@@ -399,23 +405,8 @@ start_drain(#h3{conn = Conn, control_stream_id = CtrlId, last_request_id = LastI
     _ = roadrunner_quic:send_data(
         Conn, CtrlId, roadrunner_quic_h3_frame:encode_goaway(GoawayId), false
     ),
+    ok = roadrunner_quic:close_when_done(Conn, ?H3_NO_ERROR, ~"graceful shutdown"),
     State#h3{goaway_id = GoawayId}.
-
-%% A draining connection is done once no request is in flight — neither
-%% mid-receive (`streams`) nor awaiting a worker response (`worker_refs`).
--spec is_drained(#h3{}) -> boolean().
-is_drained(#h3{goaway_id = undefined}) ->
-    false;
-is_drained(#h3{streams = Streams, worker_refs = WorkerRefs, awaiting_slot = Awaiting}) ->
-    %% A request parked for an in-flight slot is in neither `streams` (it
-    %% is fully received) nor `worker_refs` (no worker yet), but it has
-    %% been accepted and still owes the client a response. Leaving it out
-    %% here would close the connection under it, silently dropping a
-    %% request the peer sent before the GOAWAY. Its wait is bounded by
-    %% the queue deadline, and the listener force-closes at the drain
-    %% deadline regardless.
-    map_size(Streams) =:= 0 andalso map_size(WorkerRefs) =:= 0 andalso
-        map_size(Awaiting) =:= 0.
 
 %% Track the highest request stream id accepted, for the drain GOAWAY id.
 -spec note_request_id(#h3{}, non_neg_integer()) -> #h3{}.
@@ -573,8 +564,7 @@ send_continue(State, StreamId) ->
 %% is asked to stop, and the stream is marked `discarding` so residual body
 %% is dropped rather than mistaken for a new request; its FIN or reset frees
 %% the marker. When the FIN came with this chunk, nothing more arrives on
-%% the stream, so it is dropped now: a marker would never be freed, and
-%% would hold a graceful drain open until its deadline.
+%% the stream, so it is dropped now: a marker would never be freed.
 -spec refuse_request(
     #h3{}, non_neg_integer(), map(), boolean(), roadrunner_http:status(), binary()
 ) -> #h3{}.
@@ -1409,8 +1399,9 @@ give_back_slot(State) ->
     ),
     State.
 
-%% A worker exit: normal means it sent its response with the stream FIN
-%% (drop the stream); abnormal (QPACK decompression, malformed
+%% A worker exit: normal means it handed its response, FIN included, to the
+%% QUIC connection (drop the stream; the connection sends what flow control
+%% still holds); abnormal (QPACK decompression, malformed
 %% pseudo-headers, response encoding) resets the stream, leaving the
 %% connection's other streams untouched.
 -spec handle_worker_down(#h3{}, reference(), term()) -> #h3{}.
@@ -1491,10 +1482,12 @@ close_connection(#h3{conn = Conn} = State, ErrorCode, Reason, CloseReason) ->
 conn_error(State, ErrorCode, Reason) ->
     close_connection(State, ErrorCode, Reason, {protocol_error, ErrorCode}).
 
-%% The QUIC connection's own close: the peer's CONNECTION_CLOSE or
-%% stateless reset, the idle timeout, or a local transport failure.
--spec closed_reason({peer, non_neg_integer() | stateless_reset} | {local, atom()}) ->
+%% The QUIC connection's own close: the graceful close of a drain once its
+%% last response went out, the peer's CONNECTION_CLOSE or stateless reset,
+%% the idle timeout, or a local transport failure.
+-spec closed_reason({peer, non_neg_integer() | stateless_reset} | {local, atom()} | drained) ->
     roadrunner_event_handler:close_reason().
+closed_reason(drained) -> drained;
 closed_reason({peer, _ErrorCode}) -> peer_closed;
 closed_reason({local, idle_timeout}) -> keep_alive_timeout;
 closed_reason(Reason) -> {transport, Reason}.

@@ -36,7 +36,9 @@
 %% Synchronous control calls from the owner or listener arrive as
 %% `{quic_call, From, Ref, Request}` and stream writes as `{quic_send, From,
 %% Ref, Sid, IoData, Fin}`; both are answered with a `{reply, From, Ref,
-%% Result}` effect (delivered as `From ! {quic_reply, Ref, Result}`). Owner
+%% Result}` effect (delivered as `From ! {quic_reply, Ref, Result}`). A
+%% stream's final write can instead come one way, as `{quic_send_final, Sid,
+%% IoData}`, which is never answered. Owner
 %% notifications go out as async `{emit, Owner, Event}` effects (`Owner !
 %% {quic, self(), Event}`). The connection only ever sends to the owner
 %% asynchronously, so it never blocks on it.
@@ -108,6 +110,12 @@ loop(State) ->
             Now = erlang:monotonic_time(millisecond),
             {Conn, Effects} = roadrunner_quic_conn_state:handle_send(
                 From, Ref, Sid, IoData, Fin, Now, State#shell.conn
+            ),
+            continue(perform(Effects, Now, State#shell{conn = Conn}));
+        {quic_send_final, Sid, IoData} ->
+            Now = erlang:monotonic_time(millisecond),
+            {Conn, Effects} = roadrunner_quic_conn_state:handle_send_final(
+                Sid, IoData, Now, State#shell.conn
             ),
             continue(perform(Effects, Now, State#shell{conn = Conn}));
         {quic_consumed, Sid, Bytes} ->
