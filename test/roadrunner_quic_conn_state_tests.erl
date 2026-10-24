@@ -1308,6 +1308,21 @@ ack_timeout_while_draining_sends_nothing_test() ->
     ?assertEqual(draining, ?M:phase(State2)),
     ?assertEqual({State2, []}, ?M:handle_timeout(?NOW + 20, ack, State2)).
 
+%% RFC 9002 §7: ACK-only packets are not congestion controlled. With the window
+%% full of unacknowledged data, a due ACK still goes out on its own instead of
+%% waiting behind the stream data it would have ridden with, which the window
+%% holds back.
+ack_goes_out_alone_when_window_blocks_data_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, _} = ?M:handle_send(
+        self(), make_ref(), 0, binary:copy(~"x", 100000), false, ?NOW, State
+    ),
+    {State2, _} = ?M:handle_datagram(?NOW, app_datagram([ping], 0, ClientApSecret), State1),
+    {_State3, Effects} = ?M:handle_datagram(?NOW, app_datagram([ping], 1, ClientApSecret), State2),
+    Frames = sent_app_frames(Effects, ServerApSecret),
+    ?assert(lists:any(fun is_ack/1, Frames)),
+    ?assertEqual([], [F || {stream, _, _, _, _} = F <- Frames]).
+
 max_stream_data_for_untracked_stream_ignored_test() ->
     %% A MAX_STREAM_DATA grant for a stream the server is not tracking is ignored
     %% (on_max_stream_data's unknown-id branch); the connection survives.
