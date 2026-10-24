@@ -968,10 +968,19 @@ pto_backoff_advances_deadline_test() ->
     %% (RFC 9002 §6.2.1 exponential backoff), never re-fire at the same past
     %% deadline. Two fires at the same clock prove the deadline advances, so
     %% the shell never busy-spins on send_after(0).
-    #{state1 := State1} = connect(),
+    {State, _ClientApSecret, _ServerApSecret} = connect_owned(),
+    {State1, _} = ?M:handle_send(self(), make_ref(), 0, ~"tail", true, ?NOW, State),
     {State2, Effects1} = ?M:handle_timeout(?NOW, pto, State1),
     {_State3, Effects2} = ?M:handle_timeout(?NOW, pto, State2),
     ?assert(arm_deadline(Effects2) > arm_deadline(Effects1)).
+
+handshake_pto_not_armed_while_amplification_blocked_test() ->
+    %% RFC 9002 §6.2.2.1: a server the anti-amplification limit stops from
+    %% sending its probe arms no probe timeout until the client sends again.
+    #{state1 := State1} = connect(),
+    {State2, _} = ?M:handle_timeout(?NOW, pto, State1),
+    {_State3, Effects} = ?M:handle_timeout(?NOW, pto, State2),
+    ?assertMatch([{arm_timer, idle, _}], [T || {arm_timer, _, _} = T <- Effects]).
 
 pto_sends_a_probe_test() ->
     %% RFC 9002 §6.2.4: a probe timeout sends an ack-eliciting probe. Loss
@@ -1323,8 +1332,10 @@ coalesced_packet_from_another_address_dropped_test() ->
 failed_validation_returns_to_old_path_test() ->
     %% RFC 9000 §8.2.4 / §9.3.2: the new path is challenged again each
     %% interval with fresh data, and when the validation gives up the
-    %% connection returns to the last validated path, retiring the client id
-    %% it used toward the failed one.
+    %% connection returns to the last validated path. The client id it used
+    %% toward the failed path is kept for that address, not retired: a client
+    %% that really moved there no longer reads the old path, so a retirement
+    %% sent there would never bring a replacement.
     {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
     Move = app_datagram_to(CID1, [ping | padding(1100)], 2, ClientApSecret),
     {State1, Effects1} = ?M:handle_datagram(?NOW, ?PEER2, Move, State),
@@ -1337,24 +1348,84 @@ failed_validation_returns_to_old_path_test() ->
     ?assertEqual({ok, ?PEER}, ?M:peername(Reverted)),
     %% The owner hears of the return to the old address too.
     ?assertEqual([{emit, self(), {peer_changed, ?PEER}}], emits(Effects)),
+    ?assertNot(lists:member({retire_connection_id, 1}, sent_app_frames(Effects, ServerApSecret))),
+    %% The client's next packet from the failed address moves the connection
+    %% back there, addressed with the id kept for it.
+    Again = app_datagram_to(CID1, [ping], 3, ClientApSecret),
+    {Back, BackEffects} = ?M:handle_datagram(?ABANDON_AT, ?PEER2, Again, Reverted),
+    ?assertMatch([{migrate, ?PEER2} | _], BackEffects),
+    ?assertEqual({ok, ?PEER2}, ?M:peername(Back)),
+    ?assertEqual([?CLIENT_SPARE], lists:usort(short_header_dcids(BackEffects))).
+
+return_to_validated_path_retires_left_id_test() ->
+    %% RFC 9000 §9.3: a client back on the last validated path left the new
+    %% one, whose client id is retired (§5.1.2). The client repeating the
+    %% retired id's NEW_CONNECTION_ID does not bring it back: a further id
+    %% stays within the limit of two.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
+    Move = app_datagram_to(CID1, [ping | padding(1100)], 2, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER2, Move, State),
+    {Returned, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, to_scid([ping], 3, ClientApSecret), State1
+    ),
+    ?assertEqual({ok, ?PEER}, ?M:peername(Returned)),
     ?assert(lists:member({retire_connection_id, 1}, sent_app_frames(Effects, ServerApSecret))),
-    ?assertEqual([?CLIENT_SCID], lists:usort(short_header_dcids(Effects))),
-    %% The client repeating the retired id's NEW_CONNECTION_ID does not bring
-    %% it back: a further id stays within the limit of two.
     Repeat = {new_connection_id, 1, 0, ?CLIENT_SPARE, <<1:128>>},
     Next = {new_connection_id, 2, 0, <<22:64>>, <<2:128>>},
-    {State3, _} = ?M:handle_datagram(
-        ?NOW, ?PEER, to_scid([Repeat, Next], 3, ClientApSecret), Reverted
+    {State2, _} = ?M:handle_datagram(
+        ?NOW, ?PEER, to_scid([Repeat, Next], 4, ClientApSecret), Returned
     ),
-    ?assertEqual(connected, ?M:phase(State3)),
+    ?assertEqual(connected, ?M:phase(State2)),
     %% Nor does it after a Retire Prior To that leaves its number standing
     %% (one at it, here), which retires the id in use and moves to the next.
     Later = {new_connection_id, 3, 1, <<23:64>>, <<3:128>>},
-    {State4, Effects4} = ?M:handle_datagram(
-        ?NOW, ?PEER, to_scid([Later, Repeat], 4, ClientApSecret), State3
+    {State3, Effects3} = ?M:handle_datagram(
+        ?NOW, ?PEER, to_scid([Later, Repeat], 5, ClientApSecret), State2
     ),
-    ?assertEqual(connected, ?M:phase(State4)),
-    ?assertEqual([<<22:64>>], lists:usort(short_header_dcids(Effects4))).
+    ?assertEqual(connected, ?M:phase(State3)),
+    ?assertEqual([<<22:64>>], lists:usort(short_header_dcids(Effects3))).
+
+failed_validation_replaces_earlier_probe_path_test() ->
+    %% The failed path takes over from an address the client probed from
+    %% before. Here every path shares the client's only id (RFC 9000 §9.5
+    %% MAY, a NAT rebinding), which stays in use, so nothing is retired, and
+    %% the client's next packet from the failed address moves the connection
+    %% back there.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Probe = to_scid([{path_challenge, ~"probe-01"} | padding(1100)], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER3, Probe, State),
+    {State2, _} = ?M:handle_datagram(
+        ?NOW, ?PEER2, to_scid([ping | padding(1100)], 1, ClientApSecret), State1
+    ),
+    {Reverted, Effects} = ?M:handle_timeout(?ABANDON_AT, path, State2),
+    ?assertEqual({ok, ?PEER}, ?M:peername(Reverted)),
+    ?assertEqual(
+        [], [F || {retire_connection_id, _} = F <- sent_app_frames(Effects, ServerApSecret)]
+    ),
+    {Back, _} = ?M:handle_datagram(
+        ?ABANDON_AT, ?PEER2, to_scid([ping], 2, ClientApSecret), Reverted
+    ),
+    ?assertEqual({ok, ?PEER2}, ?M:peername(Back)).
+
+amplification_blocked_ack_arms_no_timer_test() ->
+    %% A due ACK the unvalidated new address cannot take yet waits for the
+    %% client to send more (RFC 9000 §8.1), and no ACK or probe timeout is
+    %% armed meanwhile (RFC 9002 §6.2.2.1): one already due would fire again
+    %% at once, starving the path validation's own timer. The next datagram
+    %% from the client lets the ACK out.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, Effects1} = ?M:handle_datagram(
+        ?NOW, ?PEER2, to_scid([ping], 0, ClientApSecret), State
+    ),
+    [AckAt] = [At || {arm_timer, ack, At} <- Effects1],
+    {State2, Effects2} = ?M:handle_timeout(AckAt, ack, State1),
+    ?assertEqual([], sends(Effects2)),
+    ?assertMatch([{arm_timer, path, _}], [T || {arm_timer, _, _} = T <- Effects2]),
+    {_State3, Effects3} = ?M:handle_datagram(
+        AckAt, ?PEER2, to_scid([ping | padding(200)], 1, ClientApSecret), State2
+    ),
+    ?assertNotEqual([], sends(Effects3)),
+    ?assertNotEqual([], [F || {ack, _, _, _, _, _} = F <- sent_app_frames(Effects3, ServerApSecret)]).
 
 return_to_validated_path_skips_validation_test() ->
     %% RFC 9000 §9.3: back on the last validated path the connection skips

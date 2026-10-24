@@ -11,9 +11,12 @@
 %% fits), and marks the address validated once a Handshake packet from the
 %% client decrypts (proof the client received the server's Initial), which
 %% lifts the limit. Holding back an over-budget datagram until more is
-%% received is the send pipeline's job; this module only does the counting.
+%% received is the send pipeline's job; this module only does the counting,
+%% and remembers that the limit held a datagram back until more arrives, so
+%% the connection arms no timer for sends that cannot happen (RFC 9002
+%% §6.2.2.1).
 
--export([new/0, received/2, sent/2, validate/1, budget/1, can_send/2]).
+-export([new/0, received/2, sent/2, validate/1, budget/1, can_send/2, block/1, blocked/1]).
 
 -export_type([t/0]).
 
@@ -23,7 +26,8 @@
 -record(amp, {
     rx = 0 :: non_neg_integer(),
     tx = 0 :: non_neg_integer(),
-    validated = false :: boolean()
+    validated = false :: boolean(),
+    blocked = false :: boolean()
 }).
 
 -opaque t() :: #amp{}.
@@ -33,10 +37,13 @@
 new() ->
     #amp{}.
 
--doc "Record `Bytes` received from the client; this raises the send budget.".
+-doc """
+Record `Bytes` received from the client; this raises the send budget and
+clears a `block/1`.
+""".
 -spec received(non_neg_integer(), t()) -> t().
 received(Bytes, #amp{rx = Rx} = Amp) ->
-    Amp#amp{rx = Rx + Bytes}.
+    Amp#amp{rx = Rx + Bytes, blocked = false}.
 
 -doc "Record `Bytes` sent to the client; this spends the send budget.".
 -spec sent(non_neg_integer(), t()) -> t().
@@ -66,3 +73,18 @@ can_send(_Bytes, #amp{validated = true}) ->
     true;
 can_send(Bytes, Amp) ->
     Bytes =< budget(Amp).
+
+-doc """
+Record that the limit held back a datagram the server had to send. It
+stays blocked until `received/2` raises the budget.
+""".
+-spec block(t()) -> t().
+block(Amp) ->
+    Amp#amp{blocked = true}.
+
+-doc "Whether the limit holds back a datagram until more is received.".
+-spec blocked(t()) -> boolean().
+blocked(#amp{validated = false, blocked = Blocked}) ->
+    Blocked;
+blocked(#amp{validated = true}) ->
+    false.

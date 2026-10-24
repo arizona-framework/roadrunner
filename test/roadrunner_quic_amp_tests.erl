@@ -48,3 +48,12 @@ validation_lifts_the_limit_test() ->
 budget_caps_with_min_test() ->
     ?assertEqual(1200, min(1200, ?M:budget(?M:validate(?M:new())))),
     ?assertEqual(300, min(1200, ?M:budget(?M:received(100, ?M:new())))).
+
+%% A datagram the limit held back blocks the account until the client
+%% sends more; a validated address is never blocked.
+block_holds_until_received_test() ->
+    Amp = ?M:block(?M:sent(300, ?M:received(100, ?M:new()))),
+    ?assert(?M:blocked(Amp)),
+    ?assertNot(?M:blocked(?M:received(1, Amp))),
+    ?assertNot(?M:blocked(?M:new())),
+    ?assertNot(?M:blocked(?M:validate(Amp))).
