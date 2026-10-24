@@ -123,13 +123,16 @@ stream_window_update_overflow_triggers_rst_stream(_Config) ->
 
 inbound_data_over_stream_window_triggers_rst_stream(_Config) ->
     %% RFC 9113 §6.9.1: a DATA frame larger than the stream-level recv
-    %% window is a stream error. A tiny stream window (10) is overrun by
-    %% one 50-byte frame; the conn stays alive.
-    {Pid, Ref, ConnPid} = start_conn(roadrunner_hello_handler, #{http2_stream_window => 10}),
-    handshake(ConnPid),
+    %% window is a stream error. The stream opens at the RFC's 65535 (no
+    %% SETTINGS_INITIAL_WINDOW_SIZE says otherwise) and, with refills off
+    %% (threshold 1), four max-size frames overrun it on the fourth; the
+    %% connection window is large enough to take them, and the conn stays
+    %% alive.
+    {Pid, Ref, ConnPid} = start_overrun_conn(),
     HpackBin = encode_request_headers(~"POST", ~"/"),
     serve_recv(ConnPid, encode_frame({headers, 1, 16#04, undefined, HpackBin})),
-    serve_recv(ConnPid, encode_frame({data, 1, 0, binary:copy(<<"x">>, 50)})),
+    Chunk = binary:copy(<<"x">>, 16384),
+    [serve_recv(ConnPid, encode_frame({data, 1, 0, Chunk})) || _ <- lists:seq(1, 4)],
     expect_send_type(3),
     true = is_process_alive(Pid),
     cleanup(Pid, Ref).
@@ -153,14 +156,17 @@ inbound_data_over_conn_window_triggers_goaway(_Config) ->
 
 inbound_padded_data_counts_padding_against_window(_Config) ->
     %% RFC 9113 §6.9.1: the whole DATA payload (pad-length byte + padding)
-    %% is flow-controlled, not just the stripped body. A 5-byte body fits
-    %% the 10-byte stream window, but the padded frame is 14 bytes on the
-    %% wire (1 pad-length + 5 body + 8 padding), so it overruns the stream
-    %% window. Without counting the padding this frame would be accepted.
-    {Pid, Ref, ConnPid} = start_conn(roadrunner_hello_handler, #{http2_stream_window => 10}),
-    handshake(ConnPid),
+    %% is flow-controlled, not just the stripped body. The stream's 65535
+    %% opening window is drawn down to 10 bytes; a 5-byte body fits that,
+    %% but the padded frame is 14 bytes on the wire (1 pad-length + 5 body
+    %% + 8 padding), so it overruns the stream window. Without counting the
+    %% padding this frame would be accepted.
+    {Pid, Ref, ConnPid} = start_overrun_conn(),
     HpackBin = encode_request_headers(~"POST", ~"/"),
     serve_recv(ConnPid, encode_frame({headers, 1, 16#04, undefined, HpackBin})),
+    Chunk = binary:copy(<<"x">>, 16384),
+    [serve_recv(ConnPid, encode_frame({data, 1, 0, Chunk})) || _ <- lists:seq(1, 3)],
+    serve_recv(ConnPid, encode_frame({data, 1, 0, binary:copy(<<"x">>, 16373)})),
     Body = binary:copy(<<"x">>, 5),
     PadLen = 8,
     Payload = <<PadLen:8, Body/binary, 0:(PadLen * 8)>>,
@@ -576,6 +582,19 @@ start_conn(Handler, Extra) ->
     Ref = monitor(process, Pid),
     Pid ! ready,
     {Pid, Ref, Pid}.
+
+%% A conn past its handshake whose stream windows can be overrun without
+%% the connection window running out first: the connection window is 1 MB
+%% (its early WINDOW_UPDATE drained with the handshake) and refills are off
+%% (threshold 1), so a stream keeps its 65535 opening window.
+start_overrun_conn() ->
+    {Pid, Ref, ConnPid} = start_conn(roadrunner_hello_handler, #{
+        http2_conn_window => 1048576,
+        http2_window_refill_threshold => 1
+    }),
+    handshake(ConnPid),
+    _ = expect_send_ack(4),
+    {Pid, Ref, ConnPid}.
 
 handshake(ConnPid) ->
     _ = expect_send(),

@@ -471,14 +471,15 @@ ops-tuning rationale.
     %% HTTP/2 tunables live under the `http2` tuple's opts map:
     %%
     %% - `conn_window` — connection-level receive window peak (bytes,
-    %%   `1..2^31-1`). Default `4194304` (4 MB), sent as an early
-    %%   `WINDOW_UPDATE(0, peak - 65535)` after the server SETTINGS
-    %%   (RFC 9113 §6.9.2 starts it at `65535`).
-    %% - `stream_window` — stream-level receive window peak (bytes,
-    %%   `1..2^31-1`). Advertised via `SETTINGS_INITIAL_WINDOW_SIZE`.
-    %%   Default `1048576` (1 MB). An upload runs at most one window
-    %%   per round trip. Setting above `conn_window` is allowed but
-    %%   not useful — the conn-level peak is the binding constraint.
+    %%   `1..2^31-1`). Default `2^31-1`, the largest allowed, sent as
+    %%   an early `WINDOW_UPDATE(0, peak - 65535)` after the server
+    %%   SETTINGS (RFC 9113 §6.9.2 starts it at `65535`).
+    %% - `stream_window` — the peak a stream's receive window grows to
+    %%   (bytes, `1..2^31-1`). Default `16777216` (16 MB). Every stream
+    %%   opens at the RFC `65535` and grows with its first refill once
+    %%   its DATA is taken. An upload runs at most one window per round
+    %%   trip. Setting above `conn_window` is allowed but not useful —
+    %%   the conn-level peak is the binding constraint.
     %% - `window_refill_threshold` — refill trigger (bytes,
     %%   `pos_integer`). When a window drops below this, the conn
     %%   refills it back to its peak. Unset (the default), each window
@@ -559,18 +560,23 @@ cookies / tracing metadata); lower them to tighten the attack surface.
 HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
 
 - `conn_window` — connection-level receive window peak in bytes
-  (`1..2^31-1`). Default `4194304` (4 MB), sent as an early
-  `WINDOW_UPDATE(0, peak - 65535)` after the server SETTINGS
-  (RFC 9113 §6.9.2 starts it at `65535`).
-- `stream_window` — stream-level receive window peak in bytes
-  (`1..2^31-1`). Advertised via `SETTINGS_INITIAL_WINDOW_SIZE`.
-  Default `1048576` (1 MB). An upload sends at most one window per
-  round trip, so this bounds its rate: 1 MB keeps pace with
-  HTTP/1.1 over a 100 ms round trip, where the RFC's `65535`
-  allows about 0.6 MB/s. A buffered body's credit is returned as
-  it arrives, so the windows bound the rate, not the memory a body
-  takes (`max_content_length` does); with manual body reading a
-  stream holds at most its window until the handler reads it.
+  (`1..2^31-1`). Default `2^31-1`, the largest allowed, sent as an
+  early `WINDOW_UPDATE(0, peak - 65535)` after the server SETTINGS
+  (RFC 9113 §6.9.2 starts it at `65535`). Its credit is returned as
+  DATA arrives, so it bounds no memory.
+- `stream_window` — the peak a stream's receive window grows to, in
+  bytes (`1..2^31-1`). Default `16777216` (16 MB). Every stream
+  opens at the RFC's `65535`, so a stream refused or rejected before
+  its body is read can draw at most that much; its window grows to
+  the peak with its first refill, once its DATA is taken. An upload
+  sends at most one window per round trip, so this bounds its rate:
+  16 MB allows about 160 MB/s over a 100 ms round trip, where the
+  RFC's `65535` allows about 0.6 MB/s. A buffered body's credit is
+  returned as it arrives, so the window bounds the rate, not the
+  memory a body takes (`max_content_length` does). With manual body
+  reading a stream holds at most its window until the handler reads
+  it, up to `stream_window × max_concurrent_streams` per connection:
+  lower `stream_window` if handlers read slowly and memory matters.
   Setting above `conn_window` is allowed but not useful — the
   conn-level peak is the binding constraint.
 - `window_refill_threshold` — refill trigger in bytes. When a
@@ -1843,8 +1849,8 @@ flatten_http1_opts(Entries) ->
 -spec http2_defaults() -> http2_opts().
 http2_defaults() ->
     #{
-        conn_window => 4194304,
-        stream_window => 1048576,
+        conn_window => 16#7FFFFFFF,
+        stream_window => 16777216,
         max_concurrent_streams => 100,
         max_header_block => 16384,
         %% Placeholder: resolved to `2 * max_header_block` when not set

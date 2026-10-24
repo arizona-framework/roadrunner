@@ -673,9 +673,10 @@ post_with_body_via_data_frame() ->
     cleanup(Pid, Ref).
 
 default_receive_windows_advertised() ->
-    %% With no window opts the stream window is advertised as
-    %% SETTINGS_INITIAL_WINDOW_SIZE (id 4) and the connection window is
-    %% raised from the RFC 9113 §6.9.2 65535 by an early WINDOW_UPDATE.
+    %% With no window opts no SETTINGS_INITIAL_WINDOW_SIZE (id 4) goes out,
+    %% so streams open at the RFC 9113 §6.9.2 65535, and the connection
+    %% window is raised from 65535 to the largest allowed by an early
+    %% WINDOW_UPDATE.
     {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, _ConnPid} = start_http2_conn(#{
@@ -684,21 +685,23 @@ default_receive_windows_advertised() ->
         http2_window_refill_threshold => unset
     }),
     {ok, {settings, 0, Settings}, <<>>} = roadrunner_http2_frame:parse(expect_send(), 16384),
-    ?assert(lists:member({4, 1048576}, Settings)),
+    ?assertNot(lists:keymember(4, 1, Settings)),
     ?assertMatch(
-        {ok, {window_update, 0, 4128769}, <<>>}, roadrunner_http2_frame:parse(expect_send(), 16384)
+        {ok, {window_update, 0, 16#7FFFFFFF - 65535}, <<>>},
+        roadrunner_http2_frame:parse(expect_send(), 16384)
     ),
     cleanup(Pid, Ref).
 
 windows_refill_below_half_their_peak() ->
-    %% Unset, the refill threshold is half of each window's own peak: the
-    %% stream window (100000) refills once below 50000, the connection
-    %% window (140000) once below 70000.
+    %% Unset, the refill threshold is half of each window's own peak. A
+    %% stream opens at the RFC's 65535 and grows to its peak (1000000)
+    %% with its first refill, below 500000; the connection window (140000)
+    %% refills once below 70000.
     {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(#{
         http2_conn_window => 140000,
-        http2_stream_window => 100000,
+        http2_stream_window => 1000000,
         http2_window_refill_threshold => unset
     }),
     _ = expect_send(),
@@ -722,15 +725,15 @@ windows_refill_below_half_their_peak() ->
         )
     ),
     Data = iolist_to_binary(roadrunner_http2_frame:encode({data, 1, 0, binary:copy(~"a", 16000)})),
-    %% 48000 bytes in: the stream has 52000 left, the connection 92000.
-    [serve_recv(ConnPid, Data) || _ <- [1, 2, 3]],
-    ?assertEqual([], collect_response_frames()),
-    %% 64000: the stream is down to 36000 and refills to its peak.
+    %% The first DATA grows the stream from 49535 left to its peak.
     serve_recv(ConnPid, Data),
-    ?assertEqual([{other, 8, 1, false}], collect_response_frames()),
+    {ok, {window_update, 1, 950465}, <<>>} = roadrunner_http2_frame:parse(expect_send(), 16384),
+    %% 64000 bytes in: the connection has 76000 left, the stream 952000.
+    [serve_recv(ConnPid, Data) || _ <- [2, 3, 4]],
+    ?assertEqual([], collect_response_frames()),
     %% 80000: the connection is down to 60000 and refills to its peak.
     serve_recv(ConnPid, Data),
-    ?assertEqual([{other, 8, 0, false}], collect_response_frames()),
+    {ok, {window_update, 0, 80000}, <<>>} = roadrunner_http2_frame:parse(expect_send(), 16384),
     cleanup(Pid, Ref).
 
 continuation_assembles_header_block() ->
@@ -3729,14 +3732,18 @@ content_length_mismatch_rst_stream() ->
 stream_window_overflow_returns_conn_window() ->
     %% DATA past the stream's receive window is a stream error (RFC 9113
     %% §6.9.1), but the frame still counted against the connection window,
-    %% so its bytes go back with the RST_STREAM.
+    %% so its bytes go back with the RST_STREAM. The stream opens at the
+    %% RFC's 65535 however small its peak (100 here), since no
+    %% SETTINGS_INITIAL_WINDOW_SIZE told the client otherwise, and a window
+    %% above its peak is never refilled.
     {Pid, Ref, ConnPid} = post_handshake_conn(#{http2_stream_window => 100}),
     {H1, _} = indexed_get_headers(1, [], 16#04, roadrunner_http2_hpack:new_encoder(4096)),
     serve_recv(ConnPid, H1),
-    serve_recv(
-        ConnPid,
-        iolist_to_binary(roadrunner_http2_frame:encode({data, 1, 0, binary:copy(~"x", 101)}))
-    ),
+    Data = iolist_to_binary(roadrunner_http2_frame:encode({data, 1, 0, binary:copy(~"x", 16384)})),
+    %% 49152 bytes in: the stream has 16383 left (the connection refills).
+    [serve_recv(ConnPid, Data) || _ <- [1, 2, 3]],
+    ?assertEqual([], [F || {other, 8, 1, _} = F <- collect_response_frames()]),
+    serve_recv(ConnPid, Data),
     Out = expect_send(),
     {ok, {rst_stream, 1, flow_control_error}, Rest} = roadrunner_http2_frame:parse(Out, 16384),
     WindowUpdate =
@@ -3745,7 +3752,7 @@ stream_window_overflow_returns_conn_window() ->
             _ -> Rest
         end,
     ?assertMatch(
-        {ok, {window_update, 0, 101}, _}, roadrunner_http2_frame:parse(WindowUpdate, 16384)
+        {ok, {window_update, 0, 16384}, _}, roadrunner_http2_frame:parse(WindowUpdate, 16384)
     ),
     cleanup(Pid, Ref).
 

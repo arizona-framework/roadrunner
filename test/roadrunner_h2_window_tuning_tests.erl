@@ -43,9 +43,10 @@ all_test_() ->
     ].
 
 default_opts_emit_only_basic_settings() ->
-    %% With default ProtoOpts (no h2_* override) the handshake emits
-    %% the same SETTINGS frame it always did — no INITIAL_WINDOW_SIZE
-    %% entry, no early WINDOW_UPDATE. Backward-compat guarantee.
+    %% With this module's RFC-baseline windows (65535, see `start_conn/1`)
+    %% the handshake emits no INITIAL_WINDOW_SIZE entry and no early
+    %% WINDOW_UPDATE. The shipped defaults are covered by
+    %% `roadrunner_conn_loop_http2_tests:default_receive_windows_advertised/0`.
     {Pid, Ref} = start_conn(#{}),
     Settings = expect_send(),
     {ok, {settings, 0, Entries}, _} = roadrunner_http2_frame:parse(Settings, 16384),
@@ -70,19 +71,19 @@ bumped_conn_window_emits_window_update() ->
     cleanup(Pid, Ref).
 
 bumped_stream_window_advertises_initial_window_size() ->
-    %% stream_window = 4M, conn stays default. Expect SETTINGS WITH
-    %% id 4 = 4M, NO follow-up WINDOW_UPDATE.
+    %% stream_window = 4M is a peak streams grow to, not advertised: the
+    %% SETTINGS carries no id 4, so streams open at the RFC's 65535.
     StreamPeak = 4 * 1024 * 1024,
     {Pid, Ref} = start_conn(#{stream_window => StreamPeak}),
     Settings = expect_send(),
     {ok, {settings, 0, Entries}, _} = roadrunner_http2_frame:parse(Settings, 16384),
-    ?assertEqual(StreamPeak, proplists:get_value(4, Entries)),
+    ?assertEqual(false, lists:keymember(4, 1, Entries)),
     ?assertEqual(no_send, drain_send(100)),
     cleanup(Pid, Ref).
 
 bumped_both_emits_settings_with_size_then_window_update() ->
-    %% Mint-style defaults: 16M / 4M. SETTINGS includes id 4 = 4M;
-    %% WINDOW_UPDATE(0, 16M - 65535) follows.
+    %% 16M / 4M: SETTINGS carries no id 4 (the stream peak is reached by
+    %% refills); WINDOW_UPDATE(0, 16M - 65535) follows.
     ConnPeak = 16 * 1024 * 1024,
     StreamPeak = 4 * 1024 * 1024,
     {Pid, Ref} = start_conn(#{
@@ -91,20 +92,18 @@ bumped_both_emits_settings_with_size_then_window_update() ->
     }),
     Settings = expect_send(),
     {ok, {settings, 0, Entries}, _} = roadrunner_http2_frame:parse(Settings, 16384),
-    ?assertEqual(StreamPeak, proplists:get_value(4, Entries)),
+    ?assertEqual(false, lists:keymember(4, 1, Entries)),
     WindowUpdate = expect_send(),
     {ok, {window_update, 0, Inc}, _} = roadrunner_http2_frame:parse(WindowUpdate, 16384),
     ?assertEqual(ConnPeak - 65535, Inc),
     cleanup(Pid, Ref).
 
 custom_threshold_changes_refill_trigger() ->
-    %% Set the recv-window peak to 100 KB and the threshold to 50 KB.
-    %% A single 60 KB DATA frame drops both windows below threshold,
-    %% so the conn must emit a WINDOW_UPDATE on stream 0 AND on the
-    %% stream id refilling each back to its peak. With the default
-    %% threshold (32 KB) and peak (65 KB) those refills wouldn't fire
-    %% until 33 KB had been consumed — this test asserts that the
-    %% configured threshold is the one in effect.
+    %% Set the recv-window peaks to 100 KB and the threshold to 50 KB,
+    %% for both windows: each refills to its peak once below it, not
+    %% below half its own peak (also 50 KB here, so the stream's
+    %% refill point at 45535 left proves nothing alone; the connection
+    %% one, at 40 KB left after 60 KB, is the configured threshold).
     Peak = 100_000,
     Threshold = 50_000,
     {Pid, Ref} = start_conn(#{
@@ -137,28 +136,17 @@ custom_threshold_changes_refill_trigger() ->
         roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, HpackBin})
     ),
     serve_recv(Pid, HeadersFrame),
-    %% Six 10 KB DATA frames = 60 KB total. Each below the
-    %% MAX_FRAME_SIZE cap of 16384. Conn + stream recv windows drop
-    %% from 100 KB → 40 KB which is < 50 KB threshold → both refill.
+    %% 10 KB DATA frames, each below the MAX_FRAME_SIZE cap of 16384. The
+    %% stream opens at the RFC's 65535: after two frames it has 45535
+    %% left, below the 50 KB threshold, and refills to its 100 KB peak.
     Chunk = binary:copy(<<"x">>, 10_000),
-    [
-        serve_recv(Pid, iolist_to_binary(roadrunner_http2_frame:encode({data, 1, 0, Chunk})))
-     || _ <- lists:seq(1, 6)
-    ],
-    %% Expect 2 WINDOW_UPDATE frames — conn (stream 0) and stream 1.
-    %% Coalesced into a single send so they share one transport
-    %% trip; parse both out of the combined buffer.
-    Combined = expect_send(),
-    {ok, {window_update, S1, Inc1}, Rest1} =
-        roadrunner_http2_frame:parse(Combined, 16384),
-    {ok, {window_update, S2, Inc2}, <<>>} =
-        roadrunner_http2_frame:parse(Rest1, 16384),
-    %% Both updates fire (one for conn, one for stream); we don't
-    %% care about order. After 60 KB consumed, the increment that
-    %% restores the window to 100 KB is exactly 60 KB.
-    ?assertEqual(lists:sort([0, 1]), lists:sort([S1, S2])),
-    ?assertEqual(60_000, Inc1),
-    ?assertEqual(60_000, Inc2),
+    Data = iolist_to_binary(roadrunner_http2_frame:encode({data, 1, 0, Chunk})),
+    [serve_recv(Pid, Data) || _ <- [1, 2]],
+    {ok, {window_update, 1, 54_465}, <<>>} = roadrunner_http2_frame:parse(expect_send(), 16384),
+    %% Four more: 60 KB in, the connection window drops from 100 KB to
+    %% 40 KB, below the threshold, and refills by exactly 60 KB.
+    [serve_recv(Pid, Data) || _ <- [3, 4, 5, 6]],
+    {ok, {window_update, 0, 60_000}, <<>>} = roadrunner_http2_frame:parse(expect_send(), 16384),
     cleanup(Pid, Ref).
 
 default_advertises_100_max_concurrent_streams() ->
