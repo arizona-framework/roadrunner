@@ -124,9 +124,10 @@ advisory or malformed cases the server currently tolerates or omits.
 - Pass the h3spec cases listed as known failures in `scripts/h3spec.sh`:
   frames that are malformed, in the wrong packet type, or forbidden from a
   client are absorbed instead of closing the connection (RFC 9000 §12.4,
-  §19), there is no CRYPTO buffer limit (§7.5), and a few HTTP/3 errors use
-  the wrong code. Check each case against the RFC before fixing, and drop
-  its line from the list in the same PR — medium
+  §19), there is no CRYPTO buffer limit (§7.5), and a KeyUpdate or
+  EndOfEarlyData during the handshake gets no `unexpected_message` alert
+  (RFC 9001 §6, §8.3). Check each case against the RFC before fixing, and
+  drop its line from the list in the same PR — medium
 
 ### Transport completeness — bites large transfers / advanced cases
 

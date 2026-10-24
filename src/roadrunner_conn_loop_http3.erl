@@ -71,6 +71,7 @@
 -define(H3_CLOSED_CRITICAL_STREAM, 16#0104).
 -define(H3_FRAME_UNEXPECTED, 16#0105).
 -define(H3_FRAME_ERROR, 16#0106).
+-define(H3_EXCESSIVE_LOAD, 16#0107).
 -define(H3_SETTINGS_ERROR, 16#0109).
 -define(H3_MISSING_SETTINGS, 16#010A).
 -define(H3_REQUEST_REJECTED, 16#010B).
@@ -772,11 +773,29 @@ handle_stream_reset(#h3{uni = Uni, streams = Streams, worker_pids = WorkerPids} 
             end
     end.
 
-%% RFC 9114 §7.2.8: HTTP/2-reserved frame types → H3_FRAME_UNEXPECTED;
-%% other malformed/oversized frames (§7.1) → H3_FRAME_ERROR.
+%% RFC 9114 §7.2.8: HTTP/2-reserved frame types → H3_FRAME_UNEXPECTED; a
+%% frame past the size we buffer is our own limit, not a malformed frame
+%% (§10.5) → H3_EXCESSIVE_LOAD; other malformed frames (§7.1) →
+%% H3_FRAME_ERROR.
 -spec frame_error_code(term()) -> non_neg_integer().
 frame_error_code({h2_reserved_frame, _}) -> ?H3_FRAME_UNEXPECTED;
+frame_error_code({frame_error, oversized, _}) -> ?H3_EXCESSIVE_LOAD;
 frame_error_code(_) -> ?H3_FRAME_ERROR.
+
+%% A frame that failed to decode on a request stream. A control-stream frame
+%% type is unexpected there whatever its payload holds (RFC 9114 §7.2.3 -
+%% §7.2.7), so its type decides the error before its payload does.
+-spec request_frame_error_code(term()) -> non_neg_integer().
+request_frame_error_code({frame_error, Type, _}) when
+    Type =:= settings;
+    Type =:= goaway;
+    Type =:= max_push_id;
+    Type =:= cancel_push;
+    Type =:= push_promise
+->
+    ?H3_FRAME_UNEXPECTED;
+request_frame_error_code(Reason) ->
+    frame_error_code(Reason).
 
 -spec new_request_stream(non_neg_integer()) -> map().
 new_request_stream(BodyCap) ->
@@ -835,7 +854,7 @@ decode_request_frames(Buf, Stream, ProtoOpts, MaxHdrBlock) ->
             %% A frame-level decode failure is a connection error per
             %% RFC 9114 §7.1 (malformed/oversized frame) and §7.2.8
             %% (HTTP/2-reserved frame type).
-            {conn_error, frame_error_code(Reason), ~"frame error"}
+            {conn_error, request_frame_error_code(Reason), ~"frame error"}
     end.
 
 %% Apply one decoded frame against the request frame-sequence state
@@ -1084,11 +1103,18 @@ validate_control_frames(Buf, SettingsReceived) ->
             end;
         {more, _} ->
             {ok, Buf, SettingsReceived};
+        {error, {frame_error, settings, malformed_varint}} ->
+            %% RFC 9114 §7.1: a SETTINGS payload that ends inside an
+            %% identifier / value pair → H3_FRAME_ERROR.
+            {conn_error, ?H3_FRAME_ERROR, ~"truncated SETTINGS frame"};
         {error, {frame_error, settings, _}} ->
-            %% RFC 9114 §7.2.4 / §7.2.4.1: a forbidden HTTP/2 setting,
-            %% a duplicate identifier, or other malformed SETTINGS
-            %% content → H3_SETTINGS_ERROR.
+            %% RFC 9114 §7.2.4 / §7.2.4.1: a forbidden HTTP/2 setting or
+            %% a duplicate identifier → H3_SETTINGS_ERROR.
             {conn_error, ?H3_SETTINGS_ERROR, ~"invalid SETTINGS frame"};
+        {error, {frame_error, push_promise, _}} ->
+            %% RFC 9114 §7.2.5: PUSH_PROMISE never belongs on the control
+            %% stream, malformed or not → H3_FRAME_UNEXPECTED.
+            {conn_error, ?H3_FRAME_UNEXPECTED, ~"request frame on control stream"};
         {error, Reason} ->
             {conn_error, frame_error_code(Reason), ~"control frame error"}
     end.

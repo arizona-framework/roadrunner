@@ -1558,8 +1558,8 @@ malformed_frame(Config) ->
     ll_await_closed(Conn).
 
 oversized_frame(Config) ->
-    %% A frame declaring a length above the max is a frame error
-    %% (RFC 9114 §7.1, H3_FRAME_ERROR) — a connection error.
+    %% A frame declaring a length above the size we buffer is a connection
+    %% error (RFC 9114 §10.5, H3_EXCESSIVE_LOAD).
     Conn = ll_connect(?config(port, Config)),
     Oversized = iolist_to_binary([
         roadrunner_quic_varint:encode(0), roadrunner_quic_varint:encode(16#FFFFFFFF)
