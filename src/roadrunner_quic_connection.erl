@@ -18,12 +18,12 @@
 %% AtMs}` sets the one deadline the core wants, and `{register_cid, CID}` /
 %% `{unregister_cid, CID}` route a connection id the core issued to this
 %% process in the registry, or stop routing one the peer retired (RFC 9000
-%% §5.1). The listener reaps every row on the process's exit, so a closing
-%% connection leaves none behind. The datagram's source address goes to the
-%% core with it: when the client moves (RFC 9000 §9), `{migrate, Peer}`
-%% points every later `{send, _}` at the new address, and `{send_to, Peer,
-%% Datagram}` sends a probing packet to an address the connection is not
-%% on. The shell re-arms its
+%% §5.1). A closing connection removes its own rows as it exits; the
+%% listener reaps those of one that crashes. The datagram's source address
+%% goes to the core with it: when the client moves (RFC 9000 §9), `{migrate,
+%% Peer}` points every later `{send, _}` at the new address, and `{send_to,
+%% Peer, Datagram}` sends a probing packet to an address the connection is
+%% not on. The shell re-arms its
 %% timer lazily: a later deadline leaves an earlier armed timer running, and
 %% when that one fires ahead of the deadline it is just re-armed, so a
 %% deadline that keeps moving later (a PTO pushed back by each ACK) costs no
@@ -128,13 +128,18 @@ loop(State) ->
 
 %% Resume the loop, or exit normally once the pure core has moved to the
 %% `closed` phase. proc_lib treats a normal return as a clean process exit,
-%% and the owner already learned of the close via the {closed, _} emit, so
-%% there is no further teardown to do here.
+%% and the owner already learned of the close via the {closed, _} emit. The
+%% only teardown left is the connection's routing rows: it removes its own,
+%% so the listener reaps a normal exit without scanning the registry.
 -spec continue(#shell{}) -> ok | no_return().
-continue(#shell{conn = Conn} = State) ->
+continue(#shell{conn = Conn, registry = Registry} = State) ->
     case roadrunner_quic_conn_state:phase(Conn) of
-        closed -> ok;
-        _ -> loop(State)
+        closed ->
+            roadrunner_quic_cid_registry:remove_all(
+                Registry, roadrunner_quic_conn_state:routes(Conn), self()
+            );
+        _ ->
+            loop(State)
     end.
 
 %% Act on a fired timer only when it is still the armed one; a stale fire

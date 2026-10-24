@@ -128,9 +128,18 @@ send_data_round_trip(#{shell := Shell, peer := Peer, client := ClientSocket, ctx
 %% normal proc_lib exit, not a crash). The close also acks the server's
 %% HANDSHAKE_DONE so a real RTT sample collapses the drain to tens of ms, the way
 %% an established connection that exchanged data drains.
-peer_close_terminates_shell(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
+peer_close_terminates_shell(#{
+    shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx, registry := Registry
+}) ->
     {timeout, 10, fun() ->
-        {ClientApSecret, _ServerApSecret} = do_handshake(Shell, Peer, ClientSocket, Ctx),
+        {ClientApSecret, ServerApSecret} = do_handshake(Shell, Peer, ClientSocket, Ctx),
+        ServerKeys = #{
+            application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)
+        },
+        [{new_connection_id, 1, 0, CID1, _}] = new_cids(
+            ?TC:frames(recv_all(ClientSocket), application, ServerKeys, byte_size(?DCID))
+        ),
+        ?assertEqual({ok, Shell}, roadrunner_quic_cid_registry:lookup(Registry, CID1)),
         %% Install self as owner (handshake already done, so {connected, _}
         %% comes back immediately) to receive the {closed, _} event.
         Ref = make_ref(),
@@ -159,7 +168,9 @@ peer_close_terminates_shell(#{shell := Shell, peer := Peer, client := ClientSock
         after 1000 ->
             erlang:error(no_closed_event)
         end,
-        wait_dead(Shell, 150)
+        wait_dead(Shell, 150),
+        %% The closed shell removed its own routing rows on the way out.
+        ?assertEqual(error, roadrunner_quic_cid_registry:lookup(Registry, CID1))
     end}.
 
 %% A synchronous peername control call round-trips through the shell.

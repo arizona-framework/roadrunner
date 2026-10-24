@@ -139,7 +139,16 @@ issued_connection_id_routes_through_listener(_Config) ->
     after 5000 -> ct:fail(stream_data_not_routed)
     end,
 
+    %% Once the connection closes it has removed its own routing rows: the
+    %% listener reaps a normal exit without scanning the registry.
+    Mon = monitor(process, ServerConn),
     ok = roadrunner_quic_test_conn:close(Conn),
+    receive
+        {'DOWN', Mon, process, ServerConn, normal} -> ok
+    after 5000 -> ct:fail(connection_did_not_close)
+    end,
+    ?assertEqual(error, roadrunner_quic_cid_registry:lookup(Registry, CID1)),
+    ?assertEqual(error, roadrunner_quic_cid_registry:lookup(Registry, CID2)),
     receive
         {owner, Owner} -> exit(Owner, kill)
     after 0 -> ok

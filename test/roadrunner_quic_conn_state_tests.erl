@@ -715,6 +715,16 @@ spare_connection_id_issued_on_confirmation_test() ->
     ?assertEqual([{register_cid, CID}], registers(Effects)),
     ?assert(index_of({register_cid, CID}, Effects) < index_of(first_send(Effects), Effects)).
 
+routes_follow_issued_ids_test() ->
+    %% The ids routing to the connection: the client's original destination
+    %% id and every issued id the client has not retired.
+    {State, ClientApSecret, _ServerApSecret, CID1} = connected_with_spare(),
+    ?assertEqual(lists:sort([?DCID, ?SCID, CID1]), lists:sort(?M:routes(State))),
+    Retire = app_datagram_to(CID1, [{retire_connection_id, 0}], 0, ClientApSecret),
+    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Retire, State),
+    [{unregister_cid, ?SCID}, {register_cid, CID2}] = registers(Effects),
+    ?assertEqual(lists:sort([?DCID, CID1, CID2]), lists:sort(?M:routes(State1))).
+
 issued_up_to_client_limit_test() ->
     %% A client accepting three ids gets two spares (sequence numbers 1 and
     %% 2), each a different id with its own token.

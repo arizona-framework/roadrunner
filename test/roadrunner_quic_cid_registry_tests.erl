@@ -74,3 +74,20 @@ reset_token_test() ->
     ?assertEqual(
         crypto:macN(hmac, sha256, Key, ~"cid-one", 16), Token
     ).
+
+remove_all_drops_a_closing_connections_ids_test() ->
+    %% A closing connection removes its own ids one by one, leaving any id
+    %% another connection holds and every other connection's routes.
+    Table = ?M:new(),
+    Closing = spawn(fun() -> ok end),
+    Other = self(),
+    ok = ?M:register_pair(Table, ~"dcid", ~"scid", Closing),
+    ok = ?M:add(Table, ~"spare-cid", Closing),
+    ok = ?M:add(Table, ~"taken-cid", Other),
+    ok = ?M:add(Table, ~"other-cid", Other),
+    ok = ?M:remove_all(Table, [~"dcid", ~"scid", ~"spare-cid", ~"taken-cid"], Closing),
+    ?assertEqual(error, ?M:lookup(Table, ~"dcid")),
+    ?assertEqual(error, ?M:lookup(Table, ~"scid")),
+    ?assertEqual(error, ?M:lookup(Table, ~"spare-cid")),
+    ?assertEqual({ok, Other}, ?M:lookup(Table, ~"taken-cid")),
+    ?assertEqual({ok, Other}, ?M:lookup(Table, ~"other-cid")).

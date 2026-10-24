@@ -93,7 +93,8 @@
     handle_send/7,
     handle_consumed/4,
     peername/1,
-    phase/1
+    phase/1,
+    routes/1
 ]).
 %% Exported for direct eunit branch coverage of the idle-timeout negotiation.
 -export([negotiated_idle_timeout/2]).
@@ -566,6 +567,15 @@ peername(#state{peer = Peer}) ->
 -spec phase(t()) -> phase().
 phase(#state{phase = Phase}) ->
     Phase.
+
+-doc """
+The connection ids that route datagrams to this connection: the client's
+original Destination Connection ID and every id we issued that the client
+has not retired (RFC 9000 §5.1).
+""".
+-spec routes(t()) -> [binary()].
+routes(#state{dcid = DCID, cids = Cids}) ->
+    [DCID | maps:values(Cids)].
 
 %% The congestion window in bytes (RFC 9002 §7), for tests to observe its
 %% slow-start growth and on-loss backoff.

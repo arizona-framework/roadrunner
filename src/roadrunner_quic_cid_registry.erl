@@ -17,14 +17,16 @@
 %% share one manager-held table across its listeners, and a connection can
 %% route its own ids.
 %%
-%% Cleanup is the owner's contract: the listener monitors each connection and
-%% calls delete_pid/2 when it ends. Between a connection ending and that
-%% cleanup, lookup/2 may briefly return its now-dead pid; routing a datagram
-%% there is a harmless no-op (the message is dropped) and is the right outcome
-%% anyway (a datagram for a gone connection should be dropped). A registration
+%% Cleanup: a connection that closes removes its own rows on the way out
+%% (remove_all/3, one delete per id); one that crashes or is killed cannot, so
+%% the listener, which links each connection, calls delete_pid/2 when one ends
+%% any other way. Between a connection ending and that cleanup, lookup/2 may
+%% briefly return its now-dead pid; routing a datagram there is a harmless
+%% no-op (the message is dropped) and is the right outcome anyway (a datagram
+%% for a gone connection should be dropped). A registration
 %% for an id already held by another pid (a recycled or, astronomically,
 %% colliding client DCID) overwrites it; the previous pid's other ids are
-%% reaped by its own delete_pid/2, and its remove/3 of the overwritten id
+%% reaped by its own cleanup, and its removal of the overwritten id
 %% leaves the new owner's row alone.
 %%
 %% The reset key is one random secret per namespace, so every listener of a
@@ -33,7 +35,7 @@
 %% §10.3.2). It is unpredictable without the key, distinct per id, and needs
 %% no per-connection state to recompute.
 
--export([new/0, register_pair/4, add/3, remove/3, lookup/2, delete_pid/2]).
+-export([new/0, register_pair/4, add/3, remove/3, remove_all/3, lookup/2, delete_pid/2]).
 -export([reset_key/1, reset_token/2]).
 
 -export_type([t/0]).
@@ -90,6 +92,16 @@ remove(#registry{table = Table}, CID, Pid) ->
     true = ets:delete_object(Table, {CID, Pid}),
     ok.
 
+-doc """
+Stop routing every one of a closing connection's ids to `Pid`, one delete
+per id, so its normal exit spares the listener the whole-table scan of
+delete_pid/2. As with remove/3, an id since taken over by another
+connection keeps its route.
+""".
+-spec remove_all(t(), [binary()], pid()) -> ok.
+remove_all(#registry{table = Table}, CIDs, Pid) ->
+    lists:foreach(fun(CID) -> true = ets:delete_object(Table, {CID, Pid}) end, CIDs).
+
 -doc "The connection owning a destination connection id, if one is registered.".
 -spec lookup(t(), binary()) -> {ok, pid()} | error.
 lookup(#registry{table = Table}, CID) ->
@@ -98,7 +110,10 @@ lookup(#registry{table = Table}, CID) ->
         [] -> error
     end.
 
--doc "Drop every connection id routing to `Pid` (its connection has ended).".
+-doc """
+Drop every connection id routing to `Pid` (its connection has ended without
+removing its own): a scan of the whole table.
+""".
 -spec delete_pid(t(), pid()) -> ok.
 delete_pid(#registry{table = Table}, Pid) ->
     true = ets:match_delete(Table, {'_', Pid}),
