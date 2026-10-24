@@ -685,5 +685,5 @@ deframe_complete(Bytes, Acc) ->
     [roadrunner_quic_test_handshake:install()]
 ) -> roadrunner_quic_keys:keys().
 keys_for(Level, Role, Installs) ->
-    [Keys] = [K || {L, R, K} <- Installs, L =:= Level, R =:= Role],
-    Keys.
+    [Secret] = [S || {L, R, S} <- Installs, L =:= Level, R =:= Role],
+    roadrunner_quic_keys:traffic_keys(Secret).

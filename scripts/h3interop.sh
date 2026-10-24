@@ -19,6 +19,13 @@
 #   multiplex  50 GETs of different sizes on one connection
 #   upload     POST 1 MB and get it echoed back
 #
+# The ngtcp2 client also runs one more case (quiche-client cannot update
+# its keys on demand):
+#
+#   keyupdate  GET 5 MB while the client updates its 1-RTT keys early in
+#              the transfer (RFC 9001 §6); it passes only if the server's
+#              packets switch to the new key phase too
+#
 # Requirements:
 #   - docker (the client images are pulled on first run)
 #   - mise (or rebar3 + erl on PATH)
@@ -141,19 +148,24 @@ fi
 case_urls() {
     case "$1" in
         small) echo "$BASE/files/100" ;;
-        large) echo "$BASE/files/5000000" ;;
+        large | keyupdate) echo "$BASE/files/5000000" ;;
         multiplex) for n in $MULTIPLEX_SIZES; do echo "$BASE/files/$n"; done ;;
         upload) echo "$BASE/echo" ;;
     esac
 }
 
 # Check a case's downloads in `$2`; both clients name each response file
-# after the last segment of its URL path.
+# after the last segment of its URL path. The keyupdate case also needs a
+# server packet in key phase 1 in the client's packet log (`$2.log`).
 check_case() {
     local name=$1 dir=$2
     case "$name" in
         small) cmp -s "$WWW/100" "$dir/100" ;;
         large) cmp -s "$WWW/5000000" "$dir/5000000" ;;
+        keyupdate)
+            cmp -s "$WWW/5000000" "$dir/5000000" &&
+                grep -q "pkt rx .* type=1RTT k=1" "$dir.log"
+            ;;
         multiplex)
             for n in $MULTIPLEX_SIZES; do
                 cmp -s "$WWW/$n" "$dir/$n" || return 1
@@ -177,15 +189,21 @@ run_quiche() {
 
 run_ngtcp2() {
     local name=$1 dir=$2
-    local body=""
-    [ "$name" = upload ] && body="-d /in/upload.bin"
+    local opts="-q"
+    case "$name" in
+        upload) opts="-q -d /in/upload.bin" ;;
+        # Update the keys 1 ms after the handshake, while the download is
+        # under way, and log every packet so check_case can see the key
+        # phase the server answers in.
+        keyupdate) opts="--key-update=1ms" ;;
+    esac
     # The client fails its handshake when run as a non-root user, so it runs
     # as root and hands the downloads back afterwards.
     timeout "$CLIENT_TIMEOUT" docker run --rm --network host \
         -v "$dir:/out" -v "$WORK_DIR:/in:ro" --entrypoint sh "$NGTCP2_IMAGE" -c "
             /usr/local/bin/wsslclient 127.0.0.1 $PORT $(case_urls "$name" | tr '\n' ' ') \
-                $body --download /out --exit-on-all-streams-close \
-                -q --no-quic-dump --no-http-dump
+                $opts --download /out --exit-on-all-streams-close \
+                --no-quic-dump --no-http-dump
             rc=\$?
             chown -R $(id -u):$(id -g) /out
             exit \$rc"
@@ -194,7 +212,9 @@ run_ngtcp2() {
 FAILED=0
 printf '%-8s %-10s %s\n' client case result
 for client in quiche ngtcp2; do
-    for name in small large multiplex upload; do
+    cases="small large multiplex upload"
+    [ "$client" = ngtcp2 ] && cases="$cases keyupdate"
+    for name in $cases; do
         dir="$WORK_DIR/$client/$name"
         mkdir -p "$dir"
         log="$dir.log"

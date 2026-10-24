@@ -128,11 +128,17 @@ advisory or malformed cases the server currently tolerates or omits.
   transfer that fills a non-zero window — already emits the frame on the
   flow's blocked transition; this remainder is the never-sent-a-byte case a
   conformant peer never produces — small
-- Respond to a peer-initiated key update (RFC 9001 §6). Security-sensitive:
-  trial-decrypt the next-phase keys and commit ONLY on success (not
-  commit-then-decrypt, which a single forged flipped-bit datagram desyncs),
-  keep the header-protection key fixed, enforce the AEAD integrity limit —
-  large
+- Start a key update of our own before the AEAD confidentiality limit (RFC
+  9001 §6.6: 2^23 packets per AES-128-GCM key, about 10 GB of full packets on
+  one connection): count the packets sealed with each send key and update
+  before the limit, within the §6.1 rules (handshake confirmed, previous
+  update acknowledged) and §6.5's three-PTO wait — medium
+- Hold back 1-RTT packets until the handshake completes (RFC 9001 §5.7): the
+  client's 1-RTT keys are installed with the server's first flight, so a
+  1-RTT packet that arrives ahead of the client Finished is decrypted,
+  processed and acknowledged today. Drop or buffer it until the Finished
+  verifies, without losing the 1-RTT packet a client coalesces behind its
+  Finished in the same datagram — small-medium
 - Congestion-control refinements (RFC 9002): NewReno gates the send loop (slow
   start, congestion avoidance, and recovery halving on ACK-detected loss), but two
   pieces are deferred — feeding timer/PTO-detected losses to the controller (only
@@ -168,7 +174,8 @@ changes by profile-share, not headline req/s.
 ### External interop check
 
 `scripts/h3interop.sh` already gates every PR on the quiche and ngtcp2 clients
-(downloads, uploads, multiplexing, with and without packet loss). Remaining:
+(downloads, uploads, multiplexing, an ngtcp2 key update, with and without packet
+loss). Remaining:
 
 - Run the QUIC Interop Runner (quic-interop-runner) on a schedule: a server
   image following its endpoint contract, so every client stack runs its test

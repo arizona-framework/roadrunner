@@ -9,8 +9,8 @@
 %% is AES-128-GCM throughout: a 16-byte key, a 12-byte IV, and a 16-byte
 %% header-protection key, each via HKDF-Expand-Label over SHA-256
 %% (`roadrunner_quic_hkdf`). `update/1` derives the next generation's
-%% secret and keys so the server can answer a peer-initiated key update
-%% (§6.1), which a v1 endpoint MUST support.
+%% secret and packet-protection key and IV so the server can answer a
+%% peer-initiated key update (§6.1), which a v1 endpoint MUST support.
 
 -export([
     initial_secret/1,
@@ -21,11 +21,15 @@
     for_connection/2
 ]).
 
--export_type([keys/0]).
+-export_type([keys/0, packet_keys/0]).
 
 -type keys() :: #{
     key := roadrunner_quic_aead:aead_key(), iv := binary(), hp := roadrunner_quic_aead:hp()
 }.
+
+%% The AEAD key and IV of one 1-RTT key generation: what a key update
+%% changes, since the header-protection key stays the same (RFC 9001 §6.1).
+-type packet_keys() :: #{key := roadrunner_quic_aead:aead_key(), iv := binary()}.
 
 %% RFC 9001 §5.2: the QUIC v1 Initial salt,
 %% 0x38762cf7f55934b34d179ae6a4c80cadccbb7f0a.
@@ -78,14 +82,18 @@ traffic_keys(Secret) ->
 -doc """
 Derive the next key generation for a key update (RFC 9001 §6.1):
 `HKDF-Expand-Label(current_secret, "quic ku", "", 32)` gives the updated
-secret, and the new keys follow from it. Returns `{UpdatedSecret, Keys}`;
-the caller keeps `UpdatedSecret` as the current secret for the following
-update.
+secret, and the new AEAD key and IV follow from it (§5.1). The
+header-protection key is not updated, so none is derived: the caller
+keeps the one it has. Returns `{UpdatedSecret, PacketKeys}`; the caller
+keeps `UpdatedSecret` to derive the generation after this one.
 """.
--spec update(binary()) -> {binary(), keys()}.
+-spec update(binary()) -> {binary(), packet_keys()}.
 update(Secret) ->
     UpdatedSecret = roadrunner_quic_hkdf:expand_label(Secret, ~"quic ku", <<>>, 32),
-    {UpdatedSecret, traffic_keys(UpdatedSecret)}.
+    {UpdatedSecret, #{
+        key => roadrunner_quic_hkdf:expand_label(UpdatedSecret, ~"quic key", <<>>, 16),
+        iv => roadrunner_quic_hkdf:expand_label(UpdatedSecret, ~"quic iv", <<>>, 12)
+    }}.
 
 -doc """
 Prepare derived keys for the connection process that will use them, in
@@ -96,14 +104,17 @@ instead of a fresh key setup (RFC 9001 §5.4.3: ECB has no state between
 blocks). From OTP 28 the packet-protection key likewise becomes an
 AES-128-GCM sealing or opening state. A state must not be used from two
 processes at once, so call this where the keys are installed and use
-them only in that process.
+them only in that process. The packet keys of a key update (`update/1`)
+carry no header-protection key, so only their AEAD key is prepared.
 """.
--spec for_connection(keys(), seal | open) -> keys().
+-spec for_connection(Keys, seal | open) -> Keys when Keys :: keys() | packet_keys().
 for_connection(#{key := Key, hp := HP} = Keys, Direction) when is_binary(Key), is_binary(HP) ->
     Keys#{
         key := aead_state(Key, Direction),
         hp := crypto:crypto_init(aes_128_ecb, HP, true)
-    }.
+    };
+for_connection(#{key := Key} = Keys, Direction) when is_binary(Key) ->
+    Keys#{key := aead_state(Key, Direction)}.
 
 -if(?OTP_RELEASE >= 28).
 -spec aead_state(binary(), seal | open) -> roadrunner_quic_aead:aead_key().
