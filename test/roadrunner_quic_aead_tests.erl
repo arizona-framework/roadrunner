@@ -68,6 +68,35 @@ rfc9001_a5_chacha20_short_header_test() ->
     ).
 
 %% =============================================================================
+%% AES-256-GCM with AES-256 header protection (RFC 9001 §5.3, §5.4.3), the
+%% AEAD of TLS_AES_256_GCM_SHA384, over the keys of
+%% `roadrunner_quic_keys_tests:aes_256_gcm_traffic_keys_test`. RFC 9001 has
+%% no AES-256 vector; the packet is A.5's (a PING, packet number 654360564
+%% in 3 bytes, header 4200bff4) sealed and masked with Python's
+%% `cryptography` AES-GCM and AES-ECB.
+%% =============================================================================
+
+aes_256_gcm_short_header_test() ->
+    Key =
+        {aes_256_gcm, hex(~"7501e53e394e2541a2f15bc462febcdda98414c8b53e3e2457944630350e12b8")},
+    IV = hex(~"9f3186ec885e99cd55aa55df"),
+    HP =
+        {aes_256_ecb, hex(~"8c8299eb2ef6405e4ba7f451703409f8a0d37969067808805eec3a1209950a92")},
+    PN = 654360564,
+    PNOffset = 1,
+    Header = hex(~"4200bff4"),
+    Plaintext = <<16#01>>,
+    Ciphertext = hex(~"32925f5daa5bbf574b93c50baa07f4db6b"),
+    Packet = hex(~"599dc51832925f5daa5bbf574b93c50baa07f4db6b"),
+    ?assertEqual(Ciphertext, ?M:seal(Key, IV, PN, Header, Plaintext)),
+    ?assertEqual({ok, Plaintext}, ?M:open(Key, IV, PN, Header, Ciphertext)),
+    Protected = ?M:protect_header(HP, Header, Ciphertext, PNOffset),
+    ?assertEqual(Packet, <<Protected/binary, Ciphertext/binary>>),
+    ?assertEqual(
+        {ok, Header, 3, 49140, Ciphertext}, ?M:unprotect_header(HP, Packet, PNOffset)
+    ).
+
+%% =============================================================================
 %% Failure paths: open and unprotect never crash on bad input.
 %% =============================================================================
 
@@ -83,6 +112,7 @@ open_rejects_tampered_payload_test_() ->
         end)
      || Key <- [
             {aes_128_gcm, hex(~"000102030405060708090a0b0c0d0e0f")},
+            {aes_256_gcm, binary:copy(<<16#2b>>, 32)},
             {chacha20_poly1305, binary:copy(<<16#2a>>, 32)}
         ]
     ].

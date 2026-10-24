@@ -20,8 +20,8 @@ rfc5869_a1_basic_test() ->
     OKM = hex(
         ~"3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
     ),
-    ?assertEqual(PRK, ?M:extract(Salt, IKM)),
-    ?assertEqual(OKM, ?M:expand(PRK, Info, 42)).
+    ?assertEqual(PRK, ?M:extract(sha256, Salt, IKM)),
+    ?assertEqual(OKM, ?M:expand(sha256, PRK, Info, 42)).
 
 rfc5869_a2_longer_inputs_test() ->
     IKM = list_to_binary(lists:seq(16#00, 16#4f)),
@@ -31,8 +31,8 @@ rfc5869_a2_longer_inputs_test() ->
     OKM = hex(
         ~"b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87"
     ),
-    ?assertEqual(PRK, ?M:extract(Salt, IKM)),
-    ?assertEqual(OKM, ?M:expand(PRK, Info, 82)).
+    ?assertEqual(PRK, ?M:extract(sha256, Salt, IKM)),
+    ?assertEqual(OKM, ?M:expand(sha256, PRK, Info, 82)).
 
 rfc5869_a3_empty_salt_test() ->
     IKM = binary:copy(<<16#0b>>, 22),
@@ -41,8 +41,8 @@ rfc5869_a3_empty_salt_test() ->
         ~"8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"
     ),
     %% An empty salt defaults to HashLen zero bytes (RFC 5869 §2.2).
-    ?assertEqual(PRK, ?M:extract(<<>>, IKM)),
-    ?assertEqual(OKM, ?M:expand(PRK, <<>>, 42)).
+    ?assertEqual(PRK, ?M:extract(sha256, <<>>, IKM)),
+    ?assertEqual(OKM, ?M:expand(sha256, PRK, <<>>, 42)).
 
 %% =============================================================================
 %% HKDF-Expand-Label (RFC 8446 §7.1) against RFC 9001 Appendix A.1, where
@@ -54,14 +54,56 @@ expand_label_rfc9001_test() ->
     InitialSecret = hex(~"7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44"),
     ClientSecret = hex(~"c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"),
     ServerSecret = hex(~"3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b"),
-    ?assertEqual(ClientSecret, ?M:expand_label(InitialSecret, ~"client in", <<>>, 32)),
-    ?assertEqual(ServerSecret, ?M:expand_label(InitialSecret, ~"server in", <<>>, 32)).
+    ?assertEqual(ClientSecret, ?M:expand_label(sha256, InitialSecret, ~"client in", <<>>, 32)),
+    ?assertEqual(ServerSecret, ?M:expand_label(sha256, InitialSecret, ~"server in", <<>>, 32)).
+
+%% =============================================================================
+%% SHA-384 (the TLS_AES_256_GCM_SHA384 hash). RFC 5869 publishes no SHA-384
+%% vectors, so these run the Appendix A.1 and A.3 inputs under SHA-384, with
+%% the expected values computed by two independent implementations (Python's
+%% `cryptography` HKDF and OTP ssl's `tls_v1:hkdf_extract/3` and
+%% `hkdf_expand/4`), which agree. The 100-byte expansion spans three 48-byte
+%% blocks, and the absent salt defaults to 48 zero bytes.
+%% =============================================================================
+
+sha384_a1_inputs_test() ->
+    IKM = binary:copy(<<16#0b>>, 22),
+    Salt = hex(~"000102030405060708090a0b0c"),
+    Info = hex(~"f0f1f2f3f4f5f6f7f8f9"),
+    PRK = hex(
+        ~"704b39990779ce1dc548052c7dc39f303570dd13fb39f7acc564680bef80e8dec70ee9a7e1f3e293ef68eceb072a5ade"
+    ),
+    OKM = hex(
+        ~"9b5097a86038b805309076a44b3a9f38063e25b516dcbf369f394cfab43685f748b6457763e4f0204fc5d95d1da3e62587b22eb8943d0fab6bb631a2fe9df1a68c6ce5d56116a52005b3f122b88b39b7251fcd6c44d3ef25f20ed96802bf1b2c1d98bf74"
+    ),
+    ?assertEqual(PRK, ?M:extract(sha384, Salt, IKM)),
+    ?assertEqual(OKM, ?M:expand(sha384, PRK, Info, 100)).
+
+sha384_a3_empty_salt_test() ->
+    IKM = binary:copy(<<16#0b>>, 22),
+    PRK = hex(
+        ~"10e40cf072a4c5626e43dd22c1cf727d4bb140975c9ad0cbc8e45b40068f8f0ba57cdb598af9dfa6963a96899af047e5"
+    ),
+    OKM = hex(
+        ~"c8c96e710f89b0d7990bca68bcdec8cf854062e54c73a7abc743fade9b242daacc1cea5670415b52849c97c4e787c1f2130fdaaed2efee2fd43ab373b705464ffbc36e70ca2a61a5ebf44d1bf8217df59cbe9dcf94a5a4546503e7f9c02e97b0fac5cb8f"
+    ),
+    ?assertEqual(PRK, ?M:extract(sha384, <<>>, IKM)),
+    ?assertEqual(OKM, ?M:expand(sha384, PRK, <<>>, 100)).
+
+hash_len_test() ->
+    ?assertEqual(32, ?M:hash_len(sha256)),
+    ?assertEqual(48, ?M:hash_len(sha384)).
+
+%% RFC 5869 §2.3: HKDF-Expand emits at most 255 * HashLen octets.
+expand_over_limit_crashes_test() ->
+    ?assertError({badmatch, false}, ?M:expand(sha256, <<0:256>>, <<>>, 255 * 32 + 1)),
+    ?assertEqual(255 * 48, byte_size(?M:expand(sha384, <<0:384>>, <<>>, 255 * 48))).
 
 %% A zero-length expansion yields the empty binary (RFC 5869 §2.3, N=0).
 expand_zero_length_test() ->
-    PRK = ?M:extract(~"salt", ~"ikm"),
-    ?assertEqual(<<>>, ?M:expand(PRK, ~"info", 0)),
-    ?assertEqual(<<>>, ?M:expand_label(PRK, ~"label", <<>>, 0)).
+    PRK = ?M:extract(sha256, ~"salt", ~"ikm"),
+    ?assertEqual(<<>>, ?M:expand(sha256, PRK, ~"info", 0)),
+    ?assertEqual(<<>>, ?M:expand_label(sha256, PRK, ~"label", <<>>, 0)).
 
 %% Uppercase before decoding so the literals are portable across OTP
 %% versions regardless of `binary:decode_hex/1`'s lowercase handling.

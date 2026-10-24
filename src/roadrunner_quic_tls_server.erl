@@ -35,18 +35,21 @@
 %%
 %% Negotiation that the codec layer leaves out is done here: the TLS version
 %% (the client must offer TLS 1.3 in supported_versions, RFC 8446 §4.2.1), the
-%% cipher suite (TLS_AES_128_GCM_SHA256 or TLS_CHACHA20_POLY1305_SHA256, picked
-%% from the client's offer, RFC 8446 §4.1.1), the key exchange group (x25519
-%% or secp256r1, from the client's supported_groups and key_share, §4.2.7,
-%% §4.2.8) and its ECDHE shared secret, the CertificateVerify signature scheme
-%% (the cert key's scheme intersected with the client's offer), and the ALPN
+%% cipher suite (TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 or
+%% TLS_CHACHA20_POLY1305_SHA256, picked from the client's offer, RFC 8446
+%% §4.1.1), the key exchange group (x25519 or secp256r1, from the client's
+%% supported_groups and key_share, §4.2.7, §4.2.8) and its ECDHE shared
+%% secret, the CertificateVerify signature scheme (the cert key's scheme
+%% intersected with the client's offer), and the ALPN
 %% protocol (the client must offer the configured one, RFC 7301 §3.2). The
 %% mandatory quic_transport_parameters extension (RFC 9001 §8.2) and the
 %% client's initial_source_connection_id binding (RFC 9000 §7.3, against the
 %% Initial Source Connection ID passed in as `peer_scid`) are also enforced
-%% here. Both cipher suites hash with SHA-256, so the key schedule is the same
-%% for either; the suite picks the AEAD of the Handshake and 1-RTT packet keys
-%% (RFC 9001 §5.3). Attacker-controlled inputs fail with a flat `{error,
+%% here. The suite picks the hash of the whole key schedule (RFC 8446 §7.1:
+%% the transcript hashes, the HelloRetryRequest's message_hash, the traffic
+%% secrets and the Finished MACs; SHA-384 for TLS_AES_256_GCM_SHA384, SHA-256
+%% for the others) and the AEAD of the Handshake and 1-RTT packet keys (RFC
+%% 9001 §5.3). Attacker-controlled inputs fail with a flat `{error,
 %% atom()}` (a malformed ClientHello, no TLS 1.3 on offer, no common cipher
 %% suite, a missing supported_groups or key_share, no common group, an invalid
 %% key share, a second ClientHello that does not answer the HelloRetryRequest,
@@ -74,6 +77,7 @@
 
 %% Cipher suites (RFC 8446 Appendix B.4) supported in v1.
 -define(TLS_AES_128_GCM_SHA256, 16#1301).
+-define(TLS_AES_256_GCM_SHA384, 16#1302).
 -define(TLS_CHACHA20_POLY1305_SHA256, 16#1303).
 
 %% Key exchange groups (RFC 8446 §4.2.7) supported in v1.
@@ -102,7 +106,10 @@
     %% the server flight.
     stage = client_hello ::
         client_hello | {retried, iolist(), cipher_suite(), group()} | flight_sent,
-    %% Filled by process_client_hello/2, read by process_client_finished/2.
+    %% Filled by process_client_hello/2, read by process_client_finished/2:
+    %% the negotiated suite's hash, the client handshake traffic secret, and
+    %% the transcript hash the client Finished covers.
+    hash = sha256 :: roadrunner_quic_hkdf:hash(),
     client_hs_secret = <<>> :: binary(),
     client_finished_hash = <<>> :: binary()
 }).
@@ -126,8 +133,10 @@
 -type install() ::
     {handshake | application, server | client, roadrunner_quic_aead:cipher(), Secret :: binary()}.
 
-%% A supported cipher suite: its codepoint and packet-protection AEAD.
--type cipher_suite() :: {non_neg_integer(), roadrunner_quic_aead:cipher()}.
+%% A supported cipher suite: its codepoint, packet-protection AEAD, and the
+%% hash of its key schedule.
+-type cipher_suite() ::
+    {non_neg_integer(), roadrunner_quic_aead:cipher(), roadrunner_quic_hkdf:hash()}.
 
 %% A supported key exchange group: its NamedGroup codepoint and the curve
 %% `crypto` names it by.
@@ -243,11 +252,11 @@ After this the loop confirms the handshake and emits HANDSHAKE_DONE.
 """.
 -spec process_client_finished(binary(), t()) -> ok | {error, handshake_failure}.
 process_client_finished(ClientFinishedBody, #server{
-    client_hs_secret = ClientHsSecret, client_finished_hash = TranscriptHash
+    hash = Hash, client_hs_secret = ClientHsSecret, client_finished_hash = TranscriptHash
 }) ->
     case
         roadrunner_quic_tls_auth:verify_client_finished(
-            ClientFinishedBody, ClientHsSecret, TranscriptHash
+            Hash, ClientFinishedBody, ClientHsSecret, TranscriptHash
         )
     of
         true -> ok;
@@ -271,20 +280,28 @@ check_version(Versions) ->
         false -> {error, protocol_version}
     end.
 
-%% The cipher suite and its packet-protection AEAD (RFC 9001 §5.3), in server
-%% preference order: TLS_AES_128_GCM_SHA256 (mandatory to implement, RFC 8446
-%% §9.1, and the Initial packets' AEAD) before TLS_CHACHA20_POLY1305_SHA256.
-%% The first one the client offered wins. Offered suites the server does not
-%% support are ignored (RFC 8446 §4.1.2, RFC 9001 §5.3); no overlap at all is a
-%% handshake_failure (RFC 8446 §4.1.1).
+%% The cipher suite with its packet-protection AEAD (RFC 9001 §5.3) and hash
+%% (RFC 8446 Appendix B.4), in server preference order, cheapest first:
+%% TLS_AES_128_GCM_SHA256 (mandatory to implement, RFC 8446 §9.1, and the
+%% Initial packets' AEAD), then TLS_AES_256_GCM_SHA384 (a SHOULD, §9.1), then
+%% TLS_CHACHA20_POLY1305_SHA256. On a server with AES instructions AES-256-GCM
+%% seals a 1200-byte packet in about 1.1x the time of AES-128-GCM and
+%% ChaCha20-Poly1305 in about 2.3x, so ChaCha20 is picked only for a client
+%% that offers neither AES suite. The first one the client offered wins.
+%% Offered suites the server does not support are ignored (RFC 8446 §4.1.2,
+%% RFC 9001 §5.3); no overlap at all is a handshake_failure (RFC 8446
+%% §4.1.1).
 -spec select_cipher_suite([non_neg_integer()]) ->
     {ok, cipher_suite()} | {error, no_common_cipher_suite}.
 select_cipher_suite(Offered) ->
     Supported = [
-        {?TLS_AES_128_GCM_SHA256, aes_128_gcm},
-        {?TLS_CHACHA20_POLY1305_SHA256, chacha20_poly1305}
+        {?TLS_AES_128_GCM_SHA256, aes_128_gcm, sha256},
+        {?TLS_AES_256_GCM_SHA384, aes_256_gcm, sha384},
+        {?TLS_CHACHA20_POLY1305_SHA256, chacha20_poly1305, sha256}
     ],
-    case [Suite || {Codepoint, _Aead} = Suite <- Supported, lists:member(Codepoint, Offered)] of
+    case
+        [Suite || {Codepoint, _Aead, _Hash} = Suite <- Supported, lists:member(Codepoint, Offered)]
+    of
         [Suite | _] -> {ok, Suite};
         [] -> {error, no_common_cipher_suite}
     end.
@@ -376,18 +393,23 @@ respond(_ClientHelloBody, _ClientHello, _CipherSuite, _KeyExchange, _Scheme, _St
 
 %% Ask for a key share in the selected group with a HelloRetryRequest (RFC
 %% 8446 §4.1.4). The transcript replaces the first ClientHello with its
-%% message_hash (§4.4.1) and continues with the HelloRetryRequest; that is
-%% all that is kept for the second ClientHello.
+%% message_hash under the selected suite's hash (§4.4.1) and continues with
+%% the HelloRetryRequest; that is all that is kept for the second
+%% ClientHello.
 -spec hello_retry_request(binary(), binary(), cipher_suite(), group(), t()) ->
     {retry, iolist(), t()}.
 hello_retry_request(
-    ClientHelloBody, SessionId, {Suite, _Aead} = CipherSuite, {Codepoint, _Curve} = Group, State
+    ClientHelloBody,
+    SessionId,
+    {Suite, _Aead, Hash} = CipherSuite,
+    {Codepoint, _Curve} = Group,
+    State
 ) ->
     HelloRetryRequest = roadrunner_quic_tls_hello:build_hello_retry_request(#{
         session_id => SessionId, cipher_suite => Suite, group => Codepoint
     }),
     ClientHello1 = roadrunner_quic_tls_handshake:encode(?CLIENT_HELLO, ClientHelloBody),
-    Transcript = [roadrunner_quic_tls_crypto:message_hash(ClientHello1), HelloRetryRequest],
+    Transcript = [roadrunner_quic_tls_crypto:message_hash(Hash, ClientHello1), HelloRetryRequest],
     {retry, HelloRetryRequest, State#server{stage = {retried, Transcript, CipherSuite, Group}}}.
 
 %% Run the key exchange, then build the server flight on top of `Transcript`
@@ -510,10 +532,11 @@ scheme_for_key(#'ECPrivateKey'{parameters = {namedCurve, ?'secp256r1'}}) ->
 
 %% Build the full server flight, threading the transcript across the four
 %% hash boundaries and deriving the handshake then application traffic
-%% secrets, whose packet keys protect with the selected suite's AEAD.
+%% secrets over the selected suite's hash, whose packet keys protect with
+%% the suite's AEAD.
 %% `Transcript` is what precedes this ClientHello: nothing, or the first
 %% ClientHello's message_hash and the HelloRetryRequest (RFC 8446 §4.4.1).
-%% The transcript is an iolist of framed messages; `transcript_hash/1`
+%% The transcript is an iolist of framed messages; `transcript_hash/2`
 %% accepts iodata, so it is never flattened here.
 -spec build_flight(iolist(), binary(), t(), #{
     session_id := binary(),
@@ -534,7 +557,7 @@ build_flight(
     } = State,
     #{
         session_id := SessionId,
-        cipher_suite := {CipherSuite, Aead},
+        cipher_suite := {CipherSuite, Aead, Hash},
         server_share := ServerShare,
         shared_secret := SharedSecret,
         scheme := Scheme
@@ -553,14 +576,14 @@ build_flight(
 
     %% Handshake traffic secrets from the transcript through ServerHello.
     HandshakeSecret = roadrunner_quic_tls_crypto:handshake_secret(
-        roadrunner_quic_tls_crypto:early_secret(), SharedSecret
+        Hash, roadrunner_quic_tls_crypto:early_secret(Hash), SharedSecret
     ),
-    HelloHash = roadrunner_quic_tls_crypto:transcript_hash(ThroughServerHello),
+    HelloHash = roadrunner_quic_tls_crypto:transcript_hash(Hash, ThroughServerHello),
     ClientHsSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        client, handshake, HandshakeSecret, HelloHash
+        Hash, client, handshake, HandshakeSecret, HelloHash
     ),
     ServerHsSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        server, handshake, HandshakeSecret, HelloHash
+        Hash, server, handshake, HandshakeSecret, HelloHash
     ),
 
     %% EncryptedExtensions + Certificate (Handshake level).
@@ -572,26 +595,26 @@ build_flight(
 
     %% CertificateVerify signs the transcript through Certificate; the
     %% emitted (randomized) bytes feed the transcript, not a rebuild.
-    CertificateHash = roadrunner_quic_tls_crypto:transcript_hash(ThroughCertificate),
+    CertificateHash = roadrunner_quic_tls_crypto:transcript_hash(Hash, ThroughCertificate),
     CertificateVerify = roadrunner_quic_tls_auth:build_certificate_verify(
         Scheme, PrivKey, CertificateHash
     ),
     ThroughCertificateVerify = [ThroughCertificate, CertificateVerify],
 
     %% Server Finished verify_data over the transcript through CertVerify.
-    CertVerifyHash = roadrunner_quic_tls_crypto:transcript_hash(ThroughCertificateVerify),
-    Finished = roadrunner_quic_tls_auth:build_finished(ServerHsSecret, CertVerifyHash),
+    CertVerifyHash = roadrunner_quic_tls_crypto:transcript_hash(Hash, ThroughCertificateVerify),
+    Finished = roadrunner_quic_tls_auth:build_finished(Hash, ServerHsSecret, CertVerifyHash),
     ThroughFinished = [ThroughCertificateVerify, Finished],
 
     %% Application traffic secrets from the transcript through the server
     %% Finished; the client Finished is verified over the same hash.
-    MasterSecret = roadrunner_quic_tls_crypto:master_secret(HandshakeSecret),
-    FinishedHash = roadrunner_quic_tls_crypto:transcript_hash(ThroughFinished),
+    MasterSecret = roadrunner_quic_tls_crypto:master_secret(Hash, HandshakeSecret),
+    FinishedHash = roadrunner_quic_tls_crypto:transcript_hash(Hash, ThroughFinished),
     ClientApSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        client, application, MasterSecret, FinishedHash
+        Hash, client, application, MasterSecret, FinishedHash
     ),
     ServerApSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        server, application, MasterSecret, FinishedHash
+        Hash, server, application, MasterSecret, FinishedHash
     ),
 
     Flight = #{
@@ -606,6 +629,7 @@ build_flight(
     ],
     State1 = State#server{
         stage = flight_sent,
+        hash = Hash,
         client_hs_secret = ClientHsSecret,
         client_finished_hash = FinishedHash
     },

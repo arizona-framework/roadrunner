@@ -72,19 +72,37 @@ build_finished_rfc8448_test() ->
     ServerHsSecret = hex("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"),
     TranscriptHash = hex("91208a9082bb48b14e2f607d839c0d3a55c4f8e1fbb88e3c1ba0e2a32be88a59"),
     VerifyData = hex("5d84b2762deff4fcd2a765d6567d94a9f32e4553166893ad86769457e40564ca"),
-    Built = iolist_to_binary(?M:build_finished(ServerHsSecret, TranscriptHash)),
+    Built = iolist_to_binary(?M:build_finished(sha256, ServerHsSecret, TranscriptHash)),
     ?assertEqual(<<20, 0, 0, 32, VerifyData/binary>>, Built).
+
+%% Over SHA-384 (TLS_AES_256_GCM_SHA384) the verify_data is 48 bytes; one of
+%% another length (here SHA-256's 32) does not match, and does not crash.
+verify_client_finished_sha384_test() ->
+    Secret = binary:copy(<<5>>, 48),
+    Hash = crypto:hash(sha384, ~"transcript"),
+    Expected = roadrunner_quic_tls_crypto:verify_data(
+        sha384, roadrunner_quic_tls_crypto:finished_key(sha384, Secret), Hash
+    ),
+    ?assertEqual(48, byte_size(Expected)),
+    ?assertEqual(
+        iolist_to_binary(roadrunner_quic_tls_handshake:encode(20, Expected)),
+        iolist_to_binary(?M:build_finished(sha384, Secret, Hash))
+    ),
+    ?assert(?M:verify_client_finished(sha384, Expected, Secret, Hash)),
+    <<Short:32/binary, _/binary>> = Expected,
+    ?assertNot(?M:verify_client_finished(sha384, Short, Secret, Hash)),
+    ?assertNot(?M:verify_client_finished(sha384, <<>>, Secret, Hash)).
 
 verify_client_finished_test() ->
     Secret = hex("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"),
     Hash = hex("96088718a85d2c0d2b21a16a7f637eba132bd1a01feac57b8f8ec571ef41c47c"),
     Expected = roadrunner_quic_tls_crypto:verify_data(
-        roadrunner_quic_tls_crypto:finished_key(Secret), Hash
+        sha256, roadrunner_quic_tls_crypto:finished_key(sha256, Secret), Hash
     ),
-    ?assert(?M:verify_client_finished(Expected, Secret, Hash)),
+    ?assert(?M:verify_client_finished(sha256, Expected, Secret, Hash)),
     %% A single flipped byte fails the constant-time compare.
     <<First, Rest/binary>> = Expected,
-    ?assertNot(?M:verify_client_finished(<<(First bxor 1), Rest/binary>>, Secret, Hash)).
+    ?assertNot(?M:verify_client_finished(sha256, <<(First bxor 1), Rest/binary>>, Secret, Hash)).
 
 %% =============================================================================
 %% Helpers

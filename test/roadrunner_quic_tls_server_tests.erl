@@ -21,6 +21,8 @@
 -define(CIPHER_AES_128_GCM_SHA256, 16#1301).
 -define(CIPHER_AES_256_GCM_SHA384, 16#1302).
 -define(CIPHER_CHACHA20_POLY1305_SHA256, 16#1303).
+%% A TLS 1.3 suite the server does not support (RFC 8446 Appendix B.4).
+-define(CIPHER_AES_128_CCM_SHA256, 16#1304).
 -define(GROUP_SECP256R1, 16#0017).
 -define(GROUP_SECP384R1, 16#0018).
 -define(GROUP_X25519, 16#001D).
@@ -65,6 +67,15 @@ chacha20_handshake_test() ->
         suite => ?CIPHER_CHACHA20_POLY1305_SHA256, aead => chacha20_poly1305
     }).
 
+%% A client offering only TLS_AES_256_GCM_SHA384 gets it: the whole key
+%% schedule runs over SHA-384 (RFC 8446 §7.1), so every secret, transcript
+%% hash and Finished verify_data is 48 bytes, and the Handshake and 1-RTT
+%% keys are AES-256-GCM keys (RFC 9001 §5.3).
+aes_256_gcm_handshake_test() ->
+    assert_full_handshake(ecdsa, #{
+        suite => ?CIPHER_AES_256_GCM_SHA384, aead => aes_256_gcm, hash => sha384
+    }).
+
 %% A client offering only secp256r1 gets ECDHE over P-256 (RFC 8446 §7.4.2):
 %% the server's share is an uncompressed P-256 point (§4.2.8.2).
 p256_handshake_test() ->
@@ -87,8 +98,23 @@ assert_full_handshake(KeyType, Opts) ->
 %% second ClientHello, with the first one replaced by its message_hash in
 %% the transcript (§4.4.1).
 hello_retry_request_handshake_test() ->
-    #{client_pub := ClientPub, priv_key := PrivKey} = Client = client(rsa, #{}),
-    Offer = #{groups => [?GROUP_X25519MLKEM768, ?GROUP_X25519], session_id => <<7, 7, 7>>},
+    assert_hello_retry_request_handshake(#{}).
+
+%% The same over TLS_AES_256_GCM_SHA384: the message_hash that replaces the
+%% first ClientHello is its SHA-384 hash, 48 bytes (RFC 8446 §4.4.1).
+aes_256_gcm_hello_retry_request_handshake_test() ->
+    assert_hello_retry_request_handshake(#{
+        suite => ?CIPHER_AES_256_GCM_SHA384, aead => aes_256_gcm, hash => sha384
+    }).
+
+assert_hello_retry_request_handshake(Opts) ->
+    #{client_pub := ClientPub, priv_key := PrivKey, suite := Suite, hash := Hash} =
+        Client = client(rsa, Opts),
+    Offer = #{
+        groups => [?GROUP_X25519MLKEM768, ?GROUP_X25519],
+        session_id => <<7, 7, 7>>,
+        cipher_suites => [Suite]
+    },
     ClientHello1 = client_hello_for(Client, Offer#{
         key_shares => [{?GROUP_X25519MLKEM768, crypto:strong_rand_bytes(1216)}]
     }),
@@ -98,7 +124,7 @@ hello_retry_request_handshake_test() ->
         #{
             random => crypto:hash(sha256, ~"HelloRetryRequest"),
             session_id => <<7, 7, 7>>,
-            cipher_suite => ?CIPHER_AES_128_GCM_SHA256,
+            cipher_suite => Suite,
             key_share => ?GROUP_X25519
         },
         server_hello_fields(HelloRetryRequest)
@@ -108,7 +134,8 @@ hello_retry_request_handshake_test() ->
     ClientHello1Framed = iolist_to_binary(
         roadrunner_quic_tls_handshake:encode(?CLIENT_HELLO, ClientHello1)
     ),
-    MessageHash = <<?MESSAGE_HASH, 32:24, (crypto:hash(sha256, ClientHello1Framed))/binary>>,
+    Digest = crypto:hash(Hash, ClientHello1Framed),
+    MessageHash = <<?MESSAGE_HASH, (byte_size(Digest)):24, Digest/binary>>,
     assert_flight(
         [MessageHash, HelloRetryRequest], ClientHello2, Flight, Installs, State2, Client
     ).
@@ -120,6 +147,7 @@ assert_flight(Transcript, ClientHelloBody, Flight, Installs, State1, #{
     client_priv := ClientPriv,
     suite := Suite,
     aead := Aead,
+    hash := Hash,
     scheme := Scheme,
     verify_key := VerifyKey,
     verify_params := {SigAlg, HashAlg, SigOpts}
@@ -154,29 +182,29 @@ assert_flight(Transcript, ClientHelloBody, Flight, Installs, State1, #{
     %% Re-derive the schedule independently from the emitted messages.
     Shared = crypto:compute_key(ecdh, ServerShare, ClientPriv, Curve),
     HandshakeSecret = roadrunner_quic_tls_crypto:handshake_secret(
-        roadrunner_quic_tls_crypto:early_secret(), Shared
+        Hash, roadrunner_quic_tls_crypto:early_secret(Hash), Shared
     ),
     ClientHelloFramed = roadrunner_quic_tls_handshake:encode(?CLIENT_HELLO, ClientHelloBody),
     ThroughServerHello = [Transcript, ClientHelloFramed, InitialGroup],
-    HelloHash = roadrunner_quic_tls_crypto:transcript_hash(ThroughServerHello),
+    HelloHash = roadrunner_quic_tls_crypto:transcript_hash(Hash, ThroughServerHello),
     ClientHsSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        client, handshake, HandshakeSecret, HelloHash
+        Hash, client, handshake, HandshakeSecret, HelloHash
     ),
     ServerHsSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        server, handshake, HandshakeSecret, HelloHash
+        Hash, server, handshake, HandshakeSecret, HelloHash
     ),
     ThroughCertificate = [ThroughServerHello, Ee, Cert],
-    CertificateHash = roadrunner_quic_tls_crypto:transcript_hash(ThroughCertificate),
+    CertificateHash = roadrunner_quic_tls_crypto:transcript_hash(Hash, ThroughCertificate),
     ThroughCertVerify = [ThroughCertificate, CertVerify],
-    CertVerifyHash = roadrunner_quic_tls_crypto:transcript_hash(ThroughCertVerify),
+    CertVerifyHash = roadrunner_quic_tls_crypto:transcript_hash(Hash, ThroughCertVerify),
     ThroughFinished = [ThroughCertVerify, Finished],
-    FinishedHash = roadrunner_quic_tls_crypto:transcript_hash(ThroughFinished),
-    MasterSecret = roadrunner_quic_tls_crypto:master_secret(HandshakeSecret),
+    FinishedHash = roadrunner_quic_tls_crypto:transcript_hash(Hash, ThroughFinished),
+    MasterSecret = roadrunner_quic_tls_crypto:master_secret(Hash, HandshakeSecret),
     ClientApSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        client, application, MasterSecret, FinishedHash
+        Hash, client, application, MasterSecret, FinishedHash
     ),
     ServerApSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        server, application, MasterSecret, FinishedHash
+        Hash, server, application, MasterSecret, FinishedHash
     ),
 
     %% Installs: handshake secrets before application secrets, server then
@@ -203,49 +231,83 @@ assert_flight(Transcript, ClientHelloBody, Flight, Installs, State1, #{
     {?FINISHED, ServerFinishedBody, <<>>} = deframe(Finished),
     ?assertEqual(
         roadrunner_quic_tls_crypto:verify_data(
-            roadrunner_quic_tls_crypto:finished_key(ServerHsSecret), CertVerifyHash
+            Hash, roadrunner_quic_tls_crypto:finished_key(Hash, ServerHsSecret), CertVerifyHash
         ),
         ServerFinishedBody
+    ),
+    %% Every secret and the verify_data are one hash length long.
+    HashLen = roadrunner_quic_hkdf:hash_len(Hash),
+    ?assertEqual(
+        [HashLen],
+        lists:usort([
+            byte_size(B)
+         || B <- [
+                HandshakeSecret,
+                MasterSecret,
+                ClientHsSecret,
+                ServerHsSecret,
+                ClientApSecret,
+                ServerApSecret,
+                ServerFinishedBody
+            ]
+        ])
     ),
 
     %% Client Finished round-trip: a correct one is accepted, a tampered
     %% one rejected. Built with the client handshake secret over the
     %% transcript through the server Finished.
     ClientFinishedBody = roadrunner_quic_tls_crypto:verify_data(
-        roadrunner_quic_tls_crypto:finished_key(ClientHsSecret), FinishedHash
+        Hash, roadrunner_quic_tls_crypto:finished_key(Hash, ClientHsSecret), FinishedHash
     ),
     ?assertEqual(ok, ?M:process_client_finished(ClientFinishedBody, State1)),
     <<First, Rest/binary>> = ClientFinishedBody,
     Tampered = <<(First bxor 1), Rest/binary>>,
-    ?assertEqual({error, handshake_failure}, ?M:process_client_finished(Tampered, State1)).
+    ?assertEqual({error, handshake_failure}, ?M:process_client_finished(Tampered, State1)),
+    %% A verify_data of the wrong length is a mismatch too, not a crash.
+    ?assertEqual({error, handshake_failure}, ?M:process_client_finished(Rest, State1)),
+    ?assertEqual(
+        {error, handshake_failure},
+        ?M:process_client_finished(<<ClientFinishedBody/binary, 0>>, State1)
+    ).
 
 %% =============================================================================
 %% Cipher suite and version negotiation (RFC 8446 §4.1.1, §4.2.1)
 %% =============================================================================
 
-%% Both supported suites on offer, ChaCha20 first: the server's preference
-%% (AES-128-GCM) wins.
+%% Every supported suite on offer, in the reverse of the server's order: the
+%% server's preference (AES-128-GCM) wins.
 prefers_aes_128_gcm_test() ->
     ?assertEqual(
         ?CIPHER_AES_128_GCM_SHA256,
-        negotiated_cipher_suite([?CIPHER_CHACHA20_POLY1305_SHA256, ?CIPHER_AES_128_GCM_SHA256])
+        negotiated_cipher_suite([
+            ?CIPHER_CHACHA20_POLY1305_SHA256,
+            ?CIPHER_AES_256_GCM_SHA384,
+            ?CIPHER_AES_128_GCM_SHA256
+        ])
     ).
 
-%% An offered suite the server does not support (TLS_AES_256_GCM_SHA384, and
+%% Without AES-128-GCM on offer, AES-256-GCM comes before ChaCha20.
+prefers_aes_256_gcm_over_chacha20_test() ->
+    ?assertEqual(
+        ?CIPHER_AES_256_GCM_SHA384,
+        negotiated_cipher_suite([?CIPHER_CHACHA20_POLY1305_SHA256, ?CIPHER_AES_256_GCM_SHA384])
+    ).
+
+%% An offered suite the server does not support (TLS_AES_128_CCM_SHA256, and
 %% an unassigned value) is ignored, not rejected (RFC 8446 §4.1.2, RFC 9001
 %% §5.3).
 ignores_unsupported_cipher_suites_test() ->
     ?assertEqual(
         ?CIPHER_CHACHA20_POLY1305_SHA256,
         negotiated_cipher_suite([
-            16#7A7A, ?CIPHER_AES_256_GCM_SHA384, ?CIPHER_CHACHA20_POLY1305_SHA256
+            16#7A7A, ?CIPHER_AES_128_CCM_SHA256, ?CIPHER_CHACHA20_POLY1305_SHA256
         ])
     ).
 
 no_common_cipher_suite_rejected_test() ->
     ?assertEqual(
         {error, no_common_cipher_suite},
-        process_offering(#{cipher_suites => [?CIPHER_AES_256_GCM_SHA384]})
+        process_offering(#{cipher_suites => [?CIPHER_AES_128_CCM_SHA256]})
     ).
 
 %% supported_versions offering only TLS 1.2, or absent altogether (a TLS 1.2
@@ -261,7 +323,7 @@ missing_supported_versions_rejected_test() ->
 version_checked_before_cipher_suite_test() ->
     ?assertEqual(
         {error, protocol_version},
-        process_offering(#{versions => [?TLS_1_2], cipher_suites => [?CIPHER_AES_256_GCM_SHA384]})
+        process_offering(#{versions => [?TLS_1_2], cipher_suites => [?CIPHER_AES_128_CCM_SHA256]})
     ).
 
 %% =============================================================================
@@ -506,7 +568,7 @@ server_random() ->
 %% A handshake's key material: the server's cert key of `KeyType` with its
 %% scheme and the client's inputs to verify it, plus the client's ephemeral
 %% key pair on `curve` (default x25519) and the suite it offers and expects
-%% (default TLS_AES_128_GCM_SHA256) with its AEAD.
+%% (default TLS_AES_128_GCM_SHA256) with its AEAD and hash.
 client(KeyType, Opts) ->
     {Scheme, PrivKey, VerifyKey, VerifyParams} = key_material(KeyType),
     Curve = maps:get(curve, Opts, x25519),
@@ -517,6 +579,7 @@ client(KeyType, Opts) ->
         client_priv => ClientPriv,
         suite => maps:get(suite, Opts, ?CIPHER_AES_128_GCM_SHA256),
         aead => maps:get(aead, Opts, aes_128_gcm),
+        hash => maps:get(hash, Opts, sha256),
         scheme => Scheme,
         priv_key => PrivKey,
         verify_key => VerifyKey,

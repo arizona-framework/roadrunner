@@ -82,10 +82,10 @@ certificate_verify_round_trip_test() ->
 finished_round_trip_test() ->
     TrafficSecret = crypto:strong_rand_bytes(32),
     Hash = crypto:strong_rand_bytes(32),
-    Framed = roadrunner_quic_tls_auth:build_finished(TrafficSecret, Hash),
+    Framed = roadrunner_quic_tls_auth:build_finished(sha256, TrafficSecret, Hash),
     [{20, Body}] = ?C:deframe_all(Framed),
-    FinishedKey = roadrunner_quic_tls_crypto:finished_key(TrafficSecret),
-    Expected = roadrunner_quic_tls_crypto:verify_data(FinishedKey, Hash),
+    FinishedKey = roadrunner_quic_tls_crypto:finished_key(sha256, TrafficSecret),
+    Expected = roadrunner_quic_tls_crypto:verify_data(sha256, FinishedKey, Hash),
     ?assertEqual(Expected, ?C:parse_finished(Body)).
 
 certificate_verify_signature_verifies_test() ->

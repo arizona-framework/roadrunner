@@ -5,10 +5,13 @@
 %% QUIC v1 endpoint: build the Certificate (§4.4.2), CertificateVerify
 %% (§4.4.3), and Finished (§4.4.4) messages, and verify the client's
 %% Finished. v1 signs with one of rsa_pss_rsae_sha256, ecdsa_secp256r1_sha256,
-%% or ed25519, all over SHA-256.
+%% or ed25519. A signature scheme names its own hash (RFC 8446 §4.2.3), so
+%% the CertificateVerify hashing does not change with the cipher suite; the
+%% transcript hash it signs and the Finished MAC do, and the Finished
+%% functions take the suite's hash.
 %%
 %% `roadrunner_quic_tls_handshake` frames the messages, and
-%% `roadrunner_quic_tls_crypto` (finished_key/1 + verify_data/2) backs the
+%% `roadrunner_quic_tls_crypto` (finished_key/2 + verify_data/3) backs the
 %% Finished MAC. The chosen signature scheme and the signing key come from
 %% the connection layer (which owns negotiation), and the certificate chain
 %% from `roadrunner_listener:quic_cert_key/1`. Builders return the framed
@@ -23,8 +26,8 @@
 -export([
     build_certificate/1,
     build_certificate_verify/3,
-    build_finished/2,
-    verify_client_finished/3
+    build_finished/3,
+    verify_client_finished/4
 ]).
 
 %% Handshake message types (RFC 8446 §4).
@@ -76,30 +79,34 @@ build_certificate_verify(Scheme, PrivateKey, TranscriptHash) ->
     roadrunner_quic_tls_handshake:encode(?CERTIFICATE_VERIFY, Body).
 
 %% =============================================================================
-%% build_finished/2 + verify_client_finished/3
+%% build_finished/3 + verify_client_finished/4
 %% =============================================================================
 
 -doc """
 Build a Finished message (RFC 8446 §4.4.4), framed as an iolist. The
-verify_data is `HMAC(finished_key(TrafficSecret), TranscriptHash)`; the
-server passes its handshake traffic secret and the transcript hash
-through CertificateVerify.
+verify_data is `HMAC(finished_key(TrafficSecret), TranscriptHash)` under
+the cipher suite's `Hash`; the server passes its handshake traffic secret
+and the transcript hash through CertificateVerify.
 """.
--spec build_finished(binary(), binary()) -> iolist().
-build_finished(TrafficSecret, TranscriptHash) ->
+-spec build_finished(roadrunner_quic_hkdf:hash(), binary(), binary()) -> iolist().
+build_finished(Hash, TrafficSecret, TranscriptHash) ->
     roadrunner_quic_tls_handshake:encode(
-        ?FINISHED, finished_verify_data(TrafficSecret, TranscriptHash)
+        ?FINISHED, finished_verify_data(Hash, TrafficSecret, TranscriptHash)
     ).
 
 -doc """
 Verify a client's Finished verify_data (RFC 8446 §4.4.4) in constant
-time. Recomputes `HMAC(finished_key(TrafficSecret), TranscriptHash)` (the
-client's handshake traffic secret, over the transcript through the server
-Finished) and compares it to `Received`.
+time. Recomputes `HMAC(finished_key(TrafficSecret), TranscriptHash)`
+under the cipher suite's `Hash` (the client's handshake traffic secret,
+over the transcript through the server Finished) and compares it to
+`Received`. A `Received` of the wrong length (not the hash length) does
+not match.
 """.
--spec verify_client_finished(binary(), binary(), binary()) -> boolean().
-verify_client_finished(Received, TrafficSecret, TranscriptHash) ->
-    crypto:hash_equals(Received, finished_verify_data(TrafficSecret, TranscriptHash)).
+-spec verify_client_finished(roadrunner_quic_hkdf:hash(), binary(), binary(), binary()) ->
+    boolean().
+verify_client_finished(Hash, Received, TrafficSecret, TranscriptHash) ->
+    Expected = finished_verify_data(Hash, TrafficSecret, TranscriptHash),
+    byte_size(Received) =:= byte_size(Expected) andalso crypto:hash_equals(Received, Expected).
 
 %% =============================================================================
 %% Internal
@@ -115,10 +122,10 @@ cert_list([Cert | Rest]) ->
     [<<(byte_size(Cert)):24>>, Cert, <<0:16>> | cert_list(Rest)].
 
 %% The Finished verify_data via the C2 key schedule.
--spec finished_verify_data(binary(), binary()) -> binary().
-finished_verify_data(TrafficSecret, TranscriptHash) ->
-    FinishedKey = roadrunner_quic_tls_crypto:finished_key(TrafficSecret),
-    roadrunner_quic_tls_crypto:verify_data(FinishedKey, TranscriptHash).
+-spec finished_verify_data(roadrunner_quic_hkdf:hash(), binary(), binary()) -> binary().
+finished_verify_data(Hash, TrafficSecret, TranscriptHash) ->
+    FinishedKey = roadrunner_quic_tls_crypto:finished_key(Hash, TrafficSecret),
+    roadrunner_quic_tls_crypto:verify_data(Hash, FinishedKey, TranscriptHash).
 
 %% Sign the CertificateVerify content under the negotiated scheme, using
 %% the same OTP crypto primitives as the dep.
