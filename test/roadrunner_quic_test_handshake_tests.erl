@@ -18,7 +18,6 @@ full_handshake_round_trip_test() ->
         PrivKey = public_key:generate_key({rsa, 2048, 65537}),
     ServerPub = #'RSAPublicKey'{modulus = N, publicExponent = E},
     {ClientPub, ClientPriv} = crypto:generate_key(ecdh, x25519),
-    {ServerEphPub, ServerEphPriv} = crypto:generate_key(ecdh, x25519),
     ClientSCID = <<1, 2, 3, 4>>,
     %% Server transport params the production decoder accepts as peer params
     %% (no server-only parameters, which the server-side decoder rejects).
@@ -28,8 +27,6 @@ full_handshake_round_trip_test() ->
         priv_key => PrivKey,
         alpn => ~"h3",
         transport_params => ServerParams,
-        eph_pub => ServerEphPub,
-        eph_priv => ServerEphPriv,
         server_random => crypto:strong_rand_bytes(32),
         peer_scid => ClientSCID
     }),
@@ -69,15 +66,12 @@ rejects_bad_certificate_verify_test() ->
     #'RSAPrivateKey'{modulus = N, publicExponent = E} = WrongKey,
     WrongPub = #'RSAPublicKey'{modulus = N, publicExponent = E},
     {ClientPub, ClientPriv} = crypto:generate_key(ecdh, x25519),
-    {ServerEphPub, ServerEphPriv} = crypto:generate_key(ecdh, x25519),
     ClientSCID = <<1, 2, 3, 4>>,
     ServerState = ?SERVER:new(#{
         cert_chain => [~"leaf-der"],
         priv_key => PrivKey,
         alpn => ~"h3",
         transport_params => #{initial_source_connection_id => <<9, 9, 9, 9>>},
-        eph_pub => ServerEphPub,
-        eph_priv => ServerEphPriv,
         server_random => crypto:strong_rand_bytes(32),
         peer_scid => ClientSCID
     }),

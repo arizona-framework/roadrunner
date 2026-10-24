@@ -29,6 +29,10 @@
 #   chacha20     GET 100 bytes offering only TLS_CHACHA20_POLY1305_SHA256
 #   chacha20-ku  keyupdate offering only TLS_CHACHA20_POLY1305_SHA256, so
 #                the updated keys are ChaCha20-Poly1305 keys too
+#   p256         GET 100 bytes offering only the secp256r1 (P-256) group
+#   hrr          GET 100 bytes sending a key share only for X25519MLKEM768,
+#                which the server does not support, so the server asks for
+#                an x25519 share with a HelloRetryRequest
 #
 # Requirements:
 #   - docker (the client images are pulled on first run)
@@ -155,7 +159,7 @@ case_urls() {
         large | keyupdate | chacha20-ku) echo "$BASE/files/5000000" ;;
         multiplex) for n in $MULTIPLEX_SIZES; do echo "$BASE/files/$n"; done ;;
         upload) echo "$BASE/echo" ;;
-        chacha20) echo "$BASE/files/100" ;;
+        chacha20 | p256 | hrr) echo "$BASE/files/100" ;;
     esac
 }
 
@@ -165,7 +169,7 @@ case_urls() {
 check_case() {
     local name=$1 dir=$2
     case "$name" in
-        small | chacha20) cmp -s "$WWW/100" "$dir/100" ;;
+        small | chacha20 | p256 | hrr) cmp -s "$WWW/100" "$dir/100" ;;
         large) cmp -s "$WWW/5000000" "$dir/5000000" ;;
         keyupdate | chacha20-ku)
             cmp -s "$WWW/5000000" "$dir/5000000" &&
@@ -203,6 +207,8 @@ run_ngtcp2() {
         keyupdate) opts="--key-update=1ms" ;;
         chacha20) opts="-q --ciphers=TLS_CHACHA20_POLY1305_SHA256" ;;
         chacha20-ku) opts="--ciphers=TLS_CHACHA20_POLY1305_SHA256 --key-update=1ms" ;;
+        p256) opts="-q --groups=P-256" ;;
+        hrr) opts="-q --groups=X25519MLKEM768:X25519" ;;
     esac
     # The client fails its handshake when run as a non-root user, so it runs
     # as root and hands the downloads back afterwards.
@@ -220,7 +226,7 @@ run_ngtcp2() {
 client_cases() {
     case "$1" in
         quiche) echo small large multiplex upload ;;
-        ngtcp2) echo small large multiplex upload keyupdate chacha20 chacha20-ku ;;
+        ngtcp2) echo small large multiplex upload keyupdate chacha20 chacha20-ku p256 hrr ;;
     esac
 }
 

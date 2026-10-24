@@ -428,7 +428,6 @@ conn_config(ClientDCID, ClientSCID, ServerSCID, Peer, #listener{
     transport_params = TransportParams,
     stream_credit = StreamCredit
 }) ->
-    {EphPub, EphPriv} = crypto:generate_key(ecdh, x25519),
     #{
         dcid => ClientDCID,
         scid => ServerSCID,
@@ -441,8 +440,6 @@ conn_config(ClientDCID, ClientSCID, ServerSCID, Peer, #listener{
             original_destination_connection_id => ClientDCID,
             initial_source_connection_id => ServerSCID
         },
-        eph_pub => EphPub,
-        eph_priv => EphPriv,
         server_random => crypto:strong_rand_bytes(32),
         stream_credit => StreamCredit
     }.

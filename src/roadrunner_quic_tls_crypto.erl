@@ -15,6 +15,8 @@
 %% Derive-Secret takes the already-computed transcript hash rather than
 %% the raw messages, so the caller is explicit about what is hashed (use
 %% `transcript_hash(<<>>)` for the empty context of the "derived" steps).
+%% After a HelloRetryRequest the transcript starts with `message_hash/1` in
+%% place of the first ClientHello (RFC 8446 §4.4.1).
 %%
 %% From the Handshake and Master Secrets it derives the client/server
 %% handshake and application traffic secrets, and from a traffic secret
@@ -23,6 +25,7 @@
 
 -export([
     transcript_hash/1,
+    message_hash/1,
     derive_secret/3,
     early_secret/0,
     handshake_secret/2,
@@ -35,10 +38,24 @@
 %% SHA-256 output length (the negotiated hash for v1).
 -define(HASH_LEN, 32).
 
+%% The synthetic message_hash handshake type (RFC 8446 §4, §4.4.1).
+-define(MESSAGE_HASH, 254).
+
 -doc "Transcript-Hash (RFC 8446 §4.4.1): SHA-256 over the concatenated handshake messages.".
 -spec transcript_hash(iodata()) -> binary().
 transcript_hash(Messages) ->
     crypto:hash(sha256, Messages).
+
+-doc """
+The synthetic message_hash handshake message (RFC 8446 §4.4.1) that takes
+the first ClientHello's place in the transcript once the server answers it
+with a HelloRetryRequest: handshake type 254, a 24-bit length, then the
+transcript hash of `ClientHello1` (the framed first ClientHello). Returned
+framed, as an iolist.
+""".
+-spec message_hash(iodata()) -> iolist().
+message_hash(ClientHello1) ->
+    roadrunner_quic_tls_handshake:encode(?MESSAGE_HASH, transcript_hash(ClientHello1)).
 
 -doc """
 Derive-Secret (RFC 8446 §7.1): an HKDF-Expand-Label keyed by `Secret`,

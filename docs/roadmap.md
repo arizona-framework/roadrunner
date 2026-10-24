@@ -114,8 +114,8 @@ need.
 A conformant browser / quiche / ngtcp2 never trips these; they tighten the
 advisory or malformed cases the server currently tolerates or omits.
 
-- Intersect the client's offered group (`supported_groups`) against the
-  hardcoded x25519, aborting on no overlap (RFC 8446 §4.1.1) — medium
+- Offer `TLS_AES_256_GCM_SHA384` (RFC 8446 §9.1 SHOULD), which needs the key
+  schedule and transcript hash over SHA-384 — small-medium
 - Honor the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` when sizing response
   headers (RFC 9114 §4.2.2) — small-medium
 

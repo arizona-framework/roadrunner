@@ -34,6 +34,9 @@
 %% (stream ids 0, 4, 8), so the bidi limit must leave those within range.
 -define(MAX_STREAMS_BIDI, 3).
 -define(MAX_STREAMS_UNI, 2).
+%% Key exchange groups (RFC 8446 §4.2.7).
+-define(GROUP_SECP256R1, 16#0017).
+-define(GROUP_X25519, 16#001D).
 
 %% =============================================================================
 %% Construction
@@ -89,9 +92,87 @@ chacha20_handshake_reaches_connected_test() ->
     ),
     ?assert(lists:member(handshake_done, Frames)).
 
+%% The server answers in the group of the client's share (x25519) with its
+%% own ephemeral share, generated per connection.
 server_hello_carries_server_key_share_test() ->
-    #{sh_framed := ServerHello, ctx := #{server_pub := ServerPub}} = connect(),
-    ?assertEqual(ServerPub, ?TC:server_hello_key_share(ServerHello)).
+    #{sh_framed := ServerHello, ctx := #{client_pub := ClientPub}} = connect(),
+    [{2, Body}] = ?TC:deframe_all(ServerHello),
+    #{group := Group, key_share := ServerShare} = ?TC:parse_server_hello(Body),
+    ?assertEqual(?GROUP_X25519, Group),
+    ?assertMatch(<<_:32/binary>>, ServerShare),
+    ?assertNotEqual(ClientPub, ServerShare),
+    #{sh_framed := OtherServerHello} = connect(),
+    ?assertNotEqual(ServerShare, ?TC:server_hello_key_share(OtherServerHello)).
+
+%% A client offering only secp256r1 completes the handshake over P-256 ECDHE:
+%% the server's share is an uncompressed P-256 point (RFC 8446 §4.2.8.2).
+p256_handshake_reaches_connected_test() ->
+    {P256Pub, P256Priv} = crypto:generate_key(ecdh, secp256r1),
+    #{state2 := State2, sh_framed := ServerHello} =
+        connect(#{}, #{key_shares => [{?GROUP_SECP256R1, P256Pub}], client_priv => P256Priv}),
+    ?assertEqual(connected, ?M:phase(State2)),
+    [{2, Body}] = ?TC:deframe_all(ServerHello),
+    ?assertMatch(
+        #{group := ?GROUP_SECP256R1, key_share := <<4, _:64/binary>>},
+        ?TC:parse_server_hello(Body)
+    ).
+
+%% A client that lists x25519 but sends no key share gets a HelloRetryRequest
+%% as the only Initial CRYPTO data (RFC 8446 §4.1.4, RFC 9001 §4.7), and the
+%% connection keeps handshaking. Its second ClientHello follows in the Initial
+%% CRYPTO stream at the next offset; the ServerHello then follows the
+%% HelloRetryRequest in the server's Initial CRYPTO stream, and the handshake
+%% completes over the message_hash transcript (RFC 8446 §4.4.1).
+hello_retry_request_reaches_connected_test() ->
+    {State0, #{scheme := Scheme, client_pub := ClientPub, client_priv := ClientPriv}} =
+        new_conn([~"leaf-cert-der"]),
+    ClientHello1 = ?TC:client_hello_framed(#{
+        scheme => Scheme, key_shares => [], groups => [?GROUP_X25519], client_scid => ?CLIENT_SCID
+    }),
+    {State1, Effects1} = ?M:handle_datagram(?NOW, initial_datagram(0, 0, ClientHello1), State0),
+    ?assertEqual(handshaking, ?M:phase(State1)),
+    InitialKeys = #{initial => roadrunner_quic_keys:initial_server(?DCID)},
+    [{crypto, 0, HelloRetryRequest}] =
+        [
+            F
+         || {crypto, _, _} = F <- ?TC:frames(
+                sends(Effects1), initial, InitialKeys, byte_size(?DCID)
+            )
+        ],
+    [{2, HelloRetryBody}] = ?TC:deframe_all(HelloRetryRequest),
+    ?assertMatch(#{group := ?GROUP_X25519}, ?TC:parse_server_hello(HelloRetryBody)),
+    ?assertNot(maps:is_key(key_share, ?TC:parse_server_hello(HelloRetryBody))),
+
+    ClientHello2 = ?TC:client_hello_framed(#{
+        scheme => Scheme, key_shares => [{?GROUP_X25519, ClientPub}], client_scid => ?CLIENT_SCID
+    }),
+    Datagram2 = initial_datagram(1, byte_size(ClientHello1), ClientHello2),
+    {State2, Effects2} = ?M:handle_datagram(?NOW, Datagram2, State1),
+    [{crypto, ServerHelloOffset, _}] =
+        [
+            F
+         || {crypto, _, _} = F <- ?TC:frames(
+                sends(Effects2), initial, InitialKeys, byte_size(?DCID)
+            )
+        ],
+    ?assertEqual(byte_size(HelloRetryRequest), ServerHelloOffset),
+
+    MessageHash = <<254, 32:24, (crypto:hash(sha256, ClientHello1))/binary>>,
+    #{state2 := State3} = finish_handshake(
+        State2, Effects2, [MessageHash, HelloRetryRequest, ClientHello2], ClientPriv
+    ),
+    ?assertEqual(connected, ?M:phase(State3)).
+
+%% RFC 8446 §4.1.2: a ClientHello after the server flight (here a second one
+%% at the next Initial CRYPTO offset, before the client Finished) closes with
+%% the TLS unexpected_message alert, 0x010a.
+client_hello_after_flight_closes_test() ->
+    #{state1 := State1, ch_framed := ClientHello} = connect(),
+    Datagram = initial_datagram(1, byte_size(ClientHello), ClientHello),
+    {State2, Effects} = ?M:handle_datagram(?NOW, Datagram, with_owner(State1)),
+    ?assertEqual(closed, ?M:phase(State2)),
+    ?assertEqual([{emit, self(), {closed, {local, unexpected_message}}}], emits(Effects)),
+    ?assertMatch([{connection_close, transport, 16#010a, 0, <<>>}], initial_close_frames(Effects)).
 
 server_flight_carries_auth_messages_test() ->
     #{flight := Flight} = connect(),
@@ -334,6 +415,24 @@ no_tls_1_3_closes_with_protocol_version_test() ->
 %% §4.1.1, RFC 9001 §4.8).
 no_common_cipher_suite_closes_test() ->
     assert_client_hello_closes(#{cipher_suites => [16#1302]}, no_common_cipher_suite, 16#0128).
+
+%% No group in common is a handshake_failure too (RFC 8446 §4.1.1).
+no_common_group_closes_test() ->
+    assert_client_hello_closes(
+        #{key_shares => [{16#0018, crypto:strong_rand_bytes(97)}]}, no_common_group, 16#0128
+    ).
+
+%% A ClientHello without supported_groups closes with the TLS
+%% missing_extension alert (109), 0x016d (RFC 8446 §9.2).
+missing_supported_groups_closes_test() ->
+    assert_client_hello_closes(#{groups => none}, missing_extension, 16#016d).
+
+%% A key share that is not a valid x25519 public value closes with the TLS
+%% illegal_parameter alert (47), 0x012f (RFC 8446 §4.2.8.2).
+invalid_key_share_closes_test() ->
+    assert_client_hello_closes(
+        #{key_shares => [{?GROUP_X25519, <<1, 2, 3>>}]}, illegal_parameter, 16#012f
+    ).
 
 assert_client_hello_closes(HelloOpts, Reason, Code) ->
     {State0, Ctx} = new_conn([~"leaf-cert-der"]),
@@ -2173,15 +2272,25 @@ connect(Extra) ->
 
 %% `HelloOpts` adds ClientHello options (`?TC:client_hello_framed/1`, such as
 %% `transport_params` overriding the client's advertised transport
-%% parameters); the packet keys follow the cipher suite the ServerHello
-%% selected.
+%% parameters, with `client_priv` the private half of a `key_shares` entry it
+%% replaces); the packet keys follow the cipher suite and group the
+%% ServerHello selected.
 connect(Extra, HelloOpts) ->
     {State0, Ctx} = new_conn([~"leaf-cert-der"], Extra),
-    #{client_priv := ClientPriv, server_pub := ServerPub} = Ctx,
+    #{client_priv := ClientPriv} = maps:merge(Ctx, HelloOpts),
 
     %% Client Initial carrying the ClientHello.
     {InitialDatagram, ClientHelloFramed} = client_hello_datagram(Ctx, HelloOpts),
     {State1, Effects1} = ?M:handle_datagram(?NOW, InitialDatagram, State0),
+    Handshake = finish_handshake(State1, Effects1, ClientHelloFramed, ClientPriv),
+    Handshake#{state0 => State0, ch_framed => ClientHelloFramed, ctx => Ctx}.
+
+%% Complete the handshake from the server's reply (`Effects1`, `State1`) to
+%% the client's last ClientHello: recover the ServerHello, derive the
+%% handshake secrets over `Transcript` (every handshake message before the
+%% ServerHello) and the ServerHello, read the server's flight, and send the
+%% client Finished.
+finish_handshake(State1, Effects1, Transcript, ClientPriv) ->
     Server1 = sends(Effects1),
 
     %% Recover the ServerHello and derive the handshake secrets.
@@ -2189,12 +2298,14 @@ connect(Extra, HelloOpts) ->
         Server1, initial, #{initial => roadrunner_quic_keys:initial_server(?DCID)}, byte_size(?DCID)
     ),
     [{2, ServerHelloBody}] = ?TC:deframe_all(ServerHello),
-    Aead = aead(maps:get(cipher, ?TC:parse_server_hello(ServerHelloBody))),
-    Shared = crypto:compute_key(ecdh, ServerPub, ClientPriv, x25519),
+    #{cipher := Cipher, group := Group, key_share := ServerShare} =
+        ?TC:parse_server_hello(ServerHelloBody),
+    Aead = aead(Cipher),
+    Shared = crypto:compute_key(ecdh, ServerShare, ClientPriv, curve(Group)),
     HandshakeSecret = roadrunner_quic_tls_crypto:handshake_secret(
         roadrunner_quic_tls_crypto:early_secret(), Shared
     ),
-    HelloHash = roadrunner_quic_tls_crypto:transcript_hash([ClientHelloFramed, ServerHello]),
+    HelloHash = roadrunner_quic_tls_crypto:transcript_hash([Transcript, ServerHello]),
     ClientHsSecret = roadrunner_quic_tls_crypto:traffic_secret(
         client, handshake, HandshakeSecret, HelloHash
     ),
@@ -2209,9 +2320,7 @@ connect(Extra, HelloOpts) ->
         #{handshake => roadrunner_quic_keys:traffic_keys(Aead, ServerHsSecret)},
         byte_size(?DCID)
     ),
-    FinishedHash = roadrunner_quic_tls_crypto:transcript_hash([
-        ClientHelloFramed, ServerHello, Flight
-    ]),
+    FinishedHash = roadrunner_quic_tls_crypto:transcript_hash([Transcript, ServerHello, Flight]),
 
     %% Build and send the client Finished at the handshake level.
     ClientFinishedBody = roadrunner_quic_tls_crypto:verify_data(
@@ -2241,7 +2350,6 @@ connect(Extra, HelloOpts) ->
     ),
 
     #{
-        state0 => State0,
         state1 => State1,
         state2 => State2,
         effects1 => Effects1,
@@ -2253,13 +2361,16 @@ connect(Extra, HelloOpts) ->
         server_hs_secret => ServerHsSecret,
         server_ap_secret => ServerApSecret,
         client_ap_secret => ClientApSecret,
-        aead => Aead,
-        ctx => Ctx
+        aead => Aead
     }.
 
 %% The packet-protection AEAD of a cipher suite (RFC 9001 §5.3).
 aead(16#1301) -> aes_128_gcm;
 aead(16#1303) -> chacha20_poly1305.
+
+%% The `crypto` curve of a key exchange group (RFC 8446 §4.2.7).
+curve(?GROUP_X25519) -> x25519;
+curve(?GROUP_SECP256R1) -> secp256r1.
 
 %% A fresh server connection plus the client material the driver reuses.
 new_conn(CertChain) ->
@@ -2269,7 +2380,6 @@ new_conn(CertChain) ->
 new_conn(CertChain, Extra) ->
     {Scheme, PrivKey} = ?TC:key_material(),
     {ClientPub, ClientPriv} = ?TC:gen_keypair(),
-    {ServerPub, ServerPriv} = ?TC:gen_keypair(),
     TransportParams = transport_params(),
     State = ?M:new(
         Extra#{
@@ -2281,8 +2391,6 @@ new_conn(CertChain, Extra) ->
             priv_key => PrivKey,
             alpn => ~"h3",
             transport_params => TransportParams,
-            eph_pub => ServerPub,
-            eph_priv => ServerPriv,
             server_random => crypto:strong_rand_bytes(32)
         },
         ?NOW
@@ -2290,8 +2398,7 @@ new_conn(CertChain, Extra) ->
     {State, #{
         scheme => Scheme,
         client_pub => ClientPub,
-        client_priv => ClientPriv,
-        server_pub => ServerPub
+        client_priv => ClientPriv
     }}.
 
 %% The client Initial datagram and the framed ClientHello it carries (the
@@ -2300,13 +2407,29 @@ client_hello_datagram(Ctx) ->
     client_hello_datagram(Ctx, #{}).
 
 client_hello_datagram(#{scheme := Scheme, client_pub := ClientPub}, HelloOpts) ->
-    Framed = ?TC:client_hello_framed(HelloOpts#{
-        scheme => Scheme, key_share => ClientPub, client_scid => ?CLIENT_SCID
-    }),
-    Datagram = ?TC:seal(
-        initial, 0, roadrunner_quic_keys:initial_client(?DCID), [{crypto, 0, Framed}], ?DCID, ?SCID
+    Framed = ?TC:client_hello_framed(
+        maps:merge(
+            #{
+                scheme => Scheme,
+                key_shares => [{?GROUP_X25519, ClientPub}],
+                client_scid => ?CLIENT_SCID
+            },
+            HelloOpts
+        )
     ),
-    {Datagram, Framed}.
+    {initial_datagram(0, 0, Framed), Framed}.
+
+%% A client Initial carrying `Bytes` at CRYPTO `Offset`, with packet number
+%% `PN`.
+initial_datagram(PN, Offset, Bytes) ->
+    ?TC:seal(
+        initial,
+        PN,
+        roadrunner_quic_keys:initial_client(?DCID),
+        [{crypto, Offset, Bytes}],
+        ?DCID,
+        ?SCID
+    ).
 
 sends(Effects) ->
     [Datagram || {send, Datagram} <- Effects].

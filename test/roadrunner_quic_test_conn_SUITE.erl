@@ -5,13 +5,21 @@
 -include_lib("stdlib/include/assert.hrl").
 
 -export([suite/0, all/0, init_per_suite/1, end_per_suite/1]).
--export([native_client_completes_handshake/1, native_client_completes_chacha20_handshake/1]).
+-export([
+    native_client_completes_handshake/1,
+    native_client_completes_chacha20_handshake/1,
+    native_client_completes_p256_handshake/1
+]).
 
 suite() ->
     [{timetrap, {seconds, 30}}].
 
 all() ->
-    [native_client_completes_handshake, native_client_completes_chacha20_handshake].
+    [
+        native_client_completes_handshake,
+        native_client_completes_chacha20_handshake,
+        native_client_completes_p256_handshake
+    ].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
@@ -34,6 +42,11 @@ native_client_completes_handshake(_Config) ->
 %% ChaCha20-Poly1305 with ChaCha20 header protection (RFC 9001 §5.3, §5.4.4).
 native_client_completes_chacha20_handshake(_Config) ->
     assert_native_handshake(#{cipher_suites => [16#1303]}).
+
+%% The same with secp256r1 as the only group the client offers: the server
+%% answers with its own P-256 share (RFC 8446 §4.2.8.2).
+native_client_completes_p256_handshake(_Config) ->
+    assert_native_handshake(#{group => secp256r1}).
 
 assert_native_handshake(Opts) ->
     %% A minimal in-test listener: the pump owns one UDP socket, reads it, and
@@ -88,7 +101,6 @@ start_shell(Socket, Peer, FirstDatagram) ->
     {ok, ClientDCID} = roadrunner_quic_packet:dcid(FirstDatagram, 8),
     {ok, #{scid := ClientSCID}} = roadrunner_quic_packet:long_header_info(FirstDatagram),
     ServerSCID = crypto:strong_rand_bytes(8),
-    {EphPub, EphPriv} = crypto:generate_key(ecdh, x25519),
     {CertChain, PrivKey} = cert_key(),
     Config = #{
         dcid => ClientDCID,
@@ -109,8 +121,6 @@ start_shell(Socket, Peer, FirstDatagram) ->
             initial_max_streams_uni => 100,
             max_idle_timeout => 30000
         },
-        eph_pub => EphPub,
-        eph_priv => EphPriv,
         server_random => crypto:strong_rand_bytes(32)
     },
     {ok, Shell} = roadrunner_quic_connection:start(Socket, Config),

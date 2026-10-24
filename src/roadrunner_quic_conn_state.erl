@@ -272,8 +272,6 @@
     priv_key := public_key:private_key(),
     alpn := binary(),
     transport_params := roadrunner_quic_transport_params:params(),
-    eph_pub := binary(),
-    eph_priv := binary(),
     server_random := binary(),
     stream_credit => on_receipt | on_read
 }.
@@ -329,8 +327,6 @@ new(
         priv_key := PrivKey,
         alpn := Alpn,
         transport_params := TransportParams,
-        eph_pub := EphPub,
-        eph_priv := EphPriv,
         server_random := ServerRandom
     } = Config,
     Now
@@ -340,8 +336,6 @@ new(
         priv_key => PrivKey,
         alpn => Alpn,
         transport_params => TransportParams,
-        eph_pub => EphPub,
-        eph_priv => EphPriv,
         server_random => ServerRandom,
         peer_scid => PeerSCID
     }),
@@ -1124,6 +1118,12 @@ process_handshake(
             ),
             State2 = queue_crypto(initial, InitialFlight, State1),
             queue_crypto(handshake, HandshakeFlight, State2);
+        {retry, HelloRetryRequest, Tls1} ->
+            %% No usable key share: ask for one (RFC 8446 §4.1.4). The
+            %% HelloRetryRequest goes out in Initial CRYPTO like a ServerHello
+            %% (RFC 9001 §4.7), and the client's second ClientHello follows in
+            %% the same Initial CRYPTO stream, landing back here.
+            queue_crypto(initial, HelloRetryRequest, State#state{tls = Tls1});
         {error, Reason} ->
             connection_fatal(initial, Reason, State)
     end;
@@ -1471,11 +1471,17 @@ close_code(unexpected_message) ->
     %% KeyUpdate (RFC 9001 §6: 0x010a) or an EndOfEarlyData, which QUIC
     %% removes (§8.3): the TLS unexpected_message alert (10).
     roadrunner_quic_error:code_int({crypto_error, 10});
-close_code(missing_transport_params) ->
+close_code(Reason) when Reason =:= missing_transport_params; Reason =:= missing_extension ->
     %% RFC 9001 §8.2: a ClientHello without the quic_transport_parameters
     %% extension MUST close with 0x016d, a CRYPTO_ERROR carrying the TLS
-    %% missing_extension alert (109).
+    %% missing_extension alert (109); so does one without supported_groups or
+    %% key_share (RFC 8446 §9.2).
     roadrunner_quic_error:code_int({crypto_error, 109});
+close_code(illegal_parameter) ->
+    %% A key share that is not a valid public value for its group (RFC 8446
+    %% §4.2.8.2), or a second ClientHello that does not answer the
+    %% HelloRetryRequest (§4.1.2): the TLS illegal_parameter alert (47).
+    roadrunner_quic_error:code_int({crypto_error, 47});
 close_code(protocol_version) ->
     %% A ClientHello that does not offer TLS 1.3 (RFC 8446 §4.2.1, RFC 9001
     %% §4.2): the TLS protocol_version alert (70).
