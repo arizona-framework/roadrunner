@@ -12,11 +12,19 @@
 %% 2. Resolves the route + middleware stack and calls the handler,
 %%    sharing the exact dispatch path h1/h2 use
 %%    (`roadrunner_conn:resolve_handler/2` + the pre-composed pipeline).
-%% 3. Writes the response straight onto the QUIC stream via
-%%    `roadrunner_quic:send_data/4` — a synchronous round-trip to the
-%%    connection (make_ref + reply) keyed by the `Conn` handle, so this
-%%    non-owner worker gets flow-control back-pressure without a separate
-%%    h2-style conn-mediated send module.
+%% 3. Writes the response straight onto the QUIC stream. A streamed write
+%%    goes through `roadrunner_quic:send_data/4`, a synchronous round-trip
+%%    to the connection (make_ref + reply) keyed by the `Conn` handle, so
+%%    this non-owner worker gets flow-control back-pressure without a
+%%    separate h2-style conn-mediated send module. A buffered response is
+%%    the worker's last word on its stream, so it goes one way
+%%    (`roadrunner_quic:send_final/3`), as on h2.
+%%
+%% The worker's exit tells the conn loop the request is done (its in-flight
+%% slot is released on the `'DOWN'`), not that the bytes are on the wire:
+%% the QUIC connection owns a buffered response from the send on, and a
+%% graceful drain closes only once that connection has sent every response
+%% (`roadrunner_quic:close_when_done/3`).
 %%
 %% Crash isolation: workers are spawn_monitored (NOT linked) by the
 %% conn loop. A handler crash is caught here and turned into a 500; any
@@ -110,8 +118,16 @@ emit_501(Conn, StreamId) ->
 
 %% Encode the response as a HEADERS frame (QPACK-encoded `:status` +
 %% the handler's headers) followed by a single DATA frame, and write
-%% both in one `roadrunner_quic:send_data/4` with the stream's FIN. A header-only
-%% response (empty body) sends just the HEADERS frame with FIN.
+%% both in one `roadrunner_quic:send_final/3` with the stream's FIN. A
+%% header-only response (empty body) sends just the HEADERS frame with FIN.
+%%
+%% Every caller sends this as the stream's final response and then exits
+%% (or, in the conn loop, drops the stream), so there is nothing left to
+%% back-pressure: the write goes one way and the worker does not wait for
+%% the connection to take it. That saves the reply and the worker wake-up
+%% per request. The frames are encoded here, so a handler's non-iodata body
+%% crashes this worker (the conn loop resets just its stream), never the
+%% connection.
 -spec send_buffered(
     pid(), non_neg_integer(), roadrunner_http:status(), roadrunner_http:headers(), iodata()
 ) ->
@@ -123,12 +139,10 @@ send_buffered(Conn, StreamId, Status, Headers, Body) ->
             0 -> HeadersFrame;
             BodyLen -> [HeadersFrame, roadrunner_quic_h3_frame:encode_data(Body, BodyLen)]
         end,
-    %% Fire-and-forget: if the peer closed between its request and our
-    %% response, the connection is draining and the send returns an error.
-    %% That is fine, the worker exits and the conn loop cleans up the stream
-    %% (same rationale as the control-stream and GOAWAY sends).
-    _ = roadrunner_quic:send_data(Conn, StreamId, Frames, true),
-    ok.
+    %% If the peer closed between its request and our response, the
+    %% connection is draining and drops the write; the worker exits and the
+    %% conn loop cleans up the stream either way.
+    roadrunner_quic:send_final(Conn, StreamId, Frames).
 
 %% `{stream, ...}` response: HEADERS (no FIN), then the handler's fun
 %% emits DATA chunks through a `Send/2` callback, then the stream FIN.

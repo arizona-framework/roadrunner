@@ -38,6 +38,7 @@
     stop_sending/1,
     send_pending/1,
     send_abandoned/1,
+    send_owed/1,
     send_offset/1,
     recv_offset/1,
     is_terminal/1
@@ -212,6 +213,19 @@ streaming worker does not treat the data as delivered and re-send.
 -spec send_abandoned(t()) -> boolean().
 send_abandoned(#stream{aborted = Aborted, send_stopped = Stopped}) ->
     Aborted orelse Stopped.
+
+-doc """
+Whether the peer started this stream and still waits on our send side:
+something arrived on it (bytes, buffered or delivered, or a final size), and
+our send side has neither put its FIN on the wire nor been abandoned. On a
+request stream that is a response still owed, or still in flight.
+""".
+-spec send_owed(t()) -> boolean().
+send_owed(#stream{fin_sent = true}) -> false;
+send_owed(#stream{aborted = true}) -> false;
+send_owed(#stream{send_stopped = true}) -> false;
+send_owed(#stream{offset = 0, segments = [], final_size = undefined}) -> false;
+send_owed(#stream{}) -> true.
 
 -doc """
 Whether both directions are finished, so the stream can be pruned: the send FIN

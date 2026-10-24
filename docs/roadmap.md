@@ -105,18 +105,6 @@ only). Remaining work:
 - A scheduler-scaled default for the reuseport pool size
   (`{http3, #{listeners => N}}`, validated `1..1024`, default 8,
   `1` = no pooling); currently unmeasured
-- Send the buffered response to the QUIC connection one way, as the h2
-  worker does: the h3 worker still waits for the connection's send reply
-  on its final send, a message and a worker wake-up per request. Not a
-  direct port of the h2 change: the worker's exit is what tells the h3
-  conn loop a stream is done, and a graceful drain closes the QUIC
-  connection once no worker is left. Today the worker exits only after
-  its bytes are flushed; sent one way, a drain could close the connection
-  before the send is processed (the send and the worker's `DOWN` go to
-  different processes) or while flow control still holds the bytes. Needs
-  the QUIC connection to report a finished stream (FIN sent) and the
-  drain to wait on that instead of on the worker; validate by profile
-  share, since the h3 bench is loadgen-bound
 
 ## Native QUIC transport follow-ups
 

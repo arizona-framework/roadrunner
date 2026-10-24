@@ -25,6 +25,11 @@ handle(#{target := ~"/empty"} = Req) ->
     {{204, [], ~""}, Req};
 handle(#{target := ~"/big"} = Req) ->
     {{200, [{~"content-type", ~"application/octet-stream"}], binary:copy(<<"x">>, 100_000)}, Req};
+handle(#{target := ~"/big-observed"} = Req) ->
+    %% `/big`, telling a registered test process which worker answers it,
+    %% so the test can wait for that worker to exit.
+    _ = (roadrunner_h3_big_observer ! {big_worker, self()}),
+    {{200, [{~"content-type", ~"application/octet-stream"}], binary:copy(<<"x">>, 100_000)}, Req};
 handle(#{target := ~"/slow"} = Req) ->
     %% Sleeps so a test can cancel the stream before the worker sends,
     %% exercising the response path's tolerance of a gone stream.

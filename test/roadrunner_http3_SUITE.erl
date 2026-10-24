@@ -105,7 +105,11 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     drain/1,
     refuse_request_during_drain/1,
     drain_refuses_new_connections/1,
-    drain_closes_a_mid_handshake_connection/1
+    drain_closes_a_mid_handshake_connection/1,
+    drain_waits_for_a_response_flow_control_holds/1,
+    drain_released_by_peer_stop_sending/1,
+    drain_released_by_peer_reset/1,
+    crashed_worker_frees_its_slot/1
 ]).
 
 suite() ->
@@ -205,7 +209,11 @@ all() ->
         drain,
         refuse_request_during_drain,
         drain_refuses_new_connections,
-        drain_closes_a_mid_handshake_connection
+        drain_closes_a_mid_handshake_connection,
+        drain_waits_for_a_response_flow_control_holds,
+        drain_released_by_peer_stop_sending,
+        drain_released_by_peer_reset,
+        crashed_worker_frees_its_slot
     ].
 
 init_per_suite(Config) ->
@@ -246,6 +254,7 @@ init_per_testcase(Case, Config) when
     Case =:= max_concurrent_requests_queue_expires;
     Case =:= max_concurrent_requests_queue_stale_grant;
     Case =:= max_concurrent_requests_queue_survives_drain;
+    Case =:= crashed_worker_frees_its_slot;
     Case =:= extra_data_after_413;
     Case =:= refused_request_with_fin_is_dropped;
     Case =:= oversized_headers_431;
@@ -1867,6 +1876,85 @@ refuse_request_during_drain(Config) ->
     ?assertEqual({200, ~"slow"}, ll_collect(Conn, SlowId, <<>>)),
     ll_close(Conn).
 
+drain_waits_for_a_response_flow_control_holds(Config) ->
+    %% A buffered response goes to the QUIC connection one way, so its worker
+    %% exits while flow control still holds most of the body (the client's
+    %% 2000-byte stream window, never raised on its own). A drain started
+    %% then must keep the connection open until the rest goes out with the
+    %% FIN, and close it (H3_NO_ERROR) right after.
+    {Conn, StreamId} = drain_with_held_response(Config),
+    ok = roadrunner_quic_test_conn:grant_stream_credit(Conn, StreamId, 200_000),
+    {fin, Bytes} = ll_collect_until_end(Conn, StreamId, <<>>),
+    ?assertEqual({200, binary:copy(~"x", 100_000)}, ll_decode(Bytes)),
+    ?assertEqual(16#100, ll_await_close_code(Conn)).
+
+drain_released_by_peer_stop_sending(Config) ->
+    %% The client gives up on the held response (STOP_SENDING): nothing is
+    %% owed on the stream any more, so the drain closes the connection
+    %% instead of waiting for bytes that will never be sent.
+    {Conn, StreamId} = drain_with_held_response(Config),
+    ok = roadrunner_quic_test_conn:stop_sending(Conn, StreamId, 16#10c),
+    ?assertEqual(16#100, ll_await_close_code(Conn)).
+
+drain_released_by_peer_reset(Config) ->
+    %% The client resets the stream of the held response (RESET_STREAM):
+    %% the stream is abandoned, so the drain closes the connection.
+    {Conn, StreamId} = drain_with_held_response(Config),
+    ok = roadrunner_quic_test_conn:reset_stream(Conn, StreamId, 16#10c),
+    ?assertEqual(16#100, ll_await_close_code(Conn)).
+
+%% Leave a buffered response held by flow control with its worker gone, then
+%% drain: returns once the drain's close is waiting on that response.
+drain_with_held_response(Config) ->
+    {ok, Conn} = roadrunner_quic_test_conn:connect(
+        {127, 0, 0, 1}, ?config(port, Config), #{stream_window => 2000}
+    ),
+    true = register(roadrunner_h3_big_observer, self()),
+    StreamId = ll_send(Conn, request_frame(~"/big-observed"), true),
+    Worker =
+        receive
+            {big_worker, Pid} -> Pid
+        after 5000 -> ct:fail(no_worker)
+        end,
+    true = unregister(roadrunner_h3_big_observer),
+    WorkerRef = monitor(process, Worker),
+    receive
+        %% `noproc`: it was already gone when the monitor was set.
+        {'DOWN', WorkerRef, process, Worker, Why} when Why =:= normal; Why =:= noproc -> ok
+    after 5000 -> ct:fail(worker_did_not_exit)
+    end,
+    [LoopPid] = drain_members(?config(listener, Config)),
+    LoopPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5000},
+    {goaway, GoawayId} = await_goaway(Conn),
+    ?assert(GoawayId > StreamId),
+    %% The conn loop asks for the close right after the GOAWAY and before it
+    %% reads anything else, so once it rejects a request opened after the
+    %% GOAWAY, the close is waiting. Had it closed at once, the reset would
+    %% never come.
+    Rejected = ll_send(Conn, request_frame(~"/"), true),
+    ?assertEqual(16#10b, ll_await_reset(Conn, Rejected)),
+    {Conn, StreamId}.
+
+crashed_worker_frees_its_slot(_Config) ->
+    %% A worker that crashes (a non-list header set fails its encode) gives
+    %% its in-flight slot back exactly once, before its stream is reset: with
+    %% a ceiling of one, the next request is served and the gauge reads zero.
+    Name = listener_name(crashed_worker_frees_its_slot),
+    {ok, _} = start_h3(Name, #{max_concurrent_requests => 1}),
+    Conn = ll_connect(roadrunner_listener:port(Name)),
+    try
+        Bad = ll_send(Conn, request_frame(~"/badheaders"), true),
+        ?assertEqual(16#102, ll_await_reset(Conn, Bad)),
+        ?assertEqual(0, inflight(Name)),
+        ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
+        Again = ll_send(Conn, request_frame(~"/badheaders"), true),
+        ?assertEqual(16#102, ll_await_reset(Conn, Again)),
+        ?assertEqual(0, inflight(Name))
+    after
+        ll_close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
 drain_refuses_new_connections(Config) ->
     %% Once draining, the listener drops a new client's Initial, so no
     %% connection starts that would miss the drain broadcast and hold the
@@ -2043,6 +2131,24 @@ ll_await_closed(Conn) ->
     after 5000 ->
         ct:fail(connection_not_closed)
     end.
+
+%% Wait for the server to close the connection, returning its error code.
+ll_await_close_code(Conn) ->
+    receive
+        {quic_test_closed, Conn, ErrorCode} -> ErrorCode
+    after 5000 ->
+        ct:fail(connection_not_closed)
+    end.
+
+%% A GET request's HEADERS frame for `Path`.
+request_frame(Path) ->
+    roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(headers(~"GET", Path))).
+
+%% The listener's in-flight request gauge, read straight out of its state
+%% (`#state{proto_opts = #{inflight_counter := Counter}}`).
+inflight(Name) ->
+    #{inflight_counter := Counter} = element(4, sys:get_state(whereis(Name))),
+    counters:get(Counter, 1).
 
 %% Wait for the server to reset `StreamId`, returning the error code.
 ll_await_reset(Conn, StreamId) ->
