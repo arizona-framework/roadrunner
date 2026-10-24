@@ -219,11 +219,18 @@ extract_server_name(#{}) ->
     undefined.
 
 %% Decode the QUIC transport parameters extension (RFC 9001 §8.2) via the
-%% C4 codec, or `none` if the extension is absent.
+%% C4 codec, or `none` if the extension is absent. Any rejection (malformed,
+%% out of range, duplicated, or server-only) is a TRANSPORT_PARAMETER_ERROR
+%% (RFC 9000 §7.4, §18.2), not a TLS alert.
 -spec extract_transport_params(#{non_neg_integer() => binary()}) ->
-    none | {ok, roadrunner_quic_transport_params:params()} | {error, atom()}.
+    none
+    | {ok, roadrunner_quic_transport_params:params()}
+    | {error, transport_parameter_error}.
 extract_transport_params(#{?EXT_QUIC_TRANSPORT_PARAMS := Data}) ->
-    roadrunner_quic_transport_params:decode(Data);
+    case roadrunner_quic_transport_params:decode(Data) of
+        {ok, _} = Ok -> Ok;
+        {error, _} -> {error, transport_parameter_error}
+    end;
 extract_transport_params(#{}) ->
     none.
 

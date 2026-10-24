@@ -239,6 +239,26 @@ initial_scid_mismatch_rejected_test() ->
     }),
     ?assertEqual({error, transport_parameter_error}, ?M:process_client_hello(Body, State)).
 
+%% RFC 9000 §7.4 / §18.2: a transport parameter the codec rejects (here an
+%% out-of-range max_ack_delay, and a server-only parameter) closes with
+%% TRANSPORT_PARAMETER_ERROR rather than a TLS alert.
+invalid_transport_param_rejected_test() ->
+    ?assertEqual(
+        {error, transport_parameter_error},
+        process_with_params(#{
+            initial_source_connection_id => <<1, 2, 3, 4>>, max_ack_delay => 16384
+        })
+    ).
+
+server_only_transport_param_rejected_test() ->
+    ?assertEqual(
+        {error, transport_parameter_error},
+        process_with_params(#{
+            initial_source_connection_id => <<1, 2, 3, 4>>,
+            original_destination_connection_id => <<5, 6, 7, 8>>
+        })
+    ).
+
 %% =============================================================================
 %% Helpers
 %% =============================================================================
@@ -367,3 +387,14 @@ deframe_all_bin(<<>>) ->
 deframe_all_bin(Bin) ->
     {ok, {Type, Body}, Rest} = roadrunner_quic_tls_handshake:decode(Bin),
     [{Type, Body} | deframe_all_bin(Rest)].
+
+process_with_params(TransportParams) ->
+    {ClientPub, _} = crypto:generate_key(ecdh, x25519),
+    Body = client_hello_body(#{
+        key_share => ClientPub,
+        sig_algs => [16#0804],
+        alpn => ~"h3",
+        session_id => <<>>,
+        transport_params => TransportParams
+    }),
+    ?M:process_client_hello(Body, rsa_state()).

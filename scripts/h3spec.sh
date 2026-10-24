@@ -34,16 +34,6 @@ H3SPEC_VERSION="v0.1.14"
 # the run gates every other case; a PR that fixes one deletes its line.
 # Matched as substrings of h3spec's case descriptions.
 KNOWN_FAILURES=(
-    "MUST send TRANSPORT_PARAMETER_ERROR if original_destination_connection_id is received"
-    "MUST send TRANSPORT_PARAMETER_ERROR if preferred_address, is received"
-    "MUST send TRANSPORT_PARAMETER_ERROR if retry_source_connection_id is received"
-    "MUST send TRANSPORT_PARAMETER_ERROR if stateless_reset_token is received"
-    "MUST send TRANSPORT_PARAMETER_ERROR if a parameter value is malformed"
-    "MUST send TRANSPORT_PARAMETER_ERROR if max_udp_payload_size < 1200"
-    "MUST send TRANSPORT_PARAMETER_ERROR if ack_delay_exponen > 20"
-    "MUST send TRANSPORT_PARAMETER_ERROR if max_ack_delay >= 2^14"
-    "MUST send TRANSPORT_PARAMETER_ERROR if initial_max_streams_bidi > 2^60"
-    "MUST send TRANSPORT_PARAMETER_ERROR if initial_max_streams_uni > 2^60"
     "MUST send FRAME_ENCODING_ERROR if an ACK range reaches below zero"
     "SHOULD send PROTOCOL_VIOLATION on an ACK for a packet never sent"
     "MUST send FRAME_ENCODING_ERROR if a frame of unknown type is received"
