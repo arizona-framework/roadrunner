@@ -1341,6 +1341,25 @@ new_stream_after_prune_opens_test() ->
     {_State3, Effects} = ?M:handle_datagram(?NOW, Req4, State2),
     ?assert(lists:member({stream_opened, 4}, [E || {emit, _Owner, E} <- Effects])).
 
+%% RFC 9000 §3.2: opening a stream opens every lower one of its type, so a
+%% request whose first packet arrives after a higher stream's (its own was
+%% lost and resent) is still a new stream: it opens and its data is delivered,
+%% not dropped as if it had been pruned. Stream 8 arriving first skips 0 and 4.
+reordered_lower_stream_opens_test() ->
+    {State0, ClientApSecret, _ServerApSecret} = connect_owned(),
+    Req8 = app_datagram([{stream, 8, 0, ~"c", true}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, Req8, State0),
+    Req0 = app_datagram([{stream, 0, 0, ~"a", true}], 1, ClientApSecret),
+    {State2, Effects0} = ?M:handle_datagram(?NOW, Req0, State1),
+    ?assertEqual(
+        [{stream_opened, 0}, {stream_data, 0, ~"a", true}], [E || {emit, _, E} <- Effects0]
+    ),
+    Req4 = app_datagram([{stream, 4, 0, ~"b", true}], 2, ClientApSecret),
+    {_State3, Effects4} = ?M:handle_datagram(?NOW, Req4, State2),
+    ?assertEqual(
+        [{stream_opened, 4}, {stream_data, 4, ~"b", true}], [E || {emit, _, E} <- Effects4]
+    ).
+
 %% A late/reordered RESET_STREAM for a pruned stream is ignored as closed
 %% (RFC 9000 §3), not recreated; the connection stays up.
 reset_for_pruned_stream_ignored_test() ->
