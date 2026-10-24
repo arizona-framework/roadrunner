@@ -632,14 +632,17 @@ HTTP/3 listener tunables (under `{http3, ThisMap}` in `protocols`).
   listener derive from: the key of the stateless reset tokens (RFC 9000
   §10.3), so a client still talking to a connection the server has lost
   (after a restart, say) is told at once to stop rather than waiting out
-  its idle timeout. Every listener of the pool shares it. Keep it as secret
-  as the TLS key. Give another server the same secret only if every packet
-  of a connection reaches the server holding it: a server sent a packet
-  for a connection it does not have answers with a valid reset, so anyone
-  who can route packets to it can close connections on the others (RFC
-  9000 §10.3.2, §21.11). Unset, a random one is drawn when the listener
-  starts, so a restarted listener cannot reset the connections of the one
-  before it.
+  its idle timeout, and the key of the address validation tokens sent
+  with NEW_TOKEN (§8.1.3), so a client coming back within the hour skips
+  the limit on what the server sends before its address is validated.
+  Every listener of the pool shares it. Keep it as secret as the TLS key.
+  Give another server the same secret only if every packet of a
+  connection reaches the server holding it: a server sent a packet for a
+  connection it does not have answers with a valid reset, so anyone who
+  can route packets to it can close connections on the others (RFC 9000
+  §10.3.2, §21.11). Unset, a random one is drawn when the listener
+  starts, so a restarted listener can neither reset the connections of
+  the one before it nor accept its tokens.
 """.
 -type http3_opts() :: #{
     listeners => 1..?MAX_H3_LISTENERS,

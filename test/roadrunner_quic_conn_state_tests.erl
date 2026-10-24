@@ -34,6 +34,8 @@
 -define(NOW, 1000).
 %% The stateless reset key the issued connection ids' tokens derive from.
 -define(RESET_KEY, <<7:256>>).
+%% The key the address validation tokens the server sends are sealed under.
+-define(TOKEN_KEY, <<9:256>>).
 %% Must match roadrunner_quic_conn_state's ?IDLE_TIMEOUT default.
 -define(IDLE_TIMEOUT, 30000).
 %% Advertised receive windows (RFC 9000 §4.1), deliberately small and distinct
@@ -1048,6 +1050,50 @@ assert_not_reset(Setup, Peer, Datagram) ->
     {State1, Effects} = ?M:handle_datagram(?NOW, Peer, Datagram, Setup()),
     ?assertEqual(connected, ?M:phase(State1)),
     ?assertEqual([], emits(Effects)).
+
+%% =============================================================================
+%% Address validation tokens (RFC 9000 §8.1.3, §9.3, §19.7)
+%% =============================================================================
+
+new_token_sent_on_confirmation_test() ->
+    %% Once the handshake confirms the client's address, the server sends a
+    %% NEW_TOKEN sealed for its IP address, for the client's next connection.
+    {_State, Effects, _ClientApSecret, ServerApSecret} = connect_owned_effects(#{}, #{}),
+    [Token] = [T || {new_token, T} <- sent_app_frames(Effects, ServerApSecret)],
+    {Ip, _Port} = ?PEER,
+    Now = erlang:system_time(second),
+    ?assertMatch({ok, _}, roadrunner_quic_token:open(?TOKEN_KEY, Token, Ip, Now)).
+
+validated_address_spares_first_flight_test() ->
+    %% A connection the listener started with a token that validated the
+    %% client's address sends its whole first flight at once, where one
+    %% without is held to three times the client's Initial (see
+    %% amplification_limit_caps_first_flight_test).
+    {State0, Ctx} = new_conn([binary:copy(<<0>>, 6000)], #{address_validated => true}),
+    {Datagram, _CHFramed} = client_hello_datagram(Ctx),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State0),
+    ?assert(lists:sum([byte_size(D) || D <- sends(Effects)]) > 3 * 1200).
+
+new_token_after_migration_test() ->
+    %% RFC 9000 §9.3 SHOULD: once a migrated client's new IP address is
+    %% validated, it gets a token for that address; a move that changed
+    %% only the port keeps the address the tokens already name.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {Moved, _} = ?M:handle_datagram(?NOW, ?PEER3, padded_ping(10, ClientApSecret), State),
+    ?assertEqual({ok, ?PEER3}, ?M:peername(Moved)),
+    [Token] = migrated_tokens(?PEER3, State, ClientApSecret, ServerApSecret),
+    {Ip3, _Port3} = ?PEER3,
+    Now = erlang:system_time(second),
+    ?assertMatch({ok, _}, roadrunner_quic_token:open(?TOKEN_KEY, Token, Ip3, Now)),
+    ?assertEqual([], migrated_tokens(?PEER2, State, ClientApSecret, ServerApSecret)).
+
+%% The NEW_TOKEN tokens the server sends once a move to `Peer` is validated.
+migrated_tokens(Peer, State, ClientApSecret, ServerApSecret) ->
+    {State1, Effects} = ?M:handle_datagram(?NOW, Peer, padded_ping(10, ClientApSecret), State),
+    [Data] = challenge_data(sends(Effects), ServerApSecret),
+    Response = to_scid([{path_response, Data}], 11, ClientApSecret),
+    {_State2, Validated} = ?M:handle_datagram(?NOW, Peer, Response, State1),
+    [T || {new_token, T} <- sent_app_frames(Validated, ServerApSecret)].
 
 application_close_at_1rtt_closes_test() ->
     %% An application-variant CONNECTION_CLOSE (0x1d) is legal at 1-RTT (an h3
@@ -3691,6 +3737,7 @@ new_conn(CertChain, Extra) ->
                 peer_scid => ?CLIENT_SCID,
                 peer => ?PEER,
                 reset_key => ?RESET_KEY,
+                token_key => ?TOKEN_KEY,
                 cert_chain => CertChain,
                 priv_key => PrivKey,
                 alpn => ~"h3",

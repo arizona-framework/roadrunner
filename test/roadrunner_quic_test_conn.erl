@@ -20,7 +20,10 @@
 %% The client keeps the server's stateless reset tokens (the handshake id's
 %% from its transport parameters, the rest from NEW_CONNECTION_ID) and tells
 %% the owner of a datagram that does not decrypt and ends in one, as
-%% {quic_test_stateless_reset, Conn} (RFC 9000 §10.3.1).
+%% {quic_test_stateless_reset, Conn} (RFC 9000 §10.3.1). It keeps the
+%% address validation tokens the server sends with NEW_TOKEN too (§19.7),
+%% which a later connection presents in its Initial with the `token` option
+%% (§8.1.3).
 %%
 %% The CID flow (RFC 9000 §17.2/§7.2): the client picks a random Initial DCID
 %% (the server's Initial-key + original_destination_connection_id anchor) and
@@ -48,6 +51,7 @@
     grant_stream_credit/3,
     server_cids/1,
     reset_tokens/1,
+    new_tokens/1,
     use_server_cid/2,
     retire_connection_id/2,
     new_connection_id/1,
@@ -124,7 +128,10 @@
     %% server (its handshake SCID is 0, RFC 9000 §5.1.1).
     next_cid_seq = 1 :: pos_integer(),
     %% The server's stateless reset tokens (RFC 9000 §10.3).
-    reset_tokens = [] :: [binary()]
+    reset_tokens = [] :: [binary()],
+    %% The address validation tokens the server sent, newest first (RFC 9000
+    %% §19.7).
+    new_tokens = [] :: [binary()]
 }).
 
 %% =============================================================================
@@ -151,7 +158,8 @@ TLS cipher suites (default TLS_AES_128_GCM_SHA256 only), so a test can
 drive the server onto another suite's packet protection. `group => x25519 |
 secp256r1` is the one key exchange group offered, with its key share
 (default x25519). `cid_events => true` tells the owner of each connection
-id the server issues, as `{quic_test_new_cid, Conn, Seq, CID}`.
+id the server issues, as `{quic_test_new_cid, Conn, Seq, CID}`. `token =>
+Token` puts an address validation token in the Initial (RFC 9000 §8.1.3).
 """.
 -spec connect(inet:ip_address() | inet:hostname(), inet:port_number(), map()) ->
     {ok, pid()} | {error, term()}.
@@ -255,6 +263,14 @@ ids NEW_CONNECTION_ID carried, newest first.
 reset_tokens(Pid) ->
     call(Pid, reset_tokens).
 
+-doc """
+The address validation tokens the server sent with NEW_TOKEN (RFC 9000
+§19.7), newest first.
+""".
+-spec new_tokens(pid()) -> [binary()].
+new_tokens(Pid) ->
+    call(Pid, new_tokens).
+
 -doc "Retire the server connection id numbered `Seq` (RFC 9000 §19.16).".
 -spec retire_connection_id(pid(), non_neg_integer()) -> ok.
 retire_connection_id(Pid, Seq) ->
@@ -329,11 +345,20 @@ init(Parent, Ref, Host, Port, Opts) ->
             maps:with([cipher_suites], Opts)
         )
     ),
-    %% Send the Initial carrying the ClientHello (padded to 1200 by seal/6).
+    %% Send the Initial carrying the ClientHello (padded to 1200), with the
+    %% `token` option's address validation token in its Token field.
     ClientInitialKeys = roadrunner_quic_keys:initial_client(Dcid0),
-    Initial = roadrunner_quic_test_client:seal(
-        initial, 0, ClientInitialKeys, [{crypto, 0, ChFramed}], Dcid0, Scid
-    ),
+    Initial =
+        case Opts of
+            #{token := Token} ->
+                roadrunner_quic_test_client:seal_initial(
+                    0, ClientInitialKeys, [{crypto, 0, ChFramed}], Dcid0, Scid, Token
+                );
+            #{} ->
+                roadrunner_quic_test_client:seal(
+                    initial, 0, ClientInitialKeys, [{crypto, 0, ChFramed}], Dcid0, Scid
+                )
+        end,
     ok = roadrunner_quic_socket:send(Socket, Host, Port, Initial),
     Conn = #conn{
         socket = Socket,
@@ -551,7 +576,7 @@ handshake_cids(
     lists:foldl(
         fun handle_app_frame/2,
         Conn#conn{server_cids = #{0 => ServerScid}},
-        [F || {new_connection_id, _, _, _, _} = F <- Frames]
+        [F || F <- Frames, element(1, F) =:= new_connection_id orelse element(1, F) =:= new_token]
     ).
 
 %% Whether the server's 1-RTT packets carry HANDSHAKE_DONE (RFC 9001 §4.1.2).
@@ -607,6 +632,9 @@ connected_loop(#conn{socket = Socket, unacked = Unacked} = Conn) ->
             connected_loop(Conn);
         {reset_tokens, From, Ref} ->
             From ! {Ref, Conn#conn.reset_tokens},
+            connected_loop(Conn);
+        {new_tokens, From, Ref} ->
+            From ! {Ref, Conn#conn.new_tokens},
             connected_loop(Conn);
         {{use_server_cid, CID}, From, Ref} ->
             From ! {Ref, ok},
@@ -824,6 +852,8 @@ handle_app_frame(
             false -> ok
         end,
     Conn#conn{server_cids = Cids#{Seq => CID}, reset_tokens = [Token | Tokens]};
+handle_app_frame({new_token, Token}, #conn{new_tokens = Tokens} = Conn) ->
+    Conn#conn{new_tokens = [Token | Tokens]};
 handle_app_frame(_Other, Conn) ->
     Conn.
 

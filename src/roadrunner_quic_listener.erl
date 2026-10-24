@@ -24,7 +24,11 @@
 %% install the owner SYNCHRONOUSLY (so ownership transfers before the handshake
 %% can complete and race the `{connected, _}` event), and only then feed the
 %% first Initial. Slot limiting, telemetry, and drain stay in the owner the
-%% handler returns; the listener owns none of them.
+%% handler returns; the listener owns none of them. A first Initial carrying
+%% an address validation token one of our connections issued with NEW_TOKEN
+%% (RFC 9000 §8.1.3) for the address it came from, still good and not spent
+%% before, starts its connection with the address validated, so the
+%% server's first flight is not held to three times what the client sent.
 %%
 %% A new server Source Connection ID is generated per connection at a fixed
 %% length, so short-header 1-RTT packets (which carry no CID-length field)
@@ -203,7 +207,11 @@ init(
             %% A pool injects one shared registry; a standalone listener owns its
             %% own. Either way the listener never deletes the table on stop, so a
             %% shared one outlives any single listener.
-            Registry = maps:get(registry, Opts, roadrunner_quic_cid_registry:new()),
+            Registry =
+                case Opts of
+                    #{registry := Injected} -> Injected;
+                    #{} -> roadrunner_quic_cid_registry:new()
+                end,
             loop(#listener{
                 socket = Socket,
                 port = BoundPort,
@@ -492,14 +500,38 @@ spawn_connection(
     #listener{socket = Socket, registry = Registry, handler = Handler} = State
 ) ->
     ServerSCID = crypto:strong_rand_bytes(?SCID_LEN),
+    {Ip, _Port} = Peer,
+    Config = conn_config(ClientDCID, ClientSCID, ServerSCID, Peer, State),
     {ok, ConnPid} = roadrunner_quic_connection:start(
-        Socket, conn_config(ClientDCID, ClientSCID, ServerSCID, Peer, State)
+        Socket, Config#{address_validated => token_validates(Datagram, Ip, Registry)}
     ),
     true = link(ConnPid),
     ok = roadrunner_quic_cid_registry:register_pair(Registry, ClientDCID, ServerSCID, ConnPid),
     ok = install_owner(ConnPid, Handler),
     _ = ConnPid ! {quic_datagram, Peer, Datagram},
     State.
+
+%% RFC 9000 §8.1.3: whether the Initial's token validates the client's
+%% address: one of ours, sealed for the IP the datagram came from, still
+%% within its lifetime, and not spent before (§8.1.4: replay MUST be
+%% prevented or limited). Any other token, including one this server cannot
+%% open after losing its secret, is no token at all: the connection goes on
+%% unvalidated rather than failing.
+-spec token_validates(binary(), inet:ip_address(), roadrunner_quic_cid_registry:t()) -> boolean().
+token_validates(Datagram, Ip, Registry) ->
+    maybe
+        {ok, <<_, _/binary>> = Token} ?= roadrunner_quic_packet:initial_token(Datagram),
+        Now = erlang:system_time(second),
+        {ok, Id} ?=
+            roadrunner_quic_token:open(
+                roadrunner_quic_cid_registry:token_key(Registry), Token, Ip, Now
+            ),
+        roadrunner_quic_cid_registry:spend_token(
+            Registry, Id, roadrunner_quic_token:oldest(Now)
+        )
+    else
+        _ -> false
+    end.
 
 %% Run the connection_handler to get the application owner and install it
 %% synchronously. On a refusal (e.g. {error, max_clients}) the owner is simply
@@ -558,6 +590,8 @@ conn_config(ClientDCID, ClientSCID, ServerSCID, Peer, #listener{
         %% registry, each with a reset token under the registry's key.
         registry => Registry,
         reset_key => ResetKey,
+        %% The key the NEW_TOKEN tokens the connection issues are sealed under.
+        token_key => roadrunner_quic_cid_registry:token_key(Registry),
         cert_chain => CertChain,
         priv_key => PrivKey,
         alpn => Alpn,

@@ -56,6 +56,11 @@
 #                server's packets reach the client at its new address. An
 #                upload, since a client that only receives sends nothing
 #                from the new port for the server to see
+#   token        GET 100 bytes twice, on two connections: the client keeps
+#                the address validation token the server sends with
+#                NEW_TOKEN on the first (RFC 9000 §8.1.3) and presents it
+#                in the Initial of the second; it passes only if both
+#                downloads match and the second Initial carried the token
 #   reset        GET 100 bytes with the request held back 3 s after the
 #                handshake, while the server is killed and restarted on
 #                the same port with the same `secret`: the restarted server
@@ -250,7 +255,7 @@ fi
 
 case_urls() {
     case "$1" in
-        small | reset) echo "$BASE/files/100" ;;
+        small | token | reset) echo "$BASE/files/100" ;;
         large | keyupdate | chacha20-ku | aes256-ku | migrate) echo "$BASE/files/5000000" ;;
         multiplex) for n in $MULTIPLEX_SIZES; do echo "$BASE/files/$n"; done ;;
         upload | rebind) echo "$BASE/echo" ;;
@@ -264,6 +269,17 @@ migrated() {
     local addr
     addr=$(sed -n 's/^Local address is now \(.*\)$/\1/p' "$1" | tail -1)
     [ -n "$addr" ] && grep -qF "Received packet: local=$addr " "$1"
+}
+
+# Whether the ngtcp2 client logged in `$1` got a NEW_TOKEN frame on its first
+# connection and sent that token in an Initial of its second, as the qlogs in
+# `$2/qlog` show (its packet log leaves the Initial's token out).
+token_reused() {
+    local token
+    token=$(sed -n 's/.* NEW_TOKEN(0x7) token=0x\([0-9a-f]*\) .*/\1/p' "$1" | head -1)
+    [ -n "$token" ] &&
+        cat "$2"/qlog/*.sqlog | grep '"name":"transport:packet_sent"' |
+        grep -q "\"packet_type\":\"initial\",[^}]*\"token\":{\"data\":\"$token\"}"
 }
 
 # Whether the ngtcp2 client logged in `$1` took a datagram from the server
@@ -319,6 +335,7 @@ check_case() {
         upload) cmp -s "$UPLOAD" "$dir/echo" ;;
         migrate) cmp -s "$WWW/5000000" "$dir/5000000" && migrated "$dir.log" ;;
         rebind) cmp -s "$UPLOAD" "$dir/echo" && migrated "$dir.log" ;;
+        token) cmp -s "$WWW/100" "$dir/100" && token_reused "$dir.log" "$dir" ;;
         reset) was_reset "$dir.log" ;;
     esac
 }
@@ -358,14 +375,25 @@ run_ngtcp2() {
         # runs alongside), logging every packet so check_case can see the
         # reset.
         reset) opts="--delay-stream=3s" ;;
+        # Keep the token in a file both connections share, logging every
+        # frame and a qlog per connection so check_case can follow the token.
+        token) opts="--token-file=/out/token --qlog-dir=/out/qlog" ;;
     esac
+    # The token case connects twice, the second time with the token the first
+    # connection was given.
+    local setup=":" second=":"
+    if [ "$name" = token ]; then
+        setup="mkdir -p /out/qlog"
+        second="\$client"
+    fi
     # The client fails its handshake when run as a non-root user, so it runs
     # as root and hands the downloads back afterwards.
     timeout "$CLIENT_TIMEOUT" docker run --rm --init --label "h3interop=$$" --network host \
         -v "$dir:/out" -v "$WORK_DIR:/in:ro" --entrypoint sh "$NGTCP2_IMAGE" -c "
-            /usr/local/bin/wsslclient 127.0.0.1 $PORT $(case_urls "$name" | tr '\n' ' ') \
+            client=\"/usr/local/bin/wsslclient 127.0.0.1 $PORT $(case_urls "$name" | tr '\n' ' ') \
                 $opts --download /out --exit-on-all-streams-close \
-                --no-quic-dump --no-http-dump
+                --no-quic-dump --no-http-dump\"
+            $setup && \$client && $second
             rc=\$?
             chown -R $(id -u):$(id -g) /out
             exit \$rc"
@@ -414,7 +442,7 @@ run_chrome() {
 client_cases() {
     case "$1" in
         quiche) echo small large multiplex upload ;;
-        ngtcp2) echo small large multiplex upload keyupdate chacha20 chacha20-ku aes256 aes256-ku p256 hrr migrate rebind reset ;;
+        ngtcp2) echo small large multiplex upload keyupdate chacha20 chacha20-ku aes256 aes256-ku p256 hrr migrate rebind token reset ;;
         chrome) echo small large multiplex upload ;;
     esac
 }

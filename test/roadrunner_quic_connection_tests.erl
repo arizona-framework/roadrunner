@@ -403,6 +403,7 @@ config(Peer) ->
         peer => Peer,
         registry => roadrunner_quic_cid_registry:new(),
         reset_key => crypto:strong_rand_bytes(32),
+        token_key => crypto:strong_rand_bytes(32),
         cert_chain => [~"leaf-cert-der"],
         priv_key => PrivKey,
         alpn => ~"h3",

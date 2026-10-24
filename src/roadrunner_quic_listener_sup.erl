@@ -64,10 +64,10 @@
     %% Shared by every listener in the pool (see
     %% `roadrunner_quic_listener:accept_gate()`).
     accept_gate => roadrunner_quic_listener:accept_gate(),
-    %% The secret the pool's stateless reset keys derive from (at least 32
-    %% bytes, `roadrunner_quic_cid_registry:new/1`). Unset, a random one is
-    %% drawn per pool, so a restarted pool cannot reset the connections of
-    %% the one before it.
+    %% The secret the pool's stateless reset and address validation token
+    %% keys derive from (at least 32 bytes, `roadrunner_quic_cid_registry:new/1`).
+    %% Unset, a random one is drawn per pool, so a restarted pool can neither
+    %% reset the connections of the one before it nor accept its tokens.
     secret => binary()
 }.
 

@@ -323,3 +323,21 @@ stateless_reset_layout_test() ->
         [21, 43, 64]
     ),
     ?assertNotEqual(?M:encode_stateless_reset(Token, 43), ?M:encode_stateless_reset(Token, 43)).
+
+%% RFC 9000 §17.2.2: the Token field of an Initial reads on a still-protected
+%% packet; anything else carries none.
+initial_token_test() ->
+    Initial = fun(Token) ->
+        <<16#C0, ?V1:32, 2, 1, 2, 1, 3, (roadrunner_quic_varint:encode(byte_size(Token)))/binary,
+            Token/binary, 16#40, 20, 0:160>>
+    end,
+    ?assertEqual({ok, ~"token"}, ?M:initial_token(Initial(~"token"))),
+    ?assertEqual({ok, <<>>}, ?M:initial_token(Initial(<<>>))),
+    <<_, AfterFirst/binary>> = Initial(~"token"),
+    %% A Handshake packet, a short header, a token running past the
+    %% datagram, a cut length varint, and a token over the 512-byte cap.
+    ?assertEqual(error, ?M:initial_token(<<16#E0, AfterFirst/binary>>)),
+    ?assertEqual(error, ?M:initial_token(<<16#40, 0:200>>)),
+    ?assertEqual(error, ?M:initial_token(<<16#C0, ?V1:32, 2, 1, 2, 1, 3, 9, "abc">>)),
+    ?assertEqual(error, ?M:initial_token(<<16#C0, ?V1:32, 2, 1, 2, 1, 3, 16#40>>)),
+    ?assertEqual(error, ?M:initial_token(Initial(binary:copy(<<1>>, 513)))).

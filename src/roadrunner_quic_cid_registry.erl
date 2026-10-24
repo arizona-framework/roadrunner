@@ -45,11 +45,24 @@
 %% token is the HMAC-SHA256 of the connection id under it, truncated to 16
 %% bytes (RFC 9000 §10.3.2). It is unpredictable without the key, distinct
 %% per id, and needs no per-connection state to recompute, so a restarted
-%% server can still reset a connection it has forgotten.
+%% server can still reset a connection it has forgotten. The address
+%% validation token key (`roadrunner_quic_token`, RFC 9000 §8.1.3) is
+%% another, so a token one server issued opens on every server given the
+%% secret.
+%%
+%% The namespace also keeps the tokens already spent (RFC 9000 §8.1.4: a
+%% NEW_TOKEN token SHOULD NOT be accepted more than once), in a second
+%% table ordered by issue time, so the ones too old to be accepted anyway
+%% are dropped from its front as new ones are spent. Past ?SPENT_LIMIT
+%% held, a token is refused rather than remembered, which costs a returning
+%% client only the address validation a client without one goes through.
+%% The set is per namespace: another server, or this one after a restart,
+%% may accept a token once more within its lifetime.
 
 -export([new/0, new/1, register_pair/4, add/3, remove/3, remove_all/3, lookup/2, delete_pid/2]).
 -export([reset_key/1, reset_token/2]).
 -export([add_reset/3, remove_resets/3, lookup_reset/2]).
+-export([token_key/1, spend_token/3]).
 
 -export_type([t/0]).
 
@@ -60,6 +73,9 @@
 %% give independent keys from one secret).
 -define(KEY_SALT, ~"roadrunner quic v1").
 -define(RESET_LABEL, ~"stateless reset").
+-define(TOKEN_LABEL, ~"address token").
+%% The most spent tokens a namespace remembers (each about a hundred bytes).
+-define(SPENT_LIMIT, 100000).
 
 -record(registry, {
     table :: ets:table(),
@@ -67,7 +83,11 @@
     %% The key the client's stateless reset tokens are stored under. Those
     %% rows live only as long as their connections, so it is random per
     %% namespace and never derived from the secret.
-    peer_reset_key :: binary()
+    peer_reset_key :: binary(),
+    %% The key address validation tokens are sealed under.
+    token_key :: <<_:256>>,
+    %% The tokens spent, as `{{IssuedAt, Nonce}}` rows of an ordered set.
+    spent :: ets:table()
 }).
 
 -opaque t() :: #registry{}.
@@ -94,7 +114,9 @@ new(Secret) when byte_size(Secret) >= 32 ->
             set, public, {read_concurrency, true}, {write_concurrency, auto}
         ]),
         reset_key = roadrunner_quic_hkdf:expand(sha256, Prk, ?RESET_LABEL, 32),
-        peer_reset_key = crypto:strong_rand_bytes(32)
+        peer_reset_key = crypto:strong_rand_bytes(32),
+        token_key = roadrunner_quic_hkdf:expand(sha256, Prk, ?TOKEN_LABEL, 32),
+        spent = ets:new(?MODULE, [ordered_set, public, {write_concurrency, auto}])
     }.
 
 -doc """
@@ -190,6 +212,36 @@ lookup_reset(#registry{table = Table, peer_reset_key = Key}, Tail) ->
 -spec reset_row(binary(), <<_:128>>) -> {reset, binary()}.
 reset_row(Key, Token) ->
     {reset, crypto:macN(hmac, sha256, Key, Token, ?TOKEN_LEN)}.
+
+-doc "The key the namespace's address validation tokens are sealed under.".
+-spec token_key(t()) -> <<_:256>>.
+token_key(#registry{token_key = Key}) ->
+    Key.
+
+-doc """
+Spend the token `Id` (its issue time and nonce, from
+`roadrunner_quic_token:open/4`): `true` the first time, `false` once spent
+or when the namespace already holds ?SPENT_LIMIT spent tokens. Spent
+tokens issued before `Oldest` (too old to be accepted anyway) are forgotten
+first.
+""".
+-spec spend_token(t(), {non_neg_integer(), binary()}, integer()) -> boolean().
+spend_token(#registry{spent = Spent}, Id, Oldest) ->
+    ok = forget_spent(Spent, Oldest),
+    ets:info(Spent, size) < ?SPENT_LIMIT andalso ets:insert_new(Spent, {Id}).
+
+%% Drop the spent tokens issued before `Oldest`, from the front of the
+%% table, so each is dropped once and the work stays proportional to the
+%% tokens spent.
+-spec forget_spent(ets:table(), integer()) -> ok.
+forget_spent(Spent, Oldest) ->
+    case ets:first(Spent) of
+        {IssuedAt, _Nonce} = Id when IssuedAt < Oldest ->
+            true = ets:delete(Spent, Id),
+            forget_spent(Spent, Oldest);
+        _ ->
+            ok
+    end.
 
 -doc "The namespace's stateless reset key, which `reset_token/2` derives tokens from.".
 -spec reset_key(t()) -> binary().

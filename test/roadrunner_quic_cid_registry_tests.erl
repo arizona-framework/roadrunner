@@ -126,3 +126,30 @@ client_reset_tokens_route_to_their_connection_test() ->
     %% The listener's cleanup of a crashed connection reaps its tokens too.
     ok = ?M:delete_pid(Table, Other),
     ?assertEqual(error, ?M:lookup_reset(Table, <<2:128>>)).
+
+secret_derives_the_token_key_test() ->
+    %% The token key derives from the secret apart from the reset key.
+    Secret = <<42:256>>,
+    Key = ?M:token_key(?M:new(Secret)),
+    ?assertEqual(Key, ?M:token_key(?M:new(Secret))),
+    ?assertNotEqual(?M:reset_key(?M:new(Secret)), Key),
+    ?assertNotEqual(Secret, Key).
+
+spend_token_once_test() ->
+    %% RFC 9000 §8.1.4: a token is accepted once. Spent tokens older than
+    %% the oldest still accepted are forgotten as others are spent.
+    Table = ?M:new(),
+    ?assert(?M:spend_token(Table, {100, <<1:96>>}, 0)),
+    ?assertNot(?M:spend_token(Table, {100, <<1:96>>}, 0)),
+    ?assert(?M:spend_token(Table, {100, <<2:96>>}, 0)),
+    ?assert(?M:spend_token(Table, {200, <<3:96>>}, 150)),
+    ?assert(?M:spend_token(Table, {100, <<1:96>>}, 0)).
+
+spend_token_limit_test() ->
+    %% Past 100000 spent tokens held, a token is refused.
+    Table = ?M:new(),
+    lists:foreach(
+        fun(N) -> true = ?M:spend_token(Table, {N, <<0:96>>}, 0) end, lists:seq(1, 100000)
+    ),
+    ?assertNot(?M:spend_token(Table, {0, <<1:96>>}, 0)),
+    ?assert(?M:spend_token(Table, {200000, <<1:96>>}, 50000)).

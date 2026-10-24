@@ -427,8 +427,8 @@ type. Beyond `port`,
   `max_concurrent_streams`, `max_header_block`, `max_header_list_size`
 - **HTTP/3 tunables**: Under the `{http3, Opts}` entry in `protocols`:
   `listeners` (reuseport pool size), `max_header_block`, `max_streams_bidi`,
-  `max_field_section_size`, `secret` (the key behind QUIC stateless resets,
-  kept across restarts)
+  `max_field_section_size`, `secret` (the key behind QUIC stateless resets
+  and address validation tokens, kept across restarts)
 
 ## Modules
 

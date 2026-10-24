@@ -28,6 +28,7 @@ an outer guard. The pure routing decision (`classify/2`) is unit-tested in
     sends_version_negotiation_for_unsupported_version/1,
     sends_stateless_reset_for_unknown_connection/1,
     restarted_listener_resets_forgotten_connection/1,
+    returning_client_token_validates_its_address/1,
     uses_injected_registry/1,
     conn_death_before_set_owner_does_not_wedge/1,
     conn_down_is_cleaned_up/1
@@ -54,6 +55,7 @@ all() ->
         sends_version_negotiation_for_unsupported_version,
         sends_stateless_reset_for_unknown_connection,
         restarted_listener_resets_forgotten_connection,
+        returning_client_token_validates_its_address,
         uses_injected_registry,
         conn_death_before_set_owner_does_not_wedge,
         conn_down_is_cleaned_up
@@ -368,6 +370,61 @@ restarted_listener_resets_forgotten_connection(_Config) ->
     end,
     ok = roadrunner_quic_test_conn:close(Conn),
     ok = roadrunner_quic_listener:stop(Second).
+
+%% RFC 9000 §8.1.3 end to end: a connection gives the client a NEW_TOKEN
+%% token, and a later Initial carrying it from the same IP address counts
+%% as validated, so the server's whole first flight (made larger than three
+%% times the 1200-byte Initial by a big certificate chain) goes out at once
+%% instead of stopping at the anti-amplification limit. The token is good
+%% once (§8.1.4), and only from the address it was issued to. A token the
+%% server cannot open is no token: the handshake still completes, and one
+%% carrying a good token completes too.
+returning_client_token_validates_its_address(_Config) ->
+    {CertChain, PrivKey} = cert_key(),
+    Opts = (listener_opts(0, drain_handler()))#{
+        cert_chain => CertChain ++ [binary:copy(<<0>>, 5000)], priv_key => PrivKey
+    },
+    {ok, Listener} = roadrunner_quic_listener:start_link(Opts),
+    Port = roadrunner_quic_listener:get_port(Listener),
+    {ok, First} = roadrunner_quic_test_conn:connect(?LOOPBACK, Port),
+    [Token] = roadrunner_quic_test_conn:new_tokens(First),
+    ok = roadrunner_quic_test_conn:close(First),
+    ?assert(first_flight(?LOOPBACK, Port, <<>>) =< 3 * 1200),
+    ?assert(first_flight(?LOOPBACK, Port, Token) > 3 * 1200),
+    ?assert(first_flight(?LOOPBACK, Port, Token) =< 3 * 1200),
+
+    {ok, Forged} = roadrunner_quic_test_conn:connect(?LOOPBACK, Port, #{token => <<1, 0:400>>}),
+    [Fresh] = roadrunner_quic_test_conn:new_tokens(Forged),
+    ok = roadrunner_quic_test_conn:close(Forged),
+    ?assert(first_flight({127, 0, 0, 2}, Port, Fresh) =< 3 * 1200),
+    {ok, Returning} = roadrunner_quic_test_conn:connect(?LOOPBACK, Port, #{token => Fresh}),
+    ok = roadrunner_quic_test_conn:close(Returning),
+    ok = roadrunner_quic_listener:stop(Listener).
+
+%% The bytes of the server's first flight answering a client Initial from
+%% `Ip` that carries `Token` and a real ClientHello, read until the server
+%% falls quiet: the client sends nothing more, so a server holding to the
+%% anti-amplification limit sends no more than three times its Initial.
+first_flight(Ip, Port, Token) ->
+    {ok, Client} = roadrunner_quic_socket:open(0, #{ip => Ip}),
+    {Scheme, _PrivKey} = roadrunner_quic_test_client:key_material(),
+    {ClientPub, _ClientPriv} = roadrunner_quic_test_client:gen_keypair(),
+    DCID = crypto:strong_rand_bytes(8),
+    SCID = crypto:strong_rand_bytes(8),
+    Hello = roadrunner_quic_test_client:client_hello_framed(Scheme, ClientPub, SCID),
+    Initial = roadrunner_quic_test_client:seal_initial(
+        0, roadrunner_quic_keys:initial_client(DCID), [{crypto, 0, Hello}], DCID, SCID, Token
+    ),
+    ok = roadrunner_quic_socket:send(Client, ?LOOPBACK, Port, Initial),
+    Bytes = flight_bytes(Client),
+    ok = roadrunner_quic_socket:close(Client),
+    Bytes.
+
+flight_bytes(Socket) ->
+    case roadrunner_quic_socket:recv(Socket, 300) of
+        {ok, _Peer, Datagram} -> byte_size(Datagram) + flight_bytes(Socket);
+        {error, timeout} -> 0
+    end.
 
 %% When a spawned connection dies, the listener's monitor fires and the CID
 %% registry row is dropped (delete_pid). This is proven, not merely

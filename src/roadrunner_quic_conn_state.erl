@@ -90,6 +90,14 @@
 %% PATH_CHALLENGE or PATH_RESPONSE fills a 1200-byte datagram where the
 %% anti-amplification limit allows (§8.2.1, §8.2.2).
 %%
+%% Once it has validated the client's address, at the handshake's
+%% confirmation and again when a migrated client's new IP address is
+%% validated (RFC 9000 §9.3 SHOULD), the server sends the client a NEW_TOKEN
+%% (§8.1.3) sealed for that IP, so the client's next connection counts as
+%% validated from its first packet. A connection the listener started with
+%% such a token (`address_validated`) begins with the anti-amplification
+%% limit lifted.
+%%
 %% Congestion control and probe transmission are deferred: the connection
 %% sends within the anti-amplification and flow limits (the MUSTs) and a
 %% probe timeout only re-checks for losses and backs off. Wiring NewReno and
@@ -231,6 +239,9 @@
     %% The key the stateless reset token of each issued id derives from
     %% (`roadrunner_quic_cid_registry:reset_token/2`, RFC 9000 §10.3.2).
     reset_key :: binary(),
+    %% The key the address validation tokens we send with NEW_TOKEN are
+    %% sealed under (`roadrunner_quic_token`, RFC 9000 §8.1.3).
+    token_key :: <<_:256>>,
     %% The client's connection ids we may address (RFC 9000 §5.1.2), by
     %% sequence number: its handshake Source Connection ID is 0, the rest came
     %% in NEW_CONNECTION_ID frames. `peer_cid_seq` is the one `peer_scid`
@@ -442,6 +453,11 @@
     peer_scid := binary(),
     peer := {inet:ip_address(), inet:port_number()},
     reset_key := binary(),
+    token_key := <<_:256>>,
+    %% Whether the client's first Initial carried an address validation
+    %% token that validated its address (RFC 9000 §8.1.3); `false` when
+    %% absent.
+    address_validated => boolean(),
     %% The listener's registry, for the shell to route the ids the core
     %% issues; the core itself never reads it.
     registry => roadrunner_quic_cid_registry:t(),
@@ -511,6 +527,7 @@ new(
         peer_scid := PeerSCID,
         peer := Peer,
         reset_key := ResetKey,
+        token_key := TokenKey,
         cert_chain := CertChain,
         priv_key := PrivKey,
         alpn := Alpn,
@@ -544,6 +561,7 @@ new(
         peer_scid = PeerSCID,
         cids = #{0 => SCID},
         reset_key = ResetKey,
+        token_key = TokenKey,
         peer_cids = #{0 => PeerSCID},
         rx_peer = Peer,
         peer = Peer,
@@ -560,7 +578,7 @@ new(
             )
         },
         spaces = #{initial => new_space(), handshake => new_space()},
-        amp = roadrunner_quic_amp:new(),
+        amp = initial_amp(Config),
         owner = undefined,
         info = #{alpn => Alpn, transport_params => TransportParams},
         max_streams_bidi = MaxStreamsBidi,
@@ -571,6 +589,14 @@ new(
         idle_timeout = IdleTimeout,
         idle_deadline = Now + IdleTimeout
     }.
+
+%% A client whose first Initial carried a token that validated its address
+%% (RFC 9000 §8.1.3) is spared the three-times limit from the start.
+-spec initial_amp(config()) -> roadrunner_quic_amp:t().
+initial_amp(#{address_validated := true}) ->
+    roadrunner_quic_amp:validate(roadrunner_quic_amp:new());
+initial_amp(#{}) ->
+    roadrunner_quic_amp:new().
 
 -spec new_space() -> #space{}.
 new_space() ->
@@ -2034,7 +2060,9 @@ path_validated(_Now, mtu, #state{prev_path = Prev} = State) ->
 %% The client owns its new address: lift the anti-amplification limit
 %% (RFC 9000 §8.1), and start the congestion controller and RTT estimate
 %% over for the new path (§9.4 MUST), unless only the port changed, which a
-%% NAT rebinding usually causes and §9.4 lets the path keep both for.
+%% NAT rebinding usually causes and §9.4 lets the path keep both for. A new
+%% IP address also gets a token of its own (§9.3 SHOULD), the ones sent
+%% before being sealed for the old one.
 -spec confirm_address(integer(), t()) -> t().
 confirm_address(Now, #state{amp = Amp, peer = {Ip, _Port}, prev_path = Prev} = State) ->
     Confirmed = State#state{amp = roadrunner_quic_amp:validate(Amp)},
@@ -2043,12 +2071,20 @@ confirm_address(Now, #state{amp = Amp, peer = {Ip, _Port}, prev_path = Prev} = S
             Confirmed;
         _ ->
             #space{loss = Loss} = Space = space(application, Confirmed),
-            put_space(
-                application,
-                Space#space{loss = roadrunner_quic_loss:reset_rtt(Now, Loss)},
-                Confirmed#state{cc = roadrunner_quic_cc_newreno:new_path(Now)}
+            queue_new_token(
+                put_space(
+                    application,
+                    Space#space{loss = roadrunner_quic_loss:reset_rtt(Now, Loss)},
+                    Confirmed#state{cc = roadrunner_quic_cc_newreno:new_path(Now)}
+                )
             )
     end.
+
+%% Send the client a NEW_TOKEN sealed for the IP address of the current
+%% path, validated by now (RFC 9000 §8.1.3, §19.7).
+-spec queue_new_token(t()) -> t().
+queue_new_token(#state{token_key = Key, peer = {Ip, _Port}} = State) ->
+    queue_frame(application, {new_token, roadrunner_quic_token:new(Key, Ip)}, State).
 
 %% Send one queued probing packet ahead of the send pass's other packets. A
 %% `challenge` is a fresh PATH_CHALLENGE (RFC 9000 §8.2.1 MUST: unpredictable
@@ -2234,9 +2270,10 @@ process_handshake(handshake, {?FINISHED, Body}, #state{tls = Tls} = State) ->
             %% Handshake confirmed: discard the Handshake space (RFC 9001
             %% §4.9.2), become connected, and send HANDSHAKE_DONE at the
             %% application level, with the spare connection ids the client
-            %% may move to (RFC 9000 §5.1.1).
+            %% may move to (RFC 9000 §5.1.1) and a token for its next
+            %% connection (§8.1.3).
             State1 = discard_space(handshake, State#state{phase = connected}),
-            queue_frame(application, handshake_done, issue_cids(State1));
+            queue_new_token(queue_frame(application, handshake_done, issue_cids(State1)));
         {error, Reason} ->
             connection_fatal(handshake, Reason, State)
     end;
