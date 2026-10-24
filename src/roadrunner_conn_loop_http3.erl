@@ -20,6 +20,7 @@
 %%   {quic, Conn, {stream_opened, StreamId}}    peer opened a stream
 %%   {quic, Conn, {stream_data, StreamId, Bin, Fin}}
 %%   {quic, Conn, {stream_reset, StreamId, ErrorCode}}
+%%   {quic, Conn, {peer_changed, Peer}}         client moved (RFC 9000 §9)
 %%   {quic, Conn, {closed, Reason}}             connection closed
 %%
 %% On `connected` it opens its own control stream and sends SETTINGS
@@ -283,6 +284,8 @@ recv_loop(#h3{conn = Conn} = State) ->
                 {conn_error, Code, Reason} -> conn_error(State, Code, Reason);
                 State1 -> loop(State1)
             end;
+        {quic, Conn, {peer_changed, Peer}} ->
+            loop(peer_changed(State, Peer));
         {quic, Conn, {closed, Reason}} ->
             terminate(State, closed_reason(Reason));
         {'DOWN', MonRef, process, _Pid, Reason} ->
@@ -300,6 +303,21 @@ recv_loop(#h3{conn = Conn} = State) ->
         %% `{quic, Conn, Event}` notifications matched above, so an unmatched
         %% message stays queued rather than being silently dropped.
     end.
+
+%% The QUIC connection followed the client to another address (RFC 9000
+%% §9), or back to the old one after a failed validation. Requests
+%% dispatched from now on report it as their peer, and the per-peer rate
+%% limit and the `real_ip` proxy trust are decided again for it, as both
+%% depend on the address the requests come from. Requests already
+%% dispatched keep the address they saw; the connection's `listener_accept`
+%% span keeps the handshake address.
+-spec peer_changed(#h3{}, {inet:ip_address(), inet:port_number()}) -> #h3{}.
+peer_changed(#h3{proto_opts = ProtoOpts} = State, Peer) ->
+    State#h3{
+        peer = Peer,
+        rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
+        real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer)
+    }.
 
 %% Open the server control stream and send SETTINGS on the `connected`
 %% event (RFC 9114 §6.2.1: each side opens one control stream and sends

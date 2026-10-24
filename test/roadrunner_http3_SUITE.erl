@@ -306,11 +306,13 @@ nat_rebinding_follows_client(Config) ->
     %% its connection ids, as in a NAT rebinding. The server validates the
     %% new address with a PATH_CHALLENGE the client answers there, and keeps
     %% serving on it, past the anti-amplification limit once validated.
+    %% Requests after the move report the new address as their peer.
     Conn = connect(?config(port, Config)),
-    ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
+    ?assertEqual({200, client_port(Conn)}, status_body(get(Conn, ~"/peer"))),
     ok = roadrunner_quic_test_conn:rebind(Conn),
     {200, _Headers, Body} = get(Conn, ~"/big"),
     ?assertEqual(100_000, byte_size(Body)),
+    ?assertEqual({200, client_port(Conn)}, status_body(get(Conn, ~"/peer"))),
     close(Conn).
 
 active_migration_follows_client(Config) ->
@@ -327,6 +329,7 @@ active_migration_follows_client(Config) ->
     ok = roadrunner_quic_test_conn:rebind(Conn),
     {200, _Headers, Body} = get(Conn, ~"/big"),
     ?assertEqual(100_000, byte_size(Body)),
+    ?assertEqual({200, client_port(Conn)}, status_body(get(Conn, ~"/peer"))),
     close(Conn).
 
 head_request(Config) ->
@@ -1958,6 +1961,11 @@ headers(Method, Path) ->
 
 status_body({Status, _Headers, Body}) -> {Status, Body};
 status_body(Other) -> Other.
+
+%% The client's local port as text, as the `/peer` route answers it.
+client_port(Conn) ->
+    {ok, {_Ip, Port}} = roadrunner_quic_test_conn:sockname(Conn),
+    integer_to_binary(Port).
 
 collect(Conn, StreamId) ->
     roadrunner_quic_test_h3:collect(Conn, StreamId).
