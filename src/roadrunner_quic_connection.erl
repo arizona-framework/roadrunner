@@ -19,7 +19,11 @@
 %% `{unregister_cid, CID}` route a connection id the core issued to this
 %% process in the registry, or stop routing one the peer retired (RFC 9000
 %% §5.1). The listener reaps every row on the process's exit, so a closing
-%% connection leaves none behind. The shell re-arms its
+%% connection leaves none behind. The datagram's source address goes to the
+%% core with it: when the client moves (RFC 9000 §9), `{migrate, Peer}`
+%% points every later `{send, _}` at the new address, and `{send_to, Peer,
+%% Datagram}` sends a probing packet to an address the connection is not
+%% on. The shell re-arms its
 %% timer lazily: a later deadline leaves an earlier armed timer running, and
 %% when that one fires ahead of the deadline it is just re-armed, so a
 %% deadline that keeps moving later (a PTO pushed back by each ACK) costs no
@@ -110,10 +114,10 @@ loop(State) ->
                 Sid, Bytes, Now, State#shell.conn
             ),
             continue(perform(Effects, Now, State#shell{conn = Conn}));
-        {quic_datagram, _Peer, Datagram} ->
+        {quic_datagram, Peer, Datagram} ->
             Now = erlang:monotonic_time(millisecond),
             {Conn, Effects} = roadrunner_quic_conn_state:handle_datagram(
-                Now, Datagram, State#shell.conn
+                Now, Peer, Datagram, State#shell.conn
             ),
             continue(perform(Effects, Now, State#shell{conn = Conn}));
         {timeout, TRef, ?MODULE} ->
@@ -187,6 +191,12 @@ perform_effect({register_cid, CID}, _Now, #shell{registry = Registry} = State) -
 perform_effect({unregister_cid, CID}, _Now, #shell{registry = Registry} = State) ->
     ok = roadrunner_quic_cid_registry:remove(Registry, CID, self()),
     State;
+perform_effect({send_to, {Ip, Port}, Datagram}, _Now, #shell{socket = Socket} = State) ->
+    %% A send error is a lost datagram, as for the batched sends.
+    _ = roadrunner_quic_socket:send(Socket, Ip, Port, Datagram),
+    State;
+perform_effect({migrate, Peer}, _Now, State) ->
+    State#shell{peer = Peer};
 perform_effect({arm_timer, Kind, AtMs}, Now, #shell{timer = Timer} = State0) ->
     State = State0#shell{deadline = {Kind, AtMs}},
     case Timer of

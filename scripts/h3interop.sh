@@ -29,8 +29,8 @@
 # file, then POSTs it.
 #
 # The ngtcp2 client also runs cases quiche-client has no options for:
-# updating its keys on demand, and steering the handshake with its TLS
-# options.
+# updating its keys on demand, steering the handshake with its TLS
+# options, and moving to a new address mid-connection.
 #
 #   keyupdate    GET 5 MB while the client updates its 1-RTT keys early in
 #                the transfer (RFC 9001 §6); it passes only if the server's
@@ -46,6 +46,16 @@
 #   hrr          GET 100 bytes sending a key share only for X25519MLKEM768,
 #                which the server does not support, so the server asks for
 #                an x25519 share with a HelloRetryRequest
+#   migrate      GET 5 MB while the client moves to a new local port and to
+#                a spare connection id of the server's just after the
+#                handshake (RFC 9000 §9); it passes only if the server's
+#                packets reach the client at its new address
+#   rebind       POST 1 MB and get it echoed back while the client's port
+#                changes under it as in a NAT rebinding, keeping its
+#                connection ids (RFC 9000 §9.3); it passes only if the
+#                server's packets reach the client at its new address. An
+#                upload, since a client that only receives sends nothing
+#                from the new port for the server to see
 #
 # Requirements:
 #   - docker (the client images are pulled on first run)
@@ -227,11 +237,19 @@ fi
 case_urls() {
     case "$1" in
         small) echo "$BASE/files/100" ;;
-        large | keyupdate | chacha20-ku | aes256-ku) echo "$BASE/files/5000000" ;;
+        large | keyupdate | chacha20-ku | aes256-ku | migrate) echo "$BASE/files/5000000" ;;
         multiplex) for n in $MULTIPLEX_SIZES; do echo "$BASE/files/$n"; done ;;
-        upload) echo "$BASE/echo" ;;
+        upload | rebind) echo "$BASE/echo" ;;
         chacha20 | aes256 | p256 | hrr) echo "$BASE/files/100" ;;
     esac
+}
+
+# Whether the ngtcp2 client logged in `$1` moved: it logs its new local
+# address, and a server packet must have reached it there.
+migrated() {
+    local addr
+    addr=$(sed -n 's/^Local address is now \(.*\)$/\1/p' "$1" | tail -1)
+    [ -n "$addr" ] && grep -qF "Received packet: local=$addr " "$1"
 }
 
 # Check Chrome's report (`$2/report`): the expected hash for every body,
@@ -258,7 +276,8 @@ check_chrome() {
 
 # Check a case's downloads in `$2`; quiche and ngtcp2 name each response file
 # after the last segment of its URL path. The key update cases also need a
-# server packet in key phase 1 in the client's packet log (`$2.log`).
+# server packet in key phase 1 in the client's packet log (`$2.log`), and
+# the migration cases a server packet at the client's new address there.
 check_case() {
     local client=$1 name=$2 dir=$3
     [ "$client" = chrome ] && {
@@ -278,6 +297,8 @@ check_case() {
             done
             ;;
         upload) cmp -s "$UPLOAD" "$dir/echo" ;;
+        migrate) cmp -s "$WWW/5000000" "$dir/5000000" && migrated "$dir.log" ;;
+        rebind) cmp -s "$UPLOAD" "$dir/echo" && migrated "$dir.log" ;;
     esac
 }
 
@@ -308,6 +329,10 @@ run_ngtcp2() {
         aes256-ku) opts="--ciphers=TLS_AES_256_GCM_SHA384 --key-update=1ms" ;;
         p256) opts="-q --groups=P-256" ;;
         hrr) opts="-q --groups=X25519MLKEM768:X25519" ;;
+        # Move 1 ms after the handshake, logging every packet so check_case
+        # can see where the server's packets arrive.
+        migrate) opts="--change-local-addr=1ms" ;;
+        rebind) opts="-d /in/www/upload.bin --change-local-addr=1ms --nat-rebinding" ;;
     esac
     # The client fails its handshake when run as a non-root user, so it runs
     # as root and hands the downloads back afterwards.
@@ -354,7 +379,7 @@ run_chrome() {
 client_cases() {
     case "$1" in
         quiche) echo small large multiplex upload ;;
-        ngtcp2) echo small large multiplex upload keyupdate chacha20 chacha20-ku aes256 aes256-ku p256 hrr ;;
+        ngtcp2) echo small large multiplex upload keyupdate chacha20 chacha20-ku aes256 aes256-ku p256 hrr migrate rebind ;;
         chrome) echo small large multiplex upload ;;
     esac
 }

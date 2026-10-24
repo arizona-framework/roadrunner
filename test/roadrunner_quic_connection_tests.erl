@@ -21,6 +21,7 @@ shell_test_() ->
         fun send_data_round_trip/1,
         fun peer_close_terminates_shell/1,
         fun peername_round_trip/1,
+        fun migration_follows_new_address/1,
         fun set_owner_emits_connected/1,
         fun system_message_handled/1,
         fun unsupported_call_replies/1,
@@ -171,6 +172,45 @@ peername_round_trip(#{shell := Shell, peer := Peer}) ->
         after 1000 ->
             erlang:error(no_reply)
         end
+    end.
+
+%% RFC 9000 §9.3: a non-probing packet from a new address moves the shell's
+%% sends there ({migrate, _}), while the old path gets its own challenge as a
+%% probing packet sent to it ({send_to, _, _}, §9.3.3).
+migration_follows_new_address(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx}) ->
+    fun() ->
+        {ClientApSecret, ServerApSecret} = do_handshake(Shell, Peer, ClientSocket, Ctx),
+        _HandshakeDone = recv_all(ClientSocket),
+        {ok, NewSocket} = roadrunner_quic_socket:open(0),
+        {ok, {_Ip, NewPort}} = roadrunner_quic_socket:sockname(NewSocket),
+        NewPeer = {{127, 0, 0, 1}, NewPort},
+        %% The client still addresses the server's handshake id, as after a
+        %% NAT rebinding.
+        Ping = ?TC:seal(
+            application,
+            0,
+            roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientApSecret),
+            [ping],
+            ?SCID,
+            ?SCID
+        ),
+        Shell ! {quic_datagram, NewPeer, Ping},
+        ServerKeys = #{
+            application => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerApSecret)
+        },
+        Challenges = fun(Socket) ->
+            [D || {path_challenge, D} <- ?TC:frames(recv_all(Socket), application, ServerKeys, 8)]
+        end,
+        ?assertMatch([_], Challenges(NewSocket)),
+        ?assertMatch([_], Challenges(ClientSocket)),
+        Ref = make_ref(),
+        Shell ! {quic_call, self(), Ref, peername},
+        receive
+            {quic_reply, Ref, Result} -> ?assertEqual({ok, NewPeer}, Result)
+        after 1000 ->
+            erlang:error(no_reply)
+        end,
+        ok = roadrunner_quic_socket:close(NewSocket)
     end.
 
 %% Installing this process as owner on a connected shell emits the once-only

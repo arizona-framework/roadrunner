@@ -18,6 +18,7 @@
 
 -export([
     new/0,
+    new_path/1,
     on_packets_acked/3,
     on_congestion_event/3,
     on_persistent_congestion/1,
@@ -50,6 +51,16 @@
 -spec new() -> t().
 new() ->
     #cc{}.
+
+-doc """
+A fresh congestion-control state for a new network path (RFC 9000 §9.4): the
+initial window, with every packet sent until `Now` (on the old path) inside a
+recovery period, so neither its acknowledgment grows the new window nor its
+loss shrinks it.
+""".
+-spec new_path(non_neg_integer()) -> t().
+new_path(Now) ->
+    #cc{recovery_start = Now}.
 
 -doc """
 Grow the window for acknowledged bytes (RFC 9002 §7.3.1).

@@ -131,6 +131,18 @@ advisory or malformed cases the server currently tolerates or omits.
   `stateless_reset_token` transport parameter, and a reset key that
   outlives a restart (it is random per listener pool today, so only ids the
   running pool issued can be reset). Small-medium
+- Address validation tokens (RFC 9000 §8.1.3): send NEW_TOKEN so a returning
+  client's address counts as validated, and accept the token in its
+  Initial, sparing it the three-times anti-amplification limit on its first
+  flight. §9.3 adds that a server SHOULD send a fresh token once it has
+  validated a migrated client's new address; the connection follows a
+  migrating client today but sends no token. Medium
+- Tell the HTTP/3 layer when a client migrates: the QUIC connection follows
+  the client to a validated new address (RFC 9000 §9), but
+  `roadrunner_conn_loop_http3` reads `peername` once at connection start, so
+  later requests still report the handshake address as their peer. Emit
+  the validated address to the owner (and the old one again if the
+  connection returns to it) and update the loop's peer. Small
 
 ### Throughput levers identified by profiling
 
