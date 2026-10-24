@@ -68,16 +68,36 @@ rfc9001_a5_chacha20_traffic_keys_test() ->
         ?M:traffic_keys(chacha20_poly1305, a5_secret())
     ).
 
+%% AES-256-GCM keys (TLS_AES_256_GCM_SHA384) expand over SHA-384: a 32-byte
+%% AEAD key, a 12-byte IV and a 32-byte AES-256 header-protection key (RFC
+%% 9001 §5.1, §5.4.3). RFC 9001 has no AES-256 vector; the expected values
+%% are from Python's `cryptography` HKDF and OTP ssl's
+%% `tls_v1:hkdf_expand_label/5`, which agree, over the SHA-384 server
+%% handshake secret of `roadrunner_quic_tls_crypto_tests`.
+aes_256_gcm_traffic_keys_test() ->
+    ?assertEqual(
+        #{
+            key =>
+                {aes_256_gcm,
+                    hex(~"7501e53e394e2541a2f15bc462febcdda98414c8b53e3e2457944630350e12b8")},
+            iv => hex(~"9f3186ec885e99cd55aa55df"),
+            hp =>
+                {aes_256_ecb,
+                    hex(~"8c8299eb2ef6405e4ba7f451703409f8a0d37969067808805eec3a1209950a92")}
+        },
+        ?M:traffic_keys(aes_256_gcm, sha384_secret())
+    ).
+
 %% =============================================================================
 %% Key update (RFC 9001 §6.1): the next secret is
-%% Expand-Label(current, "quic ku", "", 32), and the AEAD key and IV for the
-%% connection's AEAD follow from it; the header-protection key is not
-%% updated.
+%% Expand-Label(current, "quic ku", "", Hash.length) over the suite's hash,
+%% and the AEAD key and IV for the connection's AEAD follow from it; the
+%% header-protection key is not updated.
 %% =============================================================================
 
 %% RFC 9001 Appendix A.5 publishes the "quic ku" secret for its 1-RTT
 %% secret; the update secret depends only on the secret and SHA-256, which
-%% both AEADs share.
+%% both SHA-256 suites share.
 rfc9001_a5_key_update_secret_test_() ->
     UpdatedSecret = hex(~"1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9"),
     [
@@ -113,6 +133,28 @@ chacha20_key_update_test() ->
         maps:with([key, iv], ?M:traffic_keys(chacha20_poly1305, UpdatedSecret)), PacketKeys
     ).
 
+%% On an AES-256-GCM connection the "quic ku" expansion runs over SHA-384 and
+%% is 48 bytes (RFC 9001 §6.1 uses the suite's hash, RFC 8446 §7.2), and the
+%% next generation is AES-256-GCM again. Same cross-checked sources as
+%% aes_256_gcm_traffic_keys_test.
+aes_256_gcm_key_update_test() ->
+    {UpdatedSecret, PacketKeys} = ?M:update(aes_256_gcm, sha384_secret()),
+    ?assertEqual(
+        hex(
+            ~"06dba44492a51d07d4376f6bd9b5b5b59fc5449e4a7eafe955ec1fe3ba5ce2eb547842c5c725aaed6c6ef6253c7bc7d7"
+        ),
+        UpdatedSecret
+    ),
+    ?assertEqual(
+        #{
+            key =>
+                {aes_256_gcm,
+                    hex(~"5fa43c1d5b567ae4ee1c58d1580a4760012354b5040d31f324c7bd6fc541cd22")},
+            iv => hex(~"c840feabf29ad96eb857d3ca")
+        },
+        PacketKeys
+    ).
+
 %% =============================================================================
 %% Helpers
 %% =============================================================================
@@ -120,6 +162,11 @@ chacha20_key_update_test() ->
 a1_dcid() -> hex(~"8394c8f03e515708").
 
 a5_secret() -> hex(~"9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b").
+
+sha384_secret() ->
+    hex(
+        ~"e145cd264912ba03966f7d08cb7083046e08dba6cb2f6eafe63e89b643456b08aa3ecb44178e98a7f06deb1dd881d447"
+    ).
 
 %% Uppercase before decoding so the literals are portable across OTP
 %% versions regardless of `binary:decode_hex/1`'s lowercase handling.
@@ -140,6 +187,21 @@ for_connection_protects_like_the_raw_key_test() ->
      || Cipher <- [crypto:strong_rand_bytes(32) || _ <- lists:seq(1, 20)]
     ].
 
+for_connection_protects_like_the_raw_aes_256_key_test() ->
+    %% The same for an AES-256 header-protection key: the connection's
+    %% AES-256-ECB state masks like the raw 32-byte key.
+    #{hp := Raw} = Keys = roadrunner_quic_keys:traffic_keys(aes_256_gcm, sha384_secret()),
+    #{hp := State} = roadrunner_quic_keys:for_connection(Keys, open),
+    ?assertNotMatch({_, _}, State),
+    Header = <<16#43, 1:32>>,
+    [
+        ?assertEqual(
+            roadrunner_quic_aead:protect_header(Raw, Header, Cipher, 1),
+            roadrunner_quic_aead:protect_header(State, Header, Cipher, 1)
+        )
+     || Cipher <- [crypto:strong_rand_bytes(32) || _ <- lists:seq(1, 20)]
+    ].
+
 for_connection_keeps_the_chacha20_hp_key_test() ->
     %% A ChaCha20 mask runs under a new IV per sample (RFC 9001 §5.4.4), so
     %% the header-protection key stays the raw tagged key.
@@ -149,11 +211,12 @@ for_connection_keeps_the_chacha20_hp_key_test() ->
 for_connection_seals_and_opens_like_the_raw_key_test_() ->
     %% The connection's sealing state must produce the raw key's bytes,
     %% and its opening state must open them, packet after packet, for
-    %% either AEAD.
+    %% every AEAD.
     [
         ?_test(assert_seals_and_opens_like_the_raw_key(Keys))
      || Keys <- [
             roadrunner_quic_keys:initial_server(<<16#8394c8f03e515708:64>>),
+            roadrunner_quic_keys:traffic_keys(aes_256_gcm, sha384_secret()),
             roadrunner_quic_keys:traffic_keys(chacha20_poly1305, a5_secret())
         ]
     ].
@@ -181,7 +244,7 @@ assert_seals_and_opens_like_the_raw_key(Keys) ->
 for_connection_prepares_update_packet_keys_test_() ->
     %% A key update's packet keys carry no header-protection key; only the
     %% AEAD key is prepared, and it seals and opens like the raw key, for
-    %% either AEAD.
+    %% every AEAD.
     [
         ?_test(begin
             {_UpdatedSecret, #{key := Raw, iv := IV} = PacketKeys} =
@@ -195,5 +258,5 @@ for_connection_prepares_update_packet_keys_test_() ->
                 {ok, ~"payload"}, roadrunner_quic_aead:open(OpenKey, IV, 5, ~"aad", Sealed)
             )
         end)
-     || Cipher <- [aes_128_gcm, chacha20_poly1305]
+     || Cipher <- [aes_128_gcm, aes_256_gcm, chacha20_poly1305]
     ].

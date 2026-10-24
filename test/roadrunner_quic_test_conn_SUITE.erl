@@ -8,6 +8,7 @@
 -export([
     native_client_completes_handshake/1,
     native_client_completes_chacha20_handshake/1,
+    native_client_completes_aes_256_gcm_handshake/1,
     native_client_completes_p256_handshake/1
 ]).
 
@@ -18,6 +19,7 @@ all() ->
     [
         native_client_completes_handshake,
         native_client_completes_chacha20_handshake,
+        native_client_completes_aes_256_gcm_handshake,
         native_client_completes_p256_handshake
     ].
 
@@ -42,6 +44,12 @@ native_client_completes_handshake(_Config) ->
 %% ChaCha20-Poly1305 with ChaCha20 header protection (RFC 9001 §5.3, §5.4.4).
 native_client_completes_chacha20_handshake(_Config) ->
     assert_native_handshake(#{cipher_suites => [16#1303]}).
+
+%% The same over TLS_AES_256_GCM_SHA384: both ends run the key schedule over
+%% SHA-384 (RFC 8446 §7.1), and the Handshake and 1-RTT packets use
+%% AES-256-GCM with AES-256 header protection (RFC 9001 §5.3, §5.4.3).
+native_client_completes_aes_256_gcm_handshake(_Config) ->
+    assert_native_handshake(#{cipher_suites => [16#1302]}).
 
 %% The same with secp256r1 as the only group the client offers: the server
 %% answers with its own P-256 share (RFC 8446 §4.2.8.2).

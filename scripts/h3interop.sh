@@ -29,6 +29,10 @@
 #   chacha20     GET 100 bytes offering only TLS_CHACHA20_POLY1305_SHA256
 #   chacha20-ku  keyupdate offering only TLS_CHACHA20_POLY1305_SHA256, so
 #                the updated keys are ChaCha20-Poly1305 keys too
+#   aes256       GET 100 bytes offering only TLS_AES_256_GCM_SHA384, so the
+#                key schedule runs over SHA-384
+#   aes256-ku    keyupdate offering only TLS_AES_256_GCM_SHA384, so the
+#                updated keys are AES-256-GCM keys from a SHA-384 "quic ku"
 #   p256         GET 100 bytes offering only the secp256r1 (P-256) group
 #   hrr          GET 100 bytes sending a key share only for X25519MLKEM768,
 #                which the server does not support, so the server asks for
@@ -156,10 +160,10 @@ fi
 case_urls() {
     case "$1" in
         small) echo "$BASE/files/100" ;;
-        large | keyupdate | chacha20-ku) echo "$BASE/files/5000000" ;;
+        large | keyupdate | chacha20-ku | aes256-ku) echo "$BASE/files/5000000" ;;
         multiplex) for n in $MULTIPLEX_SIZES; do echo "$BASE/files/$n"; done ;;
         upload) echo "$BASE/echo" ;;
-        chacha20 | p256 | hrr) echo "$BASE/files/100" ;;
+        chacha20 | aes256 | p256 | hrr) echo "$BASE/files/100" ;;
     esac
 }
 
@@ -169,9 +173,9 @@ case_urls() {
 check_case() {
     local name=$1 dir=$2
     case "$name" in
-        small | chacha20 | p256 | hrr) cmp -s "$WWW/100" "$dir/100" ;;
+        small | chacha20 | aes256 | p256 | hrr) cmp -s "$WWW/100" "$dir/100" ;;
         large) cmp -s "$WWW/5000000" "$dir/5000000" ;;
-        keyupdate | chacha20-ku)
+        keyupdate | chacha20-ku | aes256-ku)
             cmp -s "$WWW/5000000" "$dir/5000000" &&
                 grep -q "pkt rx .* type=1RTT k=1" "$dir.log"
             ;;
@@ -207,6 +211,8 @@ run_ngtcp2() {
         keyupdate) opts="--key-update=1ms" ;;
         chacha20) opts="-q --ciphers=TLS_CHACHA20_POLY1305_SHA256" ;;
         chacha20-ku) opts="--ciphers=TLS_CHACHA20_POLY1305_SHA256 --key-update=1ms" ;;
+        aes256) opts="-q --ciphers=TLS_AES_256_GCM_SHA384" ;;
+        aes256-ku) opts="--ciphers=TLS_AES_256_GCM_SHA384 --key-update=1ms" ;;
         p256) opts="-q --groups=P-256" ;;
         hrr) opts="-q --groups=X25519MLKEM768:X25519" ;;
     esac
@@ -226,7 +232,7 @@ run_ngtcp2() {
 client_cases() {
     case "$1" in
         quiche) echo small large multiplex upload ;;
-        ngtcp2) echo small large multiplex upload keyupdate chacha20 chacha20-ku p256 hrr ;;
+        ngtcp2) echo small large multiplex upload keyupdate chacha20 chacha20-ku aes256 aes256-ku p256 hrr ;;
     esac
 }
 

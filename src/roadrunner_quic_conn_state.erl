@@ -103,13 +103,15 @@
 -define(IDLE_TIMEOUT, 30000).
 %% The AEAD integrity limits (RFC 9001 §6.6): received packets that may fail
 %% authentication within a connection before it MUST close, for
-%% AEAD_AES_128_GCM and AEAD_CHACHA20_POLY1305.
--define(AES_128_GCM_INTEGRITY_LIMIT, (1 bsl 52)).
+%% AEAD_AES_128_GCM and AEAD_AES_256_GCM (which share theirs) and
+%% AEAD_CHACHA20_POLY1305.
+-define(AES_GCM_INTEGRITY_LIMIT, (1 bsl 52)).
 -define(CHACHA20_POLY1305_INTEGRITY_LIMIT, (1 bsl 36)).
 %% The AEAD confidentiality limits (RFC 9001 §6.6): packets one key may
-%% protect. AEAD_CHACHA20_POLY1305's is above the 2^62 packet numbers there
+%% protect, again shared by AEAD_AES_128_GCM and AEAD_AES_256_GCM.
+%% AEAD_CHACHA20_POLY1305's is above the 2^62 packet numbers there
 %% are, so no connection reaches it and it is kept as that bound.
--define(AES_128_GCM_CONFIDENTIALITY_LIMIT, (1 bsl 23)).
+-define(AES_GCM_CONFIDENTIALITY_LIMIT, (1 bsl 23)).
 -define(CHACHA20_POLY1305_CONFIDENTIALITY_LIMIT, (1 bsl 62)).
 
 %% 1-RTT packets kept, still protected, while the handshake is in progress
@@ -1022,7 +1024,8 @@ key_limit(Sealed, Now, #state{aead = Aead} = State) ->
     end.
 
 -spec confidentiality_limit(roadrunner_quic_aead:cipher()) -> pos_integer().
-confidentiality_limit(aes_128_gcm) -> ?AES_128_GCM_CONFIDENTIALITY_LIMIT;
+confidentiality_limit(aes_128_gcm) -> ?AES_GCM_CONFIDENTIALITY_LIMIT;
+confidentiality_limit(aes_256_gcm) -> ?AES_GCM_CONFIDENTIALITY_LIMIT;
 confidentiality_limit(chacha20_poly1305) -> ?CHACHA20_POLY1305_CONFIDENTIALITY_LIMIT.
 
 %% RFC 9001 §6.1: we may start a key update only once the handshake is
@@ -1089,7 +1092,8 @@ auth_failed(Level, Failures, #state{aead = Aead} = State) ->
     end.
 
 -spec integrity_limit(roadrunner_quic_aead:cipher()) -> pos_integer().
-integrity_limit(aes_128_gcm) -> ?AES_128_GCM_INTEGRITY_LIMIT;
+integrity_limit(aes_128_gcm) -> ?AES_GCM_INTEGRITY_LIMIT;
+integrity_limit(aes_256_gcm) -> ?AES_GCM_INTEGRITY_LIMIT;
 integrity_limit(chacha20_poly1305) -> ?CHACHA20_POLY1305_INTEGRITY_LIMIT.
 
 %% A decrypted Handshake packet proves the client received the server's

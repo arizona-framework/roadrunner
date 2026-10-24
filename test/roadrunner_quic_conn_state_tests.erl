@@ -92,6 +92,26 @@ chacha20_handshake_reaches_connected_test() ->
     ),
     ?assert(lists:member(handshake_done, Frames)).
 
+%% A client offering only TLS_AES_256_GCM_SHA384 completes the handshake on
+%% AES-256-GCM packet protection with AES-256 header protection (RFC 9001
+%% §5.3, §5.4.3), over a SHA-384 key schedule: the driver derives 48-byte
+%% secrets, reads the server's Handshake flight with AES-256 keys, and the
+%% server's HANDSHAKE_DONE opens under the AES-256 1-RTT keys. The Initial
+%% packets stay AES-128-GCM (§5.2).
+aes_256_gcm_handshake_reaches_connected_test() ->
+    #{state2 := State2, effects2 := Effects2, server_ap_secret := ServerApSecret, aead := Aead} =
+        connect(#{}, #{cipher_suites => [16#1302]}),
+    ?assertEqual(aes_256_gcm, Aead),
+    ?assertEqual(48, byte_size(ServerApSecret)),
+    ?assertEqual(connected, ?M:phase(State2)),
+    Frames = ?TC:frames(
+        sends(Effects2),
+        application,
+        #{application => roadrunner_quic_keys:traffic_keys(aes_256_gcm, ServerApSecret)},
+        byte_size(?DCID)
+    ),
+    ?assert(lists:member(handshake_done, Frames)).
+
 %% The server answers in the group of the client's share (x25519) with its
 %% own ephemeral share, generated per connection.
 server_hello_carries_server_key_share_test() ->
@@ -124,10 +144,23 @@ p256_handshake_reaches_connected_test() ->
 %% HelloRetryRequest in the server's Initial CRYPTO stream, and the handshake
 %% completes over the message_hash transcript (RFC 8446 §4.4.1).
 hello_retry_request_reaches_connected_test() ->
+    assert_hello_retry_request_reaches_connected(16#1301, sha256).
+
+%% The same over TLS_AES_256_GCM_SHA384: the message_hash replacing the first
+%% ClientHello is its SHA-384 hash (RFC 8446 §4.4.1), which the rest of the
+%% SHA-384 key schedule builds on.
+aes_256_gcm_hello_retry_request_reaches_connected_test() ->
+    assert_hello_retry_request_reaches_connected(16#1302, sha384).
+
+assert_hello_retry_request_reaches_connected(Suite, Hash) ->
     {State0, #{scheme := Scheme, client_pub := ClientPub, client_priv := ClientPriv}} =
         new_conn([~"leaf-cert-der"]),
     ClientHello1 = ?TC:client_hello_framed(#{
-        scheme => Scheme, key_shares => [], groups => [?GROUP_X25519], client_scid => ?CLIENT_SCID
+        scheme => Scheme,
+        key_shares => [],
+        groups => [?GROUP_X25519],
+        client_scid => ?CLIENT_SCID,
+        cipher_suites => [Suite]
     }),
     {State1, Effects1} = ?M:handle_datagram(?NOW, initial_datagram(0, 0, ClientHello1), State0),
     ?assertEqual(handshaking, ?M:phase(State1)),
@@ -144,7 +177,10 @@ hello_retry_request_reaches_connected_test() ->
     ?assertNot(maps:is_key(key_share, ?TC:parse_server_hello(HelloRetryBody))),
 
     ClientHello2 = ?TC:client_hello_framed(#{
-        scheme => Scheme, key_shares => [{?GROUP_X25519, ClientPub}], client_scid => ?CLIENT_SCID
+        scheme => Scheme,
+        key_shares => [{?GROUP_X25519, ClientPub}],
+        client_scid => ?CLIENT_SCID,
+        cipher_suites => [Suite]
     }),
     Datagram2 = initial_datagram(1, byte_size(ClientHello1), ClientHello2),
     {State2, Effects2} = ?M:handle_datagram(?NOW, Datagram2, State1),
@@ -157,7 +193,8 @@ hello_retry_request_reaches_connected_test() ->
         ],
     ?assertEqual(byte_size(HelloRetryRequest), ServerHelloOffset),
 
-    MessageHash = <<254, 32:24, (crypto:hash(sha256, ClientHello1))/binary>>,
+    Digest = crypto:hash(Hash, ClientHello1),
+    MessageHash = <<254, (byte_size(Digest)):24, Digest/binary>>,
     #{state2 := State3} = finish_handshake(
         State2, Effects2, [MessageHash, HelloRetryRequest, ClientHello2], ClientPriv
     ),
@@ -411,10 +448,10 @@ missing_transport_params_closes_test() ->
 no_tls_1_3_closes_with_protocol_version_test() ->
     assert_client_hello_closes(#{versions => [16#0303]}, protocol_version, 16#0146).
 
-%% No cipher suite in common is a handshake_failure (40), 0x0128 (RFC 8446
-%% §4.1.1, RFC 9001 §4.8).
+%% No cipher suite in common (only TLS_AES_128_CCM_SHA256 on offer) is a
+%% handshake_failure (40), 0x0128 (RFC 8446 §4.1.1, RFC 9001 §4.8).
 no_common_cipher_suite_closes_test() ->
-    assert_client_hello_closes(#{cipher_suites => [16#1302]}, no_common_cipher_suite, 16#0128).
+    assert_client_hello_closes(#{cipher_suites => [16#1304]}, no_common_cipher_suite, 16#0128).
 
 %% No group in common is a handshake_failure too (RFC 8446 §4.1.1).
 no_common_group_closes_test() ->
@@ -2271,6 +2308,34 @@ chacha20_peer_key_update_test() ->
         app_packets(Effects4, generation_keys(chacha20_poly1305, ServerApSecret, 2))
     ).
 
+%% The same on an AES-256-GCM connection: every generation is an AES-256-GCM
+%% key from a SHA-384 "quic ku" secret of 48 bytes (RFC 9001 §6.1), with the
+%% AES-256 header-protection key of the first.
+aes_256_gcm_peer_key_update_test() ->
+    {State, ClientApSecret, ServerApSecret} =
+        connect_owned(#{}, #{cipher_suites => [16#1302]}),
+    {Updated, _} = roadrunner_quic_keys:update(aes_256_gcm, ClientApSecret),
+    ?assertEqual(48, byte_size(Updated)),
+    Update = phase_datagram([ping], 0, generation_keys(aes_256_gcm, ClientApSecret, 1), 1),
+    {State1, _} = ?M:handle_datagram(?NOW, Update, State),
+    ?assertEqual(connected, ?M:phase(State1)),
+    {State2, Effects2} = ?M:handle_timeout(?NOW + 20, ack, State1),
+    ?assertMatch(
+        [{ok, #{key_phase := 1, frames := [{ack, 0, _, 0, [], undefined} | _]}}],
+        app_packets(Effects2, generation_keys(aes_256_gcm, ServerApSecret, 1))
+    ),
+    ?assertEqual(
+        [{auth_failed, application}], app_packets(Effects2, generation_keys(ServerApSecret, 1))
+    ),
+    Again = phase_datagram([ping], 1, generation_keys(aes_256_gcm, ClientApSecret, 2), 0),
+    {State3, _} = ?M:handle_datagram(?NOW + 30, Again, State2),
+    ?assertEqual(connected, ?M:phase(State3)),
+    {_State4, Effects4} = ?M:handle_timeout(?NOW + 50, ack, State3),
+    ?assertMatch(
+        [{ok, #{key_phase := 0, frames := [{ack, 1, _, 1, [], undefined} | _]}}],
+        app_packets(Effects4, generation_keys(aes_256_gcm, ServerApSecret, 2))
+    ).
+
 %% RFC 9001 §6.1: a key update before the handshake is confirmed (at the
 %% server, before it completes) is a KEY_UPDATE_ERROR. The packet is held
 %% unopened during the handshake (§5.7), so the update is found, and the
@@ -2407,6 +2472,14 @@ chacha20_aead_integrity_limit_closes_test() ->
     ?assertEqual(connected, ?M:phase(?M:auth_failed(application, 1 bsl 36, State))),
     ?assertEqual(draining, ?M:phase(?M:auth_failed(application, (1 bsl 36) + 1, State))).
 
+%% AEAD_AES_256_GCM shares AEAD_AES_128_GCM's integrity limit of 2^52 (RFC
+%% 9001 §6.6).
+aes_256_gcm_aead_integrity_limit_closes_test() ->
+    {State, _ClientApSecret, _ServerApSecret} =
+        connect_owned(#{}, #{cipher_suites => [16#1302]}),
+    ?assertEqual(connected, ?M:phase(?M:auth_failed(application, 1 bsl 52, State))),
+    ?assertEqual(draining, ?M:phase(?M:auth_failed(application, (1 bsl 52) + 1, State))).
+
 %% RFC 9001 §6.6: halfway to the AES-128-GCM confidentiality limit of 2^23
 %% packets, once the peer has acknowledged a packet of the current phase and
 %% three PTOs have passed (§6.1, §6.5), the server starts a key update of its
@@ -2526,6 +2599,23 @@ chacha20_confidentiality_limit_test() ->
         app_packets(Effects2, generation_keys(chacha20_poly1305, ServerApSecret, 1))
     ).
 
+%% AEAD_AES_256_GCM shares AEAD_AES_128_GCM's confidentiality limit of 2^23
+%% packets (RFC 9001 §6.6): just short of halfway nothing changes, and
+%% halfway there the server starts a key update of its own, to the next
+%% AES-256-GCM generation.
+aes_256_gcm_confidentiality_limit_test() ->
+    {State, ClientApSecret, ServerApSecret} =
+        connect_owned(#{}, #{cipher_suites => [16#1302]}),
+    Later = ?NOW + 60000,
+    Acked = send_phase_acked(State, generation_keys(aes_256_gcm, ClientApSecret, 0)),
+    ?assertEqual(Acked, ?M:key_limit((1 bsl 22) - 1, Later, Acked)),
+    Half = ?M:key_limit(1 bsl 22, Later, Acked),
+    {_, Effects2} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, Later, Half),
+    ?assertMatch(
+        [{ok, #{key_phase := 1}}],
+        app_packets(Effects2, generation_keys(aes_256_gcm, ServerApSecret, 1))
+    ).
+
 %% =============================================================================
 %% Handshake driver (plays the QUIC client with the shared test client)
 %% =============================================================================
@@ -2568,17 +2658,17 @@ finish_handshake(State1, Effects1, Transcript, ClientPriv) ->
     [{2, ServerHelloBody}] = ?TC:deframe_all(ServerHello),
     #{cipher := Cipher, group := Group, key_share := ServerShare} =
         ?TC:parse_server_hello(ServerHelloBody),
-    Aead = aead(Cipher),
+    {Aead, Hash} = suite(Cipher),
     Shared = crypto:compute_key(ecdh, ServerShare, ClientPriv, curve(Group)),
     HandshakeSecret = roadrunner_quic_tls_crypto:handshake_secret(
-        roadrunner_quic_tls_crypto:early_secret(), Shared
+        Hash, roadrunner_quic_tls_crypto:early_secret(Hash), Shared
     ),
-    HelloHash = roadrunner_quic_tls_crypto:transcript_hash([Transcript, ServerHello]),
+    HelloHash = roadrunner_quic_tls_crypto:transcript_hash(Hash, [Transcript, ServerHello]),
     ClientHsSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        client, handshake, HandshakeSecret, HelloHash
+        Hash, client, handshake, HandshakeSecret, HelloHash
     ),
     ServerHsSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        server, handshake, HandshakeSecret, HelloHash
+        Hash, server, handshake, HandshakeSecret, HelloHash
     ),
 
     %% Recover the server's authentication flight.
@@ -2588,11 +2678,13 @@ finish_handshake(State1, Effects1, Transcript, ClientPriv) ->
         #{handshake => roadrunner_quic_keys:traffic_keys(Aead, ServerHsSecret)},
         byte_size(?DCID)
     ),
-    FinishedHash = roadrunner_quic_tls_crypto:transcript_hash([Transcript, ServerHello, Flight]),
+    FinishedHash = roadrunner_quic_tls_crypto:transcript_hash(Hash, [
+        Transcript, ServerHello, Flight
+    ]),
 
     %% Build and send the client Finished at the handshake level.
     ClientFinishedBody = roadrunner_quic_tls_crypto:verify_data(
-        roadrunner_quic_tls_crypto:finished_key(ClientHsSecret), FinishedHash
+        Hash, roadrunner_quic_tls_crypto:finished_key(Hash, ClientHsSecret), FinishedHash
     ),
     ClientFinishedFramed = iolist_to_binary(
         roadrunner_quic_tls_handshake:encode(?FINISHED, ClientFinishedBody)
@@ -2609,12 +2701,12 @@ finish_handshake(State1, Effects1, Transcript, ClientPriv) ->
 
     %% Application keys, for reading the HANDSHAKE_DONE and sealing a
     %% post-connected client 1-RTT packet.
-    MasterSecret = roadrunner_quic_tls_crypto:master_secret(HandshakeSecret),
+    MasterSecret = roadrunner_quic_tls_crypto:master_secret(Hash, HandshakeSecret),
     ServerApSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        server, application, MasterSecret, FinishedHash
+        Hash, server, application, MasterSecret, FinishedHash
     ),
     ClientApSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        client, application, MasterSecret, FinishedHash
+        Hash, client, application, MasterSecret, FinishedHash
     ),
 
     #{
@@ -2632,9 +2724,11 @@ finish_handshake(State1, Effects1, Transcript, ClientPriv) ->
         aead => Aead
     }.
 
-%% The packet-protection AEAD of a cipher suite (RFC 9001 §5.3).
-aead(16#1301) -> aes_128_gcm;
-aead(16#1303) -> chacha20_poly1305.
+%% The packet-protection AEAD (RFC 9001 §5.3) and key-schedule hash (RFC
+%% 8446 Appendix B.4) of a cipher suite.
+suite(16#1301) -> {aes_128_gcm, sha256};
+suite(16#1302) -> {aes_256_gcm, sha384};
+suite(16#1303) -> {chacha20_poly1305, sha256}.
 
 %% The `crypto` curve of a key exchange group (RFC 8446 §4.2.7).
 curve(?GROUP_X25519) -> x25519;

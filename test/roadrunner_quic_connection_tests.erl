@@ -321,14 +321,14 @@ do_handshake(Shell, Peer, ClientSocket, Ctx) ->
     ?assertNotEqual(<<>>, ServerHello),
     Shared = crypto:compute_key(ecdh, ?TC:server_hello_key_share(ServerHello), ClientPriv, x25519),
     HandshakeSecret = roadrunner_quic_tls_crypto:handshake_secret(
-        roadrunner_quic_tls_crypto:early_secret(), Shared
+        sha256, roadrunner_quic_tls_crypto:early_secret(sha256), Shared
     ),
-    HelloHash = roadrunner_quic_tls_crypto:transcript_hash([ClientHelloFramed, ServerHello]),
+    HelloHash = roadrunner_quic_tls_crypto:transcript_hash(sha256, [ClientHelloFramed, ServerHello]),
     ClientHsSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        client, handshake, HandshakeSecret, HelloHash
+        sha256, client, handshake, HandshakeSecret, HelloHash
     ),
     ServerHsSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        server, handshake, HandshakeSecret, HelloHash
+        sha256, server, handshake, HandshakeSecret, HelloHash
     ),
     Flight = ?TC:crypto_bytes(
         Flight1,
@@ -336,11 +336,11 @@ do_handshake(Shell, Peer, ClientSocket, Ctx) ->
         #{handshake => roadrunner_quic_keys:traffic_keys(aes_128_gcm, ServerHsSecret)},
         byte_size(?DCID)
     ),
-    FinishedHash = roadrunner_quic_tls_crypto:transcript_hash([
+    FinishedHash = roadrunner_quic_tls_crypto:transcript_hash(sha256, [
         ClientHelloFramed, ServerHello, Flight
     ]),
     ClientFinishedBody = roadrunner_quic_tls_crypto:verify_data(
-        roadrunner_quic_tls_crypto:finished_key(ClientHsSecret), FinishedHash
+        sha256, roadrunner_quic_tls_crypto:finished_key(sha256, ClientHsSecret), FinishedHash
     ),
     ClientFinishedFramed = iolist_to_binary(
         roadrunner_quic_tls_handshake:encode(?FINISHED, ClientFinishedBody)
@@ -354,12 +354,12 @@ do_handshake(Shell, Peer, ClientSocket, Ctx) ->
         ?SCID
     ),
     Shell ! {quic_datagram, Peer, FinishedDatagram},
-    MasterSecret = roadrunner_quic_tls_crypto:master_secret(HandshakeSecret),
+    MasterSecret = roadrunner_quic_tls_crypto:master_secret(sha256, HandshakeSecret),
     ServerApSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        server, application, MasterSecret, FinishedHash
+        sha256, server, application, MasterSecret, FinishedHash
     ),
     ClientApSecret = roadrunner_quic_tls_crypto:traffic_secret(
-        client, application, MasterSecret, FinishedHash
+        sha256, client, application, MasterSecret, FinishedHash
     ),
     {ClientApSecret, ServerApSecret}.
 

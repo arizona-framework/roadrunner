@@ -5,11 +5,12 @@
 %% header protection.
 %%
 %% The AEAD is the one the TLS cipher suite names (§5.3): AES-128-GCM for
-%% TLS_AES_128_GCM_SHA256 (always used for Initial packets, §5.2) or
-%% ChaCha20-Poly1305 for TLS_CHACHA20_POLY1305_SHA256. Both take a 12-byte
-%% IV and append a 16-byte tag. Header protection follows the AEAD:
-%% AES-128-ECB for AES-128-GCM (§5.4.3), raw ChaCha20 for ChaCha20-Poly1305
-%% (§5.4.4). A key carries its algorithm as a tag (`{aes_128_gcm, Key}`,
+%% TLS_AES_128_GCM_SHA256 (always used for Initial packets, §5.2),
+%% AES-256-GCM for TLS_AES_256_GCM_SHA384, or ChaCha20-Poly1305 for
+%% TLS_CHACHA20_POLY1305_SHA256. All take a 12-byte IV and append a 16-byte
+%% tag. Header protection follows the AEAD: AES-ECB with the AEAD's key size
+%% for AES-128-GCM and AES-256-GCM (§5.4.3), raw ChaCha20 for
+%% ChaCha20-Poly1305 (§5.4.4). A key carries its algorithm as a tag (`{aes_128_gcm, Key}`,
 %% `{aes_128_ecb, HP}`, and so on), so the functions here pick the cipher
 %% from the key they are handed. The nonce is the IV with the packet
 %% number XORed into its low 64 bits (§5.3). Header protection masks the
@@ -29,7 +30,7 @@
 
 %% The packet-protection AEADs of the supported TLS cipher suites
 %% (RFC 9001 §5.3), named as `crypto` names them.
--type cipher() :: aes_128_gcm | chacha20_poly1305.
+-type cipher() :: aes_128_gcm | aes_256_gcm | chacha20_poly1305.
 
 %% A packet-protection key: the raw key tagged with its AEAD, or (OTP 28+)
 %% the sealing or opening state a connection builds from it once
@@ -37,9 +38,9 @@
 -type aead_key() :: {cipher(), binary()} | crypto:crypto_state().
 
 %% A header-protection key: the raw key tagged with its cipher, or the
-%% AES-128-ECB state a connection builds from an AES key once
+%% AES-ECB state a connection builds from an AES key once
 %% (`roadrunner_quic_keys:for_connection/2`).
--type hp() :: {aes_128_ecb | chacha20, binary()} | crypto:crypto_state().
+-type hp() :: {aes_128_ecb | aes_256_ecb | chacha20, binary()} | crypto:crypto_state().
 
 %% AEAD authentication tag length (RFC 9001 §5.3).
 -define(TAG_LEN, 16).
@@ -179,7 +180,8 @@ nonce(<<Prefix:32, Low:64>>, PN) ->
 
 %% Header-protection mask (RFC 9001 §5.4.1) from the 16-byte sample. The
 %% first byte masks the first header byte; the next bytes mask the packet
-%% number. AES (§5.4.3) encrypts the sample with AES-128-ECB. ChaCha20
+%% number. AES (§5.4.3) encrypts the sample with AES-ECB (AES-128 or
+%% AES-256, the AEAD's key size). ChaCha20
 %% (§5.4.4) encrypts 5 zero bytes with the sample as its 16-byte IV: the
 %% first 4 sample bytes are the little-endian block counter and the other
 %% 12 the nonce, which is the counter-then-nonce IV layout `crypto` takes,
@@ -192,6 +194,8 @@ nonce(<<Prefix:32, Low:64>>, PN) ->
 -spec hp_mask(hp(), binary()) -> binary().
 hp_mask({aes_128_ecb, HPKey}, Sample) ->
     crypto:crypto_one_time(aes_128_ecb, HPKey, Sample, true);
+hp_mask({aes_256_ecb, HPKey}, Sample) ->
+    crypto:crypto_one_time(aes_256_ecb, HPKey, Sample, true);
 hp_mask({chacha20, HPKey}, Sample) ->
     crypto:crypto_one_time(chacha20, HPKey, Sample, <<0:40>>, true);
 hp_mask(HPState, Sample) ->
