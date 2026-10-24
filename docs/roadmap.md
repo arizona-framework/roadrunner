@@ -133,10 +133,6 @@ advisory or malformed cases the server currently tolerates or omits.
   commit-then-decrypt, which a single forged flipped-bit datagram desyncs),
   keep the header-protection key fixed, enforce the AEAD integrity limit —
   large
-- Closing-state CONNECTION_CLOSE retransmission (RFC 9000 §10.2.1): a connection
-  draining after a local close absorbs the peer's late packets but does not
-  re-send its CONNECTION_CLOSE in response (rate-limited), so a peer that lost the
-  close learns only by timeout — small-medium
 - Congestion-control refinements (RFC 9002): NewReno gates the send loop (slow
   start, congestion avoidance, and recovery halving on ACK-detected loss), but two
   pieces are deferred — feeding timer/PTO-detected losses to the controller (only

@@ -1863,6 +1863,26 @@ late_packet_during_draining_is_absorbed_test() ->
     ?assertEqual([], emits(Effects)),
     ?assertEqual([], [E || {arm_timer, _, _} = E <- Effects]).
 
+%% RFC 9000 §10.2.1: after our own CONNECTION_CLOSE, a late packet means the
+%% peer may not have seen it, so the same close goes out again, at packet
+%% counts 1, 2, 4, 8, ... so the answers stay rate-limited.
+late_packet_after_local_close_resends_close_test() ->
+    {State, ApSecret} = connected_with_owner(),
+    Bad = app_datagram([{retire_connection_id, 1}], 0, ApSecret),
+    {Closing, CloseEffects} = ?M:handle_datagram(?NOW, Bad, State),
+    ?assertEqual(draining, ?M:phase(Closing)),
+    [CloseDatagram] = sends(CloseEffects),
+    Late = fun(PN, S) -> ?M:handle_datagram(?NOW + PN, app_datagram([ping], PN, ApSecret), S) end,
+    {S1, E1} = Late(1, Closing),
+    {S2, E2} = Late(2, S1),
+    {S3, E3} = Late(3, S2),
+    {_S4, E4} = Late(4, S3),
+    ?assertEqual([[CloseDatagram], [CloseDatagram], [], [CloseDatagram]], [
+        sends(E)
+     || E <- [E1, E2, E3, E4]
+    ]),
+    ?assertEqual([], [T || E <- [E1, E2, E3, E4], {arm_timer, _, _} = T <- E]).
+
 drain_timeout_closes_test() ->
     %% When the drain timer fires the connection becomes closed (the shell then
     %% tears it down); the owner already learned of the close on entry, so the
