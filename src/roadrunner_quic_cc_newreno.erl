@@ -10,7 +10,8 @@
 %% A loss starts a congestion recovery period: the window halves (floored
 %% at the minimum) and further losses from packets sent during that period
 %% are ignored, so one round trip of loss reduces the window once
-%% (§7.3.2). The clock is passed in, so every decision is deterministic.
+%% (§7.3.2). Persistent congestion (§7.6) collapses the window to the
+%% minimum. The clock is passed in, so every decision is deterministic.
 %%
 %% The bytes in flight live in `roadrunner_quic_loss`; `can_send/2` takes
 %% that count rather than tracking a second copy.
@@ -19,6 +20,7 @@
     new/0,
     on_packets_acked/3,
     on_congestion_event/3,
+    on_persistent_congestion/1,
     can_send/2,
     cwnd/1,
     ssthresh/1,
@@ -83,6 +85,16 @@ on_congestion_event(SentTime, Now, #cc{cwnd = Cwnd, recovery_start = Start} = Cc
     Cc#cc{ssthresh = SsThresh, cwnd = max(SsThresh, ?MINIMUM_WINDOW), recovery_start = Now};
 on_congestion_event(_SentTime, _Now, Cc) ->
     Cc.
+
+-doc """
+Collapse the window to the minimum on persistent congestion (RFC 9002
+§7.6.2) and end the recovery period (Appendix B.8), so the next
+acknowledgement grows the window again in slow start. The slow-start
+threshold set by the congestion event that came with the loss stays.
+""".
+-spec on_persistent_congestion(t()) -> t().
+on_persistent_congestion(Cc) ->
+    Cc#cc{cwnd = ?MINIMUM_WINDOW, recovery_start = undefined}.
 
 -doc "Whether more bytes may be sent: the bytes in flight are below the window.".
 -spec can_send(non_neg_integer(), t()) -> boolean().

@@ -6,8 +6,9 @@ Over a random sequence of acknowledgements and congestion events, driven
 by a monotonic clock so each event lands after the previous one (so a
 congestion event is a genuine reduction, not a deduplicated no-op): the
 congestion window never drops below the minimum (2 * max_datagram_size,
-RFC 9002 §7.2), an acknowledgement never shrinks it, and a congestion
-event never grows it.
+RFC 9002 §7.2), an acknowledgement never shrinks it, a congestion
+event never grows it, and persistent congestion leaves it at exactly the
+minimum (§7.6.2).
 """.
 
 -compile(export_all).
@@ -38,12 +39,19 @@ check([Op | Rest], Clock, Cc) ->
         check(Rest, Clock + 1, Next).
 
 direction_ok({acked, _}, Before, After) -> After >= Before;
-direction_ok(congestion, Before, After) -> After =< Before.
+direction_ok(congestion, Before, After) -> After =< Before;
+direction_ok(persistent, _Before, After) -> After =:= ?MINIMUM_WINDOW.
 
 op() ->
-    oneof([{acked, integer(0, 5000)}, congestion]).
+    oneof([{acked, integer(0, 5000)}, congestion, persistent]).
 
 apply_op({acked, AckedBytes}, Clock, Cc) ->
     roadrunner_quic_cc_newreno:on_packets_acked(AckedBytes, Clock, Cc);
 apply_op(congestion, Clock, Cc) ->
-    roadrunner_quic_cc_newreno:on_congestion_event(Clock, Clock, Cc).
+    roadrunner_quic_cc_newreno:on_congestion_event(Clock, Clock, Cc);
+apply_op(persistent, Clock, Cc) ->
+    %% Persistent congestion always comes with the loss's congestion event
+    %% (RFC 9002 Appendix B.8).
+    roadrunner_quic_cc_newreno:on_persistent_congestion(
+        roadrunner_quic_cc_newreno:on_congestion_event(Clock, Clock, Cc)
+    ).

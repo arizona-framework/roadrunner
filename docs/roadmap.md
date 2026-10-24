@@ -138,12 +138,6 @@ advisory or malformed cases the server currently tolerates or omits.
   processed and acknowledged today. Drop or buffer it until the Finished
   verifies, without losing the 1-RTT packet a client coalesces behind its
   Finished in the same datagram — small-medium
-- Congestion-control refinements (RFC 9002): NewReno gates the send loop (slow
-  start, congestion avoidance, and recovery halving on ACK-detected loss), but two
-  pieces are deferred — feeding timer/PTO-detected losses to the controller (only
-  ACK-detected losses back off the window today), and persistent congestion (§7.6,
-  resetting the window to the minimum when a PTO spans all in-flight packets) —
-  medium
 
 ### Throughput levers identified by profiling
 

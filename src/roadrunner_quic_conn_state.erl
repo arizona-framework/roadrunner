@@ -1247,26 +1247,41 @@ apply_ack(Now, Level, Ack, Space, #state{cc = Cc} = State) ->
             )
     end.
 
-%% Feed the loss layer's per-ACK congestion signal to NewReno: grow the window
-%% for the acknowledged bytes first, then react to any loss (RFC 9002 §7.3, ack
-%% before loss). A defined largest-acked send time means the largest acked was
-%% ack-eliciting, so the acked bytes are positive; `undefined` (nothing newly
-%% acked, or a non-ack-eliciting largest) skips the growth.
+%% Feed the loss layer's congestion signal to NewReno in the RFC 9002 Appendix
+%% A.7 order: react to any loss first (a congestion event, Appendix B.8, then
+%% the collapse to the minimum window on persistent congestion, §7.6.2), then
+%% grow the window for the acknowledged bytes. Loss first means an ACK that both
+%% acknowledges and reveals loss holds the window for the packets sent before
+%% the new recovery period, while persistent congestion ends recovery so the
+%% same ACK grows the collapsed window in slow start. A defined largest-acked
+%% send time means the largest acked was ack-eliciting, so the acked bytes are
+%% positive; `undefined` (nothing newly acked, a non-ack-eliciting largest, or
+%% a timer pass) skips the growth.
 -spec apply_cc_signal(roadrunner_quic_loss:cc_signal(), integer(), roadrunner_quic_cc_newreno:t()) ->
     roadrunner_quic_cc_newreno:t().
 apply_cc_signal(
-    #{acked_bytes := AckedBytes, largest_acked_time := AckedTime, largest_lost_time := LostTime},
+    #{
+        acked_bytes := AckedBytes,
+        largest_acked_time := AckedTime,
+        largest_lost_time := LostTime,
+        persistent_congestion := Persistent
+    },
     Now,
     Cc
 ) ->
-    Grown =
-        case AckedTime of
+    Reduced =
+        case LostTime of
             undefined -> Cc;
-            _ -> roadrunner_quic_cc_newreno:on_packets_acked(AckedBytes, AckedTime, Cc)
+            _ -> roadrunner_quic_cc_newreno:on_congestion_event(LostTime, Now, Cc)
         end,
-    case LostTime of
-        undefined -> Grown;
-        _ -> roadrunner_quic_cc_newreno:on_congestion_event(LostTime, Now, Grown)
+    Collapsed =
+        case Persistent of
+            true -> roadrunner_quic_cc_newreno:on_persistent_congestion(Reduced);
+            false -> Reduced
+        end,
+    case AckedTime of
+        undefined -> Collapsed;
+        _ -> roadrunner_quic_cc_newreno:on_packets_acked(AckedBytes, AckedTime, Collapsed)
     end.
 
 %% =============================================================================
@@ -2169,23 +2184,26 @@ handle_timeout(_Now, drain, State) ->
     %% tears the connection down. The owner already learned of the close on entry.
     {State#state{phase = closed}, []}.
 
-%% On a probe timeout: queue any time-threshold losses to retransmit and
-%% increment the space's probe-timeout backoff (RFC 9002 §6.2.1), so the
-%% next deadline is strictly later. A space with packets in flight then MUST
+%% On a probe timeout: queue any time-threshold losses to retransmit, feed
+%% them to congestion control as a congestion event the same as ACK-detected
+%% losses (RFC 9002 Appendix B.8; the recovery period still dedups them,
+%% §7.3.2), and increment the space's probe-timeout backoff (RFC 9002
+%% §6.2.1), so the next deadline is strictly later. A space with packets in flight then MUST
 %% send an ack-eliciting probe (RFC 9002 §6.2.4): loss detection only counts
 %% a packet older than one the peer acknowledged, so the last packets of a
 %% flight, if lost, are found only through the ACK a probe draws. The probe
 %% is what was just found lost, else the oldest data still unacknowledged,
 %% else a PING.
 -spec on_pto(integer(), level(), t()) -> t().
-on_pto(Now, Level, #state{probes = Probes} = State) ->
+on_pto(Now, Level, #state{probes = Probes, cc = Cc} = State) ->
     #space{loss = Loss0, pending = Pending} = Space = space(Level, State),
     {Loss1, Lost} = roadrunner_quic_loss:detect_lost(Now, Loss0),
     Loss2 = roadrunner_quic_loss:on_pto_expired(Loss1),
     Space1 = Space#space{loss = Loss2, pending = lists:reverse(retransmittable(Lost), Pending)},
+    State1 = State#state{cc = apply_cc_signal(roadrunner_quic_loss:cc_signal(Loss1), Now, Cc)},
     case roadrunner_quic_loss:bytes_in_flight(Loss0) of
-        0 -> put_space(Level, Space1, State);
-        _ -> put_space(Level, probe(Space1), State#state{probes = Probes + 1})
+        0 -> put_space(Level, Space1, State1);
+        _ -> put_space(Level, probe(Space1), State1#state{probes = Probes + 1})
     end.
 
 %% With nothing found lost, probe with the oldest unacknowledged data rather
