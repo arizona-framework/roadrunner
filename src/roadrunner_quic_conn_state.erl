@@ -755,9 +755,15 @@ process_frame(_Now, application, {max_data, Max}, #state{conn_flow = ConnFlow} =
     %% pass at the end of the datagram serves any stream this unblocks.
     State#state{conn_flow = roadrunner_quic_flow:on_max_data_received(Max, ConnFlow)};
 process_frame(_Now, application, {max_stream_data, Sid, Max}, State) ->
-    on_max_stream_data(Sid, Max, State);
+    case is_sendable_stream(Sid, State) of
+        true -> on_max_stream_data(Sid, Max, State);
+        false -> connection_fatal(application, stream_state_error, State)
+    end;
 process_frame(_Now, application, {stop_sending, Sid, ErrorCode}, State) ->
-    process_stop_sending(Sid, ErrorCode, State);
+    case is_sendable_stream(Sid, State) of
+        true -> process_stop_sending(Sid, ErrorCode, State);
+        false -> connection_fatal(application, stream_state_error, State)
+    end;
 process_frame(_Now, application, {retire_connection_id, Seq}, State) when Seq > 0 ->
     %% RFC 9000 §19.16: the server never issues a connection ID past the
     %% handshake's (sequence number 0), so a higher one was never sent.
@@ -785,6 +791,20 @@ process_frame(_Now, Level, _Frame, State) ->
     %% PADDING, PING, ACK, CRYPTO and a transport CONNECTION_CLOSE, all
     %% handled above; any other frame there is a PROTOCOL_VIOLATION.
     connection_fatal(Level, protocol_violation, State).
+
+%% Whether a stream id names a stream the server sends on, the only kind a
+%% MAX_STREAM_DATA or STOP_SENDING can address (RFC 9000 §19.10, §19.5): a
+%% client-initiated bidirectional stream, or a server-initiated
+%% unidirectional one already opened. The others are receive-only (client
+%% unidirectional) or were never created (the server opens no
+%% bidirectional streams), and a frame naming one is a STREAM_STATE_ERROR.
+-spec is_sendable_stream(non_neg_integer(), t()) -> boolean().
+is_sendable_stream(Sid, _State) when Sid band 3 =:= 0 ->
+    true;
+is_sendable_stream(Sid, #state{next_uni = NextUni}) when Sid band 3 =:= 3 ->
+    Sid < NextUni;
+is_sendable_stream(_Sid, _State) ->
+    false.
 
 %% Raise a stream's send limit from a received MAX_STREAM_DATA (RFC 9000 §4.1).
 %% Only a tracked stream can have unsent data to unblock; a grant for an unknown

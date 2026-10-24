@@ -35,9 +35,6 @@ H3SPEC_VERSION="v0.1.14"
 # Matched as substrings of h3spec's case descriptions.
 KNOWN_FAILURES=(
     "MUST send CRYPTO_BUFFER_EXCEEDED if CRYPTO data is buffered beyond the limit"
-    "MUST send STREAM_STATE_ERROR if STOP_SENDING is received for a non-existing stream"
-    "MUST send STREAM_STATE_ERROR if MAX_STREAM_DATA is received for a stream that has not yet been created"
-    "MUST send STREAM_STATE_ERROR if MAX_STREAM_DATA is received for a receive-only stream"
     "MUST send unexpected_message TLS alert if KeyUpdate in Handshake is received"
     "MUST send unexpected_message TLS alert if EndOfEarlyData is received"
 )
