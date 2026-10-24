@@ -70,9 +70,10 @@
 %% address sent until a PATH_CHALLENGE answered from it validates it (§8.2,
 %% §9.3.1), and the path left behind is challenged too (§9.3.3). Validation
 %% that times out returns the connection to the last validated path
-%% (§9.3.2). On validation the congestion controller and RTT estimate start
-%% over for the new path, unless only the port changed, the usual sign of a
-%% NAT rebinding (§9.4). A 1-RTT packet held across the handshake never moves
+%% (§9.3.2). Each move, back included, tells the owner the address the
+%% connection now uses with `{peer_changed, Peer}`. On validation the
+%% congestion controller and RTT estimate start over for the new path,
+%% unless only the port changed, the usual sign of a NAT rebinding (§9.4). A 1-RTT packet held across the handshake never moves
 %% it: only one from the handshake's address is held, and it is processed as
 %% received there. A probing packet from another address moves nothing:
 %% its PATH_CHALLENGE is answered there (§8.2.2, §9.1). Every packet carrying
@@ -453,14 +454,17 @@
     | {migrate, address()}.
 
 %% Async owner notifications (conn -> owner). `stream_data` carries the
-%% FIN-only end-of-stream as `{stream_data, Sid, <<>>, true}`. `closed` is the
-%% terminal event: `{peer, ErrorCode}` is a peer CONNECTION_CLOSE, `{local,
-%% Reason}` a connection error we detected (idle-timeout joins them later).
+%% FIN-only end-of-stream as `{stream_data, Sid, <<>>, true}`.
+%% `peer_changed` names the address the connection moved to (RFC 9000 §9).
+%% `closed` is the terminal event: `{peer, ErrorCode}` is a peer
+%% CONNECTION_CLOSE, `{local, Reason}` a connection error we detected
+%% (idle-timeout joins them later).
 -type event() ::
     {connected, info()}
     | {stream_opened, non_neg_integer()}
     | {stream_data, non_neg_integer(), binary(), boolean()}
     | {stream_reset, non_neg_integer(), non_neg_integer()}
+    | {peer_changed, address()}
     | {closed, {peer, non_neg_integer()} | {local, atom()}}.
 
 %% The `connected` payload. The h3 owner ignores it; it carries the
@@ -709,12 +713,22 @@ probe_received(_Addr, _Size, Probe) ->
 
 %% Lead the effects with `{migrate, Peer}` when the call moved the
 %% connection to another address, so the shell sends every `{send, _}` of
-%% the call there.
+%% the call there, and tell the owner with `{peer_changed, Peer}` ahead of
+%% the call's other events, so a request on a stream this datagram carries
+%% already reports the new address. The owner hears of the move itself, not
+%% of the validation that follows: the server switches on the non-probing
+%% packet from the new address, before validation completes (RFC 9000
+%% §9.3), so that address is where the client's requests now come from and
+%% the one responses go to. A failed validation returns the connection to
+%% the old address (§9.3.2), which the owner hears of the same way. An
+%% owner installed later reads the current address with `peername/1`.
 -spec peer_effects(address(), t(), [effect()]) -> [effect()].
 peer_effects(Peer, #state{peer = Peer}, Effects) ->
     Effects;
-peer_effects(_Old, #state{peer = Peer}, Effects) ->
-    [{migrate, Peer} | Effects].
+peer_effects(_Old, #state{peer = Peer, owner = undefined}, Effects) ->
+    [{migrate, Peer} | Effects];
+peer_effects(_Old, #state{peer = Peer, owner = Owner}, Effects) ->
+    [{migrate, Peer}, {emit, Owner, {peer_changed, Peer}} | Effects].
 
 %% The Destination Connection ID a datagram was sent to: that of its first
 %% packet, which every packet coalesced with it shares (RFC 9000 §12.2). A

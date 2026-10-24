@@ -45,7 +45,8 @@
     use_server_cid/2,
     retire_connection_id/2,
     new_connection_id/1,
-    rebind/1
+    rebind/1,
+    sockname/1
 ]).
 
 %% v1 connection-id length and signature scheme (the test cert is RSA).
@@ -259,6 +260,11 @@ a fresh one. The client answers the server's PATH_CHALLENGE on it.
 -spec rebind(pid()) -> ok.
 rebind(Pid) ->
     call(Pid, rebind).
+
+-doc "The client's local address, the one the server sees it at.".
+-spec sockname(pid()) -> {ok, {inet:ip_address(), inet:port_number()}}.
+sockname(Pid) ->
+    call(Pid, sockname).
 
 cast_frame(Pid, Frame) ->
     Ref = make_ref(),
@@ -580,6 +586,9 @@ connected_loop(#conn{socket = Socket, unacked = Unacked} = Conn) ->
             ok = roadrunner_quic_socket:close(Socket),
             From ! {Ref, ok},
             connected_loop(Conn#conn{socket = NewSocket});
+        {sockname, From, Ref} ->
+            From ! {Ref, roadrunner_quic_socket:sockname(Socket)},
+            connected_loop(Conn);
         {send, From, Ref, StreamId, Data, Fin} ->
             Conn1 = send_stream(Conn, StreamId, Data, Fin),
             From ! {Ref, ok},

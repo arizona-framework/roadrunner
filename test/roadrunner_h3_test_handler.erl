@@ -17,6 +17,10 @@ handle(#{target := ~"/echo"} = Req) ->
     {{200, [{~"content-type", ~"text/plain"}], roadrunner_req:body(Req)}, Req};
 handle(#{target := ~"/method"} = Req) ->
     {{200, [{~"content-type", ~"text/plain"}], roadrunner_req:method(Req)}, Req};
+handle(#{target := ~"/peer"} = Req) ->
+    %% The peer port the request reports, so a test can follow a migration.
+    {_Ip, Port} = roadrunner_req:peer(Req),
+    {{200, [{~"content-type", ~"text/plain"}], integer_to_binary(Port)}, Req};
 handle(#{target := ~"/empty"} = Req) ->
     {{204, [], ~""}, Req};
 handle(#{target := ~"/big"} = Req) ->

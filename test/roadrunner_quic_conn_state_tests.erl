@@ -1101,6 +1101,8 @@ nat_rebinding_moves_to_new_address_test() ->
     {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Ping, State),
     ?assertMatch([{migrate, ?PEER2} | _], Effects),
     ?assertEqual({ok, ?PEER2}, ?M:peername(State1)),
+    %% The owner hears of the move on it, before validation completes.
+    ?assertEqual([{emit, self(), {peer_changed, ?PEER2}}], emits(Effects)),
     [NewPath] = path_datagrams(sends(Effects), ServerApSecret),
     ?assertEqual(3 * byte_size(Ping), byte_size(NewPath)),
     ?assertEqual([?CLIENT_SCID], short_header_dcids([{send, NewPath}])),
@@ -1333,6 +1335,8 @@ failed_validation_returns_to_old_path_test() ->
     {Reverted, Effects} = ?M:handle_timeout(?ABANDON_AT, path, State2),
     ?assertMatch([{migrate, ?PEER} | _], Effects),
     ?assertEqual({ok, ?PEER}, ?M:peername(Reverted)),
+    %% The owner hears of the return to the old address too.
+    ?assertEqual([{emit, self(), {peer_changed, ?PEER}}], emits(Effects)),
     ?assert(lists:member({retire_connection_id, 1}, sent_app_frames(Effects, ServerApSecret))),
     ?assertEqual([?CLIENT_SCID], lists:usort(short_header_dcids(Effects))),
     %% The client repeating the retired id's NEW_CONNECTION_ID does not bring
@@ -1358,10 +1362,46 @@ return_to_validated_path_skips_validation_test() ->
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     {State1, _} = ?M:handle_datagram(?NOW, ?PEER2, to_scid([ping], 0, ClientApSecret), State),
     {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, to_scid([ping], 1, ClientApSecret), State1),
-    ?assertMatch([{migrate, ?PEER} | _], Effects),
+    ?assertMatch([{migrate, ?PEER}, {emit, _, {peer_changed, ?PEER}} | _], Effects),
     ?assertEqual([], challenge_data(sends(Effects), ServerApSecret)),
     {_State3, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"data", true, ?NOW, State2),
     ?assertNotEqual([], sent_stream_frames(Sent, ServerApSecret)).
+
+peer_changed_precedes_stream_events_test() ->
+    %% A request on the packet that moved the connection comes from the new
+    %% address: the owner hears of the move before the stream's events.
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    Request = to_scid([{stream, 0, 0, ~"hello", true}], 0, ClientApSecret),
+    {_State1, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Request, State),
+    ?assertMatch(
+        [{emit, _, {peer_changed, ?PEER2}}, {emit, _, {stream_opened, 0}} | _], emits(Effects)
+    ).
+
+migration_without_owner_emits_nothing_test() ->
+    %% With no owner installed yet, the move is the shell's alone; the owner
+    %% reads the current address with peername/1 once installed.
+    #{
+        state1 := State1,
+        client_hs_secret := ClientHsSecret,
+        cf_framed := ClientFinished,
+        client_ap_secret := ClientApSecret,
+        aead := Aead
+    } = connect(),
+    Finished = ?TC:seal(
+        handshake,
+        0,
+        roadrunner_quic_keys:traffic_keys(Aead, ClientHsSecret),
+        [{crypto, 0, ClientFinished}],
+        ?DCID,
+        ?SCID
+    ),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, Finished, State1),
+    {State3, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER2, to_scid([ping], 0, ClientApSecret), State2
+    ),
+    ?assertMatch([{migrate, ?PEER2} | _], Effects),
+    ?assertEqual([], emits(Effects)),
+    ?assertEqual({ok, ?PEER2}, ?M:peername(State3)).
 
 failed_validation_without_validated_path_closes_test() ->
     %% RFC 9000 §9.3.2 MUST: with no validated path left to return to (the
