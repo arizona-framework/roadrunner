@@ -480,6 +480,39 @@ tcp_error_during_body_recv_exits_silently_test() ->
     ?assertEqual(<<>>, iolist_to_binary(collect_sends(Tag, 50))),
     Sink ! stop.
 
+peer_close_during_body_recv_reports_peer_closed_test() ->
+    %% The peer closing (or resetting) during the passive read of a
+    %% request's remainder ends the connection silently, and
+    %% `listener_conn_close` names why: `peer_closed` for a close, and the
+    %% transport reason otherwise. Real sockets reach these paths only when
+    %% a close lands mid-request, so drive both deterministically here.
+    [
+        assert_mid_request_close_reason(Result, Reason)
+     || {Result, Reason} <- [
+            {{error, closed}, peer_closed},
+            {{error, econnreset}, {transport, econnreset}}
+        ]
+    ].
+
+assert_mid_request_close_reason(Result, Reason) ->
+    Self = self(),
+    Tag = make_ref(),
+    attach_telemetry(Tag, [[roadrunner, listener, conn_close]]),
+    Sink = spawn_partial_then_sink(Self, Tag, partial_request(), {reply, Result}),
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, fake_opts(mid_request_close)),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 3000 -> error(no_normal_exit)
+    end,
+    ?assertMatch(
+        {[roadrunner, listener, conn_close], #{reason := Reason}}, next_event(Tag, 200)
+    ),
+    ?assertEqual(<<>>, iolist_to_binary(collect_sends(Tag, 50))),
+    detach_telemetry(Tag),
+    Sink ! stop.
+
 partial_request_then_remainder_parses_test() ->
     %% Drives the `{more, _}` branch — first packet has only the request
     %% line, second packet completes the headers. Both must parse + the
