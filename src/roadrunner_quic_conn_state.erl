@@ -2169,23 +2169,26 @@ handle_timeout(_Now, drain, State) ->
     %% tears the connection down. The owner already learned of the close on entry.
     {State#state{phase = closed}, []}.
 
-%% On a probe timeout: queue any time-threshold losses to retransmit and
-%% increment the space's probe-timeout backoff (RFC 9002 §6.2.1), so the
-%% next deadline is strictly later. A space with packets in flight then MUST
+%% On a probe timeout: queue any time-threshold losses to retransmit, feed
+%% them to congestion control as a congestion event the same as ACK-detected
+%% losses (RFC 9002 Appendix B.8; the recovery period still dedups them,
+%% §7.3.2), and increment the space's probe-timeout backoff (RFC 9002
+%% §6.2.1), so the next deadline is strictly later. A space with packets in flight then MUST
 %% send an ack-eliciting probe (RFC 9002 §6.2.4): loss detection only counts
 %% a packet older than one the peer acknowledged, so the last packets of a
 %% flight, if lost, are found only through the ACK a probe draws. The probe
 %% is what was just found lost, else the oldest data still unacknowledged,
 %% else a PING.
 -spec on_pto(integer(), level(), t()) -> t().
-on_pto(Now, Level, #state{probes = Probes} = State) ->
+on_pto(Now, Level, #state{probes = Probes, cc = Cc} = State) ->
     #space{loss = Loss0, pending = Pending} = Space = space(Level, State),
     {Loss1, Lost} = roadrunner_quic_loss:detect_lost(Now, Loss0),
     Loss2 = roadrunner_quic_loss:on_pto_expired(Loss1),
     Space1 = Space#space{loss = Loss2, pending = lists:reverse(retransmittable(Lost), Pending)},
+    State1 = State#state{cc = apply_cc_signal(roadrunner_quic_loss:cc_signal(Loss1), Now, Cc)},
     case roadrunner_quic_loss:bytes_in_flight(Loss0) of
-        0 -> put_space(Level, Space1, State);
-        _ -> put_space(Level, probe(Space1), State#state{probes = Probes + 1})
+        0 -> put_space(Level, Space1, State1);
+        _ -> put_space(Level, probe(Space1), State1#state{probes = Probes + 1})
     end.
 
 %% With nothing found lost, probe with the oldest unacknowledged data rather

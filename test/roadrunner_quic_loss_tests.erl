@@ -201,16 +201,28 @@ detect_lost_test() ->
     %% packet threshold). A much later timer pass then declares 2 and 3
     %% lost by the time threshold.
     {Loss1, _, _} = ?M:on_ack_received({ack, 4, 0, 0, []}, 100, Loss0),
-    {_Loss2, Lost} = ?M:detect_lost(10000, Loss1),
-    ?assertEqual([2, 3], lists:sort(Lost)).
+    {Loss2, Lost} = ?M:detect_lost(10000, Loss1),
+    ?assertEqual([2, 3], lists:sort(Lost)),
+    %% RFC 9002 Appendix B.8: the timer-detected loss leaves a congestion signal
+    %% with the latest lost send time and nothing acknowledged.
+    ?assertEqual(
+        #{acked_bytes => 0, largest_acked_time => undefined, largest_lost_time => 3},
+        ?M:cc_signal(Loss2)
+    ).
 
 detect_lost_stops_at_in_flight_packet_test() ->
     %% Packets numbered above the largest acknowledged were sent ahead and are
     %% not loss candidates; the loss timer reaches the oldest of them and stops,
-    %% declaring nothing lost and leaving the in-flight set unchanged.
+    %% declaring nothing lost and leaving the in-flight set unchanged. The ACK's
+    %% signal is replaced by an empty one, so it is never applied twice.
     Loss0 = send_run(0, 4, ?M:new(#{})),
     {Loss1, _, _} = ?M:on_ack_received({ack, 0, 0, 0, []}, 100, Loss0),
-    ?assertEqual({Loss1, []}, ?M:detect_lost(100, Loss1)).
+    {Loss2, []} = ?M:detect_lost(100, Loss1),
+    ?assertEqual(?M:bytes_in_flight(Loss1), ?M:bytes_in_flight(Loss2)),
+    ?assertEqual(
+        #{acked_bytes => 0, largest_acked_time => undefined, largest_lost_time => undefined},
+        ?M:cc_signal(Loss2)
+    ).
 
 loss_time_test() ->
     ?assertEqual(undefined, ?M:loss_time(?M:new(#{}))),

@@ -89,10 +89,10 @@
     last_ack_eliciting_at = undefined :: non_neg_integer() | undefined,
     %% Congestion-controlled bytes outstanding.
     bytes_in_flight = 0 :: non_neg_integer(),
-    %% The congestion-control signal from the most recent on_ack_received: the
-    %% acknowledged bytes and the send times of the largest acked / latest lost
-    %% ack-eliciting packets, for the connection's congestion controller to read
-    %% via cc_signal/1 immediately after the ACK.
+    %% The congestion-control signal from the most recent on_ack_received or
+    %% detect_lost: the acknowledged bytes and the send times of the largest
+    %% acked / latest lost ack-eliciting packets, for the connection's
+    %% congestion controller to read via cc_signal/1 immediately after.
     cc_signal = ?NO_CC_SIGNAL :: cc_signal(),
     max_ack_delay :: non_neg_integer(),
     ack_delay_exponent :: non_neg_integer()
@@ -208,10 +208,12 @@ on_ack_received(Ack, Now, Loss) ->
     end.
 
 -doc """
-The congestion-control signal from the most recent `on_ack_received/3`: a map
-with the acknowledged bytes and the send times of the largest acknowledged and
-latest lost ack-eliciting packets (`undefined` when none), for the connection's
-congestion controller. Read it immediately after the ACK.
+The congestion-control signal from the most recent `on_ack_received/3` or
+`detect_lost/2`: a map with the acknowledged bytes and the send times of the
+largest acknowledged and latest lost ack-eliciting packets (`undefined` when
+none), for the connection's congestion controller. A `detect_lost/2` pass
+acknowledges nothing, so its signal carries only the lost time. Read it
+immediately after the call that set it.
 """.
 -spec cc_signal(t()) -> cc_signal().
 cc_signal(#loss{cc_signal = Signal}) ->
@@ -244,11 +246,13 @@ Re-run loss detection when the loss timer fires (RFC 9002 §6.1), without a
 new ACK. Returns the new state and any packets now past the time
 threshold; `{State, []}` when nothing is lost or nothing has been
 acknowledged yet. The returned list is the lost packets' caller data, to
-retransmit.
+retransmit. The `cc_signal/1` it leaves carries the latest lost packet's send
+time, so these losses reach congestion control like ACK-detected ones (RFC
+9002 Appendix B.8).
 """.
 -spec detect_lost(non_neg_integer(), t()) -> {t(), Lost :: [term()]}.
 detect_lost(_Now, #loss{largest_acked = undefined} = Loss) ->
-    {Loss, []};
+    {Loss#loss{cc_signal = ?NO_CC_SIGNAL}, []};
 detect_lost(Now, #loss{sent = Sent, largest_acked = LargestAcked} = Loss) ->
     %% The loss condition is monotonic from the oldest end (lowest number,
     %% earliest sent), so the lost packets are a front prefix: take them off
@@ -256,7 +260,12 @@ detect_lost(Now, #loss{sent = Sent, largest_acked = LargestAcked} = Loss) ->
     {Lost, Survivors} = take_lost_front(Sent, LargestAcked, Now, loss_delay(Loss), []),
     Loss1 = Loss#loss{
         sent = Survivors,
-        bytes_in_flight = max(0, Loss#loss.bytes_in_flight - in_flight_bytes(Lost))
+        bytes_in_flight = max(0, Loss#loss.bytes_in_flight - in_flight_bytes(Lost)),
+        cc_signal = #{
+            acked_bytes => 0,
+            largest_acked_time => undefined,
+            largest_lost_time => largest_lost_time(Lost)
+        }
     },
     {Loss1, datas(Lost)}.
 

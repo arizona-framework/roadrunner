@@ -711,6 +711,21 @@ pto_probe_resends_what_it_finds_lost_test() ->
     ?assertMatch([{stream, 0, 0, _, false} | _], [F || {stream, _, _, _, _} = F <- Frames]),
     ?assertNot(lists:member(ping, Frames)).
 
+pto_detected_loss_reduces_congestion_window_test() ->
+    %% RFC 9002 Appendix B.8: a loss the probe timeout finds on time is a
+    %% congestion event like an ACK-detected one, so the window halves. A probe
+    %% timeout that finds nothing lost leaves the window alone.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Payload = binary:copy(~"x", 2000),
+    {State1, Sent} = ?M:handle_send(self(), make_ref(), 0, Payload, true, ?NOW, State),
+    {NothingLost, _} = ?M:handle_timeout(?NOW + 5000, pto, State1),
+    ?assertEqual(?M:cwnd(State1), ?M:cwnd(NothingLost)),
+    Largest = largest_app_pn(Sent, ServerApSecret),
+    Ack = app_datagram([{ack, Largest, 0, 0, [], undefined}], 0, ClientApSecret),
+    {State2, _} = ?M:handle_datagram(?NOW, Ack, State1),
+    {State3, _} = ?M:handle_timeout(?NOW + 5000, pto, State2),
+    ?assertEqual(?M:cwnd(State2) div 2, ?M:cwnd(State3)).
+
 path_challenge_answered_test() ->
     %% RFC 9000 §8.2.2: a PATH_CHALLENGE gets a PATH_RESPONSE echoing its data.
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
