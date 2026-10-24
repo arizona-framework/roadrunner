@@ -14,7 +14,7 @@
 
 -export([key_material/0, gen_keypair/0]).
 -export([client_hello_framed/1, client_hello_framed/3, client_hello_framed/4]).
--export([seal/6, seal_raw/6, seal_raw_reserved/6]).
+-export([seal/6, seal_initial/6, seal_raw/6, seal_raw_reserved/6]).
 -export([crypto_bytes/4, frames/4]).
 -export([server_hello_key_share/1, deframe_all/1]).
 -export([
@@ -215,6 +215,36 @@ seal(Level, PN, Keys, Frames, DCID, SCID) ->
     Entries = #{Level => #{frames => Frames, keys => Keys, pn => PN}},
     {Datagram, _Sent} = roadrunner_quic_send:datagram(Entries, DCID, SCID),
     Datagram.
+
+-doc """
+Build a client Initial datagram carrying `Token` in its Token field (RFC
+9000 §17.2.2), as a client returning with a NEW_TOKEN token does, padded
+with PADDING frames to the 1200-byte floor (§14.1).
+""".
+-spec seal_initial(
+    non_neg_integer(),
+    roadrunner_quic_keys:keys(),
+    [roadrunner_quic_frame:frame()],
+    binary(),
+    binary(),
+    binary()
+) -> binary().
+seal_initial(PN, #{key := Key, iv := IV, hp := HP}, Frames, DCID, SCID, Token) ->
+    PNLen = roadrunner_quic_packet:pn_length(PN),
+    Encoded = iolist_to_binary([roadrunner_quic_frame:encode(F) || F <- Frames]),
+    %% The header with a 2-byte Length field (every size up to 16383), so
+    %% the plaintext that fills the datagram to 1200 bytes is known first.
+    [Probe, _] = roadrunner_quic_packet:encode_long(
+        initial, 1, DCID, SCID, #{pn => PN, payload => <<0:(1000 * 8)>>, token => Token}
+    ),
+    Fill = max(byte_size(Encoded), 1200 - byte_size(Probe) - 16),
+    Plaintext = <<Encoded/binary, 0:((Fill - byte_size(Encoded)) * 8)>>,
+    [Header, _] = roadrunner_quic_packet:encode_long(
+        initial, 1, DCID, SCID, #{pn => PN, payload => <<0:((Fill + 16) * 8)>>, token => Token}
+    ),
+    Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
+    Protected = roadrunner_quic_aead:protect_header(HP, Header, Sealed, byte_size(Header) - PNLen),
+    <<Protected/binary, Sealed/binary>>.
 
 -doc """
 Seal raw plaintext (bypassing frame encoding) so a packet can carry a

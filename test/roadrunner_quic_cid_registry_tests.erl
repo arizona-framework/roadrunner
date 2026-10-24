@@ -91,3 +91,65 @@ remove_all_drops_a_closing_connections_ids_test() ->
     ?assertEqual(error, ?M:lookup(Table, ~"spare-cid")),
     ?assertEqual({ok, Other}, ?M:lookup(Table, ~"taken-cid")),
     ?assertEqual({ok, Other}, ?M:lookup(Table, ~"other-cid")).
+
+secret_derives_the_reset_key_test() ->
+    %% A namespace made from a secret derives the same reset key from it
+    %% every time (so a restart, or another server given the secret, issues
+    %% the same tokens), never the secret itself, and another secret gives
+    %% another key. A random namespace gets a key of its own.
+    Secret = <<42:256>>,
+    Key = ?M:reset_key(?M:new(Secret)),
+    ?assertEqual(Key, ?M:reset_key(?M:new(Secret))),
+    ?assertEqual(32, byte_size(Key)),
+    ?assertNotEqual(Secret, Key),
+    ?assertNotEqual(Key, ?M:reset_key(?M:new(<<43:256>>))),
+    ?assertNotEqual(Key, ?M:reset_key(?M:new())),
+    %% A secret shorter than 32 bytes is refused.
+    ?assertError(function_clause, ?M:new(<<1:248>>)).
+
+client_reset_tokens_route_to_their_connection_test() ->
+    %% A client's stateless reset token routes to the connection holding it
+    %% until removed; a row since taken over by another connection keeps its
+    %% route, and the tokens never route as connection ids.
+    Table = ?M:new(),
+    Pid = self(),
+    Other = spawn(fun() -> ok end),
+    ok = ?M:add_reset(Table, <<1:128>>, Pid),
+    ok = ?M:add_reset(Table, <<2:128>>, Pid),
+    ?assertEqual({ok, Pid}, ?M:lookup_reset(Table, <<1:128>>)),
+    ?assertEqual(error, ?M:lookup(Table, <<1:128>>)),
+    ?assertEqual(error, ?M:lookup_reset(Table, <<3:128>>)),
+    ok = ?M:add_reset(Table, <<2:128>>, Other),
+    ok = ?M:remove_resets(Table, [<<1:128>>, <<2:128>>], Pid),
+    ?assertEqual(error, ?M:lookup_reset(Table, <<1:128>>)),
+    ?assertEqual({ok, Other}, ?M:lookup_reset(Table, <<2:128>>)),
+    %% The listener's cleanup of a crashed connection reaps its tokens too.
+    ok = ?M:delete_pid(Table, Other),
+    ?assertEqual(error, ?M:lookup_reset(Table, <<2:128>>)).
+
+secret_derives_the_token_key_test() ->
+    %% The token key derives from the secret apart from the reset key.
+    Secret = <<42:256>>,
+    Key = ?M:token_key(?M:new(Secret)),
+    ?assertEqual(Key, ?M:token_key(?M:new(Secret))),
+    ?assertNotEqual(?M:reset_key(?M:new(Secret)), Key),
+    ?assertNotEqual(Secret, Key).
+
+spend_token_once_test() ->
+    %% RFC 9000 §8.1.4: a token is accepted once. Spent tokens older than
+    %% the oldest still accepted are forgotten as others are spent.
+    Table = ?M:new(),
+    ?assert(?M:spend_token(Table, {100, <<1:96>>}, 0)),
+    ?assertNot(?M:spend_token(Table, {100, <<1:96>>}, 0)),
+    ?assert(?M:spend_token(Table, {100, <<2:96>>}, 0)),
+    ?assert(?M:spend_token(Table, {200, <<3:96>>}, 150)),
+    ?assert(?M:spend_token(Table, {100, <<1:96>>}, 0)).
+
+spend_token_limit_test() ->
+    %% Past 100000 spent tokens held, a token is refused.
+    Table = ?M:new(),
+    lists:foreach(
+        fun(N) -> true = ?M:spend_token(Table, {N, <<0:96>>}, 0) end, lists:seq(1, 100000)
+    ),
+    ?assertNot(?M:spend_token(Table, {0, <<1:96>>}, 0)),
+    ?assert(?M:spend_token(Table, {200000, <<1:96>>}, 50000)).

@@ -26,6 +26,14 @@ encode_connection_id_params_test() ->
         enc(#{initial_source_connection_id => <<1, 2, 3, 4>>})
     ).
 
+encode_stateless_reset_token_test() ->
+    %% stateless_reset_token (0x02) carries the 16-byte token as raw bytes
+    %% (RFC 9000 §18.2), and decode rejects it from a client.
+    Token = <<16#5a:128>>,
+    Wire = enc(#{stateless_reset_token => Token}),
+    ?assertEqual(<<16#02, 16#10, Token/binary>>, Wire),
+    ?assertEqual({error, server_only_transport_parameter}, ?M:decode(Wire)).
+
 encode_flag_param_test() ->
     %% disable_active_migration (0x0c) is a zero-length flag.
     ?assertEqual(<<16#0C, 16#00>>, enc(#{disable_active_migration => true})).

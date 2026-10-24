@@ -94,6 +94,9 @@ All duration and interval values in `opts()` are in milliseconds —
 %% listener, so the wiring passes `listeners - 1`.)
 -define(DEFAULT_H3_LISTENERS, 8).
 -define(MAX_H3_LISTENERS, 1024).
+%% The shortest HTTP/3 `secret` accepted: 32 bytes, the key size of the
+%% HMAC-SHA256 and AES-256 keys derived from it.
+-define(MIN_H3_SECRET, 32).
 
 -doc """
 Listener configuration map.
@@ -625,12 +628,28 @@ HTTP/3 listener tunables (under `{http3, ThisMap}` in `protocols`).
   `2 * max_header_block`, so raising the encoded cap lifts this one too
   unless set explicitly. The h3 counterpart to the `{http2, ...}`
   `max_header_list_size` opt.
+- `secret` — a binary of at least 32 random bytes the QUIC keys of the
+  listener derive from: the key of the stateless reset tokens (RFC 9000
+  §10.3), so a client still talking to a connection the server has lost
+  (after a restart, say) is told at once to stop rather than waiting out
+  its idle timeout, and the key of the address validation tokens sent
+  with NEW_TOKEN (§8.1.3), so a client coming back within the hour skips
+  the limit on what the server sends before its address is validated.
+  Every listener of the pool shares it. Keep it as secret as the TLS key.
+  Give another server the same secret only if every packet of a
+  connection reaches the server holding it: a server sent a packet for a
+  connection it does not have answers with a valid reset, so anyone who
+  can route packets to it can close connections on the others (RFC 9000
+  §10.3.2, §21.11). Unset, a random one is drawn when the listener
+  starts, so a restarted listener can neither reset the connections of
+  the one before it nor accept its tokens.
 """.
 -type http3_opts() :: #{
     listeners => 1..?MAX_H3_LISTENERS,
     max_header_block => 1..16#7FFFFFFF,
     max_streams_bidi => 1..16#7FFFFFFF,
-    max_field_section_size => 1..16#7FFFFFFF
+    max_field_section_size => 1..16#7FFFFFFF,
+    secret => binary()
 }.
 
 -doc """
@@ -1010,9 +1029,20 @@ start_quic(Port, Opts, Protocols, ProtoOpts, AcceptGate) ->
                     #{ip := IP} -> PoolOpts#{ip => IP};
                     #{} -> PoolOpts
                 end,
-            Res = start_quic_pool(QuicPort, PoolOptsIp),
+            Res = start_quic_pool(QuicPort, with_quic_secret(Opts, PoolOptsIp)),
             ok = close_quic_probe(Probe),
             Res
+    end.
+
+%% The `{http3, #{secret := _}}` secret (validated with the rest of the
+%% http3 opts) goes to the QUIC pool straight from the listener opts. It is
+%% kept out of the flattened proto opts, which every connection process
+%% holds and a crash report would print.
+-spec with_quic_secret(opts(), map()) -> map().
+with_quic_secret(#{protocols := Protocols}, PoolOpts) ->
+    case lists:keyfind(http3, 1, Protocols) of
+        {http3, #{secret := Secret}} -> PoolOpts#{secret => Secret};
+        _ -> PoolOpts
     end.
 
 -spec stream_credit(roadrunner_conn:proto_opts()) -> on_receipt | on_read.
@@ -1884,28 +1914,37 @@ http3_defaults() ->
 validate_http3_opts(Opts, Raw) ->
     Defaults = http3_defaults(),
     Merged = maps:fold(
-        fun(K, V, Acc) ->
-            %% `listeners` caps at the reuseport-pool limit; `max_header_block`
-            %% (a byte size), `max_streams_bidi` (a stream count) and
-            %% `max_field_section_size` (a byte size) go up to the 31-bit ceiling.
-            Max =
-                case K of
-                    listeners -> ?MAX_H3_LISTENERS;
-                    max_header_block -> 16#7FFFFFFF;
-                    max_streams_bidi -> 16#7FFFFFFF;
-                    max_field_section_size -> 16#7FFFFFFF;
-                    _ -> 0
-                end,
-            case is_map_key(K, Defaults) of
-                false -> error({invalid_listener_opt, protocols, Raw});
-                true when is_integer(V), V >= 1, V =< Max -> Acc#{K => V};
-                true -> error({invalid_listener_opt, protocols, Raw})
-            end
+        fun
+            (secret, V, Acc) when is_binary(V), byte_size(V) >= ?MIN_H3_SECRET ->
+                Acc#{secret => V};
+            (K, V, Acc) ->
+                validate_http3_int_opt(K, V, Acc, Defaults, Raw)
         end,
         Defaults,
         Opts
     ),
     resolve_max_field_section_size(Merged, Opts).
+
+%% One integer-valued http3 opt (anything else, a short or non-binary
+%% `secret` included, is invalid).
+-spec validate_http3_int_opt(term(), term(), http3_opts(), http3_opts(), term()) -> http3_opts().
+validate_http3_int_opt(K, V, Acc, Defaults, Raw) ->
+    %% `listeners` caps at the reuseport-pool limit; `max_header_block`
+    %% (a byte size), `max_streams_bidi` (a stream count) and
+    %% `max_field_section_size` (a byte size) go up to the 31-bit ceiling.
+    Max =
+        case K of
+            listeners -> ?MAX_H3_LISTENERS;
+            max_header_block -> 16#7FFFFFFF;
+            max_streams_bidi -> 16#7FFFFFFF;
+            max_field_section_size -> 16#7FFFFFFF;
+            _ -> 0
+        end,
+    case is_map_key(K, Defaults) of
+        false -> error({invalid_listener_opt, protocols, Raw});
+        true when is_integer(V), V >= 1, V =< Max -> Acc#{K => V};
+        true -> error({invalid_listener_opt, protocols, Raw})
+    end.
 
 %% MAX_FIELD_SECTION_SIZE defaults to 2x the resolved encoded-block cap so
 %% raising `max_header_block` lifts both gates together; an explicit value

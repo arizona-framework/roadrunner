@@ -57,6 +57,11 @@
 %% packet-number start, so the plaintext must seal to at least that; 4
 %% bytes of plaintext covers the worst case (a 1-byte packet number).
 -define(MIN_SAMPLE_PLAINTEXT, 4).
+%% RFC 9000 §10.3: every packet SHOULD be at least 22 bytes longer than the
+%% connection ids the peer must use toward us (the server's fixed 8 bytes),
+%% so a stateless reset the peer sends looks like any packet of ours. Only a
+%% 1-RTT packet to a client id shorter than 8 bytes is ever smaller.
+-define(MIN_SHORT_PACKET, 30).
 %% AEAD authentication tag length (RFC 9001 §5.3).
 -define(TAG_LEN, 16).
 
@@ -159,11 +164,16 @@ header(Level, DCID, SCID, PN, SealedSize, _KeyPhase) ->
     Header.
 
 %% The plaintext size a packet must reach: the header-protection-sample
-%% minimum (RFC 9001 §5.4.2), or, for a 1-RTT packet with a `pad_to`, the
-%% size that makes the whole packet (short header, plaintext and AEAD tag)
-%% that long.
+%% minimum (RFC 9001 §5.4.2), or, for a 1-RTT packet, the size that makes
+%% the whole packet (short header, plaintext and AEAD tag) its `pad_to`,
+%% and never shorter than ?MIN_SHORT_PACKET, long.
 -spec plaintext_floor(level(), entry(), binary(), 1..4) -> non_neg_integer().
-plaintext_floor(application, #{pad_to := PadTo}, DCID, PNLen) ->
+plaintext_floor(application, Entry, DCID, PNLen) ->
+    PadTo =
+        case Entry of
+            #{pad_to := Size} -> max(Size, ?MIN_SHORT_PACKET);
+            #{} -> ?MIN_SHORT_PACKET
+        end,
     max(?MIN_SAMPLE_PLAINTEXT, PadTo - (1 + byte_size(DCID) + PNLen) - ?TAG_LEN);
 plaintext_floor(_Level, _Entry, _DCID, _PNLen) ->
     ?MIN_SAMPLE_PLAINTEXT.

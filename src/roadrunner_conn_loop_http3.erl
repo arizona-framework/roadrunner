@@ -1478,9 +1478,9 @@ close_connection(#h3{conn = Conn} = State, ErrorCode, Reason, CloseReason) ->
 conn_error(State, ErrorCode, Reason) ->
     close_connection(State, ErrorCode, Reason, {protocol_error, ErrorCode}).
 
-%% The QUIC connection's own close: the peer's CONNECTION_CLOSE, the
-%% idle timeout, or a local transport failure.
--spec closed_reason({peer, non_neg_integer()} | {local, atom()}) ->
+%% The QUIC connection's own close: the peer's CONNECTION_CLOSE or
+%% stateless reset, the idle timeout, or a local transport failure.
+-spec closed_reason({peer, non_neg_integer() | stateless_reset} | {local, atom()}) ->
     roadrunner_event_handler:close_reason().
 closed_reason({peer, _ErrorCode}) -> peer_closed;
 closed_reason({local, idle_timeout}) -> keep_alive_timeout;

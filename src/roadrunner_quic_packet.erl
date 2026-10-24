@@ -29,9 +29,11 @@
     encode_short/4,
     encode_short/5,
     encode_version_negotiation/3,
+    encode_stateless_reset/2,
     decode/2,
     dcid/2,
     long_header_info/1,
+    initial_token/1,
     coalesced_split/1,
     pn_offset/2,
     encode_pn/2,
@@ -140,6 +142,17 @@ encode_version_negotiation(DCID, SCID, Versions) ->
         | [<<V:32>> || V <- Versions]
     ].
 
+-doc """
+Build a `Size`-byte Stateless Reset (RFC 9000 §10.3) ending in `Token`: the
+short-header form and fixed bits (`01`), then random bits up to the token,
+so it looks like any 1-RTT packet to all but the peer holding the token. A
+Stateless Reset is at least 21 bytes (5 bytes before the token, §10.3).
+""".
+-spec encode_stateless_reset(<<_:128>>, 21..1200) -> binary().
+encode_stateless_reset(Token, Size) when Size >= 21 ->
+    <<First, Unpredictable/binary>> = crypto:strong_rand_bytes(Size - 16),
+    <<0:1, 1:1, First:6, Unpredictable/binary, Token/binary>>.
+
 %% =============================================================================
 %% Receive-side helpers (header-protection independent)
 %% =============================================================================
@@ -184,6 +197,29 @@ long_header_info(<<1:1, _/bitstring>>) ->
     {error, truncated};
 long_header_info(_) ->
     {error, not_long_header}.
+
+-doc """
+The Token field of a datagram's leading Initial packet (RFC 9000 §17.2.2),
+`<<>>` when it carries none. It sits between the connection ids and the
+Length field, outside header protection, so it reads on a still-protected
+packet. `error` for a datagram that does not start with a v1-shaped
+Initial whose token fits it, or a token longer than the defensive cap.
+""".
+-spec initial_token(binary()) -> {ok, binary()} | error.
+initial_token(
+    <<1:1, _Fixed:1, 0:2, _:4, _Version:32, DCIDLen, _DCID:DCIDLen/binary, SCIDLen,
+        _SCID:SCIDLen/binary, Rest/binary>>
+) ->
+    maybe
+        {ok, TokenLen, AfterTokenLen} ?= take_varint(Rest),
+        true ?= TokenLen =< ?MAX_TOKEN,
+        <<Token:TokenLen/binary, _/binary>> ?= AfterTokenLen,
+        {ok, Token}
+    else
+        _ -> error
+    end;
+initial_token(_Datagram) ->
+    error.
 
 -doc """
 Split the first packet of a (possibly coalesced) datagram (RFC 9000

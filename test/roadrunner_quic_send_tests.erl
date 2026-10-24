@@ -118,6 +118,21 @@ application_pad_to_test() ->
     {Unpadded, _} = ?M:datagram(#{application => maps:remove(pad_to, Entry)}, ?DCID, ?SCID),
     ?assertEqual(byte_size(Unpadded), byte_size(Bare)).
 
+%% RFC 9000 §10.3: a 1-RTT packet is at least 30 bytes (22 more than the
+%% server's 8-byte ids), padded when the client's id is shorter, so a reset
+%% from the client is indistinguishable from any packet of ours. A pad_to
+%% below that changes nothing.
+application_min_packet_size_test() ->
+    Entry = #{frames => [ping], keys => application_keys(), pn => 1},
+    {Datagram, _} = ?M:datagram(#{application => Entry}, <<>>, ?SCID),
+    ?assertEqual(30, byte_size(Datagram)),
+    {Small, _} = ?M:datagram(#{application => Entry#{pad_to => 10}}, <<>>, ?SCID),
+    ?assertEqual(30, byte_size(Small)),
+    ?assertMatch(
+        [{ok, #{level := application, frames := [ping, padding]}}],
+        roadrunner_quic_recv:datagram(Datagram, 0, #{application => application_keys()}, #{})
+    ).
+
 application_default_key_phase_test() ->
     Frames = [{stream, 0, 0, <<"more-body-data">>, false}],
     Entries = #{application => #{frames => Frames, keys => application_keys(), pn => 1}},

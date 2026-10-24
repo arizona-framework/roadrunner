@@ -119,6 +119,7 @@ start_shell(Socket, Peer, FirstDatagram) ->
         %% are registered in a table nothing reads.
         registry => roadrunner_quic_cid_registry:new(),
         reset_key => crypto:strong_rand_bytes(32),
+        token_key => crypto:strong_rand_bytes(32),
         cert_chain => CertChain,
         priv_key => PrivKey,
         alpn => ~"h3",

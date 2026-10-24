@@ -73,7 +73,9 @@ handshake_completes(#{shell := Shell, peer := Peer, client := ClientSocket, ctx 
 
 %% The spare connection id the core issues on confirmation routes to the shell
 %% in the registry (RFC 9000 §5.1.1), and stops routing once the client
-%% retires it (§19.16), while its replacement takes over.
+%% retires it (§19.16), while its replacement takes over. A client id's
+%% stateless reset token routes to the shell too (§10.3.1), until the id is
+%% retired.
 issued_connection_id_routes_to_shell(#{
     shell := Shell, peer := Peer, client := ClientSocket, ctx := Ctx, registry := Registry
 }) ->
@@ -99,7 +101,31 @@ issued_connection_id_routes_to_shell(#{
             ?TC:frames(recv_all(ClientSocket), application, ServerKeys, byte_size(?DCID))
         ),
         ?assertEqual(error, roadrunner_quic_cid_registry:lookup(Registry, CID1)),
-        ?assertEqual({ok, Shell}, roadrunner_quic_cid_registry:lookup(Registry, CID2))
+        ?assertEqual({ok, Shell}, roadrunner_quic_cid_registry:lookup(Registry, CID2)),
+        ClientKeys = roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientApSecret),
+        Spare = ?TC:seal(
+            application,
+            1,
+            ClientKeys,
+            [{new_connection_id, 1, 0, <<21:64>>, <<1:128>>}],
+            ?DCID,
+            ?SCID
+        ),
+        Shell ! {quic_datagram, Peer, Spare},
+        true = still_running(Shell),
+        ?assertEqual({ok, Shell}, roadrunner_quic_cid_registry:lookup_reset(Registry, <<1:128>>)),
+        Next = ?TC:seal(
+            application,
+            2,
+            ClientKeys,
+            [{new_connection_id, 2, 2, <<22:64>>, <<2:128>>}],
+            ?DCID,
+            ?SCID
+        ),
+        Shell ! {quic_datagram, Peer, Next},
+        true = still_running(Shell),
+        ?assertEqual(error, roadrunner_quic_cid_registry:lookup_reset(Registry, <<1:128>>)),
+        ?assertEqual({ok, Shell}, roadrunner_quic_cid_registry:lookup_reset(Registry, <<2:128>>))
     end.
 
 %% A stream write round-trips through the shell: {quic_send, ...} is answered
@@ -158,7 +184,11 @@ peer_close_terminates_shell(#{
             application,
             0,
             roadrunner_quic_keys:traffic_keys(aes_128_gcm, ClientApSecret),
-            [{ack, 0, 0, 0, [], undefined}, {connection_close, transport, 0, 0, <<>>}],
+            [
+                {ack, 0, 0, 0, [], undefined},
+                {new_connection_id, 1, 0, <<21:64>>, <<1:128>>},
+                {connection_close, transport, 0, 0, <<>>}
+            ],
             ?DCID,
             ?SCID
         ),
@@ -169,8 +199,10 @@ peer_close_terminates_shell(#{
             erlang:error(no_closed_event)
         end,
         wait_dead(Shell, 150),
-        %% The closed shell removed its own routing rows on the way out.
-        ?assertEqual(error, roadrunner_quic_cid_registry:lookup(Registry, CID1))
+        %% The closed shell removed its own routing rows on the way out, the
+        %% client's stateless reset token included.
+        ?assertEqual(error, roadrunner_quic_cid_registry:lookup(Registry, CID1)),
+        ?assertEqual(error, roadrunner_quic_cid_registry:lookup_reset(Registry, <<1:128>>))
     end}.
 
 %% A synchronous peername control call round-trips through the shell.
@@ -371,6 +403,7 @@ config(Peer) ->
         peer => Peer,
         registry => roadrunner_quic_cid_registry:new(),
         reset_key => crypto:strong_rand_bytes(32),
+        token_key => crypto:strong_rand_bytes(32),
         cert_chain => [~"leaf-cert-der"],
         priv_key => PrivKey,
         alpn => ~"h3",
