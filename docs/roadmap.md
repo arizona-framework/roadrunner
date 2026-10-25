@@ -220,23 +220,6 @@ run on a machine that can take one.
 
 **Scope:** small.
 
-### Honor the peer's SETTINGS_MAX_HEADER_LIST_SIZE
-
-**What:** Keep HTTP/2 response headers within the client's
-`SETTINGS_MAX_HEADER_LIST_SIZE` (RFC 9113 §6.5.2, name + value + 32 per
-field), as HTTP/3 does with `SETTINGS_MAX_FIELD_SECTION_SIZE`: a handler
-response over it answered `500` before anything is sent, trailers over it
-resetting the stream. Today the client's value is parsed into
-`roadrunner_http2_settings` but not used when sending.
-
-**Why deferred:** The setting is advisory, and the h2 headers are encoded
-in the connection process (the HPACK encoder is shared), not the stream
-worker, so the check needs the client's current value at the worker
-(where the 500 can still be chosen) while h2 lets a client send SETTINGS
-again mid-connection.
-
-**Scope:** small.
-
 ### CI bench-vs-baseline comparison
 
 **What:** The `Bench` workflow (`.github/workflows/bench.yml`) writes its

@@ -102,6 +102,20 @@ overruns it gets `GOAWAY(ENHANCE_YOUR_CALM)`. The concurrency and
 header-block caps are tuned under `{http2, #{...}}` in the `protocols`
 list, with the keys `max_concurrent_streams` and `max_header_block`.
 
+Response headers are held to the client's own limit: a client that sends
+`SETTINGS_MAX_HEADER_LIST_SIZE` gets no header section over it (RFC 9113
+§6.5.2), counted as name + value + 32 per field, `:status` and the auto
+headers (`date`, `alt-svc`) included. A handler response whose headers
+are over it is answered `500 Internal Server Error` instead, before
+anything is sent, and the error is logged. Trailers over it come after
+the status is sent, so they reset the stream with `INTERNAL_ERROR`, as
+does a limit too small for even the 500. A client may send a new limit in
+a later SETTINGS frame; each response is held to the one in force when it
+goes out. With no limit sent there is none. The server's own short
+answers (`413`, `431`, `429`, `503`, the interim `100`) are not checked:
+their few fields are far below any real limit. HTTP/3 does the same with
+`SETTINGS_MAX_FIELD_SECTION_SIZE` (below).
+
 ## HTTP/3 framing limits
 
 | Limit | Default | Configurable |

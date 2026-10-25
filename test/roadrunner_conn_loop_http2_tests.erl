@@ -70,6 +70,12 @@ all_test_() ->
         fun unsafe_trailer_resets_stream/0,
         fun non_iodata_body_resets_only_its_stream/0,
         fun unfinished_response_on_normal_exit_resets_stream/0,
+        fun peer_header_limit_buffered_over_returns_500/0,
+        fun peer_header_limit_under_passes/0,
+        fun peer_header_limit_unset_passes_big_headers/0,
+        fun peer_header_limit_streamed_over_returns_500_and_unwinds_worker/0,
+        fun peer_header_limit_trailers_over_reset_stream/0,
+        fun peer_header_limit_too_small_for_500_resets_stream/0,
         fun middleware_chain_runs/0,
         fun rst_stream_cancels_active_stream/0,
         fun router_404_returns_not_found/0,
@@ -1464,6 +1470,117 @@ unfinished_response_on_normal_exit_resets_stream() ->
     ),
     ?assert(is_process_alive(Pid)),
     cleanup(Pid, Ref).
+
+peer_header_limit_buffered_over_returns_500() ->
+    %% RFC 9113 §6.5.2: a client that sent SETTINGS_MAX_HEADER_LIST_SIZE
+    %% 200 gets no header section over it. The handler's 200 carries 237
+    %% bytes of `x-big` alone, so it is answered 500 instead (161 bytes:
+    %% `:status`, `content-type`, `date`), before anything is sent. The
+    %% oversized fields never reached the HPACK encoder: a second request
+    %% decodes with the same decoder that read the 500.
+    {Pid, Ref} = run_stream_request(~"/big-headers", peer_limit_settings(200)),
+    [{headers, 1, _, _, Block}, {data, 1, 16#01, Body, _}] = wire_frames(),
+    {ok, Headers, Dec} = roadrunner_http2_hpack:decode(
+        Block, roadrunner_http2_hpack:new_decoder(4096)
+    ),
+    ?assertEqual(~"500", proplists:get_value(~":status", Headers)),
+    ?assertEqual(undefined, proplists:get_value(~"x-big", Headers)),
+    ?assertEqual(~"Internal Server Error", Body),
+    serve_recv(Pid, complete_get_headers(3, ~"/")),
+    [{headers, 3, _, _, Block3}, {data, 3, 16#01, ~"ok", _}] = wire_frames(),
+    {ok, Headers3, _} = roadrunner_http2_hpack:decode(Block3, Dec),
+    ?assertEqual(~"200", proplists:get_value(~":status", Headers3)),
+    cleanup(Pid, Ref).
+
+peer_header_limit_under_passes() ->
+    %% A response within the client's limit goes out as the handler built
+    %% it: `:status`, `content-type` and `date` come to 161 bytes.
+    {Pid, Ref} = run_stream_request(~"/", peer_limit_settings(200)),
+    [{headers, 1, _, _, Block}, {data, 1, 16#01, ~"ok", _}] = wire_frames(),
+    ?assertEqual(~"200", response_status(Block)),
+    cleanup(Pid, Ref).
+
+peer_header_limit_unset_passes_big_headers() ->
+    %% No SETTINGS_MAX_HEADER_LIST_SIZE from the client: no limit (the
+    %% RFC 9113 §6.5.2 default), so the big header goes out.
+    {Pid, Ref} = run_stream_request(~"/big-headers"),
+    [{headers, 1, _, _, Block}, {data, 1, 16#01, ~"ok", _}] = wire_frames(),
+    {ok, Headers, _} = roadrunner_http2_hpack:decode(
+        Block, roadrunner_http2_hpack:new_decoder(4096)
+    ),
+    ?assertEqual(~"200", proplists:get_value(~":status", Headers)),
+    ?assertEqual(binary:copy(~"v", 200), proplists:get_value(~"x-big", Headers)),
+    cleanup(Pid, Ref).
+
+peer_header_limit_streamed_over_returns_500_and_unwinds_worker() ->
+    %% A streamed response's headers over the limit: the conn answers 500
+    %% (HEADERS + DATA with END_STREAM) and tells the worker its stream was
+    %% reset instead of acking, so the worker exits with `stream_reset`
+    %% before its stream fun sends anything. That exit ends the stream as
+    %% a normal one does: no RST_STREAM follows the complete 500.
+    true = register(roadrunner_h2_big_headers_observer, self()),
+    {Pid, Ref} = run_stream_request(~"/stream/big-headers", peer_limit_settings(200)),
+    Worker =
+        receive
+            {big_headers_worker, W} -> W
+        after 1000 -> error(no_worker)
+        end,
+    WorkerRef = monitor(process, Worker),
+    Worker ! go,
+    receive
+        {'DOWN', WorkerRef, process, Worker, Reason} -> ?assertEqual(stream_reset, Reason)
+    after 1000 -> error(worker_not_reset)
+    end,
+    serve_recv(Pid, roadrunner_http2_frame:encode({ping, 0, <<7:64>>})),
+    [{headers, 1, 16#04, _, Block}, {data, 1, 16#01, Body, _}, {ping, 1, <<7:64>>}] =
+        wire_frames(),
+    ?assertEqual(~"500", response_status(Block)),
+    ?assertEqual(~"Internal Server Error", Body),
+    cleanup(Pid, Ref).
+
+peer_header_limit_trailers_over_reset_stream() ->
+    %% Trailers over the limit come after the 200 HEADERS and the body, so
+    %% they cannot become a 500: the stream is reset with INTERNAL_ERROR
+    %% and the connection carries on.
+    {Pid, Ref} = run_stream_request(~"/stream/big-trailers", peer_limit_settings(200)),
+    [{headers, 1, 16#04, _, Block}, {data, 1, 0, ~"body", _}, {rst_stream, 1, internal_error}] =
+        wire_frames(),
+    ?assertEqual(~"200", response_status(Block)),
+    ?assert(is_process_alive(Pid)),
+    cleanup(Pid, Ref).
+
+peer_header_limit_too_small_for_500_resets_stream() ->
+    %% A limit too small even for the 161-byte 500 resets the stream with
+    %% INTERNAL_ERROR, buffered or streamed, and sends nothing else.
+    [
+        begin
+            {Pid, Ref} = run_stream_request(Path, peer_limit_settings(100)),
+            ?assertEqual([{rst_stream, 1, internal_error}], wire_frames()),
+            ?assert(is_process_alive(Pid)),
+            cleanup(Pid, Ref)
+        end
+     || Path <- [~"/big-headers", ~"/stream/big-headers"]
+    ].
+
+%% A client SETTINGS frame carrying SETTINGS_MAX_HEADER_LIST_SIZE (id 6).
+peer_limit_settings(Limit) ->
+    iolist_to_binary(roadrunner_http2_frame:encode({settings, 0, [{6, Limit}]})).
+
+%% Every frame the conn sends until a quiet period, parsed.
+wire_frames() ->
+    parse_wire_frames(collect_send_bytes(<<>>)).
+
+parse_wire_frames(<<>>) ->
+    [];
+parse_wire_frames(Bin) ->
+    {ok, Frame, Rest} = roadrunner_http2_frame:parse(Bin, 16384),
+    [Frame | parse_wire_frames(Rest)].
+
+response_status(Block) ->
+    {ok, Headers, _} = roadrunner_http2_hpack:decode(
+        Block, roadrunner_http2_hpack:new_decoder(4096)
+    ),
+    proplists:get_value(~":status", Headers).
 
 middleware_chain_runs() ->
     %% Listener with a non-empty middleware list — exercises the

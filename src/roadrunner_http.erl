@@ -38,7 +38,7 @@ accessors that operate on it.
 
 -export([http_date_now/0, format_http_date/1, with_date/1, auto_headers/2]).
 -export([with_defaults/2, drop_unset/1]).
--export([header_list_size/1]).
+-export([header_list_size/1, fits_header_list_size/2]).
 -export([check_header_safe/2, is_header_safe/1]).
 -export([strip_connection_specific_fields/1, strip_connection_specific_fields_safe/1]).
 -export([
@@ -203,6 +203,16 @@ header_list_size([{Name, Value} | Rest]) ->
     byte_size(Name) + byte_size(Value) + 32 + header_list_size(Rest);
 header_list_size([]) ->
     0.
+
+%% Whether a response field section fits the peer's own limit on it, its
+%% SETTINGS_MAX_HEADER_LIST_SIZE (h2, RFC 9113 §6.5.2) or
+%% SETTINGS_MAX_FIELD_SECTION_SIZE (h3, RFC 9114 §4.2.2), counted as
+%% `header_list_size/1`. Callers check for no limit first, so this sizes
+%% the section only when the peer set one.
+-doc false.
+-spec fits_header_list_size(headers(), non_neg_integer()) -> boolean().
+fits_header_list_size(Fields, Limit) ->
+    header_list_size(Fields) =< Limit.
 
 -doc """
 Format a posix timestamp (seconds since epoch) as an IMF-fixdate

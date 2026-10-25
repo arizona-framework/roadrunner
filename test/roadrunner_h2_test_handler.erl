@@ -202,6 +202,41 @@ handle(#{target := ~"/stream/bad-trailers"} = Req) ->
         end},
         Req
     };
+handle(#{target := ~"/big-headers"} = Req) ->
+    %% A 200-byte header value (237 bytes counted with its name and the 32
+    %% of overhead), over a small client SETTINGS_MAX_HEADER_LIST_SIZE.
+    {{200, [{~"x-big", binary:copy(~"v", 200)}], ~"ok"}, Req};
+handle(#{target := ~"/stream/big-headers"} = Req) ->
+    %% The same on a streamed response's headers. The worker tells a test
+    %% observer (if one registered) who it is and waits for it to set up
+    %% its monitor, so the test can see it unwind once its headers are
+    %% answered with 500.
+    ok =
+        case whereis(roadrunner_h2_big_headers_observer) of
+            undefined ->
+                ok;
+            Observer ->
+                Observer ! {big_headers_worker, self()},
+                receive
+                    go -> ok
+                end
+        end,
+    {
+        {stream, 200, [{~"x-big", binary:copy(~"v", 200)}], fun(Send) ->
+            Send(~"a", nofin),
+            Send(~"b", fin)
+        end},
+        Req
+    };
+handle(#{target := ~"/stream/big-trailers"} = Req) ->
+    %% Trailers over a small client SETTINGS_MAX_HEADER_LIST_SIZE, sent
+    %% after the 200 HEADERS and the body.
+    {
+        {stream, 200, [], fun(Send) ->
+            Send(~"body", {fin, [{~"x-big", binary:copy(~"v", 200)}]})
+        end},
+        Req
+    };
 handle(#{target := ~"/bad-body"} = Req) ->
     %% A buffered body that is not iodata: the worker crashes sizing it,
     %% before anything reaches the conn.
