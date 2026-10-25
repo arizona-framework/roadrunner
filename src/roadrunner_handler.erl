@@ -212,9 +212,9 @@ The return value replaces it: `roadrunner_req:state/1` returns it on every
 request the route answers, and `roadrunner_router:match/3` reports it.
 
 Validate options and precompute here (resolve paths, build lookup tables):
-a raise stops the listener from starting. On `reload_routes/2` it fails
-the loud way, as a middleware's `init/1` does: the call exits and the
-listener stops. The reason is wrapped as
+a raise stops the listener from starting. On `reload_routes/2` it refuses
+the reload instead: the call returns `{error, {init_failed, Reason}}` and
+the listener keeps serving its current routes. The reason is wrapped as
 `{init_route_failed, Path, Handler, Reason}` so the error names the route
 (`Path` is `undefined` for the single-handler forms).
 `roadrunner_router:validate/1` does not run it, and `compile/2` runs it

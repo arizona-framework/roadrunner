@@ -16,7 +16,7 @@ suite checks that its WebSocket `init/1` still runs only on an upgrade.
     runs_once_per_route_at_start/1,
     runs_again_on_reload/1,
     raise_stops_the_listener_from_starting/1,
-    raise_on_reload_stops_the_listener/1,
+    raise_on_reload_keeps_the_old_routes/1,
     single_handler_forms_run_it/1,
     single_handler_raise_stops_the_listener/1,
     ws_init_still_runs_on_upgrade/1
@@ -30,7 +30,7 @@ all() ->
         runs_once_per_route_at_start,
         runs_again_on_reload,
         raise_stops_the_listener_from_starting,
-        raise_on_reload_stops_the_listener,
+        raise_on_reload_keeps_the_old_routes,
         single_handler_forms_run_it,
         single_handler_raise_stops_the_listener,
         ws_init_still_runs_on_upgrade
@@ -90,19 +90,19 @@ raise_stops_the_listener_from_starting(_Config) ->
         })
     ).
 
-raise_on_reload_stops_the_listener(_Config) ->
-    process_flag(trap_exit, true),
-    _Port = start(#{routes => [{~"/a", roadrunner_hello_handler}]}),
-    Ref = monitor(process, ?MODULE),
-    ?assertExit(
-        {{{init_route_failed, ~"/a", roadrunner_init_route_handler, bad_option}, _}, _},
+raise_on_reload_keeps_the_old_routes(_Config) ->
+    %% A hook that fails for the new table refuses the reload: the caller gets
+    %% the reason and the listener keeps serving the routes it had.
+    Port = start(#{routes => [{~"/a", roadrunner_init_route_handler, #{v => old}}]}),
+    Before = get_state(Port, ~"/a"),
+    ?assertMatch(
+        {error,
+            {init_failed, {init_route_failed, ~"/a", roadrunner_init_route_handler, bad_option}}},
         roadrunner_listener:reload_routes(?MODULE, [
             {~"/a", roadrunner_init_route_handler, #{raise => bad_option}}
         ])
     ),
-    receive
-        {'DOWN', Ref, process, _, _} -> ok
-    end.
+    ?assertEqual(Before, get_state(Port, ~"/a")).
 
 single_handler_forms_run_it(_Config) ->
     State = #{notify => self()},
