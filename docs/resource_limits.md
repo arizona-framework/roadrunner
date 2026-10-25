@@ -109,6 +109,7 @@ list, with the keys `max_concurrent_streams` and `max_header_block`.
 | Field section block (encoded HEADERS) | 16 KB | yes |
 | `initial_max_streams_bidi` | 100 | yes |
 | QPACK dynamic table (`SETTINGS_QPACK_MAX_TABLE_CAPACITY`) | 4 KB | yes |
+| QPACK blocked streams (`SETTINGS_QPACK_BLOCKED_STREAMS`) | 16 | yes |
 
 The encoded request field section is capped before it reaches the
 handler; an overrun answers `431 Request Header Fields Too Large`. The
@@ -121,10 +122,21 @@ counterpart to HTTP/2's `max_concurrent_streams`. Both are tuned under
 The QPACK dynamic table a client may fill to compress its request
 headers is capped per connection at `qpack_max_table_capacity` bytes
 (name + value + 32 per entry, RFC 9204 §3.2.1), set under
-`{http3, #{...}}` too; `0` turns it off. No blocked streams are allowed
-(`SETTINGS_QPACK_BLOCKED_STREAMS = 0`), so a request never waits on the
-encoder stream, and a partial encoder instruction is buffered only up to
-the size a valid one can reach.
+`{http3, #{...}}` too; `0` turns it off. A partial encoder instruction is
+buffered only up to the size a valid one can reach.
+
+A request whose headers (or trailers) use table entries still on their
+way is held until they arrive (a blocked stream, RFC 9204 §2.1.2). At
+most `qpack_blocked_streams` requests of a connection wait this way at
+once; a client that goes past that is closed with
+`QPACK_DECOMPRESSION_FAILED`. A waiting request holds no in-flight slot
+until it can be read. With `body_buffering => manual` what it holds
+stays within its stream's flow-control window. Otherwise it holds at
+most `max_content_length` plus twice `max_header_block` bytes, frame
+headers counted, and past that it is answered `413`, since its route
+(which may allow a larger body) is not known before its headers are
+read. `0` allows no waiting request, and most clients then never use the
+table.
 
 ## Connection and slow-client guards
 
