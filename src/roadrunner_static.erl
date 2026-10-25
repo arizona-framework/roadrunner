@@ -12,6 +12,45 @@ Configure via a 3-tuple route with `#{dir => Path}` opts and a
 Reads the file from disk, sets `Content-Type` from the extension,
 returns 404 on a missing file or any path that contains `..`.
 
+## Content-Type
+
+The extension is matched without regard to case, so `logo.PNG` is served
+as `image/png`. The built-in table covers the common web types:
+
+- Documents and code: `.html` and `.htm` (`text/html`), `.css`, `.js` and
+  `.mjs` (`text/javascript`), `.json` and `.map` (`application/json`),
+  `.webmanifest` (`application/manifest+json`), `.xml`
+  (`application/xml`), `.txt`, `.csv`, `.md`, `.vtt`, `.wasm`
+  (`application/wasm`), `.pdf`, `.zip`
+- Images: `.png`, `.apng`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.avif`,
+  `.bmp`, `.svg` (`image/svg+xml`), `.ico` (`image/x-icon`)
+- Fonts: `.woff`, `.woff2`, `.ttf`, `.otf` (`font/*`)
+- Audio and video: `.mp3` (`audio/mpeg`), `.m4a` (`audio/mp4`), `.ogg`
+  (`audio/ogg`), `.wav` (`audio/wav`), `.mp4` (`video/mp4`), `.webm`
+  (`video/webm`)
+
+The `text/*` types carry `; charset=utf-8`. Any other extension, and a
+file with none, is served as `application/octet-stream`.
+
+`#{mime_types => #{Ext => ContentType}}` adds types to the table or
+replaces built-in ones for this route. `Ext` is the extension with its
+leading dot and `ContentType` is the header value, sent verbatim:
+
+```
+{~"/static/*path", roadrunner_static, #{
+    dir => ~"/var/www",
+    mime_types => #{
+        ~".glb" => ~"model/gltf-binary",
+        ~".txt" => ~"text/plain; charset=iso-8859-1"
+    }
+}}
+```
+
+The file's extension is lowercased before the lookup, so write each key
+in lowercase: `~".glb"` matches both `scene.glb` and `scene.GLB`, while a
+`~".GLB"` key never matches. The route's map is checked first and the
+built-in table second, so nothing is merged per request.
+
 ## Precompressed-sibling serving
 
 When a request's `Accept-Encoding` opts into a compressed encoding
@@ -141,6 +180,8 @@ under an `infinity` (or long) TTL.
 -define(MAX_SYMLINK_HOPS, 40).
 
 -export([handle/1, cache_clear/0]).
+%% Exported only so the eunit suite can drive the extension lookup directly.
+-export([content_type_for/2]).
 
 -export_type([siblings/0]).
 
@@ -151,18 +192,52 @@ the value is its size in bytes. `#{}` means neither sibling exists.
 """.
 -type siblings() :: #{br => non_neg_integer(), gz => non_neg_integer()}.
 
+%% Built-in extension to `Content-Type` table, keyed by the lowercased
+%% extension with its leading dot. Types are the IANA-registered ones (WHATWG
+%% for `.wav` and source maps, which IANA does not cover). Text types carry
+%% `charset=utf-8`; JSON and XML types do not, since their encoding is part of
+%% the format. A route's `mime_types` option is looked up first.
 -define(MIME_TYPES, #{
+    %% Documents and code
     ~".html" => ~"text/html; charset=utf-8",
+    ~".htm" => ~"text/html; charset=utf-8",
     ~".css" => ~"text/css; charset=utf-8",
-    ~".js" => ~"application/javascript",
+    ~".js" => ~"text/javascript; charset=utf-8",
+    ~".mjs" => ~"text/javascript; charset=utf-8",
     ~".json" => ~"application/json",
+    ~".map" => ~"application/json",
+    ~".webmanifest" => ~"application/manifest+json",
+    ~".xml" => ~"application/xml",
+    ~".txt" => ~"text/plain; charset=utf-8",
+    ~".csv" => ~"text/csv; charset=utf-8",
+    ~".md" => ~"text/markdown; charset=utf-8",
+    ~".vtt" => ~"text/vtt; charset=utf-8",
+    ~".wasm" => ~"application/wasm",
+    ~".pdf" => ~"application/pdf",
+    ~".zip" => ~"application/zip",
+    %% Images
     ~".png" => ~"image/png",
+    ~".apng" => ~"image/apng",
     ~".jpg" => ~"image/jpeg",
     ~".jpeg" => ~"image/jpeg",
     ~".gif" => ~"image/gif",
+    ~".webp" => ~"image/webp",
+    ~".avif" => ~"image/avif",
+    ~".bmp" => ~"image/bmp",
     ~".svg" => ~"image/svg+xml",
     ~".ico" => ~"image/x-icon",
-    ~".txt" => ~"text/plain; charset=utf-8"
+    %% Fonts
+    ~".woff" => ~"font/woff",
+    ~".woff2" => ~"font/woff2",
+    ~".ttf" => ~"font/ttf",
+    ~".otf" => ~"font/otf",
+    %% Audio and video
+    ~".mp3" => ~"audio/mpeg",
+    ~".m4a" => ~"audio/mp4",
+    ~".ogg" => ~"audio/ogg",
+    ~".wav" => ~"audio/wav",
+    ~".mp4" => ~"video/mp4",
+    ~".webm" => ~"video/webm"
 }).
 
 -spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
@@ -348,7 +423,7 @@ maybe_serve_precompressed(FilePath, ETag, LastMod, Siblings, Req) ->
                 {Encoding, SiblingPath, SiblingSize} ->
                     {ok,
                         precompressed_response(
-                            FilePath, Encoding, SiblingPath, SiblingSize, ETag, LastMod
+                            FilePath, Encoding, SiblingPath, SiblingSize, ETag, LastMod, Req
                         )};
                 none ->
                     none
@@ -432,12 +507,18 @@ sibling_path(FilePath, Suffix) ->
     iolist_to_binary([FilePath, Suffix]).
 
 -spec precompressed_response(
-    file:filename_all(), binary(), file:filename_all(), non_neg_integer(), binary(), binary()
+    file:filename_all(),
+    binary(),
+    file:filename_all(),
+    non_neg_integer(),
+    binary(),
+    binary(),
+    roadrunner_req:request()
 ) -> roadrunner_handler:response().
-precompressed_response(OrigPath, Encoding, SiblingPath, SiblingSize, ETag, LastMod) ->
+precompressed_response(OrigPath, Encoding, SiblingPath, SiblingSize, ETag, LastMod, Req) ->
     {sendfile, 200,
         [
-            {~"content-type", content_type_for(OrigPath)},
+            {~"content-type", content_type(OrigPath, Req)},
             {~"content-encoding", Encoding},
             {~"content-length", integer_to_binary(SiblingSize)},
             {~"etag", ETag},
@@ -478,33 +559,55 @@ if_modified_since_satisfied(Req, Mtime) ->
 serve_with_range(FilePath, Size, ETag, LastMod, Req) ->
     case parse_range(roadrunner_req:header_normalized(~"range", Req), Size) of
         {range, Start, End} ->
-            serve_range(FilePath, Size, ETag, LastMod, Start, End);
+            serve_range(FilePath, Size, ETag, LastMod, Start, End, Req);
         unsatisfiable ->
             range_not_satisfiable(Size, ETag, LastMod);
         none ->
-            serve_full_file(FilePath, Size, ETag, LastMod)
+            serve_full_file(FilePath, Size, ETag, LastMod, Req)
     end.
 
 %% Returns a `{sendfile, ...}` response so the conn dispatches
 %% `file:sendfile/5` (TCP) or a chunked read+send fallback (TLS) — the
 %% file body is never copied through the Erlang heap.
 -spec serve_full_file(
-    file:filename_all(), non_neg_integer(), binary(), binary()
+    file:filename_all(), non_neg_integer(), binary(), binary(), roadrunner_req:request()
 ) -> roadrunner_handler:response().
-serve_full_file(FilePath, Size, ETag, LastMod) ->
+serve_full_file(FilePath, Size, ETag, LastMod, Req) ->
     {sendfile, 200,
         [
-            {~"content-type", content_type_for(FilePath)},
+            {~"content-type", content_type(FilePath, Req)},
             {~"content-length", integer_to_binary(Size)},
             {~"etag", ETag},
             {~"last-modified", LastMod}
         ],
         {FilePath, 0, Size}}.
 
--spec content_type_for(file:filename_all()) -> binary().
-content_type_for(FilePath) ->
+%% The `Content-Type` for a file under the route's `mime_types` option.
+-spec content_type(file:filename_all(), roadrunner_req:request()) -> binary().
+content_type(FilePath, Req) ->
+    case roadrunner_req:state(Req) of
+        #{mime_types := MimeTypes} -> content_type_for(FilePath, MimeTypes);
+        _ -> content_type_for(FilePath, #{})
+    end.
+
+%% Look the lowercased extension up in the route's own `MimeTypes` first, then
+%% in the built-in table, so a route entry overrides or extends a built-in one.
+%% The two lookups stand in for a merged map: nothing is merged per request,
+%% and a route without the option pays one lookup in an empty map. A
+%% `MimeTypes` that is not a map raises `case_clause`.
+-doc false.
+-spec content_type_for(file:filename_all(), #{binary() => binary()}) -> binary().
+content_type_for(FilePath, MimeTypes) ->
     Ext = roadrunner_bin:ascii_lowercase(iolist_to_binary(filename:extension(FilePath))),
-    maps:get(Ext, ?MIME_TYPES, ~"application/octet-stream").
+    case MimeTypes of
+        #{Ext := Type} ->
+            Type;
+        #{} ->
+            case ?MIME_TYPES of
+                #{Ext := Type} -> Type;
+                #{} -> ~"application/octet-stream"
+            end
+    end.
 
 %% Strong ETag derived from size + posix mtime — RFC 9110 §8.8.3
 %% format: opaque-tag wrapped in double quotes. Two files with the
@@ -589,9 +692,10 @@ parse_single_range(Spec, Size) ->
     binary(),
     binary(),
     non_neg_integer(),
-    non_neg_integer()
+    non_neg_integer(),
+    roadrunner_req:request()
 ) -> roadrunner_handler:response().
-serve_range(FilePath, Size, ETag, LastMod, Start, End) ->
+serve_range(FilePath, Size, ETag, LastMod, Start, End, Req) ->
     Length = End - Start + 1,
     ContentRange = iolist_to_binary([
         ~"bytes ",
@@ -603,7 +707,7 @@ serve_range(FilePath, Size, ETag, LastMod, Start, End) ->
     ]),
     {sendfile, 206,
         [
-            {~"content-type", content_type_for(FilePath)},
+            {~"content-type", content_type(FilePath, Req)},
             {~"content-length", integer_to_binary(Length)},
             {~"content-range", ContentRange},
             {~"etag", ETag},

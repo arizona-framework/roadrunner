@@ -261,6 +261,9 @@ cover setup, process messages, and drain.
 
 Supports `ETag`, `Last-Modified`, `Range`, and precompressed `.br` / `.gz`
 files, and by default refuses a symlinked file that points outside `dir`.
+`Content-Type` comes from the file extension, with the common web types
+(fonts, `.wasm`, `.webp`, `.mjs`, and more) built in and a `mime_types`
+option to add your own.
 Handlers can also send a file directly with
 `{sendfile, Status, Headers, {Filename, Offset, Length}}` (zero-copy for
 HTTP/1.1 over plain TCP).
