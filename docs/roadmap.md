@@ -98,10 +98,6 @@ client's dynamic table, responses use the static table). Remaining work:
   table of our own (encoder stream, tracking the client's Section
   Acknowledgments and Insert Count Increments before evicting), when the
   client advertises a non-zero `SETTINGS_QPACK_MAX_TABLE_CAPACITY`
-- QPACK blocked streams: advertise `SETTINGS_QPACK_BLOCKED_STREAMS` > 0
-  and hold a request stream whose field section needs inserts still in
-  flight on the encoder stream, instead of the client waiting for our
-  Insert Count Increment before it can reference a new entry
 - HttpArena `baseline-h3` / `static-h3` profiles (the local
   `scripts/bench.escript` h3 path is wired and measured; these live in
   the separate `MDA2AV/HttpArena` repo)

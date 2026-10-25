@@ -629,7 +629,10 @@ listener_rejects_invalid_http3_opt_test() ->
             #{max_field_section_size => not_an_integer},
             #{qpack_max_table_capacity => -1},
             #{qpack_max_table_capacity => 16#80000000},
-            #{qpack_max_table_capacity => not_an_integer}
+            #{qpack_max_table_capacity => not_an_integer},
+            #{qpack_blocked_streams => -1},
+            #{qpack_blocked_streams => 16#80000000},
+            #{qpack_blocked_streams => not_an_integer}
         ]
     ).
 

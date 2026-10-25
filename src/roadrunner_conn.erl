@@ -236,6 +236,7 @@ deadline in milliseconds. The shed form answers it `503` with the
     http3_listeners => 1..1024,
     http3_max_header_block => 1..16#7FFFFFFF,
     http3_qpack_max_table_capacity => 0..16#7FFFFFFF,
+    http3_qpack_blocked_streams => 0..16#7FFFFFFF,
     %% HTTP/1 inbound size limits and close linger, flattened from
     %% `{http1, #{...}}`.
     http1_max_request_line => 1..16#7FFFFFFF,

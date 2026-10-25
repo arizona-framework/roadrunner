@@ -121,6 +121,34 @@ dynamic_trailers_acknowledged_test() ->
         )
     ).
 
+blocked_headers_test() ->
+    %% A request section that needs inserts not received yet stops the
+    %% fold (RFC 9204 §2.2.1): its HEADERS frame and all after it stay in
+    %% `buf`, unread. Once the table has them, the same bytes read on.
+    Block = <<3, 0, 16#D1, 16#D7, 16#81, 16#80>>,
+    Buf = <<(hf(Block))/binary, (df(~"body"))/binary>>,
+    One = qpack_table([{~":authority", ~"localhost"}]),
+    {blocked, 2, Stream} = roadrunner_conn_loop_http3:decode_request_frames(
+        Buf, new(1000), ?HANDLER, 16384, One
+    ),
+    ?assertMatch(
+        #{buf := Buf, header_block := undefined, frame_state := expecting_headers}, Stream
+    ),
+    Two = qpack_table([{~":authority", ~"localhost"}, {~"x-custom", ~"v"}]),
+    ?assertMatch(
+        {ok, #{header_block := Block, body_len := 4, buf := <<>>}},
+        roadrunner_conn_loop_http3:decode_request_frames(Buf, Stream, ?HANDLER, 16384, Two)
+    ).
+
+blocked_trailers_test() ->
+    %% Trailers block the same way, the body before them already read.
+    Trailers = hf(<<3, 0, 16#80>>),
+    Buf = <<(hf(<<0, 0, 16#D1>>))/binary, (df(~"body"))/binary, Trailers/binary>>,
+    {blocked, 2, Stream} = roadrunner_conn_loop_http3:decode_request_frames(
+        Buf, new(1000), ?HANDLER, 16384, qpack_table([{~"x-trailer", ~"t"}])
+    ),
+    ?assertMatch(#{buf := Trailers, body_len := 4, frame_state := expecting_data}, Stream).
+
 frame_after_trailers_test() ->
     %% A DATA frame after the trailing HEADERS → H3_FRAME_UNEXPECTED.
     Buf = <<(hf(~"req"))/binary, (hf(<<0, "trailer">>))/binary, (df(~"x"))/binary>>,

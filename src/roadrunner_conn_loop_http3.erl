@@ -25,7 +25,7 @@
 %%
 %% On `connected` it opens its own control stream and sends SETTINGS
 %% (advertising the QPACK dynamic table capacity the peer's encoder may
-%% use, and no blocked streams). Request streams (client-initiated
+%% use, and how many request streams may wait on it). Request streams (client-initiated
 %% bidirectional, `StreamId rem 4 =:= 0`) accumulate HEADERS + DATA
 %% frames; on the stream FIN a per-stream `roadrunner_http3_stream_worker`
 %% is spawned to dispatch the request and write the response.
@@ -43,20 +43,24 @@
 %% sections this side sends are static-only. The peer's encoder-stream
 %% instructions are applied in order as they arrive, and each chunk that
 %% added entries is answered with an Insert Count Increment on our decoder
-%% stream (opened with the first one). With SETTINGS_QPACK_BLOCKED_STREAMS
-%% = 0 the encoder only references entries we have acknowledged, so a
-%% request's field section can always be decoded the moment its HEADERS
-%% frame is complete, and it is: in the same event, before any later
-%% encoder-stream data is applied, so the table it is decoded against is
-%% the one it was encoded for. A section that would need entries not
-%% received yet is QPACK_DECOMPRESSION_FAILED rather than a blocked stream
-%% (§2.1.2). Every decoded section with a non-zero Required Insert Count
-%% is acknowledged right after it is decoded (never before, so the encoder
-%% keeps the entries it references until then, §2.1.1), trailers included;
-%% a request stream abandoned or reset before its sections are all decoded
-%% gets a Stream Cancellation (§4.4.2). A section with Required Insert
-%% Count 0, every section of a peer that never uses the table, takes the
-%% static-only decoder, as before.
+%% stream (opened with the first one). A request's field section is
+%% decoded in the event that completes its HEADERS frame, unless its
+%% Required Insert Count is past the inserts received so far: the stream is
+%% then blocked (§2.1.2, §2.2.1). Its frames from that HEADERS frame (or
+%% its trailers) on stay unread in its buffer, with whatever else arrives
+%% on it, and once the encoder stream brings the inserts it needs they are
+%% read as if they had just arrived. At most `qpack_blocked_streams` (an
+%% http3 opt, advertised as SETTINGS_QPACK_BLOCKED_STREAMS) are blocked at
+%% once; one more is QPACK_DECOMPRESSION_FAILED. A blocked request holds no
+%% in-flight slot, like one still arriving: it takes one at dispatch, after
+%% its section is decoded. Every decoded section with a non-zero Required
+%% Insert Count is acknowledged right after it is decoded (never before, so
+%% the encoder keeps the entries it references until then, §2.1.1),
+%% trailers included; a request stream abandoned or reset before its
+%% sections are all decoded, a blocked one included, gets a Stream
+%% Cancellation (§4.4.2). A section with Required Insert Count 0, every
+%% section of a peer that never uses the table, takes the static-only
+%% decoder, as before, and never blocks.
 %%
 %% On a graceful drain (a `{roadrunner_drain, _}` message from the
 %% listener) it sends a GOAWAY on its control stream (RFC 9114 §5.2),
@@ -116,6 +120,15 @@
 %% table. Overridable per listener via the `qpack_max_table_capacity` http3
 %% opt; 0 turns the dynamic table off.
 -define(QPACK_MAX_TABLE_CAPACITY, 4096).
+
+%% Default SETTINGS_QPACK_BLOCKED_STREAMS (RFC 9204 §5): how many request
+%% streams may wait on the encoder stream at once. Clients reference an
+%% entry they are not yet sure arrived only when this is above 0, and
+%% without that most never insert at all. 16 is nginx's default; an encoder
+%% that would risk more uses acknowledged entries or literals instead.
+%% Overridable per listener via the `qpack_blocked_streams` http3 opt; 0
+%% allows none, and a section that would block then fails.
+-define(QPACK_BLOCKED_STREAMS, 16).
 
 %% Default cap on the encoded request field section (the HEADERS block).
 %% The body is bounded by `max_content_length`; this bounds header memory
@@ -182,6 +195,12 @@
     %% The QPACK dynamic table the peer's encoder stream fills (RFC 9204
     %% §3.2), bounded by the capacity advertised in our SETTINGS.
     qpack :: roadrunner_qpack_table:t(),
+    %% SETTINGS_QPACK_BLOCKED_STREAMS as advertised (RFC 9204 §2.1.2).
+    qpack_blocked_streams = ?QPACK_BLOCKED_STREAMS :: non_neg_integer(),
+    %% Blocked request streams (RFC 9204 §2.2.1): StreamId => the Required
+    %% Insert Count it waits for. The stream's own entry carries a
+    %% `blocked` marker too (`block_stream/5`).
+    blocked = #{} :: #{non_neg_integer() => pos_integer()},
     %% Our QPACK decoder stream (RFC 9204 §4.2), opened with the first
     %% instruction it carries: the Insert Count Increment for the first
     %% insert, which comes before any section can need acknowledging.
@@ -282,6 +301,9 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
         max_content_length = MaxContentLength,
         qpack = roadrunner_qpack_table:new(
             maps:get(http3_qpack_max_table_capacity, ProtoOpts, ?QPACK_MAX_TABLE_CAPACITY)
+        ),
+        qpack_blocked_streams = maps:get(
+            http3_qpack_blocked_streams, ProtoOpts, ?QPACK_BLOCKED_STREAMS
         ),
         body_buffering = maps:get(body_buffering, ProtoOpts, auto),
         max_header_block = MaxHeaderBlock,
@@ -386,17 +408,20 @@ send_control_stream(#h3{conn = Conn} = State) ->
 
 %% Send the stream-type prefix and SETTINGS on the freshly opened control
 %% stream.
-%% `qpack_blocked_streams` stays 0 (RFC 9204 §2.1.2): the peer's encoder
-%% may then never send a section this side cannot decode at once, so no
-%% request stream ever waits on the encoder stream.
 -spec send_settings(#h3{}, non_neg_integer()) -> #h3{}.
 send_settings(
-    #h3{conn = Conn, max_field_section_size = MaxFieldSection, qpack = Qpack} = State, CtrlStreamId
+    #h3{
+        conn = Conn,
+        max_field_section_size = MaxFieldSection,
+        qpack = Qpack,
+        qpack_blocked_streams = BlockedStreams
+    } = State,
+    CtrlStreamId
 ) ->
     Prefix = roadrunner_quic_h3_frame:encode_stream_type(control),
     Settings = roadrunner_quic_h3_frame:encode_settings(#{
         qpack_max_table_capacity => roadrunner_qpack_table:max_capacity(Qpack),
-        qpack_blocked_streams => 0,
+        qpack_blocked_streams => BlockedStreams,
         max_field_section_size => MaxFieldSection,
         %% A reserved "GREASE" setting (RFC 9114 §7.2.4.1): an identifier of
         %% the form 0x1f*N+0x21 a conformant peer MUST ignore, sent so peers
@@ -439,8 +464,11 @@ drain(State) ->
 %% or gone with its final write still on the way (that write and the
 %% worker's `'DOWN'` go to different processes, so either can come first).
 %% A request parked for an in-flight slot, or still being received, owes
-%% one too. A request at or beyond the GOAWAY id is reset when it arrives,
-%% so it holds nothing open.
+%% one too, and so does one blocked on the encoder stream (RFC 9204
+%% §2.2.1): it is served once the inserts it waits for arrive, and if they
+%% never do, the listener's drain deadline ends the connection, as it does
+%% for a request still running. A request at or beyond the GOAWAY id is
+%% reset when it arrives, so it holds nothing open.
 -spec start_drain(#h3{}) -> #h3{}.
 start_drain(#h3{conn = Conn, control_stream_id = CtrlId, last_request_id = LastId} = State) when
     is_integer(CtrlId)
@@ -481,8 +509,7 @@ handle_request_stream(#h3{goaway_id = GoawayId} = State, StreamId, _Data, _Fin) 
     %% will not be processed — reject it with H3_REQUEST_REJECTED.
     reset_and_drop(State, StreamId, ?H3_REQUEST_REJECTED);
 handle_request_stream(State0, StreamId, Data, Fin) ->
-    #h3{streams = Streams, proto_opts = ProtoOpts, max_header_block = MaxHdrBlock} =
-        State = note_request_id(State0, StreamId),
+    #h3{streams = Streams} = State = note_request_id(State0, StreamId),
     Stream0 =
         case Streams of
             #{StreamId := Stream} -> Stream;
@@ -505,41 +532,181 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
             %% still comes is dropped, its credit kept, so the client soon
             %% stops; the worker answers, and its exit ends the stream.
             State#h3{streams = Streams#{StreamId := Stream0#{fin := Fin}}};
+        #{blocked := _} ->
+            blocked_in(State, StreamId, Stream0, Data, Fin);
         #{buf := Buf0} ->
-            case
-                decode_request_frames(
-                    <<Buf0/binary, Data/binary>>, Stream0, ProtoOpts, MaxHdrBlock, State#h3.qpack
-                )
-            of
-                {ok, Stream1} ->
-                    frames_in(State, StreamId, Stream0, Stream1, Data, Fin);
-                {ok, Stream1, {section_ack, Ric}} ->
-                    %% Trailers that used the dynamic table were decoded,
-                    %% and are acknowledged like any other section.
-                    State1 = section_acknowledged(State, StreamId, Ric),
-                    frames_in(State1, StreamId, Stream0, Stream1, Data, Fin);
-                too_large when is_map_key(reader, Stream0) ->
-                    body_over_cap(State, StreamId, Stream0, Fin);
-                too_large ->
-                    refuse_request(State, StreamId, Stream0, Fin, 413, ~"Payload Too Large");
-                headers_too_large ->
-                    refuse_request(
-                        State, StreamId, Stream0, Fin, 431, ~"Request Header Fields Too Large"
-                    );
-                {conn_error, _, _} = ConnError ->
-                    ConnError
-            end
+            request_frames(
+                State, StreamId, Stream0, <<Buf0/binary, Data/binary>>, byte_size(Data), Fin
+            )
     end.
+
+%% Read a request stream's frames from `Bytes`: what it had buffered, then
+%% the `Received` bytes just in. A stream the encoder stream unblocks comes
+%% back here with everything it held (`resume/2`).
+-spec request_frames(#h3{}, non_neg_integer(), map(), binary(), non_neg_integer(), boolean()) ->
+    handle_result().
+request_frames(
+    #h3{proto_opts = ProtoOpts, max_header_block = MaxHdrBlock} = State,
+    StreamId,
+    Stream0,
+    Bytes,
+    Received,
+    Fin
+) ->
+    case decode_request_frames(Bytes, Stream0, ProtoOpts, MaxHdrBlock, State#h3.qpack) of
+        {ok, Stream1} ->
+            frames_in(State, StreamId, Stream0, Stream1, Received, Fin);
+        {ok, Stream1, {section_ack, Ric}} ->
+            %% Trailers that used the dynamic table were decoded, and are
+            %% acknowledged like any other section.
+            State1 = section_acknowledged(State, StreamId, Ric),
+            frames_in(State1, StreamId, Stream0, Stream1, Received, Fin);
+        {blocked, Ric, Stream1} ->
+            %% The frames before the blocked section are applied as usual,
+            %% the stream's FIN still to come after it.
+            blocked_after(
+                frames_in(State, StreamId, Stream0, Stream1, Received, false), StreamId, Ric, Fin
+            );
+        too_large when is_map_key(reader, Stream0) ->
+            body_over_cap(State, StreamId, Stream0, Fin);
+        too_large ->
+            refuse_request(State, StreamId, Stream0, Fin, 413, ~"Payload Too Large");
+        headers_too_large ->
+            refuse_request(State, StreamId, Stream0, Fin, 431, ~"Request Header Fields Too Large");
+        {conn_error, _, _} = ConnError ->
+            ConnError
+    end.
+
+%% A field section on the stream (its request headers, or its trailers)
+%% needs inserts the encoder stream has not brought yet, and the frames
+%% before it are in. The stream blocks on it, unless those frames already
+%% ended the request (refused, or reset as malformed). A refused one whose
+%% FIN came with them has nothing more to discard.
+-spec blocked_after(handle_result(), non_neg_integer(), pos_integer(), boolean()) ->
+    handle_result().
+blocked_after(#h3{streams = Streams} = State, StreamId, Ric, Fin) ->
+    case Streams of
+        #{StreamId := #{frame_state := discarding}} when Fin ->
+            State#h3{streams = maps:remove(StreamId, Streams)};
+        #{StreamId := #{frame_state := discarding}} ->
+            State;
+        #{StreamId := Stream} ->
+            block_stream(State, StreamId, Stream, Ric, Fin);
+        _ ->
+            State
+    end;
+blocked_after({conn_error, _, _} = ConnError, _StreamId, _Ric, _Fin) ->
+    ConnError.
+
+%% The stream is blocked (RFC 9204 §2.2.1) until the inserts arrive, `buf`
+%% holding its frames from the section it waits on. One more blocked
+%% stream than the SETTINGS_QPACK_BLOCKED_STREAMS this side advertised is
+%% QPACK_DECOMPRESSION_FAILED (§2.1.2). The stream's `blocked` marker holds
+%% the Required Insert Count, whether its FIN came, and how many bytes
+%% arrived after it blocked, which a manual-mode stream counts toward the
+%% credit it gives back only once it is unblocked: until then they stay in
+%% its flow-control window, as §2.2.1 asks.
+-spec block_stream(#h3{}, non_neg_integer(), map(), pos_integer(), boolean()) ->
+    handle_result().
+block_stream(
+    #h3{blocked = Blocked, qpack_blocked_streams = Max, streams = Streams} = State,
+    StreamId,
+    Stream,
+    Ric,
+    Fin
+) when map_size(Blocked) < Max ->
+    blocked_bytes(
+        State#h3{
+            blocked = Blocked#{StreamId => Ric},
+            streams = Streams#{StreamId => Stream#{blocked => {Ric, Fin, 0}}}
+        },
+        StreamId
+    );
+block_stream(_State, _StreamId, _Stream, _Ric, _Fin) ->
+    {conn_error, ?H3_QPACK_DECOMPRESSION_FAILED, ~"too many QPACK blocked streams"}.
+
+%% More of a blocked stream, held unread behind the section it waits on.
+-spec blocked_in(#h3{}, non_neg_integer(), map(), binary(), boolean()) -> #h3{}.
+blocked_in(
+    #h3{streams = Streams} = State,
+    StreamId,
+    #{buf := Buf, blocked := {Ric, _Fin, Held}} = Stream,
+    Data,
+    Fin
+) ->
+    Held1 = Held + byte_size(Data),
+    Stream1 = Stream#{buf := <<Buf/binary, Data/binary>>, blocked := {Ric, Fin, Held1}},
+    blocked_bytes(State#h3{streams = Streams#{StreamId := Stream1}}, StreamId).
+
+%% What a blocked stream may hold. A manual-mode stream gives its QUIC
+%% credit back only as it is read, so its window bounds what it holds. An
+%% auto-mode stream's credit comes back as its bytes arrive, so it is
+%% bounded here: by its body cap plus two field sections' worth (the
+%% request's and its trailers'), frame headers counted. Its route, which
+%% may allow a larger body, cannot be known before its headers are
+%% decoded, so past that it is refused as a body over the listener's cap.
+-spec blocked_bytes(#h3{}, non_neg_integer()) -> #h3{}.
+blocked_bytes(#h3{body_buffering = manual} = State, _StreamId) ->
+    State;
+blocked_bytes(#h3{streams = Streams, max_header_block = MaxHdrBlock} = State, StreamId) ->
+    #{StreamId := #{buf := Buf, body_len := Len, body_cap := Cap, blocked := {_, Fin, _}}} =
+        Streams,
+    case byte_size(Buf) + Len > Cap + 2 * MaxHdrBlock of
+        false ->
+            State;
+        true ->
+            #h3{streams = #{StreamId := Stream}} = State1 = forget_blocked(State, StreamId),
+            refuse_request(State1, StreamId, Stream, Fin, 413, ~"Payload Too Large")
+    end.
+
+%% A stream going away is not blocked any more, if it was.
+-spec not_blocked(#h3{}, non_neg_integer()) -> #h3{}.
+not_blocked(#h3{blocked = Blocked} = State, StreamId) when is_map_key(StreamId, Blocked) ->
+    forget_blocked(State, StreamId);
+not_blocked(State, _StreamId) ->
+    State.
+
+%% A stream that is no longer blocked leaves the blocked set and loses its
+%% `blocked` marker.
+-spec forget_blocked(#h3{}, non_neg_integer()) -> #h3{}.
+forget_blocked(#h3{blocked = Blocked, streams = Streams} = State, StreamId) ->
+    #{StreamId := Stream} = Streams,
+    State#h3{
+        blocked = maps:remove(StreamId, Blocked),
+        streams = Streams#{StreamId := maps:remove(blocked, Stream)}
+    }.
+
+%% Inserts just arrived: every blocked stream whose Required Insert Count
+%% they reach is read now, in stream order, as if all it held had just
+%% arrived (RFC 9204 §2.2.1). One may block again, on its trailers.
+-spec unblock(handle_result()) -> handle_result().
+unblock(#h3{blocked = Blocked} = State) when map_size(Blocked) =:= 0 ->
+    State;
+unblock(#h3{blocked = Blocked, qpack = Table} = State) ->
+    Inserted = roadrunner_qpack_table:insert_count(Table),
+    resume(State, lists:sort([StreamId || StreamId := Ric <- Blocked, Ric =< Inserted]));
+unblock({conn_error, _, _} = ConnError) ->
+    ConnError.
+
+-spec resume(handle_result(), [non_neg_integer()]) -> handle_result().
+resume({conn_error, _, _} = ConnError, _StreamIds) ->
+    ConnError;
+resume(State, []) ->
+    State;
+resume(#h3{streams = Streams} = State, [StreamId | Rest]) ->
+    #{StreamId := #{buf := Buf, blocked := {_Ric, Fin, Held}}} = Streams,
+    #h3{streams = #{StreamId := Stream}} = State1 = forget_blocked(State, StreamId),
+    resume(request_frames(State1, StreamId, Stream, Buf, Held, Fin), Rest).
 
 %% A request stream's frames from this chunk are applied: a body read by a
 %% manual-mode worker takes them, the stream's FIN dispatches the request,
 %% and otherwise the request waits for the rest of its body.
--spec frames_in(#h3{}, non_neg_integer(), map(), map(), binary(), boolean()) ->
+-spec frames_in(#h3{}, non_neg_integer(), map(), map(), non_neg_integer(), boolean()) ->
     handle_result().
-frames_in(#h3{streams = Streams} = State, StreamId, Stream0, Stream1, Data, Fin) ->
+frames_in(#h3{streams = Streams} = State, StreamId, Stream0, Stream1, Received, Fin) ->
     %% The stream with this chunk counted, which `await_body/4` stores
     %% again once it decodes the headers.
-    Stream2 = unreleased(Stream1, Data, State),
+    Stream2 = unreleased(Stream1, Received, State),
     State1 = State#h3{streams = Streams#{StreamId => Stream2}},
     case {Stream2, Fin} of
         {#{reader := _}, _} -> body_in(State1, StreamId, Fin);
@@ -676,10 +843,10 @@ dispatch_reading(#h3{streams = Streams} = State, StreamId, Headers, ContinueOwed
 
 %% Count a chunk's raw bytes toward what a manual-mode stream hands back to
 %% QUIC flow control once its worker reads them (`deliver/3`).
--spec unreleased(map(), binary(), #h3{}) -> map().
-unreleased(#{unreleased := Unreleased} = Stream, Data, #h3{body_buffering = manual}) ->
-    Stream#{unreleased := Unreleased + byte_size(Data)};
-unreleased(Stream, _Data, _State) ->
+-spec unreleased(map(), non_neg_integer(), #h3{}) -> map().
+unreleased(#{unreleased := Unreleased} = Stream, Received, #h3{body_buffering = manual}) ->
+    Stream#{unreleased := Unreleased + Received};
+unreleased(Stream, _Received, _State) ->
     Stream.
 
 %% DATA, or the FIN ending it, for a dispatched manual-mode stream, `body`
@@ -836,18 +1003,22 @@ handle_uni_stream(#h3{uni = Uni, critical = Critical} = State, StreamId, Data, F
 encoder_stream_in(#h3{qpack = Table, uni = Uni} = State, StreamId, Instructions) ->
     case roadrunner_qpack:encoder_instructions(Instructions, Table) of
         {ok, Table1, Pending} ->
-            insert_count_increment(State#h3{
-                qpack = Table1, uni = Uni#{StreamId => {qpack_encoder, Pending}}
-            });
+            unblock(
+                insert_count_increment(State#h3{
+                    qpack = Table1, uni = Uni#{StreamId => {qpack_encoder, Pending}}
+                })
+            );
         {error, _} ->
             {conn_error, ?H3_QPACK_ENCODER_STREAM_ERROR, ~"invalid QPACK encoder instruction"}
     end.
 
 %% An Insert Count Increment (RFC 9204 §4.4.3) bringing the encoder's Known
 %% Received Count up to every insert applied so far, sent once per chunk
-%% of the encoder stream that added any. The encoder references an entry
-%% only once it knows the entry arrived (we allow no blocked streams), so
-%% it must hear of each insert, and this is how.
+%% of the encoder stream that added any. It goes out before the Section
+%% Acknowledgments of the streams those inserts unblock (`unblock/1`), as
+%% the decoder stream has to start with one (`open_decoder_stream/2`). An
+%% encoder that may not risk blocking a stream references only entries it
+%% knows arrived, so it must hear of each insert, and this is how.
 -spec insert_count_increment(#h3{}) -> handle_result().
 insert_count_increment(#h3{qpack = Table} = State) ->
     case roadrunner_qpack_table:take_increment(Table) of
@@ -932,19 +1103,22 @@ decode_section(#h3{qpack = Table} = State, StreamId, Block) ->
 %% (RFC 9114 §6.2.1, §7.2.1); for any other stream (a request stream, a
 %% not-yet-typed or unknown uni stream) it just drops the per-stream
 %% state we hold. A reset request stream also gets a QPACK Stream
-%% Cancellation (RFC 9204 §4.4.2): sections on it may be undecoded.
+%% Cancellation (RFC 9204 §4.4.2): sections on it may be undecoded. A
+%% blocked one stops being blocked (§2.2.2.2).
 -spec handle_stream_reset(#h3{}, non_neg_integer()) -> handle_result().
-handle_stream_reset(#h3{uni = Uni, streams = Streams, worker_pids = WorkerPids} = State, StreamId) ->
+handle_stream_reset(#h3{uni = Uni} = State0, StreamId) ->
     case Uni of
         #{StreamId := UniState} ->
             case uni_reset(UniState) of
                 critical ->
                     {conn_error, ?H3_CLOSED_CRITICAL_STREAM, ~"peer reset a critical stream"};
                 noncritical ->
-                    State#h3{uni = maps:remove(StreamId, Uni)}
+                    State0#h3{uni = maps:remove(StreamId, Uni)}
             end;
         _ ->
-            ok = stream_cancellation(State, StreamId),
+            ok = stream_cancellation(State0, StreamId),
+            #h3{streams = Streams, worker_pids = WorkerPids} =
+                State = not_blocked(State0, StreamId),
             case WorkerPids of
                 #{StreamId := WorkerPid} ->
                     %% Peer cancelled a dispatched request stream. Tell the
@@ -1018,6 +1192,7 @@ new_request_stream(BodyCap) ->
 -type decode_result() ::
     {ok, map()}
     | {ok, map(), {section_ack, pos_integer()}}
+    | {blocked, pos_integer(), map()}
     | too_large
     | headers_too_large
     | {conn_error, non_neg_integer(), binary()}.
@@ -1027,9 +1202,12 @@ new_request_stream(BodyCap) ->
 %% accumulated request. The undecoded remainder is stashed in `buf` for
 %% the next `stream_data` message. `{ok, Stream, {section_ack, Ric}}` means
 %% trailers that use the QPACK dynamic table were decoded and are owed a
-%% Section Acknowledgment. `Qpack` is the connection's dynamic table, which
-%% a field section decoded here (`raise_body_cap/5`, trailers) resolves
-%% against; the 3- and 4-arity forms use an empty one.
+%% Section Acknowledgment. `{blocked, Ric, Stream}` means a field section
+%% needs inserts the table has not received (RFC 9204 §2.2.1): its HEADERS
+%% frame and everything after it are left in `buf`, unread, for when they
+%% have. `Qpack` is the connection's dynamic table, which a field section
+%% decoded here (`raise_body_cap/5`, trailers) resolves against; the 3- and
+%% 4-arity forms use an empty one.
 -spec decode_request_frames(binary(), map(), roadrunner_conn:proto_opts()) -> decode_result().
 decode_request_frames(Buf, Stream, ProtoOpts) ->
     decode_request_frames(Buf, Stream, ProtoOpts, ?MAX_HEADER_BLOCK).
@@ -1053,6 +1231,8 @@ decode_request_frames(Buf, Stream, ProtoOpts, MaxHdrBlock, Qpack) ->
                         decode_request_frames(Rest, Stream1, ProtoOpts, MaxHdrBlock, Qpack),
                         SectionAck
                     );
+                {blocked, Ric} ->
+                    {blocked, Ric, Stream#{buf := Buf}};
                 Other ->
                     Other
             end;
@@ -1087,7 +1267,9 @@ with_section_ack(Other, _SectionAck) -> Other.
 %% not surfaced by the buffered path. Trailers that use the QPACK dynamic
 %% table (first byte, the encoded Required Insert Count, not 0) are decoded
 %% all the same, so they can be acknowledged and the encoder can let go of
-%% the entries they reference (RFC 9204 §2.2.2.1).
+%% the entries they reference (RFC 9204 §2.2.2.1). A field section that
+%% needs inserts not received yet is `{blocked, Ric}` (§2.2.1), checked from
+%% its prefix alone for request headers, which are decoded later.
 -spec apply_frame(
     roadrunner_quic_h3_frame:frame(),
     map(),
@@ -1097,6 +1279,7 @@ with_section_ack(Other, _SectionAck) -> Other.
 ) ->
     {ok, map()}
     | {ok, map(), {section_ack, pos_integer()}}
+    | {blocked, pos_integer()}
     | too_large
     | headers_too_large
     | {conn_error, non_neg_integer(), binary()}.
@@ -1106,6 +1289,17 @@ apply_frame(
     byte_size(Block) > MaxHdrBlock
 ->
     headers_too_large;
+apply_frame(
+    {headers, <<Eric, _/binary>> = Block},
+    #{frame_state := expecting_headers} = Stream,
+    _ProtoOpts,
+    _MaxHdr,
+    Qpack
+) when Eric =/= 0 ->
+    case roadrunner_qpack:blocked(Block, Qpack) of
+        ok -> {ok, Stream#{header_block := Block, frame_state := expecting_data}};
+        {blocked, _Ric} = Blocked -> Blocked
+    end;
 apply_frame(
     {headers, Block}, #{frame_state := expecting_headers} = Stream, _ProtoOpts, _MaxHdr, _Qpack
 ) ->
@@ -1119,6 +1313,7 @@ apply_frame(
 ) when Eric =/= 0 ->
     case roadrunner_qpack:decode(Trailers, Qpack) of
         {ok, _Trailers, Ric} -> {ok, Stream#{frame_state := expecting_done}, {section_ack, Ric}};
+        {error, {qpack, blocked, Ric}} -> {blocked, Ric};
         {error, _} -> qpack_decompression_failed()
     end;
 apply_frame(
@@ -1719,8 +1914,21 @@ closed_reason(Reason) -> {transport, Reason}.
 %% client's FIN or reset frees it (`handle_request_stream/4`,
 %% `handle_stream_reset/2`), even once the stream's worker is gone. As the
 %% rest of its frames go unread, trailers among them, the encoder gets a
-%% QPACK Stream Cancellation (RFC 9204 §4.4.2).
+%% QPACK Stream Cancellation (RFC 9204 §4.4.2). So does a manual-mode
+%% stream whose worker is done while its trailers are blocked; the FIN it
+%% may have held decides whether its client is still sending.
 -spec drop_stream(#h3{}, non_neg_integer()) -> #h3{}.
+drop_stream(#h3{blocked = Blocked, streams = Streams} = State, StreamId) when
+    is_map_key(StreamId, Blocked)
+->
+    #{StreamId := #{blocked := {_Ric, Fin, _Held}}} = Streams,
+    #h3{streams = #{StreamId := Stream} = Streams1} = State1 = forget_blocked(State, StreamId),
+    ok =
+        case Fin of
+            true -> stream_cancellation(State1, StreamId);
+            false -> ok
+        end,
+    drop_stream(State1#h3{streams = Streams1#{StreamId := Stream#{fin := Fin}}}, StreamId);
 drop_stream(#h3{conn = Conn, streams = Streams} = State, StreamId) ->
     case Streams of
         #{StreamId := #{frame_state := discarding}} ->

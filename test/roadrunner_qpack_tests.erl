@@ -348,8 +348,8 @@ required_insert_count_wraps_test() ->
         fun(_, Acc) -> insert(~"", ~"", Acc) end, table(100), lists:seq(1, 10)
     ),
     ?assertEqual({ok, [{~"", ~""}], 9}, ?M:decode(<<4, 16#00, 16#80>>, Ten)),
-    %% An encoded 2 reads as 13, past the 10 inserts: a section that would
-    %% block, which no blocked streams allows (§2.1.2).
+    %% An encoded 2 reads as 13, past the 10 inserts: a section that has to
+    %% wait for 3 more (§2.1.2).
     ?assertEqual({error, {qpack, blocked, 13}}, ?M:decode(<<2, 16#00, 16#80>>, Ten)),
     %% Past 2 * MaxEntries no encoder could have sent it.
     ?assertEqual(
@@ -375,6 +375,19 @@ required_insert_count_invalid_test() ->
     ),
     %% An integer that runs out.
     ?assertEqual({error, {qpack, bad_integer}}, ?M:decode(<<16#FF>>, Empty)).
+
+blocked_test() ->
+    %% Only the prefix is read (§2.2.1): a Required Insert Count past the
+    %% inserts received blocks, one within them does not, and a prefix that
+    %% does not decode is left to the decoder to report.
+    Ten = lists:foldl(
+        fun(_, Acc) -> insert(~"", ~"", Acc) end, table(100), lists:seq(1, 10)
+    ),
+    ?assertEqual({blocked, 13}, ?M:blocked(<<2, 16#00, 16#80>>, Ten)),
+    ?assertEqual(ok, ?M:blocked(<<4, 16#00, 16#80>>, Ten)),
+    ?assertEqual(ok, ?M:blocked(<<4>>, Ten)),
+    ?assertEqual(ok, ?M:blocked(<<7, 0>>, Ten)),
+    ?assertEqual(ok, ?M:blocked(<<16#FF>>, Ten)).
 
 base_test() ->
     Table = two_entries(),

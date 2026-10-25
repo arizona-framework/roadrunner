@@ -24,7 +24,7 @@
 %% function-clause dispatch, mirroring `roadrunner_http2_hpack`'s static
 %% table (the BEAM turns it into a jump table, no `persistent_term` read).
 
--export([encode/1, decode/1, decode/2]).
+-export([encode/1, decode/1, decode/2, blocked/2]).
 -export([encoder_instructions/2]).
 -export([section_acknowledgment/1, stream_cancellation/1, insert_count_increment/1]).
 
@@ -147,11 +147,11 @@ decode(Data) ->
 Decode a QPACK field section against the connection's dynamic table,
 returning the headers and the section's Required Insert Count (RFC 9204
 §4.5.1.1): 0 for a static-only section, which needs no Section
-Acknowledgment (§4.4.1). This side advertises
-SETTINGS_QPACK_BLOCKED_STREAMS = 0, so a section that needs inserts the
-table has not received yet is an error rather than a blocked stream
-(§2.1.2), as is a reference to an evicted entry or to one at or past the
-Required Insert Count (§2.2.3). Every error maps to
+Acknowledgment (§4.4.1). A section that needs inserts the table has not
+received yet is `{error, {qpack, blocked, RequiredInsertCount}}`: the
+caller checks for that first (`blocked/2`) and holds the stream until they
+arrive (§2.2.1). A reference to an evicted entry or to one at or past the
+Required Insert Count (§2.2.3) is an error too. Every other error maps to
 H3_QPACK_DECOMPRESSION_FAILED.
 """.
 -spec decode(binary(), roadrunner_qpack_table:t()) ->
@@ -172,11 +172,27 @@ decode(<<B, Rest/binary>>, Table) ->
 decode(<<>>, _Table) ->
     {error, {qpack, truncated}}.
 
+-doc """
+Whether a field section that uses the dynamic table (its first byte, the
+Encoded Insert Count, is not 0) has to wait for inserts the table has not
+received yet (RFC 9204 §2.2.1): `{blocked, RequiredInsertCount}` when so,
+else `ok`. A prefix that does not decode is `ok` as well, as decoding the
+section then reports the error. Only the prefix is read.
+""".
+-spec blocked(<<_:8, _:_*8>>, roadrunner_qpack_table:t()) -> ok | {blocked, pos_integer()}.
+blocked(<<B, Rest/binary>>, Table) ->
+    maybe
+        {ok, Encoded, _} ?= integer(B, 16#FF, Rest),
+        {error, {qpack, blocked, Ric}} ?= required_insert_count(Encoded, Table),
+        {blocked, Ric}
+    else
+        _ -> ok
+    end.
+
 %% Reconstruct the Required Insert Count from its encoded form (RFC 9204
 %% §4.5.1.1), which the encoder sent modulo `2 * MaxEntries`. A value no
-%% conformant encoder could produce is an error, and so is one past the
-%% inserts received: with no blocked streams allowed the section cannot
-%% wait for them (§2.1.2).
+%% conformant encoder could produce is an error. One past the inserts
+%% received is `blocked`: the section has to wait for them (§2.1.2).
 -spec required_insert_count(pos_integer(), roadrunner_qpack_table:t()) ->
     {ok, pos_integer()} | {error, decode_error()}.
 required_insert_count(Encoded, Table) ->
