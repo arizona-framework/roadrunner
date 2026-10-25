@@ -95,6 +95,9 @@ Common Ranch and Cowboy options and where they live in Roadrunner:
 Notable differences:
 
 - `protocols` defaults to `[http1]`, so list `http2` (and `http3`) to serve them
+- `max_clients` closes a connection over the cap right away, where Ranch's
+  `max_connections` leaves it waiting in the backlog; its default is 16384,
+  not 1024
 - HTTP/3 needs `tls` and runs over UDP on the same port number
 - Without `tls`, a listener serves either HTTP/1.1 or HTTP/2 (prior
   knowledge), not both
@@ -233,7 +236,7 @@ name.
 | `cowboy_req:header(<<"user-agent">>, Req)` | `roadrunner_req:header(~"user-agent", Req)` |
 | `cowboy_req:headers(Req)` | `roadrunner_req:headers(Req)`, a list of `{Name, Value}` |
 | `cowboy_req:parse_cookies(Req)` | `roadrunner_req:parse_cookies(Req)` |
-| `cowboy_req:has_body(Req)` | `roadrunner_req:has_body(Req)` |
+| `cowboy_req:has_body(Req)` | `roadrunner_req:has_body(Req)` (with `body_buffering => manual`, `false` until the body is read) |
 | `cowboy_req:read_body(Req)` | `roadrunner_req:read_body(Req)` |
 | `cowboy_req:read_urlencoded_body(Req)` | `roadrunner_req:read_form(Req)` |
 | `cowboy_req:peer(Req)` | `roadrunner_req:peer(Req)` |
@@ -381,7 +384,7 @@ handle(Req) ->
 handle_info(eof, _Push, State) ->
     {stop, State};
 handle_info({event, Data}, Push, State) ->
-    _ = Push(Data),
+    _ = Push(roadrunner_sse:event(Data)),
     {ok, State};
 handle_info(_Msg, _Push, State) ->
     {ok, State}.
@@ -389,8 +392,10 @@ handle_info(_Msg, _Push, State) ->
 
 The status and headers go out when the loop starts. Keep a catch-all clause:
 Roadrunner also sends `{roadrunner_disconnect, Reason}` when the client goes
-away and `{roadrunner_drain, Deadline}` when the listener drains.
-`roadrunner_sse` builds Server-Sent Events frames for `Push`.
+away and, on HTTP/1.1, `{roadrunner_drain, Deadline}` when the listener
+drains (on HTTP/2 and HTTP/3 the connection sends GOAWAY instead, and the loop
+gets no drain message). `roadrunner_sse` builds Server-Sent Events frames for
+`Push`.
 
 ### Sending files
 
@@ -508,12 +513,12 @@ websocket_init(State) ->
 websocket_handle(Frame = {text, _}, State) ->
     {[Frame], State};
 websocket_handle(_Frame, State) ->
-    {ok, State}.
+    {[], State}.
 
 websocket_info({log, Text}, State) ->
     {[{text, Text}], State};
 websocket_info(_Info, State) ->
-    {ok, State}.
+    {[], State}.
 ```
 
 In Roadrunner a handler returns `{websocket, Module, State}`, and `Module`
@@ -552,7 +557,7 @@ handle_info(_Info, State) ->
 | `{Frames, State}` | `{reply, Frames, State}` |
 | `{[], State, hibernate}` | `{ok, State, [hibernate]}` |
 | `{[{close, 1000, Reason}], State}` | `{close, 1000, Reason, State}` |
-| `{stop, State}` | `{close, State}` |
+| `{stop, State}` (closes with code 1000) | `{close, 1000, ~"", State}`, or `{close, State}` for a close frame with no code |
 
 Notable differences:
 
@@ -605,8 +610,12 @@ Notable differences:
 - There is no single-file form like `{priv_file, ...}` or `{file, ...}`. Use a
   small handler that returns a `{sendfile, ...}` response (see
   [Sending files](#sending-files))
-- The MIME type comes from a built-in table of common web types, and there is
-  no `mimetypes` or `etag` option to change it
+- The MIME type comes from a small built-in table (html, css, js, json, png,
+  jpg and jpeg, gif, svg, ico, txt). Any other extension, fonts and `.wasm`
+  included, is served as `application/octet-stream`, and there is no
+  `mimetypes` or `etag` option to change it. Serve other types from your own
+  handler (see [Sending files](#sending-files)) or set `content-type` in a
+  middleware
 
 ## Events and observability
 
@@ -655,6 +664,12 @@ handler, `roadrunner_event_noop`, drops every event. End `handle_event/2`
 with a catch-all clause, since new events can be added. See
 `roadrunner_event_handler` for the full list of events.
 
+Router `404` and `405` answers fire no `request_start` or `request_stop`. If
+your metrics count them, as `cowboy_metrics_h` does, add a catch-all route
+such as `{~"/*path", not_found_handler, []}` at the end of your routes. That
+handler then also gets requests whose method a route does not allow, so it
+answers those instead of the router's `405`.
+
 Each request also sets a `request_id` in the `logger` process metadata, and
 `roadrunner_listener:info/1` returns live counters such as `active_clients`
 and `requests_served`.
@@ -677,16 +692,23 @@ cover each one.
   (HTTP/2 server push): not available
 - **`read_part/1` and `read_part_body/1`** (reading multipart one part at a
   time): `read_form/1` parses a multipart body after reading all of it
-- **`cowboy_req:cast/2`** and reading the body as messages: use
-  `body_buffering => manual` and `read_body/2` with `length`
+- **`cowboy_req:cast/2`** (messages to stream handlers): there are no stream
+  handlers. To read a body piece by piece, use `body_buffering => manual` and
+  `read_body/2` with `length`
 - **Loop handler timeouts** (`{cowboy_loop, Req, State, Timeout}`): start a
-  timer with `erlang:send_after/3` in `handle/1` and handle the message in
-  `handle_info/3`
+  timer with `erlang:send_after/3` in `handle/1`, and cancel and restart it in
+  `handle_info/3` on each message to match Cowboy's idle timeout.
+  `{cowboy_loop, Req, State, hibernate}` has no equivalent
 - **`cowboy_decompress_h`** and **`cowboy_tracer_h`**: no built-in version;
   a middleware can cover your own cases
 - **`terminate/3`** in handlers and WebSocket handlers: there is no such
   callback
 - **WebSocket idle timeout** (`idle_timeout`): there is no option for it
+- **WebSockets over HTTP/2 and HTTP/3**: a `{websocket, ...}` response on
+  those protocols answers `501`; WebSocket clients connect over HTTP/1.1
+- **`cowboy_req:cert/1`, `sock/1` and `port/1`** (TLS client certificate,
+  local address, port): no reader for them. The port can be read from the
+  `host` header
 - **Middleware `{suspend, M, F, A}`**: not available
 - **`cowboy:set_env/3`** for values other than routes: keep them in your own
   application env or in route state
