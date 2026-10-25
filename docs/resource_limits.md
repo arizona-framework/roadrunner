@@ -107,14 +107,17 @@ Response headers are held to the client's own limit: a client that sends
 §6.5.2), counted as name + value + 32 per field, `:status` and the auto
 headers (`date`, `alt-svc`) included. A handler response whose headers
 are over it is answered `500 Internal Server Error` instead, before
-anything is sent, and the error is logged. Trailers over it come after
-the status is sent, so they reset the stream with `INTERNAL_ERROR`, as
-does a limit too small for even the 500. A client may send a new limit in
-a later SETTINGS frame; each response is held to the one in force when it
-goes out. With no limit sent there is none. The server's own short
-answers (`413`, `431`, `429`, `503`, the interim `100`) are not checked:
-their few fields are far below any real limit. HTTP/3 does the same with
-`SETTINGS_MAX_FIELD_SECTION_SIZE` (below).
+anything is sent, and the error is logged; the request's telemetry and
+events report the `500`. Trailers over it come after the status is sent,
+so they reset the stream with `INTERNAL_ERROR`, as does a limit too small
+for even the 500 or for one of the server's other answers (`404`, `405`,
+`413`). Each request is held to the limit known when its handler starts:
+a lower limit in a later SETTINGS frame holds for the requests after it
+(the setting is advisory, RFC 9113 §10.5.1). With no limit sent there is
+none. The connection's own short answers (`413`, `431`, `429`, `503`,
+the interim `100`) are not checked: their few fields are far below any
+real limit. HTTP/3 does the same with `SETTINGS_MAX_FIELD_SECTION_SIZE`
+(below).
 
 ## HTTP/3 framing limits
 

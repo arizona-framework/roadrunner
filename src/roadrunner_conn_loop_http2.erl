@@ -52,11 +52,14 @@
 %%
 %% Client header limit (RFC 9113 §6.5.2): a client that sent
 %% SETTINGS_MAX_HEADER_LIST_SIZE may treat a larger header section as
-%% malformed, so the conn keeps handler responses within the last value
-%% it sent. The section is sized before it is HPACK-encoded, so one over
-%% the limit never touches the encoder's dynamic table. Headers over it
-%% are answered 500 instead (nothing is sent yet), and trailers over it,
-%% or a 500 that is itself over it, reset the stream with INTERNAL_ERROR.
+%% malformed. The conn records the value and hands it to each worker it
+%% spawns, and the worker keeps its response within it (a 500 in place of
+%% headers over it; for trailers over it a crash, which the `'DOWN'` turns
+%% into a stream reset), so the status the worker reports is the one
+%% sent. The conn itself does not check. The
+%% setting is advisory (§10.5.1): a value lowered by a later SETTINGS
+%% frame holds for the workers spawned after it, not those already
+%% running.
 %%
 %% Response shapes supported:
 %%
@@ -355,8 +358,8 @@
     %% largest response header section it says it will take; `infinity`
     %% (no limit, the §6.5.2 default) until a SETTINGS frame carries it.
     %% Not to be confused with `max_header_list_size`, our own limit on
-    %% request headers. Applied when a handler response's headers or
-    %% trailers are sent (`fits_peer_limit/2`).
+    %% request headers. Handed to each worker as it is spawned
+    %% (`roadrunner_http2_stream_worker:start/5`), which applies it.
     peer_max_header_list_size = infinity :: non_neg_integer() | infinity,
     %% Set to `true` once a `{roadrunner_drain, _}` message has
     %% been observed (Phase H9). In drain mode we've already sent
@@ -1109,7 +1112,7 @@ finalize_headers(
                     %% connection is intact), and drop the stream — no worker
                     %% is dispatched until END_STREAM.
                     Resp = ~"Request Header Fields Too Large",
-                    State2 = send_own_response(
+                    State2 = encode_and_send_response_atomic(
                         State1,
                         StreamId,
                         431,
@@ -1167,9 +1170,7 @@ body_follows(StreamId, State) ->
     dispatch_reading(StreamId, false, State).
 
 %% The interim `100 (Continue)`: a HEADERS frame with `:status` alone and
-%% no END_STREAM, the final response following on the same stream. Its
-%% one 42-byte field is not checked against the client's header limit,
-%% like this process's other fixed answers (`send_own_response/6`).
+%% no END_STREAM, the final response following on the same stream.
 -spec send_continue(#loop{}, stream_id()) -> #loop{}.
 send_continue(#loop{hpack_enc = Enc} = State, StreamId) ->
     {Block, Enc1} = roadrunner_http2_hpack:encode([{~":status", ~"100"}], Enc),
@@ -1183,7 +1184,7 @@ send_continue(#loop{hpack_enc = Enc} = State, StreamId) ->
 -spec reject_too_large(#loop{}, stream_id()) -> no_return().
 reject_too_large(State, StreamId) ->
     Resp = ~"Payload Too Large",
-    State1 = send_own_response(
+    State1 = encode_and_send_response_atomic(
         State, StreamId, 413, [{~"content-type", ~"text/plain"}], Resp, byte_size(Resp)
     ),
     _ = send_rst_stream(State1, StreamId, no_error),
@@ -1628,7 +1629,11 @@ dispatch_request(
                     of
                         true ->
                             {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
-                                self(), StreamId, Req, ProtoOpts
+                                self(),
+                                StreamId,
+                                Req,
+                                ProtoOpts,
+                                State#loop.peer_max_header_list_size
                             ),
                             Stream1 = Stream#{
                                 worker_pid := WorkerPid,
@@ -1670,7 +1675,7 @@ dispatch_request(
             %% HTTP/1.1, then the stream closed: 501 for a CONNECT (no
             %% tunnels), 417 for an expectation other than `100-continue`.
             Status = roadrunner_conn:parse_error_status(Reason),
-            State1 = send_own_response(State, StreamId, Status, [], ~"", 0),
+            State1 = encode_and_send_response_atomic(State, StreamId, Status, [], ~"", 0),
             _ = send_rst_stream(State1, StreamId, no_error),
             frame_loop(remove_stream(State1#loop{req_id_buffer = NewBuf}, StreamId));
         {error, _Reason} ->
@@ -1719,45 +1724,34 @@ handle_send_response(State, StreamId, Status, Headers, Body, BodyLen) ->
         not_open ->
             State;
         Stream ->
-            Fields = response_fields(State, Status, Headers),
-            case fits_peer_limit(Fields, State) of
-                true ->
-                    send_response(State, Stream, StreamId, Fields, Body, BodyLen);
-                false ->
-                    {_, State1} = answer_over_limit(State, Stream, StreamId, Fields),
-                    State1
-            end
-    end.
-
-%% Send a buffered response whose field section is built and within the
-%% client's limit.
--spec send_response(
-    #loop{}, map(), stream_id(), roadrunner_http:headers(), iodata(), non_neg_integer()
-) -> #loop{}.
-send_response(State, Stream, StreamId, Fields, Body, BodyLen) ->
-    case BodyLen of
-        0 ->
-            %% Empty body — single HEADERS frame with END_STREAM,
-            %% same wire shape as `handle_send_headers/_, true)`.
-            encode_and_send_headers(State, StreamId, Fields, true);
-        _ ->
-            %% Short-circuit: skip the `window_budget/2` lookup
-            %% when the body already won't fit in one frame.
-            case
-                BodyLen =< ?MAX_FRAME_SIZE andalso
-                    window_budget(State, Stream) >= BodyLen
-            of
-                true ->
-                    encode_and_send_response_atomic(State, StreamId, Fields, Body, BodyLen);
-                false ->
-                    %% Body too big for one frame OR window too
-                    %% narrow — emit HEADERS now, hand the body to
-                    %% `try_send_data` which fragments / queues it.
-                    State1 = encode_and_send_headers(State, StreamId, Fields, false),
-                    #{StreamId := Stream1} = State1#loop.streams,
-                    try_send_data(
-                        State1, Stream1, StreamId, undefined, undefined, Body, BodyLen, true
-                    )
+            case BodyLen of
+                0 ->
+                    %% Empty body — single HEADERS frame with END_STREAM,
+                    %% same wire shape as `handle_send_headers/_, true)`.
+                    encode_and_send_headers(State, StreamId, Status, Headers, true);
+                _ ->
+                    %% Short-circuit: skip the `window_budget/2` lookup
+                    %% when the body already won't fit in one frame.
+                    case
+                        BodyLen =< ?MAX_FRAME_SIZE andalso
+                            window_budget(State, Stream) >= BodyLen
+                    of
+                        true ->
+                            encode_and_send_response_atomic(
+                                State, StreamId, Status, Headers, Body, BodyLen
+                            );
+                        false ->
+                            %% Body too big for one frame OR window too
+                            %% narrow — emit HEADERS now, hand the body to
+                            %% `try_send_data` which fragments / queues it.
+                            State1 = encode_and_send_headers(
+                                State, StreamId, Status, Headers, false
+                            ),
+                            #{StreamId := Stream1} = State1#loop.streams,
+                            try_send_data(
+                                State1, Stream1, StreamId, undefined, undefined, Body, BodyLen, true
+                            )
+                    end
             end
     end.
 
@@ -1766,27 +1760,10 @@ handle_send_headers(State, From, Ref, StreamId, Status, Headers, EndStream) ->
         not_open ->
             _ = (From ! {h2_stream_reset, StreamId}),
             State;
-        Stream ->
-            Fields = response_fields(State, Status, Headers),
-            case fits_peer_limit(Fields, State) of
-                true ->
-                    State1 = encode_and_send_headers(State, StreamId, Fields, EndStream),
-                    _ = (From ! {h2_send_ack, Ref}),
-                    State1;
-                false ->
-                    %% The 500 ends the stream, so the worker is told it
-                    %% was reset instead of acked: it exits with
-                    %% `stream_reset` before the handler streams a body
-                    %% that has nowhere to go (`handle_worker_down/3`). A
-                    %% reset stream has told the worker already.
-                    case answer_over_limit(State, Stream, StreamId, Fields) of
-                        {answered, State1} ->
-                            _ = (From ! {h2_stream_reset, StreamId}),
-                            State1;
-                        {reset, State1} ->
-                            State1
-                    end
-            end
+        _Stream ->
+            State1 = encode_and_send_headers(State, StreamId, Status, Headers, EndStream),
+            _ = (From ! {h2_send_ack, Ref}),
+            State1
     end.
 
 handle_send_data(State, From, Ref, StreamId, Data, Size, EndStream) ->
@@ -1804,64 +1781,10 @@ handle_send_trailers(State, From, Ref, StreamId, Trailers) ->
             _ = (From ! {h2_stream_reset, StreamId}),
             State;
         _Stream ->
-            case fits_peer_limit(Trailers, State) of
-                true ->
-                    State1 = encode_and_send_trailers(State, StreamId, Trailers),
-                    _ = (From ! {h2_send_ack, Ref}),
-                    State1;
-                false ->
-                    %% RFC 9113 §6.5.2: trailers over the client's limit
-                    %% come after the status, so they cannot become a 500:
-                    %% reset the stream instead, which also tells the
-                    %% worker (`reset_stream/2`).
-                    ok = log_over_limit(Trailers, State),
-                    reset_internal_error(State, StreamId)
-            end
+            State1 = encode_and_send_trailers(State, StreamId, Trailers),
+            _ = (From ! {h2_send_ack, Ref}),
+            State1
     end.
-
-%% Whether a response field section fits the client's
-%% SETTINGS_MAX_HEADER_LIST_SIZE. No limit, the common case, is a record
-%% match; a limit sizes the section once.
--spec fits_peer_limit(roadrunner_http:headers(), #loop{}) -> boolean().
-fits_peer_limit(_Fields, #loop{peer_max_header_list_size = infinity}) ->
-    true;
-fits_peer_limit(Fields, #loop{peer_max_header_list_size = Limit}) ->
-    roadrunner_http:fits_header_list_size(Fields, Limit).
-
-%% RFC 9113 §6.5.2: the client will likely refuse a handler response
-%% whose headers are over its SETTINGS_MAX_HEADER_LIST_SIZE. Nothing of it
-%% is sent yet, so answer 500, as for a header with CR/LF/NUL, or, when
-%% even the 500 is over the limit, reset the stream with INTERNAL_ERROR.
-%% The fields were never HPACK-encoded, so the encoder's dynamic table
-%% holds nothing of them.
--spec answer_over_limit(#loop{}, map(), stream_id(), roadrunner_http:headers()) ->
-    {answered | reset, #loop{}}.
-answer_over_limit(State, Stream, StreamId, Fields) ->
-    ok = log_over_limit(Fields, State),
-    Fields500 = response_fields(State, 500, [{~"content-type", ~"text/plain"}]),
-    case fits_peer_limit(Fields500, State) of
-        true ->
-            Body = ~"Internal Server Error",
-            {answered, send_response(State, Stream, StreamId, Fields500, Body, byte_size(Body))};
-        false ->
-            {reset, reset_internal_error(State, StreamId)}
-    end.
-
-%% Only the sizes are logged, never the fields.
--spec log_over_limit(roadrunner_http:headers(), #loop{}) -> ok.
-log_over_limit(Fields, #loop{peer_max_header_list_size = Limit}) ->
-    logger:error(#{
-        msg => "roadrunner h2 response headers exceed the client's limit",
-        size => roadrunner_http:header_list_size(Fields),
-        limit => Limit
-    }).
-
-%% Reset a stream whose worker is still alive with INTERNAL_ERROR, as for
-%% a worker crash; `reset_stream/2` tells the worker and drops the stream.
--spec reset_internal_error(#loop{}, stream_id()) -> #loop{}.
-reset_internal_error(State, StreamId) ->
-    _ = send_rst_stream(State, StreamId, internal_error),
-    reset_stream(State, StreamId).
 
 handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
     case Refs of
@@ -1880,14 +1803,13 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
                     finish_stream(State1, StreamId);
                 stream_reset ->
                     %% The worker wrote to a stream whose response had
-                    %% ended (a 500 sent in place of headers over the
-                    %% client's limit, a handler writing after its last
-                    %% frame): `stream_open/2` told it the stream was
-                    %% reset, so it stopped. A reset of ours demonitors
-                    %% first, so it never gets here. The response on the
-                    %% wire is complete, so the stream ends as for a
-                    %% normal exit, never with an RST_STREAM after its
-                    %% END_STREAM.
+                    %% already ended (a stream fun sending after its `fin`):
+                    %% `stream_open/2` told it the stream was reset, so it
+                    %% stopped. A reset of ours demonitors first, so it
+                    %% never gets here. The response on the wire is
+                    %% complete, so the stream ends as for a normal exit,
+                    %% never with an RST_STREAM after its END_STREAM (RFC
+                    %% 9113 §5.1: no frames on a closed stream).
                     finish_stream(State1, StreamId);
                 _ ->
                     abort_stream(State1, StreamId, internal_error)
@@ -1944,26 +1866,26 @@ stream_open(#loop{streams = Streams}, StreamId) ->
         #{} -> not_open
     end.
 
-%% The response field section as sent: `:status` + the handler's headers,
-%% with the connection-specific fields RFC 9113 §8.2.2 forbids h2 from
-%% generating stripped and the auto headers (`date`, `alt-svc`) added. Its
-%% size is what the client's SETTINGS_MAX_HEADER_LIST_SIZE bounds, so it is
-%% built before, and apart from, the HPACK encode.
-%%
-%% Handler-supplied header names MUST already be lowercase per RFC 9113
-%% §8.1.2 (see `roadrunner_handler:response/0`), and the worker already
-%% answered 500 for any CR/LF/NUL (`roadrunner_stream_worker`), so a
-%% handler bug cannot crash this process, which every stream shares.
+%% The response field section as sent, built by the function the worker
+%% sizes it with against the client's SETTINGS_MAX_HEADER_LIST_SIZE, so the
+%% two agree (`roadrunner_http2_stream_worker:field_section/3`).
 -spec response_fields(#loop{}, roadrunner_http:status(), roadrunner_http:headers()) ->
     roadrunner_http:headers().
 response_fields(#loop{alt_svc = AltSvc}, Status, Headers) ->
-    WireHeaders = roadrunner_http:strip_connection_specific_fields(Headers),
-    [{~":status", integer_to_binary(Status)} | roadrunner_http:auto_headers(WireHeaders, AltSvc)].
+    roadrunner_http2_stream_worker:field_section(Status, Headers, AltSvc).
 
 %% Encode + write a HEADERS frame (always fits without flow control;
 %% the wire just takes it).
-encode_and_send_headers(#loop{hpack_enc = Enc} = State, StreamId, Fields, EndStream) ->
-    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(Fields, Enc),
+encode_and_send_headers(
+    #loop{hpack_enc = Enc} = State, StreamId, Status, Headers, EndStream
+) ->
+    %% Handler-supplied header names MUST already be lowercase per RFC 9113
+    %% §8.1.2 (see `roadrunner_handler:response/0`), and the worker already
+    %% answered 500 for any CR/LF/NUL (`roadrunner_stream_worker`), so a
+    %% handler bug cannot crash this process, which every stream shares.
+    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(
+        response_fields(State, Status, Headers), Enc
+    ),
     %% `frame:encode` accepts iodata for the header block — skip
     %% the upfront flatten; ssl:send walks the iolist anyway.
     Flags =
@@ -1988,12 +1910,17 @@ encode_and_send_headers(#loop{hpack_enc = Enc} = State, StreamId, Fields, EndStr
 encode_and_send_response_atomic(
     #loop{hpack_enc = Enc, streams = Streams} = State,
     StreamId,
-    Fields,
+    Status,
+    Headers,
     Body,
     BodyLen
 ) ->
     #{StreamId := Stream} = Streams,
-    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(Fields, Enc),
+    %% Names already lowercase per `roadrunner_handler:response/0` contract,
+    %% CR/LF/NUL already answered with 500 by the worker.
+    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(
+        response_fields(State, Status, Headers), Enc
+    ),
     HFrame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04, undefined, HpackBlock}
     ),
@@ -2002,23 +1929,6 @@ encode_and_send_response_atomic(
     State1 = State#loop{hpack_enc = Enc1},
     State2 = consume_send_window(State1, StreamId, Stream, BodyLen),
     close_stream_send_side(State2, StreamId).
-
-%% One of this process's own small answers (413, 431, 429, 503, ...),
-%% sent whole as `encode_and_send_response_atomic/5` does. Only handler
-%% responses are held to the client's SETTINGS_MAX_HEADER_LIST_SIZE: these
-%% few fixed fields come to under 200 bytes, as HTTP/3 does for its own.
--spec send_own_response(
-    #loop{},
-    stream_id(),
-    roadrunner_http:status(),
-    roadrunner_http:headers(),
-    iodata(),
-    non_neg_integer()
-) -> #loop{}.
-send_own_response(State, StreamId, Status, Headers, Body, BodyLen) ->
-    encode_and_send_response_atomic(
-        State, StreamId, response_fields(State, Status, Headers), Body, BodyLen
-    ).
 
 encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
     %% Trailer names already lowercase per `roadrunner_handler:response/0`;
@@ -2374,9 +2284,16 @@ handle_slot(#loop{awaiting_slot = Awaiting, listener_name = ListenerName} = Stat
 %% `withdraw_parked/2` keeps `awaiting_slot` and `streams` in step, so a
 %% grant that still has its parked request always has its stream too.
 -spec spawn_parked(#loop{}, stream_id(), roadrunner_req:request()) -> #loop{}.
-spawn_parked(#loop{streams = Streams, proto_opts = ProtoOpts} = State, StreamId, Req) ->
+spawn_parked(
+    #loop{streams = Streams, proto_opts = ProtoOpts, peer_max_header_list_size = PeerLimit} =
+        State,
+    StreamId,
+    Req
+) ->
     #{StreamId := Stream} = Streams,
-    {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(self(), StreamId, Req, ProtoOpts),
+    {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
+        self(), StreamId, Req, ProtoOpts, PeerLimit
+    ),
     State#loop{
         streams = Streams#{StreamId := Stream#{worker_pid := WorkerPid, worker_ref := MonRef}},
         worker_refs = (State#loop.worker_refs)#{MonRef => StreamId}
@@ -2475,9 +2392,9 @@ apply_header_table_size(Params, #loop{hpack_enc = Enc} = State) ->
     end.
 
 %% RFC 9113 §6.5.2: SETTINGS_MAX_HEADER_LIST_SIZE (id 6) is the most
-%% header bytes the peer will take in one section. It is advisory, but a
-%% peer may treat a larger one as malformed, so we keep to the last value
-%% it sent (§6.5.3), checked as each handler response goes out.
+%% header bytes the peer will take in one section. It is advisory
+%% (§10.5.1), but a peer may treat a larger one as malformed, so we keep
+%% the last value it sent (§6.5.3) for the workers spawned from now on.
 -spec apply_peer_max_header_list_size(
     [{non_neg_integer(), non_neg_integer()}], #loop{}
 ) -> #loop{}.
@@ -2567,7 +2484,7 @@ rate_limit_refused(
 %% wanted (RFC 9113 §8.1).
 -spec retry_later(#loop{}, stream_id(), 429 | 503, pos_integer()) -> #loop{}.
 retry_later(State, StreamId, Status, RetryAfter) ->
-    State1 = send_own_response(
+    State1 = encode_and_send_response_atomic(
         State, StreamId, Status, [{~"retry-after", integer_to_binary(RetryAfter)}], ~"", 0
     ),
     _ = send_rst_stream(State1, StreamId, no_error),

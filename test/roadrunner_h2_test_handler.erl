@@ -207,24 +207,25 @@ handle(#{target := ~"/big-headers"} = Req) ->
     %% of overhead), over a small client SETTINGS_MAX_HEADER_LIST_SIZE.
     {{200, [{~"x-big", binary:copy(~"v", 200)}], ~"ok"}, Req};
 handle(#{target := ~"/stream/big-headers"} = Req) ->
-    %% The same on a streamed response's headers. The worker tells a test
-    %% observer (if one registered) who it is and waits for it to set up
-    %% its monitor, so the test can see it unwind once its headers are
-    %% answered with 500.
-    ok =
-        case whereis(roadrunner_h2_big_headers_observer) of
-            undefined ->
-                ok;
-            Observer ->
-                Observer ! {big_headers_worker, self()},
-                receive
-                    go -> ok
-                end
-        end,
+    %% The same on a streamed response's headers. The worker answers 500
+    %% before the fun runs, so its `a` never reaches the wire.
     {
         {stream, 200, [{~"x-big", binary:copy(~"v", 200)}], fun(Send) ->
-            Send(~"a", nofin),
-            Send(~"b", fin)
+            Send(~"a", fin)
+        end},
+        Req
+    };
+handle(#{target := ~"/sendfile/big-headers"} = Req) ->
+    {{sendfile, 200, [{~"x-big", binary:copy(~"v", 200)}], {"/dev/null", 0, 0}}, Req};
+handle(#{target := ~"/loop/big-headers"} = Req) ->
+    {{loop, 200, [{~"x-big", binary:copy(~"v", 200)}], 0}, Req};
+handle(#{target := ~"/stream/send-after-fin"} = Req) ->
+    %% A stream fun that sends again after its `fin`: the conn tells the
+    %% worker the stream was reset, and the worker exits `stream_reset`.
+    {
+        {stream, 200, [], fun(Send) ->
+            Send(~"done", fin),
+            Send(~"more", nofin)
         end},
         Req
     };

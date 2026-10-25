@@ -77,8 +77,10 @@ do_send(ConnPid, StreamId, Data, {fin, Trailers}) ->
     %% the worker (so the conn resets just this stream and the malformed
     %% bytes never reach the client) and strips the connection-specific
     %% fields RFC 9113 §8.2.2 forbids. Run it before any of the body goes
-    %% out.
+    %% out, and so the check of the trailers against the client's header
+    %% limit (RFC 9113 §6.5.2), which crashes the same way.
     WireTrailers = roadrunner_http:strip_connection_specific_fields_safe(Trailers),
+    ok = roadrunner_http2_stream_worker:check_trailers(WireTrailers),
     ok = send_nonempty(ConnPid, StreamId, Data),
     ok = sync_send_trailers(ConnPid, StreamId, WireTrailers),
     put(?FIN_KEY, true),
