@@ -89,7 +89,8 @@ directories are still followed by the kernel.
 - `refuse_escapes` (default) — symlinks whose target resolves
   inside `dir` are followed; symlinks pointing outside (e.g. an
   absolute target like `/etc/passwd`, or a relative target with
-  `..` segments) return 404. Stricter than nginx/Apache defaults
+  `..` segments) return 404. Every link of a chain is checked, so
+  a link to an in-docroot link that points outside is refused too. Stricter than nginx/Apache defaults
   but matches what an operator typically wants for a public
   docroot.
 - `follow` — every symlink is followed regardless of where it
@@ -135,6 +136,9 @@ under an `infinity` (or long) TTL.
 %% Caching is opt-in: default is `0` (disabled). See `## Metadata cache`
 %% in the moduledoc above for when to enable and the trade-offs.
 -define(DEFAULT_CACHE_TTL_MS, 0).
+%% The most symlinks the `refuse_escapes` check follows in a leaf's chain,
+%% the kernel's own limit (Linux `MAXSYMLINKS`).
+-define(MAX_SYMLINK_HOPS, 40).
 
 -export([handle/1, cache_clear/0]).
 
@@ -660,36 +664,67 @@ symlink_policy(Req) ->
         _ -> refuse_escapes
     end.
 
-%% Resolve the symlink one level and check the result lives under
-%% `dir`. Symlinks in intermediate path components are not inspected —
-%% the kernel follows those when we eventually open the file. The
-%% threat model is "an attacker plants a leaf symlink to escape", which
-%% is the common case for upload-able directories.
+%% Follow the leaf symlink hop by hop and check every hop lives under
+%% `dir`: a link to an in-docroot link that itself points outside escapes
+%% as surely as a direct one, since the kernel follows the whole chain when
+%% the file is opened. Symlinks in intermediate path components are not
+%% inspected (the kernel follows those too); the threat model is "an
+%% attacker plants a leaf symlink to escape", which is the common case for
+%% upload-able directories.
 -spec target_inside_docroot(file:filename_all(), roadrunner_req:request()) -> boolean().
 target_inside_docroot(FilePath, Req) ->
-    %% `serve_file/2` only calls us after `read_link_info` reported
-    %% `type = symlink`, so `read_link` is expected to succeed —
-    %% we let a TOCTOU race (symlink removed between the two stats)
-    %% crash and bubble up as a 500 instead of silently 404'ing.
-    {ok, Target} = file:read_link(FilePath),
+    #{dir := Dir} = roadrunner_req:state(Req),
+    %% `filename:absname/1` strips trailing slashes (except for the root
+    %% `/` itself, which we don't reasonably support as a docroot anyway),
+    %% so a single appended `/` makes the prefix check an exact directory
+    %% check rather than a sibling-prefix false positive.
+    chain_inside(FilePath, [filename:absname(Dir), $/], ?MAX_SYMLINK_HOPS).
+
+%% Check the symlink `Link` and the rest of its chain. `serve_file/2` only
+%% calls us after `read_link_info` reported `type = symlink` (and each later
+%% hop is read only once `read_link_info` says it is a link), so `read_link`
+%% is expected to succeed: a TOCTOU race (a link removed between the two
+%% stats) crashes and bubbles up as a 500 instead of silently 404ing. A chain
+%% longer than the kernel follows (Linux `MAXSYMLINKS`) is refused: opening
+%% it would fail with `ELOOP` anyway.
+-spec chain_inside(file:filename_all(), iodata(), non_neg_integer()) -> boolean().
+chain_inside(_Link, _Root, 0) ->
+    false;
+chain_inside(Link, Root, Hops) ->
+    {ok, Target} = file:read_link(Link),
+    case hop_inside(Link, Target, Root) of
+        false ->
+            false;
+        Next ->
+            case file:read_link_info(Next, [raw]) of
+                {ok, #file_info{type = symlink}} -> chain_inside(Next, Root, Hops - 1);
+                %% The end of the chain, or a missing target the serve
+                %% path answers 404 for.
+                _ -> true
+            end
+    end.
+
+%% Where the hop from `Link` to `Target` lands, or `false` when it leaves
+%% the docroot. A relative target without any `..` segment lands inside the
+%% directory containing the link, which is inside `dir`. `file:read_link/1`
+%% returns the target as a string even for a binary path, so `..` is matched
+%% in both forms: comparing against the binary alone never matched and let
+%% every `..` link through. An absolute target must sit under `dir`
+%% (`string:prefix/2` accepts chardata, so neither side needs flattening).
+-spec hop_inside(file:filename_all(), file:filename_all(), iodata()) ->
+    file:filename_all() | false.
+hop_inside(Link, Target, Root) ->
     case filename:pathtype(Target) of
         relative ->
-            %% A relative target without any `..` segments must land
-            %% inside the directory containing the symlink, which by
-            %% construction is inside `dir`. The framework runs with
-            %% binary file names (default UTF-8 native encoding), so
-            %% `filename:split/1` yields binaries and the `~".."`
-            %% literal matches directly.
-            not lists:member(~"..", filename:split(Target));
+            case lists:any(fun(S) -> S =:= ".." orelse S =:= ~".." end, filename:split(Target)) of
+                true -> false;
+                false -> filename:join(filename:dirname(Link), Target)
+            end;
         _ ->
-            %% `filename:absname/1` strips trailing slashes (except for
-            %% the root `/` itself, which we don't reasonably support
-            %% as a docroot anyway), so a single appended `/` is enough
-            %% to make `string:prefix/2` an exact directory check
-            %% rather than a sibling-prefix false positive. `string:prefix/2`
-            %% accepts chardata, so neither argument needs flattening.
-            #{dir := Dir} = roadrunner_req:state(Req),
-            string:prefix(Target, [filename:absname(Dir), $/]) =/= nomatch
+            case string:prefix(Target, Root) of
+                nomatch -> false;
+                _ -> Target
+            end
     end.
 
 %% Parse an IMF-fixdate header back into a posix timestamp. Returns

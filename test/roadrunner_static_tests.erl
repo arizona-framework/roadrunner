@@ -389,6 +389,27 @@ static_test_() ->
                 Reply = http_get(Port, ~"/static/dotdot_link.txt"),
                 ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
             end},
+            {"relative .. symlink to an existing file outside is refused", fun() ->
+                Reply = http_get(Port, ~"/static/dotdot_real_link.txt"),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply),
+                ?assertEqual(nomatch, binary:match(Reply, ~"sibling leak"))
+            end},
+            {"relative symlink chained to one that escapes is refused", fun() ->
+                %% Each hop of the chain is checked, not just the first:
+                %% `chain_link.txt` names an in-docroot link, which names
+                %% a file outside.
+                Reply = http_get(Port, ~"/static/chain_link.txt"),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply),
+                ?assertEqual(nomatch, binary:match(Reply, ~"sibling leak"))
+            end},
+            {"symlink loop is refused once the kernel's hop limit is spent", fun() ->
+                Reply = http_get(Port, ~"/static/loop_a.txt"),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
+            end},
+            {"symlink chained to one that stays inside is served", fun() ->
+                Reply = http_get(Port, ~"/static/chain_safe_link.txt"),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply)
+            end},
             {"symlink whose target is a directory still returns 404", fun() ->
                 %% After the symlink-policy gate approves the follow,
                 %% `read_file_info` on the target reports
@@ -1160,6 +1181,24 @@ setup() ->
         filename:join(SiblingDir, "leak.txt"),
         filename:join(Dir, "sibling_attack.txt")
     ),
+    %% Relative `..` symlink to a file that exists outside the docroot: the
+    %% `dotdot_link.txt` target above does not exist, so it would 404 even
+    %% if the `..` check let it through.
+    _ = file:make_symlink(
+        "../" ++ filename:basename(SiblingDir) ++ "/leak.txt",
+        filename:join(Dir, "dotdot_real_link.txt")
+    ),
+    %% A chain whose first hop stays in the docroot and whose second
+    %% leaves it, and one whose every hop stays inside.
+    _ = file:make_symlink(
+        "../" ++ filename:basename(SiblingDir) ++ "/leak.txt",
+        filename:join(Dir, "chain_hop.txt")
+    ),
+    _ = file:make_symlink("chain_hop.txt", filename:join(Dir, "chain_link.txt")),
+    _ = file:make_symlink("chain_safe_hop.txt", filename:join(Dir, "chain_safe_link.txt")),
+    _ = file:make_symlink("loop_b.txt", filename:join(Dir, "loop_a.txt")),
+    _ = file:make_symlink("loop_a.txt", filename:join(Dir, "loop_b.txt")),
+    _ = file:make_symlink("notes.txt", filename:join(Dir, "chain_safe_hop.txt")),
     %% Empty subdirectory — `filename:join` can resolve a path to it,
     %% but `file:read_file_info` reports `type = directory` so the
     %% handler returns 404 instead of trying to send it.
