@@ -147,14 +147,10 @@ changes by profile-share, not headline req/s.
   per-packet work. `stream_data_budget/5` re-encodes the pending ACK frames each
   packet just to size them; caching that size across a burst is a possible
   micro-lever — small
-- TLS handshake is a connection-SETUP lever only, not steady-state: with the
-  loadgen sustaining connections the RSA-2048 CertificateVerify is ~0% of
-  steady-state time (it read ~10% only on the old stall-and-die loadgen). It
-  still dominates connection churn — deploying an ECDSA P-256 cert cuts the
-  signature ~30-60x with no server code change (the server already signs ECDSA;
-  the bench generates RSA-2048), so switch the bench cert + add a deployment
-  note. TLS session tickets / 0-RTT (RFC 8446 §2.2, RFC 9001 §4.6) skip the
-  signature entirely for returning clients — small (cert/note) / large (tickets)
+- TLS session tickets / 0-RTT (RFC 8446 §2.2, RFC 9001 §4.6) for returning
+  clients: a connection-setup lever only, not steady-state. Resumption skips
+  the certificate and its signature, so a returning client's handshake gets
+  cheaper still than the full ECDSA P-256 one the bench now does — large
 
 ### External interop check
 

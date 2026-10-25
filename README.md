@@ -317,6 +317,20 @@ browsers upgrade. For HTTP/2 over plain TCP (prior knowledge), use
 `protocols => [http2]` without `tls`. Without `tls`, a listener serves either
 HTTP/1.1 or HTTP/2, not both.
 
+For the fastest new connections, use an ECDSA P-256 certificate. Each new TLS
+or QUIC connection signs with the certificate's key, and an ECDSA P-256
+signature takes far less CPU than an RSA one, so the server can accept many
+more new connections per second. All current browsers support it. To make a
+self-signed one for testing:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -nodes -days 365 -keyout key.pem -out cert.pem -subj /CN=localhost
+```
+
+For a real domain, ask your certificate authority for an ECDSA key (most ACME
+clients, such as certbot, can request one).
+
 A listener with `tls` starts the `ssl` application itself, so plain HTTP nodes
 never load it. If you build a release that serves TLS, add `ssl` to your
 application's `applications` list so the release includes it.
