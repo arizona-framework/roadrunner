@@ -102,9 +102,6 @@ only). Remaining work:
   the separate `MDA2AV/HttpArena` repo)
 - WebTransport / Extended CONNECT (RFC 9220) and HTTP datagrams
   (RFC 9297)
-- A scheduler-scaled default for the reuseport pool size
-  (`{http3, #{listeners => N}}`, validated `1..1024`, default 8,
-  `1` = no pooling); currently unmeasured
 
 ## Native QUIC transport follow-ups
 
