@@ -12,7 +12,8 @@ Both paths share the same `roadrunner_transport` tagged-socket abstraction.
 
 On `init/1` the listener opens the listen socket, builds the shared
 `roadrunner_conn:proto_opts()` (dispatch + body limits + timeouts +
-`max_clients` counter), and spawn-links `num_acceptors` (default 10)
+`max_clients` counter), and spawn-links `num_acceptors` (default: one per
+online scheduler, at most 10)
 `roadrunner_acceptor` processes that pull from the same listen socket.
 Connection workers are unlinked from the acceptor so a single
 connection crash doesn't take the pool down.
@@ -58,7 +59,9 @@ All duration and interval values in `opts()` are in milliseconds —
 %% Only full ones go, which a client cannot tell from none, so this bounds
 %% how long idle buckets hold memory, not how the limits behave.
 -define(ROUTE_RATE_LIMIT_SWEEP_INTERVAL, 10000).
--define(DEFAULT_NUM_ACCEPTORS, 10).
+%% The most acceptors spawned by default; fewer when there are fewer
+%% online schedulers (`default_num_acceptors/0`).
+-define(MAX_DEFAULT_NUM_ACCEPTORS, 10).
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
 -define(DEFAULT_MAX_CLIENTS, 16384).
 -define(DEFAULT_MAX_CONCURRENT_REQUESTS, infinity).
@@ -152,7 +155,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   precedes the handshake. Default 5 s.
 - `keep_alive_timeout` — idle timeout between requests on a
   keep-alive conn. Default 60 s.
-- `num_acceptors` — size of the acceptor pool. Default 10.
+- `num_acceptors` — size of the acceptor pool. Default: one per online
+  scheduler, at most 10. Every acceptor waits on the same listen socket, so
+  more acceptors than schedulers only adds contention: on one or two
+  schedulers, matching them accepts 35-55% more connections a second than
+  10 does, at about a third of the tail latency.
 - `max_keep_alive_requests` — requests served per conn before
   forced close. Default 1000.
 - `max_clients` — concurrent connection cap. Default 16384 (the modern
@@ -1001,7 +1008,11 @@ start_tcp(Port, Opts, Protocols, ProtoOpts) ->
         TcpProtocols ->
             case open_listen_socket(Port, Opts, TcpProtocols) of
                 {ok, LSocket} ->
-                    NumAcceptors = maps:get(num_acceptors, Opts, ?DEFAULT_NUM_ACCEPTORS),
+                    NumAcceptors =
+                        case Opts of
+                            #{num_acceptors := N} -> N;
+                            #{} -> default_num_acceptors()
+                        end,
                     ok = spawn_acceptors(LSocket, ProtoOpts, NumAcceptors),
                     {ok, LSocket};
                 {error, _} = Error ->
@@ -1396,6 +1407,16 @@ base_listen_opts(Opts) ->
         #{ip := IP} -> [{ip, IP} | Base];
         #{} -> Base
     end.
+
+%% One acceptor per online scheduler, at most ?MAX_DEFAULT_NUM_ACCEPTORS.
+%% Every acceptor waits on the one listen socket, so acceptors beyond the
+%% schedulers contend for it: measured over sustained connection churn,
+%% matching one or two schedulers accepted 35-55% more connections a second
+%% than 10 acceptors, with less CPU per connection and a third of the p99;
+%% at eight schedulers eight and 10 were even, so larger machines keep 10.
+-spec default_num_acceptors() -> pos_integer().
+default_num_acceptors() ->
+    min(erlang:system_info(schedulers_online), ?MAX_DEFAULT_NUM_ACCEPTORS).
 
 %% Multiple acceptor processes all calling gen_tcp:accept on the same listen
 %% socket — Linux/BSD accept is thread-safe and avoids thundering-herd via
