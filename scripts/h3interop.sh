@@ -400,13 +400,17 @@ run_ngtcp2() {
 }
 
 # Kill the listener's node outright, so no connection says goodbye, once the
-# client logged in `$1` has completed its handshake (waiting a fixed time
-# raced a slow container start, killing the node before the client had
-# connected at all), and start another on the same port with the same
-# secret. The client holds its request back long enough for the restart.
+# client logged in `$1` has received HANDSHAKE_DONE, and start another on the
+# same port with the same secret. The client holds its request back long
+# enough for the restart. Waiting a fixed time raced a slow container start,
+# killing the node before the client had connected at all; waiting only for
+# the client's own "handshake has completed" (logged once it sends its
+# Finished) raced a lost Finished, leaving the client resending it in
+# Handshake packets, which the restarted node can only drop (a stateless
+# reset answers short-header packets alone, RFC 9000 §10.3).
 restart_listener() {
     for _ in $(seq 1 200); do
-        grep -q "QUIC handshake has completed" "$1" 2>/dev/null && break
+        grep -q "frm rx .* HANDSHAKE_DONE" "$1" 2>/dev/null && break
         sleep 0.1
     done
     kill -9 "$SHELL_PID"
