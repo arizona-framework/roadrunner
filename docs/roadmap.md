@@ -203,28 +203,20 @@ lot of them.
 
 ## Other
 
-### Connection-process memory tuning follow-ups
+### `hibernate_after` throughput cost
 
-**What:** The `handler_spawn` listener opt already exposes the full
-`proc_lib:start/5` spawn config (`opts` + `start_timeout`) for every
-handler-running process, defaulting to `[{fullsweep_after, 0}]`.
-Remaining polish:
-- a named convenience opt (e.g. a top-level `max_heap_size`) if the
-  raw `opts` passthrough proves clumsy in practice
-- verify the per-process memory win extends to the HTTP/2 and HTTP/3
-  stream-worker processes under load (validated so far on the h1
-  connection process)
-- find what costs busy connections 2-7.5% throughput once
-  `hibernate_after` is set on top of the default GC policy (measured
-  with `scripts/idle_pool.escript`, 50 connections flat out, three
-  interleaved rounds); one candidate, not yet confirmed, is the
-  `erlang:send_after` / `cancel_timer` pair the hibernate receive path
-  arms on every recv
+**What:** with `hibernate_after` set on top of the default GC policy, busy
+connections lose 2-7.5% throughput (measured with
+`scripts/idle_pool.escript`, 50 connections flat out, three interleaved
+rounds). The likely cost is the `erlang:send_after` / `cancel_timer` pair
+the hibernating receive arms on every recv: letting the receive's own
+`after` cover both the hibernate trigger and the request deadline, and
+arming a timer only when the connection is about to hibernate, would
+remove it. Keep the change only if a measurement shows it does.
 
-**Why deferred:** the passthrough plus default already capture a
-substantial, workload-dependent process-memory reduction on
-allocation-heavy handlers; these are refinements that each want their
-own measurement before shipping.
+**Why deferred:** `hibernate_after` is off by default, so only listeners
+that enable it pay the cost, and the measurement needs a sustained load
+run on a machine that can take one.
 
 **Scope:** small.
 
