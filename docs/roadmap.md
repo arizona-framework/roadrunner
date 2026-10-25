@@ -276,6 +276,24 @@ Revisit only if a real workload reports false `slow_client` drops.
 
 **Scope:** small.
 
+### Check `roadrunner_static` options when the routes compile — medium
+
+**What:** `roadrunner_static` reads its route state (`dir`, `cache_control`,
+`symlink_policy`, `cache_ttl_ms`, `mime_types`) on each request and never
+checks it up front. A typo such as `symlink_policy => folow` quietly falls
+back to the default, a missing `dir` or a `mime_types` that is not a map only
+fails when a request arrives, and an uppercase `mime_types` key never
+matches. A compile-time hook for handler state (like a middleware's `init/1`,
+under a name that cannot clash with `roadrunner_ws_handler:init/1`) would let
+the handler reject a bad option when the listener starts, lowercase the
+`mime_types` keys, and merge them into the built-in table once.
+
+**Why deferred:** handlers have no compile-time hook today, and adding one
+touches the router, `validate/1` and `reload_routes/2` for every handler, not
+just the static one.
+
+**Scope:** medium.
+
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>

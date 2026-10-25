@@ -615,6 +615,133 @@ symlink_policy_refuse_test_() ->
         end}.
 
 %% =============================================================================
+%% Content-Type lookup: the built-in table directly, then the `mime_types`
+%% route opt on a dedicated listener.
+%% =============================================================================
+
+content_type_for_test_() ->
+    [
+        {"built-in types for common web assets", fun() ->
+            ?assertEqual(~"font/woff2", roadrunner_static:content_type_for(~"/a/f.woff2", #{})),
+            ?assertEqual(~"font/woff", roadrunner_static:content_type_for(~"f.woff", #{})),
+            ?assertEqual(~"application/wasm", roadrunner_static:content_type_for(~"m.wasm", #{})),
+            ?assertEqual(
+                ~"text/javascript; charset=utf-8",
+                roadrunner_static:content_type_for(~"app.mjs", #{})
+            ),
+            ?assertEqual(
+                ~"application/manifest+json",
+                roadrunner_static:content_type_for(~"site.webmanifest", #{})
+            ),
+            ?assertEqual(~"image/avif", roadrunner_static:content_type_for(~"p.avif", #{})),
+            ?assertEqual(~"video/webm", roadrunner_static:content_type_for(~"v.webm", #{}))
+        end},
+        {"extension is matched without regard to case", fun() ->
+            ?assertEqual(~"image/png", roadrunner_static:content_type_for(~"logo.PNG", #{})),
+            ?assertEqual(~"font/woff2", roadrunner_static:content_type_for(~"f.WoFf2", #{}))
+        end},
+        {"unknown or missing extension is application/octet-stream", fun() ->
+            ?assertEqual(
+                ~"application/octet-stream", roadrunner_static:content_type_for(~"x.bin", #{})
+            ),
+            ?assertEqual(
+                ~"application/octet-stream", roadrunner_static:content_type_for(~"README", #{})
+            )
+        end},
+        {"route map overrides a built-in and adds a new type", fun() ->
+            Custom = #{
+                ~".txt" => ~"text/plain; charset=iso-8859-1", ~".glb" => ~"model/gltf-binary"
+            },
+            ?assertEqual(
+                ~"text/plain; charset=iso-8859-1",
+                roadrunner_static:content_type_for(~"a.txt", Custom)
+            ),
+            ?assertEqual(
+                ~"model/gltf-binary", roadrunner_static:content_type_for(~"s.GLB", Custom)
+            ),
+            %% Extensions the route map leaves out still use the built-in table.
+            ?assertEqual(
+                ~"text/css; charset=utf-8", roadrunner_static:content_type_for(~"a.css", Custom)
+            )
+        end},
+        {"route map that is not a map raises", fun() ->
+            ?assertError({case_clause, _}, roadrunner_static:content_type_for(~"a.txt", [bad]))
+        end}
+    ].
+
+mime_types_test_() ->
+    {setup, fun mime_types_setup/0, fun mime_types_cleanup/1, fun({_Name, _Dir, Port}) ->
+        [
+            {"route type overrides a built-in on a 200", fun() ->
+                Reply = http_get(Port, ~"/static/notes.txt"),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                assert_content_type(Reply, ~"text/plain; charset=iso-8859-1")
+            end},
+            {"route type adds a new extension, matched without regard to case", fun() ->
+                Reply = http_get(Port, ~"/static/scene.GLB"),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                assert_content_type(Reply, ~"model/gltf-binary")
+            end},
+            {"route type rides a 206 range", fun() ->
+                Reply = http_get_with(Port, ~"/static/scene.GLB", [{~"Range", ~"bytes=0-1"}]),
+                ?assertMatch(<<"HTTP/1.1 206 ", _/binary>>, Reply),
+                assert_content_type(Reply, ~"model/gltf-binary")
+            end},
+            {"route type rides a precompressed sibling", fun() ->
+                Reply = http_get_with(Port, ~"/static/notes.txt", [{~"Accept-Encoding", ~"gzip"}]),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                {match, _} = re:run(Reply, ~"content-encoding: gzip", [caseless]),
+                assert_content_type(Reply, ~"text/plain; charset=iso-8859-1")
+            end},
+            {"built-in types still apply to other extensions", fun() ->
+                Reply = http_get(Port, ~"/static/font.woff2"),
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+                assert_content_type(Reply, ~"font/woff2")
+            end}
+        ]
+    end}.
+
+mime_types_invalid_test_() ->
+    {setup,
+        fun() ->
+            mime_types_listener(static_test_mime_bad, [not_a_map])
+        end,
+        fun mime_types_cleanup/1, fun({_Name, _Dir, Port}) ->
+            {"a mime_types that is not a map fails the request with a 500", fun() ->
+                Reply = http_get(Port, ~"/static/notes.txt"),
+                ?assertMatch(<<"HTTP/1.1 500 ", _/binary>>, Reply)
+            end}
+        end}.
+
+mime_types_setup() ->
+    mime_types_listener(static_test_mime, #{
+        ~".txt" => ~"text/plain; charset=iso-8859-1",
+        ~".glb" => ~"model/gltf-binary"
+    }).
+
+mime_types_listener(Name, MimeTypes) ->
+    Dir = filename:join(
+        "/tmp", "rr_mime_types_" ++ integer_to_list(rand:uniform(1000000))
+    ),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    ok = file:write_file(filename:join(Dir, "notes.txt"), ~"plain notes"),
+    ok = file:write_file(filename:join(Dir, "notes.txt.gz"), zlib:gzip(~"plain notes")),
+    ok = file:write_file(filename:join(Dir, "scene.GLB"), ~"glTF-bytes"),
+    ok = file:write_file(filename:join(Dir, "font.woff2"), ~"wOF2-bytes"),
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        routes => [
+            {~"/static/*path", roadrunner_static, #{dir => Dir, mime_types => MimeTypes}}
+        ]
+    }),
+    {Name, Dir, roadrunner_listener:port(Name)}.
+
+mime_types_cleanup({Name, Dir, _Port}) ->
+    ok = roadrunner_listener:stop(Name),
+    _ = file:del_dir_r(Dir),
+    ok.
+
+%% =============================================================================
 %% Cache-Control route opt — the configured value rides every cacheable
 %% response (200 full file, 200 precompressed sibling, 206 range, 304) and
 %% never the 404 / 416. A dedicated listener carries the opt; the default
@@ -1253,6 +1380,12 @@ recv_until_closed(Sock, Acc) ->
 assert_cache_control(Reply, Value) ->
     {match, [_, Got]} = re:run(
         Reply, ~"cache-control: ([^\r\n]+)", [caseless, {capture, all, binary}]
+    ),
+    ?assertEqual(Value, Got).
+
+assert_content_type(Reply, Value) ->
+    {match, [_, Got]} = re:run(
+        Reply, ~"content-type: ([^\r\n]+)", [caseless, {capture, all, binary}]
     ),
     ?assertEqual(Value, Got).
 
