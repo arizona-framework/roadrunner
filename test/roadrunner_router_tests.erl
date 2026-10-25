@@ -1208,7 +1208,111 @@ compile_raises_what_validate_reports_test() ->
     ?assertEqual({error, {invalid_route, {123, h}}}, roadrunner_router:validate(Routes)),
     ?assertError({invalid_route, {123, h}}, roadrunner_router:compile(Routes, [])).
 
+%% =============================================================================
+%% Handler init_route/1 (`roadrunner_init_route_handler` reports each run)
+%% =============================================================================
+
+init_route_runs_once_per_route_and_replaces_the_state_test() ->
+    State = #{notify => self()},
+    Compiled = roadrunner_router:compile(
+        [
+            {~"/a", roadrunner_init_route_handler, State},
+            #{path => ~"/b", handler => roadrunner_init_route_handler, state => State}
+        ],
+        []
+    ),
+    ?assertEqual([State, State], init_route_runs()),
+    ?assertMatch(
+        {ok, roadrunner_init_route_handler, #{}, _, {routed, State}},
+        roadrunner_router:match(~"GET", ~"/a", Compiled)
+    ),
+    ?assertMatch(
+        {ok, roadrunner_init_route_handler, #{}, _, {routed, State}},
+        roadrunner_router:match(~"GET", ~"/b", Compiled)
+    ).
+
+init_route_state_is_the_one_the_handler_sees_test() ->
+    State = #{notify => self()},
+    Compiled = roadrunner_router:compile([{~"/a", roadrunner_init_route_handler, State}], []),
+    {ok, _, _, Pipeline, _} = roadrunner_router:match(~"GET", ~"/a", Compiled),
+    {{200, [], Body}, _Req} = Pipeline(empty_req()),
+    ?assertEqual({routed, State}, binary_to_term(Body)),
+    ?assertEqual([State], init_route_runs()).
+
+init_route_gets_undefined_for_a_route_without_state_test() ->
+    %% The returned state is injected even though the route set none.
+    Compiled = roadrunner_router:compile(
+        [
+            {~"/a", roadrunner_init_route_handler},
+            #{path => ~"/b", handler => roadrunner_init_route_handler}
+        ],
+        []
+    ),
+    {ok, _, _, PipelineA, {routed, undefined}} = roadrunner_router:match(~"GET", ~"/a", Compiled),
+    {ok, _, _, _, {routed, undefined}} = roadrunner_router:match(~"GET", ~"/b", Compiled),
+    {{200, [], Body}, _Req} = PipelineA(empty_req()),
+    ?assertEqual({routed, undefined}, binary_to_term(Body)).
+
+validate_does_not_run_init_route_test() ->
+    ?assertEqual(
+        ok,
+        roadrunner_router:validate([{~"/a", roadrunner_init_route_handler, #{notify => self()}}])
+    ),
+    ?assertEqual([], init_route_runs()).
+
+compile_does_not_run_init_route_for_an_unworkable_table_test() ->
+    State = #{notify => self()},
+    ?assertError(
+        {unreachable_route, 2, ~"/a", [{1, ~"/a"}]},
+        roadrunner_router:compile(
+            [
+                {~"/a", roadrunner_init_route_handler, State},
+                {~"/a", roadrunner_init_route_handler, State}
+            ],
+            []
+        )
+    ),
+    ?assertEqual([], init_route_runs()).
+
+init_route_raise_names_the_route_test() ->
+    ?assertError(
+        {init_route_failed, ~"/b", roadrunner_init_route_handler, bad_option},
+        roadrunner_router:compile(
+            [
+                {~"/a", roadrunner_init_route_handler},
+                {~"/b", roadrunner_init_route_handler, #{raise => bad_option}}
+            ],
+            []
+        )
+    ).
+
+handler_without_init_route_keeps_its_state_test() ->
+    Compiled = roadrunner_router:compile(
+        [{~"/a", roadrunner_hello_handler, #{k => v}}, {~"/b", roadrunner_hello_handler}], []
+    ),
+    {ok, _, _, _, #{k := v}} = roadrunner_router:match(~"GET", ~"/a", Compiled),
+    {ok, _, _, _, undefined} = roadrunner_router:match(~"GET", ~"/b", Compiled).
+
+init_route_does_not_run_the_ws_init_test() ->
+    %% The fixture is also a `roadrunner_ws_handler`; its `init/1` would report
+    %% `ws_init` (and crash on a state that is not `{routed, _}`).
+    _ = roadrunner_router:compile(
+        [{~"/a", roadrunner_init_route_handler, #{notify => self()}}], []
+    ),
+    receive
+        {ws_init, _} -> error(ws_init_ran)
+    after 0 -> ok
+    end,
+    ?assertEqual([#{notify => self()}], init_route_runs()).
+
 %% --- helpers ---
+
+%% The states `roadrunner_init_route_handler:init_route/1` reported, in order.
+init_route_runs() ->
+    receive
+        {init_route, State} -> [State | init_route_runs()]
+    after 0 -> []
+    end.
 
 %% Drop the pipeline (4th element) and state (5th) so the handler
 %% module + bindings can be asserted with `?assertEqual`. The

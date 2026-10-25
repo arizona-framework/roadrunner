@@ -58,6 +58,26 @@ handle(Req) ->
     {ok, Body, Req2} = roadrunner_req:read_body(Req),
     {{200, [], Body}, Req2}.
 ```
+
+## init_route/1: optional setup when the routes compile
+
+A handler **may** implement `init_route/1`. It runs once per route that
+names the handler, when the listener starts and again on every
+`roadrunner_listener:reload_routes/2`, never per request. It gets the
+route's state and its return becomes the state the handler reads with
+`roadrunner_req:state/1`:
+
+```erlang
+init_route(Opts) -> State.  %% once per route, when the routes compile
+handle(Req) -> Result.      %% per request, roadrunner_req:state(Req) is State
+```
+
+Check the route's options and precompute there: a bad option then stops
+the listener from starting instead of failing a request, and the work is
+paid once. `roadrunner_static` uses it this way. It is the handler's
+counterpart of a middleware's `init/1`; the name differs because a module
+can also be a `roadrunner_ws_handler`, whose `init/1` runs per WebSocket
+session.
 """.
 
 -export_type([send_fun/0, stream_fun/0, push_fun/0, sendfile_spec/0, response/0, result/0]).
@@ -178,4 +198,31 @@ the loop still ends.
 -callback handle_info(Info :: term(), Push :: push_fun(), State :: term()) ->
     {ok, NewState :: term()} | {stop, NewState :: term()}.
 
--optional_callbacks([handle_info/3]).
+-doc """
+Optional setup run when the routes compile. When the handler exports it,
+the router calls it once for every route that names the handler, at
+listener start and on every `roadrunner_listener:reload_routes/2`, never
+per request. It works with every route form: the `{Path, Handler}` and
+`{Path, Handler, State}` tuples, the map form, and the listener's
+single-handler `routes => Handler | {Handler, State} | #{handler := Handler}`
+forms.
+
+`State` is the route's state, or `undefined` when the route sets none.
+The return value replaces it: `roadrunner_req:state/1` returns it on every
+request the route answers, and `roadrunner_router:match/3` reports it.
+
+Validate options and precompute here (resolve paths, build lookup tables):
+a raise stops the listener from starting. On `reload_routes/2` it fails
+the loud way, as a middleware's `init/1` does: the call exits and the
+listener stops. The reason is wrapped as
+`{init_route_failed, Path, Handler, Reason}` so the error names the route
+(`Path` is `undefined` for the single-handler forms).
+`roadrunner_router:validate/1` does not run it, and `compile/2` runs it
+only once the whole table has passed validation.
+
+A handler without `init_route/1` keeps its state exactly as the route wrote
+it.
+""".
+-callback init_route(State :: term()) -> NewState :: term().
+
+-optional_callbacks([handle_info/3, init_route/1]).

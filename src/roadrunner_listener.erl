@@ -129,6 +129,12 @@ Routing (pick one):
   already answer in full is a config error and raises at listener
   start rather than turning into a runtime 404.
 
+Whichever form is used, a handler that exports the optional
+`roadrunner_handler` callback `init_route/1` has it run once per route
+when the listener starts (and on `reload_routes/2`), turning the route's
+state into the one the handler sees. A raise in it stops the listener
+from starting, with `{init_route_failed, Path, Handler, Reason}`.
+
 Optional middleware and timing knobs (durations in milliseconds):
 - `middlewares` — listener-wide pipeline applied to every request.
 - `max_content_length` — request-body cap across HTTP/1.1, HTTP/2, and
@@ -950,8 +956,9 @@ if the replacement table cannot work. A rejected table is refused
 whole: the listener keeps serving the routes it already had, and
 nothing about the running table changes. That covers everything
 decidable from the table itself; a per-route middleware that crashes
-in its own `init/1` still fails the reload the loud way, the same as
-it would at listener start.
+in its own `init/1`, or a handler whose `init_route/1` raises, still
+fails the reload the loud way, the same as it would at listener start.
+Both run again for the new table, once per route.
 
 Each call performs one global `persistent_term` swap, which scans every
 process heap to reclaim the old table. That cost is acceptable for a
@@ -2248,7 +2255,9 @@ build_dispatch(Opts, _ListenerName) ->
     roadrunner_middleware:middleware_list(),
     no_state | {state, term()}
 ) -> roadrunner_conn:dispatch().
-bake_dispatch(Handler, Opts, HandlerMws, StateArg) ->
+bake_dispatch(Handler, Opts, HandlerMws, StateArg0) ->
+    %% The handler's `init_route/1` runs here, as it does for a routed one.
+    StateArg = roadrunner_router:init_handler_state(undefined, Handler, StateArg0),
     ListenerMws = maps:get(middlewares, Opts, []),
     Pipeline = roadrunner_middleware:compile_pipeline(
         ListenerMws ++ HandlerMws, Handler, StateArg
