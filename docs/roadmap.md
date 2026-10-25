@@ -203,23 +203,6 @@ lot of them.
 
 ## Other
 
-### `hibernate_after` throughput cost
-
-**What:** with `hibernate_after` set on top of the default GC policy, busy
-connections lose 2-7.5% throughput (measured with
-`scripts/idle_pool.escript`, 50 connections flat out, three interleaved
-rounds). The likely cost is the `erlang:send_after` / `cancel_timer` pair
-the hibernating receive arms on every recv: letting the receive's own
-`after` cover both the hibernate trigger and the request deadline, and
-arming a timer only when the connection is about to hibernate, would
-remove it. Keep the change only if a measurement shows it does.
-
-**Why deferred:** `hibernate_after` is off by default, so only listeners
-that enable it pay the cost, and the measurement needs a sustained load
-run on a machine that can take one.
-
-**Scope:** small.
-
 ### CI bench-vs-baseline comparison
 
 **What:** The `Bench` workflow (`.github/workflows/bench.yml`) writes its
