@@ -2,15 +2,54 @@
 -moduledoc """
 Built-in static file handler.
 
-Configure via a 3-tuple route with `#{dir => Path}` opts and a
-`*path` wildcard segment carrying the relative file path:
+A route serves either a directory or a single file. For a directory, give
+`dir` and end the route's path in a `*path` wildcard, which carries the
+file's path under `dir`:
 
 ```
 {~"/static/*path", roadrunner_static, #{dir => ~"/var/www"}}
 ```
 
-Reads the file from disk, sets `Content-Type` from the extension,
-returns 404 on a missing file or any path that contains `..`.
+For one file, give `file`. The route needs no wildcard, and every request
+it answers gets that file:
+
+```
+{~"/favicon.ico", roadrunner_static, #{file => ~"/var/www/favicon.ico"}}
+```
+
+Both read the file from disk, set `Content-Type` from its extension, and
+answer 404 when the file is missing (or is not a regular file). A
+directory route also answers 404 for any path that contains `..`. Every
+other feature below works the same way in both modes.
+
+## Options
+
+The route's state is a map of `t:opts/0`:
+
+- `dir` or `file` (exactly one is required): a path, as a binary or a
+  string, or `{priv, App, SubPath}`
+- `cache_control`: a `Cache-Control` value (see below)
+- `symlink_policy`: `refuse_escapes`, `follow` or `refuse` (directory
+  routes only, see below)
+- `cache_ttl_ms`: a non-negative integer or `infinity` (see below)
+- `mime_types`: extra or replacement content types (see below)
+
+The options are checked once, when the listener starts (and again on
+`roadrunner_listener:reload_routes/2`), by the handler's
+`init_route/1`. An unknown key, a value of the wrong shape, both or
+neither of `dir` and `file`, or an application `code:priv_dir/1` does not
+know stops the listener from starting with an error naming the option
+(see `init_route/1`), instead of failing a request later.
+
+A relative path is made absolute against the working directory at that
+point. `{priv, App, SubPath}` is `SubPath` under the application's
+`priv` directory, looked up once, so a release can serve the assets it
+ships without building the path itself:
+
+```
+{~"/assets/*path", roadrunner_static, #{dir => {priv, my_app, ~"static"}}},
+{~"/robots.txt", roadrunner_static, #{file => {priv, my_app, ~"robots.txt"}}}
+```
 
 ## Content-Type
 
@@ -46,10 +85,12 @@ leading dot and `ContentType` is the header value, sent verbatim:
 }}
 ```
 
-The file's extension is lowercased before the lookup, so write each key
-in lowercase: `~".glb"` matches both `scene.glb` and `scene.GLB`, while a
-`~".GLB"` key never matches. The route's map is checked first and the
-built-in table second, so nothing is merged per request.
+Each key must start with `.` and each value must be a binary. Keys are
+matched without regard to case, like the file's extension: `~".glb"` and
+`~".GLB"` both match `scene.glb` and `scene.GLB`. Two keys that differ
+only in case are refused. The route's types are merged into the built-in
+table when the listener starts, so a request does one lookup. A `file`
+route looks its type up once, then.
 
 ## Precompressed-sibling serving
 
@@ -121,7 +162,7 @@ A typical value for content-hashed build assets:
 ## Symlink policy
 
 `#{symlink_policy => Policy}` (default `refuse_escapes`) controls
-how symlinks inside the docroot are handled. The policy applies to
+how symlinks inside the docroot of a `dir` route are handled. The policy applies to
 the **leaf** of the requested path — symlinks in intermediate
 directories are still followed by the kernel.
 
@@ -137,13 +178,20 @@ directories are still followed by the kernel.
   the docroot's filesystem permissions prevent untrusted writes.
 - `refuse` — every symlink returns 404, even safe in-docroot ones.
 
+A `file` route always follows its file when it is a symlink, wherever the
+link points: the operator named that path, and no request can choose
+another one, so there is nothing to escape. Setting `symlink_policy` on a
+`file` route is refused when the listener starts, since it would have no
+effect.
+
 ## Metadata cache
 
 `#{cache_ttl_ms => N}` caches the `stat` result (size, mtime) for
 each regular file in a node-global ETS table for `N` milliseconds. Hot
 paths skip the per-request `read_link_info` syscall after the
 first hit. Symlinks always bypass the cache because the policy
-gate needs the un-followed lookup.
+gate needs the un-followed lookup (a `file` route's symlinked file
+too).
 
 The default is `0` (disabled). Enabling the cache assumes files
 are **immutable during the TTL window**: the cached `size` feeds
@@ -179,11 +227,58 @@ under an `infinity` (or long) TTL.
 %% the kernel's own limit (Linux `MAXSYMLINKS`).
 -define(MAX_SYMLINK_HOPS, 40).
 
--export([handle/1, cache_clear/0]).
-%% Exported only so the eunit suite can drive the extension lookup directly.
+-export([init_route/1, handle/1, cache_clear/0]).
+%% Exported for direct eunit branch coverage of the extension lookup.
 -export([content_type_for/2]).
 
--export_type([siblings/0]).
+-export_type([opts/0, path/0, state/0, siblings/0]).
+
+%% Every option `init_route/1` accepts.
+-define(OPTS, [dir, file, cache_control, symlink_policy, cache_ttl_ms, mime_types]).
+
+-doc """
+The route state `roadrunner_static` takes, checked when the routes compile
+(see the moduledoc for each option). Exactly one of `dir` and `file` is
+required.
+""".
+-type opts() :: #{
+    dir => path(),
+    file => path(),
+    cache_control => binary(),
+    symlink_policy => follow | refuse | refuse_escapes,
+    cache_ttl_ms => non_neg_integer() | infinity,
+    mime_types => #{binary() => binary()}
+}.
+
+-doc """
+Where `dir` or `file` points: a path, as a binary or a string, or
+`{priv, App, SubPath}` for `SubPath` under `code:priv_dir(App)`. A
+relative path is made absolute against the working directory when the
+routes compile.
+""".
+-type path() :: file:name_all() | {priv, App :: atom(), SubPath :: file:name_all()}.
+
+%% The checked options `init_route/1` builds and `handle/1` reads per request.
+%% `path` is the absolute docroot (`dir`) or file (`file`), `root` the docroot
+%% with a trailing `/` for the symlink check (`undefined` for a file). `types`
+%% is `builtin` for the built-in table, the built-in table merged with the
+%% route's `mime_types`, or, for a file, its `Content-Type` already looked up.
+%% `builtin` keeps the table a literal instead of a copy in every state.
+-record(static, {
+    mode :: dir | file,
+    path :: binary(),
+    root :: binary() | undefined,
+    types :: builtin | #{binary() => binary()} | binary(),
+    cache_control :: binary() | undefined,
+    symlink_policy :: follow | refuse | refuse_escapes,
+    cache_ttl_ms :: non_neg_integer() | infinity
+}).
+
+-doc """
+A route's options once `init_route/1` has checked them: what the handler
+reads on each request. Treat as opaque.
+""".
+-opaque state() :: #static{}.
 
 -doc """
 Precompressed siblings found on disk for a regular file, keyed by
@@ -196,7 +291,7 @@ the value is its size in bytes. `#{}` means neither sibling exists.
 %% extension with its leading dot. Types are the IANA-registered ones (WHATWG
 %% for `.wav` and source maps, which IANA does not cover). Text types carry
 %% `charset=utf-8`; JSON and XML types do not, since their encoding is part of
-%% the format. A route's `mime_types` option is looked up first.
+%% the format. `init_route/1` merges a route's `mime_types` over it.
 -define(MIME_TYPES, #{
     %% Documents and code
     ~".html" => ~"text/html; charset=utf-8",
@@ -240,28 +335,184 @@ the value is its size in bytes. `#{}` means neither sibling exists.
     ~".webm" => ~"video/webm"
 }).
 
+-doc """
+Check the route's `t:opts/0` when the routes compile (listener start and
+`roadrunner_listener:reload_routes/2`) and build the state `handle/1`
+serves from: the resolved `dir` or `file`, a `{priv, App, SubPath}` path
+looked up once, the `mime_types` keys lowercased and merged into the
+built-in table, and for `file` its `Content-Type`. A bad option raises,
+which stops the listener from starting:
+
+- `{unknown_static_opt, Key}` for a key that is not an option
+- `{invalid_static_opt, Key, Value}` for a value of the wrong shape (for a
+  bad `mime_types` entry, `Value` is that `{Ext, ContentType}` entry)
+- `{static_app_not_found, Key, App}` when `code:priv_dir(App)` knows no
+  such application
+- `{static_opt_conflict, dir, file}` when both are set, and
+  `{static_opt_conflict, file, symlink_policy}` for a policy on a file route
+- `{missing_static_opt, dir_or_file}` when neither is set
+- `{invalid_static_opts, Opts}` when the state is not a map
+""".
+-spec init_route(opts()) -> state().
+init_route(Opts) when is_map(Opts) ->
+    ok = check_known_opts(Opts),
+    Types = mime_types(Opts),
+    CacheControl = cache_control(Opts),
+    TtlMs = cache_ttl_ms(Opts),
+    case Opts of
+        #{dir := _, file := _} ->
+            error({static_opt_conflict, dir, file});
+        #{dir := Dir} ->
+            Path = resolve_path(dir, Dir),
+            #static{
+                mode = dir,
+                path = Path,
+                root = <<Path/binary, $/>>,
+                types = Types,
+                cache_control = CacheControl,
+                symlink_policy = symlink_policy(Opts),
+                cache_ttl_ms = TtlMs
+            };
+        #{file := _, symlink_policy := _} ->
+            error({static_opt_conflict, file, symlink_policy});
+        #{file := File} ->
+            Path = resolve_path(file, File),
+            %% The configured file is the operator's own choice, not a path a
+            %% request picks, so a symlink there is always followed.
+            #static{
+                mode = file,
+                path = Path,
+                root = undefined,
+                types = content_type_for(Path, Types),
+                cache_control = CacheControl,
+                symlink_policy = follow,
+                cache_ttl_ms = TtlMs
+            };
+        #{} ->
+            error({missing_static_opt, dir_or_file})
+    end;
+init_route(Opts) ->
+    error({invalid_static_opts, Opts}).
+
 -spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
-    Segments = maps:get(~"path", roadrunner_req:bindings(Req), []),
-    case validate_segments(Segments) of
-        ok ->
-            State = roadrunner_req:state(Req),
-            TtlMs =
-                case State of
-                    #{cache_ttl_ms := T} -> T;
-                    _ -> ?DEFAULT_CACHE_TTL_MS
+    case roadrunner_req:state(Req) of
+        #static{mode = file, path = File} = State ->
+            {serve(File, State, Req), Req};
+        #static{mode = dir, path = Dir} = State ->
+            Segments =
+                case roadrunner_req:bindings(Req) of
+                    #{~"path" := Path} -> Path;
+                    #{} -> []
                 end,
-            CacheControl =
-                case State of
-                    #{cache_control := V} -> V;
-                    _ -> undefined
-                end,
-            #{dir := Dir} = State,
-            FilePath = filename:join([Dir | Segments]),
-            {maybe_cache_control(serve_file(FilePath, TtlMs, Req), CacheControl), Req};
-        traversal ->
-            {roadrunner_resp:not_found(), Req}
+            case validate_segments(Segments) of
+                ok -> {serve(filename:join([Dir | Segments]), State, Req), Req};
+                traversal -> {roadrunner_resp:not_found(), Req}
+            end
     end.
+
+%% Serve `FilePath` and add the route's `Cache-Control` where it applies.
+-spec serve(binary(), state(), roadrunner_req:request()) -> roadrunner_handler:response().
+serve(FilePath, #static{cache_control = CacheControl} = State, Req) ->
+    maybe_cache_control(serve_file(FilePath, State, Req), CacheControl).
+
+%% Reject any key that is not an option, so a typo fails at listener start
+%% instead of being ignored.
+-spec check_known_opts(map()) -> ok.
+check_known_opts(Opts) ->
+    case maps:keys(maps:without(?OPTS, Opts)) of
+        [] -> ok;
+        [Key | _] -> error({unknown_static_opt, Key})
+    end.
+
+%% The absolute path a `dir` or `file` option names, as a binary. A
+%% `{priv, App, SubPath}` path asks `code:priv_dir/1` here, once.
+-spec resolve_path(dir | file, term()) -> binary().
+resolve_path(Key, {priv, App, SubPath} = Value) when is_atom(App) ->
+    case code:priv_dir(App) of
+        {error, bad_name} ->
+            error({static_app_not_found, Key, App});
+        PrivDir ->
+            case is_name(SubPath) of
+                true -> filename:absname(filename:join(name_to_binary(PrivDir), SubPath));
+                false -> error({invalid_static_opt, Key, Value})
+            end
+    end;
+resolve_path(Key, Path) ->
+    case is_name(Path) andalso not string:is_empty(Path) of
+        true -> filename:absname(name_to_binary(Path));
+        false -> error({invalid_static_opt, Key, Path})
+    end.
+
+%% A path written as a binary or as a string of characters.
+-spec is_name(term()) -> boolean().
+is_name(Name) when is_binary(Name) ->
+    true;
+is_name(Name) when is_list(Name) ->
+    io_lib:char_list(Name);
+is_name(_Name) ->
+    false.
+
+-spec name_to_binary(file:name_all()) -> binary().
+name_to_binary(Name) when is_binary(Name) ->
+    Name;
+name_to_binary(Name) ->
+    unicode:characters_to_binary(Name).
+
+-spec cache_control(map()) -> binary() | undefined.
+cache_control(#{cache_control := Value}) when is_binary(Value) ->
+    Value;
+cache_control(#{cache_control := Value}) ->
+    error({invalid_static_opt, cache_control, Value});
+cache_control(#{}) ->
+    undefined.
+
+-spec symlink_policy(map()) -> follow | refuse | refuse_escapes.
+symlink_policy(#{symlink_policy := Policy}) when
+    Policy =:= follow; Policy =:= refuse; Policy =:= refuse_escapes
+->
+    Policy;
+symlink_policy(#{symlink_policy := Policy}) ->
+    error({invalid_static_opt, symlink_policy, Policy});
+symlink_policy(#{}) ->
+    refuse_escapes.
+
+-spec cache_ttl_ms(map()) -> non_neg_integer() | infinity.
+cache_ttl_ms(#{cache_ttl_ms := infinity}) ->
+    infinity;
+cache_ttl_ms(#{cache_ttl_ms := TtlMs}) when is_integer(TtlMs), TtlMs >= 0 ->
+    TtlMs;
+cache_ttl_ms(#{cache_ttl_ms := TtlMs}) ->
+    error({invalid_static_opt, cache_ttl_ms, TtlMs});
+cache_ttl_ms(#{}) ->
+    ?DEFAULT_CACHE_TTL_MS.
+
+%% The route's extension table: `builtin` without `mime_types` (or with an
+%% empty one), else the built-in table with the route's entries merged over
+%% it, so a request looks the extension up once. Keys are lowercased here, as
+%% the request's extension is, so `~".GLB"` matches `scene.glb`; two keys
+%% that differ only in case are refused rather than one silently winning.
+-spec mime_types(map()) -> builtin | #{binary() => binary()}.
+mime_types(#{mime_types := Types}) when Types =:= #{} ->
+    builtin;
+mime_types(#{mime_types := Types}) when is_map(Types) ->
+    Lowered = #{lowercase_ext(Ext, Type) => Type || Ext := Type <- Types},
+    case map_size(Lowered) =:= map_size(Types) of
+        true -> maps:merge(?MIME_TYPES, Lowered);
+        false -> error({invalid_static_opt, mime_types, Types})
+    end;
+mime_types(#{mime_types := Types}) ->
+    error({invalid_static_opt, mime_types, Types});
+mime_types(#{}) ->
+    builtin.
+
+%% One `mime_types` key, lowercased: an extension with its leading dot,
+%% mapped to a binary `Content-Type`.
+-spec lowercase_ext(term(), term()) -> binary().
+lowercase_ext(<<".", _/binary>> = Ext, Type) when is_binary(Type) ->
+    roadrunner_bin:ascii_lowercase(Ext);
+lowercase_ext(Ext, Type) ->
+    error({invalid_static_opt, mime_types, {Ext, Type}}).
 
 -doc """
 Drop every cached static-file metadata entry. Pair with
@@ -291,15 +542,13 @@ maybe_cache_control({304, Headers, Body}, Value) ->
 maybe_cache_control(Resp, _Value) ->
     Resp.
 
--spec serve_file(
-    file:filename_all(), non_neg_integer() | infinity, roadrunner_req:request()
-) -> roadrunner_handler:response().
-serve_file(FilePath, TtlMs, Req) ->
+-spec serve_file(binary(), state(), roadrunner_req:request()) -> roadrunner_handler:response().
+serve_file(FilePath, #static{cache_ttl_ms = TtlMs} = State, Req) ->
     case cached_lookup(FilePath, TtlMs) of
         {ok, Size, Mtime, ETag, LastMod, Siblings} ->
             serve_regular_file(FilePath, Size, Mtime, ETag, LastMod, Siblings, Req);
         miss ->
-            fresh_lookup(FilePath, TtlMs, Req)
+            fresh_lookup(FilePath, State, Req)
     end.
 
 %% Cache-aware regular-file metadata lookup. Returns `miss` when the
@@ -315,18 +564,17 @@ cached_lookup(FilePath, _TtlMs) ->
     roadrunner_static_cache:lookup(FilePath).
 
 %% Stat the file, populate the cache when applicable, and dispatch on
-%% the file type. Mirrors the original `serve_file/2` body. Used on
-%% cache miss and for symlink leaves (which never cache).
--spec fresh_lookup(
-    file:filename_all(), non_neg_integer() | infinity, roadrunner_req:request()
-) -> roadrunner_handler:response().
-fresh_lookup(FilePath, TtlMs, Req) ->
+%% the file type. Used on cache miss and for symlink leaves (which never
+%% cache). A `file` route's policy is `follow`, so a symlinked file is
+%% served from its target, uncached like any other symlink leaf.
+-spec fresh_lookup(binary(), state(), roadrunner_req:request()) -> roadrunner_handler:response().
+fresh_lookup(FilePath, #static{cache_ttl_ms = TtlMs} = State, Req) ->
     %% `read_link_info/1` does not follow the leaf symlink — we need
     %% the un-followed type so the symlink-policy gate can decide
     %% whether the target is allowed to be served.
     case file:read_link_info(FilePath, [raw, {time, posix}]) of
         {ok, #file_info{type = symlink}} ->
-            case symlink_allowed(FilePath, Req) of
+            case symlink_allowed(FilePath, State) of
                 true -> serve_followed_file(FilePath, Req);
                 false -> roadrunner_resp:not_found()
             end;
@@ -582,31 +830,30 @@ serve_full_file(FilePath, Size, ETag, LastMod, Req) ->
         ],
         {FilePath, 0, Size}}.
 
-%% The `Content-Type` for a file under the route's `mime_types` option.
+%% The `Content-Type` for a file: a `file` route's, looked up once by
+%% `init_route/1`, or the extension's in a `dir` route's table.
 -spec content_type(file:filename_all(), roadrunner_req:request()) -> binary().
 content_type(FilePath, Req) ->
     case roadrunner_req:state(Req) of
-        #{mime_types := MimeTypes} -> content_type_for(FilePath, MimeTypes);
-        _ -> content_type_for(FilePath, #{})
+        #static{types = Type} when is_binary(Type) -> Type;
+        #static{types = Types} -> content_type_for(FilePath, Types)
     end.
 
-%% Look the lowercased extension up in the route's own `MimeTypes` first, then
-%% in the built-in table, so a route entry overrides or extends a built-in one.
-%% The two lookups stand in for a merged map: nothing is merged per request,
-%% and a route without the option pays one lookup in an empty map. A
-%% `MimeTypes` that is not a map raises `case_clause`.
+%% Look the lowercased extension up in the route's table: the built-in one, or
+%% the built-in one with the route's `mime_types` merged over it by
+%% `init_route/1`. Either way it is one lookup per request.
 -doc false.
--spec content_type_for(file:filename_all(), #{binary() => binary()}) -> binary().
-content_type_for(FilePath, MimeTypes) ->
+-spec content_type_for(file:filename_all(), builtin | #{binary() => binary()}) -> binary().
+content_type_for(FilePath, Types) ->
     Ext = roadrunner_bin:ascii_lowercase(iolist_to_binary(filename:extension(FilePath))),
-    case MimeTypes of
-        #{Ext := Type} ->
-            Type;
-        #{} ->
-            case ?MIME_TYPES of
-                #{Ext := Type} -> Type;
-                #{} -> ~"application/octet-stream"
-            end
+    Table =
+        case Types of
+            builtin -> ?MIME_TYPES;
+            #{} -> Types
+        end,
+    case Table of
+        #{Ext := Type} -> Type;
+        #{} -> ~"application/octet-stream"
     end.
 
 %% Strong ETag derived from size + posix mtime — RFC 9110 §8.8.3
@@ -752,46 +999,32 @@ segment_traverses(Segment) ->
         lists:member(~"..", filename:split(Segment)).
 
 %% Decide whether a symlink leaf may be served under the route's policy.
--spec symlink_allowed(file:filename_all(), roadrunner_req:request()) -> boolean().
-symlink_allowed(FilePath, Req) ->
-    case symlink_policy(Req) of
-        follow -> true;
-        refuse -> false;
-        refuse_escapes -> target_inside_docroot(FilePath, Req)
-    end.
+-spec symlink_allowed(binary(), state()) -> boolean().
+symlink_allowed(_FilePath, #static{symlink_policy = follow}) ->
+    true;
+symlink_allowed(_FilePath, #static{symlink_policy = refuse}) ->
+    false;
+symlink_allowed(FilePath, #static{symlink_policy = refuse_escapes, root = Root}) ->
+    chain_inside(FilePath, Root, ?MAX_SYMLINK_HOPS).
 
--spec symlink_policy(roadrunner_req:request()) -> follow | refuse | refuse_escapes.
-symlink_policy(Req) ->
-    case roadrunner_req:state(Req) of
-        #{symlink_policy := follow} -> follow;
-        #{symlink_policy := refuse} -> refuse;
-        _ -> refuse_escapes
-    end.
-
-%% Follow the leaf symlink hop by hop and check every hop lives under
-%% `dir`: a link to an in-docroot link that itself points outside escapes
-%% as surely as a direct one, since the kernel follows the whole chain when
-%% the file is opened. Symlinks in intermediate path components are not
-%% inspected (the kernel follows those too); the threat model is "an
-%% attacker plants a leaf symlink to escape", which is the common case for
-%% upload-able directories.
--spec target_inside_docroot(file:filename_all(), roadrunner_req:request()) -> boolean().
-target_inside_docroot(FilePath, Req) ->
-    #{dir := Dir} = roadrunner_req:state(Req),
-    %% `filename:absname/1` strips trailing slashes (except for the root
-    %% `/` itself, which we don't reasonably support as a docroot anyway),
-    %% so a single appended `/` makes the prefix check an exact directory
-    %% check rather than a sibling-prefix false positive.
-    chain_inside(FilePath, [filename:absname(Dir), $/], ?MAX_SYMLINK_HOPS).
-
-%% Check the symlink `Link` and the rest of its chain. `serve_file/2` only
+%% Check the symlink `Link` and the rest of its chain, every hop of which must
+%% live under `dir`: a link to an in-docroot link that itself points outside
+%% escapes as surely as a direct one, since the kernel follows the whole chain
+%% when the file is opened. Symlinks in intermediate path components are not
+%% inspected (the kernel follows those too); the threat model is "an attacker
+%% plants a leaf symlink to escape", which is the common case for upload-able
+%% directories. `Root` is the absolute docroot with one `/` appended
+%% (`filename:absname/1` strips trailing slashes, except for the root `/`
+%% itself, which we don't reasonably support as a docroot anyway), so the
+%% prefix check is an exact directory check rather than a sibling-prefix false
+%% positive. `serve_file/2` only
 %% calls us after `read_link_info` reported `type = symlink` (and each later
 %% hop is read only once `read_link_info` says it is a link), so `read_link`
 %% is expected to succeed: a TOCTOU race (a link removed between the two
 %% stats) crashes and bubbles up as a 500 instead of silently 404ing. A chain
 %% longer than the kernel follows (Linux `MAXSYMLINKS`) is refused: opening
 %% it would fail with `ELOOP` anyway.
--spec chain_inside(file:filename_all(), iodata(), non_neg_integer()) -> boolean().
+-spec chain_inside(file:filename_all(), binary(), non_neg_integer()) -> boolean().
 chain_inside(_Link, _Root, 0) ->
     false;
 chain_inside(Link, Root, Hops) ->
@@ -815,7 +1048,7 @@ chain_inside(Link, Root, Hops) ->
 %% in both forms: comparing against the binary alone never matched and let
 %% every `..` link through. An absolute target must sit under `dir`
 %% (`string:prefix/2` accepts chardata, so neither side needs flattening).
--spec hop_inside(file:filename_all(), file:filename_all(), iodata()) ->
+-spec hop_inside(file:filename_all(), file:filename_all(), binary()) ->
     file:filename_all() | false.
 hop_inside(Link, Target, Root) ->
     case filename:pathtype(Target) of

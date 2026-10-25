@@ -622,50 +622,164 @@ symlink_policy_refuse_test_() ->
 content_type_for_test_() ->
     [
         {"built-in types for common web assets", fun() ->
-            ?assertEqual(~"font/woff2", roadrunner_static:content_type_for(~"/a/f.woff2", #{})),
-            ?assertEqual(~"font/woff", roadrunner_static:content_type_for(~"f.woff", #{})),
-            ?assertEqual(~"application/wasm", roadrunner_static:content_type_for(~"m.wasm", #{})),
-            ?assertEqual(
-                ~"text/javascript; charset=utf-8",
-                roadrunner_static:content_type_for(~"app.mjs", #{})
-            ),
-            ?assertEqual(
-                ~"application/manifest+json",
-                roadrunner_static:content_type_for(~"site.webmanifest", #{})
-            ),
-            ?assertEqual(~"image/avif", roadrunner_static:content_type_for(~"p.avif", #{})),
-            ?assertEqual(~"video/webm", roadrunner_static:content_type_for(~"v.webm", #{}))
+            ?assertEqual(~"font/woff2", content_type(~"/a/f.woff2")),
+            ?assertEqual(~"font/woff", content_type(~"f.woff")),
+            ?assertEqual(~"application/wasm", content_type(~"m.wasm")),
+            ?assertEqual(~"text/javascript; charset=utf-8", content_type(~"app.mjs")),
+            ?assertEqual(~"application/manifest+json", content_type(~"site.webmanifest")),
+            ?assertEqual(~"image/avif", content_type(~"p.avif")),
+            ?assertEqual(~"video/webm", content_type(~"v.webm"))
         end},
         {"extension is matched without regard to case", fun() ->
-            ?assertEqual(~"image/png", roadrunner_static:content_type_for(~"logo.PNG", #{})),
-            ?assertEqual(~"font/woff2", roadrunner_static:content_type_for(~"f.WoFf2", #{}))
+            ?assertEqual(~"image/png", content_type(~"logo.PNG")),
+            ?assertEqual(~"font/woff2", content_type(~"f.WoFf2"))
         end},
         {"unknown or missing extension is application/octet-stream", fun() ->
+            ?assertEqual(~"application/octet-stream", content_type(~"x.bin")),
+            ?assertEqual(~"application/octet-stream", content_type(~"README"))
+        end},
+        {"a route's table is the only one looked up", fun() ->
+            %% `init_route/1` merges the route's types into the built-in
+            %% table, so the table handed in is complete.
+            Table = #{~".glb" => ~"model/gltf-binary"},
+            ?assertEqual(~"model/gltf-binary", roadrunner_static:content_type_for(~"s.GLB", Table)),
             ?assertEqual(
-                ~"application/octet-stream", roadrunner_static:content_type_for(~"x.bin", #{})
-            ),
+                ~"application/octet-stream", roadrunner_static:content_type_for(~"a.css", Table)
+            )
+        end}
+    ].
+
+content_type(FilePath) ->
+    roadrunner_static:content_type_for(FilePath, builtin).
+
+%% =============================================================================
+%% init_route/1: the options are checked when the routes compile.
+%% =============================================================================
+
+init_route_test_() ->
+    Bad = fun(Opts) ->
+        try roadrunner_static:init_route(Opts) of
+            State -> error({accepted, State})
+        catch
+            error:Reason -> Reason
+        end
+    end,
+    [
+        {"a dir as a binary or a string is accepted", fun() ->
+            _ = roadrunner_static:init_route(#{dir => ~"/var/www"}),
+            _ = roadrunner_static:init_route(#{dir => "/var/www"}),
+            _ = roadrunner_static:init_route(#{dir => ~"relative/www"}),
+            _ = roadrunner_static:init_route(#{file => "/var/www/index.html"}),
+            ok
+        end},
+        {"every option is accepted together", fun() ->
+            _ = roadrunner_static:init_route(#{
+                dir => ~"/var/www",
+                cache_control => ~"no-cache",
+                symlink_policy => follow,
+                cache_ttl_ms => infinity,
+                mime_types => #{~".GLB" => ~"model/gltf-binary"}
+            }),
+            _ = roadrunner_static:init_route(#{
+                dir => ~"/var/www", symlink_policy => refuse, cache_ttl_ms => 0, mime_types => #{}
+            }),
+            _ = roadrunner_static:init_route(#{
+                file => ~"/var/www/a.txt", cache_ttl_ms => 1000, mime_types => #{}
+            }),
+            ok
+        end},
+        {"an unknown key is refused", fun() ->
+            ?assertEqual({unknown_static_opt, root}, Bad(#{dir => ~"/x", root => ~"/y"}))
+        end},
+        {"both dir and file are refused", fun() ->
             ?assertEqual(
-                ~"application/octet-stream", roadrunner_static:content_type_for(~"README", #{})
+                {static_opt_conflict, dir, file}, Bad(#{dir => ~"/x", file => ~"/x/a.txt"})
             )
         end},
-        {"route map overrides a built-in and adds a new type", fun() ->
-            Custom = #{
-                ~".txt" => ~"text/plain; charset=iso-8859-1", ~".glb" => ~"model/gltf-binary"
-            },
+        {"neither dir nor file is refused", fun() ->
+            ?assertEqual({missing_static_opt, dir_or_file}, Bad(#{})),
             ?assertEqual(
-                ~"text/plain; charset=iso-8859-1",
-                roadrunner_static:content_type_for(~"a.txt", Custom)
-            ),
-            ?assertEqual(
-                ~"model/gltf-binary", roadrunner_static:content_type_for(~"s.GLB", Custom)
-            ),
-            %% Extensions the route map leaves out still use the built-in table.
-            ?assertEqual(
-                ~"text/css; charset=utf-8", roadrunner_static:content_type_for(~"a.css", Custom)
+                {missing_static_opt, dir_or_file}, Bad(#{cache_control => ~"no-cache"})
             )
         end},
-        {"route map that is not a map raises", fun() ->
-            ?assertError({case_clause, _}, roadrunner_static:content_type_for(~"a.txt", [bad]))
+        {"a state that is not a map is refused", fun() ->
+            ?assertEqual({invalid_static_opts, undefined}, Bad(undefined)),
+            ?assertEqual({invalid_static_opts, [{dir, ~"/x"}]}, Bad([{dir, ~"/x"}]))
+        end},
+        {"a dir or file of the wrong shape is refused", fun() ->
+            ?assertEqual({invalid_static_opt, dir, ~""}, Bad(#{dir => ~""})),
+            ?assertEqual({invalid_static_opt, dir, ""}, Bad(#{dir => ""})),
+            ?assertEqual({invalid_static_opt, dir, www}, Bad(#{dir => www})),
+            ?assertEqual({invalid_static_opt, file, [~"a"]}, Bad(#{file => [~"a"]})),
+            ?assertEqual(
+                {invalid_static_opt, dir, {priv, "kernel", ~"x"}},
+                Bad(#{dir => {priv, "kernel", ~"x"}})
+            ),
+            ?assertEqual(
+                {invalid_static_opt, file, {priv, kernel, 42}},
+                Bad(#{file => {priv, kernel, 42}})
+            )
+        end},
+        {"a priv path for an unknown application is refused", fun() ->
+            ?assertEqual(
+                {static_app_not_found, dir, roadrunner_no_such_app},
+                Bad(#{dir => {priv, roadrunner_no_such_app, ~"static"}})
+            ),
+            ?assertEqual(
+                {static_app_not_found, file, roadrunner_no_such_app},
+                Bad(#{file => {priv, roadrunner_no_such_app, "a.txt"}})
+            )
+        end},
+        {"a symlink_policy on a file route is refused", fun() ->
+            ?assertEqual(
+                {static_opt_conflict, file, symlink_policy},
+                Bad(#{file => ~"/x/a.txt", symlink_policy => follow})
+            )
+        end},
+        {"a bad cache_control is refused", fun() ->
+            ?assertEqual(
+                {invalid_static_opt, cache_control, "no-cache"},
+                Bad(#{dir => ~"/x", cache_control => "no-cache"})
+            )
+        end},
+        {"a bad symlink_policy is refused", fun() ->
+            ?assertEqual(
+                {invalid_static_opt, symlink_policy, folow},
+                Bad(#{dir => ~"/x", symlink_policy => folow})
+            )
+        end},
+        {"a bad cache_ttl_ms is refused", fun() ->
+            ?assertEqual(
+                {invalid_static_opt, cache_ttl_ms, -1}, Bad(#{dir => ~"/x", cache_ttl_ms => -1})
+            ),
+            ?assertEqual(
+                {invalid_static_opt, cache_ttl_ms, forever},
+                Bad(#{dir => ~"/x", cache_ttl_ms => forever})
+            )
+        end},
+        {"a bad mime_types is refused", fun() ->
+            ?assertEqual(
+                {invalid_static_opt, mime_types, [not_a_map]},
+                Bad(#{dir => ~"/x", mime_types => [not_a_map]})
+            ),
+            ?assertEqual(
+                {invalid_static_opt, mime_types, {~"glb", ~"model/gltf-binary"}},
+                Bad(#{dir => ~"/x", mime_types => #{~"glb" => ~"model/gltf-binary"}})
+            ),
+            ?assertEqual(
+                {invalid_static_opt, mime_types, {".glb", ~"model/gltf-binary"}},
+                Bad(#{dir => ~"/x", mime_types => #{".glb" => ~"model/gltf-binary"}})
+            ),
+            ?assertEqual(
+                {invalid_static_opt, mime_types, {~".glb", "model/gltf-binary"}},
+                Bad(#{dir => ~"/x", mime_types => #{~".glb" => "model/gltf-binary"}})
+            )
+        end},
+        {"mime_types keys that differ only in case are refused", fun() ->
+            Types = #{~".glb" => ~"model/gltf-binary", ~".GLB" => ~"model/other"},
+            ?assertEqual(
+                {invalid_static_opt, mime_types, Types}, Bad(#{dir => ~"/x", mime_types => Types})
+            )
         end}
     ].
 
@@ -701,22 +815,11 @@ mime_types_test_() ->
         ]
     end}.
 
-mime_types_invalid_test_() ->
-    {setup,
-        fun() ->
-            mime_types_listener(static_test_mime_bad, [not_a_map])
-        end,
-        fun mime_types_cleanup/1, fun({_Name, _Dir, Port}) ->
-            {"a mime_types that is not a map fails the request with a 500", fun() ->
-                Reply = http_get(Port, ~"/static/notes.txt"),
-                ?assertMatch(<<"HTTP/1.1 500 ", _/binary>>, Reply)
-            end}
-        end}.
-
 mime_types_setup() ->
+    %% An uppercase key is lowercased when the routes compile.
     mime_types_listener(static_test_mime, #{
         ~".txt" => ~"text/plain; charset=iso-8859-1",
-        ~".glb" => ~"model/gltf-binary"
+        ~".GLB" => ~"model/gltf-binary"
     }).
 
 mime_types_listener(Name, MimeTypes) ->
