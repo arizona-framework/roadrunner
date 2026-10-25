@@ -55,8 +55,6 @@
 -behaviour(roadrunner_stream_worker).
 %% Exported for eunit branch coverage of the stop-on-send-error path.
 -export([sendfile_loop/3]).
-%% Exported for direct eunit branch coverage of the client header limit check.
--export([fits_peer_limit/2]).
 
 %% Worker process-dict flag: set once a `{stream, ...}` `Send` observed
 %% a fin variant, so `send_stream/4` knows whether to auto-close. Lives
@@ -177,13 +175,13 @@ emit(Conn, StreamId, _Handler, {_Status, _Headers, Body}, Fields) ->
     send_fields(Conn, StreamId, Fields, Body).
 
 %% Whether a field section fits the client's SETTINGS_MAX_FIELD_SECTION_SIZE
-%% (RFC 9114 §4.2.2: name + value + 32 bytes per field, uncompressed);
+%% (RFC 9114 §4.2.2, sized by `roadrunner_http:fits_header_list_size/2`);
 %% `undefined` is no limit, and is not even sized.
 -spec fits_peer_limit(roadrunner_http:headers(), non_neg_integer() | undefined) -> boolean().
 fits_peer_limit(_Fields, undefined) ->
     true;
 fits_peer_limit(Fields, MaxFieldSection) ->
-    roadrunner_http:header_list_size(Fields) =< MaxFieldSection.
+    roadrunner_http:fits_header_list_size(Fields, MaxFieldSection).
 
 %% A section the client will likely refuse, sent after the handler's
 %% status is decided (trailers) or as the worker's own answer (404, 500,

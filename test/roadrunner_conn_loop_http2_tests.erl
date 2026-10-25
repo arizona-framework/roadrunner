@@ -70,6 +70,14 @@ all_test_() ->
         fun unsafe_trailer_resets_stream/0,
         fun non_iodata_body_resets_only_its_stream/0,
         fun unfinished_response_on_normal_exit_resets_stream/0,
+        fun peer_header_limit_buffered_over_returns_500/0,
+        fun peer_header_limit_under_passes/0,
+        fun peer_header_limit_unset_passes_big_headers/0,
+        fun peer_header_limit_counts_the_section_sent/0,
+        fun peer_header_limit_streamed_over_returns_500/0,
+        fun peer_header_limit_trailers_over_reset_stream/0,
+        fun peer_header_limit_too_small_for_500_resets_stream/0,
+        fun stream_send_after_fin_ends_stream_cleanly/0,
         fun middleware_chain_runs/0,
         fun rst_stream_cancels_active_stream/0,
         fun router_404_returns_not_found/0,
@@ -1464,6 +1472,181 @@ unfinished_response_on_normal_exit_resets_stream() ->
     ),
     ?assert(is_process_alive(Pid)),
     cleanup(Pid, Ref).
+
+peer_header_limit_buffered_over_returns_500() ->
+    %% RFC 9113 §6.5.2: a client that sent SETTINGS_MAX_HEADER_LIST_SIZE
+    %% 200 gets no header section over it. The handler's 200 carries 237
+    %% bytes of `x-big` alone, so the worker answers 500 instead (161
+    %% bytes: `:status`, `content-type`, `date`), before anything is sent,
+    %% and reports the 500 it sent. The oversized fields never reached the
+    %% HPACK encoder: a second request decodes with the same decoder that
+    %% read the 500.
+    HandlerId = attach_telemetry([[roadrunner, request, stop]]),
+    try
+        {Pid, Ref} = run_stream_request(~"/big-headers", peer_limit_settings(200)),
+        ?assertEqual({500, buffered}, reported_stop()),
+        [{headers, 1, _, _, Block}, {data, 1, 16#01, Body, _}] = wire_frames(),
+        {ok, Headers, Dec} = roadrunner_http2_hpack:decode(
+            Block, roadrunner_http2_hpack:new_decoder(4096)
+        ),
+        ?assertEqual(~"500", proplists:get_value(~":status", Headers)),
+        ?assertEqual(undefined, proplists:get_value(~"x-big", Headers)),
+        ?assertEqual(~"Internal Server Error", Body),
+        serve_recv(Pid, complete_get_headers(3, ~"/")),
+        ?assertEqual({200, buffered}, reported_stop()),
+        [{headers, 3, _, _, Block3}, {data, 3, 16#01, ~"ok", _}] = wire_frames(),
+        {ok, Headers3, _} = roadrunner_http2_hpack:decode(Block3, Dec),
+        ?assertEqual(~"200", proplists:get_value(~":status", Headers3)),
+        cleanup(Pid, Ref)
+    after
+        detach_telemetry(HandlerId)
+    end.
+
+peer_header_limit_under_passes() ->
+    %% A response within the client's limit goes out as the handler built
+    %% it: `:status`, `content-type` and `date` come to 161 bytes.
+    {Pid, Ref} = run_stream_request(~"/", peer_limit_settings(200)),
+    [{headers, 1, _, _, Block}, {data, 1, 16#01, ~"ok", _}] = wire_frames(),
+    ?assertEqual(~"200", response_status(Block)),
+    cleanup(Pid, Ref).
+
+peer_header_limit_unset_passes_big_headers() ->
+    %% No SETTINGS_MAX_HEADER_LIST_SIZE from the client: no limit (the
+    %% RFC 9113 §6.5.2 default), so the big header goes out.
+    {Pid, Ref} = run_stream_request(~"/big-headers"),
+    [{headers, 1, _, _, Block}, {data, 1, 16#01, ~"ok", _}] = wire_frames(),
+    {ok, Headers, _} = roadrunner_http2_hpack:decode(
+        Block, roadrunner_http2_hpack:new_decoder(4096)
+    ),
+    ?assertEqual(~"200", proplists:get_value(~":status", Headers)),
+    ?assertEqual(binary:copy(~"v", 200), proplists:get_value(~"x-big", Headers)),
+    cleanup(Pid, Ref).
+
+peer_header_limit_counts_the_section_sent() ->
+    %% The worker sizes the same section the conn sends, `alt-svc` and
+    %% `date` included: a limit of exactly the size of the headers on the
+    %% wire lets the 200 through, one byte less turns it into a 500.
+    AltSvc = #{alt_svc => ~"h3=\":8443\"; ma=86400"},
+    {Pid0, Ref0} = run_stream_request(~"/big-headers", ?EMPTY_SETTINGS_FRAME, AltSvc),
+    [{headers, 1, _, _, Block}, {data, 1, 16#01, ~"ok", _}] = wire_frames(),
+    {ok, Headers, _} = roadrunner_http2_hpack:decode(
+        Block, roadrunner_http2_hpack:new_decoder(4096)
+    ),
+    ?assertEqual(~"h3=\":8443\"; ma=86400", proplists:get_value(~"alt-svc", Headers)),
+    cleanup(Pid0, Ref0),
+    Size = roadrunner_http:header_list_size(Headers),
+    [
+        begin
+            {Pid, Ref} = run_stream_request(~"/big-headers", peer_limit_settings(Limit), AltSvc),
+            [{headers, 1, _, _, LimitBlock}, {data, 1, 16#01, _, _}] = wire_frames(),
+            ?assertEqual(Status, response_status(LimitBlock)),
+            cleanup(Pid, Ref)
+        end
+     || {Limit, Status} <- [{Size, ~"200"}, {Size - 1, ~"500"}]
+    ].
+
+peer_header_limit_streamed_over_returns_500() ->
+    %% A streamed response's headers over the limit (stream, sendfile and
+    %% loop shapes): the worker answers 500 (HEADERS + DATA with
+    %% END_STREAM) before the stream fun, file read or loop runs, so
+    %% nothing of the 200 reaches the wire, and reports the 500.
+    HandlerId = attach_telemetry([[roadrunner, request, stop]]),
+    try
+        [
+            begin
+                {Pid, Ref} = run_stream_request(Path, peer_limit_settings(200)),
+                ?assertEqual({500, Kind}, reported_stop()),
+                [{headers, 1, 16#04, _, Block}, {data, 1, 16#01, Body, _}] = wire_frames(),
+                ?assertEqual(~"500", response_status(Block)),
+                ?assertEqual(~"Internal Server Error", Body),
+                cleanup(Pid, Ref)
+            end
+         || {Path, Kind} <- [
+                {~"/stream/big-headers", stream},
+                {~"/sendfile/big-headers", sendfile},
+                {~"/loop/big-headers", loop}
+            ]
+        ]
+    after
+        detach_telemetry(HandlerId)
+    end.
+
+peer_header_limit_trailers_over_reset_stream() ->
+    %% Trailers over the limit come after the 200 HEADERS, so they cannot
+    %% become a 500: the worker crashes before the body that rides with
+    %% them goes out, the stream is reset with INTERNAL_ERROR and the
+    %% connection carries on.
+    {Pid, Ref} = run_stream_request(~"/stream/big-trailers", peer_limit_settings(200)),
+    [{headers, 1, 16#04, _, Block}, {rst_stream, 1, internal_error}] = wire_frames(),
+    ?assertEqual(~"200", response_status(Block)),
+    ?assert(is_process_alive(Pid)),
+    cleanup(Pid, Ref).
+
+peer_header_limit_too_small_for_500_resets_stream() ->
+    %% A limit too small even for the 161-byte 500 resets the stream with
+    %% INTERNAL_ERROR, buffered or streamed, and sends nothing else. The
+    %% same holds for the worker's own answers (here the router's 404).
+    [
+        begin
+            {Pid, Ref} = run_stream_request(Path, peer_limit_settings(100)),
+            ?assertEqual([{rst_stream, 1, internal_error}], wire_frames()),
+            ?assert(is_process_alive(Pid)),
+            cleanup(Pid, Ref)
+        end
+     || Path <- [~"/big-headers", ~"/stream/big-headers"]
+    ],
+    ok = persistent_term:put(
+        {roadrunner_routes, h2_peer_limit_404}, roadrunner_router:compile([], [])
+    ),
+    try
+        {Pid, Ref} = run_stream_request(
+            ~"/", peer_limit_settings(100), #{dispatch => {router, h2_peer_limit_404}}
+        ),
+        ?assertEqual([{rst_stream, 1, internal_error}], wire_frames()),
+        cleanup(Pid, Ref)
+    after
+        true = persistent_term:erase({roadrunner_routes, h2_peer_limit_404})
+    end.
+
+stream_send_after_fin_ends_stream_cleanly() ->
+    %% A stream fun that sends after its `fin`: the conn tells the worker
+    %% the stream was reset, and the worker exits with `stream_reset`. The
+    %% response on the wire is complete, so no RST_STREAM follows its
+    %% END_STREAM (RFC 9113 §5.1), and the conn carries on.
+    {Pid, Ref} = run_stream_request(~"/stream/send-after-fin"),
+    [{headers, 1, 16#04, _, Block}, {data, 1, 16#01, ~"done", _}] = wire_frames(),
+    ?assertEqual(~"200", response_status(Block)),
+    serve_recv(Pid, roadrunner_http2_frame:encode({ping, 0, <<7:64>>})),
+    ?assertEqual([{ping, 1, <<7:64>>}], wire_frames()),
+    cleanup(Pid, Ref).
+
+%% A client SETTINGS frame carrying SETTINGS_MAX_HEADER_LIST_SIZE (id 6).
+peer_limit_settings(Limit) ->
+    iolist_to_binary(roadrunner_http2_frame:encode({settings, 0, [{6, Limit}]})).
+
+%% The status and kind of the next `[roadrunner, request, stop]` event.
+reported_stop() ->
+    receive
+        {telemetry_event, [roadrunner, request, stop], _, #{status := S, response_kind := K}} ->
+            {S, K}
+    after 1000 -> error(no_stop_event)
+    end.
+
+%% Every frame the conn sends until a quiet period, parsed.
+wire_frames() ->
+    parse_wire_frames(collect_send_bytes(<<>>)).
+
+parse_wire_frames(<<>>) ->
+    [];
+parse_wire_frames(Bin) ->
+    {ok, Frame, Rest} = roadrunner_http2_frame:parse(Bin, 16384),
+    [Frame | parse_wire_frames(Rest)].
+
+response_status(Block) ->
+    {ok, Headers, _} = roadrunner_http2_hpack:decode(
+        Block, roadrunner_http2_hpack:new_decoder(4096)
+    ),
+    proplists:get_value(~":status", Headers).
 
 middleware_chain_runs() ->
     %% Listener with a non-empty middleware list — exercises the
@@ -4765,25 +4948,31 @@ run_stream_request(Path) ->
     run_stream_request(Path, ?EMPTY_SETTINGS_FRAME).
 
 run_stream_request(Path, PrefaceSettings) ->
+    run_stream_request(Path, PrefaceSettings, #{}).
+
+run_stream_request(Path, PrefaceSettings, ExtraOpts) ->
     {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
-        handler_spawn_opts => [{fullsweep_after, 0}],
-        tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
-        max_concurrent_requests => infinity,
-        client_counter => Counter,
-        listener_name => h2_stream_test,
-        dispatch =>
-            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
-                undefined},
-        middlewares => [],
-        http2_conn_window => 65535,
-        http2_stream_window => 65535
-    },
+    ProtoOpts = maps:merge(
+        #{
+            handler_spawn_opts => [{fullsweep_after, 0}],
+            tls_handshake_timeout => 5000,
+            handler_start_timeout => infinity,
+            max_concurrent_requests => infinity,
+            client_counter => Counter,
+            listener_name => h2_stream_test,
+            dispatch =>
+                {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                    undefined},
+            middlewares => [],
+            http2_conn_window => 65535,
+            http2_stream_window => 65535
+        },
+        ExtraOpts
+    ),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive

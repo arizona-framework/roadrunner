@@ -50,6 +50,17 @@
 %% overridable via the `max_concurrent_streams` http2 listener opt);
 %% HEADERS beyond that limit get `RST_STREAM(REFUSED_STREAM)`.
 %%
+%% Client header limit (RFC 9113 §6.5.2): a client that sent
+%% SETTINGS_MAX_HEADER_LIST_SIZE may treat a larger header section as
+%% malformed. The conn records the value and hands it to each worker it
+%% spawns, and the worker keeps its response within it (a 500 in place of
+%% headers over it; for trailers over it a crash, which the `'DOWN'` turns
+%% into a stream reset), so the status the worker reports is the one
+%% sent. The conn itself does not check. The
+%% setting is advisory (§10.5.1): a value lowered by a later SETTINGS
+%% frame holds for the workers spawned after it, not those already
+%% running.
+%%
 %% Response shapes supported:
 %%
 %% | shape | h2 |
@@ -343,6 +354,13 @@
     %% value; existing stream send-windows shift by the delta when
     %% the peer changes the setting (§6.9.2).
     peer_initial_window = 65535 :: integer(),
+    %% The client's SETTINGS_MAX_HEADER_LIST_SIZE (RFC 9113 §6.5.2), the
+    %% largest response header section it says it will take; `infinity`
+    %% (no limit, the §6.5.2 default) until a SETTINGS frame carries it.
+    %% Not to be confused with `max_header_list_size`, our own limit on
+    %% request headers. Handed to each worker as it is spawned
+    %% (`roadrunner_http2_stream_worker:start/5`), which applies it.
+    peer_max_header_list_size = infinity :: non_neg_integer() | infinity,
     %% Set to `true` once a `{roadrunner_drain, _}` message has
     %% been observed (Phase H9). In drain mode we've already sent
     %% GOAWAY(NO_ERROR), refuse fresh streams with
@@ -694,7 +712,9 @@ handle_frame({settings, 0, Params}, State) ->
                     %% Raising INITIAL_WINDOW_SIZE grows open streams' send
                     %% windows (RFC 9113 §6.9.2): ACK, then drain any sends
                     %% blocked at the old window, like the WINDOW_UPDATE path.
-                    State2 = apply_header_table_size(Params, State1),
+                    State2 = apply_peer_max_header_list_size(
+                        Params, apply_header_table_size(Params, State1)
+                    ),
                     _ = send(State2, roadrunner_http2_frame:encode({settings, 1, []})),
                     frame_loop(flush_all_pending_data(State2));
                 {error, flow_control_error} ->
@@ -1609,7 +1629,11 @@ dispatch_request(
                     of
                         true ->
                             {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
-                                self(), StreamId, Req, ProtoOpts
+                                self(),
+                                StreamId,
+                                Req,
+                                ProtoOpts,
+                                State#loop.peer_max_header_list_size
                             ),
                             Stream1 = Stream#{
                                 worker_pid := WorkerPid,
@@ -1775,8 +1799,20 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
             ),
             State1 = State#loop{worker_refs = maps:remove(MonRef, Refs)},
             case Reason of
-                normal -> finish_stream(State1, StreamId);
-                _ -> abort_stream(State1, StreamId, internal_error)
+                normal ->
+                    finish_stream(State1, StreamId);
+                stream_reset ->
+                    %% The worker wrote to a stream whose response had
+                    %% already ended (a stream fun sending after its `fin`):
+                    %% `stream_open/2` told it the stream was reset, so it
+                    %% stopped. A reset of ours demonitors first, so it
+                    %% never gets here. The response on the wire is
+                    %% complete, so the stream ends as for a normal exit,
+                    %% never with an RST_STREAM after its END_STREAM (RFC
+                    %% 9113 §5.1: no frames on a closed stream).
+                    finish_stream(State1, StreamId);
+                _ ->
+                    abort_stream(State1, StreamId, internal_error)
             end;
         #{} ->
             State
@@ -1830,22 +1866,26 @@ stream_open(#loop{streams = Streams}, StreamId) ->
         #{} -> not_open
     end.
 
+%% The response field section as sent, built by the function the worker
+%% sizes it with against the client's SETTINGS_MAX_HEADER_LIST_SIZE, so the
+%% two agree (`roadrunner_http2_stream_worker:field_section/3`).
+-spec response_fields(#loop{}, roadrunner_http:status(), roadrunner_http:headers()) ->
+    roadrunner_http:headers().
+response_fields(#loop{alt_svc = AltSvc}, Status, Headers) ->
+    roadrunner_http2_stream_worker:field_section(Status, Headers, AltSvc).
+
 %% Encode + write a HEADERS frame (always fits without flow control;
 %% the wire just takes it).
 encode_and_send_headers(
     #loop{hpack_enc = Enc} = State, StreamId, Status, Headers, EndStream
 ) ->
-    StatusBin = integer_to_binary(Status),
     %% Handler-supplied header names MUST already be lowercase per RFC 9113
     %% §8.1.2 (see `roadrunner_handler:response/0`), and the worker already
     %% answered 500 for any CR/LF/NUL (`roadrunner_stream_worker`), so a
     %% handler bug cannot crash this process, which every stream shares.
-    %% Strip the connection-specific fields RFC 9113 §8.2.2 forbids h2 from
-    %% generating.
-    WireHeaders = roadrunner_http:strip_connection_specific_fields(Headers),
-    AllHeaders =
-        [{~":status", StatusBin} | roadrunner_http:auto_headers(WireHeaders, State#loop.alt_svc)],
-    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
+    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(
+        response_fields(State, Status, Headers), Enc
+    ),
     %% `frame:encode` accepts iodata for the header block — skip
     %% the upfront flatten; ssl:send walks the iolist anyway.
     Flags =
@@ -1876,14 +1916,11 @@ encode_and_send_response_atomic(
     BodyLen
 ) ->
     #{StreamId := Stream} = Streams,
-    StatusBin = integer_to_binary(Status),
     %% Names already lowercase per `roadrunner_handler:response/0` contract,
-    %% CR/LF/NUL already answered with 500 by the worker; strip the
-    %% connection-specific fields RFC 9113 §8.2.2 forbids h2 from generating.
-    WireHeaders = roadrunner_http:strip_connection_specific_fields(Headers),
-    AllHeaders =
-        [{~":status", StatusBin} | roadrunner_http:auto_headers(WireHeaders, State#loop.alt_svc)],
-    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(AllHeaders, Enc),
+    %% CR/LF/NUL already answered with 500 by the worker.
+    {HpackBlock, Enc1} = roadrunner_http2_hpack:encode(
+        response_fields(State, Status, Headers), Enc
+    ),
     HFrame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04, undefined, HpackBlock}
     ),
@@ -2247,9 +2284,16 @@ handle_slot(#loop{awaiting_slot = Awaiting, listener_name = ListenerName} = Stat
 %% `withdraw_parked/2` keeps `awaiting_slot` and `streams` in step, so a
 %% grant that still has its parked request always has its stream too.
 -spec spawn_parked(#loop{}, stream_id(), roadrunner_req:request()) -> #loop{}.
-spawn_parked(#loop{streams = Streams, proto_opts = ProtoOpts} = State, StreamId, Req) ->
+spawn_parked(
+    #loop{streams = Streams, proto_opts = ProtoOpts, peer_max_header_list_size = PeerLimit} =
+        State,
+    StreamId,
+    Req
+) ->
     #{StreamId := Stream} = Streams,
-    {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(self(), StreamId, Req, ProtoOpts),
+    {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
+        self(), StreamId, Req, ProtoOpts, PeerLimit
+    ),
     State#loop{
         streams = Streams#{StreamId := Stream#{worker_pid := WorkerPid, worker_ref := MonRef}},
         worker_refs = (State#loop.worker_refs)#{MonRef => StreamId}
@@ -2346,6 +2390,16 @@ apply_header_table_size(Params, #loop{hpack_enc = Enc} = State) ->
                     State#loop{hpack_enc = roadrunner_http2_hpack:set_max_table_size(Size, Enc)}
             end
     end.
+
+%% RFC 9113 §6.5.2: SETTINGS_MAX_HEADER_LIST_SIZE (id 6) is the most
+%% header bytes the peer will take in one section. It is advisory
+%% (§10.5.1), but a peer may treat a larger one as malformed, so we keep
+%% the last value it sent (§6.5.3) for the workers spawned from now on.
+-spec apply_peer_max_header_list_size(
+    [{non_neg_integer(), non_neg_integer()}], #loop{}
+) -> #loop{}.
+apply_peer_max_header_list_size(Params, #loop{peer_max_header_list_size = Current} = State) ->
+    State#loop{peer_max_header_list_size = last_setting(Params, 6, Current)}.
 
 last_setting([], _Id, V) -> V;
 last_setting([{Id, V} | Rest], Id, _) -> last_setting(Rest, Id, V);

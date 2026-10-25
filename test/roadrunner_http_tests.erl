@@ -105,6 +105,15 @@ header_list_size_sums_fields_with_overhead_test() ->
         roadrunner_http:header_list_size([{~"a", ~"bb"}, {~"ccc", ~""}])
     ).
 
+fits_header_list_size_test() ->
+    %% RFC 9113 §6.5.2 / RFC 9114 §4.2.2: a field section fits the peer's
+    %% limit while its size (name + value + 32 per field) is at most it.
+    %% 7 + 3 + 32 = 42 bytes.
+    Fields = [{~":status", ~"200"}],
+    ?assert(roadrunner_http:fits_header_list_size(Fields, 42)),
+    ?assertNot(roadrunner_http:fits_header_list_size(Fields, 41)),
+    ?assert(roadrunner_http:fits_header_list_size([], 0)).
+
 %% --- with_defaults/2 ---
 
 with_defaults_empty_defaults_returns_headers_unchanged_test() ->

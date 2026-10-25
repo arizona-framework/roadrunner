@@ -643,7 +643,9 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
   over-cap request gets `431` + `RST_STREAM(NO_ERROR)`. Bounds a
   different unit than `max_header_block` (which caps the compressed
   block). Defaults to `2 * max_header_block`, so raising the encoded
-  cap lifts this one too unless set explicitly.
+  cap lifts this one too unless set explicitly. The other way round,
+  response headers are kept within the limit a client sends in its own
+  `SETTINGS_MAX_HEADER_LIST_SIZE` (see `t:roadrunner_handler:response/0`).
 """.
 -type http2_opts() :: #{
     conn_window => 1..16#7FFFFFFF,

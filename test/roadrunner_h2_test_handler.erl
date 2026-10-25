@@ -202,6 +202,42 @@ handle(#{target := ~"/stream/bad-trailers"} = Req) ->
         end},
         Req
     };
+handle(#{target := ~"/big-headers"} = Req) ->
+    %% A 200-byte header value (237 bytes counted with its name and the 32
+    %% of overhead), over a small client SETTINGS_MAX_HEADER_LIST_SIZE.
+    {{200, [{~"x-big", binary:copy(~"v", 200)}], ~"ok"}, Req};
+handle(#{target := ~"/stream/big-headers"} = Req) ->
+    %% The same on a streamed response's headers. The worker answers 500
+    %% before the fun runs, so its `a` never reaches the wire.
+    {
+        {stream, 200, [{~"x-big", binary:copy(~"v", 200)}], fun(Send) ->
+            Send(~"a", fin)
+        end},
+        Req
+    };
+handle(#{target := ~"/sendfile/big-headers"} = Req) ->
+    {{sendfile, 200, [{~"x-big", binary:copy(~"v", 200)}], {"/dev/null", 0, 0}}, Req};
+handle(#{target := ~"/loop/big-headers"} = Req) ->
+    {{loop, 200, [{~"x-big", binary:copy(~"v", 200)}], 0}, Req};
+handle(#{target := ~"/stream/send-after-fin"} = Req) ->
+    %% A stream fun that sends again after its `fin`: the conn tells the
+    %% worker the stream was reset, and the worker exits `stream_reset`.
+    {
+        {stream, 200, [], fun(Send) ->
+            Send(~"done", fin),
+            Send(~"more", nofin)
+        end},
+        Req
+    };
+handle(#{target := ~"/stream/big-trailers"} = Req) ->
+    %% Trailers over a small client SETTINGS_MAX_HEADER_LIST_SIZE, sent
+    %% after the 200 HEADERS and the body.
+    {
+        {stream, 200, [], fun(Send) ->
+            Send(~"body", {fin, [{~"x-big", binary:copy(~"v", 200)}]})
+        end},
+        Req
+    };
 handle(#{target := ~"/bad-body"} = Req) ->
     %% A buffered body that is not iodata: the worker crashes sizing it,
     %% before anything reaches the conn.
