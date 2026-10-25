@@ -1448,8 +1448,8 @@ hibernate_path_handles_tcp_error_test() ->
 
 hibernate_path_handles_deadline_fired_test() ->
     %% With short keep_alive_timeout AND hibernate_after, the
-    %% deadline timer fires before hibernation does — covers the
-    %% `{?MODULE, deadline_fired}` clause.
+    %% deadline comes before hibernation does, so the receive's
+    %% `after` times the conn out without ever hibernating.
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink_with_send_log(
@@ -1469,6 +1469,57 @@ hibernate_path_handles_deadline_fired_test() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 2000 -> error(no_normal_exit)
     end,
+    Sink ! stop.
+
+hibernated_conn_still_times_out_on_keep_alive_test() ->
+    %% Regression: the conn hibernates well before `keep_alive_timeout`
+    %% and the peer never sends again. A hibernated process only wakes on
+    %% a message, so the deadline timer armed before hibernating is what
+    %% must wake it and close the conn, silently (no 408) on keep-alive.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink_with_send_log(
+        Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    ),
+    Opts = (fake_opts(hib_ka_to))#{
+        dispatch :=
+            {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
+                undefined},
+        hibernate_after => 20,
+        keep_alive_timeout := 200
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(hibernated_conn_never_timed_out)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    ?assertEqual(2, length(binary:split(Sent, ~"HTTP/1.1 ", [global]))),
+    ?assertEqual(nomatch, binary:match(Sent, ~"HTTP/1.1 408")),
+    Sink ! stop.
+
+hibernated_conn_still_writes_408_on_request_timeout_test() ->
+    %% Same on the first request: a peer that connects and stays silent
+    %% past `hibernate_after` still gets its 408 once `request_timeout`
+    %% elapses, instead of holding a hibernated conn open forever.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_silent_sink_with_send_log(Self, Tag),
+    Opts = (fake_opts(hib_req_to))#{
+        hibernate_after => 20,
+        request_timeout := 200
+    },
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(hibernated_conn_never_timed_out)
+    end,
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertMatch(<<"HTTP/1.1 408", _/binary>>, Sent),
     Sink ! stop.
 
 hibernate_path_drops_stray_messages_test() ->

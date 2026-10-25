@@ -94,6 +94,8 @@ all_test_() ->
         fun runtime_transport_error_triggers_goaway/0,
         fun runtime_idle_timeout_emits_goaway/0,
         fun hibernate_after_fires_when_idle/0,
+        fun hibernated_idle_conn_still_emits_goaway/0,
+        fun hibernate_after_past_idle_timeout_emits_goaway/0,
         fun idle_timeout_with_open_stream_emits_goaway/0,
         fun rst_stream_active_stream_synced/0,
         fun stream_window_update_grows_window_synced/0,
@@ -2107,6 +2109,51 @@ hibernate_after_fires_when_idle() ->
         serve_recv(ConnPid, Hf),
         ?assertMatch(<<_:24, 1, _/binary>>, expect_send()),
         cleanup(Pid, Ref)
+    after
+        persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
+    end.
+
+hibernated_idle_conn_still_emits_goaway() ->
+    %% Regression: the conn hibernates well before its idle timeout. A
+    %% hibernated process only wakes on a message, so the timer armed
+    %% before hibernating is what must wake it and send the idle GOAWAY.
+    {ok, _} = roadrunner_test_event_handler:start(),
+    drain_mailbox(),
+    persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 200),
+    try
+        {Pid, Ref, ConnPid} = start_http2_conn(#{hibernate_after => 20}),
+        _ = expect_send(),
+        serve_recv(ConnPid, ?PREFACE),
+        serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        ?assertMatch(<<0, 0, 8, 7, _/binary>>, expect_send()),
+        expect_close(),
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 2000 -> error(process_did_not_exit)
+        end
+    after
+        persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
+    end.
+
+hibernate_after_past_idle_timeout_emits_goaway() ->
+    %% With no stream open and `hibernate_after` longer than the idle
+    %% timeout, the idle timeout comes first: GOAWAY, no hibernation.
+    {ok, _} = roadrunner_test_event_handler:start(),
+    drain_mailbox(),
+    persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 100),
+    try
+        {Pid, Ref, ConnPid} = start_http2_conn(#{hibernate_after => 5000}),
+        _ = expect_send(),
+        serve_recv(ConnPid, ?PREFACE),
+        serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        ?assertMatch(<<0, 0, 8, 7, _/binary>>, expect_send()),
+        expect_close(),
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 2000 -> error(process_did_not_exit)
+        end
     after
         persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
     end.

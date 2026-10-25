@@ -76,7 +76,7 @@
 %% Hibernate continuation — invoked via `erlang:hibernate/3` when an
 %% idle conn parks past `hibernate_after`. Must stay exported so the
 %% runtime can re-enter the loop on wake.
--export([recv_more_hib/1]).
+-export([recv_more_hib/2]).
 
 %% RFC 9113 §3.4 client connection preface — fixed 24 bytes.
 -define(PREFACE, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
@@ -622,30 +622,35 @@ recv_more(
     end.
 
 %% Idle-wait timeout selection. When no streams are in flight AND the
-%% listener opted into `hibernate_after`, park for that (typically
-%% shorter) window so `recv_idle_expired/1` can hibernate. Otherwise
-%% the GOAWAY idle timeout applies — including whenever streams are
-%% active, where worker messages are imminent and hibernating would be
-%% pointless.
+%% listener opted into a `hibernate_after` shorter than the idle
+%% timeout, park for that window so `recv_idle_expired/1` can
+%% hibernate. Otherwise the GOAWAY idle timeout applies: whenever
+%% streams are active, where worker messages are imminent and
+%% hibernating would be pointless, and when the idle timeout comes
+%% first anyway.
 -spec recv_timeout(#loop{}) -> non_neg_integer().
-recv_timeout(#loop{streams = Streams, hibernate_after = Ms}) when
-    map_size(Streams) =:= 0, Ms > 0
+recv_timeout(#loop{streams = Streams, hibernate_after = Ms, idle_timeout = T}) when
+    map_size(Streams) =:= 0, Ms > 0, Ms < T
 ->
     Ms;
 recv_timeout(#loop{idle_timeout = T}) ->
     T.
 
 %% Fired when `recv_more/1` sees no traffic for `recv_timeout/1`. With
-%% an empty streams map and `hibernate_after` set, collapse the heap
-%% via hibernation; the socket is already `{active, once}`-armed (we
-%% reached recv_more through `arm_and_recv/1`), so the next inbound
-%% frame — or any worker / `'DOWN'` / drain message — wakes us and
-%% `recv_more_hib/1` resumes the loop. Otherwise emit the idle GOAWAY.
+%% an empty streams map and `hibernate_after` the shorter wait, collapse
+%% the heap via hibernation; the socket is already `{active, once}`-armed
+%% (we reached recv_more through `arm_and_recv/1`), so the next inbound
+%% frame, or any worker / `'DOWN'` / drain message, wakes us and
+%% `recv_more_hib/2` resumes the loop. A hibernated process only wakes
+%% on a message, so a timer for the rest of the idle timeout goes with
+%% it: without one, an idle conn would never send its idle GOAWAY.
+%% Otherwise emit the idle GOAWAY now.
 -spec recv_idle_expired(#loop{}) -> no_return().
-recv_idle_expired(#loop{streams = Streams, hibernate_after = Ms} = State) when
-    map_size(Streams) =:= 0, Ms > 0
+recv_idle_expired(#loop{streams = Streams, hibernate_after = Ms, idle_timeout = T} = State) when
+    map_size(Streams) =:= 0, Ms > 0, Ms < T
 ->
-    erlang:hibernate(?MODULE, recv_more_hib, [State]);
+    TRef = erlang:start_timer(T - Ms, self(), ?MODULE),
+    erlang:hibernate(?MODULE, recv_more_hib, [State, TRef]);
 recv_idle_expired(State) ->
     idle_goaway(State).
 
@@ -654,12 +659,22 @@ idle_goaway(State) ->
     _ = send_goaway(State, protocol_error),
     exit_clean(State, keep_alive_timeout).
 
-%% Hibernate re-entry (see `recv_idle_expired/1`). Resumes the unified
-%% mailbox loop after an idle conn wakes from `erlang:hibernate/3`.
+%% Hibernate re-entry (see `recv_idle_expired/1`). Drops the idle
+%% timer and resumes the unified mailbox loop after an idle conn wakes
+%% from `erlang:hibernate/3`. If the timer already fired, the conn sat
+%% out its whole idle timeout: consume the timer's message and send the
+%% idle GOAWAY.
 -doc false.
--spec recv_more_hib(#loop{}) -> no_return().
-recv_more_hib(State) ->
-    recv_more(State).
+-spec recv_more_hib(#loop{}, reference()) -> no_return().
+recv_more_hib(State, TRef) ->
+    case erlang:cancel_timer(TRef) of
+        false ->
+            receive
+                {timeout, TRef, ?MODULE} -> idle_goaway(State)
+            end;
+        _Left ->
+            recv_more(State)
+    end.
 
 %% Begin a graceful drain: emit GOAWAY(NO_ERROR) once, refuse new
 %% streams henceforth. In-flight workers continue to completion.
