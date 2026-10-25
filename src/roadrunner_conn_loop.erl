@@ -72,7 +72,7 @@
 %% Internal entries — invoked via `proc_lib:start/3` and via
 %% `erlang:hibernate/3`. Must stay exported so the runtime can
 %% re-enter them after wake-from-hibernate.
--export([init_loop/3, recv_request_bytes_hib/2, ws_session_wake/6]).
+-export([init_loop/3, recv_request_bytes_hib/3, ws_session_wake/6]).
 
 %% Loop-state record carried through every phase. Allocated once on
 %% the transition out of `awaiting_shoot` and pattern-matched (not
@@ -735,11 +735,16 @@ drain_mailbox_check() ->
         ok
     end.
 
-%% Recv path with hibernation. Arms ONE `send_after` for the
-%% request/keep-alive deadline and uses the receive's `after` clause
-%% exclusively for the hibernate trigger. On wake (any inbound
-%% message) the function re-enters via `erlang:hibernate/3`'s
-%% `(?MODULE, recv_request_bytes_hib, [S, Deadline])` continuation.
+%% Recv path with hibernation. The receive's `after` covers both the
+%% hibernate trigger and the request/keep-alive deadline: it waits
+%% `min(HibernateAfter, Remaining)`, and on firing either times the conn
+%% out (the deadline came first) or hibernates. A busy conn therefore
+%% arms no timer per recv. Only a conn about to hibernate arms one, an
+%% absolute `start_timer` at the deadline, because a hibernated process
+%% only wakes on a message: without it an idle conn would outlive its
+%% `keep_alive_timeout` / `request_timeout` for as long as the peer
+%% stays silent. On wake the function re-enters via
+%% `recv_request_bytes_hib/3`, which drops that timer first.
 -spec recv_with_hibernate(#loop_state{}, integer(), pos_integer()) -> no_return().
 recv_with_hibernate(
     #loop_state{
@@ -754,10 +759,8 @@ recv_with_hibernate(
 ) ->
     {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
     Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
-    DeadlineRef = erlang:send_after(Remaining, self(), {?MODULE, deadline_fired}),
     receive
         {DataTag, _Sock, Bytes} ->
-            _ = erlang:cancel_timer(DeadlineRef),
             Now = erlang:monotonic_time(millisecond),
             %% Anchor the slowloris window at the first byte of the
             %% request (`PhaseBytes =:= 0`), not at phase entry, so an
@@ -783,36 +786,46 @@ recv_with_hibernate(
                     exit_normal(S, slow_client)
             end;
         {ClosedTag, _Sock} ->
-            _ = erlang:cancel_timer(DeadlineRef),
             exit_normal(S, peer_closed);
         {ErrorTag, _Sock, Reason} ->
-            _ = erlang:cancel_timer(DeadlineRef),
             exit_normal(S, {transport, Reason});
         {roadrunner_drain, _Deadline} ->
-            _ = erlang:cancel_timer(DeadlineRef),
             exit_normal(S, drained);
-        {?MODULE, deadline_fired} ->
-            timeout_response(S),
-            exit_normal(S, timeout_reason(S));
         _Stray ->
-            _ = erlang:cancel_timer(DeadlineRef),
             arm_active_once(S),
             recv_with_hibernate(S, Deadline, HibernateAfter)
-    after HibernateAfter ->
-        %% Idle window elapsed — drop the deadline timer (it'll
-        %% be re-armed when the conn wakes) and hibernate. The
-        %% process's heap GCs and shrinks; the next inbound
-        %% TCP packet wakes it.
-        _ = erlang:cancel_timer(DeadlineRef),
-        erlang:hibernate(?MODULE, recv_request_bytes_hib, [S, Deadline])
+    after min(HibernateAfter, Remaining) ->
+        case Remaining =< HibernateAfter of
+            true ->
+                timeout_response(S),
+                exit_normal(S, timeout_reason(S));
+            false ->
+                %% Idle window elapsed with the deadline still ahead.
+                %% The heap GCs and shrinks; the next inbound packet,
+                %% or the deadline timer, wakes the conn.
+                TRef = erlang:start_timer(Deadline, self(), ?MODULE, [{abs, true}]),
+                erlang:hibernate(?MODULE, recv_request_bytes_hib, [S, Deadline, TRef])
+        end
     end.
 
-%% Hibernate continuation. Re-enters `recv_request_bytes/2` so
-%% the next iteration picks up wherever the recv shape demands
-%% (with or without hibernation, depending on `hibernate_after`).
+%% Hibernate continuation. Drops the deadline timer armed before
+%% hibernating, then re-enters `recv_request_bytes/2` so the next
+%% iteration picks up wherever the recv shape demands. If the timer is
+%% what woke the conn, its message is consumed here and the deadline,
+%% now in the past, times the conn out on the next receive.
 -doc false.
--spec recv_request_bytes_hib(#loop_state{}, integer()) -> no_return().
-recv_request_bytes_hib(S, Deadline) ->
+-spec recv_request_bytes_hib(#loop_state{}, integer(), reference()) -> no_return().
+recv_request_bytes_hib(S, Deadline, TRef) ->
+    case erlang:cancel_timer(TRef) of
+        false ->
+            %% Already fired: its message is queued or on its way, and
+            %% nothing else consumes it, so wait for it here.
+            receive
+                {timeout, TRef, ?MODULE} -> ok
+            end;
+        _Left ->
+            ok
+    end,
     recv_request_bytes(S, Deadline).
 
 %% Slowloris on first request → 408. Idle keep-alive timeout →
