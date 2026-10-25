@@ -476,8 +476,9 @@ Standards conformance:
   Conformance harness: [`scripts/h2spec.sh`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/h2spec.sh) (drives
   [h2spec](https://github.com/summerwind/h2spec)).
 - **HTTP/3 (experimental)**: RFC 9114 over QUIC with QPACK (RFC 9204)
-  static-table compression, over Roadrunner's own pure-Erlang QUIC
-  transport (TLS 1.3 required). Conformance harness:
+  header compression, the client's dynamic table included, over
+  Roadrunner's own pure-Erlang QUIC transport (TLS 1.3 required).
+  Conformance harness:
   [`scripts/h3spec.sh`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/h3spec.sh) (drives
   [h3spec](https://github.com/kazu-yamamoto/h3spec)). Interop harness:
   [`scripts/h3interop.sh`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/h3interop.sh)

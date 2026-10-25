@@ -1,13 +1,19 @@
 -module(roadrunner_qpack).
 -moduledoc false.
 
-%% QPACK field-section codec for HTTP/3 (RFC 9204), static-table only.
+%% QPACK codec for HTTP/3 (RFC 9204): field sections, and the instructions
+%% of the encoder and decoder streams.
 %%
-%% roadrunner advertises `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0`, so neither
-%% side uses the dynamic table: every field line is an indexed static entry,
-%% a literal with a static name reference, or a literal with a literal name
-%% (RFC 9204 §4.5). The Encoded Field Section Prefix is therefore always the
-%% two bytes `00 00` (Required Insert Count 0, Base 0, §4.5.1).
+%% roadrunner's encoder never uses the dynamic table, so every field section
+%% it sends is static-only: an indexed static entry, a literal with a static
+%% name reference, or a literal with a literal name per field line (RFC 9204
+%% §4.5), behind the two-byte prefix `00 00` (Required Insert Count 0, Base 0,
+%% §4.5.1). Its decoder takes a dynamic table the peer fills through its
+%% encoder stream (`encoder_instructions/2` into a `roadrunner_qpack_table`),
+%% and a field section may reference it (`decode/2`). `decode/1` is the
+%% static-only decoder; `decode/2` hands a section whose Required Insert Count
+%% is 0 straight to it, so a peer that never uses the dynamic table costs
+%% nothing more than before.
 %%
 %% The prefixed-integer codec (RFC 9204 §4.1.1) is byte-identical to HPACK's
 %% (RFC 7541 §5.1) and the string Huffman table is the shared RFC 7541
@@ -18,7 +24,9 @@
 %% function-clause dispatch, mirroring `roadrunner_http2_hpack`'s static
 %% table (the BEAM turns it into a jump table, no `persistent_term` read).
 
--export([encode/1, decode/1]).
+-export([encode/1, decode/1, decode/2]).
+-export([encoder_instructions/2]).
+-export([section_acknowledgment/1, stream_cancellation/1, insert_count_increment/1]).
 
 -export_type([headers/0]).
 
@@ -29,9 +37,29 @@
     {qpack, dynamic_table_required}
     | {qpack, dynamic_field_line, byte()}
     | {qpack, invalid_static_index, non_neg_integer()}
+    | {qpack, invalid_dynamic_index, integer()}
+    | {qpack, invalid_required_insert_count, non_neg_integer()}
+    | {qpack, blocked, non_neg_integer()}
+    | {qpack, invalid_base}
     | {qpack, bad_integer}
     | {qpack, huffman}
     | {qpack, truncated}.
+
+-type instruction_error() ::
+    {qpack, capacity_exceeded}
+    | {qpack, entry_too_large}
+    | {qpack, invalid_static_index, non_neg_integer()}
+    | {qpack, invalid_dynamic_index, non_neg_integer()}
+    | {qpack, instruction_too_large}
+    | {qpack, bad_integer}
+    | {qpack, huffman}.
+
+%% What a field section's dynamic references resolve against: `none` for a
+%% static-only section (any dynamic reference is an error), else the table
+%% with the section's Base and Required Insert Count (§4.5.1).
+-type section_table() ::
+    none
+    | {roadrunner_qpack_table:t(), Base :: non_neg_integer(), RequiredInsertCount :: pos_integer()}.
 
 %% =============================================================================
 %% encode/1
@@ -105,16 +133,109 @@ encode_string(Str) ->
 
 -doc """
 Decode a static-only QPACK field section. Any field line that references
-the dynamic table (which roadrunner never enables) is a decode error,
-surfaced as `{error, {qpack, _}}` for the caller to map to
-H3_QPACK_DECOMPRESSION_FAILED (RFC 9204 §2.2).
+the dynamic table is a decode error, surfaced as `{error, {qpack, _}}` for
+the caller to map to H3_QPACK_DECOMPRESSION_FAILED (RFC 9204 §2.2).
 """.
 -spec decode(binary()) -> {ok, headers()} | {error, decode_error()}.
 decode(Data) ->
     maybe
         {ok, Rest} ?= decode_prefix(Data),
-        decode_field_lines(Rest)
+        decode_field_lines(Rest, none)
     end.
+
+-doc """
+Decode a QPACK field section against the connection's dynamic table,
+returning the headers and the section's Required Insert Count (RFC 9204
+§4.5.1.1): 0 for a static-only section, which needs no Section
+Acknowledgment (§4.4.1). This side advertises
+SETTINGS_QPACK_BLOCKED_STREAMS = 0, so a section that needs inserts the
+table has not received yet is an error rather than a blocked stream
+(§2.1.2), as is a reference to an evicted entry or to one at or past the
+Required Insert Count (§2.2.3). Every error maps to
+H3_QPACK_DECOMPRESSION_FAILED.
+""".
+-spec decode(binary(), roadrunner_qpack_table:t()) ->
+    {ok, headers(), non_neg_integer()} | {error, decode_error()}.
+decode(<<0, _/binary>> = Data, _Table) ->
+    case decode(Data) of
+        {ok, Headers} -> {ok, Headers, 0};
+        {error, _} = Error -> Error
+    end;
+decode(<<B, Rest/binary>>, Table) ->
+    maybe
+        {ok, EncodedInsertCount, AfterCount} ?= integer(B, 16#FF, Rest),
+        {ok, Ric} ?= required_insert_count(EncodedInsertCount, Table),
+        {ok, Base, Lines} ?= base(Ric, AfterCount),
+        {ok, Headers} ?= decode_field_lines(Lines, {Table, Base, Ric}),
+        {ok, Headers, Ric}
+    end;
+decode(<<>>, _Table) ->
+    {error, {qpack, truncated}}.
+
+%% Reconstruct the Required Insert Count from its encoded form (RFC 9204
+%% §4.5.1.1), which the encoder sent modulo `2 * MaxEntries`. A value no
+%% conformant encoder could produce is an error, and so is one past the
+%% inserts received: with no blocked streams allowed the section cannot
+%% wait for them (§2.1.2).
+-spec required_insert_count(pos_integer(), roadrunner_qpack_table:t()) ->
+    {ok, pos_integer()} | {error, decode_error()}.
+required_insert_count(Encoded, Table) ->
+    MaxEntries = roadrunner_qpack_table:max_entries(Table),
+    FullRange = 2 * MaxEntries,
+    case Encoded > FullRange of
+        true ->
+            {error, {qpack, invalid_required_insert_count, Encoded}};
+        false ->
+            TotalInserts = roadrunner_qpack_table:insert_count(Table),
+            MaxValue = TotalInserts + MaxEntries,
+            MaxWrapped = (MaxValue div FullRange) * FullRange,
+            unwrap_insert_count(MaxWrapped + Encoded - 1, MaxValue, FullRange, TotalInserts)
+    end.
+
+%% The unwrapping steps of the §4.5.1.1 algorithm: a value past the most the
+%% encoder could have meant wrapped one fewer time, and 0 is never encoded
+%% this way.
+-spec unwrap_insert_count(
+    non_neg_integer(), non_neg_integer(), pos_integer(), non_neg_integer()
+) -> {ok, pos_integer()} | {error, decode_error()}.
+unwrap_insert_count(Ric, MaxValue, FullRange, _TotalInserts) when
+    Ric > MaxValue, Ric =< FullRange
+->
+    {error, {qpack, invalid_required_insert_count, Ric}};
+unwrap_insert_count(Ric, MaxValue, FullRange, TotalInserts) when Ric > MaxValue ->
+    check_insert_count(Ric - FullRange, TotalInserts);
+unwrap_insert_count(Ric, _MaxValue, _FullRange, TotalInserts) ->
+    check_insert_count(Ric, TotalInserts).
+
+-spec check_insert_count(non_neg_integer(), non_neg_integer()) ->
+    {ok, pos_integer()} | {error, decode_error()}.
+check_insert_count(0, _TotalInserts) ->
+    {error, {qpack, invalid_required_insert_count, 0}};
+check_insert_count(Ric, TotalInserts) when Ric > TotalInserts ->
+    {error, {qpack, blocked, Ric}};
+check_insert_count(Ric, _TotalInserts) ->
+    {ok, Ric}.
+
+%% The Base (RFC 9204 §4.5.1.2): a Sign bit and a 7-bit-prefix Delta Base
+%% relative to the Required Insert Count. A negative Base is invalid.
+-spec base(pos_integer(), binary()) ->
+    {ok, non_neg_integer(), binary()} | {error, decode_error()}.
+base(Ric, <<Sign:1, Delta:7, Rest/binary>>) ->
+    maybe
+        {ok, DeltaBase, Lines} ?= integer(Delta, 16#7F, Rest),
+        signed_base(Sign, Ric, DeltaBase, Lines)
+    end;
+base(_Ric, <<>>) ->
+    {error, {qpack, truncated}}.
+
+-spec signed_base(0..1, pos_integer(), non_neg_integer(), binary()) ->
+    {ok, non_neg_integer(), binary()} | {error, decode_error()}.
+signed_base(0, Ric, DeltaBase, Lines) ->
+    {ok, Ric + DeltaBase, Lines};
+signed_base(1, Ric, DeltaBase, Lines) when DeltaBase < Ric ->
+    {ok, Ric - DeltaBase - 1, Lines};
+signed_base(1, _Ric, _DeltaBase, _Lines) ->
+    {error, {qpack, invalid_base}}.
 
 %% Field Section Prefix (RFC 9204 §4.5.1): an 8-bit-prefix Encoded Insert
 %% Count then a Sign bit + 7-bit-prefix Delta Base. Static-only sections
@@ -131,89 +252,90 @@ decode_prefix(<<Eric, _/binary>>) when Eric =/= 0 ->
 decode_prefix(_) ->
     {error, {qpack, truncated}}.
 
--spec decode_field_lines(binary()) -> {ok, headers()} | {error, decode_error()}.
+-spec decode_field_lines(binary(), section_table()) -> {ok, headers()} | {error, decode_error()}.
 %% A field line whose integers fit their prefix plus at most one
 %% continuation byte (every static index, and names and values below 135
 %% bytes) is matched here and in the helpers below, so the rest of the
 %% section stays a match context; `decode_field_line/1` returns each line
 %% as an `{ok, Header, Rest}` tuple and takes the others.
-decode_field_lines(<<>>) ->
+decode_field_lines(<<>>, _Dyn) ->
     {ok, []};
-decode_field_lines(<<B, Rest/binary>>) when B >= 2#11000000, B =/= 16#FF ->
+decode_field_lines(<<B, Rest/binary>>, Dyn) when B >= 2#11000000, B =/= 16#FF ->
     maybe
         {ok, Entry} ?= static_indexed(B band 16#3F),
-        {ok, Tail} ?= decode_field_lines(Rest),
+        {ok, Tail} ?= decode_field_lines(Rest, Dyn),
         {ok, [Entry | Tail]}
     end;
-decode_field_lines(<<16#FF, C, Rest/binary>>) when C < 128 ->
+decode_field_lines(<<16#FF, C, Rest/binary>>, Dyn) when C < 128 ->
     maybe
         {ok, Entry} ?= static_indexed(16#3F + C),
-        {ok, Tail} ?= decode_field_lines(Rest),
+        {ok, Tail} ?= decode_field_lines(Rest, Dyn),
         {ok, [Entry | Tail]}
     end;
-decode_field_lines(<<B, Rest/binary>>) when
+decode_field_lines(<<B, Rest/binary>>, Dyn) when
     B band 2#11010000 =:= 2#01010000, B band 16#0F =/= 16#0F
 ->
-    name_ref_line(B band 16#0F, Rest);
-decode_field_lines(<<B, C, Rest/binary>>) when B band 2#11010000 =:= 2#01010000, C < 128 ->
-    name_ref_line(16#0F + C, Rest);
-decode_field_lines(<<B, Rest/binary>>) when
+    name_ref_line(B band 16#0F, Rest, Dyn);
+decode_field_lines(<<B, C, Rest/binary>>, Dyn) when B band 2#11010000 =:= 2#01010000, C < 128 ->
+    name_ref_line(16#0F + C, Rest, Dyn);
+decode_field_lines(<<B, Rest/binary>>, Dyn) when
     B band 2#11100000 =:= 2#00100000, B band 2#111 =/= 2#111
 ->
-    literal_name_line((B bsr 3) band 1, B band 2#111, Rest);
-decode_field_lines(<<B, C, Rest/binary>>) when B band 2#11100000 =:= 2#00100000, C < 128 ->
-    literal_name_line((B bsr 3) band 1, 2#111 + C, Rest);
-decode_field_lines(Data) ->
+    literal_name_line((B bsr 3) band 1, B band 2#111, Rest, Dyn);
+decode_field_lines(<<B, C, Rest/binary>>, Dyn) when B band 2#11100000 =:= 2#00100000, C < 128 ->
+    literal_name_line((B bsr 3) band 1, 2#111 + C, Rest, Dyn);
+decode_field_lines(Data, Dyn) ->
     maybe
-        {ok, Header, Rest} ?= decode_field_line(Data),
-        {ok, Tail} ?= decode_field_lines(Rest),
+        {ok, Header, Rest} ?= decode_field_line(Data, Dyn),
+        {ok, Tail} ?= decode_field_lines(Rest, Dyn),
         {ok, [Header | Tail]}
     end.
 
 %% The value's length within its 7-bit prefix, else `decode_string/1`.
--spec name_ref_line(non_neg_integer(), binary()) -> {ok, headers()} | {error, decode_error()}.
-name_ref_line(Index, <<H:1, Len:7, Body:Len/binary, Rest/binary>>) when Len < 127 ->
+-spec name_ref_line(non_neg_integer(), binary(), section_table()) ->
+    {ok, headers()} | {error, decode_error()}.
+name_ref_line(Index, <<H:1, Len:7, Body:Len/binary, Rest/binary>>, Dyn) when Len < 127 ->
     maybe
         {ok, Name} ?= static_name(Index),
         {ok, Value} ?= string_value(H, Body),
-        {ok, Tail} ?= decode_field_lines(Rest),
+        {ok, Tail} ?= decode_field_lines(Rest, Dyn),
         {ok, [{Name, Value} | Tail]}
     end;
-name_ref_line(Index, Data) ->
+name_ref_line(Index, Data, Dyn) ->
     maybe
         {ok, Name} ?= static_name(Index),
         {ok, Value, Rest} ?= decode_string(Data),
-        {ok, Tail} ?= decode_field_lines(Rest),
+        {ok, Tail} ?= decode_field_lines(Rest, Dyn),
         {ok, [{Name, Value} | Tail]}
     end.
 
--spec literal_name_line(0..1, non_neg_integer(), binary()) ->
+-spec literal_name_line(0..1, non_neg_integer(), binary(), section_table()) ->
     {ok, headers()} | {error, decode_error()}.
-literal_name_line(NH, NameLen, Data) ->
+literal_name_line(NH, NameLen, Data, Dyn) ->
     case Data of
         <<NBody:NameLen/binary, VH:1, VLen:7, VBody:VLen/binary, Rest/binary>> when VLen < 127 ->
             maybe
                 {ok, Name} ?= string_value(NH, NBody),
                 {ok, Value} ?= string_value(VH, VBody),
-                {ok, Tail} ?= decode_field_lines(Rest),
+                {ok, Tail} ?= decode_field_lines(Rest, Dyn),
                 {ok, [{Name, Value} | Tail]}
             end;
         _ ->
             maybe
                 {ok, Name, AfterName} ?= take_string(NH, NameLen, Data),
                 {ok, Value, Rest} ?= decode_string(AfterName),
-                {ok, Tail} ?= decode_field_lines(Rest),
+                {ok, Tail} ?= decode_field_lines(Rest, Dyn),
                 {ok, [{Name, Value} | Tail]}
             end
     end.
 
-%% The field lines `decode_field_lines/1` does not match inline: an integer
+%% The field lines `decode_field_lines/2` does not match inline: an integer
 %% past one continuation byte, a line cut short, or a dynamic-table
 %% reference (RFC 9204 §4.5). The pattern bits are tested with `band`, as
 %% there.
--spec decode_field_line(binary()) ->
+-spec decode_field_line(binary(), section_table()) ->
     {ok, header(), binary()} | {error, decode_error()}.
-decode_field_line(<<B, Rest/binary>>) when B >= 2#11000000 ->
+decode_field_line(<<B, Rest/binary>>, _Dyn) when B >= 2#11000000 ->
     %% 11xxxxxx — Indexed Field Line, static, 6-bit index. One that gets
     %% here takes two or more continuation bytes (at least 191), past the
     %% 99-entry static table, or is cut short.
@@ -221,7 +343,7 @@ decode_field_line(<<B, Rest/binary>>) when B >= 2#11000000 ->
         {ok, Index, _} ?= integer(B band 16#3F, 16#3F, Rest),
         {error, {qpack, invalid_static_index, Index}}
     end;
-decode_field_line(<<B, Rest/binary>>) when B band 2#11010000 =:= 2#01010000 ->
+decode_field_line(<<B, Rest/binary>>, _Dyn) when B band 2#11010000 =:= 2#01010000 ->
     %% 01N1xxxx — Literal Field Line with Name Reference, static, 4-bit
     %% index; N (never index) only matters to intermediaries. As above, an
     %% index that gets here (at least 143) is past the table.
@@ -229,7 +351,7 @@ decode_field_line(<<B, Rest/binary>>) when B band 2#11010000 =:= 2#01010000 ->
         {ok, Index, _} ?= integer(B band 16#0F, 16#0F, Rest),
         {error, {qpack, invalid_static_index, Index}}
     end;
-decode_field_line(<<B, Rest/binary>>) when B band 2#11100000 =:= 2#00100000 ->
+decode_field_line(<<B, Rest/binary>>, _Dyn) when B band 2#11100000 =:= 2#00100000 ->
     %% 001NHxxx — Literal Field Line with Literal Name. 3-bit name length.
     maybe
         {ok, NameLen, AfterLen} ?= integer(B band 2#111, 2#111, Rest),
@@ -237,12 +359,71 @@ decode_field_line(<<B, Rest/binary>>) when B band 2#11100000 =:= 2#00100000 ->
         {ok, Value, Rest1} ?= decode_string(AfterName),
         {ok, {Name, Value}, Rest1}
     end;
-decode_field_line(<<Byte, _/binary>>) ->
+decode_field_line(<<Byte, _/binary>>, none) ->
     %% `1 0` (dynamic indexed), `0 1 _ 0` (dynamic name ref), `0 0 0 1`
     %% (post-base index), `0 0 0 0` (post-base name ref): all reference the
-    %% dynamic table, which is never enabled. `decode_field_lines/1` only
-    %% calls this on a non-empty buffer, so a 1-byte match is total.
-    {error, {qpack, dynamic_field_line, Byte}}.
+    %% dynamic table, which a section with Required Insert Count 0 cannot.
+    %% `decode_field_lines/2` only calls this on a non-empty buffer, so a
+    %% 1-byte match is total.
+    {error, {qpack, dynamic_field_line, Byte}};
+decode_field_line(<<B, Rest/binary>>, Dyn) when B >= 2#10000000 ->
+    %% 10xxxxxx: Indexed Field Line, dynamic (§4.5.2): a 6-bit relative
+    %% index, counted down from Base - 1.
+    maybe
+        {ok, Index, Rest1} ?= integer(B band 16#3F, 16#3F, Rest),
+        {ok, Entry} ?= dynamic_entry(relative, Index, Dyn),
+        {ok, Entry, Rest1}
+    end;
+decode_field_line(<<B, Rest/binary>>, Dyn) when B >= 2#01000000 ->
+    %% 01N0xxxx: Literal Field Line with Name Reference, dynamic (§4.5.4):
+    %% a 4-bit relative index for the name, then the value string.
+    maybe
+        {ok, Index, Rest1} ?= integer(B band 16#0F, 16#0F, Rest),
+        {ok, {Name, _}} ?= dynamic_entry(relative, Index, Dyn),
+        {ok, Value, Rest2} ?= decode_string(Rest1),
+        {ok, {Name, Value}, Rest2}
+    end;
+decode_field_line(<<B, Rest/binary>>, Dyn) when B >= 2#00010000 ->
+    %% 0001xxxx: Indexed Field Line with Post-Base Index (§4.5.3): a 4-bit
+    %% index counted up from Base.
+    maybe
+        {ok, Index, Rest1} ?= integer(B band 16#0F, 16#0F, Rest),
+        {ok, Entry} ?= dynamic_entry(post_base, Index, Dyn),
+        {ok, Entry, Rest1}
+    end;
+decode_field_line(<<B, Rest/binary>>, Dyn) ->
+    %% 0000Nxxx: Literal Field Line with Post-Base Name Reference
+    %% (§4.5.5): a 3-bit post-base index for the name, then the value.
+    maybe
+        {ok, Index, Rest1} ?= integer(B band 2#111, 2#111, Rest),
+        {ok, {Name, _}} ?= dynamic_entry(post_base, Index, Dyn),
+        {ok, Value, Rest2} ?= decode_string(Rest1),
+        {ok, {Name, Value}, Rest2}
+    end.
+
+%% The dynamic entry a field line references (RFC 9204 §3.2.5, §3.2.6): a
+%% relative index counts down from Base - 1, a post-base index up from
+%% Base. The absolute index must be below the section's Required Insert
+%% Count and still in the table (§2.2.3).
+-spec dynamic_entry(
+    relative | post_base,
+    non_neg_integer(),
+    {roadrunner_qpack_table:t(), non_neg_integer(), pos_integer()}
+) -> {ok, header()} | {error, decode_error()}.
+dynamic_entry(relative, Index, {Table, Base, Ric}) ->
+    absolute_entry(Base - 1 - Index, Table, Ric);
+dynamic_entry(post_base, Index, {Table, Base, Ric}) ->
+    absolute_entry(Base + Index, Table, Ric).
+
+-spec absolute_entry(integer(), roadrunner_qpack_table:t(), pos_integer()) ->
+    {ok, header()} | {error, decode_error()}.
+absolute_entry(Absolute, Table, Ric) when Absolute >= 0, Absolute < Ric ->
+    case roadrunner_qpack_table:absolute(Absolute, Table) of
+        {ok, _} = Ok -> Ok;
+        error -> {error, {qpack, invalid_dynamic_index, Absolute}}
+    end;
+absolute_entry(Absolute, _Table, _Ric) ->
+    {error, {qpack, invalid_dynamic_index, Absolute}}.
 
 %% A string: `H` bit + 7-bit-prefix length + octets (Huffman if H=1).
 -spec decode_string(binary()) -> {ok, binary(), binary()} | {error, decode_error()}.
@@ -302,6 +483,177 @@ static_name(Index) ->
         invalid -> {error, {qpack, invalid_static_index, Index}};
         {Name, _Value} -> {ok, Name}
     end.
+
+%% =============================================================================
+%% Encoder stream (RFC 9204 §4.3)
+%% =============================================================================
+
+-doc """
+Apply the instructions in a chunk of the peer's encoder stream (RFC 9204
+§4.3) to the dynamic table. Returns the table and the bytes of a last
+instruction not fully received yet, for the caller to put in front of the
+stream's next chunk. A capacity over the advertised maximum (§4.3.1), an
+entry larger than the capacity (§3.2.2), a reference to a static or dynamic
+entry that does not exist (§3.1, §2.2.3), an integer past 62 bits, or a
+partial instruction already longer than any valid one could be is an
+error, which the caller maps to QPACK_ENCODER_STREAM_ERROR.
+""".
+-spec encoder_instructions(binary(), roadrunner_qpack_table:t()) ->
+    {ok, roadrunner_qpack_table:t(), binary()} | {error, instruction_error()}.
+encoder_instructions(Data, Table) ->
+    case encoder_instruction(Data, Table) of
+        {ok, Table1, Rest} -> encoder_instructions(Rest, Table1);
+        more -> pending_instruction(Data, Table);
+        {error, _} = Error -> Error
+    end.
+
+%% A partial instruction waits for the rest of its bytes, but only up to the
+%% size a valid one can reach: its entry fits the capacity, a Huffman-coded
+%% string is at most 30/8 of its decoded length (RFC 7541 Appendix B codes
+%% are 5 to 30 bits), and its integers take a few bytes more. So a peer
+%% cannot make the connection buffer an instruction without bound.
+-spec pending_instruction(binary(), roadrunner_qpack_table:t()) ->
+    {ok, roadrunner_qpack_table:t(), binary()} | {error, instruction_error()}.
+pending_instruction(Data, Table) ->
+    case byte_size(Data) > 4 * roadrunner_qpack_table:capacity(Table) + 64 of
+        true -> {error, {qpack, instruction_too_large}};
+        false -> {ok, Table, Data}
+    end.
+
+%% One encoder instruction, `more` when its bytes have not all arrived.
+-spec encoder_instruction(binary(), roadrunner_qpack_table:t()) ->
+    {ok, roadrunner_qpack_table:t(), binary()} | more | {error, instruction_error()}.
+encoder_instruction(<<1:1, T:1, Index:6, Rest/binary>>, Table) ->
+    %% 1Txxxxxx: Insert with Name Reference (§4.3.2), the name from the
+    %% static table (T = 1) or the dynamic one by relative index (T = 0).
+    maybe
+        {ok, NameIndex, AfterIndex} ?= stream_integer(Index, 16#3F, Rest),
+        {ok, Name} ?= insert_name(T, NameIndex, Table),
+        {ok, Value, AfterValue} ?= stream_string(AfterIndex),
+        insert_entry(Name, Value, Table, AfterValue)
+    end;
+encoder_instruction(<<2#01:2, H:1, Len:5, Rest/binary>>, Table) ->
+    %% 01Hxxxxx: Insert with Literal Name (§4.3.3), a 6-bit prefix name
+    %% string then the value string.
+    maybe
+        {ok, NameLen, AfterLen} ?= stream_integer(Len, 16#1F, Rest),
+        {ok, Name, AfterName} ?= stream_take(H, NameLen, AfterLen),
+        {ok, Value, AfterValue} ?= stream_string(AfterName),
+        insert_entry(Name, Value, Table, AfterValue)
+    end;
+encoder_instruction(<<2#001:3, Prefix:5, Rest/binary>>, Table) ->
+    %% 001xxxxx: Set Dynamic Table Capacity (§4.3.1).
+    maybe
+        {ok, Capacity, After} ?= stream_integer(Prefix, 16#1F, Rest),
+        {ok, Table1} ?= table_result(roadrunner_qpack_table:set_capacity(Capacity, Table)),
+        {ok, Table1, After}
+    end;
+encoder_instruction(<<2#000:3, Index:5, Rest/binary>>, Table) ->
+    %% 000xxxxx: Duplicate (§4.3.4) the entry at a relative index.
+    maybe
+        {ok, Relative, After} ?= stream_integer(Index, 16#1F, Rest),
+        {ok, {Name, Value}} ?= relative_entry(Relative, Table),
+        insert_entry(Name, Value, Table, After)
+    end;
+encoder_instruction(<<>>, _Table) ->
+    more.
+
+%% The name an Insert with Name Reference takes: a static entry's (T = 1)
+%% or, by relative index, a dynamic entry's (T = 0), where 0 is the newest
+%% (§3.2.5).
+-spec insert_name(0..1, non_neg_integer(), roadrunner_qpack_table:t()) ->
+    {ok, binary()} | {error, instruction_error()}.
+insert_name(1, Index, _Table) ->
+    static_name(Index);
+insert_name(0, Index, Table) ->
+    maybe
+        {ok, {Name, _}} ?= relative_entry(Index, Table),
+        {ok, Name}
+    end.
+
+-spec relative_entry(non_neg_integer(), roadrunner_qpack_table:t()) ->
+    {ok, header()} | {error, instruction_error()}.
+relative_entry(Index, Table) ->
+    case roadrunner_qpack_table:relative(Index, Table) of
+        {ok, _} = Ok -> Ok;
+        error -> {error, {qpack, invalid_dynamic_index, Index}}
+    end.
+
+-spec insert_entry(binary(), binary(), roadrunner_qpack_table:t(), binary()) ->
+    {ok, roadrunner_qpack_table:t(), binary()} | {error, instruction_error()}.
+insert_entry(Name, Value, Table, Rest) ->
+    maybe
+        {ok, Table1} ?= table_result(roadrunner_qpack_table:insert(Name, Value, Table)),
+        {ok, Table1, Rest}
+    end.
+
+-spec table_result({ok, roadrunner_qpack_table:t()} | {error, atom()}) ->
+    {ok, roadrunner_qpack_table:t()} | {error, instruction_error()}.
+table_result({ok, _} = Ok) -> Ok;
+table_result({error, Reason}) -> {error, {qpack, Reason}}.
+
+%% A prefixed integer (§4.1.1) on the encoder stream, which may end in the
+%% middle of one: `more` while its continuation bytes are still coming.
+%% Past 62 bits (nine continuation bytes) it is an error.
+-spec stream_integer(non_neg_integer(), pos_integer(), binary()) ->
+    {ok, non_neg_integer(), binary()} | more | {error, instruction_error()}.
+stream_integer(Max, Max, Rest) ->
+    stream_continuation(Rest, Max, 0);
+stream_integer(Prefix, _Max, Rest) ->
+    {ok, Prefix, Rest}.
+
+-spec stream_continuation(binary(), non_neg_integer(), non_neg_integer()) ->
+    {ok, non_neg_integer(), binary()} | more | {error, instruction_error()}.
+stream_continuation(<<0:1, Bits:7, Rest/binary>>, I, Shift) ->
+    {ok, I + (Bits bsl Shift), Rest};
+stream_continuation(<<1:1, Bits:7, Rest/binary>>, I, Shift) when Shift < 56 ->
+    stream_continuation(Rest, I + (Bits bsl Shift), Shift + 7);
+stream_continuation(<<>>, _I, _Shift) ->
+    more;
+stream_continuation(_Rest, _I, _Shift) ->
+    {error, {qpack, bad_integer}}.
+
+%% An 8-bit prefix string literal (§4.1.2) on the encoder stream.
+-spec stream_string(binary()) -> {ok, binary(), binary()} | more | {error, instruction_error()}.
+stream_string(<<H:1, Len:7, Rest/binary>>) ->
+    maybe
+        {ok, Length, After} ?= stream_integer(Len, 16#7F, Rest),
+        stream_take(H, Length, After)
+    end;
+stream_string(<<>>) ->
+    more.
+
+-spec stream_take(0..1, non_neg_integer(), binary()) ->
+    {ok, binary(), binary()} | more | {error, instruction_error()}.
+stream_take(H, Len, Bin) ->
+    case Bin of
+        <<Str:Len/binary, Rest/binary>> ->
+            maybe
+                {ok, Value} ?= string_value(H, Str),
+                {ok, Value, Rest}
+            end;
+        _ ->
+            more
+    end.
+
+%% =============================================================================
+%% Decoder stream (RFC 9204 §4.4)
+%% =============================================================================
+
+-doc "A Section Acknowledgment (RFC 9204 §4.4.1) for a field section decoded on `StreamId`.".
+-spec section_acknowledgment(non_neg_integer()) -> iodata().
+section_acknowledgment(StreamId) ->
+    roadrunner_http2_hpack:encode_integer(7, 2#10000000, StreamId).
+
+-doc "A Stream Cancellation (RFC 9204 §4.4.2) for a stream abandoned before its field sections were all decoded.".
+-spec stream_cancellation(non_neg_integer()) -> iodata().
+stream_cancellation(StreamId) ->
+    roadrunner_http2_hpack:encode_integer(6, 2#01000000, StreamId).
+
+-doc "An Insert Count Increment (RFC 9204 §4.4.3) of `Increment`, which is never 0.".
+-spec insert_count_increment(pos_integer()) -> iodata().
+insert_count_increment(Increment) ->
+    roadrunner_http2_hpack:encode_integer(6, 2#00000000, Increment).
 
 %% =============================================================================
 %% Static table (RFC 9204 Appendix A, indices 0-98)

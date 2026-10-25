@@ -70,7 +70,8 @@ encode_string_branches_test() ->
 %% =============================================================================
 
 decode_non_zero_ric_test() ->
-    %% A Required Insert Count > 0 references the dynamic table we never enable.
+    %% A Required Insert Count > 0 needs the dynamic table, which the
+    %% static-only `decode/1` does not take (`decode/2` does).
     ?assertEqual({error, {qpack, dynamic_table_required}}, ?M:decode(<<5, 0, 16#80>>)).
 
 decode_truncated_prefix_test() ->
@@ -125,7 +126,7 @@ decode_second_field_line_error_propagates_test() ->
     ?assertEqual({error, {qpack, dynamic_field_line, 16#80}}, ?M:decode(Section)).
 
 %% =============================================================================
-%% Field lines matched in the clause heads vs through decode_field_line/1.
+%% Field lines matched in the clause heads vs through decode_field_line/2.
 %% =============================================================================
 
 %% Integers within their prefix or one continuation byte take the inline
@@ -182,8 +183,306 @@ inline_field_line_errors_test() ->
     ].
 
 %% =============================================================================
+%% Dynamic table: RFC 9204 Appendix B, run in order on one table.
+%% =============================================================================
+
+appendix_b_test() ->
+    Table0 = roadrunner_qpack_table:new(4096),
+    %% B.1: a static-only section decodes against the table as it is, with
+    %% Required Insert Count 0 (no acknowledgment owed).
+    ?assertEqual(
+        {ok, [{~":path", ~"/index.html"}], 0},
+        ?M:decode(hex("0000 510b 2f69 6e64 6578 2e68 746d 6c"), Table0)
+    ),
+    %% B.2: capacity 220, two inserts with static name references, then a
+    %% section of two post-base references (Required Insert Count 2, Base 0)
+    %% and its acknowledgment.
+    {ok, Table1, <<>>} = ?M:encoder_instructions(
+        hex(
+            "3fbd01 c00f 7777 772e 6578 616d 706c 652e 636f 6d"
+            " c10c 2f73 616d 706c 652f 7061 7468"
+        ),
+        Table0
+    ),
+    ?assertEqual(220, roadrunner_qpack_table:capacity(Table1)),
+    ?assertEqual(
+        {ok, [{~":authority", ~"www.example.com"}, {~":path", ~"/sample/path"}], 2},
+        ?M:decode(hex("0381 10 11"), Table1)
+    ),
+    ?assertEqual(hex("84"), iolist_to_binary(?M:section_acknowledgment(4))),
+    %% B.3: a speculative insert with a literal name, and the Insert Count
+    %% Increment for it.
+    {ok, Table2, <<>>} = ?M:encoder_instructions(
+        hex("4a63 7573 746f 6d2d 6b65 790c 6375 7374 6f6d 2d76 616c 7565"), Table1
+    ),
+    ?assertEqual(
+        {ok, {~"custom-key", ~"custom-value"}}, roadrunner_qpack_table:absolute(2, Table2)
+    ),
+    ?assertEqual(hex("01"), iolist_to_binary(?M:insert_count_increment(1))),
+    %% B.4: a Duplicate of relative index 2 (absolute 0), then a section
+    %% (Required Insert Count 4, Base 4) mixing dynamic and static lines,
+    %% and the Stream Cancellation the example sends instead of decoding it.
+    {ok, Table3, <<>>} = ?M:encoder_instructions(hex("02"), Table2),
+    ?assertEqual(
+        {ok,
+            [
+                {~":authority", ~"www.example.com"},
+                {~":path", ~"/"},
+                {~"custom-key", ~"custom-value"}
+            ],
+            4},
+        ?M:decode(hex("0500 80 c1 81"), Table3)
+    ),
+    ?assertEqual(hex("48"), iolist_to_binary(?M:stream_cancellation(8))),
+    %% B.5: an insert with a dynamic name reference (relative 1, absolute 2)
+    %% evicts the oldest entry, absolute 0.
+    {ok, Table4, <<>>} = ?M:encoder_instructions(
+        hex("810d 6375 7374 6f6d 2d76 616c 7565 32"), Table3
+    ),
+    ?assertEqual(
+        {ok, {~"custom-key", ~"custom-value2"}}, roadrunner_qpack_table:absolute(4, Table4)
+    ),
+    ?assertEqual(error, roadrunner_qpack_table:absolute(0, Table4)),
+    %% A section referencing the evicted entry (Required Insert Count 5,
+    %% Base 5, relative index 4 = absolute 0) fails (RFC 9204 §2.2.3).
+    ?assertEqual(
+        {error, {qpack, invalid_dynamic_index, 0}}, ?M:decode(hex("0600 84"), Table4)
+    ).
+
+%% Every split of the B.2 encoder-stream bytes into two chunks applies the
+%% same: an instruction cut short waits for the next chunk.
+encoder_instructions_split_test() ->
+    Bytes = hex(
+        "3fbd01 c00f 7777 772e 6578 616d 706c 652e 636f 6d"
+        " c10c 2f73 616d 706c 652f 7061 7468"
+    ),
+    {ok, Whole, <<>>} = ?M:encoder_instructions(Bytes, roadrunner_qpack_table:new(4096)),
+    [
+        begin
+            <<First:N/binary, Second/binary>> = Bytes,
+            {ok, Table1, Pending} = ?M:encoder_instructions(
+                First, roadrunner_qpack_table:new(4096)
+            ),
+            ?assertEqual(
+                {ok, Whole, <<>>},
+                ?M:encoder_instructions(<<Pending/binary, Second/binary>>, Table1)
+            )
+        end
+     || N <- lists:seq(0, byte_size(Bytes))
+    ].
+
+encoder_huffman_strings_test() ->
+    %% Insert with Literal Name with both strings Huffman coded (H = 1).
+    Name = roadrunner_http2_hpack_huffman:encode(~"x-custom"),
+    Value = roadrunner_http2_hpack_huffman:encode(~"some value"),
+    Instruction = <<
+        (iolist_to_binary(roadrunner_http2_hpack:encode_integer(5, 2#01100000, byte_size(Name))))/binary,
+        Name/binary,
+        (str_huffman(Value))/binary
+    >>,
+    {ok, Table, <<>>} = ?M:encoder_instructions(<<16#3F, 16#E1, 16#1F, Instruction/binary>>, new()),
+    ?assertEqual({ok, {~"x-custom", ~"some value"}}, roadrunner_qpack_table:relative(0, Table)).
+
+encoder_instruction_errors_test() ->
+    Cap = <<16#3F, 16#E1, 16#1F>>,
+    Errors = [
+        %% A capacity over the advertised 4096 (§4.3.1).
+        {capacity_exceeded, <<16#3F, 16#E2, 16#1F>>},
+        %% An entry that does not fit the capacity (§3.2.2): capacity 0.
+        {entry_too_large, <<16#C0, 16#01, $x>>},
+        %% A capacity integer past 62 bits.
+        {bad_integer, <<16#3F, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF>>},
+        %% A value string that is not valid Huffman (EOS padding of 0s).
+        {huffman, <<Cap/binary, 16#C0, 16#81, 16#00>>}
+    ],
+    [
+        ?assertMatch({error, {qpack, Reason}}, ?M:encoder_instructions(Bytes, new()))
+     || {Reason, Bytes} <- Errors
+    ].
+
+encoder_instruction_bad_references_test() ->
+    Cap = <<16#3F, 16#E1, 16#1F>>,
+    %% Insert with Name Reference to static index 99, past the table (§3.1),
+    %% and to a dynamic entry that is not there; a Duplicate of one (§4.3.4).
+    ?assertEqual(
+        {error, {qpack, invalid_dynamic_index, 0}},
+        ?M:encoder_instructions(<<Cap/binary, 16#80, 16#01, $x>>, new())
+    ),
+    ?assertEqual(
+        {error, {qpack, invalid_static_index, 99}},
+        ?M:encoder_instructions(<<Cap/binary, 16#FF, 16#24, 16#01, $x>>, new())
+    ),
+    ?assertEqual(
+        {error, {qpack, invalid_dynamic_index, 0}},
+        ?M:encoder_instructions(<<Cap/binary, 16#00>>, new())
+    ).
+
+encoder_pending_bound_test() ->
+    %% A partial instruction may grow to what a valid one could take, 4
+    %% times the capacity plus 64 bytes, and no further.
+    Cap = <<16#3F, 16#01>>,
+    {ok, Table, _} = ?M:encoder_instructions(Cap, new()),
+    ?assertEqual(32, roadrunner_qpack_table:capacity(Table)),
+    Partial = <<16#40, 16#7F, 16#FF, 16#01>>,
+    Fits = <<Partial/binary, (binary:copy(~"a", 4 * 32 + 64 - byte_size(Partial)))/binary>>,
+    ?assertEqual({ok, Table, Fits}, ?M:encoder_instructions(Fits, Table)),
+    ?assertEqual(
+        {error, {qpack, instruction_too_large}},
+        ?M:encoder_instructions(<<Fits/binary, $a>>, Table)
+    ).
+
+encoder_capacity_zero_test() ->
+    %% With the dynamic table off (maximum 0) the one valid instruction is
+    %% a capacity of 0.
+    Off = roadrunner_qpack_table:new(0),
+    ?assertMatch({ok, _, <<>>}, ?M:encoder_instructions(<<16#20, 16#20>>, Off)),
+    ?assertEqual(
+        {error, {qpack, capacity_exceeded}}, ?M:encoder_instructions(<<16#21>>, Off)
+    ).
+
+%% RFC 9204 §4.5.1.1's example: a 100-byte table (MaxEntries 3, so the
+%% count goes modulo 6) that has had 10 inserts reads an encoded 4 as a
+%% Required Insert Count of 9.
+required_insert_count_wraps_test() ->
+    Ten = lists:foldl(
+        fun(_, Acc) -> insert(~"", ~"", Acc) end, table(100), lists:seq(1, 10)
+    ),
+    ?assertEqual({ok, [{~"", ~""}], 9}, ?M:decode(<<4, 16#00, 16#80>>, Ten)),
+    %% An encoded 2 reads as 13, past the 10 inserts: a section that would
+    %% block, which no blocked streams allows (§2.1.2).
+    ?assertEqual({error, {qpack, blocked, 13}}, ?M:decode(<<2, 16#00, 16#80>>, Ten)),
+    %% Past 2 * MaxEntries no encoder could have sent it.
+    ?assertEqual(
+        {error, {qpack, invalid_required_insert_count, 7}}, ?M:decode(<<7, 0>>, Ten)
+    ).
+
+required_insert_count_invalid_test() ->
+    Empty = table(100),
+    %% With no inserts an encoded 5 reads as 4, past the most the encoder
+    %% could mean (inserts + MaxEntries = 3) yet within 2 * MaxEntries.
+    ?assertEqual(
+        {error, {qpack, invalid_required_insert_count, 4}}, ?M:decode(<<5, 0>>, Empty)
+    ),
+    %% An encoded 1 reads as 0, which is only ever encoded as 0.
+    ?assertEqual(
+        {error, {qpack, invalid_required_insert_count, 0}}, ?M:decode(<<1, 0>>, Empty)
+    ),
+    %% A table with no room (maximum capacity 0) takes no Required Insert
+    %% Count but 0.
+    ?assertEqual(
+        {error, {qpack, invalid_required_insert_count, 1}},
+        ?M:decode(<<1, 0>>, roadrunner_qpack_table:new(0))
+    ),
+    %% An integer that runs out.
+    ?assertEqual({error, {qpack, bad_integer}}, ?M:decode(<<16#FF>>, Empty)).
+
+base_test() ->
+    Table = two_entries(),
+    %% Sign 1: Base = Required Insert Count - Delta Base - 1 = 2 - 0 - 1 = 1,
+    %% so relative 0 is absolute 0 and post-base 0 is absolute 1.
+    ?assertEqual(
+        {ok, [{~"a", ~"1"}, {~"b", ~"2"}], 2}, ?M:decode(<<3, 16#80, 16#80, 16#10>>, Table)
+    ),
+    %% Sign 1 with Delta Base >= Required Insert Count: a negative Base.
+    ?assertEqual({error, {qpack, invalid_base}}, ?M:decode(<<3, 16#82>>, Table)),
+    %% Sign 0: Base = 2 + 1 = 3, relative 1 is absolute 1.
+    ?assertEqual({ok, [{~"b", ~"2"}], 2}, ?M:decode(<<3, 16#01, 16#81>>, Table)),
+    %% A prefix that ends before the Base, or inside it.
+    ?assertEqual({error, {qpack, truncated}}, ?M:decode(<<3>>, Table)),
+    ?assertEqual({error, {qpack, bad_integer}}, ?M:decode(<<3, 16#7F>>, Table)).
+
+dynamic_name_references_test() ->
+    Table = two_entries(),
+    %% Literal with dynamic Name Reference (01N0, §4.5.4), relative 1 from
+    %% Base 2 = absolute 0, N set; then Literal with Post-Base Name
+    %% Reference (0000N, §4.5.5), post-base 0 from Base 1 = absolute 1.
+    ?assertEqual(
+        {ok, [{~"a", ~"x"}], 2}, ?M:decode(<<3, 16#00, 16#61, (str(0, ~"x"))/binary>>, Table)
+    ),
+    ?assertEqual(
+        {ok, [{~"b", ~"y"}], 2},
+        ?M:decode(<<3, 16#80, 16#08, (str(1, ~"y"))/binary>>, Table)
+    ),
+    %% A static line in a dynamic section takes the inline paths.
+    ?assertEqual(
+        {ok, [{~":method", ~"GET"}, {~"b", ~"2"}], 2},
+        ?M:decode(<<3, 16#00, 16#D1, 16#80>>, Table)
+    ).
+
+dynamic_reference_errors_test() ->
+    Table = two_entries(),
+    %% Relative index past Base: a negative absolute index.
+    ?assertEqual(
+        {error, {qpack, invalid_dynamic_index, -1}}, ?M:decode(<<3, 16#00, 16#82>>, Table)
+    ),
+    %% Post-base index at the Required Insert Count (§2.2.3), indexed and
+    %% as a name.
+    ?assertEqual(
+        {error, {qpack, invalid_dynamic_index, 2}}, ?M:decode(<<3, 16#00, 16#10>>, Table)
+    ),
+    ?assertEqual(
+        {error, {qpack, invalid_dynamic_index, 2}},
+        ?M:decode(<<3, 16#00, 16#00, (str(0, ~"v"))/binary>>, Table)
+    ),
+    %% A dynamic name reference whose index runs out, or whose value does.
+    ?assertEqual({error, {qpack, bad_integer}}, ?M:decode(<<3, 16#00, 16#4F>>, Table)),
+    ?assertEqual({error, {qpack, truncated}}, ?M:decode(<<3, 16#00, 16#41>>, Table)),
+    ?assertEqual({error, {qpack, bad_integer}}, ?M:decode(<<3, 16#00, 16#BF>>, Table)),
+    ?assertEqual({error, {qpack, bad_integer}}, ?M:decode(<<3, 16#00, 16#1F>>, Table)),
+    ?assertEqual({error, {qpack, bad_integer}}, ?M:decode(<<3, 16#00, 16#07>>, Table)),
+    %% An entry the table has evicted (§2.2.3): capacity 34 keeps only the
+    %% newest of the two.
+    {ok, One} = roadrunner_qpack_table:set_capacity(34, Table),
+    ?assertEqual(
+        {error, {qpack, invalid_dynamic_index, 0}}, ?M:decode(<<3, 16#00, 16#81>>, One)
+    ).
+
+decode_with_table_static_errors_test() ->
+    %% A section with Required Insert Count 0 is the static decoder's,
+    %% errors included; an empty one has no prefix.
+    ?assertEqual(
+        {error, {qpack, dynamic_field_line, 16#80}}, ?M:decode(<<0, 0, 16#80>>, new())
+    ),
+    ?assertEqual({error, {qpack, truncated}}, ?M:decode(<<>>, new())).
+
+decoder_instructions_test() ->
+    %% RFC 9204 §4.4: 7-, 6- and 6-bit prefixes, with continuations.
+    ?assertEqual(<<16#FF, 16#01>>, iolist_to_binary(?M:section_acknowledgment(128))),
+    ?assertEqual(<<16#7F, 16#01>>, iolist_to_binary(?M:stream_cancellation(64))),
+    ?assertEqual(<<16#3F, 16#01>>, iolist_to_binary(?M:insert_count_increment(64))).
+
+%% =============================================================================
 %% Helpers
 %% =============================================================================
+
+%% A table advertising and set to 4096 bytes.
+new() ->
+    roadrunner_qpack_table:new(4096).
+
+table(Capacity) ->
+    {ok, Table} = roadrunner_qpack_table:set_capacity(
+        Capacity, roadrunner_qpack_table:new(Capacity)
+    ),
+    Table.
+
+insert(Name, Value, Table) ->
+    {ok, Table1} = roadrunner_qpack_table:insert(Name, Value, Table),
+    Table1.
+
+%% A 4096-byte table holding `a: 1` (absolute 0) and `b: 2` (absolute 1).
+two_entries() ->
+    insert(~"b", ~"2", insert(~"a", ~"1", table(4096))).
+
+%% Bytes from a hex dump as RFC 9204 Appendix B prints them.
+hex(Dump) ->
+    binary:decode_hex(<<<<C>> || <<C>> <= iolist_to_binary(Dump), C =/= $\s>>).
+
+%% An 8-bit prefix string literal whose octets are already Huffman coded.
+str_huffman(Encoded) ->
+    <<
+        (iolist_to_binary(roadrunner_http2_hpack:encode_integer(7, 2#10000000, byte_size(Encoded))))/binary,
+        Encoded/binary
+    >>.
 
 %% `roadrunner_qpack:encode/1` returns iodata (it is framed and sent as
 %% iodata in production); flatten it here, where the decoder wants the

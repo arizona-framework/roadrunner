@@ -8,8 +8,8 @@ Connection-error codes asserted here are RFC 9114 §8.1 values:
 `16#0103` = H3_STREAM_CREATION_ERROR, `16#0104` = H3_CLOSED_CRITICAL_STREAM,
 `16#0105` = H3_FRAME_UNEXPECTED, `16#0106` = H3_FRAME_ERROR,
 `16#0107` = H3_EXCESSIVE_LOAD, `16#0109` = H3_SETTINGS_ERROR,
-`16#010A` = H3_MISSING_SETTINGS; and RFC 9204 §8.3 values: `16#0201` =
-QPACK_ENCODER_STREAM_ERROR, `16#0202` = QPACK_DECODER_STREAM_ERROR.
+`16#010A` = H3_MISSING_SETTINGS; and the RFC 9204 §8.3 value `16#0202` =
+QPACK_DECODER_STREAM_ERROR.
 """.
 -include_lib("eunit/include/eunit.hrl").
 
@@ -63,7 +63,7 @@ duplicate_control_stream_test() ->
 
 qpack_encoder_claimed_test() ->
     ?assertEqual(
-        {{qpack_encoder, none}, #{qpack_encoder => true}},
+        {{qpack_encoder, <<>>}, #{qpack_encoder => true}},
         ev({pending, <<>>}, #{}, t(qpack_encoder), false)
     ).
 
@@ -173,52 +173,34 @@ drain_more_test() ->
 drain_closed_test() ->
     ?assertEqual({drop, #{}}, ev(drain, #{}, <<>>, true)).
 
-%% --- QPACK encoder stream (we advertise table capacity 0) ---
+%% --- QPACK encoder stream ---
+%%
+%% `uni_event/4` only hands the encoder stream's bytes back, the ones from
+%% the stream-type chunk on and any partial instruction kept from before;
+%% the conn applies them to its dynamic table (`roadrunner_qpack_tests`
+%% covers the instructions).
 
-encoder_capacity_zero_accepted_test() ->
-    %% Set Dynamic Table Capacity 0 (0x20) is the one valid instruction,
-    %% here in the same chunk as the stream type.
+encoder_bytes_after_type_test() ->
     ?assertEqual(
-        {{qpack_encoder, none}, #{qpack_encoder => true}},
+        {{qpack_encoder, <<16#20, 16#20>>}, #{qpack_encoder => true}},
         ev({pending, <<>>}, #{}, <<(t(qpack_encoder))/binary, 16#20, 16#20>>, false)
     ).
 
-encoder_capacity_over_limit_test() ->
-    %% RFC 9204 §4.3.1: a capacity above our advertised 0, single-byte and
-    %% with a continuation.
-    ?assertMatch({conn_error, 16#0201, _}, ev({qpack_encoder, none}, #{}, <<16#21>>, false)),
-    ?assertMatch(
-        {conn_error, 16#0201, _}, ev({qpack_encoder, none}, #{}, <<16#3F, 16#E1, 16#1F>>, false)
+encoder_bytes_after_pending_test() ->
+    %% A partial instruction kept from the last chunk comes first.
+    ?assertEqual(
+        {{qpack_encoder, <<16#3F, 16#E1, 16#1F>>}, #{}},
+        ev({qpack_encoder, <<16#3F>>}, #{}, <<16#E1, 16#1F>>, false)
     ).
-
-encoder_insert_rejected_test() ->
-    %% Insert with Name Reference (1xxxxxxx) and with Literal Name (01xxxxxx)
-    %% cannot fit a zero-capacity table (§3.2.2).
-    ?assertMatch(
-        {conn_error, 16#0201, _}, ev({qpack_encoder, none}, #{}, <<16#C0, 16#01, $x>>, false)
-    ),
-    ?assertMatch(
-        {conn_error, 16#0201, _}, ev({qpack_encoder, none}, #{}, <<16#41, $a, 16#01, $x>>, false)
-    ).
-
-encoder_duplicate_rejected_test() ->
-    %% Duplicate (000xxxxx) names an entry a zero-capacity table cannot hold.
-    ?assertMatch({conn_error, 16#0201, _}, ev({qpack_encoder, none}, #{}, <<16#00>>, false)).
-
-encoder_invalid_after_valid_test() ->
-    ?assertMatch({conn_error, 16#0201, _}, ev({qpack_encoder, none}, #{}, <<16#20, 16#21>>, false)).
-
-encoder_closed_inside_instruction_test() ->
-    %% RFC 9204 §4.2: a capacity integer that goes on past its prefix, then
-    %% the stream closes: a closed critical stream, not a capacity error.
-    ?assertMatch({conn_error, 16#0104, _}, ev({qpack_encoder, none}, #{}, <<16#3F>>, true)),
-    ?assertEqual({{qpack_encoder, 1}, #{}}, ev({qpack_encoder, 0}, #{}, <<16#80>>, false)).
-
-encoder_integer_too_long_test() ->
-    ?assertMatch({conn_error, 16#0201, _}, ev({qpack_encoder, 9}, #{}, <<16#80>>, false)).
 
 encoder_closed_test() ->
-    ?assertMatch({conn_error, 16#0104, _}, ev({qpack_encoder, none}, #{}, <<16#20>>, true)).
+    %% RFC 9204 §4.2: closing the encoder stream is a closed critical
+    %% stream, mid-instruction or not.
+    ?assertMatch({conn_error, 16#0104, _}, ev({qpack_encoder, <<>>}, #{}, <<16#20>>, true)),
+    ?assertMatch({conn_error, 16#0104, _}, ev({qpack_encoder, <<16#3F>>}, #{}, <<>>, true)),
+    ?assertMatch(
+        {conn_error, 16#0104, _}, ev({pending, <<>>}, #{}, t(qpack_encoder), true)
+    ).
 
 %% --- QPACK decoder stream (our encoder never inserts) ---
 
@@ -259,7 +241,7 @@ reset_control_is_critical_test() ->
     ?assertEqual(critical, roadrunner_conn_loop_http3:uni_reset({control, <<>>, true})).
 
 reset_qpack_is_critical_test() ->
-    ?assertEqual(critical, roadrunner_conn_loop_http3:uni_reset({qpack_encoder, none})),
+    ?assertEqual(critical, roadrunner_conn_loop_http3:uni_reset({qpack_encoder, <<>>})),
     ?assertEqual(critical, roadrunner_conn_loop_http3:uni_reset({qpack_decoder, none})).
 
 reset_pending_is_noncritical_test() ->
