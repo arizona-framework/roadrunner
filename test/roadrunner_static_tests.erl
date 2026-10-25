@@ -389,6 +389,11 @@ static_test_() ->
                 Reply = http_get(Port, ~"/static/dotdot_link.txt"),
                 ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply)
             end},
+            {"relative .. symlink to an existing file outside is refused", fun() ->
+                Reply = http_get(Port, ~"/static/dotdot_real_link.txt"),
+                ?assertMatch(<<"HTTP/1.1 404 ", _/binary>>, Reply),
+                ?assertEqual(nomatch, binary:match(Reply, ~"sibling leak"))
+            end},
             {"symlink whose target is a directory still returns 404", fun() ->
                 %% After the symlink-policy gate approves the follow,
                 %% `read_file_info` on the target reports
@@ -1159,6 +1164,13 @@ setup() ->
     _ = file:make_symlink(
         filename:join(SiblingDir, "leak.txt"),
         filename:join(Dir, "sibling_attack.txt")
+    ),
+    %% Relative `..` symlink to a file that exists outside the docroot: the
+    %% `dotdot_link.txt` target above does not exist, so it would 404 even
+    %% if the `..` check let it through.
+    _ = file:make_symlink(
+        "../" ++ filename:basename(SiblingDir) ++ "/leak.txt",
+        filename:join(Dir, "dotdot_real_link.txt")
     ),
     %% Empty subdirectory — `filename:join` can resolve a path to it,
     %% but `file:read_file_info` reports `type = directory` so the

@@ -676,11 +676,11 @@ target_inside_docroot(FilePath, Req) ->
         relative ->
             %% A relative target without any `..` segments must land
             %% inside the directory containing the symlink, which by
-            %% construction is inside `dir`. The framework runs with
-            %% binary file names (default UTF-8 native encoding), so
-            %% `filename:split/1` yields binaries and the `~".."`
-            %% literal matches directly.
-            not lists:member(~"..", filename:split(Target));
+            %% construction is inside `dir`. `file:read_link/1` returns
+            %% the target as a string even for a binary path, so `..` is
+            %% matched in both forms: comparing against the binary alone
+            %% never matched and let every `..` link through.
+            not lists:any(fun(S) -> S =:= ".." orelse S =:= ~".." end, filename:split(Target));
         _ ->
             %% `filename:absname/1` strips trailing slashes (except for
             %% the root `/` itself, which we don't reasonably support
