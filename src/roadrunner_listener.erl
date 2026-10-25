@@ -673,6 +673,13 @@ HTTP/3 listener tunables (under `{http3, ThisMap}` in `protocols`).
   `2 * max_header_block`, so raising the encoded cap lifts this one too
   unless set explicitly. The h3 counterpart to the `{http2, ...}`
   `max_header_list_size` opt.
+- `qpack_max_table_capacity`: the most bytes of QPACK dynamic table
+  (RFC 9204 §3.2) a client may set up to compress its request headers,
+  advertised via `SETTINGS_QPACK_MAX_TABLE_CAPACITY`. Each connection
+  holds at most this much table (counted as name + value + 32 per entry,
+  §3.2.1). Default `4096`, the HTTP/2 HPACK default; `0` turns the
+  dynamic table off. The server's own response headers always use the
+  static table.
 - `secret` — a binary of at least 32 random bytes the QUIC keys of the
   listener derive from: the key of the stateless reset tokens (RFC 9000
   §10.3), so a client still talking to a connection the server has lost
@@ -694,6 +701,7 @@ HTTP/3 listener tunables (under `{http3, ThisMap}` in `protocols`).
     max_header_block => 1..16#7FFFFFFF,
     max_streams_bidi => 1..16#7FFFFFFF,
     max_field_section_size => 1..16#7FFFFFFF,
+    qpack_max_table_capacity => 0..16#7FFFFFFF,
     secret => binary()
 }.
 
@@ -1998,7 +2006,8 @@ http3_defaults() ->
         max_streams_bidi => ?H3_MAX_STREAMS_BIDI,
         %% Placeholder: resolved to `2 * max_header_block` when not set
         %% explicitly (see `resolve_max_field_section_size/2`).
-        max_field_section_size => 32768
+        max_field_section_size => 32768,
+        qpack_max_table_capacity => 4096
     }.
 
 -spec validate_http3_opts(map(), term()) -> http3_opts().
@@ -2021,19 +2030,22 @@ validate_http3_opts(Opts, Raw) ->
 -spec validate_http3_int_opt(term(), term(), http3_opts(), http3_opts(), term()) -> http3_opts().
 validate_http3_int_opt(K, V, Acc, Defaults, Raw) ->
     %% `listeners` caps at the reuseport-pool limit; `max_header_block`
-    %% (a byte size), `max_streams_bidi` (a stream count) and
-    %% `max_field_section_size` (a byte size) go up to the 31-bit ceiling.
-    Max =
+    %% (a byte size), `max_streams_bidi` (a stream count),
+    %% `max_field_section_size` and `qpack_max_table_capacity` (byte sizes)
+    %% go up to the 31-bit ceiling. Only `qpack_max_table_capacity` may be
+    %% 0, which turns the QPACK dynamic table off.
+    {Min, Max} =
         case K of
-            listeners -> ?MAX_H3_LISTENERS;
-            max_header_block -> 16#7FFFFFFF;
-            max_streams_bidi -> 16#7FFFFFFF;
-            max_field_section_size -> 16#7FFFFFFF;
-            _ -> 0
+            listeners -> {1, ?MAX_H3_LISTENERS};
+            max_header_block -> {1, 16#7FFFFFFF};
+            max_streams_bidi -> {1, 16#7FFFFFFF};
+            max_field_section_size -> {1, 16#7FFFFFFF};
+            qpack_max_table_capacity -> {0, 16#7FFFFFFF};
+            _ -> {1, 0}
         end,
     case is_map_key(K, Defaults) of
         false -> error({invalid_listener_opt, protocols, Raw});
-        true when is_integer(V), V >= 1, V =< Max -> Acc#{K => V};
+        true when is_integer(V), V >= Min, V =< Max -> Acc#{K => V};
         true -> error({invalid_listener_opt, protocols, Raw})
     end.
 
@@ -2058,13 +2070,15 @@ flatten_http3_opts(Entries) ->
             listeners := Listeners,
             max_header_block := MaxHeaderBlock,
             max_streams_bidi := MaxStreamsBidi,
-            max_field_section_size := MaxFieldSection
+            max_field_section_size := MaxFieldSection,
+            qpack_max_table_capacity := QpackMaxTableCapacity
         }} ->
             #{
                 http3_listeners => Listeners,
                 http3_max_header_block => MaxHeaderBlock,
                 http3_max_streams_bidi => MaxStreamsBidi,
-                http3_max_field_section_size => MaxFieldSection
+                http3_max_field_section_size => MaxFieldSection,
+                http3_qpack_max_table_capacity => QpackMaxTableCapacity
             }
     end.
 

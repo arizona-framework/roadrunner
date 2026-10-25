@@ -88,15 +88,20 @@ stream, so there is no burst to be lenient about.
 
 ## HTTP/3 follow-ups
 
-h3 shipped experimentally (`protocols => [http3]`, QPACK static-table
-only). Remaining work:
+h3 shipped experimentally (`protocols => [http3]`; QPACK decodes the
+client's dynamic table, responses use the static table). Remaining work:
 
 - WebSocket over h3 (`websocket` shape, still `501`) — RFC 9220
   Extended CONNECT; it reuses the stream I/O backend WebSocket over h2
   (RFC 8441) needs, so it follows that item, and shares its trade-offs
-- QPACK dynamic table (non-zero capacity) — static-table compression ships
-  today; the work is wiring encoder/decoder streams + section acks +
-  blocked-stream buffering into the owned conn loop
+- QPACK encoder dynamic table: compress response headers with a dynamic
+  table of our own (encoder stream, tracking the client's Section
+  Acknowledgments and Insert Count Increments before evicting), when the
+  client advertises a non-zero `SETTINGS_QPACK_MAX_TABLE_CAPACITY`
+- QPACK blocked streams: advertise `SETTINGS_QPACK_BLOCKED_STREAMS` > 0
+  and hold a request stream whose field section needs inserts still in
+  flight on the encoder stream, instead of the client waiting for our
+  Insert Count Increment before it can reference a new entry
 - HttpArena `baseline-h3` / `static-h3` profiles (the local
   `scripts/bench.escript` h3 path is wired and measured; these live in
   the separate `MDA2AV/HttpArena` repo)

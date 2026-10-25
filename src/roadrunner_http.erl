@@ -518,8 +518,8 @@ valid_target_bytes(_) ->
 %% Field validity shared by HTTP/2 and HTTP/3 (RFC 9113 §8.2.1, RFC 9114
 %% §4.2). HTTP/2 applies the two predicates as HPACK decodes each literal
 %% field, so a field the dynamic table repeats is checked once per
-%% connection; HTTP/3 (whose QPACK keeps no dynamic table) runs
-%% `check_fields/1` over each request's fields. A request breaking them
+%% connection; HTTP/3 (whose QPACK decoder takes dynamic-table entries
+%% as inserted) runs `check_fields/1` over each request's fields. A request breaking them
 %% is malformed, so a CR or LF never reaches a handler that copies a
 %% value into something line-based.
 -doc false.

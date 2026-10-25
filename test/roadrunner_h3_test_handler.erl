@@ -17,6 +17,15 @@ handle(#{target := ~"/echo"} = Req) ->
     {{200, [{~"content-type", ~"text/plain"}], roadrunner_req:body(Req)}, Req};
 handle(#{target := ~"/method"} = Req) ->
     {{200, [{~"content-type", ~"text/plain"}], roadrunner_req:method(Req)}, Req};
+handle(#{target := <<"/header/", Name/binary>>} = Req) ->
+    %% The value of the request header the path names, empty when absent,
+    %% so a test can check how the request's headers decoded.
+    Value =
+        case roadrunner_req:header(Name, Req) of
+            undefined -> ~"";
+            Found -> Found
+        end,
+    {{200, [{~"content-type", ~"text/plain"}], Value}, Req};
 handle(#{target := ~"/peer"} = Req) ->
     %% The peer port the request reports, so a test can follow a migration.
     {_Ip, Port} = roadrunner_req:peer(Req),

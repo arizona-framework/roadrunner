@@ -6,9 +6,9 @@
 %% `roadrunner_conn_loop_http3` once a request stream finishes
 %% receiving (HEADERS + body + the stream's FIN). The worker:
 %%
-%% 1. QPACK-decodes the HEADERS field block (stateless, static-table
-%%    only — the conn advertises `qpack_max_table_capacity = 0`) and
-%%    builds the request map.
+%% 1. Takes the request map the conn loop built: the conn QPACK-decodes
+%%    the HEADERS field block, as it holds the connection's dynamic table
+%%    and a decode failure is a connection error.
 %% 2. Resolves the route + middleware stack and calls the handler,
 %%    sharing the exact dispatch path h1/h2 use
 %%    (`roadrunner_conn:resolve_handler/2` + the pre-composed pipeline).
@@ -150,8 +150,9 @@ send_buffered(Conn, StreamId, Status, Headers, Body) ->
 %% contract shared with h1/h2 (see `roadrunner_stream_response` /
 %% `roadrunner_http2_stream_response`); if the fun returns without a
 %% fin variant we close the stream so the peer never sees it half-open.
-%% The worker writes straight to the QUIC stream — QPACK is static-only
-%% and QUIC streams are independent, so no conn round-trip (unlike h2).
+%% The worker writes straight to the QUIC stream — response headers are
+%% QPACK-encoded static-only (no encoder state shared with the conn) and
+%% QUIC streams are independent, so no conn round-trip (unlike h2).
 -spec send_stream(
     pid(),
     non_neg_integer(),

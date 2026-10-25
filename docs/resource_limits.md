@@ -108,6 +108,7 @@ list, with the keys `max_concurrent_streams` and `max_header_block`.
 |---|---|---|
 | Field section block (encoded HEADERS) | 16 KB | yes |
 | `initial_max_streams_bidi` | 100 | yes |
+| QPACK dynamic table (`SETTINGS_QPACK_MAX_TABLE_CAPACITY`) | 4 KB | yes |
 
 The encoded request field section is capped before it reaches the
 handler; an overrun answers `431 Request Header Fields Too Large`. The
@@ -115,8 +116,15 @@ concurrent client-initiated bidirectional (request) stream count is
 advertised to the peer in the QUIC transport parameters, the h3
 counterpart to HTTP/2's `max_concurrent_streams`. Both are tuned under
 `{http3, #{...}}` in the `protocols` list, with the keys
-`max_header_block` and `max_streams_bidi`. QPACK runs static-table only,
-so there is no dynamic-table memory to bound yet.
+`max_header_block` and `max_streams_bidi`.
+
+The QPACK dynamic table a client may fill to compress its request
+headers is capped per connection at `qpack_max_table_capacity` bytes
+(name + value + 32 per entry, RFC 9204 §3.2.1), set under
+`{http3, #{...}}` too; `0` turns it off. No blocked streams are allowed
+(`SETTINGS_QPACK_BLOCKED_STREAMS = 0`), so a request never waits on the
+encoder stream, and a partial encoder instruction is buffered only up to
+the size a valid one can reach.
 
 ## Connection and slow-client guards
 

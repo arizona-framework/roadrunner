@@ -24,21 +24,39 @@
 %%   {quic, Conn, {closed, Reason}}             connection closed
 %%
 %% On `connected` it opens its own control stream and sends SETTINGS
-%% (advertising `qpack_max_table_capacity = 0`, so QPACK runs
-%% static-table only — no dynamic-table encoder/decoder state). Request
-%% streams (client-initiated bidirectional, `StreamId rem 4 =:= 0`)
-%% accumulate HEADERS + DATA frames; on the stream FIN a per-stream
-%% `roadrunner_http3_stream_worker` is spawned to dispatch the request
-%% and write the response. Peer-initiated unidirectional streams
-%% (`rem 4 =:= 2`) are demultiplexed by stream type (RFC 9114 §6.2):
-%% the peer control stream is validated (exactly one, SETTINGS as its
-%% first frame, no request frames), the QPACK encoder/decoder streams
-%% are checked against the zero table capacity we advertise (only the
-%% instructions valid without a dynamic table are accepted), a
-%% client-initiated push stream is refused, and
-%% unknown stream types are ignored. A violation on any of these closes
-%% the connection with the matching RFC 9114 §8.1 / RFC 9204 §6 error
-%% code.
+%% (advertising the QPACK dynamic table capacity the peer's encoder may
+%% use, and no blocked streams). Request streams (client-initiated
+%% bidirectional, `StreamId rem 4 =:= 0`) accumulate HEADERS + DATA
+%% frames; on the stream FIN a per-stream `roadrunner_http3_stream_worker`
+%% is spawned to dispatch the request and write the response.
+%% Peer-initiated unidirectional streams (`rem 4 =:= 2`) are demultiplexed
+%% by stream type (RFC 9114 §6.2): the peer control stream is validated
+%% (exactly one, SETTINGS as its first frame, no request frames), the
+%% peer's QPACK encoder stream fills the dynamic table (see "QPACK" below),
+%% its decoder stream is checked against our static-only encoder (only
+%% Stream Cancellations are valid), a client-initiated push stream is
+%% refused, and unknown stream types are ignored. A violation on any of
+%% these closes the connection with the matching RFC 9114 §8.1 / RFC 9204
+%% §6 error code.
+%%
+%% QPACK (RFC 9204): only the decoder uses the dynamic table; the field
+%% sections this side sends are static-only. The peer's encoder-stream
+%% instructions are applied in order as they arrive, and each chunk that
+%% added entries is answered with an Insert Count Increment on our decoder
+%% stream (opened with the first one). With SETTINGS_QPACK_BLOCKED_STREAMS
+%% = 0 the encoder only references entries we have acknowledged, so a
+%% request's field section can always be decoded the moment its HEADERS
+%% frame is complete, and it is: in the same event, before any later
+%% encoder-stream data is applied, so the table it is decoded against is
+%% the one it was encoded for. A section that would need entries not
+%% received yet is QPACK_DECOMPRESSION_FAILED rather than a blocked stream
+%% (§2.1.2). Every decoded section with a non-zero Required Insert Count
+%% is acknowledged right after it is decoded (never before, so the encoder
+%% keeps the entries it references until then, §2.1.1), trailers included;
+%% a request stream abandoned or reset before its sections are all decoded
+%% gets a Stream Cancellation (§4.4.2). A section with Required Insert
+%% Count 0, every section of a peer that never uses the table, takes the
+%% static-only decoder, as before.
 %%
 %% On a graceful drain (a `{roadrunner_drain, _}` message from the
 %% listener) it sends a GOAWAY on its control stream (RFC 9114 §5.2),
@@ -64,6 +82,7 @@
 -export([
     decode_request_frames/3,
     decode_request_frames/4,
+    decode_request_frames/5,
     new_request_stream/1,
     uni_event/4,
     uni_reset/1,
@@ -87,10 +106,16 @@
 -define(H3_QPACK_ENCODER_STREAM_ERROR, 16#0201).
 -define(H3_QPACK_DECODER_STREAM_ERROR, 16#0202).
 
-%% Longest prefixed-integer continuation a QPACK stream instruction may
-%% carry: a value is at most 62 bits, which 5 or 6 prefix bits plus 9
-%% continuation bytes of 7 bits each cover.
+%% Longest prefixed-integer continuation a QPACK decoder stream
+%% instruction may carry: a value is at most 62 bits, which 6 prefix bits
+%% plus 9 continuation bytes of 7 bits each cover.
 -define(MAX_QPACK_INT_CONTINUATION, 9).
+
+%% Default SETTINGS_QPACK_MAX_TABLE_CAPACITY (RFC 9204 §5): the dynamic
+%% table the peer's encoder may fill, the size of HTTP/2's default HPACK
+%% table. Overridable per listener via the `qpack_max_table_capacity` http3
+%% opt; 0 turns the dynamic table off.
+-define(QPACK_MAX_TABLE_CAPACITY, 4096).
 
 %% Default cap on the encoded request field section (the HEADERS block).
 %% The body is bounded by `max_content_length`; this bounds header memory
@@ -114,14 +139,18 @@
 %% Per peer-uni-stream state: `pending` while the leading stream-type
 %% varint is still arriving, `control` once it is known to be the peer
 %% control stream (buffering frames + tracking whether SETTINGS was
-%% seen), `qpack_encoder` / `qpack_decoder` for the QPACK streams (each
-%% tracking how many continuation bytes of an instruction's integer it is
-%% inside, `none` between instructions), and `drain` for an unknown stream
-%% type whose bytes we read and discard.
+%% seen), `qpack_encoder` for the peer's encoder stream (holding the bytes
+%% of an instruction not fully received yet; `uni_event/4` hands the
+%% stream's bytes back this way and `encoder_stream_in/3` applies them),
+%% `qpack_decoder` for its decoder stream (tracking how many continuation
+%% bytes of an instruction's integer it is inside, `none` between
+%% instructions), and `drain` for an unknown stream type whose bytes we
+%% read and discard.
 -type uni_state() ::
     {pending, binary()}
     | {control, binary(), SettingsReceived :: boolean()}
-    | {qpack_encoder | qpack_decoder, qpack_continuation()}
+    | {qpack_encoder, binary()}
+    | {qpack_decoder, qpack_continuation()}
     | drain.
 
 -type qpack_continuation() :: none | 0..?MAX_QPACK_INT_CONTINUATION.
@@ -150,6 +179,13 @@
     critical = #{} :: critical_set(),
     %% Our control stream id, set on `connected` — GOAWAY is sent on it.
     control_stream_id = undefined :: non_neg_integer() | undefined,
+    %% The QPACK dynamic table the peer's encoder stream fills (RFC 9204
+    %% §3.2), bounded by the capacity advertised in our SETTINGS.
+    qpack :: roadrunner_qpack_table:t(),
+    %% Our QPACK decoder stream (RFC 9204 §4.2), opened with the first
+    %% instruction it carries: the Insert Count Increment for the first
+    %% insert, which comes before any section can need acknowledging.
+    decoder_stream_id = undefined :: non_neg_integer() | undefined,
     %% Highest client-initiated request stream id accepted, so a drain
     %% GOAWAY can name the first request we will not process.
     last_request_id = 0 :: non_neg_integer(),
@@ -244,6 +280,9 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
         peer = Peer,
         conn_span = ConnSpan,
         max_content_length = MaxContentLength,
+        qpack = roadrunner_qpack_table:new(
+            maps:get(http3_qpack_max_table_capacity, ProtoOpts, ?QPACK_MAX_TABLE_CAPACITY)
+        ),
         body_buffering = maps:get(body_buffering, ProtoOpts, auto),
         max_header_block = MaxHeaderBlock,
         %% Decoded-section cap defaults to 2x the (possibly overridden) encoded
@@ -328,14 +367,14 @@ peer_changed(#h3{proto_opts = ProtoOpts} = State, Peer) ->
 %%
 %% The open itself fails only on the peer's stream limit (RFC 9000 §4.6).
 %% RFC 9114 §6.2 says a peer's transport parameters MUST allow at least
-%% three unidirectional streams, and the control stream is the first (and,
-%% with no dynamic QPACK table, the only, RFC 9204 §4.2) one this server
-%% opens, so a refused open means the peer broke that rule: close with
-%% H3_GENERAL_PROTOCOL_ERROR (§8.1, no more specific code fits). Waiting
-%% for a MAX_STREAMS instead could wait forever, and §6.2 does not oblige
-%% the peer to send one. A peer allowing one or two streams is also out of
-%% spec, but it leaves room for everything this server opens, so it is
-%% served rather than refused.
+%% three unidirectional streams, and the control stream is the first one
+%% this server opens, so a refused open means the peer broke that rule:
+%% close with H3_GENERAL_PROTOCOL_ERROR (§8.1, no more specific code fits).
+%% Waiting for a MAX_STREAMS instead could wait forever, and §6.2 does not
+%% oblige the peer to send one. A peer allowing one or two streams is also
+%% out of spec, but it leaves room for the control stream and, with two,
+%% the QPACK decoder stream (`open_decoder_stream/2`), everything this
+%% server opens, so it is served rather than refused.
 -spec send_control_stream(#h3{}) -> handle_result().
 send_control_stream(#h3{conn = Conn} = State) ->
     case roadrunner_quic:open_unidirectional_stream(Conn) of
@@ -347,11 +386,16 @@ send_control_stream(#h3{conn = Conn} = State) ->
 
 %% Send the stream-type prefix and SETTINGS on the freshly opened control
 %% stream.
+%% `qpack_blocked_streams` stays 0 (RFC 9204 §2.1.2): the peer's encoder
+%% may then never send a section this side cannot decode at once, so no
+%% request stream ever waits on the encoder stream.
 -spec send_settings(#h3{}, non_neg_integer()) -> #h3{}.
-send_settings(#h3{conn = Conn, max_field_section_size = MaxFieldSection} = State, CtrlStreamId) ->
+send_settings(
+    #h3{conn = Conn, max_field_section_size = MaxFieldSection, qpack = Qpack} = State, CtrlStreamId
+) ->
     Prefix = roadrunner_quic_h3_frame:encode_stream_type(control),
     Settings = roadrunner_quic_h3_frame:encode_settings(#{
-        qpack_max_table_capacity => 0,
+        qpack_max_table_capacity => roadrunner_qpack_table:max_capacity(Qpack),
         qpack_blocked_streams => 0,
         max_field_section_size => MaxFieldSection,
         %% A reserved "GREASE" setting (RFC 9114 §7.2.4.1): an identifier of
@@ -464,19 +508,16 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
         #{buf := Buf0} ->
             case
                 decode_request_frames(
-                    <<Buf0/binary, Data/binary>>, Stream0, ProtoOpts, MaxHdrBlock
+                    <<Buf0/binary, Data/binary>>, Stream0, ProtoOpts, MaxHdrBlock, State#h3.qpack
                 )
             of
                 {ok, Stream1} ->
-                    %% The stream with this chunk counted, which `await_body/4`
-                    %% stores again once it decodes the headers.
-                    Stream2 = unreleased(Stream1, Data, State),
-                    State1 = State#h3{streams = Streams#{StreamId => Stream2}},
-                    case {Stream2, Fin} of
-                        {#{reader := _}, _} -> body_in(State1, StreamId, Fin);
-                        {_, true} -> dispatch_request(State1, StreamId);
-                        {_, false} -> await_body(State1, StreamId, Stream0, Stream2)
-                    end;
+                    frames_in(State, StreamId, Stream0, Stream1, Data, Fin);
+                {ok, Stream1, {section_ack, Ric}} ->
+                    %% Trailers that used the dynamic table were decoded,
+                    %% and are acknowledged like any other section.
+                    State1 = section_acknowledged(State, StreamId, Ric),
+                    frames_in(State1, StreamId, Stream0, Stream1, Data, Fin);
                 too_large when is_map_key(reader, Stream0) ->
                     body_over_cap(State, StreamId, Stream0, Fin);
                 too_large ->
@@ -488,6 +529,22 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
                 {conn_error, _, _} = ConnError ->
                     ConnError
             end
+    end.
+
+%% A request stream's frames from this chunk are applied: a body read by a
+%% manual-mode worker takes them, the stream's FIN dispatches the request,
+%% and otherwise the request waits for the rest of its body.
+-spec frames_in(#h3{}, non_neg_integer(), map(), map(), binary(), boolean()) ->
+    handle_result().
+frames_in(#h3{streams = Streams} = State, StreamId, Stream0, Stream1, Data, Fin) ->
+    %% The stream with this chunk counted, which `await_body/4` stores
+    %% again once it decodes the headers.
+    Stream2 = unreleased(Stream1, Data, State),
+    State1 = State#h3{streams = Streams#{StreamId => Stream2}},
+    case {Stream2, Fin} of
+        {#{reader := _}, _} -> body_in(State1, StreamId, Fin);
+        {_, true} -> dispatch_request(State1, StreamId);
+        {_, false} -> await_body(State1, StreamId, Stream0, Stream2)
     end.
 
 %% A request whose body is still to come. When its HEADERS frame has just
@@ -507,13 +564,13 @@ await_body(
 ) when
     is_binary(Block)
 ->
-    case roadrunner_qpack:decode(Block) of
-        {error, _} ->
-            qpack_decompression_failed();
-        {ok, Headers} ->
-            Streams = State#h3.streams,
-            State1 = State#h3{streams = Streams#{StreamId := Stream1#{headers := Headers}}},
-            answer_expectation(State1, StreamId, Stream0, Headers)
+    case decode_section(State, StreamId, Block) of
+        {ok, Headers, State1} ->
+            Streams = State1#h3.streams,
+            State2 = State1#h3{streams = Streams#{StreamId := Stream1#{headers := Headers}}},
+            answer_expectation(State2, StreamId, Stream0, Headers);
+        {conn_error, _, _} = ConnError ->
+            ConnError
     end;
 await_body(State, StreamId, #{header_block := undefined} = Stream0, #{headers := Headers}) when
     is_list(Headers)
@@ -560,7 +617,8 @@ send_continue(State, StreamId) ->
     State.
 
 %% Answer a request refused before dispatch: 413 for a body over its cap,
-%% 431 for an oversized field section. A client still sending (no FIN yet)
+%% 431 for an oversized field section, with a QPACK Stream Cancellation
+%% (RFC 9204 §4.4.2). A client still sending (no FIN yet)
 %% is asked to stop, and the stream is marked `discarding` so residual body
 %% is dropped rather than mistaken for a new request; its FIN or reset frees
 %% the marker. When the FIN came with this chunk, nothing more arrives on
@@ -572,6 +630,9 @@ refuse_request(#h3{conn = Conn, streams = Streams} = State, StreamId, Stream0, F
     ok = roadrunner_http3_stream_worker:send_buffered(
         Conn, StreamId, Status, [{~"content-type", ~"text/plain"}], Body
     ),
+    %% Its field section may never be decoded (a 431's, a 413's on a
+    %% single-handler listener), and trailers may still come.
+    ok = stream_cancellation(State, StreamId),
     case Fin of
         true ->
             drop_stream(State, StreamId);
@@ -761,15 +822,117 @@ handle_uni_stream(#h3{uni = Uni, critical = Critical} = State, StreamId, Data, F
             ConnError;
         {drop, Critical1} ->
             State#h3{uni = maps:remove(StreamId, Uni), critical = Critical1};
+        {{qpack_encoder, Instructions}, Critical1} ->
+            encoder_stream_in(State#h3{critical = Critical1}, StreamId, Instructions);
         {UniState1, Critical1} ->
             State#h3{uni = Uni#{StreamId => UniState1}, critical = Critical1}
+    end.
+
+%% The peer's encoder stream (RFC 9204 §4.3): apply its instructions to the
+%% dynamic table in order, keep the bytes of one not fully received yet,
+%% and tell the encoder about the new entries. A bad instruction is
+%% QPACK_ENCODER_STREAM_ERROR (`roadrunner_qpack:encoder_instructions/2`).
+-spec encoder_stream_in(#h3{}, non_neg_integer(), binary()) -> handle_result().
+encoder_stream_in(#h3{qpack = Table, uni = Uni} = State, StreamId, Instructions) ->
+    case roadrunner_qpack:encoder_instructions(Instructions, Table) of
+        {ok, Table1, Pending} ->
+            insert_count_increment(State#h3{
+                qpack = Table1, uni = Uni#{StreamId => {qpack_encoder, Pending}}
+            });
+        {error, _} ->
+            {conn_error, ?H3_QPACK_ENCODER_STREAM_ERROR, ~"invalid QPACK encoder instruction"}
+    end.
+
+%% An Insert Count Increment (RFC 9204 §4.4.3) bringing the encoder's Known
+%% Received Count up to every insert applied so far, sent once per chunk
+%% of the encoder stream that added any. The encoder references an entry
+%% only once it knows the entry arrived (we allow no blocked streams), so
+%% it must hear of each insert, and this is how.
+-spec insert_count_increment(#h3{}) -> handle_result().
+insert_count_increment(#h3{qpack = Table} = State) ->
+    case roadrunner_qpack_table:take_increment(Table) of
+        {0, _} ->
+            State;
+        {Increment, Table1} ->
+            open_decoder_stream(
+                State#h3{qpack = Table1}, roadrunner_qpack:insert_count_increment(Increment)
+            )
+    end.
+
+%% Send a decoder instruction, opening our decoder stream (RFC 9204 §4.2)
+%% with its stream-type prefix for the first one. Only an Insert Count
+%% Increment can be first: a Section Acknowledgment or Stream Cancellation
+%% needs an insert before it (`decoder_instruction/2`). A refused open
+%% means the peer allows fewer than the three unidirectional streams RFC
+%% 9114 §6.2 requires (we open two), as for the control stream.
+-spec open_decoder_stream(#h3{}, iodata()) -> handle_result().
+open_decoder_stream(#h3{conn = Conn, decoder_stream_id = undefined} = State, Instruction) ->
+    case roadrunner_quic:open_unidirectional_stream(Conn) of
+        {ok, StreamId} ->
+            Prefix = roadrunner_quic_h3_frame:encode_stream_type(qpack_decoder),
+            _ = roadrunner_quic:send_data(Conn, StreamId, [Prefix, Instruction], false),
+            State#h3{decoder_stream_id = StreamId};
+        {error, stream_limit} ->
+            {conn_error, ?H3_GENERAL_PROTOCOL_ERROR, ~"peer allows no QPACK decoder stream"}
+    end;
+open_decoder_stream(State, Instruction) ->
+    ok = decoder_instruction(State, Instruction),
+    State.
+
+%% Send a decoder instruction on the open decoder stream. Fire-and-forget,
+%% like the control stream's sends: a connection already closing has no use
+%% for it.
+-spec decoder_instruction(#h3{}, iodata()) -> ok.
+decoder_instruction(#h3{conn = Conn, decoder_stream_id = StreamId}, Instruction) when
+    is_integer(StreamId)
+->
+    _ = roadrunner_quic:send_data(Conn, StreamId, Instruction, false),
+    ok.
+
+%% A Section Acknowledgment (RFC 9204 §4.4.1) for a field section just
+%% decoded on `StreamId` with a non-zero Required Insert Count `Ric`, which
+%% also raises the encoder's Known Received Count to `Ric` (§2.1.4).
+-spec section_acknowledged(#h3{}, non_neg_integer(), pos_integer()) -> #h3{}.
+section_acknowledged(#h3{qpack = Table} = State, StreamId, Ric) ->
+    ok = decoder_instruction(State, roadrunner_qpack:section_acknowledgment(StreamId)),
+    State#h3{qpack = roadrunner_qpack_table:acknowledge(Ric, Table)}.
+
+%% A Stream Cancellation (RFC 9204 §4.4.2) for a request stream abandoned
+%% or reset before every field section on it was decoded, so the encoder
+%% can drop its references to the dynamic table on that stream. Until the
+%% encoder has inserted an entry no section can reference one, so nothing
+%% is sent (and no decoder stream exists yet).
+-spec stream_cancellation(#h3{}, non_neg_integer()) -> ok.
+stream_cancellation(#h3{qpack = Table} = State, StreamId) ->
+    case roadrunner_qpack_table:insert_count(Table) of
+        0 -> ok;
+        _ -> decoder_instruction(State, roadrunner_qpack:stream_cancellation(StreamId))
+    end.
+
+%% Decode a request stream's field section (RFC 9204 §4.5). One with a
+%% Required Insert Count of 0 (first byte 0) takes the static-only decoder
+%% and needs no acknowledgment; one that uses the dynamic table is decoded
+%% against it and acknowledged. A section that fails to decode is a
+%% connection error (§2.2.3, §6).
+-spec decode_section(#h3{}, non_neg_integer(), binary()) ->
+    {ok, roadrunner_http:headers(), #h3{}} | {conn_error, non_neg_integer(), binary()}.
+decode_section(State, _StreamId, <<0, _/binary>> = Block) ->
+    case roadrunner_qpack:decode(Block) of
+        {ok, Headers} -> {ok, Headers, State};
+        {error, _} -> qpack_decompression_failed()
+    end;
+decode_section(#h3{qpack = Table} = State, StreamId, Block) ->
+    case roadrunner_qpack:decode(Block, Table) of
+        {ok, Headers, Ric} -> {ok, Headers, section_acknowledged(State, StreamId, Ric)};
+        {error, _} -> qpack_decompression_failed()
     end.
 
 %% A RESET_STREAM aborts a stream. For a critical stream (peer control /
 %% QPACK) that is a connection error of type H3_CLOSED_CRITICAL_STREAM
 %% (RFC 9114 §6.2.1, §7.2.1); for any other stream (a request stream, a
 %% not-yet-typed or unknown uni stream) it just drops the per-stream
-%% state we hold.
+%% state we hold. A reset request stream also gets a QPACK Stream
+%% Cancellation (RFC 9204 §4.4.2): sections on it may be undecoded.
 -spec handle_stream_reset(#h3{}, non_neg_integer()) -> handle_result().
 handle_stream_reset(#h3{uni = Uni, streams = Streams, worker_pids = WorkerPids} = State, StreamId) ->
     case Uni of
@@ -781,6 +944,7 @@ handle_stream_reset(#h3{uni = Uni, streams = Streams, worker_pids = WorkerPids} 
                     State#h3{uni = maps:remove(StreamId, Uni)}
             end;
         _ ->
+            ok = stream_cancellation(State, StreamId),
             case WorkerPids of
                 #{StreamId := WorkerPid} ->
                     %% Peer cancelled a dispatched request stream. Tell the
@@ -852,12 +1016,20 @@ new_request_stream(BodyCap) ->
     }.
 
 -type decode_result() ::
-    {ok, map()} | too_large | headers_too_large | {conn_error, non_neg_integer(), binary()}.
+    {ok, map()}
+    | {ok, map(), {section_ack, pos_integer()}}
+    | too_large
+    | headers_too_large
+    | {conn_error, non_neg_integer(), binary()}.
 
 %% Decode as many complete HTTP/3 frames as the buffer holds, applying
 %% the request frame-sequence rules and folding payloads into the
 %% accumulated request. The undecoded remainder is stashed in `buf` for
-%% the next `stream_data` message.
+%% the next `stream_data` message. `{ok, Stream, {section_ack, Ric}}` means
+%% trailers that use the QPACK dynamic table were decoded and are owed a
+%% Section Acknowledgment. `Qpack` is the connection's dynamic table, which
+%% a field section decoded here (`raise_body_cap/5`, trailers) resolves
+%% against; the 3- and 4-arity forms use an empty one.
 -spec decode_request_frames(binary(), map(), roadrunner_conn:proto_opts()) -> decode_result().
 decode_request_frames(Buf, Stream, ProtoOpts) ->
     decode_request_frames(Buf, Stream, ProtoOpts, ?MAX_HEADER_BLOCK).
@@ -865,11 +1037,24 @@ decode_request_frames(Buf, Stream, ProtoOpts) ->
 -spec decode_request_frames(binary(), map(), roadrunner_conn:proto_opts(), pos_integer()) ->
     decode_result().
 decode_request_frames(Buf, Stream, ProtoOpts, MaxHdrBlock) ->
+    decode_request_frames(Buf, Stream, ProtoOpts, MaxHdrBlock, roadrunner_qpack_table:new(0)).
+
+-spec decode_request_frames(
+    binary(), map(), roadrunner_conn:proto_opts(), pos_integer(), roadrunner_qpack_table:t()
+) -> decode_result().
+decode_request_frames(Buf, Stream, ProtoOpts, MaxHdrBlock, Qpack) ->
     case roadrunner_quic_h3_frame:decode(Buf) of
         {ok, Frame, Rest} ->
-            case apply_frame(Frame, Stream, ProtoOpts, MaxHdrBlock) of
-                {ok, Stream1} -> decode_request_frames(Rest, Stream1, ProtoOpts, MaxHdrBlock);
-                Other -> Other
+            case apply_frame(Frame, Stream, ProtoOpts, MaxHdrBlock, Qpack) of
+                {ok, Stream1} ->
+                    decode_request_frames(Rest, Stream1, ProtoOpts, MaxHdrBlock, Qpack);
+                {ok, Stream1, SectionAck} ->
+                    with_section_ack(
+                        decode_request_frames(Rest, Stream1, ProtoOpts, MaxHdrBlock, Qpack),
+                        SectionAck
+                    );
+                Other ->
+                    Other
             end;
         {more, _} ->
             %% A still-incomplete HEADERS frame already over the cap is an
@@ -888,34 +1073,68 @@ decode_request_frames(Buf, Stream, ProtoOpts, MaxHdrBlock) ->
             {conn_error, request_frame_error_code(Reason), ~"frame error"}
     end.
 
+%% A Section Acknowledgment owed for trailers stays owed through the frames
+%% after them, unless they fail the request.
+-spec with_section_ack(decode_result(), {section_ack, pos_integer()}) -> decode_result().
+with_section_ack({ok, Stream}, SectionAck) -> {ok, Stream, SectionAck};
+with_section_ack(Other, _SectionAck) -> Other.
+
 %% Apply one decoded frame against the request frame-sequence state
 %% machine (RFC 9114 §4.1). An out-of-sequence or control-stream-only
 %% frame on a request stream is a connection error of type
 %% H3_FRAME_UNEXPECTED (§4.1, §7.2.4); unknown/reserved frames are
 %% ignored (§9). Trailers (a HEADERS after the body) are accepted but
-%% not surfaced by the buffered path.
+%% not surfaced by the buffered path. Trailers that use the QPACK dynamic
+%% table (first byte, the encoded Required Insert Count, not 0) are decoded
+%% all the same, so they can be acknowledged and the encoder can let go of
+%% the entries they reference (RFC 9204 §2.2.2.1).
 -spec apply_frame(
-    roadrunner_quic_h3_frame:frame(), map(), roadrunner_conn:proto_opts(), pos_integer()
+    roadrunner_quic_h3_frame:frame(),
+    map(),
+    roadrunner_conn:proto_opts(),
+    pos_integer(),
+    roadrunner_qpack_table:t()
 ) ->
-    {ok, map()} | too_large | headers_too_large | {conn_error, non_neg_integer(), binary()}.
-apply_frame({headers, Block}, #{frame_state := expecting_headers}, _ProtoOpts, MaxHdrBlock) when
+    {ok, map()}
+    | {ok, map(), {section_ack, pos_integer()}}
+    | too_large
+    | headers_too_large
+    | {conn_error, non_neg_integer(), binary()}.
+apply_frame(
+    {headers, Block}, #{frame_state := expecting_headers}, _ProtoOpts, MaxHdrBlock, _Qpack
+) when
     byte_size(Block) > MaxHdrBlock
 ->
     headers_too_large;
-apply_frame({headers, Block}, #{frame_state := expecting_headers} = Stream, _ProtoOpts, _MaxHdr) ->
+apply_frame(
+    {headers, Block}, #{frame_state := expecting_headers} = Stream, _ProtoOpts, _MaxHdr, _Qpack
+) ->
     {ok, Stream#{header_block := Block, frame_state := expecting_data}};
-apply_frame({headers, _Trailers}, #{frame_state := expecting_data} = Stream, _ProtoOpts, _MaxHdr) ->
+apply_frame(
+    {headers, <<Eric, _/binary>> = Trailers},
+    #{frame_state := expecting_data} = Stream,
+    _ProtoOpts,
+    _MaxHdr,
+    Qpack
+) when Eric =/= 0 ->
+    case roadrunner_qpack:decode(Trailers, Qpack) of
+        {ok, _Trailers, Ric} -> {ok, Stream#{frame_state := expecting_done}, {section_ack, Ric}};
+        {error, _} -> qpack_decompression_failed()
+    end;
+apply_frame(
+    {headers, _Trailers}, #{frame_state := expecting_data} = Stream, _ProtoOpts, _MaxHdr, _Qpack
+) ->
     {ok, Stream#{frame_state := expecting_done}};
-apply_frame({data, Payload}, #{frame_state := expecting_data} = Stream, ProtoOpts, _MaxHdrBlock) ->
+apply_frame({data, Payload}, #{frame_state := expecting_data} = Stream, ProtoOpts, _MaxHdr, Qpack) ->
     #{body := Body, body_len := Len, body_cap := Cap} = Stream,
     NewLen = Len + byte_size(Payload),
     case NewLen > Cap of
-        true -> raise_body_cap(Stream, Payload, NewLen, ProtoOpts);
+        true -> raise_body_cap(Stream, Payload, NewLen, ProtoOpts, Qpack);
         false -> {ok, Stream#{body := [Body, Payload], body_len := NewLen}}
     end;
-apply_frame({unknown, _Type, _Payload}, Stream, _ProtoOpts, _MaxHdrBlock) ->
+apply_frame({unknown, _Type, _Payload}, Stream, _ProtoOpts, _MaxHdrBlock, _Qpack) ->
     {ok, Stream};
-apply_frame(_Frame, _Stream, _ProtoOpts, _MaxHdrBlock) ->
+apply_frame(_Frame, _Stream, _ProtoOpts, _MaxHdrBlock, _Qpack) ->
     %% DATA before HEADERS, a frame after trailers, or a control-stream
     %% frame (SETTINGS / GOAWAY / MAX_PUSH_ID / CANCEL_PUSH / PUSH_PROMISE)
     %% on a request stream — RFC 9114 §4.1 / §7.2: H3_FRAME_UNEXPECTED.
@@ -925,19 +1144,38 @@ apply_frame(_Frame, _Stream, _ProtoOpts, _MaxHdrBlock) ->
 %% cap (the listener's `max_content_length`, at first): the request's route
 %% may set a larger one. Looked up only here, once per raise, and kept on
 %% the stream after. The field section is decoded first when its HEADERS
-%% frame came in this same chunk, and kept for dispatch. A listener with a
-%% single handler has no route to look up.
--spec raise_body_cap(map(), binary(), non_neg_integer(), roadrunner_conn:proto_opts()) ->
+%% frame came in this same chunk, and kept for dispatch. One that uses the
+%% QPACK dynamic table is not kept: it is decoded again once the chunk is
+%% in (`await_body/4`, `dispatch_request/2`), against the same table, and
+%% acknowledged there, where the connection state is at hand. A listener
+%% with a single handler has no route to look up.
+-spec raise_body_cap(
+    map(), binary(), non_neg_integer(), roadrunner_conn:proto_opts(), roadrunner_qpack_table:t()
+) ->
     {ok, map()} | too_large | {conn_error, non_neg_integer(), binary()}.
-raise_body_cap(_Stream, _Payload, _NewLen, #{dispatch := {handler, _Mod, _Pipeline, _State}}) ->
+raise_body_cap(_Stream, _Payload, _NewLen, #{dispatch := {handler, _, _, _}}, _Qpack) ->
     too_large;
-raise_body_cap(#{headers := undefined, header_block := Block} = Stream, Payload, NewLen, ProtoOpts) ->
-    case roadrunner_qpack:decode(Block) of
-        {ok, Headers} -> raise_body_cap(Stream#{headers := Headers}, Payload, NewLen, ProtoOpts);
-        {error, _} -> qpack_decompression_failed()
-    end;
 raise_body_cap(
-    #{headers := Headers, body := Body, body_cap := Cap} = Stream,
+    #{headers := undefined, header_block := Block} = Stream, Payload, NewLen, ProtoOpts, Qpack
+) ->
+    case roadrunner_qpack:decode(Block, Qpack) of
+        {ok, Headers, 0} ->
+            route_body_cap(Stream#{headers := Headers}, Headers, Payload, NewLen, ProtoOpts);
+        {ok, Headers, _Ric} ->
+            route_body_cap(Stream, Headers, Payload, NewLen, ProtoOpts);
+        {error, _} ->
+            qpack_decompression_failed()
+    end;
+raise_body_cap(#{headers := Headers} = Stream, Payload, NewLen, ProtoOpts, _Qpack) ->
+    route_body_cap(Stream, Headers, Payload, NewLen, ProtoOpts).
+
+-spec route_body_cap(
+    map(), roadrunner_http:headers(), binary(), non_neg_integer(), roadrunner_conn:proto_opts()
+) ->
+    {ok, map()} | too_large.
+route_body_cap(
+    #{body := Body, body_cap := Cap} = Stream,
+    Headers,
     Payload,
     NewLen,
     #{dispatch := Dispatch}
@@ -964,8 +1202,8 @@ uni_event({pending, Buf}, Critical, Data, Fin) ->
     uni_classify(<<Buf/binary, Data/binary>>, Critical, Fin);
 uni_event({control, Buf, SettingsReceived}, Critical, Data, Fin) ->
     uni_control(<<Buf/binary, Data/binary>>, SettingsReceived, Critical, Fin);
-uni_event({qpack_encoder, Continuation}, Critical, Data, Fin) ->
-    uni_qpack_encoder(Data, Continuation, Critical, Fin);
+uni_event({qpack_encoder, Pending}, Critical, Data, Fin) ->
+    qpack_stream_open({qpack_encoder, <<Pending/binary, Data/binary>>}, Critical, Fin);
 uni_event({qpack_decoder, Continuation}, Critical, Data, Fin) ->
     uni_qpack_decoder(Data, Continuation, Critical, Fin);
 uni_event(drain, Critical, _Data, Fin) ->
@@ -1005,8 +1243,10 @@ uni_more(_Buf, Critical, true) ->
 uni_more(Buf, Critical, false) ->
     {{pending, Buf}, Critical}.
 
-%% A QPACK encoder / decoder stream (RFC 9204 §4.2). One of each only; its
-%% instructions are checked from the first byte after the stream type.
+%% A QPACK encoder / decoder stream (RFC 9204 §4.2). One of each only; a
+%% decoder stream's instructions are checked from the first byte after the
+%% stream type, and an encoder stream's are handed back, in its state, for
+%% `encoder_stream_in/3` to apply to the dynamic table.
 -spec uni_qpack(critical_set(), qpack_encoder | qpack_decoder, binary(), boolean()) ->
     uni_result().
 uni_qpack(Critical, Role, Rest, Fin) ->
@@ -1020,35 +1260,9 @@ uni_qpack(Critical, Role, Rest, Fin) ->
 -spec uni_qpack_instructions(qpack_encoder | qpack_decoder, binary(), critical_set(), boolean()) ->
     uni_result().
 uni_qpack_instructions(qpack_encoder, Data, Critical, Fin) ->
-    uni_qpack_encoder(Data, none, Critical, Fin);
+    qpack_stream_open({qpack_encoder, Data}, Critical, Fin);
 uni_qpack_instructions(qpack_decoder, Data, Critical, Fin) ->
     uni_qpack_decoder(Data, none, Critical, Fin).
-
-%% The peer's encoder stream. We advertised a dynamic table capacity of 0,
-%% so the one valid instruction is Set Dynamic Table Capacity to 0 (the
-%% single byte 0x20). A larger capacity exceeds our limit (RFC 9204
-%% §4.3.1), an insert cannot fit a zero-capacity table (§3.2.2), and a
-%% Duplicate names an entry that cannot exist (§4.3.4): each is
-%% QPACK_ENCODER_STREAM_ERROR. A capacity past the 5-bit prefix (0x3F) is
-%% rejected once its integer ends, so a stream that closes inside it is a
-%% closed critical stream instead (§4.2); `Continuation` counts the bytes
-%% of that integer read so far.
--spec uni_qpack_encoder(binary(), qpack_continuation(), critical_set(), boolean()) ->
-    uni_result().
-uni_qpack_encoder(<<16#20, Rest/binary>>, none, Critical, Fin) ->
-    uni_qpack_encoder(Rest, none, Critical, Fin);
-uni_qpack_encoder(<<16#3F, Rest/binary>>, none, Critical, Fin) ->
-    uni_qpack_encoder(Rest, 0, Critical, Fin);
-uni_qpack_encoder(<<_, _/binary>>, none, _Critical, _Fin) ->
-    {conn_error, ?H3_QPACK_ENCODER_STREAM_ERROR, ~"invalid QPACK encoder instruction"};
-uni_qpack_encoder(<<1:1, _:7, Rest/binary>>, Count, Critical, Fin) when
-    Count < ?MAX_QPACK_INT_CONTINUATION
-->
-    uni_qpack_encoder(Rest, Count + 1, Critical, Fin);
-uni_qpack_encoder(<<_, _/binary>>, _Count, _Critical, _Fin) ->
-    {conn_error, ?H3_QPACK_ENCODER_STREAM_ERROR, ~"QPACK table capacity over the limit"};
-uni_qpack_encoder(<<>>, Continuation, Critical, Fin) ->
-    qpack_stream_open({qpack_encoder, Continuation}, Critical, Fin).
 
 %% The peer's decoder stream. Our encoder never uses the dynamic table, so
 %% every field section we send has a Required Insert Count of 0: a Section
@@ -1195,10 +1409,12 @@ dispatch_request(#h3{streams = Streams} = State, StreamId) ->
             %% QPACK decode happens here (not in the worker) because a
             %% decompression failure is a CONNECTION error per RFC 9204
             %% §2.2 — the dynamic-table state is unrecoverable — whereas
-            %% a malformed message is a per-stream error.
-            case roadrunner_qpack:decode(Block) of
-                {error, _} -> qpack_decompression_failed();
-                {ok, Headers} -> dispatch_headers(State, StreamId, Stream, Headers)
+            %% a malformed message is a per-stream error. The dynamic
+            %% table lives here too, and the section is decoded against
+            %% it now, as its HEADERS frame completes.
+            case decode_section(State, StreamId, Block) of
+                {ok, Headers, State1} -> dispatch_headers(State1, StreamId, Stream, Headers);
+                {conn_error, _, _} = ConnError -> ConnError
             end;
         #{headers := Headers} = Stream ->
             dispatch_headers(State, StreamId, Stream, Headers)
@@ -1214,9 +1430,9 @@ dispatch_headers(State, StreamId, Stream, Headers) ->
     case roadrunner_http:header_list_size(Headers) > State#h3.max_field_section_size of
         true ->
             %% RFC 9114 §4.2.2: the decoded field section exceeds the
-            %% MAX_FIELD_SECTION_SIZE we advertised. QPACK is static-only
-            %% here, so there's no decoder state to desync — answer 431 and
-            %% drop the stream.
+            %% MAX_FIELD_SECTION_SIZE we advertised. The section was
+            %% decoded (and acknowledged), so there's no decoder state to
+            %% desync — answer 431 and drop the stream.
             respond_field_section_too_large(State, StreamId);
         false ->
             dispatch_decoded(State, StreamId, Headers, request_body(Stream))
@@ -1427,9 +1643,12 @@ handle_worker_down(#h3{worker_refs = WorkerRefs, worker_pids = WorkerPids} = Sta
             reset_and_drop(State1, StreamId, ?H3_INTERNAL_ERROR)
     end.
 
+%% Reset a request stream we stop serving, with a QPACK Stream
+%% Cancellation (RFC 9204 §4.4.2): it may hold sections never decoded.
 -spec reset_and_drop(#h3{}, non_neg_integer(), non_neg_integer()) -> #h3{}.
 reset_and_drop(#h3{conn = Conn} = State, StreamId, ErrorCode) ->
     _ = roadrunner_quic:reset_stream(Conn, StreamId, ErrorCode),
+    ok = stream_cancellation(State, StreamId),
     drop_stream(State, StreamId).
 
 %% Bump the cumulative throttled counter and emit the throttled telemetry
@@ -1498,7 +1717,9 @@ closed_reason(Reason) -> {transport, Reason}.
 %% H3_NO_ERROR), and a `discarding` marker drops what is already in flight
 %% rather than reading it as a new request. A marker stays until the
 %% client's FIN or reset frees it (`handle_request_stream/4`,
-%% `handle_stream_reset/2`), even once the stream's worker is gone.
+%% `handle_stream_reset/2`), even once the stream's worker is gone. As the
+%% rest of its frames go unread, trailers among them, the encoder gets a
+%% QPACK Stream Cancellation (RFC 9204 §4.4.2).
 -spec drop_stream(#h3{}, non_neg_integer()) -> #h3{}.
 drop_stream(#h3{conn = Conn, streams = Streams} = State, StreamId) ->
     case Streams of
@@ -1506,6 +1727,7 @@ drop_stream(#h3{conn = Conn, streams = Streams} = State, StreamId) ->
             State;
         #{StreamId := #{fin := false} = Stream} ->
             _ = roadrunner_quic:stop_sending(Conn, StreamId, ?H3_NO_ERROR),
+            ok = stream_cancellation(State, StreamId),
             Discarding = Stream#{
                 frame_state := discarding, buf := <<>>, body := [], reader := undefined
             },

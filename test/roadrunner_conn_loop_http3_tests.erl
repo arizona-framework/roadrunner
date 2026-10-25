@@ -23,10 +23,23 @@ decode(Buf, MaxLen, MaxHdrBlock) ->
     roadrunner_conn_loop_http3:decode_request_frames(Buf, new(MaxLen), ?HANDLER, MaxHdrBlock).
 
 %% A HEADERS frame wrapping an arbitrary field block (the block is only
-%% QPACK-decoded later, in the conn loop's dispatch, not here). The native
+%% QPACK-decoded later, in the conn loop's dispatch, not here, except for
+%% a route's body cap and for trailers that use the dynamic table). The native
 %% encoders return iodata; these build on-wire frames (binary) fed to the
 %% decoder, so flatten them.
 hf(Block) -> iolist_to_binary(roadrunner_quic_h3_frame:encode_headers(Block)).
+
+%% A 4096-byte QPACK dynamic table holding `Entries`, oldest first.
+qpack_table(Entries) ->
+    {ok, Empty} = roadrunner_qpack_table:set_capacity(4096, roadrunner_qpack_table:new(4096)),
+    lists:foldl(
+        fun({Name, Value}, Table) ->
+            {ok, Table1} = roadrunner_qpack_table:insert(Name, Value, Table),
+            Table1
+        end,
+        Empty,
+        Entries
+    ).
 df(Bin) -> iolist_to_binary(roadrunner_quic_h3_frame:encode_data(Bin)).
 
 new_request_stream_test() ->
@@ -76,14 +89,41 @@ body_too_large_test() ->
 trailers_accepted_test() ->
     %% HEADERS, DATA, then trailing HEADERS — trailers are accepted but
     %% not surfaced (header_block keeps the request headers).
-    Buf = <<(hf(~"req"))/binary, (df(~"body"))/binary, (hf(~"trailer"))/binary>>,
+    Buf = <<(hf(~"req"))/binary, (df(~"body"))/binary, (hf(<<0, "trailer">>))/binary>>,
     {ok, Stream} = decode(Buf, 1000),
     ?assertEqual(expecting_done, maps:get(frame_state, Stream)),
     ?assertEqual(~"req", maps:get(header_block, Stream)).
 
+dynamic_trailers_acknowledged_test() ->
+    %% Trailers that use the QPACK dynamic table (RFC 9204 §2.2.2.1) are
+    %% decoded so they can be acknowledged; ones that do not decode are a
+    %% connection error, and so is a frame after them.
+    Table = qpack_table([{~"x-trailer", ~"t"}]),
+    Request = <<(hf(<<0, 0, 16#D1>>))/binary, (df(~"body"))/binary>>,
+    {ok, Stream, {section_ack, 1}} = roadrunner_conn_loop_http3:decode_request_frames(
+        <<Request/binary, (hf(<<2, 0, 16#80>>))/binary>>, new(1000), ?HANDLER, 16384, Table
+    ),
+    ?assertEqual(expecting_done, maps:get(frame_state, Stream)),
+    ?assertMatch(
+        {conn_error, 16#0200, _},
+        roadrunner_conn_loop_http3:decode_request_frames(
+            <<Request/binary, (hf(<<2, 0, 16#81>>))/binary>>, new(1000), ?HANDLER, 16384, Table
+        )
+    ),
+    ?assertMatch(
+        {conn_error, 16#0105, _},
+        roadrunner_conn_loop_http3:decode_request_frames(
+            <<Request/binary, (hf(<<2, 0, 16#80>>))/binary, (df(~"x"))/binary>>,
+            new(1000),
+            ?HANDLER,
+            16384,
+            Table
+        )
+    ).
+
 frame_after_trailers_test() ->
     %% A DATA frame after the trailing HEADERS → H3_FRAME_UNEXPECTED.
-    Buf = <<(hf(~"req"))/binary, (hf(~"trailer"))/binary, (df(~"x"))/binary>>,
+    Buf = <<(hf(~"req"))/binary, (hf(<<0, "trailer">>))/binary, (df(~"x"))/binary>>,
     ?assertMatch({conn_error, 16#0105, _}, decode(Buf, 1000)).
 
 settings_on_request_stream_test() ->
@@ -171,7 +211,8 @@ route_cap_test_() ->
             fun route_cap_still_too_small/0,
             fun route_without_cap/0,
             fun undecodable_block_on_raise/0,
-            fun raises_with_decoded_headers/0
+            fun raises_with_decoded_headers/0,
+            fun raises_with_dynamic_headers/0
         ]}.
 
 -define(ROUTER, #{dispatch => {router, h3_route_cap}}).
@@ -213,6 +254,20 @@ undecodable_block_on_raise() ->
         {conn_error, 16#0200, _},
         roadrunner_conn_loop_http3:decode_request_frames(Buf, new(8), ?ROUTER)
     ).
+
+raises_with_dynamic_headers() ->
+    %% A field section that uses the QPACK dynamic table is decoded for the
+    %% route but not kept: the conn decodes it again, and acknowledges it,
+    %% once the chunk is in.
+    Table = qpack_table([{~":path", ~"/up"}]),
+    %% Required Insert Count 1 (encoded 2), Base 1; :method POST and
+    %% :scheme https from the static table, :path from absolute 0.
+    Block = <<2, 0, 16#D4, 16#D7, 16#80>>,
+    Buf = <<(hf(Block))/binary, (df(binary:copy(~"x", 20)))/binary>>,
+    {ok, Stream} = roadrunner_conn_loop_http3:decode_request_frames(
+        Buf, new(8), ?ROUTER, 16384, Table
+    ),
+    ?assertMatch(#{body_len := 20, body_cap := 64, headers := undefined}, Stream).
 
 raises_with_decoded_headers() ->
     %% Headers decoded earlier (on their own chunk) are used as they are: the
