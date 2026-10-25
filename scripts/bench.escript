@@ -442,15 +442,24 @@ filter_servers(Scenario, Drop, Servers, Opts, Reason) ->
     end,
     Opts#{servers => Filtered}.
 
-preflight_protocol(#{protocol := h1} = Opts) ->
-    Opts;
+preflight_protocol(#{protocol := h1, servers := Servers} = Opts) ->
+    %% erlang_quic is the HTTP/3-only comparison server.
+    Filtered = [S || S <- Servers, S =/= erlang_quic],
+    case Filtered =/= Servers of
+        true ->
+            io:format("note: --protocols h1 — erlang_quic filtered out (HTTP/3 only)~n", []);
+        false ->
+            ok
+    end,
+    Opts#{servers => Filtered};
 preflight_protocol(#{protocol := h2, servers := Servers} = Opts) ->
     CertDir = generate_test_cert(),
-    Filtered = [S || S <- Servers, S =/= elli],
+    Filtered = [S || S <- Servers, S =/= elli, S =/= erlang_quic],
     case Filtered =/= Servers of
         true ->
             io:format(
-                "note: --protocols h2 — elli filtered out (no HTTP/2 support)~n",
+                "note: --protocols h2 — elli and erlang_quic filtered out "
+                "(no HTTP/2 support)~n",
                 []
             );
         false ->
