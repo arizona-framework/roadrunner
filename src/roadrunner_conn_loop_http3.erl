@@ -67,8 +67,10 @@
 %% On a graceful drain (a `{roadrunner_drain, _}` message from the
 %% listener) it sends a GOAWAY on its control stream (RFC 9114 §5.2),
 %% refuses request streams opened at or beyond the GOAWAY id with
-%% H3_REQUEST_REJECTED, lets in-flight requests finish, and asks the QUIC
-%% connection to close once it has sent every response
+%% H3_REQUEST_REJECTED, passes the drain message on to every stream
+%% worker (so a `{loop, ...}` handler can wind down), lets in-flight
+%% requests finish, and asks the QUIC connection to close once it has
+%% sent every response
 %% (`roadrunner_quic:close_when_done/3`); the listener force-exits it at
 %% the deadline if a request is still running. The QUIC connection, not
 %% this loop, decides when the last response is out: a worker's buffered
@@ -214,6 +216,10 @@
     %% sent. While set, the connection is draining and request streams at
     %% or beyond it are refused. `undefined` means not draining.
     goaway_id = undefined :: non_neg_integer() | undefined,
+    %% The `Deadline` of the drain message that started the drain, handed
+    %% to every stream worker started while draining (`start_worker/3`).
+    %% `undefined` until then.
+    drain_deadline = undefined :: integer() | undefined,
     max_content_length :: non_neg_integer(),
     %% `auto` buffers a request's body and dispatches at the stream's FIN;
     %% `manual` dispatches at the end of the headers and hands the worker
@@ -358,8 +364,8 @@ loop(#h3{conn = Conn} = State) ->
             loop(handle_continue(State, Worker, StreamId));
         {roadrunner_slot, StreamId, Outcome} ->
             loop(handle_slot(State, StreamId, Outcome));
-        {roadrunner_drain, _Deadline} ->
-            drain(State)
+        {roadrunner_drain, Deadline} ->
+            drain(State, Deadline)
         %% No catch-all: like the h2 connection loop, the owner uses a
         %% selective receive. The native transport only ever sends it the
         %% `{quic, Conn, Event}` notifications matched above, so an unmatched
@@ -387,7 +393,7 @@ peer_changed(#h3{proto_opts = ProtoOpts} = State, Peer) ->
 %% state, so `connected` is delivered to this loop exactly once. The
 %% control stream stays open (no FIN) for the connection's lifetime.
 %%
-%% The SETTINGS send is fire-and-forget (`_ =`, as in `start_drain/1`): a
+%% The SETTINGS send is fire-and-forget (`_ =`, as in `start_drain/2`): a
 %% peer that closes right after the handshake (e.g. rejecting a field
 %% section) leaves the connection draining, so the send returns
 %% `{error, {invalid_state, draining}}`. That is an expected race, not a
@@ -448,21 +454,30 @@ send_settings(
 %% connection closes once their responses are out, ending this loop with
 %% `{closed, drained}`. The listener force-exits us at the deadline if a
 %% request is still running then.
--spec drain(#h3{}) -> ok.
-drain(#h3{control_stream_id = undefined} = State) ->
+-spec drain(#h3{}, integer()) -> ok.
+drain(#h3{control_stream_id = undefined} = State, _Deadline) ->
     close_connection(State, ?H3_NO_ERROR, ~"graceful shutdown", drained);
-drain(State) ->
-    loop(start_drain(State)).
+drain(State, Deadline) ->
+    loop(start_drain(State, Deadline)).
 
 %% Begin a graceful drain (RFC 9114 §5.2): send a GOAWAY on the control
 %% stream naming the first request-stream id we will not process
 %% (`last_request_id + 4`, the next client-initiated bidirectional id),
 %% mark the connection draining so later request streams are refused, and
-%% have the QUIC connection close once every response is sent. Re-sending
-%% the same id on a repeated drain is harmless and RFC-compliant (the id
-%% never increases — refused streams are not counted). The control stream
-%% exists here: `drain/1` closes a connection that has not reached
-%% `connected` (which opens it).
+%% have the QUIC connection close once every response is sent. A repeated
+%% drain message changes nothing. The control stream exists here:
+%% `drain/2` closes a connection that has not reached `connected` (which
+%% opens it).
+%%
+%% Every stream worker also gets the same `{roadrunner_drain, Deadline}`
+%% this loop did. The handler runs in the worker, not here, so this is how
+%% a `{loop, ...}` response (an SSE stream, say) learns of the drain and
+%% can wind down, as it does on HTTP/1.1, where it runs in the connection
+%% process. Every worker gets it, not only loop ones, again as on
+%% HTTP/1.1: a worker still in `handle/1` may be about to answer with a
+%% loop, and one that is not just leaves it unread. Workers started later
+%% get it as they start (`start_worker/3`), and a repeated drain sends
+%% nothing, so each worker hears of the drain once.
 %%
 %% The close waits on the QUIC connection's streams rather than on this
 %% loop's workers: every request accepted below the GOAWAY id still owes a
@@ -476,8 +491,18 @@ drain(State) ->
 %% never do, the listener's drain deadline ends the connection, as it does
 %% for a request still running. A request at or beyond the GOAWAY id is
 %% reset when it arrives, so it holds nothing open.
--spec start_drain(#h3{}) -> #h3{}.
-start_drain(#h3{conn = Conn, control_stream_id = CtrlId, last_request_id = LastId} = State) when
+-spec start_drain(#h3{}, integer()) -> #h3{}.
+start_drain(#h3{drain_deadline = Deadline} = State, _Deadline) when is_integer(Deadline) ->
+    State;
+start_drain(
+    #h3{
+        conn = Conn,
+        control_stream_id = CtrlId,
+        last_request_id = LastId,
+        worker_pids = WorkerPids
+    } = State,
+    Deadline
+) when
     is_integer(CtrlId)
 ->
     GoawayId = LastId + 4,
@@ -485,7 +510,38 @@ start_drain(#h3{conn = Conn, control_stream_id = CtrlId, last_request_id = LastI
         Conn, CtrlId, roadrunner_quic_h3_frame:encode_goaway(GoawayId), false
     ),
     ok = roadrunner_quic:close_when_done(Conn, ?H3_NO_ERROR, ~"graceful shutdown"),
-    State#h3{goaway_id = GoawayId}.
+    ok = maps:foreach(
+        fun(_StreamId, Pid) ->
+            _ = (Pid ! {roadrunner_drain, Deadline}),
+            ok
+        end,
+        WorkerPids
+    ),
+    State#h3{goaway_id = GoawayId, drain_deadline = Deadline}.
+
+%% Spawn the worker for `StreamId`. A worker started once the drain has
+%% begun (a request below the GOAWAY id still being received, or one
+%% parked for an in-flight slot) gets the drain message right away, as
+%% the workers already running did in `start_drain/2`.
+-spec start_worker(#h3{}, non_neg_integer(), roadrunner_req:request()) -> {pid(), reference()}.
+start_worker(
+    #h3{
+        conn = Conn,
+        proto_opts = ProtoOpts,
+        peer_max_field_section_size = PeerLimit,
+        drain_deadline = Deadline
+    },
+    StreamId,
+    Req
+) ->
+    {WorkerPid, _MonRef} =
+        Worker = roadrunner_http3_stream_worker:start(Conn, StreamId, Req, ProtoOpts, PeerLimit),
+    _ =
+        case Deadline of
+            undefined -> ok;
+            _ -> WorkerPid ! {roadrunner_drain, Deadline}
+        end,
+    Worker.
 
 %% Track the highest request stream id accepted, for the drain GOAWAY id.
 -spec note_request_id(#h3{}, non_neg_integer()) -> #h3{}.
@@ -1750,13 +1806,7 @@ dispatch_with_slot(#h3{streams = Streams} = State1, StreamId, Req) ->
         )
     of
         true ->
-            {WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
-                State1#h3.conn,
-                StreamId,
-                Req,
-                State1#h3.proto_opts,
-                State1#h3.peer_max_field_section_size
-            ),
+            {WorkerPid, MonRef} = start_worker(State1, StreamId, Req),
             %% The worker owns the response now, tracked by its monitor
             %% ref; drop the (no-longer-needed) frame-accumulation entry
             %% so the streams map only ever holds in-progress requests.
@@ -1806,13 +1856,7 @@ handle_slot(#h3{awaiting_slot = Awaiting} = State, StreamId, granted) ->
     case Awaiting of
         #{StreamId := Req} ->
             State1 = State#h3{awaiting_slot = maps:remove(StreamId, Awaiting)},
-            {WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
-                State1#h3.conn,
-                StreamId,
-                Req,
-                State1#h3.proto_opts,
-                State1#h3.peer_max_field_section_size
-            ),
+            {WorkerPid, MonRef} = start_worker(State1, StreamId, Req),
             State1#h3{
                 worker_refs = (State1#h3.worker_refs)#{MonRef => StreamId},
                 worker_pids = (State1#h3.worker_pids)#{StreamId => WorkerPid}

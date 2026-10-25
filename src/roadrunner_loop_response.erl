@@ -44,6 +44,13 @@
 %% handler's chance to drop subscriptions) and then ends without writing
 %% the chunked terminator — the wire is already gone. Inbound bytes (an
 %% h1 streaming response is unidirectional) re-arm and are discarded.
+%%
+%% ## Drain
+%%
+%% A listener drain's `{roadrunner_drain, Deadline}` lands in the conn
+%% process, so it reaches `handle_info/3` through the catch-all like any
+%% other message. The h2 and h3 loops get the same: their conn passes
+%% the message on to the stream worker the loop runs in.
 
 -export([run/5]).
 

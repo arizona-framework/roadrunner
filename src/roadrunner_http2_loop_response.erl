@@ -25,6 +25,10 @@
 %% stream (`RST_STREAM`, surfaced by the conn as `{h2_stream_reset, _}`)
 %% or `conn_down` when the owning conn process died (the worker's monitor
 %% `'DOWN'`).
+%%
+%% A listener drain reaches the handler as on h1: the conn passes
+%% `{roadrunner_drain, Deadline}` on to the worker, once, and the
+%% catch-all clause hands it to `handle_info/3` like any other message.
 
 -export([run/5]).
 

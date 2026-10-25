@@ -151,7 +151,8 @@ observe / rewrite.
 -doc """
 Optional, only fired for `{loop, _, _, State}` responses. The
 framework dispatches every non-OTP Erlang message delivered to the
-conn (or h2 worker) process through this callback. `Push(Data)`
+process running the handler (the connection on HTTP/1.1, the stream
+worker on HTTP/2 and HTTP/3) through this callback. `Push(Data)`
 writes one chunk to the wire. Return `{ok, NewState}` to keep
 looping or `{stop, NewState}` to emit the size-0 terminator and
 close. Handlers that don't export this callback can't use
@@ -174,6 +175,16 @@ It is delivered at most once, the loop then ends regardless of the
 return value (the wire is gone, so no terminator is written). A handler
 that does not match it explicitly falls through to its catch-all clause;
 the loop still ends.
+
+When the listener drains (`roadrunner_listener:drain/2` or
+`notify_drain/2`), the handler gets `{roadrunner_drain, Deadline}`
+through this callback on every protocol, so a long-lived loop (an SSE
+stream, say) can finish on its own terms, for example by pushing a last
+event and returning `{stop, NewState}`, before the deadline closes it.
+`Deadline` is in `erlang:monotonic_time(millisecond)` units. On HTTP/2
+and HTTP/3 it arrives once per connection, even when the listener
+broadcasts again; on HTTP/1.1 each broadcast reaches the handler. A
+handler that ignores it keeps running until the deadline.
 """.
 -callback handle_info(Info :: term(), Push :: push_fun(), State :: term()) ->
     {ok, NewState :: term()} | {stop, NewState :: term()}.

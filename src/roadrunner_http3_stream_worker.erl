@@ -375,7 +375,9 @@ sendfile_loop(IoDev, Remaining, Send) ->
 %% `handle_info/3` with a `Push` callback that emits a DATA frame; FIN
 %% on `{stop, _}`. Runs in the per-stream worker, so a handler's
 %% `self() ! Msg` / `register/2` from `handle/1` works (the worker IS
-%% the dispatch process). Mirrors `roadrunner_http2_loop_response`.
+%% the dispatch process). Mirrors `roadrunner_http2_loop_response`,
+%% listener drain included: the conn loop passes `{roadrunner_drain, _}`
+%% on to the worker and the catch-all hands it to `handle_info/3`.
 -spec send_loop(pid(), non_neg_integer(), roadrunner_http:headers(), module(), term()) -> ok.
 send_loop(Conn, StreamId, Fields, Handler, State) ->
     _ = roadrunner_quic:send_data(Conn, StreamId, header_frame(Fields), false),

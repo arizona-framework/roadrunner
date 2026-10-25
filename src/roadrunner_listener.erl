@@ -824,10 +824,18 @@ stop(Name) ->
 -doc """
 Graceful shutdown. Closes the listen socket immediately so no new
 connections are accepted, broadcasts `{roadrunner_drain, Deadline}` to
-every active conn (so `{loop, ...}` handlers can opt to honor it),
-and then polls the live-connection counter until it hits zero or
-`Timeout` milliseconds elapse. Conns still alive at the deadline are
-hard-killed via `exit(Pid, shutdown)`.
+every active conn, and then polls the live-connection counter until it
+hits zero or `Timeout` milliseconds elapse. Conns still alive at the
+deadline are hard-killed via `exit(Pid, shutdown)`.
+
+An idle HTTP/1.1 conn closes, and an HTTP/2 or HTTP/3 conn sends GOAWAY,
+refuses new requests and closes once its in-flight requests finish. The
+handler of every in-flight request gets the same message on every
+protocol: on HTTP/1.1 it runs in the conn process itself, and an HTTP/2
+or HTTP/3 conn passes the message on to each of its stream workers, so
+a `{loop, ...}` handler sees it in `handle_info/3` (see
+`roadrunner_handler`) and can wind down, as a WebSocket handler can in
+`handle_drain/2`.
 
 Returns `{ok, drained}` when the counter reached zero before the
 deadline, or `{timeout, Remaining}` with the count that was still
@@ -857,7 +865,8 @@ listener or waiting on the counter.
 Use for soft-drain workflows — telling long-lived sessions to wind down
 ahead of a deploy, or in test suites that want to observe drain
 behavior without losing the listener for subsequent cases. Unlike
-`drain/2`, the listener keeps accepting new connections.
+`drain/2`, the listener keeps accepting new connections. Handlers get
+the message as they do from `drain/2`.
 
 Like every other call into a listener, exits with `noproc` when no
 listener by that name is running.
@@ -2374,7 +2383,8 @@ do_drain(
 
 %% Best-effort broadcast to in-flight conns. Loop / SSE / WebSocket
 %% handlers can pattern-match on `{roadrunner_drain, Deadline}` in
-%% `handle_info/3`; non-loop conns ignore the message and fall through
+%% `handle_info/3` (an HTTP/2 or HTTP/3 conn passes it on to its stream
+%% workers); non-loop HTTP/1.1 conns ignore the message and fall through
 %% to the mailbox check at the next keep-alive boundary.
 -spec notify_conns(ets:table(), integer()) -> ok.
 notify_conns(Table, Deadline) ->

@@ -123,6 +123,9 @@ all_test_() ->
         fun drain_with_in_flight_stream_waits/0,
         fun drain_message_is_idempotent/0,
         fun drain_then_peer_rst_exits_via_frame_loop/0,
+        fun drain_reaches_loop_handler/0,
+        fun drain_reaches_loop_worker_once/0,
+        fun drain_reaches_workers_started_after_it/0,
         fun telemetry_request_start_stop_fires_for_h2/0,
         fun telemetry_request_stop_reports_the_status_sent/0,
         fun telemetry_request_exception_fires_on_h2_handler_crash/0,
@@ -3135,8 +3138,8 @@ drain_message_is_idempotent() ->
 drain_then_peer_rst_exits_via_frame_loop() ->
     %% Drain while a stream is open. Peer RSTs the last
     %% in-flight stream — `handle_frame({rst_stream, ...})` tail-calls
-    %% `frame_loop/1` which observes `draining = true` and an empty
-    %% streams map, and exits cleanly.
+    %% `frame_loop/1` which observes the drain and an empty streams map,
+    %% and exits cleanly.
     {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
@@ -3191,6 +3194,125 @@ drain_then_peer_rst_exits_via_frame_loop() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 1000 -> error(drain_did_not_complete)
     end.
+
+drain_reaches_loop_handler() ->
+    %% The conn passes the drain on to the stream worker, so a `{loop, ...}`
+    %% handler sees `{roadrunner_drain, _}` in `handle_info/3`, as it does
+    %% on HTTP/1.1, and stops: the stream ends with END_STREAM and the conn,
+    %% its last stream done, exits.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{
+        dispatch =>
+            {handler, roadrunner_drain_handler, fun roadrunner_drain_handler:handle/1, undefined}
+    }),
+    serve_recv(ConnPid, complete_get_headers(1, ~"/")),
+    ?assertMatch(
+        [{headers, 1, false}, {data, 1, false, ~"started"}], collect_response_frames()
+    ),
+    ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    ?assertMatch([{other, 7, 0, false}, {data, 1, true, ~""}], collect_response_frames()),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(drain_did_not_complete)
+    end.
+
+drain_reaches_loop_worker_once() ->
+    %% A repeated drain message is passed on only once: the handler counts
+    %% each drain it sees, and its `bye(1)` shows it saw one. The PING-ACK
+    %% proves the conn handled the second drain before the stop.
+    {Pid, Ref} = run_stream_request(~"/loop"),
+    _ = wait_for_register(roadrunner_h2_loop_test, 1000),
+    %% The 200 HEADERS, so the worker is in its loop.
+    _ = expect_send(),
+    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    serve_recv(Pid, iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>}))),
+    BeforeStop = frames_until_ping_ack([]),
+    roadrunner_h2_loop_test ! stop,
+    Frames = BeforeStop ++ collect_response_frames(),
+    ?assertEqual(
+        [
+            {data, 1, false, ~"data: drain\n\n"},
+            {data, 1, false, ~"data: bye(1)\n\n"},
+            {data, 1, true, ~""}
+        ],
+        [F || {data, _, _, _} = F <- Frames]
+    ),
+    ?assertEqual(1, length([G || {other, 7, _, _} = G <- Frames])),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(drain_did_not_complete)
+    end.
+
+drain_reaches_workers_started_after_it() ->
+    %% Streams opened before the GOAWAY are still served, and a worker
+    %% started once the drain began (here, at END_STREAM) gets the drain
+    %% message as it starts. The loop on stream 1 sees it; the buffered
+    %% answer on stream 3 leaves it unread and completes as usual.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined}
+    }),
+    serve_recv(ConnPid, open_get_headers(1, ~"/loop")),
+    serve_recv(ConnPid, open_get_headers(3, ~"/")),
+    ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    ?assertMatch(
+        {ok, {goaway, 3, no_error, _}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    EndStream = fun(StreamId) ->
+        iolist_to_binary(roadrunner_http2_frame:encode({data, StreamId, 16#01, <<>>}))
+    end,
+    serve_recv(ConnPid, EndStream(3)),
+    serve_recv(ConnPid, EndStream(1)),
+    _ = wait_for_register(roadrunner_h2_loop_test, 1000),
+    Frames0 = collect_response_frames(),
+    roadrunner_h2_loop_test ! stop,
+    Frames = Frames0 ++ collect_response_frames(),
+    ?assertEqual(
+        [{headers, 3, false}, {data, 3, true, ~"ok"}],
+        [F || F <- Frames, element(2, F) =:= 3]
+    ),
+    ?assertEqual(
+        [
+            {headers, 1, false},
+            {data, 1, false, ~"data: drain\n\n"},
+            {data, 1, false, ~"data: bye(1)\n\n"},
+            {data, 1, true, ~""}
+        ],
+        [F || F <- Frames, element(2, F) =:= 1]
+    ),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(drain_did_not_complete)
+    end.
+
+%% Read the conn's sends up to and including its PING ACK, returning the
+%% frames, so the test knows the conn handled what it was sent before.
+frames_until_ping_ack(Acc) ->
+    Frames = Acc ++ parse_frames(expect_send()),
+    case [P || {other, 6, 0, true} = P <- Frames] of
+        [] -> frames_until_ping_ack(Frames);
+        [_] -> Frames
+    end.
+
+%% A GET HEADERS frame for `Path` on `StreamId` with END_HEADERS but no
+%% END_STREAM, so its worker starts only when the stream ends.
+open_get_headers(StreamId, Path) ->
+    Enc = roadrunner_http2_hpack:new_encoder(4096),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", Path}
+        ],
+        Enc
+    ),
+    iolist_to_binary(
+        roadrunner_http2_frame:encode(
+            {headers, StreamId, 16#04, undefined, iolist_to_binary(Hpack)}
+        )
+    ).
 
 telemetry_request_start_stop_fires_for_h2() ->
     %% A successful h2 request fires `[roadrunner, request, start]`
