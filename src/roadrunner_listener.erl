@@ -672,7 +672,9 @@ HTTP/3 listener tunables (under `{http3, ThisMap}` in `protocols`).
   `max_header_block` (which caps the compressed block). Defaults to
   `2 * max_header_block`, so raising the encoded cap lifts this one too
   unless set explicitly. The h3 counterpart to the `{http2, ...}`
-  `max_header_list_size` opt.
+  `max_header_list_size` opt. The other way round, response headers
+  are kept within the limit a client sends in its own
+  `SETTINGS_MAX_FIELD_SECTION_SIZE` (see `t:roadrunner_handler:response/0`).
 - `qpack_max_table_capacity`: the most bytes of QPACK dynamic table
   (RFC 9204 §3.2) a client may set up to compress its request headers,
   advertised via `SETTINGS_QPACK_MAX_TABLE_CAPACITY`. Each connection

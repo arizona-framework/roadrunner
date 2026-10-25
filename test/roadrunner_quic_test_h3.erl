@@ -40,6 +40,8 @@ connect(Host, Port) ->
 -doc """
 As `connect/2` but with `Opts` passed to the underlying QUIC connection
 (e.g. `stream_window => N` to advertise a small per-stream window).
+`h3_settings => Map` adds to the SETTINGS the client sends (e.g.
+`#{max_field_section_size => N}` to limit the server's response headers).
 """.
 -spec connect(inet:ip_address() | inet:hostname(), inet:port_number(), map()) ->
     {ok, pid()} | {error, term()}.
@@ -47,7 +49,9 @@ connect(Host, Port, Opts) ->
     case roadrunner_quic_test_conn:connect(Host, Port, Opts) of
         {ok, Conn} ->
             Control = roadrunner_quic_test_conn:open_uni(Conn),
-            ok = roadrunner_quic_test_conn:send(Conn, Control, control_with_settings(), false),
+            ok = roadrunner_quic_test_conn:send(
+                Conn, Control, control_with_settings(h3_settings(Opts)), false
+            ),
             {ok, Conn};
         {error, _} = Error ->
             Error
@@ -205,13 +209,18 @@ control_settings(Data) ->
             more
     end.
 
+%% The extra SETTINGS a test asked the client to send.
+-spec h3_settings(map()) -> map().
+h3_settings(#{h3_settings := Settings}) -> Settings;
+h3_settings(_Opts) -> #{}.
+
 %% The control stream-type prefix followed by a SETTINGS frame (RFC 9114
 %% §6.2.1 / §7.2.4); static-table-only QPACK advertises a zero table capacity.
--spec control_with_settings() -> binary().
-control_with_settings() ->
+-spec control_with_settings(map()) -> binary().
+control_with_settings(Settings) ->
     iolist_to_binary([
         roadrunner_quic_h3_frame:encode_stream_type(control),
-        roadrunner_quic_h3_frame:encode_settings(#{qpack_max_table_capacity => 0})
+        roadrunner_quic_h3_frame:encode_settings(Settings#{qpack_max_table_capacity => 0})
     ]).
 
 -spec headers(binary(), binary()) -> headers().

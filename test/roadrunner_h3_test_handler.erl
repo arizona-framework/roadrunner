@@ -90,6 +90,22 @@ handle(#{target := ~"/stream-bad-trailers"} = Req) ->
         {stream, 200, [], fun(Send) -> ok = Send(~"body", {fin, [{~"x-trailer", ~"a\r\nb"}]}) end},
         Req
     };
+handle(#{target := ~"/big-header"} = Req) ->
+    %% A 1000-byte header value, over a small client header limit.
+    {{200, [{~"x-big", binary:copy(~"v", 1000)}], ~"big"}, Req};
+handle(#{target := ~"/stream-big-header"} = Req) ->
+    {
+        {stream, 200, [{~"x-big", binary:copy(~"v", 1000)}], fun(Send) -> ok = Send(~"x", fin) end},
+        Req
+    };
+handle(#{target := ~"/stream-big-trailers"} = Req) ->
+    %% Small headers, then a trailer section over a small client limit.
+    {
+        {stream, 200, [], fun(Send) ->
+            ok = Send(~"body", {fin, [{~"x-trailer", binary:copy(~"v", 1000)}]})
+        end},
+        Req
+    };
 handle(#{target := ~"/stream-exit-normal"} = Req) ->
     %% The stream fun ends the worker normally before the stream's FIN.
     {

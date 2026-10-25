@@ -32,9 +32,20 @@
 %% response encoding) crashes the worker, and the conn loop resets the
 %% stream on the `'DOWN'` — leaving the connection's other streams
 %% untouched.
+%%
+%% Client header limit (RFC 9114 §4.2.2): a client that sent
+%% SETTINGS_MAX_FIELD_SECTION_SIZE will likely refuse a header section
+%% over it, so the worker does not send one. The conn loop hands the
+%% worker the limit it knows when the worker starts (none until the
+%% client's SETTINGS arrive, §7.2.4.2), and the worker keeps it in its
+%% process dictionary only when there is one, so a client that set no
+%% limit costs one `get/1` per response. A handler response over the
+%% limit is answered 500 instead, before anything is sent, as one with an
+%% unsafe header is; trailers over it, or a 500 that is itself over it,
+%% crash the worker, so the conn loop resets the stream (H3_INTERNAL_ERROR).
 
--export([start/4]).
--export([init/4]).
+-export([start/5]).
+-export([init/5]).
 %% Exported for `roadrunner_conn_loop_http3` to emit a buffered
 %% response (e.g. 413) directly, without spawning a worker.
 -export([send_buffered/5]).
@@ -44,11 +55,17 @@
 -behaviour(roadrunner_stream_worker).
 %% Exported for eunit branch coverage of the stop-on-send-error path.
 -export([sendfile_loop/3]).
+%% Exported for direct eunit branch coverage of the client header limit check.
+-export([fits_peer_limit/2]).
 
 %% Worker process-dict flag: set once a `{stream, ...}` `Send` observed
-%% a fin variant, so `send_stream/5` knows whether to auto-close. Lives
+%% a fin variant, so `send_stream/4` knows whether to auto-close. Lives
 %% in this per-stream worker's dict, so stream isolation is automatic.
 -define(FIN_KEY, '$roadrunner_http3_stream_fin').
+
+%% Worker process-dict entry holding the client's
+%% SETTINGS_MAX_FIELD_SECTION_SIZE, absent when it set none.
+-define(PEER_LIMIT_KEY, '$roadrunner_http3_peer_max_field_section_size').
 
 %% File-read granularity for the sendfile path. QUIC has no small frame
 %% cap (unlike h2's 16 KB DATA frames), so this is just a bounded read
@@ -63,43 +80,120 @@ stream id (normal exit → stream done; abnormal → reset the stream).
 The conn loop has already QPACK-decoded the field block and built
 `Req` (so QPACK-decompression and malformed-message errors are raised
 at the connection / stream level, not by crashing this worker).
+`MaxFieldSection` is the client's SETTINGS_MAX_FIELD_SECTION_SIZE, or
+`infinity` when it set none (or its SETTINGS have not arrived yet).
 """.
--spec start(pid(), non_neg_integer(), roadrunner_req:request(), roadrunner_conn:proto_opts()) ->
+-spec start(
+    pid(),
+    non_neg_integer(),
+    roadrunner_req:request(),
+    roadrunner_conn:proto_opts(),
+    non_neg_integer() | infinity
+) ->
     {pid(), reference()}.
-start(Conn, StreamId, Req, #{handler_spawn_opts := SpawnOpts, dispatch := Dispatch}) ->
-    spawn_opt(?MODULE, init, [Conn, StreamId, Req, Dispatch], [monitor | SpawnOpts]).
+start(
+    Conn, StreamId, Req, #{handler_spawn_opts := SpawnOpts, dispatch := Dispatch}, MaxFieldSection
+) ->
+    spawn_opt(
+        ?MODULE, init, [Conn, StreamId, Req, Dispatch, MaxFieldSection], [monitor | SpawnOpts]
+    ).
 
 -doc false.
--spec init(pid(), non_neg_integer(), roadrunner_req:request(), roadrunner_conn:dispatch()) -> ok.
-init(Conn, StreamId, Req, Dispatch) ->
+-spec init(
+    pid(),
+    non_neg_integer(),
+    roadrunner_req:request(),
+    roadrunner_conn:dispatch(),
+    non_neg_integer() | infinity
+) -> ok.
+init(Conn, StreamId, Req, Dispatch, MaxFieldSection) ->
     proc_lib:set_label({roadrunner_http3_stream_worker, StreamId}),
     %% Attach request-scoped logger metadata so any `?LOG_*` from
     %% middleware/handlers is auto-correlated by `request_id` — the
     %% handler runs in this worker, not on the conn loop.
     ok = roadrunner_conn:set_request_logger_metadata(Req),
+    ok = set_peer_limit(MaxFieldSection),
     roadrunner_stream_worker:run(?MODULE, h3, Conn, StreamId, Req, Dispatch).
+
+%% Keep the client's limit for the send paths; nothing when it set none,
+%% so `get(?PEER_LIMIT_KEY)` is `undefined` and no size is computed.
+-spec set_peer_limit(non_neg_integer() | infinity) -> ok.
+set_peer_limit(infinity) ->
+    ok;
+set_peer_limit(MaxFieldSection) ->
+    _ = put(?PEER_LIMIT_KEY, MaxFieldSection),
+    ok.
 
 -doc false.
 -spec emit_handler_response(pid(), non_neg_integer(), module(), roadrunner_handler:response()) ->
     roadrunner_http:status().
-emit_handler_response(Conn, StreamId, _Handler, {Status, Headers, Body}) when
-    is_integer(Status), Status >= 200, Status =< 599
-->
-    send_buffered(Conn, StreamId, Status, Headers, Body),
-    Status;
-emit_handler_response(Conn, StreamId, _Handler, {stream, Status, Headers, Fun}) ->
-    send_stream(Conn, StreamId, Status, Headers, Fun),
-    Status;
-emit_handler_response(Conn, StreamId, _Handler, {sendfile, Status, Headers, Spec}) ->
-    send_sendfile(Conn, StreamId, Status, Headers, Spec),
-    Status;
-emit_handler_response(Conn, StreamId, Handler, {loop, Status, Headers, State}) ->
-    send_loop(Conn, StreamId, Status, Headers, Handler, State),
-    Status;
 emit_handler_response(Conn, StreamId, _Handler, {websocket, _, _}) ->
     emit_501(Conn, StreamId);
 emit_handler_response(Conn, StreamId, _Handler, {websocket, _, _, _}) ->
-    emit_501(Conn, StreamId).
+    emit_501(Conn, StreamId);
+emit_handler_response(Conn, StreamId, Handler, Response) ->
+    {Status, Headers} = status_headers(Response),
+    Fields = field_section(Status, Headers),
+    case fits_peer_limit(Fields, get(?PEER_LIMIT_KEY)) of
+        true ->
+            ok = emit(Conn, StreamId, Handler, Response, Fields),
+            Status;
+        false ->
+            %% RFC 9114 §4.2.2: the client will likely refuse a header
+            %% section over its SETTINGS_MAX_FIELD_SECTION_SIZE. Nothing
+            %% is sent yet, so answer 500, as for an unsafe header; only
+            %% the sizes are logged, never the fields.
+            logger:error(#{
+                msg => "roadrunner h3 response headers exceed the client's limit",
+                handler => Handler,
+                size => roadrunner_http:header_list_size(Fields),
+                limit => get(?PEER_LIMIT_KEY)
+            }),
+            ok = send_buffered(
+                Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
+            ),
+            500
+    end.
+
+-spec status_headers(roadrunner_handler:response()) ->
+    {roadrunner_http:status(), roadrunner_http:headers()}.
+status_headers({stream, Status, Headers, _Fun}) -> {Status, Headers};
+status_headers({sendfile, Status, Headers, _Spec}) -> {Status, Headers};
+status_headers({loop, Status, Headers, _State}) -> {Status, Headers};
+status_headers({Status, Headers, _Body}) -> {Status, Headers}.
+
+%% Send a handler response whose field section is already built and
+%% within the client's limit.
+-spec emit(
+    pid(), non_neg_integer(), module(), roadrunner_handler:response(), roadrunner_http:headers()
+) -> ok.
+emit(Conn, StreamId, _Handler, {stream, _Status, _Headers, Fun}, Fields) ->
+    send_stream(Conn, StreamId, Fields, Fun);
+emit(Conn, StreamId, _Handler, {sendfile, _Status, _Headers, Spec}, Fields) ->
+    send_sendfile(Conn, StreamId, Fields, Spec);
+emit(Conn, StreamId, Handler, {loop, _Status, _Headers, State}, Fields) ->
+    send_loop(Conn, StreamId, Fields, Handler, State);
+emit(Conn, StreamId, _Handler, {_Status, _Headers, Body}, Fields) ->
+    send_fields(Conn, StreamId, Fields, Body).
+
+%% Whether a field section fits the client's SETTINGS_MAX_FIELD_SECTION_SIZE
+%% (RFC 9114 §4.2.2: name + value + 32 bytes per field, uncompressed);
+%% `undefined` is no limit, and is not even sized.
+-spec fits_peer_limit(roadrunner_http:headers(), non_neg_integer() | undefined) -> boolean().
+fits_peer_limit(_Fields, undefined) ->
+    true;
+fits_peer_limit(Fields, MaxFieldSection) ->
+    roadrunner_http:header_list_size(Fields) =< MaxFieldSection.
+
+%% A section the client will likely refuse, sent after the handler's
+%% status is decided (trailers) or as the worker's own answer (404, 500,
+%% ...): crash, so the conn loop resets the stream.
+-spec check_peer_limit(roadrunner_http:headers()) -> ok.
+check_peer_limit(Fields) ->
+    case fits_peer_limit(Fields, get(?PEER_LIMIT_KEY)) of
+        true -> ok;
+        false -> error(field_section_too_large)
+    end.
 
 %% The `websocket` response shape is not yet wired for HTTP/3 (it needs
 %% Extended CONNECT, RFC 9220); until then it answers 501, mirroring how
@@ -128,12 +222,24 @@ emit_501(Conn, StreamId) ->
 %% per request. The frames are encoded here, so a handler's non-iodata body
 %% crashes this worker (the conn loop resets just its stream), never the
 %% connection.
+%%
+%% Only a worker holds the client's header limit, so it is checked here
+%% for the worker's own answers (404, 413, 500, ...) and not for the conn
+%% loop's (413, 431, 429, ...), whose few fixed fields come to under 200
+%% bytes. A handler's response is checked before it gets this far and goes
+%% straight to `send_fields/4`.
 -spec send_buffered(
     pid(), non_neg_integer(), roadrunner_http:status(), roadrunner_http:headers(), iodata()
 ) ->
     ok.
 send_buffered(Conn, StreamId, Status, Headers, Body) ->
-    HeadersFrame = header_frame(Status, Headers),
+    Fields = field_section(Status, Headers),
+    ok = check_peer_limit(Fields),
+    send_fields(Conn, StreamId, Fields, Body).
+
+-spec send_fields(pid(), non_neg_integer(), roadrunner_http:headers(), iodata()) -> ok.
+send_fields(Conn, StreamId, Fields, Body) ->
+    HeadersFrame = header_frame(Fields),
     Frames =
         case iolist_size(Body) of
             0 -> HeadersFrame;
@@ -154,14 +260,10 @@ send_buffered(Conn, StreamId, Status, Headers, Body) ->
 %% QPACK-encoded static-only (no encoder state shared with the conn) and
 %% QUIC streams are independent, so no conn round-trip (unlike h2).
 -spec send_stream(
-    pid(),
-    non_neg_integer(),
-    roadrunner_http:status(),
-    roadrunner_http:headers(),
-    roadrunner_handler:stream_fun()
+    pid(), non_neg_integer(), roadrunner_http:headers(), roadrunner_handler:stream_fun()
 ) -> ok.
-send_stream(Conn, StreamId, Status, Headers, Fun) ->
-    _ = roadrunner_quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
+send_stream(Conn, StreamId, Fields, Fun) ->
+    _ = roadrunner_quic:send_data(Conn, StreamId, header_frame(Fields), false),
     erase(?FIN_KEY),
     Send = fun(Data, FinFlag) -> stream_send(Conn, StreamId, Data, FinFlag) end,
     _ = handler_code(fun() -> Fun(Send) end),
@@ -214,8 +316,11 @@ stream_send(Conn, StreamId, Data, {fin, Trailers}) ->
     %% loop resets the stream and the malformed bytes never reach the client,
     %% the same cut-off h1 does for chunked trailers) and strips the
     %% connection-specific fields RFC 9114 §4.2 forbids, matching the header
-    %% path. The crash must happen before `?FIN_KEY` is set, so run it first.
+    %% path. The crash must happen before `?FIN_KEY` is set, so run it first,
+    %% and so must the one for trailers over the client's header limit
+    %% (RFC 9114 §4.2.2), which cannot become a 500 either.
     Stripped = roadrunner_http:strip_connection_specific_fields_safe(Trailers),
+    ok = check_peer_limit(Stripped),
     put(?FIN_KEY, true),
     TrailersFrame = roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(Stripped)),
     roadrunner_quic:send_data(
@@ -230,13 +335,9 @@ stream_send(Conn, StreamId, Data, {fin, Trailers}) ->
 %% the streaming machinery, mirroring the h2 sendfile path. A file-open
 %% failure crashes the worker; the conn loop resets the stream.
 -spec send_sendfile(
-    pid(),
-    non_neg_integer(),
-    roadrunner_http:status(),
-    roadrunner_http:headers(),
-    roadrunner_handler:sendfile_spec()
+    pid(), non_neg_integer(), roadrunner_http:headers(), roadrunner_handler:sendfile_spec()
 ) -> ok.
-send_sendfile(Conn, StreamId, Status, Headers, {File, Offset, Length}) ->
+send_sendfile(Conn, StreamId, Fields, {File, Offset, Length}) ->
     Fun = fun(Send) ->
         {ok, IoDev} = file:open(File, [read, raw, binary]),
         try
@@ -246,7 +347,7 @@ send_sendfile(Conn, StreamId, Status, Headers, {File, Offset, Length}) ->
             _ = file:close(IoDev)
         end
     end,
-    send_stream(Conn, StreamId, Status, Headers, Fun).
+    send_stream(Conn, StreamId, Fields, Fun).
 
 %% Stream `Length` bytes from the open file as DATA chunks, FIN on the
 %% last (or an immediate empty FIN for a zero-length range).
@@ -277,16 +378,9 @@ sendfile_loop(IoDev, Remaining, Send) ->
 %% on `{stop, _}`. Runs in the per-stream worker, so a handler's
 %% `self() ! Msg` / `register/2` from `handle/1` works (the worker IS
 %% the dispatch process). Mirrors `roadrunner_http2_loop_response`.
--spec send_loop(
-    pid(),
-    non_neg_integer(),
-    roadrunner_http:status(),
-    roadrunner_http:headers(),
-    module(),
-    term()
-) -> ok.
-send_loop(Conn, StreamId, Status, Headers, Handler, State) ->
-    _ = roadrunner_quic:send_data(Conn, StreamId, header_frame(Status, Headers), false),
+-spec send_loop(pid(), non_neg_integer(), roadrunner_http:headers(), module(), term()) -> ok.
+send_loop(Conn, StreamId, Fields, Handler, State) ->
+    _ = roadrunner_quic:send_data(Conn, StreamId, header_frame(Fields), false),
     %% Monitor the conn so an idle loop worker (blocked in `info_loop`)
     %% does not leak once the conn is gone: its `'DOWN'` becomes a
     %% `{roadrunner_disconnect, conn_down}` for the handler. The monitor
@@ -358,11 +452,17 @@ loop_push(Conn, StreamId, Data) ->
             )
     end.
 
-%% HEADERS frame: QPACK-encoded `:status` + the handler's headers, with
-%% connection-specific fields stripped (RFC 9114 §4.2 — h3 MUST NOT
+%% The response field section as sent: `:status` + the handler's headers,
+%% with connection-specific fields stripped (RFC 9114 §4.2 — h3 MUST NOT
 %% generate them) and the auto-injected `Date` (RFC 9110 §6.6.1) added.
--spec header_frame(roadrunner_http:status(), roadrunner_http:headers()) -> iolist().
-header_frame(Status, Headers) ->
+%% Its size is what the client's SETTINGS_MAX_FIELD_SECTION_SIZE bounds.
+-spec field_section(roadrunner_http:status(), roadrunner_http:headers()) ->
+    roadrunner_http:headers().
+field_section(Status, Headers) ->
     Stripped = roadrunner_http:strip_connection_specific_fields(Headers),
-    HeaderList = [{~":status", integer_to_binary(Status)} | roadrunner_http:with_date(Stripped)],
-    roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(HeaderList)).
+    [{~":status", integer_to_binary(Status)} | roadrunner_http:with_date(Stripped)].
+
+%% A HEADERS frame carrying a field section, QPACK-encoded.
+-spec header_frame(roadrunner_http:headers()) -> iolist().
+header_frame(Fields) ->
+    roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(Fields)).

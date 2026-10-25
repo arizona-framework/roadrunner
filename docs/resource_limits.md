@@ -118,6 +118,17 @@ counterpart to HTTP/2's `max_concurrent_streams`. Both are tuned under
 `{http3, #{...}}` in the `protocols` list, with the keys
 `max_header_block` and `max_streams_bidi`.
 
+Response headers are held to the client's own limit: a client that sends
+`SETTINGS_MAX_FIELD_SECTION_SIZE` (Chrome, quiche and ngtcp2 all do) gets
+no header section over it (RFC 9114 §4.2.2), counted the same way (name
++ value + 32 per field, `:status` and `date` included). A handler
+response whose headers are over it is answered `500 Internal Server
+Error` instead, before anything is sent, and the error is logged.
+Trailers over it come after the status is sent, so they reset the stream
+with `H3_INTERNAL_ERROR`, as does a limit too small for even the 500. A
+request served before the client's SETTINGS arrive has no limit (RFC
+9114 §7.2.4.2).
+
 The QPACK dynamic table a client may fill to compress its request
 headers is capped per connection at `qpack_max_table_capacity` bytes
 (name + value + 32 per entry, RFC 9204 §3.2.1), set under

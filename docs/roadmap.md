@@ -118,14 +118,6 @@ MUSTs a browser depends on are implemented; the items below are conformance
 hardening and transport completeness that a real browser GET / POST does not
 need.
 
-### SHOULD/MAY conformance — harden against non-conformant peers
-
-A conformant browser / quiche / ngtcp2 never trips these; they tighten the
-advisory or malformed cases the server currently tolerates or omits.
-
-- Honor the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` when sizing response
-  headers (RFC 9114 §4.2.2) — small-medium
-
 ### Transport completeness — bites large transfers / advanced cases
 
 - Send-side flow control edge: signal `DATA_BLOCKED` / `STREAM_DATA_BLOCKED` when
@@ -244,30 +236,22 @@ own measurement before shipping.
 
 **Scope:** small.
 
-### Advertise SETTINGS_MAX_HEADER_LIST_SIZE
+### Honor the peer's SETTINGS_MAX_HEADER_LIST_SIZE
 
-**What:** Advertise `SETTINGS_MAX_HEADER_LIST_SIZE` (RFC 9113 §6.5.2,
-id 0x06) in the server's SETTINGS frame. The cumulative HEADERS +
-CONTINUATION block is now capped (16384-byte default, GOAWAY(ENHANCE_YOUR_CALM)
-on overflow, the same way h1 and h3 bound it), which closes the
-CONTINUATION-flood memory gap. Advertising the decoded-size limit lets
-conformant clients avoid sending an oversized block in the first place
-rather than learning via the connection close.
+**What:** Keep HTTP/2 response headers within the client's
+`SETTINGS_MAX_HEADER_LIST_SIZE` (RFC 9113 §6.5.2, name + value + 32 per
+field), as HTTP/3 does with `SETTINGS_MAX_FIELD_SECTION_SIZE`: a handler
+response over it answered `500` before anything is sent, trailers over it
+resetting the stream. Today the client's value is parsed into
+`roadrunner_http2_settings` but not used when sending.
 
-**Why deferred:** The setting bounds the *decoded* header-list size, a
-different unit from the encoded-block cap that does the real memory
-bounding, so it is an advisory courtesy rather than the load-bearing
-fix. The h3 sibling (`SETTINGS_MAX_FIELD_SECTION_SIZE`, under the
-HTTP/3 follow-ups above) wants the same treatment.
+**Why deferred:** The setting is advisory, and the h2 headers are encoded
+in the connection process (the HPACK encoder is shared), not the stream
+worker, so the check needs the client's current value at the worker
+(where the 500 can still be chosen) while h2 lets a client send SETTINGS
+again mid-connection.
 
-**Scope:** small-to-medium. `server_settings_frame/1` in
-`roadrunner_conn_loop_http2.erl` adds `{6, Limit}`; the setting already
-exists defaulted to `infinity` in `roadrunner_http2_settings.erl` and the
-encoder skips `infinity`, so advertising it meaningfully needs a concrete
-value to ship and (to be truthful) decode-side enforcement, since today we
-only parse the peer's value and bound inbound via the encoded
-`max_header_block` cap. The ~50 handshake fixtures that drain the server
-SETTINGS need to tolerate the extra entry.
+**Scope:** small.
 
 ### CI bench-vs-baseline comparison
 
