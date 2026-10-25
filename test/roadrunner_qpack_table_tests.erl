@@ -68,12 +68,15 @@ insert_larger_than_capacity_test() ->
     ?assertEqual({error, entry_too_large}, ?T:insert(~"abc", ~"", table(34))).
 
 insert_copies_its_strings_test() ->
-    %% The entry does not keep the larger binary its strings came from.
+    %% The entry does not keep the larger binary its strings came from. The
+    %% name is large enough to be stored off-heap on every OTP release, so
+    %% `referenced_byte_size/1` reports the binary it holds on to (a tiny
+    %% heap binary's reported size varies between releases).
     Chunk = binary:copy(~"x", 1000),
-    <<Name:1/binary, _/binary>> = Chunk,
+    <<Name:100/binary, _/binary>> = Chunk,
     {ok, {Stored, _}} = ?T:relative(0, insert(Name, ~"", table(4096))),
-    ?assertEqual(~"x", Stored),
-    ?assertEqual(1, binary:referenced_byte_size(Stored)).
+    ?assertEqual(Name, Stored),
+    ?assertEqual(100, binary:referenced_byte_size(Stored)).
 
 lower_capacity_evicts_test() ->
     %% RFC 9204 §4.3.1 / §3.2.2: a smaller capacity evicts from the oldest;
