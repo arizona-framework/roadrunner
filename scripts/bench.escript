@@ -494,10 +494,14 @@ preflight_protocol(#{protocol := h3, servers := Servers} = Opts) ->
     {ok, _} = application:ensure_all_started(ssl),
     Opts#{servers => Filtered, cert_dir => CertDir}.
 
+%% An ECDSA P-256 cert, the kind a production TLS/QUIC listener should use:
+%% each new connection's handshake signature is far cheaper than with RSA, so
+%% connection-setup scenarios measure the server rather than RSA signing.
 generate_test_cert() ->
     Dir = string:trim(os:cmd("mktemp -d")),
     Cmd = lists:flatten(io_lib:format(
-        "openssl req -x509 -newkey rsa:2048 -nodes -days 1 "
+        "openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 "
+        "-nodes -days 1 "
         "-keyout ~s/key.pem -out ~s/cert.pem -subj /CN=localhost "
         "2>/dev/null",
         [Dir, Dir]

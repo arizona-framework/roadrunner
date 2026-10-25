@@ -109,7 +109,8 @@ client_hello_framed(Scheme, ClientPub, ClientSCID, Overrides) ->
 As `client_hello_framed/4`, from a map: `scheme`, `key_shares` (the
 `{Group, KeyExchange}` entries of the key_share extension, RFC 8446 §4.2.8)
 and `client_scid` are required; `groups` (the supported_groups list, by
-default the groups of the key shares), `transport_params` (the overrides of
+default the groups of the key shares), `signature_algorithms` (the offered
+signature schemes, default `[scheme]`), `transport_params` (the overrides of
 `client_hello_framed/4`, default none), `cipher_suites` (the offered suite
 codepoints, default TLS_AES_128_GCM_SHA256 only) and `versions` (the
 supported_versions list, default TLS 1.3 only) are optional, so a test can
@@ -121,6 +122,7 @@ steer the server's version, cipher suite and group negotiation. `none` for
     key_shares := [{non_neg_integer(), binary()}] | none,
     client_scid := binary() | none,
     groups => [non_neg_integer()] | none,
+    signature_algorithms => [non_neg_integer()],
     transport_params => roadrunner_quic_transport_params:params(),
     cipher_suites => [non_neg_integer()],
     versions => [non_neg_integer()]
@@ -130,7 +132,7 @@ client_hello_framed(#{scheme := Scheme, key_shares := KeyShares, client_scid := 
     Extensions = iolist_to_binary([
         supported_versions_ext(maps:get(versions, Opts, [?TLS_1_3])),
         supported_groups_ext(maps:get(groups, Opts, share_groups(KeyShares))),
-        signature_algorithms_ext([Scheme]),
+        signature_algorithms_ext(maps:get(signature_algorithms, Opts, [Scheme])),
         alpn_ext(~"h3"),
         key_share_ext(KeyShares),
         transport_params_ext(ClientSCID, maps:get(transport_params, Opts, #{}))

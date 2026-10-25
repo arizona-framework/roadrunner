@@ -60,9 +60,12 @@
     sockname/1
 ]).
 
-%% v1 connection-id length and signature scheme (the test cert is RSA).
+%% v1 connection-id length and the offered signature schemes: rsa_pss_rsae_sha256
+%% for the RSA test certs, ecdsa_secp256r1_sha256 for an ECDSA P-256 cert (the
+%% bench's). The server picks the one matching its key.
 -define(CID_LEN, 8).
 -define(SIG_SCHEME, 16#0804).
+-define(SIG_SCHEMES, [16#0804, 16#0403]).
 %% Max stream bytes per 1-RTT packet, leaving room for the short header,
 %% STREAM frame header, and AEAD tag within the MTU.
 -define(MAX_STREAM_CHUNK, 1000).
@@ -347,6 +350,7 @@ init(Parent, Ref, Host, Port, Opts) ->
         maps:merge(
             #{
                 scheme => ?SIG_SCHEME,
+                signature_algorithms => ?SIG_SCHEMES,
                 key_shares => [{group_codepoint(Curve), EphPub}],
                 client_scid => Scid,
                 transport_params => #{
@@ -602,7 +606,8 @@ handshake_done_received(#conn{datagrams = Datagrams, app_server_keys = AppKeys, 
     lists:member(handshake_done, Frames).
 
 %% The server's public key, from the leaf certificate in the flight, to verify
-%% CertificateVerify.
+%% CertificateVerify. An EC key (ECDSA P-256) carries its curve in the algorithm
+%% parameters, so it is paired with them into the `{ECPoint, Params}` form.
 -spec server_public_key(binary()) -> public_key:public_key().
 server_public_key(HandshakeBytes) ->
     {complete, Messages} = deframe_complete(HandshakeBytes),
@@ -610,8 +615,15 @@ server_public_key(HandshakeBytes) ->
     [LeafDer | _] = roadrunner_quic_test_client:parse_certificate(CertBody),
     OtpCert = public_key:pkix_decode_cert(LeafDer, otp),
     Tbs = OtpCert#'OTPCertificate'.tbsCertificate,
-    Spki = Tbs#'OTPTBSCertificate'.subjectPublicKeyInfo,
-    Spki#'OTPSubjectPublicKeyInfo'.subjectPublicKey.
+    #'OTPSubjectPublicKeyInfo'{
+        algorithm = #'PublicKeyAlgorithm'{parameters = Params},
+        subjectPublicKey = Key
+    } = Tbs#'OTPTBSCertificate'.subjectPublicKeyInfo,
+    public_key_term(Key, Params).
+
+-spec public_key_term(term(), term()) -> public_key:public_key().
+public_key_term(#'ECPoint'{} = Point, Params) -> {Point, Params};
+public_key_term(Key, _Params) -> Key.
 
 %% =============================================================================
 %% Connected
