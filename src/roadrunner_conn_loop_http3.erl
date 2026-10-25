@@ -31,7 +31,9 @@
 %% is spawned to dispatch the request and write the response.
 %% Peer-initiated unidirectional streams (`rem 4 =:= 2`) are demultiplexed
 %% by stream type (RFC 9114 §6.2): the peer control stream is validated
-%% (exactly one, SETTINGS as its first frame, no request frames), the
+%% (exactly one, SETTINGS as its first frame, no request frames; its
+%% SETTINGS_MAX_FIELD_SECTION_SIZE is passed to every worker started after
+%% it, which keeps response headers within it, RFC 9114 §4.2.2), the
 %% peer's QPACK encoder stream fills the dynamic table (see "QPACK" below),
 %% its decoder stream is checked against our static-only encoder (only
 %% Stream Cancellations are valid), a client-initiated push stream is
@@ -151,9 +153,9 @@
 
 %% Per peer-uni-stream state: `pending` while the leading stream-type
 %% varint is still arriving, `control` once it is known to be the peer
-%% control stream (buffering frames + tracking whether SETTINGS was
-%% seen), `qpack_encoder` for the peer's encoder stream (holding the bytes
-%% of an instruction not fully received yet; `uni_event/4` hands the
+%% control stream (buffering frames + holding its SETTINGS once seen,
+%% `false` before), `qpack_encoder` for the peer's encoder stream (holding
+%% the bytes of an instruction not fully received yet; `uni_event/4` hands the
 %% stream's bytes back this way and `encoder_stream_in/3` applies them),
 %% `qpack_decoder` for its decoder stream (tracking how many continuation
 %% bytes of an instruction's integer it is inside, `none` between
@@ -161,7 +163,7 @@
 %% read and discard.
 -type uni_state() ::
     {pending, binary()}
-    | {control, binary(), SettingsReceived :: boolean()}
+    | {control, binary(), PeerSettings :: false | map()}
     | {qpack_encoder, binary()}
     | {qpack_decoder, qpack_continuation()}
     | drain.
@@ -226,6 +228,11 @@
     %% decode in `dispatch_request/2`. Read from proto_opts; defaults to
     %% `2 * max_header_block`.
     max_field_section_size = ?DEFAULT_MAX_FIELD_SECTION_SIZE :: pos_integer(),
+    %% The client's SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 §4.2.2), read
+    %% off its control stream; `infinity` (the §7.2.4.1 default) until its
+    %% SETTINGS arrive or when they leave it out. Each stream worker gets
+    %% the value current when it starts and keeps its response within it.
+    peer_max_field_section_size = infinity :: non_neg_integer() | infinity,
     %% In-flight-request slot accounting (cross-listener cap). `infinity`
     %% (default) disables it; `inflight_counter` is the shared gauge. Read
     %% from proto_opts at `init/2` so the per-stream acquire/release passes
@@ -991,9 +998,21 @@ handle_uni_stream(#h3{uni = Uni, critical = Critical} = State, StreamId, Data, F
             State#h3{uni = maps:remove(StreamId, Uni), critical = Critical1};
         {{qpack_encoder, Instructions}, Critical1} ->
             encoder_stream_in(State#h3{critical = Critical1}, StreamId, Instructions);
+        {{control, _, PeerSettings} = UniState1, Critical1} ->
+            State#h3{
+                uni = Uni#{StreamId => UniState1},
+                critical = Critical1,
+                peer_max_field_section_size = peer_max_field_section_size(PeerSettings)
+            };
         {UniState1, Critical1} ->
             State#h3{uni = Uni#{StreamId => UniState1}, critical = Critical1}
     end.
+
+%% The client's SETTINGS_MAX_FIELD_SECTION_SIZE, `infinity` when it sent
+%% none (RFC 9114 §7.2.4.1) or its SETTINGS have not arrived yet.
+-spec peer_max_field_section_size(false | map()) -> non_neg_integer() | infinity.
+peer_max_field_section_size(#{max_field_section_size := MaxFieldSection}) -> MaxFieldSection;
+peer_max_field_section_size(_PeerSettings) -> infinity.
 
 %% The peer's encoder stream (RFC 9204 §4.3): apply its instructions to the
 %% dynamic table in order, keep the bytes of one not fully received yet,
@@ -1395,8 +1414,8 @@ route_body_cap(
 -spec uni_event(uni_state(), critical_set(), binary(), boolean()) -> uni_result().
 uni_event({pending, Buf}, Critical, Data, Fin) ->
     uni_classify(<<Buf/binary, Data/binary>>, Critical, Fin);
-uni_event({control, Buf, SettingsReceived}, Critical, Data, Fin) ->
-    uni_control(<<Buf/binary, Data/binary>>, SettingsReceived, Critical, Fin);
+uni_event({control, Buf, PeerSettings}, Critical, Data, Fin) ->
+    uni_control(<<Buf/binary, Data/binary>>, PeerSettings, Critical, Fin);
 uni_event({qpack_encoder, Pending}, Critical, Data, Fin) ->
     qpack_stream_open({qpack_encoder, <<Pending/binary, Data/binary>>}, Critical, Fin);
 uni_event({qpack_decoder, Continuation}, Critical, Data, Fin) ->
@@ -1494,20 +1513,20 @@ qpack_stream_open(UniState, Critical, false) ->
 
 %% Validate buffered bytes of the peer control stream against the
 %% control-frame sequence rules, then (if not closed) keep the leftover
-%% partial frame and the running `SettingsReceived` flag.
--spec uni_control(binary(), boolean(), critical_set(), boolean()) -> uni_result().
-uni_control(Buf, SettingsReceived, Critical, Fin) ->
-    case validate_control_frames(Buf, SettingsReceived) of
+%% partial frame and the peer's SETTINGS (`false` until they arrive).
+-spec uni_control(binary(), false | map(), critical_set(), boolean()) -> uni_result().
+uni_control(Buf, PeerSettings, Critical, Fin) ->
+    case validate_control_frames(Buf, PeerSettings) of
         {conn_error, _, _} = ConnError ->
             ConnError;
-        {ok, Leftover, SettingsReceived1} ->
+        {ok, Leftover, PeerSettings1} ->
             case Fin of
                 true ->
                     %% RFC 9114 §6.2.1: the control stream is critical and
                     %% MUST NOT be closed.
                     {conn_error, ?H3_CLOSED_CRITICAL_STREAM, ~"peer closed the control stream"};
                 false ->
-                    {{control, Leftover, SettingsReceived1}, Critical}
+                    {{control, Leftover, PeerSettings1}, Critical}
             end
     end.
 
@@ -1532,17 +1551,17 @@ claim(Critical, Role) ->
 %% are forbidden; other frames (GOAWAY / MAX_PUSH_ID / CANCEL_PUSH /
 %% reserved) are allowed. The undecoded remainder is returned to be
 %% buffered for the next chunk.
--spec validate_control_frames(binary(), boolean()) ->
-    {ok, binary(), boolean()} | {conn_error, non_neg_integer(), binary()}.
-validate_control_frames(Buf, SettingsReceived) ->
+-spec validate_control_frames(binary(), false | map()) ->
+    {ok, binary(), false | map()} | {conn_error, non_neg_integer(), binary()}.
+validate_control_frames(Buf, PeerSettings) ->
     case roadrunner_quic_h3_frame:decode(Buf) of
         {ok, Frame, Rest} ->
-            case control_frame(Frame, SettingsReceived) of
-                {ok, SettingsReceived1} -> validate_control_frames(Rest, SettingsReceived1);
+            case control_frame(Frame, PeerSettings) of
+                {ok, PeerSettings1} -> validate_control_frames(Rest, PeerSettings1);
                 {conn_error, _, _} = ConnError -> ConnError
             end;
         {more, _} ->
-            {ok, Buf, SettingsReceived};
+            {ok, Buf, PeerSettings};
         {error, {frame_error, settings, malformed_varint}} ->
             %% RFC 9114 §7.1: a SETTINGS payload that ends inside an
             %% identifier / value pair → H3_FRAME_ERROR.
@@ -1559,20 +1578,20 @@ validate_control_frames(Buf, SettingsReceived) ->
             {conn_error, frame_error_code(Reason), ~"control frame error"}
     end.
 
--spec control_frame(roadrunner_quic_h3_frame:frame(), boolean()) ->
-    {ok, boolean()} | {conn_error, non_neg_integer(), binary()}.
-control_frame({settings, _}, false) ->
-    {ok, true};
+-spec control_frame(roadrunner_quic_h3_frame:frame(), false | map()) ->
+    {ok, map()} | {conn_error, non_neg_integer(), binary()}.
+control_frame({settings, PeerSettings}, false) ->
+    {ok, PeerSettings};
 control_frame(_Frame, false) ->
     %% RFC 9114 §6.2.1: SETTINGS MUST be the first frame on the control
     %% stream — anything before it is H3_MISSING_SETTINGS.
     {conn_error, ?H3_MISSING_SETTINGS, ~"SETTINGS expected as first control frame"};
-control_frame({settings, _}, true) ->
+control_frame({settings, _}, _PeerSettings) ->
     %% RFC 9114 §7.2.4: SETTINGS occurs at most once.
     {conn_error, ?H3_FRAME_UNEXPECTED, ~"duplicate SETTINGS on control stream"};
-control_frame(Frame, true) ->
+control_frame(Frame, PeerSettings) ->
     case is_control_allowed(Frame) of
-        true -> {ok, true};
+        true -> {ok, PeerSettings};
         false -> {conn_error, ?H3_FRAME_UNEXPECTED, ~"request frame on control stream"}
     end.
 
@@ -1732,7 +1751,11 @@ dispatch_with_slot(#h3{streams = Streams} = State1, StreamId, Req) ->
     of
         true ->
             {WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
-                State1#h3.conn, StreamId, Req, State1#h3.proto_opts
+                State1#h3.conn,
+                StreamId,
+                Req,
+                State1#h3.proto_opts,
+                State1#h3.peer_max_field_section_size
             ),
             %% The worker owns the response now, tracked by its monitor
             %% ref; drop the (no-longer-needed) frame-accumulation entry
@@ -1784,7 +1807,11 @@ handle_slot(#h3{awaiting_slot = Awaiting} = State, StreamId, granted) ->
         #{StreamId := Req} ->
             State1 = State#h3{awaiting_slot = maps:remove(StreamId, Awaiting)},
             {WorkerPid, MonRef} = roadrunner_http3_stream_worker:start(
-                State1#h3.conn, StreamId, Req, State1#h3.proto_opts
+                State1#h3.conn,
+                StreamId,
+                Req,
+                State1#h3.proto_opts,
+                State1#h3.peer_max_field_section_size
             ),
             State1#h3{
                 worker_refs = (State1#h3.worker_refs)#{MonRef => StreamId},

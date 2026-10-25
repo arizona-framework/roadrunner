@@ -59,3 +59,13 @@ collect_sends(Acc) ->
         {sent, Size, Flag} -> collect_sends([{Size, Flag} | Acc])
     after 0 -> lists:reverse(Acc)
     end.
+
+%% RFC 9114 §4.2.2: a field section fits the client's limit while its size
+%% (name + value + 32 per field) is at most the limit; no limit always fits.
+fits_peer_limit_test() ->
+    %% 7 + 3 + 32 = 42 bytes.
+    Fields = [{~":status", ~"200"}],
+    ?assert(roadrunner_http3_stream_worker:fits_peer_limit(Fields, undefined)),
+    ?assert(roadrunner_http3_stream_worker:fits_peer_limit(Fields, 42)),
+    ?assertNot(roadrunner_http3_stream_worker:fits_peer_limit(Fields, 41)),
+    ?assert(roadrunner_http3_stream_worker:fits_peer_limit([], 0)).

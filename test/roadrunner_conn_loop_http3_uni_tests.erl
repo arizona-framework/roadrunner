@@ -51,7 +51,7 @@ pending_type_incomplete_fin_test() ->
 control_stream_claimed_test() ->
     %% Control type + SETTINGS as the first (and only buffered) frame.
     ?assertEqual(
-        {{control, <<>>, true}, #{control => true}},
+        {{control, <<>>, #{qpack_max_table_capacity => 0}}, #{control => true}},
         ev({pending, <<>>}, #{}, <<(t(control))/binary, (settings())/binary>>, false)
     ).
 
@@ -102,27 +102,41 @@ unknown_stream_closed_test() ->
 %% --- control-stream frame sequence (from {control, ...}) ---
 
 control_settings_first_test() ->
-    ?assertEqual({{control, <<>>, true}, #{}}, ev({control, <<>>, false}, #{}, settings(), false)).
+    %% The peer's SETTINGS are kept on the stream state, so the conn loop
+    %% can read its limits (SETTINGS_MAX_FIELD_SECTION_SIZE) from them.
+    ?assertEqual(
+        {{control, <<>>, #{qpack_max_table_capacity => 0}}, #{}},
+        ev({control, <<>>, false}, #{}, settings(), false)
+    ).
+
+control_settings_kept_after_later_frames_test() ->
+    Settings = iolist_to_binary(
+        roadrunner_quic_h3_frame:encode_settings(#{max_field_section_size => 4096})
+    ),
+    ?assertEqual(
+        {{control, <<>>, #{max_field_section_size => 4096}}, #{}},
+        ev({control, <<>>, false}, #{}, <<Settings/binary, (goaway())/binary>>, false)
+    ).
 
 control_missing_settings_test() ->
     %% A non-SETTINGS frame before SETTINGS → H3_MISSING_SETTINGS.
     ?assertMatch({conn_error, 16#010A, _}, ev({control, <<>>, false}, #{}, goaway(), false)).
 
 control_duplicate_settings_test() ->
-    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, true}, #{}, settings(), false)).
+    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, #{}}, #{}, settings(), false)).
 
 control_allowed_frame_after_settings_test() ->
     %% GOAWAY after SETTINGS is allowed.
-    ?assertEqual({{control, <<>>, true}, #{}}, ev({control, <<>>, true}, #{}, goaway(), false)).
+    ?assertEqual({{control, <<>>, #{}}, #{}}, ev({control, <<>>, #{}}, #{}, goaway(), false)).
 
 control_data_frame_rejected_test() ->
-    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, true}, #{}, data(), false)).
+    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, #{}}, #{}, data(), false)).
 
 control_headers_frame_rejected_test() ->
-    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, true}, #{}, headers(), false)).
+    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, #{}}, #{}, headers(), false)).
 
 control_push_promise_rejected_test() ->
-    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, true}, #{}, push_promise(), false)).
+    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, #{}}, #{}, push_promise(), false)).
 
 control_partial_frame_buffered_test() ->
     %% A lone frame-type byte (incomplete frame) is buffered as-is.
@@ -130,13 +144,13 @@ control_partial_frame_buffered_test() ->
 
 control_h2_reserved_frame_test() ->
     %% Frame type 0x02 is HTTP/2-reserved → H3_FRAME_UNEXPECTED.
-    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, true}, #{}, <<2, 0>>, false)).
+    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, #{}}, #{}, <<2, 0>>, false)).
 
 control_oversized_frame_test() ->
     Oversized = iolist_to_binary([
         roadrunner_quic_varint:encode(0), roadrunner_quic_varint:encode(16#FFFFFFFF)
     ]),
-    ?assertMatch({conn_error, 16#0107, _}, ev({control, <<>>, true}, #{}, Oversized, false)).
+    ?assertMatch({conn_error, 16#0107, _}, ev({control, <<>>, #{}}, #{}, Oversized, false)).
 
 control_truncated_settings_test() ->
     %% RFC 9114 §7.1: a SETTINGS payload ending inside a pair (an
@@ -147,13 +161,13 @@ control_malformed_goaway_test() ->
     %% A GOAWAY (0x07) with a byte past its id is malformed (§7.1):
     %% H3_FRAME_ERROR.
     ?assertMatch(
-        {conn_error, 16#0106, _}, ev({control, <<>>, true}, #{}, <<16#07, 2, 0, 0>>, false)
+        {conn_error, 16#0106, _}, ev({control, <<>>, #{}}, #{}, <<16#07, 2, 0, 0>>, false)
     ).
 
 control_malformed_push_promise_test() ->
     %% PUSH_PROMISE (0x05) never belongs on the control stream, so even an
     %% empty (malformed) one is H3_FRAME_UNEXPECTED.
-    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, true}, #{}, <<16#05, 0>>, false)).
+    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, #{}}, #{}, <<16#05, 0>>, false)).
 
 control_forbidden_setting_test() ->
     %% An HTTP/2-only setting (MAX_CONCURRENT_STREAMS = 0x03) is
@@ -163,7 +177,7 @@ control_forbidden_setting_test() ->
 
 control_stream_closed_test() ->
     %% FIN on the control stream is a critical stream close.
-    ?assertMatch({conn_error, 16#0104, _}, ev({control, <<>>, true}, #{}, <<>>, true)).
+    ?assertMatch({conn_error, 16#0104, _}, ev({control, <<>>, #{}}, #{}, <<>>, true)).
 
 %% --- draining an unknown stream type (from drain) ---
 
@@ -238,7 +252,7 @@ decoder_closed_test() ->
 %% --- reset classification ---
 
 reset_control_is_critical_test() ->
-    ?assertEqual(critical, roadrunner_conn_loop_http3:uni_reset({control, <<>>, true})).
+    ?assertEqual(critical, roadrunner_conn_loop_http3:uni_reset({control, <<>>, #{}})).
 
 reset_qpack_is_critical_test() ->
     ?assertEqual(critical, roadrunner_conn_loop_http3:uni_reset({qpack_encoder, <<>>})),

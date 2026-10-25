@@ -44,6 +44,10 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     stream_forbidden_trailer_stripped/1,
     stream_unsafe_header_500/1,
     stream_trailer_injection_aborts/1,
+    client_header_limit_buffered_500/1,
+    client_header_limit_stream_500/1,
+    client_header_limit_trailers_reset/1,
+    client_header_limit_below_500_resets/1,
     unfinished_stream_on_normal_exit_resets/1,
     sendfile_empty/1,
     sendfile_small/1,
@@ -149,6 +153,10 @@ all() ->
         stream_forbidden_trailer_stripped,
         stream_unsafe_header_500,
         stream_trailer_injection_aborts,
+        client_header_limit_buffered_500,
+        client_header_limit_stream_500,
+        client_header_limit_trailers_reset,
+        client_header_limit_below_500_resets,
         unfinished_stream_on_normal_exit_resets,
         sendfile_empty,
         sendfile_small,
@@ -682,6 +690,45 @@ stream_trailer_injection_aborts(Config) ->
     after
         ll_close(Conn)
     end.
+
+client_header_limit_buffered_500(Config) ->
+    %% RFC 9114 §4.2.2: a client that sent SETTINGS_MAX_FIELD_SECTION_SIZE
+    %% gets no header section over it. A response whose headers are over
+    %% the client's 500 bytes becomes a 500; one within it is sent as is,
+    %% and a client that set no limit gets the large headers.
+    Port = ?config(port, Config),
+    Limited = connect(Port, #{h3_settings => #{max_field_section_size => 500}}),
+    ?assertMatch({500, _}, status_body(get(Limited, ~"/big-header"))),
+    ?assertEqual({200, ~"ok"}, status_body(get(Limited, ~"/"))),
+    close(Limited),
+    Unlimited = connect(Port),
+    {200, Headers, ~"big"} = get(Unlimited, ~"/big-header"),
+    ?assertEqual(binary:copy(~"v", 1000), proplists:get_value(~"x-big", Headers)),
+    close(Unlimited).
+
+client_header_limit_stream_500(Config) ->
+    %% The same for a streamed response: its headers are checked before
+    %% they are sent, so it can still become a 500.
+    Conn = connect(?config(port, Config), #{h3_settings => #{max_field_section_size => 500}}),
+    ?assertMatch({500, _}, status_body(get(Conn, ~"/stream-big-header"))),
+    ?assertEqual({200, ~"chunk1-chunk2"}, status_body(get(Conn, ~"/stream"))),
+    close(Conn).
+
+client_header_limit_trailers_reset(Config) ->
+    %% Trailers over the client's limit come after the status is sent, so
+    %% the stream is reset (H3_INTERNAL_ERROR) instead; trailers within it
+    %% are sent.
+    Conn = connect(?config(port, Config), #{h3_settings => #{max_field_section_size => 500}}),
+    ?assertEqual({error, {stream_reset, 16#0102}}, get(Conn, ~"/stream-big-trailers")),
+    ?assertEqual({200, ~"body"}, status_body(get(Conn, ~"/stream-trailers"))),
+    close(Conn).
+
+client_header_limit_below_500_resets(Config) ->
+    %% A limit too small for even the 500's few fields: nothing the server
+    %% can answer fits, so the stream is reset (H3_INTERNAL_ERROR).
+    Conn = connect(?config(port, Config), #{h3_settings => #{max_field_section_size => 50}}),
+    ?assertEqual({error, {stream_reset, 16#0102}}, get(Conn, ~"/")),
+    close(Conn).
 
 unfinished_stream_on_normal_exit_resets(Config) ->
     %% A stream fun that ends its worker with `exit(normal)` before the FIN

@@ -111,6 +111,13 @@ the HTTP/1.1 path emits names verbatim, so the requirement is uniform
 across protocols. Framework helpers (`roadrunner_resp:*`,
 `roadrunner_compress`, the auto-injected `~"date"` header) all emit
 lowercase names; handler-supplied tuples must follow suit.
+
+Over HTTP/3, a client can tell the server the most header bytes it will
+take (`SETTINGS_MAX_FIELD_SECTION_SIZE`, counted as name + value + 32 per
+field, `:status` and `date` included), and the server keeps to it (RFC
+9114 §4.2.2). A response whose headers are over it is answered `500`
+instead, before anything is sent, and the error is logged. Trailers over
+it come after the status is sent, so the stream is reset instead.
 """.
 -type response() ::
     {StatusCode :: roadrunner_http:status(), roadrunner_http:headers(), Body :: iodata()}
