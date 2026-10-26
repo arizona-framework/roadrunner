@@ -51,6 +51,9 @@
     close/1,
     shutdown/2,
     peername/1,
+    sockname/1,
+    peercert/1,
+    tls_info/1,
     port/1,
     sendfile/4,
     setopts/2,
@@ -269,6 +272,30 @@ peername({ssl, S}) ->
     ssl:peername(S);
 peername({fake, _Pid}) ->
     {ok, {{127, 0, 0, 1}, 0}}.
+
+-doc "Return the local address of a connected socket.".
+-spec sockname(socket()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+sockname({gen_tcp, S}) ->
+    inet:sockname(S);
+sockname({ssl, S}) ->
+    ssl:sockname(S).
+
+-doc """
+Return the client's TLS certificate (DER), `{error, no_peercert}` when it
+sent none, or `{error, not_tls}` on a plain TCP socket.
+""".
+-spec peercert(socket()) -> {ok, binary()} | {error, term()}.
+peercert({gen_tcp, _S}) ->
+    {error, not_tls};
+peercert({ssl, S}) ->
+    ssl:peercert(S).
+
+-doc "Return the TLS session information, or `{error, not_tls}` on plain TCP.".
+-spec tls_info(socket()) -> {ok, ssl:connection_info()} | {error, term()}.
+tls_info({gen_tcp, _S}) ->
+    {error, not_tls};
+tls_info({ssl, S}) ->
+    ssl:connection_information(S).
 
 -doc "Return the locally-bound port of a listening or connected socket.".
 -spec port(socket()) -> {ok, inet:port_number()} | {error, term()}.

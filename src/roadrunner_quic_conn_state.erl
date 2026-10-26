@@ -969,6 +969,7 @@ with async `{emit, _, _}` effects, so it never blocks on the owner.
 -spec handle_call(pid(), reference(), Request, integer(), t()) -> {t(), [effect()]} when
     Request ::
         peername
+        | tls_info
         | {set_owner, pid()}
         | open_uni
         | {reset_stream, non_neg_integer(), non_neg_integer()}
@@ -978,6 +979,8 @@ with async `{emit, _, _}` effects, so it never blocks on the owner.
         | {close_when_done, non_neg_integer(), binary()}.
 handle_call(From, Ref, peername, _Now, #state{peer = Peer} = State) ->
     {State, [{reply, From, Ref, {ok, Peer}}]};
+handle_call(From, Ref, tls_info, _Now, #state{aead = Aead} = State) ->
+    {State, [{reply, From, Ref, {ok, tls_info(Aead)}}]};
 handle_call(From, Ref, {set_owner, Owner}, _Now, State) ->
     {State1, EmitEffects} = install_owner(Owner, State),
     {State1, [{reply, From, Ref, ok} | EmitEffects]};
@@ -1409,6 +1412,22 @@ key_limit(Sealed, Now, #state{aead = Aead} = State) ->
                 false -> connection_fatal(application, aead_limit_reached, State)
             end
     end.
+
+%% The TLS session as `ssl:connection_information/1` reports a TLS 1.3 one:
+%% the suite's AEAD, its hash as the PRF (RFC 8446 §B.4), the key exchange
+%% and MAC folded into the suite.
+-spec tls_info(roadrunner_quic_aead:cipher()) -> ssl:connection_info().
+tls_info(Aead) ->
+    [
+        {protocol, 'tlsv1.3'},
+        {selected_cipher_suite, #{
+            cipher => Aead, mac => aead, prf => suite_hash(Aead), key_exchange => any
+        }}
+    ].
+
+-spec suite_hash(roadrunner_quic_aead:cipher()) -> sha256 | sha384.
+suite_hash(aes_256_gcm) -> sha384;
+suite_hash(_Aead) -> sha256.
 
 -spec confidentiality_limit(roadrunner_quic_aead:cipher()) -> pos_integer().
 confidentiality_limit(aes_128_gcm) -> ?AES_GCM_CONFIDENTIALITY_LIMIT;

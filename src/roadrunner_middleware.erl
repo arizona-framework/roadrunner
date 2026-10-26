@@ -35,9 +35,10 @@ Tower, and Servant.
 
 ## No direct wire writes from middleware
 
-Middleware code never has access to the underlying socket — the
-`Request` map intentionally excludes any socket reference. To
-respond, a middleware **must** return a `Result`: the one from
+Middleware code has no way to write to the underlying socket — the
+`Request` map offers no send API (its `conn_info` only answers the
+read-only `roadrunner_req:sockname/1`, `peercert/1` and `tls_info/1`
+queries). To respond, a middleware **must** return a `Result`: the one from
 `Next(Req)`, or its own response. A response that has to be sent while
 code runs (cowboy's mid-flight `cowboy_req:reply/4` or `inform/3`) is a
 `{send, Headers, Fun}` response: the connection runs `Fun` and it

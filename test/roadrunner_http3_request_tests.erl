@@ -2,7 +2,13 @@
 -include_lib("eunit/include/eunit.hrl").
 
 ctx() ->
-    #{peer => undefined, scheme => https, request_id => ~"abc123", listener_name => test_listener}.
+    #{
+        peer => undefined,
+        conn_info => fun(_Query) -> {error, unavailable} end,
+        scheme => https,
+        request_id => ~"abc123",
+        listener_name => test_listener
+    }.
 
 from(Headers) ->
     roadrunner_http3_request:from_headers(Headers, ~"", ctx()).

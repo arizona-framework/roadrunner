@@ -461,6 +461,14 @@ peer_present_test() ->
 peer_absent_returns_undefined_test() ->
     ?assertEqual(undefined, roadrunner_req:peer(sample_req())).
 
+conn_info_absent_is_unavailable_test() ->
+    %% A request map built outside the connection pipeline has no
+    %% `conn_info` to ask.
+    Req = sample_req(),
+    ?assertEqual({error, unavailable}, roadrunner_req:sockname(Req)),
+    ?assertEqual({error, unavailable}, roadrunner_req:peercert(Req)),
+    ?assertEqual({error, unavailable}, roadrunner_req:tls_info(Req)).
+
 %% --- scheme/1 ---
 
 scheme_http_test() ->

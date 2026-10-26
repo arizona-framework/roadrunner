@@ -87,6 +87,9 @@
     %% in `exit_clean/5`.
     conn_span :: roadrunner_event_handler:span(),
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
+    %% The connection queries each request carries (`roadrunner_req:sockname/1`
+    %% and the rest), built once per connection.
+    conn_info :: roadrunner_req:conn_info(),
     scheme = http :: http | https,
     %% `first` for the first request on a fresh conn; `keep_alive` for
     %% subsequent loop-back iterations. Drives the timeout selection
@@ -330,6 +333,7 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                 listener_name = ListenerName,
                 conn_span = ConnSpan,
                 peer = Peer,
+                conn_info = roadrunner_conn:conn_info(Socket),
                 scheme = Scheme,
                 buffered = Buffered,
                 requests_counter = RequestsCounter,
@@ -847,6 +851,7 @@ handle_request_bytes(
         socket = Socket,
         listener_name = ListenerName,
         peer = Peer,
+        conn_info = ConnInfo,
         scheme = Scheme,
         requests_counter = ReqCounter,
         http1_limits = Http1Limits
@@ -862,6 +867,7 @@ handle_request_bytes(
             ),
             Req1 = Req0#{
                 peer => Peer,
+                conn_info => ConnInfo,
                 scheme => Scheme,
                 request_id => RequestId,
                 listener_name => ListenerName

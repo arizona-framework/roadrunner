@@ -177,6 +177,9 @@
     proto_opts :: roadrunner_conn:proto_opts(),
     listener_name :: atom(),
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
+    %% The connection queries each request carries, built once: they ask
+    %% the QUIC connection (`conn_info/1`).
+    conn_info :: roadrunner_req:conn_info(),
     %% The event handler's span from `listener_accept`.
     conn_span :: roadrunner_event_handler:span(),
     %% Pre-generated `request_id`s (hex), sliced 16 characters at a
@@ -310,6 +313,7 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
         proto_opts = ProtoOpts,
         listener_name = ListenerName,
         peer = Peer,
+        conn_info = conn_info(Conn),
         conn_span = ConnSpan,
         max_content_length = MaxContentLength,
         qpack = roadrunner_qpack_table:new(
@@ -379,6 +383,17 @@ loop(#h3{conn = Conn} = State) ->
 %% depend on the address the requests come from. Requests already
 %% dispatched keep the address they saw; the connection's `listener_accept`
 %% span keeps the handshake address.
+%% The connection queries for HTTP/3: the local address is the listener's
+%% UDP socket's and the TLS session the QUIC connection's. The server asks
+%% no client certificate over QUIC.
+-spec conn_info(pid()) -> roadrunner_req:conn_info().
+conn_info(Conn) ->
+    fun
+        (sockname) -> roadrunner_quic:sockname(Conn);
+        (peercert) -> {error, no_peercert};
+        (tls_info) -> roadrunner_quic:tls_info(Conn)
+    end.
+
 -spec peer_changed(#h3{}, {inet:ip_address(), inet:port_number()}) -> #h3{}.
 peer_changed(#h3{proto_opts = ProtoOpts} = State, Peer) ->
     State#h3{
@@ -1735,6 +1750,7 @@ dispatch_decoded(State, StreamId, Headers, Body) ->
     {ReqId, NewBuf} = roadrunner_conn:generate_request_id(State#h3.req_id_buffer),
     RequestContext = #{
         peer => State#h3.peer,
+        conn_info => State#h3.conn_info,
         scheme => https,
         listener_name => State#h3.listener_name,
         request_id => ReqId
