@@ -127,6 +127,9 @@ as the `call/3` state (`#{}` for a bare entry), exactly like a fun. So
 for a stateless middleware that only needs `call/3`. A fun-form middleware
 never has an `init/1` (there's no module to host the callback).
 
+Handlers have the same hook for their route state, under the name
+`roadrunner_handler:init_route/1`.
+
 ## Examples
 
 ```erlang

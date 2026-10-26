@@ -129,6 +129,12 @@ Routing (pick one):
   already answer in full is a config error and raises at listener
   start rather than turning into a runtime 404.
 
+Whichever form is used, a handler that exports the optional
+`roadrunner_handler` callback `init_route/1` has it run once per route
+when the listener starts (and on `reload_routes/2`), turning the route's
+state into the one the handler sees. A raise in it stops the listener
+from starting, with `{init_route_failed, Path, Handler, Reason}`.
+
 Optional middleware and timing knobs (durations in milliseconds):
 - `middlewares` — listener-wide pipeline applied to every request.
 - `max_content_length` — request-body cap across HTTP/1.1, HTTP/2, and
@@ -957,10 +963,13 @@ opt) since there's no router table to reload, or
 `{error, Reason}` carrying a `t:roadrunner_router:validation_error/0`
 if the replacement table cannot work. A rejected table is refused
 whole: the listener keeps serving the routes it already had, and
-nothing about the running table changes. That covers everything
-decidable from the table itself; a per-route middleware that crashes
-in its own `init/1` still fails the reload the loud way, the same as
-it would at listener start.
+nothing about the running table changes. The same holds when a hook
+that runs for the new table fails, a per-route middleware's `init/1` or
+a handler's `init_route/1` (such as `roadrunner_static` rejecting an
+option): the reload returns `{error, {init_failed, Reason}}` and the
+listener keeps its current routes. At listener start the same failure
+stops the start, since there is no table to keep.
+Both run again for the new table, once per route.
 
 Each call performs one global `persistent_term` swap, which scans every
 process heap to reclaim the old table. That cost is acceptable for a
@@ -968,7 +977,10 @@ whole-table swap at deploy time, but callers should batch route changes
 into a single `reload_routes/2` rather than calling it per route.
 """.
 -spec reload_routes(Name :: atom(), roadrunner_router:routes()) ->
-    ok | {error, no_routes} | {error, roadrunner_router:validation_error()}.
+    ok
+    | {error, no_routes}
+    | {error, roadrunner_router:validation_error()}
+    | {error, {init_failed, term()}}.
 reload_routes(Name, Routes) ->
     gen_server:call(Name, {reload_routes, Routes}).
 
@@ -2257,7 +2269,9 @@ build_dispatch(Opts, _ListenerName) ->
     roadrunner_middleware:middleware_list(),
     no_state | {state, term()}
 ) -> roadrunner_conn:dispatch().
-bake_dispatch(Handler, Opts, HandlerMws, StateArg) ->
+bake_dispatch(Handler, Opts, HandlerMws, StateArg0) ->
+    %% The handler's `init_route/1` runs here, as it does for a routed one.
+    StateArg = roadrunner_router:init_handler_state(undefined, Handler, StateArg0),
     ListenerMws = maps:get(middlewares, Opts, []),
     Pipeline = roadrunner_middleware:compile_pipeline(
         ListenerMws ++ HandlerMws, Handler, StateArg
@@ -2332,7 +2346,29 @@ do_reload_routes(
     %% the verdict comes back as a value and a bad table is simply refused.
     case roadrunner_router:validate(Routes) of
         ok ->
-            Compiled = roadrunner_router:compile(Routes, ListenerMws),
+            reload_compiled(State, Routes, Name, ProtoOpts, RouteBuckets, ListenerMws);
+        {error, _Reason} = Error ->
+            {Error, State}
+    end;
+do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _, _}}} = State, _Routes) ->
+    {{error, no_routes}, State}.
+
+%% Compile a validated replacement table and publish it. Once `validate/1`
+%% has passed, compiling can only fail in a hook that runs for the new table,
+%% a handler's `init_route/1` or a middleware's `init/1` (a bad static option,
+%% say). That failure is refused like a bad table, as `{error, {init_failed,
+%% Reason}}`, so the listener keeps serving the table it has.
+-spec reload_compiled(
+    #state{},
+    roadrunner_router:routes(),
+    atom(),
+    roadrunner_conn:proto_opts(),
+    ets:table() | undefined,
+    roadrunner_middleware:middleware_list()
+) -> {ok | {error, {init_failed, term()}}, #state{}}.
+reload_compiled(State, Routes, Name, ProtoOpts, RouteBuckets, ListenerMws) ->
+    try roadrunner_router:compile(Routes, ListenerMws) of
+        Compiled ->
             %% The first table with a route `rate_limit` gets the bucket
             %% store, published before the routes that use it.
             RouteBuckets1 =
@@ -2341,12 +2377,11 @@ do_reload_routes(
                     false -> RouteBuckets
                 end,
             persistent_term:put({roadrunner_routes, Name}, Compiled),
-            {ok, State#state{route_buckets = RouteBuckets1}};
-        {error, _Reason} = Error ->
-            {Error, State}
-    end;
-do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _, _}}} = State, _Routes) ->
-    {{error, no_routes}, State}.
+            {ok, State#state{route_buckets = RouteBuckets1}}
+    catch
+        _Class:Reason ->
+            {{error, {init_failed, Reason}}, State}
+    end.
 
 -spec do_drain(#state{}, non_neg_integer()) ->
     {{ok, drained} | {timeout, non_neg_integer()}, #state{}}.

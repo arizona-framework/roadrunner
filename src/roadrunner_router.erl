@@ -61,7 +61,7 @@ matching only walks the branches a request's segments can follow instead
 of trying every route in turn.
 """.
 
--export([compile/2, validate/1, match/3, resolve/3]).
+-export([compile/2, validate/1, match/3, resolve/3, init_handler_state/3]).
 
 -export_type([
     route/0,
@@ -89,7 +89,9 @@ A single route entry. Three shapes are accepted:
 `Path` is a binary pattern (literal segments, `:param` captures, or
 `*wildcard` catch-all). `Handler` is the module implementing
 `roadrunner_handler`. `State` is opaque per-route data threaded back
-to the handler via `roadrunner_req:state/1`; unset → `undefined`.
+to the handler via `roadrunner_req:state/1`; unset → `undefined`. When
+the handler exports `init_route/1`, the handler sees what that returned
+for `State` instead (see `compile/2`).
 `methods` is a list of uppercase method binaries the route answers;
 unset → every method. `max_content_length` is the route's own request-body
 cap in bytes, in place of the listener's (larger or smaller) for the
@@ -258,8 +260,15 @@ Each path is split on `/` (empty leading/trailing segments dropped),
 and segments starting with `:` are recorded as named captures.
 
 Raises any `t:validation_error/0` before running a middleware
-`init/1`, so a table that cannot work never has side effects. Call
-`validate/1` first to get the same verdict as a value instead.
+`init/1` or a handler `init_route/1`, so a table that cannot work never
+has side effects. Call `validate/1` first to get the same verdict as a
+value instead.
+
+A handler that exports the optional `roadrunner_handler` callback
+`init_route/1` has it run here once per route, with the route's state
+(`undefined` when it sets none); the return becomes the state the
+handler sees and the one `match/3` reports. A raise in it is re-raised
+as `{init_route_failed, Path, Handler, Reason}`, naming the route.
 
 Only a route left with nothing to answer is unreachable. Two routes
 on the same path declaring disjoint `methods` both stay reachable,
@@ -294,8 +303,9 @@ disturbing the table already serving.
 
 Covers everything decidable from the table itself: entry shapes, method
 allowlists, wildcard placement, and whether every route can be reached.
-It does not run middleware `init/1`, so a per-route middleware that
-crashes on init still surfaces at `compile/2` time.
+It does not run middleware `init/1` or handler `init_route/1`, so a
+per-route middleware or a handler that rejects its config there still
+surfaces at `compile/2` time.
 """.
 -spec validate(routes()) -> ok | {error, validation_error()}.
 validate(Routes) when is_list(Routes) ->
@@ -307,32 +317,45 @@ validate(Routes) when is_list(Routes) ->
 -spec compile_route(route(), [roadrunner_middleware:resolved()]) ->
     {[segment()], module(), roadrunner_middleware:next(), term(), method_lookup(), limits()}.
 compile_route({Path, Handler}, ResolvedListener) when is_binary(Path), is_atom(Handler) ->
-    {
-        compile_path(Path),
-        Handler,
-        roadrunner_middleware:compile_pipeline(ResolvedListener, [], Handler, no_state),
-        undefined,
-        undefined,
-        undefined
-    };
+    build_route(Path, Handler, no_state, [], undefined, undefined, ResolvedListener);
 compile_route({Path, Handler, State}, ResolvedListener) when is_binary(Path), is_atom(Handler) ->
-    {
-        compile_path(Path),
-        Handler,
-        roadrunner_middleware:compile_pipeline(ResolvedListener, [], Handler, {state, State}),
-        State,
-        undefined,
-        undefined
-    };
+    build_route(Path, Handler, {state, State}, [], undefined, undefined, ResolvedListener);
 compile_route(#{path := Path, handler := Handler} = Route, ResolvedListener) when
     is_binary(Path), is_atom(Handler)
 ->
-    RouteMws = route_middlewares(Route),
-    Methods = compile_methods(maps:get(methods, Route, undefined)),
-    {StateArg, StateValue} =
+    StateArg =
         case Route of
-            #{state := S} -> {{state, S}, S};
-            _ -> {no_state, undefined}
+            #{state := S} -> {state, S};
+            _ -> no_state
+        end,
+    build_route(
+        Path,
+        Handler,
+        StateArg,
+        route_middlewares(Route),
+        compile_methods(maps:get(methods, Route, undefined)),
+        route_limits(Route),
+        ResolvedListener
+    ).
+
+%% One route's compiled entry, whatever shape it was written in. The handler's
+%% `init_route/1` runs first, so the state its pipeline injects and the state
+%% `match/3` reports are both the one it returned.
+-spec build_route(
+    binary(),
+    module(),
+    no_state | {state, term()},
+    roadrunner_middleware:middleware_list(),
+    method_lookup(),
+    limits(),
+    [roadrunner_middleware:resolved()]
+) -> {[segment()], module(), roadrunner_middleware:next(), term(), method_lookup(), limits()}.
+build_route(Path, Handler, StateArg0, RouteMws, Methods, Limits, ResolvedListener) ->
+    StateArg = init_handler_state(Path, Handler, StateArg0),
+    StateValue =
+        case StateArg of
+            {state, S} -> S;
+            no_state -> undefined
         end,
     {
         compile_path(Path),
@@ -340,8 +363,49 @@ compile_route(#{path := Path, handler := Handler} = Route, ResolvedListener) whe
         roadrunner_middleware:compile_pipeline(ResolvedListener, RouteMws, Handler, StateArg),
         StateValue,
         Methods,
-        route_limits(Route)
+        Limits
     }.
+
+%% Run `Handler`'s optional `init_route/1` on a route's state, returning the
+%% state the route then carries. A handler without the callback keeps its state
+%% as written, so a stateless route stays stateless and costs nothing more per
+%% request. One with it is handed the route's state (`undefined` when the route
+%% sets none) and its return always becomes the route's state. A raise is
+%% re-raised in its own class with the route named: `Path` is the route's path,
+%% or `undefined` for the listener's single-handler `routes` forms, which have
+%% none. Shared with `roadrunner_listener` for those forms.
+-doc false.
+-spec init_handler_state(binary() | undefined, module(), no_state | {state, term()}) ->
+    no_state | {state, term()}.
+init_handler_state(Path, Handler, StateArg) ->
+    case has_init_route(Handler) of
+        false ->
+            StateArg;
+        true ->
+            State =
+                case StateArg of
+                    {state, S} -> S;
+                    no_state -> undefined
+                end,
+            try
+                {state, Handler:init_route(State)}
+            catch
+                Class:Reason:Stack ->
+                    erlang:raise(Class, {init_route_failed, Path, Handler, Reason}, Stack)
+            end
+    end.
+
+%% Whether `Handler` exports the optional `init_route/1`. The module is loaded
+%% first so `function_exported/3` can see it (it reports `false` for an unloaded
+%% module even when the export exists). A handler that cannot be loaded has no
+%% hook to run: the route compiles as before and fails on its first request, so
+%% a table may still name a module that is loaded later.
+-spec has_init_route(module()) -> boolean().
+has_init_route(Handler) ->
+    case code:ensure_loaded(Handler) of
+        {module, Handler} -> erlang:function_exported(Handler, init_route, 1);
+        {error, _Reason} -> false
+    end.
 
 -spec route_limits(map()) -> limits().
 route_limits(#{max_content_length := Max}) -> #{max_content_length => Max};

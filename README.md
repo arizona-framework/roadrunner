@@ -264,6 +264,17 @@ files, and by default refuses a symlinked file that points outside `dir`.
 `Content-Type` comes from the file extension, with the common web types
 (fonts, `.wasm`, `.webp`, `.mjs`, and more) built in and a `mime_types`
 option to add your own.
+
+A route can also serve one file, and either path can sit in an
+application's `priv` directory:
+
+```erlang
+{~"/assets/*path", roadrunner_static, #{dir => {priv, my_app, ~"static"}}},
+{~"/favicon.ico", roadrunner_static, #{file => {priv, my_app, ~"favicon.ico"}}}
+```
+
+The options are checked when the listener starts, so a typo stops it
+from booting instead of failing a request.
 Handlers can also send a file directly with
 `{sendfile, Status, Headers, {Filename, Offset, Length}}` (zero-copy for
 HTTP/1.1 over plain TCP).
