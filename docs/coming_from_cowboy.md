@@ -642,9 +642,20 @@ handler per node, a module with `handle_event/2`. Set it in `sys.config`:
 [{roadrunner, [{event_handler, my_events}]}].
 ```
 
-Roadrunner has no telemetry dependency. To feed `telemetry` (for example, to
-keep handlers you attached for Cowboy), add `telemetry` to your own deps and
-forward the events you need:
+Roadrunner has no telemetry dependency. To keep using `telemetry` (for
+example, handlers you attached for Cowboy, `telemetry_metrics`, Prometheus,
+or OpenTelemetry), add
+[`roadrunner_telemetry`](https://github.com/arizona-framework/roadrunner_telemetry)
+to your deps and make it the event handler. It turns every Roadrunner event
+into a `telemetry` event, such as `[roadrunner, request, stop]`, following the
+`telemetry` span convention:
+
+```erlang
+[{roadrunner, [{event_handler, roadrunner_telemetry}]}].
+```
+
+To handle only the events you need, write your own event handler instead,
+for example one that forwards to `telemetry` itself:
 
 ```erlang
 -module(my_events).
@@ -738,4 +749,5 @@ cover each one.
 - Move `cowboy_middleware` modules and response-changing stream handlers to
   `roadrunner_middleware`
 - Point `cowboy_static` routes at `roadrunner_static` with a `*path` wildcard
-- Replace `cowboy_metrics_h` or telemetry handlers with an event handler
+- Replace `cowboy_metrics_h` with an event handler, or set
+  `roadrunner_telemetry` as the event handler to keep your telemetry handlers
