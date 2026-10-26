@@ -9,7 +9,9 @@
     native_client_completes_handshake/1,
     native_client_completes_chacha20_handshake/1,
     native_client_completes_aes_256_gcm_handshake/1,
-    native_client_completes_p256_handshake/1
+    native_client_completes_p256_handshake/1,
+    lost_initial_is_resent/1,
+    duplicate_initial_is_one_connection/1
 ]).
 
 suite() ->
@@ -20,7 +22,9 @@ all() ->
         native_client_completes_handshake,
         native_client_completes_chacha20_handshake,
         native_client_completes_aes_256_gcm_handshake,
-        native_client_completes_p256_handshake
+        native_client_completes_p256_handshake,
+        lost_initial_is_resent,
+        duplicate_initial_is_one_connection
     ].
 
 init_per_suite(Config) ->
@@ -55,6 +59,41 @@ native_client_completes_aes_256_gcm_handshake(_Config) ->
 %% answers with its own P-256 share (RFC 8446 §4.2.8.2).
 native_client_completes_p256_handshake(_Config) ->
     assert_native_handshake(#{group => secp256r1}).
+
+%% The client resends its Initial until the server answers (RFC 9002 §6.2.4),
+%% so a first Initial lost on the way does not fail the connect.
+lost_initial_is_resent(_Config) ->
+    assert_one_connection(#{initial_sends => 0}).
+
+%% A resent Initial that crosses the server's first reply reaches the server
+%% as a duplicate: the listener routes it to the connection the first one
+%% started, which still serves the request, and no second connection starts.
+duplicate_initial_is_one_connection(_Config) ->
+    assert_one_connection(#{initial_sends => 2}).
+
+assert_one_connection(Opts) ->
+    {ok, _} = roadrunner_listener:start_link(?MODULE, #{
+        port => 0,
+        protocols => [http3],
+        tls => roadrunner_test_certs:server_opts(),
+        routes => roadrunner_hello_handler
+    }),
+    try
+        {ok, Conn} = roadrunner_quic_test_h3:connect(
+            {127, 0, 0, 1}, roadrunner_listener:port(?MODULE), Opts
+        ),
+        Request = [
+            {~":method", ~"GET"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"localhost"},
+            {~":path", ~"/"}
+        ],
+        ?assertMatch({200, _, _}, roadrunner_quic_test_h3:request(Conn, Request, <<>>)),
+        ?assertMatch(#{active_clients := 1}, roadrunner_listener:info(?MODULE)),
+        ok = roadrunner_quic_test_h3:close(Conn)
+    after
+        ok = roadrunner_listener:stop(?MODULE)
+    end.
 
 assert_native_handshake(Opts) ->
     %% A minimal in-test listener: the pump owns one UDP socket, reads it, and

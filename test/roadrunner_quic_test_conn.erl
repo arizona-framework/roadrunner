@@ -70,6 +70,13 @@
 %% STREAM frame header, and AEAD tag within the MTU.
 -define(MAX_STREAM_CHUNK, 1000).
 -define(RECV_TIMEOUT, 3000).
+%% Until the server's first datagram arrives, the client resends its Initial
+%% after each wait this long (RFC 9002 §6.2.4: a client with no reply probes
+%% again), so a lost datagram or a slow first reply on a loaded host does not
+%% fail the connect. Four resends and the last wait stay within
+%% ?CONNECT_TIMEOUT.
+-define(INITIAL_RESEND_TIMEOUT, 1000).
+-define(INITIAL_RESENDS, 4).
 -define(CONNECT_TIMEOUT, 8000).
 %% The connection-level receive window this client advertises and replenishes.
 %% Must match the `initial_max_data` in roadrunner_quic_test_client's transport
@@ -103,6 +110,10 @@
     %% address-validation PING takes pn 0, the client Finished pn 1.
     hs_pn = 0 :: non_neg_integer(),
     datagrams = [] :: [binary()],
+    %% The sealed Initial and the resends left before the server's first
+    %% datagram (see ?INITIAL_RESEND_TIMEOUT).
+    initial :: binary(),
+    initial_resends = ?INITIAL_RESENDS :: non_neg_integer(),
     %% 1-RTT stream state (RFC 9000 §2.1 client-initiated stream ids).
     next_bidi = 0 :: non_neg_integer(),
     next_uni = 2 :: non_neg_integer(),
@@ -167,6 +178,8 @@ secp256r1` is the one key exchange group offered, with its key share
 (default x25519). `cid_events => true` tells the owner of each connection
 id the server issues, as `{quic_test_new_cid, Conn, Seq, CID}`. `token =>
 Token` puts an address validation token in the Initial (RFC 9000 §8.1.3).
+`initial_sends => N` sends the first Initial `N` times (default 1): 0 as if
+it was lost, so the client's resend carries the handshake, 2 as a duplicate.
 """.
 -spec connect(inet:ip_address() | inet:hostname(), inet:port_number(), map()) ->
     {ok, pid()} | {error, term()}.
@@ -376,7 +389,9 @@ init(Parent, Ref, Host, Port, Opts) ->
                     initial, 0, ClientInitialKeys, [{crypto, 0, ChFramed}], Dcid0, Scid
                 )
         end,
-    ok = roadrunner_quic_socket:send(Socket, Host, Port, Initial),
+    %% `initial_sends` sends it that many times at first: 0 as if the first was
+    %% lost, 2 as a duplicate, to test the resend and the server's handling.
+    ok = send_initial(Socket, Host, Port, Initial, maps:get(initial_sends, Opts, 1)),
     Conn = #conn{
         socket = Socket,
         host = Host,
@@ -384,6 +399,7 @@ init(Parent, Ref, Host, Port, Opts) ->
         scid = Scid,
         eph_priv = EphPriv,
         ch_framed = ChFramed,
+        initial = Initial,
         owner = Parent,
         server_initial_keys = roadrunner_quic_keys:initial_server(Dcid0),
         conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ?CONN_MAX_DATA}),
@@ -412,18 +428,43 @@ group_codepoint(secp256r1) -> 16#0017.
 %% Read one datagram, buffer it, and drive the handshake as far as the
 %% buffered datagrams allow, until connected or a timeout.
 -spec handshake(#conn{}) -> {ok, #conn{}} | {error, term()}.
+handshake(#conn{server_scid = undefined, initial_resends = Left} = Conn) when Left > 0 ->
+    case roadrunner_quic_socket:recv(Conn#conn.socket, ?INITIAL_RESEND_TIMEOUT) of
+        {ok, _Peer, Datagram} ->
+            received(Conn, Datagram);
+        {error, timeout} ->
+            ok = send_initial(
+                Conn#conn.socket, Conn#conn.host, Conn#conn.port, Conn#conn.initial, 1
+            ),
+            handshake(Conn#conn{initial_resends = Left - 1})
+    end;
 handshake(Conn) ->
     case roadrunner_quic_socket:recv(Conn#conn.socket, ?RECV_TIMEOUT) of
-        {ok, _Peer, Datagram} ->
-            Buffered = Conn#conn{datagrams = Conn#conn.datagrams ++ [Datagram]},
-            case advance(learn_server_scid(Buffered)) of
-                {connected, Conn1} -> {ok, Conn1};
-                {continue, Conn1} -> handshake(Conn1);
-                {error, Reason} -> {error, Reason}
-            end;
-        {error, timeout} ->
-            {error, handshake_timeout}
+        {ok, _Peer, Datagram} -> received(Conn, Datagram);
+        {error, timeout} -> {error, handshake_timeout}
     end.
+
+-spec received(#conn{}, binary()) -> {ok, #conn{}} | {error, term()}.
+received(Conn, Datagram) ->
+    Buffered = Conn#conn{datagrams = Conn#conn.datagrams ++ [Datagram]},
+    case advance(learn_server_scid(Buffered)) of
+        {connected, Conn1} -> {ok, Conn1};
+        {continue, Conn1} -> handshake(Conn1);
+        {error, Reason} -> {error, Reason}
+    end.
+
+-spec send_initial(
+    roadrunner_quic_socket:socket(),
+    inet:ip_address() | inet:hostname(),
+    inet:port_number(),
+    binary(),
+    non_neg_integer()
+) -> ok.
+send_initial(_Socket, _Host, _Port, _Initial, 0) ->
+    ok;
+send_initial(Socket, Host, Port, Initial, Copies) ->
+    ok = roadrunner_quic_socket:send(Socket, Host, Port, Initial),
+    send_initial(Socket, Host, Port, Initial, Copies - 1).
 
 %% The server addresses its reply to the client's source CID and carries its
 %% own SCID in its first long header; capture it for the client's later
