@@ -13,4 +13,7 @@ start(_StartType, _StartArgs) ->
 
 -spec stop(term()) -> ok.
 stop(_State) ->
-    ok.
+    %% The clock clears its stamp when it terminates; this covers a
+    %% supervisor that gave up after the clock was killed, where no
+    %% terminate ran.
+    roadrunner_clock:clear_stamp().

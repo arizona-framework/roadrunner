@@ -57,8 +57,6 @@ accessors that operate on it.
 
 -export_type([headers/0, status/0, redirect_status/0, version/0, request_context/0]).
 
--define(DATE_CACHE_KEY, {?MODULE, date_cache}).
-
 -include("roadrunner_swar.hrl").
 
 %% Lanes holding a byte of at least `N` (`N` =< 0x80), exactly: each
@@ -93,44 +91,22 @@ accessors that operate on it.
     | bad_connect
     | not_implemented.
 
--define(DAY_NAMES, {~"Mon", ~"Tue", ~"Wed", ~"Thu", ~"Fri", ~"Sat", ~"Sun"}).
--define(MONTH_NAMES, {
-    ~"Jan", ~"Feb", ~"Mar", ~"Apr", ~"May", ~"Jun", ~"Jul", ~"Aug", ~"Sep", ~"Oct", ~"Nov", ~"Dec"
-}).
-
 -doc """
 Format the current UTC time as an IMF-fixdate per RFC 9110 §5.6.7
 — the canonical HTTP `Date` header format, e.g.
 `Sun, 06 Nov 1994 08:49:37 GMT`. Used by the dispatch layer to
 auto-inject the `Date` response header per RFC 9110 §6.6.1.
 
-Built via direct bit-syntax binary construction rather than
-`io_lib:format/2` because the shape is fixed (RFC 9110 mandates
-exact widths and the day/month abbreviations) and this function
-runs on the response hot path.
-
-Cached per process in the process dictionary, keyed by the current
-Posix second: the formatted binary is identical for every response
-a process emits within the same second, so we recompute it only when
-the second ticks over. Per-process rather than via `persistent_term`
-because the value changes every second, and a `persistent_term:put`
-that frequent forces a global scan of every process heap on the
-response hot path; the per-process cache pays a cheap dictionary read
-instead, and reformats at most once per second per process: once per
-connection on h1/h2, once per request on h3 (its stream workers are
-per-request).
+Built from a date stamp the application refreshes once a second, so
+a read is one `persistent_term` lookup and one 29-byte binary on the
+caller's heap, the same in a long-lived HTTP/1 connection and in a
+per-request HTTP/2 or HTTP/3 stream worker.
+Without a running clock (code run outside the application) it formats
+the system time instead, which is correct but slower.
 """.
 -spec http_date_now() -> binary().
 http_date_now() ->
-    Now = erlang:system_time(second),
-    case get(?DATE_CACHE_KEY) of
-        {Now, Bin} ->
-            Bin;
-        _ ->
-            Bin = format_http_date(Now),
-            _ = put(?DATE_CACHE_KEY, {Now, Bin}),
-            Bin
-    end.
+    roadrunner_clock:date().
 
 -doc """
 Inject a `Date` response header (RFC 9110 §6.6.1) unless the handler
@@ -222,48 +198,7 @@ explicit timestamp — used by the static file handler to emit the
 """.
 -spec format_http_date(integer()) -> binary().
 format_http_date(Posix) ->
-    Days = floor_div(Posix, 86400),
-    SecOfDay = Posix - Days * 86400,
-    {Y, M, D} = civil_from_days(Days),
-    %% 1970-01-01 was a Thursday, index 3 in the Monday-first table.
-    DayName = element(floor_mod(Days + 3, 7) + 1, ?DAY_NAMES),
-    MonthName = element(M, ?MONTH_NAMES),
-    <<DayName/binary, ", ", (pad2(D))/binary, " ", MonthName/binary, " ",
-        (integer_to_binary(Y))/binary, " ", (pad2(SecOfDay div 3600))/binary, ":",
-        (pad2(SecOfDay rem 3600 div 60))/binary, ":", (pad2(SecOfDay rem 60))/binary, " GMT">>.
-
-%% Proleptic Gregorian date for a count of days since 1970-01-01, after
-%% Howard Hinnant's `civil_from_days`. Done here rather than through
-%% `calendar` so the first response doesn't pay for loading that module:
-%% startup time is dominated by code loading.
--spec civil_from_days(integer()) -> {integer(), 1..12, 1..31}.
-civil_from_days(Days) ->
-    Z = Days + 719468,
-    Era = floor_div(Z, 146097),
-    DayOfEra = Z - Era * 146097,
-    YearOfEra = (DayOfEra - DayOfEra div 1460 + DayOfEra div 36524 - DayOfEra div 146096) div 365,
-    DayOfYear = DayOfEra - (365 * YearOfEra + YearOfEra div 4 - YearOfEra div 100),
-    MarchMonth = (5 * DayOfYear + 2) div 153,
-    D = DayOfYear - (153 * MarchMonth + 2) div 5 + 1,
-    case MarchMonth < 10 of
-        true -> {YearOfEra + Era * 400, MarchMonth + 3, D};
-        false -> {YearOfEra + Era * 400 + 1, MarchMonth - 9, D}
-    end.
-
--spec floor_div(integer(), pos_integer()) -> integer().
-floor_div(N, Div) when N >= 0 -> N div Div;
-floor_div(N, Div) -> -((Div - 1 - N) div Div).
-
--spec floor_mod(integer(), pos_integer()) -> non_neg_integer().
-floor_mod(N, Div) -> N - floor_div(N, Div) * Div.
-
-%% Two-digit zero-padded integer for the IMF-fixdate fields. Year is
-%% 4-digit for modern timestamps, so `integer_to_binary/1` suffices
-%% there; only the day/hour/minute/second need the leading-zero pad
-%% when < 10.
--spec pad2(0..99) -> binary().
-pad2(N) when N < 10 -> <<$0, ($0 + N)>>;
-pad2(N) -> integer_to_binary(N).
+    roadrunner_clock:format(Posix).
 
 -doc """
 Validate that a header name or value contains no CR, LF, or NUL —
