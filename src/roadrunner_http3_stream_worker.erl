@@ -50,7 +50,7 @@
 %% response (e.g. 413) directly, without spawning a worker.
 -export([send_buffered/5]).
 %% `roadrunner_stream_worker` callback.
--export([emit_handler_response/4]).
+-export([emit_handler_response/4, send_interim/4, start_stream/5]).
 
 -behaviour(roadrunner_stream_worker).
 %% Exported for eunit branch coverage of the stop-on-send-error path.
@@ -137,20 +137,54 @@ emit_handler_response(Conn, StreamId, Handler, Response) ->
             ok = emit(Conn, StreamId, Handler, Response, Fields),
             Status;
         false ->
-            %% RFC 9114 §4.2.2: the client will likely refuse a header
-            %% section over its SETTINGS_MAX_FIELD_SECTION_SIZE. Nothing
-            %% is sent yet, so answer 500, as for an unsafe header; only
-            %% the sizes are logged, never the fields.
-            logger:error(#{
-                msg => "roadrunner h3 response headers exceed the client's limit",
-                handler => Handler,
-                size => roadrunner_http:header_list_size(Fields),
-                limit => get(?PEER_LIMIT_KEY)
-            }),
-            ok = send_buffered(
-                Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
-            ),
-            500
+            over_peer_limit(Conn, StreamId, Handler, Fields)
+    end.
+
+%% RFC 9114 §4.2.2: the client will likely refuse a header section over its
+%% SETTINGS_MAX_FIELD_SECTION_SIZE. Nothing is sent yet, so answer 500, as
+%% for an unsafe header; only the sizes are logged, never the fields.
+-spec over_peer_limit(pid(), non_neg_integer(), module(), roadrunner_http:headers()) -> 500.
+over_peer_limit(Conn, StreamId, Handler, Fields) ->
+    logger:error(#{
+        msg => "roadrunner h3 response headers exceed the client's limit",
+        handler => Handler,
+        size => roadrunner_http:header_list_size(Fields),
+        limit => get(?PEER_LIMIT_KEY)
+    }),
+    ok = send_buffered(
+        Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
+    ),
+    500.
+
+%% An interim 1xx for `roadrunner_send:inform/3`: a HEADERS frame ahead of
+%% the final response's (RFC 9114 §4.1). Not sent when over the client's
+%% field section limit.
+-doc false.
+-spec send_interim(pid(), non_neg_integer(), roadrunner_http:status(), roadrunner_http:headers()) ->
+    ok | {error, term()}.
+send_interim(Conn, StreamId, Status, Headers) ->
+    Fields = field_section(Status, Headers),
+    case fits_peer_limit(Fields, get(?PEER_LIMIT_KEY)) of
+        true -> roadrunner_quic:send_data(Conn, StreamId, header_frame(Fields), false);
+        false -> {error, field_section_too_large}
+    end.
+
+%% The head of a `roadrunner_send:stream/3` response, with the status
+%% sent: answered 500 instead when over the client's field section limit.
+-doc false.
+-spec start_stream(
+    pid(), non_neg_integer(), module(), roadrunner_http:status(), roadrunner_http:headers()
+) ->
+    {{ok, roadrunner_handler:send_fun()} | {error, term()}, roadrunner_http:status()}.
+start_stream(Conn, StreamId, Handler, Status, Headers) ->
+    Fields = field_section(Status, Headers),
+    case fits_peer_limit(Fields, get(?PEER_LIMIT_KEY)) of
+        true ->
+            Result = roadrunner_quic:send_data(Conn, StreamId, header_frame(Fields), false),
+            Send = fun(Data, FinFlag) -> stream_send(Conn, StreamId, Data, FinFlag) end,
+            {roadrunner_send_writer:started(Result, Send), Status};
+        false ->
+            {{error, field_section_too_large}, over_peer_limit(Conn, StreamId, Handler, Fields)}
     end.
 
 -spec status_headers(roadrunner_handler:response()) ->

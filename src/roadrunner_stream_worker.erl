@@ -25,6 +25,18 @@
     pid(), non_neg_integer(), module(), roadrunner_handler:response()
 ) -> roadrunner_http:status().
 
+%% Send an interim 1xx on the stream, for `roadrunner_send:inform/3`.
+-callback send_interim(
+    pid(), non_neg_integer(), roadrunner_http:status(), roadrunner_http:headers()
+) -> ok | {error, term()}.
+
+%% Send a streamed response's head, for `roadrunner_send:stream/3`,
+%% returning the body's `Send` and the status actually sent (a 500 when the
+%% head could not be).
+-callback start_stream(
+    pid(), non_neg_integer(), module(), roadrunner_http:status(), roadrunner_http:headers()
+) -> {{ok, roadrunner_handler:send_fun()} | {error, term()}, roadrunner_http:status()}.
+
 -spec run(
     module(),
     h2 | h3,
@@ -124,6 +136,8 @@ invoke(
     Span
 ) ->
     try Pipeline(Req) of
+        {{send, Headers, Fun}, Req2} when is_list(Headers), is_function(Fun, 1) ->
+            run_send(Worker, Protocol, Conn, StreamId, Handler, Req2, Headers, Fun, Span);
         {Response0, Req2} ->
             %% A handler-returned 1xx or unsafe header becomes a 500 here,
             %% for every shape (`roadrunner_conn:final_response/3`,
@@ -155,6 +169,79 @@ invoke(
             )
     end.
 
+%% A `{send, Headers, Fun}` response: the fun writes the stream itself,
+%% as it runs, through `send_emit/4`. It runs under its own `try`
+%% (`roadrunner_send_writer:run/5`): a crash before a final response is
+%% answered 500, as a handler crash is; one after it leaves the stream to the
+%% connection, reset when its body was still open. A transport exit (the
+%% stream reset or the connection gone under a write) ends the worker as it
+%% does for the `stream` shape, without a report.
+-spec run_send(
+    module(),
+    h2 | h3,
+    pid(),
+    non_neg_integer(),
+    module(),
+    roadrunner_req:request(),
+    roadrunner_http:headers(),
+    roadrunner_send:sender(),
+    roadrunner_event_handler:span()
+) -> ok.
+run_send(Worker, Protocol, Conn, StreamId, Handler, Req, Headers, Fun, Span) ->
+    Emit = send_emit(Worker, Conn, StreamId, Handler),
+    case roadrunner_send_writer:run(Handler, Fun, Headers, Req, Emit) of
+        {done, {Kind, Status, _SentHeaders}, _Req2} ->
+            roadrunner_event:request_stop(Span, Status, Kind);
+        {crashed, exit, Reason, _Stack, _Sent} when
+            Reason =:= stream_reset; Reason =:= conn_down; element(1, Reason) =:= quic_conn_down
+        ->
+            exit(Reason);
+        {crashed, Class, Reason, Stack, Sent} ->
+            ok = roadrunner_event:request_exception(Span, Class, Reason, Stack),
+            logger:error(#{
+                msg => crash_message(Protocol),
+                handler => Handler,
+                class => Class,
+                reason => Reason,
+                stacktrace => Stack
+            }),
+            crash_answer(Sent, Worker, Conn, StreamId)
+    end.
+
+%% A 500 for a fun that crashed before its final response. After a complete
+%% one the stream is done; a body still open is reset by the connection on
+%% the worker's abnormal exit.
+-spec crash_answer(none | complete | open, module(), pid(), non_neg_integer()) -> ok.
+crash_answer(none, Worker, Conn, StreamId) ->
+    Worker:send_buffered(
+        Conn, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
+    );
+crash_answer(complete, _Worker, _Conn, _StreamId) ->
+    ok;
+crash_answer(open, _Worker, _Conn, _StreamId) ->
+    exit(unfinished_response).
+
+%% `roadrunner_send`'s writer for this stream. A complete or file response
+%% goes through the shapes' own send path (`emit_handler_response/4`), so it
+%% gets their HEAD and header-limit handling.
+-spec send_emit(module(), pid(), non_neg_integer(), module()) ->
+    roadrunner_send_writer:emit().
+send_emit(Worker, Conn, StreamId, Handler) ->
+    fun
+        ({inform, Status, Headers}, _Req) ->
+            Worker:send_interim(Conn, StreamId, Status, Headers);
+        ({reply, Status, Headers, Body}, #{method := Method}) ->
+            Response = roadrunner_conn:head_response({Status, Headers, Body}, Method),
+            {ok, Worker:emit_handler_response(Conn, StreamId, Handler, Response), Headers};
+        ({sendfile, Status, Headers, Spec}, #{method := Method}) ->
+            Response = roadrunner_conn:head_response({sendfile, Status, Headers, Spec}, Method),
+            {ok, Worker:emit_handler_response(Conn, StreamId, Handler, Response), Headers};
+        ({stream, Status, Headers}, Req) ->
+            ok = roadrunner_conn:continue_before_stream(Req),
+            {Result, Sent} = Worker:start_stream(Conn, StreamId, Handler, Status, Headers),
+            {Result, Sent, Headers}
+    end.
+
 %% RFC 9110 §5.5: a response header name or value containing CR, LF or
 %% NUL is a handler bug (usually unvalidated user input echoed into a
 %% header) that would put malformed bytes on the wire, or split at a
@@ -171,7 +258,7 @@ safe_response(_Protocol, _Handler, {websocket, _, _} = Response) ->
 safe_response(_Protocol, _Handler, {websocket, _, _, _} = Response) ->
     Response;
 safe_response(Protocol, Handler, Response) ->
-    case unsafe_header(response_headers(Response)) of
+    case roadrunner_http:unsafe_header(response_headers(Response)) of
         none ->
             Response;
         Kind ->
@@ -188,21 +275,6 @@ response_headers({stream, _, Headers, _}) -> Headers;
 response_headers({loop, _, Headers, _}) -> Headers;
 response_headers({sendfile, _, Headers, _}) -> Headers;
 response_headers({_, Headers, _}) -> Headers.
-
-%% The kind of the first field with CR/LF/NUL in it, or `none`.
--spec unsafe_header(roadrunner_http:headers()) -> none | name | value.
-unsafe_header([]) ->
-    none;
-unsafe_header([{Name, Value} | Rest]) ->
-    case roadrunner_http:is_header_safe(Name) of
-        true ->
-            case roadrunner_http:is_header_safe(Value) of
-                true -> unsafe_header(Rest);
-                false -> value
-            end;
-        false ->
-            name
-    end.
 
 -spec unsafe_message(h2 | h3) -> string().
 unsafe_message(h2) -> "roadrunner h2 handler returned a header with CR/LF/NUL";

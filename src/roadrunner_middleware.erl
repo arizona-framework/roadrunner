@@ -37,18 +37,20 @@ Tower, and Servant.
 
 Middleware code never has access to the underlying socket — the
 `Request` map intentionally excludes any socket reference. To
-respond, a middleware **must** return a `Result` (either the one
-from `Next(Req)` or its own response triple); there is no `reply`
-escape hatch equivalent to cowboy's mid-flight `cowboy_req:reply/4`.
+respond, a middleware **must** return a `Result`: the one from
+`Next(Req)`, or its own response. A response that has to be sent while
+code runs (cowboy's mid-flight `cowboy_req:reply/4` or `inform/3`) is a
+`{send, Headers, Fun}` response: the connection runs `Fun` and it
+sends through `roadrunner_send` (see `roadrunner_handler`).
 
 This is a feature, not a limitation. Bytes only hit the wire from
-one place — the conn process — which means:
+one place — the process running the request — which means:
 
 - the `request_stop` event fires for every request, with the status
   actually sent.
-- gzip wrapping, response transforms, and `Content-Length` framing
-  are applied uniformly regardless of which middleware produced
-  the response.
+- response transforms and `Content-Length` framing are applied
+  uniformly regardless of which middleware produced the response.
+  `roadrunner_compress` leaves `{send, ...}` responses as they are.
 - Send errors are handled in one place (the `response_send_failed`
   event, drain bookkeeping, slot release).
 - The "halt" pattern is structurally simple: don't call `Next`, just
@@ -61,7 +63,8 @@ one place — the conn process — which means:
 If you're porting middleware from cowboy that called
 `cowboy_req:reply/4` directly, replace the call with returning a
 response triple — `{Status, Headers, Body}` — from the middleware,
-and the framework writes the bytes.
+and the framework writes the bytes. Middleware that sent an
+`inform/3` before its reply returns a `{send, ...}` response instead.
 
 ## Where middlewares live
 

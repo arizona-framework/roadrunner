@@ -53,8 +53,8 @@ A header the handler already set wins: each default is added only when
 absent. Unlike `roadrunner_compress`, this middleware adds no `Vary` (its
 output conditions on no request header; HSTS keys off the connection scheme,
 not a header). It decorates every response shape that carries headers
-(buffered, stream, sendfile, and loop), so a file served via `sendfile` gets
-`nosniff` too. A `{websocket, ...}` upgrade passes through: its 101 carries
+(buffered, stream, sendfile, loop, and send, whose final response gets
+them), so a file served via `sendfile` gets `nosniff` too. A `{websocket, ...}` upgrade passes through: its 101 carries
 only the handshake headers plus any the handler set, and these defaults do not
 belong on a protocol switch.
 """.
@@ -143,6 +143,8 @@ transform(Req, State, {loop, Status, Headers, LoopState}) when
     is_integer(Status), Status >= 100, Status =< 599
 ->
     {loop, Status, inject(Req, State, Headers), LoopState};
+transform(Req, State, {send, Headers, Fun}) when is_list(Headers), is_function(Fun, 1) ->
+    {send, inject(Req, State, Headers), Fun};
 transform(_Req, _State, Other) ->
     Other.
 

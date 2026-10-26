@@ -34,8 +34,8 @@ current representation.
 ## Scope
 
 Only a buffered `200` for `GET` or `HEAD` is handled. Other statuses and
-methods, and `{stream, ...}`, `{loop, ...}`, `{sendfile, ...}`, and
-`{websocket, ...}` responses, pass through unchanged. Computing the ETag
+methods, and `{stream, ...}`, `{loop, ...}`, `{sendfile, ...}`,
+`{send, ...}`, and `{websocket, ...}` responses, pass through unchanged. Computing the ETag
 reads the whole body once per response, so use it on read-heavy endpoints
 where skipping the body on revalidation is worth the hash.
 """.

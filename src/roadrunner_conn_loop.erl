@@ -1142,9 +1142,10 @@ trailer_limits(#loop_state{http1_limits = {_ReqLine, MaxHdrLine, MaxHdrBlock, Ma
 %%
 %% Take the request's resolved handler (routed in `read_body_phase/3`),
 %% run its middleware pipeline bracketed by request_start / request_stop |
-%% request_exception telemetry. The 5 response shapes (buffered,
+%% request_exception telemetry. The 5 returned response shapes (buffered,
 %% stream, loop, sendfile, websocket) dispatch to their respective
-%% writers via `dispatch_response/4`.
+%% writers via `dispatch_response/4`; a `{send, ...}` fun writes its
+%% own response (`send_phase/6`).
 -spec dispatch_phase(#loop_state{}, roadrunner_req:request(), roadrunner_conn:resolved()) ->
     no_return().
 dispatch_phase(#loop_state{socket = Socket} = S, Req, Resolved) ->
@@ -1173,6 +1174,9 @@ dispatch_phase(#loop_state{socket = Socket} = S, Req, Resolved) ->
 run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
     Span = roadrunner_event:request_start(Req),
     try Pipeline(Req) of
+        {{send, Headers, Fun}, Req2} when is_list(Headers), is_function(Fun, 1), is_map(Req2) ->
+            S2 = S#loop_state{requests_served = S#loop_state.requests_served + 1},
+            send_phase(S2, Handler, Req2, Headers, Fun, Span);
         {Response0, Req2} when is_map(Req2) ->
             S2 = S#loop_state{requests_served = S#loop_state.requests_served + 1},
             %% Decide keep-alive-vs-close BEFORE the response is sent so a
@@ -1213,6 +1217,112 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
             _ = roadrunner_conn:send_internal_error(Socket),
             exit_unread(S9, Req)
     end.
+
+%% A `{send, Headers, Fun}` response: the fun writes the wire itself, as
+%% it runs, through `send_emit/2`; this process then finishes the
+%% request on what it sent, as it does for the shape that was sent. The fun
+%% runs under its own `try` (`roadrunner_send_writer:run/5`): a crash before a
+%% final response is answered 500, as a handler crash is, and one after it
+%% closes the connection.
+-spec send_phase(
+    #loop_state{},
+    module(),
+    roadrunner_req:request(),
+    roadrunner_http:headers(),
+    roadrunner_send:sender(),
+    roadrunner_event_handler:span()
+) -> no_return().
+send_phase(S0, Handler, Req, Headers, Fun, Span) ->
+    %% Queued pipelined responses go out ahead of anything the fun sends.
+    #loop_state{socket = Socket} = S = flush_out(S0),
+    case roadrunner_send_writer:run(Handler, Fun, Headers, Req, send_emit(S, Handler)) of
+        {done, {Kind, Status, SentHeaders}, Req2} ->
+            ok = roadrunner_event:request_stop(Span, Status, Kind),
+            send_finish(S, Req2, Kind, SentHeaders);
+        {crashed, Class, Reason, Stack, Sent} ->
+            ok = roadrunner_event:request_exception(Span, Class, Reason, Stack),
+            logger:error(#{
+                msg => "roadrunner handler crashed",
+                handler => Handler,
+                class => Class,
+                reason => Reason,
+                stacktrace => Stack
+            }),
+            _ = crash_answer(Sent, Socket),
+            exit_unread(S, Req)
+    end.
+
+%% A 500 for a fun that crashed before its final response; after it, the
+%% connection only closes.
+-spec crash_answer(none | complete | open, roadrunner_transport:socket()) ->
+    ok | {error, term()}.
+crash_answer(none, Socket) -> roadrunner_conn:send_internal_error(Socket);
+crash_answer(_Sent, _Socket) -> ok.
+
+%% A complete or file response is keep-alive eligible on the headers it went
+%% out with, a streamed one closes, as for the shapes themselves.
+-spec send_finish(
+    #loop_state{},
+    roadrunner_req:request(),
+    buffered | stream | sendfile,
+    roadrunner_http:headers()
+) -> no_return().
+send_finish(S, Req, stream, _Headers) ->
+    writer_finish(S, Req);
+send_finish(S, Req, _Kind, Headers) ->
+    buffered_finish(S, Req, Headers).
+
+%% `roadrunner_send`'s writer for this connection. Each final response
+%% goes out at once, `Connection: close` added when the server closes after
+%% it (`with_close_if_closing/3`, on the request the fun holds then), and
+%% reports the headers it went out with for the keep-alive decision.
+-spec send_emit(#loop_state{}, module()) -> roadrunner_send_writer:emit().
+send_emit(#loop_state{socket = Socket, alt_svc = AltSvc} = S, Handler) ->
+    fun
+        ({inform, Status, Headers}, Req) ->
+            send_interim(Socket, Status, Headers, AltSvc, Req);
+        ({reply, Status, Headers0, Body}, #{method := Method} = Req) ->
+            Headers = with_close_if_closing(S, Req, Headers0),
+            Resp = roadrunner_http1:response(
+                Status, framed(Status, Headers, Body), reply_body(Method, Body), AltSvc
+            ),
+            Result = roadrunner_event:response_send(
+                roadrunner_transport:send(Socket, Resp), buffered_response
+            ),
+            {Result, Status, Headers};
+        ({stream, Status, Headers}, Req) ->
+            ok = roadrunner_conn:continue_before_stream(Req),
+            {Result, Send} = roadrunner_stream_response:start(
+                Socket, Status, roadrunner_http:auto_headers(Headers, AltSvc)
+            ),
+            {roadrunner_send_writer:started(Result, Send), Status, Headers};
+        ({sendfile, Status, Headers0, Spec}, Req) ->
+            Headers = with_close_if_closing(S, Req, Headers0),
+            #loop_state{} = dispatch_response(S, Handler, Req, {sendfile, Status, Headers, Spec}),
+            {ok, Status, Headers}
+    end.
+
+%% RFC 9110 §15.2: a server MUST NOT send a 1xx response to an HTTP/1.0
+%% client, so an interim response to one is skipped.
+-spec send_interim(
+    roadrunner_transport:socket(),
+    roadrunner_http:status(),
+    roadrunner_http:headers(),
+    binary() | undefined,
+    roadrunner_req:request()
+) -> ok | {error, term()}.
+send_interim(_Socket, _Status, _Headers, _AltSvc, #{version := {1, 0}}) ->
+    ok;
+send_interim(Socket, Status, Headers, AltSvc, _Req) ->
+    roadrunner_event:response_send(
+        roadrunner_transport:send(Socket, roadrunner_http1:response(Status, Headers, ~"", AltSvc)),
+        interim_response
+    ).
+
+%% RFC 9110 §9.3.2: a HEAD response carries no content.
+-spec reply_body(binary(), iodata()) -> iodata().
+reply_body(~"HEAD", _Body) -> ~"";
+reply_body(_Method, Body) -> Body.
 
 %% RFC 9112 §9.6: a server that will not reuse the connection MUST signal it on
 %% the final response. The per-request keep-alive decision already reaches the
@@ -1493,9 +1603,13 @@ finishing_phase(S, Req, {Status, Headers, _Body}) when is_integer(Status) ->
 finishing_phase(S, Req, {sendfile, Status, Headers, _}) when is_integer(Status) ->
     buffered_finish(S, Req, Headers);
 finishing_phase(S, Req, _Response) ->
-    %% Stream / loop / websocket: writer owns the wire. In auto-mode
-    %% the body is already fully read; manual-mode may have leftover
-    %% that needs draining, or, when it cannot be, lingering over.
+    writer_finish(S, Req).
+
+%% Stream / loop / websocket: writer owns the wire. In auto-mode the body is
+%% already fully read; manual-mode may have leftover that needs draining,
+%% or, when it cannot be, lingering over.
+-spec writer_finish(#loop_state{}, roadrunner_req:request()) -> no_return().
+writer_finish(S, Req) ->
     case drain_body_if_manual(Req) of
         {ok, _Leftover} -> exit_normal(S, normal);
         {error, _} -> exit_lingering(S, normal)
