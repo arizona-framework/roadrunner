@@ -1151,6 +1151,16 @@ conn_streams_empty_send_nofin_emits_nothing_test_() ->
                     %% then terminator with no extra empty chunk.
                     ?assertEqual(~"2\r\nhi\r\n0\r\n\r\n", Body),
                     ok = gen_tcp:close(Sock)
+                end},
+                {"a stream fun that returns without fin gets the terminator", fun() ->
+                    {ok, Sock} = gen_tcp:connect(
+                        {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                    ),
+                    ok = gen_tcp:send(Sock, ~"GET /unfinished HTTP/1.1\r\nHost: x\r\n\r\n"),
+                    Reply = recv_until_closed(Sock),
+                    [_Headers, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                    ?assertEqual(~"2\r\nhi\r\n0\r\n\r\n", Body),
+                    ok = gen_tcp:close(Sock)
                 end}
             ]
         end}.

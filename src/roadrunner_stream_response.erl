@@ -18,11 +18,19 @@
 %% zero-length chunk encodes as `0\r\n\r\n`, the chunked terminator,
 %% which would prematurely end the response).
 %%
-%% Pure functions, no process spawn — runs in the conn process.
+%% A fun that returns without a `fin` gets the size-0 terminator written
+%% for it, so the client sees a complete chunked body (as HTTP/2 and
+%% HTTP/3 end such a stream) instead of one the close cuts short.
+%%
+%% No process spawn — runs in the conn process.
 
 -export([run/4]).
 %% Shared with `roadrunner_loop_response`'s push.
 -export([chunk_or_empty/1]).
+
+%% Process-dict flag: set once `Send` writes a fin variant. The conn runs
+%% one stream response at a time, and `run/4` clears it first.
+-define(FIN_KEY, '$roadrunner_stream_fin').
 
 -doc """
 Send the chunked-response head, then call the user's stream fun
@@ -47,11 +55,16 @@ run(Socket, Status, UserHeaders, Fun) ->
     _ = roadrunner_event:response_send(
         roadrunner_transport:send(Socket, Head), stream_response_head
     ),
-    Send = fun(Data, FinFlag) ->
-        Frame = stream_frame(Data, FinFlag),
-        roadrunner_transport:send(Socket, Frame)
+    _ = erase(?FIN_KEY),
+    Send = fun
+        (Data, nofin) ->
+            roadrunner_transport:send(Socket, stream_frame(Data, nofin));
+        (Data, FinFlag) ->
+            _ = put(?FIN_KEY, true),
+            roadrunner_transport:send(Socket, stream_frame(Data, FinFlag))
     end,
     _ = Fun(Send),
+    _ = erase(?FIN_KEY) =:= true orelse roadrunner_transport:send(Socket, ~"0\r\n\r\n"),
     ok.
 
 %% Build the wire frame for one chunked-stream emission.

@@ -2,7 +2,8 @@
 -moduledoc """
 Test fixture — calls the stream `Send` callback with empty data
 followed by a real chunk. Documents the empty-chunk special case
-in `stream_frame/2`.
+in `stream_frame/2`, and the terminator the framework writes for a
+stream fun that returns without a `fin`.
 """.
 
 -behaviour(roadrunner_handler).
@@ -16,6 +17,14 @@ handle(#{target := ~"/fin-empty"} = Req) ->
         {stream, 200, [{~"content-type", ~"text/plain"}], fun(Send) ->
             _ = Send(~"hi", nofin),
             _ = Send(~"", fin),
+            ok
+        end},
+    {Resp, Req};
+handle(#{target := ~"/unfinished"} = Req) ->
+    %% Return without a fin: the framework ends the chunked body.
+    Resp =
+        {stream, 200, [{~"content-type", ~"text/plain"}], fun(Send) ->
+            _ = Send(~"hi", nofin),
             ok
         end},
     {Resp, Req};

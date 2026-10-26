@@ -23,7 +23,8 @@ threading `Req` through the entire request lifecycle.
   also writes the size-0 terminator and `{fin, Trailers}` writes the
   terminator followed by the given trailer headers (RFC 9112 §7.1.2).
   Trailer names should be advertised in the response's `Trailer`
-  header.
+  header. A `StreamFun` that returns without a `fin` has the stream
+  ended for it.
 - `{sendfile, StatusCode, Headers, {Filename, Offset, Length}}` —
   zero-copy file body. The connection emits status + headers
   verbatim (the handler is responsible for `Content-Length` and
