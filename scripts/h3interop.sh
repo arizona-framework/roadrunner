@@ -273,13 +273,15 @@ migrated() {
 
 # Whether the ngtcp2 client logged in `$1` got a NEW_TOKEN frame on its first
 # connection and sent that token in an Initial of its second, as the qlogs in
-# `$2/qlog` show (its packet log leaves the Initial's token out).
+# `$2/qlog` show (its packet log leaves the Initial's token out). Every stage
+# reads its whole input (no `grep -q` or `head`): under pipefail, a stage that
+# stops early makes the one feeding it die of SIGPIPE and fails the pipe.
 token_reused() {
     local token
-    token=$(sed -n 's/.* NEW_TOKEN(0x7) token=0x\([0-9a-f]*\) .*/\1/p' "$1" | head -1)
+    token=$(sed -n 's/.* NEW_TOKEN(0x7) token=0x\([0-9a-f]*\) .*/\1/p' "$1" | sed -n 1p)
     [ -n "$token" ] &&
         cat "$2"/qlog/*.sqlog | grep '"name":"transport:packet_sent"' |
-        grep -q "\"packet_type\":\"initial\",[^}]*\"token\":{\"data\":\"$token\"}"
+        grep "\"packet_type\":\"initial\",[^}]*\"token\":{\"data\":\"$token\"}" >/dev/null
 }
 
 # Whether the ngtcp2 client logged in `$1` took a datagram from the server
@@ -307,7 +309,7 @@ check_chrome() {
     done
     # shellcheck disable=SC2086
     [ "$(grep -c '^proto ' "$report")" -gt "$(echo $bodies | wc -w)" ] &&
-        ! grep '^proto ' "$report" | grep -qv ' h3$'
+        ! grep '^proto ' "$report" | grep -v ' h3$' >/dev/null
 }
 
 # Check a case's downloads in `$2`; quiche and ngtcp2 name each response file
