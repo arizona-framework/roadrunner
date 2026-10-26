@@ -80,9 +80,10 @@ tell listeners apart, match on the listener name the events carry.
   `stream`, `loop`, and `websocket` responses, after the initial
   dispatch returns. `Status` is `101` for a WebSocket upgrade. `Kind`
   is `buffered | stream | loop | sendfile | websocket`.
-- `request_exception`, `{Span, Class, Reason}`: the pipeline raised.
-  `Class` is `error | exit | throw`. The connection then answers
-  `500`.
+- `request_exception`, `{Span, Class, Reason, Stacktrace}`: the
+  pipeline raised. `Class` is `error | exit | throw`, and `Stacktrace`
+  is where it raised, as caught by `catch Class:Reason:Stacktrace`.
+  The connection then answers `500`.
 - `request_rejected`, `{ListenerName, Peer, Reason}`: a request was
   dropped by the parser or a limit before any handler ran (malformed
   request line, header injection, header count or size limits,
@@ -260,7 +261,10 @@ event. See the module documentation for each event's arguments.
 -callback handle_event
     (request_start, roadrunner_req:request()) -> span();
     (request_stop, {span(), roadrunner_http:status(), response_kind()}) -> term();
-    (request_exception, {span(), error | exit | throw, term()}) -> term();
+    (
+        request_exception,
+        {span(), error | exit | throw, term(), erlang:stacktrace()}
+    ) -> term();
     (request_rejected, {atom(), peer(), term()}) -> term();
     (request_throttled, {atom(), max_concurrent_requests | rate_limit}) -> term();
     (response_send_failed, {atom(), term()}) -> term();

@@ -142,7 +142,7 @@ invoke(
             )
     catch
         Class:Reason:Stack ->
-            ok = roadrunner_event:request_exception(Span, Class, Reason),
+            ok = roadrunner_event:request_exception(Span, Class, Reason, Stack),
             logger:error(#{
                 msg => crash_message(Protocol),
                 handler => Handler,

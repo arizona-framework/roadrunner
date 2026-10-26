@@ -412,9 +412,36 @@ method_not_allowed(_Config) ->
     end.
 
 crash_500(Config) ->
-    Conn = connect(?config(port, Config)),
-    ?assertMatch({500, _}, status_body(get(Conn, ~"/crash"))),
-    close(Conn).
+    %% The crash also emits `request_exception`, with the handler's
+    %% stacktrace, through the test handler's telemetry forwarding.
+    {ok, _} = roadrunner_test_event_handler:start(),
+    Self = self(),
+    HandlerId = make_ref(),
+    ok = telemetry:attach(
+        HandlerId,
+        [roadrunner, request, exception],
+        fun(_Event, _Measurements, Metadata, _) -> Self ! {HandlerId, Metadata} end,
+        undefined
+    ),
+    try
+        Conn = connect(?config(port, Config)),
+        ?assertMatch({500, _}, status_body(get(Conn, ~"/crash"))),
+        ok = close(Conn),
+        receive
+            {HandlerId, Metadata} ->
+                ?assertMatch(
+                    #{
+                        kind := error,
+                        reason := boom,
+                        stacktrace := [{roadrunner_h3_test_handler, handle, 1, _} | _]
+                    },
+                    Metadata
+                )
+        after 2000 -> error(no_exception_event)
+        end
+    after
+        ok = telemetry:detach(HandlerId)
+    end.
 
 interim_response_500(Config) ->
     %% A handler returning a buffered 1xx status is a misuse (RFC 9110

@@ -821,8 +821,10 @@ handler_crash_writes_500_and_fires_request_exception_test() ->
     Sent = iolist_to_binary(collect_sends(Tag, 100)),
     ?assertMatch(<<"HTTP/1.1 500", _/binary>>, Sent),
     %% start fired before exception; stop did NOT fire (crash branch).
+    %% The exception carries the stacktrace of the handler's raise.
     ?assertEqual([roadrunner, request, start], next_event_name(Tag, 200)),
-    ?assertEqual([roadrunner, request, exception], next_event_name(Tag, 200)),
+    {[roadrunner, request, exception], #{stacktrace := Stack}} = next_event(Tag, 200),
+    ?assertMatch([{roadrunner_crashing_handler, handle, 1, _} | _], Stack),
     ?assertEqual(timeout, next_event_name(Tag, 50)),
     detach_telemetry(Tag),
     Sink ! stop.
