@@ -128,7 +128,7 @@ for a stateless middleware that only needs `call/3`. A fun-form middleware
 never has an `init/1` (there's no module to host the callback).
 
 Handlers have the same hook for their route state, under the name
-`roadrunner_handler:init_route/1`.
+`c:roadrunner_handler:init_route/1`.
 
 ## Examples
 
@@ -148,11 +148,18 @@ timing(Req, Next, _State) ->
     logger:info(#{took_ms => erlang:monotonic_time(millisecond) - Start}),
     Result.
 
-%% Stateful: inject a configurable `server` header on every response.
-%% Wire it as `{fun ?MODULE:server_header/3, ~"roadrunner"}`.
+%% Stateful: inject a configurable `server` header on buffered responses.
+%% Wire it as `{fun ?MODULE:server_header/3, ~"roadrunner"}`. The
+%% `is_integer(Status)` guard matters: a `{websocket, Mod, State}` upgrade
+%% is a 3-tuple too, and stream, loop and sendfile responses have other
+%% shapes, so those pass through unchanged.
 server_header(Req, Next, Server) ->
-    {{S, H, B}, Req2} = Next(Req),
-    {{S, [{~"server", Server} | H], B}, Req2}.
+    case Next(Req) of
+        {{Status, Headers, Body}, Req2} when is_integer(Status) ->
+            {{Status, [{~"server", Server} | Headers], Body}, Req2};
+        Other ->
+            Other
+    end.
 ```
 """.
 
