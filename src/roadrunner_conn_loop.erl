@@ -1441,11 +1441,11 @@ flush_out(#loop_state{socket = Socket, out = Out} = S) ->
     roadrunner_handler:response()
 ) -> #loop_state{} | {ws_session, reference(), pid(), #loop_state{}}.
 dispatch_response(S0, _Handler, Req, {websocket, Mod, State}) when is_atom(Mod) ->
-    dispatch_websocket(S0, Req, Mod, State, []);
-dispatch_response(S0, _Handler, Req, {websocket, Mod, State, Headers}) when
-    is_atom(Mod), is_list(Headers)
+    dispatch_websocket(S0, Req, Mod, State, #{});
+dispatch_response(S0, _Handler, Req, {websocket, Mod, State, Opts}) when
+    is_atom(Mod), is_map(Opts)
 ->
-    dispatch_websocket(S0, Req, Mod, State, Headers);
+    dispatch_websocket(S0, Req, Mod, State, Opts);
 dispatch_response(
     #loop_state{socket = Socket, alt_svc = AltSvc} = S0,
     _Handler,
@@ -1563,14 +1563,18 @@ has_framing([_ | Rest]) -> has_framing(Rest);
 has_framing([]) -> false.
 
 -spec dispatch_websocket(
-    #loop_state{}, roadrunner_req:request(), module(), term(), roadrunner_http:headers()
+    #loop_state{},
+    roadrunner_req:request(),
+    module(),
+    term(),
+    roadrunner_ws_handler:upgrade_opts()
 ) -> #loop_state{} | {ws_session, reference(), pid(), #loop_state{}}.
 dispatch_websocket(
     #loop_state{socket = Socket, buffered = Buffered, proto_opts = ProtoOpts} = S0,
     Req,
     Mod,
     State,
-    Headers
+    Opts
 ) ->
     %% Queued pipelined responses must precede the 101 (or the 400/500
     %% reject) on the wire.
@@ -1579,7 +1583,7 @@ dispatch_websocket(
     %% session's lifetime is the caller's to wait out (`ws_session_wait`).
     %% A rejected upgrade (400/500 already sent, `connection: close`)
     %% falls through to the normal websocket finishing path.
-    case roadrunner_ws_session:start(Socket, Req, Mod, State, Headers, Buffered, ProtoOpts) of
+    case roadrunner_ws_session:start(Socket, Req, Mod, State, Opts, Buffered, ProtoOpts) of
         %% The flushed state rides along so the caller never re-flushes
         %% the already-written batch from a stale pre-flush state.
         {session, MRef, SessPid} -> {ws_session, MRef, SessPid, S};

@@ -150,6 +150,11 @@ deadline in milliseconds. The shed form answers it `503` with the
     %% Idle ms after which a WebSocket session hibernates; `infinity`
     %% (the default) never hibernates on idle.
     ws_hibernate_after := pos_integer() | infinity,
+    %% Whether a WebSocket upgrade accepts permessage-deflate.
+    ws_compress := boolean(),
+    %% Ms of client silence after which a WebSocket session closes;
+    %% `infinity` (the default) never does.
+    ws_idle_timeout := pos_integer() | infinity,
     request_timeout := non_neg_integer(),
     %% Bound on the TLS handshake in the accept path; see the
     %% `tls_handshake_timeout` listener opt.

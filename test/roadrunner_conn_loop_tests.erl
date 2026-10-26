@@ -1845,7 +1845,7 @@ websocket_conn_hibernates_forwards_drain_and_closes_test() ->
     Sink ! stop.
 
 websocket_upgrade_headers_reach_the_101_test() ->
-    %% `{websocket, Mod, State, Headers}`: the handler's headers ride the
+    %% `{websocket, Mod, State, #{headers => Headers}}`: the handler's headers ride the
     %% 101 after the handshake's, and an entry naming a handshake header is
     %% dropped (the computed value wins, never sent twice).
     Self = self(),
@@ -1860,7 +1860,7 @@ websocket_upgrade_headers_reach_the_101_test() ->
     >>),
     Handle = fun(Req) ->
         Headers = [{~"set-cookie", ~"sid=abc; Path=/"}, {~"upgrade", ~"not-websocket"}],
-        {{websocket, roadrunner_ws_echo_handler, no_state, Headers}, Req}
+        {{websocket, roadrunner_ws_echo_handler, no_state, #{headers => Headers}}, Req}
     end,
     Opts = (fake_opts(ws_upgrade_headers))#{
         dispatch := {handler, roadrunner_ws_upgrade_handler, Handle, undefined}
@@ -1999,6 +1999,8 @@ fake_opts(ListenerName) ->
         ws_max_message_size => 10485760,
         ws_buffer => undefined,
         ws_hibernate_after => infinity,
+        ws_compress => true,
+        ws_idle_timeout => infinity,
         request_timeout => 5000,
         keep_alive_timeout => 5000,
         max_keep_alive_requests => 100,

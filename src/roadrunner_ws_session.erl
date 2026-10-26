@@ -150,6 +150,15 @@
     %% recv_loop's `after` clause dead by the receive's own semantics —
     %% the timer never arms, so the default costs nothing per message.
     hibernate_after :: pos_integer() | infinity,
+    %% Idle timeout (the `idle_timeout` upgrade / listener opt). When set,
+    %% a timer fires every interval and the session closes if the socket's
+    %% received-byte count (`roadrunner_transport:recv_count/1`) did not
+    %% move since the last fire: nothing runs per frame. `idle_timer` is
+    %% the armed timer's reference, `undefined` with no timeout, so the
+    %% `recv_loop/1` clause matching it never fires.
+    idle_timeout :: pos_integer() | infinity,
+    idle_timer :: reference() | undefined,
+    idle_recv = 0 :: non_neg_integer(),
     msg_size = 0 :: non_neg_integer(),
     %% Trailing UTF-8 bytes carried over from a previous fragment that
     %% form the start of a multi-byte sequence whose continuation
@@ -224,12 +233,14 @@ They seed the session buffer so the first frame isn't lost.
     roadrunner_req:request(),
     module(),
     term(),
-    roadrunner_http:headers(),
+    roadrunner_ws_handler:upgrade_opts(),
     binary(),
     roadrunner_conn:proto_opts()
 ) -> {session, reference(), pid()} | rejected.
-start(Socket, Req, Mod, State, ExtraHeaders, Buffered, ProtoOpts) ->
-    case roadrunner_ws:handshake_response(roadrunner_req:headers(Req), ExtraHeaders) of
+start(Socket, Req, Mod, State, Opts, Buffered, ListenerOpts) ->
+    #{ws_compress := Compress} = ProtoOpts = session_opts(Opts, ListenerOpts),
+    Headers = roadrunner_req:headers(Req),
+    case roadrunner_ws:handshake_response(Headers, maps:get(headers, Opts, []), Compress) of
         {ok, Status, RespHeaders, _, Negotiated} ->
             UpgradeResp = roadrunner_http1:response(Status, RespHeaders, ~""),
             start_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts);
@@ -240,6 +251,36 @@ start(Socket, Req, Mod, State, ExtraHeaders, Buffered, ProtoOpts) ->
             _ = roadrunner_conn:send_bad_request(Socket),
             rejected
     end.
+
+%% The listener's `ws_*` settings with the upgrade's own options laid over
+%% them (`t:roadrunner_ws_handler:upgrade_opts/0`); `headers` goes to the
+%% handshake. An unknown option is a handler bug and crashes here.
+-spec session_opts(roadrunner_ws_handler:upgrade_opts(), roadrunner_conn:proto_opts()) ->
+    roadrunner_conn:proto_opts().
+session_opts(Opts, ListenerOpts) when map_size(Opts) =:= 0 ->
+    ListenerOpts;
+session_opts(Opts, ListenerOpts) ->
+    maps:fold(fun session_opt/3, ListenerOpts, Opts).
+
+-spec session_opt(atom(), term(), roadrunner_conn:proto_opts()) -> roadrunner_conn:proto_opts().
+session_opt(headers, _Headers, Opts) ->
+    Opts;
+session_opt(compress, V, Opts) ->
+    Opts#{ws_compress := V};
+session_opt(idle_timeout, V, Opts) ->
+    Opts#{ws_idle_timeout := V};
+session_opt(max_frame_size, V, Opts) ->
+    Opts#{ws_max_frame_size := V};
+session_opt(max_message_size, V, Opts) ->
+    Opts#{ws_max_message_size := V};
+session_opt(recv_buffer, V, Opts) ->
+    Opts#{ws_buffer := V};
+session_opt(hibernate_after, V, Opts) ->
+    Opts#{ws_hibernate_after := V};
+session_opt(Flag, V, #{handler_spawn_opts := Spawn} = Opts) when
+    Flag =:= fullsweep_after; Flag =:= max_heap_size
+->
+    Opts#{handler_spawn_opts := lists:keystore(Flag, 1, Spawn, {Flag, V})}.
 
 %% RFC 6455 §4.4: a handshake asking for a version the server doesn't
 %% speak gets an error status and a `Sec-WebSocket-Version` listing the
@@ -359,7 +400,8 @@ init_session(
             #{
                 ws_max_frame_size := MaxFrame,
                 ws_max_message_size := MaxMsg,
-                ws_hibernate_after := HibernateAfter
+                ws_hibernate_after := HibernateAfter,
+                ws_idle_timeout := IdleTimeout
             } = ProtoOpts,
             Data = #data{
                 socket = Socket,
@@ -380,6 +422,7 @@ init_session(
                 max_frame_size = MaxFrame,
                 max_message_size = MaxMsg,
                 hibernate_after = HibernateAfter,
+                idle_timeout = IdleTimeout,
                 msg_acc = undefined,
                 msg_opcode = undefined,
                 msg_compressed = false,
@@ -426,11 +469,38 @@ init_pmd({permessage_deflate, Params, _ResponseValue}) ->
 awaiting_socket(#data{has_init = true, mod = Mod, mod_state = State} = Data) ->
     receive
         socket_ready ->
-            apply_handler_result(Mod:init(State), Data, false, fun enter_frame_loop/2, normal)
+            apply_handler_result(
+                Mod:init(State), arm_idle(Data), false, fun enter_frame_loop/2, normal
+            )
     end;
 awaiting_socket(Data) ->
     receive
-        socket_ready -> enter_frame_loop(Data, false)
+        socket_ready -> enter_frame_loop(arm_idle(Data), false)
+    end.
+
+%% Arm the idle timer from the socket's received-byte count now (the
+%% session owns the socket once `socket_ready` arrives).
+-spec arm_idle(#data{}) -> #data{}.
+arm_idle(#data{idle_timeout = infinity} = Data) ->
+    Data;
+arm_idle(#data{socket = Socket} = Data) ->
+    case roadrunner_transport:recv_count(Socket) of
+        {ok, Count} -> rearm_idle(Count, Data);
+        {error, Reason} -> exit_clean({error, Reason}, Data)
+    end.
+
+-spec rearm_idle(non_neg_integer(), #data{}) -> #data{}.
+rearm_idle(Count, #data{idle_timeout = Timeout} = Data) ->
+    Data#data{idle_recv = Count, idle_timer = erlang:start_timer(Timeout, self(), ws_idle)}.
+
+%% The idle timer fired: close with 1001 if the client sent nothing since
+%% the last fire, else wait another interval.
+-spec idle_check(#data{}) -> no_return().
+idle_check(#data{socket = Socket, idle_recv = Last} = Data) ->
+    case roadrunner_transport:recv_count(Socket) of
+        {ok, Last} -> flush_and_exit(timeout, queue_frame(Data, close, <<1001:16>>));
+        {ok, Count} -> recv_loop(rearm_idle(Count, Data));
+        {error, Reason} -> exit_clean({error, Reason}, Data)
     end.
 
 %% Enter the frame loop. A client that pipelined its first frame in the
@@ -453,7 +523,9 @@ enter_frame_loop(Data, Hibernate) ->
 %% those clauses loop without re-arming. `_Sock` is discarded — one socket
 %% per session, captured in `#data.socket` at init.
 -spec recv_loop(#data{}) -> no_return().
-recv_loop(#data{socket = Socket, hibernate_after = HibernateAfter} = Data) ->
+recv_loop(
+    #data{socket = Socket, hibernate_after = HibernateAfter, idle_timer = IdleTimer} = Data
+) ->
     {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
     receive
         {system, From, Req} ->
@@ -469,6 +541,8 @@ recv_loop(#data{socket = Socket, hibernate_after = HibernateAfter} = Data) ->
             exit_clean({error, closed}, Data);
         {ErrorTag, _Sock, Reason} ->
             exit_clean({error, Reason}, Data);
+        {timeout, IdleTimer, ws_idle} ->
+            idle_check(Data);
         {roadrunner_drain, Deadline} ->
             %% Drain broadcast — dispatch to optional handle_drain/2 and
             %% drop. Drain messages never reach handle_info/2 so handlers
