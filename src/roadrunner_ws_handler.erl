@@ -151,13 +151,46 @@ Why a session ended, as `terminate/2` gets it:
 - `remote` — the client sent a close frame.
 - `shutdown` — the handler closed it from `handle_drain/2`, as the
   listener drains.
+- `timeout` — the client sent nothing for the session's `idle_timeout`
+  (`t:upgrade_opts/0`).
 - `{error, Reason}` — the connection or the client failed: `closed`
   when the socket closed without a close frame, the transport's error,
   or the close the session sent for a client error (`protocol_error`,
   `invalid_payload`, or the cap a frame or message went over:
   `max_frame_size`, `max_message_size`).
 """.
--type terminate_reason() :: normal | remote | shutdown | {error, term()}.
+-type terminate_reason() :: normal | remote | shutdown | timeout | {error, term()}.
+
+-doc """
+Options for one session, the 4th element of a `{websocket, Module, State,
+Opts}` upgrade. Each falls back to the listener's `ws` option of the same
+name (`t:roadrunner_listener:ws_opts/0`):
+
+- `headers` — added to the `101 Switching Protocols` response (e.g. a
+  `set-cookie`). The handshake's own headers (`upgrade`, `connection`,
+  `sec-websocket-accept`, `sec-websocket-extensions`) win: an entry
+  naming one of them is dropped, as is a `content-length` or
+  `transfer-encoding`, which a 1xx response must not carry.
+- `compress` — whether to accept the client's permessage-deflate offer.
+- `idle_timeout` — close the session (code 1001, `terminate/2` gets
+  `timeout`) when the client sent nothing for this many milliseconds;
+  checked once per interval, so within two of them.
+- `max_frame_size`, `max_message_size`, `recv_buffer`,
+  `hibernate_after` — as the listener's.
+- `fullsweep_after`, `max_heap_size` — the session process's garbage
+  collection settings (`erlang:spawn_opt/4`).
+""".
+-type upgrade_opts() :: #{
+    headers => roadrunner_http:headers(),
+    compress => boolean(),
+    idle_timeout => pos_integer() | infinity,
+    max_frame_size => non_neg_integer(),
+    max_message_size => non_neg_integer(),
+    recv_buffer => pos_integer(),
+    hibernate_after => pos_integer() | infinity,
+    fullsweep_after => non_neg_integer(),
+    max_heap_size => erlang:max_heap_size()
+}.
 
 -doc """
 Optional. Runs once in the session process as the session ends, after
@@ -173,4 +206,4 @@ It is not called when a callback crashes, or when the session is killed
 
 -optional_callbacks([init/1, handle_info/2, handle_drain/2, terminate/2]).
 
--export_type([opt/0, result/0, terminate_reason/0]).
+-export_type([opt/0, result/0, terminate_reason/0, upgrade_opts/0]).

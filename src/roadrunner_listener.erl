@@ -766,12 +766,24 @@ WebSocket session tunables (under `ws` in the listener opts).
   session never pays — the next frame arrives before the timer.
   Unset (the default) never hibernates on idle; handlers can still
   opt in per event via the `hibernate` return option.
+- `compress` — whether to accept a client's permessage-deflate offer
+  (RFC 7692). Default `true`.
+- `idle_timeout` — close a session whose client sent nothing for this
+  many milliseconds, with close code 1001; the handler's `terminate/2`
+  gets `timeout`. The session checks once per interval, so a silent
+  client is closed between one and two intervals after its last bytes.
+  Unset (the default) never closes on idle.
+
+An upgrade can set each of these for its own session
+(`t:roadrunner_ws_handler:upgrade_opts/0`).
 """.
 -type ws_opts() :: #{
     max_frame_size => 0..16#7FFFFFFF,
     max_message_size => 0..16#7FFFFFFF,
     recv_buffer => 1..16#7FFFFFFF,
-    hibernate_after => 1..16#7FFFFFFF
+    hibernate_after => 1..16#7FFFFFFF,
+    compress => boolean(),
+    idle_timeout => 1..16#7FFFFFFF
 }.
 
 -record(state, {
@@ -1649,7 +1661,9 @@ build_proto_opts(Opts, ListenerName) ->
         max_frame_size := WsFrame,
         max_message_size := WsMsg,
         recv_buffer := WsBuffer,
-        hibernate_after := WsHibernateAfter
+        hibernate_after := WsHibernateAfter,
+        compress := WsCompress,
+        idle_timeout := WsIdleTimeout
     } =
         validate_ws_opts(maps:get(ws, Opts, #{})),
     %% Flatten the nested `handler_spawn` opt to top-level proto_opts keys the
@@ -1665,6 +1679,8 @@ build_proto_opts(Opts, ListenerName) ->
             ws_max_message_size => WsMsg,
             ws_buffer => WsBuffer,
             ws_hibernate_after => WsHibernateAfter,
+            ws_compress => WsCompress,
+            ws_idle_timeout => WsIdleTimeout,
             request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
             tls_handshake_timeout =>
                 maps:get(tls_handshake_timeout, Opts, ?DEFAULT_TLS_HANDSHAKE_TIMEOUT),
@@ -2132,7 +2148,9 @@ flatten_http3_opts(Entries) ->
         max_frame_size := non_neg_integer(),
         max_message_size := non_neg_integer(),
         recv_buffer := undefined,
-        hibernate_after := infinity
+        hibernate_after := infinity,
+        compress := true,
+        idle_timeout := infinity
     }.
 ws_defaults() ->
     #{
@@ -2144,7 +2162,10 @@ ws_defaults() ->
         %% `infinity` = the session's receive never times out into a
         %% hibernate — the `after infinity` clause is dead by the
         %% receive's own semantics, so the default costs nothing.
-        hibernate_after => infinity
+        hibernate_after => infinity,
+        compress => true,
+        %% `infinity` = no idle timer is armed.
+        idle_timeout => infinity
     }.
 
 %% Resolve the `ws` opts map against defaults, rejecting unknown keys
@@ -2157,7 +2178,9 @@ ws_defaults() ->
         max_frame_size := non_neg_integer(),
         max_message_size := non_neg_integer(),
         recv_buffer := pos_integer() | undefined,
-        hibernate_after := pos_integer() | infinity
+        hibernate_after := pos_integer() | infinity,
+        compress := boolean(),
+        idle_timeout := pos_integer() | infinity
     }.
 validate_ws_opts(Opts) when is_map(Opts) ->
     Defaults = ws_defaults(),
@@ -2182,8 +2205,20 @@ validate_ws_opts(Other) ->
 %% (reject every frame / message); `recv_buffer` and `hibernate_after`
 %% are a buffer size and an idle interval, so zero is meaningless and
 %% rejected for both.
--spec valid_ws_opt(max_frame_size | max_message_size | recv_buffer | hibernate_after, term()) ->
+-spec valid_ws_opt(
+    max_frame_size
+    | max_message_size
+    | recv_buffer
+    | hibernate_after
+    | compress
+    | idle_timeout,
+    term()
+) ->
     boolean().
+valid_ws_opt(compress, V) ->
+    is_boolean(V);
+valid_ws_opt(idle_timeout, V) ->
+    is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
 valid_ws_opt(recv_buffer, V) ->
     is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
 valid_ws_opt(hibernate_after, V) ->

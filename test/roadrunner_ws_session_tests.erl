@@ -17,7 +17,7 @@ start_with_unloadable_handler_sends_500_and_no_101_test() ->
         upgrade_req(),
         this_module_does_not_exist_xyz_42,
         undefined,
-        [],
+        #{},
         <<>>,
         ws_proto_opts()
     ),
@@ -39,7 +39,7 @@ start_with_bad_handshake_still_returns_400_test() ->
         request_id => undefined
     },
     rejected = roadrunner_ws_session:start(
-        {fake, Sink}, Req, roadrunner_ws_echo_handler, undefined, [], <<>>, ws_proto_opts()
+        {fake, Sink}, Req, roadrunner_ws_echo_handler, undefined, #{}, <<>>, ws_proto_opts()
     ),
     Sent = iolist_to_binary(collect_sends(Tag, 100)),
     Sink ! stop,
@@ -61,7 +61,7 @@ start_with_unsupported_version_sends_426_test() ->
         )
     },
     rejected = roadrunner_ws_session:start(
-        {fake, Sink}, Req, roadrunner_ws_echo_handler, undefined, [], <<>>, ws_proto_opts()
+        {fake, Sink}, Req, roadrunner_ws_echo_handler, undefined, #{}, <<>>, ws_proto_opts()
     ),
     Sent = iolist_to_binary(collect_sends(Tag, 100)),
     Sink ! stop,
@@ -85,7 +85,7 @@ ws_buffer_opt_applied_before_101_test() ->
         upgrade_req(),
         roadrunner_ws_echo_handler,
         undefined,
-        [],
+        #{},
         frame(close, <<1000:16>>),
         (ws_proto_opts())#{ws_buffer := 4096}
     ),
@@ -121,7 +121,7 @@ ws_buffer_opt_unset_leaves_socket_buffer_alone_test() ->
         upgrade_req(),
         roadrunner_ws_echo_handler,
         undefined,
-        [],
+        #{},
         frame(close, <<1000:16>>),
         ws_proto_opts()
     ),
@@ -843,7 +843,7 @@ start_hands_back_a_session_the_caller_drives_test() ->
         upgrade_req(),
         roadrunner_ws_lifecycle_handler,
         State,
-        [],
+        #{},
         <<>>,
         ws_proto_opts()
     ),
@@ -2353,6 +2353,8 @@ ws_proto_opts(MaxFrame, MaxMsg) ->
         ws_max_message_size => MaxMsg,
         ws_buffer => undefined,
         ws_hibernate_after => infinity,
+        ws_compress => true,
+        ws_idle_timeout => infinity,
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         handler_start_timeout => infinity
@@ -2854,3 +2856,28 @@ await_terminated(Sink) ->
             {Reason, maps:without([report, close_on_frame], State)}
     after 2000 -> error(no_terminate)
     end.
+
+idle_timeout_test_() ->
+    {spawn, [
+        {"a silent client closes the session with 1001", fun() ->
+            {_Pid, Sink} = terminate_session([], #{}, idle_proto_opts()),
+            ?assertMatch({timeout, _}, await_terminated(Sink))
+        end},
+        {"socket gone when arming", fun() ->
+            {Pid, Sink} = start_terminate_session([], #{}, idle_proto_opts()),
+            exit(Sink, kill),
+            erlang:demonitor(monitor(process, Sink), [flush]),
+            Pid ! socket_ready,
+            ?assertMatch({{error, einval}, _}, await_terminated(Sink))
+        end},
+        {"socket gone when the timer fires", fun() ->
+            {Pid, Sink} = terminate_session([], #{}, idle_proto_opts()),
+            %% Answered only from the frame loop, so the timer is armed.
+            _ = sys:get_state(Pid),
+            exit(Sink, kill),
+            ?assertMatch({{error, einval}, _}, await_terminated(Sink))
+        end}
+    ]}.
+
+idle_proto_opts() ->
+    (ws_proto_opts())#{ws_idle_timeout := 50}.

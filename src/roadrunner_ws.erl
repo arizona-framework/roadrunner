@@ -16,7 +16,7 @@ frames.
 
 -on_load(init_patterns/0).
 
--export([accept_key/1, handshake_response/2]).
+-export([accept_key/1, handshake_response/3]).
 -export([parse_frame/1, parse_frame/2]).
 -export([parse_frame_known/3]).
 -export([peek_frame_header/2]).
@@ -160,8 +160,11 @@ accept_key(Key) when is_binary(Key) ->
 %% The session uses this to set up zlib state. The agreed extension's
 %% response header is already in `Headers`.
 %%
-%% `Extra` are the handler's own 101 headers (the
-%% `{websocket, Module, State, Headers}` shape). They become the tail of
+%% `Compress` is the session's `compress` setting: `false` declines any
+%% extension offer (`Negotiated` is `none`) without parsing it.
+%%
+%% `Extra` are the handler's own 101 headers (the upgrade options'
+%% `headers`). They become the tail of
 %% the response list, so the common no-extra case allocates nothing more.
 %% Handshake names are dropped from them: the server computes those, and
 %% only the server can negotiate an extension, so a handler-set
@@ -169,7 +172,7 @@ accept_key(Key) when is_binary(Key) ->
 %% `content-length` and `transfer-encoding`, which a server MUST NOT send
 %% in a 1xx response (RFC 9110 §8.6, RFC 9112 §6.1).
 -doc false.
--spec handshake_response(roadrunner_http:headers(), roadrunner_http:headers()) ->
+-spec handshake_response(roadrunner_http:headers(), roadrunner_http:headers(), boolean()) ->
     {ok, roadrunner_http:status(), roadrunner_http:headers(), iodata(), negotiated()}
     | {error,
         missing_websocket_upgrade
@@ -177,18 +180,22 @@ accept_key(Key) when is_binary(Key) ->
         | missing_websocket_key
         | missing_websocket_version
         | unsupported_websocket_version}.
-handshake_response(Headers, Extra) when is_list(Headers) ->
+handshake_response(Headers, Extra, Compress) when is_list(Headers) ->
     case validate_upgrade(Headers) of
         {ok, Key} ->
             Accept = accept_key(Key),
-            Negotiated = negotiate_extensions(
-                parse_extensions(header_lookup(~"sec-websocket-extensions", Headers))
-            ),
+            Negotiated = negotiated(Compress, Headers),
             RespHeaders = build_handshake_headers(Accept, Negotiated, handler_headers(Extra)),
             {ok, 101, RespHeaders, ~"", Negotiated};
         {error, _} = Err ->
             Err
     end.
+
+-spec negotiated(boolean(), roadrunner_http:headers()) -> negotiated().
+negotiated(false, _Headers) ->
+    none;
+negotiated(true, Headers) ->
+    negotiate_extensions(parse_extensions(header_lookup(~"sec-websocket-extensions", Headers))).
 
 -spec build_handshake_headers(binary(), negotiated(), roadrunner_http:headers()) ->
     roadrunner_http:headers().
@@ -209,7 +216,7 @@ build_handshake_headers(Accept, {permessage_deflate, _, ResponseValue}, Tail) ->
     ].
 
 %% The handler's 101 headers minus the handshake's own names (see
-%% `handshake_response/2`) and the framing fields a 1xx response must not
+%% `handshake_response/3`) and the framing fields a 1xx response must not
 %% carry (RFC 9110 §8.6, RFC 9112 §6.1). Literal clause heads, so the compiler matches
 %% each name in one decision tree instead of a list scan per header.
 -spec handler_headers(roadrunner_http:headers()) -> roadrunner_http:headers().

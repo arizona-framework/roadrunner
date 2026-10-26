@@ -41,12 +41,11 @@ threading `Req` through the entire request lifecycle.
   and closes. Useful for SSE/long-poll endpoints that subscribe to a
   pubsub topic in `handle/1` and forward messages to the wire.
 - `{websocket, Module, State}` — upgrade to a `roadrunner_ws_handler`.
-- `{websocket, Module, State, Headers}` — the same upgrade, with `Headers`
-  added to the `101 Switching Protocols` response (e.g. a `set-cookie`).
-  The handshake's own headers (`upgrade`, `connection`,
-  `sec-websocket-accept`, `sec-websocket-extensions`) win: an entry
-  naming one of them is dropped, as is a `content-length` or
-  `transfer-encoding`, which a 1xx response must not carry.
+- `{websocket, Module, State, Opts}` — the same upgrade, with options
+  for this session (`t:roadrunner_ws_handler:upgrade_opts/0`): headers
+  added to the `101 Switching Protocols` response (e.g. a `set-cookie`),
+  compression, an idle timeout, size caps and process tuning, each
+  falling back to the listener's `ws` options.
 - `{send, Headers, Fun}` — the handler sends the response itself, as
   it runs. The connection calls `Fun(Req)`, which sends it with
   `roadrunner_send` (interim 1xx responses, then a complete, streamed
@@ -153,7 +152,7 @@ it come after the status is sent, so the stream is reset instead.
     | {loop, StatusCode :: roadrunner_http:status(), roadrunner_http:headers(), State :: term()}
     | {sendfile, StatusCode :: roadrunner_http:status(), roadrunner_http:headers(), sendfile_spec()}
     | {websocket, Module :: module(), State :: term()}
-    | {websocket, Module :: module(), State :: term(), roadrunner_http:headers()}
+    | {websocket, Module :: module(), State :: term(), roadrunner_ws_handler:upgrade_opts()}
     | {send, roadrunner_http:headers(), roadrunner_send:sender()}.
 
 -doc """

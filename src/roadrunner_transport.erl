@@ -54,6 +54,7 @@
     sockname/1,
     peercert/1,
     tls_info/1,
+    recv_count/1,
     port/1,
     sendfile/4,
     setopts/2,
@@ -296,6 +297,32 @@ tls_info({gen_tcp, _S}) ->
     {error, not_tls};
 tls_info({ssl, S}) ->
     ssl:connection_information(S).
+
+-doc """
+Return the bytes received on the socket so far (the `recv_oct`
+statistic). On TLS it counts the encrypted bytes, which is enough to
+tell whether the peer sent anything.
+""".
+-spec recv_count(socket()) -> {ok, non_neg_integer()} | {error, term()}.
+recv_count({gen_tcp, S}) ->
+    recv_oct(inet:getstat(S, [recv_oct]));
+recv_count({ssl, S}) ->
+    recv_oct(ssl:getstat(S, [recv_oct]));
+recv_count({fake, Pid}) ->
+    %% A fixed count while the sink lives (the fake peer never sends
+    %% between checks), the dead-socket error once it is gone, as the
+    %% fake `setopts/2` does.
+    recv_oct(
+        case is_process_alive(Pid) of
+            true -> {ok, [{recv_oct, 0}]};
+            false -> {error, einval}
+        end
+    ).
+
+-spec recv_oct({ok, [{recv_oct, non_neg_integer()}]} | {error, term()}) ->
+    {ok, non_neg_integer()} | {error, term()}.
+recv_oct({ok, [{recv_oct, N}]}) -> {ok, N};
+recv_oct({error, _} = Error) -> Error.
 
 -doc "Return the locally-bound port of a listening or connected socket.".
 -spec port(socket()) -> {ok, inet:port_number()} | {error, term()}.

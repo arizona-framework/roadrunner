@@ -594,12 +594,12 @@ Notable differences:
   Fragmented messages arrive whole, and ping, pong, and close are handled for
   you, so they never reach the handler
 - To refuse the upgrade, return a normal response from `handle/1` instead
-- To add headers to the `101` (a `sec-websocket-protocol` or a cookie), return
-  `{websocket, Mod, State, Headers}`
-- `permessage-deflate` is used when the client asks for it; there is no
-  `compress` option to set
-- Frame and message size limits are listener options under `ws`
-  (`max_frame_size`, `max_message_size`), not per upgrade
+- Cowboy's per-upgrade options go in a map: `{websocket, Mod, State, Opts}`.
+  `headers` adds headers to the `101` (a `sec-websocket-protocol` or a
+  cookie); `compress`, `idle_timeout`, `max_frame_size`, `max_message_size`
+  and the rest override the listener's `ws` options for this session
+- `permessage-deflate` is used when the client asks for it, unless
+  `compress` is `false`
 - An optional `handle_drain/2` callback runs when the listener drains
 - The upgrade runs over HTTP/1.1
 
@@ -745,7 +745,6 @@ cover each one.
   a middleware can cover your own cases
 - **`terminate/3`** in HTTP handlers: there is no such callback (WebSocket
   handlers have an optional `terminate/2`)
-- **WebSocket idle timeout** (`idle_timeout`): there is no option for it
 - **WebSockets over HTTP/2 and HTTP/3**: a `{websocket, ...}` response on
   those protocols answers `501`; WebSocket clients connect over HTTP/1.1
 - **`cowboy_req:cert/1`, `sock/1` and `port/1`** (TLS client certificate,

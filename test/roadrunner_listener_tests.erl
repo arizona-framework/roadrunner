@@ -682,7 +682,13 @@ listener_rejects_invalid_ws_opt_test() ->
             #{hibernate_after => 0},
             #{hibernate_after => -1},
             #{hibernate_after => bad},
-            #{hibernate_after => 16#80000000}
+            #{hibernate_after => 16#80000000},
+            %% `compress` is a boolean; `idle_timeout` an interval like
+            %% `hibernate_after`.
+            #{compress => yes},
+            #{idle_timeout => 0},
+            #{idle_timeout => bad},
+            #{idle_timeout => 16#80000000}
         ]
     ).
 
@@ -692,7 +698,9 @@ listener_accepts_ws_session_opts_test() ->
     %% in `roadrunner_ws_session_tests`.
     {ok, Pid} = roadrunner_listener:start_link(listener_test_ws_session_opts_ok, #{
         port => 0,
-        ws => #{recv_buffer => 2048, hibernate_after => 15000},
+        ws => #{
+            recv_buffer => 2048, hibernate_after => 15000, compress => false, idle_timeout => 30000
+        },
         routes => roadrunner_hello_handler
     }),
     ?assert(is_process_alive(Pid)),
