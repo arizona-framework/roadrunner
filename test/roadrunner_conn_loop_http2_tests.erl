@@ -3375,7 +3375,10 @@ telemetry_request_exception_fires_on_h2_handler_crash() ->
             {telemetry_event, [roadrunner, request, exception], M, Md} ->
                 ?assert(is_integer(maps:get(duration, M))),
                 ?assertEqual(error, maps:get(kind, Md)),
-                ?assertEqual(boom, maps:get(reason, Md))
+                ?assertEqual(boom, maps:get(reason, Md)),
+                ?assertMatch(
+                    #{stacktrace := [{roadrunner_h2_test_handler, handle, 1, _} | _]}, Md
+                )
         after 500 -> error(no_exception_event)
         end,
         cleanup(Pid, Ref)

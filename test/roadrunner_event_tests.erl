@@ -346,7 +346,10 @@ request_exception_fires_on_handler_crash_test_() ->
                 ),
                 ?assert(is_integer(maps:get(duration, ExcM))),
                 ?assertEqual(error, maps:get(kind, ExcMd)),
-                ?assertEqual(boom, maps:get(reason, ExcMd))
+                ?assertEqual(boom, maps:get(reason, ExcMd)),
+                ?assertMatch(
+                    #{stacktrace := [{roadrunner_crashing_handler, handle, 1, _} | _]}, ExcMd
+                )
             after
                 detach(HandlerId)
             end

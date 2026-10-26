@@ -1201,7 +1201,7 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
             end
     catch
         Class:Reason:Stack ->
-            ok = roadrunner_event:request_exception(Span, Class, Reason),
+            ok = roadrunner_event:request_exception(Span, Class, Reason, Stack),
             logger:error(#{
                 msg => "roadrunner handler crashed",
                 handler => Handler,

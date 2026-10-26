@@ -35,11 +35,11 @@ handle_event(request_stop, {{StartMono, Metadata}, Status, Kind}) ->
         #{duration => erlang:monotonic_time() - StartMono},
         Metadata#{status => Status, response_kind => Kind}
     );
-handle_event(request_exception, {{StartMono, Metadata}, Class, Reason}) ->
+handle_event(request_exception, {{StartMono, Metadata}, Class, Reason, Stacktrace}) ->
     telemetry:execute(
         [roadrunner, request, exception],
         #{duration => erlang:monotonic_time() - StartMono},
-        Metadata#{kind => Class, reason => Reason}
+        Metadata#{kind => Class, reason => Reason, stacktrace => Stacktrace}
     );
 handle_event(request_rejected, {ListenerName, Peer, Reason}) ->
     now_event([roadrunner, request, rejected], #{

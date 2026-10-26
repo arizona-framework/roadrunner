@@ -18,7 +18,7 @@
     put_handler/1,
     request_start/1,
     request_stop/3,
-    request_exception/3,
+    request_exception/4,
     response_send/2,
     listener_accept/2,
     listener_conn_close/3,
@@ -106,10 +106,11 @@ request_stop(Span, Status, Kind) ->
     ok.
 
 -doc "Emit `request_exception` for the span `request_start/1` returned.".
--spec request_exception(roadrunner_event_handler:span(), error | exit | throw, term()) ->
-    ok.
-request_exception(Span, Class, Reason) ->
-    _ = dispatch(request_exception, {Span, Class, Reason}),
+-spec request_exception(
+    roadrunner_event_handler:span(), error | exit | throw, term(), erlang:stacktrace()
+) -> ok.
+request_exception(Span, Class, Reason, Stacktrace) ->
+    _ = dispatch(request_exception, {Span, Class, Reason, Stacktrace}),
     ok.
 
 -doc """
