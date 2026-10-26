@@ -323,6 +323,7 @@ authority_and_equal_host_leave_one_host_test() ->
 request_context() ->
     #{
         peer => {{127, 0, 0, 1}, 12345},
+        conn_info => fun(_Query) -> {error, unavailable} end,
         scheme => https,
         listener_name => h2_test,
         request_id => ~"abc123"

@@ -100,6 +100,11 @@ loop(State) ->
             loop(State);
         {'$gen_cast', _Request} ->
             loop(State);
+        {quic_call, From, Ref, sockname} ->
+            %% The local address is the shared socket's, which only the shell
+            %% holds; the core never needs it.
+            _ = (From ! {quic_reply, Ref, roadrunner_quic_socket:sockname(State#shell.socket)}),
+            loop(State);
         {quic_call, From, Ref, Request} ->
             Now = erlang:monotonic_time(millisecond),
             {Conn, Effects} = roadrunner_quic_conn_state:handle_call(

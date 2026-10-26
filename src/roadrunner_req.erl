@@ -21,7 +21,7 @@ re-exported alongside it (`headers/0`, `version/0`, `status/0`,
 
 -include("roadrunner_swar.hrl").
 
--export_type([request/0, body_reader/0, cached_decisions/0, private/0]).
+-export_type([request/0, body_reader/0, cached_decisions/0, private/0, conn_info/0]).
 
 -doc """
 The parsed request map handlers receive.
@@ -69,6 +69,10 @@ care which protocol delivered the bytes.
     %% `roadrunner_router`, set by `roadrunner_conn` before dispatch.
     %% Empty map for single-handler dispatch or routes with no params.
     bindings => roadrunner_router:bindings(),
+    %% How `sockname/1`, `peercert/1` and `tls_info/1` read the
+    %% connection, built once per connection: it asks the socket (or the
+    %% QUIC connection) only when one of them is called.
+    conn_info => conn_info(),
     %% Client TCP peer captured once per connection from
     %% `inet:peername/1`. `undefined` when the OS call fails (rare;
     %% usually socket teardown).
@@ -120,6 +124,14 @@ care which protocol delivered the bytes.
 }.
 
 -type headers() :: roadrunner_http:headers().
+
+-doc """
+The connection queries a request carries on its `conn_info` field, read
+through `sockname/1`, `peercert/1` and `tls_info/1`. Built once per
+connection by the framework; it reads the connection only when called.
+""".
+-type conn_info() :: fun((sockname | peercert | tls_info) -> {ok, term()} | {error, term()}).
+
 -type version() :: roadrunner_http:version().
 
 -doc """
@@ -218,6 +230,9 @@ and `done` flips true with the stream's end.
     read_form/1,
     bindings/1,
     peer/1,
+    sockname/1,
+    peercert/1,
+    tls_info/1,
     client_ip/1,
     forwarded_for/1,
     scheme/1,
@@ -605,6 +620,42 @@ can reach the listener directly would let that peer spoof its own address.
     {inet:ip_address(), inet:port_number()} | undefined.
 peer(#{peer := P}) -> P;
 peer(_) -> undefined.
+
+-doc """
+Return the server's local address the request came in on: the listening
+address and port the client connected to. Read from the socket when called,
+not per request. Returns `{error, unavailable}` for a request map built
+outside the connection pipeline.
+""".
+-spec sockname(request()) ->
+    {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+sockname(#{conn_info := ConnInfo}) -> ConnInfo(sockname);
+sockname(_) -> {error, unavailable}.
+
+-doc """
+Return the client's TLS certificate (DER), as the TLS handshake received
+it. `{error, no_peercert}` when the client sent none (the listener's
+`tls` options decide whether one is asked for: `verify => verify_peer`),
+`{error, not_tls}` on a plain connection. HTTP/3 does not ask clients for
+a certificate, so it answers `{error, no_peercert}`. Returns
+`{error, unavailable}` for a request map built outside the connection
+pipeline.
+""".
+-spec peercert(request()) -> {ok, public_key:der_encoded()} | {error, term()}.
+peercert(#{conn_info := ConnInfo}) -> ConnInfo(peercert);
+peercert(_) -> {error, unavailable}.
+
+-doc """
+Return the TLS session information, in the shape of
+`ssl:connection_information/1`: at least `protocol` and
+`selected_cipher_suite`. `{error, not_tls}` on a plain connection.
+HTTP/3 reports TLS 1.3 and its negotiated cipher suite. Returns
+`{error, unavailable}` for a request map built outside the connection
+pipeline.
+""".
+-spec tls_info(request()) -> {ok, ssl:connection_info()} | {error, term()}.
+tls_info(#{conn_info := ConnInfo}) -> ConnInfo(tls_info);
+tls_info(_) -> {error, unavailable}.
 
 -doc """
 Return the client's IP address.

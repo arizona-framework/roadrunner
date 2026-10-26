@@ -60,6 +60,7 @@
     expects_continue/1,
     refine_conn_label/2,
     scheme/1,
+    conn_info/1,
     make_body_reader/5,
     stream_body_reader/5,
     with_body_reader/5,
@@ -861,6 +862,18 @@ peer(Socket) ->
     case roadrunner_transport:peername(Socket) of
         {ok, Peer} -> Peer;
         {error, _} -> undefined
+    end.
+
+%% The connection's `t:roadrunner_req:conn_info/0`, built once per
+%% connection and carried on each request: it reads the socket only when
+%% `roadrunner_req:sockname/1`, `peercert/1` or `tls_info/1` asks.
+-doc false.
+-spec conn_info(roadrunner_transport:socket()) -> roadrunner_req:conn_info().
+conn_info(Socket) ->
+    fun
+        (sockname) -> roadrunner_transport:sockname(Socket);
+        (peercert) -> roadrunner_transport:peercert(Socket);
+        (tls_info) -> roadrunner_transport:tls_info(Socket)
     end.
 
 -doc false.

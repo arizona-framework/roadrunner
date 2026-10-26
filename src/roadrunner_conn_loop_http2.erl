@@ -234,6 +234,8 @@
     proto_opts :: roadrunner_conn:proto_opts(),
     listener_name :: atom(),
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
+    %% The connection queries each request carries, built once.
+    conn_info :: roadrunner_req:conn_info(),
     %% The event handler's span from `listener_accept`, fired by the
     %% HTTP/1.1 fork before `enter/6`.
     conn_span :: roadrunner_event_handler:span(),
@@ -416,6 +418,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         proto_opts = ProtoOpts,
         listener_name = ListenerName,
         peer = Peer,
+        conn_info = roadrunner_conn:conn_info(Socket),
         conn_span = ConnSpan,
         scheme = Scheme,
         msg_data = Data,
@@ -1649,6 +1652,7 @@ dispatch_request(
     #loop{
         streams = Streams,
         peer = Peer,
+        conn_info = ConnInfo,
         scheme = Scheme,
         listener_name = ListenerName,
         max_concurrent_requests = MaxConcReq,
@@ -1659,6 +1663,7 @@ dispatch_request(
     {RequestId, NewBuf} = roadrunner_conn:generate_request_id(State#loop.req_id_buffer),
     RequestContext = #{
         peer => Peer,
+        conn_info => ConnInfo,
         scheme => Scheme,
         listener_name => ListenerName,
         request_id => RequestId

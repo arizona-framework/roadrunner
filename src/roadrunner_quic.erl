@@ -21,6 +21,8 @@
 
 -export([
     peername/1,
+    sockname/1,
+    tls_info/1,
     open_unidirectional_stream/1,
     send_data/4,
     send_final/3,
@@ -36,6 +38,19 @@
 -spec peername(pid()) -> {ok, {inet:ip_address(), inet:port_number()}}.
 peername(Conn) ->
     call(Conn, peername).
+
+-doc "The connection's local address: the listener socket's address and port.".
+-spec sockname(pid()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+sockname(Conn) ->
+    call(Conn, sockname).
+
+-doc """
+The connection's TLS session, in the shape of `ssl:connection_information/1`:
+`protocol` (always TLS 1.3, RFC 9001 §4.2) and `selected_cipher_suite`.
+""".
+-spec tls_info(pid()) -> {ok, ssl:connection_info()}.
+tls_info(Conn) ->
+    call(Conn, tls_info).
 
 -doc """
 Allocate a server-initiated unidirectional stream id (the h3 control/encoder/decoder

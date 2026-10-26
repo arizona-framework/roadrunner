@@ -75,6 +75,7 @@ accessors that operate on it.
 %% build a request.
 -type request_context() :: #{
     peer := {inet:ip_address(), inet:port_number()} | undefined,
+    conn_info := roadrunner_req:conn_info(),
     scheme := http | https,
     request_id := binary(),
     listener_name := atom()
@@ -831,6 +832,7 @@ build_request(Version, Method, Path, Authority, Regular, Body, RequestContext) -
         end,
     #{
         peer := Peer,
+        conn_info := ConnInfo,
         scheme := Scheme,
         request_id := RequestId,
         listener_name := ListenerName
@@ -844,6 +846,7 @@ build_request(Version, Method, Path, Authority, Regular, Body, RequestContext) -
         body => Body,
         bindings => #{},
         peer => Peer,
+        conn_info => ConnInfo,
         scheme => Scheme,
         request_id => RequestId,
         listener_name => ListenerName
