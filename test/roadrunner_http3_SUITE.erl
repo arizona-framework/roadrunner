@@ -114,6 +114,9 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     drain_resends_a_lost_response_before_closing/1,
     drain_released_by_peer_stop_sending/1,
     drain_released_by_peer_reset/1,
+    drain_reaches_loop_handler/1,
+    drain_reaches_loop_worker_once/1,
+    drain_reaches_workers_started_after_it/1,
     crashed_worker_frees_its_slot/1
 ]).
 
@@ -223,6 +226,9 @@ all() ->
         drain_resends_a_lost_response_before_closing,
         drain_released_by_peer_stop_sending,
         drain_released_by_peer_reset,
+        drain_reaches_loop_handler,
+        drain_reaches_loop_worker_once,
+        drain_reaches_workers_started_after_it,
         crashed_worker_frees_its_slot
     ].
 
@@ -265,6 +271,7 @@ init_per_testcase(Case, Config) when
     Case =:= max_concurrent_requests_queue_stale_grant;
     Case =:= max_concurrent_requests_queue_survives_drain;
     Case =:= crashed_worker_frees_its_slot;
+    Case =:= drain_reaches_loop_handler;
     Case =:= extra_data_after_413;
     Case =:= refused_request_with_fin_is_dropped;
     Case =:= oversized_headers_431;
@@ -1964,6 +1971,61 @@ drain_released_by_peer_reset(Config) ->
     {Conn, StreamId} = drain_with_held_response(Config),
     ok = roadrunner_quic_test_conn:reset_stream(Conn, StreamId, 16#10c),
     ?assertEqual(16#100, ll_await_close_code(Conn)).
+
+drain_reaches_loop_handler(_Config) ->
+    %% The conn loop passes the listener's drain on to the stream worker, so
+    %% a `{loop, ...}` handler sees `{roadrunner_drain, _}` in
+    %% `handle_info/3`, as it does on HTTP/1.1, and stops: its stream ends
+    %% with a FIN and `drain/2` finishes before the deadline.
+    Name = listener_name(drain_reaches_loop_handler),
+    {ok, _} = start_h3(Name, #{routes => [{~"/loop", roadrunner_drain_handler, #{}}]}),
+    Conn = ll_connect(roadrunner_listener:port(Name)),
+    StreamId = ll_send(Conn, request_frame(~"/loop"), true),
+    Acc = await_stream_bytes(Conn, StreamId, ~"started", <<>>),
+    ?assertEqual({ok, drained}, roadrunner_listener:drain(Name, 5000)),
+    {fin, Bytes} = ll_collect_until_end(Conn, StreamId, Acc),
+    ?assertEqual({200, ~"started"}, ll_decode(Bytes)),
+    ll_close(Conn).
+
+drain_reaches_loop_worker_once(Config) ->
+    %% A repeated drain message is passed on only once: the handler counts
+    %% each drain it sees, and its `bye(1)` shows it saw one. The rejected
+    %% request proves the conn loop read both drains before the stop.
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/loop")),
+    Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
+    [LoopPid] = drain_members(?config(listener, Config)),
+    LoopPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5000},
+    LoopPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5000},
+    Rejected = ll_send(Conn, request_frame(~"/"), true),
+    ?assertEqual(16#10b, ll_await_reset(Conn, Rejected)),
+    Worker ! stop,
+    {200, _Headers, Body} = collect(Conn, StreamId),
+    ?assertEqual(~"data: drain\n\ndata: bye(1)\n\n", Body),
+    close(Conn).
+
+drain_reaches_workers_started_after_it(Config) ->
+    %% Requests opened before the GOAWAY are still served, and a worker
+    %% started once the drain began (here, at the stream's FIN) gets the
+    %% drain message as it starts. The loop sees it; the buffered answer
+    %% leaves it unread and completes as usual.
+    Conn = connect(?config(port, Config)),
+    {ok, LoopId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/loop"), false),
+    {ok, PlainId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/"), false),
+    %% Served after both HEADERS, so the conn loop has read them.
+    ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
+    [LoopPid] = drain_members(?config(listener, Config)),
+    LoopPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5000},
+    {goaway, GoawayId} = await_goaway(Conn),
+    ?assert(GoawayId > LoopId andalso GoawayId > PlainId),
+    ok = roadrunner_quic_test_conn:send(Conn, PlainId, <<>>, true),
+    ok = roadrunner_quic_test_conn:send(Conn, LoopId, <<>>, true),
+    ?assertEqual({200, ~"ok"}, status_body(collect(Conn, PlainId))),
+    Worker = wait_for_register(roadrunner_h3_loop_test, 1000),
+    Worker ! stop,
+    {200, _Headers, Body} = collect(Conn, LoopId),
+    ?assertEqual(~"data: drain\n\ndata: bye(1)\n\n", Body),
+    close(Conn).
 
 %% Leave a buffered response held by flow control with its worker gone, then
 %% drain: returns once the drain's close is waiting on that response.

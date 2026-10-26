@@ -285,6 +285,11 @@ handle_info({push, Data}, Push, N) ->
 handle_info(stop, Push, N) ->
     _ = Push([~"data: bye(", integer_to_binary(N), ~")\n\n"]),
     {stop, N};
+handle_info({roadrunner_drain, _Deadline}, Push, N) ->
+    %% A listener drain, passed on by the conn. Counted like a push, so a
+    %% test can tell from the `bye(N)` the handler saw it exactly once.
+    _ = Push(~"data: drain\n\n"),
+    {ok, N + 1};
 handle_info({roadrunner_disconnect, Reason}, _Push, N) ->
     %% The client went away: surface the reason to the test observer (if
     %% one registered) so the end-to-end disconnect path can be asserted,

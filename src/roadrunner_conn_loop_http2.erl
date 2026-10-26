@@ -361,12 +361,13 @@
     %% request headers. Handed to each worker as it is spawned
     %% (`roadrunner_http2_stream_worker:start/5`), which applies it.
     peer_max_header_list_size = infinity :: non_neg_integer() | infinity,
-    %% Set to `true` once a `{roadrunner_drain, _}` message has
-    %% been observed (Phase H9). In drain mode we've already sent
-    %% GOAWAY(NO_ERROR), refuse fresh streams with
-    %% RST_STREAM(REFUSED_STREAM), and exit as soon as the streams
-    %% map empties.
-    draining = false :: boolean()
+    %% The `Deadline` of the first `{roadrunner_drain, Deadline}`
+    %% message, `undefined` until one arrives. In drain mode we've
+    %% already sent GOAWAY(NO_ERROR) and passed the message on to every
+    %% stream worker, refuse fresh streams with
+    %% RST_STREAM(REFUSED_STREAM), hand the same message to each worker
+    %% started from then on, and exit as soon as the streams map empties.
+    drain_deadline = undefined :: integer() | undefined
 }).
 
 -doc """
@@ -559,7 +560,9 @@ handshake_recv(
 %% =============================================================================
 
 -spec frame_loop(#loop{}) -> no_return().
-frame_loop(#loop{draining = true, streams = Streams} = State) when map_size(Streams) =:= 0 ->
+frame_loop(#loop{drain_deadline = Deadline, streams = Streams} = State) when
+    is_integer(Deadline), map_size(Streams) =:= 0
+->
     %% Drain done — the last in-flight stream finished or peer
     %% RST'd it, nothing more to do.
     exit_clean(State, drained);
@@ -615,8 +618,8 @@ recv_more(
             %% A refused park drops its stream, which may be the last one
             %% a draining conn was waiting on.
             recv_more(maybe_exit_when_drained(handle_slot(State, StreamId, Outcome)));
-        {roadrunner_drain, _Deadline} ->
-            recv_more(maybe_exit_when_drained(start_drain(State)))
+        {roadrunner_drain, Deadline} ->
+            recv_more(maybe_exit_when_drained(start_drain(State, Deadline)))
     after recv_timeout(State) ->
         recv_idle_expired(State)
     end.
@@ -677,14 +680,54 @@ recv_more_hib(State, TRef) ->
     end.
 
 %% Begin a graceful drain: emit GOAWAY(NO_ERROR) once, refuse new
-%% streams henceforth. In-flight workers continue to completion.
-%% Idempotent — subsequent drain messages are no-ops.
--spec start_drain(#loop{}) -> #loop{}.
-start_drain(#loop{draining = true} = State) ->
+%% streams henceforth. In-flight workers continue to completion, and
+%% each gets the same `{roadrunner_drain, Deadline}` the conn did: the
+%% handler runs in the worker, not here, so this is how a `{loop, ...}`
+%% response (an SSE stream, say) learns of the drain and can wind down,
+%% as it does on HTTP/1.1, where it runs in the conn process. Every
+%% worker gets it, not only loop ones, again as on HTTP/1.1: a worker
+%% still in `handle/1` may be about to answer with a loop, and one that
+%% is not just leaves it unread. Idempotent: subsequent drain messages
+%% are no-ops, so a worker hears of the drain once.
+-spec start_drain(#loop{}, integer()) -> #loop{}.
+start_drain(#loop{drain_deadline = Deadline} = State, _Deadline) when is_integer(Deadline) ->
     State;
-start_drain(#loop{} = State) ->
+start_drain(#loop{streams = Streams} = State, Deadline) ->
     _ = send_goaway(State, no_error),
-    State#loop{draining = true}.
+    ok = maps:foreach(
+        fun
+            (_StreamId, #{worker_pid := Pid, worker_ref := MonRef}) when is_reference(MonRef) ->
+                _ = (Pid ! {roadrunner_drain, Deadline}),
+                ok;
+            (_StreamId, _Stream) ->
+                ok
+        end,
+        Streams
+    ),
+    State#loop{drain_deadline = Deadline}.
+
+%% Spawn the worker for `StreamId`. A worker started once the drain has
+%% begun (a stream below the GOAWAY whose body was still arriving, or a
+%% request parked for an in-flight slot) gets the drain message right
+%% away, as the workers already running did in `start_drain/2`.
+-spec start_worker(#loop{}, stream_id(), roadrunner_req:request()) -> {pid(), reference()}.
+start_worker(
+    #loop{
+        proto_opts = ProtoOpts,
+        peer_max_header_list_size = PeerLimit,
+        drain_deadline = Deadline
+    },
+    StreamId,
+    Req
+) ->
+    {WorkerPid, _MonRef} =
+        Worker = roadrunner_http2_stream_worker:start(self(), StreamId, Req, ProtoOpts, PeerLimit),
+    _ =
+        case Deadline of
+            undefined -> ok;
+            _ -> WorkerPid ! {roadrunner_drain, Deadline}
+        end,
+    Worker.
 
 %% Once we're draining and the streams map empties, exit cleanly.
 %% Called after every event that could remove a stream. Note that
@@ -693,8 +736,8 @@ start_drain(#loop{} = State) ->
 %% `recv_more/1` is dead — typed as `#loop{}` rather than
 %% `no_return()` so the type-checker sees the live path.
 -spec maybe_exit_when_drained(#loop{}) -> #loop{}.
-maybe_exit_when_drained(#loop{draining = true, streams = Streams} = State) when
-    map_size(Streams) =:= 0
+maybe_exit_when_drained(#loop{drain_deadline = Deadline, streams = Streams} = State) when
+    is_integer(Deadline), map_size(Streams) =:= 0
 ->
     exit_clean(State, drained);
 maybe_exit_when_drained(State) ->
@@ -891,7 +934,9 @@ on_headers(StreamId, Flags, #{stream_dependency := StreamId}, Fragment, State) -
     %% RFC 9113 §5.3.1: a stream cannot depend on itself —
     %% stream-error PROTOCOL_ERROR.
     refuse_new_stream(StreamId, Flags, Fragment, protocol_error, State);
-on_headers(StreamId, Flags, _Priority, Fragment, #loop{draining = true} = State) ->
+on_headers(StreamId, Flags, _Priority, Fragment, #loop{drain_deadline = Deadline} = State) when
+    is_integer(Deadline)
+->
     %% In drain mode — refuse all new streams. The peer already
     %% saw GOAWAY(NO_ERROR); it knows new requests on this conn
     %% won't be served.
@@ -1603,7 +1648,6 @@ dispatch_request(
     Body,
     #loop{
         streams = Streams,
-        proto_opts = ProtoOpts,
         peer = Peer,
         scheme = Scheme,
         listener_name = ListenerName,
@@ -1643,13 +1687,7 @@ dispatch_request(
                         )
                     of
                         true ->
-                            {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
-                                self(),
-                                StreamId,
-                                Req,
-                                ProtoOpts,
-                                State#loop.peer_max_header_list_size
-                            ),
+                            {WorkerPid, MonRef} = start_worker(StateBuf, StreamId, Req),
                             Stream1 = Stream#{
                                 worker_pid := WorkerPid,
                                 worker_ref := MonRef
@@ -2299,16 +2337,9 @@ handle_slot(#loop{awaiting_slot = Awaiting, listener_name = ListenerName} = Stat
 %% `withdraw_parked/2` keeps `awaiting_slot` and `streams` in step, so a
 %% grant that still has its parked request always has its stream too.
 -spec spawn_parked(#loop{}, stream_id(), roadrunner_req:request()) -> #loop{}.
-spawn_parked(
-    #loop{streams = Streams, proto_opts = ProtoOpts, peer_max_header_list_size = PeerLimit} =
-        State,
-    StreamId,
-    Req
-) ->
+spawn_parked(#loop{streams = Streams} = State, StreamId, Req) ->
     #{StreamId := Stream} = Streams,
-    {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
-        self(), StreamId, Req, ProtoOpts, PeerLimit
-    ),
+    {WorkerPid, MonRef} = start_worker(State, StreamId, Req),
     State#loop{
         streams = Streams#{StreamId := Stream#{worker_pid := WorkerPid, worker_ref := MonRef}},
         worker_refs = (State#loop.worker_refs)#{MonRef => StreamId}
