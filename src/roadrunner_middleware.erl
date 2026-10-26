@@ -40,8 +40,8 @@ Middleware code never has access to the underlying socket — the
 respond, a middleware **must** return a `Result`: the one from
 `Next(Req)`, or its own response. A response that has to be sent while
 code runs (cowboy's mid-flight `cowboy_req:reply/4` or `inform/3`) is a
-`{respond, Headers, Fun}` response: the connection runs `Fun` and it
-sends through `roadrunner_respond` (see `roadrunner_handler`).
+`{send, Headers, Fun}` response: the connection runs `Fun` and it
+sends through `roadrunner_send` (see `roadrunner_handler`).
 
 This is a feature, not a limitation. Bytes only hit the wire from
 one place — the process running the request — which means:
@@ -50,7 +50,7 @@ one place — the process running the request — which means:
   actually sent.
 - response transforms and `Content-Length` framing are applied
   uniformly regardless of which middleware produced the response.
-  `roadrunner_compress` leaves `{respond, ...}` responses as they are.
+  `roadrunner_compress` leaves `{send, ...}` responses as they are.
 - Send errors are handled in one place (the `response_send_failed`
   event, drain bookkeeping, slot release).
 - The "halt" pattern is structurally simple: don't call `Next`, just
@@ -64,7 +64,7 @@ If you're porting middleware from cowboy that called
 `cowboy_req:reply/4` directly, replace the call with returning a
 response triple — `{Status, Headers, Body}` — from the middleware,
 and the framework writes the bytes. Middleware that sent an
-`inform/3` before its reply returns a `{respond, ...}` response instead.
+`inform/3` before its reply returns a `{send, ...}` response instead.
 
 ## Where middlewares live
 

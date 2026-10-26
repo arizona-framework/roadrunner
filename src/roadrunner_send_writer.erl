@@ -1,8 +1,8 @@
--module(roadrunner_respond_writer).
+-module(roadrunner_send_writer).
 -moduledoc false.
 
-%% Runs a `{respond, Headers, Fun}` response's fun and backs the
-%% `roadrunner_respond` calls it makes. Each protocol passes its writer
+%% Runs a `{send, Headers, Fun}` response's fun and backs the
+%% `roadrunner_send` calls it makes. Each protocol passes its writer
 %% (`t:emit/0`) to `run/5`, which hands it to the fun on the request, so
 %% the calls write the wire from the process running the handler: the
 %% connection on HTTP/1.1, the stream worker on HTTP/2 and HTTP/3. What
@@ -11,9 +11,9 @@
 
 -export([inform/3, final/3, run/5, started/2]).
 
--export_type([responder/0, op/0, emit/0, sent/0, outcome/0]).
+-export_type([writer/0, op/0, emit/0, sent/0, outcome/0]).
 
--record(responder, {
+-record(writer, {
     emit :: emit(),
     headers :: roadrunner_http:headers()
 }).
@@ -22,9 +22,9 @@
 %% while a stream is not ended, `{sent, ...}` once the final response is
 %% complete. One response runs at a time per process, and `run/5` clears
 %% it.
--define(KEY, '$roadrunner_respond').
+-define(KEY, '$roadrunner_send').
 
--opaque responder() :: #responder{}.
+-opaque writer() :: #writer{}.
 
 -type op() ::
     {inform, roadrunner_http:status(), roadrunner_http:headers()}
@@ -52,7 +52,7 @@
 
 -spec inform(roadrunner_http:status(), roadrunner_http:headers(), roadrunner_req:request()) ->
     ok | {error, term()}.
-inform(Status, Headers, #{respond := #responder{emit = Emit}} = Req) ->
+inform(Status, Headers, #{send := #writer{emit = Emit}} = Req) ->
     ok = unsent(),
     case roadrunner_http:unsafe_header(Headers) of
         none ->
@@ -65,7 +65,7 @@ inform(Status, Headers, #{respond := #responder{emit = Emit}} = Req) ->
 %% The final response, with the tuple's headers added: sent, or answered
 %% 500 when a header is unsafe.
 -spec final(kind(), op(), roadrunner_req:request()) -> result().
-final(Kind, Op0, #{respond := #responder{emit = Emit, headers = Extra}} = Req) ->
+final(Kind, Op0, #{send := #writer{emit = Emit, headers = Extra}} = Req) ->
     ok = unsent(),
     Op = with_headers(Op0, Extra),
     case roadrunner_http:unsafe_header(element(3, Op)) of
@@ -137,23 +137,23 @@ internal_error(Emit, Req) ->
 
 -spec log_unsafe(name | value) -> ok.
 log_unsafe(Kind) ->
-    logger:error(#{msg => "roadrunner respond call had a header with CR/LF/NUL", kind => Kind}).
+    logger:error(#{msg => "roadrunner send call had a header with CR/LF/NUL", kind => Kind}).
 
 %% Run the fun under its own `try`, so a crash is reported with what had
 %% gone out by then. Its return is the request; anything else is a handler
 %% bug that crashes the caller, as a bad `handle/1` return does.
 -spec run(
     module(),
-    roadrunner_respond:respond_fun(),
+    roadrunner_send:sender(),
     roadrunner_http:headers(),
     roadrunner_req:request(),
     emit()
 ) -> outcome().
 run(Handler, Fun, Headers, Req, Emit) ->
     _ = erase(?KEY),
-    try Fun(Req#{respond => #responder{emit = Emit, headers = Headers}}) of
+    try Fun(Req#{send => #writer{emit = Emit, headers = Headers}}) of
         #{} = Req2 ->
-            Req3 = maps:remove(respond, Req2),
+            Req3 = maps:remove(send, Req2),
             {done, finish(Handler, Emit, Req3), Req3}
     catch
         Class:Reason:Stack ->
@@ -171,7 +171,7 @@ finish(Handler, Emit, Req) ->
             {stream, Status, Headers};
         undefined ->
             logger:error(#{
-                msg => "roadrunner respond fun returned without a response",
+                msg => "roadrunner send fun returned without a response",
                 handler => Handler
             }),
             ok = internal_error(Emit, Req),

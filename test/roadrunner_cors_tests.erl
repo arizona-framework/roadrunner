@@ -84,11 +84,11 @@ stream_response_decorated_test() ->
     ?assertEqual(Fun, OutFun),
     ?assertEqual(?ORIGIN, header(~"access-control-allow-origin", Headers)).
 
-respond_response_decorated_test() ->
+send_response_decorated_test() ->
     Req = req(~"GET", [{~"origin", ?ORIGIN}]),
     Fun = fun(R) -> R end,
-    Next = fun(R) -> {{respond, [], Fun}, R} end,
-    {{respond, Headers, OutFun}, _} = call(Req, Next, ?ALLOWLIST),
+    Next = fun(R) -> {{send, [], Fun}, R} end,
+    {{send, Headers, OutFun}, _} = call(Req, Next, ?ALLOWLIST),
     ?assertEqual(Fun, OutFun),
     ?assertEqual(?ORIGIN, header(~"access-control-allow-origin", Headers)).
 

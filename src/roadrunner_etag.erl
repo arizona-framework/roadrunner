@@ -35,7 +35,7 @@ current representation.
 
 Only a buffered `200` for `GET` or `HEAD` is handled. Other statuses and
 methods, and `{stream, ...}`, `{loop, ...}`, `{sendfile, ...}`,
-`{respond, ...}`, and `{websocket, ...}` responses, pass through unchanged. Computing the ETag
+`{send, ...}`, and `{websocket, ...}` responses, pass through unchanged. Computing the ETag
 reads the whole body once per response, so use it on read-heavy endpoints
 where skipping the body on revalidation is worth the hash.
 """.

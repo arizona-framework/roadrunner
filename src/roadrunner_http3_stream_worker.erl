@@ -156,7 +156,7 @@ over_peer_limit(Conn, StreamId, Handler, Fields) ->
     ),
     500.
 
-%% An interim 1xx for `roadrunner_respond:inform/3`: a HEADERS frame ahead of
+%% An interim 1xx for `roadrunner_send:inform/3`: a HEADERS frame ahead of
 %% the final response's (RFC 9114 §4.1). Not sent when over the client's
 %% field section limit.
 -doc false.
@@ -169,7 +169,7 @@ send_interim(Conn, StreamId, Status, Headers) ->
         false -> {error, field_section_too_large}
     end.
 
-%% The head of a `roadrunner_respond:stream/3` response, with the status
+%% The head of a `roadrunner_send:stream/3` response, with the status
 %% sent: answered 500 instead when over the client's field section limit.
 -doc false.
 -spec start_stream(
@@ -182,7 +182,7 @@ start_stream(Conn, StreamId, Handler, Status, Headers) ->
         true ->
             Result = roadrunner_quic:send_data(Conn, StreamId, header_frame(Fields), false),
             Send = fun(Data, FinFlag) -> stream_send(Conn, StreamId, Data, FinFlag) end,
-            {roadrunner_respond_writer:started(Result, Send), Status};
+            {roadrunner_send_writer:started(Result, Send), Status};
         false ->
             {{error, field_section_too_large}, over_peer_limit(Conn, StreamId, Handler, Fields)}
     end.

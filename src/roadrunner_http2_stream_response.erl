@@ -58,8 +58,8 @@ run(ConnPid, StreamId, Status, Headers, Fun) ->
     ok.
 
 %% Send the response HEADERS and return the `Send/2` that writes the body:
-%% `run/5`'s first half, for a `roadrunner_respond:stream/3` call, whose fun
-%% goes on after it (`roadrunner_respond_writer` ends the stream when the
+%% `run/5`'s first half, for a `roadrunner_send:stream/3` call, whose fun
+%% goes on after it (`roadrunner_send_writer` ends the stream when the
 %% fun leaves it open).
 -doc false.
 -spec start(pid(), pos_integer(), roadrunner_http:status(), roadrunner_http:headers()) ->

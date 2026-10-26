@@ -202,7 +202,7 @@ over_peer_limit(ConnPid, StreamId, Handler, Size, Limit) ->
     ),
     500.
 
-%% An interim 1xx for `roadrunner_respond:inform/3`: a HEADERS frame without
+%% An interim 1xx for `roadrunner_send:inform/3`: a HEADERS frame without
 %% END_STREAM, the final response's HEADERS to follow (RFC 9113 §8.1). Not
 %% sent when over the client's header limit.
 -doc false.
@@ -217,7 +217,7 @@ send_interim(ConnPid, StreamId, Status, Headers) ->
             {error, header_list_too_large}
     end.
 
-%% The head of a `roadrunner_respond:stream/3` response, with the status
+%% The head of a `roadrunner_send:stream/3` response, with the status
 %% sent: answered 500 instead when over the client's header limit.
 -doc false.
 -spec start_stream(

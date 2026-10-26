@@ -113,10 +113,10 @@ care which protocol delivered the bytes.
     %% until first written; the accessors default it to `#{}`. Distinct
     %% from `state` (the user's per-route config) — see `private/1`.
     private => private(),
-    %% How a `{respond, Headers, Fun}` response's fun reaches its
-    %% connection, set only on the request that fun gets. Read by
-    %% `roadrunner_respond`.
-    respond => roadrunner_respond_writer:responder()
+    %% How a `{send, Headers, Fun}` response's fun reaches its
+    %% connection, set only on the request that fun gets. Internal:
+    %% read only by `roadrunner_send` (its private writer state).
+    send => term()
 }.
 
 -type headers() :: roadrunner_http:headers().

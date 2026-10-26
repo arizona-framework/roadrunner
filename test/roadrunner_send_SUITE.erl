@@ -1,9 +1,9 @@
--module(roadrunner_respond_SUITE).
+-module(roadrunner_send_SUITE).
 -moduledoc """
-`{respond, Headers, Fun}` responses over HTTP/1.1, HTTP/2 (h2c) and HTTP/3:
+`{send, Headers, Fun}` responses over HTTP/1.1, HTTP/2 (h2c) and HTTP/3:
 the fun sends interim, complete, streamed and file responses itself with
-`roadrunner_respond`, and the framework finishes what it leaves open. The
-handler is `roadrunner_respond_handler`; each route's state picks what its
+`roadrunner_send`, and the framework finishes what it leaves open. The
+handler is `roadrunner_send_handler`; each route's state picks what its
 fun does.
 """.
 
@@ -39,7 +39,7 @@ fun does.
     client_reset_ends_the_fun/1
 ]).
 
--define(H, roadrunner_respond_handler).
+-define(H, roadrunner_send_handler).
 
 suite() ->
     [{timetrap, {seconds, 30}}].
@@ -92,7 +92,7 @@ init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
     {ok, _} = application:ensure_all_started(ssl),
     {ok, _} = roadrunner_test_event_handler:start(),
-    File = filename:join(?config(priv_dir, Config), "respond.txt"),
+    File = filename:join(?config(priv_dir, Config), "send.txt"),
     ok = file:write_file(File, ~"abcdefgh"),
     [{file, File} | Config].
 
@@ -350,8 +350,8 @@ crashed() ->
 
 result() ->
     receive
-        {respond_result, Result} -> Result
-    after 5000 -> ct:fail(no_respond_result)
+        {send_result, Result} -> Result
+    after 5000 -> ct:fail(no_send_result)
     end.
 
 %% --- HTTP/1.1 ---

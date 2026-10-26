@@ -1690,7 +1690,7 @@ response_kind({stream, _, _, _}) -> stream;
 response_kind({loop, _, _, _}) -> loop;
 response_kind({sendfile, _, _, _}) -> sendfile;
 response_kind({websocket, _, _}) -> websocket;
-%% The status guard keeps `{respond, ...}` out: its kind is the response
+%% The status guard keeps `{send, ...}` out: its kind is the response
 %% its fun sent, which the dispatch sites report themselves.
 response_kind({Status, _, _}) when is_integer(Status) -> buffered.
 

@@ -22,7 +22,7 @@ response as a value, and Roadrunner sends it.
 | `cowboy_handler`, `init/2` | `roadrunner_handler`, `handle/1` |
 | `cowboy_req` | `roadrunner_req` (read) and `roadrunner_resp` (build responses) |
 | `cowboy_req:stream_reply/3` + `stream_body/3` | a `{stream, ...}` response |
-| `cowboy_req:reply/4` or `inform/3` while the handler runs | a `{respond, ...}` response and `roadrunner_respond` |
+| `cowboy_req:reply/4` or `inform/3` while the handler runs | a `{send, ...}` response and `roadrunner_send` |
 | `cowboy_loop` | a `{loop, ...}` response plus `handle_info/3` |
 | `cowboy_websocket` | `roadrunner_ws_handler` |
 | `cowboy_static` | `roadrunner_static` |
@@ -420,24 +420,28 @@ handle(Req) ->
 ### Sending the response as the handler runs
 
 Some Cowboy handlers send while they work: an `inform/3` first, then the
-reply, chosen as the code goes. Return `{respond, Headers, Fun}` for that.
-Roadrunner calls `Fun(Req)`, and the fun sends with `roadrunner_respond`, in
+reply, chosen as the code goes. Return `{send, Headers, Fun}` for that.
+Roadrunner calls `Fun(Req)`, and the fun sends with `roadrunner_send`, in
 the same order as Cowboy's calls, with `Req` last:
 
 ```erlang
 handle(Req) ->
-    {{respond, [], fun respond/1}, Req}.
+    {{send, [], fun send/1}, Req}.
 
-respond(Req0) ->
-    ok = roadrunner_respond:inform(103, [{~"link", ~"</app.css>; rel=preload"}], Req0),
+send(Req0) ->
+    ok = roadrunner_send:inform(103, [{~"link", ~"</app.css>; rel=preload"}], Req0),
     {ok, Body, Req} = roadrunner_req:read_body(Req0),
-    ok = roadrunner_respond:reply(200, [{~"content-type", ~"text/plain"}], Body, Req),
+    ok = roadrunner_send:reply(200, [{~"content-type", ~"text/plain"}], Body, Req),
     Req.
 ```
 
-`roadrunner_respond:stream/3` returns the same `Send` as a `{stream, ...}`
-response, and `sendfile/4` sends a file. The fun returns the request, the
-last one it got from `roadrunner_req`.
+`roadrunner_send:reply/2` sends a response built with `roadrunner_resp`, such
+as `roadrunner_send:reply(roadrunner_resp:json(200, Map), Req)`. It is not
+Cowboy's `reply(Status, Req)`: for a response without a body, send
+`roadrunner_resp:status(204)` or call `reply(204, [], ~"", Req)`.
+`roadrunner_send:stream/3` returns the same `Send` as a `{stream, ...}`
+response, and `file/4` sends a file. The fun returns the request, the last
+one it got from `roadrunner_req`.
 
 ## Middlewares and stream handlers
 
@@ -763,7 +767,7 @@ cover each one.
 - Rewrite each `init/2` as `handle/1` that returns `{Response, Req}`
 - Replace `cowboy_req:reply/4` calls with response tuples or `roadrunner_resp`
   builders, and response header maps with lists. Code that has to send as it
-  runs, or sends `inform/3`, moves to a `{respond, ...}` response
+  runs, or sends `inform/3`, moves to a `{send, ...}` response
 - Move `set_resp_header` and `set_resp_cookie` to `roadrunner_resp:add_header/3`
   and `roadrunner_resp:set_cookie/4`
 - Turn `stream_reply` code into `{stream, ...}` responses and `cowboy_loop`

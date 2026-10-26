@@ -14,7 +14,7 @@ the connection layer's job — these helpers only fill in what the
 handler can know.
 
 These helpers only construct the buffered form
-(`t:buffered_response/0`). Streaming, loop, sendfile, respond, and
+(`t:buffered_response/0`). Streaming, loop, sendfile, send, and
 WebSocket-upgrade handlers build their own tuple directly; see
 `t:roadrunner_handler:response/0` for the full union.
 """.

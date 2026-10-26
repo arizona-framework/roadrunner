@@ -53,7 +53,7 @@ run(Socket, Status, UserHeaders, Fun) ->
 
 %% Send the chunked-response head and return the head write's result with
 %% the `Send/2` that writes the body: `run/4`'s first half, for a
-%% `roadrunner_respond:stream/3` call, whose fun goes on after it.
+%% `roadrunner_send:stream/3` call, whose fun goes on after it.
 -doc false.
 -spec start(roadrunner_transport:socket(), roadrunner_http:status(), roadrunner_http:headers()) ->
     {ok | {error, term()}, roadrunner_handler:send_fun()}.

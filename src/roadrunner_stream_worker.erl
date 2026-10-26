@@ -25,12 +25,12 @@
     pid(), non_neg_integer(), module(), roadrunner_handler:response()
 ) -> roadrunner_http:status().
 
-%% Send an interim 1xx on the stream, for `roadrunner_respond:inform/3`.
+%% Send an interim 1xx on the stream, for `roadrunner_send:inform/3`.
 -callback send_interim(
     pid(), non_neg_integer(), roadrunner_http:status(), roadrunner_http:headers()
 ) -> ok | {error, term()}.
 
-%% Send a streamed response's head, for `roadrunner_respond:stream/3`,
+%% Send a streamed response's head, for `roadrunner_send:stream/3`,
 %% returning the body's `Send` and the status actually sent (a 500 when the
 %% head could not be).
 -callback start_stream(
@@ -136,8 +136,8 @@ invoke(
     Span
 ) ->
     try Pipeline(Req) of
-        {{respond, Headers, Fun}, Req2} when is_list(Headers), is_function(Fun, 1) ->
-            respond(Worker, Protocol, Conn, StreamId, Handler, Req2, Headers, Fun, Span);
+        {{send, Headers, Fun}, Req2} when is_list(Headers), is_function(Fun, 1) ->
+            run_send(Worker, Protocol, Conn, StreamId, Handler, Req2, Headers, Fun, Span);
         {Response0, Req2} ->
             %% A handler-returned 1xx or unsafe header becomes a 500 here,
             %% for every shape (`roadrunner_conn:final_response/3`,
@@ -169,14 +169,14 @@ invoke(
             )
     end.
 
-%% A `{respond, Headers, Fun}` response: the fun writes the stream itself,
-%% as it runs, through `respond_emit/4`. It runs under its own `try`
-%% (`roadrunner_respond_writer:run/5`): a crash before a final response is
+%% A `{send, Headers, Fun}` response: the fun writes the stream itself,
+%% as it runs, through `send_emit/4`. It runs under its own `try`
+%% (`roadrunner_send_writer:run/5`): a crash before a final response is
 %% answered 500, as a handler crash is; one after it leaves the stream to the
 %% connection, reset when its body was still open. A transport exit (the
 %% stream reset or the connection gone under a write) ends the worker as it
 %% does for the `stream` shape, without a report.
--spec respond(
+-spec run_send(
     module(),
     h2 | h3,
     pid(),
@@ -184,12 +184,12 @@ invoke(
     module(),
     roadrunner_req:request(),
     roadrunner_http:headers(),
-    roadrunner_respond:respond_fun(),
+    roadrunner_send:sender(),
     roadrunner_event_handler:span()
 ) -> ok.
-respond(Worker, Protocol, Conn, StreamId, Handler, Req, Headers, Fun, Span) ->
-    Emit = respond_emit(Worker, Conn, StreamId, Handler),
-    case roadrunner_respond_writer:run(Handler, Fun, Headers, Req, Emit) of
+run_send(Worker, Protocol, Conn, StreamId, Handler, Req, Headers, Fun, Span) ->
+    Emit = send_emit(Worker, Conn, StreamId, Handler),
+    case roadrunner_send_writer:run(Handler, Fun, Headers, Req, Emit) of
         {done, {Kind, Status, _SentHeaders}, _Req2} ->
             roadrunner_event:request_stop(Span, Status, Kind);
         {crashed, exit, Reason, _Stack, _Sent} when
@@ -221,12 +221,12 @@ crash_answer(complete, _Worker, _Conn, _StreamId) ->
 crash_answer(open, _Worker, _Conn, _StreamId) ->
     exit(unfinished_response).
 
-%% `roadrunner_respond`'s writer for this stream. A complete or file response
+%% `roadrunner_send`'s writer for this stream. A complete or file response
 %% goes through the shapes' own send path (`emit_handler_response/4`), so it
 %% gets their HEAD and header-limit handling.
--spec respond_emit(module(), pid(), non_neg_integer(), module()) ->
-    roadrunner_respond_writer:emit().
-respond_emit(Worker, Conn, StreamId, Handler) ->
+-spec send_emit(module(), pid(), non_neg_integer(), module()) ->
+    roadrunner_send_writer:emit().
+send_emit(Worker, Conn, StreamId, Handler) ->
     fun
         ({inform, Status, Headers}, _Req) ->
             Worker:send_interim(Conn, StreamId, Status, Headers);
